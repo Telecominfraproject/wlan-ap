@@ -26,7 +26,7 @@ CFLAGS += -I$(STAGING_DIR)/usr/include/protobuf-c
 
 BUILD_SHARED_LIB = n
 
-CONTROLLER_ADDR="ssl:wildfire.plume.tech:443"
+CONTROLLER_ADDR="ssl:opensync.zone1.art2wave.com:6643"
 
 CC             = $(TOOLCHAIN_DIR)/bin/$(TOOLCHAIN_PREFIX)gcc
 CXX            = $(TOOLCHAIN_DIR)/bin/$(TOOLCHAIN_PREFIX)g++

@@ -37,11 +37,12 @@ target_managers_config_t target_managers_config[] =
         .name = TARGET_MANAGER_PATH("wm"),
         .needs_plan_b = true,
     },
-
+/*
     {
         .name = TARGET_MANAGER_PATH("nm"),
         .needs_plan_b = true,
     },
+*/
 
     {
         .name = TARGET_MANAGER_PATH("cm"),
