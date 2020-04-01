@@ -572,13 +572,56 @@ bool osn_ip6_radv_add_dnssl(osn_ip6_radv_t *self, char *dnssl)
 
 const char *dnsmasq6_server_option6_encode(int tag, const char *value)
 {
-    static char buf[512];
+    static char buf[1024];
 
     switch (tag)
     {
         case 23:    /* DNS Recursive Name server */
-            snprintf(buf, sizeof(buf), "[%s]", value);
+        {
+            char val[1024];
+            char *pval;
+            char *rdnss;
+            int bufpos;
+            int rc;
+
+            /*
+             * Value may be a space-separated list of DNS servers -- convert
+             * it to a comma separated list. Enclose each IPv6 address with []
+             */
+            if (STRSCPY(val, value) < 0)
+            {
+                LOG(ERR, "dnsmasq: Error encoding RDNSS option: %s. String too long.", value);
+                return value;
+            }
+
+            buf[0] = '\0';
+            bufpos = 0;
+            for (rdnss = strtok_r(val, " ", &pval);
+                    rdnss != NULL;
+                    rdnss = strtok_r(NULL, " ", &pval))
+            {
+                if (bufpos == 0)
+                {
+                    rc = snprintf(buf + bufpos, sizeof(buf) - bufpos, "[%s]", rdnss);
+                }
+                else
+                {
+                    rc = snprintf(buf + bufpos, sizeof(buf) - bufpos, ",[%s]", rdnss);
+                }
+
+                if (rc >= ((int)sizeof(buf) - bufpos))
+                {
+                    LOG(NOTICE, "dnsmasq: RDNSS string too long. Truncated from and including: %s", rdnss);
+                    /* Truncate string */
+                    buf[bufpos] = '\0';
+                    break;
+                }
+
+                bufpos += rc;
+            }
+
             return buf;
+        }
 
         default:
             break;

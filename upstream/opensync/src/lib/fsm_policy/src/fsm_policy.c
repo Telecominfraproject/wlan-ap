@@ -441,9 +441,19 @@ void set_reporting(struct fsm_policy_req *req, struct fsm_policy *p)
  */
 void set_policy_record(struct fsm_policy_req *req, struct fsm_policy *p)
 {
-    req->reply.policy = p->table_name;
+    req->reply.policy = strdup(p->table_name);
+    if (req->reply.policy == NULL)
+    {
+        LOGE("%s: could not duplicate %s", __func__,
+             p->table_name);
+    }
     req->reply.policy_idx = p->idx;
-    req->reply.rule_name = p->rule_name;
+    req->reply.rule_name = strdup(p->rule_name);
+    if (req->reply.rule_name == NULL)
+    {
+        LOGE("%s: could not duplicate %s", __func__,
+             p->rule_name);
+    }
 }
 
 /**

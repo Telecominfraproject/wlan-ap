@@ -179,6 +179,8 @@ rootfs-install-append: rootfs-install-main
 
 rootfs-install-only: rootfs-install-prepend rootfs-install-main rootfs-install-append
 
-rootfs-install: rootfs rootfs-install-only
+rootfs-install:
+	$(MAKE) rootfs
+	$(MAKE) rootfs-install-only
 
 

@@ -116,7 +116,7 @@ Note-1: the wait for re-connect back to same manager addr because
 #define CM2_ONBOARD_WAN_IP_TIMEOUT      20
 #define CM2_RESOLVE_TIMEOUT             60
 
-#define CM2_MAX_DISCONNECTS             3
+#define CM2_MAX_DISCONNECTS             4
 #define CM2_STABLE_PERIOD               300 // 5 min
 // state info
 #define CM2_STATE_DIR  "/tmp/plume/"
@@ -460,6 +460,8 @@ start:
                 cm2_ovsdb_refresh_dhcp(BR_WAN_NAME);
             }
             cm2_link_sel_update_ble_state();
+            cm2_ovsdb_connection_clean_link_counters(g_state.link.if_name);
+            cm2_connection_req_stability_check(LINK_CHECK);
             cm2_set_state(true, CM2_STATE_WAN_IP);
             break;
         case CM2_REASON_SET_NEW_VTAG:
@@ -538,6 +540,8 @@ start:
             }
             if (g_state.link.is_used)
             {
+                cm2_ovsdb_connection_clean_link_counters(g_state.link.if_name);
+                cm2_connection_req_stability_check(LINK_CHECK);
                 cm2_set_state(true, CM2_STATE_WAN_IP);
                 cm2_link_sel_update_ble_state();
             }
@@ -554,7 +558,7 @@ start:
             }
             if (g_state.link.is_ip)
             {
-                cm2_connection_stability_check();
+                cm2_connection_req_stability_check(ROUTER_CHECK);
                 cm2_set_state(true, CM2_STATE_NTP_CHECK);
             }
             else if (cm2_timeout())
@@ -566,6 +570,7 @@ start:
         case CM2_STATE_NTP_CHECK: // EXTENDER only
             if (cm2_state_changed()) // first iteration
             {
+                cm2_connection_req_stability_check(NTP_CHECK);
                 LOGI("Waiting for finish NTP");
             }
             if (g_state.ntp_check)
@@ -575,6 +580,8 @@ start:
 
                 else
                      cm2_set_state(true, CM2_STATE_OVS_INIT);
+
+                cm2_connection_req_stability_check(INTERNET_CHECK);
             }
             else if (cm2_timeout())
             {
@@ -582,7 +589,7 @@ start:
             }
             else
             {
-                cm2_connection_stability_check();
+                cm2_connection_req_stability_check(NTP_CHECK);
             }
             break;
 
@@ -658,6 +665,7 @@ start:
         case CM2_STATE_TRY_CONNECT:
             /* Workaround for CAES-599, double check */
             cm2_ovsdb_remove_unused_gre_interfaces();
+            cm2_ovsdb_connection_update_unreachable_cloud_counter(g_state.link.if_name, -1);
 
             if (cm2_curr_addr()->updated)
             {
@@ -713,9 +721,9 @@ start:
             if (cm2_state_changed()) // first iteration
             {
                 LOG(NOTICE, "===== Connected to: %s", cm2_curr_dest_name());
-                if (cm2_is_extender()) {
-                    cm2_connection_stability_check();
-                }
+                if (cm2_is_extender())
+                    cm2_connection_req_stability_check(LINK_CHECK | ROUTER_CHECK | INTERNET_CHECK);
+
             }
 
             if (g_state.connected) {
@@ -727,11 +735,9 @@ start:
                 if (!g_state.is_con_stable && cm2_get_time() > CM2_STABLE_PERIOD) {
                     LOGI("Connection stable by %d sec, disconnects: %d",
                          CM2_STABLE_PERIOD, g_state.disconnects);
-                    g_state.is_con_stable = true;
 
-                    if (g_state.disconnects) {
-                        g_state.disconnects = 0;
-                    }
+                    g_state.is_con_stable = true;
+                    g_state.disconnects = 0;
                     g_state.fast_backoff = false;
 
                     if (g_state.link.vtag.state == CM2_VTAG_PENDING) {
@@ -753,6 +759,9 @@ start:
             {
                 // quiesce ovsdb-server, wait for timeout
                 cm2_ovsdb_set_Manager_target("");
+                g_state.disconnects += 1;
+                cm2_ovsdb_connection_update_unreachable_cloud_counter(g_state.link.if_name,
+                                                                      g_state.disconnects);
                 // Update timeouts based on AWLAN_Node contents
                 cm2_compute_backoff();
                 LOG(NOTICE, "===== Quiescing connection to: %s for %d seconds",
@@ -768,6 +777,10 @@ start:
             if (cm2_timeout())
             {
                 g_state.disconnects += 1;
+                if (cm2_is_extender())
+                    cm2_ovsdb_connection_update_unreachable_cloud_counter(g_state.link.if_name,
+                                                                          g_state.disconnects);
+
                 if (g_state.disconnects > CM2_MAX_DISCONNECTS)
                 {
                     // too many unsuccessful connect attempts, go back to redirector

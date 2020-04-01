@@ -400,7 +400,9 @@ cm2_ovsdb_insert_Wifi_Inet_Config(struct schema_Wifi_Master_State *master)
     icfg.ip_assign_scheme_exists = true;
     STRSCPY(icfg.ip_assign_scheme, "none");
 
-    LOGN("%s: Create new gre iface: %s", master->if_name, icfg.if_name);
+    LOGI("%s: Creating new gre iface: %s local addr: %s, remote_addr: %s, netmask: %s",
+         master->if_name, icfg.if_name, icfg.gre_local_inet_addr,
+         icfg.gre_remote_inet_addr, master->netmask);
 
     ret = ovsdb_table_upsert_simple(&table_Wifi_Inet_Config,
                                     SCHEMA_COLUMN(Wifi_Inet_Config, if_name),
@@ -993,6 +995,44 @@ void cm2_connection_recalculate_used_link(void) {
         cm2_check_master_state_links();
 }
 
+void cm2_ovsdb_connection_clean_link_counters(char *if_name)
+{
+    struct schema_Connection_Manager_Uplink uplink;
+    char   *filter[] = { "+",
+                         SCHEMA_COLUMN(Connection_Manager_Uplink, ntp_state),
+                         SCHEMA_COLUMN(Connection_Manager_Uplink, unreachable_link_counter),
+                         SCHEMA_COLUMN(Connection_Manager_Uplink, unreachable_router_counter),
+                         SCHEMA_COLUMN(Connection_Manager_Uplink, unreachable_cloud_counter),
+                         SCHEMA_COLUMN(Connection_Manager_Uplink, unreachable_internet_counter),
+                         NULL };
+    int    ret;
+
+    memset(&uplink, 0, sizeof(uplink));
+
+    LOGN("%s: Clean up link counters", if_name);
+
+    uplink.ntp_state = false;
+    uplink.ntp_state_exists = true;
+
+    uplink.unreachable_link_counter = -1;
+    uplink.unreachable_link_counter_exists = true;
+
+    uplink.unreachable_router_counter = -1;
+    uplink.unreachable_router_counter_exists = true;
+
+    uplink.unreachable_cloud_counter = -1;
+    uplink.unreachable_cloud_counter_exists = true;
+
+    uplink.unreachable_internet_counter = -1;
+    uplink.unreachable_internet_counter_exists = true;
+
+    ret = ovsdb_table_update_where_f(&table_Connection_Manager_Uplink,
+                                     ovsdb_where_simple(SCHEMA_COLUMN(Connection_Manager_Uplink, if_name), if_name),
+                                     &uplink, filter);
+    if (!ret)
+        LOGW("%s Update row failed for %s", __func__, if_name);
+}
+
 int cm2_ovsdb_ble_config_update(uint8_t ble_status)
 {
     struct schema_AW_Bluetooth_Config ble;
@@ -1090,6 +1130,9 @@ void callback_Wifi_Master_State(ovsdb_update_monitor_t *mon,
     if (ovsdb_update_changed(mon, SCHEMA_COLUMN(Wifi_Master_State, uplink_priority)))
         cm2_ovsdb_util_translate_master_priority(master);
 
+    if (ovsdb_update_changed(mon, SCHEMA_COLUMN(Wifi_Master_State, netmask)))
+        LOGI("%s: netmask changed %s", master->if_name, master->netmask);
+
     if (ovsdb_update_changed(mon, SCHEMA_COLUMN(Wifi_Master_State, if_name)))
         LOGD("%s if_name = %s changed not handled ", __func__, master->if_name);
 
@@ -1098,9 +1141,6 @@ void callback_Wifi_Master_State(ovsdb_update_monitor_t *mon,
 
     if (ovsdb_update_changed(mon, SCHEMA_COLUMN(Wifi_Master_State, if_uuid)))
         LOGD("%s if_uuid changed", __func__);
-
-    if (ovsdb_update_changed(mon, SCHEMA_COLUMN(Wifi_Master_State, netmask)))
-        LOGD("%s netmask = %s changed not handled", __func__, master->netmask);
 
     if (ovsdb_update_changed(mon, SCHEMA_COLUMN(Wifi_Master_State, dhcpc)))
         LOGD("%s dhcpc changed not handled", __func__);
@@ -1188,20 +1228,25 @@ cm2_Connection_Manager_Uplink_handle_update(
     }
 
     if (uplink->is_used) {
-      if (ovsdb_update_changed(mon, SCHEMA_COLUMN(Connection_Manager_Uplink, unreachable_router_counter))) {
-          cm2_ble_onboarding_set_status(uplink->unreachable_router_counter == 0, BLE_ONBOARDING_STATUS_ROUTER_OK);
-          cm2_ble_onboarding_apply_config();
-      }
+        bool ble_update = false;
 
-      if (ovsdb_update_changed(mon, SCHEMA_COLUMN(Connection_Manager_Uplink, unreachable_cloud_counter))) {
-          cm2_ble_onboarding_set_status(uplink->unreachable_cloud_counter == 0, BLE_ONBOARDING_STATUS_CLOUD_OK);
-          cm2_ble_onboarding_apply_config();
-      }
+        if (ovsdb_update_changed(mon, SCHEMA_COLUMN(Connection_Manager_Uplink, unreachable_router_counter))) {
+            cm2_ble_onboarding_set_status(uplink->unreachable_router_counter == 0, BLE_ONBOARDING_STATUS_ROUTER_OK);
+            ble_update = true;
+        }
 
-      if (ovsdb_update_changed(mon, SCHEMA_COLUMN(Connection_Manager_Uplink, unreachable_internet_counter))) {
-          cm2_ble_onboarding_set_status(uplink->unreachable_internet_counter == 0, BLE_ONBOARDING_STATUS_INTERNET_OK);
-          cm2_ble_onboarding_apply_config();
-      }
+        if (ovsdb_update_changed(mon, SCHEMA_COLUMN(Connection_Manager_Uplink, unreachable_cloud_counter))) {
+            cm2_ble_onboarding_set_status(uplink->unreachable_cloud_counter == 0, BLE_ONBOARDING_STATUS_CLOUD_OK);
+            ble_update = true;
+        }
+
+        if (ovsdb_update_changed(mon, SCHEMA_COLUMN(Connection_Manager_Uplink, unreachable_internet_counter))) {
+            cm2_ble_onboarding_set_status(uplink->unreachable_internet_counter == 0, BLE_ONBOARDING_STATUS_INTERNET_OK);
+            ble_update = true;
+        }
+
+        if (ble_update)
+            cm2_ble_onboarding_apply_config();
     }
     /* End of State part */
 

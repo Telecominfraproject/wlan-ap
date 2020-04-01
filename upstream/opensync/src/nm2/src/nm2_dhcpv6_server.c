@@ -402,6 +402,8 @@ void nm2_dhcpv6_server_options_update(uuidset_t *us, enum uuidset_event type, re
                     dco->dco_tag);
         }
     }
+
+    nm2_iface_apply(piface);
 }
 
 /*
