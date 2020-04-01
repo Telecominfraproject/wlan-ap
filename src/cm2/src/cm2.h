@@ -33,6 +33,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #ifdef BUILD_HAVE_LIBCARES
 #include "evx.h"
 #endif
+#include "target.h"
 
 #define IFNAME_SIZE 128 + 1
 #define IFTYPE_SIZE 128 + 1
@@ -237,6 +238,7 @@ void cm2_ovsdb_remove_unused_gre_interfaces(void);
 void cm2_ovsdb_connection_update_ble_phy_link(void);
 bool cm2_ovsdb_update_Port_tag(const char *ifname, int tag, bool set);
 bool cm2_ovsdb_connection_update_loop_state(const char *if_name, bool state);
+void cm2_ovsdb_connection_clean_link_counters(char *if_name);
 
 // addr resolve
 cm2_addr_t* cm2_get_addr(cm2_dest_e dest);
@@ -258,7 +260,7 @@ void cm2_free_addr_list(cm2_addr_t *addr);
 
 // stability and watchdog
 bool cm2_vtag_stability_check(void);
-void cm2_connection_stability_check(void);
+void cm2_connection_req_stability_check(target_connectivity_check_option_t opts);
 void cm2_stability_init(struct ev_loop *loop);
 void cm2_stability_close(struct ev_loop *loop);
 void cm2_wdt_init(struct ev_loop *loop);

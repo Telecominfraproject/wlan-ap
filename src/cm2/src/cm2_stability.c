@@ -28,7 +28,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "log.h"
 #include "schema.h"
-#include "target.h"
 #include "cm2.h"
 
 /* WATCHDOG CONFIGURATION */
@@ -138,10 +137,9 @@ static bool cm2_restore_connection(int cnt)
     return ret;
 }
 
-void cm2_connection_stability_check(void)
+void cm2_connection_req_stability_check(target_connectivity_check_option_t opts)
 {
     struct schema_Connection_Manager_Uplink con;
-    target_connectivity_check_option_t      opts;
     target_connectivity_check_t             cstate;
     cm2_main_link_type                      link_type;
     bool                                    ret;
@@ -167,25 +165,13 @@ void cm2_connection_stability_check(void)
         return;
     }
 
-    if (g_state.state == CM2_STATE_NTP_CHECK) {
-        opts = NTP_CHECK;
-    } else {
-        ret = cm2_cpu_is_low_loadavg();
-        if (!ret)
-            return;
-
-        opts = LINK_CHECK | ROUTER_CHECK | NTP_CHECK;
-        if (!g_state.connected)
-            opts |= INTERNET_CHECK;
-    }
-
     ret = target_device_connectivity_check(if_name, &cstate, opts);
     LOGN("Connection status %d, main link: %s opts: = %x", ret, if_name, opts);
 
     if (opts & LINK_CHECK) {
         counter = 0;
         if (!cstate.link_state) {
-            counter = con.unreachable_link_counter + 1;
+            counter = con.unreachable_link_counter < 0 ? 1 : con.unreachable_link_counter + 1;
             LOGW("Detected broken link. Counter = %d", counter);
         }
         ret = cm2_ovsdb_connection_update_unreachable_link_counter(if_name, counter);
@@ -195,7 +181,7 @@ void cm2_connection_stability_check(void)
     if (opts & ROUTER_CHECK) {
         counter = 0;
         if (!cstate.router_state) {
-            counter =  con.unreachable_router_counter + 1;
+            counter =  con.unreachable_router_counter < 0 ? 1 : con.unreachable_router_counter + 1;
             LOGW("Detected broken Router. Counter = %d", counter);
         }
         ret = cm2_ovsdb_connection_update_unreachable_router_counter(if_name, counter);
@@ -229,7 +215,7 @@ void cm2_connection_stability_check(void)
     if (opts & INTERNET_CHECK) {
         counter = 0;
         if (!cstate.internet_state) {
-            counter = con.unreachable_internet_counter + 1;
+            counter = con.unreachable_internet_counter < 0 ? 1 : con.unreachable_internet_counter + 1;
             LOGW("Detected broken Internet. Counter = %d", counter);
             if (counter % CM2_STABILITY_INTERNET_THRESH == 0) {
                 LOGN("Refresh br-wan interface due to Internet issue");
@@ -249,6 +235,20 @@ void cm2_connection_stability_check(void)
             g_state.ntp_check = cstate.ntp_state;
     }
     return;
+}
+
+static void cm2_connection_stability_check(void)
+{
+    target_connectivity_check_option_t opts;
+
+    if (!cm2_cpu_is_low_loadavg())
+        return;
+
+    opts = LINK_CHECK | ROUTER_CHECK | NTP_CHECK;
+    if (!g_state.connected)
+        opts |= INTERNET_CHECK;
+
+    cm2_connection_req_stability_check(opts);
 }
 
 void cm2_stability_cb(struct ev_loop *loop, ev_timer *watcher, int revents)

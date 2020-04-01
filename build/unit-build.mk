@@ -295,7 +295,7 @@ GEN_C_FLAGS = $$(CFLAGS) $(UNIT_CFLAGS) $$(foreach DEP,$$(sort $$(DEPS_$(UNIT_PA
 define UNIT_C_RULES
 # Single step dependency + compilation, generate the .d and .o file
 # at the same time; but include the .d file only if it exists.
-$(UNIT_BUILD)/%.o: %.c
+$(UNIT_BUILD)/%.o: %.c $(UNIT_PRE)
 	$$(NQ) " $(call color_compile,compile) [$(call COLOR_BOLD,$(UNIT_NAME))] $$<"
 	$$(Q)$$(CC) $(call GEN_C_FLAGS) $(1) $$< -MMD -c -o $$@
 

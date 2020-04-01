@@ -1471,6 +1471,8 @@ dns_free_req(struct fqdn_pending_req *req)
     int i;
 
     if (req->response != NULL) free(req->response);
+    if (req->rule_name != NULL) free(req->rule_name);
+    if (req->policy != NULL) free(req->policy);
 
     for (i = 0; i < req->ipv4_cnt; i++) free(req->ipv4_addrs[i]);
 

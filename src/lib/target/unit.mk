@@ -65,6 +65,7 @@ UNIT_DEPS_CFLAGS += src/lib/datapipeline
 #
 ifdef CONFIG_USE_KCONFIG
 $(eval $(if $(CONFIG_PML_TARGET),TARGET_COMMON_SRC += src/target_kconfig.c))
+$(eval $(if $(CONFIG_PML_TARGET),TARGET_COMMON_SRC += src/target_kconfig_managers.c))
 $(eval $(if $(CONFIG_PML_TARGET),UNIT_DEPS += src/lib/kconfig))
 endif
 

@@ -2,6 +2,20 @@ OpenSync™ Release Notes
 -----------------------
 
 
+### Release 1.4.0.1
+
+* Notable Enhancements
+    - OVSDB schema was updated with fields added in newer releases of OVS
+    - Handling of the Kconfig-driven `target_managers_config` table was changed
+      so that it can be overridden from the vendor, platform, or 3rdparty layer
+* Notable Fixes
+    - Fix for IPv6 address preferred lifetime not set correctly
+    - Fixed processing of IPv6 RDNSS in case of multiple entries
+    - Fix for DHCP options not applied immediately after being received
+    - Fixed code logic for reporting the onboarding status
+    - Fixed a potential 'use after free' problem when an FSM policy is removed
+
+
 ### Release 1.4.0.0
 
 * New Features

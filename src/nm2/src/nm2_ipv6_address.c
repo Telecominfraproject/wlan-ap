@@ -225,7 +225,6 @@ bool nm2_ipv6_address_update(
     {
         ip6->ip6_addr.ia6_pref_lft = lft;
     }
-    ip6->ip6_addr.ia6_pref_lft = lft;
 
     if (schema->valid_lifetime_exists && os_strtoul(schema->valid_lifetime, &lft, 0))
     {
