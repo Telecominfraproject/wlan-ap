@@ -25,7 +25,7 @@ if [ -z "$3" ]; then
     exit 1
 fi
 
-if [ -z 'ls $SDK_OUT_DIR/*' ]; then
+if [ ! "$(ls -A $SDK_OUT_DIR)" ]; then
     echo "Building OpenSync first"
     cd $SDK_PATH && make TARGET=$1 SDK_URL=$2
 else
