@@ -1,8 +1,9 @@
-.PHONY: all purge docker_console start_qemu
+.PHONY: all purge
 
 all:
-	./build.sh  $(TARGET) $(SDK_URL) $(PROFILE) $(IMAGE_URL)
+	./dock-run.sh ./build.sh  $(TARGET) $(SDK_URL) $(PROFILE) $(IMAGE_URL)
 
 purge:
 	rm -rf ./build
+	rm -rf ./example/build
 	@echo Done

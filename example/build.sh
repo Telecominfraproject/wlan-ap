@@ -35,9 +35,13 @@ if [ ! -d $BUILD_DIR ]; then
     echo "src-link kconfiglib $ROOT_PATH/feeds/lang" >> $BUILD_DIR/workdir/feeds.conf
     echo "src-link opensync $ROOT_PATH/feeds/network" >> $BUILD_DIR/workdir/feeds.conf
     git apply patch/opensync/core/01-add-lib-uci-to-wm2.patch --directory=opensync/core
-    git apply patch/opensync/core/02-wm2-write-temporary-change.patch --directory=opensync/core    
+    git apply patch/opensync/core/02-wm2-write-temporary-change.patch --directory=opensync/core
     $BUILD_DIR/workdir/scripts/feeds update -a
     $BUILD_DIR/workdir/scripts/feeds install -a
+    if [ "$1" = "IPQ40XX" ]; then
+        echo "Copying config file"
+        cp $ROOT_PATH/config/ipq40xx/ipq40xx.config $BUILD_DIR/workdir/.config
+    fi
     echo "Done"
 fi
 

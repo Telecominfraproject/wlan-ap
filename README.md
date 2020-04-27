@@ -21,7 +21,7 @@ The resulting image is found at 'build/workdir/bin/targets/ipq40xx/generic/'
  
 2) To build only the opensync package:
   cd example
-  make TARGET=IPQ40XX SDK_URL=https://downloads.openwrt.org/releases/19.07.2/targets/ipq40xx/generic/openwrt-sdk-19.07.2-ipq40xx-generic_gcc-7.5.0_musl_eabi.Linux-x86_64.tar.xz
+  make opensync TARGET=IPQ40XX SDK_URL=https://downloads.openwrt.org/releases/19.07.2/targets/ipq40xx/generic/openwrt-sdk-19.07.2-ipq40xx-generic_gcc-7.5.0_musl_eabi.Linux-x86_64.tar.xz
 
 This will install the OpenWrt SDK if it does not exist and build the opensync package.
 The resulting image is found at 'example/out'.
