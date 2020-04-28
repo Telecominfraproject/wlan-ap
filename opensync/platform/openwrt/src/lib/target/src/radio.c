@@ -33,7 +33,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #define DEFAULT_UCI_CONFIG_PATH /etc/config
 #define FILE_UCI_WIFI DEFAULT_UCI_CONFIG_PATH/wireless
-#define UCI_BUFFER_SIZE 80
 
 static bool needReset = true;  /* On start-up, we need to initialize DB from  the UCI */
 
@@ -271,6 +270,18 @@ bool target_radio_config_init2()
     struct schema_Wifi_Radio_Config rconfig;
     struct schema_Wifi_Radio_State  rstate;
 
+    target_map_init();
+
+    //Radio mappings
+    target_map_insert("wifi0", "radio1");
+    target_map_insert("wifi1", "radio2");
+    target_map_insert("wifi2", "radio0");
+
+    //VIF mappings
+    target_map_insert("home-ap-u50", "default_radio0");
+    target_map_insert("home-ap-24", "default_radio1");
+    target_map_insert("home-ap-l50", "default_radio2");
+
 #if 1
     ret = wifi_getRadioNumberOfEntries(&rnum);
     if (ret != UCI_OK)
@@ -371,44 +382,30 @@ bool target_radio_config_need_reset()
     return needReset;
 }
 
-static void radio_ifname_to_idx(const char* if_name, int* radioIndex)
+static void radio_ifname_to_idx(char* if_name, int* radioIndex)
 {
     // TODO: Quick hack.  This needs to be improved.
     *radioIndex = atoi(strndup(if_name + 5, 5));
 }
 
-static bool radio_change_channel(
-         int radioIndex,
-         int channel,
-         const char *ht_mode)
- {
-    char    uci_cmd[UCI_BUFFER_SIZE];
-    char    str[4];
-
-    snprintf(uci_cmd, sizeof(uci_cmd), "wireless.radio%d.channel", radioIndex);
-    sprintf(str, "%d", channel);
-
-    return uci_write(uci_cmd, str);
- }
-
- bool target_radio_config_set2(
+bool target_radio_config_set2(
      const struct schema_Wifi_Radio_Config *rconf,
      const struct schema_Wifi_Radio_Config_flags *changed)
  {
      int radioIndex;
 
-     radio_ifname_to_idx(rconf->if_name, &radioIndex);
+     radio_ifname_to_idx(target_map_ifname((char*)rconf->if_name), &radioIndex);
 
      if (changed->channel || changed->ht_mode)
      {
-         if (!radio_change_channel(radioIndex, rconf->channel, rconf->ht_mode))
+         if (!wifi_setRadioChannel(radioIndex, rconf->channel, rconf->ht_mode))
          {
              LOGE("%s: cannot change radio channel for %s", __func__, rconf->if_name);
              return false;
          }
      }
 
-     return true;
+     return radio_state_update(radioIndex);
  }
 
 bool radio_rops_vstate(struct schema_Wifi_VIF_State *vstate)

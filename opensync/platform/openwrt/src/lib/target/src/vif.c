@@ -1042,19 +1042,6 @@ static bool vif_ifname_to_idx(const char *ifname, int *outSsidIndex)
 
 }
 
-static bool wifi_setSSIDName(const char* ssidIfName, char* ssidName)
-{
-    char    uci_cmd[UCI_BUFFER_SIZE];
-    char    str[20];
-
-    snprintf(uci_cmd, sizeof(uci_cmd), "wireless.%s.ssid", ssidIfName);
-    sprintf(str, "%s", ssidName);
-
-    LOGN("wifi_setSSIDName %s %s", uci_cmd, str);
-
-    return uci_write(uci_cmd, str);
-}
-
 #if 0
 /* Returns true if any of the fields that need explicit applying changed */
 static bool should_apply(const struct schema_Wifi_VIF_Config_flags *changed)
@@ -1082,61 +1069,17 @@ bool target_vif_config_set2(
         int num_cconfs)
 {
     int  ssid_index;
-//    bool bval;
     int  ret;
-//    c_item_t *citem;
     char tmp[256];
-//    MeshWifiAPSecurity sec;
-    const char *ssid_ifname = target_map_ifname((char *)vconf->if_name);
+
+    const char *ssid_ifname = (char *)vconf->if_name;
 
     if (!vif_ifname_to_idx(ssid_ifname, &ssid_index))
     {
         LOGE("%s: cannot get index for %s", __func__, ssid_ifname);
         return false;
     }
-#if 0
-    if (!acl_apply(ssid_index, ssid_ifname, vconf))
-    {
-        LOGE("%s: cannot apply ACL for %s", __func__, ssid_ifname);
-        return false;
-    }
 
-    if (changed->ssid_broadcast)
-    {
-        if ((citem = c_get_item_by_str(map_enable_disable, vconf->ssid_broadcast)))
-        {
-            bval = citem->key ? TRUE : FALSE;
-            ret = wifi_setApSsidAdvertisementEnable(ssid_index, bval);
-            LOGD("[WIFI_HAL SET] wifi_setApSsidAdvertisementEnable(%d, %d) = %d",
-                                                    ssid_index, bval, ret);
-            if (ret != RETURN_OK)
-            {
-                LOGW("%s: Failed to set SSID Broadcast to '%d'", ssid_ifname, bval);
-            }
-            else
-            {
-                LOGI("%s: Updated SSID Broadcast to %d", ssid_ifname, bval);
-            }
-        }
-        else
-        {
-            LOGW("%s: Failed to decode ssid_broadcast \"%s\"",
-                 ssid_ifname, vconf->ssid_broadcast);
-        }
-    }
-
-    if (changed->vlan_id)
-    {
-        if (!target_map_update_vlan(vconf->if_name, vconf->vlan_id))
-        {
-            LOGW("%s: Failed to update VLAN to %u", ssid_ifname, vconf->vlan_id);
-        }
-        else
-        {
-            LOGI("%s: Updated VLAN to %u", ssid_ifname, vconf->vlan_id);
-        }
-    }
-#endif
     if (strlen(vconf->ssid) == 0)
     {
         LOGW("%s: vconf->ssid string is empty", ssid_ifname);
@@ -1152,99 +1095,6 @@ bool target_vif_config_set2(
         }
     }
 
-#if 0
-    if (changed->security && vconf->security_len)
-    {
-        memset(&sec, 0, sizeof(sec));
-        if (!security_to_syncmsg(vconf, &sec))
-        {
-            LOGW("%s: Failed to convert security for sync", ssid_ifname);
-        }
-        else
-        {
-            sec.index = ssid_index;
-
-            ret = wifi_setApSecurityModeEnabled(sec.index, sec.secMode);
-            LOGD("[WIFI_HAL SET] wifi_setApSecurityModeEnabled(%d, \"%s\") = %d",
-                 sec.index, sec.secMode, ret);
-            if (ret != RETURN_OK)
-            {
-                LOGW("%s: Failed to set new security mode to '%s'",
-                     ssid_ifname, sec.secMode);
-            }
-            else
-            {
-                if (strlen(sec.passphrase) == 0)
-                {
-                    LOGW("%s: security_to_syncmsg returned empty sec.passphrase", ssid_ifname);
-                }
-                else
-                {
-                    ret = wifi_setApSecurityKeyPassphrase(sec.index, sec.passphrase);
-                    LOGD("[WIFI_HAL SET] wifi_setApSecurityKeyPassphrase(%d, \"%s\") = %d",
-                         sec.index, sec.passphrase, ret);
-                    if (ret != RETURN_OK)
-                    {
-                        LOGW("%s: Failed to set new security passphrase", ssid_ifname);
-                    }
-                }
-                LOGI("%s: Security settings updated", ssid_ifname);
-
-                if (!sync_send_security_change(ssid_index, ssid_ifname, &sec))
-                {
-                    LOGW("%s: Failed to sync security change", ssid_ifname);
-                }
-            }
-        }
-    }
-
-
-    if (changed->enabled)
-    {
-        ret = wifi_setSSIDEnable(ssid_index, vconf->enabled);
-        LOGD("[WIFI_HAL SET] wifi_setSSIDEnable(%d, %d) = %d",
-                                 ssid_index, vconf->enabled, ret);
-        if (ret != RETURN_OK)
-        {
-            LOGW("%s: Failed to change enable to %d", ssid_ifname, vconf->enabled);
-        }
-    }
-
-    if (changed->ap_bridge)
-    {
-        ret = wifi_setApIsolationEnable(ssid_index, vconf->ap_bridge ? false : true);
-        LOGD("[WIFI_HAL SET] wifi_setApIsolationEnable(%d, %d) = %d",
-                                        ssid_index, !vconf->ap_bridge, ret);
-        if (ret != RETURN_OK)
-        {
-            LOGW("%s: Failed to change ap_bridge to %d", ssid_ifname, vconf->ap_bridge);
-        }
-    }
-
-    if (changed->rrm)
-    {
-        if (wifi_setNeighborReportActivation(ssid_index, vconf->rrm) != RETURN_OK)
-        {
-            LOGW("%s: Failed to change rrm to %d", ssid_ifname, vconf->rrm);
-        }
-    }
-
-    if (changed->btm)
-    {
-        if (wifi_setBSSTransitionActivation(ssid_index, vconf->btm) != RETURN_OK)
-        {
-            LOGW("%s: Failed to change btm to %d", ssid_ifname, vconf->btm);
-        }
-    }
-
-    if (should_apply(changed))
-    {
-        if (wifi_applySSIDSettings(ssid_index) != RETURN_OK)
-        {
-            LOGW("%s: Failed to apply SSID settings", ssid_ifname);
-        }
-    }
-#endif
     return vif_state_update(ssid_index);
 }
 
