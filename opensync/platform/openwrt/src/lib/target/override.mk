@@ -50,4 +50,5 @@ UNIT_SRC := $(filter-out src/target_dhcp.c,$(UNIT_SRC))
 UNIT_DEPS := $(filter-out src/lib/inet,$(UNIT_DEPS))
 UNIT_DEPS += src/lib/evsched
 UNIT_LDFLAGS += -luci
+UNIT_LDFLAGS += -libiwinfo
 UNIT_DEPS_CFLAGS += src/lib/inet
