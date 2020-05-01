@@ -58,6 +58,11 @@ target_managers_config_t target_managers_config[] =
         .name = TARGET_MANAGER_PATH("sm"),
         .needs_plan_b = false,
     },
+
+    {
+        .name = TARGET_MANAGER_PATH("qm"),
+        .needs_plan_b = false,
+    },
 };
 
 int target_managers_num = ARRAY_SIZE(target_managers_config);

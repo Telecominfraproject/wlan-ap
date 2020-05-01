@@ -27,7 +27,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "target.h"
 #include <stdio.h>
 #include <stdbool.h>
+#include "iwinfo.h"
 
+#define NUM_MAX_CLIENTS 10
 
 /*****************************************************************************
  *  INTERFACE definitions
@@ -90,27 +92,54 @@ bool target_stats_clients_get(
         ds_dlist_t *client_list,
         void *client_ctx)
 {
-    mac_address_t            mac             = {0xaa,0xbb,0xcc,0xdd,0xee,0xff};
-    ifname_t                 interface       = "br0";
-    target_client_record_t  *client_entry    = NULL;
+	char                     buf[IWINFO_BUFSIZE];
+	int                      len;
+	struct iwinfo_assoclist_entry  *assoc_client    = NULL;
+	target_client_record_t  *client_entry    = NULL;
 
-    client_entry = target_client_record_alloc();
+	// find iwinfo type
+	const char *if_type = iwinfo_type("wlan1");
+	const struct iwinfo_ops *winfo_ops = iwinfo_backend_by_name(if_type);
 
-    /* Insert dummy data for clients */
-    client_entry->info.type = RADIO_TYPE_2G;
-    memcpy(client_entry->info.mac, mac, sizeof(mac));
-    memcpy(client_entry->info.ifname, interface, sizeof(interface));
-    client_entry->stats.bytes_tx = 100;
-    client_entry->stats.bytes_rx = 200;
-    client_entry->stats.rssi = 80;
-    client_entry->stats.rate_tx = 1;
-    client_entry->stats.rate_rx = 2;
+	if(0 != winfo_ops->assoclist("wlan1", buf, &len))
+	{
+		return false;
+	}
 
-    ds_dlist_insert_tail(client_list, client_entry);
+	assoc_client = (struct iwinfo_assoclist_entry *)buf;
 
-    (*client_cb)(client_list, client_ctx, true);
+	LOGN("%s:%d radiocfg.ifname.%s len.%d", __func__, __LINE__, radio_cfg->if_name, len);
 
-    return true;
+	//add a for loop to traverse through the lists
+	for(int i = 0; i < len; i += sizeof(struct iwinfo_assoclist_entry))
+	{
+		//do all the copy stuff
+		client_entry = target_client_record_alloc();
+		client_entry->info.type = RADIO_TYPE_2G;
+		memcpy(client_entry->info.mac, assoc_client->mac, sizeof(assoc_client->mac));
+		memcpy(client_entry->info.ifname, radio_cfg->if_name, sizeof(radio_cfg->if_name));
+		client_entry->stats.bytes_tx = assoc_client->tx_bytes;
+		client_entry->stats.bytes_rx = assoc_client->rx_bytes;
+		client_entry->stats.rssi = assoc_client->signal;
+		client_entry->stats.rate_tx = assoc_client->tx_rate.rate;
+		client_entry->stats.rate_rx = assoc_client->tx_rate.rate;
+
+		ds_dlist_insert_tail(client_list, client_entry);
+
+		(*client_cb)(client_list, client_ctx, true);
+
+		LOGN("%s:%d mac.%02x:%02x:%02x:%02x:%02x:%02x", __func__, __LINE__,
+				assoc_client->mac[0],
+				assoc_client->mac[1],
+				assoc_client->mac[2],
+				assoc_client->mac[3],
+				assoc_client->mac[4],
+				assoc_client->mac[5]);
+		//move to next client
+		assoc_client++;
+	}
+
+	return true;
 }
 
 bool target_stats_clients_convert(
