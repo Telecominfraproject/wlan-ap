@@ -96,12 +96,36 @@ bool target_stats_clients_get(
 	int                      len;
 	struct iwinfo_assoclist_entry  *assoc_client    = NULL;
 	target_client_record_t  *client_entry    = NULL;
+	char stats_if_name[15];
+	radio_type_t radio_type;
+
+	memset(stats_if_name, 0, sizeof(stats_if_name));
+
+	if(strcmp(radio_cfg->if_name, "home-ap-24") == 0)
+	{
+		strncpy(stats_if_name, "wlan1", sizeof(stats_if_name));
+		radio_type = RADIO_TYPE_2G;
+	}
+	else if(strcmp(radio_cfg->if_name, "home-ap-l50") == 0)
+	{
+		strncpy(stats_if_name, "wlan2", sizeof(stats_if_name));
+		radio_type = RADIO_TYPE_5GL;
+	}
+	else if(strcmp(radio_cfg->if_name, "home-ap-u50") == 0)
+	{
+		strncpy(stats_if_name, "wlan0", sizeof(stats_if_name));
+		radio_type = RADIO_TYPE_5GU;
+	}
+	else
+	{
+		return true;
+	}
 
 	// find iwinfo type
-	const char *if_type = iwinfo_type("wlan1");
+	const char *if_type = iwinfo_type(stats_if_name);
 	const struct iwinfo_ops *winfo_ops = iwinfo_backend_by_name(if_type);
 
-	if(0 != winfo_ops->assoclist("wlan1", buf, &len))
+	if(0 != winfo_ops->assoclist(stats_if_name, buf, &len))
 	{
 		return false;
 	}
@@ -115,7 +139,7 @@ bool target_stats_clients_get(
 	{
 		//do all the copy stuff
 		client_entry = target_client_record_alloc();
-		client_entry->info.type = RADIO_TYPE_2G;
+		client_entry->info.type = radio_type;
 		memcpy(client_entry->info.mac, assoc_client->mac, sizeof(assoc_client->mac));
 		memcpy(client_entry->info.ifname, radio_cfg->if_name, sizeof(radio_cfg->if_name));
 		client_entry->stats.bytes_tx = assoc_client->tx_bytes;
