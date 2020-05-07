@@ -1,6 +1,6 @@
 # wlan-ap prototype build environment.
 
-This  environment will build an OpenWrt image for pre-candidate linksys_ea8300 that includes the OpenSync services and the required pre-requistites.
+This  environment will build a TIP based OpenWrt image for pre-candidate linksys_ea8300 that includes the OpenSync services and the required pre-requistites.
 Step 1:  Build the OpenSync services into a package using the OpenWrt SDK and the OpenWrt target library supplied by TIP wlan-ap (this) repo.
 Step 2:  Assemble an OpenWrt image for the target device using the OpenWrt Image Builder with the OpenSync package and selected package dependencies.
 
