@@ -25,18 +25,72 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 #include <stdio.h>
 #include <stdbool.h>
+#include <string.h>
+#include <target.h>
+#include "log.h"
+
+/* devinfo is /dev/mtd9 for IPQ40xx */
+static char devInfoFileName[] = "/dev/mtd9";
+#define DEV_INFO_RECORD_SZ 40
+static char devInfoModelNumber[DEV_INFO_RECORD_SZ];
+static char devInfoSerialNumber[DEV_INFO_RECORD_SZ];
+static bool devInfoModelNumber_saved = false;
+static bool devInfoSerialNumber_saved = false;
+
+char *get_devinfo_record( char * tag, char * payload, size_t payloadsz )
+{
+    FILE *devInfoFn = NULL;
+    char buffer[80];
+    char *tagPtr, *payloadPtr;
+    int bytesRead = 0;
+
+    if (tag == NULL)   return NULL;
+
+    devInfoFn = fopen(devInfoFileName, "r");
+    if (devInfoFn == NULL)   {
+        LOGE("File open failed %s %s", devInfoFileName, tag );
+        return NULL;
+    }
+    memset(buffer, 0, 80);
+    payload[0] = 0;
+
+    while ( bytesRead < 0x300 && !feof(devInfoFn)) {
+       fgets( buffer, 80, devInfoFn);
+       tagPtr = strstr(buffer, tag);
+       if (tagPtr != NULL)   {
+           strtok(tagPtr,"=");
+           payloadPtr = strtok(NULL, " \n\r");
+           LOGN ("devInfo %s %s", tag, payloadPtr);
+           strncpy(payload, payloadPtr, payloadsz);
+           break;
+       } else {
+           bytesRead += strlen(buffer);
+       }
+    }
+
+    fclose(devInfoFn);
+    return payload;
+}
 
 bool target_model_get(void *buff, size_t buffsz)
 {
-    snprintf(buff, buffsz, "%s", "OPENWRT_EA8300");
-
+    if (!devInfoModelNumber_saved)  {
+        if ( NULL == get_devinfo_record( "modelNumber=", devInfoModelNumber, DEV_INFO_RECORD_SZ))
+	   snprintf(devInfoModelNumber, DEV_INFO_RECORD_SZ, "%s", "TIP_EA8300");
+        devInfoModelNumber_saved = true; 
+    }
+    strncpy(buff, devInfoModelNumber, buffsz);
     return true;
 }
 
 bool target_serial_get(void *buff, size_t buffsz)
 {
-    snprintf(buff, buffsz, "%s", "LinkSys-Rick-01");
-
+    if (!devInfoSerialNumber_saved)  {
+        if ( NULL == get_devinfo_record( "serial_number=", devInfoSerialNumber, DEV_INFO_RECORD_SZ))
+            snprintf(devInfoSerialNumber, DEV_INFO_RECORD_SZ, "%s", "LinkSys-TIP-01");
+        devInfoSerialNumber_saved = true;
+    }
+    strncpy(buff, devInfoSerialNumber, buffsz);
     return true;
 }
 
