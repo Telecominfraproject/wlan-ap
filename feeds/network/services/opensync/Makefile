@@ -22,9 +22,9 @@ endef
 
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
+	cp -ra $(OPENSYNC_SRC)/opensync $(PKG_BUILD_DIR)
 	cp -ra $(OPENSYNC_SRC)/.git $(PKG_BUILD_DIR)
 	cp -ra $(OPENSYNC_SRC)/.gitmodules $(PKG_BUILD_DIR)
-	cp -ra $(OPENSYNC_SRC)/opensync $(PKG_BUILD_DIR)
 endef
 
 define Build/Compile

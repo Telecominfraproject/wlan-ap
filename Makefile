@@ -1,9 +1,9 @@
-.PHONY: all purge
+.PHONY: all clean purge
 
 all:
-	./dock-run.sh ./build.sh  $(TARGET) $(SDK_URL) $(PROFILE) $(IMAGE_URL)
+	./dock-run.sh ./build.sh  $(TARGET) $(SDK_URL)
 
 purge:
-	rm -rf ./build
+	cd openwrt && rm -rf * && rm -rf .*
 	rm -rf ./example/build
 	@echo Done
