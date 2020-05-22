@@ -22,6 +22,7 @@ int wifi_getRadioEnable(int radio_idx, bool *enabled);
  *  Functions to set Radio parameters
  */
 bool wifi_setRadioChannel(int radioIndex, int channel, const char *ht_mode);
+bool wifi_setRadioEnabled(int radioIndex, bool enabled);
 
 /*
  *  Functions to retrieve SSID parameters

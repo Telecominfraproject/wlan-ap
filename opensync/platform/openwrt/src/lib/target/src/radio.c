@@ -393,6 +393,7 @@ bool target_radio_config_set2(
      const struct schema_Wifi_Radio_Config_flags *changed)
  {
      int radioIndex;
+     bool rc = true;
 
      radio_ifname_to_idx(target_map_ifname((char*)rconf->if_name), &radioIndex);
 
@@ -401,10 +402,21 @@ bool target_radio_config_set2(
          if (!wifi_setRadioChannel(radioIndex, rconf->channel, rconf->ht_mode))
          {
              LOGE("%s: cannot change radio channel for %s", __func__, rconf->if_name);
-             return false;
+             rc = false;
          }
      }
 
+     if (changed->enabled)
+     {
+        if (!wifi_setRadioEnabled(radioIndex, rconf->enabled))
+        {
+            LOGE("%s: cannot enable/disable radio for %s", __func__, rconf->if_name);
+            rc = false;
+        }
+     }
+     
+     if (rc==false) LOGE("Radio config partially applied for %s", rconf->if_name);
+	
      return radio_state_update(radioIndex);
  }
 

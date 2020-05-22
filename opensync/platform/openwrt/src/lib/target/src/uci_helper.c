@@ -220,7 +220,7 @@ int wifi_getRadioEnable(int radio_idx, bool *enabled )
 }
 
 bool wifi_setRadioChannel(int radioIndex, int channel, const char *ht_mode)
- {
+{
     char    uci_cmd[UCI_BUFFER_SIZE];
     char    str[4];
 
@@ -228,7 +228,22 @@ bool wifi_setRadioChannel(int radioIndex, int channel, const char *ht_mode)
     sprintf(str, "%d", channel);
 
     return uci_write(uci_cmd, str);
- }
+}
+
+bool wifi_setRadioEnabled(int radioIndex, bool enabled)
+{
+    char    uci_cmd[UCI_BUFFER_SIZE];
+    char    disabled[4];
+
+    snprintf(uci_cmd, sizeof(uci_cmd), "wireless.radio%d.disabled", radioIndex);
+    if (enabled) {
+        sprintf(disabled, "%d", 0);
+    } else {
+        sprintf(disabled, "%d", 1);
+    }
+
+    return uci_write(uci_cmd, disabled);
+}
 
 /*
  * SSID UCI interfaces
