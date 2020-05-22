@@ -43,6 +43,7 @@ char *get_devinfo_record( char * tag, char * payload, size_t payloadsz )
     char buffer[80];
     char *tagPtr, *payloadPtr;
     int bytesRead = 0;
+    bool record_found = false;
 
     if (tag == NULL)   return NULL;
 
@@ -62,6 +63,7 @@ char *get_devinfo_record( char * tag, char * payload, size_t payloadsz )
            payloadPtr = strtok(NULL, " \n\r");
            LOGN ("devInfo %s %s", tag, payloadPtr);
            strncpy(payload, payloadPtr, payloadsz);
+           record_found = true;
            break;
        } else {
            bytesRead += strlen(buffer);
@@ -69,14 +71,18 @@ char *get_devinfo_record( char * tag, char * payload, size_t payloadsz )
     }
 
     fclose(devInfoFn);
-    return payload;
+    if (record_found) {
+        return payload;
+    } else {
+        return NULL;
+    }
 }
 
 bool target_model_get(void *buff, size_t buffsz)
 {
     if (!devInfoModelNumber_saved)  {
         if ( NULL == get_devinfo_record( "modelNumber=", devInfoModelNumber, DEV_INFO_RECORD_SZ))
-	   snprintf(devInfoModelNumber, DEV_INFO_RECORD_SZ, "%s", "TIP_EA8300");
+	   snprintf(devInfoModelNumber, DEV_INFO_RECORD_SZ, "%s", "TIP_AP");
         devInfoModelNumber_saved = true; 
     }
     strncpy(buff, devInfoModelNumber, buffsz);
