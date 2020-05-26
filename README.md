@@ -1,7 +1,10 @@
 # wlan-ap prototype build environment.
 
-The build environment will create a TIP based OpenWrt image for pre-candidate linksys_ea8300 that includes the OpenSync services and the required pre-requisites.  The required command is:
+The build environment will create a TIP based OpenWrt image that includes the OpenSync services and the required pre-requisites.  The required command is:
+EA8300: 
  make TARGET=IPQ40XX
+ECW5410:
+ make TARGET=ECW5410
 
 NOTE: The SDK_URL is no longer used in the build.  The parameter is retained to ensure the automated build is not disrupted.
 
