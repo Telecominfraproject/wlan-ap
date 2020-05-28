@@ -306,8 +306,40 @@ bool target_stats_device_temp_get(
         radio_entry_t *radio_cfg,
         dpp_device_temp_t *temp_entry)
 {
+    int32_t temperature;
+    FILE *fp = NULL;
+
+    if(strcmp(radio_cfg->if_name, "home-ap-24") == 0)
+    {
+      fp = fopen("/sys/class/hwmon/hwmon0/temp1_input","r");
+    }
+    else if(strcmp(radio_cfg->if_name, "home-ap-l50") == 0)
+    {
+     fp = fopen("/sys/class/hwmon/hwmon1/temp1_input","r");
+    }
+    else if(strcmp(radio_cfg->if_name, "home-ap-u50") == 0)
+    {
+      fp = fopen("/sys/class/hwmon/hwmon2/temp1_input","r");
+    }
+
+    if(fp==NULL)
+    {
+      LOG(ERR,"Failed to open temp input files");
+      return false;
+    }
+
+    if(fscanf(fp,"%d",&temperature) == EOF)
+    {
+      LOG(ERR,"Temperature reading failed");
+      fclose(fp);
+      return false;
+    }
+
+    LOGN("temperature : %d", temperature);
+
+    fclose(fp);
     temp_entry->type  = radio_cfg->type;
-    temp_entry->value = 42;
+    temp_entry->value = (temperature/1000);
 
     return true;
 }
