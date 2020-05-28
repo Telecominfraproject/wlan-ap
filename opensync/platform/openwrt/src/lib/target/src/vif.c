@@ -954,7 +954,7 @@ bool vif_state_get(int ssidIndex, struct schema_Wifi_VIF_State *vstate)
     ret = wifi_getBaseBSSID(ssidIndex, buf, sizeof(buf));
     if (ret != UCI_OK)
     {
-        LOGW("%s: Failed to get base BSSID (mac)", ssid_ifname);
+        LOGN("%s: Failed to get base BSSID (mac)", ssid_ifname);
     }
     else
     {
@@ -1088,7 +1088,7 @@ bool target_vif_config_set2(
     {
         memset(tmp, 0, sizeof(tmp));
         snprintf(tmp, sizeof(tmp) - 1, "%s", vconf->ssid);
-        ret = wifi_setSSIDName(ssid_ifname, tmp);
+        ret = wifi_setSSIDName(ssid_index, tmp);
         if (ret != true)
         {
             LOGW("%s: Failed to set new SSID '%s'", ssid_ifname, tmp);

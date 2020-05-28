@@ -6,9 +6,6 @@
 
 #define UCI_BUFFER_SIZE 80
 
-bool uci_read(char *uci_path, char *uci_result, size_t len);
-bool uci_write(char *uci_path, char *uci_value);
-
 /*
  *  Functions to retrieve Radio parameters
  */
@@ -17,12 +14,16 @@ int wifi_getRadioIfName(int radio_idx, char *radio_ifname, size_t radio_ifname_l
 int wifi_getRadioChannel(int radio_idx, int *channel);
 int wifi_getRadioHwMode(int radio_idx, char* hwMode, size_t hwMode_len);
 int wifi_getRadioEnable(int radio_idx, bool *enabled);
+int wifi_getRadioTxPower(int radio_idx, int *txpower );
+int wifi_getRadioBeaconInterval(int radio_idx, int *beacon_int);
 
 /*
  *  Functions to set Radio parameters
  */
 bool wifi_setRadioChannel(int radioIndex, int channel, const char *ht_mode);
 bool wifi_setRadioEnabled(int radioIndex, bool enabled);
+bool wifi_setRadioTxPower(int radioIndex, int txpower);
+bool wifi_setRadioBeaconInterval(int radioIndex, int beacon_int);
 
 /*
  *  Functions to retrieve SSID parameters
@@ -41,7 +42,7 @@ int wifi_getBaseBSSID(int ssid_index,char *buf, size_t buf_len);
 /*
  *  Functions to set SSID parameters
  */
-bool wifi_setSSIDName(const char* ssidIfName, char* ssidName);
+bool wifi_setSSIDName(int ssis_index, char* ssidName);
 
 /*
  * Functions to access OVSDB callbacks

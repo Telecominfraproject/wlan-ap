@@ -31,9 +31,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "evsched.h"
 #include "uci_helper.h"
 
-#define DEFAULT_UCI_CONFIG_PATH /etc/config
-#define FILE_UCI_WIFI DEFAULT_UCI_CONFIG_PATH/wireless
-
 static bool needReset = true;  /* On start-up, we need to initialize DB from  the UCI */
 
 static struct target_radio_ops g_rops;
@@ -53,27 +50,42 @@ static bool radio_state_get(
 
     if (UCI_OK == wifi_getRadioIfName(radioIndex, rstate->if_name, sizeof(rstate->if_name))) {
         rstate->if_name_exists = true;
-        LOGN("UCI radio if_name: %s", rstate->if_name);
+        LOGN("radio if_name: %s", rstate->if_name);
     }
 
     if (UCI_OK == wifi_getRadioHwMode(radioIndex, rstate->hw_mode, sizeof(rstate->hw_mode))) {
         rstate->hw_mode_exists = true;
-        LOGN("UCI radio hw_mode: %s", rstate->hw_mode);
+        LOGN("radio hw_mode: %s", rstate->hw_mode);
     }
 
     if (UCI_OK == wifi_getRadioChannel(radioIndex, &(rstate->channel))) {
         rstate->channel_exists = true;
-        LOGN("UCI radio channel: %d", rstate->channel);
+        LOGN("radio channel: %d", rstate->channel);
     }
 
     if (UCI_OK == wifi_getRadioEnable(radioIndex, &(rstate->enabled))) {
         rstate->enabled_exists = true;
-        LOGN("UCI radio enabled %d", rstate->enabled);
+        LOGN("radio enabled %d", rstate->enabled);
     }
 
     /* tx_power gets boundary checked between 1 .. 32 */
-    rstate->tx_power = 1;
-    rstate->tx_power_exists = true;
+    if (UCI_OK == wifi_getRadioTxPower(radioIndex, &(rstate->tx_power))) {
+        rstate->tx_power_exists = true;
+        LOGN("radio tx_power: %d", rstate->tx_power);
+        /* 0 means max in UCI, 32 is max in OVSDB */
+        if (rstate->tx_power == 0)	rstate->tx_power = 32;
+    } else {
+        rstate->tx_power = 32;
+        rstate->tx_power_exists = true;
+    }
+
+    if (UCI_OK == wifi_getRadioBeaconInterval(radioIndex, &(rstate->bcn_int))) {
+        rstate->bcn_int_exists = true;
+        LOGN("radio beacon interval: %d", rstate->bcn_int);
+    } else {
+        rstate->bcn_int = 100;
+        rstate->bcn_int_exists = true;
+    }
 
     switch (radioIndex) {
 	case 0:
@@ -414,7 +426,28 @@ bool target_radio_config_set2(
             rc = false;
         }
      }
-     
+
+     if (changed->tx_power)
+     {
+         if (!wifi_setRadioTxPower(radioIndex, rconf->tx_power))
+         {
+            LOGE("%s: cannot set radio tx power for %s", __func__, rconf->if_name);
+            rc = false;
+         }
+     }
+
+    
+     if (changed->bcn_int)
+     {
+         int beacon_interval = rconf->bcn_int;
+         if ((rconf->bcn_int < 50) || (rconf->bcn_int > 400))	beacon_interval = 100;
+         if (!wifi_setRadioBeaconInterval(radioIndex, beacon_interval))
+         {
+            LOGE("%s: cannot set beacon interval radio for %s", __func__, rconf->if_name);
+            rc = false;
+         }
+     }
+
      if (rc==false) LOGE("Radio config partially applied for %s", rconf->if_name);
 	
      return radio_state_update(radioIndex);
