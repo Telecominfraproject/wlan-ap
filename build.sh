@@ -43,6 +43,11 @@ if [ ! "$(ls -A $BUILD_DIR)" ]; then
         cp ../patch/openwrt/ecw5410/board-edgecore_ecw5410.qca9984 $BUILD_DIR/package/firmware/ipq-wifi
     fi
 
+    if [ "$1" = "AP2220" ]; then
+        DIFFCONFIG=ap2220_config
+        git apply ../patch/openwrt/ap2220/0001-tp-link-ap2220-support.patch
+        cp ../patch/openwrt/ap2220/board-tp-link_ap2220.bin $BUILD_DIR/package/firmware/ipq-wifi/
+    fi
     cd $BUILD_DIR
     ./scripts/feeds update -a
     ./scripts/feeds install -a
