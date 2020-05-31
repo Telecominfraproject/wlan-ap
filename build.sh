@@ -48,6 +48,13 @@ if [ ! "$(ls -A $BUILD_DIR)" ]; then
         git apply ../patch/openwrt/ap2220/0001-tp-link-ap2220-support.patch
         cp ../patch/openwrt/ap2220/board-tp-link_ap2220.bin $BUILD_DIR/package/firmware/ipq-wifi/
     fi
+
+    if [ "$1" = "ECW5211" ]; then
+        DIFFCONFIG=ecw5211_config
+        git apply ../patch/openwrt/ecw5211/0001-ipq40xx-add-Edgecore-ECW5211-support.patch
+        cp ../patch/openwrt/ecw5211/board-edgecore_ecw5211.qca4019 $BUILD_DIR/package/firmware/ipq-wifi/
+    fi
+
     cd $BUILD_DIR
     ./scripts/feeds update -a
     ./scripts/feeds install -a

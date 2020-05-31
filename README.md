@@ -1,10 +1,25 @@
 # wlan-ap prototype build environment.
 
 The build environment will create a TIP based OpenWrt image that includes the OpenSync services and the required pre-requisites.  The required command is:
-EA8300: 
+
+- Linksys EA8300:
+```
  make TARGET=IPQ40XX
-ECW5410:
+```
+- Edge-core ECW5410:
+```
  make TARGET=ECW5410
+```
+
+- Edge-core ECW5211:
+```
+make TARGET=ECW5211
+```
+
+- TP-Link AP2220
+```
+make TARGET=AP2220
+```
 
 NOTE: The SDK_URL is no longer used in the build.  The parameter is retained to ensure the automated build is not disrupted.
 
