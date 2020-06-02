@@ -380,3 +380,54 @@ bool wifi_setSSIDName(int ssid_index, char* ssidName)
 {
     return uci_write(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "ssid", ssidName);
 }
+
+bool wifi_setApSecurityModeEnabled(int ssid_index,
+        const struct schema_Wifi_VIF_Config *vconf)
+{
+    bool rc = true;
+    if (strcmp(vconf->security[0], OVSDB_SECURITY_ENCRYPTION_OPEN) == 0)
+    {
+        if (!uci_write(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "encryption", "none"))
+        {
+            rc = false;
+        }
+    }
+    else if (strcmp(vconf->security[0], OVSDB_SECURITY_ENCRYPTION_WPA_PSK) == 0)
+    {
+        char key[128];
+        memset(key, 0, sizeof(key));
+        snprintf(key, sizeof(key) - 1, "%s", vconf->security[1]);
+
+        if(!uci_write(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "key", key))
+        {
+            rc = false;
+        }
+
+        if (strcmp(vconf->security[2], OVSDB_SECURITY_MODE_WPA2) == 0)
+        {
+            if(!uci_write(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "encryption", "psk2"))
+            {
+                rc = false;
+            }
+        }
+        else if (strcmp(vconf->security[2], OVSDB_SECURITY_MODE_MIXED) == 0)
+        {
+            if(!uci_write(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "encryption", "psk-mixed"))
+            {
+                rc = false;
+            }
+        }
+    }
+
+    return rc;
+}
+
+bool wifi_getApSecurityModeEnabled(int ssid_index, char *buf, size_t buf_len)
+{
+    return(uci_read(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "encryption", buf, buf_len));
+}
+
+int wifi_getApSecurityKeyPassphrase(int ssid_index, char *buf, size_t buf_len)
+{
+    return(uci_read(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "key", buf, buf_len));
+}

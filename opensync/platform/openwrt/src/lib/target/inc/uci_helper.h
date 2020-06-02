@@ -5,7 +5,24 @@
 #include "uci.h"
 
 #define UCI_BUFFER_SIZE 80
+#define DEFAULT_ENC_MODE        "TKIPandAESEncryption"
 
+#define OVSDB_SECURITY_KEY                  "key"
+#define OVSDB_SECURITY_OFTAG                "oftag"
+#define OVSDB_SECURITY_MODE                 "mode"
+#define OVSDB_SECURITY_MODE_WEP64           "64"
+#define OVSDB_SECURITY_MODE_WEP128          "128"
+#define OVSDB_SECURITY_MODE_WPA1            "1"
+#define OVSDB_SECURITY_MODE_WPA2            "2"
+#define OVSDB_SECURITY_MODE_MIXED           "mixed"
+#define OVSDB_SECURITY_ENCRYPTION           "encryption"
+#define OVSDB_SECURITY_ENCRYPTION_OPEN      "OPEN"
+#define OVSDB_SECURITY_ENCRYPTION_WEP       "WEP"
+#define OVSDB_SECURITY_ENCRYPTION_WPA_PSK   "WPA-PSK"
+#define OVSDB_SECURITY_ENCRYPTION_WPA_EAP   "WPA-EAP"
+#define OVSDB_SECURITY_RADIUS_SERVER_IP     "radius_server_ip"
+#define OVSDB_SECURITY_RADIUS_SERVER_PORT   "radius_server_port"
+#define OVSDB_SECURITY_RADIUS_SERVER_SECRET "radius_server_secret"
 /*
  *  Functions to retrieve Radio parameters
  */
@@ -38,12 +55,14 @@ int wifi_getApBridgeInfo(int ssid_index, char *bridge_info, char *tmp1, char *tm
 int wifi_getApIsolationEnable(int ssid_index, bool *enabled);
 int wifi_getApSsidAdvertisementEnable(int ssid_index, bool *enabled);
 int wifi_getBaseBSSID(int ssid_index,char *buf, size_t buf_len);
+int wifi_getApSecurityKeyPassphrase(int ssid_index, char *buf, size_t buf_len);
+bool wifi_getApSecurityModeEnabled(int ssid_index, char *buf, size_t buf_len);
 
 /*
  *  Functions to set SSID parameters
  */
 bool wifi_setSSIDName(int ssis_index, char* ssidName);
-
+bool wifi_setApSecurityModeEnabled(int ssid_index, const struct schema_Wifi_VIF_Config *vconf);
 /*
  * Functions to access OVSDB callbacks
  */

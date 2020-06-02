@@ -83,26 +83,7 @@ static c_item_t map_acl_modes[] =
     C_ITEM_STR(WEXT_ACL_MODE_BLACKLIST, "blacklist"),
     C_ITEM_STR(WEXT_ACL_MODE_FLUSH,     "flush")
 };
-
-#define DEFAULT_ENC_MODE        "TKIPandAESEncryption"
-
-#define OVSDB_SECURITY_KEY                  "key"
-#define OVSDB_SECURITY_OFTAG                "oftag"
-#define OVSDB_SECURITY_MODE                 "mode"
-#   define OVSDB_SECURITY_MODE_WEP64           "64"
-#   define OVSDB_SECURITY_MODE_WEP128          "128"
-#   define OVSDB_SECURITY_MODE_WPA1            "1"
-#   define OVSDB_SECURITY_MODE_WPA2            "2"
-#   define OVSDB_SECURITY_MODE_MIXED           "mixed"
-#define OVSDB_SECURITY_ENCRYPTION           "encryption"
-#   define OVSDB_SECURITY_ENCRYPTION_OPEN      "OPEN"
-#   define OVSDB_SECURITY_ENCRYPTION_WEP       "WEP"
-#   define OVSDB_SECURITY_ENCRYPTION_WPA_PSK   "WPA-PSK"
-#   define OVSDB_SECURITY_ENCRYPTION_WPA_EAP   "WPA-EAP"
-#define OVSDB_SECURITY_RADIUS_SERVER_IP     "radius_server_ip"
-#define OVSDB_SECURITY_RADIUS_SERVER_PORT   "radius_server_port"
-#define OVSDB_SECURITY_RADIUS_SERVER_SECRET "radius_server_secret"
-
+#endif
 typedef enum
 {
     SEC_NONE                = 0,
@@ -118,17 +99,18 @@ typedef enum
 
 static c_item_t map_security[] =
 {
-    C_ITEM_STR(SEC_NONE,                    "None"),
+    C_ITEM_STR(SEC_NONE,                    "none"),
     C_ITEM_STR(SEC_WEP_64,                  "WEP-64"),
     C_ITEM_STR(SEC_WEP_128,                 "WEP-128"),
-    C_ITEM_STR(SEC_WPA_PERSONAL,            "WPA-Personal"),
+    C_ITEM_STR(SEC_WPA_PERSONAL,            "psk"),
     C_ITEM_STR(SEC_WPA_ENTERPRISE,          "WPA-Enterprise"),
-    C_ITEM_STR(SEC_WPA2_PERSONAL,           "WPA2-Personal"),
+    C_ITEM_STR(SEC_WPA2_PERSONAL,           "psk2"),
     C_ITEM_STR(SEC_WPA2_ENTERPRISE,         "WPA2-Enterprise"),
     C_ITEM_STR(SEC_WPA_WPA2_PERSONAL,       "WPA-WPA2-Personal"),
     C_ITEM_STR(SEC_WPA_WPA2_ENTERPRISE,     "WPA-WPA2-Enterprise")
 };
 
+#if 0
 static bool acl_to_state(
         INT ssid_index,
         char *ssid_ifname,
@@ -254,9 +236,8 @@ static bool acl_apply(
 
     return true;
 }
-#endif
 
-#if 0
+
 static const char* security_conf_find_by_key(
         const struct schema_Wifi_VIF_Config *vconf,
         char *key)
@@ -273,7 +254,7 @@ static const char* security_conf_find_by_key(
 
     return NULL;
 }
-
+#endif
 static int set_security_key_value(
         struct schema_Wifi_VIF_State *vstate,
         int index,
@@ -295,11 +276,11 @@ static bool set_personal_credentials(
         int ssid_index)
 {
     int ret;
-    char buf[WIFIHAL_MAX_BUFFER];
+    char buf[UCI_BUFFER_SIZE];
 
     memset(buf, 0, sizeof(buf));
-    ret = wifi_getApSecurityKeyPassphrase(ssid_index, buf);
-    if (ret != RETURN_OK)
+    ret = wifi_getApSecurityKeyPassphrase(ssid_index, buf, sizeof(buf));
+    if (ret != UCI_OK)
     {
         LOGE("%s: Failed to retrieve security passphrase", vstate->if_name);
         return false;
@@ -325,16 +306,17 @@ static bool set_enterprise_credentials(
         int index,
         int ssid_index)
 {
+#if 0
     int ret;
-    char radius_ip[WIFIHAL_MAX_BUFFER];
-    char radius_secret[WIFIHAL_MAX_BUFFER];
-    char radius_port_str[WIFIHAL_MAX_BUFFER];
+    char radius_ip[UCI_BUFFER_SIZE];
+    char radius_secret[UCI_BUFFER_SIZE];
+    char radius_port_str[UCI_BUFFER_SIZE];
     unsigned int radius_port;
 
     memset(radius_ip, 0, sizeof(radius_ip));
     memset(radius_secret, 0, sizeof(radius_secret));
     ret = wifi_getApSecurityRadiusServer(ssid_index, radius_ip, &radius_port, radius_secret);
-    if (ret != RETURN_OK)
+    if (ret != UCI_OK)
     {
         LOGE("%s: Failed to retrieve radius settings", vstate->if_name);
         return false;
@@ -347,7 +329,7 @@ static bool set_enterprise_credentials(
     index = set_security_key_value(vstate, index, OVSDB_SECURITY_RADIUS_SERVER_PORT, radius_port_str);
 
     set_security_key_value(vstate, index, OVSDB_SECURITY_RADIUS_SERVER_SECRET, radius_secret);
-
+#endif
     return true;
 }
 
@@ -373,18 +355,18 @@ static bool set_enc_mode(
 }
 
 static bool security_to_state(
-        INT ssid_index,
+        int ssid_index,
         char *ssid_ifname,
         struct schema_Wifi_VIF_State *vstate)
 {
     sec_type_t              stype;
     c_item_t                *citem;
-    char                    buf[WIFIHAL_MAX_BUFFER];
+    char                    buf[UCI_BUFFER_SIZE];
     int                     ret;
 
     memset(buf, 0, sizeof(buf));
-    ret = wifi_getApSecurityModeEnabled(ssid_index, buf);
-    if (ret != RETURN_OK)
+    ret = wifi_getApSecurityModeEnabled(ssid_index, buf, sizeof(buf));
+    if (ret != UCI_OK)
     {
         LOGE("%s: Failed to get security mode", ssid_ifname);
         return false;
@@ -434,7 +416,7 @@ static bool security_to_state(
 
     return true;
 }
-
+#if 0
 static bool security_to_syncmsg(
         const struct schema_Wifi_VIF_Config *vconf,
         MeshWifiAPSecurity *dest)
@@ -857,13 +839,13 @@ bool vif_state_get(int ssidIndex, struct schema_Wifi_VIF_State *vstate)
         SCHEMA_SET_STR(vstate->ssid, buf);
     }
 
-#if 0
+
     // security, security_keys, security_len
     if (!security_to_state(ssidIndex, ssid_ifname, vstate))
     {
         LOGW("%s: cannot get security for %s", __func__, ssid_ifname);
     }
-
+#if 0
     // mac_list_type (w/ exists)
     // mac_list, mac_list_len
     if (!acl_to_state(ssidIndex, ssid_ifname, vstate))
@@ -878,9 +860,6 @@ bool vif_state_get(int ssidIndex, struct schema_Wifi_VIF_State *vstate)
         return false;
     }
 #endif
-    strscpy(vstate->security_keys[0], "encryption", sizeof(vstate->security_keys[0]));
-    strscpy(vstate->security[0], "OPEN", sizeof(vstate->security[0]));
-    vstate->security_len = 1;
 
     strscpy(vstate->mac_list_type, "none", sizeof(vstate->mac_list_type));
     vstate->mac_list_len = 0;
@@ -1091,7 +1070,16 @@ bool target_vif_config_set2(
         ret = wifi_setSSIDName(ssid_index, tmp);
         if (ret != true)
         {
-            LOGW("%s: Failed to set new SSID '%s'", ssid_ifname, tmp);
+            LOGE("%s: Failed to set new SSID '%s'", ssid_ifname, tmp);
+        }
+    }
+
+    if (changed->security)
+    {
+        ret = wifi_setApSecurityModeEnabled(ssid_index, vconf);
+        if (ret != true)
+        {
+            LOGE("%s: Failed to set new encryption", ssid_ifname);
         }
     }
 
@@ -1114,5 +1102,3 @@ bool vif_state_update(int ssidIndex)
     return radio_rops_vstate(&vstate);
 }
 
-
-// UCI functions
