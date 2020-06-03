@@ -16,7 +16,7 @@ The build environment will create a TIP based OpenWrt image that includes the Op
 make TARGET=ECW5211
 ```
 
-- TP-Link AP2220
+- TP-Link AP2220:
 ```
 make TARGET=AP2220
 ```
@@ -25,13 +25,22 @@ NOTE: The SDK_URL is no longer used in the build.  The parameter is retained to 
 
 The resulting image is found at 'wlan-ap/openwrt/bin/targets/ipq40xx/generic'.
 
-The standalone OpenSync image is no longer required by the build process.  However, it can be can be built by 'cd example' and executing:
-make opensync TARGET=IPQ40XX SDK_URL=https://downloads.openwrt.org/releases/19.07.2/targets/ipq40xx/generic/openwrt-sdk-19.07.2-ipq40xx-generic_gcc-7.5.0_musl_eabi.Linux-x86_64.tar.xz
+## Building OpenSync and generating ipk
 
-The resulting image is found at 'wlan-ap/example/out'.
+- First build complete TIP based OpenWrt image following the instructions in the section above.
+- Re-build OpenSync and generate ipk:
+```
+make opensync TARGET=<target>
+where <target> can be either IPQ40XX, ECW5410, ECW5211, or AP2220
+```
+Example:
+```
+make opensync TARGET=ECW5410
+```
+
+The resulting image is found at 'wlan-ap/openwrt/bin/packages/<varient>/opensync/'.
  
 Caution: The work is in-progress and the following known issues apply:
-  a)  The OpenWrt target library for OpenSync is incomplete and minimally functional.
-  b)  The top level Makefile cleans the OpenWrt image and build directories BUT does not clean the OpenSync image and directories when 'make purge' is executed.
-  c)  To clean the OpenSync image and build directories, change directory to 'example' and 'make purge'.
+  a)  The top level Makefile cleans the OpenWrt image and build directories BUT does not clean the OpenSync image and directories when 'make purge' is executed.
+  b)  To clean the OpenSync image and build directories, change directory to 'example' and 'make purge'.
 
