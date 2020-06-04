@@ -6,6 +6,28 @@
 
 #define UCI_BUFFER_SIZE 80
 #define DEFAULT_ENC_MODE        "TKIPandAESEncryption"
+#define UCI_MAX_RADIOS 4
+
+typedef enum {
+  eFreqBand_24G = 0,
+  eFreqBand_5G,
+  eFreqBand_5GL,
+  eFreqBand_5GU
+} eFreqBand;
+
+#define HWMODE_11a "11a"
+#define HWMODE_11b "11b"
+#define HWMODE_11g "11g"
+
+#define HTMODE_noht   "NOHT"
+#define HTMODE_ht20   "HT20"
+#define HTMODE_ht40m  "HT40-"
+#define HTMODE_ht40p  "HT40+"
+#define HTMODE_ht40   "HT40"
+#define HTMODE_vht20  "VHT20"
+#define HTMODE_vht40  "VHT40"
+#define HTMODE_vht80  "VHT80"
+#define HTMODE_vht160 "VHT160"
 
 #define OVSDB_SECURITY_KEY                  "key"
 #define OVSDB_SECURITY_OFTAG                "oftag"
@@ -29,10 +51,12 @@
 int wifi_getRadioNumberOfEntries( int *numberOfEntries );
 int wifi_getRadioIfName(int radio_idx, char *radio_ifname, size_t radio_ifname_len);
 int wifi_getRadioChannel(int radio_idx, int *channel);
-int wifi_getRadioHwMode(int radio_idx, char* hwMode, size_t hwMode_len);
 int wifi_getRadioEnable(int radio_idx, bool *enabled);
 int wifi_getRadioTxPower(int radio_idx, int *txpower );
 int wifi_getRadioBeaconInterval(int radio_idx, int *beacon_int);
+int wifi_getRadioFreqBand(int radio_idx, char *freq_band);
+int wifi_getRadioHtMode(int radio_idx, char *ht_mode);
+int wifi_getRadioHwMode(int radio_idx, char *hw_mode);
 
 /*
  *  Functions to set Radio parameters
@@ -41,6 +65,7 @@ bool wifi_setRadioChannel(int radioIndex, int channel, const char *ht_mode);
 bool wifi_setRadioEnabled(int radioIndex, bool enabled);
 bool wifi_setRadioTxPower(int radioIndex, int txpower);
 bool wifi_setRadioBeaconInterval(int radioIndex, int beacon_int);
+bool wifi_setRadioModes(int radioIndex, const char *freq_band, const char *ht_mode, const char *hw_mode);
 
 /*
  *  Functions to retrieve SSID parameters

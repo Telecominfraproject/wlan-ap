@@ -53,11 +53,6 @@ static bool radio_state_get(
         LOGN("radio if_name: %s", rstate->if_name);
     }
 
-    if (UCI_OK == wifi_getRadioHwMode(radioIndex, rstate->hw_mode, sizeof(rstate->hw_mode))) {
-        rstate->hw_mode_exists = true;
-        LOGN("radio hw_mode: %s", rstate->hw_mode);
-    }
-
     if (UCI_OK == wifi_getRadioChannel(radioIndex, &(rstate->channel))) {
         rstate->channel_exists = true;
         LOGN("radio channel: %d", rstate->channel);
@@ -87,22 +82,43 @@ static bool radio_state_get(
         rstate->bcn_int_exists = true;
     }
 
+#if 0
     switch (radioIndex) {
-	case 0:
-           snprintf(rstate->ht_mode, sizeof(rstate->hw_mode),"HT80");
+        case 0:
+           snprintf(rstate->ht_mode, sizeof(rstate->ht_mode),"HT80");
+           snprintf(rstate->hw_mode, sizeof(rstate->hw_mode),"11a");
            snprintf(rstate->freq_band, sizeof(rstate->freq_band),"5GU");
            break;
         case 1:
-           snprintf(rstate->ht_mode, sizeof(rstate->hw_mode),"HT20");
-           snprintf(rstate->freq_band, sizeof(rstate->freq_band),"2.4G");
+           snprintf(rstate->ht_mode, sizeof(rstate->ht_mode),"HT20");
+           snprintf(rstate->hw_mode, sizeof(rstate->hw_mode),"11g");
+           snprintf(rstate->freq_band, sizeof(rstate->freq_band),"5GU");
            break;
         case 2:
-           snprintf(rstate->ht_mode, sizeof(rstate->hw_mode),"HT80");
-           snprintf(rstate->freq_band, sizeof(rstate->freq_band),"5GL");
+           snprintf(rstate->ht_mode, sizeof(rstate->ht_mode),"HT80");
+           snprintf(rstate->hw_mode, sizeof(rstate->hw_mode),"11a");
+           snprintf(rstate->freq_band, sizeof(rstate->freq_band),"5GU");
            break;
     }
     rstate->ht_mode_exists = true;
     rstate->freq_band_exists = true;
+    rstate->hw_mode_exists = true;
+#endif
+ 
+    if (UCI_OK == wifi_getRadioFreqBand(radioIndex, rstate->freq_band)) {
+	rstate->freq_band_exists = true;
+        LOGN("radio freq band: %s", rstate->freq_band);
+    }
+
+    if (UCI_OK == wifi_getRadioHtMode(radioIndex, rstate->ht_mode)) {
+        rstate->ht_mode_exists = true;
+        LOGN("radio ht mode: %s", rstate->ht_mode);
+    }
+
+    if (UCI_OK == wifi_getRadioHwMode(radioIndex, rstate->hw_mode)) {
+        rstate->hw_mode_exists = true;
+        LOGN("radio hw mode: %s", rstate->hw_mode);
+    }
 
     snprintf(rstate->country, sizeof(rstate->country),"CA");
     rstate->country_exists = true;
@@ -446,6 +462,15 @@ bool target_radio_config_set2(
             LOGE("%s: cannot set beacon interval radio for %s", __func__, rconf->if_name);
             rc = false;
          }
+     }
+
+     if ((changed->ht_mode) || (changed->hw_mode) || (changed->freq_band))
+     {
+        if (!wifi_setRadioModes(radioIndex, rconf->freq_band, rconf->ht_mode, rconf->hw_mode))    
+        {
+            LOGE("%s: cannot set radio mode and bw for %s", __func__, rconf->if_name);
+            rc = false;
+        }
      }
 
      if (rc==false) LOGE("Radio config partially applied for %s", rconf->if_name);

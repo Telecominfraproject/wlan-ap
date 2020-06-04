@@ -173,11 +173,6 @@ int wifi_getRadioChannel(int radio_idx, int *channel)
     return rc;
 }
 
-int wifi_getRadioHwMode(int radio_idx, char* hwMode, size_t hwMode_len)
-{
-    return( uci_read(WIFI_TYPE, WIFI_RADIO_SECTION, radio_idx, "hwmode", hwMode, hwMode_len));
-}
-
 int wifi_getRadioEnable(int radio_idx, bool *enabled )
 {
     int rc;
@@ -218,6 +213,102 @@ int wifi_getRadioBeaconInterval(int radio_idx, int *beacon_int)
     return rc;
 }
 
+static eFreqBand freqBand_capture[UCI_MAX_RADIOS] = {eFreqBand_5GU,eFreqBand_24G,eFreqBand_5GL};
+
+int wifi_getRadioFreqBand(int radio_idx, char *freq_band)
+{
+    int rc = true;
+    if (radio_idx < UCI_MAX_RADIOS) {
+       switch (freqBand_capture[radio_idx]) {
+       case eFreqBand_24G: 
+          strcpy(freq_band, "2.4G");
+          break;
+       case eFreqBand_5G: 
+          strcpy(freq_band, "5G");
+          break;
+       case eFreqBand_5GU: 
+          strcpy(freq_band, "5GU");
+          break;
+       case eFreqBand_5GL: 
+          strcpy(freq_band, "5GL");
+          break;
+       default:
+          rc=false;
+          break;
+       }
+   } else {
+       rc = false; 
+   }
+   return rc;
+}
+
+int wifi_getRadioHtMode(int radio_idx, char *ht_mode)
+{
+    int rc = true;
+    char htmode[8];
+
+    rc = uci_read(WIFI_TYPE, WIFI_RADIO_SECTION, radio_idx, "htmode", htmode, 8);
+    if (rc == UCI_OK )
+    {
+       if (!strcmp(htmode, HTMODE_noht)) {
+          strcpy(ht_mode, "HT20" );  /* should be ignored based on hw_mode */
+       } else if (!strcmp(htmode, HTMODE_ht20)) {
+          strcpy(ht_mode, "HT20");
+       } else if (!strcmp(htmode, HTMODE_ht40m)) {
+          strcpy(ht_mode, "HT40-");
+       } else if (!strcmp(htmode, HTMODE_ht40p)) {
+          strcpy(ht_mode, "HT40+");
+       } else if (!strcmp(htmode, HTMODE_ht40)) {
+          strcpy(ht_mode, "HT40");
+       } else if (!strcmp(htmode, HTMODE_vht20)) {
+          strcpy(ht_mode, "HT20");
+       } else if (!strcmp(htmode, HTMODE_vht40)) {
+          strcpy(ht_mode, "HT40");
+       } else if (!strcmp(htmode, HTMODE_vht80)) {
+          strcpy(ht_mode, "HT80");
+       } else if (!strcmp(htmode, HTMODE_vht160)) {
+          strcpy(ht_mode, "HT160");
+       }
+    } else {
+        rc = false;
+    }
+    return rc;
+}
+
+int wifi_getRadioHwMode(int radio_idx, char * hw_mode)
+{
+    int rc1, rc2;
+    char htmode[8];
+    char hwmode[6];
+
+    rc1 = uci_read(WIFI_TYPE, WIFI_RADIO_SECTION, radio_idx, "htmode", htmode, 8);
+    rc2 = uci_read(WIFI_TYPE, WIFI_RADIO_SECTION, radio_idx, "hwmode", hwmode, 6);
+    if ((rc1 == UCI_OK ) && (rc2 == UCI_OK ))
+    {
+       if (!strcmp(htmode, HTMODE_noht)) {
+          if (!strcmp(hwmode, HWMODE_11a)) {
+             strcpy(hw_mode, "11a");
+          } else if (!strcmp(hwmode, HWMODE_11b)) {
+             strcpy(hw_mode, "11b");
+          } else if (!strcmp(hwmode, HWMODE_11g)) {
+             strcpy(hw_mode, "11g");
+          } else {
+             rc1 = UCI_ERR_UNKNOWN;
+          } 
+       } else if ((!strcmp(htmode, HTMODE_ht20))  || (!strcmp(htmode, HTMODE_ht40m)) || 
+                  (!strcmp(htmode, HTMODE_ht40p)) || (!strcmp(htmode, HTMODE_ht40))) {
+          strcpy(hw_mode, "11n");
+       } else if ((!strcmp(htmode, HTMODE_vht20)) || (!strcmp(htmode, HTMODE_vht40)) ||
+                  (!strcmp(htmode, HTMODE_vht80)) || (!strcmp(htmode, HTMODE_vht160))) {
+          strcpy(hw_mode, "11ac");
+       } else {
+          rc1 = UCI_ERR_UNKNOWN; 
+       }
+    }
+    return rc1;
+}
+
+
 bool wifi_setRadioChannel(int radioIndex, int channel, const char *ht_mode)
 {
     char    str[4];
@@ -253,6 +344,71 @@ bool wifi_setRadioBeaconInterval(int radioIndex, int beacon_int)
 
     sprintf(str, "%d", beacon_int);
     return uci_write(WIFI_TYPE, WIFI_RADIO_SECTION, radioIndex, "beacon_int", str);
+}
+
+bool wifi_setRadioModes(int radioIndex, const char *freq_band, const char *ht_mode, const char *hw_mode)
+{
+    char chanbw[4] = "20";
+    char hwmode[4];
+    char htmode[8];
+    bool rc1, rc2, rc3;
+
+    if (! strcmp(hw_mode, "11a")) {
+       strcpy(hwmode, HWMODE_11a);
+       strcpy(htmode, HTMODE_noht);
+    } else if (!strcmp(hw_mode, "11b")) {
+       strcpy(hwmode, HWMODE_11b);
+       strcpy(htmode, HTMODE_noht);
+    } else if (!strcmp(hw_mode, "11g")) {
+       strcpy(hwmode, HWMODE_11g);
+       strcpy(htmode, HTMODE_noht);
+    } else if (!strcmp(hw_mode, "11n")) {
+       if (!strcmp(freq_band, "2.4G")) {
+           strcpy(hwmode, HWMODE_11g);
+       } else {
+           strcpy(hwmode, HWMODE_11a);
+       }
+       if (!strcmp(ht_mode, "HT20")) {
+          strcpy(htmode, HTMODE_ht20);
+       } else if (!strcmp(ht_mode, "HT40-")) {
+          strcpy(htmode, HTMODE_ht40m);
+       } else if (!strcmp(ht_mode, "HT40+")) {
+          strcpy(htmode, HTMODE_ht40p);
+       } else  if ((!strcmp(ht_mode, "HT40")) | (!strcmp(ht_mode, "HT80")) || (!strcmp(ht_mode, "HT160"))) {
+          strcpy(htmode, HTMODE_ht40);
+       } else {
+          return UCI_ERR_UNKNOWN;
+       } 
+    } else if (!strcmp(hw_mode, "11ac")) {
+       strcpy(hwmode, HWMODE_11a);
+       if (!strcmp(ht_mode, "HT20")) {
+          strcpy(htmode, HTMODE_vht20);
+       } else if ((!strcmp(ht_mode, "HT40")) || (!strcmp(ht_mode, "HT40+")) || (!strcmp(ht_mode, "HT40-"))) {
+          strcpy(htmode, HTMODE_vht40);
+       } else if (!strcmp(ht_mode, "HT80")) {
+          strcpy(htmode, HTMODE_vht80);
+       } else  if (!strcmp(ht_mode, "HT160")) {
+          strcpy(htmode, HTMODE_vht160);
+       } else {
+          return UCI_ERR_UNKNOWN;
+       }
+    }
+
+    if (!strcmp(freq_band, "2.4G")) {
+       freqBand_capture[radioIndex] = eFreqBand_24G;
+    } else if (!strcmp(freq_band, "5G")) {
+       freqBand_capture[radioIndex] = eFreqBand_5G;
+    } else if (!strcmp(freq_band, "5GL")) {
+       freqBand_capture[radioIndex] = eFreqBand_5GL;
+    } else if (!strcmp(freq_band, "5GU")) {
+       freqBand_capture[radioIndex] = eFreqBand_5GU;
+    }
+
+    rc1 = uci_write(WIFI_TYPE, WIFI_RADIO_SECTION, radioIndex,"chanbw", chanbw);
+    rc2 = uci_write(WIFI_TYPE, WIFI_RADIO_SECTION, radioIndex,"hwmode", hwmode);
+    rc3 = uci_write(WIFI_TYPE, WIFI_RADIO_SECTION, radioIndex,"htmode", htmode);
+
+    return (rc1 && rc2 && rc3);
 }
 
 /*
