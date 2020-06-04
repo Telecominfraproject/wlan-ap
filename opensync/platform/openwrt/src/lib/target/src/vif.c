@@ -59,6 +59,7 @@ static c_item_t map_hw_mode[] =
     C_ITEM_STR(HW_MODE_11N,             "11n"),
     C_ITEM_STR(HW_MODE_11AC,            "11ac")
 };
+#endif
 
 static c_item_t map_enable_disable[] =
 {
@@ -66,6 +67,7 @@ static c_item_t map_enable_disable[] =
     C_ITEM_STR(false,                   "disabled")
 };
 
+#if 0
 #define ACL_BUF_SIZE   1024
 
 enum
@@ -1050,6 +1052,8 @@ bool target_vif_config_set2(
     int  ssid_index;
     int  ret;
     char tmp[256];
+    c_item_t *citem;
+    bool bval;
 
     const char *ssid_ifname = (char *)vconf->if_name;
 
@@ -1071,6 +1075,30 @@ bool target_vif_config_set2(
         if (ret != true)
         {
             LOGE("%s: Failed to set new SSID '%s'", ssid_ifname, tmp);
+        }
+    }
+
+    if (changed->ssid_broadcast)
+    {
+        if ((citem = c_get_item_by_str(map_enable_disable, vconf->ssid_broadcast)))
+        {
+            bval = citem->key ? true : false;
+            ret = wifi_setApSsidAdvertisementEnable(ssid_index, bval);
+            LOGI("[WIFI_HAL SET] wifi_setApSsidAdvertisementEnable(%d, %d) = %d",
+                                                    ssid_index, bval, ret);
+            if (ret != true)
+            {
+                LOGW("%s: Failed to set SSID Broadcast to '%d'", ssid_ifname, bval);
+            }
+            else
+            {
+                LOGN("%s: Updated SSID Broadcast to %d", ssid_ifname, bval);
+            }
+        }
+        else
+        {
+            LOGW("%s: Failed to decode ssid_broadcast \"%s\"",
+                 ssid_ifname, vconf->ssid_broadcast);
         }
     }
 

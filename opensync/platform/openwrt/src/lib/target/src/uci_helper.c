@@ -371,6 +371,21 @@ int wifi_getApSsidAdvertisementEnable(int ssid_index, bool *enabled)
     return UCI_OK;
 }
 
+bool wifi_setApSsidAdvertisementEnable(int ssid_index, bool enabled)
+{
+    char    val[4];
+
+    if (enabled) {
+        sprintf(val, "%d", 0);
+    } else {
+        sprintf(val, "%d", 1);
+    }
+
+    LOGN("wifi_setApSsidAdvertisementEnable =  %s", val);
+
+    return uci_write(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "hidden", val);
+}
+
 int wifi_getBaseBSSID(int ssid_index,char *buf, size_t buf_len)
 {
     return( uci_read(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "bssid", buf, buf_len));
