@@ -348,13 +348,28 @@ int wifi_getApIsolationEnable(int ssid_index, bool *enabled)
     int rc;
     char result[20];
 
-    *enabled = true;    
+    *enabled = false;
     rc = uci_read(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "isolate", result, 20);
     if (( rc == UCI_OK ) && (strcmp(result,"1") == 0)) 
     {
-        *enabled = false;
+        *enabled = true;
     }
     return UCI_OK;
+}
+
+bool wifi_setApIsolationEnable(int ssid_index, bool enabled)
+{
+    char    val[4];
+
+    if (enabled) {
+        sprintf(val, "%d", 0);
+    } else {
+        sprintf(val, "%d", 1);
+    }
+
+    LOGN("wifi_setApIsolationEnable =  %s", val);
+
+    return uci_write(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "isolate", val);
 }
 
 int wifi_getApSsidAdvertisementEnable(int ssid_index, bool *enabled)

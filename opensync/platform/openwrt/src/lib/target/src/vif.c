@@ -1111,6 +1111,21 @@ bool target_vif_config_set2(
         }
     }
 
+    if (changed->ap_bridge)
+    {
+        ret = wifi_setApIsolationEnable(ssid_index, vconf->ap_bridge);
+        LOGI("[WIFI_HAL SET] wifi_setApIsolationEnable(%d, %d) = %d",
+                                               ssid_index, vconf->ap_bridge, ret);
+        if (ret != true)
+        {
+            LOGW("%s: Failed to set AP bridge to '%d'", ssid_ifname, bval);
+        }
+        else
+        {
+            LOGN("%s: Updated AP bridge to %d", ssid_ifname, bval);
+        }
+    }
+
     return vif_state_update(ssid_index);
 }
 

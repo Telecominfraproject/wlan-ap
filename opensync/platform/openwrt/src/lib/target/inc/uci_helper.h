@@ -64,6 +64,7 @@ bool wifi_getApSecurityModeEnabled(int ssid_index, char *buf, size_t buf_len);
 bool wifi_setSSIDName(int ssis_index, char* ssidName);
 bool wifi_setApSecurityModeEnabled(int ssid_index, const struct schema_Wifi_VIF_Config *vconf);
 bool wifi_setApSsidAdvertisementEnable(int ssid_index, bool enabled);
+bool wifi_setApIsolationEnable(int ssid_index, bool enabled);
 
 /*
  * Functions to access OVSDB callbacks
