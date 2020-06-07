@@ -28,6 +28,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <stdio.h>
 #include <stdbool.h>
 #include "iwinfo.h"
+#include "string.h"
 
 #define NUM_MAX_CLIENTS 10
 
@@ -249,6 +250,19 @@ bool target_stats_survey_convert(
 /******************************************************************************
  *  NEIGHBORS definitions
  *****************************************************************************/
+uint32_t channel_to_freq(uint32_t chan)
+{
+    uint32_t channel[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 132, 136, 140, 144, 149, 153, 157, 161, 165};
+    uint32_t freq[] = {2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580, 5660, 5680, 5700, 5720, 5745, 5765, 5785, 5805, 5825 };
+
+    for(int i = 0; i<33; i++)
+    {
+      if(channel[i] == chan)
+      return freq[i];
+    }
+    
+    return 0;
+}
 
 bool target_stats_scan_start(
         radio_entry_t *radio_cfg,
@@ -259,8 +273,43 @@ bool target_stats_scan_start(
         target_scan_cb_t *scan_cb,
         void *scan_ctx)
 {
-    (*scan_cb)(scan_ctx, true);
+    char command[64];
+    uint32_t frequency;
+    memset(command, 0, strlen(command));
+    //sprintf(command,"iw %s scan duration %d", radio_cfg->if_name, dwell_time);
+    //sprintf(command,"iw wlan0 scan duration 30");
 
+    if(strcmp(radio_cfg->if_name, "home-ap-24") == 0)
+    {
+      frequency = channel_to_freq(chan_list[0]);
+      sprintf(command,"iw wlan1 scan duration 30 freq %d", frequency);
+    }
+    else if(strcmp(radio_cfg->if_name, "home-ap-l50") == 0)
+    {
+      frequency = channel_to_freq(chan_list[0]);
+      sprintf(command,"iw wlan2 scan duration 30 freq %d", frequency);
+      LOGN("Freq: %d %d", frequency, chan_list[0]);
+    }
+    else if(strcmp(radio_cfg->if_name, "home-ap-u50") == 0)
+    {
+      frequency = channel_to_freq(chan_list[0]);
+      sprintf(command,"iw wlan0 scan duration 30 freq %d", frequency);
+    }
+
+    LOGN("scanning command : %s", command);
+    LOGN("channel num: %d", chan_num);
+    LOGN("scan_type : %d", scan_type);
+    if(system(command) == -1)
+    {
+
+    (*scan_cb)(scan_ctx, false);
+
+    return false;
+
+    }
+
+    (*scan_cb)(scan_ctx, true);
+   
     return true;
 }
 
@@ -268,6 +317,15 @@ bool target_stats_scan_stop(
         radio_entry_t *radio_cfg,
         radio_scan_type_t scan_type)
 {
+    char command[64];
+
+    memset(command, 0, strlen(command));
+    sprintf(command,"iw %s scan abort", radio_cfg->if_name);
+    
+    LOGN("stop scan command : %s", command);
+    if(system(command) == -1)
+    return false;
+
     return true;
 }
 
@@ -278,21 +336,102 @@ bool target_stats_scan_get(
         radio_scan_type_t scan_type,
         dpp_neighbor_report_data_t *scan_results)
 {
-    /* Insert dummy data for neighbors */
-    dpp_neighbor_record_list_t *neighbor;
 
-    neighbor = dpp_neighbor_record_alloc();
-    if (neighbor == NULL) return false;
+    char command[128];
+    FILE *fp=NULL;
+    long int fsize;
+    char *buffer=NULL;
+    char *tmp=NULL;
+    char sig[4];
+    char lastseen[12];
+    char ssid[32];
+    char channwidth[4];
+    char TSF[20];
 
-    neighbor->entry.type        = radio_cfg->type;
-    neighbor->entry.lastseen    = 1000;
-    neighbor->entry.sig         = 50;
-    neighbor->entry.chan        = chan_list[0];
-    neighbor->entry.chanwidth   = 40;
-    strncpy(neighbor->entry.ssid, "NeighWifi", 10);
-    strncpy(neighbor->entry.bssid, "ff:ee:dd:cc:bb:aa", 17);
+    memset(command, 0, strlen(command));
+ //   sprintf(command,"iw %s scan dump  > /tmp/scan%s.dump", radio_cfg->if_name, radio_cfg->if_name);
+ //   LOGN("dump scan command : %s", command);
+    if(strcmp(radio_cfg->if_name, "home-ap-24") == 0)
+    {
+      sprintf(command,"iw wlan1 scan dump  > /tmp/scanwlan0.dump");
+      LOGN("dump scan command : %s", command);
+      system(command);
+      fp = fopen("/tmp/scanwlan1.dump","r");
+    }
+    else if(strcmp(radio_cfg->if_name, "home-ap-l50") == 0)
+    {
+      sprintf(command,"iw wlan2 scan dump  > /tmp/scanwlan1.dump");
+      LOGN("dump scan command : %s", command);
+      system(command);
+      fp = fopen("/tmp/scanwlan2.dump","r");
+    }
+    else if(strcmp(radio_cfg->if_name, "home-ap-u50") == 0)
+    {
+      sprintf(command,"iw wlan0 scan dump  > /tmp/scanwlan2.dump");
+      LOGN("dump scan command : %s", command);
+      system(command);
+      fp = fopen("/tmp/scanwlan0.dump","r");
+    }
 
-    ds_dlist_insert_tail(&scan_results->list, neighbor);
+    if(fp==NULL)
+    {
+      LOG(ERR,"Failed to open scan dump files");
+      return false;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    fsize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    buffer = malloc(fsize+1);
+    fread(buffer, 1, fsize, fp);
+    buffer[fsize] = 0;
+    fclose(fp);
+    tmp = buffer;
+
+    while(strstr(tmp,"BSS") != NULL)
+    {
+     dpp_neighbor_record_list_t *neighbor;
+
+     neighbor = dpp_neighbor_record_alloc();
+     if (neighbor == NULL) return false;
+
+     neighbor->entry.type        = radio_cfg->type;
+
+     tmp = strstr(tmp,"BSS");
+     tmp = tmp + 4;
+     strncpy(neighbor->entry.bssid, tmp, 17);
+
+     tmp = strstr(tmp,"TSF");
+     tmp = tmp + 4;
+     sscanf(tmp, "%s", TSF);
+     neighbor->entry.tsf = atoi(TSF);
+     
+     tmp = strstr(tmp,"signal");
+     tmp = tmp + 8;
+     strncpy(sig, tmp, 3);
+     neighbor->entry.sig = atoi(sig);
+
+     tmp = strstr(tmp,"last seen");
+     tmp = tmp + 11;
+     sscanf(tmp, "%s", lastseen);
+     neighbor->entry.lastseen    = atoi(lastseen);
+
+     tmp = strstr(tmp,"SSID");
+     tmp = tmp + 6;
+     sscanf(tmp, "%s", ssid);
+     strncpy(neighbor->entry.ssid, ssid, 32);
+
+
+     tmp = strstr(tmp,"STA channel width");
+     tmp = tmp + 19;
+     sscanf(tmp, "%s", channwidth);
+     neighbor->entry.chanwidth   = atoi(channwidth);
+     neighbor->entry.chan        = chan_list[0];
+     
+     ds_dlist_insert_tail(&scan_results->list, neighbor);
+    }
+
+    free(buffer);
 
     return true;
 }
@@ -311,15 +450,15 @@ bool target_stats_device_temp_get(
 
     if(strcmp(radio_cfg->if_name, "home-ap-24") == 0)
     {
-      fp = fopen("/sys/class/hwmon/hwmon0/temp1_input","r");
+      fp = fopen("/sys/class/hwmon/hwmon1/temp1_input","r");
     }
     else if(strcmp(radio_cfg->if_name, "home-ap-l50") == 0)
     {
-     fp = fopen("/sys/class/hwmon/hwmon1/temp1_input","r");
+     fp = fopen("/sys/class/hwmon/hwmon2/temp1_input","r");
     }
     else if(strcmp(radio_cfg->if_name, "home-ap-u50") == 0)
     {
-      fp = fopen("/sys/class/hwmon/hwmon2/temp1_input","r");
+      fp = fopen("/sys/class/hwmon/hwmon0/temp1_input","r");
     }
 
     if(fp==NULL)
