@@ -571,38 +571,39 @@ bool wifi_setApSecurityModeEnabled(int ssid_index,
         const struct schema_Wifi_VIF_Config *vconf)
 {
     bool rc = true;
-    if (strcmp(vconf->security[0], OVSDB_SECURITY_ENCRYPTION_OPEN) == 0)
+    const char *encryption = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_ENCRYPT);
+
+    if (strcmp(encryption, OVSDB_SECURITY_ENCRYPTION_OPEN) == 0)
     {
-        if (!uci_write(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "encryption", "none"))
-        {
-            rc = false;
-        }
+        UCI_WRITE(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "encryption", "none");
     }
-    else if (strcmp(vconf->security[0], OVSDB_SECURITY_ENCRYPTION_WPA_PSK) == 0)
+    else if (strcmp(encryption, OVSDB_SECURITY_ENCRYPTION_WPA_PSK) == 0)
     {
         char key[128];
+        const char *mode = SCHEMA_KEY_VAL(vconf->security, "mode");
         memset(key, 0, sizeof(key));
-        snprintf(key, sizeof(key) - 1, "%s", vconf->security[1]);
+        snprintf(key, sizeof(key) - 1, "%s", (char *)SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_KEY));
 
-        if(!uci_write(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "key", key))
-        {
-            rc = false;
-        }
+        UCI_WRITE(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "key", key);
 
-        if (strcmp(vconf->security[2], OVSDB_SECURITY_MODE_WPA2) == 0)
+        if (strcmp(mode, OVSDB_SECURITY_MODE_WPA2) == 0)
         {
-            if(!uci_write(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "encryption", "psk2"))
-            {
-                rc = false;
-            }
+            UCI_WRITE(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "encryption", "psk2");
         }
-        else if (strcmp(vconf->security[2], OVSDB_SECURITY_MODE_MIXED) == 0)
+        else if (strcmp(mode, OVSDB_SECURITY_MODE_MIXED) == 0)
         {
-            if(!uci_write(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "encryption", "psk-mixed"))
-            {
-                rc = false;
-            }
+            UCI_WRITE(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "encryption", "psk-mixed");
         }
+    }
+    else if (strcmp(encryption, OVSDB_SECURITY_ENCRYPTION_WPA_EAP) == 0)
+    {
+        UCI_WRITE(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "encryption", "wpa2");
+        UCI_WRITE(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "server",
+                (char *)SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_IP));
+        UCI_WRITE(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "port",
+                (char *)SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_PORT));
+        UCI_WRITE(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "key",
+                (char *)SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_SECRET));
     }
 
     return rc;
@@ -616,4 +617,14 @@ bool wifi_getApSecurityModeEnabled(int ssid_index, char *buf, size_t buf_len)
 int wifi_getApSecurityKeyPassphrase(int ssid_index, char *buf, size_t buf_len)
 {
     return(uci_read(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "key", buf, buf_len));
+}
+
+bool wifi_getApSecurityRadiusServer(
+        int ssid_index, char *radius_ip, char *radius_port, char *radius_secret)
+{
+    UCI_READ(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "server", radius_ip, UCI_BUFFER_SIZE);
+    UCI_READ(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "port", radius_port, UCI_BUFFER_SIZE);
+    UCI_READ(WIFI_TYPE, WIFI_VIF_SECTION, ssid_index, "key", radius_secret, UCI_BUFFER_SIZE);
+
+    return true;
 }

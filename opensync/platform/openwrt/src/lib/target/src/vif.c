@@ -107,7 +107,7 @@ static c_item_t map_security[] =
     C_ITEM_STR(SEC_WPA_PERSONAL,            "psk"),
     C_ITEM_STR(SEC_WPA_ENTERPRISE,          "WPA-Enterprise"),
     C_ITEM_STR(SEC_WPA2_PERSONAL,           "psk2"),
-    C_ITEM_STR(SEC_WPA2_ENTERPRISE,         "WPA2-Enterprise"),
+    C_ITEM_STR(SEC_WPA2_ENTERPRISE,         "wpa2"),
     C_ITEM_STR(SEC_WPA_WPA2_PERSONAL,       "WPA-WPA2-Personal"),
     C_ITEM_STR(SEC_WPA_WPA2_ENTERPRISE,     "WPA-WPA2-Enterprise")
 };
@@ -308,17 +308,15 @@ static bool set_enterprise_credentials(
         int index,
         int ssid_index)
 {
-#if 0
-    int ret;
     char radius_ip[UCI_BUFFER_SIZE];
     char radius_secret[UCI_BUFFER_SIZE];
     char radius_port_str[UCI_BUFFER_SIZE];
-    unsigned int radius_port;
 
     memset(radius_ip, 0, sizeof(radius_ip));
     memset(radius_secret, 0, sizeof(radius_secret));
-    ret = wifi_getApSecurityRadiusServer(ssid_index, radius_ip, &radius_port, radius_secret);
-    if (ret != UCI_OK)
+    memset(radius_port_str, 0, sizeof(radius_port_str));
+
+    if (!wifi_getApSecurityRadiusServer(ssid_index, radius_ip, radius_port_str, radius_secret))
     {
         LOGE("%s: Failed to retrieve radius settings", vstate->if_name);
         return false;
@@ -326,12 +324,10 @@ static bool set_enterprise_credentials(
 
     index = set_security_key_value(vstate, index, OVSDB_SECURITY_RADIUS_SERVER_IP, radius_ip);
 
-    memset(radius_port_str, 0, sizeof(radius_port_str));
-    snprintf(radius_port_str, sizeof(radius_port_str), "%u", radius_port);
     index = set_security_key_value(vstate, index, OVSDB_SECURITY_RADIUS_SERVER_PORT, radius_port_str);
 
     set_security_key_value(vstate, index, OVSDB_SECURITY_RADIUS_SERVER_SECRET, radius_secret);
-#endif
+
     return true;
 }
 

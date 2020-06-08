@@ -3,6 +3,21 @@
 
 #include "target.h"
 #include "uci.h"
+#include "schema_consts.h"
+
+#define UCI_WRITE(type, section, index, option, value) ({ \
+        if(!uci_write(type, section, index, option, value)) \
+        { \
+            return false; \
+        } \
+})
+
+#define UCI_READ(type, section, index, option, result, length) ({ \
+        if(!uci_read(type, section, index, option, result, length)) \
+        {\
+            return false; \
+        } \
+})
 
 #define UCI_BUFFER_SIZE 80
 #define DEFAULT_ENC_MODE        "TKIPandAESEncryption"
@@ -82,6 +97,7 @@ int wifi_getApSsidAdvertisementEnable(int ssid_index, bool *enabled);
 int wifi_getBaseBSSID(int ssid_index,char *buf, size_t buf_len);
 int wifi_getApSecurityKeyPassphrase(int ssid_index, char *buf, size_t buf_len);
 bool wifi_getApSecurityModeEnabled(int ssid_index, char *buf, size_t buf_len);
+bool wifi_getApSecurityRadiusServer(int ssid_index, char *radius_ip, char *radius_port, char *radius_secret);
 
 /*
  *  Functions to set SSID parameters
