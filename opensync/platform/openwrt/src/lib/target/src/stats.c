@@ -353,23 +353,23 @@ bool target_stats_scan_get(
  //   LOGN("dump scan command : %s", command);
     if(strcmp(radio_cfg->if_name, "home-ap-24") == 0)
     {
-      sprintf(command,"iw wlan1 scan dump  > /tmp/scanwlan0.dump");
+      sprintf(command,"iw wlan1 scan dump  > /tmp/scanwlan1.dump");
       LOGN("dump scan command : %s", command);
-      system(command);
+      if(system(command) != -1)
       fp = fopen("/tmp/scanwlan1.dump","r");
     }
     else if(strcmp(radio_cfg->if_name, "home-ap-l50") == 0)
     {
-      sprintf(command,"iw wlan2 scan dump  > /tmp/scanwlan1.dump");
+      sprintf(command,"iw wlan2 scan dump  > /tmp/scanwlan2.dump");
       LOGN("dump scan command : %s", command);
-      system(command);
+      if(system(command) != -1)
       fp = fopen("/tmp/scanwlan2.dump","r");
     }
     else if(strcmp(radio_cfg->if_name, "home-ap-u50") == 0)
     {
-      sprintf(command,"iw wlan0 scan dump  > /tmp/scanwlan2.dump");
+      sprintf(command,"iw wlan0 scan dump  > /tmp/scanwlan0.dump");
       LOGN("dump scan command : %s", command);
-      system(command);
+      if(system(command) != -1)
       fp = fopen("/tmp/scanwlan0.dump","r");
     }
 
