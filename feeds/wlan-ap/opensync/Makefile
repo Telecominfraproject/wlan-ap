@@ -9,6 +9,7 @@ PKG_SOURCE_DATE:=2019-10-25
 PKG_SOURCE_VERSION:=d46964b2588800e92ac96f562054d6f45cb81147
 
 PKG_BUILD_DEPENDS:=python3-kconfiglib/host
+PKG_CONFIG_DEPENDS:=CONFIG_PACKAGE_wlan-ap-keys
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -82,7 +83,11 @@ define Package/opensync/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs//usr/plume/bin/* $(1)/usr/plume/bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs/usr/plume/etc/* $(1)/usr/plume/etc
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs/usr/plume/tools/ovsh $(1)/usr/plume/bin
+	$(SED) "s/CLOUD_IP=/CLOUD_IP=$(CONFIG_WLAN_AP_CLOUD_IP)/g" $(1)/etc/uci-defaults/99-opensync
 	$(MAKE) -C $(PKG_BUILD_DIR)/ TARGET=$(BUILD_VARIANT) rootfs-copy-only INSTALL_ROOTFS_DIR=$(1)
+ifdef CONFIG_PACKAGE_wlan-ap-keys
+	rm $(1)/usr/plume/certs/*
+endif
 endef
 
 Package/opensync-ap2220/install=$(call Package/opensync/install,$(1))
