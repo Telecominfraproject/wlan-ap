@@ -368,7 +368,7 @@ int wifi_getTxChainMask(int radioIndex, int *txChainMask)
 	point = strstr(buffer, "0x");
 	point = point + 2;
         sscanf(point, "%d", txChainMask);
-
+	free(buffer);
 	return true;
     }
 
