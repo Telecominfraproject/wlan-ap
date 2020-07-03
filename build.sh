@@ -39,7 +39,7 @@ AP2220)
 	;;
 esac
 cd ${BUILD_DIR}
-./scripts/gen_config.py ${TARGET} wlan-ap || exit 1
+./scripts/gen_config.py ${TARGET} wlan-ap wifi || exit 1
 cd -
 
 echo "### Building image ..."
