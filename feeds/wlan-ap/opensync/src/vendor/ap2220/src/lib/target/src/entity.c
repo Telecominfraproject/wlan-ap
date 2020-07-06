@@ -150,7 +150,7 @@ bool target_model_get(void *buff, size_t buffsz)
 {
     if (!devInfoModelNumber_saved)  {
         if ( NULL == get_devinfo_record( "modelNumber=", devInfoModelNumber, DEV_INFO_RECORD_SZ))
-	   snprintf(devInfoModelNumber, DEV_INFO_RECORD_SZ, "%s", "AP2220");
+	   snprintf(devInfoModelNumber, DEV_INFO_RECORD_SZ, "%s", "TIP_AP");
         devInfoModelNumber_saved = true; 
     }
     strncpy(buff, devInfoModelNumber, buffsz);
@@ -166,7 +166,7 @@ bool target_serial_get(void *buff, size_t buffsz)
     if (!devInfoSerialNumber_saved)  {
         if ( NULL == get_devinfo_record( "serial_number=", devInfoSerialNumber, DEV_INFO_RECORD_SZ))
         {
-            if (true == os_nif_macaddr("br-lan", &mac))
+            if (true == os_nif_macaddr("eth0", &mac))
             {
                 memset(mac_buff, 0, sizeof(mac_buff));
                 n = snprintf(mac_buff, sizeof(mac_buff), PRI(os_macaddr_plain_t), FMT(os_macaddr_t, mac));
