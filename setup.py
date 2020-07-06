@@ -7,6 +7,24 @@ import getopt
 
 git_am = "am"
 
+def create_keys():
+	try:
+		if Path("keys/servercert.pem").is_file():
+			return 0
+		if not Path("keys/generate_all.sh").is_file():
+			print("### Cloning key repo")
+			run(["git", "clone", "git@github.com:Telecominfraproject/wlan-pki-cert-scripts.git", "keys"], check=True)
+			print("### Clone done")
+		print("### Generate keys")
+		os.chdir("keys")
+		run(["/bin/sh", "./generate_all.sh"], check=True)
+		print("### Generate keys done")
+	except:
+		print("### Creating keys failed")
+		sys.exit(1)
+	finally:
+		os.chdir(base_dir)
+
 def clone_tree():
 	try:
 		makefile = openwrt +"/Makefile"
@@ -120,6 +138,7 @@ if not Path(config).is_file():
 config = yaml.safe_load(open(config))
 
 if setup:
+	create_keys()
 	clone_tree()
 	reset_tree()
 	setup_tree()
