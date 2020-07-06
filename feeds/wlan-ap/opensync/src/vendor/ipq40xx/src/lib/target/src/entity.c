@@ -45,25 +45,25 @@ typedef struct
 } ifmap_t;
 
 ifmap_t stats_ifmap[] = {
-    { "home-ap-24",    "wlan1",    "phy1" },
-    { "home-ap-u50",   "wlan0",    "phy0" },
-    { "home-ap-l50",   "wlan2",    "phy2" },
+    { "home_ap_24",    "wlan1",    "phy1" },
+    { "home_ap_u50",   "wlan0",    "phy0" },
+    { "home_ap_l50",   "wlan2",    "phy2" },
     { NULL,             NULL,       NULL  }
 };
 
 void target_ifname_map_init()
 {
-    target_map_init();
+    /*target_map_init();
 
     //Radio mappings
-    target_map_insert("wifi0", "radio1");
-    target_map_insert("wifi1", "radio2");
-    target_map_insert("wifi2", "radio0");
+    target_map_insert("wifi0", "wifi0");
+    target_map_insert("wifi1", "wifi1");
+    target_map_insert("wifi2", "wifi2");
 
     //VIF mappings
-    target_map_insert("home-ap-u50", "default_radio0");
-    target_map_insert("home-ap-24", "default_radio1");
-    target_map_insert("home-ap-l50", "default_radio2");
+    target_map_insert("home_ap_u50", "home_ap_u50");
+    target_map_insert("home_ap_24", "home_ap_24");
+    target_map_insert("home_ap_l50", "home_ap_l50");*/
 }
 
 bool target_map_cloud_to_iw(const char *ifname, char *iw_name, size_t length)

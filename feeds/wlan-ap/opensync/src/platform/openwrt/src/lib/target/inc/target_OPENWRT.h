@@ -37,13 +37,20 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 typedef struct
 {
-    DPP_TARGET_CLIENT_RECORD_COMMON_STRUCT;
-    dpp_client_stats_t  stats;
+	DPP_TARGET_CLIENT_RECORD_COMMON_STRUCT;
+//	dpp_client_stats_t  stats;
 } target_client_record_t;
 
 typedef struct
 {
-    DPP_TARGET_SURVEY_RECORD_COMMON_STRUCT;
+	DPP_TARGET_SURVEY_RECORD_COMMON_STRUCT;
+	uint32_t chan_active;
+	uint32_t chan_busy;
+	uint32_t chan_busy_ext;
+	uint32_t chan_self;
+	uint32_t chan_rx;
+	uint32_t chan_tx;
+	uint32_t duration_ms;
 } target_survey_record_t;
 
 typedef void target_capacity_data_t;
@@ -52,10 +59,10 @@ typedef void target_capacity_data_t;
  *  MANAGERS definitions
  *****************************************************************************/
 #if !defined(CONFIG_TARGET_MANAGER)
-#define TARGET_MANAGER_PATH(X)      "/usr/plume/bin/"X
+#define TARGET_MANAGER_PATH(X)      "/usr/opensync/bin/"X
 #endif
 
-#define TARGET_TOOLS_PATH           "/usr/plume/tools"
+#define TARGET_TOOLS_PATH           "/usr/opensync/tools"
 
 #include "target_common.h"
 

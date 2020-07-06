@@ -109,6 +109,7 @@ def setup_tree():
 
 base_dir = Path.cwd().absolute()
 setup = False
+genkey = True
 rebase = False
 config = "config.yml"
 openwrt = "openwrt"
@@ -129,6 +130,7 @@ for o, a in opts:
 		config = a
 	elif o in ("-d", "--docker"):
 		git_am = "apply"
+		genkey = False
 	else:
 		assert False, "unhandled option"
 
@@ -138,7 +140,8 @@ if not Path(config).is_file():
 config = yaml.safe_load(open(config))
 
 if setup:
-	create_keys()
+	if genkey:
+		create_keys()
 	clone_tree()
 	reset_tree()
 	setup_tree()
