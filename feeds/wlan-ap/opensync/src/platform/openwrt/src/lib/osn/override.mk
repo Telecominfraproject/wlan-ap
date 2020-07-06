@@ -27,15 +27,5 @@
 # OpenSync low level API
 #
 ##############################################################################
-UNIT_SRC := src/osn_dnsmasq.c
-UNIT_SRC += src/osn_dnsmasq6.c
-UNIT_SRC += src/osn_inet.c
-UNIT_SRC += src/osn_inet6.c
-UNIT_SRC += src/osn_odhcp6c.c
-UNIT_SRC += src/osn_priv_netlink.c
-UNIT_SRC += src/osn_route.c
-UNIT_SRC += src/osn_types.c
-UNIT_SRC += src/osn_udhcpc.c
-UNIT_SRC += src/osn_fw.c
 
 UNIT_SRC_TOP := $(OVERRIDE_DIR)/src/osn_upnpd.c

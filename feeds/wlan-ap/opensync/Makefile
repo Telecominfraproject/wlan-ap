@@ -1,14 +1,14 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=opensync
-PKG_VERSION:=1.4.0.1
+PKG_VERSION:=2.0.5.0
 PKG_RELEASE:=1
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL:=https://github.com/plume-design/opensync.git
-PKG_SOURCE_DATE:=2019-10-25
-PKG_SOURCE_VERSION:=d46964b2588800e92ac96f562054d6f45cb81147
+PKG_SOURCE_DATE:=2020-06-28
+PKG_SOURCE_VERSION:=ee8945e44366087832bdafdf69784c6a87e3a5e6
 
-PKG_BUILD_DEPENDS:=python3-kconfiglib/host
+PKG_BUILD_DEPENDS:=python3-kconfiglib/host python3-jinja2/host python3-markupsafe/host
 PKG_CONFIG_DEPENDS:=CONFIG_PACKAGE_wlan-ap-keys
 
 include $(INCLUDE_DIR)/package.mk
@@ -16,7 +16,7 @@ include $(INCLUDE_DIR)/package.mk
 define Package/opensync/default
 	CATEGORY:=Network
 	TITLE:=cloud network management system
-	DEPENDS:=+libev +jansson +protobuf +libprotobuf-c +libmosquitto +libopenssl +openvswitch +libpcap +libuci +libiwinfo +iw
+	DEPENDS:=+libev +jansson +protobuf +libprotobuf-c +libmosquitto +libopenssl +openvswitch +libpcap +libuci +libcurl +libnl-tiny +libubus +libblobmsg-json
 endef
 
 define Package/opensync-ap2220
@@ -57,6 +57,14 @@ Package/opensync-ecw5410/description=$(call Package/opensync/description)
 Package/opensync-ecw5211/description=$(call Package/opensync/description)
 Package/opensync-ea8300/description=$(call Package/opensync/description)
 
+define Package/opensync-ea8300/config
+menu "OpenSync Configuration"
+config WLAN_AP_CLOUD_IP
+	string
+	prompt "The default IP of the cloud"
+endmenu
+endef
+
 define Build/Prepare
 	$(PKG_UNPACK)
 	rm $(PKG_BUILD_DIR)/{vendor,platform}
@@ -64,6 +72,10 @@ define Build/Prepare
 	[ ! -d ./src/ ] || $(CP) ./src/. $(PKG_BUILD_DIR)
 	$(Build/Patch)
 endef
+
+TARGET_CFLAGS += \
+	-I$(STAGING_DIR)/usr/include \
+	-I$(STAGING_DIR)/usr/include/libnl-tiny
 
 define Build/Compile
 	$(MAKE) -C $(PKG_BUILD_DIR) \
@@ -76,17 +88,16 @@ define Build/Compile
 endef
 
 define Package/opensync/install
-	$(INSTALL_DIR) $(1)/usr/plume/bin
-	$(INSTALL_DIR) $(1)/usr/plume/etc
-	$(INSTALL_DIR) $(1)/usr/plume/certs
+	$(CP) ./files/* $(1)
+	$(INSTALL_DIR) $(1)/usr/opensync/{bin,etc,certs}
 	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs//usr/plume/bin/* $(1)/usr/plume/bin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs/usr/plume/etc/* $(1)/usr/plume/etc
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs/usr/plume/tools/ovsh $(1)/usr/plume/bin
-	$(SED) "s/CLOUD_IP=/CLOUD_IP=$(CONFIG_WLAN_AP_CLOUD_IP)/g" $(1)/etc/uci-defaults/99-opensync
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs/usr/opensync/bin/* $(1)/usr/opensync/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs/usr/opensync/etc/* $(1)/usr/opensync/etc
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs/usr/opensync/tools/ovsh $(1)/usr/opensync/bin
+	$(SED) "s/CLOUD_IP=/CLOUD_IP=$(CONFIG_WLAN_AP_CLOUD_IP)/g" $(1)/etc/uci-defaults/99-cloud-ip
 	$(MAKE) -C $(PKG_BUILD_DIR)/ TARGET=$(BUILD_VARIANT) rootfs-copy-only INSTALL_ROOTFS_DIR=$(1)
 ifdef CONFIG_PACKAGE_wlan-ap-keys
-	rm $(1)/usr/plume/certs/*
+	rm -f $(1)/usr/opensync/certs/*
 endif
 endef
 

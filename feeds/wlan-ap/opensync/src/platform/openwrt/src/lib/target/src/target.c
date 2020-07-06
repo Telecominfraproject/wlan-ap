@@ -33,8 +33,10 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "const.h"
 
 #include "target.h"
+#include "nl80211.h"
 
 struct ev_loop *wifihal_evloop = NULL;
+const struct target_radio_ops *radio_ops;
 
 /******************************************************************************
  *  TARGET definitions
@@ -42,94 +44,61 @@ struct ev_loop *wifihal_evloop = NULL;
 
 bool target_ready(struct ev_loop *loop)
 {
-    wifihal_evloop = loop;
-    return true;
+	wifihal_evloop = loop;
+	return true;
 }
 
 bool target_init(target_init_opt_t opt, struct ev_loop *loop)
 {
-#if 0
-    if (!target_map_ifname_init())
-    {
-        LOGE("Target init failed to initialize interface mapping");
-        return false;
-    }
-#endif
+	wifihal_evloop = loop;
+	target_map_init();
+	target_map_insert("home-ap-24", "home_ap_24");
+	target_map_insert("home-ap-50", "home_ap_50");
+	target_map_insert("home-ap-l50", "home_ap_l50");
+	target_map_insert("home-ap-u50", "home_ap_u50");
 
-    wifihal_evloop = loop;
+	target_map_insert("wifi0", "phy1");
+	target_map_insert("wifi1", "phy2");
+	target_map_insert("wifi2", "phy0");
 
-    switch (opt)
-    {
-        case TARGET_INIT_MGR_SM:
-            break;
+	switch (opt) {
+	case TARGET_INIT_MGR_SM:
+		break;
 
-        case TARGET_INIT_MGR_WM:
-            if (evsched_init(loop) == false)
-            {
-                LOGE("Initializing WM "
-                        "(Failed to initialize EVSCHED)");
-                return -1;
-            }
+	case TARGET_INIT_MGR_WM:
+		if (evsched_init(loop) == false) {
+			LOGE("Initializing WM (Failed to initialize EVSCHED)");
+			return -1;
+		}
+		break;
 
-//            sync_init(SYNC_MGR_WM, NULL);
-            break;
+	case TARGET_INIT_MGR_CM:
+		break;
 
-        case TARGET_INIT_MGR_CM:
-//            sync_init(SYNC_MGR_CM, cloud_config_mode_init);
-            break;
+	case TARGET_INIT_MGR_BM:
+		break;
 
-        case TARGET_INIT_MGR_BM:
-            break;
+	default:
+		break;
+	}
 
-        default:
-            break;
-    }
-
-    return true;
+	return true;
 }
 
 bool target_close(target_init_opt_t opt, struct ev_loop *loop)
 {
-    switch (opt)
-    {
-        case TARGET_INIT_MGR_WM:
-//            sync_cleanup();
-            /* fall through */
+	switch (opt) {
+	case TARGET_INIT_MGR_WM:
+		/* fall through */
 
-        case TARGET_INIT_MGR_SM:
-            break;
+	case TARGET_INIT_MGR_SM:
+		break;
 
-        default:
-            break;
-    }
+	default:
+		break;
+	}
 
-    target_map_close();
+	target_map_close();
 
-    return true;
+	return true;
 }
-#if 0
-const char* target_persistent_storage_dir(void)
-{
-    return TARGET_PERSISTENT_STORAGE;
-}
-
-const char* target_scripts_dir(void)
-{
-    return TARGET_SCRIPTS_PATH;
-}
-
-const char* target_tools_dir(void)
-{
-    return TARGET_TOOLS_PATH;
-}
-
-const char* target_bin_dir(void)
-{
-    return TARGET_BIN_PATH;
-}
-
-const char* target_speedtest_dir(void)
-{
-    return target_tools_dir();
-}
-#endif

@@ -26,481 +26,329 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include <stdio.h>
 #include <stdbool.h>
+
+#include <uci.h>
+#include <uci_blob.h>
+
 #include <target.h>
+
+#include "ovsdb.h"
+#include "ovsdb_update.h"
+#include "ovsdb_sync.h"
+#include "ovsdb_table.h"
+#include "ovsdb_cache.h"
+
+#include "nl80211.h"
+#include "radio.h"
+#include "vif.h"
+#include "phy.h"
 #include "log.h"
 #include "evsched.h"
-#include "uci_helper.h"
+#include "uci.h"
+#include "utils.h"
 
-static bool needReset = true;  /* On start-up, we need to initialize DB from  the UCI */
+static struct uci_package *wireless;
+struct uci_context *uci;
+struct blob_buf b = { };
+int reload_config = 0;
 
-static struct target_radio_ops g_rops;
-static bool g_resync_ongoing = false;
+enum {
+	WDEV_ATTR_PATH,
+	WDEV_ATTR_DISABLED,
+	WDEV_ATTR_CHANNEL,
+	WDEV_ATTR_TXPOWER,
+	WDEV_ATTR_BEACON_INT,
+	WDEV_ATTR_HTMODE,
+	WDEV_ATTR_HWMODE,
+	WDEV_ATTR_COUNTRY,
+	WDEV_ATTR_CHANBW,
+	WDEV_ATTR_TX_ANTENNA,
+	WDEV_ATTR_FREQ_BAND,
+	__WDEV_ATTR_MAX,
+};
 
 
-static bool radio_state_get(
-        int radioIndex,
-        struct schema_Wifi_Radio_State *rstate)
+static const struct blobmsg_policy wifi_device_policy[__WDEV_ATTR_MAX] = {
+	[WDEV_ATTR_PATH] = { .name = "path", .type = BLOBMSG_TYPE_STRING },
+	[WDEV_ATTR_DISABLED] = { .name = "disabled", .type = BLOBMSG_TYPE_BOOL },
+	[WDEV_ATTR_CHANNEL] = { .name = "channel", .type = BLOBMSG_TYPE_INT32 },
+	[WDEV_ATTR_TXPOWER] = { .name = "txpower", .type = BLOBMSG_TYPE_INT32 },
+	[WDEV_ATTR_BEACON_INT] = { .name = "beacon_int", .type = BLOBMSG_TYPE_INT32 },
+	[WDEV_ATTR_HTMODE] = { .name = "htmode", .type = BLOBMSG_TYPE_STRING },
+	[WDEV_ATTR_HWMODE] = { .name = "hwmode", .type = BLOBMSG_TYPE_STRING },
+	[WDEV_ATTR_COUNTRY] = { .name = "country", .type = BLOBMSG_TYPE_STRING },
+	[WDEV_ATTR_CHANBW] = { .name = "chanbw", .type = BLOBMSG_TYPE_INT32 },
+	[WDEV_ATTR_TX_ANTENNA] = { .name = "tx_antenna", .type = BLOBMSG_TYPE_INT32 },
+	[WDEV_ATTR_FREQ_BAND] = { .name = "freq_band", .type = BLOBMSG_TYPE_STRING },
+};
+
+const struct uci_blob_param_list wifi_device_param = {
+	.n_params = __WDEV_ATTR_MAX,
+	.params = wifi_device_policy,
+};
+
+static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_Config *rconf)
 {
-    memset(rstate, 0, sizeof(*rstate));
-    schema_Wifi_Radio_State_mark_all_present(rstate);
-    rstate->_partial_update = true;
-    rstate->channel_sync_present = false;
-    rstate->channel_mode_present = false;
-    rstate->radio_config_present = false;
-    rstate->vif_states_present = false;
+	struct blob_attr *tb[__WDEV_ATTR_MAX] = { };
+	struct schema_Wifi_Radio_State  rstate;
+	char phy[6];
 
-    if (UCI_OK == wifi_getRadioIfName(radioIndex, rstate->if_name, sizeof(rstate->if_name))) {
-        rstate->if_name_exists = true;
-        LOGN("radio if_name: %s", rstate->if_name);
-    }
+	LOGN("%s: get state", rstate.if_name);
 
-    if (UCI_OK == wifi_getRadioChannel(radioIndex, &(rstate->channel))) {
-        rstate->channel_exists = true;
-        LOGN("radio channel: %d", rstate->channel);
-    }
+	memset(&rstate, 0, sizeof(rstate));
+	schema_Wifi_Radio_State_mark_all_present(&rstate);
+	rstate._partial_update = true;
+	rstate.channel_sync_present = false;
+	rstate.channel_mode_present = false;
+	rstate.radio_config_present = false;
+	rstate.vif_states_present = false;
 
-    if (UCI_OK == wifi_getRadioEnable(radioIndex, &(rstate->enabled))) {
-        rstate->enabled_exists = true;
-        LOGN("radio enabled %d", rstate->enabled);
-    }
+	blob_buf_init(&b, 0);
+	uci_to_blob(&b, s, &wifi_device_param);
+	blobmsg_parse(wifi_device_policy, __WDEV_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
 
-    /* tx_power gets boundary checked between 1 .. 32 */
-    if (UCI_OK == wifi_getRadioTxPower(radioIndex, &(rstate->tx_power))) {
-        rstate->tx_power_exists = true;
-        LOGN("radio tx_power: %d", rstate->tx_power);
-        /* 0 means max in UCI, 32 is max in OVSDB */
-        if (rstate->tx_power == 0)	rstate->tx_power = 32;
-    } else {
-        rstate->tx_power = 32;
-        rstate->tx_power_exists = true;
-    }
+	SCHEMA_SET_STR(rstate.if_name, s->e.name);
 
-    if (UCI_OK == wifi_getRadioBeaconInterval(radioIndex, &(rstate->bcn_int))) {
-        rstate->bcn_int_exists = true;
-        LOGN("radio beacon interval: %d", rstate->bcn_int);
-    } else {
-        rstate->bcn_int = 100;
-        rstate->bcn_int_exists = true;
-    }
+	if (strcmp(s->e.name, "wifi0")) {
+		STRSCPY(rstate.hw_config_keys[0], "dfs_enable");
+		snprintf(rstate.hw_config[0], sizeof(rstate.hw_config[0]), "1");
+		STRSCPY(rstate.hw_config_keys[1], "dfs_ignorecac");
+		snprintf(rstate.hw_config[1], sizeof(rstate.hw_config[0]), "0");
+		STRSCPY(rstate.hw_config_keys[2], "dfs_usenol");
+		snprintf(rstate.hw_config[2], sizeof(rstate.hw_config[0]), "1");
+		rstate.hw_config_len = 3;
+	}
 
-#if 0
-    switch (radioIndex) {
-        case 0:
-           snprintf(rstate->ht_mode, sizeof(rstate->ht_mode),"HT80");
-           snprintf(rstate->hw_mode, sizeof(rstate->hw_mode),"11a");
-           snprintf(rstate->freq_band, sizeof(rstate->freq_band),"5GU");
-           break;
-        case 1:
-           snprintf(rstate->ht_mode, sizeof(rstate->ht_mode),"HT20");
-           snprintf(rstate->hw_mode, sizeof(rstate->hw_mode),"11g");
-           snprintf(rstate->freq_band, sizeof(rstate->freq_band),"5GU");
-           break;
-        case 2:
-           snprintf(rstate->ht_mode, sizeof(rstate->ht_mode),"HT80");
-           snprintf(rstate->hw_mode, sizeof(rstate->hw_mode),"11a");
-           snprintf(rstate->freq_band, sizeof(rstate->freq_band),"5GU");
-           break;
-    }
-    rstate->ht_mode_exists = true;
-    rstate->freq_band_exists = true;
-    rstate->hw_mode_exists = true;
-#endif
-    wifi_getRadioAllowedChannel(radioIndex, rstate->allowed_channels, &(rstate->allowed_channels_len));
+	if (!tb[WDEV_ATTR_PATH] ||
+	    phy_from_path(blobmsg_get_string(tb[WDEV_ATTR_PATH]), phy)) {
+		LOGE("%s has no phy", rstate.if_name);
+		return false;
+	}
 
-    if (UCI_OK == wifi_getRadioFreqBand(rstate->allowed_channels, rstate->allowed_channels_len, rstate->freq_band)) {
-	rstate->freq_band_exists = true;
-        LOGN("radio freq band: %s", rstate->freq_band);
-    }
+	if (tb[WDEV_ATTR_CHANNEL])
+		SCHEMA_SET_INT(rstate.channel, blobmsg_get_u32(tb[WDEV_ATTR_CHANNEL]));
 
-    if(wifi_getTxChainMask(radioIndex, &(rstate->tx_chainmask))) {
-	rstate->tx_chainmask_exists = true;
-        LOGN("tx_chainmask: %d", rstate->tx_chainmask);
-    }
+	SCHEMA_SET_INT(rstate.enabled, 1);
+	if (tb[WDEV_ATTR_DISABLED] && blobmsg_get_bool(tb[WDEV_ATTR_DISABLED]))
+		SCHEMA_SET_INT(rstate.enabled, 0);
+	else
+		SCHEMA_SET_INT(rstate.enabled, 1);
 
-    if (UCI_OK == wifi_getRadioHtMode(radioIndex, rstate->ht_mode)) {
-        rstate->ht_mode_exists = true;
-        LOGN("radio ht mode: %s", rstate->ht_mode);
-    }
+	if (tb[WDEV_ATTR_TXPOWER]) {
+		SCHEMA_SET_INT(rstate.tx_power, blobmsg_get_u32(tb[WDEV_ATTR_TXPOWER]));
+		/* 0 means max in UCI, 32 is max in OVSDB */
+		if (rstate.tx_power == 0)
+			rstate.tx_power = 32;
+	} else
+		SCHEMA_SET_INT(rstate.tx_power, 32);
 
-    if (UCI_OK == wifi_getRadioHwMode(radioIndex, rstate->hw_mode)) {
-        rstate->hw_mode_exists = true;
-        LOGN("radio hw mode: %s", rstate->hw_mode);
-    }
-    if(UCI_OK == wifi_getRadioMacaddress(radioIndex, rstate->mac)){
-        rstate->mac_exists = true;
-        LOGN("radio mac address:%s", rstate->mac);
-    }
-    snprintf(rstate->country, sizeof(rstate->country),"CA");
-    rstate->country_exists = true;
+	if (tb[WDEV_ATTR_BEACON_INT])
+		SCHEMA_SET_INT(rstate.bcn_int, blobmsg_get_u32(tb[WDEV_ATTR_BEACON_INT]));
+	else
+		SCHEMA_SET_INT(rstate.bcn_int, 100);
 
-    return true;
+	if (tb[WDEV_ATTR_HTMODE])
+		SCHEMA_SET_STR(rstate.ht_mode, blobmsg_get_string(tb[WDEV_ATTR_HTMODE]));
+
+	if (tb[WDEV_ATTR_HWMODE])
+		SCHEMA_SET_STR(rstate.hw_mode, blobmsg_get_string(tb[WDEV_ATTR_HWMODE]));
+
+	if (tb[WDEV_ATTR_TX_ANTENNA])
+		SCHEMA_SET_INT(rstate.tx_chainmask, blobmsg_get_u32(tb[WDEV_ATTR_TX_ANTENNA]));
+	else
+		SCHEMA_SET_INT(rstate.tx_chainmask, phy_get_tx_chainmask(phy));
+
+	if (rstate.hw_mode_exists && rstate.ht_mode_exists) {
+		struct mode_map *m = mode_map_get_cloud(rstate.ht_mode, rstate.hw_mode);
+
+		if (m) {
+			SCHEMA_SET_STR(rstate.hw_mode, m->hwmode);
+			if (m->htmode)
+				SCHEMA_SET_STR(rstate.ht_mode, m->htmode);
+			else
+				rstate.ht_mode_exists = false;
+		} else {
+			LOGE("%s: failed to decode ht/hwmode", rstate.if_name);
+			rstate.hw_mode_exists = false;
+			rstate.ht_mode_exists = false;
+		}
+	}
+
+	if (tb[WDEV_ATTR_COUNTRY])
+		SCHEMA_SET_STR(rstate.country, blobmsg_get_string(tb[WDEV_ATTR_COUNTRY]));
+	else
+		SCHEMA_SET_STR(rstate.country, "CA");
+
+	rstate.allowed_channels_len = phy_get_channels(phy, rstate.allowed_channels);
+	rstate.allowed_channels_present = true;
+
+	if (tb[WDEV_ATTR_FREQ_BAND])
+		SCHEMA_SET_STR(rstate.freq_band, blobmsg_get_string(tb[WDEV_ATTR_FREQ_BAND]));
+	else if (!phy_get_band(phy, rstate.freq_band))
+		rstate.freq_band_exists = true;
+
+	if (!phy_get_mac(phy, rstate.mac))
+		rstate.mac_exists = true;
+
+	if (rconf) {
+		LOGN("%s: updating radio config", rstate.if_name);
+		radio_state_to_conf(&rstate, rconf);
+		SCHEMA_SET_STR(rconf->hw_type, "ath10k");
+		radio_ops->op_rconf(rconf);
+	}
+	LOGN("%s: updating radio state", rstate.if_name);
+	radio_ops->op_rstate(&rstate);
+
+	return true;
 }
 
-static bool radio_state_update(unsigned int radioIndex)
+bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
+			      const struct schema_Wifi_Radio_Config_flags *changed)
 {
-    struct schema_Wifi_Radio_State  rstate;
+	struct uci_section *s;
 
-    if (!radio_state_get(radioIndex, &rstate))
-    {
-        LOGE("%s: Radio state update failed -- unable to get state for idx %d",
-             __func__, radioIndex);
-        return false;
-    }
-    LOGN("Updating state for radio index %d...", radioIndex);
-    g_rops.op_rstate(&rstate);
+	blob_buf_init(&b, 0);
 
-    return true;
+	if (changed->channel && rconf->channel)
+		blobmsg_add_u32(&b, "channel", rconf->channel);
+
+	if (changed->enabled)
+		blobmsg_add_u8(&b, "disabled", rconf->enabled ? 0 : 1);
+
+	if (changed->tx_power)
+		blobmsg_add_u32(&b, "txpower", rconf->tx_power);
+
+	if (changed->tx_chainmask)
+		blobmsg_add_u32(&b, "tx_antenna", rconf->tx_chainmask);
+
+	if (changed->country)
+		blobmsg_add_string(&b, "country", rconf->country);
+
+	if (changed->bcn_int) {
+		int beacon_int = rconf->bcn_int;
+
+		if ((rconf->bcn_int < 50) || (rconf->bcn_int > 400))
+			beacon_int = 100;
+		blobmsg_add_u32(&b, "beacon_int", beacon_int);
+	}
+
+	if ((changed->ht_mode) || (changed->hw_mode) || (changed->freq_band)) {
+		struct mode_map *m = mode_map_get_uci(rconf->freq_band, rconf->ht_mode,
+						      rconf->hw_mode);
+		if (m) {
+			blobmsg_add_string(&b, "htmode", m->ucihtmode);
+			blobmsg_add_string(&b, "hwmode", m->ucihwmode);
+			blobmsg_add_u32(&b, "chanbw", 20);
+		} else
+			 LOGE("%s: failed to set ht/hwmode", rconf->if_name);
+	}
+
+	uci_load(uci, "wireless", &wireless);
+	s = uci_lookup_section(uci, wireless, rconf->if_name);
+	if (!s) {
+		LOGE("%s: failed to lookup %s.%s", rconf->if_name,
+		     "wireless", rconf->if_name);
+		uci_unload(uci, wireless);
+		return false;
+	}
+
+	blob_to_uci(b.head, &wifi_device_param, s);
+	uci_commit(uci, &wireless, false);
+	uci_unload(uci, wireless);
+
+	reload_config = 1;
+
+	return true;
 }
 
-static bool radio_copy_config_from_state(
-        int radioIndex,
-        struct schema_Wifi_Radio_State *rstate,
-        struct schema_Wifi_Radio_Config *rconf)
+static void periodic_task(void *arg)
 {
-    memset(rconf, 0, sizeof(*rconf));
-    schema_Wifi_Radio_Config_mark_all_present(rconf);
-    rconf->_partial_update = true;
-    rconf->vif_configs_present = false;
+	static int counter = 0;
+	struct uci_element *e = NULL;
 
-    SCHEMA_SET_STR(rconf->if_name, rstate->if_name);
-    LOGT("rconf->ifname = %s", rconf->if_name);
-    SCHEMA_SET_STR(rconf->freq_band, rstate->freq_band);
-    LOGT("rconf->freq_band = %s", rconf->freq_band);
-    SCHEMA_SET_STR(rconf->hw_type, rstate->hw_type);
-    LOGT("rconf->hw_type = %s", rconf->hw_type);
-    SCHEMA_SET_INT(rconf->enabled, rstate->enabled);
-    LOGT("rconf->enabled = %d", rconf->enabled);
-    SCHEMA_SET_INT(rconf->channel, rstate->channel);
-    LOGT("rconf->channel = %d", rconf->channel);
-    SCHEMA_SET_INT(rconf->tx_power, rstate->tx_power);
-    LOGT("rconf->tx_power = %d", rconf->tx_power);
-    SCHEMA_SET_STR(rconf->country, rstate->country);
-    LOGT("rconf->country = %s", rconf->country);
-    SCHEMA_SET_STR(rconf->ht_mode, rstate->ht_mode);
-    LOGT("rconf->ht_mode = %s", rconf->ht_mode);
-    SCHEMA_SET_STR(rconf->hw_mode, rstate->hw_mode);
-    LOGT("rconf->hw_mode = %s", rconf->hw_mode);
+	if ((counter % 15) && !reload_config)
+		goto done;
 
-    return true;
+	if (reload_config) {
+		LOGT("periodic: reload config");
+		reload_config = 0;
+		system("reload_config");
+	}
+
+	LOGT("periodic: start state update ");
+
+	uci_load(uci, "wireless", &wireless);
+	uci_foreach_element(&wireless->sections, e) {
+		struct uci_section *s = uci_to_section(e);
+
+		if (!strcmp(s->type, "wifi-device"))
+			radio_state_update(s, NULL);
+	}
+
+	uci_foreach_element(&wireless->sections, e) {
+		struct uci_section *s = uci_to_section(e);
+
+		if (!strcmp(s->type, "wifi-iface"))
+			vif_state_update(s, NULL);
+	}
+	uci_unload(uci, wireless);
+	LOGT("periodic: stop state update ");
+
+done:
+	counter++;
+	evsched_task_reschedule_ms(EVSCHED_SEC(1));
 }
 
-static void radio_resync_all_task(void *arg)
+bool target_radio_config_init2(void)
 {
-    int r, rnum;
-    int ret;
-    int s, snum;
-    char ssid_ifname[128];
-    
-    LOGT("Re-sync started");
+	struct schema_Wifi_Radio_Config rconf;
+	struct schema_Wifi_VIF_Config vconf;
+	struct uci_element *e = NULL;
 
-#if 1
-    ret = wifi_getRadioNumberOfEntries(&rnum);
-    if (ret != UCI_OK)
-    {
-        LOGE("%s: failed to get radio count", __func__);
-        goto out;
-    }
-#else
-   rnum = 3;
-#endif
+	uci_load(uci, "wireless", &wireless);
+	uci_foreach_element(&wireless->sections, e) {
+		struct uci_section *s = uci_to_section(e);
 
-    for(r = 0; r < rnum; r++)
-    {
-        if (!radio_state_update(r))
-        {
-            LOGW("Cannot update radio state for radio index %d", r);
-            continue;
-        }
-    }
+		if (!strcmp(s->type, "wifi-device"))
+			radio_state_update(s, &rconf);
+	}
 
-#if 1
-    ret = wifi_getSSIDNumberOfEntries(&snum);
-    if (ret != UCI_OK)
-    {
-        LOGE("%s: failed to get SSID count", __func__);
-        goto out;
-    }
+	uci_foreach_element(&wireless->sections, e) {
+		struct uci_section *s = uci_to_section(e);
 
-    if (snum == 0)
-    {
-        LOGE("%s: no SSIDs detected", __func__);
-        goto out;
-    }
-#else
-    snum = 5;
-#endif
+		if (!strcmp(s->type, "wifi-iface"))
+			vif_state_update(s, &vconf);
+	}
+	uci_unload(uci, wireless);
 
-    for (s = 0; s < snum; s++)
-    {
-        memset(ssid_ifname, 0, sizeof(ssid_ifname));
-        ret = wifi_getVIFName(s, ssid_ifname, sizeof(ssid_ifname));
-        if (ret != UCI_OK)
-        {
-            continue;
-        }
-
-#if 0
-        // Filter SSID's that we don't have mappings for
-        if (!target_unmap_ifname_exists(ssid_ifname))
-        {
-            continue;
-        }
-
-        // Fetch existing clients
-        if (!clients_hal_fetch_existing(s))
-        {
-            LOGW("Fetching existing clients for %s failed", ssid_ifname);
-        }
-#endif
-
-        if (!vif_state_update(s))
-        {
-            LOGW("Cannot update VIF state for SSID index %d", s);
-            continue;
-        }
-    }
-out:
-    LOGT("Re-sync completed");
-    g_resync_ongoing = false;
-}
-
-void radio_trigger_resync()
-{
-    if (!g_resync_ongoing)
-    {
-        g_resync_ongoing = true;
-        LOGI("Radio re-sync scheduled");
-        evsched_task(&radio_resync_all_task, NULL,
-                EVSCHED_SEC(2));
-    } else
-    {
-        LOGT("Radio re-sync already ongoing!");
-    }
-}
-
-static void healthcheck_task(void *arg)
-{
-    LOGI("Healthcheck re-sync");
-    radio_trigger_resync();
-    evsched_task_reschedule_ms(EVSCHED_SEC(15));
+	return true;
 }
 
 bool target_radio_init(const struct target_radio_ops *ops)
 {
-    g_rops = *ops;
-    evsched_task(&healthcheck_task, NULL, EVSCHED_SEC(5));
-    
-    return true;
+	uci = uci_alloc_context();
+
+	target_map_init();
+	target_map_insert("home-ap-24", "home_ap_24");
+	target_map_insert("home-ap-50", "home_ap_50");
+	target_map_insert("home-ap-l50", "home_ap_l50");
+	target_map_insert("home-ap-u50", "home_ap_u50");
+
+	target_map_insert("wifi0", "phy1");
+	target_map_insert("wifi1", "phy2");
+	target_map_insert("wifi2", "phy0");
+
+	radio_ops = ops;
+
+	evsched_task(&periodic_task, NULL, EVSCHED_SEC(5));
+
+	radio_nl80211_init();
+	radio_ubus_init();
+
+	return true;
 }
 
-bool target_radio_config_init2()
+bool target_radio_config_need_reset(void)
 {
-    int r;
-    int rnum;
-    int s;
-    int snum;
-    int ssid_radio_idx;
-    char ssid_ifname[128];
-    int ret;
-
-    struct schema_Wifi_VIF_Config   vconfig;
-    struct schema_Wifi_VIF_State    vstate;
-    struct schema_Wifi_Radio_Config rconfig;
-    struct schema_Wifi_Radio_State  rstate;
-
-    target_ifname_map_init();
-
-#if 1
-    ret = wifi_getRadioNumberOfEntries(&rnum);
-    if (ret != UCI_OK)
-    {
-        LOGE("%s: failed to get radio count", __func__);
-        return false;
-    }
-#else
-    rnum = 3;
-#endif
-
-    for (r = 0; r < rnum; r++)
-    {
-        radio_state_get(r, &rstate);
-        radio_copy_config_from_state(r, &rstate, &rconfig);
-        g_rops.op_rconf(&rconfig);
-        g_rops.op_rstate(&rstate);
-
-#if 1
-        ret = wifi_getSSIDNumberOfEntries(&snum);
-
-        if (ret != UCI_OK)
-        {
-            LOGE("%s: failed to get SSID count", __func__);
-            return false;
-        }
-
-        if (snum == 0)
-        {
-            LOGE("%s: no SSIDs detected", __func__);
-            continue;
-        }
-#else
-        snum = 5;
-#endif
-
-        for (s = 0; s < snum; s++)
-        {
-            memset(ssid_ifname, 0, sizeof(ssid_ifname));
-            ret = wifi_getVIFName(s, ssid_ifname, sizeof(ssid_ifname));
-            if (ret != UCI_OK)
-            {
-                LOGW("%s: failed to get AP name for index %d. Skipping.\n", __func__, s);
-                continue;
-            }
-
-#if 0
-            // Filter SSID's that we don't have mappings for
-            if (!target_unmap_ifname_exists(ssid_ifname))
-            {
-                continue;
-            }
-#endif
-
-            ret = wifi_getSSIDRadioIndex(s, &ssid_radio_idx);
-            if (ret != UCI_OK)
-            {
-                LOGW("Cannot get radio index for SSID %d", s);
-                continue;
-            }
-
-            if (ssid_radio_idx != r)
-            {
-                continue;
-            }
-
-            LOGI("Found SSID index %d: %s", s, ssid_ifname);
-            if (!vif_state_get(s, &vstate))
-            {
-                LOGE("%s: cannot get vif state for SSID index %d", __func__, s);
-                continue;
-            }
-            if (!vif_copy_to_config(s, &vstate, &vconfig))
-            {
-                LOGE("%s: cannot copy VIF state to config for SSID index %d", __func__, s);
-                continue;
-            }
-            g_rops.op_vconf(&vconfig, rconfig.if_name);
-            g_rops.op_vstate(&vstate);
-        }
-    }
-/*
-    if (!dfs_event_cb_registered)
-    {
-        if (wifi_chan_eventRegister(chan_event_cb) != RETURN_OK)
-        {
-            LOGE("Failed to register chan event callback\n");
-        }
-
-        dfs_event_cb_registered = true;
-    }
-*/
-    return true;
+	return true;
 }
-
-bool target_radio_config_need_reset()
-{
-    return needReset;
-}
-
-static void radio_ifname_to_idx(char* if_name, int* radioIndex)
-{
-    // TODO: Quick hack.  This needs to be improved.
-    *radioIndex = atoi(strndup(if_name + 5, 5));
-}
-
-bool target_radio_config_set2(
-     const struct schema_Wifi_Radio_Config *rconf,
-     const struct schema_Wifi_Radio_Config_flags *changed)
- {
-     int radioIndex;
-     bool rc = true;
-
-     radio_ifname_to_idx(target_map_ifname((char*)rconf->if_name), &radioIndex);
-
-     if (changed->channel || changed->ht_mode)
-     {
-         if (!wifi_setRadioChannel(radioIndex, rconf->channel, rconf->ht_mode))
-         {
-             LOGE("%s: cannot change radio channel for %s", __func__, rconf->if_name);
-             rc = false;
-         }
-     }
-
-     if (changed->enabled)
-     {
-        if (!wifi_setRadioEnabled(radioIndex, rconf->enabled))
-        {
-            LOGE("%s: cannot enable/disable radio for %s", __func__, rconf->if_name);
-            rc = false;
-        }
-     }
-
-     if (changed->tx_power)
-     {
-         if (!wifi_setRadioTxPower(radioIndex, rconf->tx_power))
-         {
-            LOGE("%s: cannot set radio tx power for %s", __func__, rconf->if_name);
-            rc = false;
-         }
-     }
-
-    
-     if (changed->bcn_int)
-     {
-         int beacon_interval = rconf->bcn_int;
-         if ((rconf->bcn_int < 50) || (rconf->bcn_int > 400))	beacon_interval = 100;
-         if (!wifi_setRadioBeaconInterval(radioIndex, beacon_interval))
-         {
-            LOGE("%s: cannot set beacon interval radio for %s", __func__, rconf->if_name);
-            rc = false;
-         }
-     }
-
-     if ((changed->ht_mode) || (changed->hw_mode) || (changed->freq_band))
-     {
-        if (!wifi_setRadioModes(radioIndex, rconf->freq_band, rconf->ht_mode, rconf->hw_mode))    
-        {
-            LOGE("%s: cannot set radio mode and bw for %s", __func__, rconf->if_name);
-            rc = false;
-        }
-     }
-
-     if (rc==false) LOGE("Radio config partially applied for %s", rconf->if_name);
-	
-     return radio_state_update(radioIndex);
- }
-
-bool radio_rops_vstate(struct schema_Wifi_VIF_State *vstate)
-{
-    if (!g_rops.op_vstate)
-    {
-        LOGE("%s: op_vstate not set", __func__);
-        return false;
-    }
-
-    g_rops.op_vstate(vstate);
-    return true;
-}
-
-bool radio_rops_vconfig(
-        struct schema_Wifi_VIF_Config *vconf,
-        const char *radio_ifname)
-{
-    if (!g_rops.op_vconf)
-    {
-        LOGE("%s: op_vconf not set", __func__);
-        return false;
-    }
-
-    g_rops.op_vconf(vconf, radio_ifname);
-    return true;
-}
-

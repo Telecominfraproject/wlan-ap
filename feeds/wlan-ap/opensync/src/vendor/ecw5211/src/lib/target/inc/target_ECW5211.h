@@ -56,10 +56,10 @@ typedef void target_capacity_data_t;
  *  MANAGERS definitions
  *****************************************************************************/
 #if !defined(CONFIG_TARGET_MANAGER)
-#define TARGET_MANAGER_PATH(X)      "/usr/plume/bin/"X
+#define TARGET_MANAGER_PATH(X)      "/usr/opensync/bin/"X
 #endif
 
-#define TARGET_TOOLS_PATH           "/usr/plume/tools"
+#define TARGET_TOOLS_PATH           "/usr/opensync/tools"
 
 #include "target_common.h"
 
