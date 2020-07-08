@@ -974,8 +974,8 @@ drv_mac80211_setup() {
 		local no_reload=1
 		if [ -n "$(ubus list | grep hostapd.$primary_ap)" ]; then
 			[ "${NEW_MD5}" = "${OLD_MD5}" ] || {
-				ubus call hostapd.$primary_ap reload
-				no_reload=$?
+				#ubus call hostapd.$primary_ap reload
+				no_reload=1
 				if [ "$no_reload" != "0" ]; then
 					mac80211_vap_cleanup hostapd "${OLDAPLIST}"
 					mac80211_vap_cleanup wpa_supplicant "$(uci -q -P /var/state get wireless._${phy}.splist)"
