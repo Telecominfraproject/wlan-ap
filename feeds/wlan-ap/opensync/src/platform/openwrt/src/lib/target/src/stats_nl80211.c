@@ -67,82 +67,93 @@ static int nl80211_chainmask_recv(struct nl_msg *msg, void *arg)
 
 static int nl80211_assoclist_recv(struct nl_msg *msg, void *arg)
 {
-	static struct nla_policy stats_policy[NL80211_STA_INFO_MAX + 1] = {
-		[NL80211_STA_INFO_INACTIVE_TIME] = { .type = NLA_U32    },
-		[NL80211_STA_INFO_RX_PACKETS]    = { .type = NLA_U32    },
-		[NL80211_STA_INFO_TX_PACKETS]    = { .type = NLA_U32    },
-		[NL80211_STA_INFO_RX_BITRATE]    = { .type = NLA_NESTED },
-		[NL80211_STA_INFO_TX_BITRATE]    = { .type = NLA_NESTED },
-		[NL80211_STA_INFO_SIGNAL]        = { .type = NLA_U8     },
-		[NL80211_STA_INFO_RX_BYTES]      = { .type = NLA_U32    },
-		[NL80211_STA_INFO_TX_BYTES]      = { .type = NLA_U32    },
-		[NL80211_STA_INFO_TX_RETRIES]    = { .type = NLA_U32    },
-		[NL80211_STA_INFO_TX_FAILED]     = { .type = NLA_U32    },
-		[NL80211_STA_INFO_T_OFFSET]      = { .type = NLA_U64    },
-		[NL80211_STA_INFO_STA_FLAGS] =
-			{ .minlen = sizeof(struct nl80211_sta_flag_update) },
-	};
+    static struct nla_policy stats_policy[NL80211_STA_INFO_MAX + 1] = {
+            [NL80211_STA_INFO_INACTIVE_TIME] = { .type = NLA_U32    },
+            [NL80211_STA_INFO_RX_PACKETS]    = { .type = NLA_U32    },
+            [NL80211_STA_INFO_TX_PACKETS]    = { .type = NLA_U32    },
+            [NL80211_STA_INFO_RX_BITRATE]    = { .type = NLA_NESTED },
+            [NL80211_STA_INFO_TX_BITRATE]    = { .type = NLA_NESTED },
+            [NL80211_STA_INFO_SIGNAL]        = { .type = NLA_U8     },
+            [NL80211_STA_INFO_RX_BYTES]      = { .type = NLA_U32    },
+            [NL80211_STA_INFO_TX_BYTES]      = { .type = NLA_U32    },
+            [NL80211_STA_INFO_TX_RETRIES]    = { .type = NLA_U32    },
+            [NL80211_STA_INFO_TX_FAILED]     = { .type = NLA_U32    },
+            [NL80211_STA_INFO_RX_DROP_MISC]  = { .type = NLA_U64    },
+            [NL80211_STA_INFO_T_OFFSET]      = { .type = NLA_U64    },
+            [NL80211_STA_INFO_STA_FLAGS] =
+            { .minlen = sizeof(struct nl80211_sta_flag_update) },
+    };
 
-	static struct nla_policy rate_policy[NL80211_RATE_INFO_MAX + 1] = {
-		[NL80211_RATE_INFO_BITRATE]      = { .type = NLA_U16    },
-		[NL80211_RATE_INFO_MCS]          = { .type = NLA_U8     },
-		[NL80211_RATE_INFO_40_MHZ_WIDTH] = { .type = NLA_FLAG   },
-		[NL80211_RATE_INFO_SHORT_GI]     = { .type = NLA_FLAG   },
-	};
+    static struct nla_policy rate_policy[NL80211_RATE_INFO_MAX + 1] = {
+            [NL80211_RATE_INFO_BITRATE]      = { .type = NLA_U16    },
+            [NL80211_RATE_INFO_MCS]          = { .type = NLA_U8     },
+            [NL80211_RATE_INFO_40_MHZ_WIDTH] = { .type = NLA_FLAG   },
+            [NL80211_RATE_INFO_SHORT_GI]     = { .type = NLA_FLAG   },
+    };
 
-	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
-	struct nl_call_param *nl_call_param = (struct nl_call_param *)arg;
-	struct nlattr *rinfo[NL80211_RATE_INFO_MAX + 1];
-	struct nlattr *sinfo[NL80211_STA_INFO_MAX + 1];
-	struct nlattr *tb[NL80211_ATTR_MAX + 1];
-	target_client_record_t *client_entry;
+    struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+    struct nl_call_param *nl_call_param = (struct nl_call_param *)arg;
+    struct nlattr *rinfo[NL80211_RATE_INFO_MAX + 1];
+    struct nlattr *sinfo[NL80211_STA_INFO_MAX + 1];
+    struct nlattr *tb[NL80211_ATTR_MAX + 1];
+    target_client_record_t *client_entry;
 
-	memset(tb, 0, sizeof(tb));
-	memset(sinfo, 0, sizeof(sinfo));
+    memset(tb, 0, sizeof(tb));
+    memset(sinfo, 0, sizeof(sinfo));
 
-	nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
-		  genlmsg_attrlen(gnlh, 0), NULL);
+    nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
+            genlmsg_attrlen(gnlh, 0), NULL);
 
-	if (!tb[NL80211_ATTR_MAC] ||
-	    !tb[NL80211_ATTR_STA_INFO] ||
-		nla_parse_nested(sinfo, NL80211_STA_INFO_MAX,
-				 tb[NL80211_ATTR_STA_INFO], stats_policy)) {
-		LOGE("%s: invalid assoc entry", nl_call_param->ifname);
-		return NL_OK;
-	}
-	client_entry = target_client_record_alloc();
-	client_entry->info.type = nl_call_param->type;
-	memcpy(client_entry->info.mac, nla_data(tb[NL80211_ATTR_MAC]), ETH_ALEN);
-	memcpy(client_entry->info.ifname,
-	       target_unmap_ifname(nl_call_param->ifname),
-	       sizeof(client_entry->info.ifname));
+    if (!tb[NL80211_ATTR_MAC] ||
+            !tb[NL80211_ATTR_STA_INFO] ||
+            nla_parse_nested(sinfo, NL80211_STA_INFO_MAX,
+                    tb[NL80211_ATTR_STA_INFO], stats_policy)) {
+        LOGE("%s: invalid assoc entry", nl_call_param->ifname);
+        return NL_OK;
+    }
+    client_entry = target_client_record_alloc();
+    client_entry->info.type = nl_call_param->type;
+    memcpy(client_entry->info.mac, nla_data(tb[NL80211_ATTR_MAC]), ETH_ALEN);
+    memcpy(client_entry->info.essid,
+            target_unmap_ifname(nl_call_param->ifname),
+            sizeof(client_entry->info.ifname));
 
-	if (sinfo[NL80211_STA_INFO_TX_BYTES])
-		client_entry->stats.bytes_tx = nla_get_u32(sinfo[NL80211_STA_INFO_TX_BYTES]);
-	if (sinfo[NL80211_STA_INFO_RX_BYTES])
-		client_entry->stats.bytes_rx = nla_get_u32(sinfo[NL80211_STA_INFO_RX_BYTES]);
-	if (sinfo[NL80211_STA_INFO_RX_BITRATE] &&
-		!nla_parse_nested(rinfo, NL80211_RATE_INFO_MAX, sinfo[NL80211_STA_INFO_RX_BITRATE],
-				  rate_policy)) {
-			if (rinfo[NL80211_RATE_INFO_BITRATE32])
-				client_entry->stats.rate_rx = nla_get_u32(rinfo[NL80211_RATE_INFO_BITRATE32]) * 100;
-			else if (rinfo[NL80211_RATE_INFO_BITRATE])
-				client_entry->stats.rate_rx = nla_get_u32(rinfo[NL80211_RATE_INFO_BITRATE]) * 100;
-	}
-	if (sinfo[NL80211_STA_INFO_TX_BITRATE] &&
-		!nla_parse_nested(rinfo, NL80211_RATE_INFO_MAX, sinfo[NL80211_STA_INFO_TX_BITRATE],
-				  rate_policy)) {
-			if (rinfo[NL80211_RATE_INFO_BITRATE32])
-				client_entry->stats.rate_tx = nla_get_u32(rinfo[NL80211_RATE_INFO_BITRATE32]) * 100;
-			else if (rinfo[NL80211_RATE_INFO_BITRATE])
-				client_entry->stats.rate_tx = nla_get_u32(rinfo[NL80211_RATE_INFO_BITRATE]) * 100;
-	}
-	if (sinfo[NL80211_STA_INFO_SIGNAL])
-		client_entry->stats.rssi = (signed char)nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL]);
+    if (sinfo[NL80211_STA_INFO_TX_BYTES])
+        client_entry->stats.bytes_tx = nla_get_u32(sinfo[NL80211_STA_INFO_TX_BYTES]);
+    if (sinfo[NL80211_STA_INFO_RX_BYTES])
+        client_entry->stats.bytes_rx = nla_get_u32(sinfo[NL80211_STA_INFO_RX_BYTES]);
+    if (sinfo[NL80211_STA_INFO_RX_BITRATE] &&
+            !nla_parse_nested(rinfo, NL80211_RATE_INFO_MAX, sinfo[NL80211_STA_INFO_RX_BITRATE],
+                    rate_policy)) {
+        if (rinfo[NL80211_RATE_INFO_BITRATE32])
+            client_entry->stats.rate_rx = nla_get_u32(rinfo[NL80211_RATE_INFO_BITRATE32]) * 100;
+        else if (rinfo[NL80211_RATE_INFO_BITRATE])
+            client_entry->stats.rate_rx = nla_get_u32(rinfo[NL80211_RATE_INFO_BITRATE]) * 100;
+    }
+    if (sinfo[NL80211_STA_INFO_TX_BITRATE] &&
+            !nla_parse_nested(rinfo, NL80211_RATE_INFO_MAX, sinfo[NL80211_STA_INFO_TX_BITRATE],
+                    rate_policy)) {
+        if (rinfo[NL80211_RATE_INFO_BITRATE32])
+            client_entry->stats.rate_tx = nla_get_u32(rinfo[NL80211_RATE_INFO_BITRATE32]) * 100;
+        else if (rinfo[NL80211_RATE_INFO_BITRATE])
+            client_entry->stats.rate_tx = nla_get_u32(rinfo[NL80211_RATE_INFO_BITRATE]) * 100;
+    }
+    if (sinfo[NL80211_STA_INFO_SIGNAL])
+        client_entry->stats.rssi = (signed char)nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL]);
+    if (sinfo[NL80211_STA_INFO_TX_PACKETS])
+        client_entry->stats.frames_tx = nla_get_u32(sinfo[NL80211_STA_INFO_TX_PACKETS]);
+    if (sinfo[NL80211_STA_INFO_RX_PACKETS])
+        client_entry->stats.frames_rx = nla_get_u32(sinfo[NL80211_STA_INFO_RX_PACKETS]);
+    if (sinfo[NL80211_STA_INFO_TX_RETRIES])
+        client_entry->stats.retries_tx = nla_get_u32(sinfo[NL80211_STA_INFO_TX_RETRIES]);
+    if (sinfo[NL80211_STA_INFO_TX_FAILED])
+        client_entry->stats.errors_tx = nla_get_u32(sinfo[NL80211_STA_INFO_TX_FAILED]);
+    if (sinfo[NL80211_STA_INFO_RX_DROP_MISC])
+        client_entry->stats.errors_rx = nla_get_u64(sinfo[NL80211_STA_INFO_RX_DROP_MISC]);
 
-	ds_dlist_insert_tail(nl_call_param->list, client_entry);
+    ds_dlist_insert_tail(nl_call_param->list, client_entry);
 
-	return NL_OK;
+    return NL_OK;
 }
 
 static int nl80211_survey_recv(struct nl_msg *msg, void *arg)
