@@ -19,6 +19,28 @@ static int uci_fill_ptr(struct uci_ptr *ptr, struct uci_section *s, const char *
         return uci_lookup_ptr(p->ctx, ptr, NULL, false);
 }
 
+static char blob_to_string_buf[256];
+static char *blob_to_string(struct blob_attr *a, uint32_t type)
+{
+	switch (type) {
+	case BLOBMSG_TYPE_STRING:
+		return blobmsg_get_string(a);
+	case BLOBMSG_TYPE_BOOL:
+		snprintf(blob_to_string_buf, sizeof(blob_to_string_buf), "%s",
+			 blobmsg_get_bool(a) ? "1" : "0");
+		break;
+	case BLOBMSG_TYPE_INT32:
+		snprintf(blob_to_string_buf, sizeof(blob_to_string_buf), "%d",  blobmsg_get_u32(a));
+		break;
+	case BLOBMSG_TYPE_INT64:
+		snprintf(blob_to_string_buf, sizeof(blob_to_string_buf), "%lld",  blobmsg_get_u64(a));
+		break;
+	default:
+		return NULL;
+	}
+	return blob_to_string_buf;
+}
+
 int blob_to_uci(struct blob_attr *a, const struct uci_blob_param_list *param, struct uci_section *s)
 {
 	int sz = sizeof(struct blob_attr) * param->n_params;
@@ -34,8 +56,9 @@ int blob_to_uci(struct blob_attr *a, const struct uci_blob_param_list *param, st
 	blobmsg_parse(param->params, param->n_params, tb, blob_data(a), blob_len(a));
 
 	for (i = 0; i < param->n_params; i++) {
+		struct blob_attr *cur;
 		struct uci_ptr ptr;
-		char buf[128];
+		int rem = 0;
 
 		if (!tb[i])
 			continue;
@@ -43,28 +66,28 @@ int blob_to_uci(struct blob_attr *a, const struct uci_blob_param_list *param, st
 		if (uci_fill_ptr(&ptr, s, param->params[i].name) != UCI_OK)
 			ptr.option = param->params[i].name;
 
-		ptr.value = buf;
 		switch (param->params[i].type) {
 		case BLOBMSG_TYPE_STRING:
-			ptr.value = blobmsg_get_string(tb[i]);
-			break;
 		case BLOBMSG_TYPE_BOOL:
-			snprintf(buf, sizeof(buf), "%s",
-				 blobmsg_get_bool(tb[i]) ? "1" : "0");
-			break;
 		case BLOBMSG_TYPE_INT32:
-			snprintf(buf, sizeof(buf), "%d",  blobmsg_get_u32(tb[i]));
-			break;
 		case BLOBMSG_TYPE_INT64:
-			snprintf(buf, sizeof(buf), "%lld",  blobmsg_get_u64(tb[i]));
+			ptr.value = blob_to_string(tb[i], param->params[i].type);
+			if (uci_set(s->package->ctx, &ptr) != UCI_OK)
+				LOGE("failed to apply uci option %s", param->params[i].name);
+			break;
+		case BLOBMSG_TYPE_ARRAY:
+			uci_delete(s->package->ctx, &ptr);
+			blobmsg_for_each_attr(cur, tb[i], rem) {
+				ptr.value = blob_to_string(cur, blobmsg_type(cur));
+				if (uci_add_list(s->package->ctx, &ptr) != UCI_OK)
+					LOGE("failed to apply uci option %s", param->params[i].name);
+			}
 			break;
 		default:
 			LOGE("unhandled uci type %d", param->params[i].type);
 			continue;
 		}
 
-		if (uci_set(s->package->ctx, &ptr) != UCI_OK)
-			LOGE("failed to apply uci option %s", param->params[i].name);
 	}
 
 	free(tb);
