@@ -48,6 +48,13 @@ typedef struct
 typedef struct
 {
     DPP_TARGET_SURVEY_RECORD_COMMON_STRUCT;
+    uint32_t                        chan_active;
+    uint32_t                        chan_busy;
+    uint32_t                        chan_busy_ext;
+    uint32_t                        chan_self;
+    uint32_t                        chan_rx;
+    uint32_t                        chan_tx;
+    uint32_t                        duration_ms;
 } target_survey_record_t;
 
 typedef void target_capacity_data_t;
