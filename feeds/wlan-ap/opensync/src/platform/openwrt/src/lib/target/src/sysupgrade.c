@@ -164,23 +164,39 @@ static bool osp_upg_download_image(int timeout, long file_size)
 static bool osp_upg_download_url(int timeout)
 {
 	char file_path[128];
+	char cmd[128];
 	char *file_name;
 	status = OSP_UPG_OK;
 	unsigned long file_size;
 	struct stat st_buf;
+	int ret_status;
 
 	file_name = basename(upg_url);
 	LOGI("UM: Downloading image: (%s), from url: %s", file_name, upg_url);
 
 	osp_upg_get_img_path(file_path, sizeof(file_path));
 
-	if (stat(file_path, &st_buf) != 0) {
-		file_size = 0;
-	} else {
-		file_size = st_buf.st_size;
+	if (!stat(file_path, &st_buf))
+		unlink(file_path);
+	file_size = 0;
+
+	if (!osp_upg_download_image(timeout, file_size)) {
+		status = OSP_UPG_DL_FW;
+		return false;
 	}
 
-	return osp_upg_download_image(timeout, file_size);
+	snprintf(cmd, sizeof(cmd), "sysupgrade -T %s", file_path);
+
+	LOGI("um: testing the image %s", file_path);
+	ret_status = system(cmd);
+
+	if (!WIFEXITED(ret_status) || WEXITSTATUS(ret_status) != 0) {
+		LOGI("UM: sysupgrade failed");
+		status = OSP_UPG_IMG_FAIL;
+		return false;
+	}
+
+	return true;
 }
 
 static void cb_osp_start_download(EV_P_ ev_timer *w, int events)
@@ -195,7 +211,6 @@ static void cb_osp_start_download(EV_P_ ev_timer *w, int events)
 
 	if (!osp_upg_download_url(dl_data->dl_timeout)) {
 		LOG(ERR, "UM: Error downloading %s", upg_url);
-		status = status;
 
 		// clear library URL if download failed allow repeating same URL in case of failure
 		upg_url[0]=0;
@@ -234,7 +249,7 @@ static bool upg_upgrade(const char *password)
 	}
 
 	LOGI("UM: Upgrading the image...");
-	snprintf(cmd, sizeof(cmd), "sysupgrade -n -v %s", img_path);
+	snprintf(cmd, sizeof(cmd), "sysupgrade %s", img_path);
 
 	LOGI("UM: Upgraded with image %s", img_path);
 	ret_status = system(cmd);
