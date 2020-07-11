@@ -78,6 +78,7 @@ static int nl80211_assoclist_recv(struct nl_msg *msg, void *arg)
 		[NL80211_STA_INFO_TX_BYTES]      = { .type = NLA_U32    },
 		[NL80211_STA_INFO_TX_RETRIES]    = { .type = NLA_U32    },
 		[NL80211_STA_INFO_TX_FAILED]     = { .type = NLA_U32    },
+		[NL80211_STA_INFO_RX_DROP_MISC]  = { .type = NLA_U64    },
 		[NL80211_STA_INFO_T_OFFSET]      = { .type = NLA_U64    },
 		[NL80211_STA_INFO_STA_FLAGS] =
 			{ .minlen = sizeof(struct nl80211_sta_flag_update) },
@@ -113,7 +114,7 @@ static int nl80211_assoclist_recv(struct nl_msg *msg, void *arg)
 	client_entry = target_client_record_alloc();
 	client_entry->info.type = nl_call_param->type;
 	memcpy(client_entry->info.mac, nla_data(tb[NL80211_ATTR_MAC]), ETH_ALEN);
-	memcpy(client_entry->info.ifname,
+	memcpy(client_entry->info.essid,
 	       target_unmap_ifname(nl_call_param->ifname),
 	       sizeof(client_entry->info.ifname));
 
@@ -136,9 +137,19 @@ static int nl80211_assoclist_recv(struct nl_msg *msg, void *arg)
 				client_entry->stats.rate_tx = nla_get_u32(rinfo[NL80211_RATE_INFO_BITRATE32]) * 100;
 			else if (rinfo[NL80211_RATE_INFO_BITRATE])
 				client_entry->stats.rate_tx = nla_get_u32(rinfo[NL80211_RATE_INFO_BITRATE]) * 100;
-	}
+		}
 	if (sinfo[NL80211_STA_INFO_SIGNAL])
 		client_entry->stats.rssi = (signed char)nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL]);
+	if (sinfo[NL80211_STA_INFO_TX_PACKETS])
+		client_entry->stats.frames_tx = nla_get_u32(sinfo[NL80211_STA_INFO_TX_PACKETS]);
+	if (sinfo[NL80211_STA_INFO_RX_PACKETS])
+		client_entry->stats.frames_rx = nla_get_u32(sinfo[NL80211_STA_INFO_RX_PACKETS]);
+	if (sinfo[NL80211_STA_INFO_TX_RETRIES])
+		client_entry->stats.retries_tx = nla_get_u32(sinfo[NL80211_STA_INFO_TX_RETRIES]);
+	if (sinfo[NL80211_STA_INFO_TX_FAILED])
+		client_entry->stats.errors_tx = nla_get_u32(sinfo[NL80211_STA_INFO_TX_FAILED]);
+	if (sinfo[NL80211_STA_INFO_RX_DROP_MISC])
+		client_entry->stats.errors_rx = nla_get_u64(sinfo[NL80211_STA_INFO_RX_DROP_MISC]);
 
 	ds_dlist_insert_tail(nl_call_param->list, client_entry);
 

@@ -110,12 +110,18 @@ bool target_stats_clients_convert(radio_entry_t *radio_cfg, target_client_record
 				  target_client_record_t *data_old, dpp_client_record_t *client_record)
 {
 	memcpy(client_record->info.mac, data_new->info.mac, sizeof(data_new->info.mac));
+	memcpy(client_record->info.essid, radio_cfg->if_name, sizeof(radio_cfg->if_name));
 
-	client_record->stats.bytes_tx   = data_new->stats.bytes_tx;
-	client_record->stats.bytes_rx   = data_new->stats.bytes_rx;
 	client_record->stats.rssi       = data_new->stats.rssi;
 	client_record->stats.rate_tx    = data_new->stats.rate_tx;
 	client_record->stats.rate_rx    = data_new->stats.rate_rx;
+	client_record->stats.bytes_tx   = data_new->stats.bytes_tx   - data_old->stats.bytes_tx;
+	client_record->stats.bytes_rx   = data_new->stats.bytes_rx   - data_old->stats.bytes_rx;
+	client_record->stats.frames_tx  = data_new->stats.frames_tx  - data_old->stats.frames_tx;
+	client_record->stats.frames_rx  = data_new->stats.frames_rx  - data_old->stats.frames_rx;
+	client_record->stats.retries_tx = data_new->stats.retries_tx - data_old->stats.retries_tx;
+	client_record->stats.errors_tx  = data_new->stats.errors_tx  - data_old->stats.errors_tx;
+	client_record->stats.errors_rx  = data_new->stats.errors_rx  - data_old->stats.errors_rx;
 
 	return true;
 }
