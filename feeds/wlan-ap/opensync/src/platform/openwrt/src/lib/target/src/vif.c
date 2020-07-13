@@ -71,6 +71,8 @@ enum {
 	WIF_ATTR_FT_PSK_LOCAL,
 	WIF_ATTR_UAPSD,
 	WIF_ATTR_CONFIGURED,
+	WIF_ATTR_MACLIST,
+	WIF_ATTR_MACFILTER,
 	__WIF_ATTR_MAX,
 };
 
@@ -96,6 +98,8 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_FT_PSK_LOCAL] = { .name = "ft_psk_generate_local" ,BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_UAPSD] = { .name = "uapsd", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_CONFIGURED] = { .name = "configured", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_MACFILTER]  = { .name = "macfilter", .type = BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_MACLIST]  = { .name = "maclist", .type = BLOBMSG_TYPE_ARRAY },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -211,119 +215,154 @@ out_none:
 
 bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vconf)
 {
-	struct blob_attr *tb[__WIF_ATTR_MAX] = { };
-	struct schema_Wifi_VIF_State vstate;
-	char mac[ETH_ALEN * 3];
-	char *ifname, radio[IF_NAMESIZE];
-	char *p;
+      struct blob_attr *tb[__WIF_ATTR_MAX] = { };
+      struct schema_Wifi_VIF_State vstate;
+      char mac[ETH_ALEN * 3];
+      char *ifname, radio[IF_NAMESIZE];
+      char *p;
 
-	memset(&vstate, 0, sizeof(vstate));
-	schema_Wifi_VIF_State_mark_all_present(&vstate);
+      memset(&vstate, 0, sizeof(vstate));
+      schema_Wifi_VIF_State_mark_all_present(&vstate);
 
-	blob_buf_init(&b, 0);
-	uci_to_blob(&b, s, &wifi_iface_param);
-	blobmsg_parse(wifi_iface_policy, __WIF_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
+      blob_buf_init(&b, 0);
+      uci_to_blob(&b, s, &wifi_iface_param);
+      blobmsg_parse(wifi_iface_policy, __WIF_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
 
-	if (!tb[WIF_ATTR_DEVICE] || !tb[WIF_ATTR_IFNAME]) {
-		LOGE("%s: invalid radio/ifname", s->e.name);
-		return false;
-	}
-	ifname = target_unmap_ifname(blobmsg_get_string(tb[WIF_ATTR_IFNAME]));
-	strncpy(radio, blobmsg_get_string(tb[WIF_ATTR_DEVICE]), IF_NAMESIZE);
+      if (!tb[WIF_ATTR_DEVICE] || !tb[WIF_ATTR_IFNAME]) {
+              LOGE("%s: invalid radio/ifname", s->e.name);
+              return false;
+      }
+      ifname = target_unmap_ifname(blobmsg_get_string(tb[WIF_ATTR_IFNAME]));
+      strncpy(radio, blobmsg_get_string(tb[WIF_ATTR_DEVICE]), IF_NAMESIZE);
 
-	vstate._partial_update = true;
-	vstate.associated_clients_present = false;
-	vstate.vif_config_present = false;
+      vstate._partial_update = true;
+      vstate.associated_clients_present = false;
+      vstate.vif_config_present = false;
 
-	SCHEMA_SET_INT(vstate.rrm, 1);
-	SCHEMA_SET_INT(vstate.btm, 1);
-	SCHEMA_SET_INT(vstate.vlan_id, 1);
-	SCHEMA_SET_INT(vstate.ft_psk, 0);
-	SCHEMA_SET_INT(vstate.group_rekey, 0);
+      SCHEMA_SET_INT(vstate.rrm, 1);
+      SCHEMA_SET_INT(vstate.btm, 1);
+      SCHEMA_SET_INT(vstate.vlan_id, 1);
+      SCHEMA_SET_INT(vstate.ft_psk, 0);
+      SCHEMA_SET_INT(vstate.group_rekey, 0);
 
-	strscpy(vstate.mac_list_type, "none", sizeof(vstate.mac_list_type));
-	vstate.mac_list_len = 0;
-	vstate.mac_list_type_exists = true;
+      vstate.mac_list_len = 0;
 
-	SCHEMA_SET_STR(vstate.if_name, ifname);
+      SCHEMA_SET_STR(vstate.if_name, ifname);
 
-	if (tb[WIF_ATTR_HIDDEN] && blobmsg_get_bool(tb[WIF_ATTR_HIDDEN]))
-		SCHEMA_SET_STR(vstate.ssid_broadcast, "disabled");
-	else
-		SCHEMA_SET_STR(vstate.ssid_broadcast, "enabled");
+      if (tb[WIF_ATTR_HIDDEN] && blobmsg_get_bool(tb[WIF_ATTR_HIDDEN]))
+              SCHEMA_SET_STR(vstate.ssid_broadcast, "disabled");
+      else
+              SCHEMA_SET_STR(vstate.ssid_broadcast, "enabled");
 
-	if (tb[WIF_ATTR_MODE])
-		SCHEMA_SET_STR(vstate.mode, blobmsg_get_string(tb[WIF_ATTR_MODE]));
-	else
-		SCHEMA_SET_STR(vstate.mode, "ap");
+      if (tb[WIF_ATTR_MODE])
+              SCHEMA_SET_STR(vstate.mode, blobmsg_get_string(tb[WIF_ATTR_MODE]));
+      else
+              SCHEMA_SET_STR(vstate.mode, "ap");
 
-	if (tb[WIF_ATTR_DISABLED] && blobmsg_get_bool(tb[WIF_ATTR_DISABLED]))
-		SCHEMA_SET_INT(vstate.enabled, 0);
-	else
-		SCHEMA_SET_INT(vstate.enabled, 1);
+      if (tb[WIF_ATTR_DISABLED] && blobmsg_get_bool(tb[WIF_ATTR_DISABLED]))
+              SCHEMA_SET_INT(vstate.enabled, 0);
+      else
+              SCHEMA_SET_INT(vstate.enabled, 1);
 
-	if (tb[WIF_ATTR_ISOLATE] && blobmsg_get_bool(tb[WIF_ATTR_ISOLATE]))
-		SCHEMA_SET_INT(vstate.ap_bridge, 1);
-	else
-		SCHEMA_SET_INT(vstate.ap_bridge, 0);
+      if (tb[WIF_ATTR_ISOLATE] && blobmsg_get_bool(tb[WIF_ATTR_ISOLATE]))
+              SCHEMA_SET_INT(vstate.ap_bridge, 1);
+      else
+              SCHEMA_SET_INT(vstate.ap_bridge, 0);
 
-//	if (tb[WIF_ATTR_UAPSD] && blobmsg_get_bool(tb[WIF_ATTR_UAPSD]))
-		SCHEMA_SET_INT(vstate.uapsd_enable, true);
-//	else
-//		SCHEMA_SET_INT(vstate.uapsd_enable, false);
+//    if (tb[WIF_ATTR_UAPSD] && blobmsg_get_bool(tb[WIF_ATTR_UAPSD]))
+              SCHEMA_SET_INT(vstate.uapsd_enable, true);
+//    else
+//            SCHEMA_SET_INT(vstate.uapsd_enable, false);
 
-	if (tb[WIF_ATTR_NETWORK])
-		SCHEMA_SET_STR(vstate.bridge, blobmsg_get_string(tb[WIF_ATTR_NETWORK]));
-	else
-		LOGW("%s: unknown bridge/network", s->e.name);
+      if (tb[WIF_ATTR_NETWORK])
+              SCHEMA_SET_STR(vstate.bridge, blobmsg_get_string(tb[WIF_ATTR_NETWORK]));
+      else
+              LOGW("%s: unknown bridge/network", s->e.name);
 
-	if (vstate.bridge_exists &&
-	    (p = strstr(vstate.bridge, "vlan")) != NULL) {
-		long int v = strtol(&p[4], NULL, 10);
+      if (vstate.bridge_exists &&
+          (p = strstr(vstate.bridge, "vlan")) != NULL) {
+              long int v = strtol(&p[4], NULL, 10);
 
-		SCHEMA_SET_INT(vstate.vlan_id, v);
-	} else
-		LOGW("%s: Cannot get VlanId", s->e.name);
+              SCHEMA_SET_INT(vstate.vlan_id, v);
+    } else
+              LOGW("%s: Cannot get VlanId", s->e.name);
 
-	if (tb[WIF_ATTR_SSID])
-		SCHEMA_SET_STR(vstate.ssid, blobmsg_get_string(tb[WIF_ATTR_SSID]));
-	else
-		LOGW("%s: failed to get SSID", s->e.name);
+      if (tb[WIF_ATTR_SSID])
+              SCHEMA_SET_STR(vstate.ssid, blobmsg_get_string(tb[WIF_ATTR_SSID]));
+      else
+              LOGW("%s: failed to get SSID", s->e.name);
 
-	if (strstr(s->e.name, "50"))
-		SCHEMA_SET_STR(vstate.min_hw_mode, "11ac");
-	else
-		SCHEMA_SET_STR(vstate.min_hw_mode, "11n");
+      if (strstr(s->e.name, "50"))
+              SCHEMA_SET_STR(vstate.min_hw_mode, "11ac");
+      else
+              SCHEMA_SET_STR(vstate.min_hw_mode, "11n");
 
-	if (tb[WIF_ATTR_BSSID])
-		SCHEMA_SET_STR(vstate.mac, blobmsg_get_string(tb[WIF_ATTR_BSSID]));
-	else if (tb[WIF_ATTR_IFNAME] && !vif_get_mac(blobmsg_get_string(tb[WIF_ATTR_IFNAME]), mac))
-		SCHEMA_SET_STR(vstate.mac, mac);
-	else
-		LOGN("%s: Failed to get base BSSID (mac)", vstate.if_name);
+      if (tb[WIF_ATTR_BSSID])
+              SCHEMA_SET_STR(vstate.mac, blobmsg_get_string(tb[WIF_ATTR_BSSID]));
+      else if (tb[WIF_ATTR_IFNAME] && !vif_get_mac(blobmsg_get_string(tb[WIF_ATTR_IFNAME]), mac))
+              SCHEMA_SET_STR(vstate.mac, mac);
+      else
+              LOGN("%s: Failed to get base BSSID (mac)", vstate.if_name);
 
-	vif_state_security_get(&vstate, tb);
+      if (tb[WIF_ATTR_MACFILTER] && !strcmp(blobmsg_get_string(tb[WIF_ATTR_MACFILTER]),"disable"))
+      {
+              vstate.mac_list_type_exists = true;
+              SCHEMA_SET_STR(vstate.mac_list_type, "none");
+      }
+      else if(tb[WIF_ATTR_MACFILTER] && !strcmp(blobmsg_get_string(tb[WIF_ATTR_MACFILTER]),"allow"))
+      {
+              vstate.mac_list_type_exists = true;
+              SCHEMA_SET_STR(vstate.mac_list_type, "whitelist");
+      }
+      else if(tb[WIF_ATTR_MACFILTER] && !strcmp(blobmsg_get_string(tb[WIF_ATTR_MACFILTER]),"deny"))
+      {
+              vstate.mac_list_type_exists = true;
+              SCHEMA_SET_STR(vstate.mac_list_type, "blacklist");
+      }
+      else
+      {
+              vstate.mac_list_type_exists = false;
+              LOGN("%s: Failed to get mac list type", vstate.mac_list_type);
+      }
 
-	if (vconf) {
-		LOGN("%s: updating vif config", radio);
-		vif_state_to_conf(&vstate, vconf);
-		radio_ops->op_vconf(vconf, radio);
-	}
-	LOGN("%s: updating vif state", radio);
-	radio_ops->op_vstate(&vstate, radio);
+      if (tb[WIF_ATTR_MACLIST])
+      {
+          struct blob_attr *cur=NULL;
+          int rem=0;
+          int num = 0;
+          blobmsg_for_each_attr(cur, tb[WIF_ATTR_MACLIST], rem)
+          {
+              if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING)
+                continue;
+              strcpy(vstate.mac_list[num],blobmsg_get_string(cur));
+              num++;
+          }
+          vstate.mac_list_len=num;
+      }
 
-	return true;
+      vif_state_security_get(&vstate, tb);
+
+      if (vconf) {
+              LOGN("%s: updating vif config", radio);
+              vif_state_to_conf(&vstate, vconf);
+              radio_ops->op_vconf(vconf, radio);
+      }
+      LOGN("%s: updating vif state", radio);
+      radio_ops->op_vstate(&vstate, radio);
+
+      return true;
 }
 
 bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
-			    const struct schema_Wifi_Radio_Config *rconf,
-			    const struct schema_Wifi_Credential_Config *cconfs,
-			    const struct schema_Wifi_VIF_Config_flags *changed,
-			    int num_cconfs)
+						  const struct schema_Wifi_Radio_Config *rconf,
+						  const struct schema_Wifi_Credential_Config *cconfs,
+						  const struct schema_Wifi_VIF_Config_flags *changed,
+						  int num_cconfs)
 {
 	struct uci_package *wireless = NULL;
 	struct uci_section *s;
-
+	void *a;
+	int i;
 	blob_buf_init(&b, 0);
 
 	if (changed->enabled && vconf->enabled)
@@ -350,7 +389,7 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 		blobmsg_add_bool(&b, "uapsd", 0);
 
 	if ((changed->ft_psk && vconf->ft_psk) ||
-	    (changed->ft_mobility_domain && vconf->ft_mobility_domain)) {
+		(changed->ft_mobility_domain && vconf->ft_mobility_domain)) {
 		blobmsg_add_bool(&b, "ieee80211r", 1);
 		blobmsg_add_hex16(&b, "mobility_domain", vconf->ft_mobility_domain);
 		blobmsg_add_bool(&b, "ft_psk_generate_local", vconf->ft_psk);
@@ -368,6 +407,24 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 		if (ret != true)
 			LOGE("%s: Failed to set new vlan Network %d", ssid_ifname, vconf->vlan_id);
 	}*/
+	if (changed->mac_list_type)
+	{
+		if (!strcmp(vconf->mac_list_type,"none"))
+			blobmsg_add_string(&b, "macfilter", "disable");
+		else if (!strcmp(vconf->mac_list_type,"whitelist"))
+			blobmsg_add_string(&b, "macfilter", "allow");
+		else if (!strcmp(vconf->mac_list_type,"blacklist"))
+			blobmsg_add_string(&b, "macfilter", "deny");
+		else
+			LOGN("Invalid mac list type");
+
+		a = blobmsg_open_array(&b, "maclist");
+		for (i=0;i<vconf->mac_list_len;i++)
+		{
+			blobmsg_add_string(&b,NULL,(char*)vconf->mac_list[i]);
+		}
+		blobmsg_close_array(&b, a);
+	}
 
 	vif_config_security_set(&b, vconf);
 
@@ -375,7 +432,7 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 	s = uci_lookup_section(uci, wireless, target_map_ifname((char *)vconf->if_name));
 	if (!s) {
 		LOGE("%s: failed to lookup %s.%s", vconf->if_name,
-		     "wireless", vconf->if_name);
+			 "wireless", vconf->if_name);
 		uci_unload(uci, wireless);
 		return false;
 	}
