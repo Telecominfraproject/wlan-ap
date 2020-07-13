@@ -321,8 +321,7 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 			    const struct schema_Wifi_VIF_Config_flags *changed,
 			    int num_cconfs)
 {
-	struct uci_package *wireless = NULL;
-	struct uci_section *s;
+	char *ifname = target_map_ifname((char *)vconf->if_name);
 
 	blob_buf_init(&b, 0);
 
@@ -371,20 +370,11 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 
 	vif_config_security_set(&b, vconf);
 
-	uci_load(uci, "wireless", &wireless);
-	s = uci_lookup_section(uci, wireless, target_map_ifname((char *)vconf->if_name));
-	if (!s) {
-		LOGE("%s: failed to lookup %s.%s", vconf->if_name,
-		     "wireless", vconf->if_name);
-		uci_unload(uci, wireless);
-		return false;
-	}
-
-	blob_to_uci(b.head, &wifi_iface_param, s);
-	uci_commit(uci, &wireless, false);
+	blob_to_uci_section(uci, "wireless", ifname, "wifi-iface",
+			    b.head, &wifi_iface_param);
+	uci_commit_all(uci);
 
 	reload_config = 1;
-	uci_unload(uci, wireless);
 
 	return true;
 }
