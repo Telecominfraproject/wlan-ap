@@ -197,6 +197,13 @@ static bool osp_upg_download_url(int timeout)
 	}
 
 	return true;
+	if (stat(file_path, &st_buf) != 0) {
+		file_size = 0;
+	} else {
+		file_size = st_buf.st_size;
+	}
+
+	return osp_upg_download_image(timeout, file_size);
 }
 
 static void cb_osp_start_download(EV_P_ ev_timer *w, int events)
@@ -211,6 +218,7 @@ static void cb_osp_start_download(EV_P_ ev_timer *w, int events)
 
 	if (!osp_upg_download_url(dl_data->dl_timeout)) {
 		LOG(ERR, "UM: Error downloading %s", upg_url);
+		status = status;
 
 		// clear library URL if download failed allow repeating same URL in case of failure
 		upg_url[0]=0;
@@ -250,6 +258,7 @@ static bool upg_upgrade(const char *password)
 
 	LOGI("UM: Upgrading the image...");
 	snprintf(cmd, sizeof(cmd), "sysupgrade %s", img_path);
+	snprintf(cmd, sizeof(cmd), "sysupgrade -n -v %s", img_path);
 
 	LOGI("UM: Upgraded with image %s", img_path);
 	ret_status = system(cmd);

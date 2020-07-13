@@ -126,7 +126,6 @@ bool target_stats_clients_convert(radio_entry_t *radio_cfg, target_client_record
 	return true;
 }
 
-
 /******************************************************************************
  *  SURVEY definitions
  *****************************************************************************/
@@ -216,6 +215,11 @@ bool target_stats_scan_stop(radio_entry_t *radio_cfg, radio_scan_type_t scan_typ
 		.ifname = target_map_ifname(radio_cfg->if_name),
 	};
 	bool ret = true;
+
+	if (nl80211_scan_abort(&nl_call_param) < 0)
+		ret = false;
+	LOGT("%s: scan abort returned %d", radio_cfg->if_name, ret);
+
 
 	if (nl80211_scan_abort(&nl_call_param) < 0)
 		ret = false;
