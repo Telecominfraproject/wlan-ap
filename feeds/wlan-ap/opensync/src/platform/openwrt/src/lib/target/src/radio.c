@@ -205,8 +205,6 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 			      const struct schema_Wifi_Radio_Config_flags *changed)
 {
-	struct uci_section *s;
-
 	blob_buf_init(&b, 0);
 
 	if (changed->channel && rconf->channel)
@@ -243,18 +241,9 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 			 LOGE("%s: failed to set ht/hwmode", rconf->if_name);
 	}
 
-	uci_load(uci, "wireless", &wireless);
-	s = uci_lookup_section(uci, wireless, rconf->if_name);
-	if (!s) {
-		LOGE("%s: failed to lookup %s.%s", rconf->if_name,
-		     "wireless", rconf->if_name);
-		uci_unload(uci, wireless);
-		return false;
-	}
-
-	blob_to_uci(b.head, &wifi_device_param, s);
-	uci_commit(uci, &wireless, false);
-	uci_unload(uci, wireless);
+	blob_to_uci_section(uci, "wireless", rconf->if_name, "wifi-device",
+			    b.head, &wifi_device_param);
+	uci_commit_all(uci);
 
 	reload_config = 1;
 
