@@ -218,7 +218,7 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 	}
 
 	blob_to_uci_section(uci, "wireless", rconf->if_name, "wifi-device",
-			    b.head, &wifi_device_param);
+			    b.head, &wifi_device_param, NULL);
 	uci_commit_all(uci);
 
 	reload_config = 1;

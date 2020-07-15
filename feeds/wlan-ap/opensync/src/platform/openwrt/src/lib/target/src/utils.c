@@ -398,6 +398,54 @@ void print_mac(char *mac_addr, const unsigned char *arg)
 		arg[0], arg[1], arg[2], arg[3], arg[4], arg[5]);
 }
 
+int net_get_mac(char *iface, char *mac)
+{
+	int sz = ETH_ALEN * 3;
+	char sysfs[PATH_MAX];
+	int fd;
+
+	snprintf(sysfs, sizeof(sysfs), "/sys/class/net/%s/address", iface);
+	fd = open(sysfs, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	memset(mac, 0, sz);
+	read(fd, mac, sz - 1);
+	close(fd);
+
+	return 0;
+}
+
+int net_get_mtu(char *iface)
+{
+	char sysfs[PATH_MAX];
+	char buf[16];
+	int fd;
+
+	snprintf(sysfs, sizeof(sysfs), "/sys/class/net/%s/mtu", iface);
+	fd = open(sysfs, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	memset(buf, 0, sizeof(buf));
+	read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+
+	return atoi(buf);
+}
+
+int net_is_bridge(char *iface)
+{
+	char sysfs[PATH_MAX];
+	int fd;
+
+	snprintf(sysfs, sizeof(sysfs), "/sys/class/net/%s/bridge/root_port", iface);
+	fd = open(sysfs, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	close(fd);
+
+	return 0;
+}
+
 int ieee80211_frequency_to_channel(int freq)
 {
 	/* see 802.11-2007 17.3.8.3.2 and Annex J */

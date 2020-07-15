@@ -149,7 +149,7 @@ static void syslog_handler(int type,
 		break;
 	}
 	blob_to_uci_section(uci, "system", "@system[-1]", "system",
-			    b.head, &log_param);
+			    b.head, &log_param, NULL);
 	uci_commit_all(uci);
 	system("/sbin/reload_config");
 	if (del)
@@ -236,7 +236,7 @@ static void ntp_handler(int type,
 		break;
 	}
 	blob_to_uci_section(uci, "system", "ntp", "timeserver",
-			    b.head, &ntp_param);
+			    b.head, &ntp_param, NULL);
 	uci_commit_all(uci);
 	system("/sbin/reload_config");
 	ntp_state(0);

@@ -37,4 +37,8 @@ extern int ieee80211_channel_to_frequency(int chan);
 
 extern int iface_is_up(const char *ifname);
 
+extern int net_get_mtu(char *iface);
+extern int net_get_mac(char *iface, char *mac);
+extern int net_is_bridge(char *iface);
+
 #endif
