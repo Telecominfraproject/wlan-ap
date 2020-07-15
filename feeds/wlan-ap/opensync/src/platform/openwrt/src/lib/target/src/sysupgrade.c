@@ -55,7 +55,7 @@ static ev_timer  osp_dtimer;
 static ev_timer  osp_utimer;
 
 static bool upg_running = false;
-static char upg_url[128];
+static char upg_url[256];
 
 static void osp_upg_get_img_path(char *buf, int buflen)
 {
@@ -263,6 +263,37 @@ static bool upg_upgrade(const char *password)
 	return true;
 }
 
+static void cb_osp_start_factory_reboot(EV_P_ ev_timer *w, int events)
+{
+	struct osp_upg_data *upg_data = w->data;
+	status = OSP_UPG_OK;
+
+	// stop timer watcher
+	ev_timer_stop(EV_A_ w);
+
+	if (upg_data == NULL)
+		return;
+
+	upg_running = true;
+
+	if (!strcmp(upg_url, "reboot"))
+		system("reboot");
+	else
+		system("jffs2reset -y -r");
+
+	upg_running = false;
+
+	if (upg_data->callback == NULL) {
+		LOGE("UM: (%s) Upgrade Callback is NULL", __func__);
+		goto cleanup;
+	}
+
+	upg_data->callback(OSP_UPG_UPG, status, 100);
+
+cleanup:
+	free(w->data);
+}
+
 static void cb_osp_start_upgrade(EV_P_ ev_timer *w, int events)
 {
 	struct osp_upg_data *upg_data = w->data;
@@ -357,6 +388,11 @@ bool osp_upg_dl(char *url, uint32_t timeout, osp_upg_cb dl_cb)
 		return false;
 	}
 
+	if (!strcmp(url, "reboot") || !strcmp(url, "factory")) {
+		dl_cb(OSP_UPG_DL, OSP_UPG_OK, 100);
+		return true;
+	}
+
 	dl_data = malloc(sizeof(struct osp_dl_data));
 	if (dl_data == NULL) {
 		LOG(ERR, "UM: Unable to allocate the download struct - malloc failed");
@@ -399,7 +435,10 @@ bool osp_upg_upgrade(char *password, osp_upg_cb upg_cb)
 		upg_data->upg_password = strdup(password);
 	}
 
-	ev_timer_init(&osp_utimer, cb_osp_start_upgrade, 0, 0);
+	if (!strcmp(upg_url, "factory") || !strcmp(upg_url, "reboot"))
+		ev_timer_init(&osp_utimer, cb_osp_start_factory_reboot, 0, 0);
+	else
+		ev_timer_init(&osp_utimer, cb_osp_start_upgrade, 0, 0);
 	osp_utimer.data = upg_data;
 	ev_timer_start(EV_DEFAULT , &osp_utimer);
 
