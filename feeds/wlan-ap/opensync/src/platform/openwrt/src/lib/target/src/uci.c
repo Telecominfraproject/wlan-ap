@@ -117,10 +117,41 @@ static int blob_to_uci(struct blob_attr *a, const struct uci_blob_param_list *pa
 	return 0;
 }
 
+static int blob_to_uci_del(struct blob_attr *a, const struct uci_blob_param_list *param, struct uci_section *s)
+{
+	int sz = sizeof(struct blob_attr) * param->n_params;
+	struct blob_attr **tb = malloc(sz);
+	int i;
+
+	if (!tb) {
+		LOGE("failed to allocate blob_to_uci table");
+		return -1;
+	}
+
+	memset(tb, 0, sz);
+	blobmsg_parse(param->params, param->n_params, tb, blob_data(a), blob_len(a));
+
+	for (i = 0; i < param->n_params; i++) {
+		struct uci_ptr ptr;
+
+		if (!tb[i])
+			continue;
+
+		if (uci_fill_ptr(&ptr, s, param->params[i].name) != UCI_OK)
+			ptr.option = param->params[i].name;
+
+		uci_delete(s->package->ctx, &ptr);
+	}
+
+	free(tb);
+	return 0;
+}
+
 int blob_to_uci_section(struct uci_context *uci,
 			const char *package, const char *section,
 			const char *type, struct blob_attr *a,
-			const struct uci_blob_param_list *param)
+			const struct uci_blob_param_list *param,
+			struct blob_attr *del)
 {
 	struct uci_ptr p = {};
 	char tuple[128];
@@ -133,6 +164,8 @@ int blob_to_uci_section(struct uci_context *uci,
 	ret = uci_set(uci, &p);
 	if (ret != UCI_OK)
 		goto err_out;
+	if (del)
+		blob_to_uci_del(del, param, p.s);
 	blob_to_uci(a, param, p.s);
 
 err_out:
@@ -144,19 +177,44 @@ err_out:
 	return UCI_OK;
 }
 
-int uci_section_del(struct uci_context *uci, char *prefix, char *section)
+int uci_section_del(struct uci_context *uci, char *prefix, char *package, char *section, char *type)
 {
 	struct uci_ptr p = {};
+	char name[64];
 	int ret;
 
-	ret = uci_lookup_ptr(uci, &p, section, false);
+	snprintf(name, sizeof(name), "%s.%s=%s", package, section, type);
+
+	ret = uci_lookup_ptr(uci, &p, name, false);
 	if (ret == UCI_OK)
 		ret = uci_delete(uci, &p);
 
 	if (ret == UCI_OK)
-		LOGT("%s: deleted %s", prefix, section);
+		LOGT("%s: deleted %s", prefix, name);
 	else
-		LOG(ERR, "%s: failed to delete %s", prefix, section);
+		LOG(ERR, "%s: failed to delete %s", prefix, name);
 
 	return ret;
+}
+
+int uci_section_to_blob(struct uci_context *uci, char *package, char *section,
+			struct blob_buf *buf, const struct uci_blob_param_list *param)
+{
+        struct uci_package *p;
+        struct uci_section *s = NULL;
+	int ret = -1;
+
+	if (uci_load(uci, package, &p))
+		return -1;
+	s = uci_lookup_section(uci, p, section);
+	if (!s)
+		goto out;
+
+	blob_buf_init(buf, 0);
+	uci_to_blob(buf, s, param);
+	ret = 0;
+
+out:
+	uci_unload(uci, p);
+        return ret;
 }

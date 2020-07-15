@@ -5,6 +5,8 @@
 
 #include "radio.h"
 #include "ubus.h"
+
+extern struct ev_loop *wifihal_evloop;
 static struct ubus_context *ubus;
 extern struct ev_loop *wifihal_evloop;
 
