@@ -73,6 +73,8 @@ enum {
 	WIF_ATTR_UAPSD,
 	WIF_ATTR_VLAN_ID,
 	WIF_ATTR_VID,
+	WIF_ATTR_MACLIST,
+	WIF_ATTR_MACFILTER,
 	__WIF_ATTR_MAX,
 };
 
@@ -99,6 +101,8 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_UAPSD] = { .name = "uapsd", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_VLAN_ID] = { .name = "vlan_id", BLOBMSG_TYPE_INT32 },
 	[WIF_ATTR_VID] = { .name = "vid", BLOBMSG_TYPE_INT32 },
+	[WIF_ATTR_MACFILTER]  = { .name = "macfilter", .type = BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_MACLIST]  = { .name = "maclist", .type = BLOBMSG_TYPE_ARRAY },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -300,6 +304,33 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	else
 		LOGN("%s: Failed to get base BSSID (mac)", vstate.if_name);
 
+	vstate.mac_list_type_exists = false;
+	if (tb[WIF_ATTR_MACFILTER]) {
+		if (!strcmp(blobmsg_get_string(tb[WIF_ATTR_MACFILTER]), "disable")) {
+			vstate.mac_list_type_exists = true;
+			SCHEMA_SET_STR(vstate.mac_list_type, "none");
+		} else if(!strcmp(blobmsg_get_string(tb[WIF_ATTR_MACFILTER]), "allow")) {
+			vstate.mac_list_type_exists = true;
+			SCHEMA_SET_STR(vstate.mac_list_type, "whitelist");
+		} else if(!strcmp(blobmsg_get_string(tb[WIF_ATTR_MACFILTER]), "deny")) {
+			vstate.mac_list_type_exists = true;
+			SCHEMA_SET_STR(vstate.mac_list_type, "blacklist");\
+		}
+	}
+
+	if (tb[WIF_ATTR_MACLIST]) {
+		struct blob_attr *cur = NULL;
+		int rem = 0;
+
+		vstate.mac_list_len = 0;
+		blobmsg_for_each_attr(cur, tb[WIF_ATTR_MACLIST], rem) {
+			if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING)
+				continue;
+			strcpy(vstate.mac_list[vstate.mac_list_len], blobmsg_get_string(cur));
+			vstate.mac_list_len++;
+		}
+	}
+
 	vif_state_security_get(&vstate, tb);
 
 	if (vconf) {
@@ -366,6 +397,24 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 		if (vconf->vlan_id > 2)
 			vid = vconf->vlan_id;
 		blobmsg_add_u32(&b, "vid", vid);
+	}
+
+	if (changed->mac_list_type) {
+		struct blob_attr *a;
+		int i;
+
+		blobmsg_add_string(&b, "macfilter", "disable");
+		if (!strcmp(vconf->mac_list_type,"whitelist"))
+			blobmsg_add_string(&b, "macfilter", "allow");
+		else if (!strcmp(vconf->mac_list_type,"blacklist"))
+			blobmsg_add_string(&b, "macfilter", "deny");
+		else
+			LOGN("Invalid mac list type");
+
+		a = blobmsg_open_array(&b, "maclist");
+		for (i = 0; i < vconf->mac_list_len; i++)
+			blobmsg_add_string(&b, NULL, (char*)vconf->mac_list[i]);
+		blobmsg_close_array(&b, a);
 	}
 
 	vif_config_security_set(&b, vconf);
