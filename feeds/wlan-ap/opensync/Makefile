@@ -47,6 +47,11 @@ define Package/opensync-ea8300
   DEPENDS+=@TARGET_ipq40xx
 endef
 
+define Package/opensync
+  $(call Package/opensync/default)
+  VARIANT:=tip
+endef
+
 define Package/opensync/description
 	OpenSync is a cloud-agnostic software for the delivery, curation, and management of services for the modern home.
 	For more info please visit: https://opensync.io
@@ -57,7 +62,7 @@ Package/opensync-ecw5410/description=$(call Package/opensync/description)
 Package/opensync-ecw5211/description=$(call Package/opensync/description)
 Package/opensync-ea8300/description=$(call Package/opensync/description)
 
-define Package/opensync-ea8300/config
+define Package/opensync/config
 menu "OpenSync Configuration"
 config WLAN_AP_CLOUD_IP
 	string
@@ -110,3 +115,4 @@ $(eval $(call BuildPackage,opensync-ap2220))
 $(eval $(call BuildPackage,opensync-ecw5410))
 $(eval $(call BuildPackage,opensync-ecw5211))
 $(eval $(call BuildPackage,opensync-ea8300))
+$(eval $(call BuildPackage,opensync))
