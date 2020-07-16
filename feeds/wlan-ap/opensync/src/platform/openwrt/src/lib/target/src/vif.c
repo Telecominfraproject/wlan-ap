@@ -248,7 +248,6 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 
 	strscpy(vstate.mac_list_type, "none", sizeof(vstate.mac_list_type));
 	vstate.mac_list_len = 0;
-	vstate.mac_list_type_exists = true;
 
 	SCHEMA_SET_STR(vstate.if_name, ifname);
 
@@ -304,7 +303,6 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	else
 		LOGN("%s: Failed to get base BSSID (mac)", vstate.if_name);
 
-	vstate.mac_list_type_exists = false;
 	if (tb[WIF_ATTR_MACFILTER]) {
 		if (!strcmp(blobmsg_get_string(tb[WIF_ATTR_MACFILTER]), "disable")) {
 			vstate.mac_list_type_exists = true;
@@ -314,8 +312,10 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 			SCHEMA_SET_STR(vstate.mac_list_type, "whitelist");
 		} else if(!strcmp(blobmsg_get_string(tb[WIF_ATTR_MACFILTER]), "deny")) {
 			vstate.mac_list_type_exists = true;
-			SCHEMA_SET_STR(vstate.mac_list_type, "blacklist");\
+			SCHEMA_SET_STR(vstate.mac_list_type, "blacklist");
 		}
+		else
+			vstate.mac_list_type_exists = false;
 	}
 
 	if (tb[WIF_ATTR_MACLIST]) {
@@ -403,13 +403,12 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 		struct blob_attr *a;
 		int i;
 
-		blobmsg_add_string(&b, "macfilter", "disable");
 		if (!strcmp(vconf->mac_list_type,"whitelist"))
 			blobmsg_add_string(&b, "macfilter", "allow");
 		else if (!strcmp(vconf->mac_list_type,"blacklist"))
 			blobmsg_add_string(&b, "macfilter", "deny");
 		else
-			LOGN("Invalid mac list type");
+			blobmsg_add_string(&b, "macfilter", "disable");
 
 		a = blobmsg_open_array(&b, "maclist");
 		for (i = 0; i < vconf->mac_list_len; i++)
