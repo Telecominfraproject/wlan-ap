@@ -35,8 +35,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #define TARGET_OVSDB_SOCK_PATH      "/var/run/openvswitch/db.sock"
 #define TARGET_LOGREAD_FILENAME     "messages"
 
-void target_ifname_map_init();
-
 typedef struct
 {
 	DPP_TARGET_CLIENT_RECORD_COMMON_STRUCT;

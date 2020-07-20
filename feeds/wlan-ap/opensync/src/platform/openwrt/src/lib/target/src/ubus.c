@@ -144,7 +144,7 @@ static void ubus_reconnect_cb(void *arg)
 		evsched_task_reschedule_ms(EVSCHED_SEC(1));
 		return;
 	}
-	LOG(ERR, "ubus: connected");
+	LOG(INFO, "ubus: connected");
 
 	ubus.connection_lost = ubus_connection_lost_cb;
 

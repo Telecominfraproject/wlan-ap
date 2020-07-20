@@ -117,8 +117,8 @@ static int nl80211_assoclist_recv(struct nl_msg *msg, void *arg)
 	client_entry->info.type = nl_call_param->type;
 	memcpy(client_entry->info.mac, nla_data(tb[NL80211_ATTR_MAC]), ETH_ALEN);
 	memcpy(client_entry->info.essid,
-	       target_unmap_ifname(nl_call_param->ifname),
-	       sizeof(client_entry->info.ifname));
+	       nl_call_param->ifname,
+	       sizeof(client_entry->info.essid));
 
 	if (sinfo[NL80211_STA_INFO_TX_BYTES])
 		client_entry->stats.bytes_tx = nla_get_u32(sinfo[NL80211_STA_INFO_TX_BYTES]);
@@ -492,7 +492,7 @@ int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_lis
 	if (!msg)
 		return -1;
 
-	LOGE("%s: not setting dwell time\n", nl_call_param->ifname);
+	LOGN("%s: not setting dwell time\n", nl_call_param->ifname);
 	//nla_put_u16(msg, NL80211_ATTR_MEASUREMENT_DURATION, dwell_time);
 	freq = nla_nest_start(msg, NL80211_ATTR_SCAN_FREQUENCIES);
 	for (i = 0; i < chan_num; i ++)
