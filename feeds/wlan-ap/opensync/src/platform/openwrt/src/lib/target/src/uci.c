@@ -1,7 +1,29 @@
 #include <uci.h>
 #include <uci_blob.h>
+#include <libubox/avl-cmp.h>
+#include <libubox/avl.h>
 
 #include "log.h"
+
+void uci_commit_all(struct uci_context *uci)
+{
+	char **configs = NULL;
+	char **p;
+
+	if ((uci_list_configs(uci, &configs) != UCI_OK) || !configs) {
+                LOG(ERR, "uci: failed to commit");
+		return;
+        }
+	for (p = configs; *p; p++) {
+		struct uci_ptr ptr = { };
+
+		if (uci_lookup_ptr(uci, &ptr, *p, true) != UCI_OK)
+			continue;
+		uci_commit(uci, &ptr.p, false);
+		uci_unload(uci, ptr.p);
+	}
+	free(configs);
+}
 
 static int uci_fill_ptr(struct uci_ptr *ptr, struct uci_section *s, const char *option)
 {
@@ -41,7 +63,7 @@ static char *blob_to_string(struct blob_attr *a, uint32_t type)
 	return blob_to_string_buf;
 }
 
-int blob_to_uci(struct blob_attr *a, const struct uci_blob_param_list *param, struct uci_section *s)
+static int blob_to_uci(struct blob_attr *a, const struct uci_blob_param_list *param, struct uci_section *s)
 {
 	int sz = sizeof(struct blob_attr) * param->n_params;
 	struct blob_attr **tb = malloc(sz);
@@ -87,11 +109,52 @@ int blob_to_uci(struct blob_attr *a, const struct uci_blob_param_list *param, st
 			LOGE("unhandled uci type %d", param->params[i].type);
 			continue;
 		}
-
 	}
 
 	free(tb);
 	return 0;
 }
 
+int blob_to_uci_section(struct uci_context *uci,
+			const char *package, const char *section,
+			const char *type, struct blob_attr *a,
+			const struct uci_blob_param_list *param)
+{
+	struct uci_ptr p = {};
+	char tuple[128];
+	int ret;
 
+	snprintf(tuple, sizeof(tuple), "%s.%s=%s", package, section, type);
+	ret = uci_lookup_ptr(uci, &p, tuple, true);
+	if (ret != UCI_OK)
+		goto err_out;
+	ret = uci_set(uci, &p);
+	if (ret != UCI_OK)
+		goto err_out;
+	blob_to_uci(a, param, p.s);
+
+err_out:
+	if (ret == UCI_OK)
+		LOGT("%s: created %s", package, section);
+	else
+		LOG(ERR, "%s: failed to create %s", package, section);
+
+	return UCI_OK;
+}
+
+int uci_section_del(struct uci_context *uci, char *prefix, char *section)
+{
+	struct uci_ptr p = {};
+	int ret;
+
+	ret = uci_lookup_ptr(uci, &p, section, false);
+	if (ret == UCI_OK)
+		ret = uci_delete(uci, &p);
+
+	if (ret == UCI_OK)
+		LOGT("%s: deleted %s", prefix, section);
+	else
+		LOG(ERR, "%s: failed to delete %s", prefix, section);
+
+	return ret;
+}
