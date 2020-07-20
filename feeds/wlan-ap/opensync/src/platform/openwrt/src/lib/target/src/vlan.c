@@ -98,7 +98,7 @@ static void vlan_add_network(int bridge, int vid)
 	char ifname[64];
 
 	snprintf(name, sizeof(name), "%s_%d", BRIDGE_NAME(bridge), vid);
-	snprintf(ifname, sizeof(ifname), "@%s.%d", BRIDGE_NAME(bridge), vid);
+	snprintf(ifname, sizeof(ifname), "br-%s.%d", BRIDGE_NAME(bridge), vid);
 	blob_buf_init(&b, 0);
 	blobmsg_add_string(&b, "ifname", ifname);
 	blobmsg_add_bool(&b, "autogen", 1);
