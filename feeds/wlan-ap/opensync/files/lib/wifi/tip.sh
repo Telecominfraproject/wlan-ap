@@ -40,6 +40,18 @@ run_wlan_ap() {
 		wifi_rename wifi1 home_ap_l50 'platform/soc/a800000.wifi' '5GL'
 		wifi_rename wifi2 home_ap_u50 'soc/40000000.pci/pci0000:00/0000:00:00.0/0000:01:00.0' '5GU'
 		;;
+	edgecore,ecw5410)
+		wifi_rename wifi0 home_ap_24 'soc/1b900000.pci/pci0002:00/0002:00:00.0/0002:01:00.0' '2.4G'
+		wifi_rename wifi1 home_ap_50 'soc/1b700000.pci/pci0001:00/0001:00:00.0/0001:01:00.0' '5G'
+		;;
+	edgecore,ecw5211)
+		wifi_rename wifi0 home_ap_24 'platform/soc/a000000.wifi' '2.4G'
+		wifi_rename wifi1 home_ap_50 'platform/soc/a800000.wifi' '5G'
+		;;
+	tp-link,ap2220)
+		wifi_rename wifi0 home_ap_24 'platform/soc/a000000.wifi' '2.4G'
+		wifi_rename wifi1 home_ap_50 'soc/40000000.pci/pci0000:00/0000:00:00.0/0000:01:00.0' '5G'
+		;;
 	*)
 		;;
 	esac
