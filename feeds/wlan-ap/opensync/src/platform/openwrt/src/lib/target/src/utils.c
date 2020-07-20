@@ -264,6 +264,29 @@ int blobmsg_get_hex16(struct blob_attr *a)
 	return (int) strtoul(val, NULL, 16);
 }
 
+char* delimiter_change( const char* inStr, char* outStr, char fromChar, char toChar)
+{
+	char *pos;
+
+	sprintf(outStr, "%s", inStr);
+	pos = strchr(outStr, fromChar);
+	while (pos) {
+		*pos = toChar;
+		pos = strchr(pos, fromChar);
+	}
+	return outStr;
+}
+
+char* vif_ifname_to_sectionname( const char* ifname, char* sectionname )
+{
+	return( delimiter_change( ifname, sectionname, '-', '_' ));
+}
+
+char* vif_sectionname_to_ifname( const char* sectionname, char* ifname )
+{
+	return( delimiter_change( sectionname, ifname, '_', '-' ));
+}
+
 bool vif_state_to_conf(struct schema_Wifi_VIF_State *vstate,
 		       struct schema_Wifi_VIF_Config *vconf)
 {

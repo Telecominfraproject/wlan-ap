@@ -67,7 +67,6 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 {
 	struct blob_attr *tb[__WDEV_ATTR_MAX] = { };
 	struct schema_Wifi_Radio_State  rstate;
-	char *freq_band = NULL;
 	char phy[6];
 
 	LOGN("%s: get state", rstate.if_name);
@@ -85,19 +84,6 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 	blobmsg_parse(wifi_device_policy, __WDEV_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
 
 	SCHEMA_SET_STR(rstate.if_name, s->e.name);
-
-	if (tb[WDEV_ATTR_FREQ_BAND])
-		freq_band = blobmsg_get_string(tb[WDEV_ATTR_FREQ_BAND]);
-
-	if (freq_band && (!strcmp(freq_band, "5G") || !strcmp(freq_band, "5GU"))) {
-		STRSCPY(rstate.hw_config_keys[0], "dfs_enable");
-		snprintf(rstate.hw_config[0], sizeof(rstate.hw_config[0]), "1");
-		STRSCPY(rstate.hw_config_keys[1], "dfs_ignorecac");
-		snprintf(rstate.hw_config[1], sizeof(rstate.hw_config[0]), "0");
-		STRSCPY(rstate.hw_config_keys[2], "dfs_usenol");
-		snprintf(rstate.hw_config[2], sizeof(rstate.hw_config[0]), "1");
-		rstate.hw_config_len = 3;
-	}
 
 	if (!tb[WDEV_ATTR_PATH] ||
 	    phy_from_path(blobmsg_get_string(tb[WDEV_ATTR_PATH]), phy)) {
@@ -167,6 +153,16 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 	else if (!phy_get_band(phy, rstate.freq_band))
 		rstate.freq_band_exists = true;
 
+	if (strcmp(rstate.freq_band, "2.4G"))	{
+                STRSCPY(rstate.hw_config_keys[0], "dfs_enable");
+                snprintf(rstate.hw_config[0], sizeof(rstate.hw_config[0]), "1");
+                STRSCPY(rstate.hw_config_keys[1], "dfs_ignorecac");
+                snprintf(rstate.hw_config[1], sizeof(rstate.hw_config[0]), "0");
+                STRSCPY(rstate.hw_config_keys[2], "dfs_usenol");
+                snprintf(rstate.hw_config[2], sizeof(rstate.hw_config[0]), "1");
+                rstate.hw_config_len = 3;
+	}
+
 	if (!phy_get_mac(phy, rstate.mac))
 		rstate.mac_exists = true;
 
@@ -233,7 +229,8 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 static void periodic_task(void *arg)
 {
 	static int counter = 0;
-	struct uci_element *e = NULL;
+	struct uci_element *e = NULL, *tmp = NULL;
+	char ifname[20];
 
 	if ((counter % 15) && !reload_config)
 		goto done;
@@ -247,18 +244,18 @@ static void periodic_task(void *arg)
 	LOGT("periodic: start state update ");
 
 	uci_load(uci, "wireless", &wireless);
-	uci_foreach_element(&wireless->sections, e) {
+	uci_foreach_element_safe(&wireless->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
 
 		if (!strcmp(s->type, "wifi-device"))
 			radio_state_update(s, NULL);
 	}
 
-	uci_foreach_element(&wireless->sections, e) {
+	uci_foreach_element_safe(&wireless->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
 
 		if (!strcmp(s->type, "wifi-iface"))
-			if (vif_find(s->e.name))
+			if (vif_find(vif_sectionname_to_ifname(s->e.name, ifname)))
 				vif_state_update(s, NULL);
 	}
 	uci_unload(uci, wireless);
@@ -273,17 +270,17 @@ bool target_radio_config_init2(void)
 {
 	struct schema_Wifi_Radio_Config rconf;
 	struct schema_Wifi_VIF_Config vconf;
-	struct uci_element *e = NULL;
+	struct uci_element *e = NULL, *tmp = NULL;
 
 	uci_load(uci, "wireless", &wireless);
-	uci_foreach_element(&wireless->sections, e) {
+	uci_foreach_element_safe(&wireless->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
 
 		if (!strcmp(s->type, "wifi-device"))
 			radio_state_update(s, &rconf);
 	}
 
-	uci_foreach_element(&wireless->sections, e) {
+	uci_foreach_element_safe(&wireless->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
 
 		if (!strcmp(s->type, "wifi-iface"))
@@ -299,14 +296,10 @@ bool target_radio_init(const struct target_radio_ops *ops)
 	uci = uci_alloc_context();
 
 	target_map_init();
-	target_map_insert("home-ap-24", "home_ap_24");
-	target_map_insert("home-ap-50", "home_ap_50");
-	target_map_insert("home-ap-l50", "home_ap_l50");
-	target_map_insert("home-ap-u50", "home_ap_u50");
 
-	target_map_insert("wifi0", "phy1");
-	target_map_insert("wifi1", "phy2");
-	target_map_insert("wifi2", "phy0");
+	target_map_insert("radio0", "phy0");
+	target_map_insert("radio1", "phy1");
+	target_map_insert("radio2", "phy2");
 
 	radio_ops = ops;
 

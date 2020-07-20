@@ -82,7 +82,7 @@ static void vif_add_station(struct wifi_station *sta, char *ifname, int assoc)
 	SCHEMA_SET_STR(client.mac, mac);
 	if (assoc)
 		SCHEMA_SET_STR(client.state, "active");
-	radio_ops->op_client(&client, target_unmap_ifname(ifname), assoc);
+	radio_ops->op_client(&client, ifname, assoc);
 }
 
 static void vif_add_sta_rate_rule(uint8_t *addr, char *ifname)
