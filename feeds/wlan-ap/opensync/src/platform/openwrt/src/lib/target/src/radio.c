@@ -109,16 +109,6 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 
 	SCHEMA_SET_STR(rstate.if_name, s->e.name);
 
-	if (strcmp(s->e.name, "wifi0")) {
-		STRSCPY(rstate.hw_config_keys[0], "dfs_enable");
-		snprintf(rstate.hw_config[0], sizeof(rstate.hw_config[0]), "1");
-		STRSCPY(rstate.hw_config_keys[1], "dfs_ignorecac");
-		snprintf(rstate.hw_config[1], sizeof(rstate.hw_config[0]), "0");
-		STRSCPY(rstate.hw_config_keys[2], "dfs_usenol");
-		snprintf(rstate.hw_config[2], sizeof(rstate.hw_config[0]), "1");
-		rstate.hw_config_len = 3;
-	}
-
 	if (!tb[WDEV_ATTR_PATH] ||
 	    phy_from_path(blobmsg_get_string(tb[WDEV_ATTR_PATH]), phy)) {
 		LOGE("%s has no phy", rstate.if_name);
@@ -186,6 +176,16 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 		SCHEMA_SET_STR(rstate.freq_band, blobmsg_get_string(tb[WDEV_ATTR_FREQ_BAND]));
 	else if (!phy_get_band(phy, rstate.freq_band))
 		rstate.freq_band_exists = true;
+
+	if (strcmp(rstate.freq_band, "2.4G"))	{
+                STRSCPY(rstate.hw_config_keys[0], "dfs_enable");
+                snprintf(rstate.hw_config[0], sizeof(rstate.hw_config[0]), "1");
+                STRSCPY(rstate.hw_config_keys[1], "dfs_ignorecac");
+                snprintf(rstate.hw_config[1], sizeof(rstate.hw_config[0]), "0");
+                STRSCPY(rstate.hw_config_keys[2], "dfs_usenol");
+                snprintf(rstate.hw_config[2], sizeof(rstate.hw_config[0]), "1");
+                rstate.hw_config_len = 3;
+	}
 
 	if (!phy_get_mac(phy, rstate.mac))
 		rstate.mac_exists = true;
@@ -318,14 +318,10 @@ bool target_radio_init(const struct target_radio_ops *ops)
 	uci = uci_alloc_context();
 
 	target_map_init();
-	target_map_insert("home-ap-24", "home_ap_24");
-	target_map_insert("home-ap-50", "home_ap_50");
-	target_map_insert("home-ap-l50", "home_ap_l50");
-	target_map_insert("home-ap-u50", "home_ap_u50");
 
-	target_map_insert("wifi0", "phy1");
-	target_map_insert("wifi1", "phy2");
-	target_map_insert("wifi2", "phy0");
+	target_map_insert("radio0", "phy0");
+	target_map_insert("radio1", "phy1");
+	target_map_insert("radio2", "phy2");
 
 	radio_ops = ops;
 

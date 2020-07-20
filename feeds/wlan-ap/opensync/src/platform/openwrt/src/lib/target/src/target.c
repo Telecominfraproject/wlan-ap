@@ -52,14 +52,10 @@ bool target_init(target_init_opt_t opt, struct ev_loop *loop)
 {
 	wifihal_evloop = loop;
 	target_map_init();
-	target_map_insert("home-ap-24", "home_ap_24");
-	target_map_insert("home-ap-50", "home_ap_50");
-	target_map_insert("home-ap-l50", "home_ap_l50");
-	target_map_insert("home-ap-u50", "home_ap_u50");
 
-	target_map_insert("wifi0", "phy1");
-	target_map_insert("wifi1", "phy2");
-	target_map_insert("wifi2", "phy0");
+	target_map_insert("radio0", "phy0");
+	target_map_insert("radio1", "phy1");
+	target_map_insert("radio2", "phy2");
 
 	switch (opt) {
 	case TARGET_INIT_MGR_SM:

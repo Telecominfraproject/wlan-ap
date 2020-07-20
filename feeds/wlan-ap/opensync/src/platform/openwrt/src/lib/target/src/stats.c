@@ -46,7 +46,7 @@ bool target_is_radio_interface_ready(char *phy_name)
 
 bool target_is_interface_ready(char *if_name)
 {
-	return iface_is_up(target_map_ifname(if_name));
+	return iface_is_up(if_name);
 }
 
 /******************************************************************************
@@ -92,7 +92,7 @@ bool target_stats_clients_get(radio_entry_t *radio_cfg, radio_essid_t *essid,
 			      ds_dlist_t *client_list, void *client_ctx)
 {
 	struct nl_call_param nl_call_param = {
-		.ifname = target_map_ifname(radio_cfg->if_name),
+		.ifname = radio_cfg->if_name,
 		.type = radio_cfg->type,
 		.list = client_list,
 	};
@@ -156,7 +156,7 @@ bool target_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
 			     ds_dlist_t *survey_list, void *survey_ctx)
 {
 	struct nl_call_param nl_call_param = {
-		.ifname = target_map_ifname(radio_cfg->if_name),
+		.ifname = radio_cfg->if_name,
 		.type = radio_cfg->type,
 		.list = survey_list,
 	};
@@ -195,7 +195,7 @@ bool target_stats_scan_start(radio_entry_t *radio_cfg, uint32_t *chan_list, uint
 			     target_scan_cb_t *scan_cb, void *scan_ctx)
 {
 	struct nl_call_param nl_call_param = {
-		.ifname = target_map_ifname(radio_cfg->if_name),
+		.ifname = radio_cfg->if_name,
 	};
 	bool ret = true;
 
@@ -213,7 +213,7 @@ bool target_stats_scan_start(radio_entry_t *radio_cfg, uint32_t *chan_list, uint
 bool target_stats_scan_stop(radio_entry_t *radio_cfg, radio_scan_type_t scan_type)
 {
 	struct nl_call_param nl_call_param = {
-		.ifname = target_map_ifname(radio_cfg->if_name),
+		.ifname = radio_cfg->if_name,
 	};
 	bool ret = true;
 
@@ -228,7 +228,7 @@ bool target_stats_scan_get(radio_entry_t *radio_cfg, uint32_t *chan_list, uint32
 			   radio_scan_type_t scan_type, dpp_neighbor_report_data_t *scan_results)
 {
 	struct nl_call_param nl_call_param = {
-		.ifname = target_map_ifname(radio_cfg->if_name),
+		.ifname = radio_cfg->if_name,
 		.type = radio_cfg->type,
 		.list = &scan_results->list,
 	};

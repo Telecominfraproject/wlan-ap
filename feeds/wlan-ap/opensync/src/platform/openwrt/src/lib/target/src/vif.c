@@ -231,10 +231,15 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	blobmsg_parse(wifi_iface_policy, __WIF_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
 
 	if (!tb[WIF_ATTR_DEVICE] || !tb[WIF_ATTR_IFNAME]) {
-		LOGE("%s: invalid radio/ifname", s->e.name);
+		char name[64]; 
+		LOGN("%s: deleting invalid radio/ifname", s->e.name);
+		snprintf(name, sizeof(name), "wireless.%s",s->e.name);
+		uci_section_del(uci,"wifi-iface", name);
+		uci_commit_all(uci);
+		reload_config = 1;
 		return false;
 	}
-	ifname = target_unmap_ifname(blobmsg_get_string(tb[WIF_ATTR_IFNAME]));
+	ifname = blobmsg_get_string(tb[WIF_ATTR_IFNAME]);
 	strncpy(radio, blobmsg_get_string(tb[WIF_ATTR_DEVICE]), IF_NAMESIZE);
 
 	vstate._partial_update = true;
@@ -338,7 +343,7 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 		vif_state_to_conf(&vstate, vconf);
 		radio_ops->op_vconf(vconf, radio);
 	}
-	LOGN("%s: updating vif state", radio);
+	LOGN("%s: updating vif state %s", radio, vstate.ssid);
 	radio_ops->op_vstate(&vstate, radio);
 
 	return true;
@@ -350,10 +355,18 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 			    const struct schema_Wifi_VIF_Config_flags *changed,
 			    int num_cconfs)
 {
-	char *ifname = target_map_ifname((char *)vconf->if_name);
+        char radio_section_name[8]="";
+	int radio_index;
+	char vif_section_name[20];
 	int vid = 0;
 
 	blob_buf_init(&b, 0);
+
+	blobmsg_add_string(&b, "ifname", vconf->if_name);
+	sscanf(vconf->if_name, "wlan%d", &radio_index);
+	snprintf(radio_section_name, sizeof(radio_section_name), "radio%d", radio_index);
+	blobmsg_add_string(&b, "device", radio_section_name);
+	blobmsg_add_string(&b, "mode", "ap");
 
 	if (changed->enabled && vconf->enabled)
 		blobmsg_add_bool(&b, "disabled", 0);
@@ -403,13 +416,12 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 		struct blob_attr *a;
 		int i;
 
-		blobmsg_add_string(&b, "macfilter", "disable");
 		if (!strcmp(vconf->mac_list_type,"whitelist"))
 			blobmsg_add_string(&b, "macfilter", "allow");
 		else if (!strcmp(vconf->mac_list_type,"blacklist"))
 			blobmsg_add_string(&b, "macfilter", "deny");
 		else
-			LOGN("Invalid mac list type");
+			blobmsg_add_string(&b, "macfilter", "disable");
 
 		a = blobmsg_open_array(&b, "maclist");
 		for (i = 0; i < vconf->mac_list_len; i++)
@@ -419,13 +431,14 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 
 	vif_config_security_set(&b, vconf);
 
-	blob_to_uci_section(uci, "wireless", ifname, "wifi-iface",
+	vif_ifname_to_sectionname(vconf->if_name, vif_section_name);
+	blob_to_uci_section(uci, "wireless", vif_section_name, "wifi-iface",
 			    b.head, &wifi_iface_param);
 
 	if (vid)
-		vlan_add(ifname, vconf->vlan_id, vid);
+		vlan_add((char *)vconf->if_name, vconf->vlan_id, vid);
 	else
-		vlan_del(ifname);
+		vlan_del((char *)vconf->if_name);
 
 	uci_commit_all(uci);
 	reload_config = 1;

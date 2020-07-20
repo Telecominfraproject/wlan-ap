@@ -262,6 +262,19 @@ int blobmsg_get_hex16(struct blob_attr *a)
 	return (int) strtoul(val, NULL, 16);
 }
 
+char* vif_ifname_to_sectionname( const char* ifname, char* sectionname )
+{
+	char *pos;
+
+	sprintf(sectionname, "%s", ifname);
+	pos = strchr(sectionname,'-');
+	while (pos) {
+		*pos = '_';
+		pos = strchr(pos,'-');
+	}
+	return sectionname;
+}
+
 bool vif_state_to_conf(struct schema_Wifi_VIF_State *vstate,
 		       struct schema_Wifi_VIF_Config *vconf)
 {
