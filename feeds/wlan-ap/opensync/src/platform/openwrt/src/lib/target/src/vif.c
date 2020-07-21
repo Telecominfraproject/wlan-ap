@@ -388,6 +388,13 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 		blobmsg_add_bool(&b, "ieee80211r", 0);
 	}
 
+	if (changed->btm) {
+		blobmsg_add_bool(&b, "ieee80211v", 1);
+		blobmsg_add_bool(&b, "bss_transition", 1);
+	} else {
+		blobmsg_add_bool(&b, "ieee80211v", 0);
+	}
+
 	if (changed->bridge)
 		blobmsg_add_string(&b, "network", vconf->bridge);
 
