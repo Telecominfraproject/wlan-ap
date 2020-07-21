@@ -75,6 +75,11 @@ enum {
 	WIF_ATTR_VID,
 	WIF_ATTR_MACLIST,
 	WIF_ATTR_MACFILTER,
+	WIF_ATTR_RATELIMIT,
+	WIF_ATTR_URATE,
+	WIF_ATTR_DRATE,
+	WIF_ATTR_CURATE,
+	WIF_ATTR_CDRATE,
 	__WIF_ATTR_MAX,
 };
 
@@ -103,6 +108,11 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_VID] = { .name = "vid", BLOBMSG_TYPE_INT32 },
 	[WIF_ATTR_MACFILTER]  = { .name = "macfilter", .type = BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_MACLIST]  = { .name = "maclist", .type = BLOBMSG_TYPE_ARRAY },
+	[WIF_ATTR_RATELIMIT] = { .name = "rlimit", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_URATE] = { .name = "urate", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_DRATE] = { .name = "drate", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_CURATE] = { .name = "curate", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_CDRATE] = { .name = "cdrate", BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -214,6 +224,132 @@ static void vif_state_security_get(struct schema_Wifi_VIF_State *vstate,
 out_none:
 	vif_state_security_append(vstate, &index, OVSDB_SECURITY_ENCRYPTION,
 				  OVSDB_SECURITY_ENCRYPTION_OPEN);
+}
+
+/* Custom options table */
+#define SCHEMA_CUSTOM_OPT_SZ            20
+#define SCHEMA_CUSTOM_OPTS_MAX          5
+
+const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
+{
+	SCHEMA_CONSTS_RATE_LIMIT,
+	SCHEMA_CONSTS_RATE_DL,
+	SCHEMA_CONSTS_RATE_UL,
+	SCHEMA_CONSTS_CLIENT_RATE_DL,
+	SCHEMA_CONSTS_CLIENT_RATE_UL
+};
+
+static void vif_config_custom_opt_set(struct blob_buf *b,
+                                      const struct schema_Wifi_VIF_Config *vconf)
+{
+	int i;
+	char value[20];
+	const char *opt;
+	const char *val;
+
+	for (i = 0; i < SCHEMA_CUSTOM_OPTS_MAX; i++) {
+		opt = custom_options_table[i];
+		val = SCHEMA_KEY_VAL(vconf->custom_options, opt);
+
+		if (!val)
+			strncpy(value, "0", 20);
+		else
+			strncpy(value, val, 20);
+
+		if (strcmp(opt, "rate_limit_en") == 0) {
+			if (strcmp(value, "1") == 0)
+				blobmsg_add_bool(b, "rlimit", 1);
+			else if (strcmp(value, "0") == 0)
+				blobmsg_add_bool(b, "rlimit", 0);
+		}
+		else if (strcmp(opt, "ssid_ul_limit") == 0)
+			blobmsg_add_string(b, "urate", value);
+		else if (strcmp(opt, "ssid_dl_limit") == 0)
+			blobmsg_add_string(b, "drate", value);
+		else if (strcmp(opt, "client_dl_limit") == 0)
+			blobmsg_add_string(b, "cdrate", value);
+		else if (strcmp(opt, "client_ul_limit") == 0)
+			blobmsg_add_string(b, "curate", value);
+	}
+}
+
+static void set_custom_option_state(struct schema_Wifi_VIF_State *vstate,
+                                    int *index, const char *key,
+                                    const char *value)
+{
+	STRSCPY(vstate->custom_options_keys[*index], key);
+	STRSCPY(vstate->custom_options[*index], value);
+	*index += 1;
+	vstate->custom_options_len = *index;
+}
+
+static void vif_state_custom_options_get(struct schema_Wifi_VIF_State *vstate,
+                                         struct blob_attr **tb)
+{
+	int i;
+	int index = 0;
+	const char *opt;
+	char *buf = NULL;
+
+	for (i = 0; i < SCHEMA_CUSTOM_OPTS_MAX; i++) {
+		opt = custom_options_table[i];
+
+		if (strcmp(opt, "rate_limit_en") == 0) {
+			if (tb[WIF_ATTR_RATELIMIT] &&
+				blobmsg_get_bool(tb[WIF_ATTR_RATELIMIT]))
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							"1");
+			else
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							"0");
+		} else if (strcmp(opt, "ssid_ul_limit") == 0) {
+			if (tb[WIF_ATTR_URATE]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_URATE]);
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							buf);
+			} else {
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							"0");
+			}
+		} else if (strcmp(opt, "ssid_dl_limit") == 0) {
+			if (tb[WIF_ATTR_DRATE]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_DRATE]);
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							buf);
+			} else {
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							"0");
+			}
+		} else if (strcmp(opt, "client_dl_limit") == 0) {
+			if (tb[WIF_ATTR_CDRATE]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_CDRATE]);
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							buf);
+			} else {
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							"0");
+			}
+		} else if (strcmp(opt, "client_ul_limit") == 0) {
+			if (tb[WIF_ATTR_CURATE]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_CURATE]);
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							buf);
+			} else {
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							"0");
+			}
+		}
+	}
 }
 
 bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vconf)
@@ -331,6 +467,7 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	}
 
 	vif_state_security_get(&vstate, tb);
+	vif_state_custom_options_get(&vstate, tb);
 
 	if (vconf) {
 		LOGN("%s: updating vif config", radio);
@@ -416,6 +553,8 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 	}
 
 	vif_config_security_set(&b, vconf);
+	if (changed->custom_options)
+		vif_config_custom_opt_set(&b, vconf);
 
 	blob_to_uci_section(uci, "wireless", ifname, "wifi-iface",
 			    b.head, &wifi_iface_param);
