@@ -304,54 +304,55 @@ static void vif_state_custom_options_get(struct schema_Wifi_VIF_State *vstate,
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							"1");
-			else
+			/*else
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							"0");
+			*/
 		} else if (strcmp(opt, "ssid_ul_limit") == 0) {
 			if (tb[WIF_ATTR_URATE]) {
 				buf = blobmsg_get_string(tb[WIF_ATTR_URATE]);
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							buf);
-			} else {
+			} /*else {
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							"0");
-			}
+			}*/
 		} else if (strcmp(opt, "ssid_dl_limit") == 0) {
 			if (tb[WIF_ATTR_DRATE]) {
 				buf = blobmsg_get_string(tb[WIF_ATTR_DRATE]);
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							buf);
-			} else {
+			} /*else {
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							"0");
-			}
+			}*/
 		} else if (strcmp(opt, "client_dl_limit") == 0) {
 			if (tb[WIF_ATTR_CDRATE]) {
 				buf = blobmsg_get_string(tb[WIF_ATTR_CDRATE]);
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							buf);
-			} else {
+			} /*else {
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							"0");
-			}
+			}*/
 		} else if (strcmp(opt, "client_ul_limit") == 0) {
 			if (tb[WIF_ATTR_CURATE]) {
 				buf = blobmsg_get_string(tb[WIF_ATTR_CURATE]);
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							buf);
-			} else {
+			} /*else {
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							"0");
-			}
+			}*/
 		}
 	}
 }
