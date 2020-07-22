@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2019, Plume Design Inc. All rights reserved.
+Copyright (c) 2015, Plume Design Inc. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -24,40 +24,69 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#include <stdarg.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <jansson.h>
+#include <ev.h>
+#include <evsched.h>
+#include <syslog.h>
+#include <getopt.h>
+
+#include "ds_tree.h"
+#include "log.h"
+#include "os.h"
+#include "os_socket.h"
+#include "ovsdb.h"
+#include "evext.h"
+#include "os_backtrace.h"
+#include "json_util.h"
 #include "target.h"
-#include "const.h"
 
-/******************************************************************************
- *  MANAGERS definitions
- *****************************************************************************/
+#include "command.h"
 
-target_managers_config_t target_managers_config[] =
+#define MODULE_ID LOG_MODULE_ID_MAIN
+
+static log_severity_t cmdm_log_severity = LOG_SEVERITY_INFO;
+
+int main(int argc, char ** argv)
 {
-	{
-		.name = TARGET_MANAGER_PATH("wm"),
-		.needs_plan_b = true,
-	}, {
-		.name = TARGET_MANAGER_PATH("nm"),
-		.needs_plan_b = true,
-	}, {
-		.name = TARGET_MANAGER_PATH("cm"),
-		.needs_plan_b = true,
-	}, {
-		.name = TARGET_MANAGER_PATH("lm"),
-		.needs_plan_b = true,
-	}, {
-		.name = TARGET_MANAGER_PATH("cmdm"),
-		.needs_plan_b = true,
-	}, {
-		.name = TARGET_MANAGER_PATH("sm"),
-		.needs_plan_b = false,
-	}, {
-		.name = TARGET_MANAGER_PATH("qm"),
-		.needs_plan_b = false,
-	}, {
-		.name = TARGET_MANAGER_PATH("um"),
-		.needs_plan_b = false,
-	},
-};
+	struct ev_loop *loop = EV_DEFAULT;
 
-int target_managers_num = ARRAY_SIZE(target_managers_config);
+	if (os_get_opt(argc, argv, &cmdm_log_severity))
+		return -1;
+
+	target_log_open("CMDM", 0);
+	LOGN("Starting command manager - CMDM");
+	log_severity_set(cmdm_log_severity);
+	log_register_dynamic_severity(loop);
+
+	backtrace_init();
+
+	json_memdbg_init(loop);
+
+	if (!ovsdb_init_loop(loop, "CMDM")) {
+		LOGEM("Initializing CMDM (Failed to initialize OVSDB)");
+		return -1;
+	}
+	evsched_init(loop);
+
+	task_init();
+	command_ubus_init(loop);
+
+	ev_run(loop, 0);
+
+	if (!ovsdb_stop_loop(loop))
+		LOGE("Stopping CMDM (Failed to stop OVSDB");
+
+	ev_default_destroy();
+
+	LOGN("Exiting CMDM");
+
+	return 0;
+}
