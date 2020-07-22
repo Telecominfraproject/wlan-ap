@@ -4,6 +4,7 @@
 #include "radio.h"
 #include "ubus.h"
 static struct ubus_context *ubus;
+extern struct ev_loop *wifihal_evloop;
 
 int hapd_rrm_enable(char *name, int neighbor, int beacon)
 {
@@ -140,5 +141,5 @@ static struct ubus_instance ubus_instance = {
 
 int radio_ubus_init(void)
 {
-	return ubus_init(&ubus_instance);
+	return ubus_init(&ubus_instance, wifihal_evloop);
 }

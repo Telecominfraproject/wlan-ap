@@ -13,12 +13,13 @@ struct ubus_watch_list {
 struct ubus_instance {
 	ubus_connect_handler_t connect;
 	ubus_handler_t notify;
+	void (*subscribed)(const char *path, uint32_t id, int add);
 
 	int len;
 	struct ubus_watch_list list[];
 };
 
-extern int ubus_init(struct ubus_instance *instance);
+extern int ubus_init(struct ubus_instance *instance, struct ev_loop *_loop);
 extern uint32_t ubus_lookup_remote(char *name);
 
 #endif
