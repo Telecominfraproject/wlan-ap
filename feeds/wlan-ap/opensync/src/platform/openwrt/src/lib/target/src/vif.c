@@ -80,6 +80,8 @@ enum {
 	WIF_ATTR_DRATE,
 	WIF_ATTR_CURATE,
 	WIF_ATTR_CDRATE,
+	WIF_ATTR_IEEE80211V,
+	WIF_ATTR_BSS_TRANSITION,
 	__WIF_ATTR_MAX,
 };
 
@@ -113,6 +115,8 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_DRATE] = { .name = "drate", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_CURATE] = { .name = "curate", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_CDRATE] = { .name = "cdrate", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_IEEE80211V] = { .name = "ieee80211v", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_BSS_TRANSITION] = { .name = "bss_transition", BLOBMSG_TYPE_BOOL },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -378,7 +382,6 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	vstate.vif_config_present = false;
 
 	SCHEMA_SET_INT(vstate.rrm, 1);
-	SCHEMA_SET_INT(vstate.btm, 1);
 	SCHEMA_SET_INT(vstate.ft_psk, 0);
 	SCHEMA_SET_INT(vstate.group_rekey, 0);
 
@@ -401,6 +404,11 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 		SCHEMA_SET_INT(vstate.enabled, 0);
 	else
 		SCHEMA_SET_INT(vstate.enabled, 1);
+
+	if (tb[WIF_ATTR_IEEE80211V] && blobmsg_get_bool(tb[WIF_ATTR_IEEE80211V]))
+		SCHEMA_SET_INT(vstate.btm, 1);
+	else
+		SCHEMA_SET_INT(vstate.btm, 0);
 
 	if (tb[WIF_ATTR_ISOLATE] && blobmsg_get_bool(tb[WIF_ATTR_ISOLATE]))
 		SCHEMA_SET_INT(vstate.ap_bridge, 1);
@@ -523,6 +531,14 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 		blobmsg_add_bool(&b, "reassociation_deadline", 1);
 	} else {
 		blobmsg_add_bool(&b, "ieee80211r", 0);
+	}
+
+	if (changed->btm) {
+		blobmsg_add_bool(&b, "ieee80211v", 1);
+		blobmsg_add_bool(&b, "bss_transition", 1);
+	} else {
+		blobmsg_add_bool(&b, "ieee80211v", 0);
+		blobmsg_add_bool(&b, "bss_transition", 0);
 	}
 
 	if (changed->bridge)
