@@ -13,7 +13,7 @@ struct ubus_remote {
 	uint32_t id;
 };
 
-extern struct ev_loop *wifihal_evloop;
+struct ev_loop *loop;
 static ev_io ubus_io;
 
 static struct ubus_context ubus;
@@ -79,6 +79,9 @@ static void ubus_handle_subscribe(const char *path, uint32_t id, int add)
 		avl_delete(&ubus_tree, &remote->avl);
 		free(remote);
 	}
+
+	if (ubus_instance->subscribed)
+		ubus_instance->subscribed(path, id, add);
 }
 
 static void ubus_event_handler_cb(struct ubus_context *ctx,  struct ubus_event_handler *ev,
@@ -128,7 +131,7 @@ static void ubus_reconnect_cb(void *arg);
 
 static void ubus_connection_lost_cb(struct ubus_context *ctx)
 {
-	ev_io_stop(wifihal_evloop, &ubus_io);
+	ev_io_stop(loop, &ubus_io);
 	evsched_task(&ubus_reconnect_cb, NULL, EVSCHED_SEC(1));
 }
 
@@ -144,7 +147,7 @@ static void ubus_reconnect_cb(void *arg)
 	ubus.connection_lost = ubus_connection_lost_cb;
 
 	ev_io_init(&ubus_io, ubus_ev, ubus.sock.fd, EV_READ);
-        ev_io_start(wifihal_evloop, &ubus_io);
+        ev_io_start(loop, &ubus_io);
 
 	if (ubus_instance->connect)
 		ubus_instance->connect(&ubus);
@@ -162,11 +165,11 @@ static void ubus_reconnect_cb(void *arg)
 	ubus_lookup(&ubus, NULL, ubus_lookup_cb, NULL);
 }
 
-int ubus_init(struct ubus_instance *instance)
+int ubus_init(struct ubus_instance *instance, struct ev_loop *_loop)
 {
 	ubus_instance = instance;
-
-	evsched_task(&ubus_reconnect_cb, NULL, EVSCHED_SEC(1));
+	loop = _loop;
+	evsched_task(&ubus_reconnect_cb, NULL, EVSCHED_SEC(2));
 
 	return 0;
 }
