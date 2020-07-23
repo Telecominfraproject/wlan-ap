@@ -9,14 +9,13 @@ PKG_SOURCE_DATE:=2020-06-28
 PKG_SOURCE_VERSION:=ee8945e44366087832bdafdf69784c6a87e3a5e6
 
 PKG_BUILD_DEPENDS:=python3-kconfiglib/host python3-jinja2/host python3-markupsafe/host
-PKG_CONFIG_DEPENDS:=CONFIG_PACKAGE_wlan-ap-keys
 
 include $(INCLUDE_DIR)/package.mk
 
 define Package/opensync/default
 	CATEGORY:=Network
 	TITLE:=cloud network management system
-	DEPENDS:=+libev +jansson +protobuf +libprotobuf-c +libmosquitto +libopenssl +openvswitch +libpcap +libuci +libcurl +libnl-tiny +libubus +libblobmsg-json
+	DEPENDS:=+libev +jansson +protobuf +libprotobuf-c +libmosquitto +libopenssl +openvswitch +libpcap +libuci +libcurl +libnl-tiny +libubus +libblobmsg-json +tcpdump +curl +lldpd
 endef
 
 define Package/opensync-ap2220
