@@ -62,14 +62,6 @@ Package/opensync-ecw5410/description=$(call Package/opensync/description)
 Package/opensync-ecw5211/description=$(call Package/opensync/description)
 Package/opensync-ea8300/description=$(call Package/opensync/description)
 
-define Package/opensync/config
-menu "OpenSync Configuration"
-config WLAN_AP_CLOUD_IP
-	string
-	prompt "The default IP of the cloud"
-endmenu
-endef
-
 define Build/Prepare
 	$(PKG_UNPACK)
 	rm $(PKG_BUILD_DIR)/{vendor,platform}
@@ -99,7 +91,6 @@ define Package/opensync/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs/usr/opensync/bin/* $(1)/usr/opensync/bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs/usr/opensync/etc/* $(1)/usr/opensync/etc
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs/usr/opensync/tools/ovsh $(1)/usr/opensync/bin
-	$(SED) "s/CLOUD_IP=/CLOUD_IP=$(CONFIG_WLAN_AP_CLOUD_IP)/g" $(1)/etc/uci-defaults/99-cloud-ip
 	$(MAKE) -C $(PKG_BUILD_DIR)/ TARGET=$(BUILD_VARIANT) rootfs-copy-only INSTALL_ROOTFS_DIR=$(1)
 ifdef CONFIG_PACKAGE_wlan-ap-keys
 	rm -f $(1)/usr/opensync/certs/*
