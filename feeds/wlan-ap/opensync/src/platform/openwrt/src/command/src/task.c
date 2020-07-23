@@ -62,12 +62,19 @@ static void cmd_handler_tcpdump_cb(struct ev_loop *loop, ev_child *child, int re
 static pid_t cmd_handler_tcpdump(struct task *task)
 {
 	char ifname[IF_NAMESIZE];
+	const char *network;
 	char duration[64];
 	char pcap[64];
 	char *argv[] = { "/usr/sbin/tcpdump", "-c", "1000", "-G", duration, "-W", "1", "-w", pcap, "-i", ifname, NULL };
 	pid_t pid;
 
-	if (ubus_get_l3_device("wan", ifname) || !strlen(ifname)) {
+	network = SCHEMA_KEY_VAL(task->conf.payload, "network");
+	if (!network) {
+		LOG(ERR, "tcpdump command without a valid network");
+		return -1;
+	}
+
+	if (ubus_get_l3_device(network, ifname) || !strlen(ifname)) {
 		LOG(ERR, "failed to lookup l3_device");
 		return -1;
 	}
