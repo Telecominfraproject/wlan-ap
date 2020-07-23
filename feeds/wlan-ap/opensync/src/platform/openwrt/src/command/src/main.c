@@ -77,6 +77,7 @@ int main(int argc, char ** argv)
 	evsched_init(loop);
 
 	task_init();
+	node_config_init();
 	command_ubus_init(loop);
 
 	ev_run(loop, 0);

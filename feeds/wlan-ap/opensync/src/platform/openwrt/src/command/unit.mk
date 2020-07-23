@@ -37,6 +37,8 @@ UNIT_TYPE := BIN
 UNIT_SRC    += src/main.c
 UNIT_SRC    += src/ubus.c
 UNIT_SRC    += src/task.c
+UNIT_SRC    += src/node_config.c
+UNIT_SRC    += src/cmd_tcpdump.c
 
 UNIT_CFLAGS := -I$(UNIT_PATH)/inc
 UNIT_CFLAGS += -Isrc/lib/common/inc/

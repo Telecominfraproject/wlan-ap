@@ -47,7 +47,7 @@ target_managers_config_t target_managers_config[] =
 		.needs_plan_b = true,
 	}, {
 		.name = TARGET_MANAGER_PATH("cmdm"),
-		.needs_plan_b = true,
+		.needs_plan_b = false,
 	}, {
 		.name = TARGET_MANAGER_PATH("sm"),
 		.needs_plan_b = false,

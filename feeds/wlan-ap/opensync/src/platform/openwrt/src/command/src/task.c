@@ -1,5 +1,3 @@
-#include <libubox/list.h>
-#include <evsched.h>
 #include <net/if.h>
 
 #include "command.h"
@@ -7,99 +5,20 @@
 static struct list_head tasks = LIST_HEAD_INIT(tasks);
 static ovsdb_table_t table_Command_Config;
 static ovsdb_table_t table_Command_State;
-static char serial[64];
+static int task_running;
+char serial[64];
 
-enum {
-	TASK_WAITING,
-	TASK_PENDING,
-	TASK_RUNNING,
-	TASK_COMPLETE,
-	TASK_FAILED,
-};
-
-struct task;
-struct cmd_handler {
+static struct cmd_handler {
 	char *cmd;
 	int (*cb)(struct task *task);
-};
-
-static int cmd_handler_syslog(struct task *task);
-static int cmd_handler_tcpdump(struct task *task);
-static int task_running;
-
-static struct cmd_handler cmd_handler[] = {
+} cmd_handler[] = {
 	{
 		.cmd = "tcpdump",
 		.cb = cmd_handler_tcpdump,
-	}, {
-		.cmd = "syslog",
-		.cb = cmd_handler_syslog,
 	},
 };
 
-struct task {
-	struct cmd_handler *handler;
-	struct schema_Command_Config conf;
-	struct list_head list;
-	pid_t pid;
-	ev_child child;
-};
-
-static void task_status(struct task *task, int status);
 static void task_next(void);
-
-static void cmd_handler_tcpdump_cb(struct ev_loop *loop, ev_child *child, int revents)
-{
-	struct task *task = container_of(child, struct task, child);
-
-	ev_child_stop(loop, child);
-	if (!child->rstatus)
-		task_status(task, TASK_COMPLETE);
-	else
-		task_status(task, TASK_FAILED);
-}
-
-static pid_t cmd_handler_tcpdump(struct task *task)
-{
-	char ifname[IF_NAMESIZE];
-	const char *network;
-	char duration[64];
-	char pcap[64];
-	char *argv[] = { "/usr/sbin/tcpdump", "-c", "1000", "-G", duration, "-W", "1", "-w", pcap, "-i", ifname, NULL };
-	pid_t pid;
-
-	network = SCHEMA_KEY_VAL(task->conf.payload, "network");
-	if (!network) {
-		LOG(ERR, "tcpdump command without a valid network");
-		return -1;
-	}
-
-	if (ubus_get_l3_device(network, ifname) || !strlen(ifname)) {
-		LOG(ERR, "failed to lookup l3_device");
-		return -1;
-	}
-
-	snprintf(duration, sizeof(duration), "%d", task->conf.duration - 5);
-	snprintf(pcap, sizeof(pcap), "/tmp/%s-%d.pcap", serial, task->conf.timestamp);
-
-	pid = fork();
-	if (pid == 0) {
-		execv(*argv, argv);
-		LOGW("tcpdump: failed to start");
-		exit(1);
-	}
-
-	ev_child_init(&task->child, cmd_handler_tcpdump_cb, pid, 0);
-	ev_child_start(EV_DEFAULT, &task->child);
-
-	LOGN("tcpdump: started");
-	return pid;
-}
-
-static pid_t cmd_handler_syslog(struct task *task)
-{
-	return 0;
-}
 
 bool ovsdb_table_upsert_simple_typed_f(ovsdb_table_t *table,
 				       char *column, void *value, ovsdb_col_t col_type,
@@ -117,7 +36,7 @@ bool ovsdb_table_upsert_simple_typed(ovsdb_table_t *table,
 	return ovsdb_table_upsert_simple_typed_f(table, column, value, col_type, record, update_uuid, NULL);
 }
 
-static void task_status(struct task *task, int status)
+void task_status(struct task *task, int status, char *result)
 {
 	struct schema_Command_State state;
 	int done = 0;
@@ -151,6 +70,11 @@ static void task_status(struct task *task, int status)
 	state.cmd_uuid_exists = true;
 	state.cmd_uuid_present = true;
 	SCHEMA_SET_INT(state.timestamp, task->conf.timestamp);
+	if (result) {
+		STRSCPY(state.result_keys[0], "error");
+	        STRSCPY(state.result[0], result);
+		state.result_len = 1;
+	}
 
 	if (!ovsdb_table_upsert_simple_typed(&table_Command_State, SCHEMA_COLUMN(Command_State, cmd_uuid),
 					     &state.cmd_uuid, OCLM_UUID, &state, NULL))
@@ -171,9 +95,9 @@ static void task_run(void *arg)
 
 	task->pid = task->handler->cb(task);
 	if (task->pid <= 0)
-		task_status(task, TASK_FAILED);
+		task_status(task, TASK_FAILED, "failed to start task");
 	else
-		task_status(task, TASK_RUNNING);
+		task_status(task, TASK_RUNNING, NULL);
 }
 
 static void task_next(void)
@@ -192,7 +116,7 @@ static void task_next(void)
 	task_running = 1;
 
 	if (task->conf.delay) {
-		task_status(task, TASK_PENDING);
+		task_status(task, TASK_PENDING, NULL);
 		evsched_task(&task_run, task, EVSCHED_SEC(task->conf.delay));
 	} else
 		task_run(task);
@@ -221,7 +145,7 @@ static int command_conf_add(struct schema_Command_Config *conf)
 				task->conf.duration = 10;
 			list_add_tail(&task->list, &tasks);
 			if (!list_empty(&tasks))
-				task_status(task, TASK_WAITING);
+				task_status(task, TASK_WAITING, NULL);
 			task_next();
 			return 0;
 		}
