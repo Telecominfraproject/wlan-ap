@@ -35,6 +35,7 @@ struct task {
 };
 
 extern char serial[64];
+extern time_t crash_timestamp;
 extern pid_t cmd_handler_tcpdump(struct task *task);
 extern void task_status(struct task *task, int status, char *result);
 extern void task_init(void);
@@ -42,5 +43,7 @@ extern int ubus_get_l3_device(const char *net, char *ifname);
 extern int command_ubus_init(struct ev_loop *loop);
 extern void node_config_init(void);
 extern void webserver_init(void);
+extern void crashlog_init(void);
+extern pid_t cmd_handler_crashlog(struct task *task);
 
 #endif
