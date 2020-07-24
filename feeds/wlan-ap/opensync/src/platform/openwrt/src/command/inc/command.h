@@ -41,5 +41,6 @@ extern void task_init(void);
 extern int ubus_get_l3_device(const char *net, char *ifname);
 extern int command_ubus_init(struct ev_loop *loop);
 extern void node_config_init(void);
+extern void webserver_init(void);
 
 #endif
