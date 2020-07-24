@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #include <syslog.h>
 #include "target.h"
 #include <net/if.h>

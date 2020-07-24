@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #include <uci.h>
 #include <uci_blob.h>
 #include <libubox/avl-cmp.h>
