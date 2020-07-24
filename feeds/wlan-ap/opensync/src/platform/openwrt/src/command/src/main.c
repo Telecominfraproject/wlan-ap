@@ -79,6 +79,7 @@ int main(int argc, char ** argv)
 	task_init();
 	node_config_init();
 	command_ubus_init(loop);
+	webserver_init();
 
 	ev_run(loop, 0);
 
