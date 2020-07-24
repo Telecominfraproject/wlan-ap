@@ -17,7 +17,7 @@ define Package/wlan-ap-config/description
 endef
 
 define Package/wlan-ap-config/config
-menu "Default Cloud IP"
+menu "Cloud IP"
 config WLAN_AP_CLOUD_IP
 	string
 	prompt "The default IP of the cloud"
