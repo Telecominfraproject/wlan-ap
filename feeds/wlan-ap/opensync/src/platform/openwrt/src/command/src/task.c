@@ -15,6 +15,9 @@ static struct cmd_handler {
 	{
 		.cmd = "tcpdump",
 		.cb = cmd_handler_tcpdump,
+	}, {
+		.cmd = "crashlog",
+		.cb = cmd_handler_crashlog,
 	},
 };
 
