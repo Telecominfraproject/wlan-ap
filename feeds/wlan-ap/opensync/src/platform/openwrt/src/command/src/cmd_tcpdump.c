@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #include <libubox/list.h>
 #include <evsched.h>
 #include <net/if.h>

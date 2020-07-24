@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #ifndef __COMMAND_H_
 #define __COMMAND_H_
 
