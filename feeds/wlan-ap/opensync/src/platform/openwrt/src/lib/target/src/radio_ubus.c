@@ -116,29 +116,8 @@ static void radio_ubus_connect(struct ubus_context *ctx)
 	ubus_add_object(ubus, &radio_ubus_object);
 }
 
-static int radio_ubus_notify(struct ubus_context *ctx, struct ubus_object *obj,
-			     struct ubus_request_data *req, const char *method,
-			     struct blob_attr *msg)
-{
-	char *str;
-
-	str = blobmsg_format_json(msg, true);
-	LOGN("ubus: Received ubus notify '%s': %s\n", method, str);
-	free(str);
-
-	return 0;
-}
-
 static struct ubus_instance ubus_instance = {
 	.connect = radio_ubus_connect,
-	.notify = radio_ubus_notify,
-	.list = {
-			{
-				.path = "hostapd.",
-				.wildcard = 1,
-			},
-		},
-	.len = 1,
 };
 
 int radio_ubus_init(void)
