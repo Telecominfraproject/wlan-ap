@@ -7,7 +7,7 @@ TARGET=${1}
 
 if [ -z "$1" ]; then
 	echo "Error: please specify TARGET"
-	echo "For example: IPQ40XX, ECW5410, AP2220, ECW5211"
+	echo "For example: IPQ40XX, ECW5410, AP2220, ECW5211 EC420"
 	exit 1
 fi
 
@@ -32,6 +32,9 @@ ECW5410)
 	;;
 AP2220)
 	TARGET=ap2220
+	;;
+EC420)
+	TARGET=ec420
 	;;
 *)
 	echo "${TARGET} is unknown"
