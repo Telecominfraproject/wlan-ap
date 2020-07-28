@@ -24,7 +24,8 @@ endef
 #
 
 ALLWIFIBOARDS:= \
-	cig-wf188
+	cig-wf188 \
+	sercomm-kiwi
 
 ALLWIFIPACKAGES:=$(foreach BOARD,$(ALLWIFIBOARDS),ath11k-wifi-$(BOARD))
 
@@ -44,6 +45,9 @@ endef
 define ath11k-wifi-install-one
   $(if $(filter $(suffix $(1)),.IPQ6018),\
     $(call ath11k-wifi-install-one-to,$(1),$(2),IPQ6018),\
+  )
+  $(if $(filter $(suffix $(1)),.IPQ8074),\
+    $(call ath11k-wifi-install-one-to,$(1),$(2),IPQ8074),\
   )
 
 endef
@@ -77,5 +81,6 @@ Do not install it for any other device!
 endef
 
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
+$(eval $(call generate-ath11k-wifi-package,sercomm-kiwi,Sercomm Kiwi))
 
 $(foreach PACKAGE,$(ALLWIFIPACKAGES),$(eval $(call BuildPackage,$(PACKAGE))))
