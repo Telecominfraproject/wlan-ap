@@ -58,7 +58,6 @@ endef
 
 Package/opensync-ap2220/description=$(call Package/opensync/description)
 Package/opensync-ecw5410/description=$(call Package/opensync/description)
-Package/opensync-ecw5211/description=$(call Package/opensync/description)
 Package/opensync-ea8300/description=$(call Package/opensync/description)
 
 define Build/Prepare
@@ -98,11 +97,9 @@ endef
 
 Package/opensync-ap2220/install=$(call Package/opensync/install,$(1))
 Package/opensync-ecw5410/install=$(call Package/opensync/install,$(1))
-Package/opensync-ecw5211/install=$(call Package/opensync/install,$(1))
 Package/opensync-ea8300/install=$(call Package/opensync/install,$(1))
 
 $(eval $(call BuildPackage,opensync-ap2220))
 $(eval $(call BuildPackage,opensync-ecw5410))
-$(eval $(call BuildPackage,opensync-ecw5211))
 $(eval $(call BuildPackage,opensync-ea8300))
 $(eval $(call BuildPackage,opensync))
