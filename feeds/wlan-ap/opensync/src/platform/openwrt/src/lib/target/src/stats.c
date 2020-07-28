@@ -181,6 +181,7 @@ bool target_stats_survey_convert(radio_entry_t *radio_cfg, radio_scan_type_t sca
 	survey_record->chan_busy_ext = data_new->chan_busy_ext;
 	survey_record->duration_ms   = data_new->duration_ms;
 	survey_record->chan_busy     = data_new->chan_busy;
+	survey_record->chan_noise     = data_new->chan_noise;
 
 	return true;
 }
