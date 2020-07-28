@@ -45,8 +45,8 @@ define Package/ath11k-firmware-ipq60xx/install
 	$(INSTALL_DIR) $(1)/lib/firmware/IPQ6018
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/IPQ6018/hw1.0/2.1.0.1/WLAN.HK.2.1.0.1-01238-QCAHKSWPL_SILICONZ-2/* \
 		$(1)/lib/firmware/IPQ6018
-	$(INSTALL_DATA) $(PKG_BUILD_DIR)/IPQ6018/hw1.0/board-2.bin \
-		$(1)/lib/firmware/IPQ6018
+#	$(INSTALL_DATA) $(PKG_BUILD_DIR)/IPQ6018/hw1.0/board-2.bin \
+#		$(1)/lib/firmware/IPQ6018
 endef
 
 define Package/ath11k-firmware-ipq807x/install

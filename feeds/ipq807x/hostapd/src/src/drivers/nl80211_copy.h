@@ -1384,13 +1384,6 @@ enum nl80211_commands {
 
 	NL80211_CMD_PROBE_MESH_LINK,
 
-	NL80211_CMD_OBSS_COLOR_COLLISION,
-
-	NL80211_CMD_COLOR_CHANGE,
-	NL80211_CMD_CCA_STARTED_NOTIFY,
-	NL80211_CMD_CCA_ABORTED_NOTIFY,
-	NL80211_CMD_CCA_NOTIFY,
-
 	NL80211_CMD_SET_TID_CONFIG,
 
 	NL80211_CMD_UNPROT_BEACON,
@@ -2957,19 +2950,6 @@ enum nl80211_attrs {
 
 	NL80211_ATTR_HE_BSS_COLOR,
 
-	NL80211_ATTR_MULTI_BSSID_MODE,
-        NL80211_ATTR_MULTI_BSSID_PARENT,
-        NL80211_ATTR_MULTI_BSSID_INDEX,
-        NL80211_ATTR_MULTI_BSSID_COUNT,
-
-	NL80211_ATTR_OBSS_COLOR_BITMAP,
-
-	NL80211_ATTR_CCA_COUNT,
-	NL80211_ATTR_CCA_COLOR,
-	NL80211_ATTR_CCA_IES,
-	NL80211_ATTR_CCA_C_OFF_BEACON,
-	NL80211_ATTR_CCA_C_OFF_PRESP,
-
 	NL80211_ATTR_IFTYPE_AKM_SUITES,
 
 	NL80211_ATTR_TID_CONFIG,
@@ -2981,44 +2961,12 @@ enum nl80211_attrs {
 
 	NL80211_ATTR_RECEIVE_MULTICAST,
 
-
 	/* add attributes here, update the policy in nl80211.c */
 
 	__NL80211_ATTR_AFTER_LAST,
 	NUM_NL80211_ATTR = __NL80211_ATTR_AFTER_LAST,
 	NL80211_ATTR_MAX = __NL80211_ATTR_AFTER_LAST - 1
 };
-
-
-/**
- * enum nl80211_multi_bssid_mode - Multiple BSSID beacon type
- *
- * Used by cfg80211_ap_settings
- *
- * @MULTIPLE_BSSID_LEGACY: This BSS is not part of a multiple BSSID group
- * @MULTIPLE_BSSID_TRANSMITTED: This BSS is broadcasting a multiple BSSID
- *                                    beacon
- * @MULTIPLE_BSSID_NON_TRANSMITTED: This BSS is not broadcasting a beacon
- */
-enum nl80211_multi_bssid_mode {
-        NL80211_MULTIPLE_BSSID_LEGACY = 0,
-        NL80211_MULTIPLE_BSSID_TRANSMITTED,
-        NL80211_MULTIPLE_BSSID_NON_TRANSMITTED,
-};
-
-/**
- * enum nl80211_beacon_tx_mode - Beacon tx mode settings
- *
- * @BEACON_TX_MODE_DEFAULT: The beacons shall be sent out in its default mode
- * @BEACON_TX_MODE_STAGGERED: The beacons shall be sent out in staggered mode
- * @BEACON_TX_MODE_BURST: The beacons shall be sent out in burst mode
- *                                    beacon
- */
-enum nl80211_beacon_tx_mode {
-        NL80211_BEACON_TX_MODE_STAGGERED = 0,
-        NL80211_BEACON_TX_MODE_BURST,
-};
-
 
 /* source-level API compatibility */
 #define NL80211_ATTR_SCAN_GENERATION NL80211_ATTR_GENERATION
@@ -5803,6 +5751,7 @@ enum nl80211_ext_feature_index {
 	NL80211_EXT_FEATURE_STA_TX_PWR,
 	NL80211_EXT_FEATURE_SAE_OFFLOAD,
 	NL80211_EXT_FEATURE_VLAN_OFFLOAD,
+	NL80211_EXT_FEATURE_WIDE_BAND_SCAN,
 	NL80211_EXT_FEATURE_AQL,
 	NL80211_EXT_FEATURE_BEACON_PROTECTION,
 	NL80211_EXT_FEATURE_CONTROL_PORT_NO_PREAUTH,
