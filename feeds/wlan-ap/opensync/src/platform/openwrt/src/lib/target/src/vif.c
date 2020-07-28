@@ -44,6 +44,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "vlan.h"
 #include "nl80211.h"
 #include "utils.h"
+#include "phy.h"
 
 #define MODULE_ID LOG_MODULE_ID_VIF
 #define UCI_BUFFER_SIZE 80
@@ -222,6 +223,7 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	struct schema_Wifi_VIF_State vstate;
 	char mac[ETH_ALEN * 3];
 	char *ifname, radio[IF_NAMESIZE];
+	char band[8];
 
 	memset(&vstate, 0, sizeof(vstate));
 	schema_Wifi_VIF_State_mark_all_present(&vstate);
@@ -230,7 +232,7 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	uci_to_blob(&b, s, &wifi_iface_param);
 	blobmsg_parse(wifi_iface_policy, __WIF_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
 
-	if (!tb[WIF_ATTR_DEVICE] || !tb[WIF_ATTR_IFNAME]) {
+	if (!tb[WIF_ATTR_DEVICE] || !tb[WIF_ATTR_IFNAME] || !tb[WIF_ATTR_SSID]) {
 		char name[64]; 
 		LOGN("%s: deleting invalid radio/ifname", s->e.name);
 		snprintf(name, sizeof(name), "wireless.%s",s->e.name);
@@ -297,7 +299,9 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	else
 		LOGW("%s: failed to get SSID", s->e.name);
 
-	if (strstr(s->e.name, "50"))
+	phy_get_band(target_map_ifname(radio), band);
+	LOGD("Find min_hw_mode: Radio: %s Phy: %s Band: %s", radio, target_map_ifname(radio), band );
+	if (strstr(band, "5"))
 		SCHEMA_SET_STR(vstate.min_hw_mode, "11ac");
 	else
 		SCHEMA_SET_STR(vstate.min_hw_mode, "11n");
@@ -370,8 +374,16 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 
 	if (changed->enabled && vconf->enabled)
 		blobmsg_add_bool(&b, "disabled", 0);
-	else
-		blobmsg_add_bool(&b, "disabled", 1);
+	else {
+		char uci_name[40];
+
+	        if (vid) {
+                	vlan_del((char *)vconf->if_name);
+		}
+	        vif_ifname_to_sectionname(vconf->if_name, vif_section_name);
+		snprintf(uci_name, sizeof(uci_name),"wireless.%s", vif_section_name);
+		uci_section_del(uci, "wifi-iface", uci_name);
+	}
 
 	if (changed->ssid)
 		blobmsg_add_string(&b, "ssid", vconf->ssid);
