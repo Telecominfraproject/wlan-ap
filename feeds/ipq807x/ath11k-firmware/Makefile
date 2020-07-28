@@ -53,8 +53,8 @@ define Package/ath11k-firmware-ipq807x/install
 	$(INSTALL_DIR) $(1)/lib/firmware/IPQ8074
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/IPQ8074/hw2.0/2.1.0.1/WLAN.HK.2.1.0.1-01238-QCAHKSWPL_SILICONZ-2/* \
 		$(1)/lib/firmware/IPQ8074
-	$(INSTALL_DATA) $(PKG_BUILD_DIR)/IPQ8074/hw2.0/board-2.bin \
-		$(1)/lib/firmware/IPQ8074
+#	$(INSTALL_DATA) $(PKG_BUILD_DIR)/IPQ8074/hw2.0/board-2.bin \
+#		$(1)/lib/firmware/IPQ8074
 endef
 
 $(eval $(call BuildPackage,ath11k-firmware-ipq60xx))
