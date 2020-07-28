@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #ifndef __VLAN_H__
 #define __VLAN_H__
 

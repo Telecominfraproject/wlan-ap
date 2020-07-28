@@ -1,28 +1,4 @@
-/*
-Copyright (c) 2017, Plume Design Inc. All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-   1. Redistributions of source code must retain the above copyright
-      notice, this list of conditions and the following disclaimer.
-   2. Redistributions in binary form must reproduce the above copyright
-      notice, this list of conditions and the following disclaimer in the
-      documentation and/or other materials provided with the distribution.
-   3. Neither the name of the Plume Design Inc. nor the
-      names of its contributors may be used to endorse or promote products
-      derived from this software without specific prior written permission.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL Plume Design Inc. BE LIABLE FOR ANY
-DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
-ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-*/
+/* SPDX-License-Identifier: BSD-3-Clause */
 
 #include <stdio.h>
 #include <string.h>
@@ -76,6 +52,13 @@ enum {
 	WIF_ATTR_VID,
 	WIF_ATTR_MACLIST,
 	WIF_ATTR_MACFILTER,
+	WIF_ATTR_RATELIMIT,
+	WIF_ATTR_URATE,
+	WIF_ATTR_DRATE,
+	WIF_ATTR_CURATE,
+	WIF_ATTR_CDRATE,
+	WIF_ATTR_IEEE80211V,
+	WIF_ATTR_BSS_TRANSITION,
 	__WIF_ATTR_MAX,
 };
 
@@ -104,6 +87,13 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_VID] = { .name = "vid", BLOBMSG_TYPE_INT32 },
 	[WIF_ATTR_MACFILTER]  = { .name = "macfilter", .type = BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_MACLIST]  = { .name = "maclist", .type = BLOBMSG_TYPE_ARRAY },
+	[WIF_ATTR_RATELIMIT] = { .name = "rlimit", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_URATE] = { .name = "urate", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_DRATE] = { .name = "drate", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_CURATE] = { .name = "curate", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_CDRATE] = { .name = "cdrate", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_IEEE80211V] = { .name = "ieee80211v", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_BSS_TRANSITION] = { .name = "bss_transition", BLOBMSG_TYPE_BOOL },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -217,6 +207,133 @@ out_none:
 				  OVSDB_SECURITY_ENCRYPTION_OPEN);
 }
 
+/* Custom options table */
+#define SCHEMA_CUSTOM_OPT_SZ            20
+#define SCHEMA_CUSTOM_OPTS_MAX          5
+
+const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
+{
+	SCHEMA_CONSTS_RATE_LIMIT,
+	SCHEMA_CONSTS_RATE_DL,
+	SCHEMA_CONSTS_RATE_UL,
+	SCHEMA_CONSTS_CLIENT_RATE_DL,
+	SCHEMA_CONSTS_CLIENT_RATE_UL
+};
+
+static void vif_config_custom_opt_set(struct blob_buf *b,
+                                      const struct schema_Wifi_VIF_Config *vconf)
+{
+	int i;
+	char value[20];
+	const char *opt;
+	const char *val;
+
+	for (i = 0; i < SCHEMA_CUSTOM_OPTS_MAX; i++) {
+		opt = custom_options_table[i];
+		val = SCHEMA_KEY_VAL(vconf->custom_options, opt);
+
+		if (!val)
+			strncpy(value, "0", 20);
+		else
+			strncpy(value, val, 20);
+
+		if (strcmp(opt, "rate_limit_en") == 0) {
+			if (strcmp(value, "1") == 0)
+				blobmsg_add_bool(b, "rlimit", 1);
+			else if (strcmp(value, "0") == 0)
+				blobmsg_add_bool(b, "rlimit", 0);
+		}
+		else if (strcmp(opt, "ssid_ul_limit") == 0)
+			blobmsg_add_string(b, "urate", value);
+		else if (strcmp(opt, "ssid_dl_limit") == 0)
+			blobmsg_add_string(b, "drate", value);
+		else if (strcmp(opt, "client_dl_limit") == 0)
+			blobmsg_add_string(b, "cdrate", value);
+		else if (strcmp(opt, "client_ul_limit") == 0)
+			blobmsg_add_string(b, "curate", value);
+	}
+}
+
+static void set_custom_option_state(struct schema_Wifi_VIF_State *vstate,
+                                    int *index, const char *key,
+                                    const char *value)
+{
+	STRSCPY(vstate->custom_options_keys[*index], key);
+	STRSCPY(vstate->custom_options[*index], value);
+	*index += 1;
+	vstate->custom_options_len = *index;
+}
+
+static void vif_state_custom_options_get(struct schema_Wifi_VIF_State *vstate,
+                                         struct blob_attr **tb)
+{
+	int i;
+	int index = 0;
+	const char *opt;
+	char *buf = NULL;
+
+	for (i = 0; i < SCHEMA_CUSTOM_OPTS_MAX; i++) {
+		opt = custom_options_table[i];
+
+		if (strcmp(opt, "rate_limit_en") == 0) {
+			if (tb[WIF_ATTR_RATELIMIT] &&
+				blobmsg_get_bool(tb[WIF_ATTR_RATELIMIT]))
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							"1");
+			/*else
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							"0");
+			*/
+		} else if (strcmp(opt, "ssid_ul_limit") == 0) {
+			if (tb[WIF_ATTR_URATE]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_URATE]);
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							buf);
+			} /*else {
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							"0");
+			}*/
+		} else if (strcmp(opt, "ssid_dl_limit") == 0) {
+			if (tb[WIF_ATTR_DRATE]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_DRATE]);
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							buf);
+			} /*else {
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							"0");
+			}*/
+		} else if (strcmp(opt, "client_dl_limit") == 0) {
+			if (tb[WIF_ATTR_CDRATE]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_CDRATE]);
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							buf);
+			} /*else {
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							"0");
+			}*/
+		} else if (strcmp(opt, "client_ul_limit") == 0) {
+			if (tb[WIF_ATTR_CURATE]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_CURATE]);
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							buf);
+			} /*else {
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							"0");
+			}*/
+		}
+	}
+}
+
 bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vconf)
 {
 	struct blob_attr *tb[__WIF_ATTR_MAX] = { };
@@ -249,13 +366,11 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	vstate.vif_config_present = false;
 
 	SCHEMA_SET_INT(vstate.rrm, 1);
-	SCHEMA_SET_INT(vstate.btm, 1);
 	SCHEMA_SET_INT(vstate.ft_psk, 0);
 	SCHEMA_SET_INT(vstate.group_rekey, 0);
 
 	strscpy(vstate.mac_list_type, "none", sizeof(vstate.mac_list_type));
 	vstate.mac_list_len = 0;
-	vstate.mac_list_type_exists = true;
 
 	SCHEMA_SET_STR(vstate.if_name, ifname);
 
@@ -273,6 +388,11 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 		SCHEMA_SET_INT(vstate.enabled, 0);
 	else
 		SCHEMA_SET_INT(vstate.enabled, 1);
+
+	if (tb[WIF_ATTR_IEEE80211V] && blobmsg_get_bool(tb[WIF_ATTR_IEEE80211V]))
+		SCHEMA_SET_INT(vstate.btm, 1);
+	else
+		SCHEMA_SET_INT(vstate.btm, 0);
 
 	if (tb[WIF_ATTR_ISOLATE] && blobmsg_get_bool(tb[WIF_ATTR_ISOLATE]))
 		SCHEMA_SET_INT(vstate.ap_bridge, 1);
@@ -313,7 +433,6 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	else
 		LOGN("%s: Failed to get base BSSID (mac)", vstate.if_name);
 
-	vstate.mac_list_type_exists = false;
 	if (tb[WIF_ATTR_MACFILTER]) {
 		if (!strcmp(blobmsg_get_string(tb[WIF_ATTR_MACFILTER]), "disable")) {
 			vstate.mac_list_type_exists = true;
@@ -323,8 +442,9 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 			SCHEMA_SET_STR(vstate.mac_list_type, "whitelist");
 		} else if(!strcmp(blobmsg_get_string(tb[WIF_ATTR_MACFILTER]), "deny")) {
 			vstate.mac_list_type_exists = true;
-			SCHEMA_SET_STR(vstate.mac_list_type, "blacklist");\
-		}
+			SCHEMA_SET_STR(vstate.mac_list_type, "blacklist");
+		} else
+			vstate.mac_list_type_exists = false;
 	}
 
 	if (tb[WIF_ATTR_MACLIST]) {
@@ -341,6 +461,7 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	}
 
 	vif_state_security_get(&vstate, tb);
+	vif_state_custom_options_get(&vstate, tb);
 
 	if (vconf) {
 		LOGN("%s: updating vif config", radio);
@@ -414,6 +535,14 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 		blobmsg_add_bool(&b, "ieee80211r", 0);
 	}
 
+	if (changed->btm) {
+		blobmsg_add_bool(&b, "ieee80211v", 1);
+		blobmsg_add_bool(&b, "bss_transition", 1);
+	} else {
+		blobmsg_add_bool(&b, "ieee80211v", 0);
+		blobmsg_add_bool(&b, "bss_transition", 0);
+	}
+
 	if (changed->bridge)
 		blobmsg_add_string(&b, "network", vconf->bridge);
 
@@ -428,7 +557,7 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 		struct blob_attr *a;
 		int i;
 
-		if (!strcmp(vconf->mac_list_type,"whitelist"))
+		if (!strcmp(vconf->mac_list_type, "whitelist"))
 			blobmsg_add_string(&b, "macfilter", "allow");
 		else if (!strcmp(vconf->mac_list_type,"blacklist"))
 			blobmsg_add_string(&b, "macfilter", "deny");
@@ -442,6 +571,8 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 	}
 
 	vif_config_security_set(&b, vconf);
+	if (changed->custom_options)
+		vif_config_custom_opt_set(&b, vconf);
 
 	vif_ifname_to_sectionname(vconf->if_name, vif_section_name);
 	blob_to_uci_section(uci, "wireless", vif_section_name, "wifi-iface",

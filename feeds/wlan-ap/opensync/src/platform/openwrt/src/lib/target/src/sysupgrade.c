@@ -57,6 +57,8 @@ static ev_timer  osp_utimer;
 static bool upg_running = false;
 static char upg_url[256];
 
+static const char fw_path[] = "/tmp/upgrade.tar";
+
 static void osp_upg_get_img_path(char *buf, int buflen)
 {
 	char *file_name;
@@ -108,6 +110,36 @@ static void osp_upg_curl_free(CURL *curl)
 	curl_easy_cleanup(curl);
 }
 
+static bool osp_upg_validate_firmware(const char *img_path)
+{
+	struct stat st_buf;
+	char cmd[128];
+	int ret_status;
+
+	if (stat(img_path, &st_buf) != 0) {
+		LOG(ERR, "UM: File %s doesn't exist", img_path);
+		status = OSP_UPG_IMG_FAIL;
+		return false;
+	}
+
+	if (st_buf.st_size < 0) {
+		LOG(ERR, "UM: File %s is empty", img_path);
+		status = OSP_UPG_IMG_FAIL;
+		return false;
+	}
+
+	/* Extract Firmware tar and validate sha256 Checksum */
+	snprintf(cmd, sizeof(cmd), "/bin/validate-firmware %s", img_path);
+	ret_status = system(cmd);
+	if (!WIFEXITED(ret_status) || WEXITSTATUS(ret_status) != 0) {
+		status = OSP_UPG_MD5_FAIL;
+		LOG(ERR, "UM: Checksum validation failed");
+		return false;
+	}
+
+	return true;
+}
+
 static bool osp_upg_download_image(int timeout, long file_size)
 {
 	CURL *curl;
@@ -127,6 +159,7 @@ static bool osp_upg_download_image(int timeout, long file_size)
 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, 0L);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout);
 	curl_easy_setopt(curl, CURLOPT_URL, upg_url);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, osp_upg_fetch_data);
 	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
@@ -156,6 +189,14 @@ static bool osp_upg_download_image(int timeout, long file_size)
 		return false;
 	}
 
+	/* Validate checksum */
+	if (!osp_upg_validate_firmware(file_path)) {
+		status = status;
+		LOG(ERR, "UM: Image validation failed");
+		osp_upg_curl_free(curl);
+		return false;
+	}
+
 	osp_upg_curl_free(curl);
 
 	return true;
@@ -164,12 +205,10 @@ static bool osp_upg_download_image(int timeout, long file_size)
 static bool osp_upg_download_url(int timeout)
 {
 	char file_path[128];
-	char cmd[128];
 	char *file_name;
 	status = OSP_UPG_OK;
 	unsigned long file_size;
 	struct stat st_buf;
-	int ret_status;
 
 	file_name = basename(upg_url);
 	LOGI("UM: Downloading image: (%s), from url: %s", file_name, upg_url);
@@ -182,17 +221,6 @@ static bool osp_upg_download_url(int timeout)
 
 	if (!osp_upg_download_image(timeout, file_size)) {
 		status = OSP_UPG_DL_FW;
-		return false;
-	}
-
-	snprintf(cmd, sizeof(cmd), "sysupgrade -T %s", file_path);
-
-	LOGI("um: testing the image %s", file_path);
-	ret_status = system(cmd);
-
-	if (!WIFEXITED(ret_status) || WEXITSTATUS(ret_status) != 0) {
-		LOGI("UM: sysupgrade failed");
-		status = OSP_UPG_IMG_FAIL;
 		return false;
 	}
 
@@ -211,6 +239,7 @@ static void cb_osp_start_download(EV_P_ ev_timer *w, int events)
 
 	if (!osp_upg_download_url(dl_data->dl_timeout)) {
 		LOG(ERR, "UM: Error downloading %s", upg_url);
+		status = status;
 
 		// clear library URL if download failed allow repeating same URL in case of failure
 		upg_url[0]=0;
@@ -229,33 +258,16 @@ cleanup:
 
 static bool upg_upgrade(const char *password)
 {
-	char img_path[128];
-	struct stat st_buf;
 	char cmd[128];
 	int ret_status;
 
-	osp_upg_get_img_path(img_path, sizeof(img_path));
-
-	if (stat(img_path, &st_buf) != 0) {
-		LOG(ERR, "UM: File %s doesn't exist", img_path);
-		status = OSP_UPG_IMG_FAIL;
-		return false;
-	}
-
-	if (st_buf.st_size < 0) {
-		LOG(ERR, "UM: File %s is empty", img_path);
-		status = OSP_UPG_IMG_FAIL;
-		return false;
-	}
-
 	LOGI("UM: Upgrading the image...");
-	snprintf(cmd, sizeof(cmd), "sysupgrade %s", img_path);
+	snprintf(cmd, sizeof(cmd), "/bin/flash-firmware %s", fw_path);
 
-	LOGI("UM: Upgraded with image %s", img_path);
 	ret_status = system(cmd);
 
 	if (!WIFEXITED(ret_status) || WEXITSTATUS(ret_status) != 0) {
-		LOGI("UM: sysupgrade failed");
+		LOG(ERR, "UM: sysupgrade failed");
 		status = OSP_UPG_FL_WRITE;
 		return false;
 	}

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #ifndef _NL_80211_H__
 #define _NL_80211_H__
 

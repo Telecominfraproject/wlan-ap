@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #include <string.h>
 #include <glob.h>
 #include <libgen.h>
@@ -320,6 +322,13 @@ bool vif_state_to_conf(struct schema_Wifi_VIF_State *vstate,
 	for (i = 0; i < vstate->mac_list_len; i++)
 		STRSCPY(vconf->mac_list[i], vstate->mac_list[i]);
 	vconf->mac_list_len = vstate->mac_list_len;
+
+	for (i = 0; i < vstate->custom_options_len; i++) {
+		STRSCPY(vconf->custom_options_keys[i],
+			vstate->custom_options_keys[i]);
+		STRSCPY(vconf->custom_options[i], vstate->custom_options[i]);
+	}
+	vconf->custom_options_len = vstate->custom_options_len;
 
 	return true;
 

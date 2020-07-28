@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #ifndef _UCI_UTIL_H__
 #define _UCI_UTIL_H__
 

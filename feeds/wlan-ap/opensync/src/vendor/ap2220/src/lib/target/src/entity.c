@@ -84,7 +84,7 @@ bool target_model_get(void *buff, size_t buffsz)
 {
     if (!devInfoModelNumber_saved)  {
         if ( NULL == get_devinfo_record( "modelNumber=", devInfoModelNumber, DEV_INFO_RECORD_SZ))
-	   snprintf(devInfoModelNumber, DEV_INFO_RECORD_SZ, "%s", "TIP_AP");
+	   snprintf(devInfoModelNumber, DEV_INFO_RECORD_SZ, "%s", "AP2220");
         devInfoModelNumber_saved = true; 
     }
     strncpy(buff, devInfoModelNumber, buffsz);

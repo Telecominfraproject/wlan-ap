@@ -1,0 +1,120 @@
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -74,9 +74,14 @@ static inline enum wme_ac ath11k_tid_to_
+ 		WME_AC_VO);
+ }
+ 
++enum ath11k_skb_flags {
++	ATH11K_SKB_HW_80211_ENCAP = BIT(0),
++};
++
+ struct ath11k_skb_cb {
+ 	dma_addr_t paddr;
+ 	u8 eid;
++	u8 flags;
+ 	struct ath11k *ar;
+ 	struct ieee80211_vif *vif;
+ } __packed;
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -13,10 +13,14 @@ static enum hal_tcl_encap_type
+ ath11k_dp_tx_get_encap_type(struct ath11k_vif *arvif, struct sk_buff *skb)
+ {
+ 	struct ath11k_base *ab = arvif->ar->ab;
++	struct ieee80211_tx_info *tx_info = IEEE80211_SKB_CB(skb);
+ 
+ 	if (test_bit(ATH11K_FLAG_RAW_MODE, &ab->dev_flags))
+ 		return HAL_TCL_ENCAP_TYPE_RAW;
+ 
++	if (tx_info->control.flags & IEEE80211_TX_CTRL_HW_80211_ENCAP)
++		return HAL_TCL_ENCAP_TYPE_ETHERNET;
++
+ 	return HAL_TCL_ENCAP_TYPE_NATIVE_WIFI;
+ }
+ 
+@@ -40,8 +44,11 @@ static void ath11k_dp_tx_encap_nwifi(str
+ static u8 ath11k_dp_tx_get_tid(struct sk_buff *skb)
+ {
+ 	struct ieee80211_hdr *hdr = (void *)skb->data;
++	struct ath11k_skb_cb *cb = ATH11K_SKB_CB(skb);
+ 
+-	if (!ieee80211_is_data_qos(hdr->frame_control))
++	if (cb->flags & ATH11K_SKB_HW_80211_ENCAP)
++		return skb->priority % IEEE80211_QOS_CTL_TID_MASK;
++	else if(!ieee80211_is_data_qos(hdr->frame_control))
+ 		return HAL_DESC_REO_NON_QOS_TID;
+ 	else
+ 		return skb->priority & IEEE80211_QOS_CTL_TID_MASK;
+@@ -90,7 +97,8 @@ int ath11k_dp_tx(struct ath11k *ar, stru
+ 	if (test_bit(ATH11K_FLAG_CRASH_FLUSH, &ar->ab->dev_flags))
+ 		return -ESHUTDOWN;
+ 
+-	if (!ieee80211_is_data(hdr->frame_control))
++	if (!(info->control.flags & IEEE80211_TX_CTRL_HW_80211_ENCAP) &&
++	    !ieee80211_is_data(hdr->frame_control))
+ 		return -ENOTSUPP;
+ 
+ 	pool_id = skb_get_queue_mapping(skb) & (ATH11K_HW_MAX_QUEUES - 1);
+@@ -178,6 +186,8 @@ tcl_ring_sel:
+ 		}
+ 		break;
+ 	case HAL_TCL_ENCAP_TYPE_ETHERNET:
++		/* no need to encap */
++		break;
+ 	case HAL_TCL_ENCAP_TYPE_802_3:
+ 		/* TODO: Take care of other encap modes as well */
+ 		ret = -EINVAL;
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -4550,6 +4550,7 @@ static void ath11k_mac_op_tx(struct ieee
+ 			     struct ieee80211_tx_control *control,
+ 			     struct sk_buff *skb)
+ {
++	struct ath11k_skb_cb *skb_cb = ATH11K_SKB_CB((struct sk_buff *)skb);
+ 	struct ath11k *ar = hw->priv;
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 	struct ieee80211_vif *vif = info->control.vif;
+@@ -4558,7 +4559,10 @@ static void ath11k_mac_op_tx(struct ieee
+ 	bool is_prb_rsp;
+ 	int ret;
+ 
+-	if (ieee80211_is_mgmt(hdr->frame_control)) {
++	skb_cb->flags = 0;
++	if (info->control.flags & IEEE80211_TX_CTRL_HW_80211_ENCAP) {
++		skb_cb->flags = ATH11K_SKB_HW_80211_ENCAP;
++	} else if (ieee80211_is_mgmt(hdr->frame_control)) {
+ 		is_prb_rsp = ieee80211_is_probe_resp(hdr->frame_control);
+ 		ret = ath11k_mac_mgmt_tx(ar, skb, is_prb_rsp);
+ 		if (ret) {
+@@ -4778,6 +4782,7 @@ static int ath11k_mac_op_add_interface(s
+ 	struct vdev_create_params vdev_param = {0};
+ 	struct peer_create_params peer_param;
+ 	u32 param_id, param_value;
++	int hw_encap = 0;
+ 	u16 nss;
+ 	int i;
+ 	int ret;
+@@ -4874,10 +4879,22 @@ static int ath11k_mac_op_add_interface(s
+ 	spin_unlock_bh(&ar->data_lock);
+ 
+ 	param_id = WMI_VDEV_PARAM_TX_ENCAP_TYPE;
+-	param_value = ATH11K_HW_TXRX_NATIVE_WIFI;
++	switch (vif->type) {
++	case NL80211_IFTYPE_STATION:
++	case NL80211_IFTYPE_AP_VLAN:
++	case NL80211_IFTYPE_AP:
++		hw_encap = 1;
++		break;
++	default:
++		break;
++	}
+ 
+ 	if (test_bit(ATH11K_FLAG_RAW_MODE, &ab->dev_flags))
+ 		param_value = ATH11K_HW_TXRX_RAW;
++	else if (ieee80211_set_hw_80211_encap(vif, ath11k_ethernet_mode & hw_encap))
++		param_value = ATH11K_HW_TXRX_ETHERNET;
++	else
++		param_value = ATH11K_HW_TXRX_NATIVE_WIFI;
+ 
+ 	ret = ath11k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
+ 					    param_id, param_value);
