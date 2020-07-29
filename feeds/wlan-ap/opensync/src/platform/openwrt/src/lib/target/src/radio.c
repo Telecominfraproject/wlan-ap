@@ -67,6 +67,7 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 {
 	struct blob_attr *tb[__WDEV_ATTR_MAX] = { };
 	struct schema_Wifi_Radio_State  rstate;
+	char *freq_band = NULL;
 	char phy[6];
 
 	LOGN("%s: get state", rstate.if_name);
@@ -85,7 +86,10 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 
 	SCHEMA_SET_STR(rstate.if_name, s->e.name);
 
-	if (strcmp(s->e.name, "wifi0")) {
+	if (tb[WDEV_ATTR_FREQ_BAND])
+		freq_band = blobmsg_get_string(tb[WDEV_ATTR_FREQ_BAND]);
+
+	if (freq_band && (!strcmp(freq_band, "5G") || !strcmp(freq_band, "5GU"))) {
 		STRSCPY(rstate.hw_config_keys[0], "dfs_enable");
 		snprintf(rstate.hw_config[0], sizeof(rstate.hw_config[0]), "1");
 		STRSCPY(rstate.hw_config_keys[1], "dfs_ignorecac");
