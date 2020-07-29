@@ -15,6 +15,7 @@ _wifi_rename() {
 
 	uci -q rename wireless.${old}=${new}
 	uci -q set wireless.${new}.freq_band=${band}
+	uci -q set wireless.${new}.disabled=0
 
 	uci -q rename wireless.default_${old}=${vif}
 	uci -q set wireless.${vif}.device=${new}
@@ -48,7 +49,8 @@ run_wlan_ap() {
 		wifi_rename wifi0 home_ap_24 'platform/soc/a000000.wifi' '2.4G'
 		wifi_rename wifi1 home_ap_50 'platform/soc/a800000.wifi' '5G'
 		;;
-	tp-link,ap2220)
+	tp-link,ap2220|\
+	tp-link,ec420-g1)
 		wifi_rename wifi0 home_ap_24 'platform/soc/a000000.wifi' '2.4G'
 		wifi_rename wifi1 home_ap_50 'soc/40000000.pci/pci0000:00/0000:00:00.0/0000:01:00.0' '5G'
 		;;
