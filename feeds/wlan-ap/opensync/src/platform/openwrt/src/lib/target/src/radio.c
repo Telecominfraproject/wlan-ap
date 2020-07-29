@@ -229,7 +229,8 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 static void periodic_task(void *arg)
 {
 	static int counter = 0;
-	struct uci_element *e = NULL;
+	struct uci_element *e = NULL, *tmp = NULL;
+	char ifname[20];
 
 	if ((counter % 15) && !reload_config)
 		goto done;
@@ -243,18 +244,18 @@ static void periodic_task(void *arg)
 	LOGT("periodic: start state update ");
 
 	uci_load(uci, "wireless", &wireless);
-	uci_foreach_element(&wireless->sections, e) {
+	uci_foreach_element_safe(&wireless->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
 
 		if (!strcmp(s->type, "wifi-device"))
 			radio_state_update(s, NULL);
 	}
 
-	uci_foreach_element(&wireless->sections, e) {
+	uci_foreach_element_safe(&wireless->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
 
 		if (!strcmp(s->type, "wifi-iface"))
-			if (vif_find(s->e.name))
+			if (vif_find(vif_sectionname_to_ifname(s->e.name, ifname)))
 				vif_state_update(s, NULL);
 	}
 	uci_unload(uci, wireless);
@@ -269,17 +270,17 @@ bool target_radio_config_init2(void)
 {
 	struct schema_Wifi_Radio_Config rconf;
 	struct schema_Wifi_VIF_Config vconf;
-	struct uci_element *e = NULL;
+	struct uci_element *e = NULL, *tmp = NULL;
 
 	uci_load(uci, "wireless", &wireless);
-	uci_foreach_element(&wireless->sections, e) {
+	uci_foreach_element_safe(&wireless->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
 
 		if (!strcmp(s->type, "wifi-device"))
 			radio_state_update(s, &rconf);
 	}
 
-	uci_foreach_element(&wireless->sections, e) {
+	uci_foreach_element_safe(&wireless->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
 
 		if (!strcmp(s->type, "wifi-iface"))
