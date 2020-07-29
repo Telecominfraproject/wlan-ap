@@ -168,6 +168,7 @@ static int nl80211_survey_recv(struct nl_msg *msg, void *arg)
 		[NL80211_SURVEY_INFO_TIME_BUSY]		= { .type = NLA_U64 },
 		[NL80211_SURVEY_INFO_TIME_EXT_BUSY]	= { .type = NLA_U64 },
 		[NL80211_SURVEY_INFO_TIME_SCAN]		= { .type = NLA_U64 },
+		[NL80211_SURVEY_INFO_NOISE]		= { .type = NLA_U8 },
 	};
 
 	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
@@ -194,23 +195,26 @@ static int nl80211_survey_recv(struct nl_msg *msg, void *arg)
 		survey_record->info.chan = ieee80211_frequency_to_channel(
 						nla_get_u32(si[NL80211_SURVEY_INFO_FREQUENCY]));
 
-	if (si[NL80211_SURVEY_INFO_TIME])
-		survey_record->chan_self = nla_get_u64(tb[NL80211_SURVEY_INFO_TIME]);
+	if (si[NL80211_SURVEY_INFO_TIME_RX])
+		survey_record->chan_self = nla_get_u64(si[NL80211_SURVEY_INFO_TIME_RX]);
 
 	if (si[NL80211_SURVEY_INFO_TIME_TX])
-		survey_record->chan_tx = nla_get_u64(tb[NL80211_SURVEY_INFO_TIME_TX]);
+		survey_record->chan_tx = nla_get_u64(si[NL80211_SURVEY_INFO_TIME_TX]);
 
 	if (si[NL80211_SURVEY_INFO_TIME_RX])
-		survey_record->chan_rx = nla_get_u64(tb[NL80211_SURVEY_INFO_TIME_RX]);
+		survey_record->chan_rx = nla_get_u64(si[NL80211_SURVEY_INFO_TIME_RX]);
 
 	if (si[NL80211_SURVEY_INFO_TIME_BUSY])
-		survey_record->chan_busy = nla_get_u64(tb[NL80211_SURVEY_INFO_TIME_BUSY]);
+		survey_record->chan_busy = nla_get_u64(si[NL80211_SURVEY_INFO_TIME_BUSY]);
 
 	if (si[NL80211_SURVEY_INFO_TIME_EXT_BUSY])
-		survey_record->chan_busy_ext = nla_get_u64(tb[NL80211_SURVEY_INFO_TIME_EXT_BUSY]);
+		survey_record->chan_busy_ext = nla_get_u64(si[NL80211_SURVEY_INFO_TIME_EXT_BUSY]);
 
-	if (si[NL80211_SURVEY_INFO_TIME_SCAN])
-		survey_record->duration_ms = nla_get_u64(tb[NL80211_SURVEY_INFO_TIME_SCAN]);
+	if (si[NL80211_SURVEY_INFO_TIME])
+		survey_record->duration_ms = nla_get_u64(si[NL80211_SURVEY_INFO_TIME]);
+
+	if (si[NL80211_SURVEY_INFO_NOISE])
+		survey_record->chan_noise = nla_get_u8(si[NL80211_SURVEY_INFO_NOISE]);
 
 	ds_dlist_insert_tail(nl_call_param->list, survey_record);
 
