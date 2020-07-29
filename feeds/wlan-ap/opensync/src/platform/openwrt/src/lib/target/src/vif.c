@@ -405,7 +405,7 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	if (tb[WIF_ATTR_VLAN_ID])
 		SCHEMA_SET_INT(vstate.vlan_id, blobmsg_get_u32(tb[WIF_ATTR_VLAN_ID]));
 	else
-		SCHEMA_SET_INT(vstate.vlan_id, 0);
+		SCHEMA_SET_INT(vstate.vlan_id, 1);
 
 	if (tb[WIF_ATTR_SSID])
 		SCHEMA_SET_STR(vstate.ssid, blobmsg_get_string(tb[WIF_ATTR_SSID]));
