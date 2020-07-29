@@ -56,6 +56,10 @@ define Package/opensync/description
 	For more info please visit: https://opensync.io
 endef
 
+define Package/opensync/conffiles
+/usr/opensync/certs/
+endef
+
 Package/opensync-ap2220/description=$(call Package/opensync/description)
 Package/opensync-ecw5410/description=$(call Package/opensync/description)
 Package/opensync-ea8300/description=$(call Package/opensync/description)
