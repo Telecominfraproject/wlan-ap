@@ -1,9 +1,0 @@
-OS_TARGETS +=AP2220
-
-ifeq ($(TARGET),AP2220)
-PLATFORM=openwrt
-VENDOR=ap2220
-PLATFORM_DIR := platform/$(PLATFORM)
-KCONFIG_TARGET ?= $(PLATFORM_DIR)/kconfig/openwrt_generic
-ARCH_MK := $(PLATFORM_DIR)/build/$(PLATFORM).mk
-endif

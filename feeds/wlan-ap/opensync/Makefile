@@ -18,32 +18,11 @@ define Package/opensync/default
 	DEPENDS:=+libev +jansson +protobuf +libprotobuf-c +libmosquitto +libopenssl +openvswitch +libpcap +libuci +libcurl +libnl-tiny +libubus +libblobmsg-json +tcpdump +curl +lldpd +wlan-ap-keys
 endef
 
-define Package/opensync-ap2220
-  $(call Package/opensync/default)
-  TITLE += (AP2220)
-  VARIANT:=AP2220
-  DEPENDS+=@TARGET_ipq40xx
-endef
-
 define Package/opensync-ecw5410
   $(call Package/opensync/default)
   TITLE += (ECW5410)
   VARIANT:=ECW5410
   DEPENDS+=@TARGET_ipq806x
-endef
-
-define Package/opensync-ecw5211
-  $(call Package/opensync/default)
-  TITLE += (ECW5211)
-  VARIANT:=ECW5211
-  DEPENDS+=@TARGET_ipq40xx
-endef
-
-define Package/opensync-ea8300
-  $(call Package/opensync/default)
-  TITLE += (EA8300)
-  VARIANT:=IPQ40XX
-  DEPENDS+=@TARGET_ipq40xx
 endef
 
 define Package/opensync
@@ -60,9 +39,7 @@ define Package/opensync/conffiles
 /usr/opensync/certs/
 endef
 
-Package/opensync-ap2220/description=$(call Package/opensync/description)
 Package/opensync-ecw5410/description=$(call Package/opensync/description)
-Package/opensync-ea8300/description=$(call Package/opensync/description)
 
 define Build/Prepare
 	$(PKG_UNPACK)
@@ -99,11 +76,7 @@ ifdef CONFIG_PACKAGE_wlan-ap-keys
 endif
 endef
 
-Package/opensync-ap2220/install=$(call Package/opensync/install,$(1))
 Package/opensync-ecw5410/install=$(call Package/opensync/install,$(1))
-Package/opensync-ea8300/install=$(call Package/opensync/install,$(1))
 
-$(eval $(call BuildPackage,opensync-ap2220))
 $(eval $(call BuildPackage,opensync-ecw5410))
-$(eval $(call BuildPackage,opensync-ea8300))
 $(eval $(call BuildPackage,opensync))
