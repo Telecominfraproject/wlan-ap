@@ -25,7 +25,8 @@ static void callback_Manager(ovsdb_update_monitor_t *mon,
 {
 	if (done || mon->mon_type == OVSDB_UPDATE_DEL)
 		return;
-
+	if (!conf->is_connected)
+		return;
 	done = 1;
 	LOGN("CM connected, stopping webserver in 5 minutes");
 	evsched_task(&stop_http, NULL, EVSCHED_SEC(5 * 60));
