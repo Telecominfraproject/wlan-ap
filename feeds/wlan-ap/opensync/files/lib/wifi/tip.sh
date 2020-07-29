@@ -2,6 +2,8 @@
 
 append HOOKS "wlan_ap"
 
+mac=$(cat /sys/class/net/eth0/address | tr -d :)
+
 _wifi_rename() {
 	local old=$1
 	local new=$2
@@ -21,6 +23,7 @@ _wifi_rename() {
 	uci -q set wireless.${vif}.device=${new}
 	uci -q set wireless.${vif}.ifname=${vif}
 	uci -q set wireless.${vif}.index=0
+	uci -q set wireless.${vif}.ssid="Maverick-${mac:6}"
 }
 
 wifi_rename() {
