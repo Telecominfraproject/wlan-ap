@@ -18,6 +18,9 @@ static struct cmd_handler {
 		.cmd = "tcpdump",
 		.cb = cmd_handler_tcpdump,
 	}, {
+		.cmd = "tcpdump-wifi",
+		.cb = cmd_handler_tcpdump_wifi,
+	}, {
 		.cmd = "crashlog",
 		.cb = cmd_handler_crashlog,
 	},

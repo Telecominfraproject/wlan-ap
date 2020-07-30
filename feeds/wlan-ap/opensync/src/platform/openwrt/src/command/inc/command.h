@@ -34,11 +34,13 @@ struct task {
 	struct list_head list;
 	pid_t pid;
 	ev_child child;
+	const char *arg;
 };
 
 extern char serial[64];
 extern time_t crash_timestamp;
 extern pid_t cmd_handler_tcpdump(struct task *task);
+extern pid_t cmd_handler_tcpdump_wifi(struct task *task);
 extern void task_status(struct task *task, int status, char *result);
 extern void task_init(void);
 extern int ubus_get_l3_device(const char *net, char *ifname);
