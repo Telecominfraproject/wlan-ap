@@ -350,14 +350,10 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	blobmsg_parse(wifi_iface_policy, __WIF_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
 
 	if (!tb[WIF_ATTR_DEVICE] || !tb[WIF_ATTR_IFNAME] || !tb[WIF_ATTR_SSID]) {
-		char name[64];
-		LOGN("%s: deleting invalid radio/ifname", s->e.name);
-		snprintf(name, sizeof(name), "wireless.%s",s->e.name);
-		uci_section_del(uci,"wifi-iface", name);
-		uci_commit_all(uci);
-		reload_config = 1;
+		LOGN("%s: skipping invalid radio/ifname", s->e.name);
 		return false;
 	}
+
 	ifname = blobmsg_get_string(tb[WIF_ATTR_IFNAME]);
 	strncpy(radio, blobmsg_get_string(tb[WIF_ATTR_DEVICE]), IF_NAMESIZE);
 
@@ -474,37 +470,37 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	return true;
 }
 
+bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
+{
+	struct uci_package *wireless;
+	char vif_section_name[20];
+
+	vlan_del((char *)vconf->if_name);
+	vif_ifname_to_sectionname(vconf->if_name, vif_section_name);
+	uci_load(uci, "wireless", &wireless);
+	uci_section_del(uci, "vif", "wireless", vif_section_name, "wifi-iface");
+	uci_commit_all(uci);
+	reload_config = 1;
+	return true;
+}
+
 bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 			    const struct schema_Wifi_Radio_Config *rconf,
 			    const struct schema_Wifi_Credential_Config *cconfs,
 			    const struct schema_Wifi_VIF_Config_flags *changed,
 			    int num_cconfs)
 {
-        char radio_section_name[8]="";
-	int radio_index;
 	char vif_section_name[20];
 	int vid = 0;
 
 	blob_buf_init(&b, 0);
 
 	blobmsg_add_string(&b, "ifname", vconf->if_name);
-	sscanf(vconf->if_name, "wlan%d", &radio_index);
-	snprintf(radio_section_name, sizeof(radio_section_name), "radio%d", radio_index);
-	blobmsg_add_string(&b, "device", radio_section_name);
+	blobmsg_add_string(&b, "device", rconf->if_name);
 	blobmsg_add_string(&b, "mode", "ap");
 
-	if (changed->enabled && vconf->enabled)
-		blobmsg_add_bool(&b, "disabled", 0);
-	else {
-		char uci_name[40];
-
-	        if (vid) {
-                	vlan_del((char *)vconf->if_name);
-		}
-	        vif_ifname_to_sectionname(vconf->if_name, vif_section_name);
-		snprintf(uci_name, sizeof(uci_name),"wireless.%s", vif_section_name);
-		uci_section_del(uci, "wifi-iface", uci_name);
-	}
+	if (changed->enabled)
+		blobmsg_add_bool(&b, "disabled", vconf->enabled ? 0 : 1);
 
 	if (changed->ssid)
 		blobmsg_add_string(&b, "ssid", vconf->ssid);
@@ -576,14 +572,13 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 
 	vif_ifname_to_sectionname(vconf->if_name, vif_section_name);
 	blob_to_uci_section(uci, "wireless", vif_section_name, "wifi-iface",
-			    b.head, &wifi_iface_param);
+			    b.head, &wifi_iface_param, NULL);
 
 	if (vid)
 		vlan_add((char *)vconf->if_name, vconf->vlan_id, vid);
 	else
 		vlan_del((char *)vconf->if_name);
 
-	uci_commit_all(uci);
 	reload_config = 1;
 
 	return true;

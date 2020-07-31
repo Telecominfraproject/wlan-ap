@@ -219,7 +219,6 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 
 	blob_to_uci_section(uci, "wireless", rconf->if_name, "wifi-device",
 			    b.head, &wifi_device_param, NULL);
-	uci_commit_all(uci);
 
 	reload_config = 1;
 
@@ -238,6 +237,7 @@ static void periodic_task(void *arg)
 	if (reload_config) {
 		LOGT("periodic: reload config");
 		reload_config = 0;
+		uci_commit_all(uci);
 		system("reload_config");
 	}
 
@@ -270,17 +270,17 @@ bool target_radio_config_init2(void)
 {
 	struct schema_Wifi_Radio_Config rconf;
 	struct schema_Wifi_VIF_Config vconf;
-	struct uci_element *e = NULL, *tmp = NULL;
+	struct uci_element *e = NULL;
 
 	uci_load(uci, "wireless", &wireless);
-	uci_foreach_element_safe(&wireless->sections, tmp, e) {
+	uci_foreach_element(&wireless->sections, e) {
 		struct uci_section *s = uci_to_section(e);
 
 		if (!strcmp(s->type, "wifi-device"))
 			radio_state_update(s, &rconf);
 	}
 
-	uci_foreach_element_safe(&wireless->sections, tmp, e) {
+	uci_foreach_element(&wireless->sections, e) {
 		struct uci_section *s = uci_to_section(e);
 
 		if (!strcmp(s->type, "wifi-iface"))
