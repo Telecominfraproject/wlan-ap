@@ -15,6 +15,7 @@
 #include "ds.h"
 #include "target.h"
 
+#include <linux/if.h>
 #include <libubox/blobmsg.h>
 #include "utils.h"
 
@@ -35,6 +36,13 @@ static inline const char * __find_key(char *keyv, size_t keysz, char *datav, siz
 
 	return NULL;
 }
+
+struct iface_info {
+	char name[IFNAMSIZ];
+	int vid;
+};
+
+extern int l3_device_split(char *l3_device, struct iface_info *info);
 
 extern struct blob_buf b;
 extern ovsdb_table_t table_Wifi_Inet_Config;

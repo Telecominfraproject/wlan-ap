@@ -4,6 +4,7 @@
 #include "target.h"
 
 #include "radio.h"
+#include "phy.h"
 #include "ubus.h"
 
 extern struct ev_loop *wifihal_evloop;
@@ -98,7 +99,79 @@ radio_ubus_dummy_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	return UBUS_STATUS_OK;
 }
 
+enum {
+	ADD_VIF_RADIO,
+	ADD_VIF_NAME,
+	ADD_VIF_VID,
+	ADD_VIF_NETWORK,
+	ADD_VIF_SSID,
+	__ADD_VIF_MAX,
+};
+
+static const struct blobmsg_policy add_vif_policy[__ADD_VIF_MAX] = {
+	[ADD_VIF_RADIO] = { .name = "radio", .type = BLOBMSG_TYPE_STRING },
+	[ADD_VIF_NAME] = { .name = "name", .type = BLOBMSG_TYPE_STRING },
+	[ADD_VIF_VID] = { .name = "vid", .type = BLOBMSG_TYPE_INT32 },
+	[ADD_VIF_NETWORK] = { .name = "network", .type = BLOBMSG_TYPE_STRING },
+	[ADD_VIF_SSID] = { .name = "ssid", .type = BLOBMSG_TYPE_STRING },
+};
+
+static int
+radio_ubus_add_vif_cb(struct ubus_context *ctx, struct ubus_object *obj,
+		      struct ubus_request_data *req, const char *method,
+		      struct blob_attr *msg)
+{
+	struct blob_attr *tb[__ADD_VIF_MAX] = { };
+	struct schema_Wifi_VIF_Config conf;
+	char band[8];
+	char *radio;
+
+	if (!msg)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	blobmsg_parse(add_vif_policy, __ADD_VIF_MAX, tb, blob_data(msg), blob_len(msg));
+	if (!tb[ADD_VIF_RADIO] || !tb[ADD_VIF_NAME] || !tb[ADD_VIF_VID] ||
+	    !tb[ADD_VIF_NETWORK] || !tb[ADD_VIF_SSID])
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	radio = blobmsg_get_string(tb[ADD_VIF_RADIO]);
+
+	memset(&conf, 0, sizeof(conf));
+	schema_Wifi_VIF_Config_mark_all_present(&conf);
+	conf._partial_update = true;
+	conf._partial_update = true;
+
+        SCHEMA_SET_INT(conf.rrm, 1);
+        SCHEMA_SET_INT(conf.ft_psk, 0);
+        SCHEMA_SET_INT(conf.group_rekey, 0);
+	strscpy(conf.mac_list_type, "none", sizeof(conf.mac_list_type));
+	conf.mac_list_len = 0;
+	SCHEMA_SET_STR(conf.if_name, blobmsg_get_string(tb[ADD_VIF_NAME]));
+	SCHEMA_SET_STR(conf.ssid_broadcast, "enabled");
+	SCHEMA_SET_STR(conf.mode, "ap");
+	SCHEMA_SET_INT(conf.enabled, 1);
+	SCHEMA_SET_INT(conf.btm, 1);
+	SCHEMA_SET_INT(conf.uapsd_enable, true);
+	SCHEMA_SET_STR(conf.bridge, blobmsg_get_string(tb[ADD_VIF_NETWORK]));
+	SCHEMA_SET_INT(conf.vlan_id, blobmsg_get_u32(tb[ADD_VIF_VID]));
+	SCHEMA_SET_STR(conf.ssid, blobmsg_get_string(tb[ADD_VIF_SSID]));
+	STRSCPY(conf.security_keys[0], "encryption");
+        STRSCPY(conf.security[0], "OPEN");
+        conf.security_len = 1;
+
+	phy_get_band(target_map_ifname(radio), band);
+	if (strstr(band, "5"))
+		SCHEMA_SET_STR(conf.min_hw_mode, "11ac");
+	else
+		SCHEMA_SET_STR(conf.min_hw_mode, "11n");
+
+	radio_ops->op_vconf(&conf, radio);
+
+	return UBUS_STATUS_OK;
+}
+
 static const struct ubus_method radio_ubus_methods[] = {
+        UBUS_METHOD("dbg_add_vif", radio_ubus_add_vif_cb, add_vif_policy),
         UBUS_METHOD("dummy", radio_ubus_dummy_cb, dummy_policy),
 };
 

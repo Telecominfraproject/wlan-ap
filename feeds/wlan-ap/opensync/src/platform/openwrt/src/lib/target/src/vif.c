@@ -575,7 +575,7 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 			    b.head, &wifi_iface_param, NULL);
 
 	if (vid)
-		vlan_add((char *)vconf->if_name, vconf->vlan_id, vid);
+		vlan_add((char *)vconf->if_name, vid, !strcmp(vconf->bridge, "wan"));
 	else
 		vlan_del((char *)vconf->if_name);
 

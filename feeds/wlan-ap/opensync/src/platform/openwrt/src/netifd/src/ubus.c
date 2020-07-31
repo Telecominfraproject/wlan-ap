@@ -3,6 +3,7 @@
 #include <syslog.h>
 #include "target.h"
 
+#include "evsched.h"
 #include "netifd.h"
 #include "ubus.h"
 
@@ -33,22 +34,8 @@ static int netifd_ubus_notify(struct ubus_context *ctx, struct ubus_object *obj,
 	return 0;
 }
 
-static void netifd_ubus_iface_dump(struct ubus_request *req,
-				   int type, struct blob_attr *msg)
-{
-	wifi_inet_state_set(msg);
-	wifi_inet_master_set(msg);
-}
-
-static void netifd_ubus_subscribed(const char *path, uint32_t id, int add)
-{
-	if (!strncmp(path, "network.", 8))
-		ubus_invoke(ubus, id, "status", NULL, netifd_ubus_iface_dump, NULL, 1000);
-}
-
 static struct ubus_instance ubus_instance = {
 	.connect = netifd_ubus_connect,
-	.subscribed = netifd_ubus_subscribed,
 	.notify = netifd_ubus_notify,
 	.list = {
 			{

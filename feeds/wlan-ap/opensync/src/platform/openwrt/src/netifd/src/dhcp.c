@@ -43,14 +43,14 @@ void dhcp_add(char *net, const char *lease_time, const char *start, const char *
 	if (lease_time || start || limit) {
 		blobmsg_add_string(&b, "start", start ? start : "10");
 		blobmsg_add_string(&b, "limit", limit ? limit : "200");
-		blobmsg_add_string(&b, "leastime", lease_time ? lease_time : "12h");
+		blobmsg_add_string(&b, "leasetime", lease_time ? lease_time : "12h");
 		blobmsg_add_string(&b, "dhcpv6", "server");
 		blobmsg_add_string(&b, "ra", "server");
 		blobmsg_add_u32(&b, "ignore", 0);
 	} else {
 		blobmsg_add_u32(&b, "ignore", 1);
 	}
-	blobmsg_add_bool(&b, "autogen", 1);
+	blobmsg_add_u32(&b, "autogen", 1);
 
 	blob_to_uci_section(uci, "dhcp", net, "dhcp", b.head, &dhcp_param, NULL);
 }

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 
 #include "netifd.h"
+#include "evsched.h"
 
 #include <uci.h>
 #include <libubox/blobmsg.h>
@@ -48,6 +49,7 @@ const struct uci_blob_param_list network_param = {
 	.params = network_policy,
 };
 
+int reload_config = 0;
 ovsdb_table_t table_Wifi_Inet_Config;
 struct blob_buf b = { };
 struct blob_buf del = { };
@@ -57,6 +59,7 @@ static void wifi_inet_conf_load(struct uci_section *s)
 {
 	struct blob_attr *tb[__NET_ATTR_MAX] = { };
 	struct schema_Wifi_Inet_Config conf;
+	struct iface_info info;
 	char *ifname = NULL;
 
 	if (!strcmp(s->e.name, "loopback"))
@@ -114,6 +117,11 @@ static void wifi_inet_conf_load(struct uci_section *s)
 		SCHEMA_SET_STR(conf.parent_ifname, &ifname[1]);
 	else
 		dhcp_get_config(&conf);
+	if (ifname && !l3_device_split(ifname, &info)) {
+		SCHEMA_SET_STR(conf.parent_ifname, info.name);
+		if (info.vid)
+			SCHEMA_SET_INT(conf.vlan_id, info.vid);
+	}
 	firewall_get_config(&conf);
 
 	if (!ovsdb_table_upsert(&table_Wifi_Inet_Config, &conf, false))
@@ -139,11 +147,18 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 	else
 		blobmsg_add_bool(&del, "disabled", 1);
 
-	if (strcmp(iconf->if_type, "eth")) {
+	if (!iconf->parent_ifname_exists && strcmp(iconf->if_type, "eth")) {
 		blobmsg_add_string(&b, "type", iconf->if_type);
 		blobmsg_add_bool(&b, "vlan_filtering", 1);
 	} else
 		blobmsg_add_bool(&del, "type", 1);
+
+	if (iconf->parent_ifname_exists && iconf->vlan_id > 2 && !strcmp(iconf->if_type, "eth")) {
+		char uci_ifname[256];
+
+		snprintf(uci_ifname, sizeof(uci_ifname), "br-%s.%d", iconf->parent_ifname, iconf->vlan_id);
+		blobmsg_add_string(&b, "ifname", uci_ifname);
+	}
 
 	if (iconf->ip_assign_scheme_exists) {
 		if (is_ipv6 && !strcmp(iconf->ip_assign_scheme, "dhcp"))
@@ -178,6 +193,7 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 	}
 
 	uci_commit_all(uci);
+	reload_config = 1;
 
 	return 0;
 }
@@ -186,7 +202,7 @@ static void wifi_inet_conf_del(struct schema_Wifi_Inet_Config *iconf)
 {
 	if (!strcmp(iconf->if_name, "wan") || !strcmp(iconf->if_name, "lan")) {
 		blob_buf_init(&b, 0);
-		blobmsg_add_bool(&b, "disabled", 1);
+		blobmsg_add_string(&b, "proto", "none");
 		blob_to_uci_section(uci, "network", iconf->if_name, "interface", b.head, &network_param, NULL);
 		return;
 	}
@@ -196,6 +212,7 @@ static void wifi_inet_conf_del(struct schema_Wifi_Inet_Config *iconf)
 
 	uci_section_del(uci, "network", "network", iconf->if_name, "interface");
 	uci_commit_all(uci);
+	reload_config = 1;
 }
 
 static void callback_Wifi_Inet_Config(ovsdb_update_monitor_t *mon,
@@ -217,6 +234,17 @@ static void callback_Wifi_Inet_Config(ovsdb_update_monitor_t *mon,
 	return;
 }
 
+static void periodic_task(void *arg)
+{
+	if (reload_config) {
+		uci_commit_all(uci);
+		system("reload_config");
+		reload_config = 0;
+	}
+
+	evsched_task_reschedule_ms(EVSCHED_SEC(5));
+}
+
 void wifi_inet_config_init(void)
 {
 	struct uci_element *e = NULL;
@@ -236,6 +264,7 @@ void wifi_inet_config_init(void)
 	}
 
 	OVSDB_TABLE_MONITOR(Wifi_Inet_Config, false);
+	evsched_task(&periodic_task, NULL, EVSCHED_SEC(5));
 
 	return;
 }

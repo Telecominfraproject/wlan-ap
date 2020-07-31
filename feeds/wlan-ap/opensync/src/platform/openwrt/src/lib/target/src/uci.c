@@ -200,11 +200,13 @@ int uci_section_del(struct uci_context *uci, char *prefix, char *package, char *
 int uci_section_to_blob(struct uci_context *uci, char *package, char *section,
 			struct blob_buf *buf, const struct uci_blob_param_list *param)
 {
-        struct uci_package *p;
+        struct uci_package *p = NULL;
         struct uci_section *s = NULL;
 	int ret = -1;
 
 	if (uci_load(uci, package, &p))
+		p = uci_lookup_package(uci, package);
+	if (!p)
 		return -1;
 	s = uci_lookup_section(uci, p, section);
 	if (!s)

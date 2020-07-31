@@ -31,12 +31,10 @@ static void cmd_ubus_l3_dev(struct ubus_request *req,
 	struct blob_attr *tb[__NET_ATTR_MAX] = { };
 	char *ifname = (char *)req->priv;
 
-	syslog(0, "blogic %s:%s[%d]\n", __FILE__, __func__, __LINE__);
 	blobmsg_parse(network_policy, __NET_ATTR_MAX, tb, blob_data(msg), blob_len(msg));
 	memset(ifname, 0, IF_NAMESIZE);
 	if (tb[NET_ATTR_L3_DEVICE])
 		strncpy(ifname, blobmsg_get_string(tb[NET_ATTR_L3_DEVICE]), IF_NAMESIZE);
-	syslog(0, "blogic %s:%s[%d]%s\n", __FILE__, __func__, __LINE__, ifname);
 }
 
 int ubus_get_l3_device(const char *net, char *ifname)
@@ -44,11 +42,9 @@ int ubus_get_l3_device(const char *net, char *ifname)
 	uint32_t netifd;
 	char path[64];
 
-	syslog(0, "blogic %s:%s[%d]\n", __FILE__, __func__, __LINE__);
 	snprintf(path, sizeof(path), "network.interface.%s", net);
 	if (ubus_lookup_id(ubus, path, &netifd))
 		return -1;
-	syslog(0, "blogic %s:%s[%d]\n", __FILE__, __func__, __LINE__);
 	return ubus_invoke(ubus, netifd, "status", NULL, cmd_ubus_l3_dev, ifname, 1000);
 }
 
