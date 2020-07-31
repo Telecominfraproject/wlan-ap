@@ -297,6 +297,24 @@ bool target_stats_device_fanrpm_get(uint32_t *fan_rpm)
 }
 
 /******************************************************************************
+ *  NETWORK PROBE definitions
+ *****************************************************************************/
+bool target_stats_network_probe_get(dpp_network_probe_record_t *network_probe_report)
+{
+	
+	network_probe_report->dns_probe.state = 1;
+	network_probe_report->dns_probe.latency = 101;
+
+
+	network_probe_report->dns_probe.serverIP[0] = 8;
+	network_probe_report->dns_probe.serverIP[1] = 8;
+	network_probe_report->dns_probe.serverIP[2] = 8;
+	network_probe_report->dns_probe.serverIP[3] = 8;
+
+	return true;
+}
+
+/******************************************************************************
  *  CAPACITY definitions
  *****************************************************************************/
 
