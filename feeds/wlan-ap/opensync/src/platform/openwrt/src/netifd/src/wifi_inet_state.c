@@ -65,6 +65,24 @@ static const struct blobmsg_policy route_policy[__ROUTE_ATTR_MAX] = {
 static ovsdb_table_t table_Wifi_Inet_State;
 static ovsdb_table_t table_Wifi_Master_State;
 
+int l3_device_split(char *l3_device, struct iface_info *info)
+{
+	char *dot;
+
+	if (strncmp(l3_device, "br-", 3))
+		return -1;
+	memset (info, 0, sizeof(*info));
+	dot = strstr(l3_device, ".");
+	if (!dot) {
+		strcpy(info->name, &l3_device[3]);
+	} else {
+		strncpy(info->name, &l3_device[3], dot - l3_device - 3);
+		info->vid = atoi(&dot[1]);
+	}
+
+	return 0;
+}
+
 void wifi_inet_state_set(struct blob_attr *msg)
 {
 	struct blob_attr *tb[__NET_ATTR_MAX] = { };
@@ -96,6 +114,7 @@ void wifi_inet_state_set(struct blob_attr *msg)
 	if (tb[NET_ATTR_L3_DEVICE]) {
 		char *l3_device = blobmsg_get_string(tb[NET_ATTR_L3_DEVICE]);
 		char mac[ETH_ALEN * 3];
+		struct iface_info info;
 
 		mtu = net_get_mtu(l3_device);
 		if (mtu > 0)
@@ -106,6 +125,11 @@ void wifi_inet_state_set(struct blob_attr *msg)
 			SCHEMA_SET_STR(state.if_type, "bridge");
 		else
 			SCHEMA_SET_STR(state.if_type, "eth");
+		if (!l3_device_split(l3_device, &info) && strcmp(info.name, state.if_name)) {
+			SCHEMA_SET_STR(state.parent_ifname, info.name);
+			if (info.vid)
+				SCHEMA_SET_INT(state.vlan_id, info.vid);
+		}
 	} else
 		SCHEMA_SET_STR(state.if_type, "eth");
 

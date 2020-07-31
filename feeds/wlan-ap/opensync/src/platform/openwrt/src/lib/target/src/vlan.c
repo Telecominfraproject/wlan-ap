@@ -178,6 +178,7 @@ void vlan_add(char *vifname, int vid, int bridge)
 	struct vlan *vlan = vlan_find(vid);
 	struct vlan_vif *vif;
 
+
 	if (!vlan) {
 		vlan = malloc(sizeof(*vlan));
 		if (!vlan) {
