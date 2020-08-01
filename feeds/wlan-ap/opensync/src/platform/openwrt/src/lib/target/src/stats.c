@@ -32,6 +32,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "nl80211.h"
 #include "phy.h"
 #include "utils.h"
+#include <sys/types.h>
+#include <curl/curl.h>
+#include <time.h>
 
 #define NUM_MAX_CLIENTS 10
 
@@ -295,6 +298,41 @@ bool target_stats_device_fanrpm_get(uint32_t *fan_rpm)
 	*fan_rpm = 0;
 	return true;
 }
+
+/******************************************************************************
+ *  NETWORK PROBE definitions
+ *****************************************************************************/
+bool target_stats_network_probe_get(dpp_network_probe_record_t *network_probe_report)
+{
+	int ret = 0;
+	char server[] = "8.8.8.8";
+
+	CURL *curl = curl_easy_init();
+	time_t begin = time(NULL), end;
+
+	if (curl) {
+		curl_easy_setopt(curl, CURLOPT_URL, "http://www.google.com");
+		curl_easy_setopt(curl, CURLOPT_DNS_SERVERS, "8.8.8.8");
+		ret = curl_easy_perform(curl);
+		curl_easy_cleanup(curl);
+	}
+
+	end = time(NULL);
+
+	network_probe_report->dns_probe.latency = (end - begin);
+	memcpy(network_probe_report->dns_probe.serverIP , server, strlen(server));
+
+        if(ret == CURLE_OK) {
+		LOGT("dns resolved\n");
+		network_probe_report->dns_probe.state = 1;
+	} else {
+		LOGT("dns not resolved\n");
+		network_probe_report->dns_probe.state = 0;
+	}
+
+	return true;
+}
+
 
 /******************************************************************************
  *  CAPACITY definitions
