@@ -12,22 +12,10 @@ PKG_BUILD_DEPENDS:=python3-kconfiglib/host python3-jinja2/host python3-markupsaf
 
 include $(INCLUDE_DIR)/package.mk
 
-define Package/opensync/default
+define Package/opensync
 	CATEGORY:=Network
 	TITLE:=cloud network management system
 	DEPENDS:=+libev +jansson +protobuf +libprotobuf-c +libmosquitto +libopenssl +openvswitch +libpcap +libuci +libcurl +libnl-tiny +libubus +libblobmsg-json +tcpdump +curl +lldpd +wlan-ap-keys
-endef
-
-define Package/opensync-ecw5410
-  $(call Package/opensync/default)
-  TITLE += (ECW5410)
-  VARIANT:=ECW5410
-  DEPENDS+=@TARGET_ipq806x
-endef
-
-define Package/opensync
-  $(call Package/opensync/default)
-  VARIANT:=tip
 endef
 
 define Package/opensync/description
@@ -38,8 +26,6 @@ endef
 define Package/opensync/conffiles
 /usr/opensync/certs/
 endef
-
-Package/opensync-ecw5410/description=$(call Package/opensync/description)
 
 define Build/Prepare
 	$(PKG_UNPACK)
@@ -56,10 +42,10 @@ TARGET_CFLAGS += \
 define Build/Compile
 	$(MAKE) -C $(PKG_BUILD_DIR) \
 		OWRT_CFLAGS="$(TARGET_CFLAGS)" \
-		TARGET=$(BUILD_VARIANT) TOOLCHAIN_DIR="$(TOOLCHAIN_DIR)" \
+		TARGET=tip TOOLCHAIN_DIR="$(TOOLCHAIN_DIR)" \
 		TOOLCHAIN_PREFIX="$(TARGET_CROSS)" STAGING_DIR="$(STAGING_DIR)"
 	$(MAKE) -C $(PKG_BUILD_DIR) rootfs \
-		TARGET=$(BUILD_VARIANT) TOOLCHAIN_DIR="$(TOOLCHAIN_DIR)" \
+		TARGET=tip TOOLCHAIN_DIR="$(TOOLCHAIN_DIR)" \
 		TOOLCHAIN_PREFIX="$(TARGET_CROSS)"
 endef
 
@@ -67,16 +53,13 @@ define Package/opensync/install
 	$(CP) ./files/* $(1)
 	$(INSTALL_DIR) $(1)/usr/opensync/{bin,etc,certs}
 	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs/usr/opensync/bin/* $(1)/usr/opensync/bin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs/usr/opensync/etc/* $(1)/usr/opensync/etc
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/$(BUILD_VARIANT)/rootfs/usr/opensync/tools/ovsh $(1)/usr/opensync/bin
-	$(MAKE) -C $(PKG_BUILD_DIR)/ TARGET=$(BUILD_VARIANT) rootfs-copy-only INSTALL_ROOTFS_DIR=$(1)
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/tip/rootfs/usr/opensync/bin/* $(1)/usr/opensync/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/tip/rootfs/usr/opensync/etc/* $(1)/usr/opensync/etc
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/work/tip/rootfs/usr/opensync/tools/ovsh $(1)/usr/opensync/bin
+	$(MAKE) -C $(PKG_BUILD_DIR)/ TARGET=tip rootfs-copy-only INSTALL_ROOTFS_DIR=$(1)
 ifdef CONFIG_PACKAGE_wlan-ap-keys
 	rm -f $(1)/usr/opensync/certs/*
 endif
 endef
 
-Package/opensync-ecw5410/install=$(call Package/opensync/install,$(1))
-
-$(eval $(call BuildPackage,opensync-ecw5410))
 $(eval $(call BuildPackage,opensync))
