@@ -276,60 +276,45 @@ static void vif_state_custom_options_get(struct schema_Wifi_VIF_State *vstate,
 		opt = custom_options_table[i];
 
 		if (strcmp(opt, "rate_limit_en") == 0) {
-			if (tb[WIF_ATTR_RATELIMIT] &&
-				blobmsg_get_bool(tb[WIF_ATTR_RATELIMIT]))
-				set_custom_option_state(vstate, &index,
-							custom_options_table[i],
-							"1");
-			/*else
-				set_custom_option_state(vstate, &index,
-							custom_options_table[i],
-							"0");
-			*/
+			if (tb[WIF_ATTR_RATELIMIT]) {
+				if (blobmsg_get_bool(tb[WIF_ATTR_RATELIMIT])) {
+					set_custom_option_state(vstate, &index,
+								custom_options_table[i],
+								"1");
+				} else {
+					set_custom_option_state(vstate, &index,
+								custom_options_table[i],
+								"0");
+				}
+			}
 		} else if (strcmp(opt, "ssid_ul_limit") == 0) {
 			if (tb[WIF_ATTR_URATE]) {
 				buf = blobmsg_get_string(tb[WIF_ATTR_URATE]);
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							buf);
-			} /*else {
-				set_custom_option_state(vstate, &index,
-							custom_options_table[i],
-							"0");
-			}*/
+			}
 		} else if (strcmp(opt, "ssid_dl_limit") == 0) {
 			if (tb[WIF_ATTR_DRATE]) {
 				buf = blobmsg_get_string(tb[WIF_ATTR_DRATE]);
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							buf);
-			} /*else {
-				set_custom_option_state(vstate, &index,
-							custom_options_table[i],
-							"0");
-			}*/
+			} 
 		} else if (strcmp(opt, "client_dl_limit") == 0) {
 			if (tb[WIF_ATTR_CDRATE]) {
 				buf = blobmsg_get_string(tb[WIF_ATTR_CDRATE]);
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							buf);
-			} /*else {
-				set_custom_option_state(vstate, &index,
-							custom_options_table[i],
-							"0");
-			}*/
+			}
 		} else if (strcmp(opt, "client_ul_limit") == 0) {
 			if (tb[WIF_ATTR_CURATE]) {
 				buf = blobmsg_get_string(tb[WIF_ATTR_CURATE]);
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							buf);
-			} /*else {
-				set_custom_option_state(vstate, &index,
-							custom_options_table[i],
-							"0");
-			}*/
+			}
 		}
 	}
 }
@@ -391,9 +376,9 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 		SCHEMA_SET_INT(vstate.btm, 0);
 
 	if (tb[WIF_ATTR_ISOLATE] && blobmsg_get_bool(tb[WIF_ATTR_ISOLATE]))
-		SCHEMA_SET_INT(vstate.ap_bridge, 1);
-	else
 		SCHEMA_SET_INT(vstate.ap_bridge, 0);
+	else
+		SCHEMA_SET_INT(vstate.ap_bridge, 1);
 
 //	if (tb[WIF_ATTR_UAPSD] && blobmsg_get_bool(tb[WIF_ATTR_UAPSD]))
 		SCHEMA_SET_INT(vstate.uapsd_enable, true);
@@ -505,38 +490,47 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 	if (changed->ssid)
 		blobmsg_add_string(&b, "ssid", vconf->ssid);
 
-	if (changed->ssid_broadcast && !strcmp(vconf->ssid_broadcast, "disabled"))
-		blobmsg_add_bool(&b, "hidden", 1);
-	else
-		blobmsg_add_bool(&b, "hidden", 0);
+	if (changed->ssid_broadcast) {
+		if (!strcmp(vconf->ssid_broadcast, "disabled"))
+			blobmsg_add_bool(&b, "hidden", 1);
+		else
+			blobmsg_add_bool(&b, "hidden", 0);
+	}
 
-	if (changed->ap_bridge && vconf->ap_bridge)
-		blobmsg_add_bool(&b, "isolate", 1);
-	else
-		blobmsg_add_bool(&b, "isolate", 0);
+	if (changed->ap_bridge) {
+		if (vconf->ap_bridge)
+			blobmsg_add_bool(&b, "isolate", 0);
+		else
+			blobmsg_add_bool(&b, "isolate", 1);
+	}
 
-	if (changed->uapsd_enable && vconf->uapsd_enable)
-		blobmsg_add_bool(&b, "uapsd", 1);
-	else
-		blobmsg_add_bool(&b, "uapsd", 0);
+	if (changed->uapsd_enable) {
+		if (vconf->uapsd_enable)
+			blobmsg_add_bool(&b, "uapsd", 1);
+		else
+			blobmsg_add_bool(&b, "uapsd", 0);
+	}
 
-	if ((changed->ft_psk && vconf->ft_psk) ||
-	    (changed->ft_mobility_domain && vconf->ft_mobility_domain)) {
-		blobmsg_add_bool(&b, "ieee80211r", 1);
-		blobmsg_add_hex16(&b, "mobility_domain", vconf->ft_mobility_domain);
-		blobmsg_add_bool(&b, "ft_psk_generate_local", vconf->ft_psk);
-		blobmsg_add_bool(&b, "ft_over_ds", 0);
-		blobmsg_add_bool(&b, "reassociation_deadline", 1);
-	} else {
-		blobmsg_add_bool(&b, "ieee80211r", 0);
+	if (changed->ft_psk || changed->ft_mobility_domain) {
+        	if (vconf->ft_psk && vconf->ft_mobility_domain) {
+			blobmsg_add_bool(&b, "ieee80211r", 1);
+			blobmsg_add_hex16(&b, "mobility_domain", vconf->ft_mobility_domain);
+			blobmsg_add_bool(&b, "ft_psk_generate_local", vconf->ft_psk);
+			blobmsg_add_bool(&b, "ft_over_ds", 0);
+			blobmsg_add_bool(&b, "reassociation_deadline", 1);
+		} else {
+			blobmsg_add_bool(&b, "ieee80211r", 0);
+		}
 	}
 
 	if (changed->btm) {
-		blobmsg_add_bool(&b, "ieee80211v", 1);
-		blobmsg_add_bool(&b, "bss_transition", 1);
-	} else {
-		blobmsg_add_bool(&b, "ieee80211v", 0);
-		blobmsg_add_bool(&b, "bss_transition", 0);
+		if (vconf->btm) {
+			blobmsg_add_bool(&b, "ieee80211v", 1);
+			blobmsg_add_bool(&b, "bss_transition", 1);
+		} else {
+			blobmsg_add_bool(&b, "ieee80211v", 0);
+			blobmsg_add_bool(&b, "bss_transition", 0);
+		}
 	}
 
 	if (changed->bridge)
