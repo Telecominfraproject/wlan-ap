@@ -14,7 +14,7 @@ python3 setup.py --setup
 Next we need to select the profile and base package selection. This setup will install the feeds, packages and generate the .config file. The available profiles are ap2220, ea8300, ecw5211, ecw5410.
 ```
 cd openwrt
-./scripts/gen_config.py ap2220 wlan-ap
+./scripts/gen_config.py ap2220 wlan-ap wifi
 ```
 Finally we can build the tree.
 ```
