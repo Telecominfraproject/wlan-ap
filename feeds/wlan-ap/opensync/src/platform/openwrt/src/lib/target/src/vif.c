@@ -11,6 +11,7 @@
 #include <uci.h>
 #include <uci_blob.h>
 
+#include "captive.h"
 #include "log.h"
 #include "const.h"
 #include "target.h"
@@ -26,6 +27,7 @@
 #define UCI_BUFFER_SIZE 80
 
 extern struct blob_buf b;
+//extern struct blob_buf c;
 
 enum {
 	WIF_ATTR_DEVICE,
@@ -326,7 +328,6 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	char mac[ETH_ALEN * 3];
 	char *ifname, radio[IF_NAMESIZE];
 	char band[8];
-
 	memset(&vstate, 0, sizeof(vstate));
 	schema_Wifi_VIF_State_mark_all_present(&vstate);
 
@@ -443,6 +444,8 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 
 	vif_state_security_get(&vstate, tb);
 	vif_state_custom_options_get(&vstate, tb);
+	LOGN("Hi Captive_Portal VIF");
+	vif_state_captive_portal_options_get(&vstate,s);
 
 	if (vconf) {
 		LOGN("%s: updating vif config", radio);
@@ -572,6 +575,9 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 		vlan_add((char *)vconf->if_name, vid, !strcmp(vconf->bridge, "wan"));
 	else
 		vlan_del((char *)vconf->if_name);
+
+	if (changed->captive_portal || changed->captive_maclist)
+			vif_captive_portal_set(vconf,(char*)vconf->if_name);
 
 	reload_config = 1;
 
