@@ -477,3 +477,21 @@ int ieee80211_channel_to_frequency(int chan)
 		return 5000 + chan * 5;
 	return 0;
 }
+
+int get_redirector_addr(char *addr)
+{
+	char filepath[PATH_MAX] = {0};
+	char buf[REDIRECTOR_ADDR_SIZE];
+	int fd, ret;
+
+	snprintf(filepath, sizeof(filepath), "/usr/opensync/etc/redirector");
+	fd = open(filepath, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	memset(buf, 0, sizeof(buf));
+	ret = read(fd, buf, sizeof(buf) - 1);
+	buf[ret - 1] = '\0';
+	memcpy(addr, buf, sizeof(buf));
+	close(fd);
+	return 0;
+}

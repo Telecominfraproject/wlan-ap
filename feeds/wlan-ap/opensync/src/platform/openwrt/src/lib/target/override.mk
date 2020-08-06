@@ -41,6 +41,7 @@ UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/utils.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/iface.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/vlan.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/sysupgrade.c
+UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/awlan_node.c
 
 CONFIG_USE_KCONFIG=y
 CONFIG_INET_ETH_LINUX=y

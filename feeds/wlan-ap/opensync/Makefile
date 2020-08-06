@@ -25,6 +25,7 @@ endef
 
 define Package/opensync/conffiles
 /usr/opensync/certs/
+/usr/opensync/etc/redirector
 endef
 
 define Build/Prepare
