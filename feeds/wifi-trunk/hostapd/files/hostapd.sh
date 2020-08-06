@@ -318,7 +318,7 @@ hostapd_set_bss_options() {
 		iapp_interface eapol_version dynamic_vlan ieee80211w nasid \
 		acct_server acct_secret acct_port acct_interval \
 		bss_load_update_period chan_util_avg_period sae_require_mfp \
-		multi_ap multi_ap_backhaul_ssid multi_ap_backhaul_key beacon_rate \
+		multi_ap multi_ap_backhaul_ssid multi_ap_backhaul_key \
 		rssi_reject_assoc_rssi
 
 	set_default isolate 0
@@ -337,7 +337,6 @@ hostapd_set_bss_options() {
 	set_default chan_util_avg_period 600
 	set_default utf8_ssid 1
 	set_default multi_ap 0
-	set_default beacon_rate 60
 	set_default rssi_reject_assoc_rssi 0
 
 	append bss_conf "ctrl_interface=/var/run/hostapd"
@@ -360,7 +359,6 @@ hostapd_set_bss_options() {
 	append bss_conf "uapsd_advertisement_enabled=$uapsd" "$N"
 	append bss_conf "utf8_ssid=$utf8_ssid" "$N"
 	append bss_conf "multi_ap=$multi_ap" "$N"
-	append bss_conf "beacon_rate=$beacon_rate" "$N"
 	append bss_conf "rssi_reject_assoc_rssi=$rssi_reject_assoc_rssi" "$N"
 
 	[ "$tdls_prohibit" -gt 0 ] && append bss_conf "tdls_prohibit=$tdls_prohibit" "$N"
