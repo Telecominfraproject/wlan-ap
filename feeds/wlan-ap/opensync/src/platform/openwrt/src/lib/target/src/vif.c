@@ -444,7 +444,6 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 
 	vif_state_security_get(&vstate, tb);
 	vif_state_custom_options_get(&vstate, tb);
-	LOGN("Hi Captive_Portal VIF");
 	vif_state_captive_portal_options_get(&vstate,s);
 
 	if (vconf) {

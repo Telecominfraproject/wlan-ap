@@ -61,4 +61,5 @@ UNIT_DEPS += src/lib/evsched
 UNIT_LDFLAGS += -luci
 UNIT_LDFLAGS += -libiwinfo
 UNIT_LDFLAGS += -libnl-tiny
+UNIT_LDFLAGS += -lcurl
 UNIT_DEPS_CFLAGS += src/lib/inet
