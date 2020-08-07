@@ -6,7 +6,6 @@
 #include <libubox/blobmsg.h>
 
 #define min(a,b) (((a) < (b)) ? (a) : (b))
-#define REDIRECTOR_ADDR_SIZE 128
 
 struct mode_map {
 	int fiveg;
@@ -21,7 +20,6 @@ extern struct mode_map *mode_map_get_cloud(const char *htmode, const char *hwmod
 
 extern int vif_get_mac(char *vap, char *mac);
 extern int vif_is_ready(const char *name);
-extern int get_redirector_addr(char *addr);
 
 #define blobmsg_add_bool blobmsg_add_u8
 extern int blobmsg_add_hex16(struct blob_buf *buf, const char *name, uint16_t val);

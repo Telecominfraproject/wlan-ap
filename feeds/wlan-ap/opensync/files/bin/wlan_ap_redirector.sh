@@ -1,7 +1,11 @@
 #!/bin/sh
 
-redirector_addr=$1
-[ -z "$redirector_addr" ] && redirector_addr=ssl:opensync.zone1.art2wave.com:6643
+if [ $# -ne 1 ] ; then
+	echo "Usage: $0 <redirector address>" >&2
+	exit 1
+fi
 
-echo $redirector_addr > /usr/opensync/etc/redirector
+redirector_addr=$1
+
+uci set system.tip.redirector="${redirector_addr}"
 /etc/init.d/opensync restart
