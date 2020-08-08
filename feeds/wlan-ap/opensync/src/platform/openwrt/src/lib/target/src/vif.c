@@ -59,6 +59,7 @@ enum {
 	WIF_ATTR_CDRATE,
 	WIF_ATTR_IEEE80211V,
 	WIF_ATTR_BSS_TRANSITION,
+	WIF_ATTR_DISABLE_EAP_RETRY,
 	__WIF_ATTR_MAX,
 };
 
@@ -94,6 +95,7 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_CDRATE] = { .name = "cdrate", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_IEEE80211V] = { .name = "ieee80211v", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_BSS_TRANSITION] = { .name = "bss_transition", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_DISABLE_EAP_RETRY] = { .name = "wpa_disable_eapol_key_retries", BLOBMSG_TYPE_BOOL },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -559,6 +561,8 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 			blobmsg_add_string(&b, NULL, (char*)vconf->mac_list[i]);
 		blobmsg_close_array(&b, a);
 	}
+
+	blobmsg_add_bool(&b, "wpa_disable_eapol_key_retries", 1);
 
 	vif_config_security_set(&b, vconf);
 	if (changed->custom_options)
