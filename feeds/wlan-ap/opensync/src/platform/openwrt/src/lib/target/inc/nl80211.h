@@ -33,6 +33,7 @@ struct wifi_phy {
 struct wifi_iface {
 	struct avl_node avl;
 	uint8_t addr[6];
+	int ifidx;
 	int noise;
 	char name[IF_NAMESIZE];
 	struct wifi_phy *parent;
@@ -45,6 +46,12 @@ struct wifi_station {
 	uint8_t addr[6];
 	struct wifi_iface *parent;
 	struct list_head iface;
+
+	int8_t rssi;
+	uint32_t rx_packets;
+	uint32_t tx_packets;
+	uint32_t rx_bytes;
+	uint32_t tx_bytes;
 };
 
 extern int radio_nl80211_init(void);

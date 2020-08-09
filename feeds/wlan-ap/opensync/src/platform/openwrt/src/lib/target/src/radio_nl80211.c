@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <evsched.h>
 
 #include <net/if.h>
 
@@ -124,6 +125,44 @@ static void vif_del_sta_rate_rule(uint8_t *addr, char *ifname)
     free(rule);
 }
 
+static void vif_update_stats(struct wifi_station *sta, struct nlattr **tb)
+{
+	static struct nla_policy stats_policy[NL80211_STA_INFO_MAX + 1] = {
+		[NL80211_STA_INFO_INACTIVE_TIME] = { .type = NLA_U32    },
+		[NL80211_STA_INFO_RX_PACKETS]    = { .type = NLA_U32    },
+		[NL80211_STA_INFO_TX_PACKETS]    = { .type = NLA_U32    },
+		[NL80211_STA_INFO_RX_BITRATE]    = { .type = NLA_NESTED },
+		[NL80211_STA_INFO_TX_BITRATE]    = { .type = NLA_NESTED },
+		[NL80211_STA_INFO_SIGNAL]        = { .type = NLA_U8     },
+		[NL80211_STA_INFO_SIGNAL_AVG]    = { .type = NLA_U8     },
+		[NL80211_STA_INFO_RX_BYTES]      = { .type = NLA_U32    },
+		[NL80211_STA_INFO_TX_BYTES]      = { .type = NLA_U32    },
+		[NL80211_STA_INFO_TX_RETRIES]    = { .type = NLA_U32    },
+		[NL80211_STA_INFO_TX_FAILED]     = { .type = NLA_U32    },
+		[NL80211_STA_INFO_T_OFFSET]      = { .type = NLA_U64    },
+		[NL80211_STA_INFO_STA_FLAGS] =
+			{ .minlen = sizeof(struct nl80211_sta_flag_update) },
+	};
+
+	struct nlattr *sinfo[NL80211_STA_INFO_MAX + 1] = { };
+
+	if (!tb[NL80211_ATTR_STA_INFO])
+		return;
+	if (nla_parse_nested(sinfo, NL80211_STA_INFO_MAX,
+			     tb[NL80211_ATTR_STA_INFO], stats_policy))
+		return;
+	if (sinfo[NL80211_STA_INFO_SIGNAL_AVG])
+		sta->rssi = (int32_t) nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL_AVG]);
+	if (sinfo[NL80211_STA_INFO_RX_PACKETS])
+		sta->rx_packets = nla_get_u32(sinfo[NL80211_STA_INFO_RX_PACKETS]);
+	if (sinfo[NL80211_STA_INFO_TX_PACKETS])
+		sta->tx_packets = nla_get_u32(sinfo[NL80211_STA_INFO_TX_PACKETS]);
+	if (sinfo[NL80211_STA_INFO_RX_BYTES])
+		sta->rx_bytes = nla_get_u32(sinfo[NL80211_STA_INFO_RX_BYTES]);
+	if (sinfo[NL80211_STA_INFO_TX_BYTES])
+		sta->tx_bytes = nla_get_u32(sinfo[NL80211_STA_INFO_TX_BYTES]);
+}
+
 static void nl80211_add_station(struct nlattr **tb, char *ifname)
 {
 	struct wifi_station *sta;
@@ -135,8 +174,10 @@ static void nl80211_add_station(struct nlattr **tb, char *ifname)
 
 	addr = nla_data(tb[NL80211_ATTR_MAC]);
 	sta = avl_find_element(&sta_tree, addr, sta, avl);
-	if (sta)
+	if (sta) {
+		vif_update_stats(sta, tb);
 		return;
+	}
 
 	wif = avl_find_element(&wif_tree, ifname, wif, avl);
 	if (!wif)
@@ -154,6 +195,7 @@ static void nl80211_add_station(struct nlattr **tb, char *ifname)
 
 	vif_add_station(sta, ifname, 1);
 	vif_add_sta_rate_rule(addr, ifname);
+	vif_update_stats(sta, tb);
 }
 
 static void _nl80211_del_station(struct wifi_station *sta)
@@ -182,7 +224,7 @@ static void nl80211_del_station(struct nlattr **tb, char *ifname)
 	_nl80211_del_station(sta);
 }
 
-static void nl80211_add_iface(struct nlattr **tb, char *ifname, char *phyname)
+static void nl80211_add_iface(struct nlattr **tb, char *ifname, char *phyname, int ifidx)
 {
 	struct wifi_iface *wif;
 	uint8_t *addr;
@@ -206,6 +248,7 @@ static void nl80211_add_iface(struct nlattr **tb, char *ifname, char *phyname)
 	INIT_LIST_HEAD(&wif->stas);
 	avl_insert(&wif_tree, &wif->avl);
 	memcpy(wif->addr, addr, 6);
+	wif->ifidx = ifidx;
 	wif->parent = avl_find_element(&phy_tree, phyname, wif->parent, avl);
 	if (wif->parent)
 		list_add(&wif->phy, &wif->parent->wifs);
@@ -378,7 +421,7 @@ static int nl80211_recv(struct nl_msg *msg, void *arg)
 		nl80211_del_station(tb, ifname);
 		break;
 	case NL80211_CMD_NEW_INTERFACE:
-		nl80211_add_iface(tb, ifname, phyname);
+		nl80211_add_iface(tb, ifname, phyname, ifidx);
 		break;
 	case NL80211_CMD_DEL_INTERFACE:
 		nl80211_del_iface(tb, ifname);
@@ -391,7 +434,7 @@ static int nl80211_recv(struct nl_msg *msg, void *arg)
 		nl80211_add_phy(tb, phyname);
 		break;
 	default:
-		//syslog(0, "%s:%s[%d]%d\n", __FILE__, __func__, __LINE__, gnlh->cmd);
+		syslog(0, "%s:%s[%d]%d\n", __FILE__, __func__, __LINE__, gnlh->cmd);
 		break;
 	}
 
@@ -426,6 +469,20 @@ static void nl80211_ev(struct ev_loop *ev, struct ev_io *io, int event)
 	nl_cb_put(cb);
 }
 
+static void vif_poll_stations(void *arg)
+{
+	 struct wifi_iface *wif = NULL;
+
+	avl_for_each_element(&wif_tree, wif, avl) {
+		struct nl_msg *msg;
+
+		msg = unl_genl_msg(&unl, NL80211_CMD_GET_STATION, true);
+		nla_put_u32(msg, NL80211_ATTR_IFINDEX, wif->ifidx);
+		unl_genl_request(&unl, msg, nl80211_recv, NULL);
+	}
+	evsched_task_reschedule_ms(EVSCHED_SEC(10));
+}
+
 int radio_nl80211_init(void)
 {
 	struct nl_msg *msg;
@@ -439,8 +496,6 @@ int radio_nl80211_init(void)
 	unl_genl_request(&unl, msg, nl80211_recv, NULL);
 	msg = unl_genl_msg(&unl, NL80211_CMD_GET_INTERFACE, true);
 	unl_genl_request(&unl, msg, nl80211_recv, NULL);
-	msg = unl_genl_msg(&unl, NL80211_CMD_GET_STATION, true);
-	unl_genl_request(&unl, msg, nl80211_recv, NULL);
 
 	unl_genl_subscribe(&unl, "config");
 	unl_genl_subscribe(&unl, "mlme");
@@ -448,6 +503,7 @@ int radio_nl80211_init(void)
 
 	ev_io_init(&unl_io, nl80211_ev, unl.sock->s_fd, EV_READ);
         ev_io_start(wifihal_evloop, &unl_io);
+	evsched_task(&vif_poll_stations, NULL, EVSCHED_SEC(5));
 
 	return 0;
 }
