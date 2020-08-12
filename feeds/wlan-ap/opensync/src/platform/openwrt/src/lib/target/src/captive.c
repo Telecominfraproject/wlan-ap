@@ -7,8 +7,6 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <curl/curl.h>
-#include <curl/easy.h>
-
 #include <uci.h>
 #include <uci_blob.h>
 
@@ -101,6 +99,7 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 	int index = 0;
 	const char *opt;
 	char *buf = NULL;
+	char timeout[32];
 	struct blob_attr *tc[__NDS_ATTR_MAX] = { };
 	struct uci_element *e = NULL;
 	//int length;
@@ -126,43 +125,29 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 			LOGN("Hi About to parse");
 			blobmsg_parse(opennds_policy, __NDS_ATTR_MAX, tc, blob_data(cap.head), blob_len(cap.head));
 			LOGN("Hi OptionsGet");
-			if (tc[NDS_ATTR_CAPTIVE_MACLIST]) {
-				LOGN("Hi NDSCONDTN");
-				struct blob_attr *cur = NULL;
-				int rem = 0;
-				vstate->captive_maclist_len = 0;
-				blobmsg_for_each_attr(cur, tc[NDS_ATTR_CAPTIVE_MACLIST], rem) {
-					if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING)
-						continue;
-					strcpy(vstate->captive_maclist[vstate->captive_maclist_len], blobmsg_get_string(cur));
-					LOGN("%s: Hi MAC", (char*)vstate->captive_maclist[vstate->captive_maclist_len]);
-					vstate->captive_maclist_len++;
-				}
-			}
-			LOGN("Hi ForCNDTN");
 			LOGN("Hi ForCNDTN1");
 			for (i = 0; i < SCHEMA_CAPTIVE_PORTAL_OPTS_MAX; i++) {
 				opt = captive_portal_options_table[i];
 				LOGN("Hi c_option: %s",opt);
-				/*if (!strcmp(opt, "session_timeout"))
+				if  (!strcmp(opt, "session_timeout"))
 				{
 					LOGN("Hi Val:%d",blobmsg_get_u32(tc[NDS_ATTR_SESSIONTIMEOUT]));
 					if (tc[NDS_ATTR_SESSIONTIMEOUT])
 					{
 						LOGN("Hi IN");
-						LOGN("Hi BuFF %s",buf);
+						//LOGN("Hi BuFF %s",buf);
 						//length=snprintf(NULL,0,"%d",blobmsg_get_u32(tc[NDS_ATTR_SESSIONTIMEOUT]));
 						//LOGN("Hi LG %d",length);
-						sprintf(buf,"%d",blobmsg_get_u32(tc[NDS_ATTR_SESSIONTIMEOUT]));
-						LOGN("Hi Buff:%s",buf);
+						sprintf(timeout,"%d",blobmsg_get_u32(tc[NDS_ATTR_SESSIONTIMEOUT]));
+						LOGN("Hi Buff:%s",timeout);
 						LOGN("Hi INForCNDTNL %d",blobmsg_get_u32(tc[NDS_ATTR_SESSIONTIMEOUT]));
 						//( blobmsg_get_u32(tc[NDS_ATTR_SESSIONTIMEOUT]),buf,10);
 						set_captive_portal_state(vstate, &index,
 								captive_portal_options_table[i],
-								buf);
+								timeout);
 					}
-				}*/
-				if (strcmp(opt, "authentication") == 0) {
+				}
+				else if (strcmp(opt, "authentication") == 0) {
 					LOGN("Hi Browse");
 					if (tc[NDS_ATTR_LOGIN_OPTION_ENABLED]) {
 						buf = "none";
@@ -173,9 +158,9 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 				}
 				else if (strcmp(opt, "browser_title") == 0) {
 					LOGN("Hi Browse");
-					if (tc[NDS_ATTR_BROWSER_TITLE]) {
+					if (tc[NDS_ATTR_GATEWAYNAME]) {
 						LOGN("Hi BrowIN");
-						buf = blobmsg_get_string(tc[NDS_ATTR_BROWSER_TITLE]);
+						buf = blobmsg_get_string(tc[NDS_ATTR_GATEWAYNAME]);
 						LOGN("Hi BrowIN:%s",buf);
 						set_captive_portal_state(vstate, &index,
 								captive_portal_options_table[i],
@@ -241,15 +226,77 @@ uci_unload(cap_uci, opennds);
 LOGN("Hi ENDG");
 return;
 }
-static size_t image_data(void *ptr, size_t size, size_t nmemb, void *stream)
+/*int splash_page_logo(char* dest_file,char* src_url)
 {
-	return fwrite(ptr, size, nmemb, stream);
+	LOGN("IN LOGO FUN");
+	char cmd[1024];
+	LOGN("https://wlan-filestore.zone3.lab.connectus.ai/filestore/netExpLogo.png");
+	LOGN("%s",src_url);
+	LOGN("%s:dest_file",dest_file);
+	sprintf(cmd,"curl --insecure --cert /usr/opensync/certs/client.pem --key /usr/opensync/certs/client_dec.key %s -o %s",src_url,dest_file);
+	return (system(cmd));
+
+}*/
+void clean_up(CURL *curl,FILE* imagefile, FILE* headerfile)
+{
+	curl_easy_cleanup(curl);
+	fclose(imagefile);
+	fclose(headerfile);
+	return;
+}
+
+void splash_page_logo(char* dest_file, char* src_url)
+{
+	CURL *curl;
+	CURLcode res;
+	FILE *imagefile;
+	FILE *headerfile;
+	static const char *clientcert = "/usr/opensync/certs/client.pem";
+	const char *clientkey = "/usr/opensync/certs/client_dec.key";
+	static const char *pHeaderFile = "/etc/opennds/splashlogo_header";
+	const char *keytype = "PEM";
+	char errbuf[CURL_ERROR_SIZE];
+	headerfile = fopen(pHeaderFile, "wb");
+	LOGN("url:%s",src_url);
+	LOGN("file_path:%s",dest_file);
+	imagefile = fopen(dest_file, "wb");
+	if(imagefile == NULL){
+		LOG(ERR, "fopen failed");
+		return;
+	}
+	curl = curl_easy_init();
+
+	if(curl == NULL){
+		LOG(ERR, "curl_easy_init failed");
+		clean_up(curl,imagefile,headerfile);
+		return;
+	}
+	curl_easy_setopt(curl, CURLOPT_HEADERDATA, headerfile);
+	curl_easy_setopt(curl, CURLOPT_URL, src_url);
+	curl_easy_setopt(curl, CURLOPT_SSLCERT, clientcert);
+	curl_easy_setopt(curl, CURLOPT_SSLKEY, clientkey);
+	curl_easy_setopt(curl, CURLOPT_SSLKEYTYPE, keytype);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, imagefile);
+	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
+	curl_easy_setopt(curl, CURLOPT_HEADER, 0L);
+
+	res = curl_easy_perform(curl);
+	if(res != CURLE_OK){
+		LOGN("Image failed to Download: %s",errbuf);
+		clean_up(curl,imagefile,headerfile);
+		remove(dest_file);
+		return;
+	}
+	clean_up(curl,imagefile,headerfile);
+	return ;
 }
 void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *ifname)
 {
 	LOGN("Hi SET");
-	int i,j;
 	char value[255];
+	int j;
 	const char *opt;
 	const char *val;
 	char VIF_section_name[20];
@@ -266,16 +313,6 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 	if (stat(dir, &sta) == -1) {
 		mkdir(dir, 0755);
 	}
-	blobmsg_add_string(&cap, "macmechanism", "allow");
-	struct blob_attr *e;
-	LOGN("%d: Hi Len",vconf->captive_maclist_len);
-	e = blobmsg_open_array(&cap, "allowedmac");
-	for (i = 0; i < vconf->captive_maclist_len; i++){
-		blobmsg_add_string(&cap, NULL, (char*)vconf->captive_maclist[i]);
-		LOGN("%s: Hi MAC", (char*)vconf->captive_maclist[i]);
-	}
-	blobmsg_close_array(&cap, e);
-
 	for (j = 0; j < SCHEMA_CAPTIVE_PORTAL_OPTS_MAX; j++) {
 		opt = captive_portal_options_table[j];
 		val = SCHEMA_KEY_VAL(vconf->captive_portal, opt);
@@ -295,7 +332,7 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 			blobmsg_add_u32(&cap, "sessiontimeout", strtoul(value,NULL,10));
 		}
 		else if (strcmp(opt, "browser_title") == 0) {
-			blobmsg_add_string(&cap, "browser_title", value);
+			blobmsg_add_string(&cap, "gatewayname", value);
 			sprintf(libpath,"%s/browser_title.txt", dir);
 			file=fopen(libpath,"w+");
 			if (file == NULL) {
@@ -305,69 +342,30 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 			fclose(file);
 		}
 
-		else if (strcmp(opt, "splash_page_logo") == 0) {
-			blobmsg_add_string(&cap, "splash_page_logo", value);
-			CURL *curl;
-			FILE *fp;
-			CURLcode ret;
-			LOGN("url:%s",value);
-			char *url = value; //https://localhost:9096/filestore/netExpLogo.png==>real time: value
-			char file_path[128];
-			sprintf(file_path,IMAGE_PATH"%s","TipLogo");
-			fp = fopen(file_path,"wb");
-			if (fp == NULL) {
-				LOG(ERR, "Captive: fopen failed");
-				//curl_easy_cleanup(curl);
-			}
-			//curl_global_init(CURL_GLOBAL_DEFAULT);
-			curl = curl_easy_init();
-			if (curl == NULL) {
-				LOG(ERR, "Captive: curl_easy_init failed");
-			}
-			curl_easy_setopt(curl, CURLOPT_URL, url);
-			curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, image_data);
-			curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-			ret = curl_easy_perform(curl);
-			if (ret != CURLE_OK) {
-				LOG(ERR, "Captive: Image Failed to download (CURLError: %s)", curl_easy_strerror(ret));
-				//curl_easy_cleanup(curl);
-				remove(file_path);
-			}
-			curl_easy_cleanup(curl);
-			fclose(fp);
-			//curl_global_cleanup();
+		char file_path[128];
+		char path[64];
+		sprintf(path,IMAGE_PATH"%s/",VIF_section_name);
+		LOGN("path:%s",path);
+		struct stat st = {0};
+		if (stat(path, &st) == -1) {
+			mkdir(path, 0755);
 		}
-		/*else if (strcmp(opt, "splash_page_background_logo") == 0) {
+
+		else if (strcmp(opt, "splash_page_logo") == 0) {
+			LOGN("url:%s",value);
+			sprintf(file_path,"%s%s",path,"TipLogo.png");
+			blobmsg_add_string(&cap, "splash_page_logo", value);
+			LOGN("file_path:%s",file_path);
+			splash_page_logo(file_path,value);
+			LOGN("file_path:%s",file_path);
+		}
+
+		else if (strcmp(opt, "splash_page_background_logo") == 0) {
+			sprintf(file_path,"%s%s",path,"TipBackLogo.png");
 			blobmsg_add_string(&cap, "page_background_logo", value);
-			CURL *curl;
-			FILE *fp;
-			CURLcode ret;
-			char *url = value; //https://localhost:9096/filestore/netExpLogo.png==>real time: value
-			char file_path[128];
-			sprintf(file_path,IMAGE_PATH"%s","TipBackLogo");
-			fp = fopen(file_path,"wb");
-			if (fp == NULL) {
-				LOG(ERR, "Captive: fopen failed");
-				//curl_easy_cleanup(curl);
-			}
-			//curl_global_init(CURL_GLOBAL_DEFAULT);
-			curl = curl_easy_init();
-			if (curl == NULL) {
-				LOG(ERR, "Captive: curl_easy_init failed");
-			}
-			curl_easy_setopt(curl, CURLOPT_URL, url);
-			curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, image_data);
-			curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-			ret = curl_easy_perform(curl);
-			if (ret != CURLE_OK) {
-				LOG(ERR, "Captive: Image Failed to download (CURLError: %s)", curl_easy_strerror(ret));
-				//curl_easy_cleanup(curl);
-				remove(file_path);
-			}
-			curl_easy_cleanup(curl);
-			fclose(fp);
-			//curl_global_cleanup();
-		}*/
+			splash_page_logo(file_path,value);
+			LOGN("file_path:%s",file_path);
+		}
 		else if (strcmp(opt, "splash_page_title") == 0) {
 			blobmsg_add_string(&cap, "splash_page_title", value);
 			sprintf(libpath,"%s/splash_page_title.txt", dir);

@@ -9,11 +9,14 @@
 #include <uci.h>
 #include <uci_blob.h>
 
+typedef void (*awlan_update_cb)(struct schema_AWLAN_Node *awlan, schema_filter_t *filter);
+
 enum {
 	SYSTEM_ATTR_MODEL,
 	SYSTEM_ATTR_SERIAL,
 	SYSTEM_ATTR_PLATFORM,
 	SYSTEM_ATTR_FIRMWARE,
+	SYSTEM_ATTR_REDIRECTOR,
 	__SYSTEM_ATTR_MAX,
 };
 
@@ -22,6 +25,7 @@ static const struct blobmsg_policy system_policy[__SYSTEM_ATTR_MAX] = {
 	[SYSTEM_ATTR_SERIAL] = { .name = "serial", .type = BLOBMSG_TYPE_STRING },
 	[SYSTEM_ATTR_PLATFORM] = { .name = "platform", .type = BLOBMSG_TYPE_STRING },
 	[SYSTEM_ATTR_FIRMWARE] = { .name = "firmware", .type = BLOBMSG_TYPE_STRING },
+	[SYSTEM_ATTR_REDIRECTOR] = { .name = "redirector", .type = BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list system_param = {
@@ -59,6 +63,23 @@ bool target_sw_version_get(void *buf, size_t len)
 bool target_platform_version_get(void *buf, size_t len)
 {
 	return copy_data(SYSTEM_ATTR_PLATFORM, buf, len);
+}
+
+bool target_device_config_register(void *awlan_cb)
+{
+	struct schema_AWLAN_Node awlan;
+	schema_filter_t filter = { 1, {"+", SCHEMA_COLUMN(AWLAN_Node, redirector_addr), NULL} };
+
+	memset(&awlan, 0, sizeof(awlan));
+	if (!copy_data(SYSTEM_ATTR_REDIRECTOR, awlan.redirector_addr, sizeof(awlan.redirector_addr))) {
+		/* Seems we are not using UCI to set the redirector address. Simply return */
+		return true;
+	}
+	awlan_update_cb cbk = (awlan_update_cb) awlan_cb;
+	/* Update the redirector address */
+	cbk(&awlan, &filter);
+
+	return true;
 }
 
 static __attribute__((constructor)) void tip_data_init(void)
