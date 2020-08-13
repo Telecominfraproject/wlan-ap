@@ -261,8 +261,6 @@ hostapd_common_add_bss_config() {
 	
 	config_add_string 'owe_transition_bssid:macaddr' 'owe_transition_ssid:string'
 
-	config_add_int beacon_rate
-	config_add_int rssi_reject_assoc_rssi
 	config_add_int rssi_ignore_probe_request
 }
 
@@ -338,7 +336,6 @@ hostapd_set_bss_options() {
 	set_default chan_util_avg_period 600
 	set_default utf8_ssid 1
 	set_default multi_ap 0
-	set_default rssi_reject_assoc_rssi 0
 	set_default rssi_ignore_probe_request 0
 
 	append bss_conf "ctrl_interface=/var/run/hostapd"
@@ -361,7 +358,6 @@ hostapd_set_bss_options() {
 	append bss_conf "uapsd_advertisement_enabled=$uapsd" "$N"
 	append bss_conf "utf8_ssid=$utf8_ssid" "$N"
 	append bss_conf "multi_ap=$multi_ap" "$N"
-	append bss_conf "rssi_reject_assoc_rssi=$rssi_reject_assoc_rssi" "$N"
 	append bss_conf "rssi_ignore_probe_request=$rssi_ignore_probe_request" "$N"
 
 	[ "$tdls_prohibit" -gt 0 ] && append bss_conf "tdls_prohibit=$tdls_prohibit" "$N"
