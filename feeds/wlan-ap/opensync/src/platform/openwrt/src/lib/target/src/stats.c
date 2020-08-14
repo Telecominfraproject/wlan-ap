@@ -35,6 +35,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <sys/types.h>
 #include <curl/curl.h>
 #include <time.h>
+#include "dhcpdiscovery.h"
 
 #define NUM_MAX_CLIENTS 10
 
@@ -307,6 +308,8 @@ bool target_stats_network_probe_get(dpp_network_probe_record_t *network_probe_re
 	int ret = 0;
 	char server[] = "8.8.8.8";
 
+	/* DNS probe */
+
 	CURL *curl = curl_easy_init();
 	time_t begin = time(NULL), end;
 
@@ -329,6 +332,23 @@ bool target_stats_network_probe_get(dpp_network_probe_record_t *network_probe_re
 		LOGT("dns not resolved\n");
 		network_probe_report->dns_probe.state = 0;
 	}
+
+	/* DHCP probe */
+	char ifname[] = "br-wan";
+
+	begin = time(NULL);
+
+	if(generateQuery(ifname)) {
+		LOGT("dhcp resolved\n");
+		network_probe_report->vlan_probe.dhcpState = 1;
+	} else {
+		LOGT("dhcp not resolved\n");
+		network_probe_report->vlan_probe.dhcpState = 0;
+	}
+	end = time(NULL);
+	network_probe_report->vlan_probe.dhcpLatency = (end - begin);
+	memcpy(network_probe_report->vlan_probe.vlanIF , ifname, strlen(ifname));
+	LOGT("dhcp latency : %d \n", network_probe_report->vlan_probe.dhcpLatency);
 
 	return true;
 }
