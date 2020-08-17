@@ -25,8 +25,6 @@ extern int vif_is_ready(const char *name);
 extern int blobmsg_add_hex16(struct blob_buf *buf, const char *name, uint16_t val);
 extern int blobmsg_get_hex16(struct blob_attr *a);
 
-extern char* vif_ifname_to_sectionname( const char* ifname, char* sectionname );
-extern char* vif_sectionname_to_ifname( const char* sectionname, char* ifname );
 extern bool vif_state_to_conf(struct schema_Wifi_VIF_State *vstate, struct schema_Wifi_VIF_Config *vconf);
 extern bool radio_state_to_conf(struct schema_Wifi_Radio_State *rstate, struct schema_Wifi_Radio_Config *rconf);
 
