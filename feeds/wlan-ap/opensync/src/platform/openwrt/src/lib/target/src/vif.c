@@ -34,6 +34,7 @@ enum {
 	WIF_ATTR_MODE,
 	WIF_ATTR_SSID,
 	WIF_ATTR_BSSID,
+	WIF_ATTR_CHANNEL,
 	WIF_ATTR_ENCRYPTION,
 	WIF_ATTR_KEY,
 	WIF_ATTR_DISABLED,
@@ -70,6 +71,7 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_INDEX] = { .name = "index", .type = BLOBMSG_TYPE_INT32 },
 	[WIF_ATTR_SSID] = { .name = "ssid", .type = BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_BSSID] = { .name = "bssid", .type = BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_CHANNEL] = { .name = "channel", BLOBMSG_TYPE_INT32 },
 	[WIF_ATTR_ENCRYPTION] = { .name = "encryption", .type = BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_KEY] = { .name = "key", .type = BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_DISABLED] = { .name = "disabled", .type = BLOBMSG_TYPE_BOOL },
@@ -402,6 +404,11 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	else
 		LOGW("%s: failed to get SSID", s->e.name);
 
+	if (tb[WIF_ATTR_CHANNEL])
+		SCHEMA_SET_INT(vstate.channel, blobmsg_get_u32(tb[WIF_ATTR_CHANNEL]));
+	else
+		LOGN("%s: Failed to get channel", vstate.if_name);
+
 	phy_get_band(target_map_ifname(radio), band);
 	LOGD("Find min_hw_mode: Radio: %s Phy: %s Band: %s", radio, target_map_ifname(radio), band );
 	if (strstr(band, "5"))
@@ -563,6 +570,7 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 	}
 
 	blobmsg_add_bool(&b, "wpa_disable_eapol_key_retries", 1);
+	blobmsg_add_u32(&b, "channel", rconf->channel);
 
 	vif_config_security_set(&b, vconf);
 	if (changed->custom_options)
