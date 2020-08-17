@@ -460,12 +460,10 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
 {
 	struct uci_package *wireless;
-	char vif_section_name[20];
 
 	vlan_del((char *)vconf->if_name);
-	vif_ifname_to_sectionname(vconf->if_name, vif_section_name);
 	uci_load(uci, "wireless", &wireless);
-	uci_section_del(uci, "vif", "wireless", vif_section_name, "wifi-iface");
+	uci_section_del(uci, "vif", "wireless", (char *)vconf->if_name, "wifi-iface");
 	uci_commit_all(uci);
 	reload_config = 1;
 	return true;
@@ -477,7 +475,6 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 			    const struct schema_Wifi_VIF_Config_flags *changed,
 			    int num_cconfs)
 {
-	char vif_section_name[20];
 	int vid = 0;
 
 	blob_buf_init(&b, 0);
@@ -568,8 +565,7 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 	if (changed->custom_options)
 		vif_config_custom_opt_set(&b, vconf);
 
-	vif_ifname_to_sectionname(vconf->if_name, vif_section_name);
-	blob_to_uci_section(uci, "wireless", vif_section_name, "wifi-iface",
+	blob_to_uci_section(uci, "wireless", vconf->if_name, "wifi-iface",
 			    b.head, &wifi_iface_param, NULL);
 
 	if (vid)
