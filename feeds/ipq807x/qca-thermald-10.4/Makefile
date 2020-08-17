@@ -11,8 +11,8 @@ QCA_THERMALD_MAKE_OPTS:= \
 include $(INCLUDE_DIR)/package.mk
 
 define Package/qca-thermald-10.4
-  SECTION:=QCA
-  CATEGORY:=QCA Proprietary software
+  SECTION:=utils
+  CATEGORY:=Utilities
   URL:=http://www.qca.qualcomm.com
   MAINTAINER:=Qualcomm Atheros
   DEPENDS:=+libpthread @TARGET_ipq807x
