@@ -66,6 +66,12 @@ struct nl_call_param {
 	ds_dlist_t *list;
 };
 
+typedef struct ssid_list {
+        char ssid[RADIO_ESSID_LEN+1];
+        char ifname[RADIO_NAME_LEN+1];
+        ds_dlist_node_t node;
+} ssid_list_t;
+
 extern int stats_nl80211_init(void);
 extern int nl80211_get_tx_chainmask(char *name, unsigned int *mask);
 extern int nl80211_get_assoclist(struct nl_call_param *nl_call_param);
@@ -75,5 +81,6 @@ extern int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *c
 				target_scan_cb_t *scan_cb, void *scan_ctx);
 extern int nl80211_scan_abort(struct nl_call_param *nl_call_param);
 extern int nl80211_scan_dump(struct nl_call_param *nl_call_param);
+extern int nl80211_get_ssid(struct nl_call_param *nl_call_param);
 
 #endif
