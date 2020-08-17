@@ -99,13 +99,45 @@ bool target_stats_clients_get(radio_entry_t *radio_cfg, radio_essid_t *essid,
 		.type = radio_cfg->type,
 		.list = client_list,
 	};
+	ds_dlist_t ssid_list = DS_DLIST_INIT(ssid_list_t, node);
+        ssid_list_t *ssid = NULL;
+        struct nl_call_param ssid_call_param = {
+                .ifname = radio_cfg->if_name,
+                .type = radio_cfg->type,
+                .list = &ssid_list,
+        };
+
 	bool ret = true;
+        target_client_record_t *cl;
+ 
+        if (nl80211_get_ssid(&ssid_call_param) < 0)
+                ret = false;
 
-	if (nl80211_get_assoclist(&nl_call_param) < 0)
-		ret = false;
-	LOGT("%s: assoc returned %d, list %d", radio_cfg->if_name, ret, ds_dlist_is_empty(client_list));
+        while (!ds_dlist_is_empty(&ssid_list)) {
+                ssid = ds_dlist_head(&ssid_list);
+                
+                ds_dlist_t working_list = DS_DLIST_INIT(ds_dlist_t, od_cof);
+
+                nl_call_param.ifname  = ssid->ifname;
+                nl_call_param.list = &working_list;
+
+                if (nl80211_get_assoclist(&nl_call_param) < 0) {
+                       ds_dlist_remove(&ssid_list,ssid);
+                       continue;
+                }
+                LOGD("%s: assoc returned %d, list %d", ssid->ifname, ret, ds_dlist_is_empty(&working_list));
+
+                while (!ds_dlist_is_empty(&working_list)) {
+                        cl = ds_dlist_head(&working_list);
+                        strncpy(cl->info.essid, ssid->ssid, sizeof(cl->info.essid));
+                        ds_dlist_remove(&working_list, cl);
+                        ds_dlist_insert_tail(client_list, cl);
+                }
+                ds_dlist_remove(&ssid_list,ssid);
+                free(ssid);
+        }
+
 	(*client_cb)(client_list, client_ctx, ret);
-
         return ret;
 }
 
@@ -113,7 +145,7 @@ bool target_stats_clients_convert(radio_entry_t *radio_cfg, target_client_record
 				  target_client_record_t *data_old, dpp_client_record_t *client_record)
 {
 	memcpy(client_record->info.mac, data_new->info.mac, sizeof(data_new->info.mac));
-	memcpy(client_record->info.essid, radio_cfg->if_name, sizeof(radio_cfg->if_name));
+	memcpy(client_record->info.essid, data_new->info.essid, sizeof(radio_cfg->if_name));
 
 	client_record->stats.rssi       = data_new->stats.rssi;
 	client_record->stats.rate_tx    = data_new->stats.rate_tx;
