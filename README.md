@@ -16,6 +16,12 @@ Next we need to select the profile and base package selection. This setup will i
 cd openwrt
 ./scripts/gen_config.py ap2220 wlan-ap wifi
 ```
+If you want to build an AX image you need to setup a different config. The available profiles are hawkeye, cypress, wallaby.
+```
+cd openwrt
+./scripts/gen_config.py wallaby wifi-ax
+```
+
 Finally we can build the tree.
 ```
 make -j X V=s

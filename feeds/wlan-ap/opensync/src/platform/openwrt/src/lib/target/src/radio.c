@@ -232,7 +232,6 @@ static void periodic_task(void *arg)
 {
 	static int counter = 0;
 	struct uci_element *e = NULL, *tmp = NULL;
-	char ifname[20];
 
 	if ((counter % 15) && !reload_config)
 		goto done;
@@ -259,7 +258,7 @@ static void periodic_task(void *arg)
 		struct uci_section *s = uci_to_section(e);
 
 		if (!strcmp(s->type, "wifi-iface"))
-			if (vif_find(vif_sectionname_to_ifname(s->e.name, ifname)))
+			if (vif_find(s->e.name))
 				vif_state_update(s, NULL);
 	}
 	uci_unload(uci, wireless);

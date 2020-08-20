@@ -66,4 +66,6 @@ extern void firewall_del_zone(char *net);
 extern void firewall_get_state(struct schema_Wifi_Inet_State *state);
 extern void firewall_get_config(struct schema_Wifi_Inet_Config *conf);
 
+extern int rtnl_init(struct ev_loop *loop);
+
 #endif

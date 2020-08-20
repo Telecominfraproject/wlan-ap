@@ -46,23 +46,38 @@ define Package/opennds/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/opennds $(1)/usr/bin/
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ndsctl $(1)/usr/bin/
 
-	$(INSTALL_DIR) $(1)/etc/opennds/htdocs/images
+	$(INSTALL_DIR) $(1)/etc/opennds/htdocs/wlan0
+	$(INSTALL_DIR) $(1)/etc/opennds/htdocs/wlan0/images
+	$(INSTALL_DIR) $(1)/etc/opennds/htdocs/wlan1
+	$(INSTALL_DIR) $(1)/etc/opennds/htdocs/wlan2
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_DIR) $(1)/usr/lib/opennds
-	$(CP) ./files/lib/splash.html $(1)/etc/opennds/htdocs/
-	$(CP) ./files/lib/Tip.png $(1)/etc/opennds/htdocs/images/
+
+	$(CP) ./files/lib/splash.html $(1)/etc/opennds/htdocs/wlan0
+	$(CP) ./files/lib/splash.css $(1)/etc/opennds/htdocs/wlan0
+	$(CP) ./files/lib/splash_sitewide.html $(1)/etc/opennds/htdocs/wlan0
+	$(CP) ./files/lib/status.html $(1)/etc/opennds/htdocs/wlan0
+	
+	$(CP) ./files/lib/splash.html $(1)/etc/opennds/htdocs/wlan1
+	$(CP) ./files/lib/splash.css $(1)/etc/opennds/htdocs/wlan1
+	$(CP) ./files/lib/splash_sitewide.html $(1)/etc/opennds/htdocs/wlan1
+	$(CP) ./files/lib/status.html $(1)/etc/opennds/htdocs/wlan1
+
+	$(CP) ./files/lib/splash.html $(1)/etc/opennds/htdocs/wlan2
+	$(CP) ./files/lib/splash.css $(1)/etc/opennds/htdocs/wlan2
+	$(CP) ./files/lib/splash_sitewide.html $(1)/etc/opennds/htdocs/wlan2
+	$(CP) ./files/lib/status.html $(1)/etc/opennds/htdocs/wlan2
+
+	$(CP) ./files/lib/Tip.png $(1)/etc/opennds/htdocs/wlan0/images/
 	$(CP) ./files/lib/opennds $(1)/etc/config/
 	$(CP) ./files/etc/init.d/opennds $(1)/etc/init.d/
-	$(CP) $(PKG_BUILD_DIR)/resources/splash.css $(1)/etc/opennds/htdocs/
-	$(CP) $(PKG_BUILD_DIR)/resources/status.html $(1)/etc/opennds/htdocs/
 	$(CP) $(PKG_BUILD_DIR)/openwrt/opennds/files/etc/uci-defaults/40_opennds $(1)/etc/uci-defaults/
 	$(CP) $(PKG_BUILD_DIR)/openwrt/opennds/files/usr/lib/opennds/restart.sh $(1)/usr/lib/opennds/
 	$(CP) $(PKG_BUILD_DIR)/forward_authentication_service/binauth/binauth_log.sh $(1)/usr/lib/opennds/
 	$(CP) $(PKG_BUILD_DIR)/forward_authentication_service/binauth/binauth_sitewide.sh $(1)/usr/lib/opennds/
 	$(CP) $(PKG_BUILD_DIR)/forward_authentication_service/binauth/userlist.dat $(1)/etc/opennds/
-	$(CP) $(PKG_BUILD_DIR)/forward_authentication_service/binauth/splash_sitewide.html $(1)/etc/opennds/htdocs/
 	$(CP) $(PKG_BUILD_DIR)/forward_authentication_service/PreAuth/login.sh $(1)/usr/lib/opennds/
 	$(CP) $(PKG_BUILD_DIR)/forward_authentication_service/PreAuth/login-remote-image.sh $(1)/usr/lib/opennds/
 	$(CP) $(PKG_BUILD_DIR)/forward_authentication_service/libs/get_client_interface.sh $(1)/usr/lib/opennds/

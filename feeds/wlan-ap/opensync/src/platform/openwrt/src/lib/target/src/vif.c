@@ -48,6 +48,7 @@ enum {
 	WIF_ATTR_IEEE80211R,
 	WIF_ATTR_IEEE80211W,
 	WIF_ATTR_MOBILITY_DOMAIN,
+	WIF_ATTR_FT_OVER_DS,
 	WIF_ATTR_FT_PSK_LOCAL,
 	WIF_ATTR_UAPSD,
 	WIF_ATTR_VLAN_ID,
@@ -84,6 +85,7 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_IEEE80211R] = { .name = "ieee80211r", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_IEEE80211W] = { .name = "ieee80211w", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_MOBILITY_DOMAIN] = { .name = "mobility_domain", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_FT_OVER_DS] = { .name = "ft_over_ds", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_FT_PSK_LOCAL] = { .name = "ft_psk_generate_local" ,BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_UAPSD] = { .name = "uapsd", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_VLAN_ID] = { .name = "vlan_id", BLOBMSG_TYPE_INT32 },
@@ -462,12 +464,10 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
 {
 	struct uci_package *wireless;
-	char vif_section_name[20];
 
 	vlan_del((char *)vconf->if_name);
-	vif_ifname_to_sectionname(vconf->if_name, vif_section_name);
 	uci_load(uci, "wireless", &wireless);
-	uci_section_del(uci, "vif", "wireless", vif_section_name, "wifi-iface");
+	uci_section_del(uci, "vif", "wireless", (char *)vconf->if_name, "wifi-iface");
 	uci_commit_all(uci);
 	reload_config = 1;
 	return true;
@@ -479,7 +479,6 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 			    const struct schema_Wifi_VIF_Config_flags *changed,
 			    int num_cconfs)
 {
-	char vif_section_name[20];
 	int vid = 0;
 
 	blob_buf_init(&b, 0);
@@ -570,8 +569,7 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 	if (changed->custom_options)
 		vif_config_custom_opt_set(&b, vconf);
 
-	vif_ifname_to_sectionname(vconf->if_name, vif_section_name);
-	blob_to_uci_section(uci, "wireless", vif_section_name, "wifi-iface",
+	blob_to_uci_section(uci, "wireless", vconf->if_name, "wifi-iface",
 			    b.head, &wifi_iface_param, NULL);
 
 	if (vid)
@@ -579,7 +577,7 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 	else
 		vlan_del((char *)vconf->if_name);
 
-	if (changed->captive_portal || changed->captive_maclist)
+	if (changed->captive_portal || changed->captive_allowlist)
 			vif_captive_portal_set(vconf,(char*)vconf->if_name);
 
 	reload_config = 1;

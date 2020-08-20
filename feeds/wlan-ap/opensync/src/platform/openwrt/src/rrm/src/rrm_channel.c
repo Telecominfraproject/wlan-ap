@@ -36,14 +36,10 @@ const struct uci_blob_param_list wifi_config_param = {
 
 static void rrm_set_basic_rate(const char *if_name, int32_t rate)
 {
-
-	char vif_section_name[20];
-
 	blob_buf_init(&b, 0);
 	blobmsg_add_u32(&b, "beacon_rate", rate);
-	vif_ifname_to_sectionname(if_name, vif_section_name);
 
-	blob_to_uci_section(uci, "wireless", vif_section_name, "wifi-iface",
+	blob_to_uci_section(uci, "wireless", if_name, "wifi-iface",
 			b.head, &wifi_config_param, NULL);
 
 	uci_commit_all(uci);
@@ -52,14 +48,10 @@ static void rrm_set_basic_rate(const char *if_name, int32_t rate)
 
 static void rrm_set_reject_assoc_rssi(const char *if_name, int32_t rssi)
 {
-
-	char vif_section_name[20];
-
 	blob_buf_init(&b, 0);
 	blobmsg_add_u32(&b, "rssi_reject_assoc_rssi", rssi);
-	vif_ifname_to_sectionname(if_name, vif_section_name);
 
-	blob_to_uci_section(uci, "wireless", vif_section_name, "wifi-iface",
+	blob_to_uci_section(uci, "wireless", if_name, "wifi-iface",
 			b.head, &wifi_config_param, NULL);
 
 	uci_commit_all(uci);

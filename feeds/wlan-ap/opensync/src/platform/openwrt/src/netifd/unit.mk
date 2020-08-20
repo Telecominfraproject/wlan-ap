@@ -8,6 +8,7 @@ UNIT_SRC    += src/wifi_inet_config.c
 UNIT_SRC    += src/wifi_inet_state.c
 UNIT_SRC    += src/dhcp.c
 UNIT_SRC    += src/firewall.c
+UNIT_SRC    += src/rtnl.c
 UNIT_SRC    += src/main.c
 
 UNIT_CFLAGS := -I$(UNIT_PATH)/inc

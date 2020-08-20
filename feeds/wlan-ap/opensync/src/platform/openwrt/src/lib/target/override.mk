@@ -42,6 +42,7 @@ UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/iface.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/vlan.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/sysupgrade.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/captive.c
+UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/dhcpdiscovery.c
 
 CONFIG_USE_KCONFIG=y
 CONFIG_INET_ETH_LINUX=y

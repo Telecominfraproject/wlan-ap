@@ -25,7 +25,6 @@ static struct uci_context *cap_uci;
 
 #define SCHEMA_CAPTIVE_PORTAL_OPT_SZ            255
 #define SCHEMA_CAPTIVE_PORTAL_OPTS_MAX          9
-#define IMAGE_PATH "/etc/opennds/htdocs/images/"
 enum {
 	NDS_ATTR_SESSIONTIMEOUT,
 	NDS_ATTR_GATEWAYINTERFACE,
@@ -33,7 +32,7 @@ enum {
 	NDS_ATTR_LOGIN_OPTION_ENABLED,
 	NDS_ATTR_ENABLED,
 	NDS_ATTR_AUTHENTICATED_USERS,
-	NDS_ATTR_CAPTIVE_MACLIST,
+	NDS_ATTR_CAPTIVE_ALLOWLIST,
 	NDS_ATTR_MACMECHANISM,
 	NDS_ATTR_BROWSER_TITLE,
 	NDS_ATTR_SPLASH_PAGE_LOGO,
@@ -43,6 +42,9 @@ enum {
 	NDS_ATTR_AUTHENTICATION,
 	NDS_ATTR_ACCEPTANCE_POLICY,
 	NDS_ATTR_LOGIN_SUCCESS_TEXT,
+	NDS_ATTR_SPLASH_PAGE,
+	NDS_ATTR_BINAUTH_SCRIPT,
+	NDC_ATTR_WEB_ROOT,
 	__NDS_ATTR_MAX,
 };
 const struct blobmsg_policy opennds_policy[__NDS_ATTR_MAX] = {
@@ -52,16 +54,19 @@ const struct blobmsg_policy opennds_policy[__NDS_ATTR_MAX] = {
 	[NDS_ATTR_LOGIN_OPTION_ENABLED] = { .name = "login_option_enabled", .type = BLOBMSG_TYPE_INT32 },
 	[NDS_ATTR_ENABLED] = { .name = "enabled", .type = BLOBMSG_TYPE_INT32 },
 	[NDS_ATTR_AUTHENTICATED_USERS]  = { .name = "authenticated_users", .type = BLOBMSG_TYPE_ARRAY },
-	[NDS_ATTR_CAPTIVE_MACLIST]  = { .name = "allowedmac", .type = BLOBMSG_TYPE_ARRAY },
+	[NDS_ATTR_CAPTIVE_ALLOWLIST]  = { .name = "preauthenticated_users", .type = BLOBMSG_TYPE_ARRAY },
 	[NDS_ATTR_MACMECHANISM]  = { .name = "macmechanism", .type = BLOBMSG_TYPE_STRING },
 	[NDS_ATTR_BROWSER_TITLE]  = { .name = "browser_title", .type = BLOBMSG_TYPE_STRING },
 	[NDS_ATTR_SPLASH_PAGE_LOGO]  = { .name = "splash_page_logo", .type = BLOBMSG_TYPE_STRING },
 	[NDS_ATTR_PAGE_BACKGROUND_LOGO]  = { .name = "page_background_logo", .type = BLOBMSG_TYPE_STRING },
 	[NDS_ATTR_SPLASH_PAGE_TITLE]  = { .name = "splash_page_title", .type = BLOBMSG_TYPE_STRING },
-	[NDS_ATTR_REDIRECT_URL]  = { .name = "redirect_url", .type = BLOBMSG_TYPE_STRING },
+	[NDS_ATTR_REDIRECT_URL]  = { .name = "redirectURL", .type = BLOBMSG_TYPE_STRING },
 	[NDS_ATTR_AUTHENTICATION]  = { .name = "authentication", .type = BLOBMSG_TYPE_STRING },
 	[NDS_ATTR_ACCEPTANCE_POLICY]  = { .name = "acceptance_policy", .type = BLOBMSG_TYPE_STRING },
 	[NDS_ATTR_LOGIN_SUCCESS_TEXT]  = { .name = "login_success_text", .type = BLOBMSG_TYPE_STRING },
+	[NDS_ATTR_SPLASH_PAGE]  = { .name = "splashpage", .type = BLOBMSG_TYPE_STRING },
+	[NDS_ATTR_BINAUTH_SCRIPT]  = { .name = "binauth", .type = BLOBMSG_TYPE_STRING },
+	[NDC_ATTR_WEB_ROOT]  = { .name = "webroot", .type = BLOBMSG_TYPE_STRING },
 };
 const struct uci_blob_param_list opennds_param = {
 	.n_params = __NDS_ATTR_MAX,
@@ -104,6 +109,8 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 	struct uci_element *e = NULL;
 	//int length;
 
+
+
 	uci_load(cap_uci, "opennds", &opennds);
 	LOGN("Hi SGET1 %x",(unsigned int)opennds);
 	uci_foreach_element(&opennds->sections, e) {
@@ -126,6 +133,20 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 			blobmsg_parse(opennds_policy, __NDS_ATTR_MAX, tc, blob_data(cap.head), blob_len(cap.head));
 			LOGN("Hi OptionsGet");
 			LOGN("Hi ForCNDTN1");
+
+			if (tc[NDS_ATTR_CAPTIVE_ALLOWLIST]) {
+				LOGN("Hi NDSCONDTN");
+				struct blob_attr *cur = NULL;
+				int rem = 0;
+				vstate->captive_allowlist_len = 0;
+				blobmsg_for_each_attr(cur, tc[NDS_ATTR_CAPTIVE_ALLOWLIST], rem) {
+					if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING)
+						continue;
+					strcpy(vstate->captive_allowlist[vstate->captive_allowlist_len], blobmsg_get_string(cur));
+					LOGN("%s: Hi MAC", (char*)vstate->captive_allowlist[vstate->captive_allowlist_len]);
+					vstate->captive_allowlist_len++;
+				}
+			}
 			for (i = 0; i < SCHEMA_CAPTIVE_PORTAL_OPTS_MAX; i++) {
 				opt = captive_portal_options_table[i];
 				LOGN("Hi c_option: %s",opt);
@@ -135,25 +156,30 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 					if (tc[NDS_ATTR_SESSIONTIMEOUT])
 					{
 						LOGN("Hi IN");
-						//LOGN("Hi BuFF %s",buf);
-						//length=snprintf(NULL,0,"%d",blobmsg_get_u32(tc[NDS_ATTR_SESSIONTIMEOUT]));
-						//LOGN("Hi LG %d",length);
 						sprintf(timeout,"%d",blobmsg_get_u32(tc[NDS_ATTR_SESSIONTIMEOUT]));
 						LOGN("Hi Buff:%s",timeout);
 						LOGN("Hi INForCNDTNL %d",blobmsg_get_u32(tc[NDS_ATTR_SESSIONTIMEOUT]));
-						//( blobmsg_get_u32(tc[NDS_ATTR_SESSIONTIMEOUT]),buf,10);
 						set_captive_portal_state(vstate, &index,
 								captive_portal_options_table[i],
 								timeout);
 					}
 				}
 				else if (strcmp(opt, "authentication") == 0) {
-					LOGN("Hi Browse");
-					if (tc[NDS_ATTR_LOGIN_OPTION_ENABLED]) {
-						buf = "none";
-						set_captive_portal_state(vstate, &index,
-								captive_portal_options_table[i],
-								buf);
+					if(tc[NDS_ATTR_AUTHENTICATION]) {
+						buf = blobmsg_get_string(tc[NDS_ATTR_AUTHENTICATION]);
+						if (!strcmp(buf, "None")) {
+							LOGN("Hi OPENNDS1");
+							set_captive_portal_state(vstate, &index,
+									captive_portal_options_table[i],
+									buf);
+						}
+
+						else if (!strcmp(buf,"Captive Portal User List")) {
+							LOGN("Hi OPENNDS1");
+							set_captive_portal_state(vstate, &index,
+									captive_portal_options_table[i],
+									buf);
+						}
 					}
 				}
 				else if (strcmp(opt, "browser_title") == 0) {
@@ -219,24 +245,12 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 				}
 			}
 		}
-
 	}
-LOGN("Hi GETEND");
 uci_unload(cap_uci, opennds);
 LOGN("Hi ENDG");
 return;
 }
-/*int splash_page_logo(char* dest_file,char* src_url)
-{
-	LOGN("IN LOGO FUN");
-	char cmd[1024];
-	LOGN("https://wlan-filestore.zone3.lab.connectus.ai/filestore/netExpLogo.png");
-	LOGN("%s",src_url);
-	LOGN("%s:dest_file",dest_file);
-	sprintf(cmd,"curl --insecure --cert /usr/opensync/certs/client.pem --key /usr/opensync/certs/client_dec.key %s -o %s",src_url,dest_file);
-	return (system(cmd));
 
-}*/
 void clean_up(CURL *curl,FILE* imagefile, FILE* headerfile)
 {
 	curl_easy_cleanup(curl);
@@ -296,23 +310,26 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 {
 	LOGN("Hi SET");
 	char value[255];
-	int j;
+	int j,i;
 	const char *opt;
 	const char *val;
-	char VIF_section_name[20];
-	FILE *file;
 	blob_buf_init(&cap, 0);
 	char dir[32];
-	char libpath[64];
+	char webroot[64];
+	char port[64];
 
-	vif_ifname_to_sectionname(ifname, VIF_section_name);
+	sprintf(webroot,"/etc/opennds/htdocs/%s/",ifname);
+	LOGN("webroot:%s",dir);
 
-	sprintf(dir,"/etc/config/%s",VIF_section_name);
-	LOGN("dir:%s",dir);
-	struct stat sta = {0};
-	if (stat(dir, &sta) == -1) {
-		mkdir(dir, 0755);
+	struct blob_attr *e;
+	e = blobmsg_open_array(&cap, "preauthenticated_users");
+	for (i = 0; i < vconf->captive_allowlist_len; i++)
+	{
+		sprintf(port,"%s %s","allow tcp port 80 to",(char*)vconf->captive_allowlist[i]);
+		blobmsg_add_string(&cap, NULL, port);
 	}
+	blobmsg_close_array(&cap, e);
+
 	for (j = 0; j < SCHEMA_CAPTIVE_PORTAL_OPTS_MAX; j++) {
 		opt = captive_portal_options_table[j];
 		val = SCHEMA_KEY_VAL(vconf->captive_portal, opt);
@@ -324,8 +341,21 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 		LOGN("%s: Hi Options",value);
 
 		if (!strcmp(opt, "authentication")) {
-			if(strcmp(value,"none")==0)
-				blobmsg_add_u32(&cap, "login_option_enabled", 1);
+			blobmsg_add_u32(&cap, "enabled", 1);
+			blobmsg_add_string(&cap, "webroot",webroot);
+			//blobmsg_add_u32(&cap, "gatewayinterface",ifname);
+			if(strcmp(value,"None")==0) {
+				blobmsg_add_u32(&cap, "login_option_enabled", 0);
+				blobmsg_add_string(&cap, "authentication", value);
+				blobmsg_add_string(&cap, "splashpage","splash.html");
+				blobmsg_add_string(&cap, "binauth","");
+			}
+			else if(strcmp(value,"Captive Portal User List")==0) {
+				blobmsg_add_string(&cap, "authentication", value);
+				blobmsg_add_u32(&cap, "login_option_enabled", 0);
+				blobmsg_add_string(&cap, "splashpage", "splash_sitewide.html");
+				blobmsg_add_string(&cap, "binauth","/usr/lib/opennds/binauth_sitewide.sh");
+			}
 		}
 		else if (strcmp(opt, "session_timeout") == 0) {
 			LOGN("%lu: Hi InTVaL",strtoul(value,NULL,10));
@@ -333,18 +363,12 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 		}
 		else if (strcmp(opt, "browser_title") == 0) {
 			blobmsg_add_string(&cap, "gatewayname", value);
-			sprintf(libpath,"%s/browser_title.txt", dir);
-			file=fopen(libpath,"w+");
-			if (file == NULL) {
-				LOGW("Failed to create a file");
-			}
-			fprintf(file,"%s",val);
-			fclose(file);
+
 		}
 
 		char file_path[128];
 		char path[64];
-		sprintf(path,IMAGE_PATH"%s/",VIF_section_name);
+		sprintf(path,"%s%s/",webroot,"images");
 		LOGN("path:%s",path);
 		struct stat st = {0};
 		if (stat(path, &st) == -1) {
@@ -368,48 +392,24 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 		}
 		else if (strcmp(opt, "splash_page_title") == 0) {
 			blobmsg_add_string(&cap, "splash_page_title", value);
-			sprintf(libpath,"%s/splash_page_title.txt", dir);
-			file=fopen(libpath,"w+");
-			if (file == NULL) {
-				LOGW("Failed to create a file");
-			}
-			fprintf(file,"%s",val);
-			fclose(file);
+
 		}
 		else if (strcmp(opt, "acceptance_policy") == 0) {
 			blobmsg_add_string(&cap, "acceptance_policy", value);
-			sprintf(libpath,"%s/acceptance_policy.txt", dir);
-			file=fopen(libpath,"w+");
-			if (file == NULL) {
-				LOGW("Failed to create a file");
-			}
-			fprintf(file,"%s",val);
-			fclose(file);
+
 		}
 		else if (strcmp(opt, "redirect_url") == 0) {
-			blobmsg_add_string(&cap, "redirect_url", value);
-			sprintf(libpath,"%s/redirect_url.txt", dir);
-			file=fopen(libpath,"w+");
-			if (file == NULL) {
-				LOGW("Failed to create a file");
-			}
-			fprintf(file,"%s",val);
-			fclose(file);
+			blobmsg_add_string(&cap, "redirectURL", value);
+
 		}
 		else if (strcmp(opt, "login_success_text") == 0) {
 			blobmsg_add_string(&cap, "login_success_text", value);
-			sprintf(libpath,"%s/login_success_text.txt", dir);
-			file=fopen(libpath,"w+");
-			if (file == NULL) {
-				LOGW("Failed to create a file");
-			}
-			fprintf(file,"%s",val);
-			fclose(file);
+
 		}
 	}
 	LOGN("Hi SETEND");
-	blob_to_uci_section(cap_uci, "opennds", VIF_section_name, "opennds", cap.head, &opennds_param, NULL);
-	LOGN("Hi SETEND:%s",VIF_section_name);
+	blob_to_uci_section(cap_uci, "opennds", ifname, "opennds", cap.head, &opennds_param, NULL);
+	LOGN("Hi SETEND:%s",ifname);
 	uci_commit_all(cap_uci);
 	return;
 }
