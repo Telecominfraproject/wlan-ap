@@ -175,6 +175,7 @@ static void nl80211_add_station(struct nlattr **tb, char *ifname)
 	addr = nla_data(tb[NL80211_ATTR_MAC]);
 	sta = avl_find_element(&sta_tree, addr, sta, avl);
 	if (sta) {
+		vif_add_sta_rate_rule(addr, ifname);
 		vif_update_stats(sta, tb);
 		return;
 	}
@@ -215,8 +216,10 @@ static void nl80211_del_station(struct nlattr **tb, char *ifname)
 
 	addr = nla_data(tb[NL80211_ATTR_MAC]);
 	sta = avl_find_element(&sta_tree, addr, sta, avl);
-	if (!sta)
+	if (!sta) {
+		vif_del_sta_rate_rule(addr, ifname);
 		return;
+	}
 
 	vif_del_sta_rate_rule(addr, ifname);
 	vif_add_station(sta, ifname, 0);

@@ -71,13 +71,13 @@ if [ "$1" == "add" ]; then
 	fi
 
 elif [ "$1" == "del" ]; then
-	id=`nft list chain bridge nft-qos-ssid-lan-bridge download  -a | grep -i $3  | awk -F "handle " '{print $2}'`
+	id=`nft list chain bridge nft-qos-ssid-lan-bridge download  -a | grep -i $3  | awk -F "handle " '{print $2;exit}'`
 	logger -t "mac-rate" "$id $3"
 	if [ -n "$id" ]; then
 		nft delete rule bridge nft-qos-ssid-lan-bridge download handle $id
 	fi
 
-	id=`nft list chain bridge nft-qos-ssid-lan-bridge upload  -a | grep -i $3  | awk -F "handle " '{print $2}'`
+	id=`nft list chain bridge nft-qos-ssid-lan-bridge upload  -a | grep -i $3  | awk -F "handle " '{print $2;exit}'`
 	if [ -n "$id" ]; then
 		nft delete rule bridge nft-qos-ssid-lan-bridge upload handle $id
 	fi

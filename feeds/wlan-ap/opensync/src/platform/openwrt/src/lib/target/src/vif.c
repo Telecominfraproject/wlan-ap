@@ -449,6 +449,7 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	vif_state_security_get(&vstate, tb);
 	vif_state_custom_options_get(&vstate, tb);
 	vif_state_captive_portal_options_get(&vstate,s);
+	vif_state_dhcp_allowlist_get(&vstate,s);
 
 	if (vconf) {
 		LOGN("%s: updating vif config", radio);
@@ -577,8 +578,13 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 	else
 		vlan_del((char *)vconf->if_name);
 
-	if (changed->captive_portal || changed->captive_allowlist)
+	if (changed->captive_portal)
 			vif_captive_portal_set(vconf,(char*)vconf->if_name);
+
+	if(changed->captive_allowlist)
+	{
+			vif_dhcp_opennds_allowlist_set(vconf,(char*)vconf->if_name);
+	}
 
 	reload_config = 1;
 
