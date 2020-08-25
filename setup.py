@@ -34,7 +34,10 @@ def clone_tree():
 
 		print("### Cloning tree")
 		Path(openwrt).mkdir(exist_ok=True, parents=True)
-		run(["git", "clone", config["repo"], openwrt], check=True)
+		if git_ref != "":
+			run(["git", "clone", "--reference", git_ref, config["repo"], openwrt], check=True)
+		else:
+			run(["git", "clone", config["repo"], openwrt], check=True)
 		print("### Clone done")
 	except:
 		print("### Cloning the tree failed")
@@ -113,9 +116,10 @@ genkey = True
 rebase = False
 config = "config.yml"
 openwrt = "openwrt"
+git_ref = ""
 
 try:
-	opts, args = getopt.getopt(sys.argv[1:], "srdc:f:", ["setup", "rebase", "docker", "config=", "folder="])
+	opts, args = getopt.getopt(sys.argv[1:], "srdc:f:", ["setup", "rebase", "docker", "config=", "folder=", "reference="])
 except getopt.GetoptError as err:
 	print(err)
 	sys.exit(2)
@@ -128,6 +132,8 @@ for o, a in opts:
 		rebase = True
 	elif o in ("-c", "--config"):
 		config = a
+	elif o in ("--reference"):
+		git_ref = a
 	elif o in ("-d", "--docker"):
 		git_am = "apply"
 		genkey = False
