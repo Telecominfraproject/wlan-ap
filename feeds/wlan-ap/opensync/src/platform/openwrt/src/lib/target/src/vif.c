@@ -362,6 +362,8 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	else
 		SCHEMA_SET_STR(vstate.ssid_broadcast, "enabled");
 
+	SCHEMA_SET_INT(vstate.channel, radio_get_channel(s->e.name));
+
 	if (tb[WIF_ATTR_MODE])
 		SCHEMA_SET_STR(vstate.mode, blobmsg_get_string(tb[WIF_ATTR_MODE]));
 	else

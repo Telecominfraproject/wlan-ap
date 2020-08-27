@@ -11,5 +11,6 @@ extern int phy_get_channels(const char *name, int *channel);
 extern int phy_get_band(const char *name, char *band);
 extern int phy_is_ready(const char *name);
 extern int phy_lookup(char *name);
+extern uint32_t radio_get_channel(char *radio);
 
 #endif

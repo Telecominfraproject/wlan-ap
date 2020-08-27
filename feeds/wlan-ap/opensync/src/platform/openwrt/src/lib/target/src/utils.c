@@ -20,6 +20,7 @@
 #include "target.h"
 #include "nl80211.h"
 #include "utils.h"
+#include "iwinfo.h"
 
 static struct mode_map mode_map[] = {
 	{ 0, "11b", "11b", NULL, "NOHT" },
@@ -90,6 +91,21 @@ struct mode_map *mode_map_get_cloud(const char *htmode, const char *hwmode)
 
 	return NULL;
 }
+
+uint32_t radio_get_channel(char *radio)
+{
+	int channel;
+	const char *if_type = iwinfo_type(radio);
+	const struct iwinfo_ops *winfo_ops = iwinfo_backend_by_name(if_type);
+
+	if(0 != winfo_ops->channel(radio, &channel))
+	{
+		return 0;
+	}
+
+	return channel;
+}
+
 
 int phy_from_path(char *path, char *phy)
 {
