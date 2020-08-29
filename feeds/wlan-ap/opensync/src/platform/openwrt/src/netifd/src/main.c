@@ -55,7 +55,6 @@ int main(int argc, char ** argv)
 	wifi_inet_config_init();
 	wifi_inet_state_init();
 	netifd_ubus_init(loop);
-	rtnl_init(loop);
 
 	ev_run(loop, 0);
 
