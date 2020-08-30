@@ -4,6 +4,7 @@
 #include <uci_blob.h>
 #include <libubox/avl-cmp.h>
 #include <libubox/avl.h>
+#include <inttypes.h>
 
 #include "log.h"
 
@@ -57,7 +58,7 @@ static char *blob_to_string(struct blob_attr *a, uint32_t type)
 		snprintf(blob_to_string_buf, sizeof(blob_to_string_buf), "%d",  blobmsg_get_u32(a));
 		break;
 	case BLOBMSG_TYPE_INT64:
-		snprintf(blob_to_string_buf, sizeof(blob_to_string_buf), "%lld",  blobmsg_get_u64(a));
+		snprintf(blob_to_string_buf, sizeof(blob_to_string_buf), "%"PRIu64,  blobmsg_get_u64(a));
 		break;
 	default:
 		return NULL;
