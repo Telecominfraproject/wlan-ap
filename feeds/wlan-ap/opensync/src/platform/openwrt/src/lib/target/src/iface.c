@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 
+#include <sys/types.h>
+#include <sys/socket.h>
 #include <linux/if.h>
 
 #include <sys/ioctl.h>
