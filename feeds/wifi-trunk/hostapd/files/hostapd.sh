@@ -45,6 +45,7 @@ hostapd_append_wpa_key_mgmt() {
 			append wpa_key_mgmt "WPA-$auth_type_l"
 			[ "${ieee80211r:-0}" -gt 0 ] && append wpa_key_mgmt "FT-${auth_type_l}"
 			[ "${ieee80211w:-0}" -gt 0 ] && append wpa_key_mgmt "WPA-${auth_type_l}-SHA256"
+			[ "${ieee80211ai:-0}" -gt 0 ] && append wpa_key_mgmt "FILS-SHA256"
 		;;
 		eap192)
 			append wpa_key_mgmt "WPA-EAP-SUITE-B-192"
@@ -198,6 +199,7 @@ hostapd_common_add_bss_config() {
 
 	config_add_boolean rsn_preauth auth_cache
 	config_add_int ieee80211w
+	config_add_int ieee80211ai
 	config_add_int eapol_version
 
 	config_add_string 'auth_server:host' 'server:host'
@@ -392,7 +394,7 @@ hostapd_set_bss_options() {
 		wps_pushbutton wps_label ext_registrar wps_pbc_in_m1 wps_ap_setup_locked \
 		wps_independent wps_device_type wps_device_name wps_manufacturer wps_pin \
 		macfilter ssid utf8_ssid wmm uapsd hidden short_preamble rsn_preauth \
-		iapp_interface eapol_version dynamic_vlan ieee80211w nasid \
+		iapp_interface eapol_version dynamic_vlan ieee80211w ieee80211ai nasid \
 		acct_server acct_secret acct_port acct_interval \
 		bss_load_update_period chan_util_avg_period sae_require_mfp \
 		multi_ap multi_ap_backhaul_ssid multi_ap_backhaul_key \
