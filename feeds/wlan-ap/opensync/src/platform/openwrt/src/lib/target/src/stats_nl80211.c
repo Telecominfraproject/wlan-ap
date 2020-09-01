@@ -67,6 +67,25 @@ static int nl80211_chainmask_recv(struct nl_msg *msg, void *arg)
 	return NL_OK;
 }
 
+static int nl80211_interface_recv(struct nl_msg *msg, void *arg)
+{
+        struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+        struct nl_call_param *nl_call_param = (struct nl_call_param *)arg;
+        struct nlattr *tb[NL80211_ATTR_MAX + 1];
+        ssid_list_t *ssid_entry = NULL;
+
+        nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
+                  genlmsg_attrlen(gnlh, 0), NULL);
+
+	if ((tb[NL80211_ATTR_SSID]) && (tb[NL80211_ATTR_IFNAME])) {
+                ssid_entry = malloc(sizeof(ssid_list_t));
+                strncpy(ssid_entry->ssid, nla_data(tb[NL80211_ATTR_SSID]), sizeof(ssid_entry->ssid));
+                strncpy(ssid_entry->ifname, nla_data(tb[NL80211_ATTR_IFNAME]), sizeof(ssid_entry->ifname));
+                ds_dlist_insert_tail(nl_call_param->list, ssid_entry);
+        }
+        return NL_OK;
+}
+
 static int nl80211_assoclist_recv(struct nl_msg *msg, void *arg)
 {
 	static struct nla_policy stats_policy[NL80211_STA_INFO_MAX + 1] = {
@@ -116,9 +135,6 @@ static int nl80211_assoclist_recv(struct nl_msg *msg, void *arg)
 	client_entry = target_client_record_alloc();
 	client_entry->info.type = nl_call_param->type;
 	memcpy(client_entry->info.mac, nla_data(tb[NL80211_ATTR_MAC]), ETH_ALEN);
-	memcpy(client_entry->info.essid,
-	       nl_call_param->ifname,
-	       sizeof(client_entry->info.essid));
 
 	if (sinfo[NL80211_STA_INFO_TX_BYTES])
 		client_entry->stats.bytes_tx = nla_get_u32(sinfo[NL80211_STA_INFO_TX_BYTES]);
@@ -459,6 +475,16 @@ int nl80211_get_tx_chainmask(char *name, unsigned int *mask)
 		return -1;
 
 	return unl_genl_request(&unl, msg, nl80211_chainmask_recv, mask);
+}
+
+int nl80211_get_ssid(struct nl_call_param *nl_call_param)
+{
+       struct nl_msg *msg = nl80211_call_vif(nl_call_param, NL80211_CMD_GET_INTERFACE, true);
+
+        if (!msg)
+                return -1;
+
+        return unl_genl_request(&unl, msg, nl80211_interface_recv, nl_call_param);
 }
 
 int nl80211_get_assoclist(struct nl_call_param *nl_call_param)

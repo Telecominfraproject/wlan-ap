@@ -70,7 +70,7 @@ const struct blobmsg_policy opennds_policy[__NDS_ATTR_MAX] = {
 };
 
 struct blob_buf dnsmas={ };
-static struct uci_package *firewall;
+static struct uci_package *dhcp;
 static struct uci_context *dns;
 const struct uci_blob_param_list opennds_param = {
 	.n_params = __NDS_ATTR_MAX,
@@ -79,17 +79,11 @@ const struct uci_blob_param_list opennds_param = {
 
 enum {
 	DNS_ATTR_IPSET,
-	DNS_ATTR_NAME,
-	DNS_ATTR_STORAGE,
-	DNS_ATTR_MATCH,
 	__DNS_ATTR_MAX,
 };
 
 const struct blobmsg_policy dnsm_policy[__DNS_ATTR_MAX] = {
-	[DNS_ATTR_IPSET] = { .name = "entry", .type = BLOBMSG_TYPE_ARRAY },
-	[DNS_ATTR_NAME] = { .name = "name", .type = BLOBMSG_TYPE_STRING },
-	[DNS_ATTR_STORAGE] = { .name = "storage", .type = BLOBMSG_TYPE_STRING },
-	[DNS_ATTR_MATCH] = { .name = "match", .type = BLOBMSG_TYPE_STRING },
+	[DNS_ATTR_IPSET] = { .name = "ipset", .type = BLOBMSG_TYPE_ARRAY },
 };
 
 const struct uci_blob_param_list dnsm_param = {
@@ -102,29 +96,20 @@ void vif_state_dhcp_allowlist_get(struct schema_Wifi_VIF_State *vstate,struct uc
 	struct blob_attr *td[__DNS_ATTR_MAX] = { };
 	struct uci_element *e = NULL;
 
-	uci_load(dns, "firewall", &firewall);
-	LOGN("Hi DnsGet1 %x",(unsigned int)firewall);
-	uci_foreach_element(&firewall->sections, e) {
-		LOGN("Hi DNSGET2 :%x",(unsigned int)e);
+	uci_load(dns, "dhcp", &dhcp);
+	uci_foreach_element(&dhcp->sections, e) {
 		struct uci_section *ip_section = uci_to_section(e);
-		LOGN("%s:s->e.name",s->e.name);
-		LOGN("%s:cp_section->e.name",ip_section->e.name);
-		//if (!strcmp(cp_section->type,"opennds")){
 		if (!strcmp(s->e.name, ip_section->e.name)){
-			LOGN("%s:Hi Captive_Portal",ip_section->e.name);
 
 			blob_buf_init(&dnsmas, 0);
 			uci_to_blob(&dnsmas, ip_section, &dnsm_param);
 			if(blob_len(dnsmas.head)==0)
 			{
 				LOGN(":Hi Length Zero");
-				//return;
 			}
 			blobmsg_parse(dnsm_policy, __DNS_ATTR_MAX, td, blob_data(dnsmas.head), blob_len(dnsmas.head));
-			LOGN("Hi DNSGET3");
 
 			if (td[DNS_ATTR_IPSET]) {
-				LOGN("Hi NDSCONDTN");
 				struct blob_attr *cur = NULL;
 				int rem = 0;
 				vstate->captive_allowlist_len = 0;
@@ -132,15 +117,22 @@ void vif_state_dhcp_allowlist_get(struct schema_Wifi_VIF_State *vstate,struct uc
 					if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING)
 						continue;
 					strcpy(vstate->captive_allowlist[vstate->captive_allowlist_len], blobmsg_get_string(cur));
-					LOGN("%s: Hi MAC", (char*)vstate->captive_allowlist[vstate->captive_allowlist_len]);
+
 					vstate->captive_allowlist_len++;
 				}
 			}
 		}
 	}
-uci_unload(dns, firewall);
-LOGN("Hi DNSGETEND");
+uci_unload(dns, dhcp);
 return;
+}
+int ipset_create(char *ifname)
+{
+	char command[64];
+	char type[16] = "hash:ip";
+	char tail[32] = "ipset create set";
+	sprintf(command,"%s_%s %s", tail, ifname, type);
+	return (system(command));
 }
 void vif_dhcp_opennds_allowlist_set(const struct schema_Wifi_VIF_Config *vconf, char *ifname)
 {
@@ -148,19 +140,15 @@ void vif_dhcp_opennds_allowlist_set(const struct schema_Wifi_VIF_Config *vconf, 
 	blob_buf_init(&dnsmas, 0);
 	int i;
 	char ips[64];
-
-	blobmsg_add_string(&dnsmas, "name", "openset");
-	blobmsg_add_string(&dnsmas, "storage", "hash");
-	blobmsg_add_string(&dnsmas, "match", "dest_ip");
-	e = blobmsg_open_array(&dnsmas, "entry");
+	ipset_create(ifname);
+	e = blobmsg_open_array(&dnsmas, "ipset");
 	for (i = 0; i < vconf->captive_allowlist_len; i++)
 	{
-		strcpy(ips,(char*)vconf->captive_allowlist[i]);
+		sprintf(ips,"%s/%s_%s",(char*)vconf->captive_allowlist[i],"set",ifname);
 		blobmsg_add_string(&dnsmas, NULL,ips);
 	}
 	blobmsg_close_array(&dnsmas, e);
-
-	blob_to_uci_section(dns, "firewall", ifname, "ipset", dnsmas.head, &dnsm_param, NULL);
+	blob_to_uci_section(dns, "dhcp", ifname, "dnsmasq", dnsmas.head, &dnsm_param, NULL);
 	uci_commit_all(dns);
 	return;
 }
@@ -183,7 +171,6 @@ void set_captive_portal_state(struct schema_Wifi_VIF_State *vstate,
 		int *index, const char *key,
 		const char *value)
 {
-	LOGN("Hi Entering to Portal Options");
 	STRSCPY(vstate->captive_portal_keys[*index], key);
 	STRSCPY(vstate->captive_portal[*index], value);
 	*index += 1;
@@ -200,45 +187,26 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 	char timeout[32];
 	struct blob_attr *tc[__NDS_ATTR_MAX] = { };
 	struct uci_element *e = NULL;
-	//int length;
-
-
 
 	uci_load(cap_uci, "opennds", &opennds);
-	LOGN("Hi SGET1 %x",(unsigned int)opennds);
 	uci_foreach_element(&opennds->sections, e) {
-		LOGN("Hi SGET2 :%x",(unsigned int)e);
 		struct uci_section *cp_section = uci_to_section(e);
-		LOGN("%s:s->e.name",s->e.name);
-		LOGN("%s:cp_section->e.name",cp_section->e.name);
-		//if (!strcmp(cp_section->type,"opennds")){
 		if (!strcmp(s->e.name, cp_section->e.name)){
-			LOGN("%s:Hi Captive_Portal",cp_section->e.name);
 
 			blob_buf_init(&cap, 0);
 			uci_to_blob(&cap, cp_section, &opennds_param);
 			if(blob_len(cap.head)==0)
 			{
 				LOGN(":Hi Length Zero");
-				//return;
 			}
-			LOGN("Hi About to parse");
 			blobmsg_parse(opennds_policy, __NDS_ATTR_MAX, tc, blob_data(cap.head), blob_len(cap.head));
-			LOGN("Hi OptionsGet");
-			LOGN("Hi ForCNDTN1");
-
 			for (i = 0; i < SCHEMA_CAPTIVE_PORTAL_OPTS_MAX; i++) {
 				opt = captive_portal_options_table[i];
-				LOGN("Hi c_option: %s",opt);
 				if  (!strcmp(opt, "session_timeout"))
 				{
-					LOGN("Hi Val:%d",blobmsg_get_u32(tc[NDS_ATTR_SESSIONTIMEOUT]));
 					if (tc[NDS_ATTR_SESSIONTIMEOUT])
 					{
-						LOGN("Hi IN");
 						sprintf(timeout,"%d",blobmsg_get_u32(tc[NDS_ATTR_SESSIONTIMEOUT]));
-						LOGN("Hi Buff:%s",timeout);
-						LOGN("Hi INForCNDTNL %d",blobmsg_get_u32(tc[NDS_ATTR_SESSIONTIMEOUT]));
 						set_captive_portal_state(vstate, &index,
 								captive_portal_options_table[i],
 								timeout);
@@ -248,14 +216,12 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 					if(tc[NDS_ATTR_AUTHENTICATION]) {
 						buf = blobmsg_get_string(tc[NDS_ATTR_AUTHENTICATION]);
 						if (!strcmp(buf, "None")) {
-							LOGN("Hi OPENNDS1");
 							set_captive_portal_state(vstate, &index,
 									captive_portal_options_table[i],
 									buf);
 						}
 
 						else if (!strcmp(buf,"Captive Portal User List")) {
-							LOGN("Hi OPENNDS1");
 							set_captive_portal_state(vstate, &index,
 									captive_portal_options_table[i],
 									buf);
@@ -263,29 +229,22 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 					}
 				}
 				else if (strcmp(opt, "browser_title") == 0) {
-					LOGN("Hi Browse");
 					if (tc[NDS_ATTR_GATEWAYNAME]) {
-						LOGN("Hi BrowIN");
 						buf = blobmsg_get_string(tc[NDS_ATTR_GATEWAYNAME]);
-						LOGN("Hi BrowIN:%s",buf);
 						set_captive_portal_state(vstate, &index,
 								captive_portal_options_table[i],
 								buf);
 					}
 				} else if (strcmp(opt, "splash_page_logo") == 0) {
 					if (tc[NDS_ATTR_SPLASH_PAGE_LOGO]) {
-						LOGN("Hi SPLIN");
 						buf = blobmsg_get_string(tc[NDS_ATTR_SPLASH_PAGE_LOGO]);
-						LOGN("Hi BrowIN:%s",buf);
 						set_captive_portal_state(vstate, &index,
 								captive_portal_options_table[i],
 								buf);
 					}
 				} else if (strcmp(opt, "splash_page_background_logo") == 0) {
-					LOGN("Hi SPlashPageBackgrnd");
 					if (tc[NDS_ATTR_PAGE_BACKGROUND_LOGO]) {
 						buf = blobmsg_get_string(tc[NDS_ATTR_PAGE_BACKGROUND_LOGO]);
-						LOGN("Hi BackgrdLogo:%s",buf);
 						set_captive_portal_state(vstate, &index,
 								captive_portal_options_table[i],
 								buf);
@@ -298,10 +257,8 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 								buf);
 					}
 				}else if (strcmp(opt, "redirect_url") == 0) {
-					LOGN("Hi Redirect");
 					if (tc[NDS_ATTR_REDIRECT_URL]) {
 						buf = blobmsg_get_string(tc[NDS_ATTR_REDIRECT_URL]);
-						LOGN("Hi Redirect:%s",buf);
 						set_captive_portal_state(vstate, &index,
 								captive_portal_options_table[i],
 								buf);
@@ -309,7 +266,6 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 				}else if (strcmp(opt, "acceptance_policy") == 0) {
 					if (tc[NDS_ATTR_ACCEPTANCE_POLICY]) {
 						buf = blobmsg_get_string(tc[NDS_ATTR_ACCEPTANCE_POLICY]);
-						LOGN("Hi Acceptance:%s",buf);
 						set_captive_portal_state(vstate, &index,
 								captive_portal_options_table[i],
 								buf);
@@ -317,7 +273,6 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 				}else if (strcmp(opt, "login_success_text") == 0) {
 					if (tc[NDS_ATTR_LOGIN_SUCCESS_TEXT]) {
 						buf = blobmsg_get_string(tc[NDS_ATTR_LOGIN_SUCCESS_TEXT]);
-						LOGN("Hi login_success_text:%s",buf);
 						set_captive_portal_state(vstate, &index,
 								captive_portal_options_table[i],
 								buf);
@@ -327,7 +282,6 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 		}
 	}
 uci_unload(cap_uci, opennds);
-LOGN("Hi ENDG");
 return;
 }
 
@@ -351,8 +305,6 @@ void splash_page_logo(char* dest_file, char* src_url)
 	const char *keytype = "PEM";
 	char errbuf[CURL_ERROR_SIZE];
 	headerfile = fopen(pHeaderFile, "wb");
-	LOGN("url:%s",src_url);
-	LOGN("file_path:%s",dest_file);
 	imagefile = fopen(dest_file, "wb");
 	if(imagefile == NULL){
 		LOG(ERR, "fopen failed");
@@ -388,9 +340,8 @@ void splash_page_logo(char* dest_file, char* src_url)
 }
 void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *ifname)
 {
-	LOGN("Hi SET");
 	char value[255];
-	int j;
+	int j,i;
 	const char *opt;
 	const char *val;
 	blob_buf_init(&cap, 0);
@@ -401,16 +352,16 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 	sprintf(webroot,"/etc/opennds/htdocs");
 
 
-	/*struct blob_attr *e;
+	struct blob_attr *e;
 	e = blobmsg_open_array(&cap, "preauthenticated_users");
 
 	for(i=0;i<1;i++)
 	{
-		blobmsg_add_string(&cap, NULL, "allow tcp port 80 ipset openndsset");
-		blobmsg_add_string(&cap, NULL, "allow tcp port 443 ipset openndsset");
+		blobmsg_add_string(&cap, NULL, "allow tcp port 80 ipset set_wlan1");
+		blobmsg_add_string(&cap, NULL, "allow tcp port 443 ipset set_wlan1");
 
 	}
-	blobmsg_close_array(&cap, e);*/
+	blobmsg_close_array(&cap, e);
 
 	for (j = 0; j < SCHEMA_CAPTIVE_PORTAL_OPTS_MAX; j++) {
 		opt = captive_portal_options_table[j];
@@ -420,27 +371,20 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 			strncpy(value, "0", 255);
 		else
 			strncpy(value, val, 255);
-		LOGN("%s: Hi Options",value);
 
 		if (!strcmp(opt, "authentication")) {
-			blobmsg_add_u32(&cap, "enabled", 1);
 			blobmsg_add_string(&cap, "webroot",webroot);
 			//blobmsg_add_u32(&cap, "gatewayinterface",ifname);
 			if(strcmp(value,"None")==0) {
 				blobmsg_add_u32(&cap, "login_option_enabled", 1);
 				blobmsg_add_string(&cap, "authentication", value);
-				//blobmsg_add_string(&cap, "splashpage","splash.html");
-				//blobmsg_add_string(&cap, "binauth","");
+				blobmsg_add_u32(&cap, "enabled", 1);
 			}
 			else if(strcmp(value,"Captive Portal User List")==0) {
 				blobmsg_add_string(&cap, "authentication", value);
-				blobmsg_add_u32(&cap, "login_option_enabled", 0);
-				//blobmsg_add_string(&cap, "splashpage", "splash_sitewide.html");
-				//blobmsg_add_string(&cap, "binauth","/usr/lib/opennds/binauth_sitewide.sh");
 			}
 		}
 		else if (strcmp(opt, "session_timeout") == 0) {
-			LOGN("%lu: Hi InTVaL",strtoul(value,NULL,10));
 			blobmsg_add_u32(&cap, "sessiontimeout", strtoul(value,NULL,10));
 		}
 		else if (strcmp(opt, "browser_title") == 0) {
@@ -449,26 +393,21 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 		}
 
 		char file_path[128];
-		LOGN("path:%s",path);
 		struct stat st = {0};
 		if (stat(path, &st) == -1) {
 			mkdir(path, 0755);
 		}
 
 		else if (strcmp(opt, "splash_page_logo") == 0) {
-			LOGN("url:%s",value);
-			sprintf(file_path,"%s%s",path,"TipLogo.jpg");
+			sprintf(file_path,"%s%s",path,"TipLogo.png");
 			blobmsg_add_string(&cap, "splash_page_logo", value);
-			LOGN("file_path:%s",file_path);
 			splash_page_logo(file_path,value);
-			LOGN("file_path:%s",file_path);
 		}
 
 		else if (strcmp(opt, "splash_page_background_logo") == 0) {
-			sprintf(file_path,"%s%s",path,"TipBackLogo.jpg");
+			sprintf(file_path,"%s%s",path,"TipBackLogo.png");
 			blobmsg_add_string(&cap, "page_background_logo", value);
 			splash_page_logo(file_path,value);
-			LOGN("file_path:%s",file_path);
 		}
 		else if (strcmp(opt, "splash_page_title") == 0) {
 			blobmsg_add_string(&cap, "splash_page_title", value);
@@ -480,16 +419,13 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 		}
 		else if (strcmp(opt, "redirect_url") == 0) {
 			blobmsg_add_string(&cap, "redirectURL", value);
-
 		}
 		else if (strcmp(opt, "login_success_text") == 0) {
 			blobmsg_add_string(&cap, "login_success_text", value);
 
 		}
 	}
-	LOGN("Hi SETEND");
 	blob_to_uci_section(cap_uci, "opennds", ifname, "opennds", cap.head, &opennds_param, NULL);
-	LOGN("Hi SETEND:%s",ifname);
 	uci_commit_all(cap_uci);
 	return;
 }
