@@ -40,6 +40,7 @@ UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/ubus.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/utils.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/iface.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/vlan.c
+UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/captive.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/sysupgrade.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/dhcpdiscovery.c
 
@@ -61,4 +62,5 @@ UNIT_DEPS += src/lib/evsched
 UNIT_LDFLAGS += -luci
 UNIT_LDFLAGS += -libiwinfo
 UNIT_LDFLAGS += -libnl-tiny
+UNIT_LDFLAGS += -lcurl
 UNIT_DEPS_CFLAGS += src/lib/inet
