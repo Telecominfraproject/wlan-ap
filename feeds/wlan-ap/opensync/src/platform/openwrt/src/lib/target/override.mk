@@ -42,6 +42,7 @@ UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/iface.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/vlan.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/sysupgrade.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/dhcpdiscovery.c
+UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/radius_probe.c
 
 CONFIG_USE_KCONFIG=y
 CONFIG_INET_ETH_LINUX=y
@@ -61,4 +62,5 @@ UNIT_DEPS += src/lib/evsched
 UNIT_LDFLAGS += -luci
 UNIT_LDFLAGS += -libiwinfo
 UNIT_LDFLAGS += -libnl-tiny
+UNIT_LDFLAGS += -libradiusclient
 UNIT_DEPS_CFLAGS += src/lib/inet

@@ -377,8 +377,6 @@ int waitForResponse(
       }
       else
       {
-         fprintf(stderr,"no answer\n");
-
          return MESSAGE_NOT_RECEIVED;
       }
    }
