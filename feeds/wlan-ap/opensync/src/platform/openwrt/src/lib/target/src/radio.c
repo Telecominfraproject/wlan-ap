@@ -22,6 +22,7 @@
 #include "evsched.h"
 #include "uci.h"
 #include "utils.h"
+#include "captive.h"
 
 static struct uci_package *wireless;
 struct uci_context *uci;
@@ -295,6 +296,7 @@ bool target_radio_init(const struct target_radio_ops *ops)
 {
 	uci = uci_alloc_context();
 
+	captive_portal_init();
 	target_map_init();
 
 	target_map_insert("radio0", "phy0");

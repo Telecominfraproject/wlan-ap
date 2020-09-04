@@ -21,6 +21,7 @@
 #include "nl80211.h"
 #include "utils.h"
 #include "phy.h"
+#include "captive.h"
 
 #define MODULE_ID LOG_MODULE_ID_VIF
 #define UCI_BUFFER_SIZE 80
@@ -454,6 +455,8 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 
 	vif_state_security_get(&vstate, tb);
 	vif_state_custom_options_get(&vstate, tb);
+	vif_state_captive_portal_options_get(&vstate,s);
+	vif_state_dhcp_allowlist_get(&vstate,s);
 
 	if (vconf) {
 		LOGN("%s: updating vif config", radio);
@@ -582,6 +585,14 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 		vlan_add((char *)vconf->if_name, vid, !strcmp(vconf->bridge, "wan"));
 	else
 		vlan_del((char *)vconf->if_name);
+
+	if (changed->captive_portal)
+			vif_captive_portal_set(vconf,(char*)vconf->if_name);
+
+	if(changed->captive_allowlist)
+	{
+			vif_dhcp_opennds_allowlist_set(vconf,(char*)vconf->if_name);
+	}
 
 	reload_config = 1;
 
