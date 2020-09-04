@@ -20,6 +20,7 @@
 #include "target.h"
 #include "nl80211.h"
 #include "utils.h"
+#include "vif.h"
 
 static struct mode_map mode_map[] = {
 	{ 0, "11b", "11b", NULL, "NOHT" },
@@ -453,4 +454,29 @@ int ieee80211_channel_to_frequency(int chan)
 	else
 		return 5000 + chan * 5;
 	return 0;
+}
+
+bool vif_get_security(struct schema_Wifi_VIF_State *vstate,  char *mode,  char *encryption, char *radiusServerIP,  char *password, char *port)
+{
+	int i=0;
+
+	if(NULL == vstate->security)
+	return false;
+
+	strcpy(encryption, vstate->security[i]);
+	i++;
+	strcpy(password, vstate->security[i]);
+	i++;
+	strcpy(mode, vstate->security[i]);
+	i++;
+	if(!strcmp(encryption, OVSDB_SECURITY_ENCRYPTION_WPA_EAP))
+	{
+		strcpy(radiusServerIP, vstate->security[i]);
+		i++;
+		strcpy(port, vstate->security[i]);
+		i++;
+	}
+
+	return true;
+
 }
