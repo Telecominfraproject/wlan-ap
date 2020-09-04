@@ -15,7 +15,7 @@ include $(INCLUDE_DIR)/package.mk
 define Package/opensync
 	CATEGORY:=Network
 	TITLE:=cloud network management system
-	DEPENDS:=+libev +jansson +protobuf +libprotobuf-c +libmosquitto +libopenssl +openvswitch +libpcap +libuci +libcurl +libnl-tiny +libubus +libblobmsg-json +tcpdump +curl +lldpd +wlan-ap-keys
+	DEPENDS:=+libev +jansson +protobuf +libprotobuf-c +libmosquitto +libopenssl +openvswitch +libpcap +libuci +libcurl +libnl-tiny +libubus +libblobmsg-json +tcpdump +curl +lldpd +wlan-ap-keys +libradiusclient
 endef
 
 define Package/opensync/description
