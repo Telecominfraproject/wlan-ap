@@ -54,7 +54,6 @@ CONFIG_INET_DHCPC_NULL=y
 CONFIG_INET_DHCPS_NULL=y
 CONFIG_INET_UPNP_NULL=y
 CONFIG_INET_DNS_NULL=y
-CONFIG_INET_DHSNIFF_NULL=y
 
 UNIT_SRC := $(filter-out src/target_inet.c,$(UNIT_SRC))
 UNIT_SRC := $(filter-out src/target_dhcp.c,$(UNIT_SRC))
