@@ -191,33 +191,53 @@ bool target_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
 			     target_stats_survey_cb_t *survey_cb,
 			     ds_dlist_t *survey_list, void *survey_ctx)
 {
+	ds_dlist_t raw_survey_list = DS_DLIST_INIT(target_survey_record_t, node);
+	target_survey_record_t *survey;
 	struct nl_call_param nl_call_param = {
 		.ifname = radio_cfg->if_name,
 		.type = radio_cfg->type,
-		.list = survey_list,
+		.list = &raw_survey_list,
 	};
 	bool ret = true;
 
 	if (nl80211_get_survey(&nl_call_param) < 0)
 		ret = false;
-	LOGT("%s: survey returned %d, list %d", radio_cfg->if_name, ret, ds_dlist_is_empty(survey_list));
+	LOGT("%s: survey returned %d, list %d", radio_cfg->if_name, ret, ds_dlist_is_empty(&raw_survey_list));
+	while (!ds_dlist_is_empty(&raw_survey_list)) {
+		survey = ds_dlist_head(&raw_survey_list);
+		ds_dlist_remove(&raw_survey_list, survey);
+		LOGI("Survey entry dur %d busy %d tx %d rx %d chan %d active %d type %d",
+			survey->duration_ms, survey->chan_busy, survey->chan_tx, survey->chan_rx, survey->info.chan, survey->chan_active, scan_type);
+		if ((scan_type == RADIO_SCAN_TYPE_ONCHAN) && (survey->info.chan == chan_list[0])) {
+                	ds_dlist_insert_tail(survey_list, survey);
+		} else if ((scan_type != RADIO_SCAN_TYPE_ONCHAN) && (survey->duration_ms != 0)) {
+			ds_dlist_insert_tail(survey_list, survey);
+		} else {
+			target_survey_record_free(survey);
+			survey = NULL;
+		}
+	}
+
 	(*survey_cb)(survey_list, survey_ctx, ret);
 
 	return ret;
 }
 
+#define PERCENT(v1, v2) (v2 > 0 ? (v1*100/v2) : 0)
+
 bool target_stats_survey_convert(radio_entry_t *radio_cfg, radio_scan_type_t scan_type,
 				 target_survey_record_t *data_new, target_survey_record_t *data_old,
 				 dpp_survey_record_t *survey_record)
 {
+	LOGI("Survey convert scan_type %d chan %d", scan_type, data_new->info.chan);
 	survey_record->info.chan     = data_new->info.chan;
-	survey_record->chan_tx       = data_new->chan_tx;
-	survey_record->chan_self     = data_new->chan_self;
-	survey_record->chan_rx       = data_new->chan_rx;
-	survey_record->chan_busy_ext = data_new->chan_busy_ext;
+	survey_record->chan_tx       = PERCENT(data_new->chan_tx, data_new->duration_ms);
+	survey_record->chan_self     = PERCENT(data_new->chan_self, data_new->duration_ms);
+	survey_record->chan_rx       = PERCENT(data_new->chan_rx, data_new->duration_ms);
+	survey_record->chan_busy_ext = PERCENT(data_new->chan_busy_ext, data_new->duration_ms);
+	survey_record->chan_busy     = PERCENT(data_new->chan_busy, data_new->duration_ms);
+	survey_record->chan_noise    = data_new->chan_noise;
 	survey_record->duration_ms   = data_new->duration_ms;
-	survey_record->chan_busy     = data_new->chan_busy;
-	survey_record->chan_noise     = data_new->chan_noise;
 
 	return true;
 }
