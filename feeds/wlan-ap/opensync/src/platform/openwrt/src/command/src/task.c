@@ -78,6 +78,7 @@ void task_status(struct task *task, int status, char *result)
 	state.cmd_uuid_exists = true;
 	state.cmd_uuid_present = true;
 	SCHEMA_SET_INT(state.timestamp, task->conf.timestamp);
+	SCHEMA_SET_STR(state.command, task->conf.command);
 	if (result) {
 		STRSCPY(state.result_keys[0], "error");
 	        STRSCPY(state.result[0], result);
