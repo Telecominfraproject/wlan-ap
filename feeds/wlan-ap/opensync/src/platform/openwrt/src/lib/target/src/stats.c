@@ -36,8 +36,14 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <curl/curl.h>
 #include <time.h>
 #include "dhcpdiscovery.h"
+#include "vif.h"
 
+#define U_P_LEN 30
 #define NUM_MAX_CLIENTS 10
+#define MAX_IP_ADDR_LEN 16
+#define MAX_PWD_LEN 65
+#define MAX_ENCRYPTION_LEN 8
+#define MAX_MODE_LEN 6
 
 /*****************************************************************************
  *  INTERFACE definitions
@@ -339,12 +345,11 @@ bool target_stats_network_probe_get(dpp_network_probe_record_t *network_probe_re
 {
 	int ret = 0;
 	char server[] = "8.8.8.8";
-
+	long long int begin, end;
 	/* DNS probe */
 
 	CURL *curl = curl_easy_init();
-	time_t begin = time(NULL), end;
-
+	begin = get_timestamp();
 	if (curl) {
 		curl_easy_setopt(curl, CURLOPT_URL, "http://www.google.com");
 		curl_easy_setopt(curl, CURLOPT_DNS_SERVERS, "8.8.8.8");
@@ -352,7 +357,7 @@ bool target_stats_network_probe_get(dpp_network_probe_record_t *network_probe_re
 		curl_easy_cleanup(curl);
 	}
 
-	end = time(NULL);
+	end = get_timestamp();
 
 	network_probe_report->dns_probe.latency = (end - begin);
 	memcpy(network_probe_report->dns_probe.serverIP , server, strlen(server));
@@ -368,7 +373,7 @@ bool target_stats_network_probe_get(dpp_network_probe_record_t *network_probe_re
 	/* DHCP probe */
 	char ifname[] = "br-wan";
 
-	begin = time(NULL);
+	begin = get_timestamp();
 
 	if(generateQuery(ifname)) {
 		LOGT("dhcp resolved\n");
@@ -377,7 +382,7 @@ bool target_stats_network_probe_get(dpp_network_probe_record_t *network_probe_re
 		LOGT("dhcp not resolved\n");
 		network_probe_report->vlan_probe.dhcpState = 0;
 	}
-	end = time(NULL);
+	end = get_timestamp();
 	network_probe_report->vlan_probe.dhcpLatency = (end - begin);
 	memcpy(network_probe_report->vlan_probe.vlanIF , ifname, strlen(ifname));
 	LOGT("dhcp latency : %d \n", network_probe_report->vlan_probe.dhcpLatency);
@@ -385,6 +390,37 @@ bool target_stats_network_probe_get(dpp_network_probe_record_t *network_probe_re
 	return true;
 }
 
+bool target_stats_radius_probe_get(struct schema_Wifi_VIF_State    schema, dpp_radius_metrics_t *radius_probe_report)
+{
+	char mode[MAX_MODE_LEN];
+	char encryption[MAX_ENCRYPTION_LEN];
+	char radiusServerIP[MAX_IP_ADDR_LEN];
+	char password[U_P_LEN];
+	char port[5];
+	int  portNum;
+	long long int begin, end;
+
+	LOG(INFO,"RADIUS PROBE\n ");
+
+	if(!vif_get_security(&schema, mode, encryption, radiusServerIP, password, port))
+	return false;
+
+	if(strcmp(encryption, OVSDB_SECURITY_ENCRYPTION_WPA_EAP))
+	return false;
+
+	strcpy(radius_probe_report->serverIP, radiusServerIP);
+	portNum = atoi(port);
+
+	begin = get_timestamp();
+	if(radius_probe(radiusServerIP, password, portNum)){
+		radius_probe_report->radiusState = 1;
+	} else {
+	radius_probe_report->radiusState = 0;
+	}
+	end = get_timestamp();
+	radius_probe_report->latency = end - begin;
+	return true;
+}
 
 /******************************************************************************
  *  CAPACITY definitions
