@@ -60,7 +60,11 @@ target_managers_config_t target_managers_config[] =
 	}, {
 		.name = TARGET_MANAGER_PATH("um"),
 		.needs_plan_b = false,
+	}, {
+		.name = TARGET_MANAGER_PATH("uccm"),
+		.needs_plan_b = true,
 	},
+
 };
 
 int target_managers_num = ARRAY_SIZE(target_managers_config);
