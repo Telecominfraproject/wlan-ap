@@ -195,10 +195,6 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 
 			blob_buf_init(&cap, 0);
 			uci_to_blob(&cap, cp_section, &opennds_param);
-			if(blob_len(cap.head)==0)
-			{
-				LOGN(":Hi Length Zero");
-			}
 			blobmsg_parse(opennds_policy, __NDS_ATTR_MAX, tc, blob_data(cap.head), blob_len(cap.head));
 			for (i = 0; i < SCHEMA_CAPTIVE_PORTAL_OPTS_MAX; i++) {
 				opt = captive_portal_options_table[i];

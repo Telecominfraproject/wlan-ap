@@ -173,9 +173,9 @@ if [ ! -z "$status_present" ]; then
 elif [ -z "$hid_present" ]; then
 	hid="0"
 	gatewayaddress="0"
-	queryvarlist="clientip gatewayname splashpagetitle acceptancepolicy loginsuccesstext redir username"
+	queryvarlist="clientip gatewayname splashpagetitle acceptancepolicy loginsuccesstext redirecturl redir username"
 else
-	queryvarlist="clientip gatewayname hid splashpagetitle acceptancepolicy loginsuccesstext gatewayaddress redir username"
+	queryvarlist="clientip gatewayname hid splashpagetitle acceptancepolicy loginsuccesstext gatewayaddress redirecturl redir username"
 fi
 
 for var in $queryvarlist; do
@@ -279,6 +279,7 @@ login_form="
 	<input type=\"hidden\" name=\"acceptancepolicy\" value=\"$acceptancepolicyhtml\">
 	<input type=\"hidden\" name=\"loginsuccesstext\" value=\"$loginsuccesstexthtml\">
 	<input type=\"hidden\" name=\"gatewayaddress\" value=\"$gatewayaddress\">
+	<input type=\"hidden\" name=\"redirecturl\" value=\"$redirecturlhtml\">  
 	<input type=\"hidden\" name=\"redir\" value=\"$requested\">
 	<input type=\"text\" name=\"username\" value=\"$usernamehtml\" autocomplete=\"on\" ><br>Name<br><hr>
 	<input type="submit" value="Continue"><br><hr>
@@ -340,7 +341,7 @@ else
 	# the client user continues, so now is the time to deliver your message.
 
 	echo "<big-red>Thankyou $username!</big-red>"
-	echo "<med-blue><br><b>$loginsuccesstext</b>"
+	echo "<med-blue><br><b>$loginsuccesstexthtml</b>"
 
 	# Add your message here:
 	# You could retrieve text or images from a remote server using wget or curl
@@ -349,6 +350,7 @@ else
 	# You can also send a custom data string to BinAuth. Set the variable $custom to the desired value
 	# Max length 256 characters
 	custom="Custom data sent to BinAuth"
+	requested="$redirecturl"
 
 	echo "<form action=\"/opennds_auth/\" method=\"get\">"
 	echo "<input type=\"hidden\" name=\"tok\" value=\"$tok\">"
