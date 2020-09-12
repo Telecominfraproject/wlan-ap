@@ -227,6 +227,21 @@ bool netifd_dhcp_lease_notify(
 	sdl.vendor_class_exists = true;
 	strscpy(sdl.vendor_class, dl->dl_vendorclass, sizeof(sdl.vendor_class));
 
+	sdl.subnet_mask_exists = true;
+	snprintf(sdl.subnet_mask, sizeof(sdl.subnet_mask), PRI_osn_ip_addr, FMT_osn_ip_addr(dl->dl_subnetmask));
+
+	sdl.gateway_exists = true;
+	snprintf(sdl.gateway, sizeof(sdl.gateway), PRI_osn_ip_addr, FMT_osn_ip_addr(dl->dl_gateway));
+
+	sdl.dhcp_server_exists = true;
+	snprintf(sdl.dhcp_server, sizeof(sdl.dhcp_server), PRI_osn_ip_addr, FMT_osn_ip_addr(dl->dl_dhcpserver));
+
+	sdl.primary_dns_exists = true;
+	snprintf(sdl.primary_dns, sizeof(sdl.primary_dns), PRI_osn_ip_addr, FMT_osn_ip_addr(dl->dl_primarydns));
+
+	sdl.secondary_dns_exists = true;
+	snprintf(sdl.secondary_dns, sizeof(sdl.secondary_dns), PRI_osn_ip_addr, FMT_osn_ip_addr(dl->dl_secondarydns));
+
 	/* A lease time of 0 indicates that this entry should be deleted */
 	sdl.lease_time_exists = true;
 	if (released) {
