@@ -2,21 +2,10 @@
 
 #include "netifd.h"
 #include "inet_conf.h"
+#include "dhcp_fingerprint.h"
 #include "ovsdb_sync.h"
 #include "json_util.h"
 
-/*
- * WAR: Never populate DHCP_leased_IP with duplicate MAC entries, even if they
- * exists in /tmp/dhcp.leases. In case there are two entries with the same MAC
- * address, update DHCP_leased_IP with the most recent one.
- */
-#define WAR_LEASE_UNIQUE_MAC
-
-// Defines
-#define MODULE_ID LOG_MODULE_ID_MAIN
-
-
-#if defined(WAR_LEASE_UNIQUE_MAC)
 #include "ds_tree.h"
 #include "synclist.h"
 
@@ -24,6 +13,7 @@
 struct dhcp_lease_node
 {
 	struct osn_dhcp_server_lease    dl_lease;   /* Lease data */
+	dhcp_fp_data_t                  dl_fp_data; /* Fingerprint decode results */
 	bool                            dl_sync;    /* Present on synclist */
 	bool                            dl_updated; /* Update pending */
 	ds_tree_node_t                  dl_tnode;   /* tree node */
@@ -38,7 +28,8 @@ static ds_key_cmp_t osn_dhcp_server_lease_cmp;
 static bool __netifd_dhcp_lease_notify(
 		void *data,
 		bool released,
-		struct osn_dhcp_server_lease *dl);
+		struct osn_dhcp_server_lease *dl,
+		dhcp_fp_data_t *fp_data);
 
 /* ds_tree comparator */
 int osn_dhcp_server_lease_cmp(void *_a, void *_b)
@@ -78,7 +69,7 @@ void *osn_dhcp_server_lease_sync(synclist_t *sync, void *_old, void *_new)
 		pnew->dl_sync = true;
 
 		/* Call the original lease handler */
-		__netifd_dhcp_lease_notify(dhcp_lease_synclist_data, false, &pnew->dl_lease);
+		__netifd_dhcp_lease_notify(dhcp_lease_synclist_data, false, &pnew->dl_lease, &pnew->dl_fp_data);
 
 		return _new;
 	}
@@ -86,7 +77,7 @@ void *osn_dhcp_server_lease_sync(synclist_t *sync, void *_old, void *_new)
 		pold->dl_sync = false;
 
 		/* Call the original lease handler */
-		__netifd_dhcp_lease_notify(dhcp_lease_synclist_data, true, &pold->dl_lease);
+		__netifd_dhcp_lease_notify(dhcp_lease_synclist_data, true, &pold->dl_lease, &pold->dl_fp_data);
 
 		/* Element removal */
 		return NULL;
@@ -103,7 +94,7 @@ void *osn_dhcp_server_lease_sync(synclist_t *sync, void *_old, void *_new)
 	 */
 	if (pold->dl_updated) {
 		pold->dl_updated = false;
-		__netifd_dhcp_lease_notify(dhcp_lease_synclist_data, false, &pold->dl_lease);
+		__netifd_dhcp_lease_notify(dhcp_lease_synclist_data, false, &pold->dl_lease, &pold->dl_fp_data);
 	}
 
 	return pold;
@@ -155,6 +146,7 @@ bool netifd_dhcp_lease_notify(
 	else if (node == NULL) {
 		node = calloc(1, sizeof(struct dhcp_lease_node));
 		node->dl_lease = *dl;
+		dhcp_fp_db_lookup(&node->dl_fp_data, dl->dl_fingerprint);
 		ds_tree_insert(&dhcp_lease_list, node, &node->dl_lease);
 	}
 	else {
@@ -181,17 +173,9 @@ bool netifd_dhcp_lease_notify(
 bool __netifd_dhcp_lease_notify(
 		void *data,
 		bool released,
-		struct osn_dhcp_server_lease *dl)
+		struct osn_dhcp_server_lease *dl,
+		dhcp_fp_data_t *fp_data)
 
-#else
-/*
- * This callback is called by libinet whenever a new DHCP lease is detected.
- */
-bool netifd_dhcp_lease_notify(
-		void *data,
-		bool released,
-		struct osn_dhcp_server_lease *dl)
-#endif
 {
 	(void)data;
 
@@ -241,6 +225,18 @@ bool netifd_dhcp_lease_notify(
 
 	sdl.secondary_dns_exists = true;
 	snprintf(sdl.secondary_dns, sizeof(sdl.secondary_dns), PRI_osn_ip_addr, FMT_osn_ip_addr(dl->dl_secondarydns));
+
+	sdl.db_status_exists = true;
+	sdl.db_status = fp_data->db_status;
+
+	sdl.device_name_exists = true;
+	strscpy(sdl.device_name, fp_data->device_name, sizeof(sdl.device_name));
+
+	sdl.device_type_exists = true;
+	sdl.device_type = fp_data->device_type;
+
+	sdl.manuf_id_exists = true;
+	sdl.manuf_id = fp_data->manuf_id;
 
 	/* A lease time of 0 indicates that this entry should be deleted */
 	sdl.lease_time_exists = true;
