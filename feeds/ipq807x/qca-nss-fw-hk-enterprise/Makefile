@@ -23,7 +23,7 @@ define NssFirmware
     SECTION:=kernel
     CATEGORY:=Kernel modules
     SUBMENU:=Network Devices
-    DEPENDS:=@TARGET_ipq807x_ipq807x
+    DEPENDS:=@TARGET_ipq807x_ipq807x||TARGET_ipq807x_ipq60xx
     TITLE:=NSS firmware binaries - $(1)
     PROVIDES:=$(PKG_NAME)
     MENU:=1
