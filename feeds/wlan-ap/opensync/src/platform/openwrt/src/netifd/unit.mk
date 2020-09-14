@@ -12,6 +12,7 @@ UNIT_SRC    += src/main.c
 UNIT_SRC    += src/dhcp_lease.c
 UNIT_SRC    += src/inet_iface.c
 UNIT_SRC    += src/inet_conf.c
+UNIT_SRC    += src/dhcp_fingerprint.c
 
 UNIT_CFLAGS := -I$(UNIT_PATH)/inc
 UNIT_CFLAGS += -Isrc/lib/common/inc/
