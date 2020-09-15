@@ -63,6 +63,7 @@ enum {
 	WIF_ATTR_IEEE80211V,
 	WIF_ATTR_BSS_TRANSITION,
 	WIF_ATTR_DISABLE_EAP_RETRY,
+	WIF_ATTR_IEEE80211K,
 	__WIF_ATTR_MAX,
 };
 
@@ -101,6 +102,7 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_IEEE80211V] = { .name = "ieee80211v", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_BSS_TRANSITION] = { .name = "bss_transition", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_DISABLE_EAP_RETRY] = { .name = "wpa_disable_eapol_key_retries", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_IEEE80211K] = { .name = "ieee80211k", BLOBMSG_TYPE_BOOL },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -216,7 +218,8 @@ out_none:
 
 /* Custom options table */
 #define SCHEMA_CUSTOM_OPT_SZ            20
-#define SCHEMA_CUSTOM_OPTS_MAX          5
+#define SCHEMA_CUSTOM_OPTS_MAX          6
+#define SCHEMA_CONSTS_IEEE80211k        "ieee80211k"
 
 const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 {
@@ -224,7 +227,8 @@ const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 	SCHEMA_CONSTS_RATE_DL,
 	SCHEMA_CONSTS_RATE_UL,
 	SCHEMA_CONSTS_CLIENT_RATE_DL,
-	SCHEMA_CONSTS_CLIENT_RATE_UL
+	SCHEMA_CONSTS_CLIENT_RATE_UL,
+	SCHEMA_CONSTS_IEEE80211k,
 };
 
 static void vif_config_custom_opt_set(struct blob_buf *b,
@@ -249,6 +253,12 @@ static void vif_config_custom_opt_set(struct blob_buf *b,
 				blobmsg_add_bool(b, "rlimit", 1);
 			else if (strcmp(value, "0") == 0)
 				blobmsg_add_bool(b, "rlimit", 0);
+		}
+		else if (strcmp(opt, "ieee80211k") == 0) {
+			if (strcmp(value, "1") == 0)
+				blobmsg_add_bool(b, "ieee80211k", 1);
+			else if (strcmp(value, "0") == 0)
+				blobmsg_add_bool(b, "ieee80211k", 0);
 		}
 		else if (strcmp(opt, "ssid_ul_limit") == 0)
 			blobmsg_add_string(b, "urate", value);
@@ -285,6 +295,18 @@ static void vif_state_custom_options_get(struct schema_Wifi_VIF_State *vstate,
 		if (strcmp(opt, "rate_limit_en") == 0) {
 			if (tb[WIF_ATTR_RATELIMIT]) {
 				if (blobmsg_get_bool(tb[WIF_ATTR_RATELIMIT])) {
+					set_custom_option_state(vstate, &index,
+								custom_options_table[i],
+								"1");
+				} else {
+					set_custom_option_state(vstate, &index,
+								custom_options_table[i],
+								"0");
+				}
+			}
+		} else if (strcmp(opt, "ieee80211k") == 0) {
+			if (tb[WIF_ATTR_IEEE80211K]) {
+				if (blobmsg_get_bool(tb[WIF_ATTR_IEEE80211K])) {
 					set_custom_option_state(vstate, &index,
 								custom_options_table[i],
 								"1");
