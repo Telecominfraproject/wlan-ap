@@ -340,7 +340,7 @@ else
 	# Be aware that many devices will close the login browser as soon as
 	# the client user continues, so now is the time to deliver your message.
 
-	echo "<big-red>Thankyou $username!</big-red>"
+	echo "<big-red>Thank you $username!</big-red>"
 	echo "<med-blue><br><b>$loginsuccesstexthtml</b>"
 
 	# Add your message here:
