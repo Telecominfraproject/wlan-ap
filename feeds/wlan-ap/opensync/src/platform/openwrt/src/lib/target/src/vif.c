@@ -274,10 +274,10 @@ static void vif_config_custom_opt_set(struct blob_buf *b,
 			blobmsg_add_string(b, "cdrate", value);
 		else if (strcmp(opt, "client_ul_limit") == 0)
 			blobmsg_add_string(b, "curate", value);
-                else if (strcmp(opt, "rts_threshold") == 0)
-                        blobmsg_add_string(b, "rts_threshold", value);
-                else if (strcmp(opt, "dtim_period") == 0)
-                        blobmsg_add_string(b, "dtim_period", value);
+		else if (strcmp(opt, "rts_threshold") == 0)
+			blobmsg_add_string(b, "rts_threshold", value);
+		else if (strcmp(opt, "dtim_period") == 0)
+			blobmsg_add_string(b, "dtim_period", value);
 
 	}
 }
@@ -356,20 +356,20 @@ static void vif_state_custom_options_get(struct schema_Wifi_VIF_State *vstate,
 							buf);
 			}
 		} else if (strcmp(opt, "rts_threshold") == 0) {
-                        if (tb[WIF_ATTR_RTS_THRESHOLD]) {
-                                buf = blobmsg_get_string(tb[WIF_ATTR_RTS_THRESHOLD]);
-                                set_custom_option_state(vstate, &index,
-                                                        custom_options_table[i],
-                                                        buf);
-                        }
-                } else if (strcmp(opt, "dtim_period") == 0) {
-                        if (tb[WIF_ATTR_DTIM_PERIOD]) {
-                                buf = blobmsg_get_string(tb[WIF_ATTR_DTIM_PERIOD]);
-                                set_custom_option_state(vstate, &index,
-                                                        custom_options_table[i],
-                                                        buf);
-                        }
-                }
+			if (tb[WIF_ATTR_RTS_THRESHOLD]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_RTS_THRESHOLD]);
+				set_custom_option_state(vstate, &index,
+						custom_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "dtim_period") == 0) {
+			if (tb[WIF_ATTR_DTIM_PERIOD]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_DTIM_PERIOD]);
+				set_custom_option_state(vstate, &index,
+						custom_options_table[i],
+						buf);
+			}
+		}
 
 	}
 }
@@ -500,11 +500,10 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 			vstate.mac_list_len++;
 		}
 	}
-
 	vif_state_security_get(&vstate, tb);
 	vif_state_custom_options_get(&vstate, tb);
-	vif_state_captive_portal_options_get(&vstate,s);
-	vif_state_dhcp_allowlist_get(&vstate,s);
+	vif_state_captive_portal_options_get(&vstate, s);
+	vif_state_dhcp_allowlist_get(&vstate);
 
 	if (vconf) {
 		LOGN("%s: updating vif config", radio);

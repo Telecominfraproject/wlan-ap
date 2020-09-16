@@ -37,8 +37,37 @@ logname="ndslog.log"
 #logdir="/run/ndslog/"
 #logname="ndslog.log"
 
+#For logging
+ndspid=$(ps | grep '/usr/bin/opennds' | awk -F ' ' 'NR==2 {print $1}')
 
 # functions:
+validate_client() {
+	#Add your custom client validation here
+	#For example check all the clent entered data against a database
+	# we have:
+	# $username, $phone, $emailaddr, $addr, $code
+	#
+	# Return either 0 if validation successful or 1 if not
+	userlist="/etc/opennds/htdocs/images/wlan1/userpass.dat"
+	varlist="username password Firstname Lastname"
+
+	while read user; do
+
+		for var in $varlist; do
+			nextvar=$(echo "$varlist" | awk '{for(i=1;i<=NF;i++) if ($i=="'$var'") printf $(i+1)}')
+			eval $var=$(echo "$user" | awk -F "$var=" '{print $2}' | awk -F ", $nextvar=" '{print $1}')
+		done
+		if [ "$username" = "$1" -a "$password" = "$2" ]; then
+			exit_code=0
+			break
+		else
+			exit_code=1
+		fi
+
+	done < $userlist
+	
+return $exit_code
+}
 
 htmlentityencode() {
 	entitylist="s/\"/\&quot;/ s/>/\&gt;/ s/</\&lt;/"
@@ -92,13 +121,13 @@ write_log () {
 		echo "$datetime, New log file created" > $logfile
 	fi
 
-	ndspid=$(ps | grep opennds | awk -F ' ' 'NR==2 {print $1}')
 	filesize=$(ls -s -1 $logfile | awk -F' ' '{print $1}')
 	available=$(df | grep "$mountpoint" | eval "$awkcmd")
 	sizeratio=$(($available/$filesize))
 
 	if [ $sizeratio -ge $min_freespace_to_log_ratio ]; then
-		clientinfo="username=$username, macaddress=$clientmac, clientzone=$client_zone, useragent=$user_agent"
+		userinfo="username=$username, password=$password"
+		clientinfo="macaddress=$clientmac, clientzone=$client_zone, useragent=$user_agent"
 		echo "$datetime, $userinfo, $clientinfo" >> $logfile
 	else
 		echo "PreAuth - log file too big, please archive contents" | logger -p "daemon.err" -s -t "opennds[$ndspid]: "
@@ -106,7 +135,7 @@ write_log () {
 }
 
 # Get the urlencoded querystring and user_agent
-query_enc="$1"
+query_enc=$(echo "$1" | sed "s/%3f/%20/")
 user_agent_enc="$2"
 
 # The query string is sent to us from NDS in a urlencoded form,
@@ -157,6 +186,7 @@ user_agent=$(printf "${user_agent_enc//%/\\x}")
 #
 # Additional variables returned by NDS will be those we define here and send to NDS via an
 # html form method=get
+# See the examples here for $username and $emailaddress
 #
 # There is no limit to the number of variables we can define dynamically
 # as long as the query string does not exceed 2048 bytes.
@@ -173,20 +203,17 @@ if [ ! -z "$status_present" ]; then
 elif [ -z "$hid_present" ]; then
 	hid="0"
 	gatewayaddress="0"
-	queryvarlist="clientip gatewayname splashpagetitle acceptancepolicy loginsuccesstext redirecturl redir username"
+	queryvarlist="clientip gatewayname splashpagetitle acceptancepolicy loginsuccesstext redirecturl redir username password"
 else
-	queryvarlist="clientip gatewayname hid splashpagetitle acceptancepolicy loginsuccesstext gatewayaddress redirecturl redir username"
+	queryvarlist="clientip gatewayname hid splashpagetitle acceptancepolicy loginsuccesstext redirecturl redir gatewayaddress username password"
 fi
 
 for var in $queryvarlist; do
 	nextvar=$(echo "$queryvarlist" | awk '{for(i=1;i<=NF;i++) if ($i=="'$var'") printf $(i+1)}')
-	eval $var=$(echo "$query_enc" | awk -F "$var%3d" '{print $2}' | awk -F "%2c%20$nextvar%3d" '{print $1}')
+	eval $var=$(echo "$query_enc" | awk -F "%20$var%3d" '{print $2}' | awk -F "%2c%20$nextvar%3d" '{print $1}')
 done
 
 # URL decode and htmlentity encode vars that need it:
-#gatewayname=$(printf "${gatewayname//%/\\x}")
-#htmlentityencode "$gatewayname"
-#gatewaynamehtml=$entityencoded
 
 splashpagetitle=$(printf "${splashpagetitle//%/\\x}")                                                       
 htmlentityencode "$splashpagetitle"                   
@@ -196,20 +223,32 @@ acceptancepolicy=$(printf "${acceptancepolicy//%/\\x}")
 htmlentityencode "$acceptancepolicy"                                                 
 acceptancepolicyhtml=$entityencoded   
 
+browsertitle=$(printf "${browsertitle//%/\\x}")                            
+htmlentityencode "$browsertitle"                                                 
+browsertitlehtml=$entityencoded   
+
 loginsuccesstext=$(printf "${loginsuccesstext//%/\\x}")                                                                                        
 htmlentityencode "$loginsuccesstext"                                                                                                   
 loginsuccesstexthtml=$entityencoded
 
-username=$(printf "${username//%/\\x}")                                            
-htmlentityencode "$username"                                                         
-usernamehtml=$entityencoded 
+redirecturl=$(printf "${redirecturl//%/\\x}")
+htmlentityencode "$redirecturl"
+redirecturlhtml=$entityencoded
 
-gatewayname=$(printf "${gatewayname//%/\\x}")                                                                                 
-htmlentityencode "$gatewayname"                                                                                               
-gatewaynamehtml=$entityencoded  
+gatewayname=$(printf "${gatewayname//%/\\x}")
+htmlentityencode "$gatewayname"
+gatewaynamehtml=$entityencoded
+
+username=$(printf "${username//%/\\x}")
+htmlentityencode "$username"
+usernamehtml=$entityencoded
+
+password=$(printf "${password//%/\\x}")
+htmlentityencode "$password"
+passwordhtml=$entityencoded
 
 #requested might have trailing comma space separated, user defined parameters - so remove them as well as decoding
-requested=$(printf "${redir//%/\\x}" | awk -F ', ' '{print $1}')
+#requested=$(printf "${redir//%/\\x}" | awk -F ', ' '{print $1}')
 
 #Get the client zone, local wired, local wireless or remote mesh node
 get_client_zone
@@ -234,6 +273,7 @@ if [ "$status" = "authenticated" ]; then
 	gatewaynamehtml="Welcome!"
 fi
 
+
 header="<!DOCTYPE html>
 	<html>
 	<head>
@@ -250,25 +290,24 @@ header="<!DOCTYPE html>
 	<div class=\"offset\">
 	<med-blue>$gatewaynamehtml</med-blue>
 	<div class=\"insert\" style=\"max-width:100%;\">
-	
+	<hr>
 "
 
 # Define a common footer for every page served
 version="$(ndsctl status | grep Version)"
 year="$(date | awk -F ' ' '{print $(6)}')"
 footer="
-	<img style=\"height:60px; width:100px; float:left;\" src=\"/images/wlan1/TipLogo.png\" alt=\"Splash Page: For access to the Internet.\">
-
+	<img style=\"height:60px; width:60px; float:left;\" src=\"/images/wlan1/TipLogo.png\" alt=\"Splash Page: For access to the Internet.\">
 	<copy-right>
 		<br><br>
 		openNDS $version.
 	</copy-right>
-	<hr>
 	</div>
 	</div>
 	</body>
 	</html>
 "
+
 # Define a login form
 login_form="
 	<form action=\"/opennds_preauth/\" method=\"get\">
@@ -276,15 +315,17 @@ login_form="
 	<input type=\"hidden\" name=\"gatewayname\" value=\"$gatewaynamehtml\">
 	<input type=\"hidden\" name=\"hid\" value=\"$hid\">
 	<input type=\"hidden\" name=\"splashpagetitle\" value=\"$splashpagetitlehtml\">
-	<input type=\"hidden\" name=\"acceptancepolicy\" value=\"$acceptancepolicyhtml\">
-	<input type=\"hidden\" name=\"loginsuccesstext\" value=\"$loginsuccesstexthtml\">
+ 	<input type=\"hidden\" name=\"acceptancepolicy\" value=\"$acceptancepolicyhtml\">
+ 	<input type=\"hidden\" name=\"loginsuccesstext\" value=\"$loginsuccesstexthtml\">
 	<input type=\"hidden\" name=\"gatewayaddress\" value=\"$gatewayaddress\">
-	<input type=\"hidden\" name=\"redirecturl\" value=\"$redirecturlhtml\">  
+	 <input type=\"hidden\" name=\"redirecturl\" value=\"$redirecturlhtml\">
 	<input type=\"hidden\" name=\"redir\" value=\"$requested\">
-	<input type=\"text\" name=\"username\" value=\"$usernamehtml\" autocomplete=\"on\" ><br>Name<br><hr>
-	<input type="submit" value="Continue"><br><hr>
-	</form>
+	<input type=\"text\" name=\"username\" value=\"$usernamehtml\" autocomplete=\"on\" ><br>User Name<br><br>
+	<input type=\"password\" name=\"password\" value=\"$passwordhtml\" autocomplete=\"on\" ><br>Password<br><br>
+	<input type=\"submit\" value=\"Continue\" >
+	</form><hr>
 "
+
 # Output the page common header
 echo -e "$header"
 
@@ -298,18 +339,38 @@ if [ "$status" = "authenticated" ]; then
 	exit 0
 fi
 
+# For this simple example, we check that both the username and email address fields have been filled in.
+# If not then serve the initial page, again if necessary.
+# We are not doing any specific validation in this example, but here is the place to do it if you need to.
+#
+# Note if only one of username or email address fields is entered then that value will be preserved
+# and displayed on the page when it is re-served.
+#
 # Note also $clientip, $gatewayname and $requested (redir) must always be preserved
-
-if [ -z "$username" ]; then
-
-	echo "<big-red>Welcome to  $splashpagetitle!</big-red><br>
-	<hr>
-		<med-blue>You are connected to $client_zone</med-blue><br><br>
-		<italic-black>To access the Internet please enter your Name</italic-black><br><br>
-		<italic-black>$acceptancepolicy</italic-black><hr><br>"
+#
+if [ -z "$username" ] || [ -z "$password" ]; then
+	echo "<big-red>Welcome to $splashpagetitle!</big-red><br>
+	<med-blue>You are connected to $client_zone</med-blue><br>
+	<italic-black>To access the Internet you must complete all fields</italic-black><hr>
+    <italic-black>$acceptancepolicy</italic-black><hr><br>"
 	echo -e "$login_form"
+
 else
-	# we will now call ndsctl to get client data we need to authenticate and add to our log.
+
+
+	# If we got here, we have all fields as completed on the login page on the client,
+	# so we will now validate the client and if sucessful we will call ndsctl
+	# to get client data we need to authenticate and add to our log.
+
+	validate_client $username $password
+	if [ $? = 1 ]; then
+		echo "<big-red>Sorry!</big-red><italic-black> Validation failed, please try again.</italic-black><hr>"
+		echo -e "$login_form"
+		echo -e "$footer"
+		exit 0
+	fi
+	
+
 	# Variables returned from ndsctl are listed in $varlist.
 
 	# We at least need the client token to authenticate.
@@ -340,8 +401,8 @@ else
 	# Be aware that many devices will close the login browser as soon as
 	# the client user continues, so now is the time to deliver your message.
 
-	echo "<big-red>Thank you $username!</big-red>"
-	echo "<med-blue><br><b>$loginsuccesstexthtml</b>"
+	echo "<big-red>Thankyou!</big-red>"
+	echo "<br><med-blue>Welcome $usernamehtml</med-blue>"
 
 	# Add your message here:
 	# You could retrieve text or images from a remote server using wget or curl
@@ -349,12 +410,20 @@ else
 
 	# You can also send a custom data string to BinAuth. Set the variable $custom to the desired value
 	# Max length 256 characters
+	custom="Custom data sent to BinAuth"
+ 
+	#echo "<br><italic-black> Your News or Advertising could be here, contact the owners of this Hotspot to find out how!</italic-black>"
+
+	# If you want to redirect the client somewhere other than the url they originally requested, you can overide
+	# the $requested value here.
+	# NOTE: Many implementations of the client CPD will immediately close the CPD browser once authenticated by NDS.
+	# eg:
 	requested="$redirecturl"
 
 	echo "<form action=\"/opennds_auth/\" method=\"get\">"
 	echo "<input type=\"hidden\" name=\"tok\" value=\"$tok\">"
 	echo "<input type=\"hidden\" name=\"redir\" value=\"$requested\"><br>"
-	echo "<input type=\"hidden\" name=\"custom\" value=\"$custom\">"
+	#echo "<input type=\"text\" name=\"custom\" value=\"$custom\">"
 	echo "<input type=\"submit\" value=\"Continue\" >"
 	echo "</form><hr>"
 
@@ -367,4 +436,3 @@ echo -e "$footer"
 # The output of this script could of course be much more complex and
 # could easily be used to conduct a dialogue with the client user.
 #
-
