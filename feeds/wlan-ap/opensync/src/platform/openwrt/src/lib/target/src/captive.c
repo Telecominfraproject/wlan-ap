@@ -48,11 +48,11 @@ enum {
 	__NDS_ATTR_MAX,
 };
 const struct blobmsg_policy opennds_policy[__NDS_ATTR_MAX] = {
-	[NDS_ATTR_SESSIONTIMEOUT] = { .name = "sessiontimeout", .type = BLOBMSG_TYPE_INT32 },
+	[NDS_ATTR_SESSIONTIMEOUT] = { .name = "sessiontimeout", .type = BLOBMSG_TYPE_STRING },
 	[NDS_ATTR_GATEWAYINTERFACE] = { .name = "gatewayinterface", .type = BLOBMSG_TYPE_STRING },
 	[NDS_ATTR_GATEWAYNAME] = { .name = "gatewayname", .type = BLOBMSG_TYPE_STRING },
-	[NDS_ATTR_LOGIN_OPTION_ENABLED] = { .name = "login_option_enabled", .type = BLOBMSG_TYPE_INT32 },
-	[NDS_ATTR_ENABLED] = { .name = "enabled", .type = BLOBMSG_TYPE_INT32 },
+	[NDS_ATTR_LOGIN_OPTION_ENABLED] = { .name = "login_option_enabled", .type = BLOBMSG_TYPE_STRING },
+	[NDS_ATTR_ENABLED] = { .name = "enabled", .type = BLOBMSG_TYPE_STRING },
 	[NDS_ATTR_AUTHENTICATED_USERS]  = { .name = "authenticated_users", .type = BLOBMSG_TYPE_ARRAY },
 	[NDS_ATTR_CAPTIVE_ALLOWLIST]  = { .name = "preauthenticated_users", .type = BLOBMSG_TYPE_ARRAY },
 	[NDS_ATTR_MACMECHANISM]  = { .name = "macmechanism", .type = BLOBMSG_TYPE_STRING },
@@ -103,10 +103,6 @@ void vif_state_dhcp_allowlist_get(struct schema_Wifi_VIF_State *vstate,struct uc
 
 			blob_buf_init(&dnsmas, 0);
 			uci_to_blob(&dnsmas, ip_section, &dnsm_param);
-			if(blob_len(dnsmas.head)==0)
-			{
-				LOGN(":Hi Length Zero");
-			}
 			blobmsg_parse(dnsm_policy, __DNS_ATTR_MAX, td, blob_data(dnsmas.head), blob_len(dnsmas.head));
 
 			if (td[DNS_ATTR_IPSET]) {
@@ -184,7 +180,6 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 	int index = 0;
 	const char *opt;
 	char *buf = NULL;
-	char timeout[32];
 	struct blob_attr *tc[__NDS_ATTR_MAX] = { };
 	struct uci_element *e = NULL;
 
@@ -202,26 +197,27 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate,s
 				{
 					if (tc[NDS_ATTR_SESSIONTIMEOUT])
 					{
-						sprintf(timeout,"%d",blobmsg_get_u32(tc[NDS_ATTR_SESSIONTIMEOUT]));
+						buf = blobmsg_get_string(tc[NDS_ATTR_SESSIONTIMEOUT]);
 						set_captive_portal_state(vstate, &index,
 								captive_portal_options_table[i],
-								timeout);
+								buf);
 					}
 				}
-				else if (strcmp(opt, "authentication") == 0) {
+				else if (!strcmp(opt, "authentication")) {
 					if(tc[NDS_ATTR_AUTHENTICATION]) {
 						buf = blobmsg_get_string(tc[NDS_ATTR_AUTHENTICATION]);
 						if (!strcmp(buf, "None")) {
+
 							set_captive_portal_state(vstate, &index,
 									captive_portal_options_table[i],
 									buf);
 						}
 
-						else if (!strcmp(buf,"Captive Portal User List")) {
+						/*else if (!strcmp(buf,"Captive Portal User List")) {
 							set_captive_portal_state(vstate, &index,
 									captive_portal_options_table[i],
 									buf);
-						}
+						}*/
 					}
 				}
 				else if (strcmp(opt, "browser_title") == 0) {
@@ -371,19 +367,19 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 			strncpy(value, val, 255);
 
 		if (!strcmp(opt, "authentication")) {
-			blobmsg_add_string(&cap, "webroot",webroot);
 			//blobmsg_add_u32(&cap, "gatewayinterface",ifname);
-			if(strcmp(value,"None")==0) {
-				blobmsg_add_u32(&cap, "login_option_enabled", 1);
+			//if(strcmp(value,"None")==0) {
+			blobmsg_add_string(&cap, "authentication", value);
+			blobmsg_add_string(&cap, "login_option_enabled", "1");
+			blobmsg_add_string(&cap, "enabled", "1");
+			blobmsg_add_string(&cap, "webroot",webroot);
+			//}
+			/*else if(strcmp(value,"Captive Portal User List")==0) {
 				blobmsg_add_string(&cap, "authentication", value);
-				blobmsg_add_u32(&cap, "enabled", 1);
-			}
-			else if(strcmp(value,"Captive Portal User List")==0) {
-				blobmsg_add_string(&cap, "authentication", value);
-			}
+			}*/
 		}
 		else if (strcmp(opt, "session_timeout") == 0) {
-			blobmsg_add_u32(&cap, "sessiontimeout", strtoul(value,NULL,10));
+			blobmsg_add_string(&cap, "sessiontimeout", value);
 		}
 		else if (strcmp(opt, "browser_title") == 0) {
 			blobmsg_add_string(&cap, "gatewayname", value);
