@@ -151,6 +151,7 @@ bool netifd_dhcp_lease_notify(
 	}
 	else {
 		node->dl_lease = *dl;
+		dhcp_fp_db_lookup(&node->dl_fp_data, dl->dl_fingerprint);
 		node->dl_updated = true;
 	}
 
