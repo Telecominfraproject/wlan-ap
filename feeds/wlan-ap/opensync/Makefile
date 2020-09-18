@@ -9,8 +9,23 @@ PKG_SOURCE_DATE:=2020-06-28
 PKG_SOURCE_VERSION:=ee8945e44366087832bdafdf69784c6a87e3a5e6
 
 PKG_BUILD_DEPENDS:=python3-kconfiglib/host python3-jinja2/host python3-markupsafe/host
+HOST_BUILD_DEPENDS:=protobuf-c/host
 
 include $(INCLUDE_DIR)/package.mk
+include $(INCLUDE_DIR)/host-build.mk
+include $(INCLUDE_DIR)/package.mk
+
+define Host/Configure
+endef
+
+define Host/Compile
+endef
+
+define Host/Install
+endef
+
+define Host/Clean
+endef
 
 define Package/opensync
 	CATEGORY:=Network
@@ -40,6 +55,14 @@ TARGET_CFLAGS += \
 	-I$(STAGING_DIR)/usr/include/libnl-tiny
 
 define Build/Compile
+	$(STAGING_DIR_HOSTPKG)/bin/protoc-c \
+			--c_out=$(PKG_BUILD_DIR)/src/lib/datapipeline/inc \
+			--proto_path=$(PKG_BUILD_DIR)/interfaces \
+			$(PKG_BUILD_DIR)/interfaces/opensync_stats.proto
+	$(CP) $(PKG_BUILD_DIR)/src/lib/datapipeline/inc/opensync_stats.pb-c.c $(PKG_BUILD_DIR)/src/lib/datapipeline/src
+	$(RM) $(PKG_BUILD_DIR)/src/lib/datapipeline/inc/opensync_stats.pb-c.c
+
+
 	$(MAKE) -C $(PKG_BUILD_DIR) \
 		OWRT_CFLAGS="$(TARGET_CFLAGS)" \
 		TARGET=tip TOOLCHAIN_DIR="$(TOOLCHAIN_DIR)" \
@@ -62,4 +85,5 @@ ifdef CONFIG_PACKAGE_wlan-ap-keys
 endif
 endef
 
+$(eval $(call HostBuild))
 $(eval $(call BuildPackage,opensync))
