@@ -3,7 +3,7 @@
 #include "netifd.h"
 #include "dhcp_fingerprint.h"
 
-dhcp_fp_localdb_t local_db;
+dhcp_fp_localdb_t local_db = {0};
 
 bool dhcp_fp_db_lookup (dhcp_fp_data_t *fp_data, char *option_seq)
 {
@@ -18,7 +18,7 @@ bool dhcp_fp_db_lookup (dhcp_fp_data_t *fp_data, char *option_seq)
 	/* first, try to find it from local db */
 	for (i=0; i < local_db.db_num; i++) {
 		if (!strncmp(local_db.devices[i].option_seq, option_seq, MAX_DHCP_FINGERPRINT_OPTION_SEQ)) {
-			LOG(INFO, "found a match from db cache");
+			LOG(DEBUG, "found a match from db cache");
 
 			strcpy(fp_data->device_name, local_db.devices[i].device_name);
 			fp_data->device_type = local_db.devices[i].device_type;
@@ -46,13 +46,13 @@ bool dhcp_fp_db_lookup (dhcp_fp_data_t *fp_data, char *option_seq)
 			line[rd - 1] = '\0';
 		else continue;
 
-		if ((rt =strncmp(option_seq, &(line[0]), strlen(option_seq))) == 0) {
+		if ((rt = strncmp(option_seq, &(line[0]), rd)) == 0) {
 			if ((rd = getline(&line, &len, fp)) < 0) {
 				LOG(ERR, "db file is in wrong format, device name");
 				goto db_lookup_exit;
 			}
 
-			if ((rd >= MAX_FINGERPRINT_DEVICE_DESCRIPTION) || (rd - 1 < 0)) {
+			if (rd >= MAX_FINGERPRINT_DEVICE_DESCRIPTION) {
 				LOG(ERR, "device name length from db:%d", rd);
 				goto db_lookup_exit;
 			}
