@@ -282,6 +282,7 @@ hostapd_common_add_bss_config() {
 	config_add_string osu_ssid hs20_wan_metrics hs20_operating_class hs20_t_c_filename hs20_t_c_timestamp
 
 	config_add_int airtime_bss_weight airtime_bss_limit
+	config_add_int rts_threshold
 }
 
 hostapd_set_vlan_file() {
@@ -399,7 +400,7 @@ hostapd_set_bss_options() {
 		bss_load_update_period chan_util_avg_period sae_require_mfp \
 		multi_ap multi_ap_backhaul_ssid multi_ap_backhaul_key \
 		airtime_bss_weight airtime_bss_limit \
-		rssi_reject_assoc_rssi rssi_ignore_probe_request
+		rssi_reject_assoc_rssi rssi_ignore_probe_request rts_threshold 
 
 	set_default isolate 0
 	set_default maxassoc 0
@@ -421,6 +422,7 @@ hostapd_set_bss_options() {
 	set_default airtime_bss_limit 0
 	set_default rssi_reject_assoc_rssi 0
 	set_default rssi_ignore_probe_request 0
+	set_default rts_threshold -1
 
 	append bss_conf "ctrl_interface=/var/run/hostapd"
 	if [ "$isolate" -gt 0 ]; then
@@ -447,6 +449,7 @@ hostapd_set_bss_options() {
 	append bss_conf "multi_ap=$multi_ap" "$N"
 	append bss_conf "rssi_reject_assoc_rssi=$rssi_reject_assoc_rssi" "$N"
 	append bss_conf "rssi_ignore_probe_request=$rssi_ignore_probe_request" "$N"
+	append bss_conf "rts_threshold=$rts_threshold" "$N"
 
 	[ "$tdls_prohibit" -gt 0 ] && append bss_conf "tdls_prohibit=$tdls_prohibit" "$N"
 
