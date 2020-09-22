@@ -71,6 +71,9 @@ def reset_tree():
 			["git", "reset", "--hard", config.get("revision", config["branch"])],
 			check=True,
 		)
+		run(
+			["rm", "-r", "profiles"],
+		)
 		print("### Reset done")
 	except:
 		print("### Resetting tree failed")
@@ -101,7 +104,9 @@ def setup_tree():
 
 		for patch in patches:
 			run(["git", git_am, "-3", str(base_dir / patch)], check=True)
-
+		run(
+			["ln", "-s", "../profiles"], check=True,
+		)
 		print("### Patches done")
 	except:
 		print("### Setting up the tree failed")
