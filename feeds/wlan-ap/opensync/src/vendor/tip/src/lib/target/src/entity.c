@@ -10,6 +10,7 @@
 #include <uci_blob.h>
 
 typedef void (*awlan_update_cb)(struct schema_AWLAN_Node *awlan, schema_filter_t *filter);
+#define VERSION_MATRIX_FILE "/usr/opensync/.versions"
 
 enum {
 	SYSTEM_ATTR_MODEL,
@@ -17,6 +18,7 @@ enum {
 	SYSTEM_ATTR_PLATFORM,
 	SYSTEM_ATTR_FIRMWARE,
 	SYSTEM_ATTR_REDIRECTOR,
+	SYSTEM_ATTR_INACTIVEFW,
 	__SYSTEM_ATTR_MAX,
 };
 
@@ -26,6 +28,7 @@ static const struct blobmsg_policy system_policy[__SYSTEM_ATTR_MAX] = {
 	[SYSTEM_ATTR_PLATFORM] = { .name = "platform", .type = BLOBMSG_TYPE_STRING },
 	[SYSTEM_ATTR_FIRMWARE] = { .name = "firmware", .type = BLOBMSG_TYPE_STRING },
 	[SYSTEM_ATTR_REDIRECTOR] = { .name = "redirector", .type = BLOBMSG_TYPE_STRING },
+	[SYSTEM_ATTR_INACTIVEFW] = { .name = "inactivefw", .type = BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list system_param = {
@@ -42,6 +45,48 @@ static bool copy_data(int id, void *buf, size_t len)
 		return false;
 	}
 	strncpy(buf, blobmsg_get_string(tb[id]), len);
+	return true;
+}
+
+static bool update_version_matrix(struct schema_AWLAN_Node *awlan)
+{
+	FILE *fp = NULL;
+	char *line = NULL;
+	char *key, *val, *str = NULL;
+	size_t len;
+	int rd = 0;
+	char inactive_fw[128] = "";
+
+	fp = fopen(VERSION_MATRIX_FILE, "r");
+	if (fp == NULL) {
+		LOG(ERR, "Updating version matrix failed. versions file does not exist");
+		return false;
+	}
+	while ((rd = getline(&line, &len, fp)) != -1) {
+		if (rd -1 >= 0)
+			line[rd - 1] = '\0';
+		else continue;
+
+		str = strdup(line);
+		key = strtok(str, ":");
+		val = strtok(NULL, ":");
+
+		if (val == NULL) {
+			SCHEMA_KEY_VAL_SET(awlan->version_matrix, key, "");
+		} else {
+			SCHEMA_KEY_VAL_SET(awlan->version_matrix, key, val);
+		}
+	}
+
+	/* Update the inactive firmware version */
+	copy_data(SYSTEM_ATTR_INACTIVEFW, inactive_fw, 128);
+	SCHEMA_KEY_VAL_SET(awlan->version_matrix, "FW_IMAGE_INACTIVE", inactive_fw);
+
+	if (line != NULL)
+		free(line);
+	if (str != NULL)
+		free(str);
+	fclose(fp);
 	return true;
 }
 
@@ -68,15 +113,26 @@ bool target_platform_version_get(void *buf, size_t len)
 bool target_device_config_register(void *awlan_cb)
 {
 	struct schema_AWLAN_Node awlan;
-	schema_filter_t filter = { 1, {"+", SCHEMA_COLUMN(AWLAN_Node, redirector_addr), NULL} };
+	schema_filter_t filter;
+	bool update_matrix = true;
+	bool update_redirector = true;
 
 	memset(&awlan, 0, sizeof(awlan));
-	if (!copy_data(SYSTEM_ATTR_REDIRECTOR, awlan.redirector_addr, sizeof(awlan.redirector_addr))) {
-		/* Seems we are not using UCI to set the redirector address. Simply return */
+
+	update_redirector = copy_data(SYSTEM_ATTR_REDIRECTOR, awlan.redirector_addr, sizeof(awlan.redirector_addr));
+	update_matrix = update_version_matrix(&awlan);
+
+	if (update_matrix && update_redirector) {
+		filter = (schema_filter_t) { 2, {"+", SCHEMA_COLUMN(AWLAN_Node, redirector_addr), SCHEMA_COLUMN(AWLAN_Node, version_matrix), NULL} };
+	} else if (update_matrix) {
+		filter = (schema_filter_t) { 1, {"+", SCHEMA_COLUMN(AWLAN_Node, version_matrix), NULL} };
+	} else if (update_redirector) {
+		filter = (schema_filter_t) { 1, {"+", SCHEMA_COLUMN(AWLAN_Node, redirector_addr), NULL} };
+	} else {
+		/* Nothing to update */
 		return true;
 	}
 	awlan_update_cb cbk = (awlan_update_cb) awlan_cb;
-	/* Update the redirector address */
 	cbk(&awlan, &filter);
 
 	return true;
