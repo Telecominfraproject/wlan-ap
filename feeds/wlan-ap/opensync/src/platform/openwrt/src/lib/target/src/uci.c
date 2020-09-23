@@ -68,7 +68,7 @@ static char *blob_to_string(struct blob_attr *a, uint32_t type)
 
 static int blob_to_uci(struct blob_attr *a, const struct uci_blob_param_list *param, struct uci_section *s)
 {
-	int sz = sizeof(struct blob_attr) * param->n_params;
+	int sz = sizeof(struct blob_attr *) * param->n_params;
 	struct blob_attr **tb = malloc(sz);
 	int i;
 
@@ -120,7 +120,7 @@ static int blob_to_uci(struct blob_attr *a, const struct uci_blob_param_list *pa
 
 static int blob_to_uci_del(struct blob_attr *a, const struct uci_blob_param_list *param, struct uci_section *s)
 {
-	int sz = sizeof(struct blob_attr) * param->n_params;
+	int sz = sizeof(struct blob_attr *) * param->n_params;
 	struct blob_attr **tb = malloc(sz);
 	int i;
 
