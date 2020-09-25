@@ -92,14 +92,45 @@ struct mode_map *mode_map_get_cloud(const char *htmode, const char *hwmode)
 	return NULL;
 }
 
-int phy_from_path(char *path, char *phy)
+static int phy_from_device(char *_path, char *phy, unsigned int idx)
 {
-	unsigned int  i;
+	char path[PATH_MAX];
+	unsigned int i;
 	int ret = -1;
 	glob_t gl;
 
-	if (glob("/sys/class/ieee80211/*", GLOB_NOSORT, NULL, &gl))
+	snprintf(path, PATH_MAX, "%s/*", _path);
+	if (glob(path, 0, NULL, &gl)) {
+		perror("glob");
+		return -1;
+	}
+	for (i = 0; i < gl.gl_pathc; i++) {
+		if (i != idx)
+			continue;
+		strncpy(phy, basename(gl.gl_pathv[i]), 6);
+		ret = 0;
+		break;
+	}
+	globfree(&gl);
+	return ret;
+}
+
+int phy_from_path(char *_path, char *phy, unsigned int idx)
+{
+	char *path = strdup(_path);
+	unsigned int  i;
+	int ret = -1;
+	char *plus;
+	glob_t gl;
+
+	if (glob("/sys/class/ieee80211/*", 0, NULL, &gl))
                 return -1;
+
+	plus = strstr(path, "+");
+	if (plus) {
+		*plus = '\0';
+		plus++;
+	}
 
 	for (i = 0; i < gl.gl_pathc; i++) {
 		char symlink[PATH_MAX] = {};
@@ -108,11 +139,20 @@ int phy_from_path(char *path, char *phy)
 			continue;
 		if (!strstr(symlink, path))
 			continue;
-		strncpy(phy, basename(symlink), 6);
+		if (plus) {
+			char r_path[PATH_MAX];
+			if (!realpath(gl.gl_pathv[i], r_path))
+				continue;
+			if (phy_from_device(dirname(r_path), phy, atoi(plus)))
+				continue;
+		} else {
+			strncpy(phy, basename(symlink), 6);
+		}
 		ret = 0;
 		break;
 	}
 	globfree(&gl);
+	free(path);
 
 	return ret;
 }
