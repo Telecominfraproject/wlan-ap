@@ -1,0 +1,275 @@
+From d1ab201a3f6a0b95e1a8cf8182df24b1391ac7ed Mon Sep 17 00:00:00 2001
+From: Anilkumar Kolli <akolli@codeaurora.org>
+Date: Thu, 4 Jun 2020 13:18:27 +0530
+Subject: [PATCH 2/2] ath11k: add coredump support for qcn9000
+
+qcn9000 reads fw paging and rddm from mhi
+and sends to dev_coredump.
+
+Signed-off-by: Anilkumar Kolli <akolli@codeaurora.org>
+---
+ drivers/net/wireless/ath/ath11k/Makefile   |   1 +
+ drivers/net/wireless/ath/ath11k/core.c     |   4 +
+ drivers/net/wireless/ath/ath11k/coredump.c | 153 +++++++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath11k/coredump.h |  46 +++++++++
+ drivers/net/wireless/ath/ath11k/mhi.c      |   1 +
+ drivers/net/wireless/ath/ath11k/mhi.h      |   1 +
+ 6 files changed, 206 insertions(+)
+ create mode 100644 drivers/net/wireless/ath/ath11k/coredump.c
+ create mode 100644 drivers/net/wireless/ath/ath11k/coredump.h
+
+--- a/drivers/net/wireless/ath/ath11k/Makefile
++++ b/drivers/net/wireless/ath/ath11k/Makefile
+@@ -25,6 +25,7 @@ ath11k-$(CPTCFG_ATH11K_TRACING) += trace
+ ath11k-$(CONFIG_THERMAL) += thermal.o
+ ath11k-$(CPTCFG_ATH11K_SPECTRAL) += spectral.o
+ ath11k-$(CPTCFG_ATH11K_PKTLOG) += pktlog.o
++ath11k-$(CPTCFG_WANT_DEV_COREDUMP) += coredump.o
+ 
+ obj-$(CPTCFG_ATH11K_AHB) += ath11k_ahb.o
+ ath11k_ahb-y += ahb.o
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -8,6 +8,7 @@
+ #include <linux/remoteproc.h>
+ #include <linux/firmware.h>
+ #include "core.h"
++#include "coredump.h"
+ #include "dp_tx.h"
+ #include "dp_rx.h"
+ #include "debug.h"
+@@ -872,6 +873,9 @@ static void ath11k_core_reset(struct wor
+ 
+ 	ab->is_reset = true;
+ 
++	/* prepare coredump */
++	ath11k_coredump_download_rddm(ab);
++
+ 	ath11k_hif_power_down(ab);
+ 	ath11k_hif_power_up(ab);
+ 
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath11k/coredump.c
+@@ -0,0 +1,153 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/**
++ * Copyright (c) 2020 The Linux Foundation. All rights reserved.
++ */
++
++#include <linux/devcoredump.h>
++#include <linux/dma-direction.h>
++#include <linux/mhi.h>
++#include <linux/mm.h>
++#include "core.h"
++#include "coredump.h"
++#include "pci.h"
++#include "debug.h"
++
++static struct ath11k_dump_file_data *
++ath11k_coredump_build(struct ath11k_pci *ar_pci)
++{
++	struct mhi_controller *mhi_ctrl = ar_pci->mhi_ctrl;
++	struct ath11k_base *ab = ar_pci->ab;
++	struct image_info *rddm_img, *fw_img;
++	struct ath11k_dump_file_data *dump_data;
++	struct ath11k_dump_segment *fw_seg;
++	struct timespec64 timestamp;
++	u8 *buf = NULL, *dump_buf = NULL;
++	unsigned int seg_sz, i;
++	size_t sofar = 0;
++	size_t hdr_len = sizeof(*dump_data);
++	u32 len, rem_seg_cnt = 0;
++	size_t fwdump_buf_len = 0, ramdump_buf_len = 0, remote_buf_len = 0;
++
++	rddm_img = mhi_ctrl->rddm_image;
++	fw_img = mhi_ctrl->fbc_image;
++
++	for (i = 0; i < fw_img->entries; i++) {
++		seg_sz = fw_img->mhi_buf[i].len;
++		fwdump_buf_len += PAGE_ALIGN(seg_sz);
++	}
++
++	ath11k_info(ab, "Collect fw image dump segment, nentries %d size %u\n",
++                    fw_img->entries, fwdump_buf_len);
++
++	for (i = 0; i < rddm_img->entries; i++) {
++		seg_sz = rddm_img->mhi_buf[i].len;
++		ramdump_buf_len += PAGE_ALIGN(seg_sz);
++	}
++
++	ath11k_info(ab, "Collect RDDM image dump segment, nentries %d size %u\n",
++		    rddm_img->entries, ramdump_buf_len);
++
++	for (i = 0; i < ab->qmi.mem_seg_count; i++) {
++		if (ab->qmi.target_mem[i].type == HOST_DDR_REGION_TYPE) {
++			remote_buf_len += ab->qmi.target_mem[i].size;
++			rem_seg_cnt++;
++		}
++	}
++
++	ath11k_info(ab, "Collect remote heap dump segment of size %d\n",
++			remote_buf_len);
++
++	len = hdr_len;
++
++	len += fw_img->entries * sizeof(*fw_seg) + fwdump_buf_len;
++	len += rddm_img->entries * sizeof(*fw_seg) + ramdump_buf_len;
++	len += rem_seg_cnt * sizeof(*fw_seg) + remote_buf_len;
++
++	sofar += hdr_len;
++
++	/* This is going to get big when we start dumping FW RAM and such,
++	 * so go ahead and use vmalloc.
++	 */
++	buf = vzalloc(len);
++	if (!buf)
++		return NULL;
++
++	dump_data = (struct ath11k_dump_file_data *)(buf);
++	strlcpy(dump_data->df_magic, "ATH11K-FW-DUMP",
++		sizeof(dump_data->df_magic));
++	dump_data->len = cpu_to_le32(len);
++	dump_data->version = cpu_to_le32(ATH11K_FW_CRASH_DUMP_VERSION);
++	guid_gen(&dump_data->guid);
++	ktime_get_real_ts64(&timestamp);
++	dump_data->tv_sec = cpu_to_le64(timestamp.tv_sec);
++	dump_data->tv_nsec = cpu_to_le64(timestamp.tv_nsec);
++	dump_data->num_seg = fw_img->entries + rddm_img->entries + rem_seg_cnt;
++
++	/* Gather FW paging dump */
++	fw_seg = (struct ath11k_dump_segment *)(buf + sofar);
++	for (i = 0; i < fw_img->entries; i++) {
++		seg_sz = fw_img->mhi_buf[i].len;
++		dump_buf = fw_img->mhi_buf[i].buf;
++		fw_seg->address = fw_img->mhi_buf[i].dma_addr;
++		fw_seg->len = PAGE_ALIGN(seg_sz);
++		fw_seg->type = ATH11K_FW_CRASH_PAGING_DATA;
++		memcpy(fw_seg->data, dump_buf, fw_seg->len);
++		sofar += sizeof(*fw_seg) + fw_seg->len;
++		fw_seg = (struct ath11k_dump_segment *)(buf + sofar);
++	}
++
++	/* Gather RDDM dump */
++	for (i = 0; i < rddm_img->entries; i++) {
++		seg_sz = rddm_img->mhi_buf[i].len;
++		dump_buf = rddm_img->mhi_buf[i].buf;
++		fw_seg->address = fw_img->mhi_buf[i].dma_addr;
++		fw_seg->len = PAGE_ALIGN(seg_sz);
++		fw_seg->type = ATH11K_FW_CRASH_RDDM_DATA;
++		memcpy(fw_seg->data, dump_buf, fw_seg->len);
++		sofar += sizeof(*fw_seg) + fw_seg->len;
++		fw_seg = (struct ath11k_dump_segment *)(buf + sofar);
++	}
++
++	/* Remote segments*/
++	for (i = 0; i < ab->qmi.mem_seg_count; i++) {
++		if (ab->qmi.target_mem[i].type != HOST_DDR_REGION_TYPE)
++			continue;
++		seg_sz = ab->qmi.target_mem[i].size;
++		dump_buf = (u8 *)ab->qmi.target_mem[i].vaddr;
++		fw_seg->address = ab->qmi.target_mem[i].paddr;
++		fw_seg->len = PAGE_ALIGN(seg_sz);
++		fw_seg->type = ATH11K_FW_REMOTE_MEM_DATA;
++		memcpy(fw_seg->data, dump_buf, fw_seg->len);
++		sofar += sizeof(*fw_seg) + fw_seg->len;
++		fw_seg = (struct ath11k_dump_segment *)(buf + sofar);
++	}
++
++	return dump_data;
++}
++
++static int ath11k_coredump_submit(struct ath11k_pci *ar_pci)
++{
++	struct ath11k_dump_file_data *dump;
++
++	dump = ath11k_coredump_build(ar_pci);
++	if (!dump)
++		return -ENODATA;
++
++	dev_coredumpv(ar_pci->dev, dump,
++		      le32_to_cpu(dump->len), GFP_KERNEL);
++
++	return 0;
++}
++
++void ath11k_coredump_download_rddm(struct ath11k_base *ab)
++{
++	struct ath11k_pci *ar_pci = (struct ath11k_pci *)ab->drv_priv;
++	struct mhi_controller *mhi_ctrl = ar_pci->mhi_ctrl;
++	int ret;
++
++	mhi_download_rddm_img(mhi_ctrl, false);
++
++	ret = ath11k_coredump_submit(ar_pci);
++	if (ret < 0)
++		ath11k_err(ab, "failed to submit coredump\n");
++}
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath11k/coredump.h
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/**
++ * Copyright (c) 2020 The Linux Foundation. All rights reserved.
++ */
++
++#ifndef _COREDUMP_H_
++#define _COREDUMP_H_
++
++#define ATH11K_FW_CRASH_DUMP_VERSION 1
++
++enum ath11k_fw_crash_dump_type {
++	ATH11K_FW_CRASH_PAGING_DATA,
++	ATH11K_FW_CRASH_RDDM_DATA,
++	ATH11K_FW_REMOTE_MEM_DATA,
++	ATH11K_FW_CRASH_DUMP_MAX,
++};
++
++struct ath11k_dump_segment {
++	unsigned long address;
++	size_t len;
++	unsigned int type;
++	u8 data[0];
++};
++
++struct ath11k_dump_file_data {
++	/* "ATH11K-FW-DUMP" */
++	char df_magic[16];
++	__le32 len;
++	/* file dump version */
++	__le32 version;
++	guid_t guid;
++	/* time-of-day stamp */
++	__le64 tv_sec;
++	/* time-of-day stamp, nano-seconds */
++	__le64 tv_nsec;
++	/* number of segments */
++	__le32 num_seg;
++	/* room for growth w/out changing binary format */
++	u8 unused[8];
++	/* struct ath11k_dump_segment + more */
++	u8 data[0];
++} __packed;
++
++void ath11k_coredump_download_rddm(struct ath11k_base *ab);
++
++#endif
+--- a/drivers/net/wireless/ath/ath11k/mhi.c
++++ b/drivers/net/wireless/ath/ath11k/mhi.c
+@@ -222,6 +222,7 @@ int ath11k_pci_register_mhi(struct ath11
+ 	mhi_ctrl->bus = pci_dev->bus->number;
+ 	mhi_ctrl->slot = PCI_SLOT(pci_dev->devfn);
+ 
++	mhi_ctrl->rddm_size = ATH11K_PCI_FW_RDDM_SZ;
+ 	mhi_ctrl->fw_image = ATH11K_PCI_FW_FILE_NAME;
+ 	mhi_ctrl->regs = ar_pci->mem;
+ 
+--- a/drivers/net/wireless/ath/ath11k/mhi.h
++++ b/drivers/net/wireless/ath/ath11k/mhi.h
+@@ -7,6 +7,7 @@
+ 
+ #include "pci.h"
+ #define ATH11K_PCI_FW_FILE_NAME		"qcn9000/amss.bin"
++#define ATH11K_PCI_FW_RDDM_SZ		 (4 * 1024 *1024)
+ 
+ enum ath11k_mhi_state {
+ 	ATH11K_MHI_INIT,

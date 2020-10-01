@@ -3,9 +3,8 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=qca-nss-dp
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL=https://source.codeaurora.org/quic/qsdk/oss/lklm/nss-dp
-PKG_SOURCE_VERSION:=3d3ebdf9cbecb5d8f6e1814e18edb7901e33c3ba
-PKG_SOURCE_DATE:=2020-07-10
+PKG_BRANCH:=master
+PKG_RELEASE:=1
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -31,12 +30,22 @@ endef
 EXTRA_CFLAGS+= \
 	-I$(STAGING_DIR)/usr/include/qca-ssdk
 
+subtarget:=$(SUBTARGET)
+
+NSS_DP_HAL_DIR:=$(PKG_BUILD_DIR)/hal
+hal_arch:=$(subtarget)
+
+define Build/Configure
+	$(LN) $(NSS_DP_HAL_DIR)/arch/$(hal_arch)/nss_$(hal_arch).h \
+		$(PKG_BUILD_DIR)/exports/nss_dp_arch.h
+endef
+
 define Build/Compile
 	$(MAKE) -C "$(LINUX_DIR)" \
 		CROSS_COMPILE="$(TARGET_CROSS)" \
 		ARCH="$(LINUX_KARCH)" \
-		SUBDIRS="$(PKG_BUILD_DIR)" \
-		EXTRA_CFLAGS="$(EXTRA_CFLAGS)" SoC="$(SUBTARGET)_64" \
+		M="$(PKG_BUILD_DIR)" \
+		EXTRA_CFLAGS="$(EXTRA_CFLAGS)" SoC="$(subtarget)" \
 		modules
 endef
 
