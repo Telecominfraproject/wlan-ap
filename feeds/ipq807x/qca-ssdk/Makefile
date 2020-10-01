@@ -3,9 +3,6 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=qca-ssdk
-PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL=https://source.codeaurora.org/quic/qsdk/oss/lklm/qca-ssdk
-PKG_SOURCE_VERSION:=d51c024468408237e1844d3cbdc887057014afab
 PKG_SOURCE_DATE:=2020-07-10
 
 include $(INCLUDE_DIR)/package.mk

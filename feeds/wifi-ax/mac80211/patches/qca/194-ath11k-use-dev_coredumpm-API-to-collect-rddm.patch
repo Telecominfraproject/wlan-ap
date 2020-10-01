@@ -1,0 +1,459 @@
+From f04e76d4d8750618e9b8a182067cc738a55023d4 Mon Sep 17 00:00:00 2001
+From: Anilkumar Kolli <akolli@codeaurora.org>
+Date: Fri, 19 Jun 2020 15:54:50 +0530
+Subject: [PATCH] ath11k: use dev_coredumpm API to collect rddm
+
+ath11k allocates ~60MB of memory for each radio to
+collect the rddm using dev_coredumpv() API.
+dev_coredumpm() API does not need the memory to be
+alloctaed in kernel but with the limitation, driver
+has to wait untill the dump is read from user.
+
+Signed-off-by: Anilkumar Kolli <akolli@codeaurora.org>
+---
+ drivers/net/wireless/ath/ath11k/coredump.c | 272 +++++++++++++++++------------
+ drivers/net/wireless/ath/ath11k/coredump.h |  21 ++-
+ drivers/net/wireless/ath/ath11k/qmi.c      |  12 +-
+ drivers/net/wireless/ath/ath11k/qmi.h      |   2 +-
+ 4 files changed, 183 insertions(+), 124 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath11k/coredump.c
++++ b/drivers/net/wireless/ath/ath11k/coredump.c
+@@ -6,148 +6,204 @@
+ #include <linux/devcoredump.h>
+ #include <linux/dma-direction.h>
+ #include <linux/mhi.h>
++#include <linux/pci.h>
+ #include <linux/mm.h>
++#include <linux/uuid.h>
++#include <linux/time.h>
+ #include "core.h"
+ #include "coredump.h"
+ #include "pci.h"
+ #include "debug.h"
+ 
+-static struct ath11k_dump_file_data *
+-ath11k_coredump_build(struct ath11k_pci *ar_pci)
++static void *ath11k_coredump_find_segment(loff_t user_offset,
++					  struct ath11k_dump_segment *segment,
++					  int phnum, size_t *data_left)
+ {
+-	struct mhi_controller *mhi_ctrl = ar_pci->mhi_ctrl;
+-	struct ath11k_base *ab = ar_pci->ab;
+-	struct image_info *rddm_img, *fw_img;
+-	struct ath11k_dump_file_data *dump_data;
+-	struct ath11k_dump_segment *fw_seg;
+-	struct timespec64 timestamp;
+-	u8 *buf = NULL, *dump_buf = NULL;
+-	unsigned int seg_sz, i;
+-	size_t sofar = 0;
+-	size_t hdr_len = sizeof(*dump_data);
+-	u32 len, rem_seg_cnt = 0;
+-	size_t fwdump_buf_len = 0, ramdump_buf_len = 0, remote_buf_len = 0;
+-
+-	rddm_img = mhi_ctrl->rddm_image;
+-	fw_img = mhi_ctrl->fbc_image;
++	int i;
+ 
+-	for (i = 0; i < fw_img->entries; i++) {
+-		seg_sz = fw_img->mhi_buf[i].len;
+-		fwdump_buf_len += PAGE_ALIGN(seg_sz);
++	for (i = 0; i < phnum; i++, segment++) {
++		if (user_offset < segment->len) {
++			*data_left = user_offset;
++			return segment;
++		}
++		user_offset -= segment->len;
+ 	}
+ 
+-	ath11k_info(ab, "Collect fw image dump segment, nentries %d size %u\n",
+-                    fw_img->entries, fwdump_buf_len);
++	*data_left = 0;
++	return NULL;
++}
+ 
+-	for (i = 0; i < rddm_img->entries; i++) {
+-		seg_sz = rddm_img->mhi_buf[i].len;
+-		ramdump_buf_len += PAGE_ALIGN(seg_sz);
+-	}
++static ssize_t ath11k_coredump_read_q6dump(char *buffer, loff_t offset, size_t count,
++				void *data, size_t header_size)
++{
++	struct ath11k_coredump_state *dump_state = data;
++	struct ath11k_dump_segment *segments = dump_state->segments;
++	struct ath11k_dump_segment *seg;
++	void *elfcore = dump_state->header;
++	size_t data_left, copy_size, bytes_left = count;
++	void __iomem *addr;
++
++	/* Copy the header first */
++	if (offset < header_size) {
++		copy_size = header_size - offset;
++		copy_size = min(copy_size, bytes_left);
++
++		memcpy(buffer, elfcore + offset, copy_size);
++		offset += copy_size;
++		bytes_left -= copy_size;
++		buffer += copy_size;
++
++		return copy_size;
++	}
++
++	while (bytes_left) {
++		seg = ath11k_coredump_find_segment(offset - header_size,
++				    segments, dump_state->num_seg,
++				    &data_left);
++		/* End of segments check */
++		if (!seg) {
++			pr_info("Ramdump complete %lld bytes read\n", offset);
++			return 0;
++		}
+ 
+-	ath11k_info(ab, "Collect RDDM image dump segment, nentries %d size %u\n",
+-		    rddm_img->entries, ramdump_buf_len);
++		if (data_left)
++			copy_size = min_t(size_t, bytes_left, data_left);
++		else
++			copy_size = bytes_left;
+ 
+-	for (i = 0; i < ab->qmi.mem_seg_count; i++) {
+-		if (ab->qmi.target_mem[i].type == HOST_DDR_REGION_TYPE) {
+-			remote_buf_len += ab->qmi.target_mem[i].size;
+-			rem_seg_cnt++;
+-		}
+-	}
++		addr = seg->vaddr;
++		addr += data_left;
++		memcpy_fromio(buffer, addr, copy_size);
+ 
+-	ath11k_info(ab, "Collect remote heap dump segment of size %d\n",
+-			remote_buf_len);
++		offset += copy_size;
++		buffer += copy_size;
++		bytes_left -= copy_size;
++	}
+ 
+-	len = hdr_len;
++	return count - bytes_left;
++}
+ 
+-	len += fw_img->entries * sizeof(*fw_seg) + fwdump_buf_len;
+-	len += rddm_img->entries * sizeof(*fw_seg) + ramdump_buf_len;
+-	len += rem_seg_cnt * sizeof(*fw_seg) + remote_buf_len;
++static void ath11k_coredump_free_q6dump(void *data)
++{
++	struct ath11k_coredump_state *dump_state = data;
+ 
+-	sofar += hdr_len;
++	complete(&dump_state->dump_done);
++}
+ 
+-	/* This is going to get big when we start dumping FW RAM and such,
+-	 * so go ahead and use vmalloc.
+-	 */
+-	buf = vzalloc(len);
++void ath11k_coredump_build_inline(struct ath11k_pci *ar_pci,
++				  struct ath11k_dump_segment *segments, int num_seg)
++{
++	struct ath11k_coredump_state *dump_state;
++	struct timespec64 timestamp;
++	struct ath11k_dump_file_data *file_data;
++	size_t header_size;
++	u8 *buf;
++
++	header_size = sizeof(struct ath11k_dump_file_data);
++	header_size += num_seg * sizeof(*segments);
++	header_size = PAGE_ALIGN(header_size);
++	buf = vzalloc(header_size);
+ 	if (!buf)
+-		return NULL;
++		return;
+ 
+-	dump_data = (struct ath11k_dump_file_data *)(buf);
+-	strlcpy(dump_data->df_magic, "ATH11K-FW-DUMP",
+-		sizeof(dump_data->df_magic));
+-	dump_data->len = cpu_to_le32(len);
+-	dump_data->version = cpu_to_le32(ATH11K_FW_CRASH_DUMP_VERSION);
+-	guid_gen(&dump_data->guid);
++	file_data = (struct ath11k_dump_file_data *)buf;
++	strlcpy(file_data->df_magic, "ATH11K-FW-DUMP",
++	        sizeof(file_data->df_magic));
++	file_data->len = cpu_to_le32(header_size);
++	file_data->version = cpu_to_le32(ATH11K_FW_CRASH_DUMP_VERSION);
++	file_data->chip_id = ar_pci->dev_id;
++	file_data->qrtr_id = ar_pci->ab->qmi.service_ins_id;
++	file_data->bus_id = pci_domain_nr(ar_pci->pdev->bus);
++	if (file_data->bus_id > ATH11K_MAX_PCI_DOMAINS)
++		file_data->bus_id = ATH11K_MAX_PCI_DOMAINS;
++	guid_gen(&file_data->guid);
+ 	ktime_get_real_ts64(&timestamp);
+-	dump_data->tv_sec = cpu_to_le64(timestamp.tv_sec);
+-	dump_data->tv_nsec = cpu_to_le64(timestamp.tv_nsec);
+-	dump_data->num_seg = fw_img->entries + rddm_img->entries + rem_seg_cnt;
+-
+-	/* Gather FW paging dump */
+-	fw_seg = (struct ath11k_dump_segment *)(buf + sofar);
+-	for (i = 0; i < fw_img->entries; i++) {
++	file_data->tv_sec = cpu_to_le64(timestamp.tv_sec);
++	file_data->tv_nsec = cpu_to_le64(timestamp.tv_nsec);
++	file_data->num_seg = num_seg;
++
++	/* copy segment details to file */
++	buf += offsetof(struct ath11k_dump_file_data, seg);
++	file_data->seg =(struct ath11k_dump_segment *)buf;
++	memcpy(file_data->seg, segments, num_seg * sizeof(*segments));
++
++	dump_state = vzalloc(sizeof(*dump_state));
++	if(!dump_state)
++		return;
++
++	dump_state->header = file_data;
++	dump_state->num_seg = num_seg;
++	dump_state->segments = segments;
++	init_completion(&dump_state->dump_done);
++
++	dev_coredumpm(ar_pci->dev, NULL, dump_state, header_size, GFP_KERNEL,
++		      ath11k_coredump_read_q6dump, ath11k_coredump_free_q6dump);
++
++	/* Wait until the dump is read and free is called */
++	wait_for_completion(&dump_state->dump_done);
++	vfree(dump_state);
++	vfree(file_data);
++}
++
++void ath11k_coredump_download_rddm(struct ath11k_base *ab)
++{
++	struct ath11k_pci *ar_pci = (struct ath11k_pci *)ab->drv_priv;
++	struct mhi_controller *mhi_ctrl = ar_pci->mhi_ctrl;
++	struct image_info *rddm_img, *fw_img;
++	struct ath11k_dump_segment *segment, *seg_info;
++	int i, rem_seg_cnt = 0, len, num_seg, seg_sz;
++
++	mhi_download_rddm_img(mhi_ctrl, false);
++
++	rddm_img = mhi_ctrl->rddm_image;
++	fw_img = mhi_ctrl->fbc_image;
++
++	for (i = 0; i < ab->qmi.mem_seg_count; i++) {
++		if (ab->qmi.target_mem[i].type == HOST_DDR_REGION_TYPE)
++			rem_seg_cnt++;
++	}
++
++	num_seg = fw_img->entries + rddm_img->entries + rem_seg_cnt;
++	len = num_seg * sizeof(*segment);
++
++	seg_info = segment = (struct ath11k_dump_segment *)vzalloc(len);
++	if (!seg_info)
++		ath11k_warn(ab, "fail to alloc memory for rddm\n");
++
++	for (i = 0; i < fw_img->entries ; i++) {
+ 		seg_sz = fw_img->mhi_buf[i].len;
+-		dump_buf = fw_img->mhi_buf[i].buf;
+-		fw_seg->address = fw_img->mhi_buf[i].dma_addr;
+-		fw_seg->len = PAGE_ALIGN(seg_sz);
+-		fw_seg->type = ATH11K_FW_CRASH_PAGING_DATA;
+-		memcpy(fw_seg->data, dump_buf, fw_seg->len);
+-		sofar += sizeof(*fw_seg) + fw_seg->len;
+-		fw_seg = (struct ath11k_dump_segment *)(buf + sofar);
++		seg_info->len = PAGE_ALIGN(seg_sz);
++		seg_info->addr = fw_img->mhi_buf[i].dma_addr;
++		seg_info->vaddr = fw_img->mhi_buf[i].buf;
++		ath11k_info(ab, "seg vaddr is %px len is 0x%x\n",
++					seg_info->vaddr, seg_info->len);
++		seg_info->type = ATH11K_FW_CRASH_PAGING_DATA;
++		seg_info++;
+ 	}
+ 
+-	/* Gather RDDM dump */
+ 	for (i = 0; i < rddm_img->entries; i++) {
+ 		seg_sz = rddm_img->mhi_buf[i].len;
+-		dump_buf = rddm_img->mhi_buf[i].buf;
+-		fw_seg->address = fw_img->mhi_buf[i].dma_addr;
+-		fw_seg->len = PAGE_ALIGN(seg_sz);
+-		fw_seg->type = ATH11K_FW_CRASH_RDDM_DATA;
+-		memcpy(fw_seg->data, dump_buf, fw_seg->len);
+-		sofar += sizeof(*fw_seg) + fw_seg->len;
+-		fw_seg = (struct ath11k_dump_segment *)(buf + sofar);
++		seg_info->len = PAGE_ALIGN(seg_sz);
++		seg_info->addr = rddm_img->mhi_buf[i].dma_addr;
++		seg_info->vaddr = rddm_img->mhi_buf[i].buf;
++		ath11k_info(ab, "seg vaddr is %px len is 0x%x\n",
++					seg_info->vaddr, seg_info->len);
++		seg_info->type = ATH11K_FW_CRASH_RDDM_DATA;
++		seg_info++;
+ 	}
+ 
+-	/* Remote segments*/
+ 	for (i = 0; i < ab->qmi.mem_seg_count; i++) {
+ 		if (ab->qmi.target_mem[i].type != HOST_DDR_REGION_TYPE)
+ 			continue;
+-		seg_sz = ab->qmi.target_mem[i].size;
+-		dump_buf = (u8 *)ab->qmi.target_mem[i].vaddr;
+-		fw_seg->address = ab->qmi.target_mem[i].paddr;
+-		fw_seg->len = PAGE_ALIGN(seg_sz);
+-		fw_seg->type = ATH11K_FW_REMOTE_MEM_DATA;
+-		memcpy(fw_seg->data, dump_buf, fw_seg->len);
+-		sofar += sizeof(*fw_seg) + fw_seg->len;
+-		fw_seg = (struct ath11k_dump_segment *)(buf + sofar);
++		seg_info->len = ab->qmi.target_mem[i].size;
++		seg_info->addr = ab->qmi.target_mem[i].paddr;
++		seg_info->vaddr = ab->qmi.target_mem[i].vaddr;
++		ath11k_info(ab, "seg vaddr is %px len is 0x%x\n",
++					seg_info->vaddr, seg_info->len);
++		seg_info->type = ATH11K_FW_REMOTE_MEM_DATA;
++		seg_info++;
+ 	}
+ 
+-	return dump_data;
+-}
+-
+-static int ath11k_coredump_submit(struct ath11k_pci *ar_pci)
+-{
+-	struct ath11k_dump_file_data *dump;
+-
+-	dump = ath11k_coredump_build(ar_pci);
+-	if (!dump)
+-		return -ENODATA;
+-
+-	dev_coredumpv(ar_pci->dev, dump,
+-		      le32_to_cpu(dump->len), GFP_KERNEL);
+-
+-	return 0;
+-}
+-
+-void ath11k_coredump_download_rddm(struct ath11k_base *ab)
+-{
+-	struct ath11k_pci *ar_pci = (struct ath11k_pci *)ab->drv_priv;
+-	struct mhi_controller *mhi_ctrl = ar_pci->mhi_ctrl;
+-	int ret;
+-
+-	mhi_download_rddm_img(mhi_ctrl, false);
+-
+-	ret = ath11k_coredump_submit(ar_pci);
+-	if (ret < 0)
+-		ath11k_err(ab, "failed to submit coredump\n");
++	ath11k_coredump_build_inline(ar_pci, segment, num_seg);
++	vfree(segment);
+ }
+--- a/drivers/net/wireless/ath/ath11k/coredump.h
++++ b/drivers/net/wireless/ath/ath11k/coredump.h
+@@ -16,10 +16,10 @@ enum ath11k_fw_crash_dump_type {
+ };
+ 
+ struct ath11k_dump_segment {
+-	unsigned long address;
+-	size_t len;
++	unsigned long addr;
++	void *vaddr;
++	unsigned int len;
+ 	unsigned int type;
+-	u8 data[0];
+ };
+ 
+ struct ath11k_dump_file_data {
+@@ -28,19 +28,36 @@ struct ath11k_dump_file_data {
+ 	__le32 len;
+ 	/* file dump version */
+ 	__le32 version;
++	/* pci device id */
++	__le32 chip_id;
++	/* qrtr instance id */
++	__le32 qrtr_id;
++	/* pci domain id */
++	u8 bus_id;
+ 	guid_t guid;
+ 	/* time-of-day stamp */
+ 	__le64 tv_sec;
+ 	/* time-of-day stamp, nano-seconds */
+ 	__le64 tv_nsec;
+-	/* number of segments */
+-	__le32 num_seg;
+ 	/* room for growth w/out changing binary format */
+ 	u8 unused[8];
++	/* number of segments */
++	__le32 num_seg;
++
++	struct ath11k_dump_segment *seg;
+ 	/* struct ath11k_dump_segment + more */
++
+ 	u8 data[0];
+ } __packed;
+ 
++struct ath11k_coredump_state {
++	struct ath11k_dump_file_data *header;
++	struct ath11k_dump_segment *segments;
++	struct completion dump_done;
++	u32 num_seg;
++};
++
++
+ void ath11k_coredump_download_rddm(struct ath11k_base *ab);
+ 
+ #endif
+--- a/drivers/net/wireless/ath/ath11k/qmi.c
++++ b/drivers/net/wireless/ath/ath11k/qmi.c
+@@ -2371,7 +2371,7 @@ static int ath11k_qmi_alloc_target_mem_c
+ 	int i, idx;
+ 
+ 	for (i = 0, idx = 0; i < ab->qmi.mem_seg_count; i++) {
+-		ab->qmi.target_mem[i].vaddr = (unsigned long)dma_alloc_coherent(ab->dev, ab->qmi.target_mem[i].size,
++		ab->qmi.target_mem[i].vaddr = dma_alloc_coherent(ab->dev, ab->qmi.target_mem[i].size,
+ 						&ab->qmi.target_mem[i].paddr, GFP_KERNEL);
+ 		if (!ab->qmi.target_mem[idx].vaddr) {
+ 			ath11k_err(ab, "failed to allocate memory for FW, size: 0x%x, type: %u\n",
+@@ -2401,7 +2401,7 @@ static int ath11k_qmi_assign_target_mem_
+ 
+ 			ab->qmi.target_mem[idx].paddr = (phys_addr_t)addr;
+ 			ab->qmi.target_mem[idx].vaddr =
+-				(u32)ioremap(ab->qmi.target_mem[idx].paddr,
++					ioremap(ab->qmi.target_mem[idx].paddr,
+ 					ab->qmi.target_mem[i].size);
+ 			ab->qmi.target_mem[idx].size = ab->qmi.target_mem[i].size;
+ 			ab->qmi.target_mem[idx].type = ab->qmi.target_mem[i].type;
+@@ -2409,7 +2409,6 @@ static int ath11k_qmi_assign_target_mem_
+ 			break;
+ 		case BDF_MEM_REGION_TYPE:
+ 			ab->qmi.target_mem[idx].paddr = ab->hw_params.bdf_addr;
+-			ab->qmi.target_mem[idx].vaddr = ab->hw_params.bdf_addr;
+ 			ab->qmi.target_mem[idx].size = ab->qmi.target_mem[i].size;
+ 			ab->qmi.target_mem[idx].type = ab->qmi.target_mem[i].type;
+ 			idx++;
+@@ -2426,7 +2425,8 @@ static int ath11k_qmi_assign_target_mem_
+ 				ab->qmi.target_mem[idx].vaddr = 0UL;
+ 			} else {
+ 				ab->qmi.target_mem[idx].paddr = (phys_addr_t)addr;
+-				ab->qmi.target_mem[idx].vaddr = (u32)ioremap(ab->qmi.target_mem[idx].paddr,
++				ab->qmi.target_mem[idx].vaddr =
++					ioremap(ab->qmi.target_mem[idx].paddr,
+ 								ab->qmi.target_mem[i].size);
+ 			}
+ 			ab->qmi.target_mem[idx].size = ab->qmi.target_mem[i].size;
+@@ -2445,8 +2445,6 @@ static int ath11k_qmi_assign_target_mem_
+ 			ab->qmi.target_mem[idx].size = ab->qmi.target_mem[i].size;
+ 			ab->qmi.target_mem[idx].type = ab->qmi.target_mem[i].type;
+ 			ab->qmi.target_mem[idx].paddr = ab->hw_params.m3_addr;
+-			ab->qmi.target_mem[idx].vaddr =
+-				(unsigned int)ab->qmi.target_mem[idx].paddr;
+ 			idx++;
+ 			break;
+ 		default:
+@@ -2710,7 +2708,7 @@ static int ath11k_qmi_load_bdf_target_me
+ 		goto out_qmi_cal;
+ 	}
+ 
+-	ath11k_info(ab, "qmi caldata downloaded: %s, type: %zu\n",
++	ath11k_info(ab, "qmi caldata downloaded: %s, type: %u\n",
+ 		    (file_type == ATH11K_QMI_FILE_TYPE_CALDATA)? filename: "eeprom", file_type);
+ 
+ out_qmi_cal:
+--- a/drivers/net/wireless/ath/ath11k/qmi.h
++++ b/drivers/net/wireless/ath/ath11k/qmi.h
+@@ -113,7 +113,7 @@ struct target_mem_chunk {
+ 	u32 size;
+ 	u32 type;
+ 	dma_addr_t paddr;
+-	u32 vaddr;
++	void *vaddr;
+ };
+ 
+ struct target_info {
