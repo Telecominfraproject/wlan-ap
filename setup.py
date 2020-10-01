@@ -7,24 +7,6 @@ import getopt
 
 git_am = "am"
 
-def create_keys():
-	try:
-		if Path("keys/servercert.pem").is_file():
-			return 0
-		if not Path("keys/generate_all.sh").is_file():
-			print("### Cloning key repo")
-			run(["git", "clone", "git@github.com:Telecominfraproject/wlan-pki-cert-scripts.git", "keys"], check=True)
-			print("### Clone done")
-		print("### Generate keys")
-		os.chdir("keys")
-		run(["/bin/sh", "./generate_all.sh"], check=True)
-		print("### Generate keys done")
-	except:
-		print("### Creating keys failed")
-		sys.exit(1)
-	finally:
-		os.chdir(base_dir)
-
 def clone_tree():
 	try:
 		makefile = openwrt +"/Makefile"
@@ -136,7 +118,6 @@ def update_patches():
 base_dir = Path.cwd().absolute()
 setup = False
 update = False
-genkey = True
 rebase = False
 config = "config.yml"
 openwrt = "openwrt"
@@ -162,7 +143,6 @@ for o, a in opts:
 		git_ref = a
 	elif o in ("-d", "--docker"):
 		git_am = "apply"
-		genkey = False
 	else:
 		assert False, "unhandled option"
 
@@ -172,8 +152,6 @@ if not Path(config).is_file():
 config = yaml.safe_load(open(config))
 
 if setup:
-	if genkey:
-		create_keys()
 	clone_tree()
 	reset_tree()
 	setup_tree()
