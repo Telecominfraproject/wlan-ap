@@ -98,7 +98,7 @@ hostapd_common_add_device_config() {
 
 	config_add_string acs_chan_bias co_locate
 	config_add_array hostapd_options
-	config_add_boolean multiple_bssid rnr_beacon
+	config_add_boolean multiple_bssid rnr_beacon ema
 
 	hostapd_add_log_config
 }
@@ -111,7 +111,8 @@ hostapd_prepare_device_config() {
 	local base_cfg=
 
 	json_get_vars country country_ie beacon_int:100 dtim_period:2 doth require_mode legacy_rates \
-		acs_chan_bias local_pwr_constraint spectrum_mgmt_required multiple_bssid co_locate
+		acs_chan_bias local_pwr_constraint spectrum_mgmt_required multiple_bssid co_locate \
+		ema
 
 	hostapd_set_log_options base_cfg
 
@@ -121,6 +122,7 @@ hostapd_prepare_device_config() {
 	set_default legacy_rates 1
 	set_default multiple_bssid 0
 	set_default rnr_beacon 1
+	set_default ema 0
 
 	[ "$hwmode" = "b" ] && legacy_rates=1
 
@@ -164,6 +166,9 @@ hostapd_prepare_device_config() {
 		hostapd_add_rate brlist "$br"
 	done
 
+	append base_cfg "multiple_bssid=$multiple_bssid" "$N"
+	append base_cfg "rnr_beacon=$rnr_beacon" "$N"
+	append base_cfg "ema=$ema" "$N"
 	[ -n "$rlist" ] && append base_cfg "supported_rates=$rlist" "$N"
 	[ -n "$brlist" ] && append base_cfg "basic_rates=$brlist" "$N"
 	append base_cfg "beacon_int=$beacon_int" "$N"

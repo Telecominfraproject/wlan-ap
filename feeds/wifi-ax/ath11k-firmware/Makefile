@@ -1,7 +1,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=ath11k-firmware
-PKG_VERSION:=19
+PKG_SOURCE:=WLAN.HK.2.4.0.1.r1-01249-QCAHKSWPL_SILICONZ-2.tar.bz2
+PKG_VERSION:=1249
 
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 
@@ -40,13 +41,13 @@ endef
 
 define Package/ath11k-firmware-ipq60xx/install
 	$(INSTALL_DIR) $(1)/lib/firmware/IPQ6018
-	$(INSTALL_DATA) ./files/IPQ6018/* \
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/IPQ6018/* \
 		$(1)/lib/firmware/IPQ6018/
 endef
 
 define Package/ath11k-firmware-ipq807x/install
 	$(INSTALL_DIR) $(1)/lib/firmware/IPQ8074
-	$(INSTALL_DATA) ./files/IPQ8074/* \
+	$(CP) $(PKG_BUILD_DIR)/IPQ8074/* \
 		$(1)/lib/firmware/IPQ8074
 endef
 

@@ -448,7 +448,7 @@ mac80211_hostapd_setup_base() {
 			he_su_beamformer:1 \
 			he_su_beamformee:0 \
 			he_mu_beamformer:1 \
-			he_bss_color:64
+			he_bss_color:63
 
 		append base_cfg "ieee80211ax=1" "$N"
 		append base_cfg "he_bss_color=$he_bss_color" "$N"

@@ -2,10 +2,10 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mac80211
-PKG_VERSION:=20200628-4.4.60-9a94b73e75
+PKG_VERSION:=20200908-4.4.60-9a94b73e75
 PKG_RELEASE:=1
 PKG_SOURCE_URL:=https://mirror2.openwrt.org/sources/
-PKG_HASH:=ef279f4301022b4724433af639607687bed9805bfdf0acbe12ee1b8737b8fb1d
+PKG_HASH:=5ccb3e3b47b4ae578bbb3345e96c854eb1d1230dbf4d2fe7a131a7e7d52ec1bf
 PKG_SOURCE:=backports-$(PKG_VERSION).tar.bz2
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/backports-$(PKG_VERSION)
 PKG_BUILD_PARALLEL:=1
@@ -88,7 +88,7 @@ define KernelPackage/mac80211
   $(call KernelPackage/mac80211/Default)
   TITLE:=Linux 802.11 Wireless Networking Stack
   # +kmod-crypto-cmac is a runtime only dependency of net/mac80211/aes_cmac.c
-  DEPENDS+= +kmod-cfg80211 +hostapd-common
+  DEPENDS+= +kmod-cfg80211 +hostapd-common +kmod-qca-nss-drv
   KCONFIG:=\
 	CONFIG_AVERAGE=y
   FILES:= $(PKG_BUILD_DIR)/net/mac80211/mac80211.ko
