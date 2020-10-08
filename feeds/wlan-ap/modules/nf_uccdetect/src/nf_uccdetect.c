@@ -694,7 +694,7 @@ static struct mac_entry * mac_hash_put( uint32_t addr_high, uint32_t addr_low,
 
 		*prev_next_ptr = NewEntryPtr;
 		NewEntryPtr->mac_flags = MAC_HASH_FLAG_ENTRY_VALID;
-		printk(KERN_DEBUG "learned %x %x\n", addr_high, addr_low );
+		//printk(KERN_DEBUG "learned %x %x\n", addr_high, addr_low );
 	}
 
 	return( NewEntryPtr );
