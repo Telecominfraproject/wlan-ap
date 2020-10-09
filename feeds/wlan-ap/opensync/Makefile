@@ -52,7 +52,17 @@ endef
 
 TARGET_CFLAGS += \
 	-I$(STAGING_DIR)/usr/include \
-	-I$(STAGING_DIR)/usr/include/libnl-tiny
+	-I$(STAGING_DIR)/usr/include/libnl-tiny \
+	-ffunction-sections \
+	-fdata-sections
+
+TARGET_LDFLAGS += -Wl,--gc-sections
+
+MAKE_FLAGS := \
+	LDFLAGS="$(TARGET_LDFLAGS)" \
+	TARGET=tip TOOLCHAIN_DIR="$(TOOLCHAIN_DIR)" \
+	TOOLCHAIN_PREFIX="$(TARGET_CROSS)" \
+	NO_RDYNAMIC=1
 
 define Build/Compile
 	$(STAGING_DIR_HOSTPKG)/bin/protoc-c \
@@ -62,14 +72,11 @@ define Build/Compile
 	$(CP) $(PKG_BUILD_DIR)/src/lib/datapipeline/inc/opensync_stats.pb-c.c $(PKG_BUILD_DIR)/src/lib/datapipeline/src
 	$(RM) $(PKG_BUILD_DIR)/src/lib/datapipeline/inc/opensync_stats.pb-c.c
 
-
 	$(MAKE) -C $(PKG_BUILD_DIR) \
 		OWRT_CFLAGS="$(TARGET_CFLAGS)" \
-		TARGET=tip TOOLCHAIN_DIR="$(TOOLCHAIN_DIR)" \
-		TOOLCHAIN_PREFIX="$(TARGET_CROSS)" STAGING_DIR="$(STAGING_DIR)"
+		$(MAKE_FLAGS)
 	$(MAKE) -C $(PKG_BUILD_DIR) rootfs \
-		TARGET=tip TOOLCHAIN_DIR="$(TOOLCHAIN_DIR)" \
-		TOOLCHAIN_PREFIX="$(TARGET_CROSS)"
+		$(MAKE_FLAGS)
 endef
 
 define Package/opensync/install
