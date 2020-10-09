@@ -19,4 +19,6 @@ extern int radio_ubus_init(void);
 extern int hapd_rrm_enable(char *name, int neighbor, int beacon);
 extern int hapd_rrm_set_neighbors(char *name, struct rrm_neighbor *neigh, int count);
 
+extern void radio_maverick(void *arg);
+
 #endif

@@ -130,7 +130,7 @@ const struct uci_blob_param_list wifi_device_param = {
 	.params = wifi_device_policy,
 };
 
-static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_Config *rconf)
+static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_Config *rconf, bool force)
 {
 	struct blob_attr *tb[__WDEV_ATTR_MAX] = { };
 	struct schema_Wifi_Radio_State  rstate;
@@ -162,7 +162,7 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 		SCHEMA_SET_INT(rstate.channel, blobmsg_get_u32(tb[WDEV_ATTR_CHANNEL]));
 
 	SCHEMA_SET_INT(rstate.enabled, 1);
-	if (tb[WDEV_ATTR_DISABLED] && blobmsg_get_bool(tb[WDEV_ATTR_DISABLED]))
+	if (!force && tb[WDEV_ATTR_DISABLED] && blobmsg_get_bool(tb[WDEV_ATTR_DISABLED]))
 		SCHEMA_SET_INT(rstate.enabled, 0);
 	else
 		SCHEMA_SET_INT(rstate.enabled, 1);
@@ -321,7 +321,7 @@ static void periodic_task(void *arg)
 		struct uci_section *s = uci_to_section(e);
 
 		if (!strcmp(s->type, "wifi-device"))
-			radio_state_update(s, NULL);
+			radio_state_update(s, NULL, false);
 	}
 
 	uci_foreach_element_safe(&wireless->sections, tmp, e) {
@@ -350,7 +350,7 @@ bool target_radio_config_init2(void)
 		struct uci_section *s = uci_to_section(e);
 
 		if (!strcmp(s->type, "wifi-device"))
-			radio_state_update(s, &rconf);
+			radio_state_update(s, &rconf, false);
 	}
 
 	uci_foreach_element(&wireless->sections, e) {
@@ -362,6 +362,82 @@ bool target_radio_config_init2(void)
 	uci_unload(uci, wireless);
 
 	return true;
+}
+
+enum {
+	SYS_ATTR_DEPLOYED,
+	__SYS_ATTR_MAX,
+};
+
+static const struct blobmsg_policy system_policy[__SYS_ATTR_MAX] = {
+	[SYS_ATTR_DEPLOYED] = { .name = "deployed", .type = BLOBMSG_TYPE_INT32 },
+};
+
+static const struct uci_blob_param_list system_param = {
+	.n_params = __SYS_ATTR_MAX,
+	.params = system_policy,
+};
+
+void radio_maverick(void *arg)
+{
+	struct blob_attr *tb[__SYS_ATTR_MAX] = { };
+	struct schema_Wifi_Radio_Config rconf;
+	struct uci_element *e = NULL;
+
+	blob_buf_init(&b, 0);
+	if (uci_section_to_blob(uci, "system", "tip", &b, &system_param))
+		return;
+
+	blobmsg_parse(system_policy, __SYS_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
+	if (tb[SYS_ATTR_DEPLOYED] && blobmsg_get_u32(tb[SYS_ATTR_DEPLOYED]))
+		return;
+
+	uci_load(uci, "wireless", &wireless);
+	uci_foreach_element(&wireless->sections, e) {
+		struct uci_section *s = uci_to_section(e);
+		struct schema_Wifi_VIF_Config conf;
+		char band[8];
+		char ifname[] = "wlan0";
+
+		if (strcmp(s->type, "wifi-device"))
+			continue;
+		radio_state_update(s, &rconf, true);
+
+		if (strncmp(rconf.if_name, "radio", 5))
+			continue;
+
+		ifname[4] = rconf.if_name[5];
+		memset(&conf, 0, sizeof(conf));
+		schema_Wifi_VIF_Config_mark_all_present(&conf);
+		conf._partial_update = true;
+		conf._partial_update = true;
+
+	        SCHEMA_SET_INT(conf.rrm, 1);
+	        SCHEMA_SET_INT(conf.ft_psk, 0);
+	        SCHEMA_SET_INT(conf.group_rekey, 0);
+		strscpy(conf.mac_list_type, "none", sizeof(conf.mac_list_type));
+		conf.mac_list_len = 0;
+		SCHEMA_SET_STR(conf.if_name, ifname);
+		SCHEMA_SET_STR(conf.ssid_broadcast, "enabled");
+		SCHEMA_SET_STR(conf.mode, "ap");
+		SCHEMA_SET_INT(conf.enabled, 1);
+		SCHEMA_SET_INT(conf.btm, 1);
+		SCHEMA_SET_INT(conf.uapsd_enable, true);
+		SCHEMA_SET_STR(conf.bridge, "lan");
+		SCHEMA_SET_INT(conf.vlan_id, 1);
+		SCHEMA_SET_STR(conf.ssid, "Maverick");
+		STRSCPY(conf.security_keys[0], "encryption");
+	        STRSCPY(conf.security[0], "OPEN");
+	        conf.security_len = 1;
+		phy_get_band(target_map_ifname(rconf.if_name), band);
+		if (strstr(band, "5"))
+			SCHEMA_SET_STR(conf.min_hw_mode, "11ac");
+		else
+			SCHEMA_SET_STR(conf.min_hw_mode, "11n");
+
+		radio_ops->op_vconf(&conf, rconf.if_name);
+	}
+	uci_unload(uci, wireless);
 }
 
 bool target_radio_init(const struct target_radio_ops *ops)
@@ -381,6 +457,8 @@ bool target_radio_init(const struct target_radio_ops *ops)
 
 	radio_nl80211_init();
 	radio_ubus_init();
+
+	evsched_task(&radio_maverick, NULL, EVSCHED_SEC(60 * 10));
 
 	return true;
 }

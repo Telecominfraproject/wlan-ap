@@ -99,6 +99,15 @@ radio_ubus_dummy_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	return UBUS_STATUS_OK;
 }
 
+static int
+radio_maverick_cb(struct ubus_context *ctx, struct ubus_object *obj,
+		  struct ubus_request_data *req, const char *method,
+		  struct blob_attr *msg)
+{
+	radio_maverick(NULL);
+	return UBUS_STATUS_OK;
+}
+
 enum {
 	ADD_VIF_RADIO,
 	ADD_VIF_NAME,
@@ -173,6 +182,7 @@ radio_ubus_add_vif_cb(struct ubus_context *ctx, struct ubus_object *obj,
 static const struct ubus_method radio_ubus_methods[] = {
         UBUS_METHOD("dbg_add_vif", radio_ubus_add_vif_cb, add_vif_policy),
         UBUS_METHOD("dummy", radio_ubus_dummy_cb, dummy_policy),
+        UBUS_METHOD_NOARG("maverick", radio_maverick_cb),
 };
 
 static struct ubus_object_type radio_ubus_object_type =

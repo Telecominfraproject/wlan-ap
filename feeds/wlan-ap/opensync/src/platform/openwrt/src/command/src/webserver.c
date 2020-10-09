@@ -13,8 +13,8 @@ static int done;
 static void stop_http(void *arg)
 {
 	LOGN("Stopping webserver");
-	system("uci set uhttpd.main.deployed=1");
-	system("uci commit uhttpd");
+	system("uci set system.tip.deployed=1");
+	system("uci commit system");
 	system("/etc/init.d/uhttpd stop");
 	system("/etc/init.d/uhttpd disable");
 }
