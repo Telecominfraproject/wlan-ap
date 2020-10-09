@@ -19,6 +19,9 @@
 #define OVSDB_SECURITY_RADIUS_SERVER_IP     "radius_server_ip"
 #define OVSDB_SECURITY_RADIUS_SERVER_PORT   "radius_server_port"
 #define OVSDB_SECURITY_RADIUS_SERVER_SECRET "radius_server_secret"
+#define OVSDB_SECURITY_RADIUS_ACCT_IP       "radius_acct_ip"
+#define OVSDB_SECURITY_RADIUS_ACCT_PORT     "radius_acct_port"
+#define OVSDB_SECURITY_RADIUS_ACCT_SECRET   "radius_acct_secret"
 
 
 bool vif_get_security(struct schema_Wifi_VIF_State *vstate, char *mode, char *encryption, char *radiusServerIP, char *password, char *port);

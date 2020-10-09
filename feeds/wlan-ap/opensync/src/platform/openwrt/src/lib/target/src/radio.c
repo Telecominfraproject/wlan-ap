@@ -24,6 +24,8 @@
 #include "utils.h"
 #include "captive.h"
 
+ovsdb_table_t table_Hotspot20_Config;
+
 static struct uci_package *wireless;
 struct uci_context *uci;
 struct blob_buf b = { };
@@ -452,6 +454,8 @@ bool target_radio_init(const struct target_radio_ops *ops)
 	target_map_insert("radio2", "phy2");
 
 	radio_ops = ops;
+
+	OVSDB_TABLE_INIT(Hotspot20_Config, _uuid);
 
 	evsched_task(&periodic_task, NULL, EVSCHED_SEC(5));
 

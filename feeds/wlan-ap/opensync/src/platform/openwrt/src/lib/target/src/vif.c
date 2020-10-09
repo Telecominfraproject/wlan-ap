@@ -22,9 +22,12 @@
 #include "utils.h"
 #include "phy.h"
 #include "captive.h"
+#include "ovsdb_table.h"
 
 #define MODULE_ID LOG_MODULE_ID_VIF
 #define UCI_BUFFER_SIZE 80
+
+extern ovsdb_table_t table_Hotspot20_Config;
 
 extern struct blob_buf b;
 
@@ -42,9 +45,12 @@ enum {
 	WIF_ATTR_HIDDEN,
 	WIF_ATTR_ISOLATE,
 	WIF_ATTR_NETWORK,
-	WIF_ATTR_SERVER,
-	WIF_ATTR_PORT,
+	WIF_ATTR_AUTH_SERVER,
+	WIF_ATTR_AUTH_PORT,
 	WIF_ATTR_AUTH_SECRET,
+	WIF_ATTR_ACCT_SERVER,
+	WIF_ATTR_ACCT_PORT,
+	WIF_ATTR_ACCT_SECRET,
 	WIF_ATTR_IEEE80211R,
 	WIF_ATTR_IEEE80211W,
 	WIF_ATTR_MOBILITY_DOMAIN,
@@ -66,6 +72,25 @@ enum {
 	WIF_ATTR_IEEE80211K,
 	WIF_ATTR_RTS_THRESHOLD,
 	WIF_ATTR_DTIM_PERIOD,
+	WIF_ATTR_INTERWORKING,
+	WIF_ATTR_HS20,
+	WIF_ATTR_HESSID,
+	WIF_ATTR_ROAMING_CONSORTIUM,
+	WIF_ATTR_VENUE_NAME,
+	WIF_ATTR_VENUE_GROUP,
+	WIF_ATTR_VENUE_TYPE,
+	WIF_ATTR_VENUE_URL,
+	WIF_ATTR_NETWORK_AUTH_TYPE,
+	WIF_ATTR_IPADDR_TYPE_AVAILABILITY,
+	WIF_ATTR_DOMAIN_NAME,
+	WIF_ATTR_MCC_MNC,
+	WIF_ATTR_NAI_REALM,
+	WIF_ATTR_GAS_ADDR3,
+	WIF_ATTR_OSEN,
+	WIF_ATTR_ANQP_DOMAIN_ID,
+	WIF_ATTR_DEAUTH_REQUEST_TIMEOUT,
+	WIF_ATTR_OPER_FRIENDLY_NAME,
+	WIF_ATTR_OPERATING_CLASS,
 	__WIF_ATTR_MAX,
 };
 
@@ -83,9 +108,12 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_HIDDEN] = { .name = "hidden", .type = BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_ISOLATE] = { .name = "isolate", .type = BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_NETWORK] = { .name = "network", .type = BLOBMSG_TYPE_STRING },
-	[WIF_ATTR_SERVER] = { .name = "server", .type = BLOBMSG_TYPE_STRING },
-	[WIF_ATTR_PORT] = { .name = "port", .type = BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_AUTH_SERVER] = { .name = "auth_server", .type = BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_AUTH_PORT] = { .name = "auth_port", .type = BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_AUTH_SECRET] = { .name = "auth_secret", .type = BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_ACCT_SERVER] = { .name = "acct_server", .type = BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_ACCT_PORT] = { .name = "acct_port", .type = BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_ACCT_SECRET] = { .name = "acct_secret", .type = BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_IEEE80211R] = { .name = "ieee80211r", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_IEEE80211W] = { .name = "ieee80211w", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_MOBILITY_DOMAIN] = { .name = "mobility_domain", BLOBMSG_TYPE_STRING },
@@ -107,6 +135,25 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_IEEE80211K] = { .name = "ieee80211k", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_RTS_THRESHOLD] = { .name = "rts_threshold", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_DTIM_PERIOD] = { .name = "dtim_period", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_INTERWORKING] = { .name = "interworking", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_HS20] = { .name = "hs20", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_HESSID] = { .name = "hessid", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_ROAMING_CONSORTIUM] = { .name = "roaming_consortium", BLOBMSG_TYPE_ARRAY },
+	[WIF_ATTR_VENUE_NAME] = { .name = "venue_name", BLOBMSG_TYPE_ARRAY },
+	[WIF_ATTR_VENUE_GROUP] = { .name = "venue_group", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_VENUE_TYPE] = { .name = "venue_type", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_VENUE_URL] = { .name = "venue_url", BLOBMSG_TYPE_ARRAY },
+	[WIF_ATTR_NETWORK_AUTH_TYPE] = { .name = "network_auth_type", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_IPADDR_TYPE_AVAILABILITY] = { .name = "ipaddr_type_availability", BLOBMSG_TYPE_INT32 },
+	[WIF_ATTR_DOMAIN_NAME] = { .name = "domain_name", BLOBMSG_TYPE_ARRAY },
+	[WIF_ATTR_MCC_MNC] = { .name = "anqp_3gpp_cell_net", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_NAI_REALM] = { .name = "nai_realm", BLOBMSG_TYPE_ARRAY },
+	[WIF_ATTR_GAS_ADDR3] = { .name = "gas_address3", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_OSEN] = { .name = "osen", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_ANQP_DOMAIN_ID] = { .name = "anqp_domain_id", BLOBMSG_TYPE_INT32 },
+	[WIF_ATTR_DEAUTH_REQUEST_TIMEOUT] = { .name = "hs20_deauth_req_timeout", BLOBMSG_TYPE_INT32 },
+	[WIF_ATTR_OPER_FRIENDLY_NAME] = { .name = "hs20_oper_friendly_name", BLOBMSG_TYPE_ARRAY },
+	[WIF_ATTR_OPERATING_CLASS] = { .name = "hs20_operating_class", BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -145,12 +192,18 @@ static void vif_config_security_set(struct blob_buf *b,
 		blobmsg_add_string(b, "encryption", vif_crypto[i].uci);
 		blobmsg_add_bool(b, "ieee80211w", 1);
 		if (vif_crypto[i].enterprise) {
-			blobmsg_add_string(b, "server",
+			blobmsg_add_string(b, "auth_server",
 					   SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_IP));
-			blobmsg_add_string(b, "port",
+			blobmsg_add_string(b, "auth_port",
 					   SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_PORT));
 			blobmsg_add_string(b, "auth_secret",
 					   SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_SECRET));
+			blobmsg_add_string(b, "acct_server",
+					   SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_IP));
+			blobmsg_add_string(b, "acct_port",
+					   SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_PORT));
+			blobmsg_add_string(b, "acct_secret",
+					   SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_SECRET));
 		} else {
 			blobmsg_add_string(b, "key",
 					   SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_KEY));
@@ -191,18 +244,24 @@ static void vif_state_security_get(struct schema_Wifi_VIF_State *vstate,
 		goto out_none;
 
 	if (vc->enterprise) {
-		if (!tb[WIF_ATTR_SERVER] || !tb[WIF_ATTR_PORT] || !tb[WIF_ATTR_AUTH_SECRET])
+		if (!tb[WIF_ATTR_AUTH_SERVER] || !tb[WIF_ATTR_AUTH_PORT] || !tb[WIF_ATTR_AUTH_SECRET])
 			goto out_none;
 		vif_state_security_append(vstate, &index, OVSDB_SECURITY_ENCRYPTION,
 					  OVSDB_SECURITY_ENCRYPTION_WPA_EAP);
 		vif_state_security_append(vstate, &index, OVSDB_SECURITY_MODE,
 					  vc->mode);
 		vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_SERVER_IP,
-					  blobmsg_get_string(tb[WIF_ATTR_SERVER]));
+					  blobmsg_get_string(tb[WIF_ATTR_AUTH_SERVER]));
 		vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_SERVER_PORT,
-					  blobmsg_get_string(tb[WIF_ATTR_PORT]));
+					  blobmsg_get_string(tb[WIF_ATTR_AUTH_PORT]));
 		vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_SERVER_SECRET,
 					  blobmsg_get_string(tb[WIF_ATTR_AUTH_SECRET]));
+		vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_ACCT_IP,
+					  blobmsg_get_string(tb[WIF_ATTR_ACCT_SERVER]));
+		vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_ACCT_PORT,
+					  blobmsg_get_string(tb[WIF_ATTR_ACCT_PORT]));
+		vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_ACCT_SECRET,
+					  blobmsg_get_string(tb[WIF_ATTR_ACCT_SECRET]));
 	} else {
 		if (!tb[WIF_ATTR_KEY])
 			goto out_none;
@@ -517,6 +576,119 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	return true;
 }
 
+static void hs20_vif_config(struct blob_buf *b,
+		const struct schema_Hotspot20_Config *hs2conf)
+{
+	struct blob_attr *n;
+	int i = 0;
+
+	if (hs2conf->enable) {
+		blobmsg_add_bool(b, "interworking", 1);
+		blobmsg_add_bool(b, "hs20", 1);
+	}
+	else {
+		blobmsg_add_bool(b, "interworking", 0);
+		blobmsg_add_bool(b, "hs20", 0);
+	}
+
+	if (strlen(hs2conf->hessid))
+		blobmsg_add_string(b, "hessid", hs2conf->hessid);
+
+	n = blobmsg_open_array(b, "roaming_consortium");
+	for (i = 0; i < hs2conf->roaming_oi_len; i++)
+	{
+		blobmsg_add_string(b, NULL, hs2conf->roaming_oi[i]);
+	}
+	blobmsg_close_array(b, n);
+
+	n = blobmsg_open_array(b, "venue_name");
+	for (i = 0; i < hs2conf->venue_name_len; i++)
+	{
+		blobmsg_add_string(b, NULL, hs2conf->venue_name[i]);
+	}
+	blobmsg_close_array(b, n);
+
+	n = blobmsg_open_array(b, "venue_url");
+	for (i = 0; i < hs2conf->venue_url_len; i++)
+	{
+		blobmsg_add_string(b, NULL, hs2conf->venue_url[i]);
+	}
+	blobmsg_close_array(b, n);
+
+	n = blobmsg_open_array(b, "domain_name");
+	for (i = 0; i < hs2conf->domain_name_len; i++)
+	{
+		blobmsg_add_string(b, NULL, hs2conf->domain_name[i]);
+	}
+	blobmsg_close_array(b, n);
+
+	n = blobmsg_open_array(b, "nai_realm");
+	for (i = 0; i < hs2conf->nai_realm_len; i++)
+	{
+		blobmsg_add_string(b, NULL, hs2conf->nai_realm[i]);
+	}
+	blobmsg_close_array(b, n);
+
+	if (strlen(hs2conf->network_auth_type))
+		blobmsg_add_string(b, "network_auth_type", hs2conf->network_auth_type);
+
+	if (strlen(hs2conf->mcc_mnc))
+		blobmsg_add_string(b, "anqp_3gpp_cell_net", hs2conf->mcc_mnc);
+
+	if (hs2conf->gas_addr3_behavior < 3)
+		blobmsg_add_u32(b, "gas_address3", hs2conf->gas_addr3_behavior);
+
+	if (hs2conf->osen)
+		blobmsg_add_bool(b, "osen", 1);
+	else
+		blobmsg_add_bool(b, "osen", 0);
+
+	if (hs2conf->anqp_domain_id > 0)
+		blobmsg_add_u32(b, "anqp_domain_id", hs2conf->anqp_domain_id);
+
+	if (hs2conf->deauth_request_timeout > 0)
+		blobmsg_add_u32(b, "hs20_deauth_req_timeout", hs2conf->deauth_request_timeout);
+
+	if (hs2conf->operating_class > 0)
+		blobmsg_add_u32(b, "hs20_operating_class", hs2conf->operating_class);
+
+	n = blobmsg_open_array(b, "hs20_oper_friendly_name");
+	for (i = 0; i < hs2conf->operator_friendly_name_len; i++)
+	{
+		blobmsg_add_string(b, NULL, hs2conf->operator_friendly_name[i]);
+	}
+	blobmsg_close_array(b, n);
+
+	if (strlen(hs2conf->venue_group_type))
+	{
+		char *venue_group = strtok((char*)hs2conf->venue_group_type, ":");
+		blobmsg_add_string(b, "venue_group", venue_group);
+		blobmsg_add_string(b, "venue_type", strtok(NULL, ":"));
+	}
+
+}
+
+static bool
+set_hs20_config(struct blob_buf *b,
+		const struct schema_Wifi_VIF_Config *vconf)
+{
+	struct schema_Hotspot20_Config *hs2config;
+	int i;
+	int n;
+
+	if (!(hs2config = ovsdb_table_select_where(&table_Hotspot20_Config, json_array(), &n)))
+		return false;
+
+	while (n--)
+		for (i = 0; i < hs2config[n].vif_config_len; i++)
+		{
+			if (!strcmp(hs2config->vif_config[i].uuid, vconf->_uuid.uuid))
+				hs20_vif_config(b, &hs2config[n]);
+		}
+
+	return true;
+}
+
 bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
 {
 	struct uci_package *wireless;
@@ -625,6 +797,8 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 	vif_config_security_set(&b, vconf);
 	if (changed->custom_options)
 		vif_config_custom_opt_set(&b, vconf);
+
+	set_hs20_config(&b, vconf);
 
 	blob_to_uci_section(uci, "wireless", vconf->if_name, "wifi-iface",
 			    b.head, &wifi_iface_param, NULL);
