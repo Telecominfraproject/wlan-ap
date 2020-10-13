@@ -24,6 +24,7 @@
 
 $(info xxx $(OVERRIDE_DIR))
 UNIT_CFLAGS  += -I$(OVERRIDE_DIR)/inc
+UNIT_CFLAGS  += -I$(TOP_DIR)/src/sm/src
 
 UNIT_EXPORT_CFLAGS := $(UNIT_CFLAGS)
 

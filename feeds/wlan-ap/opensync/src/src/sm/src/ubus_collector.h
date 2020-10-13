@@ -1,0 +1,107 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
+#ifndef UBUS_COLLECTOR_H_INCLUDED
+#define UBUS_COLLECTOR_H_INCLUDED
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <syslog.h>
+#include "target.h"
+
+#include "evsched.h"
+#include "libubus.h"
+#include "dpp_events.h"
+#include "radio.h"
+#include "ubus.h"
+
+/* Initialize ubus collector */
+int ubus_collector_init(void);
+
+/* Clean up ubus collector objects */
+void ubus_collector_cleanup(void);
+
+#define UBUS_SOCKET "/var/run/ubus.sock"
+
+/* Poll ubus after this many seconds */
+#define UBUS_POLLING_DELAY 7
+
+/* Poll the session clearing 'garbage collector' after this many seconds */
+#define UBUS_GARBAGE_COLLECTION_DELAY 1
+
+enum {
+	UBUS_COLLECTOR_SESSIONS,
+	__UBUS_SESSIONS_MAX,
+};
+
+enum {
+	UBUS_CLIENT_SESSION,
+	__UBUS_SESSION_TYPES_MAX,
+};
+
+enum {
+	CLIENT_ASSOC_EVENT,
+	CLIENT_AUTH_EVENT,
+	CLIENT_DISCONNECT_EVENT,
+	CLIENT_FAILURE_EVENT,
+	CLIENT_FIRST_DATA_EVENT,
+	CLIENT_TIMEOUT_EVENT,
+	CLIENT_SESSION_ID,
+	__CLIENT_EVENTS_MAX,
+};
+
+enum {
+	CLIENT_ASSOC_ASSOC_TYPE,
+	CLIENT_ASSOC_TIMESTAMP,
+	CLIENT_ASSOC_BAND,
+	CLIENT_ASSOC_INTERNAL_SC,
+	CLIENT_ASSOC_RSSI,
+	CLIENT_ASSOC_SESSION_ID,
+	CLIENT_ASSOC_SSID,
+	CLIENT_ASSOC_STA_MAC,
+	CLIENT_ASSOC_USING11K,
+	CLIENT_ASSOC_USING11R,
+	CLIENT_ASSOC_USING11V,
+	__CLIENT_ASSOC_MAX,
+};
+
+enum {
+	CLIENT_AUTH_SESSION_ID,
+	CLIENT_AUTH_TIMESTAMP,
+	CLIENT_AUTH_BAND,
+	CLIENT_AUTH_AUTH_STATUS,
+	CLIENT_AUTH_AUTH_SSID,
+	CLIENT_AUTH_STA_MAC,
+	__CLIENT_AUTH_MAX,
+};
+
+enum {
+	CLIENT_DISCONNECT_SESSION_ID,
+	CLIENT_DISCONNECT_TIMESTAMP,
+	CLIENT_DISCONNECT_STA_MAC,
+	CLIENT_DISCONNECT_BAND,
+	CLIENT_DISCONNECT_RSSI,
+	CLIENT_DISCONNECT_INTERNAL_RC,
+	CLIENT_DISCONNECT_SSID,
+	__CLIENT_DISCONNECT_MAX,
+};
+
+enum {
+	CLIENT_FIRST_DATA_STA_MAC,
+	CLIENT_FIRST_DATA_SESSION_ID,
+	CLIENT_FIRST_DATA_TIMESTAMP,
+	CLIENT_FIRST_DATA_TX_TIMESTAMP,
+	CLIENT_FIRST_DATA_RX_TIMESTAMP,
+	__CLIENT_FIRST_DATA_MAX,
+};
+
+enum {
+	BSS_LIST_BSS_LIST,
+	__BSS_LIST_DATA_MAX,
+};
+
+enum {
+	BSS_TABLE_BSS_NAME,
+	__BSS_TABLE_MAX,
+};
+
+#endif /* UBUS_COLLECTOR_H_INCLUDED */
