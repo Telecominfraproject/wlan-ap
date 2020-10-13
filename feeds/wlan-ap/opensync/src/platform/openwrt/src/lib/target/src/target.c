@@ -59,6 +59,10 @@ bool target_init(target_init_opt_t opt, struct ev_loop *loop)
 
 	switch (opt) {
 	case TARGET_INIT_MGR_SM:
+		if (evsched_init(loop) == false) {
+			LOGE("Initializing SM (Failed to initialize EVSCHED)");
+			return -1;
+		}
 		break;
 
 	case TARGET_INIT_MGR_WM:

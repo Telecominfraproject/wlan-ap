@@ -29,6 +29,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "dpp_client.h"
 #include "dpp_survey.h"
+#include "dpp_events.h"
 
 #define TARGET_CERT_PATH            "/var/run/openvswitch/certs"
 #define TARGET_MANAGERS_PID_PATH    "/tmp/dmpid"
@@ -55,6 +56,11 @@ typedef struct
 } target_survey_record_t;
 
 typedef void target_capacity_data_t;
+
+typedef struct
+{
+	dpp_event_record_t record;
+} target_event_record_t;
 
 /******************************************************************************
  *  MANAGERS definitions
