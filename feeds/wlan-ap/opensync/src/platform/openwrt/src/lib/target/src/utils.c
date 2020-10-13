@@ -403,6 +403,13 @@ bool radio_state_to_conf(struct schema_Wifi_Radio_State *rstate,
 	}
 	rconf->hw_config_len = rstate->hw_config_len;
 
+	for (i = 0; i < rstate->custom_options_len; i++) {
+		STRSCPY(rconf->custom_options_keys[i],
+			rstate->custom_options_keys[i]);
+		STRSCPY(rconf->custom_options[i], rstate->custom_options[i]);
+	}
+	rconf->custom_options_len = rstate->custom_options_len;
+
 	return true;
 
 #undef RADIO_COPY
