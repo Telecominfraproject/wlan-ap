@@ -27,6 +27,7 @@
 static struct uci_package *wireless;
 struct uci_context *uci;
 struct blob_buf b = { };
+struct blob_buf del = { };
 int reload_config = 0;
 
 enum {
@@ -41,9 +42,9 @@ enum {
 	WDEV_ATTR_CHANBW,
 	WDEV_ATTR_TX_ANTENNA,
 	WDEV_ATTR_FREQ_BAND,
+	WDEV_ATTR_DISABLE_B_RATES,
 	__WDEV_ATTR_MAX,
 };
-
 
 static const struct blobmsg_policy wifi_device_policy[__WDEV_ATTR_MAX] = {
 	[WDEV_ATTR_PATH] = { .name = "path", .type = BLOBMSG_TYPE_STRING },
@@ -57,7 +58,72 @@ static const struct blobmsg_policy wifi_device_policy[__WDEV_ATTR_MAX] = {
 	[WDEV_ATTR_CHANBW] = { .name = "chanbw", .type = BLOBMSG_TYPE_INT32 },
 	[WDEV_ATTR_TX_ANTENNA] = { .name = "tx_antenna", .type = BLOBMSG_TYPE_INT32 },
 	[WDEV_ATTR_FREQ_BAND] = { .name = "freq_band", .type = BLOBMSG_TYPE_STRING },
+        [WDEV_ATTR_DISABLE_B_RATES] = { .name = "legacy_rates", .type = BLOBMSG_TYPE_BOOL },
 };
+
+#define SCHEMA_CUSTOM_OPT_SZ            20
+#define SCHEMA_CUSTOM_OPTS_MAX          1
+
+static const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
+{
+	SCHEMA_CONSTS_DISABLE_B_RATES,
+};
+
+static void radio_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del,
+                                      const struct schema_Wifi_Radio_Config *rconf)
+{
+	int i;
+	char value[20];
+	const char *opt;
+	const char *val;
+
+	for (i = 0; i < SCHEMA_CUSTOM_OPTS_MAX; i++) {
+		opt = custom_options_table[i];
+		val = SCHEMA_KEY_VAL(rconf->custom_options, opt);
+
+		if (!val)
+			strncpy(value, "0", 20);
+		else
+			strncpy(value, val, 20);
+
+		if (strcmp(opt, SCHEMA_CONSTS_DISABLE_B_RATES ) == 0) {
+			if (strcmp(value, "1") == 0)
+				blobmsg_add_bool(b, "legacy_rates", 0);
+			else 
+				blobmsg_add_bool(del, "legacy_rates", 0);
+		}
+	}
+}
+
+static void set_custom_option_state(struct schema_Wifi_Radio_State *rstate,
+                                    int *index, const char *key,
+                                    const char *value)
+{
+	STRSCPY(rstate->custom_options_keys[*index], key);
+	STRSCPY(rstate->custom_options[*index], value);
+	*index += 1;
+	rstate->custom_options_len = *index;
+}
+
+static void radio_state_custom_options_get(struct schema_Wifi_Radio_State *rstate,
+                                         struct blob_attr **tb)
+{
+	int i;
+	int index = 0;
+	const char *opt;
+
+	for (i = 0; i < SCHEMA_CUSTOM_OPTS_MAX; i++) {
+		opt = custom_options_table[i];
+
+		if ((strcmp(opt, SCHEMA_CONSTS_DISABLE_B_RATES) == 0) && (tb[WDEV_ATTR_DISABLE_B_RATES])) {
+			if (blobmsg_get_bool(tb[WDEV_ATTR_DISABLE_B_RATES])) {
+				set_custom_option_state(rstate, &index, opt, "0");
+			} else {
+				set_custom_option_state(rstate, &index, opt, "1");
+			}
+                }
+	}
+}
 
 const struct uci_blob_param_list wifi_device_param = {
 	.n_params = __WDEV_ATTR_MAX,
@@ -70,7 +136,7 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 	struct schema_Wifi_Radio_State  rstate;
 	char phy[6];
 
-	LOGN("%s: get state", rstate.if_name);
+	LOGN("%s: get state", s->e.name);
 
 	memset(&rstate, 0, sizeof(rstate));
 	schema_Wifi_Radio_State_mark_all_present(&rstate);
@@ -167,6 +233,8 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 	if (!phy_get_mac(phy, rstate.mac))
 		rstate.mac_exists = true;
 
+	radio_state_custom_options_get(&rstate, tb);
+
 	if (rconf) {
 		LOGN("%s: updating radio config", rstate.if_name);
 		radio_state_to_conf(&rstate, rconf);
@@ -183,6 +251,7 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 			      const struct schema_Wifi_Radio_Config_flags *changed)
 {
 	blob_buf_init(&b, 0);
+	blob_buf_init(&del, 0);
 
 	if (changed->channel && rconf->channel)
 		blobmsg_add_u32(&b, "channel", rconf->channel);
@@ -218,8 +287,11 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 			 LOGE("%s: failed to set ht/hwmode", rconf->if_name);
 	}
 
+	if (changed->custom_options)
+		radio_config_custom_opt_set(&b, &del, rconf);
+
 	blob_to_uci_section(uci, "wireless", rconf->if_name, "wifi-device",
-			    b.head, &wifi_device_param, NULL);
+			    b.head, &wifi_device_param, del.head);
 
 	reload_config = 1;
 

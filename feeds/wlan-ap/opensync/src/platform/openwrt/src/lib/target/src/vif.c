@@ -223,7 +223,6 @@ out_none:
 /* Custom options table */
 #define SCHEMA_CUSTOM_OPT_SZ            20
 #define SCHEMA_CUSTOM_OPTS_MAX          8
-#define SCHEMA_CONSTS_IEEE80211k        "ieee80211k"
 
 const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 {
@@ -381,6 +380,8 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	char mac[ETH_ALEN * 3];
 	char *ifname, radio[IF_NAMESIZE];
 	char band[8];
+
+	LOGN("%s: get state", s->e.name);
 
 	memset(&vstate, 0, sizeof(vstate));
 	schema_Wifi_VIF_State_mark_all_present(&vstate);
