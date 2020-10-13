@@ -201,7 +201,7 @@ static void vif_state_security_get(struct schema_Wifi_VIF_State *vstate,
 					  blobmsg_get_string(tb[WIF_ATTR_SERVER]));
 		vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_SERVER_PORT,
 					  blobmsg_get_string(tb[WIF_ATTR_PORT]));
-		vif_state_security_append(vstate, &index, OVSDB_SECURITY_KEY,
+		vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_SERVER_SECRET,
 					  blobmsg_get_string(tb[WIF_ATTR_AUTH_SECRET]));
 	} else {
 		if (!tb[WIF_ATTR_KEY])
