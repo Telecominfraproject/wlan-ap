@@ -42,12 +42,19 @@ UNIT_SRC    += src/cmd_tcpdump.c
 UNIT_SRC    += src/webserver.c
 UNIT_SRC    += src/crashlog.c
 UNIT_SRC    += src/cmd_crashlog.c
+UNIT_SRC    += src/redirclient.c
+UNIT_SRC    += src/redirintercomm.c
+UNIT_SRC    += src/redirmain.c
+UNIT_SRC    += src/redirmsgdispatch.c
+UNIT_SRC    += src/redirtask.c
+UNIT_SRC    += src/libwcf_devif.c
+UNIT_SRC    += src/cmd_portforwarding.c
 
 UNIT_CFLAGS := -I$(UNIT_PATH)/inc
 UNIT_CFLAGS += -Isrc/lib/common/inc/
 UNIT_CFLAGS += -Isrc/lib/version/inc/
 
-UNIT_LDFLAGS += -lev -lubox -luci -lubus
+UNIT_LDFLAGS += -lev -lubox -luci -lubus -lwebsocket
 UNIT_LDFLAGS += -lrt
 
 UNIT_EXPORT_CFLAGS := $(UNIT_CFLAGS)
