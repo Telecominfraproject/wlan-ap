@@ -23,6 +23,9 @@ static struct cmd_handler {
 	}, {
 		.cmd = "crashlog",
 		.cb = cmd_handler_crashlog,
+	}, {
+		.cmd = "startPortForwardingSession",
+		.cb = cmd_handler_port_forwarding,
 	},
 };
 
