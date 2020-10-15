@@ -26,6 +26,9 @@ enum {
 	NET_ATTR_IFNAME,
 	NET_ATTR_VID,
 	NET_ATTR_VLAN_FILTERING,
+	NET_ATTR_IP6ADDR,
+	NET_ATTR_GRE_REMOTE_ADDR,
+	NET_ATTR_GRE6_REMOTE_ADDR,
 	__NET_ATTR_MAX,
 };
 
@@ -44,6 +47,9 @@ static const struct blobmsg_policy network_policy[__NET_ATTR_MAX] = {
 	[NET_ATTR_IFNAME] = { .name = "ifname", .type = BLOBMSG_TYPE_STRING },
 	[NET_ATTR_VID] = { .name = "vid", .type = BLOBMSG_TYPE_INT32 },
 	[NET_ATTR_VLAN_FILTERING] = { .name = "vlan_filtering", .type = BLOBMSG_TYPE_BOOL },
+	[NET_ATTR_IP6ADDR] = { .name = "ip6addr", .type = BLOBMSG_TYPE_STRING },
+	[NET_ATTR_GRE_REMOTE_ADDR] = {.name = "peeraddr", .type = BLOBMSG_TYPE_STRING},
+	[NET_ATTR_GRE6_REMOTE_ADDR] = {.name = "peer6addr", .type = BLOBMSG_TYPE_STRING},
 };
 
 const struct uci_blob_param_list network_param = {
@@ -84,10 +90,11 @@ static void wifi_inet_conf_load(struct uci_section *s)
 		conf.network = true;
 	}
 
-	if (tb[NET_ATTR_PROTO])
-		SCHEMA_SET_STR(conf.ip_assign_scheme, blobmsg_get_string(tb[NET_ATTR_PROTO]));
-	else
-		SCHEMA_SET_STR(conf.ip_assign_scheme, "none");
+	if (tb[NET_ATTR_PROTO]) {
+		char *proto = blobmsg_get_string(tb[NET_ATTR_PROTO]);
+		if (!strcmp(proto, "dhcp") || !strcmp(proto, "static") || !strcmp(proto, "none"))
+			SCHEMA_SET_STR(conf.ip_assign_scheme, proto);
+	}
 
 	if (!strcmp(conf.ip_assign_scheme, "dhcpv6"))
 		SCHEMA_SET_STR(conf.ip_assign_scheme, "dhcp");
@@ -117,13 +124,38 @@ static void wifi_inet_conf_load(struct uci_section *s)
 
 	if (ifname && *ifname == '@')
 		SCHEMA_SET_STR(conf.parent_ifname, &ifname[1]);
-	else
+	else if (strcmp(conf.if_type, "gre"))
 		dhcp_get_config(&conf);
+
 	if (ifname && !l3_device_split(ifname, &info)) {
 		SCHEMA_SET_STR(conf.parent_ifname, info.name);
 		if (info.vid)
 			SCHEMA_SET_INT(conf.vlan_id, info.vid);
 	}
+
+	if (!strcmp(conf.if_type, "gre")) {
+		if (tb[NET_ATTR_IPADDR]) {
+			SCHEMA_SET_STR(conf.gre_local_inet_addr,
+					blobmsg_get_string(tb[NET_ATTR_IPADDR]));
+		} else if (tb[NET_ATTR_IP6ADDR]) {
+			SCHEMA_SET_STR(conf.gre_local_inet_addr,
+					blobmsg_get_string(tb[NET_ATTR_IP6ADDR]));
+		}
+
+		if (tb[NET_ATTR_GRE_REMOTE_ADDR]) {
+			SCHEMA_SET_STR(conf.gre_remote_inet_addr,
+					blobmsg_get_string(tb[NET_ATTR_GRE_REMOTE_ADDR]));
+		} else if (tb[NET_ATTR_GRE6_REMOTE_ADDR]) {
+			SCHEMA_SET_STR(conf.gre_remote_inet_addr,
+					blobmsg_get_string(tb[NET_ATTR_GRE6_REMOTE_ADDR]));
+		}
+
+		if (tb[NET_ATTR_IFNAME]) {
+			SCHEMA_SET_STR(conf.gre_ifname,
+					blobmsg_get_string(tb[NET_ATTR_IFNAME]));
+		}
+	}
+
 	firewall_get_config(&conf);
 
 	if (!ovsdb_table_upsert(&table_Wifi_Inet_Config, &conf, false))
@@ -149,9 +181,12 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 	else
 		blobmsg_add_bool(&del, "disabled", 1);
 
-	if (!iconf->parent_ifname_exists && strcmp(iconf->if_type, "eth")) {
+	if (!iconf->parent_ifname_exists && strcmp(iconf->if_type, "eth")
+		&& strcmp(iconf->if_type, "gre")) {
 		blobmsg_add_string(&b, "type", iconf->if_type);
 		blobmsg_add_bool(&b, "vlan_filtering", 1);
+	} else if (!strcmp(iconf->if_type, "gre")) {
+		blobmsg_add_string(&b, "type", iconf->if_type);
 	} else
 		blobmsg_add_bool(&del, "type", 1);
 
@@ -181,6 +216,20 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 	} else {
 		blobmsg_add_bool(&del, "ip4table", 1);
 		blobmsg_add_bool(&del, "vid", 1);
+	}
+
+	if (!strcmp(iconf->if_type, "gre")) {
+		blobmsg_add_string(&b, "ifname", iconf->gre_ifname);
+		blobmsg_add_string(&b, "network", "lan");
+		if (!is_ipv6) {
+			blobmsg_add_string(&b, "proto", "gretap");
+			blobmsg_add_string(&b, "ipaddr", iconf->gre_local_inet_addr);
+			blobmsg_add_string(&b, "peeraddr", iconf->gre_remote_inet_addr);
+		} else {
+			blobmsg_add_string(&b, "proto", "grev6tap");
+			blobmsg_add_string(&b, "ip6addr", iconf->gre_local_inet_addr);
+			blobmsg_add_string(&b, "peer6addr", iconf->gre_remote_inet_addr);
+		}
 	}
 
 	if (iconf->mtu_exists)
