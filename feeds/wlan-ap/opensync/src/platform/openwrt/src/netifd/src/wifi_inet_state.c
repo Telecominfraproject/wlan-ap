@@ -123,6 +123,9 @@ void wifi_inet_state_set(struct blob_attr *msg)
 			SCHEMA_SET_STR(state.hwaddr, mac);
 		if (!net_is_bridge(l3_device))
 			SCHEMA_SET_STR(state.if_type, "bridge");
+		else if (!strncmp(l3_device, "gre4", strlen("gre4")) ||
+			!strncmp(l3_device, "gre6", strlen("gre6")))
+			SCHEMA_SET_STR(state.if_type, "gre");
 		else
 			SCHEMA_SET_STR(state.if_type, "eth");
 		if (!l3_device_split(l3_device, &info) && strcmp(info.name, state.if_name)) {
@@ -205,8 +208,11 @@ void wifi_inet_state_set(struct blob_attr *msg)
 		}
 	}
 
-	if (tb[NET_ATTR_PROTO])
-		SCHEMA_SET_STR(state.ip_assign_scheme, blobmsg_get_string(tb[NET_ATTR_PROTO]));
+	if (tb[NET_ATTR_PROTO]) {
+		char *proto = blobmsg_get_string(tb[NET_ATTR_PROTO]);
+		if (!strcmp(proto, "dhcp") || !strcmp(proto, "static") || !strcmp(proto, "none"))
+			SCHEMA_SET_STR(state.ip_assign_scheme, proto);
+	}
 	else
 		SCHEMA_SET_STR(state.ip_assign_scheme, "none");
 
@@ -224,6 +230,13 @@ void wifi_inet_state_set(struct blob_attr *msg)
 			memcpy(&state.inet_config, &config._uuid, sizeof(config._uuid));
 			state.inet_config_exists = true;
 			state.inet_config_present = true;
+			if (!strcmp(state.if_type, "gre")) {
+				SCHEMA_SET_STR(state.gre_local_inet_addr,
+						config.gre_local_inet_addr);
+				SCHEMA_SET_STR(state.gre_remote_inet_addr,
+						config.gre_remote_inet_addr);
+				SCHEMA_SET_STR(state.gre_ifname,config.gre_ifname);
+			}
 		}
 	}
 
