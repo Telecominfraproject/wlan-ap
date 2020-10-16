@@ -21,6 +21,7 @@ UNIT_CFLAGS += -Isrc/lib/version/inc/
 UNIT_LDFLAGS += -lev -lubox -luci -lubus
 UNIT_LDFLAGS += -lrt
 UNIT_LDFLAGS += -lnl-tiny
+UNIT_LDFLAGS += -linterapcomm
 
 UNIT_EXPORT_CFLAGS := $(UNIT_CFLAGS)
 UNIT_EXPORT_LDFLAGS := $(UNIT_LDFLAGS)

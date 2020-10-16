@@ -14,6 +14,9 @@
 #include <evsched.h>
 #include <syslog.h>
 #include <getopt.h>
+#include <interap/interAPcomm.h>
+#include <sys/ioctl.h>
+#include <arpa/inet.h>
 
 #include "ds_tree.h"
 #include "log.h"
@@ -27,17 +30,19 @@
 #include "nl_ucc.h"
 #include "ucc.h"
 #include "dppline.h"
+
 #define MODULE_ID LOG_MODULE_ID_MAIN
+#define IAC_VOIP_PORT 50000
 
-static unsigned int mcgroups;		/* Mask of groups */
-
+static ev_io nl_io;
+static ev_io iac_io;
+struct nl_sock* nlsock = NULL;
 static log_severity_t cmdm_log_severity = LOG_SEVERITY_INFO;
 
-static void prep_nl_sock(struct nl_sock** nlsock)
+static void prep_nl_sock(struct nl_sock** nlsock, unsigned int mcgroups)
 {
 	int family_id, grp_id;
 	unsigned int bit = 0;
-	mcgroups |= 1 << (0); //group 0 Kir-change
 
 	*nlsock = nl_socket_alloc();
 	if(!*nlsock) {
@@ -93,49 +98,55 @@ exit_err:
     exit(EXIT_FAILURE);
 }
 
-static int print_rx_msg(struct nl_msg *msg, void* arg)
+/* Get current ip broadcast address */
+int get_current_ip(char *ip, char *iface) {
+
+	int fd;
+	struct ifreq ifr;
+
+	if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+		LOGI("Error: socket failed");
+		return -1;
+	}
+
+	ifr.ifr_addr.sa_family = AF_INET;
+	strncpy(ifr.ifr_name, iface, IFNAMSIZ-1);
+
+	if ((ioctl(fd, SIOCGIFBRDADDR, &ifr)) < 0) {
+		LOGI("Error: ioctl failed");
+		return -1;
+	}
+
+	memcpy(ip, inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr),
+	       16);
+
+	close(fd);
+
+	return 0;
+}
+
+static int rx_msg(struct nl_msg *msg, void* arg)
 {
 	struct nlattr *attr[GENL_UCC_ATTR_MAX+1];
 
-	struct wc_capture_buf *rbuf;
-
+	struct voip_session *data;
 	genlmsg_parse(nlmsg_hdr(msg), 0, attr, 
 			GENL_UCC_ATTR_MAX, genl_ucc_policy);
 
-	rbuf =	(struct wc_capture_buf *)nla_data(attr[GENL_UCC_ATTR_MSG]);
+	data =	(struct voip_session *)nla_data(attr[GENL_UCC_ATTR_MSG]);
 
-	LOGI("print_rx_msg: rbuf=%p", rbuf);
 	if (!attr[GENL_UCC_ATTR_MSG]) {
 		fprintf(stdout, "Kernel sent empty message!!\n");
 		return NL_OK;
 	}
-/*
-	fprintf(stdout, "Kernel says: %llu %llu %llu %d %d %d %d %d %d %d %d %d [%x:%x:%x:%x:%x:%x]\n", 
-rbuf->TimeStamp,
-rbuf->tsInUs,
-rbuf->SessionId,
-rbuf->Type,
-rbuf->From,
-rbuf->Len,
-rbuf->Channel,
-rbuf->Direction,
-rbuf->Rssi,
-rbuf->DataRate,
-rbuf->Count,
-rbuf->wifiIf,
-rbuf->staMac[0],
-rbuf->staMac[1],
-rbuf->staMac[2],
-rbuf->staMac[3],
-rbuf->staMac[4],
-rbuf->staMac[5]);
-*/ 
 
-/*
-	fprintf(stdout, "Kernel says: %s \n", 
-		nla_get_string(attr[GENL_UCC_ATTR_MSG]));
-
-*/
+	char *dst_ip = malloc(16);
+	memset(dst_ip, 0, 16);
+	if((get_current_ip(dst_ip, IAC_IFACE)) < 0) {
+		LOGI("Error: Cannot get IP for %s", IAC_IFACE);
+		return NL_OK;
+	}
+	interap_send(IAC_VOIP_PORT, dst_ip, data, sizeof(struct voip_session));
 
 	return NL_OK;
 }
@@ -147,30 +158,81 @@ static int skip_seq_check(struct nl_msg *msg, void *arg)
 	return NL_OK;
 }
 
+static void nl_event(struct ev_loop *ev, struct ev_io *io, int event)
+{
+    struct nl_cb *cb = NULL;
+    /* prep the cb */
+    cb = nl_cb_alloc(NL_CB_DEFAULT);
+    nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, skip_seq_check, NULL);
+    nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, rx_msg, NULL);
+    nl_recvmsgs(nlsock, cb);
 
-
-void netlink_listen(void) {
-	struct nl_sock* nlsock = NULL;
-	struct nl_cb *cb = NULL;
-	int ret;
-
-	LOGI("Netlink listen initialize");
-	prep_nl_sock(&nlsock);
-
-	/* prep the cb */
-	cb = nl_cb_alloc(NL_CB_DEFAULT);
-	nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, skip_seq_check, NULL);
-	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, print_rx_msg, NULL);
-	LOGI("Netlink listening");
-	do {
-		ret = nl_recvmsgs(nlsock, cb);
-	} while (!ret);
-	
-	nl_cb_put(cb);
-    nl_socket_free(nlsock);
+    nl_cb_put(cb);
 
 }
 
+void netlink_listen(struct ev_loop *loop) {
+	unsigned int mcgroups = 0;
+
+	LOGI("Netlink listen initialize");
+	mcgroups |= 1 << (GENL_UCC_MCGRP0);
+	mcgroups |= 1 << (GENL_UCC_MCGRP1);
+	prep_nl_sock(&nlsock, mcgroups);
+
+	ev_io_init(&nl_io, nl_event, nlsock->s_fd, EV_READ);
+	ev_io_start(loop, &nl_io);
+
+	LOGI("Netlink listening");
+}
+
+static int send_msg_to_kernel(struct nl_sock *sock, void *data,  unsigned int len)
+{
+	struct nl_msg* msg;
+	int family_id, err = 0;
+
+	family_id = genl_ctrl_resolve(sock, GENL_UCC_FAMILY_NAME);
+	if(family_id < 0){
+		LOGI("Unable to resolve family name!\n");
+		exit(EXIT_FAILURE);
+	}
+
+	msg = nlmsg_alloc();
+	if (!msg) {
+		LOGI("failed to allocate netlink message\n");
+		exit(EXIT_FAILURE);
+	}
+
+	if(!genlmsg_put(msg, NL_AUTO_PID, NL_AUTO_SEQ, family_id, 0, 
+		NLM_F_REQUEST, GENL_UCC_INTAP_MSG, 0)) {
+		LOGI("failed to put nl hdr!\n");
+		err = -ENOMEM;
+		goto out;
+	}
+
+	err = nla_put(msg, GENL_UCC_ATTR_INTAP_MSG, len , data);
+	if (err) {
+		LOGI("failed to put nl data!\n");
+		goto out;
+	}
+
+	err = nl_send_auto_complete(sock, msg);
+	if (err < 0) {
+		LOGI("failed to send nl message!\n");
+	}
+out:
+	nlmsg_free(msg);
+	return err;
+}
+
+int recv_process(void *data) {
+	struct nl_sock *nlsock;
+	unsigned int mcgroups = 0;
+
+	prep_nl_sock(&nlsock, mcgroups);
+	send_msg_to_kernel(nlsock, data, sizeof(struct voip_session));
+
+	return 0;
+}
 
 int main(int argc, char ** argv)
 {
@@ -210,8 +272,14 @@ int main(int argc, char ** argv)
 	}
 	evsched_init(loop);
 
+	callback cb = recv_process;
+	LOGI("Call interap_recv");
+	if( interap_recv(IAC_VOIP_PORT, cb, sizeof(struct voip_session),
+			 loop, &iac_io) < 0)
+		LOGI("Error: Failed InterAP receive");
+
 //	task_init();
-	netlink_listen();
+	netlink_listen(loop);
 //	command_ubus_init(loop);
 
 	ev_run(loop, 0);

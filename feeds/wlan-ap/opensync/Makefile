@@ -30,7 +30,7 @@ endef
 define Package/opensync
 	CATEGORY:=Network
 	TITLE:=cloud network management system
-	DEPENDS:=+libev +jansson +protobuf +libprotobuf-c +libmosquitto +libopenssl +openvswitch +libpcap +libuci +libcurl +libnl-tiny +libubus +libblobmsg-json +tcpdump +curl +lldpd +wlan-ap-keys +libradiusclient +libwebsocket
+	DEPENDS:=+libev +jansson +protobuf +libprotobuf-c +libmosquitto +libopenssl +openvswitch +libpcap +libuci +libcurl +libnl-tiny +libubus +libblobmsg-json +tcpdump +curl +lldpd +wlan-ap-keys +libradiusclient +libwebsocket +libinterapcomm
 endef
 
 define Package/opensync/description

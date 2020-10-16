@@ -35,6 +35,23 @@ struct capture_buf
     unsigned char Buffer[CAPT_BUF_SIZE];
 };
 
+/* Voice session data structures */
+struct voip_session
+{
+    uint32_t CltMacHigh;
+    uint32_t CltMacLow;
+
+    uint64_t SipSessionId;
+    unsigned int SipPort;
+    unsigned int SipState;
+    uint32_t RtpPortsFrom;
+    uint32_t RtpPortsTo;
+    uint32_t RtpVideoPortsFrom;
+    uint32_t RtpVideoPortsTo;
+    uint32_t RtpIpFrom;
+    uint32_t RtpIpTo;
+};
+
 #define GENL_UCC_HELLO_INTERVAL	2000
 
 #define GENL_UCC_FAMILY_NAME		"genl_ucc"
@@ -60,6 +77,7 @@ enum genl_ucc_attrs {
 	GENL_UCC_ATTR_UNSPEC,		/* Must NOT use element 0 */
 
 	GENL_UCC_ATTR_MSG,
+	GENL_UCC_ATTR_INTAP_MSG,
 
 	__GENL_UCC_ATTR__MAX,
 };
@@ -70,6 +88,7 @@ enum genl_ucc_attrs {
 enum {
 	GENL_UCC_C_UNSPEC,		/* Must NOT use element 0 */
 	GENL_UCC_C_MSG,
+	GENL_UCC_INTAP_MSG,
 };
 
 static struct nla_policy genl_ucc_policy[GENL_UCC_ATTR_MAX+1] = {
@@ -79,6 +98,17 @@ static struct nla_policy genl_ucc_policy[GENL_UCC_ATTR_MAX+1] = {
 		.len = sizeof(struct capture_buf)
 #else
 		.maxlen = sizeof(struct capture_buf)
+#endif
+	},
+};
+
+static struct nla_policy genl_intap_policy[GENL_UCC_ATTR_MAX+1] = {
+	[GENL_UCC_ATTR_INTAP_MSG] = {
+		.type = NLA_UNSPEC,
+#ifdef __KERNEL__
+		.len = sizeof(struct voip_session)
+#else
+		.maxlen = sizeof(struct voip_session)
 #endif
 	},
 };
