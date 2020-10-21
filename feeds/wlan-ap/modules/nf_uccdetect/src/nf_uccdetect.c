@@ -171,6 +171,8 @@ struct mac_entry
     struct voip_flow UdpFlows[MAX_UDP_FLOWS];
     struct voip_flow TcpFlows[MAX_TCP_FLOWS];
 
+    char Url[50];
+
     uint32_t tx_packets;
     uint32_t tx_bytes;
     uint32_t tx_wraps;
@@ -312,6 +314,7 @@ struct sip_call_end
     unsigned int RtpSeqFirst;
     unsigned int RtpSeqLast;
     unsigned int SipReportIdx;
+    char Url[50];
 } __attribute__((packed));
 
 struct radio_parms
@@ -368,17 +371,19 @@ int get_if_type(char *name) {
 }
 
 /*
- * get_if_id: Get id of wifi interface
+ * get_radio_id: Get id of wifi interface
  */
-int get_if_id(char *name) {
-	char id[4] = {'\0','\0','\0','\0'};
+int get_radio_id(char *name) {
+	char id[4] = {'\0','\0','\0'};
 	long res;
 	int i;
 
 	if (!strncmp(name, "wlan", 4)) {
 		id[0] = name[4];
+
 		for (i = 0; i < 2; i++) {
-			id[i+1] = name[i+6];
+			if (id[i] != '_')
+				id[i] = name[i+4];
 		}
 		kstrtol(id, 10, &res);
 		return res;
@@ -1113,7 +1118,6 @@ void voip_generate_report_event(struct mac_entry * HashPtr,
 	struct sip_call_end SipCallEnd;
 	unsigned char Tmp[4];
 	uint64_t WiFiSessionId = 0;
-	char IfName[20];
 	int WiFiIf = 0;
 	
 	if( HashPtr->SipReportSent == (Reason+1) )
@@ -1129,7 +1133,7 @@ void voip_generate_report_event(struct mac_entry * HashPtr,
 		return;
 	}
 	
-	WiFiIf = get_if_id(Intrf->name);
+	WiFiIf = get_radio_id(Intrf->name);
 	
 	memset( &SipCallEnd, 0, sizeof( SipCallEnd ) );
 	SipCallEnd.SessionId = HashPtr->SipSessionId;
@@ -1149,6 +1153,7 @@ void voip_generate_report_event(struct mac_entry * HashPtr,
 	SipCallEnd.WifiIf = 0;
 	memcpy( SipCallEnd.Codecs, HashPtr->RtpPayload, 4 );
 	
+        memcpy(&SipCallEnd.Url[0], &HashPtr->Url[0], 50);
 	//TODO: rtp_get_stats
 	
 	capture_put((unsigned char *)&SipCallEnd, 0,
@@ -1177,6 +1182,7 @@ static void voip_generate_start_event(struct mac_entry * HashPtr,
 				(VoipCodecs[i].MacLow == HashPtr->MacLow) )
 			{
 				memcpy( &(SipCallStart.Url[0]), &(VoipCodecs[i].Url[0]), 50 );
+				memcpy( &(HashPtr->Url[0]), &(VoipCodecs[i].Url[0]), 50 );
 				memcpy( &(SipCallStart.Codecs[0][0]),
 					&(VoipCodecs[i].Codecs[0][0]), 450 );
 	
@@ -1188,12 +1194,18 @@ static void voip_generate_start_event(struct mac_entry * HashPtr,
 	}
 	else
 	{
-    if( HashPtr->SipState == VOIP_MARK_SKYPE )
+    if( HashPtr->SipState == VOIP_MARK_SKYPE ) {
+        strcpy( &(HashPtr->Url[0]), "skype" );
         strcpy( &(SipCallStart.Url[0]), "skype" );
-    if( HashPtr->SipState == VOIP_MARK_GOTOMEETING )
+    }
+    if( HashPtr->SipState == VOIP_MARK_GOTOMEETING ) {
+        strcpy( &(HashPtr->Url[0]), "gotomeeting" );
         strcpy( &(SipCallStart.Url[0]), "gotomeeting" );
-    if( HashPtr->SipState == VOIP_MARK_ZOOMMEETING )
+    }
+    if( HashPtr->SipState == VOIP_MARK_ZOOMMEETING ) {
+        strcpy( &(HashPtr->Url[0]), "zoommeeting" );
         strcpy( &(SipCallStart.Url[0]), "zoommeeting" );
+    }
 }
 
 send_event:
@@ -1210,7 +1222,6 @@ send_event:
 // TODO: rtp_get_stats
 
     voip_increment_counter(WiFiIf);
-
     capture_put((unsigned char *)&SipCallStart, 0,
                 sizeof( struct sip_call_start ), PKT_TYPE_SIP_CALL_START, 
                 0, NULL, WiFiSessionId, &WiFiIf, SipCallStart.CltMac, 0);
@@ -1225,7 +1236,7 @@ void voip_generate_end_event(struct mac_entry * HashPtr, unsigned int Reason)
 	uint64_t WiFiSessionId = 0;
 	int WiFiIf = 0;
 	
-	WiFiIf = get_if_id(HashPtr->port->name);
+	WiFiIf = get_radio_id(HashPtr->port->name);
 	
 	memset( &SipCallEnd, 0, sizeof( SipCallEnd ) );
 	SipCallEnd.SessionId = HashPtr->SipSessionId;
@@ -1245,6 +1256,8 @@ void voip_generate_end_event(struct mac_entry * HashPtr, unsigned int Reason)
 	memcpy( SipCallEnd.Codecs, HashPtr->RtpPayload, 4 );
 	if( HashPtr->VideoIsDetected )
 		SipCallEnd.VideoCodec = 1;
+
+        memcpy(&SipCallEnd.Url[0], &HashPtr->Url[0], 50);
 
 	// TODO:rtp_get_stats
 
@@ -1626,7 +1639,7 @@ int voip_sip_packet_analyze(unsigned char * Message, unsigned char * EndPtr,
             hashEntry->RtpIpTo           = HashPtr->RtpIpTo;
         }
 
-    	WiFiIf = get_if_id(HashPtr->port->name);
+	WiFiIf = get_radio_id(HashPtr->port->name);
 /*
         iac_send_message
 */
@@ -1757,7 +1770,7 @@ void voip_heuristic_flow_call_start(struct mac_entry * hash_ptr,
 	struct voip_session VoipSession;
 	int WiFiIf = 0, CalType = VOIP_MARK_SKYPE;
 
-	WiFiIf = get_if_id(hash_ptr->port->name);
+	WiFiIf = get_radio_id(hash_ptr->port->name);
 
 	if( IsTcp )
 	{

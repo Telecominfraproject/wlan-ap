@@ -74,6 +74,7 @@ typedef struct ssid_list {
 
 extern int stats_nl80211_init(void);
 extern int nl80211_get_tx_chainmask(char *name, unsigned int *mask);
+extern int nl80211_get_oper_channel(char *name, unsigned int *chan);
 extern int nl80211_get_assoclist(struct nl_call_param *nl_call_param);
 extern int nl80211_get_survey(struct nl_call_param *nl_call_param);
 extern int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_list, uint32_t chan_num,

@@ -67,6 +67,23 @@ static int nl80211_chainmask_recv(struct nl_msg *msg, void *arg)
 	return NL_OK;
 }
 
+static int nl80211_channel_recv(struct nl_msg *msg, void *arg)
+{
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	struct nlattr *tb[NL80211_ATTR_MAX + 1];
+	unsigned int *chan = (unsigned int *)arg;
+
+	memset(tb, 0, sizeof(tb));
+	nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
+		  genlmsg_attrlen(gnlh, 0), NULL);
+
+	if (tb[NL80211_ATTR_WIPHY_FREQ]) {
+		*chan = ieee80211_frequency_to_channel(nla_get_u32(tb[NL80211_ATTR_WIPHY_FREQ]));
+	}
+
+	return NL_OK;
+}
+
 static int nl80211_interface_recv(struct nl_msg *msg, void *arg)
 {
         struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
@@ -475,6 +492,20 @@ int nl80211_get_tx_chainmask(char *name, unsigned int *mask)
 		return -1;
 
 	return unl_genl_request(&unl, msg, nl80211_chainmask_recv, mask);
+}
+
+int nl80211_get_oper_channel(char *name, unsigned int *chan)
+{
+	struct nl_msg *msg;
+	int idx = if_nametoindex(name);
+
+	if (!idx)
+		return -1;
+
+	msg = unl_genl_msg(&unl, NL80211_CMD_GET_INTERFACE, true);
+	nla_put_u32(msg, NL80211_ATTR_IFINDEX, idx);
+
+	return unl_genl_request(&unl, msg, nl80211_channel_recv, chan);
 }
 
 int nl80211_get_ssid(struct nl_call_param *nl_call_param)
