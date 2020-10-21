@@ -359,21 +359,6 @@ bool target_stats_device_fanrpm_get(uint32_t *fan_rpm)
 }
 
 /******************************************************************************
- *  UCC Voice Video definitions
- *****************************************************************************/
-
-bool target_stats_channel_get(char *radio_if, unsigned int *chan)
-{
-	bool ret = true;
-	if ((nl80211_get_oper_channel(radio_if, chan)) < 0)
-		ret = false;
-
-	LOGT("%s: channel %d", radio_if, *chan);
-
-	return ret;
-}
-
-/******************************************************************************
  *  NETWORK PROBE definitions
  *****************************************************************************/
 bool target_stats_network_probe_get(dpp_network_probe_record_t *network_probe_report)
