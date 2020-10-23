@@ -133,9 +133,12 @@ void wifi_inet_state_set(struct blob_attr *msg)
 			if (info.vid)
 				SCHEMA_SET_INT(state.vlan_id, info.vid);
 		}
-	} else
-		SCHEMA_SET_STR(state.if_type, "eth");
-
+	} else {
+		if (strstr(state.if_name, "wlan") != NULL)
+                        SCHEMA_SET_STR(state.if_type, "vif");
+		else
+			SCHEMA_SET_STR(state.if_type, "eth");
+	}
 
 	if (tb[NET_ATTR_IPV4_ADDR] && blobmsg_data_len(tb[NET_ATTR_IPV4_ADDR])) {
 		struct blob_attr *ipv4[__IPV4_ATTR_MAX] = { };
