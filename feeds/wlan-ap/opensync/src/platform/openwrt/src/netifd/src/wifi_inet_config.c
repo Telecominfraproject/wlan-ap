@@ -83,7 +83,10 @@ static void wifi_inet_conf_load(struct uci_section *s)
 	if (tb[NET_ATTR_TYPE])
 		SCHEMA_SET_STR(conf.if_type, blobmsg_get_string(tb[NET_ATTR_TYPE]));
 	else
-		SCHEMA_SET_STR(conf.if_type, "eth");
+		if (strstr(s->e.name,"wlan") != NULL)
+			SCHEMA_SET_STR(conf.if_type, "vif");
+		else
+			SCHEMA_SET_STR(conf.if_type, "eth");
 
 	if (!tb[NET_ATTR_DISABLED] || !blobmsg_get_u8(tb[NET_ATTR_DISABLED])) {
 		conf.enabled = true;
@@ -182,7 +185,7 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 		blobmsg_add_bool(&del, "disabled", 1);
 
 	if (!iconf->parent_ifname_exists && strcmp(iconf->if_type, "eth")
-		&& strcmp(iconf->if_type, "gre")) {
+		&& strcmp(iconf->if_type, "gre") && strcmp(iconf->if_type, "vif")) {
 		blobmsg_add_string(&b, "type", iconf->if_type);
 		blobmsg_add_bool(&b, "vlan_filtering", 1);
 	} else if (!strcmp(iconf->if_type, "gre")) {
