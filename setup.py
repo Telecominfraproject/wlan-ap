@@ -87,7 +87,7 @@ def setup_tree():
 		for patch in patches:
 			run(["git", git_am, "-3", str(base_dir / patch)], check=True)
 		run(
-			["ln", "-s", "../profiles"], check=True,
+			["ln", "-s", profiles, "profiles"], check=True,
 		)
 		print("### Patches done")
 	except:
@@ -120,11 +120,12 @@ setup = False
 update = False
 rebase = False
 config = "config.yml"
+profiles = "../profiles"
 openwrt = "openwrt"
 git_ref = ""
 
 try:
-	opts, args = getopt.getopt(sys.argv[1:], "srdc:f:u", ["setup", "rebase", "docker", "config=", "folder=", "reference=", "update"])
+	opts, args = getopt.getopt(sys.argv[1:], "srdc:f:u2", ["setup", "rebase", "docker", "config=", "folder=", "reference=", "update", "20x" ])
 except getopt.GetoptError as err:
 	print(err)
 	sys.exit(2)
@@ -143,6 +144,10 @@ for o, a in opts:
 		git_ref = a
 	elif o in ("-d", "--docker"):
 		git_am = "apply"
+	elif o in ("-2", "--20x"):
+		config = "config-20.x.yml"
+		profiles = "../profiles-20.x"
+		openwrt = "openwrt-20.x"
 	else:
 		assert False, "unhandled option"
 
