@@ -11,7 +11,7 @@ include $(INCLUDE_DIR)/package.mk
 define KernelPackage/nf_uccdetect
   SUBMENU:=Other modules
   TITLE:=UCC Session detect using netfilter hook
-  DEPENDS:=
+  DEPENDS:= @!LINUX_5_4
   FILES:=$(PKG_BUILD_DIR)/nf_uccdetect.ko
   AUTOLOAD:=$(call AutoLoad,10,nf_uccdetect)
 endef
