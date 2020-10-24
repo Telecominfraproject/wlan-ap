@@ -27,6 +27,7 @@ ALLWIFIBOARDS:= \
 	cig-wf188 \
 	cig-wf188n \
 	cig-wf194c \
+	edgecore-eap101 \
 	sercomm-wallaby \
 	edgecore-eap102
 
@@ -107,6 +108,7 @@ $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
 $(eval $(call generate-ath11k-wifi-package,cig-wf188n,Cigtech WF188n))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c,Cigtech WF194c))
 $(eval $(call generate-ath11k-wifi-package,sercomm-wallaby,Sercomm Kiwi))
+$(eval $(call generate-ath11k-wifi-package,edgecore-eap101,EdgeCore EAP101))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap102,Edgecore EAP102))
 
 $(foreach PACKAGE,$(ALLWIFIPACKAGES),$(eval $(call BuildPackage,$(PACKAGE))))
