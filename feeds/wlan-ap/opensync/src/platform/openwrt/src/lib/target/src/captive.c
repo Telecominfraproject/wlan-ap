@@ -136,19 +136,17 @@ void vif_state_dhcp_allowlist_get(struct schema_Wifi_VIF_State *vstate)
 void ipset_flush(char *ifname)
 {
 	char com[24]="ipset flush set_wlan1";
-	int ret;
-	if(!strcmp(ifname,"wlan1"))
-	{
-		ret=system(com);
-	}
-	return;
+
+	if (!strcmp(ifname,"wlan1"))
+		system(com);
 }
+
 void vif_dhcp_opennds_allowlist_set(const struct schema_Wifi_VIF_Config *vconf, char *ifname)
 {
 	struct blob_attr *e;
 	blob_buf_init(&dnsmas, 0);
 	int i;
-	char ips[64];
+	char ips[128];
 	char buff[64];
 	ipset_flush(ifname);
 	e = blobmsg_open_array(&dnsmas, "ipset");
