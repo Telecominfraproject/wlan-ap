@@ -665,7 +665,7 @@ static bool hs20_download_icon(char *icon_name, char *icon_url)
 	CURL *curl;
 	FILE *fp;
 	CURLcode res;
-	char path[32];
+	char path[38];
 	char name[32];
 
 	strcpy(name, icon_name);
