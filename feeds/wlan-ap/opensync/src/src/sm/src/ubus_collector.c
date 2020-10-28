@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 
 #include "ubus_collector.h"
+#include <inttypes.h>
 
 /* Global list of events received from hostapd */
 dpp_event_report_data_t g_report_data;
@@ -645,9 +646,9 @@ static void ubus_collector_hostapd_clear(uint64_t session_id, char *bss)
 		return;
 	}
 
-	int l = snprintf(NULL, 0, "%lli", session_id);
+	int l = snprintf(NULL, 0, "%"PRIi64, session_id);
 	char str[l + 1];
-	snprintf(str, l + 1, "%lli", session_id);
+	snprintf(str, l + 1, "%"PRIi64, session_id);
 
 	blob_buf_init(&b, 0);
 	blobmsg_add_string(&b, "session_id", str);
