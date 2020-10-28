@@ -43,6 +43,13 @@ enum {
 	WDEV_ATTR_TX_ANTENNA,
 	WDEV_ATTR_FREQ_BAND,
 	WDEV_ATTR_DISABLE_B_RATES,
+	WDEV_ATTR_HE_SU_BEAMFORMER,
+	WDEV_ATTR_HE_MU_BEAMFORMER,
+	WDEV_ATTR_HE_BSS_COLOR,
+	WDEV_ATTR_HE_MULTIPLE_BSSID,
+	WDEV_ATTR_HE_CO_LOCATE,
+	WDEV_ATTR_HE_RNR_BEACON,
+	WDEV_ATTR_HE_EMA_BEACON,
 	__WDEV_ATTR_MAX,
 };
 
@@ -59,14 +66,28 @@ static const struct blobmsg_policy wifi_device_policy[__WDEV_ATTR_MAX] = {
 	[WDEV_ATTR_TX_ANTENNA] = { .name = "tx_antenna", .type = BLOBMSG_TYPE_INT32 },
 	[WDEV_ATTR_FREQ_BAND] = { .name = "freq_band", .type = BLOBMSG_TYPE_STRING },
         [WDEV_ATTR_DISABLE_B_RATES] = { .name = "legacy_rates", .type = BLOBMSG_TYPE_BOOL },
+        [WDEV_ATTR_HE_SU_BEAMFORMER] = { .name = "he_su_beamformer", .type = BLOBMSG_TYPE_STRING },
+        [WDEV_ATTR_HE_MU_BEAMFORMER] = { .name = "he_mu_beamformer", .type = BLOBMSG_TYPE_STRING },
+        [WDEV_ATTR_HE_BSS_COLOR] = { .name = "he_bss_color", .type = BLOBMSG_TYPE_STRING },
+        [WDEV_ATTR_HE_MULTIPLE_BSSID] = { .name = "multiple_bssid", .type = BLOBMSG_TYPE_STRING },
+        [WDEV_ATTR_HE_CO_LOCATE] = { .name = "co_locate", .type = BLOBMSG_TYPE_STRING },
+        [WDEV_ATTR_HE_RNR_BEACON] = { .name = "rnr_beacon", .type = BLOBMSG_TYPE_STRING },
+        [WDEV_ATTR_HE_EMA_BEACON] = { .name = "ema_beacon", .type = BLOBMSG_TYPE_STRING },
 };
 
 #define SCHEMA_CUSTOM_OPT_SZ            20
-#define SCHEMA_CUSTOM_OPTS_MAX          1
+#define SCHEMA_CUSTOM_OPTS_MAX          8
 
 static const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 {
 	SCHEMA_CONSTS_DISABLE_B_RATES,
+	SCHEMA_CONSTS_HE_SU_BEAMFORMER,
+	SCHEMA_CONSTS_HE_MU_BEAMFORMER,
+	SCHEMA_CONSTS_HE_BSS_COLOR,
+	SCHEMA_CONSTS_HE_MULTIPLE_BSSID,
+	SCHEMA_CONSTS_HE_CO_LOCATE,
+	SCHEMA_CONSTS_HE_RNR_BEACON,
+	SCHEMA_CONSTS_HE_EMA_BEACON,
 };
 
 static void radio_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del,
@@ -91,6 +112,11 @@ static void radio_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del
 				blobmsg_add_bool(b, "legacy_rates", 0);
 			else 
 				blobmsg_add_bool(del, "legacy_rates", 0);
+		} else {
+			if (strcmp(val, "0"))
+				blobmsg_add_string(b, opt, val);
+			else
+				blobmsg_add_bool(del, "opt", 0);
 		}
 	}
 }
@@ -111,6 +137,10 @@ static void radio_state_custom_options_get(struct schema_Wifi_Radio_State *rstat
 	int i;
 	int index = 0;
 	const char *opt;
+	int lookup[] = {
+		WDEV_ATTR_HE_SU_BEAMFORMER, WDEV_ATTR_HE_MU_BEAMFORMER, WDEV_ATTR_HE_BSS_COLOR,
+		WDEV_ATTR_HE_MULTIPLE_BSSID, WDEV_ATTR_HE_CO_LOCATE, WDEV_ATTR_HE_RNR_BEACON,
+		WDEV_ATTR_HE_EMA_BEACON};
 
 	for (i = 0; i < SCHEMA_CUSTOM_OPTS_MAX; i++) {
 		opt = custom_options_table[i];
@@ -121,7 +151,15 @@ static void radio_state_custom_options_get(struct schema_Wifi_Radio_State *rstat
 			} else {
 				set_custom_option_state(rstate, &index, opt, "1");
 			}
-                }
+		} else {
+			unsigned int l;
+
+			for (l = 0; l < ARRAY_SIZE(lookup); l++) {
+				if (!tb[lookup[l]] || strcmp(opt, wifi_device_policy[lookup[l]].name))
+					continue;
+				set_custom_option_state(rstate, &index, opt, blobmsg_get_string(tb[lookup[l]]));
+			}
+		}
 	}
 }
 

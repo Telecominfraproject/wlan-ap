@@ -66,6 +66,8 @@ enum {
 	WIF_ATTR_IEEE80211K,
 	WIF_ATTR_RTS_THRESHOLD,
 	WIF_ATTR_DTIM_PERIOD,
+	WIF_ATTR_HE_RTS_THRESHOLD,
+	WIF_ATTR_HE_TWT_REQUIRED,
 	__WIF_ATTR_MAX,
 };
 
@@ -107,6 +109,8 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_IEEE80211K] = { .name = "ieee80211k", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_RTS_THRESHOLD] = { .name = "rts_threshold", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_DTIM_PERIOD] = { .name = "dtim_period", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_HE_RTS_THRESHOLD] = { .name = "he_rts_threshold", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_HE_TWT_REQUIRED] = { .name = "he_twt_required", BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -222,7 +226,7 @@ out_none:
 
 /* Custom options table */
 #define SCHEMA_CUSTOM_OPT_SZ            20
-#define SCHEMA_CUSTOM_OPTS_MAX          8
+#define SCHEMA_CUSTOM_OPTS_MAX          10
 
 const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 {
@@ -234,6 +238,8 @@ const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 	SCHEMA_CONSTS_IEEE80211k,
 	SCHEMA_CONSTS_RTS_THRESHOLD,
 	SCHEMA_CONSTS_DTIM_PERIOD,
+	SCHEMA_CONSTS_HE_RTS_THRESHOLD,
+	SCHEMA_CONSTS_HE_TWT_REQUIRED,
 };
 
 static void vif_config_custom_opt_set(struct blob_buf *b,
@@ -277,6 +283,10 @@ static void vif_config_custom_opt_set(struct blob_buf *b,
 			blobmsg_add_string(b, "rts_threshold", value);
 		else if (strcmp(opt, "dtim_period") == 0)
 			blobmsg_add_string(b, "dtim_period", value);
+		else if (strcmp(opt, "he_twt_required") == 0)
+			blobmsg_add_string(b, "he_twt_required", value);
+		else if (strcmp(opt, "he_rts_threshold") == 0)
+			blobmsg_add_string(b, "he_rts_threshold", value);
 
 	}
 }
@@ -364,6 +374,20 @@ static void vif_state_custom_options_get(struct schema_Wifi_VIF_State *vstate,
 		} else if (strcmp(opt, "dtim_period") == 0) {
 			if (tb[WIF_ATTR_DTIM_PERIOD]) {
 				buf = blobmsg_get_string(tb[WIF_ATTR_DTIM_PERIOD]);
+				set_custom_option_state(vstate, &index,
+						custom_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "he_twt_required") == 0) {
+			if (tb[WIF_ATTR_HE_TWT_REQUIRED]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_HE_TWT_REQUIRED]);
+				set_custom_option_state(vstate, &index,
+						custom_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "he_rts_thershold") == 0) {
+			if (tb[WIF_ATTR_HE_RTS_THRESHOLD]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_HE_RTS_THRESHOLD]);
 				set_custom_option_state(vstate, &index,
 						custom_options_table[i],
 						buf);
