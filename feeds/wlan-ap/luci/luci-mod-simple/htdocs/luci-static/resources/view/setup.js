@@ -26,13 +26,6 @@ var callSystemValidateFirmwareImage = rpc.declare({
 	reject: true
 });
 
-var callSystemValidateCertificates = rpc.declare({
-	object: 'system',
-	method: 'validate_tip_certificates',
-	params: [ 'path' ],
-	reject: true
-});
-
 function parseAddressAndNetmask(ipaddr, netmask) {
         var m = (ipaddr || '').match(/^(.+)\/(\d+)$/);
         if (m) {
@@ -136,7 +129,8 @@ function showProgress(text, ongoing) {
 return view.extend({
 	load: function() {
 		return Promise.all([
-			uci.load('network')
+			uci.load('network'),
+			uci.load('system')
 		]);
 	},
 
@@ -314,20 +308,27 @@ return view.extend({
 		]);
 	},
 
-	handleCertificateUpload: function(ev) {
-		return ui.uploadFile('/tmp/certs.tar').then(function(res) {
-			showProgress(_('Uploading certificate…'), true);
+	handleCertificateUpload: function(formdata, ev) {
+		var m = L.dom.findClassInstance(document.querySelector('.cbi-map'));
 
-			return callSystemValidateCertificates('/tmp/certs.tar');
-		}).then(function(res) {
-			if (!res.valid) {
-				showProgress(_('The uploaded certificates are invalid!'), false);
-				return L.resolveDefault(fs.remove('/tmp/certs.tar'));
-			}
-		}).catch(function(err) {
-			showProgress(_('Certificate upload failed.'), false);
-			ui.addNotification(null, _('Unable to upload certificates: %s').format(err));
-		});
+		return m.save().then(L.bind(function() {
+			uci.set('system', 'tip', 'redirector', formdata.data.data.certificates.redirector);
+			return this.handleApply().then(function() {
+				return ui.uploadFile('/tmp/certs.tar').then(function(res) {
+					showProgress(_('Uploading certificate…'), false);
+					fs.exec('/sbin/certupdate').then(function(res) {
+						if (res.code)
+							ui.addNotification(null, _('Certificate validation failed.'));
+						else
+							showProgress(_('Certificate uploaded successfully.'), false);
+					}).catch(function(err) {
+						ui.addNotification(null, _('Unable to upload certificates.'));
+					});
+
+					return 0;
+				});
+			});
+		}, this));
 	},
 
 	handleSettingsSave: function(formdata, ev) {
@@ -353,7 +354,8 @@ return view.extend({
 
 		return uci.save().then(function() {
 			return Promise.all([
-				callUciCommit('network')
+				callUciCommit('network'),
+				callUciCommit('system')
 			]);
 		}).catch(function(err) {
 			ui.addNotification(null, [ E('p', [ _('Failed to save configuration: %s').format(err) ]) ])
@@ -381,7 +383,7 @@ return view.extend({
 				dns: addr_wan ? addr_wan[1] : null
 			},
 			maintenance: {},
-			certificates: {}
+			certificates: {redirector: null}
 		};
 
 		m = new form.JSONMap(formdata, _('Setup'));
@@ -440,9 +442,11 @@ return view.extend({
 
 		s = m.section(form.NamedSection, 'certificates', 'certificates', _('Upgrade Certificates'));
 
+		o = s.option(form.Value, 'redirector', _('Redirector'));
+
 		o = s.option(form.Button, 'upgrade', _('Certificate upload'));
 		o.inputtitle = _('Upload certificate…');
-		o.onclick = ui.createHandlerFn(this, 'handleCertificateUpload');
+		o.onclick = ui.createHandlerFn(this, 'handleCertificateUpload', m);
 
 		return m.render();
 	},
