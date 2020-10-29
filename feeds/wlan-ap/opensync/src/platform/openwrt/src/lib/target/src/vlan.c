@@ -152,7 +152,7 @@ static void vlan_del_routing_rule(int vid)
 void _vlan_del(struct vlan_vif *vif, int del_parent)
 {
 	avl_delete(&vif_tree, &vif->avl);
-	if (!vif->bridge)
+	if (vif->bridge)
 		avl_delete(&vif->parent->bridge, &vif->vlan);
 	else
 		avl_delete(&vif->parent->nat, &vif->vlan);
@@ -167,7 +167,7 @@ void _vlan_del(struct vlan_vif *vif, int del_parent)
 		vif->parent->bridge_created = 0;
 
 	if (del_parent && vif->parent->nat_created == 0 && vif->parent->bridge_created == 0) {
-		avl_insert(&vlan_tree, &vif->parent->avl);
+		avl_delete(&vlan_tree, &vif->parent->avl);
 		free(vif->parent);
 	}
 	free(vif);
@@ -177,7 +177,6 @@ void vlan_add(char *vifname, int vid, int bridge)
 {
 	struct vlan *vlan = vlan_find(vid);
 	struct vlan_vif *vif;
-
 
 	if (!vlan) {
 		vlan = malloc(sizeof(*vlan));
@@ -195,7 +194,7 @@ void vlan_add(char *vifname, int vid, int bridge)
 
 	vif = vlan_find_vif(vlan, vifname);
 
-	if (vif && vif->vid != vid) {
+	if (vif && ((vif->vid != vid) || (vif->bridge != bridge))) {
 		_vlan_del(vif, 0);
 		vif = NULL;
 	}
@@ -216,7 +215,7 @@ void vlan_add(char *vifname, int vid, int bridge)
 		vif->vid = vid;
 		vif->bridge = bridge;
 		vif->parent = vlan;
-		if (!bridge)
+		if (bridge)
 			avl_insert(&vlan->bridge, &vif->vlan);
 		else
 			avl_insert(&vlan->nat, &vif->vlan);
