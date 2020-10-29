@@ -81,7 +81,10 @@ static void wifi_inet_conf_load(struct uci_section *s)
 
 	SCHEMA_SET_STR(conf.if_name, s->e.name);
 	if (tb[NET_ATTR_TYPE])
-		SCHEMA_SET_STR(conf.if_type, blobmsg_get_string(tb[NET_ATTR_TYPE]));
+                if ((strstr(s->e.name,"wan_") != NULL) || (strstr(s->e.name,"lan_") != NULL))
+                        SCHEMA_SET_STR(conf.if_type, "vlan");
+                else
+			SCHEMA_SET_STR(conf.if_type, blobmsg_get_string(tb[NET_ATTR_TYPE]));
 	else
 		if (strstr(s->e.name,"wlan") != NULL)
 			SCHEMA_SET_STR(conf.if_type, "vif");
@@ -176,6 +179,11 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 	if (len && iconf->if_name[len - 1] == '6')
 		is_ipv6 = 1;
 
+	if (!strcmp(iconf->if_type, "vif")) {
+		/* No useful data in vif - all determined from Wifi_VIF_Config */
+		return 0;
+	}
+
 	blob_buf_init(&b, 0);
 	blob_buf_init(&del, 0);
 
@@ -185,7 +193,7 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 		blobmsg_add_bool(&del, "disabled", 1);
 
 	if (!iconf->parent_ifname_exists && strcmp(iconf->if_type, "eth")
-		&& strcmp(iconf->if_type, "gre") && strcmp(iconf->if_type, "vif")) {
+		&& strcmp(iconf->if_type, "gre")) {
 		blobmsg_add_string(&b, "type", iconf->if_type);
 		blobmsg_add_bool(&b, "vlan_filtering", 1);
 	} else if (!strcmp(iconf->if_type, "gre")) {
@@ -193,7 +201,7 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 	} else
 		blobmsg_add_bool(&del, "type", 1);
 
-	if (iconf->parent_ifname_exists && iconf->vlan_id > 2 && !strcmp(iconf->if_type, "eth")) {
+	if (iconf->parent_ifname_exists && iconf->vlan_id > 2 && !strcmp(iconf->if_type, "vlan")) {
 		char uci_ifname[256];
 
 		snprintf(uci_ifname, sizeof(uci_ifname), "br-%s.%d", iconf->parent_ifname, iconf->vlan_id);
