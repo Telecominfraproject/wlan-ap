@@ -135,7 +135,9 @@ void wifi_inet_state_set(struct blob_attr *msg)
 		}
 	} else {
 		if (strstr(state.if_name, "wlan") != NULL)
-                        SCHEMA_SET_STR(state.if_type, "vif");
+			SCHEMA_SET_STR(state.if_type, "vif");
+		else if ((strstr(state.if_name, "wan_") != NULL) || (strstr(state.if_name, "lan_") != NULL))
+			SCHEMA_SET_STR(state.if_type, "vlan");
 		else
 			SCHEMA_SET_STR(state.if_type, "eth");
 	}
