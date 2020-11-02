@@ -224,7 +224,7 @@ out:
 	return err;
 }
 
-int recv_process(void *data) {
+int recv_process(void *data, ssize_t len) {
 	struct nl_sock *nlsock;
 	unsigned int mcgroups = 0;
 
