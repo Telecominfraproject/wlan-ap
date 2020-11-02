@@ -16,7 +16,7 @@ recv_arg ra;
 static void receive_data(struct ev_loop *ev, ev_io *io, int event)
 {
 	void *recv_data;
-	int recv_data_len;
+	ssize_t recv_data_len;
 
 	recv_data = malloc(ra.len);
 	memset(recv_data, 0, ra.len);
@@ -24,11 +24,11 @@ static void receive_data(struct ev_loop *ev, ev_io *io, int event)
 				      0, NULL, 0)) < 0)
 		printf("recvfrom() failed");
 
-	ra.cb(recv_data);
+	ra.cb(recv_data, recv_data_len);
 
 }
 
-int interap_recv(unsigned short port, int (*recv_cb)(void *), unsigned int len,
+int interap_recv(unsigned short port, int (*recv_cb)(void *, ssize_t), unsigned int len,
 		 struct ev_loop *loop, ev_io *io)
 {
 	struct sockaddr_in addr;

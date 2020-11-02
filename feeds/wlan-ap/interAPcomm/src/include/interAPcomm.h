@@ -2,11 +2,11 @@
 #include <ev.h>
 int interap_send(unsigned short port, char *dst_ip,
 		 void *data, unsigned int len);
-int interap_recv(unsigned short port, int (*recv_cb)(void *),
+int interap_recv(unsigned short port, int (*recv_cb)(void *, ssize_t),
 		 unsigned int len, struct ev_loop *loop,
 		 ev_io *io);
 
-typedef int (*callback)(void *);
+typedef int (*callback)(void *, int);
 typedef struct recv_arg {
 	callback cb;
 	unsigned int len;
