@@ -19,14 +19,16 @@ static struct ev_timer  rrm_nf_timer;
 static void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents);
 
 enum {
-	WIF_ATTR_BEACON_RATE,
 	WIF_ATTR_PROBE_ACCEPT_RATE,
+	WIF_ATTR_CLIENT_CONNECT_THRESHOLD,
+	WIF_ATTR_CLIENT_DISCONNECT_THRESHOLD,
 	__WIF_ATTR_MAX,
 };
 
 static const struct blobmsg_policy wifi_config_policy[__WIF_ATTR_MAX] = {
-		[WIF_ATTR_BEACON_RATE] = { .name = "beacon_rate", .type = BLOBMSG_TYPE_INT32 },
-		[WIF_ATTR_PROBE_ACCEPT_RATE] = { .name = "rssi_reject_assoc_rssi", .type = BLOBMSG_TYPE_INT32 },
+		[WIF_ATTR_PROBE_ACCEPT_RATE] = { .name = "rssi_ignore_probe_request", .type = BLOBMSG_TYPE_INT32 },
+		[WIF_ATTR_CLIENT_CONNECT_THRESHOLD] = { .name = "signal_connect", .type = BLOBMSG_TYPE_INT32 },
+		[WIF_ATTR_CLIENT_DISCONNECT_THRESHOLD] = { .name = "signal_stay", .type = BLOBMSG_TYPE_INT32 },
 };
 
 const struct uci_blob_param_list wifi_config_param = {
@@ -34,10 +36,10 @@ const struct uci_blob_param_list wifi_config_param = {
 		.params = wifi_config_policy,
 };
 
-static void rrm_set_basic_rate(const char *if_name, int32_t rate)
+static void rrm_set_probe_resp_thres(const char *if_name, int32_t probe_thres)
 {
 	blob_buf_init(&b, 0);
-	blobmsg_add_u32(&b, "beacon_rate", rate);
+	blobmsg_add_u32(&b, "rssi_ignore_probe_request", probe_thres);
 
 	blob_to_uci_section(uci, "wireless", if_name, "wifi-iface",
 			b.head, &wifi_config_param, NULL);
@@ -46,10 +48,11 @@ static void rrm_set_basic_rate(const char *if_name, int32_t rate)
 	reload_config = 1;
 }
 
-static void rrm_set_reject_assoc_rssi(const char *if_name, int32_t rssi)
+static void rrm_set_client_disconnect_thres(const char *if_name, int32_t disc_thres)
 {
 	blob_buf_init(&b, 0);
-	blobmsg_add_u32(&b, "rssi_reject_assoc_rssi", rssi);
+	blobmsg_add_u32(&b, "signal_connect", disc_thres);
+	blobmsg_add_u32(&b, "signal_stay", disc_thres);
 
 	blob_to_uci_section(uci, "wireless", if_name, "wifi-iface",
 			b.head, &wifi_config_param, NULL);
@@ -204,9 +207,8 @@ void set_rrm_parameters(rrm_entry_t *rrm_data)
 						continue;
 					}
 
-					rrm_set_basic_rate(vif->schema.if_name, rrm_data->basic_rate);
-					rrm_set_reject_assoc_rssi(vif->schema.if_name,
-							rrm_data->probe_resp_threshold);
+					rrm_set_client_disconnect_thres(vif->schema.if_name, rrm_data->client_disconnect_threshold);
+					rrm_set_probe_resp_thres(vif->schema.if_name, rrm_data->probe_resp_threshold);
 					continue;
 				}
 			}
