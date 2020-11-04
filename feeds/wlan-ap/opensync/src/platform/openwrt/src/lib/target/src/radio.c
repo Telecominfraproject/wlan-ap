@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <stdbool.h>
+#include <time.h>
 
 #include <uci.h>
 #include <uci_blob.h>
@@ -29,6 +30,7 @@ struct uci_context *uci;
 struct blob_buf b = { };
 struct blob_buf del = { };
 int reload_config = 0;
+static struct timespec startup_time;
 
 enum {
 	WDEV_ATTR_PATH,
@@ -306,6 +308,17 @@ static void periodic_task(void *arg)
 	if ((counter % 15) && !reload_config)
 		goto done;
 
+	if (startup_time.tv_sec) {
+		static struct timespec current_time;
+
+		clock_gettime(CLOCK_MONOTONIC, &current_time);
+		current_time.tv_sec -= startup_time.tv_sec;
+		if (current_time.tv_sec > 60 * 10) {
+			startup_time.tv_sec = 0;
+			radio_maverick(NULL);
+		}
+	}
+
 	if (reload_config) {
 		LOGT("periodic: reload config");
 		reload_config = 0;
@@ -458,7 +471,7 @@ bool target_radio_init(const struct target_radio_ops *ops)
 	radio_nl80211_init();
 	radio_ubus_init();
 
-	evsched_task(&radio_maverick, NULL, EVSCHED_SEC(60 * 10));
+	clock_gettime(CLOCK_MONOTONIC, &startup_time);
 
 	return true;
 }
