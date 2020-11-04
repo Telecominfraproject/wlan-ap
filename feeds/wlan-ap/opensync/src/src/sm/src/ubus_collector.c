@@ -19,7 +19,7 @@ typedef struct {
 } delete_entry_t;
 
 static const struct blobmsg_policy ubus_collector_bss_list_policy[__BSS_LIST_DATA_MAX] = {
-	[BSS_LIST_BSS_LIST] = {.name = "bss_list", .type = BLOBMSG_TYPE_TABLE},
+	[BSS_LIST_BSS_LIST] = {.name = "bss_list", .type = BLOBMSG_TYPE_ARRAY},
 };
 
 static const struct blobmsg_policy ubus_collector_bss_table_policy[__BSS_TABLE_MAX] = {
@@ -81,13 +81,14 @@ static const struct blobmsg_policy client_first_data_event_policy[__CLIENT_FIRST
 	[CLIENT_FIRST_DATA_RX_TIMESTAMP] = {.name = "fdata_rx_up_ts_in_us", .type = BLOBMSG_TYPE_INT64},
 };
 
+
+
 static int client_first_data_event_cb(struct blob_attr *msg,
 				      dpp_event_record_session_t *dpp_session,
 				      uint64_t event_session_id)
 {
 	int error = 0;
-	struct blob_attr
-		*tb_client_first_data_event[__CLIENT_FIRST_DATA_MAX] = {};
+	struct blob_attr *tb_client_first_data_event[__CLIENT_FIRST_DATA_MAX] = {};
 	char *mac_address = NULL;
 	uint64_t session_id = event_session_id;
 	uint32_t timestamp = 0;
@@ -141,15 +142,13 @@ static int client_first_data_event_cb(struct blob_attr *msg,
 			     first_data_event_dpp);
 	return 0;
 }
-
 static int client_disconnect_event_cb(struct blob_attr *msg,
 				      dpp_event_record_session_t *dpp_session,
 				      uint64_t event_session_id)
 {
 	int error = 0;
 	int ssid_bytes = 0;
-	struct blob_attr
-		*tb_client_disconnect_event[__CLIENT_DISCONNECT_MAX] = {};
+	struct blob_attr *tb_client_disconnect_event[__CLIENT_DISCONNECT_MAX] = {};
 	char *mac_address = NULL;
 	radio_essid_t ssid = {};
 	char *ssid_temp = NULL;
@@ -492,9 +491,10 @@ static void ubus_collector_cb(struct ubus_request *req, int type,
 		/* Schedule session for deletion */
 		delete_entry = calloc(1, sizeof(delete_entry_t));
 		delete_entry->session_id = session_id;
-		delete_entry->bss = strdup(bss);
+		delete_entry->bss = bss;
 
-		ds_dlist_insert_tail(&deletion_pending->list, delete_entry);
+		ds_dlist_insert_tail(&deletion_pending->list,
+				     delete_entry);
 		delete_entry = NULL;
 	}
 
@@ -510,7 +510,7 @@ error_out:
 	return;
 
 out:
-	LOG(INFO, "ubus_collector: successfull parse for AP object");
+	LOG(INFO, "ubus_collector: successfull parse");
 }
 
 static void ubus_collector_complete_cb(struct ubus_request *req, int ret)
@@ -526,11 +526,13 @@ static void ubus_collector_hostapd_invoke(void *arg)
 	const char *object_path = arg;
 	const char *hostapd_method = "get_sessions";
 	struct ubus_request *req = malloc(sizeof(struct ubus_request));
+	
 
 	if (ubus_lookup_id(ubus, object_path, &ubus_object_id)) {
-		LOG(INFO, "ubus_collector: could not find ubus object %s",
-		    object_path);
+		LOG(INFO,
+		    "ubus_collector: could not find ubus object %s", object_path);
 		free(req);
+		evsched_task_reschedule();
 		return;
 	}
 
@@ -541,7 +543,9 @@ static void ubus_collector_hostapd_invoke(void *arg)
 	req->complete_cb = (ubus_complete_handler_t)ubus_collector_complete_cb;
 	req->priv = arg;
 
-	ubus_complete_request(ubus, req, 0);
+	ubus_complete_request_async(ubus, req);
+
+	evsched_task_reschedule();
 }
 
 static void ubus_collector_bss_cb(struct ubus_request *req, int type,
@@ -553,14 +557,11 @@ static void ubus_collector_bss_cb(struct ubus_request *req, int type,
 	struct blob_attr *tb_bss_table[__BSS_TABLE_MAX] = {};
 	struct blob_attr *tb_bss_tbl = NULL;
 	char *bss_name = NULL;
-	dpp_event_report_data_t *bss_list = NULL;
-	delete_entry_t *bss_record = NULL;
-	ds_dlist_iter_t record_iter;
 
 	if (!msg)
-		return;
+		goto error_out;
 
-	LOG(INFO, "ubus_collector: received ubus collector bss message");
+	LOG(INFO, "ubus_collector: received ubus collector message");
 
 	error = blobmsg_parse(ubus_collector_bss_list_policy,
 			      __BSS_LIST_DATA_MAX, tb_bss_lst,
@@ -568,11 +569,8 @@ static void ubus_collector_bss_cb(struct ubus_request *req, int type,
 	if (error || !tb_bss_lst[BSS_LIST_BSS_LIST]) {
 		LOG(INFO,
 		    "ubus_collector: failed while parsing bss_list policy");
-		return;
+		goto error_out;
 	}
-
-	bss_list = calloc(1, sizeof(dpp_event_report_data_t));
-	ds_dlist_init(&bss_list->list, delete_entry_t, node);
 
 	/* itereate bss list */
 	blobmsg_for_each_attr(tb_bss_tbl, tb_bss_lst[BSS_LIST_BSS_LIST], rem)
@@ -583,43 +581,27 @@ static void ubus_collector_bss_cb(struct ubus_request *req, int type,
 				      blobmsg_data_len(tb_bss_tbl));
 		if (error) {
 			LOG(INFO,
-			    "ubus_collector_ failed while parsing bss table policy");
-			continue;
+			    "ubus_collector: failed while parsing bss table policy");
+			goto error_out;
 		}
 
-		bss_name = strdup(
-			blobmsg_get_string(tb_bss_table[BSS_TABLE_BSS_NAME]));
-		if (!bss_name) {
-			LOG(INFO,
-			    "ubus_collector: failed while getting bss_name");
-			continue;
-		}
+		bss_name = blobmsg_get_string(tb_bss_table[BSS_TABLE_BSS_NAME]);
+		if (!bss_name)
+			goto error_out;
 
-		bss_record = malloc(sizeof(delete_entry_t));
-		bss_record->bss = bss_name;
+		LOG(INFO, "ubus_collector: processing bss %s", bss_name);
 
-		ds_dlist_insert_tail(&bss_list->list, bss_record);
+		/* get sessions for current bss */
+		ubus_collector_hostapd_invoke(strdup(bss_name));
 	}
 
-	if (ds_dlist_is_empty(&bss_list->list)) {
-		LOG(INFO, "ubus_collector: no bss entries found");
-		free(bss_list);
-		return;
-	}
+	goto out;
 
-	/* get sessions from current bss */
-	for (bss_record = ds_dlist_ifirst(&record_iter, &bss_list->list);
-	     bss_record != NULL; bss_record = ds_dlist_inext(&record_iter)) {
-		LOG(INFO, "ubus_collector: processing bss %s", bss_record->bss);
-		ubus_collector_hostapd_invoke(bss_record->bss);
-
-		free(bss_record);
-	}
-
-	LOG(INFO, "ubus_collector: scanned all bss objects");
-	free(bss_list);
-
+error_out:
 	return;
+
+out:
+	LOG(INFO, "ubus_collector: successfull parse");
 }
 
 static void ubus_collector_hostapd_bss_invoke(void *arg)
@@ -630,21 +612,21 @@ static void ubus_collector_hostapd_bss_invoke(void *arg)
 	struct ubus_request *req = malloc(sizeof(struct ubus_request));
 
 	if (ubus_lookup_id(ubus, object_path, &ubus_object_id)) {
-		LOG(INFO, "ubus_collector: could not find ubus object %s",
-		    object_path);
+		LOG(INFO,
+		    "ubus_collector: could not find ubus object %s", object_path);
 		free(req);
 		evsched_task_reschedule();
 		return;
 	}
 
-	LOG(INFO, "ubus_collector: requesting hostapd bss data");
+	LOG(INFO, "ubus_collector: requesting hostapd data");
 
 	ubus_invoke_async(ubus, ubus_object_id, hostapd_method, NULL, req);
 
 	req->data_cb = (ubus_data_handler_t)ubus_collector_bss_cb;
 	req->complete_cb = (ubus_complete_handler_t)ubus_collector_complete_cb;
 
-	ubus_complete_request(ubus, req, 0);
+	ubus_complete_request_async(ubus, req);
 
 	evsched_task_reschedule();
 }
@@ -664,9 +646,9 @@ static void ubus_collector_hostapd_clear(uint64_t session_id, char *bss)
 		return;
 	}
 
-	int l = snprintf(NULL, 0, "%" PRIi64, session_id);
+	int l = snprintf(NULL, 0, "%"PRIi64, session_id);
 	char str[l + 1];
-	snprintf(str, l + 1, "%" PRIi64, session_id);
+	snprintf(str, l + 1, "%"PRIi64, session_id);
 
 	blob_buf_init(&b, 0);
 	blobmsg_add_string(&b, "session_id", str);
@@ -695,8 +677,7 @@ static void ubus_garbage_collector(void *arg)
 	delete_entry = ds_dlist_head(&deletion_pending->list);
 	if (delete_entry) {
 		if (delete_entry->session_id)
-			ubus_collector_hostapd_clear(delete_entry->session_id,
-						     delete_entry->bss);
+			ubus_collector_hostapd_clear(delete_entry->session_id, delete_entry->bss);
 
 		ds_dlist_remove_head(&deletion_pending->list);
 		free(delete_entry->bss);
