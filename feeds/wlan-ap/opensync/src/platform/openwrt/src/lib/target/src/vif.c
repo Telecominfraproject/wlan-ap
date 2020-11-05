@@ -380,6 +380,7 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	char mac[ETH_ALEN * 3];
 	char *ifname, radio[IF_NAMESIZE];
 	char band[8];
+	bool vifIsActive = false;
 
 	LOGN("%s: get state", s->e.name);
 
@@ -397,6 +398,7 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 
 	ifname = blobmsg_get_string(tb[WIF_ATTR_IFNAME]);
 	strncpy(radio, blobmsg_get_string(tb[WIF_ATTR_DEVICE]), IF_NAMESIZE);
+	vifIsActive = vif_find(ifname);
 
 	vstate._partial_update = true;
 	vstate.associated_clients_present = false;
@@ -420,6 +422,11 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 		SCHEMA_SET_STR(vstate.mode, blobmsg_get_string(tb[WIF_ATTR_MODE]));
 	else
 		SCHEMA_SET_STR(vstate.mode, "ap");
+
+	if (vifIsActive)
+		SCHEMA_SET_STR(vstate.state, "up");
+	else
+		SCHEMA_SET_STR(vstate.state, "down");
 
 	if (tb[WIF_ATTR_DISABLED] && blobmsg_get_bool(tb[WIF_ATTR_DISABLED]))
 		SCHEMA_SET_INT(vstate.enabled, 0);
@@ -520,10 +527,22 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
 {
 	struct uci_package *wireless;
+	struct uci_element *e = NULL, *tmp = NULL;
+	const char *ifname;
 
 	vlan_del((char *)vconf->if_name);
 	uci_load(uci, "wireless", &wireless);
-	uci_section_del(uci, "vif", "wireless", (char *)vconf->if_name, "wifi-iface");
+	uci_foreach_element_safe(&wireless->sections, tmp, e) {
+		struct uci_section *s = uci_to_section(e);
+		if (strcmp(s->type, "wifi-iface"))
+			continue;
+
+		ifname = uci_lookup_option_string( uci, s, "ifname" );
+		if (!strcmp(ifname,vconf->if_name)) {
+			uci_section_del(uci, "vif", "wireless", (char *)s->e.name, "wifi-iface");
+			break;
+		}
+	}
 	uci_commit_all(uci);
 	reload_config = 1;
 	return true;

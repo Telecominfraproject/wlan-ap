@@ -40,7 +40,7 @@ int avl_intcmp(const void *k1, const void *k2, void *ptr)
 }
 
 static struct avl_tree vlan_tree = AVL_TREE_INIT(vlan_tree, avl_intcmp, false, NULL);
-static struct avl_tree vif_tree = AVL_TREE_INIT(vlan_tree, avl_strcmp, false, NULL);
+static struct avl_tree vif_tree = AVL_TREE_INIT(vif_tree, avl_strcmp, false, NULL);
 
 struct vlan *vlan_find(int vid)
 {
