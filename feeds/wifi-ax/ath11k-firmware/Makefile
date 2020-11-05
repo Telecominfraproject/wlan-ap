@@ -26,12 +26,22 @@ $(Package/ath11k-firmware-default)
   DEPENDS:=@TARGET_ipq807x_ipq807x
 endef
 
+define Package/ath11k-firmware-qcn9000
+$(Package/ath11k-firmware-default)
+  TITLE:=ath11k firmware for QCN9000 devices
+  DEPENDS:=@TARGET_ipq807x
+endef
+
 define Package/ath11k-firmware-ipq60xx/description
 Standard ath11k firmware for IPQ60xx from QCA
 endef
 
 define Package/ath11k-firmware-ipq807x/description
 Standard ath11k firmware for IPQ807x from QCA
+endef
+
+define Package/ath11k-firmware-qcn9000/description
+Standard ath11k firmware for QCN9000 from QCA
 endef
 
 define Build/Compile
@@ -50,5 +60,12 @@ define Package/ath11k-firmware-ipq807x/install
 		$(1)/lib/firmware/IPQ8074
 endef
 
+define Package/ath11k-firmware-qcn9000/install
+	$(INSTALL_DIR) $(1)/lib/firmware/qcn9000
+	$(INSTALL_DATA) ./files/QCN9000/* \
+		$(1)/lib/firmware/qcn9000
+endef
+
 $(eval $(call BuildPackage,ath11k-firmware-ipq60xx))
 $(eval $(call BuildPackage,ath11k-firmware-ipq807x))
+$(eval $(call BuildPackage,ath11k-firmware-qcn9000))
