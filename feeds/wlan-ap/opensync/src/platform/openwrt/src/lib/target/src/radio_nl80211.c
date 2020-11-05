@@ -250,7 +250,6 @@ static void nl80211_add_iface(struct nlattr **tb, char *ifname, char *phyname, i
 	wif->avl.key = wif->name;
 	INIT_LIST_HEAD(&wif->stas);
 	avl_insert(&wif_tree, &wif->avl);
-	memcpy(wif->addr, addr, 6);
 	wif->ifidx = ifidx;
 	wif->parent = avl_find_element(&phy_tree, phyname, wif->parent, avl);
 	if (wif->parent)
@@ -261,7 +260,7 @@ static void _nl80211_del_iface(struct wifi_iface *wif)
 {
 	struct wifi_station *sta, *tmp;
 
-	list_del(&wif->phy);
+ 	list_del(&wif->phy);
 	list_for_each_entry_safe(sta, tmp, &wif->stas, iface)
 		_nl80211_del_station(sta);
 	avl_delete(&wif_tree, &wif->avl);
@@ -392,6 +391,7 @@ static int nl80211_recv(struct nl_msg *msg, void *arg)
 	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
 	struct nlattr *tb[NL80211_ATTR_MAX + 1];
 	char ifname[IFNAMSIZ] = {};
+	char *pif_name=NULL;
 	char phyname[IFNAMSIZ] = {};
 	int ifidx = -1, phy = -1;
 
@@ -402,10 +402,10 @@ static int nl80211_recv(struct nl_msg *msg, void *arg)
 
 	if (tb[NL80211_ATTR_IFINDEX]) {
 		ifidx = nla_get_u32(tb[NL80211_ATTR_IFINDEX]);
-		if_indextoname(ifidx, ifname);
-
-	} else if (tb[NL80211_ATTR_IFNAME]) {
-	        strncpy(ifname, nla_get_string(tb[NL80211_ATTR_IFNAME]), IFNAMSIZ);
+		pif_name = if_indextoname(ifidx, ifname);
+	}
+	if ((pif_name == NULL) && tb[NL80211_ATTR_IFNAME]) {
+	       	strncpy(ifname, nla_get_string(tb[NL80211_ATTR_IFNAME]), IFNAMSIZ);
 	}
 
 	if (tb[NL80211_ATTR_WIPHY]) {

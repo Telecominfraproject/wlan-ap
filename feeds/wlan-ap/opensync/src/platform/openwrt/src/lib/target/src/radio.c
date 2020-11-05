@@ -341,8 +341,7 @@ static void periodic_task(void *arg)
 		struct uci_section *s = uci_to_section(e);
 
 		if (!strcmp(s->type, "wifi-iface"))
-			if (vif_find(s->e.name))
-				vif_state_update(s, NULL);
+			vif_state_update(s, NULL);
 	}
 	uci_unload(uci, wireless);
 	LOGT("periodic: stop state update ");
