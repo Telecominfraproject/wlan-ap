@@ -271,12 +271,16 @@ static void vif_state_security_get(struct schema_Wifi_VIF_State *vstate,
 					  blobmsg_get_string(tb[WIF_ATTR_AUTH_PORT]));
 		vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_SERVER_SECRET,
 					  blobmsg_get_string(tb[WIF_ATTR_AUTH_SECRET]));
-		vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_ACCT_IP,
-					  blobmsg_get_string(tb[WIF_ATTR_ACCT_SERVER]));
-		vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_ACCT_PORT,
-					  blobmsg_get_string(tb[WIF_ATTR_ACCT_PORT]));
-		vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_ACCT_SECRET,
-					  blobmsg_get_string(tb[WIF_ATTR_ACCT_SECRET]));
+
+		if (tb[WIF_ATTR_ACCT_SERVER] && tb[WIF_ATTR_ACCT_PORT] && tb[WIF_ATTR_ACCT_SECRET])
+		{
+			vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_ACCT_IP,
+					blobmsg_get_string(tb[WIF_ATTR_ACCT_SERVER]));
+			vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_ACCT_PORT,
+					blobmsg_get_string(tb[WIF_ATTR_ACCT_PORT]));
+			vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_ACCT_SECRET,
+					blobmsg_get_string(tb[WIF_ATTR_ACCT_SECRET]));
+		}
 	} else {
 		if (!tb[WIF_ATTR_KEY])
 			goto out_none;
