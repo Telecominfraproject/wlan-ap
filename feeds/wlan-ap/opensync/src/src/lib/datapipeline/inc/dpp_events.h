@@ -149,6 +149,7 @@ typedef struct {
 	char __barrier[46];
 	mac_address_t clt_mac;
 	uint64_t session_id;
+	uint32_t timestamp;
 	char clt_id[DPP_CLT_ID_LEN];
 
 	ds_dlist_node_t node;
