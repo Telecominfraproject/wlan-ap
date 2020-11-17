@@ -6,7 +6,7 @@ int interap_recv(unsigned short port, int (*recv_cb)(void *, ssize_t),
 		 unsigned int len, struct ev_loop *loop,
 		 ev_io *io);
 
-typedef int (*callback)(void *, int);
+typedef int (*callback)(void *, ssize_t);
 typedef struct recv_arg {
 	callback cb;
 	unsigned int len;
