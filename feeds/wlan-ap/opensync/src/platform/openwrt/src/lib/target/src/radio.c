@@ -328,6 +328,8 @@ static void periodic_task(void *arg)
 		uci_commit_all(uci);
 		sync();
 		system("reload_config");
+		counter = 14;
+		goto done;
 	}
 
 	LOGT("periodic: start state update ");
