@@ -285,7 +285,6 @@ hostapd_common_add_bss_config() {
 	config_add_array roaming_consortium
 	config_add_array venue_name
 	config_add_array venue_url
-	config_add_array domain_name
 	config_add_array nai_realm
 	config_add_string osu_ssid hs20_wan_metrics hs20_operating_class hs20_t_c_filename hs20_t_c_timestamp
 
@@ -293,7 +292,7 @@ hostapd_common_add_bss_config() {
 	config_add_int access_network_type asra esr uesa venue_group venue_type ipaddr_type_availability \
 		gas_address3
 	config_add_string hessid network_auth_type \
-		anqp_3gpp_cell_net anqp_elem qos_map_set hs20_t_c_server_url
+		anqp_3gpp_cell_net anqp_elem domain_name qos_map_set hs20_t_c_server_url
 
 	config_add_int airtime_bss_weight airtime_bss_limit
 	config_add_int rts_threshold
@@ -344,10 +343,6 @@ append_venue_url() {
 	[ -n "$1" ] && append bss_conf "venue_url=$1" "$N"
 }
 
-append_domain_name() {
-	[ -n "$1" ] && append bss_conf "domain_name=$1" "$N"
-}
-
 append_nai_realm() {
 	[ -n "$1" ] && append bss_conf "nai_realm=$1" "$N"
 }
@@ -377,11 +372,11 @@ append_hs20_icons() {
 }
 
 append_operator_icon() {
-	[ -n "$1" ] append bss_conf "operator_icon=$1" "$N"
+	[ -n "$1" ] && append bss_conf "operator_icon=$1" "$N"
 }
 
 append_osu_icon() {
-	[ -n "$1" ] append bss_conf "osu_icon=$1" "$N"
+	[ -n "$1" ] && append bss_conf "osu_icon=$1" "$N"
 }
 
 append_osu_provider() {
@@ -834,13 +829,13 @@ hostapd_set_bss_options() {
 		osu_ssid hs20_wan_metrics hs20_operating_class hs20_t_c_filename hs20_t_c_timestamp \
 		interworking internet access_network_type asra esr uesa venue_group venue_type \
 		ipaddr_type_availability  gas_address3 hessid \
-		network_auth_type anqp_3gpp_cell_net anqp_elem qos_map_set \
+		network_auth_type anqp_3gpp_cell_net domain_name anqp_elem qos_map_set \
 		hs20_t_c_server_url
 	json_get_vars hs20 disable_dgaf osen anqp_domain_id hs20_deauth_req_timeout \
 		osu_ssid hs20_wan_metrics hs20_operating_class hs20_t_c_filename hs20_t_c_timestamp \
 		interworking internet access_network_type asra esr uesa venue_group venue_type \
 		ipaddr_type_availability  gas_address3 hessid \
-		network_auth_type anqp_3gpp_cell_net anqp_elem qos_map_set \
+		network_auth_type anqp_3gpp_cell_net domain_name anqp_elem qos_map_set \
 		hs20_t_c_server_url
 
 	set_default hs20 0
@@ -850,6 +845,7 @@ hostapd_set_bss_options() {
 	set_default hs20_deauth_req_timeout 60
 	if [ "$hs20" = "1" ]; then
 		append bss_conf "hs20=1" "$N"
+		append_hs20_icons
 		[ -n "$disable_dgaf"] && append bss_conf "disable_dgaf=$disable_dgaf" "$N"
 		[ -n "$osen"] && append bss_conf "osen=$osen" "$N"
 		[ -n "$anqp_domain_id"] && append bss_conf "anqp_domain_id=$anqp_domain_id" "$N"
@@ -863,7 +859,6 @@ hostapd_set_bss_options() {
 		json_for_each_item append_roaming_consortium roaming_consortium
 		json_for_each_item append_venue_name venue_name
 		json_for_each_item append_venue_url venue_url
-		json_for_each_item append_domain_name domain_name
 		json_for_each_item append_nai_realm nai_realm
 		json_for_each_item append_hs20_conn_capab hs20_conn_capab
 		json_for_each_item append_hs20_oper_friendly_name hs20_oper_friendly_name
@@ -885,6 +880,7 @@ hostapd_set_bss_options() {
 		[ -n "$nai_realm" ] && append bss_conf "nai_realm=$nai_realm" "$N"
 		[ -n "$anqp_elem" ] && append bss_conf "anqp_elem=$anqp_elem" "$N"
 		[ -n "$qos_map_set" ] && append bss_conf "qos_map_set=$qos_map_set" "$N"
+		[ -n "$domain_name" ] && append bss_conf "domain_name=$domain_name" "$N"
 		[ -n "$hs20_t_c_server_url" ] && append bss_conf "hs20_t_c_server_url=$hs20_t_c_server_url" "$N"
 	fi
 

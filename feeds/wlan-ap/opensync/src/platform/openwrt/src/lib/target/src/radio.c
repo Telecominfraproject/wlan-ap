@@ -27,6 +27,7 @@
 
 ovsdb_table_t table_Hotspot20_Config;
 ovsdb_table_t table_Hotspot20_OSU_Providers;
+ovsdb_table_t table_Hotspot20_Icon_Config;
 
 static struct uci_package *wireless;
 struct uci_context *uci;
@@ -464,6 +465,20 @@ static void callback_Hotspot20_Config(ovsdb_update_monitor_t *mon,
 	vif_hs20_update(conf);
 }
 
+static void callback_Hotspot20_OSU_Providers(ovsdb_update_monitor_t *mon,
+				 struct schema_Hotspot20_OSU_Providers *old,
+				 struct schema_Hotspot20_OSU_Providers *conf)
+{
+	vif_hs20_osu_update(conf);
+}
+
+static void callback_Hotspot20_Icon_Config(ovsdb_update_monitor_t *mon,
+				 struct schema_Hotspot20_Icon_Config *old,
+				 struct schema_Hotspot20_Icon_Config *conf)
+{
+	vif_hs20_icon_update(conf);
+}
+
 bool target_radio_init(const struct target_radio_ops *ops)
 {
 	uci = uci_alloc_context();
@@ -481,6 +496,10 @@ bool target_radio_init(const struct target_radio_ops *ops)
 	OVSDB_TABLE_MONITOR(Hotspot20_Config, false);
 
 	OVSDB_TABLE_INIT(Hotspot20_OSU_Providers, _uuid);
+	OVSDB_TABLE_MONITOR(Hotspot20_OSU_Providers, false);
+
+	OVSDB_TABLE_INIT(Hotspot20_Icon_Config, _uuid);
+	OVSDB_TABLE_MONITOR(Hotspot20_Icon_Config, false);
 
 	evsched_task(&periodic_task, NULL, EVSCHED_SEC(5));
 
