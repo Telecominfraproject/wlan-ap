@@ -10,6 +10,7 @@
 
 #include <uci.h>
 #include <uci_blob.h>
+#include <curl/curl.h>
 
 #include "log.h"
 #include "const.h"
@@ -28,11 +29,13 @@
 #define MODULE_ID LOG_MODULE_ID_VIF
 #define UCI_BUFFER_SIZE 80
 
-extern ovsdb_table_t table_Hotspot20_Config;
-extern ovsdb_table_t table_Hotspot20_OSU_Providers;
 extern ovsdb_table_t table_Wifi_VIF_Config;
+extern ovsdb_table_t table_Hotspot20_Icon_Config;
 
 extern struct blob_buf b;
+
+struct blob_buf hs20 = { };
+struct blob_buf osu = { };
 
 enum {
 	WIF_ATTR_DEVICE,
@@ -94,12 +97,7 @@ enum {
 	WIF_ATTR_DEAUTH_REQUEST_TIMEOUT,
 	WIF_ATTR_OPER_FRIENDLY_NAME,
 	WIF_ATTR_OPERATING_CLASS,
-	WIF_ATTR_OSU_FRIENDLY_NAME,
-	WIF_ATTR_OSU_SERVICE_DESCRIPTION,
-	WIF_ATTR_OSU_NAI,
-	WIF_ATTR_OSU_NAI2,
-	WIF_ATTR_OSU_SERVER_URI,
-	WIF_ATTR_OSU_METHOD_LIST,
+	WIF_ATTR_OPER_ICON,
 	__WIF_ATTR_MAX,
 };
 
@@ -154,7 +152,7 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_VENUE_URL] = { .name = "venue_url", BLOBMSG_TYPE_ARRAY },
 	[WIF_ATTR_NETWORK_AUTH_TYPE] = { .name = "network_auth_type", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_IPADDR_TYPE_AVAILABILITY] = { .name = "ipaddr_type_availability", BLOBMSG_TYPE_INT32 },
-	[WIF_ATTR_DOMAIN_NAME] = { .name = "domain_name", BLOBMSG_TYPE_ARRAY },
+	[WIF_ATTR_DOMAIN_NAME] = { .name = "domain_name", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_MCC_MNC] = { .name = "anqp_3gpp_cell_net", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_NAI_REALM] = { .name = "nai_realm", BLOBMSG_TYPE_ARRAY },
 	[WIF_ATTR_GAS_ADDR3] = { .name = "gas_address3", BLOBMSG_TYPE_STRING },
@@ -163,17 +161,60 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_DEAUTH_REQUEST_TIMEOUT] = { .name = "hs20_deauth_req_timeout", BLOBMSG_TYPE_INT32 },
 	[WIF_ATTR_OPER_FRIENDLY_NAME] = { .name = "hs20_oper_friendly_name", BLOBMSG_TYPE_ARRAY },
 	[WIF_ATTR_OPERATING_CLASS] = { .name = "hs20_operating_class", BLOBMSG_TYPE_STRING },
-	[WIF_ATTR_OSU_FRIENDLY_NAME] = { .name = "osu_friendly_name", BLOBMSG_TYPE_ARRAY },
-	[WIF_ATTR_OSU_SERVICE_DESCRIPTION] = { .name = "service_description", BLOBMSG_TYPE_ARRAY },
-	[WIF_ATTR_OSU_NAI] = { .name = "osu_nai", BLOBMSG_TYPE_STRING },
-	[WIF_ATTR_OSU_NAI2] = { .name = "osu_nai2", BLOBMSG_TYPE_STRING },
-	[WIF_ATTR_OSU_SERVER_URI] = { .name = "osu_server_uri", BLOBMSG_TYPE_STRING },
-	[WIF_ATTR_OSU_METHOD_LIST] = { .name = "osu_method_list", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_OPER_ICON] = { .name = "operator_icon", BLOBMSG_TYPE_ARRAY },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
 	.n_params = __WIF_ATTR_MAX,
 	.params = wifi_iface_policy,
+};
+
+enum {
+	WIF_HS20_OSU_SERVER_URI,
+	WIF_HS20_OSU_NAI,
+	WIF_HS20_OSU_NAI2,
+	WIF_HS20_OSU_METHOD_LIST,
+	WIF_HS20_OSU_FRIENDLY_NAME,
+	WIF_HS20_OSU_SERVICE_DESCRIPTION,
+	WIF_HS20_OSU_ICON,
+	__WIF_HS20_OSU_MAX,
+};
+
+static const struct blobmsg_policy wifi_hs20_osu_policy[__WIF_HS20_OSU_MAX] = {
+		[WIF_HS20_OSU_SERVER_URI] = { .name = "osu_server_uri", BLOBMSG_TYPE_STRING },
+		[WIF_HS20_OSU_NAI] = { .name = "osu_nai", BLOBMSG_TYPE_STRING },
+		[WIF_HS20_OSU_NAI2] = { .name = "osu_nai2", BLOBMSG_TYPE_STRING },
+		[WIF_HS20_OSU_METHOD_LIST] = { .name = "osu_method_list", BLOBMSG_TYPE_STRING },
+		[WIF_HS20_OSU_FRIENDLY_NAME] = { .name = "osu_friendly_name", BLOBMSG_TYPE_ARRAY },
+		[WIF_HS20_OSU_SERVICE_DESCRIPTION] = { .name = "service_description", BLOBMSG_TYPE_ARRAY },
+		[WIF_HS20_OSU_ICON] = { .name = "osu_icon", BLOBMSG_TYPE_ARRAY },
+};
+
+const struct uci_blob_param_list wifi_hs20_osu_param = {
+	.n_params = __WIF_HS20_OSU_MAX,
+	.params = wifi_hs20_osu_policy,
+};
+
+enum {
+	WIF_HS20_ICON_PATH,
+	WIF_HS20_ICON_WIDTH,
+	WIF_HS20_ICON_HEIGHT,
+	WIF_HS20_ICON_LANG,
+	WIF_HS20_ICON_TYPE,
+	__WIF_HS20_ICON_MAX,
+};
+
+static const struct blobmsg_policy wifi_hs20_icon_policy[__WIF_HS20_ICON_MAX] = {
+		[WIF_HS20_ICON_PATH] = { .name = "path", .type = BLOBMSG_TYPE_STRING },
+		[WIF_HS20_ICON_WIDTH] = { .name = "width", BLOBMSG_TYPE_INT32 },
+		[WIF_HS20_ICON_HEIGHT] = { .name = "height", BLOBMSG_TYPE_INT32 },
+		[WIF_HS20_ICON_LANG] = { .name = "lang", .type = BLOBMSG_TYPE_STRING },
+		[WIF_HS20_ICON_TYPE] = { .name = "type", .type = BLOBMSG_TYPE_STRING },
+};
+
+const struct uci_blob_param_list wifi_hs20_icon_param = {
+	.n_params = __WIF_HS20_ICON_MAX,
+	.params = wifi_hs20_icon_policy,
 };
 
 static struct vif_crypto {
@@ -602,48 +643,65 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	return true;
 }
 
-static void hs20_osu_config(struct blob_buf *b,
-		const struct schema_Hotspot20_OSU_Providers *osuconf)
-{
-	int i;
-	struct blob_attr *n;
-
-	n = blobmsg_open_array(b, "osu_friendly_name");
-	for (i = 0; i < osuconf->osu_friendly_name_len; i++)
-	{
-		blobmsg_add_string(b, NULL, osuconf->osu_friendly_name[i]);
-	}
-	blobmsg_close_array(b, n);
-
-	n = blobmsg_open_array(b, "osu_service_desc");
-	for (i = 0; i < osuconf->service_description_len; i++)
-	{
-		blobmsg_add_string(b, NULL, osuconf->service_description[i]);
-	}
-	blobmsg_close_array(b, n);
-
-	if (strlen(osuconf->osu_nai))
-		blobmsg_add_string(b, "osu_nai", osuconf->osu_nai);
-
-	if (strlen(osuconf->osu_nai2))
-		blobmsg_add_string(b, "osu_nai2", osuconf->osu_nai2);
-
-	if (strlen(osuconf->server_uri))
-		blobmsg_add_string(b, "osu_server_uri", osuconf->server_uri);
-
-	if (osuconf->method_list_len)
-	{
-		blobmsg_add_u32(b, "osu_method_list", osuconf->method_list[0]);
-	}
+size_t write_file(void *ptr, size_t size, size_t nmemb, FILE *stream) {
+	size_t written = fwrite(ptr, size, nmemb, stream);
+	return written;
 }
+
+static bool hs20_download_icon(char *icon_name, char *icon_url)
+{
+	CURL *curl;
+	FILE *fp;
+	CURLcode res;
+	char path[32];
+	char name[32];
+
+	strcpy(name, icon_name);
+	sprintf(path, "/tmp/%s", name);
+
+	curl = curl_easy_init();
+	if (curl)
+	{
+		fp = fopen(path,"wb");
+
+		if (fp == NULL)
+		{
+			curl_easy_cleanup(curl);
+			return false;
+		}
+
+		if (icon_url == NULL)
+		{
+			curl_easy_cleanup(curl);
+			fclose(fp);
+			return false;
+		}
+
+		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+		curl_easy_setopt(curl, CURLOPT_HEADER, 0L);
+		curl_easy_setopt(curl, CURLOPT_URL, icon_url);
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_file);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+		res = curl_easy_perform(curl);
+		curl_easy_cleanup(curl);
+		fclose(fp);
+		return res;
+	}
+
+	return true;
+}
+
 
 static void hs20_vif_config(struct blob_buf *b,
 		const struct schema_Hotspot20_Config *hs2conf)
 {
 	struct blob_attr *n;
-	struct schema_Hotspot20_OSU_Providers osuconf;
-	int i = 0;
 	json_t *where;
+	struct schema_Hotspot20_Icon_Config iconconf;
+	int i = 0;
+	unsigned int len = 0;
+	char domain_name[256];
 
 	if (hs2conf->enable) {
 		blobmsg_add_bool(b, "interworking", 1);
@@ -678,12 +736,19 @@ static void hs20_vif_config(struct blob_buf *b,
 	}
 	blobmsg_close_array(b, n);
 
-	n = blobmsg_open_array(b, "domain_name");
+	len = 0;
+	memset(domain_name, '\0', sizeof(domain_name));
 	for (i = 0; i < hs2conf->domain_name_len; i++)
 	{
-		blobmsg_add_string(b, NULL, hs2conf->domain_name[i]);
+		len = len + strlen(hs2conf->domain_name[i]);
+		if (len < sizeof(domain_name))
+		{
+			strcat(domain_name, hs2conf->domain_name[i]);
+			if (i != hs2conf->domain_name_len - 1)
+				strcat(domain_name, ",");
+		}
 	}
-	blobmsg_close_array(b, n);
+	blobmsg_add_string(b, "domain_name", domain_name);
 
 	n = blobmsg_open_array(b, "nai_realm");
 	for (i = 0; i < hs2conf->nai_realm_len; i++)
@@ -762,12 +827,19 @@ static void hs20_vif_config(struct blob_buf *b,
 		blobmsg_add_u32(b, "venue_type", venue_type);
 	}
 
-	for (i = 0; i < hs2conf->osu_providers_len; i++) {
-		if (!(where = ovsdb_where_uuid("_uuid", hs2conf->osu_providers[i].uuid)))
-			continue;
+	if (hs2conf->operator_icons_len)
+	{
+		n = blobmsg_open_array(b, "operator_icon");
+		for (i = 0; i < hs2conf->operator_icons_len; i++) {
+			if (!(where = ovsdb_where_uuid("_uuid", hs2conf->operator_icons[i].uuid)))
+				continue;
 
-		if (ovsdb_table_select_one_where(&table_Hotspot20_OSU_Providers, where, &osuconf))
-			hs20_osu_config(b, &osuconf);
+			if (ovsdb_table_select_one_where(&table_Hotspot20_Icon_Config, where, &iconconf))
+			{
+				blobmsg_add_string(b, NULL, iconconf.name);
+			}
+		}
+		blobmsg_close_array(b, n);
 	}
 
 }
@@ -797,6 +869,92 @@ bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
 	return true;
 }
 
+
+void vif_hs20_osu_update(struct schema_Hotspot20_OSU_Providers *osuconf)
+{
+	int i;
+	struct blob_attr *n;
+	json_t *where;
+	struct schema_Hotspot20_Icon_Config iconconf;
+
+	blob_buf_init(&osu, 0);
+	n = blobmsg_open_array(&osu, "osu_friendly_name");
+	for (i = 0; i < osuconf->osu_friendly_name_len; i++)
+	{
+		blobmsg_add_string(&osu, NULL, osuconf->osu_friendly_name[i]);
+	}
+	blobmsg_close_array(&osu, n);
+
+	n = blobmsg_open_array(&osu, "osu_service_desc");
+	for (i = 0; i < osuconf->service_description_len; i++)
+	{
+		blobmsg_add_string(&osu, NULL, osuconf->service_description[i]);
+	}
+	blobmsg_close_array(&osu, n);
+
+	if (strlen(osuconf->osu_nai))
+		blobmsg_add_string(&osu, "osu_nai", osuconf->osu_nai);
+
+	if (strlen(osuconf->osu_nai2))
+		blobmsg_add_string(&osu, "osu_nai2", osuconf->osu_nai2);
+
+	if (strlen(osuconf->server_uri))
+		blobmsg_add_string(&osu, "osu_server_uri", osuconf->server_uri);
+
+	if (osuconf->method_list_len)
+		blobmsg_add_u32(&osu, "osu_method_list", osuconf->method_list[0]);
+
+	if (osuconf->osu_icons_len)
+	{
+		n = blobmsg_open_array(&osu, "osu_icon");
+		for (i = 0; i < osuconf->osu_icons_len; i++) {
+			if (!(where = ovsdb_where_uuid("_uuid", osuconf->osu_icons[i].uuid)))
+				continue;
+
+			if (ovsdb_table_select_one_where(&table_Hotspot20_Icon_Config, where, &iconconf))
+			{
+				blobmsg_add_string(&osu, NULL, iconconf.name);
+			}
+		}
+		blobmsg_close_array(&osu, n);
+	}
+
+	blob_to_uci_section(uci, "wireless", osuconf->osu_provider_name, "osu-provider",
+			osu.head, &wifi_hs20_osu_param, NULL);
+	reload_config = 1;
+}
+
+
+void vif_hs20_icon_update(struct schema_Hotspot20_Icon_Config *iconconf)
+{
+	char path[64];
+	char name[16];
+
+	if (hs20_download_icon(iconconf->name, iconconf->url))
+	{
+		blob_buf_init(&hs20, 0);
+
+		if (iconconf->height)
+			blobmsg_add_u32(&hs20, "height", iconconf->height);
+
+		if (iconconf->width)
+			blobmsg_add_u32(&hs20, "width", iconconf->width);
+
+		if (strlen(iconconf->lang_code))
+			blobmsg_add_string(&hs20, "lang", iconconf->lang_code);
+
+		if (strlen(iconconf->img_type))
+			blobmsg_add_string(&hs20, "type", iconconf->img_type);
+
+		strcpy(name, iconconf->name);
+		sprintf(path, "/tmp/%s", name);
+		blobmsg_add_string(&hs20, "path", path);
+
+		blob_to_uci_section(uci, "wireless", iconconf->name, "hs20-icon",
+				hs20.head, &wifi_hs20_icon_param, NULL);
+		reload_config = 1;
+	}
+}
 
 void vif_hs20_update(struct schema_Hotspot20_Config *hs2conf)
 {
