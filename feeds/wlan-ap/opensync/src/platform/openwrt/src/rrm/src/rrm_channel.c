@@ -22,6 +22,8 @@ enum {
 	WIF_ATTR_PROBE_ACCEPT_RATE,
 	WIF_ATTR_CLIENT_CONNECT_THRESHOLD,
 	WIF_ATTR_CLIENT_DISCONNECT_THRESHOLD,
+	WIF_ATTR_BEACON_RATE,
+	WIF_ATTR_MCAST_RATE,
 	__WIF_ATTR_MAX,
 };
 
@@ -29,6 +31,8 @@ static const struct blobmsg_policy wifi_config_policy[__WIF_ATTR_MAX] = {
 		[WIF_ATTR_PROBE_ACCEPT_RATE] = { .name = "rssi_ignore_probe_request", .type = BLOBMSG_TYPE_INT32 },
 		[WIF_ATTR_CLIENT_CONNECT_THRESHOLD] = { .name = "signal_connect", .type = BLOBMSG_TYPE_INT32 },
 		[WIF_ATTR_CLIENT_DISCONNECT_THRESHOLD] = { .name = "signal_stay", .type = BLOBMSG_TYPE_INT32 },
+		[WIF_ATTR_BEACON_RATE] = { .name = "bcn_rate", .type = BLOBMSG_TYPE_INT32 },
+		[WIF_ATTR_MCAST_RATE] = { .name = "mcast_rate", .type = BLOBMSG_TYPE_INT32 },
 };
 
 const struct uci_blob_param_list wifi_config_param = {
@@ -36,28 +40,18 @@ const struct uci_blob_param_list wifi_config_param = {
 		.params = wifi_config_policy,
 };
 
-static void rrm_set_probe_resp_thres(const char *if_name, int32_t probe_thres)
+static void rrm_config_set(const char *if_name, rrm_entry_t *rrm_data)
 {
 	blob_buf_init(&b, 0);
-	blobmsg_add_u32(&b, "rssi_ignore_probe_request", probe_thres);
+	blobmsg_add_u32(&b, "rssi_ignore_probe_request", rrm_data->probe_resp_threshold);
+	blobmsg_add_u32(&b, "signal_connect", rrm_data->client_disconnect_threshold);
+	blobmsg_add_u32(&b, "signal_stay", rrm_data->client_disconnect_threshold);
+	blobmsg_add_u32(&b, "bcn_rate", rrm_data->beacon_rate);
+	blobmsg_add_u32(&b, "mcast_rate", rrm_data->mcast_rate);
 
 	blob_to_uci_section(uci, "wireless", if_name, "wifi-iface",
 			b.head, &wifi_config_param, NULL);
 
-	uci_commit_all(uci);
-	reload_config = 1;
-}
-
-static void rrm_set_client_disconnect_thres(const char *if_name, int32_t disc_thres)
-{
-	blob_buf_init(&b, 0);
-	blobmsg_add_u32(&b, "signal_connect", disc_thres);
-	blobmsg_add_u32(&b, "signal_stay", disc_thres);
-
-	blob_to_uci_section(uci, "wireless", if_name, "wifi-iface",
-			b.head, &wifi_config_param, NULL);
-
-	uci_commit_all(uci);
 	reload_config = 1;
 }
 
@@ -206,9 +200,7 @@ void set_rrm_parameters(rrm_entry_t *rrm_data)
 					if (vif->schema.enabled == 0) {
 						continue;
 					}
-
-					rrm_set_client_disconnect_thres(vif->schema.if_name, rrm_data->client_disconnect_threshold);
-					rrm_set_probe_resp_thres(vif->schema.if_name, rrm_data->probe_resp_threshold);
+					rrm_config_set(vif->schema.if_name, rrm_data);
 					continue;
 				}
 			}

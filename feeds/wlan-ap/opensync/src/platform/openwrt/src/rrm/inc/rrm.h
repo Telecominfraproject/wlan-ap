@@ -53,12 +53,12 @@ typedef struct
 	// Cached data
 	radio_type_t freq_band;
 	uint32_t backup_channel;
-	uint32_t cell_size;
 	int32_t probe_resp_threshold;
 	int32_t client_disconnect_threshold;
 	uint32_t snr_percentage_drop;
 	uint32_t min_load;
-	uint32_t basic_rate;
+	uint32_t beacon_rate;
+	uint32_t mcast_rate;
 
 	// Internal state data
 	int32_t noise_lwm;

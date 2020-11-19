@@ -118,12 +118,12 @@ void rrm_config_update(void)
 		}
 
 		rrm_data.backup_channel = rrm->schema.backup_channel;
-		rrm_data.cell_size = rrm->schema.cell_size;
 		rrm_data.probe_resp_threshold = rrm->schema.probe_resp_threshold;
 		rrm_data.client_disconnect_threshold = rrm->schema.client_disconnect_threshold;
 		rrm_data.snr_percentage_drop = rrm->schema.snr_percentage_drop;
 		rrm_data.min_load = rrm->schema.min_load;
-		rrm_data.basic_rate = rrm->schema.basic_rate;
+		rrm_data.beacon_rate = rrm->schema.beacon_rate;
+		rrm_data.mcast_rate = rrm->schema.mcast_rate;
 
 		/* Update cache config */
 		rrm->rrm_data = rrm_data;
@@ -409,9 +409,9 @@ void rrm_update_rrm_config_cb(ovsdb_update_monitor_t *self)
 		}
 		/* Reset configuration */
 		rrm_config->schema.backup_channel = 0;
-		rrm_config->schema.cell_size = 0;
 		rrm_config->schema.min_load = 0;
-		rrm_config->schema.basic_rate = 0;
+		rrm_config->schema.beacon_rate = 0;
+		rrm_config->schema.mcast_rate = 0;
 		rrm_config->schema.snr_percentage_drop = 0;
 		rrm_config->schema.client_disconnect_threshold = 0;
 		rrm_config->schema.probe_resp_threshold = 0;
