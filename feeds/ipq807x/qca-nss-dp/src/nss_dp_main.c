@@ -606,6 +606,11 @@ static int32_t nss_dp_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0))
+	/* max_mtu is set to 1500 in ether_setup() */
+	netdev->max_mtu = ETH_MAX_MTU;
+#endif
+
 	dp_priv = netdev_priv(netdev);
 	memset((void *)dp_priv, 0, sizeof(struct nss_dp_dev));
 
