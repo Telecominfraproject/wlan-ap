@@ -36,13 +36,26 @@ AP2220)
 EC420)
 	TARGET=ec420
 	;;
+EAP101)
+	TARGET=eap101
+	QCA_AX=1
+	;;
+EAP102)
+	TARGET=eap102
+	QCA_AX=1
+	;;
 *)
 	echo "${TARGET} is unknown"
 	exit 1
 	;;
 esac
 cd ${BUILD_DIR}
-./scripts/gen_config.py ${TARGET} wlan-ap wifi || exit 1
+if [ "${QCA_AX}" -eq 1 ]; then
+	./scripts/gen_config.py ${TARGET} wlan-ap wifi-ax || exit 1
+else
+	./scripts/gen_config.py ${TARGET} wlan-ap wifi || exit 1
+fi
+
 cd -
 
 echo "### Building image ..."
