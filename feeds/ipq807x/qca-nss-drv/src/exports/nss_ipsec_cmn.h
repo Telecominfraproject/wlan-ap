@@ -196,6 +196,7 @@ struct nss_ipsec_cmn_sa {
 struct nss_ipsec_cmn_ctx {
 	enum nss_ipsec_cmn_ctx_type type;	/**< Node type. */
 	uint32_t except_ifnum;			/**< Exception interface for egress. */
+	uint32_t sibling_ifnum;			/**< Sibling interface. */
 };
 
 /**
@@ -237,7 +238,7 @@ struct nss_ipsec_cmn_sa_stats {
 	uint32_t fail_pbuf_alloc;		/**< Failure in pbuf allocation. */
 	uint32_t fail_pbuf_linear;		/**< Failure in pbuf linearization. */
 	uint32_t fail_pbuf_stats;		/**< Failure in pbuf allocation for statistics. */
-	uint32_t fail_pbuf_align;		/**< Failure in pbuf access due non-word alignment. */
+	uint32_t fail_pbuf_align;		/**< Failure in pbuf access due to non-word alignment. */
 	uint32_t fail_cipher;			/**< Failure in decrypting the data. */
 	uint32_t fail_auth;			/**< Failure in authenticating the data. */
 	uint32_t fail_seq_ovf;			/**< Failure due to sequence number rollover. */
@@ -246,6 +247,7 @@ struct nss_ipsec_cmn_sa_stats {
 	uint32_t fail_transform;		/**< Failure in transformation; general error. */
 	uint32_t fail_crypto;			/**< Failure in crypto transformation. */
 	uint32_t fail_cle;			/**< Failure in classification; general failure. */
+	uint32_t is_stopped;			/**< Indicates if SA is stopped; for example, seq overflow. */
 };
 
 /**
@@ -268,6 +270,7 @@ struct nss_ipsec_cmn_ctx_stats {
 	uint32_t exceptioned;		/**< Exceptioned to host. */
 	uint32_t linearized;		/**< Linearized packets. */
 	uint32_t redirected;		/**< Redirected from inline. */
+	uint32_t dropped;		/**< Total dropped packets. */
 	uint32_t fail_sa;		/**< Failed to find SA. */
 	uint32_t fail_flow;		/**< Failed to find flow. */
 	uint32_t fail_stats;		/**< Failed to send statistics. */
@@ -275,6 +278,9 @@ struct nss_ipsec_cmn_ctx_stats {
 	uint32_t fail_transform;	/**< Failed to produce output. */
 	uint32_t fail_linearized;	/**< Failed to linearize. */
 	uint32_t fail_mdata_ver;	/**< Invalid metadata version. */
+	uint32_t fail_ctx_active;	/**< Failed to queue as context is not active. */
+	uint32_t fail_pbuf_crypto;	/**< Failed to allocate pbuf for crypto operation. */
+	uint32_t fail_queue_crypto;	/**< Failed to queue pbuf to crypto pnode. */
 };
 
 /**

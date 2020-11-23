@@ -52,6 +52,7 @@ enum nss_ppe_sc_type {
 	NSS_PPE_SC_PTP,			/**< Service code for PTP packets. */
 	NSS_PPE_SC_VLAN_FILTER_BYPASS,	/**< VLAN filter bypass for bridge flows between 2 different VSIs. */
 	NSS_PPE_SC_L3_EXCEPT,		/**< Indicate exception post tunnel/TAP operation. */
+	NSS_PPE_SC_SPF_BYPASS,		/**< Source port filtering bypass in PPE. */
 	NSS_PPE_SC_MAX,			/**< Maximum service code. */
 };
 

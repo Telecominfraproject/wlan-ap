@@ -85,6 +85,7 @@ struct nss_stats_info nss_ipv6_strings_exception_stats[NSS_IPV6_EXCEPTION_EVENT_
 	{"pppoe_no_session"				, NSS_STATS_TYPE_DROP},
 	{"icmp_gre_header_incomplete"			, NSS_STATS_TYPE_EXCEPTION},
 	{"icmp_esp_header_incomplete"			, NSS_STATS_TYPE_EXCEPTION},
+	{"emesh_prio_mismatch"				, NSS_STATS_TYPE_EXCEPTION},
 };
 
 /*

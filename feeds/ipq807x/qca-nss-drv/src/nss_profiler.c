@@ -136,7 +136,6 @@ void *nss_profiler_alloc_dma(struct nss_ctx_instance *nss_ctx, struct nss_profil
 		NSS_CORE_DSB();
 	}
 	ctrl->consumer[0].ring.kp = kaddr;
-
 	return kaddr;
 }
 EXPORT_SYMBOL(nss_profiler_alloc_dma);
@@ -153,8 +152,10 @@ void nss_profiler_release_dma(struct nss_ctx_instance *nss_ctx)
 
 	ctrl = nss_ctx->meminfo_ctx.sdma_ctrl;
 
-	if (ctrl && ctrl->consumer[0].ring.kp)
+	if (ctrl && ctrl->consumer[0].ring.kp) {
 		kfree(ctrl->consumer[0].ring.kp);
+		ctrl->consumer[0].ring.kp = NULL;
+	}
 }
 EXPORT_SYMBOL(nss_profiler_release_dma);
 
@@ -198,10 +199,12 @@ EXPORT_SYMBOL(nss_profile_dma_deregister_cb);
 struct nss_profile_sdma_ctrl *nss_profile_dma_get_ctrl(struct nss_ctx_instance *nss_ctx)
 {
 	struct nss_profile_sdma_ctrl *ctrl = nss_ctx->meminfo_ctx.sdma_ctrl;
-	if (ctrl) {
-		dmac_inv_range(ctrl, &ctrl->cidx);
-		dsb(sy);
+	if (!ctrl) {
+		return ctrl;
 	}
+
+	dmac_inv_range(ctrl, &ctrl->cidx);
+	dsb(sy);
 	return ctrl;
 }
 EXPORT_SYMBOL(nss_profile_dma_get_ctrl);
@@ -233,7 +236,7 @@ void nss_profiler_notify_unregister(nss_core_id_t core_id)
 {
 	nss_assert(core_id < NSS_CORE_MAX);
 
-	nss_core_register_handler(&nss_top_main.nss[core_id], NSS_PROFILER_INTERFACE, NULL, NULL);
+	nss_core_unregister_handler(&nss_top_main.nss[core_id], NSS_PROFILER_INTERFACE);
 	nss_top_main.profiler_callback[core_id] = NULL;
 	nss_top_main.profiler_ctx[core_id] = NULL;
 }

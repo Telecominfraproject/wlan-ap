@@ -307,7 +307,9 @@ static int nss_get_freq_table_handler(struct ctl_table *ctl, int write, void __u
 
 	i = 0;
 	while (i < NSS_FREQ_MAX_SCALE) {
-		printk("%d Hz ", nss_runtime_samples.freq_scale[i].frequency);
+		if (nss_runtime_samples.freq_scale[i].frequency != NSS_FREQ_SCALE_NA) {
+			printk("%d Hz ", nss_runtime_samples.freq_scale[i].frequency);
+		}
 		i++;
 	}
 	printk("\n");
@@ -860,9 +862,13 @@ static int __init nss_init(void)
 	/*
 	 * INIT ppe on supported platform
 	 */
-	if (of_machine_is_compatible("qcom,ipq807x") || of_machine_is_compatible("qcom,ipq8074")|| of_machine_is_compatible("qcom,ipq6018")) {
-		nss_ppe_init();
-	}
+#ifdef NSS_DRV_PPE_ENABLE
+	nss_ppe_init();
+#endif
+
+#ifdef NSS_DRV_DMA_ENABLE
+	nss_dma_init();
+#endif
 
 	/*
 	 * Register platform_driver
@@ -921,9 +927,9 @@ static void __exit nss_cleanup(void)
 	/*
 	 * cleanup ppe on supported platform
 	 */
-	if (of_machine_is_compatible("qcom,ipq807x") || of_machine_is_compatible("qcom,ipq6018")) {
-		nss_ppe_free();
-	}
+#ifdef NSS_DRV_PPE_ENABLE
+	nss_ppe_free();
+#endif
 
 	platform_driver_unregister(&nss_driver);
 }

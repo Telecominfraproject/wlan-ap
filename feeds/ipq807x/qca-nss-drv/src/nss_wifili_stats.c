@@ -436,6 +436,7 @@ void nss_wifili_stats_sync(struct nss_ctx_instance *nss_ctx,
 	/*
 	 * update wbm ring stats
 	 */
+	stats->stats_wbm[NSS_WIFILI_STATS_WBM_IE_LOCAL_ALLOC_FAIL] += devstats->rxwbm_stats.invalid_buf_mgr;
 	stats->stats_wbm[NSS_WIFILI_STATS_WBM_SRC_DMA] += devstats->rxwbm_stats.err_src_rxdma;
 	stats->stats_wbm[NSS_WIFILI_STATS_WBM_SRC_DMA_CODE_INV] += devstats->rxwbm_stats.err_src_rxdma_code_inv;
 	stats->stats_wbm[NSS_WIFILI_STATS_WBM_SRC_REO] += devstats->rxwbm_stats.err_src_reo;

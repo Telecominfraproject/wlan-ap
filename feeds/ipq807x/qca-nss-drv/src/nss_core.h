@@ -232,6 +232,9 @@ static inline void nss_core_dma_cache_maint(void *start, uint32_t size, int dire
  * INFO: The LOW and MAX value together describe the "performance" band that we should operate the frequency at.
  *
  */
+#define NSS_FREQ_SCALE_NA	0xFAADFAAD	/* Frequency scale not supported */
+#define NSS_FREQ_NA		0x0		/* Instructions Per ms Min */
+
 #define NSS_FREQ_110		110000000	/* Frequency in hz */
 #define NSS_FREQ_110_MIN	0x03000		/* Instructions Per ms Min */
 #define NSS_FREQ_110_MAX	0x07000		/* Instructions Per ms Max */
@@ -273,6 +276,14 @@ static inline void nss_core_dma_cache_maint(void *start, uint32_t size, int dire
 #define NSS_FREQ_800		800000000	/* Frequency in hz */
 #define NSS_FREQ_800_MIN	0x07000		/* Instructions Per ms Min */
 #define NSS_FREQ_800_MAX	0x25000		/* Instructions Per ms Max */
+
+#define NSS_FREQ_850		850000000	/* Frequency in hz */
+#define NSS_FREQ_850_MIN	0x07000		/* Instructions Per ms Min */
+#define NSS_FREQ_850_MAX	0x0c000		/* Instructions Per ms Max */
+
+#define NSS_FREQ_1000		1000000000	/* Frequency in hz */
+#define NSS_FREQ_1000_MIN	0x0c000		/* Instructions Per ms Min */
+#define NSS_FREQ_1000_MAX	0x25000		/* Instructions Per ms Max */
 
 #define NSS_FREQ_1497		1497600000	/* Frequency in hz */
 #if defined(NSS_HAL_IPQ60XX_SUPPORT)
@@ -484,7 +495,7 @@ struct nss_ctx_instance {
 					/* Worker thread statistics */
 	struct nss_unaligned_stats unaligned_stats;
 					/* Unaligned emulation performance statistics */
-	struct nss_rx_cb_list nss_rx_interface_handlers[NSS_MAX_CORES][NSS_MAX_NET_INTERFACES];
+	struct nss_rx_cb_list nss_rx_interface_handlers[NSS_MAX_NET_INTERFACES];
 					/* NSS interface callback handlers */
 	struct nss_subsystem_dataplane_register subsys_dp_register[NSS_MAX_NET_INTERFACES];
 					/* Subsystem registration data */
@@ -556,6 +567,7 @@ struct nss_top_instance {
 	uint8_t tls_handler_id;
 	uint8_t mirror_handler_id;
 	uint8_t wmdb_handler_id;
+	uint8_t dma_handler_id;
 
 	/*
 	 * Data/Message callbacks for various interfaces
@@ -951,7 +963,7 @@ void nss_core_set_subsys_dp_type(struct nss_ctx_instance *nss_ctx, struct net_de
 
 static inline nss_if_rx_msg_callback_t nss_core_get_msg_handler(struct nss_ctx_instance *nss_ctx, uint32_t interface)
 {
-	return nss_ctx->nss_rx_interface_handlers[nss_ctx->id][interface].msg_cb;
+	return nss_ctx->nss_rx_interface_handlers[interface].msg_cb;
 }
 
 static inline uint32_t nss_core_get_max_buf_size(struct nss_ctx_instance *nss_ctx)

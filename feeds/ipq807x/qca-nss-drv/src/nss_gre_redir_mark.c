@@ -340,7 +340,7 @@ bool nss_gre_redir_mark_unregister_if(uint32_t if_num)
 		return false;
 	}
 
-	nss_ctx->nss_rx_interface_handlers[nss_ctx->id][if_num].msg_cb = NULL;
+	nss_ctx->nss_rx_interface_handlers[if_num].msg_cb = NULL;
 	return true;
 }
 EXPORT_SYMBOL(nss_gre_redir_mark_unregister_if);
