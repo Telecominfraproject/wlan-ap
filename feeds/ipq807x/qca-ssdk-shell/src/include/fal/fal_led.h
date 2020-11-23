@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014,2020 The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -68,6 +68,8 @@ extern "C" {
 #define     RX_TRAFFIC_BLINK_EN    7
 #define     TX_TRAFFIC_BLINK_EN    8
 #define     LINKUP_OVERRIDE_EN     9
+#define     LED_ACTIVE_HIGH        10
+#define     LINK_2500M_LIGHT_EN    11
 
 
     /**

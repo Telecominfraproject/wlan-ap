@@ -183,6 +183,7 @@ cursor_backward(void)
         cmd_cursor--;
         term_cursor--;
         putchar('\b');
+        fflush(stdout);
     }
 }
 
@@ -223,7 +224,7 @@ handle_delete(void)
     printf("\033[J");
 
     /*re-print from delete position */
-    while (cmd_cursor < cmd_strlen)
+    while (cmd_cursor <= cmd_strlen)
         term_echo();
 
     /*move cursor back to delete position */
