@@ -20,8 +20,8 @@
 #include <linux/ethtool.h>
 #include <linux/vmalloc.h>
 #include <linux/spinlock.h>
-#include <linux/qcom_scm.h>
 #include <linux/io.h>
+#include <nss_dp_hal.h>
 #include "syn_dev.h"
 #include "syn_reg.h"
 
@@ -439,18 +439,6 @@ void syn_init_rx_desc_base(struct nss_gmac_hal_dev *nghd, uint32_t rx_desc_dma)
 }
 
 /*
- * syn_dma_tcsr_axi_cache_override()
- *	Function to program DMA AXI Cache override register.
- *
- * Make a secure io call to set XPU protected TCSR register.
- */
-static inline void syn_dma_tcsr_axi_cache_override(struct nss_gmac_hal_dev *nghd)
-{
-	qcom_scm_tcsr_reg_write((TCSR_BASE_ADDRESS + TCSR_GMAC_AXI_CACHE_OVERRIDE),
-					TCSR_GMAC_AXI_CACHE_OVERRIDE_VALUE);
-}
-
-/*
  * syn_dma_axi_bus_mode_init()
  *	Function to program DMA AXI bus mode register.
  */
@@ -829,14 +817,20 @@ static void syn_get_mac_address(struct nss_gmac_hal_dev *nghd,
  */
 static void syn_dma_init(struct nss_gmac_hal_dev *nghd)
 {
+	struct net_device *ndev = nghd->netdev;
+	struct nss_dp_dev *dp_priv = netdev_priv(ndev);
+
+	/*
+	 * Enable SoC specific GMAC clocks.
+	 */
+	nss_dp_hal_clk_enable(dp_priv);
+
+	/*
+	 * Configure DMA registers.
+	 */
 	syn_dma_bus_mode_init(nghd);
 	syn_dma_axi_bus_mode_init(nghd);
 	syn_dma_operation_mode_init(nghd);
-
-	/*
-	 * Enable AXI Cache override for GMAC.
-	 */
-	syn_dma_tcsr_axi_cache_override(nghd);
 }
 
 /*
@@ -898,26 +892,12 @@ static void *syn_init(struct gmac_hal_platform_data *gmacpdata)
 		return NULL;
 	}
 
-	/*
-	 * Populate the TCSR base addresses
-	 */
-	shd->nghd.tcsr_base =
-		devm_ioremap_nocache(&dp_priv->pdev->dev, TCSR_BASE_ADDRESS,
-				     TCSR_REG_SIZE);
-	if (!shd->nghd.tcsr_base) {
-		netdev_dbg(ndev, "ioremap fail for tcsr.\n");
-		devm_iounmap(&dp_priv->pdev->dev, shd->nghd.mac_base);
-		devm_kfree(&dp_priv->pdev->dev, shd);
-		return NULL;
-	}
-
 	spin_lock_init(&shd->nghd.slock);
 
-	netdev_dbg(ndev, "ioremap OK.Size 0x%x Ndev base 0x%lx macbase 0x%px tcsrbase 0x%px\n",
+	netdev_dbg(ndev, "ioremap OK.Size 0x%x Ndev base 0x%lx macbase 0x%px\n",
 			gmacpdata->reg_len,
 			ndev->base_addr,
-			shd->nghd.mac_base,
-			shd->nghd.tcsr_base);
+			shd->nghd.mac_base);
 
 	syn_disable_interrupt_all(&shd->nghd);
 	syn_dma_init(&shd->nghd);

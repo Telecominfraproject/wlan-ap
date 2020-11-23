@@ -45,7 +45,6 @@ struct gmac_hal_platform_data {
  */
 struct nss_gmac_hal_dev {
 	void __iomem *mac_base;	/* Base address of MAC registers	*/
-	void __iomem *tcsr_base;	/* Base address of TCSR registers	*/
 	uint32_t version;	/* GMAC Revision version		*/
 	uint32_t drv_flags;	/* Driver specific feature flags	*/
 
