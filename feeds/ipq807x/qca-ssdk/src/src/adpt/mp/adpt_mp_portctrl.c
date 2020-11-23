@@ -39,6 +39,23 @@ _adpt_mp_gcc_mac_clock_set(a_uint32_t dev_id,
 	return rv;
 }
 
+static a_bool_t
+_adpt_mp_port_phy_connected (a_uint32_t dev_id, fal_port_t port_id)
+{
+	a_bool_t force_port = 0;
+
+	ADPT_DEV_ID_CHECK(dev_id);
+
+	/* force port which connect s17c or other device chip*/
+	force_port = ssdk_port_feature_get(dev_id, port_id, PHY_F_FORCE);
+	if (force_port == A_TRUE) {
+		SSDK_DEBUG("port_id %d is a force port!\n", port_id);
+		return A_FALSE;
+	} else {
+		return A_TRUE;
+	}
+}
+
 static sw_error_t
 _adpt_mp_port_gcc_speed_clock_set(
 	a_uint32_t dev_id,
@@ -72,6 +89,34 @@ _adpt_mp_port_gcc_speed_clock_set(
 }
 
 static sw_error_t
+adpt_mp_port_reset_set(a_uint32_t dev_id, a_uint32_t port_id)
+{
+	sw_error_t rv = 0;
+	a_uint32_t phy_addr;
+	hsl_phy_ops_t *phy_drv;
+
+	ADPT_DEV_ID_CHECK(dev_id);
+
+	if (port_id == SSDK_PHYSICAL_PORT1) {
+		/*internal gephy reset*/
+		SW_RTN_ON_NULL (phy_drv = hsl_phy_api_ops_get(dev_id,
+				port_id));
+		if (NULL == phy_drv->phy_function_reset)
+			return SW_NOT_SUPPORTED;
+		rv = hsl_port_prop_get_phyid (dev_id, port_id, &phy_addr);
+		SW_RTN_ON_ERROR (rv);
+		rv = phy_drv->phy_function_reset(dev_id, phy_addr, PHY_FIFO_RESET);
+		SW_RTN_ON_ERROR (rv);
+	} else if (port_id == SSDK_PHYSICAL_PORT2) {
+		rv = adpt_mp_uniphy_adapter_port_reset(dev_id, port_id);
+	} else {
+		return SW_NOT_SUPPORTED;
+	}
+
+	return rv;
+}
+
+static sw_error_t
 adpt_mp_port_txmac_status_set(a_uint32_t dev_id, fal_port_t port_id,
 		a_bool_t enable)
 {
@@ -94,6 +139,7 @@ adpt_mp_port_txmac_status_set(a_uint32_t dev_id, fal_port_t port_id,
 	return rv;
 }
 
+#ifndef IN_PORTCONTROL_MINI
 static sw_error_t
 adpt_mp_port_txmac_status_get(a_uint32_t dev_id, fal_port_t port_id,
 		a_bool_t *enable)
@@ -116,6 +162,7 @@ adpt_mp_port_txmac_status_get(a_uint32_t dev_id, fal_port_t port_id,
 
 	return rv;
 }
+#endif
 
 static sw_error_t
 adpt_mp_port_rxmac_status_set(a_uint32_t dev_id, fal_port_t port_id,
@@ -140,6 +187,7 @@ adpt_mp_port_rxmac_status_set(a_uint32_t dev_id, fal_port_t port_id,
 	return rv;
 }
 
+#ifndef IN_PORTCONTROL_MINI
 static sw_error_t
 adpt_mp_port_rxmac_status_get(a_uint32_t dev_id, fal_port_t port_id,
 		a_bool_t *enable)
@@ -162,6 +210,7 @@ adpt_mp_port_rxmac_status_get(a_uint32_t dev_id, fal_port_t port_id,
 
 	return rv;
 }
+#endif
 
 static sw_error_t
 adpt_mp_port_txfc_status_set(a_uint32_t dev_id, fal_port_t port_id,
@@ -192,7 +241,7 @@ adpt_mp_port_txfc_status_set(a_uint32_t dev_id, fal_port_t port_id,
 		mac_flow_ctrl.bf.flowctrl_tx_enable = 1;
 		mac_flow_ctrl.bf.pause_time = GMAC_PAUSE_TIME;
 		mac_flow_ctrl.bf.disable_zero_quanta_pause =
-			GMAC_PAUSE_QUANTA_ENABLE;
+			GMAC_PAUSE_ZERO_QUANTA_ENABLE;
 		mac_operation_mode_ctrl.bf.enable_hw_flowctrl =
 			GMAC_HW_FLOWCTRL_ENABLE;
 	} else {
@@ -213,6 +262,7 @@ adpt_mp_port_txfc_status_set(a_uint32_t dev_id, fal_port_t port_id,
 	return rv;
 }
 
+#ifndef IN_PORTCONTROL_MINI
 static sw_error_t
 adpt_mp_port_txfc_status_get(a_uint32_t dev_id, fal_port_t port_id,
 	a_bool_t * enable)
@@ -239,6 +289,7 @@ adpt_mp_port_txfc_status_get(a_uint32_t dev_id, fal_port_t port_id,
 
 	return rv;
 }
+#endif
 
 static sw_error_t
 adpt_mp_port_rxfc_status_set(a_uint32_t dev_id, fal_port_t port_id,
@@ -272,6 +323,7 @@ adpt_mp_port_rxfc_status_set(a_uint32_t dev_id, fal_port_t port_id,
 	return rv;
 }
 
+#ifndef IN_PORTCONTROL_MINI
 static sw_error_t
 adpt_mp_port_rxfc_status_get(a_uint32_t dev_id, fal_port_t port_id,
 	a_bool_t * enable)
@@ -298,6 +350,7 @@ adpt_mp_port_rxfc_status_get(a_uint32_t dev_id, fal_port_t port_id,
 
 	return rv;
 }
+#endif
 
 static sw_error_t
 adpt_mp_port_flowctrl_set(a_uint32_t dev_id, fal_port_t port_id,
@@ -322,6 +375,7 @@ adpt_mp_port_flowctrl_set(a_uint32_t dev_id, fal_port_t port_id,
 	return rv;
 }
 
+#ifndef IN_PORTCONTROL_MINI
 static sw_error_t
 adpt_mp_port_flowctrl_get(a_uint32_t dev_id, fal_port_t port_id,
 	a_bool_t * enable)
@@ -342,6 +396,7 @@ adpt_mp_port_flowctrl_get(a_uint32_t dev_id, fal_port_t port_id,
 
 	return rv;
 }
+#endif
 
 static sw_error_t
 adpt_mp_port_flowctrl_forcemode_set(a_uint32_t dev_id,
@@ -360,6 +415,7 @@ adpt_mp_port_flowctrl_forcemode_set(a_uint32_t dev_id,
 	return rv;
 }
 
+#ifndef IN_PORTCONTROL_MINI
 static sw_error_t
 adpt_mp_port_flowctrl_forcemode_get(a_uint32_t dev_id,
 	fal_port_t port_id, a_bool_t *enable)
@@ -377,6 +433,45 @@ adpt_mp_port_flowctrl_forcemode_get(a_uint32_t dev_id,
 		priv->port_rx_flowctrl_forcemode[port_id - 1]);
 
 	return rv;
+}
+#endif
+
+static sw_error_t
+adpt_mp_port_mac_status_get(a_uint32_t dev_id, a_uint32_t port_id,
+	struct port_phy_status *port_mac_status)
+{
+	sw_error_t rv = SW_OK;
+	a_uint32_t gmac_id = 0;
+	union mac_configuration_u configuration;
+
+	ADPT_DEV_ID_CHECK(dev_id);
+	MP_PORT_ID_CHECK(port_id);
+	ADPT_NULL_POINT_CHECK(port_mac_status);
+
+	memset(&configuration, 0, sizeof(configuration));
+	gmac_id = MP_PORT_TO_GMAC_ID(port_id);
+
+	rv = mp_mac_configuration_get(dev_id, gmac_id, &configuration);
+	SW_RTN_ON_ERROR(rv);
+
+	if (configuration.bf.port_select == GMAC_SPEED_1000M) {
+		port_mac_status->speed = FAL_SPEED_1000;
+	} else {
+		if (configuration.bf.mii_speed == GMAC_SPEED_100M) {
+			port_mac_status->speed = FAL_SPEED_100;
+		} else {
+			port_mac_status->speed = FAL_SPEED_10;
+		}
+	}
+
+	if (configuration.bf.duplex == GMAC_FULL_DUPLEX) {
+		port_mac_status->duplex = FAL_FULL_DUPLEX;
+	} else {
+		port_mac_status->duplex = FAL_HALF_DUPLEX;
+	}
+
+	return rv;
+
 }
 
 static sw_error_t
@@ -421,6 +516,8 @@ adpt_mp_port_mac_speed_set(a_uint32_t dev_id, a_uint32_t port_id,
 		SW_RTN_ON_ERROR(rv);
 		rv = _adpt_mp_gcc_mac_clock_set(dev_id,
 			port_id, A_TRUE);
+		SW_RTN_ON_ERROR(rv);
+		rv = adpt_mp_port_reset_set(dev_id, port_id);
 		SW_RTN_ON_ERROR(rv);
 	}
 	return rv;
@@ -479,6 +576,7 @@ adpt_mp_port_promisc_mode_set(a_uint32_t dev_id, fal_port_t port_id,
 	return rv;
 }
 
+#ifndef IN_PORTCONTROL_MINI
 static sw_error_t
 adpt_mp_port_promisc_mode_get(a_uint32_t dev_id, fal_port_t port_id,
 	a_bool_t *enable)
@@ -501,6 +599,7 @@ adpt_mp_port_promisc_mode_get(a_uint32_t dev_id, fal_port_t port_id,
 
 	return rv;
 }
+#endif
 
 static sw_error_t
 adpt_mp_port_max_frame_size_set(a_uint32_t dev_id, fal_port_t port_id,
@@ -597,6 +696,8 @@ adpt_mp_port_mac_eee_enable_set(a_uint32_t dev_id, fal_port_t port_id,
 
 	return rv;
 }
+
+#ifndef IN_PORTCONTROL_MINI
 static sw_error_t
 adpt_mp_port_mac_eee_enable_get(a_uint32_t dev_id, fal_port_t port_id,
 	a_bool_t *enable)
@@ -620,6 +721,7 @@ adpt_mp_port_mac_eee_enable_get(a_uint32_t dev_id, fal_port_t port_id,
 	return rv;
 
 }
+#endif
 
 static sw_error_t
 adpt_mp_port_interface_eee_cfg_set(a_uint32_t dev_id, fal_port_t port_id,
@@ -805,7 +907,7 @@ adpt_mp_port_interface_mode_switch(a_uint32_t dev_id, a_uint32_t port_id)
 	uniphy_mode_old = ssdk_dt_global_get_mac_mode(dev_id,
 		SSDK_UNIPHY_INSTANCE0);
 	if (uniphy_mode_new != uniphy_mode_old) {
-		rv = adpt_mp_uniphy_mode_set(dev_id,
+		rv = adpt_mp_uniphy_mode_configure(dev_id,
 			SSDK_UNIPHY_INSTANCE0, uniphy_mode_new);
 		SW_RTN_ON_ERROR(rv);
 		ssdk_dt_global_set_mac_mode(dev_id,
@@ -872,34 +974,6 @@ _adpt_mp_port_status_change(struct qca_phy_priv *priv, a_uint32_t port_id,
 	if (phy_status.rx_flowctrl != priv->port_old_rx_flowctrl[port_id - 1])
 		return A_TRUE;
 	return A_FALSE;
-}
-
-static sw_error_t
-adpt_mp_port_reset_set(a_uint32_t dev_id, a_uint32_t port_id)
-{
-	sw_error_t rv = 0;
-	a_uint32_t phy_addr;
-	hsl_phy_ops_t *phy_drv;
-
-	ADPT_DEV_ID_CHECK(dev_id);
-
-	if (port_id == SSDK_PHYSICAL_PORT1) {
-		/*internal gephy reset*/
-		SW_RTN_ON_NULL (phy_drv = hsl_phy_api_ops_get(dev_id,
-				port_id));
-		if (NULL == phy_drv->phy_function_reset)
-			return SW_NOT_SUPPORTED;
-		rv = hsl_port_prop_get_phyid (dev_id, port_id, &phy_addr);
-		SW_RTN_ON_ERROR (rv);
-		rv = phy_drv->phy_function_reset(dev_id, phy_addr, PHY_FIFO_RESET);
-		SW_RTN_ON_ERROR (rv);
-	} else if (port_id == SSDK_PHYSICAL_PORT2) {
-		rv = adpt_mp_uniphy_adapter_port_reset(dev_id, port_id);
-	} else {
-		return SW_NOT_SUPPORTED;
-	}
-
-	return rv;
 }
 
 sw_error_t
@@ -1104,7 +1178,117 @@ adpt_mp_port_lpi_polling_task(struct qca_phy_priv *priv)
 	return SW_OK;
 }
 
-sw_error_t adpt_mp_portctrl_init(a_uint32_t dev_id)
+static sw_error_t
+adpt_mp_port_speed_get(a_uint32_t dev_id, fal_port_t port_id,
+	fal_port_speed_t * pspeed)
+{
+	sw_error_t rv = 0;
+	a_uint32_t phy_id = 0;
+	hsl_phy_ops_t *phy_drv;
+	struct port_phy_status port_mac_status = {0};
+
+	ADPT_DEV_ID_CHECK(dev_id);
+	ADPT_NULL_POINT_CHECK(pspeed);
+
+	if (A_TRUE != hsl_port_prop_check (dev_id, port_id, HSL_PP_PHY)) {
+		return SW_BAD_PARAM;
+	}
+
+	/* for those ports without PHY device should be s17c port */
+	if (A_FALSE == _adpt_mp_port_phy_connected (dev_id, port_id)) {
+		rv = adpt_mp_port_mac_status_get(dev_id, port_id, &port_mac_status);
+		SW_RTN_ON_ERROR (rv);
+		*pspeed= port_mac_status.speed;
+	} else {
+		SW_RTN_ON_NULL (phy_drv = hsl_phy_api_ops_get (dev_id,
+				port_id));
+		if (NULL == phy_drv->phy_speed_get) {
+			return SW_NOT_SUPPORTED;
+		}
+
+		rv = hsl_port_prop_get_phyid (dev_id, port_id, &phy_id);
+		SW_RTN_ON_ERROR (rv);
+		rv = phy_drv->phy_speed_get (dev_id, phy_id, pspeed);
+		SW_RTN_ON_ERROR (rv);
+	}
+
+	return rv;
+}
+
+static sw_error_t
+adpt_mp_port_duplex_get(a_uint32_t dev_id, fal_port_t port_id,
+	fal_port_duplex_t * pduplex)
+{
+	sw_error_t rv = 0;
+	a_uint32_t phy_id = 0;
+	hsl_phy_ops_t *phy_drv;
+	struct port_phy_status port_mac_status = {0};
+
+	ADPT_DEV_ID_CHECK(dev_id);
+	ADPT_NULL_POINT_CHECK(pduplex);
+
+	if (A_TRUE != hsl_port_prop_check (dev_id, port_id, HSL_PP_PHY)) {
+		return SW_BAD_PARAM;
+	}
+
+	/* for those ports without PHY device should be s17c port */
+	if (A_FALSE == _adpt_mp_port_phy_connected (dev_id, port_id)) {
+		rv = adpt_mp_port_mac_status_get(dev_id, port_id, &port_mac_status);
+		SW_RTN_ON_ERROR (rv);
+		*pduplex = port_mac_status.duplex;
+	} else {
+		SW_RTN_ON_NULL (phy_drv = hsl_phy_api_ops_get (dev_id,
+				port_id));
+		if (NULL == phy_drv->phy_duplex_get) {
+			return SW_NOT_SUPPORTED;
+		}
+
+		rv = hsl_port_prop_get_phyid (dev_id, port_id, &phy_id);
+		SW_RTN_ON_ERROR (rv);
+		rv = phy_drv->phy_duplex_get (dev_id, phy_id, pduplex);
+		SW_RTN_ON_ERROR (rv);
+	}
+
+	return rv;
+}
+
+static sw_error_t
+adpt_mp_port_link_status_get(a_uint32_t dev_id, fal_port_t port_id,
+	a_bool_t * status)
+{
+	sw_error_t rv = 0;
+	a_uint32_t phy_id = 0;
+	hsl_phy_ops_t *phy_drv;
+
+	ADPT_DEV_ID_CHECK(dev_id);
+	ADPT_NULL_POINT_CHECK(status);
+
+	if (A_TRUE != hsl_port_prop_check (dev_id, port_id, HSL_PP_PHY)) {
+		return SW_BAD_PARAM;
+	}
+
+	/* for those ports without PHY device should be s17c port */
+	if (A_FALSE == _adpt_mp_port_phy_connected (dev_id, port_id)) {
+		*status = A_TRUE;
+	} else {
+		SW_RTN_ON_NULL (phy_drv = hsl_phy_api_ops_get (dev_id,
+				port_id));
+		if (NULL == phy_drv->phy_link_status_get) {
+			return SW_NOT_SUPPORTED;
+		}
+
+		rv = hsl_port_prop_get_phyid (dev_id, port_id, &phy_id);
+		SW_RTN_ON_ERROR (rv);
+
+		*status = phy_drv->phy_link_status_get (dev_id, phy_id);
+	}
+
+	return SW_OK;
+
+}
+
+sw_error_t 
+adpt_mp_portctrl_init(a_uint32_t dev_id)
 {
 	adpt_api_t *p_adpt_api = NULL;
 
@@ -1114,28 +1298,33 @@ sw_error_t adpt_mp_portctrl_init(a_uint32_t dev_id)
 	{
 		return SW_FAIL;
 	}
+#ifndef IN_PORTCONTROL_MINI
 	p_adpt_api->adpt_port_txmac_status_get = adpt_mp_port_txmac_status_get;
-	p_adpt_api->adpt_port_txmac_status_set = adpt_mp_port_txmac_status_set;
 	p_adpt_api->adpt_port_rxmac_status_get = adpt_mp_port_rxmac_status_get;
-	p_adpt_api->adpt_port_rxmac_status_set = adpt_mp_port_rxmac_status_set;
 	p_adpt_api->adpt_port_rxfc_status_get = adpt_mp_port_rxfc_status_get;
-	p_adpt_api->adpt_port_rxfc_status_set = adpt_mp_port_rxfc_status_set;
 	p_adpt_api->adpt_port_txfc_status_get = adpt_mp_port_txfc_status_get;
-	p_adpt_api->adpt_port_txfc_status_set = adpt_mp_port_txfc_status_set;
-	p_adpt_api->adpt_port_flowctrl_set = adpt_mp_port_flowctrl_set;
 	p_adpt_api->adpt_port_flowctrl_get = adpt_mp_port_flowctrl_get;
-	p_adpt_api->adpt_port_flowctrl_forcemode_set =
-		adpt_mp_port_flowctrl_forcemode_set;
 	p_adpt_api->adpt_port_flowctrl_forcemode_get =
 		adpt_mp_port_flowctrl_forcemode_get;
+	p_adpt_api->adpt_port_promisc_mode_get = adpt_mp_port_promisc_mode_get;
+	p_adpt_api->adpt_port_interface_3az_status_get = adpt_mp_port_mac_eee_enable_get;
+#endif
+	p_adpt_api->adpt_port_txmac_status_set = adpt_mp_port_txmac_status_set;
+	p_adpt_api->adpt_port_rxmac_status_set = adpt_mp_port_rxmac_status_set;
+	p_adpt_api->adpt_port_rxfc_status_set = adpt_mp_port_rxfc_status_set;
+	p_adpt_api->adpt_port_txfc_status_set = adpt_mp_port_txfc_status_set;
+	p_adpt_api->adpt_port_flowctrl_set = adpt_mp_port_flowctrl_set;
+	p_adpt_api->adpt_port_flowctrl_forcemode_set =
+		adpt_mp_port_flowctrl_forcemode_set;
 	p_adpt_api->adpt_port_max_frame_size_set = adpt_mp_port_max_frame_size_set;
 	p_adpt_api->adpt_port_max_frame_size_get = adpt_mp_port_max_frame_size_get;
 	p_adpt_api->adpt_port_promisc_mode_set = adpt_mp_port_promisc_mode_set;
-	p_adpt_api->adpt_port_promisc_mode_get = adpt_mp_port_promisc_mode_get;
 	p_adpt_api->adpt_port_mac_speed_set = adpt_mp_port_mac_speed_set;
+	p_adpt_api->adpt_port_speed_get = adpt_mp_port_speed_get;
 	p_adpt_api->adpt_port_mac_duplex_set = adpt_mp_port_mac_duplex_set;
+	p_adpt_api->adpt_port_duplex_get = adpt_mp_port_duplex_get;
+	p_adpt_api->adpt_port_link_status_get = adpt_mp_port_link_status_get;
 	p_adpt_api->adpt_port_interface_3az_status_set = adpt_mp_port_mac_eee_enable_set;
-	p_adpt_api->adpt_port_interface_3az_status_get = adpt_mp_port_mac_eee_enable_get;
 	p_adpt_api->adpt_port_interface_eee_cfg_set = adpt_mp_port_interface_eee_cfg_set;
 	p_adpt_api->adpt_port_interface_eee_cfg_get = adpt_mp_port_interface_eee_cfg_get;
 	p_adpt_api->adpt_port_netdev_notify_set = adpt_mp_port_netdev_change_notify;

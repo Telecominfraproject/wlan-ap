@@ -177,6 +177,13 @@ enum cmnblk_clk_type {
 	EXTERNAL_40MHZ,
 	EXTERNAL_48MHZ,
 	EXTERNAL_50MHZ,
+	INTERNAL_96MHZ,
+};
+
+enum cmnblk_pll_src_type {
+	CMN_BLK_PLL_SRC_SEL_FROM_REG = 0,
+	CMN_BLK_PLL_SRC_SEL_FROM_LOGIC = 1,
+	CMN_BLK_PLL_SRC_SEL_FROM_PCS = 2,
 };
 
 enum mp_bcr_rst_type {
@@ -194,6 +201,12 @@ enum mp_bcr_rst_type {
 #define GMAC1_BCR_RESET_ID	"gmac1_bcr_rst"
 #define GEPHY_MISC_RESET_ID	"gephy_misc_rst"
 
+#define CMN_BLK_ADDR                0x0009B780
+#define CMN_BLK_PLL_SRC_ADDR        0x0009B028
+#define CMN_BLK_SIZE                0x100
+#define PLL_CTRL_SRC_MASK           0xfffffcff
+#define PLL_REFCLK_DIV_MASK         0xfffffe0f
+#define PLL_REFCLK_DIV_2            0x20
 #define FREQUENCY_MASK              0xfffffdf0
 #define INTERNAL_48MHZ_CLOCK        0x7
 #define EXTERNAL_25MHZ_CLOCK        0x203

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2019,2020, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -41,9 +41,11 @@ extern "C" {
 
 #ifdef DESS
 int ssdk_dess_led_init(ssdk_init_cfg *cfg);
-
 #endif
 
+#ifdef IN_LED
+sw_error_t ssdk_led_init(a_uint32_t dev_id, ssdk_init_cfg *cfg);
+#endif
 #ifdef __cplusplus
 }
 #endif                          /* __cplusplus */

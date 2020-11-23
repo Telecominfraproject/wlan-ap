@@ -59,17 +59,20 @@ sw_error_t cmd_data_check_duplex(char *cmd_str, a_uint32_t * arg_val,
                                  a_uint32_t size);
 sw_error_t cmd_data_check_speed(char *cmd_str, a_uint32_t * arg_val,
                                 a_uint32_t size);
+#ifndef IN_PORTCONTROL_MINI
 sw_error_t
 cmd_data_check_port_eee_config(char *cmd_str, void * val, a_uint32_t size);
 sw_error_t
 cmd_data_check_switch_port_loopback_config(char *cmd_str, void * val,
 	a_uint32_t size);
 #endif
+#endif
 #ifdef IN_PORTVLAN
 sw_error_t cmd_data_check_1qmode(char *cmd_str, a_uint32_t * arg_val,
                                  a_uint32_t size);
 sw_error_t cmd_data_check_egmode(char *cmd_str, a_uint32_t * arg_val,
                                  a_uint32_t size);
+#ifdef HPPE
 sw_error_t
 cmd_data_check_global_qinqmode(char *info, void *val, a_uint32_t size);
 sw_error_t
@@ -95,13 +98,16 @@ sw_error_t
 cmd_data_check_port_vlan_translation_adv_action(char *info, void *val,
 				a_uint32_t size);
 #endif
+#endif
 #ifdef IN_PORTCONTROL
 sw_error_t cmd_data_check_capable(char *cmd_str, a_uint32_t * arg_val,
                                   a_uint32_t size);
 #endif
 #ifdef IN_FDB
 sw_error_t cmd_data_check_fdbentry(char *cmdstr, void *val, a_uint32_t size);
+#ifndef IN_FDB_MINI
 sw_error_t cmd_data_check_maclimit_ctrl(char *info, void *val, a_uint32_t size);
+#endif
 #endif
 sw_error_t cmd_data_check_macaddr(char *cmdstr, void *val, a_uint32_t size);
 #ifdef IN_VLAN
@@ -113,7 +119,6 @@ sw_error_t cmd_data_check_qos_sch(char *cmdstr, fal_sch_mode_t * val,
                                   a_uint32_t size);
 sw_error_t cmd_data_check_qos_pt(char *cmdstr, fal_qos_mode_t * val,
                                  a_uint32_t size);
-#endif
 sw_error_t
 cmd_data_check_port_group(char *cmd_str, void * val, a_uint32_t size);
 sw_error_t
@@ -126,6 +131,7 @@ sw_error_t
 cmd_data_check_queue_scheduler(char *cmd_str, void * val, a_uint32_t size);
 sw_error_t
 cmd_data_check_ring_queue(char *cmd_str, void * val, a_uint32_t size);
+#endif
 #endif
 #ifdef IN_RATE
 sw_error_t cmd_data_check_storm(char *cmdstr, fal_storm_type_t * val,
@@ -144,10 +150,12 @@ sw_error_t cmd_data_check_uinta(char *cmdstr, a_uint32_t * val,
 sw_error_t cmd_data_check_maccmd(char *cmdstr, fal_fwd_cmd_t * val,
                                  a_uint32_t size);
 #ifdef IN_IP
+#ifndef IN_IP_MINI
 sw_error_t cmd_data_check_flowcmd(char *cmdstr, fal_default_flow_cmd_t * val,
                                  a_uint32_t size);
 sw_error_t cmd_data_check_flowtype(char *cmdstr, fal_flow_type_t * val,
                                  a_uint32_t size);
+#endif
 #endif
 #ifdef IN_LED
 sw_error_t cmd_data_check_ledpattern(char *info, void * val, a_uint32_t size);
@@ -233,8 +241,10 @@ sw_error_t
 cmd_data_check_acl_policer(char *cmd_str, void * val, a_uint32_t size);
 #endif
 #ifdef IN_FDB
+#ifndef IN_FDB_MINI
 sw_error_t
 cmd_data_check_fdb_smode(char *cmd_str, a_uint32_t * arg_val, a_uint32_t size);
+#endif
 #endif
 #ifdef IN_IGMP
 sw_error_t
@@ -264,7 +274,7 @@ cmd_data_check_sec_icmp4(char *cmd_str, a_uint32_t * arg_val, a_uint32_t size);
 
 sw_error_t
 cmd_data_check_sec_icmp6(char *cmd_str, a_uint32_t * arg_val, a_uint32_t size);
-
+#ifdef HPPE
 sw_error_t
 cmd_data_check_l3_parser(char *cmd_str, void * val, a_uint32_t size);
 
@@ -274,11 +284,15 @@ cmd_data_check_l4_parser(char *cmd_str, void * val, a_uint32_t size);
 sw_error_t
 cmd_data_check_exp_ctrl(char *cmd_str, void * val, a_uint32_t size);
 #endif
+#endif
 #ifdef IN_COSMAP
+#ifndef IN_COSMAP_MINI
 sw_error_t
 cmd_data_check_remark_entry(char *info, void *val, a_uint32_t size);
 #endif
+#endif
 #ifdef IN_IP
+#ifndef IN_IP_MINI
 sw_error_t
 cmd_data_check_default_route_entry(char *cmd_str, void * val, a_uint32_t size);
 
@@ -309,6 +323,7 @@ sw_error_t
 cmd_data_check_ip_mcmode(char *cmd_str, void * val, a_uint32_t size);
 sw_error_t
 cmd_data_check_ip_global(char *cmd_str, void * val, a_uint32_t size);
+#endif
 #endif
 #if defined(IN_IP) || defined(IN_NAT)
 sw_error_t

@@ -1032,6 +1032,16 @@ typedef sw_error_t (*adpt_sfp_enhanced_cfg_get_func)(a_uint32_t dev_id,
 typedef sw_error_t (*adpt_sfp_rate_encode_get_func)(a_uint32_t dev_id,
 		a_uint32_t port_id, fal_sfp_rate_encode_t *encode);
 
+/*led*/
+typedef sw_error_t (*adpt_led_ctrl_pattern_set_func)(a_uint32_t dev_id,
+	led_pattern_group_t group, led_pattern_id_t led_pattern_id,
+	led_ctrl_pattern_t * pattern);
+typedef sw_error_t (*adpt_led_ctrl_pattern_get_func)(a_uint32_t dev_id,
+	led_pattern_group_t group, led_pattern_id_t led_pattern_id,
+	led_ctrl_pattern_t * pattern);
+typedef sw_error_t (*adpt_led_ctrl_source_set_func)(a_uint32_t dev_id,
+	a_uint32_t source_id, led_ctrl_pattern_t *pattern);
+
 typedef struct
 {
 	ssdk_chip_type chip_type;
@@ -1565,6 +1575,10 @@ typedef struct
 	adpt_sfp_ctrl_rate_get_func adpt_sfp_ctrl_rate_get;
 	adpt_sfp_enhanced_cfg_get_func adpt_sfp_enhanced_cfg_get;
 	adpt_sfp_rate_encode_get_func adpt_sfp_rate_encode_get;
+	/*led*/
+	adpt_led_ctrl_pattern_set_func adpt_led_ctrl_pattern_set;
+	adpt_led_ctrl_pattern_get_func adpt_led_ctrl_pattern_get;
+	adpt_led_ctrl_source_set_func adpt_led_ctrl_source_set;
 }adpt_api_t;
 
 

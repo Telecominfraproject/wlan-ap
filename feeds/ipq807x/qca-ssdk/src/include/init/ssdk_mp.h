@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2019-2020, The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -26,7 +26,7 @@ extern "C" {
 
 #define MP_LPI_WAKEUP_TIMER             0x46
 
-sw_error_t qca_mp_hw_init(a_uint32_t dev_id);
+sw_error_t qca_mp_hw_init(a_uint32_t dev_id, ssdk_init_cfg *cfg);
 
 #ifdef __cplusplus
 }

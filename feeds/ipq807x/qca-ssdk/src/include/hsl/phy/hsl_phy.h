@@ -238,6 +238,16 @@ extern "C" {
 					      a_uint32_t phy_id,
 					      a_uint32_t * status);
 /*qca808x_end*/
+	typedef sw_error_t(*hsl_phy_led_ctrl_pattern_set) (a_uint32_t dev_id,
+					      a_uint32_t phy_id,
+					      led_ctrl_pattern_t * pattern);
+	typedef sw_error_t(*hsl_phy_led_ctrl_pattern_get) (a_uint32_t dev_id,
+					      a_uint32_t phy_id,
+					      led_ctrl_pattern_t * pattern);
+	typedef sw_error_t(*hsl_phy_led_ctrl_source_set) (a_uint32_t dev_id,
+					      a_uint32_t phy_id,
+					      a_uint32_t source_id,
+					      led_ctrl_pattern_t * pattern);
 	typedef sw_error_t(*hsl_phy_ptp_security_set) (a_uint32_t dev_id,
 				a_uint32_t phy_id, fal_ptp_security_t *sec);
 
@@ -495,6 +505,9 @@ extern "C" {
 		hsl_phy_eee_cap_get phy_eee_cap_get;
 		hsl_phy_eee_status_get phy_eee_status_get;
 /*qca808x_end*/
+		hsl_phy_led_ctrl_pattern_set phy_led_ctrl_pattern_set;
+		hsl_phy_led_ctrl_pattern_get phy_led_ctrl_pattern_get;
+		hsl_phy_led_ctrl_source_set phy_led_ctrl_source_set;
 		hsl_phy_ptp_ops_t phy_ptp_ops;
 /*qca808x_start*/
 	} hsl_phy_ops_t;
@@ -522,6 +535,13 @@ typedef enum
 	MAX_PHY_CHIP,
 } phy_type_t;
 
+#define PHY_INVALID_DAC        0
+
+typedef struct {
+	a_uint8_t mdac;
+	a_uint8_t edac;
+} phy_dac_t;
+
 typedef struct {
 	a_uint32_t phy_address[SW_MAX_NR_PORT];
 	a_uint32_t phy_type[SW_MAX_NR_PORT];
@@ -533,6 +553,7 @@ typedef struct {
 	a_bool_t phy_c45[SW_MAX_NR_PORT];
 	a_bool_t phy_combo[SW_MAX_NR_PORT];
 	a_uint32_t phy_reset_gpio[SW_MAX_NR_PORT];
+	phy_dac_t phy_dac[SW_MAX_NR_PORT];
 } phy_info_t;
 /*qca808x_end*/
 #define MALIBU5PORT_PHY         0x004DD0B1
@@ -579,6 +600,14 @@ typedef struct {
 #define INVALID_PHY_ADDR        0xff
 #define MAX_PHY_ADDR            0x1f
 #define QCA8072_PHY_NUM         0x2
+
+#define PHY_INVALID_DATA 0xffff
+
+#define PHY_RTN_ON_READ_ERROR(phy_data) \
+    do { if (phy_data == PHY_INVALID_DATA) return(SW_READ_ERROR); } while(0);
+
+#define PHY_RTN_ON_ERROR(rv) \
+    do { if (rv != SW_OK) return(rv); } while(0);
 
 sw_error_t
 hsl_phy_api_ops_register(phy_type_t phy_type, hsl_phy_ops_t * phy_api_ops);
@@ -659,6 +688,13 @@ void hsl_port_phy_reset_gpio_set(a_uint32_t dev_id, a_uint32_t port_id,
 
 void hsl_port_phy_gpio_reset(a_uint32_t dev_id, a_uint32_t port_id);
 
+void
+hsl_port_phy_dac_get(a_uint32_t dev_id, a_uint32_t port_id,
+	phy_dac_t *phy_dac);
+
+void
+hsl_port_phy_dac_set(a_uint32_t dev_id, a_uint32_t port_id,
+	phy_dac_t phy_dac);
 /*qca808x_start*/
 sw_error_t ssdk_phy_driver_cleanup(void);
 /*qca808x_end*/

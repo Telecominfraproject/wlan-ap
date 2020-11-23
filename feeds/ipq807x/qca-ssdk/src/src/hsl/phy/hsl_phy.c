@@ -573,8 +573,12 @@ sw_error_t hsl_port_phy_hw_init(a_uint32_t dev_id, a_uint32_t port_id)
 
 	phytype = hsl_phy_type_get(dev_id, port_id);
 
-	ssdk_phy_driver[phytype].init(dev_id,
-		ssdk_phy_driver[phytype].port_bmp[dev_id]);
+	if(ssdk_phy_driver[phytype].port_bmp[dev_id] != 0 &&
+			ssdk_phy_driver[phytype].init != NULL)
+	{
+		ssdk_phy_driver[phytype].init(dev_id,
+			ssdk_phy_driver[phytype].port_bmp[dev_id]);
+	}
 
 	return SW_OK;
 }
@@ -681,6 +685,26 @@ void hsl_port_phy_gpio_reset(a_uint32_t dev_id, a_uint32_t port_id)
 	SSDK_INFO("GPIO%d reset PHY done\n", gpio_num);
 
 	gpio_free(gpio_num);
+
+	return;
+}
+
+void
+hsl_port_phy_dac_get(a_uint32_t dev_id, a_uint32_t port_id,
+	phy_dac_t *phy_dac)
+{
+	phy_dac->mdac = phy_info[dev_id]->phy_dac[port_id].mdac;
+	phy_dac->edac = phy_info[dev_id]->phy_dac[port_id].edac;
+
+	return;
+}
+
+void
+hsl_port_phy_dac_set(a_uint32_t dev_id, a_uint32_t port_id,
+	phy_dac_t phy_dac)
+{
+	phy_info[dev_id]->phy_dac[port_id].mdac = phy_dac.mdac;
+	phy_info[dev_id]->phy_dac[port_id].edac = phy_dac.edac;
 
 	return;
 }

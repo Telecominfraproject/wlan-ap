@@ -21,10 +21,6 @@
 
 #define QCA803X_PHY_DELAYED_INIT_TICKS msecs_to_jiffies(1000)
 
-#define PHY_RTN_ON_READ_ERROR(phy_data) \
-    do { if (phy_data == 0xffff) return(SW_READ_ERROR); } while(0);
-
-
 typedef struct {
 	a_uint32_t dev_id;
 	a_uint32_t combo_phy_bmp;

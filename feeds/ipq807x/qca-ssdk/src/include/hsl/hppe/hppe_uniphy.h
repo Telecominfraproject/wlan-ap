@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2017, 2019-2020, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -493,13 +493,13 @@ hppe_uniphy_channel0_input_output_4_newaddedfromhere_ch0_mr_main_reset_25m_set(
 		a_uint32_t value);
 
 sw_error_t
-hppe_uniphy_channel0_input_output_4_newaddedfromhere_ch0_force_speed_25m_get(
+hppe_uniphy_channel0_force_speed_mode_get(
 		a_uint32_t dev_id,
 		a_uint32_t index,
 		a_uint32_t *value);
 
 sw_error_t
-hppe_uniphy_channel0_input_output_4_newaddedfromhere_ch0_force_speed_25m_set(
+hppe_uniphy_channel0_force_speed_mode_set(
 		a_uint32_t dev_id,
 		a_uint32_t index,
 		a_uint32_t value);

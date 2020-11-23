@@ -426,6 +426,13 @@ extern "C"
 
 #define QCA808X_PHY_FRAME_CHECK_EN              0x0001
 #define QCA808X_PHY_XMIT_MAC_CNT_SELFCLR        0x0002
+
+#define QCA808X_PHY_ADC_THRESHOLD               0x2c80
+#define QCA808X_PHY_ADC_THRESHOLD_80MV          0
+#define QCA808X_PHY_ADC_THRESHOLD_100MV         0xf0
+#define QCA808X_PHY_ADC_THRESHOLD_200MV         0x0f
+#define QCA808X_PHY_ADC_THRESHOLD_300MV         0xff
+
 a_uint16_t
 qca808x_phy_reg_read(a_uint32_t dev_id, a_uint32_t phy_id, a_uint32_t reg_id);
 
@@ -614,6 +621,8 @@ void qca808x_phy_lock_init(void);
 int qca808x_phy_init(a_uint32_t dev_id, a_uint32_t port_bmp);
 
 void qca808x_phy_exit(a_uint32_t dev_id, a_uint32_t port_id);
+a_bool_t
+qca808x_phy_2500caps(a_uint32_t dev_id, a_uint32_t phy_id);
 
 #ifdef __cplusplus
 }

@@ -23,6 +23,7 @@
 #include "hppe_init.h"
 #include "ssdk_init.h"
 #include "ssdk_clk.h"
+#include "ssdk_dts.h"
 #include "adpt.h"
 #include "hppe_reg_access.h"
 #include "hsl_phy.h"
@@ -392,10 +393,11 @@ __adpt_hppe_uniphy_sgmiiplus_mode_set(a_uint32_t dev_id, a_uint32_t uniphy_index
 static sw_error_t
 __adpt_hppe_uniphy_sgmii_mode_set(a_uint32_t dev_id, a_uint32_t uniphy_index, a_uint32_t channel)
 {
-	a_uint32_t i, max_port, mode;
+	a_uint32_t i, max_port, mode, ssdk_port;
 	sw_error_t rv = SW_OK;
 
 	union uniphy_mode_ctrl_u uniphy_mode_ctrl;
+	a_bool_t force_port = 0;
 
 	memset(&uniphy_mode_ctrl, 0, sizeof(uniphy_mode_ctrl));
 	ADPT_DEV_ID_CHECK(dev_id);
@@ -501,9 +503,24 @@ __adpt_hppe_uniphy_sgmii_mode_set(a_uint32_t dev_id, a_uint32_t uniphy_index, a_
 		uniphy_mode_ctrl.bf.newaddedfromhere_sg_mode =
 			UNIPHY_SGMII_MODE_ENABLE;
 	}
-
 	hppe_uniphy_mode_ctrl_set(dev_id, uniphy_index, &uniphy_mode_ctrl);
 
+	if (uniphy_index != SSDK_UNIPHY_INSTANCE0) {
+		if (uniphy_index == SSDK_UNIPHY_INSTANCE1) {
+			ssdk_port = SSDK_PHYSICAL_PORT5;
+		} else {
+			ssdk_port = SSDK_PHYSICAL_PORT6;
+		}
+		force_port = ssdk_port_feature_get(dev_id,
+			ssdk_port, PHY_F_FORCE);
+		if (force_port == A_TRUE) {
+			rv = hppe_uniphy_channel0_force_speed_mode_set(dev_id,
+				uniphy_index, UNIPHY_FORCE_SPEED_MODE_ENABLE);
+			SW_RTN_ON_ERROR (rv);
+			SSDK_INFO("ssdk uniphy %d connects force port\n",
+					uniphy_index);
+		}
+	}
 	/* configure uniphy gcc software reset */
 	if (adpt_hppe_chip_revision_get(dev_id) == CPPE_REVISION) {
 #if defined(CPPE)

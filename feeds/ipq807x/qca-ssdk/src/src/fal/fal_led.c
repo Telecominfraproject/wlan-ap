@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012, 2020, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -21,8 +21,7 @@
 #include "sw.h"
 #include "fal_led.h"
 #include "hsl_api.h"
-
-
+#include "adpt.h"
 
 static sw_error_t
 _fal_led_ctrl_pattern_set(a_uint32_t dev_id, led_pattern_group_t group,
@@ -30,7 +29,13 @@ _fal_led_ctrl_pattern_set(a_uint32_t dev_id, led_pattern_group_t group,
 {
     sw_error_t rv;
     hsl_api_t *p_api;
+    adpt_api_t *p_adpt_api;
 
+    if((p_adpt_api = adpt_api_ptr_get(dev_id)) != NULL &&
+        p_adpt_api->adpt_led_ctrl_pattern_set != NULL) {
+        rv = p_adpt_api->adpt_led_ctrl_pattern_set(dev_id, group, id, pattern);
+        return rv;
+    }
     SW_RTN_ON_NULL(p_api = hsl_api_ptr_get(dev_id));
 
     if (NULL == p_api->led_ctrl_pattern_set)
@@ -48,7 +53,13 @@ _fal_led_ctrl_pattern_get(a_uint32_t dev_id, led_pattern_group_t group,
 {
     sw_error_t rv;
     hsl_api_t *p_api;
+    adpt_api_t *p_adpt_api;
 
+    if((p_adpt_api = adpt_api_ptr_get(dev_id)) != NULL &&
+        p_adpt_api->adpt_led_ctrl_pattern_get != NULL) {
+        rv = p_adpt_api->adpt_led_ctrl_pattern_get(dev_id, group, id, pattern);
+        return rv;
+    }
     SW_RTN_ON_NULL(p_api = hsl_api_ptr_get(dev_id));
 
     if (NULL == p_api->led_ctrl_pattern_get)
@@ -62,16 +73,22 @@ static sw_error_t
 _fal_led_source_pattern_set(a_uint32_t dev_id, a_uint32_t source_id,
                           led_ctrl_pattern_t * pattern)
 {
-	sw_error_t rv;
-	hsl_api_t *p_api;
+    sw_error_t rv;
+    hsl_api_t *p_api;
+    adpt_api_t *p_adpt_api;
 
-	SW_RTN_ON_NULL(p_api = hsl_api_ptr_get(dev_id));
+    if((p_adpt_api = adpt_api_ptr_get(dev_id)) != NULL &&
+        p_adpt_api->adpt_led_ctrl_source_set != NULL) {
+        rv = p_adpt_api->adpt_led_ctrl_source_set(dev_id, source_id, pattern);
+        return rv;
+    }
+    SW_RTN_ON_NULL(p_api = hsl_api_ptr_get(dev_id));
 
-	if (NULL == p_api->led_ctrl_source_set)
-	return SW_NOT_SUPPORTED;
+    if (NULL == p_api->led_ctrl_source_set)
+        return SW_NOT_SUPPORTED;
 
-	rv = p_api->led_ctrl_source_set(dev_id, source_id, pattern);
-	return rv;
+    rv = p_api->led_ctrl_source_set(dev_id, source_id, pattern);
+    return rv;
 }
 
 

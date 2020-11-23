@@ -2427,7 +2427,7 @@ void switch_cpuport_setup(a_uint32_t dev_id)
 	fal_port_rxmac_status_set(dev_id, 0, A_TRUE);
 #endif
 }
-
+#ifdef IN_AQUANTIA_PHY
 #ifdef CONFIG_MDIO
 static struct mdio_if_info ssdk_mdio_ctl;
 #endif
@@ -2529,7 +2529,7 @@ static void ssdk_miireg_ioctrl_unregister(void)
 		ssdk_miireg_netdev = NULL;
 	}
 }
-
+#endif
 static void ssdk_driver_register(a_uint32_t dev_id)
 {
 	hsl_reg_mode reg_mode;
@@ -3495,8 +3495,9 @@ static int __init regi_init(void)
 		rv = chip_ver_get(dev_id, &cfg);
 		SW_CNTU_ON_ERROR_AND_COND1_OR_GOTO_OUT(rv, -ENODEV);
 /*qca808x_end*/
+#ifdef IN_AQUANTIA_PHY
 		ssdk_miireg_ioctrl_register();
-
+#endif
 		memset(&chip_spec_cfg, 0, sizeof(garuda_init_spec_cfg));
 		cfg.chip_spec_cfg = &chip_spec_cfg;
 /*qca808x_start*/
@@ -3630,8 +3631,9 @@ regi_exit(void)
 #endif
 
 	ssdk_sysfs_exit();
+#ifdef IN_AQUANTIA_PHY
 	ssdk_miireg_ioctrl_unregister();
-
+#endif
 	for (dev_id = 0; dev_id < dev_num; dev_id++) {
 		ssdk_plat_exit(dev_id);
 	}

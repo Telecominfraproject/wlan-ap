@@ -102,7 +102,7 @@ qca_ar8327_sw_set_port_reset_mib(struct switch_dev *dev,
     return 0;
 }
 
-
+#ifdef HPPE
 static int qca_ar8327_sw_print_xgport_mib(struct switch_dev *dev,
 	const struct switch_attr *attr, struct switch_val *val)
 {
@@ -273,6 +273,7 @@ static int qca_ar8327_sw_print_xgport_mib(struct switch_dev *dev,
 
 	return 0;
 }
+#endif
 
 int
 qca_ar8327_sw_get_port_mib(struct switch_dev *dev,
@@ -289,14 +290,14 @@ qca_ar8327_sw_get_port_mib(struct switch_dev *dev,
     port = val->port_vlan;
     if (port >= dev->ports)
         return -EINVAL;
-
+#ifdef HPPE
     if (priv->version == QCA_VER_HPPE &&
         qca_hppe_port_mac_type_get(priv->device_id, port) == PORT_XGMAC_TYPE)
     {
         qca_ar8327_sw_print_xgport_mib(dev, attr, val);
         return 0;
     }
-
+#endif
     mutex_lock(&priv->mib_lock);
     _qca_ar8327_sw_capture_port_counter(dev, port);
     pos = port * (sizeof(fal_mib_counter_t)/sizeof(a_uint64_t));
