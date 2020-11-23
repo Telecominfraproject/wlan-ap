@@ -58,10 +58,10 @@ endef
 
 define ath11k-wifi-install-one
   $(if $(filter $(suffix $(1)),.IPQ6018),\
-    $(call ath11k-wifi-install-one-to,$(1),$(2),IPQ6018),\
+    $(call ath11k-wifi-install-one-to,$(1),$(2),ath11k/IPQ6018/hw1.0/),\
   )
   $(if $(filter $(suffix $(1)),.IPQ8074),\
-    $(call ath11k-wifi-install-one-to,$(1),$(2),IPQ8074),\
+    $(call ath11k-wifi-install-one-to,$(1),$(2),ath11k/IPQ8074/hw2.0/),\
   )
 
 endef
@@ -95,13 +95,13 @@ Do not install it for any other device!
 endef
 
 define Package/ath11k-wifi-qcom-ipq8074/install
-	$(INSTALL_DIR) $(1)/lib/firmware/IPQ8074/
-	$(INSTALL_DATA) ./board-2.bin.IPQ8074 $(1)/lib/firmware/IPQ8074/board-2.bin
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ8074/hw2.0/
+	$(INSTALL_DATA) ./board-2.bin.IPQ8074 $(1)/lib/firmware/ath11k/IPQ8074/hw2.0/board-2.bin
 endef
 
 define Package/ath11k-wifi-qcom-ipq6018/install
 	$(INSTALL_DIR) $(1)/lib/firmware/IPQ6018/
-	$(INSTALL_DATA) ./board-2.bin.IPQ6018 $(1)/lib/firmware/IPQ6018/board-2.bin
+	$(INSTALL_DATA) ./board-2.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
 endef
 
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
