@@ -37,6 +37,24 @@ static int8_t *nss_tunipip6_log_message_types_str[NSS_TUNIPIP6_MAX] __maybe_unus
 };
 
 /*
+ * nss_tunipip6_log_error_types_str
+ *	Strings for error types for TUNIPIP6 messages
+ */
+static char *nss_tunipip6_log_error_types_str[NSS_TUNIPIP6_ERROR_MAX] __maybe_unused = {
+	"TUNIPIP6 maximum tunnel reached",
+	"TUNIPIP6 tunnel already exists",
+	"TUNIPIP6 configuration parameters are incorrect",
+	"TUNIPIP6 FMR already exists ",
+	"TUNIPIP6 no FMR configured",
+	"TUNIPIP6 FMR table is full",
+	"TUNIPIP6 invalid FMR",
+	"TUNIPIP6 BMR already exists",
+	"TUNIPIP6 no BMR configured",
+	"TUNIPIP6 memory allocation for FMR failed",
+	"TUNIPIP6 unknown error",
+};
+
+/*
  * nss_tunipip6_log_map_rule()
  *	Log NSS TUNIPIP6 map rule.
  */
@@ -73,16 +91,18 @@ static void nss_tunipip6_log_if_create_msg(struct nss_tunipip6_msg *ntm)
 		"TUNIPIP6 Flags: %d\n"
 		"TUNIPIP6 Hop Limit: %d\n"
 		"TUNIPIP6 Draft03 Specification: %d\n"
-		"TUNIPIP6 TTL inherit: %s\n"
-		"TUNIPIP6 TOS inherit: %s\n"
-		"TUNIPIP6 Frag ID Update: %s\n",
+		"TUNIPIP6 TTL inherit: %u\n"
+		"TUNIPIP6 TOS inherit: %u\n"
+		"TUNIPIP6 Frag ID Update: %u\n"
+		"TUNIPIP6 Max FMR: %u\n",
 		ntcm, ntcm->saddr,
 		ntcm->daddr, ntcm->flowlabel,
 		ntcm->flags, ntcm->hop_limit,
 		ntcm->draft03,
-		ntcm->ttl_inherit ? "true":"false",
-		ntcm->tos_inherit ? "true":"false",
-		ntcm->frag_id_update ? "true":"false");
+		ntcm->ttl_inherit,
+		ntcm->tos_inherit,
+		ntcm->frag_id_update,
+		ntcm->fmr_max);
 }
 
 /*
@@ -97,7 +117,7 @@ static void nss_tunipip6_log_verbose(struct nss_tunipip6_msg *ntm)
 		nss_tunipip6_log_if_create_msg(ntm);
 		break;
 
-	case NSS_TUNIPIP6_RX_STATS_SYNC:
+	case NSS_TUNIPIP6_STATS_SYNC:
 		/*
 		 * No log for valid stats message.
 		 */
@@ -151,9 +171,18 @@ void nss_tunipip6_log_rx_msg(struct nss_tunipip6_msg *ntm)
 		goto verbose;
 	}
 
-	nss_info("%px: msg nack - type[%d]:%s, response[%d]:%s\n",
+	if (ntm->cm.error >= NSS_TUNIPIP6_ERROR_MAX) {
+		nss_warning("%px: msg failure - type[%d]:%s, response[%d]:%s, error[%d]:Invalid error\n",
+			ntm, ntm->cm.type, nss_tunipip6_log_message_types_str[ntm->cm.type],
+			ntm->cm.response, nss_cmn_response_str[ntm->cm.response],
+			ntm->cm.error);
+		goto verbose;
+	}
+
+	nss_info("%px: msg nack - type[%d]:%s, response[%d]:%s, error[%d]:%s\n",
 		ntm, ntm->cm.type, nss_tunipip6_log_message_types_str[ntm->cm.type],
-		ntm->cm.response, nss_cmn_response_str[ntm->cm.response]);
+		ntm->cm.response, nss_cmn_response_str[ntm->cm.response],
+		ntm->cm.error, nss_tunipip6_log_error_types_str[ntm->cm.error]);
 
 verbose:
 	nss_tunipip6_log_verbose(ntm);

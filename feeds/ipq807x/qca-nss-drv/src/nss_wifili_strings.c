@@ -138,6 +138,7 @@ struct nss_stats_info nss_wifili_strings_stats_rxdma_ring[NSS_WIFILI_STATS_RXDMA
  *	wifili wbm ring stats
  */
 struct nss_stats_info nss_wifili_strings_stats_wbm[NSS_WIFILI_STATS_WBM_MAX] = {
+	{"wbm_ie_local_alloc_fail"	, NSS_STATS_TYPE_ERROR},
 	{"wbm_src_dma"			, NSS_STATS_TYPE_SPECIAL},
 	{"wbm_src_dma_code_inv"		, NSS_STATS_TYPE_SPECIAL},
 	{"wbm_src_reo"			, NSS_STATS_TYPE_SPECIAL},

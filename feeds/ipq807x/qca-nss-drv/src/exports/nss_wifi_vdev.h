@@ -180,6 +180,11 @@ enum nss_wifi_vdev_cmd {
 	NSS_WIFI_VDEV_CFG_AST_OVERRIDE_CMD,	/**< Configuration to set AST (Address Search Table) override on VAP. */
 	NSS_WIFI_VDEV_CFG_SON_CAP_CMD,		/**< Configuration to set software defined network capability on VAP. */
 	NSS_WIFI_VDEV_CFG_MULTIPASS_CMD,	/**< Configuration to enable multipass phrase capability on VAP. */
+	NSS_WIFI_VDEV_CFG_HLOS_TID_OVERRIDE_CMD,
+					/**< Configuration to enable HLOS TID override on VAP. */
+	NSS_WIFI_VDEV_ENABLE_IGMP_ME_CMD,	/**< Configuration to set IGMP multicast enhancement on VAP. */
+	NSS_WIFI_VDEV_CFG_WDS_BACKHAUL_CMD,
+						/**< Configuration to set WDS backhaul extension on VAP. */
 	NSS_WIFI_VDEV_MAX_CMD
 };
 
@@ -240,7 +245,8 @@ struct nss_wifi_vdev_config_msg {
 					/**< VAP is configured as a smart monitor VAP. */
 	uint8_t is_wrap;		/**< Specifies whether the VAP is a WRAP-AP. */
 	uint8_t is_nss_qwrap_en;	/**< VAP is configured for NSS firmware QWRAP logic. */
-	uint8_t reserved[2];		/**< Reserved for 4-byte alignment padding. */
+	uint8_t tx_per_pkt_vdev_id_check;	/**< Transmit per-packet virtual device ID check. */
+	uint8_t reserved;		/**< Reserved for 4-byte alignment padding. */
 };
 
 /**
@@ -761,9 +767,8 @@ struct nss_wifi_vdev_per_packet_metadata {
  *	Metadata payload for Mesh mode receive.
  */
 struct nss_wifi_vdev_meshmode_rx_metadata {
-	uint16_t rs_ratephy;	/**< PHY rate. */
-	uint16_t rs_ratephy_lo;	/**< PHY rate lower bytes. */
-	uint16_t rs_ratephy_hi;	/**< PHY rate higher bytes. */
+	uint16_t rs_ratephy_lo;	/**< PHY rate lower order bytes. */
+	uint16_t rs_ratephy_hi;	/**< PHY rate higher order bytes. */
 	uint16_t cntr_chan_freq;	/** Center channel frequency. */
 	uint16_t vdev_id;	/**< Virtual device ID. */
 	uint16_t peer_id;	/**< Peer ID. */
@@ -889,6 +894,17 @@ struct nss_wifi_vdev_mcast_enhance_stats {
 	 * Number of multicast bytes received for multicast enhancement.
 	 */
 	uint32_t mcast_rcvd_bytes;
+
+	/**
+	 * Number of IGMP packets received for conversion to unicast.
+	 */
+	uint32_t igmp_rcvd;
+
+	/**
+	 * Number of IGMP packets converted to unicast as a part of
+	 * VoW IGMP improvements.
+	 */
+	uint32_t igmp_ucast_converted;
 };
 
 /**
@@ -897,8 +913,8 @@ struct nss_wifi_vdev_mcast_enhance_stats {
  */
 struct nss_wifi_vdev_stats_sync_msg {
 	uint32_t dropped;			/**< Number of dropped packets. */
-	uint32_t tx_enqueue_cnt;		/**< Tx pnode enqueue count. */
-	uint32_t tx_enqueue_fail_cnt;		/**< Tx pnode enqueue count. */
+	uint32_t tx_enqueue_cnt;		/**< Transmit pnode enqueue count. */
+	uint32_t tx_enqueue_fail_cnt;		/**< Transmit pnode enqueue count. */
 	uint32_t tx_intra_bss_enqueue_cnt;	/**< Intra BSS enqueue count. */
 	uint32_t tx_intra_bss_enqueue_fail_cnt;
 						/**< Intra BSS enqueue fail count. */
@@ -906,12 +922,12 @@ struct nss_wifi_vdev_stats_sync_msg {
 						/**< Virual device multicast/broadcast packet count in AP mode. */
 	uint32_t tx_intra_bss_mcast_send_fail_cnt;
 						/**< Virtual device multicast/broadcast packet count in AP mode. */
-	uint32_t tx_enqueue_bytes;		/**< Tx enqueue bytes count. */
+	uint32_t tx_enqueue_bytes;		/**< Transmit enqueue bytes count. */
 	uint32_t rx_enqueue_cnt;		/**< Ethernet node enqueue count. */
 	uint32_t rx_enqueue_fail_cnt;		/**< Ethernet node enqueue fail count. */
 	uint32_t rx_except_enqueue_cnt;		/**< N2H (NSS to Host) node enqueue count. */
 	uint32_t rx_except_enqueue_fail_cnt;	/**< N2H (NSS to Host) node enqueue fail count. */
-	uint32_t rx_enqueue_bytes;		/**< Rx enqueue bytes count. */
+	uint32_t rx_enqueue_bytes;		/**< Receive enqueue bytes count. */
 	uint32_t rx_wds_learn_send_cnt;		/**< Virtual device WDS source port learn count. */
 	uint32_t rx_wds_learn_send_fail_cnt;	/**< Virtual device WDS source count fail. */
 	struct nss_wifi_vdev_mcast_enhance_stats wvmes;
@@ -931,6 +947,11 @@ struct nss_wifi_vdev_stats_sync_msg {
 	uint32_t tx_eapol_cnt;			/**< Number of EAPoL frames in transmit direction. */
 	uint32_t nawds_tx_mcast_cnt;		/**< Number of NAWDS packets sent. */
 	uint32_t nawds_tx_mcast_bytes;		/**< Number of NAWDS bytes sent. */
+	uint32_t per_pkt_vdev_check_fail;	/**< Number of packets that failed vdev id check in Tx. */
+	uint32_t rx_mcast_cnt;			/**< Receive multicast packet count. */
+	uint32_t rx_mcast_bytes;		/**< Receive multicast bytes count. */
+	uint32_t rx_decrypt_err;		/**< Receive decryption error */
+	uint32_t rx_mic_err;			/**< Receive MIC error */
 };
 
 /**

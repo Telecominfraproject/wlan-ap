@@ -14,12 +14,14 @@
  **************************************************************************
  */
 
+#include "nss_tx_rx_common.h"
+#include "nss_igs_stats.h"
+
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0))
 #ifdef CONFIG_NET_CLS_ACT
 #include <linux/tc_act/tc_nss_mirred.h>
 #endif
-
-#include "nss_tx_rx_common.h"
-#include "nss_igs_stats.h"
+#endif
 
 static struct module *nss_igs_module;
 

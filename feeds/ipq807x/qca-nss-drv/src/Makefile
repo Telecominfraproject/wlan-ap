@@ -18,15 +18,12 @@ qca-nss-drv-objs := \
 			nss_dynamic_interface.o \
 			nss_dynamic_interface_log.o \
 			nss_dynamic_interface_stats.o \
-			nss_edma.o \
-			nss_edma_stats.o \
-			nss_edma_strings.o \
 			nss_eth_rx.o \
 			nss_eth_rx_stats.o \
 			nss_eth_rx_strings.o \
 			nss_gmac_stats.o \
 			nss_if.o \
-                        nss_if_log.o \
+			nss_if_log.o \
 			nss_init.o \
 			nss_ipv4.o \
 			nss_ipv4_stats.o \
@@ -46,13 +43,7 @@ qca-nss-drv-objs := \
 			nss_lso_rx.o \
 			nss_lso_rx_stats.o \
 			nss_lso_rx_strings.o \
-			nss_match.o \
-			nss_match_log.o \
-			nss_match_stats.o \
 			nss_meminfo.o \
-			nss_mirror.o \
-			nss_mirror_log.o \
-			nss_mirror_stats.o \
 			nss_n2h.o \
 			nss_n2h_stats.o \
 			nss_n2h_strings.o \
@@ -60,12 +51,6 @@ qca-nss-drv-objs := \
 			nss_pm.o \
 			nss_profiler.o \
 			nss_project.o \
-			nss_ppe.o \
-			nss_ppe_log.o \
-			nss_ppe_stats.o \
-			nss_ppe_vp.o \
-			nss_ppe_vp_log.o \
-			nss_ppe_vp_stats.o \
 			nss_pppoe.o \
 			nss_pppoe_log.o \
 			nss_pppoe_stats.o \
@@ -91,7 +76,10 @@ qca-nss-drv-objs := \
 			nss_wifili_log.o \
 			nss_wifili_stats.o \
 			nss_wifili_strings.o \
-			nss_wifi_mac_db.o
+			nss_wifi_mac_db.o \
+			nss_wifi_ext_vdev.o \
+			nss_wifi_ext_vdev_stats.o \
+			nss_wifi_ext_vdev_log.o
 
 # Base NSS data plane/HAL support
 qca-nss-drv-objs += nss_data_plane/nss_data_plane_common.o
@@ -221,7 +209,8 @@ ifneq "$(NSS_DRV_TUNIPIP6_ENABLE)" "n"
 ccflags-y += -DNSS_DRV_TUNIPIP6_ENABLE
 qca-nss-drv-objs += \
 			 nss_tunipip6.o \
-			 nss_tunipip6_log.o
+			 nss_tunipip6_log.o \
+			 nss_tunipip6_stats.o
 endif
 
 ifneq "$(NSS_DRV_QRFS_ENABLE)" "n"
@@ -269,6 +258,35 @@ qca-nss-drv-objs += \
 			 nss_clmap_stats.o
 endif
 
+
+ifneq "$(NSS_DRV_VXLAN_ENABLE)" "n"
+ccflags-y += -DNSS_DRV_VXLAN_ENABLE
+qca-nss-drv-objs += \
+			 nss_vxlan.o \
+			 nss_vxlan_log.o \
+			 nss_vxlan_stats.o
+endif
+
+ifneq "$(NSS_DRV_MATCH_ENABLE)" "n"
+ccflags-y += -DNSS_DRV_MATCH_ENABLE
+qca-nss-drv-objs += \
+			nss_match.o \
+			nss_match_log.o \
+			nss_match_stats.o
+endif
+
+ifneq "$(NSS_DRV_MIRROR_ENABLE)" "n"
+ccflags-y += -DNSS_DRV_MIRROR_ENABLE
+qca-nss-drv-objs += \
+			nss_mirror.o \
+			nss_mirror_log.o \
+			nss_mirror_stats.o
+endif
+
+ifeq ($(SoC),$(filter $(SoC),ipq806x))
+qca-nss-drv-objs += nss_data_plane/nss_data_plane_gmac.o \
+		    nss_hal/ipq806x/nss_hal_pvt.o
+
 ifneq "$(NSS_DRV_C2C_ENABLE)" "n"
 ccflags-y += -DNSS_DRV_C2C_ENABLE
 qca-nss-drv-objs += \
@@ -280,18 +298,6 @@ qca-nss-drv-objs += \
 			 nss_c2c_rx_stats.o \
 			 nss_c2c_rx_strings.o
 endif
-
-ifneq "$(NSS_DRV_VXLAN_ENABLE)" "n"
-ccflags-y += -DNSS_DRV_VXLAN_ENABLE
-qca-nss-drv-objs += \
-			 nss_vxlan.o \
-			 nss_vxlan_log.o \
-			 nss_vxlan_stats.o
-endif
-
-ifeq ($(SoC),$(filter $(SoC),ipq806x ipq40xx))
-qca-nss-drv-objs += nss_data_plane/nss_data_plane_gmac.o \
-		    nss_hal/ipq806x/nss_hal_pvt.o
 ifneq "$(NSS_DRV_IPSEC_ENABLE)" "n"
 ccflags-y += -DNSS_DRV_IPSEC_ENABLE
 qca-nss-drv-objs += \
@@ -317,7 +323,19 @@ ccflags-y += -I$(obj)/nss_hal/ipq806x -DNSS_HAL_IPQ806X_SUPPORT
 endif
 
 ifeq ($(SoC),$(filter $(SoC),ipq60xx ipq60xx_64 ipq807x ipq807x_64))
-qca-nss-drv-objs += nss_data_plane/nss_data_plane.o
+qca-nss-drv-objs += nss_data_plane/nss_data_plane.o \
+					nss_edma.o \
+					nss_edma_stats.o \
+					nss_edma_strings.o \
+					nss_ppe.o \
+					nss_ppe_log.o \
+					nss_ppe_stats.o \
+					nss_ppe_vp.o \
+					nss_ppe_vp_log.o \
+					nss_ppe_vp_stats.o
+
+ccflags-y += -DNSS_DRV_PPE_ENABLE
+ccflags-y += -DNSS_DRV_EDMA_ENABLE
 
 ifneq "$(NSS_DRV_IPSEC_ENABLE)" "n"
 ccflags-y += -DNSS_DRV_IPSEC_ENABLE
@@ -328,9 +346,15 @@ endif
 
 ifneq "$(NSS_DRV_CRYPTO_ENABLE)" "n"
 ccflags-y += -DNSS_DRV_CRYPTO_ENABLE
+ccflags-y += -DNSS_DRV_DMA_ENABLE
+
 qca-nss-drv-objs += \
 		    nss_crypto_cmn.o \
-		    nss_crypto_cmn_log.o
+		    nss_crypto_cmn_log.o \
+		    nss_dma.o \
+		    nss_dma_log.o \
+		    nss_dma_stats.o \
+		    nss_dma_strings.o
 endif
 
 ifneq "$(NSS_DRV_DTLS_ENABLE)" "n"
@@ -358,6 +382,17 @@ endif
 ifeq ($(SoC),$(filter $(SoC),ipq807x ipq807x_64))
 qca-nss-drv-objs += nss_hal/ipq807x/nss_hal_pvt.o \
 		    nss_data_plane/hal/nss_ipq807x.o
+ifneq "$(NSS_DRV_C2C_ENABLE)" "n"
+ccflags-y += -DNSS_DRV_C2C_ENABLE
+qca-nss-drv-objs += \
+			 nss_c2c_tx.o \
+			 nss_c2c_tx_log.o \
+			 nss_c2c_tx_stats.o \
+			 nss_c2c_tx_strings.o \
+			 nss_c2c_rx.o \
+			 nss_c2c_rx_stats.o \
+			 nss_c2c_rx_strings.o
+endif
 ccflags-y += -I$(obj)/nss_hal/ipq807x -DNSS_HAL_IPQ807x_SUPPORT -DNSS_MULTI_H2N_DATA_RING_SUPPORT
 endif
 

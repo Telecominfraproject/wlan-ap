@@ -138,17 +138,18 @@ enum nss_ipv4_stats_types {
  * carries an IPv4 payload within it.
  */
 #define NSS_IPV4_RULE_CREATE_FLAG_L2_ENCAP 0x80
-
 #define NSS_IPV4_RULE_CREATE_FLAG_DROP 0x100
 		/**< Rule to drop packets. */
 #define NSS_IPV4_RULE_CREATE_FLAG_EXCEPTION 0x200
 		/**< Rule to except packets. */
-
 #define NSS_IPV4_RULE_CREATE_FLAG_SRC_INTERFACE_CHECK 0x400
 		/**< Check the source interface for the rule. */
-
 #define NSS_IPV4_RULE_CREATE_FLAG_NO_SRC_IDENT 0x800
 		/**< Zero out the source identifier for the rule. */
+#define NSS_IPV4_RULE_CREATE_FLAG_NO_MAC 0x1000
+		/**< Flag to bypass writing MAC addresses. */
+#define NSS_IPV4_RULE_CREATE_FLAG_EMESH_SP 0x2000
+		/**< Mark rule as E-MESH Service Prioritization valid. */
 
 /*
  * Validity flags for rule creation.
@@ -172,11 +173,15 @@ enum nss_ipv4_stats_types {
 		/**< Destination MAC address fields are valid. */
 #define NSS_IPV4_RULE_CREATE_IGS_VALID 0x800
 		/**< Ingress shaping fields are valid. */
+#define NSS_IPV4_RULE_CREATE_IDENTIFIER_VALID 0x1000
+		/**< Identifier is valid. */
 
 /*
  * Multicast command rule flags
  */
 #define NSS_IPV4_MC_RULE_CREATE_FLAG_MC_UPDATE 0x01	/**< Multicast rule update. */
+#define NSS_IPV4_MC_RULE_CREATE_FLAG_MC_EMESH_SP  0x02
+		/**< Mark multicast rule as E-MESH Service Prioritization valid. */
 
 /*
  * Multicast command validity flags
@@ -223,6 +228,14 @@ enum nss_ipv4_stats_types {
 		/**< MAC address for the flow interface is valid. */
 #define NSS_IPV4_SRC_MAC_RETURN_VALID 0x02
 		/**< MAC address for the return interface is valid. */
+
+/*
+ * Identifier valid flags (to be used with identifier_valid_flags field of nss_ipv4_identifier_rule structure)
+ */
+#define NSS_IPV4_FLOW_IDENTIFIER_VALID 0x01
+		/**< Identifier for flow direction is valid. */
+#define NSS_IPV4_RETURN_IDENTIFIER_VALID 0x02
+		/**< Identifier for return direction is valid. */
 
 /**
  * nss_ipv4_5tuple
@@ -385,6 +398,19 @@ struct nss_ipv4_rps_rule {
 };
 
 /**
+ * nss_ipv4_identifier_rule
+ *	Identifier rule structure.
+ */
+struct nss_ipv4_identifier_rule {
+	uint32_t identifier_valid_flags;
+		/**< Identifier validity flags. */
+	uint32_t flow_identifier;
+		/**< Identifier for flow direction. */
+	uint32_t return_identifier;
+		/**< Identifier for return direction. */
+};
+
+/**
  * nss_ipv4_error_response_types
  *	Error types for IPv4 messages.
  */
@@ -409,6 +435,8 @@ enum nss_ipv4_error_response_types {
 	NSS_IPV4_CR_HASH_BITMAP_INVALID,
 	NSS_IPV4_DR_HW_DECEL_FAIL_ERROR,
 	NSS_IPV4_CR_RETURN_EXIST_ERROR,
+	NSS_IPV4_CR_INVALID_IDENTIFIER,
+	NSS_IPV4_CR_EMESH_SP_CONFIG_INVALID,
 	NSS_IPV4_LAST
 };
 
@@ -448,6 +476,8 @@ struct nss_ipv4_rule_create_msg {
 			/**< RPS parameter. */
 	struct nss_ipv4_igs_rule igs_rule;
 			/**< Ingress shaping related accleration parameters. */
+	struct nss_ipv4_identifier_rule identifier;
+			/**< Rule for adding identifier. */
 };
 
 /**
@@ -736,6 +766,7 @@ enum nss_ipv4_exception_events {
 	NSS_IPV4_EXCEPTION_EVENT_PPPOE_NO_SESSION,
 	NSS_IPV4_EXCEPTION_EVENT_ICMP_IPV4_GRE_HEADER_INCOMPLETE,
 	NSS_IPV4_EXCEPTION_EVENT_ICMP_IPV4_ESP_HEADER_INCOMPLETE,
+	NSS_IPV4_EXCEPTION_EVENT_EMESH_PRIO_MISMATCH,
 	NSS_IPV4_EXCEPTION_EVENT_MAX
 };
 

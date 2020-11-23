@@ -363,8 +363,10 @@ int nss_hal_probe(struct platform_device *nss_dev)
 		nss_top->ipv4_handler_id = nss_dev->id;
 		nss_ipv4_register_handler();
 
+#ifdef NSS_DRV_EDMA_ENABLE
 		nss_top->edma_handler_id = nss_dev->id;
 		nss_edma_register_handler();
+#endif
 		nss_eth_rx_register_handler(nss_ctx);
 #ifdef NSS_DRV_LAG_ENABLE
 		nss_lag_register_handler();
@@ -415,6 +417,11 @@ int nss_hal_probe(struct platform_device *nss_dev)
 		nss_top->crypto_enabled = 1;
 		nss_crypto_register_handler();
 #endif
+
+#if defined(NSS_HAL_IPQ807x_SUPPORT) || defined(NSS_HAL_IPQ60XX_SUPPORT)
+		nss_top->dma_handler_id = nss_dev->id;
+		nss_dma_register_handler();
+#endif
 	}
 #endif
 
@@ -456,11 +463,13 @@ int nss_hal_probe(struct platform_device *nss_dev)
 		nss_pppoe_register_handler();
 	}
 
+#ifdef NSS_DRV_PPE_ENABLE
 	if (npd->ppe_enabled == NSS_FEATURE_ENABLED) {
 		nss_top->ppe_handler_id = nss_dev->id;
 		nss_ppe_register_handler();
 		nss_ppe_vp_register_handler();
 	}
+#endif
 
 #ifdef NSS_DRV_L2TP_ENABLE
 	if (npd->l2tpv2_enabled == NSS_FEATURE_ENABLED) {
@@ -552,15 +561,22 @@ int nss_hal_probe(struct platform_device *nss_dev)
 		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_VAP] = nss_dev->id;
 		nss_wifi_register_handler();
 		nss_wifili_register_handler();
+		nss_wifi_ext_vdev_register_handler();
 		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL] = nss_dev->id;
 		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL0] = nss_dev->id;
 		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL1] = nss_dev->id;
+		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_WIFI_EXT_VDEV_WDS] = nss_dev->id;
 
 		/*
 		 * Register wifi mac database when offload enabled
 		 */
 		nss_top->wmdb_handler_id = nss_dev->id;
 		nss_wifi_mac_db_register_handler();
+
+		/*
+		 * Initialize wifili thread scheme database
+		 */
+		nss_wifili_thread_scheme_db_init(nss_dev->id);
 	}
 
 #ifdef NSS_DRV_OAM_ENABLE
@@ -634,11 +650,13 @@ int nss_hal_probe(struct platform_device *nss_dev)
 	}
 #endif
 
+#ifdef NSS_DRV_MATCH_ENABLE
 	if (npd->match_enabled == NSS_FEATURE_ENABLED) {
 		nss_top->match_handler_id = nss_dev->id;
 		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_MATCH] = nss_dev->id;
 		nss_match_init();
 	}
+#endif
 
 #ifdef NSS_DRV_TLS_ENABLE
 #if defined(NSS_HAL_IPQ807x_SUPPORT) || defined(NSS_HAL_IPQ60XX_SUPPORT)
@@ -650,12 +668,16 @@ int nss_hal_probe(struct platform_device *nss_dev)
 	}
 #endif
 #endif
+
+#ifdef NSS_DRV_MIRROR_ENABLE
 	if (npd->mirror_enabled == NSS_FEATURE_ENABLED) {
 		nss_top->mirror_handler_id = nss_dev->id;
 		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_MIRROR] = nss_dev->id;
 		nss_mirror_register_handler();
 		nss_info("%d: NSS mirror is enabled", nss_dev->id);
 	}
+
+#endif
 
 	if (nss_ctx->id == 0) {
 #if (NSS_FREQ_SCALE_SUPPORT == 1)

@@ -25,6 +25,13 @@
 
 #define NSS_WIFI_MAC_DB_ENTRY_IF_LOCAL 0x1
 
+/*
+ * MAX Wi-Fi MAC database entries sent in group
+ * is chosen considering the entry size and
+ * maximum entries a smallest buffer could accomodate.
+ */
+#define NSS_WIFI_MAC_DB_GROUP_ENTRIES_MAX 48
+
 /**
  * nss_wifi_mac_db_msg_types
  *	Wi-Fi MAC database messages.
@@ -35,6 +42,7 @@ enum nss_wifi_mac_db_msg_types {
 	NSS_WIFI_MAC_DB_DEL_ENTRY_MSG,		/**< Wi-Fi MAC database delete entry message. */
 	NSS_WIFI_MAC_DB_UPDATE_ENTRY_MSG,	/**< Wi-Fi MAC database update entry message. */
 	NSS_WIFI_MAC_DB_DEINIT_MSG,		/**< Wi-Fi MAC database deinitialization message. */
+	NSS_WIFI_MAC_DB_GROUP_ENTRIES_ADD_MSG,	/**< Wi-Fi MAC database group entries add message. */
 	NSS_WIFI_MAC_DB_MAX_MSG
 };
 
@@ -61,6 +69,49 @@ enum nss_wifi_mac_db_if_opmode {
 	NSS_WIFI_MAC_DB_ENTRY_IF_OPMODE_MAX	/**< Maximum entry database interface operation mode. */
 };
 
+/*
+ * nss_wifi_mac_db_err_types
+ *	Wi-Fi MAC database erros.
+ */
+enum nss_wifi_mac_db_err_types {
+	NSS_WIFI_MAC_DB_ERROR_NONE,
+		/**< Wi-Fi MAC database error none. */
+	NSS_WIFI_MAC_DB_ERROR_ENTRY_ALLOC_FAIL,
+		/**< Error used to report a Wi-Fi MAC database entry pool allocation failure. */
+	NSS_WIFI_MAC_DB_ERROR_MAC_EXISTS,
+		/**< Error used to report that a Wi-Fi MAC database entry already exists. */
+	NSS_WIFI_MAC_DB_ERROR_MAC_TABLE_FULL,
+		/**< Error used to report that a Wi-Fi MAC table is full. */
+	NSS_WIFI_MAC_DB_ERROR_MAC_ENTRY_ALLOC_FAILED,
+		/**< Error used to report a Wi-Fi MAC database entry allocation failure. */
+	NSS_WIFI_MAC_DB_ERROR_ENTRY_NOT_FOUND,
+		/**< Error used to report that a Wi-Fi MAC database entry is not present. */
+	NSS_WIFI_MAC_DB_ERROR_MAC_ENTRY_UNHASHED,
+		/**< Error used to report that a Wi-Fi MAC database entry is unhashed. */
+	NSS_WIFI_MAC_DB_ERROR_MAC_ENTRY_DELETE_FAILED,
+		/**< Error used to report a Wi-Fi MAC database entry delete failure. */
+	NSS_WIFI_MAC_DB_ERROR_INVALID_NUM_ENTRIES_FAIL,
+		/**< Error used to report the number of invalid Wi-Fi MAC database entries. */
+	NSS_WIFI_MAC_DB_ERROR_NOT_ALLOCATED_FAIL,
+		/**< Error used to report that a Wi-Fi MAC database is not allocated. */
+	NSS_WIFI_MAC_DB_ERROR_INV_IF_RECVD_FAIL,
+		/**< Error used to report that a Wi-Fi MAC database entry interface is invalid. */
+	NSS_WIFI_MAC_DB_ERROR_INVALID_EVENT,
+		/**< Error used to report that a Wi-Fi MAC database event is invalid. */
+	NSS_WIFI_MAC_DB_ERROR_PN_INVALID,
+		/**< Error used to report that a Wi-Fi MAC database entry pnode is invalid. */
+	NSS_WIFI_MAC_DB_ERROR_PHY_PN_INVALID,
+		/**< Error used to report that a Wi-Fi MAC database entry radio pnode is invalid. */
+	NSS_WIFI_MAC_DB_ERROR_ENTRY_POOL_INVALID,
+		/**< Error used to report that a Wi-Fi MAC database entry pool is invalid. */
+	NSS_WIFI_MAC_DB_ERROR_ENTRY_POOL_ALREADY_ALLOCATED,
+		/**< Error used to report that a Wi-Fi MAC database entry pool exists. */
+	NSS_WIFI_MAC_DB_ERROR_GROUP_ENTRY_ADD_FAIL,
+		/**< Error used to report that a Wi-Fi MAC database group entry add failure. */
+	NSS_WIFI_MAC_DB_ERROR_MAX,
+		/**< Wi-Fi MAC database error maximum. */
+};
+
 /**
  * nss_wifi_mac_db_entry_info_msg
  *	Wi-Fi MAC database entry information.
@@ -75,6 +126,17 @@ struct nss_wifi_mac_db_entry_info_msg {
 };
 
 /**
+ * nss_wifi_mac_db_entry_group_info_msg
+ *	Wi-Fi MAC database group of entries information.
+ */
+struct nss_wifi_mac_db_entry_group_info_msg {
+	uint32_t num_entries;
+		/**< Number of entries in group information message. */
+	struct nss_wifi_mac_db_entry_info_msg entry[NSS_WIFI_MAC_DB_GROUP_ENTRIES_MAX];
+		/**< Wi-Fi MAC database information specific message. */
+};
+
+/**
  * nss_wifi_mac_db_msg
  *	Structure that describes Wi-Fi MAC database messages.
  */
@@ -86,6 +148,8 @@ struct nss_wifi_mac_db_msg {
 	 */
 	union {
 		struct nss_wifi_mac_db_entry_info_msg nmfdbeimsg;
+				/**< Wi-Fi MAC database information specific message. */
+		struct nss_wifi_mac_db_entry_group_info_msg nmfdbegimsg;
 				/**< Wi-Fi MAC database information specific message. */
 	} msg;			/**< Message payload. */
 };

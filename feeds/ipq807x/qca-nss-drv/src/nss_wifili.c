@@ -20,6 +20,32 @@
 #include "nss_wifili_strings.h"
 
 #define NSS_WIFILI_TX_TIMEOUT 1000 /* Millisecond to jiffies*/
+#define NSS_WIFILI_INVALID_SCHEME_ID	-1
+#define NSS_WIFILI_THREAD_SCHEME_ENTRY_MAX	4
+				/* Maximum number of thread scheme entries. */
+
+/*
+ * nss_wifili_thread_scheme_entry
+ *	Details of thread scheme.
+ */
+struct nss_wifili_thread_scheme_entry {
+	int32_t radio_ifnum;		/* Radio interface number. */
+	uint32_t radio_priority;	/* Priority of radio. */
+	uint32_t scheme_priority;	/* Priority of scheme. */
+	uint8_t scheme_index;		/* Scheme index allocated to radio. */
+	bool allocated;			/* Flag to check if scheme is allocated. */
+};
+
+/*
+ * nss_wifili_thread_scheme_db
+ *	Wifili thread scheme database.
+ */
+struct nss_wifili_thread_scheme_db {
+	spinlock_t lock;	/* Lock to protect from simultaneous access. */
+	uint32_t radio_count;	/* Radio counter. */
+	struct nss_wifili_thread_scheme_entry nwtse[NSS_WIFILI_THREAD_SCHEME_ENTRY_MAX];
+				/* Metadata for each of scheme. */
+};
 
 /*
  * nss_wifili_pvt
@@ -32,6 +58,11 @@ static struct nss_wifili_pvt {
 	void *cb;
 	void *app_data;
 } wifili_pvt;
+
+/*
+ * Scheme to radio mapping database
+ */
+static struct nss_wifili_thread_scheme_db ts_db[NSS_MAX_CORES];
 
 /*
  * nss_wifili_handler()
@@ -250,6 +281,199 @@ uint32_t nss_get_available_wifili_external_if(void)
 	return NSS_MAX_NET_INTERFACES;
 }
 EXPORT_SYMBOL(nss_get_available_wifili_external_if);
+
+/*
+ * nss_wifili_get_radio_num()
+ *     Get NSS wifili radio count.
+ *
+ * Wi-Fi host driver needs to know the current radio count
+ * to extract the radio priority from ini file.
+ */
+uint32_t nss_wifili_get_radio_num(struct nss_ctx_instance *nss_ctx)
+{
+	uint8_t core_id;
+	uint32_t radio_count;
+
+	nss_assert(nss_ctx);
+	nss_assert(nss_ctx->id < nss_top_main.num_nss);
+
+	core_id = nss_ctx->id;
+
+	spin_lock_bh(&ts_db[core_id].lock);
+	radio_count = ts_db[core_id].radio_count;
+	spin_unlock_bh(&ts_db[core_id].lock);
+
+	return radio_count;
+}
+EXPORT_SYMBOL(nss_wifili_get_radio_num);
+
+/*
+ * nss_wifili_thread_scheme_alloc()
+ *	Allocate NSS worker thread scheme index.
+ *
+ * API does search on scheme database and returns scheme index based on
+ * priority of radio and free entry available.
+ * Wi-Fi driver fetches radio priority from ini file and calls this API
+ * to get the scheme index based on radio priority.
+ *
+ */
+uint8_t nss_wifili_thread_scheme_alloc(struct nss_ctx_instance *nss_ctx,
+					int32_t radio_ifnum,
+					enum nss_wifili_thread_scheme_priority radio_priority)
+{
+	uint8_t i;
+	uint8_t scheme_idx;
+	uint8_t core_id;
+	uint8_t next_avail_entry_idx = NSS_WIFILI_THREAD_SCHEME_ENTRY_MAX;
+
+	nss_assert(nss_ctx);
+	nss_assert(nss_ctx->id < nss_top_main.num_nss);
+
+	core_id = nss_ctx->id;
+
+	/*
+	 * Iterate through scheme database and allocate
+	 * scheme_id matching the priority requested.
+	 */
+	spin_lock_bh(&ts_db[core_id].lock);
+	for (i = 0; i < NSS_WIFILI_THREAD_SCHEME_ENTRY_MAX; i++) {
+		if (ts_db[core_id].nwtse[i].allocated) {
+			continue;
+		}
+
+		if (radio_priority ==
+				ts_db[core_id].nwtse[i].scheme_priority) {
+			ts_db[core_id].nwtse[i].radio_ifnum = radio_ifnum;
+			ts_db[core_id].nwtse[i].radio_priority = radio_priority;
+			ts_db[core_id].nwtse[i].allocated = true;
+			ts_db[core_id].radio_count++;
+			scheme_idx = ts_db[core_id].nwtse[i].scheme_index;
+			spin_unlock_bh(&ts_db[core_id].lock);
+
+			nss_info("%px: Allocated scheme index:%d radio_ifnum:%d",
+					nss_ctx,
+					scheme_idx,
+					radio_ifnum);
+
+			return scheme_idx;
+		}
+
+		next_avail_entry_idx = i;
+	}
+
+	/*
+	 * When radio priority does not match any of scheme entry priority
+	 * and database has unallocated entries, provide available unallocated entry.
+	 * This prevents any catastrophic failure during attach of Wi-Fi radio.
+	 */
+	if (next_avail_entry_idx != NSS_WIFILI_THREAD_SCHEME_ENTRY_MAX) {
+
+		ts_db[core_id].nwtse[next_avail_entry_idx].radio_ifnum = radio_ifnum;
+		ts_db[core_id].nwtse[next_avail_entry_idx].radio_priority = radio_priority;
+		ts_db[core_id].nwtse[next_avail_entry_idx].allocated = true;
+		ts_db[core_id].radio_count++;
+		scheme_idx = ts_db[core_id].nwtse[next_avail_entry_idx].scheme_index;
+		spin_unlock_bh(&ts_db[core_id].lock);
+
+		nss_info("%px: Priority did not match for radio_ifnum:%d, allocated a next available scheme:%d",
+				nss_ctx,
+				radio_ifnum,
+				scheme_idx);
+
+		return scheme_idx;
+	}
+	spin_unlock_bh(&ts_db[core_id].lock);
+
+	nss_warning("%px: Could not find scheme - radio_ifnum:%d radio_map:%d\n",
+			nss_ctx,
+			radio_ifnum,
+			radio_priority);
+
+	return NSS_WIFILI_INVALID_SCHEME_ID;
+}
+EXPORT_SYMBOL(nss_wifili_thread_scheme_alloc);
+
+/*
+ * nss_wifili_thread_scheme_dealloc()
+ *	Reset thread scheme metadata.
+ */
+void nss_wifili_thread_scheme_dealloc(struct nss_ctx_instance *nss_ctx,
+					int32_t radio_ifnum)
+{
+	uint32_t id;
+	uint8_t core_id;
+
+	nss_assert(nss_ctx);
+	nss_assert(nss_ctx->id < nss_top_main.num_nss);
+
+	core_id = nss_ctx->id;
+
+	/*
+	 * Radio count cannot be zero here.
+	 */
+	nss_assert(ts_db[core_id].radio_count);
+
+	spin_lock_bh(&ts_db[core_id].lock);
+	for (id = 0; id < NSS_WIFILI_THREAD_SCHEME_ENTRY_MAX; id++) {
+		if (ts_db[core_id].nwtse[id].radio_ifnum != radio_ifnum) {
+			continue;
+		}
+
+		ts_db[core_id].nwtse[id].radio_priority = 0;
+		ts_db[core_id].nwtse[id].allocated = false;
+		ts_db[core_id].nwtse[id].radio_ifnum = 0;
+		ts_db[core_id].radio_count--;
+		break;
+	}
+	spin_unlock_bh(&ts_db[core_id].lock);
+
+	if (id == NSS_WIFILI_THREAD_SCHEME_ENTRY_MAX) {
+		nss_warning("%px: Could not find scheme database with radio_ifnum:%d",
+				nss_ctx,
+				radio_ifnum);
+	}
+}
+EXPORT_SYMBOL(nss_wifili_thread_scheme_dealloc);
+
+/*
+ * nss_wifili_thread_scheme_db_init()
+ *	Initialize thread scheme database.
+ */
+void nss_wifili_thread_scheme_db_init(uint8_t core_id)
+{
+	uint32_t id;
+
+	spin_lock_init(&ts_db[core_id].lock);
+
+	/*
+	 * Iterate through scheme database and assign
+	 * scheme_id and priority for each entry
+	 */
+	ts_db[core_id].radio_count = 0;
+	for (id = 0; id < NSS_WIFILI_THREAD_SCHEME_ENTRY_MAX; id++) {
+		ts_db[core_id].nwtse[id].radio_priority = 0;
+		ts_db[core_id].nwtse[id].radio_ifnum = 0;
+		ts_db[core_id].nwtse[id].allocated = false;
+
+		switch (id) {
+		case 0:
+			ts_db[core_id].nwtse[id].scheme_priority = NSS_WIFILI_HIGH_PRIORITY_SCHEME;
+			ts_db[core_id].nwtse[id].scheme_index = NSS_WIFILI_THREAD_SCHEME_ID_0;
+			break;
+		case 1:
+			ts_db[core_id].nwtse[id].scheme_priority = NSS_WIFILI_LOW_PRIORITY_SCHEME;
+			ts_db[core_id].nwtse[id].scheme_index = NSS_WIFILI_THREAD_SCHEME_ID_1;
+			break;
+		case 2:
+		case 3:
+			ts_db[core_id].nwtse[id].scheme_priority = NSS_WIFILI_HIGH_PRIORITY_SCHEME;
+			ts_db[core_id].nwtse[id].scheme_index = NSS_WIFILI_THREAD_SCHEME_ID_2;
+			break;
+		default:
+			nss_warning("Invalid scheme index:%d", id);
+		}
+	}
+}
 
 /*
  * nss_wifili_msg_init()

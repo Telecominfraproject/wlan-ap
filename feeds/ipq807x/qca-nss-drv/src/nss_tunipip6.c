@@ -16,6 +16,7 @@
 
 #include "nss_tx_rx_common.h"
 #include "nss_tunipip6_log.h"
+#include "nss_tunipip6_stats.h"
 
 #define NSS_TUNIPIP6_TX_TIMEOUT 3000
 
@@ -77,6 +78,15 @@ static void nss_tunipip6_handler(struct nss_ctx_instance *nss_ctx, struct nss_cm
 	if (nss_cmn_get_msg_len(ncm) > sizeof(struct nss_tunipip6_msg)) {
 		nss_warning("%px: Length of message is greater than required: %d", nss_ctx, nss_cmn_get_msg_len(ncm));
 		return;
+	}
+
+	switch (ntm->cm.type) {
+	case NSS_TUNIPIP6_STATS_SYNC:
+		/*
+		 * Sync common node stats.
+		 */
+		nss_tunipip6_stats_sync(nss_ctx, ntm);
+		break;
 	}
 
 	/*
@@ -240,6 +250,7 @@ void nss_unregister_tunipip6_if(uint32_t if_num)
 	nss_assert(nss_ctx);
 	nss_assert(nss_tunipip6_verify_if_num(if_num));
 
+	nss_stats_reset_common_stats(if_num);
 	nss_core_unregister_handler(nss_ctx, if_num);
 	nss_core_unregister_subsys_dp(nss_ctx, if_num);
 
@@ -264,6 +275,7 @@ void nss_tunipip6_register_handler()
 	struct nss_ctx_instance *nss_ctx = nss_tunipip6_get_context();
 
 	nss_core_register_handler(nss_ctx, NSS_TUNIPIP6_INTERFACE, nss_tunipip6_handler, NULL);
+	nss_tunipip6_stats_dentry_create();
 	sema_init(&tunipip6_pvt.sem, 1);
 	init_completion(&tunipip6_pvt.complete);
 }

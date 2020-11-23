@@ -190,12 +190,12 @@ uint32_t nss_core_register_msg_handler(struct nss_ctx_instance *nss_ctx, uint32_
 	/*
 	 * Check if already registered
 	 */
-	if (nss_ctx->nss_rx_interface_handlers[nss_ctx->id][interface].msg_cb) {
+	if (nss_ctx->nss_rx_interface_handlers[interface].msg_cb) {
 		nss_warning("Error - Duplicate Interface CB Registered for interface %d\n", interface);
 		return NSS_CORE_STATUS_FAILURE;
 	}
 
-	nss_ctx->nss_rx_interface_handlers[nss_ctx->id][interface].msg_cb = msg_cb;
+	nss_ctx->nss_rx_interface_handlers[interface].msg_cb = msg_cb;
 
 	return NSS_CORE_STATUS_SUCCESS;
 }
@@ -214,7 +214,7 @@ uint32_t nss_core_unregister_msg_handler(struct nss_ctx_instance *nss_ctx, uint3
 		return NSS_CORE_STATUS_FAILURE;
 	}
 
-	nss_ctx->nss_rx_interface_handlers[nss_ctx->id][interface].msg_cb = NULL;
+	nss_ctx->nss_rx_interface_handlers[interface].msg_cb = NULL;
 
 	return NSS_CORE_STATUS_SUCCESS;
 }
@@ -239,13 +239,13 @@ uint32_t nss_core_register_handler(struct nss_ctx_instance *nss_ctx, uint32_t in
 	/*
 	 * Check if already registered
 	 */
-	if (nss_ctx->nss_rx_interface_handlers[nss_ctx->id][interface].cb != NULL) {
+	if (nss_ctx->nss_rx_interface_handlers[interface].cb != NULL) {
 		nss_warning("Error - Duplicate Interface CB Registered for interface %d\n", interface);
 		return NSS_CORE_STATUS_FAILURE;
 	}
 
-	nss_ctx->nss_rx_interface_handlers[nss_ctx->id][interface].cb = cb;
-	nss_ctx->nss_rx_interface_handlers[nss_ctx->id][interface].app_data = app_data;
+	nss_ctx->nss_rx_interface_handlers[interface].cb = cb;
+	nss_ctx->nss_rx_interface_handlers[interface].app_data = app_data;
 
 	return NSS_CORE_STATUS_SUCCESS;
 }
@@ -264,8 +264,8 @@ uint32_t nss_core_unregister_handler(struct nss_ctx_instance *nss_ctx, uint32_t 
 		return NSS_CORE_STATUS_FAILURE;
 	}
 
-	nss_ctx->nss_rx_interface_handlers[nss_ctx->id][interface].cb = NULL;
-	nss_ctx->nss_rx_interface_handlers[nss_ctx->id][interface].app_data = NULL;
+	nss_ctx->nss_rx_interface_handlers[interface].cb = NULL;
+	nss_ctx->nss_rx_interface_handlers[interface].app_data = NULL;
 
 	return NSS_CORE_STATUS_SUCCESS;
 }
@@ -403,8 +403,8 @@ void nss_core_handle_nss_status_pkt(struct nss_ctx_instance *nss_ctx, struct sk_
 		return;
 	}
 
-	cb = nss_ctx->nss_rx_interface_handlers[nss_ctx->id][nss_if].cb;
-	app_data = nss_ctx->nss_rx_interface_handlers[nss_ctx->id][nss_if].app_data;
+	cb = nss_ctx->nss_rx_interface_handlers[nss_if].cb;
+	app_data = nss_ctx->nss_rx_interface_handlers[nss_if].app_data;
 
 	if (!cb) {
 		nss_warning("%px: Callback not registered for interface %d", nss_ctx, nss_if);
@@ -1111,6 +1111,10 @@ static inline bool nss_core_handle_nr_frag_skb(struct nss_ctx_instance *nss_ctx,
 		nbuf->len = payload_len;
 		nbuf->priority = desc->pri;
 
+/*
+ * TODO: Remove kernel version check when IGS is ported
+ */
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0))
 #ifdef CONFIG_NET_CLS_ACT
 		/*
 		 * Skip the ingress QoS for the packet if the descriptor has
@@ -1119,6 +1123,7 @@ static inline bool nss_core_handle_nr_frag_skb(struct nss_ctx_instance *nss_ctx,
 		if (unlikely(desc->bit_flags & N2H_BIT_FLAG_INGRESS_SHAPED)) {
 			nbuf->tc_verd = SET_TC_NCLS_NSS(nbuf->tc_verd);
 		}
+#endif
 #endif
 		goto pull;
 	}
@@ -1151,6 +1156,10 @@ static inline bool nss_core_handle_nr_frag_skb(struct nss_ctx_instance *nss_ctx,
 		nbuf->len = payload_len;
 		nbuf->priority = desc->pri;
 
+/*
+ * TODO: Remove kernel version check when IGS is ported
+ */
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0))
 #ifdef CONFIG_NET_CLS_ACT
 		/*
 		 * Skip the ingress QoS for the packet if the descriptor has
@@ -1159,6 +1168,7 @@ static inline bool nss_core_handle_nr_frag_skb(struct nss_ctx_instance *nss_ctx,
 		if (unlikely(desc->bit_flags & N2H_BIT_FLAG_INGRESS_SHAPED)) {
 			nbuf->tc_verd = SET_TC_NCLS_NSS(nbuf->tc_verd);
 		}
+#endif
 #endif
 
 		/*
@@ -1266,6 +1276,10 @@ static inline bool nss_core_handle_linear_skb(struct nss_ctx_instance *nss_ctx, 
 
 		nbuf->priority = desc->pri;
 
+/*
+ * TODO: Remove kernel version check when IGS is ported
+ */
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0))
 #ifdef CONFIG_NET_CLS_ACT
 		/*
 		 * Skip the ingress QoS for the packet if the descriptor has
@@ -1274,6 +1288,7 @@ static inline bool nss_core_handle_linear_skb(struct nss_ctx_instance *nss_ctx, 
 		if (unlikely(desc->bit_flags & N2H_BIT_FLAG_INGRESS_SHAPED)) {
 			nbuf->tc_verd = SET_TC_NCLS_NSS(nbuf->tc_verd);
 		}
+#endif
 #endif
 
 		/*
@@ -1324,6 +1339,10 @@ static inline bool nss_core_handle_linear_skb(struct nss_ctx_instance *nss_ctx, 
 		nbuf->truesize = desc->payload_len;
 		nbuf->priority = desc->pri;
 
+/*
+ * TODO: Remove kernel version check when IGS is ported
+ */
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0))
 #ifdef CONFIG_NET_CLS_ACT
 		/*
 		 * Skip the ingress QoS for the packet if the descriptor has
@@ -1332,6 +1351,7 @@ static inline bool nss_core_handle_linear_skb(struct nss_ctx_instance *nss_ctx, 
 		if (unlikely(desc->bit_flags & N2H_BIT_FLAG_INGRESS_SHAPED)) {
 			nbuf->tc_verd = SET_TC_NCLS_NSS(nbuf->tc_verd);
 		}
+#endif
 #endif
 
 		*head_ptr = nbuf;
@@ -2949,7 +2969,7 @@ static inline int32_t nss_core_send_buffer_fraglist(struct nss_ctx_instance *nss
  */
 void nss_core_init_handlers(struct nss_ctx_instance *nss_ctx)
 {
-	struct nss_rx_cb_list *cb_list = nss_ctx->nss_rx_interface_handlers[nss_ctx->id];
+	struct nss_rx_cb_list *cb_list = nss_ctx->nss_rx_interface_handlers;
 	memset(cb_list, 0, sizeof(*cb_list) * NSS_MAX_NET_INTERFACES);
 }
 

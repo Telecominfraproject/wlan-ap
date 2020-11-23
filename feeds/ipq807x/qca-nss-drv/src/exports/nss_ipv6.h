@@ -139,11 +139,14 @@ enum nss_ipv6_dscp_map_actions {
 		/**< Drop packets. */
 #define NSS_IPV6_RULE_CREATE_FLAG_EXCEPTION 0x200
 		/**< Rule to except packets. */
-
 #define NSS_IPV6_RULE_CREATE_FLAG_SRC_INTERFACE_CHECK 0x400
 		/**< Check the source interface for the rule. */
 #define NSS_IPV6_RULE_CREATE_FLAG_NO_SRC_IDENT 0x800
 		/**< Flag to indicate NSS to ignore src_ident and use value 0 for it during rule addition. */
+#define NSS_IPV6_RULE_CREATE_FLAG_NO_MAC 0x1000
+		/**< Flag to bypass writing MAC addresses. */
+#define NSS_IPV6_RULE_CREATE_FLAG_EMESH_SP 0x2000
+		/**< Mark rule as E-MESH Service Prioritization valid. */
 
 /*
  * IPv6 rule creation validity flags.
@@ -165,12 +168,14 @@ enum nss_ipv6_dscp_map_actions {
 #define NSS_IPV6_RULE_CREATE_DEST_MAC_VALID 0x400
 		/**< Destination MAC address fields are valid. */
 #define NSS_IPV6_RULE_CREATE_IGS_VALID 0x800	/**< Ingress shaping fields are valid. */
-
+#define NSS_IPV6_RULE_CREATE_IDENTIFIER_VALID 0x1000	/**< Identifier is valid. */
 
 /*
  * Multicast command rule flags
  */
 #define NSS_IPV6_MC_RULE_CREATE_FLAG_MC_UPDATE 0x01	/**< Multicast rule update. */
+#define NSS_IPV6_MC_RULE_CREATE_FLAG_MC_EMESH_SP  0x02
+		/**< Mark multicast rule as E-MESH Service Prioritization valid. */
 
 /*
  * Multicast command validity flags
@@ -215,6 +220,14 @@ enum nss_ipv6_dscp_map_actions {
 		/**< MAC address for the flow interface is valid. */
 #define NSS_IPV6_SRC_MAC_RETURN_VALID 0x02
 		/**< MAC address for the return interface is valid. */
+
+/*
+ * Identifier valid flags (to be used with identifier_valid_flags field of nss_ipv6_identifier_rule structure)
+ */
+#define NSS_IPV6_FLOW_IDENTIFIER_VALID 0x01
+		/**< Identifier for flow direction is valid. */
+#define NSS_IPV6_RETURN_IDENTIFIER_VALID 0x02
+		/**< Identifier for return direction is valid. */
 
 /**
  * nss_ipv6_exception_events
@@ -280,6 +293,7 @@ enum nss_ipv6_exception_events {
 	NSS_IPV6_EXCEPTION_EVENT_PPPOE_NO_SESSION,
 	NSS_IPV6_EXCEPTION_EVENT_ICMP_IPV6_GRE_HEADER_INCOMPLETE,
 	NSS_IPV6_EXCEPTION_EVENT_ICMP_IPV6_ESP_HEADER_INCOMPLETE,
+	NSS_IPV6_EXCEPTION_EVENT_EMESH_PRIO_MISMATCH,
 	NSS_IPV6_EXCEPTION_EVENT_MAX
 };
 
@@ -434,6 +448,19 @@ struct nss_ipv6_rps_rule {
 };
 
 /**
+ * nss_ipv6_identifier_rule
+ *	Identifier rule structure.
+ */
+struct nss_ipv6_identifier_rule {
+	uint32_t identifier_valid_flags;
+		/**< Identifier validity flags. */
+	uint32_t flow_identifier;
+		/**< Identifier for flow direction. */
+	uint32_t return_identifier;
+		/**< Identifier for return direction. */
+};
+
+/**
  * nss_ipv6_error_response_types
  *	Error types for IPv6 messages.
  */
@@ -483,6 +510,10 @@ enum nss_ipv6_error_response_types {
 		/**< Hardware deceleration fail error. */
 	NSS_IPV6_CR_RETURN_EXIST_ERROR,
 		/**< Rule creation failed because a 5-tuple return already exists. */
+	NSS_IPV6_CR_INVALID_IDENTIFIER,
+		/**< Invalid identifier value. */
+	NSS_IPV6_CR_EMESH_SP_CONFIG_INVALID,
+		/**< Rule creation failed because Qos tag was not set for a Emesh SP rule. */
 	NSS_IPV6_LAST
 		/**< Maximum number of error responses. */
 };
@@ -523,6 +554,8 @@ struct nss_ipv6_rule_create_msg {
 			/**< RPS parameter. */
 	struct nss_ipv6_igs_rule igs_rule;
 			/**< Ingress shaping related accleration parameters. */
+	struct nss_ipv6_identifier_rule identifier;
+			/**< Rule for adding identifier. */
 };
 
 /**
