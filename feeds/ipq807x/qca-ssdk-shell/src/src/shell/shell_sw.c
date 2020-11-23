@@ -19,7 +19,7 @@
 static int sw_devid = 0;
 
 sw_error_t
-cmd_set_devid(a_uint32_t *arg_val)
+cmd_set_devid(a_ulong_t *arg_val)
 {
     sw_error_t rtn;
     ssdk_cfg_t ssdk_cfg_new;

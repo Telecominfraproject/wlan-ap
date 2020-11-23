@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2020, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -4633,7 +4633,7 @@ cmd_data_check_mac_field(fal_acl_rule_t * entry)
         FAL_FIELD_FLG_SET(entry->field_flg, FAL_ACL_FIELD_VSI);
     }
 
-    /* get vsi field configuration */
+    /* get pppoe session id field configuration */
     cmd_data_check_element("pppoe session id field", "no", "usage: <yes/no/y/n>\n",
                            cmd_data_check_confirm, (cmd, A_FALSE, &tmpdata,
                                    sizeof (a_bool_t)));
@@ -7292,6 +7292,22 @@ cmd_data_check_ledpattern(char *info, void * val, a_uint32_t size)
             pattern.map |= (1 << POWER_ON_LIGHT_EN);
         }
 
+        cmd_data_check_element("active_high", "no", "usage: <yes/no/y/n>\n",
+                               cmd_data_check_confirm, (cmd, A_FALSE, &tmpdata,
+                                       sizeof (a_bool_t)));
+        if (1 == tmpdata)
+        {
+            pattern.map |= (1 << LED_ACTIVE_HIGH);
+        }
+
+        cmd_data_check_element("link_2500m_light", "no", "usage: <yes/no/y/n>\n",
+                               cmd_data_check_confirm, (cmd, A_FALSE, &tmpdata,
+                                       sizeof (a_bool_t)));
+        if (1 == tmpdata)
+        {
+            pattern.map |= (1 << LINK_2500M_LIGHT_EN);
+        }
+
         cmd_data_check_element("link_1000m_light", "no", "usage: <yes/no/y/n>\n",
                                cmd_data_check_confirm, (cmd, A_FALSE, &tmpdata,
                                        sizeof (a_bool_t)));
@@ -7401,6 +7417,18 @@ cmd_data_print_ledpattern(a_uint8_t * param_name, a_uint32_t * buf,
         if (pattern->map & (1 << POWER_ON_LIGHT_EN))
         {
             cmd_data_print_confirm("[power_on_light]:", A_TRUE, sizeof (a_bool_t));
+            dprintf("\n");
+        }
+
+        if (pattern->map & (1 << LED_ACTIVE_HIGH))
+        {
+            cmd_data_print_confirm("[active_high]:", A_TRUE, sizeof (a_bool_t));
+            dprintf("\n");
+        }
+
+        if (pattern->map & (1 << LINK_2500M_LIGHT_EN))
+        {
+            cmd_data_print_confirm("[link_2500m_light]:", A_TRUE, sizeof (a_bool_t));
             dprintf("\n");
         }
 
