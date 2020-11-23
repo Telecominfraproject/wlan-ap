@@ -19,7 +19,7 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 
 --- a/drivers/net/wireless/ath/ath11k/Kconfig
 +++ b/drivers/net/wireless/ath/ath11k/Kconfig
-@@ -12,6 +12,15 @@ config ATH11K
+@@ -11,6 +11,15 @@ config ATH11K
  
  	  If you choose to build a module, it'll be called ath11k.
  
@@ -33,21 +33,21 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	  If unsure, say Y to enable NSS offload support.
 +
  config ATH11K_AHB
- 	tristate "ath11k AHB support"
- 	depends on ATH11K && REMOTEPROC
+ 	tristate "Atheros ath11k AHB support"
+ 	depends on m
 --- a/drivers/net/wireless/ath/ath11k/Makefile
 +++ b/drivers/net/wireless/ath/ath11k/Makefile
 @@ -26,6 +26,7 @@ ath11k-$(CONFIG_THERMAL) += thermal.o
+ ath11k-$(CONFIG_WANT_DEV_COREDUMP) += coredump.o
  ath11k-$(CPTCFG_ATH11K_SPECTRAL) += spectral.o
  ath11k-$(CPTCFG_ATH11K_PKTLOG) += pktlog.o
- ath11k-$(CPTCFG_WANT_DEV_COREDUMP) += coredump.o
 +ath11k-$(CPTCFG_ATH11K_NSS_SUPPORT) += nss.o
  
  obj-$(CPTCFG_ATH11K_AHB) += ath11k_ahb.o
  ath11k_ahb-y += ahb.o
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -0,0 +1,1808 @@
+@@ -0,0 +1,2339 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * Copyright (c) 2020 The Linux Foundation. All rights reserved.
@@ -58,8 +58,9 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +#include "core.h"
 +#include "peer.h"
 +#include "dp_rx.h"
-+
-+extern unsigned int ath11k_frame_mode;
++#include "dp_tx.h"
++#include "hif.h"
++#include "../../../../../net/mac80211/sta_info.h"
 +
 +/*-----------------------------ATH11K-NSS Helpers--------------------------*/
 +
@@ -79,16 +80,135 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	return ATH11K_NSS_OPMODE_UNKNOWN;
 +}
 +
-+static enum ath11k_hw_txrx_mode
-+ath11k_nss_get_decap_type(struct ath11k_base *ab)
++static void ath11k_nss_wifili_stats_sync(struct ath11k_base *ab,
++					 struct nss_wifili_stats_sync_msg *wlsoc_stats)
 +{
-+	if (test_bit(ATH11K_FLAG_RAW_MODE, &ab->dev_flags))
-+		return ATH11K_HW_TXRX_RAW;
++	struct nss_wifili_device_stats *devstats = &wlsoc_stats->stats;
++	struct ath11k_soc_dp_stats *soc_stats = &ab->soc_stats;
++	int i;
 +
-+	if (ath11k_frame_mode == ATH11K_HW_TXRX_ETHERNET)
-+		return ATH11K_HW_TXRX_ETHERNET;
++	spin_lock_bh(&ab->base_lock);
 +
-+	return ATH11K_HW_TXRX_NATIVE_WIFI;
++	soc_stats->err_ring_pkts += devstats->rxwbm_stats.err_src_rxdma;
++	soc_stats->invalid_rbm += devstats->rxwbm_stats.invalid_buf_mgr;
++
++	for (i = 0; i < HAL_REO_ENTR_RING_RXDMA_ECODE_MAX; i++)
++		soc_stats->rxdma_error[i] += devstats->rxwbm_stats.err_dma_codes[i];
++
++	for (i = 0; i < HAL_REO_DEST_RING_ERROR_CODE_MAX; i++)
++		soc_stats->reo_error[i] += devstats->rxwbm_stats.err_reo_codes[i];
++
++	for (i = 0; i < DP_REO_DST_RING_MAX; i++)
++		soc_stats->hal_reo_error[i] += devstats->rxreo_stats[i].ring_error;
++
++	for (i = 0; i < DP_TCL_NUM_RING_MAX; i++)
++		soc_stats->tx_err.desc_na[i] += devstats->tcl_stats[i].tcl_ring_full;
++
++
++	for (i = 0; i < NSS_WIFILI_MAX_TCL_DATA_RINGS_MSG; i++)
++		atomic_add(devstats->txcomp_stats[i].invalid_bufsrc
++			  + devstats->txcomp_stats[i].invalid_cookie
++			  + devstats->tx_sw_pool_stats[i].desc_alloc_fail
++			  + devstats->tx_ext_sw_pool_stats[i].desc_alloc_fail,
++			  &soc_stats->tx_err.misc_fail);
++
++	for (i = 0; i < DP_TCL_NUM_RING_MAX; i++)
++		atomic_add(devstats->tx_data_stats[i].tx_send_fail_cnt,
++			   &soc_stats->tx_err.misc_fail);
++
++	spin_unlock_bh(&ab->base_lock);
++}
++
++static void ath11k_nss_get_peer_tx_tid_stats(struct ath11k_base *ab, int npeers, struct nss_wifili_sojourn_peer_stats *stats)
++{
++	struct ath11k_peer *peer;
++	int peer_idx, tid_idx;
++
++	for (peer_idx = 0; peer_idx < npeers; peer_idx++) {
++
++		rcu_read_lock();
++		spin_lock_bh(&ab->base_lock);
++
++		peer = ath11k_peer_find_by_id(ab, (&stats[peer_idx])->peer_id);
++		if (!peer || !peer->sta) {
++			ath11k_dbg(ab, ATH11K_DBG_NSS, "unable to find peer %d\n", (&stats[peer_idx])->peer_id);
++			spin_unlock_bh(&ab->base_lock);
++			rcu_read_unlock();
++			continue;
++		}
++
++		if (!peer->nss.nss_stats) {
++			spin_unlock_bh(&ab->base_lock);
++			rcu_read_unlock();
++			return;
++		}
++
++		for (tid_idx = 0; tid_idx < NSS_TX_TID_MAX; tid_idx++)
++			peer->nss.nss_stats->tx_tid_msdu[tid_idx] += (&stats[peer_idx])->stats[tid_idx].num_msdus;
++
++		spin_unlock_bh(&ab->base_lock);
++		rcu_read_unlock();
++	}
++}
++
++static void ath11k_nss_get_peer_stats(struct ath11k_base *ab, struct nss_wifili_peer_stats *stats)
++{
++	struct ath11k_peer *peer;
++	struct nss_wifili_peer_ctrl_stats *pstats = NULL;
++	int i, j;
++
++	for (i = 0; i < stats->npeers; i++) {
++		pstats = &stats->wpcs[i];
++
++		rcu_read_lock();
++		spin_lock_bh(&ab->base_lock);
++
++		peer = ath11k_peer_find_by_id(ab, pstats->peer_id);
++		if (!peer || !peer->sta) {
++			ath11k_dbg(ab, ATH11K_DBG_NSS, "unable to find peer %d\n", pstats->peer_id);
++			spin_unlock_bh(&ab->base_lock);
++			rcu_read_unlock();
++			continue;
++		}
++
++		if (!peer->nss.nss_stats) {
++			spin_unlock_bh(&ab->base_lock);
++			rcu_read_unlock();
++			return;
++		}
++
++		if (pstats->tx.tx_success_cnt)
++			peer->nss.nss_stats->last_ack = jiffies;
++
++		if (pstats->rx.rx_recvd) {
++			peer->nss.nss_stats->last_rx = jiffies;
++		}
++
++		peer->nss.nss_stats->tx_packets += pstats->tx.tx_mcast_cnt +
++			pstats->tx.tx_ucast_cnt +
++			pstats->tx.tx_bcast_cnt;
++		peer->nss.nss_stats->tx_bytes += pstats->tx.tx_mcast_bytes +
++			pstats->tx.tx_ucast_bytes +
++			pstats->tx.tx_bcast_bytes;
++		peer->nss.nss_stats->tx_retries += pstats->tx.retries;
++
++		for (j = 0; j < NSS_WIFILI_TQM_RR_MAX; j++)
++			peer->nss.nss_stats->tx_failed += pstats->tx.dropped.drop_stats[j];
++
++		peer->nss.nss_stats->rx_packets += pstats->rx.rx_recvd;
++		peer->nss.nss_stats->rx_bytes += pstats->rx.rx_recvd_bytes;
++		peer->nss.nss_stats->rx_dropped += pstats->rx.err.mic_err +
++			pstats->rx.err.decrypt_err;
++
++		spin_unlock_bh(&ab->base_lock);
++		rcu_read_unlock();
++	}
++}
++
++void ath11k_nss_ext_rx_stats(struct ath11k_base *ab, struct htt_rx_ring_tlv_filter *tlv_filter)
++{
++	if (ab->nss.enabled)
++		tlv_filter->rx_filter |= HTT_RX_FILTER_TLV_FLAGS_PPDU_END_USER_STATS;
 +}
 +
 +static u32 ath11k_nss_cipher_type(struct ath11k_base *ab, u32 cipher)
@@ -163,6 +283,10 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +			 WIFILI_NSS_PEER_BYTE_SIZE, DMA_TO_DEVICE);
 +
 +	kfree(peer->nss.vaddr);
++	if (peer->nss.nss_stats) {
++		kfree(peer->nss.nss_stats);
++		peer->nss.nss_stats = NULL;
++	}
 +
 +	spin_unlock_bh(&ab->base_lock);
 +
@@ -177,6 +301,8 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	enum nss_cmn_response response = msg->cm.response;
 +	u32 error =  msg->cm.error;
 +	u32 peer_id;
++	struct nss_wifili_peer_stats *peer_stats;
++	struct nss_wifili_sojourn_stats_msg *stats_msg;
 +
 +	if (!ab)
 +		return;
@@ -222,13 +348,27 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +
 +		break;
 +	case NSS_WIFILI_STATS_MSG:
-+		/* TODO */
++		if (response == NSS_CMN_RESPONSE_EMSG) {
++			ath11k_warn(ab, "soc_dp_stats failed to get updated\n");
++			break;
++		}
++		ath11k_nss_wifili_stats_sync(ab, &msg->msg.wlsoc_stats);
 +		break;
 +	case NSS_WIFILI_PEER_STATS_MSG:
-+		/* TODO */
++		peer_stats = &msg->msg.peer_stats.stats;
++		if (response == NSS_CMN_RESPONSE_EMSG) {
++			ath11k_warn(ab, "peer stats msg failed with error = %u\n", error);
++			break;
++		}
++		ath11k_nss_get_peer_stats(ab, peer_stats);
 +		break;
 +	case NSS_WIFILI_SOJOURN_STATS_MSG:
-+		/* TODO */
++		stats_msg = &msg->msg.sj_stats_msg;
++		if (response == NSS_CMN_RESPONSE_EMSG) {
++			ath11k_warn(ab, "tid peer stats msg failed with error = %u\n", error);
++			break;
++		}
++		ath11k_nss_get_peer_tx_tid_stats(ab, stats_msg->npeers, &stats_msg->sj_peer_stats[0]);
 +		break;
 +	case NSS_WIFILI_TID_REOQ_SETUP_MSG:
 +		/* TODO setup tidq */
@@ -239,11 +379,90 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	}
 +}
 +
++void ath11k_nss_process_mic_error(struct ath11k_base *ab, struct sk_buff *skb)
++{
++	struct ath11k_vif *arvif;
++	struct ath11k_peer *peer = NULL;
++	struct hal_rx_desc *desc = (struct hal_rx_desc *)skb->data;
++	struct wireless_dev *wdev;
++	u16 peer_id;
++	u8 peer_addr[ETH_ALEN];
++	u8 ucast_keyidx, mcast_keyidx;
++	bool is_mcbc;
++
++	if (!ath11k_dp_rx_h_msdu_end_first_msdu(ab, desc))
++		goto fail;
++
++	is_mcbc = ath11k_dp_rx_h_attn_is_mcbc(ab, desc);
++	peer_id = ath11k_dp_rx_h_mpdu_start_peer_id(ab, desc);
++
++	spin_lock_bh(&ab->base_lock);
++	peer = ath11k_peer_find_by_id(ab, peer_id);
++	if (!peer) {
++		ath11k_info(ab, "ath11k_nss:peer not found");
++		spin_unlock_bh(&ab->base_lock);
++		goto fail;
++	}
++
++	if (!peer->vif) {
++		ath11k_warn(ab, "ath11k_nss:vif not found");
++		spin_unlock_bh(&ab->base_lock);
++		goto fail;
++	}
++
++	ether_addr_copy(peer_addr, peer->addr);
++	mcast_keyidx = peer->mcast_keyidx;
++	ucast_keyidx = peer->ucast_keyidx;
++	arvif = ath11k_vif_to_arvif(peer->vif);
++	spin_unlock_bh(&ab->base_lock);
++
++	if (!arvif->is_started) {
++		ath11k_warn(ab, "ath11k_nss:arvif not started");
++		goto fail;
++	}
++
++	wdev = ieee80211_vif_to_wdev_relaxed(arvif->vif);
++	if (!wdev) {
++		ath11k_warn(ab, "ath11k_nss: wdev is null\n");
++		goto fail;
++	}
++
++	if (!wdev->netdev) {
++		ath11k_warn(ab, "ath11k_nss: netdev is null\n");
++		goto fail;
++	}
++
++	cfg80211_michael_mic_failure(wdev->netdev, peer_addr,
++				     is_mcbc ? NL80211_KEYTYPE_GROUP :
++				     NL80211_KEYTYPE_PAIRWISE,
++				     is_mcbc ? mcast_keyidx : ucast_keyidx,
++				     NULL, GFP_ATOMIC);
++	kfree(skb);
++	return;
++
++fail:
++	kfree(skb);
++	ath11k_warn(ab, "ath11k_nss: Failed to handle mic error\n");
++	return;
++}
++
 +static void
 +ath11k_nss_wifili_ext_callback_fn(struct ath11k_base *ab, struct sk_buff *skb,
 +				  __attribute__((unused)) struct napi_struct *napi)
 +{
-+	/* TODO */
++	struct nss_wifili_soc_per_packet_metadata *wepm;
++
++	wepm = (struct nss_wifili_soc_per_packet_metadata *)(skb->head +
++					      NSS_WIFILI_SOC_PER_PACKET_METADATA_OFFSET);
++
++	switch (wepm->pkt_type) {
++	case NSS_WIFILI_SOC_EXT_DATA_PKT_MIC_ERROR:
++		ath11k_nss_process_mic_error(ab, skb);
++		break;
++	default:
++		kfree(skb);
++		break;
++	}
 +}
 +
 +void ath11k_nss_vdev_cfg_cb(void *app_data, struct nss_cmn_msg *msg)
@@ -438,7 +657,7 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	ath11k_dbg_dump(ab, ATH11K_DBG_DP_RX, "", "dp rx msdu from nss: ",
 +			skb->data, skb->len);
 +
-+	decap_type = ath11k_nss_get_decap_type(ab);
++	decap_type = arvif->nss.decap;
 +
 +	switch (decap_type) {
 +	case ATH11K_HW_TXRX_RAW:
@@ -471,11 +690,19 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +{
 +	struct ath11k *ar = arvif->ar;
 +	nss_tx_status_t status;
++	int encap_type = ath11k_dp_tx_get_encap_type(arvif, skb);
++	struct ath11k_soc_dp_stats *soc_stats = &ar->ab->soc_stats;
 +
-+	if (ath11k_frame_mode == ATH11K_HW_TXRX_ETHERNET)
++	if(encap_type != arvif->nss.encap) {
++		ath11k_warn(ar->ab, "encap mismatch in nss tx skb encap type %d" \
++			    "vif encap type %d\n", encap_type, arvif->nss.encap);
++		goto drop;
++	}
++
++	if (encap_type == HAL_TCL_ENCAP_TYPE_ETHERNET)
 +		goto send;
 +
-+	if (test_bit(ATH11K_FLAG_RAW_MODE, &ar->ab->dev_flags))
++	if (encap_type == HAL_TCL_ENCAP_TYPE_RAW)
 +		ath11k_nss_tx_encap_raw(skb);
 +	else
 +		ath11k_nss_tx_encap_nwifi(skb);
@@ -490,6 +717,10 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +		ath11k_dbg(ar->ab, ATH11K_DBG_NSS, "nss tx failure\n");
 +
 +	return status;
++drop:
++	atomic_inc(&soc_stats->tx_err.misc_fail);
++	WARN_ON_ONCE(1);
++	return -EINVAL;
 +}
 +
 +int ath11k_nss_vdev_set_cmd(struct ath11k_vif *arvif, int cmd, int val)
@@ -516,6 +747,11 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	if (cmd == NSS_WIFI_VDEV_SECURITY_TYPE_CMD)
 +		val = ath11k_nss_cipher_type(ar->ab, val);
 +
++	if (cmd == NSS_WIFI_VDEV_ENCAP_TYPE_CMD)
++		arvif->nss.encap = val;
++	else if (cmd == NSS_WIFI_VDEV_DECAP_TYPE_CMD)
++		arvif->nss.decap = val;
++
 +	vdev_cmd = &vdev_msg->msg.vdev_cmd;
 +	vdev_cmd->cmd = cmd;
 +	vdev_cmd->value = val;
@@ -539,78 +775,17 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	return status;
 +}
 +
-+static int ath11k_nss_vdev_alloc(struct ath11k_vif *arvif)
++static int ath11k_nss_vdev_configure(struct ath11k_vif *arvif)
 +{
-+	int if_num;
-+	enum nss_dynamic_interface_type if_type;
-+
-+	if_type = NSS_DYNAMIC_INTERFACE_TYPE_VAP;
-+
-+	/* allocate interface context with NSS driver for the new vdev */
-+	if_num = nss_dynamic_interface_alloc_node(if_type);
-+
-+	if (if_num < 0)
-+		return -EINVAL;
-+
-+	arvif->nss.if_num = if_num;
-+
-+	/* Initialize completion for verifying NSS message response */
-+	init_completion(&arvif->nss.complete);
-+	return 0;
-+}
-+
-+int ath11k_nss_vdev_create(struct ath11k_vif *arvif)
-+{
-+	struct nss_wifi_vdev_msg *vdev_msg = NULL;
-+	struct nss_wifi_vdev_config_msg *vdev_cfg;
 +	struct ath11k *ar = arvif->ar;
-+	struct ath11k_base *ab = ar->ab;
-+	struct wireless_dev *wdev;
++	struct nss_wifi_vdev_msg *vdev_msg;
++	struct nss_wifi_vdev_config_msg *vdev_cfg;
 +	nss_tx_status_t status;
-+	int features = 0;
 +	int ret;
 +
-+	if (!ab->nss.enabled)
-+		return 0;
-+
-+	/* Monitor interface is not offloaded to nss */
-+	if (arvif->vdev_type == WMI_VDEV_TYPE_MONITOR)
-+		return 0;
-+
-+	wdev = ieee80211_vif_to_wdev_relaxed(arvif->vif);
-+	if (!wdev) {
-+		ath11k_warn(ab, "ath11k_nss: wdev is null\n");
-+		return -EINVAL;
-+	}
-+
-+	if (!wdev->netdev) {
-+		ath11k_warn(ab, "ath11k_nss: netdev is null\n");
-+		return -EINVAL;
-+	}
-+
-+	ret = ath11k_nss_vdev_alloc(arvif);
-+	if (ret) {
-+		ath11k_warn(ab, "failure during nss vdev alloc %d\n", ret);
-+		return ret;
-+	}
-+
-+	status = nss_register_wifi_vdev_if(ar->nss.ctx, arvif->nss.if_num,
-+					   ath11k_nss_vdev_data_receive,
-+					   ath11k_nss_vdev_special_data_receive,
-+					   ath11k_nss_vdev_event_receive,
-+					   wdev->netdev, features);
-+	if (status != NSS_TX_SUCCESS) {
-+		ath11k_warn(ab, "failure in nss vdev register %d\n", status);
-+		goto vdev_dealloc;
-+	}
-+
-+	ath11k_dbg(ab, ATH11K_DBG_NSS, "VAP register success: nss vif if_num\n");
-+
 +	vdev_msg = kzalloc(sizeof(struct nss_wifi_vdev_msg), GFP_ATOMIC);
-+	if (!vdev_msg) {
-+		ret = -ENOMEM;
-+		goto unregister;
-+	}
++	if (!vdev_msg)
++		return -ENOMEM;
 +
 +	vdev_cfg = &vdev_msg->msg.vdev_config;
 +
@@ -631,61 +806,224 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +
 +	status = nss_wifi_vdev_tx_msg(ar->nss.ctx, vdev_msg);
 +	if (status != NSS_TX_SUCCESS) {
-+		ath11k_warn(ab, "failure in nss vdev interface configure %d\n",
++		ath11k_warn(ar->ab, "failed to configure nss vdev nss_err:%d\n",
 +			    status);
 +		ret = -EINVAL;
-+		goto unregister;
++		goto free;
 +	}
 +
 +	ret = wait_for_completion_timeout(&arvif->nss.complete,
 +					  msecs_to_jiffies(ATH11K_NSS_MSG_TIMEOUT_MS));
 +	if (!ret) {
-+		ath11k_warn(ab, "timeout while waiting for vif cfg response\n");
++		ath11k_warn(ar->ab, "timeout in receiving nss vdev cfg response\n");
 +		ret = -ETIMEDOUT;
-+		goto unregister;
++		goto free;
 +	}
 +
-+	if (ret)
-+		ath11k_dbg(ab, ATH11K_DBG_NSS,
-+			   "nss vdev interface create done ctx %p, ifnum %d\n",
-+			   ar->nss.ctx, arvif->nss.if_num);
 +	ret = 0;
-+	goto free;
-+
-+unregister:
-+	nss_unregister_wifi_vdev_if(arvif->nss.if_num);
-+
-+vdev_dealloc:
-+	nss_dynamic_interface_dealloc_node(arvif->nss.if_num,
-+					   NSS_DYNAMIC_INTERFACE_TYPE_VAP);
 +free:
 +	kfree(vdev_msg);
++
 +	return ret;
 +}
 +
-+int ath11k_nss_vdev_delete(struct ath11k_vif *arvif)
++static void ath11k_nss_vdev_unregister(struct ath11k_vif *arvif)
 +{
++	struct ath11k_base *ab = arvif->ar->ab;
++
++	switch (arvif->vif->type) {
++	case NL80211_IFTYPE_AP:
++	case NL80211_IFTYPE_STATION:
++		nss_unregister_wifi_vdev_if(arvif->nss.if_num);
++		ath11k_dbg(ab, ATH11K_DBG_NSS, "unregistered nss vdev %d \n",
++			   arvif->nss.if_num);
++		break;
++	default:
++		ath11k_warn(ab, "unsupported interface type %d for nss vdev unregister\n",
++			    arvif->vif->type);
++		return;
++	}
++}
++
++static int ath11k_nss_vdev_register(struct ath11k_vif *arvif,
++				    struct net_device *netdev)
++{
++	struct ath11k *ar = arvif->ar;
++	struct ath11k_base *ab = ar->ab;
++	nss_tx_status_t status;
++	u32 features = 0;
++
++	switch (arvif->vif->type) {
++	case NL80211_IFTYPE_AP:
++	case NL80211_IFTYPE_STATION:
++		status = nss_register_wifi_vdev_if(ar->nss.ctx,
++					arvif->nss.if_num,
++					ath11k_nss_vdev_data_receive,
++					ath11k_nss_vdev_special_data_receive,
++					ath11k_nss_vdev_event_receive,
++					netdev, features);
++		if (status != NSS_TX_SUCCESS) {
++			ath11k_warn(ab, "failed to register nss vdev if_num %d nss_err:%d\n",
++				    arvif->nss.if_num, status);
++			return -EINVAL;
++		}
++
++		ath11k_dbg(ab, ATH11K_DBG_NSS, "registered nss vdev if_num %d\n",
++			   arvif->nss.if_num);
++
++		break;
++	default:
++		ath11k_warn(ab, "unsupported interface type %d for nss vdev register\n",
++			    arvif->vif->type);
++		return -ENOTSUPP;
++	}
++
++	return 0;
++}
++
++void ath11k_nss_vdev_free(struct ath11k_vif *arvif)
++{
++	struct ath11k_base *ab = arvif->ar->ab;
 +	nss_tx_status_t status;
 +
-+	if (!arvif->ar->ab->nss.enabled)
++	switch (arvif->vif->type) {
++	case NL80211_IFTYPE_AP:
++	case NL80211_IFTYPE_STATION:
++		status = nss_dynamic_interface_dealloc_node(
++						arvif->nss.if_num,
++						NSS_DYNAMIC_INTERFACE_TYPE_VAP);
++		if (status != NSS_TX_SUCCESS)
++			ath11k_warn(ab, "failed to free nss vdev nss_err:%d\n",
++				    status);
++		else
++			ath11k_dbg(ab, ATH11K_DBG_NSS,
++				   "nss vdev interface deallocated\n");
++
++		return;
++	default:
++		ath11k_warn(ab, "unsupported interface type %d for nss vdev dealloc\n",
++			    arvif->vif->type);
++		return;
++	}
++}
++
++static int ath11k_nss_vdev_alloc(struct ath11k_vif *arvif)
++{
++	struct ath11k_base *ab = arvif->ar->ab;
++	enum nss_dynamic_interface_type if_type;
++	int if_num;
++
++	/* Initialize completion for verifying NSS message response */
++	init_completion(&arvif->nss.complete);
++
++	switch (arvif->vif->type) {
++	case NL80211_IFTYPE_AP:
++	case NL80211_IFTYPE_STATION:
++		if_type = NSS_DYNAMIC_INTERFACE_TYPE_VAP;
++		/* allocate interface context with NSS driver for the new vdev */
++		if_num = nss_dynamic_interface_alloc_node(if_type);
++		if (if_num < 0) {
++			ath11k_warn(ab, "failed to allocate nss vdev\n");
++			return -EINVAL;
++		}
++
++		arvif->nss.if_num = if_num;
++
++		ath11k_dbg(ab, ATH11K_DBG_NSS, "allocated nss vdev if_num %d\n",
++			   arvif->nss.if_num);
++
++		break;
++	default:
++		ath11k_warn(ab, "unsupported interface type %d for nss vdev alloc\n",
++			    arvif->vif->type);
++		return -ENOTSUPP;
++	}
++
++	return 0;
++}
++
++int ath11k_nss_vdev_create(struct ath11k_vif *arvif)
++{
++	struct ath11k *ar = arvif->ar;
++	struct ath11k_base *ab = ar->ab;
++	struct wireless_dev *wdev;
++	int ret;
++
++	if (!ab->nss.enabled)
 +		return 0;
 +
 +	/* Monitor interface is not offloaded to nss */
 +	if (arvif->vdev_type == WMI_VDEV_TYPE_MONITOR)
 +		return 0;
 +
-+	/* Dealloc the interface*/
-+	status = nss_dynamic_interface_dealloc_node(arvif->nss.if_num,
-+						    NSS_DYNAMIC_INTERFACE_TYPE_VAP);
-+	if (status != NSS_TX_SUCCESS) {
-+		ath11k_warn(arvif->ar->ab, "nss vdev delete error %d\n", status);
++	if (arvif->nss.created)
++		return 0;
++
++	wdev = ieee80211_vif_to_wdev_relaxed(arvif->vif);
++	if (!wdev) {
++		ath11k_warn(ab, "ath11k_nss: wdev is null\n");
 +		return -EINVAL;
 +	}
 +
-+	nss_unregister_wifi_vdev_if(arvif->nss.if_num);
++	if (!wdev->netdev) {
++		ath11k_warn(ab, "ath11k_nss: netdev is null\n");
++		return -EINVAL;
++	}
 +
-+	ath11k_dbg(arvif->ar->ab, ATH11K_DBG_NSS, "nss vdev delete success\n");
-+	return 0;
++	ret = ath11k_nss_vdev_alloc(arvif);
++	if (ret)
++		return ret;
++
++	ret = ath11k_nss_vdev_register(arvif, wdev->netdev);
++	if (ret)
++		goto free_vdev;
++
++	switch (arvif->vif->type) {
++	case NL80211_IFTYPE_AP:
++	case NL80211_IFTYPE_STATION:
++		ret = ath11k_nss_vdev_configure(arvif);
++		if (ret)
++			goto unregister_vdev;
++
++		break;
++	default:
++		ret = -ENOTSUPP;
++		goto unregister_vdev;
++	}
++
++	arvif->nss.created = true;
++
++	ath11k_dbg(ab, ATH11K_DBG_NSS,
++		   "nss vdev interface created ctx %pK, ifnum %d\n",
++		   ar->nss.ctx, arvif->nss.if_num);
++
++	return ret;
++
++unregister_vdev:
++	ath11k_nss_vdev_unregister(arvif);
++free_vdev:
++	ath11k_nss_vdev_free(arvif);
++
++	return ret;
++}
++
++void ath11k_nss_vdev_delete(struct ath11k_vif *arvif)
++{
++	if (!arvif->ar->ab->nss.enabled)
++		return;
++
++	/* Monitor interface is not offloaded to nss */
++	if (arvif->vdev_type == WMI_VDEV_TYPE_MONITOR)
++		return;
++
++	if (!arvif->nss.created)
++		return;
++
++	ath11k_nss_vdev_unregister(arvif);
++
++	ath11k_nss_vdev_free(arvif);
++
++	arvif->nss.created = false;
 +}
 +
 +int ath11k_nss_vdev_up(struct ath11k_vif *arvif)
@@ -819,6 +1157,165 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	return status;
 +}
 +
++void ath11k_nss_update_sta_stats(struct station_info *sinfo,
++				 struct ieee80211_sta *sta,
++				 struct ath11k_sta *arsta)
++{
++	struct sta_info *stainfo;
++	struct ath11k_peer *peer;
++	int tid_idx;
++	struct ath11k *ar = arsta->arvif->ar;
++	struct ath11k_base *ab = ar->ab;
++
++	if (!ab->nss.enabled)
++		return;
++
++	spin_lock_bh(&ab->base_lock);
++	peer = ath11k_peer_find_by_addr(arsta->arvif->ar->ab, sta->addr);
++	if (!peer) {
++		ath11k_dbg(ab, ATH11K_DBG_NSS, "unable to find peer %pM\n",
++					sta->addr);
++		goto exit;
++	}
++
++	if (!peer->nss.nss_stats)
++		goto exit;
++
++	stainfo = container_of(sta, struct sta_info, sta);
++	if (peer->nss.nss_stats->last_rx &&
++			time_after((unsigned long)peer->nss.nss_stats->last_rx, stainfo->rx_stats.last_rx))
++		stainfo->rx_stats.last_rx = peer->nss.nss_stats->last_rx;
++
++	if (peer->nss.nss_stats->last_ack &&
++			time_after((unsigned long)peer->nss.nss_stats->last_ack, stainfo->status_stats.last_ack))
++		stainfo->status_stats.last_ack = peer->nss.nss_stats->last_ack;
++
++	stainfo->rx_stats.dropped += peer->nss.nss_stats->rx_dropped -
++		peer->nss.nss_stats->last_rxdrop;
++	peer->nss.nss_stats->last_rxdrop = peer->nss.nss_stats->rx_dropped;
++
++	sinfo->tx_packets = 0;
++	/* Add only ac-0 count as mgmt packets uses WME_AC_BE */
++	sinfo->tx_packets += stainfo->tx_stats.packets[WME_AC_BE];
++	sinfo->tx_packets += peer->nss.nss_stats->tx_packets;
++	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_PACKETS);
++	sinfo->tx_bytes = 0;
++
++	/* Add only ac-0 count as mgmt packets uses WME_AC_BE */
++	sinfo->tx_bytes += stainfo->tx_stats.bytes[WME_AC_BE];
++	sinfo->tx_bytes += peer->nss.nss_stats->tx_bytes;
++	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BYTES);
++
++	sinfo->tx_failed = stainfo->status_stats.retry_failed +
++		peer->nss.nss_stats->tx_failed;
++	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_FAILED);
++
++	sinfo->tx_retries = stainfo->status_stats.retry_count +
++		peer->nss.nss_stats->tx_retries;
++	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_RETRIES);
++
++	sinfo->rx_packets = stainfo->rx_stats.packets +
++		peer->nss.nss_stats->rx_packets;
++	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_PACKETS);
++
++	sinfo->rx_bytes = stainfo->rx_stats.bytes +
++		peer->nss.nss_stats->rx_bytes;
++	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BYTES);
++
++	if (peer->nss.nss_stats->rxrate.legacy || peer->nss.nss_stats->rxrate.nss) {
++		if (peer->nss.nss_stats->rxrate.legacy) {
++			sinfo->rxrate.legacy = peer->nss.nss_stats->rxrate.legacy;
++		} else {
++			sinfo->rxrate.mcs = peer->nss.nss_stats->rxrate.mcs;
++			sinfo->rxrate.nss = peer->nss.nss_stats->rxrate.nss;
++			sinfo->rxrate.bw = peer->nss.nss_stats->rxrate.bw;
++			sinfo->rxrate.he_gi = peer->nss.nss_stats->rxrate.he_gi;
++			sinfo->rxrate.he_dcm = peer->nss.nss_stats->rxrate.he_dcm;
++			sinfo->rxrate.he_ru_alloc = peer->nss.nss_stats->rxrate.he_ru_alloc;
++		}
++		sinfo->rxrate.flags = peer->nss.nss_stats->rxrate.flags;
++		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
++	}
++
++	if (!sinfo->pertid && cfg80211_sinfo_alloc_tid_stats(sinfo, GFP_KERNEL))
++		goto exit;
++
++	for (tid_idx = 0; tid_idx < NSS_TX_TID_MAX; tid_idx++) {
++		sinfo->pertid[tid_idx].tx_msdu = peer->nss.nss_stats->tx_tid_msdu[tid_idx];
++		sinfo->pertid[tid_idx].filled |= BIT_ULL(NL80211_TID_STATS_TX_MSDU);
++	}
++
++	for (tid_idx = 0; tid_idx < IEEE80211_NUM_TIDS; tid_idx++) {
++		sinfo->pertid[tid_idx].rx_msdu = peer->nss.nss_stats->rx_tid_msdu[tid_idx];
++		sinfo->pertid[tid_idx].filled |= BIT_ULL(NL80211_TID_STATS_RX_MSDU);
++	}
++
++exit:
++	spin_unlock_bh(&ab->base_lock);
++}
++
++void ath11k_nss_update_sta_rxrate(struct hal_rx_mon_ppdu_info *ppdu_info,
++				  struct ath11k_peer *peer)
++{
++	struct ath11k_sta *arsta = (struct ath11k_sta *)peer->sta->drv_priv;
++	u16 ath11k_hal_rx_legacy_rates[] =
++	{ 10, 20, 55, 60, 90, 110, 120, 180, 240, 360, 480, 540 };
++	u16 rate = 0;
++	u16 num_msdu;
++	struct ath11k *ar = arsta->arvif->ar;
++	struct ath11k_base *ab = ar->ab;
++
++	if (!ab->nss.enabled)
++		return;
++
++	if (!peer->nss.nss_stats)
++		return;
++
++        if ((ppdu_info->preamble_type == WMI_RATE_PREAMBLE_CCK ||
++                ppdu_info->preamble_type == WMI_RATE_PREAMBLE_OFDM) &&
++                (ppdu_info->rate < ATH11K_LEGACY_NUM)) {
++		rate = ath11k_hal_rx_legacy_rates[ppdu_info->rate];
++	}
++
++	memset(&peer->nss.nss_stats->rxrate, 0, sizeof(peer->nss.nss_stats->rxrate));
++
++	switch (ppdu_info->preamble_type) {
++	case WMI_RATE_PREAMBLE_OFDM:
++		peer->nss.nss_stats->rxrate.legacy = rate;
++		break;
++	case WMI_RATE_PREAMBLE_CCK:
++		peer->nss.nss_stats->rxrate.legacy = rate;
++		break;
++	case WMI_RATE_PREAMBLE_HT:
++		peer->nss.nss_stats->rxrate.mcs = ppdu_info->mcs + 8 * (ppdu_info->nss - 1);
++		peer->nss.nss_stats->rxrate.flags = RATE_INFO_FLAGS_MCS;
++		if (ppdu_info->gi)
++			peer->nss.nss_stats->rxrate.flags |= RATE_INFO_FLAGS_SHORT_GI;
++		break;
++	case WMI_RATE_PREAMBLE_VHT:
++		peer->nss.nss_stats->rxrate.mcs = ppdu_info->mcs;
++		peer->nss.nss_stats->rxrate.flags = RATE_INFO_FLAGS_VHT_MCS;
++		if (ppdu_info->gi)
++			peer->nss.nss_stats->rxrate.flags |= RATE_INFO_FLAGS_SHORT_GI;
++		break;
++	case WMI_RATE_PREAMBLE_HE:
++		peer->nss.nss_stats->rxrate.mcs = ppdu_info->mcs;
++		peer->nss.nss_stats->rxrate.flags = RATE_INFO_FLAGS_HE_MCS;
++		peer->nss.nss_stats->rxrate.he_dcm = ppdu_info->dcm;
++		peer->nss.nss_stats->rxrate.he_gi = ath11k_he_gi_to_nl80211_he_gi(ppdu_info->gi);
++		peer->nss.nss_stats->rxrate.he_ru_alloc = ppdu_info->ru_alloc;
++		break;
++	}
++
++	peer->nss.nss_stats->rxrate.nss = ppdu_info->nss;
++	peer->nss.nss_stats->rxrate.bw = ath11k_mac_bw_to_mac80211_bw(ppdu_info->bw);
++
++	num_msdu = ppdu_info->tcp_msdu_count + ppdu_info->tcp_ack_msdu_count +
++				ppdu_info->udp_msdu_count + ppdu_info->other_msdu_count;
++	if (ppdu_info->tid <= IEEE80211_NUM_TIDS)
++		peer->nss.nss_stats->rx_tid_msdu[ppdu_info->tid] += num_msdu;
++}
++
 +int ath11k_nss_peer_delete(struct ath11k_base *ab, u8 *addr)
 +{
 +	struct nss_wifili_peer_msg *peer_msg;
@@ -872,6 +1369,10 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	}
 +
 +	kfree(wlmsg);
++	if (peer->nss.nss_stats) {
++		kfree(peer->nss.nss_stats);
++		peer->nss.nss_stats = NULL;
++	}
 +
 +	spin_unlock_bh(&ab->base_lock);
 +
@@ -881,6 +1382,10 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	dma_unmap_single(ab->dev, peer->nss.paddr,
 +		 WIFILI_NSS_PEER_BYTE_SIZE, DMA_TO_DEVICE);
 +	kfree(peer->nss.vaddr);
++	if (peer->nss.nss_stats) {
++		kfree(peer->nss.nss_stats);
++		peer->nss.nss_stats = NULL;
++	}
 +	spin_unlock_bh(&ab->base_lock);
 +	return ret;
 +}
@@ -950,6 +1455,10 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +		   peer_msg->peer_mac_addr, peer_msg->vdev_id, peer_msg->peer_id,
 +		   peer_msg->hw_ast_idx, peer_msg->tx_ast_hash);
 +
++	peer->nss.nss_stats = kzalloc(sizeof(*peer->nss.nss_stats), GFP_ATOMIC);
++	if (!peer->nss.nss_stats)
++		ath11k_warn(ab, "Unable to create nss stats memory\n");
++
 +	goto msg_free;
 +
 +peer_mem_free:
@@ -1006,6 +1515,7 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +{
 +	struct ath11k_hal *hal = &ab->hal;
 +	struct hal_srng *srng;
++	u32 offset;
 +	int i;
 +
 +	if (ring_id < 0) {
@@ -1029,8 +1539,15 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +		   hsi->entry_size, hsi->num_entries, hsi->flags);
 +
 +	for (i = 0; i < HAL_SRNG_NUM_REG_GRP; i++) {
-+		//TODO subject to change if pine (~8074v2 or ~6018)
-+		hsi->hwreg_base[i]  = (u32)ab->mem_pa + srng->hwreg_base[i];
++		offset = srng->hwreg_base[i];
++
++		/* For PCI based devices, get the umac ring base address offset
++		 * based on window register configuration.
++		 */
++		if (!(srng->flags & HAL_SRNG_FLAGS_LMAC_RING))
++			offset = ath11k_hif_get_window_offset(ab, srng->hwreg_base[i]);
++
++		hsi->hwreg_base[i]  = (u32)ab->mem_pa + offset;
 +
 +		ath11k_dbg(ab, ATH11K_DBG_NSS, "SRNG Register %d address %d\n",
 +			   i, hsi->hwreg_base[i]);
@@ -1190,6 +1707,10 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +		return ATH11K_WIFILI_TARGET_TYPE_QCA8074V2;
 +	case ATH11K_HW_IPQ6018:
 +		return ATH11K_WIFILI_TARGET_TYPE_QCA6018;
++	case ATH11K_HW_QCN9000:
++		return ATH11K_WIFILI_TARGET_TYPE_QCN9000;
++	case ATH11K_HW_IPQ5018:
++		return ATH11K_WIFILI_TARGET_TYPE_QCA5018;
 +	default:
 +		ath11k_warn(ab, "NSS Offload not supported for this HW\n");
 +		return ATH11K_WIFILI_TARGET_TYPE_UNKNOWN;
@@ -1201,24 +1722,29 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	switch (ab->hw_rev) {
 +	case ATH11K_HW_IPQ8074:
 +	case ATH11K_HW_IPQ6018:
++	case ATH11K_HW_IPQ5018:
 +		return NSS_WIFILI_INTERNAL_INTERFACE;
++	case ATH11K_HW_QCN9000:
++		return nss_get_available_wifili_external_if();
 +	default:
 +		/* This can't happen since we validated target type earlier */
 +		WARN_ON(1);
-+		return NSS_WIFILI_INTERNAL_INTERFACE;
++		return NSS_MAX_NET_INTERFACES;
 +	}
 +}
 +
 +static int ath11k_nss_get_dynamic_interface_type(struct ath11k_base *ab)
 +{
-+	switch (ab->hw_rev) {
-+	case ATH11K_HW_IPQ8074:
-+	case ATH11K_HW_IPQ6018:
++	switch (ab->nss.if_num) {
++	case NSS_WIFILI_INTERNAL_INTERFACE:
 +		return NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL;
++	case NSS_WIFILI_EXTERNAL_INTERFACE0:
++		return NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL0;
++	case NSS_WIFILI_EXTERNAL_INTERFACE1:
++		return NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL1;
 +	default:
-+		/* This can't happen since we validated target type earlier */
-+		WARN_ON(1);
-+		return NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL;
++		ath11k_warn(ab, "NSS Offload invalid interface\n");
++		return NSS_DYNAMIC_INTERFACE_TYPE_NONE;
 +	}
 +}
 +
@@ -1294,6 +1820,11 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	wim->flags |= WIFILI_NSS_CCE_DISABLED;
 +
 +	ab->nss.if_num = ath11k_nss_get_interface_type(ab);
++
++	if (ab->nss.if_num >= NSS_MAX_NET_INTERFACES) {
++		ath11k_warn(ab, "NSS invalid interface\n");
++		goto free;
++	}
 +
 +	/* register callbacks for events and exceptions with nss */
 +	nss_contex = nss_register_wifili_if(ab->nss.if_num, NULL,
@@ -1858,7 +2389,7 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +}
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.h
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,267 @@
 +/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 +/*
 + * Copyright (c) 2020 The Linux Foundation. All rights reserved.
@@ -1874,6 +2405,8 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +struct ath11k_base;
 +struct ath11k_vif;
 +struct ath11k_peer;
++struct ath11k_sta;
++struct hal_rx_mon_ppdu_info;
 +
 +/* NSS DBG macro is not included as part of debug enum to avoid
 + * frequent changes during upgrade*/
@@ -1885,6 +2418,7 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +#define ATH11K_WIFILI_TARGET_TYPE_QCA8074V2 24
 +#define ATH11K_WIFILI_TARGET_TYPE_QCA6018   25
 +#define ATH11K_WIFILI_TARGET_TYPE_QCN9000   26
++#define ATH11K_WIFILI_TARGET_TYPE_QCA5018   29
 +
 +/* Max limit for NSS Queue */
 +#define ATH11K_WIFIILI_MAX_TX_PROCESSQ 1024
@@ -1939,12 +2473,30 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +
 +#define ATH11K_NSS_MAX_NUMBER_OF_PAGE 96
 +
++#define NSS_TX_TID_MAX 8
++
 +enum ath11k_nss_opmode {
 +	ATH11K_NSS_OPMODE_UNKNOWN,
 +	ATH11K_NSS_OPMODE_AP,
 +	ATH11K_NSS_OPMODE_IBSS,
 +	ATH11K_NSS_OPMODE_STA,
 +	ATH11K_NSS_OPMODE_MONITOR,
++};
++
++struct peer_stats {
++	u64 last_rx;
++	u64 last_ack;
++	u32 tx_packets;
++	u32 tx_bytes;
++	u32 tx_retries;
++	u32 tx_failed;
++	u32 rx_packets;
++	u32 rx_bytes;
++	u32 rx_dropped;
++	u32 last_rxdrop;
++	struct rate_info rxrate;
++	u32 tx_tid_msdu[NSS_TX_TID_MAX];
++	u32 rx_tid_msdu[IEEE80211_NUM_TIDS + 1];
 +};
 +
 +enum ath11k_nss_peer_sec_type {
@@ -1966,6 +2518,7 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +struct ath11k_nss_peer {
 +	uint32_t *vaddr;
 +	dma_addr_t paddr;
++	struct peer_stats *nss_stats;
 +};
 +
 +/* Structure to hold the vif related info for nss offload support */
@@ -1974,6 +2527,11 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	int if_num;
 +	/* Used for completion status for vdev config nss messages */
 +	struct completion complete;
++	/* Keep the copy of encap type for nss */
++	int encap;
++	/* Keep the copy of decap type for nss */
++	int decap;
++	bool created;
 +};
 +
 +/* Structure to hold the pdev/radio related info for nss offload support */
@@ -2009,15 +2567,21 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +int ath11k_nss_tx(struct ath11k_vif *arvif, struct sk_buff *skb);
 +int ath11k_nss_vdev_set_cmd(struct ath11k_vif *arvif, int cmd, int val);
 +int ath11k_nss_vdev_create(struct ath11k_vif *arvif);
-+int ath11k_nss_vdev_delete(struct ath11k_vif *arvif);
++void ath11k_nss_vdev_delete(struct ath11k_vif *arvif);
 +int ath11k_nss_vdev_up(struct ath11k_vif *arvif);
 +int ath11k_nss_vdev_down(struct ath11k_vif *arvif);
 +int ath11k_nss_peer_delete(struct ath11k_base *ab, u8 *addr);
 +int ath11k_nss_peer_create(struct ath11k_base *ab, struct ath11k_peer *peer);
 +int ath11k_nss_set_peer_sec_type(struct ath11k *ar, struct ath11k_peer *peer,
 +				 struct ieee80211_key_conf *key_conf);
++void ath11k_nss_update_sta_stats(struct station_info *sinfo,
++				 struct ieee80211_sta *sta,
++				 struct ath11k_sta *arsta);
++void ath11k_nss_update_sta_rxrate(struct hal_rx_mon_ppdu_info *ppdu_info,
++				  struct ath11k_peer *peer);
 +int ath11k_nss_setup(struct ath11k_base *ab);
 +int ath11k_nss_teardown(struct ath11k_base *ab);
++void ath11k_nss_ext_rx_stats(struct ath11k_base *ab, struct htt_rx_ring_tlv_filter *tlv_filter);
 +#else
 +static inline int ath11k_nss_tx(struct ath11k_vif *arvif, struct sk_buff *skb)
 +{
@@ -2034,9 +2598,21 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +	return 0;
 +}
 +
-+static inline int ath11k_nss_vdev_delete(struct ath11k_vif *arvif)
++static inline void ath11k_nss_vdev_delete(struct ath11k_vif *arvif)
 +{
-+	return 0;
++}
++
++static inline void ath11k_nss_update_sta_stats(struct station_info *sinfo,
++					       struct ieee80211_sta *sta,
++					       struct ath11k_sta *arsta)
++{
++	return;
++}
++
++static void ath11k_nss_update_sta_rxrate(struct hal_rx_mon_ppdu_info *ppdu_info,
++					 struct ath11k_peer *peer)
++{
++	return;
 +}
 +
 +static inline int ath11k_nss_vdev_up(struct ath11k_vif *arvif)
@@ -2074,5 +2650,66 @@ Signed-off-by: Sriram R <srirrama@codeaurora.org>
 +{
 +	return 0;
 +}
++
++void ath11k_nss_ext_rx_stats(struct ath11k_base *ab, struct htt_rx_ring_tlv_filter *tlv_filter)
++{
++	return;
++}
 +#endif /* CPTCFG_ATH11K_NSS_SUPPORT */
 +#endif
+--- a/drivers/net/wireless/ath/ath11k/hif.h
++++ b/drivers/net/wireless/ath/ath11k/hif.h
+@@ -24,6 +24,7 @@ struct ath11k_hif_ops {
+ 				   u32 *base_vector);
+ 	void (*get_msi_address)(struct ath11k_base *ab, u32 *msi_addr_lo,
+ 				u32 *msi_addr_hi);
++	u32 (*get_window_offset)(struct ath11k_base *ab, u32 offset);
+ 	void (*get_ce_msi_idx)(struct ath11k_base *ab, u32 ce_id, u32 *msi_idx);
+ };
+ 
+@@ -94,6 +95,14 @@ static inline void ath11k_get_msi_addres
+ 	ab->hif.ops->get_msi_address(ab, msi_addr_lo, msi_addr_hi);
+ }
+ 
++static inline u32 ath11k_hif_get_window_offset(struct ath11k_base *ab, u32 offset)
++{
++	if (ab->hif.ops->get_window_offset)
++		return ab->hif.ops->get_window_offset(ab, offset);
++
++	return offset;
++}
++
+ static inline void ath11k_get_ce_msi_idx(struct ath11k_base *ab, u32 ce_id,
+ 					 u32 *msi_data_idx)
+ {
+--- a/drivers/net/wireless/ath/ath11k/pci.c
++++ b/drivers/net/wireless/ath/ath11k/pci.c
+@@ -160,6 +160,20 @@ static inline u32 ath11k_pci_get_window_
+ 	return window_start;
+ }
+ 
++static inline u32 ath11k_pci_get_window_offset(struct ath11k_base *ab,
++                                               u32 offset)
++{
++        u32 window_start;
++
++        if (ab->bus_params.static_window_map) {
++                window_start = ath11k_pci_get_window_start(ab, offset);
++
++                if (window_start)
++                        offset = window_start + (offset & WINDOW_RANGE_MASK);
++        }
++        return offset;
++}
++
+ void ath11k_pci_write32(struct ath11k_base *ab, u32 offset, u32 value)
+ {
+ 	struct ath11k_pci *ab_pci = ath11k_pci_priv(ab);
+@@ -939,6 +953,7 @@ static const struct ath11k_hif_ops ath11
+ 	.get_msi_address =  ath11k_pci_get_msi_address,
+ 	.get_user_msi_vector = ath11k_get_user_msi_assignment,
+ 	.map_service_to_pipe = ath11k_pci_map_service_to_pipe,
++	.get_window_offset = ath11k_pci_get_window_offset,
+ 	.get_ce_msi_idx = ath11k_pci_get_ce_msi_idx,
+ };
+ 
