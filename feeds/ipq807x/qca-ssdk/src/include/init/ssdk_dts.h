@@ -127,10 +127,18 @@ typedef struct
 } ssdk_reg_map_info;
 
 /* DTS info for get */
+#ifdef HPPE
+#ifdef IN_QOS
 a_uint8_t ssdk_tm_tick_mode_get(a_uint32_t dev_id);
-a_uint8_t ssdk_bm_tick_mode_get(a_uint32_t dev_id);
-a_uint16_t ssdk_ucast_queue_start_get(a_uint32_t dev_id, a_uint32_t port);
 ssdk_dt_scheduler_cfg* ssdk_bootup_shceduler_cfg_get(a_uint32_t dev_id);
+#endif
+#endif
+#ifdef IN_BM
+a_uint8_t ssdk_bm_tick_mode_get(a_uint32_t dev_id);
+#endif
+#ifdef IN_QM
+a_uint16_t ssdk_ucast_queue_start_get(a_uint32_t dev_id, a_uint32_t port);
+#endif
 a_uint32_t ssdk_intf_mac_num_get(void);
 a_uint8_t* ssdk_intf_macaddr_get(a_uint32_t index);
 a_uint32_t ssdk_dt_global_get_mac_mode(a_uint32_t dev_id, a_uint32_t index);
@@ -147,11 +155,15 @@ a_uint32_t ssdk_port_force_speed_get(a_uint32_t dev_id, a_uint32_t port_id);
 struct mii_bus *
 ssdk_dts_miibus_get(a_uint32_t dev_id, a_uint32_t phy_addr);
 hsl_reg_mode ssdk_switch_reg_access_mode_get(a_uint32_t dev_id);
-hsl_reg_mode ssdk_uniphy_reg_access_mode_get(a_uint32_t dev_id);
-hsl_reg_mode ssdk_psgmii_reg_access_mode_get(a_uint32_t dev_id);
 void ssdk_switch_reg_map_info_get(a_uint32_t dev_id, ssdk_reg_map_info *info);
+#ifdef DESS
+hsl_reg_mode ssdk_psgmii_reg_access_mode_get(a_uint32_t dev_id);
 void ssdk_psgmii_reg_map_info_get(a_uint32_t dev_id, ssdk_reg_map_info *info);
+#endif
+#ifdef IN_UNIPHY
+hsl_reg_mode ssdk_uniphy_reg_access_mode_get(a_uint32_t dev_id);
 void ssdk_uniphy_reg_map_info_get(a_uint32_t dev_id, ssdk_reg_map_info *info);
+#endif
 a_bool_t ssdk_ess_switch_flag_get(a_uint32_t dev_id);
 a_uint32_t ssdk_device_id_get(a_uint32_t index);
 struct device_node *ssdk_dts_node_get(a_uint32_t dev_id);

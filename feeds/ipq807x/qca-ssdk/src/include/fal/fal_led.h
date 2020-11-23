@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012,2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012,2018,2020, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -68,11 +68,25 @@ extern "C" {
 #define     RX_TRAFFIC_BLINK_EN    7
 #define     TX_TRAFFIC_BLINK_EN    8
 #define     LINKUP_OVERRIDE_EN     9
-#define     LED_MAP_10M_SPEED	0x3e4
-#define     LED_MAP_100M_SPEED	0x3d4
-#define     LED_MAP_1000M_SPEED	0x3cc
-#define     LED_MAP_ALL_SPEED	0x3fc
+#define     LED_ACTIVE_HIGH        10
+#define     LINK_2500M_LIGHT_EN    11
+#define     LED_MAP_10M_SPEED \
+    (BIT(POWER_ON_LIGHT_EN) | BIT(LINK_10M_LIGHT_EN) | BIT(COLLISION_BLINK_EN) |\
+    BIT(RX_TRAFFIC_BLINK_EN) | BIT(TX_TRAFFIC_BLINK_EN) | BIT(LINKUP_OVERRIDE_EN))
+#define     LED_MAP_100M_SPEED \
+    (BIT(POWER_ON_LIGHT_EN) | BIT(LINK_100M_LIGHT_EN) | BIT(COLLISION_BLINK_EN) |\
+    BIT(RX_TRAFFIC_BLINK_EN) | BIT(TX_TRAFFIC_BLINK_EN) | BIT(LINKUP_OVERRIDE_EN))
+#define     LED_MAP_1000M_SPEED \
+    (BIT(POWER_ON_LIGHT_EN) | BIT(LINK_1000M_LIGHT_EN) | BIT(COLLISION_BLINK_EN) |\
+    BIT(RX_TRAFFIC_BLINK_EN) | BIT(TX_TRAFFIC_BLINK_EN) | BIT(LINKUP_OVERRIDE_EN))
+#define     LED_MAP_2500M_SPEED \
+    (BIT(POWER_ON_LIGHT_EN) | BIT(LINK_2500M_LIGHT_EN) | BIT(COLLISION_BLINK_EN) |\
+    BIT(RX_TRAFFIC_BLINK_EN) | BIT(TX_TRAFFIC_BLINK_EN) | BIT(LINKUP_OVERRIDE_EN))
+#define     LED_MAP_ALL_SPEED \
+    (LED_MAP_10M_SPEED | LED_MAP_100M_SPEED | LED_MAP_1000M_SPEED |\
+    LED_MAP_2500M_SPEED)
 
+#define     PORT_LED_SOURCE_MAX    0x3
 
     /**
     @brief This enum defines the led control pattern map.

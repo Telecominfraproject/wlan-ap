@@ -418,6 +418,7 @@ qca_switch_reg_write(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint8_t * reg_dat
 sw_error_t
 qca_psgmii_reg_read(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint8_t * reg_data, a_uint32_t len)
 {
+#ifdef DESS
 	uint32_t reg_val = 0;
 
 	if (len != sizeof (a_uint32_t))
@@ -432,12 +433,14 @@ qca_psgmii_reg_read(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint8_t * reg_data
 	reg_val = readl(qca_phy_priv_global[dev_id]->psgmii_hw_addr + reg_addr);
 
 	aos_mem_copy(reg_data, &reg_val, sizeof (a_uint32_t));
+#endif
 	return 0;
 }
 
 sw_error_t
 qca_psgmii_reg_write(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint8_t * reg_data, a_uint32_t len)
 {
+#ifdef DESS
 	uint32_t reg_val = 0;
 	if (len != sizeof (a_uint32_t))
         return SW_BAD_LEN;
@@ -450,6 +453,7 @@ qca_psgmii_reg_write(a_uint32_t dev_id, a_uint32_t reg_addr, a_uint8_t * reg_dat
 
 	aos_mem_copy(&reg_val, reg_data, sizeof (a_uint32_t));
 	writel(reg_val, qca_phy_priv_global[dev_id]->psgmii_hw_addr + reg_addr);
+#endif
 	return 0;
 }
 
@@ -844,6 +848,8 @@ static ssize_t ssdk_byte_counter_set(struct device *dev,
 	return count;
 }
 
+#ifdef HPPE
+#ifdef IN_QOS
 void ssdk_dts_port_scheduler_dump(a_uint32_t dev_id)
 {
 	a_uint32_t i;
@@ -915,7 +921,8 @@ void ssdk_dts_l1scheduler_dump(a_uint32_t dev_id)
 				scheduler_cfg->epri, scheduler_cfg->edrr_id);
 	}
 }
-
+#endif
+#endif
 static const a_int8_t *qca_phy_feature_str[QCA_PHY_FEATURE_MAX] = {
 	"PHY_CLAUSE45",
 	"PHY_COMBO",
@@ -987,9 +994,15 @@ static ssize_t ssdk_dts_dump(struct device *dev,
 		printk("        switch_mac_mode = <0x%x>\n", ssdk_dt_global_get_mac_mode(dev_id, 0));
 		printk("        switch_mac_mode1 = <0x%x>\n", ssdk_dt_global_get_mac_mode(dev_id, 1));
 		printk("        switch_mac_mode2 = <0x%x>\n", ssdk_dt_global_get_mac_mode(dev_id, 2));
+#ifdef IN_BM
 		printk("        bm_tick_mode = <0x%x>\n", ssdk_bm_tick_mode_get(dev_id));
+#endif
+#ifdef HPPE
+#ifdef IN_QOS
 		printk("        tm_tick_mode = <0x%x>\n", ssdk_tm_tick_mode_get(dev_id));
-
+#endif
+#endif
+#ifdef DESS
 		printk("ess-psgmii\n");
 		ssdk_psgmii_reg_map_info_get(dev_id, &map);
 		mode = ssdk_psgmii_reg_access_mode_get(dev_id);
@@ -1000,7 +1013,8 @@ static ssize_t ssdk_dts_dump(struct device *dev,
 			printk("        psgmii_access_mode = <mdio bus>\n");
 		else
 			printk("        psgmii_access_mode = <(null)>\n");
-
+#endif
+#ifdef IN_UNIPHY
 		printk("ess-uniphy\n");
 		ssdk_uniphy_reg_map_info_get(dev_id, &map);
 		mode = ssdk_uniphy_reg_access_mode_get(dev_id);
@@ -1011,13 +1025,17 @@ static ssize_t ssdk_dts_dump(struct device *dev,
 			printk("        uniphy_access_mode = <mdio bus>\n");
 		else
 			printk("        uniphy_access_mode = <(null)>\n");
-
+#endif
+#ifdef HPPE
+#ifdef IN_QOS
 		printk("\n");
 		ssdk_dts_port_scheduler_dump(dev_id);
 		printk("\n");
 		ssdk_dts_l0scheduler_dump(dev_id);
 		printk("\n");
 		ssdk_dts_l1scheduler_dump(dev_id);
+#endif
+#endif
 		printk("\n");
 		ssdk_dts_phyinfo_dump(dev_id);
 	}
@@ -1290,7 +1308,7 @@ ssdk_plat_init(ssdk_init_cfg *cfg, a_uint32_t dev_id)
 			return -ENODEV;
 /*qca808x_end*/
 	}
-
+#ifdef IN_UNIPHY
 	reg_mode = ssdk_uniphy_reg_access_mode_get(dev_id);
 	if(reg_mode == HSL_REG_LOCAL_BUS) {
 		ssdk_uniphy_reg_map_info_get(dev_id, &map);
@@ -1305,6 +1323,7 @@ ssdk_plat_init(ssdk_init_cfg *cfg, a_uint32_t dev_id)
 		cfg->reg_func.uniphy_reg_set = qca_uniphy_reg_write;
 		cfg->reg_func.uniphy_reg_get = qca_uniphy_reg_read;
 	}
+#endif
 	reg_mode = ssdk_switch_reg_access_mode_get(dev_id);
 	if(reg_mode == HSL_REG_LOCAL_BUS) {
 		ssdk_switch_reg_map_info_get(dev_id, &map);
@@ -1329,7 +1348,7 @@ ssdk_plat_init(ssdk_init_cfg *cfg, a_uint32_t dev_id)
 
 		cfg->reg_mode = HSL_HEADER;
 	}
-
+#ifdef DESS
 	reg_mode = ssdk_psgmii_reg_access_mode_get(dev_id);
 	if(reg_mode == HSL_REG_LOCAL_BUS) {
 		ssdk_psgmii_reg_map_info_get(dev_id, &map);
@@ -1351,7 +1370,7 @@ ssdk_plat_init(ssdk_init_cfg *cfg, a_uint32_t dev_id)
 		cfg->reg_func.psgmii_reg_set = qca_psgmii_reg_write;
 		cfg->reg_func.psgmii_reg_get = qca_psgmii_reg_read;
 	}
-
+#endif
 	reg_mode = ssdk_switch_reg_access_mode_get(dev_id);
 	if(reg_mode == HSL_REG_MDIO) {
 		cfg->reg_mode = HSL_MDIO;
@@ -1367,7 +1386,9 @@ ssdk_plat_exit(a_uint32_t dev_id)
 {
 /*qca808x_end*/
 	hsl_reg_mode reg_mode;
+#ifdef DESS
 	ssdk_reg_map_info map;
+#endif
 /*qca808x_start*/
 	printk("ssdk_plat_exit\n");
 /*qca808x_end*/
@@ -1375,7 +1396,7 @@ ssdk_plat_exit(a_uint32_t dev_id)
 	if (reg_mode == HSL_REG_LOCAL_BUS) {
 		iounmap(qca_phy_priv_global[dev_id]->hw_addr);
 	}
-
+#ifdef DESS
 	reg_mode = ssdk_psgmii_reg_access_mode_get(dev_id);
 	if (reg_mode == HSL_REG_LOCAL_BUS) {
 		ssdk_psgmii_reg_map_info_get(dev_id, &map);
@@ -1383,11 +1404,13 @@ ssdk_plat_exit(a_uint32_t dev_id)
 		release_mem_region(map.base_addr,
                                         map.size);
 	}
-
+#endif
+#ifdef IN_UNIPHY
 	reg_mode = ssdk_uniphy_reg_access_mode_get(dev_id);
 	if (reg_mode == HSL_REG_LOCAL_BUS) {
 		iounmap(qca_phy_priv_global[dev_id]->uniphy_hw_addr);
 	}
+#endif
 /*qca808x_start*/
 }
 /*qca808x_end*/

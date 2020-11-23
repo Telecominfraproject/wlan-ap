@@ -37,7 +37,7 @@ sw_error_t
 adpt_mp_uniphy_adapter_port_reset(a_uint32_t dev_id, a_uint32_t port_id);
 
 sw_error_t
-adpt_mp_uniphy_mode_set(a_uint32_t dev_id, a_uint32_t index, a_uint32_t mode);
+adpt_mp_uniphy_mode_configure(a_uint32_t dev_id, a_uint32_t index, a_uint32_t mode);
 
 #ifdef __cplusplus
 }

@@ -86,7 +86,7 @@ HSL_LOCAL sw_error_t
 scomphy_port_autoneg_adv_get (a_uint32_t dev_id, fal_port_t port_id,
 		a_uint32_t * autoadv);
 
-
+#ifndef IN_PORTCONTROL_MINI
 HSL_LOCAL sw_error_t
 scomphy_port_powersave_set (a_uint32_t dev_id, fal_port_t port_id,
 		a_bool_t enable);
@@ -110,11 +110,12 @@ scomphy_port_hibernate_get (a_uint32_t dev_id, fal_port_t port_id,
 HSL_LOCAL sw_error_t
 scomphy_port_cdt (a_uint32_t dev_id, fal_port_t port_id, a_uint32_t mdi_pair,
 		fal_cable_status_t * cable_status, a_uint32_t * cable_len);
-
+#endif
 
 HSL_LOCAL sw_error_t
 scomphy_port_link_status_get (a_uint32_t dev_id, fal_port_t port_id,
 		a_bool_t * status);
+#ifndef IN_PORTCONTROL_MINI
 
 HSL_LOCAL sw_error_t
 scomphy_port_8023az_set (a_uint32_t dev_id, fal_port_t port_id,
@@ -191,13 +192,14 @@ scomphy_port_wol_status_set (a_uint32_t dev_id, fal_port_t port_id,
 HSL_LOCAL sw_error_t
 scomphy_port_wol_status_get (a_uint32_t dev_id, fal_port_t port_id,
 		a_bool_t * enable);
-
+#endif
 HSL_LOCAL sw_error_t
 scomphy_port_power_off (a_uint32_t dev_id, fal_port_t port_id);
 
 HSL_LOCAL sw_error_t
 scomphy_port_power_on (a_uint32_t dev_id, fal_port_t port_id);
 
+#ifndef IN_PORTCONTROL_MINI
 HSL_LOCAL sw_error_t
 scomphy_port_interface_mode_set (a_uint32_t dev_id, fal_port_t port_id,
 			fal_port_interface_mode_t mode);
@@ -221,6 +223,7 @@ scomphy_port_counter_get (a_uint32_t dev_id, fal_port_t port_id,
 HSL_LOCAL sw_error_t
 scomphy_port_counter_show (a_uint32_t dev_id, fal_port_t port_id,
 		fal_port_counter_info_t * counter_info);
+#endif
 #endif
 /*qca808x_start*/
 #ifdef __cplusplus

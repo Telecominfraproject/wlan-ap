@@ -25,6 +25,9 @@ endif
 
 ifeq (MP, $(CHIP_TYPE))
   SRC_LIST = mpge_phy.c
+ifeq (TRUE, $(IN_LED))
+  SRC_LIST += mpge_led.c
+endif
 endif
 
 ifneq (,$(filter ISISC, $(SUPPORT_CHIP)))
@@ -39,6 +42,9 @@ ifeq (ALL_CHIP, $(CHIP_TYPE))
      SRC_LIST = f1_phy.c f2_phy.c malibu_phy.c
 ifneq (,$(filter MP, $(SUPPORT_CHIP)))
      SRC_LIST += mpge_phy.c
+ifeq (TRUE, $(IN_LED))
+     SRC_LIST += mpge_led.c
+endif
 endif
 endif
 
@@ -57,6 +63,9 @@ endif
 ifeq (TRUE, $(IN_QCA808X_PHY))
     SRC_LIST += qca808x_phy.c
     SRC_LIST += qca808x.c
+ifeq (TRUE, $(IN_LED))
+    SRC_LIST += qca808x_led.c
+endif
 ifeq (TRUE, $(IN_PTP))
     SRC_LIST += qca808x_ptp.c
     SRC_LIST += qca808x_ptp_api.c

@@ -24,15 +24,12 @@
 #include "qca808x_ptp.h"
 #endif
 #include "qca808x.h"
+#ifdef IN_LED
+#include "qca808x_led.h"
+#endif
+
+static a_bool_t phy_dev_drv_init_flag = A_FALSE;
 /*qca808x_start*/
-
-#define PHY_INVALID_DATA 0xffff
-#define PHY_RTN_ON_READ_ERROR(phy_data) \
-    do { if (phy_data == PHY_INVALID_DATA) return(SW_READ_ERROR); } while(0);
-
-#define PHY_RTN_ON_ERROR(rv) \
-    do { if (rv != SW_OK) return(rv); } while(0);
-
 static a_bool_t phy_ops_flag = A_FALSE;
 
 static struct mutex qca808x_reg_lock;
@@ -264,8 +261,8 @@ qca808x_phy_ms_seed_enable(a_uint32_t dev_id, a_uint32_t phy_id,
 	return rv;
 }
 
-static a_bool_t
-_qca808x_phy_2500caps(a_uint32_t dev_id, a_uint32_t phy_id)
+a_bool_t
+qca808x_phy_2500caps(a_uint32_t dev_id, a_uint32_t phy_id)
 {
 	a_uint16_t phy_data;
 
@@ -301,7 +298,7 @@ qca808x_phy_get_status(a_uint32_t dev_id, a_uint32_t phy_id,
 	}
 	else {
 		phy_status->link_status = A_FALSE;
-		if (_qca808x_phy_2500caps(dev_id, phy_id) == A_TRUE) {
+		if (qca808x_phy_2500caps(dev_id, phy_id) == A_TRUE) {
 			SW_RTN_ON_ERROR(
 				qca808x_phy_ms_random_seed_set (dev_id, phy_id));
 			/*protect logic, if MASTER_SLAVE_CONFIG_FAULT is 1,
@@ -1035,7 +1032,7 @@ qca808x_phy_set_autoneg_adv(a_uint32_t dev_id, a_uint32_t phy_id,
 			phy_data);
 	PHY_RTN_ON_ERROR(rv);
 
-	if (_qca808x_phy_2500caps(dev_id, phy_id) == A_TRUE) {
+	if (qca808x_phy_2500caps(dev_id, phy_id) == A_TRUE) {
 		rv = _qca808x_phy_set_autoneg_adv_ext(dev_id, phy_id, autoneg);
 	}
 
@@ -1101,7 +1098,7 @@ qca808x_phy_get_autoneg_adv(a_uint32_t dev_id, a_uint32_t phy_id,
 		*autoneg |= FAL_PHY_ADV_1000T_FD;
 	}
 
-	if (_qca808x_phy_2500caps(dev_id, phy_id) == A_TRUE) {
+	if (qca808x_phy_2500caps(dev_id, phy_id) == A_TRUE) {
 		rv = _qca808x_phy_get_autoneg_adv_ext(dev_id, phy_id, &phy_data);
 		if ((rv == SW_OK) &&
 				(phy_data & QCA808X_ADVERTISE_2500FULL)) {
@@ -2064,6 +2061,23 @@ void qca808x_phy_lock_init(void)
 }
 
 static sw_error_t
+qca808x_phy_adc_threshold_set(a_uint32_t dev_id, a_uint32_t phy_id,
+	a_uint32_t adc_thresold)
+{
+	sw_error_t rv = SW_OK;
+	a_uint16_t phy_data = 0;
+
+	phy_data = qca808x_phy_debug_read(dev_id, phy_id,
+		QCA808X_PHY_ADC_THRESHOLD);
+	PHY_RTN_ON_READ_ERROR(phy_data);
+	phy_data &= ~(BITS(0, 8));
+	rv = qca808x_phy_debug_write (dev_id, phy_id,
+		QCA808X_PHY_ADC_THRESHOLD, phy_data | adc_thresold);
+
+	return rv;
+}
+
+static sw_error_t
 qca808x_phy_hw_init(a_uint32_t dev_id,  a_uint32_t port_bmp)
 {
 	a_uint16_t phy_data = 0;
@@ -2099,6 +2113,10 @@ qca808x_phy_hw_init(a_uint32_t dev_id,  a_uint32_t port_bmp)
 			rv = qca808x_phy_ms_seed_enable(dev_id, phy_addr, A_TRUE);
 			SW_RTN_ON_ERROR(rv);
 			rv = qca808x_phy_ms_random_seed_set(dev_id, phy_addr);
+			SW_RTN_ON_ERROR(rv);
+			/*set adc threshold as 100mv for 10M*/
+			rv = qca808x_phy_adc_threshold_set(dev_id, phy_addr,
+				QCA808X_PHY_ADC_THRESHOLD_100MV);
 			SW_RTN_ON_ERROR(rv);
 		}
 	}
@@ -2176,7 +2194,9 @@ static sw_error_t qca808x_phy_api_ops_init(void)
 	qca808x_phy_api_ops->phy_eee_partner_adv_get = qca808x_phy_get_eee_partner_adv;
 	qca808x_phy_api_ops->phy_eee_cap_get = qca808x_phy_get_eee_cap;
 	qca808x_phy_api_ops->phy_eee_status_get = qca808x_phy_get_eee_status;
-
+#ifdef IN_LED
+	qca808x_phy_led_api_ops_init(qca808x_phy_api_ops);
+#endif
 /*qca808x_end*/
 #if defined(IN_PTP)
 	qca808x_phy_ptp_api_ops_init(&qca808x_phy_api_ops->phy_ptp_ops);
@@ -2213,14 +2233,17 @@ int qca808x_phy_init(a_uint32_t dev_id, a_uint32_t port_bmp)
 	qca808x_phy_hw_init(dev_id, port_bmp);
 
 /*qca808x_end*/
-	for (port_id = 0; port_id < SW_MAX_NR_PORT; port_id ++)
+	if(phy_dev_drv_init_flag == A_FALSE)
 	{
-		if (port_bmp & (0x1 << port_id)) {
-			qca808x_phydev_init(dev_id, port_id);
+		for (port_id = 0; port_id < SW_MAX_NR_PORT; port_id ++)
+		{
+			if (port_bmp & (0x1 << port_id)) {
+				qca808x_phydev_init(dev_id, port_id);
+			}
 		}
+		ret = qca808x_phy_driver_register();
+		phy_dev_drv_init_flag = A_TRUE;
 	}
-	ret = qca808x_phy_driver_register();
-
 /*qca808x_start*/
 	return ret;
 }

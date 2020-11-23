@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2020, The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -14,27 +14,28 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include "ssdk_init.h"
+#ifndef _MPGE_LED_H_
+#define _MPGE_LED_H_
 
-#ifdef MP
-#include "ssdk_mp.h"
-#include "hsl_phy.h"
-#endif
-
-sw_error_t qca_scomphy_hw_init(ssdk_init_cfg *cfg, a_uint32_t dev_id)
+#ifdef __cplusplus
+extern "C"
 {
-	sw_error_t rv = SW_OK;
+#endif				/* __cplusplus */
 
-	switch (cfg->phy_id) {
-#ifdef MP
-		case MP_GEPHY:
-			rv = qca_mp_hw_init(dev_id, cfg);
-			SW_RTN_ON_ERROR(rv);
-			break;
-#endif
-		default:
-			break;
-	}
-	return rv;
+sw_error_t
+mpge_phy_led_ctrl_pattern_set(a_uint32_t dev_id, a_uint32_t phy_id,
+	led_ctrl_pattern_t *pattern);
+
+sw_error_t
+mpge_phy_led_ctrl_pattern_get(a_uint32_t dev_id, a_uint32_t phy_id,
+	led_ctrl_pattern_t * pattern);
+
+sw_error_t
+mpge_phy_led_ctrl_source_set(a_uint32_t dev_id, a_uint32_t phy_id,
+	a_uint32_t source_id, led_ctrl_pattern_t * pattern);
+
+void mpge_phy_led_api_ops_init(hsl_phy_ops_t *mpge_phy_led_api_ops);
+#ifdef __cplusplus
 }
-
+#endif				/* __cplusplus */
+#endif				/* _MPGE_LED_H_ */

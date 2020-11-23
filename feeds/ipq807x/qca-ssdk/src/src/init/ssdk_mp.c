@@ -19,6 +19,7 @@
 #include "ssdk_dts.h"
 #include "ssdk_mp.h"
 #include "adpt.h"
+#include "ssdk_led.h"
 
 #ifdef IN_PORTCONTROL
 sw_error_t
@@ -37,17 +38,15 @@ qca_mp_portctrl_hw_init(a_uint32_t dev_id)
 		if (force_port == A_FALSE) {
 			fal_port_txmac_status_set (dev_id, i, A_FALSE);
 			fal_port_rxmac_status_set (dev_id, i, A_FALSE);
-			fal_port_rxfc_status_set(dev_id, i, A_FALSE);
-			fal_port_txfc_status_set(dev_id, i, A_FALSE);
 			/* init mac's lpi wake up timer to 70us */
 			port_eee_cfg.lpi_wakeup_timer = MP_LPI_WAKEUP_TIMER;
 			fal_port_interface_eee_cfg_set(dev_id, i, &port_eee_cfg);
 		} else {
 			fal_port_txmac_status_set (dev_id, i, A_TRUE);
 			fal_port_rxmac_status_set (dev_id, i, A_TRUE);
-			fal_port_rxfc_status_set(dev_id, i, A_TRUE);
-			fal_port_txfc_status_set(dev_id, i, A_TRUE);
 		}
+		fal_port_rxfc_status_set(dev_id, i, A_FALSE);
+		fal_port_txfc_status_set(dev_id, i, A_FALSE);
 		fal_port_max_frame_size_set(dev_id, i,
 			FAL_DEFAULT_MAX_FRAME_SIZE);
 		fal_port_promisc_mode_set(dev_id, i, A_TRUE);
@@ -96,7 +95,7 @@ qca_mp_interface_mode_init(a_uint32_t dev_id)
 }
 
 sw_error_t
-qca_mp_hw_init(a_uint32_t dev_id)
+qca_mp_hw_init(a_uint32_t dev_id, ssdk_init_cfg *cfg)
 {
 	sw_error_t rv = SW_OK;
 
@@ -110,6 +109,9 @@ qca_mp_hw_init(a_uint32_t dev_id)
 #endif
 	rv = qca_mp_interface_mode_init(dev_id);
 	SW_RTN_ON_ERROR(rv)
-
+#ifdef IN_LED
+	/*init MP led*/
+	rv = ssdk_led_init(dev_id, cfg);
+#endif
 	return rv;
 }

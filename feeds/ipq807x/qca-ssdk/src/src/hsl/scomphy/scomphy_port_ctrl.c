@@ -271,7 +271,7 @@ _scomphy_port_autoneg_adv_get (a_uint32_t dev_id, fal_port_t port_id,
 	return SW_OK;
 }
 
-
+#ifndef IN_PORTCONTROL_MINI
 static sw_error_t
 _scomphy_port_powersave_set (a_uint32_t dev_id, fal_port_t port_id,
 			  a_bool_t enable)
@@ -774,6 +774,7 @@ _scomphy_port_remote_loopback_get (a_uint32_t dev_id, fal_port_t port_id,
 
 	return rv;
 }
+#endif
 
 static sw_error_t
 _scomphy_port_power_off (a_uint32_t dev_id, fal_port_t port_id)
@@ -827,6 +828,7 @@ _scomphy_port_power_on (a_uint32_t dev_id, fal_port_t port_id)
 	return rv;
 }
 
+#ifndef IN_PORTCONTROL_MINI
 static sw_error_t
 _scomphy_port_wol_status_set (a_uint32_t dev_id, fal_port_t port_id,
 				a_bool_t enable)
@@ -1093,6 +1095,7 @@ _scomphy_port_counter_show (a_uint32_t dev_id, fal_port_t port_id,
 
 	return rv;
 }
+#endif
 
 static sw_error_t
 _scomphy_port_link_status_get (a_uint32_t dev_id, fal_port_t port_id,
@@ -1154,6 +1157,7 @@ _scomphy_port_reset (a_uint32_t dev_id, fal_port_t port_id)
 	return rv;
 }
 
+#ifndef IN_PORTCONTROL_MINI
 static sw_error_t
 _scomphy_port_phy_id_get (a_uint32_t dev_id, fal_port_t port_id,
 				a_uint16_t * org_id, a_uint16_t * rev_id)
@@ -1185,6 +1189,7 @@ _scomphy_port_phy_id_get (a_uint32_t dev_id, fal_port_t port_id,
 
 	return rv;
 }
+#endif
 
 /**
  * @brief Set duplex mode on a particular port.
@@ -1356,6 +1361,7 @@ scomphy_port_autoneg_adv_get (a_uint32_t dev_id, fal_port_t port_id,
 	return rv;
 }
 
+#ifndef IN_PORTCONTROL_MINI
 /**
  * @brief Set powersaving status on a particular port.
  * @param[in] dev_id device id
@@ -1716,6 +1722,7 @@ scomphy_port_remote_loopback_get (a_uint32_t dev_id, fal_port_t port_id,
 	HSL_API_UNLOCK;
 	return rv;
 }
+#endif
 
 /**
  * @brief phy power off on a particular port.
@@ -1751,6 +1758,7 @@ scomphy_port_power_on (a_uint32_t dev_id, fal_port_t port_id)
 	return rv;
 }
 
+#ifndef IN_PORTCONTROL_MINI
 /**
  * @brief Set phy wol enable on a particular port.
  * @param[in] dev_id device id
@@ -1877,6 +1885,7 @@ scomphy_port_interface_mode_status_get (a_uint32_t dev_id, fal_port_t port_id,
 	HSL_API_UNLOCK;
 	return rv;
 }
+#endif
 
 /**
  * @brief Get link status on particular port.
@@ -1897,6 +1906,7 @@ scomphy_port_link_status_get (a_uint32_t dev_id, fal_port_t port_id,
   return rv;
 }
 
+#ifndef IN_PORTCONTROL_MINI
 /**
  * @brief Set counter status on a particular port.
  * @param[in] dev_id device id
@@ -1952,7 +1962,7 @@ scomphy_port_counter_show(a_uint32_t dev_id, fal_port_t port_id,
 	HSL_API_UNLOCK;
 	return rv;
 }
-
+#endif
 
 /**
  * @brief software reset on a particular port.
@@ -1971,6 +1981,7 @@ scomphy_port_reset (a_uint32_t dev_id, fal_port_t port_id)
 	return rv;
 }
 
+#ifndef IN_PORTCONTROL_MINI
 /**
  * @brief Get phy id on a particular port.
  * @param[in] dev_id device id
@@ -1989,6 +2000,7 @@ scomphy_port_phy_id_get (a_uint32_t dev_id, fal_port_t port_id,
 	HSL_API_UNLOCK;
 	return rv;
 }
+#endif
 
 sw_error_t
 scomphy_port_ctrl_init(a_uint32_t dev_id)
@@ -2010,6 +2022,7 @@ scomphy_port_ctrl_init(a_uint32_t dev_id)
 	p_api->port_autoneg_restart = scomphy_port_autoneg_restart;
 	p_api->port_autoneg_adv_get = scomphy_port_autoneg_adv_get;
 	p_api->port_autoneg_adv_set = scomphy_port_autoneg_adv_set;
+#ifndef IN_PORTCONTROL_MINI
 	p_api->port_powersave_set = scomphy_port_powersave_set;
 	p_api->port_powersave_get = scomphy_port_powersave_get;
 	p_api->port_hibernate_set = scomphy_port_hibernate_set;
@@ -2031,8 +2044,10 @@ scomphy_port_ctrl_init(a_uint32_t dev_id)
 	p_api->port_local_loopback_get = scomphy_port_local_loopback_get;
 	p_api->port_remote_loopback_set = scomphy_port_remote_loopback_set;
 	p_api->port_remote_loopback_get = scomphy_port_remote_loopback_get;
+#endif
 	p_api->port_power_off = scomphy_port_power_off;
 	p_api->port_power_on = scomphy_port_power_on;
+#ifndef IN_PORTCONTROL_MINI
 	p_api->port_wol_status_set = scomphy_port_wol_status_set;
 	p_api->port_wol_status_get = scomphy_port_wol_status_get;
 	p_api->port_magic_frame_mac_set = scomphy_port_magic_frame_mac_set;
@@ -2045,9 +2060,12 @@ scomphy_port_ctrl_init(a_uint32_t dev_id)
 	p_api->port_counter_set = scomphy_port_counter_set;
 	p_api->port_counter_get = scomphy_port_counter_get;
 	p_api->port_counter_show = scomphy_port_counter_show;
+#endif
 	p_api->port_link_status_get = scomphy_port_link_status_get;
 	p_api->port_reset = scomphy_port_reset;
+#ifndef IN_PORTCONTROL_MINI
 	p_api->port_phy_id_get = scomphy_port_phy_id_get;
+#endif
     }
 #endif
 

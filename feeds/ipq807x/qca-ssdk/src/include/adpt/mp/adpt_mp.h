@@ -35,6 +35,7 @@ sw_error_t adpt_mp_intr_init(a_uint32_t dev_id);
 sw_error_t adpt_mp_mib_init(a_uint32_t dev_id);
 sw_error_t adpt_mp_portctrl_init(a_uint32_t dev_id);
 sw_error_t adpt_mp_uniphy_init(a_uint32_t dev_id);
+sw_error_t adpt_mp_led_init(a_uint32_t dev_id);
 
 #ifdef __cplusplus
 }

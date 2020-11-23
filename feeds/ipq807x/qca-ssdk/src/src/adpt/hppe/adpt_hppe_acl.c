@@ -2937,7 +2937,8 @@ static sw_error_t _adpt_hppe_acl_udf_rule_sw_2_hw(fal_acl_rule_t *rule, a_uint32
 	}
 	else
 	{
-		if(FAL_FIELD_FLG_TST(rule->field_flg, FAL_ACL_FIELD_UDF1))
+		if(FAL_FIELD_FLG_TST(rule->field_flg, FAL_ACL_FIELD_UDF1) &&
+			FAL_ACL_FIELD_MASK == rule->udf1_op)
 		{
 			udfrule->udf1_valid = 1;
 			udfrule->udf1 = rule->udf1_val;

@@ -2953,7 +2953,7 @@ parse_portvlan_ptqinqmode(struct switch_val *val)
 
 	return rv;
 }
-
+#ifdef HPPE
 static int
 parse_portvlan_intpid(struct switch_val *val)
 {
@@ -3163,7 +3163,7 @@ parse_portvlan_translationmissaction(struct switch_val *val)
 
 	return rv;
 }
-
+#endif
 static int
 parse_portvlan_egmode(struct switch_val *val)
 {
@@ -3196,7 +3196,7 @@ parse_portvlan_egmode(struct switch_val *val)
 
 	return rv;
 }
-
+#ifdef HPPE
 static int
 parse_portvlan_vsiegmode(struct switch_val *val)
 {
@@ -3392,7 +3392,7 @@ parse_portvlan_translationadv(struct switch_val *val)
 
 	return rv;
 }
-
+#endif
 #ifndef IN_PORTVLAN_MINI
 static int
 parse_portvlan_invlan(struct switch_val *val)
@@ -4920,7 +4920,7 @@ parse_sec_icmp6(struct switch_val *val)
 
 	return rv;
 }
-
+#ifdef HPPE
 static int
 parse_sec_expctrl(struct switch_val *val)
 {
@@ -5047,6 +5047,7 @@ parse_sec_l4parser(struct switch_val *val)
 
 	return rv;
 }
+#endif
 #endif
 
 #ifdef IN_MISC
@@ -10735,6 +10736,7 @@ parse_portvlan(const char *command_name, struct switch_val *val)
 		rv = parse_portvlan_globalqinqmode(val);
 	} else if (!strcmp(command_name, "PtQinQMode")) {
 		rv = parse_portvlan_ptqinqmode(val);
+#ifdef HPPE
 	} else if (!strcmp(command_name, "InTpid")) {
 		rv = parse_portvlan_intpid(val);
 	} else if (!strcmp(command_name, "EgTpid")) {
@@ -10747,8 +10749,10 @@ parse_portvlan(const char *command_name, struct switch_val *val)
 		rv = parse_portvlan_tagpropagation(val);
 	} else if (!strcmp(command_name, "TranslationMissAction")) {
 		rv = parse_portvlan_translationmissaction(val);
+#endif
 	} else if (!strcmp(command_name, "EgMode")) {
 		rv = parse_portvlan_egmode(val);
+#ifdef HPPE
 	} else if (!strcmp(command_name, "VsiEgMode")) {
 		rv = parse_portvlan_vsiegmode(val);
 	} else if (!strcmp(command_name, "VsiEgModeEn")) {
@@ -10757,6 +10761,7 @@ parse_portvlan(const char *command_name, struct switch_val *val)
 		rv = parse_portvlan_counter(val);
 	} else if (!strcmp(command_name, "TranslationAdv")) {
 		rv = parse_portvlan_translationadv(val);
+#endif
 	}
 	#ifndef IN_PORTVLAN_MINI
 	else if(!strcmp(command_name, "InVlan")) {
@@ -10923,12 +10928,14 @@ parse_sec(const char *command_name, struct switch_val *val)
 		rv = parse_sec_icmp4(val);
 	} else if(!strcmp(command_name, "Icmp6")) {
 		rv = parse_sec_icmp6(val);
+#ifdef HPPE
 	} else if (!strcmp(command_name, "Expctrl")) {
 		rv = parse_sec_expctrl(val);
 	} else if (!strcmp(command_name, "L3parser")) {
 		rv = parse_sec_l3parser(val);
 	} else if (!strcmp(command_name, "L4parser")) {
 		rv = parse_sec_l4parser(val);
+#endif
 	}
 
 	return rv;

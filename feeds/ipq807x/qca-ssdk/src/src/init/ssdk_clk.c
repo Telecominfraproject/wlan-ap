@@ -682,6 +682,7 @@ ssdk_mp_reset_init(void)
 		msleep(200);
 		ssdk_gcc_reset(rst, SSDK_RESET_DEASSERT);
 		msleep(200);
+		reset_control_put(rst);
 	}
 
 	i = UNIPHY1_SOFT_RESET_E;
@@ -690,12 +691,28 @@ ssdk_mp_reset_init(void)
 	SSDK_INFO("MP reset successfully!1\n");
 #endif
 }
+
+static void ssdk_cmnblk_pll_src_set(enum cmnblk_pll_src_type pll_source)
+{
+	void __iomem *cmn_pll_src_base = NULL;
+	a_uint32_t reg_val;
+
+	cmn_pll_src_base = ioremap_nocache(CMN_BLK_PLL_SRC_ADDR, CMN_BLK_SIZE);
+	if (!cmn_pll_src_base) {
+		SSDK_ERROR("Failed to map cmn pll source address!\n");
+		return;
+	}
+	reg_val = readl(cmn_pll_src_base);
+	reg_val = (reg_val & PLL_CTRL_SRC_MASK) | (pll_source << 0x8);
+	writel(reg_val, cmn_pll_src_base);
+	iounmap(cmn_pll_src_base);
+
+	return;
+}
 #endif
 #endif
 
 #if defined(HPPE) || defined(MP)
-#define CMN_BLK_ADDR	0x0009B780
-#define CMN_BLK_SIZE	0x100
 static void ssdk_cmnblk_init(enum cmnblk_clk_type mode)
 {
 	void __iomem *gcc_pll_base = NULL;
@@ -727,6 +744,12 @@ static void ssdk_cmnblk_init(enum cmnblk_clk_type mode)
 		case EXTERNAL_48MHZ:
 			reg_val = (reg_val & FREQUENCY_MASK) | EXTERNAL_48MHZ_CLOCK;
 			break;
+#if defined(MP)
+		case INTERNAL_96MHZ:
+			ssdk_cmnblk_pll_src_set(CMN_BLK_PLL_SRC_SEL_FROM_REG);
+			reg_val = (reg_val & PLL_REFCLK_DIV_MASK) | PLL_REFCLK_DIV_2;
+			break;
+#endif
 		default:
 			return;
 	}
@@ -916,6 +939,8 @@ void ssdk_gcc_clock_init(void)
 			cmnblk_clk_mode = EXTERNAL_40MHZ;
 		} else if (!strcmp(mode, "external_48MHz")) {
 			cmnblk_clk_mode = EXTERNAL_48MHZ;
+		} else if (!strcmp(mode, "internal_96MHz")) {
+			cmnblk_clk_mode = INTERNAL_96MHZ;
 		}
 	}
 
@@ -1166,6 +1191,7 @@ void ssdk_ppe_reset_init(void)
 	msleep(100);
 	ssdk_gcc_reset(rst, SSDK_RESET_DEASSERT);
 	msleep(100);
+	reset_control_put(rst);
 	SSDK_INFO("ppe reset successfully!\n");
 
 	for (i = UNIPHY0_SOFT_RESET_E; i < UNIPHY_RST_MAX; i++)

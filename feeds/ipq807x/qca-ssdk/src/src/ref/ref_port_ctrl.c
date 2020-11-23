@@ -317,6 +317,7 @@ int qca_ar8327_vlan_recovery(struct qca_phy_priv *priv)
 				val = 0x00180000;
 				for (i = 0; i < priv->ports; ++i) {
 					mask = (1 << i);
+					portmask[i] |= ~mask & priv->vlan_table[j];
 					if (mask & priv->vlan_table[j])
 					{
 						val |= ((mask & priv->vlan_tagged[j]) ?
@@ -342,15 +343,10 @@ int qca_ar8327_vlan_recovery(struct qca_phy_priv *priv)
 		}
 
 	} else {
-		/* vlan disabled:
-		 * isolate all ports, but connect them to the cpu port */
-		for (i = 0; i < priv->ports; i++) {
-			if (i == AR8327_PORT_CPU)
-				continue;
-
-			portmask[i] = 1 << AR8327_PORT_CPU;
-			portmask[AR8327_PORT_CPU] |= (1 << i);
-		}
+#if defined(IN_PORTVLAN)
+		/* vlan disabled: port based vlan used */
+		ssdk_portvlan_init(priv->device_id);
+#endif
 	}
 
 #if defined(IN_PORTVLAN)
@@ -370,7 +366,7 @@ int qca_ar8327_vlan_recovery(struct qca_phy_priv *priv)
 
 			ingressMode = FAL_1Q_SECURE;
 		} else {
-			pvid = i;
+			pvid = 0;
 			egressMode = FAL_EG_UNTOUCHED;
 			ingressMode = FAL_1Q_DISABLE;
 		}
@@ -387,7 +383,9 @@ int qca_ar8327_vlan_recovery(struct qca_phy_priv *priv)
 		fal_port_1qmode_set(priv->device_id, i, ingressMode);
 		fal_port_egvlanmode_set(priv->device_id, i, egressMode);
 		fal_port_default_cvid_set(priv->device_id, i, pvid);
-		fal_portvlan_member_update(priv->device_id, i, portmask[i]);
+		if (!priv->init && priv->vlan) {
+			fal_portvlan_member_update(priv->device_id, i, portmask[i]);
+		}
 	}
 #endif
 

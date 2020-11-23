@@ -24,7 +24,7 @@
 #define GMAC_FULL_DUPLEX                 0x1
 #define GMAC_HALF_DUPLEX                 0x0
 #define GMAC_PAUSE_TIME                  0xffff
-#define GMAC_PAUSE_QUANTA_ENABLE         0x1
+#define GMAC_PAUSE_ZERO_QUANTA_ENABLE    0x0
 #define GMAC_JD_ENABLE                   0x1
 #define GMAC_WD_DISABLE                  0x0
 #define GMAC_FRAME_BURST_ENABLE          0x1

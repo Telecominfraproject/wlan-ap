@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2014-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012, 2014-2020, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -17,6 +17,7 @@
 #include <linux/kconfig.h>
 #include <linux/version.h>
 #include <linux/kernel.h>
+#include "ssdk_plat.h"
 
 #if defined(CONFIG_OF)
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0))
@@ -135,4 +136,24 @@ int ssdk_dess_led_init(ssdk_init_cfg *cfg)
 }
 #endif
 
+#ifdef IN_LED
+sw_error_t ssdk_led_init(a_uint32_t dev_id, ssdk_init_cfg *cfg)
+{
+	a_uint32_t src_index = 0, led_src_id = 0;
+	sw_error_t rv = SW_OK;
+	led_ctrl_pattern_t pattern = {0};
 
+	for(src_index = 0; src_index < cfg->led_source_num; src_index++)
+	{
+		pattern.mode = cfg->led_source_cfg[src_index].led_pattern.mode;
+		pattern.map = cfg->led_source_cfg[src_index].led_pattern.map;
+		led_src_id = cfg->led_source_cfg[src_index].led_source_id;
+		SSDK_INFO("ssdk_led_mode:%x, ssdk_led_map:%x, ssdk_led_src_id:%x\n",
+			pattern.mode, pattern.map, led_src_id);
+		rv = fal_led_source_pattern_set(dev_id, led_src_id, &pattern);
+		SW_RTN_ON_ERROR(rv);
+	}
+
+	return SW_OK;
+}
+#endif

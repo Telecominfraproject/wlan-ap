@@ -473,6 +473,10 @@ sw_error_t adpt_init(a_uint32_t dev_id, ssdk_init_cfg *cfg)
 				rv = adpt_mp_uniphy_init(dev_id);
 				SW_RTN_ON_ERROR(rv);
 #endif
+#if defined (IN_LED)
+				rv = adpt_mp_led_init(dev_id);
+				SW_RTN_ON_ERROR(rv);
+#endif
 			}
 #endif
 			break;

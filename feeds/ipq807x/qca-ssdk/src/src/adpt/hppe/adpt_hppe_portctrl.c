@@ -93,8 +93,16 @@ static a_bool_t
 _adpt_hppe_port_phy_connected (a_uint32_t dev_id, fal_port_t port_id)
 {
 	a_uint32_t mode1, mode2;
+	a_bool_t force_port = 0;
 
 	ADPT_DEV_ID_CHECK(dev_id);
+
+	/* force port which connect s17c or other device chip*/
+	force_port = ssdk_port_feature_get(dev_id, port_id, PHY_F_FORCE);
+	if (force_port == A_TRUE) {
+		SSDK_DEBUG("port_id %d is a force port!\n", port_id);
+		return A_FALSE;
+	}
 
 	mode1 = ssdk_dt_global_get_mac_mode(dev_id, SSDK_UNIPHY_INSTANCE1);
 	mode2 = ssdk_dt_global_get_mac_mode(dev_id, SSDK_UNIPHY_INSTANCE2);
@@ -4242,7 +4250,7 @@ adpt_hppe_port_phy_status_get(a_uint32_t dev_id, a_uint32_t port_id,
 	ADPT_DEV_ID_CHECK(dev_id);
 	ADPT_NULL_POINT_CHECK(phy_status);
 
-	/* for those ports without PHY device should be sfp port */
+	/* for those ports without PHY device should be sfp port or a internal port*/
 	if (A_FALSE == _adpt_hppe_port_phy_connected (dev_id, port_id)) {
 		if (port_id != SSDK_PHYSICAL_PORT0) {
 			rv = _adpt_phy_status_get_from_ppe(dev_id,
