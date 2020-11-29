@@ -56,6 +56,7 @@ define Package/opennds/install
 	$(CP) ./files/lib/opennds $(1)/etc/config/
 	$(CP) ./files/etc/init.d/opennds $(1)/etc/init.d/
 	$(CP) ./files/lib/login.sh $(1)/usr/lib/opennds/
+	$(CP) ./files/lib/radius.sh $(1)/usr/lib/opennds/
 	$(CP) ./files/lib/userpassword.sh $(1)/usr/lib/opennds/
 	$(CP) $(PKG_BUILD_DIR)/resources/splash.html $(1)/etc/opennds/htdocs/
 	$(CP) $(PKG_BUILD_DIR)/resources/status.html $(1)/etc/opennds/htdocs/

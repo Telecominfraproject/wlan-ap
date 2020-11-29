@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
@@ -9,8 +11,7 @@
 #include <curl/curl.h>
 #include <uci.h>
 #include <uci_blob.h>
- #include <arpa/inet.h>
-
+#include <arpa/inet.h>
 #include "log.h"
 #include "const.h"
 #include "target.h"
@@ -25,7 +26,7 @@ static struct uci_package *opennds;
 static struct uci_context *cap_uci;
 
 #define SCHEMA_CAPTIVE_PORTAL_OPT_SZ            255
-#define SCHEMA_CAPTIVE_PORTAL_OPTS_MAX          10
+#define SCHEMA_CAPTIVE_PORTAL_OPTS_MAX          14
 enum {
 	NDS_ATTR_SESSIONTIMEOUT,
 	NDS_ATTR_GATEWAYINTERFACE,
@@ -48,6 +49,10 @@ enum {
 	NDS_ATTR_WEB_ROOT,
 	NDS_ATTR_PREAUTH,
 	NDS_ATTR_USERNAMEPASS_FILE,
+	NDS_ATTR_RADIUS_PORT,
+	NDS_ATTR_RADIUS_IP,
+	NDS_ATTR_RADIUS_SECRET,
+	NDS_ATTR_RADIUS_AUTH_TYPE,
 	__NDS_ATTR_MAX,
 };
 const struct blobmsg_policy opennds_policy[__NDS_ATTR_MAX] = {
@@ -72,6 +77,10 @@ const struct blobmsg_policy opennds_policy[__NDS_ATTR_MAX] = {
 	[NDS_ATTR_BINAUTH_SCRIPT]  = { .name = "binauth", .type = BLOBMSG_TYPE_STRING },
 	[NDS_ATTR_WEB_ROOT]  = { .name = "webroot", .type = BLOBMSG_TYPE_STRING },
 	[NDS_ATTR_USERNAMEPASS_FILE]  = { .name = "username_password_file", .type = BLOBMSG_TYPE_STRING },
+	[NDS_ATTR_RADIUS_PORT]  = { .name = "radius_server_port", .type = BLOBMSG_TYPE_STRING },
+	[NDS_ATTR_RADIUS_SECRET]  = { .name = "radius_server_secret", .type = BLOBMSG_TYPE_STRING },
+	[NDS_ATTR_RADIUS_IP]  = { .name = "radius_server_ip", .type = BLOBMSG_TYPE_STRING },
+	[NDS_ATTR_RADIUS_AUTH_TYPE]  = { .name = "radius_auth_type", .type = BLOBMSG_TYPE_STRING },
 };
 
 struct blob_buf dnsmas={ };
@@ -177,6 +186,10 @@ const char captive_portal_options_table[SCHEMA_CAPTIVE_PORTAL_OPTS_MAX][SCHEMA_C
 	SCHEMA_CONSTS_ACCEPTANCE_POLICY,
 	SCHEMA_CONSTS_LOGIN_SUCCESS_TEXT,
 	SCHEMA_CONSTS_USERPASS_FILE,
+	SCHEMA_CONSTS_RADIUS_PORT,
+	SCHEMA_CONSTS_RADIUS_IP,
+	SCHEMA_CONSTS_RADIUS_SECRET,
+	SCHEMA_CONSTS_RADIUS_AUTH_TYPE
 };
 
 void set_captive_portal_state(struct schema_Wifi_VIF_State *vstate,
@@ -291,6 +304,34 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate, 
 					if (tc[NDS_ATTR_USERNAMEPASS_FILE]) {
 						buf = blobmsg_get_string(tc[NDS_ATTR_USERNAMEPASS_FILE]);
 						strcpy(user_file, buf);
+						set_captive_portal_state(vstate, &index,
+								captive_portal_options_table[i],
+								buf);
+					}
+				} else if (strcmp(opt, "radius_server_ip") == 0) {
+					if (tc[NDS_ATTR_RADIUS_IP]) {
+						buf = blobmsg_get_string(tc[NDS_ATTR_RADIUS_IP]);
+						set_captive_portal_state(vstate, &index,
+								captive_portal_options_table[i],
+								buf);
+					}
+				} else if (strcmp(opt, "radius_server_port") == 0) {
+					if (tc[NDS_ATTR_RADIUS_PORT]) {
+						buf = blobmsg_get_string(tc[NDS_ATTR_RADIUS_PORT]);
+						set_captive_portal_state(vstate, &index,
+								captive_portal_options_table[i],
+								buf);
+					}
+				} else if (strcmp(opt, "radius_server_secret") == 0) {
+					if (tc[NDS_ATTR_RADIUS_SECRET]) {
+						buf = blobmsg_get_string(tc[NDS_ATTR_RADIUS_SECRET]);
+						set_captive_portal_state(vstate, &index,
+								captive_portal_options_table[i],
+								buf);
+					}
+				} else if (strcmp(opt, "radius_auth_type") == 0) {
+					if (tc[NDS_ATTR_RADIUS_AUTH_TYPE]) {
+						buf = blobmsg_get_string(tc[NDS_ATTR_RADIUS_AUTH_TYPE]);
 						set_captive_portal_state(vstate, &index,
 								captive_portal_options_table[i],
 								buf);
@@ -422,12 +463,36 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 				blobmsg_add_string(&cap, NULL, "allow tcp port 80 ipset set_wlan1");
 				blobmsg_add_string(&cap, NULL, "allow tcp port 443 ipset set_wlan1");
 				blobmsg_close_array(&cap, e);
-			} else {
+
+			} else if (strcmp(value,"radius")==0)  {
+				blobmsg_add_string(&cap, "authentication", value);
+				blobmsg_add_string(&cap, "enabled", "1");
+				blobmsg_add_string(&cap, "preauth", "/usr/lib/opennds/radius.sh");
+				ipset_create(ifname);
+
+				struct blob_attr *e;
+				e = blobmsg_open_array(&cap, "preauthenticated_users");
+				blobmsg_add_string(&cap, NULL, "allow tcp port 80 ipset set_wlan1");
+				blobmsg_add_string(&cap, NULL, "allow tcp port 443 ipset set_wlan1");
+				blobmsg_close_array(&cap, e);
+			}
+			else {
 				blobmsg_add_string(&cap, "authentication", "");
 				blobmsg_add_string(&cap, "enabled", "");
 				blobmsg_add_string(&cap, "preauth", "");
 			}
 		}
+		else if (strcmp(opt, "radius_server_port") == 0)
+			blobmsg_add_string(&cap, "radius_server_port", value);
+
+		else if (strcmp(opt, "radius_server_ip") == 0)
+			blobmsg_add_string(&cap, "radius_server_ip", value);
+
+		else if (strcmp(opt, "radius_server_secret") == 0)
+			blobmsg_add_string(&cap, "radius_server_secret", value);
+
+		else if (strcmp(opt, "radius_auth_type") == 0)
+			blobmsg_add_string(&cap, "radius_auth_type", value);
 
 		else if (strcmp(opt, "session_timeout") == 0)
 			blobmsg_add_string(&cap, "sessiontimeout", value);

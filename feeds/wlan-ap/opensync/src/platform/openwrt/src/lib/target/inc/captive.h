@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #ifndef _CAPTIVE_H__
 #define _CAPTIVE_H__
 
