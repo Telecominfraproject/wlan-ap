@@ -59,6 +59,8 @@ enum {
 	WIF_ATTR_ACCT_SERVER,
 	WIF_ATTR_ACCT_PORT,
 	WIF_ATTR_ACCT_SECRET,
+	WIF_ATTR_ACCT_INTERVAL,
+	WIF_ATTR_REQ_CUI,
 	WIF_ATTR_IEEE80211R,
 	WIF_ATTR_IEEE80211W,
 	WIF_ATTR_MOBILITY_DOMAIN,
@@ -100,11 +102,14 @@ enum {
 	WIF_ATTR_OPER_FRIENDLY_NAME,
 	WIF_ATTR_OPERATING_CLASS,
 	WIF_ATTR_OPER_ICON,
-        WIF_ATTR_PROBE_ACCEPT_RATE,
-        WIF_ATTR_CLIENT_CONNECT_THRESHOLD,
-        WIF_ATTR_CLIENT_DISCONNECT_THRESHOLD,
-        WIF_ATTR_BEACON_RATE,
-        WIF_ATTR_MCAST_RATE,
+	WIF_ATTR_PROBE_ACCEPT_RATE,
+	WIF_ATTR_CLIENT_CONNECT_THRESHOLD,
+	WIF_ATTR_CLIENT_DISCONNECT_THRESHOLD,
+	WIF_ATTR_BEACON_RATE,
+	WIF_ATTR_MCAST_RATE,
+	WIF_ATTR_RADIUS_NAS_ID_ATTR,
+	WIF_ATTR_RADIUS_AUTH_REQ_ATTR,
+	WIF_ATTR_RADIUS_ACCT_REQ_ATTR,
 	__WIF_ATTR_MAX,
 };
 
@@ -128,6 +133,8 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_ACCT_SERVER] = { .name = "acct_server", .type = BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_ACCT_PORT] = { .name = "acct_port", .type = BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_ACCT_SECRET] = { .name = "acct_secret", .type = BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_ACCT_INTERVAL] = { .name = "acct_interval", .type = BLOBMSG_TYPE_INT32 },
+	[WIF_ATTR_REQ_CUI] = { .name = "request_cui", .type = BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_IEEE80211R] = { .name = "ieee80211r", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_IEEE80211W] = { .name = "ieee80211w", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_MOBILITY_DOMAIN] = { .name = "mobility_domain", BLOBMSG_TYPE_STRING },
@@ -174,6 +181,9 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_CLIENT_DISCONNECT_THRESHOLD] = { .name = "signal_stay", .type = BLOBMSG_TYPE_INT32 },
 	[WIF_ATTR_BEACON_RATE] = { .name = "bcn_rate", .type = BLOBMSG_TYPE_INT32 },
 	[WIF_ATTR_MCAST_RATE] = { .name = "mcast_rate", .type = BLOBMSG_TYPE_INT32 },
+	[WIF_ATTR_RADIUS_NAS_ID_ATTR] = { .name = "nasid", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_RADIUS_AUTH_REQ_ATTR] = { .name = "radius_auth_req_attr", BLOBMSG_TYPE_ARRAY },
+	[WIF_ATTR_RADIUS_ACCT_REQ_ATTR] = { .name = "radius_acct_req_attr", BLOBMSG_TYPE_ARRAY },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -249,6 +259,7 @@ static void vif_config_security_set(struct blob_buf *b,
 	const char *encryption = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_ENCRYPT);
 	const char *mode = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_MODE);
 	unsigned int i;
+	unsigned int acct_interval;
 
 	if (!strcmp(encryption, OVSDB_SECURITY_ENCRYPTION_OPEN) || !mode)
 		goto open;
@@ -260,6 +271,7 @@ static void vif_config_security_set(struct blob_buf *b,
 		blobmsg_add_string(b, "encryption", vif_crypto[i].uci);
 		blobmsg_add_bool(b, "ieee80211w", 1);
 		if (vif_crypto[i].enterprise) {
+			acct_interval = 0;
 			blobmsg_add_string(b, "auth_server",
 					   SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_IP));
 			blobmsg_add_string(b, "auth_port",
@@ -272,6 +284,13 @@ static void vif_config_security_set(struct blob_buf *b,
 					   SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_PORT));
 			blobmsg_add_string(b, "acct_secret",
 					   SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_SECRET));
+			blobmsg_add_bool(b, "request_cui", 1);
+			acct_interval = atoi(SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_INTERVAL));
+
+			if (acct_interval <= 600 && acct_interval >= 60 )
+			{
+				blobmsg_add_u32(b, "acct_interval", acct_interval);
+			}
 		} else {
 			blobmsg_add_string(b, "key",
 					   SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_KEY));
@@ -300,6 +319,7 @@ static void vif_state_security_get(struct schema_Wifi_VIF_State *vstate,
 	char *encryption = NULL;
 	unsigned int i;
 	int index = 0;
+	char interval[5];
 
 	if (tb[WIF_ATTR_ENCRYPTION]) {
 		encryption = blobmsg_get_string(tb[WIF_ATTR_ENCRYPTION]);
@@ -334,6 +354,13 @@ static void vif_state_security_get(struct schema_Wifi_VIF_State *vstate,
 			vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_ACCT_SECRET,
 					blobmsg_get_string(tb[WIF_ATTR_ACCT_SECRET]));
 		}
+
+		if (tb[WIF_ATTR_ACCT_INTERVAL])
+		{
+			sprintf(interval, "%d", blobmsg_get_u32(tb[WIF_ATTR_ACCT_INTERVAL]));
+			vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_ACCT_INTERVAL,
+					interval);
+		}
 	} else {
 		if (!tb[WIF_ATTR_KEY])
 			goto out_none;
@@ -353,7 +380,7 @@ out_none:
 
 /* Custom options table */
 #define SCHEMA_CUSTOM_OPT_SZ            20
-#define SCHEMA_CUSTOM_OPTS_MAX          8
+#define SCHEMA_CUSTOM_OPTS_MAX          10
 
 const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 {
@@ -365,6 +392,8 @@ const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 	SCHEMA_CONSTS_IEEE80211k,
 	SCHEMA_CONSTS_RTS_THRESHOLD,
 	SCHEMA_CONSTS_DTIM_PERIOD,
+	SCHEMA_CONSTS_RADIUS_OPER_NAME,
+	SCHEMA_CONSTS_RADIUS_NAS_ID
 };
 
 static void vif_config_custom_opt_set(struct blob_buf *b,
@@ -372,8 +401,10 @@ static void vif_config_custom_opt_set(struct blob_buf *b,
 {
 	int i;
 	char value[20];
+	char operator_name[20];
 	const char *opt;
 	const char *val;
+	struct blob_attr *n;
 
 	for (i = 0; i < SCHEMA_CUSTOM_OPTS_MAX; i++) {
 		opt = custom_options_table[i];
@@ -408,7 +439,20 @@ static void vif_config_custom_opt_set(struct blob_buf *b,
 			blobmsg_add_string(b, "rts_threshold", value);
 		else if (strcmp(opt, "dtim_period") == 0)
 			blobmsg_add_string(b, "dtim_period", value);
+		else if (strcmp(opt, "radius_nas_id") == 0)
+			blobmsg_add_string(b, "nasid", value);
+		else if (strcmp(opt, "radius_oper_name") == 0)
+		{
+			memset(operator_name, '\0', sizeof(operator_name));
+			sprintf(operator_name, "126:s:%s", value);
+			n = blobmsg_open_array(b,"radius_auth_req_attr");
+			blobmsg_add_string(b, NULL, operator_name);
+			blobmsg_close_array(b, n);
 
+			n = blobmsg_open_array(b,"radius_acct_req_attr");
+			blobmsg_add_string(b, NULL, operator_name);
+			blobmsg_close_array(b, n);
+		}
 	}
 }
 
@@ -499,8 +543,36 @@ static void vif_state_custom_options_get(struct schema_Wifi_VIF_State *vstate,
 						custom_options_table[i],
 						buf);
 			}
-		}
+		} else if (strcmp(opt, "radius_nas_id") == 0) {
+			if (tb[WIF_ATTR_RADIUS_NAS_ID_ATTR]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_RADIUS_NAS_ID_ATTR]);
+				set_custom_option_state(vstate, &index,
+						custom_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "radius_oper_name") == 0) {
+			static struct blobmsg_policy policy[1] = {
+					{ .type = BLOBMSG_TYPE_STRING },
+			};
 
+			struct blob_attr *ttb[1];
+
+			blobmsg_parse_array(policy, ARRAY_SIZE(ttb), ttb,
+					blobmsg_data(tb[WIF_ATTR_RADIUS_AUTH_REQ_ATTR]),
+					blobmsg_data_len(tb[WIF_ATTR_RADIUS_AUTH_REQ_ATTR]));
+
+			if (ttb[0])
+			{
+				char value[20];
+				buf = blobmsg_get_string(ttb[0]);
+				if (sscanf(buf, "126:s:%s", value))
+				{
+					set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							value);
+				}
+			}
+		}
 	}
 }
 
