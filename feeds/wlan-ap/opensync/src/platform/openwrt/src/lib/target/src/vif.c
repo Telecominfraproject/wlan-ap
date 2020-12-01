@@ -25,6 +25,7 @@
 #include "captive.h"
 #include "ovsdb_table.h"
 #include "ovsdb_sync.h"
+#include "rrm_config.h"
 
 #define MODULE_ID LOG_MODULE_ID_VIF
 #define UCI_BUFFER_SIZE 80
@@ -33,6 +34,7 @@ extern ovsdb_table_t table_Wifi_VIF_Config;
 extern ovsdb_table_t table_Hotspot20_Icon_Config;
 
 extern struct blob_buf b;
+extern struct blob_buf del;
 
 struct blob_buf hs20 = { };
 struct blob_buf osu = { };
@@ -98,6 +100,11 @@ enum {
 	WIF_ATTR_OPER_FRIENDLY_NAME,
 	WIF_ATTR_OPERATING_CLASS,
 	WIF_ATTR_OPER_ICON,
+        WIF_ATTR_PROBE_ACCEPT_RATE,
+        WIF_ATTR_CLIENT_CONNECT_THRESHOLD,
+        WIF_ATTR_CLIENT_DISCONNECT_THRESHOLD,
+        WIF_ATTR_BEACON_RATE,
+        WIF_ATTR_MCAST_RATE,
 	__WIF_ATTR_MAX,
 };
 
@@ -162,6 +169,11 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_OPER_FRIENDLY_NAME] = { .name = "hs20_oper_friendly_name", BLOBMSG_TYPE_ARRAY },
 	[WIF_ATTR_OPERATING_CLASS] = { .name = "hs20_operating_class", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_OPER_ICON] = { .name = "operator_icon", BLOBMSG_TYPE_ARRAY },
+	[WIF_ATTR_PROBE_ACCEPT_RATE] = { .name = "rssi_ignore_probe_request", .type = BLOBMSG_TYPE_INT32 },
+	[WIF_ATTR_CLIENT_CONNECT_THRESHOLD] = { .name = "signal_connect", .type = BLOBMSG_TYPE_INT32 },
+	[WIF_ATTR_CLIENT_DISCONNECT_THRESHOLD] = { .name = "signal_stay", .type = BLOBMSG_TYPE_INT32 },
+	[WIF_ATTR_BEACON_RATE] = { .name = "bcn_rate", .type = BLOBMSG_TYPE_INT32 },
+	[WIF_ATTR_MCAST_RATE] = { .name = "mcast_rate", .type = BLOBMSG_TYPE_INT32 },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -844,19 +856,23 @@ static void hs20_vif_config(struct blob_buf *b,
 
 }
 
-
 bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
 {
 	struct uci_package *wireless;
 	struct uci_element *e = NULL, *tmp = NULL;
 	const char *ifname;
+	int ret=0;
 
 	vlan_del((char *)vconf->if_name);
-	uci_load(uci, "wireless", &wireless);
+	ret= uci_load(uci, "wireless", &wireless);
+	if (ret) {
+		LOGD("%s: uci_load() failed with rc %d", vconf->if_name, ret);
+		return false;
+	}
 	uci_foreach_element_safe(&wireless->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
-		if (strcmp(s->type, "wifi-iface"))
-			continue;
+		if ((s == NULL) || (s->type == NULL)) continue; 
+		if (strcmp(s->type, "wifi-iface")) continue;
 
 		ifname = uci_lookup_option_string( uci, s, "ifname" );
 		if (!strcmp(ifname,vconf->if_name)) {
@@ -864,11 +880,11 @@ bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
 			break;
 		}
 	}
-	uci_commit_all(uci);
+	uci_commit(uci, &wireless, false);
+	uci_unload(uci, wireless);
 	reload_config = 1;
 	return true;
 }
-
 
 void vif_hs20_osu_update(struct schema_Hotspot20_OSU_Providers *osuconf)
 {
@@ -989,6 +1005,7 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 	int vid = 0;
 
 	blob_buf_init(&b, 0);
+	blob_buf_init(&del,0);
 
 	blobmsg_add_string(&b, "ifname", vconf->if_name);
 	blobmsg_add_string(&b, "device", rconf->if_name);
@@ -1077,8 +1094,10 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 	if (changed->custom_options)
 		vif_config_custom_opt_set(&b, vconf);
 
+	rrm_config_vif(&b, &del, rconf->freq_band, vconf->if_name);
+
 	blob_to_uci_section(uci, "wireless", vconf->if_name, "wifi-iface",
-			    b.head, &wifi_iface_param, NULL);
+			    b.head, &wifi_iface_param, del.head);
 
 	if (vid)
 		vlan_add((char *)vconf->if_name, vid, !strcmp(vconf->bridge, "wan"));
