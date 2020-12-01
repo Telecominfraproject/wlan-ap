@@ -24,6 +24,8 @@
 #include "uci.h"
 #include "utils.h"
 #include "captive.h"
+#include "rrm_config.h"
+#include "vlan.h"
 
 ovsdb_table_t table_Hotspot20_Config;
 ovsdb_table_t table_Hotspot20_OSU_Providers;
@@ -329,8 +331,6 @@ static void periodic_task(void *arg)
 		uci_commit_all(uci);
 		sync();
 		system("reload_config");
-		counter = 14;
-		goto done;
 	}
 
 	LOGT("periodic: start state update ");
@@ -501,6 +501,9 @@ bool target_radio_init(const struct target_radio_ops *ops)
 	OVSDB_TABLE_INIT(Hotspot20_Icon_Config, _uuid);
 	OVSDB_TABLE_MONITOR(Hotspot20_Icon_Config, false);
 
+        OVSDB_TABLE_INIT(Wifi_RRM_Config, _uuid);
+        OVSDB_TABLE_MONITOR(Wifi_RRM_Config, false);
+
 	evsched_task(&periodic_task, NULL, EVSCHED_SEC(5));
 
 	radio_nl80211_init();
@@ -515,3 +518,4 @@ bool target_radio_config_need_reset(void)
 {
 	return true;
 }
+

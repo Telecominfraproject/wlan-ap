@@ -45,6 +45,7 @@ UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/captive.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/sysupgrade.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/dhcpdiscovery.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/radius_probe.c
+UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/rrm_config.c
 
 CONFIG_USE_KCONFIG=y
 CONFIG_INET_ETH_LINUX=y

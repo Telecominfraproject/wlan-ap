@@ -40,6 +40,7 @@ const struct uci_blob_param_list wifi_config_param = {
 		.params = wifi_config_policy,
 };
 
+#if 0
 static void rrm_config_set(const char *if_name, rrm_entry_t *rrm_data)
 {
 	blob_buf_init(&b, 0);
@@ -54,6 +55,7 @@ static void rrm_config_set(const char *if_name, rrm_entry_t *rrm_data)
 
 	reload_config = 1;
 }
+#endif
 
 rrm_config_t* rrm_get_rrm_config(radio_type_t band)
 {
@@ -200,7 +202,7 @@ void set_rrm_parameters(rrm_entry_t *rrm_data)
 					if (vif->schema.enabled == 0) {
 						continue;
 					}
-					rrm_config_set(vif->schema.if_name, rrm_data);
+					// rrm_config_set(vif->schema.if_name, rrm_data);
 					continue;
 				}
 			}

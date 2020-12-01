@@ -162,12 +162,15 @@ int blob_to_uci_section(struct uci_context *uci,
 	ret = uci_lookup_ptr(uci, &p, tuple, true);
 	if (ret != UCI_OK)
 		goto err_out;
+	if (!a && !(p.flags | UCI_LOOKUP_COMPLETE))
+		goto err_out;
 	ret = uci_set(uci, &p);
 	if (ret != UCI_OK)
 		goto err_out;
 	if (del)
 		blob_to_uci_del(del, param, p.s);
-	blob_to_uci(a, param, p.s);
+	if (a)
+		blob_to_uci(a, param, p.s);
 
 err_out:
 	if (ret == UCI_OK)
