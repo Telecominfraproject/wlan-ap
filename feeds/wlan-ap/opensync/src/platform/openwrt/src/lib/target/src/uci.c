@@ -224,3 +224,35 @@ out:
 	uci_unload(uci, p);
         return ret;
 }
+
+int uci_append_list(struct uci_context *uci, char *package, char *section, char *option, char *value)
+{
+	struct uci_ptr ptr;
+	char tuple[128];
+	struct uci_element *e = NULL;
+
+	snprintf(tuple, sizeof(tuple), "%s.%s.%s", package, section, option);
+	if (UCI_OK != uci_lookup_ptr(uci, &ptr, tuple, true))
+		return -1;
+	/* Check if the new element already exists in the list. If yes, return */
+	if (ptr.o) {
+		switch(ptr.o->type) {
+		case UCI_TYPE_STRING:
+			if (!strcmp(ptr.o->v.string, value))
+				return 0;
+			break;
+		case UCI_TYPE_LIST:
+			uci_foreach_element(&ptr.o->v.list, e) {
+				if (!strcmp(e->name, value))
+					return 0;
+			}
+			break;
+		default:
+			LOG(ERR, "Unknown UCI list type");
+			break;
+		}
+	}
+	ptr.value = value;
+	uci_add_list(uci, &ptr);
+	return 0;
+}

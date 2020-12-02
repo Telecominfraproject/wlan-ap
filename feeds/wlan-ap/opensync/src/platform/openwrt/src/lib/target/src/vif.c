@@ -39,6 +39,8 @@ extern struct blob_buf del;
 struct blob_buf hs20 = { };
 struct blob_buf osu = { };
 
+struct blob_buf mesh = { };
+
 enum {
 	WIF_ATTR_DEVICE,
 	WIF_ATTR_IFNAME,
@@ -110,6 +112,9 @@ enum {
 	WIF_ATTR_RADIUS_NAS_ID_ATTR,
 	WIF_ATTR_RADIUS_AUTH_REQ_ATTR,
 	WIF_ATTR_RADIUS_ACCT_REQ_ATTR,
+	WIF_ATTR_MESH_ID,
+	WIF_ATTR_MESH_FWDING,
+	WIF_ATTR_MESH_MCAST_RATE,
 	__WIF_ATTR_MAX,
 };
 
@@ -184,11 +189,32 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_RADIUS_NAS_ID_ATTR] = { .name = "nasid", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_RADIUS_AUTH_REQ_ATTR] = { .name = "radius_auth_req_attr", BLOBMSG_TYPE_ARRAY },
 	[WIF_ATTR_RADIUS_ACCT_REQ_ATTR] = { .name = "radius_acct_req_attr", BLOBMSG_TYPE_ARRAY },
+	[WIF_ATTR_MESH_ID] = { .name = "mesh_id", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_MESH_FWDING] = { .name = "mesh_fwding", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_MESH_MCAST_RATE] = { .name = "mcast_rate", BLOBMSG_TYPE_INT32 },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
 	.n_params = __WIF_ATTR_MAX,
 	.params = wifi_iface_policy,
+};
+
+enum {
+	WIF_MESH_NW_MTU,
+	WIF_MESH_NW_PROTO,
+	WIF_MESH_NW_MASTER,
+	__WIF_MESH_NW_MAX,
+};
+
+static const struct blobmsg_policy wifi_mesh_nw_policy[__WIF_MESH_NW_MAX] = {
+		[WIF_MESH_NW_MTU] = { .name = "mtu", BLOBMSG_TYPE_INT32 },
+		[WIF_MESH_NW_PROTO] = { .name = "proto", BLOBMSG_TYPE_STRING },
+		[WIF_MESH_NW_MASTER] = { .name = "master", BLOBMSG_TYPE_STRING },
+};
+
+const struct uci_blob_param_list wifi_mesh_param = {
+		.n_params = __WIF_MESH_NW_MAX,
+		.params = wifi_mesh_nw_policy,
 };
 
 enum {
@@ -518,7 +544,7 @@ static void vif_state_custom_options_get(struct schema_Wifi_VIF_State *vstate,
 				set_custom_option_state(vstate, &index,
 							custom_options_table[i],
 							buf);
-			} 
+			}
 		} else if (strcmp(opt, "client_dl_limit") == 0) {
 			if (tb[WIF_ATTR_CDRATE]) {
 				buf = blobmsg_get_string(tb[WIF_ATTR_CDRATE]);
@@ -1072,11 +1098,76 @@ void vif_hs20_update(struct schema_Hotspot20_Config *hs2conf)
 	}
 }
 
-bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
-			    const struct schema_Wifi_Radio_Config *rconf,
-			    const struct schema_Wifi_Credential_Config *cconfs,
-			    const struct schema_Wifi_VIF_Config_flags *changed,
-			    int num_cconfs)
+/* Mesh options table */
+#define VIF_SCHEMA_MESH_OPT_SZ            32
+#define VIF_SCHEMA_MESH_OPTS_MAX          2
+
+const char vif_mesh_options_table[VIF_SCHEMA_MESH_OPTS_MAX][VIF_SCHEMA_MESH_OPT_SZ] =
+{
+		SCHEMA_CONSTS_MESH_MCAST_RATE,
+		SCHEMA_CONSTS_MESH_MTU,
+};
+
+static void vif_mesh_opt_set(struct blob_buf *b, struct blob_buf *b1,
+		const struct schema_Wifi_VIF_Config *vconf)
+{
+	int i;
+	const char *opt;
+	const char *val;
+
+	for (i = 0; i < VIF_SCHEMA_MESH_OPTS_MAX; i++) {
+		opt = vif_mesh_options_table[i];
+		val = SCHEMA_KEY_VAL_NULL(vconf->mesh_options, opt);
+
+		if (strcmp(opt, "mcast_rate") == 0) {
+			if (!val)
+				blobmsg_add_u32(b, "mcast_rate", 24000);
+			else
+				blobmsg_add_u32(b, "mcast_rate", atoi(val));
+		}
+		else if (strcmp(opt, "mtu") == 0) {
+			if (!val)
+				blobmsg_add_u32(b1, "mtu", 1532);
+			else
+				blobmsg_add_u32(b1, "mtu", atoi(val));
+		}
+	}
+}
+
+static void mesh_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
+			const struct schema_Wifi_VIF_Config *vconf,
+			const struct schema_Wifi_VIF_Config_flags *changed)
+{
+	blob_buf_init(&b, 0);
+	blob_buf_init(&mesh, 0);
+
+	blobmsg_add_string(&b, "ifname", vconf->if_name);
+	blobmsg_add_string(&b, "device", rconf->if_name);
+	blobmsg_add_string(&b, "mode", "mesh");
+
+	if (changed->enabled)
+		blobmsg_add_bool(&b, "disabled", vconf->enabled ? 0 : 1);
+
+	vif_config_security_set(&b, vconf);
+
+	blobmsg_add_string(&b, "network", vconf->if_name);
+	blobmsg_add_bool(&b, "mesh_fwding", 0);
+	blobmsg_add_string(&b, "mesh_id", vconf->ssid);
+	vif_mesh_opt_set(&b, &mesh, vconf);
+	blob_to_uci_section(uci, "wireless", vconf->if_name, "wifi-iface",
+			b.head, &wifi_iface_param, NULL);
+
+	blobmsg_add_string(&mesh, "proto", "batadv_hardif");
+	blobmsg_add_string(&mesh, "master", "bat0");
+	blob_to_uci_section(uci, "network", vconf->if_name, "interface",
+			mesh.head, &wifi_mesh_param, NULL);
+
+	reload_config = 1;
+}
+
+static void ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
+			const struct schema_Wifi_VIF_Config *vconf,
+			const struct schema_Wifi_VIF_Config_flags *changed)
 {
 	int vid = 0;
 
@@ -1181,14 +1272,29 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 		vlan_del((char *)vconf->if_name);
 
 	if (changed->captive_portal)
-			vif_captive_portal_set(vconf,(char*)vconf->if_name);
+		vif_captive_portal_set(vconf,(char*)vconf->if_name);
 
 	if(changed->captive_allowlist)
 	{
-			vif_dhcp_opennds_allowlist_set(vconf,(char*)vconf->if_name);
+		vif_dhcp_opennds_allowlist_set(vconf,(char*)vconf->if_name);
 	}
 
 	reload_config = 1;
+
+}
+
+bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
+			const struct schema_Wifi_Radio_Config *rconf,
+			const struct schema_Wifi_Credential_Config *cconfs,
+			const struct schema_Wifi_VIF_Config_flags *changed,
+			int num_cconfs)
+{
+
+	if (!strcmp(vconf->mode, "mesh")) {
+		mesh_vif_config_set(rconf, vconf, changed);
+	} else {
+		ap_vif_config_set(rconf, vconf, changed);
+	}
 
 	return true;
 }

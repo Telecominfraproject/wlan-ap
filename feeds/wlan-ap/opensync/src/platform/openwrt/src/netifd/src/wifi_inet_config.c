@@ -29,6 +29,15 @@ enum {
 	NET_ATTR_IP6ADDR,
 	NET_ATTR_GRE_REMOTE_ADDR,
 	NET_ATTR_GRE6_REMOTE_ADDR,
+	NET_ATTR_MESH_MCAST_FANOUT,
+	NET_ATTR_MESH_HOP_PENALTY,
+	NET_ATTR_MESH_MCAST_MODE,
+	NET_ATTR_MESH_DIST_ARP_TABLE,
+	NET_ATTR_MESH_BRIDGE_LOOP_AVOIDANCE,
+	NET_ATTR_MESH_AP_ISOLATION,
+	NET_ATTR_MESH_BONDING,
+	NET_ATTR_MESH_ORIG_INTERVAL,
+	NET_ATTR_MESH_GW_MODE,
 	__NET_ATTR_MAX,
 };
 
@@ -50,6 +59,15 @@ static const struct blobmsg_policy network_policy[__NET_ATTR_MAX] = {
 	[NET_ATTR_IP6ADDR] = { .name = "ip6addr", .type = BLOBMSG_TYPE_STRING },
 	[NET_ATTR_GRE_REMOTE_ADDR] = {.name = "peeraddr", .type = BLOBMSG_TYPE_STRING},
 	[NET_ATTR_GRE6_REMOTE_ADDR] = {.name = "peer6addr", .type = BLOBMSG_TYPE_STRING},
+	[NET_ATTR_MESH_MCAST_FANOUT] = { .name = "multicast_fanout", .type = BLOBMSG_TYPE_INT32 },
+	[NET_ATTR_MESH_HOP_PENALTY] = { .name = "hop_penalty", .type = BLOBMSG_TYPE_INT32 },
+	[NET_ATTR_MESH_MCAST_MODE] = { .name = "multicast_mode", .type = BLOBMSG_TYPE_BOOL },
+	[NET_ATTR_MESH_DIST_ARP_TABLE] = { .name = "distributed_arp_table", .type = BLOBMSG_TYPE_BOOL },
+	[NET_ATTR_MESH_BRIDGE_LOOP_AVOIDANCE] = { .name = "bridge_loop_avoidance", .type = BLOBMSG_TYPE_BOOL },
+	[NET_ATTR_MESH_AP_ISOLATION] = { .name = "ap_isolation", .type = BLOBMSG_TYPE_BOOL },
+	[NET_ATTR_MESH_BONDING] = { .name = "bonding", .type = BLOBMSG_TYPE_BOOL },
+	[NET_ATTR_MESH_ORIG_INTERVAL] = { .name = "orig_interval", .type = BLOBMSG_TYPE_INT32 },
+	[NET_ATTR_MESH_GW_MODE] = { .name = "gw_mode", .type = BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list network_param = {
@@ -62,6 +80,16 @@ ovsdb_table_t table_Wifi_Inet_Config;
 struct blob_buf b = { };
 struct blob_buf del = { };
 struct uci_context *uci;
+
+/* Mesh options table */
+#define SCHEMA_MESH_OPT_SZ            32
+#define SCHEMA_MESH_OPTS_MAX          2
+
+const char mesh_options_table[SCHEMA_MESH_OPTS_MAX][SCHEMA_MESH_OPT_SZ] =
+{
+		SCHEMA_CONSTS_MESH_MCAST_FANOUT,
+		SCHEMA_CONSTS_MESH_HOP_PENALTY,
+};
 
 static void wifi_inet_conf_load(struct uci_section *s)
 {
@@ -168,6 +196,32 @@ static void wifi_inet_conf_load(struct uci_section *s)
 		LOG(ERR, "inet_config: failed to insert");
 }
 
+static void mesh_opt_set(struct blob_buf *b,
+                                      const struct schema_Wifi_Inet_Config *iconf)
+{
+	int i;
+	const char *opt;
+	const char *val;
+
+	for (i = 0; i < SCHEMA_MESH_OPTS_MAX; i++) {
+		opt = mesh_options_table[i];
+		val = SCHEMA_KEY_VAL_NULL(iconf->mesh_options, opt);
+
+		if (strcmp(opt, "multicast_fanout") == 0) {
+			if (!val)
+				blobmsg_add_u32(b, "multicast_fanout", 16);
+			else
+				blobmsg_add_u32(b, "multicast_fanout", atoi(val));
+		}
+		else if (strcmp(opt, "hop_penalty") == 0) {
+			if (!val)
+				blobmsg_add_u32(b, "hop_penalty", 30);
+			else
+				blobmsg_add_u32(b, "hop_penalty", atoi(val));
+		}
+	}
+}
+
 static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 {
 	const char *lease_time = SCHEMA_FIND_KEY(iconf->dhcpd, "lease_time");
@@ -193,7 +247,7 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 		blobmsg_add_bool(&del, "disabled", 1);
 
 	if (!iconf->parent_ifname_exists && strcmp(iconf->if_type, "eth")
-		&& strcmp(iconf->if_type, "gre")) {
+		&& strcmp(iconf->if_type, "gre") && strcmp(iconf->if_type, "mesh")) {
 		blobmsg_add_string(&b, "type", iconf->if_type);
 		blobmsg_add_bool(&b, "vlan_filtering", 1);
 	} else if (!strcmp(iconf->if_type, "gre")) {
@@ -242,6 +296,19 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 		}
 	}
 
+	if (!strcmp(iconf->if_type, "mesh")) {
+		mesh_opt_set(&b, iconf);
+		blobmsg_add_string(&b, "proto", "batadv");
+		/* Defaults */
+		blobmsg_add_bool(&b, "multicast_mode", 1);
+		blobmsg_add_bool(&b, "distributed_arp_table", 1);
+		blobmsg_add_bool(&b, "bridge_loop_avoidance", 1);
+		blobmsg_add_bool(&b, "ap_isolation", 1);
+		blobmsg_add_bool(&b, "bonding", 1);
+		blobmsg_add_u32(&b, "orig_interval", 5000);
+		blobmsg_add_string(&b, "gw_mode", "off");
+	}
+
 	if (iconf->mtu_exists)
 		blobmsg_add_u32(&b, "mtu", iconf->mtu);
 	else
@@ -251,6 +318,12 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 	if (!iconf->parent_ifname_exists || iconf->vlan_id > 2) {
 		dhcp_add(iconf->if_name, lease_time, dhcp_start, dhcp_stop);
 		firewall_add_zone(iconf->if_name, iconf->NAT_exists && iconf->NAT);
+	}
+
+	if (!strcmp(iconf->if_type, "mesh")) {
+		/* Add batman virtual switch interface to br-lan */
+		uci_append_list(uci, "network", "lan", "ifname", iconf->if_name);
+		/* TODO Transparent Layer 2. Remove DHCP server from br-lan */
 	}
 
 	uci_commit_all(uci);
@@ -339,7 +412,7 @@ void wifi_inet_config_init(void)
 		if (!strcmp(s->type, "interface"))
 			wifi_inet_conf_load(s);
 	}
-
+	uci_unload(uci, network);
 	OVSDB_TABLE_MONITOR(Wifi_Inet_Config, false);
 	evsched_task(&periodic_task, NULL, EVSCHED_SEC(5));
 
