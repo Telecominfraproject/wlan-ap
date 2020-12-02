@@ -19,6 +19,7 @@ else
 	echo "### OpenWrt repo already setup"
 fi
 
+WIFI=wifi
 case "${TARGET}" in
 EA8300|\
 IPQ40XX)
@@ -36,13 +37,29 @@ AP2220)
 EC420)
 	TARGET=ec420
 	;;
+EAP101)
+	TARGET=eap101
+	WIFI=wifi-ax
+	;;
+EAP102)
+	TARGET=eap102
+	WIFI=wifi-ax
+	;;
+WF188N)
+	TARGET=wf188n
+	WIFI=wifi-ax
+	;;
+WF194C)
+	TARGET=wf194c
+	WIFI=wifi-ax
+	;;
 *)
 	echo "${TARGET} is unknown"
 	exit 1
 	;;
 esac
 cd ${BUILD_DIR}
-./scripts/gen_config.py ${TARGET} wlan-ap wifi || exit 1
+./scripts/gen_config.py ${TARGET} wlan-ap ${WIFI} || exit 1
 cd -
 
 echo "### Building image ..."
