@@ -15,4 +15,6 @@ extern int uci_section_del(struct uci_context *uci, char *prefix, char *package,
 extern void uci_commit_all(struct uci_context *uci);
 extern int uci_section_to_blob(struct uci_context *uci, char *package, char *section,
 			       struct blob_buf *buf, const struct uci_blob_param_list *param);
+int uci_append_list(struct uci_context *uci, char *package, char *section, char *option, char *value);
+
 #endif
