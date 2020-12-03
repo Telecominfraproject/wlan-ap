@@ -7,7 +7,7 @@ TARGET=${1}
 
 if [ -z "$1" ]; then
 	echo "Error: please specify TARGET"
-	echo "For example: IPQ40XX, ECW5410, AP2220, ECW5211 EC420"
+	echo "For example: IPQ40XX, ECW5410, AP2220, ECW5211 EC420 WF610D"
 	exit 1
 fi
 
@@ -52,6 +52,9 @@ WF188N)
 WF194C)
 	TARGET=wf194c
 	WIFI=wifi-ax
+	;;
+WF610D)
+	TARGET=wf610d
 	;;
 *)
 	echo "${TARGET} is unknown"
