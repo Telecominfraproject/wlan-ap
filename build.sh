@@ -64,5 +64,5 @@ cd -
 
 echo "### Building image ..."
 cd $BUILD_DIR
-make -j$(nproc) V=s 2>&1 | tee build.log
+make -j$(nproc) V=s
 echo "Done"
