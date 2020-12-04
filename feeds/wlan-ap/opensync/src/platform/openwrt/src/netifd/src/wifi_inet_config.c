@@ -231,7 +231,6 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 
 	if (!strcmp(iconf->if_type, "gre")) {
 		blobmsg_add_string(&b, "ifname", iconf->gre_ifname);
-		blobmsg_add_string(&b, "network", "lan");
 		if (!is_ipv6) {
 			blobmsg_add_string(&b, "proto", "gretap");
 			blobmsg_add_string(&b, "ipaddr", iconf->gre_local_inet_addr);
