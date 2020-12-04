@@ -241,6 +241,10 @@ static struct vif_crypto {
 	{ "wpa", OVSDB_SECURITY_ENCRYPTION_WPA_EAP, OVSDB_SECURITY_MODE_WPA1, 1 },
 	{ "wpa2", OVSDB_SECURITY_ENCRYPTION_WPA_EAP, OVSDB_SECURITY_MODE_WPA2, 1 },
 	{ "wpa-mixed", OVSDB_SECURITY_ENCRYPTION_WPA_EAP, OVSDB_SECURITY_MODE_MIXED, 1 },
+	{ "sae", OVSDB_SECURITY_ENCRYPTION_WPA_SAE, OVSDB_SECURITY_MODE_WPA3, 0 },
+	{ "sae-mixed", OVSDB_SECURITY_ENCRYPTION_WPA_SAE, OVSDB_SECURITY_MODE_MIXED, 0 },
+	{ "wpa3", OVSDB_SECURITY_ENCRYPTION_WPA3_EAP, OVSDB_SECURITY_MODE_WPA3, 1 },
+	{ "wpa3-mixed", OVSDB_SECURITY_ENCRYPTION_WPA3_EAP, OVSDB_SECURITY_MODE_MIXED, 1 },
 };
 
 static void vif_config_security_set(struct blob_buf *b,
@@ -315,7 +319,7 @@ static void vif_state_security_get(struct schema_Wifi_VIF_State *vstate,
 		if (!tb[WIF_ATTR_AUTH_SERVER] || !tb[WIF_ATTR_AUTH_PORT] || !tb[WIF_ATTR_AUTH_SECRET])
 			goto out_none;
 		vif_state_security_append(vstate, &index, OVSDB_SECURITY_ENCRYPTION,
-					  OVSDB_SECURITY_ENCRYPTION_WPA_EAP);
+					  vc->encryption);
 		vif_state_security_append(vstate, &index, OVSDB_SECURITY_MODE,
 					  vc->mode);
 		vif_state_security_append(vstate, &index, OVSDB_SECURITY_RADIUS_SERVER_IP,
@@ -338,7 +342,7 @@ static void vif_state_security_get(struct schema_Wifi_VIF_State *vstate,
 		if (!tb[WIF_ATTR_KEY])
 			goto out_none;
 		vif_state_security_append(vstate, &index, OVSDB_SECURITY_ENCRYPTION,
-					  OVSDB_SECURITY_ENCRYPTION_WPA_PSK);
+					  vc->encryption);
 		vif_state_security_append(vstate, &index, OVSDB_SECURITY_MODE,
 					  vc->mode);
 		vif_state_security_append(vstate, &index, OVSDB_SECURITY_KEY,
