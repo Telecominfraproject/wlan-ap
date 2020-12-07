@@ -34,6 +34,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <sys/types.h>
 #include <curl/curl.h>
 #include <time.h>
+#include <uci.h>
 #include "dhcpdiscovery.h"
 #include "vif.h"
 
