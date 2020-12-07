@@ -27,7 +27,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "target.h"
 #include <stdio.h>
 #include <stdbool.h>
-#include "iwinfo.h"
 
 #include "nl80211.h"
 #include "phy.h"
