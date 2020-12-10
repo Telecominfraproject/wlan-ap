@@ -354,9 +354,15 @@ static void nl80211_add_phy(struct nlattr **tb, char *name)
 						phy->chandisabled[chan] = 1;
 						continue;
 					}
+
+					if (tb_freq[NL80211_FREQUENCY_ATTR_RADAR]) {
+						phy->chandfs[chan] = 1;
+						LOGE("%s: found dfs channel %d", phy->name, chan);
+						continue;
+					}
 					phy->freq[chan] = freq;
 					phy->channel[chan] = 1;
-					phy->chandfs[chan] = 1;
+
 					if (tb_freq[NL80211_FREQUENCY_ATTR_MAX_TX_POWER] &&
 					    !tb_freq[NL80211_FREQUENCY_ATTR_DISABLED])
 						phy->chanpwr[chan] = nla_get_u32(tb_freq[NL80211_FREQUENCY_ATTR_MAX_TX_POWER]) / 10;
