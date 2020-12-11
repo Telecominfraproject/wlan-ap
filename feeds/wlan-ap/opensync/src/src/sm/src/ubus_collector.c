@@ -188,7 +188,7 @@ static int client_disconnect_event_cb(struct blob_attr *msg,
 	if (ssid_bytes > RADIO_ESSID_LEN)
 		return -1;
 
-	band = blobmsg_get_u8(
+	band = blobmsg_get_u32(
 		tb_client_disconnect_event[CLIENT_DISCONNECT_BAND]);
 	rssi = blobmsg_get_u32(
 		tb_client_disconnect_event[CLIENT_DISCONNECT_RSSI]);
@@ -262,7 +262,7 @@ static int client_auth_event_cb(struct blob_attr *msg,
 
 	timestamp =
 		blobmsg_get_u32(tb_client_auth_event[CLIENT_AUTH_TIMESTAMP]);
-	band = blobmsg_get_u8(tb_client_auth_event[CLIENT_AUTH_BAND]);
+	band = blobmsg_get_u32(tb_client_auth_event[CLIENT_AUTH_BAND]);
 	auth_status =
 		blobmsg_get_u32(tb_client_auth_event[CLIENT_AUTH_AUTH_STATUS]);
 
@@ -332,7 +332,7 @@ static int client_assoc_event_cb(struct blob_attr *msg,
 	if (ssid_bytes > RADIO_ESSID_LEN)
 		return -1;
 
-	band = blobmsg_get_u8(tb_client_assoc_event[CLIENT_ASSOC_BAND]);
+	band = blobmsg_get_u32(tb_client_assoc_event[CLIENT_ASSOC_BAND]);
 	assoc_type =
 		blobmsg_get_u8(tb_client_assoc_event[CLIENT_ASSOC_ASSOC_TYPE]);
 	rssi = blobmsg_get_u32(tb_client_assoc_event[CLIENT_ASSOC_RSSI]);
