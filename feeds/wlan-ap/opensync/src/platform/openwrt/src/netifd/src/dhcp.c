@@ -17,6 +17,7 @@ enum {
 	DHCP_ATTR_RA,
 	DHCP_ATTR_IGNORE,
 	DHCP_ATTR_AUTOGEN,
+	DHCP_ATTR_FORCE,
 	__DHCP_ATTR_MAX,
 };
 
@@ -29,6 +30,7 @@ static const struct blobmsg_policy dhcp_policy[__DHCP_ATTR_MAX] = {
 	[DHCP_ATTR_RA] = { .name = "ra", .type = BLOBMSG_TYPE_STRING },
 	[DHCP_ATTR_IGNORE] = { .name = "ignore", .type = BLOBMSG_TYPE_INT32 },
 	[DHCP_ATTR_AUTOGEN] = { .name = "autogen", .type = BLOBMSG_TYPE_INT32 },
+	[DHCP_ATTR_FORCE] = { .name = "force", .type = BLOBMSG_TYPE_INT32 },
 };
 
 const struct uci_blob_param_list dhcp_param = {
@@ -47,6 +49,7 @@ void dhcp_add(char *net, const char *lease_time, const char *start, const char *
 		blobmsg_add_string(&b, "dhcpv6", "server");
 		blobmsg_add_string(&b, "ra", "server");
 		blobmsg_add_u32(&b, "ignore", 0);
+		blobmsg_add_u32(&b, "force", 1);
 	} else {
 		blobmsg_add_u32(&b, "ignore", 1);
 	}
