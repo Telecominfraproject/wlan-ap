@@ -462,21 +462,70 @@ static void callback_Hotspot20_Config(ovsdb_update_monitor_t *mon,
 				 struct schema_Hotspot20_Config *old,
 				 struct schema_Hotspot20_Config *conf)
 {
-	vif_hs20_update(conf);
+
+	switch (mon->mon_type)
+	{
+	case OVSDB_UPDATE_NEW:
+	case OVSDB_UPDATE_MODIFY:
+		(void) 	vif_hs20_update(conf);
+		break;
+
+	case OVSDB_UPDATE_DEL:
+		break;
+
+	default:
+		LOG(ERR, "Hotspot20_Config: unexpected mon_type %d %s", mon->mon_type, mon->mon_uuid);
+		break;
+	}
+	return;
 }
 
 static void callback_Hotspot20_OSU_Providers(ovsdb_update_monitor_t *mon,
 				 struct schema_Hotspot20_OSU_Providers *old,
 				 struct schema_Hotspot20_OSU_Providers *conf)
 {
-	vif_hs20_osu_update(conf);
+	switch (mon->mon_type)
+	{
+	case OVSDB_UPDATE_NEW:
+	case OVSDB_UPDATE_MODIFY:
+		(void) 	vif_hs20_osu_update(conf);
+		break;
+
+	case OVSDB_UPDATE_DEL:
+		(void) vif_section_del("osu-provider");
+		break;
+
+	default:
+		LOG(ERR, "Hotspot20_OSU_Providers: unexpected mon_type %d %s",
+				mon->mon_type, mon->mon_uuid);
+		break;
+	}
+	return;
 }
 
 static void callback_Hotspot20_Icon_Config(ovsdb_update_monitor_t *mon,
 				 struct schema_Hotspot20_Icon_Config *old,
 				 struct schema_Hotspot20_Icon_Config *conf)
 {
-	vif_hs20_icon_update(conf);
+
+	switch (mon->mon_type)
+	{
+	case OVSDB_UPDATE_NEW:
+	case OVSDB_UPDATE_MODIFY:
+		(void) 	vif_hs20_icon_update(conf);
+		break;
+
+	case OVSDB_UPDATE_DEL:
+		(void) vif_section_del("hs20-icon");
+		break;
+
+	default:
+		LOG(ERR, "Hotspot20_Icon_Config: unexpected mon_type %d %s",
+				mon->mon_type, mon->mon_uuid);
+		break;
+	}
+	return;
+
 }
 
 bool target_radio_init(const struct target_radio_ops *ops)

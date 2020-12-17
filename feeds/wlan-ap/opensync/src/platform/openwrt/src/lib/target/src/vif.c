@@ -471,7 +471,7 @@ static void vif_config_custom_opt_set(struct blob_buf *b,
 			blobmsg_add_string(b, "dtim_period", value);
 		else if (strcmp(opt, "radius_nas_id") == 0)
 			blobmsg_add_string(b, "nasid", value);
-		else if (strcmp(opt, "radius_oper_name") == 0)
+		else if (strcmp(opt, "radius_oper_name") == 0 && strlen(value) > 0)
 		{
 			memset(operator_name, '\0', sizeof(operator_name));
 			sprintf(operator_name, "126:s:%s", value);
@@ -760,6 +760,34 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 size_t write_file(void *ptr, size_t size, size_t nmemb, FILE *stream) {
 	size_t written = fwrite(ptr, size, nmemb, stream);
 	return written;
+}
+
+void vif_section_del(char *section_name)
+{
+
+	struct uci_package *wireless;
+	struct uci_element *e = NULL, *tmp = NULL;
+	int ret=0;
+
+	ret= uci_load(uci, "wireless", &wireless);
+	if (ret) {
+		LOGD("%s: uci_load() failed with rc %d", section_name, ret);
+		return;
+	}
+	uci_foreach_element_safe(&wireless->sections, tmp, e) {
+		struct uci_section *s = uci_to_section(e);
+		if ((s == NULL) || (s->type == NULL)) continue;
+		if (!strcmp(s->type, section_name)) {
+			uci_section_del(uci, "vif", "wireless", (char *)s->e.name, section_name);
+		}
+		else {
+			continue;
+		}
+	}
+	uci_commit(uci, &wireless, false);
+	uci_unload(uci, wireless);
+	reload_config = 1;
+
 }
 
 static bool hs20_download_icon(char *icon_name, char *icon_url)
@@ -1068,7 +1096,7 @@ void vif_hs20_icon_update(struct schema_Hotspot20_Icon_Config *iconconf)
 		sprintf(path, "/tmp/%s", name);
 		blobmsg_add_string(&hs20, "path", path);
 
-		blob_to_uci_section(uci, "wireless", iconconf->name, "hs20-icon",
+		blob_to_uci_section(uci, "wireless", iconconf->icon_config_name, "hs20-icon",
 				hs20.head, &wifi_hs20_icon_param, NULL);
 		reload_config = 1;
 	}
