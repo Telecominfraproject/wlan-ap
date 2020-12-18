@@ -12,6 +12,7 @@
 #define DPP_REASON_STR_LEN 129
 #define DPP_CLT_ID_LEN 129
 #define MAC_ADDRESS_STRING_LEN 17
+#define IP_ADDRESS_STRING_LEN 15
 
 /* proto: EventType */
 typedef enum {
@@ -102,7 +103,7 @@ typedef struct {
 	radio_essid_t ssid;
 	sec_type_t sec_type;
 	bool fbt_used;
-	uint8_t ip_addr[16];
+	char ip_addr[IP_ADDRESS_STRING_LEN + 1];
 	char clt_id[DPP_CLT_ID_LEN];
 	int64_t ev_time_bootup_in_us_auth;
 	int64_t ev_time_bootup_in_us_assoc;
@@ -161,7 +162,7 @@ typedef struct {
 	char sta_mac[MAC_ADDRESS_STRING_LEN + 1];
 	uint64_t session_id;
 	uint32_t timestamp;
-	uint8_t ip_addr[16];
+	char ip_addr[IP_ADDRESS_STRING_LEN + 1];
 
 	ds_dlist_node_t node;
 } dpp_event_record_ip_t;

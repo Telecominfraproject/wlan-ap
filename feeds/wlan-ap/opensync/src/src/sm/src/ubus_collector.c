@@ -4,19 +4,20 @@
 #include <inttypes.h>
 
 /* Global list of events received from hostapd */
-dpp_event_report_data_t g_report_data;
+dpp_event_record_t g_event_record;
 
-/* Internal list of processed events ready to be deleted from hostapd */
-static dpp_event_report_data_t *deletion_pending = NULL;
 static struct ubus_context *ubus = NULL;
 static char *ubus_object = NULL;
+
+/* Internal list of processed events ready to be deleted from hostapd */
+static ds_dlist_t *session_deletion_pending_list = NULL;
 
 typedef struct {
 	uint64_t session_id;
 	char *bss;
 
 	ds_dlist_node_t node;
-} delete_entry_t;
+} session_delete_entry_t;
 
 static const struct blobmsg_policy ubus_collector_bss_list_policy[__BSS_LIST_DATA_MAX] = {
 	[BSS_LIST_BSS_LIST] = {.name = "bss_list", .type = BLOBMSG_TYPE_TABLE},
@@ -37,6 +38,7 @@ static const struct blobmsg_policy client_session_events_policy[__CLIENT_EVENTS_
 	[CLIENT_FAILURE_EVENT] = {.name = "ClientFailureEvent", .type = BLOBMSG_TYPE_TABLE},
 	[CLIENT_FIRST_DATA_EVENT] = {.name = "ClientFirstDataEvent", .type = BLOBMSG_TYPE_TABLE},
 	[CLIENT_TIMEOUT_EVENT] = {.name = "ClientTimeoutEvent", .type = BLOBMSG_TYPE_TABLE},
+	[CLIENT_IP_EVENT] = {.name = "ClientIpEvent", .type = BLOBMSG_TYPE_TABLE},
 	[CLIENT_SESSION_ID] = {.name = "session_id", .type = BLOBMSG_TYPE_INT64},
 };
 
@@ -81,6 +83,77 @@ static const struct blobmsg_policy client_first_data_event_policy[__CLIENT_FIRST
 	[CLIENT_FIRST_DATA_RX_TIMESTAMP] = {.name = "fdata_rx_up_ts_in_us", .type = BLOBMSG_TYPE_INT64},
 };
 
+static const struct blobmsg_policy client_ip_event_policy[__CLIENT_IP_MAX] = {
+	[CLIENT_IP_SESSION_ID] = {.name = "session_id", .type = BLOBMSG_TYPE_INT64},
+	[CLIENT_IP_TIMESTAMP] = {.name = "timestamp", .type = BLOBMSG_TYPE_INT32},
+	[CLIENT_IP_STA_MAC] = {.name = "sta_mac", .type = BLOBMSG_TYPE_STRING},
+	[CLIENT_IP_IP_ADDRESS] = {.name = "ip_address", .type = BLOBMSG_TYPE_STRING},
+};
+
+static int client_ip_event_cb(struct blob_attr *msg,
+				      dpp_event_record_session_t *dpp_session,
+				      uint64_t event_session_id)
+{
+	int error = 0;
+	struct blob_attr
+		*tb_client_ip_event[__CLIENT_IP_MAX] = {};
+	char *mac_address = NULL;
+	uint64_t session_id = event_session_id;
+	uint32_t timestamp = 0;
+	char *ip_address = NULL;
+	int i = 0;
+	dpp_event_record_ip_t *ip_event_dpp = NULL;
+
+	error = blobmsg_parse(client_ip_event_policy,
+			      __CLIENT_IP_MAX,
+			      tb_client_ip_event, blobmsg_data(msg),
+			      blobmsg_data_len(msg));
+	if (error)
+		return -1;
+
+	for (i = 0; i < __CLIENT_IP_MAX; i++) {
+		if (!tb_client_ip_event[i]) {
+			LOG(ERR,
+			    "ubus_collector: could not parse ip event %s policy",
+			    client_ip_event_policy[i].name);
+			return -1;
+		}
+	}
+
+	mac_address = blobmsg_get_string(
+		tb_client_ip_event[CLIENT_IP_STA_MAC]);
+	if (!mac_address)
+		return -1;
+
+
+	ip_address = blobmsg_get_string(
+		tb_client_ip_event[CLIENT_IP_IP_ADDRESS]);
+	if (!ip_address)
+		return -1;
+
+
+	timestamp = blobmsg_get_u32(
+		tb_client_ip_event[CLIENT_IP_TIMESTAMP]);
+
+
+	ip_event_dpp = calloc(1, sizeof(dpp_event_record_ip_t));
+
+	memcpy(ip_event_dpp->sta_mac, mac_address,
+	       MAC_ADDRESS_STRING_LEN);
+	memcpy(ip_event_dpp->ip_addr, ip_address,
+	       IP_ADDRESS_STRING_LEN);
+	ip_event_dpp->session_id = session_id;
+	ip_event_dpp->timestamp = timestamp;
+
+	if (!ds_dlist_is_empty(&dpp_session->ip_list))
+		ds_dlist_init(&dpp_session->ip_list,
+			      dpp_event_record_ip_t, node);
+
+	ds_dlist_insert_tail(&dpp_session->ip_list,
+			     ip_event_dpp);
+	return 0;
+}
+
 static int client_first_data_event_cb(struct blob_attr *msg,
 				      dpp_event_record_session_t *dpp_session,
 				      uint64_t event_session_id)
@@ -105,7 +178,7 @@ static int client_first_data_event_cb(struct blob_attr *msg,
 
 	for (i = 0; i < __CLIENT_FIRST_DATA_MAX; i++) {
 		if (!tb_client_first_data_event[i]) {
-			LOG(INFO,
+			LOG(ERR,
 			    "ubus_collector: could not parse first_data event %s policy",
 			    client_first_data_event_policy[i].name);
 			return -1;
@@ -170,7 +243,7 @@ static int client_disconnect_event_cb(struct blob_attr *msg,
 
 	for (i = 0; i < __CLIENT_DISCONNECT_MAX; i++) {
 		if (!tb_client_disconnect_event[i]) {
-			LOG(INFO,
+			LOG(ERR,
 			    "ubus_collector: could not parse disconnect event %s policy",
 			    client_disconnect_event_policy[i].name);
 			return -1;
@@ -188,7 +261,7 @@ static int client_disconnect_event_cb(struct blob_attr *msg,
 	if (ssid_bytes > RADIO_ESSID_LEN)
 		return -1;
 
-	band = blobmsg_get_u32(
+	band = blobmsg_get_u8(
 		tb_client_disconnect_event[CLIENT_DISCONNECT_BAND]);
 	rssi = blobmsg_get_u32(
 		tb_client_disconnect_event[CLIENT_DISCONNECT_RSSI]);
@@ -242,7 +315,7 @@ static int client_auth_event_cb(struct blob_attr *msg,
 
 	for (i = 0; i < __CLIENT_AUTH_MAX; i++) {
 		if (!tb_client_auth_event[i]) {
-			LOG(INFO,
+			LOG(ERR,
 			    "ubus_collector: could not parse auth event %s policy",
 			    client_auth_event_policy[i].name);
 			return -1;
@@ -262,7 +335,7 @@ static int client_auth_event_cb(struct blob_attr *msg,
 
 	timestamp =
 		blobmsg_get_u32(tb_client_auth_event[CLIENT_AUTH_TIMESTAMP]);
-	band = blobmsg_get_u32(tb_client_auth_event[CLIENT_AUTH_BAND]);
+	band = blobmsg_get_u8(tb_client_auth_event[CLIENT_AUTH_BAND]);
 	auth_status =
 		blobmsg_get_u32(tb_client_auth_event[CLIENT_AUTH_AUTH_STATUS]);
 
@@ -314,7 +387,7 @@ static int client_assoc_event_cb(struct blob_attr *msg,
 
 	for (i = 0; i < __CLIENT_ASSOC_MAX; i++) {
 		if (!tb_client_assoc_event[i]) {
-			LOG(INFO,
+			LOG(ERR,
 			    "ubus_collector: could not parse assoc event %s policy",
 			    client_assoc_event_policy[i].name);
 			return -1;
@@ -332,7 +405,7 @@ static int client_assoc_event_cb(struct blob_attr *msg,
 	if (ssid_bytes > RADIO_ESSID_LEN)
 		return -1;
 
-	band = blobmsg_get_u32(tb_client_assoc_event[CLIENT_ASSOC_BAND]);
+	band = blobmsg_get_u8(tb_client_assoc_event[CLIENT_ASSOC_BAND]);
 	assoc_type =
 		blobmsg_get_u8(tb_client_assoc_event[CLIENT_ASSOC_ASSOC_TYPE]);
 	rssi = blobmsg_get_u32(tb_client_assoc_event[CLIENT_ASSOC_RSSI]);
@@ -369,15 +442,16 @@ static int client_assoc_event_cb(struct blob_attr *msg,
 	return 0;
 }
 
-static int (*event_handler_list[__CLIENT_EVENTS_MAX - 1])(
+static int (*client_event_handler_list[__CLIENT_EVENTS_MAX - 1])(
 	struct blob_attr *msg, dpp_event_record_session_t *dpp_session,
 	uint64_t session_id) = {
 	client_assoc_event_cb,	    client_auth_event_cb,
 	client_disconnect_event_cb, NULL,
 	client_first_data_event_cb, NULL,
+	client_ip_event_cb,
 };
 
-static void ubus_collector_cb(struct ubus_request *req, int type,
+static void ubus_collector_session_cb(struct ubus_request *req, int type,
 			      struct blob_attr *msg)
 {
 	int error = 0;
@@ -385,12 +459,11 @@ static void ubus_collector_cb(struct ubus_request *req, int type,
 	struct blob_attr *tb_sessions[__UBUS_SESSIONS_MAX] = {};
 	struct blob_attr *tb_session = NULL;
 	struct blob_attr *tb_client_events[__CLIENT_EVENTS_MAX] = {};
-	dpp_event_record_t *dpp_client_session = NULL;
 	dpp_event_record_session_t *dpp_session = NULL;
 	uint64_t session_id = 0;
 	int session_no = 0;
 	char event_message[128] = {};
-	delete_entry_t *delete_entry = NULL;
+	session_delete_entry_t *session_delete_entry = NULL;
 	char *bss = req->priv;
 	int i = 0;
 	(void)type;
@@ -398,26 +471,16 @@ static void ubus_collector_cb(struct ubus_request *req, int type,
 	if (!msg)
 		goto error_out;
 
-	LOG(INFO, "ubus_collector: received ubus collector message");
+	LOG(DEBUG, "ubus_collector: received ubus collector message");
 
 	error = blobmsg_parse(ubus_collector_sessions_policy,
 			      __UBUS_SESSIONS_MAX, tb_sessions,
 			      blobmsg_data(msg), blobmsg_data_len(msg));
 	if (error || !tb_sessions[UBUS_COLLECTOR_SESSIONS]) {
-		LOG(INFO,
+		LOG(ERR,
 		    "ubus_collector: failed while parsing session policy");
 		goto error_out;
 	}
-
-	dpp_client_session = calloc(1, sizeof(dpp_event_record_t));
-	if (!dpp_client_session) {
-		LOG(INFO,
-		    "ubus_collector: not enough memory for dpp_client_session");
-		goto error_out;
-	}
-
-	ds_dlist_init(&dpp_client_session->client_session,
-		      dpp_event_record_session_t, node);
 
 	/* Iterating on multiple ClientSession types */
 	blobmsg_for_each_attr(tb_session, tb_sessions[UBUS_COLLECTOR_SESSIONS],
@@ -425,7 +488,7 @@ static void ubus_collector_cb(struct ubus_request *req, int type,
 	{
 		dpp_session = calloc(1, sizeof(dpp_event_record_session_t));
 		if (!dpp_session) {
-			LOG(INFO,
+			LOG(ERR,
 			    "ubus_collector: not enough memory for dpp_session");
 			goto error_out;
 		}
@@ -435,17 +498,17 @@ static void ubus_collector_cb(struct ubus_request *req, int type,
 				      blobmsg_data(tb_session),
 				      blobmsg_data_len(tb_session));
 		if (error) {
-			LOG(INFO,
+			LOG(ERR,
 			    "ubus_collector: failed while parsing client session events policy");
 			goto error_out;
 		}
 
 		session_no++;
-		LOG(INFO, "ubus_collector: processing session no %d",
+		LOG(ERR, "ubus_collector: processing session no %d",
 		    session_no);
 
 		if (!tb_client_events[CLIENT_SESSION_ID]) {
-			LOG(INFO,
+			LOG(ERR,
 			    "ubus_collector: failed while getting client session_id");
 			goto error_out;
 		}
@@ -459,63 +522,58 @@ static void ubus_collector_cb(struct ubus_request *req, int type,
 				snprintf(event_message, sizeof(event_message),
 					 "%s",
 					 client_session_events_policy[i].name);
-				LOG(INFO, "ubus_collector: processing %s",
+				LOG(DEBUG, "ubus_collector: processing %s",
 				    event_message);
 
-				if (!event_handler_list[i]) {
+				if (!client_event_handler_list[i]) {
 					snprintf(
 						event_message,
 						sizeof(event_message),
 						"Event %s - handler not implemented",
 						client_session_events_policy[i]
 							.name);
-					LOG(INFO, "ubus_collector: %s",
+					LOG(DEBUG, "ubus_collector: %s",
 					    event_message);
 					continue;
 				}
 
-				error = event_handler_list[i](
+				error = client_event_handler_list[i](
 					tb_client_events[i], dpp_session,
 					session_id);
 				if (error) {
-					LOG(INFO,
+					LOG(ERR,
 					    "ubus_collector: failed in event handler");
 					goto error_out;
 				}
 			}
 		}
 
-		ds_dlist_insert_tail(&dpp_client_session->client_session,
-				     dpp_session);
+		if (session_no)
+			ds_dlist_insert_tail(&g_event_record.client_session, dpp_session);
 		dpp_session = NULL;
 
 		/* Schedule session for deletion */
-		delete_entry = calloc(1, sizeof(delete_entry_t));
-		delete_entry->session_id = session_id;
-		delete_entry->bss = strdup(bss);
+		session_delete_entry = calloc(1, sizeof(session_delete_entry_t));
+		session_delete_entry->session_id = session_id;
+		session_delete_entry->bss = strdup(bss);
 
-		ds_dlist_insert_tail(&deletion_pending->list, delete_entry);
-		delete_entry = NULL;
+		ds_dlist_insert_tail(session_deletion_pending_list, session_delete_entry);
+		session_delete_entry = NULL;
 	}
-
-	/* Move all the sessions received from hostapd to global list accessible from sm_events */
-	if (session_no)
-		ds_dlist_insert_tail(&g_report_data.list, dpp_client_session);
 
 	goto out;
 
 error_out:
 	free(dpp_session);
-	free(dpp_client_session);
 	return;
 
 out:
-	LOG(INFO, "ubus_collector: successfull parse for AP object");
+	LOG(DEBUG, "ubus_collector: successfull parse for AP object");
 }
 
 static void ubus_collector_complete_cb(struct ubus_request *req, int ret)
 {
-	LOG(INFO, "ubus_collector: finished processing");
+	LOG(DEBUG, "ubus_collector: finished processing");
 	free(req);
 	return;
 }
@@ -528,16 +586,16 @@ static void ubus_collector_hostapd_invoke(void *arg)
 	struct ubus_request *req = malloc(sizeof(struct ubus_request));
 
 	if (ubus_lookup_id(ubus, object_path, &ubus_object_id)) {
-		LOG(INFO, "ubus_collector: could not find ubus object %s",
+		LOG(ERR, "ubus_collector: could not find ubus object %s",
 		    object_path);
 		free(req);
 		return;
 	}
 
-	LOG(INFO, "ubus_collector: requesting hostapd data");
+	LOG(DEBUG, "ubus_collector: requesting hostapd data");
 	ubus_invoke_async(ubus, ubus_object_id, hostapd_method, NULL, req);
 
-	req->data_cb = (ubus_data_handler_t)ubus_collector_cb;
+	req->data_cb = (ubus_data_handler_t)ubus_collector_session_cb;
 	req->complete_cb = (ubus_complete_handler_t)ubus_collector_complete_cb;
 	req->priv = arg;
 
@@ -553,26 +611,26 @@ static void ubus_collector_bss_cb(struct ubus_request *req, int type,
 	struct blob_attr *tb_bss_table[__BSS_TABLE_MAX] = {};
 	struct blob_attr *tb_bss_tbl = NULL;
 	char *bss_name = NULL;
-	dpp_event_report_data_t *bss_list = NULL;
-	delete_entry_t *bss_record = NULL;
+	ds_dlist_t *bss_list = NULL;
+	session_delete_entry_t *bss_record = NULL;
 	ds_dlist_iter_t record_iter;
 
 	if (!msg)
 		return;
 
-	LOG(INFO, "ubus_collector: received ubus collector bss message");
+	LOG(DEBUG, "ubus_collector: received ubus collector bss message");
 
 	error = blobmsg_parse(ubus_collector_bss_list_policy,
 			      __BSS_LIST_DATA_MAX, tb_bss_lst,
 			      blobmsg_data(msg), blobmsg_data_len(msg));
 	if (error || !tb_bss_lst[BSS_LIST_BSS_LIST]) {
-		LOG(INFO,
+		LOG(ERR,
 		    "ubus_collector: failed while parsing bss_list policy");
 		return;
 	}
 
-	bss_list = calloc(1, sizeof(dpp_event_report_data_t));
-	ds_dlist_init(&bss_list->list, delete_entry_t, node);
+	bss_list = calloc(1, sizeof(ds_dlist_t));
+	ds_dlist_init(bss_list, session_delete_entry_t, node);
 
 	/* itereate bss list */
 	blobmsg_for_each_attr(tb_bss_tbl, tb_bss_lst[BSS_LIST_BSS_LIST], rem)
@@ -582,7 +640,7 @@ static void ubus_collector_bss_cb(struct ubus_request *req, int type,
 				      blobmsg_data(tb_bss_tbl),
 				      blobmsg_data_len(tb_bss_tbl));
 		if (error) {
-			LOG(INFO,
+			LOG(ERR,
 			    "ubus_collector_ failed while parsing bss table policy");
 			continue;
 		}
@@ -590,33 +648,33 @@ static void ubus_collector_bss_cb(struct ubus_request *req, int type,
 		bss_name = strdup(
 			blobmsg_get_string(tb_bss_table[BSS_TABLE_BSS_NAME]));
 		if (!bss_name) {
-			LOG(INFO,
+			LOG(ERR,
 			    "ubus_collector: failed while getting bss_name");
 			continue;
 		}
 
-		bss_record = malloc(sizeof(delete_entry_t));
+		bss_record = malloc(sizeof(session_delete_entry_t));
 		bss_record->bss = bss_name;
 
-		ds_dlist_insert_tail(&bss_list->list, bss_record);
+		ds_dlist_insert_tail(bss_list, bss_record);
 	}
 
-	if (ds_dlist_is_empty(&bss_list->list)) {
-		LOG(INFO, "ubus_collector: no bss entries found");
+	if (ds_dlist_is_empty(bss_list)) {
+		LOG(ERR, "ubus_collector: no bss entries found");
 		free(bss_list);
 		return;
 	}
 
 	/* get sessions from current bss */
-	for (bss_record = ds_dlist_ifirst(&record_iter, &bss_list->list);
+	for (bss_record = ds_dlist_ifirst(&record_iter, bss_list);
 	     bss_record != NULL; bss_record = ds_dlist_inext(&record_iter)) {
-		LOG(INFO, "ubus_collector: processing bss %s", bss_record->bss);
+		LOG(DEBUG, "ubus_collector: processing bss %s", bss_record->bss);
 		ubus_collector_hostapd_invoke(bss_record->bss);
 
 		free(bss_record);
 	}
-
-	LOG(INFO, "ubus_collector: scanned all bss objects");
+	
+	LOG(DEBUG, "ubus_collector: scanned all bss objects");
 	free(bss_list);
 
 	return;
@@ -630,14 +688,14 @@ static void ubus_collector_hostapd_bss_invoke(void *arg)
 	struct ubus_request *req = malloc(sizeof(struct ubus_request));
 
 	if (ubus_lookup_id(ubus, object_path, &ubus_object_id)) {
-		LOG(INFO, "ubus_collector: could not find ubus object %s",
+		LOG(ERR, "ubus_collector: could not find ubus object %s",
 		    object_path);
 		free(req);
 		evsched_task_reschedule();
 		return;
 	}
 
-	LOG(INFO, "ubus_collector: requesting hostapd bss data");
+	LOG(DEBUG, "ubus_collector: requesting hostapd bss data");
 
 	ubus_invoke_async(ubus, ubus_object_id, hostapd_method, NULL, req);
 
@@ -657,7 +715,7 @@ static void ubus_collector_hostapd_clear(uint64_t session_id, char *bss)
 	struct ubus_request *req = malloc(sizeof(struct ubus_request));
 
 	if (ubus_lookup_id(ubus, object_path, &ubus_object_id)) {
-		LOG(INFO,
+		LOG(ERR,
 		    "ubus_collector: could not find the designated ubus object [%s]",
 		    object_path);
 		free(req);
@@ -671,7 +729,7 @@ static void ubus_collector_hostapd_clear(uint64_t session_id, char *bss)
 	blob_buf_init(&b, 0);
 	blobmsg_add_string(&b, "session_id", str);
 
-	LOG(INFO, "ubus_collector: deleting session [%s]", str);
+	LOG(DEBUG, "ubus_collector: deleting session [%s]", str);
 	ubus_invoke_async(ubus, ubus_object_id, hostapd_method, b.head, req);
 
 	req->data_cb = NULL;
@@ -682,25 +740,25 @@ static void ubus_collector_hostapd_clear(uint64_t session_id, char *bss)
 
 static void ubus_garbage_collector(void *arg)
 {
-	delete_entry_t *delete_entry = NULL;
+	session_delete_entry_t *session_delete_entry = NULL;
 
-	if (ds_dlist_is_empty(&deletion_pending->list)) {
+	if (ds_dlist_is_empty(session_deletion_pending_list)) {
 		evsched_task_reschedule();
 		return;
 	}
 
 	/* Remove a single session from the deletion list */
-	LOG(INFO, "ubus_collector: garbage collection");
+	LOG(DEBUG, "ubus_collector: garbage collection (session)");
 
-	delete_entry = ds_dlist_head(&deletion_pending->list);
-	if (delete_entry) {
-		if (delete_entry->session_id)
-			ubus_collector_hostapd_clear(delete_entry->session_id,
-						     delete_entry->bss);
+	session_delete_entry = ds_dlist_head(session_deletion_pending_list);
+	if (session_delete_entry) {
+		if (session_delete_entry->session_id)
+			ubus_collector_hostapd_clear(session_delete_entry->session_id,
+							 session_delete_entry->bss);
 
-		ds_dlist_remove_head(&deletion_pending->list);
-		free(delete_entry->bss);
-		free(delete_entry);
+		ds_dlist_remove_head(session_deletion_pending_list);
+		free(session_delete_entry->bss);
+		free(session_delete_entry);
 	}
 
 	evsched_task_reschedule();
@@ -714,21 +772,21 @@ int ubus_collector_init(void)
 
 	ubus = ubus_connect(UBUS_SOCKET);
 	if (!ubus) {
-		LOG(INFO, "ubus_collector: cannot find ubus socket");
+		LOG(ERR, "ubus_collector: cannot find ubus socket");
 		return -1;
 	}
 
 	/* Initialize the global events and event deletion lists */
-	ds_dlist_init(&g_report_data.list, dpp_event_record_session_t, node);
+	ds_dlist_init(&g_event_record.client_session, dpp_event_record_session_t, node);
 
-	deletion_pending = calloc(1, sizeof(dpp_event_record_session_t));
-	ds_dlist_init(&deletion_pending->list, delete_entry_t, node);
+	session_deletion_pending_list = calloc(1, sizeof(ds_dlist_t));
+	ds_dlist_init(session_deletion_pending_list, session_delete_entry_t, node);
 
 	/* Schedule an event: invoke hostapd ubus get bss list method  */
 	sched_status = evsched_task(&ubus_collector_hostapd_bss_invoke, NULL,
 				    EVSCHED_SEC(UBUS_POLLING_DELAY));
 	if (sched_status < 1) {
-		LOG(INFO, "ubus_collector: failed at task creation, status %d",
+		LOG(ERR, "ubus_collector: failed at task creation, status %d",
 		    sched_status);
 		return -1;
 	}
@@ -737,7 +795,7 @@ int ubus_collector_init(void)
 	sched_status = evsched_task(&ubus_garbage_collector, NULL,
 				    EVSCHED_SEC(UBUS_GARBAGE_COLLECTION_DELAY));
 	if (sched_status < 1) {
-		LOG(INFO, "ubus_collector: failed at task creation, status %d",
+		LOG(ERR, "ubus_collector: failed at task creation, status %d",
 		    sched_status);
 		return -1;
 	}
@@ -747,8 +805,8 @@ int ubus_collector_init(void)
 
 void ubus_collector_cleanup(void)
 {
-	LOG(INFO, "ubus_collector: cleaning up ubus collector");
+	LOG(DEBUG, "ubus_collector: cleaning up ubus collector");
 	ubus_free(ubus);
-	free(deletion_pending);
+	free(session_deletion_pending_list);
 	free(ubus_object);
 }
