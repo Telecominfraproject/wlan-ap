@@ -220,8 +220,9 @@ static int nl80211_survey_recv(struct nl_msg *msg, void *arg)
 		return NL_OK;
 
 	if (nla_parse_nested(si, NL80211_SURVEY_INFO_MAX,
-			     tb[NL80211_ATTR_SURVEY_INFO], sp))
+			     tb[NL80211_ATTR_SURVEY_INFO], sp)) {
 		return NL_SKIP;
+	}
 
 	survey_record = target_survey_record_alloc();
 	if (si[NL80211_SURVEY_INFO_FREQUENCY])
@@ -248,6 +249,8 @@ static int nl80211_survey_recv(struct nl_msg *msg, void *arg)
 
 	if (si[NL80211_SURVEY_INFO_NOISE])
 		survey_record->chan_noise = nla_get_u8(si[NL80211_SURVEY_INFO_NOISE]);
+
+	survey_record->chan_in_use=si[NL80211_SURVEY_INFO_IN_USE] ? 1:0;
 
 	ds_dlist_insert_tail(nl_call_param->list, survey_record);
 
