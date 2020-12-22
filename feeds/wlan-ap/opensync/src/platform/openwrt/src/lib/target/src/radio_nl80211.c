@@ -31,13 +31,24 @@
 #include <libubox/vlist.h>
 #include <unl.h>
 
+#include <sys/time.h>
+
 #include "target.h"
 #include "nl80211.h"
 #include "phy.h"
 #include "utils.h"
 #include "radio.h"
 
+#include "ovsdb.h"
+#include "ovsdb_update.h"
+#include "ovsdb_sync.h"
+#include "ovsdb_table.h"
+#include "ovsdb_cache.h"
+#include "schema.h"
+
+#define STA_POLL_INTERVAL 10
 extern struct ev_loop *wifihal_evloop;
+extern ovsdb_table_t table_Wifi_VIF_State;
 static struct unl unl;
 static ev_io unl_io;
 
@@ -161,6 +172,8 @@ static void vif_update_stats(struct wifi_station *sta, struct nlattr **tb)
 		sta->rx_bytes = nla_get_u32(sinfo[NL80211_STA_INFO_RX_BYTES]);
 	if (sinfo[NL80211_STA_INFO_TX_BYTES])
 		sta->tx_bytes = nla_get_u32(sinfo[NL80211_STA_INFO_TX_BYTES]);
+
+	sta->last_update = time(NULL);
 }
 
 static void nl80211_add_station(struct nlattr **tb, char *ifname)
@@ -199,8 +212,10 @@ static void nl80211_add_station(struct nlattr **tb, char *ifname)
 	vif_update_stats(sta, tb);
 }
 
-static void _nl80211_del_station(struct wifi_station *sta)
+static void _nl80211_del_station(char *ifname, struct wifi_station *sta)
 {
+	vif_del_sta_rate_rule(sta->addr, ifname);
+	vif_add_station(sta, ifname, 0);
 	list_del(&sta->iface);
 	avl_delete(&sta_tree, &sta->avl);
 	free(sta);
@@ -221,10 +236,75 @@ static void nl80211_del_station(struct nlattr **tb, char *ifname)
 		return;
 	}
 
-	vif_del_sta_rate_rule(addr, ifname);
-	vif_add_station(sta, ifname, 0);
+	_nl80211_del_station(ifname, sta);
+}
 
-	_nl80211_del_station(sta);
+static void vif_sync_stations(char *ifname)
+{
+	struct schema_Wifi_Associated_Clients *ovs_clients = NULL;
+	struct schema_Wifi_VIF_State vstate;
+	json_t *where = NULL;
+	struct wifi_station *sta = NULL, *tmp = NULL;
+	int i = 0;
+	uint32_t j = 0;
+	char mac[ETH_ALEN * 3];
+
+	if (!(where = ovsdb_where_simple(SCHEMA_COLUMN(Wifi_VIF_State, if_name), ifname)))
+		return;
+	if (!ovsdb_table_select_one_where(&table_Wifi_VIF_State, where, &vstate))
+		return;
+	if (WARN_ON(!(ovs_clients = calloc(vstate.associated_clients_len, sizeof(*ovs_clients)))))
+		return;
+
+	for (i = 0; i < vstate.associated_clients_len; i++) {
+		j = 0;
+		avl_for_each_element_safe(&sta_tree, sta, avl, tmp) {
+			j++;
+
+			if (strcasecmp(ifname, sta->parent->name))
+				continue;
+
+			print_mac(mac, sta->addr);
+			if (!strcasecmp(ovs_clients[i].mac, mac))
+				break;
+		}
+		if (sta_tree.count > 0 && sta_tree.count == j)
+			radio_ops->op_client(ovs_clients + i, ifname, false);
+	}
+
+	avl_for_each_element_safe(&sta_tree, sta, avl, tmp) {
+
+		if (strcasecmp(ifname, sta->parent->name))
+			continue;
+
+		print_mac(mac, sta->addr);
+		for (i = 0; i < vstate.associated_clients_len; i++)
+			if (!strcasecmp(mac, ovs_clients[i].mac))
+				break;
+		if (i == vstate.associated_clients_len)
+			vif_add_station(sta, ifname, true);
+	}
+
+	free(ovs_clients);
+
+}
+
+static void remove_stale_station(char *ifname)
+{
+	struct wifi_station *sta = NULL, *tmp = NULL;
+	char mac[ETH_ALEN * 3];
+	time_t timeout = 0, t = 0;
+
+	avl_for_each_element_safe(&sta_tree, sta, avl, tmp) {
+		timeout = sta->last_update + (EVSCHED_SEC(STA_POLL_INTERVAL*2));
+		t = time(NULL);
+		if (t > timeout) {
+			print_mac(mac, sta->addr);
+			LOGN("%s: Remove stale STA %s %ld %ld %ld", __func__, mac,
+					t, timeout, sta->last_update);
+			_nl80211_del_station(ifname, sta);
+		}
+	}
 }
 
 static void nl80211_add_iface(struct nlattr **tb, char *ifname, char *phyname, int ifidx)
@@ -262,7 +342,7 @@ static void _nl80211_del_iface(struct wifi_iface *wif)
 
  	list_del(&wif->phy);
 	list_for_each_entry_safe(sta, tmp, &wif->stas, iface)
-		_nl80211_del_station(sta);
+		_nl80211_del_station(wif->name, sta);
 	avl_delete(&wif_tree, &wif->avl);
 	free(wif);
 }
@@ -482,14 +562,17 @@ static void vif_poll_stations(void *arg)
 {
 	 struct wifi_iface *wif = NULL;
 
+
 	avl_for_each_element(&wif_tree, wif, avl) {
 		struct nl_msg *msg;
 
 		msg = unl_genl_msg(&unl, NL80211_CMD_GET_STATION, true);
 		nla_put_u32(msg, NL80211_ATTR_IFINDEX, wif->ifidx);
 		unl_genl_request(&unl, msg, nl80211_recv, NULL);
+		remove_stale_station(wif->name);
+		vif_sync_stations(wif->name);
 	}
-	evsched_task_reschedule_ms(EVSCHED_SEC(10));
+	evsched_task_reschedule_ms(EVSCHED_SEC(STA_POLL_INTERVAL));
 }
 
 int radio_nl80211_init(void)
