@@ -52,6 +52,7 @@ struct wifi_station {
 	uint32_t tx_packets;
 	uint32_t rx_bytes;
 	uint32_t tx_bytes;
+	time_t last_update;
 };
 
 extern int radio_nl80211_init(void);
