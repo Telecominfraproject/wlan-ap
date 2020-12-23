@@ -361,7 +361,8 @@ bool target_radio_config_init2(void)
 {
 	struct schema_Wifi_Radio_Config rconf;
 	struct schema_Wifi_VIF_Config vconf;
-	struct uci_element *e = NULL;
+	struct uci_element *e = NULL, *tmp = NULL;
+	int invalidVifFound = 0;
 
 	uci_load(uci, "wireless", &wireless);
 	uci_foreach_element(&wireless->sections, e) {
@@ -371,11 +372,22 @@ bool target_radio_config_init2(void)
 			radio_state_update(s, &rconf, false);
 	}
 
-	uci_foreach_element(&wireless->sections, e) {
+	uci_foreach_element_safe(&wireless->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
+		int radio_idx;
 
-		if (!strcmp(s->type, "wifi-iface"))
-			vif_state_update(s, &vconf);
+		if (!strcmp(s->type, "wifi-iface")) {
+			if (sscanf((char*)s->e.name, "wlan%d", &radio_idx)) {
+				vif_state_update(s, &vconf);
+			} else {
+				uci_section_del(uci, "vif", "wireless", (char *)s->e.name, "wifi-iface");
+				invalidVifFound = 1;
+			}
+		}
+	}
+	if (invalidVifFound) {
+		uci_commit(uci, &wireless, false);
+		reload_config = 1;
 	}
 	uci_unload(uci, wireless);
 
