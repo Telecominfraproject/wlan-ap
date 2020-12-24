@@ -55,8 +55,6 @@ typedef struct {
 	bool using11k;
 	bool using11r;
 	bool using11v;
-
-	ds_dlist_node_t node;
 } dpp_event_record_assoc_t;
 
 /* proto: ClientAuthEvent */
@@ -68,8 +66,6 @@ typedef struct {
 	radio_essid_t ssid;
 	radio_type_t band;
 	uint32_t auth_status;
-
-	ds_dlist_node_t node;
 } dpp_event_record_auth_t;
 
 /* proto: ClientDisconnectEvent */
@@ -87,8 +83,6 @@ typedef struct {
 	int32_t rssi;
 	radio_essid_t ssid;
 	radio_type_t band;
-
-	ds_dlist_node_t node;
 } dpp_event_record_disconnect_t;
 
 /* proto: ClientConnectEvent */
@@ -115,8 +109,6 @@ typedef struct {
 	bool using11v;
 	int64_t ev_time_bootup_in_us_ip;
 	int32_t assoc_rssi;
-
-	ds_dlist_node_t node;
 } dpp_event_record_connect_t;
 
 /* proto: ClientFailureEvent */
@@ -128,8 +120,6 @@ typedef struct {
 	radio_essid_t ssid;
 	int32_t reason;
 	char reason_str[DPP_REASON_STR_LEN];
-
-	ds_dlist_node_t node;
 } dpp_event_record_failure_t;
 
 /* proto: ClientFirstDataEvent */
@@ -140,8 +130,6 @@ typedef struct {
 	uint32_t timestamp;
 	uint64_t fdata_tx_up_ts_in_us;
 	uint64_t fdata_rx_up_ts_in_us;
-
-	ds_dlist_node_t node;
 } dpp_event_record_first_data_t;
 
 /* proto: ClientIdEvent */
@@ -151,8 +139,6 @@ typedef struct {
 	uint64_t session_id;
 	uint32_t timestamp;
 	char clt_id[DPP_CLT_ID_LEN];
-
-	ds_dlist_node_t node;
 } dpp_event_record_id_t;
 
 /* proto: ClientIpEvent */
@@ -162,8 +148,6 @@ typedef struct {
 	uint64_t session_id;
 	uint32_t timestamp;
 	uint8_t ip_addr[16];
-
-	ds_dlist_node_t node;
 } dpp_event_record_ip_t;
 
 /* proto: ClientTimeoutEvent */
@@ -175,29 +159,27 @@ typedef struct {
 	ct_reason_t r_code;
 	uint64_t last_sent_up_ts_in_us;
 	uint64_t last_recv_up_ts_in_us;
-
-	ds_dlist_node_t node;
 } dpp_event_record_timeout_t;
 
 /* proto: ClientSession */
 typedef struct {
 	uint64_t session_id;
-	ds_dlist_t assoc_list; /* dpp_event_record_assoc_t */
-	ds_dlist_t auth_list; /* dpp_event_record_auth_t */
-	ds_dlist_t disconnect_list; /* dpp_event_record_disconnect_t */
-	ds_dlist_t failure_list; /* dpp_event_record_failure_t */
-	ds_dlist_t first_data_list; /* dpp_event_record_first_data_t */
-	ds_dlist_t id_list; /* dpp_event_record_id_t */
-	ds_dlist_t ip_list; /* dpp_event_record_ip_t */
-	ds_dlist_t timeout_list; /* dpp_event_record_timeout_t */
-	ds_dlist_t connect_list; /* dpp_event_record_connect_t */
+	dpp_event_record_assoc_t *assoc_event; /* dpp_event_record_assoc_t */
+	dpp_event_record_auth_t *auth_event; /* dpp_event_record_auth_t */
+	dpp_event_record_disconnect_t *disconnect_event; /* dpp_event_record_disconnect_t */
+	dpp_event_record_failure_t *failure_event; /* dpp_event_record_failure_t */
+	dpp_event_record_first_data_t *first_data_event; /* dpp_event_record_first_data_t */
+	dpp_event_record_id_t *id_event; /* dpp_event_record_id_t */
+	dpp_event_record_ip_t *ip_event; /* dpp_event_record_ip_t */
+	dpp_event_record_timeout_t *timeout_event; /* dpp_event_record_timeout_t */
+	dpp_event_record_connect_t *connect_event; /* dpp_event_record_connect_t */
 
-	ds_dlist_node_t node;
 } dpp_event_record_session_t;
 
 /* event record */
 typedef struct {
-	ds_dlist_t client_session; /* dpp_event_record_session_t */
+	dpp_event_record_session_t client_session; /* dpp_event_record_session_t */
+	bool hasSMProcessed;
 
 	ds_dlist_node_t node;
 } dpp_event_record_t;
@@ -448,9 +430,31 @@ dpp_event_client_session_record_free(dpp_event_record_session_t *record)
 	}
 }
 
+static inline dpp_event_record_t *
+dpp_event_record_alloc()
+{
+	dpp_event_record_t *record = NULL;
+
+	record = calloc(1, sizeof(dpp_event_record_t));
+	if (record) {
+		memset(record, 0, sizeof(dpp_event_record_t));
+	}
+	return record;
+}
+
+/* free */
+static inline void
+dpp_event_record_free(dpp_event_record_t *record)
+{
+	if (NULL != record) {
+		free(record);
+	}
+}
+
+
 /* Events report type */
 typedef struct {
-	ds_dlist_t list; /* dpp_event_record_t */
+	ds_dlist_t client_event_list; /* dpp_event_record_t */
 } dpp_event_report_data_t;
 
 #endif /* DPP_EVENTS_H_INCLUDED */
