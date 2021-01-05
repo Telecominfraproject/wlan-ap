@@ -43,6 +43,7 @@ static const struct blobmsg_policy client_session_events_policy[__CLIENT_EVENTS_
 	[CLIENT_FAILURE_EVENT] = {.name = "ClientFailureEvent", .type = BLOBMSG_TYPE_TABLE},
 	[CLIENT_FIRST_DATA_EVENT] = {.name = "ClientFirstDataEvent", .type = BLOBMSG_TYPE_TABLE},
 	[CLIENT_TIMEOUT_EVENT] = {.name = "ClientTimeoutEvent", .type = BLOBMSG_TYPE_TABLE},
+	[CLIENT_IP_EVENT] = {.name = "ClientIpEvent", .type = BLOBMSG_TYPE_TABLE},
 	[CLIENT_SESSION_ID] = {.name = "session_id", .type = BLOBMSG_TYPE_INT64},
 };
 
@@ -85,6 +86,13 @@ static const struct blobmsg_policy client_first_data_event_policy[__CLIENT_FIRST
 	[CLIENT_FIRST_DATA_TIMESTAMP] = {.name = "timestamp", .type = BLOBMSG_TYPE_INT32},
 	[CLIENT_FIRST_DATA_TX_TIMESTAMP] = {.name = "fdata_tx_up_ts_in_us", .type = BLOBMSG_TYPE_INT64},
 	[CLIENT_FIRST_DATA_RX_TIMESTAMP] = {.name = "fdata_rx_up_ts_in_us", .type = BLOBMSG_TYPE_INT64},
+};
+
+static const struct blobmsg_policy client_ip_event_policy[__CLIENT_IP_MAX] = {
+	[CLIENT_IP_SESSION_ID] = {.name = "session_id", .type = BLOBMSG_TYPE_INT64},
+	[CLIENT_IP_TIMESTAMP] = {.name = "timestamp", .type = BLOBMSG_TYPE_INT32},
+	[CLIENT_IP_STA_MAC] = {.name = "sta_mac", .type = BLOBMSG_TYPE_STRING},
+	[CLIENT_IP_IP_ADDRESS] = {.name = "ip_address", .type = BLOBMSG_TYPE_STRING},
 };
 
 static int frequency_to_channel(int freq)
@@ -319,12 +327,53 @@ static int client_assoc_event_cb(struct blob_attr *msg,
 	return 0;
 }
 
+static int client_ip_event_cb(struct blob_attr *msg,
+				dpp_event_record_session_t *dpp_session,
+				uint64_t event_session_id)
+{
+	int error = 0;
+	struct blob_attr *tb_client_ip_event[__CLIENT_IP_MAX] = {};
+	char *mac_address, *ip_address = NULL;
+
+	if (NULL == dpp_session)
+		return -1;
+
+	error = blobmsg_parse(client_ip_event_policy, __CLIENT_IP_MAX,
+			      tb_client_ip_event, blobmsg_data(msg),
+			      blobmsg_data_len(msg));
+	if (error)
+		return -1;
+
+	dpp_session->ip_event = dpp_event_client_ip_record_alloc();
+
+	if (!dpp_session->ip_event)
+		return -1;
+
+	dpp_session->ip_event->session_id = event_session_id;
+
+	if (tb_client_ip_event[CLIENT_IP_STA_MAC]) {
+		mac_address = blobmsg_get_string(tb_client_ip_event[CLIENT_IP_STA_MAC]);
+		memcpy(dpp_session->ip_event->sta_mac, mac_address, MAC_ADDRESS_STRING_LEN);
+	}
+
+	if (tb_client_ip_event[CLIENT_IP_IP_ADDRESS]) {
+		ip_address = blobmsg_get_string(tb_client_ip_event[CLIENT_IP_IP_ADDRESS]);
+		memcpy(dpp_session->ip_event->ip_addr, ip_address, IP_ADDRESS_STRING_LEN);
+	}
+
+	if (tb_client_ip_event[CLIENT_IP_TIMESTAMP])
+		dpp_session->ip_event->timestamp = blobmsg_get_u32(tb_client_ip_event[CLIENT_IP_TIMESTAMP]);
+
+	return 0;
+}
+
 static int (*client_event_handler_list[__CLIENT_EVENTS_MAX - 1])(
 	struct blob_attr *msg, dpp_event_record_session_t *dpp_session,
 	uint64_t session_id) = {
-	client_assoc_event_cb,	    client_auth_event_cb,
+	client_assoc_event_cb, client_auth_event_cb,
 	client_disconnect_event_cb, NULL,
 	client_first_data_event_cb, NULL,
+	client_ip_event_cb,
 };
 
 
