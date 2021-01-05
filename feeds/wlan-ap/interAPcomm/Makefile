@@ -22,15 +22,12 @@ endef
 define Build/InstallDev
 	$(INSTALL_DIR) $(1)/usr/lib
 	$(INSTALL_DIR) $(1)/usr/include/interap
-	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(CP) $(PKG_BUILD_DIR)/include/* $(1)/usr/include/interap/
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/libinterapcomm.so $(1)/usr/lib/
 endef
 
 define Package/libinterapcomm/install
 	$(INSTALL_DIR) $(1)/usr/lib
-	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/libinterapcomm.so $(1)/usr/lib/
-	$(INSTALL_DATA) ./files/etc/uci-defaults/* $(1)/etc/uci-defaults/
 endef
 $(eval $(call BuildPackage,libinterapcomm))
