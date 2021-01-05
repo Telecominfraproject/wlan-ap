@@ -228,6 +228,8 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 	else if (!phy_get_band(phy, rstate.freq_band))
 		rstate.freq_band_exists = true;
 
+	rstate.channels_len = phy_get_channels_state(phy, &rstate);
+
 	if (strcmp(rstate.freq_band, "2.4G"))	{
                 STRSCPY(rstate.hw_config_keys[0], "dfs_enable");
                 snprintf(rstate.hw_config[0], sizeof(rstate.hw_config[0]), "1");

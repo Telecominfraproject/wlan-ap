@@ -8,6 +8,8 @@ extern int phy_get_mac(char *phy, char *mac);
 extern int phy_find_hwmon(char *path, char *hwmon);
 extern int phy_get_tx_chainmask(const char *name);
 extern int phy_get_channels(const char *name, int *channel);
+extern int phy_get_channels_state(const char *name,
+			struct schema_Wifi_Radio_State *rstate);
 extern int phy_get_band(const char *name, char *band);
 extern int phy_is_ready(const char *name);
 extern int phy_lookup(char *name);

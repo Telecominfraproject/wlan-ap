@@ -222,6 +222,58 @@ int phy_get_channels(const char *name, int *channel)
 	return j;
 }
 
+static void update_channels_state(struct schema_Wifi_Radio_State *rstate,
+			int *index, const char *key, int *value, int value_len)
+{
+	int y, z = 0;
+	char str[256];
+
+	STRSCPY(rstate->channels_keys[*index], key);
+
+	for (y = 0; y < value_len; y++)
+		z += sprintf(&str[z], "%d,", value[y]);
+
+	memcpy(rstate->channels[*index], str, z);
+	*index = *index + 1;
+}
+
+int phy_get_channels_state(const char *name, struct schema_Wifi_Radio_State *rstate)
+{
+	struct wifi_phy *phy = phy_find(name);
+	int i, j = 0, k = 0, l = 0;
+	int dis[64], allow[64], radar[64];
+	int ret = 0;
+
+	if (!phy)
+		return 0;
+
+	LOGN("phy name :%s", name);
+
+	for (i = 0; (i < IEEE80211_CHAN_MAX); i++) {
+		if (phy->chandisabled[i]) {
+			dis[j] = i;
+			j++;
+		} else if (phy->chandfs[i]) {
+			radar[k] = i;
+			k++;
+		} else if (phy->channel[i]) {
+			allow[l] = i;
+			l++;
+		}
+	}
+
+	if (j)
+		update_channels_state(rstate, &ret, "disabled", dis, j);
+
+	if (k)
+		update_channels_state(rstate, &ret, "radar_detection", radar, k);
+
+	if (l)
+		update_channels_state(rstate, &ret, "allowed", allow, l);
+
+	return ret;
+}
+
 int phy_get_band(const char *name, char *band)
 {
 	struct wifi_phy *phy = phy_find(name);
