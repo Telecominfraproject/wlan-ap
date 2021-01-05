@@ -22,20 +22,20 @@ void ubus_collector_cleanup(void);
 
 #define UBUS_SOCKET "/var/run/ubus.sock"
 
-/* Poll ubus after this many seconds */
-#define UBUS_POLLING_DELAY 7
+/* Poll bss list after this many seconds */
+#define UBUS_BSS_POLLING_DELAY 7
+
+/* Poll sessions after this many seconds */
+#define UBUS_SESSIONS_POLLING_DELAY 9
 
 /* Poll the session clearing 'garbage collector' after this many seconds */
 #define UBUS_GARBAGE_COLLECTION_DELAY 1
 
+#define UBUS_OBJ_LEN 64
+
 enum {
 	UBUS_COLLECTOR_SESSIONS,
 	__UBUS_SESSIONS_MAX,
-};
-
-enum {
-	UBUS_CLIENT_SESSION,
-	__UBUS_SESSION_TYPES_MAX,
 };
 
 enum {
@@ -100,7 +100,7 @@ enum {
 };
 
 enum {
-	BSS_TABLE_BSS_NAME,
+	BSS_OBJECT_NAME,
 	__BSS_TABLE_MAX,
 };
 
