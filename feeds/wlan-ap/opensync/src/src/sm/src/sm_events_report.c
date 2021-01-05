@@ -123,6 +123,7 @@ static void sm_events_report(EV_P_ ev_timer *w, int revents)
 		dpp_record->client_session.first_data_event =  sm_record->client_session.first_data_event;
 		dpp_record->client_session.disconnect_event =  sm_record->client_session.disconnect_event;
 		dpp_record->client_session.auth_event =  sm_record->client_session.auth_event;
+		dpp_record->client_session.ip_event =  sm_record->client_session.ip_event;
 
 		/* Memset all event pointers in the global event record to NULL */
 		memset(&sm_record->client_session, 0, sizeof(dpp_event_record_session_t));
