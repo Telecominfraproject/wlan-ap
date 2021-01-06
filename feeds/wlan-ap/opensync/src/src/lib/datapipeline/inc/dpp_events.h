@@ -13,6 +13,7 @@
 #define DPP_CLT_ID_LEN 129
 #define MAC_ADDRESS_STRING_LEN 17
 #define IP_ADDRESS_STRING_LEN 15
+#define HOSTNAME_LEN 64
 
 /* proto: EventType */
 typedef enum {
@@ -177,13 +178,92 @@ typedef struct {
 
 } dpp_event_record_session_t;
 
-/* event record */
+typedef struct {
+	char __barrier[46];
+	uint32_t x_id;
+	uint32_t vlan_id;
+	char dhcp_server_ip[IP_ADDRESS_STRING_LEN + 1];
+	char client_ip[IP_ADDRESS_STRING_LEN + 1];
+	char relay_ip[IP_ADDRESS_STRING_LEN + 1];
+	char device_mac_address[MAC_ADDRESS_STRING_LEN + 1];
+	uint64_t timestamp_ms;
+} dpp_event_record_dhcp_common_data_t;
+
+/* proto: DhcpAckEvent */
+typedef struct {
+	dpp_event_record_dhcp_common_data_t dhcp_common_data;
+	char subnet_mask[IP_ADDRESS_STRING_LEN + 1];
+	char primary_dns[IP_ADDRESS_STRING_LEN + 1];
+	char secondary_dns[IP_ADDRESS_STRING_LEN + 1];
+	uint32_t lease_time;
+	uint32_t renewal_time;
+	uint32_t rebinding_time;
+	uint32_t time_offset;
+	char gateway_ip[IP_ADDRESS_STRING_LEN + 1];
+} dpp_event_record_dhcp_ack_t;
+
+/* proto: DhcpNakEvent */
+typedef struct {
+	dpp_event_record_dhcp_common_data_t dhcp_common_data;
+	bool from_internal;
+} dpp_event_record_dhcp_nak_t;
+
+/* proto: DhcpOfferEvent */
+typedef struct {
+	dpp_event_record_dhcp_common_data_t dhcp_common_data;
+	bool from_internal;
+} dpp_event_record_dhcp_offer_t;
+
+/* proto: DhcpInformEvent */
+typedef struct {
+	dpp_event_record_dhcp_common_data_t dhcp_common_data;
+} dpp_event_record_dhcp_inform_t;
+
+/* proto: DhcpDeclineEvent */
+typedef struct {
+	dpp_event_record_dhcp_common_data_t dhcp_common_data;
+} dpp_event_record_dhcp_decline_t;
+
+/* proto: DhcpRequestEvent */
+typedef struct {
+	dpp_event_record_dhcp_common_data_t dhcp_common_data;
+	char hostname[HOSTNAME_LEN];
+} dpp_event_record_dhcp_request_t;
+
+/* proto: DhcpDiscoverEvent */
+typedef struct {
+	dpp_event_record_dhcp_common_data_t dhcp_common_data;
+	char hostname[HOSTNAME_LEN];
+} dpp_event_record_dhcp_discover_t;
+
+/* proto: DhcpTransaction */
+typedef struct {
+	uint32_t x_id;
+	dpp_event_record_dhcp_ack_t *dhcp_ack_event; /* dpp_event_record_dhcp_ack_t */
+	dpp_event_record_dhcp_nak_t *dhcp_nak_event; /* dpp_event_record_dhcp_nak_t */
+	dpp_event_record_dhcp_offer_t *dhcp_offer_event; /* dpp_event_record_dhcp_offer_t */
+	dpp_event_record_dhcp_inform_t *dhcp_inform_event; /* dpp_event_record_dhcp_inform_t */
+	dpp_event_record_dhcp_decline_t *dhcp_decline_event; /* dpp_event_record_dhcp_decline_t */
+	dpp_event_record_dhcp_request_t *dhcp_request_event; /* dpp_event_record_dhcp_request_t */
+	dpp_event_record_dhcp_discover_t *dhcp_discover_event; /* dpp_event_record_dhcp_discover_t */
+
+} dpp_event_record_dhcp_transaction_t;
+
+/* client event record */
 typedef struct {
 	dpp_event_record_session_t client_session; /* dpp_event_record_session_t */
 	bool hasSMProcessed;
 
 	ds_dlist_node_t node;
-} dpp_event_record_t;
+} dpp_event_record_client_t;
+
+/* dhcp event record */
+typedef struct {
+	dpp_event_record_dhcp_transaction_t dhcp_transaction; /*dpp_event_record_dhcp_transaction_t */
+	bool hasSMProcessed;
+
+	ds_dlist_node_t node;
+} dpp_event_record_dhcp_t;
 
 /*******************************/
 /* ClientAssocEvent alloc/free */
@@ -431,31 +511,258 @@ dpp_event_client_session_record_free(dpp_event_record_session_t *record)
 	}
 }
 
-static inline dpp_event_record_t *
-dpp_event_record_alloc()
+/*********************************/
+/* Client Event Record alloc/free */
+/*********************************/
+static inline dpp_event_record_client_t *
+dpp_event_client_record_alloc()
 {
-	dpp_event_record_t *record = NULL;
+	dpp_event_record_client_t *record = NULL;
 
-	record = calloc(1, sizeof(dpp_event_record_t));
+	record = calloc(1, sizeof(dpp_event_record_client_t));
 	if (record) {
-		memset(record, 0, sizeof(dpp_event_record_t));
+		memset(record, 0, sizeof(dpp_event_record_client_t));
 	}
 	return record;
 }
 
 /* free */
 static inline void
-dpp_event_record_free(dpp_event_record_t *record)
+dpp_event_client_record_free(dpp_event_record_client_t *record)
 {
 	if (NULL != record) {
 		free(record);
 	}
 }
 
+/*********************************/
+/* DhcpAckEvent alloc/free */
+/*********************************/
+/* alloc */
+static inline dpp_event_record_dhcp_ack_t *
+dpp_event_dhcp_ack_record_alloc()
+{
+	dpp_event_record_dhcp_ack_t *record = NULL;
+
+	record = malloc(sizeof(dpp_event_record_dhcp_ack_t));
+	if (record) {
+		memset(record, 0, sizeof(dpp_event_record_dhcp_ack_t));
+	}
+	return record;
+}
+
+/* free */
+static inline void
+dpp_event_dhcp_ack_record_free(dpp_event_record_dhcp_ack_t *record)
+{
+	if (NULL != record) {
+		free(record);
+	}
+}
+
+/*********************************/
+/* DhcpNakEvent alloc/free */
+/*********************************/
+/* alloc */
+static inline dpp_event_record_dhcp_nak_t *
+dpp_event_dhcp_nak_record_alloc()
+{
+	dpp_event_record_dhcp_nak_t *record = NULL;
+
+	record = malloc(sizeof(dpp_event_record_dhcp_nak_t));
+	if (record) {
+		memset(record, 0, sizeof(dpp_event_record_dhcp_nak_t));
+	}
+	return record;
+}
+
+/* free */
+static inline void
+dpp_event_dhcp_nak_record_free(dpp_event_record_dhcp_nak_t *record)
+{
+	if (NULL != record) {
+		free(record);
+	}
+}
+
+/*********************************/
+/* DhcpOfferEvent alloc/free */
+/*********************************/
+/* alloc */
+static inline dpp_event_record_dhcp_offer_t *
+dpp_event_dhcp_offer_record_alloc()
+{
+	dpp_event_record_dhcp_offer_t *record = NULL;
+
+	record = malloc(sizeof(dpp_event_record_dhcp_offer_t));
+	if (record) {
+		memset(record, 0, sizeof(dpp_event_record_dhcp_offer_t));
+	}
+	return record;
+}
+
+/* free */
+static inline void
+dpp_event_dhcp_offer_record_free(dpp_event_record_dhcp_offer_t *record)
+{
+	if (NULL != record) {
+		free(record);
+	}
+}
+
+/*********************************/
+/* DhcpInformEvent alloc/free */
+/*********************************/
+/* alloc */
+static inline dpp_event_record_dhcp_inform_t *
+dpp_event_dhcp_inform_record_alloc()
+{
+	dpp_event_record_dhcp_inform_t *record = NULL;
+
+	record = malloc(sizeof(dpp_event_record_dhcp_inform_t));
+	if (record) {
+		memset(record, 0, sizeof(dpp_event_record_dhcp_inform_t));
+	}
+	return record;
+}
+
+/* free */
+static inline void
+dpp_event_dhcp_inform_record_free(dpp_event_record_dhcp_inform_t *record)
+{
+	if (NULL != record) {
+		free(record);
+	}
+}
+
+/*********************************/
+/* DhcpDeclineEvent alloc/free */
+/*********************************/
+/* alloc */
+static inline dpp_event_record_dhcp_decline_t *
+dpp_event_dhcp_decline_record_alloc()
+{
+	dpp_event_record_dhcp_decline_t *record = NULL;
+
+	record = malloc(sizeof(dpp_event_record_dhcp_decline_t));
+	if (record) {
+		memset(record, 0, sizeof(dpp_event_record_dhcp_decline_t));
+	}
+	return record;
+}
+
+/* free */
+static inline void
+dpp_event_dhcp_decline_record_free(dpp_event_record_dhcp_decline_t *record)
+{
+	if (NULL != record) {
+		free(record);
+	}
+}
+
+/*********************************/
+/* DhcpRequestEvent alloc/free */
+/*********************************/
+/* alloc */
+static inline dpp_event_record_dhcp_request_t *
+dpp_event_dhcp_request_record_alloc()
+{
+	dpp_event_record_dhcp_request_t *record = NULL;
+
+	record = malloc(sizeof(dpp_event_record_dhcp_request_t));
+	if (record) {
+		memset(record, 0, sizeof(dpp_event_record_dhcp_request_t));
+	}
+	return record;
+}
+
+/* free */
+static inline void
+dpp_event_dhcp_request_record_free(dpp_event_record_dhcp_request_t *record)
+{
+	if (NULL != record) {
+		free(record);
+	}
+}
+
+/*********************************/
+/* DhcpDiscoverEvent alloc/free */
+/*********************************/
+/* alloc */
+static inline dpp_event_record_dhcp_discover_t *
+dpp_event_dhcp_discover_record_alloc()
+{
+	dpp_event_record_dhcp_discover_t *record = NULL;
+
+	record = malloc(sizeof(dpp_event_record_dhcp_discover_t));
+	if (record) {
+		memset(record, 0, sizeof(dpp_event_record_dhcp_discover_t));
+	}
+	return record;
+}
+
+/* free */
+static inline void
+dpp_event_dhcp_discover_record_free(dpp_event_record_dhcp_discover_t *record)
+{
+	if (NULL != record) {
+		free(record);
+	}
+}
+
+/*********************************/
+/* DhcpTransaction alloc/free */
+/*********************************/
+/* alloc */
+static inline dpp_event_record_dhcp_transaction_t *
+dpp_event_dhcp_transaction_record_alloc()
+{
+	dpp_event_record_dhcp_transaction_t *record = NULL;
+
+	record = malloc(sizeof(dpp_event_record_dhcp_transaction_t));
+	if (record) {
+		memset(record, 0, sizeof(dpp_event_record_dhcp_transaction_t));
+	}
+	return record;
+}
+
+/* free */
+static inline void
+dpp_event_dhcp_transaction_record_free(dpp_event_record_dhcp_transaction_t *record)
+{
+	if (NULL != record) {
+		free(record);
+	}
+}
+
+/*********************************/
+/* Dhcp Event Record alloc/free */
+/*********************************/
+static inline dpp_event_record_dhcp_t *
+dpp_event_dhcp_record_alloc()
+{
+	dpp_event_record_dhcp_t *record = NULL;
+
+	record = calloc(1, sizeof(dpp_event_record_dhcp_t));
+	if (record) {
+		memset(record, 0, sizeof(dpp_event_record_dhcp_t));
+	}
+	return record;
+}
+
+/* free */
+static inline void
+dpp_event_dhcp_record_free(dpp_event_record_dhcp_t *record)
+{
+	if (NULL != record) {
+		free(record);
+	}
+}
 
 /* Events report type */
 typedef struct {
-	ds_dlist_t client_event_list; /* dpp_event_record_t */
+	ds_dlist_t client_event_list; /* dpp_event_record_client_t */
+	ds_dlist_t dhcp_event_list; /* dpp_event_record_dhcp_t */
 } dpp_event_report_data_t;
 
 #endif /* DPP_EVENTS_H_INCLUDED */
