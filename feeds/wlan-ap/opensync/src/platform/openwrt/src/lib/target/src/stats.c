@@ -266,7 +266,7 @@ bool target_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
 	return ret;
 }
 
-#define PERCENT(v1, v2) (v2 > 0 ? (v1*100/v2) : 0)
+#define PERCENT(v1, v2) (v2 > 0 ? ((v1 > v2) ? 100 : (v1*100/v2)) : 0)
 
 bool target_stats_survey_convert(radio_entry_t *radio_cfg, radio_scan_type_t scan_type,
 				 target_survey_record_t *data_new, target_survey_record_t *data_old,
