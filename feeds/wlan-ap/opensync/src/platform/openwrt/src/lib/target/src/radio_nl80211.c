@@ -49,6 +49,7 @@
 #define STA_POLL_INTERVAL 10
 extern struct ev_loop *wifihal_evloop;
 extern ovsdb_table_t table_Wifi_VIF_State;
+extern ovsdb_table_t table_Wifi_Associated_Clients;
 static struct unl unl;
 static ev_io unl_io;
 
@@ -257,19 +258,30 @@ static void vif_sync_stations(char *ifname)
 		return;
 
 	for (i = 0; i < vstate.associated_clients_len; i++) {
+		if (WARN_ON(!(where = ovsdb_where_uuid("_uuid", vstate.associated_clients[i].uuid))))
+			goto free;
+		if (WARN_ON(!ovsdb_table_select_one_where(&table_Wifi_Associated_Clients, where, ovs_clients + i)))
+			goto free;
+	}
+
+	for (i = 0; i < vstate.associated_clients_len; i++) {
 		j = 0;
 		avl_for_each_element_safe(&sta_tree, sta, avl, tmp) {
-			j++;
-
-			if (strcasecmp(ifname, sta->parent->name))
+			if (strcasecmp(ifname, sta->parent->name)) {
+				j++;
 				continue;
-
+			}
 			print_mac(mac, sta->addr);
 			if (!strcasecmp(ovs_clients[i].mac, mac))
 				break;
+			j++;
 		}
 		if (sta_tree.count > 0 && sta_tree.count == j)
+		{
+			LOGI("%s: remove stale client %s", ifname, ovs_clients[i].mac);
 			radio_ops->op_client(ovs_clients + i, ifname, false);
+		}
+
 	}
 
 	avl_for_each_element_safe(&sta_tree, sta, avl, tmp) {
@@ -282,11 +294,15 @@ static void vif_sync_stations(char *ifname)
 			if (!strcasecmp(mac, ovs_clients[i].mac))
 				break;
 		if (i == vstate.associated_clients_len)
+		{
+			LOGI("%s: add client %s", ifname, mac);
 			vif_add_station(sta, ifname, true);
+		}
+
 	}
 
+free:
 	free(ovs_clients);
-
 }
 
 static void remove_stale_station(char *ifname)
