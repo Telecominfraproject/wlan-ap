@@ -1,0 +1,218 @@
+track dhcp requested_options fingerprint
+
+Index: dnsmasq-2.80/src/dnsmasq.h
+===================================================================
+--- dnsmasq-2.80.orig/src/dnsmasq.h
++++ dnsmasq-2.80/src/dnsmasq.h
+@@ -703,6 +703,7 @@ struct dhcp_lease {
+   unsigned char *clid;   /* clientid */
+   char *hostname, *fqdn; /* name from client-hostname option or config */
+   char *old_hostname;    /* hostname before it moved to another lease */
++  char *fingerprint;     /* DHCP fingerprint                          */
+   int flags;
+   time_t expires;        /* lease expiry */
+ #ifdef HAVE_BROKEN_RTC
+@@ -1406,6 +1407,7 @@ void lease_find_interfaces(time_t now);
+ void lease_add_extradata(struct dhcp_lease *lease, unsigned char *data, 
+ 			 unsigned int len, int delim);
+ #endif
++void lease_add_fingerprint(struct dhcp_lease *lease, unsigned char *req_options);
+ #endif
+ 
+ /* rfc2131.c */
+Index: dnsmasq-2.80/src/lease.c
+===================================================================
+--- dnsmasq-2.80.orig/src/lease.c
++++ dnsmasq-2.80/src/lease.c
+@@ -21,8 +21,10 @@
+ static struct dhcp_lease *leases = NULL, *old_leases = NULL;
+ static int dns_dirty, file_dirty, leases_left;
+ 
++#define SZ_FINGERPRINT  (256)
+ static int read_leases(time_t now, FILE *leasestream)
+ {
++  char finger_buf[SZ_FINGERPRINT];
+   unsigned long ei;
+   union all_addr addr;
+   struct dhcp_lease *lease;
+@@ -58,8 +60,8 @@ static int read_leases(time_t now, FILE
+ 	  }
+ #endif
+ 	
+-	if (fscanf(leasestream, " %64s %255s %764s",
+-		   daemon->namebuff, daemon->dhcp_buff, daemon->packet) != 3)
++	if (fscanf(leasestream, " %64s %255s %255s %764s",
++		   daemon->namebuff, daemon->dhcp_buff, finger_buf, daemon->packet) != 3)
+ 	  {
+ 	    my_syslog(MS_DHCP | LOG_WARNING, _("ignoring invalid line in lease database: %s %s %s %s ..."),
+ 		      daemon->dhcp_buff3, daemon->dhcp_buff2,
+@@ -116,6 +118,13 @@ static int read_leases(time_t now, FILE
+ 	if (strcmp(daemon->dhcp_buff, "*") !=  0)
+ 	  lease_set_hostname(lease, daemon->dhcp_buff, 0, domain, NULL);
+ 
++	if (strcmp(finger_buf, "*") != 0)
++	  {
++	    lease->fingerprint = whine_malloc(SZ_FINGERPRINT);
++	    if (lease->fingerprint)
++	      strlcpy(lease->fingerprint, finger_buf, SZ_FINGERPRINT);
++	  }
++
+ 	ei = atol(daemon->dhcp_buff3);
+ 
+ #ifdef HAVE_BROKEN_RTC
+@@ -248,6 +257,23 @@ static void ourprintf(int *errp, char *f
+   va_end(ap);
+ }
+ 
++int lock_file(int fd, int lock)
++{
++  struct flock fl;
++
++  fl.l_type = lock ? F_WRLCK : F_UNLCK;
++  fl.l_whence = SEEK_SET;
++  fl.l_start = 0;
++  fl.l_len = 0;
++
++  if (fcntl(fd, F_SETLKW, &fl) == -1)
++  {
++      return 1;
++  }
++
++  return 0;
++}
++
+ void lease_update_file(time_t now)
+ {
+   struct dhcp_lease *lease;
+@@ -257,6 +283,11 @@ void lease_update_file(time_t now)
+   if (file_dirty != 0 && daemon->lease_stream)
+     {
+       errno = 0;
++      if (lock_file(fileno(daemon->lease_stream), 1) != 0)
++      {
++          err = errno;
++      }
++
+       rewind(daemon->lease_stream);
+       if (errno != 0 || ftruncate(fileno(daemon->lease_stream), 0) != 0)
+ 	err = errno;
+@@ -288,6 +319,7 @@ void lease_update_file(time_t now)
+ 
+ 	  ourprintf(&err, " %s ", daemon->addrbuff);
+ 	  ourprintf(&err, "%s ", lease->hostname ? lease->hostname : "*");
++	  ourprintf(&err, "%s ", lease->fingerprint ? lease->fingerprint : "*");
+ 	  	  
+ 	  if (lease->clid && lease->clid_len != 0)
+ 	    {
+@@ -324,6 +356,8 @@ void lease_update_file(time_t now)
+ 	      ourprintf(&err, "%s%u %s ", (lease->flags & LEASE_TA) ? "T" : "",
+ 			lease->iaid, daemon->addrbuff);
+ 	      ourprintf(&err, "%s ", lease->hostname ? lease->hostname : "*");
++	      /* DHCPv6 doesn't support fingerprinting, add a dummy entry */
++	      ourprintf(&err, "%s ", "*");
+ 	      
+ 	      if (lease->clid && lease->clid_len != 0)
+ 		{
+@@ -341,6 +375,10 @@ void lease_update_file(time_t now)
+ 	  fsync(fileno(daemon->lease_stream)) < 0)
+ 	err = errno;
+       
++      /* Unlock file */
++      if (lock_file(fileno(daemon->lease_stream), 0) != 0)
++        err = errno;
++
+       if (!err)
+ 	file_dirty = 0;
+     }
+@@ -564,6 +602,12 @@ void lease_prune(struct dhcp_lease *targ
+ 	  if (lease->hostname)
+ 	    dns_dirty = 1;
+ 
++          if (lease->fingerprint)
++            {
++             free(lease->fingerprint);
++              lease->fingerprint = NULL;
++            }
++
+ 	  daemon->metrics[lease->addr.s_addr ? METRIC_LEASES_PRUNED_4 : METRIC_LEASES_PRUNED_6]++;
+ 
+  	  *up = lease->next; /* unlink */
+@@ -1197,6 +1241,57 @@ void lease_add_extradata(struct dhcp_lea
+ }
+ #endif
+ 
++void lease_add_fingerprint(struct dhcp_lease *lease, unsigned char *req_options)
++{
++  unsigned int i, len, left;
++
++  if (req_options == NULL || req_options[0] == OPTION_END)
++  {
++    /*
++     * We were given empty options -- we are not allowed to generate an empty fingerprint string, in such case
++     * it should be set to NULL instead of ""
++     */
++    if (lease->fingerprint != NULL)
++      free(lease->fingerprint);
++
++    lease->fingerprint = NULL;
++    return;
++  }
++
++  if (lease->fingerprint == NULL)
++  {
++    lease->fingerprint = whine_malloc(SZ_FINGERPRINT);
++    if (lease->fingerprint == NULL)
++      return;
++  }
++
++  char *q = lease->fingerprint;
++  for (i = 0; req_options[i] != OPTION_END; i++)
++  {
++    left = (SZ_FINGERPRINT - (q - lease->fingerprint));
++    len  = snprintf(q,
++                    left,
++                    "%d%s",
++                    req_options[i],
++                    req_options[i+1] == OPTION_END ? "" : ",");
++    /*
++     * snprintf returns len that would have been written, not
++     * how much was actually written. This means return value
++     * can be higher then max length provided
++     */
++    if (len > left) {
++      /*
++       * Not enough room to append the entire otpion,
++       * so truncate after last option
++       */
++      *(q-1) = '\0';
++      break;
++    }
++    q += len;
++  }
++}
++
++
+ #endif
+ 	  
+ 
+Index: dnsmasq-2.80/src/rfc2131.c
+===================================================================
+--- dnsmasq-2.80.orig/src/rfc2131.c
++++ dnsmasq-2.80/src/rfc2131.c
+@@ -1299,6 +1299,16 @@ size_t dhcp_reply(struct dhcp_context *c
+ 	    }
+ 	}
+ 
++      /* get options information                */
++      if (lease)
++        {
++          lease_add_fingerprint(lease, req_options);
++        }
++      else
++        {
++          my_syslog(LOG_INFO, "fingerprint: lease is null ");
++        }
++
+       if (message)
+ 	{
+ 	  daemon->metrics[rapid_commit ? METRIC_NOANSWER : METRIC_DHCPNAK]++;
