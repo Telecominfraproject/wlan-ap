@@ -348,6 +348,20 @@ return view.extend({
 		}, this));
 	},
 
+	handleLANSettingsSave: function(formdata, ev) {
+		var m = L.dom.findClassInstance(document.querySelector('.cbi-map'));
+
+		return m.save().then(L.bind(function() {
+
+			var lan = formdata.data.data.lan
+
+			uci.set('network', 'lan', 'ipaddr', lan.addr);
+			uci.set('network', 'lan', 'netmask', lan.mask);
+
+			return this.handleApply();
+		}, this));
+	},
+
 	handleApply: function() {
 		var dlg = ui.showModal(null, [ E('em', { 'class': 'spinning' }, [ _('Saving configuration…') ]) ]);
 		dlg.removeChild(dlg.firstElementChild);
@@ -374,6 +388,10 @@ return view.extend({
 			uci.get('network', 'wan', 'gateway'),
 			uci.get('network', 'wan', 'dns'));
 
+		var addr_lan = parseAddressAndNetmask(
+			uci.get('network', 'lan', 'ipaddr'),
+			uci.get('network', 'lan', 'netmask'));
+
 		var formdata = {
 			wan: {
 				proto: uci.get('network', 'wan', 'proto'),
@@ -381,6 +399,10 @@ return view.extend({
 				mask: addr_wan ? addr_wan[1] : null,
 				gateway: addr_wan ? addr_wan[1] : null,
 				dns: addr_wan ? addr_wan[1] : null
+			},
+			lan: {
+				addr: addr_lan ? addr_lan[0] : null,
+				mask: addr_lan ? addr_lan[1] : null,
 			},
 			maintenance: {},
 			certificates: {redirector: null}
@@ -421,6 +443,16 @@ return view.extend({
 		o.rmempty = false;
 		o.datatype = 'ip4addr("nomask")';
 		o.depends('proto', 'static');
+
+		s = m.section(form.NamedSection, 'lan', 'lan', _('LAN'));
+
+		o = s.option(form.Value, 'addr', _('IP Address'));
+		o.rmempty = false;
+		o.datatype = 'ip4addr("nomask")';
+
+		o = s.option(form.Value, 'mask', _('Netmask'));
+		o.rmempty = false;
+		o.datatype = 'ip4addr("nomask")';
 
 		o = s.option(form.Button, 'save', _(''));
 		o.inputtitle = _('Save Settings');
