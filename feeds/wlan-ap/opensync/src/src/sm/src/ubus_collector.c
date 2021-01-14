@@ -49,7 +49,7 @@ static const struct blobmsg_policy client_session_events_policy[__CLIENT_EVENTS_
 
 static const struct blobmsg_policy client_assoc_event_policy[__CLIENT_ASSOC_MAX] = {
 	[CLIENT_ASSOC_ASSOC_TYPE] = {.name = "assoc_type", .type = BLOBMSG_TYPE_INT32},
-	[CLIENT_ASSOC_TIMESTAMP] = {.name = "timestamp", .type = BLOBMSG_TYPE_INT32},
+	[CLIENT_ASSOC_TIMESTAMP] = {.name = "timestamp", .type = BLOBMSG_TYPE_INT64},
 	[CLIENT_ASSOC_BAND] = {.name = "band", .type = BLOBMSG_TYPE_INT32},
 	[CLIENT_ASSOC_INTERNAL_SC] = {.name = "internal_sc", .type = BLOBMSG_TYPE_INT32},
 	[CLIENT_ASSOC_RSSI] = {.name = "rssi", .type = BLOBMSG_TYPE_INT32},
@@ -63,7 +63,7 @@ static const struct blobmsg_policy client_assoc_event_policy[__CLIENT_ASSOC_MAX]
 
 static const struct blobmsg_policy client_auth_event_policy[__CLIENT_AUTH_MAX] = {
 	[CLIENT_AUTH_SESSION_ID] = {.name = "session_id", .type = BLOBMSG_TYPE_INT64},
-	[CLIENT_AUTH_TIMESTAMP] = {.name = "timestamp", .type = BLOBMSG_TYPE_INT32},
+	[CLIENT_AUTH_TIMESTAMP] = {.name = "timestamp", .type = BLOBMSG_TYPE_INT64},
 	[CLIENT_AUTH_BAND] = {.name = "band", .type = BLOBMSG_TYPE_INT32},
 	[CLIENT_AUTH_AUTH_STATUS] = {.name = "auth_status", .type = BLOBMSG_TYPE_INT32},
 	[CLIENT_AUTH_AUTH_SSID] = {.name = "ssid", .type = BLOBMSG_TYPE_STRING},
@@ -72,7 +72,7 @@ static const struct blobmsg_policy client_auth_event_policy[__CLIENT_AUTH_MAX] =
 
 static const struct blobmsg_policy client_disconnect_event_policy[__CLIENT_DISCONNECT_MAX] = {
 	[CLIENT_DISCONNECT_SESSION_ID] = {.name = "session_id", .type = BLOBMSG_TYPE_INT64},
-	[CLIENT_DISCONNECT_TIMESTAMP] = {.name = "timestamp", .type = BLOBMSG_TYPE_INT32},
+	[CLIENT_DISCONNECT_TIMESTAMP] = {.name = "timestamp", .type = BLOBMSG_TYPE_INT64},
 	[CLIENT_DISCONNECT_STA_MAC] = {.name = "sta_mac", .type = BLOBMSG_TYPE_STRING},
 	[CLIENT_DISCONNECT_BAND] = {.name = "band", .type = BLOBMSG_TYPE_INT32},
 	[CLIENT_DISCONNECT_RSSI] = {.name = "rssi", .type = BLOBMSG_TYPE_INT32},
@@ -83,14 +83,14 @@ static const struct blobmsg_policy client_disconnect_event_policy[__CLIENT_DISCO
 static const struct blobmsg_policy client_first_data_event_policy[__CLIENT_FIRST_DATA_MAX] = {
 	[CLIENT_FIRST_DATA_STA_MAC] = {.name = "sta_mac", .type = BLOBMSG_TYPE_STRING},
 	[CLIENT_FIRST_DATA_SESSION_ID] = {.name = "session_id", .type = BLOBMSG_TYPE_INT64},
-	[CLIENT_FIRST_DATA_TIMESTAMP] = {.name = "timestamp", .type = BLOBMSG_TYPE_INT32},
+	[CLIENT_FIRST_DATA_TIMESTAMP] = {.name = "timestamp", .type = BLOBMSG_TYPE_INT64},
 	[CLIENT_FIRST_DATA_TX_TIMESTAMP] = {.name = "fdata_tx_up_ts_in_us", .type = BLOBMSG_TYPE_INT64},
 	[CLIENT_FIRST_DATA_RX_TIMESTAMP] = {.name = "fdata_rx_up_ts_in_us", .type = BLOBMSG_TYPE_INT64},
 };
 
 static const struct blobmsg_policy client_ip_event_policy[__CLIENT_IP_MAX] = {
 	[CLIENT_IP_SESSION_ID] = {.name = "session_id", .type = BLOBMSG_TYPE_INT64},
-	[CLIENT_IP_TIMESTAMP] = {.name = "timestamp", .type = BLOBMSG_TYPE_INT32},
+	[CLIENT_IP_TIMESTAMP] = {.name = "timestamp", .type = BLOBMSG_TYPE_INT64},
 	[CLIENT_IP_STA_MAC] = {.name = "sta_mac", .type = BLOBMSG_TYPE_STRING},
 	[CLIENT_IP_IP_ADDRESS] = {.name = "ip_address", .type = BLOBMSG_TYPE_STRING},
 };
@@ -158,7 +158,7 @@ static int client_first_data_event_cb(struct blob_attr *msg,
 	}
 
 	if (tb_client_first_data_event[CLIENT_FIRST_DATA_TIMESTAMP])
-		dpp_session->first_data_event->timestamp = blobmsg_get_u32(tb_client_first_data_event[CLIENT_FIRST_DATA_TIMESTAMP]);
+		dpp_session->first_data_event->timestamp = blobmsg_get_u64(tb_client_first_data_event[CLIENT_FIRST_DATA_TIMESTAMP]);
 
 	if (tb_client_first_data_event[CLIENT_FIRST_DATA_TX_TIMESTAMP])
 		dpp_session->first_data_event->fdata_tx_up_ts_in_us = blobmsg_get_u64(tb_client_first_data_event[CLIENT_FIRST_DATA_TX_TIMESTAMP]);
@@ -212,7 +212,7 @@ static int client_disconnect_event_cb(struct blob_attr *msg,
 	}
 
 	if (tb_client_disconnect_event[CLIENT_DISCONNECT_TIMESTAMP])
-		dpp_session->disconnect_event->timestamp = blobmsg_get_u32(tb_client_disconnect_event[CLIENT_DISCONNECT_TIMESTAMP]);
+		dpp_session->disconnect_event->timestamp = blobmsg_get_u64(tb_client_disconnect_event[CLIENT_DISCONNECT_TIMESTAMP]);
 
 	if (tb_client_disconnect_event[CLIENT_DISCONNECT_INTERNAL_RC])
 		dpp_session->disconnect_event->internal_rc = blobmsg_get_u32(tb_client_disconnect_event[CLIENT_DISCONNECT_INTERNAL_RC]);
@@ -258,7 +258,7 @@ static int client_auth_event_cb(struct blob_attr *msg,
 	}
 
 	if (tb_client_auth_event[CLIENT_AUTH_TIMESTAMP])
-		dpp_session->auth_event->timestamp = blobmsg_get_u32(tb_client_auth_event[CLIENT_AUTH_TIMESTAMP]);
+		dpp_session->auth_event->timestamp = blobmsg_get_u64(tb_client_auth_event[CLIENT_AUTH_TIMESTAMP]);
 
 	if (tb_client_auth_event[CLIENT_AUTH_AUTH_STATUS])
 			dpp_session->auth_event->auth_status = blobmsg_get_u32(tb_client_auth_event[CLIENT_AUTH_AUTH_STATUS]);
@@ -301,7 +301,7 @@ static int client_assoc_event_cb(struct blob_attr *msg,
 	}
 
 	if (tb_client_assoc_event[CLIENT_ASSOC_TIMESTAMP])
-		dpp_session->assoc_event->timestamp = blobmsg_get_u32(tb_client_assoc_event[CLIENT_ASSOC_TIMESTAMP]);
+		dpp_session->assoc_event->timestamp = blobmsg_get_u64(tb_client_assoc_event[CLIENT_ASSOC_TIMESTAMP]);
 
 	if (tb_client_assoc_event[CLIENT_ASSOC_INTERNAL_SC])
 		dpp_session->assoc_event->internal_sc = blobmsg_get_u32(tb_client_assoc_event[CLIENT_ASSOC_INTERNAL_SC]);
@@ -362,7 +362,7 @@ static int client_ip_event_cb(struct blob_attr *msg,
 	}
 
 	if (tb_client_ip_event[CLIENT_IP_TIMESTAMP])
-		dpp_session->ip_event->timestamp = blobmsg_get_u32(tb_client_ip_event[CLIENT_IP_TIMESTAMP]);
+		dpp_session->ip_event->timestamp = blobmsg_get_u64(tb_client_ip_event[CLIENT_IP_TIMESTAMP]);
 
 	return 0;
 }
