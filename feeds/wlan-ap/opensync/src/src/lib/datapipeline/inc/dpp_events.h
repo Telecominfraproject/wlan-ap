@@ -47,7 +47,7 @@ typedef struct {
 	char sta_mac[MAC_ADDRESS_STRING_LEN + 1];
 	uint64_t session_id;
 	radio_essid_t ssid;
-	uint32_t timestamp;
+	uint64_t timestamp;
 	radio_type_t band;
 	assoc_type_t assoc_type;
 	uint32_t status;
@@ -63,7 +63,7 @@ typedef struct {
 	char __barrier[46];
 	char sta_mac[MAC_ADDRESS_STRING_LEN + 1];
 	uint64_t session_id;
-	uint32_t timestamp;
+	uint64_t timestamp;
 	radio_essid_t ssid;
 	radio_type_t band;
 	uint32_t auth_status;
@@ -74,7 +74,7 @@ typedef struct {
 	char __barrier[46];
 	char sta_mac[MAC_ADDRESS_STRING_LEN + 1];
 	uint64_t session_id;
-	uint32_t timestamp;
+	uint64_t timestamp;
 	uint32_t reason;
 	device_type_t dev_type;
 	frame_type_t fr_type;
@@ -91,7 +91,7 @@ typedef struct {
 	char __barrier[46];
 	char sta_mac[MAC_ADDRESS_STRING_LEN + 1];
 	uint64_t session_id;
-	uint32_t timestamp;
+	uint64_t timestamp;
 	radio_type_t band;
 	assoc_type_t assoc_type;
 	radio_essid_t ssid;
@@ -117,7 +117,7 @@ typedef struct {
 	char __barrier[46];
 	char sta_mac[MAC_ADDRESS_STRING_LEN + 1];
 	uint64_t session_id;
-	uint32_t timestamp;
+	uint64_t timestamp;
 	radio_essid_t ssid;
 	int32_t reason;
 	char reason_str[DPP_REASON_STR_LEN];
@@ -128,7 +128,7 @@ typedef struct {
 	char __barrier[46];
 	char sta_mac[MAC_ADDRESS_STRING_LEN + 1];
 	uint64_t session_id;
-	uint32_t timestamp;
+	uint64_t timestamp;
 	uint64_t fdata_tx_up_ts_in_us;
 	uint64_t fdata_rx_up_ts_in_us;
 } dpp_event_record_first_data_t;
@@ -138,7 +138,7 @@ typedef struct {
 	char __barrier[46];
 	mac_address_t clt_mac;
 	uint64_t session_id;
-	uint32_t timestamp;
+	uint64_t timestamp;
 	char clt_id[DPP_CLT_ID_LEN];
 } dpp_event_record_id_t;
 
@@ -147,7 +147,7 @@ typedef struct {
 	char __barrier[46];
 	char sta_mac[MAC_ADDRESS_STRING_LEN + 1];
 	uint64_t session_id;
-	uint32_t timestamp;
+	uint64_t timestamp;
 	uint8_t ip_addr[16];
 } dpp_event_record_ip_t;
 
@@ -156,7 +156,7 @@ typedef struct {
 	char __barrier[46];
 	char sta_mac[MAC_ADDRESS_STRING_LEN + 1];
 	uint64_t session_id;
-	uint32_t timestamp;
+	uint64_t timestamp;
 	ct_reason_t r_code;
 	uint64_t last_sent_up_ts_in_us;
 	uint64_t last_recv_up_ts_in_us;
