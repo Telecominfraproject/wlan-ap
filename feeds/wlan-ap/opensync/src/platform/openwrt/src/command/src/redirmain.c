@@ -89,7 +89,7 @@ int port_forwarding(char *ipAddress, char *port)
 	    LOG(ERR, "could not resolve address");
             return( -1 );
         }
-        if( !result ){
+        if( result ){
             freeaddrinfo( result );
 	}
     } while( waitForAddrInfo );

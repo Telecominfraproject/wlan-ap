@@ -6,7 +6,7 @@
 #define MAX_REDIR_CLIENTS   5
 
 #define WS_PING_INTERVAL            20  // in seconds
-#define WS_RESET_LINK_INTERVAL      (3*WS_PING_INTERVAL)
+#define WS_RESET_LINK_INTERVAL      (6*WS_PING_INTERVAL)
 #define WS_DEFAULT_PORT             7681
 #define REDIR_RCV_ARRAY_MAX         10
 
