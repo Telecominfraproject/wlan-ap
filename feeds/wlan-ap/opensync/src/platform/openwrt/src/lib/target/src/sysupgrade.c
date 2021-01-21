@@ -35,7 +35,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "osp.h"
 
 #define TEMP_PATH "/tmp/"
-#define IMG_MAX_SIZE 40  // MB
+#define IMG_MAX_SIZE 45  // MB
 
 struct osp_dl_data
 {
@@ -57,7 +57,7 @@ static ev_timer  osp_utimer;
 static bool upg_running = false;
 static char upg_url[256];
 
-static const char fw_path[] = "/tmp/upgrade.tar";
+static const char fw_path[] = "/tmp/openwrt-sysupgrade.bin";
 
 static void osp_upg_get_img_path(char *buf, int buflen)
 {
