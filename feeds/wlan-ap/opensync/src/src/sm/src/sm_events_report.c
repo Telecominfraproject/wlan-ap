@@ -85,19 +85,36 @@ static bool dpp_events_report_timer_restart(ev_timer *timer)
 	return true;
 }
 
-static void sm_events_report_clear(ds_dlist_t *report_list)
+static void sm_events_report_client_clear(ds_dlist_t *report_list)
 {
 	ds_dlist_iter_t record_iter;
 
 	if (ds_dlist_is_empty(report_list))
 		return;
 
-	dpp_event_record_t *record = NULL;
+	dpp_event_record_client_t *record = NULL;
 	for (record = ds_dlist_ifirst(&record_iter, report_list);
 			record != NULL;
 			record = ds_dlist_inext(&record_iter)) {
 		ds_dlist_iremove(&record_iter);
-		dpp_event_record_free(record);
+		dpp_event_client_record_free(record);
+		record = NULL;
+	}
+}
+
+static void sm_events_report_dhcp_clear(ds_dlist_t *report_list)
+{
+	ds_dlist_iter_t record_iter;
+
+	if (ds_dlist_is_empty(report_list))
+		return;
+
+	dpp_event_record_dhcp_t *record = NULL;
+	for (record = ds_dlist_ifirst(&record_iter, report_list);
+			record != NULL;
+			record = ds_dlist_inext(&record_iter)) {
+		ds_dlist_iremove(&record_iter);
+		dpp_event_dhcp_record_free(record);
 		record = NULL;
 	}
 }
@@ -108,39 +125,66 @@ static void sm_events_report(EV_P_ ev_timer *w, int revents)
 	dpp_event_report_data_t *report_ctx = &events_ctx->report;
 	ev_timer *report_timer = &events_ctx->report_timer;
 
-	/* Event Record */
-	dpp_event_record_t *dpp_record = NULL;
-	dpp_event_record_t *sm_record = NULL;
-	ds_dlist_iter_t record_iter;
+	/* Client Event Record */
+	dpp_event_record_client_t *dpp_client_record = NULL;
+	dpp_event_record_client_t *sm_client_record = NULL;
+	ds_dlist_iter_t client_record_iter;
 
 	dpp_events_report_timer_restart(report_timer);
 
-	for (sm_record = ds_dlist_ifirst(&record_iter, &g_event_report.client_event_list); sm_record != NULL; sm_record = ds_dlist_inext(&record_iter)) {
-		dpp_record = dpp_event_record_alloc();
-		dpp_record->client_session.session_id = sm_record->client_session.session_id;
-		dpp_record->client_session.auth_event =  sm_record->client_session.auth_event;
-		dpp_record->client_session.assoc_event =  sm_record->client_session.assoc_event;
-		dpp_record->client_session.first_data_event =  sm_record->client_session.first_data_event;
-		dpp_record->client_session.disconnect_event =  sm_record->client_session.disconnect_event;
-		dpp_record->client_session.auth_event =  sm_record->client_session.auth_event;
-		dpp_record->client_session.ip_event =  sm_record->client_session.ip_event;
+	for (sm_client_record = ds_dlist_ifirst(&client_record_iter, &g_event_report.client_event_list); sm_client_record != NULL; sm_client_record = ds_dlist_inext(&client_record_iter)) {
+		dpp_client_record = dpp_event_client_record_alloc();
+		dpp_client_record->client_session.session_id = sm_client_record->client_session.session_id;
+		dpp_client_record->client_session.auth_event =  sm_client_record->client_session.auth_event;
+		dpp_client_record->client_session.assoc_event =  sm_client_record->client_session.assoc_event;
+		dpp_client_record->client_session.first_data_event =  sm_client_record->client_session.first_data_event;
+		dpp_client_record->client_session.disconnect_event =  sm_client_record->client_session.disconnect_event;
+		dpp_client_record->client_session.auth_event =  sm_client_record->client_session.auth_event;
+		dpp_client_record->client_session.ip_event =  sm_client_record->client_session.ip_event;
 
 		/* Memset all event pointers in the global event record to NULL */
-		memset(&sm_record->client_session, 0, sizeof(dpp_event_record_session_t));
-		sm_record->hasSMProcessed = true;
+		memset(&sm_client_record->client_session, 0, sizeof(dpp_event_record_session_t));
+		sm_client_record->hasSMProcessed = true;
 
 		if (ds_dlist_is_empty(&report_ctx->client_event_list)) {
-			ds_dlist_init(&report_ctx->client_event_list, dpp_event_record_t, node);
+			ds_dlist_init(&report_ctx->client_event_list, dpp_event_record_client_t, node);
 		}
-		ds_dlist_insert_tail(&report_ctx->client_event_list, dpp_record);
+		ds_dlist_insert_tail(&report_ctx->client_event_list, dpp_client_record);
 	}
 
-	if (!ds_dlist_is_empty(&report_ctx->client_event_list)) {
+	/* Dhcp Event Record */
+	dpp_event_record_dhcp_t *dpp_dhcp_record = NULL;
+	dpp_event_record_dhcp_t *sm_dhcp_record = NULL;
+	ds_dlist_iter_t dhcp_record_iter;
+
+	for (sm_dhcp_record = ds_dlist_ifirst(&dhcp_record_iter, &g_event_report.dhcp_event_list); sm_dhcp_record != NULL; sm_dhcp_record = ds_dlist_inext(&dhcp_record_iter)) {
+		dpp_dhcp_record = dpp_event_dhcp_record_alloc();
+		dpp_dhcp_record->dhcp_transaction.x_id = sm_dhcp_record->dhcp_transaction.x_id;
+		dpp_dhcp_record->dhcp_transaction.dhcp_ack_event =  sm_dhcp_record->dhcp_transaction.dhcp_ack_event;
+		dpp_dhcp_record->dhcp_transaction.dhcp_nak_event =  sm_dhcp_record->dhcp_transaction.dhcp_nak_event;
+		dpp_dhcp_record->dhcp_transaction.dhcp_offer_event =  sm_dhcp_record->dhcp_transaction.dhcp_offer_event;
+		dpp_dhcp_record->dhcp_transaction.dhcp_inform_event =  sm_dhcp_record->dhcp_transaction.dhcp_inform_event;
+		dpp_dhcp_record->dhcp_transaction.dhcp_decline_event =  sm_dhcp_record->dhcp_transaction.dhcp_decline_event;
+		dpp_dhcp_record->dhcp_transaction.dhcp_request_event =  sm_dhcp_record->dhcp_transaction.dhcp_request_event;
+		dpp_dhcp_record->dhcp_transaction.dhcp_discover_event =  sm_dhcp_record->dhcp_transaction.dhcp_discover_event;
+
+		/* Memset all event pointers in the global event record to NULL */
+		memset(&sm_dhcp_record->dhcp_transaction, 0, sizeof(dpp_event_record_dhcp_transaction_t));
+		sm_dhcp_record->hasSMProcessed = true;
+
+		if (ds_dlist_is_empty(&report_ctx->dhcp_event_list)) {
+			ds_dlist_init(&report_ctx->dhcp_event_list, dpp_event_record_dhcp_t, node);
+		}
+		ds_dlist_insert_tail(&report_ctx->dhcp_event_list, dpp_dhcp_record);
+	}
+
+	if (!ds_dlist_is_empty(&report_ctx->client_event_list) || !ds_dlist_is_empty(&report_ctx->dhcp_event_list)) {
 		LOG(INFO, "Sending events report...");
 		dpp_put_events(report_ctx);
 	}
 
-	sm_events_report_clear(&report_ctx->client_event_list);
+	sm_events_report_client_clear(&report_ctx->client_event_list);
+	sm_events_report_dhcp_clear(&report_ctx->dhcp_event_list);
 }
 
 /******************************************************************************
@@ -171,7 +215,8 @@ bool sm_events_report_request(radio_entry_t *radio_cfg,
 		LOG(INFO, "Initializing events reporting");
 
 		/* Initialize report list */
-		ds_dlist_init(&report_ctx->client_event_list, dpp_event_record_t, node);
+		ds_dlist_init(&report_ctx->client_event_list, dpp_event_record_client_t, node);
+		ds_dlist_init(&report_ctx->dhcp_event_list, dpp_event_record_dhcp_t, node);
 
 		/* Initialize event lib timers and pass the global
 			internal cache

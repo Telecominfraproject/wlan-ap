@@ -1,0 +1,553 @@
+Index: opensync-2.0.5.0/src/lib/inet/src/linux/inet_dhsnif_pcap.c
+===================================================================
+--- opensync-2.0.5.0.orig/src/lib/inet/src/linux/inet_dhsnif_pcap.c
++++ opensync-2.0.5.0/src/lib/inet/src/linux/inet_dhsnif_pcap.c
+@@ -40,6 +40,13 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBI
+ #include "inet.h"
+ #include "inet_dhsnif.h"
+ 
++#include "inet_dhcp_ubus.h"
++#include <libubox/avl.h>
++
++#include <ifaddrs.h>
++#include <netpacket/packet.h>
++
++
+ #define MODULE_ID LOG_MODULE_ID_DHCPS
+ 
+ static bool inet_dhsnif_init(inet_dhsnif_t *self, const char *ifname);
+@@ -51,9 +58,16 @@ static void __inet_dhsnif_process(u_char
+ static void __inet_dhsnif_process_L3(inet_dhsnif_t *self, const struct pcap_pkthdr *pkt, const u_char *packet, uint32_t offset);
+ static void __inet_dhsnif_process_dhcp(inet_dhsnif_t *self, const struct pcap_pkthdr *pkt, const u_char *packet, uint32_t offset);
+ static bool inet_dhsnif_fingerprint_to_str(uint8_t *finger, char *s, size_t sz);
++static int avl_compare_xid(const void *k1, const void *k2, void *ptr);
++static int from_internal_set(const char *mac_to_compare, bool *from_internal);
++static uint64_t get_time_in_ms(struct timespec *ts);
+ 
+ static ds_key_cmp_t inet_dhsnif_lease_cmp;
+ 
++static struct inet_dhcp_event_data dhcp_data;
++
++struct avl_tree dhcp_event_tree;
++
+ /*
+  * ===========================================================================
+  *  Public interface
+@@ -159,6 +173,7 @@ bool inet_dhsnif_notify(inet_dhsnif_t *s
+  * Ethernet header
+  */
+ #define ETH_TYPE_IP         0x800
++#define ETH_P_8021Q         0x8100
+ struct eth_hdr
+ {
+     uint8_t                 eth_dst[6];         /* Hardware destination address */
+@@ -435,6 +450,9 @@ bool __inet_dhsnif_start(inet_dhsnif_t *
+ 
+     LOG(INFO, "inet_dhsnif: %s: Interface registered for DHCP sniffing.", self->ds_ifname);
+ 
++    /* Initialize dhcp_event_tree */
++    avl_init(&dhcp_event_tree, avl_compare_xid, false, NULL);
++
+     return true;
+ 
+ error:
+@@ -495,6 +513,7 @@ void __inet_dhsnif_process(
+     (void)packet;
+ 
+     uint32_t l2_offset = 0;
++    uint32_t eth_8021q_offset = 0;
+ 
+     /* Handle l2 packet type */
+     int l2_type = pcap_datalink(self->ds_pcap);
+@@ -524,8 +543,17 @@ void __inet_dhsnif_process(
+ 
+     struct eth_hdr *eth = (void *)(packet + l2_offset);
+ 
+-    /* We're interested in IP only */
+-    if (ntohs(eth->eth_type) !=  ETH_TYPE_IP) return;
++    snprintf(dhcp_data.source_mac_address, C_MACADDR_LEN, PRI_osn_mac_addr, eth->eth_src[0], eth->eth_src[1], eth->eth_src[2], eth->eth_src[3], eth->eth_src[4], eth->eth_src[5]);
++
++    if (ntohs(eth->eth_type) == ETH_P_8021Q) {
++        dhcp_data.vlan_id = ntohs(*(uint16_t *) (packet + l2_offset + sizeof(struct eth_hdr)));
++        eth_8021q_offset += 2;
++    }
++
++    /* We're interested in IP and vlan tag only */
++    if ((ntohs(eth->eth_type) != ETH_P_8021Q) && (ntohs(eth->eth_type) != ETH_TYPE_IP)) {
++        return;
++    }
+ 
+ #if 0
+     LOG(DEBUG, "inet_dhsnif: %s: Ethernet: dst:"PRI(inet_macaddr_t)" src:"PRI(inet_macaddr_t)" type:%d",
+@@ -536,7 +564,7 @@ void __inet_dhsnif_process(
+ #endif
+ 
+     /* Forward the packet to L3 processing */
+-    __inet_dhsnif_process_L3(self, pkt, packet, l2_offset + sizeof(struct eth_hdr));
++    __inet_dhsnif_process_L3(self, pkt, packet, l2_offset + sizeof(struct eth_hdr) + eth_8021q_offset);
+ }
+ 
+ /*
+@@ -673,6 +701,20 @@ void __inet_dhsnif_process_dhcp(
+ 
+     fin[0] = 0;
+ 
++    dhcp_data.x_id = dhcp->dhcp_xid;
++
++    dhcp_data.relay_ip = OSN_IP_ADDR_INIT;
++    dhcp_data.relay_ip.ia_addr = dhcp->dhcp_giaddr;
++
++    dhcp_data.device_mac_address = OSN_MAC_ADDR_INIT;
++    memcpy(dhcp_data.device_mac_address.ma_addr, dhcp->dhcp_chaddr, sizeof(dhcp_data.device_mac_address.ma_addr));
++
++    dhcp_data.client_ip = OSN_IP_ADDR_INIT;
++    dhcp_data.client_ip.ia_addr = dhcp->dhcp_yiaddr;
++
++    dhcp_data.dhcp_server_ip = OSN_IP_ADDR_INIT;
++    dhcp_data.dhcp_server_ip.ia_addr = dhcp->dhcp_siaddr;
++
+     while (popt < packet + pkt->caplen)
+     {
+         uint8_t optid;
+@@ -718,6 +760,7 @@ void __inet_dhsnif_process_dhcp(
+ 
+             case DHCP_OPTION_LEASE_TIME:
+                 lease->le_info.dl_leasetime = ntohl(*(uint32_t *)popt);
++                dhcp_data.lease_time = ntohl(*(uint32_t *)popt);
+ #if 0
+                 LOG(DEBUG, "inet_dhsnif: %s: "PRI(inet_macaddr_t)": Lease time =  %ds",
+                         self->ds_ifname,
+@@ -786,6 +829,8 @@ void __inet_dhsnif_process_dhcp(
+                 /* Client requested Hostname */
+                 memcpy(lease->le_info.dl_hostname, popt, optlen);
+                 lease->le_info.dl_hostname[optlen] = '\0';
++                memcpy(dhcp_data.hostname, popt, optlen);
++                dhcp_data.hostname[optlen] = '\0';
+                 break;
+ 
+             case DHCP_OPTION_VENDOR_CLASS:
+@@ -824,11 +869,15 @@ void __inet_dhsnif_process_dhcp(
+                     {
+                         lease->le_info.dl_primarydns = OSN_IP_ADDR_INIT;
+                         lease->le_info.dl_primarydns.ia_addr = *(struct in_addr *)popt;
++                        dhcp_data.primary_dns = OSN_IP_ADDR_INIT;
++                        dhcp_data.primary_dns.ia_addr = *(struct in_addr *)popt;
+                     }
+                     else if (i == 4)
+                     {
+                         lease->le_info.dl_secondarydns = OSN_IP_ADDR_INIT;
+                         lease->le_info.dl_secondarydns.ia_addr = *((struct in_addr *)(popt + 4));
++                        dhcp_data.secondary_dns = OSN_IP_ADDR_INIT;
++                        dhcp_data.secondary_dns.ia_addr = *(struct in_addr *)popt;
+                     }
+                 }
+                 break;
+@@ -838,6 +887,8 @@ void __inet_dhsnif_process_dhcp(
+                     break;
+                 lease->le_info.dl_subnetmask = OSN_IP_ADDR_INIT;
+                 lease->le_info.dl_subnetmask.ia_addr = *(struct in_addr *)popt;
++                dhcp_data.subnet_mask = OSN_IP_ADDR_INIT;
++                dhcp_data.subnet_mask.ia_addr = *(struct in_addr *)popt;
+                 break;
+ 
+             case DHCP_OPTION_ROUTER:
+@@ -845,9 +896,23 @@ void __inet_dhsnif_process_dhcp(
+                     break;
+                 lease->le_info.dl_gateway = OSN_IP_ADDR_INIT;
+                 lease->le_info.dl_gateway.ia_addr = *(struct in_addr *)popt;
++                dhcp_data.gateway_ip = OSN_IP_ADDR_INIT;
++                dhcp_data.gateway_ip.ia_addr = *(struct in_addr *)popt;
+                 LOG(INFO, "inet_dhsnif: GATEWAY");
+                 break;
+ 
++            case DHCP_OPTION_TIME_OFFSET:
++                dhcp_data.time_offset = (uint32_t) ntohl(*(uint32_t *)popt);
++                break;
++
++            case DHCP_OPTION_RENEWAL_TIME:
++                dhcp_data.renewal_time = (uint32_t) ntohl(*(uint32_t *)popt);
++                break;
++
++            case DHCP_OPTION_REBINDING_TIME:
++                dhcp_data.rebinding_time = (uint32_t) ntohl(*(uint32_t *)popt);
++                break;
++
+             default:
+ #if 0
+                 LOG(DEBUG, "inet_dhsnif: %s: "PRI(inet_macaddr_t)": Received DHCP Option: %d(%d)\n",
+@@ -862,6 +927,11 @@ void __inet_dhsnif_process_dhcp(
+         popt += optlen;
+     }
+ 
++    struct timespec ts;
++    uint64_t timestamp = 0;
++    clock_gettime(CLOCK_REALTIME, &ts);
++    timestamp = get_time_in_ms(&ts);
++
+     /* Check our current phase */
+     switch (msg_type)
+     {
+@@ -881,6 +951,14 @@ void __inet_dhsnif_process_dhcp(
+                 lease->le_info.dl_fingerprint[0] = '\0';
+             }
+ 
++            dhcp_data.timestamp_ms = timestamp;
++            dhcp_data.type = INET_UBUS_DHCP_DISCOVER;
++            if (inet_dhcp_event_ubus_handle(&dhcp_data)) {
++                LOG(ERR, "inet_dhsnif: dhcp events: error handling dhcp_discover event");
++                return;
++            }
++            memset(&dhcp_data, 0, sizeof(struct inet_dhcp_event_data));
++
+             break;
+ 
+         case DHCP_MSG_REQUEST:
+@@ -907,12 +985,34 @@ void __inet_dhsnif_process_dhcp(
+                     lease->le_info.dl_fingerprint[0] = '\0';
+                 }
+             }
++
++            dhcp_data.timestamp_ms = timestamp;
++            dhcp_data.type = INET_UBUS_DHCP_REQUEST;
++            if (inet_dhcp_event_ubus_handle(&dhcp_data)) {
++                LOG(ERR, "inet_dhsnif: dhcp events: error handling dhcp_request event");
++                return;
++            }
++            memset(&dhcp_data, 0, sizeof(struct inet_dhcp_event_data));
++
+             break;
+ 
+         case DHCP_MSG_OFFER:
+             /* Save the IP address */
+             lease->le_info.dl_ipaddr = OSN_IP_ADDR_INIT;
+             lease->le_info.dl_ipaddr.ia_addr = dhcp->dhcp_yiaddr;
++
++            if (from_internal_set(dhcp_data.source_mac_address, &dhcp_data.from_internal)) {
++                LOG(ERR, "inet_dhsnif: dhcp events: could not set 'from_internal' field");
++                return;
++            }
++            dhcp_data.timestamp_ms = timestamp;
++            dhcp_data.type = INET_UBUS_DHCP_OFFER;
++            if (inet_dhcp_event_ubus_handle(&dhcp_data)) {
++                LOG(ERR, "inet_dhsnif: dhcp events: error handling dhcp_offer event");
++                return;
++            }
++            memset(&dhcp_data, 0, sizeof(struct inet_dhcp_event_data));
++
+             break;
+ 
+         case DHCP_MSG_ACK:
+@@ -927,15 +1027,60 @@ void __inet_dhsnif_process_dhcp(
+                     FMT_osn_ip_addr(lease->le_info.dl_ipaddr),
+                     FMT_osn_mac_addr(lease->le_info.dl_hwaddr),
+                     lease->le_info.dl_hostname);
++
+             /* Call callback */
+             if (self->ds_lease_fn != NULL)
+             {
+                 self->ds_lease_fn(self->ds_lease_inet, false, &lease->le_info);
+             }
+ 
++            dhcp_data.timestamp_ms = timestamp;
++            dhcp_data.type = INET_UBUS_DHCP_ACK;
++            if (inet_dhcp_event_ubus_handle(&dhcp_data)) {
++                LOG(ERR, "inet_dhsnif: dhcp events: error handling dhcp_ack event");
++                return;
++            }
++            memset(&dhcp_data, 0, sizeof(struct inet_dhcp_event_data));
++
+             break;
+ 
+         case DHCP_MSG_NACK:
++            if (from_internal_set(dhcp_data.source_mac_address, &dhcp_data.from_internal)) {
++                LOG(ERR, "inet_dhsnif: dhcp events: could not set 'from_internal' field");
++                return;
++            }
++            dhcp_data.timestamp_ms = timestamp;
++            dhcp_data.type = INET_UBUS_DHCP_NAK;
++            if (inet_dhcp_event_ubus_handle(&dhcp_data)) {
++                LOG(ERR, "inet_dhsnif: dhcp events: error handling dhcp_nak event");
++                return;
++            }
++            memset(&dhcp_data, 0, sizeof(struct inet_dhcp_event_data));
++
++            break;
++
++        case DHCP_MSG_INFORM:
++            dhcp_data.timestamp_ms = timestamp;
++            dhcp_data.type = INET_UBUS_DHCP_INFORM;
++            if (inet_dhcp_event_ubus_handle(&dhcp_data)) {
++                LOG(ERR, "inet_dhsnif: dhcp events: error handling dhcp_inform event");
++                return;
++            }
++            memset(&dhcp_data, 0, sizeof(struct inet_dhcp_event_data));
++
++            break;
++
++        case DHCP_MSG_DECLINE:
++            dhcp_data.timestamp_ms = timestamp;
++            dhcp_data.type = INET_UBUS_DHCP_DECLINE;
++            if (inet_dhcp_event_ubus_handle(&dhcp_data)) {
++                LOG(ERR, "inet_dhsnif: dhcp events: error handling dhcp_decline event");
++                return;
++            }
++            memset(&dhcp_data, 0, sizeof(struct inet_dhcp_event_data));
++
++            break;
++
+         case DHCP_MSG_RELEASE:
+             /* Callback */
+             LOG(NOTICE, "inet_dhsnif: RELEASE IP:"PRI_osn_ip_addr" MAC:"PRI_osn_mac_addr" Hostname:%s",
+@@ -950,6 +1095,7 @@ void __inet_dhsnif_process_dhcp(
+             /* Remove from the list */
+             ds_tree_remove(&self->ds_lease_list, lease);
+             free(lease);
++            memset(&dhcp_data, 0, sizeof(struct inet_dhcp_event_data));
+ 
+             break;
+     }
+@@ -1004,3 +1150,223 @@ int inet_dhsnif_lease_cmp(void *a, void
+ {
+     return memcmp(a, b, sizeof(os_macaddr_t));
+ }
++
++int avl_compare_xid(const void *k1, const void *k2, void *ptr)
++{
++    const uint32_t *id1 = k1, *id2 = k2;
++
++    if (*id1 < *id2) {
++        return -1;
++    } else {
++        return *id1 > *id2;
++    }
++}
++
++int from_internal_set(const char *mac_to_compare, bool *from_internal)
++{
++    struct ifaddrs *ifaddr = NULL;
++    struct ifaddrs *ifa = NULL;
++
++    *from_internal = false;
++    char mac_address[C_MACADDR_LEN] = {0};
++
++    if (getifaddrs(&ifaddr) == -1) {
++        return -1;
++    }
++
++    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
++        if ((ifa->ifa_addr) && (ifa->ifa_addr->sa_family == AF_PACKET)) {
++            struct sockaddr_ll *s = (struct sockaddr_ll*)ifa->ifa_addr;
++            snprintf(mac_address, sizeof(mac_address), PRI_osn_mac_addr, s->sll_addr[0], s->sll_addr[1], s->sll_addr[2], s->sll_addr[3], s->sll_addr[4], s->sll_addr[5]);
++            if (strcmp(mac_address, mac_to_compare) == 0) {
++                *from_internal = true;
++            }
++        }
++    }
++
++    freeifaddrs(ifaddr);
++    return 0;
++}
++
++uint64_t get_time_in_ms(struct timespec *ts)
++{
++    return (uint64_t) ts->tv_sec * 1000 + ts->tv_nsec / 1000000;
++}
++
++
++int inet_dhcp_event_ubus_handle(struct inet_dhcp_event_data *data) {
++    /* check event counter */
++    if (cached_dhcp_events_nr > OSYNC_MAX_CACHED_DHCP_EVENTS) {
++        LOG(INFO, "inet_dhsnif: inet_dhcp_event_ubus_handle: OSYNC_MAX_CACHED_DHCP_EVENTS [%d] exceeded", OSYNC_MAX_CACHED_DHCP_EVENTS);
++        return 0;
++    }
++
++    struct dhcp_event_avl_rec *rec = NULL;
++    uint32_t x_id = 0;
++    bool new_rec = false;
++    x_id = data->x_id;
++
++    /* find by x_id */
++    rec = avl_find_element(&dhcp_event_tree, &x_id, rec, avl);
++
++    /* prepare rec if not found */
++    if (!rec) {
++        new_rec = true;
++        rec = calloc(1, sizeof(struct dhcp_event_avl_rec));
++    }
++
++    switch (data->type) {
++        case INET_UBUS_DHCP_DISCOVER: {
++            rec->x_id = x_id;
++            rec->dhcp_records_nr++;
++            rec->dhcp_records= realloc(rec->dhcp_records,
++                        sizeof(struct dhcp_transaction) * rec->dhcp_records_nr);
++            struct dhcp_transaction *transaction = &rec->dhcp_records[rec->dhcp_records_nr - 1];
++            transaction->type = INET_UBUS_DHCP_DISCOVER;
++            transaction->u.dhcp_discover.dhcp_common.x_id = data->x_id;
++            transaction->u.dhcp_discover.dhcp_common.vlan_id = data->vlan_id;
++            snprintf(transaction->u.dhcp_discover.dhcp_common.dhcp_server_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->dhcp_server_ip));
++            snprintf(transaction->u.dhcp_discover.dhcp_common.client_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->client_ip));
++            snprintf(transaction->u.dhcp_discover.dhcp_common.relay_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->relay_ip));
++            snprintf(transaction->u.dhcp_discover.dhcp_common.device_mac_address, C_MACADDR_LEN, PRI_osn_mac_addr, FMT_osn_mac_addr(data->device_mac_address));
++            transaction->u.dhcp_discover.dhcp_common.timestamp_ms = data->timestamp_ms;
++            snprintf(transaction->u.dhcp_discover.hostname, C_HOSTNAME_LEN, "%s", data->hostname);
++            cached_dhcp_events_nr++;
++            break;
++        }
++
++        case INET_UBUS_DHCP_REQUEST: {
++            rec->x_id = x_id;
++            rec->dhcp_records_nr++;
++            rec->dhcp_records= realloc(rec->dhcp_records,
++                        sizeof(struct dhcp_transaction) * rec->dhcp_records_nr);
++            struct dhcp_transaction *transaction = &rec->dhcp_records[rec->dhcp_records_nr - 1];
++            transaction->type = INET_UBUS_DHCP_REQUEST;
++            transaction->u.dhcp_request.dhcp_common.x_id = data->x_id;
++            transaction->u.dhcp_request.dhcp_common.vlan_id = data->vlan_id;
++            snprintf(transaction->u.dhcp_request.dhcp_common.dhcp_server_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->dhcp_server_ip));
++            snprintf(transaction->u.dhcp_request.dhcp_common.client_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->client_ip));
++            snprintf(transaction->u.dhcp_request.dhcp_common.relay_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->relay_ip));
++            snprintf(transaction->u.dhcp_request.dhcp_common.device_mac_address, C_MACADDR_LEN, PRI_osn_mac_addr, FMT_osn_mac_addr(data->device_mac_address));
++            transaction->u.dhcp_request.dhcp_common.timestamp_ms = data->timestamp_ms;
++            snprintf(transaction->u.dhcp_request.hostname, C_HOSTNAME_LEN, "%s", data->hostname);
++            cached_dhcp_events_nr++;
++            break;
++        }
++
++        case INET_UBUS_DHCP_OFFER: {
++            rec->x_id = x_id;
++            rec->dhcp_records_nr++;
++            rec->dhcp_records= realloc(rec->dhcp_records,
++                        sizeof(struct dhcp_transaction) * rec->dhcp_records_nr);
++            struct dhcp_transaction *transaction = &rec->dhcp_records[rec->dhcp_records_nr - 1];
++            transaction->type = INET_UBUS_DHCP_OFFER;
++            transaction->u.dhcp_offer.dhcp_common.x_id = data->x_id;
++            transaction->u.dhcp_offer.dhcp_common.vlan_id = data->vlan_id;
++            snprintf(transaction->u.dhcp_offer.dhcp_common.dhcp_server_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->dhcp_server_ip));
++            snprintf(transaction->u.dhcp_offer.dhcp_common.client_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->client_ip));
++            snprintf(transaction->u.dhcp_offer.dhcp_common.relay_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->relay_ip));
++            snprintf(transaction->u.dhcp_offer.dhcp_common.device_mac_address, C_MACADDR_LEN, PRI_osn_mac_addr, FMT_osn_mac_addr(data->device_mac_address));
++            transaction->u.dhcp_offer.dhcp_common.timestamp_ms = data->timestamp_ms;
++            transaction->u.dhcp_offer.from_internal = data->from_internal;
++            cached_dhcp_events_nr++;
++            break;
++        }
++
++        case INET_UBUS_DHCP_ACK: {
++            rec->x_id = x_id;
++            rec->dhcp_records_nr++;
++            rec->dhcp_records= realloc(rec->dhcp_records,
++                        sizeof(struct dhcp_transaction) * rec->dhcp_records_nr);
++            struct dhcp_transaction *transaction = &rec->dhcp_records[rec->dhcp_records_nr - 1];
++            transaction->type = INET_UBUS_DHCP_ACK;
++            transaction->u.dhcp_ack.dhcp_common.x_id = data->x_id;
++            transaction->u.dhcp_ack.dhcp_common.vlan_id = data->vlan_id;
++            snprintf(transaction->u.dhcp_ack.dhcp_common.dhcp_server_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->dhcp_server_ip));
++            snprintf(transaction->u.dhcp_ack.dhcp_common.client_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->client_ip));
++            snprintf(transaction->u.dhcp_ack.dhcp_common.relay_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->relay_ip));
++            snprintf(transaction->u.dhcp_ack.dhcp_common.device_mac_address, C_MACADDR_LEN, PRI_osn_mac_addr, FMT_osn_mac_addr(data->device_mac_address));
++            transaction->u.dhcp_ack.dhcp_common.timestamp_ms = data->timestamp_ms;
++            snprintf(transaction->u.dhcp_ack.subnet_mask, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->subnet_mask));
++            snprintf(transaction->u.dhcp_ack.primary_dns, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->primary_dns));
++            snprintf(transaction->u.dhcp_ack.secondary_dns, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->secondary_dns));
++            transaction->u.dhcp_ack.lease_time = data->lease_time;
++            transaction->u.dhcp_ack.renewal_time = data->renewal_time;
++            transaction->u.dhcp_ack.rebinding_time = data->rebinding_time;
++            transaction->u.dhcp_ack.time_offset = data->time_offset;
++            snprintf(transaction->u.dhcp_ack.gateway_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->gateway_ip));
++            cached_dhcp_events_nr++;
++            break;
++        }
++
++        case INET_UBUS_DHCP_NAK: {
++            rec->x_id = x_id;
++            rec->dhcp_records_nr++;
++            rec->dhcp_records= realloc(rec->dhcp_records,
++                        sizeof(struct dhcp_transaction) * rec->dhcp_records_nr);
++            struct dhcp_transaction *transaction = &rec->dhcp_records[rec->dhcp_records_nr - 1];
++            transaction->type = INET_UBUS_DHCP_NAK;
++            transaction->u.dhcp_nak.dhcp_common.x_id = data->x_id;
++            transaction->u.dhcp_nak.dhcp_common.vlan_id = data->vlan_id;
++            snprintf(transaction->u.dhcp_nak.dhcp_common.dhcp_server_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->dhcp_server_ip));
++            snprintf(transaction->u.dhcp_nak.dhcp_common.client_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->client_ip));
++            snprintf(transaction->u.dhcp_nak.dhcp_common.relay_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->relay_ip));
++            snprintf(transaction->u.dhcp_nak.dhcp_common.device_mac_address, C_MACADDR_LEN, PRI_osn_mac_addr, FMT_osn_mac_addr(data->device_mac_address));
++            transaction->u.dhcp_nak.dhcp_common.timestamp_ms = data->timestamp_ms;
++            transaction->u.dhcp_nak.from_internal = data->from_internal;
++            break;
++        }
++
++        case INET_UBUS_DHCP_INFORM: {
++            rec->x_id = x_id;
++            rec->dhcp_records_nr++;
++            rec->dhcp_records= realloc(rec->dhcp_records,
++                        sizeof(struct dhcp_transaction) * rec->dhcp_records_nr);
++            struct dhcp_transaction *transaction = &rec->dhcp_records[rec->dhcp_records_nr - 1];
++            transaction->type = INET_UBUS_DHCP_INFORM;
++            transaction->u.dhcp_inform.dhcp_common.x_id = data->x_id;
++            transaction->u.dhcp_inform.dhcp_common.vlan_id = data->vlan_id;
++            snprintf(transaction->u.dhcp_inform.dhcp_common.dhcp_server_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->dhcp_server_ip));
++            snprintf(transaction->u.dhcp_inform.dhcp_common.client_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->client_ip));
++            snprintf(transaction->u.dhcp_inform.dhcp_common.relay_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->relay_ip));
++            snprintf(transaction->u.dhcp_inform.dhcp_common.device_mac_address, C_MACADDR_LEN, PRI_osn_mac_addr, FMT_osn_mac_addr(data->device_mac_address));
++            transaction->u.dhcp_inform.dhcp_common.timestamp_ms = data->timestamp_ms;
++            cached_dhcp_events_nr++;
++            break;
++        }
++
++        case INET_UBUS_DHCP_DECLINE: {
++            rec->x_id = x_id;
++            rec->dhcp_records_nr++;
++            rec->dhcp_records= realloc(rec->dhcp_records,
++                        sizeof(struct dhcp_transaction) * rec->dhcp_records_nr);
++            struct dhcp_transaction *transaction = &rec->dhcp_records[rec->dhcp_records_nr - 1];
++            transaction->type = INET_UBUS_DHCP_DECLINE;
++            transaction->u.dhcp_decline.dhcp_common.x_id = data->x_id;
++            transaction->u.dhcp_decline.dhcp_common.vlan_id = data->vlan_id;
++            snprintf(transaction->u.dhcp_decline.dhcp_common.dhcp_server_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->dhcp_server_ip));
++            snprintf(transaction->u.dhcp_decline.dhcp_common.client_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->client_ip));
++            snprintf(transaction->u.dhcp_decline.dhcp_common.relay_ip, C_IP4ADDR_LEN, PRI_osn_ip_addr, FMT_osn_ip_addr(data->relay_ip));
++            snprintf(transaction->u.dhcp_decline.dhcp_common.device_mac_address, C_MACADDR_LEN, PRI_osn_mac_addr, FMT_osn_mac_addr(data->device_mac_address));
++            transaction->u.dhcp_decline.dhcp_common.timestamp_ms = data->timestamp_ms;
++            cached_dhcp_events_nr++;
++            break;
++        }
++
++        default:
++            LOG(ERR, "inet_dhsnif: inet_dhcp_event_ubus_handle: unknown event type");
++            new_rec = false;
++            break;
++    }
++
++    if (new_rec) {
++        /* insert new dhcp event */
++        rec->avl.key = &rec->x_id;
++        if (avl_insert(&dhcp_event_tree, &rec->avl)) {
++            LOG(ERR, "inet_dhsnif: inet_dhcp_event_ubus_handle: failed to insert dhcp event into avl tree");
++            return 1;
++        }
++    }
++
++    return 0;
++}
+Index: opensync-2.0.5.0/src/lib/osn/inc/osn_dhcp.h
+===================================================================
+--- opensync-2.0.5.0.orig/src/lib/osn/inc/osn_dhcp.h
++++ opensync-2.0.5.0/src/lib/osn/inc/osn_dhcp.h
+@@ -90,6 +90,7 @@ enum osn_notify
+ enum osn_dhcp_option
+ {
+     DHCP_OPTION_SUBNET_MASK = 1,
++	DHCP_OPTION_TIME_OFFSET = 2,
+     DHCP_OPTION_ROUTER = 3,
+     DHCP_OPTION_DNS_SERVERS = 6,
+     DHCP_OPTION_HOSTNAME = 12,
+@@ -100,6 +101,8 @@ enum osn_dhcp_option
+     DHCP_OPTION_LEASE_TIME = 51,
+     DHCP_OPTION_MSG_TYPE = 53,
+     DHCP_OPTION_PARAM_LIST = 55,
++	DHCP_OPTION_RENEWAL_TIME = 58,
++	DHCP_OPTION_REBINDING_TIME = 59,
+     DHCP_OPTION_VENDOR_CLASS = 60,
+     DHCP_OPTION_DOMAIN_SEARCH= 119,
+     DHCP_OPTION_OSYNC_SWVER = 225,
