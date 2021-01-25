@@ -283,13 +283,14 @@ static struct vif_crypto {
 	{ "wpa3-mixed", OVSDB_SECURITY_ENCRYPTION_WPA3_EAP, OVSDB_SECURITY_MODE_MIXED, 1 },
 };
 
-static void vif_config_security_set(struct blob_buf *b,
+static int vif_config_security_set(struct blob_buf *b,
 				    const struct schema_Wifi_VIF_Config *vconf)
 {
 	const char *encryption = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_ENCRYPT);
 	const char *mode = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_MODE);
 	unsigned int i;
 	unsigned int acct_interval;
+	const char *auth_server, *auth_port, *auth_secret, *security_key;
 
 	if (!strcmp(encryption, OVSDB_SECURITY_ENCRYPTION_OPEN) || !mode)
 		goto open;
@@ -302,12 +303,17 @@ static void vif_config_security_set(struct blob_buf *b,
 		blobmsg_add_bool(b, "ieee80211w", 1);
 		if (vif_crypto[i].enterprise) {
 			acct_interval = 0;
-			blobmsg_add_string(b, "auth_server",
-					   SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_IP));
-			blobmsg_add_string(b, "auth_port",
-					   SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_PORT));
-			blobmsg_add_string(b, "auth_secret",
-					   SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_SECRET));
+			auth_server = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_IP);
+			auth_port   = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_PORT);
+			auth_secret = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_SECRET);
+			LOGT("%s: Server IP %s port %s secret %s", vconf->if_name, auth_server, auth_port, auth_secret);
+			if (!auth_server[0] || !auth_port[0] || !auth_secret[0]) {
+				LOGI("%s: Incomplete RADIUS security config - SSID not created", vconf->if_name);
+				return -1;
+			}
+			blobmsg_add_string(b, "auth_server", auth_server);
+			blobmsg_add_string(b, "auth_port",   auth_port );
+			blobmsg_add_string(b, "auth_secret", auth_secret );
 			blobmsg_add_string(b, "acct_server",
 					   SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_IP));
 			blobmsg_add_string(b, "acct_port",
@@ -322,14 +328,20 @@ static void vif_config_security_set(struct blob_buf *b,
 				blobmsg_add_u32(b, "acct_interval", acct_interval);
 			}
 		} else {
-			blobmsg_add_string(b, "key",
-					   SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_KEY));
+			security_key = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_KEY);
+			if (security_key == NULL) {
+				LOGW("%s: Incomplete security config - SSID not created", vconf->if_name);
+				return -1;
+			}
+			blobmsg_add_string(b, "key", security_key);
 		}
 	}
+	return 0;
 open:
 	blobmsg_add_string(b, "encryption", "none");
 	blobmsg_add_string(b, "key", "");
 	blobmsg_add_bool(b, "ieee80211w", 0);
+	return 0;
 }
 
 static void vif_state_security_append(struct schema_Wifi_VIF_State *vstate,
@@ -1162,7 +1174,7 @@ static void vif_mesh_opt_set(struct blob_buf *b, struct blob_buf *b1,
 	}
 }
 
-static void mesh_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
+static int mesh_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 			const struct schema_Wifi_VIF_Config *vconf,
 			const struct schema_Wifi_VIF_Config_flags *changed)
 {
@@ -1176,7 +1188,9 @@ static void mesh_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 	if (changed->enabled)
 		blobmsg_add_bool(&b, "disabled", vconf->enabled ? 0 : 1);
 
-	vif_config_security_set(&b, vconf);
+	if (vif_config_security_set(&b, vconf)) {
+		return -1;
+	}
 
 	blobmsg_add_string(&b, "network", vconf->if_name);
 	blobmsg_add_bool(&b, "mesh_fwding", 0);
@@ -1191,9 +1205,10 @@ static void mesh_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 			mesh.head, &wifi_mesh_param, NULL);
 
 	reload_config = 1;
+	return 0;
 }
 
-static void ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
+static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 			const struct schema_Wifi_VIF_Config *vconf,
 			const struct schema_Wifi_VIF_Config_flags *changed)
 {
@@ -1285,7 +1300,10 @@ static void ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 	blobmsg_add_bool(&b, "wpa_disable_eapol_key_retries", 1);
 	blobmsg_add_u32(&b, "channel", rconf->channel);
 
-	vif_config_security_set(&b, vconf);
+	if (vif_config_security_set(&b, vconf)) {
+                return -1;
+        }
+
 	if (changed->custom_options)
 		vif_config_custom_opt_set(&b, vconf);
 
@@ -1308,7 +1326,7 @@ static void ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 	}
 
 	reload_config = 1;
-
+	return 0;
 }
 
 bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
@@ -1317,11 +1335,11 @@ bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 			const struct schema_Wifi_VIF_Config_flags *changed,
 			int num_cconfs)
 {
-
+	int rc;
 	if (!strcmp(vconf->mode, "mesh")) {
-		mesh_vif_config_set(rconf, vconf, changed);
+		rc = mesh_vif_config_set(rconf, vconf, changed);
 	} else {
-		ap_vif_config_set(rconf, vconf, changed);
+		rc = ap_vif_config_set(rconf, vconf, changed);
 	}
 
 	return true;
