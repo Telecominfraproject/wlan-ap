@@ -35,6 +35,7 @@ struct task {
 	pid_t pid;
 	ev_child child;
 	const char *arg;
+	int state;
 };
 
 extern char serial[64];

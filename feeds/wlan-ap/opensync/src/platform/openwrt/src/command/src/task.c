@@ -57,19 +57,24 @@ void task_status(struct task *task, int status, char *result)
 	switch (status) {
 	case TASK_WAITING:
 		SCHEMA_SET_STR(state.state, "waiting");
+		task->state=TASK_WAITING;
 		break;
 	case TASK_PENDING:
 		SCHEMA_SET_STR(state.state, "pending");
+		task->state=TASK_PENDING;
 		break;
 	case TASK_RUNNING:
 		SCHEMA_SET_STR(state.state, "running");
+		task->state=TASK_RUNNING;
 		break;
 	case TASK_COMPLETE:
 		SCHEMA_SET_STR(state.state, "complete");
+		task->state=TASK_COMPLETE;
 		done = 1;
 		break;
 	case TASK_FAILED:
 		SCHEMA_SET_STR(state.state, "failed");
+		task->state=TASK_FAILED;
 		done = 1;
 		break;
 	default:
@@ -165,8 +170,35 @@ static int command_conf_add(struct schema_Command_Config *conf)
 	return -1;
 }
 
-static void command_conf_del(struct schema_Command_Config *conf)
+static int command_conf_del(struct schema_Command_Config *conf)
 {
+	int ret=0;
+	struct task *task=NULL, *next=NULL;
+	int err;
+	json_t* where;
+
+	list_for_each_entry_safe(task, next, &tasks,list) {
+		if (strcmp(task->conf._uuid.uuid, conf->_uuid.uuid)) {
+			continue;
+		}
+		if(task->state==TASK_RUNNING) {
+			LOGI("Deletes running Command not allowed:%s, UUID:%s",task->conf.command, task->conf._uuid.uuid);
+			ret = -1;
+			break;
+		}
+		LOGD("Delete scheduled Command:%s ,UUID:%s",task->conf.command,task->conf._uuid.uuid);
+		list_del(&task->list);
+		free(task);
+		break;
+	}
+	if(ret==0)
+	{
+		where = ovsdb_where_timestamp("timestamp",&conf->timestamp );
+		err=ovsdb_table_delete_where(&table_Command_State, where);
+		if (err < 0)
+			LOGI("Error Deleting Command State");
+	}
+	return ret;
 }
 
 static void callback_Command_Config(ovsdb_update_monitor_t *mon,
@@ -179,7 +211,7 @@ static void callback_Command_Config(ovsdb_update_monitor_t *mon,
 		command_conf_add(iconf);
 		break;
 	case OVSDB_UPDATE_DEL:
-		command_conf_del(old_rec);
+		command_conf_del(iconf);
 		break;
 	default:
 		LOG(ERR, "Invalid Command_Config mon_type(%d)", mon->mon_type);

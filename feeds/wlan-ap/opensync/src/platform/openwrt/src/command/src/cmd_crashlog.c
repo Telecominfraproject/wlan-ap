@@ -30,7 +30,7 @@ pid_t cmd_handler_crashlog(struct task *task)
 	pid_t pid;
 
 	if (!crash_timestamp) {
-		task_status(task, TASK_FAILED, "no crashlog found");
+		LOGI("No Crashlog Found");
 		return -1;
 	}
 
@@ -38,8 +38,7 @@ pid_t cmd_handler_crashlog(struct task *task)
 
 	_url = SCHEMA_KEY_VAL(task->conf.payload, "ul_url");
 	if (!_url) {
-		LOG(ERR, "curl: command without a valid ul_url");
-		task_status(task, TASK_FAILED, "invalid url");
+		LOGN("curl: crashlog command without a valid ul_url");
 		return -1;
 	}
 	snprintf(url, sizeof(url), "%s/%s-%lu.crashlog", _url, serial, crash_timestamp);
