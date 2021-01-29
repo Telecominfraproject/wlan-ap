@@ -65,19 +65,36 @@ static const struct blobmsg_policy route_policy[__ROUTE_ATTR_MAX] = {
 static ovsdb_table_t table_Wifi_Inet_State;
 static ovsdb_table_t table_Wifi_Master_State;
 
+int l3_device_split_gre(char *l3_device, struct iface_info *info)
+{
+	char *delim;
+	memset (info, 0, sizeof(*info));
+	delim = strstr(l3_device, ".");
+	if (!delim) {
+		strcpy(info->name, &l3_device[6]);
+	} else {
+		strncpy(info->name, &l3_device[6], delim - l3_device - 6);
+		info->vid = atoi(&delim[1]);
+	}
+
+	return 0;
+}
+
 int l3_device_split(char *l3_device, struct iface_info *info)
 {
-	char *dot;
-
+	char *delim;
 	if (strncmp(l3_device, "br-", 3))
 		return -1;
 	memset (info, 0, sizeof(*info));
-	dot = strstr(l3_device, ".");
-	if (!dot) {
+	if (!strncmp(l3_device, "br-gre", 6))
+		delim = strstr(l3_device, "_");
+	else
+		delim = strstr(l3_device, ".");
+	if (!delim) {
 		strcpy(info->name, &l3_device[3]);
 	} else {
-		strncpy(info->name, &l3_device[3], dot - l3_device - 3);
-		info->vid = atoi(&dot[1]);
+		strncpy(info->name, &l3_device[3], delim - l3_device - 3);
+		info->vid = atoi(&delim[1]);
 	}
 
 	return 0;

@@ -97,6 +97,7 @@ static void wifi_inet_conf_load(struct uci_section *s)
 	struct schema_Wifi_Inet_Config conf;
 	struct iface_info info;
 	char *ifname = NULL;
+	int rc = -1;
 
 	if (!strcmp(s->e.name, "loopback"))
 		return;
@@ -109,15 +110,13 @@ static void wifi_inet_conf_load(struct uci_section *s)
 
 	SCHEMA_SET_STR(conf.if_name, s->e.name);
 	if (tb[NET_ATTR_TYPE])
-                if ((strstr(s->e.name,"wan_") != NULL) || (strstr(s->e.name,"lan_") != NULL))
-                        SCHEMA_SET_STR(conf.if_type, "vlan");
-                else
-			SCHEMA_SET_STR(conf.if_type, blobmsg_get_string(tb[NET_ATTR_TYPE]));
+		SCHEMA_SET_STR(conf.if_type, blobmsg_get_string(tb[NET_ATTR_TYPE]));
+	else if ((strstr(s->e.name,"wan_") != NULL) || (strstr(s->e.name,"lan_") != NULL))
+		SCHEMA_SET_STR(conf.if_type, "vlan");
+	else if (strstr(s->e.name,"wlan") != NULL)
+		SCHEMA_SET_STR(conf.if_type, "vif");
 	else
-		if (strstr(s->e.name,"wlan") != NULL)
-			SCHEMA_SET_STR(conf.if_type, "vif");
-		else
-			SCHEMA_SET_STR(conf.if_type, "eth");
+		SCHEMA_SET_STR(conf.if_type, "eth");
 
 	if (!tb[NET_ATTR_DISABLED] || !blobmsg_get_u8(tb[NET_ATTR_DISABLED])) {
 		conf.enabled = true;
@@ -156,16 +155,23 @@ static void wifi_inet_conf_load(struct uci_section *s)
 	if (tb[NET_ATTR_IFNAME])
 		ifname = blobmsg_get_string(tb[NET_ATTR_IFNAME]);
 
-	if (ifname && *ifname == '@')
-		SCHEMA_SET_STR(conf.parent_ifname, &ifname[1]);
-	else if (strcmp(conf.if_type, "gre"))
-		dhcp_get_config(&conf);
+	if (ifname) {
+		if(!strncmp(ifname, "gre4", strlen("gre4")) || !strncmp(ifname, "gre6", strlen("gre6")))
+			rc = l3_device_split_gre(ifname, &info);
+		else if (*ifname == '@')
+			SCHEMA_SET_STR(conf.parent_ifname, &ifname[1]);
+		else
+			rc = l3_device_split(ifname, &info);
+	}
 
-	if (ifname && !l3_device_split(ifname, &info)) {
+	if (!rc) {
 		SCHEMA_SET_STR(conf.parent_ifname, info.name);
 		if (info.vid)
 			SCHEMA_SET_INT(conf.vlan_id, info.vid);
 	}
+
+	if (strcmp(conf.if_type, "gre"))
+		dhcp_get_config(&conf);
 
 	if (!strcmp(conf.if_type, "gre")) {
 		if (tb[NET_ATTR_IPADDR]) {
@@ -182,11 +188,6 @@ static void wifi_inet_conf_load(struct uci_section *s)
 		} else if (tb[NET_ATTR_GRE6_REMOTE_ADDR]) {
 			SCHEMA_SET_STR(conf.gre_remote_inet_addr,
 					blobmsg_get_string(tb[NET_ATTR_GRE6_REMOTE_ADDR]));
-		}
-
-		if (tb[NET_ATTR_IFNAME]) {
-			SCHEMA_SET_STR(conf.gre_ifname,
-					blobmsg_get_string(tb[NET_ATTR_IFNAME]));
 		}
 	}
 
@@ -255,11 +256,17 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 	} else
 		blobmsg_add_bool(&del, "type", 1);
 
-	if (iconf->parent_ifname_exists && iconf->vlan_id > 2 && !strcmp(iconf->if_type, "vlan")) {
+	if (iconf->parent_ifname_exists && iconf->vlan_id > 2) {
 		char uci_ifname[256];
-
-		snprintf(uci_ifname, sizeof(uci_ifname), "br-%s.%d", iconf->parent_ifname, iconf->vlan_id);
-		blobmsg_add_string(&b, "ifname", uci_ifname);
+		if(!strncmp(iconf->parent_ifname, "gre", strlen("gre"))) {
+			snprintf(uci_ifname, sizeof(uci_ifname), "gre4t-%s.%d", iconf->parent_ifname, iconf->vlan_id);
+			blobmsg_add_string(&b, "ifname", uci_ifname);
+			blobmsg_add_string(&b, "type", "bridge");
+		}
+		else {
+			snprintf(uci_ifname, sizeof(uci_ifname), "br-%s.%d", iconf->parent_ifname, iconf->vlan_id);
+			blobmsg_add_string(&b, "ifname", uci_ifname);
+		}
 	}
 
 	if (iconf->ip_assign_scheme_exists) {
@@ -275,7 +282,7 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 	if (iconf->netmask_exists)
 		blobmsg_add_string(&b, "netmask", iconf->netmask);
 
-	if (iconf->vlan_id_exists) {
+	if (iconf->vlan_id_exists && strncmp(iconf->parent_ifname, "gre", strlen("gre"))) {
 		blobmsg_add_u32(&b, "ip4table", iconf->vlan_id);
 		blobmsg_add_u32(&b, "vid", iconf->vlan_id);
 	} else {
@@ -284,15 +291,23 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 	}
 
 	if (!strcmp(iconf->if_type, "gre")) {
-		blobmsg_add_string(&b, "ifname", iconf->gre_ifname);
 		if (!is_ipv6) {
+			char ip_addr[IPV4_ADDR_STR_LEN];
+			if (ubus_get_wan_ip(ip_addr) || !strlen(ip_addr)) {
+				LOG(ERR, "netifd: Failed to get wan ip. GRE tunnel interface won't be created");
+				return -1;
+			}
 			blobmsg_add_string(&b, "proto", "gretap");
-			blobmsg_add_string(&b, "ipaddr", iconf->gre_local_inet_addr);
+			blobmsg_add_string(&b, "ipaddr", ip_addr);
 			blobmsg_add_string(&b, "peeraddr", iconf->gre_remote_inet_addr);
+			blobmsg_add_u32(&b, "mtu", 1500);
+			blobmsg_add_bool(&b, "force_link", 1);
 		} else {
 			blobmsg_add_string(&b, "proto", "grev6tap");
 			blobmsg_add_string(&b, "ip6addr", iconf->gre_local_inet_addr);
 			blobmsg_add_string(&b, "peer6addr", iconf->gre_remote_inet_addr);
+			blobmsg_add_u32(&b, "mtu", 1500);
+			blobmsg_add_bool(&b, "force_link", 1);
 		}
 	}
 
