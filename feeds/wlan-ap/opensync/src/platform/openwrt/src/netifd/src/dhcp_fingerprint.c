@@ -10,7 +10,7 @@ bool dhcp_fp_db_lookup (dhcp_fp_data_t *fp_data, char *option_seq)
 	FILE *fp = NULL;
 	char *line = NULL;
 	int i, rd, rt, found = 0;
-	size_t len;
+	size_t len = 0;
 	int dev_type, dev_manufid = 0;
 
 	memset(fp_data, 0, sizeof(dhcp_fp_data_t));
@@ -119,6 +119,9 @@ bool dhcp_fp_db_lookup (dhcp_fp_data_t *fp_data, char *option_seq)
 	if (local_db.index >= MAX_DHCP_FINGERPRINT_LOCAL_DB)
 		local_db.index = 0;
 
+
+	fclose(fp);
+	free(line);
 	return true;
 
 db_lookup_exit:
