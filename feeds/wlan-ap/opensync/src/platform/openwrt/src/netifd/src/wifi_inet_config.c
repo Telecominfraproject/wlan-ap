@@ -393,9 +393,6 @@ static void callback_Wifi_Inet_Config(ovsdb_update_monitor_t *mon,
 		return;
 	}
 
-	netifd_inet_config_set(piface, iconf);
-	netifd_inet_config_apply(piface);
-
 	return;
 }
 

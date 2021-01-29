@@ -104,6 +104,11 @@ inet_base_t *netifd_iface_new_inet(const char *ifname, const char *iftype)
 	memset(self, 0, sizeof(inet_base_t));
 	if((!strcmp(ifname, "wan") && !strcmp(iftype,"bridge")) || (!strcmp(ifname, "lan") && !strcmp(iftype,"bridge"))) {
 		snprintf(self->inet.in_ifname, sizeof(self->inet.in_ifname), "br-%s", ifname);
+	} else if (!strcmp(iftype,"vlan")) {
+		char name[15]= {};
+		unsigned int id = 0;
+		sscanf(ifname, "%[^_]_%d", name, &id);
+		snprintf(self->inet.in_ifname, sizeof(self->inet.in_ifname), "br-%s.%d", name, id);
 	} else {
 		STRSCPY(self->inet.in_ifname, ifname);
 	}

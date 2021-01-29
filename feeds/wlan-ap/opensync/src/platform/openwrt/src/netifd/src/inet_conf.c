@@ -11,11 +11,22 @@ struct netifd_iface* netifd_add_inet_conf(struct schema_Wifi_Inet_Config *iconf)
 
 	struct netifd_iface *piface = NULL;
 
-	piface = netifd_iface_new(iconf->if_name, iconf->if_type);
+	piface = netifd_iface_get_by_name(iconf->if_name);
 	if (piface == NULL)
 	{
-		LOG(ERR, "netifd_add_inet_conf: %s: Unable to create interface.", iconf->if_name);
-		return NULL;
+		piface = netifd_iface_new(iconf->if_name, iconf->if_type);
+		if (piface == NULL)
+		{
+			LOG(ERR, "netifd_add_inet_conf: %s: Unable to create interface.", iconf->if_name);
+			return NULL;
+		}
+
+		if (!strcmp(iconf->if_type, "bridge") || !strcmp(iconf->if_type, "vlan"))
+		{
+			LOGN("Setting up dhsnif for %s", piface->if_base->inet.in_ifname);
+			netifd_inet_config_set(piface);
+			netifd_inet_config_apply(piface);
+		}
 	}
 
 	return piface;
@@ -55,26 +66,19 @@ struct netifd_iface* netifd_modify_inet_conf(struct schema_Wifi_Inet_Config *ico
 	return piface;
 }
 
-/* Apply DHCP sniffing configuration from schema */
-bool netifd_inet_dhsnif_set(struct netifd_iface *piface, const struct schema_Wifi_Inet_Config *iconf)
+bool netifd_inet_dhsnif_set(struct netifd_iface *piface)
 {
-	/*
-	 * Enable or disable the DHCP sniffing callback according to schema values
-	 */
-	if (iconf->dhcp_sniff_exists && iconf->dhcp_sniff) {
-		LOG(INFO, "Enable dhcp sniffing callback on %s.",
-				iconf->if_name);
+		LOG(INFO, "Enable dhcp sniffing callback on %s.", piface->if_base->inet.in_ifname);
 		return inet_dhsnif_notify(piface->if_base->in_dhsnif,
 				netifd_dhcp_lease_notify, piface->if_inet);
-	}
-	return inet_dhsnif_notify(piface->if_base->in_dhsnif, NULL, piface->if_inet);
+
 }
 
-bool netifd_inet_config_set(struct netifd_iface *piface, struct schema_Wifi_Inet_Config *iconf)
+bool netifd_inet_config_set(struct netifd_iface *piface)
 {
 	bool retval = true;
 
-	retval = netifd_inet_dhsnif_set(piface, iconf);
+	retval = netifd_inet_dhsnif_set(piface);
 
 	return retval;
 }
