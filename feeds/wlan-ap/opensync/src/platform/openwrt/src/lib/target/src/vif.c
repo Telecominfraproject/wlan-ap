@@ -698,10 +698,19 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	else
 		LOGW("%s: unknown bridge/network", s->e.name);
 
-	if (tb[WIF_ATTR_VLAN_ID])
+	if (tb[WIF_ATTR_NETWORK] && !strncmp(blobmsg_get_string(tb[WIF_ATTR_NETWORK]), "gre", strlen("gre"))) {
+		char network[IFNAMSIZ];
+		char *token;
+		strncpy(network, blobmsg_get_string(tb[WIF_ATTR_NETWORK]), IFNAMSIZ);
+		token = strtok(network, "_");
+		token = strtok(NULL, "_");
+		if (NULL != token)
+			SCHEMA_SET_INT(vstate.vlan_id, atoi(token));
+	} else if (tb[WIF_ATTR_VLAN_ID]) {
 		SCHEMA_SET_INT(vstate.vlan_id, blobmsg_get_u32(tb[WIF_ATTR_VLAN_ID]));
-	else
+	} else {
 		SCHEMA_SET_INT(vstate.vlan_id, 1);
+	}
 
 	if (tb[WIF_ATTR_SSID])
 		SCHEMA_SET_STR(vstate.ssid, blobmsg_get_string(tb[WIF_ATTR_SSID]));
@@ -1273,7 +1282,7 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 	if (changed->bridge)
 		blobmsg_add_string(&b, "network", vconf->bridge);
 
-	if (changed->vlan_id) {
+	if (changed->vlan_id && strncmp(vconf->bridge, "gre", strlen("gre"))) {
 		blobmsg_add_u32(&b, "vlan_id", vconf->vlan_id);
 		if (vconf->vlan_id > 2)
 			vid = vconf->vlan_id;
@@ -1283,7 +1292,6 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 	if (changed->mac_list_type) {
 		struct blob_attr *a;
 		int i;
-
 		if (!strcmp(vconf->mac_list_type, "whitelist"))
 			blobmsg_add_string(&b, "macfilter", "allow");
 		else if (!strcmp(vconf->mac_list_type,"blacklist"))

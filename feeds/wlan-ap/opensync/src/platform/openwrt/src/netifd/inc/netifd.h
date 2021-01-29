@@ -19,6 +19,8 @@
 #include <libubox/blobmsg.h>
 #include "utils.h"
 
+#define IPV4_ADDR_STR_LEN 16
+
 #define SCHEMA_FIND_KEY(x, key)    __find_key(	 \
 	(char *)x##_keys, sizeof(*(x ## _keys)), \
 	(char *)x, sizeof(*(x)), x##_len, key)
@@ -43,6 +45,8 @@ struct iface_info {
 };
 
 extern int l3_device_split(char *l3_device, struct iface_info *info);
+extern int l3_device_split_gre(char *l3_device, struct iface_info *info);
+
 
 extern struct blob_buf b;
 extern ovsdb_table_t table_Wifi_Inet_Config;
@@ -65,5 +69,6 @@ extern void firewall_add_zone(char *net, int nat);
 extern void firewall_del_zone(char *net);
 extern void firewall_get_state(struct schema_Wifi_Inet_State *state);
 extern void firewall_get_config(struct schema_Wifi_Inet_Config *conf);
+extern int ubus_get_wan_ip(char *ipaddr);
 
 #endif
