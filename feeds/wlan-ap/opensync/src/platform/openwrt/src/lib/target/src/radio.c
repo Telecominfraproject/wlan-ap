@@ -49,6 +49,7 @@ enum {
 	WDEV_ATTR_COUNTRY,
 	WDEV_ATTR_CHANBW,
 	WDEV_ATTR_TX_ANTENNA,
+	WDEV_ATTR_RX_ANTENNA,
 	WDEV_ATTR_FREQ_BAND,
 	WDEV_ATTR_DISABLE_B_RATES,
 	__WDEV_ATTR_MAX,
@@ -64,7 +65,8 @@ static const struct blobmsg_policy wifi_device_policy[__WDEV_ATTR_MAX] = {
 	[WDEV_ATTR_HWMODE] = { .name = "hwmode", .type = BLOBMSG_TYPE_STRING },
 	[WDEV_ATTR_COUNTRY] = { .name = "country", .type = BLOBMSG_TYPE_STRING },
 	[WDEV_ATTR_CHANBW] = { .name = "chanbw", .type = BLOBMSG_TYPE_INT32 },
-	[WDEV_ATTR_TX_ANTENNA] = { .name = "tx_antenna", .type = BLOBMSG_TYPE_INT32 },
+	[WDEV_ATTR_TX_ANTENNA] = { .name = "txantenna", .type = BLOBMSG_TYPE_INT32 },
+	[WDEV_ATTR_RX_ANTENNA] = { .name = "rxantenna", .type = BLOBMSG_TYPE_INT32 },
 	[WDEV_ATTR_FREQ_BAND] = { .name = "freq_band", .type = BLOBMSG_TYPE_STRING },
         [WDEV_ATTR_DISABLE_B_RATES] = { .name = "legacy_rates", .type = BLOBMSG_TYPE_BOOL },
 };
@@ -199,6 +201,11 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 	else
 		SCHEMA_SET_INT(rstate.tx_chainmask, phy_get_tx_chainmask(phy));
 
+	if (tb[WDEV_ATTR_RX_ANTENNA])
+		SCHEMA_SET_INT(rstate.rx_chainmask, blobmsg_get_u32(tb[WDEV_ATTR_RX_ANTENNA]));
+	else
+		SCHEMA_SET_INT(rstate.rx_chainmask, phy_get_rx_chainmask(phy));
+
 	if (rstate.hw_mode_exists && rstate.ht_mode_exists) {
 		struct mode_map *m = mode_map_get_cloud(rstate.ht_mode, rstate.hw_mode);
 
@@ -263,6 +270,12 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 	blob_buf_init(&b, 0);
 	blob_buf_init(&del, 0);
 
+	char phy[6];
+	char ifname[8];
+
+	strncpy(ifname, rconf->if_name, sizeof(ifname));
+	strncpy(phy, target_map_ifname(ifname), sizeof(phy));
+
 	if (changed->channel && rconf->channel)
 		blobmsg_add_u32(&b, "channel", rconf->channel);
 
@@ -272,8 +285,29 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 	if (changed->tx_power)
 		blobmsg_add_u32(&b, "txpower", rconf->tx_power);
 
-	if (changed->tx_chainmask)
-		blobmsg_add_u32(&b, "tx_antenna", rconf->tx_chainmask);
+	if (changed->tx_chainmask) {
+		int tx_ant_avail;
+		tx_ant_avail=phy_get_tx_available_antenna(phy);
+
+		if ((rconf->tx_chainmask & tx_ant_avail) != rconf->tx_chainmask) {
+			blobmsg_add_u32(&b, "txantenna", tx_ant_avail);
+			LOGN("maximum number of tx antennae available to use:%d",tx_ant_avail);
+		}
+		else
+			blobmsg_add_u32(&b, "txantenna", rconf->tx_chainmask);
+	}
+
+	if (changed->rx_chainmask) {
+		int rx_ant_avail;
+		rx_ant_avail=phy_get_rx_available_antenna(phy);
+
+		if ((rconf->rx_chainmask & rx_ant_avail) != rconf->rx_chainmask) {
+			blobmsg_add_u32(&b, "rxantenna", rx_ant_avail);
+			LOGN("maximum number of rx antennae available to use:%d",rx_ant_avail);
+		}
+		else
+			blobmsg_add_u32(&b, "rxantenna", rconf->rx_chainmask);
+	}
 
 	if (changed->country)
 		blobmsg_add_string(&b, "country", rconf->country);

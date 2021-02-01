@@ -208,6 +208,33 @@ int phy_get_tx_chainmask(const char *name)
 	return phy->tx_ant;
 }
 
+int phy_get_rx_chainmask(const char *name)
+{
+	struct wifi_phy *phy = phy_find(name);
+
+	if (!phy)
+		return 0;
+	return phy->rx_ant;
+}
+
+int phy_get_tx_available_antenna(const char *name)
+{
+	struct wifi_phy *phy = phy_find(name);
+
+	if (!phy)
+		return 0;
+	return phy->tx_ant_avail;
+}
+
+int phy_get_rx_available_antenna(const char *name)
+{
+	struct wifi_phy *phy = phy_find(name);
+
+	if (!phy)
+		return 0;
+	return phy->rx_ant_avail;
+}
+
 int phy_get_channels(const char *name, int *channel)
 {
 	struct wifi_phy *phy = phy_find(name);
