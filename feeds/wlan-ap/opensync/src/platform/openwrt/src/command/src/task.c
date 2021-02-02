@@ -13,6 +13,7 @@ char serial[64];
 static struct cmd_handler {
 	char *cmd;
 	int (*cb)(struct task *task);
+	bool doNotQueue;
 } cmd_handler[] = {
 	{
 		.cmd = "tcpdump",
@@ -26,6 +27,10 @@ static struct cmd_handler {
 	}, {
 		.cmd = "startPortForwardingSession",
 		.cb = cmd_handler_port_forwarding,
+	}, {
+		.cmd = "stopSession",
+		.cb = cmd_handler_stop_session,
+		.doNotQueue = 1,
 	},
 };
 
@@ -100,10 +105,14 @@ void task_status(struct task *task, int status, char *result)
 	if (!done)
 		return;
 
-	list_del(&task->list);
-	free(task);
-	task_running = 0;
-	task_next();
+	if(!task->handler->doNotQueue) {
+		list_del(&task->list);
+		free(task);
+		task_running = 0;
+		task_next();
+	} else {
+		free(task);
+	}
 }
 
 static void task_run(void *arg)
@@ -160,6 +169,10 @@ static int command_conf_add(struct schema_Command_Config *conf)
 			task->handler = &cmd_handler[i];
 			if (task->conf.duration < 10)
 				task->conf.duration = 10;
+			if(task->handler->doNotQueue) {
+				task->pid = task->handler->cb(task);
+				return 0;
+			}
 			list_add_tail(&task->list, &tasks);
 			if (!list_empty(&tasks))
 				task_status(task, TASK_WAITING, NULL);

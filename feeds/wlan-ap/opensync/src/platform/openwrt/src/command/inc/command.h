@@ -52,5 +52,5 @@ extern void crashlog_init(void);
 extern pid_t cmd_handler_crashlog(struct task *task);
 extern pid_t cmd_handler_port_forwarding(struct task *task);
 extern int port_forwarding(char *ipAddress, char *port);
-
+extern int cmd_handler_stop_session(struct task *task);
 #endif
