@@ -9,6 +9,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <curl/curl.h>
+#include <sys/prctl.h>
+
+#define BUF_SIZE 8
 
 static void cmd_handler_port_forwarding_cb(struct ev_loop *loop, ev_child *child, int revents)
 {
@@ -16,6 +19,30 @@ static void cmd_handler_port_forwarding_cb(struct ev_loop *loop, ev_child *child
 
 	ev_child_stop(loop, child);
 	task_status(task, TASK_COMPLETE, NULL);
+}
+
+int cmd_handler_stop_session(struct task *task)
+{
+	pid_t pid = 0;
+	char buf[BUF_SIZE];
+
+	FILE *cmd_pipe = popen("pidof portfwd", "r");
+
+	if (cmd_pipe) {
+	fgets(buf, BUF_SIZE, cmd_pipe);
+	pid = strtoul(buf, NULL, 10);
+	pclose( cmd_pipe );
+	}
+
+	if(pid) {
+	LOG(DEBUG,"killing pid = %d", pid);
+	kill(pid, SIGKILL);
+	}
+
+	task_status(task, TASK_COMPLETE, NULL);
+	LOGN("Updating the task status stop session");
+
+	return 1;
 }
 
 pid_t cmd_handler_port_forwarding(struct task *task)
@@ -27,9 +54,10 @@ pid_t cmd_handler_port_forwarding(struct task *task)
 	gateway = SCHEMA_KEY_VAL(task->conf.payload, "gateway_hostname");
 	port = SCHEMA_KEY_VAL(task->conf.payload, "gateway_port");
 	
-	LOG(ERR, "gateway : %s   , port: %s ", gateway, port);
+	LOG(DEBUG, "gateway : %s   , port: %s ", gateway, port);
 	pid = fork();
 	if (pid == 0) {
+		prctl(PR_SET_NAME, (unsigned long)"portfwd", NULL, NULL, NULL);
 		port_forwarding(gateway, port);
 		exit(1);
 	}
