@@ -115,6 +115,10 @@ enum {
 	WIF_ATTR_MESH_ID,
 	WIF_ATTR_MESH_FWDING,
 	WIF_ATTR_MESH_MCAST_RATE,
+	WIF_ATTR_DYNAMIC_VLAN,
+	WIF_ATTR_DVLAN_FILE,
+	WIF_ATTR_DVLAN_NAMING,
+	WIF_ATTR_DVLAN_BRIDGE,
 	__WIF_ATTR_MAX,
 };
 
@@ -192,6 +196,10 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_MESH_ID] = { .name = "mesh_id", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_MESH_FWDING] = { .name = "mesh_fwding", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_MESH_MCAST_RATE] = { .name = "mcast_rate", BLOBMSG_TYPE_INT32 },
+	[WIF_ATTR_DYNAMIC_VLAN] = { .name = "dynamic_vlan", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_DVLAN_FILE] = { .name = "vlan_file", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_DVLAN_NAMING] = { .name = "vlan_naming", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_DVLAN_BRIDGE] = { .name = "vlan_bridge", BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -422,7 +430,7 @@ out_none:
 
 /* Custom options table */
 #define SCHEMA_CUSTOM_OPT_SZ            20
-#define SCHEMA_CUSTOM_OPTS_MAX          10
+#define SCHEMA_CUSTOM_OPTS_MAX          11
 
 const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 {
@@ -435,10 +443,11 @@ const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 	SCHEMA_CONSTS_RTS_THRESHOLD,
 	SCHEMA_CONSTS_DTIM_PERIOD,
 	SCHEMA_CONSTS_RADIUS_OPER_NAME,
-	SCHEMA_CONSTS_RADIUS_NAS_ID
+	SCHEMA_CONSTS_RADIUS_NAS_ID,
+	SCHEMA_CONSTS_DYNAMIC_VLAN,
 };
 
-static void vif_config_custom_opt_set(struct blob_buf *b,
+static void vif_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del,
                                       const struct schema_Wifi_VIF_Config *vconf)
 {
 	int i;
@@ -494,6 +503,26 @@ static void vif_config_custom_opt_set(struct blob_buf *b,
 			n = blobmsg_open_array(b,"radius_acct_req_attr");
 			blobmsg_add_string(b, NULL, operator_name);
 			blobmsg_close_array(b, n);
+		}
+		else if (strcmp(opt, "dynamic_vlan") == 0) {
+			blobmsg_add_string(b, "dynamic_vlan", value);
+
+			if (strcmp(value, "1") == 0 || strcmp(value, "2") == 0) {
+				strncpy(value, "/etc/hostapd.vlan", 20);
+				blobmsg_add_string(b, "vlan_file", value);
+				strncpy(value, "0", 20);
+				blobmsg_add_string(b, "vlan_naming", value);
+				strncpy(value, "br-wan.", 20);
+				blobmsg_add_string(b, "vlan_bridge", value);
+			}
+			else {
+				strncpy(value, "/etc/hostapd.vlan", 20);
+				blobmsg_add_string(del, "vlan_file", value);
+				strncpy(value, "0", 20);
+				blobmsg_add_string(del, "vlan_naming", value);
+				strncpy(value, "br-wan.", 20);
+				blobmsg_add_string(del, "vlan_bridge", value);
+			}
 		}
 	}
 }
@@ -613,6 +642,13 @@ static void vif_state_custom_options_get(struct schema_Wifi_VIF_State *vstate,
 							custom_options_table[i],
 							value);
 				}
+			}
+		} else if (strcmp(opt, "dynamic_vlan") == 0) {
+			if (tb[WIF_ATTR_DYNAMIC_VLAN]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_DYNAMIC_VLAN]);
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							buf);
 			}
 		}
 	}
@@ -1305,7 +1341,7 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
         }
 
 	if (changed->custom_options)
-		vif_config_custom_opt_set(&b, vconf);
+		vif_config_custom_opt_set(&b, &del, vconf);
 
 	rrm_config_vif(&b, &del, rconf->freq_band, vconf->if_name);
 
