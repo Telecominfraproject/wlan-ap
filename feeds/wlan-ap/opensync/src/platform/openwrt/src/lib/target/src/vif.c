@@ -115,6 +115,9 @@ enum {
 	WIF_ATTR_MESH_ID,
 	WIF_ATTR_MESH_FWDING,
 	WIF_ATTR_MESH_MCAST_RATE,
+	WIF_ATTR_DYNAMIC_VLAN,
+	WIF_ATTR_VLAN_TAGGED_IFACE,
+	WIF_ATTR_VLAN_FILE,
 	__WIF_ATTR_MAX,
 };
 
@@ -192,6 +195,9 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_MESH_ID] = { .name = "mesh_id", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_MESH_FWDING] = { .name = "mesh_fwding", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_MESH_MCAST_RATE] = { .name = "mcast_rate", BLOBMSG_TYPE_INT32 },
+	[WIF_ATTR_DYNAMIC_VLAN] = { .name = "dynamic_vlan", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_VLAN_TAGGED_IFACE] = { .name = "vlan_tagged_interface", .type = BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_VLAN_FILE] = { .name = "vlan_file", BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -421,8 +427,8 @@ out_none:
 }
 
 /* Custom options table */
-#define SCHEMA_CUSTOM_OPT_SZ            20
-#define SCHEMA_CUSTOM_OPTS_MAX          10
+#define SCHEMA_CUSTOM_OPT_SZ            22
+#define SCHEMA_CUSTOM_OPTS_MAX          13
 
 const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 {
@@ -435,7 +441,10 @@ const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 	SCHEMA_CONSTS_RTS_THRESHOLD,
 	SCHEMA_CONSTS_DTIM_PERIOD,
 	SCHEMA_CONSTS_RADIUS_OPER_NAME,
-	SCHEMA_CONSTS_RADIUS_NAS_ID
+	SCHEMA_CONSTS_RADIUS_NAS_ID,
+	SCHEMA_CONSTS_DYNAMIC_VLAN,
+	SCHEMA_CONSTS_VLAN_TAGGED_IFACE,
+	SCHEMA_CONSTS_VLAN_FILE
 };
 
 static void vif_config_custom_opt_set(struct blob_buf *b,
@@ -494,6 +503,15 @@ static void vif_config_custom_opt_set(struct blob_buf *b,
 			n = blobmsg_open_array(b,"radius_acct_req_attr");
 			blobmsg_add_string(b, NULL, operator_name);
 			blobmsg_close_array(b, n);
+		}
+		else if (strcmp(opt, "dynamic_vlan") == 0) {
+			blobmsg_add_string(b, "dynamic_vlan", value);
+		}
+		else if (strcmp(opt, "vlan_tagged_interface") == 0) {
+			blobmsg_add_string(b, "vlan_tagged_interface", value);
+		}
+		else if (strcmp(opt, "vlan_file") == 0) {
+			blobmsg_add_string(b, "vlan_file", value);
 		}
 	}
 }
@@ -614,7 +632,28 @@ static void vif_state_custom_options_get(struct schema_Wifi_VIF_State *vstate,
 							value);
 				}
 			}
-		}
+		} else if (strcmp(opt, "dynamic_vlan") == 0) {
+			if (tb[WIF_ATTR_DYNAMIC_VLAN]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_DYNAMIC_VLAN]);
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							buf);
+			}
+		} else if (strcmp(opt, "vlan_tagged_interface") == 0) {
+			if (tb[WIF_ATTR_VLAN_TAGGED_IFACE]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_VLAN_TAGGED_IFACE]);
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							buf);
+			}
+		} else if (strcmp(opt, "vlan_file") == 0) {
+			if (tb[WIF_ATTR_VLAN_FILE]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_VLAN_FILE]);
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							buf);
+			}
+		} 
 	}
 }
 
