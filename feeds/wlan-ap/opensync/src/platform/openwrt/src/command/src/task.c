@@ -52,6 +52,21 @@ bool ovsdb_table_upsert_simple_typed(ovsdb_table_t *table,
 	return ovsdb_table_upsert_simple_typed_f(table, column, value, col_type, record, update_uuid, NULL);
 }
 
+static void clear_entry_from_table(struct task *task)
+{
+	json_t* where;
+	int err;
+
+	where = ovsdb_where_uuid("cmd_uuid",task->conf._uuid.uuid );
+	err=ovsdb_table_delete_where(&table_Command_State, where);
+	if (err < 0)
+	LOG(ERR,"Error Deleting Command State");
+
+	where = ovsdb_where_uuid("_uuid",task->conf._uuid.uuid );
+	err=ovsdb_table_delete_where(&table_Command_Config, where);
+	if (err < 0)
+	LOG(ERR,"Error Deleting Command Config");
+}
 void task_status(struct task *task, int status, char *result)
 {
 	struct schema_Command_State state;
@@ -106,11 +121,13 @@ void task_status(struct task *task, int status, char *result)
 		return;
 
 	if(!task->handler->doNotQueue) {
+		clear_entry_from_table(task);
 		list_del(&task->list);
 		free(task);
 		task_running = 0;
 		task_next();
 	} else {
+		clear_entry_from_table(task);
 		free(task);
 	}
 }
@@ -183,37 +200,6 @@ static int command_conf_add(struct schema_Command_Config *conf)
 	return -1;
 }
 
-static int command_conf_del(struct schema_Command_Config *conf)
-{
-	int ret=0;
-	struct task *task=NULL, *next=NULL;
-	int err;
-	json_t* where;
-
-	list_for_each_entry_safe(task, next, &tasks,list) {
-		if (strcmp(task->conf._uuid.uuid, conf->_uuid.uuid)) {
-			continue;
-		}
-		if(task->state==TASK_RUNNING) {
-			LOGI("Deletes running Command not allowed:%s, UUID:%s",task->conf.command, task->conf._uuid.uuid);
-			ret = -1;
-			break;
-		}
-		LOGD("Delete scheduled Command:%s ,UUID:%s",task->conf.command,task->conf._uuid.uuid);
-		list_del(&task->list);
-		free(task);
-		break;
-	}
-	if(ret==0)
-	{
-		where = ovsdb_where_timestamp("timestamp",&conf->timestamp );
-		err=ovsdb_table_delete_where(&table_Command_State, where);
-		if (err < 0)
-			LOGI("Error Deleting Command State");
-	}
-	return ret;
-}
-
 static void callback_Command_Config(ovsdb_update_monitor_t *mon,
 			       struct schema_Command_Config *old_rec,
 			       struct schema_Command_Config *iconf)
@@ -224,7 +210,6 @@ static void callback_Command_Config(ovsdb_update_monitor_t *mon,
 		command_conf_add(iconf);
 		break;
 	case OVSDB_UPDATE_DEL:
-		command_conf_del(iconf);
 		break;
 	default:
 		LOG(ERR, "Invalid Command_Config mon_type(%d)", mon->mon_type);
