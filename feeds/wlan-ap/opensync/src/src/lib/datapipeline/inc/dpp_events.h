@@ -41,6 +41,10 @@ typedef enum { CTR_IDLE_TOO_LONG = 0, CTR_PROBE_FAIL } ct_reason_t;
 /* proto: SecurityType */
 typedef enum { SEC_OPEN = 0, SEC_RADIUS, SEC_PSK } sec_type_t;
 
+/* proto: CSReason*/
+typedef enum { RADAR_DETECTED = 0, HIGH_INTERFERENCE} cs_reason_t;
+
+
 /* proto: ClientAssocEvent */
 typedef struct {
 	char __barrier[46];
@@ -184,6 +188,21 @@ typedef struct {
 
 	ds_dlist_node_t node;
 } dpp_event_record_t;
+
+/*proto: ChannelSwitchEvent*/
+
+typedef struct {
+       radio_type_t    band;
+       cs_reason_t     reason;
+       uint32_t        freq;
+       uint64_t        timestamp;
+} dpp_event_record_channel_switch_t;
+
+typedef struct {
+	dpp_event_record_channel_switch_t channel_event;
+
+       ds_dlist_node_t node;
+} dpp_event_channel_switch_t;
 
 /*******************************/
 /* ClientAssocEvent alloc/free */
@@ -443,6 +462,14 @@ dpp_event_record_alloc()
 	return record;
 }
 
+static inline void
+dpp_event_channel_record_free(dpp_event_channel_switch_t *record)
+{
+	if (NULL != record) {
+		free(record);
+	}
+}
+
 /* free */
 static inline void
 dpp_event_record_free(dpp_event_record_t *record)
@@ -456,6 +483,7 @@ dpp_event_record_free(dpp_event_record_t *record)
 /* Events report type */
 typedef struct {
 	ds_dlist_t client_event_list; /* dpp_event_record_t */
+        ds_dlist_t channel_switch_list; /* dpp_event_channel_switch_t*/
 } dpp_event_report_data_t;
 
 #endif /* DPP_EVENTS_H_INCLUDED */

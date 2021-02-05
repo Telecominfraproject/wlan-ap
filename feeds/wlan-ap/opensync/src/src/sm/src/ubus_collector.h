@@ -22,6 +22,9 @@ void ubus_collector_cleanup(void);
 
 #define UBUS_SOCKET "/var/run/ubus.sock"
 
+/* Poll channel switch after this many seconds */
+#define UBUS_CHANNEL_SWITCH_POLLING_DELAY 7
+
 /* Poll bss list after this many seconds */
 #define UBUS_BSS_POLLING_DELAY 7
 
@@ -109,8 +112,21 @@ enum {
 };
 
 enum {
+	CHANNEL_SWITCH_RADIO_NAME,
+	CHANNEL_SWITCH_REASON,
+	CHANNEL_SWITCH_TIMESPEC,
+	CHANNEL_SWITCH_FREQ,
+	__CHANNEL_SWITCH_MAX,
+};
+
+enum {
 	BSS_OBJECT_NAME,
 	__BSS_TABLE_MAX,
+};
+
+enum {
+	CHAN_SWITCH_EVENT,
+	__CHANNEL_SWITCH_EVENT_MAX,
 };
 
 #endif /* UBUS_COLLECTOR_H_INCLUDED */

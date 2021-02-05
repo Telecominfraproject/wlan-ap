@@ -18,6 +18,17 @@ typedef struct {
 	ds_dlist_node_t node;
 } delete_entry_t;
 
+static const struct blobmsg_policy ubus_collector_chan_switch_event_policy[__CHANNEL_SWITCH_EVENT_MAX] = {
+	[CHAN_SWITCH_EVENT] = {.name = "chan_switch_event", .type = BLOBMSG_TYPE_TABLE},
+};
+
+static const struct blobmsg_policy channel_switch_event_policy[__CHANNEL_SWITCH_MAX] = {
+	[CHANNEL_SWITCH_RADIO_NAME] = {.name = "radio_name", .type = BLOBMSG_TYPE_INT32},
+	[CHANNEL_SWITCH_REASON] = {.name = "reason", .type = BLOBMSG_TYPE_INT32},
+	[CHANNEL_SWITCH_TIMESPEC] = {.name = "timestamp", .type = BLOBMSG_TYPE_INT64},
+	[CHANNEL_SWITCH_FREQ] = {.name = "frequency", .type = BLOBMSG_TYPE_INT32},
+};
+
 typedef struct {
 	char obj_name[UBUS_OBJ_LEN];
 	ds_dlist_node_t node;
@@ -590,6 +601,95 @@ static void ubus_collector_bss_cb(struct ubus_request *req, int type,
 	}
 }
 
+static void ubus_collector_chan_switch_events_cb(struct ubus_request *req, int type,
+				  struct blob_attr *msg)
+{
+
+	int error = 0;
+	int rem = 0;
+	struct blob_attr *tb_chan_event_lst[__CHANNEL_SWITCH_EVENT_MAX] = {};
+	struct blob_attr *tb_chan_event_table[__CHANNEL_SWITCH_MAX] = {};
+	struct blob_attr *tb_chan_event_tbl = NULL;
+	dpp_event_channel_switch_t *channel_event_record = NULL;
+
+	if (!msg)
+		return;
+
+	LOG(INFO, "ubus_collector: received ubus collector chan event message");
+
+	error = blobmsg_parse(ubus_collector_chan_switch_event_policy,
+			      __CHANNEL_SWITCH_EVENT_MAX, tb_chan_event_lst,
+			      blobmsg_data(msg), blobmsg_data_len(msg));
+	if (error || !tb_chan_event_lst[CHAN_SWITCH_EVENT]) {
+		LOG(ERR,
+		    "ubus_collector: failed while parsing chan event policy");
+		return;
+	}
+
+	/* itereate channel event list */
+	blobmsg_for_each_attr(tb_chan_event_tbl, tb_chan_event_lst[CHAN_SWITCH_EVENT], rem)
+	{
+		error = blobmsg_parse(channel_switch_event_policy,
+				      __CHANNEL_SWITCH_MAX, tb_chan_event_table,
+				      blobmsg_data(tb_chan_event_tbl),
+				      blobmsg_data_len(tb_chan_event_tbl));
+		if (error) {
+			LOG(ERR,
+			    "ubus_collector_ failed while parsing chan event policy");
+			continue;
+		}
+
+		channel_event_record = malloc(sizeof(dpp_event_channel_switch_t));
+
+		channel_event_record->channel_event.band = frequency_to_band(blobmsg_get_u32(tb_chan_event_table[CHANNEL_SWITCH_RADIO_NAME]));
+		channel_event_record->channel_event.reason = blobmsg_get_u32(tb_chan_event_table[CHANNEL_SWITCH_REASON]);
+		channel_event_record->channel_event.freq = frequency_to_channel(blobmsg_get_u32(tb_chan_event_table[CHANNEL_SWITCH_FREQ]));
+		channel_event_record->channel_event.timestamp = blobmsg_get_u64(tb_chan_event_table[CHANNEL_SWITCH_TIMESPEC]);
+		LOG(DEBUG, "ubus_collector : Channel Switch event : radio %d, reason %d, channel %d"
+		, channel_event_record->channel_event.band, channel_event_record->channel_event.reason,
+		channel_event_record->channel_event.freq);
+		ds_dlist_insert_tail(&g_event_report.channel_switch_list, channel_event_record);
+	}
+
+	return;
+
+
+}
+
+static void ubus_collector_complete_channel_switch_cb(struct ubus_request *req, int ret)
+{
+	LOG(DEBUG, "ubus_collector_complete_channel_switch_cb");
+	if (req)
+		free(req);
+}
+
+static void ubus_collector_hostapd_channel_switch_invoke(void *arg)
+{
+	uint32_t ubus_object_id = 0;
+	const char *object_path = "hostapd";
+	const char *hostapd_method = "get_chan_switch_events";
+	struct ubus_request *req = malloc(sizeof(struct ubus_request));
+
+	if (ubus_lookup_id(ubus, object_path, &ubus_object_id)) {
+		LOG(ERR, "ubus_collector: could not find ubus object %s",
+		    object_path);
+		free(req);
+		evsched_task_reschedule();
+		return;
+	}
+
+	LOG(DEBUG, "ubus_collector: requesting hostapd channel switch data");
+
+	ubus_invoke_async(ubus, ubus_object_id, hostapd_method, NULL, req);
+
+	req->data_cb = (ubus_data_handler_t)ubus_collector_chan_switch_events_cb;
+	req->complete_cb = (ubus_complete_handler_t)ubus_collector_complete_channel_switch_cb;
+
+	ubus_complete_request_async(ubus, req);
+
+	evsched_task_reschedule();
+}
+
 static void ubus_collector_hostapd_bss_invoke(void *arg)
 {
 	uint32_t ubus_object_id = 0;
@@ -681,6 +781,7 @@ int ubus_collector_init(void)
 
 	/* Initialize the global events, session deletion and bss object lists */
 	ds_dlist_init(&g_event_report.client_event_list, dpp_event_record_t, node);
+	ds_dlist_init(&g_event_report.channel_switch_list, dpp_event_channel_switch_t, node);
 	ds_dlist_init(&deletion_pending_list, delete_entry_t, node);
 	ds_dlist_init(&bss_list, bss_obj_t, node);
 
@@ -711,6 +812,14 @@ int ubus_collector_init(void)
 		return -1;
 	}
 
+	/* Schedule an event: invoke hostapd ubus channel switch method */
+	sched_status = evsched_task(&ubus_collector_hostapd_channel_switch_invoke, NULL,
+				    EVSCHED_SEC(UBUS_CHANNEL_SWITCH_POLLING_DELAY));
+	if (sched_status < 1) {
+		LOG(ERR, "ubus_collector: failed at task creation, status %d",
+		    sched_status);
+		return -1;
+	}
 	return 0;
 }
 

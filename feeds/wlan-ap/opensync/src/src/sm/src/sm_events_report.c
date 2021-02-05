@@ -85,7 +85,7 @@ static bool dpp_events_report_timer_restart(ev_timer *timer)
 	return true;
 }
 
-static void sm_events_report_clear(ds_dlist_t *report_list)
+static void sm_events_report_clear_client(ds_dlist_t *report_list)
 {
 	ds_dlist_iter_t record_iter;
 
@@ -99,6 +99,24 @@ static void sm_events_report_clear(ds_dlist_t *report_list)
 		ds_dlist_iremove(&record_iter);
 		dpp_event_record_free(record);
 		record = NULL;
+	}
+}
+
+static void sm_events_report_clear_channel(ds_dlist_t *report_list)
+{
+	if (!ds_dlist_is_empty(report_list)) {
+
+		dpp_event_channel_switch_t      *record = NULL;
+		ds_dlist_iter_t                 record_iter;
+
+		for (record = ds_dlist_ifirst(&record_iter, report_list);
+			record != NULL;
+			record = ds_dlist_inext(&record_iter))
+				{
+					ds_dlist_iremove(&record_iter);
+					dpp_event_channel_record_free(record);
+					record = NULL;
+				}
 	}
 }
 
@@ -135,12 +153,16 @@ static void sm_events_report(EV_P_ ev_timer *w, int revents)
 		ds_dlist_insert_tail(&report_ctx->client_event_list, dpp_record);
 	}
 
-	if (!ds_dlist_is_empty(&report_ctx->client_event_list)) {
+	if(!ds_dlist_is_empty(&g_event_report.channel_switch_list))
+		report_ctx->channel_switch_list = g_event_report.channel_switch_list;
+
+	if (!ds_dlist_is_empty(&report_ctx->client_event_list) || !ds_dlist_is_empty(&report_ctx->channel_switch_list)) {
 		LOG(INFO, "Sending events report...");
 		dpp_put_events(report_ctx);
 	}
 
-	sm_events_report_clear(&report_ctx->client_event_list);
+	sm_events_report_clear_client(&report_ctx->client_event_list);
+	sm_events_report_clear_channel(&report_ctx->channel_switch_list);
 }
 
 /******************************************************************************
@@ -172,6 +194,7 @@ bool sm_events_report_request(radio_entry_t *radio_cfg,
 
 		/* Initialize report list */
 		ds_dlist_init(&report_ctx->client_event_list, dpp_event_record_t, node);
+		ds_dlist_init(&report_ctx->channel_switch_list, dpp_event_channel_switch_t, node);
 
 		/* Initialize event lib timers and pass the global
 			internal cache
