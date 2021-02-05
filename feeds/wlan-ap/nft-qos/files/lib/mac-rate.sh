@@ -18,6 +18,8 @@ handle_interface() {
 			config_get rate $iface curate
 		fi
 	fi
+	# Convert from Kbits to KBytes
+	rate=$((rate/8))
 }
 
 if [ -z "$1" -o -z "$2" -o -z "$3" ]; then
