@@ -22,10 +22,14 @@ qosdef_append_rule_ssid() { # <section> <operator> <default-unit> <default-rate>
 	config_get unit $1 unit $3
 	if [ $operator == "oif" ]; then
 		config_get rate $1 drate $4
+		# Convert from Kbits to KBytes
+		rate=$((rate/8))
 	fi
 
 	if [ $operator == "iif" ]; then
 		config_get rate $1 urate $4
+		# Convert from Kbits to KBytes
+		rate=$((rate/8))
 	fi
 
 	if [ -z "$iface" -o -z "$rate" ]; then
