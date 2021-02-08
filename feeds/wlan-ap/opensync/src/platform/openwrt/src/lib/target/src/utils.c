@@ -235,6 +235,15 @@ int phy_get_rx_available_antenna(const char *name)
 	return phy->rx_ant_avail;
 }
 
+int phy_get_max_tx_power(const char *name , int channel)
+{
+	struct wifi_phy *phy = phy_find(name);
+
+	if (!phy)
+		return 0;
+	return phy->chanpwr[channel]/100; //units to dBm
+}
+
 int phy_get_channels(const char *name, int *channel)
 {
 	struct wifi_phy *phy = phy_find(name);

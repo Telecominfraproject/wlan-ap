@@ -282,8 +282,16 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 	if (changed->enabled)
 		blobmsg_add_u8(&b, "disabled", rconf->enabled ? 0 : 1);
 
-	if (changed->tx_power)
-		blobmsg_add_u32(&b, "txpower", rconf->tx_power);
+	if (changed->tx_power) {
+		int max_tx_power;
+		max_tx_power=phy_get_max_tx_power(phy,rconf->channel);
+		if (rconf->tx_power<=max_tx_power) {
+			blobmsg_add_u32(&b, "txpower", rconf->tx_power);
+		}
+		else {
+			blobmsg_add_u32(&b, "txpower", max_tx_power);
+		}
+	}
 
 	if (changed->tx_chainmask) {
 		int tx_ant_avail;

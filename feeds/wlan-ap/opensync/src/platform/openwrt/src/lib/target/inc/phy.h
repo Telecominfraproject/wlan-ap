@@ -10,6 +10,7 @@ extern int phy_get_tx_chainmask(const char *name);
 extern int phy_get_rx_chainmask(const char *name);
 extern int phy_get_tx_available_antenna(const char *name);
 extern int phy_get_rx_available_antenna(const char *name);
+extern int phy_get_max_tx_power(const char *name , int channel);
 extern int phy_get_channels(const char *name, int *channel);
 extern int phy_get_channels_state(const char *name,
 			struct schema_Wifi_Radio_State *rstate);

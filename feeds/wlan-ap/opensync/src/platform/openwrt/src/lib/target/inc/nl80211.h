@@ -23,7 +23,7 @@ struct wifi_phy {
 	unsigned char chandisabled[IEEE80211_CHAN_MAX];
 	unsigned char channel[IEEE80211_CHAN_MAX];
 	unsigned char chandfs[IEEE80211_CHAN_MAX];
-	unsigned char chanpwr[IEEE80211_CHAN_MAX];
+	unsigned int chanpwr[IEEE80211_CHAN_MAX];
 	unsigned int freq[IEEE80211_CHAN_MAX];
 
 	int tx_ant, rx_ant, tx_ant_avail, rx_ant_avail;
