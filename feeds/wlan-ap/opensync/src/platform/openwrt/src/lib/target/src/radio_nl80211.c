@@ -461,7 +461,7 @@ static void nl80211_add_phy(struct nlattr **tb, char *name)
 
 					if (tb_freq[NL80211_FREQUENCY_ATTR_MAX_TX_POWER] &&
 					    !tb_freq[NL80211_FREQUENCY_ATTR_DISABLED])
-						phy->chanpwr[chan] = nla_get_u32(tb_freq[NL80211_FREQUENCY_ATTR_MAX_TX_POWER]) / 10;
+						phy->chanpwr[chan] = nla_get_u32(tb_freq[NL80211_FREQUENCY_ATTR_MAX_TX_POWER]);
 					if (chan <= 16)
 						phy->band_2g = 1;
 					else if (chan >= 32 && chan <= 68)
