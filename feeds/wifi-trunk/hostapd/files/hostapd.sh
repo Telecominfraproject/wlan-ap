@@ -396,10 +396,10 @@ append_osu_provider() {
 	config_get osu_nai2 "$1" osu_nai2
 	config_get osu_method_list "$1" osu_method
 
-	[ -n "$osu_server_uri" ] append bss_conf "osu_server_uri=$osu_server_uri" "$N"
-	[ -n "$osu_nai" ] append bss_conf "osu_nai=$osu_nai" "$N"
-	[ -n "$osu_nai2" ] append bss_conf "osu_nai2=$osu_nai2" "$N"
-	[ -n "$osu_method_list" ] append bss_conf "osu_method_list=$osu_method_list" "$N"
+	[ -n "$osu_server_uri" ] && append bss_conf "osu_server_uri=$osu_server_uri" "$N"
+	[ -n "$osu_nai" ] && append bss_conf "osu_nai=$osu_nai" "$N"
+	[ -n "$osu_nai2" ] && append bss_conf "osu_nai2=$osu_nai2" "$N"
+	[ -n "$osu_method_list" ] && append bss_conf "osu_method_list=$osu_method_list" "$N"
 
 	config_list_foreach "$1" osu_service_desc append_osu_provider_service_desc
 	config_list_foreach "$1" osu_friendly_name append_osu_friendly_name
