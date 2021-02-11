@@ -51,6 +51,7 @@ enum {
 	WDEV_ATTR_TX_ANTENNA,
 	WDEV_ATTR_RX_ANTENNA,
 	WDEV_ATTR_FREQ_BAND,
+	WDEV_AATR_CHANNELS,
 	WDEV_ATTR_DISABLE_B_RATES,
 	__WDEV_ATTR_MAX,
 };
@@ -68,6 +69,7 @@ static const struct blobmsg_policy wifi_device_policy[__WDEV_ATTR_MAX] = {
 	[WDEV_ATTR_TX_ANTENNA] = { .name = "txantenna", .type = BLOBMSG_TYPE_INT32 },
 	[WDEV_ATTR_RX_ANTENNA] = { .name = "rxantenna", .type = BLOBMSG_TYPE_INT32 },
 	[WDEV_ATTR_FREQ_BAND] = { .name = "freq_band", .type = BLOBMSG_TYPE_STRING },
+	[WDEV_AATR_CHANNELS] = {.name = "channels", .type = BLOBMSG_TYPE_ARRAY},
         [WDEV_ATTR_DISABLE_B_RATES] = { .name = "legacy_rates", .type = BLOBMSG_TYPE_BOOL },
 };
 
@@ -272,6 +274,7 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 
 	char phy[6];
 	char ifname[8];
+	int list_channels[IEEE80211_CHAN_MAX] , list_channels_len = 0;
 
 	strncpy(ifname, rconf->if_name, sizeof(ifname));
 	strncpy(phy, target_map_ifname(ifname), sizeof(phy));
@@ -337,6 +340,17 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 			blobmsg_add_u32(&b, "chanbw", 20);
 		} else
 			 LOGE("%s: failed to set ht/hwmode", rconf->if_name);
+	}
+
+	list_channels_len = phy_get_list_channels_dfs(phy, list_channels);
+	if (list_channels_len) {
+		struct blob_attr *n;
+		n = blobmsg_open_array(&b, "channels");
+		for(int i = 0; i < list_channels_len; i++)
+		{
+			blobmsg_add_u32(&b, NULL, list_channels[i]);
+		}
+		blobmsg_close_array(&b, n);
 	}
 
 	if (changed->custom_options)

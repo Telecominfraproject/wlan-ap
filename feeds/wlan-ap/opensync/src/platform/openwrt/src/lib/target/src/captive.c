@@ -370,8 +370,8 @@ void splash_page_logo(char* dest_file, char* src_url)
 	imagefile = fopen(dest_file, "wb");
 	if(imagefile == NULL){
 		LOG(ERR, "fopen failed");
-		fclose(headerfile);
-		fclose(imagefile);
+		if(headerfile)
+			fclose(headerfile);
 		return;
 	}
 	curl = curl_easy_init();

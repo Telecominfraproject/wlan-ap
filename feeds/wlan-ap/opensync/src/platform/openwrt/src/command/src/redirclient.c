@@ -232,7 +232,7 @@ static int redirLinkClientPongReceiveHandler(struct lws *wsi, struct per_session
 	l = 0;
 
 	while (shift >= 0) {
-		l |= (*p++) << shift;
+		l |= ((unsigned long)(*p++)) << shift;
 		shift -= 8;
 	}
 
