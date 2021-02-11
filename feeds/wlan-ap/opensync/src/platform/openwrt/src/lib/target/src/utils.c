@@ -310,6 +310,27 @@ int phy_get_channels_state(const char *name, struct schema_Wifi_Radio_State *rst
 	return ret;
 }
 
+int phy_get_list_channels_dfs(const char *name, int *list)
+{
+	struct wifi_phy *phy = phy_find(name);
+	int i = 0, len = 0;
+
+	if (!phy)
+		return 0;
+
+	for (i = 0; (i < IEEE80211_CHAN_MAX); i++) {
+		if (phy->chandfs[i]) {
+			list[len] = i;
+			len++;
+		} else if (phy->channel[i]) {
+			list[len] = i;
+			len++;
+		}
+	}
+
+	return len;
+}
+
 int phy_get_band(const char *name, char *band)
 {
 	struct wifi_phy *phy = phy_find(name);
