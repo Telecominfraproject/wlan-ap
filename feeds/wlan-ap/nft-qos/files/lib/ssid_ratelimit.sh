@@ -3,11 +3,17 @@
 . /lib/nft-qos/core.sh
 
 # append rule for ssid_ratelimit qos
-qosdef_append_rule_ssid() { # <section> <operator> <default-unit> <default-rate>
+qosdef_append_rule_ssid() { # <section> <operator> <bridge>
 	local unit rate iface rlimit
 	local operator=$2
+	local bridge=$3
 
 	iface=$1
+
+	br=`/usr/opensync/bin/ovsh s Wifi_VIF_Config bridge -w if_name==$iface | grep -ic $bridge`
+	if [ $br -eq 0 ]; then
+		return
+	fi
 
 	config_get disabled $1 disabled
 	if [ "$disabled" == "1" ]; then
@@ -19,7 +25,11 @@ qosdef_append_rule_ssid() { # <section> <operator> <default-unit> <default-rate>
 		return
 	fi
 
-	config_get unit $1 unit $3
+	config_get unit $1 unit
+	if [ -z "$unit" ]; then
+		unit=kbytes
+	fi
+
 	if [ $operator == "oif" ]; then
 		config_get rate $1 drate $4
 		# Convert from Kbits to KBytes
@@ -32,7 +42,7 @@ qosdef_append_rule_ssid() { # <section> <operator> <default-unit> <default-rate>
 		rate=$((rate/8))
 	fi
 
-	if [ -z "$iface" -o -z "$rate" ]; then
+	if [ -z "$iface" -o -z "$rate" -o $rate == 0 ]; then
 		logger -t "nft-qos" "Error: No interface $iface or rate $rate present"
 		return
 	fi
@@ -56,20 +66,20 @@ qosdef_append_rule_ssid() { # <section> <operator> <default-unit> <default-rate>
 }
 
 # append chain for static qos
-qosdef_append_chain_ssid() { # <hook> <name> <section> <unit> <rate>
+qosdef_append_chain_ssid() { # <hook> <name> <section> <bridge>
 	local hook=$1 name=$2
 	local config=$3 operator
-
+	local bridge=$4
 	case "$name" in
-		download) operator="oif";;
-		upload) operator="iif";;
+		download*) operator="oif";;
+		upload*) operator="iif";;
 	esac
 
 	uci_load wireless
 	qosdef_appendx "\tchain $name {\n"
 	qosdef_append_chain_def filter $hook 0 accept
 	qosdef_append_rule_limit_whitelist $name
-	config_foreach qosdef_append_rule_ssid $config $operator $4 $5
+	config_foreach qosdef_append_rule_ssid $config $operator $bridge
 	qosdef_appendx "\t}\n"
 }
 
@@ -82,11 +92,26 @@ qosdef_flush_ssid_ratelimit() {
 qosdef_init_ssid_ratelimit() {
 	exec 500>/tmp/rlimit.lock
 	flock 500
-	local hook_ul="input" hook_dl="output"
+	local dchain
+	local uchain
+
 	logger -t "nft-qos" "`date -I'seconds'` "INIT" $0"
+
 	qosdef_appendx "table $NFT_QOS_BRIDGE_FAMILY nft-qos-ssid-lan-bridge {\n"
-	qosdef_append_chain_ssid $hook_ul upload wifi-iface $ssid_ratelimit_unit_ul $ssid_ratelimit_rate_ul
-	qosdef_append_chain_ssid $hook_dl download wifi-iface $ssid_ratelimit_unit_dl $ssid_ratelimit_rate_dl
+
+	local hook_ul="forward" hook_dl="forward"
+	uchain="upload"
+	dchain="download"
+	qosdef_append_chain_ssid $hook_ul $uchain wifi-iface wan
+	qosdef_append_chain_ssid $hook_dl $dchain wifi-iface wan
+
+	local hook_ul="input" hook_dl="output"
+	uchain="upload_nat"
+	dchain="download_nat"
+	qosdef_append_chain_ssid $hook_ul $uchain wifi-iface lan
+	qosdef_append_chain_ssid $hook_dl $dchain wifi-iface lan
+
 	qosdef_appendx "}\n"
+
 	exec 500>&-
 }
