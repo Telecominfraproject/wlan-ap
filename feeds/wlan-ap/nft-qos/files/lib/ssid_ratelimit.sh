@@ -20,6 +20,10 @@ qosdef_append_rule_ssid() { # <section> <operator> <default-unit> <default-rate>
 	fi
 
 	config_get unit $1 unit $3
+	if [ -z "$unit" ]; then
+		unit=kbytes
+	fi
+
 	if [ $operator == "oif" ]; then
 		config_get rate $1 drate $4
 		# Convert from Kbits to KBytes
@@ -32,7 +36,7 @@ qosdef_append_rule_ssid() { # <section> <operator> <default-unit> <default-rate>
 		rate=$((rate/8))
 	fi
 
-	if [ -z "$iface" -o -z "$rate" ]; then
+	if [ -z "$iface" -o -z "$rate" -o $rate == 0 ]; then
 		logger -t "nft-qos" "Error: No interface $iface or rate $rate present"
 		return
 	fi
@@ -82,7 +86,7 @@ qosdef_flush_ssid_ratelimit() {
 qosdef_init_ssid_ratelimit() {
 	exec 500>/tmp/rlimit.lock
 	flock 500
-	local hook_ul="input" hook_dl="output"
+	local hook_ul="forward" hook_dl="forward"
 	logger -t "nft-qos" "`date -I'seconds'` "INIT" $0"
 	qosdef_appendx "table $NFT_QOS_BRIDGE_FAMILY nft-qos-ssid-lan-bridge {\n"
 	qosdef_append_chain_ssid $hook_ul upload wifi-iface $ssid_ratelimit_unit_ul $ssid_ratelimit_rate_ul
