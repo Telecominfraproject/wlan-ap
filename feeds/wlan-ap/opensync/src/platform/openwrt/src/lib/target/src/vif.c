@@ -145,7 +145,7 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_ACCT_INTERVAL] = { .name = "acct_interval", .type = BLOBMSG_TYPE_INT32 },
 	[WIF_ATTR_REQ_CUI] = { .name = "request_cui", .type = BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_IEEE80211R] = { .name = "ieee80211r", BLOBMSG_TYPE_BOOL },
-	[WIF_ATTR_IEEE80211W] = { .name = "ieee80211w", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_IEEE80211W] = { .name = "ieee80211w", .type = BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_MOBILITY_DOMAIN] = { .name = "mobility_domain", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_FT_OVER_DS] = { .name = "ft_over_ds", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_FT_PSK_LOCAL] = { .name = "ft_psk_generate_local" ,BLOBMSG_TYPE_BOOL },
@@ -308,7 +308,13 @@ static int vif_config_security_set(struct blob_buf *b,
 		if (strcmp(vif_crypto[i].mode, mode))
 			continue;
 		blobmsg_add_string(b, "encryption", vif_crypto[i].uci);
-		blobmsg_add_bool(b, "ieee80211w", 1);
+
+		if (!strcmp(mode, OVSDB_SECURITY_MODE_WPA3)) {
+			blobmsg_add_string(b, "ieee80211w", "2");
+		} else {
+			blobmsg_add_string(b, "ieee80211w", "1");
+		}
+
 		if (vif_crypto[i].enterprise) {
 			acct_interval = 0;
 			auth_server = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_IP);
@@ -348,7 +354,7 @@ static int vif_config_security_set(struct blob_buf *b,
 open:
 	blobmsg_add_string(b, "encryption", "none");
 	blobmsg_add_string(b, "key", "");
-	blobmsg_add_bool(b, "ieee80211w", 0);
+	blobmsg_add_string(b, "ieee80211w", "0");
 	return 0;
 }
 
