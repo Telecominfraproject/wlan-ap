@@ -17,9 +17,10 @@ handle_interface() {
 		elif [ $2 == "upload" ]; then
 			config_get rate $iface curate
 		fi
+		# Convert from Kbits to KBytes
+		rate=$((rate/8))
 	fi
-	# Convert from Kbits to KBytes
-	rate=$((rate/8))
+
 }
 
 if [ -z "$1" -o -z "$2" -o -z "$3" ]; then
@@ -40,7 +41,11 @@ if [ "$1" == "add" ]; then
 		logger -t "mac-rate" "old_drate=$old_drate"
 		if [ "$old_drate" -ne "$rate" ]; then
 			changed=1
-			logger -t "mac-rate" "changed DL $old_drate to $rate"
+			id=`nft list chain bridge nft-qos-ssid-lan-bridge download  -a | grep -i $3  | awk -F "handle " '{print $2;exit}'`
+			if [ -n "$id" ]; then
+				nft delete rule bridge nft-qos-ssid-lan-bridge download handle $id
+			fi
+			logger -t "mac-rate" "changed DL $old_drate to $rate, del $3"
 		else
 			changed=0
 			logger -t "mac-rate" "Not changed DL $old_drate to $rate"
@@ -59,7 +64,12 @@ if [ "$1" == "add" ]; then
 		old_urate=`nft list chain bridge nft-qos-ssid-lan-bridge upload -a | grep -i $3 |  awk -F'kbytes' '{print $1}' | awk '{print $NF}'`
 		if [ "$old_urate" -ne "$rate" ]; then
 			changed=1
-			logger -t "mac-rate" "changed UL $old_urate to $rate"
+			id=`nft list chain bridge nft-qos-ssid-lan-bridge upload  -a | grep -i $3  | awk -F "handle " '{print $2;exit}'`
+			if [ -n "$id" ]; then
+				nft delete rule bridge nft-qos-ssid-lan-bridge upload handle $id
+			fi
+
+			logger -t "mac-rate" "changed UL $old_urate to $rate del $3"
 		else
 			changed=0
 			logger -t "mac-rate" "Not changed UL $old_urate to $rate"
