@@ -119,6 +119,7 @@ enum {
 	WIF_ATTR_DVLAN_FILE,
 	WIF_ATTR_DVLAN_NAMING,
 	WIF_ATTR_DVLAN_BRIDGE,
+	WIF_ATTR_MIN_HW_MODE,
 	__WIF_ATTR_MAX,
 };
 
@@ -200,6 +201,7 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_DVLAN_FILE] = { .name = "vlan_file", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_DVLAN_NAMING] = { .name = "vlan_naming", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_DVLAN_BRIDGE] = { .name = "vlan_bridge", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_MIN_HW_MODE] = { .name = "min_hw_mode", BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -660,7 +662,6 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	struct schema_Wifi_VIF_State vstate;
 	char mac[ETH_ALEN * 3];
 	char *ifname, radio[IF_NAMESIZE];
-	char band[8];
 	bool vifIsActive = false;
 
 	LOGN("%s: get state", s->e.name);
@@ -758,12 +759,8 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	else
 		LOGN("%s: Failed to get channel", vstate.if_name);
 
-	phy_get_band(target_map_ifname(radio), band);
-	LOGD("Find min_hw_mode: Radio: %s Phy: %s Band: %s", radio, target_map_ifname(radio), band );
-	if (strstr(band, "5"))
-		SCHEMA_SET_STR(vstate.min_hw_mode, "11ac");
-	else
-		SCHEMA_SET_STR(vstate.min_hw_mode, "11n");
+	if (tb[WIF_ATTR_MIN_HW_MODE])
+		SCHEMA_SET_STR(vstate.min_hw_mode, blobmsg_get_string(tb[WIF_ATTR_MIN_HW_MODE]));
 
 	if (tb[WIF_ATTR_BSSID])
 		SCHEMA_SET_STR(vstate.mac, blobmsg_get_string(tb[WIF_ATTR_BSSID]));
@@ -1292,6 +1289,9 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 		else
 			blobmsg_add_bool(&b, "uapsd", 0);
 	}
+
+	if (changed->min_hw_mode)
+		blobmsg_add_string(&b, "min_hw_mode", vconf->min_hw_mode);
 
 	if (changed->ft_psk || changed->ft_mobility_domain) {
 		if (vconf->ft_psk && vconf->ft_mobility_domain) {
