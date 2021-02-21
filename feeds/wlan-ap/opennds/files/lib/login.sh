@@ -71,9 +71,9 @@ get_client_zone () {
 	local_mesh_if=$(echo "$client_if_string" | awk '{printf $3}')
 
 	if [ ! -z "$client_meshnode" ]; then
-		client_zone="MeshZone:$client_meshnode"
+		client_zone="$client_meshnode"
 	else
-		client_zone="LocalZone:$client_if"
+		client_zone="$client_if"
 	fi
 }
 
@@ -242,7 +242,7 @@ header="<!DOCTYPE html>
 	<meta http-equiv=\"Expires\" content=\"0\">
 	<meta charset=\"utf-8\">
 	<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
-	<link rel=\"shortcut icon\" href=\"/images/wlan1/TipLogo.png\" type=\"image/x-icon\">
+	<link rel=\"shortcut icon\" href=\"/images/$client_zone/TipLogo.png\" type=\"image/x-icon\">
 	<link rel=\"stylesheet\" type=\"text/css\" href=\"/splash.css\">
 	<title>$gatewaynamehtml</title>
 	</head>
@@ -257,7 +257,7 @@ header="<!DOCTYPE html>
 version="$(ndsctl status | grep Version)"
 year="$(date | awk -F ' ' '{print $(6)}')"
 footer="
-	<img style=\"height:60px; width:100px; float:left;\" src=\"/images/wlan1/TipLogo.png\" alt=\"Splash Page: For access to the Internet.\">
+	<img style=\"height:60px; width:100px; float:left;\" src=\"/images/$client_zone/TipLogo.png\" alt=\"Splash Page: For access to the Internet.\">
 
 	<copy-right>
 		<br><br>
