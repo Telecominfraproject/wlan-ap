@@ -670,7 +670,7 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	char *ifname, radio[IF_NAMESIZE];
 	bool vifIsActive = false;
 
-	LOGN("%s: get state", s->e.name);
+	LOGT("%s: get state", s->e.name);
 
 	memset(&vstate, 0, sizeof(vstate));
 	schema_Wifi_VIF_State_mark_all_present(&vstate);
@@ -811,7 +811,7 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 		vif_state_to_conf(&vstate, vconf);
 		radio_ops->op_vconf(vconf, radio);
 	}
-	LOGN("%s: updating vif state %s", radio, vstate.ssid);
+	LOGT("%s: updating vif state %s", radio, vstate.ssid);
 	radio_ops->op_vstate(&vstate, radio);
 
 	return true;

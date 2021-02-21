@@ -147,8 +147,9 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 	struct blob_attr *tb[__WDEV_ATTR_MAX] = { };
 	struct schema_Wifi_Radio_State  rstate;
 	char phy[6];
+	int antenna;
 
-	LOGN("%s: get state", s->e.name);
+	LOGT("%s: get state", s->e.name);
 
 	memset(&rstate, 0, sizeof(rstate));
 	schema_Wifi_Radio_State_mark_all_present(&rstate);
@@ -198,13 +199,19 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 	if (tb[WDEV_ATTR_HWMODE])
 		SCHEMA_SET_STR(rstate.hw_mode, blobmsg_get_string(tb[WDEV_ATTR_HWMODE]));
 
-	if (tb[WDEV_ATTR_TX_ANTENNA])
-		SCHEMA_SET_INT(rstate.tx_chainmask, blobmsg_get_u32(tb[WDEV_ATTR_TX_ANTENNA]));
+	if (tb[WDEV_ATTR_TX_ANTENNA]) {
+		antenna = blobmsg_get_u32(tb[WDEV_ATTR_TX_ANTENNA]);
+		if (!antenna)   antenna = phy_get_tx_available_antenna(phy);
+		SCHEMA_SET_INT(rstate.tx_chainmask, antenna);
+	}
 	else
 		SCHEMA_SET_INT(rstate.tx_chainmask, phy_get_tx_chainmask(phy));
 
-	if (tb[WDEV_ATTR_RX_ANTENNA])
-		SCHEMA_SET_INT(rstate.rx_chainmask, blobmsg_get_u32(tb[WDEV_ATTR_RX_ANTENNA]));
+	if (tb[WDEV_ATTR_RX_ANTENNA]) {
+		antenna = blobmsg_get_u32(tb[WDEV_ATTR_RX_ANTENNA]);
+		if (!antenna)   antenna = phy_get_rx_available_antenna(phy);
+		SCHEMA_SET_INT(rstate.rx_chainmask, antenna);
+	}
 	else
 		SCHEMA_SET_INT(rstate.rx_chainmask, phy_get_rx_chainmask(phy));
 
@@ -260,7 +267,7 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 		SCHEMA_SET_STR(rconf->hw_type, "ath10k");
 		radio_ops->op_rconf(rconf);
 	}
-	LOGN("%s: updating radio state", rstate.if_name);
+	LOGT("%s: updating radio state", rstate.if_name);
 	radio_ops->op_rstate(&rstate);
 
 	return true;
@@ -300,24 +307,26 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 		int tx_ant_avail;
 		tx_ant_avail=phy_get_tx_available_antenna(phy);
 
-		if ((rconf->tx_chainmask & tx_ant_avail) != rconf->tx_chainmask) {
+		if (rconf->tx_chainmask == 0) {
 			blobmsg_add_u32(&b, "txantenna", tx_ant_avail);
-			LOGN("maximum number of tx antennae available to use:%d",tx_ant_avail);
-		}
-		else
+		} else if ((rconf->tx_chainmask & tx_ant_avail) != rconf->tx_chainmask) {
+			blobmsg_add_u32(&b, "txantenna", tx_ant_avail);
+		} else {
 			blobmsg_add_u32(&b, "txantenna", rconf->tx_chainmask);
+		}
 	}
 
 	if (changed->rx_chainmask) {
 		int rx_ant_avail;
 		rx_ant_avail=phy_get_rx_available_antenna(phy);
 
-		if ((rconf->rx_chainmask & rx_ant_avail) != rconf->rx_chainmask) {
+		if (rconf->rx_chainmask == 0) {
 			blobmsg_add_u32(&b, "rxantenna", rx_ant_avail);
-			LOGN("maximum number of rx antennae available to use:%d",rx_ant_avail);
-		}
-		else
+		} else if ((rconf->rx_chainmask & rx_ant_avail) != rconf->rx_chainmask) {
+			blobmsg_add_u32(&b, "rxantenna", rx_ant_avail);
+		} else {
 			blobmsg_add_u32(&b, "rxantenna", rconf->rx_chainmask);
+		}
 	}
 
 	if (changed->country)
