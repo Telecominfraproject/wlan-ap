@@ -97,6 +97,7 @@ hostapd_common_add_device_config() {
 	config_add_boolean country_ie doth
 	config_add_boolean spectrum_mgmt_required
 	config_add_int local_pwr_constraint
+	config_add_int maxassoc
 	config_add_string require_mode
 	config_add_boolean legacy_rates
 
@@ -114,7 +115,7 @@ hostapd_prepare_device_config() {
 	local base_cfg=
 
 	json_get_vars country country_ie beacon_int:100 dtim_period:2 doth require_mode legacy_rates \
-		acs_chan_bias local_pwr_constraint spectrum_mgmt_required airtime_mode
+		acs_chan_bias local_pwr_constraint spectrum_mgmt_required airtime_mode maxassoc
 
 	hostapd_set_log_options base_cfg
 
@@ -123,6 +124,7 @@ hostapd_prepare_device_config() {
 	set_default doth 1
 	set_default legacy_rates 1
 	set_default airtime_mode 0
+	set_default maxassoc 0
 
 	[ "$hwmode" = "b" ] && legacy_rates=1
 
@@ -137,6 +139,7 @@ hostapd_prepare_device_config() {
 		[ "$hwmode" = "a" -a "$doth" -gt 0 ] && append base_cfg "ieee80211h=1" "$N"
 	}
 
+	[ "$maxassoc" -gt 0 ] && append base_cfg "global_max_num_sta=$maxassoc" "$N"
 	[ -n "$acs_chan_bias" ] && append base_cfg "acs_chan_bias=$acs_chan_bias" "$N"
 
 	local brlist= br
