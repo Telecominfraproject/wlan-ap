@@ -274,7 +274,6 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 
 	char phy[6];
 	char ifname[8];
-	int list_channels[IEEE80211_CHAN_MAX] , list_channels_len = 0;
 
 	strncpy(ifname, rconf->if_name, sizeof(ifname));
 	strncpy(phy, target_map_ifname(ifname), sizeof(phy));
@@ -342,14 +341,12 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 			 LOGE("%s: failed to set ht/hwmode", rconf->if_name);
 	}
 
-	list_channels_len = phy_get_list_channels_dfs(phy, list_channels);
-	if (list_channels_len) {
-		struct blob_attr *n;
+	struct blob_attr *n;
+	int backup_channel = 0;
+	backup_channel = rrm_get_backup_channel(rconf->freq_band);
+	if(backup_channel) {
 		n = blobmsg_open_array(&b, "channels");
-		for(int i = 0; i < list_channels_len; i++)
-		{
-			blobmsg_add_u32(&b, NULL, list_channels[i]);
-		}
+		blobmsg_add_u32(&b, NULL, backup_channel);
 		blobmsg_close_array(&b, n);
 	}
 

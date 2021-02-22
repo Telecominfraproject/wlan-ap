@@ -126,13 +126,13 @@ static int frequency_to_channel(int freq)
 static radio_type_t frequency_to_band(int freq)
 {
 	int chan = frequency_to_channel(freq);
-
+	/*Need to add support for differentiating between 5G,5GU and 5GL*/
 	if (chan <= 16)
 		return RADIO_TYPE_2G;
 	else if (chan >= 32 && chan <= 68)
-		return RADIO_TYPE_5GL;
+		return RADIO_TYPE_5G;
 	else if (chan >= 96)
-		return RADIO_TYPE_5GU;
+		return RADIO_TYPE_5G;
 	else
 		return RADIO_TYPE_NONE;
 }

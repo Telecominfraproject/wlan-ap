@@ -33,6 +33,7 @@ extern ovsdb_table_t table_Wifi_RRM_Config;
 
 void rrm_config_vif(struct blob_buf *b, struct blob_buf *del, 
 		const char * freq_band, const char * if_name);
+int rrm_get_backup_channel(const char * freq_band);
 void callback_Wifi_RRM_Config(ovsdb_update_monitor_t *mon,
 		struct schema_Wifi_RRM_Config *old, struct schema_Wifi_RRM_Config *conf);
 

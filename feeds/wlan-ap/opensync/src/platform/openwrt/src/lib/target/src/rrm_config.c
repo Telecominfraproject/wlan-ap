@@ -53,6 +53,22 @@ void rrm_config_vif(struct blob_buf *b, struct blob_buf *del, const char * freq_
 	return;
 }
 
+int rrm_get_backup_channel(const char * freq_band)
+{
+	struct schema_Wifi_RRM_Config conf;
+
+	memset(&conf, 0, sizeof(conf));
+	if (false == ovsdb_table_select_one(&table_Wifi_RRM_Config,
+			SCHEMA_COLUMN(Wifi_RRM_Config, freq_band), freq_band, &conf))
+	{
+		LOG(ERR, "Wifi_Radio_Config: No RRM for band %s", freq_band );
+		return 0;
+	}
+
+	return conf.backup_channel;
+
+}
+
 static bool rrm_config_update( struct schema_Wifi_RRM_Config *conf, bool addNotDelete)
 {
 	struct schema_Wifi_Radio_Config rconf;
@@ -96,12 +112,35 @@ static bool rrm_config_changed( struct schema_Wifi_RRM_Config *old,
 	return false;
 }
 
+static bool rrm_radio_config_update(struct schema_Wifi_RRM_Config *conf )
+{
+	struct schema_Wifi_Radio_Config_flags changed;
+	struct schema_Wifi_Radio_Config rconf;
+
+	if (false == ovsdb_table_select_one(&table_Wifi_Radio_Config,
+			SCHEMA_COLUMN(Wifi_Radio_Config, freq_band), conf->freq_band, &rconf))
+	{
+		LOG(WARN, "Wifi_RRM_Config: No radio for band %s", conf->freq_band );
+		return false;
+	}
+
+	memset(&changed, 0, sizeof(changed));
+	target_radio_config_set2(&rconf, &changed);
+
+	return true;
+}
+
 static bool rrm_config_set( struct schema_Wifi_RRM_Config *old,
 	struct schema_Wifi_RRM_Config *conf ) 
 {
 	if (rrm_config_changed(old, conf)) {
-		return( rrm_config_update(conf, true));
+		rrm_config_update(conf, true);
 	}
+
+	if(conf->backup_channel != old->backup_channel) {
+		rrm_radio_config_update(conf);
+	}
+
 	return true;
 }
 
