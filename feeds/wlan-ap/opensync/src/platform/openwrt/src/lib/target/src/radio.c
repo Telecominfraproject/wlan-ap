@@ -201,15 +201,22 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 
 	if (tb[WDEV_ATTR_TX_ANTENNA]) {
 		antenna = blobmsg_get_u32(tb[WDEV_ATTR_TX_ANTENNA]);
-		if (!antenna)   antenna = phy_get_tx_available_antenna(phy);
+		if (!antenna)
+			antenna = phy_get_tx_available_antenna(phy);
+		if ((antenna & 0xf0) && !(antenna & 0x0f))
+			antenna= antenna >> 4;
 		SCHEMA_SET_INT(rstate.tx_chainmask, antenna);
 	}
 	else
 		SCHEMA_SET_INT(rstate.tx_chainmask, phy_get_tx_chainmask(phy));
 
 	if (tb[WDEV_ATTR_RX_ANTENNA]) {
+
 		antenna = blobmsg_get_u32(tb[WDEV_ATTR_RX_ANTENNA]);
-		if (!antenna)   antenna = phy_get_rx_available_antenna(phy);
+		if (!antenna)
+			antenna = phy_get_rx_available_antenna(phy);
+		if ((antenna & 0xf0) && !(antenna & 0x0f))
+			antenna= antenna >> 4;
 		SCHEMA_SET_INT(rstate.rx_chainmask, antenna);
 	}
 	else
@@ -304,28 +311,38 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 	}
 
 	if (changed->tx_chainmask) {
-		int tx_ant_avail;
+		int tx_ant_avail,txchainmask;
 		tx_ant_avail=phy_get_tx_available_antenna(phy);
 
+		if ((tx_ant_avail & 0xf0) && !(tx_ant_avail & 0x0f)) {
+			txchainmask = rconf->tx_chainmask << 4;
+		} else {
+			txchainmask = rconf->tx_chainmask;
+		}
 		if (rconf->tx_chainmask == 0) {
 			blobmsg_add_u32(&b, "txantenna", tx_ant_avail);
-		} else if ((rconf->tx_chainmask & tx_ant_avail) != rconf->tx_chainmask) {
+		} else if ((txchainmask & tx_ant_avail) != txchainmask) {
 			blobmsg_add_u32(&b, "txantenna", tx_ant_avail);
 		} else {
-			blobmsg_add_u32(&b, "txantenna", rconf->tx_chainmask);
+			blobmsg_add_u32(&b, "txantenna", txchainmask);
 		}
 	}
 
 	if (changed->rx_chainmask) {
-		int rx_ant_avail;
+		int rx_ant_avail, rxchainmask;
 		rx_ant_avail=phy_get_rx_available_antenna(phy);
 
+		if ((rx_ant_avail & 0xf0) && !(rx_ant_avail & 0x0f)) {
+			rxchainmask = rconf->rx_chainmask << 4;
+		} else {
+			rxchainmask = rconf->rx_chainmask;
+		}
 		if (rconf->rx_chainmask == 0) {
 			blobmsg_add_u32(&b, "rxantenna", rx_ant_avail);
-		} else if ((rconf->rx_chainmask & rx_ant_avail) != rconf->rx_chainmask) {
+		} else if ((rxchainmask & rx_ant_avail) != rxchainmask) {
 			blobmsg_add_u32(&b, "rxantenna", rx_ant_avail);
 		} else {
-			blobmsg_add_u32(&b, "rxantenna", rconf->rx_chainmask);
+			blobmsg_add_u32(&b, "rxantenna", rxchainmask);
 		}
 	}
 
