@@ -436,15 +436,16 @@ void captive_portal_get_current_urls(char *ifname, char *splash_logo, char *back
 	char *buf = NULL;
 	struct blob_attr *tc[__NDS_ATTR_MAX] = { };
 	struct uci_element *e = NULL;
+	struct blob_buf url_buf={ };
 
 	uci_load(cap_uci, "opennds", &opennds);
 	uci_foreach_element(&opennds->sections, e) {
 		struct uci_section *cp_section = uci_to_section(e);
 		if (!strcmp(ifname, cp_section->e.name)){
 
-			blob_buf_init(&cap, 0);
-			uci_to_blob(&cap, cp_section, &opennds_param);
-			blobmsg_parse(opennds_policy, __NDS_ATTR_MAX, tc, blob_data(cap.head), blob_len(cap.head));
+			blob_buf_init(&url_buf, 0);
+			uci_to_blob(&url_buf, cp_section, &opennds_param);
+			blobmsg_parse(opennds_policy, __NDS_ATTR_MAX, tc, blob_data(url_buf.head), blob_len(url_buf.head));
 
 			if (tc[NDS_ATTR_SPLASH_PAGE_LOGO]) {
 				buf = blobmsg_get_string(tc[NDS_ATTR_SPLASH_PAGE_LOGO]);
@@ -470,34 +471,38 @@ void captive_portal_get_current_urls(char *ifname, char *splash_logo, char *back
 	uci_unload(cap_uci, opennds);
 	return;
 }
-void opennds_parameters()
+void opennds_parameters(char *ifname)
 {
 	int i;
 	char users_router[7][64] = { "allow tcp port 53","allow udp port 53",
 				"allow udp port 67","allow tcp port 22",
 				"allow tcp port 23", "allow tcp port 80", "allow tcp port 443"};
+	struct blob_buf cap_blob={ };
+	blob_buf_init(&cap_blob, 0);
 
-	blobmsg_add_string(&cap, "fwhook_enabled","1");
-	blobmsg_add_string(&cap, "use_outdated_mhd","1");
-	blobmsg_add_string(&cap, "unescape_callback_enabled","0");
-	blobmsg_add_string(&cap, "maxclients","250");
-	blobmsg_add_string(&cap, "preauthidletimeout","30");
-	blobmsg_add_string(&cap, "authidletimeout","120");
-	blobmsg_add_string(&cap, "checkinterval","60");
-	blobmsg_add_string(&cap, "uploadrate","0");
-	blobmsg_add_string(&cap, "downloadrate","0");
-	blobmsg_add_string(&cap, "ratecheckwindow","2");
-	blobmsg_add_string(&cap, "uploadquota","0");
-	blobmsg_add_string(&cap, "downloadquota","0");
-	d = blobmsg_open_array(&cap, "authenticated_users");
-	blobmsg_add_string(&cap, NULL, "allow all");
-	blobmsg_close_array(&cap, d);
-	d = blobmsg_open_array(&cap, "users_to_router");
+	blobmsg_add_string(&cap_blob, "fwhook_enabled","1");
+	blobmsg_add_string(&cap_blob, "use_outdated_mhd","1");
+	blobmsg_add_string(&cap_blob, "unescape_callback_enabled","0");
+	blobmsg_add_string(&cap_blob, "maxclients","250");
+	blobmsg_add_string(&cap_blob, "preauthidletimeout","30");
+	blobmsg_add_string(&cap_blob, "authidletimeout","120");
+	blobmsg_add_string(&cap_blob, "checkinterval","60");
+	blobmsg_add_string(&cap_blob, "uploadrate","0");
+	blobmsg_add_string(&cap_blob, "downloadrate","0");
+	blobmsg_add_string(&cap_blob, "ratecheckwindow","2");
+	blobmsg_add_string(&cap_blob, "uploadquota","0");
+	blobmsg_add_string(&cap_blob, "downloadquota","0");
+	d = blobmsg_open_array(&cap_blob, "authenticated_users");
+	blobmsg_add_string(&cap_blob, NULL, "allow all");
+	blobmsg_close_array(&cap_blob, d);
+	d = blobmsg_open_array(&cap_blob, "users_to_router");
 	for(i = 0; i < 7; i++)
 	{
-		blobmsg_add_string(&cap, NULL, users_router[i]);
+		blobmsg_add_string(&cap_blob, NULL, users_router[i]);
 	}
-	blobmsg_close_array(&cap, d);
+	blobmsg_close_array(&cap_blob, d);
+	blob_to_uci_section(cap_uci, "opennds", ifname, "opennds", cap_blob.head, &opennds_param, NULL);
+	uci_commit_all(cap_uci);
 	return;
 }
 
@@ -564,7 +569,7 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 		if (!strcmp(opt, "authentication")) {
 			if (strcmp(value,"None")==0) {
 				blobmsg_add_string(&cap, "webroot",webroot);
-				opennds_parameters();
+				opennds_parameters(ifname);
 				blobmsg_add_string(&cap, "enabled", "1");
 				blobmsg_add_string(&cap, "gatewayinterface","br-lan");
 				blobmsg_add_string(&cap, "authentication", value);
@@ -577,7 +582,7 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 
 			} else if (strcmp(value,"username")==0) {
 				blobmsg_add_string(&cap, "webroot",webroot);
-				opennds_parameters();
+				opennds_parameters(ifname);
 				ipset_create(ifname);
 				blobmsg_add_string(&cap, "enabled", "1");
 				blobmsg_add_string(&cap, "gatewayinterface","br-lan");
@@ -590,7 +595,7 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 
 			} else if (strcmp(value,"radius")==0)  {
 				blobmsg_add_string(&cap, "webroot",webroot);
-				opennds_parameters();
+				opennds_parameters(ifname);
 				blobmsg_add_string(&cap, "authentication", value);
 				blobmsg_add_string(&cap, "enabled", "1");
 				blobmsg_add_string(&cap, "gatewayinterface","br-lan");
@@ -626,8 +631,6 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 
 		else if (strcmp(opt, "splash_page_logo") == 0) {
 			blobmsg_add_string(&cap, "splash_page_logo", value);
-			sprintf(file_path,"%s%s",path,"TipLogo.png");
-			splash_page_logo(file_path,value);
 			if (strcmp(splash_logo,value) !=0) {
 				sprintf(file_path,"%s%s",path,"TipLogo.png");
 				splash_page_logo(file_path,value);
@@ -641,8 +644,9 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 			}
 		}
 
-		else if (strcmp(opt, "splash_page_title") == 0)
+		else if (strcmp(opt, "splash_page_title") == 0) {
 			blobmsg_add_string(&cap, "splash_page_title", value);
+		}
 
 		else if (strcmp(opt, "acceptance_policy") == 0)
 			blobmsg_add_string(&cap, "acceptance_policy", value);
@@ -655,8 +659,6 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 
 		else if (strcmp(opt, "username_password_file") == 0) {
 			blobmsg_add_string(&cap, "username_password_file", value);
-			sprintf(file_path,"%s%s",path,"userpass.dat");
-			splash_page_logo(file_path,value);
 			if (strcmp(user_file,value) !=0) {
 				sprintf(file_path,"%s%s",path,"userpass.dat");
 				splash_page_logo(file_path,value);
