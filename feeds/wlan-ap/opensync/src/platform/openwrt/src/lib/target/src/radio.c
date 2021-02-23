@@ -53,6 +53,7 @@ enum {
 	WDEV_ATTR_FREQ_BAND,
 	WDEV_AATR_CHANNELS,
 	WDEV_ATTR_DISABLE_B_RATES,
+	WDEV_ATTR_MAXASSOC_CLIENTS,
 	__WDEV_ATTR_MAX,
 };
 
@@ -71,14 +72,16 @@ static const struct blobmsg_policy wifi_device_policy[__WDEV_ATTR_MAX] = {
 	[WDEV_ATTR_FREQ_BAND] = { .name = "freq_band", .type = BLOBMSG_TYPE_STRING },
 	[WDEV_AATR_CHANNELS] = {.name = "channels", .type = BLOBMSG_TYPE_ARRAY},
         [WDEV_ATTR_DISABLE_B_RATES] = { .name = "legacy_rates", .type = BLOBMSG_TYPE_BOOL },
+	[WDEV_ATTR_MAXASSOC_CLIENTS] = { .name = "maxassoc", .type = BLOBMSG_TYPE_INT32 },
 };
 
 #define SCHEMA_CUSTOM_OPT_SZ            20
-#define SCHEMA_CUSTOM_OPTS_MAX          1
+#define SCHEMA_CUSTOM_OPTS_MAX          2
 
 static const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 {
 	SCHEMA_CONSTS_DISABLE_B_RATES,
+	SCHEMA_CONSTS_MAX_CLIENTS,
 };
 
 static void radio_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del,
@@ -103,7 +106,18 @@ static void radio_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del
 				blobmsg_add_bool(b, "legacy_rates", 0);
 			else 
 				blobmsg_add_bool(del, "legacy_rates", 0);
+		} else if (strcmp(opt, SCHEMA_CONSTS_MAX_CLIENTS) == 0) {
+			int maxassoc;
+			maxassoc = strtol(value, NULL, 10);
+			if (maxassoc <= 0) {
+				blobmsg_add_u32(del, "maxassoc", maxassoc);
+			} else {
+				if (maxassoc > 100)
+					maxassoc = 100;
+				blobmsg_add_u32(b, "maxassoc", maxassoc);
+			}
 		}
+
 	}
 }
 
@@ -123,6 +137,7 @@ static void radio_state_custom_options_get(struct schema_Wifi_Radio_State *rstat
 	int i;
 	int index = 0;
 	const char *opt;
+	char buf[5];
 
 	for (i = 0; i < SCHEMA_CUSTOM_OPTS_MAX; i++) {
 		opt = custom_options_table[i];
@@ -133,7 +148,14 @@ static void radio_state_custom_options_get(struct schema_Wifi_Radio_State *rstat
 			} else {
 				set_custom_option_state(rstate, &index, opt, "1");
 			}
-                }
+		} else if (strcmp(opt, SCHEMA_CONSTS_MAX_CLIENTS) == 0) {
+			if (tb[WDEV_ATTR_MAXASSOC_CLIENTS]) {
+				snprintf(buf, sizeof(buf), "%d", blobmsg_get_u32(tb[WDEV_ATTR_MAXASSOC_CLIENTS]));
+				set_custom_option_state(rstate, &index, opt, buf);
+			} else {
+                                set_custom_option_state(rstate, &index, opt, "0");
+			}
+		}
 	}
 }
 
