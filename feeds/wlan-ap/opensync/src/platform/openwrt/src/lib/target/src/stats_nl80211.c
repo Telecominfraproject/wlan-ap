@@ -595,5 +595,9 @@ int stats_nl80211_init(void)
 		LOGE("failed to spawn nl80211");
 		return -1;
 	}
+
+	if (nl_socket_set_buffer_size(unl.sock, 262144, 0) < 0)
+		LOGE("stats_nl80211: Failed to set nl socket buffer size");
+
 	return 0;
 }
