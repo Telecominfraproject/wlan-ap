@@ -137,46 +137,6 @@ static void vif_del_sta_rate_rule(uint8_t *addr, char *ifname)
     free(rule);
 }
 
-static void vif_update_stats(struct wifi_station *sta, struct nlattr **tb)
-{
-	static struct nla_policy stats_policy[NL80211_STA_INFO_MAX + 1] = {
-		[NL80211_STA_INFO_INACTIVE_TIME] = { .type = NLA_U32    },
-		[NL80211_STA_INFO_RX_PACKETS]    = { .type = NLA_U32    },
-		[NL80211_STA_INFO_TX_PACKETS]    = { .type = NLA_U32    },
-		[NL80211_STA_INFO_RX_BITRATE]    = { .type = NLA_NESTED },
-		[NL80211_STA_INFO_TX_BITRATE]    = { .type = NLA_NESTED },
-		[NL80211_STA_INFO_SIGNAL]        = { .type = NLA_U8     },
-		[NL80211_STA_INFO_SIGNAL_AVG]    = { .type = NLA_U8     },
-		[NL80211_STA_INFO_RX_BYTES]      = { .type = NLA_U32    },
-		[NL80211_STA_INFO_TX_BYTES]      = { .type = NLA_U32    },
-		[NL80211_STA_INFO_TX_RETRIES]    = { .type = NLA_U32    },
-		[NL80211_STA_INFO_TX_FAILED]     = { .type = NLA_U32    },
-		[NL80211_STA_INFO_T_OFFSET]      = { .type = NLA_U64    },
-		[NL80211_STA_INFO_STA_FLAGS] =
-			{ .minlen = sizeof(struct nl80211_sta_flag_update) },
-	};
-
-	struct nlattr *sinfo[NL80211_STA_INFO_MAX + 1] = { };
-
-	if (!tb[NL80211_ATTR_STA_INFO])
-		return;
-	if (nla_parse_nested(sinfo, NL80211_STA_INFO_MAX,
-			     tb[NL80211_ATTR_STA_INFO], stats_policy))
-		return;
-	if (sinfo[NL80211_STA_INFO_SIGNAL_AVG])
-		sta->rssi = (int32_t) nla_get_u8(sinfo[NL80211_STA_INFO_SIGNAL_AVG]);
-	if (sinfo[NL80211_STA_INFO_RX_PACKETS])
-		sta->rx_packets = nla_get_u32(sinfo[NL80211_STA_INFO_RX_PACKETS]);
-	if (sinfo[NL80211_STA_INFO_TX_PACKETS])
-		sta->tx_packets = nla_get_u32(sinfo[NL80211_STA_INFO_TX_PACKETS]);
-	if (sinfo[NL80211_STA_INFO_RX_BYTES])
-		sta->rx_bytes = nla_get_u32(sinfo[NL80211_STA_INFO_RX_BYTES]);
-	if (sinfo[NL80211_STA_INFO_TX_BYTES])
-		sta->tx_bytes = nla_get_u32(sinfo[NL80211_STA_INFO_TX_BYTES]);
-
-	sta->last_update = time(NULL);
-}
-
 static void nl80211_add_station(struct nlattr **tb, char *ifname)
 {
 	struct wifi_station *sta;
@@ -190,7 +150,6 @@ static void nl80211_add_station(struct nlattr **tb, char *ifname)
 	sta = avl_find_element(&sta_tree, addr, sta, avl);
 	if (sta) {
 		vif_add_sta_rate_rule(addr, ifname);
-		vif_update_stats(sta, tb);
 		return;
 	}
 
@@ -210,7 +169,6 @@ static void nl80211_add_station(struct nlattr **tb, char *ifname)
 
 	vif_add_station(sta, ifname, 1);
 	vif_add_sta_rate_rule(addr, ifname);
-	vif_update_stats(sta, tb);
 }
 
 static void _nl80211_del_station(char *ifname, struct wifi_station *sta)
@@ -279,6 +237,8 @@ static void vif_sync_stations(char *ifname)
 		if (sta_tree.count > 0 && sta_tree.count == j)
 		{
 			LOGI("%s: remove stale client %s", ifname, ovs_clients[i].mac);
+			schema_Wifi_Associated_Clients_mark_all_present(ovs_clients + i);
+			ovs_clients[i]._partial_update = true;
 			radio_ops->op_client(ovs_clients + i, ifname, false);
 		}
 
@@ -303,24 +263,6 @@ static void vif_sync_stations(char *ifname)
 
 free:
 	free(ovs_clients);
-}
-
-static void remove_stale_station(char *ifname)
-{
-	struct wifi_station *sta = NULL, *tmp = NULL;
-	char mac[ETH_ALEN * 3];
-	time_t timeout = 0, t = 0;
-
-	avl_for_each_element_safe(&sta_tree, sta, avl, tmp) {
-		timeout = sta->last_update + (EVSCHED_SEC(STA_POLL_INTERVAL*2));
-		t = time(NULL);
-		if (t > timeout) {
-			print_mac(mac, sta->addr);
-			LOGN("%s: Remove stale STA %s %ld %ld %ld", __func__, mac,
-					t, timeout, sta->last_update);
-			_nl80211_del_station(ifname, sta);
-		}
-	}
 }
 
 static void nl80211_add_iface(struct nlattr **tb, char *ifname, char *phyname, int ifidx)
@@ -517,7 +459,6 @@ static int nl80211_recv(struct nl_msg *msg, void *arg)
 		else
 			snprintf(phyname, sizeof(phyname), "phy%d", phy);
 	}
-
 	switch (gnlh->cmd) {
 	case NL80211_CMD_NEW_STATION:
 		nl80211_add_station(tb, ifname);
@@ -576,16 +517,9 @@ static void nl80211_ev(struct ev_loop *ev, struct ev_io *io, int event)
 
 static void vif_poll_stations(void *arg)
 {
-	 struct wifi_iface *wif = NULL;
-
+	struct wifi_iface *wif = NULL;
 
 	avl_for_each_element(&wif_tree, wif, avl) {
-		struct nl_msg *msg;
-
-		msg = unl_genl_msg(&unl, NL80211_CMD_GET_STATION, true);
-		nla_put_u32(msg, NL80211_ATTR_IFINDEX, wif->ifidx);
-		unl_genl_request(&unl, msg, nl80211_recv, NULL);
-		remove_stale_station(wif->name);
 		vif_sync_stations(wif->name);
 	}
 	evsched_task_reschedule_ms(EVSCHED_SEC(STA_POLL_INTERVAL));
