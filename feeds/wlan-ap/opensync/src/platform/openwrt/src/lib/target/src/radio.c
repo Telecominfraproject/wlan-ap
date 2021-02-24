@@ -54,6 +54,7 @@ enum {
 	WDEV_AATR_CHANNELS,
 	WDEV_ATTR_DISABLE_B_RATES,
 	WDEV_ATTR_MAXASSOC_CLIENTS,
+	WDEV_ATTR_LOCAL_PWR_CONSTRAINT,
 	__WDEV_ATTR_MAX,
 };
 
@@ -73,15 +74,17 @@ static const struct blobmsg_policy wifi_device_policy[__WDEV_ATTR_MAX] = {
 	[WDEV_AATR_CHANNELS] = {.name = "channels", .type = BLOBMSG_TYPE_ARRAY},
         [WDEV_ATTR_DISABLE_B_RATES] = { .name = "legacy_rates", .type = BLOBMSG_TYPE_BOOL },
 	[WDEV_ATTR_MAXASSOC_CLIENTS] = { .name = "maxassoc", .type = BLOBMSG_TYPE_INT32 },
+	[WDEV_ATTR_LOCAL_PWR_CONSTRAINT] = { .name = "local_pwr_constraint", .type = BLOBMSG_TYPE_INT32 },
 };
 
-#define SCHEMA_CUSTOM_OPT_SZ            20
-#define SCHEMA_CUSTOM_OPTS_MAX          2
+#define SCHEMA_CUSTOM_OPT_SZ            24
+#define SCHEMA_CUSTOM_OPTS_MAX          3
 
 static const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 {
 	SCHEMA_CONSTS_DISABLE_B_RATES,
 	SCHEMA_CONSTS_MAX_CLIENTS,
+	SCHEMA_CONSTS_LOCAL_PWR_CONSTRAINT,
 };
 
 static void radio_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del,
@@ -116,8 +119,16 @@ static void radio_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del
 					maxassoc = 100;
 				blobmsg_add_u32(b, "maxassoc", maxassoc);
 			}
+		} else if (strcmp(opt, SCHEMA_CONSTS_LOCAL_PWR_CONSTRAINT) == 0) {
+			int pwr = atoi(value);
+			if (!strcmp(rconf->freq_band, "2.4G")) {
+				blobmsg_add_u32(del, "local_pwr_constraint", pwr);
+			} else if (pwr >= 0 && pwr <=255) {
+				blobmsg_add_u32(b, "local_pwr_constraint", pwr);
+			} else {
+				blobmsg_add_u32(del, "local_pwr_constraint", pwr);
+			}
 		}
-
 	}
 }
 
@@ -154,6 +165,11 @@ static void radio_state_custom_options_get(struct schema_Wifi_Radio_State *rstat
 				set_custom_option_state(rstate, &index, opt, buf);
 			} else {
                                 set_custom_option_state(rstate, &index, opt, "0");
+			}
+		} else if (strcmp(opt, SCHEMA_CONSTS_LOCAL_PWR_CONSTRAINT) == 0) {
+			if (tb[WDEV_ATTR_LOCAL_PWR_CONSTRAINT]) {
+				snprintf(buf, sizeof(buf), "%d", blobmsg_get_u32(tb[WDEV_ATTR_LOCAL_PWR_CONSTRAINT]));
+				set_custom_option_state(rstate, &index, opt, buf);
 			}
 		}
 	}
