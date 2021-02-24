@@ -609,6 +609,9 @@ int radio_nl80211_init(void)
 	unl_genl_subscribe(&unl, "mlme");
 	unl_genl_subscribe(&unl, "vendor");
 
+	if (nl_socket_set_buffer_size(unl.sock, 262144, 0) < 0)
+		LOGE("radio_nl80211: Failed to set nl socket buffer size");
+
 	ev_io_init(&unl_io, nl80211_ev, unl.sock->s_fd, EV_READ);
         ev_io_start(wifihal_evloop, &unl_io);
 	evsched_task(&vif_poll_stations, NULL, EVSCHED_SEC(5));
