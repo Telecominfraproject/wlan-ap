@@ -26,6 +26,7 @@ struct wifi_phy {
 	unsigned int chanpwr[IEEE80211_CHAN_MAX];
 	unsigned int freq[IEEE80211_CHAN_MAX];
 
+	int current_channel;
 	int tx_ant, rx_ant, tx_ant_avail, rx_ant_avail;
 	int band_2g, band_5gl, band_5gu;
 };
@@ -56,6 +57,7 @@ struct wifi_station {
 };
 
 extern int radio_nl80211_init(void);
+extern void update_wiphy();
 
 extern struct wifi_phy *phy_find(const char *name);
 extern struct wifi_iface *vif_find(const char *name);

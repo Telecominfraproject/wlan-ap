@@ -590,6 +590,15 @@ int ieee80211_channel_to_frequency(int chan)
 		return 5000 + chan * 5;
 	return 0;
 }
+int get_current_channel(char *name)
+{
+	struct wifi_phy *phy = phy_find(name);
+
+	if(phy)
+		return phy->current_channel;
+
+	return 0;
+}
 
 bool vif_get_security(struct schema_Wifi_VIF_State *vstate,  char *mode,  char *encryption, char *radiusServerIP,  char *password, char *port)
 {

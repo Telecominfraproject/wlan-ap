@@ -147,8 +147,10 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 	struct blob_attr *tb[__WDEV_ATTR_MAX] = { };
 	struct schema_Wifi_Radio_State  rstate;
 	char phy[6];
+	int32_t chan;
 
 	LOGN("%s: get state", s->e.name);
+	update_wiphy();
 
 	memset(&rstate, 0, sizeof(rstate));
 	schema_Wifi_Radio_State_mark_all_present(&rstate);
@@ -170,8 +172,13 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 		return false;
 	}
 
-	if (tb[WDEV_ATTR_CHANNEL])
-		SCHEMA_SET_INT(rstate.channel, blobmsg_get_u32(tb[WDEV_ATTR_CHANNEL]));
+	if (tb[WDEV_ATTR_CHANNEL]) {
+		chan = get_current_channel(phy);
+		if(chan)
+			SCHEMA_SET_INT(rstate.channel, chan);
+		else
+			SCHEMA_SET_INT(rstate.channel, blobmsg_get_u32(tb[WDEV_ATTR_CHANNEL]));
+	}
 
 	SCHEMA_SET_INT(rstate.enabled, 1);
 	if (!force && tb[WDEV_ATTR_DISABLED] && blobmsg_get_bool(tb[WDEV_ATTR_DISABLED]))
