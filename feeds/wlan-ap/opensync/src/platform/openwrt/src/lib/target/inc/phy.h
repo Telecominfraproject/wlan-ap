@@ -18,5 +18,6 @@ extern int phy_get_channels_state(const char *name,
 extern int phy_get_band(const char *name, char *band);
 extern int phy_is_ready(const char *name);
 extern int phy_lookup(char *name);
+extern int get_current_channel(char *name);
 
 #endif
