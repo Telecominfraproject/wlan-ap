@@ -262,6 +262,8 @@ struct apc_neighbor
 #define APC_IS_DROTHER 4   /* I'm on BCAST or NBMA and I'm not DR */
 #define APC_IS_BACKUP  5   /* I'm BDR */
 #define APC_IS_DR      6   /* I'm DR */
+#define APC_MAX_MODE   7
+
 
 /* Definitions for interface state machine */
 #define ISM_UP      0   /* Interface Up */

@@ -11,6 +11,7 @@ include $(INCLUDE_DIR)/package.mk
 
 define Package/libinterapcomm
   SECTION:=libs
+  DEPENDS:=+libev +libubox +libubus
   CATEGORY:=Libraries
   TITLE:=Inter AP communication library
 endef

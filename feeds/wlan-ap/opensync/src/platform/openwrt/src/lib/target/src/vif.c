@@ -131,6 +131,7 @@ enum {
 	WIF_ATTR_MIN_HW_MODE,
 	WIF_ATTR_11R_R0KH,
 	WIF_ATTR_11R_R1KH,
+	WIF_ATTR_RADPROXY,
 	__WIF_ATTR_MAX,
 };
 
@@ -224,6 +225,7 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_MIN_HW_MODE] = { .name = "min_hw_mode", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_11R_R0KH] = { .name = "r0kh", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_11R_R1KH] = { .name = "r1kh", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_RADPROXY] = { .name = "radproxy", BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -315,6 +317,61 @@ static struct vif_crypto {
 	{ "wpa3-mixed", OVSDB_SECURITY_ENCRYPTION_WPA3_EAP, OVSDB_SECURITY_MODE_MIXED, 1 },
 };
 
+extern ovsdb_table_t table_APC_State;
+extern json_t* ovsdb_table_where(ovsdb_table_t *table, void *record);
+extern unsigned int radproxy_apc;
+
+/* Custom options table */
+#define SCHEMA_CUSTOM_OPT_SZ            20
+#define SCHEMA_CUSTOM_OPTS_MAX          13
+
+const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
+{
+	SCHEMA_CONSTS_RATE_LIMIT,
+	SCHEMA_CONSTS_RATE_DL,
+	SCHEMA_CONSTS_RATE_UL,
+	SCHEMA_CONSTS_CLIENT_RATE_DL,
+	SCHEMA_CONSTS_CLIENT_RATE_UL,
+	SCHEMA_CONSTS_IEEE80211k,
+	SCHEMA_CONSTS_RTS_THRESHOLD,
+	SCHEMA_CONSTS_DTIM_PERIOD,
+	SCHEMA_CONSTS_RADIUS_OPER_NAME,
+	SCHEMA_CONSTS_RADIUS_NAS_ID,
+	SCHEMA_CONSTS_RADIUS_NAS_IP,
+	SCHEMA_CONSTS_DYNAMIC_VLAN,
+	SCHEMA_CONSTS_RADPROXY,
+};
+
+static bool vif_config_custom_opt_get_proxy(
+		const struct schema_Wifi_VIF_Config *vconf)
+{
+	int i;
+	const char *opt;
+	const char *val;
+	char value[20];
+
+	for (i = 0; i < SCHEMA_CUSTOM_OPTS_MAX; i++) {
+		opt = custom_options_table[i];
+		val = SCHEMA_KEY_VAL(vconf->custom_options, opt);
+		if (!val)
+			strncpy(value, "0", 20);
+		else
+			strncpy(value, val, 20);
+
+		if (strcmp(opt, "radproxy") == 0) {
+			if (strcmp(value, "1") == 0) {
+				radproxy_apc |= 1;
+				return true;
+			}
+			else {
+				radproxy_apc |= 0;
+				return false;
+			}
+		}
+	}
+	return false;
+}
+
 static int vif_config_security_set(struct blob_buf *b,
 				    const struct schema_Wifi_VIF_Config *vconf)
 {
@@ -322,8 +379,10 @@ static int vif_config_security_set(struct blob_buf *b,
 	const char *mode = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_MODE);
 	unsigned int i;
 	unsigned int acct_interval;
-	const char *auth_server, *auth_port, *auth_secret, *security_key;
+	const char *auth_server, *auth_port, *auth_secret, *security_key, *acct_server;
 	char key_str[64], key_holder_str[128];
+	struct schema_APC_State apc_conf;
+	const char *local_server = "127.0.0.1";
 
 	if (!strcmp(encryption, OVSDB_SECURITY_ENCRYPTION_OPEN) || !mode)
 		goto open;
@@ -341,20 +400,48 @@ static int vif_config_security_set(struct blob_buf *b,
 		}
 
 		if (vif_crypto[i].enterprise) {
+
+			if (vif_config_custom_opt_get_proxy(vconf)) {
+				LOGN("%s: Apply Proxy Security Settings", vconf->if_name);
+				json_t *where = ovsdb_table_where(&table_APC_State, &apc_conf);
+				if (false == ovsdb_table_select_one_where(&table_APC_State,
+						where, &apc_conf)) {
+					LOG(INFO, "APC_State read failed");
+					return -1;
+				}
+				if (!strncmp(apc_conf.mode, "DR", 2)) {
+					auth_server = local_server;
+					acct_server = local_server;
+				} else if (!strncmp(apc_conf.mode, "OR", 2) ||
+					   !strncmp(apc_conf.mode, "BDR", 2)) {
+					auth_server = apc_conf.dr_addr;
+					acct_server = apc_conf.dr_addr;
+				}
+				else {
+					auth_server = local_server;
+					acct_server = local_server;
+				}
+			}
+			else
+			{
+				auth_server = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_IP);
+				acct_server = SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_IP);
+			}
+
 			acct_interval = 0;
-			auth_server = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_IP);
 			auth_port   = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_PORT);
 			auth_secret = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_SECRET);
+
 			LOGT("%s: Server IP %s port %s secret %s", vconf->if_name, auth_server, auth_port, auth_secret);
 			if (!auth_server[0] || !auth_port[0] || !auth_secret[0]) {
 				LOGI("%s: Incomplete RADIUS security config - SSID not created", vconf->if_name);
 				return -1;
 			}
+
 			blobmsg_add_string(b, "auth_server", auth_server);
 			blobmsg_add_string(b, "auth_port",   auth_port );
 			blobmsg_add_string(b, "auth_secret", auth_secret );
-			blobmsg_add_string(b, "acct_server",
-					   SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_IP));
+			blobmsg_add_string(b, "acct_server", acct_server);
 			blobmsg_add_string(b, "acct_port",
 					   SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_PORT));
 			blobmsg_add_string(b, "acct_secret",
@@ -481,25 +568,6 @@ out_none:
 				  OVSDB_SECURITY_ENCRYPTION_OPEN);
 }
 
-/* Custom options table */
-#define SCHEMA_CUSTOM_OPT_SZ            20
-#define SCHEMA_CUSTOM_OPTS_MAX          12
-
-const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
-{
-	SCHEMA_CONSTS_RATE_LIMIT,
-	SCHEMA_CONSTS_RATE_DL,
-	SCHEMA_CONSTS_RATE_UL,
-	SCHEMA_CONSTS_CLIENT_RATE_DL,
-	SCHEMA_CONSTS_CLIENT_RATE_UL,
-	SCHEMA_CONSTS_IEEE80211k,
-	SCHEMA_CONSTS_RTS_THRESHOLD,
-	SCHEMA_CONSTS_DTIM_PERIOD,
-	SCHEMA_CONSTS_RADIUS_OPER_NAME,
-	SCHEMA_CONSTS_RADIUS_NAS_ID,
-	SCHEMA_CONSTS_RADIUS_NAS_IP,
-	SCHEMA_CONSTS_DYNAMIC_VLAN,
-};
 
 static void vif_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del,
                                       const struct schema_Wifi_VIF_Config *vconf)
@@ -586,7 +654,8 @@ static void vif_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del,
 				strncpy(value, "br-wan.", 20);
 				blobmsg_add_string(del, "vlan_bridge", value);
 			}
-		}
+		} else if (strcmp(opt, "radproxy") == 0)
+			blobmsg_add_string(b, "radproxy", value);
 	}
 
 	/* No NASID was found from blob, so use BSSID as NASID */
@@ -729,7 +798,15 @@ static void vif_state_custom_options_get(struct schema_Wifi_VIF_State *vstate,
 							custom_options_table[i],
 							buf);
 			}
+		} else if (strcmp(opt, "radproxy") == 0) {
+			if (tb[WIF_ATTR_RADPROXY]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_RADPROXY]);
+				set_custom_option_state(vstate, &index,
+							custom_options_table[i],
+							buf);
+			}
 		}
+
 	}
 }
 
@@ -923,6 +1000,70 @@ void vif_section_del(char *section_name)
 	uci_unload(uci, wireless);
 	reload_config = 1;
 
+}
+
+static void vif_check_radius_proxy()
+{
+	struct uci_context *uci_ctx;
+	struct uci_package *wireless;
+	struct schema_APC_State apc_conf;
+	struct uci_element *e = NULL, *tmp = NULL;
+	char *buf = NULL;
+	int rc = 0;
+
+	json_t *where = ovsdb_table_where(&table_APC_State, &apc_conf);
+	if (false == ovsdb_table_select_one_where(&table_APC_State, where, &apc_conf))
+	{
+		LOGI("APC_State read failed");
+		return;
+	}
+
+	uci_ctx = uci_alloc_context();
+
+	rc = uci_load(uci_ctx, "wireless", &wireless);
+
+	if (rc)
+	{
+		LOGD("%s: uci_load() failed with rc %d", __func__, rc);
+		goto free;
+	}
+
+	uci_foreach_element_safe(&wireless->sections, tmp, e)
+	{
+		struct blob_attr *tb[__WIF_ATTR_MAX];
+		struct uci_section *s = uci_to_section(e);
+		if ((s == NULL) || (s->type == NULL))
+			continue;
+
+		if (strcmp(s->type, "wifi-iface"))
+			continue;
+
+		blob_buf_init(&b, 0);
+		uci_to_blob(&b, s, &wifi_iface_param);
+		blobmsg_parse(wifi_iface_policy, __WIF_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
+
+		if (tb[WIF_ATTR_RADPROXY])
+		{
+			buf = blobmsg_get_string(tb[WIF_ATTR_RADPROXY]);
+
+			if (!strcmp(buf, "1") && !strcmp(apc_conf.mode, "DR"))
+			{
+				if (!system("pidof radsecproxy"))
+					goto free;
+
+				system("/etc/init.d/radsecproxy start");
+
+				goto free;
+			}
+		}
+	}
+
+	system("/etc/init.d/radsecproxy stop");
+
+free:
+	uci_unload(uci_ctx, wireless);
+	uci_free_context(uci_ctx);
+	return;
 }
 
 static bool hs20_download_icon(char *icon_name, char *icon_url)
@@ -1427,9 +1568,8 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 	blobmsg_add_bool(&b, "wpa_disable_eapol_key_retries", 1);
 	blobmsg_add_u32(&b, "channel", rconf->channel);
 
-	if (vif_config_security_set(&b, vconf)) {
-                return -1;
-        }
+	if (vif_config_security_set(&b, vconf))
+		return -1;
 
 	if (changed->custom_options)
 		vif_config_custom_opt_set(&b, &del, vconf);
@@ -1451,6 +1591,9 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 	{
 		vif_dhcp_opennds_allowlist_set(vconf,(char*)vconf->if_name);
 	}
+
+	if (changed->custom_options)
+		vif_check_radius_proxy();
 
 	reload_config = 1;
 	return 0;

@@ -7,11 +7,27 @@
 #include <string.h>
 #include <unistd.h>
 #include <interAPcomm.h>
+#include <libubox/uloop.h>
 
 /*Receiver socket*/
 int recv_sock = -1;
 
 recv_arg ra;
+
+static void receive_data_uloop(struct uloop_fd *fd, unsigned int events)
+{
+	void *recv_data;
+	ssize_t recv_data_len;
+
+	recv_data = malloc(ra.len);
+	memset(recv_data, 0, ra.len);
+	if ((recv_data_len = recvfrom(recv_sock, recv_data, ra.len,
+				      0, NULL, 0)) < 0)
+		printf("recvfrom() failed");
+
+	ra.cb(recv_data, recv_data_len);
+
+}
 
 static void receive_data(struct ev_loop *ev, ev_io *io, int event)
 {
@@ -28,8 +44,10 @@ static void receive_data(struct ev_loop *ev, ev_io *io, int event)
 
 }
 
-int interap_recv(unsigned short port, int (*recv_cb)(void *, ssize_t), unsigned int len,
-		 struct ev_loop *loop, ev_io *io)
+static struct uloop_fd server;
+
+int interap_recv(unsigned short port, int (*recv_cb)(void *, ssize_t),
+		 unsigned int len, struct ev_loop *loop, ev_io *io)
 {
 	struct sockaddr_in addr;
 	int bcast_perm;
@@ -65,8 +83,16 @@ int interap_recv(unsigned short port, int (*recv_cb)(void *, ssize_t), unsigned 
 	}
 
 	printf("Interap recving: p:%d\n", port);
-	ev_io_init(io, receive_data, recv_sock, EV_READ);
-	ev_io_start(loop, io);
+
+	if (io && loop) {
+		ev_io_init(io, receive_data, recv_sock, EV_READ);
+		ev_io_start(loop, io);
+	} else {
+
+		server.cb = receive_data_uloop;
+		server.fd = recv_sock;
+		uloop_fd_add(&server, ULOOP_READ);
+	}
 
 	return 0;
 }

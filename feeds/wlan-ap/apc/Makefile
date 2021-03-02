@@ -11,7 +11,7 @@ include $(INCLUDE_DIR)/package.mk
 
 define Package/apc
   SECTION:=base
-  DEPENDS:=+libev +libinterapcomm
+  DEPENDS:=+libev +libinterapcomm +libubus +libubox
   CATEGORY:=Base system
   TITLE:=Access Point Coordinator
 endef
@@ -33,5 +33,11 @@ endef
 define Package/apc/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/apc $(1)/usr/bin
+	chmod 0700 $(1)/usr/bin/apc
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/apc.init $(1)/etc/init.d/apc
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_BIN) ./files/apc.config $(1)/etc/config/apc
+
 endef
 $(eval $(call BuildPackage,apc))

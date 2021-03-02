@@ -33,7 +33,6 @@ reset_lists(struct apc_proto *p, struct apc_neighbor *n)
 {
 }
 
-
 struct apc_neighbor * apc_neighbor_new(struct apc_iface * ifa)
 {
 	struct apc_neighbor * n = mb_allocz(sizeof(struct apc_neighbor));
@@ -52,7 +51,6 @@ struct apc_neighbor * apc_neighbor_new(struct apc_iface * ifa)
 	return(n);
 }
 
-
 static void apc_neigh_down(struct apc_neighbor * n)
 {
 	struct apc_iface * ifa = n->ifa;
@@ -61,7 +59,6 @@ static void apc_neigh_down(struct apc_neighbor * n)
 	
 	printf("Neighbor %x on %s removed", n->rid, ifa->ifname );
 }
-
 
 /**
  * apc_neigh_chstate - handles changes related to new or lod state of neighbor
@@ -81,7 +78,8 @@ static void apc_neigh_chstate(struct apc_neighbor * n, u8 state)
 		return;
 	
 	printf("Neighbor %x on %s changed state from %s to %s\n",
-	                n->rid, ifa->ifname, apc_ns_names[old_state], apc_ns_names[state] );
+	                n->rid, ifa->ifname, apc_ns_names[old_state],
+			apc_ns_names[state]);
 	
 	n->state = state;
 
@@ -120,7 +118,6 @@ static void apc_neigh_chstate(struct apc_neighbor * n, u8 state)
 	if ((state < NEIGHBOR_2WAY) && (old_state >= NEIGHBOR_2WAY))
 		apc_iface_sm(ifa, ISM_NEICH);
 }
-
 
 /**
  * apc_neigh_sm - apc neighbor state machine
@@ -218,7 +215,6 @@ void apc_neigh_sm(struct apc_neighbor * n, int event)
 	}
 }
 
-
 static int can_do_adj(struct apc_neighbor * n)
 {
 	struct apc_iface * ifa = n->ifa;
@@ -257,12 +253,10 @@ static int can_do_adj(struct apc_neighbor * n)
 	return i;
 }
 
-
 static inline u32 neigh_get_id(struct apc_proto *p, struct apc_neighbor *n)
 {
 	return ipa_to_u32(n->ip);
 }
-
 
 static struct apc_neighbor * elect_bdr( struct apc_proto * p, list nl)
 {
@@ -271,7 +265,7 @@ static struct apc_neighbor * elect_bdr( struct apc_proto * p, list nl)
 
     n1 = NULL;
     n2 = NULL;
-    WALK_LIST( neigh, nl )                      /* First try those decl. themselves */
+    WALK_LIST( neigh, nl )                /* First try those decl. themselves */
     {
         nid = neigh_get_id( p, neigh );
 
@@ -317,7 +311,6 @@ static struct apc_neighbor * elect_bdr( struct apc_proto * p, list nl)
     return( n1 );
 }
 
-
 static struct apc_neighbor * elect_dr( struct apc_proto * p, list nl )
 {
     struct apc_neighbor *neigh, *n;
@@ -350,7 +343,6 @@ static struct apc_neighbor * elect_dr( struct apc_proto * p, list nl )
 
     return( n );
 }
-
 
 /**
  * apc_dr_election - (Backup) Designed Router election
@@ -450,7 +442,6 @@ void apc_dr_election(struct apc_iface * ifa)
 	}
 }
 
-
 struct apc_neighbor * find_neigh_by_ip(struct apc_iface * ifa, ip_addr ip)
 {
 	struct apc_neighbor * n;
@@ -462,7 +453,6 @@ struct apc_neighbor * find_neigh_by_ip(struct apc_iface * ifa, ip_addr ip)
 	}
 	return NULL;
 }
-
 
 static void inactivity_timer_hook(struct _timer * tmr)
 {

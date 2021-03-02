@@ -65,7 +65,7 @@ void apc_iface_chstate(struct apc_iface * ifa, u8 state)
 	
 	if (state == oldstate)
 		return;
-	
+
 	printf("Interface %s changed state from %s to %s\n",
 		ifa->ifname, apc_is_names[oldstate], apc_is_names[state]);
 	

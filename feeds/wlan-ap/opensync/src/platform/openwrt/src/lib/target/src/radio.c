@@ -26,10 +26,15 @@
 #include "captive.h"
 #include "rrm_config.h"
 #include "vlan.h"
+#include "radius_proxy.h"
 
 ovsdb_table_t table_Hotspot20_Config;
 ovsdb_table_t table_Hotspot20_OSU_Providers;
 ovsdb_table_t table_Hotspot20_Icon_Config;
+
+ovsdb_table_t table_APC_Config;
+ovsdb_table_t table_APC_State;
+unsigned int radproxy_apc;
 
 static struct uci_package *wireless;
 struct uci_context *uci;
@@ -669,6 +674,157 @@ static void callback_Hotspot20_Icon_Config(ovsdb_update_monitor_t *mon,
 
 }
 
+enum {
+	WIF_APC_ENABLE,
+	__WIF_APC_MAX,
+};
+
+static const struct blobmsg_policy apc_enpolicy[__WIF_APC_MAX] = {
+		[WIF_APC_ENABLE] = { .name = "enabled", BLOBMSG_TYPE_BOOL },
+};
+
+const struct uci_blob_param_list apc_param = {
+	.n_params = __WIF_APC_MAX,
+	.params = apc_enpolicy,
+};
+
+void APC_config_update(struct schema_APC_Config *conf)
+{
+	struct uci_package *apc;
+	struct blob_buf apcb = { };
+	int rc = 0;
+
+	LOGD("APC: APC_config_update");
+
+	rc = uci_load(uci, "apc", &apc);
+	if (rc)
+	{
+		LOGD("%s: uci_load failed with rc %d", __func__, rc);
+	}
+
+	blob_buf_init(&apcb, 0);
+
+ 	if (conf->enabled_changed) {
+		if (conf->enabled == true) {
+			blobmsg_add_bool(&apcb, "enabled", 1);
+			system("/etc/init.d/apc start");
+		}
+		else {
+			blobmsg_add_bool(&apcb, "enabled", 0);
+			system("/etc/init.d/apc stop");
+		}
+	}
+
+        blob_to_uci_section(uci, "apc", "apc", "apc",
+                            apcb.head, &apc_param, NULL);
+
+	uci_commit(uci, &apc, false);
+	uci_unload(uci, apc);
+}
+
+static void callback_APC_Config(ovsdb_update_monitor_t *mon,
+                                struct schema_APC_Config *old,
+                                struct schema_APC_Config *conf)
+{
+	if (mon->mon_type != OVSDB_UPDATE_DEL)
+		APC_config_update(conf);
+
+}
+
+static void callback_APC_State(ovsdb_update_monitor_t *mon,
+                                struct schema_APC_State *old,
+                                struct schema_APC_State *conf)
+{
+	LOGN("APC_state: enabled:%s dr_addr:%s bdr_addr:%s mode:%s",
+	     (conf->enabled_changed)? "changed":"unchanged", 
+	     (conf->dr_addr_changed)? "changed":"unchanged",
+	     (conf->bdr_addr_changed)? "changed":"unchanged",
+	     (conf->mode_changed)? "changed":"unchanged");
+
+	/* APC changed: if radproxy enabled then restart wireless */
+	if (radproxy_apc) {
+		radproxy_apc = 0;
+		system("ubus call service event '{\"type\": \"config.change\", \"data\": { \"package\": \"wireless\" }}'");
+	}
+}
+
+struct schema_APC_State apc_state;
+enum {
+	APC_ATTR_MODE,
+	APC_ATTR_DR_ADDR,
+	APC_ATTR_BDR_ADDR,
+	APC_ATTR_ENABLED,
+	__APC_ATTR_MAX,
+};
+
+static const struct blobmsg_policy apc_policy[__APC_ATTR_MAX] = {
+	[APC_ATTR_MODE] = { .name = "mode", .type = BLOBMSG_TYPE_STRING },
+	[APC_ATTR_DR_ADDR] = { .name = "dr_addr", .type = BLOBMSG_TYPE_STRING },
+	[APC_ATTR_BDR_ADDR] = { .name = "bdr_addr", .type = BLOBMSG_TYPE_STRING },
+	[APC_ATTR_ENABLED] = { .name = "enabled", .type = BLOBMSG_TYPE_BOOL },
+};
+
+struct schema_APC_Config apc_conf;
+
+void apc_state_set(struct blob_attr *msg)
+{
+	struct blob_attr *tb[__APC_ATTR_MAX] = { };
+
+	blobmsg_parse(apc_policy, __APC_ATTR_MAX, tb,
+		      blob_data(msg), blob_len(msg));
+
+	if (tb[APC_ATTR_MODE]) {
+		LOGD("APC mode: %s", blobmsg_get_string(tb[APC_ATTR_MODE]));
+		SCHEMA_SET_STR(apc_state.mode,
+			       blobmsg_get_string(tb[APC_ATTR_MODE]));
+	}
+	if (tb[APC_ATTR_DR_ADDR]) {
+		LOGD("APC br-addr: %s", blobmsg_get_string(tb[APC_ATTR_DR_ADDR]));
+		SCHEMA_SET_STR(apc_state.dr_addr,
+			       blobmsg_get_string(tb[APC_ATTR_DR_ADDR]));
+	}
+	if (tb[APC_ATTR_BDR_ADDR]) {
+		LOGD("APC dbr-addr: %s", blobmsg_get_string(tb[APC_ATTR_BDR_ADDR]));
+		SCHEMA_SET_STR(apc_state.bdr_addr,
+			       blobmsg_get_string(tb[APC_ATTR_BDR_ADDR]));
+	}
+	if (tb[APC_ATTR_ENABLED]) {
+		LOGD("APC enabled: %d", blobmsg_get_bool(tb[APC_ATTR_ENABLED]));
+		if (blobmsg_get_bool(tb[APC_ATTR_ENABLED])) {
+			SCHEMA_SET_INT(apc_state.enabled, true);
+		}
+		else {
+			SCHEMA_SET_INT(apc_state.enabled, false);
+		}
+	}
+
+	LOGD("APC_state Updating");
+	if (!ovsdb_table_update(&table_APC_State, &apc_state))
+		LOG(ERR, "APC_state: failed to update");
+}
+
+
+void apc_init()
+{
+	/* APC Config */
+	OVSDB_TABLE_INIT(APC_Config, _uuid);
+	OVSDB_TABLE_MONITOR(APC_Config, false);
+	SCHEMA_SET_INT(apc_conf.enabled, true);
+	LOGI("APC state/config Initialize");
+	if (!ovsdb_table_insert(&table_APC_Config, &apc_conf))
+		LOG(ERR, "APC_Config: failed to initialize");
+
+	/* APC State */
+	OVSDB_TABLE_INIT_NO_KEY(APC_State);
+	OVSDB_TABLE_MONITOR(APC_State, false);
+	SCHEMA_SET_STR(apc_state.mode, "NC");
+	SCHEMA_SET_STR(apc_state.dr_addr, "0.0.0.0");
+	SCHEMA_SET_STR(apc_state.bdr_addr, "0.0.0.0");
+	SCHEMA_SET_INT(apc_state.enabled, false);
+	if (!ovsdb_table_insert(&table_APC_State, &apc_state))
+		LOG(ERR, "APC_state: failed to initialize");
+}
+
 bool target_radio_init(const struct target_radio_ops *ops)
 {
 	uci = uci_alloc_context();
@@ -691,8 +847,13 @@ bool target_radio_init(const struct target_radio_ops *ops)
 	OVSDB_TABLE_INIT(Hotspot20_Icon_Config, _uuid);
 	OVSDB_TABLE_MONITOR(Hotspot20_Icon_Config, false);
 
-        OVSDB_TABLE_INIT(Wifi_RRM_Config, _uuid);
-        OVSDB_TABLE_MONITOR(Wifi_RRM_Config, false);
+	OVSDB_TABLE_INIT(Wifi_RRM_Config, _uuid);
+	OVSDB_TABLE_MONITOR(Wifi_RRM_Config, false);
+
+	OVSDB_TABLE_INIT(Radius_Proxy_Config, _uuid);
+	OVSDB_TABLE_MONITOR(Radius_Proxy_Config, false);
+
+	apc_init();
 
 	evsched_task(&periodic_task, NULL, EVSCHED_SEC(5));
 
