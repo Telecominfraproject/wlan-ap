@@ -6,7 +6,7 @@ subdirs=src/test
 
 CFLAGS += -O -Wall -Werror -Wshadow
 CFLAGS += -I./include/
-LIBS = -lev
+LIBS = -lev -lubox -lubus
 
 all: $(LIBNAME) $(subdirs)
 

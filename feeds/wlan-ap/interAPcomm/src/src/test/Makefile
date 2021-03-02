@@ -3,7 +3,7 @@ OBJS = interapcommtest.o
 
 CFLAGS += -Wall $(EXTRA_CFLAGS) $(extra_cflags-y)
 
-LIBS =	-L ../../ -linterapcomm -lev
+LIBS =	-L ../../ -linterapcomm -lev -lubox -lubus
 
 CFLAGS += -I. \
 	-I../../include/

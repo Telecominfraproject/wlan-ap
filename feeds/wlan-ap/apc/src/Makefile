@@ -3,11 +3,13 @@ srcdir ?= .
 VPATH ?= $(srcdir)/src
 
 
-LIBS = -lpthread -lrt -linterapcomm -lev
+LIBS = -lpthread -lrt -linterapcomm -lev -lubus -lubox
 $(call output,usr/sbin/wc-apc)
 
 CFLAGS += -I./include/ \
 	-I../include/
+
+CFLAGS += -DUBUS_SUPPORT
 
 CFLAGS  += -Wall -g
 CFLAGS += -MMD -Wall -g -Wpointer-arith -Wcast-qual -Wshadow \
@@ -15,7 +17,7 @@ CFLAGS += -MMD -Wall -g -Wpointer-arith -Wcast-qual -Wshadow \
 				-fno-omit-frame-pointer -g -rdynamic -fexceptions -funwind-tables -funsigned-char
 
 OBJS := apc_main.o \
-               hello.o iface.o neighbor.o apc.o
+               hello.o iface.o neighbor.o apc.o ubus.o
 
 all: apc
 

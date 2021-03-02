@@ -21,9 +21,11 @@
 #include <nest/apcn.h>
 #include <apc.h>
 #include <protocol.h>
+#include <ubus.h>
 
-static ev_io iac_io;
-static ev_timer  check_timer;
+#include <libubus.h>
+static struct uloop_timeout check_timer;
+static void check_timer_handler(struct uloop_timeout *timeout);
 static unsigned int CheckIp;
 static int CheckCount;
 
@@ -228,8 +230,7 @@ int set_socket(void)
 /*************************************/
 
 
-static void check_timer_handler(struct ev_loop *loop, ev_timer *timer,
-				 int revents) 
+static void check_timer_handler(struct uloop_timeout *timeout)
 {
 	timers_go();
 	if (WaitingToReelect)
@@ -256,25 +257,45 @@ static void check_timer_handler(struct ev_loop *loop, ev_timer *timer,
 		}
 		
 		CheckCount = 0;
-		if (ApcSpecSaved.IsApc == I_AM_APC)
-		{
-		//Radius stuff
-		}
 	}
+
+	uloop_timeout_set(&check_timer, 1000);
+	uloop_timeout_add(&check_timer);
+
 }
+
+static void handle_signal(int signo)
+{
+	system("/usr/opensync/bin/ovsh u APC_State dr_addr:=0.0.0.0 bdr_addr:=0.0.0.0 enabled:=false mode:=NC");
+}
+
+static void set_signals(void)
+{
+	struct sigaction s;
+
+	memset(&s, 0, sizeof(s));
+	s.sa_handler = handle_signal;
+	s.sa_flags = 0;
+	sigaction(SIGINT, &s, NULL);
+	sigaction(SIGTERM, &s, NULL);
+	sigaction(SIGPIPE, &s, NULL);
+}
+
+extern struct ubus_context *ubus_ctx;
 
 int main(int argc, char *const* argv)
 {
 	struct proto_config c;
 	struct proto * apc_proto;
-	struct ev_loop *loop = EV_DEFAULT;
+	uloop_init();
+	/*init term signals*/
+	set_signals();
 
 	/*Socket*/
 	set_socket();
 
 	/*Radius stuff*/
 
-	printf("Basic MAC\n");
 	memset(MyBasicMac, 0, 6);
 	if (get_mac_addr("br-wan", MyBasicMac) == 0) {
 		printf("APC: br-wan mac:%02X:%02X:%02X:%02X:%02X:%02X\n",
@@ -291,6 +312,7 @@ int main(int argc, char *const* argv)
 
 	/*get local ip of br-wan*/
 	MyIpAddr = 0;
+	printf("Getting br-wan IP\n");
 	while(1)
 	{
 		GetLocalIpv4Addr((unsigned char *)&MyIpAddr, "br-wan");
@@ -303,9 +325,11 @@ int main(int argc, char *const* argv)
 
 	/*listening interAP*/
 	callback cb = receive_from_socket;
+
 	if (interap_recv(IAC_APC_ELECTION_PORT, cb, 1000,
-			 loop, &iac_io) < 0)
+			 NULL, NULL) < 0)
 		printf("Error: Failed InterAP receive");
+
 
 	memset(Timers, 0, sizeof(Timers));
 	
@@ -319,11 +343,14 @@ int main(int argc, char *const* argv)
 	ApcProto = (struct apc_proto *)apc_proto;
 	proto_apc.start(apc_proto);
 
-	ev_timer_init(&check_timer, check_timer_handler, 1, 1);
+	check_timer.cb = check_timer_handler;
+	uloop_timeout_set(&check_timer, 1000);
+	uloop_timeout_add(&check_timer);
 
-	ev_timer_start(loop, &check_timer);
-
-	ev_run(loop, 0);
+	ubus_init();
+	uloop_run();
+	uloop_done();
+	ubus_done();
 
 	return(1);
 }
