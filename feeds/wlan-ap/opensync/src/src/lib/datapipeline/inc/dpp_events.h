@@ -13,6 +13,7 @@
 #define DPP_CLT_ID_LEN 129
 #define MAC_ADDRESS_STRING_LEN 17
 #define IP_ADDRESS_STRING_LEN 15
+#define IPV4_BYTES_LEN 4
 
 /* proto: EventType */
 typedef enum {
