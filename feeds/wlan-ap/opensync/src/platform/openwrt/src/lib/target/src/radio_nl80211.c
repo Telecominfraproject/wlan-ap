@@ -384,18 +384,20 @@ static void nl80211_add_phy(struct nlattr **tb, char *name)
 					freq = nla_get_u32(tb_freq[NL80211_FREQUENCY_ATTR_FREQ]);
 					chan = ieee80211_frequency_to_channel(freq);
 					if (chan >= IEEE80211_CHAN_MAX) {
-						LOGE("%s: found invalid channel %d", phy->name, chan);
+						LOG(DEBUG, "%s: found invalid channel %d", phy->name, chan);
 						continue;
 					}
 
 					if (tb_freq[NL80211_FREQUENCY_ATTR_DISABLED]) {
 						phy->chandisabled[chan] = 1;
+						phy->chandfs[chan] = 0;
 						continue;
 					}
 
 					if (tb_freq[NL80211_FREQUENCY_ATTR_RADAR]) {
 						phy->chandfs[chan] = 1;
-						LOGE("%s: found dfs channel %d", phy->name, chan);
+						phy->chandisabled[chan] = 0;
+						LOG(DEBUG, "%s: found dfs channel %d", phy->name, chan);
 						continue;
 					}
 					phy->freq[chan] = freq;
@@ -430,6 +432,17 @@ static void nl80211_del_phy(struct nlattr **tb, char *name)
 	free(phy);
 }
 
+static void nl80211_update_current_channel(struct nlattr **tb, char *name, int freq)
+{
+	struct wifi_phy *phy;
+
+	phy = avl_find_element(&phy_tree, name, phy, avl);
+	if (!phy)
+		return;
+
+	phy->current_channel = ieee80211_frequency_to_channel(freq);
+}
+
 static int nl80211_recv(struct nl_msg *msg, void *arg)
 {
 	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
@@ -438,7 +451,7 @@ static int nl80211_recv(struct nl_msg *msg, void *arg)
 	char *pif_name=NULL;
 	char phyname[IFNAMSIZ] = {};
 	int ifidx = -1, phy = -1;
-
+	int freq = 0;
 	memset(tb, 0, sizeof(tb));
 
 	nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
@@ -459,6 +472,13 @@ static int nl80211_recv(struct nl_msg *msg, void *arg)
 		else
 			snprintf(phyname, sizeof(phyname), "phy%d", phy);
 	}
+
+	if(tb[NL80211_ATTR_WIPHY_FREQ]) {
+		freq = nla_get_u32(tb[NL80211_ATTR_WIPHY_FREQ]);
+		snprintf(phyname, sizeof(phyname), "phy%d", phy);
+		nl80211_update_current_channel(tb, phyname, freq);
+	}
+
 	switch (gnlh->cmd) {
 	case NL80211_CMD_NEW_STATION:
 		nl80211_add_station(tb, ifname);
@@ -483,7 +503,6 @@ static int nl80211_recv(struct nl_msg *msg, void *arg)
 		syslog(0, "%s:%s[%d]%d\n", __FILE__, __func__, __LINE__, gnlh->cmd);
 		break;
 	}
-
 	return NL_OK;
 }
 
@@ -523,6 +542,16 @@ static void vif_poll_stations(void *arg)
 		vif_sync_stations(wif->name);
 	}
 	evsched_task_reschedule_ms(EVSCHED_SEC(STA_POLL_INTERVAL));
+}
+
+void update_wiphy()
+{
+	struct nl_msg *msg;
+
+	msg = unl_genl_msg(&unl, NL80211_CMD_GET_INTERFACE, true);
+	unl_genl_request(&unl, msg, nl80211_recv, NULL);
+	msg = unl_genl_msg(&unl, NL80211_CMD_GET_WIPHY, true);
+	unl_genl_request(&unl, msg, nl80211_recv, NULL);
 }
 
 int radio_nl80211_init(void)
