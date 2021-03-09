@@ -304,8 +304,7 @@ bool target_stats_scan_start(radio_entry_t *radio_cfg, uint32_t *chan_list, uint
 	LOGT("%s: scan trigger returned %d", radio_cfg->if_name, ret);
 
 	if (ret == false) {
-		LOG(ERR, "%s: failed to trigger scan, aborting", radio_cfg->if_name);
-		(*scan_cb)(scan_ctx, ret);
+		LOG(DEBUG, "%s: failed to trigger scan, aborting", radio_cfg->if_name);
 	}
 	return ret;
 }
