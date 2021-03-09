@@ -548,21 +548,27 @@ int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_lis
 	struct nl_msg *msg = nl80211_call_vif(nl_call_param, NL80211_CMD_TRIGGER_SCAN, false);
 	struct nlattr *freq;
 	unsigned int i;
+	int ret = 0;
 
 	if (!msg)
 		return -1;
 
-	LOGN("%s: not setting dwell time\n", nl_call_param->ifname);
+	LOGT("%s: not setting dwell time\n", nl_call_param->ifname);
 	//nla_put_u16(msg, NL80211_ATTR_MEASUREMENT_DURATION, dwell_time);
 	freq = nla_nest_start(msg, NL80211_ATTR_SCAN_FREQUENCIES);
 	for (i = 0; i < chan_num; i ++)
 		nla_put_u32(msg, i, ieee80211_channel_to_frequency(chan_list[i]));
 	nla_nest_end(msg, freq);
 
-	if (nl80211_scan_add(nl_call_param->ifname, scan_cb, scan_ctx))
+	ret = nl80211_scan_add(nl_call_param->ifname, scan_cb, scan_ctx); 
+	if (ret ) {
+		LOG(DEBUG,"%s: scan add failed %d\n", nl_call_param->ifname, ret);
 		return -1;
+	}
 
-	return unl_genl_request(&unl, msg, nl80211_scan_trigger_recv, NULL);
+	ret = unl_genl_request(&unl, msg, nl80211_scan_trigger_recv, NULL);
+	if (ret)	LOG(DEBUG, "%s: scan request failed %d\n", nl_call_param->ifname, ret);
+	return ret;
 }
 
 int nl80211_scan_abort(struct nl_call_param *nl_call_param)
