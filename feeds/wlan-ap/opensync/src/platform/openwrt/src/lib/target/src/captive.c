@@ -158,7 +158,7 @@ void vif_state_dhcp_allowlist_get(struct schema_Wifi_VIF_State *vstate)
 			if (blobmsg_type(cur) != BLOBMSG_TYPE_STRING)
 				continue;
 			sscanf(blobmsg_get_string(cur), "/%[^/]/%[^_]_%s", fqdn, set, read_ifname);
-			if(!strcmp(vstate->if_name, read_ifname))
+			if(!strcmp("opennds", read_ifname))
 			{
 				strcpy(vstate->captive_allowlist[vstate->captive_allowlist_len], fqdn);
 				vstate->captive_allowlist_len++;
@@ -171,10 +171,8 @@ void vif_state_dhcp_allowlist_get(struct schema_Wifi_VIF_State *vstate)
 
 void ipset_flush(char *ifname)
 {
-	char com[24]="ipset flush set_wlan1";
-
-	if (!strcmp(ifname,"wlan1"))
-		system(com);
+	char com[32]="ipset flush set_opennds";
+	system(com);
 }
 
 void vif_dhcp_opennds_allowlist_set(const struct schema_Wifi_VIF_Config *vconf, char *ifname)
@@ -189,7 +187,7 @@ void vif_dhcp_opennds_allowlist_set(const struct schema_Wifi_VIF_Config *vconf, 
 	for (i = 0; i < vconf->captive_allowlist_len; i++)
 	{
 		strcpy(buff,(char*)vconf->captive_allowlist[i]);
-		sprintf(ips,"/%s/set_%s", buff,ifname);
+		sprintf(ips,"/%s/set_%s", buff,"opennds");
 		blobmsg_add_string(&dnsmas, NULL,ips);
 	}
 	blobmsg_close_array(&dnsmas, e);
@@ -228,133 +226,132 @@ void set_captive_portal_state(struct schema_Wifi_VIF_State *vstate,
 	return;
 }
 
-void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate, struct uci_section *s)
+void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate)
 {
 	int i;
 	int index = 0;
 	const char *opt;
 	char *buf = NULL;
 	struct blob_attr *tc[__NDS_ATTR_MAX] = { };
-	struct uci_element *e = NULL;
+	struct uci_section *cp_section;
 
 	uci_load(cap_uci, "opennds", &opennds);
-	uci_foreach_element(&opennds->sections, e) {
-		struct uci_section *cp_section = uci_to_section(e);
-		if (!strcmp(s->e.name, cp_section->e.name)){
+	cp_section = uci_lookup_section(cap_uci, opennds,"opennds");
+	if(!cp_section) {
+		LOGN("Section Not Found");
+		return;
+	}
+	blob_buf_init(&cap, 0);
+	uci_to_blob(&cap, cp_section, &opennds_param);
+	blobmsg_parse(opennds_policy, __NDS_ATTR_MAX, tc, blob_data(cap.head), blob_len(cap.head));
+	for (i = 0; i < SCHEMA_CAPTIVE_PORTAL_OPTS_MAX; i++) {
+		opt = captive_portal_options_table[i];
+		if  (!strcmp(opt, "session_timeout"))
+		{
+			if (tc[NDS_ATTR_SESSIONTIMEOUT])
+			{
+				buf = blobmsg_get_string(tc[NDS_ATTR_SESSIONTIMEOUT]);
+				set_captive_portal_state(vstate, &index,
+						captive_portal_options_table[i],
+						buf);
+			}
+		} else if (!strcmp(opt, "authentication")) {
+			if(tc[NDS_ATTR_AUTHENTICATION]) {
+				buf = blobmsg_get_string(tc[NDS_ATTR_AUTHENTICATION]);
+				if (!strcmp(buf, "None")) {
 
-			blob_buf_init(&cap, 0);
-			uci_to_blob(&cap, cp_section, &opennds_param);
-			blobmsg_parse(opennds_policy, __NDS_ATTR_MAX, tc, blob_data(cap.head), blob_len(cap.head));
-			for (i = 0; i < SCHEMA_CAPTIVE_PORTAL_OPTS_MAX; i++) {
-				opt = captive_portal_options_table[i];
-				if  (!strcmp(opt, "session_timeout"))
-				{
-					if (tc[NDS_ATTR_SESSIONTIMEOUT])
-					{
-						buf = blobmsg_get_string(tc[NDS_ATTR_SESSIONTIMEOUT]);
-						set_captive_portal_state(vstate, &index,
-								captive_portal_options_table[i],
-								buf);
-					}
-				} else if (!strcmp(opt, "authentication")) {
-					if(tc[NDS_ATTR_AUTHENTICATION]) {
-						buf = blobmsg_get_string(tc[NDS_ATTR_AUTHENTICATION]);
-						if (!strcmp(buf, "None")) {
-
-							set_captive_portal_state(vstate, &index,
-									captive_portal_options_table[i],
-									buf);
-						} else if (!strcmp(buf,"username")) {
-							set_captive_portal_state(vstate, &index,
-									captive_portal_options_table[i],
-									buf);
-						}
-					}
-				} else if (strcmp(opt, "browser_title") == 0) {
-					if (tc[NDS_ATTR_GATEWAYNAME]) {
-						buf = blobmsg_get_string(tc[NDS_ATTR_GATEWAYNAME]);
-						set_captive_portal_state(vstate, &index,
-								captive_portal_options_table[i],
-								buf);
-					}
-				} else if (strcmp(opt, "splash_page_logo") == 0) {
-					if (tc[NDS_ATTR_SPLASH_PAGE_LOGO]) {
-						buf = blobmsg_get_string(tc[NDS_ATTR_SPLASH_PAGE_LOGO]);
-						set_captive_portal_state(vstate, &index,
-								captive_portal_options_table[i],
-								buf);
-					}
-				} else if (strcmp(opt, "splash_page_background_logo") == 0) {
-					if (tc[NDS_ATTR_PAGE_BACKGROUND_LOGO]) {
-						buf = blobmsg_get_string(tc[NDS_ATTR_PAGE_BACKGROUND_LOGO]);
-						set_captive_portal_state(vstate, &index,
-								captive_portal_options_table[i],
-								buf);
-					}
-				} else if (strcmp(opt, "splash_page_title") == 0) {
-					if (tc[NDS_ATTR_SPLASH_PAGE_TITLE]) {
-						buf = blobmsg_get_string(tc[NDS_ATTR_SPLASH_PAGE_TITLE]);
-						set_captive_portal_state(vstate, &index,
-								captive_portal_options_table[i],
-								buf);
-					}
-				} else if (strcmp(opt, "redirect_url") == 0) {
-					if (tc[NDS_ATTR_REDIRECT_URL]) {
-						buf = blobmsg_get_string(tc[NDS_ATTR_REDIRECT_URL]);
-						set_captive_portal_state(vstate, &index,
-								captive_portal_options_table[i],
-								buf);
-					}
-				} else if (strcmp(opt, "acceptance_policy") == 0) {
-					if (tc[NDS_ATTR_ACCEPTANCE_POLICY]) {
-						buf = blobmsg_get_string(tc[NDS_ATTR_ACCEPTANCE_POLICY]);
-						set_captive_portal_state(vstate, &index,
-								captive_portal_options_table[i],
-								buf);
-					}
-				} else if (strcmp(opt, "login_success_text") == 0) {
-					if (tc[NDS_ATTR_LOGIN_SUCCESS_TEXT]) {
-						buf = blobmsg_get_string(tc[NDS_ATTR_LOGIN_SUCCESS_TEXT]);
-						set_captive_portal_state(vstate, &index,
-								captive_portal_options_table[i],
-								buf);
-					}
-				} else if (strcmp(opt, "username_password_file") == 0) {
-					if (tc[NDS_ATTR_USERNAMEPASS_FILE]) {
-						buf = blobmsg_get_string(tc[NDS_ATTR_USERNAMEPASS_FILE]);
-						set_captive_portal_state(vstate, &index,
-								captive_portal_options_table[i],
-								buf);
-					}
-				} else if (strcmp(opt, "radius_server_ip") == 0) {
-					if (tc[NDS_ATTR_RADIUS_IP]) {
-						buf = blobmsg_get_string(tc[NDS_ATTR_RADIUS_IP]);
-						set_captive_portal_state(vstate, &index,
-								captive_portal_options_table[i],
-								buf);
-					}
-				} else if (strcmp(opt, "radius_server_port") == 0) {
-					if (tc[NDS_ATTR_RADIUS_PORT]) {
-						buf = blobmsg_get_string(tc[NDS_ATTR_RADIUS_PORT]);
-						set_captive_portal_state(vstate, &index,
-								captive_portal_options_table[i],
-								buf);
-					}
-				} else if (strcmp(opt, "radius_server_secret") == 0) {
-					if (tc[NDS_ATTR_RADIUS_SECRET]) {
-						buf = blobmsg_get_string(tc[NDS_ATTR_RADIUS_SECRET]);
-						set_captive_portal_state(vstate, &index,
-								captive_portal_options_table[i],
-								buf);
-					}
-				} else if (strcmp(opt, "radius_auth_type") == 0) {
-					if (tc[NDS_ATTR_RADIUS_AUTH_TYPE]) {
-						buf = blobmsg_get_string(tc[NDS_ATTR_RADIUS_AUTH_TYPE]);
-						set_captive_portal_state(vstate, &index,
-								captive_portal_options_table[i],
-								buf);
-					}
+					set_captive_portal_state(vstate, &index,
+							captive_portal_options_table[i],
+							buf);
+				} else if (!strcmp(buf,"username")) {
+					set_captive_portal_state(vstate, &index,
+							captive_portal_options_table[i],
+							buf);
 				}
+			}
+		} else if (strcmp(opt, "browser_title") == 0) {
+			if (tc[NDS_ATTR_GATEWAYNAME]) {
+				buf = blobmsg_get_string(tc[NDS_ATTR_GATEWAYNAME]);
+				set_captive_portal_state(vstate, &index,
+						captive_portal_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "splash_page_logo") == 0) {
+			if (tc[NDS_ATTR_SPLASH_PAGE_LOGO]) {
+				buf = blobmsg_get_string(tc[NDS_ATTR_SPLASH_PAGE_LOGO]);
+				set_captive_portal_state(vstate, &index,
+						captive_portal_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "splash_page_background_logo") == 0) {
+			if (tc[NDS_ATTR_PAGE_BACKGROUND_LOGO]) {
+				buf = blobmsg_get_string(tc[NDS_ATTR_PAGE_BACKGROUND_LOGO]);
+				set_captive_portal_state(vstate, &index,
+						captive_portal_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "splash_page_title") == 0) {
+			if (tc[NDS_ATTR_SPLASH_PAGE_TITLE]) {
+				buf = blobmsg_get_string(tc[NDS_ATTR_SPLASH_PAGE_TITLE]);
+				set_captive_portal_state(vstate, &index,
+						captive_portal_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "redirect_url") == 0) {
+			if (tc[NDS_ATTR_REDIRECT_URL]) {
+				buf = blobmsg_get_string(tc[NDS_ATTR_REDIRECT_URL]);
+				set_captive_portal_state(vstate, &index,
+						captive_portal_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "acceptance_policy") == 0) {
+			if (tc[NDS_ATTR_ACCEPTANCE_POLICY]) {
+				buf = blobmsg_get_string(tc[NDS_ATTR_ACCEPTANCE_POLICY]);
+				set_captive_portal_state(vstate, &index,
+						captive_portal_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "login_success_text") == 0) {
+			if (tc[NDS_ATTR_LOGIN_SUCCESS_TEXT]) {
+				buf = blobmsg_get_string(tc[NDS_ATTR_LOGIN_SUCCESS_TEXT]);
+				set_captive_portal_state(vstate, &index,
+						captive_portal_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "username_password_file") == 0) {
+			if (tc[NDS_ATTR_USERNAMEPASS_FILE]) {
+				buf = blobmsg_get_string(tc[NDS_ATTR_USERNAMEPASS_FILE]);
+				set_captive_portal_state(vstate, &index,
+						captive_portal_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "radius_server_ip") == 0) {
+			if (tc[NDS_ATTR_RADIUS_IP]) {
+				buf = blobmsg_get_string(tc[NDS_ATTR_RADIUS_IP]);
+				set_captive_portal_state(vstate, &index,
+						captive_portal_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "radius_server_port") == 0) {
+			if (tc[NDS_ATTR_RADIUS_PORT]) {
+				buf = blobmsg_get_string(tc[NDS_ATTR_RADIUS_PORT]);
+				set_captive_portal_state(vstate, &index,
+						captive_portal_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "radius_server_secret") == 0) {
+			if (tc[NDS_ATTR_RADIUS_SECRET]) {
+				buf = blobmsg_get_string(tc[NDS_ATTR_RADIUS_SECRET]);
+				set_captive_portal_state(vstate, &index,
+						captive_portal_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "radius_auth_type") == 0) {
+			if (tc[NDS_ATTR_RADIUS_AUTH_TYPE]) {
+				buf = blobmsg_get_string(tc[NDS_ATTR_RADIUS_AUTH_TYPE]);
+				set_captive_portal_state(vstate, &index,
+						captive_portal_options_table[i],
+						buf);
 			}
 		}
 	}
@@ -424,10 +421,10 @@ void splash_page_logo(char* dest_file, char* src_url)
 	return ;
 }
 
-int ipset_create(char *ifname)
+int ipset_create(char *ifnds)
 {
 	char command[64];
-	sprintf(command,"ipset create set_%s hash:ip", ifname);
+	sprintf(command,"ipset create set_%s hash:ip", ifnds);
 	return (system(command));
 }
 
@@ -435,38 +432,38 @@ void captive_portal_get_current_urls(char *ifname, char *splash_logo, char *back
 {
 	char *buf = NULL;
 	struct blob_attr *tc[__NDS_ATTR_MAX] = { };
-	struct uci_element *e = NULL;
 	struct blob_buf url_buf={ };
+	struct uci_section *cp_section;
 
 	uci_load(cap_uci, "opennds", &opennds);
-	uci_foreach_element(&opennds->sections, e) {
-		struct uci_section *cp_section = uci_to_section(e);
-		if (!strcmp(ifname, cp_section->e.name)){
+	cp_section = uci_lookup_section(cap_uci, opennds,"opennds");
+	if(!cp_section) {
+		LOGN("Section Not Found");
+		return;
+	}
 
-			blob_buf_init(&url_buf, 0);
-			uci_to_blob(&url_buf, cp_section, &opennds_param);
-			blobmsg_parse(opennds_policy, __NDS_ATTR_MAX, tc, blob_data(url_buf.head), blob_len(url_buf.head));
+	blob_buf_init(&url_buf, 0);
+	uci_to_blob(&url_buf, cp_section, &opennds_param);
+	blobmsg_parse(opennds_policy, __NDS_ATTR_MAX, tc, blob_data(url_buf.head), blob_len(url_buf.head));
 
-			if (tc[NDS_ATTR_SPLASH_PAGE_LOGO]) {
-				buf = blobmsg_get_string(tc[NDS_ATTR_SPLASH_PAGE_LOGO]);
-				strcpy(splash_logo, buf);
-			} else {
-				splash_logo[0]=0;
-			}
+	if (tc[NDS_ATTR_SPLASH_PAGE_LOGO]) {
+		buf = blobmsg_get_string(tc[NDS_ATTR_SPLASH_PAGE_LOGO]);
+		strcpy(splash_logo, buf);
+	} else {
+		splash_logo[0]=0;
+	}
 
-			if (tc[NDS_ATTR_PAGE_BACKGROUND_LOGO]) {
-				buf = blobmsg_get_string(tc[NDS_ATTR_PAGE_BACKGROUND_LOGO]);
-				strcpy(back_image, buf);
-			} else {
-				back_image[0]=0;
-			}
-			if (tc[NDS_ATTR_USERNAMEPASS_FILE]) {
-				buf = blobmsg_get_string(tc[NDS_ATTR_USERNAMEPASS_FILE]);
-				strcpy(user_file, buf);
-			} else {
-				user_file[0]=0;
-			}
-		}
+	if (tc[NDS_ATTR_PAGE_BACKGROUND_LOGO]) {
+		buf = blobmsg_get_string(tc[NDS_ATTR_PAGE_BACKGROUND_LOGO]);
+		strcpy(back_image, buf);
+	} else {
+		back_image[0]=0;
+	}
+	if (tc[NDS_ATTR_USERNAMEPASS_FILE]) {
+		buf = blobmsg_get_string(tc[NDS_ATTR_USERNAMEPASS_FILE]);
+		strcpy(user_file, buf);
+	} else {
+		user_file[0]=0;
 	}
 	uci_unload(cap_uci, opennds);
 	return;
@@ -501,7 +498,7 @@ void opennds_parameters(char *ifname)
 		blobmsg_add_string(&cap_blob, NULL, users_router[i]);
 	}
 	blobmsg_close_array(&cap_blob, d);
-	blob_to_uci_section(cap_uci, "opennds", ifname, "opennds", cap_blob.head, &opennds_param, NULL);
+	blob_to_uci_section(cap_uci, "opennds", "opennds", "opennds", cap_blob.head, &opennds_param, NULL);
 	uci_commit_all(cap_uci);
 	return;
 }
@@ -546,10 +543,10 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 	char back_image[84];
 	char user_file[84];
 
-	sprintf(path,"/etc/opennds/htdocs/images/%s/",ifname);
+	sprintf(path,"/etc/opennds/htdocs/images/");
 	sprintf(webroot,"/etc/opennds/htdocs");
-	sprintf(ipset_tcp80,"allow tcp port 80 ipset set_%s", ifname);
-	sprintf(ipset_tcp443,"allow tcp port 443 ipset set_%s", ifname);
+	sprintf(ipset_tcp80,"allow tcp port 80 ipset set_opennds");
+	sprintf(ipset_tcp443,"allow tcp port 443 ipset set_opennds");
 	char file_path[128];
 	struct stat st = {0};
 	if (stat(path, &st) == -1)
@@ -574,7 +571,7 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 				blobmsg_add_string(&cap, "gatewayinterface","br-lan");
 				blobmsg_add_string(&cap, "authentication", value);
 				blobmsg_add_string(&cap, "preauth","/usr/lib/opennds/login.sh");
-				ipset_create(ifname);
+				ipset_create("opennds");
 				d = blobmsg_open_array(&cap, "preauthenticated_users");
 				blobmsg_add_string(&cap, NULL, ipset_tcp80);
 				blobmsg_add_string(&cap, NULL, ipset_tcp443);
@@ -583,7 +580,7 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 			} else if (strcmp(value,"username")==0) {
 				blobmsg_add_string(&cap, "webroot",webroot);
 				opennds_parameters(ifname);
-				ipset_create(ifname);
+				ipset_create("opennds");
 				blobmsg_add_string(&cap, "enabled", "1");
 				blobmsg_add_string(&cap, "gatewayinterface","br-lan");
 				blobmsg_add_string(&cap, "authentication", value);
@@ -595,7 +592,7 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 
 			} else if (strcmp(value,"radius")==0)  {
 				blobmsg_add_string(&cap, "webroot",webroot);
-				opennds_parameters(ifname);
+				opennds_parameters("opennds");
 				blobmsg_add_string(&cap, "authentication", value);
 				blobmsg_add_string(&cap, "enabled", "1");
 				blobmsg_add_string(&cap, "gatewayinterface","br-lan");
@@ -607,7 +604,7 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 				blobmsg_close_array(&cap, d);
 			}
 			else {
-				opennds_section_del(ifname);
+				opennds_section_del("opennds");
 				return;
 			}
 		}
@@ -665,7 +662,7 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 			}
 		}
 	}
-	blob_to_uci_section(cap_uci, "opennds", ifname, "opennds", cap.head, &opennds_param, NULL);
+	blob_to_uci_section(cap_uci, "opennds", "opennds", "opennds", cap.head, &opennds_param, NULL);
 	uci_commit_all(cap_uci);
 	return;
 }
