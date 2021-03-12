@@ -242,7 +242,7 @@ header="<!DOCTYPE html>
 	<meta http-equiv=\"Expires\" content=\"0\">
 	<meta charset=\"utf-8\">
 	<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
-	<link rel=\"shortcut icon\" href=\"/images/$client_zone/TipLogo.png\" type=\"image/x-icon\">
+	<link rel=\"shortcut icon\" href=\"/images/TipLogo.png\" type=\"image/x-icon\">
 	<link rel=\"stylesheet\" type=\"text/css\" href=\"/splash.css\">
 	<title>$gatewaynamehtml</title>
 	</head>
@@ -257,7 +257,7 @@ header="<!DOCTYPE html>
 version="$(ndsctl status | grep Version)"
 year="$(date | awk -F ' ' '{print $(6)}')"
 footer="
-	<img style=\"height:60px; width:100px; float:left;\" src=\"/images/$client_zone/TipLogo.png\" alt=\"Splash Page: For access to the Internet.\">
+	<img style=\"height:60px; width:100px; float:left;\" src=\"/images/TipLogo.png\" alt=\"Splash Page: For access to the Internet.\">
 
 	<copy-right>
 		<br><br>

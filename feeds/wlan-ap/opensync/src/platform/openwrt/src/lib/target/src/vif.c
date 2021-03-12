@@ -669,6 +669,7 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	char mac[ETH_ALEN * 3];
 	char *ifname, radio[IF_NAMESIZE];
 	bool vifIsActive = false;
+	char network_name[8];
 
 	LOGT("%s: get state", s->e.name);
 
@@ -736,8 +737,10 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 //	else
 //		SCHEMA_SET_INT(vstate.uapsd_enable, false);
 
-	if (tb[WIF_ATTR_NETWORK])
+	if (tb[WIF_ATTR_NETWORK]) {
 		SCHEMA_SET_STR(vstate.bridge, blobmsg_get_string(tb[WIF_ATTR_NETWORK]));
+		strcpy(network_name, blobmsg_get_string(tb[WIF_ATTR_NETWORK]));
+	}
 	else
 		LOGW("%s: unknown bridge/network", s->e.name);
 
@@ -803,9 +806,10 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	}
 	vif_state_security_get(&vstate, tb);
 	vif_state_custom_options_get(&vstate, tb);
-	vif_state_captive_portal_options_get(&vstate, s);
-	vif_state_dhcp_allowlist_get(&vstate);
-
+	if(!strcmp(network_name,"lan")) {
+		vif_state_captive_portal_options_get(&vstate);
+		vif_state_dhcp_allowlist_get(&vstate);
+	}
 	if (vconf) {
 		LOGN("%s: updating vif config", radio);
 		vif_state_to_conf(&vstate, vconf);
