@@ -555,6 +555,7 @@ int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_lis
 
 	LOGT("%s: not setting dwell time\n", nl_call_param->ifname);
 	//nla_put_u16(msg, NL80211_ATTR_MEASUREMENT_DURATION, dwell_time);
+	nla_put_flag(msg, NL80211_SCAN_FLAG_AP);
 	freq = nla_nest_start(msg, NL80211_ATTR_SCAN_FREQUENCIES);
 	for (i = 0; i < chan_num; i ++)
 		nla_put_u32(msg, i, ieee80211_channel_to_frequency(chan_list[i]));
