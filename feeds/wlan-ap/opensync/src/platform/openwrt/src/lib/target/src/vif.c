@@ -98,7 +98,15 @@ enum {
 	WIF_ATTR_MCC_MNC,
 	WIF_ATTR_NAI_REALM,
 	WIF_ATTR_GAS_ADDR3,
+	WIF_ATTR_QOS_MAP_SET,
 	WIF_ATTR_OSEN,
+	WIF_ATTR_ACCESS_NETWORK_TYPE,
+	WIF_ATTR_INTERNET,
+	WIF_ATTR_ESR,
+	WIF_ATTR_ASRA,
+	WIF_ATTR_UESA,
+	WIF_ATTR_DISABLE_DGAF,
+	WIF_ATTR_WAN_METRICS,
 	WIF_ATTR_ANQP_DOMAIN_ID,
 	WIF_ATTR_DEAUTH_REQUEST_TIMEOUT,
 	WIF_ATTR_OPER_FRIENDLY_NAME,
@@ -180,7 +188,15 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_MCC_MNC] = { .name = "anqp_3gpp_cell_net", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_NAI_REALM] = { .name = "nai_realm", BLOBMSG_TYPE_ARRAY },
 	[WIF_ATTR_GAS_ADDR3] = { .name = "gas_address3", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_QOS_MAP_SET] = { .name = "qos_map_set", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_OSEN] = { .name = "osen", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_ACCESS_NETWORK_TYPE] = { .name = "access_network_type", BLOBMSG_TYPE_INT32 },
+	[WIF_ATTR_INTERNET] = { .name = "internet", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_ESR] = { .name = "esr", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_ASRA] = { .name = "asra", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_UESA] = { .name = "uesa", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_DISABLE_DGAF] = { .name = "disable_dgaf", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_WAN_METRICS] = { .name = "hs20_wan_metrics", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_ANQP_DOMAIN_ID] = { .name = "anqp_domain_id", BLOBMSG_TYPE_INT32 },
 	[WIF_ATTR_DEAUTH_REQUEST_TIMEOUT] = { .name = "hs20_deauth_req_timeout", BLOBMSG_TYPE_INT32 },
 	[WIF_ATTR_OPER_FRIENDLY_NAME] = { .name = "hs20_oper_friendly_name", BLOBMSG_TYPE_ARRAY },
@@ -974,6 +990,9 @@ static void hs20_vif_config(struct blob_buf *b,
 
 	if (strlen(hs2conf->qos_map_set))
 		blobmsg_add_string(b, "qos_map_set", hs2conf->qos_map_set);
+
+	if (hs2conf->access_network_type > 0)
+		blobmsg_add_u32(b, "access_network_type", hs2conf->access_network_type);
 
 	if (hs2conf->osen)
 		blobmsg_add_bool(b, "osen", 1);
