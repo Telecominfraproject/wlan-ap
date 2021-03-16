@@ -863,14 +863,23 @@ hostapd_set_bss_options() {
 	set_default hs20 0
 	set_default disable_dgaf $hs20
 	set_default osen 0
+	set_default internet 0
+	set_default asra 0
+	set_default esr 0
+	set_default uesa 0
 	set_default anqp_domain_id 0
+	set_default access_network_type 0
+	set_default venue_group 0
+	set_default venue_type 0
+	set_default ipaddr_type_availability 0
+	set_default gas_address3 0
 	set_default hs20_deauth_req_timeout 60
 	if [ "$hs20" = "1" ]; then
 		append bss_conf "hs20=1" "$N"
 		append_hs20_icons
 		[ -n "$disable_dgaf"] && append bss_conf "disable_dgaf=$disable_dgaf" "$N"
 		[ -n "$osen"] && append bss_conf "osen=$osen" "$N"
-		[ -n "$anqp_domain_id"] && append bss_conf "anqp_domain_id=$anqp_domain_id" "$N"
+		[ "$anqp_domain_id" -gt 0 ] && append bss_conf "anqp_domain_id=$anqp_domain_id" "$N"
 		[ -n "$hs20_deauth_req_timeout"] && append bss_conf "hs20_deauth_req_timeout=$hs20_deauth_req_timeout" "$N"
 		[ -n "$osu_ssid" ] && append bss_conf "osu_ssid=$osu_ssid" "$N"
 		[ -n "$hs20_wan_metrics" ] && append bss_conf "hs20_wan_metrics=$hs20_wan_metrics" "$N"
@@ -887,15 +896,15 @@ hostapd_set_bss_options() {
 		json_for_each_item append_osu_provider osu_provider
 		json_for_each_item append_operator_icon operator_icon
 		[ -n "$interworking" ] && append bss_conf "interworking=$interworking" "$N"
-		[ -n "$internet" ] && append bss_conf "internet=$internet" "$N"
-		[ -n "$access_network_type" ] && append bss_conf "access_network_type=$access_network_type" "$N"
-		[ -n "$asra" ] && append bss_conf "asra=$asra" "$N"
-		[ -n "$esr" ] && append bss_conf "esr=$esr" "$N"
-		[ -n "$uesa" ] && append bss_conf "uesa=$uesa" "$N"
-		[ -n "$venue_group" ] && append bss_conf "venue_group=$venue_group" "$N"
-		[ -n "$venue_type" ] && append bss_conf "venue_type=$venue_type" "$N"
-		[ -n "$ipaddr_type_availability" ] && append bss_conf "ipaddr_type_availability=$ipaddr_type_availability" "$N"
-		[ -n "$gas_address3" ] && append bss_conf "gas_address3=$gas_address3" "$N"
+		[ "$internet" -gt 0 ] && append bss_conf "internet=$internet" "$N"
+		[ "$access_network_type" -gt 0 ] && append bss_conf "access_network_type=$access_network_type" "$N"
+		[ "$asra" -gt 0 ] && append bss_conf "asra=$asra" "$N"
+		[ "$esr" -gt 0 ] && append bss_conf "esr=$esr" "$N"
+		[ "$uesa" -gt 0 ] && append bss_conf "uesa=$uesa" "$N"
+		[ "$venue_group" -gt 0 ] && append bss_conf "venue_group=$venue_group" "$N"
+		[ "$venue_type" -gt 0 ] && append bss_conf "venue_type=$venue_type" "$N"
+		[ "$ipaddr_type_availability" -gt 0 ] && append bss_conf "ipaddr_type_availability=$ipaddr_type_availability" "$N"
+		[ "$gas_address3" -gt 0 ] && append bss_conf "gas_address3=$gas_address3" "$N"
 		[ -n "$hessid" ] && append bss_conf "hessid=$hessid" "$N"
 		[ -n "$network_auth_type" ] && append bss_conf "network_auth_type=$network_auth_type" "$N"
 		[ -n "$anqp_3gpp_cell_net" ] && append bss_conf "anqp_3gpp_cell_net=$anqp_3gpp_cell_net" "$N"
