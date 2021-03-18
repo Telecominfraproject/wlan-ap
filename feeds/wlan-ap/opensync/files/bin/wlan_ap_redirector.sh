@@ -8,4 +8,5 @@ fi
 redirector_addr=$1
 
 uci set system.tip.redirector="${redirector_addr}"
+uci commit system
 /etc/init.d/opensync restart
