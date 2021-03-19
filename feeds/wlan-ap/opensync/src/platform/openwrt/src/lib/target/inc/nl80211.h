@@ -57,8 +57,6 @@ struct wifi_station {
 };
 
 extern int radio_nl80211_init(void);
-extern void update_wiphy();
-
 extern struct wifi_phy *phy_find(const char *name);
 extern struct wifi_iface *vif_find(const char *name);
 extern struct wifi_station *sta_find(const unsigned char *addr);

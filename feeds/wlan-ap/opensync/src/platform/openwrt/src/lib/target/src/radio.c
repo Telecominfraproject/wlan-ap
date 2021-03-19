@@ -190,8 +190,6 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 
 	LOGT("%s: get state", s->e.name);
 
-	update_wiphy();
-
 	memset(&rstate, 0, sizeof(rstate));
 	schema_Wifi_Radio_State_mark_all_present(&rstate);
 	rstate._partial_update = true;
