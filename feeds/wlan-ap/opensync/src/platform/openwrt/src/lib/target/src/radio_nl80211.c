@@ -544,16 +544,6 @@ static void vif_poll_stations(void *arg)
 	evsched_task_reschedule_ms(EVSCHED_SEC(STA_POLL_INTERVAL));
 }
 
-void update_wiphy()
-{
-	struct nl_msg *msg;
-
-	msg = unl_genl_msg(&unl, NL80211_CMD_GET_INTERFACE, true);
-	unl_genl_request(&unl, msg, nl80211_recv, NULL);
-	msg = unl_genl_msg(&unl, NL80211_CMD_GET_WIPHY, true);
-	unl_genl_request(&unl, msg, nl80211_recv, NULL);
-}
-
 int radio_nl80211_init(void)
 {
 	struct nl_msg *msg;
