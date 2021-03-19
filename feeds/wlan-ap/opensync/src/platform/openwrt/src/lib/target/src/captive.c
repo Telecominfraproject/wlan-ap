@@ -143,7 +143,7 @@ void vif_state_dhcp_allowlist_get(struct schema_Wifi_VIF_State *vstate)
 	uci_load(dns, "dhcp", &dhcp);
 	ip_section = uci_lookup_section(dns, dhcp,"dnsmasq");
 	if(!ip_section) {
-		LOGN("Section Not Found");
+		uci_unload(dns, dhcp);
 		return;
 	}
 	blob_buf_init(&dnsmas, 0);
@@ -238,7 +238,7 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate)
 	uci_load(cap_uci, "opennds", &opennds);
 	cp_section = uci_lookup_section(cap_uci, opennds,"opennds");
 	if(!cp_section) {
-		LOGN("Section Not Found");
+		uci_unload(cap_uci, opennds);
 		return;
 	}
 	blob_buf_init(&cap, 0);
@@ -412,7 +412,6 @@ void splash_page_logo(char* dest_file, char* src_url)
 
 	res = curl_easy_perform(curl);
 	if (res != CURLE_OK){
-		LOGN("Image failed to Download: %s",errbuf);
 		clean_up(curl,imagefile,headerfile);
 		remove(dest_file);
 		return;
@@ -438,7 +437,7 @@ void captive_portal_get_current_urls(char *ifname, char *splash_logo, char *back
 	uci_load(cap_uci, "opennds", &opennds);
 	cp_section = uci_lookup_section(cap_uci, opennds,"opennds");
 	if(!cp_section) {
-		LOGN("Section Not Found");
+		uci_unload(cap_uci, opennds);
 		return;
 	}
 
