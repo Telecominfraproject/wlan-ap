@@ -24,8 +24,6 @@ struct netifd_iface *netifd_iface_get_by_name(char *_ifname)
 	if (piface != NULL)
 		return piface;
 
-	LOG(ERR, "netifd_iface_get_by_name: Couldn't find the interface(%s)", ifname);
-
 	return NULL;
 }
 
@@ -102,7 +100,7 @@ inet_base_t *netifd_iface_new_inet(const char *ifname, const char *iftype)
 		goto error;
 	}
 	memset(self, 0, sizeof(inet_base_t));
-	if((!strcmp(ifname, "wan") && !strcmp(iftype,"bridge")) || (!strcmp(ifname, "lan") && !strcmp(iftype,"bridge"))) {
+	if(!strcmp(iftype,"bridge")) {
 		snprintf(self->inet.in_ifname, sizeof(self->inet.in_ifname), "br-%s", ifname);
 	} else if (!strcmp(iftype,"vlan")) {
 		char name[15]= {};

@@ -368,16 +368,14 @@ static void callback_Wifi_Inet_Config(ovsdb_update_monitor_t *mon,
 			       struct schema_Wifi_Inet_Config *old_rec,
 			       struct schema_Wifi_Inet_Config *iconf)
 {
-	struct netifd_iface *piface = NULL;
-
 	switch (mon->mon_type) {
 	case OVSDB_UPDATE_NEW:
 		wifi_inet_conf_add(iconf);
-		piface = netifd_add_inet_conf(iconf);
+		netifd_add_inet_conf(iconf);
 		break;
 	case OVSDB_UPDATE_MODIFY:
 		wifi_inet_conf_add(iconf);
-		piface = netifd_modify_inet_conf(iconf);
+		netifd_modify_inet_conf(iconf);
 		break;
 	case OVSDB_UPDATE_DEL:
 		wifi_inet_conf_del(old_rec);
@@ -385,12 +383,6 @@ static void callback_Wifi_Inet_Config(ovsdb_update_monitor_t *mon,
 		break;
 	default:
 		LOG(ERR, "Invalid Wifi_Inet_Config mon_type(%d)", mon->mon_type);
-	}
-
-	if(!piface) {
-		LOG(ERR, "callback_Wifi_Inet_Config: Couldn't get the netifd interface(%s)",
-				iconf->if_name);
-		return;
 	}
 
 	return;
