@@ -6,30 +6,43 @@
 
 #include "inet_conf.h"
 
-struct netifd_iface* netifd_add_inet_conf(struct schema_Wifi_Inet_Config *iconf)
-{
+static int vlan_count = 0;
 
+void netifd_add_inet_conf(struct schema_Wifi_Inet_Config *iconf)
+{
 	struct netifd_iface *piface = NULL;
 
-	piface = netifd_iface_get_by_name(iconf->if_name);
-	if (piface == NULL)
-	{
-		piface = netifd_iface_new(iconf->if_name, iconf->if_type);
-		if (piface == NULL)
-		{
-			LOG(ERR, "netifd_add_inet_conf: %s: Unable to create interface.", iconf->if_name);
-			return NULL;
-		}
+	if (strcmp(iconf->if_type, "bridge") && strcmp(iconf->if_type, "vlan")) {
+		return;
+	}
 
-		if (!strcmp(iconf->if_type, "bridge") || !strcmp(iconf->if_type, "vlan"))
-		{
-			LOGN("Setting up dhsnif for %s", piface->if_base->inet.in_ifname);
+	piface = netifd_iface_get_by_name(iconf->if_name);
+
+	if (piface)
+		return;
+
+	if (!strcmp(iconf->if_name, "wan") || !strcmp(iconf->if_name, "lan")) {
+		piface = netifd_iface_new(iconf->if_name, iconf->if_type);
+		if (!piface) {
+			LOG(ERR, "netifd_add_inet_conf: %s: Unable to create interface.", iconf->if_name);
+			return;
+		}
+		netifd_inet_config_set(piface);
+		netifd_inet_config_apply(piface);
+	} else if (iconf->vlan_id_exists && iconf->vlan_id > 2) {
+		if (vlan_count < DHCP_SNIFF_MAX_VLAN && !strstr(iconf->if_name,"lan_")) {
+			piface = netifd_iface_new(iconf->if_name, iconf->if_type);
+			if (!piface) {
+				LOG(ERR, "netifd_add_inet_conf: %s: Unable to create interface.", iconf->if_name);
+				return;
+			}
 			netifd_inet_config_set(piface);
 			netifd_inet_config_apply(piface);
+			vlan_count++;
 		}
 	}
 
-	return piface;
+	return;
 }
 
 void netifd_del_inet_conf(struct schema_Wifi_Inet_Config *old_rec)
@@ -37,14 +50,14 @@ void netifd_del_inet_conf(struct schema_Wifi_Inet_Config *old_rec)
 	struct netifd_iface *piface = NULL;
 
 	piface = netifd_iface_get_by_name(old_rec->if_name);
-	if (piface == NULL)
-	{
-		LOG(ERR, "netifd_del_inet_conf: Unable to delete non-existent interface %s.",
-				old_rec->if_name);
-	}
 
-	if (piface != NULL && !netifd_iface_del(piface))
-			{
+	if (!piface)
+		return;
+
+	if (netifd_iface_del(piface)) {
+		if (old_rec->vlan_id_exists && old_rec->vlan_id > 2)
+			vlan_count--;
+	} else {
 		LOG(ERR, "netifd_del_inet_conf: Error during destruction of interface %s.",
 				old_rec->if_name);
 	}

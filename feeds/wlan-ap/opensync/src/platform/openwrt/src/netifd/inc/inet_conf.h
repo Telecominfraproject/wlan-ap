@@ -6,7 +6,9 @@
 #include "netifd.h"
 #include "inet_iface.h"
 
-struct netifd_iface *netifd_add_inet_conf(struct schema_Wifi_Inet_Config *iconf);
+#define DHCP_SNIFF_MAX_VLAN 4
+
+void netifd_add_inet_conf(struct schema_Wifi_Inet_Config *iconf);
 void netifd_del_inet_conf(struct schema_Wifi_Inet_Config *old_rec);
 struct netifd_iface *netifd_modify_inet_conf(struct schema_Wifi_Inet_Config *iconf);
 bool netifd_inet_config_set(struct netifd_iface *piface);
