@@ -615,7 +615,7 @@ static void ubus_collector_chan_switch_events_cb(struct ubus_request *req, int t
 	if (!msg)
 		return;
 
-	LOG(INFO, "ubus_collector: received ubus collector chan event message");
+	LOG(DEBUG, "ubus_collector: received ubus collector chan event message");
 
 	error = blobmsg_parse(ubus_collector_chan_switch_event_policy,
 			      __CHANNEL_SWITCH_EVENT_MAX, tb_chan_event_lst,
