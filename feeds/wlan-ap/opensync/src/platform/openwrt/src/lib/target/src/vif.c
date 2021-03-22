@@ -118,6 +118,7 @@ enum {
 	WIF_ATTR_BEACON_RATE,
 	WIF_ATTR_MCAST_RATE,
 	WIF_ATTR_RADIUS_NAS_ID_ATTR,
+	WIF_ATTR_RADIUS_NAS_IP_ATTR,
 	WIF_ATTR_RADIUS_AUTH_REQ_ATTR,
 	WIF_ATTR_RADIUS_ACCT_REQ_ATTR,
 	WIF_ATTR_MESH_ID,
@@ -208,6 +209,7 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_BEACON_RATE] = { .name = "bcn_rate", .type = BLOBMSG_TYPE_INT32 },
 	[WIF_ATTR_MCAST_RATE] = { .name = "mcast_rate", .type = BLOBMSG_TYPE_INT32 },
 	[WIF_ATTR_RADIUS_NAS_ID_ATTR] = { .name = "nasid", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_RADIUS_NAS_IP_ATTR] = { .name = "ownip", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_RADIUS_AUTH_REQ_ATTR] = { .name = "radius_auth_req_attr", BLOBMSG_TYPE_ARRAY },
 	[WIF_ATTR_RADIUS_ACCT_REQ_ATTR] = { .name = "radius_acct_req_attr", BLOBMSG_TYPE_ARRAY },
 	[WIF_ATTR_MESH_ID] = { .name = "mesh_id", BLOBMSG_TYPE_STRING },
@@ -454,7 +456,7 @@ out_none:
 
 /* Custom options table */
 #define SCHEMA_CUSTOM_OPT_SZ            20
-#define SCHEMA_CUSTOM_OPTS_MAX          11
+#define SCHEMA_CUSTOM_OPTS_MAX          12
 
 const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 {
@@ -468,6 +470,7 @@ const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT_SZ] =
 	SCHEMA_CONSTS_DTIM_PERIOD,
 	SCHEMA_CONSTS_RADIUS_OPER_NAME,
 	SCHEMA_CONSTS_RADIUS_NAS_ID,
+	SCHEMA_CONSTS_RADIUS_NAS_IP,
 	SCHEMA_CONSTS_DYNAMIC_VLAN,
 };
 
@@ -516,6 +519,8 @@ static void vif_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del,
 			blobmsg_add_string(b, "dtim_period", value);
 		else if (strcmp(opt, "radius_nas_id") == 0)
 			blobmsg_add_string(b, "nasid", value);
+		else if (strcmp(opt, "radius_nas_ip") == 0)
+			blobmsg_add_string(b, "ownip", value);
 		else if (strcmp(opt, "radius_oper_name") == 0 && strlen(value) > 0)
 		{
 			memset(operator_name, '\0', sizeof(operator_name));
@@ -641,6 +646,13 @@ static void vif_state_custom_options_get(struct schema_Wifi_VIF_State *vstate,
 		} else if (strcmp(opt, "radius_nas_id") == 0) {
 			if (tb[WIF_ATTR_RADIUS_NAS_ID_ATTR]) {
 				buf = blobmsg_get_string(tb[WIF_ATTR_RADIUS_NAS_ID_ATTR]);
+				set_custom_option_state(vstate, &index,
+						custom_options_table[i],
+						buf);
+			}
+		} else if (strcmp(opt, "radius_nas_ip") == 0) {
+			if (tb[WIF_ATTR_RADIUS_NAS_IP_ATTR]) {
+				buf = blobmsg_get_string(tb[WIF_ATTR_RADIUS_NAS_IP_ATTR]);
 				set_custom_option_state(vstate, &index,
 						custom_options_table[i],
 						buf);
