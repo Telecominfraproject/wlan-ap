@@ -283,7 +283,7 @@ int phy_get_channels_state(const char *name, struct schema_Wifi_Radio_State *rst
 	if (!phy)
 		return 0;
 
-	LOGN("phy name :%s", name);
+	LOGD("phy name :%s", name);
 
 	for (i = 0; (i < IEEE80211_CHAN_MAX); i++) {
 		if (phy->chandisabled[i]) {

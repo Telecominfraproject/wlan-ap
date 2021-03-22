@@ -131,7 +131,7 @@ void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 		if (nf < rrm_config->rrm_data.noise_lwm )
 		{
 			rrm_config->rrm_data.noise_lwm = nf;
-			LOGN("[%s] noise_lwm set to %d", radio->config.if_name, nf);
+			LOGD("[%s] noise_lwm set to %d", radio->config.if_name, nf);
 			continue;
 		}
 
@@ -144,7 +144,7 @@ void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 		nf_drop_threshold = ((int32_t)(100 - rrm_config->rrm_data.snr_percentage_drop) *
 				rrm_config->rrm_data.noise_lwm) / 100;
 
-		LOGN("[%s] backup=%d nf=%d nf_lwm=%d drop=%d thresh=%d",
+		LOGD("[%s] backup=%d nf=%d nf_lwm=%d drop=%d thresh=%d",
 				radio->config.if_name,
 				rrm_config->rrm_data.backup_channel,
 				nf,
@@ -154,7 +154,7 @@ void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 
 		if (nf > nf_drop_threshold)
 		{
-			LOGN("[%s] backup=%d nf=%d nf_lwm=%d drop=%d thresh=%d",
+			LOGD("[%s] backup=%d nf=%d nf_lwm=%d drop=%d thresh=%d",
 					radio->config.if_name,
 					rrm_config->rrm_data.backup_channel,
 					nf,

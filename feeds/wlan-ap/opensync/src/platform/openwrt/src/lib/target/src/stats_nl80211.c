@@ -356,7 +356,7 @@ struct nl80211_scan *nl80211_scan_find(const char *name)
 	struct nl80211_scan *nl80211_scan = avl_find_element(&nl80211_scan_tree, name, nl80211_scan, avl);
 
 	if (!nl80211_scan)
-		LOGN("%s: scan context does not exist", name);
+		LOGD("%s: scan context does not exist", name);
 
 	return nl80211_scan;
 }
@@ -373,7 +373,7 @@ static int nl80211_scan_add(char *name, target_scan_cb_t *scan_cb, void *scan_ct
 		strncpy(nl80211_scan->name, name, IF_NAMESIZE);
 		nl80211_scan->avl.key = nl80211_scan->name;
 		avl_insert(&nl80211_scan_tree, &nl80211_scan->avl);
-		LOGN("%s: added scan context", name);
+		LOGD("%s: added scan context", name);
 	}
 
 	nl80211_scan->scan_cb = scan_cb;
@@ -383,7 +383,7 @@ static int nl80211_scan_add(char *name, target_scan_cb_t *scan_cb, void *scan_ct
 
 static void nl80211_scan_del(struct nl80211_scan *nl80211_scan)
 {
-	LOGN("%s: delete scan context", nl80211_scan->name);
+	LOGD("%s: delete scan context", nl80211_scan->name);
 	ev_async_stop(EV_DEFAULT, &nl80211_scan->async);
 	avl_delete(&nl80211_scan_tree, &nl80211_scan->avl);
 	free(nl80211_scan);
@@ -394,7 +394,7 @@ static void nl80211_scan_finish(char *name, bool state)
 	struct nl80211_scan *nl80211_scan = nl80211_scan_find(name);
 
 	if (nl80211_scan) {
-		LOGN("%s: calling context cb", nl80211_scan->name);
+		LOGD("%s: calling context cb", nl80211_scan->name);
 		(*nl80211_scan->scan_cb)(nl80211_scan->scan_ctx, state);
 		nl80211_scan_del(nl80211_scan);
 	}
@@ -421,14 +421,14 @@ static int nl80211_recv(struct nl_msg *msg, void *arg)
 
 	switch (gnlh->cmd) {
 	case NL80211_CMD_TRIGGER_SCAN:
-		LOGN("%s: scan started\n", ifname);
+		LOGD("%s: scan started\n", ifname);
 		break;
 	case NL80211_CMD_SCAN_ABORTED:
-		LOGN("%s: scan aborted\n", ifname);
+		LOGD("%s: scan aborted\n", ifname);
 		nl80211_scan_finish(ifname, false);
 		break;
 	case NL80211_CMD_NEW_SCAN_RESULTS:
-		LOGN("%s: scan completed\n", ifname);
+		LOGD("%s: scan completed\n", ifname);
 		nl80211_scan_finish(ifname, true);
 		break;
 	default:

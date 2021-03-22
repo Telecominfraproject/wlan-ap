@@ -383,7 +383,7 @@ bool target_stats_device_txchainmask_get(radio_entry_t *radio_cfg, dpp_device_tx
 	txchainmask_entry->type  = radio_cfg->type;
 	if (nl80211_get_tx_chainmask(target_map_ifname(radio_cfg->phy_name), &txchainmask_entry->value) < 0)
 		ret = false;
-	LOGT("%s: tx_chainmask %d", radio_cfg->phy_name, txchainmask_entry->value);
+	LOGD("%s: tx_chainmask %d", radio_cfg->phy_name, txchainmask_entry->value);
 
 	return ret;
 }

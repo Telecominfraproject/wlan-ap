@@ -157,7 +157,7 @@ static void sm_events_report(EV_P_ ev_timer *w, int revents)
 		report_ctx->channel_switch_list = g_event_report.channel_switch_list;
 
 	if (!ds_dlist_is_empty(&report_ctx->client_event_list) || !ds_dlist_is_empty(&report_ctx->channel_switch_list)) {
-		LOG(INFO, "Sending events report...");
+		LOG(DEBUG, "Sending events report...");
 		dpp_put_events(report_ctx);
 	}
 

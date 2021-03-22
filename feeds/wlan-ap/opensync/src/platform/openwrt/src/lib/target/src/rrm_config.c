@@ -37,7 +37,7 @@ void rrm_config_vif(struct blob_buf *b, struct blob_buf *del, const char * freq_
 	if (false == ovsdb_table_select_one(&table_Wifi_RRM_Config,
 			SCHEMA_COLUMN(Wifi_RRM_Config, freq_band), freq_band, &conf))
 	{
-		LOG(INFO, "Wifi_VIF_Config: No RRM for band %s", freq_band );
+		LOG(DEBUG, "Wifi_VIF_Config: No RRM for band %s", freq_band );
 		blobmsg_add_u32(del, "rssi_ignore_probe_request", -90);
 		blobmsg_add_u32(del, "signal_connect", -90);
 		blobmsg_add_u32(del, "signal_stay", -90);
@@ -92,7 +92,7 @@ static bool rrm_config_update( struct schema_Wifi_RRM_Config *conf, bool addNotD
 		memset(&vconf, 0, sizeof(vconf));
 		if (ovsdb_table_select_one_where(&table_Wifi_VIF_Config, where, &vconf))
 		{
-			LOG(INFO, "RRM band %s updates vif %s", conf->freq_band, vconf.if_name);
+			LOG(DEBUG, "RRM band %s updates vif %s", conf->freq_band, vconf.if_name);
 			target_vif_config_set2(&vconf, &rconf, NULL, &changed, 0);
 		}
 	}
