@@ -19,6 +19,16 @@ enum {
 	SYSTEM_ATTR_FIRMWARE,
 	SYSTEM_ATTR_REDIRECTOR,
 	SYSTEM_ATTR_INACTIVEFW,
+	SYSTEM_ATTR_SKU,
+	//SYSTEM_ATTR_QR,
+	SYSTEM_ATTR_MODEL_REV,
+	SYSTEM_ATTR_MODEL_DESCR,
+	SYSTEM_ATTR_MANUFACT_NAME,
+	SYSTEM_ATTR_MANUFACT_DATE,
+	SYSTEM_ATTR_MANUFACT_URL,
+	SYSTEM_ATTR_REF_DESIGN,
+	SYSTEM_ATTR_CERT_REGION,
+	SYSTEM_ATTR_MAC_ADDR,
 	__SYSTEM_ATTR_MAX,
 };
 
@@ -29,6 +39,16 @@ static const struct blobmsg_policy system_policy[__SYSTEM_ATTR_MAX] = {
 	[SYSTEM_ATTR_FIRMWARE] = { .name = "firmware", .type = BLOBMSG_TYPE_STRING },
 	[SYSTEM_ATTR_REDIRECTOR] = { .name = "redirector", .type = BLOBMSG_TYPE_STRING },
 	[SYSTEM_ATTR_INACTIVEFW] = { .name = "inactivefw", .type = BLOBMSG_TYPE_STRING },
+	[SYSTEM_ATTR_SKU] = { .name = "sku_number", .type = BLOBMSG_TYPE_STRING },
+	//[SYSTEM_ATTR_QR] = { .name = "qr_code", .type = BLOBMSG_TYPE_ARRAY },
+	[SYSTEM_ATTR_MODEL_REV] = { .name = "revision", .type = BLOBMSG_TYPE_STRING },
+	[SYSTEM_ATTR_MODEL_DESCR] = { .name = "model_description", .type = BLOBMSG_TYPE_STRING },
+	[SYSTEM_ATTR_MANUFACT_NAME] = { .name = "manufacturer_name", .type = BLOBMSG_TYPE_STRING },
+	[SYSTEM_ATTR_MANUFACT_DATE] = { .name = "manufacturer_date", .type = BLOBMSG_TYPE_STRING },
+	[SYSTEM_ATTR_MANUFACT_URL] = { .name = "manufacturer_url", .type = BLOBMSG_TYPE_STRING },
+	[SYSTEM_ATTR_REF_DESIGN] = { .name = "reference_design", .type = BLOBMSG_TYPE_STRING },
+	[SYSTEM_ATTR_CERT_REGION] = { .name = "certification_region", .type = BLOBMSG_TYPE_STRING },
+	[SYSTEM_ATTR_MAC_ADDR] = { .name = "mac_address", .type = BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list system_param = {
@@ -108,6 +128,59 @@ bool target_sw_version_get(void *buf, size_t len)
 bool target_platform_version_get(void *buf, size_t len)
 {
 	return copy_data(SYSTEM_ATTR_PLATFORM, buf, len);
+}
+
+bool target_sku_get(void *buf, size_t len)
+{
+	return copy_data(SYSTEM_ATTR_SKU, buf, len);
+}
+
+#if 0
+bool target_qr_code_get(void *buf, size_t len)
+{
+	//return copy_data(BLOBMSG_TYPE_ARRAY, buf, len);
+	return false;
+}
+#endif
+
+bool target_model_revision_get(void *buf, size_t len)
+{
+	return copy_data(SYSTEM_ATTR_MODEL_REV, buf, len);
+}
+
+bool target_model_description_get(void *buf, size_t len)
+{
+	return copy_data(SYSTEM_ATTR_MODEL_DESCR, buf, len);
+}
+
+bool target_manuf_name_get(void *buf, size_t len)
+{
+	return copy_data(SYSTEM_ATTR_MANUFACT_NAME, buf, len);
+}
+
+bool target_manuf_date_get(void *buf, size_t len)
+{
+	return copy_data(SYSTEM_ATTR_MANUFACT_DATE, buf, len);
+}
+
+bool target_manuf_url_get(void *buf, size_t len)
+{
+	return copy_data(SYSTEM_ATTR_MANUFACT_URL, buf, len);
+}
+
+bool target_ref_design_get(void *buf, size_t len)
+{
+	return copy_data(SYSTEM_ATTR_REF_DESIGN, buf, len);
+}
+
+bool target_cert_region_get(void *buf, size_t len)
+{
+	return copy_data(SYSTEM_ATTR_CERT_REGION, buf, len);
+}
+
+bool target_mac_addr_get(void *buf, size_t len)
+{
+	return copy_data(SYSTEM_ATTR_MAC_ADDR, buf, len);
 }
 
 bool target_device_config_register(void *awlan_cb)
