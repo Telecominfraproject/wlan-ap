@@ -23,7 +23,7 @@ endef
 
 define Package/ucentral-tools/install
 	$(INSTALL_DIR) $(1)/usr/sbin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/{dhcpdiscover,dnsprobe,firstcontact,radiusprobe,ip-collide} $(1)/usr/sbin/
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/{dhcpdiscover,dnsprobe,radiusprobe,ip-collide} $(1)/usr/sbin/
 endef
 
 $(eval $(call BuildPackage,ucentral-tools))
