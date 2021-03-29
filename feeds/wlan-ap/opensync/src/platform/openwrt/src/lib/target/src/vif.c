@@ -697,7 +697,7 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	char mac[ETH_ALEN * 3];
 	char *ifname, radio[IF_NAMESIZE];
 	bool vifIsActive = false;
-	char network_name[8];
+	char network_name[IF_NAMESIZE];
 
 	LOGT("%s: get state", s->e.name);
 
@@ -766,8 +766,8 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 //		SCHEMA_SET_INT(vstate.uapsd_enable, false);
 
 	if (tb[WIF_ATTR_NETWORK]) {
-		SCHEMA_SET_STR(vstate.bridge, blobmsg_get_string(tb[WIF_ATTR_NETWORK]));
-		strcpy(network_name, blobmsg_get_string(tb[WIF_ATTR_NETWORK]));
+		strncpy(network_name, blobmsg_get_string(tb[WIF_ATTR_NETWORK]), IF_NAMESIZE);
+		SCHEMA_SET_STR(vstate.bridge, network_name);
 	}
 	else
 		LOGW("%s: unknown bridge/network", s->e.name);
