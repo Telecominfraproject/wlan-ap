@@ -41,17 +41,23 @@ if (!config.Redirector) {
 	exit(1);
 }
 
-let cursor = uci.cursor("/etc/config-shadow/");
-cursor.load("ucentral");
-cursor.set("ucentral", "config", "server", config.Redirector);
-cursor.set("ucentral", "config", "serial", devid);
-cursor.commit();
+function store_config(path) {
+	let cursor = uci.cursor(path);
+	cursor.load("ucentral");
+	cursor.set("ucentral", "config", "server", config.Redirector);
+	cursor.set("ucentral", "config", "serial", devid);
+	cursor.commit();
+}
+
+store_config();
+store_config("/etc/config-shadow/");
 
 warn("firstcontact: managed to look up redirector\n");
 
 system("/etc/init.d/ucentral enable");
-system("/etc/init.d/ucentral restart");
-
 system("/etc/init.d/firstcontact disable");
+
+system("reload_config");
+system("/etc/init.d/ucentral start");
 system("/etc/init.d/firstcontact stop");
 %}
