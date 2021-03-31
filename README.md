@@ -7,12 +7,12 @@ Install build packages:  sudo apt install build-essential libncurses5-dev gawk g
 # Doing a native build on Linux
 First we need to clone and setup our tree. This will result in an openwrt/.
 ```
-python3 setup.py --setup
+./setup.py --setup
 ```
 Next we need to select the profile and base package selection. This setup will install the feeds, packages and generate the .config file.
 ```
 cd openwrt
-./scripts/gen_config.py ea8300 ucentral-ap wifi
+./scripts/gen_config.py ea8300
 ```
 Finally we can build the tree.
 ```
