@@ -547,7 +547,7 @@ int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_lis
 {
 	struct nl_msg *msg = nl80211_call_vif(nl_call_param, NL80211_CMD_TRIGGER_SCAN, false);
 	struct nlattr *freq;
-	unsigned int i;
+	unsigned int i, flags = 0;
 	int ret = 0;
 
 	if (!msg)
@@ -555,6 +555,11 @@ int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_lis
 
 	LOGT("%s: not setting dwell time\n", nl_call_param->ifname);
 	//nla_put_u16(msg, NL80211_ATTR_MEASUREMENT_DURATION, dwell_time);
+
+	/* Add the ap-force flag, otherwise the scan fails on wifi6 APs */
+	flags |= NL80211_SCAN_FLAG_AP;
+	nla_put(msg, NL80211_ATTR_SCAN_FLAGS, sizeof(uint32_t), &flags);
+
 	freq = nla_nest_start(msg, NL80211_ATTR_SCAN_FREQUENCIES);
 	for (i = 0; i < chan_num; i ++)
 		nla_put_u32(msg, i, ieee80211_channel_to_frequency(chan_list[i]));
