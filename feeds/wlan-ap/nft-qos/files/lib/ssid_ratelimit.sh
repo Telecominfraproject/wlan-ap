@@ -42,8 +42,20 @@ qosdef_append_rule_ssid() { # <section> <operator> <bridge>
 		rate=$((rate/8))
 	fi
 
-	if [ -z "$iface" -o -z "$rate" -o $rate == 0 ]; then
-		logger -t "nft-qos" "Error: No interface $iface or rate $rate present"
+	if [ -z "$iface" ]; then
+		logger -t "nft-qos" "Error: No interface $iface present"
+		return
+	fi
+
+	if [ -z "$rate" -o $rate == 0 ]; then
+		logger -t "nft-qos" "ssid-rate disabled $iface, configure client-rate"
+	        maclist=`iwinfo $iface assoclist | grep dBm | cut -f 1 -s -d" "`
+
+		for mac in $maclist
+		do
+			logger -t "nft-qos" "Add $mac"
+			/lib/nft-qos/mac-rate.sh add $iface $mac
+		done
 		return
 	fi
 

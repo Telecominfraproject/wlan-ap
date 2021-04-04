@@ -1,0 +1,258 @@
+From 22c8d560c380cb3b188d2177c96121b9cd1835bd Mon Sep 17 00:00:00 2001
+From: Chaitanya Godavarthi <chaitanya.kiran@netexperience.com>
+Date: Sun, 4 Apr 2021 15:11:22 -0400
+Subject: [PATCH] Fix ssid ratelimiting in wifi6 AP
+
+This patch backports some fixes in
+netfilter ratelimiting module for linux v4.4.60.
+These fixes are ported from until following commit id
+6e323887565fe8a23c6c85faf9e395a24affd05c in
+the mainline kernel.
+
+Signed-off-by: Chaitanya Godavarthi <chaitanya.kiran@netexperience.com>
+---
+ .../patches/110-nf-ratelimit-fix.patch        | 232 ++++++++++++++++++
+ 1 file changed, 232 insertions(+)
+ create mode 100644 target/linux/ipq807x/patches/110-nf-ratelimit-fix.patch
+
+diff --git a/target/linux/ipq807x/patches/110-nf-ratelimit-fix.patch b/target/linux/ipq807x/patches/110-nf-ratelimit-fix.patch
+new file mode 100644
+index 0000000000..d4506944b8
+--- /dev/null
++++ b/target/linux/ipq807x/patches/110-nf-ratelimit-fix.patch
+@@ -0,0 +1,232 @@
++Index: linux-4.4.60-qsdk-10fd7d14853b7020b804acae690c8acec5d954ce/include/uapi/linux/netfilter/nf_tables.h
++===================================================================
++--- linux-4.4.60-qsdk-10fd7d14853b7020b804acae690c8acec5d954ce.orig/include/uapi/linux/netfilter/nf_tables.h
+++++ linux-4.4.60-qsdk-10fd7d14853b7020b804acae690c8acec5d954ce/include/uapi/linux/netfilter/nf_tables.h
++@@ -761,6 +761,10 @@ enum nft_limit_type {
++ 	NFT_LIMIT_PKT_BYTES
++ };
++ 
+++enum nft_limit_flags {
+++        NFT_LIMIT_F_INV = (1 << 0),
+++};
+++
++ /**
++  * enum nft_limit_attributes - nf_tables limit expression netlink attributes
++  *
++@@ -768,6 +772,7 @@ enum nft_limit_type {
++  * @NFTA_LIMIT_UNIT: refill unit (NLA_U64)
++  * @NFTA_LIMIT_BURST: burst (NLA_U32)
++  * @NFTA_LIMIT_TYPE: type of limit (NLA_U32: enum nft_limit_type)
+++ * @NFTA_LIMIT_FLAGS: flags (NLA_U32: enum nft_limit_flags)
++  */
++ enum nft_limit_attributes {
++ 	NFTA_LIMIT_UNSPEC,
++@@ -775,6 +780,8 @@ enum nft_limit_attributes {
++ 	NFTA_LIMIT_UNIT,
++ 	NFTA_LIMIT_BURST,
++ 	NFTA_LIMIT_TYPE,
+++	NFTA_LIMIT_FLAGS,
+++	NFTA_LIMIT_PAD,
++ 	__NFTA_LIMIT_MAX
++ };
++ #define NFTA_LIMIT_MAX		(__NFTA_LIMIT_MAX - 1)
++Index: linux-4.4.60-qsdk-10fd7d14853b7020b804acae690c8acec5d954ce/net/netfilter/nft_limit.c
++===================================================================
++--- linux-4.4.60-qsdk-10fd7d14853b7020b804acae690c8acec5d954ce.orig/net/netfilter/nft_limit.c
+++++ linux-4.4.60-qsdk-10fd7d14853b7020b804acae690c8acec5d954ce/net/netfilter/nft_limit.c
++@@ -17,15 +17,15 @@
++ #include <linux/netfilter/nf_tables.h>
++ #include <net/netfilter/nf_tables.h>
++ 
++-static DEFINE_SPINLOCK(limit_lock);
++-
++ struct nft_limit {
+++	spinlock_t	lock;
++ 	u64		last;
++ 	u64		tokens;
++ 	u64		tokens_max;
++ 	u64		rate;
++ 	u64		nsecs;
++ 	u32		burst;
+++	bool		invert;
++ };
++ 
++ static inline bool nft_limit_eval(struct nft_limit *limit, u64 cost)
++@@ -33,7 +33,7 @@ static inline bool nft_limit_eval(struct
++ 	u64 now, tokens;
++ 	s64 delta;
++ 
++-	spin_lock_bh(&limit_lock);
+++	spin_lock_bh(&limit->lock);
++ 	now = ktime_get_ns();
++ 	tokens = limit->tokens + now - limit->last;
++ 	if (tokens > limit->tokens_max)
++@@ -43,12 +43,12 @@ static inline bool nft_limit_eval(struct
++ 	delta = tokens - cost;
++ 	if (delta >= 0) {
++ 		limit->tokens = delta;
++-		spin_unlock_bh(&limit_lock);
++-		return false;
+++		spin_unlock_bh(&limit->lock);
+++		return limit->invert;
++ 	}
++ 	limit->tokens = tokens;
++-	spin_unlock_bh(&limit_lock);
++-	return true;
+++	spin_unlock_bh(&limit->lock);
+++	return !limit->invert;
++ }
++ 
++ static int nft_limit_init(struct nft_limit *limit,
++@@ -65,20 +65,31 @@ static int nft_limit_init(struct nft_lim
++ 	limit->nsecs = unit * NSEC_PER_SEC;
++ 	if (limit->rate == 0 || limit->nsecs < unit)
++ 		return -EOVERFLOW;
++-	limit->tokens = limit->tokens_max = limit->nsecs;
++-
++-	if (tb[NFTA_LIMIT_BURST]) {
++-		u64 rate;
++ 
+++	if (tb[NFTA_LIMIT_BURST])
++ 		limit->burst = ntohl(nla_get_be32(tb[NFTA_LIMIT_BURST]));
+++	else
+++		limit->burst = 0;
+++
+++	if (limit->rate + limit->burst < limit->rate)
+++		return -EOVERFLOW;
+++
+++	/* The token bucket size limits the number of tokens can be
+++	 * accumulated. tokens_max specifies the bucket size.
+++	 * tokens_max = unit * (rate + burst) / rate.
+++	 */
+++	limit->tokens = div_u64(limit->nsecs * (limit->rate + limit->burst),
+++				limit->rate);
+++	limit->tokens_max = limit->tokens;
++ 
++-		rate = limit->rate + limit->burst;
++-		if (rate < limit->rate)
++-			return -EOVERFLOW;
+++	if (tb[NFTA_LIMIT_FLAGS]) {
+++		u32 flags = ntohl(nla_get_be32(tb[NFTA_LIMIT_FLAGS]));
++ 
++-		limit->rate = rate;
+++		if (flags & NFT_LIMIT_F_INV)
+++			limit->invert = true;
++ 	}
++ 	limit->last = ktime_get_ns();
+++	spin_lock_init(&limit->lock);
++ 
++ 	return 0;
++ }
++@@ -86,13 +97,14 @@ static int nft_limit_init(struct nft_lim
++ static int nft_limit_dump(struct sk_buff *skb, const struct nft_limit *limit,
++ 			  enum nft_limit_type type)
++ {
+++	u32 flags = limit->invert ? NFT_LIMIT_F_INV : 0;
++ 	u64 secs = div_u64(limit->nsecs, NSEC_PER_SEC);
++-	u64 rate = limit->rate - limit->burst;
++ 
++-	if (nla_put_be64(skb, NFTA_LIMIT_RATE, cpu_to_be64(rate)) ||
+++	if (nla_put_be64(skb, NFTA_LIMIT_RATE, cpu_to_be64(limit->rate)) ||
++ 	    nla_put_be64(skb, NFTA_LIMIT_UNIT, cpu_to_be64(secs)) ||
++ 	    nla_put_be32(skb, NFTA_LIMIT_BURST, htonl(limit->burst)) ||
++-	    nla_put_be32(skb, NFTA_LIMIT_TYPE, htonl(type)))
+++	    nla_put_be32(skb, NFTA_LIMIT_TYPE, htonl(type)) ||
+++	    nla_put_be32(skb, NFTA_LIMIT_FLAGS, htonl(flags)))
++ 		goto nla_put_failure;
++ 	return 0;
++ 
++@@ -120,6 +132,7 @@ static const struct nla_policy nft_limit
++ 	[NFTA_LIMIT_UNIT]	= { .type = NLA_U64 },
++ 	[NFTA_LIMIT_BURST]	= { .type = NLA_U32 },
++ 	[NFTA_LIMIT_TYPE]	= { .type = NLA_U32 },
+++	[NFTA_LIMIT_FLAGS]	= { .type = NLA_U32 },
++ };
++ 
++ static int nft_limit_pkts_init(const struct nft_ctx *ctx,
++@@ -133,7 +146,7 @@ static int nft_limit_pkts_init(const str
++ 	if (err < 0)
++ 		return err;
++ 
++-	priv->cost = div_u64(priv->limit.nsecs, priv->limit.rate);
+++	priv->cost = div64_u64(priv->limit.nsecs, priv->limit.rate);
++ 	return 0;
++ }
++ 
++@@ -153,40 +166,40 @@ static const struct nft_expr_ops nft_lim
++ 	.dump		= nft_limit_pkts_dump,
++ };
++ 
++-static void nft_limit_pkt_bytes_eval(const struct nft_expr *expr,
++-				     struct nft_regs *regs,
++-				     const struct nft_pktinfo *pkt)
+++static void nft_limit_bytes_eval(const struct nft_expr *expr,
+++				 struct nft_regs *regs,
+++				 const struct nft_pktinfo *pkt)
++ {
++ 	struct nft_limit *priv = nft_expr_priv(expr);
++-	u64 cost = div_u64(priv->nsecs * pkt->skb->len, priv->rate);
+++	u64 cost = div64_u64(priv->nsecs * pkt->skb->len, priv->rate);
++ 
++ 	if (nft_limit_eval(priv, cost))
++ 		regs->verdict.code = NFT_BREAK;
++ }
++ 
++-static int nft_limit_pkt_bytes_init(const struct nft_ctx *ctx,
++-				    const struct nft_expr *expr,
++-				    const struct nlattr * const tb[])
+++static int nft_limit_bytes_init(const struct nft_ctx *ctx,
+++				const struct nft_expr *expr,
+++				const struct nlattr * const tb[])
++ {
++ 	struct nft_limit *priv = nft_expr_priv(expr);
++ 
++ 	return nft_limit_init(priv, tb);
++ }
++ 
++-static int nft_limit_pkt_bytes_dump(struct sk_buff *skb,
++-				    const struct nft_expr *expr)
+++static int nft_limit_bytes_dump(struct sk_buff *skb,
+++				const struct nft_expr *expr)
++ {
++ 	const struct nft_limit *priv = nft_expr_priv(expr);
++ 
++ 	return nft_limit_dump(skb, priv, NFT_LIMIT_PKT_BYTES);
++ }
++ 
++-static const struct nft_expr_ops nft_limit_pkt_bytes_ops = {
+++static const struct nft_expr_ops nft_limit_bytes_ops = {
++ 	.type		= &nft_limit_type,
++ 	.size		= NFT_EXPR_SIZE(sizeof(struct nft_limit)),
++-	.eval		= nft_limit_pkt_bytes_eval,
++-	.init		= nft_limit_pkt_bytes_init,
++-	.dump		= nft_limit_pkt_bytes_dump,
+++	.eval		= nft_limit_bytes_eval,
+++	.init		= nft_limit_bytes_init,
+++	.dump		= nft_limit_bytes_dump,
++ };
++ 
++ static const struct nft_expr_ops *
++@@ -200,7 +213,7 @@ nft_limit_select_ops(const struct nft_ct
++ 	case NFT_LIMIT_PKTS:
++ 		return &nft_limit_pkts_ops;
++ 	case NFT_LIMIT_PKT_BYTES:
++-		return &nft_limit_pkt_bytes_ops;
+++		return &nft_limit_bytes_ops;
++ 	}
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
++Index: linux-4.4.60-qsdk-10fd7d14853b7020b804acae690c8acec5d954ce/net/bridge/br_private.h
++===================================================================
++--- linux-4.4.60-qsdk-10fd7d14853b7020b804acae690c8acec5d954ce.orig/net/bridge/br_private.h
+++++ linux-4.4.60-qsdk-10fd7d14853b7020b804acae690c8acec5d954ce/net/bridge/br_private.h
++@@ -926,9 +926,6 @@ BR_HOOK(uint8_t pf, unsigned int hook, s
++ 	struct sk_buff *skb, struct net_device *in, struct net_device *out,
++ 	int (*okfn)(struct net *, struct sock *, struct sk_buff *))
++ {
++-	if (!br_netfilter_run_hooks())
++-		return okfn(net, sk, skb);
++-
++ 	return NF_HOOK(pf, hook, net, sk, skb, in, out, okfn);
++ }
++ 
+-- 
+2.25.1
+

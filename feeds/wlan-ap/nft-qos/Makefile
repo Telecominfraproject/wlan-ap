@@ -48,13 +48,8 @@ define Package/nft-qos/install
 	$(INSTALL_DIR) $(1)/lib/nft-qos
 	$(INSTALL_DATA) ./files/lib/* $(1)/lib/nft-qos/
 	chmod 0700 $(1)/lib/nft-qos/mac-rate.sh
-	$(INSTALL_DIR) $(1)/etc/config
-	$(INSTALL_CONF) ./files/nft-qos.config $(1)/etc/config/nft-qos
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/nft-qos.init $(1)/etc/init.d/nft-qos
-	$(INSTALL_DIR) $(1)/etc/hotplug.d/dhcp
-	$(INSTALL_BIN) ./files/nft-qos-monitor.hotplug $(1)/etc/hotplug.d/dhcp/00-nft-qos-monitor
-	$(INSTALL_BIN) ./files/nft-qos-dynamic.hotplug $(1)/etc/hotplug.d/dhcp/01-nft-qos-dynamic
 endef
 
 $(eval $(call BuildPackage,nft-qos))

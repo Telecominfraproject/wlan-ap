@@ -103,7 +103,7 @@ static void vif_add_sta_rate_rule(uint8_t *addr, char *ifname)
 	char *rule;
 	ssize_t rule_sz;
 
-	LOGI("Add mac rate rule: %s %02X:%02X:%02X:%02X:%02X:%02X",
+	LOGI("Add mac rate rule:%s: %02X:%02X:%02X:%02X:%02X:%02X",
 	     ifname, addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
 
 	rule_sz = snprintf(NULL, 0, "/lib/nft-qos/mac-rate.sh add %s %02X:%02X:%02X:%02X:%02X:%02X",
@@ -123,7 +123,7 @@ static void vif_del_sta_rate_rule(uint8_t *addr, char *ifname)
 	char *rule;
 	ssize_t rule_sz;
 
-	LOGI("Del mac rate rule: %s %02X:%02X:%02X:%02X:%02X:%02X",
+	LOGI("Del mac rate rule:%s: %02X:%02X:%02X:%02X:%02X:%02X",
 	     ifname, addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
 
 	rule_sz = snprintf(NULL, 0, "/lib/nft-qos/mac-rate.sh del %s %02X:%02X:%02X:%02X:%02X:%02X",
@@ -147,11 +147,10 @@ static void nl80211_add_station(struct nlattr **tb, char *ifname)
 		return;
 
 	addr = nla_data(tb[NL80211_ATTR_MAC]);
+	vif_add_sta_rate_rule(addr, ifname);
 	sta = avl_find_element(&sta_tree, addr, sta, avl);
-	if (sta) {
-		vif_add_sta_rate_rule(addr, ifname);
+	if (sta)
 		return;
-	}
 
 	wif = avl_find_element(&wif_tree, ifname, wif, avl);
 	if (!wif)
@@ -168,7 +167,6 @@ static void nl80211_add_station(struct nlattr **tb, char *ifname)
 	list_add(&sta->iface, &wif->stas);
 
 	vif_add_station(sta, ifname, 1);
-	vif_add_sta_rate_rule(addr, ifname);
 }
 
 static void _nl80211_del_station(char *ifname, struct wifi_station *sta)
