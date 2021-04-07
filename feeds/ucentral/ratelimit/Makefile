@@ -11,7 +11,7 @@ define Package/ratelimit
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Wireless ratelimiting
-  DEPENDS:=hostapd-utils
+  DEPENDS:=+hostapd-utils +tc +kmod-ifb
 endef
 
 define Package/ratelimit/description
