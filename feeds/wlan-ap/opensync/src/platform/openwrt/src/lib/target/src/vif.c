@@ -129,6 +129,8 @@ enum {
 	WIF_ATTR_DVLAN_NAMING,
 	WIF_ATTR_DVLAN_BRIDGE,
 	WIF_ATTR_MIN_HW_MODE,
+	WIF_ATTR_11R_R0KH,
+	WIF_ATTR_11R_R1KH,
 	__WIF_ATTR_MAX,
 };
 
@@ -220,6 +222,8 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_DVLAN_NAMING] = { .name = "vlan_naming", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_DVLAN_BRIDGE] = { .name = "vlan_bridge", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_MIN_HW_MODE] = { .name = "min_hw_mode", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_11R_R0KH] = { .name = "r0kh", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_11R_R1KH] = { .name = "r1kh", BLOBMSG_TYPE_STRING },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -319,6 +323,7 @@ static int vif_config_security_set(struct blob_buf *b,
 	unsigned int i;
 	unsigned int acct_interval;
 	const char *auth_server, *auth_port, *auth_secret, *security_key;
+	char key_str[64], key_holder_str[128];
 
 	if (!strcmp(encryption, OVSDB_SECURITY_ENCRYPTION_OPEN) || !mode)
 		goto open;
@@ -361,6 +366,26 @@ static int vif_config_security_set(struct blob_buf *b,
 			{
 				blobmsg_add_u32(b, "acct_interval", acct_interval);
 			}
+
+			/*
+			 * If Radius is configured and Roaming is enabled,
+			 * - disable ft_psk_generate_local. This is required for hostapd to populate R0/R1.
+			 * - populate r0KH and r1KH with broadcast addressing so that the corresponding
+			 * Key Holders are auto-generated
+			 */
+			if (vconf->ft_mobility_domain) {
+				blobmsg_add_bool(b, "ft_psk_generate_local", 0);
+
+				vif_get_key_for_key_distr(auth_secret, key_str);
+
+				strcpy(key_holder_str, "ff:ff:ff:ff:ff:ff,*,");
+				strcat(key_holder_str, key_str);
+				blobmsg_add_string(b, "r0kh", key_holder_str);
+
+				strcpy(key_holder_str, "00:00:00:00:00:00,00:00:00:00:00:00,");
+				strcat(key_holder_str, key_str);
+				blobmsg_add_string(b, "r1kh", key_holder_str);
+			}
 		} else {
 			security_key = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_KEY);
 			if (security_key == NULL) {
@@ -368,6 +393,8 @@ static int vif_config_security_set(struct blob_buf *b,
 				return -1;
 			}
 			blobmsg_add_string(b, "key", security_key);
+			if (vconf->ft_mobility_domain)
+				blobmsg_add_bool(b, "ft_psk_generate_local", vconf->ft_psk);
 		}
 	}
 	return 0;
@@ -483,6 +510,9 @@ static void vif_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del,
 	const char *opt;
 	const char *val;
 	struct blob_attr *n;
+	bool found_nasid = false;
+	char mac[ETH_ALEN * 3];
+	struct blob_attr *tb[__WIF_ATTR_MAX] = { };
 
 	for (i = 0; i < SCHEMA_CUSTOM_OPTS_MAX; i++) {
 		opt = custom_options_table[i];
@@ -517,8 +547,12 @@ static void vif_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del,
 			blobmsg_add_string(b, "rts_threshold", value);
 		else if (strcmp(opt, "dtim_period") == 0)
 			blobmsg_add_string(b, "dtim_period", value);
-		else if (strcmp(opt, "radius_nas_id") == 0)
-			blobmsg_add_string(b, "nasid", value);
+		else if (strcmp(opt, "radius_nas_id") == 0) {
+			if (strcmp(value, "\0") != 0) {
+				blobmsg_add_string(b, "nasid", value);
+				found_nasid = true;
+			}
+		}
 		else if (strcmp(opt, "radius_nas_ip") == 0)
 			blobmsg_add_string(b, "ownip", value);
 		else if (strcmp(opt, "radius_oper_name") == 0 && strlen(value) > 0)
@@ -553,6 +587,15 @@ static void vif_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del,
 				blobmsg_add_string(del, "vlan_bridge", value);
 			}
 		}
+	}
+
+	/* No NASID was found from blob, so use BSSID as NASID */
+	if (found_nasid == false) {
+		blobmsg_parse(wifi_iface_policy, __WIF_ATTR_MAX, tb, blob_data(b->head), blob_len(b->head));
+		if (tb[WIF_ATTR_IFNAME] && !vif_get_mac(blobmsg_get_string(tb[WIF_ATTR_IFNAME]), mac))
+			blobmsg_add_string(b, "nasid", mac);
+		else
+			LOGE("Failed to get base BSSID (mac)\n");
 	}
 }
 
@@ -1335,10 +1378,9 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 		blobmsg_add_string(&b, "min_hw_mode", vconf->min_hw_mode);
 
 	if (changed->ft_psk || changed->ft_mobility_domain) {
-		if (vconf->ft_psk && vconf->ft_mobility_domain) {
+		if (vconf->ft_mobility_domain) {
 			blobmsg_add_bool(&b, "ieee80211r", 1);
 			blobmsg_add_hex16(&b, "mobility_domain", vconf->ft_mobility_domain);
-			blobmsg_add_bool(&b, "ft_psk_generate_local", vconf->ft_psk);
 			blobmsg_add_bool(&b, "ft_over_ds", 0);
 			blobmsg_add_bool(&b, "reassociation_deadline", 1);
 		} else {

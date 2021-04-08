@@ -624,3 +624,22 @@ bool vif_get_security(struct schema_Wifi_VIF_State *vstate,  char *mode,  char *
 	return true;
 
 }
+
+bool vif_get_key_for_key_distr(const char *secret, char *key_str)
+{
+	bool err = false;
+	FILE *fp;
+	char cmd_buf[256] = "openssl aes-128-cbc -nosalt -k ";
+
+	strcat(cmd_buf, secret);
+	strcat(cmd_buf, " -P 2>/dev/null | grep key | cut -d = -f2");
+	fp = popen(cmd_buf, "r");
+
+	
+	if (fp && fscanf(fp, "%s", key_str)) {
+		err = true;
+	}
+
+	fclose(fp);
+	return err;
+}
