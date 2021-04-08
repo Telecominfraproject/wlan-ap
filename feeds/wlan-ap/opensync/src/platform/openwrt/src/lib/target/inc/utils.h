@@ -20,6 +20,7 @@ extern struct mode_map *mode_map_get_cloud(const char *htmode, const char *hwmod
 
 extern int vif_get_mac(char *vap, char *mac);
 extern int vif_is_ready(const char *name);
+bool vif_get_key_for_key_distr(const char *secret, char *key_str);
 
 #define blobmsg_add_bool blobmsg_add_u8
 extern int blobmsg_add_hex16(struct blob_buf *buf, const char *name, uint16_t val);
