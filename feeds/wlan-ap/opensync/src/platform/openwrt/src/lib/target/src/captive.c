@@ -258,12 +258,8 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate)
 		} else if (!strcmp(opt, "authentication")) {
 			if(tc[NDS_ATTR_AUTHENTICATION]) {
 				buf = blobmsg_get_string(tc[NDS_ATTR_AUTHENTICATION]);
-				if (!strcmp(buf, "None")) {
+				if (!strcmp(buf, "None") || !strcmp(buf, "username") || !strcmp(buf, "radius")) {
 
-					set_captive_portal_state(vstate, &index,
-							captive_portal_options_table[i],
-							buf);
-				} else if (!strcmp(buf,"username")) {
 					set_captive_portal_state(vstate, &index,
 							captive_portal_options_table[i],
 							buf);
@@ -596,7 +592,7 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 				blobmsg_add_string(&cap, "enabled", "1");
 				blobmsg_add_string(&cap, "gatewayinterface","br-lan");
 				blobmsg_add_string(&cap, "preauth", "/usr/lib/opennds/radius.sh");
-				ipset_create(ifname);
+				ipset_create("opennds");
 				d = blobmsg_open_array(&cap, "preauthenticated_users");
 				blobmsg_add_string(&cap, NULL, ipset_tcp80);
 				blobmsg_add_string(&cap, NULL, ipset_tcp443);
