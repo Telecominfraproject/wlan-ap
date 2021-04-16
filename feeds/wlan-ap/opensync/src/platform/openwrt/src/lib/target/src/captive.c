@@ -612,8 +612,12 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 		else if (strcmp(opt, "radius_server_secret") == 0)
 			blobmsg_add_string(&cap, "radius_server_secret", value);
 
-		else if (strcmp(opt, "radius_auth_type") == 0)
-			blobmsg_add_string(&cap, "radius_auth_type", value);
+		else if (strcmp(opt, "radius_auth_type") == 0) {
+			if(!strcmp(value, "MSCHAPv2"))
+				blobmsg_add_string(&cap, "radius_auth_type", "MSCHAPV2");
+			else
+				blobmsg_add_string(&cap, "radius_auth_type", value);
+		}
 
 		else if (strcmp(opt, "session_timeout") == 0)
 			blobmsg_add_string(&cap, "sessiontimeout", value);
