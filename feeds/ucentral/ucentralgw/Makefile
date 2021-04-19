@@ -4,9 +4,9 @@ PKG_NAME:=ucentralgw
 PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL=git@github.com:stephb9959/ucentralgw.git
+PKG_SOURCE_URL=git@github.com:Telecominfraproject/wlan-cloud-ucentralgw.git
 PKG_SOURCE_DATE:=2021-03-28
-PKG_SOURCE_VERSION:=48dfabb1ddc91cb9feeaef802f9e48b3b013ef12
+PKG_SOURCE_VERSION:=6ed4167f1a2cd0bc0b4ebd34d488fcae4ac9e47
 CMAKE_INSTALL:=1
 
 PKG_LICENSE:=BSD-3-Clause
