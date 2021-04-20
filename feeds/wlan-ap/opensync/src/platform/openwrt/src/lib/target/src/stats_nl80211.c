@@ -13,7 +13,6 @@
 #include <sys/types.h>
 
 #include <linux/sockios.h>
-#include <linux/nl80211.h>
 
 #include <netlink/msg.h>
 #include <netlink/attr.h>
@@ -30,6 +29,7 @@
 #include <libubox/vlist.h>
 #include <unl.h>
 
+#include "nl80211_cpy.h"
 #include "target.h"
 #include "nl80211.h"
 #include "phy.h"
@@ -203,6 +203,7 @@ static int nl80211_survey_recv(struct nl_msg *msg, void *arg)
 		[NL80211_SURVEY_INFO_TIME_EXT_BUSY]	= { .type = NLA_U64 },
 		[NL80211_SURVEY_INFO_TIME_SCAN]		= { .type = NLA_U64 },
 		[NL80211_SURVEY_INFO_NOISE]		= { .type = NLA_U8 },
+		[NL80211_SURVEY_INFO_TIME_BSS_RX]	= { .type = NLA_U64 },
 	};
 
 	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
@@ -231,7 +232,7 @@ static int nl80211_survey_recv(struct nl_msg *msg, void *arg)
 						nla_get_u32(si[NL80211_SURVEY_INFO_FREQUENCY]));
 
 	if (si[NL80211_SURVEY_INFO_TIME_RX])
-		survey_record->chan_self = nla_get_u64(si[NL80211_SURVEY_INFO_TIME_RX]);
+		survey_record->chan_self = nla_get_u64(si[NL80211_SURVEY_INFO_TIME_BSS_RX]);
 
 	if (si[NL80211_SURVEY_INFO_TIME_TX])
 		survey_record->chan_tx = nla_get_u64(si[NL80211_SURVEY_INFO_TIME_TX]);
