@@ -14,7 +14,6 @@
 #include <sys/types.h>
 
 #include <linux/sockios.h>
-#include <linux/nl80211.h>
 
 #include <netlink/msg.h>
 #include <netlink/attr.h>
@@ -33,6 +32,7 @@
 
 #include <sys/time.h>
 
+#include "nl80211_cpy.h"
 #include "target.h"
 #include "nl80211.h"
 #include "phy.h"
