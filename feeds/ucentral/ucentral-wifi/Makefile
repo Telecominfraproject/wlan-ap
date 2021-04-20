@@ -18,7 +18,7 @@ define Package/ucentral-wifi
   SECTION:=ucentral
   CATEGORY:=uCentral
   TITLE:=OpenWrt wifi status daemon
-  DEPENDS:=+libubox +libubus +libnl-tiny
+  DEPENDS:=+libubox +libubus +libnl-tiny +kmod-mac80211
 endef
 
 TARGET_CFLAGS += \
