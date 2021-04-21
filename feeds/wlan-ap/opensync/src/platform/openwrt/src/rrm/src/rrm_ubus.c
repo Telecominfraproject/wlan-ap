@@ -51,7 +51,7 @@ int ubus_get_noise(const char *if_name, uint32_t *noise)
 
 }
 
-int ubus_set_channel_switch(const char *if_name, uint32_t frequency)
+int ubus_set_channel_switch(const char *if_name, uint32_t frequency, int channel_bandwidth, int sec_chan_offset)
 {
 	uint32_t id;
 	static struct blob_buf b;
@@ -61,10 +61,21 @@ int ubus_set_channel_switch(const char *if_name, uint32_t frequency)
 
 	if (ubus_lookup_id(ubus, path, &id))
 		return -1;
-
 	blob_buf_init(&b, 0);
+
+	if (channel_bandwidth == 20 || channel_bandwidth == 40) {
+		blobmsg_add_bool(&b, "ht", 1);
+	} else if (channel_bandwidth == 80) {
+		blobmsg_add_bool(&b, "vht", 1);
+	}
+	if (channel_bandwidth == 40 || channel_bandwidth == 80) {
+		blobmsg_add_u32(&b, "center_freq1", frequency+30);
+	}
+
 	blobmsg_add_u32(&b, "freq", frequency);
 	blobmsg_add_u32(&b, "bcn_count", 1);
+	blobmsg_add_u32(&b, "bandwidth", channel_bandwidth);
+	blobmsg_add_u32(&b, "sec_channel_offset", sec_chan_offset);
 	return ubus_invoke(ubus, id, "switch_chan", b.head, NULL, NULL, 1000);
 }
 
