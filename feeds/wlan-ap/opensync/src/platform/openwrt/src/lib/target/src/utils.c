@@ -23,41 +23,79 @@
 #include "vif.h"
 
 static struct mode_map mode_map[] = {
-	{ 0, "11b", "11b", NULL, "NOHT" },
-	{ 0, "11g", "11g", NULL, "NOHT" },
-	{ 1, "11a", "11a", NULL, "NOHT" },
-	{ 0, "11n", "11g", "HT20", "HT20" },
-	{ 0, "11n", "11g", "HT40", "HT40" },
-	{ 0, "11n", "11g", "HT40-", "HT40-" },
-	{ 0, "11n", "11g", "HT40+", "HT40+" },
-	{ 0, "11n", "11g", "HT80", "HT40" },
-	{ 0, "11n", "11g", "HT160", "HT40" },
-	{ 1, "11n", "11a", "HT20", "HT20" },
-	{ 1, "11n", "11a", "HT40", "HT40" },
-	{ 1, "11n", "11a", "HT40-", "HT40-" },
-	{ 1, "11n", "11a", "HT40+", "HT40+" },
-	{ 1, "11n", "11a", "HT80", "HT40" },
-	{ 1, "11n", "11a", "HT160", "HT40" },
-	{ 1, "11ac", "11a", "HT20", "VHT20" },
-	{ 1, "11ac", "11a", "HT40", "VHT40" },
-	{ 1, "11ac", "11a", "HT40-", "VHT40" },
-	{ 1, "11ac", "11a", "HT40+", "VHT40" },
-	{ 1, "11ac", "11a", "HT80", "VHT80" },
-	{ 1, "11ac", "11a", "HT160", "VHT160" },
-	{ 0, "11ax", "11g", "HT20", "HE20" },
-	{ 0, "11ax", "11g", "HT40", "HE40" },
-	{ 0, "11ax", "11g", "HT40-", "HE40" },
-	{ 0, "11ax", "11g", "HT40+", "HE40" },
-	{ 0, "11ax", "11g", "HT80", "HE80" },
-	{ 0, "11ax", "11g", "HT160", "HE80" },
-	{ 1, "11ax", "11a", "HT20", "HE20" },
-	{ 1, "11ax", "11a", "HT40", "HE40" },
-	{ 1, "11ax", "11a", "HT40-", "HE40" },
-	{ 1, "11ax", "11a", "HT40+", "HE40" },
-	{ 1, "11ax", "11a", "HT80", "HE80" },
-	{ 1, "11ax", "11a", "HT160", "HE160" },
+	{ 0, "11b", "11b", NULL, "NOHT", 0 },
+	{ 0, "11g", "11g", NULL, "NOHT", 0 },
+	{ 1, "11a", "11a", NULL, "NOHT", 0 },
+	{ 0, "11n", "11g", "HT20", "HT20", 0 },
+	{ 0, "11n", "11g", "HT40", "HT40", 1 },
+	{ 0, "11n", "11g", "HT40-", "HT40-", 1 },
+	{ 0, "11n", "11g", "HT40+", "HT40+", 1 },
+	{ 0, "11n", "11g", "HT80", "HT40", 1 },
+	{ 0, "11n", "11g", "HT160", "HT40", 1 },
+	{ 1, "11n", "11a", "HT20", "HT20", 0 },
+	{ 1, "11n", "11a", "HT40", "HT40", 1 },
+	{ 1, "11n", "11a", "HT40-", "HT40-", 1 },
+	{ 1, "11n", "11a", "HT40+", "HT40+", 1 },
+	{ 1, "11n", "11a", "HT80", "HT40", 1 },
+	{ 1, "11n", "11a", "HT160", "HT40", 1 },
+	{ 1, "11ac", "11a", "HT20", "VHT20", 0 },
+	{ 1, "11ac", "11a", "HT40", "VHT40", 1 },
+	{ 1, "11ac", "11a", "HT40-", "VHT40", 1 },
+	{ 1, "11ac", "11a", "HT40+", "VHT40", 1 },
+	{ 1, "11ac", "11a", "HT80", "VHT80", 1 },
+	{ 1, "11ac", "11a", "HT160", "VHT160", 1 },
+	{ 0, "11ax", "11g", "HT20", "HE20", 0 },
+	{ 0, "11ax", "11g", "HT40", "HE40", 1 },
+	{ 0, "11ax", "11g", "HT40-", "HE40", 1 },
+	{ 0, "11ax", "11g", "HT40+", "HE40", 1 },
+	{ 0, "11ax", "11g", "HT80", "HE80", 1 },
+	{ 0, "11ax", "11g", "HT160", "HE80", 1 },
+	{ 1, "11ax", "11a", "HT20", "HE20", 0 },
+	{ 1, "11ax", "11a", "HT40", "HE40", 1 },
+	{ 1, "11ax", "11a", "HT40-", "HE40", 1 },
+	{ 1, "11ax", "11a", "HT40+", "HE40", 1 },
+	{ 1, "11ax", "11a", "HT80", "HE80", 1 },
+	{ 1, "11ax", "11a", "HT160", "HE160", 1 },
 };
 
+typedef enum {
+	MHz20=0,
+	MHz40 = 1,
+	MHz80 = 2,
+	MHz160 = 4
+} bm_AllowedBw;
+
+typedef struct {
+	int freq;
+	bm_AllowedBw bw;
+} freqBwListEntry;
+
+freqBwListEntry freqBwList[] ={{2412, MHz20},{2417, MHz20},{2422, MHz20},{2427, MHz20},{2432, MHz20},{2437, MHz20},{2442, MHz20},{2447, MHz20},{2452, MHz20},{2457, MHz20},{2462, MHz20},{2467, MHz20},{2472, MHz20}, {2484, MHz20},
+		{ 5180, MHz20|MHz40|MHz80},{5200, MHz20},{5220, MHz20|MHz40},{5240, MHz20},{5260, MHz20|MHz40|MHz80},{5280, MHz20},{5300,MHz20|MHz40},{5320, MHz20},{5500, MHz20|MHz40|MHz80},{5520, MHz20},{5540,  MHz20|MHz40}, {5560, MHz20},
+		{5580, MHz20|MHz40|MHz80},{5600, MHz20},{5620, MHz20|MHz40},{5640, MHz20},{5660, MHz20|MHz40|MHz80},{5680, MHz20},{5700, MHz20|MHz40},{5720, MHz20},{5745, MHz20|MHz40|MHz80},{5765, MHz20},{5785, MHz20|MHz40},{5805, MHz20},{5825, MHz20}};
+
+#define REQ_BW(htmode) (!strcmp(htmode, "HT20") ? MHz20 : !strcmp(htmode, "HT40") ? MHz40 : !strcmp(htmode, "HT80") ? MHz80 : !strcmp(htmode, "HT160") ? MHz160 : MHz20)
+#define REQ_MODE(bw) (bw==MHz20 ? "HT20": bw==MHz40 ? "HT40" : bw==MHz80 ? "HT80" : bw==MHz160 ? "HT160" : "HT20")
+
+char * get_max_channel_bw_channel(int channel_freq, const char* htmode)
+{
+	unsigned int i;
+	bm_AllowedBw requestedBw;
+
+	requestedBw = REQ_BW(htmode);
+
+	for ( i = 0; i < ARRAY_SIZE(freqBwList); i++) {
+		if(freqBwList[i].freq == channel_freq) {
+			while (requestedBw) {
+				if (freqBwList[i].bw & requestedBw) {
+					return REQ_MODE(requestedBw);
+				}
+				requestedBw >>= 1;
+			}
+		}
+	}
+	return "HT20";
+}
 struct mode_map *mode_map_get_uci(const char *band, const char *htmode, const char *hwmode)
 {
 	unsigned int i;

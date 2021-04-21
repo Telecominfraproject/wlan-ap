@@ -401,8 +401,9 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 	}
 
 	if ((changed->ht_mode) || (changed->hw_mode) || (changed->freq_band)) {
-		struct mode_map *m = mode_map_get_uci(rconf->freq_band, rconf->ht_mode,
-						      rconf->hw_mode);
+		int channel_freq;
+		channel_freq = ieee80211_channel_to_frequency(rconf->channel);
+		struct mode_map *m = mode_map_get_uci(rconf->freq_band, get_max_channel_bw_channel(channel_freq, rconf->ht_mode), rconf->hw_mode);
 		if (m) {
 			blobmsg_add_string(&b, "htmode", m->ucihtmode);
 			blobmsg_add_string(&b, "hwmode", m->ucihwmode);

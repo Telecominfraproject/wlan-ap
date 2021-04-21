@@ -13,6 +13,7 @@ struct mode_map {
 	char *ucihwmode;
 	char *htmode;
 	char *ucihtmode;
+	int  sec_channel_offset;
 };
 
 extern struct mode_map *mode_map_get_uci(const char *band, const char *htmode, const char *hwmode);
@@ -38,4 +39,5 @@ extern int iface_is_up(const char *ifname);
 extern int net_get_mtu(char *iface);
 extern int net_get_mac(char *iface, char *mac);
 extern int net_is_bridge(char *iface);
+extern char* get_max_channel_bw_channel(int channel_freq, const char* htmode);
 #endif

@@ -94,6 +94,15 @@ radio_entry_t* rrm_get_radio_config(radio_type_t band)
 	}
 	return NULL;
 }
+void get_channel_bandwidth(const char* htmode, int *channel_bandwidth)
+{
+	if(!strcmp(htmode, "HT20"))
+		*channel_bandwidth=20;
+	else if (!strcmp(htmode, "HT40"))
+		*channel_bandwidth=40;
+	else if(!strcmp(htmode, "HT80"))
+		*channel_bandwidth=80;
+}
 
 void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 {
@@ -161,9 +170,19 @@ void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 					rrm_config->rrm_data.noise_lwm,
 					rrm_config->rrm_data.snr_percentage_drop,
 					nf_drop_threshold);
+			int channel_bandwidth;
+			int sec_chan_offset=0;
+			struct mode_map *m = mode_map_get_uci(radio->schema.freq_band, get_max_channel_bw_channel(ieee80211_channel_to_frequency(rrm_config->rrm_data.backup_channel),
+						radio->schema.ht_mode), radio->schema.hw_mode);
+			if (m) {
+				sec_chan_offset = m->sec_channel_offset;
+			} else
+				 LOGE("failed to get channel offset");
 
+			get_channel_bandwidth(get_max_channel_bw_channel(ieee80211_channel_to_frequency(rrm_config->rrm_data.backup_channel),
+					radio->schema.ht_mode), &channel_bandwidth);
 			ubus_set_channel_switch(radio->config.if_name,
-					ieee80211_channel_to_frequency(rrm_config->rrm_data.backup_channel));
+					ieee80211_channel_to_frequency(rrm_config->rrm_data.backup_channel), channel_bandwidth, sec_chan_offset);
 		}
 	}
 }
