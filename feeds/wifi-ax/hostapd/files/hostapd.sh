@@ -319,6 +319,7 @@ hostapd_common_add_bss_config() {
 	config_add_array airtime_sta_weight
 	config_add_int airtime_bss_weight airtime_bss_limit
 	config_add_int rts_threshold
+	config_add_boolean multicast_to_unicast proxy_arp
 }
 
 hostapd_set_vlan_file() {
@@ -485,7 +486,8 @@ hostapd_set_bss_options() {
 		bss_load_update_period chan_util_avg_period sae_require_mfp \
 		multi_ap multi_ap_backhaul_ssid multi_ap_backhaul_key \
 		airtime_bss_weight airtime_bss_limit airtime_sta_weight \
-		rssi_reject_assoc_rssi rssi_ignore_probe_request rts_threshold 
+		rssi_reject_assoc_rssi rssi_ignore_probe_request rts_threshold \
+		proxy_arp multicast_to_unicast
 
 	set_default isolate 0
 	set_default maxassoc 0
@@ -508,7 +510,8 @@ hostapd_set_bss_options() {
 	set_default rssi_reject_assoc_rssi 0
 	set_default rssi_ignore_probe_request 0
 	set_default rts_threshold -1
-
+	set_default proxy_arp 0
+	set_default multicast_to_unicast 0
 	append bss_conf "ctrl_interface=/var/run/hostapd"
 	if [ "$isolate" -gt 0 ]; then
 		append bss_conf "ap_isolate=$isolate" "$N"
@@ -536,6 +539,9 @@ hostapd_set_bss_options() {
 	append bss_conf "rssi_reject_assoc_rssi=$rssi_reject_assoc_rssi" "$N"
 	append bss_conf "rssi_ignore_probe_request=$rssi_ignore_probe_request" "$N"
 	append bss_conf "rts_threshold=$rts_threshold" "$N"
+
+	[ -n "$proxy_arp" ] && append bss_conf "proxy_arp=$proxy_arp" "$N"
+	[ -n "$multicast_to_unicast" ] && append bss_conf "multicast_to_unicast=$multicast_to_unicast" "$N"
 
 	[ "$tdls_prohibit" -gt 0 ] && append bss_conf "tdls_prohibit=$tdls_prohibit" "$N"
 
