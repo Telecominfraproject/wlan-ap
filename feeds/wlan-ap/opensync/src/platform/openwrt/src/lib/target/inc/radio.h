@@ -21,4 +21,6 @@ extern int hapd_rrm_set_neighbors(char *name, struct rrm_neighbor *neigh, int co
 
 extern void radio_maverick(void *arg);
 
+int nl80211_channel_get(char *name, unsigned int *chan);
+
 #endif

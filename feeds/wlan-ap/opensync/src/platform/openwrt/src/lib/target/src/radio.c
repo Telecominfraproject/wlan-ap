@@ -191,7 +191,7 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 	struct schema_Wifi_Radio_State  rstate;
 	char phy[6];
 	int antenna;
-	int32_t chan;
+	uint32_t chan = 0;
 
 	LOGT("%s: get state", s->e.name);
 
@@ -216,7 +216,7 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 	}
 
 	if (tb[WDEV_ATTR_CHANNEL]) {
-		chan = get_current_channel(phy);
+		nl80211_channel_get(phy, &chan);
 		if(chan)
 			SCHEMA_SET_INT(rstate.channel, chan);
 		else
