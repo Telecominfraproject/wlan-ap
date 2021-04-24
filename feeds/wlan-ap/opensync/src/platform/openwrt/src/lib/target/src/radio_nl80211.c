@@ -430,15 +430,55 @@ static void nl80211_del_phy(struct nlattr **tb, char *name)
 	free(phy);
 }
 
-static void nl80211_update_current_channel(struct nlattr **tb, char *name, int freq)
+static int nl80211_channel_recv(struct nl_msg *msg, void *arg)
 {
+	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+	struct nlattr *tb[NL80211_ATTR_MAX + 1];
+	unsigned int *chan = (unsigned int *)arg;
+
+	memset(tb, 0, sizeof(tb));
+	nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
+		  genlmsg_attrlen(gnlh, 0), NULL);
+
+	if (tb[NL80211_ATTR_WIPHY_FREQ]) {
+		*chan = ieee80211_frequency_to_channel(nla_get_u32(tb[NL80211_ATTR_WIPHY_FREQ]));
+	}
+
+	return NL_OK;
+}
+
+int nl80211_channel_get(char *name, unsigned int *chan)
+{
+	struct nl_msg *msg;
 	struct wifi_phy *phy;
+	struct wifi_iface *wif=NULL;
+	int idx = 0;
 
 	phy = avl_find_element(&phy_tree, name, phy, avl);
 	if (!phy)
-		return;
+		return -1;
 
-	phy->current_channel = ieee80211_frequency_to_channel(freq);
+	if (list_empty(&phy->wifs))
+		return -1;
+
+	wif = list_first_entry(&phy->wifs, struct wifi_iface, phy);
+
+	if (!wif)
+		return -1;
+
+	idx = if_nametoindex(wif->name);
+
+	if (!idx)
+		return -1;
+
+	msg = unl_genl_msg(&unl, NL80211_CMD_GET_INTERFACE, true);
+	nla_put_u32(msg, NL80211_ATTR_IFINDEX, idx);
+
+	unl_genl_request(&unl, msg, nl80211_channel_recv, chan);
+
+	phy->current_channel = *chan;
+
+	return NL_OK;
 }
 
 static int nl80211_recv(struct nl_msg *msg, void *arg)
@@ -449,7 +489,6 @@ static int nl80211_recv(struct nl_msg *msg, void *arg)
 	char *pif_name=NULL;
 	char phyname[IFNAMSIZ] = {};
 	int ifidx = -1, phy = -1;
-	int freq = 0;
 	memset(tb, 0, sizeof(tb));
 
 	nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
@@ -465,16 +504,11 @@ static int nl80211_recv(struct nl_msg *msg, void *arg)
 
 	if (tb[NL80211_ATTR_WIPHY]) {
 		phy = nla_get_u32(tb[NL80211_ATTR_WIPHY]);
-		if (tb[NL80211_ATTR_WIPHY_NAME])
-			strncpy(phyname, nla_get_string(tb[NL80211_ATTR_WIPHY_NAME]), IFNAMSIZ);
-		else
-			snprintf(phyname, sizeof(phyname), "phy%d", phy);
-	}
-
-	if(tb[NL80211_ATTR_WIPHY_FREQ]) {
-		freq = nla_get_u32(tb[NL80211_ATTR_WIPHY_FREQ]);
 		snprintf(phyname, sizeof(phyname), "phy%d", phy);
-		nl80211_update_current_channel(tb, phyname, freq);
+	} else if (tb[NL80211_ATTR_WIPHY_NAME]) {
+			strncpy(phyname, nla_get_string(tb[NL80211_ATTR_WIPHY_NAME]), IFNAMSIZ);
+	} else if (sscanf(ifname, "wlan%d", &phy)) {
+			snprintf(phyname, sizeof(phyname), "phy%d", phy);
 	}
 
 	switch (gnlh->cmd) {
