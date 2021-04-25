@@ -463,6 +463,19 @@ dpp_event_record_alloc()
 	return record;
 }
 
+static inline dpp_event_channel_switch_t *
+dpp_event_channel_switch_alloc()
+{
+	dpp_event_channel_switch_t *record = NULL;
+
+	record = calloc(1, sizeof(dpp_event_channel_switch_t));
+	if (record) {
+		memset(record, 0, sizeof(dpp_event_channel_switch_t));
+	}
+	return record;
+}
+
+
 static inline void
 dpp_event_channel_record_free(dpp_event_channel_switch_t *record)
 {

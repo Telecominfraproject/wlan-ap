@@ -105,7 +105,6 @@ static void sm_events_report_clear_client(ds_dlist_t *report_list)
 static void sm_events_report_clear_channel(ds_dlist_t *report_list)
 {
 	if (!ds_dlist_is_empty(report_list)) {
-
 		dpp_event_channel_switch_t      *record = NULL;
 		ds_dlist_iter_t                 record_iter;
 
@@ -129,6 +128,8 @@ static void sm_events_report(EV_P_ ev_timer *w, int revents)
 	/* Event Record */
 	dpp_event_record_t *dpp_record = NULL;
 	dpp_event_record_t *sm_record = NULL;
+	dpp_event_channel_switch_t *dpp_record_cs = NULL;
+	dpp_event_channel_switch_t *sm_record_cs = NULL;
 	ds_dlist_iter_t record_iter;
 
 	dpp_events_report_timer_restart(report_timer);
@@ -153,8 +154,23 @@ static void sm_events_report(EV_P_ ev_timer *w, int revents)
 		ds_dlist_insert_tail(&report_ctx->client_event_list, dpp_record);
 	}
 
-	if(!ds_dlist_is_empty(&g_event_report.channel_switch_list))
-		report_ctx->channel_switch_list = g_event_report.channel_switch_list;
+	for (sm_record_cs = ds_dlist_ifirst(&record_iter, &g_event_report.channel_switch_list); sm_record_cs != NULL; sm_record_cs = ds_dlist_inext(&record_iter)) {
+		dpp_record_cs = dpp_event_channel_switch_alloc();
+
+		dpp_record_cs->channel_event.band = sm_record_cs->channel_event.band;
+		dpp_record_cs->channel_event.reason =  sm_record_cs->channel_event.reason;
+		dpp_record_cs->channel_event.freq =  sm_record_cs->channel_event.freq;
+		dpp_record_cs->channel_event.timestamp =  sm_record_cs->channel_event.timestamp;
+
+		ds_dlist_iremove(&record_iter);
+		dpp_event_channel_record_free(sm_record_cs);
+		sm_record_cs = NULL;
+
+		if (ds_dlist_is_empty(&report_ctx->channel_switch_list)) {
+			ds_dlist_init(&report_ctx->channel_switch_list, dpp_event_channel_switch_t, node);
+		}
+		ds_dlist_insert_tail(&report_ctx->channel_switch_list, dpp_record_cs);
+	}
 
 	if (!ds_dlist_is_empty(&report_ctx->client_event_list) || !ds_dlist_is_empty(&report_ctx->channel_switch_list)) {
 		LOG(DEBUG, "Sending events report...");
