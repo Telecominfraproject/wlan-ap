@@ -73,7 +73,7 @@ int ubus_set_channel_switch(const char *if_name, uint32_t frequency, int channel
 	}
 
 	blobmsg_add_u32(&b, "freq", frequency);
-	blobmsg_add_u32(&b, "bcn_count", 1);
+	blobmsg_add_u32(&b, "bcn_count", 5);
 	blobmsg_add_u32(&b, "bandwidth", channel_bandwidth);
 	blobmsg_add_u32(&b, "sec_channel_offset", sec_chan_offset);
 	return ubus_invoke(ubus, id, "switch_chan", b.head, NULL, NULL, 1000);

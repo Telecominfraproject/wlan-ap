@@ -163,7 +163,7 @@ void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 
 		if (nf > nf_drop_threshold)
 		{
-			LOGD("[%s] backup=%d nf=%d nf_lwm=%d drop=%d thresh=%d",
+			LOGI("Interference detected on [%s], switching to backup_channel=%d nf=%d nf_lwm=%d drop=%d thresh=%d",
 					radio->config.if_name,
 					rrm_config->rrm_data.backup_channel,
 					nf,
