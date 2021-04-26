@@ -9,7 +9,7 @@ PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_SOURCE_URL=https://github.com/blogic/udhcpsnoop.git
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2021-04-12
-PKG_SOURCE_VERSION:=9d4b428d96513c5b45f80d5d73ae378e074c9a9b
+PKG_SOURCE_VERSION:=85ee2f9dbc08482bde88ca1a8afbc50e9ccb99db
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
