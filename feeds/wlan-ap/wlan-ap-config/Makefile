@@ -35,6 +35,8 @@ Build/Compile = $(Build/Compile/Default)
 
 define Package/wlan-ap-config/install
 	$(CP) ./files/* $(1)
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/etc/init.d/fw_version_config $(1)/etc/init.d/fw_version_config
 	$(SED) "s/CLOUD_IP=/CLOUD_IP=$(CONFIG_WLAN_AP_CLOUD_IP)/g" $(1)/etc/uci-defaults/99-tip-cloud-ip
 endef
 

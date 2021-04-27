@@ -290,6 +290,9 @@ static void cb_osp_start_factory_reboot(EV_P_ ev_timer *w, int events)
 
 	if (!strcmp(upg_url, "reboot"))
 		system("reboot");
+	else if (!strcmp(upg_url, "switch")) {
+		system("/bin/switch-bank");
+	}
 	else
 		system("jffs2reset -y -r");
 
@@ -400,7 +403,8 @@ bool osp_upg_dl(char *url, uint32_t timeout, osp_upg_cb dl_cb)
 		return false;
 	}
 
-	if (!strcmp(url, "reboot") || !strcmp(url, "factory")) {
+	if (!strcmp(url, "reboot") || !strcmp(url, "factory") ||
+				      !strcmp(url, "switch")) {
 		dl_cb(OSP_UPG_DL, OSP_UPG_OK, 100);
 		return true;
 	}
@@ -447,7 +451,8 @@ bool osp_upg_upgrade(char *password, osp_upg_cb upg_cb)
 		upg_data->upg_password = strdup(password);
 	}
 
-	if (!strcmp(upg_url, "factory") || !strcmp(upg_url, "reboot"))
+	if (!strcmp(upg_url, "factory") || !strcmp(upg_url, "reboot") ||
+					   !strcmp(upg_url, "switch"))
 		ev_timer_init(&osp_utimer, cb_osp_start_factory_reboot, 0, 0);
 	else
 		ev_timer_init(&osp_utimer, cb_osp_start_upgrade, 0, 0);
