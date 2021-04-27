@@ -47,8 +47,10 @@ enum {
 
 enum {
 	RADIUS_PROXY_SERVER_NAME,
+	RADIUS_PROXY_SERVER_HOST,
 	RADIUS_PROXY_SERVER_TYPE,
 	RADIUS_PROXY_SERVER_SECRET,
+	RADIUS_PROXY_SERVER_PORT,
 	RADIUS_PROXY_SERVER_STATUS,
 	RADIUS_PROXY_SERVER_TLS,
 	RADIUS_PROXY_SERVER_CERT_NAME_CHECK,
@@ -92,8 +94,10 @@ static const struct blobmsg_policy radius_proxy_tls_policy[__RADIUS_PROXY_TLS_MA
 
 static const struct blobmsg_policy radius_proxy_server_policy[__RADIUS_PROXY_SERVER_MAX] = {
 		[RADIUS_PROXY_SERVER_NAME] = { .name = "name", BLOBMSG_TYPE_STRING },
+		[RADIUS_PROXY_SERVER_HOST] = { .name = "host", BLOBMSG_TYPE_STRING },
 		[RADIUS_PROXY_SERVER_TYPE] = { .name = "type", BLOBMSG_TYPE_STRING },
 		[RADIUS_PROXY_SERVER_SECRET] = { .name = "secret", BLOBMSG_TYPE_STRING },
+		[RADIUS_PROXY_SERVER_PORT] = { .name = "port", BLOBMSG_TYPE_INT32 },
 		[RADIUS_PROXY_SERVER_STATUS] = { .name = "statusServer", BLOBMSG_TYPE_BOOL },
 		[RADIUS_PROXY_SERVER_TLS] = { .name = "tls", BLOBMSG_TYPE_STRING },
 		[RADIUS_PROXY_SERVER_CERT_NAME_CHECK] = { .name = "certificateNameCheck", BLOBMSG_TYPE_BOOL },
@@ -210,6 +214,8 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf )
 	int i=0;
 	char path[200];
 	char name[256];
+	char server_name[256] = {};
+	char acct_server_name[256] = {};
 	struct schema_APC_State apc_conf;
 
 	/* Configure only if APC selects this as master AP (DR) */
@@ -245,6 +251,8 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf )
 			uci_buf.head, &radius_proxy_client_param, NULL);
 
 	/* Configure TLS/non-TLS and server blocks */
+	sprintf(server_name, "%s%s", conf->radius_config_name, "server");
+	sprintf(acct_server_name, "%s%s", conf->radius_config_name, "Acctserver");
 	if (conf->radsec)
 	{
 		blob_buf_init(&uci_buf, 0);
@@ -284,25 +292,41 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf )
 		blobmsg_add_string(&uci_buf, "name", conf->server);
 		blobmsg_add_string(&uci_buf, "type", "tls");
 		blobmsg_add_string(&uci_buf, "tls", conf->server);
+		blobmsg_add_u32(&uci_buf, "port", conf->port);
 		blobmsg_add_string(&uci_buf, "secret", "radsec");
 		blobmsg_add_bool(&uci_buf, "statusServer", 0);
 		blobmsg_add_bool(&uci_buf, "certificateNameCheck", 0);
-		memset(name, '\0', sizeof(name));
-		sprintf(name, "%s%s", conf->radius_config_name, "server");
-		blob_to_uci_section(uci, "radsecproxy", name, "server",
+		blob_to_uci_section(uci, "radsecproxy", server_name, "server",
 				uci_buf.head, &radius_proxy_server_param, NULL);
 	}
 	else /* non-TLS block */
 	{
+		/* Authentication server */
 		blob_buf_init(&uci_buf, 0);
-		blobmsg_add_string(&uci_buf, "name", conf->server);
+		blobmsg_add_string(&uci_buf, "name", server_name);
+		blobmsg_add_string(&uci_buf, "host", conf->server);
 		blobmsg_add_string(&uci_buf, "type", "udp");
 		if (strlen(conf->secret) > 0)
 			blobmsg_add_string(&uci_buf, "secret", conf->secret);
-		memset(name, '\0', sizeof(name));
-		sprintf(name, "%s%s", conf->radius_config_name, "server");
-		blob_to_uci_section(uci, "radsecproxy", name, "server",
+		if (conf->port > 0)
+			blobmsg_add_u32(&uci_buf, "port", conf->port);
+		blob_to_uci_section(uci, "radsecproxy", server_name, "server",
 				uci_buf.head, &radius_proxy_server_param, NULL);
+
+		/* Accounting server */
+		if (strlen(conf->acct_server) > 0)
+		{
+			blob_buf_init(&uci_buf, 0);
+			blobmsg_add_string(&uci_buf, "name", acct_server_name);
+			blobmsg_add_string(&uci_buf, "host", conf->acct_server);
+			blobmsg_add_string(&uci_buf, "type", "udp");
+			if (strlen(conf->secret) > 0)
+				blobmsg_add_string(&uci_buf, "secret", conf->acct_secret);
+			if (conf->acct_port > 0)
+				blobmsg_add_u32(&uci_buf, "port", conf->acct_port);
+			blob_to_uci_section(uci, "radsecproxy", acct_server_name, "server",
+								uci_buf.head, &radius_proxy_server_param, NULL);
+		}
 	}
 
 	/* Configure realm block */
@@ -311,11 +335,20 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf )
 		blob_buf_init(&uci_buf, 0);
 		blobmsg_add_string(&uci_buf, "name", conf->realm[i]);
 		n = blobmsg_open_array(&uci_buf,"server");
-		blobmsg_add_string(&uci_buf, NULL, conf->server);
+		blobmsg_add_string(&uci_buf, NULL, server_name);
 		blobmsg_close_array(&uci_buf, n);
-		n = blobmsg_open_array(&uci_buf,"accountingServer");
-		blobmsg_add_string(&uci_buf, NULL, conf->server);
-		blobmsg_close_array(&uci_buf, n);
+		if (conf->radsec)
+		{ /* Accounting server same as auth server */
+			n = blobmsg_open_array(&uci_buf, "accountingServer");
+			blobmsg_add_string(&uci_buf, NULL, server_name);
+			blobmsg_close_array(&uci_buf, n);
+		}
+		else if (strlen(conf->acct_server) > 0)
+		{ /* non-TLS case where accounting server is configured */
+			n = blobmsg_open_array(&uci_buf, "accountingServer");
+			blobmsg_add_string(&uci_buf, NULL, acct_server_name);
+			blobmsg_close_array(&uci_buf, n);
+		}
 		memset(name, '\0', sizeof(name));
 		sprintf(name, "%s%s%d", conf->radius_config_name, "realm", i);
 		blob_to_uci_section(uci, "radsecproxy", name, "realm",
