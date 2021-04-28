@@ -41,4 +41,6 @@ extern int net_get_mtu(char *iface);
 extern int net_get_mac(char *iface, char *mac);
 extern int net_is_bridge(char *iface);
 extern char* get_max_channel_bw_channel(int channel_freq, const char* htmode);
+extern double dBm_to_mwatts(double dBm);
+extern double mWatts_to_dBm(double mW);
 #endif

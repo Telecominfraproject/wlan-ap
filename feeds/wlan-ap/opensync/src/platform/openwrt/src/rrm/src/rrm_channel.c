@@ -9,8 +9,6 @@
 #include "uci.h"
 #include "utils.h"
 
-#define RRM_CHANNEL_INTERVAL     15.0
-
 struct blob_buf b = { };
 struct blob_buf del = { };
 struct uci_context *uci;
@@ -103,6 +101,56 @@ void get_channel_bandwidth(const char* htmode, int *channel_bandwidth)
 	else if(!strcmp(htmode, "HT80"))
 		*channel_bandwidth=80;
 }
+/*
+ * A simple average is calculated against the Noise floor samples.
+ * - Returns a zero, if there are not enough samples in the list.
+ * - Or, returns a calculated avg of the noise samples.
+ * - A circular buffer is considered for storing the samples. New elements replace the
+ * old ones in this buffer.
+ * - The number of samples required is an integer value calculated based on the
+ * configuration time and the sample time.
+ * Example: If the config_time is 120 sec, and sample time is 15 sec, then number of
+ * samples required for averaging is 120/15 = 8 samples.
+ */
+int rrm_calculate_avg_noise_floor(rrm_entry_t *rrm_data, int nf, int config_time, int sample_time)
+{
+	int ii;
+	double avg_mW = 0;
+	int num_samples = config_time/sample_time;
+
+	if (num_samples >= RRM_MAX_NF_SAMPLES)
+		num_samples = RRM_MAX_NF_SAMPLES;
+
+	/* Replace the oldest element in the list with the new element */
+	rrm_data->rrm_chan_nf_samples[rrm_data->rrm_chan_nf_next_el] = nf;
+
+	/* Update the index to the oldest element index taking care of the boundary */
+	rrm_data->rrm_chan_nf_next_el = (rrm_data->rrm_chan_nf_next_el+1)%num_samples;
+
+	if (rrm_data->rrm_chan_nf_num_el < num_samples)
+	{
+		rrm_data->rrm_chan_nf_num_el++;
+		return 0;
+	}
+
+	/*
+	 * Convert dBm to milliWatts, calculate average,
+	 * convert the averaged milliWats back to dBm
+	 */
+	for (ii = 0; ii < num_samples; ii++)
+	{
+		avg_mW += dBm_to_mwatts(rrm_data->rrm_chan_nf_samples[ii]);
+	}
+	avg_mW = avg_mW/num_samples;
+
+	return ((int)(mWatts_to_dBm(avg_mW)));
+}
+
+void rrm_reset_noise_floor_samples(rrm_entry_t *rrm_data)
+{
+	rrm_data->rrm_chan_nf_next_el = 0;
+	rrm_data->rrm_chan_nf_num_el = 0;
+}
 
 void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 {
@@ -113,7 +161,6 @@ void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 	rrm_radio_state_t       *radio = NULL;
 	uint32_t                 noise;
 	int32_t                  nf;
-	int32_t                  nf_drop_threshold;
 	rrm_config_t             *rrm_config;
 
 	ds_tree_t *radio_list = rrm_get_radio_list();
@@ -122,14 +169,13 @@ void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 	{
 		noise = 0;
 		rrm_config = NULL;
-		nf_drop_threshold = 0;
 
 		if (ubus_get_noise(radio->config.if_name, &noise))
 			continue;
 
 		nf = (int32_t)noise;
 
-		if (nf > -1 || nf < -120)
+		if ((nf > -10) || (nf < -120))
 			continue;
 
 		rrm_config = rrm_get_rrm_config(radio->config.type);
@@ -137,43 +183,38 @@ void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 		if (rrm_config == NULL)
 			continue;
 
-		if (nf < rrm_config->rrm_data.noise_lwm )
-		{
-			rrm_config->rrm_data.noise_lwm = nf;
-			LOGD("[%s] noise_lwm set to %d", radio->config.if_name, nf);
-			continue;
-		}
-
-		if (rrm_config->rrm_data.snr_percentage_drop == 0)
-			continue;
-
 		if (rrm_config->rrm_data.backup_channel == 0)
 			continue;
 
-		nf_drop_threshold = ((int32_t)(100 - rrm_config->rrm_data.snr_percentage_drop) *
-				rrm_config->rrm_data.noise_lwm) / 100;
+		if (rrm_config->rrm_data.noise_floor_thresh == 0)
+			continue;
 
-		LOGD("[%s] backup=%d nf=%d nf_lwm=%d drop=%d thresh=%d",
+		if (rrm_config->rrm_data.noise_floor_time == 0)
+			continue;
+
+		LOGD("[%s] backup=%d nf=%d nf_thresh=%d",
 				radio->config.if_name,
 				rrm_config->rrm_data.backup_channel,
 				nf,
-				rrm_config->rrm_data.noise_lwm,
-				rrm_config->rrm_data.snr_percentage_drop,
-				nf_drop_threshold);
+				rrm_config->rrm_data.noise_floor_thresh);
 
-		if (nf > nf_drop_threshold)
+		rrm_config->rrm_data.avg_nf = rrm_calculate_avg_noise_floor(&(rrm_config->rrm_data), 
+			nf, rrm_config->rrm_data.noise_floor_time, RRM_CHANNEL_INTERVAL);
+
+		if (rrm_config->rrm_data.avg_nf &&
+			(rrm_config->rrm_data.avg_nf > rrm_config->rrm_data.noise_floor_thresh))
 		{
-			LOGI("Interference detected on [%s], switching to backup_channel=%d nf=%d nf_lwm=%d drop=%d thresh=%d",
+			LOGI("Interference detected on [%s],"
+				" switching to backup_channel=%d avg_nf=%d nfthresh=%d",
 					radio->config.if_name,
 					rrm_config->rrm_data.backup_channel,
-					nf,
-					rrm_config->rrm_data.noise_lwm,
-					rrm_config->rrm_data.snr_percentage_drop,
-					nf_drop_threshold);
+					rrm_config->rrm_data.avg_nf,
+					rrm_config->rrm_data.noise_floor_thresh);
 			int channel_bandwidth;
 			int sec_chan_offset=0;
-			struct mode_map *m = mode_map_get_uci(radio->schema.freq_band, get_max_channel_bw_channel(ieee80211_channel_to_frequency(rrm_config->rrm_data.backup_channel),
-						radio->schema.ht_mode), radio->schema.hw_mode);
+			struct mode_map *m = mode_map_get_uci(radio->schema.freq_band,
+					get_max_channel_bw_channel(ieee80211_channel_to_frequency(rrm_config->rrm_data.backup_channel),
+					radio->schema.ht_mode), radio->schema.hw_mode);
 			if (m) {
 				sec_chan_offset = m->sec_channel_offset;
 			} else
@@ -183,6 +224,8 @@ void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 					radio->schema.ht_mode), &channel_bandwidth);
 			ubus_set_channel_switch(radio->config.if_name,
 					ieee80211_channel_to_frequency(rrm_config->rrm_data.backup_channel), channel_bandwidth, sec_chan_offset);
+
+			rrm_reset_noise_floor_samples(&(rrm_config->rrm_data));
 		}
 	}
 }

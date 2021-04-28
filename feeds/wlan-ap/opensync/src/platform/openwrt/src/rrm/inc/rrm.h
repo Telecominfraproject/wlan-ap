@@ -48,6 +48,12 @@ typedef struct
 	ds_tree_node_t                  node;
 } rrm_vif_state_t;
 
+#define RRM_CHANNEL_INTERVAL     15
+
+#define RRM_MAX_NF_SAMPLES 100
+#define RRM_OBSS_HOP_MODE_NON_WIFI		1
+#define RRM_OBSS_HOP_MODE_NON_WIFI_AND_OBSS	2
+
 typedef struct
 {
 	// Cached data
@@ -59,9 +65,17 @@ typedef struct
 	uint32_t min_load;
 	uint32_t beacon_rate;
 	uint32_t mcast_rate;
+	int32_t noise_floor_thresh;
+	uint32_t noise_floor_time;
+	int32_t non_wifi_thresh;
+	uint32_t non_wifi_time;
+	uint32_t obss_hop_mode;
 
 	// Internal state data
-	int32_t noise_lwm;
+	int32_t avg_nf;
+	int32_t rrm_chan_nf_samples[RRM_MAX_NF_SAMPLES];
+	int32_t rrm_chan_nf_next_el;
+	int32_t rrm_chan_nf_num_el;
 } rrm_entry_t;
 
 typedef struct
@@ -80,5 +94,6 @@ void set_rrm_parameters(rrm_entry_t *rrm_data);
 ds_tree_t* rrm_get_rrm_config_list(void);
 ds_tree_t* rrm_get_radio_list(void);
 ds_tree_t* rrm_get_vif_list(void);
+void rrm_reset_noise_floor_samples(rrm_entry_t *rrm_data);
 
 #endif /* RRM_H_INCLUDED */

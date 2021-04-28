@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 
 #include <string.h>
+#include <math.h>
 #include <glob.h>
 #include <libgen.h>
 #include <fcntl.h>
@@ -681,3 +682,14 @@ bool vif_get_key_for_key_distr(const char *secret, char *key_str)
 	fclose(fp);
 	return err;
 }
+
+double dBm_to_mwatts(double dBm)
+{
+	return (pow(10,(dBm/10)));
+}
+
+double mWatts_to_dBm(double mW)
+{
+	return (10*log10(mW));
+}
+
