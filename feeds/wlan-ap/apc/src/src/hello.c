@@ -103,6 +103,7 @@ void apc_send_hello(struct apc_iface * ifa, int kind )
 	struct apc_hello2_packet ps;
 	unsigned int length, report = 0;
 	struct apc_spec ApcSpec;
+	char dst_ip[16];
 	
 	if (WaitingToReelect )
 		return;
@@ -202,8 +203,7 @@ void apc_send_hello(struct apc_iface * ifa, int kind )
 
 	length += i * sizeof(u32);
 
-	printf("HELLO packet sent via %s\n", ifa->ifname );
-	char *dst_ip = malloc(16);
+	printf("HELLO packet sent via  %s\n", ifa->ifname );
 	memset(dst_ip, 0, 16);
 	if ((get_current_ip(dst_ip, IAC_IFACE)) < 0) {
 		printf("Error: Cannot get IP for %s", IAC_IFACE);

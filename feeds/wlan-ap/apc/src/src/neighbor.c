@@ -36,7 +36,7 @@ reset_lists(struct apc_proto *p, struct apc_neighbor *n)
 struct apc_neighbor * apc_neighbor_new(struct apc_iface * ifa)
 {
 	struct apc_neighbor * n = mb_allocz(sizeof(struct apc_neighbor));
-	
+	printf("apc_new_neighbor\n");	
 	n->ifa = ifa;
 	add_tail(&ifa->neigh_list, NODE n);
 	n->adj = 0;
@@ -58,6 +58,8 @@ static void apc_neigh_down(struct apc_neighbor * n)
 	rem_node(NODE n);
 	
 	printf("Neighbor %x on %s removed", n->rid, ifa->ifname );
+	tm_free(n->inactim);
+	mb_free(n);
 }
 
 /**
