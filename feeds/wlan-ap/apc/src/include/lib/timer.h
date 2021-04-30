@@ -30,4 +30,9 @@ static inline timer * tm_new_set( void (*hook)(struct _timer *), void *data, uns
     return t;
 }
 
+static inline void tm_free(timer *t)
+{
+    free(t);
+}
+
 #endif

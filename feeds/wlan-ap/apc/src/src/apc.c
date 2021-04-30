@@ -26,7 +26,8 @@ static void apc_dump( struct proto * P )
 static struct proto * apc_init(struct proto_config * c)
 {
 	struct proto * P = mb_allocz(sizeof(struct apc_proto));
-	
+
+	printf("apc_init\n");
 	P->cf = c;
 	P->debug = c->debug;
 	P->mrtdump = c->mrtdump;

@@ -130,6 +130,7 @@ static int rx_msg(struct nl_msg *msg, void* arg)
 	struct nlattr *attr[GENL_UCC_ATTR_MAX+1];
 
 	struct voip_session *data;
+	char dst_ip[16];
 	genlmsg_parse(nlmsg_hdr(msg), 0, attr, 
 			GENL_UCC_ATTR_MAX, genl_ucc_policy);
 
@@ -140,7 +141,6 @@ static int rx_msg(struct nl_msg *msg, void* arg)
 		return NL_OK;
 	}
 
-	char *dst_ip = malloc(16);
 	memset(dst_ip, 0, 16);
 	if((get_current_ip(dst_ip, IAC_IFACE)) < 0) {
 		LOGI("Error: Cannot get IP for %s", IAC_IFACE);

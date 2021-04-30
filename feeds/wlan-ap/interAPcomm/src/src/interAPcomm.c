@@ -26,6 +26,7 @@ static void receive_data_uloop(struct uloop_fd *fd, unsigned int events)
 		printf("recvfrom() failed");
 
 	ra.cb(recv_data, recv_data_len);
+	free(recv_data);
 
 }
 
@@ -41,6 +42,7 @@ static void receive_data(struct ev_loop *ev, ev_io *io, int event)
 		printf("recvfrom() failed");
 
 	ra.cb(recv_data, recv_data_len);
+	free(recv_data);
 
 }
 
