@@ -94,6 +94,7 @@ enum {
 	WIF_ATTR_VENUE_URL,
 	WIF_ATTR_NETWORK_AUTH_TYPE,
 	WIF_ATTR_IPADDR_TYPE_AVAILABILITY,
+	WIF_ATTR_CONNECTION_CAPABILITY,
 	WIF_ATTR_DOMAIN_NAME,
 	WIF_ATTR_MCC_MNC,
 	WIF_ATTR_NAI_REALM,
@@ -189,7 +190,8 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_VENUE_TYPE] = { .name = "venue_type", BLOBMSG_TYPE_INT32 },
 	[WIF_ATTR_VENUE_URL] = { .name = "venue_url", BLOBMSG_TYPE_ARRAY },
 	[WIF_ATTR_NETWORK_AUTH_TYPE] = { .name = "network_auth_type", BLOBMSG_TYPE_STRING },
-	[WIF_ATTR_IPADDR_TYPE_AVAILABILITY] = { .name = "ipaddr_type_availability", BLOBMSG_TYPE_INT32 },
+	[WIF_ATTR_IPADDR_TYPE_AVAILABILITY] = { .name = "ipaddr_type_availability", BLOBMSG_TYPE_STRING },
+	[WIF_ATTR_CONNECTION_CAPABILITY] = { .name = "hs20_conn_capab", BLOBMSG_TYPE_ARRAY },
 	[WIF_ATTR_DOMAIN_NAME] = { .name = "domain_name", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_MCC_MNC] = { .name = "anqp_3gpp_cell_net", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_NAI_REALM] = { .name = "nai_realm", BLOBMSG_TYPE_ARRAY },
@@ -1162,6 +1164,7 @@ static void hs20_vif_config(struct blob_buf *b,
 	int i = 0;
 	unsigned int len = 0;
 	char domain_name[256];
+	char str[3] = {};
 
 	if (hs2conf->enable) {
 		blobmsg_add_bool(b, "interworking", 1);
@@ -1274,6 +1277,20 @@ static void hs20_vif_config(struct blob_buf *b,
 	if (strlen(hs2conf->wan_metrics))
 		blobmsg_add_string(b, "hs20_wan_metrics", hs2conf->wan_metrics);
 
+	len = strlen(hs2conf->ipaddr_type_availability);
+	if (len)
+	{
+		if (len == 1)
+		{
+			snprintf(str, sizeof(str), "0%s", hs2conf->ipaddr_type_availability);
+			blobmsg_add_string(b, "ipaddr_type_availability", str);
+		}
+		else
+		{
+			blobmsg_add_string(b, "ipaddr_type_availability", hs2conf->ipaddr_type_availability);
+		}
+	}
+
 	n = blobmsg_open_array(b, "hs20_oper_friendly_name");
 	for (i = 0; i < hs2conf->operator_friendly_name_len; i++)
 	{
@@ -1289,6 +1306,13 @@ static void hs20_vif_config(struct blob_buf *b,
 		blobmsg_add_u32(b, "venue_group", venue_group);
 		blobmsg_add_u32(b, "venue_type", venue_type);
 	}
+
+	n = blobmsg_open_array(b, "hs20_conn_capab");
+	for (i = 0; i < hs2conf->connection_capability_len; i++)
+	{
+		blobmsg_add_string(b, NULL, hs2conf->connection_capability[i]);
+	}
+	blobmsg_close_array(b, n);
 
 	if (hs2conf->operator_icons_len)
 	{
