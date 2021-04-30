@@ -295,9 +295,9 @@ hostapd_common_add_bss_config() {
 	config_add_string osu_ssid hs20_wan_metrics hs20_operating_class hs20_t_c_filename hs20_t_c_timestamp
 
 	config_add_boolean interworking internet
-	config_add_int access_network_type asra esr uesa venue_group venue_type ipaddr_type_availability \
+	config_add_int access_network_type asra esr uesa venue_group venue_type \
 		gas_address3
-	config_add_string hessid network_auth_type \
+	config_add_string hessid network_auth_type ipaddr_type_availability \
 		anqp_3gpp_cell_net anqp_elem domain_name qos_map_set hs20_t_c_server_url
 
 	config_add_int airtime_bss_weight airtime_bss_limit
@@ -881,7 +881,6 @@ hostapd_set_bss_options() {
 	set_default access_network_type 0
 	set_default venue_group 0
 	set_default venue_type 0
-	set_default ipaddr_type_availability 0
 	set_default gas_address3 0
 	set_default hs20_deauth_req_timeout 60
 	if [ "$hs20" = "1" ]; then
@@ -913,7 +912,7 @@ hostapd_set_bss_options() {
 		[ "$uesa" -gt 0 ] && append bss_conf "uesa=$uesa" "$N"
 		[ "$venue_group" -gt 0 ] && append bss_conf "venue_group=$venue_group" "$N"
 		[ "$venue_type" -gt 0 ] && append bss_conf "venue_type=$venue_type" "$N"
-		[ "$ipaddr_type_availability" -gt 0 ] && append bss_conf "ipaddr_type_availability=$ipaddr_type_availability" "$N"
+		[ -n "$ipaddr_type_availability" ] && append bss_conf "ipaddr_type_availability=$ipaddr_type_availability" "$N"
 		[ "$gas_address3" -gt 0 ] && append bss_conf "gas_address3=$gas_address3" "$N"
 		[ -n "$hessid" ] && append bss_conf "hessid=$hessid" "$N"
 		[ -n "$network_auth_type" ] && append bss_conf "network_auth_type=$network_auth_type" "$N"
