@@ -6,7 +6,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_URL=https://github.com/blogic/ucentral-tools.git
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2021-01-28
-PKG_SOURCE_VERSION:=f828db9248fe1f25a8065195083e81faaab3bd3e
+PKG_SOURCE_VERSION:=b013fc636e48d407870a46aaa68a09ed74de8d6f
 
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=BSD-3-Clause
@@ -24,6 +24,7 @@ endef
 define Package/ucentral-tools/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/{dhcpdiscover,dnsprobe,radiusprobe,ip-collide} $(1)/usr/sbin/
+	$(CP) ./files/* $(1)
 endef
 
 $(eval $(call BuildPackage,ucentral-tools))
