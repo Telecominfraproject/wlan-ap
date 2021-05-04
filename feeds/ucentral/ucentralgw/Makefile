@@ -6,7 +6,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL=git@github.com:Telecominfraproject/wlan-cloud-ucentralgw.git
 PKG_SOURCE_DATE:=2021-03-28
-PKG_SOURCE_VERSION:=4fe4a865b7ddf43991efec5fd3f21c34f89b7146
+PKG_SOURCE_VERSION:=a42e9608df8a465f9899cc23c5261a263a00b154
 CMAKE_INSTALL:=1
 
 PKG_LICENSE:=BSD-3-Clause
@@ -25,6 +25,11 @@ define Package/ucentralgw
   TITLE:= uCentral Gateway
 endef
 
+define Package/mdadm/conffiles
+/etc/ucentral/
+endef
+
+TARGET_CFLAGS += -I$(STAGING_DIR)/usr/include
 CMAKE_OPTIONS += \
 	-DSMALL_BUILD=1
 
