@@ -140,21 +140,31 @@ static bool radsec_download_cert(char *cert_name, char *dir_name, char *cert_url
 {
 	CURL *curl;
 	FILE *fp;
-	CURLcode res;
+	CURLcode curl_ret;
 	char path[200];
+	char dir_path[200];
 	char name[32];
 	char dir[32];
 	char *gw_clientcert = "/usr/opensync/certs/client.pem";
 	char *gw_clientkey = "/usr/opensync/certs/client_dec.key";
+	struct stat stat_buf;
 
 	strcpy(name, cert_name);
 	strcpy(dir, dir_name);
+	sprintf(dir_path, "/tmp/radsec/certs/%s", dir);
 	sprintf(path, "/tmp/radsec/certs/%s/%s", dir, name);
+
+	if (stat(dir_path, &stat_buf) == -1)
+	{
+		char cmd[200];
+		sprintf(cmd, "mkdir -p %s", dir_path);
+		system(cmd);
+	}
 
 	curl = curl_easy_init();
 	if (curl)
 	{
-		fp = fopen(path,"wb");
+		fp = fopen(path, "wb");
 
 		if (fp == NULL)
 		{
@@ -177,10 +187,19 @@ static bool radsec_download_cert(char *cert_name, char *dir_name, char *cert_url
 		curl_easy_setopt(curl, CURLOPT_URL, cert_url);
 		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, file_write);
 		curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-		res = curl_easy_perform(curl);
+		curl_ret = curl_easy_perform(curl);
+
+		if (curl_ret != CURLE_OK)
+		{
+			LOGE("radsec: certificate download failed %s", curl_easy_strerror(curl_ret));
+			curl_easy_cleanup(curl);
+			fclose(fp);
+			remove(path);
+			return false;
+		}
+
 		curl_easy_cleanup(curl);
 		fclose(fp);
-		return res;
 	}
 
 	return true;
