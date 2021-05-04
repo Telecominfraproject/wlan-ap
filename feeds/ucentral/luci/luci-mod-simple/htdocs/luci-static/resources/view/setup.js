@@ -26,6 +26,11 @@ var callSystemValidateFirmwareImage = rpc.declare({
 	reject: true
 });
 
+var callSystemBoard = rpc.declare({
+	object: 'system',
+	method: 'board'
+});
+
 function parseAddressAndNetmask(ipaddr, netmask) {
         var m = (ipaddr || '').match(/^(.+)\/(\d+)$/);
         if (m) {
@@ -125,12 +130,16 @@ function showProgress(text, ongoing) {
 	}
 }
 
+var formSystemBoard;
 
 return view.extend({
 	load: function() {
 		return Promise.all([
 			uci.load('network'),
-			uci.load('ucentral')
+			uci.load('ucentral'),
+			callSystemBoard().then(function(reply) {
+				formSystemBoard = reply;
+			})
 		]);
 	},
 
@@ -376,12 +385,18 @@ return view.extend({
 			uci.get('network', 'wan', 'dns'));
 
 		var formdata = {
+			information: {
+				serial: formSystemBoard.hostname,
+				model: formSystemBoard.model,
+				version: formSystemBoard.release["tip-version"],
+				revision: formSystemBoard.release["tip-revision"]
+			},
 			wan: {
 				proto: uci.get('network', 'wan', 'proto'),
 				addr: addr_wan ? addr_wan[0] : null,
 				mask: addr_wan ? addr_wan[1] : null,
-				gateway: addr_wan ? addr_wan[1] : null,
-				dns: addr_wan ? addr_wan[1] : null
+				gateway: addr_wan ? addr_wan[2] : null,
+				dns: addr_wan ? addr_wan[3] : null
 			},
 			maintenance: {},
 			certificates: {redirector: null}
@@ -390,9 +405,19 @@ return view.extend({
 		m = new form.JSONMap(formdata, _('Setup'));
 		m.tabbed = true;
 
+		s = m.section(form.NamedSection, "information", 'information', _('Information'));
+		o = s.option(form.Value, 'serial', _('Serial'));
+		o.readonly = true;
+		o = s.option(form.Value, 'model', _('Model'));
+		o.readonly = true;
+		o = s.option(form.Value, 'version', _('Release'));
+		o.readonly = true;
+		o = s.option(form.Value, 'revision', _('Revision'));
+		o.readonly = true;
+
 		s = m.section(form.NamedSection, 'wan', 'wan', _('Connectivity'));
 
-		o = s.option(cbiRichListValue, 'proto');
+		o = s.option(cbiRichListValue, 'proto', "Protocol");
 		o.value('dhcp', E('div', { 'style': 'white-space:normal' }, [
 			E('strong', [ _('Automatic address configuration (DHCP)') ]), E('br'),
 			E('span', { 'class': 'hide-open' })
