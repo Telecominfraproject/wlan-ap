@@ -13,7 +13,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL=https://github.com/jow-/ucode.git
 PKG_SOURCE_DATE:=2021-03-15
-PKG_SOURCE_VERSION:=f360350bd874aeec0806c8df02c7a20a54c44406
+PKG_SOURCE_VERSION:=02629b84de23bdc5896ac4b357e2f16dfb3996ec
 PKG_MIRROR_HASH:=
 PKG_MAINTAINER:=Jo-Philipp Wich <jo@mein.io>
 PKG_LICENSE:=ISC
@@ -25,6 +25,8 @@ PKG_CONFIG_DEPENDS:= CONFIG_ucode_lua
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
 include $(INCLUDE_DIR)/version.mk
+
+CMAKE_OPTIONS+=-DFS_SUPPORT=1 -DMATH_SUPPORT=1 -DUBUS_SUPPORT=1 -DUCI_SUPPORT=1
 
 define Package/ucode/default
   SECTION:=utils
@@ -90,27 +92,27 @@ endef
 
 define Package/ucode/install
 	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ucode $(1)/usr/bin/ucode
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ipkg-install/usr/bin/ucode $(1)/usr/bin/ucode
 endef
 
 define Package/ucode-mod-fs/install
 	$(INSTALL_DIR) $(1)/usr/lib/ucode
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/lib/fs.so $(1)/usr/lib/ucode/
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ipkg-install/usr/lib/ucode/fs.so $(1)/usr/lib/ucode/
 endef
 
 define Package/ucode-mod-math/install
 	$(INSTALL_DIR) $(1)/usr/lib/ucode
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/lib/math.so $(1)/usr/lib/ucode/
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ipkg-install/usr/lib/ucode/math.so $(1)/usr/lib/ucode/
 endef
 
 define Package/ucode-mod-ubus/install
 	$(INSTALL_DIR) $(1)/usr/lib/ucode
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/lib/ubus.so $(1)/usr/lib/ucode/
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ipkg-install/usr/lib/ucode/ubus.so $(1)/usr/lib/ucode/
 endef
 
 define Package/ucode-mod-uci/install
 	$(INSTALL_DIR) $(1)/usr/lib/ucode
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/lib/uci.so $(1)/usr/lib/ucode/
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ipkg-install/usr/lib/ucode/uci.so $(1)/usr/lib/ucode/
 endef
 
 
