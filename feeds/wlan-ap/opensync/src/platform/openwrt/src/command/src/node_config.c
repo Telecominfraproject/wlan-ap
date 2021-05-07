@@ -88,9 +88,14 @@ static void syslog_state(int config)
 	struct uci_element *e = NULL;
 	struct uci_section *s = NULL;
 	char val[128];
+	int ret = 0;
 
 	blob_buf_init(&b, 0);
-	uci_load(uci, "system", &system);
+	ret = uci_load(uci, "system", &system);
+	if (ret) {
+		LOGE("%s: uci_load() failed with rc %d", __func__, ret);
+		return;
+	}
 	uci_foreach_element(&system->sections, e) {
 		s = uci_to_section(e);
 		if (!strcmp(s->type, "system"))
@@ -179,14 +184,20 @@ static void ntp_state(int config)
         struct uci_section *s;
 	struct blob_attr *cur = NULL;
 	char val[128] = {};
-	int first = 1, rem = 0;
+	int first = 1, rem = 0, ret = 0;
 
 	blob_buf_init(&b, 0);
-	uci_load(uci, "system", &p);
+	ret = uci_load(uci, "system", &p);
+	if (ret) {
+		LOGE("%s: uci_load() failed with rc %d", __func__, ret);
+		return;
+	}
 
 	s = uci_lookup_section(uci, p, "ntp");
-	if (!s)
+	if (!s) {
+		uci_unload(uci, p);
 		return;
+	}
 
 	uci_to_blob(&b, s, &ntp_param);
 	blobmsg_parse(ntp_policy, __NTP_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));

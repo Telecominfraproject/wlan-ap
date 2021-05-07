@@ -501,25 +501,30 @@ void opennds_parameters(char *ifname)
 void opennds_section_del(char *section_name)
 {
 	struct uci_package *opennds;
+	struct uci_context *nds_ctx;
 	struct uci_element *e = NULL, *tmp = NULL;
-	int ret=0;
+	int ret = 0;
 
-	ret= uci_load(uci, "opennds", &opennds);
+	nds_ctx = uci_alloc_context();
+	ret = uci_load(nds_ctx, "opennds", &opennds);
 	if (ret) {
-		LOGD("%s: uci_load() failed with rc %d", section_name, ret);
+		LOGE("%s: %s uci_load() failed with rc %d", section_name, __func__, ret);
+		uci_free_context(nds_ctx);
 		return;
 	}
 	uci_foreach_element_safe(&opennds->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
 		if (!strcmp(s->e.name, section_name)) {
-			uci_section_del(uci, "vif", "opennds", (char *)s->e.name, section_name);
+			uci_section_del(nds_ctx, "vif", "opennds", (char *)s->e.name, section_name);
 		}
 		else {
 			continue;
 		}
 	}
-	uci_commit(uci, &opennds, false);
-	uci_unload(uci, opennds);
+
+	uci_commit(nds_ctx, &opennds, false);
+	uci_unload(nds_ctx, opennds);
+	uci_free_context(nds_ctx);
 	reload_config = 1;
 }
 

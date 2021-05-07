@@ -210,8 +210,10 @@ int uci_section_to_blob(struct uci_context *uci, char *package, char *section,
 
 	if (uci_load(uci, package, &p))
 		p = uci_lookup_package(uci, package);
-	if (!p)
+	if (!p) {
+		uci_unload(uci, p);
 		return -1;
+	}
 	s = uci_lookup_section(uci, p, section);
 	if (!s)
 		goto out;

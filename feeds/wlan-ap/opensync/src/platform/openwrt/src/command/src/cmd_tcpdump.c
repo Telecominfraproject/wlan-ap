@@ -215,6 +215,7 @@ pid_t cmd_handler_tcpdump_wifi(struct task *task)
 	char *argv[] = { "/usr/sbin/tcpdump", "-c", "1000", "-G", duration, "-W", "1", "-w", pcap, "-i", phy, NULL };
 	char iw[128];
 	pid_t pid;
+	int ret = 0;
 
 	task->arg = SCHEMA_KEY_VAL(task->conf.payload, "wifi");
 	if (!task->arg) {
@@ -225,15 +226,23 @@ pid_t cmd_handler_tcpdump_wifi(struct task *task)
 
 	blob_buf_init(&b, 0);
 	uci = uci_alloc_context();
-	uci_load(uci, "wireless", &p);
-	s = uci_lookup_section(uci, p, task->arg);
-        if (!s) {
-		task_status(task, TASK_FAILED, "unknown wifi");
+
+	ret = uci_load(uci, "wireless", &p);
+	if (ret) {
+		LOGE("%s: uci_load() failed with rc %d", __func__, ret);
 		uci_free_context(uci);
-                return -1;
+		return -1;
+	}
+	s = uci_lookup_section(uci, p, task->arg);
+	if (!s) {
+		task_status(task, TASK_FAILED, "unknown wifi");
+		uci_unload(uci, p);
+		uci_free_context(uci);
+		return -1;
 	}
 
-        uci_to_blob(&b, s, &phy_param);
+	uci_to_blob(&b, s, &phy_param);
+	uci_unload(uci, p);
 	uci_free_context(uci);
 
 	blobmsg_parse(phy_policy, __PHY_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
