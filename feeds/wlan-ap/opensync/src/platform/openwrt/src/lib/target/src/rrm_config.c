@@ -47,8 +47,19 @@ void rrm_config_vif(struct blob_buf *b, struct blob_buf *del, const char * freq_
 		blobmsg_add_u32(b, "rssi_ignore_probe_request", conf.probe_resp_threshold);
 		blobmsg_add_u32(b, "signal_connect", conf.client_disconnect_threshold);
 		blobmsg_add_u32(b, "signal_stay", conf.client_disconnect_threshold);
-		blobmsg_add_u32(b, "bcn_rate", conf.beacon_rate);
 		blobmsg_add_u32(b, "mcast_rate", conf.mcast_rate);
+
+		if (conf.beacon_rate == 0) {
+			// Default to the lowest possible bit rate for each frequency band
+			if (!strcmp(freq_band, "2.4G")) {
+				blobmsg_add_u32(b, "bcn_rate", 10);
+			} else {
+				blobmsg_add_u32(b, "bcn_rate", 60);
+			}
+		} else {
+			blobmsg_add_u32(b, "bcn_rate", conf.beacon_rate);
+		}
+		
 	}
 	return;
 }
