@@ -1020,30 +1020,31 @@ size_t write_file(void *ptr, size_t size, size_t nmemb, FILE *stream) {
 
 void vif_section_del(char *section_name)
 {
-
 	struct uci_package *wireless;
+	struct uci_context *sec_ctx;
 	struct uci_element *e = NULL, *tmp = NULL;
 	int ret=0;
-
-	ret= uci_load(uci, "wireless", &wireless);
+	sec_ctx = uci_alloc_context();
+	ret= uci_load(sec_ctx, "wireless", &wireless);
 	if (ret) {
-		LOGD("%s: uci_load() failed with rc %d", section_name, ret);
+		LOGE("%s: %s uci_load() failed with rc %d", section_name, __func__, ret);
+		uci_free_context(sec_ctx);
 		return;
 	}
 	uci_foreach_element_safe(&wireless->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
 		if ((s == NULL) || (s->type == NULL)) continue;
 		if (!strcmp(s->type, section_name)) {
-			uci_section_del(uci, "vif", "wireless", (char *)s->e.name, section_name);
+			uci_section_del(sec_ctx, "vif", "wireless", (char *)s->e.name, section_name);
 		}
 		else {
 			continue;
 		}
 	}
-	uci_commit(uci, &wireless, false);
-	uci_unload(uci, wireless);
+	uci_commit(sec_ctx, &wireless, false);
+	uci_unload(sec_ctx, wireless);
+	uci_free_context(sec_ctx);
 	reload_config = 1;
-
 }
 
 static void vif_check_radius_proxy()
@@ -1063,12 +1064,10 @@ static void vif_check_radius_proxy()
 	}
 
 	uci_ctx = uci_alloc_context();
-
 	rc = uci_load(uci_ctx, "wireless", &wireless);
 
-	if (rc)
-	{
-		LOGD("%s: uci_load() failed with rc %d", __func__, rc);
+	if (rc) {
+		LOGE("%s: uci_load() failed with rc %d", __func__, rc);
 		goto free;
 	}
 
@@ -1334,14 +1333,17 @@ static void hs20_vif_config(struct blob_buf *b,
 bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
 {
 	struct uci_package *wireless;
+	struct uci_context *vif_ctx;
 	struct uci_element *e = NULL, *tmp = NULL;
 	const char *ifname;
-	int ret=0;
+	int ret = 0;
 
 	vlan_del((char *)vconf->if_name);
-	ret= uci_load(uci, "wireless", &wireless);
+	vif_ctx = uci_alloc_context();
+	ret= uci_load(vif_ctx, "wireless", &wireless);
 	if (ret) {
-		LOGD("%s: uci_load() failed with rc %d", vconf->if_name, ret);
+		LOGE("%s: %s uci_load() failed with rc %d", vconf->if_name, __func__, ret);
+		uci_free_context(vif_ctx);
 		return false;
 	}
 	uci_foreach_element_safe(&wireless->sections, tmp, e) {
@@ -1349,14 +1351,15 @@ bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
 		if ((s == NULL) || (s->type == NULL)) continue; 
 		if (strcmp(s->type, "wifi-iface")) continue;
 
-		ifname = uci_lookup_option_string( uci, s, "ifname" );
+		ifname = uci_lookup_option_string( vif_ctx, s, "ifname" );
 		if (!strcmp(ifname,vconf->if_name)) {
-			uci_section_del(uci, "vif", "wireless", (char *)s->e.name, "wifi-iface");
+			uci_section_del(vif_ctx, "vif", "wireless", (char *)s->e.name, "wifi-iface");
 			break;
 		}
 	}
-	uci_commit(uci, &wireless, false);
-	uci_unload(uci, wireless);
+	uci_commit(vif_ctx, &wireless, false);
+	uci_unload(vif_ctx, wireless);
+	uci_free_context(vif_ctx);
 	reload_config = 1;
 	return true;
 }
@@ -1549,7 +1552,6 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 
 	blob_buf_init(&b, 0);
 	blob_buf_init(&del,0);
-
 	blobmsg_add_string(&b, "ifname", vconf->if_name);
 	blobmsg_add_string(&b, "device", rconf->if_name);
 	blobmsg_add_string(&b, "mode", "ap");

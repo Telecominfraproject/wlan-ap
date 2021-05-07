@@ -362,22 +362,27 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf )
 static bool radius_proxy_config_delete()
 {
 	struct uci_package *radsecproxy;
+	struct uci_context *rad_uci;
 	struct uci_element *e = NULL, *tmp = NULL;
-	int ret=0;
+	int ret = 0;
 
-	ret= uci_load(uci, "radsecproxy", &radsecproxy);
+	rad_uci = uci_alloc_context();
+
+	ret = uci_load(rad_uci, "radsecproxy", &radsecproxy);
 	if (ret) {
-		LOGD("%s: uci_load() failed with rc %d", __func__, ret);
+		LOGE("%s: uci_load() failed with rc %d", __func__, ret);
+		uci_free_context(rad_uci);
 		return false;
 	}
 	uci_foreach_element_safe(&radsecproxy->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
 		if ((s == NULL) || (s->type == NULL)) continue;
-		uci_section_del(uci, "radsecproxy", "radsecproxy",
+		uci_section_del(rad_uci, "radsecproxy", "radsecproxy",
 				(char *)s->e.name, s->type);
 	}
-	uci_commit(uci, &radsecproxy, false);
-	uci_unload(uci, radsecproxy);
+	uci_commit(rad_uci, &radsecproxy, false);
+	uci_unload(rad_uci, radsecproxy);
+	uci_free_context(rad_uci);
 	reload_config = 1;
 	return true;
 }
