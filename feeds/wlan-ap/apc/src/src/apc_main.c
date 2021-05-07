@@ -253,6 +253,10 @@ static void check_timer_handler(struct uloop_timeout *timeout)
 		if (CheckIp && (MyIpAddr != CheckIp))
 		{
 			printf("IP address changed from %x to %x - restart APC election\n", MyIpAddr, CheckIp);
+			system("/usr/opensync/bin/ovsh u APC_State dr_addr:=0.0.0.0 bdr_addr:=0.0.0.0 enabled:=false mode:=NC");
+			uloop_done();
+			ubus_done();
+			interap_rcv_close();
 			exit(0);
 		}
 		
@@ -266,6 +270,9 @@ static void check_timer_handler(struct uloop_timeout *timeout)
 
 static void handle_signal(int signo)
 {
+	uloop_done();
+	ubus_done();
+	interap_rcv_close();
 	system("/usr/opensync/bin/ovsh u APC_State dr_addr:=0.0.0.0 bdr_addr:=0.0.0.0 enabled:=false mode:=NC");
 }
 
@@ -327,8 +334,10 @@ int main(int argc, char *const* argv)
 	callback cb = receive_from_socket;
 
 	if (interap_recv(IAC_APC_ELECTION_PORT, cb, 1000,
-			 NULL, NULL) < 0)
+			 NULL, NULL) < 0) {
 		printf("Error: Failed InterAP receive");
+		return 1;
+	}
 
 
 	memset(Timers, 0, sizeof(Timers));
@@ -351,6 +360,7 @@ int main(int argc, char *const* argv)
 	uloop_run();
 	uloop_done();
 	ubus_done();
+	interap_rcv_close();
 
 	return(1);
 }

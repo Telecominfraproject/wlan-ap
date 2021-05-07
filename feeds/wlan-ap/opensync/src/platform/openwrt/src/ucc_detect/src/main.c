@@ -275,8 +275,10 @@ int main(int argc, char ** argv)
 	callback cb = recv_process;
 	LOGI("Call interap_recv");
 	if( interap_recv(IAC_VOIP_PORT, cb, sizeof(struct voip_session),
-			 loop, &iac_io) < 0)
+			 loop, &iac_io) < 0) {
 		LOGI("Error: Failed InterAP receive");
+		return 1;
+	}
 
 //	task_init();
 	netlink_listen(loop);
@@ -291,6 +293,7 @@ int main(int argc, char ** argv)
 #endif
 	ev_default_destroy();
 
+	interap_rcv_close();
 	LOGN("Exiting UCCM");
 
 	return 0;

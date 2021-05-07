@@ -22,8 +22,10 @@ static void receive_data_uloop(struct uloop_fd *fd, unsigned int events)
 	recv_data = malloc(ra.len);
 	memset(recv_data, 0, ra.len);
 	if ((recv_data_len = recvfrom(recv_sock, recv_data, ra.len,
-				      0, NULL, 0)) < 0)
+				      0, NULL, 0)) < 0) {
 		printf("recvfrom() failed");
+		return;
+	}
 
 	ra.cb(recv_data, recv_data_len);
 	free(recv_data);
@@ -97,6 +99,11 @@ int interap_recv(unsigned short port, int (*recv_cb)(void *, ssize_t),
 	}
 
 	return 0;
+}
+
+void interap_rcv_close(void)
+{
+	close(recv_sock);
 }
 
 int interap_send(unsigned short port, char *dst_ip, void *data,

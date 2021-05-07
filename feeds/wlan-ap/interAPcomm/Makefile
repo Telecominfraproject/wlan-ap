@@ -30,5 +30,8 @@ endef
 define Package/libinterapcomm/install
 	$(INSTALL_DIR) $(1)/usr/lib
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/libinterapcomm.so $(1)/usr/lib/
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/interap.init $(1)/etc/init.d/interap
+
 endef
 $(eval $(call BuildPackage,libinterapcomm))
