@@ -6,7 +6,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL=git@github.com:Telecominfraproject/wlan-cloud-ucentralgw.git
 PKG_SOURCE_DATE:=2021-03-28
-PKG_SOURCE_VERSION:=a42e9608df8a465f9899cc23c5261a263a00b154
+PKG_SOURCE_VERSION:=555b5fefc6337f6bc7eab9988b2d05fdc76b2381
 CMAKE_INSTALL:=1
 
 PKG_LICENSE:=BSD-3-Clause
@@ -44,9 +44,9 @@ endef
 define Package/ucentralgw/install
 	$(INSTALL_DIR) $(1)/usr/bin $(1)/usr/libexec/ucentral/
 
+	$(CP) ./files/* $(1)
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/bin/ucentralgw $(1)/usr/bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/cert_scripts/* $(1)/usr/libexec/ucentral/
-	$(CP) ./files/* $(1)
 endef
 
 $(eval $(call BuildPackage,ucentralgw))

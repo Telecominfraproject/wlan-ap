@@ -78,7 +78,7 @@ CONFIGURE_ARGS += \
 ifeq ($(BUILD_VARIANT),all)
 	CONFIGURE_ARGS += \
 		--typical
-	POCO_LIBS={Foundation,XML,JSON,Net,Util,Crypto,NetSSL,Encodings,Util,Data,DataSQLite}
+	POCO_LIBS={Foundation,XML,JSON,Net,Util,Crypto,NetSSL,Encodings,Util,Data,DataSQLite,JWT}
 else
 	CONFIGURE_ARGS += \
 		--poquito \
