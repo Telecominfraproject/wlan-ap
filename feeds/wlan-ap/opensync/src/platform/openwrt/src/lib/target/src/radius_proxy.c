@@ -216,6 +216,7 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf )
 	char name[256];
 	char server_name[256] = {};
 	char acct_server_name[256] = {};
+	char tls_name[256] = {};
 	struct schema_APC_State apc_conf;
 
 	/* Configure only if APC selects this as master AP (DR) */
@@ -253,6 +254,7 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf )
 	/* Configure TLS/non-TLS and server blocks */
 	sprintf(server_name, "%s%s", conf->radius_config_name, "server");
 	sprintf(acct_server_name, "%s%s", conf->radius_config_name, "Acctserver");
+	sprintf(tls_name, "%s%s", conf->radius_config_name, "tls");
 	if (conf->radsec)
 	{
 		blob_buf_init(&uci_buf, 0);
@@ -263,7 +265,7 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf )
 		radsec_download_cert("clientdec.key",
 				conf->radius_config_name, conf->client_key);
 
-		blobmsg_add_string(&uci_buf, "name", conf->server);
+		blobmsg_add_string(&uci_buf, "name", tls_name);
 
 		memset(path, '\0', sizeof(path));
 		sprintf(path, "/tmp/radsec/certs/%s/cacert.pem",
@@ -283,15 +285,14 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf )
 		if (strlen(conf->passphrase) > 0)
 			blobmsg_add_string(&uci_buf, "certificateKeyPassword", conf->passphrase);
 
-		memset(name, '\0', sizeof(name));
-		sprintf(name, "%s%s", conf->radius_config_name, "tls");
-		blob_to_uci_section(uci, "radsecproxy", name,
+		blob_to_uci_section(uci, "radsecproxy", tls_name,
 				"tls", uci_buf.head, &radius_proxy_tls_param, NULL);
 
 		blob_buf_init(&uci_buf, 0);
-		blobmsg_add_string(&uci_buf, "name", conf->server);
+		blobmsg_add_string(&uci_buf, "name", server_name);
+		blobmsg_add_string(&uci_buf, "host", conf->server);
 		blobmsg_add_string(&uci_buf, "type", "tls");
-		blobmsg_add_string(&uci_buf, "tls", conf->server);
+		blobmsg_add_string(&uci_buf, "tls", tls_name);
 		blobmsg_add_u32(&uci_buf, "port", conf->port);
 		blobmsg_add_string(&uci_buf, "secret", "radsec");
 		blobmsg_add_bool(&uci_buf, "statusServer", 0);
