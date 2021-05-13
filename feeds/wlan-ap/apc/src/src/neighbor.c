@@ -482,10 +482,13 @@ static void inactivity_timer_hook(struct _timer * tmr)
 			n_neigh += 1;
 			//Radius stuff
 			BackingUpRadius = 1;
+			apc_ifa->priority = 0x33;
 		}
+		else
+			apc_ifa->priority = 0x11;
+
 
 		apc_ifa->drip = MyIpAddr;
-		apc_ifa->priority = 0x11;
 		apc_ifa->bdrip = 0;
 		memset(&ApcSpec, 0, sizeof(struct apc_spec));
 		WaitingToReelect = 12;

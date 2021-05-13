@@ -701,8 +701,7 @@ void APC_config_update(struct schema_APC_Config *conf)
 	apc_uci = uci_alloc_context();
 
 	blob_buf_init(&apcb, 0);
-
-	if (conf->enabled == true) {
+	if (conf && conf->enabled == true) {
 		blobmsg_add_bool(&apcb, "enabled", 1);
 		system("/etc/init.d/apc start");
 	} else {
@@ -721,7 +720,9 @@ static void callback_APC_Config(ovsdb_update_monitor_t *mon,
                                 struct schema_APC_Config *old,
                                 struct schema_APC_Config *conf)
 {
-	if (mon->mon_type != OVSDB_UPDATE_DEL)
+	if (mon->mon_type == OVSDB_UPDATE_DEL)
+		APC_config_update(NULL);
+	else
 		APC_config_update(conf);
 
 }

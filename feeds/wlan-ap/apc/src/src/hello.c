@@ -189,8 +189,11 @@ void apc_send_hello(struct apc_iface * ifa, int kind )
 			else
 				ApcSpec.FloatIp = ApcSpecSaved.FloatIp;
 		}
-		else
+		else if (ApcSpec.IsApc == I_AM_BAPC )
 		{
+			ifa->priority = 0x12;
+		}
+		else {
 			ifa->priority = 0x11;
 			if ((ApcSpecSaved.IsApc == I_AM_APC) || BackingUpRadius )
 			{
