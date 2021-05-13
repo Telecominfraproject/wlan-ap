@@ -17,7 +17,7 @@ static struct blob_buf nb;
 static const char *ubus_path;
 timer *notify_timer;
 extern struct apc_iface * apc_ifa;
-#define APC_NOTIFY_INTERVAL 30
+#define APC_NOTIFY_INTERVAL 10
 
 struct apc_state {
 	char mode[4];
@@ -94,7 +94,7 @@ apc_info_handle(struct ubus_context *ctx, struct ubus_object *obj,
 	return 0;
 }
 
-static char apc_mode[APC_MAX_MODE][8] = {"DOWN", "LOOP", "WAITING", "PTP", "OR", "BDR", "DR"};
+static char apc_mode[APC_MAX_MODE][8] = {"DOWN", "LOOP", "WT", "PTP", "OR", "BDR", "DR"};
 void apc_update_state()
 {
 	struct in_addr dr_addr;
@@ -112,8 +112,12 @@ void apc_update_state()
 			 "%s", inet_ntoa(dr_addr));
 		snprintf(state.bdr_addr, sizeof(state.bdr_addr),
 			 "%s", inet_ntoa(bdr_addr));
-	}
-	else {
+	} else if (apc_ifa->state == APC_IS_WAITING) {
+		snprintf(state.mode, sizeof(state.mode), "%s",
+			 &apc_mode[apc_ifa->state][0]);
+		snprintf(state.dr_addr, sizeof(state.dr_addr), "0.0.0.0");
+		snprintf(state.bdr_addr, sizeof(state.bdr_addr), "0.0.0.0");
+	} else {
 		snprintf(state.mode, sizeof(state.mode), "NC");
 		snprintf(state.dr_addr, sizeof(state.dr_addr), "0.0.0.0");
 		snprintf(state.bdr_addr, sizeof(state.bdr_addr), "0.0.0.0");
