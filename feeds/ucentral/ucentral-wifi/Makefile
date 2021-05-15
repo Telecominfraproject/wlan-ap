@@ -6,7 +6,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_URL=https://github.com/blogic/ucentral-wifi.git
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2021-04-13
-PKG_SOURCE_VERSION:=2e81fd1e6e1d5b71f576af25fcb2e1dc75f94510
+PKG_SOURCE_VERSION:=cb4a3c0ac0db53bfbc30f091d2b15b36ac5db88c
 
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=BSD-3-Clause

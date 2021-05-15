@@ -9,7 +9,7 @@ echo config:$config
 	exit 1
 }
 
-ucode -m ubus -m uci -m fs -E capab=/etc/ucentral/capabilities.json -E cfg=$1 -i /usr/share/ucentral/ucentral.uc > /tmp/ucentral.uci
+/usr/share/ucentral/ucentral.uc
 
 [ $? -eq 0 ] || {
 	logger "ucentral_apply: applying $1 failed"
@@ -24,16 +24,5 @@ active=$(readlink /etc/ucentral/ucentral.active)
 
 rm -f /etc/ucentral/ucentral.active
 ln -s $config /etc/ucentral/ucentral.active
-
-rm -rf /tmp/config-shadow
-cp -r /etc/config-shadow /tmp
-cat /tmp/ucentral.uci | uci -c /tmp/config-shadow batch 2> /dev/null
-uci -c /tmp/config-shadow commit
-
-cp /tmp/config-shadow/* /etc/config/
-
-reload_config
-
-rm -rf /tmp/config-shadow
 
 return 0

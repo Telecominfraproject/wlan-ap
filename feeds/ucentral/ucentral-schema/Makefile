@@ -6,7 +6,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_URL=https://github.com/blogic/ucentral-schema.git
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2021-02-15
-PKG_SOURCE_VERSION:=e7162555f6f2450835723a9dcc029a0e9b30f822
+PKG_SOURCE_VERSION:=d32522a125ea5b3418fb5cf3992c963260bfbd97
 
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=BSD-3-Clause
@@ -25,10 +25,10 @@ endef
 
 define Package/ucentral-schema/install
 	$(INSTALL_DIR) $(1)/usr/share/ucentral
-	$(INSTALL_DATA) $(PKG_BUILD_DIR)/ucentral.schema.json $(1)/usr/share/ucentral
-	$(INSTALL_DATA) $(PKG_BUILD_DIR)/sys/*.uc $(1)/usr/share/ucentral
-	$(INSTALL_DATA) $(PKG_BUILD_DIR)/cmd/*.uc $(1)/usr/share/ucentral
-	$(INSTALL_DATA) $(PKG_BUILD_DIR)/cfg/*.uc $(1)/usr/share/ucentral
+	$(CP) $(PKG_BUILD_DIR)/schemareader.uc $(1)/usr/share/ucentral
+	$(CP) $(PKG_BUILD_DIR)/renderer/* $(1)/usr/share/ucentral
+	$(CP) $(PKG_BUILD_DIR)/command/*.uc $(1)/usr/share/ucentral
+	$(CP) $(PKG_BUILD_DIR)/system/*.uc $(1)/usr/share/ucentral
 endef
 
 $(eval $(call BuildPackage,ucentral-schema))

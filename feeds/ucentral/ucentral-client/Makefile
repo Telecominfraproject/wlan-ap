@@ -6,7 +6,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_URL=https://github.com/blogic/ucentral-client.git
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2021-02-15
-PKG_SOURCE_VERSION:=45b2e27d238d5366a3ef0a291ae2194d1db9c496
+PKG_SOURCE_VERSION:=7abb7afa812e47dd6d19912ceb826abfb6f84bad
 
 PKG_LICENSE:=BSD-3-Clause
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
@@ -18,8 +18,8 @@ define Package/ucentral-client
   SECTION:=ucentral
   CATEGORY:=uCentral
   TITLE:=OpenWrt uCentral websocket client
-  DEPENDS:=+ucentral-jsonschema +ucentral-schema \
-  	   +ucode +ucode-mod-fs +ucode-mod-ubus +ucode-mod-uci \
+  DEPENDS:=+ucentral-schema \
+  	   +ucode +ucode-mod-fs +ucode-mod-ubus +ucode-mod-uci +ucode-mod-math \
 	   +libubox +libwebsockets-openssl +libblobmsg-json +libubus
 endef
 
