@@ -35,6 +35,7 @@ ovsdb_table_t table_Hotspot20_Icon_Config;
 ovsdb_table_t table_APC_Config;
 ovsdb_table_t table_APC_State;
 unsigned int radproxy_apc = 0;
+extern json_t* ovsdb_table_where(ovsdb_table_t *table, void *record);
 
 static struct uci_package *wireless;
 struct uci_context *uci;
@@ -799,16 +800,114 @@ void apc_state_set(struct blob_attr *msg)
 		LOG(ERR, "APC_state: failed to update");
 }
 
+static ovsdb_table_t table_Manager;
+ev_timer apc_cld_mon_timer;
+ev_timer apc_cld_disconn_timer;
+ev_timer apc_backoff_timer;
+#define APC_CLD_MON_TIME 5
+#define APC_CLD_DISCONN_TIME 60
+#define APC_BKOFF_TIME 60
+
+static void
+apc_cld_mon_cb(struct ev_loop *loop, ev_timer *timer, int revents)
+{
+	struct schema_APC_State state;
+	struct schema_Manager mgr;
+	json_t *where;
+
+	where = ovsdb_table_where(&table_APC_State, &state);
+	if (false == ovsdb_table_select_one_where(&table_APC_State,
+			where, &state)) {
+		LOG(ERR, "%s: APC_State read failed", __func__);
+		return;
+	}
+	/*If not DR and not BDR the dont proceed */
+	if ((strncmp(state.mode, "DR", 2) != 0) &&
+	    (strncmp(state.mode, "BDR", 3) != 0))
+		return;
+
+	/*If BDR addr is 0 means its a standalone DR*/
+	if ((strncmp(state.bdr_addr, "0.0.0.0", 7) == 0))
+		return;
+
+	where = ovsdb_table_where(&table_Manager, &mgr);
+	if (false == ovsdb_table_select_one_where(&table_Manager,
+			where, &mgr)) {
+		LOG(ERR, "%s: Manager read failed", __func__);
+		return;
+	}
+
+	if (mgr.is_connected == false) {
+		if (!ev_is_active(&apc_cld_disconn_timer) &&
+		    !ev_is_pending(&apc_cld_disconn_timer)) {
+			LOGI("%s: START apc_cld_disconn_timer, %s",
+			     __func__, state.mode);
+			ev_timer_set(&apc_cld_disconn_timer,
+				     APC_CLD_DISCONN_TIME, 0);
+			ev_timer_start(EV_DEFAULT, &apc_cld_disconn_timer);
+		}
+	}
+	else {
+		if (ev_is_active(&apc_cld_disconn_timer)) {
+			LOGI("%s: STOP apc_cld_disconn_timer", __func__);
+			ev_timer_stop(EV_DEFAULT, &apc_cld_disconn_timer);
+		}
+	}
+}
+
+static void
+apc_backoff_cb(struct ev_loop *loop, ev_timer *timer, int revents)
+{
+	LOGI("%s: Enable APC, STOP apc_backoff_timer", __func__);
+	SCHEMA_SET_INT(apc_conf.enabled, true);
+	if (!ovsdb_table_update(&table_APC_Config, &apc_conf))
+		LOG(ERR, "%s: APC_Config: failed to update", __func__);
+
+	ev_timer_stop(EV_DEFAULT, &apc_backoff_timer);
+}
+
+static void
+apc_cld_disconn_cb(struct ev_loop *loop, ev_timer *timer, int revents)
+{
+	LOGI("%s: Disable APC , START apc_backoff_timer", __func__);
+	SCHEMA_SET_INT(apc_conf.enabled, false);
+	if (!ovsdb_table_update(&table_APC_Config, &apc_conf)) {
+		LOG(ERR, "%s:APC_Config: failed to update", __func__);
+		ev_timer_stop(EV_DEFAULT, &apc_cld_disconn_timer);
+		return;
+	}
+
+	ev_timer_set(&apc_backoff_timer, APC_BKOFF_TIME, 0);
+	ev_timer_start(EV_DEFAULT, &apc_backoff_timer);
+
+	ev_timer_stop(EV_DEFAULT, &apc_cld_disconn_timer);
+}
+
+void cloud_disconn_mon(void)
+{
+	ev_init(&apc_cld_mon_timer, apc_cld_mon_cb);
+	apc_cld_mon_timer.repeat = APC_CLD_MON_TIME;
+	ev_timer_again(EV_DEFAULT, &apc_cld_mon_timer);
+
+	ev_timer_init(&apc_cld_disconn_timer, apc_cld_disconn_cb,
+		      APC_CLD_DISCONN_TIME, 0);
+	ev_timer_init(&apc_backoff_timer, apc_backoff_cb,
+		      APC_BKOFF_TIME, 0);
+
+	OVSDB_TABLE_INIT_NO_KEY(Manager);
+}
 
 void apc_init()
 {
 	/* APC Config */
-	OVSDB_TABLE_INIT(APC_Config, _uuid);
+	OVSDB_TABLE_INIT_NO_KEY(APC_Config);
 	OVSDB_TABLE_MONITOR(APC_Config, false);
 	SCHEMA_SET_INT(apc_conf.enabled, true);
 	LOGI("APC state/config Initialize");
-	if (!ovsdb_table_insert(&table_APC_Config, &apc_conf))
+	if (!ovsdb_table_insert(&table_APC_Config, &apc_conf)) {
 		LOG(ERR, "APC_Config: failed to initialize");
+		return;
+	}
 
 	/* APC State */
 	OVSDB_TABLE_INIT_NO_KEY(APC_State);
@@ -817,8 +916,17 @@ void apc_init()
 	SCHEMA_SET_STR(apc_state.dr_addr, "0.0.0.0");
 	SCHEMA_SET_STR(apc_state.bdr_addr, "0.0.0.0");
 	SCHEMA_SET_INT(apc_state.enabled, false);
-	if (!ovsdb_table_insert(&table_APC_State, &apc_state))
+	if (!ovsdb_table_insert(&table_APC_State, &apc_state)) {
 		LOG(ERR, "APC_state: failed to initialize");
+		return;
+	}
+
+	/* Cloud connection monitor - if cloud unreachable
+	 * for certain time, disable APC and enable after a
+	 * back-off time. This triggers relection of DR among
+	 * other APs*/
+	cloud_disconn_mon();
+
 }
 
 bool target_radio_init(const struct target_radio_ops *ops)
