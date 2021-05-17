@@ -2,8 +2,8 @@
 
 AP_PRIVATE_KEY_FILE="/usr/opensync/certs/client_dec.key"
 AP_CERTIFICATE_FILE="/usr/opensync/certs/client.pem"
-AP_DEVICE_ID_FILE="/usr/opensync/certs/deviceid.txt"
-DIGICERT_API_URI="clientauth.demo.one.digicert.com"
+AP_DEVICE_ID_FILE="/usr/opensync/certs/client_deviceid.txt"
+DIGICERT_API_URI="clientauth.one.digicert.com"
 
 if [ "$1" = "-h" ]; then
   echo "Usage: $0 [redirector address]" >&2
