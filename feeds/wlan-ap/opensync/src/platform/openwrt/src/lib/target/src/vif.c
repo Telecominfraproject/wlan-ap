@@ -1047,7 +1047,7 @@ void vif_section_del(char *section_name)
 	reload_config = 1;
 }
 
-static void vif_check_radius_proxy()
+void vif_check_radius_proxy()
 {
 	struct uci_context *uci_ctx;
 	struct uci_package *wireless;

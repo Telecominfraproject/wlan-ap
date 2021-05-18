@@ -401,7 +401,6 @@ void callback_Radius_Proxy_Config(ovsdb_update_monitor_t *self,
 
 	case OVSDB_UPDATE_DEL:
 		(void) radius_proxy_config_delete();
-		(void) radius_proxy_config_set(conf);
 		break;
 
 	default:
