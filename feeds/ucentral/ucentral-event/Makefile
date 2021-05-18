@@ -6,7 +6,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_URL=https://github.com/blogic/ucentral-event.git
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2021-04-13
-PKG_SOURCE_VERSION:=58112ec4963d51232177df6aee5be7260dd8d8e5
+PKG_SOURCE_VERSION:=f3a32527c89cdcbecf7d8b7c0ab59677401a74d2
 
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=BSD-3-Clause
@@ -26,9 +26,10 @@ TARGET_CFLAGS += \
 	-I$(STAGING_DIR)/usr/include/libnl-tiny
 
 define Package/ucentral-event/install
-	$(INSTALL_DIR) $(1)/usr/sbin $(1)/etc/init.d
+	$(INSTALL_DIR) $(1)/usr/sbin $(1)/etc/init.d $(1)/etc/config
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ucentral-event $(1)/usr/sbin/
 	$(INSTALL_BIN) ./files/ucentral-event $(1)/etc/init.d/
+	$(INSTALL_DATA) ./files/event $(1)/etc/config/
 endef
 
 $(eval $(call BuildPackage,ucentral-event))
