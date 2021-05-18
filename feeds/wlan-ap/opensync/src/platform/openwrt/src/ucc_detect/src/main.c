@@ -270,16 +270,17 @@ int main(int argc, char ** argv)
 		LOGEM("Initializing UCCM (Failed to initialize OVSDB)");
 		return -1;
 	}
-	evsched_init(loop);
 
 	callback cb = recv_process;
 	LOGI("Call interap_recv");
 	if( interap_recv(IAC_VOIP_PORT, cb, sizeof(struct voip_session),
 			 loop, &iac_io) < 0) {
+		interap_rcv_close();
 		LOGI("Error: Failed InterAP receive");
 		return 1;
 	}
 
+	evsched_init(loop);
 //	task_init();
 	netlink_listen(loop);
 //	command_ubus_init(loop);
