@@ -37,5 +37,6 @@ void vif_hs20_update(struct schema_Hotspot20_Config *hs2conf);
 void vif_hs20_osu_update(struct schema_Hotspot20_OSU_Providers *hs2osuconf);
 void vif_hs20_icon_update(struct schema_Hotspot20_Icon_Config *hs2iconconf);
 void vif_section_del(char *section_name);
+void vif_check_radius_proxy(void);
 
 #endif

@@ -78,7 +78,7 @@ static const struct blobmsg_policy wifi_device_policy[__WDEV_ATTR_MAX] = {
 	[WDEV_ATTR_RX_ANTENNA] = { .name = "rxantenna", .type = BLOBMSG_TYPE_INT32 },
 	[WDEV_ATTR_FREQ_BAND] = { .name = "freq_band", .type = BLOBMSG_TYPE_STRING },
 	[WDEV_AATR_CHANNELS] = {.name = "channels", .type = BLOBMSG_TYPE_ARRAY},
-        [WDEV_ATTR_DISABLE_B_RATES] = { .name = "legacy_rates", .type = BLOBMSG_TYPE_BOOL },
+	[WDEV_ATTR_DISABLE_B_RATES] = { .name = "legacy_rates", .type = BLOBMSG_TYPE_BOOL },
 	[WDEV_ATTR_MAXASSOC_CLIENTS] = { .name = "maxassoc", .type = BLOBMSG_TYPE_INT32 },
 	[WDEV_ATTR_LOCAL_PWR_CONSTRAINT] = { .name = "local_pwr_constraint", .type = BLOBMSG_TYPE_INT32 },
 };
@@ -743,6 +743,10 @@ static void callback_APC_State(ovsdb_update_monitor_t *mon,
 		radproxy_apc = 0;
 		system("ubus call service event '{\"type\": \"config.change\", \"data\": { \"package\": \"wireless\" }}'");
 	}
+
+	/* APC changed: start / stop radius proxy service if needed */
+	vif_check_radius_proxy();
+
 }
 
 struct schema_APC_State apc_state;
