@@ -38,6 +38,9 @@ define Package/apc/install
 	$(INSTALL_BIN) ./files/apc.init $(1)/etc/init.d/apc
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_BIN) ./files/apc.config $(1)/etc/config/apc
+	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
+	$(INSTALL_BIN) ./files/etc/hotplug.d/iface/30-apc $(1)/etc/hotplug.d/iface/30-apc
+
 
 endef
 $(eval $(call BuildPackage,apc))

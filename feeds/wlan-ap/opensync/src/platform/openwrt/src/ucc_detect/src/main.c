@@ -249,48 +249,28 @@ int main(int argc, char ** argv)
 	backtrace_init();
 
 	json_memdbg_init(loop);
-#if 0
-	if (!dpp_init())
-	{
-        	LOG(ERR,
-            	"Initializing SM "
-            	"(Failed to init DPP library)");
-		return -1;
-	}
 
-	if (!uccm_mqtt_init())
-	{
-		LOG(ERR,
-		"Initializing SM "
-		"(Failed to start MQTT)");
-		return -1;
-	}
-#endif
 	if (!ovsdb_init_loop(loop, "UCCM")) {
 		LOGEM("Initializing UCCM (Failed to initialize OVSDB)");
 		return -1;
 	}
-	evsched_init(loop);
 
 	callback cb = recv_process;
 	LOGI("Call interap_recv");
 	if( interap_recv(IAC_VOIP_PORT, cb, sizeof(struct voip_session),
 			 loop, &iac_io) < 0) {
+		interap_rcv_close();
 		LOGI("Error: Failed InterAP receive");
 		return 1;
 	}
 
-//	task_init();
+	evsched_init(loop);
 	netlink_listen(loop);
-//	command_ubus_init(loop);
 
 	ev_run(loop, 0);
 
 	if (!ovsdb_stop_loop(loop))
 		LOGE("Stopping UCCM (Failed to stop OVSDB");
-#if 0
-	uccm_mqtt_stop();
-#endif
 	ev_default_destroy();
 
 	interap_rcv_close();
