@@ -242,6 +242,118 @@ static void ntp_handler(int type,
 	ntp_state(0);
 }
 
+enum {
+	LED_ATTR_SYSFS,
+	LED_ATTR_TRIGGER,
+	LED_ATTR_DELAYON,
+	LED_ATTR_DELAYOFF,
+	LED_ATTR_VALUE,
+	LED_ATTR_KEY,
+	__LED_ATTR_MAX,
+};
+
+static const struct blobmsg_policy led_policy[__LED_ATTR_MAX] = {
+	[LED_ATTR_SYSFS] = { .name = "sysfs", .type = BLOBMSG_TYPE_STRING },
+	[LED_ATTR_TRIGGER] = { .name = "trigger", .type = BLOBMSG_TYPE_STRING },
+	[LED_ATTR_DELAYON] = { .name = "delayon", .type = BLOBMSG_TYPE_STRING},
+	[LED_ATTR_DELAYOFF] = { .name = "delayoff", .type = BLOBMSG_TYPE_STRING},
+	[LED_ATTR_VALUE] = { .name = "value", .type = BLOBMSG_TYPE_STRING},
+	[LED_ATTR_KEY] = { .name = "key", .type = BLOBMSG_TYPE_STRING},
+};
+
+static const struct uci_blob_param_list led_param = {
+	.n_params = __LED_ATTR_MAX,
+	.params = led_policy,
+};
+
+static char led[][8]={"lan", "wan", "eth", "wifi2", "wifi5", "wlan2g", "wlan5g", "power","eth0",
+			  "status", "eth1", "wifi2g", "eth2", "wifi5g", "plug", "world", "usb", "linksys", "wps"};
+
+static void led_state(int config)
+{
+	struct blob_attr *tb[__LED_ATTR_MAX] = { };
+	struct uci_package *system;
+	struct uci_section *s = NULL;
+	struct uci_element *e = NULL;
+	char val[8];
+	char key[16];
+	blob_buf_init(&b, 0);
+	uci_load(uci, "system", &system);
+	uci_foreach_element(&system->sections, e) {
+		s = uci_to_section(e);
+		if (!strcmp(s->type, "led")) {
+			uci_to_blob(&b, s, &led_param);
+			blobmsg_parse(led_policy, __LED_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
+			if(tb[LED_ATTR_KEY])
+				strcpy(key, blobmsg_get_string(tb[LED_ATTR_KEY]));
+			if(tb[LED_ATTR_VALUE])
+				strcpy(val, blobmsg_get_string(tb[LED_ATTR_VALUE]));
+			break;
+		}
+		s = NULL;
+	}
+	if (!s)
+		goto out;
+	if (config)
+		node_config_set("led", key, val);
+	node_state_set("led", key, val);
+out:
+	uci_unload(uci, system);
+}
+
+int available_led_check(char *led_name)
+{
+	unsigned int i;
+	for (i = 0; i < ARRAY_SIZE(led); i++) {
+		if(!strcmp(led_name,led[i])) {
+			return 1;
+		}
+	}
+	return 0;
+}
+static void led_handler(int type,
+			struct schema_Node_Config *old,
+			struct schema_Node_Config *conf)
+{
+	char led_string[32];
+	char ap_name[16];
+	char color[16];
+	char led_section[16];
+	switch (type) {
+	case OVSDB_UPDATE_NEW:
+	case OVSDB_UPDATE_MODIFY:
+		if (!strcmp(conf->key, "led_blink") || !strcmp(conf->key, "led_off"))
+		{
+			FILE *fp;
+			system("ls /sys/class/leds/ > /tmp/led.txt");
+			fp = fopen("/tmp/led.txt", "r");
+			if (fp == NULL)
+			{
+				LOGE("Error Opening File");
+				return;
+			}
+			while ((fgets(led_string, sizeof(led_string), fp)) != NULL) {
+				led_string[strcspn(led_string, "\r\n")] = 0;
+				sscanf(led_string,"%[^:]:%[^:]:%s",ap_name, color, led_section);
+				if(available_led_check(led_section)) {
+					blob_buf_init(&b, 0);
+					if(!strcmp(conf->key, "led_blink")) {
+						blobmsg_add_string(&b, "sysfs", led_string);
+						blobmsg_add_string(&b, "value", "on");
+						blobmsg_add_string(&b, "key", conf->key );
+						blobmsg_add_string(&b, "trigger", "heartbeat");
+						blob_to_uci_section(uci, "system", led_section, "led", b.head, &led_param, NULL);
+					}
+				}
+			}
+			fclose(fp);
+		}
+	}
+	uci_commit_all(uci);
+	system("/sbin/reload_config");
+	led_state(0);
+}
+
 static struct node_handler {
 	char *name;
 	void (*handler)(int type,
@@ -258,6 +370,11 @@ static struct node_handler {
 		.name = "ntp",
 		.handler = ntp_handler,
 		.state = ntp_state,
+	},
+	{
+		.name = "led",
+		.handler = led_handler,
+		.state = led_state,
 	},
 };
 
