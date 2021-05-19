@@ -24,9 +24,9 @@ if [ -z "$1" ]; then
     --cert "${AP_CERTIFICATE_FILE}" \
     "https://${DIGICERT_API_URI}/iot/api/v2/device/${digicert_device_id}"`
 
-  controller_ip=`echo ${device_data} | jq '.fields | .[] | select ( .name == "Redirector" ) | .value' | tr -d '"'`
+  controller_url=`echo ${device_data} | jsonfilter -e '@.fields[@.name="Redirector"].value'`
   # TODO: we should get the port with the redirector record and only default to 6643 if no port was specified
-  redirector_addr="ssl:${controller_ip}:6643"
+  redirector_addr="ssl:${controller_url}:6643"
 else
   redirector_addr=$1
 fi
