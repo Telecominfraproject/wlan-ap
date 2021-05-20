@@ -14,10 +14,16 @@
 struct ubus_context *ubus_ctx = NULL;
 static struct blob_buf b;
 static struct blob_buf nb;
-static const char *ubus_path;
 timer *notify_timer;
 extern struct apc_iface * apc_ifa;
+/* Mandatorily Notify APC_State period */
 #define APC_NOTIFY_INTERVAL 10
+/* Check if any change in APC State and notify period */
+#define APC_NOTIFY_CHECK 1
+static ip_addr old_drip;
+static ip_addr old_bdrip;
+static u8 old_state;
+static unsigned int ucount = 0;
 
 struct apc_state {
 	char mode[4];
@@ -95,26 +101,44 @@ apc_info_handle(struct ubus_context *ctx, struct ubus_object *obj,
 }
 
 static char apc_mode[APC_MAX_MODE][8] = {"DOWN", "LOOP", "WT", "PTP", "OR", "BDR", "DR"};
-void apc_update_state()
+int apc_update_state(void)
 {
 	struct in_addr dr_addr;
 	struct in_addr bdr_addr;
-	dr_addr.s_addr = htonl(apc_ifa->drip);
-	bdr_addr.s_addr = htonl(apc_ifa->bdrip);
+	ip_addr cur_drip;
+	ip_addr cur_bdrip;
+	u8 cur_state;
+
+	cur_drip = apc_ifa->drip;
+	cur_bdrip = apc_ifa->bdrip;
+	cur_state = apc_ifa->state;
+	ucount++;
+
+	if (cur_drip == old_drip &&
+	    cur_bdrip == old_bdrip &&
+	    cur_state == old_state && ucount < APC_NOTIFY_INTERVAL) {
+		return -1;
+	}
+
+	printf("APC State update %u", ucount);
+	ucount = 0;
+
+	dr_addr.s_addr = htonl(cur_drip);
+	bdr_addr.s_addr = htonl(cur_bdrip);
 
 	state.enabled = true;
-	if ((apc_ifa->state == APC_IS_DR) ||
-	    (apc_ifa->state == APC_IS_BACKUP) ||
-	    (apc_ifa->state == APC_IS_DROTHER)) {
+	if ((cur_state == APC_IS_DR) ||
+	    (cur_state == APC_IS_BACKUP) ||
+	    (cur_state == APC_IS_DROTHER)) {
 		snprintf(state.mode, sizeof(state.mode), "%s",
-			 &apc_mode[apc_ifa->state][0]);
+			 &apc_mode[cur_state][0]);
 		snprintf(state.dr_addr, sizeof(state.dr_addr),
 			 "%s", inet_ntoa(dr_addr));
 		snprintf(state.bdr_addr, sizeof(state.bdr_addr),
 			 "%s", inet_ntoa(bdr_addr));
 	} else if (apc_ifa->state == APC_IS_WAITING) {
 		snprintf(state.mode, sizeof(state.mode), "%s",
-			 &apc_mode[apc_ifa->state][0]);
+			 &apc_mode[cur_state][0]);
 		snprintf(state.dr_addr, sizeof(state.dr_addr), "0.0.0.0");
 		snprintf(state.bdr_addr, sizeof(state.bdr_addr), "0.0.0.0");
 	} else {
@@ -122,11 +146,21 @@ void apc_update_state()
 		snprintf(state.dr_addr, sizeof(state.dr_addr), "0.0.0.0");
 		snprintf(state.bdr_addr, sizeof(state.bdr_addr), "0.0.0.0");
 	}
+
+	old_drip = cur_drip;
+	old_bdrip = cur_bdrip;
+	old_state = cur_state;
+
+	return 0;
 }
 
 void apc_send_notification(struct _timer * tmr)
 {
-	apc_update_state();
+	int ustate = 0;
+
+	ustate = apc_update_state();
+	if(ustate != 0)
+		return;
 
 	printf("APC send ubus notification\n");
 	blob_buf_init(&nb, 0);
@@ -159,10 +193,10 @@ ubus_init(void) {
 #endif
 	add_object(&apc_object);
 	notify_timer = tm_new_set(apc_send_notification, NULL,
-				  0, APC_NOTIFY_INTERVAL);
+				  0, APC_NOTIFY_CHECK);
 	if (notify_timer) {
-		printf("APC Start notify timer\n");
-		tm_start(notify_timer, APC_NOTIFY_INTERVAL);
+		printf("APC Start state check and notify timer\n");
+		tm_start(notify_timer, APC_NOTIFY_CHECK);
 	}
 
 	ubus_ctx->connection_lost = ubus_connection_lost;
