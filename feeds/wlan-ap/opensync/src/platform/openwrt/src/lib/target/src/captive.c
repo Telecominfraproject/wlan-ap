@@ -525,7 +525,6 @@ void opennds_section_del(char *section_name)
 	uci_commit(nds_ctx, &opennds, false);
 	uci_unload(nds_ctx, opennds);
 	uci_free_context(nds_ctx);
-	reload_config = 1;
 }
 
 void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *ifname)
