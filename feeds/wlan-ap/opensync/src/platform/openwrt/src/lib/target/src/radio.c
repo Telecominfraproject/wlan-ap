@@ -463,7 +463,7 @@ static void periodic_task(void *arg)
 	}
 
 	if (reload_config) {
-		LOGT("periodic: reload config");
+		LOGD("periodic: reload_config");
 		reload_config = 0;
 		uci_commit_all(uci);
 		sync();

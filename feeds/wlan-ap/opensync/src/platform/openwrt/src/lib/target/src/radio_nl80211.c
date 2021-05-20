@@ -50,7 +50,8 @@
 extern struct ev_loop *wifihal_evloop;
 extern ovsdb_table_t table_Wifi_VIF_State;
 extern ovsdb_table_t table_Wifi_Associated_Clients;
-static struct unl unl;
+static struct unl unl_req;
+static struct unl unl_notify;
 static ev_io unl_io;
 
 static int avl_addrcmp(const void *k1, const void *k2, void *ptr)
@@ -471,10 +472,10 @@ int nl80211_channel_get(char *name, unsigned int *chan)
 	if (!idx)
 		return -1;
 
-	msg = unl_genl_msg(&unl, NL80211_CMD_GET_INTERFACE, true);
+	msg = unl_genl_msg(&unl_req, NL80211_CMD_GET_INTERFACE, true);
 	nla_put_u32(msg, NL80211_ATTR_IFINDEX, idx);
 
-	unl_genl_request(&unl, msg, nl80211_channel_recv, chan);
+	unl_genl_request(&unl_req, msg, nl80211_channel_recv, chan);
 
 	phy->current_channel = *chan;
 
@@ -562,7 +563,7 @@ static void nl80211_ev(struct ev_loop *ev, struct ev_io *io, int event)
 	nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, finish_handler, NULL);
 	nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, no_seq_check, NULL);
 	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, nl80211_recv, NULL);
-	nl_recvmsgs(unl.sock, cb);
+	nl_recvmsgs(unl_notify.sock, cb);
 	nl_cb_put(cb);
 }
 
@@ -580,24 +581,33 @@ int radio_nl80211_init(void)
 {
 	struct nl_msg *msg;
 
-	if (unl_genl_init(&unl, "nl80211") < 0) {
+	if (unl_genl_init(&unl_req, "nl80211") < 0) {
 		syslog(0, "nl80211: failed to connect\n");
 		return -1;
 	}
 
-	msg = unl_genl_msg(&unl, NL80211_CMD_GET_WIPHY, true);
-	unl_genl_request(&unl, msg, nl80211_recv, NULL);
-	msg = unl_genl_msg(&unl, NL80211_CMD_GET_INTERFACE, true);
-	unl_genl_request(&unl, msg, nl80211_recv, NULL);
+	if (unl_genl_init(&unl_notify, "nl80211") < 0) {
+		syslog(0, "nl80211: failed to connect\n");
+		return -1;
+	}
 
-	unl_genl_subscribe(&unl, "config");
-	unl_genl_subscribe(&unl, "mlme");
-	unl_genl_subscribe(&unl, "vendor");
+	msg = unl_genl_msg(&unl_req, NL80211_CMD_GET_WIPHY, true);
+	unl_genl_request(&unl_req, msg, nl80211_recv, NULL);
+	msg = unl_genl_msg(&unl_req, NL80211_CMD_GET_INTERFACE, true);
+	unl_genl_request(&unl_req, msg, nl80211_recv, NULL);
 
-	if (nl_socket_set_buffer_size(unl.sock, 262144, 0) < 0)
+	unl_genl_subscribe(&unl_notify, "config");
+	unl_genl_subscribe(&unl_notify, "mlme");
+	unl_genl_subscribe(&unl_notify, "vendor");
+
+
+	if (nl_socket_set_buffer_size(unl_notify.sock, 262144, 0) < 0)
 		LOGE("radio_nl80211: Failed to set nl socket buffer size");
 
-	ev_io_init(&unl_io, nl80211_ev, unl.sock->s_fd, EV_READ);
+	if (nl_socket_set_nonblocking(unl_notify.sock))
+		LOGE("radio_nl80211: Failed to set socket in the non blocking mode");
+
+	ev_io_init(&unl_io, nl80211_ev, unl_notify.sock->s_fd, EV_READ);
         ev_io_start(wifihal_evloop, &unl_io);
 	evsched_task(&vif_poll_stations, NULL, EVSCHED_SEC(5));
 
