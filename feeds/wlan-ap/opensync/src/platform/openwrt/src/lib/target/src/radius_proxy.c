@@ -55,6 +55,7 @@ enum {
 	RADIUS_PROXY_SERVER_STATUS,
 	RADIUS_PROXY_SERVER_TLS,
 	RADIUS_PROXY_SERVER_CERT_NAME_CHECK,
+	RADIUS_PROXY_SERVER_DYNAMIC_LOOKUP,
 	__RADIUS_PROXY_SERVER_MAX
 };
 
@@ -104,6 +105,7 @@ static const struct blobmsg_policy radius_proxy_server_policy[__RADIUS_PROXY_SER
 		[RADIUS_PROXY_SERVER_STATUS] = { .name = "statusServer", BLOBMSG_TYPE_BOOL },
 		[RADIUS_PROXY_SERVER_TLS] = { .name = "tls", BLOBMSG_TYPE_STRING },
 		[RADIUS_PROXY_SERVER_CERT_NAME_CHECK] = { .name = "certificateNameCheck", BLOBMSG_TYPE_BOOL },
+		[RADIUS_PROXY_SERVER_DYNAMIC_LOOKUP] = { .name = "dynamicLookupCommand", BLOBMSG_TYPE_STRING },
 };
 
 static const struct blobmsg_policy radius_proxy_realm_policy[__RADIUS_PROXY_REALM_MAX] = {
@@ -290,12 +292,19 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf)
 				"tls", uci_buf.head, &radius_proxy_tls_param, NULL);
 
 		blob_buf_init(&uci_buf, 0);
+		if (conf->auto_discover)
+		{ /* auto discover radsec server address via realm DNS NAPTR record */
+			blobmsg_add_string(&uci_buf, "dynamicLookupCommand", "/bin/dynamic_lookup.sh");
+		}
+		else
+		{
+			blobmsg_add_string(&uci_buf, "host", conf->server);
+			blobmsg_add_u32(&uci_buf, "port", conf->port);
+			blobmsg_add_string(&uci_buf, "secret", "radsec");
+		}
 		blobmsg_add_string(&uci_buf, "name", server_name);
-		blobmsg_add_string(&uci_buf, "host", conf->server);
 		blobmsg_add_string(&uci_buf, "type", "tls");
 		blobmsg_add_string(&uci_buf, "tls", tls_name);
-		blobmsg_add_u32(&uci_buf, "port", conf->port);
-		blobmsg_add_string(&uci_buf, "secret", "radsec");
 		blobmsg_add_bool(&uci_buf, "statusServer", 0);
 		blobmsg_add_bool(&uci_buf, "certificateNameCheck", 0);
 		blob_to_uci_section(uci, "radsecproxy", server_name, "server",
