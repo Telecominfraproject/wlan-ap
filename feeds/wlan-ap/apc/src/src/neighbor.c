@@ -491,7 +491,8 @@ static void inactivity_timer_hook(struct _timer * tmr)
 		apc_ifa->drip = MyIpAddr;
 		apc_ifa->bdrip = 0;
 		memset(&ApcSpec, 0, sizeof(struct apc_spec));
-		WaitingToReelect = 12;
+		WaitingToReelect = 3;
+
 		return;
 	}
 	printf("Inactivity timer expired for nbr %x on %s", n->rid, 
