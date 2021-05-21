@@ -35,11 +35,13 @@ extern json_t* ovsdb_table_where(ovsdb_table_t *table, void *record);
 
 enum {
 	RADIUS_PROXY_OPTIONS_LISTEN_UDP,
+	RADIUS_PROXY_OPTIONS_NAME,
 	__RADIUS_PROXY_OPTIONS_MAX
 };
 
 enum {
 	RADIUS_PROXY_CLIENT_NAME,
+	RADIUS_PROXY_CLIENT_HOST,
 	RADIUS_PROXY_CLIENT_TYPE,
 	RADIUS_PROXY_CLIENT_SECRET,
 	__RADIUS_PROXY_CLIENT_MAX
@@ -76,10 +78,12 @@ enum {
 
 static const struct blobmsg_policy radius_proxy_options_policy[__RADIUS_PROXY_OPTIONS_MAX] = {
 		[RADIUS_PROXY_OPTIONS_LISTEN_UDP] = { .name = "ListenUDP", BLOBMSG_TYPE_ARRAY },
+		[RADIUS_PROXY_OPTIONS_NAME] = { .name = "name", BLOBMSG_TYPE_STRING },
 };
 
 static const struct blobmsg_policy radius_proxy_client_policy[__RADIUS_PROXY_CLIENT_MAX] = {
 		[RADIUS_PROXY_CLIENT_NAME] = { .name = "name", BLOBMSG_TYPE_STRING },
+		[RADIUS_PROXY_CLIENT_HOST] = { .name = "host", BLOBMSG_TYPE_STRING },
 		[RADIUS_PROXY_CLIENT_TYPE] = { .name = "type", BLOBMSG_TYPE_STRING },
 		[RADIUS_PROXY_CLIENT_SECRET] = { .name = "secret", BLOBMSG_TYPE_STRING },
 };
@@ -209,9 +213,9 @@ static bool radsec_download_cert(char *cert_name, char *dir_name, char *cert_url
 	return true;
 }
 
-static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf )
+static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf)
 {
-	int i=0;
+	int i = 0;
 	char path[200];
 	char name[256];
 	char server_name[256] = {};
@@ -219,7 +223,6 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf )
 	char tls_name[256] = {};
 	struct schema_APC_State apc_conf;
 
-	/* Configure only if APC selects this as master AP (DR) */
 	json_t *where = ovsdb_table_where(&table_APC_State, &apc_conf);
 	if (false == ovsdb_table_select_one_where(&table_APC_State,
 			where, &apc_conf)) {
@@ -227,27 +230,26 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf )
 		return false;
 	}
 
-	if (!strncmp(apc_conf.mode, "OR", 2) || !strncmp(apc_conf.mode, "BDR", 2))
-		return false;
-
 	/* Configure options block */
 	blob_buf_init(&uci_buf, 0);
 	n = blobmsg_open_array(&uci_buf,"ListenUDP");
-	blobmsg_add_string(&uci_buf, NULL, "127.0.0.1:1812");
-	blobmsg_add_string(&uci_buf, NULL, "127.0.0.1:1813");
+	blobmsg_add_string(&uci_buf, NULL, "*:1812");
+	blobmsg_add_string(&uci_buf, NULL, "*:1813");
 	blobmsg_close_array(&uci_buf, n);
 	memset(name, '\0', sizeof(name));
 	sprintf(name, "%s%s", conf->radius_config_name, "options");
+	blobmsg_add_string(&uci_buf, "name", name);
 	blob_to_uci_section(uci, "radsecproxy", name, "options",
 			uci_buf.head, &radius_proxy_options_param, NULL);
 
 	/* Configure client block */
 	blob_buf_init(&uci_buf, 0);
-	blobmsg_add_string(&uci_buf, "name", "localhost");
+	blobmsg_add_string(&uci_buf, "host", "0.0.0.0/0");
 	blobmsg_add_string(&uci_buf, "type", "udp");
 	blobmsg_add_string(&uci_buf, "secret", "secret");
 	memset(name, '\0', sizeof(name));
 	sprintf(name, "%s%s", conf->radius_config_name, "client");
+	blobmsg_add_string(&uci_buf, "name", name);
 	blob_to_uci_section(uci, "radsecproxy", name, "client",
 			uci_buf.head, &radius_proxy_client_param, NULL);
 
