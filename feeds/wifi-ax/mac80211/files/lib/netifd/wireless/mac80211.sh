@@ -118,63 +118,6 @@ mac80211_add_he_capabilities() {
 	IFS="$oifs"
 }
 
-mac80211_get_seg0() {
-	local ht_mode="$1"
-	local seg0=0
-
-	case "$ht_mode" in
-		40)
-			if [ $freq -gt 5950 ] && [ $freq -le 7115 ]; then
-				case "$(( ($channel / 4) % 2 ))" in
-					1) seg0=$(($channel - 2));;
-					0) seg0=$(($channel + 2));;
-				esac
-			elif [ $freq != 5935 ]; then
-				case "$(( ($channel / 4) % 2 ))" in
-					1) seg0=$(($channel + 2));;
-					0) seg0=$(($channel - 2));;
-				esac
-			fi
-			;;
-		80)
-			if [ $freq -gt 5950 ] && [ $freq -le 7115 ]; then
-				case "$(( ($channel / 4) % 4 ))" in
-					0) seg0=$(($channel + 6));;
-					1) seg0=$(($channel + 2));;
-					2) seg0=$(($channel - 2));;
-					3) seg0=$(($channel - 6));;
-				esac
-			elif [ $freq != 5935 ]; then
-				case "$(( ($channel / 4) % 4 ))" in
-					1) seg0=$(($channel + 6));;
-					2) seg0=$(($channel + 2));;
-					3) seg0=$(($channel - 2));;
-					0) seg0=$(($channel - 6));;
-				esac
-			fi
-			;;
-		160)
-			if [ $freq -gt 5950 ] && [ $freq -le 7115 ]; then
-				case "$channel" in
-					1|5|9|13|17|21|25|29) seg0=15;;
-					33|37|41|45|49|53|57|61) seg0=47;;
-					65|69|73|77|81|85|89|93) seg0=79;;
-					97|101|105|109|113|117|121|125) seg0=111;;
-					129|133|137|141|145|149|153|157) seg0=143;;
-					161|165|169|173|177|181|185|189) seg0=175;;
-					193|197|201|205|209|213|217|221) seg0=207;;
-				esac
-			elif [ $freq != 5935 ]; then
-				case "$channel" in
-					36|40|44|48|52|56|60|64) seg0=50;;
-					100|104|108|112|116|120|124|128) seg0=114;;
-				esac
-			fi
-			;;
-	esac
-	printf "$seg0"
-}
-
 mac80211_hostapd_setup_base() {
 	local phy="$1"
 
@@ -422,43 +365,8 @@ mac80211_hostapd_setup_base() {
 	# 802.11ax
 	enable_ax=0
 	case "$htmode" in
-		HE20)   enable_ax=1
-			if [ $freq -gt 5950 ] && [ $freq -le 7115 ]; then
-				append base_cfg "op_class=131" "$N"
-			fi
-			;;
-		HE40)
+		HE20|HE40|HE80|	HE160)
 			enable_ax=1
-			idx="$(mac80211_get_seg0 "40")"
-			if [ $freq -ge 5180 ] && [ $freq != 5935 ]; then
-				if [ $freq -gt 5950 ] && [ $freq -le 7115 ]; then
-					append base_cfg "op_class=132" "$N"
-				fi
-				append base_cfg "he_oper_chwidth=0" "$N"
-				append base_cfg "he_oper_centr_freq_seg0_idx=$idx" "$N"
-			fi
-			;;
-		HE80)
-			enable_ax=1
-			idx="$(mac80211_get_seg0 "80")"
-			if [ $freq != 5935 ]; then
-				if [ $freq -gt 5950 ] && [ $freq -le 7115 ]; then
-					append base_cfg "op_class=133" "$N"
-				fi
-				append base_cfg "he_oper_chwidth=1" "$N"
-				append base_cfg "he_oper_centr_freq_seg0_idx=$idx" "$N"
-			fi
-			;;
-		HE160)
-			enable_ax=1
-			idx="$(mac80211_get_seg0 "160")"
-			if [ $freq != 5935 ]; then
-				if [ $freq -gt 5950 ] && [ $freq -le 7115 ]; then
-					append base_cfg "op_class=134" "$N"
-				fi
-				append base_cfg "he_oper_chwidth=2" "$N"
-				append base_cfg "he_oper_centr_freq_seg0_idx=$idx" "$N"
-			fi
 		;;
 	esac
 
