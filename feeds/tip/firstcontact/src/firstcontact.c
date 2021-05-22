@@ -7,7 +7,7 @@
 #include <libubox/ulog.h>
 
 static const char *file_cert = "/etc/ucentral/cert.pem";
-static const char *file_key  = "/etc/ucentral/cert.key";
+static const char *file_key  = "/etc/ucentral/key.pem";
 static const char *file_json = "/etc/ucentral/redirector.json";
 static const char *file_dbg  = "/tmp/firstcontact.hdr";
 
@@ -72,7 +72,7 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
-	if (asprintf(&url, "https://clientauth.demo.one.digicert.com/iot/api/v2/device/%s", devid) < 0) {
+	if (asprintf(&url, "https://clientauth.one.digicert.com/iot/api/v2/device/%s", devid) < 0) {
 		ULOG_ERR("failed to assemble url\n");
 		return -1;
 	}

@@ -45,7 +45,6 @@ function store_config(path) {
 	let cursor = uci.cursor(path);
 	cursor.load("ucentral");
 	cursor.set("ucentral", "config", "server", config.Redirector);
-	cursor.set("ucentral", "config", "serial", devid);
 	cursor.commit();
 }
 

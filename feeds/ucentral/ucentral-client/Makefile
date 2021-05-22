@@ -6,7 +6,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_URL=https://github.com/blogic/ucentral-client.git
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2021-02-15
-PKG_SOURCE_VERSION:=f90775e85fcfda8480cd1d3dca9ca44f71cb9807
+PKG_SOURCE_VERSION:=d58e7ed0424e98a9dcc4e07d3b8ace83aae8fb5f
 
 PKG_LICENSE:=BSD-3-Clause
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
