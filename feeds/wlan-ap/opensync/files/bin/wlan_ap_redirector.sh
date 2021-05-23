@@ -17,9 +17,10 @@ if [ -z "$1" ]; then
       exit 1
   fi
 
-  # TODO: this command should be retried if it fails
   digicert_device_id=`cat ${AP_DEVICE_ID_FILE}`
   device_data=`curl -s \
+    --retry 5 \
+    --show-error \
     --key "${AP_PRIVATE_KEY_FILE}" \
     --cert "${AP_CERTIFICATE_FILE}" \
     "https://${DIGICERT_API_URI}/iot/api/v2/device/${digicert_device_id}"`
@@ -29,7 +30,7 @@ if [ -z "$1" ]; then
     echo "No redirector found for this device"
     exit 1
   fi
-  controller_port=`echo ${controller_url} | cut -d ":" -f2)`
+  controller_port=`echo ${controller_url} | cut -s -d ":" -f2)`
   if [ -z "$controller_port" ]; then
     redirector_addr="ssl:${controller_url}:6643"
   else
@@ -39,6 +40,7 @@ else
   redirector_addr=$1
 fi
 
+echo "${redirector_addr}" > /usr/opensync/certs/redirector.txt
 uci set system.tip.redirector="${redirector_addr}"
 uci set system.tip.deployed=0
 uci commit system
