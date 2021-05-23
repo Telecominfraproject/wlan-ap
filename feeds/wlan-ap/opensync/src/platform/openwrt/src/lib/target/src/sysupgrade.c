@@ -291,7 +291,7 @@ static void cb_osp_start_factory_reboot(EV_P_ ev_timer *w, int events)
 	if (!strcmp(upg_url, "reboot"))
 		system("reboot");
 	else
-		system("jffs2reset -y -r");
+		system("wlan_ap_factory_reset.sh");
 
 	upg_running = false;
 
