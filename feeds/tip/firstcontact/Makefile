@@ -13,7 +13,7 @@ define Package/firstcontact
   SECTION:=ucentral
   CATEGORY:=uCentral
   TITLE:=TIP DigiCert firstcontact
-  DEPENDS:=+libubox +libcurl +libopenssl
+  DEPENDS:=+libubox +libcurl +libopenssl +certificates
 endef
 
 define Package/firstcontact/install

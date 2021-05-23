@@ -1,6 +1,6 @@
 include $(TOPDIR)/rules.mk
 
-PKG_NAME:=ucentral-defaults
+PKG_NAME:=certificates
 PKG_RELEASE:=1
 
 PKG_LICENSE:=BSD-3-Clause
@@ -8,14 +8,10 @@ PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 
 include $(INCLUDE_DIR)/package.mk
 
-define Package/ucentral-defaults
+define Package/certificates
   SECTION:=ucentral
   CATEGORY:=uCentral
-  TITLE:=ucentral-defaults
-endef
-
-define Package/ucentral-defaults/description
- The default configuration of the AP.
+  TITLE:=TIP DigiCer certificate store
 endef
 
 define Build/Prepare
@@ -27,8 +23,8 @@ define Build/Compile/Default
 endef
 Build/Compile = $(Build/Compile/Default)
 
-define Package/ucentral-defaults/install
+define Package/certificates/install
 	$(CP) ./files/* $(1)
 endef
 
-$(eval $(call BuildPackage,ucentral-defaults))
+$(eval $(call BuildPackage,certificates))

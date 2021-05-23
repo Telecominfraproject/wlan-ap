@@ -13,7 +13,7 @@ maverick_cb(struct uloop_timeout *delay)
 {
 	char link[PATH_MAX] = { };
 
-	if (!readlink("/etc/ucentral/ucentral.active", link, PATH_MAX) &&
+	if (readlink("/etc/ucentral/ucentral.active", link, PATH_MAX) != -1 &&
 	    strcmp(link, "/etc/ucentral/ucentral.cfg.0000000001")) {
 		ULOG_INFO("found an active symlink\n");
 		uloop_end();
