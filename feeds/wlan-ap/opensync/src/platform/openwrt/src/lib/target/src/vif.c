@@ -32,6 +32,7 @@
 
 extern ovsdb_table_t table_Wifi_VIF_Config;
 extern ovsdb_table_t table_Hotspot20_Icon_Config;
+extern ovsdb_table_t table_Radius_Proxy_Config;
 
 extern struct blob_buf b;
 extern struct blob_buf del;
@@ -1049,12 +1050,9 @@ void vif_section_del(char *section_name)
 
 void vif_check_radius_proxy()
 {
-	struct uci_context *uci_ctx;
-	struct uci_package *wireless;
 	struct schema_APC_State apc_conf;
-	struct uci_element *e = NULL, *tmp = NULL;
-	char *buf = NULL;
-	int rc = 0;
+	int n = 0;
+	void *buf = NULL;
 
 	json_t *where = ovsdb_table_where(&table_APC_State, &apc_conf);
 	if (false == ovsdb_table_select_one_where(&table_APC_State, where, &apc_conf))
@@ -1063,49 +1061,29 @@ void vif_check_radius_proxy()
 		return;
 	}
 
-	uci_ctx = uci_alloc_context();
-	rc = uci_load(uci_ctx, "wireless", &wireless);
-
-	if (rc) {
-		LOGE("%s: uci_load() failed with rc %d", __func__, rc);
-		goto free;
-	}
-
-	uci_foreach_element_safe(&wireless->sections, tmp, e)
+	buf = ovsdb_table_select_where(&table_Radius_Proxy_Config, NULL, &n);
+	if (!buf)
 	{
-		struct blob_attr *tb[__WIF_ATTR_MAX];
-		struct uci_section *s = uci_to_section(e);
-		if ((s == NULL) || (s->type == NULL))
-			continue;
+		LOGI("Radius_Proxy_Config table doesn't exist.  Stop radsecproxy service.");
+		system("/etc/init.d/radsecproxy stop");
+		return;
+	}
+	else if (!strcmp(apc_conf.mode, "DR"))
+	{
+		if (!system("pidof radsecproxy"))
+			goto out;
 
-		if (strcmp(s->type, "wifi-iface"))
-			continue;
-
-		blob_buf_init(&b, 0);
-		uci_to_blob(&b, s, &wifi_iface_param);
-		blobmsg_parse(wifi_iface_policy, __WIF_ATTR_MAX, tb, blob_data(b.head), blob_len(b.head));
-
-		if (tb[WIF_ATTR_RADPROXY])
-		{
-			buf = blobmsg_get_string(tb[WIF_ATTR_RADPROXY]);
-
-			if (!strcmp(buf, "1") && !strcmp(apc_conf.mode, "DR"))
-			{
-				if (!system("pidof radsecproxy"))
-					goto free;
-
-				system("/etc/init.d/radsecproxy start");
-
-				goto free;
-			}
-		}
+		LOGI("Start radsecproxy service.");
+		system("/etc/init.d/radsecproxy start");
+	}
+	else
+	{
+		LOGI("Not DR. Stop radsecproxy service.");
+		system("/etc/init.d/radsecproxy stop");
 	}
 
-	system("/etc/init.d/radsecproxy stop");
-
-free:
-	uci_unload(uci_ctx, wireless);
-	uci_free_context(uci_ctx);
+out:
+	free(buf);
 	return;
 }
 
@@ -1659,9 +1637,6 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 	{
 		vif_dhcp_opennds_allowlist_set(vconf,(char*)vconf->if_name);
 	}
-
-	if (changed->custom_options)
-		vif_check_radius_proxy();
 
 	reload_config = 1;
 	return 0;
