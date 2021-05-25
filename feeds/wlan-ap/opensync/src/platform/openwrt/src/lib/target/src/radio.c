@@ -31,6 +31,7 @@
 ovsdb_table_t table_Hotspot20_Config;
 ovsdb_table_t table_Hotspot20_OSU_Providers;
 ovsdb_table_t table_Hotspot20_Icon_Config;
+ovsdb_table_t table_Radius_Proxy_Config;
 
 ovsdb_table_t table_APC_Config;
 ovsdb_table_t table_APC_State;

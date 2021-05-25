@@ -27,7 +27,6 @@
 #include "utils.h"
 #include "radius_proxy.h"
 
-ovsdb_table_t table_Radius_Proxy_Config;
 struct blob_buf uci_buf = {};
 struct blob_attr *n;
 extern ovsdb_table_t table_APC_State;
@@ -399,10 +398,12 @@ void callback_Radius_Proxy_Config(ovsdb_update_monitor_t *self,
 	case OVSDB_UPDATE_NEW:
 	case OVSDB_UPDATE_MODIFY:
 		(void) radius_proxy_config_set(conf);
+		vif_check_radius_proxy();
 		break;
 
 	case OVSDB_UPDATE_DEL:
 		(void) radius_proxy_config_delete();
+		vif_check_radius_proxy();
 		break;
 
 	default:
