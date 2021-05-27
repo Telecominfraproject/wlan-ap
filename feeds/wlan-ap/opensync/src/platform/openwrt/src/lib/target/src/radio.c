@@ -409,8 +409,26 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 
 	if ((changed->ht_mode) || (changed->hw_mode) || (changed->freq_band)) {
 		int channel_freq;
+		char buffer[8];
+		FILE *confFile_p;
+		const char* hw_mode = rconf->hw_mode;
+
 		channel_freq = ieee80211_channel_to_frequency(rconf->channel);
-		struct mode_map *m = mode_map_get_uci(rconf->freq_band, get_max_channel_bw_channel(channel_freq, rconf->ht_mode), rconf->hw_mode);
+		if (!strcmp(rconf->hw_mode, "auto")) {
+			char command[] = "auto-conf ";
+			strcat(command, phy);
+			confFile_p = popen(command, "r");
+			
+			if (confFile_p)
+			{
+				fgets(buffer, sizeof(buffer), confFile_p);
+				pclose(confFile_p);
+				buffer[strlen(buffer) - 1] = '\0'; // Remove extra \n that got added from 'echo' in script
+				hw_mode = buffer;
+			}
+		}
+
+		struct mode_map *m = mode_map_get_uci(rconf->freq_band, get_max_channel_bw_channel(channel_freq, rconf->ht_mode), hw_mode);
 		if (m) {
 			blobmsg_add_string(&b, "htmode", m->ucihtmode);
 			blobmsg_add_string(&b, "hwmode", m->ucihwmode);
