@@ -26,7 +26,6 @@ drv_mac80211_init_device_config() {
 	hostapd_common_add_device_config
 
 	config_add_string path phy 'macaddr:macaddr'
-	config_add_string hwmode
 	config_add_string tx_burst
 	config_add_string distance
 	config_add_int beacon_int chanbw frag rts
@@ -44,11 +43,24 @@ drv_mac80211_init_device_config() {
 		su_beamformee \
 		mu_beamformer \
 		mu_beamformee \
+		he_su_beamformer \
+		he_su_beamformee \
+		he_mu_beamformer \
 		vht_txop_ps \
 		htc_vht \
 		rx_antenna_pattern \
-		tx_antenna_pattern
-	config_add_int vht_max_a_mpdu_len_exp vht_max_mpdu vht_link_adapt vht160 rx_stbc tx_stbc
+		tx_antenna_pattern \
+		he_spr_sr_control \
+		he_twt_required
+	config_add_int \
+		vht_max_a_mpdu_len_exp \
+		vht_max_mpdu \
+		vht_link_adapt \
+		vht160 \
+		rx_stbc \
+		tx_stbc \
+		he_bss_color \
+		he_spr_non_srg_obss_pd_max_offset
 	config_add_boolean \
 		ldpc \
 		greenfield \
@@ -56,13 +68,6 @@ drv_mac80211_init_device_config() {
 		short_gi_40 \
 		max_amsdu \
 		dsss_cck_40
-	config_add_int \
-		he_su_beamformer \
-		he_su_beamformee \
-		he_mu_beamformer \
-		he_bss_color \
-		he_spr_sr_control \
-		he_spr_non_srg_obss_pd_max_offset
 }
 
 drv_mac80211_init_iface_config() {
@@ -76,7 +81,6 @@ drv_mac80211_init_iface_config() {
 	config_add_int max_listen_int
 	config_add_int dtim_period
 	config_add_int start_disabled
-	config_add_int he_twt_required he_spr_sr_control
 
 	# mesh
 	config_add_string mesh_id
@@ -112,7 +116,10 @@ mac80211_add_he_capabilities() {
 	for capab in "$@"; do
 		set -- $capab
 		[ "$(($4))" -gt 0 ] || continue
-		[ "$(((0x$2) & $3))" -gt 0 ] || continue
+		[ "$(((0x$2) & $3))" -gt 0 ] || {
+			eval "$4=0"
+			continue
+		}
 		append base_cfg "$1=1" "$N"
 	done
 	IFS="$oifs"
@@ -197,11 +204,6 @@ mac80211_hostapd_setup_base() {
 		[ "$rx_stbc" -lt "$cap_rx_stbc" ] && cap_rx_stbc="$rx_stbc"
 		ht_cap_mask="$(( ($ht_cap_mask & ~(0x300)) | ($cap_rx_stbc << 8) ))"
 
-		conf_tx_ant=$(iw phy "$phy" info | grep 'Configured Antennas:' | cut -d: -f2)
-		set -- $conf_tx_ant
-		if [ "$2" == "0x1" -o "$2" == "0x10" ]; then
-			tx_stbc=0
-		fi
 		mac80211_add_capabilities ht_capab_flags $ht_cap_mask \
 			LDPC:0x1::$ldpc \
 			GF:0x10::$greenfield \
@@ -222,12 +224,14 @@ mac80211_hostapd_setup_base() {
 	enable_ac=0
 	vht_oper_chwidth=0
 	vht_center_seg0=
+	chan_ofs=0
+	[ "$band" = "6g" ] && chan_ofs=1
 
 	idx="$channel"
 	case "$htmode" in
 		VHT20|HE20) enable_ac=1;;
 		VHT40|HE40)
-			case "$(( ($channel / 4) % 2 ))" in
+			case "$(( (($channel / 4) + $chan_ofs) % 2 ))" in
 				1) idx=$(($channel + 2));;
 				0) idx=$(($channel - 2));;
 			esac
@@ -235,7 +239,7 @@ mac80211_hostapd_setup_base() {
 			vht_center_seg0=$idx
 		;;
 		VHT80|HE80)
-			case "$(( ($channel / 4) % 4 ))" in
+			case "$(( (($channel / 4) + $chan_ofs) % 4 ))" in
 				1) idx=$(($channel + 6));;
 				2) idx=$(($channel + 2));;
 				3) idx=$(($channel - 2));;
@@ -246,15 +250,35 @@ mac80211_hostapd_setup_base() {
 			vht_center_seg0=$idx
 		;;
 		VHT160|HE160)
-			case "$channel" in
-				36|40|44|48|52|56|60|64) idx=50;;
-				100|104|108|112|116|120|124|128) idx=114;;
-			esac
+			if [ "$band" = "6g" ]; then
+				case "$channel" in
+					1|5|9|13|17|21|25|29) idx=15;;
+					33|37|41|45|49|53|57|61) idx=47;;
+					65|69|73|77|81|85|89|93) idx=79;;
+					97|101|105|109|113|117|121|125) idx=111;;
+					129|133|137|141|145|149|153|157) idx=143;;
+					161|165|169|173|177|181|185|189) idx=175;;
+					193|197|201|205|209|213|217|221) idx=207;;
+				esac
+			else
+				case "$channel" in
+					36|40|44|48|52|56|60|64) idx=50;;
+					100|104|108|112|116|120|124|128) idx=114;;
+				esac
+			fi
 			enable_ac=1
 			vht_oper_chwidth=2
 			vht_center_seg0=$idx
 		;;
 	esac
+	[ "$band" = "6g" ] && {
+		op_class=
+		case "$htmode" in
+			HE20) op_class=131;;
+			HE*) op_class=$((132 + $vht_oper_chwidth))
+		esac
+		[ -n "$op_class" ] && append base_cfg "op_class=$op_class" "$N"
+	}
 	[ "$hwmode" = "a" ] || enable_ac=0
 
 	if [ "$enable_ac" != "0" ]; then
@@ -291,11 +315,6 @@ mac80211_hostapd_setup_base() {
 		[ "$rx_stbc" -lt "$cap_rx_stbc" ] && cap_rx_stbc="$rx_stbc"
 		vht_cap="$(( ($vht_cap & ~(0x700)) | ($cap_rx_stbc << 8) ))"
 
-		conf_tx_ant=$(iw phy "$phy" info | grep 'Configured Antennas:' | cut -d: -f2)
-		set -- $conf_tx_ant
-		if [ "$2" == "0x1" -o "$2" == "0x10" ]; then
-			tx_stbc_2by1=0
-		fi
 		mac80211_add_capabilities vht_capab $vht_cap \
 			RXLDPC:0x10::$rxldpc \
 			SHORT-GI-80:0x20::$short_gi_80 \
@@ -365,9 +384,7 @@ mac80211_hostapd_setup_base() {
 	# 802.11ax
 	enable_ax=0
 	case "$htmode" in
-		HE20|HE40|HE80|	HE160)
-			enable_ax=1
-		;;
+		HE*) enable_ax=1 ;;
 	esac
 
 	if [ "$enable_ax" != "0" ]; then
@@ -378,19 +395,19 @@ mac80211_hostapd_setup_base() {
 			he_twt_required:0 \
 			he_spr_sr_control:0 \
 			he_spr_non_srg_obss_pd_max_offset:1 \
-			he_bss_color:64 
+			he_bss_color
 
-
-		append base_cfg "ieee80211ax=1" "$N"
-		append base_cfg "he_bss_color=$he_bss_color" "$N"
-		[ "$hwmode" = "a" ] && {
-			append base_cfg "he_oper_chwidth=$vht_oper_chwidth" "$N"
-			append base_cfg "he_oper_centr_freq_seg0_idx=$vht_center_seg0" "$N"
-		}
 		he_phy_cap=$(iw phy "$phy" info | awk -F "[()]" '/HE PHY Capabilities/ { print $2 }' | head -1)
 		he_phy_cap=${he_phy_cap:2}
 		he_mac_cap=$(iw phy "$phy" info | awk -F "[()]" '/HE MAC Capabilities/ { print $2 }' | head -1)
 		he_mac_cap=${he_mac_cap:2}
+
+		append base_cfg "ieee80211ax=1" "$N"
+		[ -n "$he_bss_color" ] && append base_cfg "he_bss_color=$he_bss_color" "$N"
+		[ "$hwmode" = "a" ] && {
+			append base_cfg "he_oper_chwidth=$vht_oper_chwidth" "$N"
+			append base_cfg "he_oper_centr_freq_seg0_idx=$vht_center_seg0" "$N"
+		}
 
 		mac80211_add_he_capabilities \
 			he_su_beamformer:${he_phy_cap:6:2}:0x80:$he_su_beamformer \
@@ -399,10 +416,7 @@ mac80211_hostapd_setup_base() {
 			he_spr_sr_control:${he_phy_cap:14:2}:0x1:$he_spr_sr_control \
 			he_twt_required:${he_mac_cap:0:2}:0x6:$he_twt_required
 
-		[ "$he_spr_sr_control" != "0" ] && {
-			append base_cfg "he_spr_sr_control=$he_spr_sr_control" "$N"
-			append base_cfg "he_spr_non_srg_obss_pd_max_offset=$he_spr_non_srg_obss_pd_max_offset" "$N"
-		}
+		[ "$he_spr_sr_control" -gt 0 ] && append base_cfg "he_spr_non_srg_obss_pd_max_offset=$he_spr_non_srg_obss_pd_max_offset" "$N"
 
 		append base_cfg "he_default_pe_duration=4" "$N"
 		append base_cfg "he_rts_threshold=1023" "$N"
@@ -484,7 +498,6 @@ mac80211_get_addr() {
 
 mac80211_generate_mac() {
 	local phy="$1"
-	local multiple_bssid="$2"
 	local id="${macidx:-0}"
 
 	local ref="$(cat /sys/class/ieee80211/${phy}/macaddress)"
@@ -493,7 +506,7 @@ mac80211_generate_mac() {
 	[ "$mask" = "00:00:00:00:00:00" ] && {
 		mask="ff:ff:ff:ff:ff:ff";
 
-		[ "$(wc -l < /sys/class/ieee80211/${phy}/addresses)" -gt 1 ] && {
+		[ "$(wc -l < /sys/class/ieee80211/${phy}/addresses)" -gt $id ] && {
 			addr="$(mac80211_get_addr "$phy" "$id")"
 			[ -n "$addr" ] && {
 				echo "$addr"
@@ -509,16 +522,11 @@ mac80211_generate_mac() {
 
 	local oIFS="$IFS"; IFS=":"; set -- $ref; IFS="$oIFS"
 
-	[ "$multiple_bssid" -eq 1 ] && {
-		printf "02:%s:%s:%s:%s:%02x" $b1 $2 $3 $4 $5 $macidx
-		return
-	}
-
 	macidx=$(($id + 1))
 	[ "$((0x$mask1))" -gt 0 ] && {
 		b1="0x$1"
 		[ "$id" -gt 0 ] && \
-			b1=$(($b1 ^ ((($id - !($b1 & 2)) << 2) | 0x2)))
+			b1=$(($b1 ^ ((($id - !($b1 & 2)) << 2)) | 0x2))
 		printf "%02x:%s:%s:%s:%s:%s" $b1 $2 $3 $4 $5 $6
 		return
 	}
@@ -622,7 +630,6 @@ mac80211_iw_interface_add() {
 }
 
 mac80211_prepare_vif() {
-	local multiple_bssid=$1
 	json_select config
 
 	json_get_vars ifname mode ssid wds powersave macaddr enable wpa_psk_file vlan_file
@@ -636,7 +643,7 @@ mac80211_prepare_vif() {
 	json_select ..
 
 	[ -n "$macaddr" ] || {
-		macaddr="$(mac80211_generate_mac $phy $multiple_bssid)"
+		macaddr="$(mac80211_generate_mac $phy)"
 		macidx="$(($macidx + 1))"
 	}
 
@@ -777,17 +784,10 @@ mac80211_setup_supplicant_noctl() {
 
 mac80211_prepare_iw_htmode() {
 	case "$htmode" in
-		VHT20|HT20|HE20) iw_htmode=HT20;;
-		HT40*|VHT40|VHT160|\
-		HE40|HE40|HE160)
-			case "$hwmode" in
-				a)
-					case "$(( ($channel / 4) % 2 ))" in
-						1) iw_htmode="HT40+" ;;
-						0) iw_htmode="HT40-";;
-					esac
-				;;
-				*)
+		VHT20|HT20) iw_htmode=HT20;;
+		HT40*|VHT40|VHT160)
+			case "$band" in
+				2g)
 					case "$htmode" in
 						HT40+) iw_htmode="HT40+";;
 						HT40-) iw_htmode="HT40-";;
@@ -800,10 +800,16 @@ mac80211_prepare_iw_htmode() {
 						;;
 					esac
 				;;
+				*)
+					case "$(( ($channel / 4) % 2 ))" in
+						1) iw_htmode="HT40+" ;;
+						0) iw_htmode="HT40-";;
+					esac
+				;;
 			esac
 			[ "$auto_channel" -gt 0 ] && iw_htmode="HT40+"
 		;;
-		VHT80|HE80)
+		VHT80)
 			iw_htmode="80MHZ"
 		;;
 		NONE|NOHT)
@@ -909,7 +915,6 @@ mac80211_setup_vif() {
 		mesh)
 			wireless_vif_parse_encryption
 			[ -z "$htmode" ] && htmode="NOHT";
-			freq="$(get_freq "$phy" "$channel")"
 			if [ "$wpa" -gt 0 -o "$auto_channel" -gt 0 ] || chan_is_dfs "$phy" "$channel"; then
 				mac80211_setup_supplicant $vif_enable || failed=1
 			else
@@ -923,7 +928,6 @@ mac80211_setup_vif() {
 		adhoc)
 			wireless_vif_parse_encryption
 			if [ "$wpa" -gt 0 -o "$auto_channel" -gt 0 ]; then
-				freq="$(get_freq "$phy" "$channel")"
 				mac80211_setup_supplicant_noctl $vif_enable || failed=1
 			else
 				mac80211_setup_adhoc $vif_enable
@@ -940,9 +944,29 @@ mac80211_setup_vif() {
 
 get_freq() {
 	local phy="$1"
-	local chan="$2"
-	iw "$phy" info | grep -E -m1 "(\* ${chan:-....} MHz${chan:+|\\[$chan\\]})" | grep MHz | awk '{print $2}'
+	local channel="$2"
+	local band="$3"
+
+	case "$band" in
+		2g) band="1:";;
+		5g) band="2:";;
+		60g) band="3:";;
+		6g) band="4:";;
+	esac
+
+	iw "$phy" info | awk -v band="$band" -v channel="[$channel]" '
+
+$1 ~ /Band/ {
+	band_match = band == $2
 }
+
+band_match && $3 == "MHz" && $4 == channel {
+	print $2
+	exit
+}
+'
+}
+
 
 chan_is_dfs() {
 	local phy="$1"
@@ -987,8 +1011,7 @@ drv_mac80211_setup() {
 		country chanbw distance \
 		txpower antenna_gain \
 		rxantenna txantenna \
-		frag rts beacon_int:100 htmode \
-		multiple_bssid:0
+		frag rts beacon_int:100 htmode
 	json_get_values basic_rate_list basic_rate
 	json_get_values scan_list scan_list
 	json_select ..
@@ -1027,7 +1050,7 @@ drv_mac80211_setup() {
 	done
 
 	# convert channel to frequency
-	[ "$auto_channel" -gt 0 ] || freq="$(get_freq "$phy" "$channel")"
+	[ "$auto_channel" -gt 0 ] || freq="$(get_freq "$phy" "$channel" "$band")"
 
 	[ -n "$country" ] && {
 		iw reg get | grep -q "^country $country:" || {
@@ -1083,7 +1106,7 @@ drv_mac80211_setup() {
 	mac80211_prepare_iw_htmode
 	for_each_interface "sta adhoc mesh monitor" mac80211_prepare_vif
 	NEWAPLIST=
-	for_each_interface "ap" mac80211_prepare_vif ${multiple_bssid}
+	for_each_interface "ap" mac80211_prepare_vif
 	NEW_MD5=$(test -e "${hostapd_conf_file}" && md5sum ${hostapd_conf_file})
 	OLD_MD5=$(uci -q -P /var/state get wireless._${phy}.md5)
 	if [ "${NEWAPLIST}" != "${OLDAPLIST}" ]; then
@@ -1111,15 +1134,14 @@ drv_mac80211_setup() {
 		if [ "$no_reload" != "0" ]; then
 			add_ap=1
 			ubus wait_for hostapd
-			ubus call hostapd config_add "{\"iface\":\"$primary_ap\", \"config\":\"${hostapd_conf_file}\"}"
-			local hostapd_pid=$(ubus call service list '{"name": "wpad"}' | jsonfilter -l 1 -e "@['wpad'].instances['hostapd'].pid")
-			wireless_add_process "$hostapd_pid" "/usr/sbin/hostapd" 1
+			local hostapd_res="$(ubus call hostapd config_add "{\"iface\":\"$primary_ap\", \"config\":\"${hostapd_conf_file}\"}")"
+			ret="$?"
+			[ "$ret" != 0 -o -z "$hostapd_res" ] && {
+				wireless_setup_failed HOSTAPD_START_FAILED
+				return
+			}
+			wireless_add_process "$(jsonfilter -s "$hostapd_res" -l 1 -e @.pid)" "/usr/sbin/hostapd" 1 1
 		fi
-		ret="$?"
-		[ "$ret" != 0 ] && {
-			wireless_setup_failed HOSTAPD_START_FAILED
-			return
-		}
 	}
 	uci -q -P /var/state set wireless._${phy}.aplist="${NEWAPLIST}"
 	uci -q -P /var/state set wireless._${phy}.md5="${NEW_MD5}"
