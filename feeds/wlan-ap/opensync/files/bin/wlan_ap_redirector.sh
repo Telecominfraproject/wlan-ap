@@ -41,6 +41,8 @@ else
 fi
 
 echo "${redirector_addr}" > /usr/opensync/certs/redirector.txt
+/etc/init.d/uhttpd enable
+/etc/init.d/uhttpd start
 uci set system.tip.redirector="${redirector_addr}"
 uci set system.tip.deployed=0
 uci commit system
