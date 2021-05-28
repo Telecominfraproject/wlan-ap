@@ -6,7 +6,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_URL=https://github.com/blogic/ucentral-event.git
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2021-04-13
-PKG_SOURCE_VERSION:=f3a32527c89cdcbecf7d8b7c0ab59677401a74d2
+PKG_SOURCE_VERSION:=863be47d264ea3fefccadfcfa53c1af53f54dd3b
 
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=BSD-3-Clause
