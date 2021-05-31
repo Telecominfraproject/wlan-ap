@@ -9,7 +9,7 @@
 var callUciCommit = rpc.declare({
 	object: 'uci',
 	method: 'commit',
-	params: [ 'config' ]
+	params: [ 'ucentral', 'network' ]
 });
 
 var callLuciSetPassword = rpc.declare({
@@ -136,7 +136,6 @@ return view.extend({
 	load: function() {
 		return Promise.all([
 			uci.load('network'),
-			uci.load('ucentral'),
 			callSystemBoard().then(function(reply) {
 				formSystemBoard = reply;
 			})
@@ -321,8 +320,6 @@ return view.extend({
 		var m = L.dom.findClassInstance(document.querySelector('.cbi-map'));
 
 		return m.save().then(L.bind(function() {
-			uci.set('config', 'config', 'server', formdata.data.data.certificates.redirector);
-			uci.set('config', 'mqtt', 'server', formdata.data.data.certificates.redirector);
 			return this.handleApply().then(function() {
 				return ui.uploadFile('/tmp/certs.tar').then(function(res) {
 					showProgress(_('Uploading certificate…'), false);
@@ -365,7 +362,6 @@ return view.extend({
 		return uci.save().then(function() {
 			return Promise.all([
 				callUciCommit('network'),
-				callUciCommit('ucentral')
 			]);
 		}).catch(function(err) {
 			ui.addNotification(null, [ E('p', [ _('Failed to save configuration: %s').format(err) ]) ])
@@ -467,8 +463,6 @@ return view.extend({
 		o.onclick = ui.createHandlerFn(this, 'handleReboot');
 
 		s = m.section(form.NamedSection, 'certificates', 'certificates', _('Upgrade Certificates'));
-
-		o = s.option(form.Value, 'redirector', _('Redirector'));
 
 		o = s.option(form.Button, 'upgrade', _('Certificate upload'));
 		o.inputtitle = _('Upload certificate…');

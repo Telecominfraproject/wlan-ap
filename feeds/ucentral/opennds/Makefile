@@ -72,6 +72,9 @@ define Package/opennds/install
 	$(CP) $(PKG_BUILD_DIR)/forward_authentication_service/fas-aes/fas-aes.php $(1)/etc/opennds/
 	$(CP) $(PKG_BUILD_DIR)/forward_authentication_service/fas-hid/fas-hid.php $(1)/etc/opennds/
 	$(CP) $(PKG_BUILD_DIR)/forward_authentication_service/fas-aes/fas-aes-https.php $(1)/etc/opennds/
+
+	# TIP tweaks
+	$(CP) ./files/* $(1)/
 endef
 
 define Package/opennds/postrm
