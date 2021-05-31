@@ -195,22 +195,34 @@ int phy_from_path(char *_path, char *phy, unsigned int idx)
 	return ret;
 }
 
-int phy_find_hwmon(char *phy, char *hwmon)
+int phy_find_hwmon_helper(char *dir, char *file, char *hwmon)
 {
-	char tmp[PATH_MAX];
 	glob_t gl;
-
-	*hwmon = '\0';
-	snprintf(tmp, sizeof(tmp), "/sys/class/ieee80211/%s/device/hwmon/*", phy);
-	if (glob(tmp, GLOB_NOSORT | GLOB_MARK, NULL, &gl))
-                return -1;
+	if (glob(dir, GLOB_NOSORT | GLOB_MARK, NULL, &gl))
+		return -1;
 	if (gl.gl_pathc) {
 		strcpy(hwmon, gl.gl_pathv[0]);
-		strncat(hwmon, "temp1_input", PATH_MAX);
+		strncat(hwmon, file, PATH_MAX);
 	}
 	globfree(&gl);
-
 	return 0;
+}
+
+int phy_find_hwmon(char *phy, char *hwmon, bool *DegreesNotMilliDegrees)
+{
+	char tmp[PATH_MAX];
+	*hwmon = '\0';
+	snprintf(tmp, sizeof(tmp), "/sys/class/ieee80211/%s/device/hwmon/*", phy);
+	if (!phy_find_hwmon_helper(tmp, "temp1_input", hwmon)) {
+		*DegreesNotMilliDegrees=false;
+		return 0;
+	}
+	snprintf(tmp, sizeof(tmp), "/sys/class/ieee80211/%s/cooling_device/subsystem/thermal_zone0/", phy);
+	if (!phy_find_hwmon_helper(tmp, "temp", hwmon)) {
+		*DegreesNotMilliDegrees=true;
+		return 0;
+	}
+	return -1;
 }
 
 int phy_get_mac(char *phy, char *mac)
