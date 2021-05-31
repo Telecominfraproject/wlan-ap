@@ -5,7 +5,7 @@
 
 extern int phy_from_path(char *path, char *phy);
 extern int phy_get_mac(char *phy, char *mac);
-extern int phy_find_hwmon(char *path, char *hwmon);
+extern int phy_find_hwmon(char *phy, char *hwmon, bool *DegreesNotMilliDegrees);
 extern int phy_get_tx_chainmask(const char *name);
 extern int phy_get_rx_chainmask(const char *name);
 extern int phy_get_tx_available_antenna(const char *name);
