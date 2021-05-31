@@ -350,12 +350,12 @@ bool target_stats_device_temp_get(radio_entry_t *radio_cfg, dpp_device_temp_t *t
 	char hwmon_path[PATH_MAX];
 	int32_t temperature;
 	FILE *fp = NULL;
+	bool DegreesNotMilliDegrees;
 
-	if (phy_find_hwmon(target_map_ifname(radio_cfg->phy_name), hwmon_path)) {
+	if (phy_find_hwmon(target_map_ifname(radio_cfg->phy_name), hwmon_path, &DegreesNotMilliDegrees)) {
 		LOG(ERR, "%s: hwmon is missing", radio_cfg->phy_name);
 		return false;
 	}
-
 	fp = fopen(hwmon_path, "r");
 	if (!fp) {
 		LOG(ERR, "%s: Failed to open temp input files", radio_cfg->phy_name);
@@ -372,7 +372,10 @@ bool target_stats_device_temp_get(radio_entry_t *radio_cfg, dpp_device_temp_t *t
 
 	fclose(fp);
 	temp_entry->type  = radio_cfg->type;
-	temp_entry->value = temperature / 1000;
+	if(DegreesNotMilliDegrees)
+		temp_entry->value = temperature;
+	else
+		temp_entry->value = temperature / 1000;
 
 	return true;
 }

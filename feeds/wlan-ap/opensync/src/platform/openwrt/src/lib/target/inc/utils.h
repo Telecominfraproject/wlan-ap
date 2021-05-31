@@ -41,4 +41,5 @@ extern int net_get_mtu(char *iface);
 extern int net_get_mac(char *iface, char *mac);
 extern int net_is_bridge(char *iface);
 extern char* get_max_channel_bw_channel(int channel_freq, const char* htmode);
+int phy_find_hwmon_helper(char *dir, char *file, char *hwmon);
 #endif
