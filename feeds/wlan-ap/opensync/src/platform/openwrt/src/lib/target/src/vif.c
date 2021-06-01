@@ -388,7 +388,8 @@ static int vif_config_security_set(struct blob_buf *b,
 	const char *mode = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_MODE);
 	unsigned int i;
 	unsigned int acct_interval;
-	const char *auth_server, *auth_port, *auth_secret, *security_key, *acct_server;
+	const char *auth_server, *auth_port, *auth_secret, *security_key;
+	const char *acct_server, *acct_port, *acct_secret;
 	char key_str[64], key_holder_str[128];
 	struct schema_APC_State apc_conf;
 	const char *local_server = "127.0.0.1";
@@ -410,7 +411,7 @@ static int vif_config_security_set(struct blob_buf *b,
 
 		if (vif_crypto[i].enterprise) {
 
-			if (vif_config_custom_opt_get_proxy(vconf)) {
+			if (vif_config_custom_opt_get_proxy(vconf)) { /* Radius Proxy Enabled */
 				LOGN("%s: Apply Proxy Security Settings", vconf->if_name);
 				json_t *where = ovsdb_table_where(&table_APC_State, &apc_conf);
 				if (false == ovsdb_table_select_one_where(&table_APC_State,
@@ -430,16 +431,22 @@ static int vif_config_security_set(struct blob_buf *b,
 					auth_server = local_server;
 					acct_server = local_server;
 				}
+				auth_port = "1812";
+				auth_secret = "secret";
+				acct_port = "1813";
+				acct_secret = "secret";
 			}
-			else
+			else /* Radius Proxy Disabled */
 			{
 				auth_server = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_IP);
 				acct_server = SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_IP);
+				auth_port   = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_PORT);
+				auth_secret = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_SECRET);
+				acct_port = SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_PORT);
+				acct_secret = SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_SECRET);
 			}
 
 			acct_interval = 0;
-			auth_port   = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_PORT);
-			auth_secret = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_RADIUS_SECRET);
 
 			LOGT("%s: Server IP %s port %s secret %s", vconf->if_name, auth_server, auth_port, auth_secret);
 			if (!auth_server[0] || !auth_port[0] || !auth_secret[0]) {
@@ -451,10 +458,8 @@ static int vif_config_security_set(struct blob_buf *b,
 			blobmsg_add_string(b, "auth_port",   auth_port );
 			blobmsg_add_string(b, "auth_secret", auth_secret );
 			blobmsg_add_string(b, "acct_server", acct_server);
-			blobmsg_add_string(b, "acct_port",
-					   SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_PORT));
-			blobmsg_add_string(b, "acct_secret",
-					   SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_SECRET));
+			blobmsg_add_string(b, "acct_port", acct_port);
+			blobmsg_add_string(b, "acct_secret", acct_secret);
 			blobmsg_add_bool(b, "request_cui", 1);
 			acct_interval = atoi(SCHEMA_KEY_VAL(vconf->security, OVSDB_SECURITY_RADIUS_ACCT_INTERVAL));
 
