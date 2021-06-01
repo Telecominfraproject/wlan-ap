@@ -37,8 +37,8 @@
 #include "radio.h"
 
 extern struct ev_loop *wifihal_evloop;
-static int nl80211_scan_started;
-static struct unl unl;
+static struct unl unl_req;
+static struct unl unl_notify;
 static ev_io unl_io;
 
 struct nl80211_scan {
@@ -345,7 +345,7 @@ static struct nl_msg *nl80211_call_phy(char *name, int cmd, bool dump)
 	if (idx < 0)
 		return NULL;
 
-	msg = unl_genl_msg(&unl, cmd, dump);
+	msg = unl_genl_msg(&unl_req, cmd, dump);
 	nla_put_u32(msg, NL80211_ATTR_WIPHY, idx);
 
 	return msg;
@@ -461,7 +461,7 @@ static void nl80211_ev(struct ev_loop *ev, struct ev_io *io, int event)
 	nl_cb_set(cb, NL_CB_FINISH, NL_CB_CUSTOM, finish_handler, NULL);
 	nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, no_seq_check, NULL);
 	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, nl80211_recv, NULL);
-	nl_recvmsgs(unl.sock, cb);
+	nl_recvmsgs(unl_notify.sock, cb);
 	nl_cb_put(cb);
 }
 
@@ -470,18 +470,10 @@ static struct nl_msg *nl80211_call_vif(struct nl_call_param *nl_call_param, int 
 	int idx = if_nametoindex(nl_call_param->ifname);
 	struct nl_msg *msg;
 
-	if (!nl80211_scan_started) {
-		unl_genl_subscribe(&unl, "scan");
-
-		ev_io_init(&unl_io, nl80211_ev, unl.sock->s_fd, EV_READ);
-		ev_io_start(wifihal_evloop, &unl_io);
-		nl80211_scan_started = 1;
-	}
-
 	if (!idx)
 		return NULL;
 
-	msg = unl_genl_msg(&unl, cmd, dump);
+	msg = unl_genl_msg(&unl_req, cmd, dump);
 	nla_put_u32(msg, NL80211_ATTR_IFINDEX, idx);
 
 	return msg;
@@ -494,7 +486,7 @@ int nl80211_get_tx_chainmask(char *name, unsigned int *mask)
 	if (!msg)
 		return -1;
 
-	return unl_genl_request(&unl, msg, nl80211_chainmask_recv, mask);
+	return unl_genl_request(&unl_req, msg, nl80211_chainmask_recv, mask);
 }
 
 int nl80211_get_oper_channel(char *name, unsigned int *chan)
@@ -505,10 +497,10 @@ int nl80211_get_oper_channel(char *name, unsigned int *chan)
 	if (!idx)
 		return -1;
 
-	msg = unl_genl_msg(&unl, NL80211_CMD_GET_INTERFACE, true);
+	msg = unl_genl_msg(&unl_req, NL80211_CMD_GET_INTERFACE, true);
 	nla_put_u32(msg, NL80211_ATTR_IFINDEX, idx);
 
-	return unl_genl_request(&unl, msg, nl80211_channel_recv, chan);
+	return unl_genl_request(&unl_req, msg, nl80211_channel_recv, chan);
 }
 
 int nl80211_get_ssid(struct nl_call_param *nl_call_param)
@@ -518,7 +510,7 @@ int nl80211_get_ssid(struct nl_call_param *nl_call_param)
         if (!msg)
                 return -1;
 
-        return unl_genl_request(&unl, msg, nl80211_interface_recv, nl_call_param);
+        return unl_genl_request(&unl_req, msg, nl80211_interface_recv, nl_call_param);
 }
 
 int nl80211_get_assoclist(struct nl_call_param *nl_call_param)
@@ -528,7 +520,7 @@ int nl80211_get_assoclist(struct nl_call_param *nl_call_param)
 	if (!msg)
 		return -1;
 
-	return unl_genl_request(&unl, msg, nl80211_assoclist_recv, nl_call_param);
+	return unl_genl_request(&unl_req, msg, nl80211_assoclist_recv, nl_call_param);
 }
 
 int nl80211_get_survey(struct nl_call_param *nl_call_param)
@@ -538,7 +530,7 @@ int nl80211_get_survey(struct nl_call_param *nl_call_param)
 	if (!msg)
 		return -1;
 
-	return unl_genl_request(&unl, msg, nl80211_survey_recv, nl_call_param);
+	return unl_genl_request(&unl_req, msg, nl80211_survey_recv, nl_call_param);
 }
 
 int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_list, uint32_t chan_num,
@@ -571,7 +563,7 @@ int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_lis
 		return -1;
 	}
 
-	ret = unl_genl_request(&unl, msg, nl80211_scan_trigger_recv, NULL);
+	ret = unl_genl_request(&unl_req, msg, nl80211_scan_trigger_recv, NULL);
 	if (ret)	LOG(DEBUG, "%s: scan request failed %d\n", nl_call_param->ifname, ret);
 	return ret;
 }
@@ -587,7 +579,7 @@ int nl80211_scan_abort(struct nl_call_param *nl_call_param)
 	if (nl80211_scan)
 		nl80211_scan_del(nl80211_scan);
 
-	return unl_genl_request(&unl, msg, nl80211_scan_abort_recv, NULL);
+	return unl_genl_request(&unl_req, msg, nl80211_scan_abort_recv, NULL);
 }
 
 int nl80211_scan_dump(struct nl_call_param *nl_call_param)
@@ -597,18 +589,31 @@ int nl80211_scan_dump(struct nl_call_param *nl_call_param)
 	if (!msg)
 		return -1;
 
-	return unl_genl_request(&unl, msg, nl80211_scan_dump_recv, nl_call_param);
+	return unl_genl_request(&unl_req, msg, nl80211_scan_dump_recv, nl_call_param);
 }
 
 int stats_nl80211_init(void)
 {
-	if (unl_genl_init(&unl, "nl80211") < 0) {
+	if (unl_genl_init(&unl_req, "nl80211") < 0) {
 		LOGE("failed to spawn nl80211");
 		return -1;
 	}
 
-	if (nl_socket_set_buffer_size(unl.sock, 262144, 0) < 0)
+	if (unl_genl_init(&unl_notify, "nl80211") < 0) {
+		LOGE("failed to spawn nl80211");
+		return -1;
+	}
+
+	if (nl_socket_set_buffer_size(unl_notify.sock, 262144, 0) < 0)
 		LOGE("stats_nl80211: Failed to set nl socket buffer size");
+
+	if (nl_socket_set_nonblocking(unl_notify.sock))
+		LOGE("stats_nl80211: Failed to set stats nl socket in the non blocking mode");
+
+	unl_genl_subscribe(&unl_notify, "scan");
+
+	ev_io_init(&unl_io, nl80211_ev, unl_notify.sock->s_fd, EV_READ);
+	ev_io_start(wifihal_evloop, &unl_io);
 
 	return 0;
 }
