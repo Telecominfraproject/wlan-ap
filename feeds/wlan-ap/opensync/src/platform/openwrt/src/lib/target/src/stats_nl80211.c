@@ -37,6 +37,7 @@
 #include "radio.h"
 
 extern struct ev_loop *wifihal_evloop;
+static int nl80211_scan_started;
 static struct unl unl_req;
 static struct unl unl_notify;
 static ev_io unl_io;
@@ -470,6 +471,14 @@ static struct nl_msg *nl80211_call_vif(struct nl_call_param *nl_call_param, int 
 	int idx = if_nametoindex(nl_call_param->ifname);
 	struct nl_msg *msg;
 
+	if (!nl80211_scan_started) {
+		unl_genl_subscribe(&unl_notify, "scan");
+
+		ev_io_init(&unl_io, nl80211_ev, unl_notify.sock->s_fd, EV_READ);
+		ev_io_start(wifihal_evloop, &unl_io);
+		nl80211_scan_started = 1;
+	}
+
 	if (!idx)
 		return NULL;
 
@@ -609,11 +618,6 @@ int stats_nl80211_init(void)
 
 	if (nl_socket_set_nonblocking(unl_notify.sock))
 		LOGE("stats_nl80211: Failed to set stats nl socket in the non blocking mode");
-
-	unl_genl_subscribe(&unl_notify, "scan");
-
-	ev_io_init(&unl_io, nl80211_ev, unl_notify.sock->s_fd, EV_READ);
-	ev_io_start(wifihal_evloop, &unl_io);
 
 	return 0;
 }
