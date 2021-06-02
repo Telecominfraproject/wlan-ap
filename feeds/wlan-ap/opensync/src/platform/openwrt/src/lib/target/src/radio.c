@@ -814,13 +814,38 @@ static int conn_since = 0;
 
 static void apc_enable(bool flag) {
 
-	SCHEMA_SET_INT(apc_conf.enabled, flag);
-	if (!ovsdb_table_update(&table_APC_Config, &apc_conf)) {
-		LOG(ERR, "%s:APC_Config: failed to update", __func__);
-		return;
-	}
+	struct schema_APC_State apc_state;
+	json_t *where;
+	
 	LOGI("APC %s: %s APC", __func__, flag?"enable":"disable");
+	if (flag == false) {
+		where = ovsdb_table_where(&table_APC_State, &apc_state);
+		if (false == ovsdb_table_select_one_where(&table_APC_State,
+						  where, &apc_state)) {
+			LOG(ERR, "%s: APC_State read failed", __func__);
+			apc_state.enabled = true;
+		}
 
+		if (apc_state.enabled == true) {
+			SCHEMA_SET_INT(apc_conf.enabled, flag);
+			if (!ovsdb_table_update(&table_APC_Config, &apc_conf)) {
+				LOG(ERR, "%s:APC_Config: failed to update", __func__);
+				return;
+			}
+			SCHEMA_SET_STR(apc_state.mode, "NC");
+			SCHEMA_SET_STR(apc_state.dr_addr, "0.0.0.0");
+			SCHEMA_SET_STR(apc_state.bdr_addr, "0.0.0.0");
+			SCHEMA_SET_INT(apc_state.enabled, false);
+			if (!ovsdb_table_update(&table_APC_State, &apc_state))
+				LOG(ERR, "APC_state: failed to update");
+		}
+	} else {
+		SCHEMA_SET_INT(apc_conf.enabled, flag);
+		if (!ovsdb_table_update(&table_APC_Config, &apc_conf)) {
+			LOG(ERR, "%s:APC_Config: failed to update", __func__);
+			return;
+		}
+	}
 }
 
 static void
@@ -844,9 +869,9 @@ apc_cld_mon_cb(struct schema_Manager *mgr)
 	/*Checks if wan ethernet port is down and disables apc*/
 	ret = system("/bin/check_wan_link.sh");
 	if (WIFEXITED(ret)) {
-		LOGI("The return value: %d\n", WEXITSTATUS(ret));
 		link = WEXITSTATUS(ret);
 		if (link == 0) {
+			LOGD("APC link down");
 			apc_enable(false);
 			return;
 		}
