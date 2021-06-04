@@ -181,6 +181,36 @@ static void radio_state_custom_options_get(struct schema_Wifi_Radio_State *rstat
 	}
 }
 
+static void set_channel_max_power(struct schema_Wifi_Radio_State *rstate,
+                                    int *index, int channel,
+                                    int max_power)
+{
+	rstate->channel_max_power_keys[*index] = channel;
+	rstate->channel_max_power[*index] = max_power;
+	*index += 1;
+	rstate->channel_max_power_len = *index;
+}
+
+// Update the entire channel_max_power map in the radio state
+static void update_channel_max_power(char* phy, struct schema_Wifi_Radio_State *rstate) {
+	int channels[64];
+	int channel_count = phy_get_channels(phy, channels);
+	channel_count += phy_get_dfs_channels(phy, channels + channel_count);
+
+	// Clear the data previously stored in channel_max_power
+	memset(rstate->channel_max_power_keys, 0, sizeof(rstate->channel_max_power_keys));
+	memset(rstate->channel_max_power, 0, sizeof(rstate->channel_max_power));
+	rstate->channel_max_power_len = 0;
+
+	// Set the new values for channel_max_power
+	int i, index = 0;
+	for (i = 0; i < channel_count && i < 64; i++) {
+		int channel = channels[i];
+		int max_tx_power = phy_get_max_tx_power(phy, channel);
+		set_channel_max_power(rstate, &index, channel, max_tx_power);
+	}
+}
+
 const struct uci_blob_param_list wifi_device_param = {
 	.n_params = __WDEV_ATTR_MAX,
 	.params = wifi_device_policy,
@@ -215,6 +245,8 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 		LOGE("%s has no phy", rstate.if_name);
 		return false;
 	}
+
+	update_channel_max_power(phy, &rstate);
 
 	if (tb[WDEV_ATTR_CHANNEL]) {
 		nl80211_channel_get(phy, &chan);
