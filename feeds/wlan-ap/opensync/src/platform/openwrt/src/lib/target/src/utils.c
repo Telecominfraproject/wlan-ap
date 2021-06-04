@@ -309,6 +309,21 @@ int phy_get_channels(const char *name, int *channel)
 	return j;
 }
 
+// Gets all the dfs channels avaible for a radio
+int phy_get_dfs_channels(const char *name, int *dfs_channels)
+{
+	struct wifi_phy *phy = phy_find(name);
+	int i, j = 0;
+
+	if (!phy)
+		return 0;
+
+	for (i = 0; (i < IEEE80211_CHAN_MAX) && (j < 64); i++)
+		if (phy->chandfs[i])
+			dfs_channels[j++] = i;
+	return j;
+}
+
 static void update_channels_state(struct schema_Wifi_Radio_State *rstate,
 			int *index, const char *key, int *value, int value_len)
 {
