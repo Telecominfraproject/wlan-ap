@@ -1335,7 +1335,11 @@ bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
 		if (strcmp(s->type, "wifi-iface")) continue;
 
 		ifname = uci_lookup_option_string( vif_ctx, s, "ifname" );
-		if (!strcmp(ifname,vconf->if_name)) {
+		if (ifname == NULL) {
+			/* Delete this section because it doesn't have an ifname - it is invalid */
+			uci_section_del(vif_ctx, "vif", "wireless", (char *)s->e.name, "wifi-iface");
+		} else if (!strcmp(ifname,vconf->if_name)) {
+			/* Delete this section because it matches the if_name we are trying to delete */
 			uci_section_del(vif_ctx, "vif", "wireless", (char *)s->e.name, "wifi-iface");
 			break;
 		}
