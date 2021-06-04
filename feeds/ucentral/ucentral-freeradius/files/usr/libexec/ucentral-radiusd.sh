@@ -10,6 +10,8 @@ user_add() {
 	[ -z "$username" -o -z "$password" ] && return
 	echo -e "$username\tCleartext-Password := \"$password\"" >> /etc/freeradius3-ucentral/mods-config/files/authorize
 	echo -e "$username\tCleartext-Password := \"$password\"" >> /etc/freeradius3-ucentral/mods-config/files/accounting
+	chmod 0600 /etc/freeradius3-ucentral/mods-config/files/authorize
+	chmod 0600 /etc/freeradius3-ucentral/mods-config/files/accounting
 }
 
 rm /etc/freeradius3-ucentral/mods-config/files/authorize
@@ -34,6 +36,7 @@ client_add() {
 	}
 }
 " >> /etc/freeradius3-ucentral/clients.conf
+chmod 0600 /etc/freeradius3-ucentral/clients.conf
 }
 
 rm /etc/freeradius3-ucentral/clients.conf

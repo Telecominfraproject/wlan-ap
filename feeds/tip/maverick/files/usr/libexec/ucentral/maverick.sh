@@ -1,5 +1,9 @@
 #!/bin/sh
 
+active=$(ubus call ucentral status | jsonfilter -e '@.active')
+
+[ -n "$active" -a ! "$active" -eq 1 ] && exit 0
+
 rm /etc/config/network /etc/config/wireless
 cp /rom/etc/config/uhttpd /rom/etc/config/firewall /rom/etc/config/dhcp /rom/etc/config/dropbear /etc/config
 config_generate

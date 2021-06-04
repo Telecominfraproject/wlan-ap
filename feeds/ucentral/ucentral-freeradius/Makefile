@@ -11,7 +11,7 @@ define Package/ucentral-freeradius
   SECTION:=ucentral
   CATEGORY:=uCentral
   TITLE:=ucentral-freeradius cfg wrapper
-  DEPENDS:=+freeradius3-mod-eap +freeradius3-mod-files
+  DEPENDS:=+freeradius3-mod-eap +freeradius3-mod-files +freeradius3-mod-eap-pwd
 endef
 
 define Package/ucentral-freeradius/description

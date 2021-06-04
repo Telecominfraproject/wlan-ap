@@ -359,8 +359,8 @@ hostapd_set_vlan_file() {
 	local ifname="$1"
 	local vlan="$2"
 	json_get_vars name vid
-	echo "${vid} ${ifname}.${name}" >> /var/run/hostapd-${ifname}.vlan
-	wireless_add_vlan "${vlan}" "${ifname}.${name}"
+	echo "${vid} ${ifname}-${name}" >> /var/run/hostapd-${ifname}.vlan
+	wireless_add_vlan "${vlan}" "${ifname}-${name}"
 }
 
 hostapd_set_vlan() {
@@ -490,11 +490,11 @@ append_hs20_conn_capab() {
 }
 
 append_radius_acct_req_attr() {
-	append bss_conf "radius_acct_req_attr=$1" "$N"
+	[ -n "$1" ] && append bss_conf "radius_acct_req_attr=$1" "$N"
 }
 
 append_radius_auth_req_attr() {
-	append bss_conf "radius_auth_req_attr=$1" "$N"
+	[ -n "$1" ] &&  append bss_conf "radius_auth_req_attr=$1" "$N"
 }
 
 append_airtime_sta_weight() {
