@@ -11,7 +11,7 @@
 static void
 maverick_cb(struct uloop_timeout *delay)
 {
-	ULOG_INFO("triggering maverick");
+	ULOG_INFO("triggering maverick check");
 	if (system("/usr/libexec/ucentral/maverick.sh"))
 		ULOG_ERR("failed to launch Maverick");
 	uloop_end();

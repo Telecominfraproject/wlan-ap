@@ -1036,13 +1036,6 @@ drv_mac80211_setup() {
 	local found
 
 	for wdev in $(list_phy_interfaces "$phy"); do
-		found=0
-		for cwdev in $OLDAPLIST $OLDSPLIST $OLDUMLIST; do
-			if [ "$wdev" = "$cwdev" ]; then
-				found=1
-				break
-			fi
-		done
 		if [ "$found" = "0" ]; then
 			ip link set dev "$wdev" down
 			iw dev "$wdev" del
@@ -1107,33 +1100,24 @@ drv_mac80211_setup() {
 	for_each_interface "sta adhoc mesh monitor" mac80211_prepare_vif
 	NEWAPLIST=
 	for_each_interface "ap" mac80211_prepare_vif
-	NEW_MD5=$(test -e "${hostapd_conf_file}" && md5sum ${hostapd_conf_file})
-	OLD_MD5=$(uci -q -P /var/state get wireless._${phy}.md5)
-	if [ "${NEWAPLIST}" != "${OLDAPLIST}" ]; then
-		mac80211_vap_cleanup hostapd "${OLDAPLIST}"
-	fi
+	mac80211_vap_cleanup hostapd "${OLDAPLIST}"
 	[ -n "${NEWAPLIST}" ] && mac80211_iw_interface_add "$phy" "${NEWAPLIST%% *}" __ap
 	local add_ap=0
 	local primary_ap=${NEWAPLIST%% *}
 	[ -n "$hostapd_ctrl" ] && {
 		local no_reload=1
 		if [ -n "$(ubus list | grep hostapd.$primary_ap)" ]; then
-			[ "${NEW_MD5}" = "${OLD_MD5}" ] || {
-				ubus call hostapd.$primary_ap reload
-				no_reload=$?
-				if [ "$no_reload" != "0" ]; then
-					mac80211_vap_cleanup hostapd "${OLDAPLIST}"
-					mac80211_vap_cleanup wpa_supplicant "$(uci -q -P /var/state get wireless._${phy}.splist)"
-					mac80211_vap_cleanup none "$(uci -q -P /var/state get wireless._${phy}.umlist)"
-					sleep 2
-					mac80211_iw_interface_add "$phy" "${NEWAPLIST%% *}" __ap
-					for_each_interface "sta adhoc mesh monitor" mac80211_prepare_vif
-				fi
-			}
+			mac80211_vap_cleanup hostapd "${OLDAPLIST}"
+			mac80211_vap_cleanup wpa_supplicant "$(uci -q -P /var/state get wireless._${phy}.splist)"
+			mac80211_vap_cleanup none "$(uci -q -P /var/state get wireless._${phy}.umlist)"
+			sleep 2
+			mac80211_iw_interface_add "$phy" "${NEWAPLIST%% *}" __ap
+			for_each_interface "sta adhoc mesh monitor" mac80211_prepare_vif
 		fi
 		if [ "$no_reload" != "0" ]; then
 			add_ap=1
 			ubus wait_for hostapd
+			ip link set $primary_ap down
 			local hostapd_res="$(ubus call hostapd config_add "{\"iface\":\"$primary_ap\", \"config\":\"${hostapd_conf_file}\"}")"
 			ret="$?"
 			[ "$ret" != 0 -o -z "$hostapd_res" ] && {
