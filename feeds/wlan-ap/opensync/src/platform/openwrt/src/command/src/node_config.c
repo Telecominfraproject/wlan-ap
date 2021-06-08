@@ -325,6 +325,18 @@ int available_led_check(char *led_name)
 	}
 	return 0;
 }
+
+static void set_led_config(char *trigger_name, char *key, char* value, char* led_string, char* led_section)
+{
+	blob_buf_init(&b, 0);
+	blobmsg_add_string(&b, "sysfs", led_string);
+	blobmsg_add_string(&b, "trigger", trigger_name);
+	blobmsg_add_string(&b, "value", value);
+	blobmsg_add_string(&b, "key", key);
+	blob_to_uci_section(uci, "system", led_section, "led", b.head, &led_param, NULL);
+	return;
+}
+
 static void led_handler(int type,
 			struct schema_Node_Config *old,
 			struct schema_Node_Config *conf)
@@ -343,7 +355,7 @@ static void led_handler(int type,
 	switch (type) {
 	case OVSDB_UPDATE_NEW:
 	case OVSDB_UPDATE_MODIFY:
-		if (!strcmp(conf->key, "led_blink"))
+		if (!strcmp(conf->key, "led_blink") || !strcmp(conf->key, "led_off"))
 		{
 			if (glob("/sys/class/leds/*", GLOB_NOSORT, NULL, &gl))
 				return;
@@ -352,12 +364,12 @@ static void led_handler(int type,
 				sscanf(sysled,"/%[^/]/%[^/]/%[^/]/%s", sys, class, leds, led_string);
 				sscanf(led_string,"%[^:]:%[^:]:%s",ap_name, color, led_section);
 				if(available_led_check(led_section)) {
-					blob_buf_init(&b, 0);
-					blobmsg_add_string(&b, "sysfs", led_string);
-					blobmsg_add_string(&b, "value", "on");
-					blobmsg_add_string(&b, "key", conf->key );
-					blobmsg_add_string(&b, "trigger", "heartbeat");
-					blob_to_uci_section(uci, "system", led_section, "led", b.head, &led_param, NULL);
+					if(!strcmp(conf->key, "led_blink")) {
+						set_led_config("heartbeat", conf->key, conf->value, led_string, led_section);
+					}
+					else if(!strcmp(conf->key, "led_off")) {
+						set_led_config("none", conf->key, conf->value, led_string, led_section);
+					}
 				}
 			}
 		}
