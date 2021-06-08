@@ -214,6 +214,9 @@ hostapd_common_add_bss_config() {
 	config_add_int maxassoc max_inactivity
 	config_add_boolean disassoc_low_ack isolate short_preamble
 
+config_add_int signal_connect signal_stay signal_poll_time \
+		signal_drop_reason signal_strikes
+
 	config_add_int \
 		wep_rekey eap_reauth_period \
 		wpa_group_rekey wpa_pair_rekey wpa_master_rekey
@@ -485,6 +488,7 @@ hostapd_set_bss_options() {
 	local wep_rekey wpa_group_rekey wpa_pair_rekey wpa_master_rekey wpa_key_mgmt
 
 	json_get_vars \
+	signal_connect signal_stay signal_poll_time signal_drop_reason signal_strikes \
 		wep_rekey wpa_group_rekey wpa_pair_rekey wpa_master_rekey wpa_strict_rekey \
 		wpa_disable_eapol_key_retries tdls_prohibit \
 		maxassoc max_inactivity disassoc_low_ack isolate auth_cache \
@@ -520,8 +524,15 @@ hostapd_set_bss_options() {
 	set_default rssi_reject_assoc_rssi 0
 	set_default rssi_ignore_probe_request 0
 	set_default rts_threshold -1
+	set_default signal_connect -128
+	set_default signal_stay -128
+	set_default signal_poll_time 5
+	set_default signal_drop_reason 3
+	set_default signal_strikes 3
 	set_default proxy_arp 0
 	set_default multicast_to_unicast 0
+
+
 	append bss_conf "ctrl_interface=/var/run/hostapd"
 	if [ "$isolate" -gt 0 ]; then
 		append bss_conf "ap_isolate=$isolate" "$N"
@@ -549,6 +560,11 @@ hostapd_set_bss_options() {
 	append bss_conf "rssi_reject_assoc_rssi=$rssi_reject_assoc_rssi" "$N"
 	append bss_conf "rssi_ignore_probe_request=$rssi_ignore_probe_request" "$N"
 	append bss_conf "rts_threshold=$rts_threshold" "$N"
+	append bss_conf "signal_connect=$signal_connect" "$N"
+	append bss_conf "signal_stay=$signal_stay" "$N"
+	append bss_conf "signal_poll_time=$signal_poll_time" "$N"
+	append bss_conf "signal_strikes=$signal_strikes" "$N"
+	append bss_conf "signal_drop_reason=$signal_drop_reason" "$N"
 
 	[ -n "$proxy_arp" ] && append bss_conf "proxy_arp=$proxy_arp" "$N"
 	[ -n "$multicast_to_unicast" ] && append bss_conf "multicast_to_unicast=$multicast_to_unicast" "$N"
