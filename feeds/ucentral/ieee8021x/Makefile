@@ -9,7 +9,7 @@ PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_SOURCE_URL=https://github.com/blogic/ieee8021x.git
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2021-04-12
-PKG_SOURCE_VERSION:=53caaa84e483cfe0fb63c024347ce71df0c707a4
+PKG_SOURCE_VERSION:=c1f36559dc0ed2deeac0531a3d5854f1955ae928
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
