@@ -821,6 +821,29 @@ struct schema_APC_Config apc_conf;
 void apc_state_set(struct blob_attr *msg)
 {
 	struct blob_attr *tb[__APC_ATTR_MAX] = { };
+	struct schema_APC_Config apc_conf;
+	struct schema_APC_State apc_state;
+	json_t *where;
+
+	/* Check if apc conf is disabled, if disabled the update state
+	 * with NC mode and return, this is to avoid the apc ubus
+	 * notifications which come after the APC is disabled */
+	where = ovsdb_table_where(&table_APC_Config, &apc_conf);
+	if (false == ovsdb_table_select_one_where(&table_APC_Config,
+						  where, &apc_conf)) {
+		LOG(ERR, "%s: APC_State read failed", __func__);
+		apc_conf.enabled = true;
+	}
+
+	if (apc_conf.enabled == false) {
+		SCHEMA_SET_STR(apc_state.mode, "NC");
+		SCHEMA_SET_STR(apc_state.dr_addr, "0.0.0.0");
+		SCHEMA_SET_STR(apc_state.bdr_addr, "0.0.0.0");
+		SCHEMA_SET_INT(apc_state.enabled, false);
+		if (!ovsdb_table_update(&table_APC_State, &apc_state))
+			LOG(ERR, "APC_state: failed to update");
+		return;
+	}
 
 	blobmsg_parse(apc_policy, __APC_ATTR_MAX, tb,
 		      blob_data(msg), blob_len(msg));
