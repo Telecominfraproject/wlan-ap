@@ -550,20 +550,39 @@ int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_lis
 	struct nlattr *freq;
 	unsigned int i, flags = 0;
 	int ret = 0;
+	uint32_t oper_chan;
 
 	if (!msg)
 		return -1;
 
-	LOGT("%s: not setting dwell time\n", nl_call_param->ifname);
-	//nla_put_u16(msg, NL80211_ATTR_MEASUREMENT_DURATION, dwell_time);
+	if (nl80211_get_oper_channel(nl_call_param->ifname, &oper_chan) < 0) {
+		/* Could not get the current operating channel */
+		oper_chan = 0;
+		LOGE("%s: Could not get the current operating channel\n",
+			nl_call_param->ifname);
+	}
 
 	/* Add the ap-force flag, otherwise the scan fails on wifi6 APs */
 	flags |= NL80211_SCAN_FLAG_AP;
 	nla_put(msg, NL80211_ATTR_SCAN_FLAGS, sizeof(uint32_t), &flags);
 
+	if ((scan_type == RADIO_SCAN_TYPE_OFFCHAN) && dwell_time)
+		nla_put_u16(msg, NL80211_ATTR_MEASUREMENT_DURATION, dwell_time);
+
 	freq = nla_nest_start(msg, NL80211_ATTR_SCAN_FREQUENCIES);
-	for (i = 0; i < chan_num; i ++)
-		nla_put_u32(msg, i, ieee80211_channel_to_frequency(chan_list[i]));
+	for (i = 0; i < chan_num; i ++) {
+		if (!oper_chan || (scan_type == RADIO_SCAN_TYPE_FULL)) {
+			nla_put_u32(msg, i, ieee80211_channel_to_frequency(chan_list[i]));
+		}
+		else if ((scan_type == RADIO_SCAN_TYPE_OFFCHAN) &&
+			(chan_list[i] != oper_chan)) {
+			nla_put_u32(msg, i, ieee80211_channel_to_frequency(chan_list[i]));
+		}
+		else if ((scan_type == RADIO_SCAN_TYPE_ONCHAN) &&
+			(chan_list[i] == oper_chan)) {
+			nla_put_u32(msg, i, ieee80211_channel_to_frequency(chan_list[i]));
+		}
+	}
 	nla_nest_end(msg, freq);
 
 	ret = nl80211_scan_add(nl_call_param->ifname, scan_cb, scan_ctx); 
@@ -573,7 +592,9 @@ int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_lis
 	}
 
 	ret = unl_genl_request(&unl_req, msg, nl80211_scan_trigger_recv, NULL);
-	if (ret)	LOG(DEBUG, "%s: scan request failed %d\n", nl_call_param->ifname, ret);
+	if (ret)
+		LOG(DEBUG, "%s: scan request failed %d\n", nl_call_param->ifname, ret);
+
 	return ret;
 }
 
