@@ -40,6 +40,9 @@ else
   redirector_addr=$1
 fi
 
+# Enable lan ssh accsess
+lan-ssh-firewall disable
+
 echo "${redirector_addr}" > /usr/opensync/certs/redirector.txt
 /etc/init.d/uhttpd enable
 /etc/init.d/uhttpd start
