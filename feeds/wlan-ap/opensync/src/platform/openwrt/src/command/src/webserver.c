@@ -10,6 +10,13 @@
 static ovsdb_table_t table_Manager;
 static int done;
 
+
+static void disable_ssh() 
+{
+	LOGN("Disabling LAN ssh access");
+	system("lan-ssh-firewall enable");
+}
+
 static void stop_http(void *arg)
 {
 	LOGN("Stopping webserver");
@@ -17,6 +24,8 @@ static void stop_http(void *arg)
 	system("uci commit system");
 	system("/etc/init.d/uhttpd stop");
 	system("/etc/init.d/uhttpd disable");
+
+	disable_ssh();
 }
 
 static void callback_Manager(ovsdb_update_monitor_t *mon,
