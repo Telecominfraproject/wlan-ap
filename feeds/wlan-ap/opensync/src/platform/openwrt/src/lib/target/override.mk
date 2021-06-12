@@ -47,6 +47,7 @@ UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/dhcpdiscovery.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/radius_probe.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/rrm_config.c
 UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/radius_proxy.c
+UNIT_SRC_TOP += $(OVERRIDE_DIR)/src/timer.c
 
 CONFIG_USE_KCONFIG=y
 CONFIG_INET_ETH_LINUX=y

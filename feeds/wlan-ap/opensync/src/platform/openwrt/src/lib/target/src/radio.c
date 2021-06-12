@@ -27,6 +27,7 @@
 #include "rrm_config.h"
 #include "vlan.h"
 #include "radius_proxy.h"
+#include "timer.h"
 
 ovsdb_table_t table_Hotspot20_Config;
 ovsdb_table_t table_Hotspot20_OSU_Providers;
@@ -35,6 +36,10 @@ ovsdb_table_t table_Radius_Proxy_Config;
 
 ovsdb_table_t table_APC_Config;
 ovsdb_table_t table_APC_State;
+ovsdb_table_t table_Wifi_VIF_Config;
+ovsdb_table_t table_Wifi_Inet_Config;
+ovsdb_table_t table_Node_Config;
+
 unsigned int radproxy_apc = 0;
 extern json_t* ovsdb_table_where(ovsdb_table_t *table, void *record);
 
@@ -42,7 +47,6 @@ static struct uci_package *wireless;
 struct uci_context *uci;
 struct blob_buf b = { };
 struct blob_buf del = { };
-int reload_config = 0;
 static struct timespec startup_time;
 
 enum {
@@ -488,20 +492,14 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 	blob_to_uci_section(uci, "wireless", rconf->if_name, "wifi-device",
 			    b.head, &wifi_device_param, del.head);
 
-	reload_config = 1;
-
+	uci_commit_all(uci);
 	return true;
 }
 
 static void periodic_task(void *arg)
 {
-	static int counter = 0;
-	struct uci_element *e = NULL, *tmp = NULL;
 	int ret = 0;
-
-	if ((counter % 15) && !reload_config)
-		goto done;
-
+	struct uci_element *e = NULL, *tmp = NULL;
 	if (startup_time.tv_sec) {
 		static struct timespec current_time;
 
@@ -512,20 +510,11 @@ static void periodic_task(void *arg)
 			radio_maverick(NULL);
 		}
 	}
-
-	if (reload_config) {
-		LOGD("periodic: reload_config");
-		reload_config = 0;
-		uci_commit_all(uci);
-		sync();
-		system("reload_config");
-	}
-
 	LOGD("periodic: start state update ");
 	ret = uci_load(uci, "wireless", &wireless);
 	if (ret) {
 		LOGE("%s: uci_load() failed with rc %d", __func__, ret);
-		return;
+		goto out;
 	}
 	uci_foreach_element_safe(&wireless->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
@@ -543,9 +532,8 @@ static void periodic_task(void *arg)
 	uci_unload(uci, wireless);
 	LOGD("periodic: stop state update ");
 
-done:
-	counter++;
-	evsched_task_reschedule_ms(EVSCHED_SEC(1));
+out:
+	evsched_task_reschedule_ms(EVSCHED_SEC(15));
 }
 
 bool target_radio_config_init2(void)
@@ -578,7 +566,6 @@ bool target_radio_config_init2(void)
 	}
 	if (invalidVifFound) {
 		uci_commit(uci, &wireless, false);
-		reload_config = 1;
 	}
 	uci_unload(uci, wireless);
 
@@ -661,6 +648,7 @@ void radio_maverick(void *arg)
 	uci_unload(uci, wireless);
 }
 
+
 static void callback_Hotspot20_Config(ovsdb_update_monitor_t *mon,
 				 struct schema_Hotspot20_Config *old,
 				 struct schema_Hotspot20_Config *conf)
@@ -680,6 +668,7 @@ static void callback_Hotspot20_Config(ovsdb_update_monitor_t *mon,
 		LOG(ERR, "Hotspot20_Config: unexpected mon_type %d %s", mon->mon_type, mon->mon_uuid);
 		break;
 	}
+	set_config_apply_timeout(mon);
 	return;
 }
 
@@ -703,6 +692,7 @@ static void callback_Hotspot20_OSU_Providers(ovsdb_update_monitor_t *mon,
 				mon->mon_type, mon->mon_uuid);
 		break;
 	}
+	set_config_apply_timeout(mon);
 	return;
 }
 
@@ -727,6 +717,7 @@ static void callback_Hotspot20_Icon_Config(ovsdb_update_monitor_t *mon,
 				mon->mon_type, mon->mon_uuid);
 		break;
 	}
+	set_config_apply_timeout(mon);
 	return;
 
 }
@@ -1032,6 +1023,51 @@ void apc_init()
 
 }
 
+static void apply_config_handler(struct timeout *timeout)
+{
+	uci_commit_all(uci);
+	sync();
+	LOGI("====Calling reload_config====");
+	system("/sbin/reload_config");
+}
+
+static struct timeout config_timer = {
+		.cb = apply_config_handler
+};
+
+static void config_timer_task(void *arg)
+{
+	timer_expiry_check(&config_timer);
+	evsched_task_reschedule_ms(EVSCHED_SEC(1));
+}
+
+void set_config_apply_timeout(ovsdb_update_monitor_t *mon)
+{
+	static bool firstconfig = true;
+	LOGI("=====Received config update - table:%s uuid:%s Action:%d======", mon->mon_table, mon->mon_uuid, mon->mon_type);
+	if(firstconfig) {
+		firstconfig = false;
+		timeout_set(&config_timer, CONFIG_APPLY_TIMEOUT * 1000);
+		evsched_task(&config_timer_task, NULL, EVSCHED_SEC(1));
+	} else {
+		timeout_set(&config_timer, CONFIG_APPLY_TIMEOUT * 1000);
+	}
+}
+
+static void callback_Wifi_Inet_Config(ovsdb_update_monitor_t *mon,
+		struct schema_Wifi_Inet_Config *old_rec,
+		struct schema_Wifi_Inet_Config *iconf)
+{
+	set_config_apply_timeout(mon);
+}
+
+static void callback_Node_Config(ovsdb_update_monitor_t *mon,
+		struct schema_Node_Config *old,
+		struct schema_Node_Config *conf)
+{
+	set_config_apply_timeout(mon);
+}
+
 bool target_radio_init(const struct target_radio_ops *ops)
 {
 	uci = uci_alloc_context();
@@ -1060,6 +1096,11 @@ bool target_radio_init(const struct target_radio_ops *ops)
 	OVSDB_TABLE_INIT(Radius_Proxy_Config, _uuid);
 	OVSDB_TABLE_MONITOR(Radius_Proxy_Config, false);
 
+	OVSDB_TABLE_INIT(Wifi_Inet_Config, _uuid);
+	OVSDB_TABLE_MONITOR(Wifi_Inet_Config, false);
+
+	OVSDB_TABLE_INIT(Node_Config, _uuid);
+	OVSDB_TABLE_MONITOR(Node_Config, false);
 
 	evsched_task(&periodic_task, NULL, EVSCHED_SEC(5));
 

@@ -178,7 +178,8 @@ void callback_Wifi_RRM_Config(ovsdb_update_monitor_t *self,
 	default:
 		LOG(ERR, "Wifi_RRM_Config: unexpected mon_type %d %s", self->mon_type, self->mon_uuid);
 		break;
-	}	
+	}
+	set_config_apply_timeout(self);
 	return;
 }
 

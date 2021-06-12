@@ -365,7 +365,6 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf)
 		blob_to_uci_section(uci, "radsecproxy", name, "realm",
 				uci_buf.head, &radius_proxy_realm_param, NULL);
 	}
-
 	uci_commit_all(uci);
 	return true;
 }
@@ -394,7 +393,6 @@ static bool radius_proxy_config_delete()
 	uci_commit(rad_uci, &radsecproxy, false);
 	uci_unload(rad_uci, radsecproxy);
 	uci_free_context(rad_uci);
-	reload_config = 1;
 	return true;
 }
 
@@ -419,7 +417,8 @@ void callback_Radius_Proxy_Config(ovsdb_update_monitor_t *self,
 		LOG(ERR, "Radius_Proxy_Config: unexpected mon_type %d %s",
 				self->mon_type, self->mon_uuid);
 		break;
-	}	
+	}
+	set_config_apply_timeout(self);
 	return;
 }
 
