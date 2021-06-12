@@ -1034,7 +1034,8 @@ void vif_section_del(char *section_name)
 	ret= uci_load(sec_ctx, "wireless", &wireless);
 	if (ret) {
 		LOGE("%s: %s uci_load() failed with rc %d", section_name, __func__, ret);
-		uci_free_context(sec_ctx);
+		if (sec_ctx)
+			uci_free_context(sec_ctx);
 		return;
 	}
 	uci_foreach_element_safe(&wireless->sections, tmp, e) {
@@ -1049,8 +1050,8 @@ void vif_section_del(char *section_name)
 	}
 	uci_commit(sec_ctx, &wireless, false);
 	uci_unload(sec_ctx, wireless);
-	uci_free_context(sec_ctx);
-	reload_config = 1;
+	if (sec_ctx)
+		uci_free_context(sec_ctx);
 }
 
 void vif_check_radius_proxy()
@@ -1326,7 +1327,8 @@ bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
 	ret= uci_load(vif_ctx, "wireless", &wireless);
 	if (ret) {
 		LOGE("%s: %s uci_load() failed with rc %d", vconf->if_name, __func__, ret);
-		uci_free_context(vif_ctx);
+		if (vif_ctx)
+			uci_free_context(vif_ctx);
 		return false;
 	}
 	uci_foreach_element_safe(&wireless->sections, tmp, e) {
@@ -1346,8 +1348,8 @@ bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
 	}
 	uci_commit(vif_ctx, &wireless, false);
 	uci_unload(vif_ctx, wireless);
-	uci_free_context(vif_ctx);
-	reload_config = 1;
+	if (vif_ctx)
+		uci_free_context(vif_ctx);
 	return true;
 }
 
@@ -1402,7 +1404,7 @@ void vif_hs20_osu_update(struct schema_Hotspot20_OSU_Providers *osuconf)
 
 	blob_to_uci_section(uci, "wireless", osuconf->osu_provider_name, "osu-provider",
 			osu.head, &wifi_hs20_osu_param, NULL);
-	reload_config = 1;
+	uci_commit_all(uci);
 }
 
 
@@ -1433,7 +1435,7 @@ void vif_hs20_icon_update(struct schema_Hotspot20_Icon_Config *iconconf)
 
 		blob_to_uci_section(uci, "wireless", iconconf->icon_config_name, "hs20-icon",
 				hs20.head, &wifi_hs20_icon_param, NULL);
-		reload_config = 1;
+		uci_commit_all(uci);
 	}
 }
 
@@ -1456,9 +1458,9 @@ void vif_hs20_update(struct schema_Hotspot20_Config *hs2conf)
 			hs20_vif_config(&b, hs2conf);
 			blob_to_uci_section(uci, "wireless", vconf.if_name, "wifi-iface",
 					b.head, &wifi_iface_param, NULL);
-			reload_config = 1;
 		}
 	}
+	uci_commit_all(uci);
 }
 
 /* Mesh options table */
@@ -1526,8 +1528,7 @@ static int mesh_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 	blobmsg_add_string(&mesh, "master", "bat0");
 	blob_to_uci_section(uci, "network", vconf->if_name, "interface",
 			mesh.head, &wifi_mesh_param, NULL);
-
-	reload_config = 1;
+	uci_commit_all(uci);
 	return 0;
 }
 
@@ -1646,8 +1647,7 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 	{
 		vif_dhcp_opennds_allowlist_set(vconf,(char*)vconf->if_name);
 	}
-
-	reload_config = 1;
+	uci_commit_all(uci);
 	return 0;
 }
 

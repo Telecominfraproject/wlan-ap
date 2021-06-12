@@ -75,7 +75,6 @@ const struct uci_blob_param_list network_param = {
 	.params = network_policy,
 };
 
-int reload_config = 0;
 ovsdb_table_t table_Wifi_Inet_Config;
 struct blob_buf b = { };
 struct blob_buf del = { };
@@ -342,7 +341,6 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 	}
 
 	uci_commit_all(uci);
-	reload_config = 1;
 
 	return 0;
 }
@@ -361,7 +359,6 @@ static void wifi_inet_conf_del(struct schema_Wifi_Inet_Config *iconf)
 
 	uci_section_del(uci, "network", "network", iconf->if_name, "interface");
 	uci_commit_all(uci);
-	reload_config = 1;
 }
 
 static void callback_Wifi_Inet_Config(ovsdb_update_monitor_t *mon,
@@ -388,17 +385,6 @@ static void callback_Wifi_Inet_Config(ovsdb_update_monitor_t *mon,
 	return;
 }
 
-static void periodic_task(void *arg)
-{
-	if (reload_config) {
-		uci_commit_all(uci);
-		system("reload_config");
-		reload_config = 0;
-	}
-
-	evsched_task_reschedule_ms(EVSCHED_SEC(5));
-}
-
 void wifi_inet_config_init(void)
 {
 	struct uci_element *e = NULL;
@@ -418,7 +404,6 @@ void wifi_inet_config_init(void)
 	}
 	uci_unload(uci, network);
 	OVSDB_TABLE_MONITOR(Wifi_Inet_Config, false);
-	evsched_task(&periodic_task, NULL, EVSCHED_SEC(5));
 
 	return;
 }
