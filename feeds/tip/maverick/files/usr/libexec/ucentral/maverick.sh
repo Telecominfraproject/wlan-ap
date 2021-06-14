@@ -29,6 +29,7 @@ config_foreach radio_enable wifi-device
 config_foreach ssid_set wifi-iface
 uci commit
 
+/etc/init.d/uhttpd enable
 /etc/init.d/ucentral stop
 
 reload_config
