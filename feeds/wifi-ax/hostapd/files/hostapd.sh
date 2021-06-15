@@ -985,10 +985,10 @@ hostapd_set_bss_options() {
 	if [ "$hs20" = "1" ]; then
 		append bss_conf "hs20=1" "$N"
 		append_hs20_icons
-		[ -n "$disable_dgaf"] && append bss_conf "disable_dgaf=$disable_dgaf" "$N"
-		[ -n "$osen"] && append bss_conf "osen=$osen" "$N"
+		[ -n "$disable_dgaf" ] && append bss_conf "disable_dgaf=$disable_dgaf" "$N"
+		[ -n "$osen" ] && append bss_conf "osen=$osen" "$N"
 		[ "$anqp_domain_id" -gt 0 ] && append bss_conf "anqp_domain_id=$anqp_domain_id" "$N"
-		[ -n "$hs20_deauth_req_timeout"] && append bss_conf "hs20_deauth_req_timeout=$hs20_deauth_req_timeout" "$N"
+		[ -n "$hs20_deauth_req_timeout" ] && append bss_conf "hs20_deauth_req_timeout=$hs20_deauth_req_timeout" "$N"
 		[ -n "$osu_ssid" ] && append bss_conf "osu_ssid=$osu_ssid" "$N"
 		[ -n "$hs20_wan_metrics" ] && append bss_conf "hs20_wan_metrics=$hs20_wan_metrics" "$N"
 		[ -n "$hs20_operating_class" ] && append bss_conf "hs20_operating_class=$hs20_operating_class" "$N"
