@@ -136,6 +136,7 @@ enum {
 	WIF_ATTR_RADPROXY,
 	WIF_ATTR_PROXY_ARP,
 	WIF_ATTR_MCAST_TO_UCAST,
+	WIF_ATTR_AUTH_CACHE,
 	__WIF_ATTR_MAX,
 };
 
@@ -233,6 +234,7 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_RADPROXY] = { .name = "radproxy", BLOBMSG_TYPE_STRING },
 	[WIF_ATTR_PROXY_ARP] = { .name = "proxy_arp", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_MCAST_TO_UCAST] = { .name = "multicast_to_unicast", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_AUTH_CACHE] = { .name = "auth_cache", BLOBMSG_TYPE_BOOL },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -488,6 +490,7 @@ static int vif_config_security_set(struct blob_buf *b,
 				strcat(key_holder_str, key_str);
 				blobmsg_add_string(b, "r1kh", key_holder_str);
 			}
+			blobmsg_add_bool(b, "auth_cache", 1);
 		} else {
 			security_key = SCHEMA_KEY_VAL(vconf->security, SCHEMA_CONSTS_SECURITY_KEY);
 			if (security_key == NULL) {
