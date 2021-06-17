@@ -1647,10 +1647,12 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 	if (changed->captive_portal)
 		vif_captive_portal_set(vconf,(char*)vconf->if_name);
 
+
 	if(changed->captive_allowlist)
 	{
 		vif_dhcp_opennds_allowlist_set(vconf,(char*)vconf->if_name);
 	}
+
 	uci_commit_all(uci);
 	return 0;
 }

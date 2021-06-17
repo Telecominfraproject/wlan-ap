@@ -512,6 +512,20 @@ bool vif_state_to_conf(struct schema_Wifi_VIF_State *vstate,
 	}
 	vconf->custom_options_len = vstate->custom_options_len;
 
+
+
+
+	for (i = 0; i < vstate->captive_allowlist_len; i++)
+		STRSCPY(vconf->captive_allowlist[i], vstate->captive_allowlist[i]);
+	vconf->captive_allowlist_len = vstate->captive_allowlist_len;
+
+	for (i = 0; i < vstate->captive_portal_len; i++) {
+		STRSCPY(vconf->captive_portal_keys[i],
+			vstate->captive_portal_keys[i]);
+		STRSCPY(vconf->captive_portal[i], vstate->captive_portal[i]);
+	}
+	vconf->captive_portal_len = vstate->captive_portal_len;
+
 	return true;
 
 #undef VIF_COPY
