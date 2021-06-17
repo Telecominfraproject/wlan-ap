@@ -20,10 +20,18 @@
 #include "nl80211.h"
 #include "utils.h"
 #include "captive.h"
+#include <libubox/avl-cmp.h>
+#include <libubox/avl.h>
+#include <libubox/vlist.h>
+#include <net/if.h>
+#include "fixup.h"
 
-struct blob_buf cap={ };
+static struct blob_buf cap={ };
+static struct blob_buf cap_blob={ };
+static struct blob_buf url_buf={ };
 static struct uci_package *opennds;
-static struct uci_context *cap_uci;
+static struct uci_context *caps_uci;
+static struct uci_context *capg_uci;
 struct blob_attr *d;
 
 #define SCHEMA_CAPTIVE_PORTAL_OPT_SZ            255
@@ -140,6 +148,10 @@ void vif_state_dhcp_allowlist_get(struct schema_Wifi_VIF_State *vstate)
 	char read_ifname[8];
 	char set[8];
 	struct blob_attr *td[__DNS_ATTR_MAX] = { };
+
+	if (vif_fixup_iface_captive_enabled(vstate->if_name) == false)
+		return;
+
 	uci_load(dns, "dhcp", &dhcp);
 	ip_section = uci_lookup_section(dns, dhcp,"dnsmasq");
 	if(!ip_section) {
@@ -182,12 +194,16 @@ void vif_dhcp_opennds_allowlist_set(const struct schema_Wifi_VIF_Config *vconf, 
 	int i;
 	char ips[128];
 	char buff[64];
+
+	if (vif_fixup_iface_captive_enabled(vconf->if_name) == false)
+		return;
+
 	ipset_flush(ifname);
 	e = blobmsg_open_array(&dnsmas, "ipset");
 	for (i = 0; i < vconf->captive_allowlist_len; i++)
 	{
 		strcpy(buff,(char*)vconf->captive_allowlist[i]);
-		sprintf(ips,"/%s/set_%s", buff,"opennds");
+		snprintf(ips, sizeof(ips), "/%s/set_%s", buff,"opennds");
 		blobmsg_add_string(&dnsmas, NULL,ips);
 	}
 	blobmsg_close_array(&dnsmas, e);
@@ -235,10 +251,13 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate)
 	struct blob_attr *tc[__NDS_ATTR_MAX] = { };
 	struct uci_section *cp_section;
 
-	uci_load(cap_uci, "opennds", &opennds);
-	cp_section = uci_lookup_section(cap_uci, opennds,"opennds");
+	if (vif_fixup_iface_captive_enabled(vstate->if_name) == false)
+		return;
+
+	uci_load(capg_uci, "opennds", &opennds);
+	cp_section = uci_lookup_section(capg_uci, opennds,"opennds");
 	if(!cp_section) {
-		uci_unload(cap_uci, opennds);
+		uci_unload(capg_uci, opennds);
 		return;
 	}
 	blob_buf_init(&cap, 0);
@@ -351,15 +370,14 @@ void vif_state_captive_portal_options_get(struct schema_Wifi_VIF_State *vstate)
 			}
 		}
 	}
-uci_unload(cap_uci, opennds);
+uci_unload(capg_uci, opennds);
 return;
 }
 
-void clean_up(CURL *curl,FILE* imagefile, FILE* headerfile)
+void clean_up(CURL *curl,FILE* imagefile)
 {
 	curl_easy_cleanup(curl);
 	fclose(imagefile);
-	fclose(headerfile);
 	return;
 }
 
@@ -368,33 +386,27 @@ size_t write_data(void *ptr, size_t size, size_t nmemb, FILE *stream) {
     return written;
 }
 
-void splash_page_logo(char* dest_file, char* src_url)
+void captive_portal_files_download(char* dest_file, char* src_url)
 {
 	CURL *curl;
 	CURLcode res;
 	FILE *imagefile;
-	FILE *headerfile;
-	static const char *clientcert = "/usr/opensync/certs/client.pem";
+	const char *clientcert = "/usr/opensync/certs/client.pem";
 	const char *clientkey = "/usr/opensync/certs/client_dec.key";
-	static const char *pHeaderFile = "/etc/opennds/splashlogo_header";
 	const char *keytype = "PEM";
-	char errbuf[CURL_ERROR_SIZE];
-	headerfile = fopen(pHeaderFile, "wb");
+
 	imagefile = fopen(dest_file, "wb");
 	if(imagefile == NULL){
 		LOG(ERR, "fopen failed");
-		if(headerfile)
-			fclose(headerfile);
 		return;
 	}
 	curl = curl_easy_init();
 
 	if (curl == NULL){
 		LOG(ERR, "curl_easy_init failed");
-		clean_up(curl,imagefile,headerfile);
+		clean_up(curl,imagefile);
 		return;
 	}
-	curl_easy_setopt(curl, CURLOPT_HEADERDATA, headerfile);
 	curl_easy_setopt(curl, CURLOPT_URL, src_url);
 	curl_easy_setopt(curl, CURLOPT_SSLCERT, clientcert);
 	curl_easy_setopt(curl, CURLOPT_SSLKEY, clientkey);
@@ -403,23 +415,22 @@ void splash_page_logo(char* dest_file, char* src_url)
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, imagefile);
-	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 	curl_easy_setopt(curl, CURLOPT_HEADER, 0L);
 
 	res = curl_easy_perform(curl);
 	if (res != CURLE_OK){
-		clean_up(curl,imagefile,headerfile);
+		clean_up(curl,imagefile);
 		remove(dest_file);
 		return;
 	}
-	clean_up(curl,imagefile,headerfile);
+	clean_up(curl,imagefile);
 	return ;
 }
 
 int ipset_create(char *ifnds)
 {
 	char command[64];
-	sprintf(command,"ipset create set_%s hash:ip", ifnds);
+	snprintf(command, sizeof(command), "ipset create set_%s hash:ip", ifnds);
 	return (system(command));
 }
 
@@ -427,18 +438,19 @@ void captive_portal_get_current_urls(char *ifname, char *splash_logo, char *back
 {
 	char *buf = NULL;
 	struct blob_attr *tc[__NDS_ATTR_MAX] = { };
-	struct blob_buf url_buf={ };
-	struct uci_section *cp_section;
+	struct uci_section *cp_section = NULL;
+	struct uci_package *opennds = NULL;
 
-	uci_load(cap_uci, "opennds", &opennds);
-	cp_section = uci_lookup_section(cap_uci, opennds,"opennds");
+	uci_load(caps_uci, "opennds", &opennds);
+	cp_section = uci_lookup_section(caps_uci, opennds,"opennds");
 	if(!cp_section) {
-		uci_unload(cap_uci, opennds);
+		uci_unload(caps_uci, opennds);
 		return;
 	}
 
 	blob_buf_init(&url_buf, 0);
 	uci_to_blob(&url_buf, cp_section, &opennds_param);
+
 	blobmsg_parse(opennds_policy, __NDS_ATTR_MAX, tc, blob_data(url_buf.head), blob_len(url_buf.head));
 
 	if (tc[NDS_ATTR_SPLASH_PAGE_LOGO]) {
@@ -460,7 +472,8 @@ void captive_portal_get_current_urls(char *ifname, char *splash_logo, char *back
 	} else {
 		user_file[0]=0;
 	}
-	uci_unload(cap_uci, opennds);
+	uci_unload(caps_uci, opennds);
+
 	return;
 }
 void opennds_parameters(char *ifname)
@@ -469,7 +482,7 @@ void opennds_parameters(char *ifname)
 	char users_router[7][64] = { "allow tcp port 53","allow udp port 53",
 				"allow udp port 67","allow tcp port 22",
 				"allow tcp port 23", "allow tcp port 80", "allow tcp port 443"};
-	struct blob_buf cap_blob={ };
+
 	blob_buf_init(&cap_blob, 0);
 
 	blobmsg_add_string(&cap_blob, "fwhook_enabled","1");
@@ -493,38 +506,35 @@ void opennds_parameters(char *ifname)
 		blobmsg_add_string(&cap_blob, NULL, users_router[i]);
 	}
 	blobmsg_close_array(&cap_blob, d);
-	blob_to_uci_section(cap_uci, "opennds", "opennds", "opennds", cap_blob.head, &opennds_param, NULL);
-	uci_commit_all(cap_uci);
+	blob_to_uci_section(caps_uci, "opennds", "opennds", "opennds", cap_blob.head, &opennds_param, NULL);
+	uci_commit_all(caps_uci);
 	return;
 }
 
 void opennds_section_del(char *section_name)
 {
 	struct uci_package *opennds;
-	struct uci_context *nds_ctx;
 	struct uci_element *e = NULL, *tmp = NULL;
 	int ret = 0;
 
-	nds_ctx = uci_alloc_context();
-	ret = uci_load(nds_ctx, "opennds", &opennds);
+	ret = uci_load(caps_uci, "opennds", &opennds);
 	if (ret) {
 		LOGE("%s: %s uci_load() failed with rc %d", section_name, __func__, ret);
-		uci_free_context(nds_ctx);
+		uci_unload(caps_uci, opennds);
 		return;
 	}
 	uci_foreach_element_safe(&opennds->sections, tmp, e) {
 		struct uci_section *s = uci_to_section(e);
 		if (!strcmp(s->e.name, section_name)) {
-			uci_section_del(nds_ctx, "vif", "opennds", (char *)s->e.name, section_name);
+			uci_section_del(caps_uci, "vif", "opennds", (char *)s->e.name, section_name);
 		}
 		else {
 			continue;
 		}
 	}
 
-	uci_commit(nds_ctx, &opennds, false);
-	uci_unload(nds_ctx, opennds);
-	uci_free_context(nds_ctx);
+	uci_commit(caps_uci, &opennds, false);
+	uci_unload(caps_uci, opennds);
 }
 
 void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *ifname)
@@ -534,23 +544,26 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 	const char *opt;
 	const char *val;
 	blob_buf_init(&cap, 0);
-	char path[64];
-	char webroot[64];
+	char path[64] = {0};
+	char webroot[64] = {0};
+
 	char ipset_tcp80[64];
 	char ipset_tcp443[64];
-	char splash_logo[84];
-	char back_image[84];
-	char user_file[84];
 
-	sprintf(path,"/etc/opennds/htdocs/images/");
-	sprintf(webroot,"/etc/opennds/htdocs");
-	sprintf(ipset_tcp80,"allow tcp port 80 ipset set_opennds");
-	sprintf(ipset_tcp443,"allow tcp port 443 ipset set_opennds");
+	char splash_logo[84] = {0};
+	char back_image[84] = {0};
+	char user_file[84] = {0};
+
+	snprintf(path, sizeof(path), "/etc/opennds/htdocs/images/");
+	snprintf(webroot, sizeof(webroot), "/etc/opennds/htdocs");
+
+	snprintf(ipset_tcp80, sizeof(ipset_tcp80),"allow tcp port 80 ipset set_opennds");
+	snprintf(ipset_tcp443, sizeof(ipset_tcp443), "allow tcp port 443 ipset set_opennds");
+
 	char file_path[128];
 	struct stat st = {0};
 	if (stat(path, &st) == -1)
 		mkdir(path, 0755);
-
 	captive_portal_get_current_urls(ifname, splash_logo, back_image, user_file);
 
 	for (j = 0; j < SCHEMA_CAPTIVE_PORTAL_OPTS_MAX; j++) {
@@ -575,6 +588,7 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 				blobmsg_add_string(&cap, NULL, ipset_tcp80);
 				blobmsg_add_string(&cap, NULL, ipset_tcp443);
 				blobmsg_close_array(&cap, d);
+				vif_fixup_set_iface_captive(ifname, true);
 
 			} else if (strcmp(value,"username")==0) {
 				blobmsg_add_string(&cap, "webroot",webroot);
@@ -589,6 +603,8 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 				blobmsg_add_string(&cap, NULL, ipset_tcp443);
 				blobmsg_close_array(&cap, d);
 
+				vif_fixup_set_iface_captive(ifname, true);
+
 			} else if (strcmp(value,"radius")==0)  {
 				blobmsg_add_string(&cap, "webroot",webroot);
 				opennds_parameters("opennds");
@@ -596,14 +612,19 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 				blobmsg_add_string(&cap, "enabled", "1");
 				blobmsg_add_string(&cap, "gatewayinterface","br-lan");
 				blobmsg_add_string(&cap, "preauth", "/usr/lib/opennds/radius.sh");
+
 				ipset_create("opennds");
 				d = blobmsg_open_array(&cap, "preauthenticated_users");
 				blobmsg_add_string(&cap, NULL, ipset_tcp80);
 				blobmsg_add_string(&cap, NULL, ipset_tcp443);
 				blobmsg_close_array(&cap, d);
+
+				vif_fixup_set_iface_captive(ifname, true);
 			}
 			else {
-				opennds_section_del("opennds");
+				vif_fixup_set_iface_captive(ifname, false);
+				if (vif_fixup_captive_enabled() == false)
+					opennds_section_del("opennds");
 				return;
 			}
 		}
@@ -632,15 +653,15 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 		else if (strcmp(opt, "splash_page_logo") == 0) {
 			blobmsg_add_string(&cap, "splash_page_logo", value);
 			if (strcmp(splash_logo,value) !=0) {
-				sprintf(file_path,"%s%s",path,"TipLogo.png");
-				splash_page_logo(file_path,value);
+				snprintf(file_path, sizeof(file_path), "%s%s",path,"TipLogo.png");
+				captive_portal_files_download(file_path,value);
 			}
 
 		} else if (strcmp(opt, "splash_page_background_logo") == 0) {
 			blobmsg_add_string(&cap, "page_background_logo", value);
 			if (strcmp(back_image,value) !=0) {
-				sprintf(file_path,"%s%s",path,"TipBackLogo.png");
-				splash_page_logo(file_path,value);
+				snprintf(file_path, sizeof(file_path),"%s%s",path,"TipBackLogo.png");
+				captive_portal_files_download(file_path,value);
 			}
 		}
 
@@ -660,18 +681,20 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 		else if (strcmp(opt, "username_password_file") == 0) {
 			blobmsg_add_string(&cap, "username_password_file", value);
 			if (strcmp(user_file,value) !=0) {
-				sprintf(file_path,"%s%s",path,"userpass.dat");
-				splash_page_logo(file_path,value);
+				snprintf(file_path, sizeof(file_path),"%s%s",path,"userpass.dat");
+				captive_portal_files_download(file_path,value);
 			}
 		}
 	}
-	blob_to_uci_section(cap_uci, "opennds", "opennds", "opennds", cap.head, &opennds_param, NULL);
-	uci_commit_all(cap_uci);
+	blob_to_uci_section(caps_uci, "opennds", "opennds", "opennds", cap.head, &opennds_param, NULL);
+	uci_commit_all(caps_uci);
 	return;
 }
+
 void captive_portal_init()
 {
-	cap_uci=uci_alloc_context();
+	caps_uci=uci_alloc_context();
+	capg_uci=uci_alloc_context();
 	dns=uci_alloc_context();
 	return;
 }
