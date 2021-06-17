@@ -52,7 +52,6 @@ define Package/opennds/install
 	$(INSTALL_DIR) $(1)/usr/lib/opennds
 
 	$(CP) ./files/lib/splash.css $(1)/etc/opennds/htdocs/
-	$(CP) ./files/lib/Tip.png $(1)/etc/opennds/htdocs/images/
 	$(CP) ./files/lib/opennds $(1)/etc/config/
 	$(CP) ./files/etc/init.d/opennds $(1)/etc/init.d/
 	$(CP) ./files/lib/login.sh $(1)/usr/lib/opennds/
