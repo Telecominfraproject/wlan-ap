@@ -232,6 +232,35 @@ void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 	}
 }
 
+void rrm_rebalance_channel(char *freq_band, int32_t channel)
+{
+	int channel_bandwidth; 
+	int sec_chan_offset=0;
+	rrm_radio_state_t       *radio = NULL;
+
+	ds_tree_t *radio_list = rrm_get_radio_list();
+
+	ds_tree_foreach(radio_list, radio)
+	{
+		if((strcmp(radio->schema.freq_band, freq_band) == 0))
+			break;
+
+	}
+
+	struct mode_map *m = mode_map_get_uci(radio->schema.freq_band,
+			get_max_channel_bw_channel(ieee80211_channel_to_frequency(channel),
+			radio->schema.ht_mode), radio->schema.hw_mode);
+	if (m) {
+			sec_chan_offset = m->sec_channel_offset;
+		} else
+			LOGE("failed to get channel offset");
+
+	get_channel_bandwidth(get_max_channel_bw_channel(ieee80211_channel_to_frequency(channel),
+			radio->schema.ht_mode), &channel_bandwidth);
+	ubus_set_channel_switch(radio->config.if_name,
+			ieee80211_channel_to_frequency(channel), channel_bandwidth, sec_chan_offset);
+
+}
 void set_rrm_parameters(rrm_entry_t *rrm_data)
 {
 	ds_tree_t                       *radio_list;

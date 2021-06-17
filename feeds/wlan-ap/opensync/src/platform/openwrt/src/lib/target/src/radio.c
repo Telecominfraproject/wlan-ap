@@ -94,6 +94,17 @@ static const char custom_options_table[SCHEMA_CUSTOM_OPTS_MAX][SCHEMA_CUSTOM_OPT
 	SCHEMA_CONSTS_LOCAL_PWR_CONSTRAINT,
 };
 
+static bool is_csa_requested(const struct schema_Wifi_Radio_Config_flags *changed)
+{
+	if(changed->channel && !changed->enabled && !changed->tx_power
+		&& !changed->tx_chainmask && !changed->rx_chainmask && !changed->country
+		&& !changed->bcn_int && !changed->ht_mode && !changed->hw_mode 
+		&& !changed->freq_band && !changed->custom_options)
+		return true;
+	else
+		return false;
+}
+
 static void radio_config_custom_opt_set(struct blob_buf *b, struct blob_buf *del,
                                       const struct schema_Wifi_Radio_Config *rconf)
 {
@@ -372,17 +383,21 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 	char phy[6];
 	char ifname[8];
 
+
 	strncpy(ifname, rconf->if_name, sizeof(ifname));
 	strncpy(phy, target_map_ifname(ifname), sizeof(phy));
 
 	if (changed->channel && rconf->channel)
 		blobmsg_add_u32(&b, "channel", rconf->channel);
 
+
 	if (changed->enabled)
 		blobmsg_add_u8(&b, "disabled", rconf->enabled ? 0 : 1);
 
+
 	if (changed->tx_power) {
 		int max_tx_power;
+
 		max_tx_power=phy_get_max_tx_power(phy,rconf->channel);
 		if (rconf->tx_power<=max_tx_power) {
 			blobmsg_add_u32(&b, "txpower", rconf->tx_power);
@@ -484,6 +499,18 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 
 	if (changed->custom_options)
 		radio_config_custom_opt_set(&b, &del, rconf);
+
+	if(is_csa_requested(changed)) {
+		FILE * fPtr;
+		fPtr = fopen("/tmp/wireless_changes.txt", "w");
+
+		if(fPtr) {
+			fputs(phy,fPtr);
+			fputs("\n",fPtr);
+			fputs(rconf->freq_band,fPtr);
+			fclose(fPtr);
+		}
+	}
 
 	blob_to_uci_section(uci, "wireless", rconf->if_name, "wifi-device",
 			    b.head, &wifi_device_param, del.head);
