@@ -26,6 +26,7 @@
 #include "ovsdb_table.h"
 #include "ovsdb_sync.h"
 #include "rrm_config.h"
+#include "fixup.h"
 
 #define MODULE_ID LOG_MODULE_ID_VIF
 #define UCI_BUFFER_SIZE 80
@@ -1326,6 +1327,7 @@ bool target_vif_config_del(const struct schema_Wifi_VIF_Config *vconf)
 	const char *ifname;
 	int ret = 0;
 
+	vif_fixup_del((char *)vconf->if_name);
 	vlan_del((char *)vconf->if_name);
 	vif_ctx = uci_alloc_context();
 	ret= uci_load(vif_ctx, "wireless", &wireless);
