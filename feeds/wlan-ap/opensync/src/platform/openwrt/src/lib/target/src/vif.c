@@ -329,7 +329,6 @@ static struct vif_crypto {
 };
 
 extern ovsdb_table_t table_APC_State;
-extern json_t* ovsdb_table_where(ovsdb_table_t *table, void *record);
 extern unsigned int radproxy_apc;
 
 /* Custom options table */
@@ -417,12 +416,12 @@ static int vif_config_security_set(struct blob_buf *b,
 
 			if (vif_config_custom_opt_get_proxy(vconf)) { /* Radius Proxy Enabled */
 				LOGN("%s: Apply Proxy Security Settings", vconf->if_name);
-				json_t *where = ovsdb_table_where(&table_APC_State, &apc_conf);
-				if (false == ovsdb_table_select_one_where(&table_APC_State,
-						where, &apc_conf)) {
-					LOG(INFO, "APC_State read failed");
+				if(apc_read_state(&apc_conf) == false)
+				{
+					LOGI("APC_State read failed");
 					return -1;
 				}
+
 				if (!strncmp(apc_conf.mode, "DR", 2)) {
 					auth_server = local_server;
 					acct_server = local_server;
@@ -1065,8 +1064,7 @@ void vif_check_radius_proxy()
 	int n = 0;
 	void *buf = NULL;
 
-	json_t *where = ovsdb_table_where(&table_APC_State, &apc_conf);
-	if (false == ovsdb_table_select_one_where(&table_APC_State, where, &apc_conf))
+	if(apc_read_state(&apc_conf) == false)
 	{
 		LOGI("APC_State read failed");
 		return;
