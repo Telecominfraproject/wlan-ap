@@ -26,5 +26,7 @@ extern void radio_maverick(void *arg);
 
 int nl80211_channel_get(char *name, unsigned int *chan);
 void set_config_apply_timeout(ovsdb_update_monitor_t *mon);
+bool apc_read_conf(struct schema_APC_Config *apcconf);
+bool apc_read_state(struct schema_APC_State *apcst);
 
 #endif
