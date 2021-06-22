@@ -222,14 +222,6 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf)
 	char server_name[256] = {};
 	char acct_server_name[256] = {};
 	char tls_name[256] = {};
-	struct schema_APC_State apc_conf;
-
-	json_t *where = ovsdb_table_where(&table_APC_State, &apc_conf);
-	if (false == ovsdb_table_select_one_where(&table_APC_State,
-			where, &apc_conf)) {
-		LOG(INFO, "APC_State read failed");
-		return false;
-	}
 
 	/* Configure options block */
 	blob_buf_init(&uci_buf, 0);

@@ -41,7 +41,6 @@ ovsdb_table_t table_Wifi_Inet_Config;
 ovsdb_table_t table_Node_Config;
 
 unsigned int radproxy_apc = 0;
-extern json_t* ovsdb_table_where(ovsdb_table_t *table, void *record);
 
 static struct uci_package *wireless;
 struct uci_context *uci;
@@ -809,32 +808,105 @@ static const struct blobmsg_policy apc_policy[__APC_ATTR_MAX] = {
 
 struct schema_APC_Config apc_conf;
 
-void apc_state_set(struct blob_attr *msg)
-{
-	struct blob_attr *tb[__APC_ATTR_MAX] = { };
-	struct schema_APC_Config apc_conf;
-	struct schema_APC_State apc_state;
-	json_t *where;
 
-	/* Check if apc conf is disabled, if disabled the update state
-	 * with NC mode and return, this is to avoid the apc ubus
-	 * notifications which come after the APC is disabled */
-	where = ovsdb_table_where(&table_APC_Config, &apc_conf);
-	if (false == ovsdb_table_select_one_where(&table_APC_Config,
-						  where, &apc_conf)) {
-		LOG(ERR, "%s: APC_State read failed", __func__);
-		apc_conf.enabled = true;
+bool apc_read_conf(struct schema_APC_Config *apcconf)
+{
+	json_t *jrows;
+	int cnt = 0;
+	int i = 0;
+	pjs_errmsg_t perr;
+
+	jrows = ovsdb_sync_select_where(SCHEMA_TABLE(APC_Config), NULL);
+	if(!jrows)
+	{
+		return false;
+	}
+	cnt = json_array_size(jrows);
+	if(!cnt)
+	{
+		json_decref(jrows);
+		return false;
 	}
 
-	if (apc_conf.enabled == false) {
+	for (i = 0; i < cnt; i++)
+	{
+		if(!schema_APC_Config_from_json(apcconf, json_array_get(jrows, i),
+						false, perr))
+		{
+			LOGE("Unable to parse APC Config column: %s", perr);
+			json_decref(jrows);
+			return false;
+		}
+	}
+	json_decref(jrows);
+
+	return true;
+}
+
+bool apc_read_state(struct schema_APC_State *apcst)
+{
+	json_t *jrows;
+	int cnt = 0;
+	int i = 0;
+	pjs_errmsg_t perr;
+
+	jrows = ovsdb_sync_select_where(SCHEMA_TABLE(APC_State), NULL);
+	if(!jrows)
+	{
+		return false;
+	}
+	cnt = json_array_size(jrows);
+	if(!cnt)
+	{
+		json_decref(jrows);
+		return false;
+	}
+
+	for (i = 0; i < cnt; i++)
+	{
+		if(!schema_APC_State_from_json(apcst, json_array_get(jrows, i),
+						false, perr))
+		{
+			LOGE("Unable to parse APC State column: %s", perr);
+			json_decref(jrows);
+			return false;
+		}
+	}
+	json_decref(jrows);
+
+	return true;
+}
+
+/* Check if apc conf is disabled, if disabled the update state
+ * with NC mode and return, this is to avoid the apc ubus
+ * notifications which come after the APC is disabled */
+bool apc_conf_en()
+{
+	struct schema_APC_Config apcconf;
+	struct schema_APC_State apc_state;
+
+	if(apc_read_conf(&apcconf) == false)
+		return true;
+
+	if (apcconf.enabled == false) {
 		SCHEMA_SET_STR(apc_state.mode, "NC");
 		SCHEMA_SET_STR(apc_state.dr_addr, "0.0.0.0");
 		SCHEMA_SET_STR(apc_state.bdr_addr, "0.0.0.0");
 		SCHEMA_SET_INT(apc_state.enabled, false);
 		if (!ovsdb_table_update(&table_APC_State, &apc_state))
 			LOG(ERR, "APC_state: failed to update");
-		return;
+		return false;
 	}
+	return true;
+}
+
+void apc_state_set(struct blob_attr *msg)
+{
+	struct blob_attr *tb[__APC_ATTR_MAX] = { };
+	struct schema_APC_State apc_state;
+
+	if(apc_conf_en() == false)
+		return;
 
 	blobmsg_parse(apc_policy, __APC_ATTR_MAX, tb,
 		      blob_data(msg), blob_len(msg));
@@ -879,13 +951,10 @@ static int conn_since = 0;
 static void apc_enable(bool flag) {
 
 	struct schema_APC_State apc_state;
-	json_t *where;
 	
 	LOGI("APC %s: %s APC", __func__, flag?"enable":"disable");
 	if (flag == false) {
-		where = ovsdb_table_where(&table_APC_State, &apc_state);
-		if (false == ovsdb_table_select_one_where(&table_APC_State,
-						  where, &apc_state)) {
+		if(apc_read_state(&apc_state) == false) {
 			LOG(ERR, "%s: APC_State read failed", __func__);
 			apc_state.enabled = true;
 		}
@@ -918,17 +987,13 @@ apc_cld_mon_cb(struct schema_Manager *mgr)
 	int i = 0;
 	conn_since = 0;
 	struct schema_APC_State apc_state;
-	json_t *where;
 	int ret = 0;
 	int link = 1;
 
-	where = ovsdb_table_where(&table_APC_State, &apc_state);
-	if (false == ovsdb_table_select_one_where(&table_APC_State,
-						  where, &apc_state)) {
+	if(apc_read_state(&apc_state) == false) {
 		LOG(ERR, "%s: APC_State read failed", __func__);
 		return;
 	}
-
 
 	/*Checks if wan ethernet port is down and disables apc*/
 	ret = system("/bin/check_wan_link.sh");
