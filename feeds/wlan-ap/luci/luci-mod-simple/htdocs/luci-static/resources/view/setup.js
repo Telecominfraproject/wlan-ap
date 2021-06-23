@@ -444,6 +444,10 @@ return view.extend({
 		o.datatype = 'ip4addr("nomask")';
 		o.depends('proto', 'static');
 
+		o = s.option(form.Button, 'save', _(''));
+		o.inputtitle = _('Save Settings');
+		o.onclick = ui.createHandlerFn(this, 'handleSettingsSave', m);
+
 		s = m.section(form.NamedSection, 'lan', 'lan', _('LAN'));
 
 		o = s.option(form.Value, 'addr', _('IP Address'));
@@ -456,7 +460,7 @@ return view.extend({
 
 		o = s.option(form.Button, 'save', _(''));
 		o.inputtitle = _('Save Settings');
-		o.onclick = ui.createHandlerFn(this, 'handleSettingsSave', m);
+		o.onclick = ui.createHandlerFn(this, 'handleLANSettingsSave', m);
 
 		s = m.section(form.NamedSection, 'maintenance', 'maintenance', _('System Maintenance'));
 
