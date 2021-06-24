@@ -651,17 +651,21 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 			blobmsg_add_string(&cap, "gatewayname", value);
 
 		else if (strcmp(opt, "splash_page_logo") == 0) {
-			blobmsg_add_string(&cap, "splash_page_logo", value);
-			if (strcmp(splash_logo,value) !=0) {
-				snprintf(file_path, sizeof(file_path), "%s%s",path,"TipLogo.png");
-				captive_portal_files_download(file_path,value);
+			if (value[0] != '\0') {
+				blobmsg_add_string(&cap, "splash_page_logo", value);
+				if (strcmp(splash_logo,value) !=0) {
+					snprintf(file_path, sizeof(file_path), "%s%s",path,"TipLogo.png");
+					captive_portal_files_download(file_path,value);
+				}
 			}
 
 		} else if (strcmp(opt, "splash_page_background_logo") == 0) {
-			blobmsg_add_string(&cap, "page_background_logo", value);
-			if (strcmp(back_image,value) !=0) {
-				snprintf(file_path, sizeof(file_path),"%s%s",path,"TipBackLogo.png");
-				captive_portal_files_download(file_path,value);
+			if (value[0] != '\0') {
+				blobmsg_add_string(&cap, "page_background_logo", value);
+				if (strcmp(back_image,value) !=0) {
+					snprintf(file_path, sizeof(file_path),"%s%s",path,"TipBackLogo.png");
+					captive_portal_files_download(file_path,value);
+				}
 			}
 		}
 
@@ -679,10 +683,12 @@ void vif_captive_portal_set(const struct schema_Wifi_VIF_Config *vconf, char *if
 			blobmsg_add_string(&cap, "login_success_text", value);
 
 		else if (strcmp(opt, "username_password_file") == 0) {
-			blobmsg_add_string(&cap, "username_password_file", value);
-			if (strcmp(user_file,value) !=0) {
-				snprintf(file_path, sizeof(file_path),"%s%s",path,"userpass.dat");
-				captive_portal_files_download(file_path,value);
+			if (value[0] != '\0') {
+				blobmsg_add_string(&cap, "username_password_file", value);
+				if (strcmp(user_file,value) !=0) {
+					snprintf(file_path, sizeof(file_path),"%s%s",path,"userpass.dat");
+					captive_portal_files_download(file_path,value);
+				}
 			}
 		}
 	}
