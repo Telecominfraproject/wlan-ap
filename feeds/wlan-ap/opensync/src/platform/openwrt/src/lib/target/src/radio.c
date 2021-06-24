@@ -950,7 +950,6 @@ apc_cld_mon_cb(struct schema_Manager *mgr)
 			if(!strncmp(mgr->status_keys[i] , "sec_since_connect",
 					       strlen("sec_since_connect"))) {
 				conn_since = atoi(mgr->status[i]);
-				LOGI("conn_since: %d", conn_since);
 				break;
 			}
 		}
