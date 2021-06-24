@@ -111,9 +111,10 @@ ifeq ($(LOCAL_VARIANT),full)
 endif
 
 ifneq ($(LOCAL_TYPE),hostapd)
+  DRIVER_MAKEOPTS += CONFIG_HS20=y CONFIG_INTERWORKING=y
   ifeq ($(LOCAL_VARIANT),mesh)
     ifeq ($(SSL_VARIANT),openssl)
-      DRIVER_MAKEOPTS += CONFIG_TLS=openssl CONFIG_AP=y CONFIG_SAE=y CONFIG_MESH=y
+      DRIVER_MAKEOPTS += CONFIG_TLS=openssl CONFIG_SAE=y CONFIG_OWE=y CONFIG_SUITEB192=y CONFIG_AP=y CONFIG_MESH=y
       TARGET_LDFLAGS += -lcrypto -lssl
     endif
     ifeq ($(SSL_VARIANT),wolfssl)

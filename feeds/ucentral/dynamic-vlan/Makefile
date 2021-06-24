@@ -6,7 +6,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_URL=https://github.com/blogic/dynamic-vlan.git
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2021-06-04
-PKG_SOURCE_VERSION:=87dbb04fd0c44ac3d6bc851610ba37eebbb7a3c3
+PKG_SOURCE_VERSION:=55d78d3e7215b601084980d922349bcfdcf9cf20
 
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=BSD-3-Clause
