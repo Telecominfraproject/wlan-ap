@@ -11,9 +11,60 @@
 
 static struct ubus_context *ubus;
 
+
+
+enum {
+	FREQ_BAND,
+	CHANNEL,
+	__RRM_REBALANCE_MAX,
+};
+
+static const struct blobmsg_policy rebalance_channel_policy[__RRM_REBALANCE_MAX] = {
+	[FREQ_BAND] = { "freq_band", BLOBMSG_TYPE_STRING },
+	[CHANNEL] = { "channel", BLOBMSG_TYPE_INT32 },
+};
+
+static int
+rrm_rebalance_channel_cb(struct ubus_context *ctx, struct ubus_object *obj,
+		      struct ubus_request_data *req, const char *method,
+		      struct blob_attr *msg)
+{
+	struct blob_attr *tb[__RRM_REBALANCE_MAX] = { };
+	int32_t channel;
+	char *freq_band;
+
+	if (!msg)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	blobmsg_parse(rebalance_channel_policy, __RRM_REBALANCE_MAX, tb, blob_data(msg), blob_len(msg));
+	if (!tb[FREQ_BAND] || !tb[CHANNEL])
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	freq_band = blobmsg_get_string(tb[FREQ_BAND]);
+	channel = blobmsg_get_u32(tb[CHANNEL]);
+
+	rrm_rebalance_channel(freq_band, channel);
+	return UBUS_STATUS_OK;
+}
+
+static const struct ubus_method rrm_ubus_methods[] = {
+        UBUS_METHOD("rrm_rebalance_channel", rrm_rebalance_channel_cb, rebalance_channel_policy),
+};
+
+static struct ubus_object_type rrm_ubus_object_type =
+        UBUS_OBJECT_TYPE("osync-rrm", rrm_ubus_methods);
+
+static struct ubus_object rrm_ubus_object = {
+        .name = "osync-rrm",
+        .type = &rrm_ubus_object_type,
+        .methods = rrm_ubus_methods,
+        .n_methods = ARRAY_SIZE(rrm_ubus_methods),
+};
+
 static void rrm_ubus_connect(struct ubus_context *ctx)
 {
 	ubus = ctx;
+	ubus_add_object(ubus, &rrm_ubus_object);
 }
 
 static void ubus_iwinfo_cb(struct ubus_request *req,

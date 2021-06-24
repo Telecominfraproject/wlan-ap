@@ -371,18 +371,26 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 
 	char phy[6];
 	char ifname[8];
+	bool is_csa_requested = false;
 
 	strncpy(ifname, rconf->if_name, sizeof(ifname));
 	strncpy(phy, target_map_ifname(ifname), sizeof(phy));
 
-	if (changed->channel && rconf->channel)
+	if (changed->channel && rconf->channel) {
 		blobmsg_add_u32(&b, "channel", rconf->channel);
+		is_csa_requested = true;
+	}
 
-	if (changed->enabled)
+	if (changed->enabled) {
 		blobmsg_add_u8(&b, "disabled", rconf->enabled ? 0 : 1);
+		is_csa_requested = false;
+	}
+
 
 	if (changed->tx_power) {
 		int max_tx_power;
+		is_csa_requested = false;
+
 		max_tx_power=phy_get_max_tx_power(phy,rconf->channel);
 		if (rconf->tx_power<=max_tx_power) {
 			blobmsg_add_u32(&b, "txpower", rconf->tx_power);
@@ -394,6 +402,8 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 
 	if (changed->tx_chainmask) {
 		int tx_ant_avail,txchainmask;
+		is_csa_requested = false;
+
 		tx_ant_avail=phy_get_tx_available_antenna(phy);
 
 		if ((tx_ant_avail & 0xf0) && !(tx_ant_avail & 0x0f)) {
@@ -412,6 +422,7 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 
 	if (changed->rx_chainmask) {
 		int rx_ant_avail, rxchainmask;
+		is_csa_requested = false;
 		rx_ant_avail=phy_get_rx_available_antenna(phy);
 
 		if ((rx_ant_avail & 0xf0) && !(rx_ant_avail & 0x0f)) {
@@ -428,11 +439,14 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 		}
 	}
 
-	if (changed->country)
+	if (changed->country) {
 		blobmsg_add_string(&b, "country", rconf->country);
+		is_csa_requested = false;
+		}
 
 	if (changed->bcn_int) {
 		int beacon_int = rconf->bcn_int;
+		is_csa_requested = false;
 
 		if ((rconf->bcn_int < 50) || (rconf->bcn_int > 400))
 			beacon_int = 100;
@@ -444,6 +458,7 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 		char buffer[8];
 		FILE *confFile_p;
 		const char* hw_mode = rconf->hw_mode;
+		is_csa_requested = false;
 
 		channel_freq = ieee80211_channel_to_frequency(rconf->channel);
 		if (!strcmp(rconf->hw_mode, "auto")) {
@@ -484,6 +499,18 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 
 	if (changed->custom_options)
 		radio_config_custom_opt_set(&b, &del, rconf);
+
+	if(is_csa_requested) {
+		FILE * fPtr;
+		fPtr = fopen("/tmp/wireless_changes.txt", "w");
+
+		if(fPtr) {
+			fputs(phy,fPtr);
+			fputs("\n",fPtr);
+			fputs(rconf->freq_band,fPtr);
+			fclose(fPtr);
+		}
+	}
 
 	blob_to_uci_section(uci, "wireless", rconf->if_name, "wifi-device",
 			    b.head, &wifi_device_param, del.head);
