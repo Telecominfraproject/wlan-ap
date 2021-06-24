@@ -95,5 +95,6 @@ ds_tree_t* rrm_get_rrm_config_list(void);
 ds_tree_t* rrm_get_radio_list(void);
 ds_tree_t* rrm_get_vif_list(void);
 void rrm_reset_noise_floor_samples(rrm_entry_t *rrm_data);
+void rrm_radio_rebalance_channel(const struct schema_Wifi_Radio_Config *rconf);
 
 #endif /* RRM_H_INCLUDED */

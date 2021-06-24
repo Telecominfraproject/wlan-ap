@@ -378,8 +378,10 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 	strncpy(ifname, rconf->if_name, sizeof(ifname));
 	strncpy(phy, target_map_ifname(ifname), sizeof(phy));
 
-	if (changed->channel && rconf->channel)
+	if (changed->channel && rconf->channel) {
 		blobmsg_add_u32(&b, "channel", rconf->channel);
+		rrm_radio_rebalance_channel(rconf);
+	}
 
 	if (changed->enabled)
 		blobmsg_add_u8(&b, "disabled", rconf->enabled ? 0 : 1);

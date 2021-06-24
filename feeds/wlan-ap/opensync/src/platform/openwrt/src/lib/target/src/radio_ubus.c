@@ -90,6 +90,35 @@ int hapd_rrm_set_neighbors(char *name, struct rrm_neighbor *neigh, int count)
 	return ubus_invoke(ubus, id, "rrm_nr_set", b.head, NULL, NULL, 1000);
 }
 
+int ubus_set_channel_switch(const char *if_name, uint32_t frequency,
+			    int channel_bandwidth, int sec_chan_offset)
+{
+	uint32_t id;
+	char path[64];
+
+	snprintf(path, sizeof(path), "hostapd.%s", if_name);
+
+	if (ubus_lookup_id(ubus, path, &id))
+		return -1;
+	blob_buf_init(&b, 0);
+
+	if (channel_bandwidth == 20 || channel_bandwidth == 40) {
+		blobmsg_add_u8(&b, "ht", 1);
+	} else if (channel_bandwidth == 80) {
+		blobmsg_add_u8(&b, "vht", 1);
+	}
+
+	if (channel_bandwidth == 40 || channel_bandwidth == 80) {
+		blobmsg_add_u32(&b, "center_freq1", frequency+30);
+	}
+
+	blobmsg_add_u32(&b, "freq", frequency);
+	blobmsg_add_u32(&b, "bcn_count", 5);
+	blobmsg_add_u32(&b, "bandwidth", channel_bandwidth);
+	blobmsg_add_u32(&b, "sec_channel_offset", sec_chan_offset);
+	return ubus_invoke(ubus, id, "switch_chan", b.head, NULL, NULL, 1000);
+}
+
 enum {
 	DUMMY_PARAMETER,
 	__DUMMY_MAX,
