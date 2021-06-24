@@ -102,7 +102,6 @@ bool set_rates_sysfs(const char *type, int rate_code, const char *ifname,
 	}
 	write(fd, value, sizeof(value));
 	close(fd);
-	LOGI("Kiran: wrote: %s to %s", value, path);
 	return true;
 }
 
@@ -238,6 +237,45 @@ bool rrm_noreload_config(struct schema_Wifi_RRM_Config *conf, const char *rname)
 					    conf->beacon_rate, 0);
 	}
 	return true;
+}
+
+void get_channel_bandwidth(const char* htmode, int *channel_bandwidth)
+{
+	if(!strcmp(htmode, "HT20"))
+		*channel_bandwidth=20;
+	else if (!strcmp(htmode, "HT40"))
+		*channel_bandwidth=40;
+	else if(!strcmp(htmode, "HT80"))
+		*channel_bandwidth=80;
+}
+
+void rrm_radio_rebalance_channel(const struct schema_Wifi_Radio_Config *rconf)
+{
+	int channel_bandwidth;
+	int sec_chan_offset=0;
+	struct mode_map *m = NULL;
+	int freq = 0;
+	char *mode = NULL;
+	int rid = 0;
+	char wlanif[16] = {0};
+
+	sscanf(rconf->if_name, "radio%d", &rid);
+	snprintf(wlanif, sizeof(wlanif), "wlan%d", rid);
+
+	freq = ieee80211_channel_to_frequency(rconf->channel);
+	mode = get_max_channel_bw_channel(freq,	rconf->ht_mode);
+
+	m = mode_map_get_uci(rconf->freq_band, mode, rconf->hw_mode);
+
+	if (m)
+		sec_chan_offset = m->sec_channel_offset;
+	else
+		LOGE("failed to get channel offset");
+
+	get_channel_bandwidth(mode, &channel_bandwidth);
+
+	ubus_set_channel_switch(wlanif, freq, channel_bandwidth,
+				sec_chan_offset);
 }
 
 static bool rrm_config_update( struct schema_Wifi_RRM_Config *conf, bool addNotDelete)
