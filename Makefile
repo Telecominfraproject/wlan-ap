@@ -3,6 +3,9 @@
 all:
 	./dock-run.sh ./build.sh  $(TARGET)
 
+dock-env:
+	./dock-run.sh bash 
+
 opensync:
 	./dock-run.sh make -j$(nproc) V=s -C openwrt package/feeds/opensync/opensync/clean
 	./dock-run.sh make -j$(nproc) V=s -C openwrt package/feeds/opensync/opensync/compile TARGET=$(TARGET) OPENSYNC_SRC=$(shell pwd)

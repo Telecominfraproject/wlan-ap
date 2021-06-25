@@ -30,6 +30,7 @@ ALLWIFIBOARDS:= \
 	edgecore-eap101 \
 	sercomm-wallaby \
 	edgecore-eap102 \
+	edgecore-eap106 \
 	tplink-ex227 \
 	tplink-ex447
 
@@ -112,6 +113,7 @@ $(eval $(call generate-ath11k-wifi-package,cig-wf194c,Cigtech WF194c))
 $(eval $(call generate-ath11k-wifi-package,sercomm-wallaby,Sercomm Kiwi))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap101,EdgeCore EAP101))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap102,Edgecore EAP102))
+$(eval $(call generate-ath11k-wifi-package,edgecore-eap106,Edgecore EAP106))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex227,TP-Link EX227))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex447,TP-Link EX447))
 

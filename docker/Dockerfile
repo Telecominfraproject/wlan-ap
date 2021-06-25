@@ -11,3 +11,4 @@ RUN apt-get update \
 RUN git config --global user.email "you@example.com"
 RUN git config --global user.name "Your Name"
 RUN pip3 install kconfiglib
+RUN apt-get install -y libncursesw5

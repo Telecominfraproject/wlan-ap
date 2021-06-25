@@ -6,4 +6,4 @@ params="-v ${PWD}:${PWD} --rm -w ${PWD} -u"$(id -u):$(id -g)" $groups -v/etc/pas
 
 docker build --tag=${tag} docker
 
-docker run $params $@
+docker run -it $params $@

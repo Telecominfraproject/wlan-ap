@@ -45,6 +45,10 @@ EAP102)
 	TARGET=eap102
 	WIFI=wifi-ax
 	;;
+EAP106)
+	TARGET=eap106
+	WIFI=wifi-ax
+	;;
 EX227)
 	TARGET=ex227
 	WIFI=wifi-ax
@@ -59,6 +63,14 @@ WF188N)
 	;;
 WF194C)
 	TARGET=wf194c
+	WIFI=wifi-ax
+	;;
+HAWKEYE)
+	TARGET=hawkeye
+	WIFI=wifi-ax
+	;;
+WALLABY)
+	TARGET=wallaby
 	WIFI=wifi-ax
 	;;
 WF610D)
