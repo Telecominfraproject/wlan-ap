@@ -2,9 +2,7 @@
 
 timeout=$1
 
-. /etc/diag.sh
-set_state upgrade
+/etc/init.d/led blink
 sleep $1
-status_led_off
-set_state done
+/etc/init.d/led restart
 exit 0
