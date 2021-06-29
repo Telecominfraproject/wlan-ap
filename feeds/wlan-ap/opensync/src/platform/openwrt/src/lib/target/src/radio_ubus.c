@@ -10,6 +10,46 @@
 extern struct ev_loop *wifihal_evloop;
 static struct ubus_context *ubus;
 extern struct ev_loop *wifihal_evloop;
+extern void apc_state_set(struct blob_attr *msg);
+
+int ubus_set_signal_thresholds(const char *if_name, int connect, int stay)
+{
+	uint32_t id;
+	char path[64];
+
+	if (connect > 0 && stay > 0)
+		return -1;
+
+	snprintf(path, sizeof(path), "hostapd.%s", if_name);
+
+	if (ubus_lookup_id(ubus, path, &id))
+		return -1;
+	blob_buf_init(&b, 0);
+
+	blobmsg_add_u32(&b, "connect", connect);
+	blobmsg_add_u32(&b, "stay", stay);
+
+	return ubus_invoke(ubus, id, "set_required_signal", b.head, NULL, NULL, 1000);
+}
+
+int ubus_set_hapd_param(const char *if_name, const char *param, const char *pval)
+{
+
+	uint32_t id;
+	char path[64];
+
+	snprintf(path, sizeof(path), "hostapd");
+
+	if (ubus_lookup_id(ubus, path, &id))
+		return -1;
+	blob_buf_init(&b, 0);
+
+	blobmsg_add_string(&b, "iface", if_name);
+	blobmsg_add_string(&b, "param", param);
+	blobmsg_add_string(&b, "param_val", pval);
+
+	return ubus_invoke(ubus, id, "param_mod", b.head, NULL, NULL, 1000);
+}
 
 int hapd_rrm_enable(char *name, int neighbor, int beacon)
 {
@@ -201,8 +241,33 @@ static void radio_ubus_connect(struct ubus_context *ctx)
 	ubus_add_object(ubus, &radio_ubus_object);
 }
 
+static int radio_ubus_notify(struct ubus_context *ctx, struct ubus_object *obj,
+			     struct ubus_request_data *req, const char *method,
+			     struct blob_attr *msg)
+{
+	char *str;
+
+	str = blobmsg_format_json(msg, true);
+	LOGD("ubus: Received ubus notify '%s': %s\n", method, str);
+	free(str);
+
+	if (!strncmp(method, "apc", 3)) {
+		LOGD("APC notification Received");
+		apc_state_set(msg);
+	}
+
+	return 0;
+}
+
 static struct ubus_instance ubus_instance = {
 	.connect = radio_ubus_connect,
+	.notify = radio_ubus_notify,
+	.list = {
+			{
+				.path = "apc",
+			},
+		},
+	.len = 1,
 };
 
 int radio_ubus_init(void)

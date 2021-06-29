@@ -19,6 +19,8 @@ extern struct uci_context *uci;
 
 extern int radio_ubus_init(void);
 
+int ubus_set_hapd_param(const char *if_name, const char *param, const char *pval);
+int ubus_set_signal_thresholds(const char *if_name, int connect, int stay);
 extern int hapd_rrm_enable(char *name, int neighbor, int beacon);
 extern int hapd_rrm_set_neighbors(char *name, struct rrm_neighbor *neigh, int count);
 
