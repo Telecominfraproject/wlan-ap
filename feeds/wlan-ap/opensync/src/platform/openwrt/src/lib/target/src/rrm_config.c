@@ -24,10 +24,130 @@
 #include "uci.h"
 #include "utils.h"
 #include "captive.h"
+#include <fcntl.h>
 
 ovsdb_table_t table_Wifi_RRM_Config;
 extern ovsdb_table_t table_Wifi_Radio_Config;
 extern ovsdb_table_t table_Wifi_VIF_Config;
+#define PHY_NAME_LEN 32
+
+bool rrm_config_txpower(const char *rname, unsigned int txpower)
+{
+	char cmd[126] = {0};
+	int rid = 0;
+	txpower = txpower * 100;
+
+	sscanf(rname, "radio%d", &rid);
+
+	memset(cmd, 0, sizeof(cmd));
+	/* iw dev <devname> set txpower <auto|fixed|limit> [<tx power in mBm>]*/
+	snprintf(cmd, sizeof(cmd),
+		"iw phy phy%d set txpower fixed %d", rid, txpower);
+	system(cmd);
+
+	return true;
+}
+
+/* get phy name */
+bool get_80211phy(const char *ifname, char *phy)
+{
+	char path[126] = {0};
+	int fd, l = 0;
+
+	snprintf(path, sizeof(path), "/sys/class/net/%s/phy80211/name", ifname);
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		LOGE("%s: Unable to read sysfs phy name", __func__);
+		close(fd);
+		return false;
+	}
+	read(fd, phy, PHY_NAME_LEN);
+	close(fd);
+	l = strlen(phy);
+	phy[l-1] = '\0';
+
+	return true;
+}
+
+bool set_rates_sysfs(const char *type, int rate_code, const char *ifname,
+		     char *band)
+{
+	int fd = 0;
+	char path[126] = {0};
+	char value[126] = {0};
+	char phy[PHY_NAME_LEN] = {0};
+	unsigned int band_id = 0;
+
+	/* get phy name */
+	if (!get_80211phy(ifname, phy))
+		return false;
+
+	if (!strcmp(band, "2.4G"))
+		band_id = 2;
+	else
+		band_id = 5;
+
+	snprintf(path, sizeof(path),
+		"/sys/kernel/debug/ieee80211/%s/ath10k/set_rates", phy);
+
+	snprintf(value, sizeof(value), "%s %s %d 0x%x",
+		 ifname, type, band_id, rate_code);
+
+	fd = open(path, O_WRONLY);
+	if (fd < 0) {
+		LOGE("%s: Unable to read sysfs set_rates", __func__);
+		close(fd);
+		return false;
+	}
+	write(fd, value, sizeof(value));
+	close(fd);
+	LOGI("Kiran: wrote: %s to %s", value, path);
+	return true;
+}
+
+#define NUM_OF_RATES 12
+bool rrm_config_mcast_bcast_rate(const char *ifname, char *band,
+				 unsigned int bcn_rate, unsigned int mcast_rate)
+{
+	int i = 0;
+	bool rc = true;
+	unsigned int bcn_code = 0xFF;
+	unsigned int mcast_code = 0xFF;
+	unsigned int rate_code[NUM_OF_RATES][2] = {{1,0x43}, {2,0x42}, {5,0x41},
+						  {11,0x40}, {6,0x3}, {9,0x7},
+						  {12,0x2}, {18,0x6}, {24,0x1},
+						  {36,0x5}, {48,0x0}, {54,0x4}};
+
+	/* beacon rate given by cloud in multiples of 10 */
+	if (bcn_rate > 0)
+		bcn_rate = bcn_rate/10;
+
+	/* Get rate code of given rate */
+	for (i = 0; i < NUM_OF_RATES; i++)
+	{
+		if (rate_code[i][0] == bcn_rate)
+			bcn_code = rate_code[i][1];
+
+		if (rate_code[i][0] == mcast_rate)
+			mcast_code = rate_code[i][1];
+	}
+
+	/* Set the rates to sysfs */
+	if (bcn_code != 0xFF)
+	{
+		if (set_rates_sysfs("beacon", bcn_code, ifname, band) == false)
+			rc = false;
+	}
+
+	if (mcast_code != 0xFF)
+	{
+		if (set_rates_sysfs("mcast", mcast_code, ifname, band) == false)
+			rc = false;
+	}
+
+	return rc;
+}
 
 void rrm_config_vif(struct blob_buf *b, struct blob_buf *del, const char * freq_band, const char * if_name)
 {
@@ -80,6 +200,46 @@ int rrm_get_backup_channel(const char * freq_band)
 
 }
 
+bool rrm_noreload_config(struct schema_Wifi_RRM_Config *conf, const char *rname)
+{
+	char pval[16];
+	char wlanif[8];
+	int rid = 0;
+
+	sscanf(rname, "radio%d", &rid);
+	snprintf(wlanif, sizeof(wlanif), "wlan%d", rid);
+
+	if (conf->probe_resp_threshold_changed) {
+		/* rssi_ignore_probe_request and signal_connect should
+		 * both be probe_resp_threshold */ 
+		snprintf(pval, sizeof(pval), "%d",
+			 conf->probe_resp_threshold);
+		ubus_set_hapd_param(wlanif,
+				    "rssi_ignore_probe_request", pval);
+		ubus_set_signal_thresholds(wlanif,
+					   conf->probe_resp_threshold,
+					   conf->client_disconnect_threshold);
+
+	}
+
+	if (conf->client_disconnect_threshold_changed) {
+		ubus_set_signal_thresholds(wlanif,
+					   conf->probe_resp_threshold,
+					   conf->client_disconnect_threshold);
+	}
+
+	if (conf->mcast_rate_changed) {
+		rrm_config_mcast_bcast_rate(wlanif, conf->freq_band, 0,
+					    conf->mcast_rate);
+	}
+
+	if (conf->beacon_rate_changed) {
+		rrm_config_mcast_bcast_rate(wlanif, conf->freq_band,
+					    conf->beacon_rate, 0);
+	}
+	return true;
+}
+
 static bool rrm_config_update( struct schema_Wifi_RRM_Config *conf, bool addNotDelete)
 {
 	struct schema_Wifi_Radio_Config rconf;
@@ -89,12 +249,29 @@ static bool rrm_config_update( struct schema_Wifi_RRM_Config *conf, bool addNotD
 	int i;
 
 	if (false == ovsdb_table_select_one(&table_Wifi_Radio_Config,
-			SCHEMA_COLUMN(Wifi_Radio_Config, freq_band), conf->freq_band, &rconf))
+			SCHEMA_COLUMN(Wifi_Radio_Config, freq_band),
+			conf->freq_band, &rconf))
 	{
-		LOG(WARN, "Wifi_RRM_Config: No radio for band %s", conf->freq_band );
+		LOG(WARN, "Wifi_RRM_Config: No radio for band %s",
+						conf->freq_band );
 		return false;
 	}	
 
+	/* Set RRM configurations which do not require a wifi vifs reload
+	 * and return */
+	if (conf->mcast_rate_changed || conf->beacon_rate_changed ||
+	    conf->probe_resp_threshold_changed ||
+	    conf->client_disconnect_threshold_changed) {
+		LOGI("RRM Config: beacon_rate:%s mcast_rate:%s probe_resp_threshold:%s client_disconnect_threshold_changed:%s",
+		     (conf->beacon_rate_changed)? "changed":"unchanged", 
+		     (conf->mcast_rate_changed)? "changed":"unchanged", 
+		     (conf->probe_resp_threshold_changed)? "changed":"unchanged",
+		     (conf->client_disconnect_threshold_changed)? "changed":"unchanged");
+		if(rrm_noreload_config(conf, rconf.if_name) == true) {
+		}
+	}
+
+	/*Reload the vifs to configure the RRM configurations*/
 	memset(&changed, 0, sizeof(changed));
 	for (i = 0; i < rconf.vif_configs_len; i++) {
 		if (!(where = ovsdb_where_uuid("_uuid", rconf.vif_configs[i].uuid)))
@@ -179,7 +356,6 @@ void callback_Wifi_RRM_Config(ovsdb_update_monitor_t *self,
 		LOG(ERR, "Wifi_RRM_Config: unexpected mon_type %d %s", self->mon_type, self->mon_uuid);
 		break;
 	}
-	set_config_apply_timeout(self);
 	return;
 }
 

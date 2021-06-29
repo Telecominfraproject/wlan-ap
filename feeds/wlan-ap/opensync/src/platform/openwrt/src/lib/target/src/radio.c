@@ -388,9 +388,12 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 		int max_tx_power;
 		max_tx_power=phy_get_max_tx_power(phy,rconf->channel);
 		if (rconf->tx_power<=max_tx_power) {
+
+			rrm_config_txpower(rconf->if_name, rconf->tx_power);
 			blobmsg_add_u32(&b, "txpower", rconf->tx_power);
 		}
 		else {
+			rrm_config_txpower(rconf->if_name, max_tx_power);
 			blobmsg_add_u32(&b, "txpower", max_tx_power);
 		}
 	}
