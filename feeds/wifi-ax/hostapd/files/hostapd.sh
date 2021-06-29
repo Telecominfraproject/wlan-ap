@@ -529,7 +529,7 @@ hostapd_set_bss_options() {
 	set_default signal_poll_time 5
 	set_default signal_drop_reason 3
 	set_default signal_strikes 3
-	set_default proxy_arp 0
+	set_default proxy_arp 1
 	set_default multicast_to_unicast 0
 
 
