@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
-
 #include <string.h>
 #include <glob.h>
 #include <linux/limits.h>
 #include <libgen.h>
+#include <stdio.h>
+#include <libubox/blobmsg_json.h>
 
 #include "uci.h"
 #include "command.h"
@@ -281,6 +282,10 @@ static const struct uci_blob_param_list led_param = {
 static char led[][8]={"lan", "wan", "eth", "wifi2", "wifi5", "wlan2g", "wlan5g", "power","eth0",
 			  "status", "eth1", "wifi2g", "eth2", "wifi5g", "plug", "world", "usb", "linksys", "wps", "bt"};
 
+static struct blob_buf b;
+#define DEFAULT_BOARD_JSON		"/etc/board.json"
+static struct blob_attr *board_info;
+
 static void led_state(int config)
 {
 	struct blob_attr *tb[__LED_ATTR_MAX] = { };
@@ -335,14 +340,57 @@ static void set_led_config(char *trigger_name, char *key, char* value, char* led
 	return;
 }
 
-static void led_handler(int type,
-			struct schema_Node_Config *old,
-			struct schema_Node_Config *conf)
+static struct blob_attr* config_find_blobmsg_attr(struct blob_attr *attr, const char *name, int type)
+{
+	struct blobmsg_policy policy = { .name = name, .type = type };
+	struct blob_attr *cur;
+
+	blobmsg_parse(&policy, 1, &cur, blobmsg_data(attr), blobmsg_len(attr));
+
+	return cur;
+}
+
+static char* get_phy_map_led_info(char* wifi)
+{
+	struct blob_attr *cur;
+
+	blob_buf_init(&b, 0);
+
+	if (!blobmsg_add_json_from_file(&b, DEFAULT_BOARD_JSON)) {
+		return NULL;
+	}
+	if (board_info != NULL) {
+		free(board_info);
+		board_info = NULL;
+	}
+	cur = config_find_blobmsg_attr(b.head, "led", BLOBMSG_TYPE_TABLE);
+	if (!cur) {
+		LOGD("Failed to find led objet in board.json file");
+		return NULL;
+	}
+	board_info = blob_memdup(cur);
+	if (!board_info)
+		return NULL;
+	cur = config_find_blobmsg_attr(board_info, wifi, BLOBMSG_TYPE_TABLE);
+	if (!cur) {
+		LOGD("Failed to find %s objet in board.json file", wifi);
+		return NULL;
+	}
+	cur = config_find_blobmsg_attr(cur, "trigger", BLOBMSG_TYPE_STRING);
+	if (!cur) {
+		LOGD("Failed to find trigger in board.json file");
+		return NULL;
+	}
+	return blobmsg_get_string(cur);
+}
+
+static void get_led_info_from_sys_config(char* key, char* value)
 {
 	char led_string[32];
 	char ap_name[16];
 	char color[16];
 	char led_section[16];
+	char led_name_final[24];
 	char sys[8];
 	char class[8];
 	char leds[8];
@@ -350,31 +398,57 @@ static void led_handler(int type,
 	glob_t gl;
 	unsigned int i;
 
+	if (glob("/sys/class/leds/*", GLOB_NOSORT, NULL, &gl))
+		return;
+	for (i = 0; i < gl.gl_pathc; i++) {
+		strncpy(sysled, gl.gl_pathv[i], sizeof(sysled));
+		sscanf(sysled,"/%[^/]/%[^/]/%[^/]/%s", sys, class, leds, led_string);
+		sscanf(led_string,"%[^:]:%[^:]:%s",ap_name, color, led_section);
+		if(available_led_check(led_section)) {
+			snprintf(led_name_final, sizeof(led_name_final), "%s%s","led_",led_section);
+			if(!strcmp(key, "led_blink")) {
+				set_led_config("heartbeat", key, value, led_string, led_name_final);
+			}
+			else if(!strcmp(key, "led_off")) {
+				set_led_config("none", key, value, led_string, led_name_final);
+			}
+			else {
+				if(!strcmp(led_section, "wifi2g") || !strcmp(led_section, "wifi5g")) {
+					set_led_config(get_phy_map_led_info(led_section), key, value, led_string, led_name_final);
+				}
+				else
+					set_led_config("none", key, value, led_string, led_name_final);
+			}
+		}
+	}
+	globfree(&gl);
+	return;
+}
+
+static void led_handler(int type,
+			struct schema_Node_Config *old,
+			struct schema_Node_Config *conf)
+{
+	int del=1;
 	switch (type) {
 	case OVSDB_UPDATE_NEW:
 	case OVSDB_UPDATE_MODIFY:
-		if (!strcmp(conf->key, "led_blink") || !strcmp(conf->key, "led_off"))
-		{
-			if (glob("/sys/class/leds/*", GLOB_NOSORT, NULL, &gl))
-				return;
-			for (i = 0; i < gl.gl_pathc; i++) {
-				strncpy(sysled, gl.gl_pathv[i], sizeof(sysled));
-				sscanf(sysled,"/%[^/]/%[^/]/%[^/]/%s", sys, class, leds, led_string);
-				sscanf(led_string,"%[^:]:%[^:]:%s",ap_name, color, led_section);
-				if(available_led_check(led_section)) {
-					if(!strcmp(conf->key, "led_blink")) {
-						set_led_config("heartbeat", conf->key, conf->value, led_string, led_section);
-					}
-					else if(!strcmp(conf->key, "led_off")) {
-						set_led_config("none", conf->key, conf->value, led_string, led_section);
-					}
-				}
-			}
+		if (!strcmp(conf->key, "led_blink") || !strcmp(conf->key, "led_off")) {
+			get_led_info_from_sys_config(conf->key, conf->value);
+			del=0;
 		}
-		globfree(&gl);
+		break;
+	case OVSDB_UPDATE_DEL:
+		get_led_info_from_sys_config("led_state", "default");
+		break;
+	default:
+		LOGD("Invalid Command");
 	}
 	uci_commit_all(uci);
-	led_state(0);
+	if(del)
+		node_state_del("led");
+	else
+		led_state(0);
 }
 
 static struct node_handler {
