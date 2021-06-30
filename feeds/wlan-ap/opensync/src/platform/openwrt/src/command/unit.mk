@@ -54,7 +54,7 @@ UNIT_CFLAGS := -I$(UNIT_PATH)/inc
 UNIT_CFLAGS += -Isrc/lib/common/inc/
 UNIT_CFLAGS += -Isrc/lib/version/inc/
 
-UNIT_LDFLAGS += -lev -lubox -luci -lubus -lwebsocket
+UNIT_LDFLAGS += -lev -lubox -luci -lubus -lwebsocket -lblobmsg_json
 UNIT_LDFLAGS += -lrt
 
 UNIT_EXPORT_CFLAGS := $(UNIT_CFLAGS)
