@@ -1089,6 +1089,7 @@ void apc_init()
 
 static void apply_config_handler(struct timeout *timeout)
 {
+	radius_proxy_fixup();
 	uci_commit_all(uci);
 	sync();
 	LOGI("====Calling reload_config====");

@@ -33,6 +33,7 @@ extern ovsdb_table_t table_Radius_Proxy_Config;
 
 void callback_Radius_Proxy_Config(ovsdb_update_monitor_t *mon,
 		struct schema_Radius_Proxy_Config *old, struct schema_Radius_Proxy_Config *conf);
+void radius_proxy_fixup(void);
 
 #endif /* RADIUS_PROXY_H_INCLUDED */
 

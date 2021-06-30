@@ -361,6 +361,95 @@ static bool radius_proxy_config_set(struct schema_Radius_Proxy_Config *conf)
 	return true;
 }
 
+void radius_proxy_fixup()
+{
+	struct uci_package *radsecproxy;
+	struct uci_context *proxy_ctx;
+	struct uci_element *e = NULL, *tmp = NULL;
+	int ret=0, wildcard_count=0, j=0, section_count=0;
+	char *acct_server = NULL, *auth_server = NULL;
+	struct uci_section *wildcard_section = NULL;
+	struct blob_attr *tb[__RADIUS_PROXY_REALM_MAX] = {};
+	struct blob_attr *n;
+	char section_name[128] = {};
+
+	if (!ovsdb_table_select_where(&table_Radius_Proxy_Config, NULL, &j))
+		return;
+
+	proxy_ctx = uci_alloc_context();
+	ret = uci_load(proxy_ctx, "radsecproxy", &radsecproxy);
+	if (ret) {
+		LOGE("%s: uci_load() failed with rc %d", __func__, ret);
+		if (proxy_ctx)
+			uci_free_context(proxy_ctx);
+		return;
+	}
+
+	uci_foreach_element_safe(&radsecproxy->sections, tmp, e) {
+		struct uci_section *s = uci_to_section(e);
+		if ((s == NULL) || (s->type == NULL)) continue;
+		if (!strcmp(s->type, "realm")) {
+			const char *realm_name;
+			section_count++;
+			realm_name = uci_lookup_option_string(proxy_ctx, s, "name");
+			if (wildcard_count == 0 && (!strcmp((char *)realm_name, "*"))) {
+				wildcard_section = s;
+				wildcard_count = section_count;
+			}
+		}
+		else {
+			continue;
+		}
+	}
+
+	TRACEF("wildcard_count: %d section_count: %d", wildcard_count, section_count);
+
+	if ((wildcard_count != section_count) && (wildcard_section != NULL)) {
+		blob_buf_init(&b, 0);
+		uci_to_blob(&b, wildcard_section, &radius_proxy_realm_param);
+		blobmsg_parse(radius_proxy_realm_policy, __RADIUS_PROXY_REALM_MAX, tb,
+						blob_data(b.head), blob_len(b.head));
+
+		/* Delete and re-add the wildcard section */
+		struct blob_attr *ttb[1];
+		blobmsg_parse_array(radius_proxy_realm_policy, ARRAY_SIZE(ttb), ttb,
+							blobmsg_data(tb[RADIUS_PROXY_REALM_AUTH_SERVER]),
+							blobmsg_data_len(tb[RADIUS_PROXY_REALM_AUTH_SERVER]));
+		if (ttb[0]) {
+			auth_server = blobmsg_get_string(ttb[0]);
+		}
+
+		blobmsg_parse_array(radius_proxy_realm_policy, ARRAY_SIZE(ttb), ttb,
+							blobmsg_data(tb[RADIUS_PROXY_REALM_ACCT_SERVER]),
+							blobmsg_data_len(tb[RADIUS_PROXY_REALM_ACCT_SERVER]));
+		if (ttb[0]) {
+			acct_server = blobmsg_get_string(ttb[0]);
+		}
+
+		strcpy(section_name, (char *)wildcard_section->e.name);
+
+		TRACEF("Delete section: %s", section_name);
+
+		uci_section_del(proxy_ctx, "radsecproxy", "radsecproxy",
+							(char *)wildcard_section->e.name, "realm");
+
+		blob_buf_init(&uci_buf, 0);
+		blobmsg_add_string(&uci_buf, "name", "*");
+		n = blobmsg_open_array(&uci_buf, "server");
+		blobmsg_add_string(&uci_buf, NULL, auth_server);
+		blobmsg_close_array(&uci_buf, n);
+		n = blobmsg_open_array(&uci_buf, "accountingServer");
+		blobmsg_add_string(&uci_buf, NULL, acct_server);
+		blobmsg_close_array(&uci_buf, n);
+		blob_to_uci_section(proxy_ctx, "radsecproxy", section_name, "realm",
+				uci_buf.head, &radius_proxy_realm_param, NULL);
+		TRACEF("Add section: %s %s %s", section_name, auth_server, acct_server);
+
+		uci_commit_all(proxy_ctx);
+	}
+	uci_free_context(proxy_ctx);
+}
+
 static bool radius_proxy_config_delete()
 {
 	struct uci_package *radsecproxy;
