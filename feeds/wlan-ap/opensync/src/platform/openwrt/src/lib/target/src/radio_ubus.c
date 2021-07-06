@@ -11,6 +11,7 @@ extern struct ev_loop *wifihal_evloop;
 static struct ubus_context *ubus;
 extern struct ev_loop *wifihal_evloop;
 extern void apc_state_set(struct blob_attr *msg);
+struct blob_buf ub = { };
 
 int ubus_set_signal_thresholds(const char *if_name, int connect, int stay)
 {
@@ -91,7 +92,8 @@ int hapd_rrm_set_neighbors(char *name, struct rrm_neighbor *neigh, int count)
 }
 
 int ubus_set_channel_switch(const char *if_name, uint32_t frequency,
-			    int channel_bandwidth, int sec_chan_offset)
+			    const char *hw_mode, int channel_bandwidth,
+			    int sec_chan_offset)
 {
 	uint32_t id;
 	char path[64];
@@ -100,23 +102,33 @@ int ubus_set_channel_switch(const char *if_name, uint32_t frequency,
 
 	if (ubus_lookup_id(ubus, path, &id))
 		return -1;
-	blob_buf_init(&b, 0);
+	blob_buf_init(&ub, 0);
 
-	if (channel_bandwidth == 20 || channel_bandwidth == 40) {
-		blobmsg_add_u8(&b, "ht", 1);
-	} else if (channel_bandwidth == 80) {
-		blobmsg_add_u8(&b, "vht", 1);
+	if (!strncmp(hw_mode, "11n", strlen("11n"))) {
+		blobmsg_add_u8(&ub, "ht", 1);
+	} else if (!strncmp(hw_mode, "11ac", strlen("11ac"))) {
+		blobmsg_add_u8(&ub, "ht", 1);
+		blobmsg_add_u8(&ub, "vht", 1);
+	} else if (!strncmp(hw_mode, "11ax", strlen("11ax"))) {
+		blobmsg_add_u8(&ub, "ht", 1);
+		blobmsg_add_u8(&ub, "vht", 1);
+		blobmsg_add_u8(&ub, "he", 1);
 	}
 
-	if (channel_bandwidth == 40 || channel_bandwidth == 80) {
-		blobmsg_add_u32(&b, "center_freq1", frequency+30);
-	}
+	if (channel_bandwidth == 40)
+		blobmsg_add_u32(&ub, "center_freq1", frequency+10);
+	else if (channel_bandwidth == 80)
+		blobmsg_add_u32(&ub, "center_freq1", frequency+30);
+	else if (channel_bandwidth == 20)
+		blobmsg_add_u32(&ub, "center_freq1", frequency);
+	else if (channel_bandwidth == 160)
+		blobmsg_add_u32(&ub, "center_freq1", frequency+70);
 
-	blobmsg_add_u32(&b, "freq", frequency);
-	blobmsg_add_u32(&b, "bcn_count", 5);
-	blobmsg_add_u32(&b, "bandwidth", channel_bandwidth);
-	blobmsg_add_u32(&b, "sec_channel_offset", sec_chan_offset);
-	return ubus_invoke(ubus, id, "switch_chan", b.head, NULL, NULL, 1000);
+	blobmsg_add_u32(&ub, "freq", frequency);
+	blobmsg_add_u32(&ub, "bcn_count", 5);
+	blobmsg_add_u32(&ub, "bandwidth", channel_bandwidth);
+	blobmsg_add_u32(&ub, "sec_channel_offset", sec_chan_offset);
+	return ubus_invoke(ubus, id, "switch_chan", ub.head, NULL, NULL, 1000);
 }
 
 enum {
