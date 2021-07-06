@@ -25,6 +25,7 @@
 #include "utils.h"
 #include "captive.h"
 #include <fcntl.h>
+#include "fixup.h"
 
 ovsdb_table_t table_Wifi_RRM_Config;
 extern ovsdb_table_t table_Wifi_Radio_Config;
@@ -258,6 +259,7 @@ void rrm_radio_rebalance_channel(const struct schema_Wifi_Radio_Config *rconf)
 	char *mode = NULL;
 	int rid = 0;
 	char wlanif[16] = {0};
+	char *hw_mode;
 
 	sscanf(rconf->if_name, "radio%d", &rid);
 	snprintf(wlanif, sizeof(wlanif), "wlan%d", rid);
@@ -265,7 +267,13 @@ void rrm_radio_rebalance_channel(const struct schema_Wifi_Radio_Config *rconf)
 	freq = ieee80211_channel_to_frequency(rconf->channel);
 	mode = get_max_channel_bw_channel(freq,	rconf->ht_mode);
 
-	m = mode_map_get_uci(rconf->freq_band, mode, rconf->hw_mode);
+	hw_mode = radio_fixup_get_hw_mode(rconf->if_name);
+	if (hw_mode == NULL) {
+		LOGE("Falied to get hw mode");
+		return;
+	}
+
+	m = mode_map_get_uci(rconf->freq_band, mode, hw_mode);
 
 	if (m)
 		sec_chan_offset = m->sec_channel_offset;
@@ -274,8 +282,10 @@ void rrm_radio_rebalance_channel(const struct schema_Wifi_Radio_Config *rconf)
 
 	get_channel_bandwidth(mode, &channel_bandwidth);
 
-	ubus_set_channel_switch(wlanif, freq, channel_bandwidth,
-				sec_chan_offset);
+
+	ubus_set_channel_switch(wlanif, freq, hw_mode,
+				channel_bandwidth, sec_chan_offset);
+
 }
 
 static bool rrm_config_update( struct schema_Wifi_RRM_Config *conf, bool addNotDelete)

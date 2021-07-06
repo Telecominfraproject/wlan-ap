@@ -25,6 +25,7 @@
  */
 
 static struct avl_tree vif_fixup_tree = AVL_TREE_INIT(vif_fixup_tree, avl_strcmp, false, NULL);
+static struct avl_tree radio_fixup_tree = AVL_TREE_INIT(radio_fixup_tree, avl_strcmp, false, NULL);
 
 struct vif_fixup * vif_fixup_find(const char *ifname)
 {
@@ -86,4 +87,54 @@ void vif_fixup_set_iface_captive(const char *ifname, bool en)
 
 	if (vif)
 		vif->has_captive = en;
+}
+
+struct radio_fixup * radio_fixup_find(const char *ifname)
+{
+        struct radio_fixup *radio = avl_find_element(&radio_fixup_tree, ifname, radio, avl);
+        if (radio)
+                return radio;
+
+	/* Not found, add */
+        radio = malloc(sizeof(*radio));
+        if (!radio)
+                return NULL;
+
+        memset(radio, 0, sizeof(*radio));
+        strncpy(radio->rname, ifname, IF_NAMESIZE);
+        radio->avl.key = radio->rname;
+        avl_insert(&radio_fixup_tree, &radio->avl);
+        return radio;
+}
+
+void radio_fixup_del(char *ifname)
+{
+        struct radio_fixup *radio = NULL;
+        radio = avl_find_element(&radio_fixup_tree, ifname, radio, avl);
+        if (radio) {
+		avl_delete(&radio_fixup_tree, &radio->avl);
+		free(radio);
+	}
+}
+
+void radio_fixup_set_hw_mode(const char *ifname, char *hw_mode)
+{
+	struct radio_fixup * radio = NULL;
+
+	radio = radio_fixup_find(ifname);
+
+	if (radio)
+		strncpy(radio->hw_mode, hw_mode, strlen(hw_mode));
+}
+
+char * radio_fixup_get_hw_mode(const char *ifname)
+{
+	struct radio_fixup * radio = NULL;
+
+	radio = radio_fixup_find(ifname);
+
+	if (radio)
+		return radio->hw_mode;
+	else
+		return NULL;
 }

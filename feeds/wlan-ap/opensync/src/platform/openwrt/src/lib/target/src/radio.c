@@ -28,6 +28,7 @@
 #include "vlan.h"
 #include "radius_proxy.h"
 #include "timer.h"
+#include "fixup.h"
 
 ovsdb_table_t table_Hotspot20_Config;
 ovsdb_table_t table_Hotspot20_OSU_Providers;
@@ -61,7 +62,7 @@ enum {
 	WDEV_ATTR_TX_ANTENNA,
 	WDEV_ATTR_RX_ANTENNA,
 	WDEV_ATTR_FREQ_BAND,
-	WDEV_AATR_CHANNELS,
+	WDEV_ATTR_CHANNELS,
 	WDEV_ATTR_DISABLE_B_RATES,
 	WDEV_ATTR_MAXASSOC_CLIENTS,
 	WDEV_ATTR_LOCAL_PWR_CONSTRAINT,
@@ -81,7 +82,7 @@ static const struct blobmsg_policy wifi_device_policy[__WDEV_ATTR_MAX] = {
 	[WDEV_ATTR_TX_ANTENNA] = { .name = "txantenna", .type = BLOBMSG_TYPE_INT32 },
 	[WDEV_ATTR_RX_ANTENNA] = { .name = "rxantenna", .type = BLOBMSG_TYPE_INT32 },
 	[WDEV_ATTR_FREQ_BAND] = { .name = "freq_band", .type = BLOBMSG_TYPE_STRING },
-	[WDEV_AATR_CHANNELS] = {.name = "channels", .type = BLOBMSG_TYPE_ARRAY},
+	[WDEV_ATTR_CHANNELS] = {.name = "channels", .type = BLOBMSG_TYPE_ARRAY},
 	[WDEV_ATTR_DISABLE_B_RATES] = { .name = "legacy_rates", .type = BLOBMSG_TYPE_BOOL },
 	[WDEV_ATTR_MAXASSOC_CLIENTS] = { .name = "maxassoc", .type = BLOBMSG_TYPE_INT32 },
 	[WDEV_ATTR_LOCAL_PWR_CONSTRAINT] = { .name = "local_pwr_constraint", .type = BLOBMSG_TYPE_INT32 },
@@ -313,6 +314,8 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 
 		if (m) {
 			SCHEMA_SET_STR(rstate.hw_mode, m->hwmode);
+			radio_fixup_set_hw_mode(rstate.if_name, m->hwmode);
+
 			if (m->htmode)
 				SCHEMA_SET_STR(rstate.ht_mode, m->htmode);
 			else
@@ -473,6 +476,7 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 			blobmsg_add_string(&b, "htmode", m->ucihtmode);
 			blobmsg_add_string(&b, "hwmode", m->ucihwmode);
 			blobmsg_add_u32(&b, "chanbw", 20);
+			radio_fixup_set_hw_mode(rconf->if_name, m->hwmode);
 		} else
 			 LOGE("%s: failed to set ht/hwmode", rconf->if_name);
 	}
