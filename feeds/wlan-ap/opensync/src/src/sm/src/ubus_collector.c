@@ -395,6 +395,19 @@ static void ubus_collector_complete_session_cb(struct ubus_request *req, int ret
 		free(req);
 }
 
+static bool ubus_collector_is_session_processed(uint64_t session_id)
+{
+	delete_entry_t *delete_entry = NULL;
+
+	ds_dlist_foreach(&deletion_pending_list, delete_entry) {
+		if ( delete_entry && (delete_entry->session_id == session_id)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static void ubus_collector_session_cb(struct ubus_request *req, int type,
 			      struct blob_attr *msg)
 {
@@ -447,13 +460,24 @@ static void ubus_collector_session_cb(struct ubus_request *req, int type,
 			continue;
 		}
 
-		event_record = dpp_event_record_alloc();
+		session_id = blobmsg_get_u64(tb_client_events[CLIENT_SESSION_ID]);
+		if (!session_id) {
+			LOG(DEBUG, "ubus_collector: Invalid sessionId");
+			continue;
+		}
 
+		/* Check if the session is already processed */
+		if (ubus_collector_is_session_processed(session_id) == true) {
+			LOG(DEBUG, "ubus_collector: Session already processed");
+			continue;
+		}
+
+		event_record = dpp_event_record_alloc();
 		if (!event_record) {
 			LOG(ERR, "ubus_collector: not enough memory for event_record");
 			continue;
 		}
-		session_id = blobmsg_get_u64(tb_client_events[CLIENT_SESSION_ID]);
+
 		event_record->client_session.session_id = session_id;
 
 		for (i = 0; i < __CLIENT_EVENTS_MAX - 1; i++) {
@@ -757,10 +781,7 @@ static void ubus_garbage_collector(void *arg)
 
 	delete_entry = ds_dlist_head(&deletion_pending_list);
 	if (delete_entry) {
-		if (delete_entry->session_id) {
-			ubus_collector_hostapd_clear(delete_entry->session_id,
-						delete_entry->bss);
-		}
+		ubus_collector_hostapd_clear(delete_entry->session_id, delete_entry->bss);
 		ds_dlist_remove_head(&deletion_pending_list);
 		free(delete_entry);
 		delete_entry = NULL;
