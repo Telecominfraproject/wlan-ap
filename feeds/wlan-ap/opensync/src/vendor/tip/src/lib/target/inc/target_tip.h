@@ -44,14 +44,14 @@ typedef struct
 typedef struct
 {
 	DPP_TARGET_SURVEY_RECORD_COMMON_STRUCT;
-	uint32_t chan_active;
-	uint32_t chan_busy;
-	uint32_t chan_busy_ext;
-	uint32_t chan_self;
-	uint32_t chan_rx;
-	uint32_t chan_tx;
+	uint64_t chan_active;
+	uint64_t chan_busy;
+	uint64_t chan_busy_ext;
+	uint64_t chan_self;
+	uint64_t chan_rx;
+	uint64_t chan_tx;
 	uint32_t chan_noise;
-	uint32_t duration_ms;
+	uint64_t duration_ms;
 	uint32_t chan_in_use;
 } target_survey_record_t;
 
