@@ -242,9 +242,9 @@ bool target_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
 	while (!ds_dlist_is_empty(&raw_survey_list)) {
 		survey = ds_dlist_head(&raw_survey_list);
 		ds_dlist_remove(&raw_survey_list, survey);
-		LOGD("Survey entry dur %d busy %d tx %d rx %d chan %d active %d type %d",
+		LOGD("Survey entry dur %llu busy %llu tx %llu rx %llu rx_self %llu chan %d type %d",
 				survey->duration_ms, survey->chan_busy, survey->chan_tx, survey->chan_rx,
-				survey->info.chan, survey->chan_active, scan_type );
+				survey->chan_self, survey->info.chan, scan_type);
 		if ((scan_type == RADIO_SCAN_TYPE_ONCHAN) && (survey->duration_ms != 0)) {
 			if (survey->info.chan == chan_list[0]) {
 				ds_dlist_insert_tail(survey_list, survey);
@@ -267,24 +267,41 @@ bool target_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
 }
 
 #define PERCENT(v1, v2) (v2 > 0 ? ((v1 > v2) ? 100 : (v1*100/v2)) : 0)
+#define DELTA(n, p) ((n) < (p) ? (n) : (n) - (p))
 
 bool target_stats_survey_convert(radio_entry_t *radio_cfg, radio_scan_type_t scan_type,
 				 target_survey_record_t *data_new, target_survey_record_t *data_old,
 				 dpp_survey_record_t *survey_record)
 {
-	LOGD("Survey convert scan_type %d chan %d", scan_type, data_new->info.chan);
+	target_survey_record_t delta;
+
+	LOGD("Survey convert scan_type %d chan %d duration_new:%llu duration_old:%llu "
+	     "busy_new %llu busy_old:%llu tx_new %llu tx_old:%llu rx_new %llu rx_old:%llu "
+	     "rx_self_new %llu rx_self_old:%llu",
+	     scan_type, data_new->info.chan, data_new->duration_ms, data_old->duration_ms,
+	     data_new->chan_busy, data_old->chan_busy, data_new->chan_tx, data_old->chan_tx,
+	     data_new->chan_rx, data_old->chan_rx, data_new->chan_self, data_old->chan_self);
+
+	memset(&delta, 0, sizeof(delta));
+
+	delta.duration_ms = DELTA(data_new->duration_ms, data_old->duration_ms);
+	delta.chan_busy = DELTA(data_new->chan_busy, data_old->chan_busy);
+	delta.chan_busy_ext = DELTA(data_new->chan_busy_ext, data_old->chan_busy_ext);
+	delta.chan_tx = DELTA(data_new->chan_tx, data_old->chan_tx);
+	delta.chan_rx = DELTA(data_new->chan_rx, data_old->chan_rx);
+	delta.chan_self = DELTA(data_new->chan_self, data_old->chan_self);
+
 	survey_record->info.chan     = data_new->info.chan;
-	survey_record->chan_tx       = PERCENT(data_new->chan_tx, data_new->duration_ms);
-	survey_record->chan_self     = PERCENT(data_new->chan_self, data_new->duration_ms);
-	survey_record->chan_rx       = PERCENT(data_new->chan_rx, data_new->duration_ms);
-	survey_record->chan_busy_ext = PERCENT(data_new->chan_busy_ext, data_new->duration_ms);
-	survey_record->chan_busy     = PERCENT(data_new->chan_busy, data_new->duration_ms);
+	survey_record->chan_tx       = PERCENT(delta.chan_tx, delta.duration_ms);
+	survey_record->chan_self     = PERCENT(delta.chan_self, delta.duration_ms);
+	survey_record->chan_rx       = PERCENT(delta.chan_rx, delta.duration_ms);
+	survey_record->chan_busy_ext = PERCENT(delta.chan_busy_ext, delta.duration_ms);
+	survey_record->chan_busy     = PERCENT(delta.chan_busy, delta.duration_ms);
 	survey_record->chan_noise    = data_new->chan_noise;
-	survey_record->duration_ms   = data_new->duration_ms;
+	survey_record->duration_ms   = delta.duration_ms;
 
 	return true;
 }
-
 
 /******************************************************************************
  *  NEIGHBORS definitions
