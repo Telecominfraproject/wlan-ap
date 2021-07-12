@@ -42,6 +42,8 @@ static struct unl unl_req;
 static struct unl unl_notify;
 static ev_io unl_io;
 
+#define NF_OFFSET_24G 14
+#define NF_OFFSET_5G  10
 struct nl80211_scan {
 	char name[IF_NAMESIZE];
 	target_scan_cb_t *scan_cb;
@@ -192,6 +194,19 @@ static int nl80211_assoclist_recv(struct nl_msg *msg, void *arg)
 	return NL_OK;
 }
 
+static int add_chan_noise_offset(unsigned int chan, int chan_noise)
+{
+	int adjusted_chan_noise = 0;
+
+	if (chan > 13) {
+		adjusted_chan_noise = chan_noise + NF_OFFSET_5G;
+	} else {
+		adjusted_chan_noise = chan_noise + NF_OFFSET_24G;
+	}
+
+	return adjusted_chan_noise;
+}
+
 static int nl80211_survey_recv(struct nl_msg *msg, void *arg)
 {
 	static struct nla_policy sp[NL80211_SURVEY_INFO_MAX + 1] = {
@@ -250,7 +265,8 @@ static int nl80211_survey_recv(struct nl_msg *msg, void *arg)
 		survey_record->duration_ms = nla_get_u64(si[NL80211_SURVEY_INFO_TIME]);
 
 	if (si[NL80211_SURVEY_INFO_NOISE])
-		survey_record->chan_noise = nla_get_u8(si[NL80211_SURVEY_INFO_NOISE]);
+		survey_record->chan_noise = add_chan_noise_offset(survey_record->info.chan, 
+			nla_get_u8(si[NL80211_SURVEY_INFO_NOISE]));
 
 	survey_record->chan_in_use=si[NL80211_SURVEY_INFO_IN_USE] ? 1:0;
 
