@@ -31,6 +31,7 @@ void set_config_apply_timeout(ovsdb_update_monitor_t *mon);
 bool apc_read_conf(struct schema_APC_Config *apcconf);
 bool apc_read_state(struct schema_APC_State *apcst);
 int ubus_set_channel_switch(const char *if_name, uint32_t frequency,
-			    int channel_bandwidth, int sec_chan_offset);
+			    const char *hw_mode, int channel_bandwidth,
+			    int sec_chan_offset);
 
 #endif
