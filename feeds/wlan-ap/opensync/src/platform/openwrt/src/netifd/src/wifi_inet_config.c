@@ -367,10 +367,24 @@ static void callback_Wifi_Inet_Config(ovsdb_update_monitor_t *mon,
 {
 	switch (mon->mon_type) {
 	case OVSDB_UPDATE_NEW:
+		if (iconf->parent_ifname_exists && iconf->vlan_id > 2) {
+			if(!strncmp(iconf->parent_ifname, "lan", strlen("lan"))) {
+				/* Skip adding VLAN interface for lan */
+				return;
+			}
+		}
+
 		wifi_inet_conf_add(iconf);
 		netifd_add_inet_conf(iconf);
 		break;
 	case OVSDB_UPDATE_MODIFY:
+		if (iconf->parent_ifname_exists && iconf->vlan_id > 2) {
+			if(!strncmp(iconf->parent_ifname, "lan", strlen("lan"))) {
+				/* Skip adding VLAN interface for lan */
+				return;
+			}
+		}
+
 		wifi_inet_conf_add(iconf);
 		netifd_modify_inet_conf(iconf);
 		break;
