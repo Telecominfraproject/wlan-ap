@@ -918,7 +918,6 @@ hostapd_set_bss_options() {
 		json_for_each_item append_venue_url venue_url
 		json_for_each_item append_nai_realm nai_realm
 		json_for_each_item append_hs20_conn_capab hs20_conn_capab
-		json_for_each_item append_hs20_oper_friendly_name hs20_oper_friendly_name
 		json_for_each_item append_osu_provider osu_provider
 		json_for_each_item append_operator_icon operator_icon
 		[ -n "$interworking" ] && append bss_conf "interworking=$interworking" "$N"
