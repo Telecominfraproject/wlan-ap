@@ -17,6 +17,7 @@
 #include <sys/ioctl.h>
 #include "target.h"
 #include "dhcp_opt.h"
+#include "log.h"
 #include "dhcpdiscovery.h"
 //#include "wc-dhcpdiscoveryDebug.h"
 
@@ -55,14 +56,15 @@ struct Answer_t
 /**
  * Use to setup the DHCP client
  */
-int dhcp_setup(const char * serveripaddress, const char * device)
+bool dhcp_setup(const char * serveripaddress, const char * device, int *fd)
 {
    struct hostent *hostent;
    const int flag = 1;
    struct sockaddr_in name;
    struct ifreq ifr;
-   int dhcp_socket;
+   int dhcp_socket = -1;
 
+   *fd = -1;
    /* We populate the interface info */
    memset(&ifr, 0, sizeof(ifr));
    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s\n", device);
@@ -71,7 +73,7 @@ int dhcp_setup(const char * serveripaddress, const char * device)
     * setup sending socket
     */
    if ((hostent=gethostbyname(serveripaddress))==NULL) {
-      return 0;
+      goto err;
    }
 
    dhcp_to.sin_family=AF_INET;
@@ -81,17 +83,16 @@ int dhcp_setup(const char * serveripaddress, const char * device)
 
    dhcp_to.sin_port=htons(67);
 
-   if ((dhcp_socket=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP))==-1)
-   {
-      return 0;
+   if ((dhcp_socket=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP))==-1) {
+      goto err;
    }
 
    if (setsockopt (dhcp_socket, SOL_SOCKET, SO_REUSEADDR, (char *)&flag, sizeof flag) < 0) {
-      return 0;
+      goto err;
    }
 
    if (setsockopt(dhcp_socket,SOL_SOCKET,SO_BROADCAST,(char *)&flag, sizeof flag) < 0) {
-      return 0;
+      goto err;
    }
 
    name.sin_family = AF_INET;
@@ -101,10 +102,16 @@ int dhcp_setup(const char * serveripaddress, const char * device)
    memset (name.sin_zero, 0, sizeof (name.sin_zero));
 
    if (bind (dhcp_socket, (struct sockaddr *)&name, sizeof name) < 0) {
-      return 0;
+      goto err;
    }
 
-   return dhcp_socket;
+   *fd = dhcp_socket;
+   return true;
+
+err:
+   if (dhcp_socket >= 0)
+      close(dhcp_socket);
+   return false;
 }
 
 void parseDhcpMessage(unsigned char *buffer,int size, struct Answer_t * response)
@@ -440,41 +447,39 @@ bool generateQuery(const char *ifname)
    const char * serverIP = "255.255.255.255";
    const char * mac_address = getMACAddress(device);
    struct Answer_t response;
+   int dhcp_socket = -1;
 
-   int dhcp_socket = dhcp_setup(serverIP, device);
+   if (!dhcp_setup(serverIP, device, &dhcp_socket)) {
+      LOGE("%s dhcp client setup failed at line %d", __func__, __LINE__);
+      goto clean;
+   }
 
-   if( dhcp_socket != 0)
-   {
-      // We sent a DISCOVER
-      send_dhcp_packet(dhcp_socket, DISCOVER,"0.0.0.0",NULL,"0.0.0.0",mac_address);
+   // We sent a DISCOVER
+   send_dhcp_packet(dhcp_socket, DISCOVER,"0.0.0.0",NULL,"0.0.0.0",mac_address);
 
-      if(waitForResponse(dhcp_socket, _serveripaddress, WAIT_TIMEOUT_SECONDS, OFFER, &response) == OFFER /* DHCP TYPE: Offer */)
-      {
-         /* We close our initial socket (which is configured for broadcasting) */
+   if (waitForResponse(dhcp_socket, _serveripaddress, WAIT_TIMEOUT_SECONDS, OFFER, &response) == OFFER /* DHCP TYPE: Offer */) {
+      /* We close our initial socket (which is configured for broadcasting) */
+      if (dhcp_socket >= 0)
          close(dhcp_socket);
 
-         /* We open a direct connection (as opposed to broadcasted one) */
-         dhcp_socket = dhcp_setup(response.serverIP, device);
-
-         /* We send a request */
-         send_dhcp_packet(dhcp_socket, REQUEST /* Request */, response.serverIP, response.offeredIP, "0.0.0.0", mac_address);
-
-         if(waitForResponse(dhcp_socket, _serveripaddress, WAIT_TIMEOUT_SECONDS, ACK_REQUEST, &response) == ACK_REQUEST /* DHCP TYPE: ACK */)
-         {
-		rc = true;
-         }
+      /* We open a direct connection (as opposed to broadcasted one) */
+      dhcp_socket = -1;
+      if (!dhcp_setup(response.serverIP, device, &dhcp_socket)) {
+         LOGE("%s dhcp client setup failed at line %d", __func__, __LINE__);
+         goto clean;
       }
-      else
-      {
-                close(dhcp_socket);
-		rc = false;
-      }
+
+      /* We send a request */
+      send_dhcp_packet(dhcp_socket, REQUEST /* Request */, response.serverIP, response.offeredIP, "0.0.0.0", mac_address);
+
+      if (waitForResponse(dhcp_socket, _serveripaddress, WAIT_TIMEOUT_SECONDS, ACK_REQUEST, &response) == ACK_REQUEST /* DHCP TYPE: ACK */)
+         rc = true;
    }
 
-   if(mac_address)
-   {
+clean:
+   if (mac_address)
       free( (void*) mac_address);
-   }
-
+   if (dhcp_socket >= 0)
+      close(dhcp_socket);
    return rc;
 }
