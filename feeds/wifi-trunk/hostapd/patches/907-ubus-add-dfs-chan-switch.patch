@@ -1,0 +1,299 @@
+Index: hostapd-2020-06-08-5a8b3662/src/ap/ubus.c
+===================================================================
+--- hostapd-2020-06-08-5a8b3662.orig/src/ap/ubus.c
++++ hostapd-2020-06-08-5a8b3662/src/ap/ubus.c
+@@ -21,6 +21,7 @@
+ #include "rrm.h"
+ #include "wnm_ap.h"
+ #include "taxonomy.h"
++#include "common/hw_features_common.h"
+ 
+ static struct ubus_context *ctx;
+ static struct blob_buf b;
+@@ -754,6 +755,208 @@ static int hostapd_get_chan_switch_event
+ 	return 0;
+ }
+ 
++#define HOSTAPD_DFS_CSA_DUR 1
++int csa_ch_id, csa_cf0_id, csa_cf1_id = 0;
++int csa_bw = CHANWIDTH_USE_HT;
++struct csa_settings css;
++
++struct hostapd_channel_data *freq_to_chan(struct hostapd_iface *iface, int freq)
++{
++	struct hostapd_hw_modes *mode;
++	struct hostapd_channel_data *chan;
++	int i;
++
++	mode = iface->current_mode;
++	if (mode == NULL || freq == 0) {
++		wpa_printf(MSG_INFO, "%s: mode is NULL", __func__);
++		return NULL;
++	}
++
++	for (i = 0; i < iface->current_mode->num_channels; i++) {
++		chan = &iface->current_mode->channels[i];
++		if (chan->freq == freq) {
++			return chan; /* Channel found */
++		}
++	}
++	return NULL;
++}
++
++void hostapd_dfs_csa_timeout(void *eloop_data, void *user_data)
++{
++	struct hostapd_data *hapd = eloop_data;
++	struct hostapd_iface *iface = hapd->iface;
++	struct csa_settings *css = user_data;
++	int ret = 0;
++
++	wpa_printf(MSG_DEBUG, "%s Stopping CSA in dfs ", __func__);
++
++	hapd->csa_in_progress = 0;
++
++	hostapd_disable_iface(iface);
++
++	iface->freq = css->freq_params.freq;
++	iface->conf->channel = csa_ch_id;
++	iface->conf->secondary_channel = css->freq_params.sec_channel_offset;
++	hostapd_set_oper_centr_freq_seg0_idx(iface->conf, csa_cf0_id);
++	hostapd_set_oper_centr_freq_seg1_idx(iface->conf, csa_cf1_id);
++	hostapd_set_oper_chwidth(iface->conf, csa_bw);
++	iface->conf->ieee80211n = css->freq_params.ht_enabled;
++	iface->conf->ieee80211ac = css->freq_params.vht_enabled;
++	iface->conf->ieee80211ax = css->freq_params.he_enabled;
++	wpa_printf(MSG_INFO, "%s: freq=%d chan=%d sec_ch=%d cf0=%d cf1=%d bw=%d 11n=%d, ac=%d, ax=%d",
++ 		   __func__, iface->freq, iface->conf->channel,
++		   iface->conf->secondary_channel, csa_cf0_id, csa_cf1_id, 
++		   css->freq_params.bandwidth, iface->conf->ieee80211n,
++		   iface->conf->ieee80211ac, iface->conf->ieee80211ax);
++
++	ret = hostapd_enable_iface(iface);
++	if (ret == 0)
++		hostapd_ubus_handle_channel_switch_event(iface,
++						HOSTAPD_UBUS_HIGH_INTERFERENCE,
++						iface->freq);
++ 
++}
++
++int hostapd_dfs_set_beacon_csa(struct hostapd_iface *iface, struct csa_settings *css)
++{
++	struct hostapd_data *hapd = iface->bss[0];
++	struct hostapd_data *hapd_bss = NULL;
++	struct csa_settings csa_settings;
++	int secondary_channel = 0;
++	u8 vht_oper_centr_freq_seg0_idx;
++	u8 vht_oper_centr_freq_seg1_idx;
++	int err = 0, i = 0;
++
++	if (hapd->csa_in_progress == 1) {
++		wpa_printf(MSG_ERROR, "CSA in progress, cannot switch channel");
++		return -1;
++	}
++
++	eloop_cancel_timeout(hostapd_dfs_csa_timeout, hapd, NULL);
++
++	/* Setup Beacon CSA request */
++	secondary_channel = iface->conf->secondary_channel;
++	vht_oper_centr_freq_seg0_idx =
++			iface->conf->vht_oper_centr_freq_seg0_idx;
++	vht_oper_centr_freq_seg1_idx =
++			iface->conf->vht_oper_centr_freq_seg1_idx;
++
++	os_memset(&csa_settings, 0, sizeof(csa_settings));
++	err = hostapd_set_freq_params(&csa_settings.freq_params,
++				      iface->conf->hw_mode,
++				      iface->freq,
++				      iface->conf->channel,
++				      iface->conf->enable_edmg,
++				      iface->conf->edmg_channel,
++				      iface->conf->ieee80211n,
++				      iface->conf->ieee80211ac,
++				      iface->conf->ieee80211ax,
++				      secondary_channel,
++				      hostapd_get_oper_chwidth(iface->conf),
++				      vht_oper_centr_freq_seg0_idx,
++				      vht_oper_centr_freq_seg1_idx,
++				      iface->current_mode->vht_capab,
++				      &iface->current_mode->he_capab[IEEE80211_MODE_AP]);
++	if (err) {
++		wpa_printf(MSG_ERROR, "DFS failed to calculate CSA freq params");
++		return -1;
++	}
++
++
++	if (!(hapd->iface->drv_flags & WPA_DRIVER_FLAGS_AP_CSA)) {
++		wpa_printf(MSG_ERROR, "CSA is not supported");
++		return -1;
++	}
++
++	/* Set Beacon */
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		hapd_bss = iface->bss[i];
++		hapd_bss->cs_freq_params = csa_settings.freq_params;
++		hapd_bss->cs_count = css->cs_count;
++		hapd_bss->cs_block_tx = css->block_tx;
++		err = ieee802_11_set_beacon(hapd_bss);
++		if (err)
++			wpa_printf(MSG_ERROR, "CSA beacon set failed, changing channel without an Announcement");
++	}
++
++	hapd->csa_in_progress = 1;
++
++	/* Switch Channel after a timeout */
++	eloop_register_timeout(HOSTAPD_DFS_CSA_DUR, 0,
++			       hostapd_dfs_csa_timeout, hapd, css);
++
++	return 0;
++}
++
++int hostapd_switch_chan_dfs(struct hostapd_iface *iface,
++			     struct csa_settings *css)
++{
++	struct hostapd_channel_data *ch, *cf1, *cf2 = NULL;
++	int res = 0;
++
++	if (iface == NULL)
++		return -1;
++
++	/* Set channel id and center frequecies id */
++	if (css->freq_params.freq > 0) {
++		ch = freq_to_chan(iface, css->freq_params.freq);
++		csa_ch_id = ch->chan;
++	}
++
++	if (css->freq_params.center_freq1 > 0) {
++		csa_cf0_id = 36 + (css->freq_params.center_freq1 - 5180) / 5;
++	}
++
++	if (css->freq_params.center_freq2 > 0) {
++		csa_cf1_id = 36 + (css->freq_params.center_freq2 - 5180) / 5;
++	}
++
++	wpa_printf(MSG_DEBUG, "%s freq=%d chan=%d sec_chan=%d, width=%d, seg0=%d, seg1=%d, cac_time=%ds, ieee80211n=%d, ieee80211ac=%d, ieee80211ax=%d ", __func__,
++		css->freq_params.freq,
++		csa_ch_id, css->freq_params.sec_channel_offset,
++		css->freq_params.bandwidth, csa_cf0_id, csa_cf1_id,
++		iface->dfs_cac_ms / 1000, iface->conf->ieee80211n,
++		iface->conf->ieee80211ac, iface->conf->ieee80211ax);
++
++	/* Set bandwidth */
++	switch (css->freq_params.bandwidth) {
++	case 0:
++	case 20:
++	case 40:
++		csa_bw = CHANWIDTH_USE_HT;
++		break;
++	case 80:
++		if (css->freq_params.center_freq2)
++			csa_bw = CHANWIDTH_80P80MHZ;
++		else
++			csa_bw = CHANWIDTH_80MHZ;
++		break;
++	case 160:
++		csa_bw = CHANWIDTH_160MHZ;
++		break;
++	default:
++		wpa_printf(MSG_WARNING, "Unknown CSA bandwidth: %d",
++			   css->freq_params.bandwidth);
++		break;
++	}
++
++	/* Set new frequency info */
++	iface->freq = css->freq_params.freq;
++	iface->conf->channel = csa_ch_id;
++	iface->conf->secondary_channel = css->freq_params.sec_channel_offset;
++	hostapd_set_oper_centr_freq_seg0_idx(iface->conf, csa_cf0_id);
++	hostapd_set_oper_centr_freq_seg1_idx(iface->conf, csa_cf1_id);
++	hostapd_set_oper_chwidth(iface->conf, csa_bw);
++	iface->conf->ieee80211n = css->freq_params.ht_enabled;
++	iface->conf->ieee80211ac = css->freq_params.vht_enabled;
++	iface->conf->ieee80211ax = css->freq_params.he_enabled;
++
++	/*Set beacon for CSA*/
++	hostapd_dfs_set_beacon_csa(iface, css);
++
++	return 0;
++}
++
+ static int
+ hostapd_switch_chan(struct ubus_context *ctx, struct ubus_object *obj,
+ 		    struct ubus_request_data *req, const char *method,
+@@ -761,14 +964,19 @@ hostapd_switch_chan(struct ubus_context
+ {
+ 	struct blob_attr *tb[__CSA_MAX];
+ 	struct hostapd_data *hapd = get_hapd_from_object(obj);
+-	struct csa_settings css;
++	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_channel_data *chan =NULL;
+ 	int i;
++	int freq = 0;
+ 
+ 	blobmsg_parse(csa_policy, __CSA_MAX, tb, blob_data(msg), blob_len(msg));
+ 
+ 	if (!tb[CSA_FREQ])
+ 		return UBUS_STATUS_INVALID_ARGUMENT;
+ 
++	freq = blobmsg_get_u32(tb[CSA_FREQ]);
++	chan = freq_to_chan(iface, freq);
++
+ 	memset(&css, 0, sizeof(css));
+ 	css.freq_params.freq = blobmsg_get_u32(tb[CSA_FREQ]);
+ 
+@@ -787,6 +995,20 @@ hostapd_switch_chan(struct ubus_context
+ 	SET_CSA_SETTING(CSA_VHT, freq_params.vht_enabled, bool);
+ 	SET_CSA_SETTING(CSA_BLOCK_TX, block_tx, bool);
+ 
++	wpa_printf(MSG_INFO, "%s: CSS freq=%d chan=%d sec_chan_off=%d, width=%d, seg0=%d, seg1=%d", __func__,
++		css.freq_params.freq,
++		chan->chan, css.freq_params.sec_channel_offset,
++		css.freq_params.bandwidth,
++		css.freq_params.center_freq1,
++		css.freq_params.center_freq2);
++
++	if ((chan->flag & HOSTAPD_CHAN_RADAR) &&
++	    ((chan->flag & HOSTAPD_CHAN_DFS_MASK)
++	     != HOSTAPD_CHAN_DFS_AVAILABLE)) {
++		wpa_printf(MSG_INFO, "%s: DFS chan need CAC", __func__);
++		hostapd_switch_chan_dfs(iface, &css);
++		return UBUS_STATUS_OK;
++	}
+ 
+ 	for (i = 0; i < hapd->iface->num_bss; i++) {
+ 		if (hostapd_switch_channel(hapd->iface->bss[i], &css) != 0)
+@@ -1454,10 +1676,16 @@ void hostapd_ubus_free_bss(struct hostap
+ 	}
+ 
+ 	free(name);
+-	for (size_t i = 0; i < bss_nr; i++)
+-		os_free(bss_lst[i]);
+-	free(bss_lst);
+-	bss_lst = NULL;
++
++	if (bss_lst != NULL) {
++		for (size_t i = 0; i < bss_nr; i++) {
++			os_free(bss_lst[i]);
++			bss_lst[i] = NULL;
++		}
++		free(bss_lst);
++		bss_lst = NULL;
++		bss_nr = 0;
++	}
+ }
+ 
+ static int hostapd_get_bss_list(struct ubus_context *ctx,
+@@ -1477,9 +1705,11 @@ static int hostapd_get_bss_list(struct u
+ 	a = blobmsg_open_array(&b_ev, "bss_list");
+ 	/* check bss list from hapd */
+ 	for (size_t i = 0; i < bss_nr; i++) {
+-		b = blobmsg_open_table(&b_ev, NULL);
+-		blobmsg_add_string(&b_ev, "name", bss_lst[i]);
+-		blobmsg_close_table(&b_ev, b);
++		if (bss_lst[i] != NULL) {
++			b = blobmsg_open_table(&b_ev, NULL);
++			blobmsg_add_string(&b_ev, "name", bss_lst[i]);
++			blobmsg_close_table(&b_ev, b);
++		}
+ 	}
+ 	blobmsg_close_array(&b_ev, a);
+ 	ubus_send_reply(ctx, req, b_ev.head);
