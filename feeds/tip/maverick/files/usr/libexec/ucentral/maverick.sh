@@ -30,6 +30,7 @@ config_foreach ssid_set wifi-iface
 uci commit
 
 /etc/init.d/uhttpd enable
+/etc/init.d/uhttpd start
 /etc/init.d/ucentral stop
 
 reload_config
