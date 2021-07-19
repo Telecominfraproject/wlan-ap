@@ -37,8 +37,8 @@ PYTHON3_PKG_BUILD:=0
 PKG_MAINTAINER:=Yousong Zhou <yszhou4tech@gmail.com>
 
 include $(INCLUDE_DIR)/package.mk
-include ../../lang/python/python3-host.mk
-include ../../lang/python/python3-package.mk
+include $(TOPDIR)/feeds/packages/lang/python/python3-host.mk
+include $(TOPDIR)/feeds/packages/lang/python/python3-package.mk
 
 
 ovs_kmod_packages:=
