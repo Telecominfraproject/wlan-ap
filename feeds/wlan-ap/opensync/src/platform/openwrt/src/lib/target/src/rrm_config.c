@@ -49,6 +49,34 @@ bool rrm_config_txpower(const char *rname, unsigned int txpower)
 	return true;
 }
 
+/* Mcast & Beacon rate set */
+#define NUM_OF_RATES 12
+enum {
+	ATH10K_DRIVER,
+	ATH11K_DRIVER,
+	ATH_DRIVER_MAX
+};
+
+typedef struct ath_rate_codes {
+	unsigned int rate;
+	unsigned long code[ATH_DRIVER_MAX];
+} ath_rc;
+
+char ath_driver_name[ATH_DRIVER_MAX][16] = {"ath10k", "ath11k"};
+ath_rc  ath_rcodes[NUM_OF_RATES] = {{1,  {0x43, 0x10000103}},
+				    {2,  {0x42, 0x10000102}},
+				    {5,  {0x41, 0x10000101}},
+				    {11, {0x40, 0x10000100}},
+				    {6,  {0x3, 0x10000003}},
+				    {9,  {0x7, 0x10000007}},
+				    {12, {0x2, 0x10000002}},
+				    {18, {0x6, 0x10000006}},
+				    {24, {0x1, 0x10000001}},
+				    {36, {0x5, 0x10000005}},
+				    {48, {0x0, 0x10000000}},
+				    {54, {0x4, 0x10000004}}};
+
+
 /* get phy name */
 bool get_80211phy(const char *ifname, char *phy)
 {
@@ -72,7 +100,7 @@ bool get_80211phy(const char *ifname, char *phy)
 }
 
 bool set_rates_sysfs(const char *type, int rate_code, const char *ifname,
-		     char *band)
+		     char *band, int dn)
 {
 	int fd = 0;
 	char path[126] = {0};
@@ -90,7 +118,8 @@ bool set_rates_sysfs(const char *type, int rate_code, const char *ifname,
 		band_id = 5;
 
 	snprintf(path, sizeof(path),
-		"/sys/kernel/debug/ieee80211/%s/ath10k/set_rates", phy);
+		"/sys/kernel/debug/ieee80211/%s/%s/set_rates", phy,
+		ath_driver_name[dn]);
 
 	snprintf(value, sizeof(value), "%s %s %d 0x%x",
 		 ifname, type, band_id, rate_code);
@@ -106,18 +135,44 @@ bool set_rates_sysfs(const char *type, int rate_code, const char *ifname,
 	return true;
 }
 
-#define NUM_OF_RATES 12
-bool rrm_config_mcast_bcast_rate(const char *ifname, char *band,
+int find_ath_driver_name(const char *ifname)
+{
+	int dn = -1;
+	char path[126] = {0};
+	char phy[PHY_NAME_LEN] = {0};
+
+	/* get phy name */
+	if (!get_80211phy(ifname, phy))
+		return -1;
+
+	for (dn = 0; dn < ATH_DRIVER_MAX; dn++) {
+		snprintf(path, sizeof(path),
+			"/sys/kernel/debug/ieee80211/%s/%s/set_rates", phy,
+			ath_driver_name[dn]);
+
+		if (access(path, F_OK) == 0) {
+			return dn;
+		}
+	}
+
+	return -1;
+}
+
+int rrm_config_mcast_bcast_rate(const char *ifname, char *band,
 				 unsigned int bcn_rate, unsigned int mcast_rate)
 {
 	int i = 0;
-	bool rc = true;
+	bool rc = 0;
 	unsigned int bcn_code = 0xFF;
 	unsigned int mcast_code = 0xFF;
-	unsigned int rate_code[NUM_OF_RATES][2] = {{1,0x43}, {2,0x42}, {5,0x41},
-						  {11,0x40}, {6,0x3}, {9,0x7},
-						  {12,0x2}, {18,0x6}, {24,0x1},
-						  {36,0x5}, {48,0x0}, {54,0x4}};
+	int dn = 0;
+
+	/*Find ath driver version ath10/11k*/
+	dn = find_ath_driver_name(ifname);
+	if (dn < -1) {
+		LOG(ERR, "%s: No set_rate path exists", __func__);
+		return -1;
+	}
 
 	/* beacon rate given by cloud in multiples of 10 */
 	if (bcn_rate > 0)
@@ -126,24 +181,29 @@ bool rrm_config_mcast_bcast_rate(const char *ifname, char *band,
 	/* Get rate code of given rate */
 	for (i = 0; i < NUM_OF_RATES; i++)
 	{
-		if (rate_code[i][0] == bcn_rate)
-			bcn_code = rate_code[i][1];
+		if (ath_rcodes[i].rate == bcn_rate)
+			bcn_code = ath_rcodes[i].code[dn];
 
-		if (rate_code[i][0] == mcast_rate)
-			mcast_code = rate_code[i][1];
+		if (ath_rcodes[i].rate == mcast_rate)
+			mcast_code = ath_rcodes[i].code[dn];
 	}
 
 	/* Set the rates to sysfs */
 	if (bcn_code != 0xFF)
 	{
-		if (set_rates_sysfs("beacon", bcn_code, ifname, band) == false)
-			rc = false;
+		if (set_rates_sysfs("beacon", bcn_code, ifname, band, dn) == false)
+			rc = -1;
+
+		/*Ath11k sets mgmt and beacon rates separately*/
+		if (dn == ATH11K_DRIVER)
+			if (set_rates_sysfs("mgmt", bcn_code, ifname, band, dn) == false)
+				rc = -1;
 	}
 
 	if (mcast_code != 0xFF)
 	{
-		if (set_rates_sysfs("mcast", mcast_code, ifname, band) == false)
-			rc = false;
+		if (set_rates_sysfs("mcast", mcast_code, ifname, band, dn) == false)
+			rc = -1;
 	}
 
 	return rc;
@@ -200,44 +260,53 @@ int rrm_get_backup_channel(const char * freq_band)
 
 }
 
-bool rrm_noreload_config(struct schema_Wifi_RRM_Config *conf, const char *rname)
+void rrm_noreload_config(struct schema_Wifi_RRM_Config *conf, const char *wlanif)
 {
 	char pval[16];
-	char wlanif[8];
-	int rid = 0;
-
-	sscanf(rname, "radio%d", &rid);
-	snprintf(wlanif, sizeof(wlanif), "wlan%d", rid);
+	int rc = 0;
 
 	if (conf->probe_resp_threshold_changed) {
 		/* rssi_ignore_probe_request and signal_connect should
 		 * both be probe_resp_threshold */ 
 		snprintf(pval, sizeof(pval), "%d",
 			 conf->probe_resp_threshold);
-		ubus_set_hapd_param(wlanif,
+		rc = ubus_set_hapd_param(wlanif,
 				    "rssi_ignore_probe_request", pval);
-		ubus_set_signal_thresholds(wlanif,
+		if (rc < 0)
+			LOG(ERR, "RRM: Set rssi_ignore_probe_req failed");
+		rc = ubus_set_signal_thresholds(wlanif,
 					   conf->probe_resp_threshold,
 					   conf->client_disconnect_threshold);
+		if (rc < 0)
+			LOG(ERR, "RRM: Set probe_resp_threshold failed");
+
 
 	}
 
 	if (conf->client_disconnect_threshold_changed) {
-		ubus_set_signal_thresholds(wlanif,
+		rc = ubus_set_signal_thresholds(wlanif,
 					   conf->probe_resp_threshold,
 					   conf->client_disconnect_threshold);
+		if (rc < 0)
+			LOG(ERR, "RRM: Set client_disconnect_thres failed");
+
 	}
 
 	if (conf->mcast_rate_changed) {
-		rrm_config_mcast_bcast_rate(wlanif, conf->freq_band, 0,
+		rc = rrm_config_mcast_bcast_rate(wlanif, conf->freq_band, 0,
 					    conf->mcast_rate);
+		if (rc < 0)
+			LOG(ERR, "RRM: Set mcast rate failed");
+
 	}
 
 	if (conf->beacon_rate_changed) {
 		rrm_config_mcast_bcast_rate(wlanif, conf->freq_band,
 					    conf->beacon_rate, 0);
+		if (rc < 0)
+			LOG(ERR, "RRM: Set beacon rate failed");
+
 	}
-	return true;
 }
 
 void get_channel_bandwidth(const char* htmode, int *channel_bandwidth)
@@ -285,7 +354,6 @@ void rrm_radio_rebalance_channel(const struct schema_Wifi_Radio_Config *rconf)
 
 	ubus_set_channel_switch(wlanif, freq, hw_mode,
 				channel_bandwidth, sec_chan_offset);
-
 }
 
 static bool rrm_config_update( struct schema_Wifi_RRM_Config *conf, bool addNotDelete)
@@ -315,7 +383,18 @@ static bool rrm_config_update( struct schema_Wifi_RRM_Config *conf, bool addNotD
 		     (conf->mcast_rate_changed)? "changed":"unchanged", 
 		     (conf->probe_resp_threshold_changed)? "changed":"unchanged",
 		     (conf->client_disconnect_threshold_changed)? "changed":"unchanged");
-		if(rrm_noreload_config(conf, rconf.if_name) == true) {
+
+		for (i = 0; i < rconf.vif_configs_len; i++) {
+			if (!(where = ovsdb_where_uuid("_uuid",
+						rconf.vif_configs[i].uuid)))
+				continue;
+
+			memset(&vconf, 0, sizeof(vconf));
+			if (ovsdb_table_select_one_where(&table_Wifi_VIF_Config,
+							 where, &vconf))
+			{
+				rrm_noreload_config(conf, vconf.if_name);
+			}
 		}
 	}
 
