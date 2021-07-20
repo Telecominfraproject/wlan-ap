@@ -6,7 +6,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_URL=https://github.com/blogic/ucentral-wifi.git
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2021-04-13
-PKG_SOURCE_VERSION:=17c442426a864144e17ef82120ed8cef8e7e7272
+PKG_SOURCE_VERSION:=17691102b2cf9f17074bf2d8155974ba1c804b8f
 #PKG_MIRROR_HASH:=a8000b3cf43ce9ebfa7305661475fec98ec1dba2dc7b062028c2e17d7c2ec50b
 
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
@@ -25,6 +25,11 @@ endef
 TARGET_CFLAGS += \
 	-I$(STAGING_DIR)/usr/include \
 	-I$(STAGING_DIR)/usr/include/libnl-tiny
+
+define Build/Prepare
+	$(Build/Prepare/Default)
+	$(CP) $(STAGING_DIR)/usr/include/mac80211/uapi/linux/nl80211.h $(PKG_BUILD_DIR)/nl80211_copy.h
+endef
 
 define Package/ucentral-wifi/install
 	$(INSTALL_DIR) $(1)/usr/sbin $(1)/etc/init.d
