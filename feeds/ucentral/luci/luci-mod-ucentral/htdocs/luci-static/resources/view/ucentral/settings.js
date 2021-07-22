@@ -1,9 +1,9 @@
 'use strict';
 'require view';
 'require form';
-'require dom';
 'require fs';
 'require ui';
+'require tools.ucentral as uctool';
 
 var profile = null;
 
@@ -15,29 +15,6 @@ function serialize(data) {
 	profile.unit.location = data.local.location;
 
 	return JSON.stringify(profile, null, '\t');
-}
-
-function showNotification(text, style, timeout) {
-	var node = ui.addNotification(null, E('p', text), style);
-
-	if (timeout) {
-		var btn = node.querySelector('input, button');
-		btn.parentNode.removeChild(btn);
-		window.setTimeout(function() { node.parentNode.removeChild(node) }, timeout);
-	}
-
-	return node;
-}
-
-function showProgress(text, ongoing) {
-	var dlg = ui.showModal(null, [
-		E('p', { 'class': ongoing ? 'spinning' : null }, [ text ])
-	]);
-
-	dlg.removeChild(dlg.firstElementChild);
-
-	if (!ongoing)
-		window.setTimeout(ui.hideModal, 750);
 }
 
 return view.extend({
@@ -67,35 +44,26 @@ return view.extend({
 		o.inputtitle = _('Upload certificate bundle…');
 		o.onclick = function(ev) {
 			return ui.uploadFile('/tmp/certs.tar').then(function(res) {
-				showProgress(_('Verifying certificates…'), true);
+				uctool.showProgress(_('Verifying certificates…'));
 
 				return fs.exec('/sbin/certupdate').then(function(res) {
-					if (res.code)
-						showNotification(_('Certificate validation failed: %s').format(res.stderr || res.stdout), 'error');
-					else
-						showNotification(_('Certificates updated.'), null, 3000);
-				}).catch(function(err) {
-					showNotification(_('Unable to update certificates: %s').format(err), 'error');
+					if (res.code) {
+						uctool.showError(_('Certificate validation failed: %s').format(res.stderr || res.stdout));
+					}
+					else {
+						uctool.showProgress(_('Certificates updated.'), 1500);
+						uctool.setDirty(true);
+					}
+				}, function(err) {
+					uctool.showError(_('Unable to verify certificates: %s').format(err));
 				});
-			}).finally(ui.hideModal);
+			});
 		};
 
 		return m.render();
 	},
 
-	handleSave: function(ev) {
-		var m = dom.findClassInstance(document.querySelector('.cbi-map'));
-
-		return m.save().then(function() {
-			return fs.write('/etc/ucentral/profile.json', serialize(m.data.data));
-		}).then(function() {
-			return fs.exec('/sbin/profileupdate');
-		}).then(function() {
-			showNotification(_('Connection settings have been saved'), null, 3000);
-		}).catch(function(err) {
-			showNotification(_('Unable to save connection settings: %s').format(err), 'error');
-		});
-	},
+	handleSave: uctool.save.bind(uctool, serialize),
 
 	handleSaveApply: null,
 	handleReset: null

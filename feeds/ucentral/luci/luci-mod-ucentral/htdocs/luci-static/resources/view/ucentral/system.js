@@ -5,6 +5,7 @@
 'require rpc';
 'require fs';
 'require ui';
+'require tools.ucentral as uctool';
 
 var callSystemValidateFirmwareImage = rpc.declare({
 	object: 'system',
@@ -36,9 +37,7 @@ return view.extend({
 		if (!confirm(_('Do you really want to erase all settings?')))
 			return;
 
-		ui.showModal(_('Erasing...'), [
-			E('p', { 'class': 'spinning' }, _('The system is erasing the configuration partition now and will reboot itself when finished.'))
-		]);
+		uctool.showProgress(_('The system is erasing the configuration partition now and will reboot itself when finished.'));
 
 		/* Currently the sysupgrade rpc call will not return, hence no promise handling */
 		fs.exec('/sbin/firstboot', [ '-r', '-y' ]);
@@ -50,10 +49,7 @@ return view.extend({
 		return ui.uploadFile('/tmp/firmware.bin', ev.target.firstChild)
 			.then(L.bind(function(btn, reply) {
 				btn.firstChild.data = _('Checking image…');
-
-				ui.showModal(_('Checking image…'), [
-					E('span', { 'class': 'spinning' }, _('Verifying the uploaded image file.'))
-				]);
+				uctool.showProgress(_('Verifying the uploaded image file.'));
 
 				return callSystemValidateFirmwareImage('/tmp/firmware.bin')
 					.then(function(res) { return [ reply, res ]; });
@@ -98,7 +94,7 @@ return view.extend({
 
 				ui.showModal(is_valid ? _('Flash image?') : _('Invalid image'), body);
 			}, this, ev.target))
-			.catch(function(e) { ui.addNotification(null, E('p', e.message)) })
+			.catch(function(e) { uctool.showError(e.message) })
 			.finally(L.bind(function(btn) {
 				btn.firstChild.data = _('Flash image…');
 			}, this, ev.target));
@@ -107,9 +103,7 @@ return view.extend({
 	handleSysupgradeConfirm: function(btn, ev) {
 		btn.firstChild.data = _('Flashing…');
 
-		ui.showModal(_('Flashing…'), [
-			E('p', { 'class': 'spinning' }, _('The system is flashing now.<br /> DO NOT POWER OFF THE DEVICE!<br /> Wait a few minutes before you try to reconnect. It might be necessary to renew the address of your computer to reach the device again, depending on your settings.'))
-		]);
+		uctool.showProgress(_('The system is flashing now.<br /> DO NOT POWER OFF THE DEVICE!<br /> Wait a few minutes before you try to reconnect. It might be necessary to renew the address of your computer to reach the device again, depending on your settings.'));
 
 		/* Currently the sysupgrade rpc call will not return, hence no promise handling */
 		fs.exec('/sbin/sysupgrade', [ '-n', '/tmp/firmware.bin' ]);
@@ -120,17 +114,15 @@ return view.extend({
 	handleReboot: function(ev) {
 		return callReboot().then(function(res) {
 			if (res != 0) {
-				L.ui.addNotification(null, E('p', _('The reboot command failed with code %d').format(res)));
+				uctool.showError(_('The reboot command failed with code %d').format(res));
 				L.raise('Error', 'Reboot failed');
 			}
 
-			L.ui.showModal(_('Rebooting…'), [
-				E('p', { 'class': 'spinning' }, _('The device is rebooting now. This page will try to reconnect automatically once the device is fully booted.'))
-			]);
+			uctool.showProgress(_('The device is rebooting now. This page will try to reconnect automatically once the device is fully booted.'));
 
-			L.ui.awaitReconnect();
+			ui.awaitReconnect();
 		})
-		.catch(function(e) { L.ui.addNotification(null, E('p', e.message)) });
+		.catch(function(e) { uctool.showError(e.message) });
 	},
 
 	render: function(rpc_replies) {

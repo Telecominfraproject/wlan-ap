@@ -1,6 +1,7 @@
 'use strict';
 'require rpc';
 'require view';
+'require tools.ucentral as uctool';
 
 var callSystemBoard = rpc.declare({
 	object: 'system',

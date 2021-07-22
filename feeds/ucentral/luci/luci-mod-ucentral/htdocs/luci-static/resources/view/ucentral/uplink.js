@@ -1,9 +1,8 @@
 'use strict';
 'require view';
 'require form';
-'require dom';
 'require fs';
-'require ui';
+'require tools.ucentral as uctool';
 
 var profile = null;
 
@@ -16,18 +15,6 @@ function serialize(data) {
 	return JSON.stringify(profile, function(key, val) {
 		return (key.charAt(0) != '.') ? val : undefined;
 	}, '\t');
-}
-
-function showNotification(text, style, timeout) {
-	var node = ui.addNotification(null, E('p', text), style);
-
-	if (timeout) {
-		var btn = node.querySelector('input, button');
-		btn.parentNode.removeChild(btn);
-		window.setTimeout(function() { node.parentNode.removeChild(node) }, timeout);
-	}
-
-	return node;
 }
 
 return view.extend({
@@ -57,6 +44,12 @@ return view.extend({
 		o.value('pppoe', _('Address configuration via PPPoE'));
 		o.value('wwan', _('Cellular network connection'));
 
+		o = s.option(form.ListValue, 'modem-type', _('Modem type'));
+		o.depends('protocol', 'wwan');
+		o.value('wwan', _('Automatic', 'Automatic modem type selection'));
+		o.value('mbim', 'MBIM');
+		o.value('qmi', 'QMI');
+
 		o = s.option(form.Value, 'access-point-name', _('APN', 'Cellular access point name'));
 		o.depends('protocol', 'wwan');
 		o.validate = function(section_id, value) {
@@ -69,12 +62,6 @@ return view.extend({
 		o = s.option(form.Value, 'pin-code', _('PIN'));
 		o.depends('protocol', 'wwan');
 		o.datatype = 'and(uinteger,minlength(4),maxlength(8))';
-
-		o = s.option(form.ListValue, 'modem-type', _('Modem Type'));
-		o.depends('protocol', 'wwan');
-		o.value('wwan', _('Automatic'));
-		o.value('mbim', 'MBIM');
-		o.value('qmi', 'QMI');
 
 		o = s.option(form.ListValue, 'authentication-type', _('Authentication'));
 		o.depends('protocol', 'wwan');
@@ -124,19 +111,7 @@ return view.extend({
 		return m.render();
 	},
 
-	handleSave: function(ev) {
-		var m = dom.findClassInstance(document.querySelector('.cbi-map'));
-
-		return m.save().then(function() {
-			return fs.write('/etc/ucentral/profile.json', serialize(m.data.data));
-		}).then(function() {
-			return fs.exec('/sbin/profileupdate');
-		}).then(function() {
-			showNotification(_('Connection settings have been saved'), null, 'error');
-		}).catch(function(err) {
-			showNotification(_('Unable to save connection settings: %s').format(err), 'error');
-		});
-	},
+	handleSave: uctool.save.bind(uctool, serialize),
 
 	handleSaveApply: null,
 	handleReset: null
