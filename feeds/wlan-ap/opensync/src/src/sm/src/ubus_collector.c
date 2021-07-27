@@ -6,17 +6,15 @@
 /* Global list of events received from hostapd */
 dpp_event_report_data_t g_event_report;
 
-/* Internal list of processed events ready to be deleted from hostapd */
-static ds_dlist_t deletion_pending_list;
 static ds_dlist_t bss_list;
 static struct ubus_context *ubus = NULL;
 
 typedef struct {
 	uint64_t session_id;
 	char bss[UBUS_OBJ_LEN];
-
-	ds_dlist_node_t node;
 } delete_entry_t;
+
+static void ubus_garbage_collector(void *arg);
 
 static const struct blobmsg_policy ubus_collector_chan_switch_event_policy[__CHANNEL_SWITCH_EVENT_MAX] = {
 	[CHAN_SWITCH_EVENT] = {.name = "chan_switch_event", .type = BLOBMSG_TYPE_TABLE},
@@ -166,6 +164,7 @@ static int client_first_data_event_cb(struct blob_attr *msg,
 	if (tb_client_first_data_event[CLIENT_FIRST_DATA_STA_MAC]) {
 		mac_address = blobmsg_get_string(tb_client_first_data_event[CLIENT_FIRST_DATA_STA_MAC]);
 		memcpy(dpp_session->first_data_event->sta_mac, mac_address, MAC_ADDRESS_STRING_LEN);
+		LOG(DEBUG, "ubus: Received FDATA event session_id:%llu client mac:%s", event_session_id, mac_address);
 	}
 
 	if (tb_client_first_data_event[CLIENT_FIRST_DATA_TIMESTAMP])
@@ -209,6 +208,7 @@ static int client_disconnect_event_cb(struct blob_attr *msg,
 	if (tb_client_disconnect_event[CLIENT_DISCONNECT_STA_MAC]) {
 		mac_address = blobmsg_get_string(tb_client_disconnect_event[CLIENT_DISCONNECT_STA_MAC]);
 		memcpy(dpp_session->disconnect_event->sta_mac, mac_address, MAC_ADDRESS_STRING_LEN);
+		LOG(DEBUG, "ubus: Received DISCONNECT event with session_id:%llu client mac:%s", event_session_id, mac_address);
 	}
 
 	if (tb_client_disconnect_event[CLIENT_DISCONNECT_BAND])
@@ -258,6 +258,7 @@ static int client_auth_event_cb(struct blob_attr *msg,
 	if (tb_client_auth_event[CLIENT_AUTH_STA_MAC]) {
 		mac_address = blobmsg_get_string(tb_client_auth_event[CLIENT_AUTH_STA_MAC]);
 		memcpy(dpp_session->auth_event->sta_mac, mac_address, MAC_ADDRESS_STRING_LEN);
+		LOG(DEBUG, "ubus: Received AUTH event with session_id:%llu client mac:%s", event_session_id, mac_address);
 	}
 
 	if (tb_client_auth_event[CLIENT_AUTH_BAND])
@@ -304,6 +305,7 @@ static int client_assoc_event_cb(struct blob_attr *msg,
 	if (tb_client_assoc_event[CLIENT_ASSOC_STA_MAC]) {
 		mac_address = blobmsg_get_string(tb_client_assoc_event[CLIENT_ASSOC_STA_MAC]);
 		memcpy(dpp_session->assoc_event->sta_mac, mac_address, MAC_ADDRESS_STRING_LEN);
+		LOG(DEBUG, "ubus: Received ASSOC event with session_id:%llu client mac:%s", event_session_id, mac_address);
 	}
 
 	if (tb_client_assoc_event[CLIENT_ASSOC_SSID]) {
@@ -365,6 +367,7 @@ static int client_ip_event_cb(struct blob_attr *msg,
 	if (tb_client_ip_event[CLIENT_IP_STA_MAC]) {
 		mac_address = blobmsg_get_string(tb_client_ip_event[CLIENT_IP_STA_MAC]);
 		memcpy(dpp_session->ip_event->sta_mac, mac_address, MAC_ADDRESS_STRING_LEN);
+		LOG(DEBUG, "ubus: Received IP event with session_id:%llu client mac:%s", event_session_id, mac_address);
 	}
 
 	if (tb_client_ip_event[CLIENT_IP_IP_ADDRESS]) {
@@ -390,22 +393,21 @@ static int (*client_event_handler_list[__CLIENT_EVENTS_MAX - 1])(
 
 static void ubus_collector_complete_session_cb(struct ubus_request *req, int ret)
 {
-	LOG(DEBUG, "ubus_collector_complete_session_cb");
 	if (req)
 		free(req);
 }
 
-static bool ubus_collector_is_session_processed(uint64_t session_id)
+static void session_delete(uint64_t session_id, char *ifname)
 {
 	delete_entry_t *delete_entry = NULL;
-
-	ds_dlist_foreach(&deletion_pending_list, delete_entry) {
-		if ( delete_entry && (delete_entry->session_id == session_id)) {
-			return true;
-		}
+	delete_entry = calloc(1, sizeof(delete_entry_t));
+	if (delete_entry) {
+		memset(delete_entry, 0, sizeof(delete_entry_t));
+		delete_entry->session_id = session_id;
+		strncpy(delete_entry->bss, ifname, UBUS_OBJ_LEN);
+		evsched_task(&ubus_garbage_collector, delete_entry,
+				EVSCHED_SEC(SESSION_DELETE_TIMEOUT));
 	}
-
-	return false;
 }
 
 static void ubus_collector_session_cb(struct ubus_request *req, int type,
@@ -418,9 +420,9 @@ static void ubus_collector_session_cb(struct ubus_request *req, int type,
 	struct blob_attr *tb_client_events[__CLIENT_EVENTS_MAX] = {};
 	dpp_event_record_t *event_record = NULL;
 	uint64_t session_id = 0;
-	delete_entry_t *delete_entry = NULL;
 	int i = 0;
 	(void)type;
+	bool is_session_empty = true;
 
 	char *ifname = (char *)req->priv;
 
@@ -466,12 +468,6 @@ static void ubus_collector_session_cb(struct ubus_request *req, int type,
 			continue;
 		}
 
-		/* Check if the session is already processed */
-		if (ubus_collector_is_session_processed(session_id) == true) {
-			LOG(DEBUG, "ubus_collector: Session already processed");
-			continue;
-		}
-
 		event_record = dpp_event_record_alloc();
 		if (!event_record) {
 			LOG(ERR, "ubus_collector: not enough memory for event_record");
@@ -489,21 +485,19 @@ static void ubus_collector_session_cb(struct ubus_request *req, int type,
 				client_event_handler_list[i](
 					tb_client_events[i], &event_record->client_session,
 					session_id);
-				}
+				is_session_empty = false;
 			}
-		event_record->hasSMProcessed = false;
-		ds_dlist_insert_tail(&g_event_report.client_event_list, event_record);
-		event_record = NULL;
+		}
+		if (is_session_empty) {
+			dpp_event_record_free(event_record);
+		} else {
+			event_record->hasSMProcessed = false;
+			ds_dlist_insert_tail(&g_event_report.client_event_list, event_record);
+			event_record = NULL;
+		}
 
 		/* Schedule session for deletion */
-		delete_entry = calloc(1, sizeof(delete_entry_t));
-		if (delete_entry) {
-			memset(delete_entry, 0, sizeof(delete_entry_t));
-			delete_entry->session_id = session_id;
-			strncpy(delete_entry->bss, ifname, UBUS_OBJ_LEN);
-			ds_dlist_insert_tail(&deletion_pending_list, delete_entry);
-			delete_entry = NULL;
-		}
+		session_delete(session_id, ifname);
 	}
 }
 
@@ -543,7 +537,6 @@ static void ubus_collector_hostapd_invoke(void *object_path)
 
 static void ubus_collector_complete_bss_cb(struct ubus_request *req, int ret)
 {
-	LOG(DEBUG, "ubus_collector_complete_bss_cb");
 	if (req)
 		free(req);
 }
@@ -639,8 +632,6 @@ static void ubus_collector_chan_switch_events_cb(struct ubus_request *req, int t
 	if (!msg)
 		return;
 
-	LOG(DEBUG, "ubus_collector: received ubus collector chan event message");
-
 	error = blobmsg_parse(ubus_collector_chan_switch_event_policy,
 			      __CHANNEL_SWITCH_EVENT_MAX, tb_chan_event_lst,
 			      blobmsg_data(msg), blobmsg_data_len(msg));
@@ -682,7 +673,6 @@ static void ubus_collector_chan_switch_events_cb(struct ubus_request *req, int t
 
 static void ubus_collector_complete_channel_switch_cb(struct ubus_request *req, int ret)
 {
-	LOG(DEBUG, "ubus_collector_complete_channel_switch_cb");
 	if (req)
 		free(req);
 }
@@ -701,8 +691,6 @@ static void ubus_collector_hostapd_channel_switch_invoke(void *arg)
 		evsched_task_reschedule();
 		return;
 	}
-
-	LOG(DEBUG, "ubus_collector: requesting hostapd channel switch data");
 
 	ubus_invoke_async(ubus, ubus_object_id, hostapd_method, NULL, req);
 
@@ -770,24 +758,12 @@ static void ubus_collector_hostapd_clear(uint64_t session_id, char *object_path)
 
 static void ubus_garbage_collector(void *arg)
 {
-	delete_entry_t *delete_entry = NULL;
+	delete_entry_t *delete_session = (delete_entry_t *)arg;
 
-	if (ds_dlist_is_empty(&deletion_pending_list)) {
-		evsched_task_reschedule();
-		return;
+	if (delete_session) {
+		ubus_collector_hostapd_clear(delete_session->session_id, delete_session->bss);
+		free(delete_session);
 	}
-
-	/* Remove a single session from the deletion list */
-
-	delete_entry = ds_dlist_head(&deletion_pending_list);
-	if (delete_entry) {
-		ubus_collector_hostapd_clear(delete_entry->session_id, delete_entry->bss);
-		ds_dlist_remove_head(&deletion_pending_list);
-		free(delete_entry);
-		delete_entry = NULL;
-	}
-
-	evsched_task_reschedule();
 }
 
 int ubus_collector_init(void)
@@ -803,7 +779,6 @@ int ubus_collector_init(void)
 	/* Initialize the global events, session deletion and bss object lists */
 	ds_dlist_init(&g_event_report.client_event_list, dpp_event_record_t, node);
 	ds_dlist_init(&g_event_report.channel_switch_list, dpp_event_channel_switch_t, node);
-	ds_dlist_init(&deletion_pending_list, delete_entry_t, node);
 	ds_dlist_init(&bss_list, bss_obj_t, node);
 
 	/* Schedule an event: invoke hostapd ubus get bss list method  */
@@ -821,15 +796,6 @@ int ubus_collector_init(void)
 	if (sched_status < 1) {
 		LOG(ERR, "ubus_collector: failed at task creation, status %d",
 			sched_status);
-		return -1;
-	}
-
-	/* Schedule an event: clear the hostapd sessions from opensync */
-	sched_status = evsched_task(&ubus_garbage_collector, NULL,
-				    EVSCHED_SEC(UBUS_GARBAGE_COLLECTION_DELAY));
-	if (sched_status < 1) {
-		LOG(ERR, "ubus_collector: failed at task creation, status %d",
-		    sched_status);
 		return -1;
 	}
 
