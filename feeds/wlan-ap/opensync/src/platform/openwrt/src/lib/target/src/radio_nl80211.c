@@ -149,13 +149,31 @@ static void nl80211_add_station(struct nlattr **tb, char *ifname)
 
 	addr = nla_data(tb[NL80211_ATTR_MAC]);
 	vif_add_sta_rate_rule(addr, ifname);
-	sta = avl_find_element(&sta_tree, addr, sta, avl);
-	if (sta)
-		return;
 
 	wif = avl_find_element(&wif_tree, ifname, wif, avl);
 	if (!wif)
 		return;
+
+	sta = avl_find_element(&sta_tree, addr, sta, avl);
+	/* In case of roaming between interfaces (wif) the sta would
+	 * already be in the sta_tree, but however it should be inserted
+	 * again with new parent wif. Also, sta should be detached from
+	 * old wif and attached to new wif.
+	 * When the client roams between wifs, the sta assocs
+	 * first to new wif(NEW_STATION nlevent) and then the hostapd
+	 * deletes (DEL_STATION nlevent) the stale client from old wif.
+	 */
+	if (sta) {
+		if (!strcasecmp(wif->name, sta->parent->name)) {
+			return;
+		}
+		else {
+			list_del(&sta->iface);
+			sta->parent = wif;
+			list_add(&sta->iface, &wif->stas);
+		}
+	}
+
 	sta = malloc(sizeof(*sta));
 	if (!sta)
 		return;
@@ -174,6 +192,11 @@ static void _nl80211_del_station(char *ifname, struct wifi_station *sta)
 {
 	vif_del_sta_rate_rule(sta->addr, ifname);
 	vif_add_station(sta, ifname, 0);
+
+	/* Dont delete sta if it has roamed to a new interface */
+	if (strcasecmp(ifname, sta->parent->name))
+		return;
+
 	list_del(&sta->iface);
 	avl_delete(&sta_tree, &sta->avl);
 	free(sta);
