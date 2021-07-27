@@ -29,6 +29,7 @@ drv_mac80211_init_device_config() {
 	config_add_string distance
 	config_add_int beacon_int chanbw frag rts
 	config_add_int rxantenna txantenna antenna_gain txpower
+	config_add_int num_global_macaddr
 	config_add_boolean noscan ht_coex acs_exclude_dfs
 	config_add_array ht_capab
 	config_add_array channels
@@ -522,7 +523,11 @@ mac80211_generate_mac() {
 	local oIFS="$IFS"; IFS=":"; set -- $ref; IFS="$oIFS"
 
 	macidx=$(($id + 1))
-	[ "$((0x$mask1))" -gt 0 ] && {
+
+	local use_global=0
+	[ "$id" -gt 0 -a "$macidx" -le "$num_global_macaddr" ] && use_global=1
+
+	[ "$((0x$mask1))" -gt 0 -a "$use_global" -lt 1 ] && {
 		b1="0x$1"
 		[ "$id" -gt 0 ] && \
 			b1=$(($b1 ^ ((($id - !($b1 & 2)) << 2)) | 0x2))
@@ -530,7 +535,7 @@ mac80211_generate_mac() {
 		return
 	}
 
-	[ "$((0x$mask6))" -lt 255 ] && {
+	[ "$((0x$mask6))" -lt 255 -a "$use_global" -gt 0 ] && {
 		printf "%s:%s:%s:%s:%s:%02x" $1 $2 $3 $4 $5 $(( 0x$6 ^ $id ))
 		return
 	}
@@ -1010,7 +1015,8 @@ drv_mac80211_setup() {
 		country chanbw distance \
 		txpower antenna_gain \
 		rxantenna txantenna \
-		frag rts beacon_int:100 htmode
+		frag rts beacon_int:100 htmode \
+		num_global_macaddr
 	json_get_values basic_rate_list basic_rate
 	json_get_values scan_list scan_list
 	json_select ..
@@ -1072,6 +1078,7 @@ drv_mac80211_setup() {
 	set_default txantenna 0xffffffff
 	set_default distance 0
 	set_default antenna_gain 0
+	set_default num_global_macaddr 1
 
 	[ "$txantenna" = "all" ] && txantenna=0xffffffff
 	[ "$rxantenna" = "all" ] && rxantenna=0xffffffff
