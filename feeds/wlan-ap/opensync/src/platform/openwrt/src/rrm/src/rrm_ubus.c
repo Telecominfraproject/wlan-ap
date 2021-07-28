@@ -51,7 +51,7 @@ int ubus_get_noise(const char *if_name, uint32_t *noise)
 
 }
 
-int ubus_set_channel_switch(const char *if_name, uint32_t frequency, int channel_bandwidth, int sec_chan_offset)
+int ubus_set_channel_switch(const char *if_name, uint32_t frequency, int channel_bandwidth, int sec_chan_offset, int reason)
 {
 	uint32_t id;
 	static struct blob_buf b;
@@ -76,6 +76,8 @@ int ubus_set_channel_switch(const char *if_name, uint32_t frequency, int channel
 	blobmsg_add_u32(&b, "bcn_count", 5);
 	blobmsg_add_u32(&b, "bandwidth", channel_bandwidth);
 	blobmsg_add_u32(&b, "sec_channel_offset", sec_chan_offset);
+	blobmsg_add_u32(&b, "reason", reason);
+
 	return ubus_invoke(ubus, id, "switch_chan", b.head, NULL, NULL, 1000);
 }
 

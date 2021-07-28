@@ -93,7 +93,7 @@ int hapd_rrm_set_neighbors(char *name, struct rrm_neighbor *neigh, int count)
 
 int ubus_set_channel_switch(const char *if_name, uint32_t frequency,
 			    const char *hw_mode, int channel_bandwidth,
-			    int sec_chan_offset)
+			    int sec_chan_offset, int reason)
 {
 	uint32_t id;
 	char path[64];
@@ -128,6 +128,8 @@ int ubus_set_channel_switch(const char *if_name, uint32_t frequency,
 	blobmsg_add_u32(&ub, "bcn_count", 5);
 	blobmsg_add_u32(&ub, "bandwidth", channel_bandwidth);
 	blobmsg_add_u32(&ub, "sec_channel_offset", sec_chan_offset);
+	blobmsg_add_u32(&ub, "reason", reason);
+	
 	return ubus_invoke(ubus, id, "switch_chan", ub.head, NULL, NULL, 1000);
 }
 
