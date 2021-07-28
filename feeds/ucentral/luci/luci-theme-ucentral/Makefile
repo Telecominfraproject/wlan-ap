@@ -1,12 +1,12 @@
 #
-# Copyright (C) 2020 Jo-Philipp Wich <jo@mein.io>
+# Copyright (C) 2021 Jo-Philipp Wich <jo@mein.io>
 #
 # This is free software, licensed under the Apache License, Version 2.0 .
 #
 
 include $(TOPDIR)/rules.mk
 
-LUCI_TITLE:=LuCI uCentral theme
+LUCI_TITLE:=LuCI theme for uCentral
 LUCI_DEPENDS:=
 
 include ../luci.mk
