@@ -225,7 +225,7 @@ void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 			get_channel_bandwidth(get_max_channel_bw_channel(ieee80211_channel_to_frequency(rrm_config->rrm_data.backup_channel),
 					radio->schema.ht_mode), &channel_bandwidth);
 			ubus_set_channel_switch(radio->config.if_name,
-					ieee80211_channel_to_frequency(rrm_config->rrm_data.backup_channel), channel_bandwidth, sec_chan_offset);
+					ieee80211_channel_to_frequency(rrm_config->rrm_data.backup_channel), channel_bandwidth, sec_chan_offset, 0);
 
 			rrm_reset_noise_floor_samples(&(rrm_config->rrm_data));
 		}

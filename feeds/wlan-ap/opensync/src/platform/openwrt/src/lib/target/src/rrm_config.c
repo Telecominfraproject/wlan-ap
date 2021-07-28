@@ -338,7 +338,7 @@ void rrm_radio_rebalance_channel(const struct schema_Wifi_Radio_Config *rconf)
 
 	hw_mode = radio_fixup_get_hw_mode(rconf->if_name);
 	if (hw_mode == NULL) {
-		LOGE("Falied to get hw mode");
+		LOGE("Failed to get hw mode");
 		return;
 	}
 
@@ -353,7 +353,8 @@ void rrm_radio_rebalance_channel(const struct schema_Wifi_Radio_Config *rconf)
 
 
 	ubus_set_channel_switch(wlanif, freq, hw_mode,
-				channel_bandwidth, sec_chan_offset);
+				channel_bandwidth, sec_chan_offset, 1);
+
 }
 
 static bool rrm_config_update( struct schema_Wifi_RRM_Config *conf, bool addNotDelete)
