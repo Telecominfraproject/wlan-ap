@@ -366,8 +366,8 @@ hostapd_set_vlan_file() {
 	local ifname="$1"
 	local vlan="$2"
 	json_get_vars name vid
-	echo "${vid} ${ifname}.${name}" >> /var/run/hostapd-${ifname}.vlan
-	wireless_add_vlan "${vlan}" "${ifname}.${name}"
+	echo "${vid} ${ifname}-${name}" >> /var/run/hostapd-${ifname}.vlan
+	wireless_add_vlan "${vlan}" "${ifname}-${name}"
 }
 
 hostapd_set_vlan() {
@@ -755,6 +755,7 @@ hostapd_set_bss_options() {
 
 	append bss_conf "ssid=$ssid" "$N"
 	[ -n "$network_bridge" ] && append bss_conf "bridge=$network_bridge" "$N"
+	[ -n "$network_ifname" ] && append bss_conf "snoop_iface=$network_ifname" "$N"
 	[ -n "$iapp_interface" ] && {
 		local ifname
 		network_get_device ifname "$iapp_interface" || ifname="$iapp_interface"
