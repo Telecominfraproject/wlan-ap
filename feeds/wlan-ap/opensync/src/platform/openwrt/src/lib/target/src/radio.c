@@ -329,8 +329,6 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 
 	if (tb[WDEV_ATTR_COUNTRY])
 		SCHEMA_SET_STR(rstate.country, blobmsg_get_string(tb[WDEV_ATTR_COUNTRY]));
-	else
-		SCHEMA_SET_STR(rstate.country, "CA");
 
 	rstate.allowed_channels_len = phy_get_channels(phy, rstate.allowed_channels);
 	rstate.allowed_channels_present = true;
