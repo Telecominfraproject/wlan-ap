@@ -366,7 +366,7 @@ poe_cmd_port_power_budget(unsigned char port, unsigned char budget)
 static int
 poe_cmd_power_mgmt_mode(unsigned char mode)
 {
-	unsigned char cmd[] = { 0x18, 0x00, mode };
+	unsigned char cmd[] = { 0x17, 0x00, mode };
 
 	return poe_cmd_queue(cmd, sizeof(cmd));
 }
