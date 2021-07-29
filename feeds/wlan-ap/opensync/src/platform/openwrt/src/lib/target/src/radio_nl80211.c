@@ -601,6 +601,18 @@ static void vif_poll_stations(void *arg)
 	evsched_task_reschedule_ms(EVSCHED_SEC(STA_POLL_INTERVAL));
 }
 
+void vif_get_assoc_stations(void)
+{
+	struct wifi_iface *wif = NULL;
+
+ 	avl_for_each_element(&wif_tree, wif, avl) {
+		struct nl_msg *msg;
+		msg = unl_genl_msg(&unl_req, NL80211_CMD_GET_STATION, true);
+		nla_put_u32(msg, NL80211_ATTR_IFINDEX, wif->ifidx);
+		unl_genl_request(&unl_req, msg, nl80211_recv, NULL);
+ 	}
+}
+
 int radio_nl80211_init(void)
 {
 	struct nl_msg *msg;
@@ -630,6 +642,8 @@ int radio_nl80211_init(void)
 
 	if (nl_socket_set_nonblocking(unl_notify.sock))
 		LOGE("radio_nl80211: Failed to set socket in the non blocking mode");
+	/* Get already associated stations if any */
+	vif_get_assoc_stations();
 
 	ev_io_init(&unl_io, nl80211_ev, unl_notify.sock->s_fd, EV_READ);
         ev_io_start(wifihal_evloop, &unl_io);
