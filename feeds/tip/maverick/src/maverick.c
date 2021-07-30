@@ -28,7 +28,7 @@ main(int argc, char **argv)
 	ulog_open(ULOG_STDIO | ULOG_SYSLOG, LOG_DAEMON, "maverick");
 
 	uloop_init();
-	uloop_timeout_set(&maverick, 150 * 1000);
+	uloop_timeout_set(&maverick, 300 * 1000);
 	uloop_run();
 	uloop_done();
 
