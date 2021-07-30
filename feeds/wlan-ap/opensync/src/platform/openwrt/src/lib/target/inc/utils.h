@@ -6,6 +6,7 @@
 #include <libubox/blobmsg.h>
 
 #define min(a,b) (((a) < (b)) ? (a) : (b))
+#define ATH_DRIVER_NAME_LEN 16
 
 struct mode_map {
 	int fiveg;
@@ -44,4 +45,5 @@ extern char* get_max_channel_bw_channel(int channel_freq, const char* htmode);
 int phy_find_hwmon_helper(char *dir, char *file, char *hwmon);
 extern double dBm_to_mwatts(double dBm);
 extern double mWatts_to_dBm(double mW);
+extern int phy_get_ath_driver_name(char *phy, char *ath_driver);
 #endif

@@ -418,6 +418,22 @@ int phy_lookup(char *name)
 	return atoi(buf);
 }
 
+int phy_get_ath_driver_name(char *phy, char *ath_driver)
+{
+	glob_t gl;
+	char path[128];
+	snprintf(path, sizeof(path),
+			"/sys/kernel/debug/ieee80211/%s/[ath]*", phy);
+	if (glob(path, GLOB_NOSORT | GLOB_MARK, NULL, &gl))
+		return -1;
+	if (gl.gl_pathc) {
+		memset(ath_driver, '\0', ATH_DRIVER_NAME_LEN);
+		strncpy(ath_driver, basename(gl.gl_pathv[0]), ATH_DRIVER_NAME_LEN - 1);
+	}
+	globfree(&gl);
+	return 0;
+}
+
 int vif_get_mac(char *vap, char *mac)
 {
 	int sz = ETH_ALEN * 3;

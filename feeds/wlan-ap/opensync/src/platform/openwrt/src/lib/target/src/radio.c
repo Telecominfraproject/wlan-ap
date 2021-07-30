@@ -216,6 +216,76 @@ static void update_channel_max_power(char* phy, struct schema_Wifi_Radio_State *
 	}
 }
 
+static int get_channel_tx_power_debugfs(char *stats_path, int *tx_power)
+{
+	bool found = false;
+	char str[512];
+	FILE * fp = NULL;
+	int txpower = -1;
+	int ret = -1;
+
+	fp = fopen(stats_path, "r");
+	if (!fp) {
+		LOGE("%s: Failed to get tx power, stats file does not exist", __func__);
+		return -1;
+	}
+
+	const char *substr = "Channel TX power";
+
+	while(fgets(str, 512, fp)) {
+		if((strstr(str, substr)) != NULL) {
+			char * plast = NULL, * pcur = str;
+			while ((pcur = strtok( pcur, " "))) {
+				plast = pcur;
+				pcur = NULL;
+			}
+			txpower = atoi(plast);
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		LOGE("%s: Unable to find Tx Power in stats", __func__);
+	} else {
+		/* txpower is set as 2 units per dBm in FW */
+		*tx_power = txpower/2;
+		ret = 0;
+	}
+	if (fp)
+		fclose(fp);
+	return ret;
+}
+
+static int get_channel_tx_power(char* phy, int *tx_power)
+{
+	char ath_driver[ATH_DRIVER_NAME_LEN] = {'\0'};
+	char stats_path[128];
+
+	if (phy_get_ath_driver_name(phy, ath_driver)) {
+		LOGE("%s: Failed to get ATH driver name", __func__);
+		return -1;
+	}
+	if (!strncmp(ath_driver, "ath10k", ATH_DRIVER_NAME_LEN)) {
+		snprintf(stats_path, sizeof(stats_path),
+				"/sys/kernel/debug/ieee80211/%s/%s/fw_stats", phy,
+				ath_driver);
+	} else if (!strncmp(ath_driver, "ath11k", ATH_DRIVER_NAME_LEN)) {
+		snprintf(stats_path, sizeof(stats_path),
+				"/sys/kernel/debug/ieee80211/%s/%s/fw_stats/pdev_stats", phy,
+				ath_driver);
+	} else {
+		LOGE("%s: Unknown ATH driver", __func__);
+		return -1;
+	}
+
+	if (get_channel_tx_power_debugfs(stats_path, tx_power)) {
+		LOGE("%s: Failed to get Channel Tx Power", __func__);
+		return -1;
+	}
+
+	return 0;
+}
+
 const struct uci_blob_param_list wifi_device_param = {
 	.n_params = __WDEV_ATTR_MAX,
 	.params = wifi_device_policy,
@@ -227,6 +297,7 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 	struct schema_Wifi_Radio_State  rstate;
 	char phy[6];
 	int antenna;
+	int tx_power = -1;
 	uint32_t chan = 0;
 
 	LOGT("%s: get state", s->e.name);
@@ -267,13 +338,14 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 	else
 		SCHEMA_SET_INT(rstate.enabled, 1);
 
-	if (tb[WDEV_ATTR_TXPOWER]) {
-		SCHEMA_SET_INT(rstate.tx_power, blobmsg_get_u32(tb[WDEV_ATTR_TXPOWER]));
-		/* 0 means max in UCI, 32 is max in OVSDB */
-		if (rstate.tx_power == 0)
-			rstate.tx_power = 32;
-	} else
+	if (!get_channel_tx_power(phy, &tx_power)) {
+		SCHEMA_SET_INT(rstate.tx_power, tx_power);
+	} else {
+		LOGE("%s: Failed to update Channel Tx Power", __func__);
+		/* Set Tx Power to max OVSDB value */
 		SCHEMA_SET_INT(rstate.tx_power, 32);
+	}
+
 
 	if (tb[WDEV_ATTR_BEACON_INT])
 		SCHEMA_SET_INT(rstate.bcn_int, blobmsg_get_u32(tb[WDEV_ATTR_BEACON_INT]));
