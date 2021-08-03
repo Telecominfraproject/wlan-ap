@@ -72,7 +72,9 @@ static bool update_version_matrix(struct schema_AWLAN_Node *awlan)
 {
 	FILE *fp = NULL;
 	char *line = NULL;
-	char *key, *val, *str = NULL;
+	char *sep = NULL;
+	char key[128] = {'\0'};
+	char val[128] = {'\0'};
 	size_t len;
 	int rd = 0;
 	char inactive_fw[128] = "";
@@ -87,15 +89,15 @@ static bool update_version_matrix(struct schema_AWLAN_Node *awlan)
 			line[rd - 1] = '\0';
 		else continue;
 
-		str = strdup(line);
-		key = strtok(str, ":");
-		val = strtok(NULL, ":");
+		/* Separate Key and Val */
+		sep = strchr(line, ':');
+		if (!sep)
+			continue;
+		*sep = '\0';
+		strncpy(key, line, sizeof(key) - 1);
+		strncpy(val, sep + 1, sizeof(key) - 1);
 
-		if (val == NULL) {
-			SCHEMA_KEY_VAL_SET(awlan->version_matrix, key, "");
-		} else {
-			SCHEMA_KEY_VAL_SET(awlan->version_matrix, key, val);
-		}
+		SCHEMA_KEY_VAL_SET(awlan->version_matrix, key, val);
 	}
 
 	/* Update the inactive firmware version */
@@ -104,8 +106,6 @@ static bool update_version_matrix(struct schema_AWLAN_Node *awlan)
 
 	if (line != NULL)
 		free(line);
-	if (str != NULL)
-		free(str);
 	fclose(fp);
 	return true;
 }
