@@ -89,7 +89,7 @@ int rrm_setup_monitor(void);
 void rrm_channel_init(void);
 int rrm_ubus_init(struct ev_loop *loop);
 int ubus_get_noise(const char *if_name, uint32_t *noise);
-int ubus_set_channel_switch(const char *if_name, uint32_t frequency, int channel_bandwidth, int sec_chan_offset, int reason);
+int ubus_set_channel_switch(const char *if_name, uint32_t frequency, const char *hw_mode, int channel_bandwidth, int sec_chan_offset, int reason);
 void set_rrm_parameters(rrm_entry_t *rrm_data);
 ds_tree_t* rrm_get_rrm_config_list(void);
 ds_tree_t* rrm_get_radio_list(void);
