@@ -51,7 +51,9 @@ int ubus_get_noise(const char *if_name, uint32_t *noise)
 
 }
 
-int ubus_set_channel_switch(const char *if_name, uint32_t frequency, int channel_bandwidth, int sec_chan_offset, int reason)
+int ubus_set_channel_switch(const char *if_name, uint32_t frequency,
+			    const char *hw_mode, int channel_bandwidth,
+			    int sec_chan_offset, int reason)
 {
 	uint32_t id;
 	static struct blob_buf b;
@@ -63,14 +65,25 @@ int ubus_set_channel_switch(const char *if_name, uint32_t frequency, int channel
 		return -1;
 	blob_buf_init(&b, 0);
 
-	if (channel_bandwidth == 20 || channel_bandwidth == 40) {
-		blobmsg_add_bool(&b, "ht", 1);
-	} else if (channel_bandwidth == 80) {
-		blobmsg_add_bool(&b, "vht", 1);
+	if (!strncmp(hw_mode, "11n", strlen("11n"))) {
+		blobmsg_add_u8(&b, "ht", 1);
+	} else if (!strncmp(hw_mode, "11ac", strlen("11ac"))) {
+		blobmsg_add_u8(&b, "ht", 1);
+		blobmsg_add_u8(&b, "vht", 1);
+	} else if (!strncmp(hw_mode, "11ax", strlen("11ax"))) {
+		blobmsg_add_u8(&b, "ht", 1);
+		blobmsg_add_u8(&b, "vht", 1);
+		blobmsg_add_u8(&b, "he", 1);
 	}
-	if (channel_bandwidth == 40 || channel_bandwidth == 80) {
+
+	if (channel_bandwidth == 40)
+		blobmsg_add_u32(&b, "center_freq1", frequency+10);
+	else if (channel_bandwidth == 80)
 		blobmsg_add_u32(&b, "center_freq1", frequency+30);
-	}
+	else if (channel_bandwidth == 20)
+		blobmsg_add_u32(&b, "center_freq1", frequency);
+	else if (channel_bandwidth == 160)
+		blobmsg_add_u32(&b, "center_freq1", frequency+70);
 
 	blobmsg_add_u32(&b, "freq", frequency);
 	blobmsg_add_u32(&b, "bcn_count", 5);
