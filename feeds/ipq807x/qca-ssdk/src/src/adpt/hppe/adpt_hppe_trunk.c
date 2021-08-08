@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2017, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2017, 2020, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -130,7 +130,7 @@ adpt_hppe_trunk_group_set(a_uint32_t dev_id, a_uint32_t trunk_id,
 	union trunk_filter_u trunk_filter;
 	union port_trunk_id_u port_trunk_id;
 	union trunk_member_u trunk_member;
-	a_uint32_t i, j, cnt = 0, data[4] = {0,0,0,0};
+	a_uint32_t i, j, cnt = 0, data[FAL_MAX_PORT_NUMBER] = {0};
 
 	memset(&trunk_filter, 0, sizeof(trunk_filter));
 	memset(&port_trunk_id, 0, sizeof(port_trunk_id));
@@ -193,49 +193,25 @@ adpt_hppe_trunk_group_set(a_uint32_t dev_id, a_uint32_t trunk_id,
 
 	if (A_TRUE == enable)
 	{
-		switch (cnt) {
-			case 1:
-				trunk_member.bf.member_0_port_id = data[0];
-				trunk_member.bf.member_1_port_id = data[0];
-				trunk_member.bf.member_2_port_id = data[0];
-				trunk_member.bf.member_3_port_id = data[0];
-				trunk_member.bf.member_4_port_id = data[0];
-				trunk_member.bf.member_5_port_id = data[0];
-				trunk_member.bf.member_6_port_id = data[0];
-				trunk_member.bf.member_7_port_id = data[0];
-				break;
-			case 2:
-				trunk_member.bf.member_0_port_id = data[0];
-				trunk_member.bf.member_1_port_id = data[1];
-				trunk_member.bf.member_2_port_id = data[0];
-				trunk_member.bf.member_3_port_id = data[1];
-				trunk_member.bf.member_4_port_id = data[0];
-				trunk_member.bf.member_5_port_id = data[1];
-				trunk_member.bf.member_6_port_id = data[0];
-				trunk_member.bf.member_7_port_id = data[1];
-				break;
-			case 3:
-				trunk_member.bf.member_0_port_id = data[0];
-				trunk_member.bf.member_1_port_id = data[1];
-				trunk_member.bf.member_2_port_id = data[2];
-				trunk_member.bf.member_3_port_id = data[0];
-				trunk_member.bf.member_4_port_id = data[1];
-				trunk_member.bf.member_5_port_id = data[2];
-				trunk_member.bf.member_6_port_id = data[0];
-				trunk_member.bf.member_7_port_id = data[1];
-				break;
-			case 4:
-				trunk_member.bf.member_0_port_id = data[0];
-				trunk_member.bf.member_1_port_id = data[1];
-				trunk_member.bf.member_2_port_id = data[2];
-				trunk_member.bf.member_3_port_id = data[3];
-				trunk_member.bf.member_4_port_id = data[0];
-				trunk_member.bf.member_5_port_id = data[1];
-				trunk_member.bf.member_6_port_id = data[2];
-				trunk_member.bf.member_7_port_id = data[3];
-				break;
+		for(i = SSDK_PHYSICAL_PORT0; i <= SSDK_PHYSICAL_PORT7; i+=cnt)
+		{
+			for(j = 0; j < cnt; j++)
+			{
+				if((i+j) < FAL_MAX_PORT_NUMBER)
+				{
+					data[i+j] = data[j];
+				}
+			}
 		}
 	}
+	trunk_member.bf.member_0_port_id = data[0];
+	trunk_member.bf.member_1_port_id = data[1];
+	trunk_member.bf.member_2_port_id = data[2];
+	trunk_member.bf.member_3_port_id = data[3];
+	trunk_member.bf.member_4_port_id = data[4];
+	trunk_member.bf.member_5_port_id = data[5];
+	trunk_member.bf.member_6_port_id = data[6];
+	trunk_member.bf.member_7_port_id = data[7];
 
 	SW_RTN_ON_ERROR(hppe_trunk_member_set(dev_id, trunk_id, &trunk_member));
 

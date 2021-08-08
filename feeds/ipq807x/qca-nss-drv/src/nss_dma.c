@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -120,7 +120,7 @@ static void nss_dma_msg_handler(struct nss_ctx_instance *nss_ctx, struct nss_cmn
 	 */
 	if (ndm->cm.type == NSS_DMA_MSG_TYPE_SYNC_STATS) {
 		nss_dma_stats_sync(nss_ctx, &ndm->msg.stats);
-
+		nss_dma_stats_notify(nss_ctx);
 	}
 
 	/*

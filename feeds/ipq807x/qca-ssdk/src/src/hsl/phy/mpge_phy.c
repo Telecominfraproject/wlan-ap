@@ -952,6 +952,30 @@ mpge_phy_dac_init(a_uint32_t dev_id, a_uint32_t phy_id,
 }
 
 static sw_error_t
+mpge_phy_ldo_efuse_set(a_uint32_t dev_id, a_uint32_t phy_id, a_uint32_t efuse_value)
+{
+	a_uint16_t phy_data = 0, phy_data1 = 0;
+	sw_error_t rv = SW_OK;
+
+	/*when set the register of MPGE_PHY_DEBUG_ANA_LDO_EFUSE, the register of
+	MPGE_PHY_DEBUG_ANA_DAC_FILTER will be changed automatically, so need to
+	save it and restore it*/
+	phy_data1 = mpge_phy_debug_read(dev_id, phy_id, MPGE_PHY_DEBUG_ANA_DAC_FILTER);
+	PHY_RTN_ON_READ_ERROR(phy_data1);
+
+	phy_data = mpge_phy_debug_read(dev_id, phy_id, MPGE_PHY_DEBUG_ANA_LDO_EFUSE);
+	PHY_RTN_ON_READ_ERROR(phy_data);
+	phy_data &= ~(BITS(4,4));
+	rv = mpge_phy_debug_write(dev_id, phy_id, MPGE_PHY_DEBUG_ANA_LDO_EFUSE,
+		phy_data | efuse_value);
+	SW_RTN_ON_ERROR(rv);
+	rv = mpge_phy_debug_write(dev_id, phy_id, MPGE_PHY_DEBUG_ANA_DAC_FILTER,
+		phy_data1);
+
+	return rv;
+}
+
+static sw_error_t
 mpge_phy_hw_init(a_uint32_t dev_id,  a_uint32_t port_bmp)
 {
 	a_uint32_t port_id = 0, phy_addr = 0;
@@ -966,6 +990,9 @@ mpge_phy_hw_init(a_uint32_t dev_id,  a_uint32_t port_bmp)
 			/*configure the CDT threshold*/
 			rv = mpge_phy_cdt_thresh_init (dev_id, phy_addr);
 			SW_RTN_ON_ERROR(rv);
+			/*set LDO efuse as default and make ICC efuse take effect only*/
+			rv = mpge_phy_ldo_efuse_set(dev_id, phy_addr,
+				MPGE_PHY_DEBUG_ANA_LDO_EFUSE_DEFAULT);
 			/*special configuration for AZ*/
 			rv = mpge_phy_mmd_write(dev_id, phy_addr, MPGE_PHY_MMD3_NUM,
 				MPGE_PHY_MMD3_AZ_CTRL1, MPGE_PHY_MMD3_AZ_CTRL1_VAL);

@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2013-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -568,6 +568,7 @@ struct nss_top_instance {
 	uint8_t mirror_handler_id;
 	uint8_t wmdb_handler_id;
 	uint8_t dma_handler_id;
+	uint8_t udp_st_handler_id;
 
 	/*
 	 * Data/Message callbacks for various interfaces
@@ -903,6 +904,8 @@ struct nss_platform_data {
 				/* Does this core handle TLS Tunnel ? */
 	enum nss_feature_enabled mirror_enabled;
 				/* Does this core handle mirror? */
+	enum nss_feature_enabled udp_st_enabled;
+				/* Does this core handle udp st? */
 };
 #endif
 

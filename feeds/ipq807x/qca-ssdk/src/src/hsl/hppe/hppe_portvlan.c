@@ -52,6 +52,28 @@ hppe_port_parsing_reg_set(
 }
 
 sw_error_t
+hppe_edma_vlan_tpid_reg_get(
+		a_uint32_t dev_id,
+		union edma_vlan_tpid_reg_u *value)
+{
+	return hppe_reg_get(
+				dev_id,
+				EDMA_CSR_BASE_ADDR + EDMA_VLAN_TPID_REG_ADDRESS,
+				&value->val);
+}
+
+sw_error_t
+hppe_edma_vlan_tpid_reg_set(
+		a_uint32_t dev_id,
+		union edma_vlan_tpid_reg_u *value)
+{
+	return hppe_reg_set(
+				dev_id,
+				EDMA_CSR_BASE_ADDR + EDMA_VLAN_TPID_REG_ADDRESS,
+				value->val);
+}
+
+sw_error_t
 hppe_vlan_tpid_reg_get(
 		a_uint32_t dev_id,
 		union vlan_tpid_reg_u *value)
@@ -3401,6 +3423,35 @@ hppe_eg_bridge_config_bridge_type_set(
 	if (SW_OK != ret)
 		return ret;
 	reg_val.bf.bridge_type = value;
+	ret = hppe_eg_bridge_config_set(dev_id, &reg_val);
+	return ret;
+}
+
+sw_error_t
+hppe_eg_bridge_config_pkt_l2_edit_en_get(
+		a_uint32_t dev_id,
+		a_uint32_t *value)
+{
+	union eg_bridge_config_u reg_val;
+	sw_error_t ret = SW_OK;
+
+	ret = hppe_eg_bridge_config_get(dev_id, &reg_val);
+	*value = reg_val.bf.pkt_l2_edit_en;
+	return ret;
+}
+
+sw_error_t
+hppe_eg_bridge_config_pkt_l2_edit_en_set(
+		a_uint32_t dev_id,
+		a_uint32_t value)
+{
+	union eg_bridge_config_u reg_val;
+	sw_error_t ret = SW_OK;
+
+	ret = hppe_eg_bridge_config_get(dev_id, &reg_val);
+	if (SW_OK != ret)
+		return ret;
+	reg_val.bf.pkt_l2_edit_en = value;
 	ret = hppe_eg_bridge_config_set(dev_id, &reg_val);
 	return ret;
 }

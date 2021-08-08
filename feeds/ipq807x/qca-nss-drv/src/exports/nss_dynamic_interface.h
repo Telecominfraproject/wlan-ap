@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2014-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -40,10 +40,10 @@
 enum nss_dynamic_interface_type {
 	NSS_DYNAMIC_INTERFACE_TYPE_NONE,
 	NSS_DYNAMIC_INTERFACE_TYPE_GRE_REDIR,
-	NSS_DYNAMIC_INTERFACE_TYPE_CAPWAP,
+	NSS_DYNAMIC_INTERFACE_TYPE_RESERVED_5,
 	NSS_DYNAMIC_INTERFACE_TYPE_TUNIPIP6_INNER,
 	NSS_DYNAMIC_INTERFACE_TYPE_TUNIPIP6_OUTER,
-	NSS_DYNAMIC_INTERFACE_TYPE_WIFI,
+	NSS_DYNAMIC_INTERFACE_TYPE_RESERVED,
 	NSS_DYNAMIC_INTERFACE_TYPE_VAP,
 	NSS_DYNAMIC_INTERFACE_TYPE_RESERVED_0,
 	NSS_DYNAMIC_INTERFACE_TYPE_PPPOE,
@@ -105,6 +105,11 @@ enum nss_dynamic_interface_type {
 	NSS_DYNAMIC_INTERFACE_TYPE_TLS_OUTER,
 	NSS_DYNAMIC_INTERFACE_TYPE_MIRROR,
 	NSS_DYNAMIC_INTERFACE_TYPE_WIFI_EXT_VDEV_WDS,
+	NSS_DYNAMIC_INTERFACE_TYPE_CAPWAP_HOST_INNER,
+	NSS_DYNAMIC_INTERFACE_TYPE_CAPWAP_OUTER,
+	NSS_DYNAMIC_INTERFACE_TYPE_WIFI_EXT_VDEV_VLAN,
+	NSS_DYNAMIC_INTERFACE_TYPE_WIFI_MESH_INNER,
+	NSS_DYNAMIC_INTERFACE_TYPE_WIFI_MESH_OUTER,
 	NSS_DYNAMIC_INTERFACE_TYPE_MAX
 };
 

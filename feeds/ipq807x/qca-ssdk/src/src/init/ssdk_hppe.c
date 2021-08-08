@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2014-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012, 2014-2019, 2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -38,8 +38,13 @@ static sw_error_t qca_hppe_fdb_hw_init(a_uint32_t dev_id)
 	SW_RTN_ON_NULL(p_api->adpt_port_bridge_txmac_set);
 
 	for(port = SSDK_PHYSICAL_PORT0; port <= SSDK_PHYSICAL_PORT7; port++) {
-		fal_fdb_port_learning_ctrl_set(dev_id, port, A_TRUE, FAL_MAC_FRWRD);
-		fal_fdb_port_stamove_ctrl_set(dev_id, port, A_TRUE, FAL_MAC_FRWRD);
+		if(port == SSDK_PHYSICAL_PORT0) {
+			fal_fdb_port_learning_ctrl_set(dev_id, port, A_FALSE, FAL_MAC_FRWRD);
+			fal_fdb_port_stamove_ctrl_set(dev_id, port, A_FALSE, FAL_MAC_FRWRD);
+		} else {
+			fal_fdb_port_learning_ctrl_set(dev_id, port, A_TRUE, FAL_MAC_FRWRD);
+			fal_fdb_port_stamove_ctrl_set(dev_id, port, A_TRUE, FAL_MAC_FRWRD);
+		}
 		fal_portvlan_member_update(dev_id, port, 0x7f);
 		if (port == SSDK_PHYSICAL_PORT0 || port == SSDK_PHYSICAL_PORT7) {
 			p_api->adpt_port_bridge_txmac_set(dev_id, port, A_TRUE);
@@ -143,12 +148,17 @@ static sw_error_t
 qca_hppe_policer_hw_init(a_uint32_t dev_id)
 {
 	a_uint32_t i = 0;
+	fal_policer_frame_type_t frame_type;
 
 	fal_policer_timeslot_set(dev_id, HPPE_POLICER_TIMESLOT_DFT);
 
 	for (i = SSDK_PHYSICAL_PORT0; i <= SSDK_PHYSICAL_PORT7; i++) {
 		fal_port_policer_compensation_byte_set(dev_id, i, 4);
 	}
+
+	/* bypass policer for dropped frame */
+	frame_type = FAL_FRAME_DROPPED;
+	fal_policer_bypass_en_set(dev_id, frame_type, A_TRUE);
 
 	return SW_OK;
 }
@@ -755,10 +765,10 @@ qca_hppe_qm_hw_init(a_uint32_t dev_id)
 	fal_ucast_queue_base_profile_set(dev_id, &queue_dst, 8, 0);
 
 	queue_dst.service_code = 3;
-	fal_ucast_queue_base_profile_set(dev_id, &queue_dst, 128, 0);
+	fal_ucast_queue_base_profile_set(dev_id, &queue_dst, 128, 8);
 
 	queue_dst.service_code = 4;
-	fal_ucast_queue_base_profile_set(dev_id, &queue_dst, 128, 0);
+	fal_ucast_queue_base_profile_set(dev_id, &queue_dst, 128, 8);
 
 	queue_dst.service_code = 5;
 	fal_ucast_queue_base_profile_set(dev_id, &queue_dst, 0, 0);
@@ -793,7 +803,7 @@ qca_hppe_qm_hw_init(a_uint32_t dev_id)
 		if (i == 2 || i == 6) {
 			fal_ucast_queue_base_profile_set(dev_id, &queue_dst, 8, 0);
 		} else if (i == 3 || i == 4) {
-			fal_ucast_queue_base_profile_set(dev_id, &queue_dst, 128, 0);
+			fal_ucast_queue_base_profile_set(dev_id, &queue_dst, 128, 8);
 		} else {
 			fal_ucast_queue_base_profile_set(dev_id, &queue_dst, 4, 0);
 		}
@@ -1025,8 +1035,8 @@ sw_error_t qca_hppe_acl_remark_ptp_servcode(a_uint32_t dev_id) {
 			LIST_PRI_TAG_SERVICE_CODE_PTP);
 	SW_RTN_ON_ERROR(ret);
 
-	/* Set up UDF0 profile */
-	ret = fal_acl_udf_profile_set(dev_id, FAL_ACL_UDF_NON_IP, 0, FAL_ACL_UDF_TYPE_L3, 0);
+	/* Set up UDF2 profile */
+	ret = fal_acl_udf_profile_set(dev_id, FAL_ACL_UDF_NON_IP, 2, FAL_ACL_UDF_TYPE_L3, 0);
 	SW_RTN_ON_ERROR(ret);
 
 	/* Tag service code for PTP packet */
@@ -1044,11 +1054,10 @@ sw_error_t qca_hppe_acl_remark_ptp_servcode(a_uint32_t dev_id) {
 	FAL_FIELD_FLG_SET(entry.field_flg, FAL_ACL_FIELD_MAC_ETHTYPE);
 
 	for (msg_type = PTP_MSG_SYNC; msg_type <= PTP_MSG_PRESP; msg_type++) {
-		/* L2 UDF0 for msg type */
-		entry.udf0_op = FAL_ACL_FIELD_MASK;
-		entry.udf0_val = (msg_type << 0x8);
-		entry.udf0_mask = 0x0f00;
-		FAL_FIELD_FLG_SET(entry.field_flg, FAL_ACL_FIELD_UDF0);
+		/* L2 UDF2 for msg type */
+		entry.udf2_val = (msg_type << 0x8);
+		entry.udf2_mask = 0x0f00;
+		FAL_FIELD_FLG_SET(entry.field_flg, FAL_ACL_FIELD_UDF2);
 
 		/* Add PTP L2 rule to ACL list */
 		ret = fal_acl_rule_add(dev_id, LIST_ID_L2_TAG_SERVICE_CODE_PTP,
@@ -1058,7 +1067,7 @@ sw_error_t qca_hppe_acl_remark_ptp_servcode(a_uint32_t dev_id) {
 
 	/* Unset L2 PTP ethernet type 0x88f7 */
 	index = 0;
-	FAL_FIELD_FLG_CLR(entry.field_flg, FAL_ACL_FIELD_UDF0);
+	FAL_FIELD_FLG_CLR(entry.field_flg, FAL_ACL_FIELD_UDF2);
 	FAL_FIELD_FLG_CLR(entry.field_flg, FAL_ACL_FIELD_MAC_ETHTYPE);
 
 	/* Create PTP ACL L4 list */
@@ -1138,6 +1147,7 @@ qca_hppe_interface_mode_init(a_uint32_t dev_id, a_uint32_t mode0, a_uint32_t mod
 	sw_error_t rv = SW_OK;
 	fal_port_t port_id;
 	a_uint32_t port_max = SSDK_PHYSICAL_PORT7;
+	a_uint32_t index = 0, mode[3] = {mode0, mode1, mode2};
 
 	SW_RTN_ON_NULL(p_api = adpt_api_ptr_get(dev_id));
 	SW_RTN_ON_NULL(p_api->adpt_port_mux_mac_type_set);
@@ -1154,6 +1164,11 @@ qca_hppe_interface_mode_init(a_uint32_t dev_id, a_uint32_t mode0, a_uint32_t mod
 		rv = p_api->adpt_uniphy_mode_set(dev_id,
 			SSDK_UNIPHY_INSTANCE2, mode2);
 		SW_RTN_ON_ERROR(rv);
+	}
+	for (index = SSDK_UNIPHY_INSTANCE0; index <= SSDK_UNIPHY_INSTANCE2; index ++) {
+		if (mode[index] == PORT_WRAPPER_MAX) {
+			ssdk_gcc_uniphy_sys_set(dev_id, index, A_FALSE);
+		}
 	}
 
 	if(adpt_hppe_chip_revision_get(dev_id) == CPPE_REVISION) {

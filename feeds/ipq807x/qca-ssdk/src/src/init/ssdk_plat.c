@@ -948,16 +948,16 @@ void ssdk_dts_phyinfo_dump(a_uint32_t dev_id)
 					port_phyinfo->phy_addr, 5, "");
 			for (j = 0; j < QCA_PHY_FEATURE_MAX; j++) {
 				if (port_phyinfo->phy_features & BIT(j) && BIT(j) != PHY_F_INIT) {
-					printk("%s ", qca_phy_feature_str[j]);
+					printk(KERN_CONT "%s ", qca_phy_feature_str[j]);
 					if (BIT(j) == PHY_F_FORCE) {
-						printk("(speed: %d, duplex: %s) ",
+						printk(KERN_CONT "(speed: %d, duplex: %s) ",
 								port_phyinfo->port_speed,
 								port_phyinfo->port_duplex > 0 ?
 								"full" : "half");
 					}
 				}
 			}
-			printk("\n");
+			printk(KERN_CONT "\n");
 		}
 	}
 }

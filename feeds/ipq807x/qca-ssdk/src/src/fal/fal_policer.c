@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2017, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2017, 2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -131,6 +131,23 @@ _fal_policer_timeslot_get(a_uint32_t dev_id, a_uint32_t *timeslot)
     rv = p_api->adpt_policer_time_slot_get(dev_id, timeslot);
     return rv;
 }
+
+sw_error_t
+_fal_policer_bypass_en_get(a_uint32_t dev_id, fal_policer_frame_type_t frame_type,
+	a_bool_t *enable)
+{
+	adpt_api_t *p_api;
+	sw_error_t rv = SW_OK;
+
+	SW_RTN_ON_NULL(p_api = adpt_api_ptr_get(dev_id));
+
+	if (NULL == p_api->adpt_policer_bypass_en_get)
+		return SW_NOT_SUPPORTED;
+
+	rv = p_api->adpt_policer_bypass_en_get(dev_id, frame_type, enable);
+	return rv;
+}
+
 #endif
 sw_error_t
 _fal_policer_timeslot_set(a_uint32_t dev_id, a_uint32_t timeslot)
@@ -145,6 +162,22 @@ _fal_policer_timeslot_set(a_uint32_t dev_id, a_uint32_t timeslot)
 
     rv = p_api->adpt_policer_time_slot_set(dev_id, timeslot);
     return rv;
+}
+
+sw_error_t
+_fal_policer_bypass_en_set(a_uint32_t dev_id, fal_policer_frame_type_t frame_type,
+	a_bool_t enable)
+{
+	adpt_api_t *p_api;
+	sw_error_t rv = SW_OK;
+
+	SW_RTN_ON_NULL(p_api = adpt_api_ptr_get(dev_id));
+
+	if (NULL == p_api->adpt_policer_bypass_en_set)
+		return SW_NOT_SUPPORTED;
+
+	rv = p_api->adpt_policer_bypass_en_set(dev_id, frame_type, enable);
+	return rv;
 }
 
 #ifndef IN_POLICER_MINI
@@ -276,6 +309,18 @@ fal_policer_timeslot_get(a_uint32_t dev_id, a_uint32_t *timeslot)
     FAL_API_UNLOCK;
     return rv;
 }
+
+sw_error_t
+fal_policer_bypass_en_get(a_uint32_t dev_id, fal_policer_frame_type_t frame_type,
+	a_bool_t *enable)
+{
+    sw_error_t rv = SW_OK;
+
+    FAL_API_LOCK;
+    rv = _fal_policer_bypass_en_get(dev_id, frame_type, enable);
+    FAL_API_UNLOCK;
+    return rv;
+}
 #endif
 sw_error_t
 fal_policer_timeslot_set(a_uint32_t dev_id, a_uint32_t timeslot)
@@ -284,6 +329,18 @@ fal_policer_timeslot_set(a_uint32_t dev_id, a_uint32_t timeslot)
 
     FAL_API_LOCK;
     rv = _fal_policer_timeslot_set(dev_id, timeslot);
+    FAL_API_UNLOCK;
+    return rv;
+}
+
+sw_error_t
+fal_policer_bypass_en_set(a_uint32_t dev_id, fal_policer_frame_type_t frame_type,
+	a_bool_t enable)
+{
+    sw_error_t rv = SW_OK;
+
+    FAL_API_LOCK;
+    rv = _fal_policer_bypass_en_set(dev_id, frame_type, enable);
     FAL_API_UNLOCK;
     return rv;
 }
@@ -336,8 +393,10 @@ EXPORT_SYMBOL(fal_acl_policer_entry_set);
 EXPORT_SYMBOL(fal_policer_timeslot_get);
 EXPORT_SYMBOL(fal_port_policer_compensation_byte_get);
 EXPORT_SYMBOL(fal_policer_global_counter_get);
+EXPORT_SYMBOL(fal_policer_bypass_en_get);
 #endif
 EXPORT_SYMBOL(fal_policer_timeslot_set);
 EXPORT_SYMBOL(fal_port_policer_compensation_byte_set);
+EXPORT_SYMBOL(fal_policer_bypass_en_set);
 
 /*insert flag for outter fal, don't remove it*/

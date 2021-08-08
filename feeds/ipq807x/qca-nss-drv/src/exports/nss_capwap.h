@@ -139,8 +139,8 @@ struct nss_capwap_stats_msg {
 
 	uint32_t rx_frag_timeout_drops;
 			/**< Packets dropped because of a reassembly timeout. */
-	uint32_t rx_queue_full_drops;
-			/**< Packets dropped because the queue is full. */
+	uint32_t rx_n2h_drops;
+			/**< Packets dropped because of error in packet processing. */
 	uint32_t rx_n2h_queue_full_drops;
 			/**< Packets dropped because the NSS-to-host queue is full. */
 	uint32_t rx_csum_drops;
@@ -298,6 +298,14 @@ struct nss_capwap_flow_rule_msg {
 };
 
 /**
+ * nss_capwap_enable_tunnel_msg
+ *	Structure to update sibling interface number.
+ */
+struct nss_capwap_enable_tunnel_msg {
+	uint32_t sibling_if_num; /**< Sibling interface Number. */
+};
+
+/**
  * nss_capwap_msg
  *	Data for sending and receiving CAPWAP messages.
  */
@@ -322,6 +330,8 @@ struct nss_capwap_msg {
 				/**< Flow rule add message. */
 		struct nss_capwap_flow_rule_msg flow_rule_del;
 				/**< Flow rule delete message. */
+		struct nss_capwap_enable_tunnel_msg enable_tunnel;
+				/**< Enable tunnel message. */
 	} msg;			/**< Message payload. */
 };
 
@@ -358,8 +368,8 @@ struct nss_capwap_tunnel_stats {
 
 	uint64_t rx_frag_timeout_drops;
 			/**< Packets dropped because of a reassembly timeout. */
-	uint64_t rx_queue_full_drops;
-			/**< Packets dropped because the queue is full. */
+	uint64_t rx_n2h_drops;
+			/**< Packets dropped because of error in processing the packet. */
 	uint64_t rx_n2h_queue_full_drops;
 			/**< Packets dropped because the NSS-to-host queue is full. */
 	uint64_t rx_csum_drops;
@@ -374,6 +384,7 @@ struct nss_capwap_tunnel_stats {
 	/*
 	 * Tx/encap stats
 	 */
+	uint64_t tx_dropped_inner;	/**<Packets dropped due to inflow queue full. */
 	uint64_t tx_segments;		/**< Number of segments or fragments. */
 	uint64_t tx_queue_full_drops;
 			/**< Packets dropped because the queue is full. */

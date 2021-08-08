@@ -72,7 +72,7 @@ extern "C"
 #define MPGE_PHY_MMD3_CDT_THRESH_CTRL13           0x807e
 #define MPGE_PHY_MMD3_CDT_THRESH_CTRL14           0x807f
 
-    /*MMD3 register field*/
+/*MMD3 register field*/
 #define MPGE_PHY_MMD3_AZ_CTRL1_VAL                0x7880
 #define MPGE_PHY_MMD3_AZ_CTRL2_VAL                0xc8
 #define MPGE_PHY_MMD3_CDT_THRESH_CTRL3_VAL        0xc040
@@ -86,6 +86,12 @@ extern "C"
 
 /*debug register*/
 #define MPGE_PHY_DEBUG_EDAC                       0x4380
+
+/*debug port analog*/
+#define MPGE_PHY_DEBUG_ANA_LDO_EFUSE              0x180
+#define MPGE_PHY_DEBUG_ANA_DAC_FILTER             0xa080
+
+#define MPGE_PHY_DEBUG_ANA_LDO_EFUSE_DEFAULT      0x50
 
 int mpge_phy_init(a_uint32_t dev_id, a_uint32_t port_bmp);
 

@@ -43,6 +43,34 @@ union port_parsing_reg_u {
 	struct port_parsing_reg bf;
 };
 
+/*[register] EDMA_VLAN_TPID_REG*/
+#define EDMA_VLAN_TPID_REG
+#define EDMA_VLAN_TPID_REG_ADDRESS 0x8
+#define EDMA_VLAN_TPID_REG_NUM     1
+#define EDMA_VLAN_TPID_REG_INC     0x4
+#define EDMA_VLAN_TPID_REG_TYPE    REG_TYPE_RW
+#define EDMA_VLAN_TPID_REG_DEFAULT 0x810088a8
+	/*[field] STAG_TPID*/
+	#define EDMA_VLAN_TPID_REG_STAG_TPID
+	#define EDMA_VLAN_TPID_REG_STAG_TPID_OFFSET  0
+	#define EDMA_VLAN_TPID_REG_STAG_TPID_LEN     16
+	#define EDMA_VLAN_TPID_REG_STAG_TPID_DEFAULT 0x88a8
+	/*[field] CTAG_TPID*/
+	#define EDMA_VLAN_TPID_REG_CTAG_TPID
+	#define EDMA_VLAN_TPID_REG_CTAG_TPID_OFFSET  16
+	#define EDMA_VLAN_TPID_REG_CTAG_TPID_LEN     16
+	#define EDMA_VLAN_TPID_REG_CTAG_TPID_DEFAULT 0x8100
+
+struct edma_vlan_tpid_reg {
+	a_uint32_t  stag_tpid:16;
+	a_uint32_t  ctag_tpid:16;
+};
+
+union edma_vlan_tpid_reg_u {
+	a_uint32_t val;
+	struct edma_vlan_tpid_reg bf;
+};
+
 /*[register] VLAN_TPID_REG*/
 #define VLAN_TPID_REG
 #define VLAN_TPID_REG_ADDRESS 0x20
@@ -869,11 +897,11 @@ union eg_vlan_tpid_u {
 	#define EG_BRIDGE_CONFIG_BRIDGE_TYPE_OFFSET  0
 	#define EG_BRIDGE_CONFIG_BRIDGE_TYPE_LEN     1
 	#define EG_BRIDGE_CONFIG_BRIDGE_TYPE_DEFAULT 0x0
-	/*[field] PKT_LE_EDIT_BYPASS*/
-	#define EG_BRIDGE_CONFIG_PKT_LE_EDIT_BYPASS
-	#define EG_BRIDGE_CONFIG_PKT_LE_EDIT_BYPASS_OFFSET  1
-	#define EG_BRIDGE_CONFIG_PKT_LE_EDIT_BYPASS_LEN     1
-	#define EG_BRIDGE_CONFIG_PKT_LE_EDIT_BYPASS_DEFAULT 0x0
+	/*[field] PKT_L2_EDIT_EN*/
+	#define EG_BRIDGE_CONFIG_PKT_L2_EDIT_EN
+	#define EG_BRIDGE_CONFIG_PKT_L2_EDIT_EN_OFFSET  1
+	#define EG_BRIDGE_CONFIG_PKT_L2_EDIT_EN_LEN     1
+	#define EG_BRIDGE_CONFIG_PKT_L2_EDIT_EN_DEFAULT 0x0
 	/*[field] QUEUE_CNT_EN*/
 	#define EG_BRIDGE_CONFIG_QUEUE_CNT_EN
 	#define EG_BRIDGE_CONFIG_QUEUE_CNT_EN_OFFSET  2
@@ -882,7 +910,7 @@ union eg_vlan_tpid_u {
 
 struct eg_bridge_config {
 	a_uint32_t  bridge_type:1;
-	a_uint32_t  pkt_le_edit_bypass:1;
+	a_uint32_t  pkt_l2_edit_en:1;
 	a_uint32_t  queue_cnt_en:1;
 	a_uint32_t  _reserved0:29;
 };

@@ -43,6 +43,8 @@ enum nss_wifi_mac_db_msg_types {
 	NSS_WIFI_MAC_DB_UPDATE_ENTRY_MSG,	/**< Wi-Fi MAC database update entry message. */
 	NSS_WIFI_MAC_DB_DEINIT_MSG,		/**< Wi-Fi MAC database deinitialization message. */
 	NSS_WIFI_MAC_DB_GROUP_ENTRIES_ADD_MSG,	/**< Wi-Fi MAC database group entries add message. */
+	NSS_WIFI_MAC_DB_ENTRY_ACTIVITY_MSG,	/**< Wi-Fi MAC database entry activity message. */
+	NSS_WIFI_MAC_DB_CREATE_ENTRY_MSG,	/**< Wi-Fi MAC database entry create message. */
 	NSS_WIFI_MAC_DB_MAX_MSG
 };
 
@@ -69,9 +71,8 @@ enum nss_wifi_mac_db_if_opmode {
 	NSS_WIFI_MAC_DB_ENTRY_IF_OPMODE_MAX	/**< Maximum entry database interface operation mode. */
 };
 
-/*
- * nss_wifi_mac_db_err_types
- *	Wi-Fi MAC database erros.
+/**
+ * Wi-Fi MAC database errors.
  */
 enum nss_wifi_mac_db_err_types {
 	NSS_WIFI_MAC_DB_ERROR_NONE,
@@ -113,11 +114,41 @@ enum nss_wifi_mac_db_err_types {
 };
 
 /**
+ * nss_wifi_mac_db_entry_create_msg
+ * 	Wi-Fi MAC database entry create message.
+ */
+struct nss_wifi_mac_db_entry_create_msg {
+	uint8_t mac_addr[ETH_ALEN];			/**< MAC address. */
+	uint16_t reserved;				/**< Reserved bytes. */
+	int32_t nss_if;					/**< NSS interface number. */
+};
+
+/**
+ * nss_wifi_mac_db_entry_activity_info
+ * 	Wi-Fi MAC database entry activity information.
+ */
+struct nss_wifi_mac_db_entry_activity_info {
+	uint8_t mac_addr[ETH_ALEN];			/**< MAC address. */
+	uint16_t reserved;				/**< Reserved bytes. */
+	int32_t nss_if;					/**< NSS interface number. */
+};
+
+/**
+ * nss_wifi_mac_db_entry_activity_info_msg
+ * 	Wi-Fi MAC database entry activity information message.
+ */
+struct nss_wifi_mac_db_entry_activity_info_msg {
+	uint32_t nentries;		/**< Number of entries. */
+	struct nss_wifi_mac_db_entry_activity_info info[1];
+					/**< Wi-Fi MAC database entry activity information. */
+};
+
+/**
  * nss_wifi_mac_db_entry_info_msg
  *	Wi-Fi MAC database entry information.
  */
 struct nss_wifi_mac_db_entry_info_msg {
-	uint8_t mac_addr[6];		/**< MAC address. */
+	uint8_t mac_addr[ETH_ALEN];	/**< MAC address. */
 	uint16_t flag;			/**< Flag information about NSS interface. */
 	int32_t nss_if;		    	/**< NSS interface number. */
 	uint32_t iftype;		/**< NSS interface type. */
@@ -151,6 +182,10 @@ struct nss_wifi_mac_db_msg {
 				/**< Wi-Fi MAC database information specific message. */
 		struct nss_wifi_mac_db_entry_group_info_msg nmfdbegimsg;
 				/**< Wi-Fi MAC database information specific message. */
+		struct nss_wifi_mac_db_entry_activity_info_msg nmfdbeact_imsg;
+				/**< Wi-Fi MAC database entry activity information message. */
+		struct nss_wifi_mac_db_entry_create_msg nmfdbecmsg;
+				/**< Wi-Fi MAC database entry create message. */
 	} msg;			/**< Message payload. */
 };
 

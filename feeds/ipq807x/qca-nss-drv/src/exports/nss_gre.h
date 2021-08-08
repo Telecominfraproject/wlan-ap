@@ -1,6 +1,6 @@
 /*
- **************************************************************************
- * Copyright (c) 2017-2019, The Linux Foundation. All rights reserved.
+ ****************************************************************************
+ * Copyright (c) 2017-2019, 2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -11,7 +11,7 @@
  * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
  * OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
- **************************************************************************
+ ****************************************************************************
  */
 
 /**
@@ -119,47 +119,49 @@ enum nss_gre_ip_types {
 };
 
 /**
- * GRE Base debug statistics
+ * nss_gre_base_types
+ *	GRE base debug statistics.
  */
-enum nss_gre_base_debug_types {
-	GRE_BASE_RX_PACKETS,			/**< Rx packet count. */
-	GRE_BASE_RX_DROPPED,			/**< Number of packet dropped at Rx. */
-	GRE_BASE_EXP_ETH_HDR_MISSING,		/**< Ethernet header missing. */
-	GRE_BASE_EXP_ETH_TYPE_NON_IP,		/**< Packet is not IPV4 or IPV6. */
-	GRE_BASE_EXP_IP_UNKNOWN_PROTOCOL,	/**< Packet protocol is unknown. */
-	GRE_BASE_EXP_IP_HEADER_INCOMPLETE,	/**< Bad IP header. */
-	GRE_BASE_EXP_IP_BAD_TOTAL_LENGTH,	/**< IP total lenghth is invalid. */
-	GRE_BASE_EXP_IP_BAD_CHECKSUM,		/**< IP checksum is bad. */
-	GRE_BASE_EXP_IP_DATAGRAM_INCOMPLETE,	/**< Bad packet. */
-	GRE_BASE_EXP_IP_FRAGMENT,		/**< IP packet is a fragment. */
-	GRE_BASE_EXP_IP_OPTIONS_INCOMPLETE,	/**< IP option is invalid. */
-	GRE_BASE_EXP_IP_WITH_OPTIONS,		/**< IP packet with options. */
-	GRE_BASE_EXP_IPV6_UNKNOWN_PROTOCOL,	/**< Protocol is unknown. */
-	GRE_BASE_EXP_IPV6_HEADER_INCOMPLETE,	/**< Incomplete ipv6 header. */
-	GRE_BASE_EXP_GRE_UNKNOWN_SESSION,	/**< Unknown GRE session. */
-	GRE_BASE_EXP_GRE_NODE_INACTIVE,		/**< GRE node is inactive. */
-	GRE_BASE_DEBUG_MAX,			/**< GRE base debug max. */
+enum nss_gre_base_types {
+	NSS_GRE_BASE_RX_PACKETS,		/**< Receive packet count. */
+	NSS_GRE_BASE_RX_DROPPED,		/**< Number of packet dropped at receive. */
+	NSS_GRE_BASE_EXP_ETH_HDR_MISSING,	/**< Ethernet header missing. */
+	NSS_GRE_BASE_EXP_ETH_TYPE_NON_IP,	/**< Packet is not IPV4 or IPV6. */
+	NSS_GRE_BASE_EXP_IP_UNKNOWN_PROTOCOL,	/**< Packet protocol is unknown. */
+	NSS_GRE_BASE_EXP_IP_HEADER_INCOMPLETE,	/**< Bad IP header. */
+	NSS_GRE_BASE_EXP_IP_BAD_TOTAL_LENGTH,	/**< IP total length is invalid. */
+	NSS_GRE_BASE_EXP_IP_BAD_CHECKSUM,	/**< IP checksum is bad. */
+	NSS_GRE_BASE_EXP_IP_DATAGRAM_INCOMPLETE,/**< Bad packet. */
+	NSS_GRE_BASE_EXP_IP_FRAGMENT,		/**< IP packet is a fragment. */
+	NSS_GRE_BASE_EXP_IP_OPTIONS_INCOMPLETE,	/**< IP option is invalid. */
+	NSS_GRE_BASE_EXP_IP_WITH_OPTIONS,	/**< IP packet with options. */
+	NSS_GRE_BASE_EXP_IPV6_UNKNOWN_PROTOCOL,	/**< Protocol is unknown. */
+	NSS_GRE_BASE_EXP_IPV6_HEADER_INCOMPLETE,/**< Incomplete ipv6 header. */
+	NSS_GRE_BASE_EXP_GRE_UNKNOWN_SESSION,	/**< Unknown GRE session. */
+	NSS_GRE_BASE_EXP_GRE_NODE_INACTIVE,	/**< GRE node is inactive. */
+	NSS_GRE_BASE_DEBUG_MAX,			/**< GRE base debug maximum. */
 };
 
-/*
- * GRE session Packet drop and exception events.
+/**
+ * nss_gre_session_types
+ *	GRE session packet drop and exception events.
  */
-enum gre_session_debug_types {
-	GRE_SESSION_PBUF_ALLOC_FAIL,		/**< Pbuf allocation failure. */
-	GRE_SESSION_DECAP_FORWARD_ENQUEUE_FAIL,	/**< Rx forward enqueue failure. */
-	GRE_SESSION_ENCAP_FORWARD_ENQUEUE_FAIL,	/**< Tx forward enqueue failure. */
-	GRE_SESSION_DECAP_TX_FORWARDED,		/**< Number of packets forwarded after decap. */
-	GRE_SESSION_ENCAP_RX_RECEIVED,		/**< Number of packets received for encap. */
-	GRE_SESSION_ENCAP_RX_DROPPED,		/**< Packets dropped while enqueuing for encap. */
-	GRE_SESSION_ENCAP_RX_LINEAR_FAIL,	/**< Packets dropped during encap linearization. */
-	GRE_SESSION_EXP_RX_KEY_ERROR,		/**< Rx KEY error. */
-	GRE_SESSION_EXP_RX_SEQ_ERROR,		/**< Rx Sequence number error. */
-	GRE_SESSION_EXP_RX_CS_ERROR,		/**< Rx checksum error */
-	GRE_SESSION_EXP_RX_FLAG_MISMATCH,	/**< Rx flag mismatch. */
-	GRE_SESSION_EXP_RX_MALFORMED,		/**< Rx packet is malformed. */
-	GRE_SESSION_EXP_RX_INVALID_PROTOCOL,	/**< Rx packet protocol is invalid. */
-	GRE_SESSION_EXP_RX_NO_HEADROOM,		/**< Packet does not have enough headroom. */
-	GRE_SESSION_DEBUG_MAX,			/**< Session debug max. */
+enum nss_gre_session_types {
+	NSS_GRE_SESSION_PBUF_ALLOC_FAIL,		/**< Pbuf allocation failure. */
+	NSS_GRE_SESSION_DECAP_FORWARD_ENQUEUE_FAIL,	/**< Receive forward enqueue failure. */
+	NSS_GRE_SESSION_ENCAP_FORWARD_ENQUEUE_FAIL,	/**< Transmit forward enqueue failure. */
+	NSS_GRE_SESSION_DECAP_TX_FORWARDED,		/**< Number of packets forwarded after decapsulation. */
+	NSS_GRE_SESSION_ENCAP_RX_RECEIVED,		/**< Number of packets received for encapsulation. */
+	NSS_GRE_SESSION_ENCAP_RX_DROPPED,		/**< Packets dropped while enqueuing for encapsulation. */
+	NSS_GRE_SESSION_ENCAP_RX_LINEAR_FAIL,		/**< Packets dropped during encapsulation linearization. */
+	NSS_GRE_SESSION_EXP_RX_KEY_ERROR,		/**< Receive key error. */
+	NSS_GRE_SESSION_EXP_RX_SEQ_ERROR,		/**< Receive Sequence number error. */
+	NSS_GRE_SESSION_EXP_RX_CS_ERROR,		/**< Receive checksum error */
+	NSS_GRE_SESSION_EXP_RX_FLAG_MISMATCH,		/**< Receive flag mismatch. */
+	NSS_GRE_SESSION_EXP_RX_MALFORMED,		/**< Receive packet is malformed. */
+	NSS_GRE_SESSION_EXP_RX_INVALID_PROTOCOL,	/**< Receive packet protocol is invalid. */
+	NSS_GRE_SESSION_EXP_RX_NO_HEADROOM,		/**< Packet does not have enough headroom. */
+	NSS_GRE_SESSION_DEBUG_MAX,			/**< Session debug maximum. */
 };
 
 /**
@@ -207,15 +209,34 @@ struct nss_gre_deconfig_msg {
  * GRE session statistics message
  */
 struct nss_gre_session_stats_msg {
-	struct nss_cmn_node_stats node_stats;	/**< Common node statistics. */
-	uint32_t stats[GRE_SESSION_DEBUG_MAX];	/**< Session debug statistics. */
+	struct nss_cmn_node_stats node_stats;		/**< Common node statistics. */
+	uint32_t stats[NSS_GRE_SESSION_DEBUG_MAX];	/**< Session debug statistics. */
 };
 
 /**
  * GRE base statistics message
  */
 struct nss_gre_base_stats_msg {
-	uint32_t stats[GRE_BASE_DEBUG_MAX];	/**< Base debug statistics. */
+	uint32_t stats[NSS_GRE_BASE_DEBUG_MAX];		/**< Base debug statistics. */
+};
+
+/**
+ * nss_gre_base_stats_notification
+ *	GRE transmission statistics structure.
+ */
+struct nss_gre_base_stats_notification {
+	uint64_t stats_base_ctx[NSS_GRE_BASE_DEBUG_MAX];	/**< Base debug transmission statistics. */
+	uint32_t core_id;					/**< Core ID. */
+};
+
+/**
+ * nss_gre_session_stats_notification
+ *	GRE transmission statistics structure.
+ */
+struct nss_gre_session_stats_notification {
+	uint64_t stats_session_ctx[NSS_GRE_SESSION_DEBUG_MAX];		/**< Session debug transmission statistics. */
+	uint32_t core_id;						/**< Core ID. */
+	uint32_t if_num;						/**< Interface number. */
 };
 
 /**
@@ -437,6 +458,34 @@ extern void nss_gre_register_pkt_callback(nss_gre_pkt_callback_t cb);
  * None.
  */
 extern void nss_gre_unregister_pkt_callback(void);
+
+/**
+ * nss_gre_stats_unregister_notifier
+ *	Deregisters a statistics notifier.
+ *
+ * @datatypes
+ *	notifier_block
+ *
+ * @param[in] nb Notifier block.
+ *
+ * @return
+ * 0 on success or non-zero on failure.
+ */
+extern int nss_gre_stats_unregister_notifier(struct notifier_block *nb);
+
+/**
+ * nss_gre_stats_register_notifier
+ *	Registers a statistics notifier.
+ *
+ * @datatypes
+ *	notifier_block
+ *
+ * @param[in] nb Notifier block.
+ *
+ * @return
+ * 0 on success or non-zero on failure.
+ */
+extern int nss_gre_stats_register_notifier(struct notifier_block *nb);
 
 /**
  * @}

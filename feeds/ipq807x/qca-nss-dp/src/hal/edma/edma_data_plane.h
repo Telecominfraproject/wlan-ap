@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2016, 2018-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016, 2018-2021, The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -30,7 +30,7 @@
 #define EDMA_NAPI_WORK			100
 #define EDMA_START_GMACS		NSS_DP_START_IFNUM
 #define EDMA_MAX_GMACS			NSS_DP_HAL_MAX_PORTS
-#define EDMA_TX_PKT_MIN_SIZE		33
+#define EDMA_TX_PKT_MIN_SIZE		33	/* IPQ807x EDMA needs a minimum packet size of 33 bytes */
 #if defined(NSS_DP_IPQ60XX)
 #define EDMA_MAX_TXCMPL_RINGS		24	/* Max TxCmpl rings */
 #else

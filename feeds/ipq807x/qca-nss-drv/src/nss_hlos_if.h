@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2013-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2019, 2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -33,7 +33,11 @@
  */
 #if defined (NSS_MEM_PROFILE_LOW)
 #define NSS_DEFAULT_NUM_CONN			512		/* Default number of connections for IPv4 and IPv6 each, for low memory profile */
+#if defined (NSS_DRV_IPV6_ENABLE)
 #define NSS_MAX_TOTAL_NUM_CONN_IPV4_IPV6	1024		/* MAX Connection shared between IPv4 and IPv6 for low memory profile */
+#else
+#define NSS_MAX_TOTAL_NUM_CONN_IPV4_IPV6	512		/* MAX Connection for IPv4 for low memory profile */
+#endif
 #define NSS_LOW_MEM_EMPTY_POOL_BUF_SZ		4096		/* Default empty buffer pool size for low profile */
 #elif defined (NSS_MEM_PROFILE_MEDIUM)
 #define NSS_DEFAULT_NUM_CONN			2048		/* Default number of connections for IPv4 and IPv6 each, for medium memory profile */

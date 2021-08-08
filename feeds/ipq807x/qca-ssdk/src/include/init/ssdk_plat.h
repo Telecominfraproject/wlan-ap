@@ -189,7 +189,8 @@ enum {
 /*qca808x_end*/
 /*poll mib per 120secs*/
 #define QCA_PHY_MIB_WORK_DELAY	120000
-#define QCA_MIB_ITEM_NUMBER	41
+#define QCA_MIB_ITEM_NUMBER \
+	(sizeof(fal_mib_counter_t)/sizeof(a_uint64_t))
 
 #define SSDK_MAX_UNIPHY_INSTANCE        3
 #define SSDK_UNIPHY_INSTANCE0           0
@@ -246,9 +247,9 @@ extern a_uint32_t ssdk_log_level;
 		if (SSDK_LOG_LEVEL_##lev <= ssdk_log_level) {\
 			a_uint32_t i_buf = 0;\
 			for(i_buf=0; i_buf<(len); i_buf++) {\
-				printk("%08lx ", *((buf)+i_buf));\
+				printk(KERN_CONT "%08lx ", *((buf)+i_buf));\
 			}\
-			printk("\n");\
+			printk(KERN_CONT "\n");\
 		}\
 	} while(0)
 

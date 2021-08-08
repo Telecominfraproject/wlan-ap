@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2017, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2017, 2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -51,6 +51,17 @@ hppe_meter_cmpst_length_reg_set(
 				value->val);
 }
 
+sw_error_t
+hppe_pc_drop_bypass_reg_set(
+		a_uint32_t dev_id,
+		union pc_drop_bypass_reg_u *value)
+{
+	return hppe_reg_set(
+				dev_id,
+				INGRESS_POLICER_BASE_ADDR + PC_DROP_BYPASS_REG_ADDRESS,
+				value->val);
+}
+
 #ifndef IN_POLICER_MINI
 sw_error_t
 hppe_pc_drop_bypass_reg_get(
@@ -61,17 +72,6 @@ hppe_pc_drop_bypass_reg_get(
 				dev_id,
 				INGRESS_POLICER_BASE_ADDR + PC_DROP_BYPASS_REG_ADDRESS,
 				&value->val);
-}
-
-sw_error_t
-hppe_pc_drop_bypass_reg_set(
-		a_uint32_t dev_id,
-		union pc_drop_bypass_reg_u *value)
-{
-	return hppe_reg_set(
-				dev_id,
-				INGRESS_POLICER_BASE_ADDR + PC_DROP_BYPASS_REG_ADDRESS,
-				value->val);
 }
 
 sw_error_t

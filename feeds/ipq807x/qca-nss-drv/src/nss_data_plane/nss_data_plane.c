@@ -19,22 +19,6 @@
 #include "nss_tx_rx_common.h"
 #include "nss_data_plane_hal.h"
 
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 5, 0))
-#define NSS_DATA_PLANE_SUPPORTED_FEATURES (NETIF_F_HIGHDMA \
-					| NETIF_F_HW_CSUM \
-					| NETIF_F_RXCSUM \
-					| NETIF_F_SG \
-					| NETIF_F_FRAGLIST \
-					| (NETIF_F_TSO | NETIF_F_TSO6 | NETIF_F_UFO))
-#else
-#define NSS_DATA_PLANE_SUPPORTED_FEATURES (NETIF_F_HIGHDMA \
-					| NETIF_F_HW_CSUM \
-					| NETIF_F_RXCSUM \
-					| NETIF_F_SG \
-					| NETIF_F_FRAGLIST \
-					| (NETIF_F_TSO | NETIF_F_TSO6))
-#endif
-
 /*
  * nss_data_plane_param
  */
@@ -228,10 +212,7 @@ drop:
  */
 static void __nss_data_plane_set_features(struct nss_dp_data_plane_ctx *dpc)
 {
-	dpc->dev->features |= NSS_DATA_PLANE_SUPPORTED_FEATURES;
-	dpc->dev->hw_features |= NSS_DATA_PLANE_SUPPORTED_FEATURES;
-	dpc->dev->vlan_features |= NSS_DATA_PLANE_SUPPORTED_FEATURES;
-	dpc->dev->wanted_features |= NSS_DATA_PLANE_SUPPORTED_FEATURES;
+	nss_data_plane_hal_set_features(dpc);
 }
 
 /*

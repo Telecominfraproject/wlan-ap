@@ -140,15 +140,28 @@ ref_fdb_get_port_by_mac(unsigned int vid, const char * addr)
 	fal_fdb_entry_t entry;
 	unsigned char i;
 	sw_error_t rv;
+	a_uint32_t dev_id = 0;
 
 	memset(&entry, 0, sizeof(entry));
+	SSDK_DEBUG("the fdb entry with MAC:%x-%x-%x-%x-%x-%x, fid:%d will be searched\n",
+		addr[0], addr[1], addr[2], addr[3], addr[4], addr[5], vid);
 	entry.fid = vid;
 	for (i = 0; i < 6; i++)
 		entry.addr.uc[i] = addr[i];
-
-	rv = fal_fdb_find(0, &entry);
-	if (rv != SW_OK)
+	for(dev_id = 0; dev_id < SW_MAX_NR_DEV; dev_id++)
+	{
+		rv = fal_fdb_find(dev_id, &entry);
+		if (rv == SW_OK)
+		{
+			SSDK_DEBUG("device %d have the entry\n", dev_id);
+			break;
+		}
+	}
+	if(rv != SW_OK)
+	{
+		SSDK_DEBUG("the entry cannot be found\n");
 		return 0xffffffff;
+	}
 
 	for (i = 0; i < MAX_PORT; i++)
 	{

@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2020-2021, The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -17,8 +17,14 @@
  */
 
 #include "nss_core.h"
+#include "nss_dma.h"
 #include "nss_dma_stats.h"
 #include "nss_dma_strings.h"
+
+/*
+ * Declare atomic notifier data structure for statistics.
+ */
+ATOMIC_NOTIFIER_HEAD(nss_dma_stats_notifier);
 
 /*
  * Spinlock to protect DMA statistics update/read
@@ -117,3 +123,41 @@ void nss_dma_stats_sync(struct nss_ctx_instance *nss_ctx, struct nss_dma_stats *
 
 	spin_unlock_bh(&nss_dma_stats_lock);
 }
+
+/*
+ * nss_dma_stats_notify()
+ *	Sends notifications to all the registered modules.
+ *
+ * Leverage NSS-FW statistics timing to update Netlink.
+ */
+void nss_dma_stats_notify(struct nss_ctx_instance *nss_ctx)
+{
+	struct nss_dma_stats_notification dma_stats;
+
+	spin_lock_bh(&nss_dma_stats_lock);
+	dma_stats.core_id = nss_ctx->id;
+	memcpy(dma_stats.stats_ctx, nss_dma_stats, sizeof(dma_stats.stats_ctx));
+	spin_unlock_bh(&nss_dma_stats_lock);
+
+	atomic_notifier_call_chain(&nss_dma_stats_notifier, NSS_STATS_EVENT_NOTIFY, &dma_stats);
+}
+
+/*
+ * nss_dma_stats_unregister_notifier()
+ *	Deregisters statistics notifier.
+ */
+int nss_dma_stats_unregister_notifier(struct notifier_block *nb)
+{
+	return atomic_notifier_chain_unregister(&nss_dma_stats_notifier, nb);
+}
+EXPORT_SYMBOL(nss_dma_stats_unregister_notifier);
+
+/*
+ * nss_dma_stats_register_notifier()
+ *	Registers statistics notifier.
+ */
+int nss_dma_stats_register_notifier(struct notifier_block *nb)
+{
+	return atomic_notifier_chain_register(&nss_dma_stats_notifier, nb);
+}
+EXPORT_SYMBOL(nss_dma_stats_register_notifier);

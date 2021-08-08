@@ -415,17 +415,23 @@ enum {
     fal_port_vlan_propagation_set(a_uint32_t dev_id, fal_port_t port_id,
                                   fal_vlan_propagation_mode_t mode);
 
+    sw_error_t
+    fal_port_qinq_role_set(a_uint32_t dev_id, fal_port_t port_id, fal_qinq_port_role_t role);
+
+
+    sw_error_t
+    fal_qinq_mode_set(a_uint32_t dev_id, fal_qinq_mode_t mode);
+
+    sw_error_t
+    fal_port_vlan_trans_add(a_uint32_t dev_id, fal_port_t port_id, fal_vlan_trans_entry_t *entry);
+
+
 #ifndef IN_PORTVLAN_MINI
-    
 
 
     sw_error_t
     fal_port_vlan_propagation_get(a_uint32_t dev_id, fal_port_t port_id,
                                   fal_vlan_propagation_mode_t * mode);
-
-
-    sw_error_t
-    fal_port_vlan_trans_add(a_uint32_t dev_id, fal_port_t port_id, fal_vlan_trans_entry_t *entry);
 
 
     sw_error_t
@@ -437,15 +443,7 @@ enum {
 
 
     sw_error_t
-    fal_qinq_mode_set(a_uint32_t dev_id, fal_qinq_mode_t mode);
-
-
-    sw_error_t
     fal_qinq_mode_get(a_uint32_t dev_id, fal_qinq_mode_t * mode);
-
-
-    sw_error_t
-    fal_port_qinq_role_set(a_uint32_t dev_id, fal_port_t port_id, fal_qinq_port_role_t role);
 
 
     sw_error_t
@@ -493,10 +491,12 @@ enum {
 
 #define FAL_GLOBAL_QINQ_MODE_INGRESS_EN (0x1UL << 0)
 #define FAL_GLOBAL_QINQ_MODE_EGRESS_EN (0x1UL << 1)
+#define FAL_GLOBAL_QINQ_MODE_EGRESS_UNTOUCHED_FOR_CPU_CODE (0x1UL << 2)
 	typedef struct {
 	    a_uint32_t mask;/*bit 0 for ingress and bit 1 for egress*/
 	    fal_qinq_mode_t ingress_mode; /* ingress direction mode */
 	    fal_qinq_mode_t egress_mode; /* egress direction mode */
+	    a_bool_t untouched_for_cpucode; /*egress untouched with cpu_code!=0 to cpu port 0 */
 	} fal_global_qinq_mode_t;
 
 #define FAL_PORT_QINQ_ROLE_INGRESS_EN (0x1UL << 0)

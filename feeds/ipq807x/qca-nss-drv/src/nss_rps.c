@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2013-2017, 2019-2020 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2017, 2019-2021 The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -307,6 +307,7 @@ static nss_tx_status_t nss_rps_ipv4_hash_bitmap_cfg(struct nss_ctx_instance *nss
 	return NSS_SUCCESS;
 }
 
+#ifdef NSS_DRV_IPV6_ENABLE
 /*
  * nss_rps_ipv6_hash_bitmap_cfg()
  *	Send Message to NSS to configure hash_bitmap.
@@ -335,6 +336,7 @@ static nss_tx_status_t nss_rps_ipv6_hash_bitmap_cfg(struct nss_ctx_instance *nss
 	up(&nss_rps_cfg_pvt.sem);
 	return NSS_SUCCESS;
 }
+#endif
 
 /*
  * nss_rps_pri_map_cfg()
@@ -455,7 +457,7 @@ static int nss_rps_hash_bitmap_cfg_handler(struct ctl_table *ctl, int write,
 {
 	struct nss_top_instance *nss_top = &nss_top_main;
 	struct nss_ctx_instance *nss_ctx = &nss_top->nss[0];
-	int ret, ret_ipv4, ret_ipv6, current_state;
+	int ret, ret_ipv4, current_state;
 
 	current_state = nss_rps_hash_bitmap;
 	ret = proc_dointvec(ctl, write, buffer, lenp, ppos);
@@ -479,17 +481,21 @@ static int nss_rps_hash_bitmap_cfg_handler(struct ctl_table *ctl, int write,
 			return ret_ipv4;
 		}
 
-		ret_ipv6 = nss_rps_ipv6_hash_bitmap_cfg(nss_ctx, nss_rps_hash_bitmap);
+#ifdef NSS_DRV_IPV6_ENABLE
+		{
+			int ret_ipv6;
+			ret_ipv6 = nss_rps_ipv6_hash_bitmap_cfg(nss_ctx, nss_rps_hash_bitmap);
 
-		if (ret_ipv6 != NSS_SUCCESS) {
-			nss_warning("%px: ipv6 hash_bitmap config message failed\n", nss_ctx);
-			nss_rps_hash_bitmap = current_state;
-			if (nss_rps_ipv4_hash_bitmap_cfg(nss_ctx, nss_rps_hash_bitmap != NSS_SUCCESS)) {
-				nss_warning("%px: ipv4 and ipv6 have different hash_bitmaps.\n", nss_ctx);
+			if (ret_ipv6 != NSS_SUCCESS) {
+				nss_warning("%px: ipv6 hash_bitmap config message failed\n", nss_ctx);
+				nss_rps_hash_bitmap = current_state;
+				if (nss_rps_ipv4_hash_bitmap_cfg(nss_ctx, nss_rps_hash_bitmap != NSS_SUCCESS)) {
+					nss_warning("%px: ipv4 and ipv6 have different hash_bitmaps.\n", nss_ctx);
+				}
+				return ret_ipv6;
 			}
-			return ret_ipv6;
 		}
-
+#endif
 		return 0;
 	}
 

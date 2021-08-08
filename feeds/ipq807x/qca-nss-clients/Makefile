@@ -6,7 +6,7 @@ PKG_SOURCE_PROTO:=git
 PKG_BRANCH:=master
 PKG_RELEASE:=2
 PKG_SOURCE_URL:=https://source.codeaurora.org/quic/qsdk/oss/lklm/nss-clients/
-PKG_VERSION:=9136ef60bf68ceed760781d3acbeddb05470e432
+PKG_VERSION:=153998d70fdba508a59a28c13a606032cbf32686
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
@@ -24,17 +24,10 @@ else
 subtarget:=$(CONFIG_TARGET_BOARD)
 endif
 
-ifneq (, $(findstring $(subtarget), "ipq807x" "ipq807x_ipq807x" "ipq60xx" "ipq807x_ipq60xx"))
 # DTLS Manager v2.0 for Hawkeye/Cypress
   DTLSMGR_DIR:=v2.0
 # IPsec Manager v2.0 for Hawkeye/Cypress
   IPSECMGR_DIR:=v2.0
-else
-# DTLS Manager v1.0 for Akronite.
-  DTLSMGR_DIR:=v1.0
-# IPsec Manager v1.0 for Akronite.
-  IPSECMGR_DIR:=v1.0
-endif
 
 define KernelPackage/qca-nss-drv-tun6rd
   SECTION:=kernel
@@ -437,6 +430,20 @@ define Build/InstallDev/qca-nss-clients
 	$(CP) $(PKG_BUILD_DIR)/exports/* $(1)/usr/include/qca-nss-clients/
 endef
 
+define KernelPackage/qca-nss-drv-wifi-meshmgr
+  SECTION:=kernel
+  CATEGORY:=Kernel modules
+  SUBMENU:=Network Devices
+  DEPENDS:=+kmod-qca-nss-drv @!LINUX_3_18
+  TITLE:=NSS WiFi-Mesh Manager for QCA NSS driver
+  FILES:=$(PKG_BUILD_DIR)/wifi_meshmgr/qca-nss-wifi-meshmgr.ko
+  AUTOLOAD:=$(call AutoLoad,51,qca-nss-wifi-meshmgr)
+endef
+
+define KernelPackage/qca-nss-drv-wifi-meshmgr/Description
+Kernel module for WiFi Mesh manager
+endef
+
 define Build/InstallDev
 	$(call Build/InstallDev/qca-nss-clients,$(1))
 endef
@@ -585,6 +592,10 @@ ifneq ($(CONFIG_PACKAGE_kmod-qca-nss-drv-mirror),)
 MAKE_OPTS+=mirror=y
 endif
 
+ifneq ($(CONFIG_PACKAGE_kmod-qca-nss-drv-wifi-meshmgr),)
+MAKE_OPTS+=wifi-meshmgr=y
+endif
+
 define Build/Compile
 	$(MAKE) -C "$(LINUX_DIR)" $(strip $(MAKE_OPTS)) \
 		CROSS_COMPILE="$(TARGET_CROSS)" \
@@ -624,3 +635,4 @@ $(eval $(call KernelPackage,qca-nss-drv-vxlanmgr))
 $(eval $(call KernelPackage,qca-nss-drv-match))
 #$(eval $(call KernelPackage,qca-nss-drv-tlsmgr))
 $(eval $(call KernelPackage,qca-nss-drv-mirror))
+$(eval $(call KernelPackage,qca-nss-drv-wifi-meshmgr))

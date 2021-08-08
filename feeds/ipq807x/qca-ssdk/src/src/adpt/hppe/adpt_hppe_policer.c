@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2017, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2017, 2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -964,7 +964,53 @@ adpt_hppe_policer_global_counter_get(a_uint32_t dev_id,
 
 	return SW_OK;
 }
+
+sw_error_t
+adpt_hppe_policer_bypass_en_get(a_uint32_t dev_id, fal_policer_frame_type_t frame_type,
+	a_bool_t *enable)
+{
+	sw_error_t rv = SW_OK;
+	union pc_drop_bypass_reg_u drop_bypass_reg;
+
+	memset(&drop_bypass_reg, 0, sizeof(drop_bypass_reg));
+	ADPT_DEV_ID_CHECK(dev_id);
+	ADPT_NULL_POINT_CHECK(enable);
+
+	rv = hppe_pc_drop_bypass_reg_get(dev_id, &drop_bypass_reg);
+	SW_RTN_ON_ERROR (rv);
+
+	if (frame_type == FAL_FRAME_DROPPED) {
+		*enable = drop_bypass_reg.bf.drop_bypass_en;
+	} else {
+		return SW_BAD_PARAM;
+	}
+
+	return SW_OK;
+}
+
 #endif
+
+sw_error_t
+adpt_hppe_policer_bypass_en_set(a_uint32_t dev_id, fal_policer_frame_type_t frame_type,
+	a_bool_t enable)
+{
+	sw_error_t rv = SW_OK;
+	union pc_drop_bypass_reg_u drop_bypass_reg;
+
+	memset(&drop_bypass_reg, 0, sizeof(drop_bypass_reg));
+	ADPT_DEV_ID_CHECK(dev_id);
+
+	if (frame_type == FAL_FRAME_DROPPED) {
+		drop_bypass_reg.bf.drop_bypass_en = enable;
+	} else {
+		return SW_BAD_PARAM;
+	}
+
+	rv = hppe_pc_drop_bypass_reg_set(dev_id, &drop_bypass_reg);
+	SW_RTN_ON_ERROR (rv);
+
+	return SW_OK;
+}
 
 void adpt_hppe_policer_func_bitmap_init(a_uint32_t dev_id)
 {
@@ -985,7 +1031,9 @@ void adpt_hppe_policer_func_bitmap_init(a_uint32_t dev_id)
 						(1 << FUNC_ADPT_POLICER_TIME_SLOT_GET)|
 						(1 << FUNC_ADPT_PORT_COMPENSATION_BYTE_SET)|
 						(1 << FUNC_ADPT_POLICER_TIME_SLOT_SET) |
-						(1 << FUNC_ADPT_POLICER_GLOBAL_COUNTER_GET));
+						(1 << FUNC_ADPT_POLICER_GLOBAL_COUNTER_GET)|
+						(1 << FUNC_ADPT_POLICER_BYPASS_EN_SET)|
+						(1 << FUNC_ADPT_POLICER_BYPASS_EN_GET));
 
 	return;
 
@@ -1007,6 +1055,8 @@ static void adpt_hppe_policer_func_unregister(a_uint32_t dev_id, adpt_api_t *p_a
 	p_adpt_api->adpt_port_compensation_byte_set = NULL;
 	p_adpt_api->adpt_policer_time_slot_set = NULL;
 	p_adpt_api->adpt_policer_global_counter_get = NULL;
+	p_adpt_api->adpt_policer_bypass_en_set = NULL;
+	p_adpt_api->adpt_policer_bypass_en_get = NULL;
 
 	return;
 
@@ -1061,6 +1111,10 @@ sw_error_t adpt_hppe_policer_init(a_uint32_t dev_id)
 	{
 		p_adpt_api->adpt_policer_global_counter_get = adpt_hppe_policer_global_counter_get;
 	}
+	if(p_adpt_api->adpt_policer_func_bitmap & (1 << FUNC_ADPT_POLICER_BYPASS_EN_GET))
+	{
+		p_adpt_api->adpt_policer_bypass_en_get = adpt_hppe_policer_bypass_en_get;
+	}
 #endif
 	if(p_adpt_api->adpt_policer_func_bitmap & (1 << FUNC_ADPT_PORT_COMPENSATION_BYTE_SET))
 	{
@@ -1069,6 +1123,10 @@ sw_error_t adpt_hppe_policer_init(a_uint32_t dev_id)
 	if(p_adpt_api->adpt_policer_func_bitmap & (1 << FUNC_ADPT_POLICER_TIME_SLOT_SET))
 	{
 		p_adpt_api->adpt_policer_time_slot_set = adpt_hppe_policer_time_slot_set;
+	}
+	if(p_adpt_api->adpt_policer_func_bitmap & (1 << FUNC_ADPT_POLICER_BYPASS_EN_SET))
+	{
+		p_adpt_api->adpt_policer_bypass_en_set = adpt_hppe_policer_bypass_en_set;
 	}
 
 	return SW_OK;

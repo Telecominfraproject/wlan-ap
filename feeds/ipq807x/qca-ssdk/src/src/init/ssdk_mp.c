@@ -20,6 +20,7 @@
 #include "ssdk_mp.h"
 #include "adpt.h"
 #include "ssdk_led.h"
+#include "ssdk_clk.h"
 
 #ifdef IN_PORTCONTROL
 sw_error_t
@@ -52,6 +53,8 @@ qca_mp_portctrl_hw_init(a_uint32_t dev_id)
 		fal_port_promisc_mode_set(dev_id, i, A_TRUE);
 		/* init software level port status */
 		qca_mac_port_status_init(dev_id, i);
+		/*enable ICC efuse loading*/
+		ssdk_mp_gephy_icc_efuse_load_enable(A_TRUE);
 	}
 	return rv;
 }

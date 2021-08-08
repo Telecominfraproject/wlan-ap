@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2017-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2015, 2017-2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -756,7 +756,16 @@ hsl_port_phydev_get(a_uint32_t dev_id, a_uint32_t port_id,
 	priv = ssdk_phy_priv_data_get(dev_id);
 	SW_RTN_ON_NULL(priv);
 
-	phy_addr = qca_ssdk_port_to_phy_addr(dev_id, port_id);
+#if defined(IN_PHY_I2C_MODE)
+	if (hsl_port_phy_access_type_get(dev_id, port_id) == PHY_I2C_ACCESS)
+	{
+		phy_addr = qca_ssdk_port_to_phy_mdio_fake_addr(dev_id, port_id);
+	}
+	else
+#endif
+	{
+		phy_addr = qca_ssdk_port_to_phy_addr(dev_id, port_id);
+	}
 	SW_RTN_ON_NULL(phydev);
 	*phydev = mdiobus_get_phy(priv->miibus, phy_addr);
 	if(*phydev == NULL)

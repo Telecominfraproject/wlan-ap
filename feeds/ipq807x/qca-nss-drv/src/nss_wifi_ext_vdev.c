@@ -43,6 +43,7 @@ static bool nss_wifi_ext_vdev_verify_if_num(uint32_t if_num)
 
 	switch (type) {
 	case NSS_DYNAMIC_INTERFACE_TYPE_WIFI_EXT_VDEV_WDS:
+	case NSS_DYNAMIC_INTERFACE_TYPE_WIFI_EXT_VDEV_VLAN:
 		return true;
 	default:
 		return false;

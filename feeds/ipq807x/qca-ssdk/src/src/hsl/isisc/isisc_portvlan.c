@@ -891,6 +891,7 @@ _isisc_port_vlan_propagation_get(a_uint32_t dev_id, fal_port_t port_id,
 
     return SW_OK;
 }
+#endif
 
 static sw_error_t
 _isisc_vlan_trans_read(a_uint32_t dev_id, a_uint32_t entry_idx,
@@ -1048,6 +1049,7 @@ _isisc_port_vlan_trans_add(a_uint32_t dev_id, fal_port_t port_id,
     return _isisc_vlan_trans_write(dev_id, entry_idx, t_pbmp, local);
 }
 
+#ifndef IN_PORTVLAN_MINI
 static sw_error_t
 _isisc_port_vlan_trans_del(a_uint32_t dev_id, fal_port_t port_id,
                           fal_vlan_trans_entry_t * entry)
@@ -1198,6 +1200,7 @@ _isisc_port_vlan_trans_iterate(a_uint32_t dev_id, fal_port_t port_id,
     *iterator = index + 1;
     return SW_OK;
 }
+#endif
 
 static sw_error_t
 _isisc_qinq_mode_set(a_uint32_t dev_id, fal_qinq_mode_t mode)
@@ -1223,6 +1226,7 @@ _isisc_qinq_mode_set(a_uint32_t dev_id, fal_qinq_mode_t mode)
     return rv;
 }
 
+#ifndef IN_PORTVLAN_MINI
 static sw_error_t
 _isisc_qinq_mode_get(a_uint32_t dev_id, fal_qinq_mode_t * mode)
 {
@@ -1247,6 +1251,7 @@ _isisc_qinq_mode_get(a_uint32_t dev_id, fal_qinq_mode_t * mode)
 
     return SW_OK;
 }
+#endif
 
 static sw_error_t
 _isisc_port_qinq_role_set(a_uint32_t dev_id, fal_port_t port_id,
@@ -1281,6 +1286,7 @@ _isisc_port_qinq_role_set(a_uint32_t dev_id, fal_port_t port_id,
     return rv;
 }
 
+#ifndef IN_PORTVLAN_MINI
 static sw_error_t
 _isisc_port_qinq_role_get(a_uint32_t dev_id, fal_port_t port_id,
                          fal_qinq_port_role_t * role)
@@ -1928,6 +1934,7 @@ isisc_port_vlan_propagation_get(a_uint32_t dev_id, fal_port_t port_id,
     HSL_API_UNLOCK;
     return rv;
 }
+#endif
 
 /**
  * @brief Add a vlan translation entry to a particular port.
@@ -1948,6 +1955,7 @@ isisc_port_vlan_trans_add(a_uint32_t dev_id, fal_port_t port_id,
     return rv;
 }
 
+#ifndef IN_PORTVLAN_MINI
 /**
  * @brief Delete a vlan translation entry from a particular port.
  * @param[in] dev_id device id
@@ -2007,6 +2015,7 @@ isisc_port_vlan_trans_iterate(a_uint32_t dev_id, fal_port_t port_id,
     HSL_API_UNLOCK;
     return rv;
 }
+#endif
 
 /**
  * @brief Set switch qinq work mode on a particular device.
@@ -2025,6 +2034,7 @@ isisc_qinq_mode_set(a_uint32_t dev_id, fal_qinq_mode_t mode)
     return rv;
 }
 
+#ifndef IN_PORTVLAN_MINI
 /**
  * @brief Get switch qinq work mode on a particular device.
  * @param[in] dev_id device id
@@ -2042,6 +2052,7 @@ isisc_qinq_mode_get(a_uint32_t dev_id, fal_qinq_mode_t * mode)
     return rv;
 }
 
+#endif
 /**
  * @brief Set qinq role on a particular port.
  * @param[in] dev_id device id
@@ -2061,6 +2072,7 @@ isisc_port_qinq_role_set(a_uint32_t dev_id, fal_port_t port_id,
     return rv;
 }
 
+#ifndef IN_PORTVLAN_MINI
 /**
  * @brief Get qinq role on a particular port.
  * @param[in] dev_id device id
@@ -2252,13 +2264,15 @@ isisc_portvlan_init(a_uint32_t dev_id)
 	p_api->port_default_cvid_get = isisc_port_default_cvid_get;
 	p_api->port_default_svid_get = isisc_port_default_svid_get;
     p_api->port_vlan_propagation_get = isisc_port_vlan_propagation_get;
-    p_api->port_vlan_trans_add = isisc_port_vlan_trans_add;
     p_api->port_vlan_trans_del = isisc_port_vlan_trans_del;
     p_api->port_vlan_trans_get = isisc_port_vlan_trans_get;
+#endif
+    p_api->port_vlan_trans_add = isisc_port_vlan_trans_add;
     p_api->qinq_mode_set = isisc_qinq_mode_set;
-    p_api->qinq_mode_get = isisc_qinq_mode_get;
     p_api->port_qinq_role_set = isisc_port_qinq_role_set;
+#ifndef IN_PORTVLAN_MINI
     p_api->port_qinq_role_get = isisc_port_qinq_role_get;
+    p_api->qinq_mode_get = isisc_qinq_mode_get;
     p_api->port_vlan_trans_iterate = isisc_port_vlan_trans_iterate;
     p_api->port_mac_vlan_xlt_set = isisc_port_mac_vlan_xlt_set;
     p_api->port_mac_vlan_xlt_get = isisc_port_mac_vlan_xlt_get;

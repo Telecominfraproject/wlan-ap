@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -137,6 +137,7 @@ void nss_hal_dt_parse_features(struct device_node *np, struct nss_platform_data 
 	npd->wifioffload_enabled = of_property_read_bool(np, "qcom,wlan-dataplane-offload-enabled");
 	npd->match_enabled = of_property_read_bool(np, "qcom,match-enabled");
 	npd->mirror_enabled = of_property_read_bool(np, "qcom,mirror-enabled");
+	npd->udp_st_enabled = of_property_read_bool(np, "qcom,udp-st-enabled");
 }
 /*
  * nss_hal_clean_up_irq()
@@ -292,7 +293,6 @@ int nss_hal_probe(struct platform_device *nss_dev)
 	 * Physical address of logical registers space
 	 */
 	nss_ctx->vphys = npd->vphys;
-	nss_assert(nss_ctx->vphys);
 	nss_info("%d:ctx=%px, vphys=%x, vmap=%px, nphys=%x, nmap=%px", nss_ctx->id,
 			nss_ctx, nss_ctx->vphys, nss_ctx->vmap, nss_ctx->nphys, nss_ctx->nmap);
 
@@ -385,24 +385,31 @@ int nss_hal_probe(struct platform_device *nss_dev)
 #ifdef NSS_DRV_CAPWAP_ENABLE
 	if (npd->capwap_enabled == NSS_FEATURE_ENABLED) {
 		nss_top->capwap_handler_id = nss_dev->id;
-		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_CAPWAP] = nss_dev->id;
+		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_CAPWAP_OUTER] = nss_dev->id;
+		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_CAPWAP_HOST_INNER] = nss_dev->id;
 	}
 #endif
 
+#ifdef NSS_DRV_IPV4_REASM_ENABLE
 	if (npd->ipv4_reasm_enabled == NSS_FEATURE_ENABLED) {
 		nss_top->ipv4_reasm_handler_id = nss_dev->id;
 		nss_ipv4_reasm_register_handler();
 	}
+#endif
 
+#ifdef NSS_DRV_IPV6_ENABLE
 	if (npd->ipv6_enabled == NSS_FEATURE_ENABLED) {
 		nss_top->ipv6_handler_id = nss_dev->id;
 		nss_ipv6_register_handler();
 	}
 
+#ifdef NSS_DRV_IPV6_REASM_ENABLE
 	if (npd->ipv6_reasm_enabled == NSS_FEATURE_ENABLED) {
 		nss_top->ipv6_reasm_handler_id = nss_dev->id;
 		nss_ipv6_reasm_register_handler();
 	}
+#endif
+#endif
 
 #ifdef NSS_DRV_CRYPTO_ENABLE
 	/*
@@ -561,11 +568,16 @@ int nss_hal_probe(struct platform_device *nss_dev)
 		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_VAP] = nss_dev->id;
 		nss_wifi_register_handler();
 		nss_wifili_register_handler();
+#ifdef NSS_DRV_WIFI_EXT_VDEV_ENABLE
 		nss_wifi_ext_vdev_register_handler();
+#endif
 		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL] = nss_dev->id;
 		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL0] = nss_dev->id;
 		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL1] = nss_dev->id;
 		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_WIFI_EXT_VDEV_WDS] = nss_dev->id;
+		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_WIFI_EXT_VDEV_VLAN] = nss_dev->id;
+		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_WIFI_MESH_INNER] = nss_dev->id;
+		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_WIFI_MESH_OUTER] = nss_dev->id;
 
 		/*
 		 * Register wifi mac database when offload enabled
@@ -586,11 +598,13 @@ int nss_hal_probe(struct platform_device *nss_dev)
 	}
 #endif
 
+#ifdef NSS_DRV_BRIDGE_ENABLE
 	if (npd->bridge_enabled == NSS_FEATURE_ENABLED) {
 		nss_top->bridge_handler_id = nss_dev->id;
 		nss_top->dynamic_interface_table[NSS_DYNAMIC_INTERFACE_TYPE_BRIDGE] = nss_dev->id;
 		nss_bridge_init();
 	}
+#endif
 
 	if (npd->vlan_enabled == NSS_FEATURE_ENABLED) {
 		nss_top->vlan_handler_id = nss_dev->id;
@@ -677,6 +691,13 @@ int nss_hal_probe(struct platform_device *nss_dev)
 		nss_info("%d: NSS mirror is enabled", nss_dev->id);
 	}
 
+#endif
+
+#ifdef NSS_DRV_UDP_ST_ENABLE
+	if (npd->udp_st_enabled == NSS_FEATURE_ENABLED) {
+		nss_top->udp_st_handler_id = nss_dev->id;
+		nss_udp_st_register_handler(nss_ctx);
+	}
 #endif
 
 	if (nss_ctx->id == 0) {

@@ -319,9 +319,9 @@ static void _adpt_acl_reg_dump(a_uint8_t *reg, a_uint32_t len)
 
 	for(i = 0; i < len; i++)
 	{
-		if(i%32 == 0)
-			printk("\n");
-		printk("%02x ", reg[i]);
+		printk(KERN_CONT "%02x ", reg[i]);
+		if((i+1)%32 == 0 || (i == len-1))
+			printk(KERN_CONT "\n");
 	}
 
 	return;
@@ -1971,7 +1971,9 @@ _adpt_hppe_acl_l2_fields_check(a_uint32_t dev_id, a_uint32_t list_id, a_uint32_t
 	}
 
 	if((FAL_FIELD_FLG_TST(rule->field_flg, FAL_ACL_FIELD_MAC_ETHTYPE)) ||
-		(FAL_FIELD_FLG_TST(rule->field_flg, FAL_ACL_FIELD_PPPOE_SESSIONID)))
+		(FAL_FIELD_FLG_TST(rule->field_flg, FAL_ACL_FIELD_PPPOE_SESSIONID)) ||
+		((FAL_FIELD_FLG_TST(rule->field_flg, FAL_ACL_FIELD_MAC_STAG_VID)) &&
+		(rule->stag_vid_op != FAL_ACL_FIELD_MASK)))
 	{
 		SSDK_DEBUG("select L2 MISC rule\n");
 		l2_rule_type_map |= (1<<ADPT_ACL_HPPE_L2_MISC_RULE);
@@ -1982,16 +1984,8 @@ _adpt_hppe_acl_l2_fields_check(a_uint32_t dev_id, a_uint32_t list_id, a_uint32_t
 	{
 		if(FAL_FIELD_FLG_TST(rule->field_flg, FAL_ACL_FIELD_MAC_STAG_VID))
 		{
-			if(rule->stag_vid_op == FAL_ACL_FIELD_MASK)
-			{
 				SSDK_DEBUG("select VLAN rule\n");
 				l2_rule_type_map |= (1<<ADPT_ACL_HPPE_VLAN_RULE);
-			}
-			else
-			{
-				SSDK_DEBUG("select L2 MISC rule\n");
-				l2_rule_type_map |= (1<<ADPT_ACL_HPPE_L2_MISC_RULE);
-			}
 		}
 	}
 
@@ -2306,7 +2300,8 @@ static sw_error_t _adpt_hppe_acl_vlan_rule_sw_2_hw(fal_acl_rule_t *rule,
 		vlanrule_mask->ctag_fmt_mask = rule->ctagged_mask;
 	}
 	/*stag*/
-	if(FAL_FIELD_FLG_TST(rule->field_flg, FAL_ACL_FIELD_MAC_STAG_VID))
+	if(FAL_FIELD_FLG_TST(rule->field_flg, FAL_ACL_FIELD_MAC_STAG_VID) &&
+		(rule->stag_vid_op == FAL_ACL_FIELD_MASK))
 	{
 		vlanrule->svid = rule->stag_vid_val;
 		vlanrule_mask->svid_mask = rule->stag_vid_mask;
@@ -3687,14 +3682,11 @@ _adpt_hppe_acl_rule_dump(a_uint32_t dev_id, a_uint32_t list_id, ADPT_HPPE_ACL_SW
 					hw_list_id*ADPT_ACL_ENTRY_NUM_PER_LIST+i, &hw_act);
 				printk("hw_entry %d\n", hw_list_id*ADPT_ACL_ENTRY_NUM_PER_LIST+i);
 				_adpt_acl_reg_dump((u_int8_t *)&hw_reg, sizeof(hw_reg));
-				printk("\n");
 				printk("hw_entry_mask %d\n",
 					hw_list_id*ADPT_ACL_ENTRY_NUM_PER_LIST+i);
 				_adpt_acl_reg_dump((u_int8_t *)&hw_mask, sizeof(hw_mask));
-				printk("\n");
 				printk("hw_action %d\n", hw_list_id*ADPT_ACL_ENTRY_NUM_PER_LIST+i);
 				_adpt_acl_reg_dump((u_int8_t *)&hw_act, sizeof(hw_act));
-				printk("\n");
 			}
 		}
 	}
