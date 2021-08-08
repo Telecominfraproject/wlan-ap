@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2016-2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012, 2016-2018, 2020, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -32,14 +32,14 @@ extern "C" {
 #define FAL_TRUNK_HASH_KEY_SA              0x2
 #define FAL_TRUNK_HASH_KEY_DIP             0x4
 #define FAL_TRUNK_HASH_KEY_SIP             0x8
-#define FAL_TRUNK_HASH_KEY_SRC_PORT  0x10
-#define FAL_TRUNK_HASH_KEY_L4_SRC_PORT           0x20
-#define FAL_TRUNK_HASH_KEY_L4_DST_PORT           0x40
-#define FAL_TRUNK_HASH_KEY_UDF0             0x80
-#define FAL_TRUNK_HASH_KEY_UDF1             0x100
-#define FAL_TRUNK_HASH_KEY_UDF2             0x200
-#define FAL_TRUNK_HASH_KEY_UDF3             0x400
-#define FAL_TRUNK_GROUP_MAX_MEMEBER    4
+#define FAL_TRUNK_HASH_KEY_SRC_PORT        0x10
+#define FAL_TRUNK_HASH_KEY_L4_SRC_PORT     0x20
+#define FAL_TRUNK_HASH_KEY_L4_DST_PORT     0x40
+#define FAL_TRUNK_HASH_KEY_UDF0            0x80
+#define FAL_TRUNK_HASH_KEY_UDF1            0x100
+#define FAL_TRUNK_HASH_KEY_UDF2            0x200
+#define FAL_TRUNK_HASH_KEY_UDF3            0x400
+#define FAL_TRUNK_GROUP_MAX_MEMEBER        8
 
 enum {
 	FUNC_TRUNK_GROUP_SET = 0,

@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2019, 2021 The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -111,6 +111,7 @@ struct nss_vxlan_stats_msg {
 	uint32_t except_vni_lookup_failed;	/**< Virtual network ID look up failed. */
 	uint32_t dropped_malformed;		/**< Packet is malformed. */
 	uint32_t dropped_next_node_queue_full;	/**< Next node dropped the packet. */
+	uint32_t except_inner_hash;		/**< Inner hash calculation failed. */
 };
 
 /**

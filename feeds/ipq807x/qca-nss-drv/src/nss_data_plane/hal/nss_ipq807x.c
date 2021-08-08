@@ -84,6 +84,17 @@ void nss_data_plane_hal_unregister(struct nss_ctx_instance *nss_ctx)
 }
 
 /*
+ * nss_data_plane_hal_set_features
+ */
+void nss_data_plane_hal_set_features(struct nss_dp_data_plane_ctx *dpc)
+{
+	dpc->dev->features |= NSS_DATA_PLANE_SUPPORTED_FEATURES;
+	dpc->dev->hw_features |= NSS_DATA_PLANE_SUPPORTED_FEATURES;
+	dpc->dev->vlan_features |= NSS_DATA_PLANE_SUPPORTED_FEATURES;
+	dpc->dev->wanted_features |= NSS_DATA_PLANE_SUPPORTED_FEATURES;
+}
+
+/*
  * nss_data_plane_hal_stats_sync()
  */
 void nss_data_plane_hal_stats_sync(struct nss_data_plane_param *ndpp,

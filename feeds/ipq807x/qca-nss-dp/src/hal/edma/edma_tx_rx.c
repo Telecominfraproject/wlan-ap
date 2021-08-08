@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2018, 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2018, 2020-21, The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -524,7 +524,7 @@ enum edma_tx edma_ring_xmit(struct edma_hw *ehw,
 {
 	struct nss_dp_dev *dp_dev = netdev_priv(netdev);
 	struct edma_txdesc_desc *txdesc = NULL;
-	uint16_t buf_len = skb_headlen(skb);
+	uint16_t buf_len;
 	uint16_t hw_next_to_use, hw_next_to_clean, chk_idx;
 	uint32_t data;
 	uint32_t store_index = 0;
@@ -559,6 +559,28 @@ enum edma_tx edma_ring_xmit(struct edma_hw *ehw,
 		spin_unlock_bh(&txdesc_ring->tx_lock);
 		return EDMA_TX_DESC;
 	}
+
+#if defined(NSS_DP_EDMA_TX_SMALL_PKT_WAR)
+	/*
+	 * IPQ807x EDMA hardware can't process the packet if the packet size is
+	 * less than EDMA_TX_PKT_MIN_SIZE (33 Byte). So, if the packet size
+	 * is indeed less than EDMA_TX_PKT_MIN_SIZE, perform padding
+	 * (if possible), otherwise drop the packet.
+	 * Using skb_padto() API for padding the packet. This API will drop
+	 * the packet if the padding is not possible.
+	 */
+	if (unlikely(skb->len < EDMA_TX_PKT_MIN_SIZE)) {
+		if (skb_padto(skb, EDMA_TX_PKT_MIN_SIZE)) {
+			netdev_dbg(netdev, "padding couldn't happen, skb is freed.\n");
+			netdev->stats.tx_dropped++;
+			spin_unlock_bh(&txdesc_ring->tx_lock);
+			return EDMA_TX_OK;
+		}
+		skb->len = EDMA_TX_PKT_MIN_SIZE;
+	}
+#endif
+
+	buf_len = skb_headlen(skb);
 
 	/*
 	 * Deliver the ptp packet to phy driver for TX timestamping

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018, 2020-2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -146,13 +146,13 @@ qca808x_phy_debug_read(a_uint32_t dev_id, a_uint32_t phy_id, a_uint16_t reg_id)
 	rv = qca808x_phy_reg_write(dev_id, phy_id, QCA808X_DEBUG_PORT_ADDRESS, reg_id);
 	if (rv != SW_OK) {
 		QCA808X_REG_UNLOCK;
-		SSDK_ERROR("qca808x_phy_reg_write failed\n");
+		SSDK_DEBUG("qca808x_phy_reg_write failed\n");
 		return PHY_INVALID_DATA;
 	}
 	phy_data = qca808x_phy_reg_read(dev_id, phy_id, QCA808X_DEBUG_PORT_DATA);
 	if (phy_data == PHY_INVALID_DATA) {
 		QCA808X_REG_UNLOCK;
-		SSDK_ERROR("qca808x_phy_reg_read failed\n");
+		SSDK_DEBUG("qca808x_phy_reg_read failed\n");
 		return PHY_INVALID_DATA;
 	}
 	QCA808X_REG_UNLOCK;

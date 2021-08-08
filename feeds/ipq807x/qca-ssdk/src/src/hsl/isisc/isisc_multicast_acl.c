@@ -826,7 +826,7 @@ sw_error_t isisc_igmp_sg_entry_clear(a_uint32_t dev_id, fal_igmp_sg_entry_t * en
         {
             MULTI_DEBUG("KKK entry clear, new(G,S), with null portmap. \n");
             isisc_multicast_acl_del(dev_id, FAL_ACL_LIST_MULTICAST, new_index-1);
-            return SW_NO_MORE;
+            return SW_OK;
         }
         else
         {
@@ -844,7 +844,7 @@ sw_error_t isisc_igmp_sg_entry_clear(a_uint32_t dev_id, fal_igmp_sg_entry_t * en
                 else if(pm_type == 1)
                 {
                     isisc_multicast_acl_del(dev_id, FAL_ACL_LIST_MULTICAST, new_index-1);
-                    return SW_NO_MORE;
+                    return SW_OK;
                 }
                 else
                 {
@@ -861,7 +861,7 @@ sw_error_t isisc_igmp_sg_entry_clear(a_uint32_t dev_id, fal_igmp_sg_entry_t * en
         if (portmap_null(new_index-1, entry->port_map))
         {
             isisc_multicast_acl_del(dev_id, FAL_ACL_LIST_MULTICAST+1, new_index-1);
-            rv = SW_NO_MORE;
+            rv = SW_OK;
         }
         else
         {

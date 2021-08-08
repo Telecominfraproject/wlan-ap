@@ -44,13 +44,17 @@ typedef struct{
 #if defined(IN_SWCONFIG)
 int
 qca_ar8327_sw_get_port_link(struct switch_dev *dev, int port,
-						struct switch_port_link *link);
+	struct switch_port_link *link);
+int qca_ar8327_sw_set_eee(struct switch_dev *dev,
+	const struct switch_attr *attr, struct switch_val *val);
+int qca_ar8327_sw_get_eee(struct switch_dev *dev,
+	const struct switch_attr *attr, struct switch_val *val);
 #endif
 
 int ssdk_port_link_notify_register(struct notifier_block *nb);
 int ssdk_port_link_notify_unregister(struct notifier_block *nb);
 int ssdk_port_link_notify(unsigned char port_id,
-            unsigned char link, unsigned char speed, unsigned char duplex);
+	unsigned char link, unsigned char speed, unsigned char duplex);
 #ifdef __cplusplus
 }
 #endif                          /* __cplusplus */

@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2018-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -104,6 +104,37 @@ enum nss_ipsec_cmn_ctx_type {
 	NSS_IPSEC_CMN_CTX_TYPE_MDATA_OUTER,	/**< Metadata for decapsulation. */
 	NSS_IPSEC_CMN_CTX_TYPE_REDIR,		/**< Redirect. */
 	NSS_IPSEC_CMN_CTX_TYPE_MAX
+};
+
+/**
+ * nss_ipsec_cmn_stats_types
+ *	IPsec common statistics types.
+ */
+enum nss_ipsec_cmn_stats_types {
+	NSS_IPSEC_CMN_STATS_FAIL_HEADROOM = NSS_STATS_NODE_MAX,
+						/**< Failure in headroom check. */
+	NSS_IPSEC_CMN_STATS_FAIL_TAILROOM,	/**< Failure in tailroom check. */
+	NSS_IPSEC_CMN_STATS_FAIL_REPLAY,	/**< Failure in anti-replay check. */
+	NSS_IPSEC_CMN_STATS_FAIL_REPLAY_DUP,	/**< Failure in anti-replay; duplicate records. */
+	NSS_IPSEC_CMN_STATS_FAIL_REPLAY_WIN,	/**< Failure in anti-replay; packet outside the window. */
+	NSS_IPSEC_CMN_STATS_FAIL_PBUF_CRYPTO,	/**< Failure in crypto pbuf allocation. */
+	NSS_IPSEC_CMN_STATS_FAIL_QUEUE,		/**< Failure due to queue full in IPsec. */
+	NSS_IPSEC_CMN_STATS_FAIL_QUEUE_CRYPTO,	/**< Failure due to queue full in crypto. */
+	NSS_IPSEC_CMN_STATS_FAIL_QUEUE_NEXTHOP,	/**< Failure due to queue full in next hop. */
+	NSS_IPSEC_CMN_STATS_FAIL_PBUF_ALLOC,	/**< Failure in pbuf allocation. */
+	NSS_IPSEC_CMN_STATS_FAIL_PBUF_LINEAR,	/**< Failure in pbuf linearization. */
+	NSS_IPSEC_CMN_STATS_FAIL_PBUF_STATS,	/**< Failure in pbuf allocation for statistics. */
+	NSS_IPSEC_CMN_STATS_FAIL_PBUF_ALIGN,	/**< Failure in pbuf access due to non-word alignmnt */
+	NSS_IPSEC_CMN_STATS_FAIL_CIPHER,	/**< Failure in decrypting the data. */
+	NSS_IPSEC_CMN_STATS_FAIL_AUTH,		/**< Failure in authenticating the data. */
+	NSS_IPSEC_CMN_STATS_FAIL_SEQ_OVF,	/**< Failure due to sequence number rollover. */
+	NSS_IPSEC_CMN_STATS_FAIL_BLK_LEN,	/**< Failure in decapsulation due to bad cipher block length. */
+	NSS_IPSEC_CMN_STATS_FAIL_HASH_LEN,	/**< Failure in decapsulation due to bad hash block length. */
+	NSS_IPSEC_CMN_STATS_FAIL_TRANSFORM,	/**< Failure in transformation; general error. */
+	NSS_IPSEC_CMN_STATS_FAIL_CRYPTO,	/**< Failure in crypto transformation. */
+	NSS_IPSEC_CMN_STATS_FAIL_CLE,		/**< Failure in classification; general failure. */
+	NSS_IPSEC_CMN_STATS_IS_STOPPED,		/**< Indicates if SA is stopped; for example: sequence overflow. */
+	NSS_IPSEC_CMN_STATS_MAX,		/**< Maximum statistics type. */
 };
 
 /**
@@ -337,6 +368,16 @@ struct nss_ipsec_cmn_mdata {
 };
 
 /**
+ * nss_ipsec_cmn_stats_notification
+ *	IPsec common transmission statistics structure.
+ */
+struct nss_ipsec_cmn_stats_notification {
+	uint64_t stats_ctx[NSS_IPSEC_CMN_STATS_MAX];	/**< Context transmission statistics. */
+	uint32_t core_id;				/**< Core ID. */
+	uint32_t if_num;				/**< Interface number. */
+};
+
+/**
  * nss_ipsec_cmn_msg
  *	Message structure for NSS IPsec messages.
  */
@@ -425,6 +466,23 @@ extern struct nss_ctx_instance *nss_ipsec_cmn_get_context(void);
 extern uint32_t nss_ipsec_cmn_get_ifnum_with_coreid(int32_t ifnum);
 
 /**
+ * nss_ipsec_cmn_unregister_if
+ *	Deregisters an IPSEC tunnel interface from the NSS.
+ *
+ * @param[in] if_num  NSS interface number.
+ *
+ * @return
+ * None.
+ *
+ * @dependencies
+ * The tunnel interface must have been previously registered.
+ *
+ * @return
+ * True if successful, else false.
+ */
+extern bool nss_ipsec_cmn_unregister_if(uint32_t if_num);
+
+/**
  * nss_ipsec_cmn_register_if
  *	Registers the IPsec interface with the NSS for sending and
  *	receiving messages.
@@ -452,39 +510,6 @@ extern struct nss_ctx_instance *nss_ipsec_cmn_register_if(uint32_t if_num, struc
 						uint32_t features, enum nss_dynamic_interface_type type, void *app_data);
 
 /**
- * nss_ipsec_cmn_unregister_if
- *	Deregisters a IPSEC tunnel interface from the NSS.
- *
- * @param[in] if_num  NSS interface number.
-. *
- * @return
- * None.
- *
- * @dependencies
- * The tunnel interface must have been previously registered.
- *
- * @return
- * True if successful, else false.
- */
-extern bool nss_ipsec_cmn_unregister_if(uint32_t if_num);
-
-/**
- * nss_ipsec_cmn_notify_register
- *	Register an event callback to handle notification from IPsec firmware package.
- *
- * @datatypes
- * nss_ipsec_cmn_msg_callback_t \n
- *
- * @param[in] ifnum     NSS interface number.
- * @param[in] cb        Callback for IPsec message.
- * @param[in] app_data  Pointer to the application context.
- *
- * @return
- * Pointer to NSS core context.
- */
-extern struct nss_ctx_instance *nss_ipsec_cmn_notify_register(uint32_t ifnum, nss_ipsec_cmn_msg_callback_t cb, void *app_data);
-
-/**
  * nss_ipsec_cmn_notify_unregister
  *	Deregisters the message notifier from the HLOS driver.
  *
@@ -501,6 +526,22 @@ extern struct nss_ctx_instance *nss_ipsec_cmn_notify_register(uint32_t ifnum, ns
  * The message notifier must have been previously registered.
  */
 extern void nss_ipsec_cmn_notify_unregister(struct nss_ctx_instance *ctx, uint32_t if_num);
+
+/**
+ * nss_ipsec_cmn_notify_register
+ *	Registers an event callback to handle notifications from the IPsec firmware package.
+ *
+ * @datatypes
+ * nss_ipsec_cmn_msg_callback_t \n
+ *
+ * @param[in] ifnum     NSS interface number.
+ * @param[in] cb        Callback for IPsec message.
+ * @param[in] app_data  Pointer to the application context.
+ *
+ * @return
+ * Pointer to the NSS core context.
+ */
+extern struct nss_ctx_instance *nss_ipsec_cmn_notify_register(uint32_t ifnum, nss_ipsec_cmn_msg_callback_t cb, void *app_data);
 
 /**
  * nss_ipsec_cmn_msg_init
@@ -614,6 +655,34 @@ extern bool nss_ipsec_cmn_ppe_port_config(struct nss_ctx_instance *ctx, struct n
  * True if successful, else false.
  */
 bool nss_ipsec_cmn_ppe_mtu_update(struct nss_ctx_instance *ctx, uint32_t if_num, uint16_t mtu, uint16_t mru);
+
+/**
+ * nss_ipsec_cmn_stats_unregister_notifier
+ *	Deregisters a statistics notifier.
+ *
+ * @datatypes
+ *	notifier_block
+ *
+ * @param[in] nb Notifier block.
+ *
+ * @return
+ * 0 on success or non-zero on failure.
+ */
+extern int nss_ipsec_cmn_stats_unregister_notifier(struct notifier_block *nb);
+
+/**
+ * nss_ipsec_cmn_stats_register_notifier
+ *	Registers a statistics notifier.
+ *
+ * @datatypes
+ *	notifier_block
+ *
+ * @param[in] nb Notifier block.
+ *
+ * @return
+ * 0 on success or non-zero on failure.
+ */
+extern int nss_ipsec_cmn_stats_register_notifier(struct notifier_block *nb);
 
 /**
  * @}

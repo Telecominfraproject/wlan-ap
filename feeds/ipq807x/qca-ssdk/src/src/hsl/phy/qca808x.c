@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018-2019, 2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -37,6 +37,25 @@ struct qca808x_phy_info* qca808x_phy_info_get(a_uint32_t phy_addr)
 
 	SSDK_ERROR("%s can't get the data for phy addr: %d\n", __func__, phy_addr);
 	return NULL;
+}
+
+static a_bool_t qca808x_sfp_present(struct phy_device *phydev)
+{
+	qca808x_priv *priv = phydev->priv;
+	struct qca808x_phy_info *pdata = priv->phy_info;
+	a_uint32_t phy_id = 0;
+	sw_error_t rv = SW_OK;
+
+	if (!pdata) {
+		SSDK_ERROR("pdata is null\n");
+		return A_FALSE;
+	}
+	rv = qca808x_phy_get_phy_id(pdata->dev_id, pdata->phy_addr, &phy_id);
+	if(rv == SW_READ_ERROR) {
+		return A_FALSE;
+	}
+
+	return A_TRUE;
 }
 
 static sw_error_t qca808x_phy_config_init(struct phy_device *phydev)
@@ -158,7 +177,8 @@ static sw_error_t qca808x_phy_config_init(struct phy_device *phydev)
 	return SW_OK;
 }
 
-static int qca808x_config_init(struct phy_device *phydev)
+static a_bool_t qca808x_config_init_done = A_FALSE;
+static int _qca808x_config_init(struct phy_device *phydev)
 {
 	int ret = 0;
 #if defined(IN_LINUX_STD_PTP)
@@ -167,6 +187,23 @@ static int qca808x_config_init(struct phy_device *phydev)
 #endif
 
 	ret |= qca808x_phy_config_init(phydev);
+
+	return ret;
+}
+
+static int qca808x_config_init(struct phy_device *phydev)
+{
+	int ret = 0;
+
+	if(!qca808x_sfp_present(phydev))
+	{
+		return 0;
+	}
+	ret = _qca808x_config_init(phydev);
+	if(!ret)
+	{
+		qca808x_config_init_done = A_TRUE;
+	}
 
 	return ret;
 }
@@ -301,6 +338,11 @@ static int qca808x_config_aneg(struct phy_device *phydev)
 	qca808x_priv *priv = phydev->priv;
 	const struct qca808x_phy_info *pdata = priv->phy_info;
 
+	if(!qca808x_sfp_present(phydev))
+	{
+		return 0;
+	}
+
 	if (!pdata) {
 		return SW_FAIL;
 	}
@@ -355,10 +397,18 @@ static int qca808x_aneg_done(struct phy_device *phydev)
 
 static int qca808x_read_status(struct phy_device *phydev)
 {
-	struct port_phy_status phy_status;
+	struct port_phy_status phy_status = {0};
 	a_uint32_t dev_id = 0, phy_id = 0;
 	qca808x_priv *priv = phydev->priv;
 	const struct qca808x_phy_info *pdata = priv->phy_info;
+
+	if(!qca808x_config_init_done)
+	{
+		if(!_qca808x_config_init(phydev))
+		{
+			qca808x_config_init_done = A_TRUE;
+		}
+	}
 
 	if (!pdata) {
 		return SW_FAIL;
@@ -437,6 +487,10 @@ static int qca808x_soft_reset(struct phy_device *phydev)
 	a_uint32_t dev_id = 0, phy_id = 0;
 	qca808x_priv *priv = phydev->priv;
 	const struct qca808x_phy_info *pdata = priv->phy_info;
+
+	if(!qca808x_sfp_present(phydev)) {
+		return 0;
+	}
 
 	if (!pdata) {
 		return SW_FAIL;
@@ -561,16 +615,12 @@ void qca808x_phydev_init(a_uint32_t dev_id, a_uint32_t port_id)
 	/* in i2c mode, need to register a fake phy device
 	 * before the phy driver register */
 	if (hsl_port_phy_access_type_get(dev_id, port_id) == PHY_I2C_ACCESS) {
-		a_uint32_t phy_id = 0;
-		sw_error_t ret = SW_OK;
-		ret = qca808x_phy_get_phy_id(dev_id, pdata->phy_addr, &phy_id);
-		if (ret != SW_OK) {
-			SSDK_ERROR("%s fail to get phy id\n", __func__);
+		a_uint32_t phy_id = QCA8081_PHY_V1_1;
+		qca808x_phy_get_phy_id(dev_id, pdata->phy_addr, &phy_id);
+		if(phy_id != QCA8081_PHY_V1_1 && phy_id != INVALID_PHY_ID) {
+			SSDK_ERROR("phy id 0x%x is not supported\n", phy_id);
 			return;
 		}
-                if(phy_id == INVALID_PHY_ID) {
-                        phy_id = QCA8081_PHY_V1_1;
-                }
 		pdata->phydev_addr = qca_ssdk_port_to_phy_mdio_fake_addr(dev_id, port_id);
 		sfp_phy_device_setup(dev_id, port_id, phy_id);
 	}

@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2017-2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -62,7 +62,7 @@
 				/**< Maximum number of bandwidth supported. */
 #define NSS_WIFILI_REPT_MU_MIMO 1
 #define NSS_WIFILI_REPT_MU_OFDMA_MIMO 3
-#define NSS_WIFILI_MAX_RESERVED_TYPE 3
+#define NSS_WIFILI_MAX_RESERVED_TYPE 2
 				/**< Maximum reserved type. */
 #define NSS_WIFILI_SOC_PER_PACKET_METADATA_SIZE 60
 				/**< Metadata area total size. */
@@ -96,6 +96,11 @@
 				/**< WBM internal maximum errors. */
 
 /*
+ * Peer Size in Bytes
+ */
+#define NSS_WIFILI_PEER_SIZE 1600
+
+/*
  * Radio specific flags
  */
 #define NSS_WIFILI_PDEV_FLAG_V3_STATS_ENABLED 0x00000008
@@ -104,6 +109,27 @@
  * Peer message flags.
  */
 #define NSS_WIFILI_PEER_MSG_DISABLE_4ADDR 0x01
+
+#ifdef __KERNEL__ /* only kernel will use. */
+
+/**
+ * Wireless Multimedia Extention Access Category to TID. @hideinitializer
+ */
+#define NSS_WIFILI_WME_AC_TO_TID(_ac) (	\
+		((_ac) == NSS_WIFILI_WME_AC_VO) ? 6 : \
+		(((_ac) == NSS_WIFILI_WME_AC_VI) ? 5 : \
+		(((_ac) == NSS_WIFILI_WME_AC_BK) ? 1 : \
+		0)))
+
+/**
+ * Wireless TID to Wireless Extension Multimedia Access Category. @hideinitializer
+ */
+#define NSS_WIFILI_TID_TO_WME_AC(_tid) (	\
+		(((_tid) == 0) || ((_tid) == 3)) ? NSS_WIFILI_WME_AC_BE : \
+		((((_tid) == 1) || ((_tid) == 2)) ? NSS_WIFILI_WME_AC_BK : \
+		((((_tid) == 4) || ((_tid) == 5)) ? NSS_WIFILI_WME_AC_VI : \
+		NSS_WIFILI_WME_AC_VO)))
+#endif /* __KERNEL */
 
 /**
  * nss_wifili_thread_scheme_id
@@ -209,6 +235,9 @@ enum nss_wifili_msg_types {
 	NSS_WIFILI_PEER_EXT_STATS_MSG,
 	NSS_WIFILI_CLR_STATS,
 	NSS_WIFILI_PEER_4ADDR_EVENT_MSG,
+	NSS_WIFILI_DBDC_REPEATER_LOOP_DETECTION_MSG,
+	NSS_WIFILI_PEER_UPDATE_AUTH_FLAG,
+	NSS_WIFILI_SEND_MESH_CAPABILITY_INFO,
 	NSS_WIFILI_MAX_MSG
 };
 
@@ -384,6 +413,7 @@ enum nss_wifili_radio_cmd {
 	NSS_WIFILI_SET_FORCE_CLIENT_MCAST_TRAFFIC,	/**< Flag to force multicast traffic for a radio. */
 	NSS_WIFILI_SET_DROP_SECONDARY_MCAST,		/**< Flag to drop multicast traffic on secondary radio. */
 	NSS_WIFILI_SET_DBDC_FASTLANE,			/**< Flag to set DBDC fast-lane mode. */
+	NSS_WIFILI_SET_DBDC_NOBACKHAUL_RADIO,           /**< Flag to set DBDC to no backhaul radio. */
 	NSS_WIFILI_RADIO_MAX_CMD			/**< Maximum radio command index. */
 };
 
@@ -680,6 +710,8 @@ struct nss_wifili_hal_srng_soc_msg {
 			/**< Shadow read pointer address. */
 	uint32_t shadow_wrptr_mem_addr;
 			/**< Shadow write pointer address. */
+	uint32_t lmac_rings_start_id;
+			/**< start id of LMAC rings. */
 };
 
 /**
@@ -1308,6 +1340,7 @@ struct nss_wifili_rx_err {
 struct nss_wifili_rx_ctrl_stats {
 	struct nss_wifili_rx_err err;			/**< Rx peer errors. */
 	uint32_t multipass_rx_pkt_drop;         /**< Total number of multipass packets without a VLAN header. */
+	uint32_t peer_unauth_rx_pkt_drop;		/**< Number of receive packets dropped due to an authorized peer. */
 	uint32_t reserved_type[NSS_WIFILI_MAX_RESERVED_TYPE];	/**< Reserved type for future use. */
 	uint32_t non_amsdu_cnt;			/**< Number of MSDUs with no MSDU level aggregation. */
 	uint32_t amsdu_cnt;			/**< Number of MSDUs part of AMSDU. */
@@ -1561,6 +1594,14 @@ struct nss_wifili_peer_isolation_msg {
 };
 
 /**
+ * nss_wifili_dbdc_repeater_loop_detection_msg
+ *	Wifili DBDC repeater loop detection message.
+ */
+struct nss_wifili_dbdc_repeater_loop_detection_msg {
+	bool dbdc_loop_detected;		/**< DBDC repeater loop detection flag. */
+};
+
+/**
  * nss_wifili_dbdc_repeater_set_msg
  *	Wifili DBDC repeater set message.
  */
@@ -1610,6 +1651,16 @@ struct nss_wifili_enable_v3_stats_msg {
  */
 struct nss_wifili_clr_stats_msg {
 	uint8_t vdev_id;;	/**< VAP ID. */
+};
+
+/**
+ * nss_wifili_update_auth_flag
+ * 	Peer authentication flag message.
+ */
+struct nss_wifili_peer_update_auth_flag {
+	uint16_t peer_id;		/**< Peer ID. */
+	uint8_t auth_flag;		/**< Peer authentication flag. */
+	uint8_t reserved;		/**< Alignment padding. */
 };
 
 /**
@@ -1670,12 +1721,20 @@ struct nss_wifili_radio_cfg_msg {
 
 /**
  * struct wifili_peer_wds_4addr_allow_msg
- *	Per peer four address configuration message.
+ *	Per-peer four address configuration message.
  */
 struct nss_wifili_peer_wds_4addr_allow_msg {
 	uint32_t peer_id;	/**< Peer ID. */
 	uint32_t if_num;	/**< Associate virtual interface number. */
 	bool enable;		/**< Boolean flag to enable/disable four address frames. */
+};
+
+/**
+ * struct nss_wifili_mesh_capability_info
+ * 	Wi-Fi mesh capability flag.
+ */
+struct nss_wifili_mesh_capability_info {
+	bool mesh_enable;	/**< Wi-Fi mesh capability flag. */
 };
 
 /**
@@ -1755,7 +1814,13 @@ struct nss_wifili_msg {
 		struct nss_wifili_clr_stats_msg clrstats;
 				/**< Clear NSS firmware statistics. */
 		struct nss_wifili_peer_wds_4addr_allow_msg wpswm;
-				/**< Peer four address event message. */
+				/**< Peer four-address event message. */
+		struct nss_wifili_dbdc_repeater_loop_detection_msg wdrldm;
+				/**< Wifili DBDC repeater loop detection message. */
+		struct nss_wifili_peer_update_auth_flag peer_auth;
+				/**< Peer authentication flag message. */
+		struct nss_wifili_mesh_capability_info cap_info;
+				/**< Mesh capability flag. */
 	} msg;			/**< Message payload. */
 };
 
@@ -1900,7 +1965,21 @@ void nss_unregister_wifili_radio_if(uint32_t if_num);
  * @return
  * External interface number.
  */
-uint32_t nss_get_available_wifili_external_if(void);
+nss_if_num_t nss_get_available_wifili_external_if(void);
+
+/**
+ * nss_wifili_release_external_if
+ *	Release the used interface number
+ *
+ * @datatypes
+ * nss_if_num
+ *
+ * @param[in] if_num             NSS interface number.
+ *
+ * @return
+ * void
+ */
+void nss_wifili_release_external_if(nss_if_num_t ifnum);
 
 /**
  * nss_wifili_thread_scheme_alloc

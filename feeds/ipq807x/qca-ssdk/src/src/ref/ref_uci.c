@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2015, 2017-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013, 2015, 2017-2019, 2021, The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -10161,6 +10161,34 @@ parse_policer_aclentry(struct switch_val *val)
 	return rv;
 }
 
+static int
+parse_policer_bypass(struct switch_val *val)
+{
+	struct switch_ext *switch_ext_p, *ext_value_p;
+	int rv = 0;
+	switch_ext_p = val->value.ext_val;
+	while(switch_ext_p) {
+		ext_value_p = switch_ext_p;
+
+		if(!strcmp(ext_value_p->option_name, "name")) {
+			switch_ext_p = switch_ext_p->next;
+			continue;
+		} else if(!strcmp(ext_value_p->option_name, "frame_type")) {
+			val_ptr[0] = (char*)ext_value_p->option_value;
+		} else if(!strcmp(ext_value_p->option_name, "bypass_status")) {
+			val_ptr[1] = (char*)ext_value_p->option_value;
+		}  else {
+			rv = -1;
+			break;
+		}
+
+		parameter_length++;
+		switch_ext_p = switch_ext_p->next;
+	}
+
+	return rv;
+}
+
 #endif
 
 #ifdef IN_SHAPER
@@ -11359,6 +11387,8 @@ parse_policer(const char *command_name, struct switch_val *val)
 		rv = parse_policer_portentry(val);
 	} else if(!strcmp(command_name, "Aclentry")) {
 		rv = parse_policer_aclentry(val);
+	} else if(!strcmp(command_name, "Bypass")) {
+		rv = parse_policer_bypass(val);
 	}
 
 	return rv;

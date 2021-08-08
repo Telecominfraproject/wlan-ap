@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2017-2021, The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -208,6 +208,10 @@ static int nss_dp_attr_set(struct net_device *dev,
 				struct switchdev_trans *trans)
 {
 	struct nss_dp_dev *dp_priv = (struct nss_dp_dev *)netdev_priv(dev);
+	struct net_device *upper_dev;
+	struct vlan_dev_priv *vlan;
+	struct list_head *iter;
+	uint32_t stp_state = attr->u.stp_state;
 
 	if (switchdev_trans_ph_prepare(trans))
 		return 0;
@@ -218,7 +222,33 @@ static int nss_dp_attr_set(struct net_device *dev,
 		netdev_dbg(dev, "set brport_flags %lu\n", attr->u.brport_flags);
 		return 0;
 	case SWITCHDEV_ATTR_ID_PORT_STP_STATE:
-		return nss_dp_stp_state_set(dp_priv, attr->u.stp_state);
+		/*
+		 * The stp state is not changed to FAL_STP_DISABLED if
+		 * the net_device (dev) has any vlan configured. Otherwise
+		 * traffic on other vlan(s) will not work.
+		 *
+		 * Note: STP for VLANs is not supported by PPE.
+		 */
+		if ((stp_state == BR_STATE_DISABLED) ||
+			(stp_state == BR_STATE_BLOCKING)) {
+			rcu_read_lock();
+			netdev_for_each_upper_dev_rcu(dev, upper_dev, iter) {
+				if (!is_vlan_dev(upper_dev))
+					continue;
+
+				vlan = vlan_dev_priv(upper_dev);
+				if (vlan->real_dev == dev) {
+					rcu_read_unlock();
+					netdev_dbg(dev, "Do not update stp state to: %u since vlan id: %d is configured on netdevice: %s\n",
+							stp_state, vlan->vlan_id, vlan->real_dev->name);
+					return 0;
+				}
+			}
+
+			rcu_read_unlock();
+		}
+
+		return nss_dp_stp_state_set(dp_priv, stp_state);
 	default:
 		return -EOPNOTSUPP;
 	}

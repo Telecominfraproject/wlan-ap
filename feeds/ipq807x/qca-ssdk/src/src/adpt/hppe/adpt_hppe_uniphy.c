@@ -37,29 +37,6 @@
 extern void adpt_hppe_gcc_port_speed_clock_set(a_uint32_t dev_id,
 				a_uint32_t port_id, fal_port_speed_t phy_speed);
 
-void
-__adpt_hppe_gcc_uniphy_sys_set(a_uint32_t dev_id, a_uint32_t uniphy_index,
-	a_bool_t enable)
-{
-	enum unphy_rst_type rst_type;
-
-	if (uniphy_index == SSDK_UNIPHY_INSTANCE0) {
-		rst_type = UNIPHY0_SOFT_RESET_E;
-	} else if (uniphy_index == SSDK_UNIPHY_INSTANCE1) {
-		rst_type = UNIPHY1_SOFT_RESET_E;
-	} else {
-		rst_type = UNIPHY2_SOFT_RESET_E;
-	}
-
-	if (enable == A_TRUE) {
-		ssdk_uniphy_reset(dev_id, rst_type, SSDK_RESET_DEASSERT);
-	} else {
-		ssdk_uniphy_reset(dev_id, rst_type, SSDK_RESET_ASSERT);
-	}
-
-	return;
-}
-
 static sw_error_t
 __adpt_hppe_uniphy_10g_r_linkup(a_uint32_t dev_id, a_uint32_t uniphy_index)
 {
@@ -713,10 +690,7 @@ adpt_hppe_uniphy_mode_set(a_uint32_t dev_id, a_uint32_t index, a_uint32_t mode)
 
 	if (mode == PORT_WRAPPER_MAX) {
 		ssdk_uniphy_raw_clock_reset(index);
-		__adpt_hppe_gcc_uniphy_sys_set(dev_id, index, A_FALSE);
 		return SW_OK;
-	} else {
-		__adpt_hppe_gcc_uniphy_sys_set(dev_id, index, A_TRUE);
 	}
 
 	switch(mode) {

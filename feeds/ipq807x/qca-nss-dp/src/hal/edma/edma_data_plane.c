@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -68,6 +68,76 @@ void edma_reg_write(uint32_t reg_off, uint32_t val)
 }
 
 /*
+ * edma_disable_interrupts()
+ *	Disable EDMA RX/TX interrupt masks.
+ */
+static void edma_disable_interrupts(void)
+{
+	struct edma_rxdesc_ring *rxdesc_ring = NULL;
+	struct edma_rxfill_ring *rxfill_ring = NULL;
+	struct edma_txcmpl_ring *txcmpl_ring = NULL;
+	int i;
+
+	for (i = 0; i < edma_hw.rxdesc_rings; i++) {
+		rxdesc_ring = &edma_hw.rxdesc_ring[i];
+		edma_reg_write(EDMA_REG_RXDESC_INT_MASK(rxdesc_ring->id),
+			       EDMA_MASK_INT_CLEAR);
+	}
+
+	for (i = 0; i < edma_hw.txcmpl_rings; i++) {
+		txcmpl_ring = &edma_hw.txcmpl_ring[i];
+		edma_reg_write(EDMA_REG_TX_INT_MASK(txcmpl_ring->id),
+			       EDMA_MASK_INT_CLEAR);
+	}
+
+	for (i = 0; i < edma_hw.rxfill_rings; i++) {
+		rxfill_ring = &edma_hw.rxfill_ring[i];
+		edma_reg_write(EDMA_REG_RXFILL_INT_MASK(rxfill_ring->id),
+			       EDMA_MASK_INT_CLEAR);
+	}
+
+	/*
+	 * Clear MISC interrupt mask.
+	 */
+	edma_reg_write(EDMA_REG_MISC_INT_MASK, EDMA_MASK_INT_CLEAR);
+}
+
+/*
+ * edma_enable_interrupts()
+ *	Enable RX/TX EDMA interrupt masks.
+ */
+static void edma_enable_interrupts(void)
+{
+	struct edma_rxdesc_ring *rxdesc_ring = NULL;
+	struct edma_rxfill_ring *rxfill_ring = NULL;
+	struct edma_txcmpl_ring *txcmpl_ring = NULL;
+	int i;
+
+	for (i = 0; i < edma_hw.rxfill_rings; i++) {
+		rxfill_ring = &edma_hw.rxfill_ring[i];
+		edma_reg_write(EDMA_REG_RXFILL_INT_MASK(rxfill_ring->id),
+				edma_hw.rxfill_intr_mask);
+	}
+
+	for (i = 0; i < edma_hw.txcmpl_rings; i++) {
+		txcmpl_ring = &edma_hw.txcmpl_ring[i];
+		edma_reg_write(EDMA_REG_TX_INT_MASK(txcmpl_ring->id),
+				edma_hw.txcmpl_intr_mask);
+	}
+
+	for (i = 0; i < edma_hw.rxdesc_rings; i++) {
+		rxdesc_ring = &edma_hw.rxdesc_ring[i];
+		edma_reg_write(EDMA_REG_RXDESC_INT_MASK(rxdesc_ring->id),
+				edma_hw.rxdesc_intr_mask);
+	}
+
+	/*
+	 * Enable MISC interrupt mask.
+	 */
+	edma_reg_write(EDMA_REG_MISC_INT_MASK, edma_hw.misc_intr_mask);
+}
+
+/*
  * nss_dp_edma_if_open()
  *	Do slow path data plane open
  */
@@ -85,6 +155,12 @@ static int edma_if_open(struct nss_dp_data_plane_ctx *dpc,
 		return NSS_DP_SUCCESS;
 
 	napi_enable(&edma_hw.napi);
+
+	/*
+	 * Enable the interrupt masks.
+	 */
+	edma_enable_interrupts();
+
 	return NSS_DP_SUCCESS;
 }
 
@@ -96,6 +172,11 @@ static int edma_if_close(struct nss_dp_data_plane_ctx *dpc)
 {
 	if (--edma_hw.active != 0)
 		return NSS_DP_SUCCESS;
+
+	/*
+	 * Disable the interrupt masks.
+	 */
+	edma_disable_interrupts();
 
 	/*
 	 * Disable NAPI
@@ -311,9 +392,6 @@ static int edma_if_deinit(struct nss_dp_data_plane_ctx *dpc)
  */
 static int edma_irq_init(void)
 {
-	struct edma_rxdesc_ring *rxdesc_ring = NULL;
-	struct edma_rxfill_ring *rxfill_ring = NULL;
-	struct edma_txcmpl_ring *txcmpl_ring = NULL;
 	int err;
 	uint32_t entry_num, i;
 
@@ -433,28 +511,6 @@ static int edma_irq_init(void)
 		goto misc_intr_req_fail;
 	}
 
-	/*
-	 * Set interrupt mask
-	 */
-	for (i = 0; i < edma_hw.rxfill_rings; i++) {
-		rxfill_ring = &edma_hw.rxfill_ring[i];
-		edma_reg_write(EDMA_REG_RXFILL_INT_MASK(rxfill_ring->id),
-				edma_hw.rxfill_intr_mask);
-	}
-
-	for (i = 0; i < edma_hw.txcmpl_rings; i++) {
-		txcmpl_ring = &edma_hw.txcmpl_ring[i];
-		edma_reg_write(EDMA_REG_TX_INT_MASK(txcmpl_ring->id),
-				edma_hw.txcmpl_intr_mask);
-	}
-
-	for (i = 0; i < edma_hw.rxdesc_rings; i++) {
-		rxdesc_ring = &edma_hw.rxdesc_ring[i];
-		edma_reg_write(EDMA_REG_RXDESC_INT_MASK(rxdesc_ring->id),
-				edma_hw.rxdesc_intr_mask);
-	}
-
-	edma_reg_write(EDMA_REG_MISC_INT_MASK, edma_hw.misc_intr_mask);
 	return 0;
 
 misc_intr_req_fail:

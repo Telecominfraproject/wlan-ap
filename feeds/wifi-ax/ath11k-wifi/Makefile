@@ -102,7 +102,7 @@ define Package/ath11k-wifi-qcom-ipq8074/install
 endef
 
 define Package/ath11k-wifi-qcom-ipq6018/install
-	$(INSTALL_DIR) $(1)/lib/firmware/IPQ6018/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
 	$(INSTALL_DATA) ./board-2.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
 endef
 

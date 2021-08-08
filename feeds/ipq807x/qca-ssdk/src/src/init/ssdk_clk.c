@@ -465,13 +465,17 @@ static void ssdk_ppe_fixed_clock_init(a_uint32_t revision)
 #endif
 
 #if defined(MP)
-#define TCSR_ETH_ADDR		0x19475C4
-#define TCSR_ETH_SIZE		4
-#define ETH_LDO_RDY		  0x1
-#define CMN_PLL_LOCKED_ADDR	         0x9B064
-#define CMN_PLL_LOCKED_SIZE	         4
-#define CMN_PLL_LOCKED		4
-#define MP_RAW_CLOCK_INSTANCE	       2
+#define TCSR_ETH_ADDR               0x19475C0
+#define TCSR_ETH_SIZE               0x4
+#define TCSR_GEPHY_LDO_BIAS_EN      0
+#define TCSR_ETH_LDO_RDY            0x4
+
+#define GEPHY_LDO_BIAS_EN           0x1
+#define ETH_LDO_RDY                 0x1
+#define CMN_PLL_LOCKED_ADDR         0x9B064
+#define CMN_PLL_LOCKED_SIZE         0x4
+#define CMN_PLL_LOCKED              0x4
+#define MP_RAW_CLOCK_INSTANCE       0x2
 
 static char *mp_rst_ids[MP_BCR_RST_MAX] = {
 	GEHPY_BCR_RESET_ID,
@@ -615,22 +619,66 @@ static void ssdk_mp_uniphy_clock_enable(void)
 }
 
 static void
-ssdk_mp_cmnblk_enable(void)
+ssdk_mp_tcsr_get(a_uint32_t tcsr_offset, a_uint32_t *tcsr_val)
 {
-	void __iomem *tcsr_eth = NULL;
-	a_uint32_t reg_val;
+	void __iomem *tcsr_base = NULL;
 
-	tcsr_eth = ioremap_nocache(TCSR_ETH_ADDR, TCSR_ETH_SIZE);
-	if (!tcsr_eth) {
+	tcsr_base = ioremap_nocache(TCSR_ETH_ADDR, TCSR_ETH_SIZE);
+	if (!tcsr_base)
+	{
 		SSDK_ERROR("Failed to map tcsr eth address!\n");
 		return;
 	}
+	*tcsr_val = readl(tcsr_base + tcsr_offset);
+	iounmap(tcsr_base);
 
-	reg_val = readl(tcsr_eth);
+	return;
+}
+
+static void
+ssdk_mp_tcsr_set(a_uint32_t tcsr_offset, a_uint32_t tcsr_val)
+{
+	void __iomem *tcsr_base = NULL;
+
+	tcsr_base = ioremap_nocache(TCSR_ETH_ADDR, TCSR_ETH_SIZE);
+	if (!tcsr_base)
+	{
+		SSDK_ERROR("Failed to map tcsr eth address!\n");
+		return;
+	}
+	writel(tcsr_val, tcsr_base + tcsr_offset);
+	iounmap(tcsr_base);
+
+	return;
+}
+
+static void
+ssdk_mp_cmnblk_enable(void)
+{
+	a_uint32_t reg_val;
+
+	ssdk_mp_tcsr_get(TCSR_ETH_LDO_RDY, &reg_val);
 	reg_val |= ETH_LDO_RDY;
-	writel(reg_val, tcsr_eth);
+	ssdk_mp_tcsr_set(TCSR_ETH_LDO_RDY, reg_val);
 
-	iounmap(tcsr_eth);
+	return;
+}
+
+void
+ssdk_mp_gephy_icc_efuse_load_enable(a_bool_t enable)
+{
+	a_uint32_t reg_val;
+
+	ssdk_mp_tcsr_get(TCSR_GEPHY_LDO_BIAS_EN, &reg_val);
+	if(!enable)
+	{
+		reg_val |= GEPHY_LDO_BIAS_EN;
+	}
+	else
+	{
+		reg_val &= ~GEPHY_LDO_BIAS_EN;
+	}
+	ssdk_mp_tcsr_set(TCSR_GEPHY_LDO_BIAS_EN, reg_val);
 }
 
 static a_bool_t
@@ -688,7 +736,7 @@ ssdk_mp_reset_init(void)
 	i = UNIPHY1_SOFT_RESET_E;
 	uniphy_rsts[i] = of_reset_control_get(rst_node, UNIPHY1_SOFT_RESET_ID);
 
-	SSDK_INFO("MP reset successfully!1\n");
+	SSDK_INFO("MP reset successfully!\n");
 #endif
 }
 
@@ -855,6 +903,27 @@ void ssdk_uniphy_raw_clock_set(
 #endif
 }
 
+void ssdk_uniphy_port5_clock_source_set(void)
+{
+#if defined(CONFIG_OF) && (LINUX_VERSION_CODE >= KERNEL_VERSION(4,4,0))
+	a_uint32_t id, mode, i;
+
+	mode = ssdk_dt_global_get_mac_mode(0, SSDK_UNIPHY_INSTANCE1);
+
+	for (i = UNIPHY_RX; i <= UNIPHY_TX; i++) {
+		if (mode == PORT_INTERFACE_MODE_MAX) {
+			id = SSDK_UNIPHY_INSTANCE0*2 + i;
+		} else {
+			id = SSDK_UNIPHY_INSTANCE1*2 + i;
+		}
+		if (clk_set_parent(uniphy_port_clks[PORT5_RX_SRC_E + i],
+			uniphy_raw_clks[id]->clk)) {
+			SSDK_ERROR("set parent fail!\n");
+		}
+	}
+#endif
+}
+
 static
 void ssdk_gcc_ppe_clock_init(a_uint32_t revision, enum cmnblk_clk_type mode)
 {
@@ -863,6 +932,7 @@ void ssdk_gcc_ppe_clock_init(a_uint32_t revision, enum cmnblk_clk_type mode)
 	/*fixme for cmn clock init*/
 	ssdk_cmnblk_init(mode);
 	ssdk_ppe_uniphy_clock_init(revision);
+	ssdk_uniphy_port5_clock_source_set();
 #endif
 }
 #endif
@@ -1202,6 +1272,34 @@ void ssdk_ppe_reset_init(void)
 		port_rsts[i-1] = of_reset_control_get(rst_node,
 							port_rst_ids[i-1]);
 #endif
+}
+
+void ssdk_gcc_uniphy_sys_set(a_uint32_t dev_id, a_uint32_t uniphy_index,
+	a_bool_t enable)
+{
+	enum unphy_rst_type rst_type;
+
+	if (of_device_is_compatible(clock_node, "qcom,ess-switch-ipq60xx")){
+		if (uniphy_index > SSDK_UNIPHY_INSTANCE1) {
+			return;
+		}
+	}
+
+	if (uniphy_index == SSDK_UNIPHY_INSTANCE0) {
+		rst_type = UNIPHY0_SOFT_RESET_E;
+	} else if (uniphy_index == SSDK_UNIPHY_INSTANCE1) {
+		rst_type = UNIPHY1_SOFT_RESET_E;
+	} else {
+		rst_type = UNIPHY2_SOFT_RESET_E;
+	}
+
+	if (enable == A_TRUE) {
+		ssdk_uniphy_reset(dev_id, rst_type, SSDK_RESET_DEASSERT);
+	} else {
+		ssdk_uniphy_reset(dev_id, rst_type, SSDK_RESET_ASSERT);
+	}
+
+	return;
 }
 #endif
 

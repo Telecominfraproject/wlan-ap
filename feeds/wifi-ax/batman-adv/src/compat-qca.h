@@ -52,21 +52,6 @@ int ipv6_mc_check_mld(struct sk_buff *skb);
 #include_next <linux/igmp.h>
 #include_next <net/addrconf.h>
 
-static inline int batadv_ipv6_mc_check_mld1(struct sk_buff *skb)
-{
-	return ipv6_mc_check_mld(skb, NULL);
-}
-
-static inline int batadv_ipv6_mc_check_mld2(struct sk_buff *skb,
-					    struct sk_buff **skb_trimmed)
-{
-	return ipv6_mc_check_mld(skb, skb_trimmed);
-}
-
-#define ipv6_mc_check_mld_get(_1, _2, ipv6_mc_check_mld_name, ...) ipv6_mc_check_mld_name
-#define ipv6_mc_check_mld(...) \
-	ipv6_mc_check_mld_get(__VA_ARGS__, batadv_ipv6_mc_check_mld2, batadv_ipv6_mc_check_mld1)(__VA_ARGS__)
-
 static inline int batadv_ip_mc_check_igmp1(struct sk_buff *skb)
 {
 	return ip_mc_check_igmp(skb, NULL);
@@ -229,17 +214,3 @@ static inline int batadv_access_ok(int type, const void __user *p,
 #endif
 
 #endif /* < KERNEL_VERSION(5, 4, 0) */
-
-
-#if LINUX_VERSION_IS_LESS(5, 10, 0)
-
-#define netif_rx_any_context batadv_netif_rx_any_context
-static inline int batadv_netif_rx_any_context(struct sk_buff *skb)
-{
-	if (in_interrupt())
-		return netif_rx(skb);
-	else
-		return netif_rx_ni(skb);
-}
-
-#endif /* LINUX_VERSION_IS_LESS(5, 10, 0) */

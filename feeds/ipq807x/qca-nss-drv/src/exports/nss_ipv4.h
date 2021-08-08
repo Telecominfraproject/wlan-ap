@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2014-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -30,6 +30,111 @@
  * @addtogroup nss_ipv4_subsystem
  * @{
  */
+
+/*
+ * IPv4 connection flags (to be used with nss_ipv4_create::flags).
+ */
+#define NSS_IPV4_CREATE_FLAG_NO_SEQ_CHECK 0x01
+		/**< Rule for not checking sequence numbers. */
+#define NSS_IPV4_CREATE_FLAG_BRIDGE_FLOW 0x02
+		/**< Rule that indicates pure bridge flow (no routing is involved). */
+#define NSS_IPV4_CREATE_FLAG_ROUTED 0x04	/**< Rule for a routed connection. */
+
+#define NSS_IPV4_CREATE_FLAG_DSCP_MARKING 0x08	/**< Rule for DSCP marking. */
+#define NSS_IPV4_CREATE_FLAG_VLAN_MARKING 0x10	/**< Rule for VLAN marking. */
+#define NSS_IPV4_CREATE_FLAG_QOS_VALID 0x20	/**< Rule for QoS is valid. */
+
+/**
+ * nss_ipv4_create
+ *	Information for an IPv4 flow or connection create rule.
+ *
+ * All fields must be passed in host-endian order.
+ */
+struct nss_ipv4_create {
+	int32_t src_interface_num;
+				/**< Source interface number (virtual or physical). */
+	int32_t dest_interface_num;
+				/**< Destination interface number (virtual or physical). */
+	int32_t protocol;	/**< L4 protocol (e.g., TCP or UDP). */
+	uint32_t flags;		/**< Flags (if any) associated with this rule. */
+	uint32_t from_mtu;	/**< MTU of the incoming interface. */
+	uint32_t to_mtu;	/**< MTU of the outgoing interface. */
+	uint32_t src_ip;	/**< Source IP address. */
+	int32_t src_port;	/**< Source L4 port (e.g., TCP or UDP port). */
+	uint32_t src_ip_xlate;	/**< Translated source IP address (used with SNAT). */
+	int32_t src_port_xlate;	/**< Translated source L4 port (used with SNAT). */
+	uint32_t dest_ip;	/**< Destination IP address. */
+	int32_t dest_port;	/**< Destination L4 port (e.g., TCP or UDP port). */
+	uint32_t dest_ip_xlate;
+			/**< Translated destination IP address (used with DNAT). */
+	int32_t dest_port_xlate;
+			/**< Translated destination L4 port (used with DNAT). */
+	uint8_t src_mac[ETH_ALEN];
+			/**< Source MAC address. */
+	uint8_t dest_mac[ETH_ALEN];
+			/**< Destination MAC address. */
+	uint8_t src_mac_xlate[ETH_ALEN];
+			/**< Translated source MAC address (post-routing). */
+	uint8_t dest_mac_xlate[ETH_ALEN];
+			/**< Translated destination MAC address (post-routing). */
+	uint8_t flow_window_scale;	/**< Window scaling factor (TCP). */
+	uint32_t flow_max_window;	/**< Maximum window size (TCP). */
+	uint32_t flow_end;		/**< TCP window end. */
+	uint32_t flow_max_end;		/**< TCP window maximum end. */
+	uint32_t flow_pppoe_if_exist;
+			/**< Flow direction: PPPoE interface exist flag. */
+	int32_t flow_pppoe_if_num;
+			/**< Flow direction: PPPoE interface number. */
+	uint16_t ingress_vlan_tag;	/**< Ingress VLAN tag expected for this flow. */
+	uint8_t return_window_scale;
+			/**< Window scaling factor of the return direction (TCP). */
+	uint32_t return_max_window;
+			/**< Maximum window size of the return direction. */
+	uint32_t return_end;
+			/**< Flow end for the return direction. */
+	uint32_t return_max_end;
+			/**< Flow maximum end for the return direction. */
+	uint32_t return_pppoe_if_exist;
+			/**< Return direction: PPPoE interface existence flag. */
+	int32_t return_pppoe_if_num;
+			/**< Return direction: PPPoE interface number. */
+	uint16_t egress_vlan_tag;	/**< Egress VLAN tag expected for this flow. */
+	uint8_t spo_needed;		/**< Indicates whether SPO is required. */
+	uint32_t param_a0;		/**< Custom parameter 0. */
+	uint32_t param_a1;		/**< Custom parameter 1. */
+	uint32_t param_a2;		/**< Custom parameter 2. */
+	uint32_t param_a3;		/**< Custom parameter 3. */
+	uint32_t param_a4;		/**< Custom parameter 4. */
+	uint32_t qos_tag;		/**< Deprecated, will be removed soon. */
+	uint32_t flow_qos_tag;		/**< QoS tag value for the flow direction. */
+	uint32_t return_qos_tag;	/**< QoS tag value for the return direction. */
+	uint8_t dscp_itag;		/**< DSCP marking tag. */
+	uint8_t dscp_imask;		/**< DSCP marking input mask. */
+	uint8_t dscp_omask;		/**< DSCP marking output mask. */
+	uint8_t dscp_oval;		/**< DSCP marking output value. */
+	uint16_t vlan_itag;		/**< VLAN marking tag. */
+	uint16_t vlan_imask;		/**< VLAN marking input mask. */
+	uint16_t vlan_omask;		/**< VLAN marking output mask. */
+	uint16_t vlan_oval;		/**< VLAN marking output value. */
+	uint32_t in_vlan_tag[MAX_VLAN_DEPTH];
+			/**< Ingress VLAN tag expected for this flow. */
+	uint32_t out_vlan_tag[MAX_VLAN_DEPTH];
+			/**< Egress VLAN tag expected for this flow. */
+	uint8_t flow_dscp;		/**< IP DSCP value for the flow direction. */
+	uint8_t return_dscp;		/**< IP DSCP value for the return direction. */
+};
+
+/**
+ * nss_ipv4_destroy
+ *	Information for an IPv4 flow or connection destroy rule.
+ */
+struct nss_ipv4_destroy {
+	int32_t protocol;	/**< L4 protocol ID. */
+	uint32_t src_ip;	/**< Source IP address. */
+	int32_t src_port;	/**< Source L4 port (e.g., TCP or UDP port). */
+	uint32_t dest_ip;	/**< Destination IP address. */
+	int32_t dest_port;	/**< Destination L4 port (e.g., TCP or UDP port). */
+};
 
 /**
  * nss_ipv4_message_types
@@ -111,6 +216,12 @@ enum nss_ipv4_stats_types {
 		/**< Number of IPv4 multicast connection destroy requests that missed the cache. */
 	NSS_IPV4_STATS_MC_CONNECTION_FLUSHES,
 		/**< Number of IPv4 multicast connection flushes. */
+	NSS_IPV4_STATS_CONNECTION_CREATE_INVALID_MIRROR_IFNUM,
+		/**< Number of IPv4 mirror connection requests with an invalid interface number. */
+	NSS_IPV4_STATS_CONNECTION_CREATE_INVALID_MIRROR_IFTYPE,
+		/**< Number of IPv4 mirror connection requests with an invalid interface type. */
+	NSS_IPV4_STATS_MIRROR_FAILURES,
+		/**< Number of IPv4 mirror failures. */
 	NSS_IPV4_STATS_MAX,
 		/**< Maximum message type. */
 };
@@ -175,6 +286,7 @@ enum nss_ipv4_stats_types {
 		/**< Ingress shaping fields are valid. */
 #define NSS_IPV4_RULE_CREATE_IDENTIFIER_VALID 0x1000
 		/**< Identifier is valid. */
+#define NSS_IPV4_RULE_CREATE_MIRROR_VALID 0x2000	/**< Mirror fields are valid. */
 
 /*
  * Multicast command rule flags
@@ -236,6 +348,15 @@ enum nss_ipv4_stats_types {
 		/**< Identifier for flow direction is valid. */
 #define NSS_IPV4_RETURN_IDENTIFIER_VALID 0x02
 		/**< Identifier for return direction is valid. */
+
+/*
+ * Mirror valid flags (to be used with the valid field of nss_ipv4_mirror_rule structure)
+ */
+#define NSS_IPV4_MIRROR_FLOW_VALID 0x01
+		/**< Mirror interface number for the flow direction is valid. */
+#define NSS_IPV4_MIRROR_RETURN_VALID 0x02
+		/**< Mirror interface number for the return direction is valid. */
+
 
 /**
  * nss_ipv4_5tuple
@@ -411,6 +532,16 @@ struct nss_ipv4_identifier_rule {
 };
 
 /**
+ * nss_ipv4_mirror_rule
+ *	Mirror rule structure.
+ */
+struct nss_ipv4_mirror_rule {
+	uint32_t valid;			/**< Mirror validity flags. */
+	nss_if_num_t flow_ifnum;	/**< Flow mirror interface number. */
+	nss_if_num_t return_ifnum;	/**< Return mirror interface number. */
+};
+
+/**
  * nss_ipv4_error_response_types
  *	Error types for IPv4 messages.
  */
@@ -478,6 +609,8 @@ struct nss_ipv4_rule_create_msg {
 			/**< Ingress shaping related accleration parameters. */
 	struct nss_ipv4_identifier_rule identifier;
 			/**< Rule for adding identifier. */
+	struct nss_ipv4_mirror_rule mirror_rule;
+			/**< Mirror rule parameter. */
 };
 
 /**
@@ -821,6 +954,16 @@ struct nss_ipv4_node_sync {
 
 	uint32_t ipv4_mc_connection_flushes;
 			/**< Number of multicast connection flushes. */
+
+	uint32_t ipv4_connection_create_invalid_mirror_ifnum;
+			/**< Number of create request failed with an invalid mirror interface number. */
+
+	uint32_t ipv4_connection_create_invalid_mirror_iftype;
+			/**< Number of create request failed with an invalid mirror interface type. */
+
+	uint32_t ipv4_mirror_failures;
+			/**< Mirror packet failed. */
+
 	uint32_t exception_events[NSS_IPV4_EXCEPTION_EVENT_MAX];
 			/**< Number of exception events. */
 };

@@ -244,6 +244,14 @@ adpt_mp_port_txfc_status_set(a_uint32_t dev_id, fal_port_t port_id,
 			GMAC_PAUSE_ZERO_QUANTA_ENABLE;
 		mac_operation_mode_ctrl.bf.enable_hw_flowctrl =
 			GMAC_HW_FLOWCTRL_ENABLE;
+		mac_operation_mode_ctrl.bf.disable_flushing_receiving_frame =
+			GMAC_FLUSH_RECEIVED_FRAMES_DISABLE;
+		/*activate flowctrl when 6KB FIFO is available*/
+		mac_operation_mode_ctrl.val &= ~(GMAC_ACTIVATE_FLOWCTRL_MASK);
+		mac_operation_mode_ctrl.val |= GMAC_ACTIVATE_FLOWCTRL_WITH_6KB;
+		/*dactivate flowctrl when 7KB FIFO is available*/
+		mac_operation_mode_ctrl.val &= ~(GMAC_DACTIVATE_FLOWCTRL_MASK);
+		mac_operation_mode_ctrl.val |= GMAC_DACTIVATE_FLOWCTRL_WITH_7KB;
 	} else {
 		mac_flow_ctrl.bf.flowctrl_tx_enable = 0;
 		mac_operation_mode_ctrl.bf.enable_hw_flowctrl =
@@ -632,7 +640,8 @@ adpt_mp_port_max_frame_size_set(a_uint32_t dev_id, fal_port_t port_id,
 	SW_RTN_ON_ERROR(rv);
 
 	mac_max_frame_ctrl.bf.max_frame_ctrl_enable = GMAC_MAX_FRAME_CTRL_ENABLE;
-	mac_max_frame_ctrl.bf.max_frame_ctrl = max_frame;
+	/* default max_frame 1518 byte doesn't include vlan tag */
+	mac_max_frame_ctrl.bf.max_frame_ctrl = max_frame + 8;
 	rv = mp_mac_max_frame_ctrl_set(dev_id, gmac_id, &mac_max_frame_ctrl);
 
 	rv = mp_mac_operation_mode_ctrl_get(dev_id, gmac_id,
@@ -1091,10 +1100,8 @@ adpt_mp_port_link_up_update(struct qca_phy_priv *priv,
 
 	msleep(50);
 
-	if (change == A_TRUE) {
-		rv = adpt_mp_port_reset_set(priv->device_id, port_id);
-		SW_RTN_ON_ERROR (rv);
-	}
+	rv = adpt_mp_port_reset_set(priv->device_id, port_id);
+	SW_RTN_ON_ERROR (rv);
 	rv = adpt_mp_port_txmac_status_set(priv->device_id,
 			port_id, A_TRUE);
 	SW_RTN_ON_ERROR (rv);

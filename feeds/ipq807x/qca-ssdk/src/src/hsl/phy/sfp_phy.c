@@ -45,7 +45,6 @@ __ETHTOOL_DECLARE_LINK_MODE_MASK(SFP_PHY_FEATURES) __ro_after_init;
 static int
 sfp_phy_probe(struct phy_device *pdev)
 {
-	pdev->autoneg = AUTONEG_DISABLE;
 	SSDK_INFO("sfp phy is probed!\n");
 	return 0;
 }

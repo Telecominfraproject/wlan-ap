@@ -35,6 +35,7 @@ enum nss_wifi_ext_vdev_msg_types {
 	NSS_WIFI_EXT_VDEV_MSG_CONFIGURE_WDS,
 	NSS_WIFI_EXT_VDEV_SET_NEXT_HOP,
 	NSS_WIFI_EXT_VDEV_MSG_STATS_SYNC,
+	NSS_WIFI_EXT_VDEV_MSG_CONFIGURE_VLAN,
 	NSS_WIFI_EXT_VDEV_MSG_MAX
 };
 
@@ -50,12 +51,16 @@ enum nss_wifi_ext_vdev_error_types {
 	NSS_WIFI_EXT_VDEV_ERROR_INV_PVAP_ID,	/**< Invalid parent virtual device interface number. */
 	NSS_WIFI_EXT_VDEV_ERROR_RADIO_NOT_PRESENT,	/**< Radio node is not present. */
 	NSS_WIFI_EXT_VDEV_ERROR_INV_IF,		/**< Message sent on invalid interface number. */
-	NSS_WIFI_EXT_VDEV_ERROR_MAX,		/**< Maxiumum error types. */
+	NSS_WIFI_EXT_VDEV_ERROR_INV_VLAN_ID,	/**< Invalid VLAN ID. */
+	NSS_WIFI_EXT_VDEV_ERROR_INV_CMD,	/**< Invalid command. */
+	NSS_WIFI_EXT_VDEV_ERROR_PEERID_ALREADY_CONFIGURED,
+						/**< Peer ID is already configured. */
+	NSS_WIFI_EXT_VDEV_ERROR_MAX		/**< Maxiumum error types. */
 };
 
 /**
  * nss_wifi_ext_vdev_wds_msg
- *	Extended WDS config message.
+ *	Extended WDS configuration message.
  */
 struct nss_wifi_ext_vdev_wds_msg {
 	uint16_t wds_peer_id;	/**< WDS station peer ID. */
@@ -91,6 +96,14 @@ struct nss_wifi_ext_vdev_set_next_hop_msg {
 };
 
 /**
+ * nss_wifi_ext_vdev_vlan_msg
+ *	Extended VLAN configuration message.
+ */
+struct nss_wifi_ext_vdev_vlan_msg {
+	uint16_t vlan_id;	/**< VLAN ID. */
+};
+
+/**
  * nss_wifi_ext_vdev_msg
  *	Message structure to Send/Receive commands.
  */
@@ -102,6 +115,7 @@ struct nss_wifi_ext_vdev_msg {
 		struct nss_wifi_ext_vdev_wds_msg wmsg;	/**< WDS configure message. */
 		struct nss_wifi_ext_vdev_set_next_hop_msg wnhm;	/**< Next hop set message. */
 		struct nss_wifi_ext_vdev_stats stats;	/**< Statistics messasge. */
+		struct nss_wifi_ext_vdev_vlan_msg vmsg;	/**< VLAN message. */
 	} msg;
 };
 
@@ -126,7 +140,7 @@ typedef void (*nss_wifi_ext_vdev_data_callback_t)(struct net_device *netdev, str
  * nss_wifi_ext_vdev_msg
  *
  * @param[in] app_data  Pointer to the application context of the message.
- * @param[in]wevm       Pointer to the message data.
+ * @param[in] wevm      Pointer to the message data.
  */
 typedef void (*nss_wifi_ext_vdev_msg_callback_t)(void *app_data, struct nss_cmn_msg *ncm);
 
@@ -225,7 +239,7 @@ extern nss_tx_status_t nss_wifi_ext_vdev_tx_msg(struct nss_ctx_instance *nss_ctx
  * nss_ctx_instance \n
  * nss_wifi_ext_vdev_msg
  *
- * @param[in] nss_ctx  NSS core context.
+ * @param[in] nss_ctx   NSS core context.
  * @param[in] nwevm     Pointer to Wi-Fi extended virtual interface message data.
  *
  * @return
@@ -240,8 +254,8 @@ extern nss_tx_status_t nss_wifi_ext_vdev_tx_msg_sync(struct nss_ctx_instance *ns
  * @datatypes
  * nss_ctx_instance \n
  *
- * @param[in] nss_ctx  NSS core context.
- * @param[in] ifnum  NSS interface number.
+ * @param[in] ctx      NSS core context.
+ * @param[in] if_num   NSS interface number.
  * @param[in] next_hop Next hop interface number.
  */
 extern nss_tx_status_t nss_wifi_ext_vdev_set_next_hop(struct nss_ctx_instance *ctx, int if_num, int next_hop);
@@ -267,8 +281,8 @@ extern struct nss_ctx_instance *nss_wifi_ext_vdev_get_ctx(void);
  *
  * @param[in] if_num         NSS interface number.
  * @param[in] cb_func_data   Callback for the data.
- * @param[in] cb_func_msg    Callback for the message.
- * @param[in] cb_func_event  Callback for the event message.
+ * @param[in] cb_func_ext    Callback for the message.
+ * @param[in] cb_func_msg    Callback for the event message.
  * @param[in] features       Data socket buffer types supported by this interface.
  * @param[in] netdev         Pointer to the associated network device.
  * @param[in] app_ctx        Pointer to the application context.

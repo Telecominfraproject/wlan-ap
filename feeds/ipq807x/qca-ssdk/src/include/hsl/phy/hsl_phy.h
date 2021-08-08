@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2017-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2015, 2017-2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -563,7 +563,7 @@ typedef struct {
 #define QCA8035_PHY             0x004DD072
 /*qca808x_start*/
 #define QCA8081_PHY_V1_1        0x004DD101
-#define INVALID_PHY_ID          0
+#define INVALID_PHY_ID          0xFFFFFFFF
 
 /*qca808x_end*/
 #define F1V1_PHY                0x004DD033

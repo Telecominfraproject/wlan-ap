@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2015-2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2015-2018, 2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -722,6 +722,10 @@ struct nss_wifi_peer_ol_stats {
 	uint32_t ppdu_retries;	/**< Number of PPDU retries. */
 	uint32_t rssi_chains[NSS_WIFI_MAX_RSSI_CHAINS];
 				/**< Acknowledgment RSSI per chain. */
+	uint32_t rx_msdus;	/**< Number of MSDUs received. */
+	uint32_t rx_bytes;	/**< Number of bytes received. */
+	uint32_t rx_mpdus;	/**< Number of MPDUs received. */
+	uint32_t rx_retries;	/**< Number of MPDU retries. */
 };
 
 /**

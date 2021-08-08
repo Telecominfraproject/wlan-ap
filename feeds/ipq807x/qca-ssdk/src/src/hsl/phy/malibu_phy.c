@@ -1503,11 +1503,6 @@ malibu_phy_set_autoneg_adv(a_uint32_t dev_id, a_uint32_t phy_id,
 		if (autoneg & FAL_PHY_ADV_ASY_PAUSE) {
 			phy_data |= MALIBU_ADVERTISE_ASYM_PAUSE;
 		}
-		if (autoneg & FAL_PHY_ADV_1000T_FD) {
-			phy_data |= MALIBU_EXTENDED_NEXT_PAGE_EN;
-		} else {
-			phy_data &= ~MALIBU_EXTENDED_NEXT_PAGE_EN;
-		}
 		malibu_phy_reg_write(dev_id, phy_id, MALIBU_AUTONEG_ADVERT,
 				     phy_data);
 
@@ -2731,6 +2726,10 @@ malibu_phy_hw_init(a_uint32_t dev_id, a_uint32_t port_bmp)
 			led_status |= MALIBU_LED_1000_CTRL1_100_10_MASK;
 			malibu_phy_mmd_write(dev_id, phy_addr, MALIBU_PHY_MMD7_NUM,
 				MALIBU_PHY_MMD7_LED_1000_CTRL1, led_status);
+			/*disable Extended next page*/
+			phy_data = malibu_phy_reg_read(dev_id, phy_addr, MALIBU_AUTONEG_ADVERT);
+			phy_data &= ~MALIBU_EXTENDED_NEXT_PAGE_EN;
+			malibu_phy_reg_write(dev_id, phy_addr, MALIBU_AUTONEG_ADVERT, phy_data);
 		}
 	}
 	/* qca 8072 two ports phy chip's firstly address to init phy chip */

@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2016-2018, 2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2018, 2020-2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -21,6 +21,8 @@
 
 #ifndef _NSS_PPE_H_
 #define _NSS_PPE_H_
+
+typedef int32_t nss_ppe_port_t;
 
 /**
  * @addtogroup nss_ppe_subsystem
@@ -55,6 +57,34 @@ enum nss_ppe_sc_type {
 	NSS_PPE_SC_SPF_BYPASS,		/**< Source port filtering bypass in PPE. */
 	NSS_PPE_SC_MAX,			/**< Maximum service code. */
 };
+
+/**
+ * nss_ppe_stats_unregister_notifier
+ *	Deregisters a statistics notifier.
+ *
+ * @datatypes
+ *	notifier_block
+ *
+ * @param[in] nb Notifier block.
+ *
+ * @return
+ * 0 on success or non-zero on failure.
+ */
+extern int nss_ppe_stats_unregister_notifier(struct notifier_block *nb);
+
+/**
+ * nss_ppe_stats_register_notifier
+ *	Registers a statistics notifier.
+ *
+ * @datatypes
+ *	notifier_block
+ *
+ * @param[in] nb Notifier block.
+ *
+ * @return
+ * 0 on success or non-zero on failure.
+ */
+extern int nss_ppe_stats_register_notifier(struct notifier_block *nb);
 
 /** @} */ /* end_addtogroup nss_ppe_subsystem */
 

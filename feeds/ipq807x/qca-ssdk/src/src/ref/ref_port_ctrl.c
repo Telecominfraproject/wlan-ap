@@ -65,6 +65,7 @@ qca_ar8327_sw_get_port_link(struct switch_dev *dev, int port,
 
 	fal_port_speed_t speed = FAL_SPEED_10;
 	fal_port_duplex_t duplex = FAL_FULL_DUPLEX;
+	fal_port_eee_cfg_t port_eee_cfg = {0};
 	a_bool_t status = 0;
 	a_bool_t tx_fc = 0;
 	a_bool_t rx_fc = 0;
@@ -117,6 +118,18 @@ qca_ar8327_sw_get_port_link(struct switch_dev *dev, int port,
 	ret = fal_port_txfc_status_get(priv->device_id, port, &tx_fc);
 	if (ret == SW_OK) {
 		link->tx_flow = tx_fc;
+	}
+	ret = fal_port_interface_eee_cfg_get(priv->device_id, port,
+		&port_eee_cfg);
+	if(ret == SW_OK)
+	{
+		link->eee &= ~(ADVERTISED_100baseT_Full || ADVERTISED_1000baseT_Full);
+		if(port_eee_cfg.advertisement & FAL_PHY_EEE_100BASE_T) {
+			link->eee |= ADVERTISED_100baseT_Full;
+		}
+		if(port_eee_cfg.advertisement & FAL_PHY_EEE_1000BASE_T) {
+			link->eee |= ADVERTISED_1000baseT_Full;
+		}
 	}
 	mutex_unlock(&priv->reg_mutex);
 
@@ -710,3 +723,53 @@ dess_rgmii_sw_mac_polling_task(struct qca_phy_priv *priv)
 	return;
 }
 
+#ifdef IN_SWCONFIG
+int qca_ar8327_sw_set_eee(struct switch_dev *dev,
+	const struct switch_attr *attr, struct switch_val *val)
+{
+	sw_error_t rv = SW_OK;
+	struct qca_phy_priv *priv = qca_phy_priv_get(dev);
+	fal_port_eee_cfg_t port_eee_cfg;
+
+	SSDK_DEBUG("configure EEE for dev_id: %d, port %d as %d\n",
+		priv->device_id, val->port_vlan, val->value.i);
+	rv = fal_port_interface_eee_cfg_get(priv->device_id, val->port_vlan, &port_eee_cfg);
+	if(rv != SW_OK)
+	{
+		return -1;
+	}
+	port_eee_cfg.enable = val->value.i;
+	port_eee_cfg.lpi_tx_enable = val->value.i;
+
+	if(port_eee_cfg.enable)
+	{
+		port_eee_cfg.advertisement = FAL_PHY_EEE_100BASE_T | FAL_PHY_EEE_1000BASE_T;
+	}
+	rv = fal_port_interface_eee_cfg_set(priv->device_id, val->port_vlan, &port_eee_cfg);
+	if(rv != SW_OK)
+	{
+		return -1;
+	}
+
+	return 0;
+}
+
+int qca_ar8327_sw_get_eee(struct switch_dev *dev,
+	const struct switch_attr *attr, struct switch_val *val)
+{
+	sw_error_t rv = SW_OK;
+	struct qca_phy_priv *priv = qca_phy_priv_get(dev);
+	fal_port_eee_cfg_t port_eee_cfg;
+
+	SSDK_DEBUG("get EEE for dev_id: %d, port %d\n",
+		priv->device_id, val->port_vlan);
+	rv = fal_port_interface_eee_cfg_get(priv->device_id, val->port_vlan, &port_eee_cfg);
+	if(rv != SW_OK)
+	{
+		return -1;
+	}
+	val->value.i = port_eee_cfg.enable;
+
+	return 0;
+}
+#endif

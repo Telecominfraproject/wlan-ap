@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016-2018, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2016-2018, 2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -95,8 +95,14 @@ enum
 	FUNC_ADPT_PORT_COMPENSATION_BYTE_SET,
 	FUNC_ADPT_POLICER_TIME_SLOT_SET,
 	FUNC_ADPT_POLICER_GLOBAL_COUNTER_GET,
+	FUNC_ADPT_POLICER_BYPASS_EN_SET,
+	FUNC_ADPT_POLICER_BYPASS_EN_GET,
 };
 
+
+typedef enum {
+	FAL_FRAME_DROPPED = 0,
+} fal_policer_frame_type_t;
 
 #ifndef IN_POLICER_MINI
 sw_error_t
@@ -134,6 +140,9 @@ sw_error_t
 fal_policer_global_counter_get(a_uint32_t dev_id,
 		fal_policer_global_counter_t *counter);
 
+sw_error_t
+fal_policer_bypass_en_get(a_uint32_t dev_id, fal_policer_frame_type_t frame_type,
+	a_bool_t *enable);
 #endif
 
 sw_error_t
@@ -143,6 +152,9 @@ fal_port_policer_compensation_byte_set(a_uint32_t dev_id, fal_port_t port_id,
 sw_error_t
 fal_policer_timeslot_set(a_uint32_t dev_id, a_uint32_t timeslot);
 
+sw_error_t
+fal_policer_bypass_en_set(a_uint32_t dev_id, fal_policer_frame_type_t frame_type,
+	a_bool_t enable);
 #ifdef __cplusplus
 }
 #endif                          /* __cplusplus */

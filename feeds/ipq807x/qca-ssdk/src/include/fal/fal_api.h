@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2015-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012, 2015-2019, 2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -479,6 +479,9 @@ extern "C" {
     SW_API_DEF(SW_API_GLOBAL_QINQ_MODE_GET, fal_global_qinq_mode_get), \
     SW_API_DEF(SW_API_PORT_QINQ_MODE_SET, fal_port_qinq_mode_set), \
     SW_API_DEF(SW_API_PORT_QINQ_MODE_GET, fal_port_qinq_mode_get), \
+    SW_API_DEF(SW_API_QINQ_MODE_SET, fal_qinq_mode_set), \
+    SW_API_DEF(SW_API_PT_QINQ_ROLE_SET, fal_port_qinq_role_set), \
+    SW_API_DEF(SW_API_PT_VLAN_TRANS_ADD, fal_port_vlan_trans_add), \
     SW_API_DEF(SW_API_TPID_SET, fal_ingress_tpid_set), \
     SW_API_DEF(SW_API_TPID_GET, fal_ingress_tpid_get), \
     SW_API_DEF(SW_API_EGRESS_TPID_SET, fal_egress_tpid_set), \
@@ -522,6 +525,9 @@ extern "C" {
     SW_API_DESC(SW_API_GLOBAL_QINQ_MODE_GET) \
     SW_API_DESC(SW_API_PORT_QINQ_MODE_SET)  \
     SW_API_DESC(SW_API_PORT_QINQ_MODE_GET) \
+    SW_API_DESC(SW_API_QINQ_MODE_SET)    \
+    SW_API_DESC(SW_API_PT_QINQ_ROLE_SET) \
+    SW_API_DESC(SW_API_PT_VLAN_TRANS_ADD) \
     SW_API_DESC(SW_API_TPID_SET)  \
     SW_API_DESC(SW_API_TPID_GET) \
     SW_API_DESC(SW_API_EGRESS_TPID_SET)  \
@@ -2138,8 +2144,9 @@ extern "C" {
     SW_API_DEF(SW_API_POLICER_PORT_ENTRY_GET, fal_port_policer_entry_get), \
     SW_API_DEF(SW_API_POLICER_ACL_ENTRY_SET, fal_acl_policer_entry_set), \
     SW_API_DEF(SW_API_POLICER_ACL_ENTRY_GET,fal_acl_policer_entry_get), \
-    SW_API_DEF(SW_API_POLICER_GLOBAL_COUNTER_GET, fal_policer_global_counter_get),
-
+    SW_API_DEF(SW_API_POLICER_GLOBAL_COUNTER_GET, fal_policer_global_counter_get), \
+    SW_API_DEF(SW_API_POLICER_BYPASS_EN_SET, fal_policer_bypass_en_set), \
+    SW_API_DEF(SW_API_POLICER_BYPASS_EN_GET, fal_policer_bypass_en_get),
 
 #define POLICER_API_PARAM \
     SW_API_DESC(SW_API_POLICER_TIMESLOT_SET)  \
@@ -2152,7 +2159,9 @@ extern "C" {
     SW_API_DESC(SW_API_POLICER_PORT_ENTRY_GET) \
     SW_API_DESC(SW_API_POLICER_ACL_ENTRY_SET) \
     SW_API_DESC(SW_API_POLICER_ACL_ENTRY_GET) \
-    SW_API_DESC(SW_API_POLICER_GLOBAL_COUNTER_GET)
+    SW_API_DESC(SW_API_POLICER_GLOBAL_COUNTER_GET) \
+    SW_API_DESC(SW_API_POLICER_BYPASS_EN_SET) \
+    SW_API_DESC(SW_API_POLICER_BYPASS_EN_GET)
 #else
 #define POLICER_API \
     SW_API_DEF(SW_API_POLICER_TIMESLOT_SET, fal_policer_timeslot_set), \

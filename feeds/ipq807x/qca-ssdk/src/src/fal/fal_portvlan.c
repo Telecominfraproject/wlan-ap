@@ -579,6 +579,7 @@ _fal_port_vlan_propagation_get(a_uint32_t dev_id, fal_port_t port_id,
     rv = p_api->port_vlan_propagation_get(dev_id, port_id, mode);
     return rv;
 }
+#endif
 
 static sw_error_t
 _fal_port_vlan_trans_add(a_uint32_t dev_id, fal_port_t port_id, fal_vlan_trans_entry_t *entry)
@@ -604,6 +605,7 @@ _fal_port_vlan_trans_add(a_uint32_t dev_id, fal_port_t port_id, fal_vlan_trans_e
     return rv;
 }
 
+#ifndef IN_PORTVLAN_MINI
 static sw_error_t
 _fal_port_vlan_trans_del(a_uint32_t dev_id, fal_port_t port_id, fal_vlan_trans_entry_t *entry)
 {
@@ -651,6 +653,7 @@ _fal_port_vlan_trans_get(a_uint32_t dev_id, fal_port_t port_id, fal_vlan_trans_e
     rv = p_api->port_vlan_trans_get(dev_id, port_id, entry);
     return rv;
 }
+#endif
 
 static sw_error_t
 _fal_qinq_mode_set(a_uint32_t dev_id, fal_qinq_mode_t mode)
@@ -676,6 +679,7 @@ _fal_qinq_mode_set(a_uint32_t dev_id, fal_qinq_mode_t mode)
     return rv;
 }
 
+#ifndef IN_PORTVLAN_MINI
 static sw_error_t
 _fal_qinq_mode_get(a_uint32_t dev_id, fal_qinq_mode_t * mode)
 {
@@ -699,6 +703,7 @@ _fal_qinq_mode_get(a_uint32_t dev_id, fal_qinq_mode_t * mode)
     rv = p_api->qinq_mode_get(dev_id, mode);
     return rv;
 }
+#endif
 
 static sw_error_t
 _fal_port_qinq_role_set(a_uint32_t dev_id, fal_port_t port_id, fal_qinq_port_role_t role)
@@ -724,6 +729,7 @@ _fal_port_qinq_role_set(a_uint32_t dev_id, fal_port_t port_id, fal_qinq_port_rol
     return rv;
 }
 
+#ifndef IN_PORTVLAN_MINI
 static sw_error_t
 _fal_port_qinq_role_get(a_uint32_t dev_id, fal_port_t port_id, fal_qinq_port_role_t * role)
 {
@@ -1463,6 +1469,7 @@ fal_port_vlan_propagation_get(a_uint32_t dev_id, fal_port_t port_id,
     FAL_API_UNLOCK;
     return rv;
 }
+#endif
 
 /**
  * @brief Add a vlan translation entry to a particular port.
@@ -1482,6 +1489,7 @@ fal_port_vlan_trans_add(a_uint32_t dev_id, fal_port_t port_id, fal_vlan_trans_en
     return rv;
 }
 
+#ifndef IN_PORTVLAN_MINI
 /**
  * @brief Delete a vlan translation entry from a particular port.
  * @param[in] dev_id device id
@@ -1517,6 +1525,7 @@ fal_port_vlan_trans_get(a_uint32_t dev_id, fal_port_t port_id, fal_vlan_trans_en
     FAL_API_UNLOCK;
     return rv;
 }
+#endif
 
 /**
  * @brief Set switch qinq work mode on a particular device.
@@ -1535,6 +1544,7 @@ fal_qinq_mode_set(a_uint32_t dev_id, fal_qinq_mode_t mode)
     return rv;
 }
 
+#ifndef IN_PORTVLAN_MINI
 /**
  * @brief Get switch qinq work mode on a particular device.
  * @param[in] dev_id device id
@@ -1551,6 +1561,7 @@ fal_qinq_mode_get(a_uint32_t dev_id, fal_qinq_mode_t * mode)
     FAL_API_UNLOCK;
     return rv;
 }
+#endif
 
 /**
  * @brief Set qinq role on a particular port.
@@ -1570,6 +1581,7 @@ fal_port_qinq_role_set(a_uint32_t dev_id, fal_port_t port_id, fal_qinq_port_role
     return rv;
 }
 
+#ifndef IN_PORTVLAN_MINI
 /**
  * @brief Get qinq role on a particular port.
  * @param[in] dev_id device id
@@ -2524,13 +2536,13 @@ EXPORT_SYMBOL(fal_port_vlan_counter_cleanup);
 EXPORT_SYMBOL(fal_portvlan_member_add);
 EXPORT_SYMBOL(fal_portvlan_member_del);
 EXPORT_SYMBOL(fal_portvlan_member_update);
-#ifndef IN_PORTVLAN_MINI
 EXPORT_SYMBOL(fal_qinq_mode_set);
-EXPORT_SYMBOL(fal_qinq_mode_get);
 EXPORT_SYMBOL(fal_port_qinq_role_set);
+EXPORT_SYMBOL(fal_port_vlan_trans_add);
+#ifndef IN_PORTVLAN_MINI
+EXPORT_SYMBOL(fal_qinq_mode_get);
 EXPORT_SYMBOL(fal_port_qinq_role_get);
 EXPORT_SYMBOL(fal_port_vlan_trans_iterate);
-EXPORT_SYMBOL(fal_port_vlan_trans_add);
 EXPORT_SYMBOL(fal_port_vlan_trans_del);
 EXPORT_SYMBOL(fal_port_vlan_trans_get);
 EXPORT_SYMBOL(fal_portvlan_member_get);

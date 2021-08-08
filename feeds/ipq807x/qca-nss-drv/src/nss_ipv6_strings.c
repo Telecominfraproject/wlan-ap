@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2019-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2019-2021, The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -114,7 +114,10 @@ struct nss_stats_info nss_ipv6_strings_stats[NSS_IPV6_STATS_MAX] = {
 	{"mc_create_invalid_interface"	,NSS_STATS_TYPE_SPECIAL},
 	{"mc_destroy_requests"		,NSS_STATS_TYPE_SPECIAL},
 	{"mc_destroy_misses"		,NSS_STATS_TYPE_SPECIAL},
-	{"mc_flushes"			,NSS_STATS_TYPE_SPECIAL}
+	{"mc_flushes"			,NSS_STATS_TYPE_SPECIAL},
+	{"mirror_invalid_ifnum_conn_create_req"		,NSS_STATS_TYPE_SPECIAL},
+	{"mirror_invalid_iftype_conn_create_req"	,NSS_STATS_TYPE_SPECIAL},
+	{"mirror_failures"		,NSS_STATS_TYPE_SPECIAL},
 };
 
 /*

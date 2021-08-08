@@ -23,6 +23,7 @@ extern "C" {
 
 #include "sw.h"
 
+#define EDMA_CSR_BASE_ADDR           0xb00000
 #define IPE_L3_BASE_ADDR             0x200000
 #define QUEUE_MANAGER_BASE_ADDR      0x800000
 #define TRAFFIC_MANAGER_BASE_ADDR    0x400000

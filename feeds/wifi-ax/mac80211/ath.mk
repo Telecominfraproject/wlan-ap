@@ -45,7 +45,9 @@ config-$(CONFIG_TARGET_ar71xx) += ATH9K_AHB
 config-$(CONFIG_TARGET_ath79) += ATH9K_AHB
 config-$(CONFIG_TARGET_ipq40xx) += ATH10K_AHB
 config-$(CONFIG_PCI) += ATH9K_PCI
-#config-$(CONFIG_ATH_USER_REGD) += ATH_USER_REGD
+config-$(CONFIG_ATH_USER_REGD) += ATH_USER_REGD \
+			ATH_REG_DYNAMIC_USER_REG_HINTS \
+			ATH_REG_DYNAMIC_USER_CERT_TESTING
 config-$(CONFIG_ATH9K_SUPPORT_PCOEM) += ATH9K_PCOEM
 config-$(CONFIG_ATH9K_TX99) += ATH9K_TX99
 config-$(CONFIG_ATH9K_UBNTHSR) += ATH9K_UBNTHSR
@@ -54,11 +56,11 @@ config-$(CONFIG_ATH10K_THERMAL) += ATH10K_THERMAL
 
 config-$(call config_package,ath9k-htc) += ATH9K_HTC
 config-$(call config_package,ath10k) += ATH10K ATH10K_PCI
-config-$(call config_package,ath11k) += ATH11K ATH11K_AHB ATH11K_SPECTRAL
+config-$(call config_package,ath11k) += ATH11K ATH11K_AHB ATH11K_SPECTRAL ATH11K_DEBUG
 config-$(call config_package,ath11k-pci) += ATH11K_PCI
 
 ifeq ($(CONFIG_KERNEL_IPQ_MEM_PROFILE),512)
-config-y += ATH11K_MEM_PROFILE_512M
+#config-y += ATH11K_MEM_PROFILE_512M
 endif
 
 config-$(call config_package,ath5k) += ATH5K
@@ -295,7 +297,7 @@ define KernelPackage/ath11k-ahb
   $(call KernelPackage/mac80211/Default)
   TITLE:=Atheros 802.11ax wireless cards support - AHB
   URL:=https://wireless.wiki.kernel.org/en/users/drivers/ath11k
-  DEPENDS+= +kmod-ath11k
+  DEPENDS+= +kmod-ath11k +kmod-ath11k-pci
   FILES:= \
 	$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath11k/ath11k_ahb.ko 
   AUTOLOAD:=$(call AutoProbe,ath11k_ahb)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2015-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013, 2015-2019, 2021, The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -1200,6 +1200,7 @@ struct sub_cmd_des_t g_policer_des[] =
 	{"fcscompensation", "set",   SW_API_POLICER_COMPENSATION_SET, NULL},
 	{"portentry", "set",   SW_API_POLICER_PORT_ENTRY_SET, NULL},
 	{"aclentry", "set",   SW_API_POLICER_ACL_ENTRY_SET, NULL},
+	{"bypass", "set",  SW_API_POLICER_BYPASS_EN_SET, NULL},
 	{NULL, NULL,  0, NULL},/*end of desc*/
 };
 #endif

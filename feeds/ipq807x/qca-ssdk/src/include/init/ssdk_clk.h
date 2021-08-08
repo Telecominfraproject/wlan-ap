@@ -291,6 +291,9 @@ void ssdk_uniphy_raw_clock_set(
 	a_uint8_t uniphy_index,
 	a_uint8_t direction,
 	a_uint32_t clock);
+void ssdk_gcc_uniphy_sys_set(a_uint32_t dev_id, a_uint32_t uniphy_index,
+	a_bool_t enable);
+void ssdk_uniphy_port5_clock_source_set(void);
 #endif
 
 #if defined(MP)
@@ -298,6 +301,9 @@ void ssdk_mp_raw_clock_set(
 	a_uint8_t uniphy_index,
 	a_uint8_t direction,
 	a_uint32_t clock);
+void ssdk_mp_gephy_icc_efuse_load_enable(
+	a_bool_t enable);
+
 #endif
 
 #ifdef __cplusplus

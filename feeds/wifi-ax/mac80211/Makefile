@@ -2,10 +2,10 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mac80211
-PKG_VERSION:=20200902_001-4.4.60-931c337125
+PKG_VERSION:=20210222_001-4.4.60-b157d2276
 PKG_RELEASE:=1
 PKG_SOURCE_URL:=https://mirror2.openwrt.org/sources/
-PKG_HASH:=f8d99202d53d142570c8d7d184fbd72a3861aa20cfe9f79a37f79aee66d3e1fe
+PKG_HASH:=a9edb1063cc9901c409e6eb79bed97ab88c664f06caa88c988e9b21731623f7a
 PKG_SOURCE:=backports-$(PKG_VERSION).tar.bz2
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/backports-$(PKG_VERSION)
 PKG_BUILD_PARALLEL:=1
@@ -38,6 +38,7 @@ config-y:= \
 	WLAN \
 	NL80211_TESTMODE \
 	CFG80211_WEXT \
+	CFG80211_INTERNAL_REGDB \
 	CFG80211_CERTIFICATION_ONUS \
 	MAC80211_RC_MINSTREL \
 	MAC80211_RC_MINSTREL_HT \
@@ -88,7 +89,7 @@ define KernelPackage/mac80211
   $(call KernelPackage/mac80211/Default)
   TITLE:=Linux 802.11 Wireless Networking Stack
   # +kmod-crypto-cmac is a runtime only dependency of net/mac80211/aes_cmac.c
-  DEPENDS+= +kmod-cfg80211 +hostapd-common +kmod-qca-nss-drv
+  DEPENDS+= +kmod-cfg80211 +hostapd-common +kmod-qca-nss-drv +kmod-qca-nss-drv-wifi-meshmgr
   KCONFIG:=\
 	CONFIG_AVERAGE=y
   FILES:= $(PKG_BUILD_DIR)/net/mac80211/mac80211.ko
@@ -178,7 +179,7 @@ config-$(call config_package,mac80211-hwsim) += MAC80211_HWSIM
 MAKE_OPTS:= -C "$(PKG_BUILD_DIR)" \
 	CROSS_COMPILE="$(KERNEL_CROSS)" \
         ARCH="$(LINUX_KARCH)" \
-	EXTRA_CFLAGS="-I$(PKG_BUILD_DIR)/include $(IREMAP_CFLAGS) -I$(STAGING_DIR)/usr/include/qca-nss-drv" \
+	EXTRA_CFLAGS="-I$(PKG_BUILD_DIR)/include $(IREMAP_CFLAGS) -I$(STAGING_DIR)/usr/include/qca-nss-drv -I$(STAGING_DIR)/usr/include/qca-nss-clients" \
 	KLIB_BUILD="$(LINUX_DIR)" \
 	MODPROBE=true \
 	KLIB=$(TARGET_MODULES_DIR) \

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -311,6 +311,15 @@ static bool nss_meminfo_init_block_lists(struct nss_ctx_instance *nss_ctx)
 		switch (mtype) {
 		case NSS_MEMINFO_MEMTYPE_IMEM:
 			/*
+			 * For SOC's where TCM is not present
+			 */
+			if (!nss_ctx->vphys) {
+				nss_info_always("%px:IMEM requested but TCM not defined "
+								"for this SOC\n", nss_ctx);
+				goto cleanup;
+			}
+
+			/*
 			 * Return SoC real address for IMEM as DMA address.
 			 */
 			dma_addr = nss_meminfo_alloc_imem(nss_ctx, r->size, r->alignment);
@@ -453,6 +462,15 @@ static bool nss_meminfo_allocate_n2h_h2n_rings(struct nss_ctx_instance *nss_ctx,
 		}
 		break;
 	case NSS_MEMINFO_MEMTYPE_IMEM:
+		/*
+		 * For SOC's where TCM is not present
+		 */
+		if (!nss_ctx->vphys) {
+			nss_info_always("%px:IMEM requested but TCM not defined "
+							"for this SOC\n", nss_ctx);
+			return false;
+		}
+
 		info->dma_addr = nss_meminfo_alloc_imem(nss_ctx, info->total_size, L1_CACHE_BYTES);
 		if (!info->dma_addr)
 			return false;
@@ -705,7 +723,6 @@ bool nss_meminfo_init(struct nss_ctx_instance *nss_ctx)
 	struct nss_meminfo_map *map;
 	struct nss_top_instance *nss_top = &nss_top_main;
 
-	NSS_VERIFY_CTX_MAGIC(nss_ctx);
 	mem_ctx = &nss_ctx->meminfo_ctx;
 
 	/*

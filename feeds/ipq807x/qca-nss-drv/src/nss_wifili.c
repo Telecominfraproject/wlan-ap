@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2017-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2017-2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -20,9 +20,15 @@
 #include "nss_wifili_strings.h"
 
 #define NSS_WIFILI_TX_TIMEOUT 1000 /* Millisecond to jiffies*/
-#define NSS_WIFILI_INVALID_SCHEME_ID	-1
-#define NSS_WIFILI_THREAD_SCHEME_ENTRY_MAX	4
-				/* Maximum number of thread scheme entries. */
+#define NSS_WIFILI_INVALID_SCHEME_ID  -1
+#define NSS_WIFILI_THREAD_SCHEME_ENTRY_MAX  4 /* Maximum number of thread scheme entries. */
+#define NSS_WIFILI_EXTERNAL_INTERFACE_MAX 2 /* Maximum external I/F supported */
+
+/*
+ * NSS external interface number table
+ */
+nss_if_num_t nss_wifili_external_tbl[NSS_WIFILI_EXTERNAL_INTERFACE_MAX] =
+	{NSS_WIFILI_EXTERNAL_INTERFACE0, NSS_WIFILI_EXTERNAL_INTERFACE1};
 
 /*
  * nss_wifili_thread_scheme_entry
@@ -46,6 +52,24 @@ struct nss_wifili_thread_scheme_db {
 	struct nss_wifili_thread_scheme_entry nwtse[NSS_WIFILI_THREAD_SCHEME_ENTRY_MAX];
 				/* Metadata for each of scheme. */
 };
+
+/*
+ * nss_wifili_external_if_state_tbl
+ *	External interface state table
+ */
+struct nss_wifili_external_if_state_tbl {
+	nss_if_num_t ifnum;
+	bool in_use;
+};
+
+/*
+ * nss_wifili_external_if_info
+ *	Wifili external interface info
+ */
+struct nss_wifili_external_if_info {
+	spinlock_t lock;
+	struct nss_wifili_external_if_state_tbl state_tbl[NSS_WIFILI_EXTERNAL_INTERFACE_MAX];
+} nss_wifi_eif_info;
 
 /*
  * nss_wifili_pvt
@@ -258,27 +282,65 @@ struct nss_ctx_instance *nss_wifili_get_context(void)
 EXPORT_SYMBOL(nss_wifili_get_context);
 
 /*
+ * nss_wifili_release_external_if()
+ *	Release the external interface.
+ */
+void nss_wifili_release_external_if(nss_if_num_t ifnum)
+{
+	uint32_t idx;
+
+	spin_lock_bh(&nss_wifi_eif_info.lock);
+	for (idx = 0; idx < NSS_WIFILI_EXTERNAL_INTERFACE_MAX; idx++) {
+		if (nss_wifi_eif_info.state_tbl[idx].ifnum != ifnum) {
+			continue;
+		}
+
+		if (!nss_wifi_eif_info.state_tbl[idx].in_use) {
+			spin_unlock_bh(&nss_wifi_eif_info.lock);
+			nss_warning("%px: I/F num:%d is not in use\n", &nss_wifi_eif_info, ifnum);
+			return;
+		}
+
+		nss_wifi_eif_info.state_tbl[idx].in_use = false;
+		break;
+	}
+
+	spin_unlock_bh(&nss_wifi_eif_info.lock);
+
+	if (idx == NSS_WIFILI_EXTERNAL_INTERFACE_MAX) {
+		nss_warning("%px: Trying to release invalid ifnum:%d\n", &nss_wifi_eif_info, ifnum);
+	}
+}
+EXPORT_SYMBOL(nss_wifili_release_external_if);
+
+/*
  * nss_get_available_wifili_external_if()
  *	Check and return the available external interface
  */
-uint32_t nss_get_available_wifili_external_if(void)
+nss_if_num_t nss_get_available_wifili_external_if(void)
 {
-	struct nss_ctx_instance *nss_ctx = (struct nss_ctx_instance *)&nss_top_main.nss[nss_top_main.wifi_handler_id];
+	nss_if_num_t ifnum = -1;
+	uint32_t idx;
+
 	/*
 	 * Check if the external interface is registered.
 	 * Return the interface number if not registered.
 	 */
-	if (!(nss_ctx->subsys_dp_register[NSS_WIFILI_EXTERNAL_INTERFACE0].ndev)) {
-		return NSS_WIFILI_EXTERNAL_INTERFACE0;
+	spin_lock_bh(&nss_wifi_eif_info.lock);
+	for (idx = 0; idx < NSS_WIFILI_EXTERNAL_INTERFACE_MAX; idx++) {
+		if (nss_wifi_eif_info.state_tbl[idx].in_use) {
+			continue;
+		}
+
+		nss_wifi_eif_info.state_tbl[idx].in_use = true;
+		ifnum = nss_wifi_eif_info.state_tbl[idx].ifnum;
+		break;
 	}
 
-	if (!(nss_ctx->subsys_dp_register[NSS_WIFILI_EXTERNAL_INTERFACE1].ndev)) {
-		return NSS_WIFILI_EXTERNAL_INTERFACE1;
-	}
+	spin_unlock_bh(&nss_wifi_eif_info.lock);
 
-	nss_warning("%px: No available external intefaces\n", nss_ctx);
-
-	return NSS_MAX_NET_INTERFACES;
+	BUG_ON(idx == NSS_WIFILI_EXTERNAL_INTERFACE_MAX);
+	return ifnum;
 }
 EXPORT_SYMBOL(nss_get_available_wifili_external_if);
 
@@ -534,6 +596,7 @@ void nss_unregister_wifili_if(uint32_t if_num)
 			|| (if_num == NSS_WIFILI_EXTERNAL_INTERFACE1));
 
 	nss_core_unregister_subsys_dp(nss_ctx, if_num);
+	nss_wifili_release_external_if(if_num);
 }
 EXPORT_SYMBOL(nss_unregister_wifili_if);
 
@@ -583,6 +646,7 @@ EXPORT_SYMBOL(nss_unregister_wifili_radio_if);
 void nss_wifili_register_handler(void)
 {
 	struct nss_ctx_instance *nss_ctx = (struct nss_ctx_instance *)&nss_top_main.nss[nss_top_main.wifi_handler_id];
+	uint32_t idx;
 
 	nss_info("nss_wifili_register_handler");
 	nss_core_register_handler(nss_ctx, NSS_WIFILI_INTERNAL_INTERFACE, nss_wifili_handler, NULL);
@@ -594,4 +658,13 @@ void nss_wifili_register_handler(void)
 
 	sema_init(&wifili_pvt.sem, 1);
 	init_completion(&wifili_pvt.complete);
+
+	/*
+	 * Intialize the external interfaces info.
+	 */
+	spin_lock_init(&nss_wifi_eif_info.lock);
+	for (idx = 0; idx < NSS_WIFILI_EXTERNAL_INTERFACE_MAX; idx++) {
+		nss_wifi_eif_info.state_tbl[idx].ifnum = nss_wifili_external_tbl[idx];
+		nss_wifi_eif_info.state_tbl[idx].in_use = false;
+	}
 }

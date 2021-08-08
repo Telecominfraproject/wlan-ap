@@ -192,7 +192,8 @@ ssdk_dts_miibus_get(a_uint32_t dev_id, a_uint32_t phy_addr)
 	ssdk_dt_cfg* cfg = ssdk_dt_global.ssdk_dt_switch_nodes[dev_id];
 
 	for (i = 0; i < cfg->phyinfo_num; i++) {
-		if (phy_addr == cfg->port_phyinfo[i].phy_addr)
+		if (phy_addr == cfg->port_phyinfo[i].phy_addr ||
+			phy_addr == cfg->port_phyinfo[i].phy_addr+1)
 			return cfg->port_phyinfo[i].miibus;
 	}
 

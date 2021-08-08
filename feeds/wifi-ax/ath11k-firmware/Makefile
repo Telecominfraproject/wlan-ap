@@ -61,9 +61,9 @@ define Package/ath11k-firmware-ipq807x/install
 endef
 
 define Package/ath11k-firmware-qcn9000/install
-	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn9000/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/QCN9074/hw1.0/
 	$(INSTALL_DATA) ./files/QCN9000/* \
-		$(1)/lib/firmware/ath11k/qcn9000/hw1.0/
+		$(1)/lib/firmware/ath11k/QCN9074/hw1.0/
 endef
 
 $(eval $(call BuildPackage,ath11k-firmware-ipq60xx))

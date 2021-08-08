@@ -1,6 +1,6 @@
 /*
  **************************************************************************
- * Copyright (c) 2013-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2021, The Linux Foundation. All rights reserved.
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
  * above copyright notice and this permission notice appear in all copies.
@@ -740,7 +740,9 @@ static int __init nss_init(void)
 	 * Registering sysctl for ipv4/6 specific config.
 	 */
 	nss_ipv4_register_sysctl();
+#ifdef NSS_DRV_IPV6_ENABLE
 	nss_ipv6_register_sysctl();
+#endif
 
 	/*
 	 * Registering sysctl for n2h specific config.
@@ -871,6 +873,13 @@ static int __init nss_init(void)
 #endif
 
 	/*
+	 * Init Wi-Fi mesh
+	 */
+#ifdef NSS_DRV_WIFI_MESH_ENABLE
+	nss_wifi_mesh_init();
+#endif
+
+	/*
 	 * Register platform_driver
 	 */
 	return platform_driver_register(&nss_driver);
@@ -910,16 +919,15 @@ static void __exit nss_cleanup(void)
 	nss_pppoe_unregister_sysctl();
 
 	/*
-	 * Unregister ipv4/6 specific sysctl
+	 * Unregister ipv4/6 specific sysctl and free allocated to connection tables
 	 */
 	nss_ipv4_unregister_sysctl();
-	nss_ipv6_unregister_sysctl();
-
-	/*
-	 * Free Memory allocated for connection tables
-	 */
 	nss_ipv4_free_conn_tables();
+
+#ifdef NSS_DRV_IPV6_ENABLE
+	nss_ipv6_unregister_sysctl();
 	nss_ipv6_free_conn_tables();
+#endif
 
 	nss_project_unregister_sysctl();
 	nss_data_plane_destroy_delay_work();
