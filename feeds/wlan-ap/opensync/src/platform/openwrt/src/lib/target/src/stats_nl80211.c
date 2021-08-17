@@ -200,10 +200,12 @@ static int add_chan_noise_offset(unsigned int chan, int chan_noise)
 {
 	int adjusted_chan_noise = 0;
 
-	if (chan > 13) {
-		adjusted_chan_noise = chan_noise + NF_OFFSET_5G;
-	} else {
-		adjusted_chan_noise = chan_noise + NF_OFFSET_24G;
+	if (chan_noise) {
+		if (chan > 13) {
+			adjusted_chan_noise = chan_noise + NF_OFFSET_5G;
+		} else {
+			adjusted_chan_noise = chan_noise + NF_OFFSET_24G;
+		}
 	}
 
 	return adjusted_chan_noise;
