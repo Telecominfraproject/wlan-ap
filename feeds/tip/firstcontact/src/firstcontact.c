@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <unistd.h>
 #include <getopt.h>
 
 #include <curl/curl.h>
@@ -19,6 +20,8 @@ int main(int argc, char **argv)
 	CURL *curl;
 	char *devid = NULL;
 	char *url;
+
+	alarm(15);
 
 	while (1) {
 		int option = getopt(argc, argv, "k:c:o:hi:");
@@ -85,6 +88,7 @@ int main(int argc, char **argv)
 	curl_easy_setopt(curl, CURLOPT_SSLKEYTYPE, "PEM");
 	curl_easy_setopt(curl, CURLOPT_SSLKEY, file_key);
 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 
 	res = curl_easy_perform(curl);
 	if (res != CURLE_OK)
