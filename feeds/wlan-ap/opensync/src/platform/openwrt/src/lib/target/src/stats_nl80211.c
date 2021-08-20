@@ -383,25 +383,29 @@ struct nl80211_scan *nl80211_scan_find(const char *name)
 	return nl80211_scan;
 }
 
-static int nl80211_scan_add(char *name, target_scan_cb_t *scan_cb, void *scan_ctx)
+static struct nl80211_scan *
+nl80211_scan_add(char *name, target_scan_cb_t *scan_cb, void *scan_ctx)
 {
 	struct nl80211_scan *nl80211_scan = avl_find_element(&nl80211_scan_tree, name, nl80211_scan, avl);
 
-	if (nl80211_scan)
-		nl80211_scan_del(nl80211_scan);
-
-	nl80211_scan = malloc(sizeof(*nl80211_scan));
-	if (!nl80211_scan)
-		return -1;
-	memset(nl80211_scan, 0, sizeof(*nl80211_scan));
-	strncpy(nl80211_scan->name, name, IF_NAMESIZE);
-	nl80211_scan->avl.key = nl80211_scan->name;
-	avl_insert(&nl80211_scan_tree, &nl80211_scan->avl);
-	LOGD("%s: added scan context", name);
+	if (!nl80211_scan) {
+		nl80211_scan = malloc(sizeof(*nl80211_scan));
+		if (!nl80211_scan)
+			return NULL;
+		memset(nl80211_scan, 0, sizeof(*nl80211_scan));
+		strncpy(nl80211_scan->name, name, IF_NAMESIZE);
+		nl80211_scan->avl.key = nl80211_scan->name;
+		avl_insert(&nl80211_scan_tree, &nl80211_scan->avl);
+		LOGD("%s: added scan context. avl:%p. scan_ctx:%p",
+			name, nl80211_scan, scan_ctx);
+	} else {
+		LOGD("nl80211_scan_add: %s: Reusing the avl:%p. scan_ctx:%p\n",
+			name, nl80211_scan, nl80211_scan->scan_ctx);
+	}
 
 	nl80211_scan->scan_cb = scan_cb;
 	nl80211_scan->scan_ctx = scan_ctx;
-	return 0;
+	return nl80211_scan;
 }
 
 static void nl80211_scan_del(struct nl80211_scan *nl80211_scan)
@@ -415,10 +419,15 @@ static void nl80211_scan_del(struct nl80211_scan *nl80211_scan)
 static void nl80211_scan_finish(char *name, bool state)
 {
 	struct nl80211_scan *nl80211_scan = nl80211_scan_find(name);
+	target_scan_cb_t *scan_cb;
+	void *scan_ctx;
 
 	if (nl80211_scan) {
 		LOGD("%s: calling context cb", nl80211_scan->name);
-		(*nl80211_scan->scan_cb)(nl80211_scan->scan_ctx, state);
+		scan_cb = nl80211_scan->scan_cb;
+		scan_ctx = nl80211_scan->scan_ctx;
+		nl80211_scan_del(nl80211_scan);
+		(*scan_cb)(scan_ctx, state);
 	}
 }
 
@@ -572,6 +581,7 @@ int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_lis
 	unsigned int i, flags = 0;
 	int ret = 0;
 	uint32_t oper_chan;
+	struct nl80211_scan *nl80211_scan;
 
 	if (!msg)
 		return -1;
@@ -606,15 +616,17 @@ int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_lis
 	}
 	nla_nest_end(msg, freq);
 
-	ret = nl80211_scan_add(nl_call_param->ifname, scan_cb, scan_ctx); 
-	if (ret ) {
+	nl80211_scan = nl80211_scan_add(nl_call_param->ifname, scan_cb, scan_ctx); 
+	if (nl80211_scan == NULL) {
 		LOG(DEBUG,"%s: scan add failed %d\n", nl_call_param->ifname, ret);
 		return -1;
 	}
 
 	ret = unl_genl_request(&unl_req, msg, nl80211_scan_trigger_recv, NULL);
-	if (ret)
+	if (ret) {
+		nl80211_scan_del(nl80211_scan);
 		LOG(DEBUG, "%s: scan request failed %d\n", nl_call_param->ifname, ret);
+	}
 
 	return ret;
 }
