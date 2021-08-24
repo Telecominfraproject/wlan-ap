@@ -43,8 +43,11 @@ if (!config.Redirector) {
 
 function store_config(path) {
 	let cursor = uci.cursor(path);
+	let redir = split(config.Redirector, ":");
+
 	cursor.load("ucentral");
-	cursor.set("ucentral", "config", "server", config.Redirector);
+	cursor.set("ucentral", "config", "server", redir[0]);
+	cursor.set("ucentral", "config", "port", redir[1] || 15002);
 	cursor.commit();
 }
 
