@@ -26,8 +26,6 @@ files/
 │   │       └── 50-fbwifi
 │   ├── init.d
 │   │   └── fbwifi
-│   └── uci-defaults
-│       └── fbwifi
 ├── usr
 │   ├── lib
 │   │   └── lua
@@ -38,13 +36,15 @@ files/
 │   │           └── view
 │   │               └── fbwifi.htm
 │   ├── sbin
+│   │   ├── fbwifi
 │   │   ├── fbwifi_debug_dump
 │   │   ├── fbwifi_gateway_info_update
 │   │   ├── fbwifi_get_config
 │   │   └── fbwifi_validate_token_db
 │   └── share
-│       ├── firewall.include
-│       └── uhttpd.include
+│       └── fbwifi
+│           ├── firewall.include
+│           └── uhttpd.json
 └── www
     └── cgi-bin
         └── fbwifi
