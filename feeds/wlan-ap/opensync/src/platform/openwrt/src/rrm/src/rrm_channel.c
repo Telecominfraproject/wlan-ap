@@ -15,6 +15,7 @@ struct uci_context *uci;
 int reload_config = 0;
 static struct ev_timer  rrm_nf_timer;
 static void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents);
+ovsdb_table_t table_Wifi_Radio_Config;
 
 enum {
 	WIF_ATTR_PROBE_ACCEPT_RATE,
@@ -163,6 +164,8 @@ void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 	uint32_t                 noise;
 	int32_t                  nf;
 	rrm_config_t             *rrm_config;
+	struct schema_Wifi_Radio_Config config = {};
+	json_t *iter;
 
 	ds_tree_t *radio_list = rrm_get_radio_list();
 
@@ -224,9 +227,20 @@ void rrm_nf_timer_handler(struct ev_loop *loop, ev_timer *timer, int revents)
 
 			get_channel_bandwidth(get_max_channel_bw_channel(ieee80211_channel_to_frequency(rrm_config->rrm_data.backup_channel),
 					radio->schema.ht_mode), &channel_bandwidth);
+			/*
+			 * Update the Wifi_Radio_Config table with the "switch-to" channel.
+			 * This is done to avoid the mismatch between radio state and radio config
+			 * because a mismatch would cause the radio to fallback to the original channel.
+			 */
+			iter = ovsdb_where_simple(SCHEMA_COLUMN(Wifi_Radio_Config, if_name), radio->schema.if_name);
+			if (iter) {
+				if (ovsdb_table_select_one_where(&table_Wifi_Radio_Config, iter, &config))
+					config.channel = rrm_config->rrm_data.backup_channel;
+			}
 			ubus_set_channel_switch(radio->config.if_name,
 					ieee80211_channel_to_frequency(rrm_config->rrm_data.backup_channel), radio->schema.hw_mode, channel_bandwidth, sec_chan_offset, 0);
-
+			if (!ovsdb_table_upsert(&table_Wifi_Radio_Config, &config, false))
+				LOG(ERR, "%s Failed to update channel in radio config", __func__);
 			rrm_reset_noise_floor_samples(&(rrm_config->rrm_data));
 		}
 	}
@@ -289,6 +303,8 @@ static void reload_config_task(void *arg)
 void rrm_channel_init(void)
 {
 	uci = uci_alloc_context();
+
+	OVSDB_TABLE_INIT(Wifi_Radio_Config, if_name);
 
 	ev_timer_init(&rrm_nf_timer,
 			rrm_nf_timer_handler,
