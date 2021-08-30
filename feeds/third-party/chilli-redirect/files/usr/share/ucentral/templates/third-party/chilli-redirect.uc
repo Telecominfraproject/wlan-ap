@@ -9,18 +9,19 @@ let keys = {
 	uamport: 3990,
 	radiusauthport: 1812,
 	radiusacctport: 1813,
-	radiusserver1: false,
-	radiusserver2: false,
-	radiusnasid: false,
-	uamallowed: false,
-	uamdomain: false,
+	radiusserver1: true,
+	radiusserver2: true,
+	radiusnasid: true,
+	uamallowed: true,
+	uamdomain: true,
 	defidletimeout: 0,
 	definteriminterval: 300,
 	acctupdate: 9,
-	uamserver: false,
-	radiussecret: false,
-	nasmac: false,
-
+	uamserver: true,
+	radiussecret: true,
+	nasmac: true,
+	macauth: true,
+	macpassword: true,
 };
 %}
 
