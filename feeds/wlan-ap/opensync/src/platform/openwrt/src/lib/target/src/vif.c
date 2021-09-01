@@ -1084,11 +1084,13 @@ void vif_check_radius_proxy()
 
 		LOGI("Start radsecproxy service.");
 		system("/etc/init.d/radsecproxy start");
+		system("ubus call service event '{\"type\": \"config.change\", \"data\": { \"package\": \"wireless\" }}'");
 	}
 	else
 	{
 		LOGI("Not DR. Stop radsecproxy service.");
 		system("/etc/init.d/radsecproxy stop");
+		system("ubus call service event '{\"type\": \"config.change\", \"data\": { \"package\": \"wireless\" }}'");
 	}
 
 out:

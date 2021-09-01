@@ -858,15 +858,8 @@ static void callback_APC_State(ovsdb_update_monitor_t *mon,
 	     (conf->bdr_addr_changed)? "changed":"unchanged",
 	     (conf->mode_changed)? "changed":"unchanged");
 
-	/* APC changed: if radproxy enabled then restart wireless */
-	if (radproxy_apc) {
-		radproxy_apc = 0;
-		system("ubus call service event '{\"type\": \"config.change\", \"data\": { \"package\": \"wireless\" }}'");
-	}
-
 	/* APC changed: start / stop radius proxy service if needed */
 	vif_check_radius_proxy();
-
 }
 
 struct schema_APC_State apc_state;
