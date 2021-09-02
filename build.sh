@@ -7,13 +7,13 @@ TARGET=${1}
 
 if [ -z "$1" ]; then
 	echo "Error: please specify TARGET"
-	echo "For example: IPQ40XX, ECW5410, AP2220, ECW5211 EC420 WF610D"
+	echo "For example: IPQ40XX, ECW5410, AP2220, ECW5211 EC420 WF610D , HFCL_ION4"
 	exit 1
 fi
 
 if [ ! "$(ls -A $BUILD_DIR)" ]; then
 	python3 setup.py --setup --docker || exit 1
-    
+
 else
 	python3 setup.py --rebase --docker
 	echo "### OpenWrt repo already setup"
@@ -63,6 +63,9 @@ WF194C)
 	;;
 WF610D)
 	TARGET=wf610d
+	;;
+HFCL_ION4)
+	TARGET=hfcl_ion4
 	;;
 *)
 	echo "${TARGET} is unknown"
