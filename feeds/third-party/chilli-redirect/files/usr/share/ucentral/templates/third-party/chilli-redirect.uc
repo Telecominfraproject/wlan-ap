@@ -9,20 +9,28 @@ let keys = {
 	uamport: 3990,
 	radiusauthport: 1812,
 	radiusacctport: 1813,
-	radiusserver1: true,
-	radiusserver2: true,
-	radiusnasid: true,
-	uamallowed: true,
-	uamdomain: true,
+	radiusserver1: false,
+	radiusserver2: false,
+	radiusnasid: false,
+	uamallowed: false,
+	uamdomain: false,
 	defidletimeout: 0,
 	definteriminterval: 300,
 	acctupdate: 9,
-	uamserver: true,
-	radiussecret: true,
-	nasmac: true,
-	macauth: true,
-	macpassword: true,
+	uamserver: false,
+	radiussecret: false,
+	nasmac: false,
+	macauth: false,
+	macpassword: false,
 };
+
+function get_value(key, value) {
+	if (key in chilli_redirect)
+		return chilli_redirect[key];
+
+	return value ? value : '';
+}
+
 %}
 
 set chilli.@chilli[0].dhcpif='{{ name }}'
@@ -43,5 +51,5 @@ set chilli.@chilli[0].nasip='10.0.0.1'
 {% endif %}
 
 {% for (let k, v in keys): %}
-set chilli.@chilli[0].{{ k }}='{{ chilli_redirect[k] ? chilli_redirect[k] : v}}'
+set chilli.@chilli[0].{{ k }}='{{ get_value(k, v) }}'
 {% endfor %}
