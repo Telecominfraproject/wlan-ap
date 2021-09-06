@@ -26,12 +26,22 @@ $(Package/qca-nss-fw-default)
   DEPENDS:=@TARGET_ipq807x_ipq807x
 endef
 
+define Package/qca-nss-fw-ipq50xx
+$(Package/qca-nss-fw-default)
+  TITLE:=NSS firmware for IPQ50xx devices
+  DEPENDS:=@TARGET_ipq807x_ipq50xx
+endef
+
 define Package/qca-nss-fw-ipq60xx/description
 Retail NSS firmware for IPQ60xx from QCA
 endef
 
 define Package/qca-nss-fw-ipq807x/description
 Retail NSS firmware for IPQ807x from QCA
+endef
+
+define Package/qca-nss-fw-ipq50xx/description
+Retail NSS firmware for IPQ50xx from QCA
 endef
 
 define Build/Compile
@@ -50,5 +60,12 @@ define Package/qca-nss-fw-ipq807x/install
 		$(1)/lib/firmware/
 endef
 
+define Package/qca-nss-fw-ipq50xx/install
+	$(INSTALL_DIR) $(1)/lib/firmware/
+	$(INSTALL_DATA) ./files/IPQ5018/* \
+		$(1)/lib/firmware/
+endef
+
+$(eval $(call BuildPackage,qca-nss-fw-ipq50xx))
 $(eval $(call BuildPackage,qca-nss-fw-ipq60xx))
 $(eval $(call BuildPackage,qca-nss-fw-ipq807x))

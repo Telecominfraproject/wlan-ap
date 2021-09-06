@@ -53,6 +53,16 @@ $(call Package/ath11k-wifi-default)
     TITLE:=board-2.bin for QCOM IPQ60xx eval kits
 endef
 
+define Package/ath11k-wifi-qcom-ipq5018
+$(call Package/ath11k-wifi-default)
+    TITLE:=board-2.bin for QCOM IPQ50xx eval kits
+endef
+
+define Package/ath11k-wifi-qcom-ipq6122
+$(call Package/ath11k-wifi-default)
+    TITLE:=board-2.bin for QCOM IPQ6122 eval kits
+endef
+
 define ath11k-wifi-install-one-to
   $(INSTALL_DIR)  $(2)/lib/firmware/$(3)/
   $(INSTALL_DATA) $(1) $(2)/lib/firmware/$(3)/board.bin
@@ -106,6 +116,16 @@ define Package/ath11k-wifi-qcom-ipq6018/install
 	$(INSTALL_DATA) ./board-2.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
 endef
 
+define Package/ath11k-wifi-qcom-ipq5018/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DATA) ./board-2.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board-2.bin
+endef
+
+define Package/ath11k-wifi-qcom-ipq6122/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6122/hw1.0/
+	$(INSTALL_DATA) ./board-2.bin.IPQ6122 $(1)/lib/firmware/ath11k/IPQ6122/hw1.0/board-2.bin
+endef
+
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
 $(eval $(call generate-ath11k-wifi-package,cig-wf188n,Cigtech WF188n))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c,Cigtech WF194c))
@@ -116,5 +136,7 @@ $(eval $(call generate-ath11k-wifi-package,tplink-ex227,TP-Link EX227))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex447,TP-Link EX447))
 
 $(foreach PACKAGE,$(ALLWIFIPACKAGES),$(eval $(call BuildPackage,$(PACKAGE))))
+$(eval $(call BuildPackage,ath11k-wifi-qcom-ipq5018))
+$(eval $(call BuildPackage,ath11k-wifi-qcom-ipq6122))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq8074))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq6018))

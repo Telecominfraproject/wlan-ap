@@ -18,11 +18,7 @@ MAKE_OPTS:=
 include $(INCLUDE_DIR)/package.mk
 
 # Keep default as ipq806x for branches that does not have subtarget framework
-ifeq ($(CONFIG_TARGET_ipq),y)
 subtarget:=$(SUBTARGET)
-else
-subtarget:=$(CONFIG_TARGET_BOARD)
-endif
 
 # DTLS Manager v2.0 for Hawkeye/Cypress
   DTLSMGR_DIR:=v2.0
