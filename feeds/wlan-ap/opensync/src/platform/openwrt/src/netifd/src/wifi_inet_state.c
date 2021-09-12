@@ -5,6 +5,9 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <libubox/blobmsg_json.h>
 
 enum {
 	NET_ATTR_INTERFACE,
@@ -100,6 +103,259 @@ int l3_device_split(char *l3_device, struct iface_info *info)
 	return 0;
 }
 
+bool wifi_inet_state_del(const char *ifname);
+bool wifi_inet_master_del(const char *ifname);
+#define DOT_OR_DOTDOT(s) ((s)[0] == '.' && (!(s)[1] || ((s)[1] == '.' && !(s)[2])))
+static struct blob_buf bb;
+#define DEFAULT_BOARD_JSON		"/etc/board.json"
+#define MAX_ETH_PORTS 5
+static struct blob_attr *board_info;
+
+struct eth_port_state {
+	char ifname[8];
+	char state[8];
+	char speed[8];
+	char duplex[16];
+	char bridge[8];
+};
+
+static struct eth_port_state wanport;
+static struct eth_port_state lanport[MAX_ETH_PORTS];
+
+static struct blob_attr* config_find_blobmsg_attr(struct blob_attr *attr, const char *name, int type)
+{
+	struct blobmsg_policy policy = { .name = name, .type = type };
+	struct blob_attr *cur;
+
+	blobmsg_parse(&policy, 1, &cur, blobmsg_data(attr), blobmsg_len(attr));
+
+	return cur;
+}
+
+
+char* get_eth_map_info(char* iface)
+{
+	struct blob_attr *cur;
+
+	blob_buf_init(&bb, 0);
+
+	if (!blobmsg_add_json_from_file(&bb, DEFAULT_BOARD_JSON)) {
+		return NULL;
+	}
+	if (board_info != NULL) {
+		free(board_info);
+		board_info = NULL;
+	}
+	cur = config_find_blobmsg_attr(bb.head, "network", BLOBMSG_TYPE_TABLE);
+	if (!cur) {
+		LOGD("Failed to find network in board.json file");
+		return NULL;
+	}
+	board_info = blob_memdup(cur);
+	if (!board_info)
+		return NULL;
+
+	cur = config_find_blobmsg_attr(board_info, iface, BLOBMSG_TYPE_TABLE);
+	if (!cur) {
+		LOGD("Failed to find %s in board.json file", iface);
+		return NULL;
+	}
+	cur = config_find_blobmsg_attr(cur, "ifname", BLOBMSG_TYPE_STRING);
+	if (!cur) {
+		LOGD("Failed to find ifname in board.json file");
+		return NULL;
+	}
+	return blobmsg_get_string(cur);
+}
+
+
+
+static void update_eth_state (char *eth, struct eth_port_state *eth_state)
+{
+	char sysfs_path[128];
+	int fd = 0;
+	struct dirent *ent;
+	DIR *iface;
+	int carrier = 1;
+	ssize_t len = 0;
+
+	memset(eth_state, 0, sizeof(struct eth_port_state));
+	/* eth interface name */
+	strncpy(eth_state->ifname, eth, sizeof(eth_state->ifname));
+
+	/* eth interface state */
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/class/net/%s/carrier", eth);
+
+	fd = open(sysfs_path, O_RDONLY);
+	if (fd < 0) {
+		carrier = 0;
+		close(fd);
+	} else {
+		len = read(fd, eth_state->state, 15);
+		if (len < 0) {
+			carrier = 0;
+		}
+		close(fd);
+	}
+
+
+	if(!strncmp(eth_state->state, "0", 1))
+		carrier = 0;
+	
+	strncpy(eth_state->state, carrier? "up":"down", sizeof(eth_state->state));
+
+	/* eth interface wan bridge */
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/class/net/br-wan/brif");
+
+	iface = opendir(sysfs_path);
+	if (iface) {
+		while ((ent = readdir(iface)) != NULL) {
+			if (DOT_OR_DOTDOT(ent->d_name))
+				continue;
+			if (strncmp(ent->d_name, eth_state->ifname, sizeof(eth_state->ifname)) == 0)
+				strncpy(eth_state->bridge, "br-wan", sizeof(eth_state->ifname));
+		}
+		closedir(iface);
+	}
+
+	/* eth interface lan bridge */
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/class/net/br-lan/brif");
+
+	iface = opendir(sysfs_path);
+	if (iface) {
+		while ((ent = readdir(iface)) != NULL) {
+			if (DOT_OR_DOTDOT(ent->d_name))
+				continue;
+			if (strncmp(ent->d_name, eth_state->ifname, sizeof(eth_state->ifname)) == 0)
+				strncpy(eth_state->bridge, "br-lan", sizeof(eth_state->bridge));
+		}
+		closedir(iface);
+	}
+
+	/* eth interface speed Mbits/sec */
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/class/net/%s/speed", eth);
+
+	fd = open(sysfs_path, O_RDONLY);
+	if (fd < 0) {
+		close(fd);
+	} else {
+
+		len = read(fd, eth_state->speed, sizeof(eth_state->speed) -1);
+
+		if (len < 0)
+			snprintf(eth_state->speed, sizeof(eth_state->speed), "0");
+		else
+			eth_state->speed[len-1] = '\0';
+		close(fd);
+	}
+
+	/* eth interface duplex */
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/class/net/%s/duplex", eth);
+
+	fd = open(sysfs_path, O_RDONLY);
+	if (fd < 0) {
+		close(fd);
+	} else {
+		len = read(fd, eth_state->duplex, sizeof(eth_state->duplex) -1);
+
+		if (len < 0)
+			snprintf(eth_state->duplex, sizeof(eth_state->duplex), "none");
+		else
+			eth_state->duplex[len-1] = '\0';
+
+		close(fd);
+	}
+}
+
+
+static void update_eth_ports_states(struct schema_Wifi_Inet_State *state)
+{
+	char *wan = NULL;
+	char *lan = NULL;
+	char *eth = NULL;
+	int cnt = 0;
+	int i = 0;
+	char port_status[128] = {'\0'};
+	char brname[IFNAMSIZ] = {'\0'};
+
+	wan = get_eth_map_info("wan");
+	update_eth_state(wan, &wanport);
+
+	lan = get_eth_map_info("lan");
+	eth = strtok (lan," ");
+	for (i = 0; i < MAX_ETH_PORTS && eth != NULL; i++)
+	{
+		update_eth_state(eth, &lanport[i]);
+		eth = strtok (NULL, " ");
+	}
+
+	if (!strncmp(state->if_name, "wan", 3))
+		strncpy(brname, "br-wan", 6);
+	else if  (!strncmp(state->if_name, "lan", 3))
+		strncpy(brname, "br-lan", 6);
+
+	if (strcmp(wanport.bridge, brname) == 0) {
+		STRSCPY(state->eth_ports_keys[0], wanport.ifname);
+		snprintf(port_status, sizeof(port_status), "%s wan %sMbps %s", 
+			 wanport.state, wanport.speed, wanport.duplex);
+		STRSCPY(state->eth_ports[0], port_status);
+		cnt++;
+		state->eth_ports_len = cnt;
+	}
+	for (i = 0; i < MAX_ETH_PORTS && lanport[i].ifname != NULL; i++) {
+		if (strcmp(lanport[i].bridge, brname) == 0) {
+			STRSCPY(state->eth_ports_keys[cnt+i], lanport[i].ifname);
+			memset(port_status, '\0', sizeof(port_status));
+			snprintf(port_status, sizeof(port_status), "%s lan %sMbps %s", 
+				 lanport[i].state, lanport[i].speed, lanport[i].duplex);
+
+			STRSCPY(state->eth_ports[cnt+i], port_status);
+			cnt++;
+			state->eth_ports_len = cnt;
+		}
+	}
+
+	if (!strncmp(state->if_name, "eth", 3)) {
+
+		char *delim = NULL;
+		char name[IFNAMSIZ] = {'\0'};
+
+		delim = strstr(state->if_name, "_");
+		if (delim)
+			strncpy(name, state->if_name, delim - state->if_name);
+
+		if (name[0] == '\0')
+			return;
+
+
+		if (strcmp(wanport.ifname, name) == 0) {
+			STRSCPY(state->eth_ports_keys[0], wanport.ifname);
+			memset(port_status, '\0', sizeof(port_status));
+			snprintf(port_status, sizeof(port_status), "%s wan %sMbps %s", 
+				 wanport.state, wanport.speed, wanport.duplex);
+			STRSCPY(state->eth_ports[0], port_status);
+			state->eth_ports_len = 1;
+		} else {
+			for (i = 0; i < MAX_ETH_PORTS && lanport[i].ifname != NULL; i++) {
+				if (strcmp(lanport[i].ifname, name) == 0) {
+					STRSCPY(state->eth_ports_keys[0], lanport[i].ifname);
+					memset(port_status, '\0', sizeof(port_status));
+					snprintf(port_status, sizeof(port_status), "%s lan %sMbps %s", 
+					 lanport[i].state, lanport[i].speed, lanport[i].duplex);
+
+					STRSCPY(state->eth_ports[0], port_status);
+					state->eth_ports_len = 1;
+				}
+			}
+		}
+	}
+}
+
 void wifi_inet_state_set(struct blob_attr *msg)
 {
 	struct blob_attr *tb[__NET_ATTR_MAX] = { };
@@ -124,6 +380,13 @@ void wifi_inet_state_set(struct blob_attr *msg)
 		state.enabled = true;
 		state.network = true;
 	} else {
+
+		/* Delete VLAN interface state column if disabled */
+		if (strstr(state.if_name, "_") != NULL) {
+			wifi_inet_state_del(state.if_name);
+			return;
+		}
+
 		state.enabled = false;
 		state.network = false;
 	}
@@ -143,6 +406,23 @@ void wifi_inet_state_set(struct blob_attr *msg)
 		else if (!strncmp(l3_device, "gre4", strlen("gre4")) ||
 			!strncmp(l3_device, "gre6", strlen("gre6")))
 			SCHEMA_SET_STR(state.if_type, "gre");
+		/* Fill if_type, vlan_id and parent_ifname using
+		 * if_name (eg:eth0_100) */
+		else if (!strncmp(l3_device, "eth", strlen("eth"))) {
+				char *delim = NULL;
+				delim = strstr(state.if_name, "_");
+				if (delim) {
+					struct iface_info info;
+					memset (&info, 0, sizeof(info));
+					SCHEMA_SET_STR(state.if_type, "vlan");
+					strncpy(info.name, &l3_device[0],
+						delim - state.if_name);
+					SCHEMA_SET_STR(state.parent_ifname, info.name);
+					info.vid = atoi(&delim[1]);
+					SCHEMA_SET_INT(state.vlan_id, info.vid);
+				}
+
+			}
 		else
 			SCHEMA_SET_STR(state.if_type, "eth");
 		if (!l3_device_split(l3_device, &info) && strcmp(info.name, state.if_name)) {
@@ -262,6 +542,8 @@ void wifi_inet_state_set(struct blob_attr *msg)
 		}
 	}
 
+	update_eth_ports_states(&state);
+
 	if (!ovsdb_table_upsert(&table_Wifi_Inet_State, &state, false))
 		LOG(ERR, "inet_state: failed to insert");
 }
@@ -289,6 +571,12 @@ void wifi_inet_master_set(struct blob_attr *msg)
 		SCHEMA_SET_STR(state.port_state, "active");
 		SCHEMA_SET_STR(state.network_state, "up");
 	} else {
+		/* Delete VLAN interface state column if disabled */
+		if (strstr(state.if_name, "_") != NULL) {
+			wifi_inet_master_del(state.if_name);
+			return;
+		}
+
 		SCHEMA_SET_STR(state.port_state, "inactive");
 		SCHEMA_SET_STR(state.network_state, "down");
 	}
@@ -329,7 +617,14 @@ void wifi_inet_master_set(struct blob_attr *msg)
 
 		if (!net_is_bridge(l3_device))
 			SCHEMA_SET_STR(state.if_type, "bridge");
-		else
+		/* Fill if_type, vlan_id and parent_ifname using
+		 * if_name (eg:eth0_100) */
+		else if (!strncmp(l3_device, "eth", strlen("eth"))) {
+				char *delim = NULL;
+				delim = strstr(state.if_name, "_");
+				if (delim)
+					SCHEMA_SET_STR(state.if_type, "vlan");
+		} else
 			SCHEMA_SET_STR(state.if_type, "eth");
 	} else
 		SCHEMA_SET_STR(state.if_type, "eth");
@@ -349,6 +644,17 @@ void wifi_inet_master_set(struct blob_attr *msg)
 		LOG(ERR, "master_state: failed to insert");
 }
 
+
+bool wifi_inet_master_del(const char *ifname)
+{
+	int ret;
+
+	ret = ovsdb_table_delete_simple(&table_Wifi_Master_State, SCHEMA_COLUMN(Wifi_Inet_State, if_name), ifname);
+	if (ret <= 0)
+		LOG(ERR, "inet_state: Error deleting Wifi_Master_State for interface %s.", ifname);
+	return ret;
+}
+
 bool wifi_inet_state_del(const char *ifname)
 {
 	int ret;
@@ -356,11 +662,6 @@ bool wifi_inet_state_del(const char *ifname)
 	ret = ovsdb_table_delete_simple(&table_Wifi_Inet_State, SCHEMA_COLUMN(Wifi_Inet_State, if_name), ifname);
 	if (ret <= 0)
 		LOG(ERR, "inet_state: Error deleting Wifi_Inet_State for interface %s.", ifname);
-
-	ret = ovsdb_table_delete_simple(&table_Wifi_Master_State, SCHEMA_COLUMN(Wifi_Inet_State, if_name), ifname);
-	if (ret <= 0)
-		LOG(ERR, "inet_state: Error deleting Wifi_Master_State for interface %s.", ifname);
-
 	return ret;
 }
 
