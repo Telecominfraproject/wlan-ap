@@ -90,6 +90,24 @@ const char mesh_options_table[SCHEMA_MESH_OPTS_MAX][SCHEMA_MESH_OPT_SZ] =
 		SCHEMA_CONSTS_MESH_HOP_PENALTY,
 };
 
+
+char* get_eth_map_info(char* iface);
+static void init_eth_ports_config(struct schema_Wifi_Inet_Config *config)
+{
+	char *wan = NULL;
+	char *lan = NULL;
+
+	wan = get_eth_map_info("wan");
+	if (!strncmp(config->if_name, "wan", 3)) {
+		SCHEMA_SET_STR(config->eth_ports, wan);
+	}
+
+	lan = get_eth_map_info("lan");
+	if (!strncmp(config->if_name, "lan", 3)) {
+		SCHEMA_SET_STR(config->eth_ports, lan);
+	}
+}
+
 static void wifi_inet_conf_load(struct uci_section *s)
 {
 	struct blob_attr *tb[__NET_ATTR_MAX] = { };
@@ -190,6 +208,7 @@ static void wifi_inet_conf_load(struct uci_section *s)
 		}
 	}
 
+	init_eth_ports_config(&conf);
 	firewall_get_config(&conf);
 
 	if (!ovsdb_table_upsert(&table_Wifi_Inet_Config, &conf, false))
@@ -261,8 +280,9 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 			snprintf(uci_ifname, sizeof(uci_ifname), "gre4t-%s.%d", iconf->parent_ifname, iconf->vlan_id);
 			blobmsg_add_string(&b, "ifname", uci_ifname);
 			blobmsg_add_string(&b, "type", "bridge");
-		}
-		else {
+		} else if(!strncmp(iconf->parent_ifname, "eth", strlen("eth"))) {
+			blobmsg_add_string(&b, "ifname", iconf->parent_ifname);
+		} else {
 			snprintf(uci_ifname, sizeof(uci_ifname), "br-%s.%d", iconf->parent_ifname, iconf->vlan_id);
 			blobmsg_add_string(&b, "ifname", uci_ifname);
 		}
@@ -345,6 +365,101 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 	return 0;
 }
 
+static int wifi_inet_dup_conf_single(struct blob_buf *dup, char *if_name, int exclude)
+
+{
+	struct blob_attr *tb[__NET_ATTR_MAX] = { };
+	struct uci_package *network = NULL;
+	struct uci_section *s;
+	int i = 0;
+
+	/* Load the network uci and lookup the if_name section */
+	uci_load(uci, "network", &network);
+	s = uci_lookup_section(uci, network , if_name);
+
+	if(!s) {
+		LOG(ERR, " %s: Failed to load uci", __func__);
+		uci_unload(uci, network);
+		return -1;
+	}
+
+	/* Copy the uci section to blob and parse it */
+	blob_buf_init(&b, 0);
+	uci_to_blob(&b, s, &network_param);
+	uci_unload(uci, network);
+	blobmsg_parse(network_policy, __NET_ATTR_MAX,
+		      tb, blob_data(b.head),
+		      blob_len(b.head));
+
+	blob_buf_init(dup, 0);
+	blob_buf_init(&del, 0);
+
+	/* copy the parsed data to the passed blob buffer */
+	for (i = 0; i < __NET_ATTR_MAX; i++) {
+		if (i == exclude)
+			continue;
+		if (tb[i]) {
+			switch (network_policy[i].type) {
+			case BLOBMSG_TYPE_STRING:
+				blobmsg_add_string(dup, network_policy[i].name,
+					   blobmsg_get_string(tb[i]));
+				break;
+			case BLOBMSG_TYPE_INT32:
+				blobmsg_add_u32(dup, network_policy[i].name,
+					   blobmsg_get_u32(tb[i]));
+				break;
+			case BLOBMSG_TYPE_BOOL:
+				blobmsg_add_bool(dup, network_policy[i].name,
+					   blobmsg_get_bool(tb[i]));
+				break;
+			default:
+				break;
+
+			}
+		}
+	}
+	return 0;
+}
+
+static int wifi_inet_conf_modify(struct schema_Wifi_Inet_Config *iconf)
+{
+	struct blob_buf dup = { };
+
+	if (iconf->eth_ports_changed) {
+		LOGI("%s+%d: changed=%d if_name=%s, eth_ports=%s",
+		      __func__, __LINE__, iconf->eth_ports_changed,
+		      iconf->if_name, iconf->eth_ports);
+
+		iconf->eth_ports_changed = 0;
+
+		/* Copy the current uci interface section to the blob excluding
+		 * the passed NET_ATTR (changed config attribute) */
+		if (wifi_inet_dup_conf_single(&dup, iconf->if_name,
+					      NET_ATTR_IFNAME) != 0)
+			return -1;
+
+		/* Add the changed configuration to the blob */
+		blobmsg_add_string(&dup, "ifname", iconf->eth_ports);
+
+		/* Delete the current uci interface section */
+		if (uci_section_del(uci, "network", "network",
+				    iconf->if_name, "interface") != 0)
+			return -1;
+
+		/* Add the resulting modified blob to uci */
+		if (blob_to_uci_section(uci, "network",
+				    iconf->if_name,
+				    "interface", dup.head,
+				    &network_param,
+				    del.head) != 0)
+			return -1;
+
+		uci_commit_all(uci);
+		blob_buf_free(&dup);
+	}
+	return 0;
+}
+
 static void wifi_inet_conf_del(struct schema_Wifi_Inet_Config *iconf)
 {
 	if (!strcmp(iconf->if_name, "wan") || !strcmp(iconf->if_name, "lan")) {
@@ -386,6 +501,13 @@ static void callback_Wifi_Inet_Config(ovsdb_update_monitor_t *mon,
 		}
 
 		wifi_inet_conf_add(iconf);
+		system("cp /etc/config/network /tmp/bkp-network");
+		if (wifi_inet_conf_modify(iconf) != 0) {
+			LOG(ERR, "Failed to modify network Conf restoring old conf");
+			system("cp /tmp/bkp-network /etc/config/network");
+		}
+		system("rm /tmp/bkp-network");
+
 		netifd_modify_inet_conf(iconf);
 		break;
 	case OVSDB_UPDATE_DEL:
@@ -413,10 +535,12 @@ void wifi_inet_config_init(void)
 	uci_foreach_element(&network->sections, e) {
 		struct uci_section *s = uci_to_section(e);
 
-		if (!strcmp(s->type, "interface"))
+		if (!strcmp(s->type, "interface")) {
 			wifi_inet_conf_load(s);
+		}
 	}
 	uci_unload(uci, network);
+
 	OVSDB_TABLE_MONITOR(Wifi_Inet_Config, false);
 
 	return;
