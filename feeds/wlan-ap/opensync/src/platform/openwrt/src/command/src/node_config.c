@@ -262,6 +262,7 @@ enum {
 	LED_ATTR_DELAYOFF,
 	LED_ATTR_VALUE,
 	LED_ATTR_KEY,
+	LED_ATTR_DEFAULT,
 	__LED_ATTR_MAX,
 };
 
@@ -272,6 +273,7 @@ static const struct blobmsg_policy led_policy[__LED_ATTR_MAX] = {
 	[LED_ATTR_DELAYOFF] = { .name = "delayoff", .type = BLOBMSG_TYPE_STRING},
 	[LED_ATTR_VALUE] = { .name = "value", .type = BLOBMSG_TYPE_STRING},
 	[LED_ATTR_KEY] = { .name = "key", .type = BLOBMSG_TYPE_STRING},
+	[LED_ATTR_DEFAULT] = { .name = "default", .type = BLOBMSG_TYPE_BOOL},
 };
 
 static const struct uci_blob_param_list led_param = {
@@ -329,13 +331,14 @@ int available_led_check(char *led_name)
 	return 0;
 }
 
-static void set_led_config(char *trigger_name, char *key, char* value, char* led_string, char* led_section)
+static void set_led_config(char *trigger_name, char *key, char* value, char* led_string, char* led_section, int state)
 {
 	blob_buf_init(&b, 0);
 	blobmsg_add_string(&b, "sysfs", led_string);
 	blobmsg_add_string(&b, "trigger", trigger_name);
 	blobmsg_add_string(&b, "value", value);
 	blobmsg_add_string(&b, "key", key);
+	blobmsg_add_bool(&b, "default", state);
 	blob_to_uci_section(uci, "system", led_section, "led", b.head, &led_param, NULL);
 	return;
 }
@@ -384,6 +387,23 @@ static char* get_phy_map_led_info(char* wifi)
 	return blobmsg_get_string(cur);
 }
 
+static void set_primary_led_color(char *ap_name, char *led_section, char *color)
+{
+	char green_leds[][10]= {"power", "wifi2g", "wifi5g", "lan", "wan", "eth0", "eth1"};
+	if (!strcmp(ap_name, "wf194c") || !strcmp(ap_name, "wf6203") || !strcmp(ap_name, "ecw5410"))
+	{
+		unsigned int i;
+		for (i = 0; i < ARRAY_SIZE(green_leds); i++) {
+			if (!strcmp(led_section, green_leds[i])) {
+				strcpy(color, "green");
+				return;
+			}
+		}
+	}
+	else
+		return;
+}
+
 static void get_led_info_from_sys_config(char* key, char* value)
 {
 	char led_string[32];
@@ -404,20 +424,28 @@ static void get_led_info_from_sys_config(char* key, char* value)
 		strncpy(sysled, gl.gl_pathv[i], sizeof(sysled));
 		sscanf(sysled,"/%[^/]/%[^/]/%[^/]/%s", sys, class, leds, led_string);
 		sscanf(led_string,"%[^:]:%[^:]:%s",ap_name, color, led_section);
-		if(available_led_check(led_section)) {
-			snprintf(led_name_final, sizeof(led_name_final), "%s%s","led_",led_section);
-			if(!strcmp(key, "led_blink")) {
-				set_led_config("heartbeat", key, value, led_string, led_name_final);
+		if (strlen(led_string) < 8)
+			continue;
+		if (available_led_check(led_section)) {
+			snprintf(led_name_final, sizeof(led_name_final), "%s%s", "led_", led_section);
+			if (strcmp(color, "green")) {
+				set_primary_led_color(ap_name, led_section, color);
+				snprintf(led_string, sizeof(led_string), "%s:%s:%s",ap_name, color, led_section);
 			}
-			else if(!strcmp(key, "led_off")) {
-				set_led_config("none", key, value, led_string, led_name_final);
+			if (!strcmp(key, "led_blink")) {
+				set_led_config("heartbeat", key, value, led_string, led_name_final, 1);
 			}
-			else {
-				if(!strcmp(led_section, "wifi2g") || !strcmp(led_section, "wifi5g")) {
-					set_led_config(get_phy_map_led_info(led_section), key, value, led_string, led_name_final);
+			else if (!strcmp(key, "led_state")) {
+				if (!strcmp(value, "off")) {
+					set_led_config("none", key, value, led_string, led_name_final, 0);
 				}
-				else
-					set_led_config("none", key, value, led_string, led_name_final);
+				else {
+					if (!strcmp(led_section, "wifi2g") || !strcmp(led_section, "wifi5g")) {
+						set_led_config(get_phy_map_led_info(led_section), key, value, led_string, led_name_final, 1);
+					}
+					else
+						set_led_config("none", key, value, led_string, led_name_final, 1);
+				}
 			}
 		}
 	}
@@ -433,7 +461,7 @@ static void led_handler(int type,
 	switch (type) {
 	case OVSDB_UPDATE_NEW:
 	case OVSDB_UPDATE_MODIFY:
-		if (!strcmp(conf->key, "led_blink") || !strcmp(conf->key, "led_off")) {
+		if (!strcmp(conf->key, "led_blink") || !strcmp(conf->key, "led_state")) {
 			get_led_info_from_sys_config(conf->key, conf->value);
 			del=0;
 		}
