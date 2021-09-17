@@ -724,6 +724,10 @@ void radio_maverick(void *arg)
 		radio_ops->op_vconf(&conf, rconf.if_name);
 	}
 	uci_unload(uci, wireless);
+	uci_commit_all(uci);
+	sync();
+	LOGI("====Calling reload_config for Maverick ssid====");
+	system("ubus call uci reload_config");
 }
 
 
