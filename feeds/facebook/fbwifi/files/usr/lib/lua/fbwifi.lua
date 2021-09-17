@@ -1,3 +1,6 @@
+-- SPDX-License-Identifier: GPL-2.0-only
+-- Copyright (c) Facebook, Inc. and its affiliates.
+--
 -- FBWIFI Lua library
 -- function table
 local fbwifi = {}

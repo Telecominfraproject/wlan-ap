@@ -1,5 +1,5 @@
--- Copyright 
--- Licensed to the public under the GNU General Public License v2.
+-- SPDX-License-Identifier: GPL-2.0-only
+-- Copyright (c) Facebook, Inc. and its affiliates.
 
 module("luci.controller.fbwifi", package.seeall)
 
