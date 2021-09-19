@@ -337,7 +337,7 @@ hostapd_common_add_bss_config() {
 
 	config_add_boolean hs20 disable_dgaf osen
 	config_add_int anqp_domain_id
-	config_add_int hs20_deauth_req_timeout
+	config_add_int hs20_deauth_req_timeout hs20_release
 	config_add_array hs20_oper_friendly_name
 	config_add_array osu_provider
 	config_add_array operator_icon
@@ -996,12 +996,13 @@ hostapd_set_bss_options() {
 
 	local hs20 disable_dgaf osen anqp_domain_id hs20_deauth_req_timeout \
 		osu_ssid hs20_wan_metrics hs20_operating_class hs20_t_c_filename hs20_t_c_timestamp \
-		hs20_t_c_server_url
+		hs20_t_c_server_url hs20_release
 	json_get_vars hs20 disable_dgaf osen anqp_domain_id hs20_deauth_req_timeout \
 		osu_ssid hs20_wan_metrics hs20_operating_class hs20_t_c_filename hs20_t_c_timestamp \
-		hs20_t_c_server_url
+		hs20_t_c_server_url hs20_release
 
 	set_default hs20 0
+	set_default hs20_release  1
 	set_default disable_dgaf $hs20
 	set_default osen 0
 	set_default anqp_domain_id 0
@@ -1009,6 +1010,7 @@ hostapd_set_bss_options() {
 	if [ "$hs20" = "1" ]; then
 		append bss_conf "hs20=1" "$N"
 		append_hs20_icons
+		append bss_conf "hs20_release=$hs20_release" "$N"
 		append bss_conf "disable_dgaf=$disable_dgaf" "$N"
 		append bss_conf "osen=$osen" "$N"
 		append bss_conf "anqp_domain_id=$anqp_domain_id" "$N"
@@ -1167,7 +1169,7 @@ wpa_supplicant_set_fixed_freq() {
 	append network_data "frequency=$freq" "$N$T"
 	case "$htmode" in
 		NOHT) append network_data "disable_ht=1" "$N$T";;
-		HT20|VHT20) append network_data "disable_ht40=1" "$N$T";;
+		HT20|VHT20|HE20) append network_data "disable_ht40=1" "$N$T";;
 		HT40*|VHT40*|VHT80*|VHT160*) append network_data "ht40=1" "$N$T";;
 	esac
 	case "$htmode" in
