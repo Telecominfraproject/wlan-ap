@@ -39,27 +39,27 @@ EC420)
 	;;
 EAP101)
 	TARGET=eap101
-	WIFI=wifi-ax
+	WIFI=wifi-cs1
 	;;
 EAP102)
 	TARGET=eap102
-	WIFI=wifi-ax
+	WIFI=wifi-cs1
 	;;
 EX227)
 	TARGET=ex227
-	WIFI=wifi-ax
+	WIFI=wifi-cs1
 	;;
 EX447)
 	TARGET=ex447
-	WIFI=wifi-ax
+	WIFI=wifi-cs1
 	;;
 WF188N)
 	TARGET=wf188n
-	WIFI=wifi-ax
+	WIFI=wifi-cs1
 	;;
 WF194C)
 	TARGET=wf194c
-	WIFI=wifi-ax
+	WIFI=wifi-cs1
 	;;
 WF610D)
 	TARGET=wf610d

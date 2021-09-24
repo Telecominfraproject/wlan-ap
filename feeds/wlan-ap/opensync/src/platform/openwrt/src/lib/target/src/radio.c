@@ -471,8 +471,8 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 		 * if not, that means the channel state changed due to a 
 		 * radar detection and shall remain in the backup channel */
 		if (is_cloud_channel_change(rconf) == 0) {
+			blobmsg_add_u32(&b, "channel", rconf->channel);
 			if(rrm_radio_rebalance_channel(rconf) == 0) {
-				blobmsg_add_u32(&b, "channel", rconf->channel);
 				radio_fixup_set_primary_chan(rconf->if_name, rconf->channel);
 			}
 		}

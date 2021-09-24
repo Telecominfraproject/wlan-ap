@@ -445,8 +445,11 @@ bool target_stats_device_fanrpm_get(uint32_t *fan_rpm)
 bool target_stats_channel_get(char *radio_if, unsigned int *chan)
 {
 	bool ret = true;
-	if ((nl80211_get_oper_channel(radio_if, chan)) < 0)
+	channel_info_t chan_info;
+	if ((nl80211_get_oper_channel(radio_if, &chan_info)) < 0)
 		ret = false;
+
+	*chan = chan_info.channel;
 
 	LOGT("%s: channel %d", radio_if, *chan);
 

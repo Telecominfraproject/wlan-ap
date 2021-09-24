@@ -69,21 +69,22 @@ static int nl80211_chainmask_recv(struct nl_msg *msg, void *arg)
 	if (tb[NL80211_ATTR_WIPHY_ANTENNA_TX])
 		*mask = nla_get_u32(tb[NL80211_ATTR_WIPHY_ANTENNA_TX]);
 
-	return NL_OK;
+	return NL_STOP;
 }
 
 static int nl80211_channel_recv(struct nl_msg *msg, void *arg)
 {
 	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
 	struct nlattr *tb[NL80211_ATTR_MAX + 1];
-	unsigned int *chan = (unsigned int *)arg;
+	channel_info_t *chan = (channel_info_t *)arg;
 
 	memset(tb, 0, sizeof(tb));
 	nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
 		  genlmsg_attrlen(gnlh, 0), NULL);
 
-	if (tb[NL80211_ATTR_WIPHY_FREQ]) {
-		*chan = ieee80211_frequency_to_channel(nla_get_u32(tb[NL80211_ATTR_WIPHY_FREQ]));
+	if (tb[NL80211_ATTR_WIPHY_FREQ] && tb[NL80211_ATTR_CHANNEL_WIDTH]) {
+		chan->channel = ieee80211_frequency_to_channel(nla_get_u32(tb[NL80211_ATTR_WIPHY_FREQ]));
+		chan->bandwidth = nla_get_u32(tb[NL80211_ATTR_CHANNEL_WIDTH]);
 	}
 
 	return NL_OK;
@@ -528,7 +529,7 @@ int nl80211_get_tx_chainmask(char *name, unsigned int *mask)
 	return unl_genl_request(&unl_req, msg, nl80211_chainmask_recv, mask);
 }
 
-int nl80211_get_oper_channel(char *name, unsigned int *chan)
+int nl80211_get_oper_channel(char *name, channel_info_t *chan)
 {
 	struct nl_msg *msg;
 	int idx = if_nametoindex(name);
@@ -577,21 +578,32 @@ int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_lis
 			 target_scan_cb_t *scan_cb, void *scan_ctx)
 {
 	struct nl_msg *msg = nl80211_call_vif(nl_call_param, NL80211_CMD_TRIGGER_SCAN, false);
-	struct nlattr *freq;
-	unsigned int i, flags = 0;
+	unsigned int i;
+	unsigned int flags = 0;
+	int center_freq = 0;
 	int ret = 0;
-	uint32_t oper_chan;
+	channel_info_t oper_chan;
 	struct nl80211_scan *nl80211_scan;
+	unsigned int requested_freq = 0;
+
+	unsigned int frequency_list_80MHz[] = {5180, 5260, 5500, 5580, 5660, 5745};
+	unsigned int frequency_list_40MHz[] = {5180, 5220, 5260, 5300, 5500, 5540,
+										   5580, 5620, 5660, 5745, 5785, 5825, 5865,
+										   5920, 5960};
 
 	if (!msg)
 		return -1;
 
-	if (nl80211_get_oper_channel(nl_call_param->ifname, &oper_chan) < 0) {
+	if (nl80211_get_oper_channel(nl_call_param->ifname, &oper_chan) != 0) {
 		/* Could not get the current operating channel */
-		oper_chan = 0;
+		oper_chan.channel = 0;
+		oper_chan.bandwidth = 0;
 		LOGE("%s: Could not get the current operating channel\n",
 			nl_call_param->ifname);
+		return -1;
 	}
+
+	requested_freq = ieee80211_channel_to_frequency(chan_list[0]);
 
 	/* Add the ap-force flag, otherwise the scan fails on wifi6 APs */
 	flags |= NL80211_SCAN_FLAG_AP;
@@ -600,35 +612,72 @@ int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_lis
 	if ((scan_type == RADIO_SCAN_TYPE_OFFCHAN) && dwell_time)
 		nla_put_u16(msg, NL80211_ATTR_MEASUREMENT_DURATION, dwell_time);
 
-	freq = nla_nest_start(msg, NL80211_ATTR_SCAN_FREQUENCIES);
-	for (i = 0; i < chan_num; i ++) {
-		if (!oper_chan || (scan_type == RADIO_SCAN_TYPE_FULL)) {
-			nla_put_u32(msg, i, ieee80211_channel_to_frequency(chan_list[i]));
+	nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, requested_freq);
+
+	if (requested_freq > 5000) {
+		switch(oper_chan.bandwidth)
+		{
+			case NL80211_CHAN_WIDTH_80:
+				center_freq = requested_freq;
+				for (i = 0; i < ARRAY_SIZE(frequency_list_80MHz); i++) {
+					if ((requested_freq >= frequency_list_80MHz[i]) &&
+							(requested_freq < frequency_list_80MHz[i] + 80)) {
+						break;
+					}
+				}
+
+				if (i == ARRAY_SIZE(frequency_list_80MHz))
+					break;
+
+				center_freq = frequency_list_80MHz[i] + 30;
+				break;
+
+			case NL80211_CHAN_WIDTH_40:
+				center_freq = requested_freq;
+				for (i = 0; i < ARRAY_SIZE(frequency_list_40MHz); i++) {
+					if ((requested_freq >= frequency_list_40MHz[i]) &&
+							(requested_freq < frequency_list_40MHz[i] + 40)) {
+						break;
+					}
+				}
+
+				if (i == ARRAY_SIZE(frequency_list_40MHz))
+					break;
+
+				center_freq = frequency_list_40MHz[i] + 10;
+				break;
+
+			default:
+				center_freq = requested_freq;
 		}
-		else if ((scan_type == RADIO_SCAN_TYPE_OFFCHAN) &&
-			(chan_list[i] != oper_chan)) {
-			nla_put_u32(msg, i, ieee80211_channel_to_frequency(chan_list[i]));
-		}
-		else if ((scan_type == RADIO_SCAN_TYPE_ONCHAN) &&
-			(chan_list[i] == oper_chan)) {
-			nla_put_u32(msg, i, ieee80211_channel_to_frequency(chan_list[i]));
-		}
+		nla_put_u32(msg, NL80211_ATTR_CHANNEL_WIDTH, oper_chan.bandwidth);
+		nla_put_u32(msg, NL80211_ATTR_CENTER_FREQ1, center_freq);
 	}
-	nla_nest_end(msg, freq);
+
+	LOGD("%s:%d chan_num.%d scan_type.%d chan.%d [%d] [%d] [%d]", __func__, __LINE__,
+		 chan_num,
+		 scan_type,
+		 chan_list[0],
+		 ieee80211_channel_to_frequency(chan_list[0]),
+		 oper_chan.bandwidth,
+		 center_freq);
 
 	nl80211_scan = nl80211_scan_add(nl_call_param->ifname, scan_cb, scan_ctx); 
 	if (nl80211_scan == NULL) {
-		LOG(DEBUG,"%s: scan add failed %d\n", nl_call_param->ifname, ret);
+		LOGD("%s: scan add failed %d\n", nl_call_param->ifname, ret);
 		return -1;
 	}
 
 	ret = unl_genl_request(&unl_req, msg, nl80211_scan_trigger_recv, NULL);
 	if (ret) {
-		nl80211_scan_del(nl80211_scan);
-		LOG(DEBUG, "%s: scan request failed %d\n", nl_call_param->ifname, ret);
+		/* Allow upper layer to send survey report and proceed to next channel
+		 * in case scan fails
+		 */
+		LOG(DEBUG, "%s: scan request failed, proceed however %d\n", nl_call_param->ifname, ret);
+		nl80211_scan_finish(nl_call_param->ifname, true);
 	}
 
-	return ret;
+	return 0;
 }
 
 int nl80211_scan_abort(struct nl_call_param *nl_call_param)
