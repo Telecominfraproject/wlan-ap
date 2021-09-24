@@ -6,6 +6,9 @@ Case studies for OEM customers are available at the official page of [Facebook W
 
 For OEM engineers, start by reading the init script in [files/etc/init.d/fbwifi](https://github.com/facebookincubator/fbc_owrt_feed/blob/master/fbwifi/files/etc/init.d/fbwifi)
 
+To enable Facebook Wi-Fi, configure the gateway_token in `/etc/config/fbwifi`, and run `fbwifi enable`.
+To disable Facebook Wi-Fi, run `fbwifi disable`.
+
 ## Contents
 
 The 'files' subdirectory contains all the configuration, script and code 
