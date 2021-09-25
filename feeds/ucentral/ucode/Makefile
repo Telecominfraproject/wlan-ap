@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2020 Jo-Philipp Wich <jo@mein.io>
+# Copyright (C) 2020-2021 Jo-Philipp Wich <jo@mein.io>
 #
 # This is free software, licensed under the GNU General Public License v2.
 # See /LICENSE for more information.
@@ -12,36 +12,45 @@ PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL=https://github.com/jow-/ucode.git
-PKG_SOURCE_DATE:=2021-03-15
-PKG_SOURCE_VERSION:=2a838d1f9f58d05bc1e15084efa42ad86fc105e4
+PKG_SOURCE_DATE:=2021-07-30
+PKG_SOURCE_VERSION:=5b908bdf64a586d27d5bdd1df8c72a7cd63b386a
 PKG_MIRROR_HASH:=
 PKG_MAINTAINER:=Jo-Philipp Wich <jo@mein.io>
 PKG_LICENSE:=ISC
 
-PKG_ASLR_PIE_REGULAR:=1
-PKG_BUILD_DEPENDS = ustream-ssl
-PKG_CONFIG_DEPENDS:= CONFIG_ucode_lua
+PKG_ABI_VERSION:=20210730
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
-include $(INCLUDE_DIR)/version.mk
 
-CMAKE_OPTIONS+=-DFS_SUPPORT=1 -DMATH_SUPPORT=1 -DUBUS_SUPPORT=1 -DUCI_SUPPORT=1
+CMAKE_OPTIONS += -DSOVERSION=$(PKG_ABI_VERSION)
 
 define Package/ucode/default
   SECTION:=utils
   CATEGORY:=Utilities
-  TITLE:=ucode - Tiny template language
+  TITLE:=ucode - Tiny scripting and templating language
 endef
 
 define Package/ucode
   $(Package/ucode/default)
-  DEPENDS:=+libjson-c
+  DEPENDS:=+libucode
 endef
 
 define Package/ucode/description
  ucode is a tiny script interpreter featuring an ECMAScript oriented
  script language and Jinja-inspired templating.
+endef
+
+
+define Package/libucode
+  $(Package/ucode/default)
+  TITLE+= - runtime library
+  ABI_VERSION:=$(PKG_ABI_VERSION)
+  DEPENDS:=+libjson-c
+endef
+
+define Package/libucode/description
+ The libucode package provides the shared runtime library for the ucode interpreter.
 endef
 
 
@@ -90,33 +99,46 @@ define Package/ucode-mod-uci/description
 endef
 
 
+define Build/InstallDev
+	$(INSTALL_DIR) $(1)/usr/lib $(1)/usr/include/ucode
+	$(CP) $(PKG_INSTALL_DIR)/usr/include/ucode/*.h $(1)/usr/include/ucode/
+	$(CP) $(PKG_INSTALL_DIR)/usr/lib/libucode.so* $(1)/usr/lib/
+endef
+
+
 define Package/ucode/install
 	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ipkg-install/usr/bin/ucode $(1)/usr/bin/ucode
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/bin/ucode $(1)/usr/bin/ucode
+endef
+
+define Package/libucode/install
+	$(INSTALL_DIR) $(1)/usr/lib
+	$(CP) $(PKG_INSTALL_DIR)/usr/lib/libucode.so.* $(1)/usr/lib/
 endef
 
 define Package/ucode-mod-fs/install
 	$(INSTALL_DIR) $(1)/usr/lib/ucode
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ipkg-install/usr/lib/ucode/fs.so $(1)/usr/lib/ucode/
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/fs.so $(1)/usr/lib/ucode/
 endef
 
 define Package/ucode-mod-math/install
 	$(INSTALL_DIR) $(1)/usr/lib/ucode
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ipkg-install/usr/lib/ucode/math.so $(1)/usr/lib/ucode/
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/math.so $(1)/usr/lib/ucode/
 endef
 
 define Package/ucode-mod-ubus/install
 	$(INSTALL_DIR) $(1)/usr/lib/ucode
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ipkg-install/usr/lib/ucode/ubus.so $(1)/usr/lib/ucode/
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/ubus.so $(1)/usr/lib/ucode/
 endef
 
 define Package/ucode-mod-uci/install
 	$(INSTALL_DIR) $(1)/usr/lib/ucode
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ipkg-install/usr/lib/ucode/uci.so $(1)/usr/lib/ucode/
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/uci.so $(1)/usr/lib/ucode/
 endef
 
 
 $(eval $(call BuildPackage,ucode))
+$(eval $(call BuildPackage,libucode))
 $(eval $(call BuildPackage,ucode-mod-fs))
 $(eval $(call BuildPackage,ucode-mod-math))
 $(eval $(call BuildPackage,ucode-mod-ubus))
