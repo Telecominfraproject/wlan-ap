@@ -138,3 +138,26 @@ char * radio_fixup_get_hw_mode(const char *ifname)
 	else
 		return NULL;
 }
+
+/* primary channel */
+void radio_fixup_set_primary_chan(const char *ifname, int chan)
+{
+	struct radio_fixup * radio = NULL;
+
+	radio = radio_fixup_find(ifname);
+
+	if (radio)
+		radio->chan = chan;
+}
+
+int radio_fixup_get_primary_chan(const char *ifname)
+{
+	struct radio_fixup * radio = NULL;
+
+	radio = radio_fixup_find(ifname);
+
+	if (radio)
+		return radio->chan;
+	else
+		return -1;
+}
