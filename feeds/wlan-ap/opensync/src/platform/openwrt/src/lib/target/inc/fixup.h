@@ -21,10 +21,13 @@ struct radio_fixup {
         struct avl_node avl;
         char rname[IF_NAMESIZE];
         char hw_mode[8];
+        int chan;
 };
 
 struct radio_fixup * radio_fixup_find(const char *name);
 void radio_fixup_del(char *ifname);
 void radio_fixup_set_hw_mode(const char *ifname, char *hw_mode);
 char *radio_fixup_get_hw_mode(const char *ifname);
+int radio_fixup_get_primary_chan(const char *ifname);
+void radio_fixup_set_primary_chan(const char *ifname, int chan);
 #endif

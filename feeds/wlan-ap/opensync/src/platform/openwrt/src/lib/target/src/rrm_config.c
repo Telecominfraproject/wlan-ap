@@ -319,7 +319,7 @@ void get_channel_bandwidth(const char* htmode, int *channel_bandwidth)
 		*channel_bandwidth=80;
 }
 
-void rrm_radio_rebalance_channel(const struct schema_Wifi_Radio_Config *rconf)
+int rrm_radio_rebalance_channel(const struct schema_Wifi_Radio_Config *rconf)
 {
 	int channel_bandwidth;
 	int sec_chan_offset=0;
@@ -339,7 +339,7 @@ void rrm_radio_rebalance_channel(const struct schema_Wifi_Radio_Config *rconf)
 	hw_mode = radio_fixup_get_hw_mode(rconf->if_name);
 	if (hw_mode == NULL) {
 		LOGE("Failed to get hw mode");
-		return;
+		return -1;
 	}
 
 	m = mode_map_get_uci(rconf->freq_band, mode, hw_mode);
@@ -352,7 +352,7 @@ void rrm_radio_rebalance_channel(const struct schema_Wifi_Radio_Config *rconf)
 	get_channel_bandwidth(mode, &channel_bandwidth);
 
 
-	ubus_set_channel_switch(wlanif, freq, hw_mode,
+	return ubus_set_channel_switch(wlanif, freq, hw_mode,
 				channel_bandwidth, sec_chan_offset, 1);
 
 }

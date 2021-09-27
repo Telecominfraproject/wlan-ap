@@ -226,7 +226,7 @@ static int get_channel_tx_power_debugfs(char *stats_path, int *tx_power)
 
 	fp = fopen(stats_path, "r");
 	if (!fp) {
-		LOGE("%s: Failed to get tx power, stats file does not exist", __func__);
+		LOGI("%s: ERR Failed to get tx power, stats file does not exist", __func__);
 		return -1;
 	}
 
@@ -279,9 +279,20 @@ static int get_channel_tx_power(char* phy, int *tx_power)
 	}
 
 	if (get_channel_tx_power_debugfs(stats_path, tx_power)) {
-		LOGE("%s: Failed to get Channel Tx Power", __func__);
+		LOGI("%s: ERR Failed to get Channel Tx Power", __func__);
 		return -1;
 	}
+
+	return 0;
+}
+
+int is_cloud_channel_change(const struct schema_Wifi_Radio_Config *rconf)
+{
+	int channel = 0;
+
+	channel = radio_fixup_get_primary_chan(rconf->if_name);
+	if (channel == rconf->channel)
+		return -1;
 
 	return 0;
 }
@@ -330,6 +341,8 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 			SCHEMA_SET_INT(rstate.channel, chan);
 		else
 			SCHEMA_SET_INT(rstate.channel, blobmsg_get_u32(tb[WDEV_ATTR_CHANNEL]));
+		radio_fixup_set_primary_chan(rstate.if_name,
+			     blobmsg_get_u32(tb[WDEV_ATTR_CHANNEL]));
 	}
 
 	SCHEMA_SET_INT(rstate.enabled, 1);
@@ -341,7 +354,7 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 	if (!get_channel_tx_power(phy, &tx_power)) {
 		SCHEMA_SET_INT(rstate.tx_power, tx_power);
 	} else {
-		LOGE("%s: Failed to update Channel Tx Power", __func__);
+		LOGI("%s:ERR: Failed to update Channel Tx Power", __func__);
 		/* Set Tx Power to max OVSDB value */
 		SCHEMA_SET_INT(rstate.tx_power, 32);
 	}
@@ -452,8 +465,15 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 	strncpy(phy, target_map_ifname(ifname), sizeof(phy));
 
 	if (changed->channel && rconf->channel) {
-		blobmsg_add_u32(&b, "channel", rconf->channel);
-		rrm_radio_rebalance_channel(rconf);
+		/* If radio channel config has changed then rebalance channel,
+		 * if not, that means the channel state changed due to a 
+		 * radar detection and shall remain in the backup channel */
+		if (is_cloud_channel_change(rconf) == 0) {
+			if(rrm_radio_rebalance_channel(rconf) == 0) {
+				blobmsg_add_u32(&b, "channel", rconf->channel);
+				radio_fixup_set_primary_chan(rconf->if_name, rconf->channel);
+			}
+		}
 	}
 
 	if (changed->enabled)

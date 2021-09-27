@@ -40,6 +40,6 @@ void callback_Wifi_RRM_Config(ovsdb_update_monitor_t *mon,
 		struct schema_Wifi_RRM_Config *old, struct schema_Wifi_RRM_Config *conf);
 
 
-void rrm_radio_rebalance_channel(const struct schema_Wifi_Radio_Config *rconf);
+int rrm_radio_rebalance_channel(const struct schema_Wifi_Radio_Config *rconf);
 #endif /* RRM_CONFIG_H_INCLUDED */
 
