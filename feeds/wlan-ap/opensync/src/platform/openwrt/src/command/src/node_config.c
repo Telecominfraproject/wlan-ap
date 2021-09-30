@@ -389,8 +389,8 @@ static char* get_phy_map_led_info(char* wifi)
 
 static void set_primary_led_color(char *ap_name, char *led_section, char *color)
 {
-	char green_leds[][10]= {"power", "wifi2g", "wifi5g", "lan", "wan", "eth0", "eth1"};
-	if (!strcmp(ap_name, "wf194c") || !strcmp(ap_name, "wf6203") || !strcmp(ap_name, "ecw5410"))
+	char green_leds[][10]= {"power", "wifi2g", "wifi5g", "lan", "wan", "eth0", "eth1", "status"};
+	if (!strcmp(ap_name, "wf194c") || !strcmp(ap_name, "wf6203") || !strcmp(ap_name, "ecw5410") || !strcmp(ap_name, "ec420"))
 	{
 		unsigned int i;
 		for (i = 0; i < ARRAY_SIZE(green_leds); i++) {
