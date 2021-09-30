@@ -1609,7 +1609,7 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 		blobmsg_add_u32(&b, "vid", vid);
 	}
 
-	if (changed->mac_list_type) {
+	if (changed->mac_list_type || changed->mac_list) {
 		struct blob_attr *a;
 		int i;
 		if (!strcmp(vconf->mac_list_type, "whitelist"))
