@@ -207,6 +207,12 @@ mac80211_hostapd_setup_base() {
 		[ "$rx_stbc" -lt "$cap_rx_stbc" ] && cap_rx_stbc="$rx_stbc"
 		ht_cap_mask="$(( ($ht_cap_mask & ~(0x300)) | ($cap_rx_stbc << 8) ))"
 
+		conf_tx_ant=$(iw phy "$phy" info | grep 'Configured Antennas:' | cut -d: -f2)
+		set -- $conf_tx_ant
+		if [ "$2" == "0x1" -o "$2" == "0x10" ]; then
+			tx_stbc=0
+		fi
+
 		mac80211_add_capabilities ht_capab_flags $ht_cap_mask \
 			LDPC:0x1::$ldpc \
 			GF:0x10::$greenfield \
@@ -315,6 +321,12 @@ mac80211_hostapd_setup_base() {
 		cap_rx_stbc=$((($vht_cap >> 8) & 7))
 		[ "$rx_stbc" -lt "$cap_rx_stbc" ] && cap_rx_stbc="$rx_stbc"
 		vht_cap="$(( ($vht_cap & ~(0x700)) | ($cap_rx_stbc << 8) ))"
+
+		conf_tx_ant=$(iw phy "$phy" info | grep 'Configured Antennas:' | cut -d: -f2)
+		set -- $conf_tx_ant
+		if [ "$2" == "0x1" -o "$2" == "0x10" ]; then
+			tx_stbc_2by1=0
+		fi
 
 		mac80211_add_capabilities vht_capab $vht_cap \
 			RXLDPC:0x10::$rxldpc \
