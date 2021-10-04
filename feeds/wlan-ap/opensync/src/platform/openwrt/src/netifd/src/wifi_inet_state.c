@@ -284,14 +284,17 @@ static void update_eth_ports_states(struct schema_Wifi_Inet_State *state)
 	char brname[IFNAMSIZ] = {'\0'};
 
 	wan = get_eth_map_info("wan");
-	update_eth_state(wan, &wanport);
+	if (wan != NULL)
+		update_eth_state(wan, &wanport);
 
 	lan = get_eth_map_info("lan");
-	eth = strtok (lan," ");
-	for (i = 0; i < MAX_ETH_PORTS && eth != NULL; i++)
-	{
-		update_eth_state(eth, &lanport[i]);
-		eth = strtok (NULL, " ");
+	if (lan != NULL) {
+		eth = strtok (lan," ");
+		for (i = 0; i < MAX_ETH_PORTS && eth != NULL; i++)
+		{
+			update_eth_state(eth, &lanport[i]);
+			eth = strtok (NULL, " ");
+		}
 	}
 
 	if (!strncmp(state->if_name, "wan", 3))
