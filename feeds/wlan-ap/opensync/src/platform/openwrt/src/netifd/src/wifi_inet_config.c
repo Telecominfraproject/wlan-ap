@@ -98,12 +98,12 @@ static void init_eth_ports_config(struct schema_Wifi_Inet_Config *config)
 	char *lan = NULL;
 
 	wan = get_eth_map_info("wan");
-	if (!strncmp(config->if_name, "wan", 3)) {
+	if (wan != NULL && !strncmp(config->if_name, "wan", 3)) {
 		SCHEMA_SET_STR(config->eth_ports, wan);
 	}
 
 	lan = get_eth_map_info("lan");
-	if (!strncmp(config->if_name, "lan", 3)) {
+	if (lan != NULL && !strncmp(config->if_name, "lan", 3)) {
 		SCHEMA_SET_STR(config->eth_ports, lan);
 	}
 }
