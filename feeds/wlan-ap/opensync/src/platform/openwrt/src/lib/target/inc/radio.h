@@ -33,5 +33,5 @@ bool apc_read_state(struct schema_APC_State *apcst);
 int ubus_set_channel_switch(const char *if_name, uint32_t frequency,
 			    const char *hw_mode, int channel_bandwidth,
 			    int sec_chan_offset, int reason);
-
+int nl80211_allowed_channels_get(char *name);
 #endif
