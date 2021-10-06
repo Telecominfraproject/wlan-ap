@@ -10,6 +10,7 @@
 #include "utils.h"
 #include "inet_iface.h"
 #include "inet_conf.h"
+#include "eth_vlan.h"
 
 enum {
 	NET_ATTR_TYPE,
@@ -38,6 +39,10 @@ enum {
 	NET_ATTR_MESH_BONDING,
 	NET_ATTR_MESH_ORIG_INTERVAL,
 	NET_ATTR_MESH_GW_MODE,
+	NET_ATTR_VLAN_TRUNK,
+	NET_ATTR_ALLOWED_VLANS,
+	NET_ATTR_VLAN_PVID,
+
 	__NET_ATTR_MAX,
 };
 
@@ -68,6 +73,9 @@ static const struct blobmsg_policy network_policy[__NET_ATTR_MAX] = {
 	[NET_ATTR_MESH_BONDING] = { .name = "bonding", .type = BLOBMSG_TYPE_BOOL },
 	[NET_ATTR_MESH_ORIG_INTERVAL] = { .name = "orig_interval", .type = BLOBMSG_TYPE_INT32 },
 	[NET_ATTR_MESH_GW_MODE] = { .name = "gw_mode", .type = BLOBMSG_TYPE_STRING },
+	[NET_ATTR_VLAN_TRUNK] = { .name = "vlan_trunk", .type = BLOBMSG_TYPE_BOOL },
+	[NET_ATTR_ALLOWED_VLANS] = {.name = "allowed_vlans", .type = BLOBMSG_TYPE_STRING},
+	[NET_ATTR_VLAN_PVID] = {.name = "pvid", .type = BLOBMSG_TYPE_STRING},
 };
 
 const struct uci_blob_param_list network_param = {
@@ -90,24 +98,18 @@ const char mesh_options_table[SCHEMA_MESH_OPTS_MAX][SCHEMA_MESH_OPT_SZ] =
 		SCHEMA_CONSTS_MESH_HOP_PENALTY,
 };
 
-
-char* get_eth_map_info(char* iface);
-static void init_eth_ports_config(struct schema_Wifi_Inet_Config *config)
+static void set_vlan_trunk_config(struct schema_Wifi_Inet_Config *conf,
+                                    int *index, const char *key,
+                                    char *value)
 {
-	char *wan = NULL;
-	char *lan = NULL;
-
-	wan = get_eth_map_info("wan");
-	if (wan != NULL && !strncmp(config->if_name, "wan", 3)) {
-		SCHEMA_SET_STR(config->eth_ports, wan);
-	}
-
-	lan = get_eth_map_info("lan");
-	if (lan != NULL && !strncmp(config->if_name, "lan", 3)) {
-		SCHEMA_SET_STR(config->eth_ports, lan);
-	}
+	STRSCPY(conf->vlan_trunk_keys[*index], key);
+	STRSCPY(conf->vlan_trunk[*index], value);
+	*index += 1;
+	conf->vlan_trunk_len = *index;
 }
 
+char* get_eth_map_info(char* iface);
+static char wan_eth_ports[33];
 static void wifi_inet_conf_load(struct uci_section *s)
 {
 	struct blob_attr *tb[__NET_ATTR_MAX] = { };
@@ -115,6 +117,9 @@ static void wifi_inet_conf_load(struct uci_section *s)
 	struct iface_info info;
 	char *ifname = NULL;
 	int rc = -1;
+	char *delim = NULL;
+	int index = 0;
+	int eth_vid = 0;
 
 	if (!strcmp(s->e.name, "loopback"))
 		return;
@@ -126,13 +131,25 @@ static void wifi_inet_conf_load(struct uci_section *s)
 	memset(&conf, 0, sizeof(conf));
 
 	SCHEMA_SET_STR(conf.if_name, s->e.name);
+
+	delim = strstr(conf.if_name, "_");
 	if (tb[NET_ATTR_TYPE])
 		SCHEMA_SET_STR(conf.if_type, blobmsg_get_string(tb[NET_ATTR_TYPE]));
 	else if ((strstr(s->e.name,"wan_") != NULL) || (strstr(s->e.name,"lan_") != NULL))
 		SCHEMA_SET_STR(conf.if_type, "vlan");
 	else if (strstr(s->e.name,"wlan") != NULL)
 		SCHEMA_SET_STR(conf.if_type, "vif");
-	else
+	else if (delim)
+	{
+		if (!strncmp(&delim[1], "trunk", 5)) {
+			SCHEMA_SET_STR(conf.if_type, "vlan_trunk");
+		} else if (tb[NET_ATTR_VID]) {
+			eth_vid = blobmsg_get_u32(tb[NET_ATTR_VID]);
+			if (atoi(&delim[1]) == eth_vid)
+				SCHEMA_SET_STR(conf.if_type, "vlan");
+		}
+
+	} else
 		SCHEMA_SET_STR(conf.if_type, "eth");
 
 	if (!tb[NET_ATTR_DISABLED] || !blobmsg_get_u8(tb[NET_ATTR_DISABLED])) {
@@ -185,6 +202,36 @@ static void wifi_inet_conf_load(struct uci_section *s)
 		SCHEMA_SET_STR(conf.parent_ifname, info.name);
 		if (info.vid)
 			SCHEMA_SET_INT(conf.vlan_id, info.vid);
+	} else {
+
+		SCHEMA_SET_STR(conf.eth_ports, ifname);
+		if (!strncmp(conf.if_name, "wan", 3) &&
+				strncmp(conf.if_name, "wan6", 4) != 0) {
+			strncpy(wan_eth_ports, conf.eth_ports,
+				sizeof(wan_eth_ports));
+		}
+	}
+
+	if (!strncmp(conf.if_type, "vlan_trunk", 10)) {
+		SCHEMA_SET_STR(conf.parent_ifname, ifname);
+		SCHEMA_SET_STR(conf.eth_ports, ifname);
+
+		if (tb[NET_ATTR_ALLOWED_VLANS]) {
+			set_vlan_trunk_config(&conf, &index,
+					      SCHEMA_CONSTS_ALLOWED_VLANS,
+			      blobmsg_get_string(tb[NET_ATTR_ALLOWED_VLANS]));
+		}
+		if (tb[NET_ATTR_VLAN_PVID]) {
+			set_vlan_trunk_config(&conf, &index,
+					      SCHEMA_CONSTS_PVID,
+			      blobmsg_get_string(tb[NET_ATTR_VLAN_PVID]));
+		}
+
+
+	}
+
+	if (delim && tb[NET_ATTR_VID] && (atoi(&delim[1]) == eth_vid)) {
+		SCHEMA_SET_STR(conf.parent_ifname, ifname);
 	}
 
 	if (strcmp(conf.if_type, "gre"))
@@ -208,7 +255,6 @@ static void wifi_inet_conf_load(struct uci_section *s)
 		}
 	}
 
-	init_eth_ports_config(&conf);
 	firewall_get_config(&conf);
 
 	if (!ovsdb_table_upsert(&table_Wifi_Inet_Config, &conf, false))
@@ -237,6 +283,37 @@ static void mesh_opt_set(struct blob_buf *b,
 				blobmsg_add_u32(b, "hop_penalty", 30);
 			else
 				blobmsg_add_u32(b, "hop_penalty", atoi(val));
+		}
+	}
+}
+
+const char vlan_trunk_table[SCHEMA_VLAN_TRUNK_MAX][SCHEMA_VLAN_TRUNK_SZ] =
+{
+	SCHEMA_CONSTS_ALLOWED_VLANS,
+	SCHEMA_CONSTS_PVID,
+};
+
+static void vlan_trunk_set(struct blob_buf *b, struct blob_buf *del,
+                                      const struct schema_Wifi_Inet_Config *iconf)
+{
+	int i;
+	char value[256];
+	const char *opt;
+	const char *val;
+
+	for (i = 0; i < SCHEMA_VLAN_TRUNK_MAX; i++) {
+		opt = vlan_trunk_table[i];
+		val = SCHEMA_KEY_VAL(iconf->vlan_trunk, opt);
+
+		if (!val)
+			strncpy(value, "0", 256);
+		else
+			strncpy(value, val, 256);
+
+		if (strcmp(opt, SCHEMA_CONSTS_ALLOWED_VLANS) == 0) {
+			blobmsg_add_string(b, "allowed_vlans", value);
+		} else if (strcmp(opt, SCHEMA_CONSTS_PVID) == 0) {
+			blobmsg_add_string(b, "pvid", value);
 		}
 	}
 }
@@ -347,6 +424,13 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 		blobmsg_add_u32(&b, "mtu", iconf->mtu);
 	else
 		blobmsg_add_bool(&del, "mtu", 1);
+
+	if (!strcmp(iconf->if_type, "vlan_trunk")) {
+		vlan_trunk_set(&b, &del, iconf);
+		blobmsg_add_string(&b, "ifname", iconf->parent_ifname);
+		blobmsg_add_bool(&b, "vlan_trunk", 1);
+	}
+
 	blob_to_uci_section(uci, "network", iconf->if_name, "interface", b.head, &network_param, del.head);
 
 	if (!iconf->parent_ifname_exists || iconf->vlan_id > 2) {
@@ -520,6 +604,20 @@ static void callback_Wifi_Inet_Config(ovsdb_update_monitor_t *mon,
 
 	return;
 }
+void wan6_init_conf_eth_port(void)
+{
+	json_t *iter;
+	iter = ovsdb_where_simple(SCHEMA_COLUMN(Wifi_Inet_Config, if_name), "wan6");
+	if (iter) {
+		struct schema_Wifi_Inet_Config lconfig = {};
+		if (ovsdb_table_select_one_where(&table_Wifi_Inet_Config, iter, &lconfig))
+			SCHEMA_SET_STR(lconfig.eth_ports, wan_eth_ports);
+
+		if (!ovsdb_table_upsert(&table_Wifi_Inet_Config, &lconfig, false))
+			LOGI("Error: wan6 config init failed");
+
+	}
+}
 
 void wifi_inet_config_init(void)
 {
@@ -540,6 +638,7 @@ void wifi_inet_config_init(void)
 		}
 	}
 	uci_unload(uci, network);
+	wan6_init_conf_eth_port();
 
 	OVSDB_TABLE_MONITOR(Wifi_Inet_Config, false);
 

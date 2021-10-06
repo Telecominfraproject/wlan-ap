@@ -13,12 +13,13 @@ UNIT_SRC    += src/dhcp_lease.c
 UNIT_SRC    += src/inet_iface.c
 UNIT_SRC    += src/inet_conf.c
 UNIT_SRC    += src/dhcp_fingerprint.c
+UNIT_SRC    += src/bridge_vlan_parse.c
 
 UNIT_CFLAGS := -I$(UNIT_PATH)/inc
 UNIT_CFLAGS += -Isrc/lib/common/inc/
 UNIT_CFLAGS += -Isrc/lib/version/inc/
 
-UNIT_LDFLAGS += -lev -lubus -lubox -luci -lblobmsg_json -lnl-tiny
+UNIT_LDFLAGS += -lev -lubus -lubox -luci -lblobmsg_json -lnl-tiny -ljson-c
 UNIT_LDFLAGS += -lrt
 
 UNIT_EXPORT_CFLAGS := $(UNIT_CFLAGS)
