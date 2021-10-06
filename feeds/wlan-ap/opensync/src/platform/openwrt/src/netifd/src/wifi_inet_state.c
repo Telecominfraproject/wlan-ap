@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <libubox/blobmsg_json.h>
+#include "eth_vlan.h"
 
 enum {
 	NET_ATTR_INTERFACE,
@@ -108,19 +109,10 @@ bool wifi_inet_master_del(const char *ifname);
 #define DOT_OR_DOTDOT(s) ((s)[0] == '.' && (!(s)[1] || ((s)[1] == '.' && !(s)[2])))
 static struct blob_buf bb;
 #define DEFAULT_BOARD_JSON		"/etc/board.json"
-#define MAX_ETH_PORTS 5
 static struct blob_attr *board_info;
 
-struct eth_port_state {
-	char ifname[8];
-	char state[8];
-	char speed[8];
-	char duplex[16];
-	char bridge[8];
-};
-
-static struct eth_port_state wanport;
-static struct eth_port_state lanport[MAX_ETH_PORTS];
+struct eth_port_state wanport;
+struct eth_port_state lanport[MAX_ETH_PORTS];
 
 static struct blob_attr* config_find_blobmsg_attr(struct blob_attr *attr, const char *name, int type)
 {
@@ -359,13 +351,49 @@ static void update_eth_ports_states(struct schema_Wifi_Inet_State *state)
 	}
 }
 
+static void set_vlan_trunk_state(struct schema_Wifi_Inet_State *state,
+                                    int *index, const char *key,
+                                    const char *value)
+{
+	STRSCPY(state->vlan_trunk_keys[*index], key);
+	STRSCPY(state->vlan_trunk[*index], value);
+	*index += 1;
+	state->vlan_trunk_len = *index;
+}
+
+void vlan_state_update(struct schema_Wifi_Inet_State *state)
+{
+	int i, j = 0;
+	int index = 0;
+	const char *opt;
+	char buf[256];
+
+	for (i = 0; i < SCHEMA_VLAN_TRUNK_MAX; i++) {
+		opt = vlan_trunk_table[i];
+
+		if ((strcmp(opt, SCHEMA_CONSTS_ALLOWED_VLANS) == 0)) {
+			struct eth_port_state *eps = get_eth_port(state->parent_ifname);
+			char *s = buf;
+			for (j=0; j < 64; j++){
+				if (eps->vlans.allowed_vlans[j] != 0)
+					s += snprintf(s, sizeof(buf) - 1, " %d ",
+					eps->vlans.allowed_vlans[j]);
+			}
+			set_vlan_trunk_state(state, &index, opt, buf);
+		} else if (strcmp(opt, SCHEMA_CONSTS_PVID) == 0) {
+			struct eth_port_state *eps = get_eth_port(state->parent_ifname);
+			snprintf(buf, sizeof(buf), "%d", eps->vlans.pvid);
+			set_vlan_trunk_state(state, &index, opt, buf);
+		}
+	}
+}
+
 void wifi_inet_state_set(struct blob_attr *msg)
 {
 	struct blob_attr *tb[__NET_ATTR_MAX] = { };
 	struct schema_Wifi_Inet_State state;
 	json_t *iter;
 	int mtu;
-
 	blobmsg_parse(network_policy, __NET_ATTR_MAX, tb, blob_data(msg), blob_len(msg));
 	memset(&state, 0, sizeof(state));
 
@@ -378,6 +406,7 @@ void wifi_inet_state_set(struct blob_attr *msg)
 
 	if (!strcmp(state.if_name, "loopback"))
 		return;
+
 
 	if (tb[NET_ATTR_UP] && blobmsg_get_bool(tb[NET_ATTR_UP])) {
 		state.enabled = true;
@@ -417,18 +446,37 @@ void wifi_inet_state_set(struct blob_attr *msg)
 				if (delim) {
 					struct iface_info info;
 					memset (&info, 0, sizeof(info));
-					SCHEMA_SET_STR(state.if_type, "vlan");
-					strncpy(info.name, &l3_device[0],
-						delim - state.if_name);
-					SCHEMA_SET_STR(state.parent_ifname, info.name);
-					info.vid = atoi(&delim[1]);
-					SCHEMA_SET_INT(state.vlan_id, info.vid);
-				}
+					if (!strncmp(&delim[1], "trunk", 5))
+					{
+						SCHEMA_SET_STR(state.if_type,
+							       "vlan_trunk");
+						strncpy(info.name, &l3_device[0],
+							delim - state.if_name);
+						SCHEMA_SET_STR(state.parent_ifname,
+							       info.name);
 
+						vlan_state_json_parse();
+						vlan_state_update(&state);
+					}
+					else {
+						struct eth_port_state *eps;
+						SCHEMA_SET_STR(state.if_type,
+							       "vlan");
+						strncpy(info.name, &l3_device[0],
+							delim - state.if_name);
+						SCHEMA_SET_STR(state.parent_ifname,
+							       info.name);
+						vlan_state_json_parse();
+						eps = get_eth_port(info.name);
+						SCHEMA_SET_INT(state.vlan_id,
+							       eps->vlans.pvid);
+					}
+				}
 			}
 		else
 			SCHEMA_SET_STR(state.if_type, "eth");
-		if (!l3_device_split(l3_device, &info) && strcmp(info.name, state.if_name)) {
+		if (!l3_device_split(l3_device, &info) &&
+		    strcmp(info.name, state.if_name)) {
 			SCHEMA_SET_STR(state.parent_ifname, info.name);
 			if (info.vid)
 				SCHEMA_SET_INT(state.vlan_id, info.vid);
