@@ -410,11 +410,24 @@ static void nl80211_add_phy(struct nlattr **tb, char *name)
 						continue;
 					}
 
+					phy->freq[chan] = 0;
+					phy->channel[chan] = 0;
+					phy->chandfs[chan] = 0;
+					phy->chandisabled[chan] = 0;
+					phy->chanpwr[chan] = 0;
+
 					if (tb_freq[NL80211_FREQUENCY_ATTR_DISABLED]) {
 						phy->chandisabled[chan] = 1;
 						phy->chandfs[chan] = 0;
 						continue;
 					}
+
+					if (chan <= 16)
+						phy->band_2g = 1;
+					else if (chan >= 32 && chan <= 68)
+						phy->band_5gl = 1;
+					else if (chan >= 96)
+						phy->band_5gu = 1;
 
 					if (tb_freq[NL80211_FREQUENCY_ATTR_RADAR]) {
 						phy->chandfs[chan] = 1;
@@ -423,18 +436,13 @@ static void nl80211_add_phy(struct nlattr **tb, char *name)
 						LOG(DEBUG, "%s: found dfs channel %d", phy->name, chan);
 						continue;
 					}
+
 					phy->freq[chan] = freq;
 					phy->channel[chan] = 1;
 
 					if (tb_freq[NL80211_FREQUENCY_ATTR_MAX_TX_POWER] &&
 					    !tb_freq[NL80211_FREQUENCY_ATTR_DISABLED])
 						phy->chanpwr[chan] = nla_get_u32(tb_freq[NL80211_FREQUENCY_ATTR_MAX_TX_POWER]);
-					if (chan <= 16)
-						phy->band_2g = 1;
-					else if (chan >= 32 && chan <= 68)
-						phy->band_5gl = 1;
-					else if (chan >= 96)
-						phy->band_5gu = 1;
 				}
 			}
 		}
@@ -650,4 +658,34 @@ int radio_nl80211_init(void)
 	evsched_task(&vif_poll_stations, NULL, EVSCHED_SEC(5));
 
 	return 0;
+}
+
+int nl80211_allowed_channels_get(char *name)
+{
+	struct nl_msg *msg;
+	struct wifi_phy *phy;
+	struct wifi_iface *wif=NULL;
+	int idx = 0;
+
+	phy = avl_find_element(&phy_tree, name, phy, avl);
+	if (!phy)
+		return -1;
+
+	if (list_empty(&phy->wifs))
+		return -1;
+
+	wif = list_first_entry(&phy->wifs, struct wifi_iface, phy);
+
+	if (!wif)
+		return -1;
+
+	idx = if_nametoindex(wif->name);
+
+	if (!idx)
+		return -1;
+
+	msg = unl_genl_msg(&unl_req, NL80211_CMD_GET_WIPHY, true);
+	unl_genl_request(&unl_req, msg, nl80211_recv, NULL);
+
+	return NL_OK;
 }
