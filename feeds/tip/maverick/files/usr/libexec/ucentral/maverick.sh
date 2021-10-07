@@ -34,6 +34,15 @@ config_foreach ssid_set wifi-iface
 config_load firewall
 config_foreach delete_forwarding forwarding
 
+[ -z "$(uci get network.lan)" ] && {
+	# single port devices wont bring up a lan interface by default
+	uci set network.lan=interface
+	uci set network.lan.type=bridge
+	uci set network.lan.proto=static
+	uci set network.lan.ipaddr=192.168.1.1
+	uci set network.lan.netmask=255.255.255.0
+}
+
 uci commit
 
 /etc/init.d/uhttpd enable
