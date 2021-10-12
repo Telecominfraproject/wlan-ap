@@ -17,7 +17,7 @@ include ./openvswitch.mk
 #
 PKG_NAME:=openvswitch
 PKG_VERSION:=$(ovs_version)
-PKG_RELEASE:=6
+PKG_RELEASE:=9
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://www.openvswitch.org/releases/
 PKG_HASH:=5c7baed537364d43af36c15dde298c95d35cb2cb3204b4d3fe9b0fc73c97f16d
@@ -155,7 +155,7 @@ ovs_libopenvswitch_title:=Open vSwitch (libopenvswitch.so)
 ovs_libopenvswitch_hidden:=1
 ovs_libopenvswitch_depends:=+libopenssl +!(arc||arceb):libunwind
 ovs_libopenvswitch_depends+=+libatomic
-ifeq ($(CONFIG_KEEPALIVED_ROUTES),y)
+ifeq ($(CONFIG_OPENVSWITCH_WITH_LIBUNBOUND),y)
 ovs_libopenvswitch_depends+=+libunbound
 endif
 ovs_libopenvswitch_files:=usr/lib/libopenvswitch*.so*
