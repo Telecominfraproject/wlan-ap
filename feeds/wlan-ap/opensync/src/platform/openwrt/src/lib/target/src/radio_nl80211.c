@@ -636,6 +636,7 @@ int radio_nl80211_init(void)
 	}
 
 	msg = unl_genl_msg(&unl_req, NL80211_CMD_GET_WIPHY, true);
+	nla_put_flag(msg, NL80211_ATTR_SPLIT_WIPHY_DUMP);
 	unl_genl_request(&unl_req, msg, nl80211_recv, NULL);
 	msg = unl_genl_msg(&unl_req, NL80211_CMD_GET_INTERFACE, true);
 	unl_genl_request(&unl_req, msg, nl80211_recv, NULL);
