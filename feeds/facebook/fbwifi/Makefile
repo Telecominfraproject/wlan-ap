@@ -24,8 +24,7 @@ define Package/fbwifi
   SECTION:=net
   CATEGORY:=Network
   DEPENDS:=+iptables +luasec +luasocket \
-	+luci-base +libuci-lua +luaposix \
-	+luci-mod-network +luci-mod-status +luci-theme-bootstrap \
+	+libuci-lua +luaposix \
 	+lua-cjson +uhttpd
   TITLE:=Facebook Wi-Fi
   PKGARCH:=all
@@ -34,6 +33,22 @@ endef
 define Package/fbwifi/description
   Facebook Wi-Fi, an AP authorisation solution
 endef
+
+
+define Package/luci-app-fbwifi
+  SUBMENU:=3. Applications
+  SECTION:=luci
+  CATEGORY:=LuCI
+  TITLE:=LuCI support for Facebook Wi-Fi
+  DEPENDS:= \
+	+fbwifi \
+	+luci-base +luci-mod-network +luci-mod-status +luci-theme-bootstrap
+endef
+
+define Package/luci-app-fbwifi/description
+  LuCI support for Facebook Wi-Fi
+endef
+
 
 define Package/fbwifi/conffiles
 /etc/config/fbwifi
@@ -50,7 +65,13 @@ endef
 
 define Package/fbwifi/install
 	$(INSTALL_DIR) $(1)
-	$(CP) ./files/* $(1)/
+	$(CP) ./files/fbwifi/* $(1)/
+endef
+
+define Package/luci-app-fbwifi/install
+	$(INSTALL_DIR) $(1)
+	$(CP) ./files/luci-app-fbwifi/* $(1)
 endef
 
 $(eval $(call BuildPackage,fbwifi))
+$(eval $(call BuildPackage,luci-app-fbwifi))

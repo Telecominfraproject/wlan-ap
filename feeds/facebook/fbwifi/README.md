@@ -11,48 +11,12 @@ To disable Facebook Wi-Fi, run `fbwifi disable`.
 
 ## Contents
 
-The 'files' subdirectory contains all the configuration, script and code 
-that implements the Facebook Wi-Fi v2.0 standard for OpenWrt.
+The 'files' subdirectory contains two subdirectories, one for the fbwifi
+package that implements the Facebook Wi-Fi v2.0 standard for OpenWrt, and
+another one containing a LuCI application to configure Facebook Wi-Fi.
 
-The folder structure follows *nix conventions :
+The folder structures follow *nix conventions:
 - 'etc' is the boot time scripts and configuration
 - 'usr' contains procedural scripts, lua common code module and GUI prototype for luci
 - 'www' contains the HTTP endpoints as CGI handlers 
 
-```
-files/
-├── etc
-│   ├── config
-│   │   └── fbwifi
-│   ├── hotplug.d
-│   │   └── iface
-│   │       └── 50-fbwifi
-│   ├── init.d
-│   │   └── fbwifi
-├── usr
-│   ├── lib
-│   │   └── lua
-│   │       ├── fbwifi.lua
-│   │       └── luci
-│   │           ├── controller
-│   │           │   └── fbwifi.lua
-│   │           └── view
-│   │               └── fbwifi.htm
-│   ├── sbin
-│   │   ├── fbwifi
-│   │   ├── fbwifi_debug_dump
-│   │   ├── fbwifi_gateway_info_update
-│   │   ├── fbwifi_get_config
-│   │   └── fbwifi_validate_token_db
-│   └── share
-│       └── fbwifi
-│           ├── firewall.include
-│           └── uhttpd.json
-└── www
-    └── cgi-bin
-        └── fbwifi
-            └── v2.0
-                ├── auth
-                ├── capport
-                └── info
-```
