@@ -12,10 +12,6 @@ var callReboot = rpc.declare({
 	expect: { result: 0 }
 });
 
-callReboot = function() {
-	return Promise.resolve(0);
-}
-
 function handleReboot(ev) {
 	return callReboot().then(function(res) {
 		if (res != 0) {
