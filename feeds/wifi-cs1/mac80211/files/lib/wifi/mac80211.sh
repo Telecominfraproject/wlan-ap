@@ -167,12 +167,19 @@ detect_mac80211() {
 			dev_id="set wireless.radio${devidx}.macaddr=$(cat /sys/class/ieee80211/${dev}/macaddress)"
 		fi
 
+		if [ $mode_band == "2g" ]
+			hwmode="11g"
+		else
+			hwmode="11a"
+		fi
+
 		uci -q batch <<-EOF
 			set wireless.radio${devidx}=wifi-device
 			set wireless.radio${devidx}.type=mac80211
 			${dev_id}
 			set wireless.radio${devidx}.channel=${channel}
 			set wireless.radio${devidx}.band=${mode_band}
+			set wireless.radio${devidx}.hwmode=${hwmode}
 			set wireless.radio${devidx}.htmode=$htmode
 			set wireless.radio${devidx}.num_global_macaddr=8
 			set wireless.radio${devidx}.disabled=1
