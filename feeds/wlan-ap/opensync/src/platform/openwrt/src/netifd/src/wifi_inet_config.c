@@ -202,8 +202,7 @@ static void wifi_inet_conf_load(struct uci_section *s)
 		SCHEMA_SET_STR(conf.parent_ifname, info.name);
 		if (info.vid)
 			SCHEMA_SET_INT(conf.vlan_id, info.vid);
-	} else {
-
+	} else if (ifname) {
 		SCHEMA_SET_STR(conf.eth_ports, ifname);
 		if (!strncmp(conf.if_name, "wan", 3) &&
 				strncmp(conf.if_name, "wan6", 4) != 0) {
