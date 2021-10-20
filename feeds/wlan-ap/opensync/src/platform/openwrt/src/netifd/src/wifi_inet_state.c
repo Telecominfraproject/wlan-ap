@@ -310,9 +310,9 @@ static void update_eth_ports_states(struct schema_Wifi_Inet_State *state)
 				 lanport[i].state, lanport[i].speed, lanport[i].duplex);
 
 			STRSCPY(state->eth_ports[cnt+i], port_status);
-			cnt++;
-			state->eth_ports_len = cnt;
+			state->eth_ports_len++;
 		}
+
 	}
 
 	if (!strncmp(state->if_name, "eth", 3)) {
@@ -469,7 +469,7 @@ void wifi_inet_state_set(struct blob_attr *msg)
 						vlan_state_json_parse();
 						eps = get_eth_port(info.name);
 						SCHEMA_SET_INT(state.vlan_id,
-							       eps->vlans.pvid);
+			       ((eps->vlans.pvid > 0 && eps->vlans.pvid < 4095)? eps->vlans.pvid:1));
 					}
 				}
 			}
