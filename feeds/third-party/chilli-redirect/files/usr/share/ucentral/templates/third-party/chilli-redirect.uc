@@ -22,6 +22,7 @@ let keys = {
 	nasmac: false,
 	macauth: false,
 	macpassword: false,
+	uamsecret: false,
 };
 
 function get_value(key, value) {
