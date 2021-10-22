@@ -97,6 +97,23 @@ char * get_max_channel_bw_channel(int channel_freq, const char* htmode)
 	}
 	return "HT20";
 }
+
+void get_on_channel_bandwidth(radio_entry_t *radio_cfg, int *channel_bandwidth)
+{
+	if (radio_cfg->chanwidth == 1) {
+		*channel_bandwidth = 20;
+		return;
+	} else if (radio_cfg->chanwidth == 2) {
+		*channel_bandwidth = 40;
+		return;
+	} else if (radio_cfg->chanwidth == 5) {
+		*channel_bandwidth = 80;
+		return;
+	} else
+		*channel_bandwidth = 0;
+	return;
+}
+
 struct mode_map *mode_map_get_uci(const char *band, const char *htmode, const char *hwmode)
 {
 	unsigned int i;

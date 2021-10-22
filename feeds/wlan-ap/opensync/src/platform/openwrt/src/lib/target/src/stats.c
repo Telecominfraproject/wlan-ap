@@ -204,6 +204,7 @@ bool target_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
 	char ifName[10];
 	int val=0;
 	int radio=0;
+	int channel_bandwidth=0;
 	sscanf(radio_cfg->if_name,"wlan%d_%d",&radio,&val);
 	sprintf(ifName,"wlan%d",radio);
 	ds_dlist_t raw_survey_list = DS_DLIST_INIT(target_survey_record_t, node);
@@ -230,6 +231,8 @@ bool target_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
 		while (!ds_dlist_is_empty(onchan_list)) {
 			survey = ds_dlist_head(onchan_list);
 			ds_dlist_remove(onchan_list, survey);
+			get_on_channel_bandwidth(radio_cfg, &channel_bandwidth);
+			survey->chan_width = channel_bandwidth;
 			ds_dlist_insert_tail(survey_list, survey);
 		}
 	} else {
@@ -247,6 +250,8 @@ bool target_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
 				survey->chan_self, survey->info.chan, scan_type);
 		if ((scan_type == RADIO_SCAN_TYPE_ONCHAN) && (survey->duration_ms != 0)) {
 			if (survey->info.chan == chan_list[0]) {
+				get_on_channel_bandwidth(radio_cfg, &channel_bandwidth);
+				survey->chan_width = channel_bandwidth;
 				ds_dlist_insert_tail(survey_list, survey);
 			} else {
 				ds_dlist_insert_tail(offchan_list, survey);
@@ -255,6 +260,8 @@ bool target_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
 			if (!survey->chan_in_use) {
 				ds_dlist_insert_tail(survey_list, survey);
 			} else {
+				get_on_channel_bandwidth(radio_cfg, &channel_bandwidth);
+				survey->chan_width = channel_bandwidth;
 				ds_dlist_insert_tail(onchan_list, survey);
 			}
 		} else {
@@ -290,12 +297,13 @@ bool target_stats_survey_convert(radio_entry_t *radio_cfg, radio_scan_type_t sca
 		data_new->chan_busy += data_old->chan_busy;
 	}
 
+
 	LOGD("Survey convert scan_type %d chan %d duration_new:%llu duration_old:%llu "
 	     "busy_new %llu busy_old:%llu tx_new %llu tx_old:%llu rx_new %llu rx_old:%llu "
-	     "rx_self_new %llu rx_self_old:%llu",
+	     "rx_self_new %llu rx_self_old:%llu channel_bandwidth:%llu",
 	     scan_type, data_new->info.chan, data_new->duration_ms, data_old->duration_ms,
 	     data_new->chan_busy, data_old->chan_busy, data_new->chan_tx, data_old->chan_tx,
-	     data_new->chan_rx, data_old->chan_rx, data_new->chan_self, data_old->chan_self);
+	     data_new->chan_rx, data_old->chan_rx, data_new->chan_self, data_old->chan_self, data_new->chan_width);
 
 	memset(&delta, 0, sizeof(delta));
 
@@ -306,6 +314,7 @@ bool target_stats_survey_convert(radio_entry_t *radio_cfg, radio_scan_type_t sca
 	delta.chan_rx = DELTA(data_new->chan_rx, data_old->chan_rx);
 	delta.chan_self = DELTA(data_new->chan_self, data_old->chan_self);
 
+	survey_record->chan_width     = data_new->chan_width;
 	survey_record->info.chan     = data_new->info.chan;
 	survey_record->chan_tx       = PERCENT(delta.chan_tx, delta.duration_ms);
 	survey_record->chan_self     = PERCENT(delta.chan_self, delta.duration_ms);
