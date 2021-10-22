@@ -53,6 +53,7 @@ typedef struct
 	uint64_t chan_tx;
 	uint32_t chan_noise;
 	uint64_t duration_ms;
+	uint64_t chan_width;
 } target_survey_record_t;
 
 typedef void target_capacity_data_t;
