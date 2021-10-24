@@ -13,7 +13,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL=https://github.com/jow-/ucode.git
 PKG_SOURCE_DATE:=2021-07-30
-PKG_SOURCE_VERSION:=5b908bdf64a586d27d5bdd1df8c72a7cd63b386a
+PKG_SOURCE_VERSION:=0f022aae0c6008fe6f2219871d32dca8b9105066
 PKG_MIRROR_HASH:=
 PKG_MAINTAINER:=Jo-Philipp Wich <jo@mein.io>
 PKG_LICENSE:=ISC
@@ -62,6 +62,17 @@ endef
 
 define Package/ucode-mod-fs/description
  The filesystem plugin module allows interaction with the local file system.
+endef
+
+
+define Package/ucode-mod-resolv
+  $(Package/ucode/default)
+  TITLE+= (resolv module)
+  DEPENDS:=ucode
+endef
+
+define Package/ucode-mod-resolv/description
+ The resolv plugin module allows making DNS resolves.
 endef
 
 
@@ -121,6 +132,11 @@ define Package/ucode-mod-fs/install
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/fs.so $(1)/usr/lib/ucode/
 endef
 
+define Package/ucode-mod-resolv/install
+	$(INSTALL_DIR) $(1)/usr/lib/ucode
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/resolv.so $(1)/usr/lib/ucode/
+endef
+
 define Package/ucode-mod-math/install
 	$(INSTALL_DIR) $(1)/usr/lib/ucode
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/math.so $(1)/usr/lib/ucode/
@@ -140,6 +156,7 @@ endef
 $(eval $(call BuildPackage,ucode))
 $(eval $(call BuildPackage,libucode))
 $(eval $(call BuildPackage,ucode-mod-fs))
+$(eval $(call BuildPackage,ucode-mod-resolv))
 $(eval $(call BuildPackage,ucode-mod-math))
 $(eval $(call BuildPackage,ucode-mod-ubus))
 $(eval $(call BuildPackage,ucode-mod-uci))

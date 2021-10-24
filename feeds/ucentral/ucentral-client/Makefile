@@ -18,7 +18,7 @@ define Package/ucentral-client
   SECTION:=ucentral
   CATEGORY:=uCentral
   TITLE:=OpenWrt uCentral websocket client
-  DEPENDS:=+ucode +ucode-mod-fs +ucode-mod-ubus +ucode-mod-uci +ucode-mod-math \
+  DEPENDS:=+ucode +ucode-mod-fs +ucode-mod-ubus +ucode-mod-uci +ucode-mod-math +ucode-mod-resolv \
 	   +libubox +libwebsockets-openssl +libblobmsg-json +libubus
 endef
 
