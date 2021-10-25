@@ -986,7 +986,6 @@ hostapd_set_bss_options() {
 		[ -n "$iw_network_auth_type" ] && \
 			append bss_conf "network_auth_type=$iw_network_auth_type" "$N"
 		[ -n "$iw_gas_address3" ] && append bss_conf "gas_address3=$iw_gas_address3" "$N"
-		[ -n "$iw_qos_map_set" ] && append bss_conf "qos_map_set=$iw_qos_map_set" "$N"
 
 		json_for_each_item append_iw_roaming_consortium iw_roaming_consortium
 		json_for_each_item append_iw_anqp_elem iw_anqp_elem
@@ -1004,6 +1003,7 @@ hostapd_set_bss_options() {
 		[ -n "$iw_anqp_3gpp_cell_net_conf" ] && \
 			append bss_conf "anqp_3gpp_cell_net=$iw_anqp_3gpp_cell_net_conf" "$N"
 	fi
+	[ -n "$iw_qos_map_set" ] && append bss_conf "qos_map_set=$iw_qos_map_set" "$N"
 
 
 	local hs20 disable_dgaf osen anqp_domain_id hs20_deauth_req_timeout \
