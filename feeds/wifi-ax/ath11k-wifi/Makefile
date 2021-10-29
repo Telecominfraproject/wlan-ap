@@ -31,7 +31,7 @@ ALLWIFIBOARDS:= \
 	edgecore-eap101 \
 	sercomm-wallaby \
 	edgecore-eap102 \
-	wallys-dr6018
+	wallys-dr6018 \
 	tplink-ex227 \
 	tplink-ex447
 
