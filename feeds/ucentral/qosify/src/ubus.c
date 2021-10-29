@@ -139,8 +139,8 @@ static const struct blobmsg_policy qosify_config_policy[__CL_CONFIG_MAX] = {
 	[CL_CONFIG_RESET] = { "reset", BLOBMSG_TYPE_BOOL },
 	[CL_CONFIG_FILES] = { "files", BLOBMSG_TYPE_ARRAY },
 	[CL_CONFIG_TIMEOUT] = { "timeout", BLOBMSG_TYPE_INT32 },
-	[CL_CONFIG_DSCP_UDP] = { "dscp_default_tcp", BLOBMSG_TYPE_STRING },
-	[CL_CONFIG_DSCP_TCP] = { "dscp_default_udp", BLOBMSG_TYPE_STRING },
+	[CL_CONFIG_DSCP_UDP] = { "dscp_default_udp", BLOBMSG_TYPE_STRING },
+	[CL_CONFIG_DSCP_TCP] = { "dscp_default_tcp", BLOBMSG_TYPE_STRING },
 	[CL_CONFIG_DSCP_PRIO] = { "dscp_prio", BLOBMSG_TYPE_STRING },
 	[CL_CONFIG_DSCP_BULK] = { "dscp_bulk", BLOBMSG_TYPE_STRING },
 	[CL_CONFIG_DSCP_ICMP] = { "dscp_icmp", BLOBMSG_TYPE_STRING },
@@ -306,6 +306,11 @@ int qosify_ubus_init(void)
 	ubus_auto_connect(&conn);
 
 	return 0;
+}
+
+void qosify_ubus_stop(void)
+{
+	ubus_auto_shutdown(&conn);
 }
 
 struct iface_req {

@@ -16,7 +16,7 @@ PKG_BUILD_DEPENDS:=bpf-headers
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
-#include $(INCLUDE_DIR)/bpf.mk
+include $(INCLUDE_DIR)/bpf.mk
 
 define Package/qosify
   SECTION:=kernel
@@ -27,12 +27,10 @@ define Package/qosify
   PKGFLAGS+=nonshared
 endef
 
-#BPF_DOC = $(wildcard $(patsubst %,$(BPF_HEADERS_DIR)/scripts/%.py,bpf_doc bpf_helpers_doc))
-
-TARGET_CFLAGS += -I$(BPF_HEADERS_DIR)/user_headers/include
+BPF_DOC = $(wildcard $(patsubst %,$(BPF_HEADERS_DIR)/scripts/%.py,bpf_doc bpf_helpers_doc))
 
 define Build/Compile
-#	$(call CompileBPF,$(PKG_BUILD_DIR)/qosify-bpf.c)
+	$(call CompileBPF,$(PKG_BUILD_DIR)/qosify-bpf.c)
 	$(Build/Compile/Default)
 endef
 
@@ -43,7 +41,7 @@ endef
 
 define Package/qosify/install
 	$(INSTALL_DIR) $(1)/lib/bpf $(1)/usr/sbin $(1)/etc/init.d $(1)/etc/config $(1)/etc/hotplug.d/net
-	$(INSTALL_DATA) ./files/qosify-bpf.o $(1)/lib/bpf
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/qosify-bpf.o $(1)/lib/bpf
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/bin/qosify $(1)/usr/sbin/
 	$(INSTALL_BIN) ./files/qosify.init $(1)/etc/init.d/qosify
 	$(INSTALL_DATA) ./files/qosify-defaults.conf $(1)/etc/qosify-defaults.conf

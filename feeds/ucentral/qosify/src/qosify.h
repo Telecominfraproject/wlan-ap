@@ -38,7 +38,7 @@ struct qosify_map_data {
 	uint8_t file_dscp;
 
 	union {
-		uint16_t port;
+		uint32_t port;
 		struct in_addr ip;
 		struct in6_addr ip6;
 	} addr;
@@ -77,6 +77,7 @@ void qosify_iface_status(struct blob_buf *b);
 void qosify_iface_stop(void);
 
 int qosify_ubus_init(void);
+void qosify_ubus_stop(void);
 int qosify_ubus_check_interface(const char *name, char *ifname, int ifname_len);
 
 #endif

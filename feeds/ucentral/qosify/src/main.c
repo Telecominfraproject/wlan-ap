@@ -62,6 +62,7 @@ int main(int argc, char **argv)
 
 	uloop_run();
 
+	qosify_ubus_stop();
 	qosify_iface_stop();
 
 	uloop_done();

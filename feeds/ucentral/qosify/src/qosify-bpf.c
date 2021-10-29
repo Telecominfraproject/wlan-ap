@@ -238,7 +238,9 @@ parse_l4proto(struct qosify_config *config, struct __sk_buff *skb,
 		return;
 
 	if ((*value & DSCP_FALLBACK_FLAG) && *dscp_out)
-		*dscp_out = *value;
+		return;
+
+	*dscp_out = *value;
 }
 
 static void
