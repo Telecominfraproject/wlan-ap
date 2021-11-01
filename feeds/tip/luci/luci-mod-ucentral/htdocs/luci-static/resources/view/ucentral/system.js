@@ -79,9 +79,10 @@ return view.extend({
 
 				var cntbtn = E('button', {
 					'class': 'btn cbi-button-action important',
-					'click': ui.createHandlerFn(this, 'handleSysupgradeConfirm', btn),
-					'disabled': !is_valid
+					'click': ui.createHandlerFn(this, 'handleSysupgradeConfirm', btn)
 				}, [ _('Continue') ]);
+				if (!is_valid)
+					cntbtn.disabled = true;
 
 				body.push(E('div', { 'class': 'right' }, [
 					E('button', {
