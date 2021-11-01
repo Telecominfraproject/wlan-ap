@@ -11,6 +11,10 @@
 #define QOSIFY_INGRESS			(1 << 0)
 #define QOSIFY_IP_ONLY			(1 << 1)
 
+
+#define QOSIFY_DSCP_FALLBACK_FLAG	(1 << 6)
+#define QOSIFY_DSCP_DEFAULT_FLAG	(1 << 7)
+
 /* global config data */
 struct qosify_config {
 	uint8_t dscp_prio;

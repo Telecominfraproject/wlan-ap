@@ -16,7 +16,6 @@
 #include "qosify-bpf.h"
 
 #define INET_ECN_MASK 3
-#define DSCP_FALLBACK_FLAG	BIT(6)
 
 #define FLOW_CHECK_INTERVAL	((u32)((1000000000ULL) >> 24))
 #define FLOW_TIMEOUT		((u32)((30ULL * 1000000000ULL) >> 24))
@@ -211,33 +210,37 @@ static void
 parse_l4proto(struct qosify_config *config, struct __sk_buff *skb,
 	      __u32 offset, __u8 proto, __u8 *dscp_out)
 {
-	struct udphdr *udp = skb_ptr(skb, offset);
-	__u32 key;
+	struct udphdr *udp;
+	__u32 src, dest, key;
 	__u8 *value;
 
+	udp = skb_ptr(skb, offset);
 	if (skb_check(skb, &udp->len))
 		return;
 
-	if (module_flags & QOSIFY_INGRESS)
-		key = udp->source;
-	else
-		key = udp->dest;
-
-	if (proto == IPPROTO_TCP)
-		value = bpf_map_lookup_elem(&tcp_ports, &key);
-	else if (proto == IPPROTO_UDP)
-		value = bpf_map_lookup_elem(&udp_ports, &key);
-	else {
-		if ((proto == IPPROTO_ICMP || proto == IPPROTO_ICMPV6) &&
-		    config && config->dscp_icmp != 0xff)
-			*dscp_out = config->dscp_icmp;
+	if (config && (proto == IPPROTO_ICMP || proto == IPPROTO_ICMPV6)) {
+		*dscp_out = config->dscp_icmp;
 		return;
 	}
 
-	if (!value)
-		return;
+	src = udp->source;
+	dest = udp->dest;
 
-	if ((*value & DSCP_FALLBACK_FLAG) && *dscp_out)
+	if (module_flags & QOSIFY_INGRESS)
+		key = src;
+	else
+		key = dest;
+
+	if (proto == IPPROTO_TCP) {
+		value = bpf_map_lookup_elem(&tcp_ports, &key);
+	} else {
+		if (proto != IPPROTO_UDP)
+			key = 0;
+
+		value = bpf_map_lookup_elem(&udp_ports, &key);
+	}
+
+	if (!value)
 		return;
 
 	*dscp_out = *value;
@@ -253,7 +256,14 @@ check_flow(struct qosify_config *config, struct __sk_buff *skb,
 	__u32 hash;
 	__u32 time;
 
+	if (!(*dscp & QOSIFY_DSCP_DEFAULT_FLAG))
+		return;
+
 	if (!config)
+		return;
+
+	if (!config->bulk_trigger_pps &&
+	    !config->prio_max_avg_pkt_len)
 		return;
 
 	time = cur_time();
@@ -287,7 +297,8 @@ check_flow(struct qosify_config *config, struct __sk_buff *skb,
 	if (flow->pkt_count < 0xffff)
 		flow->pkt_count++;
 
-	if (flow->pkt_count > config->bulk_trigger_pps) {
+	if (config->bulk_trigger_pps &&
+	    flow->pkt_count > config->bulk_trigger_pps) {
 		flow->dscp = config->dscp_bulk;
 		flow->bulk_timeout = config->bulk_trigger_timeout;
 	}
@@ -302,8 +313,7 @@ out:
 			flow->dscp = 0xff;
 	}
 
-	if (flow->dscp != 0xff &&
-	    !(*dscp && (flow->dscp & DSCP_FALLBACK_FLAG)))
+	if (flow->dscp != 0xff)
 		*dscp = flow->dscp;
 
 	return;
@@ -324,8 +334,9 @@ parse_ipv4(struct __sk_buff *skb, __u32 *offset)
 	struct qosify_config *config;
 	const __u32 zero_port = 0;
 	struct iphdr *iph;
-	__u8 dscp = 0;
+	__u8 dscp = 0xff;
 	__u8 *value;
+	__u8 ipproto;
 	int hdr_len;
 	void *key;
 	bool force;
@@ -337,7 +348,7 @@ parse_ipv4(struct __sk_buff *skb, __u32 *offset)
 		return;
 
 	hdr_len = iph->ihl * 4;
-	if (bpf_skb_pull_data(skb, *offset + hdr_len))
+	if (bpf_skb_pull_data(skb, *offset + hdr_len + sizeof(struct udphdr)))
 		return;
 
 	iph = skb_ptr(skb, *offset);
@@ -346,7 +357,8 @@ parse_ipv4(struct __sk_buff *skb, __u32 *offset)
 	if (skb_check(skb, (void *)(iph + 1)))
 		return;
 
-	parse_l4proto(config, skb, *offset, iph->protocol, &dscp);
+	ipproto = iph->protocol;
+	parse_l4proto(config, skb, *offset, ipproto, &dscp);
 
 	if (module_flags & QOSIFY_INGRESS)
 		key = &iph->saddr;
@@ -355,14 +367,14 @@ parse_ipv4(struct __sk_buff *skb, __u32 *offset)
 
 	value = bpf_map_lookup_elem(&ipv4_map, key);
 	/* use udp port 0 entry as fallback for non-tcp/udp */
-	if (!value)
+	if (!value && dscp == 0xff)
 		value = bpf_map_lookup_elem(&udp_ports, &zero_port);
 	if (value)
 		dscp = *value;
 
 	check_flow(config, skb, &dscp);
 
-	force = !(dscp & DSCP_FALLBACK_FLAG);
+	force = !(dscp & QOSIFY_DSCP_FALLBACK_FLAG);
 	dscp &= GENMASK(5, 0);
 
 	ipv4_change_dsfield(iph, INET_ECN_MASK, dscp << 2, force);
@@ -376,12 +388,13 @@ parse_ipv6(struct __sk_buff *skb, __u32 *offset)
 	struct ipv6hdr *iph;
 	__u8 dscp = 0;
 	__u8 *value;
+	__u8 ipproto;
 	void *key;
 	bool force;
 
 	config = get_config();
 
-	if (bpf_skb_pull_data(skb, *offset + sizeof(*iph)))
+	if (bpf_skb_pull_data(skb, *offset + sizeof(*iph) + sizeof(struct udphdr)))
 		return;
 
 	iph = skb_ptr(skb, *offset);
@@ -390,12 +403,13 @@ parse_ipv6(struct __sk_buff *skb, __u32 *offset)
 	if (skb_check(skb, (void *)(iph + 1)))
 		return;
 
+	ipproto = iph->nexthdr;
 	if (module_flags & QOSIFY_INGRESS)
 		key = &iph->saddr;
 	else
 		key = &iph->daddr;
 
-	parse_l4proto(config, skb, *offset, iph->nexthdr, &dscp);
+	parse_l4proto(config, skb, *offset, ipproto, &dscp);
 
 	value = bpf_map_lookup_elem(&ipv6_map, key);
 
@@ -407,7 +421,7 @@ parse_ipv6(struct __sk_buff *skb, __u32 *offset)
 
 	check_flow(config, skb, &dscp);
 
-	force = !(dscp & DSCP_FALLBACK_FLAG);
+	force = !(dscp & QOSIFY_DSCP_FALLBACK_FLAG);
 	dscp &= GENMASK(5, 0);
 
 	ipv6_change_dsfield(iph, INET_ECN_MASK, dscp << 2, force);

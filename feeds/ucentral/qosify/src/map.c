@@ -36,6 +36,34 @@ static const struct {
 	[CL_MAP_CONFIG] = { "config", "config" },
 };
 
+static const struct {
+	const char name[5];
+	uint8_t val;
+} codepoints[] = {
+	{ "CS0", 0 },
+	{ "CS1", 8 },
+	{ "CS2", 16 },
+	{ "CS3", 24 },
+	{ "CS4", 32 },
+	{ "CS5", 40 },
+	{ "CS6", 48 },
+	{ "CS7", 56 },
+	{ "AF11", 10 },
+	{ "AF12", 12 },
+	{ "AF13", 14 },
+	{ "AF21", 18 },
+	{ "AF22", 20 },
+	{ "AF22", 22 },
+	{ "AF31", 26 },
+	{ "AF32", 28 },
+	{ "AF33", 30 },
+	{ "AF41", 34 },
+	{ "AF42", 36 },
+	{ "AF43", 38 },
+	{ "EF", 46 },
+	{ "VA", 44 },
+};
+
 static void qosify_map_timer_cb(struct uloop_timeout *t)
 {
 	qosify_map_gc();
@@ -104,6 +132,8 @@ static void __qosify_map_set_dscp_default(enum qosify_map_id id, uint8_t val)
 	int fd = qosify_map_fds[id];
 	int i;
 
+	val |= QOSIFY_DSCP_DEFAULT_FLAG;
+
 	for (i = 0; i < (1 << 16); i++) {
 		data.addr.port = htons(i);
 		if (avl_find(&map_data, &data))
@@ -159,38 +189,11 @@ static char *str_skip(char *str, bool space)
 static int
 qosify_map_codepoint(const char *val)
 {
-	static const struct {
-		const char name[5];
-		uint8_t val;
-	} cp[] = {
-		{ "CS0", 0 },
-		{ "CS1", 8 },
-		{ "CS2", 16 },
-		{ "CS3", 24 },
-		{ "CS4", 32 },
-		{ "CS5", 40 },
-		{ "CS6", 48 },
-		{ "CS7", 56 },
-		{ "AF11", 10 },
-		{ "AF12", 12 },
-		{ "AF13", 14 },
-		{ "AF21", 18 },
-		{ "AF22", 20 },
-		{ "AF22", 22 },
-		{ "AF31", 26 },
-		{ "AF32", 28 },
-		{ "AF33", 30 },
-		{ "AF41", 34 },
-		{ "AF42", 36 },
-		{ "AF43", 38 },
-		{ "EF", 46 },
-		{ "VA", 44 },
-	};
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(cp); i++)
-		if (!strcmp(cp[i].name, val))
-			return cp[i].val;
+	for (i = 0; i < ARRAY_SIZE(codepoints); i++)
+		if (!strcmp(codepoints[i].name, val))
+			return codepoints[i].val;
 
 	return 0xff;
 }
@@ -349,6 +352,28 @@ int qosify_map_dscp_value(const char *val)
 		return -1;
 
 	return dscp + (fallback << 6);
+}
+
+static void
+qosify_map_dscp_codepoint_str(char *dest, int len, uint8_t dscp)
+{
+	int i;
+
+	if (dscp & QOSIFY_DSCP_FALLBACK_FLAG) {
+		*(dest++) = '+';
+		len--;
+		dscp &= ~QOSIFY_DSCP_FALLBACK_FLAG;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(codepoints); i++) {
+		if (codepoints[i].val != dscp)
+			continue;
+
+		snprintf(dest, len, "%s", codepoints[i].name);
+		return;
+	}
+
+	snprintf(dest, len, "0x%x", dscp);
 }
 
 static void
@@ -542,6 +567,10 @@ void qosify_map_dump(struct blob_buf *b)
 
 		blobmsg_add_u8(b, "file", e->data.file);
 		blobmsg_add_u8(b, "user", e->data.user);
+
+		buf = blobmsg_alloc_string_buffer(b, "dscp", buf_len);
+		qosify_map_dscp_codepoint_str(buf, buf_len, e->data.dscp);
+		blobmsg_add_string_buffer(b);
 
 		blobmsg_add_string(b, "type", qosify_map_info[e->data.id].type_name);
 
