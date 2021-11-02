@@ -167,7 +167,7 @@ detect_mac80211() {
 			dev_id="set wireless.radio${devidx}.macaddr=$(cat /sys/class/ieee80211/${dev}/macaddress)"
 		fi
 
-		if [ $mode_band == "2g" ]
+		if [ $mode_band == "2g" ]; then
 			hwmode="11g"
 		else
 			hwmode="11a"
