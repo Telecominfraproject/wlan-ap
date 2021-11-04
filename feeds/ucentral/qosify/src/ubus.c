@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Copyright (C) 2021 Felix Fietkau <nbd@nbd.name>
+ */
 #include <libubus.h>
 
 #include "qosify.h"
@@ -46,6 +50,7 @@ enum {
 	CL_ADD_IPV6,
 	CL_ADD_TCP_PORT,
 	CL_ADD_UDP_PORT,
+	CL_ADD_DNS,
 	__CL_ADD_MAX
 };
 
@@ -56,6 +61,7 @@ static const struct blobmsg_policy qosify_add_policy[__CL_ADD_MAX] = {
 	[CL_ADD_IPV6] = { "ipv6", BLOBMSG_TYPE_ARRAY },
 	[CL_ADD_TCP_PORT] = { "tcp_port", BLOBMSG_TYPE_ARRAY },
 	[CL_ADD_UDP_PORT] = { "udp_port", BLOBMSG_TYPE_ARRAY },
+	[CL_ADD_DNS] = { "dns", BLOBMSG_TYPE_ARRAY },
 };
 
 
@@ -111,6 +117,10 @@ qosify_ubus_add(struct ubus_context *ctx, struct ubus_object *obj,
 
 	if ((cur = tb[CL_ADD_UDP_PORT]) != NULL &&
 	    (ret = qosify_ubus_add_array(cur, dscp, CL_MAP_UDP_PORTS) != 0))
+		return ret;
+
+	if ((cur = tb[CL_ADD_DNS]) != NULL &&
+	    (ret = qosify_ubus_add_array(cur, dscp, CL_MAP_DNS) != 0))
 		return ret;
 
 	qosify_map_timeout = prev_timemout;
@@ -254,12 +264,6 @@ qosify_ubus_status(struct ubus_context *ctx, struct ubus_object *obj,
 	return 0;
 }
 
-enum {
-	CL_DEV_EVENT_NAME,
-	CL_DEV_EVENT_ADD,
-	__CL_DEV_EVENT_MAX,
-};
-
 static int
 qosify_ubus_check_devices(struct ubus_context *ctx, struct ubus_object *obj,
 			  struct ubus_request_data *req, const char *method,
@@ -270,6 +274,48 @@ qosify_ubus_check_devices(struct ubus_context *ctx, struct ubus_object *obj,
 	return 0;
 }
 
+enum {
+	CL_DNS_HOST_NAME,
+	CL_DNS_HOST_TYPE,
+	CL_DNS_HOST_ADDR,
+	CL_DNS_HOST_TTL,
+	__CL_DNS_HOST_MAX
+};
+
+static const struct blobmsg_policy qosify_dns_policy[__CL_DNS_HOST_MAX] = {
+	[CL_DNS_HOST_NAME] = { "name", BLOBMSG_TYPE_STRING },
+	[CL_DNS_HOST_TYPE] = { "type", BLOBMSG_TYPE_STRING },
+	[CL_DNS_HOST_ADDR] = { "address", BLOBMSG_TYPE_STRING },
+	[CL_DNS_HOST_TTL] = { "ttl", BLOBMSG_TYPE_INT32 },
+};
+
+static int
+qosify_ubus_add_dns_host(struct ubus_context *ctx, struct ubus_object *obj,
+			 struct ubus_request_data *req, const char *method,
+			 struct blob_attr *msg)
+{
+	struct blob_attr *tb[__CL_DNS_HOST_MAX];
+	struct blob_attr *cur;
+	uint32_t ttl = 0;
+
+	blobmsg_parse(qosify_dns_policy, __CL_DNS_HOST_MAX, tb,
+		      blobmsg_data(msg), blobmsg_len(msg));
+
+	if (!tb[CL_DNS_HOST_NAME] || !tb[CL_DNS_HOST_TYPE] ||
+	    !tb[CL_DNS_HOST_ADDR])
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	if ((cur = tb[CL_DNS_HOST_TTL]) != NULL)
+		ttl = blobmsg_get_u32(cur);
+
+	if (qosify_map_add_dns_host(blobmsg_get_string(tb[CL_DNS_HOST_NAME]),
+				    blobmsg_get_string(tb[CL_DNS_HOST_ADDR]),
+				    blobmsg_get_string(tb[CL_DNS_HOST_TYPE]),
+				    ttl))
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+	return 0;
+}
 
 static const struct ubus_method qosify_methods[] = {
 	UBUS_METHOD_NOARG("reload", qosify_ubus_reload),
@@ -279,6 +325,7 @@ static const struct ubus_method qosify_methods[] = {
 	UBUS_METHOD("config", qosify_ubus_config, qosify_config_policy),
 	UBUS_METHOD_NOARG("dump", qosify_ubus_dump),
 	UBUS_METHOD_NOARG("status", qosify_ubus_status),
+	UBUS_METHOD("add_dns_host", qosify_ubus_add_dns_host, qosify_dns_policy),
 	UBUS_METHOD_NOARG("check_devices", qosify_ubus_check_devices),
 };
 

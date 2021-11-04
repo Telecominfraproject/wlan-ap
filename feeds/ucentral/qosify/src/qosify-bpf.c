@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Copyright (C) 2021 Felix Fietkau <nbd@nbd.name>
+ */
 #define KBUILD_MODNAME "foo"
 #include <uapi/linux/bpf.h>
 #include <uapi/linux/if_ether.h>
@@ -64,7 +68,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(pinning, 1);
 	__uint(key_size, sizeof(struct in_addr));
-	__type(value, __u8);
+	__type(value, struct qosify_ip_map_val);
 	__uint(max_entries, 100000);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } ipv4_map SEC(".maps");
@@ -73,7 +77,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(pinning, 1);
 	__uint(key_size, sizeof(struct in6_addr));
-	__type(value, __u8);
+	__type(value, struct qosify_ip_map_val);
 	__uint(max_entries, 100000);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 } ipv6_map SEC(".maps");
@@ -332,6 +336,7 @@ static __always_inline void
 parse_ipv4(struct __sk_buff *skb, __u32 *offset)
 {
 	struct qosify_config *config;
+	struct qosify_ip_map_val *ip_val;
 	const __u32 zero_port = 0;
 	struct iphdr *iph;
 	__u8 dscp = 0xff;
@@ -365,12 +370,17 @@ parse_ipv4(struct __sk_buff *skb, __u32 *offset)
 	else
 		key = &iph->daddr;
 
-	value = bpf_map_lookup_elem(&ipv4_map, key);
-	/* use udp port 0 entry as fallback for non-tcp/udp */
-	if (!value && dscp == 0xff)
+	ip_val = bpf_map_lookup_elem(&ipv4_map, key);
+	if (ip_val) {
+		if (!ip_val->seen)
+			ip_val->seen = 1;
+		dscp = ip_val->dscp;
+	} else if (dscp == 0xff) {
+		/* use udp port 0 entry as fallback for non-tcp/udp */
 		value = bpf_map_lookup_elem(&udp_ports, &zero_port);
-	if (value)
-		dscp = *value;
+		if (value)
+			dscp = *value;
+	}
 
 	check_flow(config, skb, &dscp);
 
@@ -384,6 +394,7 @@ static __always_inline void
 parse_ipv6(struct __sk_buff *skb, __u32 *offset)
 {
 	struct qosify_config *config;
+	struct qosify_ip_map_val *ip_val;
 	const __u32 zero_port = 0;
 	struct ipv6hdr *iph;
 	__u8 dscp = 0;
@@ -411,13 +422,17 @@ parse_ipv6(struct __sk_buff *skb, __u32 *offset)
 
 	parse_l4proto(config, skb, *offset, ipproto, &dscp);
 
-	value = bpf_map_lookup_elem(&ipv6_map, key);
-
-	/* use udp port 0 entry as fallback for non-tcp/udp */
-	if (!value)
+	ip_val = bpf_map_lookup_elem(&ipv6_map, key);
+	if (ip_val) {
+		if (!ip_val->seen)
+			ip_val->seen = 1;
+		dscp = ip_val->dscp;
+	} else if (dscp == 0xff) {
+		/* use udp port 0 entry as fallback for non-tcp/udp */
 		value = bpf_map_lookup_elem(&udp_ports, &zero_port);
-	if (value)
-		dscp = *value;
+		if (value)
+			dscp = *value;
+	}
 
 	check_flow(config, skb, &dscp);
 

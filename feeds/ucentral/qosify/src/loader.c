@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Copyright (C) 2021 Felix Fietkau <nbd@nbd.name>
+ */
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
@@ -35,24 +39,17 @@ static void qosify_fill_rodata(struct bpf_object *obj, uint32_t flags)
 }
 
 static int
-qosify_create_program(const char *suffix, uint32_t flags, bool *force_init)
+qosify_create_program(const char *suffix, uint32_t flags)
 {
 	DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts,
 		.pin_root_path = CLASSIFY_DATA_PATH,
 	);
 	struct bpf_program *prog;
 	struct bpf_object *obj;
-	struct stat st;
 	char path[256];
 	int err;
 
 	snprintf(path, sizeof(path), CLASSIFY_PIN_PATH "_" "%s", suffix);
-	if (!*force_init) {
-		if (stat(path, &st) == 0)
-			return 0;
-
-		*force_init = true;
-	}
 
 	obj = bpf_object__open_file(CLASSIFY_PROG_PATH, &opts);
 	err = libbpf_get_error(obj);
@@ -91,7 +88,7 @@ qosify_create_program(const char *suffix, uint32_t flags, bool *force_init)
 	return 0;
 }
 
-int qosify_loader_init(bool force_init)
+int qosify_loader_init(void)
 {
 	static const struct {
 		const char *suffix;
@@ -105,8 +102,7 @@ int qosify_loader_init(bool force_init)
 	glob_t g;
 	int i;
 
-	if (force_init &&
-	    glob(CLASSIFY_DATA_PATH "/*", 0, NULL, &g) == 0) {
+	if (glob(CLASSIFY_DATA_PATH "/*", 0, NULL, &g) == 0) {
 		for (i = 0; i < g.gl_pathc; i++)
 			unlink(g.gl_pathv[i]);
 	}
@@ -117,8 +113,7 @@ int qosify_loader_init(bool force_init)
 	qosify_init_env();
 
 	for (i = 0; i < ARRAY_SIZE(progs); i++) {
-		if (qosify_create_program(progs[i].suffix, progs[i].flags,
-				      &force_init))
+		if (qosify_create_program(progs[i].suffix, progs[i].flags))
 			return -1;
 	}
 

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Copyright (C) 2021 Felix Fietkau <nbd@nbd.name>
+ */
 #include <arpa/inet.h>
 
 #include <errno.h>
@@ -17,7 +21,8 @@ static AVL_TREE(map_data, qosify_map_entry_cmp, false, NULL);
 static LIST_HEAD(map_files);
 static uint32_t next_timeout;
 static uint8_t qosify_dscp_default[2] = { 0xff, 0xff };
-int qosify_map_timeout = 3600;
+int qosify_map_timeout;
+int qosify_active_timeout;
 struct qosify_config config;
 
 struct qosify_map_file {
@@ -34,6 +39,7 @@ static const struct {
 	[CL_MAP_IPV4_ADDR] = { "ipv4_map", "ipv4_addr" },
 	[CL_MAP_IPV6_ADDR] = { "ipv6_map", "ipv6_addr" },
 	[CL_MAP_CONFIG] = { "config", "config" },
+	[CL_MAP_DNS] = { "dns", "dns" },
 };
 
 static const struct {
@@ -62,6 +68,8 @@ static const struct {
 	{ "AF43", 38 },
 	{ "EF", 46 },
 	{ "VA", 44 },
+	{ "LE", 1 },
+	{ "DF", 0 },
 };
 
 static void qosify_map_timer_cb(struct uloop_timeout *t)
@@ -165,7 +173,7 @@ int qosify_map_init(void)
 {
 	int i;
 
-	for (i = 0; i < ARRAY_SIZE(qosify_map_fds); i++) {
+	for (i = 0; i < CL_MAP_DNS; i++) {
 		qosify_map_fds[i] = qosify_map_get_fd(i);
 		if (qosify_map_fds[i] < 0)
 			return -1;
@@ -206,7 +214,35 @@ static int qosify_map_entry_cmp(const void *k1, const void *k2, void *ptr)
 	if (d1->id != d2->id)
 		return d2->id - d1->id;
 
+	if (d1->id == CL_MAP_DNS)
+		return strcmp(d1->addr.dns.pattern, d2->addr.dns.pattern);
+
 	return memcmp(&d1->addr, &d2->addr, sizeof(d1->addr));
+}
+
+static struct qosify_map_entry *
+__qosify_map_alloc_entry(struct qosify_map_data *data)
+{
+	struct qosify_map_entry *e;
+	char *pattern;
+
+	if (data->id < CL_MAP_DNS) {
+		e = calloc(1, sizeof(*e));
+		memcpy(&e->data.addr, &data->addr, sizeof(e->data.addr));
+
+		return e;
+	}
+
+	e = calloc_a(sizeof(*e), &pattern, strlen(data->addr.dns.pattern) + 1);
+	strcpy(pattern, data->addr.dns.pattern);
+	e->data.addr.dns.pattern = pattern;
+	if (regcomp(&e->data.addr.dns.regex, pattern,
+		    REG_EXTENDED | REG_ICASE | REG_NOSUB)) {
+		free(e);
+		return NULL;
+	}
+
+	return e;
 }
 
 static void __qosify_map_set_entry(struct qosify_map_data *data)
@@ -223,10 +259,12 @@ static void __qosify_map_set_entry(struct qosify_map_data *data)
 		if (!add)
 			return;
 
-		e = calloc(1, sizeof(*e));
+		e = __qosify_map_alloc_entry(data);
+		if (!e)
+			return;
+
 		e->avl.key = &e->data;
 		e->data.id = data->id;
-		memcpy(&e->data.addr, &data->addr, sizeof(e->data.addr));
 		avl_insert(&map_data, &e->avl);
 	} else {
 		prev_dscp = e->data.dscp;
@@ -246,8 +284,14 @@ static void __qosify_map_set_entry(struct qosify_map_data *data)
 		e->data.dscp = e->data.file_dscp;
 	}
 
-	if (e->data.dscp != prev_dscp)
-		bpf_map_update_elem(fd, &data->addr, &e->data.dscp, BPF_ANY);
+	if (e->data.dscp != prev_dscp && data->id < CL_MAP_DNS) {
+		struct qosify_ip_map_val val = {
+			.dscp = e->data.dscp,
+			.seen = 1,
+		};
+
+		bpf_map_update_elem(fd, &data->addr, &val, BPF_ANY);
+	}
 
 	if (add) {
 		if (qosify_map_timeout == ~0 || file) {
@@ -316,6 +360,9 @@ int qosify_map_set_entry(enum qosify_map_id id, bool file, const char *str, uint
 	};
 
 	switch (id) {
+	case CL_MAP_DNS:
+		data.addr.dns.pattern = str;
+		break;
 	case CL_MAP_TCP_PORTS:
 	case CL_MAP_UDP_PORTS:
 		return qosify_map_set_port(&data, str);
@@ -397,6 +444,8 @@ qosify_map_parse_line(char *str)
 	if (dscp < 0)
 		return;
 
+	if (!strncmp(key, "dns:", 4))
+		qosify_map_set_entry(CL_MAP_DNS, true, key + 4, dscp);
 	if (!strncmp(key, "tcp:", 4))
 		qosify_map_set_entry(CL_MAP_TCP_PORTS, true, key + 4, dscp);
 	else if (!strncmp(key, "udp:", 4))
@@ -483,6 +532,7 @@ void qosify_map_reset_config(void)
 	qosify_map_set_dscp_default(CL_MAP_TCP_PORTS, 0);
 	qosify_map_set_dscp_default(CL_MAP_UDP_PORTS, 0);
 	qosify_map_timeout = 3600;
+	qosify_active_timeout = 300;
 
 	memset(&config, 0, sizeof(config));
 	config.dscp_prio = 0xff;
@@ -502,12 +552,44 @@ void qosify_map_reload(void)
 	qosify_map_gc();
 }
 
+static void qosify_map_free_entry(struct qosify_map_entry *e)
+{
+	int fd = qosify_map_fds[e->data.id];
+
+	avl_delete(&map_data, &e->avl);
+	if (e->data.id < CL_MAP_DNS)
+		bpf_map_delete_elem(fd, &e->data.addr);
+	free(e);
+}
+
+static bool
+qosify_map_entry_refresh_timeout(struct qosify_map_entry *e)
+{
+	struct qosify_ip_map_val val;
+	int fd = qosify_map_fds[e->data.id];
+
+	if (e->data.id != CL_MAP_IPV4_ADDR &&
+	    e->data.id != CL_MAP_IPV6_ADDR)
+		return false;
+
+	if (bpf_map_lookup_elem(fd, &e->data.addr, &val))
+		return false;
+
+	if (!val.seen)
+		return false;
+
+	e->timeout = qosify_gettime() + qosify_active_timeout;
+	val.seen = 0;
+	bpf_map_update_elem(fd, &e->data.addr, &val, BPF_ANY);
+
+	return true;
+}
+
 void qosify_map_gc(void)
 {
 	struct qosify_map_entry *e, *tmp;
 	int32_t timeout = 0;
 	uint32_t cur_time = qosify_gettime();
-	int fd;
 
 	next_timeout = 0;
 	avl_for_each_element_safe(&map_data, e, avl, tmp) {
@@ -515,6 +597,9 @@ void qosify_map_gc(void)
 
 		if (e->data.user && e->timeout != ~0) {
 			cur_timeout = e->timeout - cur_time;
+			if (cur_timeout <= 0 &&
+			    qosify_map_entry_refresh_timeout(e))
+				cur_timeout = e->timeout - cur_time;
 			if (cur_timeout <= 0) {
 				e->data.user = false;
 				e->data.dscp = e->data.file_dscp;
@@ -527,10 +612,7 @@ void qosify_map_gc(void)
 		if (e->data.file || e->data.user)
 			continue;
 
-		avl_delete(&map_data, &e->avl);
-		fd = qosify_map_fds[e->data.id];
-		bpf_map_delete_elem(fd, &e->data.addr);
-		free(e);
+		qosify_map_free_entry(e);
 	}
 
 	if (!timeout)
@@ -538,6 +620,52 @@ void qosify_map_gc(void)
 
 	uloop_timeout_set(&qosify_map_timer, timeout * 1000);
 }
+
+
+int qosify_map_add_dns_host(const char *host, const char *addr, const char *type, int ttl)
+{
+	struct qosify_map_data data = {
+		.id = CL_MAP_DNS,
+		.addr.dns.pattern = "",
+	};
+	struct qosify_map_entry *e;
+	int prev_timeout = qosify_map_timeout;
+
+	e = avl_find_ge_element(&map_data, &data, e, avl);
+	if (!e)
+		return 0;
+
+	memset(&data, 0, sizeof(data));
+	data.user = true;
+	if (!strcmp(type, "A"))
+		data.id = CL_MAP_IPV4_ADDR;
+	else if (!strcmp(type, "AAAA"))
+		data.id = CL_MAP_IPV6_ADDR;
+	else
+		return 0;
+
+	if (qosify_map_fill_ip(&data, addr))
+		return -1;
+
+	avl_for_element_to_last(&map_data, e, e, avl) {
+		regex_t *regex = &e->data.addr.dns.regex;
+
+		if (e->data.id != CL_MAP_DNS)
+			return 0;
+
+		if (regexec(regex, host, 0, NULL, 0) != 0)
+			continue;
+
+		if (ttl)
+			qosify_map_timeout = ttl;
+		data.dscp = e->data.dscp;
+		__qosify_map_set_entry(&data);
+		qosify_map_timeout = prev_timeout;
+	}
+
+	return 0;
+}
+
 
 void qosify_map_dump(struct blob_buf *b)
 {
@@ -574,22 +702,25 @@ void qosify_map_dump(struct blob_buf *b)
 
 		blobmsg_add_string(b, "type", qosify_map_info[e->data.id].type_name);
 
-		buf = blobmsg_alloc_string_buffer(b, "value", buf_len);
 		switch (e->data.id) {
 		case CL_MAP_TCP_PORTS:
 		case CL_MAP_UDP_PORTS:
-			snprintf(buf, buf_len, "%d", ntohs(e->data.addr.port));
+			blobmsg_printf(b, "addr", "%d", ntohs(e->data.addr.port));
 			break;
 		case CL_MAP_IPV4_ADDR:
 		case CL_MAP_IPV6_ADDR:
+			buf = blobmsg_alloc_string_buffer(b, "addr", buf_len);
 			af = e->data.id == CL_MAP_IPV6_ADDR ? AF_INET6 : AF_INET;
 			inet_ntop(af, &e->data.addr, buf, buf_len);
+			blobmsg_add_string_buffer(b);
+			break;
+		case CL_MAP_DNS:
+			blobmsg_add_string(b, "addr", e->data.addr.dns.pattern);
 			break;
 		default:
 			*buf = 0;
 			break;
 		}
-		blobmsg_add_string_buffer(b);
 		blobmsg_close_table(b, c);
 	}
 	blobmsg_close_array(b, a);

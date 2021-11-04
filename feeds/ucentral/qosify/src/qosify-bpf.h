@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Copyright (C) 2021 Felix Fietkau <nbd@nbd.name>
+ */
 #ifndef __BPF_QOSIFY_H
 #define __BPF_QOSIFY_H
 
@@ -25,6 +29,11 @@ struct qosify_config {
 	uint16_t bulk_trigger_pps;
 
 	uint16_t prio_max_avg_pkt_len;
+};
+
+struct qosify_ip_map_val {
+	uint8_t dscp; /* must be first */
+	uint8_t seen;
 };
 
 #endif
