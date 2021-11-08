@@ -304,15 +304,14 @@ static void update_eth_ports_states(struct schema_Wifi_Inet_State *state)
 	}
 	for (i = 0; i < MAX_ETH_PORTS && lanport[i].ifname != NULL; i++) {
 		if (strcmp(lanport[i].bridge, brname) == 0) {
-			STRSCPY(state->eth_ports_keys[cnt+i], lanport[i].ifname);
+			STRSCPY(state->eth_ports_keys[state->eth_ports_len], lanport[i].ifname);
 			memset(port_status, '\0', sizeof(port_status));
 			snprintf(port_status, sizeof(port_status), "%s lan %sMbps %s", 
 				 lanport[i].state, lanport[i].speed, lanport[i].duplex);
 
-			STRSCPY(state->eth_ports[cnt+i], port_status);
+			STRSCPY(state->eth_ports[state->eth_ports_len], port_status);
 			state->eth_ports_len++;
 		}
-
 	}
 
 	if (!strncmp(state->if_name, "eth", 3)) {

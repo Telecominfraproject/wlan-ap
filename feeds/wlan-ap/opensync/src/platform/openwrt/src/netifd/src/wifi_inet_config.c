@@ -317,6 +317,15 @@ static void vlan_trunk_set(struct blob_buf *b, struct blob_buf *del,
 	}
 }
 
+static void reload_vlan_trunk(struct schema_Wifi_Inet_Config *iconf)
+{
+	char buf[128] = {0};
+
+	snprintf(buf, sizeof(buf), "ACTION=ifup INTERFACE=%s /sbin/hotplug-call iface",iconf->if_name);
+
+	system(buf);
+}
+
 static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 {
 	const char *lease_time = SCHEMA_FIND_KEY(iconf->dhcpd, "lease_time");
@@ -324,6 +333,7 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 	const char *dhcp_stop = SCHEMA_FIND_KEY(iconf->dhcpd, "stop");
 	int len = strlen(iconf->if_name);
 	int is_ipv6 = 0;
+	int reload_trunk = 0;
 
 	if (len && iconf->if_name[len - 1] == '6')
 		is_ipv6 = 1;
@@ -428,6 +438,7 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 		vlan_trunk_set(&b, &del, iconf);
 		blobmsg_add_string(&b, "ifname", iconf->parent_ifname);
 		blobmsg_add_bool(&b, "vlan_trunk", 1);
+		reload_trunk = 1;
 	}
 
 	blob_to_uci_section(uci, "network", iconf->if_name, "interface", b.head, &network_param, del.head);
@@ -444,6 +455,10 @@ static int wifi_inet_conf_add(struct schema_Wifi_Inet_Config *iconf)
 	}
 
 	uci_commit_all(uci);
+
+	/*workaround, trunk interface doesnt reload in reload_config */
+	if(reload_trunk)
+		reload_vlan_trunk(iconf);
 
 	return 0;
 }
