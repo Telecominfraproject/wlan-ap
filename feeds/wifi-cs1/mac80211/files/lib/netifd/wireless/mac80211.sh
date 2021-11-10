@@ -1151,10 +1151,19 @@ drv_mac80211_setup() {
 		fi
 		if [ "$no_reload" != "0" ]; then
 			add_ap=1
-			ubus wait_for hostapd
+			ubus wait_for hostapd.$primary_ap
 			local hostapd_res="$(ubus call hostapd config_add "{\"iface\":\"$primary_ap\", \"config\":\"${hostapd_conf_file}\"}")"
 			ret="$?"
-			[ "$ret" != 0 -o -z "$hostapd_res" ] && {
+
+                        if [ -z "$hostapd_res" ]; then
+                                local hostapd_pid=$(ubus call service list '{"name": "wpad"}' | jsonfilter -l 1 -e "@['wpad'].instances['hostapd'].pid")
+                                wireless_add_process "$hostapd_pid" "/usr/sbin/hostapd" 1 1
+                        else
+                                wireless_add_process "$(jsonfilter -s "$hostapd_res" -l 1 -e @.pid)" "/usr/sbin/hostapd" 1 1
+                        fi
+
+			[ "$ret" != 0 ] && {
+				echo "mac80211.sh wireless setup failed for $primary_ap"
 				wireless_setup_failed HOSTAPD_START_FAILED
 				return
 			}
