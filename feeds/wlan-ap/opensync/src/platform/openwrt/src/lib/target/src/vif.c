@@ -1623,6 +1623,7 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 		for (i = 0; i < vconf->mac_list_len; i++)
 			blobmsg_add_string(&b, NULL, (char*)vconf->mac_list[i]);
 		blobmsg_close_array(&b, a);
+		system("ubus call service event '{\"type\": \"config.change\", \"data\": { \"package\": \"wireless\" }}'");
 	}
 
 	blobmsg_add_bool(&b, "wpa_disable_eapol_key_retries", 1);
