@@ -369,6 +369,8 @@ hostapd_common_add_bss_config() {
 
 	config_add_int eap_server
 	config_add_string eap_user_file ca_cert server_cert private_key private_key_passwd server_id
+
+	config_add_boolean ratelimit
 }
 
 hostapd_set_vlan_file() {
