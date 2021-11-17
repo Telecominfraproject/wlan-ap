@@ -43,6 +43,7 @@ return view.extend({
 		o.value('dhcp', _('Address configuration via DHCP'));
 		o.value('pppoe', _('Address configuration via PPPoE'));
 		o.value('wwan', _('Cellular network connection'));
+		o.value('wds', _('WiFi WDS uplink'));
 
 		o = s.option(form.ListValue, 'modem-type', _('Modem type'));
 		o.depends('protocol', 'wwan');
@@ -104,6 +105,25 @@ return view.extend({
 		o = s.option(form.DynamicList, 'use-dns', _('DNS Servers'));
 		o.depends('protocol', 'static');
 		o.datatype = 'ipaddr("nomask")';
+
+		o = s.option(form.Value, 'ssid', _('SSID'));
+		o.depends('protocol', 'wds');
+		o.rmempty = false;
+
+		o = s.option(form.Value, 'passphrase', _('Passphrase'));
+		o.depends('protocol', 'wds');
+		o.password = true;
+		o.rmempty = false;
+		o.datatype = "rangelength(8, 31)";
+
+		o = s.option(form.ListValue, 'encryption', _('Encryption'));
+		o.depends('protocol', 'wds');
+		o.value('psk', 'PSK');
+		o.value('psk-mixed', 'PSK-Mixed');
+		o.value('psk2', 'PSK2');
+		o.value('sae', 'SAE');
+		o.value('sae-mixed', 'SAE-Mixed');
+		o.password = true;
 
 		for (var i = 0; i < s.children.length; i++)
 			data.broadband[s.children[i].option] = profile.broadband[s.children[i].option];
