@@ -359,7 +359,7 @@ int get_if_type(char *name) {
  */
 int get_radio_id(char *name) {
 	char id[4] = {'\0','\0','\0'};
-	long res;
+	long res = -2;
 	int i;
 
 	if (!strncmp(name, "wlan", 4)) {
@@ -1124,6 +1124,9 @@ void voip_generate_report_event(struct mac_entry * HashPtr,
 	}
 	
 	WiFiIf = get_radio_id(Intrf->name);
+
+	if (WiFiIf < 0)
+		return;
 	
 	memset( &SipCallEnd, 0, sizeof( SipCallEnd ) );
 	SipCallEnd.SessionId = HashPtr->SipSessionId;
@@ -1227,6 +1230,9 @@ void voip_generate_end_event(struct mac_entry * HashPtr, unsigned int Reason)
 	int WiFiIf = 0;
 	
 	WiFiIf = get_radio_id(HashPtr->port->name);
+
+	if (WiFiIf < 0)
+		return;
 	
 	memset( &SipCallEnd, 0, sizeof( SipCallEnd ) );
 	SipCallEnd.SessionId = HashPtr->SipSessionId;
@@ -1631,6 +1637,9 @@ int voip_sip_packet_analyze(unsigned char * Message, unsigned char * EndPtr,
 
     	WiFiIf = get_radio_id(HashPtr->port->name);
 
+	if (WiFiIf < 0)
+		return (-1);
+
 	iac_send_message(&VoipSession, sizeof(struct voip_session));
 
         voip_generate_start_event( HashPtr, VoipSession.SipSessionId, WiFiIf );
@@ -1760,6 +1769,9 @@ void voip_heuristic_flow_call_start(struct mac_entry * hash_ptr,
 	int WiFiIf = 0, CalType = VOIP_MARK_SKYPE;
 
 	WiFiIf = get_radio_id(hash_ptr->port->name);
+
+	if (WiFiIf < 0)
+		return;
 
 	if( IsTcp )
 	{
