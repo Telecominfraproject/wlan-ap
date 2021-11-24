@@ -624,11 +624,14 @@ int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_lis
 
 	ret = unl_genl_request(&unl_req, msg, nl80211_scan_trigger_recv, NULL);
 	if (ret) {
-		nl80211_scan_del(nl80211_scan);
-		LOG(DEBUG, "%s: scan request failed %d\n", nl_call_param->ifname, ret);
+		/* Allow upper layer to send survey report and proceed to next channel
+		 * in case scan fails
+		 */
+		LOG(DEBUG, "%s: scan request failed, proceed however %d\n", nl_call_param->ifname, ret);
+		nl80211_scan_finish(nl_call_param->ifname, true);
 	}
 
-	return ret;
+	return 0;
 }
 
 int nl80211_scan_abort(struct nl_call_param *nl_call_param)
