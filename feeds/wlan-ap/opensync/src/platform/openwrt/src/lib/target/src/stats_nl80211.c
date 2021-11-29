@@ -111,18 +111,19 @@ static int nl80211_interface_recv(struct nl_msg *msg, void *arg)
 static int nl80211_assoclist_recv(struct nl_msg *msg, void *arg)
 {
 	static struct nla_policy stats_policy[NL80211_STA_INFO_MAX + 1] = {
-		[NL80211_STA_INFO_INACTIVE_TIME] = { .type = NLA_U32    },
-		[NL80211_STA_INFO_RX_PACKETS]    = { .type = NLA_U32    },
-		[NL80211_STA_INFO_TX_PACKETS]    = { .type = NLA_U32    },
-		[NL80211_STA_INFO_RX_BITRATE]    = { .type = NLA_NESTED },
-		[NL80211_STA_INFO_TX_BITRATE]    = { .type = NLA_NESTED },
-		[NL80211_STA_INFO_SIGNAL]        = { .type = NLA_U8     },
-		[NL80211_STA_INFO_RX_BYTES]      = { .type = NLA_U32    },
-		[NL80211_STA_INFO_TX_BYTES]      = { .type = NLA_U32    },
-		[NL80211_STA_INFO_TX_RETRIES]    = { .type = NLA_U32    },
-		[NL80211_STA_INFO_TX_FAILED]     = { .type = NLA_U32    },
-		[NL80211_STA_INFO_RX_DROP_MISC]  = { .type = NLA_U64    },
-		[NL80211_STA_INFO_T_OFFSET]      = { .type = NLA_U64    },
+		[NL80211_STA_INFO_INACTIVE_TIME]  = { .type = NLA_U32    },
+		[NL80211_STA_INFO_RX_PACKETS]     = { .type = NLA_U32    },
+		[NL80211_STA_INFO_TX_PACKETS]     = { .type = NLA_U32    },
+		[NL80211_STA_INFO_RX_BITRATE]     = { .type = NLA_NESTED },
+		[NL80211_STA_INFO_TX_BITRATE]     = { .type = NLA_NESTED },
+		[NL80211_STA_INFO_SIGNAL]         = { .type = NLA_U8     },
+		[NL80211_STA_INFO_RX_BYTES]       = { .type = NLA_U32    },
+		[NL80211_STA_INFO_TX_BYTES]       = { .type = NLA_U32    },
+		[NL80211_STA_INFO_TX_RETRIES]     = { .type = NLA_U32    },
+		[NL80211_STA_INFO_TX_FAILED]      = { .type = NLA_U32    },
+		[NL80211_STA_INFO_RX_DROP_MISC]   = { .type = NLA_U64    },
+		[NL80211_STA_INFO_T_OFFSET]       = { .type = NLA_U64    },
+		[NL80211_STA_INFO_CONNECTED_TIME] = { .type = NLA_U32    },
 		[NL80211_STA_INFO_STA_FLAGS] =
 			{ .minlen = sizeof(struct nl80211_sta_flag_update) },
 	};
@@ -190,6 +191,8 @@ static int nl80211_assoclist_recv(struct nl_msg *msg, void *arg)
 		client_entry->stats.errors_tx = nla_get_u32(sinfo[NL80211_STA_INFO_TX_FAILED]);
 	if (sinfo[NL80211_STA_INFO_RX_DROP_MISC])
 		client_entry->stats.errors_rx = nla_get_u64(sinfo[NL80211_STA_INFO_RX_DROP_MISC]);
+	if (sinfo[NL80211_STA_INFO_CONNECTED_TIME])
+		client_entry->connectedTime = nla_get_u32(sinfo[NL80211_STA_INFO_CONNECTED_TIME]);
 
 	ds_dlist_insert_tail(nl_call_param->list, client_entry);
 

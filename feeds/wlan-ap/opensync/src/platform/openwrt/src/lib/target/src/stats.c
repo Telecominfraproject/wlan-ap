@@ -157,13 +157,26 @@ bool target_stats_clients_convert(radio_entry_t *radio_cfg, target_client_record
 	client_record->stats.rssi       = data_new->stats.rssi;
 	client_record->stats.rate_tx    = data_new->stats.rate_tx;
 	client_record->stats.rate_rx    = data_new->stats.rate_rx;
-	client_record->stats.bytes_tx   = data_new->stats.bytes_tx   - data_old->stats.bytes_tx;
-	client_record->stats.bytes_rx   = data_new->stats.bytes_rx   - data_old->stats.bytes_rx;
-	client_record->stats.frames_tx  = data_new->stats.frames_tx  - data_old->stats.frames_tx;
-	client_record->stats.frames_rx  = data_new->stats.frames_rx  - data_old->stats.frames_rx;
-	client_record->stats.retries_tx = data_new->stats.retries_tx - data_old->stats.retries_tx;
-	client_record->stats.errors_tx  = data_new->stats.errors_tx  - data_old->stats.errors_tx;
-	client_record->stats.errors_rx  = data_new->stats.errors_rx  - data_old->stats.errors_rx;
+	
+	// If the new data is less than the old that we know there was a reconnect since the last collection period
+	// If this is the case we should just use the new value only
+	if (data_new->connectedTime < data_old->connectedTime) {
+		client_record->stats.bytes_tx   = data_new->stats.bytes_tx;
+		client_record->stats.bytes_rx   = data_new->stats.bytes_rx;
+		client_record->stats.frames_tx  = data_new->stats.frames_tx;
+		client_record->stats.frames_rx  = data_new->stats.frames_rx;
+		client_record->stats.retries_tx = data_new->stats.retries_tx;
+		client_record->stats.errors_tx  = data_new->stats.errors_tx;
+		client_record->stats.errors_rx  = data_new->stats.errors_rx;
+	} else {
+		client_record->stats.bytes_tx   = data_new->stats.bytes_tx - data_old->stats.bytes_tx;
+		client_record->stats.bytes_rx   = data_new->stats.bytes_rx - data_old->stats.bytes_rx;
+		client_record->stats.frames_tx  = data_new->stats.frames_tx - data_old->stats.frames_tx;
+		client_record->stats.frames_rx  = data_new->stats.frames_rx - data_old->stats.frames_rx;
+		client_record->stats.retries_tx = data_new->stats.retries_tx - data_old->stats.retries_tx;
+		client_record->stats.errors_tx  = data_new->stats.errors_tx - data_old->stats.errors_tx;
+		client_record->stats.errors_rx  = data_new->stats.errors_rx - data_old->stats.errors_rx;
+	}
 
 	return true;
 }
