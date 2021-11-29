@@ -1187,6 +1187,7 @@ void apc_init()
 	cloud_disconn_mon();
 
 }
+
 static void apply_config_handler(struct timeout *timeout)
 {
 	radius_proxy_fixup();
