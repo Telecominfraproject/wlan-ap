@@ -341,6 +341,7 @@ static bool radio_state_update(struct uci_section *s, struct schema_Wifi_Radio_C
 			SCHEMA_SET_INT(rstate.channel, chan);
 		else
 			SCHEMA_SET_INT(rstate.channel, blobmsg_get_u32(tb[WDEV_ATTR_CHANNEL]));
+
 		radio_fixup_set_primary_chan(rstate.if_name,
 			     blobmsg_get_u32(tb[WDEV_ATTR_CHANNEL]));
 	}
@@ -462,6 +463,9 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 
 	char phy[6];
 	char ifname[8];
+	int freq = 0;
+	char *mode = NULL;
+	struct mode_map *m;
 
 	strncpy(ifname, rconf->if_name, sizeof(ifname));
 	strncpy(phy, target_map_ifname(ifname), sizeof(phy));
@@ -471,9 +475,17 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 		 * if not, that means the channel state changed due to a 
 		 * radar detection and shall remain in the backup channel */
 		if (is_cloud_channel_change(rconf) == 0) {
-			blobmsg_add_u32(&b, "channel", rconf->channel);
 			if(rrm_radio_rebalance_channel(rconf) == 0) {
+				blobmsg_add_u32(&b, "channel", rconf->channel);
 				radio_fixup_set_primary_chan(rconf->if_name, rconf->channel);
+
+				/* Update the ht_mode in UCI if we downgraded due to channel change */
+				freq = ieee80211_channel_to_frequency(rconf->channel);
+				mode = get_max_channel_bw_channel(freq,	rconf->ht_mode);
+				if (strncmp(mode, rconf->ht_mode, 4)) {
+					m = mode_map_get_uci(rconf->freq_band, mode, rconf->hw_mode);
+					blobmsg_add_string(&b, "htmode", m->ucihtmode);
+				}
 			}
 		}
 	}
@@ -563,7 +575,7 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 			}
 		}
 
-		struct mode_map *m = mode_map_get_uci(rconf->freq_band, get_max_channel_bw_channel(channel_freq, rconf->ht_mode), hw_mode);
+		m = mode_map_get_uci(rconf->freq_band, get_max_channel_bw_channel(channel_freq, rconf->ht_mode), hw_mode);
 		if (m) {
 			blobmsg_add_string(&b, "htmode", m->ucihtmode);
 			blobmsg_add_string(&b, "hwmode", m->ucihwmode);
