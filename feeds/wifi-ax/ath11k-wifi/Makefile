@@ -28,6 +28,7 @@ ALLWIFIBOARDS:= \
 	cig-wf188n \
 	cig-wf194c \
 	cig-wf194c4 \
+	cig-wf196 \
 	edgecore-eap101 \
 	sercomm-wallaby \
 	edgecore-eap102 \
@@ -64,6 +65,11 @@ endef
 define Package/ath11k-wifi-qcom-ipq6122
 $(call Package/ath11k-wifi-default)
     TITLE:=board-2.bin for QCOM IPQ6122 eval kits
+endef
+
+define Package/ath11k-wifi-cig-wf196_6g
+$(call Package/ath11k-wifi-default)
+    TITLE:=cig-wf196 6G bdf
 endef
 
 define ath11k-wifi-install-one-to
@@ -129,10 +135,16 @@ define Package/ath11k-wifi-qcom-ipq6122/install
 	$(INSTALL_DATA) ./board-2.bin.IPQ6122 $(1)/lib/firmware/ath11k/IPQ6122/hw1.0/board-2.bin
 endef
 
+define Package/ath11k-wifi-cig-wf196_6g/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/QCN9074/hw1.0/
+	$(INSTALL_DATA) ./board-cig-wf196_6g.bin.QCN9074 $(1)/lib/firmware/ath11k/QCN9074/hw1.0/board.bin
+endef
+
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
 $(eval $(call generate-ath11k-wifi-package,cig-wf188n,Cigtech WF188n))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c,Cigtech WF194c))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c4,Cigtech WF194c4))
+$(eval $(call generate-ath11k-wifi-package,cig-wf196,Cigtech WF196))
 $(eval $(call generate-ath11k-wifi-package,sercomm-wallaby,Sercomm Kiwi))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018,Wallys DR6018))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018-v4,Wallys DR6018 V4))
@@ -146,3 +158,4 @@ $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq5018))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq6122))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq8074))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq6018))
+$(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g))
