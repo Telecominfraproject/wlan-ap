@@ -157,12 +157,16 @@ detect_mac80211() {
 		channel=""
 		htmode=""
 		ht_capab=""
+		scanning=""
 
 		get_band_defaults "$dev"
 
 		path="$(iwinfo nl80211 path "$dev")"
 		if [ -n "$path" ]; then
 			dev_id="set wireless.radio${devidx}.path='$path'"
+			if [ "$(cat /etc/board.json | jsonfilter -e "@.wifi['$path'].scanning")" == "true" ]; then
+				scanning="set wireless.radio${devidx}.scanning=1"
+			fi
 		else
 			dev_id="set wireless.radio${devidx}.macaddr=$(cat /sys/class/ieee80211/${dev}/macaddress)"
 		fi
@@ -175,6 +179,7 @@ detect_mac80211() {
 			set wireless.radio${devidx}.band=${mode_band}
 			set wireless.radio${devidx}.htmode=$htmode
 			set wireless.radio${devidx}.num_global_macaddr=8
+			${scanning}
 			set wireless.radio${devidx}.disabled=1
 
 			set wireless.default_radio${devidx}=wifi-iface
