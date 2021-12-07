@@ -41,6 +41,7 @@ ovsdb_table_t table_Wifi_VIF_Config;
 ovsdb_table_t table_Wifi_Inet_Config;
 ovsdb_table_t table_Node_Config;
 
+static bool full_config = false;
 unsigned int radproxy_apc = 0;
 
 static struct uci_package *wireless;
@@ -460,32 +461,34 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 {
 	blob_buf_init(&b, 0);
 	blob_buf_init(&del, 0);
-
 	char phy[6];
 	char ifname[8];
-	int freq = 0;
-	char *mode = NULL;
 	struct mode_map *m;
 
 	strncpy(ifname, rconf->if_name, sizeof(ifname));
 	strncpy(phy, target_map_ifname(ifname), sizeof(phy));
+
+	if (full_config && !changed->channel)
+		full_config = false;
 
 	if (changed->channel && rconf->channel) {
 		/* If radio channel config has changed then rebalance channel,
 		 * if not, that means the channel state changed due to a 
 		 * radar detection and shall remain in the backup channel */
 		if (is_cloud_channel_change(rconf) == 0) {
-			if(rrm_radio_rebalance_channel(rconf) == 0) {
+			/* In case of full config push, do not send CSA as hostapd
+			 * is anyway going to reload with reload_config script detecting
+			 * the UCI change. This would help avoid back to back channel switch.
+			 */
+			if (full_config) {
+				LOGD("channel change due to full config push. New channel is %d", rconf->channel);
 				blobmsg_add_u32(&b, "channel", rconf->channel);
 				radio_fixup_set_primary_chan(rconf->if_name, rconf->channel);
-
-				/* Update the ht_mode in UCI if we downgraded due to channel change */
-				freq = ieee80211_channel_to_frequency(rconf->channel);
-				mode = get_max_channel_bw_channel(freq,	rconf->ht_mode);
-				if (strncmp(mode, rconf->ht_mode, 4)) {
-					m = mode_map_get_uci(rconf->freq_band, mode, rconf->hw_mode);
-					blobmsg_add_string(&b, "htmode", m->ucihtmode);
-				}
+				full_config = false;
+			} else if (rrm_radio_rebalance_channel(rconf) == 0) {
+				LOGD("channel change due to RRM rebalancing. New channel is %d", rconf->channel);
+				blobmsg_add_u32(&b, "channel", rconf->channel);
+				radio_fixup_set_primary_chan(rconf->if_name, rconf->channel);
 			}
 		}
 	}
@@ -554,7 +557,7 @@ bool target_radio_config_set2(const struct schema_Wifi_Radio_Config *rconf,
 		blobmsg_add_u32(&b, "beacon_int", beacon_int);
 	}
 
-	if ((changed->ht_mode) || (changed->hw_mode) || (changed->freq_band)) {
+	if ((changed->channel || changed->ht_mode) || (changed->hw_mode) || (changed->freq_band)) {
 		int channel_freq;
 		char buffer[8];
 		FILE *confFile_p;
@@ -1236,6 +1239,7 @@ static void callback_Wifi_Inet_Config(ovsdb_update_monitor_t *mon,
 		struct schema_Wifi_Inet_Config *old_rec,
 		struct schema_Wifi_Inet_Config *iconf)
 {
+	full_config = true;
 	set_config_apply_timeout(mon);
 }
 
