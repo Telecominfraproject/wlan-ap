@@ -278,36 +278,61 @@ bool target_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
 
 bool target_stats_survey_convert(radio_entry_t *radio_cfg, radio_scan_type_t scan_type,
 				 target_survey_record_t *data_new, target_survey_record_t *data_old,
-				 dpp_survey_record_t *survey_record)
+				 dpp_survey_record_t *survey_record, int sampling_interval,
+				 int scan_interval, bool for_report)
 {
 	target_survey_record_t delta;
 
 	if (data_new->info.chan != data_old->info.chan) {
 		/* Do not consider the old channel's data */
 		memset(data_old, 0, sizeof(*data_old));
-	} else if ((data_new->duration_ms <= data_old->duration_ms) &&
-			(data_new->chan_busy <= data_old->chan_busy)) {
-		/*
-		 * Take care of survey data from CHAN_INFO events which are Read-On-Clear
-		 * in nature, whereas survey data from BSS_CHAN_INFO events are Read only.
-		 * Chan_info event down in the driver updates only the duration, noise floor
-		 * and the chan_busy data.
-		 */
-		data_new->duration_ms += data_old->duration_ms;
-		data_new->chan_busy += data_old->chan_busy;
 	}
+#if 0
+	else if ((data_new->duration_ms <= data_old->duration_ms) &&
+			(data_new->chan_busy <= data_old->chan_busy)) {
+		LOGD("target_stats_survey_convert: for_report:%d, scan_type:%d, chan:%d,"
+			"oldSurveyP:%p, newChanDur:%llu, oldDur:%llu, newBusy:%llu, oldBusy:%llu,"
+			" new_nf:%u, old_nf:%u, scInt:%d\n",
+			for_report, scan_type, data_new->info.chan, data_old, data_new->duration_ms,
+			data_old->duration_ms, data_new->chan_busy, data_old->chan_busy,
+			data_new->chan_noise, data_old->chan_noise, scan_interval);
 
+		if (((scan_type == 2) && (data_new->duration_ms <= 150)) ||
+			((scan_type == 3) && (data_new->duration_ms <= (uint64_t)scan_interval))) {
+			/*
+			 * Take care of survey data from CHAN_INFO events which are Read-On-Clear
+			 * in nature, whereas survey data from BSS_CHAN_INFO events are Read only.
+			 * Chan_info event down in the driver updates only the duration, noise floor
+			 * and the chan_busy data.
+			 */
+			data_new->duration_ms += data_old->duration_ms;
+			data_new->chan_busy += data_old->chan_busy;
+		} else if (data_new->duration_ms != data_old->duration_ms) {
+			/* Counters might have been reset due to wifi down/up */
+			memset(data_old, 0, sizeof(*data_old));
+		}
+	}
+#endif
 
-	LOGD("Survey convert scan_type %d chan %d duration_new:%llu duration_old:%llu "
-	     "busy_new %llu busy_old:%llu tx_new %llu tx_old:%llu rx_new %llu rx_old:%llu "
-	     "rx_self_new %llu rx_self_old:%llu channel_bandwidth:%llu",
-	     scan_type, data_new->info.chan, data_new->duration_ms, data_old->duration_ms,
-	     data_new->chan_busy, data_old->chan_busy, data_new->chan_tx, data_old->chan_tx,
-	     data_new->chan_rx, data_old->chan_rx, data_new->chan_self, data_old->chan_self, data_new->chan_width);
+	LOGD("Survey convert for_report:%d scan_type %d chan %d old_survey_p:%p, dur_new:%llu"
+		" dur_old:%llu diffDur:%llu busy_new %llu busy_old:%llu tx_new %llu tx_old:%llu"
+		" rx_new %llu rx_old:%llu rx_self_new %llu rx_self_old:%llu channel_bw:%llu\n"
+		" new_nf:%u old_nf:%u",
+		for_report, scan_type, data_new->info.chan, data_old, data_new->duration_ms,
+		data_old->duration_ms, (data_new->duration_ms - data_old->duration_ms),
+		data_new->chan_busy, data_old->chan_busy, data_new->chan_tx, data_old->chan_tx,
+		data_new->chan_rx, data_old->chan_rx, data_new->chan_self, data_old->chan_self,
+		data_new->chan_width, data_new->chan_noise, data_old->chan_noise);
 
 	memset(&delta, 0, sizeof(delta));
 
 	delta.duration_ms = DELTA(data_new->duration_ms, data_old->duration_ms);
+
+	if (!delta.duration_ms || (delta.duration_ms > (uint32_t)sampling_interval*1000))
+		delta.duration_ms = (uint32_t)sampling_interval*1000;
+	if (!data_new->chan_noise)
+		data_new->chan_noise = data_old->chan_noise;
+
 	delta.chan_busy = DELTA(data_new->chan_busy, data_old->chan_busy);
 	delta.chan_busy_ext = DELTA(data_new->chan_busy_ext, data_old->chan_busy_ext);
 	delta.chan_tx = DELTA(data_new->chan_tx, data_old->chan_tx);
