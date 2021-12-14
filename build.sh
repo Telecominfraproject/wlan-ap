@@ -61,6 +61,10 @@ WF194C)
 	TARGET=wf194c
 	WIFI=wifi-cs1
 	;;
+WF194C4)
+	TARGET=wf194c4
+	WIFI=wifi-cs1
+	;;
 WF610D)
 	TARGET=wf610d
 	;;
