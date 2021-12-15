@@ -612,7 +612,11 @@ int nl80211_scan_trigger(struct nl_call_param *nl_call_param, uint32_t *chan_lis
 	if ((scan_type == RADIO_SCAN_TYPE_OFFCHAN) && dwell_time)
 		nla_put_u16(msg, NL80211_ATTR_MEASUREMENT_DURATION, dwell_time);
 
-	nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, requested_freq);
+	if ((scan_type == RADIO_SCAN_TYPE_OFFCHAN) && (chan_list[0] != oper_chan.channel)) {
+		nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, requested_freq);
+	} else if ((scan_type == RADIO_SCAN_TYPE_ONCHAN) && (chan_list[0] == oper_chan.channel)) {
+		nla_put_u32(msg, NL80211_ATTR_WIPHY_FREQ, requested_freq);
+	}
 
 	if (requested_freq > 5000) {
 		switch(oper_chan.bandwidth)

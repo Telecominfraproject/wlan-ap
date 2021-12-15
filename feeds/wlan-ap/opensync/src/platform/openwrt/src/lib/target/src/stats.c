@@ -27,6 +27,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "target.h"
 #include <stdio.h>
 #include <stdbool.h>
+#include <math.h>
 
 #include "nl80211.h"
 #include "phy.h"
@@ -192,14 +193,10 @@ void target_survey_record_free(target_survey_record_t *result)
 		free(result);
 }
 
-#define SURVEY_RADIOS 3
-static ds_dlist_t onChanList[SURVEY_RADIOS];
-static ds_dlist_t offChanList[SURVEY_RADIOS];
-
 bool target_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
-			     uint32_t chan_num, radio_scan_type_t scan_type,
-			     target_stats_survey_cb_t *survey_cb,
-			     ds_dlist_t *survey_list, void *survey_ctx)
+							 uint32_t chan_num, radio_scan_type_t scan_type,
+							 target_stats_survey_cb_t *survey_cb,
+							 ds_dlist_t *survey_list, void *survey_ctx)
 {
 	char ifName[10];
 	int val=0;
@@ -209,60 +206,36 @@ bool target_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
 	sprintf(ifName,"wlan%d",radio);
 	ds_dlist_t raw_survey_list = DS_DLIST_INIT(target_survey_record_t, node);
 	target_survey_record_t *survey;
+	uint32_t oper_chan = 0;
 	struct nl_call_param nl_call_param = {
 		.ifname = ifName,
 		.type = radio_cfg->type,
 		.list = &raw_survey_list,
 	};
 	bool ret = true;
-	ds_dlist_t *onchan_list;
-	ds_dlist_t *offchan_list;
-
-	if(radio<SURVEY_RADIOS) {
-		onchan_list=&onChanList[radio];
-		offchan_list=&offChanList[radio];
-	} else {
-		return false;
-	}
 
 	if (nl80211_get_survey(&nl_call_param) < 0)
 		ret = false;
-	if (scan_type == RADIO_SCAN_TYPE_ONCHAN) {
-		while (!ds_dlist_is_empty(onchan_list)) {
-			survey = ds_dlist_head(onchan_list);
-			ds_dlist_remove(onchan_list, survey);
-			get_on_channel_bandwidth(radio_cfg, &channel_bandwidth);
-			survey->chan_width = channel_bandwidth;
-			ds_dlist_insert_tail(survey_list, survey);
-		}
-	} else {
-		while (!ds_dlist_is_empty(offchan_list)) {
-			survey = ds_dlist_head(offchan_list);
-			ds_dlist_remove(offchan_list, survey);
-			ds_dlist_insert_tail(survey_list, survey);
-		}
-	}
+	if (!target_stats_channel_get(nl_call_param.ifname, &oper_chan))
+		ret = false;
+
 	while (!ds_dlist_is_empty(&raw_survey_list)) {
 		survey = ds_dlist_head(&raw_survey_list);
 		ds_dlist_remove(&raw_survey_list, survey);
 		LOGD("Survey entry dur %llu busy %llu tx %llu rx %llu rx_self %llu chan %d type %d",
 				survey->duration_ms, survey->chan_busy, survey->chan_tx, survey->chan_rx,
 				survey->chan_self, survey->info.chan, scan_type);
-		if ((scan_type == RADIO_SCAN_TYPE_ONCHAN) && (survey->duration_ms != 0)) {
-			if (survey->info.chan == chan_list[0]) {
+
+		if (survey->info.chan == chan_list[0] && (survey->duration_ms != 0)) {
+			if ((scan_type == RADIO_SCAN_TYPE_ONCHAN) && survey->info.chan == oper_chan) {
 				get_on_channel_bandwidth(radio_cfg, &channel_bandwidth);
 				survey->chan_width = channel_bandwidth;
 				ds_dlist_insert_tail(survey_list, survey);
-			} else {
-				ds_dlist_insert_tail(offchan_list, survey);
-			}
-		} else if ((scan_type != RADIO_SCAN_TYPE_ONCHAN) && (survey->duration_ms != 0)) {
-			if (!survey->chan_in_use) {
+			} else if ((scan_type == RADIO_SCAN_TYPE_OFFCHAN) && survey->info.chan != oper_chan) {
 				ds_dlist_insert_tail(survey_list, survey);
 			} else {
-				get_on_channel_bandwidth(radio_cfg, &channel_bandwidth);
-				survey->chan_width = channel_bandwidth;
-				ds_dlist_insert_tail(onchan_list, survey);
+				target_survey_record_free(survey);
+				survey = NULL;
 			}
 		} else {
 			target_survey_record_free(survey);
@@ -270,10 +243,10 @@ bool target_stats_survey_get(radio_entry_t *radio_cfg, uint32_t *chan_list,
 		}
 	}
 	(*survey_cb)(survey_list, survey_ctx, ret);
-	return ret;
+	return true;
 }
 
-#define PERCENT(v1, v2) (v2 > 0 ? ((v1 > v2) ? 100 : (v1*100/v2)) : 0)
+#define PERCENT(v1, v2) round((v2 > 0 ? ((v1 > v2) ? 100 : ((float)v1*100/(float)v2)) : 0))
 #define DELTA(n, p) ((n) < (p) ? (n) : (n) - (p))
 
 bool target_stats_survey_convert(radio_entry_t *radio_cfg, radio_scan_type_t scan_type,
@@ -321,7 +294,11 @@ bool target_stats_survey_convert(radio_entry_t *radio_cfg, radio_scan_type_t sca
 	survey_record->chan_rx       = PERCENT(delta.chan_rx, delta.duration_ms);
 	survey_record->chan_busy_ext = PERCENT(delta.chan_busy_ext, delta.duration_ms);
 	survey_record->chan_busy     = PERCENT(delta.chan_busy, delta.duration_ms);
-	survey_record->chan_noise    = data_new->chan_noise;
+	if (0 == data_new->chan_noise) {
+		survey_record->chan_noise = data_old->chan_noise;
+	} else {
+		survey_record->chan_noise = data_new->chan_noise;
+	}
 	survey_record->duration_ms   = delta.duration_ms;
 
 	return true;
@@ -563,11 +540,5 @@ bool target_stats_capacity_convert(target_capacity_data_t *capacity_new,
 }
 static __attribute__((constructor)) void sm_init(void)
 {
-	int i;
 	stats_nl80211_init();
-	for(i=0; i<SURVEY_RADIOS; i++)
-	{
-		ds_dlist_init(&onChanList[i],target_survey_record_t, node);
-		ds_dlist_init(&offChanList[i],target_survey_record_t, node);
-	}
 }

@@ -74,8 +74,8 @@ typedef struct ssid_list {
 } ssid_list_t;
 
 typedef struct channel_info {
-	int channel;
-	int bandwidth;
+	uint32_t channel;
+	uint32_t bandwidth;
 } channel_info_t;
 
 extern int stats_nl80211_init(void);
