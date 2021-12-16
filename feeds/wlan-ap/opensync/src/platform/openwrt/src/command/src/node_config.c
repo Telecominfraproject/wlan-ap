@@ -360,7 +360,8 @@ static char* get_phy_map_led_info(char* wifi)
 	blob_buf_init(&b, 0);
 
 	if (!blobmsg_add_json_from_file(&b, DEFAULT_BOARD_JSON)) {
-		return NULL;
+		LOGD("Failed to load board.json file");
+		goto out;
 	}
 	if (board_info != NULL) {
 		free(board_info);
@@ -369,22 +370,25 @@ static char* get_phy_map_led_info(char* wifi)
 	cur = config_find_blobmsg_attr(b.head, "led", BLOBMSG_TYPE_TABLE);
 	if (!cur) {
 		LOGD("Failed to find led objet in board.json file");
-		return NULL;
+		goto out;
 	}
 	board_info = blob_memdup(cur);
 	if (!board_info)
-		return NULL;
+		goto out;
 	cur = config_find_blobmsg_attr(board_info, wifi, BLOBMSG_TYPE_TABLE);
 	if (!cur) {
 		LOGD("Failed to find %s objet in board.json file", wifi);
-		return NULL;
+		goto out;
 	}
 	cur = config_find_blobmsg_attr(cur, "trigger", BLOBMSG_TYPE_STRING);
 	if (!cur) {
 		LOGD("Failed to find trigger in board.json file");
-		return NULL;
+		goto out;
 	}
 	return blobmsg_get_string(cur);
+
+out:
+	return "none";
 }
 
 static void set_primary_led_color(char *ap_name, char *led_section, char *color)
