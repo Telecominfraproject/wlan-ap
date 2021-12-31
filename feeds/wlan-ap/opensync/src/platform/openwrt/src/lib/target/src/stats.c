@@ -258,18 +258,7 @@ bool target_stats_survey_convert(radio_entry_t *radio_cfg, radio_scan_type_t sca
 	if (data_new->info.chan != data_old->info.chan) {
 		/* Do not consider the old channel's data */
 		memset(data_old, 0, sizeof(*data_old));
-	} else if ((data_new->duration_ms <= data_old->duration_ms) &&
-			(data_new->chan_busy <= data_old->chan_busy)) {
-		/*
-		 * Take care of survey data from CHAN_INFO events which are Read-On-Clear
-		 * in nature, whereas survey data from BSS_CHAN_INFO events are Read only.
-		 * Chan_info event down in the driver updates only the duration, noise floor
-		 * and the chan_busy data.
-		 */
-		data_new->duration_ms += data_old->duration_ms;
-		data_new->chan_busy += data_old->chan_busy;
 	}
-
 
 	LOGD("Survey convert scan_type %d chan %d duration_new:%llu duration_old:%llu "
 	     "busy_new %llu busy_old:%llu tx_new %llu tx_old:%llu rx_new %llu rx_old:%llu "
