@@ -59,3 +59,19 @@ Kernel configs for ath11k support specific to ipq807x and IPQ60xx
 endef
 
 $(eval $(call KernelPackage,qrtr_mproc))
+
+define KernelPackage/bt_tty
+  TITLE:= BT Inter-processor Communication
+  DEPENDS+= @TARGET_ipq807x
+  KCONFIG:= \
+          CONFIG_QTI_BT_TTY=y \
+          CONFIG_QCOM_MDT_LOADER=y
+  FILES:= $(LINUX_DIR)/drivers/soc/qcom/bt/bt_rproc.ko
+  AUTOLOAD:=$(call AutoLoad,53,bt_rproc,1)
+endef
+
+define KernelPackage/bt_tty/description
+BT Interprocessor Communication support specific to IPQ50xx
+endef
+
+$(eval $(call KernelPackage,bt_tty))
