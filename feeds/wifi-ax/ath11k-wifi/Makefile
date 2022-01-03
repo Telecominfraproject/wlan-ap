@@ -63,6 +63,11 @@ $(call Package/ath11k-wifi-default)
     TITLE:=board-2.bin for QCOM IPQ50xx eval kits
 endef
 
+define Package/ath11k-wifi-qcom-qcn9000
+$(call Package/ath11k-wifi-default)
+    TITLE:=board-2.bin for QCOM QCN9000 eval kits
+endef
+
 define Package/ath11k-wifi-qcom-ipq6122
 $(call Package/ath11k-wifi-default)
     TITLE:=board-2.bin for QCOM IPQ6122 eval kits
@@ -142,6 +147,11 @@ define Package/ath11k-wifi-qcom-ipq6122/install
 	$(INSTALL_DATA) ./board-2.bin.IPQ6122 $(1)/lib/firmware/ath11k/IPQ6122/hw1.0/board-2.bin
 endef
 
+define Package/ath11k-wifi-qcom-qcn9000/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/QCN9074/hw1.0/
+	$(INSTALL_DATA) ./board-2.bin.QCN9000 $(1)/lib/firmware/ath11k/QCN9074/hw1.0/board-2.bin
+endef
+
 define Package/ath11k-wifi-cig-wf196_6g/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/QCN9074/hw1.0/
 	$(INSTALL_DATA) ./board-cig-wf196_6g.bin.QCN9074 $(1)/lib/firmware/ath11k/QCN9074/hw1.0/board.bin
@@ -166,4 +176,5 @@ $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq5018))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq6122))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq8074))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq6018))
+$(eval $(call BuildPackage,ath11k-wifi-qcom-qcn9000))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g))
