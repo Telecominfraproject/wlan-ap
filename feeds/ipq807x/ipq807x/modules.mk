@@ -59,3 +59,39 @@ Kernel configs for ath11k support specific to ipq807x and IPQ60xx
 endef
 
 $(eval $(call KernelPackage,qrtr_mproc))
+
+define KernelPackage/bt_tty
+  TITLE:= BT Inter-processor Communication
+  DEPENDS+= @TARGET_ipq807x
+  KCONFIG:= \
+          CONFIG_QTI_BT_TTY=y \
+          CONFIG_QCOM_MDT_LOADER=y
+  FILES:= $(LINUX_DIR)/drivers/soc/qcom/bt/bt_rproc.ko
+  AUTOLOAD:=$(call AutoLoad,53,bt_rproc,1)
+endef
+
+define KernelPackage/bt_tty/description
+BT Interprocessor Communication support specific to IPQ50xx
+endef
+
+$(eval $(call KernelPackage,bt_tty))
+
+define KernelPackage/usb-phy-ipq5018
+  TITLE:=DWC3 USB PHY driver for IPQ5018
+  DEPENDS:=@TARGET_ipq807x_ipq50xx
+  KCONFIG:= \
+        CONFIG_USB_QCA_M31_PHY \
+        CONFIG_PHY_IPQ_UNIPHY_USB
+  FILES:= \
+        $(LINUX_DIR)/drivers/usb/phy/phy-qca-m31.ko \
+        $(LINUX_DIR)/drivers/phy/phy-qca-uniphy.ko
+  AUTOLOAD:=$(call AutoLoad,45,phy-qca-m31 phy-qca-uniphy,1)
+  $(call AddDepends/usb)
+endef
+
+define KernelPackage/usb-phy-ipq5018/description
+ This driver provides support for the USB PHY drivers
+ within the IPQ5018 SoCs.
+endef
+
+$(eval $(call KernelPackage,usb-phy-ipq5018))
