@@ -17,6 +17,7 @@ DEFAULT_PACKAGES += kmod-qca-nss-dp kmod-qca-ssdk swconfig \
 	kmod-usb-phy-ipq807x kmod-usb-dwc3-of-simple \
 	kmod-ath11k-ahb kmod-qrtr_mproc wpad \
 	kmod-gpio-button-hotplug \
-	qca-thermald-10.4 qca-ssdk-shell kmod-qca-nss-drv-bridge-mgr
+	qca-thermald-10.4 qca-ssdk-shell kmod-qca-nss-drv-bridge-mgr \
+	uboot-envtools
 
 $(eval $(call BuildTarget))
