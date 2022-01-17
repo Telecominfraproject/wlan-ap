@@ -1,4 +1,4 @@
-#!/bin.sh
+#!/bin/sh
 
 uci add system certificates
 uci set system.@certificates[-1].key=/etc/ucentral/key.pem
