@@ -6,7 +6,7 @@ PKG_RELEASE:=1
 PKG_SOURCE_URL=https://github.com/blogic/ucentral-schema.git
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2022-01-17
-PKG_SOURCE_VERSION:=311bf9813564a790f3f6deb3055a501fb152723a
+PKG_SOURCE_VERSION:=f926153c5f8ac1ff6d6b1ed76e3540220f64efed
 
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=BSD-3-Clause
@@ -17,6 +17,7 @@ define Package/ucentral-schema
   SECTION:=ucentral
   CATEGORY:=uCentral
   TITLE:=OpenWrt uCentral schema
+  DEPENDS+= +ucode-mod-nl80211
 endef
 
 define Package/ucentral-recovery
