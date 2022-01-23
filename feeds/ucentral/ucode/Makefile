@@ -13,8 +13,8 @@ PKG_RELEASE:=1
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL=https://github.com/jow-/ucode.git
 PKG_SOURCE_DATE:=2021-07-30
-PKG_SOURCE_VERSION:=0f022aae0c6008fe6f2219871d32dca8b9105066
-PKG_MIRROR_HASH:=
+PKG_SOURCE_VERSION:=03b6a8efc1834a4114f0d11e1a7cecff3242b305
+PKG_MIRROR_HASH:=6af37293d6d7023f30728c76a02b4e48d323262a45058410760a30256e0dbe2b
 PKG_MAINTAINER:=Jo-Philipp Wich <jo@mein.io>
 PKG_LICENSE:=ISC
 
@@ -33,7 +33,7 @@ endef
 
 define Package/ucode
   $(Package/ucode/default)
-  DEPENDS:=+libucode
+  DEPENDS:=+libucode 
 endef
 
 define Package/ucode/description
@@ -110,6 +110,33 @@ define Package/ucode-mod-uci/description
 endef
 
 
+define Package/ucode-mod-nl80211
+  $(Package/ucode/default)
+  TITLE+= (nl80211 module)
+  DEPENDS:=ucode +libnl-tiny +kmod-mac80211
+endef
+
+define Package/ucode-mod-nl80211/description
+ The nl80211 module allows templates to send and receive nl80211 messages..
+endef
+
+
+define Package/ucode-mod-struct
+  $(Package/ucode/default)
+  TITLE+= (struct module)
+  DEPENDS:=ucode
+endef
+
+define Package/ucode-mod-struct/description
+ The struct module allows templates to unpack binary buffers.
+endef
+
+
+define Build/Prepare
+	$(Build/Prepare/Default)
+	$(CP) $(STAGING_DIR)/usr/include/mac80211/uapi/linux/nl80211.h $(PKG_BUILD_DIR)/nl80211_copy.h
+endef
+
 define Build/InstallDev
 	$(INSTALL_DIR) $(1)/usr/lib $(1)/usr/include/ucode
 	$(CP) $(PKG_INSTALL_DIR)/usr/include/ucode/*.h $(1)/usr/include/ucode/
@@ -152,6 +179,16 @@ define Package/ucode-mod-uci/install
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/uci.so $(1)/usr/lib/ucode/
 endef
 
+define Package/ucode-mod-nl80211/install
+	$(INSTALL_DIR) $(1)/usr/lib/ucode
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/nl80211.so $(1)/usr/lib/ucode/
+endef
+
+define Package/ucode-mod-struct/install
+	$(INSTALL_DIR) $(1)/usr/lib/ucode
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/struct.so $(1)/usr/lib/ucode/
+endef
+
 
 $(eval $(call BuildPackage,ucode))
 $(eval $(call BuildPackage,libucode))
@@ -160,3 +197,5 @@ $(eval $(call BuildPackage,ucode-mod-resolv))
 $(eval $(call BuildPackage,ucode-mod-math))
 $(eval $(call BuildPackage,ucode-mod-ubus))
 $(eval $(call BuildPackage,ucode-mod-uci))
+$(eval $(call BuildPackage,ucode-mod-nl80211))
+$(eval $(call BuildPackage,ucode-mod-struct))
