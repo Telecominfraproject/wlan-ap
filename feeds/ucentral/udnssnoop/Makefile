@@ -9,7 +9,7 @@ PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_SOURCE_URL=https://github.com/blogic/udnssnoop.git
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2021-04-12
-PKG_SOURCE_VERSION:=852a5246af43d321905979fc850e654718a56061
+PKG_SOURCE_VERSION:=67e1e5f0bfc12222aa59c54e7066b1c00a680e56
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
