@@ -29,6 +29,7 @@ ALLWIFIBOARDS:= \
 	cig-wf194c \
 	cig-wf194c4 \
 	cig-wf196 \
+	cybertan-eww622-a1 \
 	edgecore-eap101 \
 	sercomm-wallaby \
 	edgecore-eap102 \
@@ -78,11 +79,17 @@ define ath11k-wifi-install-one-to
 endef
 
 define ath11k-wifi-install-one
+  $(if $(filter $(suffix $(1)),.IPQ5018),\
+    $(call ath11k-wifi-install-one-to,$(1),$(2),ath11k/IPQ5018/hw1.0/),\
+  )
   $(if $(filter $(suffix $(1)),.IPQ6018),\
     $(call ath11k-wifi-install-one-to,$(1),$(2),ath11k/IPQ6018/hw1.0/),\
   )
   $(if $(filter $(suffix $(1)),.IPQ8074),\
     $(call ath11k-wifi-install-one-to,$(1),$(2),ath11k/IPQ8074/hw2.0/),\
+  )
+  $(if $(filter $(suffix $(1)),.QCN9074),\
+    $(call ath11k-wifi-install-one-to,$(1),$(2),ath11k/QCN9074/hw1.0/),\
   )
 
 endef
@@ -145,6 +152,7 @@ $(eval $(call generate-ath11k-wifi-package,cig-wf188n,Cigtech WF188n))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c,Cigtech WF194c))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c4,Cigtech WF194c4))
 $(eval $(call generate-ath11k-wifi-package,cig-wf196,Cigtech WF196))
+$(eval $(call generate-ath11k-wifi-package,cybertan-eww622-a1,CyberTan EWW622 A1))
 $(eval $(call generate-ath11k-wifi-package,sercomm-wallaby,Sercomm Kiwi))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018,Wallys DR6018))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018-v4,Wallys DR6018 V4))
