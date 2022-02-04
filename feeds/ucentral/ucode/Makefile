@@ -132,6 +132,17 @@ define Package/ucode-mod-struct/description
 endef
 
 
+define Package/ucode-mod-rtnl
+  $(Package/ucode/default)
+  TITLE+= (rtnl module)
+  DEPENDS:=ucode +libnl-tiny
+endef
+
+define Package/ucode-mod-struct/description
+ The rtnl module allows templates to send and receive rtnl messages..
+endef
+
+
 define Build/Prepare
 	$(Build/Prepare/Default)
 	$(CP) $(STAGING_DIR)/usr/include/mac80211/uapi/linux/nl80211.h $(PKG_BUILD_DIR)/nl80211_copy.h
@@ -189,6 +200,11 @@ define Package/ucode-mod-struct/install
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/struct.so $(1)/usr/lib/ucode/
 endef
 
+define Package/ucode-mod-rtnl/install
+	$(INSTALL_DIR) $(1)/usr/lib/ucode
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/rtnl.so $(1)/usr/lib/ucode/
+endef
+
 
 $(eval $(call BuildPackage,ucode))
 $(eval $(call BuildPackage,libucode))
@@ -199,3 +215,4 @@ $(eval $(call BuildPackage,ucode-mod-ubus))
 $(eval $(call BuildPackage,ucode-mod-uci))
 $(eval $(call BuildPackage,ucode-mod-nl80211))
 $(eval $(call BuildPackage,ucode-mod-struct))
+$(eval $(call BuildPackage,ucode-mod-rtnl))
