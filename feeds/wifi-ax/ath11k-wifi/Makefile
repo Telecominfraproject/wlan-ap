@@ -36,7 +36,8 @@ ALLWIFIBOARDS:= \
 	wallys-dr6018 \
 	wallys-dr6018-v4 \
 	tplink-ex227 \
-	tplink-ex447
+	tplink-ex447 \
+	gl-ax1800
 
 ALLWIFIPACKAGES:=$(foreach BOARD,$(ALLWIFIBOARDS),ath11k-wifi-$(BOARD))
 
@@ -76,6 +77,11 @@ endef
 define Package/ath11k-wifi-cig-wf196_6g
 $(call Package/ath11k-wifi-default)
     TITLE:=cig-wf196 6G bdf
+endef
+
+define Package/ath11k-wifi-gl-ax1800
+$(call Package/ath11k-wifi-default)
+    TITLE:=gl-ax1800 bdf
 endef
 
 define ath11k-wifi-install-one-to
@@ -155,6 +161,11 @@ endef
 define Package/ath11k-wifi-cig-wf196_6g/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/QCN9074/hw1.0/
 	$(INSTALL_DATA) ./board-cig-wf196_6g.bin.QCN9074 $(1)/lib/firmware/ath11k/QCN9074/hw1.0/board.bin
+endef
+
+define Package/ath11k-wifi-gl-ax1800/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-gl-ax1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
 endef
 
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
