@@ -119,6 +119,7 @@ hostapd_common_add_device_config() {
 	config_add_int maxassoc
 
 	config_add_string acs_chan_bias
+	config_add_boolean acs_exclude_dfs
 	config_add_array hostapd_options
 
 	config_add_int airtime_mode
@@ -137,7 +138,7 @@ hostapd_prepare_device_config() {
 	json_get_vars country country3 country_ie beacon_int:100 dtim_period:2 doth require_mode legacy_rates \
 		acs_chan_bias local_pwr_constraint spectrum_mgmt_required airtime_mode cell_density \
 		rts_threshold beacon_rate rssi_reject_assoc_rssi rssi_ignore_probe_request maxassoc \
-		multiple_bssid he_co_locate rnr_beacon ema
+		multiple_bssid he_co_locate rnr_beacon ema acs_exclude_dfs
 
 	hostapd_set_log_options base_cfg
 
@@ -151,6 +152,7 @@ hostapd_prepare_device_config() {
 	set_default rnr_beacon 0
 	set_default multiple_bssid 0
 	set_default ema 0
+	set_default acs_exclude_dfs 0
 
 	[ -n "$country" ] && {
 		append base_cfg "country_code=$country" "$N"
@@ -247,6 +249,7 @@ hostapd_prepare_device_config() {
 	[ "$he_co_locate" -gt 0 ] && append base_cfg "he_co_locate=$he_co_locate" "$N"
 	[ "$multiple_bssid" -gt 0 ] && append base_cfg "multiple_bssid=$multiple_bssid" "$N"
 	[ "$ema" -gt 0 ] && append base_cfg "ema=$ema" "$N"
+	[ "$acs_exclude_dfs" -gt 0 ] && append base_cfg "acs_exclude_dfs=$acs_exclude_dfs" "$N"
 
 	json_get_values opts hostapd_options
 	for val in $opts; do
