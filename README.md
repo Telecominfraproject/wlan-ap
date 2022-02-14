@@ -12,7 +12,7 @@ First we need to clone and setup our tree. This will result in an openwrt/.
 Next we need to select the profile and base package selection. This setup will install the feeds, packages and generate the .config file.
 ```
 cd openwrt
-./scripts/gen_config.py ea8300
+./scripts/gen_config.py linksys_ea8300
 ```
 Finally we can build the tree.
 ```
