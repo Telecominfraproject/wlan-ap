@@ -24,6 +24,7 @@ platform_check_image() {
 	cig,wf188n|\
 	cig,wf194c|\
 	cig,wf194c4|\
+	cig,wf196|\
 	cybertan,eww622-a1|\
 	wallys,dr6018|\
 	wallys,dr6018-v4|\
@@ -57,6 +58,7 @@ platform_do_upgrade() {
 	cig,wf188n|\
 	cig,wf194c|\
 	cig,wf194c4|\
+	cig,wf196|\
 	cybertan,eww622-a1|\
 	hfcl,ion4xi|\
 	hfcl,ion4xe|\
