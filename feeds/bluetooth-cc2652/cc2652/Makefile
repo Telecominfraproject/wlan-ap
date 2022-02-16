@@ -37,6 +37,9 @@ define Package/cc2652/install
 
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_BIN) ./files/tisbl.config $(1)/etc/config/tisbl
+
+	$(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_BIN) ./files/tisbl.defaults $(1)/etc/uci-defaults
 endef
 
 $(eval $(call BuildPackage,cc2652))

@@ -33,6 +33,7 @@ ALLWIFIBOARDS:= \
 	edgecore-eap101 \
 	sercomm-wallaby \
 	edgecore-eap102 \
+	edgecore-eap104 \
 	wallys-dr6018 \
 	wallys-dr6018-v4 \
 	tplink-ex227 \
@@ -95,6 +96,9 @@ define ath11k-wifi-install-one
   )
   $(if $(filter $(suffix $(1)),.QCN9074),\
     $(call ath11k-wifi-install-one-to,$(1),$(2),ath11k/QCN9074/hw1.0/),\
+  )
+  $(if $(filter $(suffix $(1)),.QCN6122),\
+    $(call ath11k-wifi-install-one-to,$(1),$(2),ath11k/qcn6122/hw1.0/),\
   )
 
 endef
@@ -168,6 +172,7 @@ $(eval $(call generate-ath11k-wifi-package,wallys-dr6018,Wallys DR6018))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018-v4,Wallys DR6018 V4))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap101,EdgeCore EAP101))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap102,Edgecore EAP102))
+$(eval $(call generate-ath11k-wifi-package,edgecore-eap104,Edgecore EAP104))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex227,TP-Link EX227))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex447,TP-Link EX447))
 

@@ -9,6 +9,15 @@ define Device/cybertan_eww622_a1
 endef
 TARGET_DEVICES += cybertan_eww622_a1
 
+define Device/edgecore_eap104
+  DEVICE_TITLE := EdgeCore EAP104
+  DEVICE_DTS := qcom-ipq5018-eap104
+  SUPPORTED_DEVICES := edgecore,eap104
+  DEVICE_PACKAGES := ath11k-wifi-edgecore-eap104 ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.5-c1
+endef
+TARGET_DEVICES += edgecore_eap104
+
 define Device/qcom_mp03_1
   DEVICE_TITLE := Qualcomm Maple 03.1
   DEVICE_DTS := qcom-ipq5018-mp03.1
