@@ -727,7 +727,7 @@ hostapd_set_bss_options() {
 			wps_not_configured=1
 			[ "$macfilter" = radius ] && {
 				append_radius_server
-				vlan_possible = 1
+				vlan_possible=1
 			}
 		;;
 		psk|sae|psk-sae)
