@@ -26,6 +26,7 @@ platform_check_image() {
 	cig,wf194c4|\
 	cig,wf196|\
 	cybertan,eww622-a1|\
+	glinet,ax1800|\
 	wallys,dr6018|\
 	wallys,dr6018-v4|\
 	edgecore,eap101|\
@@ -62,6 +63,7 @@ platform_do_upgrade() {
 	cig,wf196|\
 	cybertan,eww622-a1|\
 	edgecore,eap104|\
+	glinet,ax1800|\
 	hfcl,ion4xi|\
 	hfcl,ion4xe|\
 	qcom,ipq6018-cp01|\
