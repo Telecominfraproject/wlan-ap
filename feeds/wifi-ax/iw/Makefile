@@ -13,7 +13,7 @@ PKG_RELEASE:=1
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.xz
 PKG_SOURCE_URL:=https://www.kernel.org/pub/software/network/iw
-PKG_MD5SUM:=7a47d6f749ec69afcaf351166fd12f6f
+PKG_HASH:=293a07109aeb7e36267cf59e3ce52857e9ffae3a6666eb8ac77894b1839fe1f2
 
 PKG_MAINTAINER:=Felix Fietkau <nbd@openwrt.org>
 PKG_LICENSE:=GPL-2.0

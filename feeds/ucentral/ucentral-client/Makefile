@@ -4,6 +4,7 @@ PKG_NAME:=ucentral-client
 PKG_RELEASE:=1
 
 PKG_SOURCE_URL=https://github.com/blogic/ucentral-client.git
+PKG_MIRROR_HASH:=f00e800d97335d088281670aa1b459da1fdd5e4a2927ce280b7d9cb369ebc21a
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2022-01-10
 PKG_SOURCE_VERSION:=e3b71c61e1a07bb3b5fa34fe835fd8f6f708caa3

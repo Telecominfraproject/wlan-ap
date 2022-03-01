@@ -6,6 +6,7 @@ PKG_SOURCE_PROTO:=git
 PKG_BRANCH:=master
 PKG_RELEASE:=2
 PKG_SOURCE_URL:=https://source.codeaurora.org/quic/qsdk/oss/lklm/nss-clients/
+PKG_MIRROR_HASH:=802bf8b2dac8da0549e108b873afd982d127370c07d6574ece71f902eafe7698
 PKG_VERSION:=153998d70fdba508a59a28c13a606032cbf32686
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
