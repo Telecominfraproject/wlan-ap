@@ -16,12 +16,14 @@ wifi config
 
 . /lib/functions.sh
 
+SUFFIX=$(uci get system.@system[0].hostname | tail -c 7 | tr a-f A-F | tr -d '\n')
+
 radio_enable() { 
 	uci set wireless.$1.disabled=0 
 } 
 
 ssid_set() { 
-	uci set wireless.$1.ssid='Maverick' 
+	uci set wireless.$1.ssid=Maverick-${SUFFIX}
 }
 
 delete_forwarding() {
