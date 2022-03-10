@@ -38,7 +38,8 @@ ALLWIFIBOARDS:= \
 	wallys-dr6018 \
 	wallys-dr6018-v4 \
 	tplink-ex227 \
-	tplink-ex447
+	tplink-ex447 \
+	yuncore-ax840
 
 ALLWIFIPACKAGES:=$(foreach BOARD,$(ALLWIFIBOARDS),ath11k-wifi-$(BOARD))
 
@@ -186,6 +187,7 @@ $(eval $(call generate-ath11k-wifi-package,edgecore-eap102,Edgecore EAP102))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap104,Edgecore EAP104))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex227,TP-Link EX227))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex447,TP-Link EX447))
+$(eval $(call generate-ath11k-wifi-package,yuncore-ax840,YunCore AX840))
 
 $(foreach PACKAGE,$(ALLWIFIPACKAGES),$(eval $(call BuildPackage,$(PACKAGE))))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq5018))
