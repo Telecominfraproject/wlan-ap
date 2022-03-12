@@ -82,6 +82,15 @@ define Device/glinet_ax1800
 endef
 TARGET_DEVICES += glinet_ax1800
 
+define Device/glinet_axt1800
+  DEVICE_TITLE := GL-iNet AXT1800
+  DEVICE_DTS := qcom-ipq6018-gl-axt1800
+  SUPPORTED_DEVICES := glinet,axt1800
+  DEVICE_DTS_CONFIG := config@cp03-c1
+  DEVICE_PACKAGES := ath11k-wifi-gl-ax1800 -kmod-usb-dwc3-of-simple kmod-usb-dwc3-qcom kmod-usb3
+endef
+TARGET_DEVICES += glinet_axt1800
+
 define Device/yuncore_ax840
   DEVICE_TITLE := YunCore AX840
   DEVICE_DTS := qcom-ipq6018-yuncore-ax840
