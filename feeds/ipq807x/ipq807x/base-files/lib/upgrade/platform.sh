@@ -1,5 +1,8 @@
 . /lib/functions/system.sh
 
+RAMFS_COPY_BIN='fw_setenv'
+RAMFS_COPY_DATA='/etc/fw_env.config /var/lock/fw_printenv.lock'
+
 qca_do_upgrade() {
         local tar_file="$1"
 
@@ -35,6 +38,7 @@ platform_check_image() {
 	edgecore,eap106|\
 	hfcl,ion4xi|\
 	hfcl,ion4xe|\
+	plasmacloud,pax1800|\
 	tplink,ex227|\
 	tplink,ex447|\
 	yuncore,ax840|\
@@ -84,6 +88,10 @@ platform_do_upgrade() {
 		CI_UBIPART="rootfs1"
 		[ "$(find_mtd_chardev rootfs)" ] && CI_UBIPART="rootfs"
 		nand_upgrade_tar "$1"
+		;;
+	plasmacloud,pax1800)
+		PART_NAME="inactive"
+		platform_do_upgrade_dualboot_datachk "$1"
 		;;
 	esac
 }

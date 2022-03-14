@@ -90,3 +90,17 @@ define Device/yuncore_ax840
   DEVICE_PACKAGES := ath11k-wifi-yuncore-ax840 uboot-env
 endef
 TARGET_DEVICES += yuncore_ax840
+
+define Device/plasmacloud_pax1800
+  DEVICE_TITLE := Plasma Cloud PAX1800
+  DEVICE_DTS := qcom-ipq6018-pax1800
+  SUPPORTED_DEVICES := plasmacloud,pax1800
+  DEVICE_DTS_CONFIG := config@cp03-c1
+  BLOCKSIZE := 64k
+  KERNEL := kernel-bin | gzip | fit gzip $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb | pad-to $$(BLOCKSIZE)
+  IMAGES := sysupgrade.tar factory.bin
+  IMAGE/factory.bin := append-rootfs | pad-rootfs | openmesh-image ce_type=PAX1800
+  IMAGE/sysupgrade.bin/squashfs := append-rootfs | pad-rootfs | sysupgrade-tar rootfs=$$$$@ | append-metadata
+  DEVICE_PACKAGES := ath11k-wifi-plasmacloud-pax1800 uboot-envtools
+endef
+TARGET_DEVICES += plasmacloud_pax1800

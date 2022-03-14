@@ -35,6 +35,7 @@ ALLWIFIBOARDS:= \
 	sercomm-wallaby \
 	edgecore-eap102 \
 	edgecore-eap104 \
+	plasmacloud-pax1800 \
 	wallys-dr6018 \
 	wallys-dr6018-v4 \
 	tplink-ex227 \
@@ -84,6 +85,11 @@ endef
 define Package/ath11k-wifi-gl-ax1800
 $(call Package/ath11k-wifi-default)
     TITLE:=gl-ax1800 bdf
+endef
+
+define Package/ath11k-wifi-plasmacloud-pax1800
+$(call Package/ath11k-wifi-default)
+    TITLE:=plasmacloud-pax1800 bdf
 endef
 
 define ath11k-wifi-install-one-to
@@ -171,6 +177,11 @@ endef
 define Package/ath11k-wifi-gl-ax1800/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
 	$(INSTALL_DATA) ./board-gl-ax1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
+endef
+
+define Package/ath11k-wifi-plasmacloud-pax1800/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-plasmacloud-pax1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
 endef
 
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
