@@ -84,6 +84,7 @@ platform_check_image() {
 	edgecore,eap106|\
 	hfcl,ion4xi|\
 	hfcl,ion4xe|\
+	plasmacloud,pax1800-v1|\
 	plasmacloud,pax1800-v2|\
 	tplink,ex227|\
 	tplink,ex447|\
@@ -162,6 +163,7 @@ platform_do_upgrade() {
 		fi
 		nand_upgrade_tar "$1"
 		;;
+	plasmacloud,pax1800-v1|\
 	plasmacloud,pax1800-v2)
 		PART_NAME="inactive"
 		platform_do_upgrade_dualboot_datachk "$1"

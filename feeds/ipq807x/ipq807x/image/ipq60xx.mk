@@ -101,6 +101,17 @@ define Device/plasmacloud_common_64k
   KERNEL += | pad-to $$(BLOCKSIZE)
 endef
 
+define Device/plasmacloud_pax1800-v1
+  $(Device/plasmacloud_common_64k)
+  DEVICE_TITLE := Plasma Cloud PAX1800 v1
+  DEVICE_DTS := qcom-ipq6018-pax1800-v1
+  SUPPORTED_DEVICES := plasmacloud,pax1800-v1
+  DEVICE_DTS_CONFIG := config@cp03-c1
+  CE_TYPE := PAX1800
+  DEVICE_PACKAGES += ath11k-wifi-plasmacloud-pax1800
+endef
+TARGET_DEVICES += plasmacloud_pax1800-v1
+
 define Device/plasmacloud_pax1800-v2
   $(Device/plasmacloud_common_64k)
   DEVICE_TITLE := Plasma Cloud PAX1800 v2
