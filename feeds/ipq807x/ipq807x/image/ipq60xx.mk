@@ -1,5 +1,7 @@
 KERNEL_LOADADDR := 0x41008000
 
+DEVICE_VARS += CE_TYPE
+
 define Device/cig_wf188n
   DEVICE_TITLE := Cigtech WF-188n
   DEVICE_DTS := qcom-ipq6018-cig-wf188n
@@ -88,3 +90,24 @@ define Device/yuncore_ax840
   DEVICE_PACKAGES := ath11k-wifi-yuncore-ax840 uboot-env
 endef
 TARGET_DEVICES += yuncore_ax840
+
+define Device/plasmacloud_common_64k
+  DEVICE_PACKAGES := uboot-envtools
+  CE_TYPE :=
+  BLOCKSIZE := 64k
+  IMAGES := sysupgrade.tar factory.bin
+  IMAGE/factory.bin := append-rootfs | pad-rootfs | openmesh-image ce_type=$$$$(CE_TYPE)
+  IMAGE/sysupgrade.tar := append-rootfs | pad-rootfs | sysupgrade-tar rootfs=$$$$@ | append-metadata
+  KERNEL += | pad-to $$(BLOCKSIZE)
+endef
+
+define Device/plasmacloud_pax1800-v2
+  $(Device/plasmacloud_common_64k)
+  DEVICE_TITLE := Plasma Cloud PAX1800 v2
+  DEVICE_DTS := qcom-ipq6018-pax1800-v2
+  SUPPORTED_DEVICES := plasmacloud,pax1800-v2
+  DEVICE_DTS_CONFIG := config@plasmacloud.pax1800v2
+  CE_TYPE := PAX1800v2
+  DEVICE_PACKAGES += ath11k-wifi-plasmacloud-pax1800
+endef
+TARGET_DEVICES += plasmacloud_pax1800-v2
