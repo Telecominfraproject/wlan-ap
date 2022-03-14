@@ -36,6 +36,7 @@ ALLWIFIBOARDS:= \
 	sercomm-wallaby \
 	edgecore-eap102 \
 	edgecore-eap104 \
+	plasmacloud-pax1800 \
 	wallys-dr6018 \
 	wallys-dr6018-v4 \
 	tplink-ex227 \
@@ -95,6 +96,11 @@ endef
 define Package/ath11k-wifi-motorola-q14
 $(call Package/ath11k-wifi-default)
     TITLE:=motorola q14 bdf
+endef
+
+define Package/ath11k-wifi-plasmacloud-pax1800
+$(call Package/ath11k-wifi-default)
+    TITLE:=plasmacloud-pax1800(-v2) bdf
 endef
 
 define ath11k-wifi-install-one-to
@@ -194,6 +200,11 @@ define Package/ath11k-wifi-motorola-q14/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
 	$(INSTALL_DATA) ./board-motorol-q14.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
 	$(INSTALL_DATA) ./board-2-motorol-q14.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board-2.bin
+endef
+
+define Package/ath11k-wifi-plasmacloud-pax1800/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-plasmacloud-pax1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
 endef
 
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
