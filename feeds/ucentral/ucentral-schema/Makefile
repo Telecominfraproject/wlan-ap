@@ -4,9 +4,10 @@ PKG_NAME:=ucentral-schema
 PKG_RELEASE:=1
 
 PKG_SOURCE_URL=https://github.com/blogic/ucentral-schema.git
+PKG_MIRROR_HASH:=8ce01f836813dcdf7af2ef3c2136fb91b87b64c7e485ee9aac38f1c4b1d561a9
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2022-01-17
-PKG_SOURCE_VERSION:=ef7649fb0ee48765f363ecd2c62ba68e5c952d0e
+PKG_SOURCE_VERSION:=9dfff1744e9d0f5d39edaa1cd1b349db1e16600c
 
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=BSD-3-Clause
