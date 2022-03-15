@@ -5,6 +5,25 @@
 # newly flashed partition. If the new partition can't be booted due to
 # upgrade failures the previously used partition is loaded.
 
+platform_post_upgrade_sanity_check()
+{
+	local part_name=$1
+	local inactive_mtd=$2
+	local cfg_md5=$3
+	local part_offset=$4
+	local part_size=$5
+
+	md5_part_disk=$(dd if=/dev/${inactive_mtd} bs=$((64*1024)) skip=$((part_offset / (64*1024))) count=$((part_size / (64*1024))) 2>&- | md5sum | awk '{print $1}')
+
+	if [ "${cfg_md5}" != "${md5_part_disk}" ]; then
+	      echo "post-flashing checksum mismatch: ${part_name}" >&2
+	      echo "${cfg_md5} != ${md5_part_disk}"
+	      return 1
+	fi
+
+	return 0
+}
+
 platform_do_upgrade_dualboot_datachk() {
 	local tar_file="$1"
 	local restore_backup
@@ -76,6 +95,9 @@ platform_do_upgrade_dualboot_datachk() {
 	mtd -q erase inactive
 	tar xf $tar_file ${board_dir}/root -O | mtd -n -p $kernel_length $restore_backup write - $PART_NAME
 	tar xf $tar_file ${board_dir}/kernel -O | mtd -n write - $PART_NAME
+
+	platform_post_upgrade_sanity_check "kernel" "mtd${kernel_mtd}" $kernel_md5 0 $kernel_length || return 1
+	platform_post_upgrade_sanity_check "rootfs" "mtd${kernel_mtd}" $rootfs_md5 $kernel_length $rootfs_length || return 1
 
 	# prepare new u-boot env
 	if [ "$next_boot_part" = "1" ]; then
