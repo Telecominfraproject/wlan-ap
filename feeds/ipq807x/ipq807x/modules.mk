@@ -114,7 +114,7 @@ $(eval $(call KernelPackage,diag-char))
 
 define KernelPackage/usb-dwc3-qcom
   TITLE:=DWC3 Qualcomm USB driver
-  DEPENDS:=@(!LINUX_4_14) @(TARGET_ipq40xx||TARGET_ipq807x) +kmod-usb-dwc3
+  DEPENDS:=@(!LINUX_4_14) @TARGET_ipq807x +kmod-usb-dwc3
   KCONFIG:= CONFIG_USB_DWC3_QCOM
   FILES:= $(LINUX_DIR)/drivers/usb/dwc3/dwc3-qcom.ko \
         $(LINUX_DIR)/drivers/usb/dwc3/dbm.ko
