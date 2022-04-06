@@ -41,6 +41,8 @@ define Device/cig_wf196
   DEVICE_DTS := qcom-ipq807x-wf196
   DEVICE_DTS_CONFIG=config@hk14
   SUPPORTED_DEVICES := cig,wf196
+  BLOCKSIZE := 256k
+  PAGESIZE := 4096
   DEVICE_PACKAGES := ath11k-wifi-cig-wf196 aq-fw-download uboot-envtools kmod-usb3 kmod-usb2 \
   	ath11k-firmware-qcn9000 ath11k-wifi-cig-wf196_6g
 endef
