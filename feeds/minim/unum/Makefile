@@ -36,12 +36,6 @@ define Package/unum/description
  for more details.
 endef
 
-
-# We build from the local sources only, here are defines to 
-# replace if we decide to publish it and make a download tarball.
-AGENT_SOURCE_DIR=$(MINIM_UNUM_DIR)/src/unum
-AGENT_FILES_DIR=$(MINIM_UNUM_DIR)/files
-
 # Path where we store sources and file in the LEDE build tree (making it the
 # same as in our build system tree)
 PKG_BUILD_DIR_UNUM=$(PKG_BUILD_DIR)/src/unum
@@ -87,12 +81,12 @@ else
 endif
 
 # Add common, platform and target specific features to the release feature list
-RELEASE_FEATURES := $(shell cat "$(AGENT_FILES_DIR)/features-common.txt")
-ifneq ("$(wildcard $(AGENT_FILES_DIR)/$(AGENT_MODEL_ID)/features.txt)","")
-  RELEASE_FEATURES := $(RELEASE_FEATURES) $(shell cat "$(AGENT_FILES_DIR)/$(AGENT_MODEL_ID)/features.txt")
+RELEASE_FEATURES := $(shell cat "$(PKG_BUILD_DIR_FILES)/features-common.txt")
+ifneq ("$(wildcard $(PKG_BUILD_DIR_FILES)/$(AGENT_MODEL_ID)/features.txt)","")
+  RELEASE_FEATURES := $(RELEASE_FEATURES) $(shell cat "$(PKG_BUILD_DIR_FILES)/$(AGENT_MODEL_ID)/features.txt")
 endif
-ifneq ("$(wildcard $(AGENT_FILES_DIR)/$(AGENT_MODEL_ID)/features-$(AGENT_HARDWARE_ID).txt)","")
-  RELEASE_FEATURES := $(RELEASE_FEATURES) $(shell cat "$(AGENT_FILES_DIR)/$(AGENT_MODEL_ID)/features-$(AGENT_HARDWARE_ID).txt")
+ifneq ("$(wildcard $(PKG_BUILD_DIR_FILES)/$(AGENT_MODEL_ID)/features-$(AGENT_HARDWARE_ID).txt)","")
+  RELEASE_FEATURES := $(RELEASE_FEATURES) $(shell cat "$(PKG_BUILD_DIR_FILES)/$(AGENT_MODEL_ID)/features-$(AGENT_HARDWARE_ID).txt")
 endif
 # Create comma separated quoted release features list
 quote := "
