@@ -56,7 +56,7 @@ function state_get() {
 function state_set(state) {
 	let file = fs.open("/tmp/uchannel.json", "w");
 
-	state.uptime = uptime;
+	state.executed = uptime;
 	file.write(state);
 	file.close();
 
@@ -64,7 +64,7 @@ function state_set(state) {
 		node: "*",
 		data: {
 			status: state.status,
-			uptime: state.uptime,
+			uptime: state.executed,
 		}
 	});
 	printf("entering %s state\n", state.status);
