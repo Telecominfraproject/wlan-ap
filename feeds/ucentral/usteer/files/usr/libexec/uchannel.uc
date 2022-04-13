@@ -272,7 +272,7 @@ function youngest() {
 let state = state_get();
 
 if (state.status == "waiting" &&
-    (uptime - state.uptime < (12 * 60 * 60))) {
+    (uptime - state.changed < (12 * 60 * 60))) {
 	state_set(state);
 	return;
 }
