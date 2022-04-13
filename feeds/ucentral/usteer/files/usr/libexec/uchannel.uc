@@ -125,11 +125,11 @@ function channel_overlap() {
 
 	for (let id, i in info) {
 		peers.local[i.freq] = true;
-		block_list[freq2band(freq)][i.freq] = 0;
+		block_list[freq2band(i.freq)][i.freq] = 0;
 	}
 	for (let node, r in remote) {
 		peers[split(node, "#")][r.freq] = true;
-		block_list[freq2band(freq)][r.freq] = 0;
+		block_list[freq2band(r.freq)][r.freq] = 0;
 	}
 
 	for (let id, peer in peers)
