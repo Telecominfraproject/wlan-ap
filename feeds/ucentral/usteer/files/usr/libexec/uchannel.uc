@@ -258,8 +258,8 @@ function channel_balance(band, mask) {
 
 function youngest() {
 	for (let ip, host in hosts) {
-		if (host.host_info.status == "overlap" &&
-		    host.host_info.uptime < uptime) {
+		if (host.host_info?.status == "overlap" &&
+		    host.host_info?.uptime < uptime) {
 			print("Found a younger host\n");
 			return 1;
 		}
