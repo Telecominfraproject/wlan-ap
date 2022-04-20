@@ -1,4 +1,3 @@
-{%
 let devid;
 let fd = fs.open("/etc/ucentral/dev-id", "r");
 if (!fd) {
@@ -62,4 +61,3 @@ system("/etc/init.d/firstcontact disable");
 system("reload_config");
 system("/etc/init.d/ucentral start");
 system("/etc/init.d/firstcontact stop");
-%}

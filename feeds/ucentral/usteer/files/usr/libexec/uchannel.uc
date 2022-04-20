@@ -1,5 +1,4 @@
 #!/usr/bin/ucode
-{%
 let fs = require("fs");
 let ubus = require("ubus");
 let conn = ubus.connect();
@@ -328,4 +327,3 @@ for (let freq, obj in overlap) {
 state.status = "waiting";
 state.changed = uptime;
 state_set(state);
-%}

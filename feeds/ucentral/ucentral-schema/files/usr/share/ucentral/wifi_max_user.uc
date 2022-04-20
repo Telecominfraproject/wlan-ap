@@ -1,4 +1,4 @@
-#!/usr/bin/ucode -R
+#!/usr/bin/ucode 
 
 let nl = require("nl80211");
 let def = nl.const;
