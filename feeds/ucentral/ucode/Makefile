@@ -12,13 +12,13 @@ PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL=https://github.com/jow-/ucode.git
-PKG_MIRROR_HASH:=376b89c35967d3761acb192af9fb6b7b20dbcc50d03c8ed851751d2376bf26b4
-PKG_SOURCE_DATE:=2021-07-30
-PKG_SOURCE_VERSION:=8fd4746da31b945a6259ac846f7cf8dcfef0b1ef
+PKG_SOURCE_DATE:=2022-04-07
+PKG_SOURCE_VERSION:=33f1e0b0926e973fb5ae445e9a995848762143bb
+PKG_MIRROR_HASH:=e419678244c5402c739e3a200d6d1d7cd6989a711c73744bc68b2d5b76bae33a
 PKG_MAINTAINER:=Jo-Philipp Wich <jo@mein.io>
 PKG_LICENSE:=ISC
 
-PKG_ABI_VERSION:=20210730
+PKG_ABI_VERSION:=20220322
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
@@ -33,7 +33,7 @@ endef
 
 define Package/ucode
   $(Package/ucode/default)
-  DEPENDS:=+libucode 
+  DEPENDS:=+libucode
 endef
 
 define Package/ucode/description
@@ -65,17 +65,6 @@ define Package/ucode-mod-fs/description
 endef
 
 
-define Package/ucode-mod-resolv
-  $(Package/ucode/default)
-  TITLE+= (resolv module)
-  DEPENDS:=ucode
-endef
-
-define Package/ucode-mod-resolv/description
- The resolv plugin module allows making DNS resolves.
-endef
-
-
 define Package/ucode-mod-math
   $(Package/ucode/default)
   TITLE+= (math module)
@@ -84,6 +73,50 @@ endef
 
 define Package/ucode-mod-math/description
  The math plugin provides access to various <math.h> procedures.
+endef
+
+
+define Package/ucode-mod-nl80211
+  $(Package/ucode/default)
+  TITLE+= (nl80211 module)
+  DEPENDS:=ucode +libnl-tiny +kmod-mac80211
+endef
+
+define Package/ucode-mod-nl80211/description
+ The nl80211 plugin provides access to the Linux wireless 802.11 netlink API.
+endef
+
+
+define Package/ucode-mod-resolv
+  $(Package/ucode/default)
+  TITLE+= (resolv module)
+  DEPENDS:=ucode
+endef
+
+define Package/ucode-mod-resolv/description
+ The resolv plugin implements simple DNS resolving.
+endef
+
+
+define Package/ucode-mod-rtnl
+  $(Package/ucode/default)
+  TITLE+= (rtnl module)
+  DEPENDS:=ucode +libnl-tiny
+endef
+
+define Package/ucode-mod-rtnl/description
+ The rtnl plugin provides access to the Linux routing netlink API.
+endef
+
+
+define Package/ucode-mod-struct
+  $(Package/ucode/default)
+  TITLE+= (struct module)
+  DEPENDS:=ucode
+endef
+
+define Package/ucode-mod-struct/description
+ The struct plugin implemnts Python 3 compatible struct.pack/unpack functionality.
 endef
 
 
@@ -109,40 +142,6 @@ define Package/ucode-mod-uci/description
  The uci module allows templates to read and modify uci configuration.
 endef
 
-
-define Package/ucode-mod-nl80211
-  $(Package/ucode/default)
-  TITLE+= (nl80211 module)
-  DEPENDS:=ucode +libnl-tiny +kmod-mac80211
-endef
-
-define Package/ucode-mod-nl80211/description
- The nl80211 module allows templates to send and receive nl80211 messages..
-endef
-
-
-define Package/ucode-mod-struct
-  $(Package/ucode/default)
-  TITLE+= (struct module)
-  DEPENDS:=ucode
-endef
-
-define Package/ucode-mod-struct/description
- The struct module allows templates to unpack binary buffers.
-endef
-
-
-define Package/ucode-mod-rtnl
-  $(Package/ucode/default)
-  TITLE+= (rtnl module)
-  DEPENDS:=ucode +libnl-tiny
-endef
-
-define Package/ucode-mod-struct/description
- The rtnl module allows templates to send and receive rtnl messages..
-endef
-
-
 define Build/Prepare
 	$(Build/Prepare/Default)
 	$(CP) $(STAGING_DIR)/usr/include/mac80211/uapi/linux/nl80211.h $(PKG_BUILD_DIR)/nl80211_copy.h
@@ -157,7 +156,7 @@ endef
 
 define Package/ucode/install
 	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/bin/ucode $(1)/usr/bin/ucode
+	$(CP) $(PKG_INSTALL_DIR)/usr/bin/u* $(1)/usr/bin/
 endef
 
 define Package/libucode/install
@@ -170,14 +169,29 @@ define Package/ucode-mod-fs/install
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/fs.so $(1)/usr/lib/ucode/
 endef
 
+define Package/ucode-mod-math/install
+	$(INSTALL_DIR) $(1)/usr/lib/ucode
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/math.so $(1)/usr/lib/ucode/
+endef
+
+define Package/ucode-mod-nl80211/install
+	$(INSTALL_DIR) $(1)/usr/lib/ucode
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/nl80211.so $(1)/usr/lib/ucode/
+endef
+
 define Package/ucode-mod-resolv/install
 	$(INSTALL_DIR) $(1)/usr/lib/ucode
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/resolv.so $(1)/usr/lib/ucode/
 endef
 
-define Package/ucode-mod-math/install
+define Package/ucode-mod-rtnl/install
 	$(INSTALL_DIR) $(1)/usr/lib/ucode
-	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/math.so $(1)/usr/lib/ucode/
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/rtnl.so $(1)/usr/lib/ucode/
+endef
+
+define Package/ucode-mod-struct/install
+	$(INSTALL_DIR) $(1)/usr/lib/ucode
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/struct.so $(1)/usr/lib/ucode/
 endef
 
 define Package/ucode-mod-ubus/install
@@ -190,29 +204,14 @@ define Package/ucode-mod-uci/install
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/uci.so $(1)/usr/lib/ucode/
 endef
 
-define Package/ucode-mod-nl80211/install
-	$(INSTALL_DIR) $(1)/usr/lib/ucode
-	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/nl80211.so $(1)/usr/lib/ucode/
-endef
-
-define Package/ucode-mod-struct/install
-	$(INSTALL_DIR) $(1)/usr/lib/ucode
-	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/struct.so $(1)/usr/lib/ucode/
-endef
-
-define Package/ucode-mod-rtnl/install
-	$(INSTALL_DIR) $(1)/usr/lib/ucode
-	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/rtnl.so $(1)/usr/lib/ucode/
-endef
-
 
 $(eval $(call BuildPackage,ucode))
 $(eval $(call BuildPackage,libucode))
 $(eval $(call BuildPackage,ucode-mod-fs))
-$(eval $(call BuildPackage,ucode-mod-resolv))
 $(eval $(call BuildPackage,ucode-mod-math))
+$(eval $(call BuildPackage,ucode-mod-nl80211))
+$(eval $(call BuildPackage,ucode-mod-resolv))
+$(eval $(call BuildPackage,ucode-mod-rtnl))
+$(eval $(call BuildPackage,ucode-mod-struct))
 $(eval $(call BuildPackage,ucode-mod-ubus))
 $(eval $(call BuildPackage,ucode-mod-uci))
-$(eval $(call BuildPackage,ucode-mod-nl80211))
-$(eval $(call BuildPackage,ucode-mod-struct))
-$(eval $(call BuildPackage,ucode-mod-rtnl))
