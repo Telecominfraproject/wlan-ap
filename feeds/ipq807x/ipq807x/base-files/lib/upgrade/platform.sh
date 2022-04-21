@@ -70,8 +70,6 @@ platform_do_upgrade() {
 	edgecore,eap104|\
 	glinet,ax1800|\
 	glinet,axt1800|\
-	hfcl,ion4xi|\
-	hfcl,ion4xe|\
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\
@@ -81,6 +79,17 @@ platform_do_upgrade() {
 	yuncore,ax840|\
 	tplink,ex447|\
 	tplink,ex227)	
+		nand_upgrade_tar "$1"
+		;;
+	hfcl,ion4xi|\
+	hfcl,ion4xe)
+		if grep -q rootfs_1 /proc/cmdline; then
+			CI_UBIPART="rootfs"
+			fw_setenv primary 0 || exit 1
+		else
+			CI_UBIPART="rootfs_1"
+			fw_setenv primary 1 || exit 1
+		fi
 		nand_upgrade_tar "$1"
 		;;
 	edgecore,eap106)
