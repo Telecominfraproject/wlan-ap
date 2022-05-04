@@ -9,7 +9,7 @@ echo config:$config
 	exit 1
 }
 
-/usr/share/ucentral/ucentral.uc
+/usr/share/ucentral/ucentral.uc $config
 
 [ $? -eq 0 ] || {
 	logger "ucentral_apply: applying $1 failed"
