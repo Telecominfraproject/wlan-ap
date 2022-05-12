@@ -2,16 +2,16 @@ KERNEL_LOADADDR := 0x41208000
 
 define Device/qcom_hk01
   DEVICE_TITLE := Qualcomm Hawkeye HK01
-  DEVICE_DTS := qcom-ipq807x-hk01
+  DEVICE_DTS := ipq8074-hk01
   DEVICE_DTS_CONFIG=config@hk01
   SUPPORTED_DEVICES := qcom,ipq807x-hk01
   DEVICE_PACKAGES := ath11k-wifi-qcom-ipq8074
 endef
-TARGET_DEVICES += qcom_hk01
+#TARGET_DEVICES += qcom_hk01
 
 define Device/qcom_hk14
   DEVICE_TITLE := Qualcomm Hawkeye HK14
-  DEVICE_DTS := qcom-ipq807x-hk14
+  DEVICE_DTS := ipq8074-hk14
   DEVICE_DTS_CONFIG=config@hk14
   SUPPORTED_DEVICES := qcom,ipq807x-hk14
   DEVICE_PACKAGES := ath11k-wifi-qcom-ipq8074 kmod-ath11k-pci ath11k-firmware-qcn9000
@@ -34,15 +34,13 @@ define Device/cig_wf194c4
   SUPPORTED_DEVICES := cig,wf194c4
   DEVICE_PACKAGES := ath11k-wifi-cig-wf194c4 aq-fw-download uboot-envtools kmod-usb3 kmod-usb2
 endef
-TARGET_DEVICES += cig_wf194c4
+#TARGET_DEVICES += cig_wf194c4
 
 define Device/cig_wf196
   DEVICE_TITLE := CIG WF196
   DEVICE_DTS := qcom-ipq807x-wf196
   DEVICE_DTS_CONFIG=config@hk14
   SUPPORTED_DEVICES := cig,wf196
-  BLOCKSIZE := 256k
-  PAGESIZE := 4096
   DEVICE_PACKAGES := ath11k-wifi-cig-wf196 aq-fw-download uboot-envtools kmod-usb3 kmod-usb2 \
   	ath11k-firmware-qcn9000 ath11k-wifi-cig-wf196_6g
 endef

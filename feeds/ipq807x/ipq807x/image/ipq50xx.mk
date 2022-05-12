@@ -25,7 +25,7 @@ define Device/qcom_mp03_1
   DEVICE_PACKAGES := ath11k-wifi-qcom-ipq5018
   DEVICE_DTS_CONFIG := config@mp03.1
 endef
-TARGET_DEVICES += qcom_mp03_1
+#TARGET_DEVICES += qcom_mp03_1
 
 define Device/qcom_mp03_3
   DEVICE_TITLE := Qualcomm Maple 03.3
@@ -34,4 +34,4 @@ define Device/qcom_mp03_3
   DEVICE_PACKAGES := ath11k-wifi-qcom-ipq5018
   DEVICE_DTS_CONFIG := config@mp03.3
 endef
-TARGET_DEVICES += qcom_mp03_3
+#TARGET_DEVICES += qcom_mp03_3
