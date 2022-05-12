@@ -84,6 +84,8 @@ drv_mac80211_init_iface_config() {
 	config_add_int dtim_period
 	config_add_int start_disabled
 
+	config_add_int fils_discovery_max_interval
+
 	# mesh
 	config_add_string mesh_id
 	config_add_int $MP_CONFIG_INT
@@ -488,15 +490,25 @@ mac80211_hostapd_setup_bss() {
 
 	hostapd_set_bss_options hostapd_cfg "$phy" "$vif" || return 1
 	json_get_vars wds wds_bridge dtim_period max_listen_int start_disabled
+        json_get_vars fils_discovery_max_interval
 
 	set_default wds 0
 	set_default start_disabled 0
+	set_default fils_discovery_max_interval 0
 
 	[ "$wds" -gt 0 ] && {
 		append hostapd_cfg "wds_sta=1" "$N"
 		[ -n "$wds_bridge" ] && append hostapd_cfg "wds_bridge=$wds_bridge" "$N"
 	}
 	[ "$staidx" -gt 0 -o "$start_disabled" -eq 1 ] && append hostapd_cfg "start_disabled=1" "$N"
+
+	[ "$band" = "6g" ] && {
+		if [ "$fils_discovery_max_interval" -gt 0 ] && [ "$fils_discovery_max_interval" -le 20 ]; then
+			append hostapd_cfg "fils_discovery_max_interval=$fils_discovery_max_interval" "$N"
+		else
+			append hostapd_cfg "fils_discovery_max_interval=20" "$N"
+		fi
+	}
 
 	cat >> /var/run/hostapd-$phy.conf <<EOF
 $hostapd_cfg
@@ -1049,6 +1061,8 @@ drv_mac80211_setup() {
 		wireless_set_retry 0
 		return 1
 	}
+	
+	[ "$band" = "6g" ] && multiple_bssid=1
 
 	wireless_set_data phy="$phy"
 	[ -z "$(uci -q -P /var/state show wireless._${phy})" ] && uci -q -P /var/state set wireless._${phy}=phy
