@@ -154,6 +154,8 @@ hostapd_prepare_device_config() {
 	set_default ema 0
 	set_default acs_exclude_dfs 0
 
+	[ "$band" = "6g" ] && multiple_bssid=1
+
 	[ -n "$country" ] && {
 		append base_cfg "country_code=$country" "$N"
 		[ -n "$country3" ] && append base_cfg "country3=$country3" "$N"
