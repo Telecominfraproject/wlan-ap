@@ -3,7 +3,16 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=qca-ssdk-shell
+PKG_SOURCE_PROTO:=git
+PKG_BRANCH:=master
 PKG_RELEASE:=1
+PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/ssdk-shell
+PKG_MIRROR_HASH:=b9274a939e3dc47acb489cb475205c49dc79dbda5c6dfbd65d3940fa13786c80
+PKG_VERSION:=9452cc86eee3730eac5f48e45800c3a9717e313b
+
+PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
+PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
+PKG_SOURCE_VERSION:=$(PKG_VERSION)
 
 include $(INCLUDE_DIR)/package.mk
 
