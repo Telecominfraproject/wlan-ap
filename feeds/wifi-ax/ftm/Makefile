@@ -15,7 +15,7 @@ define Package/$(PKG_NAME)
   URL:=http://www.qca.qualcomm.com
   MAINTAINER:=Qualcomm Atheros
   TITLE:= QCA ftm utils
-  DEPENDS:= @TARGET_ipq_ipq807x||TARGET_ipq_ipq807x_64||TARGET_ipq_ipq60xx||TARGET_ipq_ipq60xx_64||TARGET_ipq_ipq50xx||TARGET_ipq_ipq50xx_64||TARGET_ipq807x||TARGET_ipq50xx +libnl +libtcmd +qca-diag +librt +FEATURE_QCA_IOT:qca-IOT +FEATURE_QCA_IOT_IPQ50XX_SUPPORT:btdaemon +kmod-diag-char
+  DEPENDS:= @TARGET_ipq_ipq807x||TARGET_ipq_ipq807x_64||TARGET_ipq_ipq60xx||TARGET_ipq_ipq60xx_64||TARGET_ipq_ipq50xx||TARGET_ipq_ipq50xx_64||TARGET_ipq807x||TARGET_ipq50xx +libnl +libtcmd +qca-diag +librt +kmod-diag-char
 endef
 
 define Package/$(PKG_NAME)/description/Default

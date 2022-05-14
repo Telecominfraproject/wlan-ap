@@ -98,13 +98,30 @@ endef
 
 $(eval $(call KernelPackage,usb-phy-ipq5018))
 
+define KernelPackage/usb-f-diag
+  TITLE:=USB DIAG
+  KCONFIG:=CONFIG_USB_F_DIAG \
+        CONFIG_USB_CONFIGFS_F_DIAG=y \
+        CONFIG_DIAG_OVER_USB=y
+  DEPENDS:=+kmod-usb-lib-composite +kmod-usb-configfs
+  FILES:=$(LINUX_DIR)/drivers/usb/gadget/function/usb_f_diag.ko
+  AUTOLOAD:=$(call AutoLoad,52,usb_f_diag)
+  $(call AddPlatformDepends/usb)
+endef
+
+define KernelPackage/usb-f-diag/description
+ USB DIAG
+endef
+
+$(eval $(call KernelPackage,usb-f-diag))
+
 define KernelPackage/diag-char
   TITLE:=CHAR DIAG
   KCONFIG:= CONFIG_DIAG_MHI=y@ge5.4 \
           CONFIG_DIAG_OVER_PCIE=n@ge5.4 \
           CONFIG_DIAGFWD_BRIDGE_CODE=y \
-          CONFIG_DIAG_CHAR=m
-  DEPENDS:=+kmod-lib-crc-ccitt
+          CONFIG_DIAG_CHAR
+  DEPENDS:=+kmod-lib-crc-ccitt +kmod-usb-f-diag
   FILES:=$(LINUX_DIR)/drivers/char/diag/diagchar.ko
 endef
 
@@ -113,3 +130,35 @@ define KernelPackage/diag-char/description
 endef
 
 $(eval $(call KernelPackage,diag-char))
+
+define KernelPackage/usb-configfs
+ TITLE:= USB functions
+  KCONFIG:=CONFIG_USB_CONFIGFS \
+        CONFIG_USB_CONFIGFS_SERIAL=n \
+        CONFIG_USB_CONFIGFS_ACM=n \
+        CONFIG_USB_CONFIGFS_OBEX=n \
+        CONFIG_USB_CONFIGFS_NCM=n \
+        CONFIG_USB_CONFIGFS_ECM=n \
+        CONFIG_USB_CONFIGFS_ECM_SUBSET=n \
+        CONFIG_USB_CONFIGFS_RNDIS=n \
+        CONFIG_USB_CONFIGFS_EEM=n \
+        CONFIG_USB_CONFIGFS_MASS_STORAGE=n \
+        CONFIG_USB_CONFIGFS_F_LB_SS=n \
+        CONFIG_USB_CONFIGFS_F_FS=n \
+        CONFIG_USB_CONFIGFS_F_UAC1=n \
+        CONFIG_USB_CONFIGFS_F_UAC2=n \
+        CONFIG_USB_CONFIGFS_F_MIDI=n \
+        CONFIG_USB_CONFIGFS_F_HID=n \
+        CONFIG_USB_CONFIGFS_F_PRINTER=n \
+        CONFIG_USB_CONFIGFS_F_QDSS=n
+  $(call AddPlatformDepends/usb)
+endef
+
+define KernelPackage/usb-configfs/description
+ USB functions
+endef
+
+$(eval $(call KernelPackage,usb-configfs))
+
+
+
