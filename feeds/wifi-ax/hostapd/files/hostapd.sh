@@ -706,7 +706,7 @@ hostapd_set_bss_options() {
 			set_default ieee80211w 2
 			set_default sae_require_mfp 1
 		;;
-		psk-sae|eap-eap256)
+		psk-sae|psk2-radius|eap-eap256)
 			set_default ieee80211w 1
 			set_default sae_require_mfp 1
 		;;
@@ -768,6 +768,11 @@ hostapd_set_bss_options() {
 			hostapd_append_wep_key bss_conf
 			append bss_conf "wep_default_key=$wep_keyidx" "$N"
 			[ -n "$wep_rekey" ] && append bss_conf "wep_rekey_period=$wep_rekey" "$N"
+		;;
+		psk2-radius)
+			append bss_conf "wpa_psk_radius=3" "$N"
+			append_radius_server
+			vlan_possible=1
 		;;
 	esac
 
