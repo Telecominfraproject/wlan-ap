@@ -1,5 +1,8 @@
 . /lib/functions/system.sh
 
+RAMFS_COPY_BIN='fw_printenv fw_setenv'
+RAMFS_COPY_DATA='/etc/fw_env.config /var/lock/fw_printenv.lock'
+
 qca_do_upgrade() {
         local tar_file="$1"
 
@@ -67,8 +70,6 @@ platform_do_upgrade() {
 	edgecore,eap104|\
 	glinet,ax1800|\
 	glinet,axt1800|\
-	hfcl,ion4xi|\
-	hfcl,ion4xe|\
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\
@@ -80,11 +81,35 @@ platform_do_upgrade() {
 	tplink,ex227)	
 		nand_upgrade_tar "$1"
 		;;
-	edgecore,eap106|\
-	edgecore,eap102|\
-	edgecore,eap101)
+	hfcl,ion4xi|\
+	hfcl,ion4xe)
+		if grep -q rootfs_1 /proc/cmdline; then
+			CI_UBIPART="rootfs"
+			fw_setenv primary 0 || exit 1
+		else
+			CI_UBIPART="rootfs_1"
+			fw_setenv primary 1 || exit 1
+		fi
+		nand_upgrade_tar "$1"
+		;;
+	edgecore,eap106)
 		CI_UBIPART="rootfs1"
 		[ "$(find_mtd_chardev rootfs)" ] && CI_UBIPART="rootfs"
+		nand_upgrade_tar "$1"
+		;;
+	edgecore,eap101|\
+	edgecore,eap102)
+		if [ "$(find_mtd_chardev rootfs)" ]; then
+			CI_UBIPART="rootfs"
+		else
+			if grep -q rootfs1 /proc/cmdline; then
+				CI_UBIPART="rootfs2"
+				fw_setenv active 2 || exit 1
+			else
+				CI_UBIPART="rootfs1"
+				fw_setenv active 1 || exit 1
+			fi
+		fi
 		nand_upgrade_tar "$1"
 		;;
 	esac
