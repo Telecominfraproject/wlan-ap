@@ -27,7 +27,7 @@ define Device/motorola_q14
   IMAGES := sysupgrade.tar mmc-factory.bin
   IMAGE/mmc-factory.bin := append-ubi | qsdk-ipq-factory-mmc
 endef
-#TARGET_DEVICES += motorola_q14
+TARGET_DEVICES += motorola_q14
 
 define Device/qcom_mp03_1
   DEVICE_TITLE := Qualcomm Maple 03.1
