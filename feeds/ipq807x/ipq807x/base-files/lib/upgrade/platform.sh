@@ -19,6 +19,50 @@ qca_do_upgrade() {
         fi
 }
 
+find_mmc_part() {
+	local DEVNAME PARTNAME
+
+	if grep -q "$1" /proc/mtd; then
+		echo "" && return 0
+	fi
+
+	for DEVNAME in /sys/block/mmcblk*/mmcblk*p*; do
+		PARTNAME=$(grep PARTNAME ${DEVNAME}/uevent | cut -f2 -d'=')
+		[ "$PARTNAME" = "$1" ] && echo "/dev/$(basename $DEVNAME)" && return 0
+	done
+}
+
+do_flash_emmc() {
+	local tar_file=$1
+	local emmcblock=$(find_mmc_part $2)
+	local board_dir=$3
+	local part=$4
+
+	[ -z "$emmcblock" ] && {
+		echo failed to find $2
+		return
+	}
+
+	echo erase $4
+	dd if=/dev/zero of=${emmcblock}
+	echo flash $4
+	tar Oxf $tar_file ${board_dir}/$part | dd of=${emmcblock}
+}
+
+emmc_do_upgrade() {
+	local tar_file="$1"
+
+	local board_dir=$(tar tf $tar_file | grep -m 1 '^sysupgrade-.*/$')
+	board_dir=${board_dir%/}
+	do_flash_emmc $tar_file '0:HLOS' $board_dir kernel
+	do_flash_emmc $tar_file 'rootfs' $board_dir root
+
+	local emmcblock="$(find_mmc_part "rootfs_data")"
+        if [ -e "$emmcblock" ]; then
+                mkfs.ext4 "$emmcblock"
+        fi
+}
+
 platform_check_image() {
 	local magic_long="$(get_magic_long "$1")"
 	board=$(board_name)
@@ -42,6 +86,7 @@ platform_check_image() {
 	tplink,ex227|\
 	tplink,ex447|\
 	yuncore,ax840|\
+	motorola,q14|\
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\
@@ -61,6 +106,9 @@ platform_do_upgrade() {
 	case $board in
 	cig,wf188)
 		qca_do_upgrade $1
+		;;
+	motorola,q14)
+		emmc_do_upgrade $1
 		;;
 	cig,wf188n|\
 	cig,wf194c|\
