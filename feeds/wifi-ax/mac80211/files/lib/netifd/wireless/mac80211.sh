@@ -552,9 +552,9 @@ mac80211_generate_mac() {
 
 	local oIFS="$IFS"; IFS=":"; set -- $ref; IFS="$oIFS"
 	[ "$multiple_bssid" -eq 1 ] && {
-               printf "02:%s:%s:%s:%s:%02x" $b1 $2 $3 $4 $5 $macidx
-               return
-    }
+		printf "02:%s:%s:%s:%s:%02x" $b1 $2 $3 $4 $5 $macidx
+		return
+	}
 	macidx=$(($id + 1))
 
 	local use_global=0
