@@ -43,7 +43,7 @@ define Device/wallys_dr6018
   SUPPORTED_DEVICES := wallys,dr6018
   DEVICE_PACKAGES := ath11k-wifi-wallys-dr6018 uboot-envtools
 endef
-#TARGET_DEVICES += wallys_dr6018
+TARGET_DEVICES += wallys_dr6018
 
 define Device/wallys_dr6018_v4
   DEVICE_TITLE := Wallys DR6018 V4
@@ -52,7 +52,7 @@ define Device/wallys_dr6018_v4
   SUPPORTED_DEVICES := wallys,dr6018-v4
   DEVICE_PACKAGES := ath11k-wifi-wallys-dr6018-v4 uboot-envtools
 endef
-#TARGET_DEVICES += wallys_dr6018_v4
+TARGET_DEVICES += wallys_dr6018_v4
 
 define Device/glinet_ax1800
   DEVICE_TITLE := GL-iNet AX1800
