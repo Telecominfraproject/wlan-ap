@@ -32,6 +32,7 @@ ALLWIFIBOARDS:= \
 	cybertan-eww622-a1 \
 	edgecore-eap101 \
 	gl-ax1800 \
+	gl-axt1800 \
 	sercomm-wallaby \
 	edgecore-eap102 \
 	edgecore-eap104 \
@@ -84,6 +85,11 @@ endef
 define Package/ath11k-wifi-gl-ax1800
 $(call Package/ath11k-wifi-default)
     TITLE:=gl-ax1800 bdf
+endef
+
+define Package/ath11k-wifi-gl-axt1800
+$(call Package/ath11k-wifi-default)
+    TITLE:=gl-axt1800 bdf
 endef
 
 define Package/ath11k-wifi-motorola-q14
@@ -176,6 +182,11 @@ endef
 define Package/ath11k-wifi-gl-ax1800/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
 	$(INSTALL_DATA) ./board-gl-ax1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
+endef
+
+define Package/ath11k-wifi-gl-axt1800/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-gl-axt1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
 endef
 
 define Package/ath11k-wifi-motorola-q14/install
