@@ -730,6 +730,7 @@ mac80211_prepare_vif() {
 			[ "$wds" -gt 0 ] && wdsflag="4addr on"
 			mac80211_iw_interface_add "$phy" "$ifname" managed "$wdsflag" || return
 			if [ "$wds" -gt 0 ]; then
+				echo 1 > /sys/kernel/debug/ieee80211/$phy/netdev\:$ifname/disable_offload
 				iw "$ifname" set 4addr on
 			else
 				iw "$ifname" set 4addr off
