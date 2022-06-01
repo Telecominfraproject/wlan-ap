@@ -41,7 +41,7 @@ define Device/wallys_dr6018
   DEVICE_DTS := qcom-ipq6018-wallys-dr6018
   DEVICE_DTS_CONFIG := config@cp01-c4
   SUPPORTED_DEVICES := wallys,dr6018
-  DEVICE_PACKAGES := ath11k-wifi-wallys-dr6018 uboot-envtools
+  DEVICE_PACKAGES := ath11k-wifi-wallys-dr6018 uboot-envtools -kmod-usb-dwc3-of-simple kmod-usb-dwc3-qcom kmod-usb3 kmod-usb2
 endef
 TARGET_DEVICES += wallys_dr6018
 
@@ -50,7 +50,7 @@ define Device/wallys_dr6018_v4
   DEVICE_DTS := qcom-ipq6018-wallys-dr6018-v4
   DEVICE_DTS_CONFIG := config@cp01-c4
   SUPPORTED_DEVICES := wallys,dr6018-v4
-  DEVICE_PACKAGES := ath11k-wifi-wallys-dr6018-v4 uboot-envtools
+  DEVICE_PACKAGES := ath11k-wifi-wallys-dr6018-v4 uboot-envtools ath11k-firmware-qcn9000
 endef
 TARGET_DEVICES += wallys_dr6018_v4
 
