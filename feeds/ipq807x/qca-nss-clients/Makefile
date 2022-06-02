@@ -5,9 +5,9 @@ PKG_NAME:=qca-nss-clients
 PKG_SOURCE_PROTO:=git
 PKG_BRANCH:=master
 PKG_RELEASE:=2
-PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-clients
-PKG_MIRROR_HASH:=95bae8cc23fe950aae5d6b6fd402b6ab4339782ffb08eb29d249105fcb9022bf
-PKG_VERSION:=30742bb1decd5fe7b4e01be8081ab0a99c1f6888
+PKG_SOURCE_URL:=https://source.codeaurora.org/quic/qsdk/oss/lklm/nss-clients/
+PKG_MIRROR_HASH:=802bf8b2dac8da0549e108b873afd982d127370c07d6574ece71f902eafe7698
+PKG_VERSION:=153998d70fdba508a59a28c13a606032cbf32686
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
@@ -602,7 +602,6 @@ define Build/Compile
 		SoC="$(subtarget)" \
 		DTLSMGR_DIR="$(DTLSMGR_DIR)" \
 		IPSECMGR_DIR="$(IPSECMGR_DIR)" \
-		KBUILD_MODPOST_WARN=1 \
 		modules
 endef
 

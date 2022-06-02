@@ -2,17 +2,8 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=qca-nss-drv
-PKG_SOURCE_PROTO:=git
 PKG_BRANCH:=master
 PKG_RELEASE:=2
-PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-drv
-PKG_MIRROR_HASH:=350af8f6b1f06ea0871314783a5362483963bbe327ba774ba49a2a775847363e
-PKG_VERSION:=7563fe37340ec4a28b7821a0ac17608ff30e2a85
-
-PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
-PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
-PKG_SOURCE_VERSION:=$(PKG_VERSION)
-
 
 NSS_CLIENTS_DIR:=$(TOPDIR)/qca/src/qca-nss-clients
 
@@ -114,7 +105,6 @@ define Build/Compile
 		ARCH="$(LINUX_KARCH)" \
 		M="$(PKG_BUILD_DIR)" \
 		EXTRA_CFLAGS="$(EXTRA_CFLAGS)" SoC="$(subtarget)" \
-		KBUILD_MODPOST_WARN=1 \
 		modules
 endef
 
