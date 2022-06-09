@@ -18,6 +18,17 @@ define Device/edgecore_eap104
 endef
 TARGET_DEVICES += edgecore_eap104
 
+define Device/motorola_q14
+  DEVICE_TITLE := Motorola Q14
+  DEVICE_DTS := qcom-ipq5018-q14
+  SUPPORTED_DEVICES := motorola,q14
+  DEVICE_PACKAGES := ath11k-wifi-motorola-q14 ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.5-c1
+  IMAGES := sysupgrade.tar mmc-factory.bin
+  IMAGE/mmc-factory.bin := append-ubi | qsdk-ipq-factory-mmc
+endef
+#TARGET_DEVICES += motorola_q14
+
 define Device/qcom_mp03_1
   DEVICE_TITLE := Qualcomm Maple 03.1
   DEVICE_DTS := qcom-ipq5018-mp03.1
@@ -25,7 +36,7 @@ define Device/qcom_mp03_1
   DEVICE_PACKAGES := ath11k-wifi-qcom-ipq5018
   DEVICE_DTS_CONFIG := config@mp03.1
 endef
-#TARGET_DEVICES += qcom_mp03_1
+TARGET_DEVICES += qcom_mp03_1
 
 define Device/qcom_mp03_3
   DEVICE_TITLE := Qualcomm Maple 03.3
@@ -34,4 +45,4 @@ define Device/qcom_mp03_3
   DEVICE_PACKAGES := ath11k-wifi-qcom-ipq5018
   DEVICE_DTS_CONFIG := config@mp03.3
 endef
-#TARGET_DEVICES += qcom_mp03_3
+TARGET_DEVICES += qcom_mp03_3

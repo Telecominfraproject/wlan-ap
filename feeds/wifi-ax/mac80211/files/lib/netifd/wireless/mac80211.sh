@@ -134,7 +134,7 @@ mac80211_hostapd_setup_base() {
 
 	json_select config
 
-	[ "$auto_channel" -gt 0 ] && channel=acs_survey
+	[ "$auto_channel" -gt 0 ] && channel=0
 
 	[ "$auto_channel" -gt 0 ] && json_get_vars acs_exclude_dfs
 	[ -n "$acs_exclude_dfs" ] && [ "$acs_exclude_dfs" -gt 0 ] &&
@@ -730,6 +730,7 @@ mac80211_prepare_vif() {
 			[ "$wds" -gt 0 ] && wdsflag="4addr on"
 			mac80211_iw_interface_add "$phy" "$ifname" managed "$wdsflag" || return
 			if [ "$wds" -gt 0 ]; then
+				echo 1 > /sys/kernel/debug/ieee80211/$phy/netdev\:$ifname/disable_offload
 				iw "$ifname" set 4addr on
 			else
 				iw "$ifname" set 4addr off
@@ -1176,10 +1177,13 @@ drv_mac80211_setup() {
 		if [ "$no_reload" != "0" ]; then
 			add_ap=1
 			ubus wait_for hostapd
-			local hostapd_res="$(ubus call hostapd config_add "{\"iface\":\"$primary_ap\", \"config\":\"${hostapd_conf_file}\"}")"
+			local hostapd_res
+			[ -f /tmp/wifi_fail_test ] || hostapd_res="$(ubus call hostapd config_add "{\"iface\":\"$primary_ap\", \"config\":\"${hostapd_conf_file}\"}")"
 			ret="$?"
+			rm -f /tmp/wifi_fail_test
 			[ "$ret" != 0 -o -z "$hostapd_res" ] && {
-				wireless_setup_failed HOSTAPD_START_FAILED
+				logger failed to start wifi trying again
+			#	wireless_setup_failed HOSTAPD_START_FAILED
 				return
 			}
 			wireless_add_process "$(jsonfilter -s "$hostapd_res" -l 1 -e @.pid)" "/usr/sbin/hostapd" 1 1

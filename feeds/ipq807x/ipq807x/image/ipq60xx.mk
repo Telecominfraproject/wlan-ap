@@ -41,9 +41,9 @@ define Device/wallys_dr6018
   DEVICE_DTS := qcom-ipq6018-wallys-dr6018
   DEVICE_DTS_CONFIG := config@cp01-c4
   SUPPORTED_DEVICES := wallys,dr6018
-  DEVICE_PACKAGES := ath11k-wifi-wallys-dr6018 uboot-envtools
+  DEVICE_PACKAGES := ath11k-wifi-wallys-dr6018 uboot-envtools -kmod-usb-dwc3-of-simple kmod-usb-dwc3-qcom kmod-usb3 kmod-usb2
 endef
-#TARGET_DEVICES += wallys_dr6018
+TARGET_DEVICES += wallys_dr6018
 
 define Device/wallys_dr6018_v4
   DEVICE_TITLE := Wallys DR6018 V4
@@ -52,7 +52,15 @@ define Device/wallys_dr6018_v4
   SUPPORTED_DEVICES := wallys,dr6018-v4
   DEVICE_PACKAGES := ath11k-wifi-wallys-dr6018-v4 uboot-envtools
 endef
-#TARGET_DEVICES += wallys_dr6018_v4
+TARGET_DEVICES += wallys_dr6018_v4
+
+define Device/qcom_cp01_c1
+  DEVICE_TITLE := Qualcomm Cypress C1
+  DEVICE_DTS := qcom-ipq6018-cp01-c1
+  SUPPORTED_DEVICES := qcom,ipq6018-cp01
+  DEVICE_PACKAGES := ath11k-wifi-qcom-ipq6018
+endef
+TARGET_DEVICES += qcom_cp01_c1
 
 define Device/glinet_ax1800
   DEVICE_TITLE := GL-iNet AX1800
@@ -68,7 +76,7 @@ define Device/glinet_axt1800
   DEVICE_DTS := qcom-ipq6018-gl-axt1800
   SUPPORTED_DEVICES := glinet,axt1800
   DEVICE_DTS_CONFIG := config@cp03-c1
-  DEVICE_PACKAGES := ath11k-wifi-gl-ax1800 -kmod-usb-dwc3-of-simple kmod-usb-dwc3-qcom kmod-usb3
+  DEVICE_PACKAGES := ath11k-wifi-gl-axt1800 -kmod-usb-dwc3-of-simple kmod-usb-dwc3-qcom kmod-usb3
 endef
 TARGET_DEVICES += glinet_axt1800
 

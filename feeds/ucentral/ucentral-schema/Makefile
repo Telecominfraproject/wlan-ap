@@ -3,12 +3,11 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=ucentral-schema
 PKG_RELEASE:=1
 
-PKG_SOURCE_URL=https://github.com/blogic/ucentral-schema.git
-PKG_MIRROR_HASH:=562e558135f2da69ae4ae0573813b06b61d3071a026d478678822b13d5b7dee0
-#PKG_MIRROR_HASH:=cffdabf01601cd9508d77301fc9f6ab65a2f99ad4a35e3eeed31e9c6b161f63c
+PKG_SOURCE_URL=https://github.com/Telecominfraproject/wlan-ucentral-schema.git
+PKG_MIRROR_HASH:=3ba2d66f8e52c784f136bf340ab2fb81568a1d8df8dbebfa487fc57652bea04f
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_DATE:=2022-01-17
-PKG_SOURCE_VERSION:=48292adfa238fb81bb3fe0c047e28541c6fe5875
+PKG_SOURCE_DATE:=2022-05-29
+PKG_SOURCE_VERSION:=96324e2f7443cb3ae70f8fca10f37548f673e3f8
 
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=BSD-3-Clause
