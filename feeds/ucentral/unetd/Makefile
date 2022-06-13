@@ -26,7 +26,7 @@ define Package/unetd
   SECTION:=utils
   CATEGORY:=Base system
   TITLE:=Wireguard network configuration service
-  DEPENDS:=+libubox +libubus +libblobmsg-json +libnl-tiny +TARGET_ipq807x:kmod-wireguard-backport +!TARGET_ipq807x:kmod-wireguard
+  DEPENDS:=+libubox +libubus +libblobmsg-json +libnl-tiny +TARGET_ipq807x:kmod-wireguard-backport +!TARGET_ipq807x:kmod-wireguard +wireguard-tools
 endef
 
 TARGET_CFLAGS += \
