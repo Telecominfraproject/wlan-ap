@@ -44,7 +44,7 @@ do_flash_emmc() {
 	}
 
 	echo erase $4
-	dd if=/dev/zero of=${emmcblock}
+	dd if=/dev/zero of=${emmcblock} 2> /dev/null
 	echo flash $4
 	tar Oxf $tar_file ${board_dir}/$part | dd of=${emmcblock}
 }
