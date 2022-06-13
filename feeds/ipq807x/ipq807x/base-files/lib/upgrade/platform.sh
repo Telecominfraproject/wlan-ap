@@ -59,7 +59,7 @@ emmc_do_upgrade() {
 
 	local emmcblock="$(find_mmc_part "rootfs_data")"
         if [ -e "$emmcblock" ]; then
-                mkfs.ext4 "$emmcblock"
+                mkfs.ext4 -F "$emmcblock"
         fi
 }
 
