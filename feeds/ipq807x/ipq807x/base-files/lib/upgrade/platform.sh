@@ -44,7 +44,7 @@ do_flash_emmc() {
 	}
 
 	echo erase $4
-	dd if=/dev/zero of=${emmcblock}
+	dd if=/dev/zero of=${emmcblock} 2> /dev/null
 	echo flash $4
 	tar Oxf $tar_file ${board_dir}/$part | dd of=${emmcblock}
 }
@@ -59,7 +59,7 @@ emmc_do_upgrade() {
 
 	local emmcblock="$(find_mmc_part "rootfs_data")"
         if [ -e "$emmcblock" ]; then
-                mkfs.ext4 "$emmcblock"
+                mkfs.ext4 -F "$emmcblock"
         fi
 }
 
