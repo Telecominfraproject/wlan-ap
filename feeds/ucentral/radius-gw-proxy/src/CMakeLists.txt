@@ -11,7 +11,7 @@ ADD_DEFINITIONS(-Os -std=gnu99 -g3 -Wmissing-declarations -Wno-unused-parameter 
 
 SET(CMAKE_SHARED_LIBRARY_LINK_C_FLAGS "")
 
-SET(SOURCES main.c)
+SET(SOURCES main.c ubus.c)
 
 FIND_LIBRARY(ubus NAMES ubus)
 FIND_LIBRARY(ubox NAMES ubox)
