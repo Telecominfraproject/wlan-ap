@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+
 #define _GNU_SOURCE
 
 #include <sys/types.h>
@@ -13,25 +15,15 @@
 
 #include <libubox/uloop.h>
 #include <libubox/usock.h>
-
-#include <libubox/avl.h>
-#include <libubox/avl-cmp.h>
+#include <libubox/ulog.h>
 
 #include <libubus.h>
 
+#include "ubus.h"
+
 #define RAD_PROX_BUFLEN		(4 * 1024)
 
-#define TLV_STATION_ID		30
-#define TLV_VENDOR		26
-#define TLV_TIP_SERVER_V4	2
-
-#define TIP_VENDOR		58888
-
-enum socket_type {
-	RADIUS_AUTH = 0,
-	RADIUS_ACCT,
-	RADIUS_DAS
-};
+#define TLV_PROXY_STATE		33
 
 struct radius_socket {
 	struct uloop_fd fd;
@@ -52,53 +44,52 @@ struct radius_tlv {
 	char data[];
 };
 
-struct radius_station_id {
+struct radius_proxy_state_key {
 	char id[256];
 	enum socket_type type;
 };
 
-struct radius_station {
+struct radius_proxy_state {
 	struct avl_node avl;
-	struct radius_station_id key;
+	struct radius_proxy_state_key key;
 	int port;
 };
 
-static struct ubus_auto_conn conn;
-static uint32_t ucentral;
-static struct blob_buf b;
+static struct radius_socket *sock_auth;
+static struct radius_socket *sock_acct;
 
 static int
 avl_memcmp(const void *k1, const void *k2, void *ptr)
 {
-	return memcmp(k1, k2, sizeof(struct radius_station_id));
+	return memcmp(k1, k2, sizeof(struct radius_proxy_state_key));
 }
 
-static AVL_TREE(radius_stations, avl_memcmp, false, NULL);
+static AVL_TREE(radius_proxy_states, avl_memcmp, false, NULL);
+static struct blob_buf b;
 
 static void
-radius_station_add(char *id, int port, enum socket_type type)
+radius_proxy_state_add(char *id, int port, enum socket_type type)
 {
-	struct radius_station *station;
-	struct radius_station_id key = { .type = type };
+	struct radius_proxy_state *station;
+	struct radius_proxy_state_key key = { .type = type };
 
 	strcpy(key.id, id);
-	station = avl_find_element(&radius_stations, &key, station, avl);
+	station = avl_find_element(&radius_proxy_states, &key, station, avl);
 
 	if (!station) {
-		printf("new station/port, adding to avl tree\n");
+		ULOG_INFO("new station/port, adding to avl tree\n");
 		station = malloc(sizeof(*station));
 		memset(station, 0, sizeof(*station));
 		strcpy(station->key.id, id);
 		station->key.type = type;
 		station->avl.key = &station->key;
-		avl_insert(&radius_stations, &station->avl);
+		avl_insert(&radius_proxy_states, &station->avl);
 	}
 	station->port = port;
 }
 
-
 static char *
-b64(char *src, int len)
+b64enc(char *src, int len)
 {
 	char *dst;
 	int ret;
@@ -114,14 +105,25 @@ b64(char *src, int len)
 	return dst;
 }
 
+static char *
+b64dec(char *src, int *ret)
+{
+	int len = strlen(src);
+	char *dst = malloc(len);
+	*ret = b64_decode(src, dst, len);
+	if (*ret < 0)
+		return NULL;
+	return dst;
+}
+
 static void
-radius_forward(char *buf, char *server, enum socket_type type)
+radius_forward_gw(char *buf, enum socket_type type)
 {
 	struct radius_header *hdr = (struct radius_header *) buf;
 	struct ubus_request async = { };
-	char *data = b64(buf, hdr->len);
+	char *data = b64enc(buf, ntohs(hdr->len));
 
-	if (!data)
+	if (!data || !ucentral)
 		return;
 
 	blob_buf_init(&b, 0);
@@ -137,7 +139,6 @@ radius_forward(char *buf, char *server, enum socket_type type)
 	}
 
 	blobmsg_add_string(&b, "data", data);
-	blobmsg_add_string(&b, "dst", server);
 
 	ubus_invoke_async(&conn.ctx, ucentral, "radius", b.head, &async);
 	ubus_abort_request(&conn.ctx, &async);
@@ -146,22 +147,20 @@ radius_forward(char *buf, char *server, enum socket_type type)
 }
 
 static int
-radius_parse(char *buf, int len, int port, enum socket_type type)
+radius_parse(char *buf, int len, int port, enum socket_type type, int tx)
 {
 	struct radius_header *hdr = (struct radius_header *) buf;
-	struct radius_tlv *station_id = NULL;
-	char station_id_str[256] = {};
-	char server_ip_str[256] = {};
+	struct radius_tlv *proxy_state = NULL;
+	char proxy_state_str[256] = {};
 	void *avp = hdr->avp;
+	int len_orig = ntohs(hdr->len);
 
-	hdr->len = ntohs(hdr->len);
-
-	if (hdr->len != len) {
-		printf("invalid header length\n");
+	if (len_orig != len) {
+		ULOG_ERR("invalid header length, %d %d\n", len_orig, len);
 		return -1;
 	}
 
-	printf("\tcode:%d, id:%d, len:%d\n", hdr->code, hdr->id, hdr->len);
+	printf("\tcode:%d, id:%d, len:%d\n", hdr->code, hdr->id, len_orig);
 
 	len -= sizeof(*hdr);
 
@@ -169,39 +168,82 @@ radius_parse(char *buf, int len, int port, enum socket_type type)
 		struct radius_tlv *tlv = (struct radius_tlv *)avp;
 
 		if (len < tlv->len) {
-			printf("invalid TLV length\n");
+			ULOG_ERR("invalid TLV length\n");
 			return -1;
 		}
 
-		if (tlv->id == TLV_STATION_ID)
-			station_id = tlv;
-		if (tlv->id == TLV_VENDOR && ntohl(*(uint32_t *) tlv->data) == TIP_VENDOR) {
-			struct radius_tlv *vendor = (struct radius_tlv *) &tlv->data[6];
-
-			if (vendor->id == TLV_TIP_SERVER_V4)
-				strncpy(server_ip_str, vendor->data, vendor->len - 2);
-		}
+		if (tlv->id == TLV_PROXY_STATE)
+			proxy_state = tlv;
 
 		printf("\tID:%d, len:%d\n", tlv->id, tlv->len);
 		avp += tlv->len;
 		len -= tlv->len;
 	}
 
-	if (!station_id) {
-		printf("no station ID found\n");
+	if (!proxy_state) {
+		ULOG_ERR("no proxy_state found\n");
 		return -1;
 	}
-	if (!*server_ip_str) {
-		printf("no server ip found\n");
-		return -1;
-	}
-	memcpy(station_id_str, station_id->data, station_id->len - 2);
-	printf("\tcalling station id:%s, server ip:%s\n", station_id_str, server_ip_str);
-	radius_station_add(station_id_str, port, type);
+	memcpy(proxy_state_str, proxy_state->data, proxy_state->len - 2);
+	printf("\tfowarding to %s, prox_state:%s\n", tx ? "gateway" : "hostapd", proxy_state_str);
+	if (tx) {
+		radius_proxy_state_add(proxy_state_str, port, type);
+		radius_forward_gw(buf, type);
+	} else {
+		struct radius_proxy_state *proxy = avl_find_element(&radius_proxy_states, proxy_state, proxy, avl);
+		struct radius_proxy_state_key key = {};
+		struct sockaddr_in dest;
+		struct radius_socket *sock;
 
-	radius_forward(buf, server_ip_str, type);
+		switch(type) {
+		case RADIUS_AUTH:
+			sock = sock_auth;
+			break;
+
+		case RADIUS_ACCT:
+			sock = sock_acct;
+			break;
+		default:
+			ULOG_ERR("bad socket type\n");
+			return -1;
+		}
+
+		strcpy(key.id, proxy_state_str);
+		key.type = type;
+		proxy = avl_find_element(&radius_proxy_states, &key, proxy, avl);
+
+		if (!proxy) {
+			ULOG_ERR("unknown proxy_state, dropping frame\n");
+			return -1;
+		}
+		memset(&dest, 0, sizeof(dest));
+		dest.sin_family = AF_INET;
+		dest.sin_port = proxy->port;
+		inet_pton(AF_INET, "127.0.0.1", &(dest.sin_addr.s_addr));
+
+		if (sendto(sock->fd.fd, buf, len_orig,
+			   MSG_DONTWAIT, (struct sockaddr*)&dest, sizeof(dest)) < 0)
+			ULOG_ERR("failed to deliver frame to localhost\n");
+	}
 
 	return 0;
+}
+
+void
+gateway_recv(char *data, enum socket_type type)
+{
+	int len = 0;
+	char *frame;
+
+	frame = b64dec(data, &len);
+
+	if (!frame) {
+		ULOG_ERR("failed to b64_decode frame\n");
+		return;
+	}
+
+	radius_parse(frame, len, 0, type, 0);
+	free(frame);
 }
 
 static void
@@ -223,13 +265,10 @@ sock_recv(struct uloop_fd *u, unsigned int events)
 		.msg_control = cmsg_buf,
 		.msg_controllen = sizeof(cmsg_buf),
 	};
-	struct cmsghdr *cmsg;
 	struct radius_socket *sock = container_of(u, struct radius_socket, fd);
 	int len;
 
 	do {
-		struct in_pktinfo *pkti = NULL;
-
 		len = recvmsg(u->fd, &msg, 0);
 		if (len < 0) {
 			switch (errno) {
@@ -244,21 +283,9 @@ sock_recv(struct uloop_fd *u, unsigned int events)
 			}
 		}
 
-		for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-			if (cmsg->cmsg_type != IP_PKTINFO)
-				continue;
-
-			pkti = (struct in_pktinfo *) CMSG_DATA(cmsg);
-		}
-
-		if (!pkti) {
-			printf("Received packet without ifindex\n");
-			continue;
-		}
-
 		inet_ntop(AF_INET, &sin.sin_addr, addr_str, sizeof(addr_str));
 		printf("RX: src:%s:%d, len=%d\n", addr_str, sin.sin_port, len);
-		radius_parse(buf, len, sin.sin_port, sock->type);
+		radius_parse(buf, len, sin.sin_port, sock->type, 1);
 	} while (1);
 }
 
@@ -266,7 +293,6 @@ static struct radius_socket *
 sock_open(char *port, enum socket_type type)
 {
 	struct radius_socket *sock = malloc(sizeof(*sock));
-	int yes = 1;
 
 	if (!sock)
 		return NULL;
@@ -281,8 +307,6 @@ sock_open(char *port, enum socket_type type)
 		free(sock);
                 return NULL;
         }
-        if (setsockopt(sock->fd.fd, IPPROTO_IP, IP_PKTINFO, &yes, sizeof(yes)) < 0)
-		perror("setsockopt(IP_PKTINFO)");
 
 	sock->type = type;
 	sock->fd.cb = sock_recv;
@@ -292,65 +316,20 @@ sock_open(char *port, enum socket_type type)
 	return sock;
 }
 
-static void
-ubus_event_handler_cb(struct ubus_context *ctx,  struct ubus_event_handler *ev,
-		      const char *type, struct blob_attr *msg)
-{
-	enum {
-		EVENT_ID,
-		EVENT_PATH,
-		__EVENT_MAX
-	};
-
-	static const struct blobmsg_policy status_policy[__EVENT_MAX] = {
-		[EVENT_ID] = { .name = "id", .type = BLOBMSG_TYPE_INT32 },
-		[EVENT_PATH] = { .name = "path", .type = BLOBMSG_TYPE_STRING },
-	};
-
-	struct blob_attr *tb[__EVENT_MAX];
-	char *path;
-	uint32_t id;
-
-	blobmsg_parse(status_policy, __EVENT_MAX, tb, blob_data(msg), blob_len(msg));
-
-	if (!tb[EVENT_ID] || !tb[EVENT_PATH])
-		return;
-
-	path = blobmsg_get_string(tb[EVENT_PATH]);
-	id = blobmsg_get_u32(tb[EVENT_ID]);
-
-	if (strcmp(path, "ucentral"))
-		return;
-	if (!strcmp("ubus.object.remove", type))
-		ucentral = 0;
-	else
-		ucentral = id;
-}
-
-static struct ubus_event_handler ubus_event_handler = { .cb = ubus_event_handler_cb };
-
-static void
-ubus_connect_handler(struct ubus_context *ctx)
-{
-	ubus_register_event_handler(ctx, &ubus_event_handler, "ubus.object.add");
-	ubus_register_event_handler(ctx, &ubus_event_handler, "ubus.object.remove");
-
-	ubus_lookup_id(ctx, "ucentral", &ucentral);
-}
-
 int main(int argc, char **argv)
 {
+	ulog_open(ULOG_STDIO | ULOG_SYSLOG, LOG_DAEMON, "radius-gw-proxy");
 
 	uloop_init();
 
-	conn.cb = ubus_connect_handler;
-	ubus_auto_connect(&conn);
+	ubus_init();
 
-	sock_open("1812", RADIUS_AUTH);
-	sock_open("1813", RADIUS_ACCT);
+	sock_auth = sock_open("1812", RADIUS_AUTH);
+	sock_acct = sock_open("1813", RADIUS_ACCT);
 
 	uloop_run();
 	uloop_end();
+	ubus_deinit();
 
 	return 0;
 }
