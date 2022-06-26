@@ -1,0 +1,140 @@
+From: Stefano Brivio <sbrivio@redhat.com>
+Date: Tue, 4 Aug 2020 07:53:44 +0200
+Subject: [PATCH] vxlan: Support for PMTU discovery on directly bridged links
+
+If the interface is a bridge or Open vSwitch port, and we can't
+forward a packet because it exceeds the local PMTU estimate,
+trigger an ICMP or ICMPv6 reply to the sender, using the same
+interface to forward it back.
+
+If metadata collection is enabled, reverse destination and source
+addresses, so that Open vSwitch is able to match this packet against
+the existing, reverse flow.
+
+v2: Use netif_is_any_bridge_port() (David Ahern)
+
+Signed-off-by: Stefano Brivio <sbrivio@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -1903,7 +1903,7 @@ static struct dst_entry *vxlan6_get_rout
+ 
+ /* Bypass encapsulation if the destination is local */
+ static void vxlan_encap_bypass(struct sk_buff *skb, struct vxlan_dev *src_vxlan,
+-			       struct vxlan_dev *dst_vxlan)
++			       struct vxlan_dev *dst_vxlan, bool snoop)
+ {
+ 	struct pcpu_sw_netstats *tx_stats, *rx_stats;
+ 	union vxlan_addr loopback;
+@@ -1928,7 +1928,7 @@ static void vxlan_encap_bypass(struct sk
+ #endif
+ 	}
+ 
+-	if (dst_vxlan->flags & VXLAN_F_LEARN)
++	if ((dst_vxlan->flags & VXLAN_F_LEARN) && snoop)
+ 		vxlan_snoop(skb->dev, &loopback, eth_hdr(skb)->h_source);
+ 
+ 	u64_stats_update_begin(&tx_stats->syncp);
+@@ -1973,7 +1973,7 @@ static int encap_bypass_if_local(struct
+ 
+ 			return -ENOENT;
+ 		}
+-		vxlan_encap_bypass(skb, vxlan, dst_vxlan);
++		vxlan_encap_bypass(skb, vxlan, dst_vxlan, true);
+ 		return 1;
+ 	}
+ 
+@@ -1990,7 +1990,7 @@ static void vxlan_xmit_one(struct sk_buf
+ 	const struct iphdr *old_iph;
+ 	struct flowi4 fl4;
+ 	union vxlan_addr *dst;
+-	union vxlan_addr remote_ip;
++	union vxlan_addr remote_ip, local_ip;
+ 	struct vxlan_metadata _md;
+ 	struct vxlan_metadata *md = &_md;
+ 	__be16 src_port = 0, dst_port;
+@@ -2006,6 +2006,7 @@ static void vxlan_xmit_one(struct sk_buf
+ 		dst_port = rdst->remote_port ? rdst->remote_port : vxlan->cfg.dst_port;
+ 		vni = rdst->remote_vni;
+ 		dst = &rdst->remote_ip;
++		local_ip = vxlan->cfg.saddr;
+ 	} else {
+ 		if (!info) {
+ 			WARN_ONCE(1, "%s: Missing encapsulation instructions\n",
+@@ -2015,17 +2016,20 @@ static void vxlan_xmit_one(struct sk_buf
+ 		dst_port = info->key.tp_dst ? : vxlan->cfg.dst_port;
+ 		vni = be64_to_cpu(info->key.tun_id);
+ 		remote_ip.sa.sa_family = ip_tunnel_info_af(info);
+-		if (remote_ip.sa.sa_family == AF_INET)
++		if (remote_ip.sa.sa_family == AF_INET) {
+ 			remote_ip.sin.sin_addr.s_addr = info->key.u.ipv4.dst;
+-		else
++			local_ip.sin.sin_addr.s_addr = info->key.u.ipv4.src;
++		} else {
+ 			remote_ip.sin6.sin6_addr = info->key.u.ipv6.dst;
++			local_ip.sin6.sin6_addr = info->key.u.ipv6.src;
++		}
+ 		dst = &remote_ip;
+ 	}
+ 
+ 	if (vxlan_addr_any(dst)) {
+ 		if (did_rsc) {
+ 			/* short-circuited back to local bridge */
+-			vxlan_encap_bypass(skb, vxlan, vxlan);
++			vxlan_encap_bypass(skb, vxlan, vxlan, true);
+ 			return;
+ 		}
+ 		goto drop;
+@@ -2104,7 +2108,23 @@ static void vxlan_xmit_one(struct sk_buf
+ 		/* Reset the skb_iif to Tunnels interface index */
+ 		skb->skb_iif = dev->ifindex;
+ 
+-		skb_tunnel_check_pmtu(skb, &rt->dst, VXLAN_HEADROOM, false);
++		err = skb_tunnel_check_pmtu(skb, &rt->dst, VXLAN_HEADROOM,
++					    netif_is_any_bridge_port(dev));
++		if (err < 0) {
++			goto tx_error;
++		} else if (err) {
++			if (info) {
++				struct in_addr src, dst;
++
++				src = remote_ip.sin.sin_addr;
++				dst = local_ip.sin.sin_addr;
++				info->key.u.ipv4.src = src.s_addr;
++				info->key.u.ipv4.dst = dst.s_addr;
++			}
++			vxlan_encap_bypass(skb, vxlan, vxlan, false);
++			ip_rt_put(rt);
++			return;
++		}
+ 
+ 		tos = ip_tunnel_ecn_encap(tos, old_iph, skb);
+ 		ttl = ttl ? : ip4_dst_hoplimit(&rt->dst);
+@@ -2165,7 +2185,24 @@ static void vxlan_xmit_one(struct sk_buf
+ 				flags |= VXLAN_F_UDP_ZERO_CSUM6_TX;
+ 		}
+ 
+-		skb_tunnel_check_pmtu(skb, ndst, VXLAN6_HEADROOM, false);
++		err = skb_tunnel_check_pmtu(skb, ndst, VXLAN6_HEADROOM,
++					    netif_is_any_bridge_port(dev));
++		if (err < 0) {
++			goto tx_error;
++		} else if (err) {
++			if (info) {
++				struct in6_addr src, dst;
++
++				src = remote_ip.sin6.sin6_addr;
++				dst = local_ip.sin6.sin6_addr;
++				info->key.u.ipv6.src = src;
++				info->key.u.ipv6.dst = dst;
++			}
++
++			vxlan_encap_bypass(skb, vxlan, vxlan, false);
++			ip_rt_put(rt);
++			return;
++		}
+ 
+ 		ttl = ttl ? : ip6_dst_hoplimit(ndst);
+ 		err = vxlan6_xmit_skb(ndst, sk, skb, dev, &saddr, &dst->sin6.sin6_addr,
