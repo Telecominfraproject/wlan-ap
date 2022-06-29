@@ -40,6 +40,8 @@ static int ubus_frame_cb(struct ubus_context *ctx,
 		type = RADIUS_AUTH;
 	else if (!strcmp(radius, "acct"))
 		type = RADIUS_ACCT;
+	else if (!strcmp(radius, "coa"))
+		type = RADIUS_DAS;
 	else
 		return UBUS_STATUS_INVALID_ARGUMENT;
 
