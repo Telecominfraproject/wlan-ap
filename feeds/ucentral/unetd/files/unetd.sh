@@ -15,6 +15,7 @@ proto_unet_init_config() {
 	proto_config_add_string file
 	proto_config_add_int keepalive
 	proto_config_add_string domain
+	proto_config_add_string "tunnels:list(string)"
 	no_device=1
 	available=1
 	no_proto_task=1
@@ -23,8 +24,8 @@ proto_unet_init_config() {
 proto_unet_setup() {
 	local config="$1"
 
-	local device type key file keepalive domain
-	json_get_vars device type key file keepalive domain
+	local device type key file keepalive domain tunnels
+	json_get_vars device type key file keepalive domain tunnels
 	device="${device:-$config}"
 
 	[ -n "$file" ] && type="${type:-file}"
@@ -37,6 +38,15 @@ proto_unet_setup() {
 	json_add_string file "$file"
 	[ -n "$keepalive" ] && json_add_int keepalive "$keepalive"
 	json_add_string domain "$domain"
+
+	json_add_object tunnels
+	for t in $tunnels; do
+		local ifname="${t%%=*}"
+		local service="${t#*=}"
+		[ -n "$ifname" -a -n "$service" -a "$ifname" != "$t" ] || continue
+		json_add_string "$ifname" "$service"
+	done
+	json_close_object
 
 	ip link del dev "$device" >/dev/null 2>&1
 	ip link add dev "$device" type wireguard || {
