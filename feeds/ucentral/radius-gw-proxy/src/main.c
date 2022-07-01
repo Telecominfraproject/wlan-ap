@@ -23,6 +23,7 @@
 
 #define RAD_PROX_BUFLEN		(4 * 1024)
 
+#define TLV_NAS_IP		4
 #define TLV_PROXY_STATE		33
 
 struct radius_socket {
@@ -57,6 +58,7 @@ struct radius_proxy_state {
 
 static struct radius_socket *sock_auth;
 static struct radius_socket *sock_acct;
+static struct radius_socket *sock_dae;
 
 static int
 avl_memcmp(const void *k1, const void *k2, void *ptr)
@@ -134,6 +136,9 @@ radius_forward_gw(char *buf, enum socket_type type)
 	case RADIUS_ACCT:
 		blobmsg_add_string(&b, "radius", "acct");
 		break;
+	case RADIUS_DAS:
+		blobmsg_add_string(&b, "radius", "coa");
+		break;
 	default:
 		return;
 	}
@@ -154,6 +159,7 @@ radius_parse(char *buf, int len, int port, enum socket_type type, int tx)
 	char proxy_state_str[256] = {};
 	void *avp = hdr->avp;
 	int len_orig = ntohs(hdr->len);
+	uint8_t localhost[] = { 0x7f, 0, 0, 1 };
 
 	if (len_orig != len) {
 		ULOG_ERR("invalid header length, %d %d\n", len_orig, len);
@@ -175,9 +181,30 @@ radius_parse(char *buf, int len, int port, enum socket_type type, int tx)
 		if (tlv->id == TLV_PROXY_STATE)
 			proxy_state = tlv;
 
+		if (type == RADIUS_DAS && tlv->id == TLV_NAS_IP && tlv->len == 6)
+			memcpy(tlv->data, &localhost, 4);
+
 		printf("\tID:%d, len:%d\n", tlv->id, tlv->len);
 		avp += tlv->len;
 		len -= tlv->len;
+	}
+
+	if (type == RADIUS_DAS) {
+		if (tx) {
+			radius_forward_gw(buf, type);
+		} else {
+			struct sockaddr_in dest;
+
+			memset(&dest, 0, sizeof(dest));
+			dest.sin_family = AF_INET;
+			dest.sin_port = htons(3799);
+			inet_pton(AF_INET, "127.0.0.1", &(dest.sin_addr.s_addr));
+
+			if (sendto(sock_dae->fd.fd, buf, len_orig,
+				   MSG_DONTWAIT, (struct sockaddr*)&dest, sizeof(dest)) < 0)
+				ULOG_ERR("failed to deliver DAS frame to localhost\n");
+		}
+		return 0;
 	}
 
 	if (!proxy_state) {
@@ -326,6 +353,7 @@ int main(int argc, char **argv)
 
 	sock_auth = sock_open("1812", RADIUS_AUTH);
 	sock_acct = sock_open("1813", RADIUS_ACCT);
+	sock_dae = sock_open("1814", RADIUS_DAS);
 
 	uloop_run();
 	uloop_end();
