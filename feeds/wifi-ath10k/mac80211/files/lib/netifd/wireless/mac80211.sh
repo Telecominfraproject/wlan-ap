@@ -495,8 +495,9 @@ mac80211_hostapd_setup_bss() {
 	[ "$wds" -gt 0 ] && {
 		append hostapd_cfg "wds_sta=1" "$N"
 		[ -n "$wds_bridge" ] && append hostapd_cfg "wds_bridge=$wds_bridge" "$N"
+		[ "$staidx" -gt 0 ] && append hostapd_cfg "start_disabled=1" "$N"
 	}
-	[ "$staidx" -gt 0 -o "$start_disabled" -eq 1 ] && append hostapd_cfg "start_disabled=1" "$N"
+	[ "$start_disabled" -eq 1 ] && append hostapd_cfg "start_disabled=1" "$N"
 
 	cat >> /var/run/hostapd-$phy.conf <<EOF
 $hostapd_cfg
@@ -777,7 +778,11 @@ mac80211_setup_supplicant() {
 	NEW_MD5_SP=$(test -e "${_config}" && md5sum ${_config})
 	OLD_MD5_SP=$(uci -q -P /var/state get wireless._${phy}.md5_${ifname})
 	if [ "$add_sp" = "1" ]; then
-		wpa_supplicant_run "$ifname" "$hostapd_ctrl"
+		if [ "$wds" -gt 0 ]; then
+			wpa_supplicant_run "$ifname" "$hostapd_ctrl"
+		else
+			wpa_supplicant_run "$ifname"
+		fi
 	else
 		[ "${NEW_MD5_SP}" == "${OLD_MD5_SP}" ] || ubus call $spobj reload
 	fi
@@ -919,7 +924,7 @@ mac80211_setup_vif() {
 	local action=up
 
 	json_select data
-	json_get_vars ifname
+	json_get_vars ifname wds
 	json_select ..
 
 	json_select config
