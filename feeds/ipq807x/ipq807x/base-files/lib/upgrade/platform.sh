@@ -32,6 +32,15 @@ find_mmc_part() {
 	done
 }
 
+do_flash_bootconfig_emmc() {
+        local bin=$1
+        local emmcblock=$2
+	echo "In do_flash_bootconfig_emmc bin is $bin emmc $emmcblock"
+        dd if=/dev/zero of=${emmcblock}
+        dd if=/tmp/${bin}.bin of=${emmcblock}
+}
+
+
 do_flash_emmc() {
 	local tar_file=$1
 	local emmcblock=$(find_mmc_part $2)
@@ -63,6 +72,102 @@ emmc_do_upgrade() {
         fi
 }
 
+do_populate_emmc() {
+        local bin=$1
+        local emmcblock=$2
+
+	echo erase $emmcblock
+        dd if=/dev/zero of=${emmcblock} 2> /dev/null
+	echo flash $emmcblock
+        dd if=/tmp/${bin}.bin of=${emmcblock}
+}
+
+
+do_flash_failsafe_partition() {
+        local tar_file=$1
+        local mtdname=$2
+	local section=$3
+        local emmcblock
+        local primaryboot
+	local board_dir="sysupgrade-slink_r680"
+
+        local mtd_part=$(cat /proc/mtd | grep $mtdname)
+        [ -z "$mtd_part" ] && {
+                mtd_part=$(echo $(find_mmc_part "$mtdname"))
+                [ -z "$mtd_part" ] && return 1
+        }
+
+        # Fail safe upgrade
+        [ -f /proc/boot_info/$mtdname/upgradepartition ] && {
+                default_mtd=$mtdname
+                mtdname=$(cat /proc/boot_info/$mtdname/upgradepartition)
+		echo "SK: Upgrade partion is $mtdname"
+                primaryboot=$(cat /proc/boot_info/$default_mtd/primaryboot)
+                if [ $primaryboot -eq 0 ]; then
+                        echo 1 > /proc/boot_info/$default_mtd/primaryboot
+                else
+                        echo 0 > /proc/boot_info/$default_mtd/primaryboot
+                fi
+        }
+
+        emmcblock="$(find_mmc_part "$mtdname")"
+	echo "Flashing $emmcblock"
+
+        if [ -e "$emmcblock" ]; then
+		echo erase $emmcblock
+		dd if=/dev/zero of=${emmcblock} 2> /dev/null
+		echo flash $emmcblock
+		tar Oxf $tar_file ${board_dir}/$section | dd of=${emmcblock}
+
+        else
+		echo "We came in the worng location"
+        fi
+
+}
+
+do_flash_bootconfig() {
+        local bin=$1
+        local mtdname=$2
+	local emmcblock=$(find_mmc_part $2)
+
+        # Indicate the bootloader that formware upgrade is complete.
+        if [ -f /proc/boot_info/getbinary_${bin} ]; then
+                cat /proc/boot_info/getbinary_${bin} > /tmp/${bin}.bin
+                do_populate_emmc $bin $emmcblock
+        fi
+}
+
+platform_version_upgrade() {
+        local version_files="appsbl_version sbl_version tz_version hlos_version rpm_version"
+        local sys="/sys/devices/system/qfprom/qfprom0/"
+        local tmp="/tmp/"
+
+        for file in $version_files; do
+                [ -f "${tmp}${file}" ] && {
+                        echo "Updating "${sys}${file}" with `cat "${tmp}${file}"`"
+                        echo `cat "${tmp}${file}"` > "${sys}${file}"
+                        rm -f "${tmp}${file}"
+                }
+        done
+}
+
+emmc_do_upgrade_failsafe() {
+	local tar_file="$1"
+
+	do_flash_failsafe_partition $1 '0:HLOS' kernel
+	do_flash_failsafe_partition $1 'rootfs' root
+	local emmcblock="$(find_mmc_part "rootfs_data")"
+        if [ -e "$emmcblock" ]; then
+                mkfs.ext4 -F "$emmcblock"
+        fi
+
+	do_flash_bootconfig bootconfig "0:BOOTCONFIG"
+	do_flash_bootconfig bootconfig1 "0:BOOTCONFIG1"
+	platform_version_upgrade
+}
+
+
+
 platform_check_image() {
 	local magic_long="$(get_magic_long "$1")"
 	board=$(board_name)
@@ -90,7 +195,8 @@ platform_check_image() {
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\
-	qcom,ipq5018-mp03.3)
+	qcom,ipq5018-mp03.3|\
+	slink,r680)
 		[ "$magic_long" = "73797375" ] && return 0
 		;;
 	esac
@@ -110,6 +216,9 @@ platform_do_upgrade() {
 	motorola,q14)
 		emmc_do_upgrade $1
 		;;
+	slink,r680)
+		emmc_do_upgrade_failsafe $1
+		;;
 	cig,wf188n|\
 	cig,wf194c|\
 	cig,wf194c4|\
@@ -126,7 +235,7 @@ platform_do_upgrade() {
 	wallys,dr6018-v4|\
 	yuncore,ax840|\
 	tplink,ex447|\
-	tplink,ex227)	
+	tplink,ex227)
 		nand_upgrade_tar "$1"
 		;;
 	hfcl,ion4xi|\
