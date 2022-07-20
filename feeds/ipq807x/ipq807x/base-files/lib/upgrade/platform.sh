@@ -129,7 +129,9 @@ platform_do_upgrade() {
 	wallys,dr6018-v4|\
 	yuncore,ax840|\
 	tplink,ex447|\
-	tplink,ex227)	
+	tplink,ex227|\
+	meshpp,s618-cp03|\
+	meshpp,s618-cp01)
 		nand_upgrade_tar "$1"
 		;;
 	hfcl,ion4xi|\
