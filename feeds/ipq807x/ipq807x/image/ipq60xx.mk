@@ -122,3 +122,21 @@ define Device/plasmacloud_pax1800-v2
   DEVICE_PACKAGES += ath11k-wifi-plasmacloud-pax1800
 endef
 TARGET_DEVICES += plasmacloud_pax1800-v2
+
+define Device/meshpp_s618_cp03
+  DEVICE_TITLE := S618 cp03
+  DEVICE_DTS := qcom-ipq6018-meshpp-s618-cp03
+  SUPPORTED_DEVICES := meshpp,s618-cp03
+  DEVICE_DTS_CONFIG := config@cp03-c1
+  DEVICE_PACKAGES := ath11k-wifi-meshpp-s618 -kmod-usb-dwc3-of-simple kmod-usb-dwc3-qcom kmod-usb3
+endef
+TARGET_DEVICES += meshpp_s618_cp03
+
+define Device/meshpp_s618_cp01
+  DEVICE_TITLE := S618 cp01
+  DEVICE_DTS := qcom-ipq6018-meshpp-s618-cp01
+  SUPPORTED_DEVICES := meshpp,s618-cp01
+  DEVICE_DTS_CONFIG := config@cp01-c1
+  DEVICE_PACKAGES := ath11k-wifi-meshpp-s618 -kmod-usb-dwc3-of-simple kmod-usb-dwc3-qcom kmod-usb3
+endef
+TARGET_DEVICES += meshpp_s618_cp01

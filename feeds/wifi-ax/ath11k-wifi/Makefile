@@ -41,7 +41,8 @@ ALLWIFIBOARDS:= \
 	wallys-dr6018-v4 \
 	tplink-ex227 \
 	tplink-ex447 \
-	yuncore-ax840
+	yuncore-ax840 \
+	meshpp-s618
 
 ALLWIFIPACKAGES:=$(foreach BOARD,$(ALLWIFIBOARDS),ath11k-wifi-$(BOARD))
 
@@ -106,6 +107,11 @@ endef
 define Package/ath11k-wifi-hfcl-ion4xi
 $(call Package/ath11k-wifi-default)
     TITLE:=hfcl-ion4xi bdf
+endef
+
+define Package/ath11k-wifi-meshpp-s618
+$(call Package/ath11k-wifi-default)
+    TITLE:=meshpp-s618 bdf
 endef
 
 define ath11k-wifi-install-one-to
@@ -212,6 +218,11 @@ define Package/ath11k-wifi-plasmacloud-pax1800/install
 	$(INSTALL_DATA) ./board-plasmacloud-pax1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
 endef
 
+define Package/ath11k-wifi-meshpp-s618/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-2-meshpp-s618.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
+endef
+
 define Package/ath11k-wifi-hfcl-ion4xi/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
 	$(INSTALL_DATA) ./board-hfcl-ion4xi.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
@@ -232,6 +243,7 @@ $(eval $(call generate-ath11k-wifi-package,edgecore-eap104,Edgecore EAP104))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex227,TP-Link EX227))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex447,TP-Link EX447))
 $(eval $(call generate-ath11k-wifi-package,yuncore-ax840,YunCore AX840))
+$(eval $(call generate-ath11k-wifi-package,meshpp-s618,Mesh++ S618))
 
 $(foreach PACKAGE,$(ALLWIFIPACKAGES),$(eval $(call BuildPackage,$(PACKAGE))))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq5018))
