@@ -55,7 +55,9 @@ emmc_do_upgrade() {
 	local board_dir=$(tar tf $tar_file | grep -m 1 '^sysupgrade-.*/$')
 	board_dir=${board_dir%/}
 	do_flash_emmc $tar_file '0:HLOS' $board_dir kernel
+	do_flash_emmc $tar_file '0:HLOS_1' $board_dir kernel
 	do_flash_emmc $tar_file 'rootfs' $board_dir root
+	do_flash_emmc $tar_file 'rootfs_1' $board_dir root
 
 	local emmcblock="$(find_mmc_part "rootfs_data")"
         if [ -e "$emmcblock" ]; then
