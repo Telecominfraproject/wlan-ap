@@ -118,7 +118,6 @@ platform_do_upgrade() {
 	cig,wf194c4|\
 	cig,wf196|\
 	cybertan,eww622-a1|\
-	edgecore,eap104|\
 	glinet,ax1800|\
 	glinet,axt1800|\
 	qcom,ipq6018-cp01|\
@@ -145,6 +144,7 @@ platform_do_upgrade() {
 		fi
 		nand_upgrade_tar "$1"
 		;;
+	edgecore,eap104|\
 	edgecore,eap106)
 		CI_UBIPART="rootfs1"
 		[ "$(find_mtd_chardev rootfs)" ] && CI_UBIPART="rootfs"
