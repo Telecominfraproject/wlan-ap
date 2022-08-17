@@ -1,16 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=usteer
+PKG_SOURCE_DATE:=2022-08-16
+PKG_SOURCE_VERSION:=041e88424081969777bc5db76b37d2d792671fa0
 PKG_RELEASE:=1
 
-PKG_SOURCE_URL=https://git.openwrt.org/project/usteer.git
-PKG_MIRROR_HASH:=34a9f2867b3e9050d4707b986481681f97f6fad71bc3fb3276fa3c3b26e2ab67
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_DATE:=2021-04-19
-PKG_SOURCE_VERSION:=f42bf2962edd0199e4c96ebf19933b2846bcce27
-#PKG_MIRROR_HASH:=fe00f6ba4e188c1235338a6786c8b23a11a5d4b0e663ffb494ac3d2f4bdc1864
+PKG_SOURCE_URL=https://git.openwrt.org/project/usteer.git
+PKG_MIRROR_HASH:=c145ec34bb725b32d3e5d6f6ae13355c383b1c9750de6f70b7c0482ff382d15a
 
-PKG_BUILD_PARALLEL:=1
+PKG_MAINTAINER:=David Bauer <mail@david-bauer.net>
+PKG_LICENSE:=GPL-2.0-only
+
+PKG_BUILD_DEPENDS:=libpcap
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
@@ -18,7 +22,7 @@ include $(INCLUDE_DIR)/cmake.mk
 define Package/usteer
   SECTION:=net
   CATEGORY:=Network
-  DEPENDS:=+libubox +libubus +libblobmsg-json +libnl-tiny +libpcap
+  DEPENDS:=+libubox +libubus +libblobmsg-json +libnl-tiny
   TITLE:=OpenWrt AP roaming assist daemon
 endef
 
@@ -28,8 +32,11 @@ endef
 
 define Package/usteer/install
 	$(INSTALL_DIR) $(1)/sbin $(1)/etc/init.d $(1)/etc/config
-	$(CP) ./files/* $(1)/
-	$(CP) $(PKG_BUILD_DIR)/{usteerd,ap-monitor} $(1)/sbin/
+
+	$(CP) $(PKG_BUILD_DIR)/openwrt/usteer/files/etc/config/usteer $(1)/etc/config/usteer
+
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/openwrt/usteer/files/etc/init.d/usteer $(1)/etc/init.d/usteer
+	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/sbin/usteerd $(1)/sbin/usteerd
 endef
 
 $(eval $(call BuildPackage,usteer))
