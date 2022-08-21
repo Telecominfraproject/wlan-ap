@@ -103,6 +103,11 @@ $(call Package/ath11k-wifi-default)
     TITLE:=plasmacloud-pax1800(-v2) bdf
 endef
 
+define Package/ath11k-wifi-hfcl-ion4xi
+$(call Package/ath11k-wifi-default)
+    TITLE:=hfcl-ion4xi bdf
+endef
+
 define ath11k-wifi-install-one-to
   $(INSTALL_DIR)  $(2)/lib/firmware/$(3)/
   $(INSTALL_DATA) $(1) $(2)/lib/firmware/$(3)/board.bin
@@ -207,6 +212,11 @@ define Package/ath11k-wifi-plasmacloud-pax1800/install
 	$(INSTALL_DATA) ./board-plasmacloud-pax1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
 endef
 
+define Package/ath11k-wifi-hfcl-ion4xi/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-hfcl-ion4xi.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
+endef
+
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
 $(eval $(call generate-ath11k-wifi-package,cig-wf188n,Cigtech WF188n))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c,Cigtech WF194c))
@@ -231,3 +241,4 @@ $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq6018))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-qcn9000))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g))
 $(eval $(call BuildPackage,ath11k-wifi-motorola-q14))
+$(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi))
