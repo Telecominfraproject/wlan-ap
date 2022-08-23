@@ -1063,7 +1063,7 @@ drv_mac80211_setup() {
 		return 1
 	}
 	
-	[ "$band" = "6g" ] && multiple_bssid=1
+	[ "$band" = "6g" ] && set_default multiple_bssid 1
 
 	wireless_set_data phy="$phy"
 	[ -z "$(uci -q -P /var/state show wireless._${phy})" ] && uci -q -P /var/state set wireless._${phy}=phy
