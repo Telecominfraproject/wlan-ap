@@ -888,14 +888,20 @@ hostapd_set_bss_options() {
 			set_default mobility_domain "$(echo "$ssid" | md5sum | head -c 4)"
 			set_default ft_over_ds 1
 			set_default reassociation_deadline 1000
+			skip_kh_setup=0
 
 			case "$auth_type" in
-				psk|sae|psk-sae)
+				psk|psk-sae)
 					set_default ft_psk_generate_local 1
+					skip_kh_setup="$ft_psk_generate_local"
 				;;
 				*)
 					set_default ft_psk_generate_local 0
 				;;
+			esac
+
+			case "$auth_type" in
+				*sae*) skip_kh_setup=0;;
 			esac
 
 			[ -n "$network_ifname" ] && append bss_conf "ft_iface=$network_ifname" "$N"
@@ -905,7 +911,7 @@ hostapd_set_bss_options() {
 			append bss_conf "reassociation_deadline=$reassociation_deadline" "$N"
 			[ -n "$nasid" ] || append bss_conf "nas_identifier=${macaddr//\:}" "$N"
 
-			if [ "$ft_psk_generate_local" -eq "0" ]; then
+			if [ "$skip_kh_setup" -eq "0" ]; then
 				json_get_vars r0_key_lifetime r1_key_holder pmk_r1_push
 				json_get_values r0kh r0kh
 				json_get_values r1kh r1kh
