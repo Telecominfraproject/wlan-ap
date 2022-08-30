@@ -6,16 +6,16 @@ let fs = require('fs');
 let rtnl = require('rtnl');
 let uam = require('uam');
 
-let file = fs.open('/usr/share/uspot/header', 'r');
+let uci = require('uci').cursor();
+let config = uci.get_all('uspot');
+
+let file = fs.open(config.config.web_root == 1 ? '/tmp/ucentral/www-uspot/header.html' : '/usr/share/uspot/header', 'r');
 let header = file.read('all');
 file.close();
 
-file = fs.open('/usr/share/uspot/footer', 'r');
+file = fs.open(config.config.web_root == 1 ? '/tmp/ucentral/www-uspot/footer.html' : '/usr/share/uspot/footer', 'r');
 let footer = file.read('all');
 file.close();
-
-let uci = require('uci').cursor();
-let config = uci.get_all('uspot');
 
 // fs.open wrapper
 function fs_open(cmd) {
@@ -60,8 +60,7 @@ function request_start(ctx) {
 			'&mac=' + replace(ctx.mac, ':', '-') +
 			'&ip=' + ctx.env.REMOTE_ADDR +
 			'&called=' + config.uam.nasmac +
-			'&nasid=' + config.uam.nasid +
-			'&userurl=www.google.com';
+			'&nasid=' + config.uam.nasid;
 		ctx.uam_location += '&md=' + uam.md5(ctx.uam_location, config.uam.uam_secret);
 		include('uam.uc', ctx);
 		return;
