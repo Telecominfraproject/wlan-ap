@@ -2,7 +2,7 @@
 
 
 RAMFS_COPY_BIN='fw_setenv'
-RAMFS_COPY_DATA='/etc/fw_env.config /var/lock/fw_printenv.lock'
+RAMFS_COPY_DATA='/etc/fw_env.config /var/lock/fw_printenv.lock /tmp/downgrade'
 
 qca_do_upgrade() {
         local tar_file="$1"
@@ -153,7 +153,11 @@ platform_do_upgrade() {
 		if [ "$(find_mtd_chardev rootfs)" ]; then
 			CI_UBIPART="rootfs"
 		else
-			if grep -q rootfs1 /proc/cmdline; then
+			if [ -e /tmp/downgrade ]; then
+				CI_UBIPART="rootfs1"
+				fw_setenv active 1 || exit 1
+				fw_setenv upgrade_available 0 || exit 1
+			elif grep -q rootfs1 /proc/cmdline; then
 				CI_UBIPART="rootfs2"
 				fw_setenv active 2 || exit 1
 			else
