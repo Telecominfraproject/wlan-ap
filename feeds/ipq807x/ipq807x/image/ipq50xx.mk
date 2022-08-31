@@ -46,3 +46,12 @@ define Device/qcom_mp03_3
   DEVICE_DTS_CONFIG := config@mp03.3
 endef
 TARGET_DEVICES += qcom_mp03_3
+ 
+define Device/indio_um-325ax
+  DEVICE_TITLE := Indio UM-325AX
+  DEVICE_DTS := qcom-ipq5018-indio-um-325ax
+  SUPPORTED_DEVICES := indio,um-325ax
+  DEVICE_PACKAGES := ath11k-wifi-indio-um-325ax ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.3
+endef
+TARGET_DEVICES += indio_um-325ax

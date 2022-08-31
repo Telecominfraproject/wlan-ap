@@ -82,6 +82,7 @@ platform_check_image() {
 	edgecore,eap102|\
 	edgecore,eap104|\
 	edgecore,eap106|\
+	indio,um-325ax|\
 	hfcl,ion4xi|\
 	hfcl,ion4xe|\
 	plasmacloud,pax1800-v1|\
@@ -121,6 +122,7 @@ platform_do_upgrade() {
 	edgecore,eap104|\
 	glinet,ax1800|\
 	glinet,axt1800|\
+	indio,um-325ax|\
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\
