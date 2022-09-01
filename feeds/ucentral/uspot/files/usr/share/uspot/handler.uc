@@ -193,10 +193,9 @@ global.handle_request = function(env) {
 	// split QUERY_STRING
 	if (env.QUERY_STRING)
 		for (let chunk in split(env.QUERY_STRING, '&')) {
-			let var = split(chunk, '=');
-			if (length(var) != 2)
-				continue;
-			ctx.query_string[var[0]] = var[1];
+			let m = match(chunk, /^([^=]+)=(.*)$/);
+			if (!m) continue;
+			ctx.query_string[m[1]] = replace(m[2], /%([[:xdigit:]][[:xdigit:]])/g, (m, h) => chr(hex(h) || 0x20));
 		}
 
 	// recv POST data

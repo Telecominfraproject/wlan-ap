@@ -13,6 +13,8 @@ enum {
         RADIUS_SERVER,
         RADIUS_USERNAME,
         RADIUS_PASSWORD,
+        RADIUS_CHAP_PASSWORD,
+        RADIUS_CHAP_CHALLENGE,
         RADIUS_ACCT_SESSION,
         RADIUS_CLIENT_IP,
         RADIUS_CALLED_STATION,
@@ -27,6 +29,8 @@ static const struct blobmsg_policy radius_policy[__RADIUS_MAX] = {
         [RADIUS_SERVER] = { .name = "server", .type = BLOBMSG_TYPE_STRING },
         [RADIUS_USERNAME] = { .name = "username", .type = BLOBMSG_TYPE_STRING },
         [RADIUS_PASSWORD] = { .name = "password", .type = BLOBMSG_TYPE_STRING },
+        [RADIUS_CHAP_PASSWORD] = { .name = "chap_password", .type = BLOBMSG_TYPE_STRING },
+        [RADIUS_CHAP_CHALLENGE] = { .name = "chap_challenge", .type = BLOBMSG_TYPE_STRING },
         [RADIUS_ACCT_SESSION] = { .name = "acct_session", .type = BLOBMSG_TYPE_STRING },
         [RADIUS_CLIENT_IP] = { .name = "client_ip", .type = BLOBMSG_TYPE_STRING },
         [RADIUS_CALLED_STATION] = { .name = "called_station", .type = BLOBMSG_TYPE_STRING },
@@ -40,6 +44,8 @@ static struct config {
 	char *server;
 	char *username;
 	char *password;
+	char chap_password[17];
+	char chap_challenge[16];
 	char *acct_session;
 	struct sockaddr_in client_ip;
 	char *called_station;
@@ -50,6 +56,26 @@ static struct config {
 
 static struct blob_buf b = {};
 static struct blob_attr *tb[__RADIUS_MAX] = {};
+
+static int
+str_to_hex(char *in, char *out, int olen)
+{
+	int ilen = strlen(in);
+	int len = 0;
+
+	while (ilen >= 2 && olen > 1) {
+		int c;
+		sscanf(in, "%2x", &c);
+		*out++ = (char) c;
+
+		in += 2;
+		ilen -= 2;
+		len++;
+	}
+	*out = '\0';
+
+	return len;
+}
 
 static int
 result(rc_handle const *rh, int accept, VALUE_PAIR *pair)
@@ -92,6 +118,14 @@ config_load(void)
 
 	if (tb[RADIUS_PASSWORD])
 		config.password = blobmsg_get_string(tb[RADIUS_PASSWORD]);
+
+	if (tb[RADIUS_CHAP_PASSWORD]) {
+		*config.chap_password = '\0';
+		str_to_hex(blobmsg_get_string(tb[RADIUS_CHAP_PASSWORD]), &config.chap_password[1], 16);
+	}
+
+	if (tb[RADIUS_CHAP_CHALLENGE])
+		str_to_hex(blobmsg_get_string(tb[RADIUS_CHAP_CHALLENGE]), config.chap_challenge, 16);
 
 	if (tb[RADIUS_ACCT_SESSION])
 		config.acct_session = blobmsg_get_string(tb[RADIUS_ACCT_SESSION]);
@@ -222,6 +256,64 @@ uam_auth(void)
 }
 
 static int
+uam_chap_auth(void)
+{
+	VALUE_PAIR *send = NULL, *received;
+	rc_handle *rh = NULL;
+
+	if (!config.server || !config.username ||
+	    !config.acct_session || !config.called_station ||
+	    !config.calling_station || !config.nas_id)
+		return result(NULL, 0, NULL);
+
+	rh = radius_init();
+	if (!rh)
+		return result(NULL, 0, NULL);
+
+	if (rc_avpair_add(rh, &send, PW_USER_NAME, config.username, -1, 0) == NULL)
+		return result(rh, 0, NULL);
+
+	if (rc_avpair_add(rh, &send, PW_CHAP_PASSWORD, config.chap_password, 17, 0) == NULL)
+		return result(rh, 0, NULL);
+
+	if (rc_avpair_add(rh, &send, PW_CHAP_CHALLENGE, config.chap_challenge, 16, 0) == NULL)
+		return result(rh, 0, NULL);
+
+	if (rc_avpair_add(rh, &send, PW_ACCT_SESSION_ID, config.acct_session, -1, 0) == NULL)
+		return result(rh, 0, NULL);
+
+	if (rc_avpair_add(rh, &send, PW_FRAMED_IP_ADDRESS, &config.client_ip.sin_addr, 4, 0) == NULL)
+		return result(rh, 0, NULL);
+
+	//if (rc_avpair_add(rh, &send, PW_NAS_PORT_TYPE, , -1, 0) == NULL)
+	//	return result(rh, 0, NULL);
+
+	//if (rc_avpair_add(rh, &send, PW_NAS_PORT, , -1, 0) == NULL)
+	//	return result(rh, 0, NULL);
+
+//	if (rc_avpair_add(rh, &send, PW_NAS_PORT_ID_STRING, , -1, 0) == NULL)
+//		return result(rh, 0, NULL);
+
+	if (rc_avpair_add(rh, &send, PW_CALLED_STATION_ID, config.called_station, -1, 0) == NULL)
+		return result(rh, 0, NULL);
+
+	if (rc_avpair_add(rh, &send, PW_CALLING_STATION_ID, config.calling_station, -1, 0) == NULL)
+		return result(rh, 0, NULL);
+
+	if (rc_avpair_add(rh, &send, PW_NAS_IP_ADDRESS, &config.nas_ip.sin_addr, 4, 0) == NULL)
+		return result(rh, 0, NULL);
+
+	if (rc_avpair_add(rh, &send, PW_NAS_IDENTIFIER, config.nas_id, -1, 0) == NULL)
+		return result(rh, 0, NULL);
+
+	rc_apply_config(rh);
+	if (rc_auth(rh, 0, send, &received, NULL) == OK_RC)
+		return result(rh, 1, received);
+
+	return result(rh, 0, NULL);
+}
+
+static int
 uam_acct(void)
 {
 	VALUE_PAIR *send = NULL, *received;
@@ -297,6 +389,9 @@ main(int argc, char **argv)
 
 	if (!strcmp(config.type, "uam-auth"))
 		return uam_auth();
+
+	if (!strcmp(config.type, "uam-chap-auth"))
+		return uam_chap_auth();
 
 	if (!strcmp(config.type, "uam-acct"))
 		return uam_acct();

@@ -21,30 +21,43 @@ let uam = require('uam');
 // give a client access to the internet
 function allow_client(ctx) {
 	system('ubus call spotfilter client_set \'{ "interface": "hotspot", "address": "' + replace(ctx.mac, '-', ':') + '", "state": 1, "dns_state": 1}\'');
-	include('allow.uc', ctx);
+	if (ctx.query_string.userurl)
+		include('uam.uc', { uam_location: ctx.query_string.userurl });
+	else
+		include('allow.uc', ctx);
 }
 
 // log the client in via radius
 function auth_client(ctx) {
-	if (!ctx.query_string.username || !ctx.query_string.password) {
-		include('allow.uc', ctx);
-		return false;
-	}
-	let password = uam.password(uam.md5(config.uam.challenge, ctx.mac), ctx.query_string.password, config.uam.uam_secret);
-
-	let cfg = fs.open('/tmp/' + ctx.mac + '.json', 'w');
-	cfg.write({
-		type: 'uam-auth',
+	let password;
+	let payload = {
 		server: sprintf('%s:%s:%s',config.radius.auth_server, config.radius.auth_port, config.radius.auth_secret),
-		username: ctx.mac,
-		password,
 		acct_session: "0123456789",
 		client_ip: ctx.env.REMOTE_ADDR,
 		called_station: ctx.mac,
 		calling_station: config.uam.nasmac,
 		nas_ip: ctx.env.SERVER_ADDR,
 		nas_id: config.uam.nasid
-	});
+	};
+
+	if (ctx.query_string.username && ctx.query_string.response) {
+		let challenge = uam.md5(config.uam.challenge, ctx.mac);
+
+		payload.type = 'uam-chap-auth';
+		payload.username = ctx.query_string.username;
+		payload.chap_password = ctx.query_string.response;
+		if (config.uam.secret)
+			payload.chap_challenge = uam.chap_challenge(challenge, config.uam.uam_secret);
+		else
+			payload.chap_challenge = challenge;
+	} else if (ctx.query_string.username && ctx.query_string.password) {
+		payload.type = 'uam-auth';
+		payload.username = ctx.mac;
+		payload.password = uam.password(uam.md5(config.uam.challenge, ctx.mac), ctx.query_string.password, config.uam.uam_secret);
+	}
+
+	let cfg = fs.open('/tmp/' + ctx.mac + '.json', 'w');
+	cfg.write(payload);
 	cfg.close();
 
 	let stdout = fs.popen('/usr/bin/radius-client /tmp/' + ctx.mac + '.json');
@@ -82,10 +95,9 @@ global.handle_request = function(env) {
 	// split QUERY_STRING
 	if (env.QUERY_STRING)
 		for (let chunk in split(env.QUERY_STRING, '&')) {
-			let var = split(chunk, '=');
-			if (length(var) != 2)
-				continue;
-			ctx.query_string[var[0]] = var[1];
+			let m = match(chunk, /^([^=]+)=(.*)$/);
+			if (!m) continue;
+			ctx.query_string[m[1]] = replace(m[2], /%([[:xdigit:]][[:xdigit:]])/g, (m, h) => chr(hex(h) || 0x20));
 		}
 	auth_client(ctx);
 };

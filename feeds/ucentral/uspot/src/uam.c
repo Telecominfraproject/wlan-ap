@@ -12,7 +12,7 @@
 #define MIN(a, b)	((a > b) ? b : a)
 
 static int
-hex_to_str(char *in, char *out, int olen)
+str_to_hex(char *in, char *out, int olen)
 {
 	int ilen = strlen(in);
 	int len = 0;
@@ -29,6 +29,15 @@ hex_to_str(char *in, char *out, int olen)
 	*out = '\0';
 
 	return len;
+}
+
+static void
+hex_to_str(char *in, char *out, int len)
+{
+	int i;
+
+	for (i = 0; i < len; i++)
+		sprintf(&out[i * 2], "%02x", in[i]);
 }
 
 static uc_value_t *
@@ -50,8 +59,8 @@ uc_password(uc_vm_t *vm, size_t nargs)
 	if (!_chal || !_pass || !_secret)
 		return ucv_boolean_new(false);
 
-	plen = hex_to_str(ucv_to_string(vm, _pass), pass, sizeof(pass));
-	clen = hex_to_str(ucv_to_string(vm, _chal), chal, sizeof(chal));
+	plen = str_to_hex(ucv_to_string(vm, _pass), pass, sizeof(pass));
+	clen = str_to_hex(ucv_to_string(vm, _chal), chal, sizeof(chal));
 	secret = ucv_to_string(vm, _secret);
 
 	md5_begin(&md5);
@@ -63,6 +72,34 @@ uc_password(uc_vm_t *vm, size_t nargs)
 		cleartext[i] = pass[i] ^ uamchal[i];
 
 	return ucv_string_new(cleartext);
+
+}
+
+static uc_value_t *
+uc_challenge(uc_vm_t *vm, size_t nargs)
+{
+	uc_value_t *_chal = uc_fn_arg(0);
+	uc_value_t *_secret = uc_fn_arg(1);
+	char chal[32];
+	char uamchal[32];
+	char ret[33] = {};
+	int clen;
+	char *secret;
+	md5_ctx_t md5 = {};
+
+	if (!_chal || !_secret)
+		return ucv_boolean_new(false);
+
+	clen = str_to_hex(ucv_to_string(vm, _chal), chal, sizeof(chal));
+	secret = ucv_to_string(vm, _secret);
+
+	md5_begin(&md5);
+	md5_hash(chal, clen, &md5);
+	md5_hash(secret, strlen(secret), &md5);
+	md5_end(uamchal, &md5);
+
+	hex_to_str(uamchal, ret, 16);
+	return ucv_string_new(ret);
 
 }
 
@@ -97,6 +134,7 @@ uc_md5(uc_vm_t *vm, size_t nargs)
 
 static const uc_function_list_t global_fns[] = {
         { "password",	uc_password },
+        { "chap_challenge",	uc_challenge },
         { "md5",	uc_md5 },
 };
 
