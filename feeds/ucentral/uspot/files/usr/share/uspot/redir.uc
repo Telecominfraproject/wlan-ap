@@ -1,5 +1,5 @@
 Status: 302 Found
-Location: {{ uam_location }}
+Location: {{ redir_location }}
 Content-Type: text/html
 
 
