@@ -38,6 +38,33 @@ define Device/edgecore_eap101
 endef
 TARGET_DEVICES += edgecore_eap101
 
+define Device/indio_um-310ax-v1
+  DEVICE_TITLE := Indio UM-310AX V1
+  DEVICE_DTS := qcom-ipq6018-indio-um-310ax-v1
+  DEVICE_DTS_CONFIG := config@cp03-c1
+  SUPPORTED_DEVICES := indio,um-310ax-v1
+  DEVICE_PACKAGES := ath11k-wifi-indio-um-310ax-v1 uboot-env
+endef
+TARGET_DEVICES += indio_um-310ax-v1
+
+define Device/indio_um-510axp-v1
+  DEVICE_TITLE := Indio UM-510AXP V1
+  DEVICE_DTS := qcom-ipq6018-indio-um-510axp-v1
+  DEVICE_DTS_CONFIG := config@cp03-c1
+  SUPPORTED_DEVICES := indio,um-510axp-v1
+  DEVICE_PACKAGES := ath11k-wifi-indio-um-510axp-v1 uboot-env
+endef
+TARGET_DEVICES += indio_um-510axp-v1
+
+define Device/indio_um-510axm-v1
+  DEVICE_TITLE := Indio UM-510AXM V1
+  DEVICE_DTS := qcom-ipq6018-indio-um-510axm-v1
+  DEVICE_DTS_CONFIG := config@cp03-c1
+  SUPPORTED_DEVICES := indio,um-510axm-v1
+  DEVICE_PACKAGES := ath11k-wifi-indio-um-510axm-v1 uboot-env
+endef
+TARGET_DEVICES += indio_um-510axm-v1
+
 define Device/wallys_dr6018
   DEVICE_TITLE := Wallys DR6018
   DEVICE_DTS := qcom-ipq6018-wallys-dr6018
