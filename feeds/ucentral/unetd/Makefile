@@ -18,6 +18,7 @@ PKG_LICENSE:=GPL-2.0
 PKG_MAINTAINER:=Felix Fietkau <nbd@nbd.name>
 
 PKG_BUILD_PARALLEL:=1
+PKG_BUILD_DEPENDS:=bpf-headers
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
