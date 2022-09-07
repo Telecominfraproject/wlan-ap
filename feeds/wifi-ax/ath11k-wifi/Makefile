@@ -36,6 +36,9 @@ ALLWIFIBOARDS:= \
 	sercomm-wallaby \
 	edgecore-eap102 \
 	edgecore-eap104 \
+	indio-um-310ax-v1 \
+	indio-um-510axp-v1 \
+	indio-um-510axm-v1 \
 	plasmacloud-pax1800 \
 	wallys-dr6018 \
 	wallys-dr6018-v4 \
@@ -229,6 +232,9 @@ $(eval $(call generate-ath11k-wifi-package,wallys-dr6018-v4,Wallys DR6018 V4))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap101,EdgeCore EAP101))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap102,Edgecore EAP102))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap104,Edgecore EAP104))
+$(eval $(call generate-ath11k-wifi-package,indio-um-310ax-v1,Indio UM-310AX V1))
+$(eval $(call generate-ath11k-wifi-package,indio-um-510axp-v1,Indio UM-510AXP V1))
+$(eval $(call generate-ath11k-wifi-package,indio-um-510axm-v1,Indio UM-510AXM V1))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex227,TP-Link EX227))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex447,TP-Link EX447))
 $(eval $(call generate-ath11k-wifi-package,yuncore-ax840,YunCore AX840))
