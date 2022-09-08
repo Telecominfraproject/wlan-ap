@@ -87,6 +87,7 @@ platform_check_image() {
 	tplink,ex447|\
 	yuncore,ax840|\
 	motorola,q14|\
+	muxi,ap3220l|\
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\
@@ -118,6 +119,7 @@ platform_do_upgrade() {
 	edgecore,eap104|\
 	glinet,ax1800|\
 	glinet,axt1800|\
+	muxi,ap3220l|\
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\
