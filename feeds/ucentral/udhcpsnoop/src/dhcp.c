@@ -49,6 +49,7 @@ const char *dhcpsnoop_parse_ipv4(const void *buf, size_t len, uint16_t port, uin
 			break;
 		case DHCPV4_OPT_LEASETIME:
 			if (opt[1] != 4)
+				continue;
 			leasetime = *((uint32_t *) &opt[2]);
 			break;
 		case DHCPV4_OPT_REBIND:
@@ -71,7 +72,8 @@ const char *dhcpsnoop_parse_ipv4(const void *buf, size_t len, uint16_t port, uin
 	else if (leasetime)
 		*expire = leasetime;
 	else
-		*expire = 24 * 60;
+		*expire = 24 * 60 * 60;
+	*expire = ntohl(*expire);
 
 	switch(type) {
 	case DHCPV4_MSG_ACK:
