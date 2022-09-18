@@ -18,6 +18,6 @@ DEFAULT_PACKAGES += kmod-qca-nss-dp kmod-qca-ssdk swconfig \
 	kmod-ath11k-ahb kmod-qrtr_mproc wpad \
 	kmod-gpio-button-hotplug \
 	qca-thermald-10.4 qca-ssdk-shell kmod-qca-nss-drv-bridge-mgr \
-	uboot-envtools
+	uboot-envtools -firewall4 firewall
 
 $(eval $(call BuildTarget))
