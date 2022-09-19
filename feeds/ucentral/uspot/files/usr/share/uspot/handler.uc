@@ -55,7 +55,7 @@ function request_click(ctx) {
 // delegate a local username/password authentication
 function request_credentials(ctx) {
 	// make sure this is the right auth_mode
-	if (portal/config?.config?.auth_mode != 'credentials') {
+	if (portal.config?.config?.auth_mode != 'credentials') {
 		include('error.uc', ctx);
                 return;
 	}
