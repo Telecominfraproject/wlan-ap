@@ -64,6 +64,11 @@ static inline const char *interface_name(struct interface *iface)
 	return iface->node.key;
 }
 
+static inline const char *device_name(struct device *dev)
+{
+	return dev->node.avl.key;
+}
+
 void interface_add(const char *name, struct blob_attr *config,
 		   struct blob_attr *devices);
 void interface_free(struct interface *iface);

@@ -26,6 +26,46 @@ return {
 	header,
 	footer,
 
+	// syslog helper
+	syslog: function(ctx, msg) {
+		warn('uspot: ' + ctx.env.REMOTE_ADDR + ' - ' + msg + '\n');
+	},
+
+	debug: function(ctx, msg) {
+		if (config.config.debug)
+			this.syslog(ctx, msg);
+	},
+
+	// mac re-formater
+	format_mac: function(mac) {
+		switch(config.uam.mac_format) {
+		case 'aabbccddeeff':
+		case 'AABBCCDDEEFF':
+			mac = replace(mac, ':', '');
+			break;
+		case 'aa-bb-cc-dd-ee-ff':
+		case 'AA-BB-CC-DD-EE-FF':
+			mac = replace(mac, ':', '-');
+			warn('uspot: ' + ctx.env.REMOTE_ADDR + ' - ' + msg + '\n');
+			break;
+		}
+
+		switch(config.uam.mac_format) {
+		case 'aabbccddeeff':
+		case 'aa-bb-cc-dd-ee-ff':
+		case 'aa:bb:cc:dd:ee:ff':
+			mac = lc(mac);
+			break;
+		case 'AABBCCDDEEFF':
+		case 'AA:BB:CC:DD:EE:FF':
+		case 'AA-BB-CC-DD-EE-FF':
+			mac = uc(mac);
+			break;
+		}
+
+		return mac;
+	},
+
 	// wrapper for scraping external tools stdout
 	fs_popen: function(cmd) {
 		let stdout = fs.popen(cmd);
@@ -43,45 +83,79 @@ return {
 	},
 
 	// give a client access to the internet
-	allow_client: function(ctx) {
+	allow_client: function(ctx, data) {
+		this.syslog(ctx, 'allow client to pass traffic');
 		ctx.ubus.call('spotfilter', 'client_set', {
 			"interface": "hotspot",
-			"address": replace(ctx.mac, '-', ':'),
+			"address": ctx.mac,
 			"state": 1,
 			"dns_state": 1,
 			"accounting": [ "dl", "ul"],
 			"data": {
-				"connect": time()
+				... data || {},
+				"connect": time(),
 			}
 		});
 		if (ctx.query_string.userurl)
 			include('redir.uc', { redir_location: ctx.query_string.userurl });
 		else
 			include('allow.uc', ctx);
+		//data.radius.reply['WISPr-Bandwidth-Max-Up'] = "20000000";
+		//data.radius.reply['WISPr-Bandwidth-Max-Down'] = "10000000";
+		if (data?.radius?.reply && (+data.radius.reply['WISPr-Bandwidth-Max-Up'] && +data.radius.reply['WISPr-Bandwidth-Max-Down']))
+			ctx.ubus.call('ratelimit', 'client_set', {
+				device: ctx.device,
+				address: ctx.mac,
+				rate_egress: sprintf('%s', data.radius.reply['WISPr-Bandwidth-Max-Down']),
+				rate_ingress: sprintf('%s', data.radius.reply['WISPr-Bandwidth-Max-Up']),
+			 });
+	},
+
+	// put a client back into pre-auth state
+	logoff: function(ctx, data) {
+		this.syslog(ctx, 'logging client off');
+		ctx.ubus.call('spotfilter', 'client_set', {
+			interface: 'hotspot',
+			address: ctx.mac,
+			state: 0,
+			dns_state: 1,
+			accounting: [],
+			flush: true,
+		});
+		include('logoff.uc', ctx);
 	},
 
 	// generate the default radius auth payload
-	radius_init: function(ctx) {
+	radius_init: function(ctx, acct_session) {
+		let math = require('math');
+		if (!acct_session) {
+			acct_session = '';
+
+			for (let i = 0; i < 16; i++)
+			        acct_session += sprintf('%d', math.rand() % 10);
+		}
+
 		return {
 			server: sprintf('%s:%s:%s', this.config.radius.auth_server, this.config.radius.auth_port, this.config.radius.auth_secret),
-			acct_session: "0123456789",
+			acct_server: sprintf('%s:%s:%s', this.config.radius.acct_server, this.config.radius.acct_port, this.config.radius.acct_secret),
+			acct_session,
 			client_ip: ctx.env.REMOTE_ADDR,
-			called_station: ctx.mac,
-			calling_station: this.config.uam.nasmac,
+			called_station: this.config.uam.nasmac,
+			calling_station: this.format_mac(ctx.mac),
 			nas_ip: ctx.env.SERVER_ADDR,
 			nas_id: this.config.uam.nasid
 		};
 	},
 
 	radius_call: function(ctx, payload) {
-		let cfg = fs.open('/tmp/' + ctx.mac + '.json', 'w');
+		let cfg = fs.open('/tmp/auth' + ctx.mac + '.json', 'w');
 		cfg.write(payload);
 		cfg.close();
 
-		return this.fs_popen('/usr/bin/radius-client /tmp/' + ctx.mac + '.json');
+		return this.fs_popen('/usr/bin/radius-client /tmp/auth' + ctx.mac + '.json');
 	},
 
-	handle_request: function(env) {
+	handle_request: function(env, uam) {
 		let mac;
 		let form_data = {};
 		let query_string = {};
@@ -91,25 +165,39 @@ return {
 		// lookup the peers MAC
 		let macs = this.rtnl.request(this.rtnl.const.RTM_GETNEIGH, this.rtnl.const.NLM_F_DUMP, { });
 		for (let m in macs)
-			if (m.dst == env.REMOTE_HOST)
-				ctx.mac = replace(m.lladdr, ':', '-');
+			if (m.dst == env.REMOTE_HOST && m.lladdr)
+				ctx.mac = m.lladdr;
 
 		// if the MAC lookup failed, go to the error page
 		if (!ctx.mac) {
+			this.syslog(ctx, 'failed to look up mac');
 			include('error.uc', ctx);
 			return NULL;
 		}
+		ctx.format_mac = this.format_mac(ctx.mac);
 
 		// check if a client is already connected
 		ctx.ubus = ubus.connect();
 		let connected = ctx.ubus.call('spotfilter', 'client_get', {
-			'interface': 'hotspot',
-			'address': ctx.mac
+			interface: 'hotspot',
+			address: ctx.mac,
 		});
-		if (connected?.state) {
+		if (!uam && connected?.state) {
 			include('connected.uc', ctx);
 			return NULL;
 		}
+		if (!connected.data.ssid) {
+			let hapd = ctx.ubus.call('hostapd.' + connected.device, 'get_status');
+			ctx.ubus.call('spotfilter', 'client_set', {
+				interface: 'hotspot',
+				address: ctx.mac,
+				data: {
+					ssid: hapd.ssid || 'unknown'
+				}
+			});
+		}
+		ctx.device = connected.device;
+		ctx.ssid = connected.data.ssid;
 
 		// split QUERY_STRING
 		if (env.QUERY_STRING)

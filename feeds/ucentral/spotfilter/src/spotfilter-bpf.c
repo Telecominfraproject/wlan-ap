@@ -158,9 +158,9 @@ int spotfilter_out(struct __sk_buff *skb)
 		return TC_ACT_UNSPEC;
 
 	cl = bpf_map_lookup_elem(&client, eth->h_dest);
-	if (cl) {
-		if (cl->flags & SPOTFILTER_CLIENT_F_ACCT_DL)
-			cl->bytes_dl += skb->len;
+	if (cl && (cl->flags & SPOTFILTER_CLIENT_F_ACCT_DL)) {
+		cl->packets_dl++;
+		cl->bytes_dl += skb->len;
 	}
 
 	skb_parse_vlan(&info);
@@ -204,8 +204,10 @@ int spotfilter_in(struct __sk_buff *skb)
 	cl = bpf_map_lookup_elem(&client, eth->h_source);
 	if (cl) {
 		cldata = *cl;
-		if (cl->flags & SPOTFILTER_CLIENT_F_ACCT_UL)
+		if (cl->flags & SPOTFILTER_CLIENT_F_ACCT_UL) {
+			cl->packets_ul++;
 			cl->bytes_ul += skb->len;
+		}
 	}
 
 	has_vlan = !!skb_parse_vlan(&info);

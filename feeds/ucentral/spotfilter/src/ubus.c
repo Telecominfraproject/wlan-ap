@@ -88,6 +88,7 @@ enum {
 	CLIENT_ATTR_DNS_STATE,
 	CLIENT_ATTR_ACCOUNTING,
 	CLIENT_ATTR_DATA,
+	CLIENT_ATTR_FLUSH,
 	__CLIENT_ATTR_MAX
 };
 
@@ -99,6 +100,7 @@ static const struct blobmsg_policy client_policy[__CLIENT_ATTR_MAX] = {
 	[CLIENT_ATTR_DNS_STATE] = { "dns_state", BLOBMSG_TYPE_INT32 },
 	[CLIENT_ATTR_ACCOUNTING] = { "accounting", BLOBMSG_TYPE_ARRAY },
 	[CLIENT_ATTR_DATA] = { "data", BLOBMSG_TYPE_TABLE },
+	[CLIENT_ATTR_FLUSH] = { "flush", BLOBMSG_TYPE_BOOL },
 };
 
 static int
@@ -176,6 +178,7 @@ client_ubus_update(struct ubus_context *ctx, struct ubus_object *obj,
 	const char *id = NULL;
 	int state = -1, dns_state = -1;
 	int accounting = -1;
+	bool flush = false;
 	int ret;
 
 	ret = client_ubus_init(msg, tb, &iface, &addr, &id, &cl);
@@ -203,8 +206,11 @@ client_ubus_update(struct ubus_context *ctx, struct ubus_object *obj,
 	if (!addr)
 		return UBUS_STATUS_INVALID_ARGUMENT;
 
+	if (tb[CLIENT_ATTR_FLUSH])
+		flush = blobmsg_get_bool(tb[CLIENT_ATTR_FLUSH]);
+
 	client_set(iface, addr, id, state, dns_state, accounting,
-		   tb[CLIENT_ATTR_DATA]);
+		   tb[CLIENT_ATTR_DATA], NULL, flush);
 
 	return 0;
 }
@@ -241,8 +247,10 @@ static void client_dump(struct interface *iface, struct client *cl)
 
 	spotfilter_bpf_get_client(iface, &cl->key, &cl->data);
 
-	if (iface->client_autoremove)
-		blobmsg_add_u32(&b, "idle", cl->idle);
+	if (cl->device)
+		blobmsg_add_string(&b, "device", cl->device);
+
+	blobmsg_add_u32(&b, "idle", cl->idle);
 
 	blobmsg_add_u32(&b, "state", cl->data.cur_class);
 	blobmsg_add_u32(&b, "dns_state", cl->data.dns_class);
@@ -281,6 +289,8 @@ static void client_dump(struct interface *iface, struct client *cl)
 	interface_dump_action(&b, iface, cl->data.dns_class);
 	blobmsg_close_table(&b, c);
 
+	blobmsg_add_u64(&b, "packets_ul", cl->data.packets_ul);
+	blobmsg_add_u64(&b, "packets_dl", cl->data.packets_dl);
 	blobmsg_add_u64(&b, "bytes_ul", cl->data.bytes_ul);
 	blobmsg_add_u64(&b, "bytes_dl", cl->data.bytes_dl);
 }
