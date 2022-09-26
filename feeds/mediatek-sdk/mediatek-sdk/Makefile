@@ -3,7 +3,7 @@
 include $(TOPDIR)/rules.mk
 
 ARCH:=arm
-BOARD:=mediatek-sdk
+BOARD:=mediatek_sdk
 BOARDNAME:=MediaTek ARM (SDK)
 SUBTARGETS:=mt7622 mt7623 mt7629 mt7986 mt7981
 FEATURES:=squashfs nand ramdisk fpu
