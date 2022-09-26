@@ -3,6 +3,7 @@ Content-Type: text/html
 
 {{ header }}
 
-<h1> An Error occured, please try again </h1>
+<h2> An Error occured </h2>
+<h2> Please try again </h2>
 
 {{ footer }}

@@ -76,6 +76,9 @@ platform_check_image() {
 	cybertan,eww622-a1|\
 	glinet,ax1800|\
 	glinet,axt1800|\
+	indio,um-310ax-v1|\
+	indio,um-510axp-v1|\
+	indio,um-510axm-v1|\
 	wallys,dr6018|\
 	wallys,dr6018-v4|\
 	edgecore,eap101|\
@@ -118,9 +121,11 @@ platform_do_upgrade() {
 	cig,wf194c4|\
 	cig,wf196|\
 	cybertan,eww622-a1|\
-	edgecore,eap104|\
 	glinet,ax1800|\
 	glinet,axt1800|\
+	indio,um-310ax-v1|\
+	indio,um-510axp-v1|\
+	indio,um-510axm-v1|\
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\
@@ -145,6 +150,7 @@ platform_do_upgrade() {
 		fi
 		nand_upgrade_tar "$1"
 		;;
+	edgecore,eap104|\
 	edgecore,eap106)
 		CI_UBIPART="rootfs1"
 		[ "$(find_mtd_chardev rootfs)" ] && CI_UBIPART="rootfs"
