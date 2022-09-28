@@ -362,7 +362,7 @@ static int mt753x_nl_response(struct sk_buff *skb, struct genl_info *info)
 	return ret;
 }
 
-int __init mt753x_nl_init(void)
+int mt753x_nl_init(void)
 {
 	int ret;
 
@@ -375,7 +375,7 @@ int __init mt753x_nl_init(void)
 	return 0;
 }
 
-void __exit mt753x_nl_exit(void)
+void mt753x_nl_exit(void)
 {
 	genl_unregister_family(&mt753x_nl_family);
 }

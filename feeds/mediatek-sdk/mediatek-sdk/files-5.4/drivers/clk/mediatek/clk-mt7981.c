@@ -27,8 +27,6 @@
 
 static DEFINE_SPINLOCK(mt7981_clk_lock);
 
-
-
 static const struct mtk_fixed_factor infra_divs[] __initconst = {
 	FACTOR(CK_INFRA_CK_F26M, "infra_ck_f26m", "csw_f26m_sel", 1, 1),
 	FACTOR(CK_INFRA_UART, "infra_uart", "uart_sel", 1, 1),
@@ -109,7 +107,7 @@ static const struct mtk_fixed_factor top_divs[] __initconst = {
 	FACTOR(CK_TOP_CB_RTC_32K, "cb_rtc_32k", "cb_cksq_40m", 1, 1250),
 	FACTOR(CK_TOP_CB_RTC_32P7K, "cb_rtc_32p7k", "cb_cksq_40m", 1, 1220),
 	FACTOR(CK_TOP_USB_TX250M, "usb_tx250m", "cb_cksq_40m", 1, 1),
-	FACTOR(CK_TOP_FAUD, "faud", "cb_cksq_40m", 1, 1),
+	FACTOR(CK_TOP_FAUD, "faud", "aud_sel", 1, 1),
 	FACTOR(CK_TOP_NFI1X, "nfi1x", "nfi1x_sel", 1, 1),
 	FACTOR(CK_TOP_USB_EQ_RX250M, "usb_eq_rx250m", "cb_cksq_40m", 1, 1),
 	FACTOR(CK_TOP_USB_CDR_CK, "usb_cdr", "cb_cksq_40m", 1, 1),
@@ -421,13 +419,13 @@ static const char * const infra_uart0_parents[] __initconst = {
 };
 
 static const char * const infra_spi0_parents[] __initconst = {
-	"infra_i2c"
-	"infra_ispi0",
+	"infra_i2c",
+	"infra_ispi0"
 };
 
 static const char * const infra_spi1_parents[] __initconst = {
-	"infra_i2c"
-	"infra_ispi1",
+	"infra_i2c",
+	"infra_ispi1"
 };
 
 static const char * const infra_pwm1_parents[] __initconst = {
@@ -442,10 +440,10 @@ static const char * const infra_pwm_bsel_parents[] __initconst = {
 };
 
 static const char * const infra_pcie_parents[] __initconst = {
-	"infra_pcie",
-	"cb_cksq_40m",
+	"infra_ck_f32k",
 	"infra_ck_f26m",
-	"infra_ck_f32k"
+	"cb_cksq_40m",
+	"infra_pcie"
 };
 
 static const struct mtk_mux infra_muxes[] = {
@@ -475,8 +473,9 @@ static const struct mtk_mux infra_muxes[] = {
 	    infra_pcie_parents, 0x0028, 0x0020, 0x0024, 0, 2, -1, -1, -1),
 };
 
-static const struct mtk_clk_divider top_adj_divs[] = {
-	DIV_ADJ(CK_TOP_AUD_I2S_M, "aud_i2s_m", "aud", 0x0420, 8, 8),
+static struct mtk_composite top_aud_divs[] = {
+	DIV_GATE(CK_TOP_AUD_I2S_M, "aud_i2s_m", "aud",
+		0x0420, 0, 0x0420, 8, 8),
 };
 
 static const struct mtk_gate_regs infra0_cg_regs = {
@@ -746,7 +745,8 @@ static void __init mtk_topckgen_init(struct device_node *node)
 
 	mtk_clk_register_factors(top_divs, ARRAY_SIZE(top_divs), mt7981_top_clk_data);
 	mtk_clk_register_muxes(top_muxes, ARRAY_SIZE(top_muxes), node, &mt7981_clk_lock, mt7981_top_clk_data);
-	mtk_clk_register_dividers(top_adj_divs, ARRAY_SIZE(top_adj_divs), base, &mt7981_clk_lock, mt7981_top_clk_data);
+	mtk_clk_register_composites(top_aud_divs, ARRAY_SIZE(top_aud_divs),
+		base, &mt7981_clk_lock, mt7981_top_clk_data);
 
 	r = of_clk_add_provider(node, of_clk_src_onecell_get, mt7981_top_clk_data);
 

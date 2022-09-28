@@ -776,6 +776,8 @@ static int mt753x_probe(struct platform_device *pdev)
 	mt753x_mdio_register(gsw);
 #endif
 
+	mt753x_nl_init();
+
 	mt753x_swconfig_init(gsw);
 
 	if (sw->post_init)
@@ -812,6 +814,8 @@ static int mt753x_remove(struct platform_device *pdev)
 	mdiobus_unregister(gsw->gphy_bus);
 #endif
 
+	mt753x_nl_exit();
+
 	mt753x_remove_gsw(gsw);
 
 	platform_set_drvdata(pdev, NULL);
@@ -842,16 +846,12 @@ static int __init mt753x_init(void)
 	INIT_LIST_HEAD(&mt753x_devs);
 	ret = platform_driver_register(&mt753x_driver);
 
-	mt753x_nl_init();
-
 	return ret;
 }
 module_init(mt753x_init);
 
 static void __exit mt753x_exit(void)
 {
-	mt753x_nl_exit();
-
 	platform_driver_unregister(&mt753x_driver);
 }
 module_exit(mt753x_exit);

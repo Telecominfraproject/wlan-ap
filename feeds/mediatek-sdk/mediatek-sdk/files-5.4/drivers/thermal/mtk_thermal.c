@@ -150,7 +150,7 @@
 
 /*
  * Layout of the fuses providing the calibration data
- * These macros could be used for MT7986.
+ * These macros could be used for MT7981 and MT7986.
  */
 #define CALIB_BUF0_ADC_GE_V3(x)		(((x) >> 0) & 0x3ff)
 #define CALIB_BUF0_ADC_OE_V3(x)		(((x) >> 10) & 0x3ff)
@@ -258,6 +258,27 @@ enum mtk_thermal_version {
 
 /* The calibration coefficient of sensor  */
 #define MT8183_CALIBRATION	153
+
+/* AUXADC channel 11 is used for the temperature sensors */
+#define MT7981_TEMP_AUXADC_CHANNEL	11
+
+/* The total number of temperature sensors in the MT7981 */
+#define MT7981_NUM_SENSORS		1
+
+/* The number of banks in the MT7981 */
+#define MT7981_NUM_ZONES		1
+
+/* The number of sensing points per bank */
+#define MT7981_NUM_SENSORS_PER_ZONE	1
+
+/* MT7981 thermal sensors */
+#define MT7981_TS1	0
+
+/* The number of controller in the MT7981 */
+#define MT7981_NUM_CONTROLLER		1
+
+/* The calibration coefficient of sensor  */
+#define MT7981_CALIBRATION		165
 
 /* AUXADC channel 11 is used for the temperature sensors */
 #define MT7986_TEMP_AUXADC_CHANNEL	11
@@ -421,6 +442,14 @@ static const int mt7622_adcpnp[MT7622_NUM_SENSORS_PER_ZONE] = { TEMP_ADCPNP0, };
 static const int mt7622_mux_values[MT7622_NUM_SENSORS] = { 0, };
 static const int mt7622_vts_index[MT7622_NUM_SENSORS] = { VTS1 };
 static const int mt7622_tc_offset[MT7622_NUM_CONTROLLER] = { 0x0, };
+
+/* MT7981 thermal sensor data */
+static const int mt7981_bank_data[MT7981_NUM_SENSORS] = { MT7981_TS1, };
+static const int mt7981_msr[MT7981_NUM_SENSORS_PER_ZONE] = { TEMP_MSR0, };
+static const int mt7981_adcpnp[MT7981_NUM_SENSORS_PER_ZONE] = {	TEMP_ADCPNP0, };
+static const int mt7981_mux_values[MT7981_NUM_SENSORS] = { 0, };
+static const int mt7981_vts_index[MT7981_NUM_SENSORS] = { VTS1 };
+static const int mt7981_tc_offset[MT7981_NUM_CONTROLLER] = { 0x0, };
 
 /* MT7986 thermal sensor data */
 static const int mt7986_bank_data[MT7986_NUM_SENSORS] = { MT7986_TS1, };
@@ -591,6 +620,30 @@ static const struct mtk_thermal_data mt8183_thermal_data = {
 	.adcpnp = mt8183_adcpnp,
 	.sensor_mux_values = mt8183_mux_values,
 	.version = MTK_THERMAL_V1,
+};
+
+/*
+ * MT7981 uses AUXADC Channel 11 for raw data access.
+ */
+static const struct mtk_thermal_data mt7981_thermal_data = {
+	.auxadc_channel = MT7981_TEMP_AUXADC_CHANNEL,
+	.num_banks = MT7981_NUM_ZONES,
+	.num_sensors = MT7981_NUM_SENSORS,
+	.vts_index = mt7981_vts_index,
+	.cali_val = MT7981_CALIBRATION,
+	.num_controller = MT7981_NUM_CONTROLLER,
+	.controller_offset = mt7981_tc_offset,
+	.need_switch_bank = true,
+	.bank_data = {
+		{
+			.num_sensors = 1,
+			.sensors = mt7981_bank_data,
+		},
+	},
+	.msr = mt7981_msr,
+	.adcpnp = mt7981_adcpnp,
+	.sensor_mux_values = mt7981_mux_values,
+	.version = MTK_THERMAL_V3,
 };
 
 /*
@@ -1068,6 +1121,10 @@ static const struct of_device_id mtk_thermal_of_match[] = {
 	{
 		.compatible = "mediatek,mt8183-thermal",
 		.data = (void *)&mt8183_thermal_data,
+	},
+	{
+		.compatible = "mediatek,mt7981-thermal",
+		.data = (void *)&mt7981_thermal_data,
 	},
 	{
 		.compatible = "mediatek,mt7986-thermal",

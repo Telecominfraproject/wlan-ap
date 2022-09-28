@@ -46,12 +46,20 @@
 
 static const uint8_t mt7622_ecc_caps[] = { 4, 6, 8, 10, 12 };
 
+static const uint8_t mt7981_ecc_caps[] = {
+	4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24
+};
+
 static const uint8_t mt7986_ecc_caps[] = {
 	4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24
 };
 
 static const uint32_t mt7622_ecc_regs[] = {
 	[ECC_DECDONE] = 0x11c,
+};
+
+static const uint32_t mt7981_ecc_regs[] = {
+	[ECC_DECDONE] = 0x124,
 };
 
 static const uint32_t mt7986_ecc_regs[] = {
@@ -74,6 +82,14 @@ static const struct mtk_ecc_soc_data mtk_ecc_socs[__SNAND_SOC_MAX] = {
 		.mode_shift = 4,
 		.errnum_bits = 5,
 		.errnum_shift = 5,
+	},
+	[SNAND_SOC_MT7981] = {
+		.ecc_caps = mt7981_ecc_caps,
+		.num_ecc_cap = ARRAY_SIZE(mt7981_ecc_caps),
+		.regs = mt7981_ecc_regs,
+		.mode_shift = 5,
+		.errnum_bits = 5,
+		.errnum_shift = 8,
 	},
 	[SNAND_SOC_MT7986] = {
 		.ecc_caps = mt7986_ecc_caps,

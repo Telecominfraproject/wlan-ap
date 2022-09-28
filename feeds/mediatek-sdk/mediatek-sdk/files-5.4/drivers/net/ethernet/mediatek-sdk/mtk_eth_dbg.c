@@ -27,6 +27,7 @@
 
 #include "mtk_eth_soc.h"
 #include "mtk_eth_dbg.h"
+#include "mtk_eth_reset.h"
 
 u32 hw_lro_agg_num_cnt[MTK_HW_LRO_RING_NUM][MTK_HW_LRO_MAX_AGG_CNT + 1];
 u32 hw_lro_agg_size_cnt[MTK_HW_LRO_RING_NUM][16];
@@ -318,9 +319,42 @@ static ssize_t mtketh_debugfs_reset(struct file *file, const char __user *ptr,
 				    size_t len, loff_t *off)
 {
 	struct mtk_eth *eth = file->private_data;
+	char buf[8] = "";
+	int count = len;
+	unsigned long dbg_level = 0;
 
-	schedule_work(&eth->pending_work);
-	return len;
+	len = min(count, sizeof(buf) - 1);
+	if (copy_from_user(buf, ptr, len))
+		return -EFAULT;
+
+	buf[len] = '\0';
+	if (kstrtoul(buf, 0, &dbg_level))
+		return -EINVAL;
+
+	switch(dbg_level)
+	{
+		case 0:
+			if (atomic_read(&reset_lock) == 0)
+				atomic_inc(&reset_lock);
+			break;
+		case 1:
+			if (atomic_read(&force) == 0)
+				atomic_inc(&force);
+			schedule_work(&eth->pending_work);
+			break;
+		case 2:
+			if (atomic_read(&reset_lock) == 1)
+				atomic_dec(&reset_lock);
+			break;
+		default:
+			pr_info("Usage: echo [level] > /sys/kernel/debug/mtketh/reset\n");
+			pr_info("Commands:	 [level] \n");
+			pr_info("			   0	 disable reset \n");
+			pr_info("			   1	 force reset \n");
+			pr_info("			   2	 enable reset\n");
+			break;
+	}
+	return count;
 }
 
 static const struct file_operations fops_reg_w = {
@@ -398,12 +432,12 @@ void mii_mgr_write_combine(struct mtk_eth *eth, u16 phy_addr, u16 phy_register,
 
 static void mii_mgr_read_cl45(struct mtk_eth *eth, u16 port, u16 devad, u16 reg, u16 *data)
 {
-	mtk_cl45_ind_read(eth, port, devad, reg, data);
+	*data = _mtk_mdio_read(eth, port, mdiobus_c45_addr(devad, reg));
 }
 
 static void mii_mgr_write_cl45(struct mtk_eth *eth, u16 port, u16 devad, u16 reg, u16 data)
 {
-	mtk_cl45_ind_write(eth, port, devad, reg, data);
+	_mtk_mdio_write(eth, port, mdiobus_c45_addr(devad, reg), data);
 }
 
 int mtk_do_priv_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
@@ -625,42 +659,36 @@ static const struct file_operations switch_count_fops = {
 	.release = single_release
 };
 
-static struct proc_dir_entry *proc_tx_ring, *proc_rx_ring;
+static struct proc_dir_entry *proc_tx_ring, *proc_hwtx_ring, *proc_rx_ring;
 
 int tx_ring_read(struct seq_file *seq, void *v)
 {
+	struct mtk_eth *eth = g_eth;
 	struct mtk_tx_ring *ring = &g_eth->tx_ring;
-	struct mtk_tx_dma *tx_ring;
+	struct mtk_tx_dma_v2 *tx_ring;
 	int i = 0;
-
-	tx_ring =
-	    kmalloc(sizeof(struct mtk_tx_dma) * MTK_DMA_SIZE, GFP_KERNEL);
-	if (!tx_ring) {
-		seq_puts(seq, " allocate temp tx_ring fail.\n");
-		return 0;
-	}
-
-	for (i = 0; i < MTK_DMA_SIZE; i++)
-		tx_ring[i] = ring->dma[i];
 
 	seq_printf(seq, "free count = %d\n", (int)atomic_read(&ring->free_count));
 	seq_printf(seq, "cpu next free: %d\n", (int)(ring->next_free - ring->dma));
 	seq_printf(seq, "cpu last free: %d\n", (int)(ring->last_free - ring->dma));
 	for (i = 0; i < MTK_DMA_SIZE; i++) {
-		dma_addr_t tmp = ring->phys + i * sizeof(*tx_ring);
+		dma_addr_t tmp = ring->phys + i * eth->soc->txrx.txd_size;
+
+		tx_ring = ring->dma + i * eth->soc->txrx.txd_size;
 
 		seq_printf(seq, "%d (%pad): %08x %08x %08x %08x", i, &tmp,
-			   *(int *)&tx_ring[i].txd1, *(int *)&tx_ring[i].txd2,
-			   *(int *)&tx_ring[i].txd3, *(int *)&tx_ring[i].txd4);
-#if defined(CONFIG_MEDIATEK_NETSYS_V2)
-		seq_printf(seq, " %08x %08x %08x %08x",
-			   *(int *)&tx_ring[i].txd5, *(int *)&tx_ring[i].txd6,
-			   *(int *)&tx_ring[i].txd7, *(int *)&tx_ring[i].txd8);
-#endif
+			   tx_ring->txd1, tx_ring->txd2,
+			   tx_ring->txd3, tx_ring->txd4);
+
+		if (MTK_HAS_CAPS(eth->soc->caps, MTK_NETSYS_V2)) {
+			seq_printf(seq, " %08x %08x %08x %08x",
+				   tx_ring->txd5, tx_ring->txd6,
+				   tx_ring->txd7, tx_ring->txd8);
+		}
+
 		seq_printf(seq, "\n");
 	}
 
-	kfree(tx_ring);
 	return 0;
 }
 
@@ -677,38 +705,71 @@ static const struct file_operations tx_ring_fops = {
 	.release = single_release
 };
 
-int rx_ring_read(struct seq_file *seq, void *v)
+int hwtx_ring_read(struct seq_file *seq, void *v)
 {
-	struct mtk_rx_ring *ring = &g_eth->rx_ring[0];
-	struct mtk_rx_dma *rx_ring;
-
+	struct mtk_eth *eth = g_eth;
+	struct mtk_tx_dma_v2 *hwtx_ring;
 	int i = 0;
 
-	rx_ring =
-	    kmalloc(sizeof(struct mtk_rx_dma) * MTK_DMA_SIZE, GFP_KERNEL);
-	if (!rx_ring) {
-		seq_puts(seq, " allocate temp rx_ring fail.\n");
-		return 0;
+	for (i = 0; i < MTK_DMA_SIZE; i++) {
+		dma_addr_t addr = eth->phy_scratch_ring + i * eth->soc->txrx.txd_size;
+
+		hwtx_ring = eth->scratch_ring + i * eth->soc->txrx.txd_size;
+
+		seq_printf(seq, "%d (%pad): %08x %08x %08x %08x", i, &addr,
+			   hwtx_ring->txd1, hwtx_ring->txd2,
+			   hwtx_ring->txd3, hwtx_ring->txd4);
+
+		if (MTK_HAS_CAPS(eth->soc->caps, MTK_NETSYS_V2)) {
+			seq_printf(seq, " %08x %08x %08x %08x",
+				   hwtx_ring->txd5, hwtx_ring->txd6,
+				   hwtx_ring->txd7, hwtx_ring->txd8);
+		}
+
+		seq_printf(seq, "\n");
 	}
 
-	for (i = 0; i < MTK_DMA_SIZE; i++)
-		rx_ring[i] = ring->dma[i];
+	return 0;
+}
+
+static int hwtx_ring_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, hwtx_ring_read, NULL);
+}
+
+static const struct file_operations hwtx_ring_fops = {
+	.owner = THIS_MODULE,
+	.open = hwtx_ring_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release
+};
+
+int rx_ring_read(struct seq_file *seq, void *v)
+{
+	struct mtk_eth *eth = g_eth;
+	struct mtk_rx_ring *ring = &g_eth->rx_ring[0];
+	struct mtk_rx_dma_v2 *rx_ring;
+	int i = 0;
 
 	seq_printf(seq, "next to read: %d\n",
 		   NEXT_DESP_IDX(ring->calc_idx, MTK_DMA_SIZE));
 	for (i = 0; i < MTK_DMA_SIZE; i++) {
+		rx_ring = ring->dma + i * eth->soc->txrx.rxd_size;
+
 		seq_printf(seq, "%d: %08x %08x %08x %08x", i,
-			   *(int *)&rx_ring[i].rxd1, *(int *)&rx_ring[i].rxd2,
-			   *(int *)&rx_ring[i].rxd3, *(int *)&rx_ring[i].rxd4);
-#if defined(CONFIG_MEDIATEK_NETSYS_V2)
-		seq_printf(seq, " %08x %08x %08x %08x",
-			   *(int *)&rx_ring[i].rxd5, *(int *)&rx_ring[i].rxd6,
-			   *(int *)&rx_ring[i].rxd7, *(int *)&rx_ring[i].rxd8);
-#endif
+			   rx_ring->rxd1, rx_ring->rxd2,
+			   rx_ring->rxd3, rx_ring->rxd4);
+
+		if (MTK_HAS_CAPS(eth->soc->caps, MTK_NETSYS_V2)) {
+			seq_printf(seq, " %08x %08x %08x %08x",
+				   rx_ring->rxd5, rx_ring->rxd6,
+				   rx_ring->rxd7, rx_ring->rxd8);
+		}
+
 		seq_printf(seq, "\n");
 	}
 
-	kfree(rx_ring);
 	return 0;
 }
 
@@ -744,10 +805,10 @@ int dbg_regs_read(struct seq_file *seq, void *v)
 	seq_puts(seq, "   <<DEBUG REG DUMP>>\n");
 
 	seq_printf(seq, "| FE_INT_STA	: %08x |\n",
-		   mtk_r32(eth, MTK_INT_STATUS));
+		   mtk_r32(eth, MTK_FE_INT_STATUS));
 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_NETSYS_V2))
 		seq_printf(seq, "| FE_INT_STA2	: %08x |\n",
-			   mtk_r32(eth, MTK_INT_STATUS2));
+			   mtk_r32(eth, MTK_FE_INT_STATUS2));
 
 	seq_printf(seq, "| PSE_FQFC_CFG	: %08x |\n",
 		   mtk_r32(eth, MTK_PSE_FQFC_CFG));
@@ -833,9 +894,9 @@ int dbg_regs_read(struct seq_file *seq, void *v)
 			   mtk_dbg_r32(MTK_WED_RTQM_GLO_CFG));
 	}
 
-	mtk_w32(eth, 0xffffffff, MTK_INT_STATUS);
+	mtk_w32(eth, 0xffffffff, MTK_FE_INT_STATUS);
 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_NETSYS_V2))
-		mtk_w32(eth, 0xffffffff, MTK_INT_STATUS2);
+		mtk_w32(eth, 0xffffffff, MTK_FE_INT_STATUS2);
 
 	return 0;
 }
@@ -853,17 +914,18 @@ static const struct file_operations dbg_regs_fops = {
 	.release = single_release
 };
 
-void hw_lro_stats_update(u32 ring_no, struct mtk_rx_dma *rxd)
+void hw_lro_stats_update(u32 ring_no, struct mtk_rx_dma_v2 *rxd)
 {
+	struct mtk_eth *eth = g_eth;
 	u32 idx, agg_cnt, agg_size;
 
-#if defined(CONFIG_MEDIATEK_NETSYS_V2)
-	idx = ring_no - 4;
-	agg_cnt = RX_DMA_GET_AGG_CNT_V2(rxd->rxd6);
-#else
-	idx = ring_no - 1;
-	agg_cnt = RX_DMA_GET_AGG_CNT(rxd->rxd2);
-#endif
+	if (MTK_HAS_CAPS(eth->soc->caps, MTK_NETSYS_V2)) {
+		idx = ring_no - 4;
+		agg_cnt = RX_DMA_GET_AGG_CNT_V2(rxd->rxd6);
+	} else {
+		idx = ring_no - 1;
+		agg_cnt = RX_DMA_GET_AGG_CNT(rxd->rxd2);
+	}
 
 	agg_size = RX_DMA_GET_PLEN0(rxd->rxd2);
 
@@ -873,17 +935,18 @@ void hw_lro_stats_update(u32 ring_no, struct mtk_rx_dma *rxd)
 	hw_lro_tot_agg_cnt[idx] += agg_cnt;
 }
 
-void hw_lro_flush_stats_update(u32 ring_no, struct mtk_rx_dma *rxd)
+void hw_lro_flush_stats_update(u32 ring_no, struct mtk_rx_dma_v2 *rxd)
 {
+	struct mtk_eth *eth = g_eth;
 	u32 idx, flush_reason;
 
-#if defined(CONFIG_MEDIATEK_NETSYS_V2)
-	idx = ring_no - 4;
-	flush_reason = RX_DMA_GET_FLUSH_RSN_V2(rxd->rxd6);
-#else
-	idx = ring_no - 1;
-	flush_reason = RX_DMA_GET_REV(rxd->rxd2);
-#endif
+	if (MTK_HAS_CAPS(eth->soc->caps, MTK_NETSYS_V2)) {
+		idx = ring_no - 4;
+		flush_reason = RX_DMA_GET_FLUSH_RSN_V2(rxd->rxd6);
+	} else {
+		idx = ring_no - 1;
+		flush_reason = RX_DMA_GET_REV(rxd->rxd2);
+	}
 
 	if ((flush_reason & 0x7) == MTK_HW_LRO_AGG_FLUSH)
 		hw_lro_agg_flush_cnt[idx]++;
@@ -1454,8 +1517,66 @@ static const struct file_operations hw_lro_auto_tlb_fops = {
 	.release = single_release
 };
 
+int reset_event_read(struct seq_file *seq, void *v)
+{
+	struct mtk_eth *eth = g_eth;
+	struct mtk_reset_event reset_event = eth->reset_event;
+
+	seq_printf(seq, "[Event]		[Count]\n");
+	seq_printf(seq, " FQ Empty:	%d\n",
+		   reset_event.count[MTK_EVENT_FQ_EMPTY]);
+	seq_printf(seq, " TSO Fail:	%d\n",
+		   reset_event.count[MTK_EVENT_TSO_FAIL]);
+	seq_printf(seq, " TSO Illegal:	%d\n",
+		   reset_event.count[MTK_EVENT_TSO_ILLEGAL]);
+	seq_printf(seq, " TSO Align:	%d\n",
+		   reset_event.count[MTK_EVENT_TSO_ALIGN]);
+	seq_printf(seq, " RFIFO OV:	%d\n",
+		   reset_event.count[MTK_EVENT_RFIFO_OV]);
+	seq_printf(seq, " RFIFO UF:	%d\n",
+		   reset_event.count[MTK_EVENT_RFIFO_UF]);
+	seq_printf(seq, " Force:		%d\n",
+		   reset_event.count[MTK_EVENT_FORCE]);
+	seq_printf(seq, "----------------------------\n");
+	seq_printf(seq, " Warm Cnt:	%d\n",
+		   reset_event.count[MTK_EVENT_WARM_CNT]);
+	seq_printf(seq, " Cold Cnt:	%d\n",
+		   reset_event.count[MTK_EVENT_COLD_CNT]);
+	seq_printf(seq, " Total Cnt:	%d\n",
+		   reset_event.count[MTK_EVENT_TOTAL_CNT]);
+
+	return 0;
+}
+
+static int reset_event_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, reset_event_read, 0);
+}
+
+ssize_t reset_event_write(struct file *file, const char __user *buffer,
+			  size_t count, loff_t *data)
+{
+	struct mtk_eth *eth = g_eth;
+	struct mtk_reset_event *reset_event = &eth->reset_event;
+
+	memset(reset_event, 0, sizeof(struct mtk_reset_event));
+	pr_info("MTK reset event counter is cleared !\n");
+
+	return count;
+}
+
+static const struct file_operations reset_event_fops = {
+	.owner = THIS_MODULE,
+	.open = reset_event_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.write = reset_event_write,
+	.release = single_release
+};
+
+
 struct proc_dir_entry *proc_reg_dir;
-static struct proc_dir_entry *proc_esw_cnt, *proc_dbg_regs;
+static struct proc_dir_entry *proc_esw_cnt, *proc_dbg_regs, *proc_reset_event;
 
 int debug_proc_init(struct mtk_eth *eth)
 {
@@ -1468,6 +1589,11 @@ int debug_proc_init(struct mtk_eth *eth)
 	    proc_create(PROCREG_TXRING, 0, proc_reg_dir, &tx_ring_fops);
 	if (!proc_tx_ring)
 		pr_notice("!! FAIL to create %s PROC !!\n", PROCREG_TXRING);
+
+	proc_hwtx_ring =
+	    proc_create(PROCREG_HWTXRING, 0, proc_reg_dir, &hwtx_ring_fops);
+	if (!proc_hwtx_ring)
+		pr_notice("!! FAIL to create %s PROC !!\n", PROCREG_HWTXRING);
 
 	proc_rx_ring =
 	    proc_create(PROCREG_RXRING, 0, proc_reg_dir, &rx_ring_fops);
@@ -1499,6 +1625,11 @@ int debug_proc_init(struct mtk_eth *eth)
 				PROCREG_HW_LRO_AUTO_TLB);
 	}
 
+	proc_reset_event =
+	    proc_create(PROCREG_RESET_EVENT, 0, proc_reg_dir, &reset_event_fops);
+	if (!proc_reset_event)
+		pr_notice("!! FAIL to create %s PROC !!\n", PROCREG_RESET_EVENT);
+
 	return 0;
 }
 
@@ -1506,6 +1637,8 @@ void debug_proc_exit(void)
 {
 	if (proc_tx_ring)
 		remove_proc_entry(PROCREG_TXRING, proc_reg_dir);
+	if (proc_hwtx_ring)
+		remove_proc_entry(PROCREG_HWTXRING, proc_reg_dir);
 	if (proc_rx_ring)
 		remove_proc_entry(PROCREG_RXRING, proc_reg_dir);
 
@@ -1525,5 +1658,8 @@ void debug_proc_exit(void)
 		if (proc_hw_lro_auto_tlb)
 			remove_proc_entry(PROCREG_HW_LRO_AUTO_TLB, proc_reg_dir);
 	}
+
+	if (proc_reset_event)
+		remove_proc_entry(PROCREG_RESET_EVENT, proc_reg_dir);
 }
 

@@ -46,15 +46,15 @@ define Device/mediatek_mt7622-ubi
   DEVICE_MODEL := MTK7622 AP (UBI)
   DEVICE_DTS := mt7622-rfb1-ubi
   DEVICE_DTS_DIR := $(DTS_DIR)/mediatek
-  SUPPORTED_DEVICES := mediatek,mt7622,ubi
   UBINIZE_OPTS := -E 5
   BLOCKSIZE := 128k
   PAGESIZE := 2048
-  IMAGE_SIZE := 36864k
-  KERNEL_IN_UBI := 1
+  KERNEL_SIZE := 4194304
+  IMAGE_SIZE := 32768k
   IMAGES += factory.bin
-  IMAGE/factory.bin := append-ubi | check-size $$$$(IMAGE_SIZE)
-  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+  IMAGE/factory.bin := append-kernel | pad-to $$(KERNEL_SIZE) | append-ubi | \
+                check-size $$$$(IMAGE_SIZE)
+  IMAGE/sysupgrade.bin := sysupgrade-tar
   DEVICE_PACKAGES := kmod-usb-ohci kmod-usb2 kmod-usb3 kmod-ata-ahci-mtk
 endef
 TARGET_DEVICES += mediatek_mt7622-ubi

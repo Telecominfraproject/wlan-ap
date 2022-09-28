@@ -25,17 +25,6 @@ platform_check_image() {
 	[ "$#" -gt 1 ] && return 1
 
 	case "$board" in
-	mediatek,mt7622,ubi)
-		# tar magic `ustar`
-		magic="$(dd if="$1" bs=1 skip=257 count=5 2>/dev/null)"
-
-		[ "$magic" != "ustar" ] && {
-			echo "Invalid image type."
-			return 1
-		}
-
-		return 0
-		;;
 	*)
 		[ "$magic" != "d00dfeed" ] && {
 			echo "Invalid image type."

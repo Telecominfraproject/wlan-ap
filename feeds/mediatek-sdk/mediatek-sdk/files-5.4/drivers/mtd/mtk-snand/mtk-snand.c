@@ -83,6 +83,7 @@
 #define NFI_MASTERSTA_MASK_7622		(MAS_ADDR | MAS_RD | MAS_WR | MAS_RDDLY)
 #define AHB_BUS_BUSY			BIT(1)
 #define BUS_BUSY			BIT(0)
+#define NFI_MASTERSTA_MASK_7981		(AHB_BUS_BUSY | BUS_BUSY)
 #define NFI_MASTERSTA_MASK_7986		(AHB_BUS_BUSY | BUS_BUSY)
 
 /* SNFI registers */
@@ -147,6 +148,11 @@
 
 static const uint8_t mt7622_spare_sizes[] = { 16, 26, 27, 28 };
 
+static const uint8_t mt7981_spare_sizes[] = {
+	16, 26, 27, 28, 32, 36, 40, 44, 48, 49, 50, 51, 52, 62, 61, 63, 64,
+	67, 74
+};
+
 static const uint8_t mt7986_spare_sizes[] = {
 	16, 26, 27, 28, 32, 36, 40, 44, 48, 49, 50, 51, 52, 62, 61, 63, 64,
 	67, 74
@@ -178,6 +184,20 @@ static const struct mtk_snand_soc_data mtk_snand_socs[__SNAND_SOC_MAX] = {
 		.mastersta_mask = NFI_MASTERSTA_MASK_7622,
 		.spare_sizes = mt7622_spare_sizes,
 		.num_spare_size = ARRAY_SIZE(mt7622_spare_sizes),
+		.latch_lat = 0,
+		.sample_delay = 40
+	},
+	[SNAND_SOC_MT7981] = {
+		.sector_size = 1024,
+		.max_sectors = 16,
+		.fdm_size = 8,
+		.fdm_ecc_size = 1,
+		.fifo_size = 64,
+		.bbm_swap = true,
+		.empty_page_check = true,
+		.mastersta_mask = NFI_MASTERSTA_MASK_7981,
+		.spare_sizes = mt7981_spare_sizes,
+		.num_spare_size = ARRAY_SIZE(mt7981_spare_sizes),
 		.latch_lat = 0,
 		.sample_delay = 40
 	},

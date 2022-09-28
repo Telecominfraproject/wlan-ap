@@ -1036,10 +1036,52 @@ static int hnat_whnat_open(struct inode *inode, struct file *file)
 	return single_open(file, hnat_whnat_show, file->private_data);
 }
 
+static ssize_t hnat_whnat_write(struct file *file, const char __user *buf,
+				size_t length, loff_t *offset)
+{
+	char line[64] = {0};
+	struct net_device *dev;
+	int enable;
+	char name[32];
+	size_t size;
+
+	if (length >= sizeof(line))
+		return -EINVAL;
+
+	if (copy_from_user(line, buf, length))
+		return -EFAULT;
+
+	if (sscanf(line, "%s %d", name, &enable) != 2)
+		return -EFAULT;
+
+	line[length] = '\0';
+
+	dev = dev_get_by_name(&init_net, name);
+
+	if (dev) {
+		if (enable) {
+			mtk_ppe_dev_register_hook(dev);
+			pr_info("register wifi extern if = %s\n", dev->name);
+		} else {
+			mtk_ppe_dev_unregister_hook(dev);
+			pr_info("unregister wifi extern if = %s\n", dev->name);
+		}
+	} else {
+		pr_info("no such device!\n");
+	}
+
+	size = strlen(line);
+	*offset += size;
+
+	return length;
+}
+
+
 static const struct file_operations hnat_whnat_fops = {
 	.open = hnat_whnat_open,
 	.read = seq_read,
 	.llseek = seq_lseek,
+	.write = hnat_whnat_write,
 	.release = single_release,
 };
 
@@ -1774,10 +1816,9 @@ static ssize_t hnat_queue_write(struct file *file, const char __user *buf,
 	int resv;
 	int scheduler;
 	size_t size;
-	u32 qtx_sch;
+	u32 qtx_sch = 0;
 
 	cr_set_field(h->fe_base + QDMA_PAGE, QTX_CFG_PAGE, (id / NUM_OF_Q_PER_PAGE));
-	qtx_sch = readl(h->fe_base + QTX_SCH(id % NUM_OF_Q_PER_PAGE));
 	if (length >= sizeof(line))
 		return -EINVAL;
 
@@ -1800,7 +1841,6 @@ static ssize_t hnat_queue_write(struct file *file, const char __user *buf,
 		min_exp++;
 	}
 
-	qtx_sch &= 0x70000000;
 	if (hnat_priv->data->num_of_sch == 4)
 		qtx_sch |= (scheduler & 0x3) << 30;
 	else
@@ -1910,20 +1950,35 @@ static ssize_t hnat_mape_toggle_write(struct file *file, const char __user *buff
 				      size_t count, loff_t *data)
 {
 	char buf = 0;
-	int len = count;
-
-	if (copy_from_user(&buf, buffer, len))
+	int i;
+	u32 ppe_cfg;
+	
+	if ((count < 1) || copy_from_user(&buf, buffer, sizeof(buf)))
 		return -EFAULT;
 
-	if (buf == '1' && !mape_toggle) {
+	if (buf == '1') {
 		pr_info("mape is going to be enabled, ds-lite is going to be disabled !\n");
 		mape_toggle = 1;
-	} else if (buf == '0' && mape_toggle) {
+	} else if (buf == '0') {
 		pr_info("ds-lite is going to be enabled, mape is going to be disabled !\n");
 		mape_toggle = 0;
+	} else {
+		pr_info("Invalid parameter.\n");
+		return -EFAULT;
 	}
 
-	return len;
+	for (i = 0; i < CFG_PPE_NUM; i++) {
+		ppe_cfg = readl(hnat_priv->ppe_base[i] + PPE_FLOW_CFG);
+
+		if (mape_toggle)
+			ppe_cfg &= ~BIT_IPV4_DSL_EN;
+		else
+			ppe_cfg |= BIT_IPV4_DSL_EN;
+
+		writel(ppe_cfg, hnat_priv->ppe_base[i] + PPE_FLOW_CFG);
+	}
+
+	return count;
 }
 
 static const struct file_operations hnat_mape_toggle_fops = {
@@ -2019,28 +2074,28 @@ void hnat_qos_shaper_ebl(u32 id, u32 enable)
 static void hnat_qos_disable(void)
 {
 	struct mtk_hnat *h = hnat_priv;
-	u32 id;
+	u32 id, cfg;
 
 	for (id = 0; id < MAX_PPPQ_PORT_NUM; id++) {
 		hnat_qos_shaper_ebl(id, 0);
-		writel(0, h->fe_base + QTX_CFG(id % NUM_OF_Q_PER_PAGE));
+		writel((4 << QTX_CFG_HW_RESV_CNT_OFFSET) |
+		       (4 << QTX_CFG_SW_RESV_CNT_OFFSET),
+		       h->fe_base + QTX_CFG(id % NUM_OF_Q_PER_PAGE));
 	}
 
-	writel((4 << QTX_CFG_HW_RESV_CNT_OFFSET) |
-	       (4 << QTX_CFG_SW_RESV_CNT_OFFSET), h->fe_base + QTX_CFG(0));
-
+	cfg = (QDMA_TX_SCH_WFQ_EN) | (QDMA_TX_SCH_WFQ_EN << 16);
 	for (id = 0; id < h->data->num_of_sch; id += 2) {
 		if (h->data->num_of_sch == 4)
-			writel(0, h->fe_base + QDMA_TX_4SCH_BASE(id));
+			writel(cfg, h->fe_base + QDMA_TX_4SCH_BASE(id));
 		else
-			writel(0, h->fe_base + QDMA_TX_2SCH_BASE);
+			writel(cfg, h->fe_base + QDMA_TX_2SCH_BASE);
 	}
 }
 
 static void hnat_qos_pppq_enable(void)
 {
 	struct mtk_hnat *h = hnat_priv;
-	u32 id;
+	u32 id, cfg;
 
 	for (id = 0; id < MAX_PPPQ_PORT_NUM; id++) {
 		if (hook_toggle)
@@ -2053,11 +2108,12 @@ static void hnat_qos_pppq_enable(void)
 		       h->fe_base + QTX_CFG(id % NUM_OF_Q_PER_PAGE));
 	}
 
+	cfg = (QDMA_TX_SCH_WFQ_EN) | (QDMA_TX_SCH_WFQ_EN << 16);
 	for (id = 0; id < h->data->num_of_sch; id+= 2) {
 		if (h->data->num_of_sch == 4)
-                        writel(0, h->fe_base + QDMA_TX_4SCH_BASE(id));
+                        writel(cfg, h->fe_base + QDMA_TX_4SCH_BASE(id));
                 else
-                        writel(0, h->fe_base + QDMA_TX_2SCH_BASE);
+                        writel(cfg, h->fe_base + QDMA_TX_2SCH_BASE);
 	}
 }
 
@@ -2079,6 +2135,7 @@ static ssize_t hnat_qos_toggle_write(struct file *file, const char __user *buffe
 		qos_toggle = 1;
 	} else if (buf[0] == '2') {
 		pr_info("Per-port-per-queue mode is going to be enabled !\n");
+		pr_info("PPPQ use qid 0~5 (scheduler 0).\n");
 		qos_toggle = 2;
 		hnat_qos_pppq_enable();
 	}

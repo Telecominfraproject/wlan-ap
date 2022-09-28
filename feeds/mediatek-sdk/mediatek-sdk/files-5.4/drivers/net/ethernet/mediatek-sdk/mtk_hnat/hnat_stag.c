@@ -40,7 +40,8 @@ u32 hnat_dsa_fill_stag(const struct net_device *netdev,
 
 	switch (eth_proto) {
 	case ETH_P_IP:
-		if (entry->ipv4_hnapt.bfib1.pkt_type == IPV4_DSLITE)
+		if (entry->ipv4_hnapt.bfib1.pkt_type == IPV4_DSLITE
+			|| (entry->ipv4_hnapt.bfib1.pkt_type == IPV4_MAP_E))
 			entry->ipv4_dslite.etype = sp_tag;
 		else
 			entry->ipv4_hnapt.etype = sp_tag;

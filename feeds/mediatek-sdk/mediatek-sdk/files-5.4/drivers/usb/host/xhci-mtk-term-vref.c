@@ -22,6 +22,7 @@ ssize_t RG_USB20_TERM_VREF_SEL_show(struct device *dev,
 	struct xhci_hcd_mtk *mtk = dev_get_drvdata(dev);
 	struct usb_hcd *hcd = mtk->hcd;
 	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+	struct device_node  *node = dev->of_node;
 	ssize_t cnt = 0;
 	void __iomem *addr;
 	u32 val;
@@ -67,8 +68,8 @@ ssize_t RG_USB20_TERM_VREF_SEL_show(struct device *dev,
 			cnt += sprintf(buf + cnt,
 				       "USB20 Port%i: 0x%08X\n", i, val);
 
-			ret = query_phy_addr(dev->of_node,
-						 &index, &io, &length);
+			ret = query_phy_addr(node,
+					 &index, &io, &length, PHY_TYPE_USB2);
 			if (ret && ret != -EACCES) {
 				if (ret == -EPERM)
 					cnt += sprintf(buf + cnt,
@@ -143,7 +144,7 @@ ssize_t RG_USB20_TERM_VREF_SEL_store(struct device *dev,
 	hqa_info(mtk, " params: %i %i %s\n",
 		port, index, str);
 
-	ret = query_phy_addr(node, &index, &io, &length);
+	ret = query_phy_addr(node, &index, &io, &length, PHY_TYPE_USB2);
 	if (ret && ret != -EACCES)
 		goto error;
 

@@ -460,14 +460,14 @@ static const struct mtk_pin_field_calc mt7986_pin_pupd_range[] = {
 	PIN_FIELD_BASE(39, 39, 2, 0x60, 0x10, 18, 1),
 	PIN_FIELD_BASE(40, 40, 2, 0x60, 0x10, 19, 1),
 	PIN_FIELD_BASE(41, 41, 2, 0x60, 0x10, 12, 1),
-	PIN_FIELD_BASE(42, 42, 2, 0x60, 0x10, 22, 1),
-	PIN_FIELD_BASE(43, 43, 2, 0x60, 0x10, 23, 1),
-	PIN_FIELD_BASE(44, 44, 2, 0x60, 0x10, 20, 1),
-	PIN_FIELD_BASE(45, 45, 2, 0x60, 0x10, 21, 1),
-	PIN_FIELD_BASE(46, 46, 2, 0x60, 0x10, 26, 1),
-	PIN_FIELD_BASE(47, 47, 2, 0x60, 0x10, 27, 1),
-	PIN_FIELD_BASE(48, 48, 2, 0x60, 0x10, 24, 1),
-	PIN_FIELD_BASE(49, 49, 2, 0x60, 0x10, 25, 1),
+	PIN_FIELD_BASE(42, 42, 2, 0x60, 0x10, 23, 1),
+	PIN_FIELD_BASE(43, 43, 2, 0x60, 0x10, 24, 1),
+	PIN_FIELD_BASE(44, 44, 2, 0x60, 0x10, 21, 1),
+	PIN_FIELD_BASE(45, 45, 2, 0x60, 0x10, 22, 1),
+	PIN_FIELD_BASE(46, 46, 2, 0x60, 0x10, 27, 1),
+	PIN_FIELD_BASE(47, 47, 2, 0x60, 0x10, 28, 1),
+	PIN_FIELD_BASE(48, 48, 2, 0x60, 0x10, 25, 1),
+	PIN_FIELD_BASE(49, 49, 2, 0x60, 0x10, 26, 1),
 	PIN_FIELD_BASE(50, 50, 1, 0x40, 0x10, 2, 1),
 	PIN_FIELD_BASE(51, 51, 1, 0x40, 0x10, 3, 1),
 	PIN_FIELD_BASE(52, 52, 1, 0x40, 0x10, 4, 1),
@@ -532,14 +532,14 @@ static const struct mtk_pin_field_calc mt7986_pin_r0_range[] = {
 	PIN_FIELD_BASE(39, 39, 2, 0x70, 0x10, 18, 1),
 	PIN_FIELD_BASE(40, 40, 2, 0x70, 0x10, 19, 1),
 	PIN_FIELD_BASE(41, 41, 2, 0x70, 0x10, 12, 1),
-	PIN_FIELD_BASE(42, 42, 2, 0x70, 0x10, 22, 1),
-	PIN_FIELD_BASE(43, 43, 2, 0x70, 0x10, 23, 1),
-	PIN_FIELD_BASE(44, 44, 2, 0x70, 0x10, 20, 1),
-	PIN_FIELD_BASE(45, 45, 2, 0x70, 0x10, 21, 1),
-	PIN_FIELD_BASE(46, 46, 2, 0x70, 0x10, 26, 1),
-	PIN_FIELD_BASE(47, 47, 2, 0x70, 0x10, 27, 1),
-	PIN_FIELD_BASE(48, 48, 2, 0x70, 0x10, 24, 1),
-	PIN_FIELD_BASE(49, 49, 2, 0x70, 0x10, 25, 1),
+	PIN_FIELD_BASE(42, 42, 2, 0x70, 0x10, 23, 1),
+	PIN_FIELD_BASE(43, 43, 2, 0x70, 0x10, 24, 1),
+	PIN_FIELD_BASE(44, 44, 2, 0x70, 0x10, 21, 1),
+	PIN_FIELD_BASE(45, 45, 2, 0x70, 0x10, 22, 1),
+	PIN_FIELD_BASE(46, 46, 2, 0x70, 0x10, 27, 1),
+	PIN_FIELD_BASE(47, 47, 2, 0x70, 0x10, 28, 1),
+	PIN_FIELD_BASE(48, 48, 2, 0x70, 0x10, 25, 1),
+	PIN_FIELD_BASE(49, 49, 2, 0x70, 0x10, 26, 1),
 	PIN_FIELD_BASE(50, 50, 1, 0x50, 0x10, 2, 1),
 	PIN_FIELD_BASE(51, 51, 1, 0x50, 0x10, 3, 1),
 	PIN_FIELD_BASE(52, 52, 1, 0x50, 0x10, 4, 1),
@@ -604,14 +604,14 @@ static const struct mtk_pin_field_calc mt7986_pin_r1_range[] = {
 	PIN_FIELD_BASE(39, 39, 2, 0x80, 0x10, 18, 1),
 	PIN_FIELD_BASE(40, 40, 2, 0x80, 0x10, 19, 1),
 	PIN_FIELD_BASE(41, 41, 2, 0x80, 0x10, 12, 1),
-	PIN_FIELD_BASE(42, 42, 2, 0x80, 0x10, 22, 1),
-	PIN_FIELD_BASE(43, 43, 2, 0x80, 0x10, 23, 1),
-	PIN_FIELD_BASE(44, 44, 2, 0x80, 0x10, 20, 1),
-	PIN_FIELD_BASE(45, 45, 2, 0x80, 0x10, 21, 1),
-	PIN_FIELD_BASE(46, 46, 2, 0x80, 0x10, 26, 1),
-	PIN_FIELD_BASE(47, 47, 2, 0x80, 0x10, 27, 1),
-	PIN_FIELD_BASE(48, 48, 2, 0x80, 0x10, 24, 1),
-	PIN_FIELD_BASE(49, 49, 2, 0x80, 0x10, 25, 1),
+	PIN_FIELD_BASE(42, 42, 2, 0x80, 0x10, 23, 1),
+	PIN_FIELD_BASE(43, 43, 2, 0x80, 0x10, 24, 1),
+	PIN_FIELD_BASE(44, 44, 2, 0x80, 0x10, 21, 1),
+	PIN_FIELD_BASE(45, 45, 2, 0x80, 0x10, 22, 1),
+	PIN_FIELD_BASE(46, 46, 2, 0x80, 0x10, 27, 1),
+	PIN_FIELD_BASE(47, 47, 2, 0x80, 0x10, 28, 1),
+	PIN_FIELD_BASE(48, 48, 2, 0x80, 0x10, 25, 1),
+	PIN_FIELD_BASE(49, 49, 2, 0x80, 0x10, 26, 1),
 	PIN_FIELD_BASE(50, 50, 1, 0x60, 0x10, 2, 1),
 	PIN_FIELD_BASE(51, 51, 1, 0x60, 0x10, 3, 1),
 	PIN_FIELD_BASE(52, 52, 1, 0x60, 0x10, 4, 1),
@@ -881,6 +881,17 @@ static int mt7986_mdc_mdio_funcs[] = { 1, 1, };
 static int mt7986_wf0_mode1_pins[] = { 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85 };
 static int mt7986_wf0_mode1_funcs[] = { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
 
+static int mt7986_wf_2g_pins[] = {74, 75, 76, 77, 78, 79, 80, 81, 82, 83, };
+static int mt7986_wf_2g_funcs[] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, };
+
+static int mt7986_wf_5g_pins[] = {91, 92, 93, 94, 95, 96, 97, 98, 99, 100, };
+static int mt7986_wf_5g_funcs[] = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, };
+
+static int mt7986_wf_dbdc_pins[] = {
+	74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, };
+static int mt7986_wf_dbdc_funcs[] = {
+	2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, };
+
 /* WF0_HB */
 static int mt7986_wf0_hb_pins[] = { 74, 75, 76, 77, 78 };
 static int mt7986_wf0_hb_funcs[] = { 2, 2, 2, 2, 2 };
@@ -986,6 +997,11 @@ static const struct group_desc mt7986_groups[] = {
         PINCTRL_PIN_GROUP("wf1_mode1", mt7986_wf1_mode1),
      /*  @GPIO(91,97): WF1_MODE2(2) */
         PINCTRL_PIN_GROUP("wf1_mode2", mt7986_wf1_mode2),
+
+
+	PINCTRL_PIN_GROUP("wf_2g", mt7986_wf_2g),
+	PINCTRL_PIN_GROUP("wf_5g", mt7986_wf_5g),
+	PINCTRL_PIN_GROUP("wf_dbdc", mt7986_wf_dbdc),
 };
 
 /* Joint those groups owning the same capability in user point of view which
@@ -1005,6 +1021,7 @@ static const char *mt7986_uart_groups[] = { "uart1_0", "uart1_1", "uart1_2",
 static const char *mt7986_wdt_groups[] = { "watchdog", };
 static const char *mt7986_flash_groups[] = { "snfi", "emmc_45", "emmc_51", "spi0", "spi0_wp_hold"};
 static const char *mt7986_pcie_groups[] = { "pcie_clk", "pcie_wake", "pcie_pereset"};
+static const char *mt7986_wf_groups[] = { "wf_2g", "wf_5g", "wf_dbdc", };
 
 static const struct function_desc mt7986_functions[] = {
 	{"eth",	mt7986_ethernet_groups, ARRAY_SIZE(mt7986_ethernet_groups)},
@@ -1016,6 +1033,7 @@ static const struct function_desc mt7986_functions[] = {
 	{"watchdog", mt7986_wdt_groups, ARRAY_SIZE(mt7986_wdt_groups)},
 	{"flash", mt7986_flash_groups, ARRAY_SIZE(mt7986_flash_groups)},
 	{"pcie", mt7986_pcie_groups, ARRAY_SIZE(mt7986_pcie_groups)},
+	{"wifi", mt7986_wf_groups, ARRAY_SIZE(mt7986_wf_groups)},
 };
 
 static const struct mtk_eint_hw mt7986_eint_hw = {

@@ -123,6 +123,7 @@
 #define QDMA_TX_2SCH_BASE		(QDMA_BASE + 0x214)
 #define QTX_MIB_IF			(QDMA_BASE + 0x2bc)
 #define QDMA_TX_4SCH_BASE(x)		(QDMA_BASE + 0x398 + (((x) >> 1) * 0x4))
+#define QDMA_TX_SCH_WFQ_EN		BIT(15)
 
 /*--------------------------------------------------------------------------*/
 /* Register Mask*/
@@ -140,6 +141,8 @@
 #define HASH_MODE (0x3 << 14) /* RW */
 #define SCAN_MODE (0x3 << 16) /* RW */
 #define XMODE (0x3 << 18) /* RW */
+#define TICK_SEL (0x1 << 24) /* RW */
+
 
 /*PPE_CAH_CTRL mask*/
 #define CAH_EN (0x1 << 0) /* RW */
@@ -669,6 +672,7 @@ struct mtk_hnat {
 	struct ppe_mcast_table *pmcast;
 
 	u32 foe_etry_num;
+	u32 etry_num_cfg;
 	struct net_device *g_ppdev;
 	struct net_device *g_wandev;
 	struct net_device *wifi_hook_if[MAX_IF_NUM];
@@ -885,6 +889,8 @@ enum FoeIpAct {
 	})
 
 #define IS_DSA_LAN(dev) (!strncmp(dev->name, "lan", 3))
+#define IS_DSA_1G_LAN(dev) (!strncmp(dev->name, "lan", 3) &&		       \
+			    strcmp(dev->name, "lan5"))
 #define IS_DSA_WAN(dev) (!strncmp(dev->name, "wan", 3))
 #define NONE_DSA_PORT 0xff
 #define MAX_CRSN_NUM 32
@@ -959,6 +965,8 @@ void set_gmac_ppe_fwd(int gmac_no, int enable);
 int entry_detail(u32 ppe_id, int index);
 int entry_delete_by_mac(u8 *mac);
 int entry_delete(u32 ppe_id, int index);
+int hnat_warm_init(void);
+
 struct hnat_accounting *hnat_get_count(struct mtk_hnat *h, u32 ppe_id,
 				       u32 index, struct hnat_accounting *diff);
 

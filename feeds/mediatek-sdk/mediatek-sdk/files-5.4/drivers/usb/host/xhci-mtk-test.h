@@ -15,12 +15,17 @@
 #ifdef CONFIG_USB_XHCI_MTK_DEBUGFS
 int hqa_create_attr(struct device *dev);
 void hqa_remove_attr(struct device *dev);
+void ssusb_remap_ip_regs(struct device *dev);
+
 #else
 static inline int hqa_create_attr(struct device *dev)
 {
 	return 0;
 }
 static inline void hqa_remove_attr(struct device *dev)
+{
+}
+static inline void ssusb_remap_ip_regs(struct device *dev)
 {
 }
 #endif

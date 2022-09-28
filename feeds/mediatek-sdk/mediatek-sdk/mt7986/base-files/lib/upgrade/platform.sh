@@ -1,11 +1,12 @@
-RAMFS_COPY_BIN='mkfs.f2fs blkid blockdev'
+RAMFS_COPY_BIN='mkfs.f2fs blkid blockdev fw_printenv fw_setenv'
+RAMFS_COPY_DATA="/etc/fw_env.config /var/lock/fw_printenv.lock"
 
 platform_do_upgrade() {
 	local board=$(board_name)
 
 	case "$board" in
 	*snand*)
-		nand_do_upgrade "$1"
+		ubi_do_upgrade "$1"
 		;;
 	*emmc*)
 		mtk_mmc_do_upgrade "$1"
