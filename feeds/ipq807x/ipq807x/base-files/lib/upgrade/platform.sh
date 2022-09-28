@@ -84,6 +84,7 @@ platform_check_image() {
 	edgecore,eap101|\
 	edgecore,eap102|\
 	edgecore,eap104|\
+	liteon,wpx8324|\
 	edgecore,eap106|\
 	hfcl,ion4xi|\
 	hfcl,ion4xe|\
@@ -151,6 +152,7 @@ platform_do_upgrade() {
 		nand_upgrade_tar "$1"
 		;;
 	edgecore,eap104|\
+	liteon,wpx8324|\
 	edgecore,eap106)
 		CI_UBIPART="rootfs1"
 		[ "$(find_mtd_chardev rootfs)" ] && CI_UBIPART="rootfs"
