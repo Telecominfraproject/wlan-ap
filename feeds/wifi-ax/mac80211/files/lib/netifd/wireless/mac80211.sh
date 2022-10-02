@@ -533,7 +533,7 @@ mac80211_generate_mac() {
 	local ref="$(cat /sys/class/ieee80211/${phy}/macaddress)"
 	local mask="$(cat /sys/class/ieee80211/${phy}/address_mask)"
 
-	[ "$mask" = "00:00:00:00:00:00" -a "$multiple_bssid" -neq 1 ] && {
+	[ "$mask" = "00:00:00:00:00:00" -a "$multiple_bssid" != 1 ] && {
 		mask="ff:ff:ff:ff:ff:ff";
 
 		[ "$(wc -l < /sys/class/ieee80211/${phy}/addresses)" -gt $id ] && {
