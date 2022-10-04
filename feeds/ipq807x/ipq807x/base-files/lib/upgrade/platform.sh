@@ -164,3 +164,17 @@ platform_do_upgrade() {
 		;;
 	esac
 }
+
+platform_copy_config() {
+	board=$(board_name)
+	case $board in
+	motorola,q14)
+		local emmcblock="$(find_mmc_part "rootfs_data")"
+		if [ -e "$emmcblock" ]; then
+			mount -t ext4 -o rw,noatime ${emmcblock} /mnt
+			cp -af "$UPGRADE_BACKUP" "/mnt/$BACKUP_FILE"
+			umount /mnt
+		fi
+		;;
+	esac
+}
