@@ -366,3 +366,20 @@ define Device/mediatek_mt7986-fpga-ubi
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
 endef
 TARGET_DEVICES += mediatek_mt7986-fpga-ubi
+
+define Device/motorola_r14
+  DEVICE_VENDOR := Motorola
+  DEVICE_MODEL := r14
+  DEVICE_DTS := mt7986a-motorola-r14
+  DEVICE_DTS_DIR := $(DTS_DIR)/mediatek
+  SUPPORTED_DEVICES := motorola,r14
+  UBINIZE_OPTS := -E 5
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  IMAGE_SIZE := 65536k
+  KERNEL_IN_UBI := 1
+  IMAGES += factory.bin
+  IMAGE/factory.bin := append-ubi | check-size $$$$(IMAGE_SIZE)
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+endef
+TARGET_DEVICES += motorola_r14

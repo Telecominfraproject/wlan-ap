@@ -5,6 +5,9 @@ platform_do_upgrade() {
 	local board=$(board_name)
 
 	case "$board" in
+	motorola,r14)
+		nand_do_upgrade "$1"
+		;;
 	*snand*)
 		ubi_do_upgrade "$1"
 		;;
@@ -26,6 +29,7 @@ platform_check_image() {
 	[ "$#" -gt 1 ] && return 1
 
 	case "$board" in
+	motorola,r14 |\
 	*snand* |\
 	*emmc*)
 		# tar magic `ustar`
