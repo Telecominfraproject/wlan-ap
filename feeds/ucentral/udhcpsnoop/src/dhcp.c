@@ -6,10 +6,11 @@
 #include "dhcpsnoop.h"
 #include "msg.h"
 
-const char *dhcpsnoop_parse_ipv4(const void *buf, size_t len, uint16_t port, uint32_t *rebind)
+const char *dhcpsnoop_parse_ipv4(const void *buf, size_t len, uint16_t port, uint32_t *expire)
 {
 	const struct dhcpv4_message *msg = buf;
 	const uint8_t *pos, *end;
+	uint32_t leasetime = 0, rebind = 0, renew = 0;
 	char type = 0;
 
 	if (port != 67 && port != 68)
@@ -46,13 +47,33 @@ const char *dhcpsnoop_parse_ipv4(const void *buf, size_t len, uint16_t port, uin
 				continue;
 			type = opt[2];
 			break;
-		case DHCPV4_OPT_REBIND:
-			if (!rebind || opt[1] != 4)
+		case DHCPV4_OPT_LEASETIME:
+			if (opt[1] != 4)
 				continue;
-			*rebind = *((uint32_t *) &opt[2]);
+			leasetime = *((uint32_t *) &opt[2]);
+			break;
+		case DHCPV4_OPT_REBIND:
+			if (opt[1] != 4)
+				continue;
+			rebind = *((uint32_t *) &opt[2]);
+			break;
+		case DHCPV4_OPT_RENEW:
+			if (opt[1] != 4)
+				continue;
+			renew = *((uint32_t *) &opt[2]);
 			break;
 		}
 	}
+
+	if (renew)
+		*expire = renew;
+	else if (rebind)
+		*expire = rebind;
+	else if (leasetime)
+		*expire = leasetime;
+	else
+		*expire = 24 * 60 * 60;
+	*expire = ntohl(*expire);
 
 	switch(type) {
 	case DHCPV4_MSG_ACK:

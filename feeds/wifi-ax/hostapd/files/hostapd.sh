@@ -154,8 +154,6 @@ hostapd_prepare_device_config() {
 	set_default ema 0
 	set_default acs_exclude_dfs 0
 
-	[ "$band" = "6g" ] && multiple_bssid=1
-
 	[ -n "$country" ] && {
 		append base_cfg "country_code=$country" "$N"
 		[ -n "$country3" ] && append base_cfg "country3=$country3" "$N"
@@ -378,7 +376,7 @@ hostapd_common_add_bss_config() {
 	config_add_array airtime_sta_weight
 	config_add_int airtime_bss_weight airtime_bss_limit
 
-	config_add_boolean multicast_to_unicast proxy_arp per_sta_vif
+	config_add_boolean multicast_to_unicast multicast_to_unicast_all proxy_arp per_sta_vif
 
 	config_add_array hostapd_bss_options
 	config_add_boolean default_disabled
@@ -627,7 +625,7 @@ hostapd_set_bss_options() {
 		bss_load_update_period chan_util_avg_period sae_require_mfp sae_pwe \
 		multi_ap multi_ap_backhaul_ssid multi_ap_backhaul_key skip_inactivity_poll \
 		airtime_bss_weight airtime_bss_limit airtime_sta_weight \
-		multicast_to_unicast proxy_arp per_sta_vif \
+		multicast_to_unicast_all proxy_arp per_sta_vif \
 		eap_server eap_user_file ca_cert server_cert private_key private_key_passwd server_id \
 		vendor_elements fils
 
@@ -888,14 +886,20 @@ hostapd_set_bss_options() {
 			set_default mobility_domain "$(echo "$ssid" | md5sum | head -c 4)"
 			set_default ft_over_ds 1
 			set_default reassociation_deadline 1000
+			skip_kh_setup=0
 
 			case "$auth_type" in
-				psk|sae|psk-sae)
+				psk|psk-sae)
 					set_default ft_psk_generate_local 1
+					skip_kh_setup="$ft_psk_generate_local"
 				;;
 				*)
 					set_default ft_psk_generate_local 0
 				;;
+			esac
+
+			case "$auth_type" in
+				*sae*) skip_kh_setup=0;;
 			esac
 
 			[ -n "$network_ifname" ] && append bss_conf "ft_iface=$network_ifname" "$N"
@@ -905,7 +909,7 @@ hostapd_set_bss_options() {
 			append bss_conf "reassociation_deadline=$reassociation_deadline" "$N"
 			[ -n "$nasid" ] || append bss_conf "nas_identifier=${macaddr//\:}" "$N"
 
-			if [ "$ft_psk_generate_local" -eq "0" ]; then
+			if [ "$skip_kh_setup" -eq "0" ]; then
 				json_get_vars r0_key_lifetime r1_key_holder pmk_r1_push
 				json_get_values r0kh r0kh
 				json_get_values r1kh r1kh
@@ -1134,9 +1138,9 @@ hostapd_set_bss_options() {
 		[ -n "$server_id" ] && append bss_conf "server_id=$server_id" "$N"
 	fi
 
-	set_default multicast_to_unicast 0
-	if [ "$multicast_to_unicast" -gt 0 ]; then
-		append bss_conf "multicast_to_unicast=$multicast_to_unicast" "$N"
+	set_default multicast_to_unicast_all 0
+	if [ "$multicast_to_unicast_all" -gt 0 ]; then
+		append bss_conf "multicast_to_unicast=$multicast_to_unicast_all" "$N"
 	fi
 	set_default proxy_arp 0
 	if [ "$proxy_arp" -gt 0 ]; then

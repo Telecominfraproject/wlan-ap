@@ -353,7 +353,7 @@ int main(int argc, char **argv)
 
 	sock_auth = sock_open("1812", RADIUS_AUTH);
 	sock_acct = sock_open("1813", RADIUS_ACCT);
-	sock_dae = sock_open("1814", RADIUS_DAS);
+	sock_dae = sock_open("3379", RADIUS_DAS);
 
 	uloop_run();
 	uloop_end();

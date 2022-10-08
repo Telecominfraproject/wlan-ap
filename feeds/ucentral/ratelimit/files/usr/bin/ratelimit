@@ -1,176 +1,337 @@
-#!/bin/sh
+#!/usr/bin/env ucode
+'use strict';
 
-. /lib/functions.sh
+import { basename, popen } from 'fs';
+import * as ubus from 'ubus';
+import * as uloop from 'uloop';
 
-wrapper() {
-	echo calling $*
-	$*
+let defaults = {};
+let devices = {};
+
+function cmd(command, ignore_error) {
+//	if (ignore_error)
+//		command += "> /dev/null 2>&1";
+	warn(`> ${command}\n`);
+	let rc = system(command);
+	return ignore_error || rc == 0;
 }
 
-TC() {
-	wrapper tc $*
+function qdisc_add_leaf(iface, id, opts) {
+	opts ??= "";
+	return cmd(`tc class replace dev ${iface} parent 1:1 classid 1:${id} htb rate 1mbit ${opts} burst 2k prio 1`) &&
+	       cmd(`tc qdisc replace dev ${iface} parent 1:${id} handle ${id}: fq_codel flows 128 limit 800 quantum 300 noecn`);
 }
 
-IP() {
-	wrapper ip $*
+function qdisc_del_leaf(iface, id) {
+	cmd(`tc class del dev ${iface} parent 1:1 classid 1:${id}`, true);
 }
 
-get_id() {
-	addr=$1
-	hashval="0x$(echo "$addr" | md5sum | head -c8)"
-	mask=0x4ff
-	echo $(($hashval & $mask))
+function qdisc_add(iface) {
+	return cmd(`tc qdisc add dev ${iface} root handle 1: htb default 2`) &&
+	       cmd(`tc class add dev ${iface} parent 1: classid 1:1 htb rate 1000mbit burst 6k`) &&
+	       qdisc_add_leaf(iface, 2, "ceil 1000mbit");
 }
 
-delclient() {
-	local ifb=rateifb$1
-	local iface=$1
-	local mac=$2
-	local id=$3
-	
-	logger "ratelimit: delete old client entries"
-
-	[ -z "$id" ] && id=$(get_id ${mac//:})
-
-	TC filter del dev $iface protocol all parent 1: prio 1 u32 match ether dst $mac flowid 1:$id
-	TC class del dev $iface parent 1:1 classid 1:$id
-	
-	TC filter del dev $ifb protocol all parent 1: prio 1 u32 match ether src $mac flowid 1:$id
-	TC class del dev $ifb parent 1:1 classid 1:$id
+function qdisc_del(iface) {
+	cmd(`tc qdisc del dev ${iface} root`, true);
 }
 
-ingress=0
-egress=0
-
-getrate() {
-	config_get ssid $1 ssid
-	[ "$ssid" == "$2" ] || return
-	config_get ingress $1 ingress
-	config_get egress $1 egress
+function ifb_dev(iface) {
+	return "ifb-" + iface;
 }
 
-addclient() {
-	local ifb=rateifb$1
-	local iface=$1
-	local mac=$2
-	local ssid=$(cat /tmp/ratelimit.$iface)
+function ifb_add(iface, ifbdev) {
+	return cmd(`ip link add ${ifbdev} type ifb`) &&
+	       cmd(`ip link set ${ifbdev} up`) &&
+	       cmd(`tc qdisc add dev ${iface} clsact`, true) &&
+	       cmd(`tc filter add dev ${iface} ingress protocol all prio 512 matchall action mirred egress redirect dev ${ifbdev}`);
+}
 
-	egress=$3
-	ingress=$4
+function ifb_del(iface, ifbdev) {
+	cmd(`tc filter del dev ${iface} ingress protocol all prio 512`);
+	cmd(`ip link set ${ifbdev} down`, true);
+	cmd(`ip link del ${ifbdev}`, true);
+}
 
-	logger "ratelimit: adding client"
+function macfilter_add(iface, id, type, mac) {
+	return cmd(`tc filter add dev ${iface} protocol all parent 1: prio 1 handle 800::${id} u32 match ether ${type} ${mac} flowid 1:${id}`);
+}
 
-	[ "$egress" -eq 0 -o $ingress -eq 0 ] && {
-		config_load ratelimit
-		config_foreach getrate rate $ssid
+function macfilter_del(iface, id) {
+	cmd(`tc filter del dev ${iface} protocol all parent 1: prio 1 handle 800::${id} u32`, true);
+}
+
+function linux_client_del(device, client) {
+	let ifbdev = ifb_dev(device.name);
+	let id = client.id + 3;
+
+	macfilter_del(device.name, id);
+	qdisc_del_leaf(device.name, id);
+	macfilter_del(ifbdev, id);
+	qdisc_del_leaf(ifbdev, id);
+}
+
+function linux_client_set(device, client) {
+	let ifbdev = ifb_dev(device.name);
+	let id = client.id + 3;
+
+	linux_client_del(device, client);
+
+	let ret = qdisc_add_leaf(device.name, id, `ceil ${client.data.rate_egress}`) &&
+		  macfilter_add(device.name, id, "dst", client.address) &&
+		  qdisc_add_leaf(ifbdev, id, `ceil ${client.data.rate_ingress}`) &&
+		  macfilter_add(ifbdev, id, "src", client.address);
+
+	if (!ret)
+		linux_client_del(device, client);
+
+	return ret;
+}
+
+
+let ops = {
+	device: {
+		add: function(name) {
+			let ifbdev = ifb_dev(name);
+
+			qdisc_del(name);
+			ifb_del(name, ifbdev);
+
+			let ret = qdisc_add(name) &&
+				  ifb_add(name, ifbdev) &&
+				  qdisc_add(ifbdev);
+
+			if (!ret) {
+				qdisc_del(name);
+				ifb_del(name, ifbdev);
+			}
+
+			return ret;
+		},
+		remove: function(name) {
+			let ifbdev = ifb_dev(name);
+			qdisc_del(name);
+			ifb_del(name, ifbdev);
+		}
+	},
+	client: {
+		set: function(device, client) {
+			return linux_client_set(device, client);
+		},
+		remove: function(device, client) {
+			linux_client_del(device, client);
+		}
+	}
+};
+
+function get_device(devices, name) {
+	let device = devices[name];
+
+	if (device)
+		return device;
+
+	if (!ops.device.add(name))
+		return null;
+
+	device = {
+		name: name,
+		clients: {},
+		client_order: [],
+	};
+
+	devices[name] = device;
+
+	return device;
+}
+
+function del_device(name) {
+	if (!devices[name])
+		return;
+	ops.device.remove(name);
+	delete devices[name];
+}
+
+function get_free_idx(list) {
+	for (let i = 0; i < length(list); i++)
+		if (list[i] == null)
+			return i;
+
+	return length(list);
+}
+
+function del_client(device, address) {
+	let client = device.clients[address];
+
+	if (!client)
+		return false;
+
+	delete device.clients[address];
+	device.client_order[client.id] = null;
+
+	ops.client.remove(device, client);
+	return true;
+}
+
+function get_client(device, address) {
+	let client = device.clients[address];
+
+	if (client)
+		return client;
+
+	let i = get_free_idx(device.client_order);
+	client = {};
+	client.address = address;
+	client.id = i;
+	client.data = {};
+
+	device.clients[address] = client;
+	device.client_order[i] = client;
+
+	return client;
+}
+
+function set_client(device, client, data) {
+	let update = false;
+
+	for (let key in data) {
+		if (client.data[key] != data[key])
+			update = true;
+
+		client.data[key] = data[key];
 	}
 
-	[ "$egress" -eq 0 -o $ingress -eq 0 ] && {
-		logger "ratelimit: no valid rates"
-		exit 1
+	if (update && !ops.client.set(device, client)) {
+		del_client(device, client.address);
+		return false;
 	}
 
-	local id=$(get_id ${mac//:})
-
-	logger "ratelimit: add new client entries for $2 $egress $ingress"
-
-	TC class add dev $iface parent 1:1 classid 1:$id htb rate 1mbit ceil ${egress}mbit burst 2k prio 1
-	TC qdisc add dev $iface parent 1:$id handle $id: sfq perturb 10
-	TC filter add dev $iface protocol all parent 1: prio 1 u32 match ether dst $mac flowid 1:$id
-	
-	TC class add dev $ifb parent 1:1 classid 1:$id htb rate 1mbit ceil ${ingress}mbit burst 2k prio 1
-	TC filter add dev $ifb protocol all parent 1: prio 1 u32 match ether src $mac flowid 1:$id
+	return true;
 }
 
-deliface() {
-	local ifb=rateifb$1
-	local iface=$1
+function run_service() {
+	let uctx = ubus.connect();
 
-	[ -d /sys/class/net/$ifb/ ] || return 0
+	uctx.publish("ratelimit", {
+		defaults_set: {
+			call: function(req) {
+				let r_i = req.args.rate_ingress ?? req.args.rate;
+				let r_e = req.args.rate_egress ?? req.args.rate;
+				let name = req.args.name;
 
-	logger "ratelimit: deleting old iface settings"
+				if (!name || !r_i || !r_e)
+					return ubus.STATUS_INVALID_ARGUMENT;
 
-	IP link set $ifb down
-	IP link del $ifb
+				defaults[name] = [ r_e, r_i ];
 
-	TC qdisc del dev $iface root &2> /dev/null
+				return 0;
+			},
+			args: {
+				name:"",
+				rate:"",
+				rate_ingress:"",
+				rate_egress:"",
+			}
+		},
+		client_set: {
+			call: function(req) {
+				let r_i = req.args.rate_ingress ?? req.args.rate;
+				let r_e = req.args.rate_egress ?? req.args.rate;
 
-	rm -f /tmp/ratelimit.$iface
-	[ -f /tmp/run/hostapd-cli-$iface.pid ] && kill "$(cat /tmp/run/hostapd-cli-$iface.pid)"
-}
+				if (req.args.defaults && defaults[req.args.defaults]) {
+					let def = defaults[req.args.defaults];
 
-found=0
-find_ssid() {
-	local ssid
-	config_get ssid $1 ssid
-	[ "$ssid" == "$2" ] || return
-	found=1
-}
+					r_e ??= def[0];
+					r_i ??= def[1];
+				}
 
-addiface() {
-	local ifb=rateifb$1
-	local iface=$1
-	local ssid
+				if (!req.args.device || !req.args.address || !r_i || !r_e)
+					return ubus.STATUS_INVALID_ARGUMENT;
 
+				let device = get_device(devices, req.args.device);
+				if (!device)
+					return ubus.STATUS_INVALID_ARGUMENT;
 
-	[ -f /tmp/ratelimit.$iface -o -d /sys/class/net/$ifb/ ] && {
-		return 0
+				let client = get_client(device, req.args.address);
+				if (!client)
+					return ubus.STATUS_INVALID_ARGUMENT;
+
+				let data = {
+					rate_ingress: r_i,
+					rate_egress: r_e
+				};
+
+				if (!set_client(device, client, data))
+					return ubus.STATUS_UNKNOWN_ERROR;
+
+				return 0;
+			},
+			args: {
+				device:"",
+				defaults:"",
+				address:"",
+				rate:"",
+				rate_ingress:"",
+				rate_egress:"",
+			}
+		},
+		client_delete: {
+			call: function(req) {
+				if (!req.args.address)
+					return ubus.STATUS_INVALID_ARGUMENT;
+
+				if (req.args.device) {
+					let device = devices[req.args.device];
+					if (!device)
+						return ubus.STATUS_NOT_FOUND;
+
+					if (!del_client(device, req.args.address))
+						return ubus.STATUS_NOT_FOUND;
+				} else {
+					for (let dev in devices) {
+						let device = devices[dev];
+
+						del_client(device, req.args.address);
+					}
+				}
+
+				return 0;
+			},
+			args: {
+				device:"",
+				address:"",
+			}
+		},
+		device_delete: {
+			call: function(req) {
+				let name = req.args.device;
+
+				if (!name)
+					return ubus.STATUS_INVALID_ARGUMENT;
+
+				if (!devices[name])
+					return ubus.STATUS_NOT_FOUND;
+
+				del_device(name);
+
+				return 0;
+			},
+			args: {
+				device:"",
+			}
+		}
+	});
+
+	try {
+		uloop.run();
+	} catch (e) {
+		warn(`Error: ${e}\n${e.stacktrace[0].context}`);
 	}
-	
-	echo -n startup > /tmp/ratelimit.$iface
 
-	sleep 2
-	ssid=$(ubus call hostapd.$iface get_status | jsonfilter -e '@.ssid')
-	[ -z "$ssid" ] && {
-		rm /tmp/ratelimit.$iface
-		logger "ratelimit: failed to lookup ssid"
-		exit 1
+	for (let dev in devices) {
+		del_device(dev);
 	}
-	config_load ratelimit
-	config_foreach find_ssid rate $ssid
-	[ "$found" -eq 0 ] && {
-		rm /tmp/ratelimit.$iface
-		exit 0
-	}
-	logger "ratelimit: adding new iface settings"
-
-	echo -n $ssid > /tmp/ratelimit.$iface
-
-	IP link add name $ifb type ifb
-	IP link set $ifb up
-
-	sleep 1
-
-	TC qdisc add dev $iface root handle 1: htb default 30
-	TC class add dev $iface parent 1: classid 1:1 htb rate 1000mbit burst 6k
-	TC qdisc add dev $iface ingress
-	TC filter add dev $iface parent ffff: protocol all prio 10 u32 match u32 0 0 flowid 1:1 action mirred egress redirect dev $ifb
-
-	TC qdisc add dev $ifb root handle 1: htb default 10
-	TC class add dev $ifb parent 1: classid 1:1 htb rate 100mbit
-	hostapd_cli -a /usr/libexec/ratelimit.sh -i $iface -P /tmp/run/hostapd-cli-$iface.pid -B
-       
-	for sta in $(ubus call wifi station | jsonfilter -e '@[*][*].mac'); do
-		addclient $iface $sta
-	done
 }
 
-waitiface() {
-	local iface=$1
-
-	ubus -t 120 wait_for hostapd.$1
-
-	[ $? -eq 0 ] || exit 0
-
-	addiface $iface
-}
-
-flush() {
-	for a in `ls /sys/class/net/ | grep rateifb`; do
-		deliface ${a:7}
-	done
-}
-
-cmd=$1
-shift
-$cmd $@
+uloop.init();
+run_service();
+uloop.done();

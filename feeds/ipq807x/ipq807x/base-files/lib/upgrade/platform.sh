@@ -1,7 +1,8 @@
 . /lib/functions/system.sh
 
-RAMFS_COPY_BIN='fw_printenv fw_setenv'
-RAMFS_COPY_DATA='/etc/fw_env.config /var/lock/fw_printenv.lock'
+
+RAMFS_COPY_BIN='fw_setenv'
+RAMFS_COPY_DATA='/etc/fw_env.config /var/lock/fw_printenv.lock /tmp/downgrade'
 
 qca_do_upgrade() {
         local tar_file="$1"
@@ -75,14 +76,20 @@ platform_check_image() {
 	cybertan,eww622-a1|\
 	glinet,ax1800|\
 	glinet,axt1800|\
+	indio,um-310ax-v1|\
+	indio,um-510axp-v1|\
+	indio,um-510axm-v1|\
 	wallys,dr6018|\
 	wallys,dr6018-v4|\
 	edgecore,eap101|\
 	edgecore,eap102|\
 	edgecore,eap104|\
+	liteon,wpx8324|\
 	edgecore,eap106|\
 	hfcl,ion4xi|\
 	hfcl,ion4xe|\
+	plasmacloud,pax1800-v1|\
+	plasmacloud,pax1800-v2|\
 	tplink,ex227|\
 	tplink,ex447|\
 	yuncore,ax840|\
@@ -116,9 +123,11 @@ platform_do_upgrade() {
 	cig,wf194c4|\
 	cig,wf196|\
 	cybertan,eww622-a1|\
-	edgecore,eap104|\
 	glinet,ax1800|\
 	glinet,axt1800|\
+	indio,um-310ax-v1|\
+	indio,um-510axp-v1|\
+	indio,um-510axm-v1|\
 	muxi,ap3220l|\
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
@@ -128,7 +137,9 @@ platform_do_upgrade() {
 	wallys,dr6018-v4|\
 	yuncore,ax840|\
 	tplink,ex447|\
-	tplink,ex227)	
+	tplink,ex227|\
+	meshpp,s618-cp03|\
+	meshpp,s618-cp01)
 		nand_upgrade_tar "$1"
 		;;
 	hfcl,ion4xi|\
@@ -142,6 +153,8 @@ platform_do_upgrade() {
 		fi
 		nand_upgrade_tar "$1"
 		;;
+	edgecore,eap104|\
+	liteon,wpx8324|\
 	edgecore,eap106)
 		CI_UBIPART="rootfs1"
 		[ "$(find_mtd_chardev rootfs)" ] && CI_UBIPART="rootfs"
@@ -152,7 +165,11 @@ platform_do_upgrade() {
 		if [ "$(find_mtd_chardev rootfs)" ]; then
 			CI_UBIPART="rootfs"
 		else
-			if grep -q rootfs1 /proc/cmdline; then
+			if [ -e /tmp/downgrade ]; then
+				CI_UBIPART="rootfs1"
+				fw_setenv active 1 || exit 1
+				fw_setenv upgrade_available 0 || exit 1
+			elif grep -q rootfs1 /proc/cmdline; then
 				CI_UBIPART="rootfs2"
 				fw_setenv active 2 || exit 1
 			else
@@ -161,6 +178,11 @@ platform_do_upgrade() {
 			fi
 		fi
 		nand_upgrade_tar "$1"
+		;;
+	plasmacloud,pax1800-v1|\
+	plasmacloud,pax1800-v2)
+		PART_NAME="inactive"
+		platform_do_upgrade_dualboot_datachk "$1"
 		;;
 	esac
 }

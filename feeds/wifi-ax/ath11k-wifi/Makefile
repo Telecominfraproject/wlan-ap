@@ -32,15 +32,22 @@ ALLWIFIBOARDS:= \
 	cybertan-eww622-a1 \
 	edgecore-eap101 \
 	gl-ax1800 \
-	muxi-ap3220l \
+	gl-axt1800 \
 	sercomm-wallaby \
 	edgecore-eap102 \
 	edgecore-eap104 \
+	liteon-wpx8324 \
+	indio-um-310ax-v1 \
+	indio-um-510axp-v1 \
+	indio-um-510axm-v1 \
+	muxi-ap3220l \
+	plasmacloud-pax1800 \
 	wallys-dr6018 \
 	wallys-dr6018-v4 \
 	tplink-ex227 \
 	tplink-ex447 \
-	yuncore-ax840
+	yuncore-ax840 \
+	meshpp-s618
 
 ALLWIFIPACKAGES:=$(foreach BOARD,$(ALLWIFIBOARDS),ath11k-wifi-$(BOARD))
 
@@ -87,9 +94,29 @@ $(call Package/ath11k-wifi-default)
     TITLE:=gl-ax1800 bdf
 endef
 
+define Package/ath11k-wifi-gl-axt1800
+$(call Package/ath11k-wifi-default)
+    TITLE:=gl-axt1800 bdf
+endef
+
 define Package/ath11k-wifi-motorola-q14
 $(call Package/ath11k-wifi-default)
     TITLE:=motorola q14 bdf
+endef
+
+define Package/ath11k-wifi-plasmacloud-pax1800
+$(call Package/ath11k-wifi-default)
+    TITLE:=plasmacloud-pax1800(-v2) bdf
+endef
+
+define Package/ath11k-wifi-hfcl-ion4xi
+$(call Package/ath11k-wifi-default)
+    TITLE:=hfcl-ion4xi bdf
+endef
+
+define Package/ath11k-wifi-meshpp-s618
+$(call Package/ath11k-wifi-default)
+    TITLE:=meshpp-s618 bdf
 endef
 
 define ath11k-wifi-install-one-to
@@ -179,11 +206,31 @@ define Package/ath11k-wifi-gl-ax1800/install
 	$(INSTALL_DATA) ./board-gl-ax1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
 endef
 
+define Package/ath11k-wifi-gl-axt1800/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-gl-axt1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
+endef
+
 define Package/ath11k-wifi-motorola-q14/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
 	$(INSTALL_DATA) ./board-motorol-q14.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
 	$(INSTALL_DATA) ./board-2-motorol-q14.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board-2.bin
+endef
+
+define Package/ath11k-wifi-plasmacloud-pax1800/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-plasmacloud-pax1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
+endef
+
+define Package/ath11k-wifi-meshpp-s618/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-2-meshpp-s618.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
+endef
+
+define Package/ath11k-wifi-hfcl-ion4xi/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-hfcl-ion4xi.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
 endef
 
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
@@ -198,9 +245,14 @@ $(eval $(call generate-ath11k-wifi-package,wallys-dr6018-v4,Wallys DR6018 V4))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap101,EdgeCore EAP101))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap102,Edgecore EAP102))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap104,Edgecore EAP104))
+$(eval $(call generate-ath11k-wifi-package,liteon-wpx8324,Liteon WPX8324))
+$(eval $(call generate-ath11k-wifi-package,indio-um-310ax-v1,Indio UM-310AX V1))
+$(eval $(call generate-ath11k-wifi-package,indio-um-510axp-v1,Indio UM-510AXP V1))
+$(eval $(call generate-ath11k-wifi-package,indio-um-510axm-v1,Indio UM-510AXM V1))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex227,TP-Link EX227))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex447,TP-Link EX447))
 $(eval $(call generate-ath11k-wifi-package,yuncore-ax840,YunCore AX840))
+$(eval $(call generate-ath11k-wifi-package,meshpp-s618,Mesh++ S618))
 $(eval $(call generate-ath11k-wifi-package,muxi-ap3220l,MUXI AP3220L))
 
 $(foreach PACKAGE,$(ALLWIFIPACKAGES),$(eval $(call BuildPackage,$(PACKAGE))))
@@ -211,3 +263,4 @@ $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq6018))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-qcn9000))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g))
 $(eval $(call BuildPackage,ath11k-wifi-motorola-q14))
+$(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi))
