@@ -94,6 +94,9 @@ define Package/ath11k-firmware-ipq60xx/install
 	$(INSTALL_DIR) $(1)/lib/firmware/IPQ6018
 	$(INSTALL_DATA) ./files/IPQ6018/* \
 		$(1)/lib/firmware/IPQ6018/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0
+	mv $(1)/lib/firmware/IPQ6018/qdss_trace_config.bin \
+		$(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
 endef
 
 define Package/ath11k-firmware-ipq807x/install
