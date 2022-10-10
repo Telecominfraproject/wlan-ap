@@ -17,10 +17,12 @@ struct client {
 
 	struct spotfilter_client_key key;
 	struct spotfilter_client_data data;
+	const char *device;
 };
 
 int client_set(struct interface *iface, const void *addr, const char *id,
-	       int state, int dns_state, int accounting, struct blob_attr *data);
+	       int state, int dns_state, int accounting, struct blob_attr *data,
+	       const char *device, bool flush);
 void client_free(struct interface *iface, struct client *cl);
 void client_set_ipaddr(const void *mac, const void *addr, bool ipv6);
 void client_init_interface(struct interface *iface);

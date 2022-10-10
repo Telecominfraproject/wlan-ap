@@ -36,6 +36,7 @@ ALLWIFIBOARDS:= \
 	sercomm-wallaby \
 	edgecore-eap102 \
 	edgecore-eap104 \
+	liteon-wpx8324 \
 	indio-um-310ax-v1 \
 	indio-um-510axp-v1 \
 	indio-um-510axm-v1 \
@@ -243,6 +244,7 @@ $(eval $(call generate-ath11k-wifi-package,wallys-dr6018-v4,Wallys DR6018 V4))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap101,EdgeCore EAP101))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap102,Edgecore EAP102))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap104,Edgecore EAP104))
+$(eval $(call generate-ath11k-wifi-package,liteon-wpx8324,Liteon WPX8324))
 $(eval $(call generate-ath11k-wifi-package,indio-um-310ax-v1,Indio UM-310AX V1))
 $(eval $(call generate-ath11k-wifi-package,indio-um-510axp-v1,Indio UM-510AXP V1))
 $(eval $(call generate-ath11k-wifi-package,indio-um-510axm-v1,Indio UM-510AXM V1))

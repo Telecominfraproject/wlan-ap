@@ -18,7 +18,7 @@ endef
 
 define Package/uspot/install
 	$(INSTALL_DIR) $(1)/usr/bin/ $(1)/usr/lib/ucode
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/radius-client $(1)/usr/bin
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/radius-client $(1)/usr/bin/radius-client
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/libuam.so $(1)/usr/lib/ucode/uam.so
 	$(CP) ./files/* $(1)
 endef
