@@ -17,7 +17,7 @@ struct client {
 
 	struct spotfilter_client_key key;
 	struct spotfilter_client_data data;
-	const char *device;
+	char *device;
 };
 
 int client_set(struct interface *iface, const void *addr, const char *id,
