@@ -37,6 +37,10 @@ function get_session_timeout(mac) {
 	return session_timeout;
 }
 
+function radius_available(mac) {
+	return !!clients[mac]?.radius;
+}
+
 function radius_init(mac, payload) {
 	for (let key in [ 'server', 'acct_server', 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_id', 'username' ])
 		if (clients[mac].radius[key])
@@ -53,6 +57,8 @@ function radius_call(mac, payload) {
 }
 
 function radius_stop(mac) {
+	if (!radius_available(mac))
+		return;
 	debug(mac, 'stopping accounting');
 
 	let payload = {
@@ -88,6 +94,8 @@ function radius_acct(mac, payload) {
 }
 
 function radius_idle_time(mac) {
+	if (!radius_available(mac))
+		return;
 	let payload = {
 		acct_type: 2,
 		terminate_cause: 4,
@@ -96,6 +104,8 @@ function radius_idle_time(mac) {
 }
 
 function radius_session_time(mac) {
+	if (!radius_available(mac))
+		return;
 	let payload = {
 		acct_type: 2,
 		terminate_cause: 5,
@@ -104,6 +114,8 @@ function radius_session_time(mac) {
 }
 
 function radius_disconnect(mac) {
+	if (!radius_available(mac))
+		return;
 	let payload = {
 		acct_type: 2,
 		terminate_cause: 1,
@@ -112,6 +124,8 @@ function radius_disconnect(mac) {
 }
 
 function radius_interim(mac) {
+	if (!radius_available(mac))
+		return;
 	let payload = {
 		acct_type: 3,
 	};
@@ -126,17 +140,24 @@ function client_add(mac, state) {
 	if (state.state != 1)
 		return;
 
-	let interval = (state.data?.radius?.reply['Acct-Interim-Interval'] || acct_interval) * 1000;
-	let idle = (state.data?.radius?.reply['Idle-Timeout'] || idle_timeout);
-	let session = (state.data?.radius?.reply['Session-Timeout'] || session_timeout);
+	let interval = acct_interval * 1000;
+	let idle = idle_timeout;
+	let session = session_timeout;
 	let accounting = (config.radius?.acct_server && config.radius?.acct_secret);
+
+	if (state.data?.radius?.reply) {
+		interval = (state.data?.radius?.reply['Acct-Interim-Interval'] || acct_interval) * 1000;
+		idle = (state.data?.radius?.reply['Idle-Timeout'] || idle_timeout);
+		session = (state.data?.radius?.reply['Session-Timeout'] || session_timeout);
+	}
 
 	clients[mac] = {
 		accounting,
-		radius: state.data.radius.request,
 		interval,
 		idle,
 	};
+	if (state.data?.radius?.request)
+		clients[mac].radius= state.data.radius.request;
 	syslog(mac, 'adding client');
 	if (accounting)
 		clients[mac].timeout = uloop.timer(interval, () => radius_interim(mac));
