@@ -189,6 +189,7 @@ function client_timeout(mac) {
 	ubus.call('spotfilter', 'client_set', {
 			interface: "hotspot",
 			state: 0,
+			dns_state: 1,
 			address: mac,
 			accounting: [],
 			flush: true,
