@@ -46,7 +46,6 @@ return {
 		case 'aa-bb-cc-dd-ee-ff':
 		case 'AA-BB-CC-DD-EE-FF':
 			mac = replace(mac, ':', '-');
-			warn('uspot: ' + ctx.env.REMOTE_ADDR + ' - ' + msg + '\n');
 			break;
 		}
 
