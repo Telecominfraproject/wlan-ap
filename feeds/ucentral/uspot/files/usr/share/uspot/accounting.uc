@@ -32,8 +32,8 @@ function get_idle_timeout(mac) {
 }
 
 function get_session_timeout(mac) {
-	if (clients[mac]?.session_timeout)
-		return clients[mac].session_timeout;
+	if (clients[mac]?.session)
+		return clients[mac].session;
 	return session_timeout;
 }
 
@@ -154,6 +154,7 @@ function client_add(mac, state) {
 	clients[mac] = {
 		accounting,
 		interval,
+		session,
 		idle,
 	};
 	if (state.data?.radius?.request)
