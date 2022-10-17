@@ -7,6 +7,7 @@ let portal = require('common');
 
 // delegate an initial connection to the correct handler
 function request_start(ctx) {
+	portal.debug(ctx, 'start ' + (portal.config?.config?.auth_mode || '') + ' flow');
 	switch (portal.config?.config?.auth_mode) {
 	case 'click-to-continue':
 		include('click.uc', ctx);
@@ -22,12 +23,14 @@ function request_start(ctx) {
 			'?res=notyet' +
 			'&uamip=' + ctx.env.SERVER_ADDR +
 			'&uamport=' + portal.config.uam.uam_port +
-			'&challenge=' + portal.uam.md5(portal.config.uam.challenge, ctx.mac) +
-			'&mac=' + replace(ctx.mac, ':', '-') +
+			'&challenge=' + portal.uam.md5(portal.config.uam.challenge, ctx.format_mac) +
+			'&mac=' + ctx.format_mac +
 			'&ip=' + ctx.env.REMOTE_ADDR +
 			'&called=' + portal.config.uam.nasmac +
-			'&nasid=' + portal.config.uam.nasid;
-		ctx.redir_location += '&md=' + portal.uam.md5(ctx.uam_location, portal.config.uam.uam_secret);
+			'&nasid=' + portal.config.uam.nasid +
+			'&ssid=' + ctx.ssid;
+		if (portal.config.uam.uam_secret)
+			ctx.redir_location += '&md=' + portal.uam.md5(ctx.redir_location, portal.config.uam.uam_secret);
 		include('redir.uc', ctx);
 		return;
 	default:
@@ -46,6 +49,7 @@ function request_click(ctx) {
 
 	// check if a username and password was provided
 	if (ctx.form_data.accept_terms != 'clicked') {
+		portal.debug(ctx, 'user did not accept conditions');
 		request_start({ ...ctx, error: 1 });
                 return;
 	}
@@ -62,6 +66,7 @@ function request_credentials(ctx) {
 
 	// check if a username and password was provided
 	if (!ctx.form_data.username || !ctx.form_data.password) {
+		portal.debug(ctx, 'missing credentials\n');
 		request_start({ ...ctx, error: 1 });
                 return;
 	}
@@ -76,11 +81,12 @@ function request_credentials(ctx) {
 		    ctx.form_data.password != cred.password)
 			continue;
 
-		portal.allow_client(ctx);
+		portal.allow_client(ctx, { username: ctx.form_data.username });
 		return;
 	}
 
 	// auth failed
+	portal.debug(ctx, 'invalid credentials\n');
 	request_start({ ...ctx, error: 1 });
 }
 
@@ -94,23 +100,25 @@ function request_radius(ctx) {
 
 	// check if a username and password was provided
 	if (!ctx.form_data.username || !ctx.form_data.password) {
+		portal.debug(ctx, 'missing credentials\n');
 		request_start({ ...ctx, error: 1 });
                 return;
 	}
 
 	// trigger the radius auth
-	let payload = radius_init(ctx);
+	let payload = portal.radius_init(ctx);
 	payload.type = 'auth';
 	payload.username = ctx.form_data.username;
 	payload.password = ctx.form_data.password;
 
-        let reply = portal.radius_call(ctx, payload);
-	if (reply['access-accept']) {
-                portal.allow_client(ctx);
+        let radius = portal.radius_call(ctx, payload);
+	if (radius['access-accept']) {
+                portal.allow_client(ctx, { username: ctx.form_data.username, radius: { reply: radius.reply, request: payload } } );
                 return;
         }
 
 	// auth failed
+	portal.debug(ctx, 'invalid credentials\n');
 	request_start({ ...ctx, error: 1 });
 }
 

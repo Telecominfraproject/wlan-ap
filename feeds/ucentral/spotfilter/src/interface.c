@@ -32,12 +32,6 @@ void interface_free(struct interface *iface)
 	free(iface);
 }
 
-static inline const char *
-device_name(struct device *dev)
-{
-	return dev->node.avl.key;
-}
-
 static void
 interface_check_device(struct interface *iface, struct device *dev)
 {

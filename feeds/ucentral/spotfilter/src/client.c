@@ -97,7 +97,8 @@ static void client_set_id(struct interface *iface, struct client *cl, const char
 }
 
 int client_set(struct interface *iface, const void *addr, const char *id,
-	       int state, int dns_state, int accounting, struct blob_attr *data)
+	       int state, int dns_state, int accounting, struct blob_attr *data,
+	       const char *device, bool flush)
 {
 	struct cache_entry *c;
 	struct blob_attr *cur;
@@ -142,12 +143,21 @@ int client_set(struct interface *iface, const void *addr, const char *id,
 
 		kvlist_set(&cl->kvdata, blobmsg_name(cur), cur);
 	}
+	if (device)
+		cl->device = device;
 	if (state >= 0)
 		cl->data.cur_class = state;
 	if (dns_state >= 0)
 		cl->data.dns_class = dns_state;
 	if (accounting >= 0)
 		cl->data.flags = accounting;
+	if (flush) {
+		kvlist_free(&cl->kvdata);
+		cl->data.packets_ul = 0;
+		cl->data.packets_dl = 0;
+		cl->data.bytes_ul = 0;
+		cl->data.bytes_dl = 0;
+	}
 	spotfilter_bpf_set_client(iface, &cl->key, &cl->data);
 
 	if (new_client)

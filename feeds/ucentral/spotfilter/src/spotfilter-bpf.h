@@ -19,6 +19,8 @@ struct spotfilter_client_data {
 	uint8_t dns_class;
 	uint8_t flags;
 
+	uint64_t packets_ul;
+	uint64_t packets_dl;
 	uint64_t bytes_ul;
 	uint64_t bytes_dl;
 };

@@ -155,14 +155,12 @@ nl80211_interface_update(struct interface *iface)
 	struct client *cl, *tmp;
 	struct device *dev;
 
-	if (!iface->client_autoremove)
-		return;
-
 	avl_for_each_element_safe(&iface->clients, cl, node, tmp) {
 		if (cl->idle++ < iface->client_timeout)
 			continue;
 
-		client_free(iface, cl);
+		if (iface->client_autoremove)
+			client_free(iface, cl);
 	}
 
 	vlist_for_each_element(&iface->devices, dev, node)
@@ -218,7 +216,7 @@ found:
 	if (cl)
 		cl->idle = 0;
 	else if (iface->client_autocreate)
-		client_set(iface, addr, NULL, -1, -1, -1, NULL);
+		client_set(iface, addr, NULL, -1, -1, -1, NULL, device_name(dev), false);
 
 	return NL_SKIP;
 }
