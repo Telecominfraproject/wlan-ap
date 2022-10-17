@@ -46,7 +46,6 @@ return {
 		case 'aa-bb-cc-dd-ee-ff':
 		case 'AA-BB-CC-DD-EE-FF':
 			mac = replace(mac, ':', '-');
-			warn('uspot: ' + ctx.env.REMOTE_ADDR + ' - ' + msg + '\n');
 			break;
 		}
 
@@ -140,7 +139,7 @@ return {
 			acct_server: sprintf('%s:%s:%s', this.config.radius.acct_server, this.config.radius.acct_port, this.config.radius.acct_secret),
 			acct_session,
 			client_ip: ctx.env.REMOTE_ADDR,
-			called_station: this.config.uam.nasmac,
+			called_station: this.config.uam.nasmac + ':' + ctx.ssid,
 			calling_station: this.format_mac(ctx.mac),
 			nas_ip: ctx.env.SERVER_ADDR,
 			nas_id: this.config.uam.nasid
