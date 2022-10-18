@@ -27,6 +27,11 @@ struct vlan_hdr {
 	uint16_t proto;
 };
 
+struct gre_hdr {
+	uint16_t flags;
+	uint16_t proto;
+};
+
 struct packet {
 	void *buffer;
 	unsigned int len;
@@ -91,6 +96,7 @@ dhcpsnoop_packet_cb(struct packet *pkt)
 	bool ipv6 = false;
 	uint32_t rebind = 0;
 
+inside_tunnel:
 	eth = pkt_pull(pkt, sizeof(*eth));
 	if (!eth)
 		return;
@@ -127,6 +133,15 @@ dhcpsnoop_packet_cb(struct packet *pkt)
 		break;
 	default:
 		return;
+	}
+
+	if (proto == IPPROTO_GRE) {
+		struct gre_hdr *gre;
+		gre = pkt_pull(pkt, sizeof(*gre));
+		if (!gre) return;
+		proto = be16_to_cpu(gre->proto);
+		if (proto != 0x6558) return;
+		goto inside_tunnel;
 	}
 
 	if (proto != IPPROTO_UDP)
@@ -217,11 +232,37 @@ prepare_filter_cmd(char *buf, int len, const char *dev, int prio, bool add, bool
 			add ? "add" : "del", dev, egress ? "e" : "in", prio);
 }
 
+#define MATCH_GRE_ETH_IP_UDP_DHCP_67 \
+	" match u16 0x6558 0xffff at 22 " \
+	" match u16 0x0800 0xffff at 36 " \
+	" match u8 17 0xff at 47 " \
+	" match u16 67 0xffff at 58 "
+
+#define MATCH_GRE_ETH_VLAN_IP_UDP_DHCP_67 \
+	" match u16 0x6558 0xffff at 22 " \
+	" match u16 0x8100 0xffff at 36 " \
+	" match u16 0x0800 0xffff at 40 " \
+	" match u8 17 0xff at 51 " \
+	" match u16 67 0xffff at 62 "
+
+#define MATCH_GRE_ETH_IP_UDP_DHCP_68 \
+	" match u16 0x6558 0xffff at 22 " \
+	" match u16 0x0800 0xffff at 36 " \
+	" match u8 17 0xff at 47 " \
+	" match u16 68 0xffff at 58 "
+
+#define MATCH_GRE_ETH_VLAN_IP_UDP_DHCP_68 \
+	" match u16 0x6558 0xffff at 22 " \
+	" match u16 0x8100 0xffff at 36 " \
+	" match u16 0x0800 0xffff at 40 " \
+	" match u8 17 0xff at 51 " \
+	" match u16 68 0xffff at 62 "
+
 static void
 dhcpsnoop_dev_attach_filters(struct device *dev, bool egress)
 {
 	int prio = DHCPSNOOP_PRIO_BASE;
-	char buf[256];
+	char buf[350];
 	int ofs;
 
 	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
@@ -244,6 +285,32 @@ dhcpsnoop_dev_attach_filters(struct device *dev, bool egress)
 			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
 	dhcpsnoop_run_cmd(buf, false);
 
+	/* GRE */
+	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
+	APPEND(buf, ofs, " protocol ip u32 match ip protocol 47 0xff"
+			 MATCH_GRE_ETH_IP_UDP_DHCP_67
+			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
+	dhcpsnoop_run_cmd(buf, false);
+
+	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
+	APPEND(buf, ofs, " protocol ip u32 match ip protocol 47 0xff"
+			 MATCH_GRE_ETH_IP_UDP_DHCP_68
+			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
+	dhcpsnoop_run_cmd(buf, false);
+
+	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
+	APPEND(buf, ofs, " protocol ip u32 match ip protocol 47 0xff "
+			 MATCH_GRE_ETH_VLAN_IP_UDP_DHCP_67
+			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
+	dhcpsnoop_run_cmd(buf, false);
+
+	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
+	APPEND(buf, ofs, " protocol ip u32 match ip protocol 47 0xff"
+			 MATCH_GRE_ETH_VLAN_IP_UDP_DHCP_68
+			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
+	dhcpsnoop_run_cmd(buf, false);
+
+	/* IPv6 */
 	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
 	APPEND(buf, ofs, " protocol ipv6 u32 match ip6 sport 546 0xfffe"
 			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
@@ -261,7 +328,7 @@ dhcpsnoop_dev_cleanup_filters(struct device *dev, bool egress)
 	char buf[128];
 	int i;
 
-	for (i = DHCPSNOOP_PRIO_BASE; i < DHCPSNOOP_PRIO_BASE + 6; i++) {
+	for (i = DHCPSNOOP_PRIO_BASE; i < DHCPSNOOP_PRIO_BASE + 10; i++) {
 		prepare_filter_cmd(buf, sizeof(buf), dev->ifname, i, false, egress);
 		dhcpsnoop_run_cmd(buf, true);
 	}
