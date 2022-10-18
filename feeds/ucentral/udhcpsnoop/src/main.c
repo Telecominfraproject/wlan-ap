@@ -68,11 +68,11 @@ out:
 int main(int argc, char **argv)
 {
 	ulog_open(ULOG_STDIO | ULOG_SYSLOG, LOG_DAEMON, "udhcpsnoop");
-
 	uloop_init();
 	dhcpsnoop_ubus_init();
 	dhcpsnoop_dev_init();
 
+	ulog_threshold(LOG_INFO);
 	uloop_run();
 
 	dhcpsnoop_ubus_done();
