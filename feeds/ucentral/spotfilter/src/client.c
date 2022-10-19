@@ -65,6 +65,7 @@ static void __client_free(struct interface *iface, struct client *cl)
 		avl_delete(&iface->client_ids, &cl->id_node);
 	avl_delete(&iface->clients, &cl->node);
 	kvlist_free(&cl->kvdata);
+	free(cl->device);
 	spotfilter_bpf_set_client(iface, &cl->key, NULL);
 	free(cl);
 }
@@ -143,8 +144,10 @@ int client_set(struct interface *iface, const void *addr, const char *id,
 
 		kvlist_set(&cl->kvdata, blobmsg_name(cur), cur);
 	}
-	if (device)
-		cl->device = device;
+	if (device) {
+		free(cl->device);
+		cl->device = strdup(device);
+	}
 	if (state >= 0)
 		cl->data.cur_class = state;
 	if (dns_state >= 0)
