@@ -19,18 +19,7 @@ function request_start(ctx) {
 		include('radius.uc', ctx);
 		return;
 	case 'uam':
-		ctx.redir_location = portal.config.uam.uam_server +
-			'?res=notyet' +
-			'&uamip=' + ctx.env.SERVER_ADDR +
-			'&uamport=' + portal.config.uam.uam_port +
-			'&challenge=' + portal.uam.md5(portal.config.uam.challenge, ctx.format_mac) +
-			'&mac=' + ctx.format_mac +
-			'&ip=' + ctx.env.REMOTE_ADDR +
-			'&called=' + portal.config.uam.nasmac +
-			'&nasid=' + portal.config.uam.nasid +
-			'&ssid=' + ctx.ssid;
-		if (portal.config.uam.uam_secret)
-			ctx.redir_location += '&md=' + portal.uam.md5(ctx.redir_location, portal.config.uam.uam_secret);
+		ctx.redir_location = portal.uam_url(ctx, 'notyet');
 		include('redir.uc', ctx);
 		return;
 	default:

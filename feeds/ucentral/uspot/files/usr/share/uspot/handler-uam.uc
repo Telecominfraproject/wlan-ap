@@ -12,7 +12,7 @@ function auth_client(ctx) {
 	let password;
 	let payload = portal.radius_init(ctx);
 
-	payload.logoff_url = sprintf('http://%s:3990/logoff', ctx.env.SERVER_ADDR);
+	payload.logoff_url = sprintf('http://%s:3990/', ctx.env.SERVER_ADDR);
 	if (ctx.query_string.username && ctx.query_string.response) {
 		let challenge = uam.md5(portal.config.uam.challenge, ctx.format_mac);
 
@@ -30,6 +30,8 @@ function auth_client(ctx) {
 
         let radius = portal.radius_call(ctx, payload);
 	if (radius['access-accept']) {
+		if (portal.config.uam.final_redirect_url == 'uam')
+			ctx.query_string.userurl = portal.uam_url(ctx, 'success');
 		portal.allow_client(ctx, { radius: { reply: radius.reply, request: payload } } );
 
 		payload = portal.radius_init(ctx, payload.acct_session);
@@ -39,7 +41,11 @@ function auth_client(ctx) {
 		portal.radius_call(ctx, payload);
 		return;
 	}
-	include('error.uc', ctx);
+
+	if (portal.config.uam.final_redirect_url == 'uam')
+		include('redir.uc', { redir_location: portal.uam_url(ctx, 'reject') });
+	else
+		include('error.uc', ctx);
 }
 
 // disconnect client
