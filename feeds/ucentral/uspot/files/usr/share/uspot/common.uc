@@ -147,11 +147,28 @@ return {
 	},
 
 	radius_call: function(ctx, payload) {
-		let cfg = fs.open('/tmp/auth' + ctx.mac + '.json', 'w');
+		let type = payload.acct ? 'acct' : 'auth';
+		let cfg = fs.open('/tmp/' + type + ctx.mac + '.json', 'w');
 		cfg.write(payload);
 		cfg.close();
 
-		return this.fs_popen('/usr/bin/radius-client /tmp/auth' + ctx.mac + '.json');
+		return this.fs_popen('/usr/bin/radius-client /tmp/' + type + ctx.mac + '.json');
+	},
+
+	uam_url: function(ctx, res) {
+		let uam_url = this.config.uam.uam_server +
+			'?res=' + res +
+			'&uamip=' + ctx.env.SERVER_ADDR +
+			'&uamport=' + this.config.uam.uam_port +
+			'&challenge=' + this.uam.md5(this.config.uam.challenge, ctx.format_mac) +
+			'&mac=' + ctx.format_mac +
+			'&ip=' + ctx.env.REMOTE_ADDR +
+			'&called=' + this.config.uam.nasmac +
+			'&nasid=' + this.config.uam.nasid +
+			'&ssid=' + ctx.ssid;
+		if (this.config.uam.uam_secret)
+			uam_url += '&md=' + this.uam.md5(ctx.redir_location, this.config.uam.uam_secret);
+		return uam_url;
 	},
 
 	handle_request: function(env, uam) {
