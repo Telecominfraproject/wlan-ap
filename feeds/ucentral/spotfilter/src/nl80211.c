@@ -147,6 +147,7 @@ nl80211_device_update(struct interface *iface, struct device *dev)
 
 	nl_send_auto_complete(genl, msg);
 	nlmsg_free(msg);
+	nl_wait_for_ack(genl);
 }
 
 static void
