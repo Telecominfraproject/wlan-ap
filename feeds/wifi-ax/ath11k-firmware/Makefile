@@ -115,6 +115,11 @@ define Package/ath11k-firmware-qcn9000/install
 		$(1)/lib/firmware/ath11k/QCN9074/hw1.0/
 endef
 
+define Package/ath11k-wifi-yuncore-ax840/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-2.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
+endef
+
 $(eval $(call BuildPackage,ath11k-firmware-ipq50xx))
 $(eval $(call BuildPackage,ath11k-firmware-ipq50xx-spruce))
 $(eval $(call BuildPackage,ath11k-firmware-ipq60xx))
