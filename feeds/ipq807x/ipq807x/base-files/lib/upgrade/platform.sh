@@ -133,7 +133,6 @@ platform_do_upgrade() {
 	qcom,ipq5018-mp03.3|\
 	wallys,dr6018|\
 	wallys,dr6018-v4|\
-	yuncore,ax840|\
 	tplink,ex447|\
 	tplink,ex227|\
 	meshpp,s618-cp03|\
@@ -181,6 +180,13 @@ platform_do_upgrade() {
 	plasmacloud,pax1800-v2)
 		PART_NAME="inactive"
 		platform_do_upgrade_dualboot_datachk "$1"
+		;;
+	yuncore,ax840)
+		[ -f /proc/boot_info/rootfs/upgradepartition ] && {
+			CI_UBIPART="$(cat /proc/boot_info/rootfs/upgradepartition)"
+			CI_BOOTCFG=1
+		}
+		nand_upgrade_tar "$1"
 		;;
 	esac
 }
