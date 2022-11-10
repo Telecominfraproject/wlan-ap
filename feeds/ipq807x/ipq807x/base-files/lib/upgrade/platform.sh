@@ -87,6 +87,8 @@ platform_check_image() {
 	liteon,wpx8324|\
 	edgecore,eap106|\
 	hfcl,ion4xi|\
+	hfcl,ion4x|\
+	hfcl,ion4x_2|\
 	hfcl,ion4xe|\
 	plasmacloud,pax1800-v1|\
 	plasmacloud,pax1800-v2|\
@@ -141,6 +143,8 @@ platform_do_upgrade() {
 		nand_upgrade_tar "$1"
 		;;
 	hfcl,ion4xi|\
+	hfcl,ion4x|\
+	hfcl,ion4x_2|\
 	hfcl,ion4xe)
 		if grep -q rootfs_1 /proc/cmdline; then
 			CI_UBIPART="rootfs"

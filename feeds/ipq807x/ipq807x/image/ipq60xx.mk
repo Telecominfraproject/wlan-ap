@@ -20,6 +20,24 @@ define Device/hfcl_ion4xe
 endef
 TARGET_DEVICES += hfcl_ion4xe
 
+define Device/hfcl_ion4x
+  DEVICE_TITLE := HFCL ION4X
+  DEVICE_DTS := qcom-ipq6018-hfcl-ion4x
+  DEVICE_DTS_CONFIG := config@cp01-c1
+  SUPPORTED_DEVICES := hfcl,ion4x
+  DEVICE_PACKAGES := ath11k-wifi-qcom-ipq6018 uboot-envtools
+endef
+TARGET_DEVICES += hfcl_ion4x
+
+define Device/hfcl_ion4x_2
+  DEVICE_TITLE := HFCL ION4X_2
+  DEVICE_DTS := qcom-ipq6018-hfcl-ion4x_2
+  DEVICE_DTS_CONFIG := config@cp01-c1
+  SUPPORTED_DEVICES := hfcl,ion4x_2
+  DEVICE_PACKAGES := ath11k-wifi-qcom-ipq6018 uboot-envtools
+endef
+TARGET_DEVICES += hfcl_ion4x_2
+
 define Device/hfcl_ion4xi
   DEVICE_TITLE := HFCL ION4Xi
   DEVICE_DTS := qcom-ipq6018-hfcl-ion4xi
