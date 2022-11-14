@@ -90,12 +90,14 @@ platform_check_image() {
 	hfcl,ion4x|\
 	hfcl,ion4x_2|\
 	hfcl,ion4xe|\
+	muxi,ap3220l|\
 	plasmacloud,pax1800-v1|\
 	plasmacloud,pax1800-v2|\
 	tplink,ex227|\
 	tplink,ex447|\
 	yuncore,ax840|\
 	motorola,q14|\
+	muxi,ap3220l|\
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\

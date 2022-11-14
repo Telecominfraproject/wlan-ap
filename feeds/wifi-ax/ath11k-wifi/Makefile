@@ -40,6 +40,7 @@ ALLWIFIBOARDS:= \
 	indio-um-310ax-v1 \
 	indio-um-510axp-v1 \
 	indio-um-510axm-v1 \
+	muxi-ap3220l \
 	plasmacloud-pax1800 \
 	wallys-dr6018 \
 	wallys-dr6018-v4 \
@@ -252,6 +253,7 @@ $(eval $(call generate-ath11k-wifi-package,tplink-ex227,TP-Link EX227))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex447,TP-Link EX447))
 $(eval $(call generate-ath11k-wifi-package,yuncore-ax840,YunCore AX840))
 $(eval $(call generate-ath11k-wifi-package,meshpp-s618,Mesh++ S618))
+$(eval $(call generate-ath11k-wifi-package,muxi-ap3220l,MUXI AP3220L))
 
 $(foreach PACKAGE,$(ALLWIFIPACKAGES),$(eval $(call BuildPackage,$(PACKAGE))))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq5018))
