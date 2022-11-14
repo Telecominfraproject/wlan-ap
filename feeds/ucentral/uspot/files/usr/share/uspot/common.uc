@@ -166,6 +166,8 @@ return {
 			'&called=' + this.config.uam.nasmac +
 			'&nasid=' + this.config.uam.nasid +
 			'&ssid=' + ctx.ssid;
+		if (ctx.query_string?.redir)
+			uam_url += '&userurl=' + ctx.query_string.redir;
 		if (this.config.uam.uam_secret)
 			uam_url += '&md=' + this.uam.md5(ctx.redir_location, this.config.uam.uam_secret);
 		return uam_url;
