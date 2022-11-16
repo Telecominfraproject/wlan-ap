@@ -170,7 +170,7 @@ radius_parse(char *buf, int len, int port, enum socket_type type, int tx)
 
 	len -= sizeof(*hdr);
 
-	while (len > 0) {
+	while (len > 1) {
 		struct radius_tlv *tlv = (struct radius_tlv *)avp;
 
 		if (len < tlv->len) {
