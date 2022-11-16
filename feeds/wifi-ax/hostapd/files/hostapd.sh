@@ -394,6 +394,8 @@ hostapd_common_add_bss_config() {
 	config_add_boolean ratelimit
 
 	config_add_string uci_section
+
+	config_add_boolean dynamic_probe_resp
 }
 
 hostapd_set_vlan_file() {
@@ -629,7 +631,7 @@ hostapd_set_bss_options() {
 		airtime_bss_weight airtime_bss_limit airtime_sta_weight \
 		multicast_to_unicast_all proxy_arp per_sta_vif \
 		eap_server eap_user_file ca_cert server_cert private_key private_key_passwd server_id \
-		vendor_elements fils uci_section
+		vendor_elements fils uci_section dynamic_probe_resp
 
 	set_default fils 0
 	set_default isolate 0
@@ -652,6 +654,7 @@ hostapd_set_bss_options() {
 	set_default airtime_bss_weight 0
 	set_default airtime_bss_limit 0
 	set_default eap_server 0
+	set_default dynamic_probe_resp 0
 
 	/usr/sbin/hostapd -vfils || fils=0
 
@@ -677,6 +680,7 @@ hostapd_set_bss_options() {
 	append bss_conf "preamble=$short_preamble" "$N"
 	append bss_conf "wmm_enabled=$wmm" "$N"
 	append bss_conf "ignore_broadcast_ssid=$hidden" "$N"
+	append bss_conf "dynamic_probe_resp=$dynamic_probe_resp" "$N"
 	append bss_conf "uapsd_advertisement_enabled=$uapsd" "$N"
 	append bss_conf "utf8_ssid=$utf8_ssid" "$N"
 	append bss_conf "multi_ap=$multi_ap" "$N"
