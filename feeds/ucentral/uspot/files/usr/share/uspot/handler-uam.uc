@@ -60,6 +60,7 @@ global.handle_request = function(env) {
 	case '/logon':
 		auth_client(ctx);
 		break;
+	case '/logout':
 	case '/logoff':
 		deauth_client(ctx);
 		break;
