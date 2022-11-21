@@ -33,6 +33,18 @@ static uint32_t client_gettime(void)
 	return ts.tv_sec;
 }
 
+static bool client_is_active(const uint8_t *mac)
+{
+	struct interface *iface;
+
+	avl_for_each_element(&interfaces, iface, node) {
+		if (avl_find(&iface->clients, mac))
+			return true;
+	}
+
+	return false;
+}
+
 static void client_gc(struct uloop_timeout *t)
 {
 	struct cache_entry *c, *tmp;
@@ -40,6 +52,11 @@ static void client_gc(struct uloop_timeout *t)
 
 	avl_for_each_element_safe(&cache, c, node, tmp) {
 		uint32_t diff;
+
+		if (client_is_active(c->macaddr)) {
+			c->time = now;
+			continue;
+		}
 
 		diff = now - c->time;
 		if (diff < CACHE_TIMEOUT)
