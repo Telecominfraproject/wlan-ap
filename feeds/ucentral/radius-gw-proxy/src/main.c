@@ -170,10 +170,10 @@ radius_parse(char *buf, int len, int port, enum socket_type type, int tx)
 
 	len -= sizeof(*hdr);
 
-	while (len > 1) {
+	while (len >= sizeof(struct radius_tlv)) {
 		struct radius_tlv *tlv = (struct radius_tlv *)avp;
 
-		if (len < tlv->len) {
+		if (len < tlv->len || tlv->len < sizeof(*tlv)) {
 			ULOG_ERR("invalid TLV length\n");
 			return -1;
 		}
