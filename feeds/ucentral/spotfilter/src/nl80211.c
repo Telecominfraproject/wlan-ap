@@ -248,6 +248,7 @@ int spotfilter_nl80211_init(void)
 	genl_cb = nl_cb_alloc(NL_CB_DEFAULT);
 	nl_cb_set(genl_cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, no_seq_check, NULL);
 	nl_cb_set(genl_cb, NL_CB_VALID, NL_CB_CUSTOM, valid_msg, NULL);
+	nl_socket_set_cb(genl, genl_cb);
 
 	genl_fd.fd = nl_socket_get_fd(genl);
 	genl_fd.cb = nl80211_sock_cb;
