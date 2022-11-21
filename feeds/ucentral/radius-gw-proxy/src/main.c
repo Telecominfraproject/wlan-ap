@@ -152,13 +152,13 @@ radius_forward_gw(char *buf, enum socket_type type)
 }
 
 static int
-radius_parse(char *buf, int len, int port, enum socket_type type, int tx)
+radius_parse(char *buf, unsigned int len, int port, enum socket_type type, int tx)
 {
 	struct radius_header *hdr = (struct radius_header *) buf;
 	struct radius_tlv *proxy_state = NULL;
 	char proxy_state_str[256] = {};
 	void *avp = hdr->avp;
-	int len_orig = ntohs(hdr->len);
+	unsigned int len_orig = ntohs(hdr->len);
 	uint8_t localhost[] = { 0x7f, 0, 0, 1 };
 
 	if (len_orig != len) {
@@ -170,10 +170,10 @@ radius_parse(char *buf, int len, int port, enum socket_type type, int tx)
 
 	len -= sizeof(*hdr);
 
-	while (len > 1) {
+	while (len >= sizeof(struct radius_tlv)) {
 		struct radius_tlv *tlv = (struct radius_tlv *)avp;
 
-		if (len < tlv->len) {
+		if (len < tlv->len || tlv->len < sizeof(*tlv)) {
 			ULOG_ERR("invalid TLV length\n");
 			return -1;
 		}
@@ -312,7 +312,7 @@ sock_recv(struct uloop_fd *u, unsigned int events)
 
 		inet_ntop(AF_INET, &sin.sin_addr, addr_str, sizeof(addr_str));
 		printf("RX: src:%s:%d, len=%d\n", addr_str, sin.sin_port, len);
-		radius_parse(buf, len, sin.sin_port, sock->type, 1);
+		radius_parse(buf, (unsigned int)len, sin.sin_port, sock->type, 1);
 	} while (1);
 }
 
