@@ -32,6 +32,7 @@ enum {
         RADIUS_INPUT_PACKETS,
         RADIUS_OUTPUT_PACKETS,
         RADIUS_LOGOFF_URL,
+        RADIUS_CLASS,
         __RADIUS_MAX,
 };
 
@@ -59,6 +60,7 @@ static const struct blobmsg_policy radius_policy[__RADIUS_MAX] = {
         [RADIUS_INPUT_PACKETS] = { .name = "input_packets", .type = BLOBMSG_TYPE_INT32 },
         [RADIUS_OUTPUT_PACKETS] = { .name = "output_packets", .type = BLOBMSG_TYPE_INT32 },
         [RADIUS_LOGOFF_URL] = { .name = "logoff_url", .type = BLOBMSG_TYPE_STRING },
+        [RADIUS_CLASS] = { .name = "class", .type = BLOBMSG_TYPE_STRING },
 };
 
 static struct blob_buf b = {};
@@ -250,6 +252,10 @@ radius(void)
 		if (rc_avpair_add(rh, &send, PW_ACCT_OUTPUT_PACKETS, &val, 4, 0) == NULL)
 			return result(rh, 0, NULL);
 	}
+
+	if (tb[RADIUS_CLASS])
+		if (rc_avpair_add(rh, &send, PW_CLASS, blobmsg_get_string(tb[RADIUS_CLASS]), -1, 0) == NULL)
+			return result(rh, 0, NULL);
 
 	val = 19;
 	if (rc_avpair_add(rh, &send, PW_NAS_PORT_TYPE, &val, 4, 0) == NULL)

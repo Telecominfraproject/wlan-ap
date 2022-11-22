@@ -38,6 +38,8 @@ function auth_client(ctx) {
 		payload.acct = true;
 		payload.username = ctx.query_string.username;
 		payload.acct_type = 1;
+		if (radius.reply.Class)
+			payload.class = radius.reply.Class;
 		portal.radius_call(ctx, payload);
 		return;
 	}

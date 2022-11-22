@@ -88,6 +88,8 @@ function radius_acct(mac, payload) {
 	payload.input_gigawords = state.bytes_ul >> 32;
 	payload.output_packets = state.packets_dl;
 	payload.input_packets = state.packets_ul;
+	if (state.data?.radius?.reply.Class)
+		payload.class = state.data.radius.reply.Class;
 
 	radius_call(mac, payload);
 	return true;
