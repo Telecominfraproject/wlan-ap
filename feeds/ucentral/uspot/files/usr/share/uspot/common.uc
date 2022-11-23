@@ -111,7 +111,7 @@ return {
 	},
 
 	// put a client back into pre-auth state
-	logoff: function(ctx, data) {
+	logoff: function(ctx, uam) {
 		this.syslog(ctx, 'logging client off');
 		ctx.ubus.call('spotfilter', 'client_set', {
 			interface: 'hotspot',
@@ -121,7 +121,11 @@ return {
 			accounting: [],
 			flush: true,
 		});
-		include('logoff.uc', ctx);
+
+		if (uam)
+			include('redir.uc', { redir_location: this.uam_url(ctx, 'logoff') });
+		else
+			include('logoff.uc', ctx);
 	},
 
 	// generate the default radius auth payload
@@ -169,7 +173,7 @@ return {
 		if (ctx.query_string?.redir)
 			uam_url += '&userurl=' + ctx.query_string.redir;
 		if (this.config.uam.uam_secret)
-			uam_url += '&md=' + this.uam.md5(ctx.redir_location, this.config.uam.uam_secret);
+			uam_url += '&md=' + this.uam.md5(uam_url, this.config.uam.uam_secret);
 		return uam_url;
 	},
 

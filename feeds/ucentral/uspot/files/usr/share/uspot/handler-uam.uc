@@ -52,7 +52,7 @@ function auth_client(ctx) {
 
 // disconnect client
 function deauth_client(ctx) {
-	portal.logoff(ctx);
+	portal.logoff(ctx, true);
 }
 
 global.handle_request = function(env) {
