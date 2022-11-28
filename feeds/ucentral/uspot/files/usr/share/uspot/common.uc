@@ -119,7 +119,9 @@ return {
 			state: 0,
 			dns_state: 1,
 			accounting: [],
-			flush: true,
+			data: {
+				logoff : 1
+			}
 		});
 
 		if (uam)

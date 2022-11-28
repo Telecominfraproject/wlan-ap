@@ -60,6 +60,8 @@ function radius_stop(mac) {
 	if (!radius_available(mac))
 		return;
 	debug(mac, 'stopping accounting');
+	if (clients[mac].accounting)
+		clients[mac].timeout.cancel();
 
 	let payload = {
 		acct: true,
@@ -111,6 +113,16 @@ function radius_session_time(mac) {
 	let payload = {
 		acct_type: 2,
 		terminate_cause: 5,
+	};
+	radius_acct(mac, payload);
+}
+
+function radius_logoff(mac) {
+	if (!radius_available(mac))
+		return;
+	let payload = {
+		acct_type: 2,
+		terminate_cause: 0,
 	};
 	radius_acct(mac, payload);
 }
@@ -168,26 +180,31 @@ function client_add(mac, state) {
 
 function client_remove(mac, reason) {
 	syslog(mac, reason);
-	if (clients[mac]) {
-		radius_stop(mac);
-		if (clients[mac].accounting)
-			clients[mac].timeout.cancel();
-		delete clients[mac];
-	}
+	radius_stop(mac);
+	delete clients[mac];
 	ubus.call('spotfilter', 'client_remove', {
 			interface: "hotspot",
 			address: mac
 		});
 }
 
+function client_flush(mac) {
+	syslog(mac, 'logoff event');
+	radius_stop(mac);
+	ubus.call('spotfilter', 'client_set', {
+			interface: 'hotspot',
+			address: mac,
+			state: 0,
+			dns_state: 1,
+			accounting: [],
+			flush: true
+		});
+}
+
 function client_timeout(mac) {
 	syslog(mac, 'session timeout');
-	if (clients[mac]) {
-		radius_stop(mac);
-		if (clients[mac].accounting)
-			clients[mac].timeout.cancel();
-		delete clients[mac];
-	}
+	radius_stop(mac);
+	delete clients[mac];
 	ubus.call('spotfilter', 'client_set', {
 			interface: "hotspot",
 			state: 0,
@@ -208,29 +225,33 @@ uloop.timer(1000, function() {
 		if (!clients[k])
 			client_add(k, v);
 
-	for (let k, v in clients)
+	for (let k, v in clients) {
+		if (list[k].data?.logoff) {
+			radius_logoff(k);
+			client_flush(k);
+			continue;
+		}
+
 		if (!list[k] || !list[k].state) {
 			radius_disconnect(k);
 			client_remove(k, 'disconnect event');
+			continue;
 		}
 
-	for (let k, v in list) {
 		if (v.idle > get_idle_timeout(k)) {
 			if (clients[k])
 				radius_idle_time(k);
 			client_remove(k, 'idle event');
-
 		}
 		let timeout = get_session_timeout(k);
 		if (timeout && ((t - v.data.connect) > timeout)) {
 			if (clients[k])
 				radius_session_time(k);
 			client_timeout(k);
-
 		}
 	}
 
-	this.set(5000);
+	this.set(1000);
 });
 
 uloop.run();
