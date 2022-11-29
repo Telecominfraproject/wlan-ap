@@ -117,6 +117,7 @@ hostapd_common_add_device_config() {
 	config_add_int rssi_reject_assoc_rssi
 	config_add_int rssi_ignore_probe_request
 	config_add_int maxassoc
+	config_add_boolean maxassoc_ignore_probe
 
 	config_add_string acs_chan_bias
 	config_add_boolean acs_exclude_dfs
@@ -138,7 +139,8 @@ hostapd_prepare_device_config() {
 	json_get_vars country country3 country_ie beacon_int:100 dtim_period:2 doth require_mode legacy_rates \
 		acs_chan_bias local_pwr_constraint spectrum_mgmt_required airtime_mode cell_density \
 		rts_threshold beacon_rate rssi_reject_assoc_rssi rssi_ignore_probe_request maxassoc \
-		multiple_bssid he_co_locate rnr_beacon ema acs_exclude_dfs
+		multiple_bssid he_co_locate rnr_beacon ema acs_exclude_dfs \
+		maxassoc_ignore_probe
 
 	hostapd_set_log_options base_cfg
 
@@ -245,6 +247,7 @@ hostapd_prepare_device_config() {
 	append base_cfg "dtim_period=$dtim_period" "$N"
 	[ "$airtime_mode" -gt 0 ] && append base_cfg "airtime_mode=$airtime_mode" "$N"
 	[ -n "$maxassoc" ] && append base_cfg "iface_max_num_sta=$maxassoc" "$N"
+	[ "$maxassoc_ignore_probe" -gt 0 ] && append base_cfg "no_probe_resp_if_max_sta=1" "$N"
 	[ "$rnr_beacon" -gt 0 ] && append base_cfg "rnr_beacon=$rnr_beacon" "$N"
 	[ "$he_co_locate" -gt 0 ] && append base_cfg "he_co_locate=$he_co_locate" "$N"
 	[ "$multiple_bssid" -gt 0 ] && append base_cfg "multiple_bssid=$multiple_bssid" "$N"
