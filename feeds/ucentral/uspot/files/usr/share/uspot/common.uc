@@ -219,6 +219,7 @@ return {
 					ssid: hapd.ssid || 'unknown'
 				}
 			});
+			connected.data.ssid = hapd.ssid;
 		}
 		ctx.device = connected.device;
 		ctx.ssid = connected.data.ssid;
