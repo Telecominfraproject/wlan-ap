@@ -158,11 +158,13 @@ function client_add(mac, state) {
 	let idle = idle_timeout;
 	let session = session_timeout;
 	let accounting = (config.radius?.acct_server && config.radius?.acct_secret);
+	let max_total = 0;
 
 	if (state.data?.radius?.reply) {
 		interval = (state.data?.radius?.reply['Acct-Interim-Interval'] || acct_interval) * 1000;
 		idle = (state.data?.radius?.reply['Idle-Timeout'] || idle_timeout);
 		session = (state.data?.radius?.reply['Session-Timeout'] || session_timeout);
+		max_total = (state.data?.radius?.reply['ChilliSpot-Max-Total-Octets'] || 0);
 	}
 
 	clients[mac] = {
@@ -170,6 +172,7 @@ function client_add(mac, state) {
 		interval,
 		session,
 		idle,
+		max_total,
 	};
 	if (state.data?.radius?.request)
 		clients[mac].radius= state.data.radius.request;
@@ -201,8 +204,8 @@ function client_flush(mac) {
 		});
 }
 
-function client_timeout(mac) {
-	syslog(mac, 'session timeout');
+function client_timeout(mac, reason) {
+	syslog(mac, reason);
 	radius_stop(mac);
 	delete clients[mac];
 	ubus.call('spotfilter', 'client_set', {
@@ -244,10 +247,18 @@ uloop.timer(1000, function() {
 			client_remove(k, 'idle event');
 		}
 		let timeout = get_session_timeout(k);
-		if (timeout && ((t - v.data.connect) > timeout)) {
+		if (timeout && ((t - list[k].data.connect) > timeout)) {
 			if (clients[k])
 				radius_session_time(k);
-			client_timeout(k);
+			client_timeout(k, 'session timeout');
+			continue;
+		}
+		if (clients[k].max_total) {
+			let total = list[k].bytes_ul + list[k].bytes_dl;
+			if (total >= clients[k].max_total) {
+				radius_session_time(k);
+				client_timeout(k, 'max octets reached');
+			}
 		}
 	}
 
