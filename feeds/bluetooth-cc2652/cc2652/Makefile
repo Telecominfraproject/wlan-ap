@@ -25,21 +25,12 @@ define Build/Prepare
 endef
 
 define Package/cc2652/install
-	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) ./files/tisbl.init $(1)/etc/init.d/tisbl
-
-	$(INSTALL_DIR) $(1)/etc/tifirmware
-	$(INSTALL_BIN) ./files/firmware/* $(1)/etc/tifirmware/
+	$(INSTALL_DIR) $(1)/lib/firmware/cc2562
+	$(INSTALL_BIN) ./files/firmware/* $(1)/lib/firmware/cc2562
 	
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/tisbl $(1)/usr/bin/
 	$(INSTALL_BIN) ./files/*.sh $(1)/usr/bin/
-
-	$(INSTALL_DIR) $(1)/etc/config
-	$(INSTALL_BIN) ./files/tisbl.config $(1)/etc/config/tisbl
-
-	$(INSTALL_DIR) $(1)/etc/uci-defaults
-	$(INSTALL_BIN) ./files/tisbl.defaults $(1)/etc/uci-defaults
 endef
 
 $(eval $(call BuildPackage,cc2652))

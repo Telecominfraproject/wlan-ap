@@ -1,0 +1,178 @@
+From 93aa68836fce4e223ba4759e7ad3e451cd2fbc12 Mon Sep 17 00:00:00 2001
+From: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Date: Thu, 12 May 2022 17:23:49 +0530
+Subject: [PATCH] ath11k: fix bandwidth change issue for peer sta
+
+Currently, ath11k sends peer assoc command for each peer to
+firmware when bandwidth changes. Peer assoc command is a
+bulky command and if many clients connected, this could lead
+to firmware buffer getting overflowed leading to firmware
+assert.
+
+However, during bandwidth change, only phymode and bandwidth
+also can be updated by WMI set peer param command. This makes
+the overall command light when compared to peer assoc and for
+multi-client cases, firmware buffer overflow also does not
+occur.
+
+Remove sending peer assoc command during sta bandwidth change
+and instead add sending WMI set peer param command for phymode
+and bandwidth.
+
+Signed-off-by: Aditya Kumar Singh <quic_adisi@quicinc.com>
+---
+ drivers/net/wireless/ath/ath11k/core.h |  1 +
+ drivers/net/wireless/ath/ath11k/mac.c  | 83 +++++++++++++++++++-------
+ 2 files changed, 62 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.h b/drivers/net/wireless/ath/ath11k/core.h
+index 9c663f7..904c17f 100644
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -598,6 +598,7 @@ struct ath11k_sta {
+ #ifdef CPTCFG_ATH11K_CFR
+ 	struct ath11k_per_peer_cfr_capture cfr_capture;
+ #endif
++	u32 bw_last;
+ };
+ 
+ #define ATH11K_HALF_20MHZ_BW 10
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index b55f383..f76b8fd 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -4954,11 +4954,12 @@ static void ath11k_sta_rc_update_wk(struct work_struct *wk)
+ 	const u8 *ht_mcs_mask;
+ 	const u16 *vht_mcs_mask;
+ 	const u16 *he_mcs_mask;
+-	u32 changed, bw, nss, smps;
++	u32 changed, bw, nss, smps, bw_last;
+ 	int err, num_ht_rates, num_vht_rates,  num_he_rates;
+ 	const struct cfg80211_bitrate_mask *mask;
+ 	struct peer_assoc_params peer_arg;
+ 	bool peer_dbg_info, debug;
++	enum wmi_phy_mode peer_phymode;
+ 
+ 	arsta = container_of(wk, struct ath11k_sta, update_wk);
+ 	sta = container_of((void *)arsta, struct ieee80211_sta, drv_priv);
+@@ -4984,6 +4985,7 @@ static void ath11k_sta_rc_update_wk(struct work_struct *wk)
+ 	arsta->changed = 0;
+ 
+ 	bw = arsta->bw;
++	bw_last = arsta->bw_last;
+ 	nss = arsta->nss;
+ 	smps = arsta->smps;
+ 
+@@ -4999,29 +5001,58 @@ static void ath11k_sta_rc_update_wk(struct work_struct *wk)
+ 			   ath11k_mac_max_he_nss(he_mcs_mask)));
+ 
+ 	if (changed & IEEE80211_RC_BW_CHANGED) {
+-		/* Send peer assoc command before peer bandwidth param set to
+-		 * avoid the target assert due to mismatch between the peer phymode
+-		 * and peer bandwidth.
+-		 */
+-		debug = ath11k_peer_assoc_prepare(ar, arvif->vif, sta, &peer_arg, true);
++		/* Get the the peer phymode */
++		ath11k_peer_assoc_h_phymode(ar, arvif->vif, sta, &peer_arg);
++		peer_phymode = peer_arg.peer_phymode;
+ 
+-		peer_arg.is_assoc = false;
+-		err = ath11k_wmi_send_peer_assoc_cmd(ar, &peer_arg, debug);
+-		if (err)
+-			ath11k_warn(ar->ab, "failed to run peer assoc for STA %pM vdev %i: %d\n",
+-					sta->addr, arvif->vdev_id, err);
+-		else {
+-			if (!wait_for_completion_timeout(&ar->peer_assoc_done, 1 * HZ))
+-				ath11k_warn(ar->ab, "failed to get peer assoc conf event for %pM vdev %i\n",
+-					    sta->addr, arvif->vdev_id);
+-			else {
+-				err = ath11k_wmi_set_peer_param(ar, sta->addr, arvif->vdev_id,
+-								WMI_PEER_CHWIDTH, bw);
+-				if (err)
+-					ath11k_warn(ar->ab, "failed to update STA %pM peer bw %d: %d\n",
+-						    sta->addr, bw, err);
++		if (peer_dbg_info)
++			ath11k_dbg(ar->ab, ATH11K_DBG_PEER, "mac update sta %pM peer bw %d phymode %d\n",
++				   sta->addr, bw, peer_phymode);
++
++		if (bw > bw_last) {
++			/* BW is upgraded. In this case we send WMI_PEER_PHYMODE
++			 * followed by WMI_PEER_CHWIDTH
++			 */
++			ath11k_dbg(ar->ab, ATH11K_DBG_MAC, "mac BW upgrade for sta %pM new BW %d, old BW %d\n",
++				   sta->addr, bw, bw_last);
++
++			err = ath11k_wmi_set_peer_param(ar, sta->addr, arvif->vdev_id,
++							WMI_PEER_PHYMODE, peer_phymode);
++
++			if (err) {
++				ath11k_warn(ar->ab, "failed to update STA %pM peer phymode %d: %d\n",
++					    sta->addr, peer_phymode, err);
++				goto exit;
+ 			}
++
++			err = ath11k_wmi_set_peer_param(ar, sta->addr, arvif->vdev_id,
++							WMI_PEER_CHWIDTH, bw);
++			if (err)
++				ath11k_warn(ar->ab, "failed to update STA %pM peer bw %d: %d\n",
++					    sta->addr, bw, err);
++		} else {
++			/* BW is downgraded. In this case we send WMI_PEER_CHWIDTH
++			 * followed by WMI_PEER_PHYMODE
++			 */
++			ath11k_dbg(ar->ab, ATH11K_DBG_MAC, "mac BW downgrade for sta %pM new BW %d, old BW %d\n",
++				   sta->addr, bw, bw_last);
++
++			err = ath11k_wmi_set_peer_param(ar, sta->addr, arvif->vdev_id,
++							WMI_PEER_CHWIDTH, bw);
++			if (err) {
++				ath11k_warn(ar->ab, "failed to update STA %pM peer bw %d: %d\n",
++					    sta->addr, bw, err);
++				goto exit;
++			}
++
++			err = ath11k_wmi_set_peer_param(ar, sta->addr, arvif->vdev_id,
++							WMI_PEER_PHYMODE, peer_phymode);
++
++			if (err)
++				ath11k_warn(ar->ab, "failed to update STA %pM peer phymode %d: %d\n",
++					    sta->addr, peer_phymode, err);
+ 		}
++
+ 	}
+ 
+ 	if (changed & IEEE80211_RC_NSS_CHANGED) {
+@@ -5111,7 +5142,7 @@ static void ath11k_sta_rc_update_wk(struct work_struct *wk)
+ 					    sta->addr, arvif->vdev_id);
+ 		}
+ 	}
+-
++exit:
+ 	mutex_unlock(&ar->conf_mutex);
+ }
+ 
+@@ -5737,6 +5768,13 @@ static int ath11k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 
+ 		spin_unlock_bh(&ar->ab->base_lock);
+ 
++		spin_lock_bh(&ar->data_lock);
++
++		/* Set arsta bw and last bw */
++		arsta->bw = arsta->bw_last = sta->bandwidth;
++
++		spin_unlock_bh(&ar->data_lock);
++
+ 		if (vif->type == NL80211_IFTYPE_STATION && arvif->is_up) {
+ 			ret = ath11k_wmi_set_peer_param(ar, sta->addr,
+ 							arvif->vdev_id,
+@@ -5938,6 +5976,7 @@ static void ath11k_mac_op_sta_rc_update(struct ieee80211_hw *hw,
+ 			break;
+ 		}
+ 
++		arsta->bw_last = arsta->bw;
+ 		arsta->bw = bw;
+ 	}
+ 
+-- 
+2.17.1
+

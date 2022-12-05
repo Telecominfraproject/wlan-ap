@@ -1,0 +1,716 @@
+From 57342b4c68d80754c3b6e1df4af1a46afc936a90 Mon Sep 17 00:00:00 2001
+From: Hari Chandrakanthan <quic_haric@quicinc.com>
+Date: Wed, 1 Dec 2021 21:27:36 +0530
+Subject: [PATCH] hostapd : Add support to awgn mitigation for 6Ghz
+
+when awgn interference is detected on operating channel,
+AP is supposed to stop transmitting in that channel.
+AP can reduce it's operating bandwidth or
+completely move to another channel based on the
+interference segment.
+
+hostapd receives awgn notification through NL80211_CMD_AWGN_DETECT
+cmd and the NL attribute NL80211_ATTR_AWGN_INTERFERENCE_BITMAP
+provides the channel interference information.
+
+Eg: For 80Mhz operating bandwidth, the chan bw interference
+bitmap can be as follows.
+segment chan_bw_interference_bitmap
+0       0x01
+1       0x02
+2       0x04
+3       0x08
+
+segment 0 - primary 20Mhz
+segment 1 - secondary 20Mhz
+segment 2 - secondary 40Mhz lower
+segment 3 - secondary 40Mhz upper
+
+Signed-off-by: Hari Chandrakanthan <quic_haric@quicinc.com>
+---
+ hostapd/Makefile                   |   1 +
+ src/ap/Makefile                    |   1 +
+ src/ap/drv_callbacks.c             |  13 ++
+ src/ap/interference.c              | 387 +++++++++++++++++++++++++++++++++++++
+ src/ap/interference.h              |  41 ++++
+ src/drivers/driver.h               |  13 ++
+ src/drivers/driver_common.c        |   1 +
+ src/drivers/driver_nl80211_event.c |  30 +++
+ src/drivers/nl80211_copy.h         |  13 ++
+ wpa_supplicant/Makefile            |   1 +
+ 10 files changed, 501 insertions(+)
+ create mode 100644 src/ap/interference.c
+ create mode 100644 src/ap/interference.h
+
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -1186,6 +1186,7 @@ OBJS += ../src/ap/ap_list.o
+ OBJS += ../src/ap/ieee802_11.o
+ OBJS += ../src/ap/hw_features.o
+ OBJS += ../src/ap/dfs.o
++OBJS += ../src/ap/interference.o
+ CFLAGS += -DNEED_AP_MLME
+ endif
+ OBJS += ../src/ap/ieee802_11_ht.o
+--- a/src/ap/Makefile
++++ b/src/ap/Makefile
+@@ -36,6 +36,7 @@ LIB_OBJS= \
+ 	ieee802_11_shared.o \
+ 	ieee802_11_vht.o \
+ 	ieee802_1x.o \
++	interference.o \
+ 	neighbor_db.o \
+ 	ndisc_snoop.o \
+ 	p2p_hostapd.o \
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -43,6 +43,7 @@
+ #include "dpp_hostapd.h"
+ #include "fils_hlp.h"
+ #include "neighbor_db.h"
++#include "interference.h"
+ 
+ #ifdef CONFIG_FILS
+ void hostapd_notify_assoc_fils_finish(struct hostapd_data *hapd,
+@@ -1685,6 +1686,13 @@ static void hostapd_event_dfs_radar_dete
+ 				   radar->cf1, radar->cf2);
+ }
+ 
++static void hostapd_event_awgn_detected(struct hostapd_data *hapd,
++					struct awgn_event *awgn_info)
++{
++	hostapd_intf_awgn_detected(hapd->iface, awgn_info->freq, awgn_info->chan_width,
++				   awgn_info->cf1, awgn_info->cf2,
++				   awgn_info->chan_bw_interference_bitmap);
++}
+ 
+ static void hostapd_event_dfs_pre_cac_expired(struct hostapd_data *hapd,
+ 					      struct dfs_event *radar)
+@@ -2069,6 +2077,11 @@ void hostapd_wpa_event(void *ctx, enum w
+ 			break;
+ 		hostapd_event_dfs_radar_detected(hapd, &data->dfs_event);
+ 		break;
++	case EVENT_AWGN_DETECTED:
++		if (!data)
++			break;
++		hostapd_event_awgn_detected(hapd, &data->awgn_event);
++		break;
+ 	case EVENT_DFS_PRE_CAC_EXPIRED:
+ 		if (!data)
+ 			break;
+--- /dev/null
++++ b/src/ap/interference.c
+@@ -0,0 +1,393 @@
++/*
++ * AWGN - Additive white Gaussian Noise
++ * Copyright (c) 2002-2013, Jouni Malinen <j@w1.fi>
++ * Copyright (c) 2013-2017, Qualcomm Atheros, Inc.
++ *
++ * This software may be distributed under the terms of the BSD license.
++ * See README for more details.
++ */
++
++/*
++ * Copyright (c) 2021 Qualcomm Innovation Center, Inc. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without modification,
++ * are permitted (subject to the limitations in the disclaimer below) provided that
++ * the following conditions are met:
++ * * Redistributions of source code must retain the above copyright notice,
++ *   this list of conditions and the following disclaimer.
++ * * Redistributions in binary form must reproduce the above copyright notice,
++ *   this list of conditions and the following disclaimer in the documentation and/or
++ *   other materials provided with the distribution.
++ * * Neither the name of Qualcomm Innovation Center, Inc. nor the names of its contributors
++ *   may be used to endorse or promote products derived from this software without specific
++ *   prior written permission.
++ * NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED BY THIS LICENSE.
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS
++ * OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
++ * AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
++ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
++ * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "utils/includes.h"
++
++#include "utils/common.h"
++#include "common/ieee802_11_defs.h"
++#include "common/hw_features_common.h"
++#include "common/wpa_ctrl.h"
++#include "hostapd.h"
++#include "ap_drv_ops.h"
++#include "drivers/driver.h"
++#include "beacon.h"
++#include "eloop.h"
++#include "hw_features.h"
++
++/*
++ * intf_awgn_chan_range_available - check whether the channel can operate
++ * in the given bandwidth in 6Ghz
++ * @first_chan_idx - channel index of the first 20Mhz channel in a segment
++ * @num_chans - number of 20Mhz channels needed for the operating bandwidth
++ */
++static int intf_awgn_chan_range_available(struct hostapd_hw_modes *mode,
++					  int first_chan_idx, int num_chans)
++{
++	struct hostapd_channel_data *first_chan = NULL;
++	int allowed_40_6g[] = {1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 105,
++			       113, 121, 129, 137, 145, 153, 161, 169, 177, 185, 193,
++			       201, 209, 217, 225, 233};
++	int allowed_80_6g[] = {1, 17, 33, 49, 65, 81, 97, 113, 129, 145, 161, 177,
++			       193, 209};
++	int allowed_160_6g[] = {1, 33, 65, 97, 129, 161, 193};
++	int chan_idx_match = 0;
++	int i;
++
++	first_chan = &mode->channels[first_chan_idx];
++
++	if (!first_chan || !chan_pri_allowed(first_chan)) {
++		wpa_printf(MSG_DEBUG, "AWGN: primary channel not allowed");
++		return 0;
++	}
++
++	/* 20Mhz channel, so no need to check the range */
++	if (num_chans == 1)
++		return 1;
++
++	if (num_chans == 2) { /* 40Mhz channel */
++		for (i = 0; i < ARRAY_SIZE(allowed_40_6g); i++) {
++			if (first_chan->chan == allowed_40_6g[i]) {
++				chan_idx_match = 1;
++				break;
++			}
++		}
++	} else if (num_chans == 4) { /* 80Mhz channel */
++		for (i = 0; i < ARRAY_SIZE(allowed_80_6g); i++) {
++			if (first_chan->chan == allowed_80_6g[i]) {
++				chan_idx_match = 1;
++				break;
++			}
++		}
++	} else if (num_chans == 8) { /* 160Mhz channel */
++		for (i = 0; i < ARRAY_SIZE(allowed_160_6g); i++) {
++			if (first_chan->chan == allowed_160_6g[i]) {
++				chan_idx_match = 1;
++				break;
++			}
++		}
++	}
++
++	if (chan_idx_match == 1)
++		return 1;
++
++	return 0;
++}
++
++static int is_in_chanlist(struct hostapd_iface *iface,
++			  struct hostapd_channel_data *chan)
++{
++	if (!iface->conf->acs_ch_list.num)
++		return 1;
++
++	return freq_range_list_includes(&iface->conf->acs_ch_list, chan->chan);
++}
++
++/*
++ *intf_awgn_find_channel - find the channel that can operate with bandwidth chan_width.
++  If idx doesn't match with index of any of the existing channel, then the api
++  returns the total number of available chandefs that supports the provided bandwidth
++ * @idx - index of the channel
++ * @chan_width - bandwidth of the channel
++ */
++static int intf_awgn_find_channel(struct hostapd_iface *iface,
++				  struct hostapd_channel_data **ret_chan,
++				  int idx, int chan_width)
++{
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	struct hostapd_channel_data *chan;
++	int i, channel_idx = 0, n_chans;
++
++	switch (chan_width) {
++	case CHAN_WIDTH_20_NOHT:
++	case CHAN_WIDTH_20:
++		n_chans = 1;
++		break;
++	case CHAN_WIDTH_40:
++		n_chans = 2;
++		break;
++	case CHAN_WIDTH_80:
++		n_chans = 4;
++		break;
++	case CHAN_WIDTH_80P80:
++	case CHAN_WIDTH_160:
++		n_chans = 8;
++		break;
++	default:
++		n_chans = 1;
++		break;
++	}
++
++	for (i = 0; i < mode->num_channels; i++) {
++		chan = &mode->channels[i];
++
++		/* Skip incompatible chandefs */
++		if (!intf_awgn_chan_range_available(mode, i, n_chans)) {
++			wpa_printf(MSG_DEBUG,
++				   "AWGN: range not available for %d (%d)",
++				   chan->freq, chan->chan);
++			continue;
++		}
++
++		if (!is_in_chanlist(iface, chan)) {
++			wpa_printf(MSG_DEBUG,
++				   "AWGN: channel %d (%d) not in chanlist",
++				   chan->freq, chan->chan);
++			continue;
++		}
++
++		if (ret_chan && idx == channel_idx) {
++			wpa_printf(MSG_DEBUG, "AWGN: Selected channel %d (%d)",
++				   chan->freq, chan->chan);
++			*ret_chan = chan;
++			return idx;
++		}
++
++		wpa_printf(MSG_DEBUG, "AWGN: Adding channel %d (%d)",
++			   chan->freq, chan->chan);
++		channel_idx++;
++	}
++	return channel_idx;
++}
++
++enum chan_seg {
++	SEG_PRI20             =  0x1,
++	SEG_SEC20             =  0x2,
++	SEG_SEC40_LOWER       =  0x4,
++	SEG_SEC40_UPPER       =  0x8,
++	SEG_SEC40             =  0xC,
++	SEG_SEC80_LOWER       = 0x10,
++	SEG_SEC80_LOWER_UPPER = 0x20,
++	SEG_SEC80_UPPER_LOWER = 0x40,
++	SEG_SEC80_UPPER       = 0x80,
++	SEG_SEC80             = 0xF0,
++};
++
++#define BASE_6G_FREQ 5950
++
++int get_centre_freq_6g(int chan_idx, int chan_width, int *centre_freq)
++{
++	if (!centre_freq)
++		return -1;
++
++	*centre_freq = 0;
++
++	switch (chan_width) {
++	case CHAN_WIDTH_40:
++		if (chan_idx >= 1 && chan_idx <= 229)
++			*centre_freq = ((chan_idx / 8) * 8 + 3) * 5 + BASE_6G_FREQ;
++		break;
++	case CHAN_WIDTH_80:
++		if (chan_idx >= 1 && chan_idx <= 221)
++			*centre_freq = ((chan_idx / 16) * 16 + 7) * 5 + BASE_6G_FREQ;
++		break;
++	case CHAN_WIDTH_160:
++		if (chan_idx >= 1 && chan_idx <= 221)
++			*centre_freq = ((chan_idx / 32) * 32 + 15) * 5 + BASE_6G_FREQ;
++		break;
++	default:
++		break;
++	}
++
++	if (*centre_freq == 0)
++		return -1;
++
++	return 0;
++}
++
++/*
++ * hostapd_intf_awgn_detected - awgn interference is detected in the operating channel.
++ * The interference channel information is available as a
++ * bitmap(chan_bw_interference_bitmap). If interference has occurred in the
++ * primary channel, do a complete channel switch to a different channel else
++ * reduce the operating bandwidth and continue ap operation in the same channel.
++ */
++int hostapd_intf_awgn_detected(struct hostapd_iface *iface, int freq, int chan_width,
++			       int cf1, int cf2, u32 chan_bw_interference_bitmap)
++{
++	struct csa_settings settings;
++	struct hostapd_channel_data *chan_data = NULL;
++	struct hostapd_channel_data *chan_temp = NULL;
++	int ret;
++	unsigned int i;
++	u32 _rand;
++	u32 chan_idx;
++	int num_available_chandefs;
++	u8 channel_switch = 0;
++	int new_chan_width;
++	int new_centre_freq;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++
++	wpa_printf(MSG_DEBUG,
++		   "input freq=%d, chan_width=%d, cf1=%d cf2=%d"
++		   " chan_bw_interference_bitmap=0x%x",
++		   freq,
++		   chan_width,
++		   cf1, cf2, chan_bw_interference_bitmap);
++
++	if (iface->conf->discard_6g_awgn_event) {
++		wpa_printf(MSG_DEBUG, "discard_6g_awgn_event set ignoring"
++			   "AWGN DETECT event from driver");
++		return 0;
++	}
++
++	/* check whether interference has occurred in primary 20Mhz channel */
++	if (!chan_bw_interference_bitmap || (chan_bw_interference_bitmap & SEG_PRI20))
++		channel_switch = 1;
++
++	if (channel_switch) {
++		/* Find a random channel to be switched */
++		num_available_chandefs = intf_awgn_find_channel(iface, NULL, 0,
++								chan_width);
++		if (num_available_chandefs == 0) {
++			wpa_printf(MSG_ERROR, "AWGN: no available_chandefs");
++			return 0;
++		}
++
++		if (os_get_random((u8 *)&_rand, sizeof(_rand)) < 0) {
++			wpa_printf(MSG_ERROR, "AWGN: couldn't get random number");
++			return 0;
++		}
++
++		chan_idx = _rand % num_available_chandefs;
++		intf_awgn_find_channel(iface, &chan_data, chan_idx, chan_width);
++
++		if (!chan_data) {
++			wpa_printf(MSG_ERROR, "AWGN: no random channel found, chan idx : %d",
++				   chan_idx);
++			return 0;
++		}
++
++		if(chan_data->freq == freq) {
++			/* New random channel is same as operating channel
++			 * so choose another channel
++			 */
++			chan_data = NULL;
++			chan_idx = (chan_idx + 1) % num_available_chandefs;
++			intf_awgn_find_channel(iface, &chan_data, chan_idx, chan_width);
++			if (!chan_data) {
++				wpa_printf(MSG_ERROR,
++					   "AWGN: random channel not found, chan idx : %d",
++					   chan_idx);
++				return 0;
++			}
++		}
++
++		wpa_printf(MSG_DEBUG, "AWGN: got random channel %d (%d)",
++			   chan_data->freq, chan_data->chan);
++		new_chan_width = chan_width;
++	} else {
++		/* interference is not present in the primary 20Mhz, so reduce bandwidth*/
++		for (i = 0; i < mode->num_channels; i++) {
++			chan_temp = &mode->channels[i];
++			if (chan_temp->freq == freq)
++				chan_data = chan_temp;
++		}
++		if (!chan_data) {
++			wpa_printf(MSG_ERROR, "AWGN : no channel found");
++			return 0;
++		}
++
++		if ((chan_width > CHAN_WIDTH_80) &&
++		    !(chan_bw_interference_bitmap & SEG_SEC40) &&
++		    !(chan_bw_interference_bitmap & SEG_SEC20))
++			new_chan_width = CHAN_WIDTH_80;
++		else if (chan_width > CHAN_WIDTH_40 &&
++			 !(chan_bw_interference_bitmap & SEG_SEC20))
++			new_chan_width = CHAN_WIDTH_40;
++		else
++			new_chan_width = CHAN_WIDTH_20;
++	}
++
++	if (new_chan_width > CHAN_WIDTH_20) {
++		ret = get_centre_freq_6g(chan_data->chan, new_chan_width,
++					 &new_centre_freq);
++		if (ret) {
++			wpa_printf(MSG_ERROR,
++				   "AWGN : couldn't find centre freq for chan : %d"
++				   " chan_width : %d", chan_data->chan, new_chan_width);
++			return 0;
++		}
++	} else {
++		new_centre_freq = chan_data->freq;
++	}
++
++	os_memset(&settings, 0, sizeof(settings));
++	settings.cs_count = 5;
++	settings.freq_params.freq = chan_data->freq;
++
++	switch (new_chan_width) {
++	case CHAN_WIDTH_40:
++		settings.freq_params.bandwidth = 40;
++		break;
++	case CHAN_WIDTH_80P80:
++	case CHAN_WIDTH_80:
++		settings.freq_params.bandwidth = 80;
++		break;
++	case CHAN_WIDTH_160:
++		settings.freq_params.bandwidth = 160;
++		break;
++	default:
++		settings.freq_params.bandwidth = 20;
++		break;
++	}
++
++	settings.freq_params.center_freq1 = new_centre_freq;
++	settings.freq_params.ht_enabled = iface->conf->ieee80211n;
++	settings.freq_params.vht_enabled = iface->conf->ieee80211ac;
++	settings.freq_params.he_enabled = iface->conf->ieee80211ax;
++
++	for (i = 0; i < iface->num_bss; i++) {
++		/* Save CHAN_SWITCH VHT and HE config */
++		hostapd_chan_switch_config(iface->bss[i],
++					   &settings.freq_params);
++
++		wpa_printf(MSG_DEBUG,
++			   "channel=%u, freq=%d, bw=%d, center_freq1=%d",
++			   settings.freq_params.channel,
++			   settings.freq_params.freq,
++			   settings.freq_params.bandwidth,
++			   settings.freq_params.center_freq1);
++
++		ret = hostapd_switch_channel(iface->bss[i], &settings);
++		if (ret) {
++			/* FIX: What do we do if CSA fails in the middle of
++			 * submitting multi-BSS CSA requests?
++			 */
++			return ret;
++		}
++	}
++
++	return 0;
++}
+--- /dev/null
++++ b/src/ap/interference.h
+@@ -0,0 +1,41 @@
++/*
++ * INTF - Interference
++ * AWGN - Additive white Gaussian Noise
++ * Copyright (c) 2002-2013, Jouni Malinen <j@w1.fi>
++ * Copyright (c) 2013-2017, Qualcomm Atheros, Inc.
++ *
++ * This software may be distributed under the terms of the BSD license.
++ * See README for more details.
++ */
++
++/*
++ * Copyright (c) 2021 Qualcomm Innovation Center, Inc. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without modification,
++ * are permitted (subject to the limitations in the disclaimer below) provided that
++ * the following conditions are met:
++ * * Redistributions of source code must retain the above copyright notice,
++ *   this list of conditions and the following disclaimer.
++ * * Redistributions in binary form must reproduce the above copyright notice,
++ *   this list of conditions and the following disclaimer in the documentation and/or
++ *   other materials provided with the distribution.
++ * * Neither the name of Qualcomm Innovation Center, Inc. nor the names of its contributors
++ *   may be used to endorse or promote products derived from this software without specific
++ *   prior written permission.
++ * NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED BY THIS LICENSE.
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS
++ * OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
++ * AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
++ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
++ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
++ * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++int hostapd_intf_awgn_detected(struct hostapd_iface *iface, int freq,
++			       int chan_width,
++			       int cf1, int cf2,
++			       u32 chan_bw_interference_bitmap);
++
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -5264,6 +5264,7 @@ enum wpa_event_type {
+ 	 * EVENT_CCA_NOTIFY - Notification that CCA has completed
+ 	 */
+ 	EVENT_CCA_NOTIFY,
++	EVENT_AWGN_DETECTED,
+ };
+ 
+ 
+@@ -6173,6 +6174,18 @@ union wpa_event_data {
+ 	struct bss_color_collision {
+ 		u64 bitmap;
+ 	} bss_color_collision;
++
++	/**
++	 * Data for EVENT_AWGN
++	 */
++	struct awgn_event {
++		int freq;
++		enum chan_width chan_width;
++		int cf1;
++		int cf2;
++		u32 chan_bw_interference_bitmap;
++	} awgn_event;
++
+ };
+ 
+ /**
+--- a/src/drivers/driver_common.c
++++ b/src/drivers/driver_common.c
+@@ -95,6 +95,7 @@ const char * event_to_string(enum wpa_ev
+ 	E2S(CCA_STARTED_NOTIFY);
+ 	E2S(CCA_ABORTED_NOTIFY);
+ 	E2S(CCA_NOTIFY);
++	E2S(AWGN_DETECTED);
+ 	}
+ 
+ 	return "UNKNOWN";
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -149,6 +149,7 @@ static const char * nl80211_command_to_s
+ 	C2S(NL80211_CMD_COLOR_CHANGE_ANNOUNCEMENT_STARTED)
+ 	C2S(NL80211_CMD_COLOR_CHANGE_ANNOUNCEMENT_ABORTED)
+ 	C2S(NL80211_CMD_COLOR_CHANGE_ANNOUNCEMENT_COMPLETED)
++	C2S(NL80211_CMD_AWGN_DETECT)
+ 	default:
+ 		return "NL80211_CMD_UNKNOWN";
+ 	}
+@@ -1821,6 +1822,32 @@ static void nl80211_radar_event(struct w
+ 	}
+ }
+ 
++static void nl80211_awgn_event(struct wpa_driver_nl80211_data *drv,
++			       struct nlattr **tb)
++{
++	union wpa_event_data data;
++
++	os_memset(&data, 0, sizeof(data));
++
++	if (tb[NL80211_ATTR_WIPHY_FREQ])
++		data.awgn_event.freq = nla_get_u32(tb[NL80211_ATTR_WIPHY_FREQ]);
++
++	if (tb[NL80211_ATTR_CHANNEL_WIDTH])
++		data.awgn_event.chan_width =
++			convert2width(nla_get_u32(tb[NL80211_ATTR_CHANNEL_WIDTH]));
++
++	if (tb[NL80211_ATTR_CENTER_FREQ1])
++		data.awgn_event.cf1 = nla_get_u32(tb[NL80211_ATTR_CENTER_FREQ1]);
++
++	if (tb[NL80211_ATTR_CENTER_FREQ2])
++		data.awgn_event.cf2 = nla_get_u32(tb[NL80211_ATTR_CENTER_FREQ2]);
++
++	if (tb[NL80211_ATTR_AWGN_INTERFERENCE_BITMAP])
++		data.awgn_event.chan_bw_interference_bitmap =
++			nla_get_u32(tb[NL80211_ATTR_AWGN_INTERFERENCE_BITMAP]);
++
++	wpa_supplicant_event(drv->ctx, EVENT_AWGN_DETECTED, &data);
++}
+ 
+ static void nl80211_spurious_frame(struct i802_bss *bss, struct nlattr **tb,
+ 				   int wds)
+@@ -3077,6 +3104,9 @@ static void do_process_drv_event(struct
+ 		mlme_event_color_change_announcement_completed(drv);
+ 		break;
+ #endif
++	case NL80211_CMD_AWGN_DETECT:
++		nl80211_awgn_event(drv, tb);
++		break;
+ 	default:
+ 		wpa_dbg(drv->ctx, MSG_DEBUG, "nl80211: Ignored unknown event "
+ 			"(cmd=%d)", cmd);
+--- a/src/drivers/nl80211_copy.h
++++ b/src/drivers/nl80211_copy.h
+@@ -1192,6 +1192,9 @@
+  *
+  * @NL80211_CMD_SET_UNSOL_BCAST_PROBE_RESP: Command to set unsolicited
+  *	broadcast probe response transmission parameters.
++ * @NL80211_CMD_AWGN_DETECT: Once AWGN interference is detected on the operating
++ *	channel, userspace is notified with the interference bitmap using
++ *	%NL80211_ATTR_AWGN_INTERFERENCE_BITMAP
+  *
+  * @NL80211_CMD_MAX: highest used command number
+  * @__NL80211_CMD_AFTER_LAST: internal use
+@@ -1437,6 +1440,7 @@ enum nl80211_commands {
+ 	NL80211_CMD_COLOR_CHANGE_ANNOUNCEMENT_ABORTED,
+ 	NL80211_CMD_COLOR_CHANGE_ANNOUNCEMENT_COMPLETED,
+ 
++	NL80211_CMD_AWGN_DETECT,
+ 
+ 	/* add new commands above here */
+ 
+@@ -2612,6 +2616,9 @@ enum nl80211_commands {
+  * 	staggered mode or burst mode in %NL80211_CMD_START_AP from
+  * 	user-space.
+  *
++ * @NL80211_ATTR_AWGN_INTERFERENCE_BITMAP: u32 attribute specifying the
++ *	interference bitmap of operating bandwidth for %NL80211_CMD_AWGN_DETECT
++ *
+  * @NUM_NL80211_ATTR: total number of nl80211_attrs available
+  * @NL80211_ATTR_MAX: highest attribute number currently defined
+  * @__NL80211_ATTR_AFTER_LAST: internal use
+@@ -3127,6 +3134,12 @@ enum nl80211_attrs {
+ 
+ 	NL80211_ATTR_BEACON_TX_MODE,
+ 
++	NL80211_ATTR_WIPHY_ANTENNA_GAIN,
++
++	NL80211_ATTR_STA_MGMT_RTS_CTS_CONFIG,
++
++	NL80211_ATTR_AWGN_INTERFERENCE_BITMAP,
++
+ 	/* add attributes here, update the policy in nl80211.c */
+ 
+ 	__NL80211_ATTR_AFTER_LAST,
+--- a/wpa_supplicant/Makefile
++++ b/wpa_supplicant/Makefile
+@@ -964,6 +964,7 @@ OBJS += ../src/ap/ap_list.o
+ OBJS += ../src/ap/ieee802_11.o
+ OBJS += ../src/ap/hw_features.o
+ OBJS += ../src/ap/dfs.o
++OBJS += ../src/ap/interference.o
+ CFLAGS += -DNEED_AP_MLME
+ endif
+ ifdef CONFIG_WPS
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3536,6 +3536,8 @@ static int hostapd_config_fill(struct ho
+ 		bss->unsol_bcast_probe_resp_interval = val;
+ 	} else if (os_strcmp(buf, "he_co_locate") == 0) {
+ 		conf->he_co_locate = atoi(pos);
++	} else if (os_strcmp(buf, "discard_6g_awgn_event") == 0) {
++		conf->discard_6g_awgn_event = atoi(pos);
+ #endif /* CONFIG_IEEE80211AX */
+ 	} else if (os_strcmp(buf, "max_listen_interval") == 0) {
+ 		bss->max_listen_interval = atoi(pos);
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -277,6 +277,7 @@ struct hostapd_config * hostapd_config_d
+ 	conf->he_6ghz_max_ampdu_len_exp = 7;
+ 	conf->he_6ghz_rx_ant_pat = 1;
+ 	conf->he_6ghz_tx_ant_pat = 1;
++	conf->discard_6g_awgn_event = 0;
+ #endif /* CONFIG_IEEE80211AX */
+ 
+ 	/* The third octet of the country string uses an ASCII space character
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1077,6 +1077,7 @@ struct hostapd_config {
+ 	u8 he_6ghz_rx_ant_pat;
+ 	u8 he_6ghz_tx_ant_pat;
+ 	bool he_co_locate;
++	bool discard_6g_awgn_event;
+ #define AP_TYPE_6GHZ_INDOOR_AP	0
+ #define AP_TYPE_6GHZ_STANDARD_POWER_AP	1
+ #define AP_TYPE_6GHZ_VERY_LOW_POWER_AP	2

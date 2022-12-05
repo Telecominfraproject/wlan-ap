@@ -1,0 +1,335 @@
+From 7e16446ef036631b3b037681caccdc809416acff Mon Sep 17 00:00:00 2001
+From: Rameshkumar Sundaram <quic_ramess@quicinc.com>
+Date: Tue, 19 Apr 2022 00:30:22 +0530
+Subject: [PATCH] hostapd: Disable 6GHz FILS and UBPR for mutli-band AP
+
+WFA test plan 2.0 has specification below:
+3.3.2.1 Out of Box requirements:
+FILS Discovery and Unsolicited Probe Response(UBPR) frames disabled
+in the 6 GHz band if the AP simultaneously operates
+on multiple bands in its out of box configuration.
+
+Also Channel access latency in 6GHz gets impacted by 20-33%
+when there is FILS/UBPR in-band discovery frames.
+Extra transmissions (FILS, UBPRs) are polluting the spectrum
+and increasing the potential to cause interference to the
+incumbent systems operating in the 6GHz band.
+
+Keeping these in-band advertisement frames disabled helps
+to optimize this latency. So, the aim to is to keep
+FILS/UBPR disabled without impacting discoverability.
+Having OOB advertisement in lower band helps to avoid any
+impact in AP discoverability even if FILS/UBPR is
+disabled in 6GHz. So, keep them disabled if OOB is
+ongoing.
+Re-enable in-band discovery with FILS/UBPR frames
+if OOB gets disabled.
+
+A value of 0 in fils discovery max-interval and UBPR
+interval is sent to disable corresponding frame.
+
+Signed-off-by: Rameshkumar Sundaram <quic_ramess@quicinc.com>
+---
+ src/ap/ap_config.h           |  5 ++++
+ src/ap/beacon.c              | 30 +++++++++++++++++--
+ src/ap/hostapd.c             | 70 ++++++++++++++++++++++++++++++++++++++++++--
+ src/ap/ieee802_11.c          | 13 +++-----
+ src/ap/ieee802_11.h          |  8 ++++-
+ src/drivers/driver_nl80211.c | 17 +++++++++--
+ 6 files changed, 126 insertions(+), 17 deletions(-)
+
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index c231a9d..44d6173 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -895,6 +895,11 @@ struct hostapd_bss_config {
+ 	unsigned int unsol_bcast_probe_resp_interval;
+ 	u8 rnr_beacon;
+ 	int beacon_tx_mode;
++	enum {
++		FILS_UBPR_USER_DISABLED,
++		FILS_UBPR_FORCE_DISABLED,
++		FILS_UBPR_ENABLED
++	} fils_state, ubpr_state;
+ };
+ 
+ /**
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index b445976..f480188 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -1244,16 +1244,27 @@ static u8 * hostapd_probe_resp_offloads(struct hostapd_data *hapd,
+ 
+ 
+ #ifdef CONFIG_IEEE80211AX
+-/* Unsolicited broadcast Probe Response transmission, 6 GHz only */
++/* Unsolicited broadcast Probe Response(UBPR) transmission, 6 GHz only */
+ static u8 * hostapd_unsol_bcast_probe_resp(struct hostapd_data *hapd,
+ 					   struct wpa_driver_ap_params *params)
+ {
++	/* Do not enable UBPR in 6GHz AP if colocated with lower band APs */
++	hapd->conf->ubpr_state = FILS_UBPR_USER_DISABLED;
+ 	if (!is_6ghz_op_class(hapd->iconf->op_class))
+ 		return NULL;
+ 
++	if (hapd->conf->unsol_bcast_probe_resp_interval &&
++	    (get_colocation_mode(hapd) == COLOCATED_6GHZ)) {
++		hapd->conf->ubpr_state = FILS_UBPR_FORCE_DISABLED;
++		return NULL;
++	}
++
+ 	params->unsol_bcast_probe_resp_interval =
+ 		hapd->conf->unsol_bcast_probe_resp_interval;
+ 
++	if (params->unsol_bcast_probe_resp_interval)
++		hapd->conf->ubpr_state = FILS_UBPR_ENABLED;
++
+ 	return hostapd_gen_probe_resp(hapd, NULL, 0,
+ 				      &params->unsol_bcast_probe_resp_tmpl_len,
+ 				      NULL, 0);
+@@ -1505,6 +1516,17 @@ static u8 * hostapd_gen_fils_discovery(struct hostapd_data *hapd, size_t *len)
+ static u8 * hostapd_fils_discovery(struct hostapd_data *hapd,
+ 				   struct wpa_driver_ap_params *params)
+ {
++	/* Do not enable Fils discovery for 6GHz AP if its colocated
++	 * with lower band APs.
++	 */
++
++	if (is_6ghz_op_class(hapd->iconf->op_class) &&
++	    get_colocation_mode(hapd) == COLOCATED_6GHZ &&
++	    hapd->conf->fils_discovery_max_int) {
++		hapd->conf->fils_state = FILS_UBPR_FORCE_DISABLED;
++		return NULL;
++	}
++
+ 	params->fd_max_int = hapd->conf->fils_discovery_max_int;
+ 	if (is_6ghz_op_class(hapd->iconf->op_class) &&
+ 	    params->fd_max_int > FD_MAX_INTERVAL_6GHZ)
+@@ -1514,10 +1536,12 @@ static u8 * hostapd_fils_discovery(struct hostapd_data *hapd,
+ 	if (params->fd_min_int > params->fd_max_int)
+ 		params->fd_min_int = params->fd_max_int;
+ 
+-	if (params->fd_max_int)
++	if (params->fd_max_int) {
++		hapd->conf->fils_state = FILS_UBPR_ENABLED;
+ 		return hostapd_gen_fils_discovery(hapd,
+ 						  &params->fd_frame_tmpl_len);
+-
++	}
++	hapd->conf->fils_state = FILS_UBPR_USER_DISABLED;
+ 	return NULL;
+ }
+ 
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index e4217b5..34675a0 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -67,7 +67,8 @@ static void hostapd_interface_setup_failure_handler(void *eloop_ctx,
+ 						    void *timeout_ctx);
+ static void
+ hostapd_switch_color_timeout_handler(void *eloop_data, void *user_ctx);
+-
++static void
++hostapd_interface_update_fils_ubpr(struct hostapd_iface *iface, bool iface_enabled);
+ 
+ int hostapd_for_each_interface(struct hapd_interfaces *interfaces,
+ 			       int (*cb)(struct hostapd_iface *iface,
+@@ -2246,6 +2247,8 @@ dfs_offload:
+ 	for (j = 0; j < iface->num_bss; j++)
+ 		hostapd_neighbor_set_own_report(iface->bss[j]);
+ 
++	hostapd_interface_update_fils_ubpr(iface, true);
++
+ 	return 0;
+ 
+ fail:
+@@ -2477,7 +2480,7 @@ void hostapd_interface_deinit(struct hostapd_iface *iface)
+ 			break;
+ 		hostapd_bss_deinit(iface->bss[j]);
+ 	}
+-
++	hostapd_interface_update_fils_ubpr(iface, false);
+ #ifdef NEED_AP_MLME
+ 	hostapd_stop_setup_timers(iface);
+ 	eloop_cancel_timeout(ap_ht2040_timeout, iface, NULL);
+@@ -2593,6 +2596,68 @@ static int ifname_in_use(struct hapd_interfaces *interfaces, const char *ifname)
+ 	return 0;
+ }
+ 
++/**
++ * hostapd_interface_update_fils_ubpr - Update 6GHz In-band discovery
++ * frames (FILS/UBPR) based on lower band interface state change.
++ * @iface_enabled: Whether lower band AP is enabled or disabled
++ *
++ * This function iterates through interfaces list and updates all 6GHz
++ * APs In-band discovery frames (enable/disable) based on state of lower
++ * band interfaces.
++ * Lower band interfaces going down: Enable FILS/UBPR for all 6GHz APs if config
++ * has it enabled.
++ * Lower band interfaces coming up: Disable FILS/UBPR for all 6GHz APs if not done
++ * already.
++ */
++
++static void
++hostapd_interface_update_fils_ubpr(struct hostapd_iface *iface, bool iface_enabled)
++{
++	int i, j;
++
++	if (!iface || (iface->interfaces == NULL))
++		return;
++
++#ifdef CONFIG_MESH
++	if (iface->mconf != NULL)
++		return;
++#endif
++
++	if (is_6ghz_op_class(iface->conf->op_class))
++		return;
++
++	for (i = 0; i < iface->interfaces->count; i++) {
++		struct hostapd_iface *iface_6g = iface->interfaces->iface[i];
++		if (iface == iface_6g || !iface_6g || !iface_6g->conf)
++			continue;
++
++		if (!is_6ghz_op_class(iface_6g->conf->op_class))
++			continue;
++
++		for (j = 0; j < iface_6g->num_bss; j++) {
++			if (!iface_6g->bss[j] || !iface_6g->bss[j]->started)
++				continue;
++
++			/* Lower band interface coming up but fils/ubpr is already disabled */
++			if (iface_enabled &&
++			    (iface_6g->bss[j]->conf->fils_state != FILS_UBPR_ENABLED &&
++			    iface_6g->bss[j]->conf->ubpr_state != FILS_UBPR_ENABLED)) {
++				continue;
++			}
++			/* Lower band interface going down but fils/ubpr is not force disabled */
++			if (!iface_enabled &&
++			    (iface_6g->bss[j]->conf->fils_state != FILS_UBPR_FORCE_DISABLED &&
++			    iface_6g->bss[j]->conf->ubpr_state != FILS_UBPR_FORCE_DISABLED)) {
++				continue;
++			}
++			wpa_printf(MSG_DEBUG, "%s Interface getting %s, check and set 6GHz Interface(%s)"
++				   "In-band discovery frames", iface->bss[0]->conf->iface,
++				   iface_enabled ? "enabled" : "disabled", iface_6g->bss[j]->conf->iface);
++			ieee802_11_set_beacon(iface_6g->bss[j]);
++		}
++	}
++	return;
++}
+ 
+ /**
+  * hostapd_interface_init_bss - Read configuration file and init BSS data
+@@ -2872,6 +2937,7 @@ int hostapd_disable_iface(struct hostapd_iface *hapd_iface)
+ 	wpa_printf(MSG_DEBUG, "Interface %s disabled",
+ 		   hapd_iface->bss[0]->conf->iface);
+ 	hostapd_set_state(hapd_iface, HAPD_IFACE_DISABLED);
++	hostapd_interface_update_fils_ubpr(hapd_iface, false);
+ 	return 0;
+ }
+ 
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index c835164..74119f1 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -89,13 +89,6 @@ static void handle_auth(struct hostapd_data *hapd,
+ 			int rssi, int from_queue,
+ 			struct hostapd_frame_info *fi);
+ 
+-enum colocation_mode {
+-	NO_COLOCATED_6GHZ,
+-	STANDALONE_6GHZ,
+-	COLOCATED_6GHZ,
+-	COLOCATED_LOWER_BAND,
+-};
+-
+ static size_t hostapd_eid_rnr_iface_len(struct hostapd_data *hapd,
+ 				 struct hostapd_data *reporting_hapd,
+ 				 size_t *current_len,
+@@ -108,7 +101,6 @@ static u8 * hostapd_eid_rnr_colocation(struct hostapd_data *hapd, u8 *eid,
+ 				       size_t *current_len);
+ static u8 * hostapd_eid_neighbor_report_db(struct hostapd_data *hapd, u8 *eid,
+ 					   size_t *current_len);
+-static enum colocation_mode get_colocation_mode(struct hostapd_data *hapd);
+ 
+ u8 * hostapd_eid_multi_ap(struct hostapd_data *hapd, u8 *eid)
+ {
+@@ -7640,7 +7632,7 @@ static size_t hostapd_eid_neighbor_report_db_len(struct hostapd_data *hapd,
+ }
+ 
+ 
+-static enum colocation_mode get_colocation_mode(struct hostapd_data *hapd)
++enum colocation_mode get_colocation_mode(struct hostapd_data *hapd)
+ {
+ 	u8 i;
+ 	bool is_6ghz = is_6ghz_op_class(hapd->iconf->op_class);
+@@ -7659,6 +7651,9 @@ static enum colocation_mode get_colocation_mode(struct hostapd_data *hapd)
+ 		if (iface == hapd->iface || !iface || !iface->conf)
+ 			continue;
+ 
++		if (iface->state == HAPD_IFACE_DISABLED)
++			continue;
++
+ 		is_colocated_6ghz = is_6ghz_op_class(iface->conf->op_class);
+ 		if (!is_6ghz && is_colocated_6ghz)
+ 			return COLOCATED_LOWER_BAND;
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index e8ce776..5eb02c3 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -19,7 +19,13 @@ struct ieee80211_mgmt;
+ struct radius_sta;
+ enum ieee80211_op_mode;
+ struct mac_acl_entry;
+-
++enum colocation_mode {
++        NO_COLOCATED_6GHZ,
++        STANDALONE_6GHZ,
++        COLOCATED_6GHZ,
++        COLOCATED_LOWER_BAND,
++};
++enum colocation_mode get_colocation_mode(struct hostapd_data *hapd);
+ int ieee802_11_mgmt(struct hostapd_data *hapd, const u8 *buf, size_t len,
+ 		    struct hostapd_frame_info *fi);
+ void ieee802_11_mgmt_cb(struct hostapd_data *hapd, const u8 *buf, size_t len,
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index b68352f..7251f2e 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -4389,8 +4389,15 @@ static int nl80211_fils_discovery(struct i802_bss *bss,
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+ 	struct nl_msg *msg;
+ 
+-	if (!params->fd_max_int)
++	if (!bss->drv->fils_discovery) {
++		if (params->fd_max_int) {
++			wpa_printf(MSG_ERROR,
++				   "nl80211: Driver does not support FILS Discovery frame transmission for %s",
++				   bss->ifname);
++			return -1;
++		}
+ 		return 0;
++	}
+ 
+ 	wpa_printf(MSG_DEBUG,
+ 		   "nl80211: FILS discovery maximum interval=%u, minimum interval=%u",
+@@ -4443,8 +4450,14 @@ static int nl80211_unsol_bcast_probe_resp(struct i802_bss *bss,
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+ 	struct nl_msg *msg;
+ 
+-	if (!params->unsol_bcast_probe_resp_interval)
++	if (!bss->drv->unsol_bcast_probe_resp) {
++		if (params->unsol_bcast_probe_resp_interval) {
++			wpa_printf(MSG_ERROR,
++		"nl80211: Driver does not support unsolicited broadcast Probe Response frame transmission for %s", bss->ifname);
++			return -1;
++		}
+ 		return 0;
++	}
+ 
+ 	wpa_printf(MSG_DEBUG,
+ 		   "nl80211: Unsolicited broadcast probe response interval=%u",
+-- 
+2.7.4
+

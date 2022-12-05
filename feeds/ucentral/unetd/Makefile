@@ -36,7 +36,10 @@ define Package/unetd
   SECTION:=utils
   CATEGORY:=Base system
   TITLE:=OpenWrt wireguard overlay network configuration service
-  DEPENDS:=+libubox +libubus +libblobmsg-json +libnl-tiny +libunet +libbpf $(BPF_DEPENDS) +TARGET_ipq807x:kmod-wireguard-backport +!TARGET_ipq807x:kmod-wireguard +wireguard-tools
+  DEPENDS:=+libubox +libubus +libblobmsg-json +libnl-tiny +libunet +libbpf $(BPF_DEPENDS) \
+  	+TARGET_ipq807x:kmod-wireguard-backport +!TARGET_ipq807x:kmod-wireguard \
+  	+TARGET_ipq60xx:kmod-wireguard-backport +!TARGET_ipq60xx:kmod-wireguard \
+	+wireguard-tools
 endef
 
 TARGET_CFLAGS += \
@@ -70,5 +73,5 @@ define Package/unetd/install
 	$(INSTALL_BIN) ./files/unetd.sh $(1)/lib/netifd/proto
 endef
 
-$(eval $(call BuildPackage,libunet))
-$(eval $(call BuildPackage,unetd))
+#$(eval $(call BuildPackage,libunet))
+#$(eval $(call BuildPackage,unetd))
