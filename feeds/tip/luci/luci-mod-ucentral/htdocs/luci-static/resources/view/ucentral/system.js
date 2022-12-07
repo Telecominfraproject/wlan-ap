@@ -20,7 +20,6 @@ var callReboot = rpc.declare({
 	expect: { result: 0 }
 });
 
-
 var mapdata = { actions: {}, config: {} };
 
 return view.extend({
@@ -43,6 +42,26 @@ return view.extend({
 		fs.exec('/sbin/firstboot', [ '-r', '-y' ]);
 
 		ui.awaitReconnect('192.168.1.1', 'openwrt.lan');
+	},
+
+	handleDiagnostics: function(ev) {
+		return fs.exec('/sbin/diagnostic-bundle').then(function(result) {
+			var form = E('form', {
+				method: 'post',
+				action: L.env.cgi_base + '/cgi-download',
+				enctype: 'application/x-www-form-urlencoded'
+			}, [
+				E('input', { 'type': 'hidden', 'name': 'sessionid', 'value': L.env.sessionid }),
+				E('input', { 'type': 'hidden', 'name': 'path',      'value': '/tmp/bundle.maverick.tar.gz' }),
+				E('input', { 'type': 'hidden', 'name': 'filename',  'value': 'bundle.maverick.tar.gz' }),
+				E('input', { 'type': 'hidden', 'name': 'mimetype',  'value': 'application/gzip' })
+			]);
+
+			document.body.appendChild(form);
+
+			form.submit();
+			form.parentNode.removeChild(form);
+		});
 	},
 
 	handleSysupgrade: function(ev) {
@@ -170,6 +189,16 @@ return view.extend({
 		o.inputstyle = 'action important';
 		o.inputtitle = _('Flash image…');
 		o.onclick = L.bind(this.handleSysupgrade, this);
+
+		o = s.option(form.SectionValue, 'actions', form.NamedSection, 'actions', 'actions', _('Diagnostic bundle'),
+			_('Download the default diagnostic bundle from the AP.'));
+
+		ss = o.subsection;
+
+		o = ss.option(form.Button, 'Diagnostic');
+		o.inputstyle = 'action important';
+		o.inputtitle = _('Download Diagnostics');
+		o.onclick = L.bind(this.handleDiagnostics, this);
 
 
 		return m.render();
