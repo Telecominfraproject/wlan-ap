@@ -90,7 +90,7 @@ function radius_acct(mac, payload) {
 	payload.input_gigawords = state.bytes_ul >> 32;
 	payload.output_packets = state.packets_dl;
 	payload.input_packets = state.packets_ul;
-	if (state.data?.radius?.reply.Class)
+	if (state.data?.radius?.reply?.Class)
 		payload.class = state.data.radius.reply.Class;
 
 	radius_call(mac, payload);
@@ -241,10 +241,11 @@ uloop.timer(1000, function() {
 			continue;
 		}
 
-		if (v.idle > get_idle_timeout(k)) {
+		if (list[k].idle > get_idle_timeout(k)) {
 			if (clients[k])
 				radius_idle_time(k);
 			client_remove(k, 'idle event');
+			continue;
 		}
 		let timeout = get_session_timeout(k);
 		if (timeout && ((t - list[k].data.connect) > timeout)) {
