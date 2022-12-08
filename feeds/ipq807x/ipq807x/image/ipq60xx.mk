@@ -185,3 +185,13 @@ define Device/meshpp_s618_cp01
   DEVICE_PACKAGES := ath11k-wifi-meshpp-s618 -kmod-usb-dwc3-of-simple kmod-usb-dwc3-qcom kmod-usb3
 endef
 TARGET_DEVICES += meshpp_s618_cp01
+
+define Device/yuncore_fap650
+  DEVICE_TITLE := YunCore FAP 650
+  DEVICE_DTS := qcom-ipq6018-yuncore-fap650
+  SUPPORTED_DEVICES := yuncore,fap650
+  DEVICE_DTS_CONFIG := config@cp03-c1
+  DEVICE_PACKAGES := ath11k-wifi-yuncore-fap650
+endef
+TARGET_DEVICES += yuncore_fap650
+
