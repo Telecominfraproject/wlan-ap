@@ -62,14 +62,6 @@ function radius_stop(mac) {
 	debug(mac, 'stopping accounting');
 	if (clients[mac].accounting)
 		clients[mac].timeout.cancel();
-
-	let payload = {
-		acct: true,
-		acct_type: 8,
-		terminate_cause: 0,
-	};
-	radius_init(mac, payload);
-	radius_call(mac, payload);
 }
 
 function radius_acct(mac, payload) {
@@ -122,7 +114,7 @@ function radius_logoff(mac) {
 		return;
 	let payload = {
 		acct_type: 2,
-		terminate_cause: 0,
+		terminate_cause: 1,
 	};
 	radius_acct(mac, payload);
 }
