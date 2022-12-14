@@ -301,6 +301,7 @@ hostapd_common_add_bss_config() {
 
 	config_add_string nasid
 	config_add_string ownip
+	config_add_string detect_local_ip
 	config_add_string radius_client_addr
 	config_add_string iapp_interface
 	config_add_string eap_type ca_cert client_cert identity anonymous_identity auth priv_key priv_key_pwd
@@ -555,7 +556,8 @@ append_radius_server() {
 		ownip radius_client_addr \
 		eap_reauth_period request_cui \
 		erp_domain mobility_domain \
-		fils_realm fils_dhcp
+		fils_realm fils_dhcp \
+		detect_local_ip
 
 	# legacy compatibility
 	[ -n "$auth_server" ] || json_get_var auth_server server
@@ -605,6 +607,9 @@ append_radius_server() {
 	}
 	json_for_each_item append_radius_auth_req_attr radius_auth_req_attr
 
+	if [ 0$detect_local_ip -eq 1 ]; then
+		ownip=`/sbin/ip -o -4 addr list $network_ifname | awk '{print $4}' | cut -d/ -f1`
+	fi
 	[ -n "$ownip" ] && append bss_conf "own_ip_addr=$ownip" "$N"
 	[ -n "$radius_client_addr" ] && append bss_conf "radius_client_addr=$radius_client_addr" "$N"
 	[ "$macfilter" = radius ] && append bss_conf "macaddr_acl=2" "$N"
