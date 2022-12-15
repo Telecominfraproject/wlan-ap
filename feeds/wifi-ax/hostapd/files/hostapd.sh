@@ -552,10 +552,12 @@ append_radius_server() {
 	json_get_vars \
 		auth_server auth_secret auth_port \
 		dae_client dae_secret dae_port \
-		ownip radius_client_addr \
+		dynamic_ownip ownip radius_client_addr \
 		eap_reauth_period request_cui \
 		erp_domain mobility_domain \
 		fils_realm fils_dhcp
+
+	set_default dynamic_ownip 1
 
 	# legacy compatibility
 	[ -n "$auth_server" ] || json_get_var auth_server server
@@ -605,7 +607,12 @@ append_radius_server() {
 	}
 	json_for_each_item append_radius_auth_req_attr radius_auth_req_attr
 
-	[ -n "$ownip" ] && append bss_conf "own_ip_addr=$ownip" "$N"
+	if [ -n "$ownip" ]; then
+		append bss_conf "own_ip_addr=$ownip" "$N"
+	elif [ "$dynamic_ownip" -gt 0 ]; then
+		append bss_conf "dynamic_own_ip_addr=$dynamic_ownip" "$N"
+	fi
+
 	[ -n "$radius_client_addr" ] && append bss_conf "radius_client_addr=$radius_client_addr" "$N"
 	[ "$macfilter" = radius ] && append bss_conf "macaddr_acl=2" "$N"
 }
