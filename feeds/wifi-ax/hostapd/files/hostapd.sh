@@ -552,10 +552,12 @@ append_radius_server() {
 	json_get_vars \
 		auth_server auth_secret auth_port \
 		dae_client dae_secret dae_port \
-		ownip radius_client_addr \
+		dynamic_ownip ownip radius_client_addr \
 		eap_reauth_period request_cui \
 		erp_domain mobility_domain \
 		fils_realm fils_dhcp
+
+	set_default dynamic_ownip 1
 
 	# legacy compatibility
 	[ -n "$auth_server" ] || json_get_var auth_server server
@@ -605,7 +607,12 @@ append_radius_server() {
 	}
 	json_for_each_item append_radius_auth_req_attr radius_auth_req_attr
 
-	[ -n "$ownip" ] && append bss_conf "own_ip_addr=$ownip" "$N"
+	if [ -n "$ownip" ]; then
+		append bss_conf "own_ip_addr=$ownip" "$N"
+	elif [ "$dynamic_ownip" -gt 0 ]; then
+		append bss_conf "dynamic_own_ip_addr=$dynamic_ownip" "$N"
+	fi
+
 	[ -n "$radius_client_addr" ] && append bss_conf "radius_client_addr=$radius_client_addr" "$N"
 	[ "$macfilter" = radius ] && append bss_conf "macaddr_acl=2" "$N"
 }
@@ -698,7 +705,9 @@ hostapd_set_bss_options() {
 		[ -n "$wpa_strict_rekey" ] && append bss_conf "wpa_strict_rekey=$wpa_strict_rekey" "$N"
 	}
 
-	[ -n "$nasid" ] && append bss_conf "nas_identifier=$nasid" "$N"
+	set_default nasid "${macaddr//\:}"
+	append bss_conf "nas_identifier=$nasid" "$N"
+
 	[ -n "$acct_server" ] && {
 		append bss_conf "acct_server_addr=$acct_server" "$N"
 		append bss_conf "acct_server_port=$acct_port" "$N"
@@ -916,7 +925,6 @@ hostapd_set_bss_options() {
 			append bss_conf "ft_psk_generate_local=$ft_psk_generate_local" "$N"
 			append bss_conf "ft_over_ds=$ft_over_ds" "$N"
 			append bss_conf "reassociation_deadline=$reassociation_deadline" "$N"
-			[ -n "$nasid" ] || append bss_conf "nas_identifier=${macaddr//\:}" "$N"
 
 			if [ "$skip_kh_setup" -eq "0" ]; then
 				json_get_vars r0_key_lifetime r1_key_holder pmk_r1_push

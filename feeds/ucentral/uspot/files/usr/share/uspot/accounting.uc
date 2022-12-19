@@ -56,20 +56,15 @@ function radius_call(mac, payload) {
 	system('/usr/bin/radius-client /tmp/acct' + mac + '.json');
 }
 
-function radius_stop(mac) {
+function radius_stop(mac, payload) {
 	if (!radius_available(mac))
 		return;
 	debug(mac, 'stopping accounting');
+	ubus.call('spotfilter', 'client_set', payload);
+	system('conntrack -D -s ' + clients[mac].ip4addr  + ' -m 2');
 	if (clients[mac].accounting)
 		clients[mac].timeout.cancel();
-
-	let payload = {
-		acct: true,
-		acct_type: 8,
-		terminate_cause: 0,
-	};
-	radius_init(mac, payload);
-	radius_call(mac, payload);
+	delete clients[mac];
 }
 
 function radius_acct(mac, payload) {
@@ -122,7 +117,7 @@ function radius_logoff(mac) {
 		return;
 	let payload = {
 		acct_type: 2,
-		terminate_cause: 0,
+		terminate_cause: 1,
 	};
 	radius_acct(mac, payload);
 }
@@ -174,6 +169,10 @@ function client_add(mac, state) {
 		idle,
 		max_total,
 	};
+	if (state.ip4addr)
+		clients[mac].ip4addr = state.ip4addr;
+	if (state.ip6addr)
+		clients[mac].ip6addr = state.ip6addr;
 	if (state.data?.radius?.request)
 		clients[mac].radius= state.data.radius.request;
 	syslog(mac, 'adding client');
@@ -183,39 +182,34 @@ function client_add(mac, state) {
 
 function client_remove(mac, reason) {
 	syslog(mac, reason);
-	radius_stop(mac);
-	delete clients[mac];
-	ubus.call('spotfilter', 'client_remove', {
-			interface: "hotspot",
-			address: mac
-		});
+	radius_stop(mac, {
+		interface: "hotspot",
+		address: mac
+	});
 }
 
 function client_flush(mac) {
 	syslog(mac, 'logoff event');
-	radius_stop(mac);
-	ubus.call('spotfilter', 'client_set', {
-			interface: 'hotspot',
-			address: mac,
-			state: 0,
-			dns_state: 1,
-			accounting: [],
-			flush: true
-		});
+	radius_stop(mac, {
+		interface: 'hotspot',
+		address: mac,
+		state: 0,
+		dns_state: 1,
+		accounting: [],
+		flush: true
+	});
 }
 
 function client_timeout(mac, reason) {
 	syslog(mac, reason);
-	radius_stop(mac);
-	delete clients[mac];
-	ubus.call('spotfilter', 'client_set', {
-			interface: "hotspot",
-			state: 0,
-			dns_state: 1,
-			address: mac,
-			accounting: [],
-			flush: true,
-		});
+	radius_stop(mac, {
+		interface: "hotspot",
+		state: 0,
+		dns_state: 1,
+		address: mac,
+		accounting: [],
+		flush: true,
+	});
 }
 
 uloop.init();
