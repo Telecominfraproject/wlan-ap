@@ -3,7 +3,7 @@
 case $2 in
 AP-STA-CONNECTED)
 	[ $4 = 0 -o $5 = 0 ] && {
-		ubus call ratelimit client_set '{"device": "'$1'", "address": "'$3'", "defaults": "'$(ubus call wifi iface | jsonfilter -e "@.$1.ssid")'" }'
+		ubus call ratelimit client_set '{"device": "'$1'", "address": "'$3'", "defaults": "'$(ubus call wifi iface | jsonfilter -e "@['$1'].ssid")'" }'
 		logger ratelimit addclient $1 $3 $ssid
 		return
 	}
