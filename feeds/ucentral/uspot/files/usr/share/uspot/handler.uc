@@ -19,6 +19,19 @@ function request_start(ctx) {
 		include('radius.uc', ctx);
 		return;
 	case 'uam':
+		if (portal.config?.uam.mac_auth) {
+			let payload = portal.radius_init(ctx);
+			payload.username = ctx.format_mac;
+			payload.password = ctx.format_mac;
+			payload.service_type = 2;
+		        let radius = portal.radius_call(ctx, payload);
+			if (radius['access-accept']) {
+				if (portal.config.uam.final_redirect_url == 'uam')
+					ctx.query_string.userurl = portal.uam_url(ctx, 'success');
+				portal.allow_client(ctx, { radius: { reply: radius.reply, request: payload } } );
+				return;
+			}
+		}
 		ctx.redir_location = portal.uam_url(ctx, 'notyet');
 		include('redir.uc', ctx);
 		return;
