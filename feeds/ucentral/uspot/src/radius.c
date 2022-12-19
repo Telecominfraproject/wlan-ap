@@ -33,6 +33,7 @@ enum {
         RADIUS_OUTPUT_PACKETS,
         RADIUS_LOGOFF_URL,
         RADIUS_CLASS,
+        RADIUS_SERVICE_TYPE,
         __RADIUS_MAX,
 };
 
@@ -61,6 +62,7 @@ static const struct blobmsg_policy radius_policy[__RADIUS_MAX] = {
         [RADIUS_OUTPUT_PACKETS] = { .name = "output_packets", .type = BLOBMSG_TYPE_INT32 },
         [RADIUS_LOGOFF_URL] = { .name = "logoff_url", .type = BLOBMSG_TYPE_STRING },
         [RADIUS_CLASS] = { .name = "class", .type = BLOBMSG_TYPE_STRING },
+        [RADIUS_SERVICE_TYPE] = { .name = "service_type", .type = BLOBMSG_TYPE_INT32 },
 };
 
 static struct blob_buf b = {};
@@ -138,7 +140,7 @@ radius(void)
 		rc_add_config(rh, "acctserver", blobmsg_get_string(tb[RADIUS_ACCT_SERVER]), "code", __LINE__);
 	rc_add_config(rh, "servers", "/tmp/radius.servers", "code", __LINE__);
 	rc_add_config(rh, "dictionary", "/etc/radcli/dictionary", "code", __LINE__);
-	rc_add_config(rh, "radius_timeout", "2", "code", __LINE__);
+	rc_add_config(rh, "radius_timeout", "5", "code", __LINE__);
 	rc_add_config(rh, "radius_retries", "1", "code", __LINE__);
 	rc_add_config(rh, "bindaddr", "*", "code", __LINE__);
 
@@ -250,6 +252,12 @@ radius(void)
 	if (tb[RADIUS_OUTPUT_PACKETS]) {
 		val = blobmsg_get_u32(tb[RADIUS_OUTPUT_PACKETS]);
 		if (rc_avpair_add(rh, &send, PW_ACCT_OUTPUT_PACKETS, &val, 4, 0) == NULL)
+			return result(rh, 0, NULL);
+	}
+
+	if (tb[RADIUS_SERVICE_TYPE]) {
+		val = blobmsg_get_u32(tb[RADIUS_SERVICE_TYPE]);
+		if (rc_avpair_add(rh, &send, PW_SERVICE_TYPE, &val, 4, 0) == NULL)
 			return result(rh, 0, NULL);
 	}
 
