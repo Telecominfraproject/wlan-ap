@@ -1,32 +1,5 @@
 KERNEL_LOADADDR := 0x41080000
 
-define Device/qcom_hk01
-  DEVICE_TITLE := Qualcomm Hawkeye HK01
-  DEVICE_DTS := qcom-ipq807x-hk01
-  DEVICE_DTS_CONFIG=config@hk01
-  SUPPORTED_DEVICES := qcom,ipq807x-hk01
-  DEVICE_PACKAGES := ath11k-wifi-qcom-ipq8074
-endef
-#TARGET_DEVICES += qcom_hk01
-
-define Device/qcom_hk14
-  DEVICE_TITLE := Qualcomm Hawkeye HK14
-  DEVICE_DTS := qcom-ipq807x-hk14
-  DEVICE_DTS_CONFIG=config@hk14
-  SUPPORTED_DEVICES := qcom,ipq807x-hk14
-  DEVICE_PACKAGES := ath11k-wifi-qcom-ipq8074 kmod-ath11k-pci ath11k-firmware-qcn9000
-endef
-#TARGET_DEVICES += qcom_hk14
-
-define Device/cig_wf194
-  DEVICE_TITLE := CIG WF194C
-  DEVICE_DTS := qcom-ipq807x-wf194c
-  DEVICE_DTS_CONFIG=config@hk01
-  SUPPORTED_DEVICES := cig,wf194c
-  DEVICE_PACKAGES := ath11k-wifi-cig-wf194c aq-fw-download uboot-envtools kmod-usb3 kmod-usb2
-endef
-#TARGET_DEVICES += cig_wf194
-
 define Device/cig_wf194c4
   DEVICE_TITLE := CIG WF194C4
   DEVICE_DTS := qcom-ipq807x-wf194c4

@@ -23,7 +23,7 @@ endef
 define Package/qca-nss-fw-ipq807x
 $(Package/qca-nss-fw-default)
   TITLE:=NSS firmware for IPQ807x devices
-  DEPENDS:=@TARGET_ipq807x_ipq807x
+  DEPENDS:=@TARGET_ipq807x
 endef
 
 define Package/qca-nss-fw-ipq50xx

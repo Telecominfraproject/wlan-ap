@@ -7,6 +7,7 @@ PKG_SOURCE_PROTO:=git
 PKG_BRANCH:=master
 PKG_RELEASE:=1
 PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-ssdk
+PKG_MIRROR_HASH:=3be4158fc80540c8dcb2d844110205685fa81c935fdd2268aee72b04d34d7c1f
 PKG_VERSION:=775e4dc814580012e1019f53ff5cdb8968ed4ca8
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
