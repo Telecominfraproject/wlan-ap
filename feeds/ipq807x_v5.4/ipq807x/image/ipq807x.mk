@@ -50,7 +50,7 @@ define Device/tplink_ex227
   IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
   IMAGE/nand-factory.ubi := append-ubi
 endef
-#TARGET_DEVICES += tplink_ex227
+TARGET_DEVICES += tplink_ex227
 
 define Device/tplink_ex447
   DEVICE_TITLE := TP-Link EX447
@@ -63,4 +63,4 @@ define Device/tplink_ex447
   IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
   IMAGE/nand-factory.ubi := append-ubi
 endef
-#TARGET_DEVICES += tplink_ex447
+TARGET_DEVICES += tplink_ex447

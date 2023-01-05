@@ -17,13 +17,13 @@ endef
 define Package/ath11k-firmware-ipq50xx
 $(Package/ath11k-firmware-default)
   TITLE:=ath11k firmware for IPQ50xx devices
-  DEPENDS:=@TARGET_ipq807x_ipq50xx
+  DEPENDS:=@TARGET_ipq50xx
 endef
 
 define Package/ath11k-firmware-ipq50xx-spruce
 $(Package/ath11k-firmware-default)
   TITLE:=ath11k firmware for IPQ50xx devices with spruce
-  DEPENDS:=@TARGET_ipq807x_ipq50xx
+  DEPENDS:=@TARGET_ipq50xx
 endef
 
 define Package/ath11k-firmware-ipq60xx
@@ -41,7 +41,7 @@ endef
 define Package/ath11k-firmware-qcn6122
 $(Package/ath11k-firmware-default)
   TITLE:=ath11k firmware for QCN6122 devices
-  DEPENDS:=@TARGET_ipq807x_ipq50xx
+  DEPENDS:=@TARGET_ipq50xx
 endef
 
 define Package/ath11k-firmware-qcn9000

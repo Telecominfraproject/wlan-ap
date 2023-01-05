@@ -56,7 +56,7 @@ define Package/ath11k-wifi-default
   SUBMENU:=ath11k Board-Specific Overrides
   SECTION:=firmware
   CATEGORY:=Firmware
-  DEPENDS:=@TARGET_ipq807x||TARGET_ipq60xx
+  DEPENDS:=@TARGET_ipq807x||TARGET_ipq60xx||TARGET_ipq50xx
   TITLE:=Custom Board
 endef
 
@@ -103,6 +103,11 @@ endef
 define Package/ath11k-wifi-motorola-q14
 $(call Package/ath11k-wifi-default)
     TITLE:=motorola q14 bdf
+endef
+
+define Package/ath11k-wifi-edgecore-oap101
+$(call Package/ath11k-wifi-default)
+    TITLE:=edgecore-oap101 bdf
 endef
 
 define Package/ath11k-wifi-plasmacloud-pax1800
@@ -219,6 +224,13 @@ define Package/ath11k-wifi-motorola-q14/install
 	$(INSTALL_DATA) ./board-2-motorol-q14.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board-2.bin
 endef
 
+define Package/ath11k-wifi-edgecore-oap101/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-edgecore-oap101.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-2-edgecore-oap101.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board-2.bin
+endef
+
 define Package/ath11k-wifi-plasmacloud-pax1800/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
 	$(INSTALL_DATA) ./board-plasmacloud-pax1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
@@ -265,4 +277,5 @@ $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq6018))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-qcn9000))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g))
 $(eval $(call BuildPackage,ath11k-wifi-motorola-q14))
+$(eval $(call BuildPackage,ath11k-wifi-edgecore-oap101))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi))
