@@ -34,7 +34,7 @@ define Device/edgecore_eap101
   DEVICE_DTS := qcom-ipq6018-edgecore-eap101
   DEVICE_DTS_CONFIG := config@cp01-c1
   SUPPORTED_DEVICES := edgecore,eap101
-  DEVICE_PACKAGES := ath11k-wifi-edgecore-eap101 uboot-envtools -kmod-usb-dwc3-of-simple kmod-usb-dwc3-qcom kmod-usb3 kmod-usb2
+  DEVICE_PACKAGES := ath11k-wifi-edgecore-eap101 uboot-envtools -kmod-usb-dwc3-of-simple kmod-usb-dwc3-qcom kmod-usb3 kmod-usb2 kmod-tpm-tis-spi
 endef
 TARGET_DEVICES += edgecore_eap101
 
