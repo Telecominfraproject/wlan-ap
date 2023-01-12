@@ -23,11 +23,6 @@ define Package/ucentral-client
 	   +libubox +libwebsockets-openssl +libblobmsg-json +libubus
 endef
 
-define Package/ucentral-client/conffiles
-/etc/ucentral/
-/etc/config-shadow/
-endef
-
 define Package/ucentral-client/install
 	$(INSTALL_DIR) $(1)/usr/sbin/
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/ucentral $(1)/usr/sbin/
