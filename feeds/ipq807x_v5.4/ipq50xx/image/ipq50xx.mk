@@ -27,15 +27,6 @@ define Device/edgecore_oap101_6e
 endef
 TARGET_DEVICES += edgecore_oap101_6e
 
-define Device/liteon_wpx8324
-  DEVICE_TITLE := Liteon WPX8324
-  DEVICE_DTS := qcom-ipq5018-liteon-wpx8324
-  SUPPORTED_DEVICES := liteon,wpx8324
-  DEVICE_PACKAGES := ath11k-wifi-liteon-wpx8324 ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
-  DEVICE_DTS_CONFIG := config@mp03.5-c1
-endef
-#TARGET_DEVICES += liteon_wpx8324
-
 define Device/muxi_ap3220l
   DEVICE_TITLE := MUXI AP3220L
   DEVICE_DTS := qcom-ipq5018-muxi-ap3220l
