@@ -76,6 +76,8 @@ platform_check_image() {
 	wallys,dr6018-v4|\
 	edgecore,eap101|\
 	hfcl,ion4xi|\
+	hfcl,ion4x|\
+	hfcl,ion4x_2|\
 	hfcl,ion4xe|\
 	yuncore,ax840|\
 	yuncore,fap650)
@@ -102,6 +104,8 @@ platform_do_upgrade() {
 		nand_upgrade_tar "$1"
 		;;
 	hfcl,ion4xi|\
+	hfcl,ion4x|\
+	hfcl,ion4x_2|\
 	hfcl,ion4xe)
 		if grep -q rootfs_1 /proc/cmdline; then
 			CI_UBIPART="rootfs"
