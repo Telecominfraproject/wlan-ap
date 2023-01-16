@@ -216,7 +216,7 @@ return {
 				interface: 'hotspot',
 				address: ctx.mac,
 				data: {
-					ssid: hapd.ssid || 'unknown'
+					ssid: hapd?.ssid || 'unknown'
 				}
 			});
 			connected.data.ssid = hapd.ssid;
