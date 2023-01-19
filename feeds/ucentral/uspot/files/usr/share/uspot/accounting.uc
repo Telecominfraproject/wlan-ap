@@ -27,13 +27,13 @@ function debug(mac, msg) {
 
 function get_idle_timeout(mac) {
 	if (clients[mac])
-		return clients[mac].idle;
+		return +clients[mac].idle;
 	return idle_timeout;
 }
 
 function get_session_timeout(mac) {
 	if (clients[mac]?.session)
-		return clients[mac].session;
+		return +clients[mac].session;
 	return session_timeout;
 }
 
@@ -45,6 +45,10 @@ function radius_init(mac, payload) {
 	for (let key in [ 'server', 'acct_server', 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_id', 'username' ])
 		if (clients[mac].radius[key])
 			payload[key] = clients[mac].radius[key];
+
+	if (config.radius?.acct_proxy)
+		payload.acct_proxy = config.radius.acct_proxy;
+
 	return payload;
 }
 
@@ -56,11 +60,11 @@ function radius_call(mac, payload) {
 	system('/usr/bin/radius-client /tmp/acct' + mac + '.json');
 }
 
-function radius_stop(mac, payload) {
+function radius_stop(mac, payload, remove) {
 	if (!radius_available(mac))
 		return;
 	debug(mac, 'stopping accounting');
-	ubus.call('spotfilter', 'client_set', payload);
+	ubus.call('spotfilter', client_remove ? 'client_remove' : 'client_set', payload);
 	system('conntrack -D -s ' + clients[mac].ip4addr  + ' -m 2');
 	if (clients[mac].accounting)
 		clients[mac].timeout.cancel();
@@ -185,7 +189,7 @@ function client_remove(mac, reason) {
 	radius_stop(mac, {
 		interface: "hotspot",
 		address: mac
-	});
+	}, true);
 }
 
 function client_flush(mac) {
