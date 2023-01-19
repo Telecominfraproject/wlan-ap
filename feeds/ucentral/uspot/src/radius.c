@@ -34,6 +34,8 @@ enum {
         RADIUS_LOGOFF_URL,
         RADIUS_CLASS,
         RADIUS_SERVICE_TYPE,
+        RADIUS_PROXY_STATE_ACCT,
+        RADIUS_PROXY_STATE_AUTH,
         __RADIUS_MAX,
 };
 
@@ -63,6 +65,8 @@ static const struct blobmsg_policy radius_policy[__RADIUS_MAX] = {
         [RADIUS_LOGOFF_URL] = { .name = "logoff_url", .type = BLOBMSG_TYPE_STRING },
         [RADIUS_CLASS] = { .name = "class", .type = BLOBMSG_TYPE_STRING },
         [RADIUS_SERVICE_TYPE] = { .name = "service_type", .type = BLOBMSG_TYPE_INT32 },
+        [RADIUS_PROXY_STATE_AUTH] = { .name = "auth_proxy", .type = BLOBMSG_TYPE_STRING },
+        [RADIUS_PROXY_STATE_ACCT] = { .name = "acct_proxy", .type = BLOBMSG_TYPE_STRING },
 };
 
 static struct blob_buf b = {};
@@ -151,6 +155,16 @@ radius(void)
 		val = blobmsg_get_u32(tb[RADIUS_ACCT_TYPE]);
 		if (rc_avpair_add(rh, &send, PW_ACCT_STATUS_TYPE, &val, 4, 0) == NULL)
 			return result(rh, 0, NULL);
+	}
+
+	if (tb[RADIUS_ACCT] && blobmsg_get_bool(tb[RADIUS_ACCT])) {
+		if (tb[RADIUS_PROXY_STATE_ACCT])
+			if (rc_avpair_add(rh, &send, PW_PROXY_STATE, blobmsg_get_string(tb[RADIUS_PROXY_STATE_ACCT]), -1, 0) == NULL)
+		                return result(rh, 0, NULL);
+	} else {
+		if (tb[RADIUS_PROXY_STATE_AUTH])
+			if (rc_avpair_add(rh, &send, PW_PROXY_STATE, blobmsg_get_string(tb[RADIUS_PROXY_STATE_AUTH]), -1, 0) == NULL)
+		                return result(rh, 0, NULL);
 	}
 
 	if (tb[RADIUS_USERNAME])

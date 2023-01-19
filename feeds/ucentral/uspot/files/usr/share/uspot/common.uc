@@ -140,7 +140,7 @@ return {
 			        acct_session += sprintf('%d', math.rand() % 10);
 		}
 
-		return {
+		let payload = {
 			server: sprintf('%s:%s:%s', this.config.radius.auth_server, this.config.radius.auth_port, this.config.radius.auth_secret),
 			acct_server: sprintf('%s:%s:%s', this.config.radius.acct_server, this.config.radius.acct_port, this.config.radius.acct_secret),
 			acct_session,
@@ -150,6 +150,13 @@ return {
 			nas_ip: ctx.env.SERVER_ADDR,
 			nas_id: this.config.uam.nasid
 		};
+
+		if (this.config.radius.auth_proxy)
+			payload.auth_proxy = this.config.radius.auth_proxy;
+		if (this.config.radius.acct_proxy)
+			payload.acct_proxy = this.config.radius.acct_proxy;
+
+		return payload;
 	},
 
 	radius_call: function(ctx, payload) {
