@@ -7,12 +7,25 @@
 #include <sys/ioctl.h>
 #include <netinet/ether.h>
 #include <net/if.h>
+#include <arpa/inet.h>
 
 #include <libubox/avl-cmp.h>
 
 #include "spotfilter.h"
 
 AVL_TREE(interfaces, avl_strcmp, false, NULL);
+
+enum {
+	WL_ATTR_CLASS,
+	WL_ATTR_HOSTS,
+	WL_ATTR_ADDRS,
+	__WL_ATTR_MAX
+};
+static const struct blobmsg_policy wl_policy[__WL_ATTR_MAX] = {
+	[WL_ATTR_CLASS] = { "class", BLOBMSG_TYPE_INT32 },
+	[WL_ATTR_HOSTS] = { "hosts", BLOBMSG_TYPE_ARRAY },
+	[WL_ATTR_ADDRS] = { "address", BLOBMSG_TYPE_ARRAY },
+};
 
 void interface_free(struct interface *iface)
 {
@@ -169,21 +182,15 @@ invalid:
 static bool
 __interface_check_whitelist(struct blob_attr *attr)
 {
-	enum {
-		WL_ATTR_CLASS,
-		WL_ATTR_HOSTS,
-		__WL_ATTR_MAX
-	};
-	static const struct blobmsg_policy policy[__WL_ATTR_MAX] = {
-		[WL_ATTR_CLASS] = { "class", BLOBMSG_TYPE_INT32 },
-		[WL_ATTR_HOSTS] = { "hosts", BLOBMSG_TYPE_ARRAY },
-	};
 	struct blob_attr *tb[__WL_ATTR_MAX];
 
-	blobmsg_parse(policy, __WL_ATTR_MAX, tb, blobmsg_data(attr), blobmsg_len(attr));
+	blobmsg_parse(wl_policy, __WL_ATTR_MAX, tb, blobmsg_data(attr), blobmsg_len(attr));
 
-	if (!tb[WL_ATTR_CLASS] || !tb[WL_ATTR_HOSTS])
+	if (!tb[WL_ATTR_CLASS])
 		return false;
+
+	if (!tb[WL_ATTR_HOSTS])
+		return true;
 
 	return blobmsg_check_array(tb[WL_ATTR_HOSTS], BLOBMSG_TYPE_STRING) >= 0;
 }
@@ -204,6 +211,50 @@ interface_check_whitelist(struct blob_attr *attr)
 
 	return true;
 }
+
+static void
+interface_whitelist_set(struct interface *iface, bool add)
+{
+	struct blob_attr *tb[__WL_ATTR_MAX];
+	struct blob_attr *attr, *cur;
+	unsigned int class = 0;
+	int rem, rem2;
+
+	if (!iface->whitelist)
+		return;
+
+	blobmsg_for_each_attr(attr, iface->whitelist, rem) {
+		blobmsg_parse(wl_policy, __WL_ATTR_MAX, tb, blobmsg_data(attr), blobmsg_len(attr));
+
+		if (!tb[WL_ATTR_ADDRS])
+			continue;
+
+		if (add) {
+			if (!tb[WL_ATTR_CLASS])
+				continue;
+
+			class = blobmsg_get_u32(tb[WL_ATTR_CLASS]);
+			if (class >= SPOTFILTER_NUM_CLASS)
+				continue;
+		}
+
+		blobmsg_for_each_attr(cur, tb[WL_ATTR_ADDRS], rem2) {
+			const char *addrstr = blobmsg_get_string(cur);
+			bool ipv6 = strchr(addrstr, ':');
+			union {
+				struct in_addr in;
+				struct in6_addr in6;
+			} addr = {};
+			uint8_t val = class;
+
+			if (inet_pton(ipv6 ? AF_INET6 : AF_INET, addrstr, &addr) != 1)
+				continue;
+
+			spotfilter_bpf_set_whitelist(iface, &addr, ipv6, add ? &val : NULL);
+		}
+	}
+}
+
 
 static void
 interface_set_config(struct interface *iface, bool iface_init)
@@ -236,6 +287,8 @@ interface_set_config(struct interface *iface, bool iface_init)
 
 	blobmsg_parse(policy, __CONFIG_ATTR_MAX, tb,
 		      blobmsg_data(iface->config), blobmsg_len(iface->config));
+
+	interface_whitelist_set(iface, false);
 
 	if ((cur = tb[CONFIG_ATTR_DEFAULT_CLASS]) != NULL &&
 	    blobmsg_get_u32(cur) < SPOTFILTER_NUM_CLASS)
@@ -298,6 +351,8 @@ interface_set_config(struct interface *iface, bool iface_init)
 		memset(&iface->cdata[i], 0, sizeof(iface->cdata[i]));
 		spotfilter_bpf_update_class(iface, i);
 	}
+
+	interface_whitelist_set(iface, true);
 }
 
 void interface_check_devices(void)
