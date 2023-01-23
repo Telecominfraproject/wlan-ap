@@ -1843,8 +1843,22 @@ void hostapd_ubus_notify(struct hostapd_data *hapd, const char *type, const u8 *
 
 	blob_buf_init(&b, 0);
 	blobmsg_add_macaddr(&b, "address", addr);
+	blobmsg_add_string(&b, "ifname", hapd->conf->iface);
 
 	ubus_notify(ctx, &hapd->ubus.obj, type, b.head, -1);
+}
+
+
+void hostapd_ubus_notify_authorized(struct hostapd_data *hapd, struct sta_info *sta)
+{
+	if (!hapd->ubus.obj.has_subscribers)
+		return;
+
+	blob_buf_init(&b, 0);
+	blobmsg_add_macaddr(&b, "address", sta->addr);
+	blobmsg_add_string(&b, "ifname", hapd->conf->iface);
+
+	ubus_notify(ctx, &hapd->ubus.obj, "sta-authorized", b.head, -1);
 }
 
 void hostapd_ubus_notify_beacon_report(

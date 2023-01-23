@@ -80,7 +80,7 @@ endef
 define Package/ucode-mod-nl80211
   $(Package/ucode/default)
   TITLE+= (nl80211 module)
-  DEPENDS:=ucode +libnl-tiny +kmod-mac80211
+  DEPENDS:=ucode +libnl-tiny +kmod-mac80211 +libubox
 endef
 
 define Package/ucode-mod-nl80211/description

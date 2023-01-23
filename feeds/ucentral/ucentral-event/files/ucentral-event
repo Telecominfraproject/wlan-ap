@@ -1,21 +1,306 @@
-#!/bin/sh /etc/rc.common
+#!/usr/bin/ucode
 
-START=80
+'use strict';
 
-USE_PROCD=1
-PROG=/usr/sbin/ucentral-event
+import * as libubus from 'ubus';
+import * as libuci from 'uci';
+import * as uloop from 'uloop';
+import * as nl80211 from 'nl80211';
 
-service_triggers() {
-	procd_add_reload_trigger event
+let ubus = libubus.connect();
+let uci = libuci.cursor();
+
+let hostapd = {};
+let hapd_subscriber;
+let dhcp_subscriber;
+let log_subscriber;
+let ratelimit = false;
+let config;
+let wan_ports;
+
+function config_load() {
+	uci.load('event');
+	config = uci.get_all('event');
+	wan_ports = config.config?.wan_ports || [ 'eth0' ];
+
+	if (config.wifi?.filter == '*')
+		config.wifi.filter = [ 'probe', 'auth', 'assoc', 'disassoc', 'deauth', 'local-deauth', 'inactive-deauth', 'key-mismatch', 'beacon-report', 'radar-detected' ];
+
+	if (config.dhcp?.filter == '*')
+		config.dhcp.filter = [ 'ack', 'discover', 'offer', 'request', 'solicit', 'reply', 'renew' ];
 }
 
-start_service() {
-	procd_open_instance
-	procd_set_param command "$PROG"
-	procd_set_param respawn
-	procd_close_instance
+function match(object, type, list) {
+	if (object in list || type in list)
+		return true;
+	return false;
 }
 
-reload_service() {
-	restart
+function event(object, verb, payload) {
+	let type = object;
+	if (verb)
+		type += '.' + verb;
+	if (match(object, type, config.bulk?.filter))
+		ubus.call('ucentral', 'telemetry', {
+			event: 'event',
+			payload: {
+				type,
+				payload
+			}
+		});
+	else if (match(object, type, config.realtime?.filter))
+		ubus.call('ucentral', 'event', {
+			type,
+			payload
+		});
 }
+
+let handlers = {
+	'sta-authorized': function(notify, hapd) {
+		event('client', 'join', {
+			client: notify.data.address,
+			ssid: hapd.ssid,
+		});
+		if (ratelimit) {
+			let msg = {
+				device: hapd.ifname,
+				address: notify.data.address,
+			};
+			if (notify.data['rate-limit']) {
+				msg.rate_ingress = notify.data['rate-limit'][0] / 1000;
+				msg.rate_egress = notify.data['rate-limit'][1] / 1000;
+			} else
+				msg.defaults = hapd.ssid;
+			ubus.call('ratelimit', 'client_set', msg);
+		}
+	},
+
+	disassoc: function(notify, hapd) {
+		if (ratelimit) {
+			let msg = {
+				address: notify.data.address,
+			};
+			ubus.call('ratelimit', 'client_delete', msg);
+		}
+	},
+
+	'key-mismatch': function(notify, hapd) {
+		event('client', 'key-mismatch', {
+			client: notify.data.address,
+			ssid: hapd.ssid,
+		});
+	}, 
+
+	vlan_add: function(notify) {
+		for (let wan in wan_ports) {
+			let msg = {
+				name: wan,
+				vlan: [ `${notify.data.vlan_id}:t` ]
+			};
+			ubus.call('network.interface.up_none', 'add_device', msg);
+		}
+
+		let msg = {
+			name: notify.data.ifname,
+			'link-ext': true,
+			vlan: [ `${notify.data.vlan_id}` ]
+		};
+		ubus.call('network.interface.up_none', 'add_device', msg);
+	},
+
+	disassoc: function(notify, hapd) {
+		if (ratelimit) {
+			let msg = {
+				address: notify.data.address,
+			};
+			ubus.call('ratelimit', 'client_delete', msg);
+		}
+	},
+};
+
+
+function hapd_subscriber_notify_cb(notify) {
+	if (config.wifi?.filter == '*' || index(config.wifi?.filter || [], notify.type) > 0) {
+		let payload = {};
+		payload[notify.type] = notify.data;
+		ubus.call('ucentral', 'telemetry', {
+			event: 'wifi-frames',
+			payload
+		});
+	}
+	if (notify.type == 'probe')
+		return true;
+	let handler = handlers[notify.type];
+	if (!handler)
+		return true;
+	let hapd = hostapd[notify.data.ifname];
+	handler(notify, hapd);
+
+	return true;
+}
+
+function hostapd_event(ifname, type) {
+	let payload = {};
+	for (let p in [ 'ssid', 'bssid', 'channel', 'band' ])
+		payload[p] = hostapd[ifname][p];
+
+	event('wifi', type, payload);
+}
+
+function hostapd_add(path, obj) {
+	let ifname = obj[1];
+
+	hostapd[ifname] = ubus.call(path, 'get_status');
+	hostapd[ifname].ifname = ifname;
+	hostapd[ifname].path = path;
+
+	if (hostapd[ifname].op_class >= 81 &&
+	    hostapd[ifname].op_class <= 84)
+		hostapd[ifname].band = '2G';
+
+	else if (hostapd[ifname].op_class >= 115 &&
+		 hostapd[ifname].op_class <= 127)
+		hostapd[ifname].band = '5G';
+
+	else if (hostapd[ifname].op_class >= 133 &&
+		 hostapd[ifname].op_class <= 136)
+		hostapd[ifname].band = '6G';
+
+	else
+		hostapd[ifname].band = 'unknown';
+
+	hostapd_event(ifname, 'start');
+
+	printf('adding %s\n', path);
+	hapd_subscriber.subscribe(path);
+}
+
+function hostapd_remove(path, obj) {
+	let ifname = obj[1];
+	hostapd_event(ifname, 'stop');
+	printf('removing %s\n', path);
+	delete hostapd[ifname];
+}
+
+function hapd_subscriber_remove_cb(remove) {
+	printf('remove: %.J\n', remove);
+}
+
+function dhcp_subscriber_notify_cb(notify) {
+	if (config.dhcp?.filter == '*' || index(config.dhcp?.filter || [], notify.type) > 0) {
+		notify.data.type = notify.type;
+		ubus.call('ucentral', 'telemetry', {
+			event: 'dhcp-snooping',
+			payload: notify.data,
+		});
+	}
+}
+
+function dhcp_subscriber_remove_cb(remove) {
+	printf('dhcp remove: %.J\n', remove);
+}
+
+function log_subscriber_notify_cb(notify) {
+	let msg = split(notify.data.msg, ': ', 2);
+	let daemon = split(msg[0], '[')[0];
+
+	switch(daemon) {
+	case 'dropbear':
+		event('ssh', '',  msg[1]);
+		break;
+	}
+}
+
+function log_subscriber_remove_cb(remove) {
+	printf('dhcp remove: %.J\n', remove);
+}
+
+function unsub_object(add, id, path) {
+	let object = split(path, '.');
+
+	switch (path) {
+	case 'ratelimit':
+		ratelimit = add;
+		break;
+	case 'dhcpsnoop':
+		printf('adding %s\n', path);
+		dhcp_subscriber.subscribe(path);
+		break;
+	case 'log':
+		printf('adding %s\n', path);
+		log_subscriber.subscribe(path);
+		break;
+	}
+	if (object[0] == 'hostapd' && object[1]) {
+		if (add)
+			hostapd_add(path, object);
+		else
+			hostapd_remove(path, object);
+	}
+}
+
+function listener_cb(event, payload) {
+	unsub_object(event == 'ubus.object.add', payload.id, payload.path);
+}
+
+function nl_cb(msg) {
+	let mac = msg.msg.mac;
+	let sinfo = msg.msg.sta_info;
+	let payload = {
+		client: mac,
+		tx_bytes: sinfo.tx_bytes64,
+		rx_bytes: sinfo.rx_bytes64,
+		tx_packets: sinfo.tx_packets,
+		rx_packets: sinfo.rx_packets,
+		connected_time: sinfo.connected_time,
+	};
+	event('client', 'leave',  payload);
+}
+
+let ubus_methods = {
+	event: {
+		call: function(req) {
+			if (!req.args.object || !req.args.payload)
+				return ubus.STATUS_INVALID_ARGUMENT;
+
+			event(req.args.object, req.args.verb, req.args.payload);
+			return 0;
+		},
+		args: {
+			object:"",
+			verb:"",
+			payload:{},
+		}
+	},
+
+	reload: {
+		call: function(req) {
+			config_load();
+		},
+		args: {
+
+		}
+	},
+};
+
+uloop.init();
+
+config_load();
+
+hapd_subscriber = ubus.subscriber(hapd_subscriber_notify_cb, hapd_subscriber_remove_cb);
+dhcp_subscriber = ubus.subscriber(dhcp_subscriber_notify_cb, dhcp_subscriber_remove_cb);
+log_subscriber = ubus.subscriber(log_subscriber_notify_cb, log_subscriber_remove_cb);
+
+let list = ubus.list();
+for (let k, path in list)
+	unsub_object(true, 0, path);
+
+ubus.listener('ubus.object.add', listener_cb);
+ubus.listener('ubus.object.remove', listener_cb);
+
+ubus.publish("event", ubus_methods);
+
+let l = nl80211.listener(nl_cb, [ nl80211.const.NL80211_CMD_DEL_STATION ]);
+
+uloop.run();
+uloop.done();
