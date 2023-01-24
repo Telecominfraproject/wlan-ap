@@ -17,7 +17,7 @@ KERNEL_NAME_SUFFIX=-qsdk-26349818b464f8c7b52d59ce73579d9f3dd6bd5d
 include $(INCLUDE_DIR)/target.mk
 DEFAULT_PACKAGES += kmod-qca-nss-dp kmod-qca-ssdk swconfig \
 	kmod-qca-nss-drv qca-nss-fw-ipq807x \
-	kmod-usb-phy-ipq807x kmod-usb-dwc3-qcom-internal \
+	kmod-usb-dwc3-qcom-internal \
 	kmod-ath11k-ahb ath11k-firmware-ipq807x \
 	kmod-gpio-button-hotplug iwinfo \
 	qca-ssdk-shell kmod-qca-nss-drv-bridge-mgr \
