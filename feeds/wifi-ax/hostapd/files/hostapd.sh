@@ -291,7 +291,16 @@ hostapd_common_add_bss_config() {
 	config_add_string acct_server
 	config_add_string acct_secret
 	config_add_int acct_port
+
+	config_add_string acct_server_secondary
+	config_add_string acct_secret_secondary
+	config_add_int acct_port_secondary
+
 	config_add_int acct_interval
+
+	config_add_string auth_server_secondary
+	config_add_string auth_secret_secondary
+	config_add_int auth_port_secondary
 
 	config_add_int bss_load_update_period chan_util_avg_period
 
@@ -551,6 +560,7 @@ append_radius_server() {
 
 	json_get_vars \
 		auth_server auth_secret auth_port \
+		auth_server_secondary auth_secret_secondary auth_port_secondary \
 		dae_client dae_secret dae_port \
 		dynamic_ownip ownip radius_client_addr \
 		eap_reauth_period request_cui \
@@ -589,6 +599,7 @@ append_radius_server() {
 	}
 
 	set_default auth_port 1812
+	set_default auth_port_secondary 1812
 	set_default dae_port 3799
 	set_default request_cui 0
 
@@ -596,6 +607,13 @@ append_radius_server() {
 		append bss_conf "auth_server_addr=$auth_server" "$N"
 		append bss_conf "auth_server_port=$auth_port" "$N"
 		append bss_conf "auth_server_shared_secret=$auth_secret" "$N"
+	}
+
+	[ -n "$auth_server_secondary" ] && {
+		append bss_conf "auth_server_addr=$auth_server_secondary" "$N"
+		append bss_conf "auth_server_port=$auth_port_secondary" "$N"
+		[ -n "$auth_secret_secondary" ] && \
+			append bss_conf "auth_server_shared_secret=$auth_secret_secondary" "$N"
 	}
 
 	[ "$request_cui" -gt 0 ] && append bss_conf "radius_request_cui=$request_cui" "$N"
@@ -636,6 +654,7 @@ hostapd_set_bss_options() {
 		macfilter ssid utf8_ssid wmm uapsd hidden short_preamble rsn_preauth \
 		iapp_interface eapol_version dynamic_vlan ieee80211w nasid \
 		acct_server acct_secret acct_port acct_interval \
+		acct_server_secondary acct_secret_secondary acct_port_secondary \
 		bss_load_update_period chan_util_avg_period sae_require_mfp sae_pwe \
 		multi_ap multi_ap_backhaul_ssid multi_ap_backhaul_key skip_inactivity_poll \
 		airtime_bss_weight airtime_bss_limit airtime_sta_weight \
@@ -657,6 +676,7 @@ hostapd_set_bss_options() {
 	set_default tdls_prohibit 0
 	set_default eapol_version $((wpa & 1))
 	set_default acct_port 1813
+	set_default acct_port_secondary 1813
 	set_default bss_load_update_period 60
 	set_default chan_util_avg_period 600
 	set_default utf8_ssid 1
@@ -716,6 +736,13 @@ hostapd_set_bss_options() {
 		[ -n "$acct_interval" ] && \
 			append bss_conf "radius_acct_interim_interval=$acct_interval" "$N"
 		json_for_each_item append_radius_acct_req_attr radius_acct_req_attr
+	}
+
+	[ -n "$acct_server_secondary" ] && {
+		append bss_conf "acct_server_addr=$acct_server_secondary" "$N"
+		append bss_conf "acct_server_port=$acct_port_secondary" "$N"
+		[ -n "$acct_secret_secondary" ] && \
+			append bss_conf "acct_server_shared_secret=$acct_secret_secondary" "$N"
 	}
 
 	case "$auth_type" in
