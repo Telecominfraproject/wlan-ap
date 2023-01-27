@@ -1857,6 +1857,13 @@ void hostapd_ubus_notify_authorized(struct hostapd_data *hapd, struct sta_info *
 	blob_buf_init(&b, 0);
 	blobmsg_add_macaddr(&b, "address", sta->addr);
 	blobmsg_add_string(&b, "ifname", hapd->conf->iface);
+	if (sta->bandwidth[0] || sta->bandwidth[1]) {
+		void *r = blobmsg_open_array(&b, "rate-limit");
+
+		blobmsg_add_u32(&b, "", sta->bandwidth[0]);
+		blobmsg_add_u32(&b, "", sta->bandwidth[1]);
+		blobmsg_close_array(&b, r);
+	}
 
 	ubus_notify(ctx, &hapd->ubus.obj, "sta-authorized", b.head, -1);
 }
