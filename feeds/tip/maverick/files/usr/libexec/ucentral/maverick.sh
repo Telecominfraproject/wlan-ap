@@ -47,6 +47,7 @@ config_foreach delete_forwarding forwarding
 
 uci commit
 
+/etc/init.d/rpcd start
 /etc/init.d/uhttpd start
 
 reload_config
