@@ -4,6 +4,7 @@ PKG_NAME:=ucentral-client
 PKG_RELEASE:=1
 
 PKG_SOURCE_URL=https://github.com/Telecominfraproject/wlan-ucentral-client.git
+PKG_MIRROR_HASH:=38d770883713edfcede3d113df1b2dcc408f92ea19f752dde9a620667fa9c3bc
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2022-06-22
 PKG_SOURCE_VERSION:=8f5ab3f8fe87cad5c3a6c56463294c946459c725
