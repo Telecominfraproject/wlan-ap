@@ -1,0 +1,381 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6d76f3a1b9df..3fb1f7aed964 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -143,13 +143,14 @@ ENDIF()
+ 
+ IF(RTNL_SUPPORT)
+   FIND_LIBRARY(nl NAMES nl-tiny)
++  FIND_LIBRARY(ubox NAMES ubox)
+   FIND_PATH(nl_include_dir NAMES netlink/msg.h PATH_SUFFIXES libnl-tiny)
+   INCLUDE_DIRECTORIES(${nl_include_dir})
+   SET(LIBRARIES ${LIBRARIES} rtnl_lib)
+   ADD_LIBRARY(rtnl_lib MODULE lib/rtnl.c)
+   SET_TARGET_PROPERTIES(rtnl_lib PROPERTIES OUTPUT_NAME rtnl PREFIX "")
+   TARGET_LINK_OPTIONS(rtnl_lib PRIVATE ${UCODE_MODULE_LINK_OPTIONS})
+-  TARGET_LINK_LIBRARIES(rtnl_lib ${nl})
++  TARGET_LINK_LIBRARIES(rtnl_lib ${nl} ${ubox})
+ ENDIF()
+ 
+ IF(NL80211_SUPPORT)
+diff --git a/lib/rtnl.c b/lib/rtnl.c
+index c72b9fdc816c..6a9144e21734 100644
+--- a/lib/rtnl.c
++++ b/lib/rtnl.c
+@@ -49,12 +49,19 @@ limitations under the License.
+ #include <linux/netconf.h>
+ #include <linux/ipv6.h>
+ 
++#include <libubox/uloop.h>
++
+ #include "ucode/module.h"
+ 
++#define DIV_ROUND_UP(n, d)      (((n) + (d) - 1) / (d))
++
+ #define err_return(code, ...) do { set_error(code, __VA_ARGS__); return NULL; } while(0)
+ 
+ #define NLM_F_STRICT_CHK (1 << 15)
+ 
++#define RTNL_CMDS_BITMAP_SIZE	DIV_ROUND_UP(__RTM_MAX, 32)
++#define RTNL_GRPS_BITMAP_SIZE	DIV_ROUND_UP(__RTNLGRP_MAX, 32)
++
+ /* Can't use net/if.h for declarations as it clashes with linux/if.h
+  * on certain musl versions.
+  * Ref: https://www.openwall.com/lists/musl/2017/04/16/1 */
+@@ -82,6 +89,15 @@ set_error(int errcode, const char *fmt, ...) {
+ 	}
+ }
+ 
++static uc_resource_type_t *listener_type;
++static uc_value_t *listener_registry;
++static uc_vm_t *listener_vm;
++
++typedef struct {
++	uint32_t cmds[RTNL_CMDS_BITMAP_SIZE];
++	size_t index;
++} uc_nl_listener_t;
++
+ typedef struct {
+ 	uint8_t family;
+ 	uint8_t mask;
+@@ -3202,6 +3218,11 @@ uc_nl_convert_attr(const uc_nl_attr_spec_t *spec, struct nl_msg *msg, char *base
+ 
+ 
+ static struct nl_sock *sock = NULL;
++static struct {
++	struct nl_sock *evsock;
++	struct uloop_fd evsock_fd;
++	uint32_t groups[RTNL_GRPS_BITMAP_SIZE];
++} nl_conn;
+ 
+ typedef enum {
+ 	STATE_UNREPLIED,
+@@ -3463,6 +3484,287 @@ uc_nl_request(uc_vm_t *vm, size_t nargs)
+ 	}
+ }
+ 
++static const uc_nl_nested_spec_t *
++uc_nl_msg_spec(int type)
++{
++	switch (type) {
++	case RTM_NEWLINK:
++	case RTM_DELLINK:
++		return &link_msg;
++	case RTM_NEWROUTE:
++	case RTM_DELROUTE:
++		return &route_msg;
++	case RTM_NEWNEIGH:
++	case RTM_DELNEIGH:
++		return &neigh_msg;
++	case RTM_NEWADDR:
++	case RTM_DELADDR:
++		return &addr_msg;
++	case RTM_NEWRULE:
++	case RTM_DELRULE:
++		return &rule_msg;
++	case RTM_NEWADDRLABEL:
++	case RTM_DELADDRLABEL:
++		return &addrlabel_msg;
++	case RTM_NEWNEIGHTBL:
++		return &neightbl_msg;
++	case RTM_NEWNETCONF:
++	case RTM_DELNETCONF:
++		return &netconf_msg;
++	default:
++		return NULL;
++	}
++}
++
++static void
++uc_nl_prepare_event(uc_vm_t *vm, uc_value_t *dest, struct nl_msg *msg)
++{
++	struct nlmsghdr *hdr = nlmsg_hdr(msg);
++	const uc_nl_nested_spec_t *spec;
++	const uc_nl_attr_spec_t *attrs = NULL;
++	size_t nattrs = 0, headsize = 0;
++	uc_value_t *o;
++
++	spec = uc_nl_msg_spec(hdr->nlmsg_type);
++	if (spec) {
++		attrs = spec->attrs;
++		nattrs = spec->nattrs;
++		headsize = spec->headsize;
++	}
++
++	o = ucv_object_new(vm);
++	if (!uc_nl_convert_attrs(msg, nlmsg_attrdata(hdr, 0),
++		nlmsg_attrlen(hdr, 0), headsize, attrs, nattrs, vm, o)) {
++		ucv_put(o);
++		return;
++	}
++
++	ucv_object_add(dest, "msg", o);
++	if (headsize)
++		ucv_object_add(dest, "head", ucv_string_new_length(NLMSG_DATA(hdr), headsize));
++}
++
++static bool
++uc_nl_fill_cmds(uint32_t *cmd_bits, uc_value_t *cmds)
++{
++	if (ucv_type(cmds) == UC_ARRAY) {
++		for (size_t i = 0; i < ucv_array_length(cmds); i++) {
++			int64_t n = ucv_int64_get(ucv_array_get(cmds, i));
++
++			if (errno || n < 0 || n >= __RTM_MAX)
++				return false;
++
++			cmd_bits[n / 32] |= (1 << (n % 32));
++		}
++	}
++	else if (ucv_type(cmds) == UC_INTEGER) {
++		int64_t n = ucv_int64_get(cmds);
++
++		if (errno || n < 0 || n > 255)
++			return false;
++
++		cmd_bits[n / 32] |= (1 << (n % 32));
++	}
++	else if (!cmds)
++		memset(cmd_bits, 0xff, RTNL_CMDS_BITMAP_SIZE * sizeof(*cmd_bits));
++	else
++		return false;
++
++	return true;
++}
++
++static int
++cb_listener_event(struct nl_msg *msg, void *arg)
++{
++	struct nlmsghdr *hdr = nlmsg_hdr(msg);
++	uc_vm_t *vm = listener_vm;
++	int cmd = hdr->nlmsg_type;
++
++	if (!nl_conn.evsock_fd.registered || !vm)
++		return NL_SKIP;
++
++	for (size_t i = 0; i < ucv_array_length(listener_registry); i += 2) {
++		uc_value_t *this = ucv_array_get(listener_registry, i);
++		uc_value_t *func = ucv_array_get(listener_registry, i + 1);
++		uc_nl_listener_t *l;
++		uc_value_t *o;
++
++		l = ucv_resource_data(this, "rtnl.listener");
++		if (!l)
++			continue;
++
++		if (cmd > __RTM_MAX || !(l->cmds[cmd / 32] & (1 << (cmd % 32))))
++			continue;
++
++		if (!ucv_is_callable(func))
++			continue;
++
++		o = ucv_object_new(vm);
++		uc_nl_prepare_event(vm, o, msg);
++		ucv_object_add(o, "cmd", ucv_int64_new(cmd));
++
++		uc_vm_stack_push(vm, ucv_get(this));
++		uc_vm_stack_push(vm, ucv_get(func));
++		uc_vm_stack_push(vm, o);
++
++		if (uc_vm_call(vm, true, 1) != EXCEPTION_NONE) {
++			uloop_end();
++			return NL_STOP;
++		}
++
++		ucv_put(uc_vm_stack_pop(vm));
++	}
++
++	return NL_SKIP;
++}
++
++static void
++uc_nl_listener_cb(struct uloop_fd *fd, unsigned int events)
++{
++	nl_recvmsgs_default(nl_conn.evsock);
++}
++
++static void
++uc_nl_add_group(unsigned int idx)
++{
++	if (idx >= __RTNLGRP_MAX)
++		return;
++
++	if (nl_conn.groups[idx / 32] & (1 << (idx % 32)))
++		return;
++
++	nl_conn.groups[idx / 32] |= (1 << (idx % 32));
++	nl_socket_add_membership(nl_conn.evsock, idx);
++}
++
++static bool
++uc_nl_evsock_init(void)
++{
++	struct uloop_fd *fd = &nl_conn.evsock_fd;
++	struct nl_sock *sock;
++
++	if (nl_conn.evsock)
++		return true;
++
++	sock = nl_socket_alloc();
++
++	if (nl_connect(sock, NETLINK_ROUTE))
++		goto free;
++
++	fd->fd = nl_socket_get_fd(sock);
++	fd->cb = uc_nl_listener_cb;
++	uloop_fd_add(fd, ULOOP_READ);
++
++	nl_socket_set_buffer_size(sock, 65535, 0);
++	nl_socket_disable_seq_check(sock);
++	nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM, cb_listener_event, NULL);
++
++	nl_conn.evsock = sock;
++
++	return true;
++
++free:
++	nl_socket_free(sock);
++	return false;
++}
++
++static uc_value_t *
++uc_nl_listener(uc_vm_t *vm, size_t nargs)
++{
++	uc_nl_listener_t *l;
++	uc_value_t *cb_func = uc_fn_arg(0);
++	uc_value_t *cmds = uc_fn_arg(1);
++	uc_value_t *groups = uc_fn_arg(2);
++	uc_value_t *rv;
++	size_t i;
++
++	if (!ucv_is_callable(cb_func)) {
++		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "Invalid callback");
++		return NULL;
++	}
++
++	if (!uc_nl_evsock_init())
++		return NULL;
++
++	if (ucv_type(groups) == UC_ARRAY) {
++		for (i = 0; i < ucv_array_length(groups); i++) {
++			int64_t n = ucv_int64_get(ucv_array_get(groups, i));
++
++			if (errno || n < 0 || n >= __RTNLGRP_MAX)
++				err_return(NLE_INVAL, NULL);
++
++			uc_nl_add_group(n);
++		}
++	} else {
++		uc_nl_add_group(RTNLGRP_LINK);
++	}
++
++	for (i = 0; i < ucv_array_length(listener_registry); i += 2) {
++		if (!ucv_array_get(listener_registry, i))
++			break;
++	}
++
++	ucv_array_set(listener_registry, i + 1, cb_func);
++	l = xalloc(sizeof(*l));
++	l->index = i;
++	if (!uc_nl_fill_cmds(l->cmds, cmds)) {
++		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "Invalid command ID");
++		free(l);
++		return NULL;
++	}
++
++	rv = uc_resource_new(listener_type, l);
++	ucv_array_set(listener_registry, i, rv);
++	listener_vm = vm;
++
++	return rv;
++}
++
++static void
++uc_nl_listener_free(void *arg)
++{
++	uc_nl_listener_t *l = arg;
++
++	ucv_array_set(listener_registry, l->index, NULL);
++	ucv_array_set(listener_registry, l->index + 1, NULL);
++	free(l);
++}
++
++static uc_value_t *
++uc_nl_listener_set_commands(uc_vm_t *vm, size_t nargs)
++{
++	uc_nl_listener_t *l = uc_fn_thisval("rtnl.listener");
++	uc_value_t *cmds = uc_fn_arg(0);
++
++	if (!l)
++		return NULL;
++
++	memset(l->cmds, 0, sizeof(l->cmds));
++	if (!uc_nl_fill_cmds(l->cmds, cmds))
++		uc_vm_raise_exception(vm, EXCEPTION_TYPE, "Invalid command ID");
++
++	return NULL;
++}
++
++static uc_value_t *
++uc_nl_listener_close(uc_vm_t *vm, size_t nargs)
++{
++	uc_nl_listener_t **lptr = uc_fn_this("rtnl.listener");
++	uc_nl_listener_t *l;
++
++	if (!lptr)
++		return NULL;
++
++	l = *lptr;
++	if (!l)
++		return NULL;
++
++	*lptr = NULL;
++	uc_nl_listener_free(l);
++
++	return NULL;
++}
++
+ 
+ static void
+ register_constants(uc_vm_t *vm, uc_value_t *scope)
+@@ -3833,12 +4135,20 @@ register_constants(uc_vm_t *vm, uc_value_t *scope)
+ static const uc_function_list_t global_fns[] = {
+ 	{ "error",		uc_nl_error },
+ 	{ "request",	uc_nl_request },
++	{ "listener",	uc_nl_listener },
+ };
+ 
++static const uc_function_list_t listener_fns[] = {
++	{ "set_commands",	uc_nl_listener_set_commands },
++	{ "close",			uc_nl_listener_close },
++};
+ 
+ void uc_module_init(uc_vm_t *vm, uc_value_t *scope)
+ {
+ 	uc_function_list_register(scope, global_fns);
+ 
++	listener_type = uc_type_declare(vm, "rtnl.listener", listener_fns, uc_nl_listener_free);
++	listener_registry = ucv_array_new(vm);
++
+ 	register_constants(vm, scope);
+ }
