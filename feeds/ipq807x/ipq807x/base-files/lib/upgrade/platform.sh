@@ -50,6 +50,22 @@ do_flash_emmc() {
 	tar Oxf $tar_file ${board_dir}/$part | dd of=${emmcblock}
 }
 
+emmc_do_upgrade_cig() {
+        local tar_file="$1"
+
+        local board_dir=$(tar tf $tar_file | grep -m 1 '^sysupgrade-.*/$')
+        board_dir=${board_dir%/}
+	
+        do_flash_emmc $tar_file '0:HLOS_1' $board_dir kernel
+        do_flash_emmc $tar_file 'rootfs_1' $board_dir root
+
+        local emmcblock="$(find_mmc_part "rootfs_data")"
+        if [ -e "$emmcblock" ]; then
+                mkfs.ext4 -F "$emmcblock"
+        fi
+}
+
+
 emmc_do_upgrade() {
 	local tar_file="$1"
 
@@ -69,6 +85,7 @@ platform_check_image() {
 	board=$(board_name)
 	case $board in
 	cig,wf188|\
+	cig,wf660a|\
 	cig,wf188n|\
 	cig,wf194c|\
 	cig,wf194c4|\
@@ -117,6 +134,9 @@ platform_do_upgrade() {
 	case $board in
 	cig,wf188)
 		qca_do_upgrade $1
+		;;
+	cig,wf660a)
+		emmc_do_upgrade_cig $1
 		;;
 	motorola,q14)
 		emmc_do_upgrade $1

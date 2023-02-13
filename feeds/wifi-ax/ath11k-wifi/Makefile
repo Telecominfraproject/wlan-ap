@@ -26,6 +26,7 @@ endef
 ALLWIFIBOARDS:= \
 	cig-wf188 \
 	cig-wf188n \
+	cig-wf660a \
 	cig-wf194c \
 	cig-wf194c4 \
 	cig-wf196 \
@@ -236,6 +237,7 @@ endef
 
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
 $(eval $(call generate-ath11k-wifi-package,cig-wf188n,Cigtech WF188n))
+$(eval $(call generate-ath11k-wifi-package,cig-wf660a,Cigtech WF660a))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c,Cigtech WF194c))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c4,Cigtech WF194c4))
 $(eval $(call generate-ath11k-wifi-package,cig-wf196,Cigtech WF196))

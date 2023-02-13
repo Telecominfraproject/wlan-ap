@@ -2,6 +2,17 @@ KERNEL_LOADADDR := 0x41008000
 
 DEVICE_VARS += CE_TYPE
 
+define Device/cig_wf660a
+  DEVICE_TITLE := Cigtech WF-660a
+  DEVICE_DTS := qcom-ipq6018-cig-wf660a
+  SUPPORTED_DEVICES := cig,wf660a
+  DEVICE_DTS_CONFIG := config@cp01-c1
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf660a uboot-env uboot-envtools
+  IMAGES := sysupgrade.tar mmc-factory.bin
+  IMAGE/mmc-factory.bin := append-ubi | qsdk-ipq-factory-mmc
+endef
+TARGET_DEVICES += cig_wf660a
+
 define Device/cig_wf188n
   DEVICE_TITLE := Cigtech WF-188n
   DEVICE_DTS := qcom-ipq6018-cig-wf188n
