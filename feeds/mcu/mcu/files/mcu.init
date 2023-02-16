@@ -1,0 +1,254 @@
+#!/bin/sh /etc/rc.common
+
+START=80
+
+. /lib/functions/mcu.sh
+
+SECT=
+
+mcu_setup_uart() {
+	local uart="$1"
+	local baud="$2"
+	local flow="$3"
+	local gpio_path="$4"
+	local gpio_on="$5"
+	local sn="$6"
+
+	# Take out MCU out of reset and read basic info
+	mcu_enable_pin_set "$gpio_path" "$gpio_on"
+	sleep 1
+
+	mcu_sn_check_and_update "$sn" "$uart" "$baud" "$flow"
+	[ $? -ne 0 ] && return 1
+
+	mcu_fw_check_and_update "$uart" "$baud" "$flow"
+	[ $? -ne 0 ] && return 1
+}
+
+mcu_setup_usb() {
+	local gpio_path="$1"
+	local gpio_on="$2"
+	local sn="$3"
+	local gpio_off="0"
+
+	local uart
+
+	[ "$gpio_on" = "0" ] && gpio_off="1"
+
+	# If we have S/N in config, only take out the MCU from reset
+	[ -n "$sn" ] && {
+		mcu_logi "MCU S/N already set, hotplug will perform config"
+		mcu_enable_pin_set "$gpio_path" "$gpio_on"
+		return 0
+	}
+
+	# If S/N is missing, we need to take out MCU from reset, find out
+	# its S/N and save it for later
+
+	exec 9>"$MCU_FLOCK_FILE" || {
+		mcu_loge "failed to obtain lock (exec fail)!"
+		return 1
+	}
+
+	flock -n 9 || {
+		mcu_loge "failed to obtain lock (flock fail)!"
+		return 1
+	}
+
+	usb_path="/sys/bus/usb/devices/*"
+	devs_old=""
+	for dev_path in $usb_path; do
+		dev="$(basename "$dev_path")"
+		[[ $dev == *":"* ]] && continue
+
+		p="$(cat "${dev_path}/product" 2>/dev/null)"
+		id="$(cat "${dev_path}/idVendor" 2>/dev/null)"
+		id="${id}$(cat "${dev_path}/idProduct" 2>/dev/null)"
+
+		[ "$p" = "$MCUBOOT_USB_PRODUCT" -a \
+		 "$id" = "$MCUBOOT_USB_VID_PID" ] && \
+			devs_old="$devs_old $dev"
+	done
+
+	mcu_enable_pin_set "$gpio_path" "$gpio_on"
+	sleep 2
+
+	dev_found=""
+	for dev_path in $usb_path; do
+		dev="$(basename "$dev_path")"
+		[[ $dev == *":"* ]] && continue
+
+		p="$(cat "${dev_path}/product" 2>/dev/null)"
+		id="$(cat "${dev_path}/idVendor" 2>/dev/null)"
+		id="${id}$(cat "${dev_path}/idProduct" 2>/dev/null)"
+
+		[ "$p" = "$MCUBOOT_USB_PRODUCT" -a \
+		 "$id" = "$MCUBOOT_USB_VID_PID" ] && {
+			[ -n "$devs_old" ] && {
+				if echo "$devs_old" | grep -q "$dev"; then
+					continue
+				fi
+			}
+
+			dev_found="$dev"
+			break
+		}
+	done
+
+	[ -n "$dev_found" ] || {
+		mcu_loge "failed to find MCU on USB bus"
+		mcu_enable_pin_set "$gpio_path" "$gpio_off"
+
+		flock -u 9
+		return 1
+	}
+
+	mcu_logd "MCU found on USB bus: '$dev_found'"
+
+	# We expect just a single ttyACM interface
+	usb_path="/sys/bus/usb/devices/${dev_found}*/tty/*"
+	for tty_path in $usb_path; do
+		tty="$(basename "$tty_path")"
+		[ -c "/dev/${tty}" ] && {
+			uart="/dev/${tty}"
+			break
+		}
+	done
+
+	[ -n "$uart" ] || {
+		mcu_loge "failed to find ttyACM interface"
+		mcu_enable_pin_set "$gpio_path" "$gpio_off"
+
+		flock -u 9
+		return 1
+	}
+
+	mcu_sn_check_and_update "$sn" "$uart"
+	[ $? -ne 0 ] && {
+		mcu_enable_pin_set "$gpio_path" "$gpio_off"
+
+		flock -u 9
+		return 1
+	}
+
+	mcu_fw_check_and_update "$uart"
+	[ $? -ne 0 ] && {
+		mcu_enable_pin_set "$gpio_path" "$gpio_off"
+
+		flock -u 9
+		return 1
+	}
+
+	flock -u 9
+}
+
+mcu_setup() {
+	local sn
+	local disabled
+	local uart_baud
+	local uart_flow
+	local uart_path
+	local interface
+	local bootloader
+	local enable_pin
+	local gpio_path
+
+	local gpio_on="1"
+	local gpio_off="0"
+
+	SECT="$1"
+	MCU_SCRIPT_NAME="mcu-init.${SECT}"
+
+	MCU_SYSINFO_OUTPUT=""
+	MCU_IMGLIST_OUTPUT=""
+
+	# Section disabled?
+	config_get_bool disabled "$SECT" disabled "0"
+	[ "$disabled" = "1" ] && {
+		mcu_logw "section is disabled in config"
+		return 0
+	}
+
+	config_get sn "$SECT" sn
+	config_get bootloader "$SECT" bootloader
+	config_get enable_pin "$SECT" enable_pin
+	config_get interface "$SECT" interface
+	config_get uart_path "$SECT" uart_path
+	config_get uart_baud "$SECT" uart_baud "115200"
+	config_get_bool uart_flow "$SECT" uart_flow "0"
+
+	# As for now, only 'mcuboot' bootloader is supported
+	case "$bootloader" in
+	"mcuboot")
+		command -v umcumgr > /dev/null 2>&1 || {
+			mcu_loge "missing 'umcumgr' tool"
+			return 1
+		}
+		;;
+	*)
+		mcu_loge "unsupported or unset 'bootloader' option"
+		return 1
+		;;
+	esac
+
+	# Verify 'enable_pin' option
+	if [ -z "$enable_pin" ]; then
+		# USB based MCU without GPIO based way for reset are fully
+		# handled by the hotplug script
+		[ "$interface" = "usb" ] && {
+			mcu_logw "'enable_pin' option is unset, ignoring"
+			return 0
+		}
+
+		[ "$interface" = "uart" ] && {
+			mcu_loge "'enable_pin' option is unset"
+			return 1
+		}
+	else
+		gpio_path="/sys/class/gpio/${enable_pin}"
+		[ -d "$gpio_path" ] || {
+			mcu_loge "invalid 'enable_pin' option"
+			return 1
+		}
+
+		[ "$(cat "${gpio_path}/active_low")" = "1" ] && {
+			gpio_on="0"
+			gpio_off="1"
+		}
+
+		# TODO: should we maybe bail out here if the MCU was took out
+		#       of reset already before, by something/someone else?
+		[ "$(cat "${gpio_path}/value")" = "$gpio_on" ] && {
+			mcu_logw "MCU already enabled, resetting"
+			mcu_enable_pin_set "$gpio_path" "$gpio_off"
+			sleep 1
+		}
+	fi
+
+	# For now only 'usb' and 'uart' interfaces are supported
+	case "$interface" in
+	"uart")
+		[ -z "$uart_path" -o ! -c "$uart_path" ] && {
+			mcu_loge "invalid or unset 'uart_path' option"
+			return 1
+		}
+
+		mcu_setup_uart "$uart_path" "$uart_baud" "$uart_flow" \
+			       "$gpio_path" "$gpio_on" "$sn"
+		;;
+	"usb")
+		mcu_setup_usb "$gpio_path" "$gpio_on" "$sn"
+		;;
+	*)
+		mcu_loge "unsupported or unset 'interface' option"
+		return 1
+		;;
+	esac
+}
+
+start() {
+	config_load mcu
+	config_foreach mcu_setup mcu
+
+	return 0
+}
