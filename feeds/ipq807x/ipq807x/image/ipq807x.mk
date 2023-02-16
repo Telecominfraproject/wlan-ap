@@ -44,7 +44,8 @@ define Device/cig_wf196
   BLOCKSIZE := 256k
   PAGESIZE := 4096
   DEVICE_PACKAGES := ath11k-wifi-cig-wf196 aq-fw-download uboot-envtools kmod-usb3 kmod-usb2 \
-  	ath11k-firmware-qcn9000 ath11k-wifi-cig-wf196_6g
+	ath11k-firmware-qcn9000 ath11k-wifi-cig-wf196_6g \
+	zephyr-v3.3.x-hci_uart-cig_wf196_nrf52833
 endef
 TARGET_DEVICES += cig_wf196
 
