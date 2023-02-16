@@ -351,6 +351,11 @@ mcu_sn_check_and_update() {
 
 	[ -n "$sn_dev" ] && {
 		if [ -z "$sn" ]; then
+			[ -d /etc/config-shadow ] && {
+				uci -c /etc/config-shadow -q set mcu.${SECT}.sn="$sn_dev"
+				uci -c /etc/config-shadow -q commit mcu
+			}
+
 			uci -q set mcu.${SECT}.sn="$sn_dev"
 			uci -q commit mcu
 		else
@@ -424,6 +429,11 @@ mcu_fw_check_and_update() {
 		[ "$active_slot" = "1" ] && firmware="$slot1_fw"
 
 		[ -n "$firmware" ] && {
+			[ -d /etc/config-shadow ] && {
+				uci -c /etc/config-shadow -q set mcu.${SECT}.firmware="$firmware"
+				uci -c /etc/config-shadow -q commit mcu
+			}
+
 			uci -q set mcu.${SECT}.firmware="$firmware"
 			uci -q commit mcu
 
