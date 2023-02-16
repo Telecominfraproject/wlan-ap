@@ -33,10 +33,18 @@ define Build/Compile
 endef
 
 define Package/mcu/install
-	$(INSTALL_DIR) $(1)/etc/init.d $(1)/etc/hotplug.d/usb $(1)/lib/functions
+	$(INSTALL_DIR) $(1)/etc/init.d $(1)/etc/hotplug.d/usb $(1)/lib/functions $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/mcu.init $(1)/etc/init.d/mcu
 	$(INSTALL_DATA) ./files/mcu.hotplug $(1)/etc/hotplug.d/usb/30-mcu
 	$(INSTALL_DATA) ./files/mcu.sh $(1)/lib/functions
+	$(if $(wildcard ./files/uci-defaults/$(BOARD)_$(SUBTARGET)), \
+		$(INSTALL_DATA) ./files/uci-defaults/$(BOARD)_$(SUBTARGET) \
+		$(1)/etc/uci-defaults/20-mcu, \
+		$(if $(wildcard ./files/uci-defaults/$(BOARD)), \
+			$(INSTALL_DATA) ./files/uci-defaults/$(BOARD) \
+			$(1)/etc/uci-defaults/20-mcu \
+		) \
+	)
 endef
 
 $(eval $(call BuildPackage,mcu))

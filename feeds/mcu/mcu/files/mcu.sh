@@ -513,3 +513,29 @@ mcu_fw_check_and_update() {
 
 	return 0
 }
+
+mcu_add_uci_config() {
+	local name="$1"
+	local interface="$2"
+	local bootloader="$3"
+	local firmware="$4"
+	local enable_pin="$5"
+	local uart_path="$6"
+	local uart_baud="$7"
+	local uart_flow="$8"
+
+	uci -q set mcu.${name}="mcu"
+	uci -q set mcu.${name}.interface="$interface"
+	uci -q set mcu.${name}.bootloader="$bootloader"
+	uci -q set mcu.${name}.firmware="$firmware"
+
+	[ -n "$enable_pin" ] && uci -q set mcu.${name}.enable_pin="$enable_pin"
+	[ -n "$uart_path" ] && uci -q set mcu.${name}.uart_path="$uart_path"
+	[ -n "$uart_baud" ] && uci -q set mcu.${name}.uart_baud="$uart_baud"
+
+	[ "$uart_flow" = "1" ] && uci -q set mcu.${name}.uart_flow="1"
+
+	uci -q set mcu.${name}.disabled="0"
+
+	uci -q commit mcu
+}
