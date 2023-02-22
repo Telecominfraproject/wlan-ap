@@ -64,7 +64,7 @@ function radius_stop(mac, payload, remove) {
 	if (!radius_available(mac))
 		return;
 	debug(mac, 'stopping accounting');
-	ubus.call('spotfilter', client_remove ? 'client_remove' : 'client_set', payload);
+	ubus.call('spotfilter', remove ? 'client_remove' : 'client_set', payload);
 	system('conntrack -D -s ' + clients[mac].ip4addr  + ' -m 2');
 	if (clients[mac].accounting)
 		clients[mac].timeout.cancel();
