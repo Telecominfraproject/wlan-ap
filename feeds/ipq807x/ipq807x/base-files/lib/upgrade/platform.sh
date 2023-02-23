@@ -113,6 +113,7 @@ platform_check_image() {
 	tplink,ex227|\
 	tplink,ex447|\
 	yuncore,ax840|\
+	yuncore,fap650|\
 	motorola,q14|\
 	muxi,ap3220l|\
 	qcom,ipq6018-cp01|\
@@ -158,6 +159,7 @@ platform_do_upgrade() {
 	wallys,dr6018|\
 	wallys,dr6018-v4|\
 	yuncore,ax840|\
+	yuncore,fap650|\
 	tplink,ex447|\
 	tplink,ex227|\
 	meshpp,s618-cp03|\
