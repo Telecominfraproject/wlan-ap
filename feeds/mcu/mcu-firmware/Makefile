@@ -65,7 +65,7 @@ $(foreach FW,$(ZEPHYR_VERSIONS),$(eval $(call Download,zephyr-fw,$(FW))))
 define zephyr-fw
   define Package/$(1)-$(2)-$(3)
     $(call Package/mcu-fw-default)
-    DEPENDS:=+mcu
+    DEPENDS:=+mcu $(call zephyr-fw-deps,$(2))
     TITLE:=Zephyr '$(2)'
   endef
 
@@ -78,6 +78,10 @@ define zephyr-fw
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/$(1)/$(3)/$(1)__$(2)/*.bin \
 		$$(1)/lib/firmware/mcu/$(3)/$(1)__$(2)/
   endef
+endef
+
+define zephyr-fw-deps
+	$(if $(findstring hci_u,$1),+bluez-daemon +kmod-bluetooth +kmod-crypto-user)
 endef
 
 define zephyr-fw-unzip
