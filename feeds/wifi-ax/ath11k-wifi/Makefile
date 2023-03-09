@@ -29,7 +29,8 @@ ALLWIFIBOARDS:= \
 	cig-wf660a \
 	cig-wf194c \
 	cig-wf194c4 \
-	cig-wf196 \
+	cig-wf196-ca \
+	cig-wf196-us \
 	cybertan-eww622-a1 \
 	edgecore-eap101 \
 	gl-ax1800 \
@@ -86,9 +87,14 @@ $(call Package/ath11k-wifi-default)
     TITLE:=board-2.bin for QCOM IPQ6122 eval kits
 endef
 
-define Package/ath11k-wifi-cig-wf196_6g
+define Package/ath11k-wifi-cig-wf196_6g-ca
 $(call Package/ath11k-wifi-default)
-    TITLE:=cig-wf196 6G bdf
+    TITLE:=cig-wf196 6G bdf CA
+endef
+
+define Package/ath11k-wifi-cig-wf196_6g-us
+$(call Package/ath11k-wifi-default)
+    TITLE:=cig-wf196 6G bdf US
 endef
 
 define Package/ath11k-wifi-gl-ax1800
@@ -198,9 +204,16 @@ define Package/ath11k-wifi-qcom-qcn9000/install
 	$(INSTALL_DATA) ./board-2.bin.QCN9000 $(1)/lib/firmware/ath11k/QCN9074/hw1.0/board-2.bin
 endef
 
-define Package/ath11k-wifi-cig-wf196_6g/install
+define Package/ath11k-wifi-cig-wf196_6g-ca/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/QCN9074/hw1.0/
-	$(INSTALL_DATA) ./board-cig-wf196_6g.bin.QCN9074 $(1)/lib/firmware/ath11k/QCN9074/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-cig-wf196_6g-ca.bin.QCN9074 $(1)/lib/firmware/ath11k/QCN9074/hw1.0/board.bin
+	echo -n 'CA' > $(1)/lib/firmware/country
+endef
+
+define Package/ath11k-wifi-cig-wf196_6g-us/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/QCN9074/hw1.0/
+	$(INSTALL_DATA) ./board-cig-wf196_6g-us.bin.QCN9074 $(1)/lib/firmware/ath11k/QCN9074/hw1.0/board.bin
+	echo -n 'US' > $(1)/lib/firmware/country
 endef
 
 define Package/ath11k-wifi-gl-ax1800/install
@@ -240,7 +253,8 @@ $(eval $(call generate-ath11k-wifi-package,cig-wf188n,Cigtech WF188n))
 $(eval $(call generate-ath11k-wifi-package,cig-wf660a,Cigtech WF660a))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c,Cigtech WF194c))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c4,Cigtech WF194c4))
-$(eval $(call generate-ath11k-wifi-package,cig-wf196,Cigtech WF196))
+$(eval $(call generate-ath11k-wifi-package,cig-wf196-ca,Cigtech WF196 CA))
+$(eval $(call generate-ath11k-wifi-package,cig-wf196-us,Cigtech WF196 US))
 $(eval $(call generate-ath11k-wifi-package,cybertan-eww622-a1,CyberTan EWW622 A1))
 $(eval $(call generate-ath11k-wifi-package,sercomm-wallaby,Sercomm Kiwi))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018,Wallys DR6018))
@@ -265,6 +279,7 @@ $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq6122))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq8074))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq6018))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-qcn9000))
-$(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g))
+$(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g-ca))
+$(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g-us))
 $(eval $(call BuildPackage,ath11k-wifi-motorola-q14))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi))
