@@ -56,8 +56,13 @@ _mcu_get_fwlist() {
 
 	[ -n "$baud" ] || baud="115200"
 
-	MCU_IMGLIST_OUTPUT="$(umcumgr -s -d "$uart" -b "$baud$flow" list)"
-	[ $? -eq 0 ] || return 1
+	[ -n "$MCU_IMGLIST_OUTPUT" ] || {
+		MCU_IMGLIST_OUTPUT="$(umcumgr -s -d "$uart" -b "$baud$flow" list)"
+		[ $? -eq 0 ] || {
+			mcu_loge "request 'list' failed (uart='$uart', baud='$baud', flow='$flow')"
+			return 1
+		}
+	}
 }
 
 _mcu_get_fwmetadata() {
@@ -69,10 +74,7 @@ _mcu_get_fwmetadata() {
 	local value
 
 	[ -n "$MCU_IMGLIST_OUTPUT" ] || {
-		_mcu_get_fwlist "$uart" "$baud" "$flow" || {
-			mcu_loge "request 'list' failed (uart='$uart', baud='$baud', flow='$flow')"
-			return 1
-		}
+		_mcu_get_fwlist "$uart" "$baud" "$flow" || return 1
 	}
 
 	if [ "$slot" = "0" ]; then
@@ -220,6 +222,28 @@ mcu_get_fwname() {
 	echo "$value"
 }
 
+mcu_get_fwsha() {
+	local slot="$1"
+	local uart="$2"
+	local baud="$3"
+	local flow="$4"
+
+	local value
+
+	[ -n "$MCU_IMGLIST_OUTPUT" ] || {
+		_mcu_get_fwlist "$uart" "$baud" "$flow" || return 1
+	}
+
+	if [ "$slot" = "0" ]; then
+		slot="slot0_hash"
+	else
+		slot="slot1_hash"
+	fi
+
+	value="$(echo "$MCU_IMGLIST_OUTPUT" | grep "$slot=" | cut -d '=' -f 2)"
+	echo "$value"
+}
+
 mcu_req_boot() {
 	local uart="$1"
 	local baud="$2"
@@ -284,6 +308,19 @@ mcu_sel_slot() {
 	}
 
 	mcu_logi "active firmware slot changed to: '$slot'"
+}
+
+mcu_fwfile_sha() {
+	local path="$1"
+
+	local value
+
+	[ -f "$path" ] || return 1
+
+	value="$(umcumgr -s hash "$path" | grep "hash=" | cut -d '=' -f 2)"
+	[ -n "$value" ] || return 1
+
+	echo "$value"
 }
 
 mcu_fw_upload() {
@@ -377,8 +414,12 @@ mcu_fw_check_and_update() {
 	local active_slot
 	local fw_slots
 	local slot0_fw
+	local slot0_sha
 	local slot1_fw
+	local slot1_sha
 	local firmware
+	local fw0_sha
+	local fw1_sha
 	local board
 
 	config_get firmware "$SECT" firmware
@@ -407,20 +448,34 @@ mcu_fw_check_and_update() {
 				mcu_loge "firmware '$firmware' doesn't exist"
 				return 1
 			}
+
+			fw1_sha="$(mcu_fwfile_sha "${MCU_FW_DIR}/${board}/${firmware}/slot1.bin")"
 		else
 			[ -f "${MCU_FW_DIR}/${board}/${firmware}/slot0.bin" ] || {
 				mcu_loge "firmware '$firmware' doesn't exist"
 				return 1
 			}
 		fi
+
+		fw0_sha="$(mcu_fwfile_sha "${MCU_FW_DIR}/${board}/${firmware}/slot0.bin")"
 	}
 
 	slot0_fw="$(mcu_get_fwname "0" "$uart" "$baud" "$flow")"
 	[ $? -eq 0 ] || return 1
 
+	[ -n "$slot0_fw" ] && {
+		slot0_sha="$(mcu_get_fwsha "0" "$uart" "$baud" "$flow")"
+		[ $? -eq 0 ] || return 1
+	}
+
 	[ "$fw_slots" = "2" ] && {
 		slot1_fw="$(mcu_get_fwname "1" "$uart" "$baud" "$flow")"
 		[ $? -eq 0 ] || return 1
+
+		[ -n "$slot1_fw" ] && {
+			slot1_sha="$(mcu_get_fwsha "1" "$uart" "$baud" "$flow")"
+			[ $? -eq 0 ] || return 1
+		}
 	}
 
 	# No target firmware provided, check what's on device and update config
@@ -445,8 +500,8 @@ mcu_fw_check_and_update() {
 	}
 
 	# Do we have target firmware installed in the first slot?
-	[ "$firmware" = "$slot0_fw" ] && {
-		mcu_logd "found matching firmware installed in slot '0'"
+	[ "$firmware" = "$slot0_fw" -a "$slot0_sha" = "$fw0_sha" ] && {
+		mcu_logi "found matching firmware installed in slot '0'"
 
 		if [ "$fw_slots" = "2" -a "$active_slot" != "0" ]; then
 			mcu_sel_slot "0" "$uart" "$baud" "$flow"
@@ -463,6 +518,8 @@ mcu_fw_check_and_update() {
 		return 0
 	}
 
+	mcu_logi "no matching firmware found in slot '0'"
+
 	# Upload and boot firmware on single-slot device
 	[ "$fw_slots" = "1" ] && {
 		mcu_fw_upload "$board" "0" "$firmware" "$uart" "$baud" "$flow"
@@ -475,8 +532,8 @@ mcu_fw_check_and_update() {
 	}
 
 	# Do we have target firmware installed in the second slot?
-	[ "$firmware" = "$slot1_fw" ] && {
-		mcu_logd "found matching firmware installed in slot '1'"
+	[ "$firmware" = "$slot1_fw" -a "$slot1_sha" = "$fw1_sha" ] && {
+		mcu_logi "found matching firmware installed in slot '1'"
 
 		if [ "$active_slot" != "1" ]; then
 			mcu_sel_slot "1" "$uart" "$baud" "$flow"
@@ -492,6 +549,8 @@ mcu_fw_check_and_update() {
 
 		return 0
 	}
+
+	mcu_logi "no matching firmware found in slot '1'"
 
 	# Upload and boot firmware on multi-slot device
 	# Always use inactive slot
