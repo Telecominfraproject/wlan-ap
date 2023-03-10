@@ -8,7 +8,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mcu-firmware
-PKG_VERSION:=2023-03-05
+PKG_VERSION:=2023-03-10
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=Piotr Dymacz <pepe2k@gmail.com>
@@ -28,7 +28,7 @@ endef
 #   version-name_git-sha_pipeline-id_sha256-of-package
 ZEPHYR_VERSIONS := \
 	zephyr-v3.3.x_7055d10e538e_3877473859_321a0daf6328698a913c6504d19aa85a5170dfce6039b86d31d2e9162d34af7c \
-	zephyr-main_63d7f67d401d_3877472923_e44948759ad705f8a28449760ec3153f81d3620e0d3665e50490c7786dd2f8e2
+	zephyr-main_cf50a3c570bb_3912606668_10922f34cdde9e16cbee76a13a14fb935b9d1fe13eb9136cba31de27033a9c3e
 
 ZEPHYR_FW_CI_URL := https://gitlab.com/pepe2k/zephyr/-/jobs/
 
