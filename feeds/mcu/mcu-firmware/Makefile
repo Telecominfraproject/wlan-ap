@@ -8,7 +8,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mcu-firmware
-PKG_VERSION:=2023-03-10
+PKG_VERSION:=2023-03-12
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=Piotr Dymacz <pepe2k@gmail.com>
