@@ -6,7 +6,10 @@
 MCUBOOT_USB_PRODUCT="MCUboot serial recovery"
 MCUBOOT_USB_VID_PID="16c005e1"
 
-MCU_FW_DIR="/lib/firmware/mcu/"
+# Host support and firmware directories
+MCU_HS_DIR="/etc/mcu.d"
+MCU_FW_DIR="/lib/firmware/mcu"
+
 MCU_FLOCK_FILE="/tmp/lock/mcu"
 
 MCU_SYSINFO_OUTPUT=
