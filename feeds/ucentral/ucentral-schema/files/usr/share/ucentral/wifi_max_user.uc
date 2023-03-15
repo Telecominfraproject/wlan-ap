@@ -13,4 +13,4 @@ function phy_get() {
 }
 
 let phys = phy_get();
-printf("%d\n", phys[0].max_ap_assoc);
+printf("%d\n", phys[0].max_ap_assoc || 32);

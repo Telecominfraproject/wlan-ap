@@ -13,7 +13,10 @@ function auth_client(ctx) {
 	let payload = portal.radius_init(ctx);
 
 	payload.logoff_url = sprintf('http://%s:3990/', ctx.env.SERVER_ADDR);
-	if (ctx.query_string.username && ctx.query_string.response) {
+	if (ctx.query_string.username && ctx.query_string.password && !portal.config.uam.uam_secret) {
+		payload.username = ctx.query_string.username;
+		payload.password = ctx.query_string.password;
+	} else if (ctx.query_string.username && ctx.query_string.response) {
 		let challenge = uam.md5(portal.config.uam.challenge, ctx.format_mac);
 
 		payload.username = ctx.query_string.username;
