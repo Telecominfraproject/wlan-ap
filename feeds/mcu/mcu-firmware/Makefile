@@ -8,7 +8,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mcu-firmware
-PKG_VERSION:=2023-03-05
+PKG_VERSION:=2023-03-12
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=Piotr Dymacz <pepe2k@gmail.com>
@@ -28,9 +28,14 @@ endef
 #   version-name_git-sha_pipeline-id_sha256-of-package
 ZEPHYR_VERSIONS := \
 	zephyr-v3.3.x_7055d10e538e_3877473859_321a0daf6328698a913c6504d19aa85a5170dfce6039b86d31d2e9162d34af7c \
-	zephyr-main_63d7f67d401d_3877472923_e44948759ad705f8a28449760ec3153f81d3620e0d3665e50490c7786dd2f8e2
+	zephyr-main_cf50a3c570bb_3912606668_10922f34cdde9e16cbee76a13a14fb935b9d1fe13eb9136cba31de27033a9c3e
 
 ZEPHYR_FW_CI_URL := https://gitlab.com/pepe2k/zephyr/-/jobs/
+
+ZEPHYR_FW_TYPES := \
+	hello_world \
+	hci_uart \
+	hci_usb
 
 # Zephyr 'hello_world' targets
 ZEPHYR_HELLO_WORLD_TARGETS := \
@@ -59,6 +64,20 @@ define Download/zephyr-fw
 endef
 $(foreach FW,$(ZEPHYR_VERSIONS),$(eval $(call Download,zephyr-fw,$(FW))))
 
+# $(1) firmware name (e.g. hci_usb)
+define zephyr-fw-host-support
+  define Package/zephyr-$(1)-host-support
+    $(call Package/mcu-fw-default)
+    DEPENDS:=+mcu
+    TITLE:=Zephyr '$(1)' common host side support
+    HIDDEN:=1
+  endef
+
+  define Package/zephyr-$(1)-host-support/install
+	$(CP) ./files/$(1)/* $$(1)/
+  endef
+endef
+
 # $(1) version (e.g zephyr-v3.3.x)
 # $(2) firmware name (e.g. hci_usb)
 # $(3) target/board name (e.g. nrf52840dongle_nrf52840)
@@ -81,6 +100,7 @@ define zephyr-fw
 endef
 
 define zephyr-fw-deps
+	$(if $(wildcard ./files/$(1)/*),+zephyr-$(1)-host-support) \
 	$(if $(findstring hci_u,$1),+bluez-daemon +kmod-bluetooth +kmod-crypto-user)
 endef
 
@@ -102,6 +122,15 @@ define Build/Compile
 endef
 
 
+# Generate host side support packages (per firmware type)
+$(foreach FW,$(ZEPHYR_FW_TYPES),\
+  $(if $(wildcard ./files/$(FW)/*),$(eval $(call zephyr-fw-host-support,$(FW)))))
+
+$(foreach FW,$(ZEPHYR_FW_TYPES),\
+  $(if $(wildcard ./files/$(FW)/*),$(eval $(call BuildPackage,zephyr-$(FW)-host-support))))
+
+
+# Generate dedicated Zephyr firmware packages (per firmware version, type and board)
 $(foreach VER,$(ZEPHYR_VERSIONS),\
   $(foreach TARGET,$(ZEPHYR_HELLO_WORLD_TARGETS),\
     $(eval $(call zephyr-fw,$(call word-underscore,$(VER),1),hello_world,$(TARGET)))))
