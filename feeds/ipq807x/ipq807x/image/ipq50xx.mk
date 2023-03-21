@@ -1,5 +1,14 @@
 KERNEL_LOADADDR := 0x41208000
 
+define Device/cig_wf186w
+  DEVICE_TITLE := Cigtech WF-186w
+  DEVICE_DTS := qcom-ipq5018-cig-wf186w
+  SUPPORTED_DEVICES := cig,wf186w
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf186w ath11k-firmware-ipq50xx-map-spruce
+  DEVICE_DTS_CONFIG := config@mp03.3
+endef
+TARGET_DEVICES += cig_wf186w
+
 define Device/cybertan_eww622_a1
   DEVICE_TITLE := CyberTan EWW622-A1
   DEVICE_DTS := qcom-ipq5018-eww622-a1

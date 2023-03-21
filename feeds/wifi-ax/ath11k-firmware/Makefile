@@ -20,6 +20,13 @@ $(Package/ath11k-firmware-default)
   DEPENDS:=@TARGET_ipq807x_ipq50xx
 endef
 
+
+define Package/ath11k-firmware-ipq50xx-map-spruce
+$(Package/ath11k-firmware-default)
+  TITLE:=ath11k firmware for IPQ50xx+spruce devices
+  DEPENDS:=@TARGET_ipq807x_ipq50xx
+endef
+
 define Package/ath11k-firmware-ipq50xx-spruce
 $(Package/ath11k-firmware-default)
   TITLE:=ath11k firmware for IPQ50xx devices with spruce
@@ -54,6 +61,11 @@ define Package/ath11k-firmware-ipq50xx/description
 Standard ath11k firmware for IPQ50xx from QCA
 endef
 
+
+define Package/ath11k-firmware-ipq50xx-map-spruce/description
+Standard ath11k firmware for IPQ50xx+spruce from QCA
+endef
+
 define Package/ath11k-firmware-ipq50xx-spruce/description
 Standard ath11k firmware for IPQ50xx/spruce from QCA
 endef
@@ -82,6 +94,18 @@ define Package/ath11k-firmware-ipq50xx/install
 	$(INSTALL_DIR) $(1)/lib/firmware/IPQ5018
 	$(INSTALL_DATA) ./files/IPQ5018/* \
 		$(1)/lib/firmware/IPQ5018/
+endef
+
+
+define Package/ath11k-firmware-ipq50xx-map-spruce/install
+	$(INSTALL_DIR) $(1)/lib/firmware/IPQ5018
+	$(INSTALL_DATA) ./files/IPQ5018_map_spruce/* \
+		$(1)/lib/firmware/IPQ5018/
+
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122
+	$(INSTALL_DIR) $(1)/lib/firmware/qcn6122
+	$(INSTALL_DATA) ./files/QCN6122_map_spruce/* \
+		$(1)/lib/firmware/qcn6122/
 endef
 
 define Package/ath11k-firmware-ipq50xx-spruce/install
@@ -121,6 +145,7 @@ define Package/ath11k-wifi-yuncore-ax840/install
 endef
 
 $(eval $(call BuildPackage,ath11k-firmware-ipq50xx))
+$(eval $(call BuildPackage,ath11k-firmware-ipq50xx-map-spruce))
 $(eval $(call BuildPackage,ath11k-firmware-ipq50xx-spruce))
 $(eval $(call BuildPackage,ath11k-firmware-ipq60xx))
 $(eval $(call BuildPackage,ath11k-firmware-ipq807x))

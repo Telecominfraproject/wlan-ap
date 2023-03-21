@@ -26,6 +26,7 @@ endef
 ALLWIFIBOARDS:= \
 	cig-wf188 \
 	cig-wf188n \
+	cig-wf186w \
 	cig-wf660a \
 	cig-wf194c \
 	cig-wf194c4 \
@@ -216,6 +217,7 @@ define Package/ath11k-wifi-cig-wf196_6g-us/install
 	echo -n 'US' > $(1)/lib/firmware/country
 endef
 
+
 define Package/ath11k-wifi-gl-ax1800/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
 	$(INSTALL_DATA) ./board-gl-ax1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
@@ -250,6 +252,7 @@ endef
 
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
 $(eval $(call generate-ath11k-wifi-package,cig-wf188n,Cigtech WF188n))
+$(eval $(call generate-ath11k-wifi-package,cig-wf186w,Cigtech WF186w))
 $(eval $(call generate-ath11k-wifi-package,cig-wf660a,Cigtech WF660a))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c,Cigtech WF194c))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c4,Cigtech WF194c4))

@@ -84,6 +84,7 @@ platform_check_image() {
 	local magic_long="$(get_magic_long "$1")"
 	board=$(board_name)
 	case $board in
+	cig,wf186w|\
 	cig,wf188|\
 	cig,wf660a|\
 	cig,wf188n|\
@@ -142,6 +143,7 @@ platform_do_upgrade() {
 	motorola,q14)
 		emmc_do_upgrade $1
 		;;
+	cig,wf186w|\
 	cig,wf188n|\
 	cig,wf194c|\
 	cig,wf194c4|\
