@@ -289,6 +289,10 @@ mcu_sn_check_and_update() {
 	return 0
 }
 
+# Returns:
+# 0 if MCU was requested to boot firmware
+# 1 on error
+# 2 if MCU was requested to reset
 mcu_fw_check_and_update() {
 	local uart="$1"
 	local baud="$2"
@@ -385,9 +389,11 @@ mcu_fw_check_and_update() {
 
 			mcu_req "boot" "$uart" "$baud" "$flow"
 			[ $? -ne 0 ] && return 1
+
+			return 0
 		}
 
-		return 0
+		return 1
 	}
 
 	# Do we have target firmware installed in the first slot?
@@ -401,6 +407,8 @@ mcu_fw_check_and_update() {
 			# Changing active slots requires MCU reset at the moment
 			mcu_req "reset" "$uart" "$baud" "$flow"
 			[ $? -ne 0 ] && return 1
+
+			return 2
 		else
 			mcu_req "boot" "$uart" "$baud" "$flow"
 			[ $? -ne 0 ] && return 1
@@ -411,15 +419,15 @@ mcu_fw_check_and_update() {
 
 	mcu_logi "no matching firmware found in slot '0'"
 
-	# Upload and boot firmware on single-slot device
+	# Upload firmware and reset on single-slot device
 	[ "$fw_slots" = "1" ] && {
 		mcu_fw_upload "$board" "0" "$firmware" "$uart" "$baud" "$flow"
 		[ $? -ne 0 ] && return 1
 
-		mcu_req "boot" "$uart" "$baud" "$flow"
+		mcu_req "reset" "$uart" "$baud" "$flow"
 		[ $? -ne 0 ] && return 1
 
-		return 0
+		return 2
 	}
 
 	# Do we have target firmware installed in the second slot?
@@ -433,6 +441,8 @@ mcu_fw_check_and_update() {
 			# Changing active slots requires MCU reset at the moment
 			mcu_req "reset" "$uart" "$baud" "$flow"
 			[ $? -ne 0 ] && return 1
+
+			return 2
 		else
 			mcu_req "boot" "$uart" "$baud" "$flow"
 			[ $? -ne 0 ] && return 1
@@ -461,7 +471,7 @@ mcu_fw_check_and_update() {
 	mcu_req "reset" "$uart" "$baud" "$flow"
 	[ $? -ne 0 ] && return 1
 
-	return 0
+	return 2
 }
 
 mcu_add_uci_config() {
