@@ -10,6 +10,7 @@ CPU_TYPE:=cortex-a7
 
 KERNEL_PATCHVER:=4.4
 KERNEL_NAME_SUFFIX=-qsdk-11f09717303ecd83c3a64e9efe23f25921dc1016
+KERNEL_QSDK_4_4:=y
 
 include $(INCLUDE_DIR)/target.mk
 DEFAULT_PACKAGES += kmod-qca-nss-dp kmod-qca-ssdk swconfig \
