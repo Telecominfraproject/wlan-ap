@@ -1,0 +1,474 @@
+From 3407566165b93dba2d878ab62315b4a4900a51b1 Mon Sep 17 00:00:00 2001
+From: Sriram R <quic_srirrama@quicinc.com>
+Date: Fri, 24 Dec 2021 14:58:33 +0530
+Subject: [PATCH 04/10] ath12k: vdev statemachine changes for single wiphy
+
+Since any channel can be assigned to a  vif being brought up,
+the vdev cannot be created during add_interface(). Hence defer the
+vdev creation till channel assignment.
+Once a vdev is created and assigned to the vif, we delete in remove_interface
+or it can be deleted when the vif switches across channels in different
+radios.
+
+Signed-off-by: Sriram R <quic_srirrama@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |   1 +
+ drivers/net/wireless/ath/ath12k/hw.h   |   2 +
+ drivers/net/wireless/ath/ath12k/mac.c  | 262 +++++++++++++++++++++++++--------
+ 3 files changed, 206 insertions(+), 59 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -300,6 +300,7 @@ struct ath12k_vif {
+ 		} ap;
+ 	} u;
+ 
++	bool is_created;
+ 	bool is_started;
+ 	bool is_up;
+ 	bool spectral_enabled;
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -65,6 +65,8 @@
+ #define TARGET_RX_BATCHMODE		1
+ #define TARGET_EMA_MAX_PROFILE_PERIOD	8
+ 
++#define ATH12K_HW_DEFAULT_QUEUE		0
++
+ #define ATH12K_HW_MAX_QUEUES		4
+ #define ATH12K_QUEUE_LEN		4096
+ 
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -6788,37 +6788,19 @@ static void ath12k_mac_op_update_vif_off
+ 	}
+ }
+ 
+-static int ath12k_mac_op_add_interface(struct ieee80211_hw *hw,
+-				       struct ieee80211_vif *vif)
++static int ath12k_mac_vdev_create(struct ath12k *ar, struct ieee80211_vif *vif)
+ {
+-	struct ath12k *ar = hw->priv;
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
++	struct ieee80211_hw *hw = ab->ah->hw;
+ 	struct vdev_create_params vdev_param = {0};
+ 	struct peer_create_params peer_param;
+ 	u32 param_id, param_value;
+ 	u16 nss;
+ 	int i;
+-	int ret;
+-	int bit;
+-
+-	vif->driver_flags |= IEEE80211_VIF_SUPPORTS_UAPSD;
++	int ret, vdev_id;
+ 
+-	mutex_lock(&ar->conf_mutex);
+-
+-	if (vif->type == NL80211_IFTYPE_AP &&
+-	    ar->num_peers > (ar->max_num_peers - 1)) {
+-		ath12k_warn(ab, "failed to create vdev due to insufficient peer entry resource in firmware\n");
+-		ret = -ENOBUFS;
+-		goto err;
+-	}
+-
+-	if (ar->num_created_vdevs > (TARGET_NUM_VDEVS - 1)) {
+-		ath12k_warn(ab, "failed to create vdev, reached max vdev limit %d\n",
+-			    TARGET_NUM_VDEVS);
+-		ret = -EBUSY;
+-		goto err;
+-	}
++	lockdep_assert_held(&ar->conf_mutex);
+ 
+ 	/* Send vdev stats offload commands to firmware before first vdev
+ 	 * creation. ie., when num_created_vdevs = 0
+@@ -6831,34 +6813,9 @@ static int ath12k_mac_op_add_interface(s
+ 		}
+ 	}
+ 
+-	memset(arvif, 0, sizeof(*arvif));
+-
+-	arvif->ar = ar;
+-	arvif->vif = vif;
+-
+-	INIT_LIST_HEAD(&arvif->list);
+-
+-	arvif->key_cipher = INVALID_CIPHER;
+-	/* Should we initialize any worker to handle connection loss indication
+-	 * from firmware in sta mode?
+-	 */
+-
+-	for (i = 0; i < ARRAY_SIZE(arvif->bitrate_mask.control); i++) {
+-		arvif->bitrate_mask.control[i].legacy = 0xffffffff;
+-		arvif->bitrate_mask.control[i].gi = NL80211_TXRATE_FORCE_SGI;
+-		memset(arvif->bitrate_mask.control[i].ht_mcs, 0xff,
+-		       sizeof(arvif->bitrate_mask.control[i].ht_mcs));
+-		memset(arvif->bitrate_mask.control[i].vht_mcs, 0xff,
+-		       sizeof(arvif->bitrate_mask.control[i].vht_mcs));
+-		memset(arvif->bitrate_mask.control[i].he_mcs, 0xff,
+-		       sizeof(arvif->bitrate_mask.control[i].he_mcs));
+-		memset(arvif->bitrate_mask.control[i].eht_mcs, 0xff,
+-		       sizeof(arvif->bitrate_mask.control[i].eht_mcs));
+-	}
+-
+-	bit = __ffs64(ab->free_vdev_map);
++	vdev_id = __ffs64(ab->free_vdev_map);
+ 
+-	arvif->vdev_id = bit;
++	arvif->vdev_id = vdev_id;
+ 	arvif->vdev_subtype = WMI_VDEV_SUBTYPE_NONE;
+ 
+ 	switch (vif->type) {
+@@ -6874,17 +6831,18 @@ static int ath12k_mac_op_add_interface(s
+ 		break;
+ 	case NL80211_IFTYPE_MONITOR:
+ 		arvif->vdev_type = WMI_VDEV_TYPE_MONITOR;
+-		ar->monitor_vdev_id = bit;
++		ar->monitor_vdev_id = vdev_id;
+ 		break;
+ 	default:
+ 		WARN_ON(1);
+ 		break;
+ 	}
+ 
+-	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac add interface id %d type %d subtype %d map %llx\n",
++	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac vdev create id %d type %d subtype %d map %llx\n",
+ 		   arvif->vdev_id, arvif->vdev_type, arvif->vdev_subtype,
+ 		   ab->free_vdev_map);
+ 
++	/* TODO Revisit this sharing of common queues across all ar's */
+ 	vif->cab_queue = arvif->vdev_id % (ATH12K_HW_MAX_QUEUES - 1);
+ 	for (i = 0; i < ARRAY_SIZE(vif->hw_queue); i++)
+ 		vif->hw_queue[i] = i % (ATH12K_HW_MAX_QUEUES - 1);
+@@ -6904,8 +6862,10 @@ static int ath12k_mac_op_add_interface(s
+ 	}
+ 
+ 	ar->num_created_vdevs++;
++	arvif->is_created = true;
+ 	ath12k_dbg(ab, ATH12K_DBG_MAC, "vdev %pM created, vdev_id %d\n",
+ 		   vif->addr, arvif->vdev_id);
++
+ 	ar->allocated_vdev_map |= 1LL << arvif->vdev_id;
+ 	ab->free_vdev_map &= ~(1LL << arvif->vdev_id);
+ 
+@@ -6994,7 +6954,7 @@ static int ath12k_mac_op_add_interface(s
+ 		goto err_peer_del;
+ 
+ 	param_id = WMI_VDEV_PARAM_RTS_THRESHOLD;
+-	param_value = ar->hw->wiphy->rts_threshold;
++	param_value = hw->wiphy->rts_threshold;
+ 	ret = ath12k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
+ 					    param_id, param_value);
+ 	if (ret) {
+@@ -7041,6 +7001,7 @@ err_peer_del:
+ err_vdev_del:
+ 	ath12k_wmi_vdev_delete(ar, arvif->vdev_id);
+ 	ar->num_created_vdevs--;
++	arvif->is_created = false;
+ 	ar->allocated_vdev_map &= ~(1LL << arvif->vdev_id);
+ 	ab->free_vdev_map |= 1LL << arvif->vdev_id;
+ 	ab->free_vdev_stats_id_map &= ~(1LL << arvif->vdev_stats_id);
+@@ -7049,10 +7010,110 @@ err_vdev_del:
+ 	spin_unlock_bh(&ar->data_lock);
+ 
+ err:
+-	ath12k_debugfs_remove_interface(arvif);
++	return ret;
++}
++
++static struct ath12k *ath12k_mac_assign_vif_to_vdev(struct ieee80211_hw *hw,
++						    struct ieee80211_vif *vif,
++						    struct ieee80211_chanctx_conf *ctx)
++{
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar;
++	struct ath12k_base *ab;
++	struct ath12k_vif *arvif = (void *)vif->drv_priv;
++	u8 bit;
++	int ret;
++
++	lockdep_assert_held(&ah->conf_mutex);
++
++	if (arvif->ar)
++		goto out;
++
++	ar = ath12k_get_ar_by_ctx(hw, ctx);
++
++	if (!ar)
++		goto out;
++
++	ab = ar->ab;
++
++	mutex_lock(&ar->conf_mutex);
++
++	if (vif->type == NL80211_IFTYPE_AP &&
++	    ar->num_peers > (ar->max_num_peers - 1)) {
++		ath12k_warn(ab, "failed to create vdev due to insufficient peer entry resource in firmware\n");
++		ret = -ENOBUFS;
++		goto unlock;
++	}
++
++	if (ar->num_created_vdevs > (TARGET_NUM_VDEVS - 1)) {
++		ath12k_warn(ab, "failed to create vdev, reached max vdev limit %d\n",
++			    TARGET_NUM_VDEVS);
++		ret = -EBUSY;
++		goto unlock;
++	}
++
++	ret = ath12k_mac_vdev_create(ar, vif);
++	if (ret) {
++		ath12k_warn(ab, "failed to create vdev %d ret %d", bit, ret);
++		goto unlock;
++	}
++	arvif->ar = ar;
++
++	/* TODO Apply any parameters for the vdev which were received after
++	 * add_interface, corresponding to this vif
++	 */
++
++unlock:
+ 	mutex_unlock(&ar->conf_mutex);
++out:
++	return arvif->ar;
++}
+ 
+-	return ret;
++static int ath12k_mac_op_add_interface(struct ieee80211_hw *hw,
++				       struct ieee80211_vif *vif)
++{
++	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
++	struct ath12k_hw *ah = hw->priv;
++	int i;
++
++	/* The ar in which this vif will be assigned can be determined since
++	 * it depends on the channel in which the vif is brought up.
++	 * For now, prepare the vif/arvif with common changes
++	 * TODO Add checks to ensure at least one ar has a free vdev
++	 * Also if the hw uses only one link/ar the vdev could be created
++	 * here itself
++	 */
++
++	mutex_lock(&ah->conf_mutex);
++	memset(arvif, 0, sizeof(*arvif));
++
++	arvif->vdev_type = vif->type;
++	arvif->vif = vif;
++
++	INIT_LIST_HEAD(&arvif->list);
++	arvif->key_cipher = INVALID_CIPHER;
++
++	for (i = 0; i < ARRAY_SIZE(arvif->bitrate_mask.control); i++) {
++		arvif->bitrate_mask.control[i].legacy = 0xffffffff;
++		arvif->bitrate_mask.control[i].gi = NL80211_TXRATE_FORCE_SGI;
++		memset(arvif->bitrate_mask.control[i].ht_mcs, 0xff,
++		       sizeof(arvif->bitrate_mask.control[i].ht_mcs));
++		memset(arvif->bitrate_mask.control[i].vht_mcs, 0xff,
++		       sizeof(arvif->bitrate_mask.control[i].vht_mcs));
++		memset(arvif->bitrate_mask.control[i].he_mcs, 0xff,
++		       sizeof(arvif->bitrate_mask.control[i].he_mcs));
++		memset(arvif->bitrate_mask.control[i].eht_mcs, 0xff,
++		       sizeof(arvif->bitrate_mask.control[i].eht_mcs));
++	}
++
++	/* Allocate Default Queue now and reassign during actual vdev create */
++	vif->cab_queue = ATH12K_HW_DEFAULT_QUEUE;
++	for (i = 0; i < ARRAY_SIZE(vif->hw_queue); i++)
++		vif->hw_queue[i] = ATH12K_HW_DEFAULT_QUEUE;
++
++	vif->driver_flags |= IEEE80211_VIF_SUPPORTS_UAPSD;
++	mutex_unlock(&ah->conf_mutex);
++	return 0;
+ }
+ 
+ static void ath12k_mac_vif_unref(struct ath12k_dp *dp, struct ieee80211_vif *vif)
+@@ -7083,12 +7144,22 @@ static void ath12k_mac_vif_unref(struct
+ static void ath12k_mac_op_remove_interface(struct ieee80211_hw *hw,
+ 					   struct ieee80211_vif *vif)
+ {
+-	struct ath12k *ar = hw->priv;
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar;
+ 	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
+-	struct ath12k_base *ab = ar->ab;
++	struct ath12k_base *ab;
+ 	unsigned long time_left;
+ 	int ret;
+ 
++	mutex_lock(&ah->conf_mutex);
++	if (!arvif->is_created) {
++		mutex_unlock(&ah->conf_mutex);
++		return;
++	}
++
++	ar = arvif->ar;
++	ab = ar->ab;
++
+ 	mutex_lock(&ar->conf_mutex);
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_MAC, "mac remove interface (vdev %d)\n",
+@@ -7134,6 +7205,7 @@ static void ath12k_mac_op_remove_interfa
+ 	ar->allocated_vdev_map &= ~(1LL << arvif->vdev_id);
+ 	ab->free_vdev_stats_id_map &= ~(1LL << arvif->vdev_stats_id);
+ 	ar->num_created_vdevs--;
++	arvif->is_created = false;
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_MAC, "vdev %pM deleted, vdev_id %d\n",
+ 		   vif->addr, arvif->vdev_id);
+@@ -7162,6 +7234,7 @@ err_vdev_del:
+ 	/* TODO: recal traffic pause state based on the available vdevs */
+ 
+ 	mutex_unlock(&ar->conf_mutex);
++	mutex_unlock(&ah->conf_mutex);
+ }
+ 
+ /* FIXME: Has to be verified. */
+@@ -7769,8 +7842,15 @@ static void ath12k_mac_op_change_chanctx
+ 					 struct ieee80211_chanctx_conf *ctx,
+ 					 u32 changed)
+ {
+-	struct ath12k *ar = hw->priv;
+-	struct ath12k_base *ab = ar->ab;
++	struct ath12k *ar;
++	struct ath12k_base *ab;
++
++	ar = ath12k_get_ar_by_ctx(hw, ctx);
++
++	if (!ar)
++		return;
++
++	ab = ar->ab;
+ 
+ 	mutex_lock(&ar->conf_mutex);
+ 
+@@ -8338,13 +8418,43 @@ ath12k_mac_op_assign_vif_chanctx(struct
+ 				 struct ieee80211_vif *vif,
+ 				 struct ieee80211_chanctx_conf *ctx)
+ {
+-	struct ath12k *ar = hw->priv;
+-	struct ath12k_base *ab = ar->ab;
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar;
++	struct ath12k_base *ab;
+ 	struct ath12k_vif *arvif = (void *)vif->drv_priv;
+ 	int ret;
+ 	struct peer_create_params param;
+ 	enum ieee80211_ap_reg_power power_type;
+ 
++	if (!ctx)
++		return -EINVAL;
++
++	mutex_lock(&ah->conf_mutex);
++	if (!arvif->is_created) {
++		ar = ath12k_mac_assign_vif_to_vdev(hw, vif, ctx);
++		if (!ar) {
++			mutex_unlock(&ah->conf_mutex);
++			return -EINVAL;
++		}
++	} else {
++		ar = arvif->ar;
++		if (!ar) {
++			mutex_unlock(&ah->conf_mutex);
++			return -EINVAL;
++		}
++
++		/* TODO If vif is already assigned, but now the chan is different and belongs
++		 * to a different ar, then delete the old vdev in different ar and create new
++		 */
++		if (!ar->mac.sbands[ctx->def.chan->band].channels) {
++			mutex_unlock(&ah->conf_mutex);
++			WARN_ON(1);
++			return -EINVAL;
++		}
++	}
++
++	ab = ar->ab;
++
+ 	mutex_lock(&ar->conf_mutex);
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_MAC,
+@@ -8428,6 +8538,7 @@ ath12k_mac_op_assign_vif_chanctx(struct
+ 
+ out:
+ 	mutex_unlock(&ar->conf_mutex);
++	mutex_unlock(&ah->conf_mutex);
+ 
+ 	return ret;
+ }
+@@ -8437,11 +8548,29 @@ ath12k_mac_op_unassign_vif_chanctx(struc
+ 				   struct ieee80211_vif *vif,
+ 				   struct ieee80211_chanctx_conf *ctx)
+ {
+-	struct ath12k *ar = hw->priv;
+-	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_vif *arvif = (void *)vif->drv_priv;
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k_base *ab;
++	struct ath12k *ar;
+ 	int ret;
+ 
++	mutex_lock(&ah->conf_mutex);
++	/* The vif is expected to be attached to an ar's VDEV.
++	 * We leave the vif/vdev in this function as is
++	 * and not delete the vdev symmetric to assign_vif_chanctx()
++	 * the VDEV will be deleted and unassigned either during
++	 * remove_interface() or when there is a change in channel
++	 * that moves the vif to a new ar
++	 */
++	if (!arvif->is_created) {
++		mutex_unlock(&ah->conf_mutex);
++		WARN_ON(1);
++		return;
++	}
++
++	ar = arvif->ar;
++	ab = ar->ab;
++
+ 	mutex_lock(&ar->conf_mutex);
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_MAC,
+@@ -8459,11 +8588,13 @@ ath12k_mac_op_unassign_vif_chanctx(struc
+ 		ret = ath12k_mac_monitor_stop(ar);
+ 		if (ret) {
+ 			mutex_unlock(&ar->conf_mutex);
++			mutex_unlock(&ah->conf_mutex);
+ 			return;
+ 		}
+ 
+ 		arvif->is_started = false;
+ 		mutex_unlock(&ar->conf_mutex);
++		mutex_unlock(&ah->conf_mutex);
+ 		return;
+ 	}
+ 
+@@ -8484,6 +8615,7 @@ ath12k_mac_op_unassign_vif_chanctx(struc
+ 		ath12k_mac_monitor_stop(ar);
+ 
+ 	mutex_unlock(&ar->conf_mutex);
++	mutex_unlock(&ah->conf_mutex);
+ }
+ 
+ static int
+@@ -8492,7 +8624,22 @@ ath12k_mac_op_switch_vif_chanctx(struct
+ 				 int n_vifs,
+ 				 enum ieee80211_chanctx_switch_mode mode)
+ {
+-	struct ath12k *ar = hw->priv;
++	struct ath12k *ar;
++
++	/* TODO Swiching a vif between two radios require deleting of vdev
++	 * in its current ar and creating a vdev and applying its cached params
++	 * to the new vdev in ar.
++	 * Currently only switching within same band allowed, also if ar's
++	 * which are in same band (5G LB/HB needs to be handled)
++	 */
++	if (vifs->old_ctx->def.chan->band != vifs->new_ctx->def.chan->band) {
++		WARN_ON(1);
++		return -EINVAL;
++	}
++
++	ar = ath12k_get_ar_by_ctx(hw, vifs->old_ctx);
++	if (!ar)
++		return -EINVAL;
+ 
+ 	mutex_lock(&ar->conf_mutex);
+ 

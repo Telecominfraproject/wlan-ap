@@ -1,0 +1,253 @@
+From 7f4be61346f929cc79dd066394c3e6e94fc60a52 Mon Sep 17 00:00:00 2001
+From: Rameshkumar Sundaram <quic_ramess@quicinc.com>
+Date: Wed, 25 May 2022 12:40:43 +0530
+Subject: [PATCH] mac80211: add RU puncturing support for mesh
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+RU puncturing(“Punctured 242-tone RU") refers to the transmission
+of a PPDU in which no signal is present in at
+least one of the 20 MHz subchannels within the PPDU bandwidth,
+puncturing might be the result of the unavailability
+of 20 MHz subchannel(s) within the PPDU bandwidth,
+such as a busy channel indicated by the CCA or
+the setting of the Disabled Subchannel Bitmap field (16 bit field)
+in the EHT Operations element.
+
+RU puncturing bitmap is a 16 bit field where each bit corresponds
+to a 20 MHz channel in the given bandwidth,
+bit 0 corresponding to the channel with lowest frequency.
+Bit set to 1 indicates that the channel is punctured, otherwise active.
+
+Userspace will send the RU puncturing bitmap via attribute
+NL80211_ATTR_RU_PUNCT_BITMAP in Frequncey Params as
+a part of join mesh (NL80211_CMD_JOIN_MESH) command.
+The recieved puncturing bitmap is validated and copied to
+chandef's ru_punct_bitmap of mesh interface data.
+
+Add changes to build mesh beacon's EHT Operational IE with
+disable_sub_chan_bitmap_present and disable_subchannel_bitmap
+based on chandef's ru_punct_bitmap.
+
+Validate & Update Peer mesh Stations's puncturing bitmap
+in local structures while adding new mesh station
+(Parsed from Peer mesh Station's eht oper ie)
+
+Add changes to allow mesh peering with Peer's that advertise
+different puncturing pattern than self.
+
+Signed-off-by: Rameshkumar Sundaram <quic_ramess@quicinc.com>
+---
+ include/linux/ieee80211.h |  2 +-
+ include/net/cfg80211.c    |  0
+ include/net/cfg80211.h    |  8 ++++++++
+ include/net/mac80211.h    |  2 ++
+ net/mac80211/cfg.c        |  9 +++++++--
+ net/mac80211/mesh.c       |  5 +++++
+ net/mac80211/mesh_plink.c | 32 ++++++++++++++++++++++++++++++++
+ net/mac80211/util.c       |  7 +++++++
+ net/wireless/chan.c       |  1 +
+ net/wireless/nl80211.c    |  4 ++++
+ 10 files changed, 67 insertions(+), 3 deletions(-)
+ create mode 100644 include/net/cfg80211.c
+
+diff --git a/include/linux/ieee80211.h b/include/linux/ieee80211.h
+index 1e23fe6..9f212d7 100644
+--- a/include/linux/ieee80211.h
++++ b/include/linux/ieee80211.h
+@@ -2031,7 +2031,7 @@ struct ieee80211_eht_operation {
+ 	u8 ccfs;
+ 	u8 disable_sub_chan_bitmap_present:1,
+ 	   reserved2:7;
+-	u8 disable_subchannel_bitmap[2];
++	__le16 disable_subchannel_bitmap;
+ } __packed;
+ 
+ #define IEEE80211_EHT_OPER_DISABLED_SUBCHANNEL_BITMAP_PRESENT	0x1
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index a90c205..a4261f5 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -957,6 +957,13 @@ cfg80211_chandef_compatible(const struct cfg80211_chan_def *chandef1,
+ bool cfg80211_chandef_valid(const struct cfg80211_chan_def *chandef);
+ 
+ /**
++ * cfg80211_ru_punct_bitmap_valid - check if Puncturing bitmap on given
++ * channel definition is valid
++ * @chandef: the channel definition to check
++ * Return: %true if the Puncturing bitmap is valid . %false otherwise.
++ */
++bool cfg80211_ru_punct_bitmap_valid(const struct cfg80211_chan_def *chandef);
++/**
+  * cfg80211_chandef_usable - check if secondary channels can be used
+  * @wiphy: the wiphy to validate against
+  * @chandef: the channel definition to check
+@@ -1587,6 +1594,7 @@ struct station_parameters {
+ 	const u8 *supported_oper_classes;
+ 	u8 supported_oper_classes_len;
+ 	u8 opmode_notif;
++	u16 ru_punct_bitmap;
+ 	bool opmode_notif_used;
+ 	int support_p2p_ps;
+ 	const struct ieee80211_he_cap_elem *he_capa;
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index bfbb53f..3c14e9b 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -2166,6 +2166,7 @@ struct ieee80211_sta_txpwr {
+  * @he_cap: HE capabilities of this STA
+  * @he_6ghz_capa: on 6 GHz, holds the HE 6 GHz band capabilities
+  * @eht_cap: EHT capabilities of this STA
++ * @ru_punct_bitmap: RU Puncturing bitmap of this STA
+  * @max_rx_aggregation_subframes: maximal amount of frames in a single AMPDU
+  *	that this station is allowed to transmit to us.
+  *	Can be modified by driver.
+@@ -2207,6 +2208,7 @@ struct ieee80211_sta {
+ 	struct ieee80211_sta_he_cap he_cap;
+ 	struct ieee80211_he_6ghz_capa he_6ghz_capa;
+ 	struct ieee80211_sta_eht_cap eht_cap;
++	u16 ru_punct_bitmap;
+ 	u16 max_rx_aggregation_subframes;
+ 	bool wme;
+ 	u8 uapsd_queues;
+diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
+index 75858c2..a8d76d2 100644
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -1946,14 +1946,19 @@ static int sta_apply_parameters(struct ieee80211_local *local,
+ 						  (void *)params->he_6ghz_capa,
+ 						  sta);
+ 
+-	if (params->eht_capa)
++	if (params->eht_capa) {
+ 		ieee80211_eht_cap_ie_to_sta_eht_cap(sdata, sband,
+ 						    (u8 *)params->he_capa,
+ 						    params->he_capa_len,
+ 						    params->eht_capa,
+ 						    params->eht_capa_len,
+ 						    sta);
+-
++		/* 802.11s mesh STA may have different eht punctruing pattern,
++		 * update it here so that drivers can use if needed.
++		 */
++		if (ieee80211_vif_is_mesh(&sdata->vif) && params->ru_punct_bitmap)
++			sta->sta.ru_punct_bitmap = params->ru_punct_bitmap;
++	}
+ 	if (params->opmode_notif_used) {
+ 		/* returned value is only needed for rc update, but the
+ 		 * rc isn't initialized here yet, so ignore it
+diff --git a/net/mac80211/mesh.c b/net/mac80211/mesh.c
+index 5aefebb..09a1f21 100644
+--- a/net/mac80211/mesh.c
++++ b/net/mac80211/mesh.c
+@@ -107,6 +107,11 @@ bool mesh_matches_local(struct ieee80211_sub_if_data *sdata,
+ 	ieee80211_chandef_he_6ghz_oper(sdata, ie->he_operation, ie->eht_operation,
+ 				       &sta_chan_def);
+ 
++	/* Update STA ru_punct_bitmap before compatiblity check to allow mesh peering with
++	 * Peers advertising different puncturing pattern.
++	 */
++	sta_chan_def.ru_punct_bitmap = sdata->vif.bss_conf.chandef.ru_punct_bitmap;
++
+ 	if (!cfg80211_chandef_compatible(&sdata->vif.bss_conf.chandef,
+ 					 &sta_chan_def))
+ 		return false;
+diff --git a/net/mac80211/mesh_plink.c b/net/mac80211/mesh_plink.c
+index 2566367..54df484 100644
+--- a/net/mac80211/mesh_plink.c
++++ b/net/mac80211/mesh_plink.c
+@@ -425,6 +425,7 @@ static void mesh_sta_info_init(struct ieee80211_sub_if_data *sdata,
+ 	u32 rates, basic_rates = 0, changed = 0;
+ 	enum ieee80211_sta_rx_bandwidth bw = sta->sta.bandwidth;
+ 	struct ieee80211_sta_rx_stats *stats;
++	struct cfg80211_chan_def eht_chandef;
+ 
+ 	sband = ieee80211_get_sband(sdata);
+ 	if (!sband)
+@@ -477,6 +478,37 @@ static void mesh_sta_info_init(struct ieee80211_sub_if_data *sdata,
+ 		sta->sta.bandwidth = IEEE80211_STA_RX_BW_20;
+ 	}
+ 
++	/* 802.11s mesh peer may have different eht puncturing pattern,
++	 * update it here so that drivers can use if needed.
++	 */
++	if (elems->eht_operation &&
++	    elems->eht_operation->chan_width >= IEEE80211_EHT_OPER_CHAN_WIDTH_80MHZ &&
++	    elems->eht_operation->disable_sub_chan_bitmap_present) {
++		struct ieee80211_channel *chan = sdata->vif.bss_conf.chandef.chan;
++
++		cfg80211_chandef_create(&eht_chandef, chan, NL80211_CHAN_NO_HT);
++		eht_chandef.ru_punct_bitmap = elems->eht_operation->disable_subchannel_bitmap;
++		eht_chandef.ru_punct_bitmap_supp_he = 0;
++		/* Validate Peer's Puncturing Bitmap and reset if invalid */
++		switch (elems->eht_operation->chan_width) {
++			case IEEE80211_EHT_OPER_CHAN_WIDTH_80MHZ:
++				eht_chandef.width = NL80211_CHAN_WIDTH_80;
++				break;
++			case IEEE80211_EHT_OPER_CHAN_WIDTH_160MHZ:
++				eht_chandef.width = NL80211_CHAN_WIDTH_160;
++				break;
++			case IEEE80211_EHT_OPER_CHAN_WIDTH_320MHZ:
++				eht_chandef.width = NL80211_CHAN_WIDTH_320;
++				break;
++			default:
++				eht_chandef.width = NL80211_CHAN_WIDTH_20;
++		}
++		eht_chandef.center_freq1 = ieee80211_channel_to_frequency(elems->eht_operation->ccfs,
++									  chan->band);
++		if (cfg80211_ru_punct_bitmap_valid(&eht_chandef))
++			sta->sta.ru_punct_bitmap = elems->eht_operation->disable_subchannel_bitmap;
++	}
++
+ 	if (!test_sta_flag(sta, WLAN_STA_RATE_CONTROL))
+ 		rate_control_rate_init(sta);
+ 	else
+diff --git a/net/mac80211/util.c b/net/mac80211/util.c
+index 6dbfc19..016bd55 100644
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -3323,6 +3323,13 @@ u8 *ieee80211_ie_build_eht_oper(u8 *pos, struct cfg80211_chan_def *chandef)
+ 	eht_oper->ccfs =
+ 		ieee80211_frequency_to_channel(chandef->center_freq1);
+ 
++	if (chandef->ru_punct_bitmap) {
++		eht_oper->disable_sub_chan_bitmap_present = 1;
++		eht_oper->disable_subchannel_bitmap = chandef->ru_punct_bitmap;
++	} else {
++		eht_oper->disable_sub_chan_bitmap_present = 0;
++		eht_oper->disable_subchannel_bitmap = 0;
++	}
+ 	return pos;
+ }
+ 
+diff --git a/net/wireless/chan.c b/net/wireless/chan.c
+index 6389861..261e104 100644
+--- a/net/wireless/chan.c
++++ b/net/wireless/chan.c
+@@ -292,6 +292,7 @@ bool cfg80211_ru_punct_bitmap_valid(const struct cfg80211_chan_def *chandef)
+ 
+ 	return true;
+ }
++EXPORT_SYMBOL(cfg80211_ru_punct_bitmap_valid);
+ 
+ bool cfg80211_chandef_valid(const struct cfg80211_chan_def *chandef)
+ {
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index f532a13..b430664 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -7329,6 +7329,10 @@ static int nl80211_new_station(struct sk_buff *skb, struct genl_info *info)
+ 			nla_get_u8(info->attrs[NL80211_ATTR_OPMODE_NOTIF]);
+ 	}
+ 
++	if (info->attrs[NL80211_ATTR_RU_PUNCT_BITMAP])
++		params.ru_punct_bitmap =
++			nla_get_u16(info->attrs[NL80211_ATTR_RU_PUNCT_BITMAP]);
++
+ 	if (info->attrs[NL80211_ATTR_STA_PLINK_ACTION])
+ 		params.plink_action =
+ 			nla_get_u8(info->attrs[NL80211_ATTR_STA_PLINK_ACTION]);
+-- 
+2.7.4
+

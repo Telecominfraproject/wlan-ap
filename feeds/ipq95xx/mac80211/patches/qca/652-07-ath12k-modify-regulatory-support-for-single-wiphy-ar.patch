@@ -1,0 +1,271 @@
+From d9a7f694280ff7682b788f06a4f4c0ebe4b255cf Mon Sep 17 00:00:00 2001
+From: Sriram R <quic_srirrama@quicinc.com>
+Date: Wed, 29 Dec 2021 15:57:18 +0530
+Subject: [PATCH 08/10] ath12k: modify regulatory support for single wiphy
+ architecture
+
+With all the rados being combined and registered as a single
+mac80211 hw/wiphy, separate regd built from fw rules need not
+be updated to cfg80211. Rather we can pick one of the regd
+built from the rules to update to cfg80211 for the whole
+registered device. We prefer 6GHz pdev based rules since it has
+the rules for all bands. If the hw doesnt support 6GHz, then update
+rules from one of the pdevs.
+
+Also, when regulatory notification is received, update to all the
+underlying radios/ar so that it becomes aware of the change and as
+well us it updates its local regd with the new country rules. Later
+pick the appropriate pdev's regd(6GHz if available) and apply to
+cfg80211.
+
+Signed-off-by: Sriram R <quic_srirrama@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |   2 +
+ drivers/net/wireless/ath/ath12k/mac.c  |   8 ++-
+ drivers/net/wireless/ath/ath12k/reg.c  | 109 +++++++++++++++++++++++----------
+ 3 files changed, 85 insertions(+), 34 deletions(-)
+
+Index: b/drivers/net/wireless/ath/ath12k/core.h
+===================================================================
+--- a/drivers/net/wireless/ath/ath12k/core.h	2022-08-01 18:27:08.929744331 +0530
++++ b/drivers/net/wireless/ath/ath12k/core.h	2022-08-01 18:27:08.925744362 +0530
+@@ -872,6 +872,8 @@ struct ath12k_hw {
+ 	 * concurrent debugfs configuration and concurrent FW statistics events.
+ 	 */
+ 	struct mutex conf_mutex;
++	bool regd_updated;
++	u8 supported_band_mask;
+ 	u8 num_radio;
+ 	struct ath12k radio[0] __aligned(sizeof(void *));
+ };
+Index: b/drivers/net/wireless/ath/ath12k/mac.c
+===================================================================
+--- a/drivers/net/wireless/ath/ath12k/mac.c	2022-08-01 18:27:08.929744331 +0530
++++ b/drivers/net/wireless/ath/ath12k/mac.c	2022-08-01 18:27:08.925744362 +0530
+@@ -10165,6 +10165,7 @@ static int ath12k_mac_setup_channels_rat
+ 					   u32 supported_bands)
+ {
+ 	struct ath12k_base *ab = ar->ab;
++	struct ath12k_hw *ah = ar->ab->ah;
+ 	struct ieee80211_supported_band *band;
+ 	struct ath12k_hal_reg_capabilities_ext *reg_cap, *temp_reg_cap;
+ 	void *channels;
+@@ -10205,6 +10206,8 @@ static int ath12k_mac_setup_channels_rat
+ 					     ab->reg_freq_2g.start_freq),
+ 					  min(temp_reg_cap->high_2ghz_chan,
+ 					     ab->reg_freq_2g.end_freq));
++
++		ah->supported_band_mask |= BIT(NL80211_BAND_2GHZ);
+ 	}
+ 
+ 	if (supported_bands & WMI_HOST_WLAN_5G_CAP) {
+@@ -10244,6 +10247,8 @@ static int ath12k_mac_setup_channels_rat
+ 						      ab->reg_freq_5g.end_freq));
+ 
+ 			ath12k_mac_update_5_9_ch_list(ar, band);
++
++			ah->supported_band_mask |= BIT(NL80211_BAND_5GHZ);
+ 		} else if (reg_cap->low_5ghz_chan >= ATH12K_MIN_6G_FREQ &&
+                            reg_cap->high_5ghz_chan <= ATH12K_MAX_6G_FREQ) {
+                         band = &ar->mac.sbands[NL80211_BAND_6GHZ];
+@@ -10293,6 +10298,8 @@ static int ath12k_mac_setup_channels_rat
+                         * to prevent APIs from breaking */
+                        band->n_channels = band->chan_6g[0]->n_channels;
+                        band->channels = band->chan_6g[0]->channels;
++
++			ah->supported_band_mask |= BIT(NL80211_BAND_6GHZ);
+ 		}
+ 	}
+ 
+@@ -10632,7 +10639,6 @@ int ath12k_mac_register(struct ath12k_ba
+  		pdev = &ab->pdevs[i];
+  		ar = pdev->ar;
+ 
+-		/* FIXME regd needs to be set only once */
+ 		ret = ath12k_regd_update(ar, true);
+ 		if (ret) {
+ 			ath12k_err(ar->ab, "ath12k regd update failed: %d\n", ret);
+Index: b/drivers/net/wireless/ath/ath12k/reg.c
+===================================================================
+--- a/drivers/net/wireless/ath/ath12k/reg.c	2022-08-01 18:27:08.929744331 +0530
++++ b/drivers/net/wireless/ath/ath12k/reg.c	2022-08-01 18:29:46.460535198 +0530
+@@ -91,11 +91,11 @@ static struct cur_reg_rule
+        return reg_rule;
+ }
+ 
+-static bool ath12k_regdom_changes(struct ath12k *ar, char *alpha2)
++static bool ath12k_regdom_changes(struct ath12k_hw *ah, char *alpha2)
+ {
+ 	const struct ieee80211_regdomain *regd;
+ 
+-	regd = rcu_dereference_rtnl(ar->hw->wiphy->regd);
++	regd = rcu_dereference_rtnl(ah->hw->wiphy->regd);
+ 	/* This can happen during wiphy registration where the previous
+ 	 * user request is received before we update the regd received
+ 	 * from firmware.
+@@ -107,38 +107,11 @@ static bool ath12k_regdom_changes(struct
+ }
+ 
+ static void
+-ath12k_reg_notifier(struct wiphy *wiphy, struct regulatory_request *request)
++ath12k_reg_send_request(struct ath12k *ar, struct regulatory_request *request)
+ {
+-	struct ieee80211_hw *hw = wiphy_to_ieee80211_hw(wiphy);
+ 	struct wmi_init_country_params init_country_param;
+-	struct ath12k *ar = hw->priv;
+ 	int ret;
+ 
+-	ath12k_dbg(ar->ab, ATH12K_DBG_REG,
+-		   "Regulatory Notification received for %s\n", wiphy_name(wiphy));
+-
+-	/* Currently supporting only General User Hints. Cell base user
+-	 * hints to be handled later.
+-	 * Hints from other sources like Core, Beacons are not expected for
+-	 * self managed wiphy's
+-	 */
+-	if (!(request->initiator == NL80211_REGDOM_SET_BY_USER &&
+-	      request->user_reg_hint_type == NL80211_USER_REG_HINT_USER)) {
+-		ath12k_warn(ar->ab, "Unexpected Regulatory event for this wiphy\n");
+-		return;
+-	}
+-
+-	if (!IS_ENABLED(CPTCFG_ATH_REG_DYNAMIC_USER_REG_HINTS)) {
+-		ath12k_dbg(ar->ab, ATH12K_DBG_REG,
+-			   "Country Setting is not allowed\n");
+-		return;
+-	}
+-
+-	if (!ath12k_regdom_changes(ar, request->alpha2)) {
+-		ath12k_dbg(ar->ab, ATH12K_DBG_REG, "Country is already set\n");
+-		return;
+-	}
+-
+ 	/* Set the country code to the firmware and wait for
+ 	 * the WMI_REG_CHAN_LIST_CC EVENT for updating the
+ 	 * reg info
+@@ -153,6 +126,40 @@ ath12k_reg_notifier(struct wiphy *wiphy,
+ 			    "INIT Country code set to fw failed : %d\n", ret);
+ }
+ 
++static void
++ath12k_reg_notifier(struct wiphy *wiphy, struct regulatory_request *request)
++{
++	struct ieee80211_hw *hw = wiphy_to_ieee80211_hw(wiphy);
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar;
++	int i;
++
++	/* Currently supporting only General User Hints. Cell base user
++	 * hints to be handled later.
++	 * Hints from other sources like Core, Beacons are not expected for
++	 * self managed wiphy's
++	 */
++	if (!(request->initiator == NL80211_REGDOM_SET_BY_USER &&
++	      request->user_reg_hint_type == NL80211_USER_REG_HINT_USER))
++		return;
++
++	if (!IS_ENABLED(CPTCFG_ATH_REG_DYNAMIC_USER_REG_HINTS))
++		return;
++
++	 mutex_lock(&ah->conf_mutex);
++	if (!ath12k_regdom_changes(ah, request->alpha2))
++		goto exit;
++
++	ah->regd_updated = false;
++	ar = ah->radio;
++
++	/* Send the reg change request to all the radios */
++	for (i = 0; i < ah->num_radio; i++, ar++)
++		ath12k_reg_send_request(ar, request);
++exit:
++	mutex_unlock(&ah->conf_mutex);
++}
++
+ int ath12k_reg_update_chan_list(struct ath12k *ar)
+ {
+ 	struct ieee80211_supported_band **bands;
+@@ -167,7 +174,7 @@ int ath12k_reg_update_chan_list(struct a
+ 
+ 	bands = hw->wiphy->bands;
+ 	for (band = 0; band < NUM_NL80211_BANDS; band++) {
+-		if (!bands[band])
++		if (!(ar->mac.sbands[band].channels && bands[band]))
+ 			continue;
+ 
+ 		for (i = 0; i < bands[band]->n_channels; i++) {
+@@ -195,7 +202,7 @@ int ath12k_reg_update_chan_list(struct a
+ 	ch = params->ch_param;
+ 
+ 	for (band = 0; band < NUM_NL80211_BANDS; band++) {
+-		if (!bands[band])
++		if (!(ar->mac.sbands[band].channels && bands[band]))
+ 			continue;
+ 
+ 		for (i = 0; i < bands[band]->n_channels; i++) {
+@@ -268,8 +275,32 @@ int ath12k_regd_update(struct ath12k *ar
+ 	struct ieee80211_regdomain *regd, *regd_copy = NULL;
+ 	int ret, regd_len, pdev_id;
+ 	struct ath12k_base *ab;
++	struct ath12k_hw *ah;
++	int i;
+ 
+ 	ab = ar->ab;
++	ah = ab->ah;
++
++	mutex_lock(&ah->conf_mutex);
++
++	if (ah->regd_updated) {
++		mutex_unlock(&ah->conf_mutex);
++		return 0;
++	}
++
++	/* Since FW provides reg rules which are similar for 2G/5G pdev
++	 * but since 6G pdev has superset of all rules including rules for
++	 * all bands, we prefer 6G pdev. If 6GHz pdev was part of the
++	 * ath12k_hw, wait for the 6GHz pdev, else pick the first pdev
++	 * which calls this function and use its regd to update global
++	 * hw regd. The regd_updated flag set at the end will not allow
++	 * any further updates.
++	 */
++	if ((ah->supported_band_mask & BIT(NL80211_BAND_6GHZ)) && !ar->supports_6ghz) {
++		mutex_unlock(&ah->conf_mutex);
++		return 0;
++	}
++
+ 	pdev_id = ar->pdev_idx;
+ 
+ 	spin_lock_bh(&ab->base_lock);
+@@ -322,14 +353,29 @@ int ath12k_regd_update(struct ath12k *ar
+ 	if (ret)
+ 		goto err;
+ 
+-	if (ar->state == ATH12K_STATE_ON) {
+-		ret = ath12k_reg_update_chan_list(ar);
+-		if (ret)
+-			goto err;
++	ah->regd_updated = true;
++
++	/* Apply the new regd to all the radios, this is expected to be received only once
++	 * since we check for ah->regd_updated and allow here only once
++	 */
++	ar = ah->radio;
++	ab = ar->ab;
++
++	for (i = 0; i < ah->num_radio; i++) {
++		ab = ar->ab;
++
++		if (ar->state == ATH12K_STATE_ON) {
++			ret = ath12k_reg_update_chan_list(ar);
++			if (ret)
++				goto err;
++		}
++		ar++;
+ 	}
+ 
++	mutex_unlock(&ah->conf_mutex);
+ 	return 0;
+ err:
++	mutex_unlock(&ah->conf_mutex);
+ 	ath12k_warn(ab, "failed to perform regd update : %d\n", ret);
+ 	return ret;
+ }

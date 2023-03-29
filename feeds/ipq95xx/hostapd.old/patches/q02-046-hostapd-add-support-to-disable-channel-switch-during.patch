@@ -1,0 +1,283 @@
+From 00cada639346750210160441c00b5e953aa57d40 Mon Sep 17 00:00:00 2001
+From: Hari Chandrakanthan <quic_haric@quicinc.com>
+Date: Mon, 11 Jul 2022 22:30:27 +0530
+Subject: [PATCH] hostapd : add support to disable channel switch during radar
+ detection
+
+A new config disable_csa_dfs is added.
+When the above config is enabled, the usual channel switch during
+radar detection is skipped.
+
+Rather hostapd/wpa_supplicant waits for 500ms for the user to do
+the manual channel switch using hostapd_cli/wpa_cli.
+
+If no channel switch or channel set is issued within 500ms,
+the interface is disabled.
+
+sample channel switch that disables the radar handling timer :
+wpa_cli -i wlan2 chan_switch 5 5745 center_freq1=5775 sec_channel_offset=1
+bandwidth=80 vht ht he
+hostapd_cli -i wlan3 chan_switch 5 5745 center_freq1=5775 sec_channel_offset=1
+bandwidth=80 vht ht he
+
+sample set channel cmd that disables the radar handling timer:
+hostapd_cli -i wlan0 set channel 100
+wpa_cli -i wlan1 set_network 0 frequency 5500
+
+Signed-off-by: Hari Chandrakanthan <quic_haric@quicinc.com>
+---
+ hostapd/config_file.c              |  2 ++
+ hostapd/ctrl_iface.c               | 14 ++++++++++++++
+ hostapd/hostapd.conf               |  4 ++++
+ src/ap/ap_config.h                 |  1 +
+ src/ap/dfs.c                       | 22 ++++++++++++++++++++--
+ src/ap/dfs.h                       |  4 +++-
+ wpa_supplicant/ap.c                | 12 +++++++++++-
+ wpa_supplicant/config.c            |  2 ++
+ wpa_supplicant/config.h            |  1 +
+ wpa_supplicant/ctrl_iface.c        | 12 +++++++++++-
+ wpa_supplicant/mesh.c              |  2 ++
+ wpa_supplicant/wpa_supplicant.conf |  4 ++++
+ 12 files changed, 75 insertions(+), 5 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 2aae477..2e4440b 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -4704,6 +4704,8 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			return 1;
+ 		}
+ #endif /* CONFIG_IEEE80211BE */
++	} else if (os_strcmp(buf, "disable_csa_dfs") == 0) {
++		conf->disable_csa_dfs = atoi(pos);
+ 	} else {
+ 		wpa_printf(MSG_ERROR,
+ 			   "Line %d: unknown configuration item '%s'",
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 1060c48..c053bf3 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -1499,6 +1499,13 @@ static int hostapd_ctrl_iface_set(struct hostapd_data *hapd, char *cmd)
+ 	} else if (os_strcasecmp(cmd, "setband") == 0) {
+ 		ret = hostapd_ctrl_iface_set_band(hapd, value);
+ 	} else {
++		if (hapd->iface->conf->disable_csa_dfs &&
++		    ((os_strcmp(cmd, "channel") == 0) &&
++		    ((os_strcmp(value, "acs_survey") != 0) &&
++		    (atoi(value) != 0)))) {
++			eloop_cancel_timeout(hostapd_dfs_radar_handling_timeout,
++					     hapd->iface, NULL);
++		}
+ 		ret = hostapd_set_iface(hapd->iconf, hapd->conf, cmd, value);
+ 		if (ret)
+ 			return ret;
+@@ -2876,6 +2883,13 @@ static int hostapd_ctrl_iface_chan_switch(struct hostapd_iface *iface,
+ 	int bandwidth;
+ 	u8 chan;
+ 
++	if (iface->conf->disable_csa_dfs == 1) {
++		wpa_printf(MSG_DEBUG, "chanswitch interface %s : cancel radar"
++			   " handling timer", iface->conf->bss[0]->iface);
++		eloop_cancel_timeout(hostapd_dfs_radar_handling_timeout,
++				     iface, NULL);
++	}
++
+ 	ret = hostapd_parse_csa_settings(pos, &settings);
+ 	if (ret)
+ 		return ret;
+diff --git a/hostapd/hostapd.conf b/hostapd/hostapd.conf
+index e4328d3..944acd5 100644
+--- a/hostapd/hostapd.conf
++++ b/hostapd/hostapd.conf
+@@ -229,6 +229,10 @@ channel=1
+ # (default 0, i.e., not constraint)
+ #min_tx_power=20
+ 
++# disable_csa_dfs option can be used to skip the channel switch in hostapd
++# during radar detection
++#disable_csa_dfs=1
++
+ # Beacon interval in kus (1.024 ms) (default: 100; range 15..65535)
+ beacon_int=100
+ 
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index e16b123..e63b11a 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1153,6 +1153,7 @@ struct hostapd_config {
+ 	u8 ru_punct_ofdma;
+ 	u8 ru_punct_acs_threshold;
+ 	int enable_320mhz_bw;
++	int disable_csa_dfs;
+ };
+ 
+ static inline u8 hostapd_get_he_6ghz_reg_pwr_type(struct hostapd_config *conf)
+diff --git a/src/ap/dfs.c b/src/ap/dfs.c
+index 11bdd38..ea65cb4 100644
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -1105,6 +1105,17 @@ void hostapd_dfs_test_mode_csa_timeout(void *eloop_data, void *user_data)
+ 	ieee802_11_set_beacon(hapd);
+ }
+ 
++void hostapd_dfs_radar_handling_timeout(void *eloop_data, void *user_data)
++{
++	struct hostapd_iface *iface = eloop_data;
++
++	wpa_printf(MSG_INFO, "Disabling interface %s since no channel"
++		   " switch is initiated within radar handling timeout",
++		   iface->conf->bss[0]->iface);
++
++	hostapd_disable_iface(iface);
++}
++
+ static int hostapd_dfs_testmode_set_beacon_csa(struct hostapd_iface *iface)
+ {
+ 	struct hostapd_data *hapd = iface->bss[0];
+@@ -1361,8 +1372,15 @@ int hostapd_dfs_radar_detected(struct hostapd_iface *iface, int freq,
+ 	if (!res)
+ 		return 0;
+ 
+-	/* radar detected while operating, switch the channel. */
+-	res = hostapd_dfs_start_channel_switch(iface);
++	if (!iface->conf->disable_csa_dfs) {
++		/* radar detected while operating, switch the channel. */
++		res = hostapd_dfs_start_channel_switch(iface);
++	} else if (!eloop_is_timeout_registered(hostapd_dfs_radar_handling_timeout,
++		   iface, NULL)) {
++		eloop_register_timeout(0, HAPD_DFS_RADAR_CH_SWITCH_WAIT_DUR,
++				       hostapd_dfs_radar_handling_timeout,
++				       iface, NULL);
++	}
+ 
+ 	return res;
+ }
+diff --git a/src/ap/dfs.h b/src/ap/dfs.h
+index 3a7c3e4..0cd0ced 100644
+--- a/src/ap/dfs.h
++++ b/src/ap/dfs.h
+@@ -11,6 +11,8 @@
+ 
+ /* CSA beacon duration in seconds for dfs testing mode */
+ #define HOSTAPD_DFS_TEST_MODE_CSA_DUR 1
++/* Wait duration between radar detection and channel switch*/
++#define HAPD_DFS_RADAR_CH_SWITCH_WAIT_DUR 500000
+ 
+ void hostapd_dfs_test_mode_csa_timeout(void *eloop_data, void *user_data);
+ 
+@@ -37,5 +39,5 @@ int hostapd_dfs_start_cac(struct hostapd_iface *iface, int freq,
+ int hostapd_handle_dfs_offload(struct hostapd_iface *iface);
+ int hostapd_is_dfs_overlap(struct hostapd_iface *iface, enum chan_width width,
+ 			   int center_freq);
+-
++void hostapd_dfs_radar_handling_timeout(void *eloop_data, void *user_data);
+ #endif /* DFS_H */
+diff --git a/wpa_supplicant/ap.c b/wpa_supplicant/ap.c
+index 2b90019..884a0e2 100644
+--- a/wpa_supplicant/ap.c
++++ b/wpa_supplicant/ap.c
+@@ -1624,7 +1624,17 @@ int ap_switch_channel(struct wpa_supplicant *wpa_s,
+ int ap_ctrl_iface_chanswitch(struct wpa_supplicant *wpa_s, const char *pos)
+ {
+ 	struct csa_settings settings;
+-	int ret = hostapd_parse_csa_settings(pos, &settings);
++	int ret;
++
++	if (wpa_s->ifmsh && wpa_s->ifmsh->conf->disable_csa_dfs == 1) {
++		wpa_printf(MSG_DEBUG, "wpa chanswitch interface %s :"
++			   " cancelling radar handling timeout",
++			   wpa_s->ifmsh->conf->bss[0]->iface);
++		eloop_cancel_timeout(hostapd_dfs_radar_handling_timeout,
++				     wpa_s->ifmsh, NULL);
++	}
++
++	ret = hostapd_parse_csa_settings(pos, &settings);
+ 
+ 	if (ret)
+ 		return ret;
+diff --git a/wpa_supplicant/config.c b/wpa_supplicant/config.c
+index 502d3d6..dcc3868 100644
+--- a/wpa_supplicant/config.c
++++ b/wpa_supplicant/config.c
+@@ -5456,6 +5456,8 @@ static const struct global_parse_data global_fields[] = {
+ #endif /* CONFIG_PASN */
+ 	{ INT_RANGE(he_6ghz_reg_client_type, 1, 2),
+ 	  CFG_CHANGED_HE_6GHZ_CLIENT_TYPE},
++	{ INT_RANGE(disable_csa_dfs, 0, 1), 0 },
++
+ };
+ 
+ #undef FUNC
+diff --git a/wpa_supplicant/config.h b/wpa_supplicant/config.h
+index 7479583..89be860 100644
+--- a/wpa_supplicant/config.h
++++ b/wpa_supplicant/config.h
+@@ -1710,6 +1710,7 @@ struct wpa_config {
+ 	 * 2 = SUBORDINATE CLIENT
+ 	 */
+ 	u8 he_6ghz_reg_client_type;
++	int disable_csa_dfs;
+ };
+ 
+ 
+diff --git a/wpa_supplicant/ctrl_iface.c b/wpa_supplicant/ctrl_iface.c
+index 1aff200..61aeea7 100644
+--- a/wpa_supplicant/ctrl_iface.c
++++ b/wpa_supplicant/ctrl_iface.c
+@@ -60,6 +60,7 @@
+ #include "dpp_supplicant.h"
+ #include "sme.h"
+ #include "ap/ieee802_11.h"
++#include "ap/dfs.h"
+ 
+ #ifdef __NetBSD__
+ #include <net/if_ether.h>
+@@ -3628,7 +3629,16 @@ static int wpa_supplicant_ctrl_iface_set_network(
+ 		   id, name);
+ 	wpa_hexdump_ascii_key(MSG_DEBUG, "CTRL_IFACE: value",
+ 			      (u8 *) value, os_strlen(value));
+-
++#ifdef NEED_AP_MLME
++	if ((os_strcmp(name, "frequency") == 0) &&
++	    (wpa_s->ifmsh && wpa_s->ifmsh->conf->disable_csa_dfs == 1)) {
++		wpa_printf(MSG_DEBUG, "wpa interface %s :"
++			   " cancelling radar handling timeout",
++			   wpa_s->ifmsh->conf->bss[0]->iface);
++		eloop_cancel_timeout(hostapd_dfs_radar_handling_timeout,
++				     wpa_s->ifmsh, NULL);
++	}
++#endif
+ 	ssid = wpa_config_get_network(wpa_s->conf, id);
+ 	if (ssid == NULL) {
+ 		wpa_printf(MSG_DEBUG, "CTRL_IFACE: Could not find network "
+diff --git a/wpa_supplicant/mesh.c b/wpa_supplicant/mesh.c
+index 0372c08..948f365 100644
+--- a/wpa_supplicant/mesh.c
++++ b/wpa_supplicant/mesh.c
+@@ -554,6 +554,8 @@ static int wpa_supplicant_mesh_init(struct wpa_supplicant *wpa_s,
+ 		conf->basic_rates[rate_len] = -1;
+ 	}
+ 
++	ifmsh->conf->disable_csa_dfs = wpa_s->conf->disable_csa_dfs;
++
+ 	/* While it can enhance performance to switch the primary channel, which
+ 	 * is also the secondary channel of another network at the same time),
+ 	 * to the other primary channel, problems exist with this in mesh
+diff --git a/wpa_supplicant/wpa_supplicant.conf b/wpa_supplicant/wpa_supplicant.conf
+index 162e81d..29a0fe1 100644
+--- a/wpa_supplicant/wpa_supplicant.conf
++++ b/wpa_supplicant/wpa_supplicant.conf
+@@ -1704,6 +1704,10 @@ fast_reauth=1
+ #Set 1 to enable 160MHz in Mesh mode
+ #enable_160mhz_bw=1
+ 
++# disable_csa_dfs option can be used to skip the channel switch in wpa_supplicant
++# during radar detection
++#disable_csa_dfs=1
++
+ # Example blocks:
+ 
+ # Simple case: WPA-PSK, PSK as an ASCII passphrase, allow all valid ciphers
+-- 
+2.7.4
+

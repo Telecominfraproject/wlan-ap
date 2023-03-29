@@ -1,0 +1,154 @@
+From 4259383e2decfbff254fd2a10dd4ebd6515958ec Mon Sep 17 00:00:00 2001
+From: Balamurugan Mahalingam <quic_bmahalin@quicinc.com>
+Date: Mon, 17 Oct 2022 11:29:38 -0700
+Subject: [PATCH 4/7] ath12k: remove locks and optimize tx completion path
+
+Avoid taking locks while processing the tx completion. The rings
+are accessed associated with specific cores for processing. There
+is no need to take locks to avoid contention.
+
+Introduce simple inline functions to update the rings directly
+without too many checks in the ath12k_hif_write32 access
+
+Move the tx completion processing to a new IRQ group to assign
+specific irq smp affinity and process the tx completions
+on a specific core
+
+Signed-off-by: Balamurugan Mahalingam <quic_bmahalin@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_tx.c | 11 +++--------
+ drivers/net/wireless/ath/ath12k/hal.c   |  5 ++---
+ drivers/net/wireless/ath/ath12k/hal.h   | 23 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/hw.c    |  2 +-
+ 4 files changed, 29 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp_tx.c b/drivers/net/wireless/ath/ath12k/dp_tx.c
+index 509e64e..dd71f9b 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -66,11 +66,9 @@ static void ath12k_dp_tx_release_txbuf(struct ath12k_dp *dp,
+ 				       struct ath12k_tx_desc_info *tx_desc,
+ 				       u8 ring_id)
+ {
+-	spin_lock_bh(&dp->tx_desc_lock[ring_id]);
+ 	tx_desc->skb = NULL;
+ 	tx_desc->skb_ext_desc = NULL;
+ 	list_move_tail(&tx_desc->list, &dp->tx_desc_free_list[ring_id]);
+-	spin_unlock_bh(&dp->tx_desc_lock[ring_id]);
+ }
+ 
+ static inline
+@@ -798,14 +796,12 @@ void ath12k_dp_tx_completion_handler(struct ath12k_base *ab, int ring_id)
+ 	struct hal_wbm_completion_ring_tx tx_status = { 0 };
+ 	enum hal_wbm_rel_src_module buf_rel_source;
+ 
+-	spin_lock_bh(&status_ring->lock);
+ 
+-	ath12k_hal_srng_access_begin(ab, status_ring);
++	ath12k_hal_srng_access_dst_ring_begin_nolock(ab, status_ring);
+ 
+ 	valid_entries = ath12k_hal_srng_dst_num_free(ab, status_ring, false);
+ 	if (!valid_entries) {
+-		ath12k_hal_srng_access_end(ab, status_ring);
+-		spin_unlock_bh(&status_ring->lock);
++		ath12k_hal_srng_access_umac_dst_ring_end_nolock(ab->mem, status_ring);
+ 		return;
+ 	}
+ 
+@@ -860,9 +856,8 @@ void ath12k_dp_tx_completion_handler(struct ath12k_base *ab, int ring_id)
+ 		ath12k_dp_tx_complete_msdu(ar, msdu, &tx_status, buf_rel_source, skb_ext_desc);
+ 	}
+ 
+-	ath12k_hal_srng_access_end(ab, status_ring);
++	ath12k_hal_srng_access_umac_dst_ring_end_nolock(ab->mem, status_ring);
+ 
+-	spin_unlock_bh(&status_ring->lock);
+ }
+ 
+ int ath12k_dp_tx_send_reo_cmd(struct ath12k_base *ab, struct dp_rx_tid *rx_tid,
+diff --git a/drivers/net/wireless/ath/ath12k/hal.c b/drivers/net/wireless/ath/ath12k/hal.c
+index 7dd00e0..2912627 100644
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -936,8 +936,8 @@ u32 *ath12k_hal_srng_dst_peek(struct ath12k_base *ab, struct hal_srng *srng)
+ 	return NULL;
+ }
+ 
+-static void ath12k_hal_srng_prefetch_desc(struct ath12k_base *ab,
+-                                          struct hal_srng *srng)
++void ath12k_hal_srng_prefetch_desc(struct ath12k_base *ab,
++				   struct hal_srng *srng)
+ {
+ 	u32 *desc;
+ 
+@@ -1008,7 +1008,6 @@ void ath12k_hal_srng_dst_invalidate_entry(struct ath12k_base *ab,
+ 	u32 *desc;
+ 	u32 tp, hp;
+ 
+-	lockdep_assert_held(&srng->lock);
+ 
+ 	if (!(srng->flags & HAL_SRNG_FLAGS_CACHED) || !entries)
+ 	        return;
+diff --git a/drivers/net/wireless/ath/ath12k/hal.h b/drivers/net/wireless/ath/ath12k/hal.h
+index 4922ead..d0e444d 100644
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -1163,6 +1163,8 @@ void ath12k_hal_reo_ring_ctrl_hash_ix3_setup(struct ath12k_base *ab,
+ 					     u32 ring_hash_map);
+ void ath12k_hal_reo_ring_ctrl_hash_ix2_setup(struct ath12k_base *ab,
+ 					     u32 ring_hash_map);
++void ath12k_hal_srng_prefetch_desc(struct ath12k_base *ab,
++				   struct hal_srng *srng);
+ 
+ static inline
+ u32 *ath12k_hal_srng_src_get_next_entry_nolock(struct ath12k_base *ab,
+@@ -1203,6 +1205,16 @@ void ath12k_hal_srng_access_src_ring_begin_nolock(void *mem,
+ 	srng->u.src_ring.cached_tp = *(volatile u32 *)srng->u.src_ring.tp_addr;
+ }
+ 
++static inline
++void ath12k_hal_srng_access_dst_ring_begin_nolock(struct ath12k_base *ab,
++						  struct hal_srng *srng)
++{
++	srng->u.dst_ring.cached_hp = *srng->u.dst_ring.hp_addr;
++	/* Try to prefetch the next descriptor in the ring */
++	if (srng->flags & HAL_SRNG_FLAGS_CACHED)
++		ath12k_hal_srng_prefetch_desc(ab, srng);
++}
++
+ static inline
+ void ath12k_hal_srng_access_umac_src_ring_end_nolock(void *mem,
+ 						     struct hal_srng *srng)
+@@ -1216,4 +1228,15 @@ void ath12k_hal_srng_access_umac_src_ring_end_nolock(void *mem,
+ 	srng->timestamp = jiffies;
+ }
+ 
++static inline
++void ath12k_hal_srng_access_umac_dst_ring_end_nolock(void *mem,
++						     struct hal_srng *srng)
++{
++	u32 offset = (unsigned long)srng->u.dst_ring.tp_addr - (unsigned long)mem;
++	srng->u.dst_ring.last_hp = *srng->u.dst_ring.hp_addr;
++	writel_relaxed(srng->u.dst_ring.tp, mem + HAL_DP_REG_WINDOW_OFFSET
++		       + (offset & WINDOW_RANGE_MASK));
++	srng->timestamp = jiffies;
++}
++
+ #endif
+diff --git a/drivers/net/wireless/ath/ath12k/hw.c b/drivers/net/wireless/ath/ath12k/hw.c
+index 45f5aef..ce7c0a0 100644
+--- a/drivers/net/wireless/ath/ath12k/hw.c
++++ b/drivers/net/wireless/ath/ath12k/hw.c
+@@ -307,8 +307,8 @@ const struct ath12k_hw_ring_mask ath12k_hw_ring_mask_qcn92xx = {
+ 		ATH12K_TX_RING_MASK_0,
+ 		ATH12K_TX_RING_MASK_1,
+ 		ATH12K_TX_RING_MASK_2,
+-		ATH12K_TX_RING_MASK_3,
+ 		0, 0, 0, 0, 0, 0, 0, 0,
++		ATH12K_TX_RING_MASK_3,
+ 	},
+ 	.rx_mon_dest = {
+ 		0, 0, 0, 0, 0, 0, 0, 0,
+-- 
+2.17.1
+

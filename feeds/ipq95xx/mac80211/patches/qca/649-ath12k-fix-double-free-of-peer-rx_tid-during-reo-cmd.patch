@@ -1,0 +1,185 @@
+From af88ecce160c37afd39fbb684d5795d6645fe7d9 Mon Sep 17 00:00:00 2001
+From: Sathishkumar Muruganandam <murugana@codeaurora.org>
+Date: Mon, 25 Jul 2022 12:12:49 +0530
+Subject: [PATCH] ath12k: fix double free of peer rx_tid during reo cmd failure
+
+Peer rx_tid is locally copied thrice during peer_rx_tid_cleanup to send
+REO_CMD_UPDATE_RX_QUEUE followed by REO_CMD_FLUSH_CACHE to flush all
+aged REO descriptors from HW cache.
+
+When sending REO_CMD_FLUSH_CACHE fails, we do dma unmap of already
+mapped rx_tid->vaddr and free it. This is not checked during
+reo_cmd_list_cleanup() and dp_reo_cmd_free() before trying to free and
+unmap again.
+
+Fix this by setting rx_tid->vaddr NULL in rx tid delete and also wherever
+freeing it to check in reo_cmd_list_cleanup() and reo_cmd_free() before
+trying to free again.
+
+Prevent REO cmd failures causing double free by increasing REO cmd
+ring size and moving REO status ring mask to IRQ group 3 from group
+0 to separate from tx completion ring on IRQ group 0 which may delay
+reo status processing
+
+Signed-off-by: Sathishkumar Muruganandam <murugana@codeaurora.org>
+Signed-off-by: Harshitha Prem <quic_hprem@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.h    |  2 +-
+ drivers/net/wireless/ath/ath12k/dp_rx.c | 52 +++++++++++++++++--------
+ 2 files changed, 37 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+index 04bbf9d..f65e3fb 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -201,7 +201,7 @@ struct ath12k_pdev_dp {
+ #define DP_REO_REINJECT_RING_SIZE	32
+ #define DP_RX_RELEASE_RING_SIZE		1024
+ #define DP_REO_EXCEPTION_RING_SIZE	128
+-#define DP_REO_CMD_RING_SIZE		128
++#define DP_REO_CMD_RING_SIZE		256
+ #define DP_REO_STATUS_RING_SIZE		2048
+ #define DP_RXDMA_BUF_RING_SIZE		4096
+ #define DP_RXDMA_REFILL_RING_SIZE	2048
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
+index 857845e..762a698 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -634,13 +634,18 @@ void ath12k_dp_reo_cmd_list_cleanup(struct ath12k_base *ab)
+ 	struct ath12k_dp *dp = &ab->dp;
+ 	struct dp_reo_cmd *cmd, *tmp;
+ 	struct dp_reo_cache_flush_elem *cmd_cache, *tmp_cache;
++	struct dp_rx_tid *rx_tid;
+ 
+ 	spin_lock_bh(&dp->reo_cmd_lock);
+ 	list_for_each_entry_safe(cmd, tmp, &dp->reo_cmd_list, list) {
+ 		list_del(&cmd->list);
+-		dma_unmap_single(ab->dev, cmd->data.paddr,
+-				 cmd->data.size, DMA_BIDIRECTIONAL);
+-		kfree(cmd->data.vaddr);
++		rx_tid = &cmd->data;
++		if (rx_tid->vaddr) {
++			dma_unmap_single(ab->dev, rx_tid->paddr,
++				 rx_tid->size, DMA_BIDIRECTIONAL);
++			kfree(rx_tid->vaddr);
++			rx_tid->vaddr = NULL;
++		}
+ 		kfree(cmd);
+ 	}
+ 
+@@ -648,9 +653,13 @@ void ath12k_dp_reo_cmd_list_cleanup(struct ath12k_base *ab)
+ 				 &dp->reo_cmd_cache_flush_list, list) {
+ 		list_del(&cmd_cache->list);
+ 		dp->reo_cmd_cache_flush_count--;
+-		dma_unmap_single(ab->dev, cmd_cache->data.paddr,
+-				 cmd_cache->data.size, DMA_BIDIRECTIONAL);
+-		kfree(cmd_cache->data.vaddr);
++		rx_tid = &cmd_cache->data;
++                if (rx_tid->vaddr) {
++                       dma_unmap_single(ab->dev, rx_tid->paddr,
++	                                 rx_tid->size, DMA_BIDIRECTIONAL);
++                        kfree(rx_tid->vaddr);
++                        rx_tid->vaddr = NULL;
++                }
+ 		kfree(cmd_cache);
+ 	}
+ 	spin_unlock_bh(&dp->reo_cmd_lock);
+@@ -664,10 +673,12 @@ static void ath12k_dp_reo_cmd_free(struct ath12k_dp *dp, void *ctx,
+ 	if (status != HAL_REO_CMD_SUCCESS)
+ 		ath12k_warn(dp->ab, "failed to flush rx tid hw desc, tid %d status %d\n",
+ 			    rx_tid->tid, status);
+-
+-	dma_unmap_single(dp->ab->dev, rx_tid->paddr, rx_tid->size,
++	if (rx_tid->vaddr) {
++		dma_unmap_single(dp->ab->dev, rx_tid->paddr, rx_tid->size,
+ 			 DMA_BIDIRECTIONAL);
+-	kfree(rx_tid->vaddr);
++		kfree(rx_tid->vaddr);
++		rx_tid->vaddr = NULL;
++	}
+ }
+ 
+ static void ath12k_dp_reo_cache_flush(struct ath12k_base *ab,
+@@ -706,6 +717,7 @@ static void ath12k_dp_reo_cache_flush(struct ath12k_base *ab,
+ 		dma_unmap_single(ab->dev, rx_tid->paddr, rx_tid->size,
+ 				 DMA_BIDIRECTIONAL);
+ 		kfree(rx_tid->vaddr);
++		rx_tid->vaddr = NULL;
+ 	}
+ }
+ 
+@@ -726,9 +738,11 @@ static void ath12k_dp_rx_tid_del_func(struct ath12k_dp *dp, void *ctx,
+ 	}
+ 
+ 	elem = kzalloc(sizeof(*elem), GFP_ATOMIC);
+-	if (!elem)
++	if (!elem) {
++		 ath12k_warn(ab, "failed to alloc reo_cache_flush_elem, rx tid %d\n",
++				                             rx_tid->tid);
+ 		goto free_desc;
+-
++	}
+ 	elem->ts = jiffies;
+ 	memcpy(&elem->data, rx_tid, sizeof(*rx_tid));
+ 
+@@ -758,6 +772,7 @@ free_desc:
+ 	dma_unmap_single(ab->dev, rx_tid->paddr, rx_tid->size,
+ 			 DMA_BIDIRECTIONAL);
+ 	kfree(rx_tid->vaddr);
++	rx_tid->vaddr = NULL;
+ }
+ 
+ static void ath12k_peer_rx_tid_qref_setup(struct ath12k_base *ab, u16 peer_id, u16 tid,
+@@ -799,6 +814,7 @@ void ath12k_peer_rx_tid_delete(struct ath12k *ar,
+ 	if (!rx_tid->active)
+ 		return;
+ 
++	rx_tid->active = false;
+ 	cmd.flag = HAL_REO_CMD_FLG_NEED_STATUS;
+ 	cmd.addr_lo = lower_32_bits(rx_tid->paddr);
+ 	cmd.addr_hi = upper_32_bits(rx_tid->paddr);
+@@ -815,8 +831,9 @@ void ath12k_peer_rx_tid_delete(struct ath12k *ar,
+ 	}
+ 
+ 	ath12k_peer_rx_tid_qref_reset(ar->ab, peer->peer_id, tid);
+-
+-	rx_tid->active = false;
++	rx_tid->vaddr = NULL;
++	rx_tid->paddr = 0;
++	rx_tid->size = 0;
+ }
+ 
+ static int ath12k_dp_rx_link_desc_return(struct ath12k_base *ab,
+@@ -967,7 +984,8 @@ int ath12k_peer_rx_tid_setup(struct ath12k *ar, const u8 *peer_mac, int vdev_id,
+ 						    ba_win_sz, ssn, true);
+ 		spin_unlock_bh(&ab->base_lock);
+ 		if (ret) {
+-			ath12k_warn(ab, "failed to update reo for rx tid %d\n", tid);
++			ath12k_warn(ab, "failed to update reo for peer %pM rx tid %d\n",
++				       peer_mac, tid);
+ 			return ret;
+ 		}
+ 
+@@ -1003,6 +1021,8 @@ int ath12k_peer_rx_tid_setup(struct ath12k *ar, const u8 *peer_mac, int vdev_id,
+ 	ret = dma_mapping_error(ab->dev, paddr);
+ 	if (ret) {
+ 		spin_unlock_bh(&ab->base_lock);
++		ath12k_warn(ab, "failed to dma map for peer %pM rx tid :%d setup\n",
++				peer_mac, tid);
+ 		goto err_mem_free;
+ 	}
+ 
+@@ -1019,8 +1039,8 @@ int ath12k_peer_rx_tid_setup(struct ath12k *ar, const u8 *peer_mac, int vdev_id,
+ 	return ret;
+ 
+ err_mem_free:
+-	kfree(vaddr);
+-
++	 kfree(rx_tid->vaddr);
++	 rx_tid->vaddr = NULL;
+ 	return ret;
+ }
+ 
+-- 
+2.17.1
+

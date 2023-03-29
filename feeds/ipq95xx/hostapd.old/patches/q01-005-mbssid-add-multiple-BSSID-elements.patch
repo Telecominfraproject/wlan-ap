@@ -1,0 +1,450 @@
+From 78dcbdbbf8a5ab304b72b7c967f6618642d4f78e Mon Sep 17 00:00:00 2001
+From: John Crispin <john@phrozen.org>
+Date: Fri, 10 Sep 2021 14:56:37 -0700
+Subject: [PATCH 05/15] mbssid: add multiple BSSID elements
+
+Add data as per IEEE Std 802.11-2020 9.4.2.45 Multiple BSSID element.
+Include this element in beacons and probe response frames when mbssid
+is enabled. Split the BSSes into multiple elements if the data
+does not fit in 255 bytes allowed for a single element.
+
+Add support for enhanced multiple BSSID advertisements (EMA) by
+sending offsets to the start of each MBSSID element to nl80211.
+Mac80211 generates different EMA beacons by including only one
+multiple BSSID element in each beacon frame.
+
+Signed-off-by: John Crispin <john@phrozen.org>
+Signed-off-by: Aloka Dixit <quic_alokad@quicinc.com>
+---
+ src/ap/beacon.c              |  67 ++++++++++-
+ src/ap/ieee802_11.c          | 212 +++++++++++++++++++++++++++++++++++
+ src/ap/ieee802_11.h          |   5 +-
+ src/common/ieee802_11_defs.h |   2 +
+ src/drivers/driver.h         |  27 +++++
+ 5 files changed, 309 insertions(+), 4 deletions(-)
+
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -463,6 +463,9 @@ static int hostapd_set_mbssid_beacon(str
+ 				     struct wpa_driver_ap_params *params)
+ {
+ 	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_data *tx_bss;
++	size_t len;
++	u8 num_mbssid = 0, *end;
+ 
+ 	if (!iface->conf->mbssid || iface->num_bss == 1)
+ 		return 0;
+@@ -478,10 +481,55 @@ static int hostapd_set_mbssid_beacon(str
+ 		return -1;
+ 	}
+ 
+-	params->mbssid_tx_iface = hostapd_mbssid_get_tx_bss(hapd)->conf->iface;
++	tx_bss = hostapd_mbssid_get_tx_bss(hapd);
++	params->mbssid_tx_iface = tx_bss->conf->iface;
+ 	params->mbssid_index = hostapd_mbssid_get_bss_index(hapd);
+ 	params->mbssid_count = iface->num_bss;
+ 
++	len = hostapd_eid_mbssid_len(tx_bss, WLAN_FC_STYPE_BEACON, &num_mbssid);
++	if (hapd->iconf->ema) {
++		if (!iface->ema_max_periodicity) {
++			wpa_printf(MSG_WARNING, "MBSSID: Driver doesn't support"
++				   " enhanced multiple BSSID advertisements");
++			return -1;
++		}
++		if (num_mbssid > iface->ema_max_periodicity) {
++			wpa_printf(MSG_WARNING, "MBSSID: Driver supports "
++				   "maximum %u EMA profile periodicity",
++				   iface->ema_max_periodicity);
++			return -1;
++		}
++		params->ema = 1;
++	}
++
++	if (hapd != tx_bss || !num_mbssid)
++		return 0;
++
++	params->mbssid_elem_count = num_mbssid;
++	params->mbssid_elem = os_zalloc(len);
++	if (!params->mbssid_elem) {
++		wpa_printf(MSG_ERROR, "Memory allocation failed for multiple "
++			   "BSSID elements");
++		return -1;
++	}
++
++	params->mbssid_elem_offset = os_zalloc(params->mbssid_elem_count *
++					       sizeof(u8 *));
++	if (!params->mbssid_elem_offset) {
++		wpa_printf(MSG_ERROR, "MBSSID: Memory allocation failed for "
++			   "multiple BSSID element offsets");
++		os_free(params->mbssid_elem);
++		params->mbssid_elem = NULL;
++		return -1;
++	}
++
++	end = hostapd_eid_mbssid(tx_bss, params->mbssid_elem,
++				 params->mbssid_elem + len,
++				 WLAN_FC_STYPE_BEACON,
++				 params->mbssid_elem_count,
++				 params->mbssid_elem_offset);
++	params->mbssid_elem_len = end - params->mbssid_elem;
++
+ 	return 0;
+ }
+ 
+@@ -494,8 +542,11 @@ static u8 * hostapd_gen_probe_resp(struc
+ 	u8 *pos, *epos, *csa_pos;
+ 	size_t buflen;
+ 
++	hapd = hostapd_mbssid_get_tx_bss(hapd);
++
+ #define MAX_PROBERESP_LEN 768
+ 	buflen = MAX_PROBERESP_LEN;
++
+ #ifdef CONFIG_WPS
+ 	if (hapd->wps_probe_resp_ie)
+ 		buflen += wpabuf_len(hapd->wps_probe_resp_ie);
+@@ -532,6 +583,7 @@ static u8 * hostapd_gen_probe_resp(struc
+ 	}
+ #endif /* CONFIG_IEEE80211AX */
+ 
++	buflen += hostapd_eid_mbssid_len(hapd, WLAN_FC_STYPE_PROBE_RESP, NULL);
+ 	buflen += hostapd_eid_rnr_len(hapd, WLAN_FC_STYPE_PROBE_RESP);
+ 	buflen += hostapd_mbo_ie_len(hapd);
+ 	buflen += hostapd_eid_owe_trans_len(hapd);
+@@ -600,6 +652,8 @@ static u8 * hostapd_gen_probe_resp(struc
+ 	pos = hostapd_eid_supported_op_classes(hapd, pos);
+ 	pos = hostapd_eid_ht_capabilities(hapd, pos);
+ 	pos = hostapd_eid_ht_operation(hapd, pos);
++	pos = hostapd_eid_mbssid(hapd, pos, epos, WLAN_FC_STYPE_PROBE_RESP, 0,
++				 NULL);
+ 
+ 	pos = hostapd_eid_ext_capab(hapd, pos);
+ 
+@@ -1155,6 +1209,9 @@ void handle_probe_req(struct hostapd_dat
+ 	}
+ #endif /* CONFIG_TESTING_OPTIONS */
+ 
++	if (hapd != hostapd_mbssid_get_tx_bss(hapd) && res != EXACT_SSID_MATCH)
++		return;
++
+ 	wpa_msg_ctrl(hapd->msg_ctx, MSG_INFO, RX_PROBE_REQUEST "sa=" MACSTR
+ 		     " signal=%d", MAC2STR(mgmt->sa), ssi_signal);
+ 
+@@ -1181,7 +1238,8 @@ void handle_probe_req(struct hostapd_dat
+ 				hapd->cs_c_off_ecsa_proberesp;
+ 	}
+ 
+-	ret = hostapd_drv_send_mlme(hapd, resp, resp_len, noack,
++	ret = hostapd_drv_send_mlme(hostapd_mbssid_get_tx_bss(hapd), resp,
++				    resp_len, noack,
+ 				    csa_offs_len ? csa_offs : NULL,
+ 				    csa_offs_len, 0);
+ 
+@@ -1661,7 +1719,6 @@ int ieee802_11_build_ap_params(struct ho
+ 	tailpos = hostapd_eid_supported_op_classes(hapd, tailpos);
+ 	tailpos = hostapd_eid_ht_capabilities(hapd, tailpos);
+ 	tailpos = hostapd_eid_ht_operation(hapd, tailpos);
+-
+ 	if (hostapd_set_mbssid_beacon(hapd, params))
+ 		return -1;
+ 
+@@ -1880,6 +1937,10 @@ void ieee802_11_free_ap_params(struct wp
+ 	params->head = NULL;
+ 	os_free(params->proberesp);
+ 	params->proberesp = NULL;
++	os_free(params->mbssid_elem);
++	params->mbssid_elem = NULL;
++	os_free(params->mbssid_elem_offset);
++	params->mbssid_elem_offset = NULL;
+ #ifdef CONFIG_FILS
+ 	os_free(params->fd_frame_tmpl);
+ 	params->fd_frame_tmpl = NULL;
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -3974,6 +3974,23 @@ static void handle_auth(struct hostapd_d
+ }
+ 
+ 
++u8 hostapd_max_bssid_indicator(struct hostapd_data *hapd)
++{
++	size_t num_bss_nontx;
++	u8 max_bssid_ind = 0;
++
++	if (!hapd->iconf->mbssid || hapd->iface->num_bss <= 1)
++		return 0;
++
++	num_bss_nontx = hapd->iface->num_bss - 1;
++	while (num_bss_nontx > 0) {
++		max_bssid_ind++;
++		num_bss_nontx >>= 1;
++	}
++	return max_bssid_ind;
++}
++
++
+ int hostapd_get_aid(struct hostapd_data *hapd, struct sta_info *sta)
+ {
+ 	int i, j = 32, aid;
+@@ -7667,4 +7684,199 @@ u8 * hostapd_eid_rnr(struct hostapd_data
+ 	return eid;
+ }
+ 
++
++static size_t hostapd_eid_mbssid_elem_len(struct hostapd_data *hapd,
++					  u32 frame_type, size_t *bss_index)
++{
++	size_t len = 3, i;
++
++	for (i = *bss_index; i < hapd->iface->num_bss; i++) {
++		struct hostapd_data *bss = hapd->iface->bss[i];
++		const u8 *auth, *rsn, *rsnx;
++		size_t nontx_profile_len, auth_len;
++
++		if (!bss || !bss->conf || !bss->started)
++			continue;
++
++		/*
++		 * Sublement ID: 1 byte
++		 * Length: 1 byte
++		 * Nontransmitted capabilities: 4 bytes
++		 * SSID element: 2 + variable
++		 * Multiple BSSID Index Element: 3 bytes (+2 bytes in beacons)
++		 * Fixed length = 1 + 1 + 4 + 2 + 3 = 11
++		 */
++		nontx_profile_len = 11 + bss->conf->ssid.ssid_len;
++
++		if (frame_type == WLAN_FC_STYPE_BEACON)
++			nontx_profile_len += 2;
++
++		auth = wpa_auth_get_wpa_ie(bss->wpa_auth, &auth_len);
++		if (auth) {
++			rsn = get_ie(auth, auth_len, WLAN_EID_RSN);
++			if (rsn)
++				nontx_profile_len += (2 + rsn[1]);
++
++			rsnx = get_ie(auth, auth_len, WLAN_EID_RSNX);
++			if (rsnx)
++				nontx_profile_len += (2 + rsnx[1]);
++		}
++
++		if ((len + nontx_profile_len) > 255)
++			goto mbssid_too_big;
++
++		len += nontx_profile_len;
++	}
++
++mbssid_too_big:
++	*bss_index = i;
++	return len;
++}
++
++
++size_t hostapd_eid_mbssid_len(struct hostapd_data *hapd, u32 frame_type,
++			      u8 *elem_count)
++{
++	size_t len = 0, bss_index = 1;
++
++	if (!hapd->iconf->mbssid || hapd->iface->num_bss <= 1 ||
++	    (frame_type != WLAN_FC_STYPE_BEACON &&
++	     frame_type != WLAN_FC_STYPE_PROBE_RESP))
++		return 0;
++
++	if (frame_type == WLAN_FC_STYPE_BEACON) {
++		if (!elem_count) {
++			wpa_printf(MSG_ERROR, "MBSSID: Insufficient data for "
++				   "beacons");
++			return 0;
++		}
++		*elem_count = 0;
++	}
++
++	while (bss_index < hapd->iface->num_bss) {
++		len += hostapd_eid_mbssid_elem_len(hapd, frame_type,
++						   &bss_index);
++
++		if (frame_type == WLAN_FC_STYPE_BEACON)
++			*elem_count += 1;
++	}
++	return len;
++}
++
++
++static u8 * hostapd_eid_mbssid_elem(struct hostapd_data *hapd, u8 *eid, u8 *end,
++				    u32 frame_type, u8 max_bssid_indicator,
++				    size_t *bss_index)
++{
++	size_t i;
++	u8 *eid_len_offset, *max_bssid_indicator_offset;
++
++	*eid++ = WLAN_EID_MULTIPLE_BSSID;
++	eid_len_offset = eid++;
++	max_bssid_indicator_offset = eid++;
++
++	for (i = *bss_index; i < hapd->iface->num_bss; i++) {
++		struct hostapd_data *bss = hapd->iface->bss[i];
++		struct hostapd_bss_config *conf;
++		u8 *eid_len_pos, *nontx_bss_start = eid;
++		const u8 *auth, *rsn, *rsnx;
++		size_t auth_len = 0;
++		u16 capab_info;
++
++		if (!bss || !bss->conf || !bss->started)
++			continue;
++		conf = bss->conf;
++
++		*eid++ = WLAN_EID_SUBELEMENT_NONTRANSMITTED_BSSID_PROFILE;
++		eid_len_pos = eid++;
++
++		*eid++ = WLAN_EID_NONTRANSMITTED_BSSID_CAPA;
++		*eid++ = sizeof(capab_info);
++		capab_info = host_to_le16(hostapd_own_capab_info(bss));
++		os_memcpy(eid, (const void *)&capab_info, sizeof(capab_info));
++		eid += sizeof(capab_info);
++
++		*eid++ = WLAN_EID_SSID;
++		*eid++ = conf->ssid.ssid_len;
++		os_memcpy(eid, conf->ssid.ssid, conf->ssid.ssid_len);
++		eid += conf->ssid.ssid_len;
++
++		*eid++ = WLAN_EID_MULTIPLE_BSSID_INDEX;
++		if (frame_type == WLAN_FC_STYPE_BEACON) {
++			*eid++ = 3;
++			*eid++ = i;
++			*eid++ = conf->dtim_period;
++			*eid++ = 0xFF;
++		} else {
++			*eid++ = 1;
++			*eid++ = i;
++		}
++
++		auth = wpa_auth_get_wpa_ie(bss->wpa_auth, &auth_len);
++		if (auth) {
++			rsn = get_ie(auth, auth_len, WLAN_EID_RSN);
++			if (rsn) {
++				os_memcpy(eid, rsn, 2 + rsn[1]);
++				eid += (2 + rsn[1]);
++			}
++
++			rsnx = get_ie(auth, auth_len, WLAN_EID_RSNX);
++			if (rsnx) {
++				os_memcpy(eid, rsnx, 2 + rsnx[1]);
++				eid += (2 + rsnx[1]);
++			}
++		}
++
++		*eid_len_pos = (eid - eid_len_pos) - 1;
++
++		if (((eid - eid_len_offset) - 1) > 255) {
++			eid = nontx_bss_start;
++			goto mbssid_too_big;
++		}
++	}
++
++mbssid_too_big:
++	*bss_index = i;
++	*max_bssid_indicator_offset = max_bssid_indicator;
++	if (*max_bssid_indicator_offset < 1)
++		*max_bssid_indicator_offset = 1;
++	*eid_len_offset = (eid - eid_len_offset) - 1;
++	return eid;
++}
++
++
++u8 * hostapd_eid_mbssid(struct hostapd_data *hapd, u8 *eid, u8 *end,
++			u32 frame_type, u8 elem_count, u8 **elem_offset)
++{
++	size_t bss_index = 1;
++	u8 elem_index = 0;
++
++	if (!hapd->iconf->mbssid || hapd->iface->num_bss <= 1 ||
++	    (frame_type != WLAN_FC_STYPE_BEACON &&
++	     frame_type != WLAN_FC_STYPE_PROBE_RESP))
++		return eid;
++
++	if (frame_type == WLAN_FC_STYPE_BEACON && !elem_offset) {
++		wpa_printf(MSG_ERROR, "MBSSID: Insufficient data for beacons");
++		return eid;
++	}
++
++	while (bss_index < hapd->iface->num_bss) {
++		if (frame_type == WLAN_FC_STYPE_BEACON) {
++			if (elem_index == elem_count) {
++				wpa_printf(MSG_WARNING, "MBSSID: More number of"
++					   " elements than provided array");
++				break;
++			}
++
++			elem_offset[elem_index] = eid;
++			elem_index = elem_index + 1;
++		}
++		eid = hostapd_eid_mbssid_elem(hapd, eid, end, frame_type,
++					      hostapd_max_bssid_indicator(hapd),
++					      &bss_index);
++	}
++	return eid;
++}
++
+ #endif /* CONFIG_NATIVE_WINDOWS */
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -129,8 +129,11 @@ u8 * hostapd_eid_time_zone(struct hostap
+ int hostapd_update_time_adv(struct hostapd_data *hapd);
+ void hostapd_client_poll_ok(struct hostapd_data *hapd, const u8 *addr);
+ u8 * hostapd_eid_bss_max_idle_period(struct hostapd_data *hapd, u8 *eid);
+-
+ int auth_sae_init_committed(struct hostapd_data *hapd, struct sta_info *sta);
++size_t hostapd_eid_mbssid_len(struct hostapd_data *hapd, u32 frame_type,
++			      u8 *elem_count);
++u8 * hostapd_eid_mbssid(struct hostapd_data *hapd, u8 *eid, u8 *end,
++			u32 frame_type, u8 elem_count, u8 **elem_offset);
+ #ifdef CONFIG_SAE
+ void sae_clear_retransmit_timer(struct hostapd_data *hapd,
+ 				struct sta_info *sta);
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -491,6 +491,8 @@
+ #define WLAN_EID_EXT_ANTI_CLOGGING_TOKEN 93
+ #define WLAN_EID_EXT_PASN_PARAMS 100
+ 
++#define WLAN_EID_SUBELEMENT_NONTRANSMITTED_BSSID_PROFILE 0
++
+ /* Operating Triplet can be any integer >= 201
+  * From IEEE P802.11-REVmd/D4.0: The first octet in each Subband
+  * Triplet field or Operating Triplet field contains an unsigned
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -1642,6 +1642,33 @@ struct wpa_driver_ap_params {
+ 	 * mbssid_count - Total number of BSSs in the group
+ 	 */
+ 	unsigned int mbssid_count;
++
++	/**
++	 * mbssid_elem - Buffer containing all multiple BSSID elements
++	 */
++	u8 *mbssid_elem;
++
++	/**
++	 * mbssid_elem_len - Total length of all multiple BSSID elements
++	 */
++	size_t mbssid_elem_len;
++
++	/**
++	 * mbssid_elem_count - The number of multiple bssid elements
++	 */
++	u8 mbssid_elem_count;
++
++	/**
++	 * mbssid_elem_offset - Offsets to elements in mbssid_elem.
++	 * Kernel will use these offsets to generate multiple BSSID beacons.
++	 */
++	u8 **mbssid_elem_offset;
++
++	/**
++	 * ema - Enhanced multi-bssid advertisements support.
++	 */
++	u8 ema;
++
+ };
+ 
+ struct wpa_driver_mesh_bss_params {

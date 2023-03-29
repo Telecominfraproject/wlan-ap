@@ -1,0 +1,712 @@
+From e59e0243756319b1556903deb4a3ae6a4d5157c7 Mon Sep 17 00:00:00 2001
+From: Dinesh Karthikeyan <quic_dinek@quicinc.com>
+Date: Thu, 9 Jun 2022 14:45:57 +0530
+Subject: [PATCH] ath12k: Add support for PCSS SSR dump collection
+
+Add support for PCSS Sub System Restart dump collection without
+crashing the entire Q6 remote processor and collect the dump via
+devcoredump.
+
+Enable the PCSS dump collection, to  upload it to device physical
+address and FW sends dump upload request to host. Host driver collects
+the PCSS dump via devcoredump and gives it to the user space. Driver
+sends dump upload done request and FW sends back dump upload done
+response.
+
+FW will not upload the next new dump to allocated physical address until
+it receives the dump upload done request from the driver. Add QMI
+support to handle QMI events and allocate memory region for
+PCSS dump collection. Add devcoredump support to save collected dump.
+
+Signed-off-by: Dinesh Karthikeyan <quic_dinek@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h     |   1 +
+ drivers/net/wireless/ath/ath12k/coredump.c |  54 +++++++
+ drivers/net/wireless/ath/ath12k/coredump.h |   7 +
+ drivers/net/wireless/ath/ath12k/debugfs.c  |  64 ++++++++
+ drivers/net/wireless/ath/ath12k/qmi.c      | 231 +++++++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/qmi.h      |  39 +++++
+ drivers/net/wireless/ath/ath12k/wmi.c      |  31 ++++
+ drivers/net/wireless/ath/ath12k/wmi.h      |  15 ++
+ 8 files changed, 442 insertions(+)
+
+Index: backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/core.h
+===================================================================
+--- backports-20220404-5.4.164-f40abb4788.orig/drivers/net/wireless/ath/ath12k/core.h	2022-07-17 14:36:35.867436883 +0530
++++ backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/core.h	2022-07-17 14:36:35.855436846 +0530
+@@ -552,6 +552,7 @@
+ 	u32 pktlog_peer_valid;
+ 	u8 pktlog_peer_addr[ETH_ALEN];
+ 	u32 rx_filter;
++	bool enable_m3_dump;
+ };
+ 
+ struct ath12k_per_peer_tx_stats {
+Index: backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/coredump.c
+===================================================================
+--- backports-20220404-5.4.164-f40abb4788.orig/drivers/net/wireless/ath/ath12k/coredump.c	2022-07-17 14:36:35.867436883 +0530
++++ backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/coredump.c	2022-07-17 14:37:39.195631007 +0530
+@@ -220,6 +220,13 @@
+ 			seg_info->type = ATH12K_FW_PAGEABLE_DATA;
+ 			seg_info++;
+ 		}
++		if (ab->qmi.target_mem[i].type == M3_DUMP_REGION_TYPE) {
++			seg_info->len = ab->qmi.target_mem[i].size;
++			seg_info->addr = ab->qmi.target_mem[i].paddr;
++			seg_info->vaddr = ab->qmi.target_mem[i].v.ioaddr;
++			seg_info->type = ATH12K_FW_M3_DUMP;
++			seg_info++;
++		}
+ 		seg_info->len = ab->qmi.target_mem[i].size;
+ 		seg_info->addr = ab->qmi.target_mem[i].paddr;
+ 		seg_info->vaddr = ab->qmi.target_mem[i].v.addr;
+@@ -337,3 +344,45 @@
+ 
+ 	return ret;
+ }
++
++void ath12k_coredump_m3_dump(struct ath12k_base *ab,
++			     struct ath12k_qmi_m3_dump_upload_req_data *event_data)
++{
++	struct target_mem_chunk *target_mem = ab->qmi.target_mem;
++	struct ath12k_qmi_m3_dump_data m3_dump_data;
++	void *dump;
++	int i, ret = 0;
++
++	dump = vzalloc(event_data->size);
++	if (!dump) {
++		return;
++	}
++
++	for (i = 0; i < ab->qmi.mem_seg_count; i++) {
++		if (target_mem[i].paddr == event_data->addr &&
++		    event_data->size <= target_mem[i].size)
++			break;
++	}
++
++	if (i == ab->qmi.mem_seg_count) {
++		ath12k_warn(ab, "qmi invalid paddr from firmware for M3 dump\n");
++		ret = -EINVAL;
++		vfree(dump);
++		goto send_resp;
++	}
++
++	m3_dump_data.addr = target_mem[i].v.ioaddr;
++	m3_dump_data.size = event_data->size;
++	m3_dump_data.pdev_id = event_data->pdev_id;
++	m3_dump_data.timestamp = ktime_to_ms(ktime_get());
++
++	memcpy(dump, m3_dump_data.addr, m3_dump_data.size);
++
++	dev_coredumpv(ab->dev, dump, m3_dump_data.size,
++		      GFP_KERNEL);
++
++send_resp:
++       ret = ath12k_qmi_m3_dump_upload_done_ind_send(ab, event_data->pdev_id, ret);
++       if (ret < 0)
++               ath12k_warn(ab, "qmi M3 dump upload done failed\n");
++}
+Index: backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/coredump.h
+===================================================================
+--- backports-20220404-5.4.164-f40abb4788.orig/drivers/net/wireless/ath/ath12k/coredump.h	2022-07-17 14:36:35.867436883 +0530
++++ backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/coredump.h	2022-07-17 14:36:35.855436846 +0530
+@@ -79,6 +79,8 @@
+ 				  struct ath12k_dump_segment *segments, int num_seg);
+ void ath12k_coredump_qdss_dump(struct ath12k_base *ab,
+ 			       struct ath12k_qmi_event_qdss_trace_save_data *event_data);
++void ath12k_coredump_m3_dump(struct ath12k_base *ab,
++			     struct ath12k_qmi_m3_dump_upload_req_data *event_data);
+ #else
+ static inline void ath12k_coredump_download_rddm(struct ath12k_base *ab)
+ {
+@@ -94,6 +96,11 @@
+ 			  struct ath12k_qmi_event_qdss_trace_save_data *event_data)
+ {
+ }
++static inline void
++ath12k_coredump_m3_dump(struct ath12k_base *ab,
++			struct ath12k_qmi_m3_dump_upload_req_data *event_data)
++{
++}
+ #endif
+ 
+ #endif
+Index: backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/debugfs.c
+===================================================================
+--- backports-20220404-5.4.164-f40abb4788.orig/drivers/net/wireless/ath/ath12k/debugfs.c	2022-07-17 14:36:35.867436883 +0530
++++ backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/debugfs.c	2022-07-17 14:36:35.855436846 +0530
+@@ -1459,6 +1459,67 @@
+ 	.llseek = default_llseek,
+ };
+ 
++static ssize_t ath12k_write_enable_m3_dump(struct file *file,
++					   const char __user *ubuf,
++					   size_t count, loff_t *ppos)
++{
++	struct ath12k *ar = file->private_data;
++	bool enable;
++	int ret;
++
++	if (kstrtobool_from_user(ubuf, count, &enable))
++		return -EINVAL;
++
++	mutex_lock(&ar->conf_mutex);
++
++	if (ar->state != ATH12K_STATE_ON) {
++		ret = -ENETDOWN;
++		goto exit;
++	}
++
++	if (enable == ar->debug.enable_m3_dump) {
++		ret = count;
++		goto exit;
++	}
++
++	ret = ath12k_wmi_pdev_m3_dump_enable(ar, enable);
++	if (ret) {
++		ath12k_warn(ar->ab,
++			    "failed to enable m3 ssr dump %d\n",
++			    ret);
++		goto exit;
++	}
++
++	ar->debug.enable_m3_dump = enable;
++	ret = count;
++
++exit:
++	mutex_unlock(&ar->conf_mutex);
++	return ret;
++}
++
++static ssize_t ath12k_read_enable_m3_dump(struct file *file,
++					  char __user *ubuf,
++					  size_t count, loff_t *ppos)
++{
++	struct ath12k *ar = file->private_data;
++	char buf[32];
++	size_t len = 0;
++
++	mutex_lock(&ar->conf_mutex);
++	len = scnprintf(buf, sizeof(buf) - len, "%d\n",
++			ar->debug.enable_m3_dump);
++	mutex_unlock(&ar->conf_mutex);
++
++	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
++}
++
++static const struct file_operations fops_enable_m3_dump = {
++	.read = ath12k_read_enable_m3_dump,
++	.write = ath12k_write_enable_m3_dump,
++	.open = simple_open
++};
++
+ int ath12k_debugfs_register(struct ath12k *ar)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+@@ -1508,6 +1569,9 @@
+ 			    ar->debug.debugfs_pdev, ar,
+ 			    &fops_athdiag);
+ 
++	debugfs_create_file("enable_m3_dump", 0644,
++			    ar->debug.debugfs_pdev, ar,
++			    &fops_enable_m3_dump);
+ 	return 0;
+ }
+ 
+Index: backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/qmi.c
+===================================================================
+--- backports-20220404-5.4.164-f40abb4788.orig/drivers/net/wireless/ath/ath12k/qmi.c	2022-07-17 14:36:35.867436883 +0530
++++ backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/qmi.c	2022-07-17 14:36:35.859436859 +0530
+@@ -15,6 +15,7 @@
+ #include <linux/ioport.h>
+ #include <linux/firmware.h>
+ #include <linux/module.h>
++#include <linux/devcoredump.h>
+ 
+ #define SLEEP_CLOCK_SELECT_INTERNAL_BIT	0x02
+ #define HOST_CSTATE_BIT			0x04
+@@ -578,6 +579,24 @@
+ 		.ei_array	= qmi_response_type_v01_ei,
+ 	},
+ 	{
++		.data_type	= QMI_OPT_FLAG,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x20,
++		.offset		= offsetof(struct qmi_wlanfw_ind_register_req_msg_v01,
++					   m3_dump_upload_req_enable_valid),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_1_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x20,
++		.offset		= offsetof(struct qmi_wlanfw_ind_register_req_msg_v01,
++					   m3_dump_upload_req_enable),
++	},
++	{
+ 		.data_type	= QMI_EOTI,
+ 		.array_type	= NO_ARRAY,
+ 		.tlv_type	= QMI_COMMON_TLV_TYPE,
+@@ -839,6 +858,24 @@
+ 		                           qdss_trace_save_enable),
+ 	},
+ 	{
++                .data_type      = QMI_OPT_FLAG,
++                .elem_len       = 1,
++                .elem_size      = sizeof(u8),
++                .array_type     = NO_ARRAY,
++                .tlv_type       = 0x20,
++                .offset         = offsetof(struct qmi_wlanfw_ind_register_req_msg_v01,
++                                           m3_dump_upload_req_enable_valid),
++        },
++        {
++                .data_type      = QMI_UNSIGNED_1_BYTE,
++                .elem_len       = 1,
++                .elem_size      = sizeof(u8),
++                .array_type     = NO_ARRAY,
++                .tlv_type       = 0x20,
++                .offset         = offsetof(struct qmi_wlanfw_ind_register_req_msg_v01,
++                                           m3_dump_upload_req_enable),
++        },
++	{
+ 		.data_type	= QMI_EOTI,
+ 		.array_type	= NO_ARRAY,
+ 		.tlv_type	= QMI_COMMON_TLV_TYPE,
+@@ -2293,6 +2330,87 @@
+ 	return ret;
+ }
+ 
++static struct qmi_elem_info qmi_wlanfw_m3_dump_upload_req_ind_msg_v01_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof(u32),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x01,
++		.offset = offsetof(struct qmi_wlanfw_m3_dump_upload_req_ind_msg_v01,
++				   pdev_id),
++	},
++	{
++		.data_type = QMI_UNSIGNED_8_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof(u64),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x02,
++		.offset = offsetof(struct qmi_wlanfw_m3_dump_upload_req_ind_msg_v01,
++				   addr),
++	},
++	{
++		.data_type = QMI_UNSIGNED_8_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof(u64),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x03,
++		.offset = offsetof(struct qmi_wlanfw_m3_dump_upload_req_ind_msg_v01,
++				   size),
++	},
++	{
++		.data_type = QMI_EOTI,
++		.array_type = NO_ARRAY,
++		.tlv_type = QMI_COMMON_TLV_TYPE,
++	},
++};
++
++static struct qmi_elem_info qmi_wlanfw_m3_dump_upload_done_req_msg_v01_ei[] = {
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof(u32),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x01,
++		.offset = offsetof(struct
++				   qmi_wlanfw_m3_dump_upload_done_req_msg_v01,
++				   pdev_id),
++	},
++	{
++		.data_type = QMI_UNSIGNED_4_BYTE,
++		.elem_len = 1,
++		.elem_size = sizeof(u32),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x02,
++		.offset = offsetof(struct
++				   qmi_wlanfw_m3_dump_upload_done_req_msg_v01,
++				   status),
++	},
++	{
++		.data_type = QMI_EOTI,
++		.array_type = NO_ARRAY,
++		.tlv_type = QMI_COMMON_TLV_TYPE,
++	},
++};
++
++static struct qmi_elem_info qmi_wlanfw_m3_dump_upload_done_resp_msg_v01_ei[] = {
++	{
++		.data_type = QMI_STRUCT,
++		.elem_len = 1,
++		.elem_size = sizeof(struct qmi_response_type_v01),
++		.array_type = NO_ARRAY,
++		.tlv_type = 0x02,
++		.offset = offsetof(struct qmi_wlanfw_m3_dump_upload_done_resp_msg_v01,
++				   resp),
++		.ei_array = qmi_response_type_v01_ei,
++	},
++	{
++		.data_type = QMI_EOTI,
++		.array_type = NO_ARRAY,
++		.tlv_type = QMI_COMMON_TLV_TYPE,
++	},
++};
++
+ int ath12k_qmi_send_qdss_trace_config_download_req(struct ath12k_base *ab,
+ 					     const u8 *buffer, unsigned int buffer_len)
+ {
+@@ -2535,6 +2653,8 @@
+ 	req->qdss_trace_save_enable = 1;
+ 	req->qdss_trace_free_enable_valid = 1;
+ 	req->qdss_trace_free_enable = 1;
++	req->m3_dump_upload_req_enable_valid = 1;
++	req->m3_dump_upload_req_enable = 1;
+ 
+ 	req->pin_connect_result_enable_valid = 0;
+ 	req->pin_connect_result_enable = 0;
+@@ -2782,6 +2902,17 @@
+ 				            "qmi fail to update BHI table %d\n", ret);
+ 			idx++;
+ 			break;
++		case M3_DUMP_REGION_TYPE:
++                        ab->qmi.target_mem[idx].v.ioaddr =
++                                        ioremap(ab->qmi.target_mem[idx].paddr,
++						ab->qmi.target_mem[i].size);
++                        ab->qmi.target_mem[idx].size =
++					ab->qmi.target_mem[i].size;
++                        ab->qmi.target_mem[idx].type =
++					ab->qmi.target_mem[i].type;
++			sz += ab->qmi.target_mem[i].size;
++			idx++;
++			break;
+ 
+ 		default:
+ 			ath12k_warn(ab, "qmi ignore invalid mem req type %d\n",
+@@ -3422,6 +3553,71 @@
+ 	return 0;
+ }
+ 
++int ath12k_qmi_m3_dump_upload_done_ind_send(struct ath12k_base *ab,
++					    u32 pdev_id, int status)
++{
++	struct qmi_wlanfw_m3_dump_upload_done_req_msg_v01 *req;
++	struct qmi_wlanfw_m3_dump_upload_done_resp_msg_v01 *resp;
++	struct qmi_txn txn;
++	int ret;
++
++	req = kzalloc(sizeof(*req), GFP_KERNEL);
++	if (!req)
++		return -ENOMEM;
++
++	resp = kzalloc(sizeof(*resp), GFP_KERNEL);
++	if (!resp) {
++		kfree(req);
++		return -ENOMEM;
++	}
++
++	req->pdev_id = pdev_id;
++	req->status = status;
++
++	ret = qmi_txn_init(&ab->qmi.handle, &txn,
++			   qmi_wlanfw_m3_dump_upload_done_resp_msg_v01_ei, resp);
++	if (ret < 0)
++		goto out;
++
++	ret =
++	qmi_send_request(&ab->qmi.handle, NULL, &txn,
++			 QMI_WLFW_M3_DUMP_UPLOAD_DONE_REQ_V01,
++			 QMI_WLANFW_M3_DUMP_UPLOAD_DONE_REQ_MSG_V01_MAX_MSG_LEN,
++			 qmi_wlanfw_m3_dump_upload_done_req_msg_v01_ei, req);
++	if (ret < 0) {
++		qmi_txn_cancel(&txn);
++		ath12k_warn(ab, "Failed to send M3 dump upload done request, err %d\n",
++			    ret);
++		goto out;
++	}
++
++	ret = qmi_txn_wait(&txn, msecs_to_jiffies(ATH12K_QMI_WLANFW_TIMEOUT_MS));
++	if (ret < 0)
++		goto out;
++
++	if (resp->resp.result != QMI_RESULT_SUCCESS_V01) {
++		ath12k_warn(ab, "qmi M3 upload done req failed, result: %d, err: %d\n",
++			    resp->resp.result, resp->resp.error);
++		ret = -EINVAL;
++		goto out;
++	}
++	ath12k_info(ab, "qmi m3 dump uploaded\n");
++
++out:
++	kfree(req);
++	kfree(resp);
++	return ret;
++}
++
++static void ath12k_qmi_event_m3_dump_upload_req(struct ath12k_qmi *qmi,
++						void *data)
++{
++	struct ath12k_base *ab = qmi->ab;
++	struct ath12k_qmi_m3_dump_upload_req_data *event_data = data;
++
++	ath12k_coredump_m3_dump(ab, event_data);
++}
++
+ static void ath12k_qmi_qdss_mem_free(struct ath12k_qmi *qmi)
+ {
+ 	struct ath12k_base *ab = qmi->ab;
+@@ -3819,6 +4015,30 @@
+ 	ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi cold boot calibration done\n");
+ }
+ 
++static void ath12k_qmi_m3_dump_upload_req_ind_cb(struct qmi_handle *qmi_hdl,
++						 struct sockaddr_qrtr *sq,
++						 struct qmi_txn *txn,
++						 const void *data)
++{
++	struct ath12k_qmi *qmi = container_of(qmi_hdl, struct ath12k_qmi, handle);
++	struct ath12k_base *ab = qmi->ab;
++	const struct qmi_wlanfw_m3_dump_upload_req_ind_msg_v01 *msg = data;
++	struct ath12k_qmi_m3_dump_upload_req_data *event_data;
++
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi m3 dump memory request\n");
++
++	event_data = kzalloc(sizeof(*event_data), GFP_KERNEL);
++	if (!event_data)
++		return;
++
++	event_data->pdev_id = msg->pdev_id;
++	event_data->addr = msg->addr;
++	event_data->size = msg->size;
++
++	ath12k_qmi_driver_event_post(qmi, ATH12K_QMI_EVENT_M3_DUMP_UPLOAD_REQ,
++				     event_data);
++}
++
+ static void ath12k_wlfw_qdss_trace_req_mem_ind_cb(struct qmi_handle *qmi_hdl,
+ 						  struct sockaddr_qrtr *sq,
+ 						  struct qmi_txn *txn,
+@@ -3975,6 +4195,14 @@
+ 	},
+ 	{
+ 		.type = QMI_INDICATION,
++		.msg_id = QMI_WLFW_M3_DUMP_UPLOAD_REQ_IND_V01,
++		.ei = qmi_wlanfw_m3_dump_upload_req_ind_msg_v01_ei,
++		.decoded_size =
++			sizeof(struct qmi_wlanfw_m3_dump_upload_req_ind_msg_v01),
++		.fn = ath12k_qmi_m3_dump_upload_req_ind_cb,
++	},
++	{
++		.type = QMI_INDICATION,
+ 		.msg_id = QMI_WLFW_QDSS_TRACE_REQ_MEM_IND_V01,
+ 		.ei = qmi_wlanfw_request_mem_ind_msg_v01_ei,
+ 		.decoded_size =
+@@ -4097,6 +4325,9 @@
+ 		case ATH12K_QMI_EVENT_QDSS_TRACE_SAVE:
+ 			ath12k_qmi_event_qdss_trace_save_hdlr(qmi, event->data);
+ 			break;
++		case ATH12K_QMI_EVENT_M3_DUMP_UPLOAD_REQ:
++			ath12k_qmi_event_m3_dump_upload_req(qmi, event->data);
++			break;
+ 		default:
+ 			ath12k_warn(ab, "invalid event type: %d", event->type);
+ 			break;
+Index: backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/qmi.h
+===================================================================
+--- backports-20220404-5.4.164-f40abb4788.orig/drivers/net/wireless/ath/ath12k/qmi.h	2022-07-17 14:36:35.867436883 +0530
++++ backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/qmi.h	2022-07-17 14:36:35.859436859 +0530
+@@ -29,6 +29,7 @@
+ #define ATH12K_QMI_DEVMEM_CMEM_INDEX	0
+ #define ATH12K_QMI_MAX_QDSS_CONFIG_FILE_NAME_SIZE 64
+ #define ATH12K_QMI_DEFAULT_QDSS_CONFIG_FILE_NAME "qdss_trace_config.bin"
++#define ATH12K_QMI_M3_DUMP_SIZE			0x100000
+ 
+ #define QMI_WLFW_REQUEST_MEM_IND_V01		0x0035
+ #define QMI_WLFW_FW_MEM_READY_IND_V01		0x0037
+@@ -38,6 +39,8 @@
+ #define QMI_Q6_QDSS_ETR_SIZE_QCN92XX            0x100000
+ #define QMI_WLFW_QDSS_TRACE_SAVE_IND_V01        0x0041
+ #define QMI_Q6_QDSS_ETR_OFFSET_QCN92XX		0x2500000
++#define QMI_WLFW_M3_DUMP_UPLOAD_REQ_IND_V01	0x004D
++#define QMI_WLFW_M3_DUMP_UPLOAD_DONE_REQ_V01	0x004E
+ 
+ #define QMI_WLANFW_MAX_DATA_SIZE_V01		6144
+ #define ATH12K_FIRMWARE_MODE_OFF		4
+@@ -75,6 +78,7 @@
+ 	ATH12K_QMI_EVENT_POWER_DOWN,
+ 	ATH12K_QMI_EVENT_QDSS_TRACE_REQ_MEM = 15,
+ 	ATH12K_QMI_EVENT_QDSS_TRACE_SAVE,
++	ATH12K_QMI_EVENT_M3_DUMP_UPLOAD_REQ = 18,
+ 	ATH12K_QMI_EVENT_MAX,
+ };
+ 
+@@ -84,6 +88,13 @@
+ 	void *data;
+ };
+ 
++struct ath12k_qmi_m3_dump_data {
++	u32 pdev_id;
++	u32 size;
++	u64 timestamp;
++	char *addr;
++};
++
+ struct ath12k_qmi_ce_cfg {
+ 	const struct ce_pipe_config *tgt_ce;
+ 	int tgt_ce_len;
+@@ -156,6 +167,12 @@
+ 	struct dev_mem_info dev_mem[ATH12K_QMI_WLFW_MAX_DEV_MEM_NUM_V01];
+ };
+ 
++struct ath12k_qmi_m3_dump_upload_req_data {
++	u32 pdev_id;
++	u64 addr;
++	u64 size;
++};
++
+ #define QMI_WLANFW_QDSS_TRACE_CONFIG_DOWNLOAD_REQ_MSG_V01_MAX_LEN 6167
+ #define QMI_WLANFW_QDSS_TRACE_CONFIG_DOWNLOAD_RESP_MSG_V01_MAX_LEN 7
+ #define QMI_WLANFW_QDSS_TRACE_CONFIG_DOWNLOAD_REQ_V01 0x0044
+@@ -202,6 +219,16 @@
+ };
+ 
+ #define QMI_WLANFW_HOST_CAP_REQ_MSG_V01_MAX_LEN		261
++
++struct qmi_wlanfw_m3_dump_upload_done_req_msg_v01 {
++	u32 pdev_id;
++	u32 status;
++};
++
++struct qmi_wlanfw_m3_dump_upload_done_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++};
++
+ #define QMI_WLANFW_HOST_CAP_REQ_V01			0x0034
+ #define QMI_WLANFW_HOST_CAP_RESP_MSG_V01_MAX_LEN	7
+ #define QMI_WLFW_HOST_CAP_RESP_V01			0x0034
+@@ -312,6 +339,8 @@
+ 	u8 qdss_trace_save_enable;
+ 	u8 qdss_trace_free_enable_valid;
+ 	u8 qdss_trace_free_enable;
++	u8 m3_dump_upload_req_enable_valid;
++	u8 m3_dump_upload_req_enable;
+ };
+ 
+ struct qmi_wlanfw_ind_register_resp_msg_v01 {
+@@ -536,6 +565,8 @@
+ #define QMI_WLANFW_M3_INFO_RESP_V01		0x003C
+ #define QMI_WLANFW_M3_INFO_REQ_V01		0x003C
+ 
++#define QMI_WLANFW_M3_DUMP_UPLOAD_DONE_REQ_MSG_V01_MAX_MSG_LEN	14
++
+ struct qmi_wlanfw_m3_info_req_msg_v01 {
+ 	u64 addr;
+ 	u32 size;
+@@ -654,6 +685,12 @@
+ 	struct qmi_response_type_v01 resp;
+ };
+ 
++struct qmi_wlanfw_m3_dump_upload_req_ind_msg_v01 {
++	u32 pdev_id;
++	u64 addr;
++	u64 size;
++};
++
+ int ath12k_qmi_firmware_start(struct ath12k_base *ab,
+ 			      u32 mode);
+ void ath12k_qmi_firmware_stop(struct ath12k_base *ab);
+@@ -667,4 +704,6 @@
+ int ath12k_send_qdss_trace_mode_req(struct ath12k_base *ab,
+ 				    enum qmi_wlanfw_qdss_trace_mode_enum_v01 mode);
+ int ath12k_enable_fwlog(struct ath12k_base *ab);
++int ath12k_qmi_m3_dump_upload_done_ind_send(struct ath12k_base *ab,
++					    u32 pdev_id, int status);
+ #endif
+Index: backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/wmi.c
+===================================================================
+--- backports-20220404-5.4.164-f40abb4788.orig/drivers/net/wireless/ath/ath12k/wmi.c	2022-07-17 14:36:35.867436883 +0530
++++ backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/wmi.c	2022-07-17 14:36:35.859436859 +0530
+@@ -8654,6 +8654,37 @@
+         return ath12k_wmi_send_unit_test_cmd(ar, wmi_ut, awgn_args);
+ }
+ 
++int ath12k_wmi_pdev_m3_dump_enable(struct ath12k *ar, u32 enable)
++{
++	struct ath12k_vif *arvif;
++	u32 m3_args[WMI_M3_MAX_TEST_ARGS];
++	struct wmi_unit_test_cmd wmi_ut;
++	bool arvif_found = false;
++
++	list_for_each_entry(arvif, &ar->arvifs, list) {
++		if (arvif->is_started) {
++			arvif_found = true;
++			break;
++		}
++	}
++
++	if (!arvif_found)
++		return -EINVAL;
++
++	m3_args[WMI_M3_TEST_CMDID] = WMI_DBG_ENABLE_M3_SSR;
++	m3_args[WMI_M3_TEST_ENABLE] = enable;
++
++	wmi_ut.vdev_id = arvif->vdev_id;
++	wmi_ut.module_id = WMI_M3_UNIT_TEST_MODULE;
++	wmi_ut.num_args = WMI_M3_MAX_TEST_ARGS;
++	wmi_ut.diag_token = WMI_M3_UNIT_TEST_TOKEN;
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_WMI, "%s M3 SSR dump\n",
++		   enable ? "Enabling" : "Disabling");
++
++	return ath12k_wmi_send_unit_test_cmd(ar, wmi_ut, m3_args);
++}
++
+ int ath12k_wmi_connect(struct ath12k_base *ab)
+ {
+ 	u32 i;
+Index: backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/wmi.h
+===================================================================
+--- backports-20220404-5.4.164-f40abb4788.orig/drivers/net/wireless/ath/ath12k/wmi.h	2022-07-17 14:36:35.867436883 +0530
++++ backports-20220404-5.4.164-f40abb4788/drivers/net/wireless/ath/ath12k/wmi.h	2022-07-17 14:36:35.859436859 +0530
+@@ -2150,6 +2150,11 @@
+ 	WMI_MAX_EXT2_SERVICE,
+ };
+ 
++enum wmi_unit_test_cmdid {
++	/* TODO: Add the remaining cmd ids if needed */
++	WMI_DBG_ENABLE_M3_SSR = 36,
++};
++
+ enum {
+ 	WMI_SMPS_FORCED_MODE_NONE = 0,
+ 	WMI_SMPS_FORCED_MODE_DISABLED,
+@@ -4252,6 +4257,15 @@
+         WMI_AWGN_MAX_TEST_ARGS,
+ };
+ 
++#define WMI_M3_UNIT_TEST_MODULE	0x22
++#define WMI_M3_UNIT_TEST_TOKEN	0
++
++enum wmi_m3_test_args_idx {
++	WMI_M3_TEST_CMDID,
++	WMI_M3_TEST_ENABLE,
++	WMI_M3_MAX_TEST_ARGS,
++};
++
+ struct wmi_unit_test_cmd {
+ 	u32 tlv_header;
+ 	u32 vdev_id;
+@@ -6060,5 +6074,6 @@
+ int ath12k_wmi_send_vdev_set_tpc_power(struct ath12k *ar,
+                                         u32 vdev_id,
+                                         struct ath12k_reg_tpc_power_info *param);
++int ath12k_wmi_pdev_m3_dump_enable(struct ath12k *ar, u32 enable);
+ 
+ #endif

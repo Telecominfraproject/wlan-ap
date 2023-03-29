@@ -1,0 +1,222 @@
+From a72ca46c5afd2a4146f0fd95ba1306a8c47028c7 Mon Sep 17 00:00:00 2001
+From: John Crispin <john@phrozen.org>
+Date: Fri, 21 Jan 2022 10:14:48 -0800
+Subject: [PATCH 09/14] ath11k: EMA beacon support
+
+Add new function ath11k_mac_setup_bcn_tmpl_ema() which invokes the new
+API provided by MAC80211 to retrieve EMA beacons. For non EMA APs,
+ath11k_mac_setup_bcn_tmpl_legacy() is added which maintains the current
+functionality.
+
+Signed-off-by: John Crispin <john@phrozen.org>
+Signed-off-by: Aloka Dixit <quic_alokad@quicinc.com>
+---
+ drivers/net/wireless/ath/ath11k/mac.c | 110 +++++++++++++++++++++-----
+ drivers/net/wireless/ath/ath11k/wmi.c |   4 +-
+ drivers/net/wireless/ath/ath11k/wmi.h |  12 ++-
+ 3 files changed, 106 insertions(+), 20 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -1445,7 +1445,7 @@ static void ath11k_mac_setup_bcn_tmpl_vi
+ 		vht_cap = (void *)(vht_cap_ie + 2);
+ 		arvif->vht_cap = vht_cap->vht_cap_info;
+ 	}
+-	ar->cfr_phymode = ath11k_cfr_chan_to_phymode(arvif);
++	arvif->ar->cfr_phymode = ath11k_cfr_chan_to_phymode(arvif);
+ 
+ 	if (cfg80211_find_vendor_ie(WLAN_OUI_MICROSOFT,
+ 				    WLAN_OUI_TYPE_MICROSOFT_WPA,
+@@ -1464,37 +1464,116 @@ static void ath11k_mac_setup_bcn_tmpl_vi
+ 
+ }
+ 
+-static int ath11k_mac_setup_bcn_tmpl(struct ath11k_vif *arvif)
++static int __ath11k_mac_setup_bcn_tmpl(struct ath11k_vif *arvif,
++				       struct sk_buff *bcn,
++				       struct ieee80211_mutable_offsets offs,
++				       int ema_idx, int ema_cnt)
+ {
+ 	struct ath11k *ar = arvif->ar;
+-	struct ath11k_base *ab = ar->ab;
+-	struct ieee80211_hw *hw = ar->hw;
+-	struct ieee80211_vif *vif = arvif->vif;
++	u32 ema_param = 0;
++
++	if (ema_cnt) {
++		ema_param = (ema_cnt << WMI_BEACON_EMA_PARAM_PERIODICITY_SHIFT);
++		ema_param |= (ema_idx << WMI_BEACON_EMA_PARAM_TMPL_IDX_SHIFT);
++		ema_param |= ((!ema_idx ? 1 : 0) <<
++			      WMI_BEACON_EMA_PARAM_FIRST_TMPL_SHIFT);
++		ema_param |= ((ema_idx + 1 == ema_cnt ? 1 : 0) <<
++			      WMI_BEACON_EMA_PARAM_LAST_TMPL_SHIFT);
++	}
++
++	return ath11k_wmi_bcn_tmpl(ar, arvif->vdev_id, &offs, bcn, ema_param);
++}
++
++static int ath11k_mac_setup_bcn_tmpl_ema(struct ath11k_vif *arvif)
++{
++	struct ath11k_vif *tx_arvif;
++	struct ieee80211_ema_beacons *beacons;
++	u8 i = 0;
++	int ret = 0;
++
++	if (!arvif->vif->mbssid_tx_vif)
++		return -1;
++
++	tx_arvif = (void *)arvif->vif->mbssid_tx_vif->drv_priv;
++	beacons = ieee80211_beacon_get_template_ema_list(tx_arvif->ar->hw,
++							 tx_arvif->vif);
++	if (!beacons || !beacons->cnt) {
++		ath11k_warn(arvif->ar->ab,
++			    "failed to get ema beacon templates from mac80211\n");
++		return -EPERM;
++	}
++
++	if (tx_arvif == arvif)
++		ath11k_mac_setup_bcn_tmpl_vif_params(tx_arvif,
++						     beacons->bcn[0].skb);
++
++	for (i = 0; i < beacons->cnt; i++) {
++		ret = __ath11k_mac_setup_bcn_tmpl(tx_arvif, beacons->bcn[i].skb,
++						  beacons->bcn[i].offs,
++						  i, beacons->cnt);
++		if (ret) {
++			ath11k_warn(arvif->ar->ab,
++				    "failed to set ema beacon template id %i error %d\n",
++				    i, ret);
++			break;
++		}
++	}
++
++	ieee80211_beacon_free_ema_list(beacons);
++	return ret;
++}
++
++static int ath11k_mac_setup_bcn_tmpl_non_ema(struct ath11k_vif *arvif)
++{
++	struct ath11k_vif *tx_arvif = arvif;
+ 	struct ieee80211_mutable_offsets offs = {};
+ 	struct sk_buff *bcn;
+ 	int ret;
+ 
+-	if (arvif->vdev_type != WMI_VDEV_TYPE_AP)
+-		return 0;
++	if (arvif->vif->mbssid_tx_vif)
++		tx_arvif = (void *)arvif->vif->mbssid_tx_vif->drv_priv;
++
++	bcn = ieee80211_beacon_get_template(tx_arvif->ar->hw, tx_arvif->vif,
++					    &offs);
+ 
+-	bcn = ieee80211_beacon_get_template(hw, vif, &offs);
+ 	if (!bcn) {
+-		ath11k_warn(ab, "failed to get beacon template from mac80211\n");
++		ath11k_warn(arvif->ar->ab,
++			    "failed to get beacon template from mac80211\n");
+ 		return -EPERM;
+ 	}
+ 
+-	ath11k_mac_setup_bcn_tmpl_vif_params(arvif, bcn);
+-	ret = ath11k_wmi_bcn_tmpl(ar, arvif->vdev_id, &offs, bcn);
+ 
+-	kfree_skb(bcn);
++	if (tx_arvif == arvif)
++		ath11k_mac_setup_bcn_tmpl_vif_params(tx_arvif, bcn);
+ 
++	ret = __ath11k_mac_setup_bcn_tmpl(tx_arvif, bcn, offs, 0, 0);
+ 	if (ret)
+-		ath11k_warn(ab, "failed to submit beacon template command: %d\n",
++		ath11k_warn(arvif->ar->ab,
++			    "failed to submit beacon template command: %d\n",
+ 			    ret);
+ 
++	kfree_skb(bcn);
+ 	return ret;
+ }
+ 
++static int ath11k_mac_setup_bcn_tmpl(struct ath11k_vif *arvif)
++{
++	struct ieee80211_vif *vif = arvif->vif;
++
++	if (arvif->vdev_type != WMI_VDEV_TYPE_AP)
++		return 0;
++
++	if (vif->mbssid_tx_vif &&
++	    arvif != (void *)vif->mbssid_tx_vif->drv_priv &&
++	    arvif->is_up)
++		return 0;
++
++	if (vif->bss_conf.ema_ap)
++		return ath11k_mac_setup_bcn_tmpl_ema(arvif);
++	else
++		return ath11k_mac_setup_bcn_tmpl_non_ema(arvif);
++}
++
+ void ath11k_mac_bcn_tx_event(struct ath11k_vif *arvif)
+ {
+ 	struct ieee80211_vif *vif = arvif->vif;
+--- a/drivers/net/wireless/ath/ath11k/wmi.c
++++ b/drivers/net/wireless/ath/ath11k/wmi.c
+@@ -1980,7 +1980,7 @@ int ath11k_wmi_send_bcn_offload_control_
+ 
+ int ath11k_wmi_bcn_tmpl(struct ath11k *ar, u32 vdev_id,
+ 			struct ieee80211_mutable_offsets *offs,
+-			struct sk_buff *bcn)
++			struct sk_buff *bcn, u32 ema_params)
+ {
+ 	struct ath11k_pdev_wmi *wmi = ar->wmi;
+ 	struct wmi_bcn_tmpl_cmd *cmd;
+@@ -2018,6 +2018,8 @@ int ath11k_wmi_bcn_tmpl(struct ath11k *a
+ 	}
+ 
+ 	cmd->buf_len = bcn->len;
++	cmd->mbssid_ie_offset = offs->mbssid_off;
++	cmd->ema_params = ema_params;
+ 
+ 	ptr = skb->data + sizeof(*cmd);
+ 
+@@ -10287,7 +10289,7 @@ static int ath11k_wmi_tbtt_offset_subtlv
+ 
+ 	mgmt = (void *)bcn->data;
+ 	memcpy(&mgmt->u.beacon.timestamp, &adjusted_tsf, sizeof(adjusted_tsf));
+-	ret = ath11k_wmi_bcn_tmpl(ar, arvif->vdev_id, &offs, bcn);
++	ret = ath11k_wmi_bcn_tmpl(ar, arvif->vdev_id, &offs, bcn, 0);
+ 	kfree_skb(bcn);
+ 
+ 	if (ret)
+--- a/drivers/net/wireless/ath/ath11k/wmi.h
++++ b/drivers/net/wireless/ath/ath11k/wmi.h
+@@ -3898,6 +3898,11 @@ struct wmi_ftm_event_msg {
+ 
+ #define WMI_BEACON_TX_BUFFER_SIZE	512
+ 
++#define WMI_BEACON_EMA_PARAM_PERIODICITY_SHIFT         0
++#define WMI_BEACON_EMA_PARAM_TMPL_IDX_SHIFT            8
++#define WMI_BEACON_EMA_PARAM_FIRST_TMPL_SHIFT          16
++#define WMI_BEACON_EMA_PARAM_LAST_TMPL_SHIFT           24
++
+ struct wmi_bcn_tmpl_cmd {
+ 	u32 tlv_header;
+ 	u32 vdev_id;
+@@ -3908,6 +3913,11 @@ struct wmi_bcn_tmpl_cmd {
+ 	u32 csa_event_bitmap;
+ 	u32 mbssid_ie_offset;
+ 	u32 esp_ie_offset;
++	u32 csc_switch_count_offset;
++	u32 csc_event_bitmap;
++	u32 mu_edca_ie_offset;
++	u32 feature_enable_bitmap;
++	u32 ema_params;
+ } __packed;
+ 
+ struct wmi_key_seq_counter {
+@@ -6931,7 +6941,7 @@ int ath11k_wmi_set_per_peer_per_tid_cfg(
+ 					const struct wmi_per_peer_per_tid_cfg_arg *arg);
+ int ath11k_wmi_bcn_tmpl(struct ath11k *ar, u32 vdev_id,
+ 			struct ieee80211_mutable_offsets *offs,
+-			struct sk_buff *bcn);
++			struct sk_buff *bcn, u32 ema_param);
+ int ath11k_wmi_vdev_down(struct ath11k *ar, u8 vdev_id);
+ int ath11k_wmi_vdev_up(struct ath11k *ar, struct vdev_up_params *params);
+ int ath11k_wmi_vdev_stop(struct ath11k *ar, u8 vdev_id);

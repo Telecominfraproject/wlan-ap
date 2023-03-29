@@ -1,0 +1,420 @@
+From 658e92173ed2b7d0276cb77e37107d04013b2264 Mon Sep 17 00:00:00 2001
+From: P Praneesh <quic_ppranees@quicinc.com>
+Date: Tue, 31 May 2022 19:37:15 +0530
+Subject: [PATCH] ath12k: disabling credit flow for WMI path
+
+Firmware credit flow control is enabled for WMI control services,
+which expects available tokens should be acquired before sending a
+command to the target. Also the token gets released when firmware
+receives the command.
+
+This credit-based flow limits driver to send WMI command only
+when the token available which is causing WMI commands to timeout and
+return -EAGAIN, whereas firmware has enough capability to process the
+WMI command. To fix this Tx starvation issue, introduce the ability to
+disable the credit flow for the WMI path.
+
+The driver sends WMI configuration for disabling credit flow to firmware
+by two ways.
+	1. By using a global flag
+		(HTC_MSG_SETUP_COMPLETE_EX_ID msg type flags)
+	2. By using a local flag
+		(ATH12K_HTC_CONN_FLAGS_DISABLE_CREDIT_FLOW_CTRL = 1 << 3)
+
+Ath12k uses both these configurations to disable credit flow for the
+WMI path completely.
+
+Also added a hw_param member for credit flow control by which we can
+enable or disable it based on per-target basis.
+
+Signed-off-by: Praneesh P <quic_ppranees@quicinc.com>
+Signed-off-by: Karthik M <quic_karm@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/ce.c   | 32 +++++++++++----
+ drivers/net/wireless/ath/ath12k/ce.h   |  4 +-
+ drivers/net/wireless/ath/ath12k/core.c |  1 +
+ drivers/net/wireless/ath/ath12k/htc.c  | 71 +++++++++++++++++++++++++---------
+ drivers/net/wireless/ath/ath12k/htc.h  |  8 +++-
+ drivers/net/wireless/ath/ath12k/hw.h   |  1 +
+ drivers/net/wireless/ath/ath12k/wmi.c  | 52 ++++++++++++++++++++++---
+ drivers/net/wireless/ath/ath12k/wmi.h  |  1 +
+ 8 files changed, 136 insertions(+), 34 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/ce.c
++++ b/drivers/net/wireless/ath/ath12k/ce.c
+@@ -41,6 +41,7 @@ const struct ce_attr ath12k_host_ce_conf
+ 		.src_nentries = 32,
+ 		.src_sz_max = 2048,
+ 		.dest_nentries = 0,
++		.send_cb = ath12k_htc_tx_completion_handler,
+ 	},
+ 
+ 	/* CE4: host->target HTT */
+@@ -74,6 +75,7 @@ const struct ce_attr ath12k_host_ce_conf
+ 		.src_nentries = 32,
+ 		.src_sz_max = 2048,
+ 		.dest_nentries = 0,
++		.send_cb = ath12k_htc_tx_completion_handler,
+ 	},
+ 
+ 	/* CE8: target autonomous hif_memcpy */
+@@ -371,18 +373,31 @@ err_unlock:
+ 	return skb;
+ }
+ 
+-static void ath12k_ce_send_done_cb(struct ath12k_ce_pipe *pipe)
++static void ath12k_ce_tx_process_cb(struct ath12k_ce_pipe *pipe)
+ {
+ 	struct ath12k_base *ab = pipe->ab;
+ 	struct sk_buff *skb;
++	struct sk_buff_head list;
+ 
++	__skb_queue_head_init(&list);
+ 	while (!IS_ERR(skb = ath12k_ce_completed_send_next(pipe))) {
+ 		if (!skb)
+ 			continue;
+ 
+ 		dma_unmap_single(ab->dev, ATH12K_SKB_CB(skb)->paddr, skb->len,
+ 				 DMA_TO_DEVICE);
+-		dev_kfree_skb_any(skb);
++		if ((!pipe->send_cb) || ab->hw_params.credit_flow) {
++			dev_kfree_skb_any(skb);
++			continue;
++		}
++
++		__skb_queue_tail(&list, skb);
++	}
++
++	while ((skb = __skb_dequeue(&list))) {
++		ath12k_dbg(ab, ATH12K_DBG_PCI, "tx ce pipe %d len %d\n",
++			   pipe->pipe_num, skb->len);
++		pipe->send_cb(ab, skb);
+ 	}
+ }
+ 
+@@ -512,7 +527,7 @@ static int ath12k_ce_alloc_pipe(struct a
+ 	pipe->attr_flags = attr->flags;
+ 
+ 	if (attr->src_nentries) {
+-		pipe->send_cb = ath12k_ce_send_done_cb;
++		pipe->send_cb = attr->send_cb;
+ 		nentries = roundup_pow_of_two(attr->src_nentries);
+ 		desc_sz = ath12k_hal_ce_get_desc_size(HAL_CE_DESC_SRC);
+ 		ring = ath12k_ce_alloc_ring(ab, nentries, desc_sz);
+@@ -543,9 +558,10 @@ static int ath12k_ce_alloc_pipe(struct a
+ void ath12k_ce_per_engine_service(struct ath12k_base *ab, u16 ce_id)
+ {
+ 	struct ath12k_ce_pipe *pipe = &ab->ce.ce_pipe[ce_id];
++	const struct ce_attr *attr = &ab->hw_params.host_ce_config[ce_id];
+ 
+-	if (pipe->send_cb)
+-		pipe->send_cb(pipe);
++	if (attr->src_nentries)
++		ath12k_ce_tx_process_cb(pipe);
+ 
+ 	if (pipe->recv_cb)
+ 		ath12k_ce_recv_process_cb(pipe);
+@@ -554,9 +570,10 @@ void ath12k_ce_per_engine_service(struct
+ void ath12k_ce_poll_send_completed(struct ath12k_base *ab, u8 pipe_id)
+ {
+ 	struct ath12k_ce_pipe *pipe = &ab->ce.ce_pipe[pipe_id];
++	const struct ce_attr *attr =  &ab->hw_params.host_ce_config[pipe_id];
+ 
+-	if ((pipe->attr_flags & CE_ATTR_DIS_INTR) && pipe->send_cb)
+-		pipe->send_cb(pipe);
++	if ((pipe->attr_flags & CE_ATTR_DIS_INTR) && attr->src_nentries)
++		ath12k_ce_tx_process_cb(pipe);
+ }
+ 
+ int ath12k_ce_send(struct ath12k_base *ab, struct sk_buff *skb, u8 pipe_id,
+--- a/drivers/net/wireless/ath/ath12k/ce.h
++++ b/drivers/net/wireless/ath/ath12k/ce.h
+@@ -102,6 +102,8 @@ struct ce_attr {
+ 	unsigned int dest_nentries;
+ 
+ 	void (*recv_cb)(struct ath12k_base *, struct sk_buff *);
++
++	void (*send_cb)(struct ath12k_base *, struct sk_buff *);
+ };
+ 
+ #define CE_DESC_RING_ALIGN 8
+@@ -155,7 +157,7 @@ struct ath12k_ce_pipe {
+ 	unsigned int buf_sz;
+ 	unsigned int rx_buf_needed;
+ 
+-	void (*send_cb)(struct ath12k_ce_pipe *);
++	void (*send_cb)(struct ath12k_base *, struct sk_buff *);
+ 	void (*recv_cb)(struct ath12k_base *, struct sk_buff *);
+ 
+ 	struct tasklet_struct intr_tq;
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -68,6 +68,7 @@ static const struct ath12k_hw_params ath
+ 		.num_tcl_banks = 48,
+ 		.fix_l1ss = false,
+ 		.supports_ap_ps = true,
++		.credit_flow = false,
+ 	},
+ };
+ 
+--- a/drivers/net/wireless/ath/ath12k/htc.c
++++ b/drivers/net/wireless/ath/ath12k/htc.c
+@@ -82,6 +82,8 @@ int ath12k_htc_send(struct ath12k_htc *h
+ 	struct ath12k_base *ab = htc->ab;
+ 	int credits = 0;
+ 	int ret;
++	bool credit_flow_enabled = (ab->hw_params.credit_flow &&
++				    ep->tx_credit_flow_enabled);
+ 
+ 	if (eid >= ATH12K_HTC_EP_COUNT) {
+ 		ath12k_warn(ab, "Invalid endpoint id: %d\n", eid);
+@@ -90,7 +92,7 @@ int ath12k_htc_send(struct ath12k_htc *h
+ 
+ 	skb_push(skb, sizeof(struct ath12k_htc_hdr));
+ 
+-	if (ep->tx_credit_flow_enabled) {
++	if (credit_flow_enabled) {
+ 		credits = DIV_ROUND_UP(skb->len, htc->target_credit_size);
+ 		spin_lock_bh(&htc->tx_lock);
+ 		if (ep->tx_credits < credits) {
+@@ -127,7 +129,7 @@ int ath12k_htc_send(struct ath12k_htc *h
+ err_unmap:
+ 	dma_unmap_single(dev, skb_cb->paddr, skb->len, DMA_TO_DEVICE);
+ err_credits:
+-	if (ep->tx_credit_flow_enabled) {
++	if (credit_flow_enabled) {
+ 		spin_lock_bh(&htc->tx_lock);
+ 		ep->tx_credits += credits;
+ 		ath12k_dbg(ab, ATH12K_DBG_HTC,
+@@ -204,23 +206,25 @@ static int ath12k_htc_process_trailer(st
+ 			break;
+ 		}
+ 
+-		switch (record->hdr.id) {
+-		case ATH12K_HTC_RECORD_CREDITS:
+-			len = sizeof(struct ath12k_htc_credit_report);
+-			if (record->hdr.len < len) {
+-				ath12k_warn(ab, "Credit report too long\n");
+-				status = -EINVAL;
++		if (ab->hw_params.credit_flow) {
++			switch (record->hdr.id) {
++			case ATH12K_HTC_RECORD_CREDITS:
++				len = sizeof(struct ath12k_htc_credit_report);
++				if (record->hdr.len < len) {
++					ath12k_warn(ab, "Credit report too long\n");
++					status = -EINVAL;
++					break;
++				}
++				ath12k_htc_process_credit_report(htc,
++								 record->credit_report,
++								 record->hdr.len,
++								 src_eid);
++				break;
++			default:
++				ath12k_warn(ab, "Unhandled record: id:%d length:%d\n",
++					    record->hdr.id, record->hdr.len);
+ 				break;
+ 			}
+-			ath12k_htc_process_credit_report(htc,
+-							 record->credit_report,
+-							 record->hdr.len,
+-							 src_eid);
+-			break;
+-		default:
+-			ath12k_warn(ab, "Unhandled record: id:%d length:%d\n",
+-				    record->hdr.id, record->hdr.len);
+-			break;
+ 		}
+ 
+ 		if (status)
+@@ -246,6 +250,29 @@ static void ath12k_htc_suspend_complete(
+ 	complete(&ab->htc_suspend);
+ }
+ 
++void ath12k_htc_tx_completion_handler(struct ath12k_base *ab,
++				      struct sk_buff *skb)
++{
++	struct ath12k_htc *htc = &ab->htc;
++	struct ath12k_htc_ep *ep;
++	void (*ep_tx_complete)(struct ath12k_base *, struct sk_buff *);
++	u8 eid;
++
++	eid = ATH12K_SKB_CB(skb)->eid;
++	if (eid >= ATH12K_HTC_EP_COUNT)
++		return;
++
++	ep = &htc->endpoint[eid];
++	spin_lock_bh(&htc->tx_lock);
++	ep_tx_complete = ep->ep_ops.ep_tx_complete;
++	spin_unlock_bh(&htc->tx_lock);
++	if (!ep_tx_complete) {
++		dev_kfree_skb_any(skb);
++		return;
++	}
++	ep_tx_complete(htc->ab, skb);
++}
++
+ void ath12k_htc_rx_completion_handler(struct ath12k_base *ab,
+ 				      struct sk_buff *skb)
+ {
+@@ -604,6 +631,11 @@ int ath12k_htc_connect_service(struct at
+ 		disable_credit_flow_ctrl = true;
+ 	}
+ 
++	if (!ab->hw_params.credit_flow) {
++		flags |= ATH12K_HTC_CONN_FLAGS_DISABLE_CREDIT_FLOW_CTRL;
++		disable_credit_flow_ctrl = true;
++	}
++
+ 	req_msg->flags_len = FIELD_PREP(HTC_SVC_MSG_CONNECTIONFLAGS, flags);
+ 	req_msg->msg_svc_id |= FIELD_PREP(HTC_SVC_MSG_SERVICE_ID,
+ 					  conn_req->service_id);
+@@ -729,7 +761,10 @@ int ath12k_htc_start(struct ath12k_htc *
+ 	msg->msg_id = FIELD_PREP(HTC_MSG_MESSAGEID,
+ 				 ATH12K_HTC_MSG_SETUP_COMPLETE_EX_ID);
+ 
+-	ath12k_dbg(ab, ATH12K_DBG_HTC, "HTC is using TX credit flow control\n");
++	if (ab->hw_params.credit_flow)
++		ath12k_dbg(ab, ATH12K_DBG_HTC, "HTC is using TX credit flow control\n");
++	else
++		msg->flags |= ATH12K_GLOBAL_DISABLE_CREDIT_FLOW;
+ 
+ 	status = ath12k_htc_send(htc, ATH12K_HTC_EP_0, skb);
+ 	if (status) {
+--- a/drivers/net/wireless/ath/ath12k/htc.h
++++ b/drivers/net/wireless/ath/ath12k/htc.h
+@@ -84,8 +84,8 @@ enum ath12k_htc_conn_flags {
+ 	ATH12K_HTC_CONN_FLAGS_THRESHOLD_LEVEL_ONE_HALF      = 0x1,
+ 	ATH12K_HTC_CONN_FLAGS_THRESHOLD_LEVEL_THREE_FOURTHS = 0x2,
+ 	ATH12K_HTC_CONN_FLAGS_THRESHOLD_LEVEL_UNITY         = 0x3,
+-	ATH12K_HTC_CONN_FLAGS_REDUCE_CREDIT_DRIBBLE    = 1 << 2,
+-	ATH12K_HTC_CONN_FLAGS_DISABLE_CREDIT_FLOW_CTRL = 1 << 3
++	ATH12K_HTC_CONN_FLAGS_REDUCE_CREDIT_DRIBBLE	    = 0x4,
++	ATH12K_HTC_CONN_FLAGS_DISABLE_CREDIT_FLOW_CTRL	    = 0x8,
+ };
+ 
+ enum ath12k_htc_conn_svc_status {
+@@ -117,6 +117,8 @@ struct ath12k_htc_conn_svc_resp {
+ 	u32 svc_meta_pad;
+ } __packed;
+ 
++#define ATH12K_GLOBAL_DISABLE_CREDIT_FLOW BIT(1)
++
+ struct ath12k_htc_setup_complete_extended {
+ 	u32 msg_id;
+ 	u32 flags;
+@@ -307,5 +309,7 @@ int ath12k_htc_send(struct ath12k_htc *h
+ struct sk_buff *ath12k_htc_alloc_skb(struct ath12k_base *ar, int size);
+ void ath12k_htc_rx_completion_handler(struct ath12k_base *ar,
+ 				      struct sk_buff *skb);
++void ath12k_htc_tx_completion_handler(struct ath12k_base *ab,
++				      struct sk_buff *skb);
+ 
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -166,6 +166,7 @@ struct ath12k_hw_params {
+ 	u32 num_tcl_banks;
+ 	bool fix_l1ss;
+ 	bool supports_ap_ps;
++	bool credit_flow;
+ };
+ 
+ struct ath12k_hw_ops {
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -338,21 +338,37 @@ int ath12k_wmi_cmd_send(struct ath12k_pd
+ {
+ 	struct ath12k_wmi_base *wmi_sc = wmi->wmi_ab;
+ 	int ret = -EOPNOTSUPP;
++	struct ath12k_base *ab = wmi_sc->ab;
+ 
+ 	might_sleep();
+ 
+-	wait_event_timeout(wmi_sc->tx_credits_wq, ({
+-		ret = ath12k_wmi_cmd_send_nowait(wmi, skb, cmd_id);
+-
+-		if (ret && test_bit(ATH12K_FLAG_CRASH_FLUSH, &wmi_sc->ab->dev_flags))
+-			ret = -ESHUTDOWN;
+-
+-		(ret != -EAGAIN);
+-	}), WMI_SEND_TIMEOUT_HZ);
++	if (ab->hw_params.credit_flow) {
++		wait_event_timeout(wmi_sc->tx_credits_wq, ({
++			ret = ath12k_wmi_cmd_send_nowait(wmi, skb, cmd_id);
++
++			if (ret && test_bit(ATH12K_FLAG_CRASH_FLUSH,
++					    &wmi_sc->ab->dev_flags))
++				ret = -ESHUTDOWN;
++			(ret != -EAGAIN);
++			}), WMI_SEND_TIMEOUT_HZ);
++	} else {
++		wait_event_timeout(wmi->tx_ce_desc_wq, ({
++			ret = ath12k_wmi_cmd_send_nowait(wmi, skb, cmd_id);
++			if (ret && test_bit(ATH12K_FLAG_CRASH_FLUSH,
++			    		    &wmi_sc->ab->dev_flags))
++				ret = -ESHUTDOWN;
++
++			(ret != -ENOBUFS);
++			}), WMI_SEND_TIMEOUT_HZ);
++	}	
+ 
+ 	if (ret == -EAGAIN)
+ 		ath12k_warn(wmi_sc->ab, "wmi command %d timeout\n", cmd_id);
+ 
++	if (ret == -ENOBUFS)
++		ath12k_warn(wmi_sc->ab, "ce desc not available for wmi command %d\n",
++			    cmd_id);
++
+ 	return ret;
+ }
+ 
+@@ -6673,7 +6689,30 @@ static void ath12k_wmi_op_ep_tx_credits(
+ static void ath12k_wmi_htc_tx_complete(struct ath12k_base *ab,
+ 				       struct sk_buff *skb)
+ {
++	struct ath12k_pdev_wmi *wmi = NULL;
++	u32 i;
++	u8 wmi_ep_count;
++	u8 eid;
++
++	eid = ATH12K_SKB_CB(skb)->eid;
+ 	dev_kfree_skb(skb);
++
++	if (eid >= ATH12K_HTC_EP_COUNT)
++		return;
++
++	wmi_ep_count = ab->htc.wmi_ep_count;
++	if (wmi_ep_count > ab->hw_params.max_radios)
++		return;
++
++	for (i = 0; i < ab->htc.wmi_ep_count; i++) {
++		if (ab->wmi_ab.wmi[i].eid == eid) {
++			wmi = &ab->wmi_ab.wmi[i];
++			break;
++		}
++	}
++
++	if (wmi)
++		wake_up(&wmi->tx_ce_desc_wq);
+ }
+ 
+ static bool ath12k_reg_is_world_alpha(char *alpha)
+@@ -8477,6 +8516,7 @@ static int ath12k_connect_pdev_htc_servi
+ 	ab->wmi_ab.wmi_endpoint_id[pdev_idx] = conn_resp.eid;
+ 	ab->wmi_ab.wmi[pdev_idx].eid = conn_resp.eid;
+ 	ab->wmi_ab.max_msg_len[pdev_idx] = conn_resp.max_msg_len;
++	init_waitqueue_head(&ab->wmi_ab.wmi[pdev_idx].tx_ce_desc_wq);
+ 
+ 	return 0;
+ }
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -2708,6 +2708,7 @@ struct ath12k_pdev_wmi {
+ 	enum ath12k_htc_ep_id eid;
+ 	const struct wmi_peer_flags_map *peer_flags;
+ 	u32 rx_decap_mode;
++	wait_queue_head_t tx_ce_desc_wq;
+ };
+ 
+ struct vdev_create_params {

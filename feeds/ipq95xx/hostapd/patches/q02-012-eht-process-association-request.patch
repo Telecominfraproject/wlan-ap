@@ -1,0 +1,216 @@
+From a181193ed7b1d7ec37d6fe58d1e7c0f8c1ad15d7 Mon Sep 17 00:00:00 2001
+From: Aloka Dixit <quic_alokad@quicinc.com>
+Date: Fri, 2 Jul 2021 12:22:20 -0700
+Subject: [PATCH 12/23] eht: process association request
+
+Parse EHT capabilities sent by a non-AP STA in association requests.
+Validate the IE length, matching MCS rates between AP tx and STA rx.
+Store the capabilities in the station info structure.
+
+Signed-off-by: Aloka Dixit <quic_alokad@quicinc.com>
+---
+ src/ap/ieee802_11.c     |  10 ++++
+ src/ap/ieee802_11.h     |   3 ++
+ src/ap/ieee802_11_eht.c | 117 ++++++++++++++++++++++++++++++++++++++++
+ src/ap/sta_info.c       |   1 +
+ src/ap/sta_info.h       |   6 +++
+ 5 files changed, 137 insertions(+)
+
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -4593,6 +4593,16 @@ static int check_assoc_ies(struct hostap
+ 		}
+ 	}
+ #endif /* CONFIG_IEEE80211AX */
++#ifdef CONFIG_IEEE80211BE
++	if (hapd->iconf->ieee80211be && !hapd->conf->disable_11be) {
++		resp = copy_sta_eht_capab(hapd, sta, IEEE80211_MODE_AP,
++					  elems.he_capabilities,
++					  elems.eht_capabilities,
++					  elems.eht_capabilities_len);
++		if (resp != WLAN_STATUS_SUCCESS)
++			return resp;
++	}
++#endif /* CONFIG_IEEE80211BE */
+ 
+ #ifdef CONFIG_P2P
+ 	if (elems.p2p) {
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -221,4 +221,7 @@ u8 * hostapd_eid_eht_capab(struct hostap
+ 			   enum ieee80211_op_mode opmode);
+ u8 * hostapd_eid_eht_operation(struct hostapd_data *hapd, u8 *eid,
+ 			       enum ieee80211_op_mode opmode);
++u16 copy_sta_eht_capab(struct hostapd_data *hapd, struct sta_info *sta,
++		       enum ieee80211_op_mode opmode, const u8 *he_capab,
++		       const u8 *eht_capab, size_t eht_capab_len);
+ #endif /* IEEE802_11_H */
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -20,6 +20,7 @@
+ #include "utils/common.h"
+ #include "hostapd.h"
+ #include "ieee802_11.h"
++#include "sta_info.h"
+ 
+ static u8 ieee80211_eht_ppet_size(const u8 *ppe_thres, const u8 *phy_cap_info)
+ {
+@@ -219,3 +220,119 @@ u8 * hostapd_eid_eht_operation(struct ho
+ 	*length_pos = pos - (eid + 2);
+ 	return pos;
+ }
++
++
++static int check_valid_eht_mcs_nss(struct hostapd_data *hapd, const u8 *ap_mcs,
++				   const u8 *sta_mcs, u8 mcs_count, u8 map_len)
++{
++	u8 i, j;
++
++	for (i = 0; i < mcs_count; i++) {
++		ap_mcs += (i * 3);
++		sta_mcs += (i * 3);
++
++		for (j = 0; j < map_len; j++) {
++			if (((ap_mcs[j] >> 4) & 0xFF) == 0)
++				continue;
++
++			if ((sta_mcs[j] & 0xFF) == 0)
++				continue;
++
++			return 1;
++		}
++	}
++
++	wpa_printf(MSG_DEBUG,
++		   "No matching EHT MCS found between AP TX and STA RX");
++	return 0;
++}
++
++static int check_valid_eht_mcs(struct hostapd_data *hapd, const u8 *sta_eht_capab,
++			       enum ieee80211_op_mode opmode)
++{
++	struct hostapd_hw_modes *mode;
++	const u8 *ap_mcs, *sta_mcs;
++
++	mode = hapd->iface->current_mode;
++	if (!mode)
++		return 1;
++
++	ap_mcs = mode->eht_capab[opmode].mcs;
++	sta_mcs = ((const struct ieee80211_eht_capabilities *) sta_eht_capab)->optional;
++
++	if (ieee80211_eht_mcs_set_size(mode->he_capab[opmode].phy_cap,
++				       mode->eht_capab[opmode].phy_cap) ==
++	    EHT_PHYCAP_MCS_NSS_LEN_20MHZ_ONLY) {
++		return check_valid_eht_mcs_nss(hapd, ap_mcs, sta_mcs, 1,
++					       EHT_PHYCAP_MCS_NSS_LEN_20MHZ_ONLY);
++
++	} else {
++		u8 mcs_count = 1;
++
++		switch (hapd->iface->conf->eht_oper_chwidth) {
++		/* TODO CHANWIDTH_320MHZ */
++		case CHANWIDTH_80P80MHZ:
++		case CHANWIDTH_160MHZ:
++			mcs_count = 2;
++			break;
++		default:
++			break;
++		}
++
++		return check_valid_eht_mcs_nss(hapd, ap_mcs, sta_mcs, mcs_count,
++					       EHT_PHYCAP_MCS_NSS_LEN_20MHZ_PLUS);
++	}
++
++	return 0;
++}
++
++
++static int ieee80211_invalid_eht_cap_size(const u8 *he_cap, const u8 *eht_cap,
++					  size_t len)
++{
++	struct ieee80211_eht_capabilities *cap;
++	const u8 *he_phy_cap;
++	size_t cap_len;
++
++	he_phy_cap = ((struct ieee80211_he_capabilities *)he_cap)->he_phy_capab_info;
++	cap = (struct ieee80211_eht_capabilities *) eht_cap;
++	cap_len = sizeof(*cap);
++	if (len < cap_len)
++		return 1;
++
++	cap_len += ieee80211_eht_mcs_set_size(he_phy_cap, cap->phy_cap);
++	if (len < cap_len)
++		return 1;
++
++	cap_len += ieee80211_eht_ppet_size(&eht_cap[cap_len], cap->phy_cap);
++
++	return (len != cap_len);
++}
++
++
++u16 copy_sta_eht_capab(struct hostapd_data *hapd, struct sta_info *sta,
++		       enum ieee80211_op_mode opmode, const u8 *he_capab,
++		       const u8 *eht_capab, size_t eht_capab_len)
++{
++	if (!eht_capab || !hapd->iconf->ieee80211be ||
++	    hapd->conf->disable_11be ||
++	    ieee80211_invalid_eht_cap_size(he_capab, eht_capab, eht_capab_len) ||
++	    !check_valid_eht_mcs(hapd, eht_capab, opmode)) {
++		sta->flags_ext &= ~WLAN_STA_EXT_EHT;
++		os_free(sta->eht_capab);
++		sta->eht_capab = NULL;
++		return WLAN_STATUS_SUCCESS;
++	}
++
++	if (!sta->eht_capab) {
++		sta->eht_capab = os_zalloc(eht_capab_len);
++		if (!sta->eht_capab)
++			return WLAN_STATUS_UNSPECIFIED_FAILURE;
++	}
++
++	sta->flags_ext |= WLAN_STA_EXT_EHT;
++	os_memcpy(sta->eht_capab, eht_capab, eht_capab_len);
++	sta->eht_capab_len = eht_capab_len;
++
++	return WLAN_STATUS_SUCCESS;
++}
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -358,6 +358,7 @@ void ap_free_sta(struct hostapd_data *ha
+ 	os_free(sta->vht_operation);
+ 	os_free(sta->he_capab);
+ 	os_free(sta->he_6ghz_capab);
++	os_free(sta->eht_capab);
+ 	hostapd_free_psk_list(sta->psk);
+ 	os_free(sta->identity);
+ 	os_free(sta->radius_cui);
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -46,6 +46,9 @@
+ #define WLAN_STA_PENDING_DEAUTH_CB BIT(30)
+ #define WLAN_STA_NONERP BIT(31)
+ 
++/* STA flags_ext */
++#define WLAN_STA_EXT_EHT BIT(0)
++
+ /* Maximum number of supported rates (from both Supported Rates and Extended
+  * Supported Rates IEs). */
+ #define WLAN_SUPP_RATES_MAX 32
+@@ -113,6 +116,7 @@ struct sta_info {
+ 	u16 aid; /* STA's unique AID (1 .. 2007) or 0 if not yet assigned */
+ 	u16 disconnect_reason_code; /* RADIUS server override */
+ 	u32 flags; /* Bitfield of WLAN_STA_* */
++	u32 flags_ext; /* Bitfield of WLAN_STA_EXT_* */
+ 	u16 capability;
+ 	u16 listen_interval; /* or beacon_int for APs */
+ 	u8 supported_rates[WLAN_SUPP_RATES_MAX];
+@@ -214,6 +218,8 @@ struct sta_info {
+ 	struct ieee80211_he_capabilities *he_capab;
+ 	size_t he_capab_len;
+ 	struct ieee80211_he_6ghz_band_cap *he_6ghz_capab;
++	struct ieee80211_eht_capabilities *eht_capab;
++	size_t eht_capab_len;
+ 
+ 	int sa_query_count; /* number of pending SA Query requests;
+ 			     * 0 = no SA Query in progress */

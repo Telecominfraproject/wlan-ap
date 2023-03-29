@@ -1,0 +1,170 @@
+From 0e61c67c914efd88130e5af49d4aa9dbb3829141 Mon Sep 17 00:00:00 2001
+From: Balamurugan Mahalingam <quic_bmahalin@quicinc.com>
+Date: Mon, 17 Oct 2022 11:27:49 -0700
+Subject: [PATCH 3/7] ath12k: optimize datapath tx completion routine
+
+Avoid copying all descriptors to a cached memory list and then
+processing it again. Avoid two loops to process it.
+Use a single loop to process the tx completion
+
+Signed-off-by: Balamurugan Mahalingam <quic_bmahalin@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c    | 17 +----------
+ drivers/net/wireless/ath/ath12k/dp.h    |  3 --
+ drivers/net/wireless/ath/ath12k/dp_tx.c | 38 ++++++++++---------------
+ 3 files changed, 16 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp.c b/drivers/net/wireless/ath/ath12k/dp.c
+index 9f6be7a..a671cda 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -248,9 +248,9 @@ int ath12k_dp_srng_setup(struct ath12k_base *ab, struct dp_srng *ring,
+ 		/* Allocate the reo dst and tx completion rings from cacheable memory */
+ 		switch (type) {
+ 		case HAL_REO_DST:
+-		case HAL_WBM2SW_RELEASE:
+ 			cached = true;
+ 			break;
++		case HAL_WBM2SW_RELEASE:
+ 		default:
+ 			cached = false;
+ 		}
+@@ -1273,7 +1273,6 @@ static void ath12k_dp_reoq_lut_cleanup(struct ath12k_base *ab)
+ void ath12k_dp_free(struct ath12k_base *ab)
+ {
+ 	struct ath12k_dp *dp = &ab->dp;
+-	int i;
+ 
+ 	ath12k_dp_link_desc_cleanup(ab, dp->link_desc_banks,
+ 				    HAL_WBM_IDLE_LINK, &dp->wbm_idle_ring);
+@@ -1285,9 +1284,6 @@ void ath12k_dp_free(struct ath12k_base *ab)
+ 
+ 	ath12k_dp_reo_cmd_list_cleanup(ab);
+ 
+-	for (i = 0; i < DP_TCL_NUM_RING_MAX; i++)
+-		kfree(dp->tx_ring[i].tx_status);
+-
+ 	ath12k_dp_rx_free(ab);
+ 	/* Deinit any SOC level resource */
+ }
+@@ -1603,15 +1599,6 @@ int ath12k_dp_alloc(struct ath12k_base *ab)
+ 
+ 	for (i = 0; i < DP_TCL_NUM_RING_MAX; i++) {
+ 		dp->tx_ring[i].tcl_data_ring_id = i;
+-
+-		dp->tx_ring[i].tx_status_head = 0;
+-		dp->tx_ring[i].tx_status_tail = DP_TX_COMP_RING_SIZE - 1;
+-		dp->tx_ring[i].tx_status = kmalloc(size, GFP_KERNEL);
+-		if (!dp->tx_ring[i].tx_status) {
+-			ret = -ENOMEM;
+-			//FIXME The allocated tx status is not freed properly here
+-			goto fail_cmn_reoq_cleanup;
+-		}
+ 	}
+ 
+ 	for (i = 0; i < HAL_DSCP_TID_MAP_TBL_NUM_ENTRIES_MAX; i++)
+@@ -1627,8 +1614,6 @@ int ath12k_dp_alloc(struct ath12k_base *ab)
+ 
+ fail_dp_rx_free:
+ 	ath12k_dp_rx_free(ab);
+-
+-fail_cmn_reoq_cleanup:
+ 	ath12k_dp_reoq_lut_cleanup(ab);
+ 
+ fail_cmn_srng_cleanup:
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+index 97193f0..9008b70 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -81,9 +81,6 @@ struct dp_tx_ring {
+ 	u8 tcl_data_ring_id;
+ 	struct dp_srng tcl_data_ring;
+ 	struct dp_srng tcl_comp_ring;
+-	struct hal_wbm_completion_ring_tx *tx_status;
+-	int tx_status_head;
+-	int tx_status_tail;
+ };
+ 
+ struct ath12k_pdev_mon_stats {
+diff --git a/drivers/net/wireless/ath/ath12k/dp_tx.c b/drivers/net/wireless/ath/ath12k/dp_tx.c
+index ac954d1..509e64e 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -794,8 +794,8 @@ void ath12k_dp_tx_completion_handler(struct ath12k_base *ab, int ring_id)
+ 	struct dp_tx_ring *tx_ring = &dp->tx_ring[ring_id];
+ 	u32 *desc, desc_id;
+ 	u8 mac_id;
+-	int valid_entries, count = 0, i = 0;
+-	struct hal_wbm_completion_ring_tx *tx_status;
++	int valid_entries;
++	struct hal_wbm_completion_ring_tx tx_status = { 0 };
+ 	enum hal_wbm_rel_src_module buf_rel_source;
+ 
+ 	spin_lock_bh(&status_ring->lock);
+@@ -815,30 +815,18 @@ void ath12k_dp_tx_completion_handler(struct ath12k_base *ab, int ring_id)
+ 		if (!ath12k_dp_tx_completion_valid(desc))
+ 			continue;
+ 
+-		memcpy(&tx_ring->tx_status[count],
+-		       desc, sizeof(struct hal_wbm_release_ring));
+-		count++;
++		memcpy(&tx_status, desc,
++		       sizeof(struct hal_wbm_completion_ring_tx));
+ 
+-		if (count == DP_TX_COMP_RING_SIZE)
+-			break;
+-	}
+-
+-	ath12k_hal_srng_access_end(ab, status_ring);
+-
+-	spin_unlock_bh(&status_ring->lock);
+-
+-	while (count--) {
+-		tx_status = &tx_ring->tx_status[i++];
+-
+-		if (likely(FIELD_GET(HAL_WBM_COMPL_TX_INFO0_CC_DONE, tx_status->info0))) {
++		if (likely(FIELD_GET(HAL_WBM_COMPL_TX_INFO0_CC_DONE, tx_status.info0))) {
+ 			/* HW done cookie conversion */
+ 			tx_desc = (struct ath12k_tx_desc_info *)(uintptr_t)
+-					(tx_status->buf_va_lo |
+-					(((u64)tx_status->buf_va_hi) << 32));
++					(tx_status.buf_va_lo |
++					(((u64)tx_status.buf_va_hi) << 32));
+ 		} else {
+ 			/* SW does cookie conversion to VA */
+ 			desc_id = FIELD_GET(BUFFER_ADDR_INFO1_SW_COOKIE,
+-					    tx_status->buf_va_hi);
++					    tx_status.buf_va_hi);
+ 
+ 			tx_desc = ath12k_dp_get_tx_desc(ab, desc_id);
+ 		}
+@@ -855,10 +843,10 @@ void ath12k_dp_tx_completion_handler(struct ath12k_base *ab, int ring_id)
+ 		 */
+ 		ath12k_dp_tx_release_txbuf(dp, tx_desc, tx_desc->pool_id);
+ 		buf_rel_source = FIELD_GET(HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE,
+-					   tx_status->info0);
++					   tx_status.info0);
+ 		if (unlikely(buf_rel_source == HAL_WBM_REL_SRC_MODULE_FW)) {
+ 			ath12k_dp_tx_process_htt_tx_complete(ab,
+-							     (void *)tx_status,
++							     (void *)&tx_status,
+ 							     mac_id, msdu,
+ 							     tx_ring, skb_ext_desc);
+ 			continue;
+@@ -869,8 +857,12 @@ void ath12k_dp_tx_completion_handler(struct ath12k_base *ab, int ring_id)
+ 		if (atomic_dec_and_test(&ar->dp.num_tx_pending))
+ 			wake_up(&ar->dp.tx_empty_waitq);
+ 
+-		ath12k_dp_tx_complete_msdu(ar, msdu, tx_status, buf_rel_source, skb_ext_desc);
++		ath12k_dp_tx_complete_msdu(ar, msdu, &tx_status, buf_rel_source, skb_ext_desc);
+ 	}
++
++	ath12k_hal_srng_access_end(ab, status_ring);
++
++	spin_unlock_bh(&status_ring->lock);
+ }
+ 
+ int ath12k_dp_tx_send_reo_cmd(struct ath12k_base *ab, struct dp_rx_tid *rx_tid,
+-- 
+2.17.1
+

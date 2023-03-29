@@ -1,0 +1,194 @@
+From b2d5bcdbe6cc84ca9526db04adb2d3b9b2e59f58 Mon Sep 17 00:00:00 2001
+From: P Praneesh <quic_ppranees@quicinc.com>
+Date: Tue, 31 May 2022 18:25:26 +0530
+Subject: ath12k: add wait operation for tx management packets for 
+flush from mac80211
+
+Transmission of management packets are done in a work queue. Sometimes
+the workqueue does not finish Tx immediately, then it lead after the next
+step of vdev delete finished, it start to send the management packet to
+firmware and lead firmware crash.
+
+ieee80211_set_disassoc() have logic of ieee80211_flush_queues() after
+it send_deauth_disassoc() to ath12k, its purpose is make sure the
+deauth was actually sent, so it need to change ath12k to match the
+purpose of mac80211.
+
+To address these issue wait for Tx management as well as Tx data packets.
+
+Signed-off-by: Wen Gong <quic_wgong@quicinc.com>
+Signed-off-by: Karthik M <quic_karm@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c |  1 +
+ drivers/net/wireless/ath/ath12k/core.h |  1 +
+ drivers/net/wireless/ath/ath12k/mac.c  | 44 +++++++++++++++++++++++++++++-----
+ drivers/net/wireless/ath/ath12k/wmi.c  | 12 +++++++++-
+ 4 files changed, 51 insertions(+), 7 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -848,6 +848,7 @@ static void ath12k_core_restart(struct w
+ 		idr_for_each(&ar->txmgmt_idr,
+ 			     ath12k_mac_tx_mgmt_pending_free, ar);
+ 		idr_destroy(&ar->txmgmt_idr);
++		wake_up(&ar->txmgmt_empty_waitq);
+ 	}
+ 
+ 	wake_up(&ab->wmi_ab.tx_credits_wq);
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -672,6 +672,7 @@ struct ath12k {
+ 	/* protects txmgmt_idr data */
+ 	spinlock_t txmgmt_idr_lock;
+ 	atomic_t num_pending_mgmt_tx;
++	wait_queue_head_t txmgmt_empty_waitq;
+ 
+ 	/* cycle count is reported twice for each visited channel during scan.
+ 	 * access protected by data_lock
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -5947,6 +5947,21 @@ static int __ath12k_set_antenna(struct a
+ 	return 0;
+ }
+ 
++static void ath12k_mgmt_over_wmi_tx_drop(struct ath12k *ar, struct sk_buff *skb)
++{
++	int num_mgmt;
++
++	ieee80211_free_txskb(ar->hw, skb);
++
++	num_mgmt = atomic_dec_if_positive(&ar->num_pending_mgmt_tx);
++
++	if (num_mgmt < 0)
++        	WARN_ON_ONCE(1);
++
++	if (!num_mgmt)
++        	wake_up(&ar->txmgmt_empty_waitq);
++}
++
+ int ath12k_mac_tx_mgmt_pending_free(int buf_id, void *skb, void *ctx)
+ {
+ 	struct sk_buff *msdu = skb;
+@@ -5963,7 +5978,7 @@ int ath12k_mac_tx_mgmt_pending_free(int
+ 	info = IEEE80211_SKB_CB(msdu);
+ 	memset(&info->status, 0, sizeof(info->status));
+ 
+-	ieee80211_free_txskb(ar->hw, msdu);
++	ath12k_mgmt_over_wmi_tx_drop(ar, skb);
+ 
+ 	return 0;
+ }
+@@ -6002,6 +6017,8 @@ static int ath12k_mac_mgmt_tx_wmi(struct
+ 	buf_id = idr_alloc(&ar->txmgmt_idr, skb, 0,
+ 			   ATH12K_TX_MGMT_NUM_PENDING_MAX, GFP_ATOMIC);
+ 	spin_unlock_bh(&ar->txmgmt_idr_lock);
++	ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
++		   "mac tx mgmt frame, buf id %d\n", buf_id);
+ 	if (buf_id < 0)
+ 		return -ENOSPC;
+ 
+@@ -6048,7 +6065,7 @@ static void ath12k_mgmt_over_wmi_tx_purg
+ 	struct sk_buff *skb;
+ 
+ 	while ((skb = skb_dequeue(&ar->wmi_mgmt_tx_queue)) != NULL)
+-		ieee80211_free_txskb(ar->hw, skb);
++		ath12k_mgmt_over_wmi_tx_drop(ar, skb);
+ }
+ 
+ static void ath12k_mgmt_over_wmi_tx_work(struct work_struct *work)
+@@ -6063,7 +6080,7 @@ static void ath12k_mgmt_over_wmi_tx_work
+ 		skb_cb = ATH12K_SKB_CB(skb);
+ 		if (!skb_cb->vif) {
+ 			ath12k_warn(ar->ab, "no vif found for mgmt frame\n");
+-			ieee80211_free_txskb(ar->hw, skb);
++			ath12k_mgmt_over_wmi_tx_drop(ar, skb);
+ 			continue;
+ 		}
+ 
+@@ -6074,16 +6091,18 @@ static void ath12k_mgmt_over_wmi_tx_work
+ 			if (ret) {
+ 				ath12k_warn(ar->ab, "failed to tx mgmt frame, vdev_id %d :%d\n",
+ 					    arvif->vdev_id, ret);
+-				ieee80211_free_txskb(ar->hw, skb);
++				ath12k_mgmt_over_wmi_tx_drop(ar, skb);
+ 			} else {
+-				atomic_inc(&ar->num_pending_mgmt_tx);
++				ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
++					   "mac tx mgmt frame, vdev_id %d\n",
++					   arvif->vdev_id);
+ 			}
+ 		} else {
+ 			ath12k_warn(ar->ab,
+ 				    "dropping mgmt frame for vdev %d, is_started %d\n",
+ 				    arvif->vdev_id,
+ 				    arvif->is_started);
+-			ieee80211_free_txskb(ar->hw, skb);
++			ath12k_mgmt_over_wmi_tx_drop(ar, skb);
+ 		}
+ 	}
+ }
+@@ -6114,6 +6133,7 @@ static int ath12k_mac_mgmt_tx(struct ath
+ 	}
+ 
+ 	skb_queue_tail(q, skb);
++	atomic_inc(&ar->num_pending_mgmt_tx);
+ 	ieee80211_queue_work(ar->hw, &ar->wmi_mgmt_tx_work);
+ 
+ 	return 0;
+@@ -8230,6 +8250,17 @@ static void ath12k_mac_op_flush(struct i
+ 				       ATH12K_FLUSH_TIMEOUT);
+ 	if (time_left == 0)
+ 		ath12k_warn(ar->ab, "failed to flush transmit queue %ld\n", time_left);
++
++	time_left = wait_event_timeout(ar->txmgmt_empty_waitq,
++				       (atomic_read(&ar->num_pending_mgmt_tx) == 0),
++				       ATH12K_FLUSH_TIMEOUT);
++	if (time_left == 0)
++		ath12k_warn(ar->ab, "failed to flush mgmt transmit queue %ld\n",
++			    time_left);
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
++		   "mac mgmt tx flush mgmt pending %d\n",
++		   atomic_read(&ar->num_pending_mgmt_tx));
+ }
+ 
+ static int
+@@ -9709,6 +9740,7 @@ int ath12k_mac_register(struct ath12k_ba
+ 		if (ret)
+ 			goto err_cleanup;
+ 
++		init_waitqueue_head(&ar->txmgmt_empty_waitq);
+ 		idr_init(&ar->txmgmt_idr);
+ 		spin_lock_init(&ar->txmgmt_idr_lock);
+ 	}
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -5645,6 +5645,7 @@ static int wmi_process_mgmt_tx_comp(stru
+ 	struct sk_buff *msdu;
+ 	struct ieee80211_tx_info *info;
+ 	struct ath12k_skb_cb *skb_cb;
++	int num_mgmt;
+ 
+ 	spin_lock_bh(&ar->txmgmt_idr_lock);
+ 	msdu = idr_find(&ar->txmgmt_idr, desc_id);
+@@ -5668,10 +5669,19 @@ static int wmi_process_mgmt_tx_comp(stru
+ 
+ 	ieee80211_tx_status_irqsafe(ar->hw, msdu);
+ 
++	num_mgmt = atomic_dec_if_positive(&ar->num_pending_mgmt_tx);
++
+ 	/* WARN when we received this event without doing any mgmt tx */
+-	if (atomic_dec_if_positive(&ar->num_pending_mgmt_tx) < 0)
++	if (num_mgmt < 0)
+ 		WARN_ON_ONCE(1);
+ 
++	ath12k_dbg(ar->ab, ATH12K_DBG_WMI,
++		   "wmi mgmt tx comp pending %d desc id %d\n",
++		   num_mgmt, desc_id);
++
++	if (!num_mgmt)
++		wake_up(&ar->txmgmt_empty_waitq);	
++
+ 	return 0;
+ }
+ 
