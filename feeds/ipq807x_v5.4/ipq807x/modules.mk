@@ -39,3 +39,21 @@ define KernelPackage/usb-dwc3-qcom-internal/description
 endef
 
 $(eval $(call KernelPackage,usb-dwc3-qcom-internal))
+
+define KernelPackage/diag-char
+  TITLE:=CHAR DIAG
+  KCONFIG:= CONFIG_DIAG_MHI=y@ge5.4 \
+          CONFIG_DIAG_OVER_PCIE=n@ge5.4 \
+          CONFIG_DIAGFWD_BRIDGE_CODE=y \
+          CONFIG_DIAG_CHAR=m
+  DEPENDS:=+kmod-lib-crc-ccitt
+  FILES:=$(LINUX_DIR)/drivers/char/diag/diagchar.ko
+endef
+
+define KernelPackage/diag-char/description
+ CHAR DIAG
+endef
+
+$(eval $(call KernelPackage,diag-char))
+
+
