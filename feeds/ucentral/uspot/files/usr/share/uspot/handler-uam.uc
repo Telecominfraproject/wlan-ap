@@ -13,27 +13,27 @@ function auth_client(ctx) {
 	let payload = portal.radius_init(ctx);
 
 	payload.logoff_url = sprintf('http://%s:3990/', ctx.env.SERVER_ADDR);
-	if (ctx.query_string.username && ctx.query_string.password && !portal.config.uam.uam_secret) {
+	if (ctx.query_string.username && ctx.query_string.password && !ctx.config.uam_secret) {
 		payload.username = ctx.query_string.username;
 		payload.password = ctx.query_string.password;
 	} else if (ctx.query_string.username && ctx.query_string.response) {
-		let challenge = uam.md5(portal.config.uam.challenge, ctx.format_mac);
+		let challenge = uam.md5(ctx.config.challenge, ctx.format_mac);
 
 		payload.username = ctx.query_string.username;
 		payload.chap_password = ctx.query_string.response;
-		if (portal.config.uam.secret)
-			payload.chap_challenge = uam.chap_challenge(challenge, portal.config.uam.uam_secret);
+		if (ctx.config.secret)
+			payload.chap_challenge = uam.chap_challenge(challenge, ctx.config.uam_secret);
 		else
 			payload.chap_challenge = challenge;
 	} else if (ctx.query_string.username && ctx.query_string.password) {
 		payload.username = ctx.query_string.username;
-		payload.password = uam.password(uam.md5(portal.config.uam.challenge, ctx.format_mac), ctx.query_string.password, portal.config.uam.uam_secret);
+		payload.password = uam.password(uam.md5(ctx.config.challenge, ctx.format_mac), ctx.query_string.password, ctx.config.uam_secret);
 	} else
 		include('error.uc', ctx);
 
         let radius = portal.radius_call(ctx, payload);
 	if (radius['access-accept']) {
-		if (portal.config.uam.final_redirect_url == 'uam')
+		if (ctx.config.final_redirect_url == 'uam')
 			ctx.query_string.userurl = portal.uam_url(ctx, 'success');
 		portal.allow_client(ctx, { radius: { reply: radius.reply, request: payload } } );
 
@@ -47,7 +47,7 @@ function auth_client(ctx) {
 		return;
 	}
 
-	if (portal.config.uam.final_redirect_url == 'uam')
+	if (ctx.config.final_redirect_url == 'uam')
 		include('redir.uc', { redir_location: portal.uam_url(ctx, 'reject') });
 	else
 		include('error.uc', ctx);

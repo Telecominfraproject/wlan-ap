@@ -4,14 +4,46 @@ let ubus = require('ubus');
 let fs = require('fs');
 let uci = require('uci').cursor();
 let config = uci.get_all('uspot');
+let nl = require("nl80211");
 
-let file = fs.open(config.config.web_root == 1 ? '/tmp/ucentral/www-uspot/header.html' : '/usr/share/uspot/header', 'r');
+let file = fs.open('/usr/share/uspot/header', 'r');
 let header = file.read('all');
 file.close();
 
-file = fs.open(config.config.web_root == 1 ? '/tmp/ucentral/www-uspot/footer.html' : '/usr/share/uspot/footer', 'r');
+file = fs.open('/usr/share/uspot/footer', 'r');
 let footer = file.read('all');
 file.close();
+
+let header_custom;
+let footer_custom;
+
+file = fs.open('/tmp/ucentral/www-uspot/header.html', 'r');
+if (file) {
+	header_custom = file.read('all');
+	file.close();
+}
+
+file = fs.open('/tmp/ucentral/www-uspot/footer.html', 'r');
+if (file) {
+	footer_custom = file.read('all');
+	file.close();
+}
+
+let devices = uci.get_all('uspot', 'devices');
+
+function lookup_station(mac) {
+	let wifs = nl.request(nl.const.NL80211_CMD_GET_INTERFACE, nl.const.NLM_F_DUMP);
+	for (let wif in wifs) {
+		if (substr(wif.ifname, 0, 5) != 'wlanc')
+			continue;
+		let res = nl.request(nl.const.NL80211_CMD_GET_STATION, nl.const.NLM_F_DUMP, { dev: wif.ifname });
+		for (let sta in res) {
+			if (sta.mac != lc(mac))
+				continue;
+			return devices[wif.ifname]
+		}
+	}
+}
 
 function PO(id, english) {
 	return english;
@@ -32,13 +64,13 @@ return {
 	},
 
 	debug: function(ctx, msg) {
-		if (config.config.debug)
+		if (config.def_captive.debug)
 			this.syslog(ctx, msg);
 	},
 
 	// mac re-formater
-	format_mac: function(mac) {
-		switch(config.uam.mac_format) {
+	format_mac: function(format, mac) {
+		switch(format) {
 		case 'aabbccddeeff':
 		case 'AABBCCDDEEFF':
 			mac = replace(mac, ':', '');
@@ -49,7 +81,7 @@ return {
 			break;
 		}
 
-		switch(config.uam.mac_format) {
+		switch(format) {
 		case 'aabbccddeeff':
 		case 'aa-bb-cc-dd-ee-ff':
 		case 'aa:bb:cc:dd:ee:ff':
@@ -85,7 +117,7 @@ return {
 	allow_client: function(ctx, data) {
 		this.syslog(ctx, 'allow client to pass traffic');
 		ctx.ubus.call('spotfilter', 'client_set', {
-			"interface": "hotspot",
+			"interface": ctx.spotfilter,
 			"address": ctx.mac,
 			"state": 1,
 			"dns_state": 1,
@@ -114,7 +146,7 @@ return {
 	logoff: function(ctx, uam) {
 		this.syslog(ctx, 'logging client off');
 		ctx.ubus.call('spotfilter', 'client_set', {
-			interface: 'hotspot',
+			interface: ctx.spotfilter,
 			address: ctx.mac,
 			state: 0,
 			dns_state: 1,
@@ -141,20 +173,20 @@ return {
 		}
 
 		let payload = {
-			server: sprintf('%s:%s:%s', this.config.radius.auth_server, this.config.radius.auth_port, this.config.radius.auth_secret),
-			acct_server: sprintf('%s:%s:%s', this.config.radius.acct_server, this.config.radius.acct_port, this.config.radius.acct_secret),
+			server: sprintf('%s:%s:%s', ctx.config.auth_server, ctx.config.auth_port, ctx.config.auth_secret),
+			acct_server: sprintf('%s:%s:%s', ctx.config.acct_server, ctx.config.acct_port, ctx.config.acct_secret),
 			acct_session,
 			client_ip: ctx.env.REMOTE_ADDR,
-			called_station: this.config.uam.nasmac + ':' + ctx.ssid,
-			calling_station: this.format_mac(ctx.mac),
+			called_station: ctx.config.nasmac + ':' + ctx.ssid,
+			calling_station: ctx.format_mac,
 			nas_ip: ctx.env.SERVER_ADDR,
-			nas_id: this.config.uam.nasid
+			nas_id: ctx.config.nasid
 		};
 
-		if (this.config.radius.auth_proxy)
-			payload.auth_proxy = this.config.radius.auth_proxy;
-		if (this.config.radius.acct_proxy)
-			payload.acct_proxy = this.config.radius.acct_proxy;
+		if (ctx.config.auth_proxy)
+			payload.auth_proxy = ctx.config.auth_proxy;
+		if (ctx.config.acct_proxy)
+			payload.acct_proxy = ctx.config.acct_proxy;
 
 		return payload;
 	},
@@ -169,20 +201,20 @@ return {
 	},
 
 	uam_url: function(ctx, res) {
-		let uam_url = this.config.uam.uam_server +
+		let uam_url = ctx.config.uam_server +
 			'?res=' + res +
 			'&uamip=' + ctx.env.SERVER_ADDR +
-			'&uamport=' + this.config.uam.uam_port +
-			'&challenge=' + this.uam.md5(this.config.uam.challenge, ctx.format_mac) +
+			'&uamport=' + ctx.config.uam_port +
+			'&challenge=' + this.uam.md5(ctx.config.challenge, ctx.format_mac) +
 			'&mac=' + ctx.format_mac +
 			'&ip=' + ctx.env.REMOTE_ADDR +
-			'&called=' + this.config.uam.nasmac +
-			'&nasid=' + this.config.uam.nasid +
+			'&called=' + ctx.config.nasmac +
+			'&nasid=' + ctx.config.nasid +
 			'&ssid=' + ctx.ssid;
 		if (ctx.query_string?.redir)
 			uam_url += '&userurl=' + ctx.query_string.redir;
-		if (this.config.uam.uam_secret)
-			uam_url += '&md=' + this.uam.md5(uam_url, this.config.uam.uam_secret);
+		if (ctx.config.uam_secret)
+			uam_url += '&md=' + this.uam.md5(uam_url, ctx.config.uam_secret);
 		return uam_url;
 	},
 
@@ -205,22 +237,30 @@ return {
 			include('error.uc', ctx);
 			return NULL;
 		}
-		ctx.format_mac = this.format_mac(ctx.mac);
+		ctx.spotfilter = lookup_station(ctx.mac);
+		ctx.config = config[ctx.spotfilter] || {};
+		ctx.format_mac = this.format_mac(ctx.config.mac_format, ctx.mac);
+		if (+ctx.config.web_root) {
+			ctx.header = header_custom;
+			ctx.footer = footer_custom;
+		}
 
 		// check if a client is already connected
 		ctx.ubus = ubus.connect();
-		let connected = ctx.ubus.call('spotfilter', 'client_get', {
-			interface: 'hotspot',
+		let connected;
+		connected = ctx.ubus.call('spotfilter', 'client_get', {
+			interface: ctx.spotfilter,
 			address: ctx.mac,
 		});
+
 		if (!uam && connected?.state) {
 			include('connected.uc', ctx);
-			return NULL;
+			return;
 		}
 		if (!connected.data.ssid) {
 			let hapd = ctx.ubus.call('hostapd.' + connected.device, 'get_status');
 			ctx.ubus.call('spotfilter', 'client_set', {
-				interface: 'hotspot',
+				interface: ctx.spotfilter,
 				address: ctx.mac,
 				data: {
 					ssid: hapd?.ssid || 'unknown'

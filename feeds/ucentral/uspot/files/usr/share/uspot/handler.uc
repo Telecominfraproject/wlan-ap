@@ -7,8 +7,8 @@ let portal = require('common');
 
 // delegate an initial connection to the correct handler
 function request_start(ctx) {
-	portal.debug(ctx, 'start ' + (portal.config?.config?.auth_mode || '') + ' flow');
-	switch (portal.config?.config?.auth_mode) {
+	portal.debug(ctx, 'start ' + (ctx.config.auth_mode || '') + ' flow');
+	switch (ctx.config.auth_mode) {
 	case 'click-to-continue':
 		include('click.uc', ctx);
 		return;
@@ -19,14 +19,14 @@ function request_start(ctx) {
 		include('radius.uc', ctx);
 		return;
 	case 'uam':
-		if (portal.config?.uam.mac_auth) {
+		if (ctx.config.mac_auth) {
 			let payload = portal.radius_init(ctx);
 			payload.username = ctx.format_mac;
 			payload.password = ctx.format_mac;
 			payload.service_type = 2;
 		        let radius = portal.radius_call(ctx, payload);
 			if (radius['access-accept']) {
-				if (portal.config.uam.final_redirect_url == 'uam')
+				if (ctx.config.final_redirect_url == 'uam')
 					ctx.query_string.userurl = portal.uam_url(ctx, 'success');
 				portal.allow_client(ctx, { radius: { reply: radius.reply, request: payload } } );
 				return;
@@ -44,7 +44,7 @@ function request_start(ctx) {
 // delegate a local click-to-continue authentication
 function request_click(ctx) {
 	// make sure this is the right auth_mode
-	if (portal.config?.config?.auth_mode != 'click-to-continue') {
+	if (ctx.config.auth_mode != 'click-to-continue') {
 		include('error.uc', ctx);
                 return;
 	}
@@ -61,7 +61,7 @@ function request_click(ctx) {
 // delegate a local username/password authentication
 function request_credentials(ctx) {
 	// make sure this is the right auth_mode
-	if (portal.config?.config?.auth_mode != 'credentials') {
+	if (ctx.config.auth_mode != 'credentials') {
 		include('error.uc', ctx);
                 return;
 	}
@@ -79,6 +79,8 @@ function request_credentials(ctx) {
 
 		if (cred['.type'] != 'credentials')
 			continue;
+		if (cred.interface != ctx.spotfilter)
+			continue;
 		if (ctx.form_data.username != cred.username ||
 		    ctx.form_data.password != cred.password)
 			continue;
@@ -95,7 +97,7 @@ function request_credentials(ctx) {
 // delegate a radius username/password authentication
 function request_radius(ctx) {
 	// make sure this is the right auth_mode
-	if (portal.config?.config?.auth_mode != 'radius') {
+	if (ctx.config.auth_mode != 'radius') {
 		include('error.uc', ctx);
                 return;
 	}
