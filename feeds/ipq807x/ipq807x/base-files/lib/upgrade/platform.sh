@@ -105,6 +105,7 @@ platform_check_image() {
 	liteon,wpx8324|\
 	edgecore,eap106|\
 	hfcl,ion4xi|\
+	hfcl,ion4xi_wp|\
 	hfcl,ion4x|\
 	hfcl,ion4x_2|\
 	hfcl,ion4xe|\
@@ -180,6 +181,20 @@ platform_do_upgrade() {
 		fi
 		nand_upgrade_tar "$1"
 		;;
+	hfcl,ion4xi_wp)
+		wp_part=$(fw_printenv primary | cut  -d = -f2)
+		echo "Current Primary is $wp_part"
+		if [[ $wp_part == 1 ]]; then
+                        CI_UBIPART="rootfs"
+			echo "Setting Primary 0 and Flashing"
+                        fw_setenv primary 0 || exit 1
+                else
+                        CI_UBIPART="rootfs_1"
+			echo "Setting Primary 1 and Flashing"
+                        fw_setenv primary 1 || exit 1
+                fi
+                nand_upgrade_tar "$1"
+                ;;
 	edgecore,eap104|\
 	liteon,wpx8324|\
 	edgecore,eap106)
