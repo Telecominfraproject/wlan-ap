@@ -26,7 +26,7 @@ define Package/spotfilter
   SECTION:=utils
   CATEGORY:=Utilities
   TITLE:=Network filter for hotspot services
-  DEPENDS:=+libbpf +libubox +libubus +libnl-tiny +kmod-sched-cake +kmod-sched-bpf $(BPF_DEPENDS)
+  DEPENDS:=+libbpf +libubox +libubus +libnl-tiny +kmod-sched-bpf +kmod-ifb $(BPF_DEPENDS)
 endef
 
 TARGET_CFLAGS += \
