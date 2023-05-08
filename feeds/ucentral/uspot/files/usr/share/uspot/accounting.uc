@@ -158,7 +158,7 @@ function radius_interim(interface, mac) {
 	if (radius_acct(interface, mac, payload))
 		debug(interface, mac, 'iterim acct call');
 	else
-		syslog(interface, mac, 'failed to sent interim accounting frame\n');
+		syslog(interface, mac, 'failed to send interim accounting frame\n');
 	clients[interface][mac].timeout.set(clients[interface][mac].interval);
 }
 
