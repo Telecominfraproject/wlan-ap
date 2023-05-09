@@ -12,7 +12,7 @@ function auth_client(ctx) {
 	let password;
 	let payload = portal.radius_init(ctx);
 
-	payload.logoff_url = sprintf('http://%s:3990/', ctx.env.SERVER_ADDR);
+	payload.logoff_url = sprintf('http://%s:%s/logoff', ctx.env.SERVER_ADDR, ctx.config.uam_port);
 	if (ctx.query_string.username && ctx.query_string.password && !ctx.config.uam_secret) {
 		payload.username = ctx.query_string.username;
 		payload.password = ctx.query_string.password;
