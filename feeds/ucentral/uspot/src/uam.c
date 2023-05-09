@@ -11,33 +11,46 @@
 
 #define MIN(a, b)	((a > b) ? b : a)
 
+/**
+ * Convert a string of hex bytes into the equivalent null-terminated character string.
+ * @param in null-terminated input hex string buffer
+ * @param out output buffer
+ * @param osize output buffer size
+ * @return number of characters decoded
+ * @note if osize is <= strlen(in)/2, the output will be truncated (null-terminated).
+ * @warning no input sanitization is performed: in must be null-terminated;
+ * the resulting output string may contain non-representable characters.
+ */
 static int
-str_to_hex(char *in, char *out, int olen)
+str_to_hex(const char *in, char *out, int osize)
 {
 	int ilen = strlen(in);
-	int len = 0;
+	int i;
 
-	while (ilen >= 2 && olen > 1) {
-		int c;
-		sscanf(in, "%2x", &c);
-		*out++ = (char) c;
-
-		in += 2;
-		ilen -= 2;
-		len++;
+	for (i = 0; (i < ilen/2) && (i < osize - 1); i++) {
+		if (sscanf(&in[i * 2], "%2hhx", &out[i]) != 1)
+			break;	// truncate output on scan errors
 	}
-	*out = '\0';
 
-	return len;
+	out[i] = '\0';
+	return i;
 }
 
+/**
+ * Convert a byte input buffer to null-terminated hex string representation.
+ * @param in input bytes buffer
+ * @param out output buffer
+ * @param len number of input bytes to convert
+ * @warning output buffer size must be 2*len+1 or there will be a buffer overflow.
+ */
 static void
-hex_to_str(char *in, char *out, int len)
+hex_to_str(const void *in, char *out, int len)
 {
+	const unsigned char *hex = in;
 	int i;
 
 	for (i = 0; i < len; i++)
-		sprintf(&out[i * 2], "%02x", in[i]);
+		snprintf(&out[i * 2], 3, "%02hhX", hex[i]);
 }
 
 static uc_value_t *
@@ -98,7 +111,7 @@ uc_challenge(uc_vm_t *vm, size_t nargs)
 	md5_hash(secret, strlen(secret), &md5);
 	md5_end(uamchal, &md5);
 
-	hex_to_str(uamchal, ret, 16);
+	hex_to_str(uamchal, ret, sizeof(uamchal)/2);
 	return ucv_string_new(ret);
 
 }
@@ -113,7 +126,6 @@ uc_md5(uc_vm_t *vm, size_t nargs)
 	char *secret;
 	char *str;
 	md5_ctx_t md5 = {};
-	int i = 0;
 
 	if (!_str || !_secret)
 		return ucv_boolean_new(false);
@@ -126,9 +138,7 @@ uc_md5(uc_vm_t *vm, size_t nargs)
 	md5_hash(secret, strlen(secret), &md5);
 	md5_end(_md, &md5);
 
-	for (i = 0; i < 16; i++)
-		sprintf(&md[2 * i], "%02X", _md[i]);
-
+	hex_to_str(_md, md, sizeof(_md)/2);
 	return ucv_string_new(md);
 }
 
