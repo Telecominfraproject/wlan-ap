@@ -72,24 +72,29 @@ static const struct blobmsg_policy radius_policy[__RADIUS_MAX] = {
 static struct blob_buf b = {};
 static struct blob_attr *tb[__RADIUS_MAX] = {};
 
+/**
+ * Convert a string of hex bytes into the equivalent null-terminated character string.
+ * @param in null-terminated input hex string buffer
+ * @param out output buffer
+ * @param osize output buffer size
+ * @return number of characters decoded
+ * @note if osize is <= strlen(in)/2, the output will be truncated (null-terminated).
+ * @warning no input sanitization is performed: in must be null-terminated;
+ * the resulting output string may contain non-representable characters.
+ */
 static int
-str_to_hex(char *in, char *out, int olen)
+str_to_hex(const char *in, char *out, int osize)
 {
 	int ilen = strlen(in);
-	int len = 0;
+	int i;
 
-	while (ilen >= 2 && olen > 1) {
-		int c;
-		sscanf(in, "%2x", &c);
-		*out++ = (char) c;
-
-		in += 2;
-		ilen -= 2;
-		len++;
+	for (i = 0; (i < ilen/2) && (i < osize - 1); i++) {
+		if (sscanf(&in[i * 2], "%2hhx", &out[i]) != 1)
+			break;	// truncate output on scan errors
 	}
-	*out = '\0';
 
-	return len;
+	out[i] = '\0';
+	return i;
 }
 
 static int
