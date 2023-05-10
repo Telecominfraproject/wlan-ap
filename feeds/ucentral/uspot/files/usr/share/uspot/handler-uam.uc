@@ -28,8 +28,10 @@ function auth_client(ctx) {
 	} else if (ctx.query_string.username && ctx.query_string.password) {
 		payload.username = ctx.query_string.username;
 		payload.password = uam.password(uam.md5(ctx.config.challenge, ctx.format_mac), ctx.query_string.password, ctx.config.uam_secret);
-	} else
+	} else {
 		include('error.uc', ctx);
+		return;
+	}
 
         let radius = portal.radius_call(ctx, payload);
 	if (radius['access-accept']) {
