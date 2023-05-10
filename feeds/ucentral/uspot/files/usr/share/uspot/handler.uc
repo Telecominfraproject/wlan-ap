@@ -19,7 +19,7 @@ function request_start(ctx) {
 		include('radius.uc', ctx);
 		return;
 	case 'uam':
-		if (ctx.config.mac_auth) {
+		if (+ctx.config.mac_auth) {
 			let payload = portal.radius_init(ctx);
 			payload.username = ctx.format_mac;
 			payload.password = ctx.format_mac;
