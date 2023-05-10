@@ -68,6 +68,16 @@ return {
 			this.syslog(ctx, msg);
 	},
 
+	// session id generator
+	session_init: function() {
+		let math = require('math');
+		let sessionid = '';
+
+		for (let i = 0; i < 16; i++)
+		        sessionid += sprintf('%d', math.rand() % 10);
+		return sessionid;
+	},
+
 	// mac re-formater
 	format_mac: function(format, mac) {
 		switch(format) {
@@ -163,19 +173,13 @@ return {
 	},
 
 	// generate the default radius auth payload
-	radius_init: function(ctx, acct_session) {
-		let math = require('math');
-		if (!acct_session) {
-			acct_session = '';
-
-			for (let i = 0; i < 16; i++)
-			        acct_session += sprintf('%d', math.rand() % 10);
-		}
-
+	radius_init: function(ctx) {
+		if (!ctx.sessionid)
+			ctx.sessionid = this.session_init();
 		let payload = {
 			server: sprintf('%s:%s:%s', ctx.config.auth_server, ctx.config.auth_port, ctx.config.auth_secret),
 			acct_server: sprintf('%s:%s:%s', ctx.config.acct_server, ctx.config.acct_port, ctx.config.acct_secret),
-			acct_session,
+			acct_session: ctx.sessionid,
 			client_ip: ctx.env.REMOTE_ADDR,
 			called_station: ctx.config.nasmac + ':' + ctx.ssid,
 			calling_station: ctx.format_mac,
@@ -210,7 +214,8 @@ return {
 			'&ip=' + ctx.env.REMOTE_ADDR +
 			'&called=' + ctx.config.nasmac +
 			'&nasid=' + ctx.config.nasid +
-			'&ssid=' + ctx.ssid;
+			'&ssid=' + ctx.ssid +
+			'&sessionid=' + ctx.sessionid;
 		if (ctx.query_string?.redir)
 			uam_url += '&userurl=' + ctx.query_string.redir;
 		if (ctx.config.uam_secret)
@@ -268,8 +273,20 @@ return {
 			});
 			connected.data.ssid = hapd.ssid;
 		}
+		if (!connected.data.sessionid) {
+			let sessionid = this.session_init();
+			ctx.ubus.call('spotfilter', 'client_set', {
+				interface: ctx.spotfilter,
+				address: ctx.mac,
+				data: {
+					sessionid: sessionid
+				}
+			});
+			connected.data.sessionid = sessionid;
+		}
 		ctx.device = connected.device;
 		ctx.ssid = connected.data.ssid;
+		ctx.sessionid = connected.data.sessionid;
 
 		// split QUERY_STRING
 		if (env.QUERY_STRING)

@@ -39,7 +39,7 @@ function auth_client(ctx) {
 			ctx.query_string.userurl = portal.uam_url(ctx, 'success');
 		portal.allow_client(ctx, { radius: { reply: radius.reply, request: payload } } );
 
-		payload = portal.radius_init(ctx, payload.acct_session);
+		payload = portal.radius_init(ctx);
 		payload.acct = true;
 		payload.username = ctx.query_string.username;
 		payload.acct_type = 1;
