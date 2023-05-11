@@ -9,6 +9,13 @@ let uci = require('uci').cursor();
 let config = uci.get_all('uspot');
 let clients = {};
 
+if (!config) {
+	let log = 'uspot: failed to load config';
+	system('logger ' + log);
+	warn(log + '\n');
+	exit(1);
+}
+
 function acct_interval(interface) {
 	return config[interface]?.acct_interval || 600;
 }
