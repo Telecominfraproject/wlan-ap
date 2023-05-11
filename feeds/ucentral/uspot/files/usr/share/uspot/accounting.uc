@@ -21,10 +21,10 @@ function session_timeout(interface) {
 	return config[interface].session_timeout || 0;
 }
 
-let devices = uci.get_all('uspot', 'devices');
-for (let k, v in devices)
-	if (substr(k, 0, 1) != '.')
-		clients[v] = {};;
+uci.foreach('uspot', 'uspot', (d) => {
+	if (!d[".anonymous"])
+		clients[d[".name"]] = {};
+});
 
 function syslog(interface, mac, msg) {
 	let log = sprintf('uspot: %s %s %s', interface, mac, msg);
