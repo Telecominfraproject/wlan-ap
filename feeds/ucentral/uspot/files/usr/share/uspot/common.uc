@@ -29,12 +29,38 @@ if (file) {
 	file.close();
 }
 
-let devices = uci.get_all('uspot', 'devices');
+let devices = {};
+uci.foreach('uspot', 'uspot', (d) => {
+	function adddev(ifname, sname) {
+		if (ifname in devices)
+			warn('uspot: ignoring duplicate entry for ifname: "' + ifname + '"\n');
+		else
+			devices[ifname] = sname;
+	}
+
+	if (d[".anonymous"]) {
+		warn('uspot: ignoring invalid anonymous section at index ' + d[".index"] + '\n');
+		return;
+	}
+
+	let spotname = d[".name"];
+	if (!d.ifname) {
+		warn('uspot: missing ifname in section "' + spotname + '"\n');
+		return;
+	}
+
+	if (type(d.ifname) == "array") {
+		for (let n in d.ifname)
+			adddev(n, spotname);
+	}
+	else
+		adddev(d.ifname, spotname);
+});
 
 function lookup_station(mac) {
 	let wifs = nl.request(nl.const.NL80211_CMD_GET_INTERFACE, nl.const.NLM_F_DUMP);
 	for (let wif in wifs) {
-		if (substr(wif.ifname, 0, 5) != 'wlanc')
+		if (!(wif.ifname in devices))
 			continue;
 		let res = nl.request(nl.const.NL80211_CMD_GET_STATION, nl.const.NLM_F_DUMP, { dev: wif.ifname });
 		for (let sta in res) {
