@@ -1,5 +1,13 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/*
+ * A simple JSON to radius client.
+ * Copyright (C) 2022 John Crispin <john@phrozen.org>
+ * Copyright (C) 2023 Thibaut Varène <hacks@slashdirt.org>
+ */
+
 #include <stdio.h>
 #include <string.h>
+#include <assert.h>
 
 #include <arpa/inet.h>
 
@@ -9,68 +17,112 @@
 #include <libubox/blobmsg_json.h>
 
 enum {
-        RADIUS_ACCT,
-        RADIUS_SERVER,
-        RADIUS_ACCT_SERVER,
-        RADIUS_ACCT_TYPE,
-        RADIUS_USERNAME,
-        RADIUS_PASSWORD,
-        RADIUS_CHAP_PASSWORD,
-        RADIUS_CHAP_CHALLENGE,
-        RADIUS_ACCT_SESSION,
-        RADIUS_CLIENT_IP,
-        RADIUS_CALLED_STATION,
-        RADIUS_CALLING_STATION,
-        RADIUS_NAS_IP,
-        RADIUS_NAS_ID,
-        RADIUS_TERMINATE_CAUSE,
-        RADIUS_SESSION_TIME,
-        RADIUS_INPUT_OCTETS,
-        RADIUS_OUTPUT_OCTETS,
-        RADIUS_INPUT_GIGAWORDS,
-        RADIUS_OUTPUT_GIGAWORDS,
-        RADIUS_INPUT_PACKETS,
-        RADIUS_OUTPUT_PACKETS,
-        RADIUS_LOGOFF_URL,
-        RADIUS_CLASS,
-        RADIUS_SERVICE_TYPE,
-        RADIUS_PROXY_STATE_ACCT,
-        RADIUS_PROXY_STATE_AUTH,
-        __RADIUS_MAX,
+	RADIUS_ACCT,
+	RADIUS_SERVER,
+	RADIUS_ACCT_SERVER,
+	RADIUS_ACCT_TYPE,
+	RADIUS_USERNAME,
+	RADIUS_PASSWORD,
+	RADIUS_CHAP_PASSWORD,
+	RADIUS_CHAP_CHALLENGE,
+	RADIUS_ACCT_SESSION,
+	RADIUS_CLIENT_IP,
+	RADIUS_CALLED_STATION,
+	RADIUS_CALLING_STATION,
+	RADIUS_NAS_IP,
+	RADIUS_NAS_ID,
+	RADIUS_TERMINATE_CAUSE,
+	RADIUS_SESSION_TIME,
+	RADIUS_INPUT_OCTETS,
+	RADIUS_OUTPUT_OCTETS,
+	RADIUS_INPUT_GIGAWORDS,
+	RADIUS_OUTPUT_GIGAWORDS,
+	RADIUS_INPUT_PACKETS,
+	RADIUS_OUTPUT_PACKETS,
+	RADIUS_LOGOFF_URL,
+	RADIUS_CLASS,
+	RADIUS_SERVICE_TYPE,
+	RADIUS_PROXY_STATE_ACCT,
+	RADIUS_PROXY_STATE_AUTH,
+	__RADIUS_MAX,
 };
 
 static const struct blobmsg_policy radius_policy[__RADIUS_MAX] = {
-        [RADIUS_ACCT] = { .name = "acct", .type = BLOBMSG_TYPE_BOOL },
-        [RADIUS_SERVER] = { .name = "server", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_ACCT_SERVER] = { .name = "acct_server", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_ACCT_TYPE] = { .name = "acct_type", .type = BLOBMSG_TYPE_INT32 },
-        [RADIUS_USERNAME] = { .name = "username", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_PASSWORD] = { .name = "password", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_CHAP_PASSWORD] = { .name = "chap_password", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_CHAP_CHALLENGE] = { .name = "chap_challenge", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_ACCT_SESSION] = { .name = "acct_session", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_CLIENT_IP] = { .name = "client_ip", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_CALLED_STATION] = { .name = "called_station", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_CALLING_STATION] = { .name = "calling_station", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_NAS_IP] = { .name = "nas_ip", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_NAS_ID] = { .name = "nas_id", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_TERMINATE_CAUSE] = { .name = "terminate_cause", .type = BLOBMSG_TYPE_INT32 },
-        [RADIUS_SESSION_TIME] = { .name = "session_time", .type = BLOBMSG_TYPE_INT32 },
-        [RADIUS_INPUT_OCTETS] = { .name = "input_octets", .type = BLOBMSG_TYPE_INT32 },
-        [RADIUS_OUTPUT_OCTETS] = { .name = "output_octets", .type = BLOBMSG_TYPE_INT32 },
-        [RADIUS_INPUT_GIGAWORDS] = { .name = "input_gigawords", .type = BLOBMSG_TYPE_INT32 },
-        [RADIUS_OUTPUT_GIGAWORDS] = { .name = "output_gigawords", .type = BLOBMSG_TYPE_INT32 },
-        [RADIUS_INPUT_PACKETS] = { .name = "input_packets", .type = BLOBMSG_TYPE_INT32 },
-        [RADIUS_OUTPUT_PACKETS] = { .name = "output_packets", .type = BLOBMSG_TYPE_INT32 },
-        [RADIUS_LOGOFF_URL] = { .name = "logoff_url", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_CLASS] = { .name = "class", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_SERVICE_TYPE] = { .name = "service_type", .type = BLOBMSG_TYPE_INT32 },
-        [RADIUS_PROXY_STATE_AUTH] = { .name = "auth_proxy", .type = BLOBMSG_TYPE_STRING },
-        [RADIUS_PROXY_STATE_ACCT] = { .name = "acct_proxy", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_ACCT] = { .name = "acct", .type = BLOBMSG_TYPE_BOOL },
+	[RADIUS_SERVER] = { .name = "server", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_ACCT_SERVER] = { .name = "acct_server", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_ACCT_TYPE] = { .name = "acct_type", .type = BLOBMSG_TYPE_INT32 },
+	[RADIUS_USERNAME] = { .name = "username", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_PASSWORD] = { .name = "password", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_CHAP_PASSWORD] = { .name = "chap_password", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_CHAP_CHALLENGE] = { .name = "chap_challenge", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_ACCT_SESSION] = { .name = "acct_session", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_CLIENT_IP] = { .name = "client_ip", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_CALLED_STATION] = { .name = "called_station", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_CALLING_STATION] = { .name = "calling_station", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_NAS_IP] = { .name = "nas_ip", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_NAS_ID] = { .name = "nas_id", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_TERMINATE_CAUSE] = { .name = "terminate_cause", .type = BLOBMSG_TYPE_INT32 },
+	[RADIUS_SESSION_TIME] = { .name = "session_time", .type = BLOBMSG_TYPE_INT32 },
+	[RADIUS_INPUT_OCTETS] = { .name = "input_octets", .type = BLOBMSG_TYPE_INT32 },
+	[RADIUS_OUTPUT_OCTETS] = { .name = "output_octets", .type = BLOBMSG_TYPE_INT32 },
+	[RADIUS_INPUT_GIGAWORDS] = { .name = "input_gigawords", .type = BLOBMSG_TYPE_INT32 },
+	[RADIUS_OUTPUT_GIGAWORDS] = { .name = "output_gigawords", .type = BLOBMSG_TYPE_INT32 },
+	[RADIUS_INPUT_PACKETS] = { .name = "input_packets", .type = BLOBMSG_TYPE_INT32 },
+	[RADIUS_OUTPUT_PACKETS] = { .name = "output_packets", .type = BLOBMSG_TYPE_INT32 },
+	[RADIUS_LOGOFF_URL] = { .name = "logoff_url", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_CLASS] = { .name = "class", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_SERVICE_TYPE] = { .name = "service_type", .type = BLOBMSG_TYPE_INT32 },
+	[RADIUS_PROXY_STATE_AUTH] = { .name = "auth_proxy", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_PROXY_STATE_ACCT] = { .name = "acct_proxy", .type = BLOBMSG_TYPE_STRING },
 };
 
 static struct blob_buf b = {};
 static struct blob_attr *tb[__RADIUS_MAX] = {};
+
+static int cb_ip(void * p, size_t s, struct blob_attr *b);
+static int cb_chap_passwd(void * p, size_t s, struct blob_attr *b);
+static int cb_chap_challenge(void * p, size_t s, struct blob_attr *b);
+
+#define VENDORSPEC_WBAL			14122
+#define ATTR_WBAL_WISPR_LOGOFF_URL	3
+
+/** Internal keys to radcli association table */
+static const struct {
+	uint32_t attrid;		///< radcli attribute ID
+	uint32_t vendorspec;		///< radcli vendorspec ID
+	/**
+	 * Optional callback for data processing.
+	 * Takes a pointer to allocated output space (size as second arg), and a pointer to current blob_attr.
+	 * Output will be passed verbatim to rc_avpair_add(). Returns output length.
+	 */
+	int (*const cb)(void *, size_t, struct blob_attr *);
+} avpair[__RADIUS_MAX] = {
+	[RADIUS_ACCT_TYPE] = { .attrid = PW_ACCT_STATUS_TYPE, },
+	[RADIUS_USERNAME] = { .attrid = PW_USER_NAME, },
+	[RADIUS_PASSWORD] = { .attrid = PW_USER_PASSWORD, },
+	[RADIUS_CHAP_PASSWORD] = { .attrid = PW_CHAP_PASSWORD, .cb = cb_chap_passwd, },
+	[RADIUS_CHAP_CHALLENGE] = { .attrid = PW_CHAP_CHALLENGE, .cb = cb_chap_challenge, },
+	[RADIUS_ACCT_SESSION] = { .attrid = PW_ACCT_SESSION_ID, },
+	[RADIUS_CLIENT_IP] = { .attrid = PW_FRAMED_IP_ADDRESS, .cb = cb_ip, },
+	[RADIUS_CALLED_STATION] = { .attrid = PW_CALLED_STATION_ID, },
+	[RADIUS_CALLING_STATION] = { .attrid = PW_CALLING_STATION_ID, },
+	[RADIUS_NAS_IP] = { .attrid = PW_NAS_IP_ADDRESS, .cb = cb_ip, },
+	[RADIUS_NAS_ID] = { .attrid = PW_NAS_IDENTIFIER, },
+	[RADIUS_TERMINATE_CAUSE] = { .attrid = PW_ACCT_TERMINATE_CAUSE, },
+	[RADIUS_SESSION_TIME] = { .attrid = PW_ACCT_SESSION_TIME, },
+	[RADIUS_INPUT_OCTETS] = { .attrid = PW_ACCT_INPUT_OCTETS, },
+	[RADIUS_OUTPUT_OCTETS] = { .attrid = PW_ACCT_OUTPUT_OCTETS, },
+	[RADIUS_INPUT_GIGAWORDS] = { .attrid = PW_ACCT_INPUT_GIGAWORDS, },
+	[RADIUS_OUTPUT_GIGAWORDS] = { .attrid = PW_ACCT_OUTPUT_GIGAWORDS },
+	[RADIUS_INPUT_PACKETS] = { .attrid = PW_ACCT_INPUT_PACKETS, },
+	[RADIUS_OUTPUT_PACKETS] = { .attrid = PW_ACCT_OUTPUT_PACKETS, },
+	[RADIUS_LOGOFF_URL] = { .attrid = ATTR_WBAL_WISPR_LOGOFF_URL, .vendorspec = VENDORSPEC_WBAL, },
+	[RADIUS_CLASS] = { .attrid = PW_CLASS, },
+	[RADIUS_SERVICE_TYPE] = { .attrid = PW_SERVICE_TYPE, },
+	[RADIUS_PROXY_STATE_AUTH] = { .attrid = PW_PROXY_STATE, },
+	[RADIUS_PROXY_STATE_ACCT] = { .attrid = PW_PROXY_STATE, },
+};
 
 /**
  * Convert a string of hex bytes into the equivalent null-terminated character string.
@@ -95,6 +147,47 @@ str_to_hex(const char *in, char *out, int osize)
 
 	out[i] = '\0';
 	return i;
+}
+
+/**
+ * Format IPv4 address.
+ * @param p pointer to output value
+ * @param s size of allocated output buffer
+ * @param b input blob_attr (expect string)
+ * @return effective length of value
+ */
+static int cb_ip(void * p, size_t s, struct blob_attr *b)
+{
+	struct sockaddr_in ip = {};
+
+	assert(s >= sizeof(ip.sin_addr));
+	inet_pton(AF_INET, blobmsg_get_string(b), &ip.sin_addr);
+	ip.sin_addr.s_addr = ntohl(ip.sin_addr.s_addr);
+	memcpy(p, &ip.sin_addr, sizeof(ip.sin_addr));
+
+	return sizeof(ip.sin_addr);
+}
+
+static int cb_chap_passwd(void *p, size_t s, struct blob_attr *b)
+{
+	char *str = p;
+	int len;
+
+	assert(s >= 17);
+	len = str_to_hex(blobmsg_get_string(b), str+1, 16);
+
+	return len+1;
+}
+
+static int cb_chap_challenge(void *p, size_t s, struct blob_attr *b)
+{
+	char *str = p;
+	int len;
+
+	assert(s >= 16);
+	len = str_to_hex(blobmsg_get_string(b), str, 16);
+
+	return len;
 }
 
 static int
@@ -128,23 +221,21 @@ static int
 radius(void)
 {
 	VALUE_PAIR *send = NULL, *received;
-	struct sockaddr_in client_ip = {};
-	struct sockaddr_in nas_ip = {};
-        char chap_challenge[16] = {};
-        char chap_password[17] = {};
 	rc_handle *rh = rc_new();
+	char tempstr[32];
 	uint32_t val;
+	void *pval;
+	int len, i;
 
 	if (rh == NULL)
-		return result(rh, 0, NULL);;
+		goto fail;
 
 	rh = rc_config_init(rh);
 	if (rh == NULL)
-		return result(rh, 0, NULL);;
+		goto fail;
 
 	if (tb[RADIUS_SERVER])
 		rc_add_config(rh, "authserver", blobmsg_get_string(tb[RADIUS_SERVER]), "code", __LINE__);
-
 	if (tb[RADIUS_ACCT_SERVER])
 		rc_add_config(rh, "acctserver", blobmsg_get_string(tb[RADIUS_ACCT_SERVER]), "code", __LINE__);
 	rc_add_config(rh, "servers", "/tmp/radius.servers", "code", __LINE__);
@@ -154,139 +245,70 @@ radius(void)
 	rc_add_config(rh, "bindaddr", "*", "code", __LINE__);
 
 	if (rc_read_dictionary(rh, rc_conf_str(rh, "dictionary")) != 0)
-		return result(rh, 0, NULL);
+		goto fail;
 
-	if (tb[RADIUS_ACCT_TYPE]) {
-		val = blobmsg_get_u32(tb[RADIUS_ACCT_TYPE]);
-		if (rc_avpair_add(rh, &send, PW_ACCT_STATUS_TYPE, &val, 4, 0) == NULL)
-			return result(rh, 0, NULL);
+	// process parsed blobmsg for radius request
+	for (i = 0; i < __RADIUS_MAX; i++) {
+		switch (i) {
+			case RADIUS_ACCT:
+			case RADIUS_SERVER:
+			case RADIUS_ACCT_SERVER:
+			case RADIUS_PROXY_STATE_ACCT:
+			case RADIUS_PROXY_STATE_AUTH:
+				continue;	// ignore those keys
+			default:
+		}
+
+		if (!tb[i])
+			continue;
+
+		pval = NULL;
+		len = 0;
+		switch (radius_policy[i].type) {
+			case BLOBMSG_TYPE_INT32:
+				len = 4;
+				if (avpair[i].cb)
+					len = avpair[i].cb(&val, sizeof(val), tb[i]);
+				else
+					val = blobmsg_get_u32(tb[i]);
+				pval = &val;
+				break;
+			case BLOBMSG_TYPE_STRING:
+				len = -1;
+				if (avpair[i].cb) {
+					memset(tempstr, 0, sizeof(tempstr));
+					len = avpair[i].cb(&tempstr, sizeof(tempstr), tb[i]);
+					pval = &tempstr;
+				}
+				else
+					pval = blobmsg_get_string(tb[i]);
+				break;
+			default:
+				fprintf(stderr, "policy type not implemented, fix radius.c!\n");
+				goto fail;
+		}
+
+		if (pval && len) {
+			if (rc_avpair_add(rh, &send, avpair[i].attrid, pval, len, avpair[i].vendorspec) == NULL)
+				goto fail;
+		}
 	}
 
 	if (tb[RADIUS_ACCT] && blobmsg_get_bool(tb[RADIUS_ACCT])) {
-		if (tb[RADIUS_PROXY_STATE_ACCT])
+		if (tb[RADIUS_PROXY_STATE_ACCT]) {
 			if (rc_avpair_add(rh, &send, PW_PROXY_STATE, blobmsg_get_string(tb[RADIUS_PROXY_STATE_ACCT]), -1, 0) == NULL)
-		                return result(rh, 0, NULL);
+				goto fail;
+		}
 	} else {
-		if (tb[RADIUS_PROXY_STATE_AUTH])
+		if (tb[RADIUS_PROXY_STATE_AUTH]) {
 			if (rc_avpair_add(rh, &send, PW_PROXY_STATE, blobmsg_get_string(tb[RADIUS_PROXY_STATE_AUTH]), -1, 0) == NULL)
-		                return result(rh, 0, NULL);
+				goto fail;
+		}
 	}
-
-	if (tb[RADIUS_USERNAME])
-		if (rc_avpair_add(rh, &send, PW_USER_NAME, blobmsg_get_string(tb[RADIUS_USERNAME]), -1, 0) == NULL)
-	                return result(rh, 0, NULL);
-
-	if (tb[RADIUS_PASSWORD])
-		if (rc_avpair_add(rh, &send, PW_USER_PASSWORD, blobmsg_get_string(tb[RADIUS_PASSWORD]), -1, 0) == NULL)
-			return result(rh, 0, NULL);
-
-	if (tb[RADIUS_CHAP_PASSWORD]) {
-		str_to_hex(blobmsg_get_string(tb[RADIUS_CHAP_PASSWORD]), &chap_password[1], 16);
-		if (rc_avpair_add(rh, &send, PW_CHAP_PASSWORD, chap_password, 17, 0) == NULL)
-			return result(rh, 0, NULL);
-	}
-
-	if (tb[RADIUS_CHAP_CHALLENGE]) {
-		str_to_hex(blobmsg_get_string(tb[RADIUS_CHAP_CHALLENGE]), chap_challenge, 16);
-		if (rc_avpair_add(rh, &send, PW_CHAP_CHALLENGE, chap_challenge, 16, 0) == NULL)
-	                return result(rh, 0, NULL);
-	}
-
-	if (tb[RADIUS_ACCT_SESSION])
-		if (rc_avpair_add(rh, &send, PW_ACCT_SESSION_ID, blobmsg_get_string(tb[RADIUS_ACCT_SESSION]), -1, 0) == NULL)
-			return result(rh, 0, NULL);
-
-	if (tb[RADIUS_CLIENT_IP]) {
-		inet_pton(AF_INET, blobmsg_get_string(tb[RADIUS_CLIENT_IP]), &(client_ip.sin_addr));
-		client_ip.sin_addr.s_addr = ntohl(client_ip.sin_addr.s_addr);
-		if (rc_avpair_add(rh, &send, PW_FRAMED_IP_ADDRESS, &client_ip.sin_addr, 4, 0) == NULL)
-			return result(rh, 0, NULL);
-	}
-
-	if (tb[RADIUS_CALLED_STATION])
-		if (rc_avpair_add(rh, &send, PW_CALLED_STATION_ID, blobmsg_get_string(tb[RADIUS_CALLED_STATION]), -1, 0) == NULL)
-			return result(rh, 0, NULL);
-
-	if (tb[RADIUS_LOGOFF_URL])
-		if (rc_avpair_add(rh, &send, 3, blobmsg_get_string(tb[RADIUS_LOGOFF_URL]), -1, 14122) == NULL)
-			return result(rh, 0, NULL);
-
-	if (tb[RADIUS_CALLING_STATION])
-		if (rc_avpair_add(rh, &send, PW_CALLING_STATION_ID, blobmsg_get_string(tb[RADIUS_CALLING_STATION]), -1, 0) == NULL)
-			return result(rh, 0, NULL);
-
-	if (tb[RADIUS_NAS_IP]) {
-		inet_pton(AF_INET, blobmsg_get_string(tb[RADIUS_NAS_IP]), &(nas_ip.sin_addr));
-		nas_ip.sin_addr.s_addr = ntohl(nas_ip.sin_addr.s_addr);
-		if (rc_avpair_add(rh, &send, PW_NAS_IP_ADDRESS, &nas_ip.sin_addr, 4, 0) == NULL)
-			return result(rh, 0, NULL);
-	}
-
-	if (tb[RADIUS_NAS_ID])
-		if (rc_avpair_add(rh, &send, PW_NAS_IDENTIFIER, blobmsg_get_string(tb[RADIUS_NAS_ID]), -1, 0) == NULL)
-			return result(rh, 0, NULL);
-
-	if (tb[RADIUS_TERMINATE_CAUSE]) {
-		val = blobmsg_get_u32(tb[RADIUS_TERMINATE_CAUSE]);
-		if (rc_avpair_add(rh, &send, PW_ACCT_TERMINATE_CAUSE, &val, 4, 0) == NULL)
-			return result(rh, 0, NULL);
-	}
-
-	if (tb[RADIUS_SESSION_TIME]) {
-		val = blobmsg_get_u32(tb[RADIUS_SESSION_TIME]);
-		if (rc_avpair_add(rh, &send, PW_ACCT_SESSION_TIME, &val, 4, 0) == NULL)
-			return result(rh, 0, NULL);
-	}
-
-	if (tb[RADIUS_INPUT_OCTETS]) {
-		val = blobmsg_get_u32(tb[RADIUS_INPUT_OCTETS]);
-		if (rc_avpair_add(rh, &send, PW_ACCT_INPUT_OCTETS, &val, 4, 0) == NULL)
-			return result(rh, 0, NULL);
-	}
-
-	if (tb[RADIUS_OUTPUT_OCTETS]) {
-		val = blobmsg_get_u32(tb[RADIUS_OUTPUT_OCTETS]);
-		if (rc_avpair_add(rh, &send, PW_ACCT_OUTPUT_OCTETS, &val, 4, 0) == NULL)
-			return result(rh, 0, NULL);
-	}
-
-	if (tb[RADIUS_INPUT_GIGAWORDS]) {
-		val = blobmsg_get_u32(tb[RADIUS_INPUT_GIGAWORDS]);
-		if (rc_avpair_add(rh, &send, PW_ACCT_INPUT_GIGAWORDS, &val, 4, 0) == NULL)
-			return result(rh, 0, NULL);
-	}
-
-	if (tb[RADIUS_OUTPUT_GIGAWORDS]) {
-		val = blobmsg_get_u32(tb[RADIUS_OUTPUT_GIGAWORDS]);
-		if (rc_avpair_add(rh, &send, PW_ACCT_OUTPUT_GIGAWORDS, &val, 4, 0) == NULL)
-			return result(rh, 0, NULL);
-	}
-
-	if (tb[RADIUS_INPUT_PACKETS]) {
-		val = blobmsg_get_u32(tb[RADIUS_INPUT_PACKETS]);
-		if (rc_avpair_add(rh, &send, PW_ACCT_INPUT_PACKETS, &val, 4, 0) == NULL)
-			return result(rh, 0, NULL);
-	}
-
-	if (tb[RADIUS_OUTPUT_PACKETS]) {
-		val = blobmsg_get_u32(tb[RADIUS_OUTPUT_PACKETS]);
-		if (rc_avpair_add(rh, &send, PW_ACCT_OUTPUT_PACKETS, &val, 4, 0) == NULL)
-			return result(rh, 0, NULL);
-	}
-
-	if (tb[RADIUS_SERVICE_TYPE]) {
-		val = blobmsg_get_u32(tb[RADIUS_SERVICE_TYPE]);
-		if (rc_avpair_add(rh, &send, PW_SERVICE_TYPE, &val, 4, 0) == NULL)
-			return result(rh, 0, NULL);
-	}
-
-	if (tb[RADIUS_CLASS])
-		if (rc_avpair_add(rh, &send, PW_CLASS, blobmsg_get_string(tb[RADIUS_CLASS]), -1, 0) == NULL)
-			return result(rh, 0, NULL);
 
 	val = 19;
 	if (rc_avpair_add(rh, &send, PW_NAS_PORT_TYPE, &val, 4, 0) == NULL)
-		return result(rh, 0, NULL);
+		goto fail;
 
 	rc_apply_config(rh);
 	if (tb[RADIUS_ACCT] && blobmsg_get_bool(tb[RADIUS_ACCT])) {
@@ -297,6 +319,7 @@ radius(void)
 			return result(rh, 1, received);
 	}
 
+fail:
 	return result(rh, 0, NULL);
 }
 
