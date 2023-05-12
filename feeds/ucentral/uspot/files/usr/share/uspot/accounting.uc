@@ -73,11 +73,15 @@ function radius_init(interface, mac, payload) {
 }
 
 function radius_call(interface, mac, payload) {
-	let cfg = fs.open('/tmp/acct' + mac + '.json', 'w');
+	let path = '/tmp/uacct' + mac + '.json';
+	let cfg = fs.open(path, 'w');
 	cfg.write(payload);
 	cfg.close();
 
-	system('/usr/bin/radius-client /tmp/acct' + mac + '.json');
+	system('/usr/bin/radius-client ' + path);
+
+	if (!+config[interface].debug)
+		fs.unlink(path);
 }
 
 function radius_stop(interface, mac, payload, remove) {

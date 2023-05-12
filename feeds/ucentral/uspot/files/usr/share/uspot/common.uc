@@ -221,13 +221,19 @@ return {
 		return payload;
 	},
 
+	// call radius-client with the provided payload and return reply
 	radius_call: function(ctx, payload) {
-		let type = payload.acct ? 'acct' : 'auth';
-		let cfg = fs.open('/tmp/' + type + ctx.mac + '.json', 'w');
+		let path = '/tmp/' + (payload.acct ? 'acct' : 'auth') + ctx.mac + '.json';
+		let cfg = fs.open(path, 'w');
 		cfg.write(payload);
 		cfg.close();
 
-		return this.fs_popen('/usr/bin/radius-client /tmp/' + type + ctx.mac + '.json');
+		let reply = this.fs_popen('/usr/bin/radius-client ' + path);
+
+		if (!+config.def_captive.debug)
+			fs.unlink(path);
+
+		return reply;
 	},
 
 	uam_url: function(ctx, res) {
