@@ -210,9 +210,11 @@ return {
 			called_station: ctx.config.nasmac + ':' + ctx.ssid,
 			calling_station: ctx.format_mac,
 			nas_ip: ctx.env.SERVER_ADDR,
-			nas_id: ctx.config.nasid
+			nas_id: ctx.config.nasid,
 		};
 
+		if (ctx.config.location_name)
+			payload.location_name = ctx.config.location_name;
 		if (ctx.config.auth_proxy)
 			payload.auth_proxy = ctx.config.auth_proxy;
 		if (ctx.config.acct_proxy)
