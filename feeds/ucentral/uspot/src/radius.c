@@ -44,6 +44,7 @@ enum {
 	RADIUS_SERVICE_TYPE,
 	RADIUS_PROXY_STATE_ACCT,
 	RADIUS_PROXY_STATE_AUTH,
+	RADIUS_LOCATION_NAME,
 	__RADIUS_MAX,
 };
 
@@ -75,6 +76,7 @@ static const struct blobmsg_policy radius_policy[__RADIUS_MAX] = {
 	[RADIUS_SERVICE_TYPE] = { .name = "service_type", .type = BLOBMSG_TYPE_INT32 },
 	[RADIUS_PROXY_STATE_AUTH] = { .name = "auth_proxy", .type = BLOBMSG_TYPE_STRING },
 	[RADIUS_PROXY_STATE_ACCT] = { .name = "acct_proxy", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_LOCATION_NAME] = { .name = "location_name", .type = BLOBMSG_TYPE_STRING },
 };
 
 static struct blob_buf b = {};
@@ -85,6 +87,7 @@ static int cb_chap_passwd(void * p, size_t s, struct blob_attr *b);
 static int cb_chap_challenge(void * p, size_t s, struct blob_attr *b);
 
 #define VENDORSPEC_WBAL			14122
+#define ATTR_WBAL_WISPR_LOCATION_NAME	2
 #define ATTR_WBAL_WISPR_LOGOFF_URL	3
 
 /** Internal keys to radcli association table */
@@ -122,6 +125,7 @@ static const struct {
 	[RADIUS_SERVICE_TYPE] = { .attrid = PW_SERVICE_TYPE, },
 	[RADIUS_PROXY_STATE_AUTH] = { .attrid = PW_PROXY_STATE, },
 	[RADIUS_PROXY_STATE_ACCT] = { .attrid = PW_PROXY_STATE, },
+	[RADIUS_LOCATION_NAME] = { .attrid = ATTR_WBAL_WISPR_LOCATION_NAME, .vendorspec = VENDORSPEC_WBAL, },
 };
 
 /**

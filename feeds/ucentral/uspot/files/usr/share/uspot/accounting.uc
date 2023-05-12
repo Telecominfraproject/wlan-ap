@@ -62,7 +62,7 @@ function radius_available(interface,mac) {
 }
 
 function radius_init(interface, mac, payload) {
-	for (let key in [ 'server', 'acct_server', 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_id', 'username' ])
+	for (let key in [ 'server', 'acct_server', 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_id', 'username', 'location_name' ])
 		if (clients[interface][mac].radius[key])
 			payload[key] = clients[interface][mac].radius[key];
 
