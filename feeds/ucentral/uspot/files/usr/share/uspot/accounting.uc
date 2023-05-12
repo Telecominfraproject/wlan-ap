@@ -41,7 +41,7 @@ function syslog(interface, mac, msg) {
 }
 
 function debug(interface, mac, msg) {
-	if (config[interface].debug)
+	if (+config[interface].debug)
 		syslog(interface, mac, msg);
 }
 
