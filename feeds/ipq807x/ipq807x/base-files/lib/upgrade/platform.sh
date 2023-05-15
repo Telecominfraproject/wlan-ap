@@ -119,6 +119,8 @@ platform_check_image() {
 	cig,wf194c4|\
 	cig,wf196|\
 	cybertan,eww622-a1|\
+	cybertan,eww631-a1|\
+	cybertan,eww631-b1|\
 	glinet,ax1800|\
 	glinet,axt1800|\
 	indio,um-310ax-v1|\
@@ -177,6 +179,8 @@ platform_do_upgrade() {
 	cig,wf194c4|\
 	cig,wf196|\
 	cybertan,eww622-a1|\
+	cybertan,eww631-a1|\
+	cybertan,eww631-b1|\
 	glinet,ax1800|\
 	glinet,axt1800|\
 	indio,um-310ax-v1|\
