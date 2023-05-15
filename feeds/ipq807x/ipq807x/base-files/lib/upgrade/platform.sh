@@ -5,19 +5,19 @@ RAMFS_COPY_BIN='fw_setenv'
 RAMFS_COPY_DATA='/etc/fw_env.config /var/lock/fw_printenv.lock /tmp/downgrade'
 
 qca_do_upgrade() {
-        local tar_file="$1"
+	local tar_file="$1"
 
-        local board_dir=$(tar tf $tar_file | grep -m 1 '^sysupgrade-.*/$')
-        board_dir=${board_dir%/}
+	local board_dir=$(tar tf $tar_file | grep -m 1 '^sysupgrade-.*/$')
+	board_dir=${board_dir%/}
 	local dev=$(find_mtd_chardev "0:HLOS")
 
-        tar Oxf $tar_file ${board_dir}/kernel | mtd write - ${dev}
+	tar Oxf $tar_file ${board_dir}/kernel | mtd write - ${dev}
 
-        if [ -n "$UPGRADE_BACKUP" ]; then
-                tar Oxf $tar_file ${board_dir}/root | mtd -j "$UPGRADE_BACKUP" write - rootfs
-        else
-                tar Oxf $tar_file ${board_dir}/root | mtd write - rootfs
-        fi
+	if [ -n "$UPGRADE_BACKUP" ]; then
+		tar Oxf $tar_file ${board_dir}/root | mtd -j "$UPGRADE_BACKUP" write - rootfs
+	else
+		tar Oxf $tar_file ${board_dir}/root | mtd write - rootfs
+	fi
 }
 
 find_mmc_part() {
@@ -38,6 +38,8 @@ do_flash_emmc() {
 	local emmcblock=$(find_mmc_part $2)
 	local board_dir=$3
 	local part=$4
+	
+	[ -b "$emmcblock" ] || emmcblock=$(find_mmc_part $2)
 
 	[ -z "$emmcblock" ] && {
 		echo failed to find $2
@@ -50,21 +52,46 @@ do_flash_emmc() {
 	tar Oxf $tar_file ${board_dir}/$part | dd of=${emmcblock}
 }
 
-emmc_do_upgrade_cig() {
-        local tar_file="$1"
+emmc_do_upgrade_bootconfig() {
+	local tar_file="$1"
 
-        local board_dir=$(tar tf $tar_file | grep -m 1 '^sysupgrade-.*/$')
-        board_dir=${board_dir%/}
-	
-        do_flash_emmc $tar_file '0:HLOS_1' $board_dir kernel
-        do_flash_emmc $tar_file 'rootfs_1' $board_dir root
+	local board_dir=$(tar tf $tar_file | grep -m 1 '^sysupgrade-.*/$')
+	board_dir=${board_dir%/}
+	mount -t proc proc /proc
+	[ -f /proc/boot_info/getbinary_bootconfig ] || {
+		echo "bootconfig does not exist"
+		exit
+	}
+	CI_ROOTPART="$(cat /proc/boot_info/rootfs/upgradepartition)"
+	CI_KERNPART="$(cat /proc/boot_info/0:HLOS/upgradepartition)"
 
-        local emmcblock="$(find_mmc_part "rootfs_data")"
-        if [ -e "$emmcblock" ]; then
-                mkfs.ext4 -F "$emmcblock"
-        fi
+	[ -n "$CI_KERNPART" -a -n "$CI_ROOTPART" ] || {
+		echo "kernel or rootfs partition is unknown"
+		exit
+	}
+
+	local primary="0"
+	[ "$(cat /proc/boot_info/rootfs/primaryboot)" = "0" ] && primary="1"
+	echo "$primary" > /proc/boot_info/rootfs/primaryboot 2>/dev/null
+	echo "$primary" > /proc/boot_info/0:HLOS/primaryboot 2>/dev/null
+	cp /proc/boot_info/getbinary_bootconfig /tmp/bootconfig
+
+	do_flash_emmc $tar_file $CI_KERNPART $board_dir kernel
+	do_flash_emmc $tar_file $CI_ROOTPART $board_dir root
+
+	local emmcblock="$(find_mmc_part "rootfs_data")"
+	if [ -e "$emmcblock" ]; then
+		mkfs.ext4 -F "$emmcblock"
+	fi
+
+	for part in "0:BOOTCONFIG" "0:BOOTCONFIG1"; do
+		local emmcblock=$(find_mmc_part $part)
+		echo erase ${emmcblock}
+		dd if=/dev/zero of=${emmcblock} 2> /dev/null
+		echo update $emmcblock
+		dd if=/tmp/bootconfig of=${emmcblock} 2> /dev/null
+	done
 }
-
 
 emmc_do_upgrade() {
 	local tar_file="$1"
@@ -75,9 +102,9 @@ emmc_do_upgrade() {
 	do_flash_emmc $tar_file 'rootfs' $board_dir root
 
 	local emmcblock="$(find_mmc_part "rootfs_data")"
-        if [ -e "$emmcblock" ]; then
-                mkfs.ext4 -F "$emmcblock"
-        fi
+	if [ -e "$emmcblock" ]; then
+		mkfs.ext4 -F "$emmcblock"
+	fi
 }
 
 platform_check_image() {
@@ -139,7 +166,7 @@ platform_do_upgrade() {
 		qca_do_upgrade $1
 		;;
 	cig,wf660a)
-		emmc_do_upgrade_cig $1
+		emmc_do_upgrade_bootconfig $1
 		;;
 	motorola,q14)
 		emmc_do_upgrade $1
@@ -185,16 +212,16 @@ platform_do_upgrade() {
 		wp_part=$(fw_printenv primary | cut  -d = -f2)
 		echo "Current Primary is $wp_part"
 		if [[ $wp_part == 1 ]]; then
-                        CI_UBIPART="rootfs"
+			CI_UBIPART="rootfs"
 			echo "Setting Primary 0 and Flashing"
-                        fw_setenv primary 0 || exit 1
-                else
-                        CI_UBIPART="rootfs_1"
+			fw_setenv primary 0 || exit 1
+		else
+			CI_UBIPART="rootfs_1"
 			echo "Setting Primary 1 and Flashing"
-                        fw_setenv primary 1 || exit 1
-                fi
-                nand_upgrade_tar "$1"
-                ;;
+			fw_setenv primary 1 || exit 1
+		fi
+		nand_upgrade_tar "$1"
+		;;
 	edgecore,eap104|\
 	liteon,wpx8324|\
 	edgecore,eap106)
