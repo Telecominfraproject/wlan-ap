@@ -18,6 +18,24 @@ define Device/cybertan_eww622_a1
 endef
 TARGET_DEVICES += cybertan_eww622_a1
 
+define Device/cybertan_eww631_a1
+  DEVICE_TITLE := CyberTan EWW631-A1
+  DEVICE_DTS := qcom-ipq5018-eww631-a1
+  SUPPORTED_DEVICES := cybertan,eww631-a1
+  DEVICE_PACKAGES := ath11k-wifi-cybertan-eww631-a1 ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.5-c1
+endef
+TARGET_DEVICES += cybertan_eww631_a1
+
+define Device/cybertan_eww631_b1
+  DEVICE_TITLE := CyberTan EWW631-B1
+  DEVICE_DTS := qcom-ipq5018-eww631-b1
+  SUPPORTED_DEVICES := cybertan,eww631-b1
+  DEVICE_PACKAGES := ath11k-wifi-cybertan-eww631-b1 ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp02.1
+endef
+TARGET_DEVICES += cybertan_eww631_b1
+
 define Device/edgecore_eap104
   DEVICE_TITLE := EdgeCore EAP104
   DEVICE_DTS := qcom-ipq5018-eap104
