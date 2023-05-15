@@ -242,11 +242,12 @@ radius(void)
 		rc_add_config(rh, "authserver", blobmsg_get_string(tb[RADIUS_SERVER]), "code", __LINE__);
 	if (tb[RADIUS_ACCT_SERVER])
 		rc_add_config(rh, "acctserver", blobmsg_get_string(tb[RADIUS_ACCT_SERVER]), "code", __LINE__);
-	rc_add_config(rh, "servers", "/tmp/radius.servers", "code", __LINE__);
 	rc_add_config(rh, "dictionary", "/etc/radcli/dictionary", "code", __LINE__);
 	rc_add_config(rh, "radius_timeout", "5", "code", __LINE__);
 	rc_add_config(rh, "radius_retries", "1", "code", __LINE__);
 	rc_add_config(rh, "bindaddr", "*", "code", __LINE__);
+	if (rc_apply_config(rh) != 0)
+		goto fail;
 
 	if (rc_read_dictionary(rh, rc_conf_str(rh, "dictionary")) != 0)
 		goto fail;
