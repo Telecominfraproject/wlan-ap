@@ -262,6 +262,7 @@ radius(void)
 			case RADIUS_PROXY_STATE_AUTH:
 				continue;	// ignore those keys
 			default:
+				break;
 		}
 
 		if (!tb[i])
