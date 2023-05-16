@@ -215,6 +215,21 @@ function run_service() {
 			},
 			args: {}
 		},
+		add_device: {   
+			call: function(req) {                   
+				if (!req.args.device || !req.args.vlan)
+					return ubus.STATUS_INVALID_ARGUMENT;
+				if (!vlan_config[req.args.device])
+					vlan_config[req.args.device] = [];
+				push(vlan_config[req.args.device], [ req.args.vlan, "rx", "tx"]);
+				vlan_set_config(vlan_config);
+				return 0;                           
+			},                           
+			args: {                     
+				"device": "wlan0",
+				"vlan": 100,               
+			}                                                                       
+		}, 
 		reset: {
 			call: function(req) {
 				let old_config = vlan_config;
