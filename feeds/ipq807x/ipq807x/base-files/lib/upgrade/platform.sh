@@ -57,7 +57,6 @@ emmc_do_upgrade_bootconfig() {
 
 	local board_dir=$(tar tf $tar_file | grep -m 1 '^sysupgrade-.*/$')
 	board_dir=${board_dir%/}
-	mount -t proc proc /proc
 	[ -f /proc/boot_info/getbinary_bootconfig ] || {
 		echo "bootconfig does not exist"
 		exit
