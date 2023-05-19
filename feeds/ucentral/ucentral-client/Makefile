@@ -4,10 +4,10 @@ PKG_NAME:=ucentral-client
 PKG_RELEASE:=1
 
 PKG_SOURCE_URL=https://github.com/Telecominfraproject/wlan-ucentral-client.git
-PKG_MIRROR_HASH:=7363b8d2cf240e875536af71e84d16eb75e62ac9cb82b090676346e505ab5dab
+PKG_MIRROR_HASH:=37f823eb235b84cfa5c1bc12fa471ce3b6330831f17fb25fe5fbdf3a2fc1aa7a
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2022-06-22
-PKG_SOURCE_VERSION:=cb5030f5ade75a45f6d165c740bc1b4f379be7a4
+PKG_SOURCE_VERSION:=ffd9d6f8fa2e4a4118d0b00b5d6ecb5aa09026ed
 
 PKG_LICENSE:=BSD-3-Clause
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
