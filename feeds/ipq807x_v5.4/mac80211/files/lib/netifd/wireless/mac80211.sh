@@ -533,7 +533,7 @@ mac80211_generate_mac() {
 	local ref="$(cat /sys/class/ieee80211/${phy}/macaddress)"
 	local mask="$(cat /sys/class/ieee80211/${phy}/address_mask)"
 
-	[ "$mask" = "00:00:00:00:00:00" ] && {
+	[ "$mask" = "00:00:00:00:00:00" -a "$multiple_bssid" != 1 ] && {
 		mask="ff:ff:ff:ff:ff:ff";
 
 		[ "$(wc -l < /sys/class/ieee80211/${phy}/addresses)" -gt $id ] && {
@@ -1063,7 +1063,7 @@ drv_mac80211_setup() {
 		return 1
 	}
 	
-	[ "$band" = "6g" ] && multiple_bssid=1
+	[ "$band" = "6g" ] && set_default multiple_bssid 1
 
 	wireless_set_data phy="$phy"
 	[ -z "$(uci -q -P /var/state show wireless._${phy})" ] && uci -q -P /var/state set wireless._${phy}=phy

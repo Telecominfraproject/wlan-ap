@@ -21,8 +21,7 @@ ifdef CONFIG_PACKAGE_MAC80211_DEBUGFS
 	CARL9170_DEBUGFS \
 	ATH11K_DEBUG \
 	ATH5K_DEBUG \
-	ATH6KL_DEBUG \
-	ATH11K_PKTLOG
+	ATH6KL_DEBUG
 endif
 
 ifdef CONFIG_PACKAGE_MAC80211_TRACING
@@ -57,7 +56,7 @@ config-$(CONFIG_ATH10K_THERMAL) += ATH10K_THERMAL
 
 config-$(call config_package,ath9k-htc) += ATH9K_HTC
 config-$(call config_package,ath10k) += ATH10K ATH10K_PCI
-config-$(call config_package,ath11k) += ATH11K ATH11K_AHB ATH11K_SPECTRAL ATH11K_DEBUG ATH11K_CFR
+config-$(call config_package,ath11k) += ATH11K ATH11K_AHB ATH11K_SPECTRAL ATH11K_DEBUG
 config-$(call config_package,ath11k-pci) += ATH11K_PCI
 
 #ifeq ($(CONFIG_KERNEL_IPQ_MEM_PROFILE),512)
@@ -283,8 +282,8 @@ define KernelPackage/ath11k
   $(call KernelPackage/mac80211/Default)
   TITLE:=Atheros 802.11ax wireless cards support
   URL:=https://wireless.wiki.kernel.org/en/users/drivers/ath11k
-  DEPENDS+= @TARGET_ipq807x||TARGET_ipq60xx||TARGET_ipq50xx +kmod-ath +@DRIVER_11N_SUPPORT +@DRIVER_11AC_SUPPORT +@DRIVER_11W_SUPPORT \
-  	+@DRIVER_11AX_SUPPORT +kmod-qca-nss-drv +HWMON:kmod-hwmon-core
+  DEPENDS+= @TARGET_ipq60xx +kmod-ath +@DRIVER_11N_SUPPORT +@DRIVER_11AC_SUPPORT +@DRIVER_11W_SUPPORT \
+  	+@DRIVER_11AX_SUPPORT +kmod-qca-nss-drv
   FILES:= \
 	$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath11k/ath11k.ko
 endef

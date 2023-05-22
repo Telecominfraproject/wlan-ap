@@ -20,6 +20,13 @@ $(Package/ath11k-firmware-default)
   DEPENDS:=@TARGET_ipq50xx
 endef
 
+
+define Package/ath11k-firmware-ipq50xx-map-spruce
+$(Package/ath11k-firmware-default)
+  TITLE:=ath11k firmware for IPQ50xx+spruce devices
+  DEPENDS:=@TARGET_ipq50xx
+endef
+
 define Package/ath11k-firmware-ipq50xx-spruce
 $(Package/ath11k-firmware-default)
   TITLE:=ath11k firmware for IPQ50xx devices with spruce
@@ -47,11 +54,16 @@ endef
 define Package/ath11k-firmware-qcn9000
 $(Package/ath11k-firmware-default)
   TITLE:=ath11k firmware for QCN9000 devices
-  DEPENDS:=@TARGET_ipq807x||TARGET_ipq60xx
+  DEPENDS:=@TARGET_ipq807x||TARGET_ipq50xx||TARGET_ipq60xx
 endef
 
 define Package/ath11k-firmware-ipq50xx/description
 Standard ath11k firmware for IPQ50xx from QCA
+endef
+
+
+define Package/ath11k-firmware-ipq50xx-map-spruce/description
+Standard ath11k firmware for IPQ50xx+spruce from QCA
 endef
 
 define Package/ath11k-firmware-ipq50xx-spruce/description
@@ -82,6 +94,18 @@ define Package/ath11k-firmware-ipq50xx/install
 	$(INSTALL_DIR) $(1)/lib/firmware/IPQ5018
 	$(INSTALL_DATA) ./files/IPQ5018/* \
 		$(1)/lib/firmware/IPQ5018/
+endef
+
+
+define Package/ath11k-firmware-ipq50xx-map-spruce/install
+	$(INSTALL_DIR) $(1)/lib/firmware/IPQ5018
+	$(INSTALL_DATA) ./files/IPQ5018_map_spruce/* \
+		$(1)/lib/firmware/IPQ5018/
+
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122
+	$(INSTALL_DIR) $(1)/lib/firmware/qcn6122
+	$(INSTALL_DATA) ./files/QCN6122_map_spruce/* \
+		$(1)/lib/firmware/qcn6122/
 endef
 
 define Package/ath11k-firmware-ipq50xx-spruce/install
@@ -115,7 +139,13 @@ define Package/ath11k-firmware-qcn9000/install
 		$(1)/lib/firmware/ath11k/QCN9074/hw1.0/
 endef
 
+define Package/ath11k-wifi-yuncore-ax840/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-2.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
+endef
+
 $(eval $(call BuildPackage,ath11k-firmware-ipq50xx))
+$(eval $(call BuildPackage,ath11k-firmware-ipq50xx-map-spruce))
 $(eval $(call BuildPackage,ath11k-firmware-ipq50xx-spruce))
 $(eval $(call BuildPackage,ath11k-firmware-ipq60xx))
 $(eval $(call BuildPackage,ath11k-firmware-ipq807x))
