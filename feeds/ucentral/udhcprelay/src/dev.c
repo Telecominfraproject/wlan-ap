@@ -111,13 +111,14 @@ dhcprelay_add_filter(struct device *dev, int prio, const char *match_string)
 	ofs = prepare_filter_cmd(buf, sizeof(buf), ifname, prio++, true);
 	APPEND(buf, ofs,
 	       " %s flowid 1:1 action pedit ex munge eth dst set ff:ff:%02x:%02x:%02x:%02x pipe"
-	       " action mirred ingress %s dev " DHCPRELAY_IFB_NAME,
+	       " action mirred ingress %s dev " DHCPRELAY_IFB_NAME "%s",
 	       match_string,
 	       (uint8_t)(ifindex >> 24),
 	       (uint8_t)(ifindex >> 16),
 	       (uint8_t)(ifindex >> 8),
 	       (uint8_t)(ifindex),
-		   dev->upstream ? "mirror" : "redirect");
+		   dev->upstream ? "mirror" : "redirect",
+		   dev->upstream ? " continue" : "");
 	dhcprelay_run_cmd(buf, false);
 }
 
