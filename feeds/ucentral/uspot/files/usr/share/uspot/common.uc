@@ -167,15 +167,34 @@ return {
 			include('redir.uc', { redir_location: ctx.query_string.userurl });
 		else
 			include('allow.uc', ctx);
-		//data.radius.reply['WISPr-Bandwidth-Max-Up'] = "20000000";
-		//data.radius.reply['WISPr-Bandwidth-Max-Down'] = "10000000";
-		if (data?.radius?.reply && (+data.radius.reply['WISPr-Bandwidth-Max-Up'] && +data.radius.reply['WISPr-Bandwidth-Max-Down']))
-			ctx.ubus.call('ratelimit', 'client_set', {
-				device: ctx.device,
-				address: ctx.mac,
-				rate_egress: sprintf('%s', data.radius.reply['WISPr-Bandwidth-Max-Down']),
-				rate_ingress: sprintf('%s', data.radius.reply['WISPr-Bandwidth-Max-Up']),
-			 });
+
+		this.ratelimit_client(ctx, data);
+	},
+
+	// ratelimit a client from radius reply attributes
+	ratelimit_client: function(ctx, data) {
+		if (!(data?.radius?.reply))
+			return;
+
+		let reply = data.radius.reply;
+
+		// check known attributes - WISPr: bps, ChiliSpot: kbps
+		let maxup = reply['WISPr-Bandwidth-Max-Up'] || reply['ChilliSpot-Bandwidth-Max-Up']*1000;
+		let maxdown = reply['WISPr-Bandwidth-Max-Down'] || reply['ChilliSpot-Bandwidth-Max-Down']*1000;
+
+		if (!(+maxdown || +maxup))
+			return;
+
+		let args = {
+			device: ctx.device,
+			address: ctx.mac,
+		};
+		if (+maxdown)
+			args.rate_egress = sprintf('%s', maxdown);
+		if (+maxup)
+			args.rate_ingress = sprintf('%s', maxup);
+
+		ctx.ubus.call('ratelimit', 'client_set', args);
 	},
 
 	// put a client back into pre-auth state
