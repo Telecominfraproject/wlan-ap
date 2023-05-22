@@ -16,6 +16,10 @@ define Package/udhcpsnoop
   DEPENDS:=+libubox +libubus +kmod-ifb +tc
 endef
 
+define Package/udhcpsnoop/conffiles
+/etc/config/dhcpsnoop
+endef
+
 define Package/udhcpsnoop/install
 	$(INSTALL_DIR) \
 		$(1)/usr/sbin \
