@@ -3,7 +3,7 @@
 'use strict';
 
 push(REQUIRE_SEARCH_PATH, "/usr/share/uspot/*.uc");
-let portal = require('common');
+let portal = require('portal');
 
 // delegate an initial connection to the correct handler
 function request_start(ctx) {

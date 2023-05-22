@@ -4,7 +4,7 @@
 
 push(REQUIRE_SEARCH_PATH, "/usr/share/uspot/*.uc");
 
-let portal = require('common');
+let portal = require('portal');
 let uam = require('uam');
 
 // log the client in via radius
