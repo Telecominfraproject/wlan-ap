@@ -88,6 +88,8 @@ function radius_stop(interface, mac, payload, remove) {
 	if (!radius_available(interface, mac))
 		return;
 	debug(interface, mac, 'stopping accounting');
+	payload.interface = interface;
+	payload.address = mac;
 	ubus.call('spotfilter', remove ? 'client_remove' : 'client_set', payload);
 	system('conntrack -D -s ' + clients[interface][mac].ip4addr  + ' -m 2');
 	if (clients[interface][mac].accounting)
@@ -203,17 +205,12 @@ function client_add(interface, mac, state) {
 
 function client_remove(interface, mac, reason) {
 	syslog(interface, mac, reason);
-	radius_stop(interface, mac, {
-		interface,
-		address: mac
-	}, true);
+	radius_stop(interface, mac, {}, true);
 }
 
 function client_flush(interface, mac) {
 	syslog(interface, mac, 'logoff event');
 	radius_stop(interface, mac, {
-		interface,
-		address: mac,
 		state: 0,
 		dns_state: 1,
 		accounting: [],
@@ -224,10 +221,8 @@ function client_flush(interface, mac) {
 function client_timeout(interface, mac, reason) {
 	syslog(interface, mac, reason);
 	radius_stop(interface, mac, {
-		interface,
 		state: 0,
 		dns_state: 1,
-		address: mac,
 		accounting: [],
 		flush: true,
 	});
