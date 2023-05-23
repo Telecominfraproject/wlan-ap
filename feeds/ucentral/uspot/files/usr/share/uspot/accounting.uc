@@ -17,7 +17,7 @@ if (!config) {
 }
 
 function acct_interval(interface) {
-	return config[interface]?.acct_interval || 600;
+	return config[interface].acct_interval || 600;
 }
 
 function idle_timeout(interface) {
@@ -66,7 +66,7 @@ function radius_init(interface, mac, payload) {
 		if (clients[interface][mac].radius[key])
 			payload[key] = clients[interface][mac].radius[key];
 
-	if (config[interface]?.acct_proxy)
+	if (config[interface].acct_proxy)
 		payload.acct_proxy = config[interface].acct_proxy;
 
 	return payload;
@@ -177,7 +177,7 @@ function client_add(interface, mac, state) {
 	if (state.state != 1)
 		return;
 
-	let accounting = (config[interface]?.acct_server && config[interface]?.acct_secret);
+	let accounting = (config[interface].acct_server && config[interface].acct_secret);
 	let interval = (state.data?.radius?.reply['Acct-Interim-Interval'] || acct_interval(interface)) * 1000;
 	let session = (state.data?.radius?.reply['Session-Timeout'] || session_timeout(interface));
 	let idle = (state.data?.radius?.reply['Idle-Timeout'] || idle_timeout(interface));
