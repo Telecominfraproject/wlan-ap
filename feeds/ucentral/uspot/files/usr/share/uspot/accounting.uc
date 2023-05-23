@@ -33,10 +33,6 @@ function debug(interface, mac, msg) {
 		syslog(interface, mac, msg);
 }
 
-function radius_available(interface,mac) {
-	return !!clients[interface][mac]?.radius;
-}
-
 function radius_init(interface, mac, payload) {
 	for (let key in [ 'server', 'acct_server', 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_id', 'username', 'location_name' ])
 		if (clients[interface][mac].radius[key])
@@ -65,9 +61,8 @@ function radius_acct(interface, mac, payload) {
 		interface,
 		address: mac
 	});
-	if (!state) {
-		return false;
-	}
+	if (!state)
+		return;
 
 	payload = radius_init(interface, mac, payload);
 	payload.acct = true;
@@ -82,7 +77,6 @@ function radius_acct(interface, mac, payload) {
 		payload.class = state.data.radius.reply.Class;
 
 	radius_call(interface, mac, payload);
-	return true;
 }
 
 // RADIUS Acct-Terminate-Cause attributes
@@ -106,15 +100,12 @@ function radius_terminate(interface, mac, cause) {
 }
 
 function radius_interim(interface, mac) {
-	if (!radius_available(interface, mac))
-		return;
+	const acct_type_interim = 3;
 	let payload = {
-		acct_type: 3,
+		acct_type: acct_type_interim,
 	};
-	if (radius_acct(interface, mac, payload))
-		debug(interface, mac, 'iterim acct call');
-	else
-		syslog(interface, mac, 'failed to send interim accounting frame\n');
+	radius_acct(interface, mac, payload);
+	debug(interface, mac, 'iterim acct call');
 	clients[interface][mac].timeout.set(clients[interface][mac].interval);
 }
 
@@ -148,11 +139,12 @@ function client_add(interface, mac, state) {
 		clients[interface][mac].ip4addr = state.ip4addr;
 	if (state.ip6addr)
 		clients[interface][mac].ip6addr = state.ip6addr;
-	if (state.data?.radius?.request)
+	if (state.data?.radius?.request) {
 		clients[interface][mac].radius = state.data.radius.request;
+		if (accounting)
+			clients[interface][mac].timeout = uloop.timer(interval, () => radius_interim(interface, mac));
+	}
 	syslog(interface, mac, 'adding client');
-	if (accounting)
-		clients[interface][mac].timeout = uloop.timer(interval, () => radius_interim(interface, mac));
 }
 
 function client_kick(interface, mac, remove) {
