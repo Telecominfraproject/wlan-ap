@@ -208,17 +208,7 @@ function client_remove(interface, mac, reason) {
 	radius_stop(interface, mac, {}, true);
 }
 
-function client_flush(interface, mac) {
-	syslog(interface, mac, 'logoff event');
-	radius_stop(interface, mac, {
-		state: 0,
-		dns_state: 1,
-		accounting: [],
-		flush: true
-	});
-}
-
-function client_timeout(interface, mac, reason) {
+function client_flush(interface, mac, reason) {
 	syslog(interface, mac, reason);
 	radius_stop(interface, mac, {
 		state: 0,
@@ -240,7 +230,7 @@ function accounting(interface) {
 	for (let k, v in clients[interface]) {
 		if (list[k].data?.logoff) {
 			radius_logoff(interface, k);
-			client_flush(interface, k);
+			client_flush(interface, k, 'logoff event');
 			continue;
 		}
 
@@ -260,14 +250,14 @@ function accounting(interface) {
 		if (timeout && ((t - list[k].data.connect) > timeout)) {
 			if (clients[interface][k])
 				radius_session_time(interface, k);
-			client_timeout(interface, k, 'session timeout');
+			client_flush(interface, k, 'session timeout');
 			continue;
 		}
 		if (clients[interface][k].max_total) {
 			let total = list[k].bytes_ul + list[k].bytes_dl;
 			if (total >= clients[interface][k].max_total) {
 				radius_session_time(interface, k);
-				client_timeout(interface, k, 'max octets reached');
+				client_flush(interface, k, 'max octets reached');
 			}
 		}
 	}
