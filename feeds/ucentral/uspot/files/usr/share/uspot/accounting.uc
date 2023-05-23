@@ -16,18 +16,6 @@ if (!config) {
 	exit(1);
 }
 
-function acct_interval(interface) {
-	return config[interface].acct_interval || 600;
-}
-
-function idle_timeout(interface) {
-	return config[interface].idle_timeout || 600;
-}
-
-function session_timeout(interface) {
-	return config[interface].session_timeout || 0;
-}
-
 uci.foreach('uspot', 'uspot', (d) => {
 	if (!d[".anonymous"])
 		clients[d[".name"]] = {};
@@ -154,10 +142,19 @@ function client_add(interface, mac, state) {
 	if (state.state != 1)
 		return;
 
+	let defval = 0;
+
 	let accounting = (config[interface].acct_server && config[interface].acct_secret);
-	let interval = (state.data?.radius?.reply['Acct-Interim-Interval'] || acct_interval(interface)) * 1000;
-	let session = (state.data?.radius?.reply['Session-Timeout'] || session_timeout(interface));
-	let idle = (state.data?.radius?.reply['Idle-Timeout'] || idle_timeout(interface));
+
+	defval = config[interface].acct_interval || 600;
+	let interval = (state.data?.radius?.reply['Acct-Interim-Interval'] || defval) * 1000;
+
+	defval = config[interface].session_timeout || 0;
+	let session = (state.data?.radius?.reply['Session-Timeout'] || defval);
+
+	defval = config[interface].idle_timeout || 600;
+	let idle = (state.data?.radius?.reply['Idle-Timeout'] || defval);
+
 	let max_total = (state.data?.radius?.reply['ChilliSpot-Max-Total-Octets'] || 0);
 
 	clients[interface][mac] = {
