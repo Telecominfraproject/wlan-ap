@@ -84,19 +84,6 @@ function radius_call(interface, mac, payload) {
 		fs.unlink(path);
 }
 
-function radius_stop(interface, mac, payload, remove) {
-	if (!radius_available(interface, mac))
-		return;
-	debug(interface, mac, 'stopping accounting');
-	payload.interface = interface;
-	payload.address = mac;
-	ubus.call('spotfilter', remove ? 'client_remove' : 'client_set', payload);
-	system('conntrack -D -s ' + clients[interface][mac].ip4addr  + ' -m 2');
-	if (clients[interface][mac].accounting)
-		clients[interface][mac].timeout.cancel();
-	delete clients[interface][mac];
-}
-
 function radius_acct(interface, mac, payload) {
 	let state = ubus.call('spotfilter', 'client_get', {
 		interface,
@@ -203,19 +190,35 @@ function client_add(interface, mac, state) {
 		clients[interface][mac].timeout = uloop.timer(interval, () => radius_interim(interface, mac));
 }
 
+function client_kick(interface, mac, remove) {
+	debug(interface, mac, 'stopping accounting');
+	let payload = {
+		interface,
+		address: mac,
+		...(remove ? {} : {
+			state: 0,
+			dns_state: 1,
+			accounting: [],
+			flush: true,
+		}),
+	};
+
+	ubus.call('spotfilter', remove ? 'client_remove' : 'client_set', payload);
+	system('conntrack -D -s ' + clients[interface][mac].ip4addr  + ' -m 2');
+
+	if (clients[interface][mac].accounting)
+		clients[interface][mac].timeout.cancel();
+	delete clients[interface][mac];
+}
+
 function client_remove(interface, mac, reason) {
 	syslog(interface, mac, reason);
-	radius_stop(interface, mac, {}, true);
+	client_kick(interface, mac, true);
 }
 
 function client_flush(interface, mac, reason) {
 	syslog(interface, mac, reason);
-	radius_stop(interface, mac, {
-		state: 0,
-		dns_state: 1,
-		accounting: [],
-		flush: true,
-	});
+	client_kick(interface, mac, false);
 }
 
 
