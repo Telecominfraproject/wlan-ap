@@ -308,17 +308,13 @@ radius(void)
 			if (rc_avpair_add(rh, &send, PW_PROXY_STATE, blobmsg_get_string(tb[RADIUS_PROXY_STATE_ACCT]), -1, 0) == NULL)
 				goto fail;
 		}
+		if (rc_acct(rh, 0, send) == OK_RC)
+			return result(rh, 1, NULL);
 	} else {
 		if (tb[RADIUS_PROXY_STATE_AUTH]) {
 			if (rc_avpair_add(rh, &send, PW_PROXY_STATE, blobmsg_get_string(tb[RADIUS_PROXY_STATE_AUTH]), -1, 0) == NULL)
 				goto fail;
 		}
-	}
-
-	if (tb[RADIUS_ACCT] && blobmsg_get_bool(tb[RADIUS_ACCT])) {
-		if (rc_acct(rh, 0, send) == OK_RC)
-			return result(rh, 1, NULL);
-	} else {
 		if (rc_auth(rh, 0, send, &received, NULL) == OK_RC)
 			return result(rh, 1, received);
 	}
