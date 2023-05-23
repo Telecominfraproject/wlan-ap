@@ -189,7 +189,11 @@ function client_kick(interface, mac, remove) {
 	};
 
 	ubus.call('spotfilter', remove ? 'client_remove' : 'client_set', payload);
-	system('conntrack -D -s ' + clients[interface][mac].ip4addr  + ' -m 2');
+
+	if (clients[interface][mac].ip4addr)
+		system('conntrack -D -s ' + clients[interface][mac].ip4addr + ' -m 2');
+	if (clients[interface][mac].ip6addr)
+		system('conntrack -D -s ' + clients[interface][mac].ip6addr + ' -m 2');
 
 	if (clients[interface][mac].accounting)
 		clients[interface][mac].timeout.cancel();
