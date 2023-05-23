@@ -45,18 +45,6 @@ function debug(interface, mac, msg) {
 		syslog(interface, mac, msg);
 }
 
-function get_idle_timeout(interface, mac) {
-	if (clients[interface][mac])
-		return +clients[interface][mac].idle;
-	return idle_timeout(interface);
-}
-
-function get_session_timeout(interface, mac) {
-	if (clients[interface][mac]?.session)
-		return +clients[interface][mac].session;
-	return session_timeout(interface);
-}
-
 function radius_available(interface,mac) {
 	return !!clients[interface][mac]?.radius;
 }
@@ -243,12 +231,12 @@ function accounting(interface) {
 			continue;
 		}
 
-		if (list[mac].idle > get_idle_timeout(interface, mac)) {
+		if (+list[mac].idle > +clients[interface][mac].idle) {
 			radius_idle_time(interface, mac);
 			client_remove(interface, mac, 'idle event');
 			continue;
 		}
-		let timeout = get_session_timeout(interface, mac);
+		let timeout = +clients[interface][mac].session;
 		if (timeout && ((t - list[mac].data.connect) > timeout)) {
 			radius_session_time(interface, mac);
 			client_flush(interface, mac, 'session timeout');
