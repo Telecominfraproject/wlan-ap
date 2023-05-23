@@ -85,43 +85,23 @@ function radius_acct(interface, mac, payload) {
 	return true;
 }
 
-function radius_idle_time(interface, mac) {
-	if (!radius_available(interface, mac))
-		return;
-	let payload = {
-		acct_type: 2,
-		terminate_cause: 4,
-	};
-	radius_acct(interface, mac, payload);
-}
+// RADIUS Acct-Terminate-Cause attributes
+const radtc_logout = 1;		// User Logout
+const radtc_lostcarrier = 2;	// Lost Carrier
+const radtc_idleto = 4;		// Idle Timeout
+const radtc_sessionto = 5;	// Session Timeout
+const radtc_adminreset = 6;	// Admin Reset
 
-function radius_session_time(interface, mac) {
-	if (!radius_available(interface, mac))
+function radius_terminate(interface, mac, cause) {
+	if (!clients[interface][mac].radius)
 		return;
-	let payload = {
-		acct_type: 2,
-		terminate_cause: 5,
-	};
-	radius_acct(interface, mac, payload);
-}
 
-function radius_logoff(interface, mac) {
-	if (!radius_available(interface, mac))
-		return;
+	const acct_type_stop = 2;
 	let payload = {
-		acct_type: 2,
-		terminate_cause: 1,
+		acct_type: acct_type_stop,
+		terminate_cause: cause,
 	};
-	radius_acct(interface, mac, payload);
-}
-
-function radius_disconnect(interface, mac) {
-	if (!radius_available(interface, mac))
-		return;
-	let payload = {
-		acct_type: 2,
-		terminate_cause: 1,
-	};
+	debug(interface, mac, 'acct terminate: ' + cause);
 	radius_acct(interface, mac, payload);
 }
 
@@ -221,31 +201,31 @@ function accounting(interface) {
 
 	for (let mac in clients[interface]) {
 		if (!list[mac] || !list[mac].state) {
-			radius_disconnect(interface, mac);
+			radius_terminate(interface, mac, radtc_lostcarrier);
 			client_remove(interface, mac, 'disconnect event');
 			continue;
 		}
 
 		if (list[mac].data.logoff) {
-			radius_logoff(interface, mac);
+			radius_terminate(interface, mac, radtc_logout);
 			client_flush(interface, mac, 'logoff event');
 			continue;
 		}
 
 		if (+list[mac].idle > +clients[interface][mac].idle) {
-			radius_idle_time(interface, mac);
+			radius_terminate(interface, mac, radtc_idleto);
 			client_remove(interface, mac, 'idle event');
 			continue;
 		}
 		let timeout = +clients[interface][mac].session;
 		if (timeout && ((t - list[mac].data.connect) > timeout)) {
-			radius_session_time(interface, mac);
+			radius_terminate(interface, mac, radtc_sessionto);
 			client_flush(interface, mac, 'session timeout');
 			continue;
 		}
 		let maxtotal = +clients[interface][mac].max_total;
 		if (maxtotal && ((list[mac].bytes_ul + list[mac].bytes_dl) >= maxtotal)) {
-			radius_session_time(interface, mac);
+			radius_terminate(interface, mac, radtc_sessionto);
 			client_flush(interface, mac, 'max octets reached');
 		}
 	}
