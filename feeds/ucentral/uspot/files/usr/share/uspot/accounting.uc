@@ -226,41 +226,41 @@ function accounting(interface) {
 	let list = ubus.call('spotfilter', 'client_list', { interface });
 	let t = time();
 
-	for (let k, v in list)
-		if (!clients[interface][k])
-			client_add(interface, k, v);
+	for (let mac, payload in list)
+		if (!clients[interface][mac])
+			client_add(interface, mac, payload);
 
-	for (let k, v in clients[interface]) {
-		if (list[k].data?.logoff) {
-			radius_logoff(interface, k);
-			client_flush(interface, k, 'logoff event');
-			continue;
-		}
-
-		if (!list[k] || !list[k].state) {
-			radius_disconnect(interface, k);
-			client_remove(interface, k, 'disconnect event');
+	for (let mac in clients[interface]) {
+		if (list[mac].data?.logoff) {
+			radius_logoff(interface, mac);
+			client_flush(interface, mac, 'logoff event');
 			continue;
 		}
 
-		if (list[k].idle > get_idle_timeout(interface, k)) {
-			if (clients[interface][k])
-				radius_idle_time(interface, k);
-			client_remove(interface, k, 'idle event');
+		if (!list[mac] || !list[mac].state) {
+			radius_disconnect(interface, mac);
+			client_remove(interface, mac, 'disconnect event');
 			continue;
 		}
-		let timeout = get_session_timeout(interface, k);
-		if (timeout && ((t - list[k].data.connect) > timeout)) {
-			if (clients[interface][k])
-				radius_session_time(interface, k);
-			client_flush(interface, k, 'session timeout');
+
+		if (list[mac].idle > get_idle_timeout(interface, mac)) {
+			if (clients[interface][mac])
+				radius_idle_time(interface, mac);
+			client_remove(interface, mac, 'idle event');
 			continue;
 		}
-		if (clients[interface][k].max_total) {
-			let total = list[k].bytes_ul + list[k].bytes_dl;
-			if (total >= clients[interface][k].max_total) {
-				radius_session_time(interface, k);
-				client_flush(interface, k, 'max octets reached');
+		let timeout = get_session_timeout(interface, mac);
+		if (timeout && ((t - list[mac].data.connect) > timeout)) {
+			if (clients[interface][mac])
+				radius_session_time(interface, mac);
+			client_flush(interface, mac, 'session timeout');
+			continue;
+		}
+		if (clients[interface][mac].max_total) {
+			let total = list[mac].bytes_ul + list[mac].bytes_dl;
+			if (total >= clients[interface][mac].max_total) {
+				radius_session_time(interface, mac);
+				client_flush(interface, mac, 'max octets reached');
 			}
 		}
 	}
@@ -269,7 +269,7 @@ function accounting(interface) {
 uloop.init();
 
 uloop.timer(1000, function() {
-	for (let interface, v in clients)
+	for (let interface in clients)
 		accounting(interface); 
 	this.set(1000);
 });
