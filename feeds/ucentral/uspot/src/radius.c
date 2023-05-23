@@ -45,6 +45,7 @@ enum {
 	RADIUS_PROXY_STATE_ACCT,
 	RADIUS_PROXY_STATE_AUTH,
 	RADIUS_LOCATION_NAME,
+	RADIUS_NAS_PORT_TYPE,
 	__RADIUS_MAX,
 };
 
@@ -77,6 +78,7 @@ static const struct blobmsg_policy radius_policy[__RADIUS_MAX] = {
 	[RADIUS_PROXY_STATE_AUTH] = { .name = "auth_proxy", .type = BLOBMSG_TYPE_STRING },
 	[RADIUS_PROXY_STATE_ACCT] = { .name = "acct_proxy", .type = BLOBMSG_TYPE_STRING },
 	[RADIUS_LOCATION_NAME] = { .name = "location_name", .type = BLOBMSG_TYPE_STRING },
+	[RADIUS_NAS_PORT_TYPE] = { .name = "nas_port_type", .type = BLOBMSG_TYPE_INT32 },
 };
 
 static struct blob_buf b = {};
@@ -126,6 +128,7 @@ static const struct {
 	[RADIUS_PROXY_STATE_AUTH] = { .attrid = PW_PROXY_STATE, },
 	[RADIUS_PROXY_STATE_ACCT] = { .attrid = PW_PROXY_STATE, },
 	[RADIUS_LOCATION_NAME] = { .attrid = ATTR_WBAL_WISPR_LOCATION_NAME, .vendorspec = VENDORSPEC_WBAL, },
+	[RADIUS_NAS_PORT_TYPE] = { .attrid = PW_NAS_PORT_TYPE, },
 };
 
 /**
@@ -312,11 +315,6 @@ radius(void)
 		}
 	}
 
-	val = 19;
-	if (rc_avpair_add(rh, &send, PW_NAS_PORT_TYPE, &val, 4, 0) == NULL)
-		goto fail;
-
-	rc_apply_config(rh);
 	if (tb[RADIUS_ACCT] && blobmsg_get_bool(tb[RADIUS_ACCT])) {
 		if (rc_acct(rh, 0, send) == OK_RC)
 			return result(rh, 1, NULL);

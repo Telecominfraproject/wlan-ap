@@ -230,6 +230,7 @@ return {
 			calling_station: ctx.format_mac,
 			nas_ip: ctx.env.SERVER_ADDR,
 			nas_id: ctx.config.nasid,
+			nas_port_type: 19,	// wireless
 		};
 
 		if (ctx.config.location_name)
