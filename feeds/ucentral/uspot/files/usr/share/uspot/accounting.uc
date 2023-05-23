@@ -177,18 +177,11 @@ function client_add(interface, mac, state) {
 	if (state.state != 1)
 		return;
 
-	let interval = acct_interval(interface) * 1000;
-	let idle = idle_timeout(interface);
-	let session = session_timeout(interface);
 	let accounting = (config[interface]?.acct_server && config[interface]?.acct_secret);
-	let max_total = 0;
-
-	if (state.data?.radius?.reply) {
-		interval = (state.data?.radius?.reply['Acct-Interim-Interval'] || acct_interval(interface)) * 1000;
-		idle = (state.data?.radius?.reply['Idle-Timeout'] || idle_timeout(interface));
-		session = (state.data?.radius?.reply['Session-Timeout'] || session_timeout(interface));
-		max_total = (state.data?.radius?.reply['ChilliSpot-Max-Total-Octets'] || 0);
-	}
+	let interval = (state.data?.radius?.reply['Acct-Interim-Interval'] || acct_interval(interface)) * 1000;
+	let session = (state.data?.radius?.reply['Session-Timeout'] || session_timeout(interface));
+	let idle = (state.data?.radius?.reply['Idle-Timeout'] || idle_timeout(interface));
+	let max_total = (state.data?.radius?.reply['ChilliSpot-Max-Total-Octets'] || 0);
 
 	clients[interface][mac] = {
 		accounting,
