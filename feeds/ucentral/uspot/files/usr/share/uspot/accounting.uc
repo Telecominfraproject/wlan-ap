@@ -115,19 +115,19 @@ function client_add(interface, mac, state) {
 
 	let defval = 0;
 
-	let accounting = (config[interface].acct_server && config[interface].acct_secret);
+	let accounting = !!(config[interface].acct_server && config[interface].acct_secret);
 
 	// RFC: NAS local interval value *must* override RADIUS attribute
 	defval = config[interface].acct_interval;
-	let interval = (defval || state.data?.radius?.reply['Acct-Interim-Interval'] || 0) * 1000;
+	let interval = +(defval || state.data?.radius?.reply['Acct-Interim-Interval'] || 0) * 1000;
 
 	defval = config[interface].session_timeout || 0;
-	let session = (state.data?.radius?.reply['Session-Timeout'] || defval);
+	let session = +(state.data?.radius?.reply['Session-Timeout'] || defval);
 
 	defval = config[interface].idle_timeout || 600;
-	let idle = (state.data?.radius?.reply['Idle-Timeout'] || defval);
+	let idle = +(state.data?.radius?.reply['Idle-Timeout'] || defval);
 
-	let max_total = (state.data?.radius?.reply['ChilliSpot-Max-Total-Octets'] || 0);
+	let max_total = +(state.data?.radius?.reply['ChilliSpot-Max-Total-Octets'] || 0);
 
 	clients[interface][mac] = {
 		accounting,
