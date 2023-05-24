@@ -19,6 +19,7 @@ let uciload = uci.foreach('uspot', 'uspot', (d) => {
 			acct_port: d.acct_port || 1813,
 			acct_proxy: d.acct_proxy,
 			acct_interval: d.acct_interval,
+			nas_id: d.nasid,
 			idle_timeout: d.idle_timeout || 600,
 			session_timeout: d.session_timeout || 0,
 			debug: d.debug,
@@ -52,8 +53,9 @@ function radius_init(interface, mac, payload) {
 	let settings = interfaces[interface].settings;
 
 	payload.acct_server = sprintf('%s:%s:%s', settings.acct_server, settings.acct_port, settings.acct_secret);
+	payload.nas_id = settings.nas_id;
 
-	for (let key in [ 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_id', 'username', 'location_name' ])
+	for (let key in [ 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'username', 'location_name' ])
 		if (client.radius[key])
 			payload[key] = client.radius[key];
 
