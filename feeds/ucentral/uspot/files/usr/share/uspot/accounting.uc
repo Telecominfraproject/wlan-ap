@@ -60,7 +60,7 @@ function radius_acct(interface, mac, payload) {
 	let state = ubus.call('spotfilter', 'client_get', {
 		interface,
 		address: mac
-	});
+	}) || clients[interface][mac];	// fallback to last known state
 	if (!state)
 		return;
 
@@ -111,7 +111,20 @@ function radius_interim(interface, mac) {
 function client_interim(interface, mac, time) {
 	let client = clients[interface][mac];
 
-	if (!client.accounting || !client.interval)
+	if (!client.accounting)
+		return;
+
+	// preserve a copy of last spotfilter stats for use in disconnect case
+	let state = ubus.call('spotfilter', 'client_get', {
+		interface,
+		address: mac
+	});
+	if (!state)
+		return;
+
+	client.acct_data = state.acct_data;
+
+	if (!client.interval)
 		return;
 
 	if (time >= client.next_interim) {
@@ -146,6 +159,9 @@ function client_add(interface, mac, state) {
 		session,
 		idle,
 		max_total,
+		data: {
+			connect: state.data.connect,
+		}
 	};
 	if (state.ip4addr)
 		clients[interface][mac].ip4addr = state.ip4addr;
