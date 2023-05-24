@@ -289,10 +289,12 @@ static void client_dump(struct interface *iface, struct client *cl)
 	interface_dump_action(&b, iface, cl->data.dns_class);
 	blobmsg_close_table(&b, c);
 
+	c = blobmsg_open_table(&b, "acct_data");
 	blobmsg_add_u64(&b, "packets_ul", cl->data.packets_ul);
 	blobmsg_add_u64(&b, "packets_dl", cl->data.packets_dl);
 	blobmsg_add_u64(&b, "bytes_ul", cl->data.bytes_ul);
 	blobmsg_add_u64(&b, "bytes_dl", cl->data.bytes_dl);
+	blobmsg_close_table(&b, c);
 }
 
 static int

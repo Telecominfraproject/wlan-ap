@@ -67,12 +67,12 @@ function radius_acct(interface, mac, payload) {
 	payload = radius_init(interface, mac, payload);
 	payload.acct = true;
 	payload.session_time = time() - state.data.connect;
-	payload.output_octets = state.bytes_dl & 0xffffffff;
-	payload.input_octets = state.bytes_ul & 0xffffffff;
-	payload.output_gigawords = state.bytes_dl >> 32;
-	payload.input_gigawords = state.bytes_ul >> 32;
-	payload.output_packets = state.packets_dl;
-	payload.input_packets = state.packets_ul;
+	payload.output_octets = state.acct_data.bytes_dl & 0xffffffff;
+	payload.input_octets = state.acct_data.bytes_ul & 0xffffffff;
+	payload.output_gigawords = state.acct_data.bytes_dl >> 32;
+	payload.input_gigawords = state.acct_data.bytes_ul >> 32;
+	payload.output_packets = state.acct_data.packets_dl;
+	payload.input_packets = state.acct_data.packets_ul;
 	if (state.data?.radius?.reply?.Class)
 		payload.class = state.data.radius.reply.Class;
 
@@ -226,7 +226,7 @@ function accounting(interface) {
 			continue;
 		}
 		let maxtotal = +clients[interface][mac].max_total;
-		if (maxtotal && ((list[mac].bytes_ul + list[mac].bytes_dl) >= maxtotal)) {
+		if (maxtotal && ((list[mac].acct_data.bytes_ul + list[mac].acct_data.bytes_dl) >= maxtotal)) {
 			radius_terminate(interface, mac, radtc_sessionto);
 			client_reset(interface, mac, 'max octets reached');
 			continue;
