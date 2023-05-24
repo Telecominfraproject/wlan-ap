@@ -49,12 +49,16 @@ function debug(interface, mac, msg) {
 
 function radius_init(interface, mac, payload) {
 	let client = interfaces[interface].clients[mac];
-	for (let key in [ 'server', 'acct_server', 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_id', 'username', 'location_name' ])
+	let settings = interfaces[interface].settings;
+
+	payload.acct_server = sprintf('%s:%s:%s', settings.acct_server, settings.acct_port, settings.acct_secret);
+
+	for (let key in [ 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_id', 'username', 'location_name' ])
 		if (client.radius[key])
 			payload[key] = client.radius[key];
 
-	if (interfaces[interface].settings.acct_proxy)
-		payload.acct_proxy = interfaces[interface].settings.acct_proxy;
+	if (settings.acct_proxy)
+		payload.acct_proxy = settings.acct_proxy;
 
 	return payload;
 }
@@ -124,9 +128,6 @@ function radius_interim(interface, mac) {
 }
 
 function client_interim(interface, mac, time) {
-	if (!interfaces[interface].settings.accounting)
-		return;
-
 	let client = interfaces[interface].clients[mac];
 
 	// preserve a copy of last spotfilter stats for use in disconnect case
@@ -230,6 +231,7 @@ function client_reset(interface, mac, reason) {
 function accounting(interface) {
 	let list = ubus.call('spotfilter', 'client_list', { interface });
 	let t = time();
+	let accounting = interfaces[interface].settings.accounting;
 
 	for (let mac, payload in list)
 		if (!interfaces[interface].clients[mac])
@@ -266,7 +268,8 @@ function accounting(interface) {
 			continue;
 		}
 
-		client_interim(interface, mac, t);
+		if (accounting)
+			client_interim(interface, mac, t);
 	}
 }
 
