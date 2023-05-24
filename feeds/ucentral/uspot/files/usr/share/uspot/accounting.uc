@@ -6,20 +6,34 @@ let fs = require('fs');
 let uloop = require('uloop');
 let ubus = require('ubus').connect();
 let uci = require('uci').cursor();
-let config = uci.get_all('uspot');
-let clients = {};
+let interfaces = {};
 
-if (!config) {
+let uciload = uci.foreach('uspot', 'uspot', (d) => {
+	if (!d[".anonymous"]) {
+		let accounting = !!(d.acct_server && d.acct_secret);
+		interfaces[d[".name"]] = {
+		settings: {
+			accounting,
+			acct_server: d.acct_server,
+			acct_secret: d.acct_secret,
+			acct_port: d.acct_port || 1813,
+			acct_proxy: d.acct_proxy,
+			acct_interval: d.acct_interval,
+			idle_timeout: d.idle_timeout || 600,
+			session_timeout: d.session_timeout || 0,
+			debug: d.debug,
+		},
+		clients: {},
+		};
+	}
+});
+
+if (!uciload) {
 	let log = 'uspot: failed to load config';
 	system('logger ' + log);
 	warn(log + '\n');
 	exit(1);
 }
-
-uci.foreach('uspot', 'uspot', (d) => {
-	if (!d[".anonymous"])
-		clients[d[".name"]] = {};
-});
 
 function syslog(interface, mac, msg) {
 	let log = sprintf('uspot: %s %s %s', interface, mac, msg);
@@ -29,17 +43,18 @@ function syslog(interface, mac, msg) {
 }
 
 function debug(interface, mac, msg) {
-	if (+config[interface].debug)
+	if (+interfaces[interface].settings.debug)
 		syslog(interface, mac, msg);
 }
 
 function radius_init(interface, mac, payload) {
+	let client = interfaces[interface].clients[mac];
 	for (let key in [ 'server', 'acct_server', 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_id', 'username', 'location_name' ])
-		if (clients[interface][mac].radius[key])
-			payload[key] = clients[interface][mac].radius[key];
+		if (client.radius[key])
+			payload[key] = client.radius[key];
 
-	if (config[interface].acct_proxy)
-		payload.acct_proxy = config[interface].acct_proxy;
+	if (interfaces[interface].settings.acct_proxy)
+		payload.acct_proxy = interfaces[interface].settings.acct_proxy;
 
 	return payload;
 }
@@ -52,7 +67,7 @@ function radius_call(interface, mac, payload) {
 
 	system('/usr/bin/radius-client ' + path);
 
-	if (!+config[interface].debug)
+	if (!+interfaces[interface].settings.debug)
 		fs.unlink(path);
 }
 
@@ -60,7 +75,7 @@ function radius_acct(interface, mac, payload) {
 	let state = ubus.call('spotfilter', 'client_get', {
 		interface,
 		address: mac
-	}) || clients[interface][mac];	// fallback to last known state
+	}) || interfaces[interface].clients[mac];	// fallback to last known state
 	if (!state)
 		return;
 
@@ -87,7 +102,7 @@ const radtc_sessionto = 5;	// Session Timeout
 const radtc_adminreset = 6;	// Admin Reset
 
 function radius_terminate(interface, mac, cause) {
-	if (!clients[interface][mac].radius)
+	if (!interfaces[interface].clients[mac].radius)
 		return;
 
 	const acct_type_stop = 2;
@@ -109,10 +124,10 @@ function radius_interim(interface, mac) {
 }
 
 function client_interim(interface, mac, time) {
-	let client = clients[interface][mac];
-
-	if (!client.accounting)
+	if (!interfaces[interface].settings.accounting)
 		return;
+
+	let client = interfaces[interface].clients[mac];
 
 	// preserve a copy of last spotfilter stats for use in disconnect case
 	let state = ubus.call('spotfilter', 'client_get', {
@@ -139,22 +154,23 @@ function client_add(interface, mac, state) {
 
 	let defval = 0;
 
-	let accounting = !!(config[interface].acct_server && config[interface].acct_secret);
+	let settings = interfaces[interface].settings;
+	let accounting = settings.accounting;
 
 	// RFC: NAS local interval value *must* override RADIUS attribute
-	defval = config[interface].acct_interval;
+	defval = settings.acct_interval;
 	let interval = +(defval || state.data?.radius?.reply['Acct-Interim-Interval'] || 0);
 
-	defval = config[interface].session_timeout || 0;
+	defval = settings.session_timeout;
 	let session = +(state.data?.radius?.reply['Session-Timeout'] || defval);
 
-	defval = config[interface].idle_timeout || 600;
+	defval = settings.idle_timeout;
 	let idle = +(state.data?.radius?.reply['Idle-Timeout'] || defval);
 
 	let max_total = +(state.data?.radius?.reply['ChilliSpot-Max-Total-Octets'] || 0);
 
-	clients[interface][mac] = {
-		accounting,
+	let clients = interfaces[interface].clients;
+	clients[mac] = {
 		interval,
 		session,
 		idle,
@@ -164,13 +180,13 @@ function client_add(interface, mac, state) {
 		}
 	};
 	if (state.ip4addr)
-		clients[interface][mac].ip4addr = state.ip4addr;
+		clients[mac].ip4addr = state.ip4addr;
 	if (state.ip6addr)
-		clients[interface][mac].ip6addr = state.ip6addr;
+		clients[mac].ip6addr = state.ip6addr;
 	if (state.data?.radius?.request) {
-		clients[interface][mac].radius = state.data.radius.request;
+		clients[mac].radius = state.data.radius.request;
 		if (accounting && interval)
-			clients[interface][mac].next_interim = state.data.connect + interval;
+			clients[mac].next_interim = state.data.connect + interval;
 	}
 	syslog(interface, mac, 'adding client');
 }
@@ -190,12 +206,14 @@ function client_kick(interface, mac, remove) {
 
 	ubus.call('spotfilter', remove ? 'client_remove' : 'client_set', payload);
 
-	if (clients[interface][mac].ip4addr)
-		system('conntrack -D -s ' + clients[interface][mac].ip4addr + ' -m 2');
-	if (clients[interface][mac].ip6addr)
-		system('conntrack -D -s ' + clients[interface][mac].ip6addr + ' -m 2');
+	let client = interfaces[interface].clients[mac];
 
-	delete clients[interface][mac];
+	if (client.ip4addr)
+		system('conntrack -D -s ' + client.ip4addr + ' -m 2');
+	if (client.ip6addr)
+		system('conntrack -D -s ' + client.ip6addr + ' -m 2');
+
+	delete interfaces[interface].clients[mac];
 }
 
 function client_remove(interface, mac, reason) {
@@ -214,10 +232,10 @@ function accounting(interface) {
 	let t = time();
 
 	for (let mac, payload in list)
-		if (!clients[interface][mac])
+		if (!interfaces[interface].clients[mac])
 			client_add(interface, mac, payload);
 
-	for (let mac in clients[interface]) {
+	for (let mac, client in interfaces[interface].clients) {
 		if (!list[mac] || !list[mac].state) {
 			radius_terminate(interface, mac, radtc_lostcarrier);
 			client_remove(interface, mac, 'disconnect event');
@@ -230,18 +248,18 @@ function accounting(interface) {
 			continue;
 		}
 
-		if (+list[mac].idle > +clients[interface][mac].idle) {
+		if (+list[mac].idle > +client.idle) {
 			radius_terminate(interface, mac, radtc_idleto);
 			client_reset(interface, mac, 'idle event');
 			continue;
 		}
-		let timeout = +clients[interface][mac].session;
+		let timeout = +client.session;
 		if (timeout && ((t - list[mac].data.connect) > timeout)) {
 			radius_terminate(interface, mac, radtc_sessionto);
 			client_reset(interface, mac, 'session timeout');
 			continue;
 		}
-		let maxtotal = +clients[interface][mac].max_total;
+		let maxtotal = +client.max_total;
 		if (maxtotal && ((list[mac].acct_data.bytes_ul + list[mac].acct_data.bytes_dl) >= maxtotal)) {
 			radius_terminate(interface, mac, radtc_sessionto);
 			client_reset(interface, mac, 'max octets reached');
@@ -255,7 +273,7 @@ function accounting(interface) {
 uloop.init();
 
 uloop.timer(10000, function() {
-	for (let interface in clients)
+	for (let interface in interfaces)
 		accounting(interface); 
 	this.set(10000);
 });
