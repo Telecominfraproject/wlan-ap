@@ -238,10 +238,10 @@ function accounting(interface) {
 
 uloop.init();
 
-uloop.timer(1000, function() {
+uloop.timer(10000, function() {
 	for (let interface in clients)
 		accounting(interface); 
-	this.set(1000);
+	this.set(10000);
 });
 
 uloop.run();
