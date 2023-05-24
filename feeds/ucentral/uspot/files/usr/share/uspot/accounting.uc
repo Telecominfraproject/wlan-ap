@@ -178,7 +178,7 @@ function client_remove(interface, mac, reason) {
 	client_kick(interface, mac, true);
 }
 
-function client_flush(interface, mac, reason) {
+function client_reset(interface, mac, reason) {
 	syslog(interface, mac, reason);
 	client_kick(interface, mac, false);
 }
@@ -201,7 +201,7 @@ function accounting(interface) {
 
 		if (list[mac].data.logoff) {
 			radius_terminate(interface, mac, radtc_logout);
-			client_flush(interface, mac, 'logoff event');
+			client_reset(interface, mac, 'logoff event');
 			continue;
 		}
 
@@ -213,13 +213,13 @@ function accounting(interface) {
 		let timeout = +clients[interface][mac].session;
 		if (timeout && ((t - list[mac].data.connect) > timeout)) {
 			radius_terminate(interface, mac, radtc_sessionto);
-			client_flush(interface, mac, 'session timeout');
+			client_reset(interface, mac, 'session timeout');
 			continue;
 		}
 		let maxtotal = +clients[interface][mac].max_total;
 		if (maxtotal && ((list[mac].bytes_ul + list[mac].bytes_dl) >= maxtotal)) {
 			radius_terminate(interface, mac, radtc_sessionto);
-			client_flush(interface, mac, 'max octets reached');
+			client_reset(interface, mac, 'max octets reached');
 		}
 	}
 }
