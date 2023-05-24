@@ -117,8 +117,9 @@ function client_add(interface, mac, state) {
 
 	let accounting = (config[interface].acct_server && config[interface].acct_secret);
 
-	defval = config[interface].acct_interval || 600;
-	let interval = (state.data?.radius?.reply['Acct-Interim-Interval'] || defval) * 1000;
+	// RFC: NAS local interval value *must* override RADIUS attribute
+	defval = config[interface].acct_interval;
+	let interval = (defval || state.data?.radius?.reply['Acct-Interim-Interval'] || 0) * 1000;
 
 	defval = config[interface].session_timeout || 0;
 	let session = (state.data?.radius?.reply['Session-Timeout'] || defval);
@@ -141,7 +142,7 @@ function client_add(interface, mac, state) {
 		clients[interface][mac].ip6addr = state.ip6addr;
 	if (state.data?.radius?.request) {
 		clients[interface][mac].radius = state.data.radius.request;
-		if (accounting)
+		if (accounting && interval)
 			clients[interface][mac].timeout = uloop.timer(interval, () => radius_interim(interface, mac));
 	}
 	syslog(interface, mac, 'adding client');
