@@ -106,7 +106,18 @@ function radius_interim(interface, mac) {
 	};
 	radius_acct(interface, mac, payload);
 	debug(interface, mac, 'iterim acct call');
-	clients[interface][mac].timeout.set(clients[interface][mac].interval);
+}
+
+function client_interim(interface, mac, time) {
+	let client = clients[interface][mac];
+
+	if (!client.accounting || !client.interval)
+		return;
+
+	if (time >= client.next_interim) {
+		radius_interim(interface, mac);
+		client.next_interim += client.interval;
+	}
 }
 
 function client_add(interface, mac, state) {
@@ -119,7 +130,7 @@ function client_add(interface, mac, state) {
 
 	// RFC: NAS local interval value *must* override RADIUS attribute
 	defval = config[interface].acct_interval;
-	let interval = +(defval || state.data?.radius?.reply['Acct-Interim-Interval'] || 0) * 1000;
+	let interval = +(defval || state.data?.radius?.reply['Acct-Interim-Interval'] || 0);
 
 	defval = config[interface].session_timeout || 0;
 	let session = +(state.data?.radius?.reply['Session-Timeout'] || defval);
@@ -143,7 +154,7 @@ function client_add(interface, mac, state) {
 	if (state.data?.radius?.request) {
 		clients[interface][mac].radius = state.data.radius.request;
 		if (accounting && interval)
-			clients[interface][mac].timeout = uloop.timer(interval, () => radius_interim(interface, mac));
+			clients[interface][mac].next_interim = state.data.connect + interval;
 	}
 	syslog(interface, mac, 'adding client');
 }
@@ -168,8 +179,6 @@ function client_kick(interface, mac, remove) {
 	if (clients[interface][mac].ip6addr)
 		system('conntrack -D -s ' + clients[interface][mac].ip6addr + ' -m 2');
 
-	if (clients[interface][mac].accounting)
-		clients[interface][mac].timeout.cancel();
 	delete clients[interface][mac];
 }
 
@@ -220,7 +229,10 @@ function accounting(interface) {
 		if (maxtotal && ((list[mac].bytes_ul + list[mac].bytes_dl) >= maxtotal)) {
 			radius_terminate(interface, mac, radtc_sessionto);
 			client_reset(interface, mac, 'max octets reached');
+			continue;
 		}
+
+		client_interim(interface, mac, t);
 	}
 }
 
