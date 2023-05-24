@@ -201,13 +201,13 @@ function accounting(interface) {
 
 		if (list[mac].data.logoff) {
 			radius_terminate(interface, mac, radtc_logout);
-			client_reset(interface, mac, 'logoff event');
+			client_remove(interface, mac, 'logoff event');
 			continue;
 		}
 
 		if (+list[mac].idle > +clients[interface][mac].idle) {
 			radius_terminate(interface, mac, radtc_idleto);
-			client_remove(interface, mac, 'idle event');
+			client_reset(interface, mac, 'idle event');
 			continue;
 		}
 		let timeout = +clients[interface][mac].session;
