@@ -32,6 +32,9 @@ function auth_client(ctx) {
 	if (radius['access-accept']) {
 		if (ctx.config.final_redirect_url == 'uam')
 			ctx.query_string.userurl = portal.uam_url(ctx, 'success');
+
+		delete payload.server;
+		delete payload.acct_server;	// don't publish server secrets
 		portal.allow_client(ctx, { radius: { reply: radius.reply, request: payload } } );
 
 		payload = portal.radius_init(ctx);

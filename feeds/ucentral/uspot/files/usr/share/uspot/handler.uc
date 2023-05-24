@@ -29,6 +29,8 @@ function request_start(ctx) {
 			if (radius['access-accept']) {
 				if (ctx.config.final_redirect_url == 'uam')
 					ctx.query_string.userurl = portal.uam_url(ctx, 'success');
+				delete payload.server;
+				delete payload.acct_server;	// don't publish radius secrets
 				portal.allow_client(ctx, { radius: { reply: radius.reply, request: payload } } );
 				return;
 			}
@@ -118,6 +120,8 @@ function request_radius(ctx) {
 
         let radius = portal.radius_call(ctx, payload);
 	if (radius['access-accept']) {
+		delete payload.server;
+		delete payload.acct_server;	// don't publish radius secrets
                 portal.allow_client(ctx, { username: ctx.form_data.username, radius: { reply: radius.reply, request: payload } } );
                 return;
         }
