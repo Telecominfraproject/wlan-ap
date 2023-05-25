@@ -49,24 +49,26 @@ function debug(interface, mac, msg) {
 }
 
 function radius_init(interface, mac, payload) {
-	let client = interfaces[interface].clients[mac];
 	let settings = interfaces[interface].settings;
 
 	payload.acct_server = sprintf('%s:%s:%s', settings.acct_server, settings.acct_port, settings.acct_secret);
 	payload.nas_id = settings.nas_id;
-
-	for (let key in [ 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'username', 'location_name' ])
-		if (client.radius[key])
-			payload[key] = client.radius[key];
-
 	if (settings.acct_proxy)
 		payload.acct_proxy = settings.acct_proxy;
+
+	if (mac) {
+		// dealing with client accounting
+		let client = interfaces[interface].clients[mac];
+		for (let key in [ 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'username', 'location_name' ])
+			if (client.radius[key])
+				payload[key] = client.radius[key];
+	}
 
 	return payload;
 }
 
 function radius_call(interface, mac, payload) {
-	let path = '/tmp/uacct' + mac + '.json';
+	let path = '/tmp/uacct' + (mac || payload.acct_session) + '.json';
 	let cfg = fs.open(path, 'w');
 	cfg.write(payload);
 	cfg.close();
