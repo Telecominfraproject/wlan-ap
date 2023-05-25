@@ -231,6 +231,40 @@ function client_reset(interface, mac, reason) {
 	client_kick(interface, mac, false);
 }
 
+function radius_accton(interface)
+{
+	// assign a global interface session ID for Accounting-On/Off messages
+	let math = require('math');
+	let sessionid = '';
+
+	for (let i = 0; i < 16; i++)
+		sessionid += sprintf('%x', math.rand() % 16);
+
+	interfaces[interface].sessionid = sessionid;
+
+	const acct_type_accton = 7;	// Accounting-On
+	let payload = {
+		acct_type: acct_type_accton,
+		acct_session: sessionid,
+	};
+	payload = radius_init(interface, null, payload);
+	payload.acct = true;
+	radius_call(interface, null, payload);
+	debug(interface, null, 'acct-on call');
+}
+
+function radius_acctoff(interface)
+{
+	const acct_type_acctoff = 8;	// Accounting-Off
+	let payload = {
+		acct_type: acct_type_acctoff,
+		acct_session: interfaces[interface].sessionid,
+	};
+	payload = radius_init(interface, null, payload);
+	payload.acct = true;
+	radius_call(interface, null, payload);
+	debug(interface, null, 'acct-off call');
+}
 
 function accounting(interface) {
 	let list = ubus.call('spotfilter', 'client_list', { interface });
@@ -277,7 +311,29 @@ function accounting(interface) {
 	}
 }
 
+function start()
+{
+	let seen = {};
+
+	for (let interface, data in interfaces) {
+		if (!data.settings.acct_server || (data.settings.acct_server in seen))
+			continue;	// avoid sending duplicate requests to the same server
+		seen[data.settings.acct_server] = 1;
+		radius_accton(interface);
+	}
+}
+
+function stop()
+{
+	for (let interface, data in interfaces) {
+		if (data.sessionid)	// we have previously sent Accounting-On
+			radius_acctoff(interface);
+	}
+}
+
 uloop.init();
+
+start();
 
 uloop.timer(10000, function() {
 	for (let interface in interfaces)
@@ -286,3 +342,5 @@ uloop.timer(10000, function() {
 });
 
 uloop.run();
+
+stop();
