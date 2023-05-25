@@ -100,7 +100,7 @@ return {
 		let sessionid = '';
 
 		for (let i = 0; i < 16; i++)
-		        sessionid += sprintf('%d', math.rand() % 10);
+		        sessionid += sprintf('%x', math.rand() % 16);
 		return sessionid;
 	},
 
