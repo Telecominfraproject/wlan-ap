@@ -59,7 +59,7 @@ function radius_init(interface, mac, payload) {
 	if (mac) {
 		// dealing with client accounting
 		let client = interfaces[interface].clients[mac];
-		for (let key in [ 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'username', 'location_name' ])
+		for (let key in [ 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_port_type', 'username', 'location_name' ])
 			if (client.radius[key])
 				payload[key] = client.radius[key];
 	}
