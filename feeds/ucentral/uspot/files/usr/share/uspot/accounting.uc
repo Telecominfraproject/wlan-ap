@@ -39,7 +39,7 @@ if (!uciload) {
 function syslog(interface, mac, msg) {
 	let log = sprintf('uspot: %s %s %s', interface, mac, msg);
 
-	system('logger ' + log);
+	system('logger \'' + log + '\'');
 	warn(log + '\n');
 }
 
