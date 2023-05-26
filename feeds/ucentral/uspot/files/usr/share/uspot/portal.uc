@@ -229,7 +229,6 @@ return {
 			ctx.sessionid = this.session_init();
 		let payload = {
 			server: sprintf('%s:%s:%s', ctx.config.auth_server, ctx.config.auth_port, ctx.config.auth_secret),
-			acct_server: sprintf('%s:%s:%s', ctx.config.acct_server, ctx.config.acct_port, ctx.config.acct_secret),
 			acct_session: ctx.sessionid,
 			client_ip: ctx.env.REMOTE_ADDR,
 			called_station: ctx.config.nasmac + ':' + ctx.ssid,
@@ -243,15 +242,13 @@ return {
 			payload.location_name = ctx.config.location_name;
 		if (ctx.config.auth_proxy)
 			payload.auth_proxy = ctx.config.auth_proxy;
-		if (ctx.config.acct_proxy)
-			payload.acct_proxy = ctx.config.acct_proxy;
 
 		return payload;
 	},
 
 	// call radius-client with the provided payload and return reply
 	radius_call: function(ctx, payload) {
-		let path = '/tmp/' + (payload.acct ? 'acct' : 'auth') + ctx.mac + '.json';
+		let path = '/tmp/auth' + ctx.mac + '.json';
 		let cfg = fs.open(path, 'w');
 		cfg.write(payload);
 		cfg.close();
