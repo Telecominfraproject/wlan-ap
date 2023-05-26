@@ -36,14 +36,6 @@ function auth_client(ctx) {
 		delete payload.server;
 		delete payload.acct_server;	// don't publish server secrets
 		portal.allow_client(ctx, { radius: { reply: radius.reply, request: payload } } );
-
-		payload = portal.radius_init(ctx);
-		payload.acct = true;
-		payload.username = ctx.query_string.username;
-		payload.acct_type = 1;
-		if (radius.reply.Class)
-			payload.class = radius.reply.Class;
-		portal.radius_call(ctx, payload);
 		return;
 	}
 

@@ -169,6 +169,12 @@ return {
 			include('allow.uc', ctx);
 
 		this.ratelimit_client(ctx, data);
+
+		// start accounting
+		ctx.ubus.call('uspot', 'client_add', {
+			interface: ctx.spotfilter,
+			address: ctx.mac,
+		});
 	},
 
 	// ratelimit a client from radius reply attributes

@@ -79,6 +79,13 @@ function radius_call(interface, mac, payload) {
 		fs.unlink(path);
 }
 
+// RADIUS Acct-Status-Type attributes
+const radat_start = 1;		// Start
+const radat_stop = 2;		// Stop
+const radat_interim = 3;	// Interim-Update
+const radat_accton = 7;		// Accounting-On
+const radat_acctoff = 8;	// Accounting-Off
+
 function radius_acct(interface, mac, payload) {
 	let state = ubus.call('spotfilter', 'client_get', {
 		interface,
@@ -89,13 +96,16 @@ function radius_acct(interface, mac, payload) {
 
 	payload = radius_init(interface, mac, payload);
 	payload.acct = true;
-	payload.session_time = time() - state.data.connect;
-	payload.output_octets = state.acct_data.bytes_dl & 0xffffffff;
-	payload.input_octets = state.acct_data.bytes_ul & 0xffffffff;
-	payload.output_gigawords = state.acct_data.bytes_dl >> 32;
-	payload.input_gigawords = state.acct_data.bytes_ul >> 32;
-	payload.output_packets = state.acct_data.packets_dl;
-	payload.input_packets = state.acct_data.packets_ul;
+
+	if (payload.acct_type != radat_start) {
+		payload.session_time = time() - state.data.connect;
+		payload.output_octets = state.acct_data.bytes_dl & 0xffffffff;
+		payload.input_octets = state.acct_data.bytes_ul & 0xffffffff;
+		payload.output_gigawords = state.acct_data.bytes_dl >> 32;
+		payload.input_gigawords = state.acct_data.bytes_ul >> 32;
+		payload.output_packets = state.acct_data.packets_dl;
+		payload.input_packets = state.acct_data.packets_ul;
+	}
 	if (state.data?.radius?.reply?.Class)
 		payload.class = state.data.radius.reply.Class;
 
@@ -113,19 +123,25 @@ function radius_terminate(interface, mac, cause) {
 	if (!interfaces[interface].clients[mac].radius)
 		return;
 
-	const acct_type_stop = 2;
 	let payload = {
-		acct_type: acct_type_stop,
+		acct_type: radat_stop,
 		terminate_cause: cause,
 	};
 	debug(interface, mac, 'acct terminate: ' + cause);
 	radius_acct(interface, mac, payload);
 }
 
-function radius_interim(interface, mac) {
-	const acct_type_interim = 3;
+function radius_start(interface, mac) {
 	let payload = {
-		acct_type: acct_type_interim,
+		acct_type: radat_start,
+	};
+	debug(interface, mac, 'acct start');
+	radius_acct(interface, mac, payload);
+}
+
+function radius_interim(interface, mac) {
+	let payload = {
+		acct_type: radat_interim,
 	};
 	radius_acct(interface, mac, payload);
 	debug(interface, mac, 'iterim acct call');
@@ -190,8 +206,11 @@ function client_add(interface, mac, state) {
 		clients[mac].ip6addr = state.ip6addr;
 	if (state.data?.radius?.request) {
 		clients[mac].radius = state.data.radius.request;
-		if (accounting && interval)
-			clients[mac].next_interim = state.data.connect + interval;
+		if (accounting) {
+			radius_start(interface, mac);
+			if (interval)
+				clients[mac].next_interim = time() + interval;
+		}
 	}
 	syslog(interface, mac, 'adding client');
 }
@@ -242,9 +261,8 @@ function radius_accton(interface)
 
 	interfaces[interface].sessionid = sessionid;
 
-	const acct_type_accton = 7;	// Accounting-On
 	let payload = {
-		acct_type: acct_type_accton,
+		acct_type: radat_accton,
 		acct_session: sessionid,
 	};
 	payload = radius_init(interface, null, payload);
@@ -255,9 +273,8 @@ function radius_accton(interface)
 
 function radius_acctoff(interface)
 {
-	const acct_type_acctoff = 8;	// Accounting-Off
 	let payload = {
-		acct_type: acct_type_acctoff,
+		acct_type: radat_acctoff,
 		acct_session: interfaces[interface].sessionid,
 	};
 	payload = radius_init(interface, null, payload);
@@ -270,10 +287,6 @@ function accounting(interface) {
 	let list = ubus.call('spotfilter', 'client_list', { interface });
 	let t = time();
 	let accounting = interfaces[interface].settings.accounting;
-
-	for (let mac, payload in list)
-		if (!interfaces[interface].clients[mac])
-			client_add(interface, mac, payload);
 
 	for (let mac, client in interfaces[interface].clients) {
 		if (!list[mac] || !list[mac].state) {
@@ -316,9 +329,16 @@ function start()
 	let seen = {};
 
 	for (let interface, data in interfaces) {
-		if (!data.settings.acct_server || (data.settings.acct_server in seen))
-			continue;	// avoid sending duplicate requests to the same server
-		seen[data.settings.acct_server] = 1;
+		let server = data.settings.acct_server;
+		let nasid = data.settings.nas_id;
+
+		if (!server || !nasid)
+			continue;
+		if ((server in seen) && (nasid in seen[server]))
+			continue;	// avoid sending duplicate requests to the same server for the same nasid
+		if (!seen[server])
+			seen[server] = {};
+		seen[server][nasid] = 1;
 		radius_accton(interface);
 	}
 }
@@ -331,16 +351,52 @@ function stop()
 	}
 }
 
+function run_service() {
+	ubus.publish("uspot", {
+		client_add: {
+			call: function(req) {
+				let interface = req.args.interface;
+				let address = req.args.address;
+
+				if (!interface || !address)
+					return ubus.STATUS_INVALID_ARGUMENT;
+
+				address = uc(address);	// spotfilter uses ether_ntoa() which is uppercase
+
+				let state = ubus.call('spotfilter', 'client_get', {
+					interface,
+					address,
+				});
+				if (!state)
+					return ubus.STATUS_INVALID_ARGUMENT;
+
+				if (!interfaces[interface].clients[address])
+					client_add(interface, address, state);
+
+				return 0;
+			},
+			args: {
+				interface:"",
+				address:"",
+			}
+		},
+	});
+
+	try {
+		start();
+		uloop.timer(10000, function() {
+			for (let interface in interfaces)
+				accounting(interface);
+			this.set(10000);
+		});
+		uloop.run();
+	} catch (e) {
+		warn(`Error: ${e}\n${e.stacktrace[0].context}`);
+	}
+
+	stop();
+}
+
 uloop.init();
-
-start();
-
-uloop.timer(10000, function() {
-	for (let interface in interfaces)
-		accounting(interface); 
-	this.set(10000);
-});
-
-uloop.run();
-
-stop();
+run_service();
+uloop.done();
