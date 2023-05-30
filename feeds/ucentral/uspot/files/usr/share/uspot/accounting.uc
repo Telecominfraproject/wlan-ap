@@ -327,12 +327,6 @@ function accounting(interface) {
 			continue;
 		}
 
-		if (list[mac].data.logoff) {
-			radius_terminate(interface, mac, radtc_logout);
-			client_remove(interface, mac, 'logoff event');
-			continue;
-		}
-
 		if (+list[mac].idle > +client.idle) {
 			radius_terminate(interface, mac, radtc_idleto);
 			client_reset(interface, mac, 'idle event');
@@ -404,6 +398,26 @@ function run_service() {
 
 				if (!interfaces[interface].clients[address])
 					client_add(interface, address, state);
+
+				return 0;
+			},
+			args: {
+				interface:"",
+				address:"",
+			}
+		},
+		client_remove: {
+			call: function(req) {
+				let interface = req.args.interface;
+				let address = req.args.address;
+
+				if (!interface || !address)
+					return ubus.STATUS_INVALID_ARGUMENT;
+
+				address = uc(address);
+
+				if (interfaces[interface].clients[address])
+					client_remove(interface, address, 'client_remove event');
 
 				return 0;
 			},

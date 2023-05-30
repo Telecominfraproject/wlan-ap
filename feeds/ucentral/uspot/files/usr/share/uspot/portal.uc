@@ -178,21 +178,15 @@ return {
 	// put a client back into pre-auth state
 	logoff: function(ctx, uam) {
 		this.syslog(ctx, 'logging client off');
-		ctx.ubus.call('spotfilter', 'client_set', {
-			interface: ctx.spotfilter,
-			address: ctx.mac,
-			state: 0,
-			dns_state: 1,
-			accounting: [],
-			data: {
-				logoff : 1
-			}
-		});
-
 		if (uam)
 			include('redir.uc', { redir_location: this.uam_url(ctx, 'logoff') });
 		else
 			include('logoff.uc', ctx);
+
+		ctx.ubus.call('uspot', 'client_remove', {
+			interface: ctx.spotfilter,
+			address: ctx.mac,
+		});
 	},
 
 	// generate the default radius auth payload
