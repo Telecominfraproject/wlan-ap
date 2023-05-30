@@ -243,6 +243,8 @@ function client_kick(interface, mac, remove) {
 function client_remove(interface, mac, reason) {
 	syslog(interface, mac, reason);
 	client_kick(interface, mac, true);
+	// delete ratelimit rules if any - ratelimit gets lc mac from portal
+	ubus.call('ratelimit', 'client_delete', { address: lc(mac) });
 }
 
 function client_reset(interface, mac, reason) {
