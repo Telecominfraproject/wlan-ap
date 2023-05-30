@@ -24,7 +24,7 @@ function request_start(ctx) {
 			let payload = portal.radius_init(ctx);
 			payload.username = ctx.format_mac + (ctx.config.mac_suffix || '');
 			payload.password = ctx.config.mac_passwd || ctx.format_mac;
-			payload.service_type = 2;
+			payload.service_type = 10;	// Call-Check, see https://wiki.freeradius.org/guide/mac-auth#web-auth-safe-mac-auth
 		        let radius = portal.radius_call(ctx, payload);
 			if (radius['access-accept']) {
 				if (ctx.config.final_redirect_url == 'uam')
