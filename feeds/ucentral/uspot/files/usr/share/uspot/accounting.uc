@@ -169,6 +169,33 @@ function client_interim(interface, mac, time) {
 	}
 }
 
+// ratelimit a client from radius reply attributes
+function client_ratelimit(interface, mac, state) {
+	if (!(state.data?.radius?.reply))
+		return;
+
+	let reply = state.data.radius.reply;
+
+	// check known attributes - WISPr: bps, ChiliSpot: kbps
+	let maxup = reply['WISPr-Bandwidth-Max-Up'] || reply['ChilliSpot-Bandwidth-Max-Up']*1000;
+	let maxdown = reply['WISPr-Bandwidth-Max-Down'] || reply['ChilliSpot-Bandwidth-Max-Down']*1000;
+
+	if (!(+maxdown || +maxup))
+		return;
+
+	let args = {
+		device: state.device,
+		address: mac,
+	};
+	if (+maxdown)
+		args.rate_egress = sprintf('%s', maxdown);
+	if (+maxup)
+		args.rate_ingress = sprintf('%s', maxup);
+
+	ubus.call('ratelimit', 'client_set', args);
+	syslog(interface, mac, 'ratelimiting client: ' + maxdown + '/' + maxup);
+}
+
 function client_add(interface, mac, state) {
 	if (state.state != 1)
 		return;
@@ -213,6 +240,9 @@ function client_add(interface, mac, state) {
 		}
 	}
 	syslog(interface, mac, 'adding client');
+
+	// apply ratelimiting rules, if any
+	client_ratelimit(interface, mac, state);
 }
 
 function client_kick(interface, mac, remove) {
@@ -243,8 +273,8 @@ function client_kick(interface, mac, remove) {
 function client_remove(interface, mac, reason) {
 	syslog(interface, mac, reason);
 	client_kick(interface, mac, true);
-	// delete ratelimit rules if any - ratelimit gets lc mac from portal
-	ubus.call('ratelimit', 'client_delete', { address: lc(mac) });
+	// delete ratelimit rules if any
+	ubus.call('ratelimit', 'client_delete', { address: mac });
 }
 
 function client_reset(interface, mac, reason) {

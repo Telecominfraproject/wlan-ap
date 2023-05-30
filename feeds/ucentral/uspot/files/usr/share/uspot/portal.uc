@@ -168,39 +168,11 @@ return {
 		else
 			include('allow.uc', ctx);
 
-		this.ratelimit_client(ctx, data);
-
 		// start accounting
 		ctx.ubus.call('uspot', 'client_add', {
 			interface: ctx.spotfilter,
 			address: ctx.mac,
 		});
-	},
-
-	// ratelimit a client from radius reply attributes
-	ratelimit_client: function(ctx, data) {
-		if (!(data?.radius?.reply))
-			return;
-
-		let reply = data.radius.reply;
-
-		// check known attributes - WISPr: bps, ChiliSpot: kbps
-		let maxup = reply['WISPr-Bandwidth-Max-Up'] || reply['ChilliSpot-Bandwidth-Max-Up']*1000;
-		let maxdown = reply['WISPr-Bandwidth-Max-Down'] || reply['ChilliSpot-Bandwidth-Max-Down']*1000;
-
-		if (!(+maxdown || +maxup))
-			return;
-
-		let args = {
-			device: ctx.device,
-			address: ctx.mac,
-		};
-		if (+maxdown)
-			args.rate_egress = sprintf('%s', maxdown);
-		if (+maxup)
-			args.rate_ingress = sprintf('%s', maxup);
-
-		ctx.ubus.call('ratelimit', 'client_set', args);
 	},
 
 	// put a client back into pre-auth state
