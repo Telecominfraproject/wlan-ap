@@ -27,6 +27,15 @@ define Device/edgecore_oap101_6e
 endef
 TARGET_DEVICES += edgecore_oap101_6e
 
+define Device/edgecore_oap101e
+  DEVICE_TITLE := EdgeCore OAP101 E
+  DEVICE_DTS := qcom-ipq5018-oap101e
+  SUPPORTED_DEVICES := edgecore,oap101e
+  DEVICE_PACKAGES := ath11k-wifi-edgecore-oap101 ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122 kmod-hwmon-tmp102 kmod-gpio-pca953x ugps kmod-tpm-tis-i2c
+  DEVICE_DTS_CONFIG := config@mp03.5-c1
+endef
+TARGET_DEVICES += edgecore_oap101e
+
 define Device/muxi_ap3220l
   DEVICE_TITLE := MUXI AP3220L
   DEVICE_DTS := qcom-ipq5018-muxi-ap3220l

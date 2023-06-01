@@ -85,6 +85,7 @@ platform_check_image() {
 	edgecore,eap102|\
 	edgecore,eap104|\
 	edgecore,oap101-6e|\
+	edgecore,oap101e|\
 	edgecore,eap106|\
 	hfcl,ion4xi|\
 	hfcl,ion4x|\
@@ -141,6 +142,7 @@ platform_do_upgrade() {
 	tplink,ex447|\
 	tplink,ex227|\
 	edgecore,oap101-6e|\
+	edgecore,oap101e|\
 	meshpp,s618-cp03|\
 	meshpp,s618-cp01)
 		nand_upgrade_tar "$1"
