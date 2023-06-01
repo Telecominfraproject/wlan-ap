@@ -281,6 +281,13 @@ return {
 			address: ctx.mac,
 		});
 
+		// stop if spotfilter doesn't reply
+		if (!connected) {
+			this.syslog(ctx, 'spotfilter error');
+			include('error.uc', ctx);
+			return NULL;
+		}
+
 		if (!uam && connected?.state) {
 			include('connected.uc', ctx);
 			return;
