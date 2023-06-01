@@ -231,17 +231,22 @@ return {
 		return reply;
 	},
 
-	uspot_macauth: function(ctx) {
-		let reply = ctx.ubus.call('uspot', 'client_macauth', {
+	uspot_auth: function(ctx, username, password) {
+		let payload = {
 			interface: ctx.spotfilter,
 			address: ctx.mac,
 			client_ip: ctx.env.REMOTE_ADDR,
 			ssid: ctx.ssid,
 			sessionid: ctx.sessionid,
-		});
+		};
+		if (username)
+			payload.username = username;
+		if (password)
+			payload.password = password;
 
-		return reply;
+		return ctx.ubus.call('uspot', 'client_auth', payload);
 	},
+
 
 	uam_url: function(ctx, res) {
 		let uam_url = ctx.config.uam_server +

@@ -473,13 +473,17 @@ function stop()
 
 function run_service() {
 	uconn.publish("uspot", {
-		client_macauth: {
+		client_auth: {
 			call: function(req) {
 				let interface = req.args.interface;
 				let address = req.args.address;
-				let ssid = req.args.ssid;
 				let client_ip = req.args.client_ip;
+				let username = req.args.username;
+				let password = req.args.password;
+				let ssid = req.args.ssid;
 				let sessionid = req.args.sessionid || generate_sessionid();
+
+				let try_macauth = false;
 
 				if (!interface || !address || !client_ip)
 					return { 'access-accept': 0 };
@@ -489,20 +493,29 @@ function run_service() {
 
 				let settings = interfaces[interface].settings;
 
-				if (!+settings.mac_auth)
-					return { 'access-accept': 0 };
+				if (!username && !password) {
+					if  (!+settings.mac_auth)	// don't try mac-auth if not allowed
+						return { 'access-accept': 0 };
+					else
+						try_macauth = true;
+				}
 
 				let fmac = format_mac(interface, address);
 
 				let request = {
-					username: fmac + (settings.mac_suffix || ''),
-					password: settings.mac_passwd || fmac,
-					service_type: 10,	// Call-Check, see https://wiki.freeradius.org/guide/mac-auth#web-auth-safe-mac-auth
+					username,
+					password,
 					calling_station: fmac,
 					called_station: settings.nas_mac + ':' + ssid,
 					acct_session: sessionid,
 					client_ip,
 				};
+
+				if (try_macauth) {
+					request.username = fmac + (settings.mac_suffix || '');
+					request.password = settings.mac_passwd || fmac;
+					request.service_type = 10;	// Call-Check, see https://wiki.freeradius.org/guide/mac-auth#web-auth-safe-mac-auth
+				}
 
 				request = radius_init(interface, address, request, true);
 
@@ -510,15 +523,33 @@ function run_service() {
 
 				if (radius['access-accept']) {
 					delete request.server;	// don't publish RADIUS server secret
-					allow_client(interface, address, { radius: { radius.reply, request } });	// XXX && client_add()
+					allow_client(interface, address, {
+						username,	// XXX does anything use this? comes from handler.uc radius & credentials auth
+						radius: { reply: radius.reply, request }
+					});	// XXX && client_add()
 				}
 
 				return radius;
 			},
+			/*
+			 @param interface: REQUIRED: uspot interface
+			 @param address: REQUIRED: client MAC address
+			 @param client_ip: REQUIRED: client IP
+			 @param username: OPTIONAL: client username
+			 @param password: OPTIONAL: client password
+			 @param ssid: OPTIONAL: client SSID
+			 @param sessionid: OPTIONAL: accounting session ID
+
+			 operation:
+			  - call with (interface, address, client_ip) -> RADIUS MAC authentication
+			  - call with (interface, address, client_ip, username, password) -> RADIUS password auth
+			 */
 			args: {
 				interface:"",
 				address:"",
 				client_ip:"",
+				username:"",
+				password:"",
 				ssid:"",
 				sessionid:"",
 			}
