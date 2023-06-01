@@ -38,8 +38,7 @@ function auth_client(ctx) {
 		if (ctx.config.final_redirect_url == 'uam')
 			ctx.query_string.userurl = portal.uam_url(ctx, 'success');
 
-		delete payload.server;	// don't publish server secrets
-		portal.allow_client(ctx, { radius: { reply: radius.reply, request: payload } } );
+		portal.allow_client(ctx);
 		return;
 	}
 

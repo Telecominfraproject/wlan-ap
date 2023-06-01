@@ -137,36 +137,8 @@ return {
 		return mac;
 	},
 
-	// wrapper for scraping external tools stdout
-	fs_popen: function(cmd) {
-		let stdout = fs.popen(cmd);
-	        if (!stdout)
-			return null;
-
-		let reply = null;
-		try {
-			reply = json(stdout.read('all'));
-		} catch(e) {
-
-		}
-		stdout.close();
-		return reply;
-	},
-
 	// give a client access to the internet
-	allow_client: function(ctx, data) {
-		this.syslog(ctx, 'allow client to pass traffic');
-		ctx.ubus.call('spotfilter', 'client_set', {
-			"interface": ctx.spotfilter,
-			"address": ctx.mac,
-			"state": 1,
-			"dns_state": 1,
-			"accounting": [ "dl", "ul"],
-			"data": {
-				... data || {},
-				"connect": time(),
-			}
-		});
+	allow_client: function(ctx) {
 		if (ctx.query_string.userurl)
 			include('redir.uc', { redir_location: ctx.query_string.userurl });
 		else
@@ -193,44 +165,7 @@ return {
 		});
 	},
 
-	// generate the default radius auth payload
-	radius_init: function(ctx) {
-		if (!ctx.sessionid)
-			ctx.sessionid = this.session_init();
-		let payload = {
-			server: sprintf('%s:%s:%s', ctx.config.auth_server, ctx.config.auth_port, ctx.config.auth_secret),
-			acct_session: ctx.sessionid,
-			client_ip: ctx.env.REMOTE_ADDR,
-			called_station: ctx.config.nasmac + ':' + ctx.ssid,
-			calling_station: ctx.format_mac,
-			nas_ip: ctx.env.SERVER_ADDR,
-			nas_id: ctx.config.nasid,
-			nas_port_type: 19,	// wireless
-		};
-
-		if (ctx.config.location_name)
-			payload.location_name = ctx.config.location_name;
-		if (ctx.config.auth_proxy)
-			payload.auth_proxy = ctx.config.auth_proxy;
-
-		return payload;
-	},
-
-	// call radius-client with the provided payload and return reply
-	radius_call: function(ctx, payload) {
-		let path = '/tmp/auth' + ctx.mac + '.json';
-		let cfg = fs.open(path, 'w');
-		cfg.write(payload);
-		cfg.close();
-
-		let reply = this.fs_popen('/usr/bin/radius-client ' + path);
-
-		if (!+config.def_captive.debug)
-			fs.unlink(path);
-
-		return reply;
-	},
-
+	// request authentication from uspot backend, return reply 'access-accept': 0 or 1
 	uspot_auth: function(ctx, username, password, challenge, extra) {
 		let payload = {
 			interface: ctx.spotfilter,

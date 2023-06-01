@@ -28,8 +28,7 @@ function request_start(ctx) {
 			if (radius && radius['access-accept']) {
 				if (ctx.config.final_redirect_url == 'uam')
 					ctx.query_string.userurl = portal.uam_url(ctx, 'success');
-				delete payload.server;  // don't publish radius secrets
-				portal.allow_client(ctx, { radius: { reply: radius.reply, request: payload } } );
+				portal.allow_client(ctx);
 				return;
 			}
 		}
@@ -86,7 +85,7 @@ function request_credentials(ctx) {
 		    ctx.form_data.password != cred.password)
 			continue;
 
-		portal.allow_client(ctx, { username: ctx.form_data.username });
+		portal.allow_client(ctx);
 		return;
 	}
 
@@ -116,8 +115,7 @@ function request_radius(ctx) {
 
         let radius = portal.uspot_auth(ctx, username, password);
 	if (radius && radius['access-accept']) {
-		delete payload.server;	// don't publish radius secrets
-                portal.allow_client(ctx, { username: ctx.form_data.username, radius: { reply: radius.reply, request: payload } } );
+                portal.allow_client(ctx);
                 return;
         }
 
