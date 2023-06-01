@@ -231,18 +231,21 @@ return {
 		return reply;
 	},
 
-	uspot_auth: function(ctx, username, password) {
+	uspot_auth: function(ctx, username, password, challenge, extra) {
 		let payload = {
 			interface: ctx.spotfilter,
 			address: ctx.mac,
 			client_ip: ctx.env.REMOTE_ADDR,
 			ssid: ctx.ssid,
 			sessionid: ctx.sessionid,
+			reqdata: { ... extra || {} },
 		};
 		if (username)
 			payload.username = username;
 		if (password)
 			payload.password = password;
+		if (challenge)
+			payload.challenge = challenge;
 
 		return ctx.ubus.call('uspot', 'client_auth', payload);
 	},

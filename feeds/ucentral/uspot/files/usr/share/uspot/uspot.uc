@@ -480,8 +480,10 @@ function run_service() {
 				let client_ip = req.args.client_ip;
 				let username = req.args.username;
 				let password = req.args.password;
+				let challenge = req.args.challenge;
 				let ssid = req.args.ssid;
 				let sessionid = req.args.sessionid || generate_sessionid();
+				let reqdata = req.args.reqdata;
 
 				let try_macauth = false;
 
@@ -504,11 +506,11 @@ function run_service() {
 
 				let request = {
 					username,
-					password,
 					calling_station: fmac,
 					called_station: settings.nas_mac + ':' + ssid,
 					acct_session: sessionid,
 					client_ip,
+					... reqdata || {},
 				};
 
 				if (try_macauth) {
@@ -516,6 +518,12 @@ function run_service() {
 					request.password = settings.mac_passwd || fmac;
 					request.service_type = 10;	// Call-Check, see https://wiki.freeradius.org/guide/mac-auth#web-auth-safe-mac-auth
 				}
+				else if (challenge) {
+					request.chap_password = password;
+					request.chap_challenge = challenge;
+				}
+				else
+					request.password = password;
 
 				request = radius_init(interface, address, request, true);
 
@@ -536,13 +544,16 @@ function run_service() {
 			 @param address: REQUIRED: client MAC address
 			 @param client_ip: REQUIRED: client IP
 			 @param username: OPTIONAL: client username
-			 @param password: OPTIONAL: client password
+			 @param password: OPTIONAL: client password or CHAP password
+			 @param challenge: OPTIONAL: client CHAP challenge
 			 @param ssid: OPTIONAL: client SSID
 			 @param sessionid: OPTIONAL: accounting session ID
+			 @param reqdata: OPTIONAL: additional RADIUS request data - to be passed verbatim to radius-client
 
 			 operation:
 			  - call with (interface, address, client_ip) -> RADIUS MAC authentication
 			  - call with (interface, address, client_ip, username, password) -> RADIUS password auth
+			  - call with (interface, address, client_ip, username, password, challenge) -> RADIUS CHAP challenge auth
 			 */
 			args: {
 				interface:"",
@@ -550,8 +561,10 @@ function run_service() {
 				client_ip:"",
 				username:"",
 				password:"",
+				challenge:"",
 				ssid:"",
 				sessionid:"",
+				reqdata:{},
 			}
 		},
 		client_add: {

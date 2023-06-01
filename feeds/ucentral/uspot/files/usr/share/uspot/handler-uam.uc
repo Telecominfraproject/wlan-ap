@@ -12,18 +12,20 @@ let uam = require('uam');
 
 // log the client in via radius
 function auth_client(ctx) {
+	let username;
 	let password;
-	let payload = portal.radius_init(ctx);
+	let challenge;
+	let payload = {};
 
 	payload.logoff_url = sprintf('http://%s:%s/logoff', ctx.env.SERVER_ADDR, ctx.config.uam_port);
 	if (ctx.query_string.username) {	// username must be set
-		payload.username = ctx.query_string.username;
+		username = ctx.query_string.username;
 		if (ctx.query_string.response) {	// try challenge first
-			let challenge = uam.md5(ctx.config.challenge, ctx.format_mac);
-			payload.chap_password = ctx.query_string.response;
-			payload.chap_challenge = ctx.config.uam_secret ? uam.chap_challenge(challenge, ctx.config.uam_secret) : challenge;
+			challenge = uam.md5(ctx.config.challenge, ctx.format_mac);
+			password = ctx.query_string.response;
+			challenge = ctx.config.uam_secret ? uam.chap_challenge(challenge, ctx.config.uam_secret) : challenge;
 		} else if ("password" in ctx.query_string) {	// allow empty password
-			payload.password = !ctx.config.uam_secret ? ctx.query_string.password :
+			password = !ctx.config.uam_secret ? ctx.query_string.password :
 				uam.password(uam.md5(ctx.config.challenge, ctx.format_mac), ctx.query_string.password, ctx.config.uam_secret);
 		}
 	} else {
@@ -31,8 +33,8 @@ function auth_client(ctx) {
 		return;
 	}
 
-        let radius = portal.radius_call(ctx, payload);
-	if (radius['access-accept']) {
+        let radius = portal.uspot_auth(ctx, username, password, challenge, payload);
+	if (radius && radius['access-accept']) {
 		if (ctx.config.final_redirect_url == 'uam')
 			ctx.query_string.userurl = portal.uam_url(ctx, 'success');
 
