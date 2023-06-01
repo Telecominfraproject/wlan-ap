@@ -231,6 +231,18 @@ return {
 		return reply;
 	},
 
+	uspot_macauth: function(ctx) {
+		let reply = ctx.ubus.call('uspot', 'client_macauth', {
+			interface: ctx.spotfilter,
+			address: ctx.mac,
+			client_ip: ctx.env.REMOTE_ADDR,
+			ssid: ctx.ssid,
+			sessionid: ctx.sessionid,
+		});
+
+		return reply;
+	},
+
 	uam_url: function(ctx, res) {
 		let uam_url = ctx.config.uam_server +
 			'?res=' + res +

@@ -24,15 +24,11 @@ function request_start(ctx) {
 	case 'uam':
 		// try mac-auth first if enabled
 		if (+ctx.config.mac_auth) {
-			let payload = portal.radius_init(ctx);
-			payload.username = ctx.format_mac + (ctx.config.mac_suffix || '');
-			payload.password = ctx.config.mac_passwd || ctx.format_mac;
-			payload.service_type = 10;	// Call-Check, see https://wiki.freeradius.org/guide/mac-auth#web-auth-safe-mac-auth
-		        let radius = portal.radius_call(ctx, payload);
-			if (radius['access-accept']) {
+		        let radius = portal.uspot_macauth(ctx);
+			if (radius && radius['access-accept']) {
 				if (ctx.config.final_redirect_url == 'uam')
 					ctx.query_string.userurl = portal.uam_url(ctx, 'success');
-				delete payload.server;	// don't publish radius secrets
+				delete payload.server;  // don't publish radius secrets
 				portal.allow_client(ctx, { radius: { reply: radius.reply, request: payload } } );
 				return;
 			}
@@ -120,7 +116,7 @@ function request_radius(ctx) {
 	payload.password = ctx.form_data.password;
 
         let radius = portal.radius_call(ctx, payload);
-	if (radius['access-accept']) {
+	if (radius && radius['access-accept']) {
 		delete payload.server;	// don't publish radius secrets
                 portal.allow_client(ctx, { username: ctx.form_data.username, radius: { reply: radius.reply, request: payload } } );
                 return;

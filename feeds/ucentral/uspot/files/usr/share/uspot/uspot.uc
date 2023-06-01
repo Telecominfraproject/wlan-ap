@@ -18,12 +18,22 @@ let uciload = uci.foreach('uspot', 'uspot', (d) => {
 		interfaces[d[".name"]] = {
 		settings: {
 			accounting,
+			auth_server: d.auth_server,
+			auth_secret: d.auth_secret,
+			auth_port: d.auth_port || 1812,
+			auth_proxy: d.auth_proxy,
 			acct_server: d.acct_server,
 			acct_secret: d.acct_secret,
 			acct_port: d.acct_port || 1813,
 			acct_proxy: d.acct_proxy,
 			acct_interval: d.acct_interval,
 			nas_id: d.nasid,
+			nas_mac: d.nasmac,
+			mac_auth: d.mac_auth,
+			mac_passwd: d.mac_passwd,
+			mac_suffix: d.mac_suffix,
+			mac_format: d.mac_format,
+			location_name: d.location_name,
 			idle_timeout: d.idle_timeout || 600,
 			session_timeout: d.session_timeout || 0,
 			debug: d.debug,
@@ -52,15 +62,81 @@ function debug(interface, mac, msg) {
 		syslog(interface, mac, msg);
 }
 
-function radius_init(interface, mac, payload) {
+// mac re-formater
+function format_mac(interface, mac) {
+	let format = interfaces[interface].settings.mac_format;
+
+	switch(format) {
+	case 'aabbccddeeff':
+	case 'AABBCCDDEEFF':
+		mac = replace(mac, ':', '');
+		break;
+	case 'aa-bb-cc-dd-ee-ff':
+	case 'AA-BB-CC-DD-EE-FF':
+		mac = replace(mac, ':', '-');
+		break;
+	}
+
+	switch(format) {
+	case 'aabbccddeeff':
+	case 'aa-bb-cc-dd-ee-ff':
+	case 'aa:bb:cc:dd:ee:ff':
+		mac = lc(mac);
+		break;
+	case 'AABBCCDDEEFF':
+	case 'AA:BB:CC:DD:EE:FF':
+	case 'AA-BB-CC-DD-EE-FF':
+		mac = uc(mac);
+		break;
+	}
+
+	return mac;
+}
+
+function json_cmd(cmd) {
+	let stdout = fs.popen(cmd);
+	if (!stdout)
+		return null;
+
+	let reply = null;
+	try {
+		reply = json(stdout.read('all'));
+	} catch(e) {
+	}
+	stdout.close();
+	return reply;
+}
+
+function generate_sessionid() {
+	let math = require('math');
+	let sessionid = '';
+
+	for (let i = 0; i < 16; i++)
+		sessionid += sprintf('%x', math.rand() % 16);
+
+	return sessionid;
+}
+
+function radius_init(interface, mac, payload, auth) {
 	let settings = interfaces[interface].settings;
 
-	payload.acct_server = sprintf('%s:%s:%s', settings.acct_server, settings.acct_port, settings.acct_secret);
-	payload.nas_id = settings.nas_id;
-	if (settings.acct_proxy)
-		payload.acct_proxy = settings.acct_proxy;
+	if (auth) {
+		payload.server = sprintf('%s:%s:%s', settings.auth_server, settings.auth_port, settings.auth_secret);
+		if (settings.auth_proxy)
+			payload.auth_proxy = settings.auth_proxy;
+		payload.nas_port_type = 19;	// wireless
+	}
+	else {
+		payload.acct_server = sprintf('%s:%s:%s', settings.acct_server, settings.acct_port, settings.acct_secret);
+		if (settings.acct_proxy)
+			payload.acct_proxy = settings.acct_proxy;
+	}
 
-	if (mac) {
+	payload.nas_id = settings.nas_id;	// XXX RFC says NAS-IP is not required when NAS-ID is set, but it's added by libradcli anyway
+	if (settings.location_name)
+		payload.location_name = settings.location_name;
+
+	if (!auth && mac) {
 		// dealing with client accounting
 		let client = interfaces[interface].clients[mac];
 		for (let key in [ 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_port_type', 'username', 'location_name' ])
@@ -77,10 +153,12 @@ function radius_call(interface, mac, payload) {
 	cfg.write(payload);
 	cfg.close();
 
-	system('/usr/bin/radius-client ' + path);
+	let reply = json_cmd('/usr/bin/radius-client ' + path);
 
 	if (!+interfaces[interface].settings.debug)
 		fs.unlink(path);
+
+	return reply;
 }
 
 // RADIUS Acct-Status-Type attributes
@@ -289,11 +367,7 @@ function client_reset(interface, mac, reason) {
 function radius_accton(interface)
 {
 	// assign a global interface session ID for Accounting-On/Off messages
-	let math = require('math');
-	let sessionid = '';
-
-	for (let i = 0; i < 16; i++)
-		sessionid += sprintf('%x', math.rand() % 16);
+	let sessionid = generate_sessionid();
 
 	interfaces[interface].sessionid = sessionid;
 
@@ -354,6 +428,22 @@ function accounting(interface) {
 	}
 }
 
+// give a client access to the internet
+function allow_client(interface, address, data) {
+	syslog(interface, address, 'allow client to pass traffic');
+	ubus.call('spotfilter', 'client_set', {
+		interface,
+		address,
+		state: 1,
+		dns_state: 1,
+		accounting: [ "dl", "ul"],
+		data: {
+			... data || {},
+			connect: time(),
+		}
+	});
+}
+
 function start()
 {
 	let seen = {};
@@ -383,6 +473,56 @@ function stop()
 
 function run_service() {
 	uconn.publish("uspot", {
+		client_macauth: {
+			call: function(req) {
+				let interface = req.args.interface;
+				let address = req.args.address;
+				let ssid = req.args.ssid;
+				let client_ip = req.args.client_ip;
+				let sessionid = req.args.sessionid || generate_sessionid();
+
+				if (!interface || !address || !client_ip)
+					return { 'access-accept': 0 };
+
+				if (!(interface in interfaces))
+					return { 'access-accept': 0 };
+
+				let settings = interfaces[interface].settings;
+
+				if (!+settings.mac_auth)
+					return { 'access-accept': 0 };
+
+				let fmac = format_mac(interface, address);
+
+				let request = {
+					username: fmac + (settings.mac_suffix || ''),
+					password: settings.mac_passwd || fmac,
+					service_type: 10,	// Call-Check, see https://wiki.freeradius.org/guide/mac-auth#web-auth-safe-mac-auth
+					calling_station: fmac,
+					called_station: settings.nas_mac + ':' + ssid,
+					acct_session: sessionid,
+					client_ip,
+				};
+
+				request = radius_init(interface, address, request, true);
+
+				let radius = radius_call(interface, address, request);
+
+				if (radius['access-accept']) {
+					delete request.server;	// don't publish RADIUS server secret
+					allow_client(interface, address, { radius: { radius.reply, request } });	// XXX && client_add()
+				}
+
+				return radius;
+			},
+			args: {
+				interface:"",
+				address:"",
+				client_ip:"",
+				ssid:"",
+				sessionid:"",
+			}
+		},
 		client_add: {
 			call: function(req) {
 				let interface = req.args.interface;
