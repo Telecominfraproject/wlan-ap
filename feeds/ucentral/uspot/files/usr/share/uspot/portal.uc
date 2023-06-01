@@ -221,12 +221,16 @@ return {
 		let query_string = {};
 		let post_data = '';
 		let ctx = { env, header: this.header, footer: this.footer, mac, form_data, post_data, query_string, config: this.config, PO };
+		let dev;
 
 		// lookup the peers MAC
 		let macs = this.rtnl.request(this.rtnl.const.RTM_GETNEIGH, this.rtnl.const.NLM_F_DUMP, { });
-		for (let m in macs)
-			if (m.dst == env.REMOTE_HOST && m.lladdr)
+		for (let m in macs) {
+			if (m.dst == env.REMOTE_HOST && m.lladdr) {
 				ctx.mac = m.lladdr;
+				dev = m.dev;
+			}
+		}
 
 		// if the MAC lookup failed, go to the error page
 		if (!ctx.mac) {
@@ -234,7 +238,7 @@ return {
 			include('error.uc', ctx);
 			return NULL;
 		}
-		ctx.spotfilter = lookup_station(ctx.mac);
+		ctx.spotfilter = lookup_station(ctx.mac) || devices[dev];	// fallback to rtnl device
 		ctx.config = config[ctx.spotfilter] || {};
 		ctx.format_mac = this.format_mac(ctx.config.mac_format, ctx.mac);
 		if (+ctx.config.web_root) {
