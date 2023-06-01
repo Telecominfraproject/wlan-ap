@@ -18,7 +18,7 @@ function auth_client(ctx) {
 		if (ctx.query_string.response) {	// try challenge first
 			let challenge = uam.md5(ctx.config.challenge, ctx.format_mac);
 			payload.chap_password = ctx.query_string.response;
-			payload.chap_challenge = ctx.config.secret ? uam.chap_challenge(challenge, ctx.config.uam_secret) : challenge;
+			payload.chap_challenge = ctx.config.uam_secret ? uam.chap_challenge(challenge, ctx.config.uam_secret) : challenge;
 		} else if ("password" in ctx.query_string) {	// allow empty password
 			payload.password = !ctx.config_uam_secret ? ctx.query_string.password :
 				uam.password(uam.md5(ctx.config.challenge, ctx.format_mac), ctx.query_string.password, ctx.config.uam_secret);
