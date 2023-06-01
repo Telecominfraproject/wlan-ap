@@ -113,7 +113,6 @@ function request_radius(ctx) {
 
 	// trigger the radius auth
 	let payload = portal.radius_init(ctx);
-	payload.type = 'auth';
 	payload.username = ctx.form_data.username;
 	payload.password = ctx.form_data.password;
 
