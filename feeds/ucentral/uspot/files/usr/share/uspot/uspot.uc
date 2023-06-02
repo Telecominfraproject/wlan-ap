@@ -94,6 +94,7 @@ function format_mac(interface, mac) {
 	return mac;
 }
 
+// wrapper for scraping external tools JSON stdout
 function json_cmd(cmd) {
 	let stdout = fs.popen(cmd);
 	if (!stdout)
@@ -118,6 +119,17 @@ function generate_sessionid() {
 	return sessionid;
 }
 
+/**
+ * Augment and return RADIUS payload with necessary fields.
+ * This function adds to an existing RADIUS payload the necessary Authentication or Accounting requests fields:
+ * server, proxy, NAS-ID, and in the case of client accounting, client identification data.
+ *
+ * @param {string} interface the target uspot interface
+ * @param {?string} mac the client MAC address (for client accounting)
+ * @param {object} payload the RADIUS payload
+ * @param {?boolean} auth true for Radius Authentication, else Accounting request.
+ * @returns {object) the augmented payload
+ */
 function radius_init(interface, mac, payload, auth) {
 	let settings = interfaces[interface].settings;
 
@@ -149,6 +161,14 @@ function radius_init(interface, mac, payload, auth) {
 	return payload;
 }
 
+/**
+ * Execute "radius-client" with the provided RADIUS payload, return reply.
+ *
+ * @param {string} interface the target uspot interface (used for debugging only)
+ * @param {?string} mac the optional client MAC address
+ * @param {object} payload the RADIUS payload
+ * @returns {object} "radius-client" reply
+ */
 function radius_call(interface, mac, payload) {
 	let path = '/tmp/u' + (payload.acct ? "acct" : "auth") + (mac || payload.acct_session) + '.json';
 	let cfg = fs.open(path, 'w');
@@ -170,6 +190,16 @@ const radat_interim = 3;	// Interim-Update
 const radat_accton = 7;		// Accounting-On
 const radat_acctoff = 8;	// Accounting-Off
 
+/**
+ * Send RADIUS client accounting.
+ * This function computes and populates the following RADIUS payload fields:
+ * session_time, {input,output}_{octets,gigawords,packets} and class;
+ * it then executes a RADIUS Accounting request with these elements.
+ *
+ * @param {string} interface the target uspot interface
+ * @param {string} mac the client MAC address
+ * @param {object} payload the RADIUS payload
+ */
 function radius_acct(interface, mac, payload) {
 	let client = interfaces[interface].clients[mac];
 	let state = uconn.call('spotfilter', 'client_get', {
@@ -204,6 +234,13 @@ const radtc_idleto = 4;		// Idle Timeout
 const radtc_sessionto = 5;	// Session Timeout
 const radtc_adminreset = 6;	// Admin Reset
 
+/**
+ * Terminate a client RADIUS accounting.
+ *
+ * @param {string} interface the target uspot interface
+ * @param {string} mac the client MAC address
+ * @param {number} cause the RADIUS Acct-Terminate-Cause value
+ */
 function radius_terminate(interface, mac, cause) {
 	if (!interfaces[interface].clients[mac].radius)
 		return;
@@ -216,6 +253,12 @@ function radius_terminate(interface, mac, cause) {
 	radius_acct(interface, mac, payload);
 }
 
+/**
+ * Start a client RADIUS accounting.
+ *
+ * @param {string} interface the target uspot interface
+ * @param {string} mac the client MAC address
+ */
 function radius_start(interface, mac) {
 	let payload = {
 		acct_type: radat_start,
@@ -224,6 +267,12 @@ function radius_start(interface, mac) {
 	radius_acct(interface, mac, payload);
 }
 
+/**
+ * Send interim client RADIUS accounting.
+ *
+ * @param {string} interface the target uspot interface
+ * @param {string} mac the client MAC address
+ */
 function radius_interim(interface, mac) {
 	let payload = {
 		acct_type: radat_interim,
@@ -232,6 +281,15 @@ function radius_interim(interface, mac) {
 	debug(interface, mac, 'iterim acct call');
 }
 
+/**
+ * Uspot internal client accounting.
+ * This function keeps track of the last known spotfilter accounting data,
+ * and optionally sends interim RADIUS reports if configured
+ *
+ * @param {string} interface the target uspot interface
+ * @param {string} mac the client MAC address
+ * @param {?number} time the UNIX time of the report (only for RADIUS requests)
+ */
 function client_interim(interface, mac, time) {
 	let client = interfaces[interface].clients[mac];
 
@@ -254,7 +312,15 @@ function client_interim(interface, mac, time) {
 	}
 }
 
-// ratelimit a client from radius reply attributes
+/**
+ * Apply RADIUS-provided client bandwidth limits.
+ * This function parses a radius reply for the following attributes:
+ * 'WISPr-Bandwidth-Max-{Up,Down}' or 'ChilliSpot-Bandwidth-Max-{Up,Down}'
+ * and enforces these limits if present.
+ *
+ * @param {string} interface the target uspot interface
+ * @param {string} mac the client MAC address
+ */
 function client_ratelimit(interface, mac) {
 	let client = interfaces[interface].clients[mac];
 
@@ -283,6 +349,14 @@ function client_ratelimit(interface, mac) {
 	syslog(interface, mac, 'ratelimiting client: ' + maxdown + '/' + maxup);
 }
 
+/**
+ * Add an authenticated but not yet validated client to the backend.
+ * This function adds a client that passed authentication, but hasn't yet been enabled.
+ * If the client isn't subsequently enabled, it will be purged after a 60s grace period.
+ *
+ * @param {string} interface the target uspot interface
+ * @param {string} mac the client MAC address
+ */
 function client_create(interface, mac, payload)
 {
 	let client = {
@@ -294,6 +368,7 @@ function client_create(interface, mac, payload)
 
 	interfaces[interface].clients[mac] = client;
 
+	// if debug, save entire client payload to spotfilter
 	if (interfaces[interface].settings.debug)
 		uconn.call('spotfilter', 'client_set', {
 			interface,
@@ -304,6 +379,15 @@ function client_create(interface, mac, payload)
 	debug(interface, mac, 'creating client');
 }
 
+/**
+ * Enable an authenticated client to pass traffic.
+ * This function authorizes a client, applying RADIUS-provided limits if any:
+ * 'Acct-Interim-Interval', 'Session-Timeout', 'Idle-Timeout' and 'ChilliSpot-Max-Total-Octets'.
+ * It updates spotfilter state for authorization, starts RADIUS accounting and ratelimit as needed.
+ *
+ * @param {string} interface the target uspot interface
+ * @param {string} mac the client MAC address
+ */
 function client_enable(interface, mac) {
 	let defval = 0;
 
@@ -367,6 +451,14 @@ function client_enable(interface, mac) {
 	client_ratelimit(interface, mac);
 }
 
+/**
+ * Kick a client from the system.
+ * This function deletes a client from the backend, and removes existing connection flows.
+ *
+ * @param {string} interface the target uspot interface
+ * @param {string} mac the client MAC address
+ * @param {boolean} remove calls 'spotfilter client_remove' if true, otherwise client state is only reset to 0
+ */
 function client_kick(interface, mac, remove) {
 	debug(interface, mac, 'stopping accounting');
 	let payload = {
@@ -404,6 +496,11 @@ function client_reset(interface, mac, reason) {
 	client_kick(interface, mac, false);
 }
 
+/**
+ * Signal beginning of RADIUS accounting for this NAS.
+ *
+ * @param {string} interface the target uspot interface
+ */
 function radius_accton(interface)
 {
 	// assign a global interface session ID for Accounting-On/Off messages
@@ -421,6 +518,11 @@ function radius_accton(interface)
 	debug(interface, null, 'acct-on call');
 }
 
+/**
+ * Signal end of RADIUS accounting for this NAS.
+ *
+ * @param {string} interface the target uspot interface
+ */
 function radius_acctoff(interface)
 {
 	let payload = {
@@ -433,6 +535,16 @@ function radius_acctoff(interface)
 	debug(interface, null, 'acct-off call');
 }
 
+/**
+ * Perform accounting housekeeping for a uspot interface.
+ * This function goes throught the list of known clients and performs:
+ * - cleanup authenticated but not enabled clients after 60s grace period;
+ * - cleanup when a client is no longer known to spotfilter;
+ * - client termination on idle timeout, session timeout or data budget expiration.
+ * - RADIUS interim accounting report
+ *
+ * @param {string} interface the target uspot interface
+ */
 function accounting(interface) {
 	let list = uconn.call('spotfilter', 'client_list', { interface });
 	let t = time();
@@ -479,6 +591,7 @@ function start()
 {
 	let seen = {};
 
+	// for each unique interface/nasid with configured RADIUS, send Accounting-On
 	for (let interface, data in interfaces) {
 		let server = data.settings.acct_server;
 		let nasid = data.settings.nas_id;
@@ -616,6 +729,7 @@ function run_service() {
 			 @param ssid: OPTIONAL: client SSID
 			 @param sessionid: OPTIONAL: accounting session ID
 			 @param reqdata: OPTIONAL: additional RADIUS request data - to be passed verbatim to radius-client
+			 @param return {object} "{"access-accept":N}" where N==1 if auth succeeded, 0 otherwise
 
 			 operation:
 			  - call with (interface, address, client_ip) -> click-to-continue or RADIUS MAC authentication
@@ -656,6 +770,12 @@ function run_service() {
 
 				return 0;
 			},
+			/*
+			 Enable a previously authenticated client to pass traffic.
+			 XXX REVIEW: we might want to squash that into client_auth()
+			 @param interface: REQUIRED: uspot interface
+			 @param address: REQUIRED: client MAC address
+			 */
 			args: {
 				interface:"",
 				address:"",
@@ -680,6 +800,11 @@ function run_service() {
 
 				return 0;
 			},
+			/*
+			 Delete a client from the system.
+			 @param interface: REQUIRED: uspot interface
+			 @param address: REQUIRED: client MAC address
+			 */
 			args: {
 				interface:"",
 				address:"",
@@ -704,6 +829,11 @@ function run_service() {
 
 				return client.data || {};
 			},
+			/*
+			 Get a client public state.
+			 @param interface: REQUIRED: uspot interface
+			 @param address: REQUIRED: client MAC address
+			 */
 			args: {
 				interface:"",
 				address:"",
@@ -725,6 +855,10 @@ function run_service() {
 
 				return payload;
 			},
+			/*
+			 List all clients for a given interface.
+			 @param interface: REQUIRED: uspot interface
+			 */
 			args: {
 				interface:"",
 			}
