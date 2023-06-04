@@ -91,3 +91,12 @@ define Device/qcom_mp03_3
   DEVICE_DTS_CONFIG := config@mp03.3
 endef
 TARGET_DEVICES += qcom_mp03_3
+
+define Device/yuncore_fap655
+  DEVICE_TITLE := Yuncore FAP650
+  DEVICE_DTS := qcom-ipq5018-yuncore-fap655
+  SUPPORTED_DEVICES := yuncore,fap655
+  DEVICE_PACKAGES := ath11k-wifi-yuncore-fap655 ath11k-firmware-ipq50xx-map-spruce -kmod-usb-dwc3-of-simple kmod-usb-dwc3-qcom kmod-usb3
+  DEVICE_DTS_CONFIG := config@mp03.3
+endef
+TARGET_DEVICES += yuncore_fap655

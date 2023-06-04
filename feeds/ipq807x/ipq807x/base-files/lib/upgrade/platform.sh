@@ -144,6 +144,7 @@ platform_check_image() {
 	tplink,ex447|\
 	yuncore,ax840|\
 	yuncore,fap650|\
+	yuncore,fap655|\
 	motorola,q14|\
 	muxi,ap3220l|\
 	qcom,ipq6018-cp01|\
@@ -256,7 +257,8 @@ platform_do_upgrade() {
 		PART_NAME="inactive"
 		platform_do_upgrade_dualboot_datachk "$1"
 		;;
-	yuncore,ax840)
+	yuncore,ax840|\
+	yuncore,fap655)
 		[ -f /proc/boot_info/rootfs/upgradepartition ] && {
 			CI_UBIPART="$(cat /proc/boot_info/rootfs/upgradepartition)"
 			CI_BOOTCFG=1
