@@ -7,7 +7,8 @@
 
 let fs = require('fs');
 let uloop = require('uloop');
-let ubus = require('ubus').connect();
+let ubus = require('ubus');
+let uconn = ubus.connect();
 let uci = require('uci').cursor();
 let interfaces = {};
 
@@ -90,7 +91,7 @@ const radat_accton = 7;		// Accounting-On
 const radat_acctoff = 8;	// Accounting-Off
 
 function radius_acct(interface, mac, payload) {
-	let state = ubus.call('spotfilter', 'client_get', {
+	let state = uconn.call('spotfilter', 'client_get', {
 		interface,
 		address: mac
 	}) || interfaces[interface].clients[mac];	// fallback to last known state
@@ -154,7 +155,7 @@ function client_interim(interface, mac, time) {
 	let client = interfaces[interface].clients[mac];
 
 	// preserve a copy of last spotfilter stats for use in disconnect case
-	let state = ubus.call('spotfilter', 'client_get', {
+	let state = uconn.call('spotfilter', 'client_get', {
 		interface,
 		address: mac
 	});
@@ -195,7 +196,7 @@ function client_ratelimit(interface, mac, state) {
 	if (+maxup)
 		args.rate_ingress = sprintf('%s', maxup);
 
-	ubus.call('ratelimit', 'client_set', args);
+	uconn.call('ratelimit', 'client_set', args);
 	syslog(interface, mac, 'ratelimiting client: ' + maxdown + '/' + maxup);
 }
 
@@ -261,7 +262,7 @@ function client_kick(interface, mac, remove) {
 		}),
 	};
 
-	ubus.call('spotfilter', remove ? 'client_remove' : 'client_set', payload);
+	uconn.call('spotfilter', remove ? 'client_remove' : 'client_set', payload);
 
 	let client = interfaces[interface].clients[mac];
 
@@ -277,7 +278,7 @@ function client_remove(interface, mac, reason) {
 	syslog(interface, mac, reason);
 	client_kick(interface, mac, true);
 	// delete ratelimit rules if any
-	ubus.call('ratelimit', 'client_delete', { address: mac });
+	uconn.call('ratelimit', 'client_delete', { address: mac });
 }
 
 function client_reset(interface, mac, reason) {
@@ -319,7 +320,7 @@ function radius_acctoff(interface)
 }
 
 function accounting(interface) {
-	let list = ubus.call('spotfilter', 'client_list', { interface });
+	let list = uconn.call('spotfilter', 'client_list', { interface });
 	let t = time();
 	let accounting = interfaces[interface].settings.accounting;
 
@@ -381,7 +382,7 @@ function stop()
 }
 
 function run_service() {
-	ubus.publish("uspot", {
+	uconn.publish("uspot", {
 		client_add: {
 			call: function(req) {
 				let interface = req.args.interface;
@@ -394,7 +395,7 @@ function run_service() {
 
 				address = uc(address);	// spotfilter uses ether_ntoa() which is uppercase
 
-				let state = ubus.call('spotfilter', 'client_get', {
+				let state = uconn.call('spotfilter', 'client_get', {
 					interface,
 					address,
 				});
