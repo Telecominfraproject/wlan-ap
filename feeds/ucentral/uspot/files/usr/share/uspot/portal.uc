@@ -75,6 +75,16 @@ function lookup_station(mac) {
 	}
 }
 
+function spotfilter_device(spotfilter, mac)
+{
+	let uconn = ubus.connect();
+	let spot = uconn.call('spotfilter', 'client_get', {
+		interface: spotfilter,
+		address: mac,
+	});
+	return (spot?.device);
+}
+
 function PO(id, english) {
 	return english;
 }
@@ -145,7 +155,7 @@ return {
 			include('allow.uc', ctx);
 
 		// start accounting
-		ctx.ubus.call('uspot', 'client_add', {
+		ctx.ubus.call('uspot', 'client_enable', {
 			interface: ctx.spotfilter,
 			address: ctx.mac,
 		});
@@ -234,47 +244,34 @@ return {
 
 		// check if a client is already connected
 		ctx.ubus = ubus.connect();
-		let connected;
-		connected = ctx.ubus.call('spotfilter', 'client_get', {
+		let cdata;
+		cdata = ctx.ubus.call('uspot', 'client_get', {
 			interface: ctx.spotfilter,
 			address: ctx.mac,
 		});
 
-		// stop if spotfilter doesn't reply
-		if (!connected) {
-			this.syslog(ctx, 'spotfilter error');
+		// stop if backend doesn't reply
+		if (!cdata) {
+			this.syslog(ctx, 'uspot error');
 			include('error.uc', ctx);
 			return NULL;
 		}
 
-		if (!uam && connected?.state) {
+		if (!uam && length(cdata)) {	// cdata is empty for disconnected clients
 			include('connected.uc', ctx);
 			return;
 		}
-		if (!connected.data.ssid) {
-			let hapd = ctx.ubus.call('hostapd.' + connected.device, 'get_status');
-			ctx.ubus.call('spotfilter', 'client_set', {
-				interface: ctx.spotfilter,
-				address: ctx.mac,
-				data: {
-					ssid: hapd?.ssid || 'unknown'
-				}
-			});
-			connected.data.ssid = hapd?.ssid || 'unknown';
+		if (!cdata.ssid) {
+			let device = spotfilter_device(ctx.spotfilter, ctx.mac);
+			let hapd = ctx.ubus.call('hostapd.' + device, 'get_status');
+			cdata.ssid = hapd?.ssid || 'unknown';
 		}
-		if (!connected.data.sessionid) {
+		if (!cdata.sessionid) {
 			let sessionid = this.session_init();
-			ctx.ubus.call('spotfilter', 'client_set', {
-				interface: ctx.spotfilter,
-				address: ctx.mac,
-				data: {
-					sessionid: sessionid
-				}
-			});
-			connected.data.sessionid = sessionid;
+			cdata.sessionid = sessionid;
 		}
-		ctx.ssid = connected.data.ssid;
-		ctx.sessionid = connected.data.sessionid;
+		ctx.ssid = cdata.ssid;
+		ctx.sessionid = cdata.sessionid;
 
 		// split QUERY_STRING
 		if (env.QUERY_STRING)

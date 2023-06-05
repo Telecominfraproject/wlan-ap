@@ -139,9 +139,10 @@ function radius_init(interface, mac, payload, auth) {
 	if (!auth && mac) {
 		// dealing with client accounting
 		let client = interfaces[interface].clients[mac];
+		let radius = client.radius.request;
 		for (let key in [ 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_port_type', 'username', 'location_name' ])
-			if (client.radius[key])
-				payload[key] = client.radius[key];
+			if (radius[key])
+				payload[key] = radius[key];
 	}
 
 	return payload;
@@ -169,10 +170,11 @@ const radat_accton = 7;		// Accounting-On
 const radat_acctoff = 8;	// Accounting-Off
 
 function radius_acct(interface, mac, payload) {
+	let client = interfaces[interface].clients[mac];
 	let state = uconn.call('spotfilter', 'client_get', {
 		interface,
 		address: mac
-	}) || interfaces[interface].clients[mac];	// fallback to last known state
+	}) || client;	// fallback to last known state
 	if (!state)
 		return;
 
@@ -180,7 +182,7 @@ function radius_acct(interface, mac, payload) {
 	payload.acct = true;
 
 	if (payload.acct_type != radat_start) {
-		payload.session_time = time() - state.data.connect;
+		payload.session_time = time() - client.connect;
 		payload.output_octets = state.acct_data.bytes_dl & 0xffffffff;
 		payload.input_octets = state.acct_data.bytes_ul & 0xffffffff;
 		payload.output_gigawords = state.acct_data.bytes_dl >> 32;
@@ -252,11 +254,13 @@ function client_interim(interface, mac, time) {
 }
 
 // ratelimit a client from radius reply attributes
-function client_ratelimit(interface, mac, state) {
-	if (!(state.data?.radius?.reply))
+function client_ratelimit(interface, mac) {
+	let client = interfaces[interface].clients[mac];
+
+	if (!(client.radius?.reply))
 		return;
 
-	let reply = state.data.radius.reply;
+	let reply = client.radius.reply;
 
 	// check known attributes - WISPr: bps, ChiliSpot: kbps
 	let maxup = reply['WISPr-Bandwidth-Max-Up'] || (reply['ChilliSpot-Bandwidth-Max-Up']*1000);
@@ -266,7 +270,7 @@ function client_ratelimit(interface, mac, state) {
 		return;
 
 	let args = {
-		device: state.device,
+		device: client.device,
 		address: mac,
 	};
 	if (+maxdown)
@@ -278,53 +282,88 @@ function client_ratelimit(interface, mac, state) {
 	syslog(interface, mac, 'ratelimiting client: ' + maxdown + '/' + maxup);
 }
 
-function client_add(interface, mac, state) {
-	if (state.state != 1)
-		return;
+function client_create(interface, mac, payload)
+{
+	let client = {
+		connect: time(),
+		data: {},
+		...payload,
+		state: 0,
+	};
 
+	interfaces[interface].clients[mac] = client;
+
+	if (interfaces[interface].settings.debug)
+		uconn.call('spotfilter', 'client_set', {
+			interface,
+			address: mac,
+			data: client,
+		});
+
+	debug(interface, mac, 'creating client');
+}
+
+function client_enable(interface, mac) {
 	let defval = 0;
 
 	let settings = interfaces[interface].settings;
 	let accounting = settings.accounting;
 
+	let radius = interfaces[interface].clients[mac]?.radius;
+
 	// RFC: NAS local interval value *must* override RADIUS attribute
 	defval = settings.acct_interval;
-	let interval = +(defval || state.data?.radius?.reply['Acct-Interim-Interval'] || 0);
+	let interval = +(defval || radius?.reply['Acct-Interim-Interval'] || 0);
 
 	defval = settings.session_timeout;
-	let session = +(state.data?.radius?.reply['Session-Timeout'] || defval);
+	let session = +(radius?.reply['Session-Timeout'] || defval);
 
 	defval = settings.idle_timeout;
-	let idle = +(state.data?.radius?.reply['Idle-Timeout'] || defval);
+	let idle = +(radius?.reply['Idle-Timeout'] || defval);
 
-	let max_total = +(state.data?.radius?.reply['ChilliSpot-Max-Total-Octets'] || 0);
+	let max_total = +(radius?.reply['ChilliSpot-Max-Total-Octets'] || 0);
 
-	let clients = interfaces[interface].clients;
-	clients[mac] = {
+	let client = {
+		... interfaces[interface].clients[mac] || {},
+		state: 1,
 		interval,
 		session,
 		idle,
 		max_total,
-		data: {
-			connect: state.data.connect,
-		}
 	};
-	if (state.ip4addr)
-		clients[mac].ip4addr = state.ip4addr;
-	if (state.ip6addr)
-		clients[mac].ip6addr = state.ip6addr;
-	if (state.data?.radius?.request) {
-		clients[mac].radius = state.data.radius.request;
-		if (accounting) {
-			radius_start(interface, mac);
-			if (interval)
-				clients[mac].next_interim = time() + interval;
-		}
-	}
+	if (radius?.request && accounting && interval)
+		client.next_interim = time() + interval;
+
+	let spotfilter = uconn.call('spotfilter', 'client_get', {
+		interface,
+		address: mac,
+	});
+
+	client.device = spotfilter.device;
+	if (spotfilter?.ip4addr)
+		client.ip4addr = spotfilter.ip4addr;
+	if (spotfilter?.ip6addr)
+		client.ip6addr = spotfilter.ip6addr;
+
+	// tell spotfilter this client is allowed
+	uconn.call('spotfilter', 'client_set', {
+		interface,
+		address: mac,
+		state: 1,
+		dns_state: 1,
+		accounting: accounting ? [ "dl", "ul"] : [],
+		data: interfaces[interface].settings.debug ? client : {},
+	});
+
+	interfaces[interface].clients[mac] = client;
 	syslog(interface, mac, 'adding client');
 
+	// start RADIUS accounting
+	if (accounting && radius?.request)
+		radius_start(interface, mac);
+
 	// apply ratelimiting rules, if any
-	client_ratelimit(interface, mac, state);
+	client_ratelimit(interface, mac);
 }
 
 function client_kick(interface, mac, remove) {
@@ -399,6 +438,13 @@ function accounting(interface) {
 	let accounting = interfaces[interface].settings.accounting;
 
 	for (let mac, client in interfaces[interface].clients) {
+		if (!client.state) {
+			const stale = 60;	// 60s timeout for (new) unauth clients
+			if ((t - client.connect) > stale)
+				client_remove(interface, mac, 'stale client');
+			continue;
+		}
+
 		if (!list[mac] || !list[mac].state) {
 			radius_terminate(interface, mac, radtc_lostcarrier);
 			client_remove(interface, mac, 'disconnect event');
@@ -411,7 +457,7 @@ function accounting(interface) {
 			continue;
 		}
 		let timeout = +client.session;
-		if (timeout && ((t - list[mac].data.connect) > timeout)) {
+		if (timeout && ((t - client.connect) > timeout)) {
 			radius_terminate(interface, mac, radtc_sessionto);
 			client_reset(interface, mac, 'session timeout');
 			continue;
@@ -426,22 +472,6 @@ function accounting(interface) {
 		if (accounting)
 			client_interim(interface, mac, t);
 	}
-}
-
-// give a client access to the internet
-function allow_client(interface, address, data) {
-	syslog(interface, address, 'allow client to pass traffic');
-	ubus.call('spotfilter', 'client_set', {
-		interface,
-		address,
-		state: 1,
-		dns_state: 1,
-		accounting: [ "dl", "ul"],
-		data: {
-			... data || {},
-			connect: time(),
-		}
-	});
 }
 
 function start()
@@ -503,6 +533,7 @@ function run_service() {
 				}
 
 				let fmac = format_mac(interface, address);
+				address = uc(address);	// spotfilter uses ether_ntoa() which is uppercase
 
 				let request = {
 					username,
@@ -531,10 +562,18 @@ function run_service() {
 
 				if (radius['access-accept']) {
 					delete request.server;	// don't publish RADIUS server secret
-					allow_client(interface, address, {
-						username,	// XXX does anything use this? comes from handler.uc radius & credentials auth
-						radius: { reply: radius.reply, request }
-					});	// XXX && client_add()
+
+					let payload = {
+						data: {
+							sessionid: acct_session,
+							username,	// XXX does anything use this? comes from handler.uc radius & credentials auth
+						},
+						radius: { reply: radius.reply, request }	// save RADIUS payload for later use
+					};
+					if (ssid)
+						payload.data.ssid = ssid;
+
+					client_create(interface, address, payload);
 				}
 
 				delete radius.reply;
@@ -568,7 +607,7 @@ function run_service() {
 				reqdata:{},
 			}
 		},
-		client_add: {
+		client_enable: {
 			call: function(req) {
 				let interface = req.args.interface;
 				let address = req.args.address;
@@ -578,17 +617,15 @@ function run_service() {
 				if (!(interface in interfaces))
 					return ubus.STATUS_INVALID_ARGUMENT;
 
+				address = uc(address);
+
+				// enabling clients can only be done for known ones (i.e. those which passed authentication)
+				if (!interfaces[interface].clients[address])
+					return ubus.STATUS_NOT_FOUND;
+
 				address = uc(address);	// spotfilter uses ether_ntoa() which is uppercase
 
-				let state = uconn.call('spotfilter', 'client_get', {
-					interface,
-					address,
-				});
-				if (!state)
-					return ubus.STATUS_INVALID_ARGUMENT;
-
-				if (!interfaces[interface].clients[address])
-					client_add(interface, address, state);
+				client_enable(interface, address);
 
 				return 0;
 			},
@@ -615,6 +652,30 @@ function run_service() {
 				}
 
 				return 0;
+			},
+			args: {
+				interface:"",
+				address:"",
+			}
+		},
+		client_get: {
+			call: function(req) {
+				let interface = req.args.interface;
+				let address = req.args.address;
+
+				if (!interface || !address)
+					return ubus.STATUS_INVALID_ARGUMENT;
+				if (!(interface in interfaces))
+					return ubus.STATUS_INVALID_ARGUMENT;
+
+				address = uc(address);
+
+				if (!interfaces[interface].clients[address])
+					return {};
+
+				let client = interfaces[interface].clients[address];
+
+				return client.data || {};
 			},
 			args: {
 				interface:"",
