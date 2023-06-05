@@ -386,6 +386,8 @@ function run_service() {
 
 				if (!interface || !address)
 					return ubus.STATUS_INVALID_ARGUMENT;
+				if (!(interface in interfaces))
+					return ubus.STATUS_INVALID_ARGUMENT;
 
 				address = uc(address);	// spotfilter uses ether_ntoa() which is uppercase
 
@@ -412,6 +414,8 @@ function run_service() {
 				let address = req.args.address;
 
 				if (!interface || !address)
+					return ubus.STATUS_INVALID_ARGUMENT;
+				if (!(interface in interfaces))
 					return ubus.STATUS_INVALID_ARGUMENT;
 
 				address = uc(address);
