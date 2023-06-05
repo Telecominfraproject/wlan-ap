@@ -33,8 +33,8 @@ function auth_client(ctx) {
 		return;
 	}
 
-        let radius = portal.uspot_auth(ctx, username, password, challenge, payload);
-	if (radius && radius['access-accept']) {
+        let auth = portal.uspot_auth(ctx, username, password, challenge, payload);
+	if (auth && auth['access-accept']) {
 		if (ctx.config.final_redirect_url == 'uam')
 			ctx.query_string.userurl = portal.uam_url(ctx, 'success');
 

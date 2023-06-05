@@ -537,6 +537,7 @@ function run_service() {
 					});	// XXX && client_add()
 				}
 
+				delete radius.reply;
 				return radius;
 			},
 			/*

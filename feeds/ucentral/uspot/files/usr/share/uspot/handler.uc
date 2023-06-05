@@ -24,8 +24,8 @@ function request_start(ctx) {
 	case 'uam':
 		// try mac-auth first if enabled
 		if (+ctx.config.mac_auth) {
-		        let radius = portal.uspot_auth(ctx);
-			if (radius && radius['access-accept']) {
+		        let auth = portal.uspot_auth(ctx);
+			if (auth && auth['access-accept']) {
 				if (ctx.config.final_redirect_url == 'uam')
 					ctx.query_string.userurl = portal.uam_url(ctx, 'success');
 				portal.allow_client(ctx);
@@ -113,8 +113,8 @@ function request_radius(ctx) {
 	let username = ctx.form_data.username;
 	let password = ctx.form_data.password;
 
-        let radius = portal.uspot_auth(ctx, username, password);
-	if (radius && radius['access-accept']) {
+        let auth = portal.uspot_auth(ctx, username, password);
+	if (auth && auth['access-accept']) {
                 portal.allow_client(ctx);
                 return;
         }
