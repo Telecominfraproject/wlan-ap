@@ -56,10 +56,4 @@ config rule
 	list proto 'tcp'
 	option dest_port '53'
 	option target 'ACCEPT'
-
-config include
-	option type 'nftables'
-	option path '/usr/share/uspot/firewall.nft'
-	option position 'chain-post'
-	option chain 'mangle_postrouting'
 ```

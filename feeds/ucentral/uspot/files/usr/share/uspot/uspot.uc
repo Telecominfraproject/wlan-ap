@@ -263,9 +263,9 @@ function client_kick(interface, mac, remove) {
 	let client = interfaces[interface].clients[mac];
 
 	if (client.ip4addr)
-		system('conntrack -D -s ' + client.ip4addr + ' -m 2');
+		system('conntrack -D -s ' + client.ip4addr);
 	if (client.ip6addr)
-		system('conntrack -D -s ' + client.ip6addr + ' -m 2');
+		system('conntrack -D -s ' + client.ip6addr);
 
 	delete interfaces[interface].clients[mac];
 }
