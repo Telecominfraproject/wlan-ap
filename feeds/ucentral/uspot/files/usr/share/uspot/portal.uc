@@ -90,7 +90,7 @@ return {
 	},
 
 	debug: function(ctx, msg) {
-		if (+config.def_captive.debug)
+		if (+config.def_captive?.debug)
 			this.syslog(ctx, msg);
 	},
 
