@@ -313,15 +313,15 @@ function client_enable(interface, mac) {
 
 	// RFC: NAS local interval value *must* override RADIUS attribute
 	defval = settings.acct_interval;
-	let interval = +(defval || radius?.reply['Acct-Interim-Interval'] || 0);
+	let interval = +(defval || radius?.reply?.['Acct-Interim-Interval'] || 0);
 
 	defval = settings.session_timeout;
-	let session = +(radius?.reply['Session-Timeout'] || defval);
+	let session = +(radius?.reply?.['Session-Timeout'] || defval);
 
 	defval = settings.idle_timeout;
-	let idle = +(radius?.reply['Idle-Timeout'] || defval);
+	let idle = +(radius?.reply?.['Idle-Timeout'] || defval);
 
-	let max_total = +(radius?.reply['ChilliSpot-Max-Total-Octets'] || 0);
+	let max_total = +(radius?.reply?.['ChilliSpot-Max-Total-Octets'] || 0);
 
 	let client = {
 		... interfaces[interface].clients[mac] || {},
