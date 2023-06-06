@@ -682,6 +682,26 @@ function run_service() {
 				address:"",
 			}
 		},
+		client_list: {
+			call: function(req) {
+				let interface = req.args.interface;
+
+				if (!interface)
+					return ubus.STATUS_INVALID_ARGUMENT;
+				if (!(interface in interfaces))
+					return ubus.STATUS_INVALID_ARGUMENT;
+
+				let clients = interfaces[interface].clients;
+
+				let payload = {};
+				payload[interface] = keys(clients);
+
+				return payload;
+			},
+			args: {
+				interface:"",
+			}
+		},
 	});
 
 	try {
