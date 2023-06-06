@@ -71,7 +71,7 @@ function radius_init(interface, mac, payload) {
 }
 
 function radius_call(interface, mac, payload) {
-	let path = '/tmp/uacct' + (mac || payload.acct_session) + '.json';
+	let path = '/tmp/u' + (payload.acct ? "acct" : "auth") + (mac || payload.acct_session) + '.json';
 	let cfg = fs.open(path, 'w');
 	cfg.write(payload);
 	cfg.close();
