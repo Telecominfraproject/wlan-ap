@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-FileCopyrightText: 2022-2023 John Crispin <john@phrozen.org>
+// SPDX-FileCopyrightText: 2023 Thibaut Varène <hacks@slashdirt.org>
+
 'use strict';
 
 let ubus = require('ubus');
