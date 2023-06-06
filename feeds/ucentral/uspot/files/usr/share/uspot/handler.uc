@@ -74,17 +74,8 @@ function request_credentials(ctx) {
 	}
 
 	// check if the credentials are valid
-	for (let k in portal.config) {
-		let cred = portal.config[k];
-
-		if (cred['.type'] != 'credentials')
-			continue;
-		if (cred.interface != ctx.spotfilter)
-			continue;
-		if (ctx.form_data.username != cred.username ||
-		    ctx.form_data.password != cred.password)
-			continue;
-
+	let auth = portal.uspot_auth(ctx, ctx.form_data.username, ctx.form_data.password);
+	if (auth && auth['access-accept']) {
 		portal.allow_client(ctx);
 		return;
 	}

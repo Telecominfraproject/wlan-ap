@@ -18,6 +18,7 @@ let uciload = uci.foreach('uspot', 'uspot', (d) => {
 		interfaces[d[".name"]] = {
 		settings: {
 			accounting,
+			auth_mode: d.auth_mode,
 			auth_server: d.auth_server,
 			auth_secret: d.auth_secret,
 			auth_port: d.auth_port || 1812,
@@ -524,6 +525,37 @@ function run_service() {
 					return { 'access-accept': 0 };
 
 				let settings = interfaces[interface].settings;
+				address = uc(address);	// spotfilter uses ether_ntoa() which is uppercase
+
+				// prepare client payload
+				let payload = {
+					data: {
+						sessionid,
+						username,	// XXX does anything use this? comes from handler.uc radius & credentials auth
+						client_ip,	// not used, could be useful
+					},
+				};
+				if (ssid)
+					payload.data.ssid = ssid;
+
+				// credentials
+				if (settings.auth_mode == 'credentials') {
+					let match = false;
+					uci.foreach('uspot', 'credentials', (d) => {
+						// check if the credentials are valid
+						if (d.interface != interface)
+							return;
+						if (d.username == username && d.password == password)
+							match = true;
+					});
+					if (match)
+						client_create(interface, address, payload);
+					return { 'access-accept': match };
+				}
+
+				// else, radius/uam - give up early if no server set
+				if (!settings.auth_server)
+					return { 'access-accept': 0 };
 
 				if (!username && !password) {
 					if  (!+settings.mac_auth)	// don't try mac-auth if not allowed
@@ -533,7 +565,6 @@ function run_service() {
 				}
 
 				let fmac = format_mac(interface, address);
-				address = uc(address);	// spotfilter uses ether_ntoa() which is uppercase
 
 				let request = {
 					username,
@@ -562,17 +593,7 @@ function run_service() {
 
 				if (radius['access-accept']) {
 					delete request.server;	// don't publish RADIUS server secret
-
-					let payload = {
-						data: {
-							sessionid: acct_session,
-							username,	// XXX does anything use this? comes from handler.uc radius & credentials auth
-						},
-						radius: { reply: radius.reply, request }	// save RADIUS payload for later use
-					};
-					if (ssid)
-						payload.data.ssid = ssid;
-
+					payload.radius = { reply: radius.reply, request };	// save RADIUS payload for later use
 					client_create(interface, address, payload);
 				}
 
@@ -592,7 +613,7 @@ function run_service() {
 
 			 operation:
 			  - call with (interface, address, client_ip) -> RADIUS MAC authentication
-			  - call with (interface, address, client_ip, username, password) -> RADIUS password auth
+			  - call with (interface, address, client_ip, username, password) -> credentials or RADIUS password auth
 			  - call with (interface, address, client_ip, username, password, challenge) -> RADIUS CHAP challenge auth
 			 */
 			args: {
