@@ -314,7 +314,6 @@ return {
 			});
 			connected.data.sessionid = sessionid;
 		}
-		ctx.device = connected.device;
 		ctx.ssid = connected.data.ssid;
 		ctx.sessionid = connected.data.sessionid;
 
