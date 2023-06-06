@@ -538,6 +538,12 @@ function run_service() {
 				if (ssid)
 					payload.data.ssid = ssid;
 
+				// click-to-continue: always accept - portal is responsible for checking conditions are met
+				if (settings.auth_mode == 'click-to-continue') {
+					client_create(interface, address, payload);
+					return { 'access-accept': 1 };
+				}
+
 				// credentials
 				if (settings.auth_mode == 'credentials') {
 					let match = false;
@@ -612,7 +618,7 @@ function run_service() {
 			 @param reqdata: OPTIONAL: additional RADIUS request data - to be passed verbatim to radius-client
 
 			 operation:
-			  - call with (interface, address, client_ip) -> RADIUS MAC authentication
+			  - call with (interface, address, client_ip) -> click-to-continue or RADIUS MAC authentication
 			  - call with (interface, address, client_ip, username, password) -> credentials or RADIUS password auth
 			  - call with (interface, address, client_ip, username, password, challenge) -> RADIUS CHAP challenge auth
 			 */

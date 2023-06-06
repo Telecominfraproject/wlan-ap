@@ -55,6 +55,7 @@ function request_click(ctx) {
 		request_start({ ...ctx, error: 1 });
                 return;
 	}
+	portal.uspot_auth(ctx);
 	portal.allow_client(ctx);
 }
 
