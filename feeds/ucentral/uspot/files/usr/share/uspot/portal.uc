@@ -301,7 +301,7 @@ return {
 					ssid: hapd?.ssid || 'unknown'
 				}
 			});
-			connected.data.ssid = hapd.ssid;
+			connected.data.ssid = hapd?.ssid || 'unknown';
 		}
 		if (!connected.data.sessionid) {
 			let sessionid = this.session_init();
