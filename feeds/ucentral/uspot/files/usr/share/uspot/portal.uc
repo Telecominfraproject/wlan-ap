@@ -156,7 +156,7 @@ return {
 
 		// start accounting
 		ctx.ubus.call('uspot', 'client_enable', {
-			interface: ctx.spotfilter,
+			uspot: ctx.spotfilter,
 			address: ctx.mac,
 		});
 	},
@@ -170,7 +170,7 @@ return {
 			include('logoff.uc', ctx);
 
 		ctx.ubus.call('uspot', 'client_remove', {
-			interface: ctx.spotfilter,
+			uspot: ctx.spotfilter,
 			address: ctx.mac,
 		});
 	},
@@ -178,7 +178,7 @@ return {
 	// request authentication from uspot backend, return reply 'access-accept': 0 or 1
 	uspot_auth: function(ctx, username, password, challenge, extra) {
 		let payload = {
-			interface: ctx.spotfilter,
+			uspot: ctx.spotfilter,
 			address: ctx.mac,
 			client_ip: ctx.env.REMOTE_ADDR,
 			ssid: ctx.ssid,
@@ -246,7 +246,7 @@ return {
 		ctx.ubus = ubus.connect();
 		let cdata;
 		cdata = ctx.ubus.call('uspot', 'client_get', {
-			interface: ctx.spotfilter,
+			uspot: ctx.spotfilter,
 			address: ctx.mac,
 		});
 
