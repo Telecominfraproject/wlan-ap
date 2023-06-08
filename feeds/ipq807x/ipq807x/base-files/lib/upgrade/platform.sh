@@ -217,12 +217,10 @@ platform_do_upgrade() {
 		echo "Current Primary is $wp_part"
 		if [[ $wp_part == 1 ]]; then
 			CI_UBIPART="rootfs"
-			echo "Setting Primary 0 and Flashing"
-			fw_setenv primary 0 || exit 1
+			CI_FWSETENV="primary 0"
 		else
 			CI_UBIPART="rootfs_1"
-			echo "Setting Primary 1 and Flashing"
-			fw_setenv primary 1 || exit 1
+			CI_FWSETENV="primary 1"
 		fi
 		nand_upgrade_tar "$1"
 		;;
@@ -244,10 +242,10 @@ platform_do_upgrade() {
 				fw_setenv upgrade_available 0 || exit 1
 			elif grep -q rootfs1 /proc/cmdline; then
 				CI_UBIPART="rootfs2"
-				fw_setenv active 2 || exit 1
+				CI_FWSETENV="active 2"
 			else
 				CI_UBIPART="rootfs1"
-				fw_setenv active 1 || exit 1
+				CI_FWSETENV="active 1"
 			fi
 		fi
 		nand_upgrade_tar "$1"
