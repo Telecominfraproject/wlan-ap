@@ -46,6 +46,7 @@ enum {
 	RADIUS_PROXY_STATE_AUTH,
 	RADIUS_LOCATION_NAME,
 	RADIUS_NAS_PORT_TYPE,
+	RADIUS_CUI,
 	__RADIUS_MAX,
 };
 
@@ -79,6 +80,7 @@ static const struct blobmsg_policy radius_policy[__RADIUS_MAX] = {
 	[RADIUS_PROXY_STATE_ACCT] = { .name = "acct_proxy", .type = BLOBMSG_TYPE_STRING },
 	[RADIUS_LOCATION_NAME] = { .name = "location_name", .type = BLOBMSG_TYPE_STRING },
 	[RADIUS_NAS_PORT_TYPE] = { .name = "nas_port_type", .type = BLOBMSG_TYPE_INT32 },
+	[RADIUS_CUI] = { .name = "cui", .type = BLOBMSG_TYPE_STRING },
 };
 
 static struct blob_buf b = {};
@@ -129,6 +131,7 @@ static const struct {
 	[RADIUS_PROXY_STATE_ACCT] = { .attrid = PW_PROXY_STATE, },
 	[RADIUS_LOCATION_NAME] = { .attrid = ATTR_WBAL_WISPR_LOCATION_NAME, .vendorspec = VENDORSPEC_WBAL, },
 	[RADIUS_NAS_PORT_TYPE] = { .attrid = PW_NAS_PORT_TYPE, },
+	[RADIUS_CUI] = { .attrid = PW_CHARGEABLE_USER_IDENTITY, },
 };
 
 /**

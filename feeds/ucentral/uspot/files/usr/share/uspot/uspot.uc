@@ -153,7 +153,7 @@ function radius_init(uspot, mac, payload, auth) {
 		// dealing with client accounting
 		let client = uspots[uspot].clients[mac];
 		let radius = client.radius.request;
-		for (let key in [ 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_port_type', 'username', 'location_name' ])
+		for (let key in [ 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_port_type', 'username', 'location_name', 'cui' ])
 			if (radius[key])
 				payload[key] = radius[key];
 	}
@@ -408,6 +408,8 @@ function client_enable(uspot, mac) {
 
 	let max_total = +(radius?.reply?.['ChilliSpot-Max-Total-Octets'] || 0);
 
+	let cui = radius?.reply?.['Chargeable-User-Identity'];
+
 	let client = {
 		... uspots[uspot].clients[mac] || {},
 		state: 1,
@@ -418,6 +420,8 @@ function client_enable(uspot, mac) {
 	};
 	if (radius?.request && accounting && interval)
 		client.next_interim = time() + interval;
+	if (cui)
+		client.radius.request['cui'] = cui;
 
 	let spotfilter = uconn.call('spotfilter', 'client_get', {
 		interface: uspot,
