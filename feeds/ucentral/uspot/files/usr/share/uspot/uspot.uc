@@ -619,6 +619,67 @@ function stop()
 	}
 }
 
+function das_match_client(uspot, request)
+{
+	let match;
+
+	for (let mac, client in uspots[uspot].clients) {
+		if (!client.radius?.request)
+			continue;
+
+		// ucode does not (yet) support 'continue [label]'
+		let fail = false;
+		for (let key, val in request) {
+			// all request keys must match
+			if (client.radius.request[key] != val) {
+				fail = true;
+				break;
+			}
+		}
+
+		if (fail)
+			continue;
+
+		match = mac;
+		break;
+	}
+
+	return match;
+}
+
+// Retrieve and filter out CoA change requests
+function das_coa_filter_changes(request)
+{
+	let changes = {};
+
+	for (let key in [ 'Session-Timeout', 'Idle-Timeout', 'Acct-Interim-Interval' ]) {
+		if (key in request) {
+			changes[key] = request[key];
+			delete request[key];
+		}
+	}
+
+	return changes;
+}
+
+// update a client with CoA changes
+function das_coa_update_client(client, changes)
+{
+	for (let key, val in changes) {
+		switch (key) {
+		case 'Acct-Interim-Interval':
+			client.interval = val;
+			break;
+		case 'Session-Timeout':
+			client.session = val;
+			break;
+		case 'Idle-Timeout':
+			client.idle = val;
+			break;
+		}
+	}
+}
+
 function run_service() {
 	uconn.publish("uspot", {
 		client_auth: {
@@ -865,6 +926,68 @@ function run_service() {
 			 */
 			args: {
 				uspot:"",
+			}
+		},
+		das_disconnect: {
+			call: function(req) {
+				let uspot = req.args.uspot;
+				let request = req.args.request;
+
+				if (!uspot || !request)
+					return ubus.STATUS_INVALID_ARGUMENT;
+				if (!(uspot in uspots))
+					return ubus.STATUS_INVALID_ARGUMENT;
+
+				let address = das_match_client(uspot, request);
+
+				if (address) {
+					radius_terminate(uspot, address, radtc_adminreset);
+					client_remove(uspot, address, 'das_disconnect event');
+				}
+
+				return { "found": address ? true : false };
+			},
+			/*
+			 Disconnect clients matching request.
+			 @param uspot: REQUIRED: target uspot
+			 @param request: REQUIRED: any of { username, nas_ip, called_station, calling_station, nas_id, acct_session, cui }
+			 @return { "found": true } if match found and disconnected
+			 */
+			args: {
+				uspot:"",
+				request:{},
+			}
+		},
+		das_coa: {
+			call: function(req) {
+				let uspot = req.args.uspot;
+				let request = req.args.request;
+
+				if (!uspot || !request)
+					return ubus.STATUS_INVALID_ARGUMENT;
+				if (!(uspot in uspots))
+					return ubus.STATUS_INVALID_ARGUMENT;
+
+				let changes = das_coa_filter_changes(request);
+				let address = das_match_client(uspot, request);
+
+				if (address) {
+					let client = uspots[uspot].clients[address];
+					das_coa_update_client(client, changes);
+					syslog(uspot, address, "CoA update");
+				}
+
+				return { "found": address ? true : false };
+			},
+			/*
+			 Update clients matching CoA request.
+			 @param uspot: REQUIRED: target uspot
+			 @param request: REQUIRED: any of { username, nas_ip, called_station, calling_station, nas_id, acct_session, cui } + Supported CoA changes
+			 @return { "found": true } if match found and updated
+			 */
+			args: {
+				uspot:"",
+				request:{},
 			}
 		},
 	});
