@@ -158,8 +158,14 @@ radius_parse(char *buf, unsigned int len, int port, enum socket_type type, int t
 	struct radius_tlv *proxy_state = NULL;
 	char proxy_state_str[256] = {};
 	void *avp = hdr->avp;
-	unsigned int len_orig = ntohs(hdr->len);
+	unsigned int len_orig;
 	uint8_t localhost[] = { 0x7f, 0, 0, 1 };
+
+	if (len < sizeof(*hdr)) {
+		ULOG_ERR("invalid packet length, %d\n", len);
+		return -1;
+	}
+	len_orig = ntohs(hdr->len);
 
 	if (len_orig != len) {
 		ULOG_ERR("invalid header length, %d %d\n", len_orig, len);
