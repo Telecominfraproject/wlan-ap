@@ -6,7 +6,7 @@ ADD_DEFINITIONS(-Os -ggdb -Wall -Werror --std=gnu99 -Wmissing-declarations)
 
 SET(CMAKE_SHARED_LIBRARY_LINK_C_FLAGS "")
 
-ADD_EXECUTABLE(radius-client radius.c)
+ADD_EXECUTABLE(radius-client radius-client.c)
 TARGET_LINK_LIBRARIES(radius-client radcli ubox blobmsg_json)
 INSTALL(TARGETS radius-client
 	RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR}
