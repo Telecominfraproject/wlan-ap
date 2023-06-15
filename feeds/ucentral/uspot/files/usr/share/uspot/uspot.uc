@@ -177,8 +177,8 @@ function client_ratelimit(interface, mac, state) {
 	let reply = state.data.radius.reply;
 
 	// check known attributes - WISPr: bps, ChiliSpot: kbps
-	let maxup = reply['WISPr-Bandwidth-Max-Up'] || reply['ChilliSpot-Bandwidth-Max-Up']*1000;
-	let maxdown = reply['WISPr-Bandwidth-Max-Down'] || reply['ChilliSpot-Bandwidth-Max-Down']*1000;
+	let maxup = reply['WISPr-Bandwidth-Max-Up'] || (reply['ChilliSpot-Bandwidth-Max-Up']*1000);
+	let maxdown = reply['WISPr-Bandwidth-Max-Down'] || (reply['ChilliSpot-Bandwidth-Max-Down']*1000);
 
 	if (!(+maxdown || +maxup))
 		return;
