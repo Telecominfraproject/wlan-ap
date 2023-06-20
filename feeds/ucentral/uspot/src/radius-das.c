@@ -62,7 +62,7 @@
 #include <string.h>
 #include <ctype.h>
 
-#include <radcli/radcli.h>	// for RADIUS attribute ids - no linkage
+#include <radcli/radcli.h>	// for RADIUS attribute ids and names
 
 #include <libubox/uloop.h>
 #include <libubox/usock.h>
@@ -71,6 +71,8 @@
 
 #include <libubus.h>
 #include <uci.h>
+
+#define RADCLI_DICT		"/etc/radcli/dictionary"
 
 #define RAD_PROX_BUFLEN		(4 * 1024)
 
@@ -123,6 +125,7 @@ static struct {
 	const char *uspot;
 	const char *secret;
 	const char *port;
+	rc_handle *rh;
 	struct uloop_fd ufd;
 } das;
 
@@ -169,9 +172,22 @@ static const void * toval_str(const struct radius_tlv *tlv)
 	return buf;
 }
 
+static const char *
+radius_attr_name(uint8_t attrid)
+{
+	DICT_ATTR *DA;
+
+	DA = rc_dict_getattr(das.rh, attrid);
+	if (!DA) {
+		ULOG_ERR("failed to lookup attribute key %d\n", attrid);
+		return NULL;
+	}
+
+	return DA->name;
+}
+
 // AVP matching table for uspot callback
 static const struct {
-	const char *name;
 	const int type;
 	/**
 	 * Callback for data processing.
@@ -179,17 +195,17 @@ static const struct {
 	 */
 	const void * (*const toval)(const struct radius_tlv *);
 } radius_attrids[256] = {
-	[PW_USER_NAME] = { .name = "username", .type = BLOBMSG_TYPE_STRING, .toval = toval_str, },
-	[PW_NAS_IP_ADDRESS] = { .name = "nas_ip", .type = BLOBMSG_TYPE_STRING, .toval = toval_ip, },
-	[PW_FRAMED_IP_ADDRESS] = { .name = "client_ip", .type = BLOBMSG_TYPE_STRING, .toval = toval_ip, },
-	[PW_SESSION_TIMEOUT] = { .name = "Session-Timeout", .type = BLOBMSG_TYPE_INT32, .toval = toval_u32, },
-	[PW_IDLE_TIMEOUT] = { .name = "Idle-Timeout", .type = BLOBMSG_TYPE_INT32, .toval = toval_u32, },
-	[PW_CALLED_STATION_ID] = { .name = "called_station", .type = BLOBMSG_TYPE_STRING, .toval = toval_str, },
-	[PW_CALLING_STATION_ID] = { .name = "calling_station", .type = BLOBMSG_TYPE_STRING, .toval = toval_str,},
-	[PW_NAS_IDENTIFIER] = { .name = "nas_id", .type = BLOBMSG_TYPE_STRING, .toval = toval_str, },
-	[PW_ACCT_SESSION_ID] = { .name = "acct_session", .type = BLOBMSG_TYPE_STRING, .toval = toval_str, },
-	[PW_ACCT_INTERIM_INTERVAL] = { .name = "Acct-Interim-Interval", .type = BLOBMSG_TYPE_INT32, .toval = toval_u32, },
-	[PW_CHARGEABLE_USER_IDENTITY] = { .name = "cui", .type = BLOBMSG_TYPE_STRING, .toval = toval_str, },
+	[PW_USER_NAME] = { .type = BLOBMSG_TYPE_STRING, .toval = toval_str, },
+	[PW_NAS_IP_ADDRESS] = { .type = BLOBMSG_TYPE_STRING, .toval = toval_ip, },
+	[PW_FRAMED_IP_ADDRESS] = { .type = BLOBMSG_TYPE_STRING, .toval = toval_ip, },
+	[PW_SESSION_TIMEOUT] = { .type = BLOBMSG_TYPE_INT32, .toval = toval_u32, },
+	[PW_IDLE_TIMEOUT] = { .type = BLOBMSG_TYPE_INT32, .toval = toval_u32, },
+	[PW_CALLED_STATION_ID] = { .type = BLOBMSG_TYPE_STRING, .toval = toval_str, },
+	[PW_CALLING_STATION_ID] = {  .type = BLOBMSG_TYPE_STRING, .toval = toval_str,},
+	[PW_NAS_IDENTIFIER] = { .type = BLOBMSG_TYPE_STRING, .toval = toval_str, },
+	[PW_ACCT_SESSION_ID] = { .type = BLOBMSG_TYPE_STRING, .toval = toval_str, },
+	[PW_ACCT_INTERIM_INTERVAL] = { .type = BLOBMSG_TYPE_INT32, .toval = toval_u32, },
+	[PW_CHARGEABLE_USER_IDENTITY] = { .type = BLOBMSG_TYPE_STRING, .toval = toval_str, },
 };
 
 struct das_request {
@@ -262,20 +278,19 @@ das_request_process(const struct das_request *drq)
 		}
 
 		// parse known attributes for uspot call
-		if (radius_attrids[id].name) {
+		if (radius_attrids[id].toval) {
+			const char *attrname = radius_attr_name(id);
+			const void *val = radius_attrids[id].toval(tlv);
+			if (!attrname || !val)
+				goto fail;
+
 			switch (radius_attrids[id].type) {
 				case BLOBMSG_TYPE_STRING:
-					const char *str = radius_attrids[id].toval(tlv);
-					if (!str)
-						goto fail;
-					if (blobmsg_add_string(&b, radius_attrids[id].name, str))
+					if (blobmsg_add_string(&b, attrname, (const char *)val))
 						goto fail;
 					break;
 				case BLOBMSG_TYPE_INT32:
-					const uint32_t *val = radius_attrids[id].toval(tlv);
-					if (!val)
-						goto fail;
-					if (blobmsg_add_u32(&b, radius_attrids[id].name, *val))
+					if (blobmsg_add_u32(&b, attrname, *(const uint32_t *)val))
 						goto fail;
 					break;
 				default:
@@ -850,6 +865,30 @@ fail:
 	return ret;
 }
 
+static int
+load_radcli_dict(void)
+{
+	int ret = 1;
+
+	das.rh = rc_new();
+	if (das.rh == NULL)
+		goto fail;
+
+	das.rh = rc_config_init(das.rh);
+	if (das.rh == NULL)
+		goto fail;
+
+	if (rc_read_dictionary(das.rh, RADCLI_DICT)) {
+		rc_destroy(das.rh);
+		goto fail;
+	}
+
+	ret = 0;
+
+fail:
+	return ret;
+}
+
 static void
 usage(const char *name)
 {
@@ -885,6 +924,11 @@ int main(int argc, char **argv)
 	}
 
 	ulog_open(ULOG_STDIO | ULOG_SYSLOG, LOG_DAEMON, "uspot-das");
+
+	if (load_radcli_dict()) {
+		ULOG_ERR("failed to load libradcli dictionary\n");
+		return -1;
+	}
 
 	if (load_config()) {
 		ULOG_ERR("failed to load configuration\n");
@@ -922,6 +966,7 @@ int main(int argc, char **argv)
 	freeconst(das.secret);
 	freeconst(das.port);
 
+	rc_destroy(das.rh);
 
 	return 0;
 }

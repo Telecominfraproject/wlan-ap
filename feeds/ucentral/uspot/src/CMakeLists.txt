@@ -13,7 +13,7 @@ INSTALL(TARGETS radius-client
 )
 
 ADD_EXECUTABLE(uspot-das radius-das.c)
-TARGET_LINK_LIBRARIES(uspot-das ubox ubus uci)
+TARGET_LINK_LIBRARIES(uspot-das ubox ubus uci radcli)
 INSTALL(TARGETS uspot-das
 	RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR}
 )

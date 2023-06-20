@@ -137,7 +137,7 @@ function radius_init(uspot, mac, payload, auth) {
 		payload.server = sprintf('%s:%s:%s', settings.auth_server, settings.auth_port, settings.auth_secret);
 		if (settings.auth_proxy)
 			payload.auth_proxy = settings.auth_proxy;
-		payload.nas_port_type = 19;	// wireless
+		payload['NAS-Port-Type'] = 19;	// wireless
 	}
 	else {
 		payload.acct_server = sprintf('%s:%s:%s', settings.acct_server, settings.acct_port, settings.acct_secret);
@@ -145,15 +145,15 @@ function radius_init(uspot, mac, payload, auth) {
 			payload.acct_proxy = settings.acct_proxy;
 	}
 
-	payload.nas_id = settings.nas_id;	// XXX RFC says NAS-IP is not required when NAS-ID is set, but it's added by libradcli anyway
+	payload['NAS-Identifier'] = settings.nas_id;	// XXX RFC says NAS-IP is not required when NAS-ID is set, but it's added by libradcli anyway
 	if (settings.location_name)
-		payload.location_name = settings.location_name;
+		payload['WISPr-Location-Name'] = settings.location_name;
 
 	if (!auth && mac) {
 		// dealing with client accounting
 		let client = uspots[uspot].clients[mac];
 		let radius = client.radius.request;
-		for (let key in [ 'acct_session', 'client_ip', 'called_station', 'calling_station', 'nas_ip', 'nas_port_type', 'username', 'location_name', 'cui' ])
+		for (let key in [ 'Acct-Session-Id', 'Framed-IP-Address', 'Called-Station-Id', 'Calling-Station-Id', 'NAS-IP-Address', 'NAS-Port-Type', 'User-Name', 'WISPr-Location-Name', 'Chargeable-User-Identity' ])
 			if (radius[key])
 				payload[key] = radius[key];
 	}
@@ -170,7 +170,7 @@ function radius_init(uspot, mac, payload, auth) {
  * @returns {object} "radius-client" reply
  */
 function radius_call(uspot, mac, payload) {
-	let path = '/tmp/u' + (payload.acct ? "acct" : "auth") + (mac || payload.acct_session) + '.json';
+	let path = '/tmp/u' + (payload.acct ? "acct" : "auth") + (mac || payload['Acct-Session-Id']) + '.json';
 	let cfg = fs.open(path, 'w');
 	cfg.write(payload);
 	cfg.close();
@@ -213,16 +213,16 @@ function radius_acct(uspot, mac, payload) {
 	payload.acct = true;
 
 	if (payload.acct_type != radat_start) {
-		payload.session_time = time() - client.connect;
-		payload.output_octets = state.acct_data.bytes_dl & 0xffffffff;
-		payload.input_octets = state.acct_data.bytes_ul & 0xffffffff;
-		payload.output_gigawords = state.acct_data.bytes_dl >> 32;
-		payload.input_gigawords = state.acct_data.bytes_ul >> 32;
-		payload.output_packets = state.acct_data.packets_dl;
-		payload.input_packets = state.acct_data.packets_ul;
+		payload['Acct-Session-Time'] = time() - client.connect;
+		payload['Acct-Output-Octets'] = state.acct_data.bytes_dl & 0xffffffff;
+		payload['Acct-Input-Octets'] = state.acct_data.bytes_ul & 0xffffffff;
+		payload['Acct-Output-Gigawords'] = state.acct_data.bytes_dl >> 32;
+		payload['Acct-Input-Gigawords'] = state.acct_data.bytes_ul >> 32;
+		payload['Acct-Output-Packets'] = state.acct_data.packets_dl;
+		payload['Acct-Input-Packets'] = state.acct_data.packets_ul;
 	}
 	if (state.data?.radius?.reply?.Class)
-		payload.class = state.data.radius.reply.Class;
+		payload.Class = state.data.radius.reply.Class;
 
 	radius_call(uspot, mac, payload);
 }
@@ -246,8 +246,8 @@ function radius_terminate(uspot, mac, cause) {
 		return;
 
 	let payload = {
-		acct_type: radat_stop,
-		terminate_cause: cause,
+		'Acct-Status-Type': radat_stop,
+		'Acct-Terminate-Cause': cause,
 	};
 	debug(uspot, mac, 'acct terminate: ' + cause);
 	radius_acct(uspot, mac, payload);
@@ -261,7 +261,7 @@ function radius_terminate(uspot, mac, cause) {
  */
 function radius_start(uspot, mac) {
 	let payload = {
-		acct_type: radat_start,
+		'Acct-Status-Type': radat_start,
 	};
 	debug(uspot, mac, 'acct start');
 	radius_acct(uspot, mac, payload);
@@ -275,7 +275,7 @@ function radius_start(uspot, mac) {
  */
 function radius_interim(uspot, mac) {
 	let payload = {
-		acct_type: radat_interim,
+		'Acct-Status-Type': radat_interim,
 	};
 	radius_acct(uspot, mac, payload);
 	debug(uspot, mac, 'iterim acct call');
@@ -421,7 +421,7 @@ function client_enable(uspot, mac) {
 	if (radius?.request && accounting && interval)
 		client.next_interim = time() + interval;
 	if (cui)
-		client.radius.request['cui'] = cui;
+		client.radius.request['Chargeable-User-Identity'] = cui;
 
 	let spotfilter = uconn.call('spotfilter', 'client_get', {
 		interface: uspot,
@@ -513,8 +513,8 @@ function radius_accton(uspot)
 	uspots[uspot].sessionid = sessionid;
 
 	let payload = {
-		acct_type: radat_accton,
-		acct_session: sessionid,
+		'Acct-Status-Type': radat_accton,
+		'Acct-Session-Id': sessionid,
 	};
 	payload = radius_init(uspot, null, payload);
 	payload.acct = true;
@@ -530,8 +530,8 @@ function radius_accton(uspot)
 function radius_acctoff(uspot)
 {
 	let payload = {
-		acct_type: radat_acctoff,
-		acct_session: uspots[uspot].sessionid,
+		'Acct-Status-Type': radat_acctoff,
+		'Acct-Session-Id': uspots[uspot].sessionid,
 	};
 	payload = radius_init(uspot, null, payload);
 	payload.acct = true;
@@ -751,25 +751,25 @@ function run_service() {
 				let fmac = format_mac(uspot, address);
 
 				let request = {
-					username,
-					calling_station: fmac,
-					called_station: settings.nas_mac + ':' + ssid,
-					acct_session: sessionid,
-					client_ip,
+					'User-Name': username,
+					'Calling-Station-Id': fmac,
+					'Called-Station-Id': settings.nas_mac + ':' + ssid,
+					'Acct-Session-Id': sessionid,
+					'Framed-IP-Address': client_ip,
 					... reqdata || {},
 				};
 
 				if (try_macauth) {
-					request.username = fmac + (settings.mac_suffix || '');
-					request.password = settings.mac_passwd || fmac;
-					request.service_type = 10;	// Call-Check, see https://wiki.freeradius.org/guide/mac-auth#web-auth-safe-mac-auth
+					request['User-Name'] = fmac + (settings.mac_suffix || '');
+					request['Password'] = settings.mac_passwd || fmac;
+					request['Service-Type'] = 10;	// Call-Check, see https://wiki.freeradius.org/guide/mac-auth#web-auth-safe-mac-auth
 				}
 				else if (challenge) {
-					request.chap_password = password;
-					request.chap_challenge = challenge;
+					request['CHAP-Password'] = password;
+					request['CHAP-Challenge'] = challenge;
 				}
 				else
-					request.password = password;
+					request['Password'] = password;
 
 				request = radius_init(uspot, address, request, true);
 
@@ -950,7 +950,7 @@ function run_service() {
 			/*
 			 Disconnect clients matching request.
 			 @param uspot: REQUIRED: target uspot
-			 @param request: REQUIRED: any of { username, nas_ip, called_station, calling_station, nas_id, acct_session, cui }
+			 @param request: REQUIRED: any of { 'User-Name', 'NAS-IP-Address', 'Called-Station-Id', 'Calling-Station-Id', 'NAS-Identifier', 'Acct-Session-Id', 'Chargeable-User-Identity' }
 			 @return { "found": true } if match found and disconnected
 			 */
 			args: {
@@ -982,7 +982,7 @@ function run_service() {
 			/*
 			 Update clients matching CoA request.
 			 @param uspot: REQUIRED: target uspot
-			 @param request: REQUIRED: any of { username, nas_ip, called_station, calling_station, nas_id, acct_session, cui } + Supported CoA changes
+			 @param request: REQUIRED: any of { 'User-Name', 'NAS-IP-Address', 'Called-Station-Id', 'Calling-Station-Id', 'NAS-Identifier', 'Acct-Session-Id', 'Chargeable-User-Identity' } + Supported CoA changes
 			 @return { "found": true } if match found and updated
 			 */
 			args: {
