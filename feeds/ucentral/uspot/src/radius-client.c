@@ -124,7 +124,7 @@ static const struct {
  * @param in null-terminated input hex string buffer
  * @param out output buffer
  * @param osize output buffer size
- * @return number of characters decoded
+ * @return number of characters decoded or -1 on error
  * @note if osize is <= strlen(in)/2, the output will be truncated (null-terminated).
  * @warning no input sanitization is performed: in must be null-terminated;
  * the resulting output string may contain non-representable characters.
@@ -137,7 +137,7 @@ str_to_hex(const char *in, char *out, int osize)
 
 	for (i = 0; (i < ilen/2) && (i < osize - 1); i++) {
 		if (sscanf(&in[i * 2], "%2hhx", &out[i]) != 1)
-			break;	// truncate output on scan errors
+			return -1;
 	}
 
 	out[i] = '\0';
@@ -171,18 +171,15 @@ static int cb_chap_passwd(void *p, size_t s, struct blob_attr *b)
 	assert(s >= 17);
 	len = str_to_hex(blobmsg_get_string(b), str+1, 16);
 
-	return len+1;
+	return len >= 0 ? len+1 : len;
 }
 
 static int cb_chap_challenge(void *p, size_t s, struct blob_attr *b)
 {
 	char *str = p;
-	int len;
 
 	assert(s >= 16);
-	len = str_to_hex(blobmsg_get_string(b), str, 16);
-
-	return len;
+	return str_to_hex(blobmsg_get_string(b), str, 16);
 }
 
 static int
@@ -202,7 +199,7 @@ result(rc_handle const *rh, int accept, VALUE_PAIR *pair)
 		for (vp = pair; vp != NULL; vp = vp->next) {
 			if (rc_avpair_tostr(rh, vp, name, sizeof(name), value,
 					    sizeof(value)) == -1)
-				break;
+				continue;	// add as many attributes as possible
 			blobmsg_add_string(&b, name, value);
 		}
 		blobmsg_close_table(&b, c);
@@ -239,13 +236,20 @@ radius(rc_handle *rh)
 	void *pval;
 	int len, i;
 
-	if (tb[RADIUS_SERVER])
-		rc_add_config(rh, "authserver", blobmsg_get_string(tb[RADIUS_SERVER]), "code", __LINE__);
-	if (tb[RADIUS_ACCT_SERVER])
-		rc_add_config(rh, "acctserver", blobmsg_get_string(tb[RADIUS_ACCT_SERVER]), "code", __LINE__);
-	rc_add_config(rh, "radius_timeout", "5", "code", __LINE__);
-	rc_add_config(rh, "radius_retries", "1", "code", __LINE__);
-	rc_add_config(rh, "bindaddr", "*", "code", __LINE__);
+	if (tb[RADIUS_SERVER]) {
+		if (rc_add_config(rh, "authserver", blobmsg_get_string(tb[RADIUS_SERVER]), "code", __LINE__))
+			goto fail;
+	}
+	if (tb[RADIUS_ACCT_SERVER]) {
+		if (rc_add_config(rh, "acctserver", blobmsg_get_string(tb[RADIUS_ACCT_SERVER]), "code", __LINE__))
+			goto fail;
+	}
+	if (rc_add_config(rh, "radius_timeout", "5", "code", __LINE__))
+		goto fail;
+	if (rc_add_config(rh, "radius_retries", "1", "code", __LINE__))
+		goto fail;
+	if (rc_add_config(rh, "bindaddr", "*", "code", __LINE__))
+		goto fail;
 	if (rc_apply_config(rh) != 0)
 		goto fail;
 
@@ -262,8 +266,11 @@ radius(rc_handle *rh)
 		switch (radius_policy[i].type) {
 			case BLOBMSG_TYPE_INT32:
 				len = 4;
-				if (avpair[i].cb)
+				if (avpair[i].cb) {
 					len = avpair[i].cb(&val, sizeof(val), tb[i]);
+					if (len < 0)
+						goto fail;
+				}
 				else
 					val = blobmsg_get_u32(tb[i]);
 				pval = &val;
@@ -273,6 +280,8 @@ radius(rc_handle *rh)
 				if (avpair[i].cb) {
 					memset(tempstr, 0, sizeof(tempstr));
 					len = avpair[i].cb(&tempstr, sizeof(tempstr), tb[i]);
+					if (len < 0)
+						goto fail;
 					pval = &tempstr;
 				}
 				else
@@ -363,11 +372,13 @@ main(int argc, char **argv)
 		}
 	}
 
-	blob_buf_init(&b, 0);
+	if (blob_buf_init(&b, 0))
+		goto fail;
 	if (!blobmsg_add_json_from_file(&b, argv[1]))
 		goto fail;
 
-	blobmsg_parse(radius_policy, __RADIUS_MAX, tb, blob_data(b.head), blob_len(b.head));
+	if (blobmsg_parse(radius_policy, __RADIUS_MAX, tb, blob_data(b.head), blob_len(b.head)))
+		goto fail;
 
 	return radius(rh);
 fail:
