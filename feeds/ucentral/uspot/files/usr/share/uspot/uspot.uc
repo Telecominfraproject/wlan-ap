@@ -428,10 +428,16 @@ function client_enable(uspot, mac) {
 		address: mac,
 	});
 
+	// abort if spotfilter does not reply (not running?)
+	if (!spotfilter) {
+		syslog(uspot, mac, 'no reply from spotfilter!');
+		return;
+	}
+
 	client.device = spotfilter.device;
-	if (spotfilter?.ip4addr)
+	if (spotfilter.ip4addr)
 		client.ip4addr = spotfilter.ip4addr;
-	if (spotfilter?.ip6addr)
+	if (spotfilter.ip6addr)
 		client.ip6addr = spotfilter.ip6addr;
 
 	// tell spotfilter this client is allowed
@@ -553,6 +559,11 @@ function accounting(uspot) {
 	let list = uconn.call('spotfilter', 'client_list', { interface: uspot });
 	let t = time();
 	let accounting = uspots[uspot].settings.accounting;
+
+	if (!list) {
+		syslog(uspot, null, 'no client list from spotfilter!');
+		return;
+	}
 
 	for (let mac, client in uspots[uspot].clients) {
 		if (!client.state) {
