@@ -122,9 +122,9 @@ TARGET_DEVICES += yuncore_fap655
 
 define Device/xunison_d50_5g
   DEVICE_TITLE := Xunison D50-5G
-  DEVICE_DTS := qcom-ipq5018-xunison-d50
+  DEVICE_DTS := qcom-ipq5018-xunison-d50-5g
   SUPPORTED_DEVICES := xunison,d50_5g
-  DEVICE_PACKAGES := ath11k-wifi-xunison-d50 ath11k-firmware-ipq50xx ath11k-firmware-qcn9000 ath11k-firmware-qcn6122
+  DEVICE_PACKAGES := ath11k-wifi-xunison-d50 ath11k-firmware-ipq50xx ath11k-firmware-qcn9000 ath11k-firmware-qcn6122 ath11k-wifi-qcom-ipq5018
   DEVICE_DTS_CONFIG := config@mp03.1
   IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
   IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
@@ -135,10 +135,10 @@ TARGET_DEVICES += xunison_d50_5g
 
 define Device/xunison_d50
   DEVICE_TITLE := Xunison D50
-  DEVICE_DTS := qcom-ipq5018-xunison-d50-5g
+  DEVICE_DTS := qcom-ipq5018-xunison-d50
   SUPPORTED_DEVICES := xunison,d50
   DEVICE_PACKAGES := ath11k-wifi-xunison-d50 ath11k-firmware-ipq50xx ath11k-firmware-qcn9000 ath11k-firmware-qcn6122
-  DEVICE_DTS_CONFIG := config@mp03.1-c2
+  DEVICE_DTS_CONFIG := config@mp03.1
   IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
   IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
   IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
