@@ -465,14 +465,15 @@ function client_kick(uspot, mac, remove) {
 	if (client.ip6addr)
 		system('conntrack -D -s ' + client.ip6addr);
 
+	// delete ratelimit rules if any
+	uconn.call('ratelimit', 'client_delete', { address: mac });
+
 	delete uspots[uspot].clients[mac];
 }
 
 function client_remove(uspot, mac, reason) {
 	syslog(uspot, mac, reason);
 	client_kick(uspot, mac, true);
-	// delete ratelimit rules if any
-	uconn.call('ratelimit', 'client_delete', { address: mac });
 }
 
 function client_reset(uspot, mac, reason) {
