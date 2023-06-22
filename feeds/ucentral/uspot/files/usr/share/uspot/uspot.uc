@@ -5,11 +5,14 @@
 
 'use strict';
 
+push(REQUIRE_SEARCH_PATH, "/usr/share/uspot/*.uc");
+
 let fs = require('fs');
 let uloop = require('uloop');
 let ubus = require('ubus');
 let uconn = ubus.connect();
 let uci = require('uci').cursor();
+let lib = require('uspotlib');
 let uspots = {};
 
 let uciload = uci.foreach('uspot', 'uspot', (d) => {
@@ -63,35 +66,9 @@ function debug(uspot, mac, msg) {
 		syslog(uspot, mac, msg);
 }
 
-// mac re-formater
 function format_mac(uspot, mac) {
 	let format = uspots[uspot].settings.mac_format;
-
-	switch(format) {
-	case 'aabbccddeeff':
-	case 'AABBCCDDEEFF':
-		mac = replace(mac, ':', '');
-		break;
-	case 'aa-bb-cc-dd-ee-ff':
-	case 'AA-BB-CC-DD-EE-FF':
-		mac = replace(mac, ':', '-');
-		break;
-	}
-
-	switch(format) {
-	case 'aabbccddeeff':
-	case 'aa-bb-cc-dd-ee-ff':
-	case 'aa:bb:cc:dd:ee:ff':
-		mac = lc(mac);
-		break;
-	case 'AABBCCDDEEFF':
-	case 'AA:BB:CC:DD:EE:FF':
-	case 'AA-BB-CC-DD-EE-FF':
-		mac = uc(mac);
-		break;
-	}
-
-	return mac;
+	return lib.format_mac(format, mac);
 }
 
 // wrapper for scraping external tools JSON stdout
@@ -107,16 +84,6 @@ function json_cmd(cmd) {
 	}
 	stdout.close();
 	return reply;
-}
-
-function generate_sessionid() {
-	let math = require('math');
-	let sessionid = '';
-
-	for (let i = 0; i < 16; i++)
-		sessionid += sprintf('%x', math.rand() % 16);
-
-	return sessionid;
 }
 
 /**
@@ -514,7 +481,7 @@ function client_reset(uspot, mac, reason) {
 function radius_accton(uspot)
 {
 	// assign a global uspot session ID for Accounting-On/Off messages
-	let sessionid = generate_sessionid();
+	let sessionid = lib.generate_sessionid();
 
 	uspots[uspot].sessionid = sessionid;
 
@@ -702,7 +669,7 @@ function run_service() {
 				let password = req.args.password;
 				let challenge = req.args.challenge;
 				let ssid = req.args.ssid;
-				let sessionid = req.args.sessionid || generate_sessionid();
+				let sessionid = req.args.sessionid || lib.generate_sessionid();
 				let reqdata = req.args.reqdata;
 
 				let try_macauth = false;

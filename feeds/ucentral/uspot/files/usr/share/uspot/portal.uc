@@ -9,6 +9,7 @@ let fs = require('fs');
 let uci = require('uci').cursor();
 let config = uci.get_all('uspot');
 let nl = require("nl80211");
+let lib = require('uspotlib');
 
 let file = fs.open('/usr/share/uspot/header', 'r');
 let header = file.read('all');
@@ -108,45 +109,6 @@ return {
 			this.syslog(ctx, msg);
 	},
 
-	// session id generator
-	session_init: function() {
-		let math = require('math');
-		let sessionid = '';
-
-		for (let i = 0; i < 16; i++)
-		        sessionid += sprintf('%x', math.rand() % 16);
-		return sessionid;
-	},
-
-	// mac re-formater
-	format_mac: function(format, mac) {
-		switch(format) {
-		case 'aabbccddeeff':
-		case 'AABBCCDDEEFF':
-			mac = replace(mac, ':', '');
-			break;
-		case 'aa-bb-cc-dd-ee-ff':
-		case 'AA-BB-CC-DD-EE-FF':
-			mac = replace(mac, ':', '-');
-			break;
-		}
-
-		switch(format) {
-		case 'aabbccddeeff':
-		case 'aa-bb-cc-dd-ee-ff':
-		case 'aa:bb:cc:dd:ee:ff':
-			mac = lc(mac);
-			break;
-		case 'AABBCCDDEEFF':
-		case 'AA:BB:CC:DD:EE:FF':
-		case 'AA-BB-CC-DD-EE-FF':
-			mac = uc(mac);
-			break;
-		}
-
-		return mac;
-	},
-
 	// give a client access to the internet
 	allow_client: function(ctx) {
 		if (ctx.query_string.userurl)
@@ -240,7 +202,7 @@ return {
 		}
 		ctx.spotfilter = lookup_station(ctx.mac) || devices[dev];	// fallback to rtnl device
 		ctx.config = config[ctx.spotfilter] || {};
-		ctx.format_mac = this.format_mac(ctx.config.mac_format, ctx.mac);
+		ctx.format_mac = lib.format_mac(ctx.config.mac_format, ctx.mac);
 		if (+ctx.config.web_root) {
 			ctx.header = header_custom;
 			ctx.footer = footer_custom;
@@ -271,7 +233,7 @@ return {
 			cdata.ssid = hapd?.ssid || 'unknown';
 		}
 		if (!cdata.sessionid) {
-			let sessionid = this.session_init();
+			let sessionid = lib.generate_sessionid();
 			cdata.sessionid = sessionid;
 		}
 		ctx.ssid = cdata.ssid;
