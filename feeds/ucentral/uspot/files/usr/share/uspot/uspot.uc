@@ -168,6 +168,11 @@ const radat_acctoff = 8;	// Accounting-Off
  * @param {object} payload the RADIUS payload
  */
 function radius_acct(uspot, mac, payload) {
+	let settings = uspots[uspot].settings;
+
+	if (!settings.accounting)
+		return;
+
 	let client = uspots[uspot].clients[mac];
 	let state = uconn.call('spotfilter', 'client_get', {
 		interface: uspot,
@@ -181,12 +186,14 @@ function radius_acct(uspot, mac, payload) {
 
 	if (payload.acct_type != radat_start) {
 		payload['Acct-Session-Time'] = time() - client.connect;
-		payload['Acct-Output-Octets'] = state.acct_data.bytes_dl & 0xffffffff;
-		payload['Acct-Input-Octets'] = state.acct_data.bytes_ul & 0xffffffff;
-		payload['Acct-Output-Gigawords'] = state.acct_data.bytes_dl >> 32;
-		payload['Acct-Input-Gigawords'] = state.acct_data.bytes_ul >> 32;
-		payload['Acct-Output-Packets'] = state.acct_data.packets_dl;
-		payload['Acct-Input-Packets'] = state.acct_data.packets_ul;
+		if (length(state.acct_data)) {
+			payload['Acct-Output-Octets'] = state.acct_data.bytes_dl & 0xffffffff;
+			payload['Acct-Input-Octets'] = state.acct_data.bytes_ul & 0xffffffff;
+			payload['Acct-Output-Gigawords'] = state.acct_data.bytes_dl >> 32;
+			payload['Acct-Input-Gigawords'] = state.acct_data.bytes_ul >> 32;
+			payload['Acct-Output-Packets'] = state.acct_data.packets_dl;
+			payload['Acct-Input-Packets'] = state.acct_data.packets_ul;
+		}
 	}
 	if (state.data?.radius?.reply?.Class)
 		payload.Class = state.data.radius.reply.Class;
