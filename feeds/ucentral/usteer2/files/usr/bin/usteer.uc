@@ -2,6 +2,9 @@
 
 push(REQUIRE_SEARCH_PATH, '/usr/share/usteer/*.uc');
 
+global.nl80211 = require("nl80211");
+global.fs = require('fs');
+
 global.ulog = {
 	identity: 'usteer',
 	channels: [ 'stdio', 'syslog' ],
@@ -15,6 +18,12 @@ global.ubus = {
 	},
 
 	methods: {
+		phys: {
+			cb: function(msg) {
+				return global.phy.status();
+			}
+		},
+
 		interfaces: {
 			cb: function(msg) {
 				return global.local.status();
@@ -59,14 +68,14 @@ global.start = function() {
 		global.uci = require('uci').cursor();
 		global.ubus.conn = require('ubus').connect();
 
-		for (let module in [ 'config', 'local', 'station', 'command', 'policy' ]) {
+		for (let module in [ 'config', 'event', 'phy', 'local', 'station', 'command', 'policy' ]) {
 			printf('loading ' + module + '\n');
 			global[module] = require(module);
 			if (exists(global[module], 'init'))
 				global[module].init();
 		}
 	} catch(e) {
-		printf('exception %s\n', e);
+                printf('exception %.J %.J\n', e, e.stacktrace[0].context);
 	}
 };
 
