@@ -1,9 +1,25 @@
 let nl80211 = require("nl80211");
 let def = nl80211.const;
-let subscriber;
+let hapd_subscriber;
+let ucentral_subscriber;
 let state = {};
 let hapd = {};
 let handlers = {};
+
+function channel_to_freq(band, channel) {
+	if (band == '2G' && channel >= 1 && channel <= 13)
+		return 2407 + channel * 5;
+	else if (band == '2G' && channel == 14)
+		return 2484;
+	else if (band == '5G' && channel >= 7 && channel <= 177)
+		return 5000 + channel * 5;
+	else if (band == '5G' && channel >= 183 && channel <= 196)
+		return 4000 + channel * 5;
+	else if (band == '60G' && channel >= 1 && channel <= 6)
+		return 56160 + channel * 2160;
+
+       return null;
+}
 
 function channel_survey(dev) {
 	/* trigger the nl80211 call that gathers channel survey data */
@@ -42,6 +58,23 @@ function hapd_update() {
 	return 5000;
 }
 
+function hapd_nr_set(iface) {
+	let list = [];
+	for (let k, v in hapd) {
+		if (k == iface || v.ssid != hapd[iface].ssid)
+			continue;
+		push(list, v.rrm_nr);
+
+		global.ubus.conn.call('hostapd.' + iface, 'rrm_nr_set', { list }); 
+	}
+}
+
+function hapd_nr_update(ssid) {
+	for (let k, v in hapd)
+		if (v.ssid == ssid)
+			hapd_nr_set(k);
+}
+
 function hapd_subunsub(path, sub) {
 	/* check if this is a hostapd instance */
 	let name = split(path, '.');
@@ -54,6 +87,7 @@ function hapd_subunsub(path, sub) {
 
 	/* the hostapd instance disappeared */
 	if (!sub) {
+		global.event.send('rrm.bss.del', { bssid: hapd[name] });
 		delete hapd[name];
 		delete state[name];
 		return;
@@ -66,11 +100,10 @@ function hapd_subunsub(path, sub) {
 
 	let cfg = uci.get_all('usteer2', status.uci_section);
 	if (!cfg)
-		return;
-
+		cfg = {};
 
 	/* subscibe to hostapd */
-	subscriber.subscribe(path);
+	hapd_subscriber.subscribe(path);
 
 	/* tell hostapd to wait for a reply before answering probe requests */
 	//global.ubus.conn.call(path, 'notify_response', { 'notify_response': 1 });
@@ -94,10 +127,31 @@ function hapd_subunsub(path, sub) {
 
 	/* trigger an initial channel survey */
 	channel_survey(name);
+
+	/* update the neighborhood reports */
+	hapd_nr_update(hapd[name].ssid);
+
+	/* send an event */
+	global.event.send('rrm.bss.add', {
+		bssid: hapd[name].bssid,
+		ssid: hapd[name].ssid,
+		freq: hapd[name].freq,
+		channel: hapd[name].channel,
+		op_class: hapd[name].op_class
+	});
+}
+
+function ucentral_subunsub(sub) {
+	if (!sub)
+		return;
+	ucentral_subscriber.subscribe('ucentral');
 }
 
 function hapd_listener(event, msg) {
 	hapd_subunsub(msg.path, event == 'ubus.object.add');
+
+	if (msg.path == 'ucentral')
+		ucentral_subunsub(event == 'ubus.object.add');
 }
 
 function hapd_handle_event(req) {
@@ -111,25 +165,33 @@ function hapd_handle_event(req) {
 	req.reply();
 }
 
+function ucentral_handle_event(req) {
+	printf('%.J\n', req);
+}
+
 return {
 	status: function() {
 		return hapd;
 	},
 
 	init: function() {
-		subscriber = global.ubus.conn.subscriber(
+		hapd_subscriber = global.ubus.conn.subscriber(
 			hapd_handle_event,
-			function(msg) {
-//				printf('2 %.J\n', msg);
-			});
+			function(msg) {	});
+		ucentral_subscriber = global.ubus.conn.subscriber(
+			ucentral_handle_event,
+			function(msg) { });
 
 		/* register a callback that will monitor hostapd instances spawning and disappearing */
 		global.ubus.conn.listener('ubus.object.add', hapd_listener);
 		global.ubus.conn.listener('ubus.object.remove', hapd_listener);
 
 		/* iterade over all existing hostapd instances and subscribe to them */
-		for (let path in global.ubus.conn.list())
+		for (let path in global.ubus.conn.list()) {
 			hapd_subunsub(path, true);
+			if (path == 'ucentral')
+				ucentral_subunsub(true);
+		}
 
 		uloop_timeout(hapd_update, 5000);
 	},
@@ -138,5 +200,19 @@ return {
 		/* a policy requested to be notified of action frames, register the callback */
 		handlers[event] ??= [];
 		push(handlers[event], handler);
+	},
+
+	switch_chan: function(msg) {
+		if (!msg.addr || !msg.params?.band || !msg.params?.channel)
+			return false;
+		for (let bss, v in hapd) {
+			if (v.bssid != lc(msg.addr))
+				continue;
+			return global.ubus.conn.call('hostapd.' + bss, 'switch_chan', {
+				freq: channel_to_freq(msg.param.band, mag.param.channel),
+				bcn_count: 10
+			}) == null;
+		}
+		return false;
 	},
 };

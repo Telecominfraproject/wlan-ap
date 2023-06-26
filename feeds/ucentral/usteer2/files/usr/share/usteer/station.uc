@@ -1,6 +1,8 @@
 let stations = {};
 
-function station_add(device, addr, data, seen) {
+function station_add(device, addr, data, seen, bssid) {
+	let add = false;
+
 	/* only honour stations that are authenticated */
 	if (!data.auth || !data.assoc)
 		return;
@@ -8,6 +10,7 @@ function station_add(device, addr, data, seen) {
 	/* if the station is new, add the initial entry */
 	if (!stations[addr]) {
 		ulog_info(`add station ${ addr }\n`);
+		add = true;
 
 		/* extract the rrm bits and give them meaningful names */
 		let rrm = {
@@ -20,9 +23,12 @@ function station_add(device, addr, data, seen) {
 
 		/* add the new station */
 		stations[addr] = {
+			bssid,
+			addr,
 			rrm,
 			beacon_report: {},
 		};
+
 	}
 
 	/* update device, seen and signal data */
@@ -30,10 +36,20 @@ function station_add(device, addr, data, seen) {
 	stations[addr].seen = seen;
 	if (data.signal)
 		stations[addr].signal = data.signal;
+
+	/* if the station just joined, send an event */
+	if (add)
+		global.event.send('rrm.station.add', { addr, rrm: stations[addr].rrm, bssid });
 }
 
 function station_del(addr) {
+	if (!stations[addr])
+		return;
 	ulog_info(`deleting ${ addr }\n`);
+
+	/* send an event */
+	global.event.send('rrm.station.del', { addr, bssid: stations[addr].bssid });
+
 	delete stations[addr];
 }
 
@@ -41,21 +57,23 @@ function stations_update() {
 	try {
 		/* lets not call time() multiple times */
 		let seen = time();
+		
+		/* list off all known macs */
+		let macs = [];
 
 		/* iterate over all ssids and ask hapd for the list of associations */
-		for (let device in global.local.status()) {
-			let clients = global.ubus.conn.call(`hostapd.${ device}`, 'get_clients');
+		for (let device, v in global.local.status()) {
+			let clients = global.ubus.conn.call(`hostapd.${device}`, 'get_clients');
 
-			for (let client in clients.clients)
-				if (clients.clients[client].auth)
-					station_add(device, client, clients.clients[client], seen);
-				else
-					station_del(client);
+			for (let client in clients.clients) {
+				station_add(device, client, clients.clients[client], seen, v.bssid);
+				push(macs, client);
+			}
 		}
-
-		/* purge all stations that have not been seen in a while */
+		
+		/* purge all stations that have not been seen in a while or are not associated */
 		for (let station in stations) {
-			if (seen - stations[station].seen <= +global.config.station_expiry)
+			if (!(station in macs) || seen - stations[station].seen <= +global.config.station_expiry)
 				continue;
 			station_del(station);
 		}
@@ -76,12 +94,15 @@ function beacon_report(type, report) {
 	}
 
 	/* store the report */
-	stations[report.address].beacon_report[report.bssid] = {
+	let payload = {
+		bssid: report.bssid,
 		seen: time(),
 		channel: report.channel,
 		rcpi: report.rcpi,
 		rsni: report.rsni,
 	};
+	stations[report.address].beacon_report[report.bssid] = payload;
+	global.event.send('rrm.beacon.report', payload);
 }
 
 function probe_handler(type, data) {
@@ -142,60 +163,80 @@ return {
 		return ret;
 	},
 
-	beacon_request: function(addr, channel, mode, op_class, duration) {
-		let station = stations[addr];
+	beacon_request: function(msg) {
+		if (!msg.addr || (!msg.params?.channel && !msg.params?.ssid))
+			return false;
+
+		let station = stations[msg.addr];
 
 		/* make sure that the station exists */
 		if (!station) {
-			ulog_err(`beacon request on unknown station ${addr}`);
+			ulog_err(`beacon request on unknown station ${msg.addr}`);
 			return false;
 		}
 
 		/* make sure that the station supports active beacon requests */
 		if (!station.rrm?.beacon_active_measure) {
-			ulog_err(`${addr} does not support beacon requests`);
+			ulog_err(`${msg.addr} does not support beacon requests`);
 			return false;
 		}
 
 		station.beacon_report = {};
 		let payload = {
-			addr,
-			channel,
-			mode: mode || 1,
-			op_class: op_class || 128,
-			duration: duration || 100,
+			addr: msg.addr,
+			mode: msg.params?.mode || 1,
+			op_class: msg.params?.op_class || 128,
+			duration: msg.params?.duration || 100,
 		};
+		if (msg.params.channel)
+			payload.channel = msg.params.channel;
+		else
+			payload.ssid = msg.params.ssid;
 		global.ubus.conn.call(`hostapd.${station.device}`, 'rrm_beacon_req', payload);
 
 		return true;
 	},
 
-	kick: function(addr, reason, ban_time) {
-		if (!exists(stations, addr))
-			return -1;
+	kick: function(msg) {
+		if (!msg.addr || !msg.params?.ban_time || !msg.params?.reason)
+			return false;
+
+		if (!exists(stations, msg.addr))
+			return false;
 
 		let payload = {
-			addr,
-			reason: reason || 5,
-			deauth: 1
+			addr: msg.addr,
+			reason: msg.params.reason,
+			deauth: 1,
+			ban_time: msg.params.ban_time
 		};
 
-		if (ban_time)
-			payload.ban_time = ban_time * 1000;
-
 		/* tell hostapd to kick a station via ubus */
-		global.ubus.conn.call(`hostapd.${stations[addr].device}`, 'del_client', payload);
+		global.ubus.conn.call(`hostapd.${stations[msg.addr].device}`, 'del_client', payload);
 
-		return 0;
+		return true;
 	},
 
 	list: function(msg) {
-		if (msg?.mac)
-			return stations[msg.mac] || {};
+		if (msg?.addr)
+			return stations[msg.addr] || {};
 		return stations;
 	},
 
-	steer: function(addr, imminent, neighbors) {
+	// ubus call usteer2 command '{"action": "bss_transition", "addr": "4e:7f:3e:2c:8a:68", "params": { "neighbors": ["36:ef:b6:af:48:b1"]}}'
+	bss_transition: function(msg) {
+		if (!msg.addr || !msg.params?.neighbors)
+			return false;
+		if (!stations[msg.addr])
+			return false;
 
+		let neighbors = [];
+		for (let i = 0; i < 5; i++)
+			if (msg.params?.neighbors[i])
+				push(neighbors, replace(msg.params?.neighbors[i], ':', ''));
+
+		let ret = global.ubus.conn.call(`hostapd.${stations[msg.addr].device}`, 'wnm_disassoc_imminent', {
+			addr: msg.addr, duration: 20, abridged: 1, neighbors }) == null;
+		return ret;
 	},
 };
