@@ -111,6 +111,16 @@ define Device/qcom_mp03_3
 endef
 TARGET_DEVICES += qcom_mp03_3
 
+define Device/hfcl_ion4xi_w
+  DEVICE_TITLE := HFCL ION4xi_w
+  DEVICE_DTS := qcom-ipq5018-hfcl-ion4xi_w
+  SUPPORTED_DEVICES := hfcl,ion4xi_w
+  DEVICE_PACKAGES := ath11k-wifi-hfcl-ion4xi_w ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.3
+endef
+TARGET_DEVICES += hfcl_ion4xi_w
+
+
 define Device/yuncore_fap655
   DEVICE_TITLE := Yuncore FAP650
   DEVICE_DTS := qcom-ipq5018-yuncore-fap655
