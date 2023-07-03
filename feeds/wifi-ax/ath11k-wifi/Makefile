@@ -281,7 +281,7 @@ define Package/ath11k-wifi-hfcl-ion4xi_w/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
 	$(INSTALL_DATA) ./board-hfcl-ion4xi_w.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
-	$(INSTALL_DATA) ./board-2-hfcl-ion4xi_w.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board-2.bin
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_w.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin
 endef
 
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
