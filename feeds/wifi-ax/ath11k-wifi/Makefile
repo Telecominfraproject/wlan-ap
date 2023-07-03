@@ -236,7 +236,9 @@ define Package/ath11k-wifi-cig-wf196_6g-us/install
 endef
 
 define Package/ath11k-wifi-xunison-d50/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/QCN9074/hw1.0/
+	$(INSTALL_DATA) ./board-xunison-d50.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
 	$(INSTALL_DATA) ./board-xunison-d50.bin.QCN9074 $(1)/lib/firmware/ath11k/QCN9074/hw1.0/board.bin
 endef
 
