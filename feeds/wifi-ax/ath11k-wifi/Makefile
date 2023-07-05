@@ -136,6 +136,16 @@ $(call Package/ath11k-wifi-default)
     TITLE:=hfcl-ion4xi_w bdf
 endef
 
+define Package/ath11k-wifi-hfcl-ion4x_w
+$(call Package/ath11k-wifi-default)
+    TITLE:=hfcl-ion4x_w bdf
+endef
+
+define Package/ath11k-wifi-hfcl-ion4xi_HMR
+$(call Package/ath11k-wifi-default)
+    TITLE:=hfcl-ion4xi_HMR bdf
+endef
+
 define Package/ath11k-wifi-hfcl-ion4xi_wp
 $(call Package/ath11k-wifi-default)
     TITLE:=hfcl-ion4xi_wp bdf
@@ -286,6 +296,21 @@ define Package/ath11k-wifi-hfcl-ion4xi_w/install
 	$(INSTALL_DATA) ./board-hfcl-ion4xi_w.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin
 endef
 
+define Package/ath11k-wifi-hfcl-ion4x_w/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_w.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_w.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin
+endef
+
+define Package/ath11k-wifi-hfcl-ion4xi_HMR/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_HMR.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_HMR.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin
+endef
+
+
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
 $(eval $(call generate-ath11k-wifi-package,cig-wf188n,Cigtech WF188n))
 $(eval $(call generate-ath11k-wifi-package,cig-wf186w,Cigtech WF186w))
@@ -328,3 +353,6 @@ $(eval $(call BuildPackage,ath11k-wifi-xunison-d50))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_wp))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_w))
+$(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4x_w))
+$(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_HMR))
+

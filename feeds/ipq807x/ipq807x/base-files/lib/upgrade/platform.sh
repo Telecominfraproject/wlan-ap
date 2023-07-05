@@ -134,6 +134,8 @@ platform_check_image() {
 	edgecore,eap106|\
 	hfcl,ion4xi|\
 	hfcl,ion4xi_w|\
+	hfcl,ion4x_w|\
+	hfcl,ion4xi_HMR|\
 	hfcl,ion4xi_wp|\
 	hfcl,ion4x|\
 	hfcl,ion4x_2|\
@@ -218,6 +220,8 @@ platform_do_upgrade() {
 		nand_upgrade_tar "$1"
 		;;
 	hfcl,ion4xi_w|\
+	hfcl,ion4x_w|\
+	hfcl,ion4xi_HMR|\
 	hfcl,ion4xi_wp)
 		wp_part=$(fw_printenv primary | cut  -d = -f2)
 		echo "Current Primary is $wp_part"
