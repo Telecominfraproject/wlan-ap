@@ -13,7 +13,7 @@ define Package/uspot
   SECTION:=net
   CATEGORY:=Network
   TITLE:=hotspot daemon
-  DEPENDS:=+spotfilter +uhttpd-mod-ucode +libradcli +iptables-mod-conntrack-extra +conntrack \
+  DEPENDS:=+spotfilter +uhttpd-mod-ucode +libradcli +conntrack \
 	   +ucode-mod-math +ucode-mod-nl80211 +ucode-mod-rtnl +ucode-mod-uloop +ratelimit \
 	   +libubus +libubox +libuci
 endef
