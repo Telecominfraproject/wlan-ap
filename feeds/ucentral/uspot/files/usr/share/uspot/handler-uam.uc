@@ -17,7 +17,7 @@ function auth_client(ctx) {
 	let challenge;
 	let payload = {};
 
-	payload['WISPr-Logoff-URL'] = sprintf('http://%s:%s/logoff', ctx.env.SERVER_ADDR, ctx.config.uam_port);
+	payload['WISPr-Logoff-URL'] = sprintf('http://%s:%s/logoff', ctx.env.SERVER_ADDR, (ctx.config.uam_port || "3990"));
 	if (ctx.query_string.username) {	// username must be set
 		username = ctx.query_string.username;
 		if (ctx.query_string.response) {	// try challenge first
