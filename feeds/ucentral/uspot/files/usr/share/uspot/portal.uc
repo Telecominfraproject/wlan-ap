@@ -198,7 +198,7 @@ return {
 		if (!ctx.mac) {
 			this.syslog(ctx, 'failed to look up mac');
 			include('error.uc', ctx);
-			return NULL;
+			return null;
 		}
 		ctx.spotfilter = lookup_station(ctx.mac) || devices[dev];	// fallback to rtnl device
 		ctx.config = config[ctx.spotfilter] || {};
@@ -220,7 +220,7 @@ return {
 		if (!cdata) {
 			this.syslog(ctx, 'uspot error');
 			include('error.uc', ctx);
-			return NULL;
+			return null;
 		}
 
 		if (!uam && length(cdata)) {	// cdata is empty for disconnected clients
