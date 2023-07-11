@@ -94,7 +94,9 @@ let main_obj = {
 				return libubus.STATUS_INVALID_ARGUMENT;
 			}
 
-			return 0;
+			return {
+				pid: wpas.getpid()
+			};
 		}
 	},
 	config_add: {

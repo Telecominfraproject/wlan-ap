@@ -208,7 +208,7 @@ uc_value_t *wpa_ucode_registry_remove(uc_value_t *reg, int idx)
 	uc_value_t *val = wpa_ucode_registry_get(reg, idx);
 
 	if (val)
-		ucv_array_delete(reg, idx - 1, 1);
+		ucv_array_set(reg, idx - 1, NULL);
 
 	return val;
 }
