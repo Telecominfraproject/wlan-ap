@@ -752,7 +752,7 @@ mac80211_setup_adhoc() {
 	[ -n "$mcast_rate" ] && wpa_supplicant_add_rate mcval "$mcast_rate"
 
 	local prev
-	json_set_namespace wdev prev
+	json_set_namespace wdev_uc prev
 
 	json_add_object "$ifname"
 	json_add_string mode adhoc
@@ -778,7 +778,7 @@ mac80211_setup_mesh() {
 	[ -n "$mesh_id" ] && ssid="$mesh_id"
 
 	local prev
-	json_set_namespace wdev prev
+	json_set_namespace wdev_uc prev
 
 	json_add_object "$ifname"
 	json_add_string mode mesh
@@ -797,7 +797,7 @@ mac80211_setup_mesh() {
 
 mac80211_setup_monitor() {
 	local prev
-	json_set_namespace wdev prev
+	json_set_namespace wdev_uc prev
 
 	json_add_object "$ifname"
 	json_add_string mode monitor
@@ -1073,13 +1073,13 @@ drv_mac80211_setup() {
 	wpa_supp_init=
 	for_each_interface "ap" mac80211_check_ap
 
-	mv "$hostapd_conf_file" "$hostapd_conf_file.prev"
+	[ -f "$hostapd_conf_file" ] && mv "$hostapd_conf_file" "$hostapd_conf_file.prev"
 
 	for_each_interface "sta adhoc mesh" mac80211_set_noscan
 	[ -n "$has_ap" ] && mac80211_hostapd_setup_base "$phy"
 
 	local prev
-	json_set_namespace wdev prev
+	json_set_namespace wdev_uc prev
 	json_init
 	json_set_namespace "$prev"
 
@@ -1104,8 +1104,8 @@ drv_mac80211_setup() {
 
 	[ -n "$wpa_supp_init" ] && wpa_supplicant_start "$phy"
 
-	json_set_namespace wdev prev
-	wdev_tool "$(json_dump)" $active_ifnames
+	json_set_namespace wdev_uc prev
+	wdev_tool "$phy" "$(json_dump)" $active_ifnames
 	json_set_namespace "$prev"
 
 	for_each_interface "ap sta adhoc mesh monitor" mac80211_set_vif_txpower
