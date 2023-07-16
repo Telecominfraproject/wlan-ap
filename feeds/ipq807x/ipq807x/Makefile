@@ -7,6 +7,7 @@ SUBTARGETS:=ipq807x ipq60xx ipq50xx
 FEATURES:=squashfs ramdisk nand pcie usb
 KERNELNAME:=Image dtbs
 CPU_TYPE:=cortex-a7
+DEVICE_TYPE:=qsdk
 
 KERNEL_PATCHVER:=4.4
 KERNEL_NAME_SUFFIX=-qsdk-11f09717303ecd83c3a64e9efe23f25921dc1016
