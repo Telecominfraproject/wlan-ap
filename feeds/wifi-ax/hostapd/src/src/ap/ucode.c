@@ -136,7 +136,10 @@ uc_hostapd_bss_set_config(uc_vm_t *vm, size_t nargs)
 	conf->bss[idx] = NULL;
 	hostapd_config_free(conf);
 
-	hostapd_reload_bss(hapd);
+	hostapd_bss_deinit_no_free(hapd);
+	hostapd_free_hapd_data(hapd);
+	hostapd_setup_bss(hapd, hapd == iface->bss[0], !iface->conf->multiple_bssid);
+
 	ret = 0;
 
 out:

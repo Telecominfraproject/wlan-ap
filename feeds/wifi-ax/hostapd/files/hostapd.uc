@@ -31,35 +31,24 @@ function iface_remove(cfg)
 		wdev_remove(bss.ifname);
 }
 
-function write_lines(f, data)
+function iface_gen_config(phy, config)
 {
-	for (let line in data) {
-		f.write(line);
-		f.write("\n");
-	}
-}
-
-function iface_write_config(phy, config)
-{
-	config.file = `/var/run/ap-${phy}.conf`;
-
-	let f = open(config.file, "w");
-	if (!f) {
-		hostapd.printf(`Failed to open file ${config.file}`);
-		return;
-	}
-
-	write_lines(f, config.radio.data);
-	f.write(`channel=${config.radio.channel}\n`);
+	let str = `data:
+${join("\n", config.radio.data)}
+channel=${config.radio.channel}
+`;
 
 	for (let i = 0; i < length(config.bss); i++) {
 		let bss = config.bss[i];
 		let type = i > 0 ? "bss" : "interface";
 
-		f.write(`${type}=${bss.ifname}\n`);
-		write_lines(f, bss.data);
+		str += `
+${type}=${bss.ifname}
+${join("\n", bss.data)}
+`;
 	}
-	f.close();
+
+	return str;
 }
 
 function iface_restart(phy, config, old_config)
@@ -76,7 +65,8 @@ function iface_restart(phy, config, old_config)
 	let err = wdev_create(phy, bss.ifname, { mode: "ap" });
 	if (err)
 		hostapd.printf(`Failed to create ${bss.ifname} on phy ${phy}: ${err}`);
-	if (hostapd.add_iface(`bss_config=${bss.ifname}:${config.file}`) < 0) {
+	let config_inline = iface_gen_config(phy, config);
+	if (hostapd.add_iface(`bss_config=${bss.ifname}:${config_inline}`) < 0) {
 		hostapd.printf(`hostapd.add_iface failed for phy ${phy} ifname=${bss.ifname}`);
 		return;
 	}
@@ -134,10 +124,12 @@ function iface_reload_config(phy, config, old_config)
 	if (!iface)
 		return false;
 
+	let config_inline = iface_gen_config(phy, config);
+
 	bss_reload_psk(iface.bss[0], config.bss[0], old_config.bss[0]);
 	if (!is_equal(config.bss[0], old_config.bss[0])) {
 		hostapd.printf(`Reload config for bss '${config.bss[0].ifname}' on phy '${phy}'`);
-		if (iface.bss[0].set_config(config.file, 0) < 0) {
+		if (iface.bss[0].set_config(config_inline, 0) < 0) {
 			hostapd.printf(`Failed to set config`);
 			return false;
 		}
@@ -173,7 +165,7 @@ function iface_reload_config(phy, config, old_config)
 			return false;
 		}
 
-		if (bss.set_config(config.file, idx) < 0) {
+		if (bss.set_config(config_inline, idx) < 0) {
 			hostapd.printf(`Failed to set config`);
 			return false;
 		}
@@ -188,7 +180,7 @@ function iface_reload_config(phy, config, old_config)
 			return false;
 		}
 
-		if (iface.add_bss(config.file, idx) < 0) {
+		if (iface.add_bss(config_inline, idx) < 0) {
 			hostapd.printf(`Failed to add bss`);
 			return false;
 		}
@@ -205,8 +197,6 @@ function iface_set_config(phy, config)
 
 	if (!config)
 		return iface_remove(old_config);
-
-	iface_write_config(phy, config);
 
 	let ret = iface_reload_config(phy, config, old_config);
 	if (ret) {
