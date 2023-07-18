@@ -127,6 +127,11 @@ $(call Package/ath11k-wifi-default)
     TITLE:=meshpp-s618 bdf
 endef
 
+define Package/ath11k-wifi-edgecore-oap101
+$(call Package/ath11k-wifi-default)
+    TITLE:=edgecore oap101 bdf
+endef
+
 define ath11k-wifi-install-one-to
   $(INSTALL_DIR)  $(2)/lib/firmware/$(3)/
   $(INSTALL_DATA) $(1) $(2)/lib/firmware/$(3)/board.bin
@@ -248,6 +253,13 @@ define Package/ath11k-wifi-hfcl-ion4xi/install
 	$(INSTALL_DATA) ./board-hfcl-ion4xi.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
 endef
 
+define Package/ath11k-wifi-edgecore-oap101/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-edgecore-oap101.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-2-edgecore-oap101.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board-2.bin
+endef
+
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
 $(eval $(call generate-ath11k-wifi-package,cig-wf188n,Cigtech WF188n))
 $(eval $(call generate-ath11k-wifi-package,cig-wf660a,Cigtech WF660a))
@@ -283,3 +295,4 @@ $(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g-ca))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g-us))
 $(eval $(call BuildPackage,ath11k-wifi-motorola-q14))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi))
+$(eval $(call BuildPackage,ath11k-wifi-edgecore-oap101))
