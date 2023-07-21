@@ -149,6 +149,7 @@ function iface_reload_config(phy, config, old_config)
 		if (!new_cfg[name]) {
 			hostapd.printf(`Remove bss '${name}' on phy '${phy}'`);
 			bss.delete();
+			wdev_remove(name);
 			continue;
 		}
 
