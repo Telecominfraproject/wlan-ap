@@ -46,6 +46,7 @@ ALLWIFIBOARDS:= \
 	indio-um-510axm-v1 \
 	muxi-ap3220l \
 	plasmacloud-pax1800 \
+	wallys-dr5018 \
 	wallys-dr6018 \
 	wallys-dr6018-v4 \
 	tplink-ex227 \
@@ -356,6 +357,7 @@ $(eval $(call generate-ath11k-wifi-package,cybertan-eww622-a1,CyberTan EWW622 A1
 $(eval $(call generate-ath11k-wifi-package,cybertan-eww631-a1,CyberTan EWW631 A1))
 $(eval $(call generate-ath11k-wifi-package,cybertan-eww631-b1,CyberTan EWW631 B1))
 $(eval $(call generate-ath11k-wifi-package,sercomm-wallaby,Sercomm Kiwi))
+$(eval $(call generate-ath11k-wifi-package,wallys-dr5018,Wallys Dr5018))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018,Wallys DR6018))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018-v4,Wallys DR6018 V4))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap101,EdgeCore EAP101))

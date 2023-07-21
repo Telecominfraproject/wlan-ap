@@ -125,6 +125,7 @@ platform_check_image() {
 	indio,um-310ax-v1|\
 	indio,um-510axp-v1|\
 	indio,um-510axm-v1|\
+	wallys,dr5018|\
 	wallys,dr6018|\
 	wallys,dr6018-v4|\
 	edgecore,eap101|\
@@ -197,6 +198,7 @@ platform_do_upgrade() {
 	xunison,d50|\
 	xunison,d50-5g|\
 	qcom,ipq5018-mp03.3|\
+	wallys,dr5018|\
 	wallys,dr6018|\
 	wallys,dr6018-v4|\
 	yuncore,fap650|\
