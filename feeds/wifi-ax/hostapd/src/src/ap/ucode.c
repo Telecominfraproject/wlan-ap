@@ -4,6 +4,7 @@
 #include "utils/common.h"
 #include "utils/ucode.h"
 #include "hostapd.h"
+#include "ap_drv_ops.h"
 #include <libubox/uloop.h>
 
 static uc_resource_type_t *global_type, *bss_type, *iface_type;
@@ -110,6 +111,7 @@ static uc_value_t *
 uc_hostapd_bss_set_config(uc_vm_t *vm, size_t nargs)
 {
 	struct hostapd_data *hapd = uc_fn_thisval("hostapd.bss");
+	struct hostapd_bss_config *old_bss;
 	struct hostapd_iface *iface;
 	struct hostapd_config *conf;
 	uc_value_t *file = uc_fn_arg(0);
@@ -128,7 +130,7 @@ uc_hostapd_bss_set_config(uc_vm_t *vm, size_t nargs)
 	if (!conf || idx > conf->num_bss || !conf->bss[idx])
 		goto out;
 
-	hostapd_config_free_bss(hapd->conf);
+	old_bss = hapd->conf;
 	for (i = 0; i < iface->conf->num_bss; i++)
 		if (iface->conf->bss[i] == hapd->conf)
 			iface->conf->bss[i] = conf->bss[idx];
@@ -137,7 +139,9 @@ uc_hostapd_bss_set_config(uc_vm_t *vm, size_t nargs)
 	hostapd_config_free(conf);
 
 	hostapd_bss_deinit_no_free(hapd);
+	hostapd_drv_stop_ap(hapd);
 	hostapd_free_hapd_data(hapd);
+	hostapd_config_free_bss(old_bss);
 	hostapd_setup_bss(hapd, hapd == iface->bss[0], !iface->conf->multiple_bssid);
 
 	ret = 0;
@@ -187,6 +191,7 @@ uc_hostapd_bss_delete(uc_vm_t *vm, size_t nargs)
 		iface->bss[i - 1] = iface->bss[i];
 	iface->num_bss--;
 
+	hostapd_drv_stop_ap(hapd);
 	hostapd_bss_deinit(hapd);
 	hostapd_remove_iface_bss_conf(iface->conf, hapd->conf);
 	hostapd_config_free_bss(hapd->conf);
