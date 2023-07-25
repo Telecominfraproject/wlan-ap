@@ -821,6 +821,15 @@ mac80211_set_vif_txpower() {
 	[ "$wds" -gt 0 ] && echo 1 > /sys/kernel/debug/ieee80211/$phy/netdev\:$ifname/disable_offload
 }
 
+wpa_supplicant_init_config() {
+	json_set_namespace wpa_supp prev
+
+	json_init
+	json_add_array config
+
+	json_set_namespace "$prev"
+}
+
 wpa_supplicant_add_interface() {
 	local ifname="$1"
 	local mode="$2"
@@ -830,12 +839,6 @@ wpa_supplicant_add_interface() {
 	_wpa_supplicant_common "$ifname"
 
 	json_set_namespace wpa_supp prev
-
-	[ -n "$wpa_supp_init" ] || {
-		json_init
-		json_add_array config
-		wpa_supp_init=1
-	}
 
 	json_add_object
 	json_add_string ctrl "$_rpath"
@@ -852,9 +855,7 @@ wpa_supplicant_add_interface() {
 
 	json_set_namespace "$prev"
 
-	ret="$?"
-
-	return $ret
+	wpa_supp_init=1
 }
 
 wpa_supplicant_set_config() {
@@ -870,7 +871,11 @@ wpa_supplicant_set_config() {
 	json_cleanup
 	json_set_namespace "$prev"
 
-	ubus wait_for wpa_supplicant
+	ubus -S -t 0 wait_for wpa_supplicant || {
+		[ -n "$wpa_supp_init" ] || return 0
+
+		ubus wait_for wpa_supplicant
+	}
 
 	local supplicant_res="$(ubus call wpa_supplicant config_set "$data")"
 	ret="$?"
@@ -880,8 +885,27 @@ wpa_supplicant_set_config() {
 
 }
 
+hostapd_set_config() {
+	[ -n "$hostapd_ctrl" ] || {
+		ubus call hostapd config_set '{ "phy": "'"$phy"'", "config": "", "prev_config": "'"${hostapd_conf_file}.prev"'" }' > /dev/null
+		return 0;
+	}
+
+	ubus wait_for hostapd
+	local hostapd_res="$(ubus call hostapd config_set "{ \"phy\": \"$phy\", \"config\":\"${hostapd_conf_file}\", \"prev_config\": \"${hostapd_conf_file}.prev\"}")"
+	ret="$?"
+	[ "$ret" != 0 -o -z "$hostapd_res" ] && {
+		wireless_setup_failed HOSTAPD_START_FAILED
+		return
+	}
+	wireless_add_process "$(jsonfilter -s "$hostapd_res" -l 1 -e @.pid)" "/usr/sbin/hostapd" 1 1
+}
+
+
 wpa_supplicant_start() {
 	local phy="$1"
+
+	[ -n "$wpa_supp_init" ] || return 0
 
 	ubus call wpa_supplicant config_set '{ "phy": "'"$phy"'" }' > /dev/null
 }
@@ -1083,26 +1107,17 @@ drv_mac80211_setup() {
 	json_init
 	json_set_namespace "$prev"
 
+	wpa_supplicant_init_config
+
 	mac80211_prepare_iw_htmode
 	active_ifnames=
 	for_each_interface "ap sta adhoc mesh monitor" mac80211_prepare_vif ${multiple_bssid}
 	for_each_interface "ap sta adhoc mesh monitor" mac80211_setup_vif
 
-	[ -n "$wpa_supp_init" ] && wpa_supplicant_set_config "$phy"
+	[ -x /usr/sbin/wpa_supplicant ] && wpa_supplicant_set_config "$phy"
+	[ -x /usr/sbin/hostapd ] && hostapd_set_config "$phy"
 
-	[ -n "$hostapd_ctrl" ] && {
-		ubus wait_for hostapd
-
-		local hostapd_res="$(ubus call hostapd config_set "{ \"phy\": \"$phy\", \"config\":\"${hostapd_conf_file}\", \"prev_config\": \"${hostapd_conf_file}.prev\"}")"
-		ret="$?"
-		[ "$ret" != 0 -o -z "$hostapd_res" ] && {
-			wireless_setup_failed HOSTAPD_START_FAILED
-			return
-		}
-		wireless_add_process "$(jsonfilter -s "$hostapd_res" -l 1 -e @.pid)" "/usr/sbin/hostapd" 1 1
-	}
-
-	[ -n "$wpa_supp_init" ] && wpa_supplicant_start "$phy"
+	[ -x /usr/sbin/wpa_supplicant ] && wpa_supplicant_start "$phy"
 
 	json_set_namespace wdev_uc prev
 	wdev_tool "$phy" "$(json_dump)" $active_ifnames
