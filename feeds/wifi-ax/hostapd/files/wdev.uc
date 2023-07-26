@@ -89,24 +89,24 @@ function drop_inactive(config)
 function add_ifname(config)
 {
 	for (let key in config)
-		config.ifname = key;
+		config[key].ifname = key;
 }
 
 function delete_ifname(config)
 {
 	for (let key in config)
-		delete config.ifname;
+		delete config[key].ifname;
 }
 
 function add_existing(phy, config)
 {
 	let wdevs = glob(`/sys/class/ieee80211/${phy}/device/net/*`);
-	wdevs = map(wdevs, function(arg) { basename(arg) });
+	wdevs = map(wdevs, (arg) => basename(arg));
 	for (let wdev in wdevs) {
 		if (config[wdev])
 			continue;
 
-		if (readfile(`/sys/class/net/${wdev}/operstate`) == "down")
+		if (trim(readfile(`/sys/class/net/${wdev}/operstate`)) == "down")
 			config[wdev] = {};
 	}
 }

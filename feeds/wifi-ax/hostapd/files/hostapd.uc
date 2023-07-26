@@ -1,6 +1,6 @@
 let libubus = require("ubus");
 import { open, readfile } from "fs";
-import { wdev_create, wdev_remove, is_equal, vlist_new } from "common";
+import { wdev_create, wdev_remove, is_equal, vlist_new, phy_is_fullmac } from "common";
 
 let ubus = libubus.connect();
 
@@ -128,6 +128,9 @@ function iface_reload_config(phy, config, old_config)
 
 	bss_reload_psk(iface.bss[0], config.bss[0], old_config.bss[0]);
 	if (!is_equal(config.bss[0], old_config.bss[0])) {
+		if (phy_is_fullmac(phy))
+			return false;
+
 		hostapd.printf(`Reload config for bss '${config.bss[0].ifname}' on phy '${phy}'`);
 		if (iface.bss[0].set_config(config_inline, 0) < 0) {
 			hostapd.printf(`Failed to set config`);
