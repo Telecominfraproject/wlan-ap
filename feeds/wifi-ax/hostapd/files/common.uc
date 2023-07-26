@@ -15,11 +15,23 @@ function wdev_remove(name)
 	nl80211.request(nl80211.const.NL80211_CMD_DEL_INTERFACE, 0, { dev: name });
 }
 
+function __phy_is_fullmac(phyidx)
+{
+	let data = nl80211.request(nl80211.const.NL80211_CMD_GET_WIPHY, 0, { wiphy: phyidx });
+
+	return !data.software_iftypes.ap_vlan;
+}
+
+function phy_is_fullmac(phy)
+{
+	let phyidx = int(trim(readfile(`/sys/class/ieee80211/${phy}/index`)));
+
+	return __phy_is_fullmac(phyidx);
+}
 
 function find_reusable_wdev(phyidx)
 {
-	let data = nl80211.request(nl80211.const.NL80211_CMD_GET_WIPHY, 0, { wiphy: phyidx });
-	if (data.software_iftypes.ap_vlan)
+	if (!__phy_is_fullmac(phyidx))
 		return null;
 
 	data = nl80211.request(
@@ -153,4 +165,4 @@ function vlist_new(cb) {
 		}, vlist_proto);
 }
 
-export { wdev_remove, wdev_create, is_equal, vlist_new };
+export { wdev_remove, wdev_create, is_equal, vlist_new, phy_is_fullmac };
