@@ -43,6 +43,9 @@ static char *action_names[] = {
 #ifdef IPQ_806x
         "powersave",
 	"nss",
+#ifdef IPQ_5000
+	"cooling"
+#endif
 #else
 	"report",
 	"lcd",
@@ -335,6 +338,41 @@ sensor_setting_t def_sensor_cp[] = {
 def_sensor_setting_t def_cp_setting = {
 	.sensor_count = 1,
 	.sensors = def_sensor_cp
+};
+
+/* TODO: Fix desc, id, lvl_trig, lvl_clr */
+sensor_setting_t def_sensor_mp[] = {
+	{
+		.desc = "tsens_tz_sensor4",
+		.id = 4,
+		.disabled = 0, /* Sensor enabled */
+		.sampling_period_us = 1000,
+		.num_thresholds = 1, /* No. of threshold levels */
+
+		.t = {
+			{
+				.lvl_trig = 120,
+				.num_actions = 1,
+				.actions = {
+					{
+						.action = SHUTDOWN,
+						.info = 1000
+					}
+				}
+			}
+		},
+
+		/* Internal variables initialized with threshold count */
+		._n_thresholds = 1,
+		._n_to_clear = 1,
+		._n_actions = 1,
+		._n_action_info = 1
+	},
+};
+
+def_sensor_setting_t def_mp_setting = {
+	.sensor_count = 1,
+	.sensors = def_sensor_mp
 };
 
 /* IPQ806x */
@@ -638,8 +676,18 @@ void update_def_sensor_settings(thermal_setting_t *settings)
 		case THERM_IPQ_6028:
 		case THERM_IPQ_6000:
 		case THERM_IPQ_6010:
+		case THERM_IPQ_6005:
 			msg("==== IPQ60xx ====\n");
 			def_sensor_setting = &def_cp_setting;
+			break;
+		case THERM_IPQ_5010:
+		case THERM_IPQ_5018:
+		case THERM_IPQ_5028:
+		case THERM_IPQ_5000:
+		case THERM_IPQ_0509:
+		case THERM_IPQ_0518:
+			msg("==== IPQ50xx ====\n");
+			def_sensor_setting = &def_mp_setting;
 			break;
 		default:
 			msg("==== DEFAULT ===\n");
@@ -851,6 +899,13 @@ int parse_config(thermal_setting_t *settings, int fd)
 				|| settings->soc_id == THERM_IPQ_6000
 				|| settings->soc_id == THERM_IPQ_6010)
 				i = TSENS_TZ_SENSOR4;
+			else if ( settings->soc_id == THERM_IPQ_5010
+				|| settings->soc_id == THERM_IPQ_5018
+				|| settings->soc_id == THERM_IPQ_5028
+				|| settings->soc_id == THERM_IPQ_5000
+				|| settings->soc_id == THERM_IPQ_0509
+				|| settings->soc_id == THERM_IPQ_0518)
+				i = TSENS_TZ_SENSOR1;
 			else
 				i = TSENS_TZ_SENSOR0;
 

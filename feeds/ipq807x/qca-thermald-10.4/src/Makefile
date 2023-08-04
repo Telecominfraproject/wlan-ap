@@ -18,6 +18,9 @@ endif
 
 export CC = $(CROSS)gcc
 export CFLAGS += -O2 -Wall -DIPQ_806x -c
+ifeq ($(SoC),$(filter $(SoC),ipq50xx ipq50xx_64))
+export CFLAGS += -DIPQ_5000
+endif
 export STRIP = $(CROSS)strip
 export SOURCES= \
 		thermal.c \
@@ -63,6 +66,7 @@ install: local
 	cp -a -f $(ALL) $(INSTALL_ROOT)/usr/sbin/
 	mkdir -p $(INSTALL_ROOT)/etc/thermal
 	cp -a -f ipq-thermald-806?.conf $(INSTALL_ROOT)/etc/thermal/
+	cp -a -f ipq-thermald-cybertan-eww631-*.conf $(INSTALL_ROOT)/etc/thermal/
 	@echo Installed outputs from `pwd`
 
 # Remove all generated files
