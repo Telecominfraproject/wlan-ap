@@ -138,7 +138,14 @@ enum therm_msm_id {
 	THERM_IPQ_6018,
 	THERM_IPQ_6028,
 	THERM_IPQ_6000,
-	THERM_IPQ_6010
+	THERM_IPQ_6010,
+	THERM_IPQ_6005,
+	THERM_IPQ_5010,
+	THERM_IPQ_5018,
+	THERM_IPQ_5028,
+	THERM_IPQ_5000,
+	THERM_IPQ_0509,
+	THERM_IPQ_0518
 };
 
 enum therm_msm_id therm_get_msm_id(void);
@@ -158,6 +165,9 @@ enum {
 #ifdef IPQ_806x
 	POWERSAVE,
 	NSS_FREQ,
+#ifdef IPQ_5000
+	COOLING,
+#endif
 #else
 	REPORT,
 	LCD,
@@ -311,6 +321,9 @@ int cpufreq_request(int cpu, int requester, int temperature, int frequency);
 int powersave_request( int enable );
 int nssfreq_request( int frequency );
 int powerctl_restart(int reset_max);
+#ifdef IPQ_5000
+int cooling_request( int requester, int temperature, int percentage );
+#endif
 #else
 int report_action(int requester, int temperature, int level, int is_trigger);
 int lcd_brightness_request(int requester, int temperature, int value);

@@ -45,7 +45,7 @@
 #define NUM_US_IN_MS        (1000)
 #define CPU_BUF_MAX         (50)
 #define HOTPLUG_BUF_MAX     (1024)
-
+#define SHUTDOWN_BUF_MAX    (100)
 enum {
 	MITIGATION_ENABLE = 0,
 	MITIGATION_DISABLE = 1
@@ -116,6 +116,8 @@ int shutdown_action(int requester, int temperature, int delay)
 {
 	static int shutdown_requested = 0;
 	int ret = 0;
+	int fd;
+	char buf[SHUTDOWN_BUF_MAX] = {0};
 
 	if (requester < 0 ||
 	    requester >= SENSOR_IDX_MAX) {
@@ -134,6 +136,15 @@ int shutdown_action(int requester, int temperature, int delay)
 		    "with %d millisecond delay\n",
 		    SENSOR(requester), temperature, delay);
 
+		fd = open("/dev/console", O_RDWR, 0);
+		if (fd >= 0)
+		{
+			snprintf(buf, SHUTDOWN_BUF_MAX, "THERMAL SHUTDOWN: "
+				"%s reached temperature %d with %d mSec Delay \n",
+				SENSOR(requester), temperature, delay);
+			write(fd,buf,SHUTDOWN_BUF_MAX);
+			close(fd);
+		}
 		usleep(delay * NUM_US_IN_MS);
 
 		/* commit buffers to disk and shutdown */
@@ -403,7 +414,7 @@ int cpufreq_init()
 		return -1;
 	}
 	info("Number of cpus :%d\n", num_cpus);
-	memset(online, 0, MAX_CPUS);
+	memset(online, 0, MAX_CPUS * sizeof(int));
 
 	for (cpu = 0; cpu < num_cpus; cpu++) {
 		snprintf(finfo_buf, MAX_PATH, CPU_SYSFS(FMAX_INFO_NODE), cpu);
@@ -1384,6 +1395,99 @@ int nssfreq_request(int frequency)
         pthread_mutex_unlock(&nssfreq_set_mtx);
         return ret;
 }
+#ifdef IPQ_5000
+/*===========================================================================
+FUNCTION cooling_request
+
+Action function to request wlan throttling action
+
+ARGUMENTS
+        percentage => duty cycle of tx queues suspending
+
+RETURN VALUE
+        0 on success, -1 on failure.
+===========================================================================*/
+static int cooling_req[2];
+#define COOLING_24G_MITIGATION_SYSFS "/sys/class/thermal/cooling_device0/cur_state"
+#define COOLING_5G_MITIGATION_SYSFS "/sys/class/thermal/cooling_device1/cur_state"
+#define MAX_COOLING_MITIGATION_PERCENTAGE  (90)
+
+static pthread_mutex_t cooling_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+int cooling_request(int requester, int temperature, int percentage )
+{
+	int ret = -1;
+	char buf[UINT_BUF_MAX] = {0};
+	static int current_24g_percentage, current_5g_percentage;
+	char * end_ptr;
+
+	if ((NULL == COOLING_24G_MITIGATION_SYSFS) || (NULL == COOLING_5G_MITIGATION_SYSFS)) {
+		msg("%s: Unsupported action on current target", __func__);
+		return -1;
+	}
+
+	temperature = RCONV(temperature);
+
+	if (percentage < 0)
+		percentage = 0;
+
+	if (percentage > MAX_COOLING_MITIGATION_PERCENTAGE)
+		percentage = MAX_COOLING_MITIGATION_PERCENTAGE;
+
+	pthread_mutex_lock(&cooling_mtx);
+
+	if (requester == 1) {
+	/* get current cooling percentage */
+		if (read_line_from_file(COOLING_24G_MITIGATION_SYSFS, buf, UINT_BUF_MAX) > 0) {
+			current_24g_percentage = strtol(buf, &end_ptr, 10);
+			dbgmsg("current 2g cooling percentage(%d)\n", current_24g_percentage);
+		}
+
+		/* Aggregate cooling throttling percentage for 24g */
+		cooling_req[requester] = percentage;
+
+		if (percentage != current_24g_percentage) {
+			snprintf(buf, UINT_BUF_MAX, "%d", percentage);
+			if (write_to_file(COOLING_24G_MITIGATION_SYSFS, buf, strlen(buf)) > 0) {
+				info("ACTION: COOLING - "
+				    "Setting 24G COOLING mitigation to %d\n", percentage);
+				ret = 0;
+			} else {
+				msg("Unable to set COOLING mitigation to %d\n", percentage);
+			}
+		} else {
+			dbgmsg("COOLING mitigation already at %d percentage\n", percentage);
+			ret = 0;
+		}
+	}
+	else if (requester == 4) {
+	/* get current 5g cooling percentage */
+		if (read_line_from_file(COOLING_5G_MITIGATION_SYSFS, buf, UINT_BUF_MAX) > 0) {
+			current_5g_percentage = strtol(buf, &end_ptr, 10);
+			dbgmsg("current 5g cooling percentage(%d)\n", current_5g_percentage);
+		}
+
+		/* Aggregate cooling throttling percentage for 5g */
+		cooling_req[requester] = percentage;
+
+		if (percentage != current_5g_percentage) {
+			snprintf(buf, UINT_BUF_MAX, "%d", percentage);
+			if (write_to_file(COOLING_5G_MITIGATION_SYSFS, buf, strlen(buf)) > 0) {
+				info("ACTION: COOLING - "
+				    "Setting 5G COOLING mitigation to %d\n", percentage);
+				ret = 0;
+			} else {
+				msg("Unable to set COOLING mitigation to %d\n", percentage);
+			}
+		} else {
+			dbgmsg("COOLING mitigation already at %d percentage\n", percentage);
+			ret = 0;
+		}
+	}
+	pthread_mutex_unlock(&cooling_mtx);
+	return ret;
+}
+#endif
 
 /*===========================================================================
 FUNCTION set_mitigation_level

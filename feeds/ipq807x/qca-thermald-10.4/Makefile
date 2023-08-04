@@ -35,6 +35,8 @@ define Package/qca-thermald-10.4/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/install/etc/thermal/ipq-thermald-8064.conf $(1)/etc/thermal
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/install/etc/thermal/ipq-thermald-8066.conf $(1)/etc/thermal
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/install/etc/thermal/ipq-thermald-8069.conf $(1)/etc/thermal
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/install/etc/thermal/ipq-thermald-cybertan-eww631-a1.conf $(1)/etc/thermal
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/install/etc/thermal/ipq-thermald-cybertan-eww631-b1.conf $(1)/etc/thermal
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/thermal.init $(1)/etc/init.d/thermal
 	$(INSTALL_DIR) $(1)/etc/config
