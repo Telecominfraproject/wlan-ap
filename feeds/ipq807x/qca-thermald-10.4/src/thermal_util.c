@@ -93,6 +93,14 @@ static therm_msm_soc_type msm_soc_table[] = {
 	{THERM_IPQ_6028,   403},
 	{THERM_IPQ_6000,   421},
 	{THERM_IPQ_6010,   422},
+	{THERM_IPQ_6005,   453},
+	/* MP variants */
+	{THERM_IPQ_5010,   446},
+	{THERM_IPQ_5018,   447},
+	{THERM_IPQ_5028,   448},
+	{THERM_IPQ_5000,   503},
+	{THERM_IPQ_0509,   504},
+	{THERM_IPQ_0518,   505},
 };
 
 int read_id_from_binary_file(char *path, size_t size) {
