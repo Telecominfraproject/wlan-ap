@@ -179,7 +179,6 @@ platform_do_upgrade() {
 	motorola,q14)
 		emmc_do_upgrade $1
 		;;
-	cig,wf186w|\
 	cig,wf188n|\
 	cig,wf194c|\
 	cig,wf194c4|\
@@ -267,6 +266,7 @@ platform_do_upgrade() {
 		PART_NAME="inactive"
 		platform_do_upgrade_dualboot_datachk "$1"
 		;;
+	cig,wf186w|\
 	yuncore,ax840|\
 	yuncore,fap655)
 		[ -f /proc/boot_info/rootfs/upgradepartition ] && {
