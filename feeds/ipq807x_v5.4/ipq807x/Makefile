@@ -21,6 +21,6 @@ DEFAULT_PACKAGES += kmod-qca-nss-dp kmod-qca-ssdk swconfig \
 	kmod-ath11k-ahb ath11k-firmware-ipq807x \
 	kmod-gpio-button-hotplug iwinfo \
 	qca-ssdk-shell \
-	uboot-envtools
+	uboot-envtools -procd-ujail
 
 $(eval $(call BuildTarget))
