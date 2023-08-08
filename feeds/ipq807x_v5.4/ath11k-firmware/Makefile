@@ -26,6 +26,12 @@ $(Package/ath11k-firmware-default)
   DEPENDS:=@TARGET_ipq50xx
 endef
 
+define Package/ath11k-firmware-ipq50xx-map-spruce
+$(Package/ath11k-firmware-default)
+  TITLE:=ath11k firmware for IPQ50xx+spruce devices
+  DEPENDS:=@TARGET_ipq50xx
+endef
+
 define Package/ath11k-firmware-ipq60xx
 $(Package/ath11k-firmware-default)
   TITLE:=ath11k firmware for IPQ60xx devices
@@ -56,6 +62,10 @@ endef
 
 define Package/ath11k-firmware-ipq50xx-spruce/description
 Standard ath11k firmware for IPQ50xx/spruce from QCA
+endef
+
+define Package/ath11k-firmware-ipq50xx-map-spruce/description
+Standard ath11k firmware for IPQ50xx+spruce from QCA
 endef
 
 define Package/ath11k-firmware-ipq60xx/description
@@ -90,6 +100,17 @@ define Package/ath11k-firmware-ipq50xx-spruce/install
 		$(1)/lib/firmware/IPQ5018/
 endef
 
+define Package/ath11k-firmware-ipq50xx-map-spruce/install
+	$(INSTALL_DIR) $(1)/lib/firmware/IPQ5018
+	$(INSTALL_DATA) ./files/IPQ5018_map_spruce/* \
+		$(1)/lib/firmware/IPQ5018/
+
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122
+	$(INSTALL_DIR) $(1)/lib/firmware/qcn6122
+	$(INSTALL_DATA) ./files/QCN6122_map_spruce/* \
+		$(1)/lib/firmware/qcn6122/
+endef
+
 define Package/ath11k-firmware-ipq60xx/install
 	$(INSTALL_DIR) $(1)/lib/firmware/IPQ6018
 	$(INSTALL_DATA) ./files/IPQ6018/* \
@@ -117,6 +138,7 @@ endef
 
 $(eval $(call BuildPackage,ath11k-firmware-ipq50xx))
 $(eval $(call BuildPackage,ath11k-firmware-ipq50xx-spruce))
+$(eval $(call BuildPackage,ath11k-firmware-ipq50xx-map-spruce))
 $(eval $(call BuildPackage,ath11k-firmware-ipq60xx))
 $(eval $(call BuildPackage,ath11k-firmware-ipq807x))
 $(eval $(call BuildPackage,ath11k-firmware-qcn6122))

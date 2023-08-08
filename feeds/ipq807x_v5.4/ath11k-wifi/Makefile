@@ -48,6 +48,7 @@ ALLWIFIBOARDS:= \
 	tplink-ex447 \
 	yuncore-ax840 \
 	yuncore-fap650 \
+	yuncore-fap655 \
 	meshpp-s618
 
 ALLWIFIPACKAGES:=$(foreach BOARD,$(ALLWIFIBOARDS),ath11k-wifi-$(BOARD))
@@ -119,6 +120,27 @@ define Package/ath11k-wifi-hfcl-ion4xi
 $(call Package/ath11k-wifi-default)
     TITLE:=hfcl-ion4xi bdf
 endef
+
+define Package/ath11k-wifi-hfcl-ion4xi_w
+$(call Package/ath11k-wifi-default)
+    TITLE:=hfcl-ion4xi_w bdf
+endef
+
+define Package/ath11k-wifi-hfcl-ion4x_w
+$(call Package/ath11k-wifi-default)
+    TITLE:=hfcl-ion4x_w bdf
+endef
+
+define Package/ath11k-wifi-hfcl-ion4xi_HMR
+$(call Package/ath11k-wifi-default)
+    TITLE:=hfcl-ion4xi_HMR bdf
+endef
+
+define Package/ath11k-wifi-hfcl-ion4xi_wp
+$(call Package/ath11k-wifi-default)
+    TITLE:=hfcl-ion4xi_wp bdf
+endef
+
 
 define Package/ath11k-wifi-meshpp-s618
 $(call Package/ath11k-wifi-default)
@@ -261,6 +283,32 @@ define Package/ath11k-wifi-hfcl-ion4xi/install
 	$(INSTALL_DATA) ./board-hfcl-ion4xi.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
 endef
 
+define Package/ath11k-wifi-hfcl-ion4xi_wp/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_wp.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board.bin
+endef
+
+define Package/ath11k-wifi-hfcl-ion4xi_w/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_w.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_w.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin
+endef
+
+define Package/ath11k-wifi-hfcl-ion4x_w/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_w.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_w.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin
+endef
+
+define Package/ath11k-wifi-hfcl-ion4xi_HMR/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_HMR.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_HMR.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin
+endef
+
 define Package/ath11k-wifi-edgecore-oap101/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
@@ -302,6 +350,7 @@ $(eval $(call generate-ath11k-wifi-package,yuncore-ax840,YunCore AX840))
 $(eval $(call generate-ath11k-wifi-package,meshpp-s618,Mesh++ S618))
 $(eval $(call generate-ath11k-wifi-package,muxi-ap3220l,MUXI AP3220L))
 $(eval $(call generate-ath11k-wifi-package,yuncore-fap650,YunCore FAP650))
+$(eval $(call generate-ath11k-wifi-package,yuncore-fap655,YunCore FAP655))
 
 $(foreach PACKAGE,$(ALLWIFIPACKAGES),$(eval $(call BuildPackage,$(PACKAGE))))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq5018))
@@ -313,6 +362,10 @@ $(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g-ca))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g-us))
 $(eval $(call BuildPackage,ath11k-wifi-motorola-q14))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi))
+$(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_wp))
+$(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_w))
+$(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4x_w))
+$(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_HMR))
 $(eval $(call BuildPackage,ath11k-wifi-edgecore-oap101))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf188n-ca))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf188n-us))
