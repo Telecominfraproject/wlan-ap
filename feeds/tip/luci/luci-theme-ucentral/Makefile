@@ -7,7 +7,7 @@
 include $(TOPDIR)/rules.mk
 
 LUCI_TITLE:=LuCI theme for uCentral
-LUCI_DEPENDS:=
+LUCI_DEPENDS:=+luci-lua-runtime
 
 include ../luci.mk
 
