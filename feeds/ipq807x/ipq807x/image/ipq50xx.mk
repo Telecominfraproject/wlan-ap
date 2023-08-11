@@ -27,6 +27,15 @@ define Device/cybertan_eww631_a1
 endef
 TARGET_DEVICES += cybertan_eww631_a1
 
+define Device/wallys_dr5018
+  DEVICE_TITLE := Wallys DR5018
+  DEVICE_DTS := qcom-ipq5018-wallys-dr5018
+  SUPPORTED_DEVICES := wallys,dr5018
+  DEVICE_PACKAGES := ath11k-wifi-wallys-dr5018 ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.5-c1
+endef
+TARGET_DEVICES += wallys_dr5018
+
 define Device/cybertan_eww631_b1
   DEVICE_TITLE := CyberTan EWW631-B1
   DEVICE_DTS := qcom-ipq5018-eww631-b1
