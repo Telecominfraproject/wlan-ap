@@ -66,10 +66,12 @@ function iface_restart(phy, config, old_config)
 	if (err)
 		hostapd.printf(`Failed to create ${bss.ifname} on phy ${phy}: ${err}`);
 	let config_inline = iface_gen_config(phy, config);
-	if (hostapd.add_iface(`bss_config=${bss.ifname}:${config_inline}`) < 0) {
+
+	let ubus = hostapd.data.ubus;
+	ubus.call("wpa_supplicant", "phy_set_state", { phy: phy, stop: true });
+	if (hostapd.add_iface(`bss_config=${bss.ifname}:${config_inline}`) < 0)
 		hostapd.printf(`hostapd.add_iface failed for phy ${phy} ifname=${bss.ifname}`);
-		return;
-	}
+	ubus.call("wpa_supplicant", "phy_set_state", { phy: phy, stop: false });
 }
 
 function array_to_obj(arr, key, start)
@@ -123,30 +125,37 @@ function iface_reload_config(phy, config, old_config)
 	if (config.bss[0].ifname != old_config.bss[0].ifname)
 		return false;
 
-	let iface = hostapd.interfaces[config.bss[0].ifname];
+	let iface_name = config.bss[0].ifname;
+	let iface = hostapd.interfaces[iface_name];
 	if (!iface)
+		return false;
+
+	let first_bss = hostapd.bss[iface_name];
+	if (!first_bss)
 		return false;
 
 	let config_inline = iface_gen_config(phy, config);
 
-	bss_reload_psk(iface.bss[0], config.bss[0], old_config.bss[0]);
+	bss_reload_psk(first_bss, config.bss[0], old_config.bss[0]);
 	if (!is_equal(config.bss[0], old_config.bss[0])) {
 		if (phy_is_fullmac(phy))
 			return false;
 
+		if (config.bss[0].bssid != old_config.bss[0].bssid)
+			return false;
+
 		hostapd.printf(`Reload config for bss '${config.bss[0].ifname}' on phy '${phy}'`);
-		if (iface.bss[0].set_config(config_inline, 0) < 0) {
+		if (first_bss.set_config(config_inline, 0) < 0) {
 			hostapd.printf(`Failed to set config`);
 			return false;
 		}
 	}
 
-	let bss_list = array_to_obj(iface.bss, "name", 1);
 	let new_cfg = array_to_obj(config.bss, "ifname", 1);
 	let old_cfg = array_to_obj(old_config.bss, "ifname", 1);
 
 	for (let name in old_cfg) {
-		let bss = bss_list[name];
+		let bss = hostapd.bss[name];
 		if (!bss) {
 			hostapd.printf(`bss '${name}' not found`);
 			return false;
@@ -267,6 +276,9 @@ function iface_load_config(filename)
 		if (!val[0])
 			continue;
 
+		if (val[0] == "bssid")
+			bss.bssid = val[1];
+
 		if (val[0] == "bss") {
 			bss = config_add_bss(config, val[1]);
 			continue;
@@ -301,6 +313,78 @@ let main_obj = {
 				hostapd.printf(`Error reloading config: ${e}\n${e.stacktrace[0].context}`);
 				return libubus.STATUS_INVALID_ARGUMENT;
 			}
+
+			return 0;
+		}
+	},
+	apsta_state: {
+		args: {
+			phy: "",
+			up: true,
+			frequency: 0,
+			sec_chan_offset: 0,
+			csa: true,
+			csa_count: 0,
+		},
+		call: function(req) {
+			if (req.args.up == null || !req.args.phy)
+				return libubus.STATUS_INVALID_ARGUMENT;
+
+			let phy = req.args.phy;
+			let config = hostapd.data.config[phy];
+			if (!config || !config.bss || !config.bss[0] || !config.bss[0].ifname)
+				return 0;
+
+			let iface = hostapd.interfaces[config.bss[0].ifname];
+			if (!iface)
+				return 0;
+
+			if (!req.args.up) {
+				iface.stop();
+				return 0;
+			}
+
+			let freq = req.args.frequency;
+			if (!freq)
+				return libubus.STATUS_INVALID_ARGUMENT;
+
+			let sec_offset = req.args.sec_chan_offset;
+			if (sec_offset != -1 && sec_offset != 1)
+				sec_offset = 0;
+
+			let width = 0;
+			for (let line in config.radio.data) {
+				if (!sec_offset && match(line, /^ht_capab=.*HT40/)) {
+					sec_offset = null; // auto-detect
+					continue;
+				}
+
+				let val = match(line, /^(vht_oper_chwidth|he_oper_chwidth)=(\d+)/);
+				if (!val)
+					continue;
+
+				val = int(val[2]);
+				if (val > width)
+					width = val;
+			}
+
+			if (freq < 4000)
+				width = 0;
+
+			let freq_info = hostapd.freq_info(freq, sec_offset, width);
+			if (!freq_info)
+				return libubus.STATUS_UNKNOWN_ERROR;
+
+			let ret;
+			if (req.args.csa) {
+				freq_info.csa_count = req.args.csa_count ?? 10;
+				ret = iface.switch_channel(freq_info);
+			} else {
+				iface.stop();
+				ret = iface.start(freq_info);
+			}
+			if (!ret)
+				return libubus.STATUS_UNKNOWN_ERROR;
 
 			return 0;
 		}
