@@ -154,6 +154,7 @@ platform_check_image() {
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\
+	xunison,q50|\
 	xunison,d50|\
 	xunison,d50-5g|\
 	qcom,ipq5018-mp03.3)
@@ -194,6 +195,7 @@ platform_do_upgrade() {
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\
+	xunison,q50|\
 	xunison,d50|\
 	xunison,d50-5g|\
 	qcom,ipq5018-mp03.3|\

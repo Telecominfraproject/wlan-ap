@@ -156,6 +156,19 @@ define Device/yuncore_fap655
 endef
 TARGET_DEVICES += yuncore_fap655
 
+define Device/xunison_q50
+  DEVICE_TITLE := Xunison Q50
+  DEVICE_DTS := qcom-ipq5018-xunison-q50
+  SUPPORTED_DEVICES := xunison,q50
+  DEVICE_PACKAGES := ath11k-wifi-xunison-d50 ath11k-firmware-ipq50xx ath11k-firmware-qcn9000
+  DEVICE_DTS_CONFIG := config@mp03.1
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/nand-factory.ubi := append-ubi
+endef
+TARGET_DEVICES += xunison_q50
+
 define Device/xunison_d50-5g
   DEVICE_TITLE := Xunison D50-5G
   DEVICE_DTS := qcom-ipq5018-xunison-d50-5g
