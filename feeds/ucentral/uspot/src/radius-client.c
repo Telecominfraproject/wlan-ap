@@ -13,6 +13,16 @@
 
 #include <radcli/radcli.h>
 
+// compat defines for pre 1.3 libradcli
+#ifndef RC_NAME_LENGTH
+ #define RC_NAME_LENGTH NAME_LENGTH
+#endif
+#ifndef VENDOR_BIT_SIZE
+ #define VENDOR_BIT_SIZE 16
+#endif
+
+#define RADCLI_DICT		"/etc/radcli/dictionary"
+
 #include <libubox/blobmsg.h>
 #include <libubox/blobmsg_json.h>
 
@@ -46,39 +56,16 @@ enum {
 	RADIUS_PROXY_STATE_AUTH,
 	RADIUS_LOCATION_NAME,
 	RADIUS_NAS_PORT_TYPE,
+	RADIUS_CUI,
 	__RADIUS_MAX,
 };
 
-static const struct blobmsg_policy radius_policy[__RADIUS_MAX] = {
+static struct blobmsg_policy radius_policy[__RADIUS_MAX] = {
 	[RADIUS_ACCT] = { .name = "acct", .type = BLOBMSG_TYPE_BOOL },
 	[RADIUS_SERVER] = { .name = "server", .type = BLOBMSG_TYPE_STRING },
 	[RADIUS_ACCT_SERVER] = { .name = "acct_server", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_ACCT_TYPE] = { .name = "acct_type", .type = BLOBMSG_TYPE_INT32 },
-	[RADIUS_USERNAME] = { .name = "username", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_PASSWORD] = { .name = "password", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_CHAP_PASSWORD] = { .name = "chap_password", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_CHAP_CHALLENGE] = { .name = "chap_challenge", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_ACCT_SESSION] = { .name = "acct_session", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_CLIENT_IP] = { .name = "client_ip", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_CALLED_STATION] = { .name = "called_station", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_CALLING_STATION] = { .name = "calling_station", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_NAS_IP] = { .name = "nas_ip", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_NAS_ID] = { .name = "nas_id", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_TERMINATE_CAUSE] = { .name = "terminate_cause", .type = BLOBMSG_TYPE_INT32 },
-	[RADIUS_SESSION_TIME] = { .name = "session_time", .type = BLOBMSG_TYPE_INT32 },
-	[RADIUS_INPUT_OCTETS] = { .name = "input_octets", .type = BLOBMSG_TYPE_INT32 },
-	[RADIUS_OUTPUT_OCTETS] = { .name = "output_octets", .type = BLOBMSG_TYPE_INT32 },
-	[RADIUS_INPUT_GIGAWORDS] = { .name = "input_gigawords", .type = BLOBMSG_TYPE_INT32 },
-	[RADIUS_OUTPUT_GIGAWORDS] = { .name = "output_gigawords", .type = BLOBMSG_TYPE_INT32 },
-	[RADIUS_INPUT_PACKETS] = { .name = "input_packets", .type = BLOBMSG_TYPE_INT32 },
-	[RADIUS_OUTPUT_PACKETS] = { .name = "output_packets", .type = BLOBMSG_TYPE_INT32 },
-	[RADIUS_LOGOFF_URL] = { .name = "logoff_url", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_CLASS] = { .name = "class", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_SERVICE_TYPE] = { .name = "service_type", .type = BLOBMSG_TYPE_INT32 },
 	[RADIUS_PROXY_STATE_AUTH] = { .name = "auth_proxy", .type = BLOBMSG_TYPE_STRING },
 	[RADIUS_PROXY_STATE_ACCT] = { .name = "acct_proxy", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_LOCATION_NAME] = { .name = "location_name", .type = BLOBMSG_TYPE_STRING },
-	[RADIUS_NAS_PORT_TYPE] = { .name = "nas_port_type", .type = BLOBMSG_TYPE_INT32 },
 };
 
 static struct blob_buf b = {};
@@ -129,6 +116,7 @@ static const struct {
 	[RADIUS_PROXY_STATE_ACCT] = { .attrid = PW_PROXY_STATE, },
 	[RADIUS_LOCATION_NAME] = { .attrid = ATTR_WBAL_WISPR_LOCATION_NAME, .vendorspec = VENDORSPEC_WBAL, },
 	[RADIUS_NAS_PORT_TYPE] = { .attrid = PW_NAS_PORT_TYPE, },
+	[RADIUS_CUI] = { .attrid = PW_CHARGEABLE_USER_IDENTITY, },
 };
 
 /**
@@ -136,7 +124,7 @@ static const struct {
  * @param in null-terminated input hex string buffer
  * @param out output buffer
  * @param osize output buffer size
- * @return number of characters decoded
+ * @return number of characters decoded or -1 on error
  * @note if osize is <= strlen(in)/2, the output will be truncated (null-terminated).
  * @warning no input sanitization is performed: in must be null-terminated;
  * the resulting output string may contain non-representable characters.
@@ -149,7 +137,7 @@ str_to_hex(const char *in, char *out, int osize)
 
 	for (i = 0; (i < ilen/2) && (i < osize - 1); i++) {
 		if (sscanf(&in[i * 2], "%2hhx", &out[i]) != 1)
-			break;	// truncate output on scan errors
+			return -1;
 	}
 
 	out[i] = '\0';
@@ -183,18 +171,15 @@ static int cb_chap_passwd(void *p, size_t s, struct blob_attr *b)
 	assert(s >= 17);
 	len = str_to_hex(blobmsg_get_string(b), str+1, 16);
 
-	return len+1;
+	return len >= 0 ? len+1 : len;
 }
 
 static int cb_chap_challenge(void *p, size_t s, struct blob_attr *b)
 {
 	char *str = p;
-	int len;
 
 	assert(s >= 16);
-	len = str_to_hex(blobmsg_get_string(b), str, 16);
-
-	return len;
+	return str_to_hex(blobmsg_get_string(b), str, 16);
 }
 
 static int
@@ -208,13 +193,13 @@ result(rc_handle const *rh, int accept, VALUE_PAIR *pair)
 
 	if (pair) {
 		void *c = blobmsg_open_table(&b, "reply");
-		char name[33], value[256];
+		char name[RC_NAME_LENGTH+1], value[256];
 		VALUE_PAIR *vp;
 
 		for (vp = pair; vp != NULL; vp = vp->next) {
 			if (rc_avpair_tostr(rh, vp, name, sizeof(name), value,
 					    sizeof(value)) == -1)
-				break;
+				continue;	// add as many attributes as possible
 			blobmsg_add_string(&b, name, value);
 		}
 		blobmsg_close_table(&b, c);
@@ -224,49 +209,54 @@ result(rc_handle const *rh, int accept, VALUE_PAIR *pair)
 	return accept;
 }
 
+/**
+ * @param key internal radius key id (from enum at top of file)
+ * @return 0 if key is a normal RADIUS attribute and can be processed programmatically as such, 1 otherwise.
+ */
+static int nonattr_blobkey(int key)
+{
+	switch (key) {
+		case RADIUS_ACCT:
+		case RADIUS_SERVER:
+		case RADIUS_ACCT_SERVER:
+		case RADIUS_PROXY_STATE_ACCT:
+		case RADIUS_PROXY_STATE_AUTH:
+			return 1;	// ignore those keys
+		default:
+			return 0;
+	}
+}
+
 static int
-radius(void)
+radius(rc_handle *rh)
 {
 	VALUE_PAIR *send = NULL, *received;
-	rc_handle *rh = rc_new();
-	char tempstr[32];
+	char tempstr[RC_NAME_LENGTH];
 	uint32_t val;
 	void *pval;
 	int len, i;
 
-	if (rh == NULL)
+	if (tb[RADIUS_SERVER]) {
+		if (rc_add_config(rh, "authserver", blobmsg_get_string(tb[RADIUS_SERVER]), "code", __LINE__))
+			goto fail;
+	}
+	if (tb[RADIUS_ACCT_SERVER]) {
+		if (rc_add_config(rh, "acctserver", blobmsg_get_string(tb[RADIUS_ACCT_SERVER]), "code", __LINE__))
+			goto fail;
+	}
+	if (rc_add_config(rh, "radius_timeout", "5", "code", __LINE__))
 		goto fail;
-
-	rh = rc_config_init(rh);
-	if (rh == NULL)
+	if (rc_add_config(rh, "radius_retries", "1", "code", __LINE__))
 		goto fail;
-
-	if (tb[RADIUS_SERVER])
-		rc_add_config(rh, "authserver", blobmsg_get_string(tb[RADIUS_SERVER]), "code", __LINE__);
-	if (tb[RADIUS_ACCT_SERVER])
-		rc_add_config(rh, "acctserver", blobmsg_get_string(tb[RADIUS_ACCT_SERVER]), "code", __LINE__);
-	rc_add_config(rh, "dictionary", "/etc/radcli/dictionary", "code", __LINE__);
-	rc_add_config(rh, "radius_timeout", "5", "code", __LINE__);
-	rc_add_config(rh, "radius_retries", "1", "code", __LINE__);
-	rc_add_config(rh, "bindaddr", "*", "code", __LINE__);
+	if (rc_add_config(rh, "bindaddr", "*", "code", __LINE__))
+		goto fail;
 	if (rc_apply_config(rh) != 0)
-		goto fail;
-
-	if (rc_read_dictionary(rh, rc_conf_str(rh, "dictionary")) != 0)
 		goto fail;
 
 	// process parsed blobmsg for radius request
 	for (i = 0; i < __RADIUS_MAX; i++) {
-		switch (i) {
-			case RADIUS_ACCT:
-			case RADIUS_SERVER:
-			case RADIUS_ACCT_SERVER:
-			case RADIUS_PROXY_STATE_ACCT:
-			case RADIUS_PROXY_STATE_AUTH:
-				continue;	// ignore those keys
-			default:
-				break;
-		}
+		if (nonattr_blobkey(i))
+			continue;	// ignore those keys
 
 		if (!tb[i])
 			continue;
@@ -276,8 +266,11 @@ radius(void)
 		switch (radius_policy[i].type) {
 			case BLOBMSG_TYPE_INT32:
 				len = 4;
-				if (avpair[i].cb)
+				if (avpair[i].cb) {
 					len = avpair[i].cb(&val, sizeof(val), tb[i]);
+					if (len < 0)
+						goto fail;
+				}
 				else
 					val = blobmsg_get_u32(tb[i]);
 				pval = &val;
@@ -287,6 +280,8 @@ radius(void)
 				if (avpair[i].cb) {
 					memset(tempstr, 0, sizeof(tempstr));
 					len = avpair[i].cb(&tempstr, sizeof(tempstr), tb[i]);
+					if (len < 0)
+						goto fail;
 					pval = &tempstr;
 				}
 				else
@@ -326,14 +321,66 @@ fail:
 int
 main(int argc, char **argv)
 {
+	rc_handle *rh = rc_new();
+	DICT_ATTR *DA;
+	uint64_t attribute;
+	int i;
+
 	if (argc != 2)
-		return result(NULL, 0, NULL);
+		goto fail;
 
-	blob_buf_init(&b, 0);
+	if (rh == NULL)
+		goto fail;
+
+	rh = rc_config_init(rh);
+	if (rh == NULL)
+		goto fail;
+
+	if (rc_add_config(rh, "dictionary", RADCLI_DICT, "code", __LINE__))
+		goto fail;
+
+	if (rc_read_dictionary(rh, rc_conf_str(rh, "dictionary")) != 0)
+		goto fail;
+
+	// populate radius_policy from radcli dictionary names/types
+	for (i = 0; i < __RADIUS_MAX; i++) {
+		if (nonattr_blobkey(i))
+			continue;
+
+		attribute = ((uint64_t)avpair[i].vendorspec << VENDOR_BIT_SIZE) | (uint64_t)avpair[i].attrid;
+		DA = rc_dict_getattr(rh, attribute);
+		if (!DA) {
+			fprintf(stderr, "failed to lookup attribute key %d\n", i);
+			goto fail;
+		}
+
+		radius_policy[i].name = DA->name;
+		switch (DA->type) {
+			case PW_TYPE_INTEGER:
+				radius_policy[i].type = BLOBMSG_TYPE_INT32;
+				break;
+			case PW_TYPE_STRING:
+			case PW_TYPE_IPADDR:
+			case PW_TYPE_DATE:
+			case PW_TYPE_IPV6ADDR:
+			case PW_TYPE_IPV6PREFIX:
+				radius_policy[i].type = BLOBMSG_TYPE_STRING;
+				break;
+			default:
+				fprintf(stderr, "unsupported attribute type %d for %s\n", DA->type, DA->name);
+				goto fail;
+		}
+	}
+
+	if (blob_buf_init(&b, 0))
+		goto fail;
 	if (!blobmsg_add_json_from_file(&b, argv[1]))
-		return result(NULL, 0, NULL);
+		goto fail;
 
-	blobmsg_parse(radius_policy, __RADIUS_MAX, tb, blob_data(b.head), blob_len(b.head));
+	if (blobmsg_parse(radius_policy, __RADIUS_MAX, tb, blob_data(b.head), blob_len(b.head)))
+		goto fail;
 
-	return radius();
+	return radius(rh);
+fail:
+	return result(rh, 0, NULL);
 }

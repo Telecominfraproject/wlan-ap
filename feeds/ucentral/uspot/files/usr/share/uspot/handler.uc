@@ -1,4 +1,7 @@
 {%
+// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-FileCopyrightText: 2022-2023 John Crispin <john@phrozen.org>
+// SPDX-FileCopyrightText: 2023 Thibaut Varène <hacks@slashdirt.org>
 
 'use strict';
 
@@ -21,16 +24,11 @@ function request_start(ctx) {
 	case 'uam':
 		// try mac-auth first if enabled
 		if (+ctx.config.mac_auth) {
-			let payload = portal.radius_init(ctx);
-			payload.username = ctx.format_mac + (ctx.config.mac_suffix || '');
-			payload.password = ctx.config.mac_passwd || ctx.format_mac;
-			payload.service_type = 10;	// Call-Check, see https://wiki.freeradius.org/guide/mac-auth#web-auth-safe-mac-auth
-		        let radius = portal.radius_call(ctx, payload);
-			if (radius['access-accept']) {
+		        let auth = portal.uspot_auth(ctx);
+			if (auth && auth['access-accept']) {
 				if (ctx.config.final_redirect_url == 'uam')
 					ctx.query_string.userurl = portal.uam_url(ctx, 'success');
-				delete payload.server;	// don't publish radius secrets
-				portal.allow_client(ctx, { radius: { reply: radius.reply, request: payload } } );
+				portal.allow_client(ctx);
 				return;
 			}
 		}
@@ -57,6 +55,7 @@ function request_click(ctx) {
 		request_start({ ...ctx, error: 1 });
                 return;
 	}
+	portal.uspot_auth(ctx);
 	portal.allow_client(ctx);
 }
 
@@ -76,18 +75,9 @@ function request_credentials(ctx) {
 	}
 
 	// check if the credentials are valid
-	for (let k in portal.config) {
-		let cred = portal.config[k];
-
-		if (cred['.type'] != 'credentials')
-			continue;
-		if (cred.interface != ctx.spotfilter)
-			continue;
-		if (ctx.form_data.username != cred.username ||
-		    ctx.form_data.password != cred.password)
-			continue;
-
-		portal.allow_client(ctx, { username: ctx.form_data.username });
+	let auth = portal.uspot_auth(ctx, ctx.form_data.username, ctx.form_data.password);
+	if (auth && auth['access-accept']) {
+		portal.allow_client(ctx);
 		return;
 	}
 
@@ -112,14 +102,12 @@ function request_radius(ctx) {
 	}
 
 	// trigger the radius auth
-	let payload = portal.radius_init(ctx);
-	payload.username = ctx.form_data.username;
-	payload.password = ctx.form_data.password;
+	let username = ctx.form_data.username;
+	let password = ctx.form_data.password;
 
-        let radius = portal.radius_call(ctx, payload);
-	if (radius['access-accept']) {
-		delete payload.server;	// don't publish radius secrets
-                portal.allow_client(ctx, { username: ctx.form_data.username, radius: { reply: radius.reply, request: payload } } );
+        let auth = portal.uspot_auth(ctx, username, password);
+	if (auth && auth['access-accept']) {
+                portal.allow_client(ctx);
                 return;
         }
 
