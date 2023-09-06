@@ -772,6 +772,7 @@ hostapd_set_bss_options() {
 			# Here we make the assumption that if we're in open mode
 			# with WPS enabled, we got to be in unconfigured state.
 			wps_not_configured=1
+			vlan_possible=1
 			[ "$macfilter" = radius ] && {
 				append_radius_server
 				vlan_possible=1
