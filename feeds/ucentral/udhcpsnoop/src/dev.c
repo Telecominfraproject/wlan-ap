@@ -267,58 +267,58 @@ dhcpsnoop_dev_attach_filters(struct device *dev, bool egress)
 
 	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
 	APPEND(buf, ofs, " protocol ip u32 match ip sport 67 0xffff"
-			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
+			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME " continue");
 	dhcpsnoop_run_cmd(buf, false);
 
 	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
 	APPEND(buf, ofs, " protocol 802.1Q u32 offset plus 4 match ip sport 67 0xffff"
-			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
+			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME " continue");
 	dhcpsnoop_run_cmd(buf, false);
 
 	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
 	APPEND(buf, ofs, " protocol ip u32 match ip sport 68 0xffff"
-			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
+			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME " continue");
 	dhcpsnoop_run_cmd(buf, false);
 
 	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
 	APPEND(buf, ofs, " protocol 802.1Q u32 offset plus 4 match ip sport 68 0xffff"
-			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
+			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME " continue");
 	dhcpsnoop_run_cmd(buf, false);
 
 	/* GRE */
 	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
 	APPEND(buf, ofs, " protocol ip u32 match ip protocol 47 0xff"
 			 MATCH_GRE_ETH_IP_UDP_DHCP_67
-			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
+			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME " continue");
 	dhcpsnoop_run_cmd(buf, false);
 
 	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
 	APPEND(buf, ofs, " protocol ip u32 match ip protocol 47 0xff"
 			 MATCH_GRE_ETH_IP_UDP_DHCP_68
-			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
+			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME " continue");
 	dhcpsnoop_run_cmd(buf, false);
 
 	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
 	APPEND(buf, ofs, " protocol ip u32 match ip protocol 47 0xff "
 			 MATCH_GRE_ETH_VLAN_IP_UDP_DHCP_67
-			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
+			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME " continue");
 	dhcpsnoop_run_cmd(buf, false);
 
 	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
 	APPEND(buf, ofs, " protocol ip u32 match ip protocol 47 0xff"
 			 MATCH_GRE_ETH_VLAN_IP_UDP_DHCP_68
-			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
+			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME " continue");
 	dhcpsnoop_run_cmd(buf, false);
 
 	/* IPv6 */
 	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
 	APPEND(buf, ofs, " protocol ipv6 u32 match ip6 sport 546 0xfffe"
-			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
+			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME " continue");
 	dhcpsnoop_run_cmd(buf, false);
 
 	ofs = prepare_filter_cmd(buf, sizeof(buf), dev->ifname, prio++, true, egress);
 	APPEND(buf, ofs, " protocol 802.1Q u32 offset plus 4 match ip6 sport 546 0xfffe"
-			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME);
+			 " flowid 1:1 action mirred ingress mirror dev " DHCPSNOOP_IFB_NAME " continue");
 	dhcpsnoop_run_cmd(buf, false);
 }
 

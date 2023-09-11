@@ -25,7 +25,6 @@ endef
 
 ALLWIFIBOARDS:= \
 	cig-wf188 \
-	cig-wf188n \
 	cig-wf186w \
 	cig-wf660a \
 	cig-wf194c \
@@ -47,6 +46,7 @@ ALLWIFIBOARDS:= \
 	indio-um-510axm-v1 \
 	muxi-ap3220l \
 	plasmacloud-pax1800 \
+	wallys-dr5018 \
 	wallys-dr6018 \
 	wallys-dr6018-v4 \
 	tplink-ex227 \
@@ -91,6 +91,16 @@ $(call Package/ath11k-wifi-default)
     TITLE:=board-2.bin for QCOM IPQ6122 eval kits
 endef
 
+define Package/ath11k-wifi-cig-wf188n-ca
+$(call Package/ath11k-wifi-default)
+    TITLE:=cig-wf188n bdf CA
+endef
+
+define Package/ath11k-wifi-cig-wf188n-us
+$(call Package/ath11k-wifi-default)
+    TITLE:=cig-wf188n bdf US
+endef
+
 define Package/ath11k-wifi-cig-wf196_6g-ca
 $(call Package/ath11k-wifi-default)
     TITLE:=cig-wf196 6G bdf CA
@@ -116,6 +126,11 @@ $(call Package/ath11k-wifi-default)
     TITLE:=motorola q14 bdf
 endef
 
+define Package/ath11k-wifi-xunison-d50
+$(call Package/ath11k-wifi-default)
+    TITLE:=xunison d50 bdf
+endef
+
 define Package/ath11k-wifi-plasmacloud-pax1800
 $(call Package/ath11k-wifi-default)
     TITLE:=plasmacloud-pax1800(-v2) bdf
@@ -124,6 +139,21 @@ endef
 define Package/ath11k-wifi-hfcl-ion4xi
 $(call Package/ath11k-wifi-default)
     TITLE:=hfcl-ion4xi bdf
+endef
+
+define Package/ath11k-wifi-hfcl-ion4xi_w
+$(call Package/ath11k-wifi-default)
+    TITLE:=hfcl-ion4xi_w bdf
+endef
+
+define Package/ath11k-wifi-hfcl-ion4x_w
+$(call Package/ath11k-wifi-default)
+    TITLE:=hfcl-ion4x_w bdf
+endef
+
+define Package/ath11k-wifi-hfcl-ion4xi_HMR
+$(call Package/ath11k-wifi-default)
+    TITLE:=hfcl-ion4xi_HMR bdf
 endef
 
 define Package/ath11k-wifi-hfcl-ion4xi_wp
@@ -135,6 +165,12 @@ define Package/ath11k-wifi-meshpp-s618
 $(call Package/ath11k-wifi-default)
     TITLE:=meshpp-s618 bdf
 endef
+
+define Package/ath11k-wifi-edgecore-oap101
+$(call Package/ath11k-wifi-default)
+    TITLE:=edgecore oap101 bdf
+endef
+
 
 define ath11k-wifi-install-one-to
   $(INSTALL_DIR)  $(2)/lib/firmware/$(3)/
@@ -213,6 +249,18 @@ define Package/ath11k-wifi-qcom-qcn9000/install
 	$(INSTALL_DATA) ./board-2.bin.QCN9000 $(1)/lib/firmware/ath11k/QCN9074/hw1.0/board-2.bin
 endef
 
+define Package/ath11k-wifi-cig-wf188n-ca/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-cig-wf188n-ca.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board.bin
+	echo -n 'CA MY DE' > $(1)/lib/firmware/country
+endef
+
+define Package/ath11k-wifi-cig-wf188n-us/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-cig-wf188n-us.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board.bin
+	echo -n 'US MY DE' > $(1)/lib/firmware/country
+endef
+
 define Package/ath11k-wifi-cig-wf196_6g-ca/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/QCN9074/hw1.0/
 	$(INSTALL_DATA) ./board-cig-wf196_6g-ca.bin.QCN9074 $(1)/lib/firmware/ath11k/QCN9074/hw1.0/board.bin
@@ -225,6 +273,12 @@ define Package/ath11k-wifi-cig-wf196_6g-us/install
 	echo -n 'US' > $(1)/lib/firmware/country
 endef
 
+define Package/ath11k-wifi-xunison-d50/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/QCN9074/hw1.0/
+	$(INSTALL_DATA) ./board-xunison-d50.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-xunison-d50.bin.QCN9074 $(1)/lib/firmware/ath11k/QCN9074/hw1.0/board.bin
+endef
 
 define Package/ath11k-wifi-gl-ax1800/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
@@ -263,8 +317,36 @@ define Package/ath11k-wifi-hfcl-ion4xi_wp/install
 	$(INSTALL_DATA) ./board-hfcl-ion4xi_wp.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board.bin
 endef
 
+define Package/ath11k-wifi-hfcl-ion4xi_w/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_w.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_w.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin
+endef
+
+define Package/ath11k-wifi-hfcl-ion4x_w/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_w.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_w.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin
+endef
+
+define Package/ath11k-wifi-hfcl-ion4xi_HMR/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_HMR.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_HMR.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin
+endef
+
+define Package/ath11k-wifi-edgecore-oap101/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-edgecore-oap101.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-2-edgecore-oap101.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board-2.bin
+endef
+
+
 $(eval $(call generate-ath11k-wifi-package,cig-wf188,Cigtech WF188))
-$(eval $(call generate-ath11k-wifi-package,cig-wf188n,Cigtech WF188n))
 $(eval $(call generate-ath11k-wifi-package,cig-wf186w,Cigtech WF186w))
 $(eval $(call generate-ath11k-wifi-package,cig-wf660a,Cigtech WF660a))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c,Cigtech WF194c))
@@ -275,6 +357,7 @@ $(eval $(call generate-ath11k-wifi-package,cybertan-eww622-a1,CyberTan EWW622 A1
 $(eval $(call generate-ath11k-wifi-package,cybertan-eww631-a1,CyberTan EWW631 A1))
 $(eval $(call generate-ath11k-wifi-package,cybertan-eww631-b1,CyberTan EWW631 B1))
 $(eval $(call generate-ath11k-wifi-package,sercomm-wallaby,Sercomm Kiwi))
+$(eval $(call generate-ath11k-wifi-package,wallys-dr5018,Wallys Dr5018))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018,Wallys DR6018))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018-v4,Wallys DR6018 V4))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap101,EdgeCore EAP101))
@@ -298,8 +381,16 @@ $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq6122))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq8074))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq6018))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-qcn9000))
+$(eval $(call BuildPackage,ath11k-wifi-cig-wf188n-ca))
+$(eval $(call BuildPackage,ath11k-wifi-cig-wf188n-us))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g-ca))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g-us))
 $(eval $(call BuildPackage,ath11k-wifi-motorola-q14))
+$(eval $(call BuildPackage,ath11k-wifi-xunison-d50))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_wp))
+$(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_w))
+$(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4x_w))
+$(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_HMR))
+$(eval $(call BuildPackage,ath11k-wifi-edgecore-oap101))
+

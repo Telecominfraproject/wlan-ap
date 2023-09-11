@@ -73,6 +73,11 @@ static void clear_all_alarms(sensor_setting_t *sensor, int sensor_temp)
 		case NSS_FREQ:
                         nssfreq_request(-1);
                         break;
+#ifdef IPQ_5000
+		case COOLING:
+			cooling_request(sensor->id, sensor_temp, 0);
+			break;
+#endif
 #endif
 		}
 	}
@@ -186,6 +191,11 @@ void *sensor_monitor(void *vsensor)
 				case NSS_FREQ:
                                         nssfreq_request(sensor->t[i].actions[j].info);
                                         break;
+#ifdef IPQ_5000
+				case COOLING:
+                                        cooling_request(sensor->id, sensor_temp, sensor->t[i].actions[j].info);
+                                        break;
+#endif
 #else
 				case REPORT:
                                         if (alarm_raised)

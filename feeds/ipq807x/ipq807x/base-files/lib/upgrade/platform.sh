@@ -125,6 +125,7 @@ platform_check_image() {
 	indio,um-310ax-v1|\
 	indio,um-510axp-v1|\
 	indio,um-510axm-v1|\
+	wallys,dr5018|\
 	wallys,dr6018|\
 	wallys,dr6018-v4|\
 	edgecore,eap101|\
@@ -133,6 +134,9 @@ platform_check_image() {
 	liteon,wpx8324|\
 	edgecore,eap106|\
 	hfcl,ion4xi|\
+	hfcl,ion4xi_w|\
+	hfcl,ion4x_w|\
+	hfcl,ion4xi_HMR|\
 	hfcl,ion4xi_wp|\
 	hfcl,ion4x|\
 	hfcl,ion4x_2|\
@@ -150,6 +154,8 @@ platform_check_image() {
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\
+	xunison,d50|\
+	xunison,d50-5g|\
 	qcom,ipq5018-mp03.3)
 		[ "$magic_long" = "73797375" ] && return 0
 		;;
@@ -173,7 +179,6 @@ platform_do_upgrade() {
 	motorola,q14)
 		emmc_do_upgrade $1
 		;;
-	cig,wf186w|\
 	cig,wf188n|\
 	cig,wf194c|\
 	cig,wf194c4|\
@@ -189,7 +194,10 @@ platform_do_upgrade() {
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\
+	xunison,d50|\
+	xunison,d50-5g|\
 	qcom,ipq5018-mp03.3|\
+	wallys,dr5018|\
 	wallys,dr6018|\
 	wallys,dr6018-v4|\
 	yuncore,fap650|\
@@ -212,17 +220,18 @@ platform_do_upgrade() {
 		fi
 		nand_upgrade_tar "$1"
 		;;
+	hfcl,ion4xi_w|\
+	hfcl,ion4x_w|\
+	hfcl,ion4xi_HMR|\
 	hfcl,ion4xi_wp)
 		wp_part=$(fw_printenv primary | cut  -d = -f2)
 		echo "Current Primary is $wp_part"
 		if [[ $wp_part == 1 ]]; then
 			CI_UBIPART="rootfs"
-			echo "Setting Primary 0 and Flashing"
-			fw_setenv primary 0 || exit 1
+			CI_FWSETENV="primary 0"
 		else
 			CI_UBIPART="rootfs_1"
-			echo "Setting Primary 1 and Flashing"
-			fw_setenv primary 1 || exit 1
+			CI_FWSETENV="primary 1"
 		fi
 		nand_upgrade_tar "$1"
 		;;
@@ -244,10 +253,10 @@ platform_do_upgrade() {
 				fw_setenv upgrade_available 0 || exit 1
 			elif grep -q rootfs1 /proc/cmdline; then
 				CI_UBIPART="rootfs2"
-				fw_setenv active 2 || exit 1
+				CI_FWSETENV="active 2"
 			else
 				CI_UBIPART="rootfs1"
-				fw_setenv active 1 || exit 1
+				CI_FWSETENV="active 1"
 			fi
 		fi
 		nand_upgrade_tar "$1"
@@ -257,6 +266,7 @@ platform_do_upgrade() {
 		PART_NAME="inactive"
 		platform_do_upgrade_dualboot_datachk "$1"
 		;;
+	cig,wf186w|\
 	yuncore,ax840|\
 	yuncore,fap655)
 		[ -f /proc/boot_info/rootfs/upgradepartition ] && {

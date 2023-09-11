@@ -70,6 +70,19 @@ drv_mac80211_init_device_config() {
 		short_gi_40 \
 		max_amsdu \
 		dsss_cck_40
+	config_add_int \
+		ru_punct_bitmap \
+		ru_punct_acs_threshold \
+		ccfs \
+		eht_su_beamformee \
+		eht_su_beamformer \
+		eht_mu_beamformer \
+		eht_ulmumimo_80mhz \
+		eht_ulmumimo_160mhz \
+		eht_ulmumimo_320mhz
+	config_add_boolean \
+		ru_punct_ofdma \
+		disable_eml_cap
 }
 
 drv_mac80211_init_iface_config() {
@@ -159,7 +172,7 @@ mac80211_hostapd_setup_base() {
 	ht_capab=
 	case "$htmode" in
 		VHT20|HT20|HE20) ;;
-		HT40*|VHT40|VHT80|VHT160|HE40|HE80|HE160)
+		HT40*|VHT40|VHT80|VHT160|HE40|HE80|HE160|EHT40|EHT80|EHT320)
 			case "$hwmode" in
 				a)
 					case "$(( (($channel / 4) + $chan_ofs) % 2 ))" in
@@ -234,8 +247,8 @@ mac80211_hostapd_setup_base() {
 
 	idx="$channel"
 	case "$htmode" in
-		VHT20|HE20) enable_ac=1;;
-		VHT40|HE40)
+		VHT20|HE20|EHT20) enable_ac=1;;
+		VHT40|HE40|EHT40)
 			case "$(( (($channel / 4) + $chan_ofs) % 2 ))" in
 				1) idx=$(($channel + 2));;
 				0) idx=$(($channel - 2));;
@@ -243,7 +256,7 @@ mac80211_hostapd_setup_base() {
 			enable_ac=1
 			vht_center_seg0=$idx
 		;;
-		VHT80|HE80)
+		VHT80|HE80|EHT80)
 			case "$(( (($channel / 4) + $chan_ofs) % 4 ))" in
 				1) idx=$(($channel + 6));;
 				2) idx=$(($channel + 2));;
@@ -254,7 +267,7 @@ mac80211_hostapd_setup_base() {
 			vht_oper_chwidth=1
 			vht_center_seg0=$idx
 		;;
-		VHT160|HE160)
+		VHT160|HE160|EHT160|EHT320)
 			if [ "$band" = "6g" ]; then
 				case "$channel" in
 					1|5|9|13|17|21|25|29) idx=15;;
@@ -280,7 +293,7 @@ mac80211_hostapd_setup_base() {
 		op_class=
 		case "$htmode" in
 			HE20) op_class=131;;
-			HE*) op_class=$((132 + $vht_oper_chwidth))
+			HE*|EHT*) op_class=$((132 + $vht_oper_chwidth))
 		esac
 		[ -n "$op_class" ] && append base_cfg "op_class=$op_class" "$N"
 	}
@@ -402,8 +415,13 @@ mac80211_hostapd_setup_base() {
 
 	# 802.11ax
 	enable_ax=0
+	enable_be=0
 	case "$htmode" in
 		HE*) enable_ax=1 ;;
+		HE*|EHT*)
+			enable_ax=1
+			enable_be=1
+			;;
 	esac
 
 	if [ "$enable_ax" != "0" ]; then
@@ -426,6 +444,10 @@ mac80211_hostapd_setup_base() {
 		[ "$hwmode" = "a" ] && {
 			append base_cfg "he_oper_chwidth=$vht_oper_chwidth" "$N"
 			append base_cfg "he_oper_centr_freq_seg0_idx=$vht_center_seg0" "$N"
+			 [ "$enable_be" != "0" ] && {
+				append base_cfg "eht_oper_chwidth=$vht_oper_chwidth" "$N"
+				append base_cfg "eht_oper_centr_freq_seg0_idx=$vht_center_seg0" "$N"
+			 }
 		}
 
 		mac80211_add_he_capabilities \
@@ -463,6 +485,78 @@ mac80211_hostapd_setup_base() {
 		append base_cfg "he_mu_edca_ac_vo_ecwmin=5" "$N"
 		append base_cfg "he_mu_edca_ac_vo_ecwmax=7" "$N"
 		append base_cfg "he_mu_edca_ac_vo_timer=255" "$N"
+	fi
+
+	if [ "$enable_be" != "0" ]; then
+		json_get_vars \
+			ru_punct_bitmap:0 \
+			ru_punct_ofdma:0 \
+			ru_punct_acs_threshold:0 \
+			ccfs:0 \
+			eht_su_beamformee:1 \
+			eht_su_beamformer:1 \
+			eht_mu_beamformer:1 \
+			eht_ulmumimo_80mhz \
+			eht_ulmumimo_160mhz \
+			eht_ulmumimo_320mhz \
+			disable_eml_cap
+
+		append base_cfg "ieee80211be=1" "$N"
+		append base_cfg "eht_su_beamformer=$eht_su_beamformer" "$N"
+		append base_cfg "eht_mu_beamformer=$eht_mu_beamformer" "$N"
+		append base_cfg "eht_su_beamformee=$eht_su_beamformee" "$N"
+		
+		drv_mlo_capable=$(cat /sys/module/ath12k/parameters/mlo_capable)
+		if [ -n "$drv_mlo_capable" ] && [ $drv_mlo_capable -eq 1 ]; then
+			append base_cfg "mlo=1" "$N"
+		fi
+		config_get bonded $2 bonded
+		if [ -n "$bonded" ] && [ $bonded -eq 1 ]; then
+			append base_cfg "bonded=1" "$N"
+		fi
+
+		[ -n "$disable_eml_cap" ] && append base_cfg "disable_eml_cap=$disable_eml_cap" "$N"
+
+		if [ -n "$eht_ulmumimo_80mhz" ]; then
+			if [ $eht_ulmumimo_80mhz -eq 0 ]; then
+				append base_cfg "eht_ulmumimo_80mhz=0" "$N"
+			elif [  $eht_ulmumimo_80mhz -gt 0 ]; then
+				append base_cfg "eht_ulmumimo_80mhz=1" "$N"
+			fi
+		else
+			append base_cfg "eht_ulmumimo_80mhz=-1" "$N"
+		fi
+
+		if [ -n "$eht_ulmumimo_160mhz" ]; then
+			if [ $eht_ulmumimo_160mhz -eq 0 ]; then
+				append base_cfg "eht_ulmumimo_160mhz=0" "$N"
+			elif [  $eht_ulmumimo_160mhz -gt 0 ]; then
+				append base_cfg "eht_ulmumimo_160mhz=1" "$N"
+			fi
+		else
+			append base_cfg "eht_ulmumimo_160mhz=-1" "$N"
+		fi
+
+		if [ -n "$eht_ulmumimo_320mhz" ]; then
+			if [ $eht_ulmumimo_320mhz -eq 0 ]; then
+				append base_cfg "eht_ulmumimo_320mhz=0" "$N"
+			elif [  $eht_ulmumimo_320mhz -gt 0 ]; then
+				append base_cfg "eht_ulmumimo_320mhz=1" "$N"
+			fi
+		else
+			append base_cfg "eht_ulmumimo_320mhz=-1" "$N"
+		fi
+
+		if [ -n $ru_punct_bitmap ] && [ $ru_punct_bitmap -gt 0 ]; then
+			append base_cfg "ru_punct_bitmap=$ru_punct_bitmap" "$N"
+		fi
+		if [ -n $ru_punct_ofdma ] && [ $ru_punct_ofdma -gt 0 ]; then
+			append base_cfg "ru_punct_ofdma=$ru_punct_ofdma" "$N"
+		fi
+		if [ -n $ru_punct_acs_threshold ] && [ $ru_punct_acs_threshold -gt 0 ]; then
+			append base_cfg "ru_punct_acs_threshold=$ru_punct_acs_threshold" "$N"
+		fi
+		[ -n "$use_ru_puncture_dfs" ] && append base_cfg "use_ru_puncture_dfs=$use_ru_puncture_dfs" "$N"
 	fi
 
 	hostapd_prepare_device_config "$hostapd_conf_file" nl80211

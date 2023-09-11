@@ -12,24 +12,37 @@ PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL=https://github.com/jow-/ucode.git
-PKG_MIRROR_HASH:=413a08ee63c30c44d6f0a5de14b1c84787f9bd1fe8b125c8e4956aa2884cc933
-#PKG_MIRROR_HASH:=98303ef9d5fa7eca04042792abaf8a2e66082237a23a89a7f5e72e4409714a72
-PKG_SOURCE_DATE:=2022-04-07
-PKG_SOURCE_VERSION:=7fa59ce44b9347528b0e4e44ebcfb04a08479f3f
+PKG_SOURCE_DATE:=2023-06-06
+PKG_SOURCE_VERSION:=c7d84aae09691a99ae3db427c0b2463732ef84f4
+PKG_MIRROR_HASH:=38826ae70d886d1d7ada3fc6591ac807169aa28107f60f7f2e617520083525fb
 PKG_MAINTAINER:=Jo-Philipp Wich <jo@mein.io>
 PKG_LICENSE:=ISC
 
-PKG_ABI_VERSION:=20220322
+PKG_ABI_VERSION:=20220812
 
 include $(INCLUDE_DIR)/package.mk
+include $(INCLUDE_DIR)/host-build.mk
 include $(INCLUDE_DIR)/cmake.mk
 
-CMAKE_OPTIONS += -DSOVERSION=$(PKG_ABI_VERSION)
+CMAKE_OPTIONS += -DSOVERSION=$(PKG_ABI_VERSION) -DLINUX=ON
+CMAKE_HOST_OPTIONS += \
+	-DSOVERSION=$(PKG_ABI_VERSION) \
+	-DFS_SUPPORT=ON \
+	-DMATH_SUPPORT=ON \
+	-DNL80211_SUPPORT=OFF \
+	-DRESOLV_SUPPORT=OFF \
+	-DRTNL_SUPPORT=OFF \
+	-DSTRUCT_SUPPORT=ON \
+	-DUBUS_SUPPORT=OFF \
+	-DUCI_SUPPORT=OFF \
+	-DULOOP_SUPPORT=OFF
+
 
 define Package/ucode/default
-  SECTION:=utils
-  CATEGORY:=Utilities
-  TITLE:=ucode - Tiny scripting and templating language
+  SUBMENU:=ucode
+  SECTION:=lang
+  CATEGORY:=Languages
+  TITLE:=Tiny scripting and templating language
 endef
 
 define Package/ucode
@@ -45,7 +58,10 @@ endef
 
 define Package/libucode
   $(Package/ucode/default)
-  TITLE+= - runtime library
+  SUBMENU:=
+  SECTION:=libs
+  CATEGORY:=Libraries
+  TITLE+= (library)
   ABI_VERSION:=$(PKG_ABI_VERSION)
   DEPENDS:=+libjson-c
 endef
@@ -80,7 +96,7 @@ endef
 define Package/ucode-mod-nl80211
   $(Package/ucode/default)
   TITLE+= (nl80211 module)
-  DEPENDS:=ucode +libnl-tiny +kmod-mac80211 +libubox
+  DEPENDS:=ucode +libnl-tiny +libubox +kmod-mac80211
 endef
 
 define Package/ucode-mod-nl80211/description
@@ -117,7 +133,7 @@ define Package/ucode-mod-struct
 endef
 
 define Package/ucode-mod-struct/description
- The struct plugin implemnts Python 3 compatible struct.pack/unpack functionality.
+ The struct plugin implements Python 3 compatible struct.pack/unpack functionality.
 endef
 
 
@@ -143,6 +159,7 @@ define Package/ucode-mod-uci/description
  The uci module allows templates to read and modify uci configuration.
 endef
 
+
 define Package/ucode-mod-uloop
   $(Package/ucode/default)
   TITLE+= (uloop module)
@@ -150,7 +167,8 @@ define Package/ucode-mod-uloop
 endef
 
 define Package/ucode-mod-uloop/description
- The uloop module allows templates to run a main loop.
+ The uloop module allows ucode scripts to interact with OpenWrt uloop event
+ loop implementation.
 endef
 
 define Build/Prepare
@@ -220,9 +238,8 @@ define Package/ucode-mod-uloop/install
 	$(INSTALL_BIN) $(PKG_INSTALL_DIR)/usr/lib/ucode/uloop.so $(1)/usr/lib/ucode/
 endef
 
-
-$(eval $(call BuildPackage,ucode))
 $(eval $(call BuildPackage,libucode))
+$(eval $(call BuildPackage,ucode))
 $(eval $(call BuildPackage,ucode-mod-fs))
 $(eval $(call BuildPackage,ucode-mod-math))
 $(eval $(call BuildPackage,ucode-mod-nl80211))
@@ -232,3 +249,4 @@ $(eval $(call BuildPackage,ucode-mod-struct))
 $(eval $(call BuildPackage,ucode-mod-ubus))
 $(eval $(call BuildPackage,ucode-mod-uci))
 $(eval $(call BuildPackage,ucode-mod-uloop))
+$(eval $(call HostBuild))
