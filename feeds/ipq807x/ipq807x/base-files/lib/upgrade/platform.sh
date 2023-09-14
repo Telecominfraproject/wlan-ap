@@ -111,6 +111,7 @@ platform_check_image() {
 	board=$(board_name)
 	case $board in
 	cig,wf186w|\
+	cig,wf186h|\
 	cig,wf188|\
 	cig,wf660a|\
 	cig,wf188n|\
@@ -267,6 +268,7 @@ platform_do_upgrade() {
 		platform_do_upgrade_dualboot_datachk "$1"
 		;;
 	cig,wf186w|\
+	cig,wf186h|\
 	yuncore,ax840|\
 	yuncore,fap655)
 		[ -f /proc/boot_info/rootfs/upgradepartition ] && {
