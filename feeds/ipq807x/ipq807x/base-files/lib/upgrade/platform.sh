@@ -84,11 +84,17 @@ emmc_do_upgrade_bootconfig() {
 	fi
 
 	for part in "0:BOOTCONFIG" "0:BOOTCONFIG1"; do
-		local emmcblock=$(find_mmc_part $part)
-		echo erase ${emmcblock}
-		dd if=/dev/zero of=${emmcblock} 2> /dev/null
-		echo update $emmcblock
-		dd if=/tmp/bootconfig of=${emmcblock} 2> /dev/null
+               local emmcblock=$(echo $(find_mtd_chardev $part) | sed 's/^.\{5\}//')
+               if [ -n "$emmcblock" ]; then
+                       echo start to update $emmcblock
+                       mtd -qq write /proc/boot_info/getbinary_bootconfig "/dev/${emmcblock}" 2>/dev/null && echo update mtd $emmcblock
+               else
+                       emmcblock=$(find_mmc_part $part)
+                       echo erase ${emmcblock}
+                       dd if=/dev/zero of=${emmcblock} 2> /dev/null
+                       echo update $emmcblock
+                       dd if=/tmp/bootconfig of=${emmcblock} 2> /dev/null
+               fi
 	done
 }
 
