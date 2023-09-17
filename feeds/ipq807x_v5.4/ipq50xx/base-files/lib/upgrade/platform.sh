@@ -68,6 +68,7 @@ platform_check_image() {
 	local magic_long="$(get_magic_long "$1")"
 	board=$(board_name)
 	case $board in
+	cig,wf186w|\
 	edgecore,eap104|\
 	hfcl,ion4xi_w|\
 	yuncore,fap655|\	
@@ -107,6 +108,7 @@ platform_do_upgrade() {
                 fi
                 nand_upgrade_tar "$1"
                 ;;
+	cig,wf186w|\
 	yuncore,fap655)
 		[ -f /proc/boot_info/rootfs/upgradepartition ] && {
 			CI_UBIPART="$(cat /proc/boot_info/rootfs/upgradepartition)"
