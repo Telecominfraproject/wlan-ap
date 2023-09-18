@@ -68,7 +68,7 @@ global.start = function() {
 		global.uci = require('uci').cursor();
 		global.ubus.conn = require('ubus').connect();
 
-		for (let module in [ 'config', 'event', 'phy', 'local', 'station', 'command', 'policy' ]) {
+		for (let module in [ 'config', 'event', 'phy', 'neighbor', 'local', 'station', 'command', 'policy' ]) {
 			printf('loading ' + module + '\n');
 			global[module] = require(module);
 			if (exists(global[module], 'init'))

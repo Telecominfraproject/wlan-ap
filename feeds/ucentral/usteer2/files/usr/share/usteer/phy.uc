@@ -147,12 +147,12 @@ return {
 	},
 
 	txpower: function(msg) {
-		if (!msg.phy || !msg.params?.level)
+		if (!msg.bssid || !msg.level)
 			return false;
-		if (!this.phys[msg.phy])
-			return false;
-
-		global.nl80211.request(global.nl80211.const.NL80211_CMD_SET_WIPHY, 0, { wiphy: this.phys[msg.phy].index, wiphy_tx_power_setting: 2, wiphy_tx_power_level: msg.params.level * 100});
+		let wiphy = global.local.bssid_to_phy(msg.bssid);
+		if (wiphy < 0)
+			return false;	
+		global.nl80211.request(global.nl80211.const.NL80211_CMD_SET_WIPHY, 0, { wiphy, wiphy_tx_power_setting: 2, wiphy_tx_power_level: msg.level * 100});
 		return true;
 	},
 };
