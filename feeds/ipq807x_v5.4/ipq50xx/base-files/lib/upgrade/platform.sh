@@ -83,6 +83,7 @@ platform_check_image() {
 	wallys,dr6018-v4|\
 	edgecore,eap101|\
 	edgecore,eap102|\
+	edgecore,oap102|\
 	edgecore,eap104|\
 	edgecore,oap101-6e|\
 	edgecore,oap101e|\
@@ -167,7 +168,8 @@ platform_do_upgrade() {
 		nand_upgrade_tar "$1"
 		;;
 	edgecore,eap101|\
-	edgecore,eap102)
+	edgecore,eap102|\
+	edgecore,oap102)
 		if [ "$(find_mtd_chardev rootfs)" ]; then
 			CI_UBIPART="rootfs"
 		else
