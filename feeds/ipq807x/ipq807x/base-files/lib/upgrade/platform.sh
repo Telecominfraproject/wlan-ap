@@ -52,7 +52,7 @@ do_flash_emmc() {
 	tar Oxf $tar_file ${board_dir}/$part | dd of=${emmcblock}
 }
 
-emmc_do_upgrade_bootconfig() {
+spi_nor_emmc_do_upgrade_bootconfig() {
 	local tar_file="$1"
 
 	local board_dir=$(tar tf $tar_file | grep -m 1 '^sysupgrade-.*/$')
@@ -84,10 +84,10 @@ emmc_do_upgrade_bootconfig() {
 	fi
 
 	for part in "0:BOOTCONFIG" "0:BOOTCONFIG1"; do
-               local emmcblock=$(echo $(find_mtd_chardev $part) | sed 's/^.\{5\}//')
-               if [ -n "$emmcblock" ]; then
-                       echo start to update $emmcblock
-                       mtd -qq write /proc/boot_info/getbinary_bootconfig "/dev/${emmcblock}" 2>/dev/null && echo update mtd $emmcblock
+               local mtdchar=$(echo $(find_mtd_chardev $part) | sed 's/^.\{5\}//')
+               if [ -n "$mtdchar" ]; then
+                       echo start to update $mtdchar
+                       mtd -qq write /proc/boot_info/getbinary_bootconfig "/dev/${mtdchar}" 2>/dev/null && echo update mtd $mtdchar
                else
                        emmcblock=$(find_mmc_part $part)
                        echo erase ${emmcblock}
@@ -180,7 +180,7 @@ platform_do_upgrade() {
 		qca_do_upgrade $1
 		;;
 	cig,wf660a)
-		emmc_do_upgrade_bootconfig $1
+		spi_nor_emmc_do_upgrade_bootconfig $1
 		;;
 	motorola,q14)
 		emmc_do_upgrade $1
