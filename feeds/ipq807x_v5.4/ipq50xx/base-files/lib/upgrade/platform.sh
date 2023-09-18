@@ -71,8 +71,10 @@ platform_check_image() {
 	edgecore,eap104|\
 	hfcl,ion4xi_w|\
 	yuncore,fap655|\	
+	edgecore,oap101|\
 	edgecore,oap101-6e|\
-	edgecore,oap101e)
+	edgecore,oap101e|\
+	edgecore,oap101e-6e)
 		[ "$magic_long" = "73797375" ] && return 0
 		;;
 	esac
@@ -86,8 +88,10 @@ platform_do_upgrade() {
 
 	board=$(board_name)
 	case $board in
+	edgecore,oap101|\
 	edgecore,oap101-6e|\
-	edgecore,oap101e)
+	edgecore,oap101e|\
+	edgecore,oap101e-6e)
 		nand_upgrade_tar "$1"
 		;;
 	edgecore,eap104)
