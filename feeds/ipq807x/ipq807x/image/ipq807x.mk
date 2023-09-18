@@ -72,6 +72,16 @@ define Device/edgecore_eap102
 endef
 TARGET_DEVICES += edgecore_eap102
 
+define Device/edgecore_oap102
+  DEVICE_TITLE := Edgecore OAP102
+  DEVICE_DTS := qcom-ipq807x-oap102
+  DEVICE_DTS_CONFIG=config@ac02
+  SUPPORTED_DEVICES := edgecore,oap102
+  DEVICE_PACKAGES := ath11k-wifi-edgecore-eap102 kmod-usb2 kmod-usb3 uboot-envtools \
+	zephyr-v3.3.x-hci_usb-edgecore_eap102_nrf52840
+endef
++TARGET_DEVICES += edgecore_oap102
+
 define Device/edgecore_eap106
   DEVICE_TITLE := Edgecore EAP106
   DEVICE_DTS := qcom-ipq807x-eap106
