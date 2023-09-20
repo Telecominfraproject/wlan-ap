@@ -1,6 +1,6 @@
 include $(TOPDIR)/rules.mk
 
-PKG_NAME:=usteer2
+PKG_NAME:=rrmd
 PKG_RELEASE:=1
 PKG_LICENSE:=ISC
 
@@ -8,11 +8,11 @@ PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 
 include $(INCLUDE_DIR)/package.mk
 
-define Package/usteer2
+define Package/rrmd
   SECTION:=utils
   CATEGORY:=Utilities
   DEPENDS:=+ucrun
-  TITLE:=wifi client steering
+  TITLE:=radio resource management
 endef
 
 define Build/Compile/Default
@@ -20,8 +20,8 @@ define Build/Compile/Default
 endef
 Build/Compile = $(Build/Compile/Default)
 
-define Package/usteer2/install
+define Package/rrmd/install
 	$(CP) ./files/* $(1)/
 endef
 
-$(eval $(call BuildPackage,usteer2))
+$(eval $(call BuildPackage,rrmd))

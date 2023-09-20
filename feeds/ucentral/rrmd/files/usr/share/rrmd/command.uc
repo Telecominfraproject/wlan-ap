@@ -10,7 +10,7 @@ function result(error, event, text, data) {
 }
 
 const actions = {
-	// ubus call usteer2 command '{"action": "kick", "addr": "1c:57:dc:37:3c:b1", "reason": 5, "ban_time": 30 }'
+	// ubus call rrmd command '{"action": "kick", "addr": "1c:57:dc:37:3c:b1", "reason": 5, "ban_time": 30 }'
 	kick: function(msg) {
 		if (!global.station.kick(msg))
 			return result(1, msg.event, 'station ' + msg.addr + ' is unknown', { action: 'kick', addr: msg.addr });
@@ -18,9 +18,9 @@ const actions = {
 		return result(0, 0, 'station ' + msg.addr + ' was kicked', { action: 'kick', addr: msg.addr });
 	},
 
-	// ubus call usteer2 command '{"action": "beacon_request", "addr": "4e:7f:3e:2c:8a:68", "params": "channel": 1}'
-	// ubus call usteer2 command '{"action": "beacon_request", "addr": "4e:7f:3e:2c:8a:68", "params": "ssid": "Pluto" }'
-	// ubus call usteer2 get_beacon_request '{"addr": "4e:7f:3e:2c:8a:68"}'
+	// ubus call rrmd command '{"action": "beacon_request", "addr": "4e:7f:3e:2c:8a:68", "params": "channel": 1}'
+	// ubus call rrmd command '{"action": "beacon_request", "addr": "4e:7f:3e:2c:8a:68", "params": "ssid": "Pluto" }'
+	// ubus call rrmd get_beacon_request '{"addr": "4e:7f:3e:2c:8a:68"}'
 	beacon_request: function(msg) {
 		if (!global.station.beacon_request(msg))
 			return result(1, msg.event, 'station ' + msg.addr + ' is unknown', { action: 'beacon_request', addr: msg.addr });
@@ -28,7 +28,7 @@ const actions = {
 		return result(0, 0, 'station ' + msg.addr + ' beacon-request sent', { action: 'beacon_request', addr: msg.addr });
 	},
 
-	// ubus call usteer2 command '{"action": "channel_switch", "bssid": "34:eF:b6:aF:48:b1", "channel": 4 }'
+	// ubus call rrmd command '{"action": "channel_switch", "bssid": "34:eF:b6:aF:48:b1", "channel": 4 }'
 	channel_switch: function(msg) {
 		if (!global.local.switch_chan(msg))
 			return result(1, msg.event, 'BSS ' + msg.bssid + ' failed to trigger channel switch', { action: 'channel_switch', bssid: msg.bssid });
@@ -36,7 +36,7 @@ const actions = {
 		return result(0, msg.event, 'BSS ' + msg.bssid + ' triggered channel switch', { action: 'channel_switch', bssid: msg.bssid });
 	},
 
-	// ubus call usteer2 command '{"action": "tx_power", "bssid": "34:eF:b6:aF:48:b1", "level": 20}'
+	// ubus call rrmd command '{"action": "tx_power", "bssid": "34:eF:b6:aF:48:b1", "level": 20}'
 	tx_power: function(msg) {
 		if (!global.phy.txpower(msg))
 			return result(1, msg.event, 'BSS ' + msg.bssid + ' failed to set TX power', { action: 'tx_power', bssid: msg.bssid });
@@ -45,7 +45,7 @@ const actions = {
 		return result(0, msg.event, 'BSS ' + msg.bssid + ' changed TX power', { action: 'tx_power', bssid: msg.bssid, level });
 	},
 
-	// ubus call usteer2 command '{"action": "bss_transition", "addr": "4e:7f:3e:2c:8a:68", "neighbors": ["34:ef:b6:af:48:b1"] }'
+	// ubus call rrmd command '{"action": "bss_transition", "addr": "4e:7f:3e:2c:8a:68", "neighbors": ["34:ef:b6:af:48:b1"] }'
 	bss_transition: function(msg) {
 		if (!global.station.bss_transition(msg))
 			return result(1, msg.event, 'BSS transition ' + msg.addr + ' failed to trigger', { action: 'bss_transition', addr: msg.addr });
@@ -53,7 +53,7 @@ const actions = {
 		return result(0, 0, 'BSS transition ' + msg.addr + ' triggered');
 	},
 	
-	// ubus call usteer2 command '{"action": "neighbors", "neighbors": [ [ "00:11:22:33:44:55", "OpenWifi", "34efb6af48b1af4900005301070603010300" ], [ "aa:bb:cc:dd:ee:ff", "OpenWifi2", "34efb6af48b1af4900005301070603010300" ] ] }'
+	// ubus call rrmd command '{"action": "neighbors", "neighbors": [ [ "00:11:22:33:44:55", "OpenWifi", "34efb6af48b1af4900005301070603010300" ], [ "aa:bb:cc:dd:ee:ff", "OpenWifi2", "34efb6af48b1af4900005301070603010300" ] ] }'
 	neighbors: function(msg) {
 		if (!global.neighbor.remote(msg))
 			return result(1, msg.event, 'Failed to set neighbors', { action: 'neighbors' });

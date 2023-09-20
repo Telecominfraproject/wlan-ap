@@ -91,7 +91,7 @@ function hapd_subunsub(path, sub) {
 	if (!status)
 		return;
 
-	let cfg = uci.get_all('usteer2', status.uci_section);
+	let cfg = uci.get_all('rrmd', status.uci_section);
 	if (!cfg)
 		cfg = {};
 
