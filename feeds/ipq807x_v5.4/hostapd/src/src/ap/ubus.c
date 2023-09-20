@@ -153,7 +153,7 @@ hostapd_bss_ban_client(struct hostapd_data *hapd, u8 *addr, int time)
 		}
 	}
 
-	eloop_register_timeout(0, time * 1000, hostapd_bss_del_ban, ban, hapd);
+	eloop_register_timeout(time, 0, hostapd_bss_del_ban, ban, hapd);
 }
 
 static int
