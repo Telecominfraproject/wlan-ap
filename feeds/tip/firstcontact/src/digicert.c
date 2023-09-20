@@ -10,7 +10,7 @@
 static const char *file_cert = "/etc/ucentral/cert.pem";
 static const char *file_key  = "/etc/ucentral/key.pem";
 static const char *file_json = "/etc/ucentral/redirector.json";
-static const char *file_dbg  = "/tmp/firstcontact.hdr";
+static const char *file_dbg  = "/tmp/digicert.hdr";
 
 int main(int argc, char **argv)
 {
@@ -44,7 +44,7 @@ int main(int argc, char **argv)
 			break;
 		default:
 		case 'h':
-			printf("Usage: firstcontact OPTIONS\n"
+			printf("Usage: digicert OPTIONS\n"
 			       "  -k <keyfile>\n"
 			       "  -c <certfile>\n"
 			       "  -o <outfile>\n"
@@ -58,7 +58,7 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
-	ulog_open(ULOG_SYSLOG | ULOG_STDIO, LOG_DAEMON, "firstcontact");
+	ulog_open(ULOG_SYSLOG | ULOG_STDIO, LOG_DAEMON, "digicert");
 	ULOG_INFO("attempting first contact\n");
 
 	fp_dbg = fopen(file_dbg, "wb");
