@@ -1,7 +1,7 @@
 let policies = {};
 return {
 	init: function() {
-		let config = global.uci.get_all('usteer2');
+		let config = global.uci.get_all('rrmd');
 		for (let section in config) {
 			if (config[section]['.type'] != 'policy' || !config[section].name)
 				continue;

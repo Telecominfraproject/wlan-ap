@@ -1,17 +1,17 @@
 #!/usr/bin/ucrun
 
-push(REQUIRE_SEARCH_PATH, '/usr/share/usteer/*.uc');
+push(REQUIRE_SEARCH_PATH, '/usr/share/rrmd/*.uc');
 
 global.nl80211 = require("nl80211");
 global.fs = require('fs');
 
 global.ulog = {
-	identity: 'usteer',
+	identity: 'rrm',
 	channels: [ 'stdio', 'syslog' ],
 };
 
 global.ubus = {
-	object: 'usteer2',
+	object: 'rrm',
 
 	connect: function() {
 		printf('connected to ubus\n');
