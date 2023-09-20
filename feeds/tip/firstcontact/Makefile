@@ -18,7 +18,7 @@ endef
 
 define Package/firstcontact/install
 	$(INSTALL_DIR) $(1)/usr/sbin
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/firstcontact $(1)/usr/sbin/
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/digicert $(1)/usr/sbin/
 	$(CP) ./files/* $(1)
 endef
 
