@@ -6,7 +6,16 @@ let state = {};
 let hapd = {};
 let handlers = {};
 
-function channel_to_freq(band, channel) {
+function channel_to_freq(cur_freq, channel) {
+
+	let band;
+	if (cur_freq <= 2484)
+		band = '2G';
+	else if (cur_freq <= 5885)
+		band = '5G';
+	else
+		band = '6G';
+
 	if (band == '2G' && channel >= 1 && channel <= 13)
 		return 2407 + channel * 5;
 	else if (band == '2G' && channel == 14)
@@ -58,23 +67,6 @@ function hapd_update() {
 	return 5000;
 }
 
-function hapd_nr_set(iface) {
-	let list = [];
-	for (let k, v in hapd) {
-		if (k == iface || v.ssid != hapd[iface].ssid)
-			continue;
-		push(list, v.rrm_nr);
-
-		global.ubus.conn.call('hostapd.' + iface, 'rrm_nr_set', { list }); 
-	}
-}
-
-function hapd_nr_update(ssid) {
-	for (let k, v in hapd)
-		if (v.ssid == ssid)
-			hapd_nr_set(k);
-}
-
 function hapd_subunsub(path, sub) {
 	/* check if this is a hostapd instance */
 	let name = split(path, '.');
@@ -88,6 +80,7 @@ function hapd_subunsub(path, sub) {
 	/* the hostapd instance disappeared */
 	if (!sub) {
 		global.event.send('rrm.bss.del', { bssid: hapd[name] });
+		global.neighbor.local_del(name);
 		delete hapd[name];
 		delete state[name];
 		return;
@@ -122,14 +115,15 @@ function hapd_subunsub(path, sub) {
 
 	/* ask hostapd for the local neighbourhood report data */
 	let rrm = global.ubus.conn.call(path, 'rrm_nr_get_own');
-	if (rrm && rrm.value)
+	if (rrm && rrm.value) {
 		hapd[name].rrm_nr = rrm.value;
+		global.neighbor.local_add(name, rrm.value);
+	}
 
+	global.neighbor.update();
+	
 	/* trigger an initial channel survey */
-	channel_survey(name);
-
-	/* update the neighborhood reports */
-	hapd_nr_update(hapd[name].ssid);
+	//channel_survey(name);
 
 	/* send an event */
 	global.event.send('rrm.bss.add', {
@@ -137,7 +131,8 @@ function hapd_subunsub(path, sub) {
 		ssid: hapd[name].ssid,
 		freq: hapd[name].freq,
 		channel: hapd[name].channel,
-		op_class: hapd[name].op_class
+		op_class: hapd[name].op_class,
+		rrm_nr: hapd[name].rrm_nr,
 	});
 }
 
@@ -169,6 +164,10 @@ function ucentral_handle_event(req) {
 	printf('%.J\n', req);
 }
 
+function channel_switch_handler(type, data) {
+	global.event.send('rrm.bss.channel-switch', { bssid: data.bssid, freq: data.freq });
+}
+
 return {
 	status: function() {
 		return hapd;
@@ -193,7 +192,8 @@ return {
 				ucentral_subunsub(true);
 		}
 
-		uloop_timeout(hapd_update, 5000);
+//		uloop_timeout(hapd_update, 5000);
+		global.local.register_handler('channel-switch', channel_switch_handler);
 	},
 
 	register_handler: function(event, handler) {
@@ -203,16 +203,36 @@ return {
 	},
 
 	switch_chan: function(msg) {
-		if (!msg.addr || !msg.params?.band || !msg.params?.channel)
+		if (!msg.bssid || !msg.channel)
 			return false;
 		for (let bss, v in hapd) {
-			if (v.bssid != lc(msg.addr))
+			if (v.bssid != lc(msg.bssid))
 				continue;
 			return global.ubus.conn.call('hostapd.' + bss, 'switch_chan', {
-				freq: channel_to_freq(msg.param.band, mag.param.channel),
+				freq: channel_to_freq(v.freq, msg.channel),
 				bcn_count: 10
 			}) == null;
 		}
 		return false;
+	},
+
+	bssid_to_phy: function(bssid) {
+		for (let bss, v in hapd) {
+			if (v.bssid != lc(bssid))
+				continue;
+			let iface = global.nl80211.request(global.nl80211.const.NL80211_CMD_GET_INTERFACE, 0, { dev: bss });
+			return iface.wiphy;
+		}
+		return -1;
+	},
+
+	txpower: function(bssid) {
+		for (let bss, v in hapd) {
+			if (v.bssid != lc(bssid))
+				continue;
+			let iface = global.nl80211.request(global.nl80211.const.NL80211_CMD_GET_INTERFACE, 0, { dev: bss });
+			return iface.wiphy_tx_power_level;
+		}
+		return 0;
 	},
 };

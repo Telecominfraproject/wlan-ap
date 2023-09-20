@@ -1,0 +1,285 @@
+From 4e4128e44fcb6c0f444e4aa481eb8941f47a801a Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Fri, 15 Sep 2023 20:47:10 +0200
+Subject: [PATCH] netifd: add support for enabling/disabling wifi interfaces
+ via ifup/ifdown
+
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+---
+ package/network/config/netifd/files/sbin/ifup |  33 ---
+ .../patches/410-wireless_network_state.patch  | 194 ++++++++++++++++++
+ 2 files changed, 194 insertions(+), 33 deletions(-)
+ create mode 100644 package/network/config/netifd/patches/410-wireless_network_state.patch
+
+diff --git a/package/network/config/netifd/files/sbin/ifup b/package/network/config/netifd/files/sbin/ifup
+index 15be535bbfc9..fbf2fd80c7ea 100755
+--- a/package/network/config/netifd/files/sbin/ifup
++++ b/package/network/config/netifd/files/sbin/ifup
+@@ -1,7 +1,6 @@
+ #!/bin/sh
+ 
+ ifup_all=
+-setup_wifi=
+ 
+ if_call() {
+ 	local interface="$1"
+@@ -14,7 +13,6 @@ case "$0" in
+ 	*ifdown) modes=down;;
+ 	*ifup)
+ 		modes="down up"
+-		setup_wifi=1
+ 	;;
+ 	*) echo "Invalid command: $0";;
+ esac
+@@ -25,10 +23,6 @@ while :; do
+ 			ifup_all=1
+ 			shift
+ 		;;
+-		-w)
+-			setup_wifi=
+-			shift
+-		;;
+ 		*)
+ 			break
+ 		;;
+@@ -40,7 +34,6 @@ if [ -n "$ifup_all" ]; then
+ 	for interface in $(ubus -S list 'network.interface.*'); do
+ 		if_call "${interface##network.interface.}"
+ 	done
+-	[ -n "$setup_wifi" ] && /sbin/wifi up
+ 	exit
+ else
+ 	ubus -S list "network.interface.$1" > /dev/null || {
+@@ -49,29 +42,3 @@ else
+ 	}
+ 	if_call "$1"
+ fi
+-
+-if [ -n "$setup_wifi" ] && grep -sq config /etc/config/wireless; then
+-	. /lib/functions.sh
+-
+-	find_related_radios() {
+-		local wdev wnet
+-		config_get wdev "$1" device
+-		config_get wnet "$1" network
+-
+-		if [ -n "$wdev" ]; then
+-			for wnet in $wnet; do
+-				if [ "$wnet" = "$network" ]; then
+-					append radio_devs "$wdev" "$N"
+-				fi
+-			done
+-		fi
+-	}
+-
+-	network="$1"
+-	config_load wireless
+-	config_foreach find_related_radios wifi-iface
+-
+-	for dev in $(echo "$radio_devs" | sort -u); do
+-		/sbin/wifi up "$dev"
+-	done
+-fi
+diff --git a/package/network/config/netifd/patches/410-wireless_network_state.patch b/package/network/config/netifd/patches/410-wireless_network_state.patch
+new file mode 100644
+index 000000000000..4e9b905190b6
+--- /dev/null
++++ b/package/network/config/netifd/patches/410-wireless_network_state.patch
+@@ -0,0 +1,194 @@
++--- a/config.c
+++++ b/config.c
++@@ -784,7 +784,7 @@ config_init_all(void)
++ 	vlist_flush(&interfaces);
++ 	interface_refresh_assignments(false);
++ 	interface_start_pending();
++-	wireless_start_pending();
+++	wireless_start_pending(0);
++ 
++ 	return ret;
++ }
++--- a/interface.c
+++++ b/interface.c
++@@ -25,6 +25,7 @@
++ #include "ubus.h"
++ #include "config.h"
++ #include "system.h"
+++#include "wireless.h"
++ 
++ struct vlist_tree interfaces;
++ static LIST_HEAD(iface_all_users);
++@@ -1125,6 +1126,7 @@ interface_set_up(struct interface *iface
++ 	const char *error = NULL;
++ 
++ 	iface->autostart = true;
+++	wireless_check_network_enabled();
++ 
++ 	if (iface->state != IFS_DOWN)
++ 		return;
++@@ -1157,6 +1159,7 @@ interface_set_down(struct interface *ifa
++ 			__interface_set_down(iface, false);
++ 	} else {
++ 		iface->autostart = false;
+++		wireless_check_network_enabled();
++ 		__interface_set_down(iface, false);
++ 	}
++ }
++--- a/wireless.c
+++++ b/wireless.c
++@@ -198,6 +198,9 @@ prepare_config(struct wireless_device *w
++ 
++ 	l = blobmsg_open_table(&b, "interfaces");
++ 	vlist_for_each_element(&wdev->interfaces, vif, node) {
+++		if (vif->disabled)
+++			continue;
+++
++ 		i = blobmsg_open_table(&b, vif->name);
++ 		vif_config_add_bridge(&b, vif->network, up);
++ 		put_container(&b, vif->config, "config");
++@@ -438,6 +441,8 @@ wireless_device_run_handler(struct wirel
++ 		wdev->prev_config = NULL;
++ 	} else {
++ 		prepare_config(wdev, &b, up);
+++		free(wdev->prev_config);
+++		wdev->prev_config = up ? blob_memdup(b.head) : NULL;
++ 		config = blobmsg_format_json(b.head, true);
++ 	}
++ 
++@@ -495,8 +500,6 @@ __wireless_device_set_up(struct wireless
++ 	if ((!force && wdev->state != IFS_DOWN) || config_init)
++ 		return;
++ 
++-	free(wdev->prev_config);
++-	wdev->prev_config = NULL;
++ 	wdev->state = IFS_SETUP;
++ 	wireless_device_run_handler(wdev, true);
++ }
++@@ -690,16 +693,6 @@ wdev_set_config_state(struct wireless_de
++ }
++ 
++ static void
++-wdev_prepare_prev_config(struct wireless_device *wdev)
++-{
++-	if (wdev->prev_config)
++-		return;
++-
++-	prepare_config(wdev, &b, false);
++-	wdev->prev_config = blob_memdup(b.head);
++-}
++-
++-static void
++ wdev_change_config(struct wireless_device *wdev, struct wireless_device *wd_new)
++ {
++ 	struct blob_attr *new_config = wd_new->config;
++@@ -709,7 +702,6 @@ wdev_change_config(struct wireless_devic
++ 	wdev->serialize = wd_new->serialize;
++ 	free(wd_new);
++ 
++-	wdev_prepare_prev_config(wdev);
++ 	if (blob_attr_equal(wdev->config, new_config) && wdev->disabled == disabled)
++ 		return;
++ 
++@@ -1533,19 +1525,78 @@ wireless_device_notify(struct wireless_d
++ 	return 0;
++ }
++ 
++-/* called on startup and by netifd reload() */
++-void
++-wireless_start_pending(void)
+++static void
+++wdev_check_network_enabled(struct wireless_device *wdev)
+++{
+++	struct wireless_interface *vif;
+++	struct interface *iface;
+++	struct blob_attr *cur;
+++	int rem;
+++
+++	vlist_for_each_element(&wdev->interfaces, vif, node) {
+++		int enabled = -1;
+++
+++		blobmsg_for_each_attr(cur, vif->network, rem) {
+++			iface = vlist_find(&interfaces, blobmsg_get_string(cur), iface, node);
+++			if (!iface)
+++				continue;
+++
+++			if (iface->autostart) {
+++				enabled = 1;
+++				break;
+++			}
+++			if (enabled != 1)
+++				enabled = 0;
+++		}
+++
+++		if (vif->disabled == !enabled)
+++			continue;
+++
+++		vif->disabled = !enabled;
+++		wdev->config_update = true;
+++	}
+++}
+++
+++static void
+++__wireless_start_pending(struct uloop_timeout *t)
++ {
++ 	struct wireless_device *wdev;
++ 
++ 	vlist_for_each_element(&wireless_devices, wdev, node) {
+++		wdev_check_network_enabled(wdev);
++ 		if (wdev->config_update)
++ 			wdev_set_config_state(wdev, IFC_RELOAD);
++ 		__wireless_device_set_up(wdev, 0);
++ 	}
++ }
++ 
+++void wireless_start_pending(int timeout)
+++{
+++	static struct uloop_timeout timer = {
+++		.cb = __wireless_start_pending
+++	};
+++
+++	if (timeout) {
+++		uloop_timeout_set(&timer, timeout);
+++		return;
+++	}
+++
+++	uloop_timeout_cancel(&timer);
+++	timer.cb(&timer);
+++}
+++
+++void wireless_check_network_enabled(void)
+++{
+++	struct wireless_device *wdev;
+++
+++	vlist_for_each_element(&wireless_devices, wdev, node) {
+++		wdev_check_network_enabled(wdev);
+++
+++		if (wdev->config_update)
+++			wireless_start_pending(1000);
+++	}
+++}
+++
++ void wireless_device_hotplug_event(const char *name, bool add)
++ {
++ 	struct wireless_interface *vif;
++--- a/wireless.h
+++++ b/wireless.h
++@@ -94,6 +94,7 @@ struct wireless_interface {
++ 	int multicast_to_unicast;
++ 	int vlan_idx;
++ 	int sta_idx;
+++	bool disabled;
++ };
++ 
++ struct wireless_vlan {
++@@ -142,7 +143,8 @@ void wireless_station_create(struct wire
++ int wireless_device_notify(struct wireless_device *wdev, struct blob_attr *data,
++ 			   struct ubus_request_data *req);
++ 
++-void wireless_start_pending(void);
+++void wireless_check_network_enabled(void);
+++void wireless_start_pending(int timeout);
++ void wireless_init(void);
++ void wireless_device_hotplug_event(const char *name, bool add);
++ 
+-- 
+2.39.2
+
