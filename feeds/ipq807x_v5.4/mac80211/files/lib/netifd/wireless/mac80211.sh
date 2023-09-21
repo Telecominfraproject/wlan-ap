@@ -488,6 +488,7 @@ ${channel:+channel=$channel}
 ${channel_list:+chanlist=$channel_list}
 ${hostapd_noscan:+noscan=1}
 ${tx_burst:+tx_queue_data2_burst=$tx_burst}
+#num_global_macaddr=$num_global_macaddr
 $base_cfg
 
 EOF
@@ -528,6 +529,7 @@ mac80211_hostapd_setup_bss() {
 	cat >> /var/run/hostapd-$phy.conf <<EOF
 $hostapd_cfg
 bssid=$macaddr
+${default_macaddr:+#default_macaddr}
 ${dtim_period:+dtim_period=$dtim_period}
 ${max_listen_int:+max_listen_interval=$max_listen_int}
 EOF
@@ -542,57 +544,9 @@ mac80211_get_addr() {
 
 mac80211_generate_mac() {
 	local phy="$1"
-	local multiple_bssid="$2"
 	local id="${macidx:-0}"
 
-	local ref="$(cat /sys/class/ieee80211/${phy}/macaddress)"
-	local mask="$(cat /sys/class/ieee80211/${phy}/address_mask)"
-
-	[ "$mask" = "00:00:00:00:00:00" -a "$multiple_bssid" != 1 ] && {
-		mask="ff:ff:ff:ff:ff:ff";
-
-		[ "$(wc -l < /sys/class/ieee80211/${phy}/addresses)" -gt $id ] && {
-			addr="$(mac80211_get_addr "$phy" "$id")"
-			[ -n "$addr" ] && {
-				echo "$addr"
-				return
-			}
-		}
-	}
-
-	local oIFS="$IFS"; IFS=":"; set -- $mask; IFS="$oIFS"
-
-	local mask1=$1
-	local mask6=$6
-
-	local oIFS="$IFS"; IFS=":"; set -- $ref; IFS="$oIFS"
-	[ "$multiple_bssid" -eq 1 ] && {
-               printf "02:%s:%s:%s:%s:%02x" $b1 $2 $3 $4 $5 $macidx
-               return
-    }
-	macidx=$(($id + 1))
-
-	local use_global=0
-	[ "$id" -gt 0 -a "$macidx" -le "$num_global_macaddr" ] && use_global=1
-
-	[ "$((0x$mask1))" -gt 0 -a "$use_global" -lt 1 ] && {
-		b1="0x$1"
-		[ "$id" -gt 0 ] && \
-			b1=$(($b1 ^ ((($id - !($b1 & 2)) << 2)) | 0x2))
-		printf "%02x:%s:%s:%s:%s:%s" $b1 $2 $3 $4 $5 $6
-		return
-	}
-
-	[ "$((0x$mask6))" -lt 255 -a "$use_global" -gt 0 ] && {
-		printf "%s:%s:%s:%s:%s:%02x" $1 $2 $3 $4 $5 $(( 0x$6 ^ $id ))
-		return
-	}
-
-	off2=$(( (0x$6 + $id) / 0x100 ))
-	printf "%s:%s:%s:%s:%02x:%02x" \
-		$1 $2 $3 $4 \
-		$(( (0x$5 + $off2) % 0x100 )) \
-		$(( (0x$6 + $id) % 0x100 ))
+	wdev_tool "$phy" get_macaddr id=$id num_global=$num_global_macaddr mbssid=$multiple_bssid
 }
 
 find_phy() {
@@ -626,11 +580,14 @@ mac80211_prepare_vif() {
 	set_default powersave 0
 	json_add_string _ifname "$ifname"
 
+	default_macaddr=
 	[ -n "$macaddr" ] || {
-		macaddr="$(mac80211_generate_mac $phy $multiple_bssid)"
+		macaddr="$(mac80211_generate_mac $phy)"
  		macidx="$(($macidx + 1))"
+		default_macaddr=1
 	}
 	json_add_string _macaddr "$macaddr"
+	json_add_string _default_macaddr "$default_macaddr"
 	json_select ..
 
 
@@ -754,7 +711,7 @@ mac80211_setup_adhoc() {
 
 	json_add_object "$ifname"
 	json_add_string mode adhoc
-	json_add_string macaddr "$macaddr"
+	[ -n "$default_macaddr" ] || json_add_string macaddr "$macaddr"
 	json_add_string ssid "$ssid"
 	json_add_string freq "$freq"
 	json_add_string htmode "$iw_htmode"
@@ -780,7 +737,7 @@ mac80211_setup_mesh() {
 
 	json_add_object "$ifname"
 	json_add_string mode mesh
-	json_add_string macaddr "$macaddr"
+	[ -n "$default_macaddr" ] || json_add_string macaddr "$macaddr"
 	json_add_string ssid "$ssid"
 	json_add_string freq "$freq"
 	json_add_string htmode "$iw_htmode"
@@ -831,7 +788,6 @@ wpa_supplicant_init_config() {
 wpa_supplicant_add_interface() {
 	local ifname="$1"
 	local mode="$2"
-	local hostapd_ctrl="$3"
 	local prev
 
 	_wpa_supplicant_common "$ifname"
@@ -843,9 +799,8 @@ wpa_supplicant_add_interface() {
 	json_add_string iface "$ifname"
 	json_add_string mode "$mode"
 	json_add_string config "$_config"
-	json_add_string macaddr "$macaddr"
+	[ -n "$default_macaddr" ] || json_add_string macaddr "$macaddr"
 	[ -n "$network_bridge" ] && json_add_string bridge "$network_bridge"
-	[ -n "$hostapd_ctrl" ] && json_add_string hostapd_ctrl "$hostapd_ctrl"
 	[ -n "$wds" ] && json_add_boolean 4addr "$wds"
 	json_add_boolean powersave "$powersave"
 	[ "$mode" = "mesh" ] && mac80211_add_mesh_params
@@ -920,7 +875,7 @@ mac80211_setup_supplicant() {
 		wpa_supplicant_add_network "$ifname" "$freq" "$htmode" "$noscan"
 	fi
 
-	wpa_supplicant_add_interface "$ifname" "$mode" "$hostapd_ctrl"
+	wpa_supplicant_add_interface "$ifname" "$mode"
 
 	return 0
 }
@@ -932,6 +887,7 @@ mac80211_setup_vif() {
 	json_select config
 	json_get_var ifname _ifname
 	json_get_var macaddr _macaddr
+	json_get_var default_macaddr _default_macaddr
 	json_get_vars mode wds powersave
 
 	set_default powersave 0
@@ -1014,7 +970,7 @@ mac80211_reset_config() {
 	hostapd_conf_file="/var/run/hostapd-$phy.conf"
 	ubus call hostapd config_set '{ "phy": "'"$phy"'", "config": "", "prev_config": "'"$hostapd_conf_file"'" }' > /dev/null
 	ubus call wpa_supplicant config_set '{ "phy": "'"$phy"'", "config": [] }' > /dev/null
-	wdev_tool "$phy" '{}'
+	wdev_tool "$phy" set_config '{}'
 }
 
 drv_mac80211_setup() {
@@ -1116,7 +1072,7 @@ drv_mac80211_setup() {
 
 	mac80211_prepare_iw_htmode
 	active_ifnames=
-	for_each_interface "ap sta adhoc mesh monitor" mac80211_prepare_vif ${multiple_bssid}
+	for_each_interface "ap sta adhoc mesh monitor" mac80211_prepare_vif
 	for_each_interface "ap sta adhoc mesh monitor" mac80211_setup_vif
 
 	[ -x /usr/sbin/wpa_supplicant ] && wpa_supplicant_set_config "$phy"
@@ -1125,7 +1081,7 @@ drv_mac80211_setup() {
 	[ -x /usr/sbin/wpa_supplicant ] && wpa_supplicant_start "$phy"
 
 	json_set_namespace wdev_uc prev
-	wdev_tool "$phy" "$(json_dump)" $active_ifnames
+	wdev_tool "$phy" set_config "$(json_dump)" $active_ifnames
 	json_set_namespace "$prev"
 
 	for_each_interface "ap sta adhoc mesh monitor" mac80211_set_vif_txpower

@@ -725,8 +725,7 @@ hostapd_set_bss_options() {
 		[ -n "$wpa_strict_rekey" ] && append bss_conf "wpa_strict_rekey=$wpa_strict_rekey" "$N"
 	}
 
-	set_default nasid "${macaddr//\:}"
-	append bss_conf "nas_identifier=$nasid" "$N"
+	[ -n "$nasid" ] && append bss_conf "nas_identifier=$nasid" "$N"
 
 	[ -n "$acct_server" ] && {
 		append bss_conf "acct_server_addr=$acct_server" "$N"
@@ -772,9 +771,9 @@ hostapd_set_bss_options() {
 			# Here we make the assumption that if we're in open mode
 			# with WPS enabled, we got to be in unconfigured state.
 			wps_not_configured=1
+			vlan_possible=1
 			[ "$macfilter" = radius ] && {
 				append_radius_server
-				vlan_possible=1
 			}
 		;;
 		psk|sae|psk-sae)

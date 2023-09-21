@@ -164,7 +164,7 @@ return {
 	},
 
 	beacon_request: function(msg) {
-		if (!msg.addr || (!msg.params?.channel && !msg.params?.ssid))
+		if (!msg.addr || (!msg.channel && !msg.ssid))
 			return false;
 
 		let station = stations[msg.addr];
@@ -185,20 +185,20 @@ return {
 		let payload = {
 			addr: msg.addr,
 			mode: msg.params?.mode || 1,
-			op_class: msg.params?.op_class || 128,
-			duration: msg.params?.duration || 100,
+			op_class: msg.op_class || 128,
+			duration: msg.duration || 100,
 		};
-		if (msg.params.channel)
-			payload.channel = msg.params.channel;
+		if (msg.channel)
+			payload.channel = msg.channel;
 		else
-			payload.ssid = msg.params.ssid;
+			payload.ssid = msg.ssid;
 		global.ubus.conn.call(`hostapd.${station.device}`, 'rrm_beacon_req', payload);
 
 		return true;
 	},
 
 	kick: function(msg) {
-		if (!msg.addr || !msg.params?.ban_time || !msg.params?.reason)
+		if (!msg.addr || !msg.ban_time || !msg.reason)
 			return false;
 
 		if (!exists(stations, msg.addr))
@@ -206,9 +206,9 @@ return {
 
 		let payload = {
 			addr: msg.addr,
-			reason: msg.params.reason,
+			reason: msg.reason,
 			deauth: 1,
-			ban_time: msg.params.ban_time
+			ban_time: msg.ban_time
 		};
 
 		/* tell hostapd to kick a station via ubus */
@@ -223,17 +223,16 @@ return {
 		return stations;
 	},
 
-	// ubus call usteer2 command '{"action": "bss_transition", "addr": "4e:7f:3e:2c:8a:68", "params": { "neighbors": ["36:ef:b6:af:48:b1"]}}'
 	bss_transition: function(msg) {
-		if (!msg.addr || !msg.params?.neighbors)
+		if (!msg.addr || !msg.neighbors)
 			return false;
 		if (!stations[msg.addr])
 			return false;
 
 		let neighbors = [];
 		for (let i = 0; i < 5; i++)
-			if (msg.params?.neighbors[i])
-				push(neighbors, replace(msg.params?.neighbors[i], ':', ''));
+			if (msg.neighbors[i])
+				push(neighbors, replace(msg.neighbors[i], ':', ''));
 
 		let ret = global.ubus.conn.call(`hostapd.${stations[msg.addr].device}`, 'wnm_disassoc_imminent', {
 			addr: msg.addr, duration: 20, abridged: 1, neighbors }) == null;

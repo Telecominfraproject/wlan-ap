@@ -306,6 +306,39 @@ hostapd_bss_get_clients(struct ubus_context *ctx, struct ubus_object *obj,
 			blobmsg_add_u32(&b, "tx", sta_driver_data.current_tx_rate * 100);
 			blobmsg_close_table(&b, r);
 			blobmsg_add_u32(&b, "signal", sta_driver_data.signal);
+		
+			r = blobmsg_open_table(&b, "mcs");
+			if (sta_driver_data.rx_hemcs) {
+				blobmsg_add_u32(&b, "he", 1);
+				blobmsg_add_u32(&b, "rx", sta_driver_data.rx_hemcs);
+				blobmsg_add_u32(&b, "tx", sta_driver_data.tx_hemcs);
+			} else if (sta_driver_data.rx_vhtmcs) {
+				blobmsg_add_u32(&b, "vht", 1);
+				blobmsg_add_u32(&b, "rx", sta_driver_data.rx_vhtmcs);
+				blobmsg_add_u32(&b, "tx", sta_driver_data.tx_vhtmcs);
+			} else {
+				blobmsg_add_u32(&b, "rx", sta_driver_data.rx_mcs);
+				blobmsg_add_u32(&b, "tx", sta_driver_data.tx_mcs);
+			}
+			blobmsg_close_table(&b, r);
+
+			r = blobmsg_open_table(&b, "nss");
+			if (sta_driver_data.rx_he_nss) {
+				blobmsg_add_u32(&b, "he", 1);
+				blobmsg_add_u32(&b, "rx", sta_driver_data.rx_he_nss);
+				blobmsg_add_u32(&b, "tx", sta_driver_data.tx_he_nss);
+			} else if (sta_driver_data.rx_vht_nss) {
+				blobmsg_add_u32(&b, "vht", 1);
+				blobmsg_add_u32(&b, "rx", sta_driver_data.rx_vht_nss);
+				blobmsg_add_u32(&b, "tx", sta_driver_data.tx_vht_nss);
+			} else {
+				blobmsg_add_u32(&b, "rx", sta_driver_data.rx_mcs);
+				blobmsg_add_u32(&b, "tx", sta_driver_data.tx_mcs);
+			}
+			blobmsg_close_table(&b, r);
+		
+			if (sta->signal_mgmt)
+				blobmsg_add_u32(&b, "signal_mgmt", sta->signal_mgmt);
 		}
 
 		hostapd_parse_capab_blobmsg(sta);
@@ -423,6 +456,12 @@ hostapd_bss_get_status(struct ubus_context *ctx, struct ubus_object *obj,
 	blobmsg_add_u32(&b, "cac_seconds_left",
 			hapd->iface->cac_started ? hapd->iface->dfs_cac_ms / 1000 - now.sec : 0);
 	blobmsg_close_table(&b, dfs_table);
+
+	if (hapd->conf->uci_section)
+		blobmsg_add_string(&b, "uci_section", hapd->conf->uci_section);
+
+	if (hapd->signal_mgmt)
+		blobmsg_add_u32(&b, "signal_mgmt", hapd->signal_mgmt);
 
 	ubus_send_reply(ctx, req, b.head);
 
@@ -1696,6 +1735,19 @@ void hostapd_ubus_notify(struct hostapd_data *hapd, const char *type, const u8 *
 	blobmsg_add_string(&b, "ifname", hapd->conf->iface);
 
 	ubus_notify(ctx, &hapd->ubus.obj, type, b.head, -1);
+}
+
+void hostapd_ubus_notify_csa(struct hostapd_data *hapd, int freq)
+{
+	if (!hapd->ubus.obj.has_subscribers)
+		return;
+
+	blob_buf_init(&b, 0);
+	blobmsg_add_string(&b, "ifname", hapd->conf->iface);
+	blobmsg_add_u32(&b, "freq", freq);
+	blobmsg_printf(&b, "bssid", MACSTR, MAC2STR(hapd->conf->bssid));
+
+	ubus_notify(ctx, &hapd->ubus.obj, "channel-switch", b.head, -1);
 }
 
 
