@@ -4,10 +4,10 @@ PKG_NAME:=ucentral-schema
 PKG_RELEASE:=1
 
 PKG_SOURCE_URL=https://github.com/Telecominfraproject/wlan-ucentral-schema.git
-PKG_MIRROR_HASH:=62571bb529e8b350bafdc63db3d7e02effa3edf5e5f19bfe8ced96c7cfb08b0e
+PKG_MIRROR_HASH:=9cbad2ebd2e43c06ebda8c1efecf4218193ea64bedf0fc1dea3d442c6b14ab2d
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2022-05-29
-PKG_SOURCE_VERSION:=e99eaf9bdbbe68639b4632d7fec171d89c379dc5
+PKG_SOURCE_VERSION:=ec6331b78105ea6f7d780fd9dcbccdf0ef9be2d4
 
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=BSD-3-Clause
@@ -38,6 +38,7 @@ define Package/ucentral-schema/install
 	$(CP) $(PKG_BUILD_DIR)/command/*.uc $(1)/usr/share/ucentral
 	$(CP) $(PKG_BUILD_DIR)/system/*.uc $(1)/usr/share/ucentral
 	$(CP) ./files/* $(1)
+	$(CP) $(PKG_BUILD_DIR)/ucentral.schema.pretty.json $(OUTPUT_DIR)
 endef
 
 define Package/ucentral-recovery/install
