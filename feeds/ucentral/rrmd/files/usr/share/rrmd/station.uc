@@ -29,17 +29,33 @@ function station_add(device, addr, data, seen, bssid) {
 			beacon_report: {},
 		};
 
+		if (config.beacon_request_assoc)
+			stations[addr].beacon_request_assoc = time();
 	}
 
 	/* update device, seen and signal data */
 	stations[addr].device = device;
 	stations[addr].seen = seen;
+	stations[addr].ssid = global.local.interfaces[device].ssid;
+	stations[addr].channel = global.local.interfaces[device].channel;
+	stations[addr].op_class = global.local.interfaces[device].op_class;
 	if (data.signal)
 		stations[addr].signal = data.signal;
 
 	/* if the station just joined, send an event */
 	if (add)
 		global.event.send('rrm.station.add', { addr, rrm: stations[addr].rrm, bssid });
+
+	/* check if a beacon_report should be triggered */
+	if (stations[addr].beacon_request_assoc && time() - stations[addr].beacon_request_assoc >= 30) {
+		global.station.beacon_request({ addr, channel: stations[addr].channel});
+		stations[addr].beacon_request_assoc = 0;	
+	}
+
+	if (stations[addr].beacon_report_seen && time() - stations[addr].beacon_report_seen > 3) {
+		global.event.send('rrm.beacon.report', { addr, report: stations[addr].beacon_report });
+		stations[addr].beacon_report_seen = 0;
+	}
 }
 
 function station_del(addr) {
@@ -90,11 +106,15 @@ function beacon_report(type, report) {
 	/* make sure that the station exists */
 	if (!stations[report.address]) {
 		ulog_err(`beacon report on unknown station ${report.address}\n`);
-		return false;
+		return true;
 	}
+
+	if (stations[report.address].beacon_report[report.bssid])
+		return true;
 
 	/* store the report */
 	let payload = {
+		addr: report.address,
 		bssid: report.bssid,
 		seen: time(),
 		channel: report.channel,
@@ -102,7 +122,7 @@ function beacon_report(type, report) {
 		rsni: report.rsni,
 	};
 	stations[report.address].beacon_report[report.bssid] = payload;
-	global.event.send('rrm.beacon.report', payload);
+	stations[report.address].beacon_report_seen = time();;
 }
 
 function probe_handler(type, data) {
@@ -122,6 +142,7 @@ function disassoc_handler(type, data) {
 }
 
 return {
+	stations,
 	init: function() {
 		/* register the mgmt frame handlers */
 		global.local.register_handler('beacon-report', beacon_report);
@@ -164,7 +185,7 @@ return {
 	},
 
 	beacon_request: function(msg) {
-		if (!msg.addr || (!msg.channel && !msg.ssid))
+		if (!msg.addr)
 			return false;
 
 		let station = stations[msg.addr];
@@ -184,13 +205,12 @@ return {
 		station.beacon_report = {};
 		let payload = {
 			addr: msg.addr,
-			mode: msg.params?.mode || 1,
-			op_class: msg.op_class || 128,
+			mode: msg.mode || 1,
+			op_class: station.op_class || 128,
 			duration: msg.duration || 100,
+			channel: (msg.channel == null) ? station.channel : msg.channel,
 		};
-		if (msg.channel)
-			payload.channel = msg.channel;
-		else
+		if (msg.ssid)
 			payload.ssid = msg.ssid;
 		global.ubus.conn.call(`hostapd.${station.device}`, 'rrm_beacon_req', payload);
 
@@ -237,5 +257,8 @@ return {
 		let ret = global.ubus.conn.call(`hostapd.${stations[msg.addr].device}`, 'wnm_disassoc_imminent', {
 			addr: msg.addr, duration: 20, abridged: 1, neighbors }) == null;
 		return ret;
+	},
+
+	reload: function() {
 	},
 };
