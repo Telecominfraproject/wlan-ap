@@ -3,6 +3,7 @@
 push(REQUIRE_SEARCH_PATH, '/usr/share/rrmd/*.uc');
 
 global.nl80211 = require("nl80211");
+global.uloop = require("uloop");
 global.fs = require('fs');
 
 global.ulog = {
@@ -60,6 +61,20 @@ global.ubus = {
 				return global.policy.status(msg);
 			},
 		},
+
+		reload: {
+			cb: function(msg) {
+				global.config.init();
+				for (let module in [ 'local', 'station' ])
+					global[module].reload();
+			},
+		},
+
+		scan_dump: {
+			cb: function(msg) {
+				return global.scan.beacons;
+			},
+		},
 	},
 };
 
@@ -68,7 +83,7 @@ global.start = function() {
 		global.uci = require('uci').cursor();
 		global.ubus.conn = require('ubus').connect();
 
-		for (let module in [ 'config', 'event', 'phy', 'neighbor', 'local', 'station', 'command', 'policy' ]) {
+		for (let module in [ 'config', 'event', 'phy', 'scan', 'neighbor', 'local', 'station', 'command', 'policy' ]) {
 			printf('loading ' + module + '\n');
 			global[module] = require(module);
 			if (exists(global[module], 'init'))

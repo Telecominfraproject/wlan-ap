@@ -1,6 +1,8 @@
 let uci = require("uci");
 let cursor = uci ? uci.cursor() : null;
 
+const SCAN_FLAG_AP = (1<<2);
+
 function freq2channel(freq) {
 	if (freq == 2484)
 		return 14;
@@ -76,7 +78,7 @@ function lookup_phys() {
 		if (!path)
 			continue;
 
-		let p = { phyname, index: phy.wiphy };
+		let p = { path, phyname, index: phy.wiphy };
 		p.htmode = [];
 		p.band = [];
 		for (let band in phy.wiphy_bands) {
@@ -129,7 +131,7 @@ function lookup_phys() {
 		p.band = uniq(p.band);
 		if (!length(p.dfs_channels))
 			delete p.dfs_channels;
-		ret[path] = p;
+		ret[phyname] = p;
 	}
 	return ret;
 }
