@@ -305,6 +305,8 @@ hostapd_bss_get_clients(struct ubus_context *ctx, struct ubus_object *obj,
 			blobmsg_add_u32(&b, "rx", sta_driver_data.current_rx_rate * 100);
 			blobmsg_add_u32(&b, "tx", sta_driver_data.current_tx_rate * 100);
 			blobmsg_close_table(&b, r);
+			blobmsg_add_u32(&b, "retries", sta_driver_data.tx_retry_count);
+			blobmsg_add_u32(&b, "failed", sta_driver_data.tx_retry_failed);
 			blobmsg_add_u32(&b, "signal", sta_driver_data.signal);
 		
 			r = blobmsg_open_table(&b, "mcs");
