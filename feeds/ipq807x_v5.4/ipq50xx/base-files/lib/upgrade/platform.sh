@@ -71,7 +71,7 @@ platform_check_image() {
 	cig,wf186w|\
 	edgecore,eap104|\
 	hfcl,ion4xi_w|\
-	yuncore,fap655|\	
+	yuncore,fap655|\
 	edgecore,oap101|\
 	edgecore,oap101-6e|\
 	edgecore,oap101e|\
