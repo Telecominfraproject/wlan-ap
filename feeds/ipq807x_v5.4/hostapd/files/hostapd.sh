@@ -794,6 +794,9 @@ hostapd_set_bss_options() {
 			[ "$eapol_version" -ge "1" -a "$eapol_version" -le "2" ] && append bss_conf "eapol_version=$eapol_version" "$N"
 
 			set_default dynamic_vlan 0
+			[ "$macfilter" = radius ] && {
+				append_radius_server
+			}
 			vlan_possible=1
 			wps_possible=1
 		;;
