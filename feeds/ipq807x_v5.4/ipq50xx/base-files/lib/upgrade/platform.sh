@@ -92,9 +92,7 @@ platform_do_upgrade() {
 	edgecore,oap101|\
 	edgecore,oap101-6e|\
 	edgecore,oap101e|\
-	edgecore,oap101e-6e)
-		nand_upgrade_tar "$1"
-		;;
+	edgecore,oap101e-6e|\
 	edgecore,eap104)
 		CI_UBIPART="rootfs1"
 		[ "$(find_mtd_chardev rootfs)" ] && CI_UBIPART="rootfs"
