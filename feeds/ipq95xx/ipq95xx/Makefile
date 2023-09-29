@@ -12,15 +12,16 @@ SUBTARGETS:=generic ipq95xx_32
 KERNELNAME:=zImage Image dtbs
 
 KERNEL_PATCHVER:=5.4
-KERNEL_NAME_SUFFIX=-qsdk-879aa8d1f540d2357674beed0069e4450946b831
+KERNEL_NAME_SUFFIX=-qsdk-f2ee796db820cd8261889849f043c9c816196452
 
 include $(INCLUDE_DIR)/target.mk
 DEFAULT_PACKAGES += \
 	uboot-envtools kmod-leds-gpio kmod-gpio-button-hotplug kmod-button-hotplug \
-	kmod-usb3 swconfig \
+	kmod-usb3 swconfig kmod-qca-nss-dp \
 	kmod-usb-phy-ipq807x kmod-usb-dwc3-qcom-internal \
-	kmod-qca-nss-ppe kmod-qca-ssdk-nohnat kmod-qca-psdk kmod-qca-nss-dp \
+	kmod-qca-nss-ppe kmod-qca-ssdk-nohnat kmod-qca-psdk \
 	kmod-gpio-button-hotplug iwinfo uboot-envtools swconfig \
+	kmod-ath11k-ahb ath11k-firmware-ipq95xx \
 	kmod-ath12k ath12k-firmware-qcn92xx wpad-openssl \
 	-procd-ujail
 

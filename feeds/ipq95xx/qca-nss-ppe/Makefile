@@ -6,8 +6,8 @@ PKG_SOURCE_PROTO:=git
 PKG_BRANCH:=master
 PKG_RELEASE:=2
 PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe
-PKG_MIRROR_HASH:=f3355f9e5b6635954806eb9653751ebf40a04cf7b8113c8abca17b075de30619
-PKG_VERSION:=15a863594d33ad56044d7f11905bcbb41e3eb948
+PKG_MIRROR_HASH:=754a604e282d97af3eac8b6af0a16c4fe48fdef8f04ae593d016e1f0ba9886da
+PKG_VERSION:=ffc8f2447dbb2d4a29d1fca4fad516132d5848fe
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
@@ -119,6 +119,8 @@ EXTRA_CFLAGS+= \
 	-I$(STAGING_DIR)/usr/include/qca-ssdk/fal \
 	-I$(STAGING_DIR)/usr/include/qca-ssdk/init \
 	-I$(STAGING_DIR)/usr/include/nat46 \
+	-Wno-error=unused-variable \
+
 
 ifneq ($(CONFIG_PACKAGE_kmod-qca-nss-ppe-bridge-mgr),)
 MAKE_OPTS+=bridge-mgr=y
@@ -149,6 +151,7 @@ define Build/Compile
 		EXTRA_CFLAGS="$(EXTRA_CFLAGS)" \
 		SoC="$(subtarget)" \
 		KBUILD_MODPOST_WARN=1 \
+		V=1 \
 		modules
 endef
 

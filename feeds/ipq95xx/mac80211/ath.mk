@@ -289,7 +289,7 @@ define KernelPackage/ath11k
   TITLE:=Atheros 802.11ax wireless cards support
   URL:=https://wireless.wiki.kernel.org/en/users/drivers/ath11k
   DEPENDS+= @TARGET_ipq95xx +kmod-ath +@DRIVER_11N_SUPPORT +@DRIVER_11AC_SUPPORT +@DRIVER_11W_SUPPORT \
-  	+@DRIVER_11AX_SUPPORT +HWMON:kmod-hwmon-core
+  	+@DRIVER_11AX_SUPPORT
   FILES:= \
 	$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath11k/ath11k.ko
 endef
@@ -324,7 +324,7 @@ define KernelPackage/ath12k
   TITLE:=Atheros 802.11be wireless cards support
   URL:=https://wireless.wiki.kernel.org/en/users/drivers/ath12k
   DEPENDS+= @TARGET_ipq95xx +kmod-ath +@DRIVER_11N_SUPPORT +@DRIVER_11AC_SUPPORT +@DRIVER_11W_SUPPORT \
-  	+@DRIVER_11AX_SUPPORT +HWMON:kmod-hwmon-core
+  	+@DRIVER_11AX_SUPPORT
   FILES:= \
 	$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/ath12k.ko
   AUTOLOAD:=$(call AutoProbe,ath12k)
