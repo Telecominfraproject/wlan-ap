@@ -148,7 +148,7 @@ define Build/Compile
 		M="$(PKG_BUILD_DIR)" \
 		EXTRA_CFLAGS="$(EXTRA_CFLAGS)" \
 		SoC="$(subtarget)" \
-		BUILD_MODPOST_WARN=1 \
+		KBUILD_MODPOST_WARN=1 \
 		modules
 endef
 

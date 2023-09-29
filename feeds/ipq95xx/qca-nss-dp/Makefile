@@ -25,8 +25,7 @@ define KernelPackage/qca-nss-dp
 		+TARGET_ipq53xx:kmod-qca-nss-ppe
   TITLE:=Kernel driver for NSS data plane
   FILES:=$(PKG_BUILD_DIR)/qca-nss-dp.ko
-#  AUTOLOAD:=$(call AutoLoad,31,qca-nss-dp)
-  AUTOLOAD:=$(call AutoProbe,qca-nss-dp)
+  AUTOLOAD:=$(call AutoLoad,60,qca-nss-dp)
 endef
 
 define KernelPackage/qca-nss-dp/Description
@@ -92,6 +91,7 @@ define Build/Compile
 		ARCH="$(LINUX_KARCH)" \
 		M="$(PKG_BUILD_DIR)" \
 		EXTRA_CFLAGS="$(EXTRA_CFLAGS)" SoC="$(hal_arch)" \
+		KBUILD_MODPOST_WARN=1 \
 		modules
 endef
 

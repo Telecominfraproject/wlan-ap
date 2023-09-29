@@ -725,8 +725,7 @@ hostapd_set_bss_options() {
 		[ -n "$wpa_strict_rekey" ] && append bss_conf "wpa_strict_rekey=$wpa_strict_rekey" "$N"
 	}
 
-	set_default nasid "${macaddr//\:}"
-	append bss_conf "nas_identifier=$nasid" "$N"
+	[ -n "$nasid" ] && append bss_conf "nas_identifier=$nasid" "$N"
 
 	[ -n "$acct_server" ] && {
 		append bss_conf "acct_server_addr=$acct_server" "$N"
@@ -771,8 +770,8 @@ hostapd_set_bss_options() {
 			wps_possible=1
 			# Here we make the assumption that if we're in open mode
 			# with WPS enabled, we got to be in unconfigured state.
-			vlan_possible=1
 			wps_not_configured=1
+			vlan_possible=1
 			[ "$macfilter" = radius ] && {
 				append_radius_server
 			}
@@ -795,6 +794,9 @@ hostapd_set_bss_options() {
 			[ "$eapol_version" -ge "1" -a "$eapol_version" -le "2" ] && append bss_conf "eapol_version=$eapol_version" "$N"
 
 			set_default dynamic_vlan 0
+			[ "$macfilter" = radius ] && {
+				append_radius_server
+			}
 			vlan_possible=1
 			wps_possible=1
 		;;
@@ -1202,9 +1204,6 @@ hostapd_set_bss_options() {
 	for val in $opts; do
 		append bss_conf "$val" "$N"
 	done
-
-	bss_md5sum=$(echo $bss_conf | md5sum | cut -d" " -f1)
-	append bss_conf "config_id=$bss_md5sum" "$N"
 
 	append "$var" "$bss_conf" "$N"
 	return 0

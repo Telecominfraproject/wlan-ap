@@ -20,7 +20,7 @@ define KernelPackage/nat46
   SECTION:=kernel
   SUBMENU:=Network Support
   FILES:=$(PKG_BUILD_DIR)/nat46/modules/nat46.ko
-  AUTOLOAD:=$(call AutoLoad,33,nat46)
+  AUTOLOAD:=$(call AutoLoad,29,nat46)
 endef
 
 include $(INCLUDE_DIR)/kernel-defaults.mk
