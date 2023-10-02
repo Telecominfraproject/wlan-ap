@@ -1,5 +1,20 @@
 OTHER_MENU:=Other modules
 
+define KernelPackage/switch-rtl8367c
+  SUBMENU:=$(NETWORK_DEVICES_MENU)
+  TITLE:=Realtek RTL8367C/S switch support
+  DEPENDS:=+kmod-switch-rtl8366-smi
+  KCONFIG:=CONFIG_RTL8367C_PHY=y
+  FILES:=$(LINUX_DIR)/drivers/net/phy/rtl8367c.ko
+  AUTOLOAD:=$(call AutoLoad,43,rtl8367c,1)
+endef
+
+define KernelPackage/switch-rtl8367c/description
+ Realtek RTL8367C/S switch support
+endef
+
+$(eval $(call KernelPackage,switch-rtl8367c))
+
 define KernelPackage/tpm-tis-core
   SUBMENU:=$(OTHER_MENU)
   TITLE:=TPM TIS 1.2 Interface / TPM 2.0 FIFO Interface
