@@ -251,6 +251,7 @@ nand_do_upgrade_success() {
 	[ -f "$conf_tar" ] && nand_restore_config "$conf_tar"
 	echo "sysupgrade successful"
 	umount -a
+	sleep 5
 	reboot -f
 }
 
