@@ -361,7 +361,7 @@ function accounting(interface) {
 function hapd_subscriber_notify_cb(notify) {
 	if (notify.type != 'coa')
 		return 0;
-	notify.data.address = uc(notify.data.address);
+	notify.data.address = uc(split(notify.data.address, ':')[0]);
 	let iface = interface_find(notify.data.address);
 	if (!iface)
 		return 0;
