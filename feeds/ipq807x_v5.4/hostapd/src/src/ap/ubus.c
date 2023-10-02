@@ -1638,6 +1638,7 @@ int hostapd_ubus_handle_event(struct hostapd_data *hapd, struct hostapd_ubus_req
 		[HOSTAPD_UBUS_PROBE_REQ] = "probe",
 		[HOSTAPD_UBUS_AUTH_REQ] = "auth",
 		[HOSTAPD_UBUS_ASSOC_REQ] = "assoc",
+		[HOSTAPD_UBUS_COA] = "coa",
 	};
 	const char *type = "mgmt";
 	struct ubus_event_req ureq = {};
@@ -1707,7 +1708,7 @@ int hostapd_ubus_handle_event(struct hostapd_data *hapd, struct hostapd_ubus_req
 		}
 	}
 
-	if (!hapd->ubus.notify_response) {
+	if (!hapd->ubus.notify_response && req->type != HOSTAPD_UBUS_COA) {
 		ubus_notify(ctx, &hapd->ubus.obj, type, b.head, -1);
 		return WLAN_STATUS_SUCCESS;
 	}

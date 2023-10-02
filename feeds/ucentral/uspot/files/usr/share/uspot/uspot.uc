@@ -7,6 +7,7 @@ let uloop = require('uloop');
 let ubus = require('ubus').connect();
 let uci = require('uci').cursor();
 let interfaces = {};
+let hapd_subscriber;
 
 let uciload = uci.foreach('uspot', 'uspot', (d) => {
 	if (!d[".anonymous"]) {
@@ -118,6 +119,13 @@ const radtc_lostcarrier = 2;	// Lost Carrier
 const radtc_idleto = 4;		// Idle Timeout
 const radtc_sessionto = 5;	// Session Timeout
 const radtc_adminreset = 6;	// Admin Reset
+
+function interface_find(mac) {
+	for (let k, v in interfaces)
+		if (v.clients[mac])
+			return k;
+	return null;
+}
 
 function radius_terminate(interface, mac, cause) {
 	if (!interfaces[interface].clients[mac].radius)
@@ -350,6 +358,34 @@ function accounting(interface) {
 	}
 }
 
+function hapd_subscriber_notify_cb(notify) {
+	if (notify.type != 'coa')
+		return 0;
+	notify.data.address = uc(notify.data.address);
+	let iface = interface_find(notify.data.address);
+	if (!iface)
+		return 0;
+	client_kick(iface, notify.data.address, true);
+	return 1;
+}
+
+function hapd_subscriber_remove_cb(remove) {
+	printf('remove: %.J\n', remove);
+}
+
+function listener_cb(event, payload) {
+	unsub_object(event == 'ubus.object.add', payload.id, payload.path);
+}
+
+function unsub_object(add, id, path) {
+	let object = split(path, '.');
+
+	if (object[0] == 'hostapd' && object[1] && add) {
+		printf('adding %s\n', path);
+		hapd_subscriber.subscribe(path);
+	}
+}
+
 function start()
 {
 	let seen = {};
@@ -367,6 +403,14 @@ function start()
 		seen[server][nasid] = 1;
 		radius_accton(interface);
 	}
+	hapd_subscriber = ubus.subscriber(hapd_subscriber_notify_cb, hapd_subscriber_remove_cb);
+	
+	let list = ubus.list();
+	for (let k, path in list)
+	        unsub_object(true, 0, path);
+
+	ubus.listener('ubus.object.add', listener_cb);
+	ubus.listener('ubus.object.remove', listener_cb);
 }
 
 function stop()

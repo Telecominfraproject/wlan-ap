@@ -603,7 +603,7 @@ append_radius_server() {
 	set_default dae_port 3799
 	set_default request_cui 0
 
-	[ "$eap_server" -eq 0 ] && {
+	[ "$eap_server" -eq 0  -a -n "$auth_server" ] && {
 		append bss_conf "auth_server_addr=$auth_server" "$N"
 		append bss_conf "auth_server_port=$auth_port" "$N"
 		append bss_conf "auth_server_shared_secret=$auth_secret" "$N"
@@ -772,9 +772,7 @@ hostapd_set_bss_options() {
 			# with WPS enabled, we got to be in unconfigured state.
 			wps_not_configured=1
 			vlan_possible=1
-			[ "$macfilter" = radius ] && {
-				append_radius_server
-			}
+			append_radius_server
 		;;
 		psk|sae|psk-sae)
 			json_get_vars key wpa_psk_file
@@ -793,10 +791,8 @@ hostapd_set_bss_options() {
 			}
 			[ "$eapol_version" -ge "1" -a "$eapol_version" -le "2" ] && append bss_conf "eapol_version=$eapol_version" "$N"
 
+			append_radius_server
 			set_default dynamic_vlan 0
-			[ "$macfilter" = radius ] && {
-				append_radius_server
-			}
 			vlan_possible=1
 			wps_possible=1
 		;;
