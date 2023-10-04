@@ -373,10 +373,6 @@ function hapd_subscriber_remove_cb(remove) {
 	printf('remove: %.J\n', remove);
 }
 
-function listener_cb(event, payload) {
-	unsub_object(event == 'ubus.object.add', payload.id, payload.path);
-}
-
 function unsub_object(add, id, path) {
 	let object = split(path, '.');
 
@@ -384,6 +380,10 @@ function unsub_object(add, id, path) {
 		printf('adding %s\n', path);
 		hapd_subscriber.subscribe(path);
 	}
+}
+
+function listener_cb(event, payload) {
+	unsub_object(event == 'ubus.object.add', payload.id, payload.path);
 }
 
 function start()
