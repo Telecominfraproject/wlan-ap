@@ -69,7 +69,7 @@ define Device/cybertan_eww631_b1
   DEVICE_DTS := qcom-ipq5018-eww631-b1
   SUPPORTED_DEVICES := cybertan,eww631-b1
   DEVICE_PACKAGES := ath11k-wifi-cybertan-eww631-b1 ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
-  DEVICE_DTS_CONFIG := config@mp02.1
+  DEVICE_DTS_CONFIG := config@mp03.5-c1
 endef
 TARGET_DEVICES += cybertan_eww631_b1
 
