@@ -25,6 +25,7 @@ endef
 
 ALLWIFIBOARDS:= \
 	cig-wf186w \
+	cig-wf186h \
 	cig-wf660a \
 	cig-wf194c \
 	cig-wf194c4 \
@@ -343,6 +344,7 @@ define Package/ath11k-wifi-cig-wf188n-us/install
 endef
 
 $(eval $(call generate-ath11k-wifi-package,cig-wf186w,Cigtech WF186w))
+$(eval $(call generate-ath11k-wifi-package,cig-wf186h,Cigtech WF186h))
 $(eval $(call generate-ath11k-wifi-package,cig-wf660a,Cigtech WF660a))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c,Cigtech WF194c))
 $(eval $(call generate-ath11k-wifi-package,cig-wf194c4,Cigtech WF194c4))
