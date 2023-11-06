@@ -24,6 +24,7 @@
 #include "taxonomy.h"
 #include "airtime_policy.h"
 #include "hw_features.h"
+#include "ieee802_11_auth.h"
 
 static struct ubus_context *ctx;
 static struct blob_buf b;
@@ -1604,11 +1605,47 @@ hostapd_wired_del_clients(struct ubus_context *ctx, struct ubus_object *obj,
 	return 0;
 }
 
+enum {
+	MAC_AUTH_ADDR,
+	__MAC_AUTH_MAX
+};
+
+static const struct blobmsg_policy mac_auth_policy[__MAC_AUTH_MAX] = {
+	[MAC_AUTH_ADDR] = { "addr", BLOBMSG_TYPE_STRING },
+};
+
+static int
+hostapd_wired_mac_auth(struct ubus_context *ctx, struct ubus_object *obj,
+		       struct ubus_request_data *req, const char *method,
+		       struct blob_attr *msg)
+{
+	struct hostapd_data *hapd = container_of(obj, struct hostapd_data, ubus.obj);
+	struct blob_attr *tb[__MAC_AUTH_MAX];
+        struct radius_sta rad_info;
+	struct sta_info *sta;
+	u8 addr[ETH_ALEN];
+	int acl_res;
+	
+	blobmsg_parse(mac_auth_policy, __MAC_AUTH_MAX, tb, blob_data(msg), blob_len(msg));
+
+	if (hwaddr_aton(blobmsg_data(tb[MAC_AUTH_ADDR]), addr))
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+        acl_res = hostapd_allowed_address(hapd, addr, NULL, 0, &rad_info, 0);
+        if (acl_res == HOSTAPD_ACL_REJECT) {
+                wpa_printf(MSG_ERROR, "Ignore new peer notification\n");
+                return UBUS_STATUS_INVALID_ARGUMENT;
+        }
+
+	return 0;
+}
+
 static const struct ubus_method wired_methods[] = {
 	UBUS_METHOD_NOARG("reload", hostapd_bss_reload),
 	UBUS_METHOD_NOARG("get_clients", hostapd_wired_get_clients),
 	UBUS_METHOD_NOARG("del_clients", hostapd_wired_del_clients),
 	UBUS_METHOD_NOARG("get_status", hostapd_wired_get_status),
+	UBUS_METHOD("mac_auth", hostapd_wired_mac_auth, mac_auth_policy),
 };
 
 static struct ubus_object_type wired_object_type =
@@ -1847,6 +1884,8 @@ void hostapd_ubus_notify_authorized(struct hostapd_data *hapd, struct sta_info *
 
 	blob_buf_init(&b, 0);
 	blobmsg_add_macaddr(&b, "address", sta->addr);
+	if (sta->vlan_id)
+		blobmsg_add_u32(&b, "vlan", sta->vlan_id);
 	blobmsg_add_string(&b, "ifname", hapd->conf->iface);
 	if (sta->bandwidth[0] || sta->bandwidth[1]) {
 		void *r = blobmsg_open_array(&b, "rate-limit");
