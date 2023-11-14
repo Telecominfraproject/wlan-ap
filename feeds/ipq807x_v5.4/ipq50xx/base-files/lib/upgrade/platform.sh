@@ -72,6 +72,10 @@ platform_check_image() {
 	cig,wf186h|\
 	edgecore,eap104|\
 	hfcl,ion4xi_w|\
+	optimcloud,d60|\
+	optimcloud,d60-5g|\
+	optimcloud,d50|\
+	optimcloud,d50-5g|\
 	yuncore,fap655|\
 	edgecore,oap101|\
 	edgecore,oap101-6e|\
@@ -113,6 +117,10 @@ platform_do_upgrade() {
                 ;;
 	cig,wf186w|\
 	cig,wf186h|\
+	optimcloud,d60|\
+	optimcloud,d60-5g|\
+	optimcloud,d50|\
+	optimcloud,d50-5g|\
 	yuncore,fap655)
 		[ -f /proc/boot_info/rootfs/upgradepartition ] && {
 			CI_UBIPART="$(cat /proc/boot_info/rootfs/upgradepartition)"
