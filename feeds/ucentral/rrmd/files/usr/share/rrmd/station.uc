@@ -228,7 +228,8 @@ return {
 			addr: msg.addr,
 			reason: msg.reason,
 			deauth: 1,
-			ban_time: msg.ban_time
+			ban_time: msg.ban_time,
+			global_ban: msg.global_ban || false,
 		};
 
 		/* tell hostapd to kick a station via ubus */

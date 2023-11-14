@@ -508,6 +508,7 @@ enum {
 	DEL_CLIENT_REASON,
 	DEL_CLIENT_DEAUTH,
 	DEL_CLIENT_BAN_TIME,
+	DEL_CLIENT_GLOBAL_BAN,
 	__DEL_CLIENT_MAX
 };
 
@@ -516,6 +517,7 @@ static const struct blobmsg_policy del_policy[__DEL_CLIENT_MAX] = {
 	[DEL_CLIENT_REASON] = { "reason", BLOBMSG_TYPE_INT32 },
 	[DEL_CLIENT_DEAUTH] = { "deauth", BLOBMSG_TYPE_INT8 },
 	[DEL_CLIENT_BAN_TIME] = { "ban_time", BLOBMSG_TYPE_INT32 },
+	[DEL_CLIENT_GLOBAL_BAN] = { "global_ban", BLOBMSG_TYPE_INT8 },
 };
 
 static int
@@ -526,7 +528,7 @@ hostapd_bss_del_client(struct ubus_context *ctx, struct ubus_object *obj,
 	struct blob_attr *tb[__DEL_CLIENT_MAX];
 	struct hostapd_data *hapd = container_of(obj, struct hostapd_data, ubus.obj);
 	struct sta_info *sta;
-	bool deauth = false;
+	bool deauth = false, global = false;
 	int reason;
 	u8 addr[ETH_ALEN];
 
@@ -544,6 +546,9 @@ hostapd_bss_del_client(struct ubus_context *ctx, struct ubus_object *obj,
 	if (tb[DEL_CLIENT_DEAUTH])
 		deauth = blobmsg_get_bool(tb[DEL_CLIENT_DEAUTH]);
 
+	if (tb[DEL_CLIENT_GLOBAL_BAN])
+		global = blobmsg_get_bool(tb[DEL_CLIENT_GLOBAL_BAN]);
+
 	sta = ap_get_sta(hapd, addr);
 	if (sta) {
 		if (deauth) {
@@ -555,8 +560,18 @@ hostapd_bss_del_client(struct ubus_context *ctx, struct ubus_object *obj,
 		}
 	}
 
-	if (tb[DEL_CLIENT_BAN_TIME])
-		hostapd_bss_ban_client(hapd, addr, blobmsg_get_u32(tb[DEL_CLIENT_BAN_TIME]));
+	if (tb[DEL_CLIENT_BAN_TIME]) {
+		int i;
+
+		for (i = 0; i < hapd->iface->num_bss; i++) {
+			struct hostapd_data *bss = hapd->iface->bss[i];
+
+			if (!global && bss != hapd)
+				continue;
+
+			hostapd_bss_ban_client(bss, addr, blobmsg_get_u32(tb[DEL_CLIENT_BAN_TIME]));
+		}
+	}
 
 	return 0;
 }
@@ -820,7 +835,7 @@ hostapd_switch_chan(struct ubus_context *ctx, struct ubus_object *obj,
 				chwidth, seg0, seg1,
 				iconf->vht_capab,
 				mode ? &mode->he_capab[IEEE80211_MODE_AP] :
-				NULL, NULL);
+				NULL, 0);
 
 	for (i = 0; i < hapd->iface->num_bss; i++) {
 		struct hostapd_data *bss = hapd->iface->bss[i];
