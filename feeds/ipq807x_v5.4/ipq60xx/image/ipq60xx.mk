@@ -2,23 +2,14 @@ KERNEL_LOADADDR := 0x41080000
 
 DEVICE_VARS += CE_TYPE
 
-define Device/cig_wf188n-ca
+define Device/cig_wf188n
   DEVICE_TITLE := Cigtech WF-188n
   DEVICE_DTS := qcom-ipq6018-cig-wf188n
   DEVICE_DTS_CONFIG := config@cp03-c1
   SUPPORTED_DEVICES := cig,wf188n
-  DEVICE_PACKAGES := ath11k-wifi-cig-wf188n-ca uboot-env
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf188n uboot-env
 endef
-TARGET_DEVICES += cig_wf188n-ca
-
-define Device/cig_wf188n-us
-  DEVICE_TITLE := Cigtech WF-188n
-  DEVICE_DTS := qcom-ipq6018-cig-wf188n
-  DEVICE_DTS_CONFIG := config@cp03-c1
-  SUPPORTED_DEVICES := cig,wf188n
-  DEVICE_PACKAGES := ath11k-wifi-cig-wf188n-us uboot-env
-endef
-TARGET_DEVICES += cig_wf188n-us
+TARGET_DEVICES += cig_wf188n
 
 define Device/hfcl_ion4xe
   DEVICE_TITLE := HFCL ION4Xe
