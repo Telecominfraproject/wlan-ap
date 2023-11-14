@@ -53,7 +53,7 @@ endef
 define Package/ath11k-firmware-qcn9000
 $(Package/ath11k-firmware-default)
   TITLE:=ath11k firmware for QCN9000 devices
-  DEPENDS:=@TARGET_ipq807x||TARGET_ipq60xx
+  DEPENDS:=@TARGET_ipq807x||TARGET_ipq60xx||TARGET_ipq50xx
 endef
 
 define Package/ath11k-firmware-ipq50xx/description
