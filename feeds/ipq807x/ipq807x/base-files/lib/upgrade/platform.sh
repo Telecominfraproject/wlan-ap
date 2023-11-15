@@ -162,8 +162,6 @@ platform_check_image() {
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\
-	xunison,d50|\
-	xunison,d50-5g|\
 	qcom,ipq5018-mp03.3)
 		[ "$magic_long" = "73797375" ] && return 0
 		;;
@@ -202,8 +200,6 @@ platform_do_upgrade() {
 	qcom,ipq6018-cp01|\
 	qcom,ipq807x-hk01|\
 	qcom,ipq807x-hk14|\
-	xunison,d50|\
-	xunison,d50-5g|\
 	qcom,ipq5018-mp03.3|\
 	wallys,dr5018|\
 	wallys,dr6018|\

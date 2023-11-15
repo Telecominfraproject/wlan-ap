@@ -128,11 +128,6 @@ $(call Package/ath11k-wifi-default)
     TITLE:=motorola q14 bdf
 endef
 
-define Package/ath11k-wifi-xunison-d50
-$(call Package/ath11k-wifi-default)
-    TITLE:=xunison d50 bdf
-endef
-
 define Package/ath11k-wifi-plasmacloud-pax1800
 $(call Package/ath11k-wifi-default)
     TITLE:=plasmacloud-pax1800(-v2) bdf
@@ -279,13 +274,6 @@ define Package/ath11k-wifi-cig-wf196_6g-us/install
 	echo -n 'US' > $(1)/lib/firmware/country
 endef
 
-define Package/ath11k-wifi-xunison-d50/install
-	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
-	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/QCN9074/hw1.0/
-	$(INSTALL_DATA) ./board-xunison-d50.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
-	$(INSTALL_DATA) ./board-xunison-d50.bin.QCN9074 $(1)/lib/firmware/ath11k/QCN9074/hw1.0/board.bin
-endef
-
 define Package/ath11k-wifi-gl-ax1800/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
 	$(INSTALL_DATA) ./board-gl-ax1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
@@ -400,7 +388,6 @@ $(eval $(call BuildPackage,ath11k-wifi-cig-wf188n-us))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g-ca))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf196_6g-us))
 $(eval $(call BuildPackage,ath11k-wifi-motorola-q14))
-$(eval $(call BuildPackage,ath11k-wifi-xunison-d50))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_wp))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_w))
