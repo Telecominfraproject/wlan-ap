@@ -521,6 +521,24 @@ static const struct blobmsg_policy del_policy[__DEL_CLIENT_MAX] = {
 };
 
 static int
+hostapd_bss_del_client_cb(struct hostapd_iface *iface, void *ctx)
+{
+	struct blob_attr **tb = ctx;
+	u8 addr[ETH_ALEN];
+	int i;
+
+	hwaddr_aton(blobmsg_data(tb[DEL_CLIENT_ADDR]), addr);
+
+	syslog(0, "blogic %s:%s[%d]\n", __FILE__, __func__, __LINE__);
+	for (i = 0; i < iface->num_bss; i++) {
+		struct hostapd_data *bss = iface->bss[i];
+
+		hostapd_bss_ban_client(bss, addr, blobmsg_get_u32(tb[DEL_CLIENT_BAN_TIME]));
+	}
+	return 0;
+}
+
+static int
 hostapd_bss_del_client(struct ubus_context *ctx, struct ubus_object *obj,
 			struct ubus_request_data *req, const char *method,
 			struct blob_attr *msg)
@@ -529,7 +547,7 @@ hostapd_bss_del_client(struct ubus_context *ctx, struct ubus_object *obj,
 	struct hostapd_data *hapd = container_of(obj, struct hostapd_data, ubus.obj);
 	struct sta_info *sta;
 	bool deauth = false, global = false;
-	int reason;
+	int reason, ban_time = 0;;
 	u8 addr[ETH_ALEN];
 
 	blobmsg_parse(del_policy, __DEL_CLIENT_MAX, tb, blob_data(msg), blob_len(msg));
@@ -561,16 +579,11 @@ hostapd_bss_del_client(struct ubus_context *ctx, struct ubus_object *obj,
 	}
 
 	if (tb[DEL_CLIENT_BAN_TIME]) {
-		int i;
-
-		for (i = 0; i < hapd->iface->num_bss; i++) {
-			struct hostapd_data *bss = hapd->iface->bss[i];
-
-			if (!global && bss != hapd)
-				continue;
-
-			hostapd_bss_ban_client(bss, addr, blobmsg_get_u32(tb[DEL_CLIENT_BAN_TIME]));
-		}
+		ban_time = blobmsg_get_u32(tb[DEL_CLIENT_BAN_TIME]); 
+		if (global)
+			hapd->iface->interfaces->for_each_interface(hapd->iface->interfaces, hostapd_bss_del_client_cb, tb);
+		else
+			hostapd_bss_ban_client(hapd, addr, ban_time);
 	}
 
 	return 0;
