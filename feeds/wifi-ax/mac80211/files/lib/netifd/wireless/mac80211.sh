@@ -914,10 +914,11 @@ mac80211_setup_vif() {
 
 	json_select config
 	json_get_var ifname _ifname
-	json_get_vars vif_txpower
+	json_get_vars vif_txpower wds
 	json_select ..
 
 	[ -z "$vif_txpower" ] || iw dev "$ifname" set txpower fixed "${vif_txpower%%.*}00"
+	[ "$wds" -gt 0 ] && echo 1 > /sys/kernel/debug/ieee80211/$phy/netdev\:$ifname/disable_offload
 	[ -n "$ifname" ] && wireless_add_vif "$name" "$ifname"
 }
 
