@@ -12,6 +12,8 @@ function result(error, event, text, data) {
 const actions = {
 	// ubus call rrm command '{"action": "kick", "addr": "1c:57:dc:37:3c:b1", "reason": 5, "ban_time": 30, "global_ban": true }'
 	kick: function(msg) {
+		if (!exists(msg, 'global_ban'))
+			msg.global_ban = true;
 		if (!global.station.kick(msg))
 			return result(1, msg.event, 'station ' + msg.addr + ' is unknown', { action: 'kick', addr: msg.addr });
 
