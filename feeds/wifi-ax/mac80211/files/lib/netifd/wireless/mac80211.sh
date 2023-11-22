@@ -823,6 +823,8 @@ mac80211_prepare_vif() {
 	json_select config
 
 	json_get_vars ifname mode ssid wds powersave macaddr enable wpa_psk_file vlan_file
+	local config_wpa_psk_file="$wpa_psk_file"
+	local config_vlan_file="$vlan_file"
 
 	[ -n "$ifname" ] || {
 		local prefix;
@@ -904,8 +906,8 @@ mac80211_prepare_vif() {
 	json_select ..
 
 	[ "$mode" == "ap" ] && {
-		[ -z "$wpa_psk_file" ] && hostapd_set_psk "$ifname"
-		[ -z "$vlan_file" ] && hostapd_set_vlan "$ifname"
+		[ -z "$config_wpa_psk_file" ] && hostapd_set_psk "$ifname"
+		[ -z "$config_vlan_file" ] && hostapd_set_vlan "$ifname"
 	}
 }
 
