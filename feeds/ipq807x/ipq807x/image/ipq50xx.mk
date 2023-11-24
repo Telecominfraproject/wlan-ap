@@ -165,3 +165,56 @@ define Device/yuncore_fap655
 endef
 TARGET_DEVICES += yuncore_fap655
 
+define Device/optimcloud_d50-5g
+  DEVICE_TITLE := OptimCloud D50-5G
+  DEVICE_DTS := qcom-ipq5018-optimcloud-d50-5g
+  SUPPORTED_DEVICES := optimcloud,d50-5g
+  DEVICE_PACKAGES := ath11k-wifi-optimcloud-d50 ath11k-firmware-ipq50xx ath11k-firmware-qcn9000 
+  DEVICE_DTS_CONFIG := config@mp03.1
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/nand-factory.ubi := append-ubi
+endef
+TARGET_DEVICES += optimcloud_d50-5g
+
+define Device/optimcloud_d50
+  DEVICE_TITLE := OptimCloud D50
+  DEVICE_DTS := qcom-ipq5018-optimcloud-d50
+  SUPPORTED_DEVICES := optimcloud,d50
+  DEVICE_PACKAGES := ath11k-wifi-optimcloud-d50 ath11k-firmware-ipq50xx ath11k-firmware-qcn9000 ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.1
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/factory.ubi := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/nand-factory.ubi := append-ubi | qsdk-ipq-factory-nand
+endef
+TARGET_DEVICES += optimcloud_d50
+
+define Device/optimcloud_d60-5g
+  DEVICE_TITLE := OptimCloud D60-5G
+  DEVICE_DTS := qcom-ipq5018-optimcloud-d60-5g
+  SUPPORTED_DEVICES := optimcloud,d60-5g
+  DEVICE_PACKAGES := ath11k-wifi-optimcloud-d60 ath11k-firmware-ipq50xx ath11k-firmware-qcn9000
+  DEVICE_DTS_CONFIG := config@mp03.1
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/nand-factory.ubi := append-ubi
+endef
+TARGET_DEVICES += optimcloud_d60-5g
+
+define Device/optimcloud_d60
+  DEVICE_TITLE := OptimCloud D60
+  DEVICE_DTS := qcom-ipq5018-optimcloud-d60
+  SUPPORTED_DEVICES := optimcloud,d60
+  DEVICE_PACKAGES := ath11k-wifi-optimcloud-d60 ath11k-firmware-ipq50xx ath11k-firmware-qcn9000 ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.1
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/factory.ubi := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/nand-factory.ubi := append-ubi | qsdk-ipq-factory-nand
+endef
+TARGET_DEVICES += optimcloud_d60
