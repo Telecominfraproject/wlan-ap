@@ -72,6 +72,15 @@ define Device/edgecore_oap101e_6e
 endef
 TARGET_DEVICES += edgecore_oap101e_6e
 
+define Device/hfcl_ion4x_w
+  DEVICE_TITLE := HFCL ION4x_w
+  DEVICE_DTS := qcom-ipq5018-hfcl-ion4x_w
+  SUPPORTED_DEVICES := hfcl,ion4x_w
+  DEVICE_PACKAGES := ath11k-wifi-hfcl-ion4x_w ath11k-firmware-ipq50xx-map-spruce
+  DEVICE_DTS_CONFIG := config@mp03.3
+endef
+TARGET_DEVICES += hfcl_ion4x_w
+
 define Device/hfcl_ion4xi_w
   DEVICE_TITLE := HFCL ION4xi_w
   DEVICE_DTS := qcom-ipq5018-hfcl-ion4xi_w
