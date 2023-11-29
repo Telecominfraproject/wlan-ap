@@ -71,6 +71,7 @@ platform_check_image() {
 	cig,wf186w|\
 	cig,wf186h|\
 	edgecore,eap104|\
+	hfcl,ion4x_w|\
 	hfcl,ion4xi_w|\
 	optimcloud,d60|\
 	optimcloud,d60-5g|\
@@ -103,7 +104,8 @@ platform_do_upgrade() {
 		[ "$(find_mtd_chardev rootfs)" ] && CI_UBIPART="rootfs"
 		nand_upgrade_tar "$1"
 		;;
-        hfcl,ion4xi_w)
+        hfcl,ion4x_w|\
+	hfcl,ion4xi_w)
                 wp_part=$(fw_printenv primary | cut  -d = -f2)
                 echo "Current Primary is $wp_part"
                 if [[ $wp_part == 1 ]]; then
