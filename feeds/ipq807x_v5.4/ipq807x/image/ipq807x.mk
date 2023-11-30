@@ -9,29 +9,17 @@ define Device/cig_wf194c4
 endef
 TARGET_DEVICES += cig_wf194c4
 
-define Device/cig_wf196_us
+define Device/cig_wf196
   DEVICE_TITLE := CIG WF196
   DEVICE_DTS := qcom-ipq807x-wf196
   DEVICE_DTS_CONFIG=config@hk14
   SUPPORTED_DEVICES := cig,wf196
   BLOCKSIZE := 256k
   PAGESIZE := 4096
-  DEVICE_PACKAGES := ath11k-wifi-cig-wf196-us aq-fw-download uboot-envtools kmod-usb3 kmod-usb2 \
-  	ath11k-firmware-qcn9000 ath11k-wifi-cig-wf196_6g-us
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf196 aq-fw-download uboot-envtools kmod-usb3 kmod-usb2 \
+  	ath11k-firmware-qcn9000
 endef
-TARGET_DEVICES += cig_wf196_us
-
-define Device/cig_wf196_ca
-  DEVICE_TITLE := CIG WF196
-  DEVICE_DTS := qcom-ipq807x-wf196
-  DEVICE_DTS_CONFIG=config@hk14
-  SUPPORTED_DEVICES := cig,wf196
-  BLOCKSIZE := 256k
-  PAGESIZE := 4096
-  DEVICE_PACKAGES := ath11k-wifi-cig-wf196-ca aq-fw-download uboot-envtools kmod-usb3 kmod-usb2 \
-  	ath11k-firmware-qcn9000 ath11k-wifi-cig-wf196_6g-ca
-endef
-TARGET_DEVICES += cig_wf196_ca
+TARGET_DEVICES += cig_wf196
 
 define Device/edgecore_eap102
   DEVICE_TITLE := Edgecore EAP102
