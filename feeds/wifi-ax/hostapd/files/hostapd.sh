@@ -745,11 +745,11 @@ hostapd_set_bss_options() {
 	}
 
 	case "$auth_type" in
-		sae|owe|eap192|eap256)
+		sae|owe|eap192|eap2)
 			set_default ieee80211w 2
 			set_default sae_require_mfp 1
 		;;
-		psk-sae|psk2-radius|eap-eap256)
+		psk-sae|psk2-radius|eap-eap2)
 			set_default ieee80211w 1
 			set_default sae_require_mfp 1
 		;;
@@ -796,7 +796,7 @@ hostapd_set_bss_options() {
 			vlan_possible=1
 			wps_possible=1
 		;;
-		eap|eap192|eap-eap256|eap256)
+		eap|eap192|eap-eap2|eap2)
 			append_radius_server
 			# radius can provide VLAN ID for clients
 			vlan_possible=1
@@ -1342,10 +1342,10 @@ wpa_supplicant_add_network() {
 		default_disabled
 
 	case "$auth_type" in
-		sae|owe|eap-eap256)
+		sae|owe|eap-eap2)
 			set_default ieee80211w 2
 		;;
-		psk-sae|eap192|eap256)
+		psk-sae|eap192|eap2)
 			set_default ieee80211w 1
 		;;
 	esac
@@ -1423,7 +1423,7 @@ wpa_supplicant_add_network() {
 			fi
 			append network_data "$passphrase" "$N$T"
 		;;
-		eap|eap192|eap-eap256|eap256)
+		eap|eap192|eap-eap2|eap2)
 			hostapd_append_wpa_key_mgmt
 			key_mgmt="$wpa_key_mgmt"
 
