@@ -509,6 +509,7 @@ static uc_value_t *
 uc_hostapd_iface_start(uc_vm_t *vm, size_t nargs)
 {
 	struct hostapd_iface *iface = uc_fn_thisval("hostapd.iface");
+	struct hostapd_hw_modes *cmode = iface->current_mode;
 	uc_value_t *info = uc_fn_arg(0);
 	struct hostapd_config *conf;
 	bool changed = false;
