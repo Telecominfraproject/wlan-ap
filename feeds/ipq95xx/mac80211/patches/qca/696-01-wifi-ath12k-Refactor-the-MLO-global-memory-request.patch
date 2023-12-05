@@ -1,0 +1,338 @@
+From e2b5ab5ff4ea3791567b855017386ac2358688a9 Mon Sep 17 00:00:00 2001
+From: Karthikeyan Periyasamy <quic_periyasa@quicinc.com>
+Date: Sun, 27 Nov 2022 10:22:22 +0530
+Subject: [PATCH 1/2] wifi: ath12k: Refactor the MLO global memory request
+
+Signed-off-by: Karthikeyan Periyasamy <quic_periyasa@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |   7 +-
+ drivers/net/wireless/ath/ath12k/qmi.c  | 232 +++++++++++++------------
+ 2 files changed, 120 insertions(+), 119 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1016,12 +1016,9 @@ struct ath12k_hw {
+ };
+ 
+ struct ath12k_mlo_memory {
++	struct target_mem_chunk chunk[ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01];
+ 	struct reserved_mem *rsv;
+-	union {
+-		void __iomem *ioaddr;
+-		void *addr;
+-	} v;
+-	u32 size;
++	bool init_done;
+ };
+ 
+ /* Holds info on the group of SOCs that are registered as a single wiphy
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -3221,9 +3221,12 @@ out:
+ }
+ 
+ static void ath12k_qmi_free_mlo_mem_chunk(struct ath12k_base *ab,
+-					  struct target_mem_chunk *chunk)
++					  struct target_mem_chunk *chunk,
++					  int idx)
+ {
+ 	struct ath12k_hw_group *ag = ab->ag;
++	struct target_mem_chunk *mlo_chunk;
++	bool fixed_mem = ab->bus_params.fixed_mem_region;
+ 
+ 	lockdep_assert_held(&ag->mutex_lock);
+ 
+@@ -3231,43 +3234,63 @@ static void ath12k_qmi_free_mlo_mem_chun
+ 		return;
+ 
+ 	if (ag->num_started)
+-		goto skip_unmap;
++		goto out;
++
++	if (idx >= ARRAY_SIZE(ag->mlo_mem.chunk)) {
++		ath12k_warn(ab, "invalid idx %d for MLO memory chunk free\n", idx);
++		return;
++	}
++
++	mlo_chunk = &ag->mlo_mem.chunk[idx];
+ 
+-	iounmap(ag->mlo_mem.v.ioaddr);
+-	ag->mlo_mem.v.ioaddr = NULL;
+-	ag->mlo_mem.rsv = NULL;
+-	ag->mlo_mem.size = 0;
++	if (fixed_mem) {
++		iounmap(mlo_chunk->v.ioaddr);
++		mlo_chunk->v.ioaddr = NULL;
++	}
+ 
+-skip_unmap:
++	mlo_chunk->paddr = NULL;
++	mlo_chunk->size = 0;
++
++out:
+ 	chunk->v.ioaddr = NULL;
+ 	chunk->paddr = NULL;
++	chunk->size = 0;
+ }
+ 
+ void ath12k_qmi_free_target_mem_chunk(struct ath12k_base *ab)
+ {
+-	int i;
++	struct ath12k_hw_group *ag = ab->ag;
++	int i, mlo_idx;
+ 
+-	for (i = 0; i < ab->qmi.mem_seg_count; i++) {
+-		if (ab->bus_params.fixed_mem_region) {
+-			if (!ab->qmi.target_mem[i].v.ioaddr)
+-				continue;
++	for (i = 0, mlo_idx = 0; i < ab->qmi.mem_seg_count; i++) {
++		if (ab->qmi.target_mem[i].type == MLO_GLOBAL_MEM_REGION_TYPE) {
++			ath12k_qmi_free_mlo_mem_chunk(ab,
++						      &ab->qmi.target_mem[i],
++						      mlo_idx);
++		} else {
++			if (ab->bus_params.fixed_mem_region) {
++				if (!ab->qmi.target_mem[i].v.ioaddr)
++					continue;
+ 
+-			if (ab->qmi.target_mem[i].type == MLO_GLOBAL_MEM_REGION_TYPE) {
+-				ath12k_qmi_free_mlo_mem_chunk(ab, &ab->qmi.target_mem[i]);
+-			} else {
+ 				iounmap(ab->qmi.target_mem[i].v.ioaddr);
+ 				ab->qmi.target_mem[i].v.ioaddr = NULL;
++			} else {
++				if (!ab->qmi.target_mem[i].v.addr)
++					continue;
++				dma_free_coherent(ab->dev,
++						  ab->qmi.target_mem[i].size,
++						  ab->qmi.target_mem[i].v.addr,
++						  ab->qmi.target_mem[i].paddr);
++				ab->qmi.target_mem[i].v.addr = NULL;
+ 			}
+-		} else {
+-			if (!ab->qmi.target_mem[i].v.addr)
+-				continue;
+-			dma_free_coherent(ab->dev,
+-					  ab->qmi.target_mem[i].size,
+-					  ab->qmi.target_mem[i].v.addr,
+-					  ab->qmi.target_mem[i].paddr);
+-			ab->qmi.target_mem[i].v.addr = NULL;
+ 		}
+ 	}
++
++	if (!ag->num_started && ag->mlo_mem.init_done) {
++		memset(ag->mlo_mem.chunk, 0, sizeof(ag->mlo_mem.chunk));
++		ag->mlo_mem.rsv = NULL;
++		ag->mlo_mem.init_done = false;
++	}
+ }
+ 
+ static int ath12k_qmi_alloc_target_mem_chunk(struct ath12k_base *ab)
+@@ -3319,86 +3342,14 @@ static int ath12k_qmi_alloc_target_mem_c
+ 	return 0;
+ }
+ 
+-static int ath12k_qmi_assign_mlo_mem_chunk(struct ath12k_base *ab,
+-					   struct target_mem_chunk *chunk)
+-{
+-	struct ath12k_hw_group *ag = ab->ag;
+-	struct device_node *mlo_global_mem_node;
+-	struct reserved_mem *mlo_mem;
+-	int ret = 0;
+-
+-	mutex_lock(&ag->mutex_lock);
+-
+-	if (ag->mlo_mem.rsv) {
+-		if (ag->mlo_mem.size != chunk->size) {
+-			ath12k_warn(ab, "MLO memory requested size %x is mismatch %x\n",
+-				    chunk->size, ag->mlo_mem.size);
+-			ret = -EINVAL;
+-			goto out;
+-		}
+-
+-		goto skip_remap;
+-	}
+-
+-	mlo_global_mem_node = of_find_node_by_name(NULL, "mlo_global_mem_0");
+-	if (!mlo_global_mem_node) {
+-		ath12k_warn(ab, "qmi fail to get MLO global memory node\n");
+-		ret = -EINVAL;
+-		goto out;
+-	}
+-
+-	mlo_mem = of_reserved_mem_lookup(mlo_global_mem_node);
+-	if (!mlo_mem) {
+-		of_node_put(mlo_global_mem_node);
+-		ath12k_warn(ab, "qmi fail to get MLO memory resource node %px\n",
+-			    mlo_mem);
+-		ret = -EINVAL;
+-		goto out;
+-	}
+-
+-	of_node_put(mlo_global_mem_node);
+-
+-	if (chunk->size > mlo_mem->size) {
+-		ath12k_warn(ab, "MLO memory requested size %x is beyond %pa\n",
+-			    chunk->size, &mlo_mem->size);
+-		ret = -ENOMEM;
+-		goto out;
+-	}
+-
+-	ag->mlo_mem.v.ioaddr = ioremap(mlo_mem->base, chunk->size);
+-	if (!ag->mlo_mem.v.ioaddr) {
+-		ath12k_warn(ab, "failed to allocate MLO memory requested size %x\n",
+-			    chunk->size);
+-		ret = -ENOMEM;
+-		goto out;
+-	}
+-
+-	ag->mlo_mem.rsv = mlo_mem;
+-	ag->mlo_mem.size = chunk->size;
+-
+-	memset_io(ag->mlo_mem.v.ioaddr, 0, ag->mlo_mem.size);
+-
+-skip_remap:
+-	ath12k_dbg(ab, ATH12K_DBG_QMI, "MLO mem node start 0x%llx size %llu ioaddr %p req size %u\n",
+-		   (unsigned long long)ag->mlo_mem.rsv->base,
+-		   (unsigned long long)ag->mlo_mem.rsv->size,
+-		   ag->mlo_mem.v.ioaddr,
+-		   chunk->size);
+-
+-	chunk->paddr = ag->mlo_mem.rsv->base;
+-	chunk->v.ioaddr = ag->mlo_mem.v.ioaddr;
+-out:
+-	mutex_unlock(&ag->mutex_lock);
+-	return ret;
+-}
+-
+ static int ath12k_qmi_assign_target_mem_chunk(struct ath12k_base *ab)
+ {
+ 	struct device *dev = ab->dev;
+-	struct device_node *hremote_node = NULL;
++	struct ath12k_hw_group *ag = ab->ag;
++	struct device_node *hremote_node = NULL, *mem_node;
+ 	struct resource res;
+-	int host_ddr_sz, sz;
+-	int i, idx, ret;
++	int host_ddr_sz, mlo_ddr_sz, sz, mlo_sz = 0;
++	int i, idx, mlo_idx, ret;
+ 
+ 	sz = ab->host_ddr_fixed_mem_off;
+ 	hremote_node = of_parse_phandle(dev->of_node, "memory-region", 0);
+@@ -3414,19 +3365,56 @@ static int ath12k_qmi_assign_target_mem_
+ 		return ret;
+ 	}
+ 
++	mutex_lock(&ag->mutex_lock);
++
++	if (ag->mlo_mem.init_done)
++		goto skip_mlo_mem_init;
++
++	mem_node = of_find_node_by_name(NULL, "mlo_global_mem_0");
++	if (!mem_node) {
++		ath12k_warn(ab, "qmi fail to get MLO global memory node\n");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	ag->mlo_mem.rsv = of_reserved_mem_lookup(mem_node);
++	of_node_put(mem_node);
++	if (!ag->mlo_mem.rsv) {
++		ath12k_warn(ab, "qmi fail to get MLO memory resource node %px\n",
++			    ag->mlo_mem.rsv);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	memset(ag->mlo_mem.chunk, 0, sizeof(ag->mlo_mem.chunk));
++	ag->mlo_mem.init_done = true;
++
++skip_mlo_mem_init:
++	mlo_ddr_sz = ag->mlo_mem.rsv->size;
+ 	host_ddr_sz = (res.end - res.start) + 1;
+ 
+-	for (i = 0, idx = 0; i < ab->qmi.mem_seg_count; i++) {
+-		if (ab->qmi.target_mem[i].type != MLO_GLOBAL_MEM_REGION_TYPE) {
+-			ab->qmi.target_mem[idx].paddr = res.start + sz;
+-
+-			if (ab->qmi.target_mem[i].size > (host_ddr_sz - sz)) {
+-				ath12k_warn(ab, "No fixed mem to assign for type %d\n",
+-					    ab->qmi.target_mem[i].type);
+-				return -EINVAL;
+-			}
++	for (i = 0, idx = 0, mlo_idx = 0; i < ab->qmi.mem_seg_count; i++) {
++		struct target_mem_chunk *mlo_chunk;
++		phys_addr_t paddr;
++		int remain_sz;
++
++		if (ab->qmi.target_mem[i].type == MLO_GLOBAL_MEM_REGION_TYPE) {
++			paddr = ag->mlo_mem.rsv->base + mlo_sz;
++			remain_sz = mlo_ddr_sz - mlo_sz;
++		} else {
++			paddr = res.start + sz;
++			remain_sz = host_ddr_sz - sz;
+ 		}
+ 
++		ab->qmi.target_mem[idx].paddr = paddr;
++
++		if (ab->qmi.target_mem[i].size > remain_sz) {
++			ath12k_warn(ab, "No fixed mem to assign for type %d\n",
++				    ab->qmi.target_mem[i].type);
++			ret = -EINVAL;
++			goto out;
++ 		}
++
+ 		switch (ab->qmi.target_mem[i].type) {
+ 		case HOST_DDR_REGION_TYPE:
+ 			ab->qmi.target_mem[idx].v.ioaddr =
+@@ -3487,16 +3475,23 @@ static int ath12k_qmi_assign_target_mem_
+ 			idx++;
+ 			break;
+ 		case MLO_GLOBAL_MEM_REGION_TYPE:
+-			ab->qmi.target_mem[idx].size = ab->qmi.target_mem[i].size;
+-
+-			ret = ath12k_qmi_assign_mlo_mem_chunk(ab, &ab->qmi.target_mem[idx]);
+-			if (ret) {
+-				ath12k_warn(ab, "qmi failed to assign MLO target memory: %d\n",
+-					    ret);
+-				return ret;
++			mlo_chunk = &ag->mlo_mem.chunk[mlo_idx];
++			if (!mlo_chunk->paddr) {
++				mlo_chunk->size = ab->qmi.target_mem[i].size;
++				mlo_chunk->type = ab->qmi.target_mem[i].type;
++				mlo_chunk->paddr = paddr;
++				mlo_chunk->v.ioaddr = ioremap(mlo_chunk->paddr,
++							      mlo_chunk->size);
++				memset_io(mlo_chunk->v.ioaddr, 0, mlo_chunk->size);
+ 			}
+-			ab->qmi.target_mem[idx].type = ab->qmi.target_mem[i].type;
++
++			ab->qmi.target_mem[idx].paddr = mlo_chunk->paddr;
++                        ab->qmi.target_mem[idx].v.ioaddr = mlo_chunk->v.ioaddr;
++			ab->qmi.target_mem[idx].size = mlo_chunk->size;
++			ab->qmi.target_mem[idx].type = mlo_chunk->type;
++			mlo_sz += mlo_chunk->size;
+ 			idx++;
++			mlo_idx++;
+ 			break;
+ 		default:
+ 			ath12k_warn(ab, "qmi ignore invalid mem req type %d\n",
+@@ -3507,10 +3502,18 @@ static int ath12k_qmi_assign_target_mem_
+ 		ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi target mem seg idx %d i %d type %d size %d\n",
+ 			   idx, i, ab->qmi.target_mem[idx - 1].type, ab->qmi.target_mem[idx - 1].size);
+ 	}
++
++	mutex_unlock(&ag->mutex_lock);
++
+ 	ab->host_ddr_fixed_mem_off = sz;
+ 	ab->qmi.mem_seg_count = idx;
+ 
+ 	return 0;
++
++out:
++	ath12k_qmi_free_target_mem_chunk(ab);
++	mutex_unlock(&ag->mutex_lock);
++	return ret;
+ }
+ 
+ static int ath12k_qmi_request_target_cap(struct ath12k_base *ab)

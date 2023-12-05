@@ -1,0 +1,399 @@
+From e294e31ab8bbd4e12f561d6304fe55164689357f Mon Sep 17 00:00:00 2001
+From: Dinesh Karthikeyan <quic_dinek@quicinc.com>
+Date: Wed, 31 May 2023 09:58:45 -0700
+Subject: [PATCH] ath12k: Add full dump support for IPQ5322
+
+Handle the full dump collection support for IPQ5322 in MLO
+capable condition.
+
+Signed-off-by: Dinesh Karthikeyan <quic_dinek@quicinc.com>
+Signed-off-by: Sidhanta Sahu <quic_sidhanta@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/ahb.c      |  20 +-
+ drivers/net/wireless/ath/ath12k/ahb.h      |   2 +-
+ drivers/net/wireless/ath/ath12k/core.c     | 206 ++++++++++++++++-----
+ drivers/net/wireless/ath/ath12k/core.h     |   1 +
+ drivers/net/wireless/ath/ath12k/coredump.c |  11 +-
+ 5 files changed, 181 insertions(+), 59 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/ath12k/ahb.c
+index be32336..6aff66d 100644
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -629,7 +629,7 @@ static int ath12k_ahb_ssr_notifier_reg(struct ath12k_base *ab)
+ {
+ 	struct ath12k_ahb *ab_ahb = ath12k_ahb_priv(ab);
+ 
+-	return ath12k_rproc_register_subsys_notifier(ab_ahb->tgt_rproc->name,
++	return ath12k_rproc_register_subsys_notifier(ab_ahb->tgt_rrproc->name,
+ 						     &ab->ssr_nb,
+ 						     &ab->atomic_ssr_nb);
+ }
+@@ -638,7 +638,7 @@ static int ath12k_ahb_ssr_notifier_unreg(struct ath12k_base *ab)
+ {
+ 	struct ath12k_ahb *ab_ahb = ath12k_ahb_priv(ab);
+ 
+-	return ath12k_rproc_unregister_subsys_notifier(ab_ahb->tgt_rproc->name,
++	return ath12k_rproc_unregister_subsys_notifier(ab_ahb->tgt_rrproc->name,
+ 						       &ab->ssr_nb,
+ 						       &ab->atomic_ssr_nb);
+ }
+@@ -664,8 +664,8 @@ static int ath12k_core_get_rproc(struct ath12k_base *ab)
+ {
+ 	struct ath12k_ahb *ab_ahb = ath12k_ahb_priv(ab);
+ 	struct device *dev = ab->dev;
+-	struct rproc *prproc;
+-	phandle rproc_phandle;
++	struct rproc *prproc, *rrproc;
++	phandle rproc_phandle, rproc_rpd_node;
+ 
+ 	if (of_property_read_u32(dev->of_node, "qcom,rproc", &rproc_phandle)) {
+ 		ath12k_err(ab, "failed to get q6_rproc handle\n");
+@@ -679,6 +679,18 @@ static int ath12k_core_get_rproc(struct ath12k_base *ab)
+ 	}
+ 	ab_ahb->tgt_rproc = prproc;
+ 
++	if (of_property_read_u32(dev->of_node, "qcom,rproc_rpd", &rproc_rpd_node)) {
++		ath12k_err(ab, "failed to get q6_root_pd_rproc handle\n");
++		return -ENOENT;
++	}
++
++	rrproc = rproc_get_by_phandle(rproc_rpd_node);
++	if (!rrproc) {
++		ath12k_err(ab, "failed to get root pd rproc\n");
++		return -EINVAL;
++	}
++	ab_ahb->tgt_rrproc = rrproc;
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/ahb.h b/drivers/net/wireless/ath/ath12k/ahb.h
+index 5efe1c4..f682434 100644
+--- a/drivers/net/wireless/ath/ath12k/ahb.h
++++ b/drivers/net/wireless/ath/ath12k/ahb.h
+@@ -26,7 +26,7 @@ enum ath12k_ahb_smp2p_msg_id {
+ struct ath12k_base;
+ 
+ struct ath12k_ahb {
+-	struct rproc *tgt_rproc;
++	struct rproc *tgt_rproc, *tgt_rrproc;
+ 	struct {
+ 		struct device *dev;
+ 		struct iommu_domain *iommu_domain;
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+index d03de4e..beacee0 100644
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -20,6 +20,7 @@
+ #include "wow.h"
+ #include "sawf.h"
+ #include "ppe.h"
++#include "ahb.h"
+ 
+ unsigned int ath12k_debug_mask;
+ module_param_named(debug_mask, ath12k_debug_mask, uint, 0644);
+@@ -60,6 +61,8 @@ MODULE_PARM_DESC(mgmt_rx_reorder, "Mgmt Rx Re-Ordering (0 - disable, 1 - enable)
+ static DEFINE_MUTEX(ath12k_hw_lock);
+ static struct list_head ath12k_hw_groups = LIST_HEAD_INIT(ath12k_hw_groups);
+ 
++extern struct ath12k_coredump_info ath12k_coredump_ram_info;
++
+ /* This function needs to be used only when dt has multi chip grouping information */
+ static struct ath12k_hw_group *ath12k_core_hw_group_find_by_id(u8 group_id)
+ {
+@@ -1613,6 +1616,43 @@ void ath12k_core_wait_dump_collect(struct ath12k_base *ab)
+ }
+ EXPORT_SYMBOL(ath12k_core_wait_dump_collect);
+ 
++void ath12k_core_issue_bug_on(struct ath12k_base *ab)
++{
++	struct ath12k_hw_group *ag = ab->ag;
++
++	if ((ag->mlo_capable &&
++	    (atomic_read(&ath12k_coredump_ram_info.num_chip) >= ab->ag->num_started)) ||
++	    (!ag->mlo_capable))
++		BUG_ON(1);
++	else
++		ath12k_info(ab,
++			    "%d chip dump collected and waiting for partner chips\n",
++			    atomic_read(&ath12k_coredump_ram_info.num_chip));
++}
++
++static void ath12k_coredump_download_ahb(struct ath12k_base *ab)
++{
++	struct ath12k_hw_group *ag = ab->ag;
++	int dump_count;
++
++	/* Crash the system once all the stats are dumped */
++	if (ab->fw_recovery_support)
++		return;
++
++	if (ag->mlo_capable ) {
++		dump_count = atomic_read(&ath12k_coredump_ram_info.num_chip);
++		if (dump_count >= ATH12K_MAX_SOCS) {
++			ath12k_err(ab, "invalid chip number %d\n",
++				   dump_count);
++			return;
++		}
++	}
++
++	atomic_inc(&ath12k_coredump_ram_info.num_chip);
++
++	ath12k_core_issue_bug_on(ab);
++}
++
+ /* Print the driver stats and crash the system on receiving this notification */
+ static int ath12k_core_ssr_notifier_cb(struct notifier_block *nb,
+ 				       const unsigned long event,
+@@ -1636,11 +1676,12 @@ static int ath12k_core_atomic_ssr_notifier_cb(struct notifier_block *nb,
+ {
+ 	struct ath12k_base *ab = container_of(nb, struct ath12k_base, atomic_ssr_nb);
+ 	struct device *dev = ab->dev;
+-	bool multi_pd_arch = false;
+-	phandle rproc_phandle;
+-	struct device_node *rproc_node = NULL;
++	phandle rrproc_phandle;
+ 	struct platform_device *pdev = NULL;
++	struct device_node *rrproc_node = NULL;
+ 	struct platform_device *ssr_pdev = (struct platform_device *)data;
++	struct ath12k_ahb *ab_ahb = ath12k_ahb_priv(ab);
++
+ 
+ 	if (event != SUBSYS_PREPARE_FOR_FATAL_SHUTDOWN)
+ 		return NOTIFY_DONE;
+@@ -1650,34 +1691,30 @@ static int ath12k_core_atomic_ssr_notifier_cb(struct notifier_block *nb,
+ 	if (!test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags))
+ 		return NOTIFY_DONE;
+ 
+-	/* Print the stats and do recover only if notification is received
+-	 * for expected PD. Currently, there's only one PD for which below code
+-	 * may not necessary. It's just added as a sanity check incase
+-	 * core-BSP code base is modified and impacted this function.
+-	 * However, below code will needed review when there will be
+-	 * multi pd architecture.
+-	 */
+-	multi_pd_arch = of_property_read_bool(dev->of_node, "qcom,multipd_arch");
+-	if (multi_pd_arch) {
+-		if (of_property_read_u32(dev->of_node, "qcom,rproc",
+-					 &rproc_phandle))
+-			return NOTIFY_DONE;
+-		rproc_node = of_find_node_by_phandle(rproc_phandle);
+-		if (!rproc_node) {
+-			ath12k_warn(ab, "ssr notification failed to get rproc_node\n");
+-			return NOTIFY_DONE;
+-		}
+-		pdev = of_find_device_by_node(rproc_node);
+-		if (!pdev) {
+-			ath12k_warn(ab, "Failed to get pdev from device node\n");
+-			return NOTIFY_DONE;
+-		}
+-		if (strcmp(ssr_pdev->name, pdev->name) != 0) {
+-			ath12k_warn(ab, "SSR notification mismatch %s  pdev name:%s\n",
+-				    (char *)data, pdev->name);
+-			return NOTIFY_DONE;
+-		}
++	if (of_property_read_u32(dev->of_node, "qcom,rproc_rpd",
++				 &rrproc_phandle))
++		return NOTIFY_DONE;
++	rrproc_node = of_find_node_by_phandle(rrproc_phandle);
++	if (!rrproc_node) {
++		ath12k_warn(ab, "ssr notification failed to get rproc_node\n");
++		return NOTIFY_DONE;
+ 	}
++	pdev = of_find_device_by_node(rrproc_node);
++	if (!pdev) {
++		ath12k_warn(ab, "Failed to get pdev from device node\n");
++		return NOTIFY_DONE;
++	}
++	if (strcmp(ssr_pdev->name, pdev->name) != 0) {
++		ath12k_warn(ab, "SSR notification mismatch %s  pdev name:%s\n",
++			    (char *)data, pdev->name);
++		return NOTIFY_DONE;
++	}
++
++	/* Changing the rrpoc->state to crashed disabled the
++	 * remoteproc module to do the recovery process.
++	 * This module will take care of the rrproc recovery process.
++	 */
++	ab_ahb->tgt_rrproc->state = RPROC_CRASHED;
+ 
+ 	if (!(test_bit(ATH12K_FLAG_UNREGISTERING, &ab->ag->dev_flags))) {
+ 		set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+@@ -1688,14 +1725,6 @@ static int ath12k_core_atomic_ssr_notifier_cb(struct notifier_block *nb,
+ 	ath12k_hal_dump_srng_stats(ab);
+ 	/* TODO Add more driver stats */
+ 
+-	ath12k_qmi_free_target_mem_chunk(ab);
+-
+-	/* Crash the system once all the stats are dumped */
+-	if (!ab->fw_recovery_support)
+-		BUG_ON(1);
+-
+-	ath12k_dbg(ab, ATH12K_DBG_BOOT, "reset started\n");
+-
+ 	return NOTIFY_OK;
+ }
+ 
+@@ -1915,6 +1944,85 @@ static void ath12k_core_restart(struct work_struct *work)
+ 		ath12k_warn(ab, "SAWF SLA reconfiguring failed\n");
+ }
+ 
++static void ath12k_rproc_recovery_do_coredump(struct rproc *rproc)
++{
++	if (rproc) {
++		rproc->ops->coredump(rproc);
++	}
++}
++
++static int ath12k_rproc_recovery_stop_coredump(struct ath12k_base *ab)
++{
++	int ret;
++	struct ath12k_ahb *ab_ahb = ath12k_ahb_priv(ab);
++
++	if (ab_ahb->tgt_rproc) {
++		ab_ahb->tgt_rproc->state = RPROC_CRASHED;
++		ret = rproc_stop(ab_ahb->tgt_rproc, true);
++		if (ret < 0) {
++			ath12k_err(ab, "userpd rproc stop failed\n");
++			return ret;
++		}
++		ab_ahb->tgt_rproc->state = RPROC_SUSPENDED;
++	}
++	if (ab_ahb->tgt_rrproc) {
++		ab_ahb->tgt_rrproc->state = RPROC_RUNNING;
++		ret = rproc_stop(ab_ahb->tgt_rrproc, true);
++		if (ret < 0) {
++			ath12k_err(ab, "rootpd rproc stop failed\n");
++			return ret;
++		}
++		ath12k_rproc_recovery_do_coredump(ab_ahb->tgt_rrproc);
++	}
++
++	return 0;
++}
++
++static int ath12k_rproc_recovery_power_up(struct ath12k_base *ab)
++{
++	struct ath12k_ahb *ab_ahb = ath12k_ahb_priv(ab);
++	struct rproc *rproc_rpd;
++	const struct firmware *firmware_p = NULL;
++	struct rproc *rproc;
++	struct device *dev;
++	int ret;
++
++	rproc = ab_ahb->tgt_rproc;
++	rproc_rpd = ab_ahb->tgt_rrproc;
++
++	if (rproc_rpd) {
++		dev = &rproc_rpd->dev;
++		ret = request_firmware(&firmware_p, rproc_rpd->firmware, dev);
++		if (ret < 0) {
++			ath12k_err(ab, "request_firmware failed: %d\n", ret);
++			return ret;
++		}
++		ret = rproc_start(rproc_rpd, firmware_p);
++		if (ret < 0) {
++			ath12k_err(ab, "Root pd rproc_start failed: %d\n", ret);
++			return ret;
++		}
++	} else {
++		if (rproc) {
++			dev = &rproc->dev;
++			ret = request_firmware(&firmware_p,
++					       rproc->firmware, dev);
++			if (ret < 0) {
++				ath12k_err(ab, "request_firmware failed: %d\n",
++						ret);
++				return ret;
++			}
++			ret = rproc_start(rproc, firmware_p);
++			if (ret < 0) {
++				ath12k_err(ab, "User pd rproc_start failed: %d\n", ret);
++				return ret;
++			}
++		}
++	}
++
++	return 0;
++}
++
+ static void ath12k_core_reset(struct work_struct *work)
+ {
+ 	struct ath12k_base *ab = container_of(work, struct ath12k_base, reset_work);
+@@ -1993,10 +2101,6 @@ static void ath12k_core_reset(struct work_struct *work)
+ 						     ATH12K_WMI_FW_HANG_DELAY, true);
+ 	}
+ 
+-	/* Incase recovery fails and FW asserts again, this is to prevent invalid operation. */
+-	if (ag->num_started && ab->fw_recovery_support)
+-		ag->num_started--;
+-
+ 	if (!ag->hw_queues_stopped)
+ 		ath12k_core_mlo_hw_queues_stop(ag);
+ 
+@@ -2012,12 +2116,24 @@ static void ath12k_core_reset(struct work_struct *work)
+ 	 */
+ 	if (ab->hif.bus == ATH12K_BUS_PCI) {
+ 		ath12k_coredump_download_rddm(ab);
++	} else if (ab->hif.bus == ATH12K_BUS_AHB) {
++		ath12k_coredump_download_ahb(ab);
+ 	}
+ 
+-	if (ab->fw_recovery_support) {
+-		ath12k_hif_power_down(ab);
+-		ath12k_hif_power_up(ab);
++	/* Incase recovery fails and FW asserts again, this is to prevent invalid operation. */
++	if (ag->num_started && ab->fw_recovery_support)
++		ag->num_started--;
+ 
++	if (ab->fw_recovery_support) {
++		if (ab->hif.bus == ATH12K_BUS_PCI) {
++			ath12k_hif_power_down(ab);
++			ath12k_hif_power_up(ab);
++		} else if (ab->hif.bus == ATH12K_BUS_AHB) {
++			ath12k_rproc_recovery_stop_coredump(ab);
++			ath12k_qmi_free_target_mem_chunk(ab);
++			ath12k_rproc_recovery_power_up(ab);
++			ath12k_core_wait_dump_collect(ab);
++		}
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT, "reset started\n");
+ 	}
+ 	mutex_unlock(&ag->mutex_lock);
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index 549e402..32ece80 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1515,6 +1515,7 @@ const struct firmware *ath12k_core_firmware_request(struct ath12k_base *ab,
+ 						    const char *filename);
+ 
+ void ath12k_core_wait_dump_collect(struct ath12k_base *ab);
++void ath12k_core_issue_bug_on(struct ath12k_base *ab);
+ 
+ void ath12k_fw_stats_init(struct ath12k *ar);
+ void ath12k_fw_stats_pdevs_free(struct list_head *head);
+diff --git a/drivers/net/wireless/ath/ath12k/coredump.c b/drivers/net/wireless/ath/ath12k/coredump.c
+index 874e8a9..04321f6 100644
+--- a/drivers/net/wireless/ath/ath12k/coredump.c
++++ b/drivers/net/wireless/ath/ath12k/coredump.c
+@@ -321,15 +321,8 @@ void ath12k_coredump_download_rddm(struct ath12k_base *ab)
+ 		chip_seg->num_seg = num_seg;
+ 		chip_seg->seg = segment;
+ 
+-		if (ag->mlo_capable &&
+-		    (atomic_read(&ath12k_coredump_ram_info.num_chip) >= ab->ag->num_started))
+-			BUG_ON(1);
+-		else if (!ag->mlo_capable)
+-			BUG_ON(1);
+-		else
+-			ath12k_info(ab,
+-				    "%d chip dump collected and waiting for partner chips\n",
+-				    atomic_read(&ath12k_coredump_ram_info.num_chip));
++		ath12k_core_issue_bug_on(ab);
++
+ 	} else {
+ 		/* TODO dump collection for MLO when fw_recovery set */
+ 		ath12k_info(ab, "WLAN target is restarting");
+-- 
+2.17.1
+

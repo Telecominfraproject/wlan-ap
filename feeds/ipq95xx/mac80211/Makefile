@@ -2,11 +2,11 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=mac80211
-PKG_VERSION:=20220404-5.4.164-f40abb4788
+PKG_VERSION:=20220822-5.4.213-ef7197996efe
 PKG_RELEASE:=1
 PKG_SOURCE_URL:=https://mirror2.openwrt.org/sources/
-PKG_HASH:=be7781729017385f2a1d0b388c9fca22468dbbc442138f80e3932ad04ed59f0c
 PKG_SOURCE:=backports-$(PKG_VERSION).tar.bz2
+PKG_HASH:=80cbf7738d08dc43683c8df0a4334b8220fb153116e8a13e408e854ad2c4950b
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/backports-$(PKG_VERSION)
 PKG_BUILD_PARALLEL:=1
 
@@ -179,7 +179,7 @@ config-$(call config_package,mac80211-hwsim) += MAC80211_HWSIM
 MAKE_OPTS:= -C "$(PKG_BUILD_DIR)" \
 	CROSS_COMPILE="$(KERNEL_CROSS)" \
         ARCH="$(LINUX_KARCH)" \
-	EXTRA_CFLAGS="-I$(PKG_BUILD_DIR)/include $(IREMAP_CFLAGS) -I$(STAGING_DIR)/usr/include/qca-nss-drv -I$(STAGING_DIR)/usr/include/qca-nss-clients -Wno-incompatible-pointer-types -Wno-discarded-qualifiers -Wno-int-conversion -Wno-unused-function -Wno-implicit-fallthrough -Wno-error=array-parameter -Wno-stringop-overread -Wno-address -Wno-array-parameter" \
+	EXTRA_CFLAGS="-I$(PKG_BUILD_DIR)/include $(IREMAP_CFLAGS) -I$(STAGING_DIR)/usr/include/qca-nss-drv -I$(STAGING_DIR)/usr/include/qca-nss-clients -Wno-incompatible-pointer-types -Wno-discarded-qualifiers -Wno-int-conversion -Wno-unused-function -Wno-implicit-fallthrough -Wno-error=array-parameter -Wno-stringop-overread -Wno-address -Wno-array-parameter -Wno-error=unused-variable" \
 	KLIB_BUILD="$(LINUX_DIR)" \
 	MODPROBE=true \
 	KLIB=$(TARGET_MODULES_DIR) \
