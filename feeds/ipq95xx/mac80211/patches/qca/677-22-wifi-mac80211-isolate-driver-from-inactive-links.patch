@@ -1,0 +1,697 @@
+From e989305cd76c7a4ceee4fb0f024d419efeb10c93 Mon Sep 17 00:00:00 2001
+From: Johannes Berg <johannes.berg@intel.com>
+Date: Fri, 18 Nov 2022 18:26:34 +0530
+Subject: [PATCH]  wifi: mac80211: isolate driver from inactive links
+
+In order to let the driver select active links and properly
+make multi-link connections, as a first step isolate the
+driver from inactive links, and set the active links to be
+only the association link for client-side interfaces. For
+AP side nothing changes since APs always have to have all
+their links active.
+
+To simplify things, update the for_each_sta_active_link()
+API to include the appropriate vif pointer.
+
+This also implies not allocating a chanctx for an inactive
+link, which requires a few more changes.
+
+Since we now no longer try to program multiple links to the
+driver, remove the check in the MLME code.
+
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+---
+ include/net/mac80211.h    |  30 +++----
+ net/mac80211/chan.c       |   6 ++
+ net/mac80211/driver-ops.c | 172 ++++++++++++++++++++++++++++++++++++++
+ net/mac80211/driver-ops.h | 167 ++++++------------------------------
+ net/mac80211/key.c        |   8 ++
+ net/mac80211/link.c       |  66 ++++++++++++---
+ net/mac80211/mlme.c       |   8 +-
+ net/mac80211/util.c       |   2 +-
+ 8 files changed, 286 insertions(+), 173 deletions(-)
+
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index c13fdca..685d5e8 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -1897,6 +1897,9 @@ struct ieee80211_vif_cfg {
+  * @link_conf: in case of MLD, the per-link BSS configuration,
+  *	indexed by link ID
+  * @valid_links: bitmap of valid links, or 0 for non-MLO.
++ * @active_links: The bitmap of active links, or 0 for non-MLO.
++ *	The driver shouldn't change this directly, but use the
++ *	API calls meant for that purpose.
+  * @addr: address of this interface
+  * @p2p: indicates whether this AP or STA interface is a p2p
+  *	interface, i.e. a GO or p2p-sta respectively
+@@ -1932,7 +1935,7 @@ struct ieee80211_vif {
+ 	struct ieee80211_vif_cfg cfg;
+ 	struct ieee80211_bss_conf bss_conf;
+ 	struct ieee80211_bss_conf __rcu *link_conf[IEEE80211_MLD_MAX_NUM_LINKS];
+-	u16 valid_links;
++	u16 valid_links, active_links;
+ 	u8 addr[ETH_ALEN] __aligned(2);
+ 	bool p2p;
+ 
+@@ -1963,12 +1966,11 @@ struct ieee80211_vif {
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+ };
+ 
+-/* FIXME: for now loop over all the available links; later will be changed
+- * to loop only over the active links.
+- */
+-#define for_each_vif_active_link(vif, link, link_id)			     \
+-	for (link_id = 0; link_id < ARRAY_SIZE((vif)->link_conf); link_id++) \
+-		if ((link = rcu_dereference((vif)->link_conf[link_id])))
++#define for_each_vif_active_link(vif, link, link_id)				\
++	for (link_id = 0; link_id < ARRAY_SIZE((vif)->link_conf); link_id++)	\
++		if ((!(vif)->active_links ||					\
++		     (vif)->active_links & BIT(link_id)) &&			\
++		    (link = rcu_dereference((vif)->link_conf[link_id])))
+ 
+ static inline bool ieee80211_vif_is_mesh(struct ieee80211_vif *vif)
+ {
+@@ -2382,13 +2384,13 @@ struct ieee80211_sta {
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+ };
+ 
+-/* FIXME: need to loop only over links which are active and check the actual
+- * lock
+- */
+-#define for_each_sta_active_link(sta, link_sta, link_id)		         \
+-	for (link_id = 0; link_id < ARRAY_SIZE((sta)->link); link_id++)	         \
+-		if (((link_sta) = rcu_dereference_protected((sta)->link[link_id],\
+-							    1)))	         \
++/* FIXME: check the locking correctly */
++#define for_each_sta_active_link(vif, sta, link_sta, link_id)			\
++	for (link_id = 0; link_id < ARRAY_SIZE((sta)->link); link_id++)		\
++		if ((!(vif)->active_links ||					\
++		     (vif)->active_links & BIT(link_id)) &&			\
++		    ((link_sta) = rcu_dereference_protected((sta)->link[link_id],\
++							    1)))
+ 
+ /**
+  * enum sta_notify_cmd - sta notify command
+diff --git a/net/mac80211/chan.c b/net/mac80211/chan.c
+index 778455b..527fb5a 100644
+--- a/net/mac80211/chan.c
++++ b/net/mac80211/chan.c
+@@ -1811,6 +1811,12 @@ int ieee80211_link_use_channel(struct ieee80211_link_data *link,
+ 
+ 	lockdep_assert_held(&local->mtx);
+ 
++	if (sdata->vif.active_links &&
++	    !(sdata->vif.active_links & BIT(link->link_id))) {
++		ieee80211_link_update_chandef(link, chandef);
++		return 0;
++	}
++
+ 	mutex_lock(&local->chanctx_mtx);
+ 
+ 	ret = cfg80211_chandef_dfs_required(local->hw.wiphy,
+diff --git a/net/mac80211/driver-ops.c b/net/mac80211/driver-ops.c
+index 08b3a1a..7a6bff0 100644
+--- a/net/mac80211/driver-ops.c
++++ b/net/mac80211/driver-ops.c
+@@ -216,6 +216,10 @@ int drv_conf_tx(struct ieee80211_local *local,
+ 	if (!check_sdata_in_driver(sdata))
+ 		return -EIO;
+ 
++	if (sdata->vif.active_links &&
++	    !(sdata->vif.active_links & BIT(link->link_id)))
++		return 0;
++
+ 	if (params->cw_min == 0 || params->cw_min > params->cw_max) {
+ 		/*
+ 		 * If we can't configure hardware anyway, don't warn. We may
+@@ -296,6 +300,60 @@ void drv_reset_tsf(struct ieee80211_local *local,
+ 	trace_drv_return_void(local);
+ }
+ 
++int drv_assign_vif_chanctx(struct ieee80211_local *local,
++			   struct ieee80211_sub_if_data *sdata,
++			   struct ieee80211_bss_conf *link_conf,
++			   struct ieee80211_chanctx *ctx)
++{
++	int ret = 0;
++
++	drv_verify_link_exists(sdata, link_conf);
++	if (!check_sdata_in_driver(sdata))
++		return -EIO;
++
++	if (sdata->vif.active_links &&
++	    !(sdata->vif.active_links & BIT(link_conf->link_id)))
++		return 0;
++
++	trace_drv_assign_vif_chanctx(local, sdata, link_conf, ctx);
++	if (local->ops->assign_vif_chanctx) {
++		WARN_ON_ONCE(!ctx->driver_present);
++		ret = local->ops->assign_vif_chanctx(&local->hw,
++						     &sdata->vif,
++						     link_conf,
++						     &ctx->conf);
++	}
++	trace_drv_return_int(local, ret);
++
++	return ret;
++}
++
++void drv_unassign_vif_chanctx(struct ieee80211_local *local,
++			      struct ieee80211_sub_if_data *sdata,
++			      struct ieee80211_bss_conf *link_conf,
++			      struct ieee80211_chanctx *ctx)
++{
++	might_sleep();
++
++	drv_verify_link_exists(sdata, link_conf);
++	if (!check_sdata_in_driver(sdata))
++		return;
++
++	if (sdata->vif.active_links &&
++	    !(sdata->vif.active_links & BIT(link_conf->link_id)))
++		return;
++
++	trace_drv_unassign_vif_chanctx(local, sdata, link_conf, ctx);
++	if (local->ops->unassign_vif_chanctx) {
++		WARN_ON_ONCE(!ctx->driver_present);
++		local->ops->unassign_vif_chanctx(&local->hw,
++						 &sdata->vif,
++						 link_conf,
++						 &ctx->conf);
++	}
++	trace_drv_return_void(local);
++}
++
+ int drv_switch_vif_chanctx(struct ieee80211_local *local,
+ 			   struct ieee80211_vif_chanctx_switch *vifs,
+ 			   int n_vifs, enum ieee80211_chanctx_switch_mode mode)
+@@ -390,3 +448,117 @@ void drv_config_mesh_offload_path(struct ieee80211_local *local,
+ 	/* TODO: trace event */
+ }
+ #endif
++
++void drv_link_info_changed(struct ieee80211_local *local,
++			   struct ieee80211_sub_if_data *sdata,
++			   struct ieee80211_bss_conf *info,
++			   int link_id, u64 changed)
++{
++	might_sleep();
++
++	if (WARN_ON_ONCE(changed & (BSS_CHANGED_BEACON |
++				    BSS_CHANGED_BEACON_ENABLED) &&
++			 sdata->vif.type != NL80211_IFTYPE_AP &&
++			 sdata->vif.type != NL80211_IFTYPE_ADHOC &&
++			 sdata->vif.type != NL80211_IFTYPE_MESH_POINT &&
++			 sdata->vif.type != NL80211_IFTYPE_OCB))
++		return;
++
++	if (WARN_ON_ONCE(sdata->vif.type == NL80211_IFTYPE_P2P_DEVICE ||
++			 sdata->vif.type == NL80211_IFTYPE_NAN ||
++			 (sdata->vif.type == NL80211_IFTYPE_MONITOR &&
++			  !sdata->vif.bss_conf.mu_mimo_owner &&
++			  !(changed & BSS_CHANGED_TXPOWER))))
++		return;
++
++	if (!check_sdata_in_driver(sdata))
++		return;
++
++	if (sdata->vif.active_links &&
++	    !(sdata->vif.active_links & BIT(link_id)))
++		return;
++
++	trace_drv_link_info_changed(local, sdata, info, changed);
++	if (local->ops->link_info_changed)
++		local->ops->link_info_changed(&local->hw, &sdata->vif,
++					      info, changed);
++	else if (local->ops->bss_info_changed)
++		local->ops->bss_info_changed(&local->hw, &sdata->vif,
++					     info, changed);
++	trace_drv_return_void(local);
++}
++
++int drv_set_key(struct ieee80211_local *local,
++		enum set_key_cmd cmd,
++		struct ieee80211_sub_if_data *sdata,
++		struct ieee80211_sta *sta,
++		struct ieee80211_key_conf *key)
++{
++	int ret;
++
++	might_sleep();
++
++	sdata = get_bss_sdata(sdata);
++	if (!check_sdata_in_driver(sdata))
++		return -EIO;
++
++	if (WARN_ON(key->link_id >= 0 && sdata->vif.active_links &&
++		    !(sdata->vif.active_links & BIT(key->link_id))))
++		return -ENOLINK;
++
++	trace_drv_set_key(local, cmd, sdata, sta, key);
++	ret = local->ops->set_key(&local->hw, cmd, &sdata->vif, sta, key);
++	trace_drv_return_int(local, ret);
++	return ret;
++}
++
++int drv_change_vif_links(struct ieee80211_local *local,
++			 struct ieee80211_sub_if_data *sdata,
++			 u16 old_links, u16 new_links,
++			 struct ieee80211_bss_conf *old[IEEE80211_MLD_MAX_NUM_LINKS])
++{
++	int ret = -EOPNOTSUPP;
++
++	might_sleep();
++
++	if (!check_sdata_in_driver(sdata))
++		return -EIO;
++
++	if (old_links == new_links)
++		return 0;
++
++	trace_drv_change_vif_links(local, sdata, old_links, new_links);
++	if (local->ops->change_vif_links)
++		ret = local->ops->change_vif_links(&local->hw, &sdata->vif,
++						   old_links, new_links, old);
++	trace_drv_return_int(local, ret);
++
++	return ret;
++}
++
++int drv_change_sta_links(struct ieee80211_local *local,
++			 struct ieee80211_sub_if_data *sdata,
++			 struct ieee80211_sta *sta,
++			 u16 old_links, u16 new_links)
++{
++	int ret = -EOPNOTSUPP;
++
++	might_sleep();
++
++	if (!check_sdata_in_driver(sdata))
++		return -EIO;
++
++	old_links &= sdata->vif.active_links;
++	new_links &= sdata->vif.active_links;
++
++	if (old_links == new_links)
++		return 0;
++
++	trace_drv_change_sta_links(local, sdata, sta, old_links, new_links);
++	if (local->ops->change_sta_links)
++		ret = local->ops->change_sta_links(&local->hw, &sdata->vif, sta,
++						   old_links, new_links);
++	trace_drv_return_int(local, ret);
++
++	return ret;
++}
+diff --git a/net/mac80211/driver-ops.h b/net/mac80211/driver-ops.h
+index ada16cf..7a3b7cc 100644
+--- a/net/mac80211/driver-ops.h
++++ b/net/mac80211/driver-ops.h
+@@ -165,40 +165,10 @@ static inline void drv_vif_cfg_changed(struct ieee80211_local *local,
+ 	trace_drv_return_void(local);
+ }
+ 
+-static inline void drv_link_info_changed(struct ieee80211_local *local,
+-					 struct ieee80211_sub_if_data *sdata,
+-					 struct ieee80211_bss_conf *info,
+-					 int link_id, u64 changed)
+-{
+-	might_sleep();
+-
+-	if (WARN_ON_ONCE(changed & (BSS_CHANGED_BEACON |
+-				    BSS_CHANGED_BEACON_ENABLED) &&
+-			 sdata->vif.type != NL80211_IFTYPE_AP &&
+-			 sdata->vif.type != NL80211_IFTYPE_ADHOC &&
+-			 sdata->vif.type != NL80211_IFTYPE_MESH_POINT &&
+-			 sdata->vif.type != NL80211_IFTYPE_OCB))
+-		return;
+-
+-	if (WARN_ON_ONCE(sdata->vif.type == NL80211_IFTYPE_P2P_DEVICE ||
+-			 sdata->vif.type == NL80211_IFTYPE_NAN ||
+-			 (sdata->vif.type == NL80211_IFTYPE_MONITOR &&
+-			  !sdata->vif.bss_conf.mu_mimo_owner &&
+-			  !(changed & BSS_CHANGED_TXPOWER))))
+-		return;
+-
+-	if (!check_sdata_in_driver(sdata))
+-		return;
+-
+-	trace_drv_link_info_changed(local, sdata, info, changed);
+-	if (local->ops->link_info_changed)
+-		local->ops->link_info_changed(&local->hw, &sdata->vif,
+-					      info, changed);
+-	else if (local->ops->bss_info_changed)
+-		local->ops->bss_info_changed(&local->hw, &sdata->vif,
+-					     info, changed);
+-	trace_drv_return_void(local);
+-}
++void drv_link_info_changed(struct ieee80211_local *local,
++			   struct ieee80211_sub_if_data *sdata,
++			   struct ieee80211_bss_conf *info,
++			   int link_id, u64 changed);
+ 
+ static inline void drv_nss_bss_info_changed(struct ieee80211_local *local,
+ 					struct ieee80211_sub_if_data *sdata,
+@@ -273,27 +243,11 @@ static inline int drv_set_tim(struct ieee80211_local *local,
+ 	return ret;
+ }
+ 
+-static inline int drv_set_key(struct ieee80211_local *local,
+-			      enum set_key_cmd cmd,
+-			      struct ieee80211_sub_if_data *sdata,
+-			      struct ieee80211_sta *sta,
+-			      struct ieee80211_key_conf *key)
+-{
+-	int ret;
+-
+-	might_sleep();
+-
+-	if (!ieee80211_hw_check(&local->hw, SUPPORTS_NSS_OFFLOAD))
+-		sdata = get_bss_sdata(sdata);
+-
+-	if (!check_sdata_in_driver(sdata))
+-		return -EIO;
+-
+-	trace_drv_set_key(local, cmd, sdata, sta, key);
+-	ret = local->ops->set_key(&local->hw, cmd, &sdata->vif, sta, key);
+-	trace_drv_return_int(local, ret);
+-	return ret;
+-}
++int drv_set_key(struct ieee80211_local *local,
++	        enum set_key_cmd cmd,
++	        struct ieee80211_sub_if_data *sdata,
++	        struct ieee80211_sta *sta,
++	        struct ieee80211_key_conf *key);
+ 
+ static inline void drv_update_tkip_key(struct ieee80211_local *local,
+ 				       struct ieee80211_sub_if_data *sdata,
+@@ -969,52 +923,14 @@ static inline void drv_verify_link_exists(struct ieee80211_sub_if_data *sdata,
+ 		sdata_assert_lock(sdata);
+ }
+ 
+-static inline int drv_assign_vif_chanctx(struct ieee80211_local *local,
+-					 struct ieee80211_sub_if_data *sdata,
+-					 struct ieee80211_bss_conf *link_conf,
+-					 struct ieee80211_chanctx *ctx)
+-{
+-	int ret = 0;
+-
+-	drv_verify_link_exists(sdata, link_conf);
+-	if (!check_sdata_in_driver(sdata))
+-		return -EIO;
+-
+-	trace_drv_assign_vif_chanctx(local, sdata, link_conf, ctx);
+-	if (local->ops->assign_vif_chanctx) {
+-		WARN_ON_ONCE(!ctx->driver_present);
+-		ret = local->ops->assign_vif_chanctx(&local->hw,
+-						     &sdata->vif,
+-						     link_conf,
+-						     &ctx->conf);
+-	}
+-	trace_drv_return_int(local, ret);
+-
+-	return ret;
+-}
+-
+-static inline void drv_unassign_vif_chanctx(struct ieee80211_local *local,
+-					    struct ieee80211_sub_if_data *sdata,
+-					    struct ieee80211_bss_conf *link_conf,
+-					    struct ieee80211_chanctx *ctx)
+-{
+-	might_sleep();
+-
+-	drv_verify_link_exists(sdata, link_conf);
+-	if (!check_sdata_in_driver(sdata))
+-		return;
+-
+-	trace_drv_unassign_vif_chanctx(local, sdata, link_conf, ctx);
+-	if (local->ops->unassign_vif_chanctx) {
+-		WARN_ON_ONCE(!ctx->driver_present);
+-		local->ops->unassign_vif_chanctx(&local->hw,
+-						 &sdata->vif,
+-						 link_conf,
+-						 &ctx->conf);
+-	}
+-	trace_drv_return_void(local);
+-}
+-
++int drv_assign_vif_chanctx(struct ieee80211_local *local,
++			   struct ieee80211_sub_if_data *sdata,
++			   struct ieee80211_bss_conf *link_conf,
++			   struct ieee80211_chanctx *ctx);
++void drv_unassign_vif_chanctx(struct ieee80211_local *local,
++			      struct ieee80211_sub_if_data *sdata,
++			      struct ieee80211_bss_conf *link_conf,
++			      struct ieee80211_chanctx *ctx);
+ int drv_switch_vif_chanctx(struct ieee80211_local *local,
+ 			   struct ieee80211_vif_chanctx_switch *vifs,
+ 			   int n_vifs, enum ieee80211_chanctx_switch_mode mode);
+@@ -1556,47 +1472,14 @@ static inline void drv_twt_teardown_request(struct ieee80211_local *local,
+ 	trace_drv_return_void(local);
+ }
+ 
+-static inline int drv_change_vif_links(struct ieee80211_local *local,
+-				       struct ieee80211_sub_if_data *sdata,
+-				       u16 old_links, u16 new_links,
+-				       struct ieee80211_bss_conf *old[IEEE80211_MLD_MAX_NUM_LINKS])
+-{
+-	int ret = -EOPNOTSUPP;
+-
+-	might_sleep();
+-
+-	if (!check_sdata_in_driver(sdata))
+-		return -EIO;
+-
+-	trace_drv_change_vif_links(local, sdata, old_links, new_links);
+-	if (local->ops->change_vif_links)
+-		ret = local->ops->change_vif_links(&local->hw, &sdata->vif,
+-						   old_links, new_links, old);
+-	trace_drv_return_int(local, ret);
+-
+-	return ret;
+-}
+-
+-static inline int drv_change_sta_links(struct ieee80211_local *local,
+-				       struct ieee80211_sub_if_data *sdata,
+-				       struct ieee80211_sta *sta,
+-				       u16 old_links, u16 new_links)
+-{
+-	int ret = -EOPNOTSUPP;
+-
+-	might_sleep();
+-
+-	if (!check_sdata_in_driver(sdata))
+-		return -EIO;
+-
+-	trace_drv_change_sta_links(local, sdata, sta, old_links, new_links);
+-	if (local->ops->change_sta_links)
+-		ret = local->ops->change_sta_links(&local->hw, &sdata->vif, sta,
+-						   old_links, new_links);
+-	trace_drv_return_int(local, ret);
+-
+-	return ret;
+-}
++int drv_change_vif_links(struct ieee80211_local *local,
++			 struct ieee80211_sub_if_data *sdata,
++			 u16 old_links, u16 new_links,
++			 struct ieee80211_bss_conf *old[IEEE80211_MLD_MAX_NUM_LINKS]);
++int drv_change_sta_links(struct ieee80211_local *local,
++			 struct ieee80211_sub_if_data *sdata,
++			 struct ieee80211_sta *sta,
++			 u16 old_links, u16 new_links);
+ 
+ #ifdef CPTCFG_MAC80211_MESH
+ void drv_config_mesh_offload_path(struct ieee80211_local *local,
+diff --git a/net/mac80211/key.c b/net/mac80211/key.c
+index 4d2ae2a..583b018 100644
+--- a/net/mac80211/key.c
++++ b/net/mac80211/key.c
+@@ -179,6 +179,10 @@ static int ieee80211_key_enable_hw_accel(struct ieee80211_key *key)
+ 		}
+ 	}
+ 
++	if (key->conf.link_id >= 0 && sdata->vif.active_links &&
++	    !(sdata->vif.active_links & BIT(key->conf.link_id)))
++		return 0;
++
+ 	ret = drv_set_key(key->local, SET_KEY, sdata,
+ 			  sta ? &sta->sta : NULL, &key->conf);
+ 
+@@ -248,6 +252,10 @@ static void ieee80211_key_disable_hw_accel(struct ieee80211_key *key)
+ 	sta = key->sta;
+ 	sdata = key->sdata;
+ 
++	if (key->conf.link_id >= 0 && sdata->vif.active_links &&
++	    !(sdata->vif.active_links & BIT(key->conf.link_id)))
++		return;
++
+ 	if (!(key->conf.flags & (IEEE80211_KEY_FLAG_GENERATE_MMIC |
+ 				 IEEE80211_KEY_FLAG_PUT_MIC_SPACE |
+ 				 IEEE80211_KEY_FLAG_RESERVE_TAILROOM)))
+diff --git a/net/mac80211/link.c b/net/mac80211/link.c
+index 096f313..8df348a 100644
+--- a/net/mac80211/link.c
++++ b/net/mac80211/link.c
+@@ -73,28 +73,37 @@ struct link_container {
+ 	struct ieee80211_bss_conf conf;
+ };
+ 
+-static void ieee80211_free_links(struct ieee80211_sub_if_data *sdata,
+-				 struct link_container **links)
++static void ieee80211_tear_down_links(struct ieee80211_sub_if_data *sdata,
++				      struct link_container **links, u16 mask)
+ {
++	struct ieee80211_link_data *link;
+ 	LIST_HEAD(keys);
+ 	unsigned int link_id;
+ 
+ 	for (link_id = 0; link_id < IEEE80211_MLD_MAX_NUM_LINKS; link_id++) {
+-		if (!links[link_id])
++		if (!(mask & BIT(link_id)))
++			continue;
++		link = &links[link_id]->data;
++		if (link_id == 0 && !link)
++			link = &sdata->deflink;
++		if (WARN_ON(!link))
+ 			continue;
+-		ieee80211_remove_link_keys(&links[link_id]->data, &keys);
++		ieee80211_remove_link_keys(link, &keys);
++		ieee80211_link_stop(link);
+ 	}
+ 
+ 	synchronize_rcu();
+ 
+ 	ieee80211_free_key_list(sdata->local, &keys);
++}
+ 
+-	for (link_id = 0; link_id < IEEE80211_MLD_MAX_NUM_LINKS; link_id++) {
+-		if (!links[link_id])
+-			continue;
+-		ieee80211_link_stop(&links[link_id]->data);
++static void ieee80211_free_links(struct ieee80211_sub_if_data *sdata,
++				 struct link_container **links)
++{
++	unsigned int link_id;
++
++	for (link_id = 0; link_id < IEEE80211_MLD_MAX_NUM_LINKS; link_id++)
+ 		kfree(links[link_id]);
+-	}
+ }
+ 
+ static int ieee80211_check_dup_link_addrs(struct ieee80211_sub_if_data *sdata)
+@@ -123,11 +132,38 @@ static int ieee80211_check_dup_link_addrs(struct ieee80211_sub_if_data *sdata)
+ 	return 0;
+ }
+ 
++static void ieee80211_set_vif_links_bitmaps(struct ieee80211_sub_if_data *sdata,
++					    u16 links)
++{
++	sdata->vif.valid_links = links;
++
++	if (!links) {
++		sdata->vif.active_links = 0;
++		return;
++	}
++
++	switch (sdata->vif.type) {
++	case NL80211_IFTYPE_AP:
++		/* in an AP all links are always active */
++		sdata->vif.active_links = links;
++		break;
++	case NL80211_IFTYPE_STATION:
++		if (sdata->vif.active_links)
++			break;
++		WARN_ON(hweight16(links) > 1);
++		sdata->vif.active_links = links;
++		break;
++	default:
++		WARN_ON(1);
++	}
++}
++
+ static int ieee80211_vif_update_links(struct ieee80211_sub_if_data *sdata,
+ 				      struct link_container **to_free,
+ 				      u16 new_links)
+ {
+ 	u16 old_links = sdata->vif.valid_links;
++	u16 old_active = sdata->vif.active_links;
+ 	unsigned long add = new_links & ~old_links;
+ 	unsigned long rem = old_links & ~new_links;
+ 	unsigned int link_id;
+@@ -195,13 +231,17 @@ static int ieee80211_vif_update_links(struct ieee80211_sub_if_data *sdata,
+ 		ieee80211_link_init(sdata, -1, &sdata->deflink,
+ 				    &sdata->vif.bss_conf);
+ 
+-	sdata->vif.valid_links = new_links;
+-
+ 	ret = ieee80211_check_dup_link_addrs(sdata);
+ 	if (!ret) {
++		/* for keys we will not be able to undo this */
++		ieee80211_tear_down_links(sdata, to_free, rem);
++
++		ieee80211_set_vif_links_bitmaps(sdata, new_links);
++
+ 		/* tell the driver */
+ 		ret = drv_change_vif_links(sdata->local, sdata,
+-					   old_links, new_links,
++					   old_links & old_active,
++					   new_links & sdata->vif.active_links,
+ 					   old);
+ 	}
+ 
+@@ -209,7 +249,7 @@ static int ieee80211_vif_update_links(struct ieee80211_sub_if_data *sdata,
+ 		/* restore config */
+ 		memcpy(sdata->link, old_data, sizeof(old_data));
+ 		memcpy(sdata->vif.link_conf, old, sizeof(old));
+-		sdata->vif.valid_links = old_links;
++		ieee80211_set_vif_links_bitmaps(sdata, old_links);
+ 		/* and free (only) the newly allocated links */
+ 		memset(to_free, 0, sizeof(links));
+ 		goto free;
+diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
+index 5b5892b..3e46156 100644
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@ -4042,11 +4042,11 @@ static bool ieee80211_assoc_config_link(struct ieee80211_link_data *link,
+ 		goto out;
+ 	}
+ 
+-	sband = ieee80211_get_link_sband(link);
+-	if (!sband) {
++	if (WARN_ON(!link->conf->chandef.chan)) {
+ 		ret = false;
+ 		goto out;
+ 	}
++	sband = local->hw.wiphy->bands[link->conf->chandef.chan->band];
+ 
+ 	if (!(link->u.mgd.conn_flags & IEEE80211_CONN_DISABLE_HE) &&
+ 	    (!elems->he_cap || !elems->he_operation)) {
+@@ -4846,8 +4846,10 @@ static bool ieee80211_assoc_success(struct ieee80211_sub_if_data *sdata,
+ 			err = ieee80211_prep_channel(sdata, link,
+ 						     assoc_data->link[link_id].bss,
+ 						     &link->u.mgd.conn_flags);
+-			if (err)
++			if (err) {
++				link_info(link, "prep_channel failed\n");
+ 				goto out_err;
++			}
+ 		}
+ 
+ 		err = ieee80211_mgd_setup_link_sta(link, sta, link_sta,
+diff --git a/net/mac80211/util.c b/net/mac80211/util.c
+index 27ae770..069aa7e 100644
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -2904,7 +2904,7 @@ void ieee80211_recalc_min_chandef(struct ieee80211_sub_if_data *sdata,
+ 		 */
+ 		rcu_read_unlock();
+ 
+-		if (WARN_ON_ONCE(!chanctx_conf))
++		if (!chanctx_conf)
+ 			goto unlock;
+ 
+ 		chanctx = container_of(chanctx_conf, struct ieee80211_chanctx,
+-- 
+2.17.1
+

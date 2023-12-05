@@ -1,0 +1,139 @@
+From 9d666eda50b8623af32e6724e34644e63721afb6 Mon Sep 17 00:00:00 2001
+From: Harshitha Prem <quic_hprem@quicinc.com>
+Date: Tue, 21 Mar 2023 21:07:03 +0530
+Subject: [PATCH] wifi: ath12k: fix usage of same vdev_id for same soc
+
+when stability test is ran with multiple combination of
+mesh interfaces, monitor interfaces and virtual AP interfaces,
+firmware assert is seen with the reason of same vdev_id used
+for two interfaces in same soc.
+
+This is because, whenever vdev_id is assigned it is protected
+by ar locks and the updation of free vdev is done only after wmi
+command successful which are not sufficient in case of split mac cases,
+where more than one radio is present in an soc, and it does not protect
+under race condition where two interface simultaneously fetch the same
+vdev id when one of the interface is still processing its wmi command.
+
+To handle the same, add changes to protect the free_vdev_map with
+ab locks as well as update the free_vdev_map as soon as fetched for
+assignment without waiting for wmi command result.
+
+Signed-off-by: Harshitha Prem <quic_hprem@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -1191,7 +1191,10 @@ static int ath12k_mac_monitor_vdev_creat
+ 		return -ENOMEM;
+ 	}
+ 
++	spin_lock_bh(&ar->ab->base_lock);
+ 	bit = __ffs64(ar->ab->free_vdev_map);
++	ar->ab->free_vdev_map &= ~(1LL << bit);
++	spin_unlock_bh(&ar->ab->base_lock);
+ 
+ 	ar->monitor_vdev_id = bit;
+ 
+@@ -1215,6 +1218,9 @@ static int ath12k_mac_monitor_vdev_creat
+ 	if (ret) {
+ 		ath12k_warn(ar->ab, "failed to request monitor vdev %i creation: %d\n",
+ 			    ar->monitor_vdev_id, ret);
++		spin_lock_bh(&ar->ab->base_lock);
++		ar->ab->free_vdev_map |= 1LL << (ar->monitor_vdev_id);
++		spin_unlock_bh(&ar->ab->base_lock);
+ 		ar->monitor_vdev_id = -1;
+ 		return ret;
+ 	}
+@@ -1233,7 +1239,6 @@ static int ath12k_mac_monitor_vdev_creat
+ 		return ret;
+ 
+ 	ar->allocated_vdev_map |= 1LL << ar->monitor_vdev_id;
+-	ar->ab->free_vdev_map &= ~(1LL << ar->monitor_vdev_id);
+ 	ar->num_created_vdevs++;
+ 	set_bit(MONITOR_VDEV_CREATED, &ar->monitor_flags);
+ 
+@@ -1268,9 +1273,11 @@ static int ath12k_mac_monitor_vdev_delet
+ 		ath12k_warn(ar->ab, "Timeout in receiving vdev delete response\n");
+ 	} else {
+ 		ar->allocated_vdev_map &= ~(1LL << ar->monitor_vdev_id);
++		spin_lock_bh(&ar->ab->base_lock);
+ 		ar->ab->free_vdev_map |= 1LL << (ar->monitor_vdev_id);
+ 		ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac monitor vdev %d deleted\n",
+ 			   ar->monitor_vdev_id);
++		spin_unlock_bh(&ar->ab->base_lock);
+ 		ar->num_created_vdevs--;
+ 		ar->monitor_vdev_id = -1;
+ 		clear_bit(MONITOR_VDEV_CREATED, &ar->monitor_flags);
+@@ -4701,7 +4708,10 @@ static int ath12k_mac_vdev_delete(struct
+ 		goto clean_up;
+ 	}
+ 
++	spin_lock_bh(&ar->ab->base_lock);
+ 	ar->ab->free_vdev_map |= 1LL << arvif->vdev_id;
++	spin_unlock_bh(&ar->ab->base_lock);
++
+ 	ar->allocated_vdev_map &= ~(1LL << arvif->vdev_id);
+ 	ar->ab->free_vdev_stats_id_map &= ~(1LL << arvif->vdev_stats_id);
+ 	ar->num_created_vdevs--;
+@@ -9461,13 +9471,18 @@ static int ath12k_mac_vdev_create(struct
+ 		}
+ 	}
+ 
++	spin_lock_bh(&ar->ab->base_lock);
++
+ 	if (!ab->free_vdev_map) {
++		spin_unlock_bh(&ar->ab->base_lock);
+ 		ath12k_warn(ar->ab, "failed to create vdev. No free vdev id left.\n");
+ 		ret = -EINVAL;
+ 		goto err;
+ 	}
+ 
+ 	vdev_id = __ffs64(ab->free_vdev_map);
++	ab->free_vdev_map &= ~(1LL << vdev_id);
++	spin_unlock_bh(&ar->ab->base_lock);
+ 
+ 	arvif->vdev_id = vdev_id;
+ 	/* Assume it as non-mbssid initially, well overwrite it later.
+@@ -9522,6 +9537,10 @@ static int ath12k_mac_vdev_create(struct
+ 	if (ret) {
+ 		ath12k_warn(ab, "failed to create WMI vdev %d: %d\n",
+ 			    arvif->vdev_id, ret);
++	        spin_lock_bh(&ar->ab->base_lock);
++		ab->free_vdev_map |= 1LL << arvif->vdev_id;
++		spin_unlock_bh(&ar->ab->base_lock);
++
+ 		goto err;
+ 	}
+ 
+@@ -9532,7 +9551,6 @@ static int ath12k_mac_vdev_create(struct
+ 		   link_addr, arvif->vdev_id);
+ 
+ 	ar->allocated_vdev_map |= 1LL << arvif->vdev_id;
+-	ab->free_vdev_map &= ~(1LL << arvif->vdev_id);
+ 
+ 	spin_lock_bh(&ar->data_lock);
+ 	list_add(&arvif->list, &ar->arvifs);
+@@ -9666,7 +9684,9 @@ err_vdev_del:
+ 	ar->num_created_vdevs--;
+ 	arvif->is_created = false;
+ 	ar->allocated_vdev_map &= ~(1LL << arvif->vdev_id);
++	spin_lock_bh(&ar->ab->base_lock);
+ 	ab->free_vdev_map |= 1LL << arvif->vdev_id;
++	spin_unlock_bh(&ar->ab->base_lock);
+ 	ab->free_vdev_stats_id_map &= ~(1LL << arvif->vdev_stats_id);
+ 	spin_lock_bh(&ar->data_lock);
+ 	list_del(&arvif->list);
+@@ -15095,7 +15115,10 @@ int ath12k_mac_allocate(struct ath12k_hw
+ 
+ 				/* Initialize channel counters frequency value in hertz */
+ 				ab->cc_freq_hz = 320000;
++
++				spin_lock_bh(&ab->base_lock);
+ 				ab->free_vdev_map = (1LL << (ab->num_radios * TARGET_NUM_VDEVS)) - 1;
++				spin_unlock_bh(&ab->base_lock);
+ 
+ 				ath12k_dp_pdev_pre_alloc(ab);
+ 			}
