@@ -64,7 +64,7 @@ config-$(call config_package,ath10k) += ATH10K ATH10K_PCI
 config-$(call config_package,ath11k) += ATH11K ATH11K_AHB ATH11K_SPECTRAL ATH11K_DEBUG ATH11K_CFR
 config-$(call config_package,ath11k-pci) += ATH11K_PCI
 config-$(call config_package,ath12k) += ATH12K
-config-y += ATH12K_SPECTRAL
+config-y += ATH12K_SPECTRAL ATH12K_AHB
 
 #ifeq ($(CONFIG_KERNEL_IPQ_MEM_PROFILE),512)
 config-y += ATH11K_MEM_PROFILE_512M
@@ -289,7 +289,7 @@ define KernelPackage/ath11k
   $(call KernelPackage/mac80211/Default)
   TITLE:=Atheros 802.11ax wireless cards support
   URL:=https://wireless.wiki.kernel.org/en/users/drivers/ath11k
-  DEPENDS+= @TARGET_ipq95xx +kmod-ath +@DRIVER_11N_SUPPORT +@DRIVER_11AC_SUPPORT +@DRIVER_11W_SUPPORT \
+  DEPENDS+= @(TARGET_ipq95xx||TARGET_ipq53xx) +kmod-ath +@DRIVER_11N_SUPPORT +@DRIVER_11AC_SUPPORT +@DRIVER_11W_SUPPORT \
   	+@DRIVER_11AX_SUPPORT
   FILES:= \
 	$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath11k/ath11k.ko
@@ -324,7 +324,7 @@ define KernelPackage/ath12k
   $(call KernelPackage/mac80211/Default)
   TITLE:=Atheros 802.11be wireless cards support
   URL:=https://wireless.wiki.kernel.org/en/users/drivers/ath12k
-  DEPENDS+= @TARGET_ipq95xx +kmod-ath +@DRIVER_11N_SUPPORT +@DRIVER_11AC_SUPPORT +@DRIVER_11W_SUPPORT \
+  DEPENDS+= @(TARGET_ipq95xx||TARGET_ipq53xx) +kmod-ath +@DRIVER_11N_SUPPORT +@DRIVER_11AC_SUPPORT +@DRIVER_11W_SUPPORT \
   	+@DRIVER_11AX_SUPPORT
   FILES:= \
 	$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/ath12k.ko
