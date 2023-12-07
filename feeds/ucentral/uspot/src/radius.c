@@ -181,7 +181,7 @@ static int cb_chap_passwd(void *p, size_t s, struct blob_attr *b)
 	int len;
 
 	assert(s >= 17);
-	len = str_to_hex(blobmsg_get_string(b), str+1, 16);
+	len = str_to_hex(blobmsg_get_string(b), str+1, 17);
 
 	return len+1;
 }
@@ -192,7 +192,7 @@ static int cb_chap_challenge(void *p, size_t s, struct blob_attr *b)
 	int len;
 
 	assert(s >= 16);
-	len = str_to_hex(blobmsg_get_string(b), str, 16);
+	len = str_to_hex(blobmsg_get_string(b), str, 17);
 
 	return len;
 }
