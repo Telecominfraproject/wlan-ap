@@ -460,8 +460,10 @@ function run_service() {
 
 				address = uc(address);
 
-				if (interfaces[interface].clients[address])
+				if (interfaces[interface].clients[address]) {
+					radius_terminate(interface, address, radtc_logout);
 					client_remove(interface, address, 'client_remove event');
+				}
 
 				return 0;
 			},
