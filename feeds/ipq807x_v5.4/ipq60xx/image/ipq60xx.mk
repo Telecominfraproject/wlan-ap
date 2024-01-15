@@ -25,7 +25,7 @@ define Device/hfcl_ion4xe
   DEVICE_DTS := qcom-ipq6018-hfcl-ion4xe
   DEVICE_DTS_CONFIG := config@cp01-c1
   SUPPORTED_DEVICES := hfcl,ion4xe
-  DEVICE_PACKAGES := ath11k-wifi-qcom-ipq6018 uboot-envtools kmod-hwmon-lm75
+  DEVICE_PACKAGES := ath11k-wifi-hfcl-ion4xe uboot-envtools kmod-hwmon-lm75
 endef
 TARGET_DEVICES += hfcl_ion4xe
 
