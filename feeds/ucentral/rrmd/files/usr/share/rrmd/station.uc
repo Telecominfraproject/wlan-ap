@@ -29,8 +29,9 @@ function station_add(device, addr, data, seen, bssid) {
 			beacon_report: {},
 		};
 
-		if (config.beacon_request_assoc)
+	/*	if (config.beacon_request_assoc)
 			stations[addr].beacon_request_assoc = time();
+	*/
 	}
 
 	/* update device, seen and signal data */
@@ -47,6 +48,7 @@ function station_add(device, addr, data, seen, bssid) {
 		global.event.send('rrm.station.add', { addr, rrm: stations[addr].rrm, bssid });
 
 	/* check if a beacon_report should be triggered */
+	/*
 	if (stations[addr].beacon_request_assoc && time() - stations[addr].beacon_request_assoc >= 30) {
 		global.station.beacon_request({ addr, channel: stations[addr].channel});
 		stations[addr].beacon_request_assoc = 0;	
@@ -56,6 +58,7 @@ function station_add(device, addr, data, seen, bssid) {
 		global.event.send('rrm.beacon.report', { addr, report: stations[addr].beacon_report });
 		stations[addr].beacon_report_seen = 0;
 	}
+	*/
 }
 
 function station_del(addr) {
