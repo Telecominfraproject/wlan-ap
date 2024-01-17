@@ -1,10 +1,19 @@
 KERNEL_LOADADDR := 0x41080000
 
+define Device/cig_wf186h
+  DEVICE_TITLE := Cigtech WF-186h
+  DEVICE_DTS := qcom-ipq5018-cig-wf186h
+  SUPPORTED_DEVICES := cig,wf186h
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf186h ath11k-firmware-ipq50xx-map-spruce
+  DEVICE_DTS_CONFIG := config@mp03.3
+endef
+TARGET_DEVICES += cig_wf186h
+
 define Device/cig_wf186w
   DEVICE_TITLE := Cigtech WF-186w
   DEVICE_DTS := qcom-ipq5018-cig-wf186w
   SUPPORTED_DEVICES := cig,wf186w
-  DEVICE_PACKAGES := ath11k-wifi-cig-wf186w ath11k-firmware-ipq50xx-map-spruce kmod-switch-rtl8367c
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf186w ath11k-firmware-ipq50xx-map-spruce
   DEVICE_DTS_CONFIG := config@mp03.3
 endef
 TARGET_DEVICES += cig_wf186w
@@ -63,6 +72,15 @@ define Device/edgecore_oap101e_6e
 endef
 TARGET_DEVICES += edgecore_oap101e_6e
 
+define Device/hfcl_ion4x_w
+  DEVICE_TITLE := HFCL ION4x_w
+  DEVICE_DTS := qcom-ipq5018-hfcl-ion4x_w
+  SUPPORTED_DEVICES := hfcl,ion4x_w
+  DEVICE_PACKAGES := ath11k-wifi-hfcl-ion4x_w ath11k-firmware-ipq50xx-map-spruce
+  DEVICE_DTS_CONFIG := config@mp03.3
+endef
+TARGET_DEVICES += hfcl_ion4x_w
+
 define Device/hfcl_ion4xi_w
   DEVICE_TITLE := HFCL ION4xi_w
   DEVICE_DTS := qcom-ipq5018-hfcl-ion4xi_w
@@ -71,3 +89,39 @@ define Device/hfcl_ion4xi_w
   DEVICE_DTS_CONFIG := config@mp03.3
 endef
 TARGET_DEVICES += hfcl_ion4xi_w
+
+define Device/optimcloud_d50-5g
+  DEVICE_TITLE := OptimCloud D50-5G
+  DEVICE_DTS := qcom-ipq5018-optimcloud-d50-5g
+  SUPPORTED_DEVICES := optimcloud,d50-5g
+  DEVICE_PACKAGES := ath11k-wifi-optimcloud-d50 ath11k-firmware-ipq50xx ath11k-firmware-qcn9000
+  DEVICE_DTS_CONFIG := config@mp03.1
+endef
+TARGET_DEVICES += optimcloud_d50-5g
+
+define Device/optimcloud_d50
+  DEVICE_TITLE := OptimCloud D50
+  DEVICE_DTS := qcom-ipq5018-optimcloud-d50
+  SUPPORTED_DEVICES := optimcloud,d50
+  DEVICE_PACKAGES := ath11k-wifi-optimcloud-d50 ath11k-firmware-ipq50xx ath11k-firmware-qcn9000 ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.1
+endef
+TARGET_DEVICES += optimcloud_d50
+
+define Device/optimcloud_d60-5g
+  DEVICE_TITLE := OptimCloud D60-5G
+  DEVICE_DTS := qcom-ipq5018-optimcloud-d60-5g
+  SUPPORTED_DEVICES := optimcloud,d60-5g
+  DEVICE_PACKAGES := ath11k-wifi-optimcloud-d60 ath11k-firmware-ipq50xx ath11k-firmware-qcn9000
+  DEVICE_DTS_CONFIG := config@mp03.1
+endef
+TARGET_DEVICES += optimcloud_d60-5g
+
+define Device/optimcloud_d60
+  DEVICE_TITLE := OptimCloud D60
+  DEVICE_DTS := qcom-ipq5018-optimcloud-d60
+  SUPPORTED_DEVICES := optimcloud,d60
+  DEVICE_PACKAGES := ath11k-wifi-optimcloud-d60 ath11k-firmware-ipq50xx ath11k-firmware-qcn9000 ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.1
+endef
+TARGET_DEVICES += optimcloud_d60

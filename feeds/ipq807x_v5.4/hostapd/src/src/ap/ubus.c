@@ -24,6 +24,7 @@
 #include "taxonomy.h"
 #include "airtime_policy.h"
 #include "hw_features.h"
+#include "ieee802_11_auth.h"
 
 static struct ubus_context *ctx;
 static struct blob_buf b;
@@ -507,6 +508,7 @@ enum {
 	DEL_CLIENT_REASON,
 	DEL_CLIENT_DEAUTH,
 	DEL_CLIENT_BAN_TIME,
+	DEL_CLIENT_GLOBAL_BAN,
 	__DEL_CLIENT_MAX
 };
 
@@ -515,7 +517,26 @@ static const struct blobmsg_policy del_policy[__DEL_CLIENT_MAX] = {
 	[DEL_CLIENT_REASON] = { "reason", BLOBMSG_TYPE_INT32 },
 	[DEL_CLIENT_DEAUTH] = { "deauth", BLOBMSG_TYPE_INT8 },
 	[DEL_CLIENT_BAN_TIME] = { "ban_time", BLOBMSG_TYPE_INT32 },
+	[DEL_CLIENT_GLOBAL_BAN] = { "global_ban", BLOBMSG_TYPE_INT8 },
 };
+
+static int
+hostapd_bss_del_client_cb(struct hostapd_iface *iface, void *ctx)
+{
+	struct blob_attr **tb = ctx;
+	u8 addr[ETH_ALEN];
+	int i;
+
+	hwaddr_aton(blobmsg_data(tb[DEL_CLIENT_ADDR]), addr);
+
+	syslog(0, "blogic %s:%s[%d]\n", __FILE__, __func__, __LINE__);
+	for (i = 0; i < iface->num_bss; i++) {
+		struct hostapd_data *bss = iface->bss[i];
+
+		hostapd_bss_ban_client(bss, addr, blobmsg_get_u32(tb[DEL_CLIENT_BAN_TIME]));
+	}
+	return 0;
+}
 
 static int
 hostapd_bss_del_client(struct ubus_context *ctx, struct ubus_object *obj,
@@ -525,8 +546,8 @@ hostapd_bss_del_client(struct ubus_context *ctx, struct ubus_object *obj,
 	struct blob_attr *tb[__DEL_CLIENT_MAX];
 	struct hostapd_data *hapd = container_of(obj, struct hostapd_data, ubus.obj);
 	struct sta_info *sta;
-	bool deauth = false;
-	int reason;
+	bool deauth = false, global = false;
+	int reason, ban_time = 0;;
 	u8 addr[ETH_ALEN];
 
 	blobmsg_parse(del_policy, __DEL_CLIENT_MAX, tb, blob_data(msg), blob_len(msg));
@@ -543,6 +564,9 @@ hostapd_bss_del_client(struct ubus_context *ctx, struct ubus_object *obj,
 	if (tb[DEL_CLIENT_DEAUTH])
 		deauth = blobmsg_get_bool(tb[DEL_CLIENT_DEAUTH]);
 
+	if (tb[DEL_CLIENT_GLOBAL_BAN])
+		global = blobmsg_get_bool(tb[DEL_CLIENT_GLOBAL_BAN]);
+
 	sta = ap_get_sta(hapd, addr);
 	if (sta) {
 		if (deauth) {
@@ -554,8 +578,13 @@ hostapd_bss_del_client(struct ubus_context *ctx, struct ubus_object *obj,
 		}
 	}
 
-	if (tb[DEL_CLIENT_BAN_TIME])
-		hostapd_bss_ban_client(hapd, addr, blobmsg_get_u32(tb[DEL_CLIENT_BAN_TIME]));
+	if (tb[DEL_CLIENT_BAN_TIME]) {
+		ban_time = blobmsg_get_u32(tb[DEL_CLIENT_BAN_TIME]); 
+		if (global)
+			hapd->iface->interfaces->for_each_interface(hapd->iface->interfaces, hostapd_bss_del_client_cb, tb);
+		else
+			hostapd_bss_ban_client(hapd, addr, ban_time);
+	}
 
 	return 0;
 }
@@ -819,7 +848,7 @@ hostapd_switch_chan(struct ubus_context *ctx, struct ubus_object *obj,
 				chwidth, seg0, seg1,
 				iconf->vht_capab,
 				mode ? &mode->he_capab[IEEE80211_MODE_AP] :
-				NULL, NULL);
+				NULL, 0);
 
 	for (i = 0; i < hapd->iface->num_bss; i++) {
 		struct hostapd_data *bss = hapd->iface->bss[i];
@@ -1604,11 +1633,47 @@ hostapd_wired_del_clients(struct ubus_context *ctx, struct ubus_object *obj,
 	return 0;
 }
 
+enum {
+	MAC_AUTH_ADDR,
+	__MAC_AUTH_MAX
+};
+
+static const struct blobmsg_policy mac_auth_policy[__MAC_AUTH_MAX] = {
+	[MAC_AUTH_ADDR] = { "addr", BLOBMSG_TYPE_STRING },
+};
+
+static int
+hostapd_wired_mac_auth(struct ubus_context *ctx, struct ubus_object *obj,
+		       struct ubus_request_data *req, const char *method,
+		       struct blob_attr *msg)
+{
+	struct hostapd_data *hapd = container_of(obj, struct hostapd_data, ubus.obj);
+	struct blob_attr *tb[__MAC_AUTH_MAX];
+        struct radius_sta rad_info;
+	struct sta_info *sta;
+	u8 addr[ETH_ALEN];
+	int acl_res;
+	
+	blobmsg_parse(mac_auth_policy, __MAC_AUTH_MAX, tb, blob_data(msg), blob_len(msg));
+
+	if (hwaddr_aton(blobmsg_data(tb[MAC_AUTH_ADDR]), addr))
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
+        acl_res = hostapd_allowed_address(hapd, addr, NULL, 0, &rad_info, 0);
+        if (acl_res == HOSTAPD_ACL_REJECT) {
+                wpa_printf(MSG_ERROR, "Ignore new peer notification\n");
+                return UBUS_STATUS_INVALID_ARGUMENT;
+        }
+
+	return 0;
+}
+
 static const struct ubus_method wired_methods[] = {
 	UBUS_METHOD_NOARG("reload", hostapd_bss_reload),
 	UBUS_METHOD_NOARG("get_clients", hostapd_wired_get_clients),
 	UBUS_METHOD_NOARG("del_clients", hostapd_wired_del_clients),
 	UBUS_METHOD_NOARG("get_status", hostapd_wired_get_status),
+	UBUS_METHOD("mac_auth", hostapd_wired_mac_auth, mac_auth_policy),
 };
 
 static struct ubus_object_type wired_object_type =
@@ -1847,6 +1912,8 @@ void hostapd_ubus_notify_authorized(struct hostapd_data *hapd, struct sta_info *
 
 	blob_buf_init(&b, 0);
 	blobmsg_add_macaddr(&b, "address", sta->addr);
+	if (sta->vlan_id)
+		blobmsg_add_u32(&b, "vlan", sta->vlan_id);
 	blobmsg_add_string(&b, "ifname", hapd->conf->iface);
 	if (sta->bandwidth[0] || sta->bandwidth[1]) {
 		void *r = blobmsg_open_array(&b, "rate-limit");

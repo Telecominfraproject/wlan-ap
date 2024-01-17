@@ -167,7 +167,7 @@ define Package/hostapd-openssl
 $(call Package/hostapd/Default,$(1))
   TITLE+= (OpenSSL full)
   VARIANT:=full-openssl
-  DEPENDS+=+libopenssl
+  DEPENDS+=+libopenssl +libopenssl-legacy
 endef
 
 Package/hostapd-openssl/description = $(Package/hostapd/description)
@@ -253,7 +253,7 @@ define Package/wpad-openssl
 $(call Package/wpad/Default,$(1))
   TITLE+= (OpenSSL full)
   VARIANT:=wpad-full-openssl
-  DEPENDS+=+libopenssl
+  DEPENDS+=+libopenssl +libopenssl-legacy
 endef
 
 Package/wpad-openssl/description = $(Package/wpad/description)
@@ -506,7 +506,7 @@ TARGET_CPPFLAGS := \
 	$(if $(CONFIG_WPA_MSG_MIN_PRIORITY),-DCONFIG_MSG_MIN_PRIORITY=$(CONFIG_WPA_MSG_MIN_PRIORITY))
 
 TARGET_CFLAGS += -ffunction-sections -fdata-sections -flto
-TARGET_LDFLAGS += -Wl,--gc-sections -flto=jobserver -fuse-linker-plugin -lubox -lubus -lucode
+TARGET_LDFLAGS += -Wl,--gc-sections -flto=jobserver -fuse-linker-plugin -lubox -lubus -lucode -lblobmsg_json
 
 ifdef CONFIG_PACKAGE_kmod-cfg80211
   TARGET_LDFLAGS += -lm -lnl-tiny
@@ -592,6 +592,12 @@ endef
 define Install/hostapd
 	$(INSTALL_DIR) $(1)/usr/sbin $(1)/usr/share/hostap
 	$(INSTALL_DATA) ./files/hostapd.uc $(1)/usr/share/hostap/
+	$(INSTALL_DIR) $(1)/etc/init.d $(1)/etc/config $(1)/etc/radius
+	ln -sf hostapd $(1)/usr/sbin/hostapd-radius
+	$(INSTALL_BIN) ./files/radius.init $(1)/etc/init.d/radius
+	$(INSTALL_DATA) ./files/radius.config $(1)/etc/config/radius
+	$(INSTALL_DATA) ./files/radius.clients $(1)/etc/radius/clients
+	$(INSTALL_DATA) ./files/radius.users $(1)/etc/radius/users
 endef
 
 define Install/supplicant
@@ -613,6 +619,7 @@ endef
 define Package/hostapd/install
 	$(call Install/hostapd,$(1))
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/hostapd/hostapd $(1)/usr/sbin/
+	$(Install/hostapd/full)
 endef
 Package/hostapd-basic/install = $(Package/hostapd/install)
 Package/hostapd-basic-openssl/install = $(Package/hostapd/install)

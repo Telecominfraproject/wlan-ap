@@ -9,6 +9,16 @@ function store_config() {
 	fs.writefile('/etc/ucentral/gateway.json', gw);
 }
 
+function store_config_uci(path) {
+        let cursor = uci.cursor(path);
+        let redir = split(config.Redirector, ":");
+
+        cursor.load("ucentral");
+        cursor.set("ucentral", "config", "server", redir[0]);
+        cursor.set("ucentral", "config", "port", redir[1] || 15002);
+        cursor.commit();
+}
+
 function digicert() {
 	let devid;
 	let fd = fs.open("/etc/ucentral/dev-id", "r");
@@ -61,6 +71,8 @@ function digicert() {
 if (!fs.stat('/etc/ucentral/gateway.json')) {
 	digicert();
 	store_config();
+	store_config_uci();
+	store_config_uci("/etc/config-shadow/");
 	warn("firstcontact: managed to look up redirector\n");
 }
 
