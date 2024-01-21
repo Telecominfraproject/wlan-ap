@@ -27,13 +27,30 @@ dhcpsnoop_ubus_config(struct ubus_context *ctx, struct ubus_object *obj,
 	blobmsg_parse(dhcpsnoop_config_policy, __DS_CONFIG_MAX, tb,
 		      blobmsg_data(msg), blobmsg_len(msg));
 
-	dhcpsnoop_dev_config_update(tb[DS_CONFIG_DEVICES]);
+	dhcpsnoop_dev_config_update(tb[DS_CONFIG_DEVICES], false);
 
 	dhcpsnoop_dev_check();
 
 	return 0;
 }
 
+
+static int
+dhcpsnoop_ubus_add_devices(struct ubus_context *ctx, struct ubus_object *obj,
+		           struct ubus_request_data *req, const char *method,
+		           struct blob_attr *msg)
+{
+	struct blob_attr *tb[__DS_CONFIG_MAX];
+
+	blobmsg_parse(dhcpsnoop_config_policy, __DS_CONFIG_MAX, tb,
+		      blobmsg_data(msg), blobmsg_len(msg));
+
+	dhcpsnoop_dev_config_update(tb[DS_CONFIG_DEVICES], true);
+
+	dhcpsnoop_dev_check();
+
+	return 0;
+}
 
 static int
 dhcpsnoop_ubus_check_devices(struct ubus_context *ctx, struct ubus_object *obj,
@@ -61,6 +78,7 @@ dhcpsnoop_ubus_dump(struct ubus_context *ctx, struct ubus_object *obj,
 
 static const struct ubus_method dhcpsnoop_methods[] = {
 	UBUS_METHOD("config", dhcpsnoop_ubus_config, dhcpsnoop_config_policy),
+	UBUS_METHOD("add_devices", dhcpsnoop_ubus_add_devices, dhcpsnoop_config_policy),
 	UBUS_METHOD_NOARG("check_devices", dhcpsnoop_ubus_check_devices),
 	UBUS_METHOD_NOARG("dump", dhcpsnoop_ubus_dump),
 };

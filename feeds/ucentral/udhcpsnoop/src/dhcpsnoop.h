@@ -16,7 +16,7 @@ int dhcpsnoop_run_cmd(char *cmd, bool ignore_error);
 
 int dhcpsnoop_dev_init(void);
 void dhcpsnoop_dev_done(void);
-void dhcpsnoop_dev_config_update(struct blob_attr *data);
+void dhcpsnoop_dev_config_update(struct blob_attr *data, bool add_only);
 void dhcpsnoop_dev_check(void);
 
 void dhcpsnoop_ubus_init(void);
