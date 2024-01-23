@@ -21,8 +21,7 @@ DEFAULT_PACKAGES += \
 	kmod-usb-phy-ipq5018 kmod-usb-dwc3-qcom-internal \
 	kmod-qca-nss-ppe kmod-qca-ssdk-nohnat kmod-qca-psdk \
 	kmod-gpio-button-hotplug iwinfo uboot-envtools swconfig \
-	kmod-ath11k-ahb \
-	kmod-ath12k ath12k-firmware-qcn92xx wpad-openssl \
+	kmod-ath12k wpad-openssl \
 	-procd-ujail
 
 $(eval $(call BuildTarget))
