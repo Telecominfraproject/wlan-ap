@@ -20,7 +20,7 @@ DEFAULT_PACKAGES += kmod-qca-nss-dp kmod-qca-ssdk swconfig \
 	kmod-usb-phy-ipq5018 kmod-usb-dwc3-qcom-internal \
 	kmod-ath11k-ahb  ath11k-firmware-ipq5018 \
 	kmod-gpio-button-hotplug iwinfo \
-	qca-ssdk-shell \
+	qca-ssdk-shell kmod-bootconfig \
 	uboot-envtools -procd-ujail
 
 $(eval $(call BuildTarget))
