@@ -123,17 +123,23 @@ when       who     what, where, why
 
 #define GUID_LEN 16
 
-#ifdef ANDROID
+#if defined (ANDROID) || defined (USE_ANDROID_LOGGING)
 	#define LOG_TAG "Diag_Lib"
 	#define DIAG_LOGE(...)  { \
 		ALOGE(__VA_ARGS__); \
 		if (!diag_disable_console) \
 			printf(__VA_ARGS__); \
 	}
-	#include <cutils/log.h>
-        #include "common_log.h"
+	#define DIAG_LOGD(...)  { \
+		ALOGE(__VA_ARGS__); \
+		if (!diag_disable_console) \
+			printf(__VA_ARGS__); \
+	}
+	#include <log/log.h>
+    #include "common_log.h"
 #else
 	#define DIAG_LOGE(...) printf (__VA_ARGS__)
+	#define DIAG_LOGD(...) printf (__VA_ARGS__)
 #endif
 #include <pthread.h>
 #include <stdio.h>
@@ -166,6 +172,12 @@ typedef enum {
 	DB_PARSER_STATE_READ,
 	DB_PARSER_STATE_CLOSE,
 } qsr4_db_file_parser_state;
+
+/* enum to handle packet processing status */
+enum pkt_status{
+	PKT_PROCESS_ONGOING,
+	PKT_PROCESS_DONE
+};
 
 /*
  * Structure to keep track of diag callback interface clients. Please note that

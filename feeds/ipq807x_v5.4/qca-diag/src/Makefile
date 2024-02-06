@@ -2,7 +2,7 @@ INCLUDE_DIR +=  include -I src
 LIB	:= -lpthread -shared
 LDFLAGS +=  -Llib/ -ldiag -lpthread -pie
 FLAGS = -fPIC -g -DUSE_MUSL
-EXTRA_CFLAGS = $(TARGET_CFLAGS) $(TARGET_LDFLAGS) $(TARGET_CPPFLAGS) -fstack-protector-all -znow -zrelro -Werror -Wno-error=attributes
+EXTRA_CFLAGS = $(TARGET_CFLAGS) $(TARGET_LDFLAGS) $(TARGET_CPPFLAGS) -fstack-protector-all -znow -zrelro -Werror -Wno-error=address-of-packed-member -Wl,--allow-multiple-definition -Wno-error=attributes 
 sample_cliobj	:= dci_client/diag_dci_sample.c
 klogobj		:= klog/diag_klog.c
 mdobj		:= mdlog/diag_mdlog.c
