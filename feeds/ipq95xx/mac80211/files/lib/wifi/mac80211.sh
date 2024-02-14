@@ -72,6 +72,8 @@ BEGIN {
 		if (vht && band != "1:") mode="VHT80"
 		if (he) mode="HE80"
 		if (he && band == "1:") mode="HE20"
+		if (be) mode="EHT80"
+		if (be && band == "1:") mode="EHT20"
                 sub("\\[", "", channel)
                 sub("\\]", "", channel)
                 bands = bands band channel ":" mode " "
@@ -85,6 +87,7 @@ $1 == "Band" {
 	vht = ""
 	ht = ""
 	he = ""
+	be = ""
 }
 
 $0 ~ "Capabilities:" {
@@ -97,6 +100,10 @@ $0 ~ "VHT Capabilities" {
 
 $0 ~ "HE Iftypes" {
 	he=1
+}
+
+$0 ~ "EHT Iftypes" {
+	be=1
 }
 
 $1 == "*" && $3 == "MHz" && $0 !~ /disabled/ && band && !channel {
