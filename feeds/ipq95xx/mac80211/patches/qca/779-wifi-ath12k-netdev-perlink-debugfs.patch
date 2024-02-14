@@ -1,0 +1,552 @@
+From 5670c880488b363b9dd907e601c5179f974da84f Mon Sep 17 00:00:00 2001
+From: Benjamin Berg <benjamin.berg@intel.com>
+Date: Thu, 1 Jun 2023 12:46:33 +0530
+Subject: [PATCH] UPSTREAM: wifi: mac80211: add netdev per-link debugfs data and driver
+ hook
+
+This adds the infrastructure to have netdev specific per-link data both
+for mac80211 and the driver in debugfs. For the driver, a new callback
+is added which is only used if MLO is supported.
+
+Cherry-picked from: https://patchwork.kernel.org/project/linux-wireless/patch/20230301115906.fb4c947e4df8.I69b3516ddf4c8a7501b395f652d6063444ecad63@changeid/
+
+Signed-off-by: Benjamin Berg <benjamin.berg@intel.com>
+Signed-off-by: Gregory Greenman <gregory.greenman@intel.com>
+Signed-off-by: Karthik M <quic_karm@quicinc.com>
+---
+ include/net/mac80211.h        |  10 ++
+ net/mac80211/debugfs_netdev.c | 245 ++++++++++++++++++++++------------
+ net/mac80211/debugfs_netdev.h |  21 +--
+ net/mac80211/driver-ops.c     |  27 +++-
+ net/mac80211/driver-ops.h     |  16 +++
+ net/mac80211/ieee80211_i.h    |   4 +
+ net/mac80211/link.c           |   5 +-
+ 7 files changed, 234 insertions(+), 94 deletions(-)
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -3919,6 +3919,12 @@ struct ieee80211_ppe_vp_ds_params {
+  *	the station. See @sta_pre_rcu_remove if needed.
+  *	This callback can sleep.
+  *
++ * @link_add_debugfs: Drivers can use this callback to add debugfs files
++ *	when a link is added to a mac80211 vif. This callback should be within
++ *	a CPTCFG_MAC80211_DEBUGFS conditional. This callback can sleep.
++ *	For non-MLO the callback will be called once for the default bss_conf
++ *	with the vif's directory rather than a separate subdirectory.
++ *
+  * @sta_add_debugfs: Drivers can use this callback to add debugfs files
+  *	when a station is added to mac80211's station list. This callback
+  *	should be within a CPTCFG_MAC80211_DEBUGFS conditional. This
+@@ -4393,6 +4399,10 @@ struct ieee80211_ops {
+ 	int (*sta_remove)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			  struct ieee80211_sta *sta);
+ #ifdef CPTCFG_MAC80211_DEBUGFS
++	void (*link_add_debugfs)(struct ieee80211_hw *hw,
++				 struct ieee80211_vif *vif,
++				 struct ieee80211_bss_conf *link_conf,
++				 struct dentry *dir);
+ 	void (*sta_add_debugfs)(struct ieee80211_hw *hw,
+ 				struct ieee80211_vif *vif,
+ 				struct ieee80211_sta *sta,
+--- a/net/mac80211/debugfs_netdev.c
++++ b/net/mac80211/debugfs_netdev.c
+@@ -23,16 +23,16 @@
+ #include "driver-ops.h"
+ 
+ static ssize_t ieee80211_if_read(
+-	struct ieee80211_sub_if_data *sdata,
++	void *data,
+ 	char __user *userbuf,
+ 	size_t count, loff_t *ppos,
+-	ssize_t (*format)(const struct ieee80211_sub_if_data *, char *, int))
++	ssize_t (*format)(const void *, char *, int))
+ {
+ 	char buf[200];
+ 	ssize_t ret = -EINVAL;
+ 
+ 	read_lock(&dev_base_lock);
+-	ret = (*format)(sdata, buf, sizeof(buf));
++	ret = (*format)(data, buf, sizeof(buf));
+ 	read_unlock(&dev_base_lock);
+ 
+ 	if (ret >= 0)
+@@ -42,10 +42,10 @@ static ssize_t ieee80211_if_read(
+ }
+ 
+ static ssize_t ieee80211_if_write(
+-	struct ieee80211_sub_if_data *sdata,
++	void *data,
+ 	const char __user *userbuf,
+ 	size_t count, loff_t *ppos,
+-	ssize_t (*write)(struct ieee80211_sub_if_data *, const char *, int))
++	ssize_t (*write)(void *, const char *, int))
+ {
+ 	char buf[64];
+ 	ssize_t ret;
+@@ -58,64 +58,64 @@ static ssize_t ieee80211_if_write(
+ 	buf[count] = '\0';
+ 
+ 	rtnl_lock();
+-	ret = (*write)(sdata, buf, count);
++	ret = (*write)(data, buf, count);
+ 	rtnl_unlock();
+ 
+ 	return ret;
+ }
+ 
+-#define IEEE80211_IF_FMT(name, field, format_string)			\
++#define IEEE80211_IF_FMT(name, type, field, format_string)		\
+ static ssize_t ieee80211_if_fmt_##name(					\
+-	const struct ieee80211_sub_if_data *sdata, char *buf,		\
++	const type *data, char *buf,					\
+ 	int buflen)							\
+ {									\
+-	return scnprintf(buf, buflen, format_string, sdata->field);	\
++	return scnprintf(buf, buflen, format_string, data->field);	\
+ }
+-#define IEEE80211_IF_FMT_DEC(name, field)				\
+-		IEEE80211_IF_FMT(name, field, "%d\n")
+-#define IEEE80211_IF_FMT_HEX(name, field)				\
+-		IEEE80211_IF_FMT(name, field, "%#x\n")
+-#define IEEE80211_IF_FMT_LHEX(name, field)				\
+-		IEEE80211_IF_FMT(name, field, "%#lx\n")
++#define IEEE80211_IF_FMT_DEC(name, type, field)				\
++		IEEE80211_IF_FMT(name, type, field, "%d\n")
++#define IEEE80211_IF_FMT_HEX(name, type, field)				\
++		IEEE80211_IF_FMT(name, type, field, "%#x\n")
++#define IEEE80211_IF_FMT_LHEX(name, type, field)			\
++		IEEE80211_IF_FMT(name, type, field, "%#lx\n")
+ 
+-#define IEEE80211_IF_FMT_HEXARRAY(name, field)				\
++#define IEEE80211_IF_FMT_HEXARRAY(name, type, field)			\
+ static ssize_t ieee80211_if_fmt_##name(					\
+-	const struct ieee80211_sub_if_data *sdata,			\
++	const type *data,						\
+ 	char *buf, int buflen)						\
+ {									\
+ 	char *p = buf;							\
+ 	int i;								\
+-	for (i = 0; i < sizeof(sdata->field); i++) {			\
++	for (i = 0; i < sizeof(data->field); i++) {			\
+ 		p += scnprintf(p, buflen + buf - p, "%.2x ",		\
+-				 sdata->field[i]);			\
++				 data->field[i]);			\
+ 	}								\
+ 	p += scnprintf(p, buflen + buf - p, "\n");			\
+ 	return p - buf;							\
+ }
+ 
+-#define IEEE80211_IF_FMT_ATOMIC(name, field)				\
++#define IEEE80211_IF_FMT_ATOMIC(name, type, field)			\
+ static ssize_t ieee80211_if_fmt_##name(					\
+-	const struct ieee80211_sub_if_data *sdata,			\
++	const type *data,						\
+ 	char *buf, int buflen)						\
+ {									\
+-	return scnprintf(buf, buflen, "%d\n", atomic_read(&sdata->field));\
++	return scnprintf(buf, buflen, "%d\n", atomic_read(&data->field));\
+ }
+ 
+-#define IEEE80211_IF_FMT_MAC(name, field)				\
++#define IEEE80211_IF_FMT_MAC(name, type, field)				\
+ static ssize_t ieee80211_if_fmt_##name(					\
+-	const struct ieee80211_sub_if_data *sdata, char *buf,		\
++	const type *data, char *buf,		\
+ 	int buflen)							\
+ {									\
+-	return scnprintf(buf, buflen, "%pM\n", sdata->field);		\
++	return scnprintf(buf, buflen, "%pM\n", data->field);		\
+ }
+ 
+-#define IEEE80211_IF_FMT_JIFFIES_TO_MS(name, field)			\
++#define IEEE80211_IF_FMT_JIFFIES_TO_MS(name, type, field)		\
+ static ssize_t ieee80211_if_fmt_##name(					\
+-	const struct ieee80211_sub_if_data *sdata,			\
++	const type *data,						\
+ 	char *buf, int buflen)						\
+ {									\
+ 	return scnprintf(buf, buflen, "%d\n",				\
+-			 jiffies_to_msecs(sdata->field));		\
++			 jiffies_to_msecs(data->field));		\
+ }
+ 
+ #define _IEEE80211_IF_FILE_OPS(name, _read, _write)			\
+@@ -126,43 +126,67 @@ static const struct file_operations name
+ 	.llseek = generic_file_llseek,					\
+ }
+ 
+-#define _IEEE80211_IF_FILE_R_FN(name)					\
++#define _IEEE80211_IF_FILE_R_FN(name, type)				\
+ static ssize_t ieee80211_if_read_##name(struct file *file,		\
+ 					char __user *userbuf,		\
+ 					size_t count, loff_t *ppos)	\
+ {									\
++	ssize_t (*fn)(const void *, char *, int) = (void *)		\
++		((ssize_t (*)(const type, char *, int))			\
++		 ieee80211_if_fmt_##name);				\
+ 	return ieee80211_if_read(file->private_data,			\
+-				 userbuf, count, ppos,			\
+-				 ieee80211_if_fmt_##name);		\
++				 userbuf, count, ppos, fn);		\
+ }
+ 
+-#define _IEEE80211_IF_FILE_W_FN(name)					\
++#define _IEEE80211_IF_FILE_W_FN(name, type)				\
+ static ssize_t ieee80211_if_write_##name(struct file *file,		\
+ 					 const char __user *userbuf,	\
+ 					 size_t count, loff_t *ppos)	\
+ {									\
++	ssize_t (*fn)(void *, const char *, int) = (void *)		\
++		((ssize_t (*)(type, const char *, int))			\
++		 ieee80211_if_parse_##name);				\
+ 	return ieee80211_if_write(file->private_data, userbuf, count,	\
+-				  ppos, ieee80211_if_parse_##name);	\
++				  ppos, fn);				\
+ }
+ 
+ #define IEEE80211_IF_FILE_R(name)					\
+-	_IEEE80211_IF_FILE_R_FN(name)					\
++	_IEEE80211_IF_FILE_R_FN(name, struct ieee80211_sub_if_data *)	\
+ 	_IEEE80211_IF_FILE_OPS(name, ieee80211_if_read_##name, NULL)
+ 
+ #define IEEE80211_IF_FILE_W(name)					\
+-	_IEEE80211_IF_FILE_W_FN(name)					\
++	_IEEE80211_IF_FILE_W_FN(name, struct ieee80211_sub_if_data *)	\
+ 	_IEEE80211_IF_FILE_OPS(name, NULL, ieee80211_if_write_##name)
+ 
+ #define IEEE80211_IF_FILE_RW(name)					\
+-	_IEEE80211_IF_FILE_R_FN(name)					\
+-	_IEEE80211_IF_FILE_W_FN(name)					\
++	_IEEE80211_IF_FILE_R_FN(name, struct ieee80211_sub_if_data *)	\
++	_IEEE80211_IF_FILE_W_FN(name, struct ieee80211_sub_if_data *)	\
+ 	_IEEE80211_IF_FILE_OPS(name, ieee80211_if_read_##name,		\
+ 			       ieee80211_if_write_##name)
+ 
+ #define IEEE80211_IF_FILE(name, field, format)				\
+-	IEEE80211_IF_FMT_##format(name, field)				\
++	IEEE80211_IF_FMT_##format(name, struct ieee80211_sub_if_data, field)\
+ 	IEEE80211_IF_FILE_R(name)
+ 
++/* Same but with a link_ prefix in the ops variable name and different type */
++#define IEEE80211_IF_LINK_FILE_R(name)					\
++	_IEEE80211_IF_FILE_R_FN(name, struct ieee80211_link_data *)	\
++	_IEEE80211_IF_FILE_OPS(link_##name, ieee80211_if_read_##name, NULL)
++
++#define IEEE80211_IF_LINK_FILE_W(name)					\
++	_IEEE80211_IF_FILE_W_FN(name)					\
++	_IEEE80211_IF_FILE_OPS(link_##name, NULL, ieee80211_if_write_##name)
++
++#define IEEE80211_IF_LINK_FILE_RW(name)					\
++	_IEEE80211_IF_FILE_R_FN(name, struct ieee80211_link_data *)	\
++	_IEEE80211_IF_FILE_W_FN(name, struct ieee80211_link_data *)	\
++	_IEEE80211_IF_FILE_OPS(link_##name, ieee80211_if_read_##name,	\
++			       ieee80211_if_write_##name)
++
++#define IEEE80211_IF_LINK_FILE(name, field, format)			\
++	IEEE80211_IF_FMT_##format(name, struct ieee80211_link_data, field) \
++	IEEE80211_IF_LINK_FILE_R(name)
++
+ /* common attributes */
+ IEEE80211_IF_FILE(rc_rateidx_mask_2ghz, rc_rateidx_mask[NL80211_BAND_2GHZ],
+ 		  HEX);
+@@ -204,12 +228,11 @@ static ssize_t ieee80211_if_fmt_rc_ratei
+ }
+ 
+ IEEE80211_IF_FILE_R(rc_rateidx_vht_mcs_mask_5ghz);
+-
+ IEEE80211_IF_FILE(flags, flags, HEX);
+ IEEE80211_IF_FILE(state, state, LHEX);
+-IEEE80211_IF_FILE(txpower, vif.bss_conf.txpower, DEC);
+-IEEE80211_IF_FILE(ap_power_level, deflink.ap_power_level, DEC);
+-IEEE80211_IF_FILE(user_power_level, deflink.user_power_level, DEC);
++IEEE80211_IF_LINK_FILE(txpower, conf->txpower, DEC);
++IEEE80211_IF_LINK_FILE(ap_power_level, ap_power_level, DEC);
++IEEE80211_IF_LINK_FILE(user_power_level, user_power_level, DEC);
+ 
+ static ssize_t
+ ieee80211_if_fmt_hw_queues(const struct ieee80211_sub_if_data *sdata,
+@@ -622,6 +645,7 @@ static ssize_t ieee80211_if_parse_tsf(
+ }
+ IEEE80211_IF_FILE_RW(tsf);
+ 
++IEEE80211_IF_LINK_FILE(addr, conf->addr, MAC);
+ 
+ #ifdef CPTCFG_MAC80211_MESH
+ IEEE80211_IF_FILE(estab_plinks, u.mesh.estab_plinks, ATOMIC);
+@@ -823,9 +847,6 @@ static void add_files(struct ieee80211_s
+ 
+ 	DEBUGFS_ADD(flags);
+ 	DEBUGFS_ADD(state);
+-	DEBUGFS_ADD(txpower);
+-	DEBUGFS_ADD(user_power_level);
+-	DEBUGFS_ADD(ap_power_level);
+ 
+ 	if (sdata->vif.type != NL80211_IFTYPE_MONITOR)
+ 		add_common_files(sdata);
+@@ -890,6 +911,23 @@ void ieee80211_debugfs_remove_link(struc
+ 	}
+ }
+ 
++#undef DEBUGFS_ADD_MODE
++#undef DEBUGFS_ADD
++
++#define DEBUGFS_ADD_MODE(dentry, name, mode) \
++	debugfs_create_file(#name, mode, dentry, \
++			    link, &link_##name##_ops)
++
++#define DEBUGFS_ADD(dentry, name) DEBUGFS_ADD_MODE(dentry, name, 0400)
++
++static void add_link_files(struct ieee80211_link_data *link,
++			   struct dentry *dentry)
++{
++	DEBUGFS_ADD(dentry, txpower);
++	DEBUGFS_ADD(dentry, user_power_level);
++	DEBUGFS_ADD(dentry, ap_power_level);
++}
++
+ void ieee80211_debugfs_add_netdev(struct ieee80211_sub_if_data *sdata)
+ {
+ 	char buf[10 + IFNAMSIZ];
+@@ -905,11 +943,23 @@ void ieee80211_debugfs_add_netdev(struct
+ 		sdata->vif.link_debugfs[i] = NULL;
+ 
+ 	add_files(sdata);
++	/* Removed the following condition check,
++	 * if (!(sdata->local->hw.wiphy->flags & WIPHY_FLAG_SUPPORTS_MLO))
++	 * This condition is not valid for HT,VHT modes  and it will not allow
++	 * to create debugfs files.
++	 * In case of EHT mode, debugfs files will be created in both
++	 * netdev:wlan0 directory as well as in link-0 directory
++	 * TODO : Need to revisit and change the condition.
++	 */
++	add_link_files(&sdata->deflink, sdata->vif.debugfs_dir);
+ 
+ 	/* create default link if it does not exist */
+ 	if (sdata->vif.link_debugfs[0])
+ 		return;
+ 
++	/*TODO : Need to revamp the contents of link0 directory to link-0
++	 * directory
++	 */
+ 	memset(buf, 0, 10 + IFNAMSIZ);
+ 	snprintf(buf, 10 + IFNAMSIZ, "link0");
+ 	sdata->vif.link_debugfs[0] = debugfs_create_dir(buf,
+@@ -939,6 +989,74 @@ void ieee80211_debugfs_remove_netdev(str
+ 
+ }
+ 
++#ifdef CPTCFG_MAC80211_DEBUGFS
++void ieee80211_link_debugfs_add(struct ieee80211_link_data *link)
++{
++	char link_dir_name[10];
++
++	if (WARN_ON(!link->sdata->vif.debugfs_dir))
++		return;
++
++	/* For now, this should not be called for non-MLO capable drivers */
++	if (WARN_ON(!(link->sdata->local->hw.wiphy->flags & WIPHY_FLAG_SUPPORTS_MLO)))
++		return;
++
++	if (link->debugfs_dir)
++		return;
++
++	snprintf(link_dir_name, sizeof(link_dir_name),
++		 "link-%d", link->link_id);
++
++	link->debugfs_dir =
++		debugfs_create_dir(link_dir_name,
++				   link->sdata->vif.debugfs_dir);
++
++	DEBUGFS_ADD(link->debugfs_dir, addr);
++	add_link_files(link, link->debugfs_dir);
++}
++
++void ieee80211_link_debugfs_remove(struct ieee80211_link_data *link)
++{
++	if (!link->sdata->vif.debugfs_dir || !link->debugfs_dir) {
++		link->debugfs_dir = NULL;
++		return;
++	}
++
++	if (link->debugfs_dir == link->sdata->vif.debugfs_dir) {
++		WARN_ON(link != &link->sdata->deflink);
++		link->debugfs_dir = NULL;
++		return;
++	}
++
++	debugfs_remove_recursive(link->debugfs_dir);
++	link->debugfs_dir = NULL;
++}
++
++void ieee80211_link_debugfs_drv_add(struct ieee80211_link_data *link)
++{
++	if (WARN_ON(!link->debugfs_dir))
++		return;
++
++	drv_link_add_debugfs(link->sdata->local, link->sdata,
++			     link->conf, link->debugfs_dir);
++}
++
++void ieee80211_link_debugfs_drv_remove(struct ieee80211_link_data *link)
++{
++	if (!link || !link->debugfs_dir)
++		return;
++
++	if (WARN_ON(link->debugfs_dir == link->sdata->vif.debugfs_dir))
++		return;
++
++	/* Recreate the directory excluding the driver data */
++	debugfs_remove_recursive(link->debugfs_dir);
++	link->debugfs_dir = NULL;
++
++	ieee80211_link_debugfs_add(link);
++}
++#endif
++
+ void ieee80211_debugfs_rename_netdev(struct ieee80211_sub_if_data *sdata)
+ {
+ 	struct dentry *dir;
+--- a/net/mac80211/debugfs_netdev.h
++++ b/net/mac80211/debugfs_netdev.h
+@@ -14,6 +14,12 @@ void ieee80211_debugfs_add_link(struct i
+ 				unsigned long add);
+ void ieee80211_debugfs_remove_link(struct ieee80211_sub_if_data *sdata,
+ 				   unsigned long rem);
++
++void ieee80211_link_debugfs_add(struct ieee80211_link_data *link);
++void ieee80211_link_debugfs_remove(struct ieee80211_link_data *link);
++
++void ieee80211_link_debugfs_drv_add(struct ieee80211_link_data *link);
++void ieee80211_link_debugfs_drv_remove(struct ieee80211_link_data *link);
+ #else
+ static inline void ieee80211_debugfs_add_netdev(
+ 	struct ieee80211_sub_if_data *sdata)
+@@ -30,7 +36,15 @@ static inline void ieee80211_debugfs_add
+ static inline void ieee80211_debugfs_remove_link(struct ieee80211_sub_if_data *sdata,
+ 						 unsigned long rem);
+ {}
++static inline void ieee80211_link_debugfs_add(struct ieee80211_link_data *link)
++{}
++static inline void ieee80211_link_debugfs_remove(struct ieee80211_link_data *link)
++{}
+ 
++static inline void ieee80211_link_debugfs_drv_add(struct ieee80211_link_data *link)
++{}
++static inline void ieee80211_link_debugfs_drv_remove(struct ieee80211_link_data *link)
++{}
+ #endif
+ 
+ #endif /* __IEEE80211_DEBUGFS_NETDEV_H */
+--- a/net/mac80211/driver-ops.c
++++ b/net/mac80211/driver-ops.c
+@@ -8,6 +8,7 @@
+ #include "trace.h"
+ #include "driver-ops.h"
+ #include "debugfs_sta.h"
++#include "debugfs_netdev.h"
+ 
+ int drv_start(struct ieee80211_local *local)
+ {
+@@ -522,6 +523,10 @@ int drv_change_vif_links(struct ieee8021
+ 			 u16 old_links, u16 new_links,
+ 			 struct ieee80211_bss_conf *old[IEEE80211_MLD_MAX_NUM_LINKS])
+ {
++	struct ieee80211_link_data *link;
++	unsigned long links_to_add;
++	unsigned long links_to_rem;
++	unsigned int link_id;
+ 	int ret = -EOPNOTSUPP;
+ 
+ 	might_sleep();
+@@ -532,13 +537,33 @@ int drv_change_vif_links(struct ieee8021
+ 	if (old_links == new_links)
+ 		return 0;
+ 
++	links_to_add = ~old_links & new_links;
++	links_to_rem = old_links & ~new_links;
++
++	for_each_set_bit(link_id, &links_to_rem, IEEE80211_MLD_MAX_NUM_LINKS) {
++		link = rcu_access_pointer(sdata->link[link_id]);
++
++		ieee80211_link_debugfs_drv_remove(link);
++	}
++
+ 	trace_drv_change_vif_links(local, sdata, old_links, new_links);
+ 	if (local->ops->change_vif_links)
+ 		ret = local->ops->change_vif_links(&local->hw, &sdata->vif,
+ 						   old_links, new_links, old);
+ 	trace_drv_return_int(local, ret);
+ 
+-	return ret;
++	if (ret)
++		return ret;
++
++	for_each_set_bit(link_id, &links_to_add, IEEE80211_MLD_MAX_NUM_LINKS) {
++		link = rcu_access_pointer(sdata->link[link_id]);
++
++#ifdef CPTCFG_MAC80211_DEBUGFS
++		ieee80211_link_debugfs_drv_add(link);
++#endif
++	}
++
++	return 0;
+ }
+ 
+ int drv_change_sta_links(struct ieee80211_local *local,
+--- a/net/mac80211/driver-ops.h
++++ b/net/mac80211/driver-ops.h
+@@ -485,6 +485,22 @@ static inline void drv_sta_remove(struct
+ }
+ 
+ #ifdef CPTCFG_MAC80211_DEBUGFS
++static inline void drv_link_add_debugfs(struct ieee80211_local *local,
++					struct ieee80211_sub_if_data *sdata,
++					struct ieee80211_bss_conf *link_conf,
++					struct dentry *dir)
++{
++	might_sleep();
++
++	sdata = get_bss_sdata(sdata);
++	if (!check_sdata_in_driver(sdata))
++		return;
++
++	if (local->ops->link_add_debugfs)
++		local->ops->link_add_debugfs(&local->hw, &sdata->vif,
++					     link_conf, dir);
++}
++
+ static inline void drv_sta_add_debugfs(struct ieee80211_local *local,
+ 				       struct ieee80211_sub_if_data *sdata,
+ 				       struct ieee80211_sta *sta,
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1014,6 +1014,10 @@ struct ieee80211_link_data {
+ 	struct ieee80211_tx_queue_params tx_conf[IEEE80211_NUM_ACS];
+ 
+ 	struct ieee80211_bss_conf *conf;
++
++#ifdef CPTCFG_MAC80211_DEBUGFS
++	struct dentry *debugfs_dir;
++#endif
+ };
+ 
+ struct ieee80211_sub_if_data {
+--- a/net/mac80211/link.c
++++ b/net/mac80211/link.c
+@@ -63,6 +63,7 @@ void ieee80211_link_init(struct ieee8021
+ 		default:
+ 			WARN_ON(1);
+ 		}
++		ieee80211_link_debugfs_add(link);
+ 	}
+ }
+ 
+@@ -95,6 +96,7 @@ static void ieee80211_tear_down_links(st
+ 		if (WARN_ON(!link))
+ 			continue;
+ 		ieee80211_remove_link_keys(link, &keys);
++		ieee80211_link_debugfs_remove(link);
+ 		ieee80211_link_stop(link);
+ 	}
+ 
