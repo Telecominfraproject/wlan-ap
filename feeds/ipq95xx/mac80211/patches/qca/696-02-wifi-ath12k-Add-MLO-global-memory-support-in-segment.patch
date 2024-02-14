@@ -1,0 +1,170 @@
+From 6a59bbc503199922e22ac2f1a188548737d9110f Mon Sep 17 00:00:00 2001
+From: Karthikeyan Periyasamy <quic_periyasa@quicinc.com>
+Date: Sun, 27 Nov 2022 22:30:29 +0530
+Subject: [PATCH 2/2] wifi: ath12k: Add MLO global memory support in segmented
+ mode
+
+Signed-off-by: Karthikeyan Periyasamy <quic_periyasa@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/qmi.c | 105 ++++++++++++++++++++------
+ 1 file changed, 81 insertions(+), 24 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -3230,7 +3230,7 @@ static void ath12k_qmi_free_mlo_mem_chun
+ 
+ 	lockdep_assert_held(&ag->mutex_lock);
+ 
+-	if (!ag->mlo_mem.rsv)
++	if (!ag->mlo_mem.init_done)
+ 		return;
+ 
+ 	if (ag->num_started)
+@@ -3244,15 +3244,28 @@ static void ath12k_qmi_free_mlo_mem_chun
+ 	mlo_chunk = &ag->mlo_mem.chunk[idx];
+ 
+ 	if (fixed_mem) {
+-		iounmap(mlo_chunk->v.ioaddr);
+-		mlo_chunk->v.ioaddr = NULL;
++		if (mlo_chunk->v.ioaddr) {
++			iounmap(mlo_chunk->v.ioaddr);
++			mlo_chunk->v.ioaddr = NULL;
++		}
++	} else {
++		if (mlo_chunk->v.addr) {
++			dma_free_coherent(ab->dev,
++					  mlo_chunk->size,
++					  mlo_chunk->v.addr,
++					  mlo_chunk->paddr);
++			mlo_chunk->v.addr = NULL;
++		}
+ 	}
+ 
+ 	mlo_chunk->paddr = NULL;
+ 	mlo_chunk->size = 0;
+ 
+ out:
+-	chunk->v.ioaddr = NULL;
++	if (fixed_mem)
++		chunk->v.ioaddr = NULL;
++	else
++		chunk->v.addr = NULL;
+ 	chunk->paddr = NULL;
+ 	chunk->size = 0;
+ }
+@@ -3293,14 +3306,47 @@ void ath12k_qmi_free_target_mem_chunk(st
+ 	}
+ }
+ 
++static int ath12k_qmi_alloc_chunk(struct ath12k_base *ab,
++				  struct target_mem_chunk *chunk)
++{
++	chunk->v.addr = dma_alloc_coherent(ab->dev,
++					   chunk->size,
++					   &chunk->paddr,
++					   GFP_KERNEL | __GFP_NOWARN);
++	if (!chunk->v.addr) {
++		if (chunk->size > ATH12K_QMI_MAX_CHUNK_SIZE) {
++			ab->qmi.target_mem_delayed = true;
++			ath12k_warn(ab,
++				    "qmi dma allocation failed (%d B type %u), will try later with small size\n",
++				    chunk->size,
++				    chunk->type);
++			ath12k_qmi_free_target_mem_chunk(ab);
++			return -EAGAIN;
++		}
++		ath12k_warn(ab, "memory allocation failure for %u size: %d\n",
++			    chunk->type, chunk->size);
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
+ static int ath12k_qmi_alloc_target_mem_chunk(struct ath12k_base *ab)
+ {
+-	int i;
+-	struct target_mem_chunk *chunk;
++	struct ath12k_hw_group *ag = ab->ag;
++	int i, mlo_idx, ret;
++	struct target_mem_chunk *chunk, *mlo_chunk;
++
++	mutex_lock(&ag->mutex_lock);
++
++	if (!ag->mlo_mem.init_done) {
++		memset(ag->mlo_mem.chunk, 0, sizeof(ag->mlo_mem.chunk));
++		ag->mlo_mem.init_done = true;
++	}
+ 
+ 	ab->qmi.target_mem_delayed = false;
+ 
+-	for (i = 0; i < ab->qmi.mem_seg_count; i++) {
++	for (i = 0, mlo_idx = 0; i < ab->qmi.mem_seg_count; i++) {
+ 		chunk = &ab->qmi.target_mem[i];
+ 
+ 		/* Allocate memory for the region and the functionality supported
+@@ -3308,27 +3354,32 @@ static int ath12k_qmi_alloc_target_mem_c
+ 		 * allocate memory, assigns NULL and FW will handle this without crashing.
+ 		 */
+ 		switch (chunk->type) {
++		case MLO_GLOBAL_MEM_REGION_TYPE:
++			mlo_chunk = &ag->mlo_mem.chunk[mlo_idx];
++			if (!mlo_chunk->paddr) {
++				mlo_chunk->size = chunk->size;
++				mlo_chunk->type = chunk->type;
++
++				ret = ath12k_qmi_alloc_chunk(ab, mlo_chunk);
++				if (ret) {
++					ret = (ret == -EAGAIN) ? 0 : ret;
++					goto out;
++				}
++
++				memset(mlo_chunk->v.addr, 0, mlo_chunk->size);
++			}
++			chunk->paddr = mlo_chunk->paddr;
++			chunk->v.addr = mlo_chunk->v.addr;
++			mlo_idx++;
++			break;
+ 		case HOST_DDR_REGION_TYPE:
+ 		case M3_DUMP_REGION_TYPE:
+ 		case PAGEABLE_MEM_REGION_TYPE:
+ 		case CALDB_MEM_REGION_TYPE:
+-			chunk->v.addr = dma_alloc_coherent(ab->dev,
+-							   chunk->size,
+-							   &chunk->paddr,
+-							   GFP_KERNEL | __GFP_NOWARN);
+-			if (!chunk->v.addr) {
+-				if (chunk->size > ATH12K_QMI_MAX_CHUNK_SIZE) {
+-					ab->qmi.target_mem_delayed = true;
+-					ath12k_warn(ab,
+-						    "qmi dma allocation failed (%d B type %u), will try later with small size\n",
+-						    chunk->size,
+-						    chunk->type);
+-					ath12k_qmi_free_target_mem_chunk(ab);
+-					return 0;
+-				}
+-				ath12k_warn(ab, "memory allocation failure for %u size: %d\n",
+-					    chunk->type, chunk->size);
+-				return -ENOMEM;
++			ret = ath12k_qmi_alloc_chunk(ab, chunk);
++			if (ret) {
++				ret = (ret == -EAGAIN) ? 0 : ret;
++				goto out;
+ 			}
+ 			break;
+ 		default:
+@@ -3339,7 +3390,14 @@ static int ath12k_qmi_alloc_target_mem_c
+ 			break;
+ 		}
+ 	}
++
++	mutex_unlock(&ag->mutex_lock);
+ 	return 0;
++
++out:
++	ath12k_qmi_free_target_mem_chunk(ab);
++	mutex_unlock(&ag->mutex_lock);
++	return ret;
+ }
+ 
+ static int ath12k_qmi_assign_target_mem_chunk(struct ath12k_base *ab)

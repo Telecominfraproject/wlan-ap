@@ -1,0 +1,134 @@
+From 20e708b386fa3e0683e2d19af69460f2b48bbffa Mon Sep 17 00:00:00 2001
+From: Ramasamy Kaliappan <quic_rkaliapp@quicinc.com>
+Date: Mon, 3 Jul 2023 11:53:40 +0530
+Subject: [PATCH 2/2] cfg80211: support reporting failed links
+
+For assoc and connect result APIs, support reporting
+failed links; they should still come with the BSS
+pointer in the case of assoc, so they're released
+correctly. In the case of connect result, this is
+optional.
+
+Source: https://www.spinics.net/lists/linux-wireless/msg228130.html
+
+Signed-off-by: Johannes Berg <johannes.berg@xxxxxxxxx>
+Signed-off-by: Ramasamy Kaliappan <quic_rkaliapp@quicinc.com>
+---
+ include/net/cfg80211.h |  7 +++++++
+ net/wireless/mlme.c    |  4 ++++
+ net/wireless/nl80211.c |  5 ++++-
+ net/wireless/sme.c     | 14 ++++++++++++++
+ 4 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index 173487b..e969ca6 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -7287,6 +7287,8 @@ void cfg80211_auth_timeout(struct net_device *dev, const u8 *addr);
+  * @ap_mld_addr: AP MLD address (in case of MLO)
+  * @links: per-link information indexed by link ID, use links[0] for
+  *	non-MLO connections
++ * @links.status: Set this (along with a BSS pointer) for links that
++ *	were rejected by the AP.
+  */
+ struct cfg80211_rx_assoc_resp {
+ 	const u8 *buf;
+@@ -7298,6 +7300,7 @@ struct cfg80211_rx_assoc_resp {
+ 	struct {
+ 		const u8 *addr;
+ 		struct cfg80211_bss *bss;
++		u16 status;
+ 	} links[IEEE80211_MLD_MAX_NUM_LINKS];
+ };
+ 
+@@ -7808,6 +7811,9 @@ struct cfg80211_fils_resp_params {
+  *	if the bss is expired during the connection, esp. for those drivers
+  *	implementing connect op. Only one parameter among @bssid and @bss needs
+  *	to be specified.
++ * @links.status: per-link status code, to report a status code that's not
++ *	%WLAN_STATUS_SUCCESS for a given link, it must also be in the
++ *	@valid_links bitmap and may have a BSS pointer (which is then released)
+  */
+ struct cfg80211_connect_resp_params {
+ 	int status;
+@@ -7824,6 +7830,7 @@ struct cfg80211_connect_resp_params {
+ 		const u8 *addr;
+ 		const u8 *bssid;
+ 		struct cfg80211_bss *bss;
++		u16 status;
+ 	} links[IEEE80211_MLD_MAX_NUM_LINKS];
+ };
+ 
+diff --git a/net/wireless/mlme.c b/net/wireless/mlme.c
+index a14bd55..7b1299e 100644
+--- a/net/wireless/mlme.c
++++ b/net/wireless/mlme.c
+@@ -42,6 +42,10 @@ void cfg80211_rx_assoc_resp(struct net_device *dev,
+ 	unsigned int link_id;
+ 
+ 	for (link_id = 0; link_id < ARRAY_SIZE(data->links); link_id++) {
++		cr.links[link_id].status = data->links[link_id].status;
++		WARN_ON_ONCE(cr.links[link_id].status != WLAN_STATUS_SUCCESS &&
++			     (!cr.ap_mld_addr || !cr.links[link_id].bss));
++
+ 		cr.links[link_id].bss = data->links[link_id].bss;
+ 		if (!cr.links[link_id].bss)
+ 			continue;
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index fb64c2d..b666653 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -18730,6 +18730,7 @@ void nl80211_send_connect_result(struct cfg80211_registered_device *rdev,
+ 			link_info_size += (cr->links[link].bssid ||
+ 					   cr->links[link].bss) ?
+ 					  nla_total_size(ETH_ALEN) : 0;
++			link_info_size += nla_total_size(sizeof(u16));
+ 		}
+ 	}
+ 
+@@ -18798,7 +18799,9 @@ void nl80211_send_connect_result(struct cfg80211_registered_device *rdev,
+ 			     nla_put(msg, NL80211_ATTR_BSSID, ETH_ALEN, bssid)) ||
+ 			    (cr->links[link].addr &&
+ 			     nla_put(msg, NL80211_ATTR_MAC, ETH_ALEN,
+-				     cr->links[link].addr)))
++				     cr->links[link].addr)) ||
++			    nla_put_u16(msg, NL80211_ATTR_STATUS_CODE,
++					cr->links[link].status))
+ 				goto nla_put_failure;
+ 
+ 			nla_nest_end(msg, nested_mlo_links);
+diff --git a/net/wireless/sme.c b/net/wireless/sme.c
+index 78e7104..e782a00 100644
+--- a/net/wireless/sme.c
++++ b/net/wireless/sme.c
+@@ -788,6 +788,10 @@ void __cfg80211_connect_result(struct net_device *dev,
+ 		}
+ 
+ 		for_each_valid_link(cr, link) {
++			/* don't do extra lookups for failures */
++			if (cr->links[link].status != WLAN_STATUS_SUCCESS)
++				continue;
++
+ 			if (cr->links[link].bss)
+ 				continue;
+ 
+@@ -824,6 +828,16 @@ void __cfg80211_connect_result(struct net_device *dev,
+ 	}
+ 
+ 	memset(wdev->links, 0, sizeof(wdev->links));
++	for_each_valid_link(cr, link) {
++		if (cr->links[link].status == WLAN_STATUS_SUCCESS)
++			continue;
++		cr->valid_links &= ~BIT(link);
++		/* don't require bss pointer for failed links */
++		if (!cr->links[link].bss)
++			continue;
++		cfg80211_unhold_bss(bss_from_pub(cr->links[link].bss));
++		cfg80211_put_bss(wdev->wiphy, cr->links[link].bss);
++	}
+ 	wdev->valid_links = cr->valid_links;
+ 	for_each_valid_link(cr, link)
+ 		wdev->links[link].client.current_bss =
+-- 
+2.17.1
+
