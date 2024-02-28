@@ -24,6 +24,8 @@ function channel_to_freq(cur_freq, channel) {
 		return 5000 + channel * 5;
 	else if (band == '5G' && channel >= 183 && channel <= 196)
 		return 4000 + channel * 5;
+        else if (band == '6G' && channel >= 5)
+                return 5950 + channel * 5; 
 	else if (band == '60G' && channel >= 1 && channel <= 6)
 		return 56160 + channel * 2160;
 
