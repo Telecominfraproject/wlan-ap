@@ -100,7 +100,7 @@ function scan_timer() {
 	} catch(e) {
 		printf('%.J\n', e.stacktrace[0].context);
 	};
-	return 1000;
+//	return 1000;
 }
 
 return {
