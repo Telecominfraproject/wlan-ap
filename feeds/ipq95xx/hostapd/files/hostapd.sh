@@ -251,7 +251,7 @@ hostapd_prepare_device_config() {
 	[ -n "$maxassoc" ] && append base_cfg "iface_max_num_sta=$maxassoc" "$N"
 	[ "$maxassoc_ignore_probe" -gt 0 ] && append base_cfg "no_probe_resp_if_max_sta=1" "$N"
 	[ "$rnr_beacon" -gt 0 ] && append base_cfg "rnr_beacon=$rnr_beacon" "$N"
-	[ "$he_co_locate" -gt 0 ] && append base_cfg "he_co_locate=$he_co_locate" "$N"
+#	[ "$he_co_locate" -gt 0 ] && append base_cfg "he_co_locate=$he_co_locate" "$N"
 	[ "$multiple_bssid" -gt 0 ] && append base_cfg "multiple_bssid=$multiple_bssid" "$N"
 	[ "$ema" -gt 0 ] && append base_cfg "ema=$ema" "$N"
 	[ "$mlo" -gt 0 ] && append base_cfg "mlo=1" "$N"

@@ -16,6 +16,8 @@ platform_do_upgrade() {
 
 	board=$(board_name)
 	case $board in
+	cig,wf198|\
+	sercomm,ap72tip|\
 	qcom,ipq9574-ap-al02-c4|\
 	qcom,ipq9574-ap-al02-c15)
 		nand_upgrade_tar "$1"
