@@ -194,8 +194,6 @@ platform_do_upgrade() {
 	cig,wf194c4|\
 	cig,wf196|\
 	cybertan,eww622-a1|\
-	cybertan,eww631-a1|\
-	cybertan,eww631-b1|\
 	glinet,ax1800|\
 	glinet,axt1800|\
 	indio,um-310ax-v1|\
@@ -287,6 +285,19 @@ platform_do_upgrade() {
 			CI_UBIPART="$(cat /proc/boot_info/rootfs/upgradepartition)"
 			CI_BOOTCFG=1
 		}
+		nand_upgrade_tar "$1"
+		;;
+	cybertan,eww631-a1|\
+	cybertan,eww631-b1)
+		boot_part=$(fw_printenv bootfrom | cut  -d = -f2)
+		echo "Current bootfrom is $boot_part"
+		if [[ $boot_part == 1 ]]; then
+			CI_UBIPART="rootfs"
+			CI_FWSETENV="bootfrom 0"
+		else
+			CI_UBIPART="rootfs_1"
+			CI_FWSETENV="bootfrom 1"
+		fi
 		nand_upgrade_tar "$1"
 		;;
 	esac
