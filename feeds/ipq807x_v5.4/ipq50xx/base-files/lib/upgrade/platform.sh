@@ -70,6 +70,8 @@ platform_check_image() {
 	case $board in
 	cig,wf186w|\
 	cig,wf186h|\
+	cybertan,eww631-a1|\
+	cybertan,eww631-b1|\
 	edgecore,eap104|\
 	hfcl,ion4x_w|\
 	hfcl,ion4xi_w|\
@@ -128,6 +130,19 @@ platform_do_upgrade() {
 			CI_UBIPART="$(cat /proc/boot_info/rootfs/upgradepartition)"
 			CI_BOOTCFG=1
 		}
+		nand_upgrade_tar "$1"
+		;;
+	cybertan,eww631-a1|\
+	cybertan,eww631-b1)
+		boot_part=$(fw_printenv bootfrom | cut  -d = -f2)
+		echo "Current bootfrom is $boot_part"
+		if [[ $boot_part == 1 ]]; then
+			CI_UBIPART="rootfs"
+			CI_FWSETENV="bootfrom 0"
+		else
+			CI_UBIPART="rootfs_1"
+			CI_FWSETENV="bootfrom 1"
+		fi
 		nand_upgrade_tar "$1"
 		;;
 	esac
