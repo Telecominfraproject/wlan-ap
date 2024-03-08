@@ -1,0 +1,281 @@
+From f65c0f12471c39c5833b045a429d25ad504dc320 Mon Sep 17 00:00:00 2001
+From: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Date: Thu, 3 Aug 2023 17:05:20 +0800
+Subject: [PATCH] 999-2728-net-phy-aquantia-add-mib-read.patch
+
+---
+ drivers/net/phy/Kconfig         |   6 ++
+ drivers/net/phy/Makefile        |   3 +
+ drivers/net/phy/aquantia.h      |  22 +++++
+ drivers/net/phy/aquantia_main.c |   4 +
+ drivers/net/phy/aquantia_mib.c  | 167 ++++++++++++++++++++++++++++++++
+ 5 files changed, 202 insertions(+)
+ create mode 100644 drivers/net/phy/aquantia_mib.c
+
+diff --git a/drivers/net/phy/Kconfig b/drivers/net/phy/Kconfig
+index d467834..d6e2f37 100644
+--- a/drivers/net/phy/Kconfig
++++ b/drivers/net/phy/Kconfig
+@@ -405,6 +405,12 @@ config AQUANTIA_PHY_FW_FILE
+ 	---help---
+ 	  Currently supports the Aquantia AQR113c
+ 
++config AQUANTIA_PHY_MIB
++	tristate "MIB Read Enable"
++	depends on AQUANTIA_PHY
++	---help---
++	  Currently supports the Aquantia AQR113C
++
+ config AX88796B_PHY
+ 	tristate "Asix PHYs"
+ 	help
+diff --git a/drivers/net/phy/Makefile b/drivers/net/phy/Makefile
+index e9653de..7aff0be 100644
+--- a/drivers/net/phy/Makefile
++++ b/drivers/net/phy/Makefile
+@@ -71,6 +71,9 @@ endif
+ ifdef CONFIG_AQUANTIA_PHY_FW_DOWNLOAD
+ aquantia-objs			+= aquantia_firmware.o
+ endif
++ifdef CONFIG_AQUANTIA_PHY_MIB
++aquantia-objs			+= aquantia_mib.o
++endif
+ obj-$(CONFIG_AIROHA_EN8801SC_PHY)	+= en8801sc.o
+ obj-$(CONFIG_AIROHA_EN8811H_PHY)	+= air_en8811h.o
+ obj-$(CONFIG_AQUANTIA_PHY)	+= aquantia.o
+diff --git a/drivers/net/phy/aquantia.h b/drivers/net/phy/aquantia.h
+index ab1c241..68845b5 100644
+--- a/drivers/net/phy/aquantia.h
++++ b/drivers/net/phy/aquantia.h
+@@ -47,6 +47,21 @@ static const struct aqr107_hw_stat aqr107_hw_stats[] = {
+ };
+ #define AQR107_SGMII_STAT_SZ ARRAY_SIZE(aqr107_hw_stats)
+ 
++#ifdef CONFIG_AQUANTIA_PHY_MIB
++struct aqr107_mib_stat {
++	u64 crc8_error_packets;
++	u64 ldpc_error_packets;
++	u64 ls_tx_good_packets;
++	u64 ls_tx_bad_packets;
++	u64 ls_rx_good_packets;
++	u64 ls_rx_bad_packets;
++	u64 ss_tx_good_packets;
++	u64 ss_tx_bad_packets;
++	u64 ss_rx_good_packets;
++	u64 ss_rx_bad_packets;
++};
++#endif
++
+ struct aqr107_priv {
+ 	u64 sgmii_stats[AQR107_SGMII_STAT_SZ];
+ #ifdef CONFIG_AQUANTIA_PHY_FW_DOWNLOAD
+@@ -57,6 +72,10 @@ struct aqr107_priv {
+ 	int fw_dl_mode;
+ 	u16 heartbeat;
+ #endif
++#ifdef CONFIG_AQUANTIA_PHY_MIB
++	struct aqr107_mib_stat mib;
++	struct task_struct *mib_thread;
++#endif
+ };
+ 
+ int aqr107_set_downshift(struct phy_device *phydev, u8 cnt);
+@@ -78,3 +97,6 @@ enum {
+ int aqr_firmware_heartbeat_thread(void *data);
+ int aqr_firmware_download(struct phy_device *phydev);
+ #endif
++#ifdef CONFIG_AQUANTIA_PHY_MIB
++int aqr107_config_mib(struct phy_device *phydev);
++#endif
+\ No newline at end of file
+diff --git a/drivers/net/phy/aquantia_main.c b/drivers/net/phy/aquantia_main.c
+index 874cd26..5c05ea8 100644
+--- a/drivers/net/phy/aquantia_main.c
++++ b/drivers/net/phy/aquantia_main.c
+@@ -605,6 +605,10 @@ static int aqr107_probe(struct phy_device *phydev)
+ 	if (!phydev->priv)
+ 		return -ENOMEM;
+ 
++#ifdef CONFIG_AQUANTIA_PHY_MIB
++	aqr107_config_mib(phydev);
++#endif
++
+ 	return aqr_hwmon_probe(phydev);
+ }
+ 
+diff --git a/drivers/net/phy/aquantia_mib.c b/drivers/net/phy/aquantia_mib.c
+new file mode 100644
+index 0000000..07223fa
+--- /dev/null
++++ b/drivers/net/phy/aquantia_mib.c
+@@ -0,0 +1,167 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Packet counter driver for Aquantia PHY
++ */
++
++#include <linux/phy.h>
++#include <linux/kernel.h>
++#include <linux/debugfs.h>
++#include <linux/kthread.h>
++
++#include "aquantia.h"
++
++#define MDIO_PCS_LS_TX_GOOD_COUNTER		0xc820
++#define MDIO_PCS_LS_TX_BAD_COUNTER		0xc822
++#define MDIO_PCS_SS_TX_GOOD_COUNTER		0xc860
++#define MDIO_PCS_SS_TX_BAD_COUNTER		0xc862
++#define MDIO_PCS_CRC8_ERROR_COUNTER		0xe810
++#define MDIO_PCS_LS_RX_GOOD_COUNTER		0xe812
++#define MDIO_PCS_LS_RX_BAD_COUNTER		0xe814
++#define MDIO_PCS_LDPC_ERROR_COUNTER		0xe820
++#define MDIO_PCS_SS_RX_GOOD_COUNTER		0xe860
++#define MDIO_PCS_SS_RX_BAD_COUNTER		0xe862
++
++static int aqr107_mib_read_word(struct phy_device *phydev, u32 reg, u16 *lsw, u16 *msw)
++{
++	int val;
++
++	val = phy_read_mmd(phydev, MDIO_MMD_PCS, reg + 1);
++	if (val < 0)
++		return val;
++
++	*msw = val;
++
++	val = phy_read_mmd(phydev, MDIO_MMD_PCS, reg);
++	if (val < 0)
++		return val;
++
++	*lsw = val;
++
++	return 0;
++}
++
++static void aqr107_mib_read(struct phy_device *phydev)
++{
++	struct aqr107_priv *priv = phydev->priv;
++	u16 lsw, msw;
++
++	if (!aqr107_mib_read_word(phydev, MDIO_PCS_CRC8_ERROR_COUNTER, &lsw, &msw))
++		priv->mib.crc8_error_packets += ((msw << 16) | lsw);
++
++	if (!aqr107_mib_read_word(phydev, MDIO_PCS_LDPC_ERROR_COUNTER, &lsw, &msw))
++		priv->mib.ldpc_error_packets += ((msw << 16) | lsw);
++
++	if (!aqr107_mib_read_word(phydev, MDIO_PCS_LS_TX_GOOD_COUNTER, &lsw, &msw))
++		priv->mib.ls_tx_good_packets += ((msw << 16) | lsw);
++
++	if (!aqr107_mib_read_word(phydev, MDIO_PCS_LS_TX_BAD_COUNTER, &lsw, &msw))
++		priv->mib.ls_tx_bad_packets += ((msw << 16) | lsw);
++
++	if (!aqr107_mib_read_word(phydev, MDIO_PCS_LS_RX_GOOD_COUNTER, &lsw, &msw))
++		priv->mib.ls_rx_good_packets += ((msw << 16) | lsw);
++
++	if (!aqr107_mib_read_word(phydev, MDIO_PCS_LS_RX_BAD_COUNTER, &lsw, &msw))
++		priv->mib.ls_rx_bad_packets += ((msw << 16) | lsw);
++
++	if (!aqr107_mib_read_word(phydev, MDIO_PCS_SS_TX_GOOD_COUNTER, &lsw, &msw))
++		priv->mib.ss_tx_good_packets += ((msw << 16) | lsw);
++
++	if (!aqr107_mib_read_word(phydev, MDIO_PCS_SS_TX_BAD_COUNTER, &lsw, &msw))
++		priv->mib.ss_tx_bad_packets += ((msw << 16) | lsw);
++
++	if (!aqr107_mib_read_word(phydev, MDIO_PCS_SS_RX_GOOD_COUNTER, &lsw, &msw))
++		priv->mib.ss_rx_good_packets += ((msw << 16) | lsw);
++
++	if (!aqr107_mib_read_word(phydev, MDIO_PCS_SS_RX_BAD_COUNTER, &lsw, &msw))
++		priv->mib.ss_rx_bad_packets += ((msw << 16) | lsw);
++}
++
++static int aqr107_mib_thread(void *data)
++{
++	struct phy_device *phydev = data;
++
++	for (;;) {
++		if (kthread_should_stop())
++			break;
++
++		aqr107_mib_read(phydev);
++
++		set_current_state(TASK_INTERRUPTIBLE);
++		schedule_timeout(HZ);
++	}
++
++	return 0;
++}
++
++static int aqr107_mib_show(struct seq_file *m, void *private)
++{
++	struct phy_device *phydev = m->private;
++	struct aqr107_priv *priv = phydev->priv;
++
++	aqr107_mib_read(phydev);
++
++	seq_printf(m, "+---------------------------------+\n");
++	seq_printf(m, "|         <<AQUANTIA MIB>>        |\n");
++	seq_printf(m, "| CRC8 Error Packets=%012lld |\n", priv->mib.crc8_error_packets);
++	seq_printf(m, "| LDPC Error Packets=%012lld |\n", priv->mib.ldpc_error_packets);
++	seq_printf(m, "|           [Line Side]\n");
++	seq_printf(m, "| TX   Good  Packets=%012lld |\n", priv->mib.ls_tx_good_packets);
++	seq_printf(m, "| TX   Bad   Packets=%012lld |\n", priv->mib.ls_tx_bad_packets);
++	seq_printf(m, "| RX   Good  Packets=%012lld |\n", priv->mib.ls_rx_good_packets);
++	seq_printf(m, "| RX   Bad   Packets=%012lld |\n", priv->mib.ls_rx_bad_packets);
++	seq_printf(m, "|          [System Side]\n");
++	seq_printf(m, "| TX   Good  Packets=%012lld |\n", priv->mib.ss_tx_good_packets);
++	seq_printf(m, "| TX   Bad   Packets=%012lld |\n", priv->mib.ss_tx_bad_packets);
++	seq_printf(m, "| RX   Good  Packets=%012lld |\n", priv->mib.ss_rx_good_packets);
++	seq_printf(m, "| RX   Bad   Packets=%012lld |\n", priv->mib.ss_rx_bad_packets);
++	seq_printf(m, "+---------------------------------+\n");
++
++	memset(&priv->mib, 0, sizeof(priv->mib));
++
++	return 0;
++}
++
++static int aqr107_mib_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, aqr107_mib_show, inode->i_private);
++}
++
++int aqr107_config_mib(struct phy_device *phydev)
++{
++	static const struct file_operations fops_mib = {
++		.open = aqr107_mib_open,
++		.read = seq_read,
++		.llseek = seq_lseek,
++		.release = single_release
++	};
++
++	struct aqr107_priv *priv = phydev->priv;
++	struct dentry *root;
++	char dirname[5];
++
++	snprintf(dirname, sizeof(dirname), "phy%d", phydev->mdio.addr);
++
++	root = debugfs_lookup("aquantia", NULL);
++	if (!root) {
++		root = debugfs_create_dir("aquantia", NULL);
++		if (!root)
++			return -ENOMEM;
++	}
++
++	debugfs_create_file(dirname, S_IRUGO, root, phydev, &fops_mib);
++
++	if (!priv->mib_thread) {
++		/* create a thread for recording packet counts */
++		priv->mib_thread = kthread_create(aqr107_mib_thread,
++						  phydev,
++						  "aqr107_mib_thread");
++		if (IS_ERR(priv->mib_thread)) {
++			phydev_err(phydev,
++				   "failed to create aqr107_mib_thread(%ld)\n",
++				   PTR_ERR(priv->mib_thread));
++			return PTR_ERR(priv->mib_thread);
++		}
++		wake_up_process(priv->mib_thread);
++	}
++
++	return 0;
++}
+-- 
+2.18.0
+

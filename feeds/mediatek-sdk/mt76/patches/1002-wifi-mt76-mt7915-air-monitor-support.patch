@@ -1,0 +1,549 @@
+From 52d315f190fa9ca9355da428e29ed2911ce10152 Mon Sep 17 00:00:00 2001
+From: Bo Jiao <Bo.Jiao@mediatek.com>
+Date: Tue, 11 Jan 2022 12:03:23 +0800
+Subject: [PATCH 1002/1049] wifi: mt76: mt7915: air monitor support
+
+---
+ mt76_connac_mcu.h |   2 +
+ mt7915/mac.c      |   4 +
+ mt7915/main.c     |   3 +
+ mt7915/mt7915.h   |  32 ++++
+ mt7915/vendor.c   | 361 ++++++++++++++++++++++++++++++++++++++++++++++
+ mt7915/vendor.h   |  38 +++++
+ 6 files changed, 440 insertions(+)
+
+diff --git a/mt76_connac_mcu.h b/mt76_connac_mcu.h
+index 81af8709..4569113a 100644
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1235,6 +1235,8 @@ enum {
+ 	MCU_EXT_CMD_GROUP_PRE_CAL_INFO = 0xab,
+ 	MCU_EXT_CMD_DPD_PRE_CAL_INFO = 0xac,
+ 	MCU_EXT_CMD_PHY_STAT_INFO = 0xad,
++	/* for vendor csi and air monitor */
++	MCU_EXT_CMD_SMESH_CTRL = 0xae,
+ 	MCU_EXT_CMD_CSI_CTRL = 0xc2,
+ };
+ 
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 06229ca1..c2e8dbd1 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -531,6 +531,10 @@ mt7915_mac_fill_rx(struct mt7915_dev *dev, struct sk_buff *skb,
+ 			seq_ctrl = le16_to_cpu(hdr->seq_ctrl);
+ 			qos_ctl = *ieee80211_get_qos_ctl(hdr);
+ 		}
++#ifdef CONFIG_MTK_VENDOR
++		if (phy->amnt_ctrl.enable)
++			mt7915_vendor_amnt_fill_rx(phy, skb);
++#endif
+ 	} else {
+ 		status->flag |= RX_FLAG_8023;
+ 		mt7915_wed_check_ppe(dev, &dev->mt76.q_rx[q], msta, skb,
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 6790e987..2c7287db 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -794,6 +794,9 @@ int mt7915_mac_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ 	if (ret)
+ 		return ret;
+ 
++#ifdef CONFIG_MTK_VENDOR
++	mt7915_vendor_amnt_sta_remove(mvif->phy, sta);
++#endif
+ 	return mt7915_mcu_add_rate_ctrl(dev, vif, sta, false);
+ }
+ 
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index e4689d05..18a68998 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -232,6 +232,33 @@ struct csi_data {
+ 
+ 	struct list_head node;
+ };
++
++#define MT7915_AIR_MONITOR_MAX_ENTRY	16
++#define MT7915_AIR_MONITOR_MAX_GROUP	MT7915_AIR_MONITOR_MAX_ENTRY >> 1
++
++struct mt7915_air_monitor_group {
++	bool enable;
++	bool used[2];
++};
++
++struct mt7915_air_monitor_entry {
++	bool enable;
++
++	u8 group_idx;
++	u8 group_used_idx;
++	u8 muar_idx;
++	u8 addr[ETH_ALEN];
++	unsigned int last_seen;
++	s8 rssi[4];
++	struct ieee80211_sta *sta;
++};
++
++struct mt7915_air_monitor_ctrl {
++	u8 enable;
++
++	struct mt7915_air_monitor_group group[MT7915_AIR_MONITOR_MAX_GROUP];
++	struct mt7915_air_monitor_entry entry[MT7915_AIR_MONITOR_MAX_ENTRY];
++};
+ #endif
+ 
+ struct mt7915_phy {
+@@ -296,6 +323,8 @@ struct mt7915_phy {
+ 		u32 interval;
+ 		u32 last_record;
+ 	} csi;
++
++	struct mt7915_air_monitor_ctrl amnt_ctrl;
+ #endif
+ };
+ 
+@@ -686,6 +715,9 @@ int mt7915_mmio_wed_init(struct mt7915_dev *dev, void *pdev_ptr,
+ void mt7915_vendor_register(struct mt7915_phy *phy);
+ int mt7915_mcu_set_csi(struct mt7915_phy *phy, u8 mode,
+ 		       u8 cfg, u8 v1, u32 v2, u8 *mac_addr, u32 sta_interval);
++void mt7915_vendor_amnt_fill_rx(struct mt7915_phy *phy, struct sk_buff *skb);
++int mt7915_vendor_amnt_sta_remove(struct mt7915_phy *phy,
++				  struct ieee80211_sta *sta);
+ #endif
+ 
+ #ifdef MTK_DEBUG
+diff --git a/mt7915/vendor.c b/mt7915/vendor.c
+index 55da60a1..c964b143 100644
+--- a/mt7915/vendor.c
++++ b/mt7915/vendor.c
+@@ -448,6 +448,355 @@ out:
+ 	return err;
+ }
+ 
++static const struct nla_policy
++amnt_ctrl_policy[NUM_MTK_VENDOR_ATTRS_AMNT_CTRL] = {
++	[MTK_VENDOR_ATTR_AMNT_CTRL_SET] = {.type = NLA_NESTED },
++	[MTK_VENDOR_ATTR_AMNT_CTRL_DUMP] = { .type = NLA_NESTED },
++};
++
++static const struct nla_policy
++amnt_set_policy[NUM_MTK_VENDOR_ATTRS_AMNT_SET] = {
++	[MTK_VENDOR_ATTR_AMNT_SET_INDEX] = {.type = NLA_U8 },
++	[MTK_VENDOR_ATTR_AMNT_SET_MACADDR] = { .type = NLA_NESTED },
++};
++
++static const struct nla_policy
++amnt_dump_policy[NUM_MTK_VENDOR_ATTRS_AMNT_DUMP] = {
++	[MTK_VENDOR_ATTR_AMNT_DUMP_INDEX] = {.type = NLA_U8 },
++	[MTK_VENDOR_ATTR_AMNT_DUMP_LEN] = { .type = NLA_U8 },
++	[MTK_VENDOR_ATTR_AMNT_DUMP_RESULT] = { .type = NLA_NESTED },
++};
++
++struct mt7915_amnt_data {
++	u8 idx;
++	u8 addr[ETH_ALEN];
++	s8 rssi[4];
++	u32 last_seen;
++};
++
++struct mt7915_smesh {
++	u8 band;
++	u8 write;
++	u8 enable;
++	bool a2;
++	bool a1;
++	bool data;
++	bool mgnt;
++	bool ctrl;
++} __packed;
++
++struct mt7915_smesh_event {
++	u8 band;
++	__le32 value;
++} __packed;
++
++static int
++mt7915_vendor_smesh_ctrl(struct mt7915_phy *phy, u8 write,
++			 u8 enable, u32 *value)
++{
++	struct mt7915_dev *dev = phy->dev;
++	struct mt7915_smesh req = {
++		.band = phy != &dev->phy,
++		.write = write,
++		.enable = enable,
++		.a2 = 1,
++		.a1 = 1,
++		.data = 1,
++	};
++	struct mt7915_smesh_event *res;
++	struct sk_buff *skb;
++	int ret = 0;
++
++	ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_EXT_CMD(SMESH_CTRL),
++					&req, sizeof(req), !write, &skb);
++
++	if (ret || write)
++		return ret;
++
++	res = (struct mt7915_smesh_event *) skb->data;
++
++	if (!value)
++		return -EINVAL;
++
++	*value = res->value;
++
++	dev_kfree_skb(skb);
++
++	return 0;
++}
++
++static int
++mt7915_vendor_amnt_muar(struct mt7915_phy *phy, u8 muar_idx, u8 *addr)
++{
++	struct mt7915_dev *dev = phy->dev;
++	struct {
++		u8 mode;
++		u8 force_clear;
++		u8 clear_bitmap[8];
++		u8 entry_count;
++		u8 write;
++		u8 band;
++
++		u8 index;
++		u8 bssid;
++		u8 addr[ETH_ALEN];
++	} __packed req = {
++		.entry_count = 1,
++		.write = 1,
++		.band = phy != &dev->phy,
++		.index = muar_idx,
++	};
++
++	ether_addr_copy(req.addr, addr);
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(MUAR_UPDATE), &req,
++				 sizeof(req), true);
++}
++
++static int
++mt7915_vendor_amnt_set_en(struct mt7915_phy *phy, u8 enable)
++{
++	u32 status;
++	int ret;
++
++	ret = mt7915_vendor_smesh_ctrl(phy, 0, enable, &status);
++	if (ret)
++		return ret;
++
++	status = status & 0xff;
++
++	if (status == enable)
++		return 0;
++
++	ret = mt7915_vendor_smesh_ctrl(phy, 1, enable, &status);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static int
++mt7915_vendor_amnt_set_addr(struct mt7915_phy *phy, u8 index, u8 *addr)
++{
++	struct mt7915_air_monitor_ctrl *amnt_ctrl = &phy->amnt_ctrl;
++	struct mt7915_air_monitor_group *group;
++	struct mt7915_air_monitor_entry *entry = &amnt_ctrl->entry[index];
++	const u8 zero_addr[ETH_ALEN] = {};
++	int enable = !ether_addr_equal(addr, zero_addr);
++	int ret, i, j;
++
++	if (enable == 1 && entry->enable == 1) {
++		ether_addr_copy(entry->addr, addr);
++	} else if (enable == 1 && entry->enable == 0){
++		for (i = 0; i < MT7915_AIR_MONITOR_MAX_GROUP; i++) {
++			group = &(amnt_ctrl->group[i]);
++			if (group->used[0] == 0)
++				j = 0;
++			else if (group->used[1] == 0)
++				j = 1;
++			else
++				continue;
++
++			group->enable = 1;
++			group->used[j] = 1;
++			entry->enable = 1;
++			entry->group_idx = i;
++			entry->group_used_idx = j;
++			entry->muar_idx = 32 + 2 * i + 2 * i + 2 * j;
++			ether_addr_copy(entry->addr, addr);
++			break;
++		}
++	} else {
++		group = &(amnt_ctrl->group[entry->group_idx]);
++
++		group->used[entry->group_used_idx] = 0;
++		if (group->used[0] == 0 && group->used[1] == 0)
++			group->enable = 0;
++
++		entry->enable = 0;
++		ether_addr_copy(entry->addr, addr);
++	}
++
++	amnt_ctrl->enable &= ~(1 << entry->group_idx);
++	amnt_ctrl->enable |= entry->enable << entry->group_idx;
++	ret = mt7915_vendor_amnt_muar(phy, entry->muar_idx, addr);
++	if (ret)
++		return ret;
++
++	return mt7915_vendor_amnt_set_en(phy, amnt_ctrl->enable);
++}
++
++void mt7915_vendor_amnt_fill_rx(struct mt7915_phy *phy, struct sk_buff *skb)
++{
++	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
++	struct mt7915_air_monitor_ctrl *ctrl = &phy->amnt_ctrl;
++	struct ieee80211_hdr *hdr = mt76_skb_get_hdr(skb);
++	__le16 fc = hdr->frame_control;
++	u8 addr[ETH_ALEN];
++	int i;
++
++	if (!ieee80211_has_fromds(fc))
++		ether_addr_copy(addr, hdr->addr2);
++	else if (ieee80211_has_tods(fc))
++		ether_addr_copy(addr, hdr->addr4);
++	else
++		ether_addr_copy(addr, hdr->addr3);
++
++	for (i = 0; i < MT7915_AIR_MONITOR_MAX_ENTRY; i++) {
++		struct mt7915_air_monitor_entry *entry;
++
++		if (ether_addr_equal(addr, ctrl->entry[i].addr)) {
++			entry = &ctrl->entry[i];
++			entry->rssi[0] = status->chain_signal[0];
++			entry->rssi[1] = status->chain_signal[1];
++			entry->rssi[2] = status->chain_signal[2];
++			entry->rssi[3] = status->chain_signal[3];
++			entry->last_seen = jiffies;
++		}
++	}
++
++	if (ieee80211_has_tods(fc) &&
++	    !ether_addr_equal(hdr->addr3, phy->mt76->macaddr))
++		return;
++	else if (!ether_addr_equal(hdr->addr1, phy->mt76->macaddr))
++		return;
++}
++
++int mt7915_vendor_amnt_sta_remove(struct mt7915_phy *phy,
++				  struct ieee80211_sta *sta)
++{
++	u8 zero[ETH_ALEN] = {};
++	int i;
++
++	if (!phy->amnt_ctrl.enable)
++		return 0;
++
++	for (i = 0; i < MT7915_AIR_MONITOR_MAX_ENTRY; i++)
++		if (ether_addr_equal(sta->addr, phy->amnt_ctrl.entry[i].addr))
++			return mt7915_vendor_amnt_set_addr(phy, i, zero);
++
++	return 0;
++}
++
++static int
++mt7915_vendor_amnt_ctrl(struct wiphy *wiphy, struct wireless_dev *wdev,
++			const void *data, int data_len)
++{
++	struct ieee80211_hw *hw = wiphy_to_ieee80211_hw(wiphy);
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++	struct nlattr *tb1[NUM_MTK_VENDOR_ATTRS_AMNT_CTRL];
++	struct nlattr *tb2[NUM_MTK_VENDOR_ATTRS_AMNT_SET];
++	struct nlattr *cur;
++	u8 index = 0, i = 0;
++	u8 mac_addr[ETH_ALEN] = {};
++	int err, rem;
++
++	err = nla_parse(tb1, MTK_VENDOR_ATTR_AMNT_CTRL_MAX, data, data_len,
++			amnt_ctrl_policy, NULL);
++	if (err)
++		return err;
++
++	if (!tb1[MTK_VENDOR_ATTR_AMNT_CTRL_SET])
++		return -EINVAL;
++
++	err = nla_parse_nested(tb2, MTK_VENDOR_ATTR_AMNT_SET_MAX,
++		tb1[MTK_VENDOR_ATTR_AMNT_CTRL_SET], amnt_set_policy, NULL);
++
++	if (!tb2[MTK_VENDOR_ATTR_AMNT_SET_INDEX] ||
++		!tb2[MTK_VENDOR_ATTR_AMNT_SET_MACADDR])
++		return -EINVAL;
++
++	index = nla_get_u8(tb2[MTK_VENDOR_ATTR_AMNT_SET_INDEX]);
++	nla_for_each_nested(cur, tb2[MTK_VENDOR_ATTR_AMNT_SET_MACADDR], rem) {
++		mac_addr[i++] = nla_get_u8(cur);
++	}
++
++	return mt7915_vendor_amnt_set_addr(phy, index, mac_addr);
++}
++
++static int
++mt7915_amnt_dump(struct mt7915_phy *phy, struct sk_buff *skb,
++		 u8 amnt_idx, int *attrtype)
++{
++	struct mt7915_air_monitor_entry *entry =
++			&phy->amnt_ctrl.entry[amnt_idx];
++	struct mt7915_amnt_data data;
++	u32 last_seen = 0;
++
++	if (entry->enable == 0)
++		return 0;
++
++	last_seen = jiffies_to_msecs(jiffies - entry->last_seen);
++
++	data.idx = amnt_idx;
++	ether_addr_copy(data.addr, entry->addr);
++	data.rssi[0] = entry->rssi[0];
++	data.rssi[1] = entry->rssi[1];
++	data.rssi[2] = entry->rssi[2];
++	data.rssi[3] = entry->rssi[3];
++	data.last_seen = last_seen;
++
++	nla_put(skb, (*attrtype)++, sizeof(struct mt7915_amnt_data), &data);
++
++	return 1;
++}
++
++static int
++mt7915_vendor_amnt_ctrl_dump(struct wiphy *wiphy, struct wireless_dev *wdev,
++			     struct sk_buff *skb, const void *data, int data_len,
++			     unsigned long *storage)
++{
++	struct ieee80211_hw *hw = wiphy_to_ieee80211_hw(wiphy);
++	struct mt7915_phy *phy = mt7915_hw_phy(hw);
++	struct nlattr *tb1[NUM_MTK_VENDOR_ATTRS_AMNT_CTRL];
++	struct nlattr *tb2[NUM_MTK_VENDOR_ATTRS_AMNT_DUMP];
++	void *a, *b;
++	int err = 0, attrtype = 0, i, len = 0;
++	u8 amnt_idx;
++
++	if (*storage == 1)
++		return -ENOENT;
++	*storage = 1;
++
++	err = nla_parse(tb1, MTK_VENDOR_ATTR_AMNT_CTRL_MAX, data, data_len,
++			amnt_ctrl_policy, NULL);
++	if (err)
++		return err;
++
++	if (!tb1[MTK_VENDOR_ATTR_AMNT_CTRL_DUMP])
++		return -EINVAL;
++
++	err = nla_parse_nested(tb2, MTK_VENDOR_ATTR_AMNT_DUMP_MAX,
++			       tb1[MTK_VENDOR_ATTR_AMNT_CTRL_DUMP],
++			       amnt_dump_policy, NULL);
++	if (err)
++		return err;
++
++	if (!tb2[MTK_VENDOR_ATTR_AMNT_DUMP_INDEX])
++		return -EINVAL;
++
++	amnt_idx = nla_get_u8(tb2[MTK_VENDOR_ATTR_AMNT_DUMP_INDEX]);
++
++	a = nla_nest_start(skb, MTK_VENDOR_ATTR_AMNT_CTRL_DUMP);
++	b = nla_nest_start(skb, MTK_VENDOR_ATTR_AMNT_DUMP_RESULT);
++
++	if (amnt_idx != 0xff) {
++		len += mt7915_amnt_dump(phy, skb, amnt_idx, &attrtype);
++	} else {
++		for (i = 0; i < MT7915_AIR_MONITOR_MAX_ENTRY; i++) {
++			len += mt7915_amnt_dump(phy, skb, i, &attrtype);
++		}
++	}
++
++	nla_nest_end(skb, b);
++
++	nla_put_u8(skb, MTK_VENDOR_ATTR_AMNT_DUMP_LEN, len);
++
++	nla_nest_end(skb, a);
++
++	return len + 1;
++}
++
+ static const struct wiphy_vendor_command mt7915_vendor_commands[] = {
+ 	{
+ 		.info = {
+@@ -460,6 +809,18 @@ static const struct wiphy_vendor_command mt7915_vendor_commands[] = {
+ 		.dumpit = mt7915_vendor_csi_ctrl_dump,
+ 		.policy = csi_ctrl_policy,
+ 		.maxattr = MTK_VENDOR_ATTR_CSI_CTRL_MAX,
++	},
++	{
++		.info = {
++			.vendor_id = MTK_NL80211_VENDOR_ID,
++			.subcmd = MTK_NL80211_VENDOR_SUBCMD_AMNT_CTRL,
++		},
++		.flags = WIPHY_VENDOR_CMD_NEED_NETDEV |
++			 WIPHY_VENDOR_CMD_NEED_RUNNING,
++		.doit = mt7915_vendor_amnt_ctrl,
++		.dumpit = mt7915_vendor_amnt_ctrl_dump,
++		.policy = amnt_ctrl_policy,
++		.maxattr = MTK_VENDOR_ATTR_AMNT_CTRL_MAX,
+ 	}
+ };
+ 
+diff --git a/mt7915/vendor.h b/mt7915/vendor.h
+index e1f5fd36..1863eee5 100644
+--- a/mt7915/vendor.h
++++ b/mt7915/vendor.h
+@@ -5,6 +5,7 @@
+ #define MTK_NL80211_VENDOR_ID	0x0ce7
+ 
+ enum mtk_nl80211_vendor_subcmds {
++	MTK_NL80211_VENDOR_SUBCMD_AMNT_CTRL = 0xae,
+ 	MTK_NL80211_VENDOR_SUBCMD_CSI_CTRL = 0xc2,
+ };
+ 
+@@ -60,4 +61,41 @@ enum mtk_vendor_attr_csi_data {
+ 		NUM_MTK_VENDOR_ATTRS_CSI_DATA - 1
+ };
+ 
++enum mtk_vendor_attr_mnt_ctrl {
++	MTK_VENDOR_ATTR_AMNT_CTRL_UNSPEC,
++
++	MTK_VENDOR_ATTR_AMNT_CTRL_SET,
++	MTK_VENDOR_ATTR_AMNT_CTRL_DUMP,
++
++	/* keep last */
++	NUM_MTK_VENDOR_ATTRS_AMNT_CTRL,
++	MTK_VENDOR_ATTR_AMNT_CTRL_MAX =
++		NUM_MTK_VENDOR_ATTRS_AMNT_CTRL - 1
++};
++
++enum mtk_vendor_attr_mnt_set {
++	MTK_VENDOR_ATTR_AMNT_SET_UNSPEC,
++
++	MTK_VENDOR_ATTR_AMNT_SET_INDEX,
++	MTK_VENDOR_ATTR_AMNT_SET_MACADDR,
++
++	/* keep last */
++	NUM_MTK_VENDOR_ATTRS_AMNT_SET,
++	MTK_VENDOR_ATTR_AMNT_SET_MAX =
++		NUM_MTK_VENDOR_ATTRS_AMNT_SET - 1
++};
++
++enum mtk_vendor_attr_mnt_dump {
++	MTK_VENDOR_ATTR_AMNT_DUMP_UNSPEC,
++
++	MTK_VENDOR_ATTR_AMNT_DUMP_INDEX,
++	MTK_VENDOR_ATTR_AMNT_DUMP_LEN,
++	MTK_VENDOR_ATTR_AMNT_DUMP_RESULT,
++
++	/* keep last */
++	NUM_MTK_VENDOR_ATTRS_AMNT_DUMP,
++	MTK_VENDOR_ATTR_AMNT_DUMP_MAX =
++		NUM_MTK_VENDOR_ATTRS_AMNT_DUMP - 1
++};
++
+ #endif
+-- 
+2.18.0
+

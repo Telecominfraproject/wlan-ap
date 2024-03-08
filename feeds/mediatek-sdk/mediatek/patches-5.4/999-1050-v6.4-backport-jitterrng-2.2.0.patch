@@ -1,0 +1,1155 @@
+diff --git a/crypto/Makefile b/crypto/Makefile
+index 4e7a0a8f7..2b5a2a9c8 100644
+--- a/crypto/Makefile
++++ b/crypto/Makefile
+@@ -156,6 +156,7 @@ CFLAGS_jitterentropy.o = -O0
+ KASAN_SANITIZE_jitterentropy.o = n
+ UBSAN_SANITIZE_jitterentropy.o = n
+ jitterentropy_rng-y := jitterentropy.o jitterentropy-kcapi.o
++jitterentropy_rng-$(CONFIG_CRYPTO_CPU_JITTERENTROPY_DEBUG) += jitterentropy-dbg.o
+ obj-$(CONFIG_CRYPTO_TEST) += tcrypt.o
+ obj-$(CONFIG_CRYPTO_GHASH) += ghash-generic.o
+ obj-$(CONFIG_CRYPTO_USER_API) += af_alg.o
+diff --git a/crypto/jitterentropy-dbg.c b/crypto/jitterentropy-dbg.c
+new file mode 100644
+index 000000000..2e7e98b9a
+--- /dev/null
++++ b/crypto/jitterentropy-dbg.c
+@@ -0,0 +1,242 @@
++/*
++ * Non-physical true random number generator based on timing jitter - DebugFS
++ *
++ * Copyright Stephan Mueller <smueller@chronox.de>, 2013
++ *
++ * License
++ * =======
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, and the entire permission notice in its entirety,
++ *    including the disclaimer of warranties.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. The name of the author may not be used to endorse or promote
++ *    products derived from this software without specific prior
++ *    written permission.
++ *
++ * ALTERNATIVELY, this product may be distributed under the terms of
++ * the GNU General Public License, in which case the provisions of the GPL are
++ * required INSTEAD OF the above restrictions.  (This clause is
++ * necessary due to a potential bad interaction between the GPL and
++ * the restrictions contained in a BSD-style copyright.)
++ *
++ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESS OR IMPLIED
++ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE, ALL OF
++ * WHICH ARE HEREBY DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT
++ * OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
++ * BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
++ * USE OF THIS SOFTWARE, EVEN IF NOT ADVISED OF THE POSSIBILITY OF SUCH
++ * DAMAGE.
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <asm/uaccess.h>
++#include <linux/string.h>
++#include <linux/compat.h>
++#include <linux/export.h>
++#include <linux/file.h>
++#include <linux/debugfs.h>
++
++#include "jitterentropy.h"
++#include "jitterentropy-dbg.h"
++
++struct jent_debugfs {
++	struct dentry *jent_debugfs_root;
++	struct dentry *jent_debugfs_entropy;
++	struct dentry *jent_debugfs_noise;
++};
++
++struct jent_raw
++{
++	spinlock_t raw_lock;
++	struct rand_data *entropy_collector;
++};
++
++static struct jent_debugfs jent_debugfs;
++static struct jent_raw raw_entropy;
++
++void jent_drng_cleanup_raw(struct jent_raw *raw)
++{
++	spin_lock_bh(&raw->raw_lock);
++	if (NULL != raw->entropy_collector)
++		jent_entropy_collector_free(raw->entropy_collector);
++	raw->entropy_collector = NULL;
++	spin_unlock_bh(&raw->raw_lock);
++}
++
++int jent_drng_get_bytes_raw(struct jent_raw *raw, char *data, size_t len)
++{
++	int ret = 0;
++
++	spin_lock_bh(&raw->raw_lock);
++	ret = jent_read_entropy(raw->entropy_collector, data, len);
++	if (0 > ret) {
++		printk(DRIVER_NAME": Unable to obtain %zu bytes of entropy\n", len);
++		ret = -EAGAIN;
++	}
++
++	spin_unlock_bh(&raw->raw_lock);
++	return ret;
++}
++
++
++static inline int jent_dbg_raw_bytes(char *data, size_t len)
++{
++        return jent_drng_get_bytes_raw(&raw_entropy, data, len);
++}
++
++static ssize_t jent_debugfs_read_func(struct file *file,
++				      char __user *buf, size_t nbytes,
++				      loff_t *ppos, size_t chunk,
++				      int (*source)(char *out, size_t len))
++{
++	ssize_t total = 0;
++	int ret = 0;
++	loff_t pos = *ppos;
++	char *out;
++
++	if (!nbytes)
++		return -EINVAL;
++
++	out = kzalloc(chunk, GFP_KERNEL);
++	if (!out)
++		return -ENOMEM;
++
++	while (nbytes > 0) {
++		int copy = min_t(int, chunk, nbytes);
++		ret = source(out, copy);
++		if (0 > ret) {
++			printk(DRIVER_NAME": could not obtain random data: %d\n", ret);
++			ret = -EAGAIN;
++			break;
++		}
++		if (copy_to_user(buf+pos+total, out, copy)) {
++			ret = -EFAULT;
++			break;
++		}
++		nbytes -= copy;
++		total += copy;
++	}
++	kzfree(out);
++
++	return ((0 > ret) ? ret : total);
++}
++
++static ssize_t jent_debugfs_noise_read(struct file *file, char __user *buf,
++			      size_t nbytes, loff_t *ppos)
++{
++	struct rand_data *ec = raw_entropy.entropy_collector;
++	int total = 0;
++	loff_t pos = *ppos;
++	char *out;
++
++	out = kzalloc(8, GFP_KERNEL);
++
++	while (nbytes > 0) {
++		int len = min_t(int, 8, nbytes);
++		jent_lfsr_time(ec, 0, 0, 0);
++		memcpy(out, &ec->data, len);
++		if (copy_to_user(buf+pos+total, out, len)) {
++			break;
++		}
++		nbytes -= len;
++		total += len;
++	}
++	kzfree(out);
++	return total;
++
++}
++static ssize_t jent_debugfs_seed_read(struct file *file, char __user *buf,
++			      size_t nbytes, loff_t *ppos)
++{
++	int ret = jent_debugfs_read_func(file, buf, nbytes, ppos, 8,
++				      jent_dbg_raw_bytes);
++	return ret;
++}
++
++int jent_drng_init_raw(struct jent_raw *raw, unsigned int flags)
++{
++	int ret = 0;
++
++	raw->entropy_collector = jent_entropy_collector_alloc(1, flags);
++	if (!raw->entropy_collector)
++		ret = -ENOMEM;
++
++	spin_lock_init(&raw->raw_lock);
++	return ret;
++}
++
++static struct file_operations jent_seed_fops = {
++	.owner = THIS_MODULE,
++	.read = jent_debugfs_seed_read,
++};
++
++static struct file_operations jent_noise_fops = {
++	.owner = THIS_MODULE,
++	.read = jent_debugfs_noise_read,
++};
++
++
++int __init jent_dbg_init(void)
++{
++	int ret = -EINVAL;
++	jent_debugfs.jent_debugfs_root = NULL;
++	jent_debugfs.jent_debugfs_noise = NULL;
++	jent_debugfs.jent_debugfs_entropy = NULL;
++
++	ret = jent_drng_init_raw(&raw_entropy, JENT_DISABLE_STIR);
++	if (ret) {
++		printk(DRIVER_NAME": Raw entropy collector instantiation failed\n");
++		return ret;
++	}
++	jent_debugfs.jent_debugfs_root =
++		debugfs_create_dir(DRIVER_NAME, NULL);
++	if (IS_ERR(jent_debugfs.jent_debugfs_root)) {
++		printk(DRIVER_NAME": initialization of debugfs directory failed\n");
++		goto cleandir;
++	}
++
++	jent_debugfs.jent_debugfs_entropy =
++		debugfs_create_file("entropy", S_IRUGO,
++		jent_debugfs.jent_debugfs_root,
++		NULL, &jent_seed_fops);
++	if (IS_ERR(jent_debugfs.jent_debugfs_entropy)) {
++		printk(DRIVER_NAME": initialization of entropy file failed\n");
++		goto cleandir;
++	}
++
++	jent_debugfs.jent_debugfs_noise =
++		debugfs_create_file("noise", S_IRUGO,
++		jent_debugfs.jent_debugfs_root,
++		NULL, &jent_noise_fops);
++	if (IS_ERR(jent_debugfs.jent_debugfs_noise)) {
++		printk(DRIVER_NAME": initialization of noise file failed\n");
++		goto cleandir;
++	}
++	return 0;
++
++cleandir:
++	debugfs_remove_recursive(jent_debugfs.jent_debugfs_root);
++	jent_drng_cleanup_raw(&raw_entropy);
++
++	return ret;
++}
++
++void jent_dbg_exit(void)
++{
++	debugfs_remove_recursive(jent_debugfs.jent_debugfs_root);
++	jent_drng_cleanup_raw(&raw_entropy);
++}
+diff --git a/crypto/jitterentropy-dbg.h b/crypto/jitterentropy-dbg.h
+new file mode 100644
+index 000000000..921bd65dc
+--- /dev/null
++++ b/crypto/jitterentropy-dbg.h
+@@ -0,0 +1,49 @@
++/*
++ * Non-physical true random number generator based on timing jitter.
++ *
++ * Copyright Stephan Mueller <smueller@chronox.de>, 2013
++ *
++ * License
++ * =======
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, and the entire permission notice in its entirety,
++ *    including the disclaimer of warranties.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. The name of the author may not be used to endorse or promote
++ *    products derived from this software without specific prior
++ *    written permission.
++ *
++ * ALTERNATIVELY, this product may be distributed under the terms of
++ * the GNU General Public License, in which case the provisions of the GPL are
++ * required INSTEAD OF the above restrictions.  (This clause is
++ * necessary due to a potential bad interaction between the GPL and
++ * the restrictions contained in a BSD-style copyright.)
++ *
++ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESS OR IMPLIED
++ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE, ALL OF
++ * WHICH ARE HEREBY DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT
++ * OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
++ * BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
++ * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
++ * USE OF THIS SOFTWARE, EVEN IF NOT ADVISED OF THE POSSIBILITY OF SUCH
++ * DAMAGE.
++ */
++
++#ifndef _JITTERENTROPY_DBG_KERNEL_H
++#define _JITTERENTROPY_DBG_KERNEL_H
++
++int __init jent_dbg_init(void);
++void jent_dbg_exit(void);
++
++
++#endif /* _JITTERENTROPY_DBG_KERNEL_H */
+diff --git a/crypto/jitterentropy-kcapi.c b/crypto/jitterentropy-kcapi.c
+index 701b8d86a..7a3691fab 100644
+--- a/crypto/jitterentropy-kcapi.c
++++ b/crypto/jitterentropy-kcapi.c
+@@ -44,13 +44,11 @@
+ #include <linux/crypto.h>
+ #include <crypto/internal/rng.h>
+ 
+-struct rand_data;
+-int jent_read_entropy(struct rand_data *ec, unsigned char *data,
+-		      unsigned int len);
+-int jent_entropy_init(void);
+-struct rand_data *jent_entropy_collector_alloc(unsigned int osr,
+-					       unsigned int flags);
+-void jent_entropy_collector_free(struct rand_data *entropy_collector);
++#include "jitterentropy.h"
++
++#ifdef CONFIG_CRYPTO_CPU_JITTERENTROPY_DEBUG
++#include "jitterentropy-dbg.h"
++#endif
+ 
+ /***************************************************************************
+  * Helper function
+@@ -148,7 +146,31 @@ static int jent_kcapi_random(struct crypto_rng *tfm,
+ 	int ret = 0;
+ 
+ 	spin_lock(&rng->jent_lock);
++
+ 	ret = jent_read_entropy(rng->entropy_collector, rdata, dlen);
++
++	if (ret == -3) {
++		/* Handle permanent health test error */
++		/*
++		 * If the kernel was booted with fips=1, it implies that
++		 * the entire kernel acts as a FIPS 140 module. In this case
++		 * an SP800-90B permanent health test error is treated as
++		 * a FIPS module error.
++		 */
++		if (fips_enabled)
++			panic("Jitter RNG permanent health test failure\n");
++
++		pr_err("Jitter RNG permanent health test failure\n");
++		ret = -EFAULT;
++	} else if (ret == -2) {
++		/* Handle intermittent health test error */
++		pr_warn_ratelimited("Reset Jitter RNG due to intermittent health test failure\n");
++		ret = -EAGAIN;
++	} else if (ret == -1) {
++		/* Handle other errors */
++		ret = -EINVAL;
++	}
++
+ 	spin_unlock(&rng->jent_lock);
+ 
+ 	return ret;
+@@ -182,15 +204,31 @@ static int __init jent_mod_init(void)
+ 
+ 	ret = jent_entropy_init();
+ 	if (ret) {
++		/* Handle permanent health test error */
++		if (fips_enabled)
++			panic("jitterentropy: Initialization failed with host not compliant with requirements: %d\n", ret);
++
+ 		pr_info("jitterentropy: Initialization failed with host not compliant with requirements: %d\n", ret);
+ 		return -EFAULT;
+ 	}
++
++#ifdef CONFIG_CRYPTO_CPU_JITTERENTROPY_DEBUG
++	ret = jent_dbg_init();
++#endif
++	if(ret)
++		return ret;
++	printk("Debug interface error\n");
+ 	return crypto_register_rng(&jent_alg);
++
+ }
+ 
+ static void __exit jent_mod_exit(void)
+ {
+ 	crypto_unregister_rng(&jent_alg);
++
++#ifdef CONFIG_CRYPTO_CPU_JITTERENTROPY_DEBUG
++	jent_dbg_exit();
++#endif
+ }
+ 
+ module_init(jent_mod_init);
+diff --git a/crypto/jitterentropy.c b/crypto/jitterentropy.c
+index 77fa2120f..fea7a6d42 100644
+--- a/crypto/jitterentropy.c
++++ b/crypto/jitterentropy.c
+@@ -2,12 +2,12 @@
+  * Non-physical true random number generator based on timing jitter --
+  * Jitter RNG standalone code.
+  *
+- * Copyright Stephan Mueller <smueller@chronox.de>, 2015 - 2019
++ * Copyright Stephan Mueller <smueller@chronox.de>, 2015 - 2020
+  *
+  * Design
+  * ======
+  *
+- * See http://www.chronox.de/jent.html
++ * See https://www.chronox.de/jent.html
+  *
+  * License
+  * =======
+@@ -47,7 +47,7 @@
+ 
+ /*
+  * This Jitterentropy RNG is based on the jitterentropy library
+- * version 2.1.2 provided at http://www.chronox.de/jent.html
++ * version 2.2.0 provided at https://www.chronox.de/jent.html
+  */
+ 
+ #ifdef __OPTIMIZE__
+@@ -58,32 +58,8 @@ typedef	unsigned long long	__u64;
+ typedef	long long		__s64;
+ typedef	unsigned int		__u32;
+ #define NULL    ((void *) 0)
++#include "jitterentropy.h"
+ 
+-/* The entropy pool */
+-struct rand_data {
+-	/* all data values that are vital to maintain the security
+-	 * of the RNG are marked as SENSITIVE. A user must not
+-	 * access that information while the RNG executes its loops to
+-	 * calculate the next random value. */
+-	__u64 data;		/* SENSITIVE Actual random number */
+-	__u64 old_data;		/* SENSITIVE Previous random number */
+-	__u64 prev_time;	/* SENSITIVE Previous time stamp */
+-#define DATA_SIZE_BITS ((sizeof(__u64)) * 8)
+-	__u64 last_delta;	/* SENSITIVE stuck test */
+-	__s64 last_delta2;	/* SENSITIVE stuck test */
+-	unsigned int osr;	/* Oversample rate */
+-#define JENT_MEMORY_BLOCKS 64
+-#define JENT_MEMORY_BLOCKSIZE 32
+-#define JENT_MEMORY_ACCESSLOOPS 128
+-#define JENT_MEMORY_SIZE (JENT_MEMORY_BLOCKS*JENT_MEMORY_BLOCKSIZE)
+-	unsigned char *mem;	/* Memory access location with size of
+-				 * memblocks * memblocksize */
+-	unsigned int memlocation; /* Pointer to byte in *mem */
+-	unsigned int memblocks;	/* Number of memory blocks in *mem */
+-	unsigned int memblocksize; /* Size of one memory block in bytes */
+-	unsigned int memaccessloops; /* Number of memory accesses per random
+-				      * bit generation */
+-};
+ 
+ /* Flags that can be used to initialize the RNG */
+ #define JENT_DISABLE_MEMORY_ACCESS (1<<2) /* Disable memory access for more
+@@ -98,19 +74,187 @@ struct rand_data {
+ 				   * variations (2nd derivation of time is
+ 				   * zero). */
+ #define JENT_ESTUCK		8 /* Too many stuck results during init. */
++#define JENT_EHEALTH		9 /* Health test failed during initialization */
++
++/*
++ * The output n bits can receive more than n bits of min entropy, of course,
++ * but the fixed output of the conditioning function can only asymptotically
++ * approach the output size bits of min entropy, not attain that bound. Random
++ * maps will tend to have output collisions, which reduces the creditable
++ * output entropy (that is what SP 800-90B Section 3.1.5.1.2 attempts to bound).
++ *
++ * The value "64" is justified in Appendix A.4 of the current 90C draft,
++ * and aligns with NIST's in "epsilon" definition in this document, which is
++ * that a string can be considered "full entropy" if you can bound the min
++ * entropy in each bit of output to at least 1-epsilon, where epsilon is
++ * required to be <= 2^(-32).
++ */
++#define JENT_ENTROPY_SAFETY_FACTOR	64
++
++#include <linux/fips.h>
++#include <linux/printk.h>
++
++/***************************************************************************
++ * Adaptive Proportion Test
++ *
++ * This test complies with SP800-90B section 4.4.2.
++ ***************************************************************************/
++
++/*
++ * Reset the APT counter
++ *
++ * @ec [in] Reference to entropy collector
++ */
++static void jent_apt_reset(struct rand_data *ec, unsigned int delta_masked)
++{
++	/* Reset APT counter */
++	ec->apt_count = 0;
++	ec->apt_base = delta_masked;
++	ec->apt_observations = 0;
++}
++
++/*
++ * Insert a new entropy event into APT
++ *
++ * @ec [in] Reference to entropy collector
++ * @delta_masked [in] Masked time delta to process
++ */
++static void jent_apt_insert(struct rand_data *ec, unsigned int delta_masked)
++{
++	/* Initialize the base reference */
++	if (!ec->apt_base_set) {
++		ec->apt_base = delta_masked;
++		ec->apt_base_set = 1;
++		return;
++	}
++
++	if (delta_masked == ec->apt_base)
++		ec->apt_count++;
++
++	ec->apt_observations++;
++
++	if (ec->apt_observations >= JENT_APT_WINDOW_SIZE)
++		jent_apt_reset(ec, delta_masked);
++}
++
++/* APT health test failure detection */
++static int jent_apt_permanent_failure(struct rand_data *ec)
++{
++	return (ec->apt_count >= JENT_APT_CUTOFF_PERMANENT) ? 1 : 0;
++}
++
++static int jent_apt_failure(struct rand_data *ec)
++{
++	return (ec->apt_count >= JENT_APT_CUTOFF) ? 1 : 0;
++}
+ 
+ /***************************************************************************
+- * Helper functions
++ * Stuck Test and its use as Repetition Count Test
++ *
++ * The Jitter RNG uses an enhanced version of the Repetition Count Test
++ * (RCT) specified in SP800-90B section 4.4.1. Instead of counting identical
++ * back-to-back values, the input to the RCT is the counting of the stuck
++ * values during the generation of one Jitter RNG output block.
++ *
++ * The RCT is applied with an alpha of 2^{-30} compliant to FIPS 140-2 IG 9.8.
++ *
++ * During the counting operation, the Jitter RNG always calculates the RCT
++ * cut-off value of C. If that value exceeds the allowed cut-off value,
++ * the Jitter RNG output block will be calculated completely but discarded at
++ * the end. The caller of the Jitter RNG is informed with an error code.
+  ***************************************************************************/
+ 
+-void jent_get_nstime(__u64 *out);
+-void *jent_zalloc(unsigned int len);
+-void jent_zfree(void *ptr);
+-int jent_fips_enabled(void);
+-void jent_panic(char *s);
+-void jent_memcpy(void *dest, const void *src, unsigned int n);
++/*
++ * Repetition Count Test as defined in SP800-90B section 4.4.1
++ *
++ * @ec [in] Reference to entropy collector
++ * @stuck [in] Indicator whether the value is stuck
++ */
++static void jent_rct_insert(struct rand_data *ec, int stuck)
++{
++	if (stuck) {
++		ec->rct_count++;
++	} else {
++		/* Reset RCT */
++		ec->rct_count = 0;
++	}
++}
++
++static inline __u64 jent_delta(__u64 prev, __u64 next)
++{
++#define JENT_UINT64_MAX		(__u64)(~((__u64) 0))
++	return (prev < next) ? (next - prev) :
++			       (JENT_UINT64_MAX - prev + 1 + next);
++}
++
++/*
++ * Stuck test by checking the:
++ * 	1st derivative of the jitter measurement (time delta)
++ * 	2nd derivative of the jitter measurement (delta of time deltas)
++ * 	3rd derivative of the jitter measurement (delta of delta of time deltas)
++ *
++ * All values must always be non-zero.
++ *
++ * @ec [in] Reference to entropy collector
++ * @current_delta [in] Jitter time delta
++ *
++ * @return
++ * 	0 jitter measurement not stuck (good bit)
++ * 	1 jitter measurement stuck (reject bit)
++ */
++static int jent_stuck(struct rand_data *ec, __u64 current_delta)
++{
++	__u64 delta2 = jent_delta(ec->last_delta, current_delta);
++	__u64 delta3 = jent_delta(ec->last_delta2, delta2);
++
++	ec->last_delta = current_delta;
++	ec->last_delta2 = delta2;
++
++	/*
++	 * Insert the result of the comparison of two back-to-back time
++	 * deltas.
++	 */
++	jent_apt_insert(ec, current_delta);
++
++	if (!current_delta || !delta2 || !delta3) {
++		/* RCT with a stuck bit */
++		jent_rct_insert(ec, 1);
++		return 1;
++	}
++
++	/* RCT with a non-stuck bit */
++	jent_rct_insert(ec, 0);
++
++	return 0;
++}
++
++/* RCT health test failure detection */
++static int jent_rct_permanent_failure(struct rand_data *ec)
++{
++	return (ec->rct_count >= JENT_RCT_CUTOFF_PERMANENT) ? 1 : 0;
++}
++
++static int jent_rct_failure(struct rand_data *ec)
++{
++	return (ec->rct_count >= JENT_RCT_CUTOFF) ? 1 : 0;
++}
++
++/* Report of health test failures */
++static int jent_health_failure(struct rand_data *ec)
++{
++	return jent_rct_failure(ec) | jent_apt_failure(ec);
++}
++
++static int jent_permanent_health_failure(struct rand_data *ec)
++{
++	return jent_rct_permanent_failure(ec) | jent_apt_permanent_failure(ec);
++}
++
++/***************************************************************************
++ * Noise sources
++ ***************************************************************************/
+ 
+-/**
++/*
+  * Update of the loop count used for the next round of
+  * an entropy collection.
+  *
+@@ -153,11 +297,7 @@ static __u64 jent_loop_shuffle(struct rand_data *ec,
+ 	return (shuffle + (1<<min));
+ }
+ 
+-/***************************************************************************
+- * Noise sources
+- ***************************************************************************/
+-
+-/**
++/*
+  * CPU Jitter noise source -- this is the noise source based on the CPU
+  *			      execution time jitter
+  *
+@@ -171,18 +311,19 @@ static __u64 jent_loop_shuffle(struct rand_data *ec,
+  * the CPU execution time jitter. Any change to the loop in this function
+  * implies that careful retesting must be done.
+  *
+- * Input:
+- * @ec entropy collector struct -- may be NULL
+- * @time time stamp to be injected
+- * @loop_cnt if a value not equal to 0 is set, use the given value as number of
+- *	     loops to perform the folding
++ * @ec [in] entropy collector struct
++ * @time [in] time stamp to be injected
++ * @loop_cnt [in] if a value not equal to 0 is set, use the given value as
++ *		  number of loops to perform the folding
++ * @stuck [in] Is the time stamp identified as stuck?
+  *
+  * Output:
+  * updated ec->data
+  *
+  * @return Number of loops the folding operation is performed
+  */
+-static __u64 jent_lfsr_time(struct rand_data *ec, __u64 time, __u64 loop_cnt)
++void jent_lfsr_time(struct rand_data *ec, __u64 time, __u64 loop_cnt,
++			   int stuck)
+ {
+ 	unsigned int i;
+ 	__u64 j = 0;
+@@ -225,12 +366,20 @@ static __u64 jent_lfsr_time(struct rand_data *ec, __u64 time, __u64 loop_cnt)
+ 			new ^= tmp;
+ 		}
+ 	}
+-	ec->data = new;
+ 
+-	return fold_loop_cnt;
++	/*
++	 * If the time stamp is stuck, do not finally insert the value into
++	 * the entropy pool. Although this operation should not do any harm
++	 * even when the time stamp has no entropy, SP800-90B requires that
++	 * any conditioning operation (SP800-90B considers the LFSR to be a
++	 * conditioning operation) to have an identical amount of input
++	 * data according to section 3.1.5.
++	 */
++	if (!stuck)
++		ec->data = new;
+ }
+ 
+-/**
++/*
+  * Memory Access noise source -- this is a noise source based on variations in
+  *				 memory access times
+  *
+@@ -248,16 +397,13 @@ static __u64 jent_lfsr_time(struct rand_data *ec, __u64 time, __u64 loop_cnt)
+  * to reliably access either L3 or memory, the ec->mem memory must be quite
+  * large which is usually not desirable.
+  *
+- * Input:
+- * @ec Reference to the entropy collector with the memory access data -- if
+- *     the reference to the memory block to be accessed is NULL, this noise
+- *     source is disabled
+- * @loop_cnt if a value not equal to 0 is set, use the given value as number of
+- *	     loops to perform the folding
+- *
+- * @return Number of memory access operations
++ * @ec [in] Reference to the entropy collector with the memory access data -- if
++ *	    the reference to the memory block to be accessed is NULL, this noise
++ *	    source is disabled
++ * @loop_cnt [in] if a value not equal to 0 is set, use the given value
++ *		  number of loops to perform the LFSR
+  */
+-static unsigned int jent_memaccess(struct rand_data *ec, __u64 loop_cnt)
++static void jent_memaccess(struct rand_data *ec, __u64 loop_cnt)
+ {
+ 	unsigned int wrap = 0;
+ 	__u64 i = 0;
+@@ -267,7 +413,7 @@ static unsigned int jent_memaccess(struct rand_data *ec, __u64 loop_cnt)
+ 		jent_loop_shuffle(ec, MAX_ACC_LOOP_BIT, MIN_ACC_LOOP_BIT);
+ 
+ 	if (NULL == ec || NULL == ec->mem)
+-		return 0;
++		return;
+ 	wrap = ec->memblocksize * ec->memblocks;
+ 
+ 	/*
+@@ -293,44 +439,12 @@ static unsigned int jent_memaccess(struct rand_data *ec, __u64 loop_cnt)
+ 		ec->memlocation = ec->memlocation + ec->memblocksize - 1;
+ 		ec->memlocation = ec->memlocation % wrap;
+ 	}
+-	return i;
+ }
+ 
+ /***************************************************************************
+  * Start of entropy processing logic
+  ***************************************************************************/
+-
+-/**
+- * Stuck test by checking the:
+- *	1st derivation of the jitter measurement (time delta)
+- *	2nd derivation of the jitter measurement (delta of time deltas)
+- *	3rd derivation of the jitter measurement (delta of delta of time deltas)
+- *
+- * All values must always be non-zero.
+- *
+- * Input:
+- * @ec Reference to entropy collector
+- * @current_delta Jitter time delta
+- *
+- * @return
+- *	0 jitter measurement not stuck (good bit)
+- *	1 jitter measurement stuck (reject bit)
+- */
+-static int jent_stuck(struct rand_data *ec, __u64 current_delta)
+-{
+-	__s64 delta2 = ec->last_delta - current_delta;
+-	__s64 delta3 = delta2 - ec->last_delta2;
+-
+-	ec->last_delta = current_delta;
+-	ec->last_delta2 = delta2;
+-
+-	if (!current_delta || !delta2 || !delta3)
+-		return 1;
+-
+-	return 0;
+-}
+-
+-/**
++/*
+  * This is the heart of the entropy generation: calculate time deltas and
+  * use the CPU jitter in the time deltas. The jitter is injected into the
+  * entropy pool.
+@@ -339,15 +453,15 @@ static int jent_stuck(struct rand_data *ec, __u64 current_delta)
+  *	    of this function! This can be done by calling this function
+  *	    and not using its result.
+  *
+- * Input:
+- * @entropy_collector Reference to entropy collector
++ * @ec [in] Reference to entropy collector
+  *
+  * @return result of stuck test
+  */
+-static int jent_measure_jitter(struct rand_data *ec)
++int jent_measure_jitter(struct rand_data *ec)
+ {
+ 	__u64 time = 0;
+ 	__u64 current_delta = 0;
++	int stuck;
+ 
+ 	/* Invoke one noise source before time measurement to add variations */
+ 	jent_memaccess(ec, 0);
+@@ -357,31 +471,33 @@ static int jent_measure_jitter(struct rand_data *ec)
+ 	 * invocation to measure the timing variations
+ 	 */
+ 	jent_get_nstime(&time);
+-	current_delta = time - ec->prev_time;
++	current_delta = jent_delta(ec->prev_time, time);
+ 	ec->prev_time = time;
++	/* Check whether we have a stuck measurement. */
++	stuck = jent_stuck(ec, current_delta);
+ 
+ 	/* Now call the next noise sources which also injects the data */
+-	jent_lfsr_time(ec, current_delta, 0);
+-
+-	/* Check whether we have a stuck measurement. */
+-	return jent_stuck(ec, current_delta);
++	jent_lfsr_time(ec, current_delta, 0, stuck);
++	return stuck;
+ }
+ 
+-/**
++/*
+  * Generator of one 64 bit random number
+  * Function fills rand_data->data
+  *
+- * Input:
+- * @ec Reference to entropy collector
++ * @ec [in] Reference to entropy collector
+  */
+ static void jent_gen_entropy(struct rand_data *ec)
+ {
+-	unsigned int k = 0;
++	unsigned int k = 0, safety_factor = 0;
++
++	if (fips_enabled)
++		safety_factor = JENT_ENTROPY_SAFETY_FACTOR;
+ 
+ 	/* priming of the ->prev_time value */
+ 	jent_measure_jitter(ec);
+ 
+-	while (1) {
++	while (!jent_health_failure(ec)) {
+ 		/* If a stuck measurement is received, repeat measurement */
+ 		if (jent_measure_jitter(ec))
+ 			continue;
+@@ -390,37 +506,12 @@ static void jent_gen_entropy(struct rand_data *ec)
+ 		 * We multiply the loop value with ->osr to obtain the
+ 		 * oversampling rate requested by the caller
+ 		 */
+-		if (++k >= (DATA_SIZE_BITS * ec->osr))
++		if (++k >= ((DATA_SIZE_BITS + safety_factor) * ec->osr))
+ 			break;
+ 	}
+ }
+ 
+-/**
+- * The continuous test required by FIPS 140-2 -- the function automatically
+- * primes the test if needed.
+- *
+- * Return:
+- * 0 if FIPS test passed
+- * < 0 if FIPS test failed
+- */
+-static void jent_fips_test(struct rand_data *ec)
+-{
+-	if (!jent_fips_enabled())
+-		return;
+-
+-	/* prime the FIPS test */
+-	if (!ec->old_data) {
+-		ec->old_data = ec->data;
+-		jent_gen_entropy(ec);
+-	}
+-
+-	if (ec->data == ec->old_data)
+-		jent_panic("jitterentropy: Duplicate output detected\n");
+-
+-	ec->old_data = ec->data;
+-}
+-
+-/**
++/*
+  * Entry function: Obtain entropy for the caller.
+  *
+  * This function invokes the entropy gathering logic as often to generate
+@@ -430,42 +521,62 @@ static void jent_fips_test(struct rand_data *ec)
+  * This function truncates the last 64 bit entropy value output to the exact
+  * size specified by the caller.
+  *
+- * Input:
+- * @ec Reference to entropy collector
+- * @data pointer to buffer for storing random data -- buffer must already
+- *	 exist
+- * @len size of the buffer, specifying also the requested number of random
+- *	in bytes
++ * @ec [in] Reference to entropy collector
++ * @data [in] pointer to buffer for storing random data -- buffer must already
++ *	      exist
++ * @len [in] size of the buffer, specifying also the requested number of random
++ *	     in bytes
+  *
+  * @return 0 when request is fulfilled or an error
+  *
+  * The following error codes can occur:
+  *	-1	entropy_collector is NULL
++ *	-2	Intermittent health failure
++ *	-3	Permanent health failure
+  */
+ int jent_read_entropy(struct rand_data *ec, unsigned char *data,
+ 		      unsigned int len)
+ {
+ 	unsigned char *p = data;
+ 
+ 	if (!ec)
+ 		return -1;
+ 
+-	while (0 < len) {
++	while (len > 0) {
+ 		unsigned int tocopy;
+ 
+ 		jent_gen_entropy(ec);
+-		jent_fips_test(ec);
++
++		if (jent_permanent_health_failure(ec)) {
++			/*
++			 * At this point, the Jitter RNG instance is considered
++			 * as a failed instance. There is no rerun of the
++			 * startup test any more, because the caller
++			 * is assumed to not further use this instance.
++			 */
++			return -3;
++		} else if (jent_health_failure(ec)) {
++			/*
++			 * Perform startup health tests and return permanent
++			 * error if it fails.
++			 */
++			if (jent_entropy_init())
++				return -3;
++
++			return -2;
++		}
++
+ 		if ((DATA_SIZE_BITS / 8) < len)
+ 			tocopy = (DATA_SIZE_BITS / 8);
+ 		else
+ 			tocopy = len;
+ 		jent_memcpy(p, &ec->data, tocopy);
+ 
+ 		len -= tocopy;
+ 		p += tocopy;
+ 	}
+ 
+	return 0;
+ }
+ 
+ /***************************************************************************
+@@ -496,7 +609,7 @@ struct rand_data *jent_entropy_collector_alloc(unsigned int osr,
+ 	}
+ 
+ 	/* verify and set the oversampling rate */
+-	if (0 == osr)
++	if (osr == 0)
+ 		osr = 1; /* minimum sampling rate is 1 */
+ 	entropy_collector->osr = osr;
+ 
+@@ -518,11 +631,15 @@ int jent_entropy_init(void)
+ 	int i;
+ 	__u64 delta_sum = 0;
+ 	__u64 old_delta = 0;
++	unsigned int nonstuck = 0;
+ 	int time_backwards = 0;
+ 	int count_mod = 0;
+ 	int count_stuck = 0;
+ 	struct rand_data ec = { 0 };
+ 
++	/* Required for RCT */
++	ec.osr = 1;
++
+ 	/* We could perform statistical tests here, but the problem is
+ 	 * that we only have a few loop counts to do testing. These
+ 	 * loop counts may show some slight skew and we produce
+@@ -544,8 +661,10 @@ int jent_entropy_init(void)
+ 	/*
+ 	 * TESTLOOPCOUNT needs some loops to identify edge systems. 100 is
+ 	 * definitely too little.
++	 *
++	 * SP800-90B requires at least 1024 initial test cycles.
+ 	 */
+-#define TESTLOOPCOUNT 300
++#define TESTLOOPCOUNT 1024
+ #define CLEARCACHE 100
+ 	for (i = 0; (TESTLOOPCOUNT + CLEARCACHE) > i; i++) {
+ 		__u64 time = 0;
+@@ -557,13 +676,13 @@ int jent_entropy_init(void)
+ 		/* Invoke core entropy collection logic */
+ 		jent_get_nstime(&time);
+ 		ec.prev_time = time;
+-		jent_lfsr_time(&ec, time, 0);
++		jent_lfsr_time(&ec, time, 0, 0);
+ 		jent_get_nstime(&time2);
+ 
+ 		/* test whether timer works */
+ 		if (!time || !time2)
+ 			return JENT_ENOTIME;
+-		delta = time2 - time;
++		delta = jent_delta(time, time2);
+ 		/*
+ 		 * test whether timer is fine grained enough to provide
+ 		 * delta even when called shortly after each other -- this
+@@ -581,11 +700,31 @@ int jent_entropy_init(void)
+ 		 * etc. with the goal to clear it to get the worst case
+ 		 * measurements.
+ 		 */
+-		if (CLEARCACHE > i)
++		if (i < CLEARCACHE)
+ 			continue;
+ 
+ 		if (stuck)
+ 			count_stuck++;
++		else {
++			nonstuck++;
++
++			/*
++			 * Ensure that the APT succeeded.
++			 *
++			 * With the check below that count_stuck must be less
++			 * than 10% of the overall generated raw entropy values
++			 * it is guaranteed that the APT is invoked at
++			 * floor((TESTLOOPCOUNT * 0.9) / 64) == 14 times.
++			 */
++			if ((nonstuck % JENT_APT_WINDOW_SIZE) == 0) {
++				jent_apt_reset(&ec,
++					       delta & JENT_APT_WORD_MASK);
++			}
++		}
++
++		/* Validate health test result */
++		if (jent_health_failure(&ec))
++			return JENT_EHEALTH;
+ 
+ 		/* test whether we have an increasing timer */
+ 		if (!(time2 > time))
+@@ -616,7 +755,7 @@ int jent_entropy_init(void)
+ 	 * should not fail. The value of 3 should cover the NTP case being
+ 	 * performed during our test run.
+ 	 */
+-	if (3 < time_backwards)
++	if (time_backwards > 3)
+ 		return JENT_ENOMONOTONIC;
+ 
+ 	/*
+diff --git a/crypto/jitterentropy.h b/crypto/jitterentropy.h
+new file mode 100644
+index 000000000..ee555f642
+--- /dev/null
++++ b/crypto/jitterentropy.h
+@@ -0,0 +1,79 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#ifndef _JITTERENTROPY_H
++#define _JITTERENTROPY_H
++#include <linux/types.h>
++
++/* Flags that can be used to initialize the RNG */
++#define JENT_DISABLE_STIR (1<<0) /* Disable stirring the entropy pool */
++#define JENT_DISABLE_UNBIAS (1<<1) /* Disable the Von-Neuman Unbiaser */
++#define JENT_DISABLE_MEMORY_ACCESS (1<<2) /* Disable memory access for more
++					     entropy, saves MEMORY_SIZE RAM for
++					     entropy collector */
++#define DRIVER_NAME     "jitterentropy"
++
++struct rand_data {
++	/* all data values that are vital to maintain the security
++	 * of the RNG are marked as SENSITIVE. A user must not
++	 * access that information while the RNG executes its loops to
++	 * calculate the next random value. */
++	__u64 data;		/* SENSITIVE Actual random number */
++	__u64 old_data;		/* SENSITIVE Previous random number */
++	__u64 prev_time;	/* SENSITIVE Previous time stamp */
++#define DATA_SIZE_BITS ((sizeof(__u64)) * 8)
++	__u64 last_delta;	/* SENSITIVE stuck test */
++	__s64 last_delta2;	/* SENSITIVE stuck test */
++	unsigned int osr;	/* Oversample rate */
++#define JENT_MEMORY_BLOCKS 64
++#define JENT_MEMORY_BLOCKSIZE 32
++#define JENT_MEMORY_ACCESSLOOPS 128
++#define JENT_MEMORY_SIZE (JENT_MEMORY_BLOCKS*JENT_MEMORY_BLOCKSIZE)
++	unsigned char *mem;	/* Memory access location with size of
++				 * memblocks * memblocksize */
++	unsigned int memlocation; /* Pointer to byte in *mem */
++	unsigned int memblocks;	/* Number of memory blocks in *mem */
++	unsigned int memblocksize; /* Size of one memory block in bytes */
++	unsigned int memaccessloops; /* Number of memory accesses per random
++				      * bit generation */
++
++	/* Repetition Count Test */
++	unsigned int rct_count;			/* Number of stuck values */
++
++	/* Intermittent health test failure threshold of 2^-30 */
++#define JENT_RCT_CUTOFF		30	/* Taken from SP800-90B sec 4.4.1 */
++#define JENT_APT_CUTOFF		325	/* Taken from SP800-90B sec 4.4.2 */
++	/* Permanent health test failure threshold of 2^-60 */
++#define JENT_RCT_CUTOFF_PERMANENT	60
++#define JENT_APT_CUTOFF_PERMANENT	355
++#define JENT_APT_WINDOW_SIZE	512	/* Data window size */
++	/* LSB of time stamp to process */
++#define JENT_APT_LSB		16
++#define JENT_APT_WORD_MASK	(JENT_APT_LSB - 1)
++	unsigned int apt_observations;	/* Number of collected observations */
++	unsigned int apt_count;		/* APT counter */
++	unsigned int apt_base;		/* APT base reference */
++	unsigned int apt_base_set:1;	/* APT base reference set? */
++	unsigned int stir:1;		/* Post-processing stirring */
++	unsigned int disable_unbias:1;	/* Deactivate Von-Neuman unbias */
++};
++extern void *jent_zalloc(unsigned int len);
++extern void jent_zfree(void *ptr);
++extern void jent_memcpy(void *dest, const void *src, unsigned int n);
++extern void jent_get_nstime(__u64 *out);
++
++struct rand_data;
++extern int jent_entropy_init(void);
++extern int jent_read_entropy(struct rand_data *ec, unsigned char *data,
++			     unsigned int len);
++
++extern struct rand_data *jent_entropy_collector_alloc(unsigned int osr,
++						      unsigned int flags);
++extern void jent_entropy_collector_free(struct rand_data *entropy_collector);
++
++unsigned int jent_version(void);
++
++void jent_lfsr_time(struct rand_data *ec, __u64 time, __u64 loop_cnt, int stuck);
++
++int jent_measure_jitter(struct rand_data *ec);
++
++#endif /* _JITTERENTROPY_H */

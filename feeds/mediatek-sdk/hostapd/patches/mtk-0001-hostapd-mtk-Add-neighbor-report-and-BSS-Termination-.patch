@@ -1,0 +1,437 @@
+From 3d293987fab67ca8a119a24ff15e99561b0663dc Mon Sep 17 00:00:00 2001
+From: "howard.hsu" <howard-yh.hsu@mediatek.com>
+Date: Wed, 19 Jan 2022 19:18:07 +0800
+Subject: [PATCH] hostapd: mtk: Add neighbor report and BSS Termination for MBO
+ certification
+
+1. Add hostapd_neighbor_count() and hostapd_neighbor_insert_buffer ()
+The first function can count the number of neighbor report in neighbore report
+database. The second can iterate neighbor report database to build up neighbor
+report data.
+
+2. Support including neighbor report elements in ANQP response
+3. Support including neignbor report elements in BTM response
+4. Support configuring BSS Termination TSF by using hostapd_cli command
+5. Disable interface if BSS Termination TSF is set
+6. Support including neighbor report elements in BTM request
+7. Add hostapd_neighbor_set_own_report_pref()
+8. Add hostapd_neighbor_set_pref_by_non_pref_chan()
+
+Revert
+---
+ hostapd/ctrl_iface.c   |   5 ++
+ src/ap/ap_config.c     |   1 +
+ src/ap/ap_config.h     |   1 +
+ src/ap/ctrl_iface_ap.c |  19 ++++++-
+ src/ap/gas_serv.c      |  29 ++++++++++
+ src/ap/gas_serv.h      |   2 +
+ src/ap/neighbor_db.c   | 119 +++++++++++++++++++++++++++++++++++++++++
+ src/ap/neighbor_db.h   |   9 ++++
+ src/ap/wnm_ap.c        |  42 ++++++++++++++-
+ 9 files changed, 223 insertions(+), 4 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index a258492..c2a2822 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -1338,6 +1338,11 @@ static int hostapd_ctrl_iface_set(struct hostapd_data *hapd, char *cmd)
+ #endif /* CONFIG_DPP */
+ 	} else if (os_strcasecmp(cmd, "setband") == 0) {
+ 		ret = hostapd_ctrl_iface_set_band(hapd, value);
++	} else if (os_strcasecmp(cmd, "bss_termination_tsf") == 0) {
++		int termination_sec = atoi(value);
++		hapd->conf->bss_termination_tsf = termination_sec;
++		wpa_printf(MSG_DEBUG, "BSS Termination TSF: value = %d",
++                termination_sec);
+ 	} else {
+ 		ret = hostapd_set_iface(hapd->iconf, hapd->conf, cmd, value);
+ 		if (ret)
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index d7a0c7c..4a20eb4 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -170,6 +170,7 @@ void hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
+ 	/* comeback after 10 TUs */
+ 	bss->pasn_comeback_after = 10;
+ #endif /* CONFIG_PASN */
++	bss->bss_termination_tsf = 0;
+ }
+ 
+ 
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 39b26d6..a875632 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -558,6 +558,7 @@ struct hostapd_bss_config {
+ 	int wnm_sleep_mode;
+ 	int wnm_sleep_mode_no_keys;
+ 	int bss_transition;
++	unsigned int bss_termination_tsf;
+ 
+ 	/* IEEE 802.11u - Interworking */
+ 	int interworking;
+diff --git a/src/ap/ctrl_iface_ap.c b/src/ap/ctrl_iface_ap.c
+index 96209ce..18bae5c 100644
+--- a/src/ap/ctrl_iface_ap.c
++++ b/src/ap/ctrl_iface_ap.c
+@@ -1203,6 +1203,10 @@ int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ 			wpa_printf(MSG_DEBUG, "Invalid bss_term data");
+ 			return -1;
+ 		}
++		if (hapd->conf->bss_termination_tsf) {
++			WPA_PUT_LE64(&bss_term_dur[2], hapd->conf->bss_termination_tsf);
++		}
++
+ 		end++;
+ 		WPA_PUT_LE16(&bss_term_dur[10], atoi(end));
+ 	}
+@@ -1229,14 +1233,25 @@ int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ 		req_mode |= WNM_BSS_TM_REQ_ESS_DISASSOC_IMMINENT;
+ 	}
+ 
+-	if (os_strstr(cmd, " pref=1"))
++	if (os_strstr(cmd, " pref=1")) {
+ 		req_mode |= WNM_BSS_TM_REQ_PREF_CAND_LIST_INCLUDED;
++		if (nei_len == 0) {
++			// Add neigibor report from neighbor report db to nei_rep buffer
++			nei_len = hostapd_neighbor_insert_buffer (hapd, nei_rep, 1000);
++		}
++	}
+ 	if (os_strstr(cmd, " abridged=1"))
+ 		req_mode |= WNM_BSS_TM_REQ_ABRIDGED;
+-	if (os_strstr(cmd, " disassoc_imminent=1"))
++	if (os_strstr(cmd, " disassoc_imminent=1")) {
+ 		req_mode |= WNM_BSS_TM_REQ_DISASSOC_IMMINENT;
++		/* Set own BSS neighbor report preference value as 0 */
++		hostapd_neighbor_set_own_report_pref(hapd, nei_rep, nei_len, 0);
++	}
++
+ 
+ #ifdef CONFIG_MBO
++	hostapd_neighbor_set_pref_by_non_pref_chan(hapd, sta, nei_rep, nei_len);
++
+ 	pos = os_strstr(cmd, "mbo=");
+ 	if (pos) {
+ 		unsigned int mbo_reason, cell_pref, reassoc_delay;
+diff --git a/src/ap/gas_serv.c b/src/ap/gas_serv.c
+index 90f1577..5845ff8 100644
+--- a/src/ap/gas_serv.c
++++ b/src/ap/gas_serv.c
+@@ -19,6 +19,7 @@
+ #include "dpp_hostapd.h"
+ #include "sta_info.h"
+ #include "gas_serv.h"
++#include "neighbor_db.h"
+ 
+ 
+ #ifdef CONFIG_DPP
+@@ -369,6 +370,24 @@ static void anqp_add_network_auth_type(struct hostapd_data *hapd,
+ 	}
+ }
+ 
++static void anqp_add_neighbor_report(struct hostapd_data *hapd,
++				       struct wpabuf *buf)
++{
++	struct hostapd_neighbor_entry *nr;
++	u8 *len_pos = gas_anqp_add_element(buf, ANQP_NEIGHBOR_REPORT);
++	if (dl_list_empty(&hapd->nr_db)) {
++		wpabuf_put_le16(buf, 0);
++	}
++	else {
++		dl_list_for_each(nr, &hapd->nr_db, struct hostapd_neighbor_entry, list ) {
++			wpabuf_put_u8(buf, WLAN_EID_NEIGHBOR_REPORT);
++			wpabuf_put_u8(buf, wpabuf_len(nr->nr));
++			wpabuf_put_buf(buf, nr->nr);
++		}
++	}
++	gas_anqp_set_element_len(buf, len_pos);
++}
++
+ 
+ static void anqp_add_roaming_consortium(struct hostapd_data *hapd,
+ 					struct wpabuf *buf)
+@@ -986,6 +1005,9 @@ gas_serv_build_gas_resp_payload(struct hostapd_data *hapd,
+ 		len += 1000;
+ 	if (request & ANQP_REQ_ICON_REQUEST)
+ 		len += 65536;
++    if (request & ANQP_REQ_NEIGHBOR_REPORT) {
++        len += (40 * hostapd_neighbor_count(hapd));
++    }
+ #ifdef CONFIG_FILS
+ 	if (request & ANQP_FILS_REALM_INFO)
+ 		len += 2 * dl_list_len(&hapd->conf->fils_realms);
+@@ -1028,6 +1050,8 @@ gas_serv_build_gas_resp_payload(struct hostapd_data *hapd,
+ 		anqp_add_elem(hapd, buf, ANQP_TDLS_CAPABILITY);
+ 	if (request & ANQP_REQ_EMERGENCY_NAI)
+ 		anqp_add_elem(hapd, buf, ANQP_EMERGENCY_NAI);
++	if (request & ANQP_REQ_NEIGHBOR_REPORT)
++		anqp_add_neighbor_report(hapd, buf);
+ 
+ 	for (i = 0; i < num_extra_req; i++) {
+ #ifdef CONFIG_FILS
+@@ -1172,6 +1196,11 @@ static void rx_anqp_query_list_id(struct hostapd_data *hapd, u16 info_id,
+ 			     "Emergency NAI",
+ 			     get_anqp_elem(hapd, info_id) != NULL, qi);
+ 		break;
++	case ANQP_NEIGHBOR_REPORT:
++		set_anqp_req(ANQP_REQ_NEIGHBOR_REPORT,
++			     "Neighbor Report",
++			     get_anqp_elem(hapd, info_id) != NULL, qi);
++		break;
+ 	default:
+ #ifdef CONFIG_FILS
+ 		if (info_id == ANQP_FILS_REALM_INFO &&
+diff --git a/src/ap/gas_serv.h b/src/ap/gas_serv.h
+index 1528af4..d0241f2 100644
+--- a/src/ap/gas_serv.h
++++ b/src/ap/gas_serv.h
+@@ -40,6 +40,8 @@
+ 	(1 << (ANQP_TDLS_CAPABILITY - ANQP_QUERY_LIST))
+ #define ANQP_REQ_EMERGENCY_NAI \
+ 	(1 << (ANQP_EMERGENCY_NAI - ANQP_QUERY_LIST))
++#define ANQP_REQ_NEIGHBOR_REPORT \
++	(1 << (ANQP_NEIGHBOR_REPORT - ANQP_QUERY_LIST))
+ /*
+  * First 15 Hotspot 2.0 vendor specific ANQP-elements can be included in the
+  * optimized bitmap.
+diff --git a/src/ap/neighbor_db.c b/src/ap/neighbor_db.c
+index 52f25eb..9254d09 100644
+--- a/src/ap/neighbor_db.c
++++ b/src/ap/neighbor_db.c
+@@ -89,6 +89,38 @@ int hostapd_neighbor_show(struct hostapd_data *hapd, char *buf, size_t buflen)
+ }
+ 
+ 
++int hostapd_neighbor_count(struct hostapd_data *hapd)
++{
++	struct hostapd_neighbor_entry *nr;
++	int count = 0;
++
++	dl_list_for_each(nr, &hapd->nr_db, struct hostapd_neighbor_entry,
++			 list) {
++		count++;
++	}
++	return count;
++}
++
++
++int hostapd_neighbor_insert_buffer(struct hostapd_data *hapd, char *buf,
++        size_t buflen)
++{
++	struct hostapd_neighbor_entry *nr;
++	char *pos = buf;
++
++	dl_list_for_each(nr, &hapd->nr_db, struct hostapd_neighbor_entry,
++			 list) {
++		/* For neighbor report IE, we only need bssid and nr*/
++		*pos++ = WLAN_EID_NEIGHBOR_REPORT;
++		*pos++ = wpabuf_len(nr->nr);
++		os_memcpy(pos, wpabuf_head(nr->nr), wpabuf_len(nr->nr));
++		pos += wpabuf_len(nr->nr);
++	}
++
++	return pos - buf;
++}
++
++
+ static void hostapd_neighbor_clear_entry(struct hostapd_neighbor_entry *nr)
+ {
+ 	wpabuf_free(nr->nr);
+@@ -325,3 +357,90 @@ void hostapd_neighbor_set_own_report(struct hostapd_data *hapd)
+ 	wpabuf_free(nr);
+ #endif /* NEED_AP_MLME */
+ }
++
++
++void hostapd_neighbor_set_own_report_pref(struct hostapd_data *hapd, char *nei_buf,
++			 size_t buflen, const int pref)
++{
++	struct hostapd_neighbor_entry *nr;
++	char *pos, *next_nr;
++
++	pos = nei_buf;
++	next_nr = nei_buf;
++
++	dl_list_for_each(nr, &hapd->nr_db, struct hostapd_neighbor_entry,
++			 list) {
++		pos = next_nr;
++		next_nr = pos + 2 + wpabuf_len(nr->nr);
++		/* Shift 2 bytes for Element ID and Neighbor report length */
++		pos = pos + 2;
++		if(os_memcmp(pos, hapd->own_addr, ETH_ALEN) == 0) {
++			/* Shift for BSSID + BSSID info + Op_class + channel num + PHY type */
++			pos = pos + 6 + 4 + 1 + 1 + 1;
++
++			/* Iterate Subelement */
++			while (next_nr - pos > 0) {
++				if (*pos == 3) {
++					pos = pos + 2;
++					*pos = pref;
++					return;
++				} else {
++					pos++;
++					int shift_len = *pos++;
++					pos = pos + shift_len;
++				}
++			}
++		}
++	}
++}
++
++#ifdef CONFIG_MBO
++void hostapd_neighbor_set_pref_by_non_pref_chan(struct hostapd_data *hapd,
++			 struct sta_info* sta, char *nei_buf, size_t buflen)
++{
++	struct hostapd_neighbor_entry *nr;
++	struct mbo_non_pref_chan_info *info;
++	u8 i;
++
++	for(info = sta->non_pref_chan; info; info = info->next) {
++		/* Check OP_Class and Channel num */
++		for(i = 0; i < info->num_channels; i++) {
++			char *pos, *next_nr;
++
++			pos = nei_buf;
++			next_nr = nei_buf;
++
++			/* Iterate Neighbor report database */
++			dl_list_for_each(nr, &hapd->nr_db, struct hostapd_neighbor_entry,
++					 list) {
++				pos = next_nr;
++				next_nr = pos + 2 + wpabuf_len(nr->nr);
++				/**
++				 * Shift 12 bytes for Element ID, Neighbor report length,
++				 * BSSID and BSSID info.
++				 */
++				pos = pos + 12;
++				int nr_op_class = *pos++;
++				int nr_channel = *pos;
++				if(info->op_class == nr_op_class && info->channels[i] == nr_channel) {
++					/* Shift for Channel Num + PHY type */
++					pos = pos + 1 + 1;
++
++					// Iterate Subelement
++					while(next_nr - pos > 0) {
++						if(*pos == 3) {
++							pos = pos + 2;
++							*pos = info->pref;
++							break;
++						}else {
++							pos++;
++							int shift_len = *pos++;
++							pos = pos + shift_len;
++						}
++					}
++				}
++			}
++		}
++	}
++}
++#endif
+diff --git a/src/ap/neighbor_db.h b/src/ap/neighbor_db.h
+index 992671b..a1ddc07 100644
+--- a/src/ap/neighbor_db.h
++++ b/src/ap/neighbor_db.h
+@@ -24,4 +24,13 @@ int hostapd_neighbor_remove(struct hostapd_data *hapd, const u8 *bssid,
+ 			    const struct wpa_ssid_value *ssid);
+ void hostapd_free_neighbor_db(struct hostapd_data *hapd);
+ 
++int hostapd_neighbor_count(struct hostapd_data *hapd);
++int hostapd_neighbor_insert_buffer(struct hostapd_data *hapd, char *buf,
++        size_t buflen);
++void hostapd_neighbor_set_own_report_pref(struct hostapd_data *hapd, char *nei_buf,
++			 size_t buflen, const int pref);
++#ifdef CONFIG_MBO
++void hostapd_neighbor_set_pref_by_non_pref_chan(struct hostapd_data *hapd,
++			 struct sta_info* sta, char *nei_buf, size_t buflen);
++#endif
+ #endif /* NEIGHBOR_DB_H */
+diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
+index 3ea92af..f6761ab 100644
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -20,6 +20,7 @@
+ #include "ap/wpa_auth.h"
+ #include "mbo_ap.h"
+ #include "wnm_ap.h"
++#include "ap/neighbor_db.h"
+ 
+ #define MAX_TFS_IE_LEN  1024
+ 
+@@ -370,9 +371,21 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 	u8 *pos;
+ 	int res;
+ 
+-	mgmt = os_zalloc(sizeof(*mgmt));
+-	if (mgmt == NULL)
++	int nr_num = hostapd_neighbor_count(hapd);
++	int nr_size = ETH_ALEN + 4 + 1 + 1 + 1 + 5;
++	int total_nr_size = nr_num * nr_size;
++	u8 *nr_data = os_malloc(total_nr_size);
++	int nr_data_len = 0;
++	if(nr_data == NULL) {
++		wpa_printf (MSG_ERROR, "Failed to allocate memory");
++	} else {
++	    nr_data_len = hostapd_neighbor_insert_buffer(hapd, nr_data, total_nr_size);
++	}
++	mgmt = os_zalloc(sizeof(*mgmt) + nr_data_len);
++	if (mgmt == NULL) {
++		wpa_printf (MSG_ERROR, "Failed to allocate memory for mgmt frame");
+ 		return -1;
++	}
+ 	os_memcpy(mgmt->da, addr, ETH_ALEN);
+ 	os_memcpy(mgmt->sa, hapd->own_addr, ETH_ALEN);
+ 	os_memcpy(mgmt->bssid, hapd->own_addr, ETH_ALEN);
+@@ -382,10 +395,18 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 	mgmt->u.action.u.bss_tm_req.action = WNM_BSS_TRANS_MGMT_REQ;
+ 	mgmt->u.action.u.bss_tm_req.dialog_token = dialog_token;
+ 	mgmt->u.action.u.bss_tm_req.req_mode = 0;
++	if(nr_num) {
++		mgmt->u.action.u.bss_tm_req.req_mode |= WNM_BSS_TM_REQ_PREF_CAND_LIST_INCLUDED;
++	}
+ 	mgmt->u.action.u.bss_tm_req.disassoc_timer = host_to_le16(0);
+ 	mgmt->u.action.u.bss_tm_req.validity_interval = 1;
+ 	pos = mgmt->u.action.u.bss_tm_req.variable;
+ 
++	if(nr_num) {
++		os_memcpy(pos, nr_data, nr_data_len);
++		pos += nr_data_len;
++	}
++
+ 	hapd->openwrt_stats.wnm.bss_transition_request_tx++;
+ 	wpa_printf(MSG_DEBUG, "WNM: Send BSS Transition Management Request to "
+ 		   MACSTR " dialog_token=%u req_mode=0x%x disassoc_timer=%u "
+@@ -759,6 +780,22 @@ static void set_disassoc_timer(struct hostapd_data *hapd, struct sta_info *sta,
+ }
+ 
+ 
++void bss_termination_disable_iface(void *eloop_ctx, void *timeout_ctx)
++{
++	struct hostapd_data *hapd = eloop_ctx;
++	hostapd_disable_iface(hapd->iface);
++}
++
++
++static void set_disable_iface_timer(struct hostapd_data *hapd, struct sta_info *sta,
++			       int disable_iface_timer)
++{
++	wpa_printf(MSG_DEBUG, "Disable interface timer set to %d secs", disable_iface_timer);
++	eloop_register_timeout(disable_iface_timer, 0,
++			       bss_termination_disable_iface, hapd, NULL);
++}
++
++
+ int wnm_send_ess_disassoc_imminent(struct hostapd_data *hapd,
+ 				   struct sta_info *sta, const char *url,
+ 				   int disassoc_timer)
+@@ -848,6 +885,7 @@ int wnm_send_bss_tm_req(struct hostapd_data *hapd, struct sta_info *sta,
+ 	    bss_term_dur) {
+ 		os_memcpy(pos, bss_term_dur, 12);
+ 		pos += 12;
++		set_disable_iface_timer(hapd, sta, hapd->conf->bss_termination_tsf);
+ 	}
+ 
+ 	if (url) {
+-- 
+2.18.0
+
