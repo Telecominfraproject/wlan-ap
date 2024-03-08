@@ -33,9 +33,9 @@ define Package/ath12k-wifi-qcom-qcn9274/install
 	$(INSTALL_DATA) ./board-2.bin.QCN9274 $(1)/lib/firmware/ath12k/QCN9274/hw1.0/board-2.bin
 endef
 
-define Package/ath12k-wifi-cig-wf198
+define Package/ath12k-wifi-cig-wf189
 $(call Package/ath12k-wifi-default)
-    TITLE:=board.bin for CIG WF198
+    TITLE:=board.bin for CIG WF189
 endef
 
 define Package/ath12k-wifi-sercomm-ap72tip
@@ -43,12 +43,12 @@ $(call Package/ath12k-wifi-default)
     TITLE:=board.bin for Sercomm WIFI-7
 endef
 
-define Package/ath12k-wifi-cig-wf198/install
+define Package/ath12k-wifi-cig-wf189/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0
 	$(INSTALL_DATA) ./regdb.bin $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
-	$(INSTALL_DATA) ./board-cig-wf198.bin.qcn9224 $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-cig-wf189.bin.qcn9224 $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board.bin
 	$(INSTALL_DATA) ./regdb.bin $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
-	$(INSTALL_DATA) ./board-cig-wf198.bin.ipq53xx $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-cig-wf189.bin.ipq53xx $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board.bin
 endef
 
 define Package/ath12k-wifi-sercomm-ap72tip/install
@@ -60,5 +60,5 @@ define Package/ath12k-wifi-sercomm-ap72tip/install
 endef
 
 $(eval $(call BuildPackage,ath12k-wifi-qcom-qcn9274))
-$(eval $(call BuildPackage,ath12k-wifi-cig-wf198))
+$(eval $(call BuildPackage,ath12k-wifi-cig-wf189))
 $(eval $(call BuildPackage,ath12k-wifi-sercomm-ap72tip))
