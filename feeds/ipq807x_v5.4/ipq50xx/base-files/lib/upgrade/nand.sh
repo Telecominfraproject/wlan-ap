@@ -247,8 +247,8 @@ nand_do_upgrade_success() {
 	local conf_tar="/tmp/sysupgrade.tgz"
 	sync
 	[ "$CI_BOOTCFG" = 1 ] && nand_qca_update_bootconfig
+	[ -f "$conf_tar" ] && nand_restore_config "$conf_tar" && sync
 	[ -n "$CI_FWSETENV" ] && fw_setenv $CI_FWSETENV
-	[ -f "$conf_tar" ] && nand_restore_config "$conf_tar"
 	echo "sysupgrade successful"
 	umount -a
 	reboot -f

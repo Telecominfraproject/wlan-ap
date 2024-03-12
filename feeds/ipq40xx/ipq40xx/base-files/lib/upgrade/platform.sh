@@ -83,12 +83,12 @@ platform_do_upgrade() {
 		part="$(awk -F 'ubi.mtd=' '{printf $2}' /proc/cmdline | cut -d " " -f 1)"
 		case "$part" in
 		rootfs1)
-			fw_setenv active 2 || exit 1
 			CI_UBIPART="rootfs2"
+			CI_FWSETENV="active 2"
 			;;
 		rootfs2)
-			fw_setenv active 1 || exit 1
 			CI_UBIPART="rootfs1"
+			CI_FWSETENV="active 1"
 			;;
 		*)
 			# legacy bootloader
