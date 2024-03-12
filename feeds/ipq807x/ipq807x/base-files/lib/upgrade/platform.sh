@@ -260,8 +260,8 @@ platform_do_upgrade() {
 		else
 			if [ -e /tmp/downgrade ]; then
 				CI_UBIPART="rootfs1"
-				fw_setenv active 1 || exit 1
-				fw_setenv upgrade_available 0 || exit 1
+				{ echo 'active 1'; echo 'upgrade_available 0'; } > /tmp/fw_setenv.txt || exit 1
+				CI_FWSETENV="-s /tmp/fw_setenv.txt"
 			elif grep -q rootfs1 /proc/cmdline; then
 				CI_UBIPART="rootfs2"
 				CI_FWSETENV="active 2"
