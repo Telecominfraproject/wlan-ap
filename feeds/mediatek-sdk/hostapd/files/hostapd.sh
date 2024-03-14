@@ -404,6 +404,7 @@ hostapd_common_add_bss_config() {
 	config_add_string group_cipher
 	config_add_string group_mgmt_cipher
 
+	config_add_string uci_section
 }
 
 hostapd_set_vlan_file() {
@@ -591,7 +592,7 @@ hostapd_set_bss_options() {
 		multicast_to_unicast_all proxy_arp per_sta_vif \
 		eap_server eap_user_file ca_cert server_cert private_key private_key_passwd server_id \
 		vendor_elements fils ocv unsol_bcast_probe_resp_interval fils_discovery_min_interval \
-		fils_discovery_max_interval rnr group_cipher group_mgmt_cipher
+		fils_discovery_max_interval rnr group_cipher group_mgmt_cipher uci_section 
 
 	set_default fils 0
 	set_default isolate 0
@@ -633,6 +634,7 @@ hostapd_set_bss_options() {
 	[ "$airtime_bss_limit" -gt 0 ] && append bss_conf "airtime_bss_limit=$airtime_bss_limit" "$N"
 	json_for_each_item append_airtime_sta_weight airtime_sta_weight
 
+	[ -n "$uci_section" ] && append bss_conf "uci_section=$uci_section" "$N"
 	append bss_conf "bss_load_update_period=$bss_load_update_period" "$N"
 	append bss_conf "chan_util_avg_period=$chan_util_avg_period" "$N"
 	append bss_conf "disassoc_low_ack=$disassoc_low_ack" "$N"

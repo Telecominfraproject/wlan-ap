@@ -43,7 +43,7 @@ define Device/mt7981-spim-nand-rfb
 endef
 TARGET_DEVICES += mt7981-spim-nand-rfb
 
-define Device/edgecore-eap111
+define Device/edgecore_eap111
   DEVICE_VENDOR := EdgeCore
   DEVICE_MODEL := EAP111
   DEVICE_DTS := mt7981-edgecore-eap111
@@ -59,7 +59,7 @@ define Device/edgecore-eap111
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
   DEVICE_PACKAGES := kmod-mt7981-firmware kmod-mt7915e
 endef
-TARGET_DEVICES += edgecore-eap111
+TARGET_DEVICES += edgecore_eap111
 
 define Device/mt7981-spim-nand-gsw
   DEVICE_VENDOR := MediaTek
