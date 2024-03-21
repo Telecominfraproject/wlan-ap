@@ -64,7 +64,7 @@ when       who    what, where, why
 #define PID_DIR "/root/diag_logs"
 #define MAX_CHAN	4
 
-static unsigned char read_buf[4096];
+static unsigned char read_buf[MAX_CHAN][4096];
 static char ip_addr_name[FILE_NAME_LEN] = "192.168.0.10";
 static char port_number_string[FILE_NAME_LEN] = "2500";
 static int port_number = 2500;
@@ -397,13 +397,22 @@ int open_connection(struct diag_socket *sock)
 int read_socket(struct diag_socket *socket)
 {
 	int num_read;
+	int status;
 
+repeat:
 	/* Read from the socket */
-	memset(read_buf, 0, 4096);
-	num_read = recv(socket->fd, (unsigned char *)read_buf, 4096, 0);
+	memset(read_buf[socket->id], 0, 4096);
+	num_read = recv(socket->fd, (unsigned char *)read_buf[socket->id], 4096, 0);
 	if (num_read > 0) {
-		/* Send the data read off of the socket to the kernel via the library */
-		diag_send_socket_data(socket->id, read_buf, num_read);
+		/*
+		 * Process socket data to make sure full command is received before send it
+		 * to the diag core via the library. If return value is not PKT_PROCESS_DONE
+		 * then this is the case of partial packet and wait for pending bytes to
+		 * get full diag command.
+		 */
+		status = diag_send_socket_data(socket->id, read_buf[socket->id], num_read);
+		if (status != PKT_PROCESS_DONE)
+			goto repeat;
 	} else if (num_read == -1) {
 		DIAG_LOGE("diag_socket_log: Read socket error: %s, errno: %d\n",
 				strerror(errno), errno);

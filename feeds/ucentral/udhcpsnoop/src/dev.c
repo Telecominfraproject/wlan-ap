@@ -449,15 +449,19 @@ free:
 	return;
 }
 
-void dhcpsnoop_dev_config_update(struct blob_attr *data)
+void dhcpsnoop_dev_config_update(struct blob_attr *data, bool add_only)
 {
 	struct blob_attr *cur;
 	int rem;
 
-	vlist_update(&devices);
+	if (!add_only)
+		vlist_update(&devices);
+
 	blobmsg_for_each_attr(cur, data, rem)
 		dhcpsnoop_dev_config_add(cur);
-	vlist_flush(&devices);
+
+	if (!add_only)
+		vlist_flush(&devices);
 }
 
 void dhcpsnoop_dev_check(void)

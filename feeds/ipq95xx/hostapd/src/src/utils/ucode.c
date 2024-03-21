@@ -52,12 +52,12 @@ uc_value_t *uc_wpa_freq_info(uc_vm_t *vm, size_t nargs)
 	uc_value_t *sec = uc_fn_arg(1);
 	int width = ucv_uint64_get(uc_fn_arg(2));
 	int freq_val, center_idx, center_ofs;
+	enum oper_chan_width chanwidth;
 	enum hostapd_hw_mode hw_mode;
 	u8 op_class, channel, tmp_channel;
 	const char *modestr;
 	int sec_channel = 0;
 	uc_value_t *ret;
-	int chanwidth;
 
 	if (ucv_type(freq) != UC_INTEGER)
 		return NULL;
@@ -77,13 +77,13 @@ uc_value_t *uc_wpa_freq_info(uc_vm_t *vm, size_t nargs)
 
 	switch (width) {
 	case 0:
-		chanwidth = CHANWIDTH_USE_HT;
+		chanwidth = CONF_OPER_CHWIDTH_USE_HT;
 		break;
 	case 1:
-		chanwidth = CHANWIDTH_80MHZ;
+		chanwidth = CONF_OPER_CHWIDTH_80MHZ;
 		break;
 	case 2:
-		chanwidth = CHANWIDTH_160MHZ;
+		chanwidth = CONF_OPER_CHWIDTH_160MHZ;
 		break;
 	default:
 		return NULL;

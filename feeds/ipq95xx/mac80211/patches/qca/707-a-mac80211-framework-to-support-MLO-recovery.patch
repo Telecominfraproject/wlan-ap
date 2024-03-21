@@ -1,0 +1,293 @@
+From 8ee049fcd08c9e98e374f63f1a003a334d128867 Mon Sep 17 00:00:00 2001
+From: Pradeep Kumar Chitrapu <quic_pradeepc@quicinc.com>
+Date: Thu, 12 Jan 2023 09:46:29 -0800
+Subject: [PATCH 1/3] mac80211: framework to support MLO recovery
+
+Extend current ieee80211_reconfig to account for multiple links
+BSS reconfig. Currently supports only AP mode.
+
+Co-Developed-by: Ramanathan Choodamani <quic_rchoodam@quicinc.com>
+Signed-off-by: Ramanathan Choodamani <quic_rchoodam@quicinc.com>
+Signed-off-by: Pradeep Kumar Chitrapu <quic_pradeepc@quicinc.com>
+---
+ net/mac80211/util.c | 230 ++++++++++++++++++++++++--------------------
+ 1 file changed, 128 insertions(+), 102 deletions(-)
+
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -2368,13 +2368,133 @@ static int ieee80211_reconfig_nan(struct
+ 	return 0;
+ }
+ 
++static int ieee80211_reconfig_link_bss(struct ieee80211_sub_if_data *sdata,
++				       struct ieee80211_link_data *link,
++				       struct ieee80211_bss_conf *link_conf)
++{
++	struct ieee80211_local *local = sdata->local;
++	int i, res, changed = 0;
++
++	switch (sdata->vif.type) {
++	case NL80211_IFTYPE_AP_VLAN:
++	case NL80211_IFTYPE_MONITOR:
++		break;
++	case NL80211_IFTYPE_ADHOC:
++		if (sdata->vif.cfg.ibss_joined)
++			WARN_ON(drv_join_ibss(local, sdata));
++		fallthrough;
++	default:
++		ieee80211_reconfig_stations(sdata);
++		fallthrough;
++	case NL80211_IFTYPE_AP: /* AP stations are handled later */
++		for (i = 0; i < IEEE80211_NUM_ACS; i++)
++			drv_conf_tx(local, link, i,
++					&link->tx_conf[i]);
++		break;
++	}
++
++	/* common change flags for all interface types */
++	changed = BSS_CHANGED_ERP_CTS_PROT |
++		  BSS_CHANGED_ERP_PREAMBLE |
++		  BSS_CHANGED_ERP_SLOT |
++		  BSS_CHANGED_HT |
++		  BSS_CHANGED_BASIC_RATES |
++		  BSS_CHANGED_BEACON_INT |
++		  BSS_CHANGED_BSSID |
++		  BSS_CHANGED_CQM |
++		  BSS_CHANGED_QOS |
++		  BSS_CHANGED_IDLE |
++		  BSS_CHANGED_TXPOWER |
++		  BSS_CHANGED_MCAST_RATE;
++
++	if (link_conf->mu_mimo_owner)
++		changed |= BSS_CHANGED_MU_GROUPS;
++
++	switch (sdata->vif.type) {
++	case NL80211_IFTYPE_STATION:
++		changed |= BSS_CHANGED_PS;
++		changed &= ~BSS_CHANGED_IDLE;
++		ieee80211_link_info_change_notify(sdata, link, changed);
++
++		changed = BSS_CHANGED_ASSOC |
++			  BSS_CHANGED_ARP_FILTER |
++			  BSS_CHANGED_IDLE;
++
++		ieee80211_vif_cfg_change_notify(sdata, changed);
++		changed = 0;
++		/* Re-send beacon info report to the driver */
++		if (link->u.mgd.have_beacon)
++			changed |= BSS_CHANGED_BEACON_INFO;
++
++		if (link_conf->max_idle_period ||
++			link_conf->protected_keep_alive)
++			changed |= BSS_CHANGED_KEEP_ALIVE;
++
++		ieee80211_link_info_change_notify(sdata, link, changed);
++		break;
++	case NL80211_IFTYPE_OCB:
++		changed |= BSS_CHANGED_OCB;
++		ieee80211_link_info_change_notify(sdata, link, changed);
++		break;
++	case NL80211_IFTYPE_ADHOC:
++		changed |= BSS_CHANGED_IBSS;
++		fallthrough;
++	case NL80211_IFTYPE_AP:
++		changed |= BSS_CHANGED_P2P_PS;
++
++		if (link_conf->ftm_responder == 1 &&
++			wiphy_ext_feature_isset(sdata->local->hw.wiphy,
++				NL80211_EXT_FEATURE_ENABLE_FTM_RESPONDER))
++			changed |= BSS_CHANGED_FTM_RESPONDER;
++
++		if (sdata->vif.type == NL80211_IFTYPE_AP) {
++			changed |= BSS_CHANGED_AP_PROBE_RESP;
++
++			if (rcu_access_pointer(link->u.ap.beacon))
++				drv_start_ap(local, sdata,
++						 link->conf);
++
++			ieee80211_vif_cfg_change_notify(sdata, BSS_CHANGED_SSID);
++		}
++		fallthrough;
++	case NL80211_IFTYPE_MESH_POINT:
++		if (link_conf->enable_beacon) {
++			changed |= BSS_CHANGED_BEACON |
++				   BSS_CHANGED_BEACON_ENABLED;
++			ieee80211_link_info_change_notify(sdata, link, changed &~ BSS_CHANGED_IDLE);
++		}
++		break;
++	case NL80211_IFTYPE_NAN:
++		res = ieee80211_reconfig_nan(sdata);
++		if (res < 0) {
++			ieee80211_handle_reconfig_failure(local);
++			return res;
++		}
++		break;
++	case NL80211_IFTYPE_AP_VLAN:
++	case NL80211_IFTYPE_MONITOR:
++	case NL80211_IFTYPE_P2P_DEVICE:
++		/* nothing to do */
++		break;
++	case NL80211_IFTYPE_UNSPECIFIED:
++	case NUM_NL80211_IFTYPES:
++	case NL80211_IFTYPE_P2P_CLIENT:
++	case NL80211_IFTYPE_P2P_GO:
++	case NL80211_IFTYPE_WDS:
++		WARN_ON(1);
++		break;
++	}
++
++	return 0;
++}
++
+ int ieee80211_reconfig(struct ieee80211_local *local)
+ {
+ 	struct ieee80211_hw *hw = &local->hw;
+ 	struct ieee80211_sub_if_data *sdata;
+ 	struct ieee80211_chanctx *ctx;
+ 	struct sta_info *sta;
+-	int res, i;
++	int res;
+ 	bool reconfig_due_to_wowlan = false;
+ 	struct ieee80211_sub_if_data *sched_scan_sdata;
+ 	struct cfg80211_sched_scan_request *sched_scan_req;
+@@ -2508,6 +2628,7 @@ int ieee80211_reconfig(struct ieee80211_
+ 
+ 		sdata = wiphy_dereference(local->hw.wiphy,
+ 					  local->monitor_sdata);
++
+ 		if (sdata && ieee80211_sdata_running(sdata))
+ 			ieee80211_assign_chanctx(local, sdata, &sdata->deflink);
+ 	}
+@@ -2520,7 +2641,6 @@ int ieee80211_reconfig(struct ieee80211_
+ 	/* Finally also reconfigure all the BSS information */
+ 	list_for_each_entry(sdata, &local->interfaces, list) {
+ 		unsigned int link_id;
+-		u32 changed;
+ 
+ 		if (!ieee80211_sdata_running(sdata))
+ 			continue;
+@@ -2535,111 +2655,23 @@ int ieee80211_reconfig(struct ieee80211_
+ 			if (link)
+ 				ieee80211_assign_chanctx(local, sdata, link);
+ 		}
+-		sdata_unlock(sdata);
+ 
+-		switch (sdata->vif.type) {
+-		case NL80211_IFTYPE_AP_VLAN:
+-		case NL80211_IFTYPE_MONITOR:
+-			break;
+-		case NL80211_IFTYPE_ADHOC:
+-			if (sdata->vif.cfg.ibss_joined)
+-				WARN_ON(drv_join_ibss(local, sdata));
+-			fallthrough;
+-		default:
+-			ieee80211_reconfig_stations(sdata);
+-			fallthrough;
+-		case NL80211_IFTYPE_AP: /* AP stations are handled later */
+-			for (i = 0; i < IEEE80211_NUM_ACS; i++)
+-				drv_conf_tx(local, &sdata->deflink, i,
+-					    &sdata->deflink.tx_conf[i]);
+-			break;
+-		}
++		for (link_id = 0;
++		     link_id < ARRAY_SIZE(sdata->vif.link_conf);
++		     link_id++) {
++			struct ieee80211_link_data *link;
++			struct ieee80211_bss_conf *link_conf;
+ 
+-		/* common change flags for all interface types */
+-		changed = BSS_CHANGED_ERP_CTS_PROT |
+-			  BSS_CHANGED_ERP_PREAMBLE |
+-			  BSS_CHANGED_ERP_SLOT |
+-			  BSS_CHANGED_HT |
+-			  BSS_CHANGED_BASIC_RATES |
+-			  BSS_CHANGED_BEACON_INT |
+-			  BSS_CHANGED_BSSID |
+-			  BSS_CHANGED_CQM |
+-			  BSS_CHANGED_QOS |
+-			  BSS_CHANGED_IDLE |
+-			  BSS_CHANGED_TXPOWER |
+-			  BSS_CHANGED_MCAST_RATE;
+-
+-		if (sdata->vif.bss_conf.mu_mimo_owner)
+-			changed |= BSS_CHANGED_MU_GROUPS;
+-
+-		switch (sdata->vif.type) {
+-		case NL80211_IFTYPE_STATION:
+-			changed |= BSS_CHANGED_ASSOC |
+-				   BSS_CHANGED_ARP_FILTER |
+-				   BSS_CHANGED_PS;
+-
+-			/* Re-send beacon info report to the driver */
+-			if (sdata->deflink.u.mgd.have_beacon)
+-				changed |= BSS_CHANGED_BEACON_INFO;
+-
+-			if (sdata->vif.bss_conf.max_idle_period ||
+-			    sdata->vif.bss_conf.protected_keep_alive)
+-				changed |= BSS_CHANGED_KEEP_ALIVE;
+-
+-			sdata_lock(sdata);
+-			ieee80211_bss_info_change_notify(sdata, changed);
+-			sdata_unlock(sdata);
+-			break;
+-		case NL80211_IFTYPE_OCB:
+-			changed |= BSS_CHANGED_OCB;
+-			ieee80211_bss_info_change_notify(sdata, changed);
+-			break;
+-		case NL80211_IFTYPE_ADHOC:
+-			changed |= BSS_CHANGED_IBSS;
+-			fallthrough;
+-		case NL80211_IFTYPE_AP:
+-			changed |= BSS_CHANGED_SSID | BSS_CHANGED_P2P_PS;
+-
+-			if (sdata->vif.bss_conf.ftm_responder == 1 &&
+-			    wiphy_ext_feature_isset(sdata->local->hw.wiphy,
+-					NL80211_EXT_FEATURE_ENABLE_FTM_RESPONDER))
+-				changed |= BSS_CHANGED_FTM_RESPONDER;
+-
+-			if (sdata->vif.type == NL80211_IFTYPE_AP) {
+-				changed |= BSS_CHANGED_AP_PROBE_RESP;
+-
+-				if (rcu_access_pointer(sdata->deflink.u.ap.beacon))
+-					drv_start_ap(local, sdata,
+-						     sdata->deflink.conf);
+-			}
+-			fallthrough;
+-		case NL80211_IFTYPE_MESH_POINT:
+-			if (sdata->vif.bss_conf.enable_beacon) {
+-				changed |= BSS_CHANGED_BEACON |
+-					   BSS_CHANGED_BEACON_ENABLED;
+-				ieee80211_bss_info_change_notify(sdata, changed);
+-			}
+-			break;
+-		case NL80211_IFTYPE_NAN:
+-			res = ieee80211_reconfig_nan(sdata);
+-			if (res < 0) {
+-				ieee80211_handle_reconfig_failure(local);
++			link = sdata_dereference(sdata->link[link_id], sdata);
++			if (!link)
++				continue;
++
++			link_conf = link->conf;
++			res = ieee80211_reconfig_link_bss(sdata, link, link_conf);
++			if (res < 0)
+ 				return res;
+-			}
+-			break;
+-		case NL80211_IFTYPE_AP_VLAN:
+-		case NL80211_IFTYPE_MONITOR:
+-		case NL80211_IFTYPE_P2P_DEVICE:
+-			/* nothing to do */
+-			break;
+-		case NL80211_IFTYPE_UNSPECIFIED:
+-		case NUM_NL80211_IFTYPES:
+-		case NL80211_IFTYPE_P2P_CLIENT:
+-		case NL80211_IFTYPE_P2P_GO:
+-		case NL80211_IFTYPE_WDS:
+-			WARN_ON(1);
+-			break;
+ 		}
++		sdata_unlock(sdata);
+ 	}
+ 
+ 	ieee80211_recalc_ps(local);

@@ -6,8 +6,8 @@ PKG_SOURCE_PROTO:=git
 PKG_BRANCH:=master
 PKG_RELEASE:=2
 PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe
-PKG_MIRROR_HASH:=754a604e282d97af3eac8b6af0a16c4fe48fdef8f04ae593d016e1f0ba9886da
-PKG_VERSION:=ffc8f2447dbb2d4a29d1fca4fad516132d5848fe
+PKG_MIRROR_HASH:=1a479dd17f4d69dcde16ac923fcfed482c03f9ff884b1eb7f0d7eb70a55b14cc
+PKG_VERSION:=8fd53230ede34386fe42ca2f63314e05b73d3b15
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
@@ -121,6 +121,7 @@ EXTRA_CFLAGS+= \
 	-I$(STAGING_DIR)/usr/include/nat46 \
 	-Wno-error=unused-variable \
 
+MAKE_OPTS+=ppe-drv=y
 
 ifneq ($(CONFIG_PACKAGE_kmod-qca-nss-ppe-bridge-mgr),)
 MAKE_OPTS+=bridge-mgr=y

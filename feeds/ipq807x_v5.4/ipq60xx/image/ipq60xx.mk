@@ -2,23 +2,14 @@ KERNEL_LOADADDR := 0x41080000
 
 DEVICE_VARS += CE_TYPE
 
-define Device/cig_wf188n-ca
+define Device/cig_wf188n
   DEVICE_TITLE := Cigtech WF-188n
   DEVICE_DTS := qcom-ipq6018-cig-wf188n
   DEVICE_DTS_CONFIG := config@cp03-c1
   SUPPORTED_DEVICES := cig,wf188n
-  DEVICE_PACKAGES := ath11k-wifi-cig-wf188n-ca uboot-env
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf188n uboot-env
 endef
-TARGET_DEVICES += cig_wf188n-ca
-
-define Device/cig_wf188n-us
-  DEVICE_TITLE := Cigtech WF-188n
-  DEVICE_DTS := qcom-ipq6018-cig-wf188n
-  DEVICE_DTS_CONFIG := config@cp03-c1
-  SUPPORTED_DEVICES := cig,wf188n
-  DEVICE_PACKAGES := ath11k-wifi-cig-wf188n-us uboot-env
-endef
-TARGET_DEVICES += cig_wf188n-us
+TARGET_DEVICES += cig_wf188n
 
 define Device/hfcl_ion4xe
   DEVICE_TITLE := HFCL ION4Xe
@@ -101,14 +92,14 @@ define Device/wallys_dr6018
 endef
 TARGET_DEVICES += wallys_dr6018
 
-define Device/wallys_dr6018_v4
+define Device/wallys_dr6018-v4
   DEVICE_TITLE := Wallys DR6018 V4
   DEVICE_DTS := qcom-ipq6018-wallys-dr6018-v4
   DEVICE_DTS_CONFIG := config@cp01-c4
   SUPPORTED_DEVICES := wallys,dr6018-v4
   DEVICE_PACKAGES := ath11k-wifi-wallys-dr6018-v4 uboot-envtools ath11k-firmware-qcn9000
 endef
-TARGET_DEVICES += wallys_dr6018_v4
+TARGET_DEVICES += wallys_dr6018-v4
 
 define Device/glinet_ax1800
   DEVICE_TITLE := GL-iNet AX1800

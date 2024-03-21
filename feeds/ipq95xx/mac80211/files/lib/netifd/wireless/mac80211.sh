@@ -536,22 +536,13 @@ mac80211_hostapd_setup_base() {
 			eht_ulmumimo_80mhz \
 			eht_ulmumimo_160mhz \
 			eht_ulmumimo_320mhz \
-			disable_eml_cap
+			disable_eml_cap:1
 
 		append base_cfg "ieee80211be=1" "$N"
 		append base_cfg "eht_su_beamformer=$eht_su_beamformer" "$N"
 		append base_cfg "eht_mu_beamformer=$eht_mu_beamformer" "$N"
 		append base_cfg "eht_su_beamformee=$eht_su_beamformee" "$N"
 		
-		drv_mlo_capable=$(cat /sys/module/ath12k/parameters/mlo_capable)
-		if [ -n "$drv_mlo_capable" ] && [ $drv_mlo_capable -eq 1 ]; then
-			append base_cfg "mlo=1" "$N"
-		fi
-		config_get bonded $2 bonded
-		if [ -n "$bonded" ] && [ $bonded -eq 1 ]; then
-			append base_cfg "bonded=1" "$N"
-		fi
-
 		[ -n "$disable_eml_cap" ] && append base_cfg "disable_eml_cap=$disable_eml_cap" "$N"
 
 		if [ -n "$eht_ulmumimo_80mhz" ]; then
@@ -1151,9 +1142,9 @@ drv_mac80211_setup() {
 	[ "$rxantenna" = "$prev_rxantenna" -a "$txantenna" = "$prev_txantenna" ] || mac80211_reset_config "$phy"
 	wireless_set_data phy="$phy" txantenna="$txantenna" rxantenna="$rxantenna"
 
-	iw phy "$phy" set antenna $txantenna $rxantenna >/dev/null 2>&1
-	iw phy "$phy" set antenna_gain $antenna_gain >/dev/null 2>&1
-	iw phy "$phy" set distance "$distance" >/dev/null 2>&1
+#	iw phy "$phy" set antenna $txantenna $rxantenna >/dev/null 2>&1
+#	iw phy "$phy" set antenna_gain $antenna_gain >/dev/null 2>&1
+#	iw phy "$phy" set distance "$distance" >/dev/null 2>&1
 
 	if [ -n "$txpower" ]; then
 		iw phy "$phy" set txpower fixed "${txpower%%.*}00"

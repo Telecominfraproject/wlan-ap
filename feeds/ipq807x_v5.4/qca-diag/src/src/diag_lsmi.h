@@ -34,6 +34,14 @@ when       who     what, where, why
 #define DIAG_MDLOG_PID_FILE_SZ  100
 #define NUM_PROC 10
 #define HDLC_DISABLE	1
+
+/* Non-HDLC Header:
+ * 1 byte - Control char
+ * 1 byte - Version
+ * 2 bytes - Packet length
+ */
+#define DIAG_NON_HDLC_HEADER_SIZE       4
+
 extern int diag_fd;
 extern int fd_md[NUM_PROC];
 extern int gdwClientID;

@@ -29,7 +29,6 @@ define Package/qca-diag/Description
   stack.
 endef
 
-
 QCASSDK_CONFIG_OPTS+= TOOL_PATH=$(TOOLCHAIN_DIR)/bin/ \
                 SYS_PATH=$(LINUX_DIR) \
                 TOOLPREFIX=$(TARGET_CROSS) \

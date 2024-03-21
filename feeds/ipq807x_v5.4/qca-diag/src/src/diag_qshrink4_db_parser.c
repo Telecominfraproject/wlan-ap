@@ -249,6 +249,8 @@ static int diag_qsr4_db_file_mem_init(qsr4_db_file_list** file_entry)
 	}
 	if (entry->head == NULL)
 		entry->head = file_block_offset;
+	else
+		free(file_block_offset);
 
 	return TRUE;
 

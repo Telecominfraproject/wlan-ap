@@ -89,6 +89,9 @@ when       who    what, where, why
 
 #define MAX_CHANNELS 4
 
+#define MAX_USER_PKT_SIZE		16384
+#define USER_SPACE_DATA_TYPE_SIZE	4
+
 #define DCI_HEADER_LENGTH	sizeof(int)
 #define DCI_LEN_FIELD_LENGTH	sizeof(int)
 #define DCI_EVENT_OFFSET	sizeof(uint16)
@@ -133,6 +136,13 @@ when       who    what, where, why
 								-1, -1, -1};
 	char dir_name[FILE_NAME_LEN];
 	char peripheral_name[FILE_NAME_LEN];
+
+/* enum defined to handle full/partial packet case */
+typedef enum {
+	PKT_START,
+	PKT_HEADER,
+	PKT_PAYLOAD
+} diag_pkt_states;
 
 static struct diag_callback_tbl_t cb_clients[NUM_PROC];
 static int socket_inited = 0;
@@ -619,46 +629,246 @@ SIDE EFFECTS
 ===========================================================================*/
 int diag_send_socket_data(int id, unsigned char buf[], int num_bytes)
 {
-	unsigned char send_buf[4100];
-	unsigned char offset = 4;
-	int i;
-	int start = 0;
-	int end = 0;
-	int copy_bytes;
-	int success;
+	static unsigned char send_buf[MAX_CHANNELS][MAX_USER_PKT_SIZE];
+	static unsigned char extra_header = USER_SPACE_DATA_TYPE_SIZE;
+	static unsigned char tmp_header[DIAG_NON_HDLC_HEADER_SIZE];
+	static diag_pkt_states pkt_state = PKT_START;
+	static int hdlc_pkt_pending = FALSE;
+	static uint32_t total_pkt_size = 0;
+	static uint32_t bytes_required = 0;
+	static int s_char = 0, e_char = 0;
+	static uint32_t pkt_start_off = 0;
+	static uint32_t saved_bytes = 0;
+	int status = PKT_PROCESS_DONE;
+	int packet_len_index = 0;
+	uint16_t packet_len = 0;
+	int i = 0, j = 0;
 
-	if ((id >= 0) && (id < MAX_CHANNELS)) {
-		*(int *)send_buf = USER_SPACE_DATA_TYPE;
-		if (socket_token[id] != 0 ) {
-			*(int *)(send_buf + offset) = socket_token[id];
-			offset += 4;
-		}
-
-		for (i = 0; i < num_bytes; i++) {
-			if (hdlc_disabled) {
-				if (buf[i] == CONTROL_CHAR && i == 0) {
-					end = end + 1;
-					continue;
-				}
-			}
-			if (buf[i] == CONTROL_CHAR) {
-				copy_bytes = end-start+1;
-				memcpy(send_buf+offset, buf+start, copy_bytes);
-				diag_send_data(send_buf, copy_bytes+offset);
-				start = i+1;
-				end = i+1;
-				continue;
-			}
-			end = end+1;
-		}
-		success = 1;
-	} else {
-		DIAG_LOGE("diag: In %s, Error sending socket data. Invalid socket id: %d\n",
-			__func__, id);
-		success = 0;
+	if ((id < 0) || id >= MAX_CHANNELS) {
+		DIAG_LOGE("diag_socket_log: %s: Error sending socket data. socket id: %d, num_bytes: %d\n",
+			__func__, id, num_bytes);
+		return PKT_PROCESS_DONE;
 	}
 
-	return success;
+	for (i = 0; i < num_bytes; i++) {
+		status = PKT_PROCESS_ONGOING;
+		switch (pkt_state)
+		{
+		case PKT_START:
+			if (buf[i] == CONTROL_CHAR && !hdlc_pkt_pending) {
+				s_char = buf[i];
+				pkt_start_off = i;
+				/* probably it is non-HDLC packet */
+				if (num_bytes >= (pkt_start_off + DIAG_NON_HDLC_HEADER_SIZE)) {
+					/* received full header */
+					packet_len_index = pkt_start_off + 2;
+					packet_len = (uint16_t)(*(uint16_t *)(buf + packet_len_index));
+					total_pkt_size = DIAG_NON_HDLC_HEADER_SIZE + packet_len + 1;
+					if (total_pkt_size <= (num_bytes - pkt_start_off)) {
+						e_char = buf[total_pkt_size-1];
+						if (s_char == e_char) {
+							/* full non-HDLC packet received */
+							memset(send_buf[id], 0, MAX_USER_PKT_SIZE);
+							*(int *)send_buf[id] = USER_SPACE_DATA_TYPE;
+							if (socket_token[id] != 0) {
+								*(int *)(send_buf[id] + extra_header) = socket_token[id];
+								extra_header += sizeof(int);
+							}
+							memcpy(send_buf[id] + extra_header, buf, total_pkt_size);
+							/* send it diag core */
+							diag_send_data(send_buf[id], total_pkt_size + extra_header);
+							i += total_pkt_size - 1;
+							s_char = 0;
+							e_char = 0;
+							total_pkt_size = 0;
+							extra_header = USER_SPACE_DATA_TYPE_SIZE;
+							status = PKT_PROCESS_DONE;
+						}
+					} else {
+						/* full header + partial packet received */
+						pkt_state = PKT_PAYLOAD;
+						memset(send_buf[id], 0, MAX_USER_PKT_SIZE);
+						*(int *)send_buf[id] = USER_SPACE_DATA_TYPE;
+						if (socket_token[id] != 0) {
+							*(int *)(send_buf[id] + extra_header) = socket_token[id];
+							extra_header += sizeof(int);
+						}
+						memcpy(send_buf[id] + extra_header, (buf + pkt_start_off), (num_bytes - pkt_start_off));
+						saved_bytes = (num_bytes - pkt_start_off + extra_header);
+						bytes_required = total_pkt_size - (saved_bytes - extra_header);
+						i += num_bytes - 1;
+						DIAG_LOGD("%s:PKT_START: full header + partial pkt received, total_pkt_size %d recvd %d pending %d\n",
+							__func__, total_pkt_size, (saved_bytes - extra_header), bytes_required);
+					}
+				} else {
+					/* partial header received */
+					memcpy(tmp_header, (buf + pkt_start_off), (num_bytes - pkt_start_off));
+					saved_bytes = (num_bytes - pkt_start_off);
+					bytes_required = DIAG_NON_HDLC_HEADER_SIZE - saved_bytes;
+					i += num_bytes - 1;
+					pkt_state = PKT_HEADER;
+					DIAG_LOGD("%s:PKT_START: partial header received, recvd %d pending %d\n",
+						__func__, saved_bytes, bytes_required);
+				}
+			} else {
+				/* HDLC packet will enter here */
+				if (!hdlc_pkt_pending) {
+					hdlc_pkt_pending = TRUE;
+					memset(send_buf[id], 0, MAX_USER_PKT_SIZE);
+					*(int *)send_buf[id] = USER_SPACE_DATA_TYPE;
+					if (socket_token[id] != 0) {
+						*(int *)(send_buf[id] + extra_header) = socket_token[id];
+						extra_header += sizeof(int);
+					}
+					saved_bytes = extra_header;
+				}
+				/* iterate through the packet to find the delimiter */
+				for (j = 0; j < num_bytes; j++) {
+					if (buf[j] == CONTROL_CHAR) {
+						if (j == (num_bytes - 1)) {
+							/* delimiter found at the end of current packet
+							 * probably this is end of HDLC packet
+							 */
+							if (saved_bytes + num_bytes >= MAX_USER_PKT_SIZE) {
+								DIAG_LOGE("%s:hdlc: command too large, dropping pkt\n", __func__);
+								hdlc_pkt_pending = FALSE;
+								saved_bytes = 0;
+								i += num_bytes - 1;
+								break;
+							}
+							memcpy(send_buf[id] + saved_bytes, buf, num_bytes);
+							/* send it to diag core */
+							diag_send_data(send_buf[id], saved_bytes + num_bytes);
+							hdlc_pkt_pending = FALSE;
+							i += num_bytes - 1;
+							saved_bytes = 0;
+							extra_header = USER_SPACE_DATA_TYPE_SIZE;
+							status = PKT_PROCESS_DONE;
+						} else {
+							/* delimiter character may come at the middle of packet
+							 * just ignore as we cant handle this case
+							 */
+							DIAG_LOGD("%s:hdlc: Delimiter found at the middle index %d\n", __func__, j);
+						}
+					}
+				}
+				/* full HDLC packet has not received */
+				if (hdlc_pkt_pending) {
+					if (saved_bytes + num_bytes >= MAX_USER_PKT_SIZE) {
+						DIAG_LOGE("%s:hdlc: command too large, dropping pkt\n", __func__);
+						hdlc_pkt_pending = FALSE;
+						saved_bytes = 0;
+						i += num_bytes - 1;
+						break;
+					}
+					memcpy(send_buf[id] + saved_bytes, buf, num_bytes);
+					saved_bytes += num_bytes;
+					i += num_bytes - 1;
+					DIAG_LOGD("%s:hdlc: Partial Packet received, recvd %d\n", __func__,
+						(saved_bytes - extra_header));
+				}
+			}
+			break;
+
+		case PKT_HEADER:
+			if(num_bytes >= bytes_required){
+				/* we have full header now */
+				memcpy(tmp_header+saved_bytes, buf, bytes_required);
+				packet_len = (uint16_t)(*(uint16_t *)(tmp_header + 2));
+				total_pkt_size = DIAG_NON_HDLC_HEADER_SIZE + packet_len + 1;
+				if (total_pkt_size <= (num_bytes + saved_bytes)) {
+					/* might received full packet */
+					e_char = buf[total_pkt_size - saved_bytes - 1];
+					if (s_char == e_char) {
+						/* full non-HDLC packet received */
+						memset(send_buf[id], 0, MAX_USER_PKT_SIZE);
+						*(int *)send_buf[id] = USER_SPACE_DATA_TYPE;
+						if (socket_token[id] != 0) {
+							*(int *)(send_buf[id] + extra_header) = socket_token[id];
+							extra_header += sizeof(int);
+						}
+						memcpy(send_buf[id] + extra_header, tmp_header, saved_bytes);
+						memcpy(send_buf[id] + extra_header + saved_bytes, buf,
+								total_pkt_size - saved_bytes);
+						/* send it to diag core */
+						diag_send_data(send_buf[id], total_pkt_size + extra_header);
+						i += total_pkt_size - saved_bytes - 1;
+						s_char = 0;
+						e_char = 0;
+						total_pkt_size = 0;
+						bytes_required = 0;
+						saved_bytes = 0;
+						extra_header = USER_SPACE_DATA_TYPE_SIZE;
+						pkt_state = PKT_START;
+						status = PKT_PROCESS_DONE;
+					}
+				} else {
+					/* full header + partial packet received */
+					pkt_state = PKT_PAYLOAD;
+					memset(send_buf[id], 0, MAX_USER_PKT_SIZE);
+					*(int *)send_buf[id] = USER_SPACE_DATA_TYPE;
+					if (socket_token[id] != 0) {
+						*(int *)(send_buf[id] + extra_header) = socket_token[id];
+						extra_header += sizeof(int);
+					}
+					/* copy partial header received */
+					memcpy(send_buf[id] + extra_header, tmp_header, saved_bytes);
+					memcpy(send_buf[id] + extra_header + saved_bytes, buf, num_bytes);
+					bytes_required = total_pkt_size - saved_bytes - num_bytes;
+					i += num_bytes - 1;
+					saved_bytes += num_bytes + extra_header;
+					DIAG_LOGD("%s:PKT_HEADER: full header + partial pkt received, total_pkt_size %d recvd %d pending %d\n",
+						__func__, total_pkt_size, (saved_bytes - extra_header), bytes_required);
+				}
+			} else {
+				/* still full header not yet received */
+				memcpy(tmp_header + saved_bytes, buf, num_bytes);
+				saved_bytes += num_bytes;
+				bytes_required = DIAG_NON_HDLC_HEADER_SIZE - saved_bytes;
+				i += num_bytes - 1;
+				DIAG_LOGD("%s:PKT_HEADER: still partial header received, recvd %d pending %d\n",
+					__func__, saved_bytes, bytes_required);
+			}
+			break;
+
+		case PKT_PAYLOAD:
+			if(num_bytes >= bytes_required){
+				/* received pending bytes */
+				e_char = buf[bytes_required - 1];
+				if (s_char == e_char) {
+					/* full non-HDLC packet received */
+					memcpy(send_buf[id] + saved_bytes, buf, bytes_required);
+					/* send it to diag core */
+					diag_send_data(send_buf[id], total_pkt_size + extra_header);
+					i += bytes_required - 1;
+					s_char = 0;
+					e_char = 0;
+					total_pkt_size = 0;
+					bytes_required = 0;
+					saved_bytes = 0;
+					extra_header = USER_SPACE_DATA_TYPE_SIZE;
+					pkt_state = PKT_START;
+					status = PKT_PROCESS_DONE;
+				}
+			} else {
+				/* still not yet received the full packet */
+				memcpy(send_buf[id] + saved_bytes, buf, num_bytes);
+				bytes_required = total_pkt_size - (saved_bytes -
+								extra_header) - num_bytes;
+				i += num_bytes - 1;
+				saved_bytes += num_bytes;
+				DIAG_LOGD("%s:PKT_PAYLOAD: Still waiting for full packet,saved %d pending %d\n",
+							__func__, (saved_bytes - extra_header), bytes_required);
+			}
+			break;
+		default:
+			DIAG_LOGD("%s:default: Unexpected packet state\n",
+						__func__);
+			break;
+		}
+	}
+
+	return status;
 }
 
 /*==========================================================================
@@ -2300,6 +2510,7 @@ int diag_read_mask_file(void)
 		if (!found_cmd) {
 			DIAG_LOGE("Sorry, could not find valid commands in the mask file,"
 					"please check the mask file again\n");
+			fclose(read_mask_fp);
 			return -1;
 		}
 	} else {
@@ -2321,6 +2532,7 @@ int diag_read_mask_file(void)
 			if (mask_buf[count_mask_bytes] != CONTROL_CHAR && i == 0) {
 				DIAG_LOGE("Sorry, the mask file doesn't adhere to framing definition,"
 					"please check the mask file again\n");
+				fclose(read_mask_fp);
 				return -1;
 			}
 			if (count_mask_bytes > payload && mask_buf[count_mask_bytes] == CONTROL_CHAR && i != 0) {

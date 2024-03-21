@@ -1,0 +1,318 @@
+From c2f145f7cb1beb260987e12488c68dff72b0b546 Mon Sep 17 00:00:00 2001
+From: Balamurugan Mahalingam <quic_bmahalin@quicinc.com>
+Date: Mon, 14 Aug 2023 04:53:27 -0700
+Subject: [PATCH 1/2] ath12k: Enable support to convert multicast to unicast
+ during DS
+
+Convert the multicast frames to unicast in ath12k driver for the
+Direct switch scenarios. The multicast packets are transmitted
+through the SW path and its directly delivered to the ath12k layer
+using the bonded interface net device operations, convert the multicast
+frame to unicast within the driver and transmit it
+
+Signed-off-by: Balamurugan Mahalingam <quic_bmahalin@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/bondif.c | 152 ++++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/bondif.h |   2 +
+ drivers/net/wireless/ath/ath12k/core.h   |   1 +
+ drivers/net/wireless/ath/ath12k/mac.c    |   5 +
+ include/net/mac80211.h                   |   4 +
+ net/mac80211/cfg.c                       |   1 +
+ net/mac80211/driver-ops.h                |  20 +++
+ 7 files changed, 184 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/wireless/ath/ath12k/bondif.c
++++ b/drivers/net/wireless/ath/ath12k/bondif.c
+@@ -7,11 +7,13 @@
+ #include <linux/module.h>
+ #include <net/bonding.h>
+ #include <linux/ieee80211.h>
++#include <linux/if_vlan.h>
+ #include "core.h"
+ #include "ppe.h"
+ #include "bondif.h"
+ #include "debug.h"
+ #include "dp_tx.h"
++#include "peer.h"
+ 
+ static const struct net_device_ops ieee80211_link_dataif_8023_ops;
+ extern struct ath12k_link_vif *ath12k_mac_assign_link_vif( struct ath12k_hw *ah,
+@@ -299,6 +301,7 @@ int ath12k_mac_op_change_vif_links(struc
+ 		link_ndev_pvt->is_started = false;
+ 		link_ndev_pvt->is_bond_enslaved = false;
+ 		mldev->vif = vif;
++ 		mldev->ahvif = ath12k_vif_to_ahvif(vif);
+ 		mutex_lock(&vif->bond_mutex);
+ 		vif->link_ndev[link_num] = link_ndev;
+ 		mutex_unlock(&vif->bond_mutex);
+@@ -566,6 +569,97 @@ fail_remove_tx_buf:
+ 	return ret;
+ }
+ 
++static int ath12k_update_da(struct sk_buff *skb, u8 *ucastaddr)
++{
++        int ret;
++        struct ethhdr *ethhdr;
++
++        ret  = skb_ensure_writable(skb, ETH_HLEN);
++        if (unlikely(ret))
++                return ret;
++
++        ethhdr = (void *)skb->data;
++        ether_addr_copy(ethhdr->h_dest, ucastaddr);
++
++        return 0;
++}
++
++static int ath12k_convert_to_unicast(struct ath12k_base *ab, struct sk_buff *skb, struct ath12k_vif *orig_ahvif,
++			       struct sk_buff_head *queue)
++{
++	const struct ethhdr *ethhdr;
++	struct ath12k_vif *ahvif;
++	struct ath12k_peer *peer;
++	struct ieee80211_vif *vif;
++	struct sk_buff *skb_new;
++	int ring_id;
++	int ret = 0;
++
++	if (!skb)
++		return -EINVAL;
++
++	ethhdr = (struct ethhdr *)skb->data;
++
++	ring_id = ab->hw_params->hw_ops->get_ring_selector(skb);
++
++	spin_lock_bh(&ab->base_lock);
++	list_for_each_entry(peer, &ab->peers, list) {
++		vif = peer->vif;
++		ahvif = ath12k_vif_to_ahvif(vif);
++		if (ahvif != orig_ahvif)
++			continue;
++
++		if(!peer->sta)
++			continue;
++
++		if (unlikely(ether_addr_equal(ethhdr->h_source, peer->sta->addr))) {
++			/* do not send back to source */
++			continue;
++		}
++
++		skb_new = skb_clone(skb, GFP_ATOMIC);
++		if (!skb_new) {
++			ret = -ENOMEM;
++			goto purge;
++		}
++		if (unlikely(ath12k_update_da(skb_new, peer->sta->addr))) {
++			dev_kfree_skb(skb_new);
++			ret = -ENOMEM;
++			goto purge;
++		}
++		__skb_queue_tail(queue, skb_new);
++	}
++	goto out;
++purge:
++	__skb_queue_purge(queue);
++out:
++	spin_unlock_bh(&ab->base_lock);
++	return ret;
++}
++
++static bool ath12k_dp_mlo_multicast_to_unicast(struct sk_buff *skb,
++					   struct net_device *bond_dev)
++{
++	const struct ethhdr *eth = (void *)skb->data;
++	const struct vlan_ethhdr *ethvlan = (void *)skb->data;
++	__be16 ethertype;
++
++	ethertype = eth->h_proto;
++	if (ethertype == htons(ETH_P_8021Q) && skb->len >= VLAN_ETH_HLEN)
++		ethertype = ethvlan->h_vlan_encapsulated_proto;
++	switch (ethertype) {
++	case htons(ETH_P_ARP):
++	case htons(ETH_P_IP):
++	case htons(ETH_P_IPV6):
++		break;
++	default:
++		return false;
++	}
++
++	return true;
++}
++
++
+ int ath12k_dp_mlo_xmit_netdev(struct sk_buff *skb, struct net_device *bond_dev)
+ {
+ 	struct net_device *link_dev = NULL;
+@@ -578,10 +672,13 @@ int ath12k_dp_mlo_xmit_netdev(struct sk_
+ 	struct ath12k *tmp_ar;
+ 	int is_mcast;
+ 	u16 mcbc_gsn;
+-	int ret;
++	struct sk_buff *skb1;
++	int ret, i;
++	bool is_convert;
+ 	int link_id, ring_id = 0;
+ 	struct ath12k_skb_cb *skb_cb;
+ 	struct ieee80211_tx_info *info;
++	struct sk_buff_head queue;
+ 
+ 	if (!(bond_dev->flags & IFF_UP)) {
+ 		dev_kfree_skb(skb);
+@@ -613,6 +710,34 @@ int ath12k_dp_mlo_xmit_netdev(struct sk_
+ 			return NETDEV_TX_OK;
+ 		}
+ 
++		if (ahvif->mcast_to_ucast_en) {
++			is_convert = ath12k_dp_mlo_multicast_to_unicast(skb, bond_dev);
++
++			if (is_convert) {
++				for (i = 0; i < IEEE80211_MLD_MAX_NUM_LINKS; i++) {
++					arvif = ahvif->link[i];
++					if (!arvif)
++						continue;
++
++					__skb_queue_head_init(&queue);
++					ath12k_convert_to_unicast(arvif->ab, skb, ahvif,  &queue);
++					while ((skb1 = __skb_dequeue(&queue))) {
++						eh = (struct ethhdr *)skb1->data;
++						link_dev = ath12k_mac_get_tx_link_netdev( mldev, eh->h_dest);
++#ifdef CPTCFG_MAC80211_SFE_SUPPORT
++						skb1->fast_xmit = 0;
++#endif
++						if (link_dev)
++							link_dev->netdev_ops->ndo_start_xmit(skb1, link_dev);
++						else
++							dev_kfree_skb_any(skb1);
++					}
++				}
++				dev_kfree_skb_any(skb);
++				return NETDEV_TX_OK;
++			}
++		}
++
+ 		spin_lock(&ahvif->mcbc_gsn_lock);
+ 		mcbc_gsn = ahvif->mcbc_gsn++;
+ 		if (ahvif->mcbc_gsn > 0xFFF)
+@@ -985,3 +1110,21 @@ int ath12k_bond_dev_cb(struct wireless_d
+ 	}
+ 	return 0;
+ }
++
++int ath12k_mac_op_set_multicast_to_unicast(struct ieee80211_hw *hw,
++					    struct ieee80211_vif *vif,
++					    const bool enabled)
++{
++	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
++	struct wireless_dev *wdev = ieee80211_vif_to_wdev(vif);
++
++	if (!g_bonded_interface_model)
++		return -ENOTSUPP;
++
++	if (!wdev->bond_netdev)
++		return -ENOTSUPP;
++
++	ahvif->mcast_to_ucast_en = enabled;
++
++	return 0;
++}
+--- a/drivers/net/wireless/ath/ath12k/bondif.h
++++ b/drivers/net/wireless/ath/ath12k/bondif.h
+@@ -23,6 +23,9 @@ void ath12k_enable_ds_for_link_netdev(st
+ int ath12k_free_bonddev_for_sfe(struct wireless_dev *wdev,
+ 				struct ieee80211_vif *vif,
+ 				int link_num);
++int ath12k_mac_op_set_multicast_to_unicast(struct ieee80211_hw *hw,
++					   struct ieee80211_vif *vif,
++					   const bool enabled);
+ int ath12k_bond_link_enslave(struct ath12k_link_vif *arvif, struct net_device *link_dev);
+ void ath12k_bond_link_release(struct ath12k_link_vif *arvif);
+ enum ath12k_bond_state {
+@@ -36,10 +39,12 @@ enum ath12k_bond_state {
+ struct ath12k_mld_dev {
+ 	struct net_device *netdev;
+ 	struct ieee80211_vif *vif;
++	struct ath12k_vif *ahvif;
+ 	struct wireless_dev *wdev; //dummy one for bond registration. Optimize Bond MLO API.
+ 	struct net_device *link_dev[MAX_MLO_CHIPS][MAX_PDEV_PER_SOC];
+ 	u8 primary_chipid, primary_pdevid;
+ 	bool mcast_dev_set;
++	bool mcast_to_ucast_en;
+ 	unsigned long bond_state;
+ };
+ 
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -488,6 +488,7 @@ struct ath12k_vif {
+ #ifdef CPTCFG_ATH12K_DEBUGFS
+ 	struct dentry *debugfs_linkstats;
+ #endif /* CPTCFG_ATH12K_DEBUGFS */
++	bool mcast_to_ucast_en;
+ };
+ 
+ struct ath12k_vif_iter {
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -15026,6 +15026,9 @@ static const struct ieee80211_ops ath12k
+ #endif
+ 	.get_txpower			= ath12k_mac_op_get_txpower,
+ 	.set_radar_background		= ath12k_mac_op_set_radar_background,
++#ifdef CPTCFG_ATH12K_BONDED_DS_SUPPORT
++	.set_multicast_to_unicast	= ath12k_mac_op_set_multicast_to_unicast,
++#endif
+ };
+ 
+ static void ath12k_mac_update_ch_list(struct ath12k *ar,
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -4690,6 +4690,10 @@ struct ieee80211_ops {
+ 	int (*ppeds_detach_vdev)(struct ieee80211_hw *hw,
+ 				 struct ieee80211_vif *vif,
+ 				 struct ieee80211_ppe_vp_ds_params *vp_params);
++	int (*set_multicast_to_unicast)(struct ieee80211_hw *hw,
++					struct net_device *dev,
++					const bool enabled);
++
+ };
+ 
+ /**
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -4905,6 +4905,9 @@ static int ieee80211_set_multicast_to_un
+ 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+ 
+ 	sdata->u.ap.multicast_to_unicast = enabled;
++#ifdef CPTCFG_MAC80211_PPE_SUPPORT
++	drv_set_multicast_to_unicast(sdata->local, sdata, dev, enabled);
++#endif
+ 
+ 	return 0;
+ }
+--- a/net/mac80211/driver-ops.h
++++ b/net/mac80211/driver-ops.h
+@@ -1510,6 +1510,26 @@ static inline void drv_twt_teardown_requ
+ 	trace_drv_return_void(local);
+ }
+ 
++#ifdef CPTCFG_MAC80211_PPE_SUPPORT
++static inline int drv_set_multicast_to_unicast(struct ieee80211_local *local,
++						struct ieee80211_sub_if_data *sdata,
++						struct net_device *dev,
++						const bool enabled)
++{
++	struct ieee80211_vif *vif = sdata ? &sdata->vif : NULL;
++
++	might_sleep();
++
++	if (!check_sdata_in_driver(sdata))
++		return -EIO;
++
++	if (!local->ops->set_multicast_to_unicast)
++		return -ENOTSUPP;
++
++	return local->ops->set_multicast_to_unicast(&local->hw, vif, enabled);
++}
++#endif
++
+ static inline int drv_ppeds_attach_vdev(struct ieee80211_sub_if_data *sdata,
+ 					struct ieee80211_vif *vif, void *vp_arg,
+ 					int *ppe_vp_num,

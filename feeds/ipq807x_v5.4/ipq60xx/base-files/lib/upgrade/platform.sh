@@ -122,10 +122,10 @@ platform_do_upgrade() {
 		else
 			if grep -q rootfs1 /proc/cmdline; then
 				CI_UBIPART="rootfs2"
-				fw_setenv active 2 || exit 1
+				CI_FWSETENV="active 2"
 			else
 				CI_UBIPART="rootfs1"
-				fw_setenv active 1 || exit 1
+				CI_FWSETENV="active 1"
 			fi
 		fi
 		nand_upgrade_tar "$1"
