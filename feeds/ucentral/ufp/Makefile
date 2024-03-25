@@ -25,7 +25,7 @@ define Package/ufp
   SECTION:=utils
   CATEGORY:=Utilities
   TITLE:=Device fingerprinting daemon
-  DEPENDS:=+ucode +ucode-mod-fs +libubox
+  DEPENDS:=+ucode +ucode-mod-fs +ucode-mod-struct +libubox
 endef
 
 define Package/ufp/conffiles
