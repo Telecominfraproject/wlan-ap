@@ -129,6 +129,21 @@ function vlan_add(dev, vid, ad)
 	vlans[keystr] = true;
 }
 
+function vlan_config_push(vlan_config, dev, vid)
+{
+	let vlan_found = false;
+
+	for (let v in vlan_config[dev]) {
+		if (v[0] == vid) {
+			vlan_found = true;
+			break;
+		}
+	}
+
+	if (!vlan_found)
+		push(vlan_config[dev], [ vid, "rx", "tx"]);
+}
+
 function vlan_set_config(config)
 {
 	vlan_config = config;
@@ -221,7 +236,7 @@ function run_service() {
 					return ubus.STATUS_INVALID_ARGUMENT;
 				if (!vlan_config[req.args.device])
 					vlan_config[req.args.device] = [];
-				push(vlan_config[req.args.device], [ req.args.vlan, "rx", "tx"]);
+				vlan_config_push(vlan_config, req.args.device, req.args.vlan);
 				vlan_set_config(vlan_config);
 				return 0;                           
 			},                           
