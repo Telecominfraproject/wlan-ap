@@ -221,8 +221,7 @@ return {
 
 		let reply = this.fs_popen('/usr/bin/radius-client ' + path);
 
-		if (!+config.def_captive.debug)
-			fs.unlink(path);
+		fs.unlink(path);
 
 		return reply;
 	},
