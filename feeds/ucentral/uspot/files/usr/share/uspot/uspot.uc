@@ -76,8 +76,7 @@ function radius_call(interface, mac, payload) {
 
 	system('/usr/bin/radius-client ' + path);
 
-	if (!+interfaces[interface].settings.debug)
-		fs.unlink(path);
+	fs.unlink(path);
 }
 
 // RADIUS Acct-Status-Type attributes
