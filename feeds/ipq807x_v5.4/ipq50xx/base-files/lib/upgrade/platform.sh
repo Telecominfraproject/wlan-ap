@@ -70,6 +70,8 @@ platform_check_image() {
 	case $board in
 	cig,wf186w|\
 	cig,wf186h|\
+	cybertan,rap630c-311g|\
+	cybertan,rap630w-311g|\		
 	cybertan,eww631-a1|\
 	cybertan,eww631-b1|\
 	edgecore,eap104|\
@@ -132,6 +134,8 @@ platform_do_upgrade() {
 		}
 		nand_upgrade_tar "$1"
 		;;
+	cybertan,rap630c-311g|\
+	cybertan,rap630w-311g|\			
 	cybertan,eww631-a1|\
 	cybertan,eww631-b1)
 		boot_part=$(fw_printenv bootfrom | cut  -d = -f2)
