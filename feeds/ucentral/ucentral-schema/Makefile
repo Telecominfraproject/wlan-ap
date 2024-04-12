@@ -4,10 +4,10 @@ PKG_NAME:=ucentral-schema
 PKG_RELEASE:=1
 
 PKG_SOURCE_URL=https://github.com/Telecominfraproject/wlan-ucentral-schema.git
-PKG_MIRROR_HASH:=d081fdd3c4655254b8e4be76f0fa881f53f20a0e8bfcf12f3b547701b6ea126b
+PKG_MIRROR_HASH:=5afb439480d12d3e8e5158f056850b034096cf36a91574dbeecd4a98a8830e83
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2022-05-29
-PKG_SOURCE_VERSION:=cb1c18db707dc86c7eeb3e8828c8f37a689fe644
+PKG_SOURCE_VERSION:=cc0bf95db178248a5e0d3adbc3bcfde1001c4802
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=BSD-3-Clause
 
@@ -31,7 +31,8 @@ define Build/Compile
 endef
 
 define Package/ucentral-schema/install
-	$(INSTALL_DIR) $(1)/usr/share/ucentral
+	$(INSTALL_DIR) $(1)/usr/share/ucentral $(1)/etc/ucentral/
+	$(CP) $(PKG_BUILD_DIR)/schema.json $(1)/etc/ucentral/
 	$(CP) $(PKG_BUILD_DIR)/schemareader.uc $(1)/usr/share/ucentral
 	$(CP) $(PKG_BUILD_DIR)/renderer/* $(1)/usr/share/ucentral
 	$(CP) $(PKG_BUILD_DIR)/command/*.uc $(1)/usr/share/ucentral
