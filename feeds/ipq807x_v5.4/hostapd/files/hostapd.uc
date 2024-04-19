@@ -800,6 +800,12 @@ return {
 			iface_set_config(phy, null);
 		hostapd.ubus.disconnect();
 	},
+	afc_request: function(iface, data) {
+		let ret = ubus.call("afc", "request", { data });
+		if (type(ret) != "object")
+			return;
+		return ret.data;
+	},
 	bss_add: function(name, obj) {
 		bss_event("add", name);
 	},

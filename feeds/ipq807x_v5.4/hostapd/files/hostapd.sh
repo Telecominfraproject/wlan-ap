@@ -126,7 +126,28 @@ hostapd_common_add_device_config() {
 
 	config_add_boolean multiple_bssid rnr_beacon he_co_locate ema
 
+	config_add_boolean afc
+	config_add_string \
+		afc_request_version afc_request_id afc_serial_number \
+		afc_location_type afc_location afc_height afc_height_type
+	config_add_array afc_cert_ids afc_freq_range afc_op_class
+	config_add_int \
+		afc_min_power afc_major_axis afc_minor_axis afc_orientation \
+		afc_vertical_tolerance
+
 	hostapd_add_log_config
+}
+
+
+hostapd_get_list() {
+	local var="$1"
+	local field="$2"
+
+	local cur __val_list
+	json_get_values __val_list "$field"
+	for cur in $__val_list; do
+		append "$var" "$cur" ","
+	done
 }
 
 hostapd_prepare_device_config() {
@@ -139,7 +160,7 @@ hostapd_prepare_device_config() {
 		acs_chan_bias local_pwr_constraint spectrum_mgmt_required airtime_mode cell_density \
 		rts_threshold beacon_rate rssi_reject_assoc_rssi rssi_ignore_probe_request maxassoc \
 		multiple_bssid he_co_locate rnr_beacon ema acs_exclude_dfs \
-		maxassoc_ignore_probe
+		maxassoc_ignore_probe band
 
 	hostapd_set_log_options base_cfg
 
@@ -252,6 +273,45 @@ hostapd_prepare_device_config() {
 	[ "$multiple_bssid" -gt 0 ] && append base_cfg "multiple_bssid=$multiple_bssid" "$N"
 	[ "$ema" -gt 0 ] && append base_cfg "ema=$ema" "$N"
 	[ "$acs_exclude_dfs" -gt 0 ] && append base_cfg "acs_exclude_dfs=$acs_exclude_dfs" "$N"
+	if [ "$band" = "6g" ]; then
+		json_get_vars afc he_6ghz_reg_pwr_type
+	else
+		afc=0
+		he_6ghz_reg_pwr_type=
+	fi
+	set_default afc 0
+	[ "$afc" -gt 0 ] && {
+		for v in afc_request_version afc_request_id afc_serial_number afc_min_power afc_height afc_height_type afc_vertical_tolerance \
+				 afc_major_axis afc_minor_axis afc_orientation; do
+			json_get_var val $v
+			append base_cfg "$v=$val" "$N"
+		done
+
+		for v in afc_cert_ids afc_op_class afc_freq_range; do
+			val=
+			hostapd_get_list val $v
+			append base_cfg "$v=$val" "$N"
+		done
+
+		json_get_vars afc_location_type afc_location
+		case "$afc_location_type" in
+			ellipse)
+				append base_cfg "afc_location_type=0" "$N"
+				append base_cfg "afc_linear_polygon=$afc_location" "$N"
+			;;
+			linear_polygon)
+				append base_cfg "afc_location_type=1" "$N"
+				append base_cfg "afc_linear_polygon=$afc_location" "$N"
+			;;
+			radial_polygon)
+				append base_cfg "afc_location_type=2" "$N"
+				append base_cfg "afc_radial_polygon=$afc_location" "$N"
+			;;
+		esac
+
+		he_6ghz_reg_pwr_type=1
+	}
+	[ -n "$he_6ghz_reg_pwr_type" ] && append base_cfg "he_6ghz_reg_pwr_type=$he_6ghz_reg_pwr_type" "$N"
 
 	json_get_values opts hostapd_options
 	for val in $opts; do

@@ -26,6 +26,8 @@ void hostapd_ucode_free_iface(struct hostapd_iface *iface);
 void hostapd_ucode_add_bss(struct hostapd_data *hapd);
 void hostapd_ucode_free_bss(struct hostapd_data *hapd);
 void hostapd_ucode_reload_bss(struct hostapd_data *hapd);
+int hostapd_ucode_afc_request(struct hostapd_iface *iface, const char *request,
+			      char *buf, size_t len);
 
 #else
 

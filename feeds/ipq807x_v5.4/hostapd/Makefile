@@ -92,6 +92,7 @@ DRIVER_MAKEOPTS= \
 	CONFIG_IEEE80211N=$(HOSTAPD_IEEE80211N) \
 	CONFIG_IEEE80211AC=$(HOSTAPD_IEEE80211AC) \
 	CONFIG_IEEE80211AX=$(HOSTAPD_IEEE80211AX) \
+	CONFIG_AFC=$(HOSTAPD_IEEE80211AX) \
 	CONFIG_DRIVER_WEXT=$(CONFIG_DRIVER_WEXT_SUPPORT) \
 	CONFIG_UCODE=y
 
@@ -138,6 +139,13 @@ endif
 
 DRV_DEPENDS:=+PACKAGE_kmod-cfg80211:libnl-tiny
 
+define Package/afcd
+  SECTION:=net
+  CATEGORY:=Network
+  SUBMENU:=WirelessAPD
+  TITLE:=AFC communication daemon
+  DEPENDS:=+ucode +ucode-mod-uclient +ucode-mod-uloop
+endef
 
 define Package/hostapd/Default
   SECTION:=net
@@ -506,7 +514,7 @@ TARGET_CPPFLAGS := \
 	$(if $(CONFIG_WPA_MSG_MIN_PRIORITY),-DCONFIG_MSG_MIN_PRIORITY=$(CONFIG_WPA_MSG_MIN_PRIORITY))
 
 TARGET_CFLAGS += -ffunction-sections -fdata-sections -flto
-TARGET_LDFLAGS += -Wl,--gc-sections -flto=jobserver -fuse-linker-plugin -lubox -lubus -lucode -lblobmsg_json
+TARGET_LDFLAGS += -Wl,--gc-sections -flto=jobserver -fuse-linker-plugin -lubox -lubus -lucode -lblobmsg_json -ljson-c
 
 ifdef CONFIG_PACKAGE_kmod-cfg80211
   TARGET_LDFLAGS += -lm -lnl-tiny
@@ -587,6 +595,12 @@ endef
 define Build/Compile
 	$(Build/Compile/$(LOCAL_TYPE))
 	$(Build/Compile/$(BUILD_VARIANT))
+endef
+
+define Package/afcd/install
+	$(INSTALL_DIR) $(1)/usr/share/hostap $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/afcd.init $(1)/etc/init.d/afcd
+	$(INSTALL_DATA) ./files/afcd.uc $(1)/usr/share/hostap/
 endef
 
 define Install/hostapd
@@ -692,6 +706,7 @@ ifeq ($(BUILD_VARIANT),supplicant-full-wolfssl)
   endef
 endif
 
+$(eval $(call BuildPackage,afcd))
 $(eval $(call BuildPackage,hostapd))
 $(eval $(call BuildPackage,hostapd-basic))
 $(eval $(call BuildPackage,hostapd-basic-openssl))
