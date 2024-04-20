@@ -12,6 +12,7 @@ define Package/certificates
   SECTION:=ucentral
   CATEGORY:=uCentral
   TITLE:=TIP DigiCer certificate store
+  DEPENDS += +squashfs-tools-mksquashfs
 endef
 
 define Build/Prepare
