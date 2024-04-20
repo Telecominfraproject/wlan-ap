@@ -38,6 +38,11 @@ $(call Package/ath12k-wifi-default)
     TITLE:=board.bin for CIG WF189
 endef
 
+define Package/ath12k-wifi-edgecore-eap105
+$(call Package/ath12k-wifi-default)
+    TITLE:=board.bin for Edgecore EAP105
+endef
+
 define Package/ath12k-wifi-sercomm-ap72tip
 $(call Package/ath12k-wifi-default)
     TITLE:=board.bin for Sercomm WIFI-7
@@ -51,6 +56,14 @@ define Package/ath12k-wifi-cig-wf189/install
 	$(INSTALL_DATA) ./board-cig-wf189.bin.ipq53xx $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board.bin
 endef
 
+define Package/ath12k-wifi-edgecore-eap105/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0
+	$(INSTALL_DATA) ./regdb.bin $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
+	$(INSTALL_DATA) ./board-edgecore-eap105.bin.qcn9224 $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board.bin
+	$(INSTALL_DATA) ./regdb.bin $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
+	$(INSTALL_DATA) ./board-edgecore-eap105.bin.ipq53xx $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board.bin
+endef
+
 define Package/ath12k-wifi-sercomm-ap72tip/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0
 	$(INSTALL_DATA) ./regdb.bin $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
@@ -61,4 +74,5 @@ endef
 
 $(eval $(call BuildPackage,ath12k-wifi-qcom-qcn9274))
 $(eval $(call BuildPackage,ath12k-wifi-cig-wf189))
+$(eval $(call BuildPackage,ath12k-wifi-edgecore-eap105))
 $(eval $(call BuildPackage,ath12k-wifi-sercomm-ap72tip))

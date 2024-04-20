@@ -17,6 +17,7 @@ platform_do_upgrade() {
 	board=$(board_name)
 	case $board in
 	cig,wf189|\
+	edgecore,eap105|\
 	sercomm,ap72tip|\
 	qcom,ipq9574-ap-al02-c4|\
 	qcom,ipq9574-ap-al02-c15)
