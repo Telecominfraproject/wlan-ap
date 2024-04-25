@@ -1,0 +1,283 @@
+From 920a20927f1537ae2a6ce9c7123ef189e83cd0a0 Mon Sep 17 00:00:00 2001
+From: Evelyn Tsai <evelyn.tsai@mediatek.com>
+Date: Sat, 11 Nov 2023 11:42:59 +0800
+Subject: [PATCH] hostapd: mtk: ACS: Fix 2.4GHz HT40 case and channel switch
+ fail
+
+Issue#1. Add 2.4G HT40- support
+1. Add 2.4G HT40- support
+2. Fix issue: selected best channel is out of channels
+
+Issue#2. Fix chan_switch to usable DFS channel fail due to ACS
+
+Step and issue:
+1. Enable ACS in hostapd config;
+2. Bootup and then use hostapd_cli cmd switch channel to a DFS channel;
+3. Will do ACS again, and no work on channel specified in step 2.
+
+Root cause:
+When need do DFS-CAC, hostapd will do intf disable, then set the new
+channel into running config settings, and finally enable intf;
+In the test case, new DFS channel is set to runnint config settings, but
+another param "acs" is still 1 (enable), caused the ACS running when
+intf enabled.
+---
+ src/ap/acs.c     | 142 ++++++++++++++++++++++++++---------------------
+ src/ap/hostapd.c |   3 +
+ 2 files changed, 83 insertions(+), 62 deletions(-)
+
+diff --git a/src/ap/acs.c b/src/ap/acs.c
+index 130e135..65573b9 100644
+--- a/src/ap/acs.c
++++ b/src/ap/acs.c
+@@ -712,10 +712,19 @@ acs_find_ideal_chan_mode(struct hostapd_iface *iface,
+ 			 struct hostapd_channel_data **ideal_chan,
+ 			 long double *ideal_factor)
+ {
+-	struct hostapd_channel_data *chan, *adj_chan = NULL, *best;
++	struct hostapd_channel_data *chan, *adj_chan = NULL, *tmp_chan = NULL, *best;
+ 	long double factor;
+ 	int i, j;
+ 	unsigned int k;
++	int ht40_plus = 1, sec_ch_factor = 1;
++
++	if (is_24ghz_mode(mode->mode)) {
++		ht40_plus = (iface->conf->secondary_channel == -1) ? 0 : 1;
++		sec_ch_factor = (iface->conf->secondary_channel == -1) ? -1 : 1;
++	}
++
++	wpa_printf(MSG_INFO, "%s:%d, bw(%u), n_chans(%d), num_channels(%d), sec_ch(%d)",
++		__func__, __LINE__, bw, n_chans, mode->num_channels, iface->conf->secondary_channel);
+ 
+ 	for (i = 0; i < mode->num_channels; i++) {
+ 		double total_weight;
+@@ -723,6 +732,9 @@ acs_find_ideal_chan_mode(struct hostapd_iface *iface,
+ 		bool update_best = true;
+ 
+ 		best = chan = &mode->channels[i];
++		wpa_printf(MSG_INFO,
++			   "ACS: Channel[%d] %d: interference_factor %Lg",
++			   i, chan->chan, chan->interference_factor);
+ 
+ 		/* Since in the current ACS implementation the first channel is
+ 		 * always a primary channel, skip channels not available as
+@@ -747,7 +759,7 @@ acs_find_ideal_chan_mode(struct hostapd_iface *iface,
+ 		if (chan->flag & HOSTAPD_CHAN_INDOOR_ONLY && iface->conf->country[2] == 0x4f)
+ 			continue;
+ 
+-		if (!chan_bw_allowed(chan, bw, 1, 1)) {
++		if (!chan_bw_allowed(chan, bw, ht40_plus, 1)) {
+ 			wpa_printf(MSG_DEBUG,
+ 				   "ACS: Channel %d: BW %u is not supported",
+ 				   chan->chan, bw);
+@@ -789,60 +801,73 @@ acs_find_ideal_chan_mode(struct hostapd_iface *iface,
+ 		}
+ 
+ 		factor = 0;
+-		if (acs_usable_chan(chan))
+-			factor = chan->interference_factor;
+-		total_weight = 1;
+-
+-		for (j = 1; j < n_chans; j++) {
+-			adj_chan = acs_find_chan(iface, chan->freq + (j * 20));
+-			if (!adj_chan)
+-				break;
++		total_weight = 0;
+ 
+-			if (!chan_bw_allowed(adj_chan, bw, 1, 0)) {
+-				wpa_printf(MSG_DEBUG,
+-					   "ACS: PRI Channel %d: secondary channel %d BW %u is not supported",
+-					   chan->chan, adj_chan->chan, bw);
+-				break;
+-			}
+-
+-			if (acs_usable_chan(adj_chan)) {
+-				factor += adj_chan->interference_factor;
++		if (!is_24ghz_mode(mode->mode)) {
++			/* If the AP is in the 5 GHz or 6 GHz band, lets prefer a less
++			 * crowded primary channel if one was found in the segment */
++			if (acs_usable_chan(chan)) {
++				factor += chan->interference_factor;
+ 				total_weight += 1;
+-			} else {
+-				update_best = false;
+ 			}
+ 
+-			/* find the best channel in this segment */
+-			if (update_best &&
+-			    adj_chan->interference_factor <
+-			    best->interference_factor)
+-				best = adj_chan;
+-		}
++			for (j = 1; j < n_chans; j++) {
++				adj_chan = acs_find_chan(iface, chan->freq + j * 20);
++				if (!adj_chan)
++					break;
+ 
+-		if (j != n_chans) {
+-			wpa_printf(MSG_DEBUG, "ACS: Channel %d: not enough bandwidth",
+-				   chan->chan);
+-			continue;
+-		}
++				if (!is_in_chanlist(iface, adj_chan) || !is_in_freqlist(iface, adj_chan))
++					break;
+ 
+-		/* If the AP is in the 5 GHz or 6 GHz band, lets prefer a less
+-		 * crowded primary channel if one was found in the segment */
+-		if (iface->current_mode->mode == HOSTAPD_MODE_IEEE80211A &&
+-		    chan != best) {
+-			wpa_printf(MSG_DEBUG,
+-				   "ACS: promoting channel %d over %d (less interference %Lg/%Lg)",
+-				   best->chan, chan->chan,
+-				   chan->interference_factor,
+-				   best->interference_factor);
+-			chan = best;
+-		}
++				if (!chan_bw_allowed(adj_chan, bw, 1, 0)) {
++					wpa_printf(MSG_DEBUG,
++						   "ACS: PRI Channel %d: secondary channel %d BW %u is not supported",
++						   chan->chan, adj_chan->chan, bw);
++					break;
++				}
+ 
+-		/* 2.4 GHz has overlapping 20 MHz channels. Include adjacent
+-		 * channel interference factor. */
+-		if (is_24ghz_mode(mode->mode)) {
++				update_best = true;
++				if (acs_usable_chan(adj_chan)) {
++					factor += adj_chan->interference_factor;
++					total_weight += 1;
++				} else {
++					update_best = false;
++				}
++
++				/* find the best channel in this segment */
++				if (update_best &&
++					adj_chan->interference_factor < best->interference_factor)
++					best = adj_chan;
++			}
++
++			if (j != n_chans) {
++				wpa_printf(MSG_DEBUG, "ACS: Channel %d: not enough bandwidth",
++					   chan->chan);
++				continue;
++			}
++
++			if (chan != best) {
++				wpa_printf(MSG_INFO,
++					   "ACS: promoting channel %d over %d (less interference %Lg/%Lg)",
++					   best->chan, chan->chan,
++					   chan->interference_factor,
++					   best->interference_factor);
++				chan = best;
++			}
++		} else {
+ 			for (j = 0; j < n_chans; j++) {
++				/* Will set primary_channel / secondary_channel(40M case) weight to 1 */
++				tmp_chan = acs_find_chan(iface, chan->freq +
++							 (j * sec_ch_factor * 20));
++				if (tmp_chan && acs_usable_chan(tmp_chan)) {
++					factor += tmp_chan->interference_factor;
++					total_weight += 1;
++				}
++
++				/* 2.4 GHz has overlapping 20 MHz channels. Include adjacent channel
++				interference factor, separately for primary/secondary channel. */
+ 				adj_chan = acs_find_chan(iface, chan->freq +
+-							 (j * 20) - 5);
++							  (j * sec_ch_factor * 20) - 5);
+ 				if (adj_chan && acs_usable_chan(adj_chan)) {
+ 					factor += ACS_ADJ_WEIGHT *
+ 						adj_chan->interference_factor;
+@@ -850,7 +875,7 @@ acs_find_ideal_chan_mode(struct hostapd_iface *iface,
+ 				}
+ 
+ 				adj_chan = acs_find_chan(iface, chan->freq +
+-							 (j * 20) - 10);
++							  (j * sec_ch_factor * 20) - 10);
+ 				if (adj_chan && acs_usable_chan(adj_chan)) {
+ 					factor += ACS_NEXT_ADJ_WEIGHT *
+ 						adj_chan->interference_factor;
+@@ -858,7 +883,7 @@ acs_find_ideal_chan_mode(struct hostapd_iface *iface,
+ 				}
+ 
+ 				adj_chan = acs_find_chan(iface, chan->freq +
+-							 (j * 20) + 5);
++							 (j * sec_ch_factor * 20) + 5);
+ 				if (adj_chan && acs_usable_chan(adj_chan)) {
+ 					factor += ACS_ADJ_WEIGHT *
+ 						adj_chan->interference_factor;
+@@ -866,7 +891,7 @@ acs_find_ideal_chan_mode(struct hostapd_iface *iface,
+ 				}
+ 
+ 				adj_chan = acs_find_chan(iface, chan->freq +
+-							 (j * 20) + 10);
++							 (j * sec_ch_factor * 20) + 10);
+ 				if (adj_chan && acs_usable_chan(adj_chan)) {
+ 					factor += ACS_NEXT_ADJ_WEIGHT *
+ 						adj_chan->interference_factor;
+@@ -875,7 +900,8 @@ acs_find_ideal_chan_mode(struct hostapd_iface *iface,
+ 			}
+ 		}
+ 
+-		factor /= total_weight;
++		if (total_weight)
++			factor /= total_weight;
+ 
+ 		bias = NULL;
+ 		if (iface->conf->acs_chan_bias) {
+@@ -894,11 +920,11 @@ acs_find_ideal_chan_mode(struct hostapd_iface *iface,
+ 
+ 		if (bias) {
+ 			factor *= bias->bias;
+-			wpa_printf(MSG_DEBUG,
++			wpa_printf(MSG_INFO,
+ 				   "ACS:  * channel %d: total interference = %Lg (%f bias)",
+ 				   chan->chan, factor, bias->bias);
+ 		} else {
+-			wpa_printf(MSG_DEBUG,
++			wpa_printf(MSG_INFO,
+ 				   "ACS:  * channel %d: total interference = %Lg",
+ 				   chan->chan, factor);
+ 		}
+@@ -939,14 +965,6 @@ acs_find_ideal_chan(struct hostapd_iface *iface)
+ 		goto bw_selected;
+ 	}
+ 
+-	/* TODO: HT40- support */
+-
+-	if (iface->conf->ieee80211n &&
+-	    iface->conf->secondary_channel == -1) {
+-		wpa_printf(MSG_ERROR, "ACS: HT40- is not supported yet. Please try HT40+");
+-		return NULL;
+-	}
+-
+ 	if (iface->conf->ieee80211n &&
+ 	    iface->conf->secondary_channel)
+ 		n_chans = 2;
+@@ -981,7 +999,7 @@ bw_selected:
+ 	}
+ 
+ 	if (ideal_chan) {
+-		wpa_printf(MSG_DEBUG, "ACS: Ideal channel is %d (%d MHz) with total interference factor of %Lg",
++		wpa_printf(MSG_INFO, "ACS: Ideal channel is %d (%d MHz) with total interference factor of %Lg",
+ 			   ideal_chan->chan, ideal_chan->freq, ideal_factor);
+ 		return ideal_chan;
+ 	}
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index f2eb638..250c168 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -3895,6 +3895,9 @@ hostapd_switch_channel_fallback(struct hostapd_iface *iface,
+ 
+ 	iface->freq = freq_params->freq;
+ 	iface->conf->channel = freq_params->channel;
++	if (iface->conf->channel != 0) /* If channel not zero, will disable acs. */
++		iface->conf->acs = 0;
++
+ 	iface->conf->secondary_channel = freq_params->sec_channel_offset;
+ 	hostapd_set_oper_centr_freq_seg0_idx(iface->conf, seg0_idx);
+ 	hostapd_set_oper_centr_freq_seg1_idx(iface->conf, seg1_idx);
+-- 
+2.18.0
+

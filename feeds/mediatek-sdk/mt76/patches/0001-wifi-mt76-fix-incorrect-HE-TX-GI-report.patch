@@ -1,0 +1,501 @@
+From 04c5f949e2b47ce069c020794d2ac64e73386992 Mon Sep 17 00:00:00 2001
+From: Evelyn Tsai <evelyn.tsai@mediatek.com>
+Date: Thu, 18 May 2023 18:11:37 +0800
+Subject: [PATCH 01/15] wifi: mt76: fix incorrect HE TX GI report
+
+Change GI reporting source from static capability to rate-tuning module.
+
+Signed-off-by: Benjamin Lin <benjamin-jw.lin@mediatek.com>
+---
+ mt76.h          |   4 ++
+ mt7915/init.c   |   4 ++
+ mt7915/mac.c    |  64 ++++++++++++-------
+ mt7915/main.c   |   7 +++
+ mt7915/mcu.c    | 161 ++++++++++++++++++++++++++++++++++++++++++++++++
+ mt7915/mcu.h    |  58 +++++++++++++++++
+ mt7915/mt7915.h |   6 ++
+ 7 files changed, 282 insertions(+), 22 deletions(-)
+
+diff --git a/mt76.h b/mt76.h
+index 1f249581..6282cb64 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -277,12 +277,16 @@ struct mt76_queue_ops {
+ 	void (*reset_q)(struct mt76_dev *dev, struct mt76_queue *q);
+ };
+ 
++#define MT_PHY_TYPE_LEGACY	GENMASK(2, 0)
++#define MT_PHY_TYPE_EXT		GENMASK(7, 3)
++
+ enum mt76_phy_type {
+ 	MT_PHY_TYPE_CCK,
+ 	MT_PHY_TYPE_OFDM,
+ 	MT_PHY_TYPE_HT,
+ 	MT_PHY_TYPE_HT_GF,
+ 	MT_PHY_TYPE_VHT,
++	MT_PHY_TYPE_HE_REMAP,
+ 	MT_PHY_TYPE_HE_SU = 8,
+ 	MT_PHY_TYPE_HE_EXT_SU,
+ 	MT_PHY_TYPE_HE_TB,
+diff --git a/mt7915/init.c b/mt7915/init.c
+index 11c46217..ea96d8dc 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -673,6 +673,8 @@ mt7915_register_ext_phy(struct mt7915_dev *dev, struct mt7915_phy *phy)
+ 	struct mt76_phy *mphy = phy->mt76;
+ 	int ret;
+ 
++	INIT_LIST_HEAD(&phy->stats_list);
++	spin_lock_init(&phy->stats_lock);
+ 	INIT_DELAYED_WORK(&mphy->mac_work, mt7915_mac_work);
+ 
+ 	mt7915_eeprom_parse_hw_cap(dev, phy);
+@@ -1202,6 +1204,8 @@ int mt7915_register_device(struct mt7915_dev *dev)
+ 	dev->phy.dev = dev;
+ 	dev->phy.mt76 = &dev->mt76.phy;
+ 	dev->mt76.phy.priv = &dev->phy;
++	INIT_LIST_HEAD(&dev->phy.stats_list);
++	spin_lock_init(&dev->phy.stats_lock);
+ 	INIT_WORK(&dev->rc_work, mt7915_mac_sta_rc_work);
+ 	INIT_DELAYED_WORK(&dev->mphy.mac_work, mt7915_mac_work);
+ 	INIT_LIST_HEAD(&dev->sta_rc_list);
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index e4536111..9e1cfa6c 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -173,15 +173,7 @@ static void mt7915_mac_sta_poll(struct mt7915_dev *dev)
+ 						       rx_cur);
+ 		}
+ 
+-		/*
+-		 * We don't support reading GI info from txs packets.
+-		 * For accurate tx status reporting and AQL improvement,
+-		 * we need to make sure that flags match so polling GI
+-		 * from per-sta counters directly.
+-		 */
+ 		rate = &msta->wcid.rate;
+-		addr = mt7915_mac_wtbl_lmac_addr(dev, idx, 7);
+-		val = mt76_rr(dev, addr);
+ 
+ 		switch (rate->bw) {
+ 		case RATE_INFO_BW_160:
+@@ -198,18 +190,6 @@ static void mt7915_mac_sta_poll(struct mt7915_dev *dev)
+ 			break;
+ 		}
+ 
+-		if (rate->flags & RATE_INFO_FLAGS_HE_MCS) {
+-			u8 offs = 24 + 2 * bw;
+-
+-			rate->he_gi = (val & (0x3 << offs)) >> offs;
+-		} else if (rate->flags &
+-			   (RATE_INFO_FLAGS_VHT_MCS | RATE_INFO_FLAGS_MCS)) {
+-			if (val & BIT(12 + bw))
+-				rate->flags |= RATE_INFO_FLAGS_SHORT_GI;
+-			else
+-				rate->flags &= ~RATE_INFO_FLAGS_SHORT_GI;
+-		}
+-
+ 		/* get signal strength of resp frames (CTS/BA/ACK) */
+ 		addr = mt7915_mac_wtbl_lmac_addr(dev, idx, 30);
+ 		val = mt76_rr(dev, addr);
+@@ -911,6 +891,7 @@ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ 		info = le32_to_cpu(*cur_info);
+ 		if (info & MT_TX_FREE_PAIR) {
+ 			struct mt7915_sta *msta;
++			struct mt7915_phy *phy;
+ 			u16 idx;
+ 
+ 			idx = FIELD_GET(MT_TX_FREE_WLAN_ID, info);
+@@ -920,11 +901,18 @@ mt7915_mac_tx_free(struct mt7915_dev *dev, void *data, int len)
+ 				continue;
+ 
+ 			msta = container_of(wcid, struct mt7915_sta, wcid);
+-			spin_lock_bh(&mdev->sta_poll_lock);
++			phy = msta->vif->phy;
++			spin_lock_bh(&dev->mt76.sta_poll_lock);
+ 			if (list_empty(&msta->wcid.poll_list))
+ 				list_add_tail(&msta->wcid.poll_list,
+ 					      &mdev->sta_poll_list);
+-			spin_unlock_bh(&mdev->sta_poll_lock);
++			spin_unlock_bh(&dev->mt76.sta_poll_lock);
++
++			spin_lock_bh(&phy->stats_lock);
++			if (list_empty(&msta->stats_list))
++				list_add_tail(&msta->stats_list, &phy->stats_list);
++			spin_unlock_bh(&phy->stats_lock);
++
+ 			continue;
+ 		}
+ 
+@@ -1003,6 +991,7 @@ mt7915_mac_tx_free_v0(struct mt7915_dev *dev, void *data, int len)
+ static void mt7915_mac_add_txs(struct mt7915_dev *dev, void *data)
+ {
+ 	struct mt7915_sta *msta = NULL;
++	struct mt7915_phy *phy;
+ 	struct mt76_wcid *wcid;
+ 	__le32 *txs_data = data;
+ 	u16 wcidx;
+@@ -1038,6 +1027,11 @@ static void mt7915_mac_add_txs(struct mt7915_dev *dev, void *data)
+ 		list_add_tail(&msta->wcid.poll_list, &dev->mt76.sta_poll_list);
+ 	spin_unlock_bh(&dev->mt76.sta_poll_lock);
+ 
++	phy = msta->vif->phy;
++	spin_lock_bh(&phy->stats_lock);
++	if (list_empty(&msta->stats_list))
++		list_add_tail(&msta->stats_list, &phy->stats_list);
++	spin_unlock_bh(&phy->stats_lock);
+ out:
+ 	rcu_read_unlock();
+ }
+@@ -1947,6 +1941,27 @@ static void mt7915_mac_severe_check(struct mt7915_phy *phy)
+ 	phy->trb_ts = trb;
+ }
+ 
++static void mt7915_mac_sta_stats_work(struct mt7915_phy *phy)
++{
++	struct mt7915_sta *sta;
++	LIST_HEAD(list);
++
++	spin_lock_bh(&phy->stats_lock);
++	list_splice_init(&phy->stats_list, &list);
++
++	while (!list_empty(&list)) {
++		sta = list_first_entry(&list, struct mt7915_sta, stats_list);
++		list_del_init(&sta->stats_list);
++		spin_unlock_bh(&phy->stats_lock);
++
++		mt7915_mcu_get_tx_rate(phy, sta->wcid.idx);
++
++		spin_lock_bh(&phy->stats_lock);
++	}
++
++	spin_unlock_bh(&phy->stats_lock);
++}
++
+ void mt7915_mac_sta_rc_work(struct work_struct *work)
+ {
+ 	struct mt7915_dev *dev = container_of(work, struct mt7915_dev, rc_work);
+@@ -2005,6 +2020,11 @@ void mt7915_mac_work(struct work_struct *work)
+ 			mt7915_mcu_muru_debug_get(phy);
+ 	}
+ 
++	if (++phy->stats_work_count == 10) {
++		phy->stats_work_count = 0;
++		mt7915_mac_sta_stats_work(phy);
++	}
++
+ 	mutex_unlock(&mphy->dev->mutex);
+ 
+ 	mt76_tx_status_check(mphy->dev, false);
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 3709d18d..3182fac5 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -751,6 +751,7 @@ int mt7915_mac_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ 
+ 	INIT_LIST_HEAD(&msta->rc_list);
+ 	INIT_LIST_HEAD(&msta->wcid.poll_list);
++	INIT_LIST_HEAD(&msta->stats_list);
+ 	msta->vif = mvif;
+ 	msta->wcid.sta = 1;
+ 	msta->wcid.idx = idx;
+@@ -775,6 +776,7 @@ void mt7915_mac_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ {
+ 	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
+ 	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
++	struct mt7915_phy *phy = msta->vif->phy;
+ 	int i;
+ 
+ 	mt7915_mcu_add_sta(dev, vif, sta, false);
+@@ -791,6 +793,11 @@ void mt7915_mac_sta_remove(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+ 	if (!list_empty(&msta->rc_list))
+ 		list_del_init(&msta->rc_list);
+ 	spin_unlock_bh(&mdev->sta_poll_lock);
++
++	spin_lock_bh(&phy->stats_lock);
++	if (!list_empty(&msta->stats_list))
++		list_del_init(&msta->stats_list);
++	spin_unlock_bh(&phy->stats_lock);
+ }
+ 
+ static void mt7915_tx(struct ieee80211_hw *hw,
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 09badb16..fce152c9 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -3723,6 +3723,167 @@ out:
+ 	return ret;
+ }
+ 
++static int
++mt7915_mcu_parse_tx_gi(struct mt76_dev *dev, u8 mode, u8 gi, u8 bw,
++                       struct rate_info *rate)
++{
++	/* Legacy drivers only use 3 bits for PHY mode. For backward
++	 * compatibility, HE and newer PHY mode indices are remapped
++	 * to the extended bits.
++	 */
++	if (u8_get_bits(mode, MT_PHY_TYPE_LEGACY) == MT_PHY_TYPE_HE_REMAP)
++		mode = u8_get_bits(mode, MT_PHY_TYPE_EXT);
++
++	switch (mode) {
++	case MT_PHY_TYPE_CCK:
++	case MT_PHY_TYPE_OFDM:
++		break;
++	case MT_PHY_TYPE_HT:
++	case MT_PHY_TYPE_HT_GF:
++	case MT_PHY_TYPE_VHT:
++		if (gi)
++			rate->flags |= RATE_INFO_FLAGS_SHORT_GI;
++		break;
++	case MT_PHY_TYPE_HE_SU:
++	case MT_PHY_TYPE_HE_EXT_SU:
++	case MT_PHY_TYPE_HE_TB:
++	case MT_PHY_TYPE_HE_MU:
++		if (!is_mt7915(dev)) {
++			switch (bw) {
++			case MCU_PHY_BW_20:
++				gi = u8_get_bits(gi, HE_GI_BW_20);
++				break;
++			case MCU_PHY_BW_40:
++				gi = u8_get_bits(gi, HE_GI_BW_40);
++				break;
++			case MCU_PHY_BW_80:
++				gi = u8_get_bits(gi, HE_GI_BW_80);
++				break;
++			case MCU_PHY_BW_160:
++				gi = u8_get_bits(gi, HE_GI_BW_160);
++				break;
++			default:
++				return -EINVAL;
++			}
++		}
++
++		if (gi > NL80211_RATE_INFO_HE_GI_3_2)
++			return -EINVAL;
++
++		rate->he_gi = gi;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++int mt7915_mcu_get_tx_rate_v1(struct mt7915_phy *phy, u16 wcidx)
++{
++	struct mt7915_mcu_ra_info_v1 *rate;
++	struct mt7915_dev *dev = phy->dev;
++	struct mt76_phy *mphy = phy->mt76;
++	struct mt76_wcid *wcid;
++	struct sk_buff *skb;
++	int ret;
++
++	struct {
++		__le32 category;
++		u8 wcidx_lo;
++		u8 band;
++		u8 wcidx_hi;
++		u8 rsv[5];
++	} req = {
++		.category = cpu_to_le32(MCU_GET_TX_RATE),
++		.wcidx_lo = to_wcid_lo(wcidx),
++		.band = mphy->band_idx,
++		.wcidx_hi = to_wcid_hi(wcidx)
++	};
++
++	ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_EXT_QUERY(GET_TX_STAT),
++                                        &req, sizeof(req), true, &skb);
++	if (ret)
++		return ret;
++
++	rate = (struct mt7915_mcu_ra_info_v1 *)skb->data;
++	if ((rate->wcidx_hi << 8 | rate->wcidx_lo) != wcidx) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	rcu_read_lock();
++	wcid = rcu_dereference(dev->mt76.wcid[wcidx]);
++	if (!wcid) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++
++	ret = mt7915_mcu_parse_tx_gi(mphy->dev, rate->mode, rate->gi,
++                                     rate->bw, &wcid->rate);
++unlock:
++	rcu_read_unlock();
++out:
++	dev_kfree_skb(skb);
++
++	return ret;
++}
++
++int mt7915_mcu_get_tx_rate_v2(struct mt7915_phy *phy, u16 wcidx)
++{
++	struct mt7915_mcu_ra_info_v2 *rate;
++	struct mt7915_dev *dev = phy->dev;
++	struct mt76_phy *mphy = phy->mt76;
++	struct mt76_wcid *wcid;
++	struct sk_buff *skb;
++	int ret;
++
++	struct {
++		u8 category;
++		u8 band;
++		__le16 wcidx;
++	} req = {
++		.category = MCU_GET_TX_RATE,
++		.band = mphy->band_idx,
++		.wcidx = cpu_to_le16(wcidx)
++	};
++
++	ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_EXT_QUERY(GET_TX_STAT),
++					&req, sizeof(req), true, &skb);
++	if (ret)
++		return ret;
++
++	rate = (struct mt7915_mcu_ra_info_v2 *)skb->data;
++	if (le16_to_cpu(rate->wcidx) != wcidx) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	rcu_read_lock();
++	wcid = rcu_dereference(dev->mt76.wcid[wcidx]);
++	if (!wcid) {
++		ret = -EINVAL;
++		goto unlock;
++	}
++
++	ret = mt7915_mcu_parse_tx_gi(mphy->dev, rate->mode, rate->gi,
++                                     rate->bw, &wcid->rate);
++unlock:
++	rcu_read_unlock();
++out:
++	dev_kfree_skb(skb);
++
++	return ret;
++}
++
++int mt7915_mcu_get_tx_rate(struct mt7915_phy *phy, u16 wcidx)
++{
++	if (is_mt7915(&phy->dev->mt76))
++		return mt7915_mcu_get_tx_rate_v1(phy, wcidx);
++	else
++		return mt7915_mcu_get_tx_rate_v2(phy, wcidx);
++}
++
+ int mt7915_mcu_update_bss_color(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+ 				struct cfg80211_he_bss_color *he_bss_color)
+ {
+diff --git a/mt7915/mcu.h b/mt7915/mcu.h
+index b41ac4aa..8f365461 100644
+--- a/mt7915/mcu.h
++++ b/mt7915/mcu.h
+@@ -152,6 +152,61 @@ struct mt7915_mcu_eeprom_info {
+ 	u8 data[16];
+ } __packed;
+ 
++enum {
++	MCU_PHY_BW_20 = 0,
++	MCU_PHY_BW_40,
++	MCU_PHY_BW_80,
++	MCU_PHY_BW_160,
++	MCU_PHY_BW_10,
++	MCU_PHY_BW_5,
++	MCU_PHY_BW_8080,
++	MCU_PHY_BW_320,
++	MCU_PHY_BW_NUM
++};
++
++#define HE_GI_BW_20	GENMASK(1, 0)
++#define HE_GI_BW_40	GENMASK(3, 2)
++#define HE_GI_BW_80	GENMASK(5, 4)
++#define HE_GI_BW_160	GENMASK(7, 6)
++
++struct mt7915_mcu_ra_info_v1 {
++	u8 wcidx_lo;
++	u8 band;
++	u8 wcidx_hi;
++	u8 rsv1[46];
++
++	u8 mode;
++	u8 flags;
++	u8 stbc;
++	u8 gi;
++	u8 bw;
++	u8 ldpc;
++	u8 mcs;
++	u8 nss;
++	u8 ltf;
++
++	u8 rsv2[8];
++};
++
++struct mt7915_mcu_ra_info_v2 {
++	u8 category;
++	u8 rsv1;
++	__le16 num;
++	__le16 wcidx;
++
++	u8 mode;
++	u8 flags;
++	u8 stbc;
++	u8 gi;
++	u8 bw;
++	u8 ldpc;
++	u8 mcs;
++	u8 nss;
++	u8 ltf;
++
++	u8 rsv2;
++};
++
+ struct mt7915_mcu_phy_rx_info {
+ 	u8 category;
+ 	u8 rate;
+@@ -527,4 +582,7 @@ mt7915_get_power_bound(struct mt7915_phy *phy, s8 txpower)
+ 	return txpower;
+ }
+ 
++enum {
++	MCU_GET_TX_RATE = 4
++};
+ #endif
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 6e79bc65..44950ab1 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -137,6 +137,7 @@ struct mt7915_sta {
+ 	struct mt7915_vif *vif;
+ 
+ 	struct list_head rc_list;
++	struct list_head stats_list;
+ 	u32 airtime_ac[8];
+ 
+ 	int ack_signal;
+@@ -224,6 +225,10 @@ struct mt7915_phy {
+ 	struct mt76_mib_stats mib;
+ 	struct mt76_channel_state state_ts;
+ 
++	u8 stats_work_count;
++	struct list_head stats_list;
++	spinlock_t stats_lock;
++
+ #ifdef CONFIG_NL80211_TESTMODE
+ 	struct {
+ 		u32 *reg_backup;
+@@ -495,6 +500,7 @@ int mt7915_mcu_get_chan_mib_info(struct mt7915_phy *phy, bool chan_switch);
+ int mt7915_mcu_get_temperature(struct mt7915_phy *phy);
+ int mt7915_mcu_set_thermal_throttling(struct mt7915_phy *phy, u8 state);
+ int mt7915_mcu_set_thermal_protect(struct mt7915_phy *phy);
++int mt7915_mcu_get_tx_rate(struct mt7915_phy *phy, u16 wcidx);
+ int mt7915_mcu_get_rx_rate(struct mt7915_phy *phy, struct ieee80211_vif *vif,
+ 			   struct ieee80211_sta *sta, struct rate_info *rate);
+ int mt7915_mcu_rdd_background_enable(struct mt7915_phy *phy,
+-- 
+2.18.0
+

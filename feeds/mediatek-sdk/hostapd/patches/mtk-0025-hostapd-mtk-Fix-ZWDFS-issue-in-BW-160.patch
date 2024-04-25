@@ -1,0 +1,210 @@
+From f723f9502240a9a7df4cc05eab5f5e9dc3b05c4a Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Mon, 20 Mar 2023 16:08:30 +0800
+Subject: [PATCH 25/35] hostapd: mtk: Fix ZWDFS issue in BW 160
+
+When background radar is enabled and bandwidth is set to 160, AP will
+fail to startup due to the lack of non-DFS channel.
+Under this circumstance, AP should perform CAC itself, and the background
+chain could also perform CAC simultaneously.
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+---
+ src/ap/dfs.c | 98 ++++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 79 insertions(+), 19 deletions(-)
+
+diff --git a/src/ap/dfs.c b/src/ap/dfs.c
+index d082fe0..d688ecb 100644
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -69,15 +69,22 @@ static int dfs_get_used_n_chans(struct hostapd_iface *iface, int *seg1)
+ static int dfs_channel_available(struct hostapd_channel_data *chan,
+ 				 enum dfs_channel_type type)
+ {
++	int dfs_status = chan->flag & HOSTAPD_CHAN_DFS_MASK;
++
++	if (chan->flag & HOSTAPD_CHAN_DISABLED)
++		return -1;
++
+ 	if (type == DFS_NO_CAC_YET) {
+ 		/* Select only radar channel where CAC has not been
+ 		 * performed yet
+ 		 */
+-		if ((chan->flag & HOSTAPD_CHAN_RADAR) &&
+-		    (chan->flag & HOSTAPD_CHAN_DFS_MASK) ==
+-		     HOSTAPD_CHAN_DFS_USABLE)
++		if (!(chan->flag & HOSTAPD_CHAN_RADAR))
++			return 0;
++
++		if (dfs_status == HOSTAPD_CHAN_DFS_USABLE)
+ 			return 1;
+-		return 0;
++
++		return -1;
+ 	}
+ 
+ 	/*
+@@ -86,16 +93,14 @@ static int dfs_channel_available(struct hostapd_channel_data *chan,
+ 	 * channel for CSA, unless they are available for immediate use.
+ 	 */
+ 	if (type == DFS_AVAILABLE && (chan->flag & HOSTAPD_CHAN_RADAR) &&
+-	    ((chan->flag & HOSTAPD_CHAN_DFS_MASK) !=
+-	     HOSTAPD_CHAN_DFS_AVAILABLE))
+-		return 0;
++	    (dfs_status != HOSTAPD_CHAN_DFS_AVAILABLE))
++		return -1;
+ 
+-	if (chan->flag & HOSTAPD_CHAN_DISABLED)
+-		return 0;
+ 	if ((chan->flag & HOSTAPD_CHAN_RADAR) &&
+-	    ((chan->flag & HOSTAPD_CHAN_DFS_MASK) ==
+-	     HOSTAPD_CHAN_DFS_UNAVAILABLE))
+-		return 0;
++	    ((dfs_status == HOSTAPD_CHAN_DFS_UNAVAILABLE) ||
++	    (dfs_status == HOSTAPD_CHAN_DFS_UNKNOWN)))
++		return -1;
++
+ 	return 1;
+ }
+ 
+@@ -167,7 +172,7 @@ static int dfs_chan_range_available(struct hostapd_hw_modes *mode,
+ 				    enum dfs_channel_type type)
+ {
+ 	struct hostapd_channel_data *first_chan, *chan;
+-	int i;
++	int i, available = 0, ret = 0;
+ 	u32 bw = num_chan_to_bw(num_chans);
+ 
+ 	if (first_chan_idx + num_chans > mode->num_channels) {
+@@ -203,14 +208,17 @@ static int dfs_chan_range_available(struct hostapd_hw_modes *mode,
+ 			return 0;
+ 		}
+ 
+-		if (!dfs_channel_available(chan, type)) {
++		ret = dfs_channel_available(chan, type);
++		if (ret < 0) {
+ 			wpa_printf(MSG_DEBUG, "DFS: channel not available %d",
+ 				   first_chan->freq + i * 20);
+ 			return 0;
+ 		}
++
++		available |= ret;
+ 	}
+ 
+-	return 1;
++	return available;
+ }
+ 
+ 
+@@ -826,8 +834,12 @@ static unsigned int dfs_get_cac_time(struct hostapd_iface *iface,
+  */
+ int hostapd_handle_dfs(struct hostapd_iface *iface)
+ {
++	struct hostapd_channel_data *channel;
+ 	int res, n_chans, n_chans1, start_chan_idx, start_chan_idx1;
+-	int skip_radar = 0;
++	int sec = 0, skip_radar = 0;
++	u8 cf1 = 0, cf2 = 0;
++	bool use_radar_background = dfs_use_radar_background(iface);
++	enum dfs_channel_type channel_type = DFS_NO_CAC_YET;
+ 
+ 	if (is_6ghz_freq(iface->freq))
+ 		return 1;
+@@ -890,7 +902,7 @@ int hostapd_handle_dfs(struct hostapd_iface *iface)
+ 	/* Finally start CAC */
+ 	hostapd_set_state(iface, HAPD_IFACE_DFS);
+ 	wpa_printf(MSG_DEBUG, "DFS start CAC on %d MHz%s", iface->freq,
+-		   dfs_use_radar_background(iface) ? " (background)" : "");
++		   use_radar_background ? " (background)" : "");
+ 	wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, DFS_EVENT_CAC_START
+ 		"freq=%d chan=%d sec_chan=%d, width=%d, seg0=%d, seg1=%d, cac_time=%ds",
+ 		iface->freq,
+@@ -900,6 +912,16 @@ int hostapd_handle_dfs(struct hostapd_iface *iface)
+ 		hostapd_get_oper_centr_freq_seg1_idx(iface->conf),
+ 		iface->dfs_cac_ms / 1000);
+ 
++	if (use_radar_background) {
++		channel = dfs_get_valid_channel(iface, &sec, &cf1, &cf2, DFS_AVAILABLE);
++		/*
++		 * AP cannot get any random available channel.
++		 * Let AP and dedicated radar chain both perform CAC.
++		 */
++		if (!channel)
++			use_radar_background = false;
++	}
++
+ 	res = hostapd_start_dfs_cac(
+ 		iface, iface->conf->hw_mode, iface->freq, iface->conf->channel,
+ 		iface->conf->ieee80211n, iface->conf->ieee80211ac,
+@@ -908,14 +930,14 @@ int hostapd_handle_dfs(struct hostapd_iface *iface)
+ 		hostapd_get_oper_chwidth(iface->conf),
+ 		hostapd_get_oper_centr_freq_seg0_idx(iface->conf),
+ 		hostapd_get_oper_centr_freq_seg1_idx(iface->conf),
+-		dfs_use_radar_background(iface));
++		use_radar_background);
+ 
+ 	if (res) {
+ 		wpa_printf(MSG_ERROR, "DFS start_dfs_cac() failed, %d", res);
+ 		return -1;
+ 	}
+ 
+-	if (dfs_use_radar_background(iface)) {
++	if (use_radar_background) {
+ 		/* Cache background radar parameters. */
+ 		iface->radar_background.channel = iface->conf->channel;
+ 		iface->radar_background.secondary_channel =
+@@ -936,6 +958,35 @@ int hostapd_handle_dfs(struct hostapd_iface *iface)
+ 
+ 		iface->radar_background.temp_ch = 1;
+ 		return 1;
++	} else if (dfs_use_radar_background(iface)) {
++		if (iface->dfs_domain == HOSTAPD_DFS_REGION_ETSI)
++			channel_type = DFS_ANY_CHANNEL;
++
++		channel = dfs_get_valid_channel(iface, &sec, &cf1, &cf2, channel_type);
++
++		if (!channel ||
++		    (channel->chan == iface->conf->channel &&
++		    cf1 == hostapd_get_oper_centr_freq_seg0_idx(iface->conf) &&
++		    cf2 == hostapd_get_oper_centr_freq_seg1_idx(iface->conf))) {
++			wpa_printf(MSG_ERROR, "Background radar could not get valid channel\n");
++			iface->radar_background.channel = -1;
++			return 0;
++		}
++
++		hostapd_start_dfs_cac(iface, iface->conf->hw_mode,
++				      channel->freq, channel->chan,
++				      iface->conf->ieee80211n,
++				      iface->conf->ieee80211ac,
++				      iface->conf->ieee80211ax,
++				      iface->conf->ieee80211be,
++				      sec, hostapd_get_oper_chwidth(iface->conf),
++				      cf1, cf2, true);
++
++		iface->radar_background.channel = channel->chan;
++		iface->radar_background.freq = channel->freq;
++		iface->radar_background.secondary_channel = sec;
++		iface->radar_background.centr_freq_seg0_idx = cf1;
++		iface->radar_background.centr_freq_seg1_idx = cf2;
+ 	}
+ 
+ 	return 0;
+@@ -1185,6 +1236,15 @@ int hostapd_dfs_complete_cac(struct hostapd_iface *iface, int success, int freq,
+ 				hostapd_setup_interface_complete(iface, 0);
+ 				iface->cac_started = 0;
+ 			}
++
++			/*
++			 * When background radar is enabled but the CAC completion
++			 * is not received from the background chain.
++			 * Then, reset radar background chain.
++			 */
++			if (dfs_use_radar_background(iface) &&
++			    iface->radar_background.channel == -1)
++				hostpad_dfs_update_background_chain(iface);
+ 		}
+ 	} else if (hostapd_dfs_is_background_event(iface, freq)) {
+ 		iface->radar_background.cac_started = 0;
+-- 
+2.18.0
+

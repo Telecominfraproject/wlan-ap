@@ -36,7 +36,7 @@ define Package/unetd
   SECTION:=utils
   CATEGORY:=Base system
   TITLE:=OpenWrt wireguard overlay network configuration service
-  DEPENDS:=+libubox +libubus +libblobmsg-json +libnl-tiny +libunet +libbpf $(BPF_DEPENDS) +(LINUX_5_4||LINUX_4_4):kmod-wireguard-backport +!(LINUX_5_4||LINUX_4_4):kmod-wireguard +wireguard-tools
+  DEPENDS:=+libubox +libubus +libblobmsg-json +libnl-tiny +libunet +libbpf $(BPF_DEPENDS) +(LINUX_5_4||LINUX_4_4):kmod-wireguard-backport +!(LINUX_5_4||LINUX_4_4):kmod-wireguard +wireguard-tools @!TARGET_mediatek
 endef
 
 TARGET_CFLAGS += \

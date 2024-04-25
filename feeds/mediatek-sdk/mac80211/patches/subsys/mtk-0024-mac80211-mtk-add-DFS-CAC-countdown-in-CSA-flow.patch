@@ -1,0 +1,353 @@
+From d10310d3eb842ebc449271b45ad2f47634149385 Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Wed, 15 Nov 2023 15:05:17 +0800
+Subject: [PATCH] mac80211: mtk: add DFS CAC countdown in CSA flow
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+---
+ include/net/cfg80211.h     | 32 +++++++++++++++++
+ net/mac80211/cfg.c         | 45 +++++++++++++++++++++++-
+ net/mac80211/ieee80211_i.h |  2 ++
+ net/mac80211/iface.c       |  2 ++
+ net/mac80211/mlme.c        |  6 +++-
+ net/mac80211/util.c        | 11 +++++-
+ net/wireless/chan.c        | 71 ++++++++++++++++++++++++++++++++++++++
+ net/wireless/nl80211.c     |  5 +--
+ net/wireless/rdev-ops.h    | 17 +++++++++
+ 9 files changed, 186 insertions(+), 5 deletions(-)
+
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index 03f072f..a443b0d 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -4308,6 +4308,10 @@ struct cfg80211_ops {
+ 					 struct net_device *dev,
+ 					 struct cfg80211_chan_def *chandef,
+ 					 u32 cac_time_ms);
++	int	(*start_radar_detection_post_csa)(struct wiphy *wiphy,
++						  struct net_device *dev,
++						  struct cfg80211_chan_def *chandef,
++						  u32 cac_time_ms);
+ 	void	(*end_cac)(struct wiphy *wiphy,
+ 				struct net_device *dev);
+ 	int	(*update_ft_ies)(struct wiphy *wiphy, struct net_device *dev,
+@@ -7796,6 +7800,34 @@ bool cfg80211_reg_can_beacon_relax(struct wiphy *wiphy,
+ 				   struct cfg80211_chan_def *chandef,
+ 				   enum nl80211_iftype iftype);
+ 
++/**
++ * cfg80211_reg_can_beacon_dfs_relax - check if beaconing is allowed with DFS & IR-relaxation
++ * @wiphy: the wiphy
++ * @chandef: the channel definition
++ * @iftype: interface type
++ *
++ * Return: %true if there is no secondary channel or the secondary channel(s)
++ * can be used for beaconing. This version bypasses radar channel check, allowing
++ * channel switch to a USABLE DFS channel and performing CAC after the channel switch.
++ * It also checks if IR-relaxation conditions apply, to allow beaconing under more
++ * permissive conditions.
++ *
++ * Requires the wiphy mutex to be held.
++ */
++bool cfg80211_reg_can_beacon_dfs_relax(struct wiphy *wiphy,
++				       struct cfg80211_chan_def *chandef,
++				       enum nl80211_iftype iftype);
++
++/**
++ * cfg80211_start_radar_detection_post_csa - start radar detection after CSA
++ * @wiphy: the wiphy
++ * @wdev: the wireless device
++ * @chandef: the channel definition to start radar detection on
++ */
++int cfg80211_start_radar_detection_post_csa(struct wiphy *wiphy,
++					    struct wireless_dev *wdev,
++					    struct cfg80211_chan_def *chandef);
++
+ /*
+  * cfg80211_ch_switch_notify - update wdev channel and notify userspace
+  * @dev: the device which switched channels
+diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
+index 56381f8..3e6e903 100644
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -3328,6 +3328,39 @@ static int ieee80211_set_after_csa_beacon(struct ieee80211_sub_if_data *sdata,
+ 	return 0;
+ }
+ 
++void ieee80211_cac_sta_flush_work(struct work_struct *work)
++{
++	struct ieee80211_sub_if_data *sdata =
++		container_of(work, struct ieee80211_sub_if_data,
++			     cac_sta_flush_work);
++
++	__sta_info_flush(sdata, true);
++}
++
++static int ieee80211_start_radar_detection_post_csa(struct wiphy *wiphy,
++						    struct net_device *dev,
++						    struct cfg80211_chan_def *chandef,
++						    u32 cac_time_ms)
++{
++	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
++	struct ieee80211_local *local = sdata->local;
++
++	if (!list_empty(&local->roc_list) || local->scanning)
++		return -EBUSY;
++
++	/* whatever, but channel contexts should not complain about that one */
++	sdata->smps_mode = IEEE80211_SMPS_OFF;
++	sdata->needed_rx_chains = local->rx_chains;
++
++	ieee80211_queue_work(&local->hw, &sdata->cac_sta_flush_work);
++
++	ieee80211_queue_delayed_work(&local->hw,
++				     &sdata->dfs_cac_timer_work,
++				     msecs_to_jiffies(cac_time_ms));
++
++	return 1;
++}
++
+ static int __ieee80211_csa_finalize(struct ieee80211_sub_if_data *sdata)
+ {
+ 	struct ieee80211_local *local = sdata->local;
+@@ -3361,6 +3394,11 @@ static int __ieee80211_csa_finalize(struct ieee80211_sub_if_data *sdata)
+ 					&sdata->csa_chandef))
+ 		return -EINVAL;
+ 
++	err = cfg80211_start_radar_detection_post_csa(local->hw.wiphy, &sdata->wdev,
++						      &sdata->vif.bss_conf.chandef);
++	if (err)
++		return err > 0 ? 0 : err;
++
+ 	sdata->vif.csa_active = false;
+ 
+ 	err = ieee80211_set_after_csa_beacon(sdata, &changed);
+@@ -4538,7 +4576,11 @@ ieee80211_skip_cac(struct wireless_dev *wdev)
+ 
+ 	cancel_delayed_work(&sdata->dfs_cac_timer_work);
+ 	if (wdev->cac_started) {
+-		ieee80211_vif_release_channel(sdata);
++		if (sdata->vif.csa_active)
++			ieee80211_queue_work(&sdata->local->hw,
++					     &sdata->csa_finalize_work);
++		else
++			ieee80211_vif_release_channel(sdata);
+ 		cac_time_ms = wdev->cac_time_ms;
+ 		wdev->cac_start_time = jiffies -
+ 				       msecs_to_jiffies(cac_time_ms + 1);
+@@ -4630,6 +4672,7 @@ const struct cfg80211_ops mac80211_config_ops = {
+ #endif
+ 	.get_channel = ieee80211_cfg_get_channel,
+ 	.start_radar_detection = ieee80211_start_radar_detection,
++	.start_radar_detection_post_csa = ieee80211_start_radar_detection_post_csa,
+ 	.end_cac = ieee80211_end_cac,
+ 	.channel_switch = ieee80211_channel_switch,
+ 	.set_qos_map = ieee80211_set_qos_map,
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 2519c14..bb5906d 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -962,6 +962,7 @@ struct ieee80211_sub_if_data {
+ 	struct mac80211_qos_map __rcu *qos_map;
+ 
+ 	struct work_struct csa_finalize_work;
++	struct work_struct cac_sta_flush_work;
+ 	bool csa_block_tx; /* write-protected by sdata_lock and local->mtx */
+ 	struct cfg80211_chan_def csa_chandef;
+ 
+@@ -1812,6 +1813,7 @@ int ieee80211_mgmt_tx_cancel_wait(struct wiphy *wiphy,
+ void ieee80211_csa_finalize_work(struct work_struct *work);
+ int ieee80211_channel_switch(struct wiphy *wiphy, struct net_device *dev,
+ 			     struct cfg80211_csa_settings *params);
++void ieee80211_cac_sta_flush_work(struct work_struct *work);
+ 
+ #define IEEE80211_BSS_COLOR_AGEOUT_TIME	10
+ #define IEEE80211_BSS_COLOR_MAX		64
+diff --git a/net/mac80211/iface.c b/net/mac80211/iface.c
+index 00b0443..ef32d53 100644
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -463,6 +463,7 @@ static void ieee80211_do_stop(struct ieee80211_sub_if_data *sdata, bool going_do
+ 	sdata_unlock(sdata);
+ 
+ 	cancel_work_sync(&sdata->csa_finalize_work);
++	cancel_work_sync(&sdata->cac_sta_flush_work);
+ 	cancel_work_sync(&sdata->color_change_finalize_work);
+ 
+ 	cancel_delayed_work_sync(&sdata->dfs_cac_timer_work);
+@@ -1749,6 +1750,7 @@ static void ieee80211_setup_sdata(struct ieee80211_sub_if_data *sdata,
+ 	INIT_WORK(&sdata->work, ieee80211_iface_work);
+ 	INIT_WORK(&sdata->recalc_smps, ieee80211_recalc_smps_work);
+ 	INIT_WORK(&sdata->csa_finalize_work, ieee80211_csa_finalize_work);
++	INIT_WORK(&sdata->cac_sta_flush_work, ieee80211_cac_sta_flush_work);
+ 	INIT_WORK(&sdata->color_change_finalize_work, ieee80211_color_change_finalize_work);
+ 	INIT_LIST_HEAD(&sdata->assigned_chanctx_list);
+ 	INIT_LIST_HEAD(&sdata->reserved_chanctx_list);
+diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
+index 48053e4..e9ec32d 100644
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@ -1870,7 +1870,11 @@ void ieee80211_dfs_cac_timer_work(struct work_struct *work)
+ 
+ 	mutex_lock(&sdata->local->mtx);
+ 	if (sdata->wdev.cac_started) {
+-		ieee80211_vif_release_channel(sdata);
++		if (sdata->vif.csa_active)
++			ieee80211_queue_work(&sdata->local->hw,
++					     &sdata->csa_finalize_work);
++		else
++			ieee80211_vif_release_channel(sdata);
+ 		cfg80211_cac_event(sdata->dev, &chandef,
+ 				   NL80211_RADAR_CAC_FINISHED,
+ 				   GFP_KERNEL);
+diff --git a/net/mac80211/util.c b/net/mac80211/util.c
+index 26cd627..e07fe73 100644
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -3873,7 +3873,16 @@ void ieee80211_dfs_cac_cancel(struct ieee80211_local *local)
+ 
+ 		if (sdata->wdev.cac_started) {
+ 			chandef = sdata->vif.bss_conf.chandef;
+-			ieee80211_vif_release_channel(sdata);
++			if (sdata->vif.csa_active) {
++				sdata->vif.csa_active = false;
++				if (sdata->u.ap.next_beacon) {
++					kfree(sdata->u.ap.next_beacon->mbssid_ies);
++					kfree(sdata->u.ap.next_beacon);
++					sdata->u.ap.next_beacon = NULL;
++				}
++			} else {
++				ieee80211_vif_release_channel(sdata);
++			}
+ 			cfg80211_cac_event(sdata->dev,
+ 					   &chandef,
+ 					   NL80211_RADAR_CAC_ABORTED,
+diff --git a/net/wireless/chan.c b/net/wireless/chan.c
+index 9f651f9..88dd69e 100644
+--- a/net/wireless/chan.c
++++ b/net/wireless/chan.c
+@@ -1262,6 +1262,77 @@ bool cfg80211_reg_can_beacon_relax(struct wiphy *wiphy,
+ }
+ EXPORT_SYMBOL(cfg80211_reg_can_beacon_relax);
+ 
++bool cfg80211_reg_can_beacon_dfs_relax(struct wiphy *wiphy,
++				       struct cfg80211_chan_def *chandef,
++				       enum nl80211_iftype iftype)
++{
++	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
++	u32 prohibited_flags = IEEE80211_CHAN_DISABLED |
++			       IEEE80211_CHAN_RADAR;
++
++	lockdep_assert_held(&rdev->wiphy.mtx);
++
++	/* Bypass available and usable dfs channel */
++	if (cfg80211_chandef_dfs_required(wiphy, chandef, iftype) > 0 &&
++	    (cfg80211_chandef_dfs_usable(wiphy, chandef) ||
++	     cfg80211_chandef_dfs_available(wiphy, chandef)))
++		prohibited_flags = IEEE80211_CHAN_DISABLED;
++
++	/* Under certain conditions suggested by some regulatory bodies a
++	 * GO/STA can IR on channels marked with IEEE80211_NO_IR. Set this flag
++	 * only if such relaxations are not enabled and the conditions are not
++	 * met.
++	 */
++	if (!cfg80211_ir_permissive_chan(wiphy, iftype, chandef->chan))
++		prohibited_flags |= IEEE80211_CHAN_NO_IR;
++
++	return cfg80211_chandef_usable(wiphy, chandef, prohibited_flags);
++}
++EXPORT_SYMBOL(cfg80211_reg_can_beacon_dfs_relax);
++
++int cfg80211_start_radar_detection_post_csa(struct wiphy *wiphy,
++					    struct wireless_dev *wdev,
++					    struct cfg80211_chan_def *chandef)
++{
++	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
++	u32 cac_time_ms;
++	enum nl80211_dfs_regions dfs_region;
++	int ret = 0;
++
++	if (cfg80211_chandef_dfs_available(wiphy, chandef))
++		goto out;
++
++	flush_delayed_work(&rdev->dfs_update_channels_wk);
++
++	dfs_region = reg_get_dfs_region(wiphy);
++	if (dfs_region == NL80211_DFS_UNSET)
++		goto out;
++
++	cac_time_ms = cfg80211_chandef_dfs_cac_time(wiphy, chandef);
++	if (WARN_ON(!cac_time_ms))
++		cac_time_ms = IEEE80211_DFS_MIN_CAC_TIME_MS;
++
++	pr_info("%s: region = %u, center freq1 = %u, center freq2 = %u, cac time ms = %u\n",
++		__func__, dfs_region, chandef->center_freq1, chandef->center_freq2, cac_time_ms);
++
++	ret = rdev_start_radar_detection_post_csa(rdev, wdev->netdev, chandef, cac_time_ms);
++	if (ret > 0) {
++		wdev->chandef = *chandef;
++		wdev->cac_started = true;
++		wdev->cac_start_time = jiffies;
++		wdev->cac_time_ms = cac_time_ms;
++		if (rdev->background_cac_started &&
++		    cfg80211_is_sub_chan(chandef, rdev->background_radar_chandef.chan)) {
++			cfg80211_stop_background_radar_detection(rdev->background_radar_wdev);
++		}
++		cfg80211_cac_event(wdev->netdev, chandef, NL80211_RADAR_CAC_STARTED, GFP_KERNEL);
++	}
++
++out:
++	return ret;
++}
++EXPORT_SYMBOL(cfg80211_start_radar_detection_post_csa);
++
+ int cfg80211_set_monitor_channel(struct cfg80211_registered_device *rdev,
+ 				 struct cfg80211_chan_def *chandef)
+ {
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index 97c2833..4883b1f 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -9625,8 +9625,9 @@ skip_beacons:
+ 		cfg80211_set_dfs_state(&rdev->wiphy, &params.chandef, NL80211_DFS_AVAILABLE);
+ 	}
+ 
+-	if (!cfg80211_reg_can_beacon_relax(&rdev->wiphy, &params.chandef,
+-					   wdev->iftype)) {
++	/* handle DFS CAC after CSA is sent */
++	if (!cfg80211_reg_can_beacon_dfs_relax(&rdev->wiphy, &params.chandef,
++					       wdev->iftype)) {
+ 		err = -EINVAL;
+ 		goto free;
+ 	}
+diff --git a/net/wireless/rdev-ops.h b/net/wireless/rdev-ops.h
+index 26f4604..f4d050b 100644
+--- a/net/wireless/rdev-ops.h
++++ b/net/wireless/rdev-ops.h
+@@ -1190,6 +1190,23 @@ rdev_start_radar_detection(struct cfg80211_registered_device *rdev,
+ 	return ret;
+ }
+ 
++static inline int
++rdev_start_radar_detection_post_csa(struct cfg80211_registered_device *rdev,
++				    struct net_device *dev,
++				    struct cfg80211_chan_def *chandef,
++				    u32 cac_time_ms)
++{
++	int ret = -EOPNOTSUPP;
++
++	trace_rdev_start_radar_detection(&rdev->wiphy, dev, chandef,
++					 cac_time_ms);
++	if (rdev->ops->start_radar_detection_post_csa)
++		ret = rdev->ops->start_radar_detection_post_csa(&rdev->wiphy, dev,
++								chandef, cac_time_ms);
++	trace_rdev_return_int(&rdev->wiphy, ret);
++	return ret;
++}
++
+ static inline void
+ rdev_end_cac(struct cfg80211_registered_device *rdev,
+ 	     struct net_device *dev)
+-- 
+2.18.0
+

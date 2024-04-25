@@ -1,0 +1,499 @@
+From 4d7eabd37042f541f085cca6265bd22ae3f05e6e Mon Sep 17 00:00:00 2001
+From: mtk22468 <Xuzhu.Wang@mediatek.com>
+Date: Mon, 18 Sep 2023 10:50:36 +0800
+Subject: [PATCH] ovs add multicast to unicast support
+
+---
+ net/openvswitch/actions.c  |  30 ++++
+ net/openvswitch/datapath.c | 290 +++++++++++++++++++++++++++++++++++++
+ net/openvswitch/datapath.h |  32 ++++
+ net/openvswitch/vport.c    |   8 +
+ net/openvswitch/vport.h    |  26 ++++
+ 5 files changed, 386 insertions(+)
+
+diff --git a/net/openvswitch/actions.c b/net/openvswitch/actions.c
+index 9e8a5c4..e953e62 100644
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@ -919,6 +919,10 @@ static void do_output(struct datapath *dp, struct sk_buff *skb, int out_port,
+ 		      struct sw_flow_key *key)
+ {
+ 	struct vport *vport = ovs_vport_rcu(dp, out_port);
++	struct multicast_data_base *mdb;
++	struct multicast_table *table;
++	struct multicast_table_entry *entry;
++	struct sk_buff *skb_cpy;
+ 
+ 	if (likely(vport)) {
+ 		u16 mru = OVS_CB(skb)->mru;
+@@ -933,6 +937,32 @@ static void do_output(struct datapath *dp, struct sk_buff *skb, int out_port,
+ 
+ 		if (likely(!mru ||
+ 		           (skb->len <= mru + vport->dev->hard_header_len))) {
++			if (is_multicast_addr(skb) && !is_igmp_mld(skb)) {
++				mdb = vport->mdb;
++				spin_lock_bh(&mdb->tbl_lock);
++				list_for_each_entry(table, &mdb->list_head, mdb_node) {
++					if ((key->eth.type == htons(ETH_P_IP) &&
++						table->group_addr.u.ip4 == key->ipv4.addr.dst) ||
++						(key->eth.type == htons(ETH_P_IPV6) &&
++						ipv6_addr_equal(&table->group_addr.u.ip6, &key->ipv6.addr.dst))) {
++						list_for_each_entry(entry, &table->entry_list, entry_node) {
++							skb_cpy = skb_copy(skb, GFP_ATOMIC);
++							if (!skb_cpy) {
++								kfree_skb(skb);
++								pr_err("%s(): skb copy error\n", __func__);
++								spin_unlock_bh(&mdb->tbl_lock);
++								return;
++							}
++							memcpy(skb_cpy->data, entry->eth_addr, ETH_ALEN);
++							ovs_vport_send(vport, skb_cpy, ovs_key_mac_proto(key));
++						}
++						spin_unlock_bh(&mdb->tbl_lock);
++						kfree_skb(skb);
++						return;
++					}
++				}
++				spin_unlock_bh(&mdb->tbl_lock);
++			}
+ 			ovs_vport_send(vport, skb, ovs_key_mac_proto(key));
+ 		} else if (mru <= vport->dev->mtu) {
+ 			struct net *net = read_pnet(&dp->net);
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index 4c537e7..e6787cc 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -11,6 +11,9 @@
+ #include <linux/if_vlan.h>
+ #include <linux/in.h>
+ #include <linux/ip.h>
++#include <linux/igmp.h>
++#include <net/mld.h>
++#include <linux/icmpv6.h>
+ #include <linux/jhash.h>
+ #include <linux/delay.h>
+ #include <linux/time.h>
+@@ -538,6 +541,271 @@ static int queue_userspace_packet(struct datapath *dp, struct sk_buff *skb,
+ 	return err;
+ }
+ 
++static int ovs_multicast_add_group(struct ip_addr *_group_addr,
++									const u8 *entry_addr,
++									struct vport *input_vport)
++{
++	struct multicast_data_base *mdb;
++	struct multicast_table *table;
++	struct multicast_table_entry *entry;
++	int err;
++
++	mdb = input_vport->mdb;
++	spin_lock_bh(&mdb->tbl_lock);
++	list_for_each_entry(table, &mdb->list_head, mdb_node) {
++		if (!memcmp(&table->group_addr.u, &_group_addr->u, sizeof(struct ip_addr))) {
++			list_for_each_entry(entry, &table->entry_list, entry_node) {
++				if (ether_addr_equal(entry->eth_addr, entry_addr))
++					goto out;
++			}
++
++			entry = kzalloc(sizeof(struct multicast_table_entry), GFP_ATOMIC);
++			if (!entry) {
++				err = -ENOMEM;
++				goto err;
++			}
++
++			memcpy(entry->eth_addr, entry_addr, ETH_ALEN);
++			list_add(&entry->entry_node, &table->entry_list);
++			goto out;
++		}
++	}
++
++	table = kzalloc(sizeof(struct multicast_table), GFP_ATOMIC);
++	if (!table) {
++		err = -ENOMEM;
++		goto err;
++	}
++
++	INIT_LIST_HEAD(&table->entry_list);
++	entry = kzalloc(sizeof(struct multicast_table_entry), GFP_ATOMIC);
++	if (!entry) {
++		kfree(table);
++		err = -ENOMEM;
++		goto err;
++	}
++
++	memcpy(entry->eth_addr, entry_addr, ETH_ALEN);
++	list_add(&entry->entry_node, &table->entry_list);
++
++	table->group_addr.u = _group_addr->u;
++	list_add(&table->mdb_node, &mdb->list_head);
++
++out:
++	err = 0;
++err:
++	spin_unlock_bh(&mdb->tbl_lock);
++	return err;
++}
++
++static int ovs_multicast_leave_group(struct ip_addr *_group_addr,
++									const u8 *entry_addr,
++									struct vport *input_vport)
++{
++	struct multicast_data_base *mdb;
++	struct multicast_table *table, *table_tmp;
++	struct multicast_table_entry *entry, *entry_tmp;
++	int err;
++
++	mdb = input_vport->mdb;
++	spin_lock_bh(&mdb->tbl_lock);
++	list_for_each_entry_safe(table, table_tmp, &mdb->list_head, mdb_node) {
++		if (!memcmp(&table->group_addr.u, &_group_addr->u, sizeof(struct ip_addr))) {
++			list_for_each_entry_safe(entry, entry_tmp, &table->entry_list, entry_node) {
++				if (ether_addr_equal(entry->eth_addr, entry_addr)) {
++					list_del(&entry->entry_node);
++					kfree(entry);
++
++					if (list_empty(&table->entry_list)) {
++						list_del(&table->mdb_node);
++						kfree(table);
++					}
++
++					goto out;
++				}
++			}
++		}
++	}
++
++out:
++	err = 0;
++	spin_unlock_bh(&mdb->tbl_lock);
++	return err;
++}
++
++static int ovs_multicast_ipv4_rcv(struct sk_buff *skb, struct vport *input_vport)
++{
++	struct ethhdr *eth_hdr;
++	const u8 *dl_src;
++	struct ip_addr group_addr = {0};
++	struct iphdr *ip_header;
++	struct igmphdr *igmp_header;
++	int i;
++	struct igmpv3_report *igmpv3_hdr;
++	u16 group_num;
++	struct igmpv3_grec *grec;
++	u8 group_type;
++	u8 aux_data_len;
++	u16 num_of_source;
++	int err;
++
++	err = ip_mc_check_igmp(skb);
++	if (err)
++		return 0;
++
++	eth_hdr = skb_eth_hdr(skb);
++	dl_src = eth_hdr->h_source;
++	ip_header = ip_hdr(skb);
++	igmp_header = igmp_hdr(skb);
++
++	switch (igmp_header->type) {
++	case IGMP_HOST_MEMBERSHIP_REPORT:
++	case IGMPV2_HOST_MEMBERSHIP_REPORT:
++		group_addr.u.ip4 = igmp_header->group;
++		if (ipv4_is_local_multicast(group_addr.u.ip4))
++			return 0;
++		ovs_multicast_add_group(&group_addr, dl_src, input_vport);
++		break;
++	case IGMP_HOST_LEAVE_MESSAGE:
++		group_addr.u.ip4 = igmp_header->group;
++		if (ipv4_is_local_multicast(group_addr.u.ip4))
++			return 0;
++		ovs_multicast_leave_group(&group_addr, dl_src, input_vport);
++		break;
++	case IGMPV3_HOST_MEMBERSHIP_REPORT:
++		igmpv3_hdr = (struct igmpv3_report *)igmp_header;
++		group_num = ntohs(igmpv3_hdr->ngrec);
++		grec = igmpv3_hdr->grec;
++
++		for (i = 0; i < group_num; i++) {
++			group_type = grec->grec_type;
++			aux_data_len = grec->grec_auxwords;
++			num_of_source = ntohs(grec->grec_nsrcs);
++			group_addr.u.ip4 = grec->grec_mca;
++			if (ipv4_is_local_multicast(group_addr.u.ip4))
++				return 0;
++
++			if (group_type == IGMPV3_MODE_IS_EXCLUDE ||
++				group_type == IGMPV3_CHANGE_TO_EXCLUDE ||
++				group_type == IGMPV3_ALLOW_NEW_SOURCES)
++				ovs_multicast_add_group(&group_addr, dl_src, input_vport);
++
++			if (group_type == IGMPV3_MODE_IS_INCLUDE ||
++				group_type == IGMPV3_CHANGE_TO_INCLUDE ||
++				group_type == IGMPV3_BLOCK_OLD_SOURCES)
++				if (num_of_source == 0)
++					ovs_multicast_leave_group(&group_addr, dl_src, input_vport);
++
++			grec = (struct igmpv3_grec *)((u8 *)grec + sizeof(struct igmpv3_grec)
++					+ aux_data_len * sizeof(u32));
++		}
++		break;
++	case IGMP_HOST_MEMBERSHIP_QUERY:
++		break;
++	default:
++		pr_warning("%s(): error packet type 0x%x\n", __func__, igmp_header->type);
++		break;
++	}
++	return 0;
++}
++
++static int ovs_multicast_ipv6_rcv(struct sk_buff *skb, struct vport *input_vport)
++{
++	const u8 *dl_src;
++	struct mld_msg *mld_hdr;
++	struct ip_addr group_addr = {0};
++	struct icmp6hdr *icmpv6_hdr;
++	u16 group_num;
++	struct mld2_grec *grec;
++	u8 group_type;
++	u8 aux_data_len;
++	u16 num_of_source;
++	int i;
++	int err;
++
++	err = ipv6_mc_check_mld(skb);
++	if (err)
++		return err;
++
++	mld_hdr = (struct mld_msg *)skb_transport_header(skb);
++	dl_src = skb_eth_hdr(skb)->h_source;
++
++	switch (mld_hdr->mld_type) {
++	case ICMPV6_MGM_REPORT:
++		group_addr.u.ip6 = mld_hdr->mld_mca;
++		if (ipv6_addr_is_ll_all_nodes(&group_addr.u.ip6))
++			return 0;
++		ovs_multicast_add_group(&group_addr, dl_src, input_vport);
++		break;
++	case ICMPV6_MGM_REDUCTION:
++		group_addr.u.ip6 = mld_hdr->mld_mca;
++		if (ipv6_addr_is_ll_all_nodes(&group_addr.u.ip6))
++			return 0;
++		ovs_multicast_leave_group(&group_addr, dl_src, input_vport);
++		break;
++	case ICMPV6_MLD2_REPORT:
++		icmpv6_hdr = icmp6_hdr(skb);
++		group_num = ntohs(icmpv6_hdr->icmp6_dataun.un_data16[1]);
++		grec = (struct mld2_grec *)(skb_transport_header(skb) + sizeof(struct icmp6hdr));
++
++		for (i = 0; i < group_num; i++) {
++			group_type = grec->grec_type;
++			aux_data_len = grec->grec_auxwords;
++			num_of_source = ntohs(grec->grec_nsrcs);
++			group_addr.u.ip6 = grec->grec_mca;
++			if (ipv6_addr_is_ll_all_nodes(&group_addr.u.ip6))
++				return 0;
++
++			if ((group_type == MLD2_MODE_IS_EXCLUDE ||
++				group_type == MLD2_CHANGE_TO_EXCLUDE ||
++				group_type == MLD2_ALLOW_NEW_SOURCES) &&
++				num_of_source == 0)
++				ovs_multicast_add_group(&group_addr, dl_src, input_vport);
++			else if ((group_type == MLD2_MODE_IS_INCLUDE ||
++					group_type == MLD2_CHANGE_TO_INCLUDE ||
++					group_type == MLD2_BLOCK_OLD_SOURCES) &&
++					num_of_source == 0)
++				ovs_multicast_leave_group(&group_addr, dl_src, input_vport);
++			else {
++				pr_info("%s(): group_type(%d), aux_data_len(%d),\
++						num_of_source(%d), group_addr(%pI6)\n",
++						__func__, group_type, aux_data_len,
++						num_of_source, &group_addr.u.ip6);
++				return 0;
++			}
++			grec = (struct mld2_grec *)((u8 *)grec + sizeof(struct mld2_grec)
++										+ aux_data_len * sizeof(u32));
++		}
++		break;
++	case ICMPV6_MGM_QUERY:
++		break;
++	default:
++		pr_warning("%s(): error packet type 0x%x\n", __func__, mld_hdr->mld_type);
++		break;
++	}
++
++	return 0;
++}
++
++static int ovs_multicast_rcv(struct sk_buff *skb, struct vport *input_vport)
++{
++	int ret = 0;
++
++	if (!skb)
++		return -EINVAL;
++
++	switch (skb->protocol) {
++	case htons(ETH_P_IP):
++		ret = ovs_multicast_ipv4_rcv(skb, input_vport);
++		break;
++	case htons(ETH_P_IPV6):
++		ret = ovs_multicast_ipv6_rcv(skb, input_vport);
++		break;
++	}
++
++	return ret;
++}
++
+ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct ovs_header *ovs_header = info->userhdr;
+@@ -612,6 +880,9 @@ static int ovs_packet_cmd_execute(struct sk_buff *skb, struct genl_info *info)
+ 	OVS_CB(packet)->input_vport = input_vport;
+ 	sf_acts = rcu_dereference(flow->sf_acts);
+ 
++	if (is_multicast_addr(packet))
++		ovs_multicast_rcv(packet, input_vport);
++
+ 	local_bh_disable();
+ 	err = ovs_execute_actions(dp, packet, sf_acts, &flow->key);
+ 	local_bh_enable();
+@@ -2199,6 +2470,9 @@ static int ovs_vport_cmd_del(struct sk_buff *skb, struct genl_info *info)
+ 	struct datapath *dp;
+ 	struct vport *vport;
+ 	unsigned int new_headroom;
++	struct multicast_data_base *mdb;
++	struct multicast_table *table, *table_tmp;
++	struct multicast_table_entry *entry, *entry_tmp;
+ 	int err;
+ 
+ 	reply = ovs_vport_cmd_alloc_info();
+@@ -2226,6 +2500,22 @@ static int ovs_vport_cmd_del(struct sk_buff *skb, struct genl_info *info)
+ 	if (netdev_get_fwd_headroom(vport->dev) == dp->max_headroom)
+ 		update_headroom = true;
+ 
++	mdb = vport->mdb;
++	spin_lock_bh(&mdb->tbl_lock);
++	list_for_each_entry_safe(table, table_tmp, &mdb->list_head, mdb_node) {
++		list_for_each_entry_safe(entry, entry_tmp, &table->entry_list, entry_node) {
++			list_del(&entry->entry_node);
++			kfree(entry);
++
++			if (list_empty(&table->entry_list)) {
++				list_del(&table->mdb_node);
++				kfree(table);
++			}
++		}
++	}
++	spin_unlock_bh(&mdb->tbl_lock);
++	kfree(mdb);
++
+ 	netdev_reset_rx_headroom(vport->dev);
+ 	ovs_dp_detach_port(vport);
+ 
+diff --git a/net/openvswitch/datapath.h b/net/openvswitch/datapath.h
+index 81e85dd..6830d3b 100644
+--- a/net/openvswitch/datapath.h
++++ b/net/openvswitch/datapath.h
+@@ -215,6 +215,38 @@ static inline struct datapath *get_dp(struct net *net, int dp_ifindex)
+ 	return dp;
+ }
+ 
++static inline bool is_multicast_addr(struct sk_buff *skb)
++{
++	struct ethhdr *eth_hdr;
++
++	if (!skb)
++		return 0;
++
++	eth_hdr = skb_eth_hdr(skb);
++
++	return (eth_hdr->h_dest[0] == 0x01 && skb->protocol == htons(ETH_P_IP)) ||
++			(eth_hdr->h_dest[0] == 0x33 && skb->protocol == htons(ETH_P_IPV6));
++}
++
++static inline bool is_igmp_mld(struct sk_buff *skb)
++{
++	struct ethhdr *eth_hdr;
++	int err = 0;
++
++	if (!skb)
++		return err;
++
++	eth_hdr = skb_eth_hdr(skb);
++
++	if (skb->protocol == htons(ETH_P_IP)) {
++		err = ip_hdr(skb)->protocol == IPPROTO_IGMP;
++	} else if (skb->protocol == htons(ETH_P_IPV6)) {
++		err = !ipv6_mc_check_mld(skb);
++	}
++
++	return err;
++}
++
+ extern struct notifier_block ovs_dp_device_notifier;
+ extern struct genl_family dp_vport_genl_family;
+ 
+diff --git a/net/openvswitch/vport.c b/net/openvswitch/vport.c
+index 19af0ef..77bc923 100644
+--- a/net/openvswitch/vport.c
++++ b/net/openvswitch/vport.c
+@@ -141,6 +141,14 @@ struct vport *ovs_vport_alloc(int priv_size, const struct vport_ops *ops,
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
++	vport->mdb = kzalloc(sizeof(struct multicast_data_base), GFP_KERNEL);
++	if (!vport->mdb) {
++		kfree(vport);
++		return ERR_PTR(-ENOMEM);
++	}
++	INIT_LIST_HEAD(&vport->mdb->list_head);
++	spin_lock_init(&vport->mdb->tbl_lock);
++
+ 	return vport;
+ }
+ EXPORT_SYMBOL_GPL(ovs_vport_alloc);
+diff --git a/net/openvswitch/vport.h b/net/openvswitch/vport.h
+index 1eb7495..eb69d6c 100644
+--- a/net/openvswitch/vport.h
++++ b/net/openvswitch/vport.h
+@@ -55,6 +55,30 @@ struct vport_portids {
+ 	u32 ids[];
+ };
+ 
++struct ip_addr {
++	union {
++		__be32 ip4;
++		struct in6_addr ip6;
++	} u;
++};
++
++struct multicast_table_entry {
++	struct list_head entry_node;
++	u8 eth_addr[ETH_ALEN];
++};
++
++struct multicast_table {
++	struct list_head mdb_node;
++	struct list_head entry_list;
++	struct ip_addr group_addr;
++};
++
++struct multicast_data_base {
++	struct list_head list_head;
++	spinlock_t tbl_lock;
++};
++
++
+ /**
+  * struct vport - one port within a datapath
+  * @dev: Pointer to net_device.
+@@ -79,6 +103,8 @@ struct vport {
+ 
+ 	struct list_head detach_list;
+ 	struct rcu_head rcu;
++
++	struct multicast_data_base *mdb;
+ };
+ 
+ /**
+-- 
+2.18.0
+
