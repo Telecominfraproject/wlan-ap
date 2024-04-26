@@ -294,7 +294,7 @@ function refresh()
 			let clients = ubus.call(ap, "get_clients").clients;
 			for (let client in clients) {
 				let client_cache = prev_ap_cache[client];
-				if (!client_cache || client_cache.assoc_ie || !client_cache.probe_ie)
+				if (!client_cache || !client_cache.assoc_ie || !client_cache.probe_ie)
 					client_cache = client_refresh(ap, client);
 				global.device_refresh(client);
 			}
