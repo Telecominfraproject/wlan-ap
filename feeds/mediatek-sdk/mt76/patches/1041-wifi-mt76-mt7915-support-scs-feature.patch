@@ -1,0 +1,387 @@
+From 9c8dcebc80801b77b23b0a2af28a3d51662c164f Mon Sep 17 00:00:00 2001
+From: Howard Hsu <howard-yh.hsu@mediatek.com>
+Date: Wed, 6 Dec 2023 08:53:03 +0800
+Subject: [PATCH] wifi: mt76: mt7915: support scs feature
+
+Add support scs feature for connac2 codebase. This commit includes three
+parts.
+1. enable scs feature when interface is up.
+2. support configure scs feature on/off by debugfs scs_enable.
+3. Firmware needs driver to provide the tx_bytes, rx_bytes,
+active_station_number, total throughtput and min rssi of all connected
+stations. In mt76 driver, we run a delayed work to send all must-need
+statistics through mcu command every second.
+
+Please noted that the scs feature is only enable for apsoc is 7986 or
+7981 (WED Rx 2.0).
+
+Signed-off-by: Howard Hsu <howard-yh.hsu@mediatek.com>
+---
+ mt76.h               |   2 +
+ mt76_connac_mcu.h    |   1 +
+ mt7915/init.c        |   1 +
+ mt7915/mac.c         |  11 ++++
+ mt7915/main.c        |  13 +++++
+ mt7915/mcu.c         | 118 +++++++++++++++++++++++++++++++++++++++++++
+ mt7915/mcu.h         |   4 ++
+ mt7915/mt7915.h      |  14 +++++
+ mt7915/mtk_debugfs.c |  24 +++++++++
+ 9 files changed, 188 insertions(+)
+
+diff --git a/mt76.h b/mt76.h
+index cff22f5..7ffba7d 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -311,6 +311,7 @@ struct mt76_sta_stats {
+ 	u64 tx_nss[4];		/* 1, 2, 3, 4 */
+ 	u64 tx_mcs[16];		/* mcs idx */
+ 	u64 tx_bytes;
++	u64 last_tx_bytes;
+ 	/* WED TX */
+ 	u32 tx_packets;		/* unit: MSDU */
+ 	u32 tx_retries;
+@@ -320,6 +321,7 @@ struct mt76_sta_stats {
+ 	u32 rx_packets;
+ 	u32 rx_errors;
+ 	u32 rx_drops;
++	u64 last_rx_bytes;
+ };
+ 
+ enum mt76_wcid_flags {
+diff --git a/mt76_connac_mcu.h b/mt76_connac_mcu.h
+index 94fcf32..247b520 100644
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1236,6 +1236,7 @@ enum {
+ 	MCU_EXT_CMD_SET_RDD_PATTERN = 0x7d,
+ 	MCU_EXT_CMD_MWDS_SUPPORT = 0x80,
+ 	MCU_EXT_CMD_SET_SER_TRIGGER = 0x81,
++	MCU_EXT_CMD_SCS_FEATURE_CTRL = 0x82,
+ 	MCU_EXT_CMD_TWT_AGRT_UPDATE = 0x94,
+ 	MCU_EXT_CMD_FW_DBG_CTRL = 0x95,
+ 	MCU_EXT_CMD_OFFCH_SCAN_CTRL = 0x9a,
+diff --git a/mt7915/init.c b/mt7915/init.c
+index 545afe7..074f247 100644
+--- a/mt7915/init.c
++++ b/mt7915/init.c
+@@ -1248,6 +1248,7 @@ int mt7915_register_device(struct mt7915_dev *dev)
+ 	spin_lock_init(&dev->phy.stats_lock);
+ 	INIT_WORK(&dev->rc_work, mt7915_mac_sta_rc_work);
+ 	INIT_DELAYED_WORK(&dev->mphy.mac_work, mt7915_mac_work);
++	INIT_DELAYED_WORK(&dev->scs_work, mt7915_mcu_scs_sta_poll);
+ 	INIT_LIST_HEAD(&dev->sta_rc_list);
+ 	INIT_LIST_HEAD(&dev->twt_list);
+ 
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 9a49375..2e4a8f8 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1504,6 +1504,8 @@ mt7915_mac_full_reset(struct mt7915_dev *dev)
+ 	if (ext_phy)
+ 		cancel_delayed_work_sync(&ext_phy->mac_work);
+ 
++	cancel_delayed_work_sync(&dev->scs_work);
++
+ 	mutex_lock(&dev->mt76.mutex);
+ 	for (i = 0; i < 10; i++) {
+ 		if (!mt7915_mac_restart(dev))
+@@ -1529,6 +1531,10 @@ mt7915_mac_full_reset(struct mt7915_dev *dev)
+ 		ieee80211_queue_delayed_work(ext_phy->hw,
+ 					     &ext_phy->mac_work,
+ 					     MT7915_WATCHDOG_TIME);
++
++	if (mtk_wed_device_active(&dev->mt76.mmio.wed) &&
++	    mtk_wed_get_rx_capa(&dev->mt76.mmio.wed))
++		ieee80211_queue_delayed_work(mt76_hw(dev), &dev->scs_work, HZ);
+ }
+ 
+ /* system error recovery */
+@@ -1587,6 +1593,7 @@ void mt7915_mac_reset_work(struct work_struct *work)
+ 		set_bit(MT76_RESET, &phy2->mt76->state);
+ 		cancel_delayed_work_sync(&phy2->mt76->mac_work);
+ 	}
++	cancel_delayed_work_sync(&dev->scs_work);
+ 	mt76_worker_disable(&dev->mt76.tx_worker);
+ 	mt76_for_each_q_rx(&dev->mt76, i)
+ 		napi_disable(&dev->mt76.napi[i]);
+@@ -1651,6 +1658,10 @@ void mt7915_mac_reset_work(struct work_struct *work)
+ 					     &phy2->mt76->mac_work,
+ 					     MT7915_WATCHDOG_TIME);
+ 
++	if (mtk_wed_device_active(&dev->mt76.mmio.wed) &&
++	    mtk_wed_get_rx_capa(&dev->mt76.mmio.wed))
++		ieee80211_queue_delayed_work(mt76_hw(dev), &dev->scs_work, HZ);
++
+ 	dev_info(dev->mt76.dev,"\n%s L1 SER recovery completed.",
+ 		 wiphy_name(dev->mt76.hw->wiphy));
+ }
+diff --git a/mt7915/main.c b/mt7915/main.c
+index 2ff7667..2750e60 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -89,12 +89,24 @@ int mt7915_run(struct ieee80211_hw *hw)
+ 	if (ret)
+ 		goto out;
+ 
++	/* Enable SCS if and only if WED Rx (2.0 and after) is supported. */
++	if (mtk_wed_device_active(&dev->mt76.mmio.wed) &&
++	    mtk_wed_get_rx_capa(&dev->mt76.mmio.wed) &&
++	    !mt76_testmode_enabled(phy->mt76)) {
++		ret = mt7915_mcu_set_scs_en(phy, true);
++		if (ret)
++			goto out;
++	}
++
+ 	set_bit(MT76_STATE_RUNNING, &phy->mt76->state);
+ 
+ 	if (!mt76_testmode_enabled(phy->mt76))
+ 		ieee80211_queue_delayed_work(hw, &phy->mt76->mac_work,
+ 					     MT7915_WATCHDOG_TIME);
+ 
++	if (!running && phy->scs_ctrl.scs_enable)
++		ieee80211_queue_delayed_work(hw, &dev->scs_work, HZ);
++
+ 	if (!running)
+ 		mt7915_mac_reset_counters(phy);
+ 
+@@ -135,6 +147,7 @@ static void mt7915_stop(struct ieee80211_hw *hw)
+ 	}
+ 
+ 	if (!mt7915_dev_running(dev)) {
++		cancel_delayed_work_sync(&dev->scs_work);
+ 		mt76_connac_mcu_set_pm(&dev->mt76, dev->phy.mt76->band_idx, 1);
+ 		mt7915_mcu_set_mac(dev, dev->phy.mt76->band_idx, false, false);
+ 	}
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index 1af6dac..aa3f9ad 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -5239,6 +5239,124 @@ int mt7915_mcu_sw_aci_set(struct mt7915_dev *dev, bool val)
+ 				 sizeof(req), NULL);
+ }
+ 
++int mt7915_mcu_set_scs_en(struct mt7915_phy *phy, u8 enable)
++{
++	struct mt7915_dev *dev = phy->dev;
++	struct {
++		__le32 subcmd;
++		u8 band_idx;
++		u8 enable;
++	} __packed req = {
++		.subcmd = cpu_to_le32(SCS_ENABLE),
++		.band_idx = phy->mt76->band_idx,
++		.enable = enable + 1,
++	};
++
++	phy->scs_ctrl.scs_enable = !!enable;
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(SCS_FEATURE_CTRL),
++				 &req, sizeof(req), NULL);
++}
++
++void mt7915_sta_scs_para(void *data, struct ieee80211_sta *sta)
++{
++#define SCS_ACTIVE_STA_CRITERIA_2M 250000
++	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
++	struct mt7915_phy *poll_phy = (struct mt7915_phy *)data;
++	u8 band_idx = msta->wcid.phy_idx;
++	s64 tx_bytes_last_sec, rx_bytes_last_sec;
++	u64 total_bytes_last_sec;
++
++	if (band_idx > MT_BAND1)
++		return;
++
++	tx_bytes_last_sec = (s64)msta->wcid.stats.tx_bytes -
++			    (s64)msta->wcid.stats.last_tx_bytes;
++	rx_bytes_last_sec = (s64)msta->wcid.stats.rx_bytes -
++			    (s64)msta->wcid.stats.last_rx_bytes;
++
++	/**
++	 * Since wo reports rx stats every 900ms, it needs to be converted as
++	 * statistics every one second.
++	 */
++	rx_bytes_last_sec = rx_bytes_last_sec / 9 * 10;
++
++	poll_phy->scs_ctrl.tx_bytes_last_sec += tx_bytes_last_sec;
++	poll_phy->scs_ctrl.rx_bytes_last_sec += rx_bytes_last_sec;
++
++	total_bytes_last_sec = tx_bytes_last_sec + rx_bytes_last_sec;
++	if (total_bytes_last_sec > SCS_ACTIVE_STA_CRITERIA_2M) {
++		poll_phy->scs_ctrl.tput += total_bytes_last_sec >> 17;
++		poll_phy->scs_ctrl.active_sta++;
++	}
++
++	msta->wcid.stats.last_tx_bytes = msta->wcid.stats.tx_bytes;
++	msta->wcid.stats.last_rx_bytes = msta->wcid.stats.rx_bytes;
++
++	if (poll_phy->scs_ctrl.sta_min_rssi > msta->ack_signal)
++		poll_phy->scs_ctrl.sta_min_rssi = msta->ack_signal;
++}
++
++int mt7915_mcu_set_scs_stats(struct mt7915_phy *phy)
++{
++	struct mt7915_dev *dev = phy->dev;
++	struct {
++		__le32 subcmd;
++		u8 band_idx;
++		u8 active_sta;
++		__le16 tput;
++		bool rx_only_mode;
++		u8 __rsv;
++		s8 min_rssi;
++	} __packed req = {
++		.subcmd = cpu_to_le32(SCS_SEND_DATA),
++		.band_idx = phy->mt76->band_idx,
++		.active_sta = phy->scs_ctrl.active_sta,
++		.tput = cpu_to_le16(phy->scs_ctrl.tput),
++		.rx_only_mode = false,
++		.min_rssi = phy->scs_ctrl.sta_min_rssi,
++	};
++
++	/* Rx only mode is that Rx percentage is larger than 90% */
++	if (phy->scs_ctrl.tx_bytes_last_sec < phy->scs_ctrl.rx_bytes_last_sec / 9)
++		req.rx_only_mode = true;
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(SCS_FEATURE_CTRL),
++				 &req, sizeof(req), NULL);
++}
++
++void mt7915_mcu_scs_sta_poll(struct work_struct *work)
++{
++	struct mt7915_dev *dev = container_of(work, struct mt7915_dev,
++					      scs_work.work);
++	struct mt7915_phy *phy;
++	bool scs_enable_flag = false;
++	u8 i;
++
++	for (i = MT_BAND0; i < MT_BAND2; i++) {
++		if (!dev->mt76.phys[i])
++			continue;
++
++		phy = dev->mt76.phys[i]->priv;
++		if (!phy->scs_ctrl.scs_enable ||
++		    !test_bit(MT76_STATE_RUNNING, &phy->mt76->state))
++			continue;
++
++		ieee80211_iterate_stations_atomic(dev->mt76.phys[i]->hw,
++						  mt7915_sta_scs_para, phy);
++
++		mt7915_mcu_set_scs_stats(phy);
++
++		memset(&phy->scs_ctrl, 0, sizeof(phy->scs_ctrl));
++		phy->scs_ctrl.scs_enable = true;
++
++		scs_enable_flag = true;
++	}
++
++	if (scs_enable_flag)
++		ieee80211_queue_delayed_work(mt76_hw(dev), &dev->scs_work, HZ);
++}
++
+ int mt7915_mcu_set_qos_map(struct mt7915_dev *dev, struct ieee80211_vif *vif)
+ {
+ #define IP_DSCP_NUM	64
+diff --git a/mt7915/mcu.h b/mt7915/mcu.h
+index 3089fb6..742a785 100644
+--- a/mt7915/mcu.h
++++ b/mt7915/mcu.h
+@@ -1200,4 +1200,8 @@ struct mt7915_mcu_edcca_info {
+ };
+ #endif
+ 
++enum {
++	SCS_SEND_DATA = 0,
++	SCS_ENABLE = 3,
++};
+ #endif
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 03ec7e2..3daec29 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -270,6 +270,15 @@ struct mt7915_air_monitor_ctrl {
+ };
+ #endif
+ 
++struct mt7915_scs_ctrl {
++	u64 tx_bytes_last_sec;
++	u64 rx_bytes_last_sec;
++	bool scs_enable;
++	s8 sta_min_rssi;
++	u16 tput;
++	u8 active_sta;
++};
++
+ struct mt7915_phy {
+ 	struct mt76_phy *mt76;
+ 	struct mt7915_dev *dev;
+@@ -344,6 +353,7 @@ struct mt7915_phy {
+ 
+ 	struct mt7915_air_monitor_ctrl amnt_ctrl;
+ #endif
++	struct mt7915_scs_ctrl scs_ctrl;
+ };
+ 
+ #ifdef MTK_DEBUG
+@@ -476,6 +486,8 @@ struct mt7915_dev {
+ 	} adie[ADIE_MAX_CNT];
+ #endif
+ 
++	struct delayed_work scs_work;
++
+ 	bool wmm_pbc_enable;
+ 	struct work_struct wmm_pbc_work;
+ 	u32 adie_type;
+@@ -803,6 +815,8 @@ int mt7915_mcu_sw_aci_set(struct mt7915_dev *dev, bool val);
+ int mt7915_mcu_ipi_hist_ctrl(struct mt7915_phy *phy, void *data, u8 cmd, bool wait_resp);
+ int mt7915_mcu_ipi_hist_scan(struct mt7915_phy *phy, void *data, u8 mode, bool wait_resp);
+ int mt7915_mcu_enable_obss_spr(struct mt7915_phy *phy, u8 action, u8 val);
++int mt7915_mcu_set_scs_en(struct mt7915_phy *phy, u8 enable);
++void mt7915_mcu_scs_sta_poll(struct work_struct *work);
+ 
+ #ifdef MTK_DEBUG
+ int mt7915_mtk_init_debugfs(struct mt7915_phy *phy, struct dentry *dir);
+diff --git a/mt7915/mtk_debugfs.c b/mt7915/mtk_debugfs.c
+index dad5ed7..0953223 100644
+--- a/mt7915/mtk_debugfs.c
++++ b/mt7915/mtk_debugfs.c
+@@ -3820,6 +3820,29 @@ mt7915_sr_enable_set(void *data, u64 val)
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_sr_enable, NULL,
+ 			 mt7915_sr_enable_set, "%llx\n");
+ 
++static int
++mt7915_scs_enable_set(void *data, u64 val)
++{
++	struct mt7915_phy *phy = data;
++	int ret;
++
++	/* Enable scs if and only if WED Rx (2.0 and after) is supported */
++	if (!mtk_wed_device_active(&phy->dev->mt76.mmio.wed) ||
++	    !mtk_wed_get_rx_capa(&phy->dev->mt76.mmio.wed))
++		return 0;
++
++	ret = mt7915_mcu_set_scs_en(phy, (u8) val);
++	if (ret)
++		return ret;
++
++	if (phy->scs_ctrl.scs_enable)
++		ieee80211_queue_delayed_work(phy->mt76->hw, &phy->dev->scs_work, HZ);
++
++	return 0;
++}
++DEFINE_DEBUGFS_ATTRIBUTE(fops_scs_enable, NULL,
++			 mt7915_scs_enable_set, "%lld\n");
++
+ int mt7915_mtk_init_debugfs(struct mt7915_phy *phy, struct dentry *dir)
+ {
+ 	struct mt7915_dev *dev = phy->dev;
+@@ -3912,6 +3935,7 @@ int mt7915_mtk_init_debugfs(struct mt7915_phy *phy, struct dentry *dir)
+ 	debugfs_create_file("sw_aci", 0600, dir, dev,
+ 			    &fops_sw_aci);
+ 	debugfs_create_file("sr_enable", 0200, dir, phy, &fops_sr_enable);
++	debugfs_create_file("scs_enable", 0200, dir, phy, &fops_scs_enable);
+ 	return 0;
+ }
+ #endif
+-- 
+2.18.0
+

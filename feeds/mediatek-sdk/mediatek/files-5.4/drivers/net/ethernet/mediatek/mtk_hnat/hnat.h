@@ -1092,8 +1092,13 @@ enum FoeIpAct {
 #define entry_hnat_is_bound(e) (e->bfib1.state == BIND)
 #define entry_hnat_state(e) (e->bfib1.state)
 
-#define skb_hnat_is_hashed(skb)                                                \
+#if defined(CONFIG_MEDIATEK_NETSYS_V2) || defined(CONFIG_MEDIATEK_NETSYS_V3)
+#define skb_hnat_is_hashed(skb)                                                 \
+	(skb_hnat_entry(skb) != 0x7fff && skb_hnat_entry(skb) < hnat_priv->foe_etry_num)
+#else
+#define skb_hnat_is_hashed(skb)                                                 \
 	(skb_hnat_entry(skb) != 0x3fff && skb_hnat_entry(skb) < hnat_priv->foe_etry_num)
+#endif
 #define FROM_GE_LAN_GRP(skb) (FROM_GE_LAN(skb) | FROM_GE_LAN2(skb))
 #define FROM_GE_LAN(skb) (skb_hnat_iface(skb) == FOE_MAGIC_GE_LAN)
 #define FROM_GE_LAN2(skb) (skb_hnat_iface(skb) == FOE_MAGIC_GE_LAN2)

@@ -513,8 +513,6 @@ ar8216_read_port_link(struct ar8xxx_priv *priv, int port,
 	}
 }
 
-#ifdef CONFIG_ETHERNET_PACKET_MANGLE
-
 static struct sk_buff *
 ar8216_mangle_tx(struct net_device *dev, struct sk_buff *skb)
 {
@@ -580,8 +578,6 @@ ar8216_mangle_rx(struct net_device *dev, struct sk_buff *skb)
 	buf[14 + 2] |= vlan >> 8;
 	buf[15 + 2] = vlan & 0xff;
 }
-
-#endif
 
 int
 ar8216_wait_bit(struct ar8xxx_priv *priv, int reg, u32 mask, u32 val)
@@ -891,7 +887,7 @@ ar8216_phy_write(struct ar8xxx_priv *priv, int addr, int regnum, u16 val)
 static int
 ar8229_hw_init(struct ar8xxx_priv *priv)
 {
-	phy_interface_t phy_if_mode;
+	int phy_if_mode;
 
 	if (priv->initialized)
 		return 0;
@@ -899,7 +895,7 @@ ar8229_hw_init(struct ar8xxx_priv *priv)
 	ar8xxx_write(priv, AR8216_REG_CTRL, AR8216_CTRL_RESET);
 	ar8xxx_reg_wait(priv, AR8216_REG_CTRL, AR8216_CTRL_RESET, 0, 1000);
 
-	of_get_phy_mode(priv->pdev->of_node, &phy_if_mode);
+	phy_if_mode = of_get_phy_mode(priv->pdev->of_node);
 
 	if (phy_if_mode == PHY_INTERFACE_MODE_GMII) {
 		ar8xxx_write(priv, AR8229_REG_OPER_MODE0,
@@ -2425,9 +2421,7 @@ static int
 ar8xxx_phy_config_init(struct phy_device *phydev)
 {
 	struct ar8xxx_priv *priv = phydev->priv;
-#ifdef CONFIG_ETHERNET_PACKET_MANGLE
 	struct net_device *dev = phydev->attached_dev;
-#endif
 	int ret;
 
 	if (WARN_ON(!priv))
@@ -2455,15 +2449,13 @@ ar8xxx_phy_config_init(struct phy_device *phydev)
 	if (ret)
 		return ret;
 
-#ifdef CONFIG_ETHERNET_PACKET_MANGLE
 	/* VID fixup only needed on ar8216 */
 	if (chip_is_ar8216(priv)) {
 		dev->phy_ptr = priv;
-		dev->extra_priv_flags |= IFF_NO_IP_ALIGN;
+		dev->priv_flags |= IFF_NO_IP_ALIGN;
 		dev->eth_mangle_rx = ar8216_mangle_rx;
 		dev->eth_mangle_tx = ar8216_mangle_tx;
 	}
-#endif
 
 	return 0;
 }
@@ -2692,12 +2684,10 @@ ar8xxx_phy_detach(struct phy_device *phydev)
 	if (!dev)
 		return;
 
-#ifdef CONFIG_ETHERNET_PACKET_MANGLE
 	dev->phy_ptr = NULL;
-	dev->extra_priv_flags &= ~IFF_NO_IP_ALIGN;
+	dev->priv_flags &= ~IFF_NO_IP_ALIGN;
 	dev->eth_mangle_rx = NULL;
 	dev->eth_mangle_tx = NULL;
-#endif
 }
 
 static void
@@ -2725,6 +2715,13 @@ ar8xxx_phy_remove(struct phy_device *phydev)
 	ar8xxx_free(priv);
 }
 
+static int
+ar8xxx_phy_soft_reset(struct phy_device *phydev)
+{
+	/* we don't need an extra reset */
+	return 0;
+}
+
 static struct phy_driver ar8xxx_phy_driver[] = {
 	{
 		.phy_id		= 0x004d0000,
@@ -2736,6 +2733,7 @@ static struct phy_driver ar8xxx_phy_driver[] = {
 		.config_init	= ar8xxx_phy_config_init,
 		.config_aneg	= ar8xxx_phy_config_aneg,
 		.read_status	= ar8xxx_phy_read_status,
+		.soft_reset	= ar8xxx_phy_soft_reset,
 		.get_features	= ar8xxx_get_features,
 	}
 };

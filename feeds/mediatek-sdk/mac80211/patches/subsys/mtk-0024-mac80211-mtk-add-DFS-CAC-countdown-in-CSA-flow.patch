@@ -1,20 +1,20 @@
-From d10310d3eb842ebc449271b45ad2f47634149385 Mon Sep 17 00:00:00 2001
+From bb918e40dcc7d082f898234cf29cd545de78621e Mon Sep 17 00:00:00 2001
 From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
 Date: Wed, 15 Nov 2023 15:05:17 +0800
 Subject: [PATCH] mac80211: mtk: add DFS CAC countdown in CSA flow
 
 Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
 ---
- include/net/cfg80211.h     | 32 +++++++++++++++++
- net/mac80211/cfg.c         | 45 +++++++++++++++++++++++-
- net/mac80211/ieee80211_i.h |  2 ++
- net/mac80211/iface.c       |  2 ++
- net/mac80211/mlme.c        |  6 +++-
- net/mac80211/util.c        | 11 +++++-
- net/wireless/chan.c        | 71 ++++++++++++++++++++++++++++++++++++++
- net/wireless/nl80211.c     |  5 +--
- net/wireless/rdev-ops.h    | 17 +++++++++
- 9 files changed, 186 insertions(+), 5 deletions(-)
+ include/net/cfg80211.h     | 32 +++++++++++++++
+ net/mac80211/cfg.c         | 84 +++++++++++++++++++++++++++++++++++---
+ net/mac80211/ieee80211_i.h |  2 +
+ net/mac80211/iface.c       |  2 +
+ net/mac80211/mlme.c        |  6 ++-
+ net/mac80211/util.c        | 11 ++++-
+ net/wireless/chan.c        | 72 ++++++++++++++++++++++++++++++++
+ net/wireless/nl80211.c     |  5 ++-
+ net/wireless/rdev-ops.h    | 17 ++++++++
+ 9 files changed, 221 insertions(+), 10 deletions(-)
 
 diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
 index 03f072f..a443b0d 100644
@@ -67,7 +67,7 @@ index 03f072f..a443b0d 100644
   * cfg80211_ch_switch_notify - update wdev channel and notify userspace
   * @dev: the device which switched channels
 diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
-index 56381f8..3e6e903 100644
+index 56381f8..7a30ca6 100644
 --- a/net/mac80211/cfg.c
 +++ b/net/mac80211/cfg.c
 @@ -3328,6 +3328,39 @@ static int ieee80211_set_after_csa_beacon(struct ieee80211_sub_if_data *sdata,
@@ -122,7 +122,78 @@ index 56381f8..3e6e903 100644
  	sdata->vif.csa_active = false;
  
  	err = ieee80211_set_after_csa_beacon(sdata, &changed);
-@@ -4538,7 +4576,11 @@ ieee80211_skip_cac(struct wireless_dev *wdev)
+@@ -3428,6 +3466,11 @@ static int ieee80211_set_csa_beacon(struct ieee80211_sub_if_data *sdata,
+ 
+ 	switch (sdata->vif.type) {
+ 	case NL80211_IFTYPE_AP:
++		if (sdata->u.ap.next_beacon) {
++			kfree(sdata->u.ap.next_beacon->mbssid_ies);
++			kfree(sdata->u.ap.next_beacon);
++			sdata->u.ap.next_beacon = NULL;
++		}
+ 		sdata->u.ap.next_beacon =
+ 			cfg80211_beacon_dup(&params->beacon_after);
+ 		if (!sdata->u.ap.next_beacon)
+@@ -3586,15 +3629,14 @@ __ieee80211_channel_switch(struct wiphy *wiphy, struct net_device *dev,
+ 	if (!list_empty(&local->roc_list) || local->scanning)
+ 		return -EBUSY;
+ 
+-	if (sdata->wdev.cac_started)
+-		return -EBUSY;
+-
+ 	if (cfg80211_chandef_identical(&params->chandef,
+ 				       &sdata->vif.bss_conf.chandef))
+ 		return -EINVAL;
+ 
+-	/* don't allow another channel switch if one is already active. */
+-	if (sdata->vif.csa_active)
++	/* don't allow another channel switch if one is already active
++	 * unless its during post CSA radar detection.
++	 */
++	if (sdata->vif.csa_active && !sdata->wdev.cac_started)
+ 		return -EBUSY;
+ 
+ 	mutex_lock(&local->chanctx_mtx);
+@@ -3646,6 +3688,14 @@ __ieee80211_channel_switch(struct wiphy *wiphy, struct net_device *dev,
+ 		goto out;
+ 	}
+ 
++	/* Finalize CSA immediately if CAC is started during last channel switch */
++	if (sdata->wdev.cac_started) {
++		ieee80211_wake_vif_queues(local, sdata, IEEE80211_QUEUE_STOP_REASON_CSA);
++		cancel_delayed_work(&sdata->dfs_cac_timer_work);
++		sdata->wdev.cac_started = false;
++		changed = 0;
++	}
++
+ 	sdata->csa_chandef = params->chandef;
+ 	sdata->csa_block_tx = params->block_tx;
+ 	sdata->vif.csa_active = true;
+@@ -3661,6 +3711,23 @@ __ieee80211_channel_switch(struct wiphy *wiphy, struct net_device *dev,
+ 		ieee80211_bss_info_change_notify(sdata, changed);
+ 		drv_channel_switch_beacon(sdata, &params->chandef);
+ 	} else {
++		struct ieee80211_sub_if_data *tmp;
++		int n_assigned = 0, n_reserved = 0;
++
++		list_for_each_entry(tmp, &chanctx->assigned_vifs,
++				    assigned_chanctx_list) {
++			n_assigned++;
++			if (tmp->reserved_chanctx)
++				n_reserved++;
++		}
++
++		/* Wait for all interfaces to be ready */
++		if (n_assigned != n_reserved) {
++			sdata->reserved_ready = true;
++			err = 0;
++			goto out;
++		}
++
+ 		/* if the beacon didn't change, we can finalize immediately */
+ 		ieee80211_csa_finalize(sdata);
+ 	}
+@@ -4538,7 +4605,11 @@ ieee80211_skip_cac(struct wireless_dev *wdev)
  
  	cancel_delayed_work(&sdata->dfs_cac_timer_work);
  	if (wdev->cac_started) {
@@ -135,7 +206,7 @@ index 56381f8..3e6e903 100644
  		cac_time_ms = wdev->cac_time_ms;
  		wdev->cac_start_time = jiffies -
  				       msecs_to_jiffies(cac_time_ms + 1);
-@@ -4630,6 +4672,7 @@ const struct cfg80211_ops mac80211_config_ops = {
+@@ -4630,6 +4701,7 @@ const struct cfg80211_ops mac80211_config_ops = {
  #endif
  	.get_channel = ieee80211_cfg_get_channel,
  	.start_radar_detection = ieee80211_start_radar_detection,
@@ -184,7 +255,7 @@ index 00b0443..ef32d53 100644
  	INIT_LIST_HEAD(&sdata->assigned_chanctx_list);
  	INIT_LIST_HEAD(&sdata->reserved_chanctx_list);
 diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
-index 48053e4..e9ec32d 100644
+index 2dbc18c..ed81ebf 100644
 --- a/net/mac80211/mlme.c
 +++ b/net/mac80211/mlme.c
 @@ -1870,7 +1870,11 @@ void ieee80211_dfs_cac_timer_work(struct work_struct *work)
@@ -223,10 +294,10 @@ index 26cd627..e07fe73 100644
  					   &chandef,
  					   NL80211_RADAR_CAC_ABORTED,
 diff --git a/net/wireless/chan.c b/net/wireless/chan.c
-index 9f651f9..88dd69e 100644
+index 9f651f9..f02598b 100644
 --- a/net/wireless/chan.c
 +++ b/net/wireless/chan.c
-@@ -1262,6 +1262,77 @@ bool cfg80211_reg_can_beacon_relax(struct wiphy *wiphy,
+@@ -1262,6 +1262,78 @@ bool cfg80211_reg_can_beacon_relax(struct wiphy *wiphy,
  }
  EXPORT_SYMBOL(cfg80211_reg_can_beacon_relax);
  
@@ -267,10 +338,11 @@ index 9f651f9..88dd69e 100644
 +	enum nl80211_dfs_regions dfs_region;
 +	int ret = 0;
 +
++	/* Update DFS channel state especially when original channel include DFS channel */
++	cfg80211_sched_dfs_chan_update(rdev);
++
 +	if (cfg80211_chandef_dfs_available(wiphy, chandef))
 +		goto out;
-+
-+	flush_delayed_work(&rdev->dfs_update_channels_wk);
 +
 +	dfs_region = reg_get_dfs_region(wiphy);
 +	if (dfs_region == NL80211_DFS_UNSET)

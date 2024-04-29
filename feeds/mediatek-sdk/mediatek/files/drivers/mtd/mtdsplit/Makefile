@@ -1,5 +1,4 @@
 obj-$(CONFIG_MTD_SPLIT)		+= mtdsplit.o
-obj-$(CONFIG_MTD_SPLIT_BCM63XX_FW) += mtdsplit_bcm63xx.o
 obj-$(CONFIG_MTD_SPLIT_BCM_WFI_FW) += mtdsplit_bcm_wfi.o
 obj-$(CONFIG_MTD_SPLIT_CFE_BOOTFS) += mtdsplit_cfe_bootfs.o
 obj-$(CONFIG_MTD_SPLIT_SEAMA_FW) += mtdsplit_seama.o
@@ -15,4 +14,3 @@ obj-$(CONFIG_MTD_SPLIT_WRGG_FW) += mtdsplit_wrgg.o
 obj-$(CONFIG_MTD_SPLIT_MINOR_FW) += mtdsplit_minor.o
 obj-$(CONFIG_MTD_SPLIT_JIMAGE_FW) += mtdsplit_jimage.o
 obj-$(CONFIG_MTD_SPLIT_ELF_FW) += mtdsplit_elf.o
-obj-$(CONFIG_MTD_SPLIT_H3C_VFS) += mtdsplit_h3c_vfs.o

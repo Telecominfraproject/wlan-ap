@@ -608,6 +608,15 @@ int entry_detail(u32 ppe_id, int index)
 			entry->ipv4_hnapt.tport_id,
 			entry->ipv4_hnapt.tops_entry,
 			entry->ipv4_hnapt.cdrt_id);
+		pr_info("usr_info = %d, tid = %d, hf = %d, amsdu = %d\n",
+			entry->ipv4_hnapt.winfo_pao.usr_info,
+			entry->ipv4_hnapt.winfo_pao.tid,
+			entry->ipv4_hnapt.winfo_pao.hf,
+			entry->ipv4_hnapt.winfo_pao.amsdu);
+		pr_info("is_fixedrate = %d, is_prior = %d, is_sp = %d\n",
+			entry->ipv4_hnapt.winfo_pao.is_fixedrate,
+			entry->ipv4_hnapt.winfo_pao.is_prior,
+			entry->ipv4_hnapt.winfo_pao.is_sp);
 #endif
 		pr_info("=========================================\n\n");
 	} else {
@@ -638,17 +647,43 @@ int entry_detail(u32 ppe_id, int index)
 				entry->ipv6_hnapt.tport_id,
 				entry->ipv6_hnapt.tops_entry,
 				entry->ipv6_hnapt.cdrt_id);
-
+			pr_info("usr_info = %d, tid = %d, hf = %d, amsdu = %d\n",
+				entry->ipv6_hnapt.winfo_pao.usr_info,
+				entry->ipv6_hnapt.winfo_pao.tid,
+				entry->ipv6_hnapt.winfo_pao.hf,
+				entry->ipv6_hnapt.winfo_pao.amsdu);
+			pr_info("is_fixedrate = %d, is_prior = %d, is_sp = %d\n",
+				entry->ipv6_hnapt.winfo_pao.is_fixedrate,
+				entry->ipv6_hnapt.winfo_pao.is_prior,
+				entry->ipv6_hnapt.winfo_pao.is_sp);
 		} else if (IS_IPV4_MAPE(entry) || IS_IPV4_MAPT(entry)) {
 			pr_info("tport_id = %d, tops_entry = %d, cdrt_id = %d\n",
 				entry->ipv4_mape.tport_id,
 				entry->ipv4_mape.tops_entry,
 				entry->ipv4_mape.cdrt_id);
+			pr_info("usr_info = %d, tid = %d, hf = %d, amsdu = %d\n",
+				entry->ipv4_mape.winfo_pao.usr_info,
+				entry->ipv4_mape.winfo_pao.tid,
+				entry->ipv4_mape.winfo_pao.hf,
+				entry->ipv4_mape.winfo_pao.amsdu);
+			pr_info("is_fixedrate = %d, is_prior = %d, is_sp = %d\n",
+				entry->ipv4_mape.winfo_pao.is_fixedrate,
+				entry->ipv4_mape.winfo_pao.is_prior,
+				entry->ipv4_mape.winfo_pao.is_sp);
 		} else {
 			pr_info("tport_id = %d, tops_entry = %d, cdrt_id = %d\n",
 				entry->ipv6_5t_route.tport_id,
 				entry->ipv6_5t_route.tops_entry,
 				entry->ipv6_5t_route.cdrt_id);
+			pr_info("usr_info = %d, tid = %d, hf = %d, amsdu = %d\n",
+				entry->ipv6_5t_route.winfo_pao.usr_info,
+				entry->ipv6_5t_route.winfo_pao.tid,
+				entry->ipv6_5t_route.winfo_pao.hf,
+				entry->ipv6_5t_route.winfo_pao.amsdu);
+			pr_info("is_fixedrate = %d, is_prior = %d, is_sp = %d\n",
+				entry->ipv6_5t_route.winfo_pao.is_fixedrate,
+				entry->ipv6_5t_route.winfo_pao.is_prior,
+				entry->ipv6_5t_route.winfo_pao.is_sp);
 		}
 #endif
 		pr_info("=========================================\n\n");
@@ -2805,7 +2840,7 @@ static ssize_t hnat_qos_toggle_write(struct file *file, const char __user *buffe
 		qos_toggle = 1;
 	} else if (buf[0] == '2') {
 		pr_info("Per-port-per-queue mode is going to be enabled!\n");
-		pr_info("PPPQ use qid 0~5 (scheduler 0).\n");
+		pr_info("PPPQ use qid 0~11 (scheduler 0).\n");
 		qos_toggle = 2;
 		qos_dl_toggle = 1;
 		qos_ul_toggle = 1;

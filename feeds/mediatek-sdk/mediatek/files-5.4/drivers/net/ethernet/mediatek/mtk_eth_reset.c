@@ -194,6 +194,27 @@ static void mtk_dump_reg(void *_eth, char *name, u32 offset, u32 range)
 	}
 }
 
+static void mtk_dump_regmap(struct regmap *pmap, char *name,
+			    u32 offset, u32 range)
+{
+	unsigned int cur = offset;
+	unsigned int val1 = 0, val2 = 0, val3 = 0, val4 = 0;
+
+	if (!pmap)
+		return;
+
+	pr_info("\n============ %s ============\n", name);
+	while (cur < offset + range) {
+		regmap_read(pmap, cur, &val1);
+		regmap_read(pmap, cur + 0x4, &val2);
+		regmap_read(pmap, cur + 0x8, &val3);
+		regmap_read(pmap, cur + 0xc, &val4);
+		pr_info("0x%x: %08x %08x %08x %08x\n",
+			cur, val1, val2, val3, val4);
+		cur += 0x10;
+	}
+}
+
 void mtk_dump_netsys_info(void *_eth)
 {
 	struct mtk_eth *eth = _eth;
@@ -211,13 +232,17 @@ void mtk_dump_netsys_info(void *_eth)
 	mtk_dump_reg(eth, "WDMA", WDMA_BASE(0), 0x600);
 	mtk_dump_reg(eth, "PPE", 0x2200, 0x200);
 	mtk_dump_reg(eth, "GMAC", 0x10000, 0x300);
+	mtk_dump_regmap(eth->sgmii->pcs[0].regmap,
+			"SGMII0", 0, 0x1a0);
+	mtk_dump_regmap(eth->sgmii->pcs[1].regmap,
+			"SGMII1", 0, 0x1a0);
 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_NETSYS_V3)) {
 		mtk_dump_reg(eth, "XGMAC0", 0x12000, 0x300);
 		mtk_dump_reg(eth, "XGMAC1", 0x13000, 0x300);
-		mtk_dump_usxgmii(eth->usxgmii->pcs[0].regmap,
-			"USXGMII0", 0, 0x1000);
-		mtk_dump_usxgmii(eth->usxgmii->pcs[1].regmap,
-			"USXGMII1", 0, 0x1000);
+		mtk_dump_regmap(eth->usxgmii->pcs[0].regmap,
+				"USXGMII0", 0, 0x1000);
+		mtk_dump_regmap(eth->usxgmii->pcs[1].regmap,
+				"USXGMII1", 0, 0x1000);
 	}
 }
 

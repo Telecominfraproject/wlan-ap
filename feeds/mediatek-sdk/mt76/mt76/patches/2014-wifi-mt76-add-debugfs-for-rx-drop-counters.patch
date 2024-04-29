@@ -1,0 +1,423 @@
+From 26fb1344b791a77c86f15a3f2f96aa07d68efea3 Mon Sep 17 00:00:00 2001
+From: Peter Chiu <chui-hao.chiu@mediatek.com>
+Date: Wed, 20 Mar 2024 15:14:20 +0800
+Subject: [PATCH 2014/2014] wifi: mt76: add debugfs for rx drop counters
+
+Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
+---
+ agg-rx.c             |  5 +++++
+ dma.c                | 32 ++++++++++++++++++++++-------
+ dma.h                | 14 +++++++------
+ mac80211.c           |  6 ++++++
+ mt76.h               | 37 +++++++++++++++++++++++++++++++++
+ mt7915/mac.c         | 10 +++++++++
+ mt7915/mtk_debugfs.c | 49 ++++++++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 140 insertions(+), 13 deletions(-)
+
+diff --git a/agg-rx.c b/agg-rx.c
+index 07c386c..97a963a 100644
+--- a/agg-rx.c
++++ b/agg-rx.c
+@@ -151,6 +151,7 @@ void mt76_rx_aggr_reorder(struct sk_buff *skb, struct sk_buff_head *frames)
+ 	struct mt76_wcid *wcid = status->wcid;
+ 	struct ieee80211_sta *sta;
+ 	struct mt76_rx_tid *tid;
++	struct mt76_phy *phy;
+ 	bool sn_less;
+ 	u16 seqno, head, size, idx;
+ 	u8 tidno = status->qos_ctl & IEEE80211_QOS_CTL_TID_MASK;
+@@ -177,6 +178,8 @@ void mt76_rx_aggr_reorder(struct sk_buff *skb, struct sk_buff_head *frames)
+ 	if (!tid)
+ 		return;
+ 
++	phy = mt76_dev_phy(tid->dev, wcid->phy_idx);
++
+ 	status->flag |= RX_FLAG_DUP_VALIDATED;
+ 	spin_lock_bh(&tid->lock);
+ 
+@@ -198,6 +201,7 @@ void mt76_rx_aggr_reorder(struct sk_buff *skb, struct sk_buff_head *frames)
+ 	if (sn_less) {
+ 		__skb_unlink(skb, frames);
+ 		dev_kfree_skb(skb);
++		phy->rx_dbg_stats.rx_drop[MT_RX_DROP_AGG_SN_LESS]++;
+ 		goto out;
+ 	}
+ 
+@@ -224,6 +228,7 @@ void mt76_rx_aggr_reorder(struct sk_buff *skb, struct sk_buff_head *frames)
+ 	/* Discard if the current slot is already in use */
+ 	if (tid->reorder_buf[idx]) {
+ 		dev_kfree_skb(skb);
++		phy->rx_dbg_stats.rx_drop[MT_RX_DROP_AGG_DUP]++;
+ 		goto out;
+ 	}
+ 
+diff --git a/dma.c b/dma.c
+index da3e8bc..782463f 100644
+--- a/dma.c
++++ b/dma.c
+@@ -251,13 +251,16 @@ mt76_dma_add_rx_buf(struct mt76_dev *dev, struct mt76_queue *q,
+ 	if (mt76_queue_is_wed_rx(q)) {
+ 		if (!rxwi) {
+ 			rxwi = mt76_get_rxwi(dev);
+-			if (!rxwi)
++			if (!rxwi) {
++				q->rx_drop[MT_RX_DROP_DMAD_GET_RXWI_FAIL]++;
+ 				return -ENOMEM;
++			}
+ 		}
+ 
+ 		rx_token = mt76_rx_token_consume(dev, data, rxwi, buf->addr);
+ 		if (rx_token < 0) {
+ 			mt76_put_rxwi(dev, rxwi);
++			q->rx_drop[MT_RX_DROP_DMAD_GET_TOKEN_FAIL]++;
+ 			return -ENOMEM;
+ 		}
+ 
+@@ -429,6 +432,7 @@ mt76_dma_get_buf(struct mt76_dev *dev, struct mt76_queue *q, int idx,
+ 	struct mt76_desc *desc = &q->desc[idx];
+ 	u32 ctrl, desc_info, buf1;
+ 	void *buf = e->buf;
++	int reason;
+ 
+ 	if (mt76_queue_is_wed_rro_ind(q))
+ 		goto done;
+@@ -444,7 +448,9 @@ mt76_dma_get_buf(struct mt76_dev *dev, struct mt76_queue *q, int idx,
+ 		*info = desc_info;
+ 
+ 	buf1 = le32_to_cpu(desc->buf1);
+-	mt76_dma_should_drop_buf(drop, ctrl, buf1, desc_info);
++	reason = mt76_dma_should_drop_buf(drop, ctrl, buf1, desc_info);
++	if (drop && *drop && reason >= 0)
++		q->rx_drop[reason]++;
+ 
+ 	if (mt76_queue_is_wed_rx(q)) {
+ 		u32 id, find = 0;
+@@ -468,13 +474,17 @@ mt76_dma_get_buf(struct mt76_dev *dev, struct mt76_queue *q, int idx,
+ 			}
+ 
+ 			spin_unlock_bh(&dev->rx_token_lock);
+-			if (!find)
++			if (!find) {
++				q->rx_drop[MT_RX_DROP_DMAD_ADDR_NOT_FOUND]++;
+ 				return NULL;
++			}
+ 		}
+ 
+ 		r = mt76_rx_token_release(dev, token);
+-		if (!r)
++		if (!r) {
++			q->rx_drop[MT_RX_DROP_DMAD_TOKEN_NOT_FOUND]++;
+ 			return NULL;
++		}
+ 
+ 		dma_unmap_single(dev->dma_dev, r->dma_addr,
+ 				 SKB_WITH_OVERHEAD(q->buf_size),
+@@ -490,8 +500,10 @@ mt76_dma_get_buf(struct mt76_dev *dev, struct mt76_queue *q, int idx,
+ 			struct mt76_queue_buf qbuf;
+ 
+ 			buf = page_frag_alloc(&q->rx_page, q->buf_size, GFP_ATOMIC | GFP_DMA32);
+-			if (!buf)
++			if (!buf) {
++				q->rx_drop[MT_RX_DROP_DMAD_NOMEM]++;
+ 				return NULL;
++			}
+ 
+ 			memcpy(buf, r->ptr, SKB_WITH_OVERHEAD(q->buf_size));
+ 
+@@ -501,6 +513,7 @@ mt76_dma_get_buf(struct mt76_dev *dev, struct mt76_queue *q, int idx,
+ 			if (unlikely(dma_mapping_error(dev->dma_dev, r->dma_addr))) {
+ 				skb_free_frag(r->ptr);
+ 				mt76_put_rxwi(dev, r);
++				q->rx_drop[MT_RX_DROP_DMAD_DMA_MAPPING_FAIL]++;
+ 				return NULL;
+ 			}
+ 
+@@ -518,8 +531,11 @@ mt76_dma_get_buf(struct mt76_dev *dev, struct mt76_queue *q, int idx,
+ 			}
+ 		}
+ 
+-		if (drop)
++		if (drop) {
+ 			*drop |= !!(buf1 & MT_DMA_CTL_WO_DROP);
++			if (buf1 & MT_DMA_CTL_WO_DROP)
++				q->rx_drop[MT_RX_DROP_DMAD_WO_FRAG]++;
++		}
+ 	} else {
+ 		dma_unmap_single(dev->dma_dev, e->dma_addr[0],
+ 				 SKB_WITH_OVERHEAD(q->buf_size),
+@@ -968,8 +984,10 @@ mt76_dma_rx_process(struct mt76_dev *dev, struct mt76_queue *q, int budget)
+ 			goto free_frag;
+ 
+ 		skb = build_skb(data, q->buf_size);
+-		if (!skb)
++		if (!skb) {
++			q->rx_drop[MT_RX_DROP_BUILD_SKB_FAIL]++;
+ 			goto free_frag;
++		}
+ 
+ 		skb_reserve(skb, q->buf_offset);
+ 
+diff --git a/dma.h b/dma.h
+index 619dc0f..6b2ee7e 100644
+--- a/dma.h
++++ b/dma.h
+@@ -92,27 +92,29 @@ mt76_dma_reset_tx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ 		mt76_wed_dma_setup(dev, q, true);
+ }
+ 
+-static inline void
++static inline int
+ mt76_dma_should_drop_buf(bool *drop, u32 ctrl, u32 buf1, u32 info)
+ {
+ 	if (!drop)
+-		return;
++		return -1;
+ 
+ 	*drop = !!(ctrl & (MT_DMA_CTL_TO_HOST_A | MT_DMA_CTL_DROP));
+ 	if (!(ctrl & MT_DMA_CTL_VER_MASK))
+-		return;
++		return MT_RX_DROP_DMAD_WO_DROP;
+ 
+ 	switch (FIELD_GET(MT_DMA_WED_IND_REASON, buf1)) {
+ 	case MT_DMA_WED_IND_REASON_REPEAT:
+ 		*drop = true;
+-		break;
++		return MT_RX_DROP_DMAD_RRO_REPEAT;
+ 	case MT_DMA_WED_IND_REASON_OLDPKT:
+ 		*drop = !(info & MT_DMA_INFO_DMA_FRAG);
+-		break;
++		return MT_RX_DROP_DMAD_RRO_OLDPKT;
+ 	default:
+ 		*drop = !!(ctrl & MT_DMA_CTL_PN_CHK_FAIL);
+-		break;
++		return MT_RX_DROP_DMAD_RRO_PN_CHK_FAIL;
+ 	}
++
++	return -1;
+ }
+ 
+ #endif
+diff --git a/mac80211.c b/mac80211.c
+index 225b290..0360172 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -774,6 +774,7 @@ static void mt76_rx_release_amsdu(struct mt76_phy *phy, enum mt76_rxq_id q)
+ 		}
+ 
+ 		if (ether_addr_equal(skb->data + offset, rfc1042_header)) {
++			phy->rx_dbg_stats.rx_drop[MT_RX_DROP_RFC_PKT]++;
+ 			dev_kfree_skb(skb);
+ 			return;
+ 		}
+@@ -811,6 +812,7 @@ void mt76_rx(struct mt76_dev *dev, enum mt76_rxq_id q, struct sk_buff *skb)
+ 
+ 	if (!test_bit(MT76_STATE_RUNNING, &phy->state)) {
+ 		dev_kfree_skb(skb);
++		phy->rx_dbg_stats.rx_drop[MT_RX_DROP_STATE_ERR]++;
+ 		return;
+ 	}
+ 
+@@ -1048,6 +1050,7 @@ mt76_rx_convert(struct mt76_dev *dev, struct sk_buff *skb,
+ {
+ 	struct ieee80211_rx_status *status = IEEE80211_SKB_RXCB(skb);
+ 	struct ieee80211_hdr *hdr = mt76_skb_get_hdr(skb);
++	struct mt76_phy *phy;
+ 	struct mt76_rx_status mstat;
+ 
+ 	mstat = *((struct mt76_rx_status *)skb->cb);
+@@ -1090,6 +1093,9 @@ mt76_rx_convert(struct mt76_dev *dev, struct sk_buff *skb,
+ 
+ 	*sta = wcid_to_sta(mstat.wcid);
+ 	*hw = mt76_phy_hw(dev, mstat.phy_idx);
++
++	phy = mt76_dev_phy(dev, mstat.phy_idx);
++	phy->rx_dbg_stats.rx_to_mac80211++;
+ }
+ 
+ static void
+diff --git a/mt76.h b/mt76.h
+index c1128d1..9be17b7 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -175,6 +175,33 @@ enum mt76_dfs_state {
+ 	MT_DFS_STATE_ACTIVE,
+ };
+ 
++enum {
++	/* Per dev counters*/
++	MT_RX_DROP_DMAD_RRO_REPEAT,
++	MT_RX_DROP_DMAD_RRO_OLDPKT,
++	MT_RX_DROP_DMAD_RRO_PN_CHK_FAIL,
++	MT_RX_DROP_DMAD_WO_FRAG,
++	MT_RX_DROP_DMAD_WO_DROP,
++	MT_RX_DROP_DMAD_ADDR_NOT_FOUND,
++	MT_RX_DROP_DMAD_TOKEN_NOT_FOUND,
++	MT_RX_DROP_DMAD_GET_TOKEN_FAIL,
++	MT_RX_DROP_DMAD_GET_RXWI_FAIL,
++	MT_RX_DROP_DMAD_NOMEM,
++	MT_RX_DROP_DMAD_DMA_MAPPING_FAIL,
++	MT_RX_DROP_BUILD_SKB_FAIL,
++
++	MT_RX_DROP_PER_Q_MAX,
++
++	/* Per phy counters */
++	MT_RX_DROP_RXD_ERR = 0,
++	MT_RX_DROP_STATE_ERR,
++	MT_RX_DROP_RFC_PKT,
++	MT_RX_DROP_AGG_SN_LESS,
++	MT_RX_DROP_AGG_DUP,
++
++	MT_RX_DROP_PER_PHY_MAX,
++};
++
+ struct mt76_queue_buf {
+ 	dma_addr_t addr;
+ 	u16 len;
+@@ -243,6 +270,8 @@ struct mt76_queue {
+ 	dma_addr_t desc_dma;
+ 	struct sk_buff *rx_head;
+ 	struct page_frag_cache rx_page;
++
++	u32 rx_drop[MT_RX_DROP_PER_Q_MAX];
+ };
+ 
+ struct mt76_mcu_ops {
+@@ -870,6 +899,13 @@ struct mt76_tx_debug {
+ 	u32 tx_drop[MT_TX_DROP_MAX];
+ };
+ 
++struct mt76_rx_debug {
++	u32 rx_from_hw;
++	u32 rx_to_mac80211;
++
++	u32 rx_drop[MT_RX_DROP_PER_PHY_MAX];
++};
++
+ struct mt76_phy {
+ 	struct ieee80211_hw *hw;
+ 	struct mt76_dev *dev;
+@@ -928,6 +964,7 @@ struct mt76_phy {
+ 	} leds;
+ 	int tokens;
+ 	struct mt76_tx_debug tx_dbg_stats;
++	struct mt76_rx_debug rx_dbg_stats;
+ };
+ 
+ struct mt76_dev {
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index 1e2ef8c..195b5f6 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -1175,9 +1175,11 @@ void mt7915_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
+ 			 struct sk_buff *skb, u32 *info)
+ {
+ 	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
++	struct mt76_phy *phy;
+ 	__le32 *rxd = (__le32 *)skb->data;
+ 	__le32 *end = (__le32 *)&skb->data[skb->len];
+ 	enum rx_pkt_type type;
++	u8 band_idx;
+ 
+ 	type = le32_get_bits(rxd[0], MT_RXD0_PKT_TYPE);
+ 
+@@ -1206,12 +1208,20 @@ void mt7915_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
+ 		dev_kfree_skb(skb);
+ 		break;
+ 	case PKT_TYPE_NORMAL:
++		band_idx = le32_get_bits(rxd[1], MT_RXD1_NORMAL_BAND_IDX);
++		phy = mt76_dev_phy(mdev, band_idx);
++		phy->rx_dbg_stats.rx_from_hw++;
++
+ 		if (!mt7915_mac_fill_rx(dev, skb, q, info)) {
+ 			mt76_rx(&dev->mt76, q, skb);
+ 			return;
+ 		}
+ 		fallthrough;
+ 	default:
++		band_idx = le32_get_bits(rxd[1], MT_RXD1_NORMAL_BAND_IDX);
++		phy = mt76_dev_phy(mdev, band_idx);
++		phy->rx_dbg_stats.rx_drop[MT_RX_DROP_RXD_ERR]++;
++
+ 		dev_kfree_skb(skb);
+ 		break;
+ 	}
+diff --git a/mt7915/mtk_debugfs.c b/mt7915/mtk_debugfs.c
+index 568ecff..c9b58a2 100644
+--- a/mt7915/mtk_debugfs.c
++++ b/mt7915/mtk_debugfs.c
+@@ -4032,9 +4032,12 @@ static int mt7915_reset_counter(void *data, u64 val)
+ 	struct mt7915_phy *phy = data;
+ 	struct mt7915_dev *dev = phy->dev;
+ 	struct mt76_wcid *wcid;
++	u8 qid = phy->mt76->band_idx ? MT_RXQ_BAND1 : MT_RXQ_MAIN;
+ 
+ 	if (!dev->wlan_idx) {
+ 		memset(&phy->mt76->tx_dbg_stats, 0, sizeof(struct mt76_tx_debug));
++		memset(&phy->mt76->rx_dbg_stats, 0, sizeof(struct mt76_rx_debug));
++		memset(&dev->mt76.q_rx[qid].rx_drop, 0, sizeof(u32) * MT_RX_DROP_PER_Q_MAX);
+ 
+ 		return 0;
+ 	}
+@@ -4122,6 +4125,51 @@ mt7915_tx_drop_show(struct seq_file *s, void *data)
+ 
+ DEFINE_SHOW_ATTRIBUTE(mt7915_tx_drop);
+ 
++static int
++mt7915_rx_drop_show(struct seq_file *s, void *data)
++{
++	struct mt7915_phy *phy = s->private;
++	struct mt7915_dev *dev = phy->dev;
++	struct mt76_rx_debug *stats = &phy->mt76->rx_dbg_stats;
++	struct mt76_queue *q;
++	u8 band_idx = phy->mt76->band_idx;
++	u8 qid = band_idx ? MT_RXQ_BAND1 : MT_RXQ_MAIN;
++
++	q = &dev->mt76.q_rx[qid];
++
++#define __pr(src, t) seq_printf(s, "Drop due to %s: %d\n", \
++				#t, src->rx_drop[MT_RX_DROP_##t])
++	seq_printf(s, "RXQ%d drop:\n", MT_RXQ_ID(qid));
++	__pr(q, DMAD_RRO_REPEAT);
++	__pr(q, DMAD_RRO_OLDPKT);
++	__pr(q, DMAD_RRO_PN_CHK_FAIL);
++	__pr(q, DMAD_WO_FRAG);
++	__pr(q, DMAD_WO_DROP);
++	__pr(q, DMAD_ADDR_NOT_FOUND);
++	__pr(q, DMAD_TOKEN_NOT_FOUND);
++	__pr(q, DMAD_GET_TOKEN_FAIL);
++	__pr(q, DMAD_GET_RXWI_FAIL);
++	__pr(q, DMAD_NOMEM);
++	__pr(q, DMAD_DMA_MAPPING_FAIL);
++	__pr(q, BUILD_SKB_FAIL);
++
++	seq_printf(s, "\nPhy%d receive from hw: %d\n", band_idx, stats->rx_from_hw);
++	seq_printf(s, "Phy%d send to mac80211: %d\n", band_idx, stats->rx_to_mac80211);
++
++	seq_printf(s, "\nPhy%d drop:\n", band_idx);
++	__pr(stats, RXD_ERR);
++	__pr(stats, STATE_ERR);
++	__pr(stats, RFC_PKT);
++	__pr(stats, AGG_SN_LESS);
++	__pr(stats, AGG_DUP);
++
++#undef __pr
++
++	return 0;
++}
++
++DEFINE_SHOW_ATTRIBUTE(mt7915_rx_drop);
++
+ int mt7915_mtk_init_debugfs(struct mt7915_phy *phy, struct dentry *dir)
+ {
+ 	struct mt7915_dev *dev = phy->dev;
+@@ -4222,6 +4270,7 @@ int mt7915_mtk_init_debugfs(struct mt7915_phy *phy, struct dentry *dir)
+ 	debugfs_create_file("reset_counter", 0200, dir, phy, &fops_reset_counter);
+ 	debugfs_create_devm_seqfile(dev->mt76.dev, "per", dir, mt7915_per_read);
+ 	debugfs_create_file("tx_drop_stats", 0400, dir, phy, &mt7915_tx_drop_fops);
++	debugfs_create_file("rx_drop_stats", 0400, dir, phy, &mt7915_rx_drop_fops);
+ 
+ 	return 0;
+ }
+-- 
+2.18.0
+

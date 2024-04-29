@@ -19,7 +19,9 @@
 #define MTK_QDMA_PAGE_SIZE	2048
 #define	MTK_MAX_RX_LENGTH	1536
 #define MTK_MIN_TX_LENGTH	60
-#define MTK_DMA_SIZE		2048
+#define MTK_DMA_SIZE(x)		(SZ_##x)
+#define MTK_FQ_DMA_HEAD		32
+#define MTK_FQ_DMA_LENGTH	2048
 #define MTK_NAPI_WEIGHT		256
 
 #if defined(CONFIG_MEDIATEK_NETSYS_V3)
@@ -175,6 +177,7 @@
 
 /* GDM and CDM Threshold */
 #define MTK_GDM2_THRES		0x1530
+#define MTK_CDM2_THRES		0x1534
 #define MTK_CDMW0_THRES		0x164c
 #define MTK_CDMW1_THRES		0x1650
 #define MTK_CDME0_THRES		0x1654
@@ -453,6 +456,7 @@
 #define MTK_RX_BT_32DWORDS	(3 << 11)
 #define MTK_NDP_CO_PRO		BIT(10)
 #define MTK_TX_WB_DDONE		BIT(6)
+#define MTK_DMA_SIZE_MASK	GENMASK(5, 4)
 #define MTK_DMA_SIZE_16DWORDS	(2 << 4)
 #define MTK_DMA_SIZE_32DWORDS	(3 << 4)
 #define MTK_RX_DMA_BUSY		BIT(3)
@@ -745,6 +749,7 @@
 #define MAC_MCR_FORCE_MODE	BIT(15)
 #define MAC_MCR_TX_EN		BIT(14)
 #define MAC_MCR_RX_EN		BIT(13)
+#define MAC_MCR_PRMBL_LMT_EN	BIT(10)
 #define MAC_MCR_BACKOFF_EN	BIT(9)
 #define MAC_MCR_BACKPR_EN	BIT(8)
 #define MAC_MCR_FORCE_EEE1000	BIT(7)
@@ -1718,6 +1723,9 @@ struct mtk_soc_data {
 	struct {
 		u32	txd_size;
 		u32	rxd_size;
+		u32	tx_dma_size;
+		u32	rx_dma_size;
+		u32	fq_dma_size;
 		u32	rx_dma_l4_valid;
 		u32	dma_max_len;
 		u32	dma_len_offset;
@@ -1900,7 +1908,7 @@ struct mtk_eth {
 	void				*scratch_ring;
 	struct mtk_reset_event		reset_event;
 	dma_addr_t			phy_scratch_ring;
-	void				*scratch_head;
+	void				*scratch_head[MTK_FQ_DMA_HEAD];
 	struct clk			*clks[MTK_CLK_MAX];
 
 	struct mii_bus			*mii_bus;
@@ -1991,7 +1999,6 @@ int mtk_mac2xgmii_id(struct mtk_eth *eth, int mac_id);
 struct phylink_pcs *mtk_usxgmii_select_pcs(struct mtk_usxgmii *ss, int id);
 int mtk_usxgmii_init(struct mtk_eth *eth, struct device_node *r);
 int mtk_toprgu_init(struct mtk_eth *eth, struct device_node *r);
-int mtk_dump_usxgmii(struct regmap *pmap, char *name, u32 offset, u32 range);
 void mtk_usxgmii_link_poll(struct work_struct *work);
 
 void mtk_eth_set_dma_device(struct mtk_eth *eth, struct device *dma_dev);

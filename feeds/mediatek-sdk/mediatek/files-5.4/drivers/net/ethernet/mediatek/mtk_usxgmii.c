@@ -187,6 +187,8 @@ void mtk_usxgmii_setup_phya_usxgmii(struct mtk_usxgmii_pcs *mpcs)
 	regmap_update_bits(mpcs->regmap_pextp, 0x0070, GENMASK(31, 0),
 			   0x02002800);
 	ndelay(1020);
+	regmap_update_bits(mpcs->regmap_pextp, 0x3040, GENMASK(31, 0),
+			   0x20000000);
 	/* Setup DA default value */
 	regmap_update_bits(mpcs->regmap_pextp, 0x30B0, GENMASK(31, 0),
 			   0x00000020);
@@ -299,6 +301,8 @@ void mtk_usxgmii_setup_phya_5gbaser(struct mtk_usxgmii_pcs *mpcs)
 	regmap_update_bits(mpcs->regmap_pextp, 0x0070, GENMASK(31, 0),
 			   0x02002800);
 	ndelay(1020);
+	regmap_update_bits(mpcs->regmap_pextp, 0x3040, GENMASK(31, 0),
+			   0x20000000);
 	/* Setup DA default value */
 	regmap_update_bits(mpcs->regmap_pextp, 0x30B0, GENMASK(31, 0),
 			   0x00000020);
@@ -411,6 +415,8 @@ void mtk_usxgmii_setup_phya_10gbaser(struct mtk_usxgmii_pcs *mpcs)
 	regmap_update_bits(mpcs->regmap_pextp, 0x0070, GENMASK(31, 0),
 			   0x02002800);
 	ndelay(1020);
+	regmap_update_bits(mpcs->regmap_pextp, 0x3040, GENMASK(31, 0),
+			   0x20000000);
 	/* Setup DA default value */
 	regmap_update_bits(mpcs->regmap_pextp, 0x30B0, GENMASK(31, 0),
 			   0x00000020);
@@ -763,6 +769,7 @@ static void mtk_usxgmii_pcs_link_up(struct phylink_pcs *pcs, unsigned int mode,
 {
 	struct mtk_usxgmii_pcs *mpcs = pcs_to_mtk_usxgmii_pcs(pcs);
 	unsigned long t_start = jiffies;
+	unsigned int mpcs_mode;
 
 	/* Reconfiguring USXGMII to ensure the quality of the RX signal
 	 * after the line side link up.
@@ -776,7 +783,11 @@ static void mtk_usxgmii_pcs_link_up(struct phylink_pcs *pcs, unsigned int mode,
 		if (mtk_usxgmii_link_status(mpcs))
 			return;
 
-		if (mpcs->mode == MLO_AN_PHY)
+		spin_lock(&mpcs->regmap_lock);
+		mpcs_mode = mpcs->mode;
+		spin_unlock(&mpcs->regmap_lock);
+
+		if (mpcs_mode != MLO_AN_INBAND)
 			mtk_usxgmii_pcs_config(&mpcs->pcs, mode,
 						interface, NULL, false);
 	} while (time_before(jiffies, t_start + msecs_to_jiffies(3000)));
@@ -836,23 +847,3 @@ struct phylink_pcs *mtk_usxgmii_select_pcs(struct mtk_usxgmii *ss, int id)
 
 	return &ss->pcs[id].pcs;
 }
-
-int mtk_dump_usxgmii(struct regmap *pmap, char *name, u32 offset, u32 range)
-{
-	unsigned int cur = offset;
-	unsigned int val1 = 0, val2 = 0, val3 = 0, val4 = 0;
-
-	pr_info("\n============ %s ============ pmap:%lx\n",
-		name, (unsigned long)pmap);
-	while (cur < offset + range) {
-		regmap_read(pmap, cur, &val1);
-		regmap_read(pmap, cur + 0x4, &val2);
-		regmap_read(pmap, cur + 0x8, &val3);
-		regmap_read(pmap, cur + 0xc, &val4);
-		pr_info("0x%x: %08x %08x %08x %08x\n", cur,
-			val1, val2, val3, val4);
-		cur += 0x10;
-	}
-	return 0;
-}
-

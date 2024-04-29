@@ -35,6 +35,7 @@ MODULE_LICENSE("GPL");
  * GPIO3  <-> BASE_T_LED2,
  **************************/
 /* User-defined.B */
+/*#define AIR_MD32_FW_CHECK*/
 #define AIR_LED_SUPPORT
 #ifdef AIR_LED_SUPPORT
 static const struct air_base_t_led_cfg led_cfg[3] = {
@@ -52,9 +53,45 @@ static const u16 led_dur = UNIT_LED_BLINK_DURATION << AIR_LED_BLK_DUR_64M;
 /***********************************************************
  *                  F U N C T I O N S
  ***********************************************************/
+static void air_mdio_read_buf(struct phy_device *phydev, unsigned long address,
+			const struct firmware *fw, unsigned int *crc32)
+{
+	unsigned int write_data, offset;
+	int ret = 0, len = 0;
+	unsigned int pbus_data_low, pbus_data_high;
+	struct device *dev = phydev_dev(phydev);
+	struct mii_bus *mbus = phydev_mdio_bus(phydev);
+	int addr = phydev_addr(phydev);
+	char *buf = kmalloc(fw->size, GFP_KERNEL);
 
+	memset(buf, '\0', fw->size);
+	/* page 4 */
+	ret |= air_mii_cl22_write(mbus, addr, 0x1F, 4);
+	/* address increment*/
+	ret |= air_mii_cl22_write(mbus, addr, 0x10, 0x8000);
+	ret |= air_mii_cl22_write(mbus, addr,
+			0x15, (unsigned int)((address >> 16) & 0xffff));
+	ret |= air_mii_cl22_write(mbus, addr,
+			0x16, (unsigned int)(address & 0xffff));
+	for (offset = 0; offset < fw->size; offset += 4) {
+		pbus_data_high = air_mii_cl22_read(mbus, addr, 0x17);
+		pbus_data_low = air_mii_cl22_read(mbus, addr, 0x18);
+		buf[offset + 0] = pbus_data_low & 0xff;
+		buf[offset + 1] = (pbus_data_low & 0xff00) >> 8;
+		buf[offset + 2] = pbus_data_high & 0xff;
+		buf[offset + 3] = (pbus_data_high & 0xff00) >> 8;
+	}
+	msleep(100);
+	*crc32 = ~crc32(~0, buf, fw->size);
+	ret |= air_mii_cl22_write(mbus, addr, 0x1F, 0);
+	kfree(buf);
+	if (ret) {
+		dev_info(dev, "%s 0x%lx FAIL(ret:%d)\n",
+				__func__, address, ret);
+	}
+}
 
-static int MDIOWriteBuf(struct phy_device *phydev,
+static int air_mdio_write_buf(struct phy_device *phydev,
 		unsigned long address, const struct firmware *fw)
 {
 	unsigned int write_data, offset;
@@ -115,6 +152,10 @@ static int en8811h_load_firmware(struct phy_device *phydev)
 	const char *firmware;
 	int ret = 0;
 	u32 pbus_value = 0;
+#ifdef AIR_MD32_FW_CHECK
+	unsigned int d_crc32 = 0, crc32 = 0;
+	int retry = 0;
+#endif
 	struct en8811h_priv *priv = phydev->priv;
 
 	ret = air_buckpbus_reg_write(phydev,
@@ -138,12 +179,12 @@ static int en8811h_load_firmware(struct phy_device *phydev)
 	dev_info(dev, "%s: crc32=0x%x\n",
 		firmware, ~crc32(~0, fw->data, fw->size));
 	/* Download DM */
-	ret = MDIOWriteBuf(phydev, 0x00000000, fw);
+	ret = air_mdio_write_buf(phydev, 0x00000000, fw);
 	release_firmware(fw);
 	if (ret < 0) {
 		dev_err(dev,
-			"MDIOWriteBuf 0x00000000 fail, ret: %d\n", ret);
-		return ret;
+			"air_mdio_write_buf 0x00000000 fail, ret: %d\n", ret);
+		goto release;
 	}
 
 	firmware = EN8811H_MD32_DSP;
@@ -157,22 +198,56 @@ static int en8811h_load_firmware(struct phy_device *phydev)
 	dev_info(dev, "%s: crc32=0x%x\n",
 		firmware, ~crc32(~0, fw->data, fw->size));
 	/* Download PM */
-	ret = MDIOWriteBuf(phydev, 0x00100000, fw);
-	release_firmware(fw);
+	ret = air_mdio_write_buf(phydev, 0x00100000, fw);
 	if (ret < 0) {
 		dev_err(dev,
-			"MDIOWriteBuf 0x00100000 fail , ret: %d\n", ret);
-		return ret;
+			"air_mdio_write_buf 0x00100000 fail , ret: %d\n", ret);
+		goto release;
 	}
 	pbus_value = air_buckpbus_reg_read(phydev, 0x800000);
 	pbus_value &= ~BIT(11);
 	ret = air_buckpbus_reg_write(phydev, 0x800000, pbus_value);
 	if (ret < 0)
-		return ret;
+		goto release;
+#ifdef AIR_MD32_FW_CHECK
+	crc32 = ~crc32(~0, fw->data, fw->size);
+	/* Check PM */
+	air_mdio_read_buf(phydev, 0x100000, fw, &d_crc32);
+	if (d_crc32 == crc32)
+		dev_info(dev, "0x00100000 Check Sum Pass.\n");
+	else {
+		dev_info(dev, "0x00100000 Check Sum Fail.\n");
+		dev_info(dev, "CRC32 0x%x != Caculated CRC32 0x%x\n",
+					crc32, d_crc32);
+	}
+	release_firmware(fw);
+	retry = MAX_RETRY;
+	do {
+		ret = air_buckpbus_reg_write(phydev, 0x0f0018, 0x01);
+		if (ret < 0)
+			return ret;
+		msleep(100);
+		pbus_value = air_buckpbus_reg_read(phydev, 0x0f0018);
+		if (retry == 0) {
+			dev_err(dev,
+				"Release Software Reset fail , ret: %d\n",
+						pbus_value);
+			break;
+		}
+		retry--;
+	} while (pbus_value != 0x1);
+	dev_info(dev,
+		"Release Software Reset successful.\n");
+#else
+	release_firmware(fw);
 	ret = air_buckpbus_reg_write(phydev, 0x0f0018, 0x01);
 	if (ret < 0)
 		return ret;
+#endif
 	return 0;
+release:
+	release_firmware(fw);
+	return ret;
 }
 
 #ifdef AIR_LED_SUPPORT
@@ -383,18 +458,10 @@ static int en8811h_probe(struct phy_device *phydev)
 			"EN8811H initialize fail!\n");
 		goto priv_free;
 	}
-	/* Mode selection*/
-	dev_info(dev, "EN8811H Mode 1 !\n");
-	ret = air_mii_cl45_write(phydev, 0x1e, 0x800c, 0x0);
-	if (ret < 0)
-		goto priv_free;
-	ret = air_mii_cl45_write(phydev, 0x1e, 0x800d, 0x0);
-	if (ret < 0)
-		goto priv_free;
-	ret = air_mii_cl45_write(phydev, 0x1e, 0x800e, 0x1101);
-	if (ret < 0)
-		goto priv_free;
-	ret = air_mii_cl45_write(phydev, 0x1e, 0x800f, 0x0002);
+	ret |= air_mii_cl45_write(phydev, 0x1e, 0x800c, 0x0);
+	ret |= air_mii_cl45_write(phydev, 0x1e, 0x800d, 0x0);
+	ret |= air_mii_cl45_write(phydev, 0x1e, 0x800e, 0x1101);
+	ret |= air_mii_cl45_write(phydev, 0x1e, 0x800f, 0x0002);
 	if (ret < 0)
 		goto priv_free;
 	/* Serdes polarity */
@@ -415,6 +482,13 @@ static int en8811h_probe(struct phy_device *phydev)
 	dev_info(dev, "Tx, Rx Polarity : %08x\n", pbus_value);
 	pbus_value = air_buckpbus_reg_read(phydev, 0x3b3c);
 	dev_info(dev, "MD32 FW Version : %08x\n", pbus_value);
+	if (priv->surge) {
+		ret = air_surge_5ohm_config(phydev);
+		if (ret < 0)
+			dev_err(dev,
+				"air_surge_5ohm_config fail. (ret=%d)\n", ret);
+	} else
+		dev_info(dev, "Surge Protection Mode - 0R\n");
 #if defined(AIR_LED_SUPPORT)
 	ret = en8811h_led_init(phydev);
 	if (ret < 0) {
