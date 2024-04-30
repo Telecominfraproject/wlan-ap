@@ -227,8 +227,11 @@ int spotfilter_in(struct __sk_buff *skb)
 
 		if (!is_control)
 			wl_val = bpf_map_lookup_elem(&whitelist_ipv6, &ip6h->daddr);
+	} else if (info.proto == bpf_htons(ETH_P_ARP)) {
+		bpf_clone_redirect(skb, config.snoop_ifindex, BPF_F_INGRESS);
+		return TC_ACT_UNSPEC;
 	} else {
-			return TC_ACT_UNSPEC;
+		return TC_ACT_UNSPEC;
 	}
 
 	if (wl_val) {

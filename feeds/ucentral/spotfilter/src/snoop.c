@@ -9,6 +9,7 @@
 #include <netinet/udp.h>
 #include <netpacket/packet.h>
 #include <net/if.h>
+#include <net/if_arp.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -47,6 +48,20 @@
 int spotfilter_ifb_ifindex;
 static struct uloop_fd ufd;
 static struct uloop_timeout cname_gc_timer;
+
+struct arp_packet {
+	uint16_t hwtype;
+	uint16_t proto;
+	uint8_t h_size;
+	uint8_t p_size;
+	uint16_t op;
+
+	uint8_t src_mac[ETH_ALEN];
+	uint8_t src_ip[4];
+
+	uint8_t dest_mac[ETH_ALEN];
+	uint8_t dest_ip[4];
+};
 
 struct vlan_hdr {
 	uint16_t tci;
@@ -395,6 +410,7 @@ spotfilter_packet_cb(struct packet *pkt)
 	struct ip6_hdr *ip6;
 	struct ip *ip;
 	struct udphdr *udp;
+	struct arp_packet *arp;
 	bool ipv4;
 
 	eth = pkt_pull(pkt, sizeof(*eth));
@@ -413,6 +429,19 @@ spotfilter_packet_cb(struct packet *pkt)
 	}
 
 	switch (proto) {
+	case ETH_P_ARP:
+		arp = pkt_peek(pkt, sizeof(*arp));
+		if (!arp)
+			break;
+
+		if (arp->hwtype != cpu_to_be16(1) ||
+		    arp->proto != cpu_to_be16(0x800) ||
+		    arp->h_size != 6 || arp->p_size != 4 ||
+		    arp->op != cpu_to_be16(1))
+			break;
+
+		client_set_arp_ipaddr(eth->h_source, &arp->src_ip);
+		break;
 	case ETH_P_IP:
 		ip = pkt_peek(pkt, sizeof(struct ip));
 		if (!ip)

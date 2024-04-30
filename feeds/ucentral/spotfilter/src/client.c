@@ -12,6 +12,7 @@
 struct cache_entry {
 	struct avl_node node;
 	uint8_t macaddr[ETH_ALEN];
+	uint32_t arp_ip4addr;
 	uint32_t ip4addr;
 	uint32_t ip6addr[4];
 	uint32_t time;
@@ -144,6 +145,8 @@ int client_set(struct interface *iface, const void *addr, const char *id,
 	if (c) {
 		if (!cl->data.ip4addr)
 			cl->data.ip4addr = c->ip4addr;
+		if (!cl->arp_ip4addr)
+			cl->arp_ip4addr = c->arp_ip4addr;
 		if (!cl->data.ip6addr[0])
 			memcpy(cl->data.ip6addr, c->ip6addr, sizeof(cl->data.ip6addr));
 	}
@@ -186,33 +189,44 @@ int client_set(struct interface *iface, const void *addr, const char *id,
 	return 0;
 }
 
-void client_set_ipaddr(const void *mac, const void *addr, bool ipv6)
+static struct cache_entry *
+client_get_cache_entry(const void *mac)
 {
 	static struct uloop_timeout gc_timer = {
 		.cb = client_gc
 	};
+	struct cache_entry *c;
+
+	c = avl_find_element(&cache, mac, c, node);
+	if (c)
+		goto out;
+
+	c = calloc(1, sizeof(*c));
+	memcpy(c->macaddr, mac, ETH_ALEN);
+	c->node.key = c->macaddr;
+	avl_insert(&cache, &c->node);
+	if (!gc_timer.pending)
+		uloop_timeout_set(&gc_timer, CACHE_TIMEOUT * 1000);
+
+out:
+	c->time = client_gettime();
+
+	return c;
+}
+
+void client_set_ipaddr(const void *mac, const void *addr, bool ipv6)
+{
 	struct interface *iface;
 	struct cache_entry *c;
 	struct client *cl;
 
-	c = avl_find_element(&cache, mac, c, node);
-	if (!c) {
-		c = calloc(1, sizeof(*c));
-		memcpy(c->macaddr, mac, ETH_ALEN);
-		c->node.key = c->macaddr;
-		avl_insert(&cache, &c->node);
-		if (!gc_timer.pending)
-			uloop_timeout_set(&gc_timer, CACHE_TIMEOUT * 1000);
-	}
-
+	c = client_get_cache_entry(mac);
 	if (!ipv6 && !c->ip4addr)
 		memcpy(&c->ip4addr, addr, sizeof(c->ip4addr));
 	else if (ipv6 && !c->ip6addr[0])
 		memcpy(&c->ip6addr, addr, sizeof(c->ip6addr));
 	else
 		return;
-
-	c->time = client_gettime();
 
 	avl_for_each_element(&interfaces, iface, node) {
 		cl = avl_find_element(&iface->clients, mac, cl, node);
@@ -229,5 +243,23 @@ void client_set_ipaddr(const void *mac, const void *addr, bool ipv6)
 			continue;
 
 		spotfilter_bpf_set_client(iface, &cl->key, &cl->data);
+	}
+}
+
+void client_set_arp_ipaddr(const void *mac, const void *addr)
+{
+	struct interface *iface;
+	struct cache_entry *c;
+	struct client *cl;
+
+	c = client_get_cache_entry(mac);
+	memcpy(&c->arp_ip4addr, addr, sizeof(c->arp_ip4addr));
+
+	avl_for_each_element(&interfaces, iface, node) {
+		cl = avl_find_element(&iface->clients, mac, cl, node);
+		if (!cl)
+			continue;
+
+		cl->arp_ip4addr = c->arp_ip4addr;
 	}
 }

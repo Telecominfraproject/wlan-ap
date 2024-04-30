@@ -15,6 +15,7 @@ struct client {
 	struct kvlist kvdata;
 	int idle;
 
+	uint32_t arp_ip4addr;
 	struct spotfilter_client_key key;
 	struct spotfilter_client_data data;
 	char *device;
@@ -25,6 +26,7 @@ int client_set(struct interface *iface, const void *addr, const char *id,
 	       const char *device, bool flush);
 void client_free(struct interface *iface, struct client *cl);
 void client_set_ipaddr(const void *mac, const void *addr, bool ipv6);
+void client_set_arp_ipaddr(const void *mac, const void *addr);
 void client_init_interface(struct interface *iface);
 
 #endif

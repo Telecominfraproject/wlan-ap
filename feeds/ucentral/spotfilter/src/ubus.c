@@ -257,6 +257,12 @@ static void client_dump(struct interface *iface, struct client *cl)
 	if (cl->id_node.key)
 		blobmsg_add_string(&b, "id", (const char *)cl->id_node.key);
 
+	if (cl->arp_ip4addr) {
+		buf = blobmsg_alloc_string_buffer(&b, "arp_ip4addr", INET6_ADDRSTRLEN);
+		inet_ntop(AF_INET, (const void *)&cl->arp_ip4addr, buf, INET6_ADDRSTRLEN);
+		blobmsg_add_string_buffer(&b);
+	}
+
 	if (cl->data.ip4addr) {
 		buf = blobmsg_alloc_string_buffer(&b, "ip4addr", INET6_ADDRSTRLEN);
 		inet_ntop(AF_INET, (const void *)&cl->data.ip4addr, buf, INET6_ADDRSTRLEN);
