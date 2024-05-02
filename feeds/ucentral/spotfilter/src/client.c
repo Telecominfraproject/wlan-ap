@@ -13,6 +13,7 @@ struct cache_entry {
 	struct avl_node node;
 	uint8_t macaddr[ETH_ALEN];
 	uint32_t arp_ip4addr;
+	bool arp;
 	uint32_t ip4addr;
 	uint32_t ip6addr[4];
 	uint32_t time;
@@ -214,16 +215,19 @@ out:
 	return c;
 }
 
-void client_set_ipaddr(const void *mac, const void *addr, bool ipv6)
+void client_set_ipaddr(const void *mac, const void *addr, bool ipv6, bool arp)
 {
 	struct interface *iface;
 	struct cache_entry *c;
 	struct client *cl;
 
 	c = client_get_cache_entry(mac);
-	if (!ipv6 && !c->ip4addr)
+	if (!ipv6 && arp && c->arp)
+		return;
+	if (!ipv6 && (!c->ip4addr || c->arp)) {
 		memcpy(&c->ip4addr, addr, sizeof(c->ip4addr));
-	else if (ipv6 && !c->ip6addr[0])
+		c->arp = arp;
+	} else if (ipv6 && !c->ip6addr[0])
 		memcpy(&c->ip6addr, addr, sizeof(c->ip6addr));
 	else
 		return;

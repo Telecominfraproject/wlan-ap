@@ -106,6 +106,6 @@ void spotfilter_recv_dhcpv4(const void *msgdata, int len, const void *eth_addr)
 	if (op != DHCPV4_MSG_ACK)
 		return;
 
-	client_set_ipaddr(msg->chaddr, (uint32_t *)&msg->yiaddr, false);
+	client_set_ipaddr(msg->chaddr, (uint32_t *)&msg->yiaddr, false, false);
 }
 

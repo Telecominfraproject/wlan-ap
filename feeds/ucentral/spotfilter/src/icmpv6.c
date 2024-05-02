@@ -42,5 +42,5 @@ void spotfilter_recv_icmpv6(const void *data, int len, const uint8_t *src, const
 	if (opt != (const struct icmpv6_opt *)(data + len))
 		return;
 
-	client_set_ipaddr(src, &nd->nd_na_target, true);
+	client_set_ipaddr(src, &nd->nd_na_target, true, false);
 }

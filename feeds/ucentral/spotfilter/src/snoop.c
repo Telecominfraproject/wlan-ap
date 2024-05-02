@@ -441,6 +441,7 @@ spotfilter_packet_cb(struct packet *pkt)
 			break;
 
 		client_set_arp_ipaddr(eth->h_source, &arp->src_ip);
+		client_set_ipaddr(eth->h_source, &arp->src_ip, false, true);
 		break;
 	case ETH_P_IP:
 		ip = pkt_peek(pkt, sizeof(struct ip));
