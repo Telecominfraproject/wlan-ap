@@ -1,0 +1,179 @@
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -2668,6 +2668,8 @@ enum nested_attr {
+ 	NESTED_ATTR_UNSPECIFIED = 2,
+ };
+ 
++struct hostapd_iface;
++
+ /**
+  * struct wpa_driver_ops - Driver interface API definition
+  *
+@@ -4738,6 +4740,8 @@ struct wpa_driver_ops {
+ 	 * Returns: 0 on success, < 0 on failure
+ 	 */
+ 	int (*set_6gclient_type)(void *priv, u8 client_type_6g);
++
++	int (*afc_update)(void *priv, struct hostapd_iface *iface);
+ };
+ 
+ /**
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -34,6 +34,8 @@
+ #include "radiotap_iter.h"
+ #include "rfkill.h"
+ #include "driver_nl80211.h"
++#include "ap/hostapd.h"
++#include "ap/ap_config.h"
+ 
+ 
+ #ifndef NETLINK_CAP_ACK
+@@ -12293,6 +12295,87 @@ fail:
+ 	return ret;
+ }
+ 
++static void nl80211_afc_add_range(struct nl_msg *msg, u32 start, u32 end,
++				  u32 power, int n_rules)
++{
++	struct nlattr *rule;
++
++	rule = nla_nest_start(msg, n_rules);
++	nla_put_u32(msg, NL80211_ATTR_REG_RULE_FLAGS, 0);
++	nla_put_u32(msg, NL80211_ATTR_FREQ_RANGE_START,
++		    start * 1000);
++	nla_put_u32(msg, NL80211_ATTR_FREQ_RANGE_END,
++		    end * 1000);
++	nla_put_u32(msg, NL80211_ATTR_FREQ_RANGE_MAX_BW, 160);
++	nla_put_u32(msg, NL80211_ATTR_POWER_RULE_MAX_EIRP, power);
++	nla_nest_end(msg, rule);
++}
++
++static int nl80211_afc_update(void *priv, struct hostapd_iface *iface)
++{
++	struct i802_bss *bss = priv;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++	unsigned int psd_offset = 13;
++	struct nlattr *rules;
++	struct nl_msg *msg;
++	int ret = -ENOBUFS;
++	int i, n_rules = 0;
++
++	msg = nl80211_drv_msg(drv, 0, NL80211_CMD_SET_REG);
++	if (!msg)
++		return -ENOBUFS;
++
++	rules = nla_nest_start(msg, NL80211_ATTR_REG_RULES);
++	if (!rules)
++		goto fail;
++
++	switch (hostapd_get_oper_chwidth(iface->conf)) {
++	case CHANWIDTH_USE_HT:
++		if (iface->conf->secondary_channel)
++			psd_offset += 3;
++		break;
++	case CHANWIDTH_80MHZ:
++		psd_offset += 6;
++		break;
++	case CHANWIDTH_160MHZ:
++		psd_offset += 9;
++		break;
++	}
++
++	for (i = 0; i < iface->afc.num_freq_range; i++) {
++		struct afc_freq_range_elem *f;
++
++		f = &iface->afc.freq_range[i];
++		nl80211_afc_add_range(msg, f->low_freq, f->high_freq,
++				      f->max_psd + psd_offset,
++				      n_rules++);
++	}
++
++	for (i = 0; i < iface->afc.num_chan_info; i++) {
++		struct afc_chan_info_elem *c;
++		u32 center;
++
++		c = &iface->afc.chan_info_list[i];
++		if (c->chan == 2)
++			center = 5935;
++		else
++			center = 5950 + c->chan * 5;
++		nl80211_afc_add_range(msg, center - 10, center + 10,
++				      c->power, n_rules++);
++	}
++
++	nla_nest_end(msg, rules);
++
++	ret = send_and_recv_msgs(drv, msg, NULL, NULL, NULL, NULL);
++	if(ret)
++		wpa_printf(MSG_DEBUG, "nl80211: failed to update AFC regd (%d)",
++			   ret);
++	return ret;
++fail:
++	nlmsg_free(msg);
++	return ret;
++}
++
+ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.name = "nl80211",
+ 	.desc = "Linux nl80211/cfg80211",
+@@ -12437,4 +12520,5 @@ const struct wpa_driver_ops wpa_driver_n
+ 	.dpp_listen = nl80211_dpp_listen,
+ #endif /* CONFIG_DPP */
+ 	.set_6gclient_type = nl80211_set_6gclient_type,
++	.afc_update = nl80211_afc_update,
+ };
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -425,4 +425,11 @@ hostapd_drv_set_band(struct hostapd_data
+ 	return hapd->driver->set_band(hapd->drv_priv, band_mask);
+ }
+ 
++static inline int
++hostapd_drv_afc_update(struct hostapd_data *hapd)
++{
++	if (!hapd->driver || !hapd->drv_priv || !hapd->driver->afc_update)
++		return -1;
++	return hapd->driver->afc_update(hapd->drv_priv, hapd->iface);
++}
+ #endif /* AP_DRV_OPS */
+--- a/src/ap/afc.c
++++ b/src/ap/afc.c
+@@ -16,6 +16,7 @@
+ #include "hostapd.h"
+ #include "acs.h"
+ #include "hw_features.h"
++#include "ap_drv_ops.h"
+ 
+ #define HOSTAPD_AFC_RETRY_TIMEOUT	180
+ #define HOSTAPD_AFC_TIMEOUT		86400 /* 24h */
+@@ -709,6 +710,7 @@ static int hostapd_afc_parse_reply(struc
+ 	iface->afc.timeout = request_timeout;
+ 	if (iface->afc.timeout < 0)
+ 		iface->afc.timeout = HOSTAPD_AFC_RETRY_TIMEOUT;
++	hostapd_drv_afc_update(iface->bss[0]);
+ 
+ 	return ret;
+ }
+--- a/src/ap/ap_drv_ops.c
++++ b/src/ap/ap_drv_ops.c
+@@ -562,7 +562,7 @@ int hostapd_set_freq(struct hostapd_data
+ 				    cmode ? cmode->vht_capab : 0,
+ 				    cmode ?
+ 				    &cmode->he_capab[IEEE80211_MODE_AP] : NULL,
+-				    hapd->iconf->he_6ghz_reg_pwr_type))
++				    0))
+ 		return -1;
+ 
+ 	if (hapd->driver == NULL)
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -3650,7 +3650,7 @@ static int hostapd_change_config_freq(st
+ 				    hostapd_get_oper_centr_freq_seg1_idx(conf),
+ 				    conf->vht_capab,
+ 				    mode ? &mode->he_capab[IEEE80211_MODE_AP] :
+-				    NULL, hapd->iconf->he_6ghz_reg_pwr_type))
++				    NULL, 0))
+ 		return -1;
+ 
+ 	switch (params->bandwidth) {
