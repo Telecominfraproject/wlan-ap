@@ -1830,7 +1830,8 @@ ubus_event_cb(struct ubus_notify_request *req, int idx, int ret)
 {
 	struct ubus_event_req *ureq = container_of(req, struct ubus_event_req, nreq);
 
-	ureq->resp = ret;
+	if (!ureq->resp)
+		ureq->resp = ret;
 }
 
 int hostapd_ubus_handle_event(struct hostapd_data *hapd, struct hostapd_ubus_request *req)
