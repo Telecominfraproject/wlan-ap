@@ -78,6 +78,7 @@ platform_check_image() {
 	hfcl,ion4xi|\
 	hfcl,ion4x|\
 	hfcl,ion4x_2|\
+	hfcl,ion4x_3|\
 	hfcl,ion4xe|\
 	yuncore,ax840|\
 	yuncore,fap650)
@@ -106,6 +107,7 @@ platform_do_upgrade() {
 	hfcl,ion4xi|\
 	hfcl,ion4x|\
 	hfcl,ion4x_2|\
+	hfcl,ion4x_3|\
 	hfcl,ion4xe)
 		if grep -q rootfs_1 /proc/cmdline; then
 			CI_UBIPART="rootfs"
