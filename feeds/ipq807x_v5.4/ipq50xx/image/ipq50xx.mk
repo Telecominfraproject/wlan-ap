@@ -49,6 +49,15 @@ define Device/edgecore_eap104
 endef
 TARGET_DEVICES += edgecore_eap104
 
+define Device/udaya_a6_id2
+  DEVICE_TITLE := Udaya A6 - ID2
+  DEVICE_DTS := qcom-ipq5018-udaya-a6-id2
+  SUPPORTED_DEVICES := udaya,a6-id2
+  DEVICE_PACKAGES := ath11k-wifi-udaya-a6-id2 ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.5-c1
+endef
+TARGET_DEVICES += udaya_a6_id2
+
 define Device/yuncore_fap655
   DEVICE_TITLE := Yuncore FAP650
   DEVICE_DTS := qcom-ipq5018-yuncore-fap655
