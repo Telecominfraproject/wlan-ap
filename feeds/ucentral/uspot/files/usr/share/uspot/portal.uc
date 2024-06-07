@@ -288,7 +288,15 @@ return {
 		}
 
 		if (!uam && connected?.state) {
-			include('connected.uc', ctx);
+			switch (split(ctx.env.REQUEST_URI, '?')[0] || '') {
+			case '/logout':
+			case '/logoff':
+				this.logoff(ctx, false);
+				break;
+			default:
+				include('connected.uc', ctx);
+				break;
+			}
 			return;
 		}
 		if (!connected.data.ssid) {
