@@ -178,15 +178,25 @@ return {
 	// put a client back into pre-auth state
 	logoff: function(ctx, uam) {
 		this.syslog(ctx, 'logging client off');
-		if (uam)
+		if (uam) {
 			include('redir.uc', { redir_location: this.uam_url(ctx, 'logoff') });
-		else
+			ctx.ubus.call('uspot', 'client_remove', {
+				interface: ctx.spotfilter,
+				address: uc(ctx.mac),
+			});
+		} else {
 			include('logoff.uc', ctx);
+			let payload = {
+				interface: ctx.spotfilter,
+				address: uc(ctx.mac),
+			};
 
-		ctx.ubus.call('uspot', 'client_remove', {
-			interface: ctx.spotfilter,
-			address: ctx.mac,
-		});
+			if (ctx.connected.ip4addr)
+				system('conntrack -D -s ' + ctx.connected.ip4addr + ' > /dev/null');
+			if (ctx.connected.ip6addr)
+				system('conntrack -D -s ' + ctx.connected.ip6addr + ' > /dev/null');
+			ctx.ubus.call('spotfilter', 'client_remove', payload);
+		}
 	},
 
 	// generate the default radius auth payload
@@ -286,7 +296,7 @@ return {
 			include('error.uc', ctx);
 			return NULL;
 		}
-
+		ctx.connected = connected;
 		if (!uam && connected?.state) {
 			switch (split(ctx.env.REQUEST_URI, '?')[0] || '') {
 			case '/logout':
