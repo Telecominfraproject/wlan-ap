@@ -404,7 +404,7 @@ hostapd_common_add_bss_config() {
 	config_add_string lci civic
 
 	config_add_boolean ieee80211r pmk_r1_push ft_psk_generate_local ft_over_ds
-	config_add_int r0_key_lifetime reassociation_deadline
+	config_add_int r0_key_lifetime reassociation_deadline ft_l2_refresh
 	config_add_string mobility_domain r1_key_holder
 	config_add_array r0kh r1kh
 
@@ -984,10 +984,11 @@ hostapd_set_bss_options() {
 		set_default ieee80211r 0
 
 		if [ "$ieee80211r" -gt "0" ]; then
-			json_get_vars mobility_domain ft_psk_generate_local ft_over_ds reassociation_deadline
+			json_get_vars mobility_domain ft_psk_generate_local ft_over_ds reassociation_deadline ft_l2_refresh
 
 			set_default mobility_domain "$(echo "$ssid" | md5sum | head -c 4)"
 			set_default ft_over_ds 1
+			set_default ft_l2_refresh 30
 			set_default reassociation_deadline 1000
 			skip_kh_setup=0
 
@@ -1010,6 +1011,7 @@ hostapd_set_bss_options() {
 			append bss_conf "ft_psk_generate_local=$ft_psk_generate_local" "$N"
 			append bss_conf "ft_over_ds=$ft_over_ds" "$N"
 			append bss_conf "reassociation_deadline=$reassociation_deadline" "$N"
+			[ -n "$ft_l2_refresh" ] && append bss_conf "ft_l2_refresh=$ft_l2_refresh" "$N"
 
 			if [ "$skip_kh_setup" -eq "0" ]; then
 				json_get_vars r0_key_lifetime r1_key_holder pmk_r1_push
