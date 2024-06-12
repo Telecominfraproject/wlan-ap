@@ -3,7 +3,7 @@ include $(TOPDIR)/rules.mk
 ARCH:=aarch64
 BOARD:=ipq50xx
 BOARDNAME:=Qualcomm Technologies, Inc IPQ50xx
-FEATURES:=squashfs fpu ramdisk pcie usbgadgeti nand 
+FEATURES:=squashfs fpu ramdisk pcie usbgadget nand 
 CPU_TYPE:=cortex-a53
 CPU_SUBTYPE:=neon-vfpv4
 MAINTAINER:=John Crispin <blogic@openwrt.org>
