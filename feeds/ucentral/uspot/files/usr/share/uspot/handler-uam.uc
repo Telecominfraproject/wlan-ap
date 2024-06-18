@@ -53,6 +53,7 @@ global.handle_request = function(env) {
 	let ctx = portal.handle_request(env, true);
 
 	switch (split(ctx.env.REQUEST_URI, '?')[0] || '') {
+	case '/login':
 	case '/logon':
 		auth_client(ctx);
 		break;

@@ -52,6 +52,7 @@ ALLWIFIBOARDS:= \
 	yuncore-ax840 \
 	yuncore-fap650 \
 	yuncore-fap655 \
+	udaya-a6-id2 \
 	meshpp-s618
 
 ALLWIFIPACKAGES:=$(foreach BOARD,$(ALLWIFIBOARDS),ath11k-wifi-$(BOARD))
@@ -393,6 +394,7 @@ $(eval $(call generate-ath11k-wifi-package,meshpp-s618,Mesh++ S618))
 $(eval $(call generate-ath11k-wifi-package,muxi-ap3220l,MUXI AP3220L))
 $(eval $(call generate-ath11k-wifi-package,yuncore-fap650,YunCore FAP650))
 $(eval $(call generate-ath11k-wifi-package,yuncore-fap655,YunCore FAP655))
+$(eval $(call generate-ath11k-wifi-package,udaya-a6-id2,Udaya A6-ID2))
 
 $(foreach PACKAGE,$(ALLWIFIPACKAGES),$(eval $(call BuildPackage,$(PACKAGE))))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq5018))

@@ -80,6 +80,7 @@ platform_check_image() {
 	optimcloud,d50|\
 	optimcloud,d50-5g|\
 	yuncore,fap655|\
+	udaya,a6-id2|\
 	edgecore,oap101|\
 	edgecore,oap101-6e|\
 	edgecore,oap101e|\
@@ -121,6 +122,7 @@ platform_do_upgrade() {
                 ;;
 	cig,wf186w|\
 	cig,wf186h|\
+	udaya,a6-id2|\
 	optimcloud,d60|\
 	optimcloud,d60-5g|\
 	optimcloud,d50|\
