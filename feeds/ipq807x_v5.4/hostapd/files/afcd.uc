@@ -72,7 +72,7 @@ function handle_request(req)
 
 	let cl = uclient.new(opts.url, null, cb);
 
-	if (!cl.ssl_init({ verify: true, ca_files: [ opts.cert ] })) {
+	if (!cl.ssl_init({ verify: !!opts.cert, ca_files: [ opts.cert ] })) {
 		warn(`Failed to initialize SSL\n`);
 		return false;
 	}
