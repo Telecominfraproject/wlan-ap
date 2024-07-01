@@ -5,6 +5,7 @@ let uci = require('uci').cursor();
 let uloop = require('uloop');
 let rtnl = require('rtnl');
 let fs = require('fs');
+let log = require("log");
 let hapd_subscriber;
 let device_subscriber;
 let ifaces = {};
@@ -44,7 +45,7 @@ function netifd_handle_iface(name, auth_status, vlan) {
 function hapd_subscriber_notify_cb(notify) {
 	switch(notify.type) {
 	case 'sta-authorized':
-		printf('authenticated station\n');
+		log.syslog(LOG_USER, "authenticated station");
 		push(ifaces[notify.data.ifname].lladdr, notify.data.address);
 		netifd_handle_iface(notify.data.ifname, true, notify.data.vlan);
 		break;
@@ -65,6 +66,81 @@ function flush_iface(name) {
 	ifaces[name].lladdr = [];
 }
 
+/* generate a hostapd configuration */
+function hostapd_start(iface) {
+	if (!fs.stat("/sys/class/net/" + iface)) {
+		log.syslog(LOG_ERR, "Interface ${iface} does not exist yet");
+		return;
+	}
+	if (!config.auth_server_addr) {
+		log.syslog(LOG_ERR, "Auth server address is empty");
+		return;
+	}
+
+	let path = '/var/run/hostapd-' + iface + '.conf';
+	let file = fs.open(path, 'w+');
+
+	file.write('driver=wired\n');
+	file.write('ieee8021x=1\n');
+	file.write('eap_reauth_period=0\n');
+	file.write('ctrl_interface=/var/run/hostapd\n');
+	file.write('interface=' + iface + '\n');
+	file.write('ca_cert=' + config.ca + '\n');
+	file.write('server_cert=' + config.cert + '\n');
+	file.write('private_key=' + config.key + '\n');
+	file.write('dynamic_vlan=1\n');
+	file.write('vlan_no_bridge=1\n');
+	file.write('vlan_naming=1\n');
+
+	if (config.auth_server_addr) {
+		file.write('dynamic_own_ip_addr=1\n');
+		file.write('auth_server_addr=' + config.auth_server_addr + '\n');
+		file.write('auth_server_port=' + config.auth_server_port + '\n');
+		file.write('auth_server_shared_secret=' + config.auth_server_secret + '\n');
+		if (config.acct_server_addr && config.acct_server_port && config.acct_server_secret + '\n') {
+			file.write('acct_server_addr=' + config.acct_server_addr + '\n');
+			file.write('acct_server_port=' + config.acct_server_port + '\n');
+			file.write('acct_server_shared_secret=' + config.acct_server_secret + '\n');
+		}
+		if (config.nas_identifier)
+			file.write('nas_identifier=${config.nas_identifier}\n');
+		if (config.coa_server_addr && config.coa_server_port && config.coa_server_secret) {
+			file.write('radius_das_client=' + config.coa_server_addr + ' ' + config.coa_server_secret + '\n');
+			file.write('radius_das_port=' + config.coa_server_port + '\n');
+		}
+		if (+config.mac_address_bypass)
+			file.write('macaddr_acl=2\n');
+	} else {
+		file.write('eap_server=1\n');
+		file.write('eap_user_file=/var/run/hostapd-ieee8021x.eap_user\n');
+	}
+	file.close();
+
+	/* is hostapd already running ? */
+	/*
+	 * For certains scenarios, we need to remove and add
+	 * instead of reload (reload did not work).
+	 * Consider the following scenario -
+	 * Say on CIG 186w as an example
+	 * eth0.4086 interface exists with some non-ieee8021x config.
+	 * Push ieee8021x config. In general the flow is that
+	 * reload_config is called followed by invocation of services (from ucentral-schema)
+	 * Services inovation does n't wait until the config reloaded ie in this context
+	 * ieee8021x service is invoked much before the network interfaces are recreated.
+	 * That is not correct. To handle this, we capture link-up events
+	 * and remove the existing interface (in hostapd as shown below) and add again
+	 */
+
+	if (ifaces[iface].hostapd) {
+		log.syslog(LOG_USER, "Remove the config  ${iface}");
+		ubus.call('hostapd', 'config_remove', { iface: iface });
+	}
+	log.syslog(LOG_USER, "Add config (clear the old one) ${iface}");
+	ubus.call('hostapd', 'config_add', { iface: iface, config: path });
+	system('ifconfig ' + iface + ' up');
+}
+
+/* build a list of all running and new interfaces */
 /* handle events from netifd */
 function device_subscriber_notify_cb(notify) {
 	switch(notify.type) {
@@ -77,6 +153,12 @@ function device_subscriber_notify_cb(notify) {
 		ifaces[notify.data.name].authenticated = false;
 		flush_iface(notify.data.name);
 		ubus.call('ratelimit', 'device_delete', { device: notify.data.name });
+		break;
+	case 'link_up':
+		if (!ifaces[notify.data.name])
+			break;
+		log.syslog(LOG_USER, "starting iface ${notify.data.name}");
+		hostapd_start(notify.data.name);
 		break;
 	};
 
@@ -94,17 +176,25 @@ function ubus_unsub_object(add, id, path) {
 		device_subscriber.subscribe(path);
 	}
 
-	if (object[0] != 'hostapd' || !ifaces[object[1]])
+	let object_hostapd = object[0];
+	let object_ifaces = object[1];
+
+	if (length(object) > 2) {
+		// For swconfig platforms
+		// The interface name is of the form eth0.4086 etc
+		object_ifaces = object[1] + "." + object[2];
+	}
+
+	if (object_hostapd != 'hostapd' || !ifaces[object_ifaces])
 		return;
 	if (add) {
-		printf('adding %s\n', path);
+		log.syslog(LOG_USER, "adding ${path}");
 		hapd_subscriber.subscribe(path);
-		ifaces[object[1]].hostapd = true;
-		ifaces[object[1]].path = path;
+		ifaces[object_ifaces].hostapd = true;
+		ifaces[object_ifaces].path = path;
 	} else {
-		printf('remove: %.J\n', remove);
-		netifd_handle_iface(object[1], false);
-		delete ifaces[object[1]];
+		netifd_handle_iface(object_ifaces, false);
+		delete ifaces[object_ifaces];
 	}
 }
 
@@ -129,58 +219,6 @@ function ubus_listener_init() {
 	ubus.listener('ubus.object.remove', ubus_listener_cb);
 }
 
-/* generate a hostapd configuration */
-function hostapd_start(iface) {
-	let path = '/var/run/hostapd-' + iface + '.conf';
-	let file = fs.open(path, 'w+');
-
-	file.write('driver=wired\n');
-	file.write('ieee8021x=1\n');
-	file.write('eap_reauth_period=0\n');
-	file.write('ctrl_interface=/var/run/hostapd\n');
-	file.write('interface=' + iface + '\n');
-	file.write('ca_cert=' + config.ca + '\n');
-	file.write('server_cert=' + config.cert + '\n');
-	file.write('private_key=' + config.key + '\n');
-	file.write('dynamic_vlan=1\n');
-        file.write('vlan_no_bridge=1\n');
-        file.write('vlan_naming=1\n');
-	
-	if (config.auth_server_addr) {
-		file.write('dynamic_own_ip_addr=1\n');
-		file.write('auth_server_addr=' + config.auth_server_addr + '\n');
-		file.write('auth_server_port=' + config.auth_server_port + '\n');
-		file.write('auth_server_shared_secret=' + config.auth_server_secret + '\n');
-		if (config.acct_server_addr && config.acct_server_port && config.acct_server_secret + '\n') {
-			file.write('acct_server_addr=' + config.addr + '\n');
-			file.write('acct_server_port=' + config.port + '\n');
-			file.write('acct_server_shared_secret=' + config.secret + '\n');
-		}
-		if (config.nas_identifier)
-			file.write('nas_identifier=' + radius.nas_identifier + '\n');
-		if (config.coa_server_addr && config.coa_server_addr.port && config.coa_server_secret) {
-			file.write('radius_das_client=' + config.coa_server_addr + ' ' + config.coa_server_secret + '\n');
-			file.write('radius_das_port=' + config.coa_server_port + '\n');
-		}
-		if (+config.mac_address_bypass)
-			file.write('macaddr_acl=2\n');
-	} else {
-		file.write('eap_server=1\n');
-		file.write('eap_user_file=/var/run/hostapd-ieee8021x.eap_user\n');
-	}
-	file.close();
-
-	/* is hostapd already running ? */
-	if (ifaces[iface].hostapd) {
-		printf('hostapd.%s is already running\n', iface);
-		ubus.call(ifaces[iface].path, 'reload');
-	} else {
-		ubus.call('hostapd', 'config_add', { iface, config: path });
-	}
-	system('ifconfig ' + iface + ' up');
-}
-
-/* build a list of all running and new interfaces */
 function prepare_ifaces() {
 	for (let k, v in ifaces)
 		v.active = false;
@@ -212,7 +250,7 @@ function start_ifaces() {
 /* shutdown all interfaces */
 function shutdown() {
 	for (let iface, v in ifaces) {
-		printf('shutdown\n');
+		log.syslog(LOG_USER, "shutdown");
 		ubus.call('hostapd', 'config_remove', { iface });
 		netifd_handle_iface(iface, false);
 		flush_iface(iface);
@@ -252,6 +290,7 @@ function rtnl_cb(msg) {
 	ubus.call(ifaces[msg.msg.dev].path, 'mac_auth', { addr: msg.msg.lladdr });
 }
 
+log.openlog("ieee8021x", log.LOG_PID, log.LOG_USER);
 uloop.init();
 ubus.publish('ieee8021x', ubus_methods);
 config_load();
@@ -262,3 +301,4 @@ start_ifaces();
 uloop.run();
 uloop.done();
 shutdown();
+log.closelog();
