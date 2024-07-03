@@ -604,7 +604,7 @@ define Package/afcd/install
 endef
 
 define Install/hostapd
-	$(INSTALL_DIR) $(1)/usr/sbin $(1)/usr/share/hostap
+	$(INSTALL_DIR) $(1)/usr/sbin $(1)/usr/share/hostap $(1)/etc/init.d
 	$(INSTALL_DATA) ./files/hostapd.uc $(1)/usr/share/hostap/
 	$(INSTALL_DIR) $(1)/etc/init.d $(1)/etc/config $(1)/etc/radius
 	ln -sf hostapd $(1)/usr/sbin/hostapd-radius
@@ -612,6 +612,8 @@ define Install/hostapd
 	$(INSTALL_DATA) ./files/radius.config $(1)/etc/config/radius
 	$(INSTALL_DATA) ./files/radius.clients $(1)/etc/radius/clients
 	$(INSTALL_DATA) ./files/radius.users $(1)/etc/radius/users
+	$(INSTALL_BIN) ./files/mpskd $(1)/usr/share/hostap/
+	$(INSTALL_BIN) ./files/mpskd.init $(1)/etc/init.d/mpskd
 endef
 
 define Install/supplicant
