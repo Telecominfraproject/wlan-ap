@@ -2,6 +2,17 @@ KERNEL_LOADADDR := 0x41080000
 
 DEVICE_VARS += CE_TYPE
 
+define Device/cig_wf660a
+  DEVICE_TITLE := Cigtech WF-660a
+  DEVICE_DTS := qcom-ipq6018-cig-wf660a
+  SUPPORTED_DEVICES := cig,wf660a
+  DEVICE_DTS_CONFIG := config@cp01-c1
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf660a uboot-env uboot-envtools
+  IMAGES := sysupgrade.tar mmc-factory.bin
+  IMAGE/mmc-factory.bin := append-ubi | qsdk-ipq-factory-mmc
+endef
+TARGET_DEVICES += cig_wf660a
+
 define Device/cig_wf188n
   DEVICE_TITLE := Cigtech WF-188n
   DEVICE_DTS := qcom-ipq6018-cig-wf188n
@@ -37,15 +48,6 @@ define Device/hfcl_ion4x_2
   DEVICE_PACKAGES := ath11k-wifi-qcom-ipq6018 uboot-envtools kmod-hwmon-lm75
 endef
 TARGET_DEVICES += hfcl_ion4x_2
-
-define Device/hfcl_ion4x_3
-  DEVICE_TITLE := HFCL ION4X_3
-  DEVICE_DTS := qcom-ipq6018-hfcl-ion4x_3
-  DEVICE_DTS_CONFIG := config@cp01-c1
-  SUPPORTED_DEVICES := hfcl,ion4x_3
-  DEVICE_PACKAGES := ath11k-wifi-hfcl-ion4x_3 uboot-envtools kmod-hwmon-lm75
-endef
-TARGET_DEVICES += hfcl_ion4x_3
 
 define Device/hfcl_ion4xi
   DEVICE_TITLE := HFCL ION4Xi
