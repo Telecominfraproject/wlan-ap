@@ -135,9 +135,11 @@ function hostapd_start(iface) {
 		log.syslog(LOG_USER, "Remove the config  ${iface}");
 		ubus.call('hostapd', 'config_remove', { iface: iface });
 	}
-	log.syslog(LOG_USER, "Add config (clear the old one) ${iface}");
+	log.syslog(LOG_USER, "Add config (clear the old one) " + iface);
 	ubus.call('hostapd', 'config_add', { iface: iface, config: path });
 	system('ifconfig ' + iface + ' up');
+	// Subscribe to corresponding hostapd if it is (re)added
+	hapd_subscriber.subscribe("hostapd." + iface);
 }
 
 /* build a list of all running and new interfaces */
@@ -188,13 +190,14 @@ function ubus_unsub_object(add, id, path) {
 	if (object_hostapd != 'hostapd' || !ifaces[object_ifaces])
 		return;
 	if (add) {
-		log.syslog(LOG_USER, "adding ${path}");
+		log.syslog(LOG_USER, "adding " + path);
 		hapd_subscriber.subscribe(path);
 		ifaces[object_ifaces].hostapd = true;
 		ifaces[object_ifaces].path = path;
 	} else {
+		// Mark the port as unauthorized. but dont delete it
+		// ifaces  contains the configured (from uci config) ports
 		netifd_handle_iface(object_ifaces, false);
-		delete ifaces[object_ifaces];
 	}
 }
 
