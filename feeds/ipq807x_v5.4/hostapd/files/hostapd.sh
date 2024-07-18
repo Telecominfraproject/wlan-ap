@@ -73,6 +73,10 @@ hostapd_append_wpa_key_mgmt() {
 		owe)
 			append wpa_key_mgmt "OWE"
 		;;
+		psk2-radius)
+			append wpa_key_mgmt "WPA-PSK-SHA256"
+			[ "${ieee80211r:-0}" -gt 0 ] && append wpa_key_mgmt "FT-PSK"
+		;;
 	esac
 
 	[ "$fils" -gt 0 ] && {
@@ -405,7 +409,7 @@ hostapd_common_add_bss_config() {
 
 	config_add_boolean ieee80211r pmk_r1_push ft_psk_generate_local ft_over_ds
 	config_add_int r0_key_lifetime reassociation_deadline ft_l2_refresh
-	config_add_string mobility_domain r1_key_holder
+	config_add_string mobility_domain r1_key_holder ft_key
 	config_add_array r0kh r1kh
 
 	config_add_int ieee80211w_max_timeout ieee80211w_retry_timeout
@@ -1014,7 +1018,7 @@ hostapd_set_bss_options() {
 			[ -n "$ft_l2_refresh" ] && append bss_conf "ft_l2_refresh=$ft_l2_refresh" "$N"
 
 			if [ "$skip_kh_setup" -eq "0" ]; then
-				json_get_vars r0_key_lifetime r1_key_holder pmk_r1_push
+				json_get_vars r0_key_lifetime r1_key_holder pmk_r1_push ft_key
 				json_get_values r0kh r0kh
 				json_get_values r1kh r1kh
 
@@ -1028,6 +1032,7 @@ hostapd_set_bss_options() {
 					set_default r1kh "00:00:00:00:00:00,00:00:00:00:00:00,$key"
 				}
 
+				[ -n "$ft_key" ] && append bss_conf "ft_key=$ft_key" "$N"
 				[ -n "$r1_key_holder" ] && append bss_conf "r1_key_holder=$r1_key_holder" "$N"
 				append bss_conf "r0_key_lifetime=$r0_key_lifetime" "$N"
 				append bss_conf "pmk_r1_push=$pmk_r1_push" "$N"
