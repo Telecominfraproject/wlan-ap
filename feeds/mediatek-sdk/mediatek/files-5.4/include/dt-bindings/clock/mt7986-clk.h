@@ -109,6 +109,7 @@
 #define CK_TOP_F26M			48
 #define CK_TOP_AUD_L			49
 #define CK_TOP_A_TUNER			50
+#define CLK_TOP_CONN_MCUSYS_SEL		50
 #define CK_TOP_U2U3_REF			51
 #define CK_TOP_U2U3_SYS			52
 #define CK_TOP_U2U3_XHCI		53
@@ -121,6 +122,7 @@
 #define CK_TOP_PWM_SEL			60
 #define CK_TOP_I2C_SEL			61
 #define CK_TOP_PEXTP_TL_SEL		62
+#define CLK_TOP_AP2CNN_HOST_SEL		62
 #define CK_TOP_EMMC_250M_SEL		63
 #define CK_TOP_EMMC_416M_SEL		64
 #define CK_TOP_F_26M_ADC_SEL		65
