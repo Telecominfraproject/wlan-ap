@@ -32,6 +32,9 @@ platform_do_upgrade() {
 		fi
 		nand_do_upgrade "$1"
 		;;
+	sonicfi,rap630w-211g)
+		/tmp/nand_sonicfi_rap630w_211g.sh "$1"
+		;;		
 	esac
 }
 
@@ -46,6 +49,13 @@ platform_check_image() {
 		nand_do_platform_check "$board" "$1"
 		return $?
 		;;
+	sonicfi,rap630w-211g)
+		[ "$magic" != "73797375" ] && {
+			echo "Invalid image type."
+			return 1
+		}
+		return 0
+		;;		
 	esac
 
 	return 0
