@@ -79,12 +79,17 @@ function lookup_phys() {
 			continue;
 
 		let p = { path, phyname, index: phy.wiphy };
+		p.channels = [];
+		p.dfs_channels = [];
 		p.htmode = [];
 		p.band = [];
 		for (let band in phy.wiphy_bands) {
 			for (let freq in band?.freqs) {
 				if (freq.disabled)
 					continue;
+				push(p.channels, freq2channel(freq.freq));
+				if (freq.radar)
+					push(p.dfs_channels, freq2channel(freq.freq));
 				if (freq.freq >= 6000)
 					push(p.band, '6G');
 				else if (freq.freq <= 2484)
