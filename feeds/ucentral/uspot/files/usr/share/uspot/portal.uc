@@ -6,29 +6,6 @@ let uci = require('uci').cursor();
 let config = uci.get_all('uspot');
 let nl = require("nl80211");
 
-let file = fs.open('/usr/share/uspot/header', 'r');
-let header = file.read('all');
-file.close();
-
-file = fs.open('/usr/share/uspot/footer', 'r');
-let footer = file.read('all');
-file.close();
-
-let header_custom;
-let footer_custom;
-
-file = fs.open('/tmp/ucentral/www-uspot/header.html', 'r');
-if (file) {
-	header_custom = file.read('all');
-	file.close();
-}
-
-file = fs.open('/tmp/ucentral/www-uspot/footer.html', 'r');
-if (file) {
-	footer_custom = file.read('all');
-	file.close();
-}
-
 let devices = {};
 uci.foreach('uspot', 'uspot', (d) => {
 	function adddev(ifname, sname) {
@@ -81,8 +58,6 @@ return {
 	uam: require('uam'),
 	uci,
 	config,
-	header,
-	footer,
 
 	// syslog helper
 	syslog: function(ctx, msg) {
@@ -163,16 +138,17 @@ return {
 				"connect": time(),
 			}
 		});
-		if (ctx.query_string.userurl)
-			include('redir.uc', { redir_location: ctx.query_string.userurl });
-		else
-			include('allow.uc', ctx);
 
 		// start accounting
 		ctx.ubus.call('uspot', 'client_add', {
 			interface: ctx.spotfilter,
 			address: ctx.mac,
 		});
+		
+		if (ctx.query_string.userurl)
+			include('redir.uc', { redir_location: ctx.query_string.userurl });
+		else
+			include('serve.uc', { location: '/allow.html' });
 	},
 
 	// put a client back into pre-auth state
@@ -260,7 +236,7 @@ return {
 		let form_data = {};
 		let query_string = {};
 		let post_data = '';
-		let ctx = { env, header: this.header, footer: this.footer, mac, form_data, post_data, query_string, config: this.config, PO };
+		let ctx = { env, mac, form_data, post_data, query_string, config: this.config, PO };
 
 		// lookup the peers MAC
 		let macs = this.rtnl.request(this.rtnl.const.RTM_GETNEIGH, this.rtnl.const.NLM_F_DUMP, { });
@@ -277,10 +253,6 @@ return {
 		ctx.spotfilter = lookup_station(ctx.mac);
 		ctx.config = config[ctx.spotfilter] || {};
 		ctx.format_mac = this.format_mac(ctx.config.mac_format, ctx.mac);
-		if (+ctx.config.web_root) {
-			ctx.header = header_custom;
-			ctx.footer = footer_custom;
-		}
 
 		// check if a client is already connected
 		ctx.ubus = ubus.connect();
@@ -304,7 +276,7 @@ return {
 				this.logoff(ctx, false);
 				break;
 			default:
-				include('connected.uc', ctx);
+				include('serve.uc', { location: '/connected.html' });
 				break;
 			}
 			return;

@@ -10,13 +10,13 @@ function request_start(ctx) {
 	portal.debug(ctx, 'start ' + (ctx.config.auth_mode || '') + ' flow');
 	switch (ctx.config.auth_mode) {
 	case 'click-to-continue':
-		include('click.uc', ctx);
+		include('serve.uc', { location: '/click.html' });
 		return;
 	case 'credentials':
-		include('credentials.uc', ctx);
+		include('serve.uc', { location: '/credentials.html' });
 		return;
 	case 'radius':
-		include('radius.uc', ctx);
+		include('serve.uc', { location: '/radius.html' });
 		return;
 	case 'uam':
 		// try mac-auth first if enabled
