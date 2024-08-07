@@ -156,3 +156,15 @@ define Device/optimcloud_d60
   DEVICE_DTS_CONFIG := config@mp03.1
 endef
 TARGET_DEVICES += optimcloud_d60
+
+define Device/glinet_b3000
+  DEVICE_TITLE := GL.iNet B3000
+  DEVICE_DTS := qcom-ipq5018-gl-b3000
+  SUPPORTED_DEVICES := glinet,b3000
+  DEVICE_PACKAGES := ath11k-wifi-gl-b3000 ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.5-c1
+  IMAGES := sysupgrade.tar nand-factory.bin
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
+endef
+TARGET_DEVICES += glinet_b3000

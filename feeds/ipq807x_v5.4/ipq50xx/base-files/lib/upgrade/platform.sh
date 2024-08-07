@@ -80,6 +80,7 @@ platform_check_image() {
 	optimcloud,d50|\
 	optimcloud,d50-5g|\
 	yuncore,fap655|\
+	glinet,b3000|\
 	udaya,a6-id2|\
 	edgecore,oap101|\
 	edgecore,oap101-6e|\
@@ -98,6 +99,7 @@ platform_do_upgrade() {
 
 	board=$(board_name)
 	case $board in
+	glinet,b3000|\
 	edgecore,oap101|\
 	edgecore,oap101-6e|\
 	edgecore,oap101e|\
