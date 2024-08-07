@@ -35,6 +35,7 @@ ALLWIFIBOARDS:= \
 	edgecore-eap101 \
 	gl-ax1800 \
 	gl-axt1800 \
+	gl-b3000 \
 	sercomm-wallaby \
 	edgecore-eap102 \
 	edgecore-oap102 \
@@ -103,6 +104,11 @@ endef
 define Package/ath11k-wifi-gl-axt1800
 $(call Package/ath11k-wifi-default)
     TITLE:=gl-axt1800 bdf
+endef
+
+define Package/ath11k-wifi-gl-b3000
+$(call Package/ath11k-wifi-default)
+    TITLE:=gl-b3000 bdf
 endef
 
 define Package/ath11k-wifi-motorola-q14
@@ -288,6 +294,13 @@ endef
 define Package/ath11k-wifi-gl-axt1800/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
 	$(INSTALL_DATA) ./board-gl-axt1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
+endef
+
+define Package/ath11k-wifi-gl-b3000/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-gl-b3000.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
+	$(INSTALL_DATA) ./board-gl-b3000.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin
 endef
 
 define Package/ath11k-wifi-motorola-q14/install
