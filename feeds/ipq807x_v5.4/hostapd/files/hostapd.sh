@@ -1026,10 +1026,12 @@ hostapd_set_bss_options() {
 				set_default pmk_r1_push 0
 
 				[ -n "$r0kh" -a -n "$r1kh" ] || {
-					key=`echo -n "$mobility_domain/$auth_secret" | md5sum | awk '{print $1}'`
+					[ -z "$ft_key" ] && {
+						key=`echo -n "$mobility_domain/$auth_secret" | md5sum | awk '{print $1}'`
 
-					set_default r0kh "ff:ff:ff:ff:ff:ff,*,$key"
-					set_default r1kh "00:00:00:00:00:00,00:00:00:00:00:00,$key"
+						set_default r0kh "ff:ff:ff:ff:ff:ff,*,$key"
+						set_default r1kh "00:00:00:00:00:00,00:00:00:00:00:00,$key"
+					}
 				}
 
 				[ -n "$ft_key" ] && append bss_conf "ft_key=$ft_key" "$N"
