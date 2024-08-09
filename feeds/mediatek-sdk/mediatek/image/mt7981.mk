@@ -61,6 +61,24 @@ define Device/edgecore_eap111
 endef
 TARGET_DEVICES += edgecore_eap111
 
+define Device/edgecore_eap112
+  DEVICE_VENDOR := EdgeCore
+  DEVICE_MODEL := EAP112
+  DEVICE_DTS := mt7981-edgecore-eap112
+  DEVICE_DTS_DIR := $(DTS_DIR)/mediatek
+  SUPPORTED_DEVICES := edgecore,eap112
+  UBINIZE_OPTS := -E 5
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  IMAGE_SIZE := 65536k
+  KERNEL_IN_UBI := 1
+  IMAGES += factory.bin
+  IMAGE/factory.bin := append-ubi | check-size $$$$(IMAGE_SIZE)
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+  DEVICE_PACKAGES := kmod-mt7981-firmware kmod-mt7915e
+endef
+TARGET_DEVICES += edgecore_eap112
+
 define Device/mt7981-spim-nand-gsw
   DEVICE_VENDOR := MediaTek
   DEVICE_MODEL := mt7981-spim-nand-gsw

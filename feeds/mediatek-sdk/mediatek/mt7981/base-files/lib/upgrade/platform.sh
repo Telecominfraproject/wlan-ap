@@ -3,7 +3,8 @@ platform_do_upgrade() {
 	local board=$(board_name)
 
 	case "$board" in
-	edgecore,eap111)
+	edgecore,eap111|\
+	edgecore,eap112)
 		if [ -e /tmp/downgrade ]; then
 			CI_UBIPART="rootfs1"
 			{ echo 'active 1'; echo 'upgrade_available 0'; } > /tmp/fw_setenv.txt || exit 1
@@ -42,7 +43,8 @@ platform_check_image() {
 	[ "$#" -gt 1 ] && return 1
 
 	case "$board" in
-	edgecore,eap111)
+	edgecore,eap111|\
+	edgecore,eap112)
 		nand_do_platform_check "$board" "$1"
 		return $?
 		;;
