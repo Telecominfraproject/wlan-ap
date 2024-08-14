@@ -614,6 +614,8 @@ define Install/hostapd
 	$(INSTALL_DATA) ./files/radius.users $(1)/etc/radius/users
 	$(INSTALL_BIN) ./files/mpskd $(1)/usr/share/hostap/
 	$(INSTALL_BIN) ./files/mpskd.init $(1)/etc/init.d/mpskd
+	$(INSTALL_BIN) ./files/gps_reset.init $(1)/etc/init.d/gps_reset
+	$(INSTALL_BIN) ./files/gps_lock $(1)/usr/share/hostap/
 endef
 
 define Install/supplicant
