@@ -74,7 +74,7 @@ hostapd_append_wpa_key_mgmt() {
 			append wpa_key_mgmt "OWE"
 		;;
 		psk2-radius)
-			append wpa_key_mgmt "WPA-PSK-SHA256"
+			append wpa_key_mgmt "WPA-PSK"
 			[ "${ieee80211r:-0}" -gt 0 ] && append wpa_key_mgmt "FT-PSK"
 		;;
 	esac
