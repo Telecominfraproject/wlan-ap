@@ -14,9 +14,9 @@ PKG_NAME:=wireguard-backport
 PKG_VERSION:=1.0.20211208
 PKG_RELEASE:=1
 
-PKG_SOURCE:=wireguard-linux-compat-$(PKG_VERSION).tar.xz
+PKG_SOURCE:=wireguard-linux-compat-$(PKG_VERSION).zip
 PKG_SOURCE_URL:=https://git.zx2c4.com/wireguard-linux-compat/snapshot/
-PKG_HASH:=a594436deae9a19739207024fdb7fe5d2e5c11aa15f3120973d13173f288ec38
+PKG_HASH:=eebae0ef776a5b7928465372b675cb09d00a9a31d315b48a5e57c0fdab708420
 
 PKG_LICENSE:=GPL-2.0
 PKG_LICENSE_FILES:=COPYING
