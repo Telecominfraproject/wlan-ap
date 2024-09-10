@@ -47,8 +47,8 @@ hostapd_append_wpa_key_mgmt() {
 			[ "${ieee80211w:-0}" -gt 0 ] && append wpa_key_mgmt "WPA-${auth_type_l}-SHA256"
 		;;
 		eap192)
-			append wpa_key_mgmt "WPA-EAP-SUITE-B-192"
-			[ "${ieee80211r:-0}" -gt 0 ] && append wpa_key_mgmt "FT-EAP"
+			[ "${ieee80211r:-0}" -gt 0 ] || append wpa_key_mgmt "WPA-EAP-SUITE-B-192"
+			[ "${ieee80211r:-0}" -gt 0 ] && append wpa_key_mgmt "FT-EAP-SHA384"
 		;;
 		eap-eap2)
 			append wpa_key_mgmt "WPA-EAP"
@@ -72,6 +72,11 @@ hostapd_append_wpa_key_mgmt() {
 		;;
 		owe)
 			append wpa_key_mgmt "OWE"
+		;;
+		psk2-radius)
+			append wpa_key_mgmt "WPA-PSK"
+			[ "${ieee80211r:-0}" -gt 0 ] && append wpa_key_mgmt "FT-PSK"
+			[ "${ieee80211w:-0}" -gt 0 ] && append wpa_key_mgmt "WPA-PSK-SHA256"
 		;;
 	esac
 
@@ -126,7 +131,28 @@ hostapd_common_add_device_config() {
 
 	config_add_boolean multiple_bssid rnr_beacon he_co_locate ema
 
+	config_add_boolean afc
+	config_add_string \
+		afc_request_version afc_request_id afc_serial_number \
+		afc_location_type afc_location afc_height afc_height_type
+	config_add_array afc_cert_ids afc_freq_range afc_op_class
+	config_add_int \
+		afc_min_power afc_major_axis afc_minor_axis afc_orientation \
+		afc_vertical_tolerance
+
 	hostapd_add_log_config
+}
+
+
+hostapd_get_list() {
+	local var="$1"
+	local field="$2"
+
+	local cur __val_list
+	json_get_values __val_list "$field"
+	for cur in $__val_list; do
+		append "$var" "$cur" ","
+	done
 }
 
 hostapd_prepare_device_config() {
@@ -139,7 +165,7 @@ hostapd_prepare_device_config() {
 		acs_chan_bias local_pwr_constraint spectrum_mgmt_required airtime_mode cell_density \
 		rts_threshold beacon_rate rssi_reject_assoc_rssi rssi_ignore_probe_request maxassoc \
 		multiple_bssid he_co_locate rnr_beacon ema acs_exclude_dfs \
-		maxassoc_ignore_probe
+		maxassoc_ignore_probe band
 
 	hostapd_set_log_options base_cfg
 
@@ -252,6 +278,45 @@ hostapd_prepare_device_config() {
 	[ "$multiple_bssid" -gt 0 ] && append base_cfg "multiple_bssid=$multiple_bssid" "$N"
 	[ "$ema" -gt 0 ] && append base_cfg "ema=$ema" "$N"
 	[ "$acs_exclude_dfs" -gt 0 ] && append base_cfg "acs_exclude_dfs=$acs_exclude_dfs" "$N"
+	if [ "$band" = "6g" ]; then
+		json_get_vars afc he_6ghz_reg_pwr_type
+	else
+		afc=0
+		he_6ghz_reg_pwr_type=
+	fi
+	set_default afc 0
+	[ "$afc" -gt 0 ] && {
+		for v in afc_request_version afc_request_id afc_serial_number afc_min_power afc_height afc_height_type afc_vertical_tolerance \
+				 afc_major_axis afc_minor_axis afc_orientation; do
+			json_get_var val $v
+			append base_cfg "$v=$val" "$N"
+		done
+
+		for v in afc_cert_ids afc_op_class afc_freq_range; do
+			val=
+			hostapd_get_list val $v
+			append base_cfg "$v=$val" "$N"
+		done
+
+		json_get_vars afc_location_type afc_location
+		case "$afc_location_type" in
+			ellipse)
+				append base_cfg "afc_location_type=0" "$N"
+				append base_cfg "afc_linear_polygon=$afc_location" "$N"
+			;;
+			linear_polygon)
+				append base_cfg "afc_location_type=1" "$N"
+				append base_cfg "afc_linear_polygon=$afc_location" "$N"
+			;;
+			radial_polygon)
+				append base_cfg "afc_location_type=2" "$N"
+				append base_cfg "afc_radial_polygon=$afc_location" "$N"
+			;;
+		esac
+
+		he_6ghz_reg_pwr_type=1
+	}
+	[ -n "$he_6ghz_reg_pwr_type" ] && append base_cfg "he_6ghz_reg_pwr_type=$he_6ghz_reg_pwr_type" "$N"
 
 	json_get_values opts hostapd_options
 	for val in $opts; do
@@ -344,8 +409,8 @@ hostapd_common_add_bss_config() {
 	config_add_string lci civic
 
 	config_add_boolean ieee80211r pmk_r1_push ft_psk_generate_local ft_over_ds
-	config_add_int r0_key_lifetime reassociation_deadline
-	config_add_string mobility_domain r1_key_holder
+	config_add_int r0_key_lifetime reassociation_deadline ft_l2_refresh
+	config_add_string mobility_domain r1_key_holder ft_key
 	config_add_array r0kh r1kh
 
 	config_add_int ieee80211w_max_timeout ieee80211w_retry_timeout
@@ -439,6 +504,7 @@ hostapd_set_psk() {
 	local ifname="$1"
 
 	rm -f /var/run/hostapd-${ifname}.psk
+	touch /var/run/hostapd-${ifname}.psk
 	for_each_station hostapd_set_psk_file ${ifname}
 }
 
@@ -602,7 +668,7 @@ append_radius_server() {
 	set_default dae_port 3799
 	set_default request_cui 0
 
-	[ "$eap_server" -eq 0 ] && {
+	[ "$eap_server" -eq 0  -a -n "$auth_server" ] && {
 		append bss_conf "auth_server_addr=$auth_server" "$N"
 		append bss_conf "auth_server_port=$auth_port" "$N"
 		append bss_conf "auth_server_shared_secret=$auth_secret" "$N"
@@ -724,8 +790,7 @@ hostapd_set_bss_options() {
 		[ -n "$wpa_strict_rekey" ] && append bss_conf "wpa_strict_rekey=$wpa_strict_rekey" "$N"
 	}
 
-	set_default nasid "${macaddr//\:}"
-	append bss_conf "nas_identifier=$nasid" "$N"
+	[ -n "$nasid" ] && append bss_conf "nas_identifier=$nasid" "$N"
 
 	[ -n "$acct_server" ] && {
 		append bss_conf "acct_server_addr=$acct_server" "$N"
@@ -772,9 +837,7 @@ hostapd_set_bss_options() {
 			# with WPS enabled, we got to be in unconfigured state.
 			wps_not_configured=1
 			vlan_possible=1
-			[ "$macfilter" = radius ] && {
-				append_radius_server
-			}
+			append_radius_server
 		;;
 		psk|sae|psk-sae)
 			json_get_vars key wpa_psk_file
@@ -793,6 +856,7 @@ hostapd_set_bss_options() {
 			}
 			[ "$eapol_version" -ge "1" -a "$eapol_version" -le "2" ] && append bss_conf "eapol_version=$eapol_version" "$N"
 
+			append_radius_server
 			set_default dynamic_vlan 0
 			vlan_possible=1
 			wps_possible=1
@@ -925,10 +989,11 @@ hostapd_set_bss_options() {
 		set_default ieee80211r 0
 
 		if [ "$ieee80211r" -gt "0" ]; then
-			json_get_vars mobility_domain ft_psk_generate_local ft_over_ds reassociation_deadline
+			json_get_vars mobility_domain ft_psk_generate_local ft_over_ds reassociation_deadline ft_l2_refresh
 
 			set_default mobility_domain "$(echo "$ssid" | md5sum | head -c 4)"
 			set_default ft_over_ds 1
+			set_default ft_l2_refresh 30
 			set_default reassociation_deadline 1000
 			skip_kh_setup=0
 
@@ -951,9 +1016,10 @@ hostapd_set_bss_options() {
 			append bss_conf "ft_psk_generate_local=$ft_psk_generate_local" "$N"
 			append bss_conf "ft_over_ds=$ft_over_ds" "$N"
 			append bss_conf "reassociation_deadline=$reassociation_deadline" "$N"
+			[ -n "$ft_l2_refresh" ] && append bss_conf "ft_l2_refresh=$ft_l2_refresh" "$N"
 
 			if [ "$skip_kh_setup" -eq "0" ]; then
-				json_get_vars r0_key_lifetime r1_key_holder pmk_r1_push
+				json_get_vars r0_key_lifetime r1_key_holder pmk_r1_push ft_key
 				json_get_values r0kh r0kh
 				json_get_values r1kh r1kh
 
@@ -961,12 +1027,15 @@ hostapd_set_bss_options() {
 				set_default pmk_r1_push 0
 
 				[ -n "$r0kh" -a -n "$r1kh" ] || {
-					key=`echo -n "$mobility_domain/$auth_secret" | md5sum | awk '{print $1}'`
+					[ -z "$ft_key" ] && {
+						key=`echo -n "$mobility_domain/$auth_secret" | md5sum | awk '{print $1}'`
 
-					set_default r0kh "ff:ff:ff:ff:ff:ff,*,$key"
-					set_default r1kh "00:00:00:00:00:00,00:00:00:00:00:00,$key"
+						set_default r0kh "ff:ff:ff:ff:ff:ff,*,$key"
+						set_default r1kh "00:00:00:00:00:00,00:00:00:00:00:00,$key"
+					}
 				}
 
+				[ -n "$ft_key" ] && append bss_conf "ft_key=$ft_key" "$N"
 				[ -n "$r1_key_holder" ] && append bss_conf "r1_key_holder=$r1_key_holder" "$N"
 				append bss_conf "r0_key_lifetime=$r0_key_lifetime" "$N"
 				append bss_conf "pmk_r1_push=$pmk_r1_push" "$N"

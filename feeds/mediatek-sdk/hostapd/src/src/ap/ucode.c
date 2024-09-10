@@ -9,6 +9,7 @@
 #include "ap_drv_ops.h"
 #include "dfs.h"
 #include "acs.h"
+#include "ieee802_11_auth.h"
 #include <libubox/uloop.h>
 
 static uc_resource_type_t *global_type, *bss_type, *iface_type;
@@ -51,7 +52,7 @@ hostapd_ucode_update_bss_list(struct hostapd_iface *iface, uc_value_t *if_bss, u
 	int i;
 
 	list = ucv_array_new(vm);
-	for (i = 0; i < iface->num_bss; i++) {
+	for (i = 0; iface->bss && i < iface->num_bss; i++) {
 		struct hostapd_data *hapd = iface->bss[i];
 		uc_value_t *val = hostapd_ucode_bss_get_uval(hapd);
 
@@ -255,6 +256,7 @@ uc_hostapd_bss_set_config(uc_vm_t *vm, size_t nargs)
 
 	hostapd_setup_bss(hapd, hapd == iface->bss[0], true);
 	hostapd_ucode_update_interfaces();
+	hostapd_owe_update_trans(iface);
 
 done:
 	ret = 0;
@@ -375,6 +377,7 @@ uc_hostapd_iface_add_bss(uc_vm_t *vm, size_t nargs)
 	conf->bss[idx] = NULL;
 	ret = hostapd_ucode_bss_get_uval(hapd);
 	hostapd_ucode_update_interfaces();
+	hostapd_owe_update_trans(iface);
 	goto out;
 
 deinit_ctrl:
@@ -603,6 +606,7 @@ out:
 
 		ieee802_11_set_beacon(hapd);
 	}
+	hostapd_owe_update_trans(iface);
 
 	return ucv_boolean_new(true);
 }
@@ -694,6 +698,7 @@ uc_hostapd_bss_rename(uc_vm_t *vm, size_t nargs)
 	hostapd_ubus_add_bss(hapd);
 
 	hostapd_ucode_update_interfaces();
+	hostapd_owe_update_trans(hapd->iface);
 out:
 	if (interfaces->ctrl_iface_init)
 		interfaces->ctrl_iface_init(hapd);
@@ -701,6 +706,113 @@ out:
 	return ret ? NULL : ucv_boolean_new(true);
 }
 
+int hostapd_ucode_sta_auth(struct hostapd_data *hapd, struct sta_info *sta)
+{
+	char addr[sizeof(MACSTR)];
+	uc_value_t *val, *cur;
+	int ret = 0;
+
+	if (wpa_ucode_call_prepare("sta_auth"))
+		return 0;
+
+	uc_value_push(ucv_get(ucv_string_new(hapd->conf->iface)));
+
+	snprintf(addr, sizeof(addr), MACSTR, MAC2STR(sta->addr));
+	val = ucv_string_new(addr);
+	uc_value_push(ucv_get(val));
+
+	val = wpa_ucode_call(2);
+
+	cur = ucv_object_get(val, "psk", NULL);
+	if (ucv_type(cur) == UC_ARRAY) {
+		struct hostapd_sta_wpa_psk_short *p, **next;
+		size_t len = ucv_array_length(cur);
+
+		next = &sta->psk;
+		hostapd_free_psk_list(*next);
+		*next = NULL;
+
+		for (size_t i = 0; i < len; i++) {
+			uc_value_t *cur_psk;
+			const char *str;
+			size_t str_len;
+
+			cur_psk = ucv_array_get(cur, i);
+			str = ucv_string_get(cur_psk);
+			str_len = strlen(str);
+			if (!str || str_len < 8 || str_len > 64)
+				continue;
+
+			p = os_zalloc(sizeof(*p));
+			if (len == 64) {
+				if (hexstr2bin(str, p->psk, PMK_LEN) < 0) {
+					free(p);
+					continue;
+				}
+			} else {
+				p->is_passphrase = 1;
+				memcpy(p->passphrase, str, str_len + 1);
+			}
+
+			*next = p;
+			next = &p->next;
+		}
+	}
+
+	cur = ucv_object_get(val, "force_psk", NULL);
+	sta->use_sta_psk = ucv_is_truish(cur);
+
+	cur = ucv_object_get(val, "status", NULL);
+	if (ucv_type(cur) == UC_INTEGER)
+		ret = ucv_int64_get(cur);
+
+	ucv_put(val);
+	ucv_gc(vm);
+
+	return ret;
+}
+
+void hostapd_ucode_sta_connected(struct hostapd_data *hapd, struct sta_info *sta)
+{
+	struct hostapd_sta_wpa_psk_short *psk = sta->psk;
+	char addr[sizeof(MACSTR)];
+	uc_value_t *val, *cur;
+	int ret = 0;
+
+	if (wpa_ucode_call_prepare("sta_connected"))
+		return;
+
+	uc_value_push(ucv_get(ucv_string_new(hapd->conf->iface)));
+
+	snprintf(addr, sizeof(addr), MACSTR, MAC2STR(sta->addr));
+	val = ucv_string_new(addr);
+	uc_value_push(ucv_get(val));
+
+	val = ucv_object_new(vm);
+	if (sta->psk_idx)
+		ucv_object_add(val, "psk_idx", ucv_int64_new(sta->psk_idx - 1));
+	if (sta->psk)
+		ucv_object_add(val, "psk", ucv_string_new(sta->psk->passphrase));
+	uc_value_push(ucv_get(val));
+
+	val = wpa_ucode_call(3);
+	if (ucv_type(val) != UC_OBJECT)
+		goto out;
+
+	cur = ucv_object_get(val, "vlan", NULL);
+	if (ucv_type(cur) == UC_INTEGER) {
+		struct vlan_description vdesc = {
+			.notempty = 1,
+			.untagged = ucv_int64_get(cur),
+		};
+
+		ap_sta_set_vlan(hapd, sta, &vdesc);
+		ap_sta_bind_vlan(hapd, sta);
+	}
+
+out:
+	ucv_put(val);
+}
 
 int hostapd_ucode_init(struct hapd_interfaces *ifaces)
 {
@@ -763,6 +875,34 @@ void hostapd_ucode_free(void)
 void hostapd_ucode_free_iface(struct hostapd_iface *iface)
 {
 	wpa_ucode_registry_remove(iface_registry, iface->ucode.idx);
+}
+
+int hostapd_ucode_afc_request(struct hostapd_iface *iface, const char *request,
+			      char *buf, size_t len)
+{
+	uc_value_t *val;
+	size_t ret_len;
+	int ret = -1;
+
+	if (wpa_ucode_call_prepare("afc_request"))
+		return -1;
+
+	uc_value_push(ucv_get(ucv_string_new(iface->phy)));
+	uc_value_push(ucv_get(ucv_string_new(request)));
+	val = wpa_ucode_call(2);
+	if (ucv_type(val) != UC_STRING)
+		goto out;
+
+	ret_len = ucv_string_length(val);
+	if (ret_len >= len)
+		goto out;
+
+	memcpy(buf, ucv_string_get(val), ret_len + 1);
+	ret = (int)ret_len;
+
+out:
+	ucv_put(val);
+	return ret;
 }
 
 void hostapd_ucode_add_bss(struct hostapd_data *hapd)

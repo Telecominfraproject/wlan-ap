@@ -431,6 +431,10 @@ radius_user_parse_methods(struct eap_user *eap, struct blob_attr *data)
 				eap->ttls_auth |= EAP_TTLS_AUTH_MSCHAPV2;
 				continue;
 			}
+			if (!strcmp(method, "MACACL")) {
+				eap->macacl = 1;
+				continue;
+			}
 		}
 		n++;
 	}
