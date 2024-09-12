@@ -32,8 +32,6 @@ ALLWIFIBOARDS:= \
 	cybertan-eww622-a1 \
 	cybertan-eww631-a1 \
 	cybertan-eww631-b1 \
-	sonicfi-rap630c-311g \
-	sonicfi-rap630w-311g \
 	edgecore-eap101 \
 	gl-ax1800 \
 	gl-axt1800 \
@@ -188,6 +186,16 @@ endef
 define Package/ath11k-wifi-cig-wf188n
 $(call Package/ath11k-wifi-default)
     TITLE:=cig-wf188n bdf
+endef
+
+define Package/ath11k-wifi-sonicfi-rap630c-311g
+$(call Package/ath11k-wifi-default)
+    TITLE:=sonicfi-rap630c-311g bdf
+endef
+
+define Package/ath11k-wifi-sonicfi-rap630w-311g
+$(call Package/ath11k-wifi-default)
+    TITLE:=sonicfi-rap630w-311g bdf
 endef
 
 define ath11k-wifi-install-one-to
@@ -384,6 +392,24 @@ define Package/ath11k-wifi-cig-wf188n/install
 	$(INSTALL_DATA) ./board-cig-wf188n-us.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board.bin.US
 endef
 
+define Package/ath11k-wifi-sonicfi-rap630c-311g/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-sonicfi-rap630c-311g-ca.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin.CA
+	$(INSTALL_DATA) ./board-sonicfi-rap630c-311g-us.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin.US
+	$(INSTALL_DATA) ./board-sonicfi-rap630c-311g-ca.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin.CA
+	$(INSTALL_DATA) ./board-sonicfi-rap630c-311g-us.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin.US
+endef
+
+define Package/ath11k-wifi-sonicfi-rap630w-311g/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-sonicfi-rap630w-311g-ca.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin.CA
+	$(INSTALL_DATA) ./board-sonicfi-rap630w-311g-us.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin.US
+	$(INSTALL_DATA) ./board-sonicfi-rap630w-311g-ca.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin.CA
+	$(INSTALL_DATA) ./board-sonicfi-rap630w-311g-us.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin.US
+endef
+
 $(eval $(call generate-ath11k-wifi-package,cig-wf186w,Cigtech WF186w))
 $(eval $(call generate-ath11k-wifi-package,cig-wf186h,Cigtech WF186h))
 $(eval $(call generate-ath11k-wifi-package,cig-wf660a,Cigtech WF660a))
@@ -392,8 +418,6 @@ $(eval $(call generate-ath11k-wifi-package,cig-wf194c4,Cigtech WF194c4))
 $(eval $(call generate-ath11k-wifi-package,cybertan-eww622-a1,CyberTan EWW622 A1))
 $(eval $(call generate-ath11k-wifi-package,cybertan-eww631-a1,CyberTan EWW631 A1))
 $(eval $(call generate-ath11k-wifi-package,cybertan-eww631-b1,CyberTan EWW631 B1))
-$(eval $(call generate-ath11k-wifi-package,sonicfi-rap630c-311g,Sonicfi RAP630C 311G))
-$(eval $(call generate-ath11k-wifi-package,sonicfi-rap630w-311g,Sonicfi RAP630W 311G))
 $(eval $(call generate-ath11k-wifi-package,sercomm-wallaby,Sercomm Kiwi))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018,Wallys DR6018))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018-v4,Wallys DR6018 V4))
@@ -435,3 +459,5 @@ $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_HMR))
 $(eval $(call BuildPackage,ath11k-wifi-edgecore-oap101))
 $(eval $(call BuildPackage,ath11k-wifi-edgecore-oap101e))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf188n))
+$(eval $(call BuildPackage,ath11k-wifi-sonicfi-rap630c-311g))
+$(eval $(call BuildPackage,ath11k-wifi-sonicfi-rap630w-311g))
