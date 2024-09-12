@@ -1873,6 +1873,7 @@ void hostapd_ubus_notify_authorized(struct hostapd_data *hapd, struct sta_info *
 	blobmsg_add_macaddr(&b, "address", sta->addr);
 	if (auth_alg)
 		blobmsg_add_string(&b, "auth-alg", auth_alg);
+	blobmsg_add_string(&b, "ifname", hapd->conf->iface);
 
 	ubus_notify(ctx, &hapd->ubus.obj, "sta-authorized", b.head, -1);
 }
