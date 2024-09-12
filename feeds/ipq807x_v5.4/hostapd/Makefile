@@ -601,6 +601,7 @@ define Package/afcd/install
 	$(INSTALL_DIR) $(1)/usr/share/hostap $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/afcd.init $(1)/etc/init.d/afcd
 	$(INSTALL_DATA) ./files/afcd.uc $(1)/usr/share/hostap/
+	$(INSTALL_DATA) ./files/afc_location.uc $(1)/usr/share/hostap/
 endef
 
 define Install/hostapd
