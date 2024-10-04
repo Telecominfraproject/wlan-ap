@@ -70,9 +70,12 @@ platform_check_image() {
 	case $board in
 	cig,wf186w|\
 	cig,wf186h|\
+	sonicfi,rap630c-311g|\
+	sonicfi,rap630w-311g|\
 	cybertan,eww631-a1|\
 	cybertan,eww631-b1|\
 	edgecore,eap104|\
+	wallys,dr5018|\
 	hfcl,ion4x_w|\
 	hfcl,ion4xi_w|\
 	optimcloud,d60|\
@@ -80,6 +83,7 @@ platform_check_image() {
 	optimcloud,d50|\
 	optimcloud,d50-5g|\
 	yuncore,fap655|\
+	glinet,b3000|\
 	udaya,a6-id2|\
 	udaya,a6-od2|\
 	edgecore,oap101|\
@@ -99,6 +103,7 @@ platform_do_upgrade() {
 
 	board=$(board_name)
 	case $board in
+	glinet,b3000|\	
 	edgecore,oap101|\
 	edgecore,oap101-6e|\
 	edgecore,oap101e|\
@@ -123,6 +128,7 @@ platform_do_upgrade() {
                 ;;
 	cig,wf186w|\
 	cig,wf186h|\
+	wallys,dr5018|\
 	udaya,a6-id2|\
 	udaya,a6-od2|\
 	optimcloud,d60|\
@@ -136,6 +142,8 @@ platform_do_upgrade() {
 		}
 		nand_upgrade_tar "$1"
 		;;
+	sonicfi,rap630c-311g|\
+	sonicfi,rap630w-311g|\	
 	cybertan,eww631-a1|\
 	cybertan,eww631-b1)
 		boot_part=$(fw_printenv bootfrom | cut  -d = -f2)
