@@ -32,12 +32,9 @@ ALLWIFIBOARDS:= \
 	cybertan-eww622-a1 \
 	cybertan-eww631-a1 \
 	cybertan-eww631-b1 \
-	sonicfi-rap630c-311g \
-	sonicfi-rap630w-311g \
 	edgecore-eap101 \
 	gl-ax1800 \
 	gl-axt1800 \
-	gl-b3000 \
 	sercomm-wallaby \
 	edgecore-eap102 \
 	edgecore-oap102 \
@@ -48,7 +45,6 @@ ALLWIFIBOARDS:= \
 	indio-um-510axm-v1 \
 	muxi-ap3220l \
 	plasmacloud-pax1800 \
-	wallys-dr5018 \
 	wallys-dr6018 \
 	wallys-dr6018-v4 \
 	tplink-ex227 \
@@ -57,6 +53,7 @@ ALLWIFIBOARDS:= \
 	yuncore-fap650 \
 	yuncore-fap655 \
 	udaya-a6-id2 \
+	udaya-a6-od2 \
 	meshpp-s618
 
 ALLWIFIPACKAGES:=$(foreach BOARD,$(ALLWIFIBOARDS),ath11k-wifi-$(BOARD))
@@ -107,11 +104,6 @@ endef
 define Package/ath11k-wifi-gl-axt1800
 $(call Package/ath11k-wifi-default)
     TITLE:=gl-axt1800 bdf
-endef
-
-define Package/ath11k-wifi-gl-b3000
-$(call Package/ath11k-wifi-default)
-    TITLE:=gl-b3000 bdf
 endef
 
 define Package/ath11k-wifi-motorola-q14
@@ -299,13 +291,6 @@ define Package/ath11k-wifi-gl-axt1800/install
 	$(INSTALL_DATA) ./board-gl-axt1800.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board-2.bin
 endef
 
-define Package/ath11k-wifi-gl-b3000/install
-	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
-	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
-	$(INSTALL_DATA) ./board-gl-b3000.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin
-	$(INSTALL_DATA) ./board-gl-b3000.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin
-endef
-
 define Package/ath11k-wifi-motorola-q14/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
@@ -392,8 +377,6 @@ $(eval $(call generate-ath11k-wifi-package,cig-wf194c4,Cigtech WF194c4))
 $(eval $(call generate-ath11k-wifi-package,cybertan-eww622-a1,CyberTan EWW622 A1))
 $(eval $(call generate-ath11k-wifi-package,cybertan-eww631-a1,CyberTan EWW631 A1))
 $(eval $(call generate-ath11k-wifi-package,cybertan-eww631-b1,CyberTan EWW631 B1))
-$(eval $(call generate-ath11k-wifi-package,sonicfi-rap630c-311g,Sonicfi RAP630C 311G))
-$(eval $(call generate-ath11k-wifi-package,sonicfi-rap630w-311g,Sonicfi RAP630W 311G))
 $(eval $(call generate-ath11k-wifi-package,sercomm-wallaby,Sercomm Kiwi))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018,Wallys DR6018))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018-v4,Wallys DR6018 V4))
@@ -413,7 +396,7 @@ $(eval $(call generate-ath11k-wifi-package,muxi-ap3220l,MUXI AP3220L))
 $(eval $(call generate-ath11k-wifi-package,yuncore-fap650,YunCore FAP650))
 $(eval $(call generate-ath11k-wifi-package,yuncore-fap655,YunCore FAP655))
 $(eval $(call generate-ath11k-wifi-package,udaya-a6-id2,Udaya A6-ID2))
-$(eval $(call generate-ath11k-wifi-package,wallys-dr5018,Wallys DR5018))
+$(eval $(call generate-ath11k-wifi-package,udaya-a6-od2,Udaya A6-OD2))
 
 $(foreach PACKAGE,$(ALLWIFIPACKAGES),$(eval $(call BuildPackage,$(PACKAGE))))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq5018))
