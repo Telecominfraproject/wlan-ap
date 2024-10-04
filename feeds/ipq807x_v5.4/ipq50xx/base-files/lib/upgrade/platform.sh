@@ -85,6 +85,7 @@ platform_check_image() {
 	yuncore,fap655|\
 	glinet,b3000|\
 	udaya,a6-id2|\
+	udaya,a6-od2|\
 	edgecore,oap101|\
 	edgecore,oap101-6e|\
 	edgecore,oap101e|\
@@ -128,6 +129,7 @@ platform_do_upgrade() {
 	cig,wf186w|\
 	cig,wf186h|\
 	udaya,a6-id2|\
+	udaya,a6-od2|\
 	wallys,dr5018|\
 	optimcloud,d60|\
 	optimcloud,d60-5g|\
