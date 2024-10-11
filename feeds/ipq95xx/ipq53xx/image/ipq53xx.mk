@@ -35,3 +35,15 @@ define Device/edgecore_eap105
   DEVICE_PACKAGES := ath12k-wifi-edgecore-eap105 ath12k-firmware-qcn92xx-split-phy ath12k-firmware-ipq53xx
 endef
 TARGET_DEVICES += edgecore_eap105
+
+define Device/sonicfi_rap7110c_341x
+  DEVICE_TITLE := SONICFI RAP7110C-341X
+  DEVICE_DTS := ipq5332-sonicfi-rap7110c-341x
+  DEVICE_DTS_CONFIG := config@mi01.6
+  SUPPORTED_DEVICES := sonicfi,rap7110c-341x
+  IMAGES := sysupgrade.tar mmc-factory.bin
+  IMAGE/mmc-factory.bin := append-ubi | qsdk-ipq-factory-mmc
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  DEVICE_PACKAGES := ath12k-wifi-sonicfi-rap7110c-341x ath12k-firmware-qcn92xx-split-phy ath12k-firmware-ipq53xx
+endef
+TARGET_DEVICES += sonicfi_rap7110c_341x
