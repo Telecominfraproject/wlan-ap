@@ -1,0 +1,2975 @@
+From d83908579b1be56f94c7c11285633357174a51dc Mon Sep 17 00:00:00 2001
+From: Sowmiya Sree Elavalagan <quic_ssreeela@quicinc.com>
+Date: Thu, 3 Aug 2023 23:32:37 +0530
+Subject: [PATCH] ath12k: qcn6432 bring up
+
+Add qcn6432 platform support.
+qcn6432 has a hybrid architecture which is enumerated as
+pci device by Q6 and as ahb device on host. Device BAR
+addressed is received through qmi handshake. Interrupts
+are MSI based. DP and CE register read and write happens
+using static window.
+
+Signed-off-by: Sowmiya Sree Elavalagan <quic_ssreeela@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/Makefile   |   1 +
+ drivers/net/wireless/ath/ath12k/ahb.c      |  43 +-
+ drivers/net/wireless/ath/ath12k/ahb.h      |   5 +
+ drivers/net/wireless/ath/ath12k/ce.c       |   5 +-
+ drivers/net/wireless/ath/ath12k/ce.h       |   1 +
+ drivers/net/wireless/ath/ath12k/core.c     |   7 +-
+ drivers/net/wireless/ath/ath12k/core.h     |  38 +-
+ drivers/net/wireless/ath/ath12k/coredump.c |   2 +-
+ drivers/net/wireless/ath/ath12k/debugfs.c  |   9 +-
+ drivers/net/wireless/ath/ath12k/dp.c       |   7 +-
+ drivers/net/wireless/ath/ath12k/hal.c      |  60 +-
+ drivers/net/wireless/ath/ath12k/hal.h      |   9 +
+ drivers/net/wireless/ath/ath12k/hif.h      |  19 +
+ drivers/net/wireless/ath/ath12k/hw.c       | 220 ++++-
+ drivers/net/wireless/ath/ath12k/hw.h       |   1 +
+ drivers/net/wireless/ath/ath12k/mhi.c      |  10 +-
+ drivers/net/wireless/ath/ath12k/pci.c      | 623 +--------------
+ drivers/net/wireless/ath/ath12k/pci.h      |  22 -
+ drivers/net/wireless/ath/ath12k/pcic.c     | 890 +++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/pcic.h     |  74 ++
+ drivers/net/wireless/ath/ath12k/qmi.c      | 214 ++++-
+ drivers/net/wireless/ath/ath12k/qmi.h      |  17 +
+ 22 files changed, 1638 insertions(+), 639 deletions(-)
+ create mode 100644 drivers/net/wireless/ath/ath12k/pcic.c
+ create mode 100644 drivers/net/wireless/ath/ath12k/pcic.h
+
+--- a/drivers/net/wireless/ath/ath12k/Makefile
++++ b/drivers/net/wireless/ath/ath12k/Makefile
+@@ -18,6 +18,7 @@ ath12k-y += core.o \
+ 	    dbring.o \
+ 	    hw.o \
+ 	    mhi.o \
++	    pcic.o \
+ 	    pci.o \
+ 	    dp_mon.o \
+ 	    vendor.o \
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -5,7 +5,6 @@
+  */
+ 
+ #include <linux/module.h>
+-#include <linux/platform_device.h>
+ #include <linux/of_device.h>
+ #include <linux/of.h>
+ #include <linux/dma-mapping.h>
+@@ -14,6 +13,7 @@
+ #include "ahb.h"
+ #include "debug.h"
+ #include "hif.h"
++#include "pcic.h"
+ #include <linux/remoteproc.h>
+ #include <linux/soc/qcom/smem.h>
+ #include <linux/soc/qcom/smem_state.h>
+@@ -22,6 +22,9 @@ static const struct of_device_id ath12k_
+ 	{ .compatible = "qcom,ipq5332-wifi",
+ 	  .data = (void *)ATH12K_HW_IPQ5332_HW10,
+ 	},
++	{ .compatible = "qcom,qcn6432-wifi",
++	  .data = (void *)ATH12K_HW_QCN6432_HW10,
++	},
+ 	{ }
+ };
+ 
+@@ -405,6 +408,7 @@ static void ath12k_ahb_init_qmi_ce_confi
+ 	cfg->svc_to_ce_map_len = ab->hw_params->svc_to_ce_map_len;
+ 	cfg->svc_to_ce_map = ab->hw_params->svc_to_ce_map;
+ 	ab->qmi.service_ins_id = ab->hw_params->qmi_service_ins_id;
++	ab->qmi.service_ins_id += ab->userpd_id;
+ }
+ 
+ static void ath12k_ahb_free_ext_irq(struct ath12k_base *ab)
+@@ -426,6 +430,9 @@ static void ath12k_ahb_free_irq(struct a
+ 	int irq_idx;
+ 	int i;
+ 
++	if (ab->hif.bus == ATH12K_BUS_HYBRID)
++		return ath12k_pcic_free_hybrid_irq(ab);
++
+ 	for (i = 0; i < ab->hw_params->ce_count; i++) {
+ 		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
+ 			continue;
+@@ -568,6 +575,9 @@ static int ath12k_ahb_config_irq(struct
+ 	int irq, irq_idx, i;
+ 	int ret;
+ 
++	if (ab->hif.bus == ATH12K_BUS_HYBRID)
++		return ath12k_pcic_config_hybrid_irq(ab);
++
+ 	/* Configure CE irqs */
+ 	for (i = 0; i < ab->hw_params->ce_count; i++) {
+ 		struct ath12k_ce_pipe *ce_pipe = &ab->ce.ce_pipe[i];
+@@ -664,6 +674,23 @@ static const struct ath12k_hif_ops ath12
+ 	.ssr_notifier_unreg = ath12k_ahb_ssr_notifier_unreg,
+ };
+ 
++static const struct ath12k_hif_ops ath12k_ahb_hif_ops_qcn6432 = {
++	.start = ath12k_pcic_start,
++	.stop = ath12k_pcic_stop,
++	.cmem_read32 = ath12k_pcic_cmem_read32,
++	.cmem_write32 = ath12k_pcic_cmem_write32,
++	.power_down = ath12k_ahb_power_down,
++	.power_up = ath12k_ahb_power_up,
++	.read32 = ath12k_pcic_ipci_read32,
++	.write32 = ath12k_pcic_ipci_write32,
++	.irq_enable = ath12k_pcic_ext_irq_enable,
++	.irq_disable = ath12k_pcic_ext_irq_disable,
++	.get_msi_address =  ath12k_pcic_get_msi_address,
++	.get_user_msi_vector = ath12k_pcic_get_user_msi_assignment,
++	.config_static_window = ath12k_pcic_config_static_window,
++	.get_msi_irq = ath12k_pcic_get_msi_irq,
++	.map_service_to_pipe = ath12k_pcic_map_service_to_pipe,
++};
+ 
+ static int ath12k_core_get_rproc(struct ath12k_base *ab)
+ {
+@@ -734,6 +761,8 @@ static int ath12k_ahb_setup_resources(st
+ 	struct resource *mem_res;
+ 	void __iomem *mem;
+ 
++	if (ab->hif.bus == ATH12K_BUS_HYBRID)
++		return 0;
+ 
+ 	mem = devm_platform_get_and_ioremap_resource(pdev, 0, &mem_res);
+ 	if (IS_ERR(mem)) {
+@@ -952,7 +981,8 @@ static int ath12k_ahb_probe(struct platf
+ 	const struct ath12k_hif_ops *hif_ops;
+ 	struct device *dev = &pdev->dev;
+ 	enum ath12k_hw_rev hw_rev;
+-	int ret, userpd_id;
++	struct ath12k_bus_params *bus_params;
++	int ret, userpd_id, bus_type;
+ 
+ 	of_id = of_match_device(ath12k_ahb_of_match, &pdev->dev);
+ 	if (!of_id) {
+@@ -967,6 +997,13 @@ static int ath12k_ahb_probe(struct platf
+ 	switch (hw_rev) {
+ 	case ATH12K_HW_IPQ5332_HW10:
+ 		hif_ops = &ath12k_ahb_hif_ops_ipq5332;
++		bus_params = &ath12k_ahb_bus_params;
++		bus_type = ATH12K_BUS_AHB;
++		break;
++	case ATH12K_HW_QCN6432_HW10:
++		hif_ops = &ath12k_ahb_hif_ops_qcn6432;
++		bus_params = &ath12k_internal_pci_bus_params;
++		bus_type = ATH12K_BUS_HYBRID;
+ 		break;
+ 	default:
+ 		dev_err(&pdev->dev, "Unsupported device type %d\n", hw_rev);
+@@ -980,7 +1017,7 @@ static int ath12k_ahb_probe(struct platf
+ 	}
+ 
+ 	ab = ath12k_core_alloc(&pdev->dev, sizeof(struct ath12k_ahb),
+-			       ATH12K_BUS_AHB, &ath12k_ahb_bus_params);
++			       bus_type, bus_params);
+ 	if (!ab) {
+ 		dev_err(&pdev->dev, "failed to allocate ath12k base\n");
+ 		return -ENOMEM;
+--- a/drivers/net/wireless/ath/ath12k/ahb.h
++++ b/drivers/net/wireless/ath/ath12k/ahb.h
+@@ -84,4 +84,9 @@ static const struct ath12k_bus_params at
+ 	.fixed_mem_region = true,
+ };
+ 
++static const struct ath12k_bus_params ath12k_internal_pci_bus_params = {
++	.fixed_bdf_addr = false,
++	.fixed_mem_region = true,
++};
++
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/ce.c
++++ b/drivers/net/wireless/ath/ath12k/ce.c
+@@ -599,7 +599,10 @@ static void ath12k_ce_srng_msi_ring_para
+ 
+ 	ring_params->msi_addr = addr_lo;
+ 	ring_params->msi_addr |= (dma_addr_t)(((uint64_t)addr_hi) << 32);
+-	ring_params->msi_data = (msi_data_idx % msi_data_count) + msi_data_start;
++	if (ab->hif.bus == ATH12K_BUS_HYBRID)
++		ring_params->msi_data = ab->ipci.ce_msi_data[ce_id];
++	else
++		ring_params->msi_data = (msi_data_idx % msi_data_count) + msi_data_start;
+ 	ring_params->flags |= HAL_SRNG_FLAGS_MSI_INTR;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/ce.h
++++ b/drivers/net/wireless/ath/ath12k/ce.h
+@@ -8,6 +8,7 @@
+ #define ATH12K_CE_H
+ 
+ #define CE_COUNT_MAX 16
++#define ATH12K_QCN6432_CE_COUNT 12
+ 
+ /* Byte swap data words */
+ #define CE_ATTR_BYTE_SWAP_DATA 2
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -3158,7 +3158,8 @@ static void ath12k_core_reset(struct wor
+ 		if (ab->hif.bus == ATH12K_BUS_PCI) {
+ 			ath12k_hif_power_down(ab);
+ 			ath12k_hif_power_up(ab);
+-		} else if (ab->hif.bus == ATH12K_BUS_AHB) {
++		} else if (ab->hif.bus == ATH12K_BUS_AHB ||
++			   ab->hif.bus == ATH12K_BUS_HYBRID) {
+ 			ath12k_rproc_recovery_stop_coredump(ab);
+ 			ath12k_qmi_free_target_mem_chunk(ab);
+ 			ath12k_rproc_recovery_power_up(ab);
+@@ -3248,6 +3249,7 @@ int ath12k_core_init(struct ath12k_base
+ 	/* Register a notifier after core init
+ 	 * to be called on fw crash
+ 	 */
++	init_waitqueue_head(&ab->ipci.gic_msi_waitq);
+ 	ab->ssr_nb.notifier_call = ath12k_core_ssr_notifier_cb;
+ 	ab->atomic_ssr_nb.notifier_call = ath12k_core_atomic_ssr_notifier_cb;
+ 	ret = ath12k_hif_ssr_notifier_reg(ab);
+@@ -3641,7 +3643,8 @@ static void ath12k_rddm_notifier(struct
+ 			if (ab->in_panic)
+ 				return;
+ 			ab->in_panic = true;
+-			if (ab->hif.bus == ATH12K_BUS_AHB)
++			if (ab->hif.bus == ATH12K_BUS_AHB ||
++			    ab->hif.bus == ATH12K_BUS_HYBRID)
+ 				ath12k_core_atomic_ssr_notifier_cb(&ab->atomic_ssr_nb,
+ 								   SUBSYS_PREPARE_FOR_FATAL_SHUTDOWN,
+ 								   ab->pdev);
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -150,6 +150,7 @@ enum ath12k_hw_rev {
+ 	ATH12K_HW_QCN9274_HW20,
+ 	ATH12K_HW_WCN7850_HW20,
+ 	ATH12K_HW_IPQ5332_HW10,
++	ATH12K_HW_QCN6432_HW10,
+ };
+ 
+ #define ATH12K_DIAG_HW_ID_OFFSET 16
+@@ -190,6 +191,11 @@ struct ath12k_ext_irq_grp {
+ 
+ #define HE_PPET16_PPET8_SIZE            8
+ 
++enum ath12k_msi_supported_hw {
++	ATH12K_MSI_CONFIG_PCI,
++	ATH12K_MSI_CONFIG_IPCI,
++};
++
+ /* 802.11ax PPE (PPDU packet Extension) threshold */
+ struct he_ppe_threshold {
+ 	u32 numss_m1;
+@@ -1231,6 +1237,14 @@ enum ath12k_mlo_recovery_mode {
+ 	ATH12K_MLO_RECOVERY_MODE1 = 2,
+ };
+ 
++struct ath12k_internal_pci {
++	bool gic_enabled;
++	wait_queue_head_t gic_msi_waitq;
++	u32 dp_msi_data[ATH12K_EXT_IRQ_GRP_NUM_MAX];
++	u32 ce_msi_data[ATH12K_QCN6432_CE_COUNT];
++	u32 dp_irq_num[ATH12K_EXT_IRQ_GRP_NUM_MAX];
++};
++
+ struct ath12k_mlo_dp_umac_reset {
+         atomic_t response_chip;
+         spinlock_t lock;
+@@ -1448,7 +1462,15 @@ struct ath12k_base {
+ #endif
+ 
+ 	int userpd_id;
++	struct {
++		const struct ath12k_msi_config *config;
++		u32 ep_base_data;
++		u32 irqs[32];
++		u32 addr_lo;
++		u32 addr_hi;
++	} msi;
+ 
++	struct ath12k_internal_pci ipci;
+ 	u32 chwidth_num_peer_caps;
+ 	struct ath12k_dp_umac_reset dp_umac_reset;
+ 
+@@ -1687,6 +1709,8 @@ static inline const char *ath12k_bus_str
+ 		return "pci";
+ 	case ATH12K_BUS_AHB:
+ 		return "ahb";
++	case ATH12K_BUS_HYBRID:
++		return "ahb";
+ 	}
+ 
+ 	return "unknown";
+--- a/drivers/net/wireless/ath/ath12k/coredump.c
++++ b/drivers/net/wireless/ath/ath12k/coredump.c
+@@ -120,7 +120,7 @@ void ath12k_coredump_build_inline(struct
+ 		sizeof(file_data->df_magic));
+ 	file_data->len = cpu_to_le32(header_size);
+ 	file_data->version = cpu_to_le32(ATH12K_FW_CRASH_DUMP_V2);
+-	if (ab->hif.bus == ATH12K_BUS_AHB) {
++	if (ab->hif.bus == ATH12K_BUS_AHB || ab->hif.bus == ATH12K_BUS_HYBRID) {
+ 		file_data->chip_id = ab->qmi.target.chip_id;
+ 		file_data->qrtr_id = ab->qmi.service_ins_id;
+ 		file_data->bus_id = ab->userpd_id;
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -2397,8 +2397,13 @@ int ath12k_debugfs_soc_create(struct ath
+ 	if (!(IS_ERR_OR_NULL(ab->debugfs_soc)))
+ 		return 0;
+ 
+-	snprintf(soc_name, sizeof(soc_name), "%s_%s", ab->hw_params->name,
+-		 dev_name(ab->dev));
++	if (ab->userpd_id) {
++		snprintf(soc_name, sizeof(soc_name), "%s_%d",
++			 ab->hw_params->name, ab->userpd_id);
++	} else {
++		snprintf(soc_name, sizeof(soc_name), "%s_%s", ab->hw_params->name,
++			 dev_name(ab->dev));
++	}
+ 
+ 	ab->debugfs_soc = debugfs_create_dir(soc_name, debugfs_ath12k);
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -313,8 +313,11 @@ static void ath12k_dp_srng_msi_setup(str
+ 
+ 	ring_params->msi_addr = addr_lo;
+ 	ring_params->msi_addr |= (dma_addr_t)(((uint64_t)addr_hi) << 32);
+-	ring_params->msi_data = (msi_group_number % msi_data_count)
+-		+ msi_data_start;
++	if (ab->hif.bus == ATH12K_BUS_HYBRID)
++		ring_params->msi_data = ab->ipci.dp_msi_data[msi_group_number];
++	else
++		ring_params->msi_data = (msi_group_number % msi_data_count)
++			+ msi_data_start;
+ 	ring_params->flags |= HAL_SRNG_FLAGS_MSI_INTR;
+ 
+ 	vector = msi_irq_start  + (msi_group_number % msi_data_count);
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -879,6 +879,54 @@ const struct hal_ops hal_qcn9274_ops = {
+ 	.hal_get_tqm_scratch_reg = ath12k_hal_qcn9274_get_tqm_scratch_reg,
+ };
+ 
++const struct hal_ops hal_qcn6432_ops = {
++	.rx_desc_get_first_msdu = ath12k_hw_qcn9274_rx_desc_get_first_msdu,
++	.rx_desc_get_last_msdu = ath12k_hw_qcn9274_rx_desc_get_last_msdu,
++	.rx_desc_get_l3_pad_bytes = ath12k_hw_qcn9274_rx_desc_get_l3_pad_bytes,
++	.rx_desc_encrypt_valid = ath12k_hw_qcn9274_rx_desc_encrypt_valid,
++	.rx_desc_get_encrypt_type = ath12k_hw_qcn9274_rx_desc_get_encrypt_type,
++	.rx_desc_get_decap_type = ath12k_hw_qcn9274_rx_desc_get_decap_type,
++	.rx_desc_get_mesh_ctl = ath12k_hw_qcn9274_rx_desc_get_mesh_ctl,
++	.rx_desc_get_mpdu_seq_ctl_vld = ath12k_hw_qcn9274_rx_desc_get_mpdu_seq_ctl_vld,
++	.rx_desc_get_mpdu_fc_valid = ath12k_hw_qcn9274_rx_desc_get_mpdu_fc_valid,
++	.rx_desc_get_mpdu_start_seq_no = ath12k_hw_qcn9274_rx_desc_get_mpdu_start_seq_no,
++	.rx_desc_get_msdu_len = ath12k_hw_qcn9274_rx_desc_get_msdu_len,
++	.rx_desc_get_msdu_sgi = ath12k_hw_qcn9274_rx_desc_get_msdu_sgi,
++	.rx_desc_get_msdu_rate_mcs = ath12k_hw_qcn9274_rx_desc_get_msdu_rate_mcs,
++	.rx_desc_get_msdu_rx_bw = ath12k_hw_qcn9274_rx_desc_get_msdu_rx_bw,
++	.rx_desc_get_msdu_freq = ath12k_hw_qcn9274_rx_desc_get_msdu_freq,
++	.rx_desc_get_msdu_pkt_type = ath12k_hw_qcn9274_rx_desc_get_msdu_pkt_type,
++	.rx_desc_get_msdu_nss = ath12k_hw_qcn9274_rx_desc_get_msdu_nss,
++	.rx_desc_get_mpdu_tid = ath12k_hw_qcn9274_rx_desc_get_mpdu_tid,
++	.rx_desc_get_mpdu_peer_id = ath12k_hw_qcn9274_rx_desc_get_mpdu_peer_id,
++	.rx_desc_copy_end_tlv = ath12k_hw_qcn9274_rx_desc_copy_end_tlv,
++	.rx_desc_get_mpdu_ppdu_id = ath12k_hw_qcn9274_rx_desc_get_mpdu_ppdu_id,
++	.rx_desc_set_msdu_len = ath12k_hw_qcn9274_rx_desc_set_msdu_len,
++	.rx_desc_get_msdu_payload = ath12k_hw_qcn9274_rx_desc_get_msdu_payload,
++	.rx_desc_get_mpdu_start_offset = ath12k_hw_qcn9274_rx_desc_get_mpdu_start_offset,
++	.rx_desc_get_msdu_end_offset = ath12k_hw_qcn9274_rx_desc_get_msdu_end_offset,
++	.rx_desc_get_msdu_intra_bss_bit = ath12k_hw_qcn9274_rx_desc_get_msdu_intra_bss_bit,
++	.rx_desc_mac_addr2_valid = ath12k_hw_qcn9274_rx_desc_mac_addr2_valid,
++	.rx_desc_mpdu_start_addr2 = ath12k_hw_qcn9274_rx_desc_mpdu_start_addr2,
++	.rx_desc_is_da_mcbc = ath12k_hw_qcn9274_rx_desc_is_da_mcbc,
++	.rx_desc_get_dot11_hdr = ath12k_hw_qcn9274_rx_desc_get_dot11_hdr,
++	.rx_desc_get_crypto_header = ath12k_hw_qcn9274_rx_desc_get_crypto_hdr,
++	.create_srng_config = ath12k_hal_srng_create_config_qcn9274,
++	.tcl_to_wbm_rbm_map = ath12k_hal_qcn9274_tcl_to_wbm_rbm_map,
++	.dp_rx_h_msdu_done = ath12k_hw_qcn9274_dp_rx_h_msdu_done,
++	.dp_rx_h_l4_cksum_fail = ath12k_hw_qcn9274_dp_rx_h_l4_cksum_fail,
++	.dp_rx_h_ip_cksum_fail = ath12k_hw_qcn9274_dp_rx_h_ip_cksum_fail,
++	.dp_rx_h_is_decrypted = ath12k_hw_qcn9274_dp_rx_h_is_decrypted,
++	.dp_rx_h_mpdu_err = ath12k_hw_qcn9274_dp_rx_h_mpdu_err,
++	.rx_desc_get_ip_valid = ath12k_hal_qcn9274_rx_desc_get_ip_valid,
++	.rxdma_ring_wmask_rx_mpdu_start = ath12k_hal_rx_mpdu_start_wmask_get,
++	.rxdma_ring_wmask_rx_msdu_end = ath12k_hal_rx_msdu_end_wmask_get,
++	.rx_desc_get_msdu_src_link_id = ath12k_hw_qcn9274_rx_desc_get_msdu_src_link,
++	.rx_get_desc_info = ath12k_hw_qcn9274_get_rx_desc_info,
++	.rx_get_desc_msdulen_l3pad = ath12k_hw_qcn9274_get_rx_msdulen_l3pad,
++	.rx_desc_get_first_last_msdu = ath12k_hw_qcn9274_get_rx_first_last_msdu,
++};
++
+ static bool ath12k_hw_wcn7850_rx_desc_get_first_msdu(struct hal_rx_desc *desc)
+ {
+ 	return !!le16_get_bits(desc->u.wcn7850.msdu_end.info5,
+@@ -2283,14 +2331,16 @@ int ath12k_hal_srng_setup_idx(struct ath
+ 				srng->u.src_ring.hp_addr =
+ 					(u32 *)((unsigned long)ab->mem + reg_base);
+ 				if (type  == HAL_TCL_DATA) {
+-					if (ab->hif.bus == ATH12K_BUS_PCI)
++					if (ab->hif.bus == ATH12K_BUS_PCI ||
++					    ab->hif.bus == ATH12K_BUS_HYBRID){
+ 						srng->u.src_ring.hp_addr_direct =
+ 							(u32 *)((unsigned long)ab->mem +
+ 							HAL_DP_REG_WINDOW_OFFSET +
+ 							(reg_base & WINDOW_RANGE_MASK));
+-					else
++					} else {
+ 						srng->u.src_ring.hp_addr_direct =
+ 							srng->u.src_ring.hp_addr;
++					}
+ 				}
+ 			} else {
+ 					ath12k_dbg(ab, ATH12K_DBG_HAL,
+@@ -2333,15 +2383,17 @@ int ath12k_hal_srng_setup_idx(struct ath
+ 					(u32 *)((unsigned long)ab->mem + reg_base +
+ 					(HAL_REO1_RING_TP - HAL_REO1_RING_HP));
+ 				if (type  == HAL_WBM2SW_RELEASE) {
+-					if (ab->hif.bus == ATH12K_BUS_PCI)
++					if (ab->hif.bus == ATH12K_BUS_PCI ||
++					    ab->hif.bus == ATH12K_BUS_HYBRID) {
+ 						srng->u.dst_ring.tp_addr_direct =
+ 							(u32 *)((unsigned long)ab->mem +
+ 							(reg_base & WINDOW_RANGE_MASK) +
+ 							HAL_DP_REG_WINDOW_OFFSET +
+ 							(HAL_REO1_RING_TP - HAL_REO1_RING_HP));
+-					else
++					} else {
+ 						srng->u.dst_ring.tp_addr_direct =
+ 							srng->u.dst_ring.tp_addr;
++					}
+ 				}
+ 			} else {
+ 					ath12k_dbg(ab, ATH12K_DBG_HAL,
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -201,6 +201,7 @@ struct ath12k_dp_rx_info;
+ 		(HAL_REO1_RING_MISC(ab) - HAL_REO1_RING_BASE_LSB(ab))
+ 
+ /* REO2SW(x) R2 ring pointers (head/tail) address */
++/* REO2SW(x) R2 ring pointers (head/tail) address */
+ #define HAL_REO1_RING_HP			0x00003048
+ #define HAL_REO1_RING_TP			0x0000304c
+ #define HAL_REO2_RING_HP			0x00003050
+@@ -433,6 +434,13 @@ struct ath12k_dp_rx_info;
+ #define HAL_IPQ5332_PMM_REG_BASE	0xCB500FC
+ #define HAL_IPQ5332_PMM_SIZE		0x100
+ 
++#define HAL_QCN6432_CE_WFSS_REG_BASE	0x1B80000
++#define HAL_QCN6432_CE_SIZE		0x200000
++
++#define HAL_QCN6432_CMEM_REG_BASE	0x00100000
++#define HAL_QCN6432_CMEM_SIZE		0x40000
++#define HAL_QCN6432_CMEM_BASE		0x100000
++
+ enum hal_srng_ring_id {
+ 	HAL_SRNG_RING_ID_REO2SW0 = 0,
+ 	HAL_SRNG_RING_ID_REO2SW1,
+@@ -1193,6 +1201,7 @@ struct hal_ops {
+ 
+ extern const struct hal_ops hal_qcn9274_ops;
+ extern const struct hal_ops hal_wcn7850_ops;
++extern const struct hal_ops hal_qcn6432_ops;
+ 
+ u32 ath12k_hal_reo_qdesc_size(u32 ba_window_size, u8 tid);
+ void ath12k_hal_reo_qdesc_setup(struct hal_rx_reo_queue *qdesc,
+--- a/drivers/net/wireless/ath/ath12k/hif.h
++++ b/drivers/net/wireless/ath/ath12k/hif.h
+@@ -36,6 +36,9 @@ struct ath12k_hif_ops {
+ 	void (*get_ce_msi_idx)(struct ath12k_base *ab, u32 ce_id, u32 *msi_idx);
+ 	int (*ssr_notifier_reg)(struct ath12k_base *ab);
+ 	int (*ssr_notifier_unreg)(struct ath12k_base *ab);
++	void (*config_static_window)(struct ath12k_base *ab);
++	int (*get_msi_irq)(struct ath12k_base *ab, unsigned int vector);
++
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ 	int (*ppeds_register_interrupts)(struct ath12k_base *ab, int type, int vector,
+ 					 int ring_num);
+@@ -231,6 +234,22 @@ static inline void ath12k_hif_power_down
+ 	ab->hif.ops->power_down(ab);
+ }
+ 
++static inline void ath12k_hif_config_static_window(struct ath12k_base *ab)
++{
++	if (!ab->hif.ops->config_static_window)
++		return;
++
++	ab->hif.ops->config_static_window(ab);
++}
++
++static inline int ath12k_hif_get_msi_irq(struct ath12k_base *ab, unsigned int vector)
++{
++	if (!ab->hif.ops->get_msi_irq)
++		return -EOPNOTSUPP;
++
++	return ab->hif.ops->get_msi_irq(ab, vector);
++}
++
+ static inline int ath12k_hif_dp_umac_reset_irq_config(struct ath12k_base *ab)
+ {
+ 	if (ab->hif.ops->dp_umac_reset_irq_config)
+--- a/drivers/net/wireless/ath/ath12k/hw.c
++++ b/drivers/net/wireless/ath/ath12k/hw.c
+@@ -151,6 +151,8 @@ static const struct ath12k_hw_ops ipq533
+ #define ATH12K_REO_STATUS_RING_MASK_0 0x1
+ 
+ #define ATH12K_HOST2RXDMA_RING_MASK_0 0x1
++#define ATH12K_HOST2RXDMA_RING_MASK_1 0x2
++#define ATH12K_HOST2RXDMA_RING_MASK_2 0x4
+ 
+ #define ATH12K_RX_MON_RING_MASK_0 0x1
+ #define ATH12K_RX_MON_RING_MASK_1 0x2
+@@ -946,6 +948,56 @@ static struct ath12k_hw_ring_mask ath12k
+ 	},
+ };
+ 
++static struct ath12k_hw_ring_mask ath12k_hw_ring_mask_qcn6432 = {
++	.tx  = {
++		ATH12K_TX_RING_MASK_0,
++		ATH12K_TX_RING_MASK_1,
++		ATH12K_TX_RING_MASK_2 |ATH12K_TX_RING_MASK_3,
++		0, 0, 0, 0, 0, 0, 0, 0,
++	},
++	.rx_mon_dest = {
++		0, 0,
++		ATH12K_RX_MON_RING_MASK_0,
++		ATH12K_RX_MON_RING_MASK_1,
++		ATH12K_RX_MON_RING_MASK_2,
++		0, 0, 0, 0, 0, 0, 0,
++	},
++	.rx = {
++		0, 0, 0,
++		ATH12K_RX_RING_MASK_0,
++		ATH12K_RX_RING_MASK_1,
++		ATH12K_RX_RING_MASK_2 | ATH12K_RX_RING_MASK_3,
++		0, 0, 0, 0, 0, 0,
++	},
++	.rx_err = {
++		0, 0,
++		ATH12K_RX_ERR_RING_MASK_0,
++		0, 0, 0, 0, 0, 0, 0, 0, 0,
++	},
++	.rx_wbm_rel = {
++		0, 0,
++		ATH12K_RX_WBM_REL_RING_MASK_0,
++		0, 0, 0, 0, 0, 0, 0, 0, 0,
++	},
++	.reo_status = {
++		0, 0,
++		ATH12K_REO_STATUS_RING_MASK_0,
++		0, 0, 0, 0, 0, 0, 0, 0, 0,
++	},
++	.host2rxdma = {
++		0, 0,
++		ATH12K_HOST2RXDMA_RING_MASK_0,
++		ATH12K_HOST2RXDMA_RING_MASK_1,
++		ATH12K_HOST2RXDMA_RING_MASK_2,
++		0, 0, 0, 0, 0, 0, 0,
++	},
++	.tx_mon_dest = {
++		ATH12K_TX_MON_RING_MASK_0,
++		ATH12K_TX_MON_RING_MASK_1,
++		0, 0, 0, 0, 0, 0, 0, 0, 0, 0
++	},
++};
++
+ static const struct ath12k_hw_regs qcn9274_v1_regs = {
+ 	/* SW2TCL(x) R0 ring configuration address */
+ 	.hal_tcl1_ring_id = 0x00000908,
+@@ -1292,6 +1344,96 @@ static const struct ath12k_hw_regs wcn78
+ 	.hal_umac_ce1_dest_reg_base = 0x01b83000,
+ };
+ 
++const struct ath12k_hw_regs qcn6432_regs = {
++	/* SW2TCL(x) R0 ring configuration address */
++	.hal_tcl1_ring_id = 0x00000918,
++	.hal_tcl1_ring_misc = 0x00000920,
++	.hal_tcl1_ring_tp_addr_lsb = 0x0000092c,
++	.hal_tcl1_ring_tp_addr_msb = 0x00000930,
++	.hal_tcl1_ring_consumer_int_setup_ix0 = 0x00000940,
++	.hal_tcl1_ring_consumer_int_setup_ix1 = 0x00000944,
++	.hal_tcl1_ring_msi1_base_lsb = 0x00000958,
++	.hal_tcl1_ring_msi1_base_msb = 0x0000095c,
++	.hal_tcl1_ring_base_lsb = 0x00000910,
++	.hal_tcl1_ring_base_msb = 0x00000914,
++	.hal_tcl1_ring_msi1_data = 0x00000960,
++	.hal_tcl2_ring_base_lsb = 0x00000988,
++	.hal_tcl_ring_base_lsb = 0x00000b68,
++
++	/* TCL STATUS ring address */
++	.hal_tcl_status_ring_base_lsb = 0x00000d48,
++
++	/* REO DEST ring address */
++	.hal_reo2_ring_base = 0x00000578,
++	.hal_reo1_misc_ctrl_addr = 0x00000b9c,
++	.hal_reo1_sw_cookie_cfg0 = 0x0000006c,
++	.hal_reo1_sw_cookie_cfg1 = 0x00000070,
++	.hal_reo1_qdesc_lut_base0 = 0x00000074,
++	.hal_reo1_qdesc_lut_base1 = 0x00000078,
++	.hal_reo1_qdesc_addr_read = 0x0000007c,
++	.hal_reo1_qdesc_max_peerid = 0x00000088,
++	.hal_reo1_ring_base_lsb = 0x00000500,
++	.hal_reo1_ring_base_msb = 0x00000504,
++	.hal_reo1_ring_id = 0x00000508,
++	.hal_reo1_ring_misc = 0x00000510,
++	.hal_reo1_ring_hp_addr_lsb = 0x00000514,
++	.hal_reo1_ring_hp_addr_msb = 0x00000518,
++	.hal_reo1_ring_producer_int_setup = 0x00000524,
++	.hal_reo1_ring_msi1_base_lsb = 0x00000548,
++	.hal_reo1_ring_msi1_base_msb = 0x0000054C,
++	.hal_reo1_ring_msi1_data = 0x00000550,
++	.hal_reo1_aging_thres_ix0 = 0x00000B28,
++	.hal_reo1_aging_thres_ix1 = 0x00000B2C,
++	.hal_reo1_aging_thres_ix2 = 0x00000B30,
++	.hal_reo1_aging_thres_ix3 = 0x00000B34,
++
++	/* REO Exception ring address */
++	.hal_reo2_sw0_ring_base = 0x000008c0,
++
++	/* REO Reinject ring address */
++	.hal_sw2reo_ring_base = 0x00000320,
++	.hal_sw2reo1_ring_base = 0x00000398,
++
++	/* REO cmd ring address */
++	.hal_reo_cmd_ring_base = 0x000002A8,
++
++	/* REO status ring address */
++	.hal_reo_status_ring_base = 0x00000aa0,
++
++	/* WBM idle link ring address */
++	.hal_wbm_idle_ring_base_lsb = 0x00000d3c,
++	.hal_wbm_idle_ring_misc_addr = 0x00000d4c,
++	.hal_wbm_r0_idle_list_cntl_addr = 0x00000240,
++	.hal_wbm_r0_idle_list_size_addr = 0x00000244,
++	.hal_wbm_scattered_ring_base_lsb = 0x00000250,
++	.hal_wbm_scattered_ring_base_msb = 0x00000254,
++	.hal_wbm_scattered_desc_head_info_ix0 = 0x00000260,
++	.hal_wbm_scattered_desc_head_info_ix1   = 0x00000264,
++	.hal_wbm_scattered_desc_tail_info_ix0 = 0x00000270,
++	.hal_wbm_scattered_desc_tail_info_ix1 = 0x00000274,
++	.hal_wbm_scattered_desc_ptr_hp_addr = 0x0000027c,
++
++	/* SW2WBM release ring address */
++	.hal_wbm_sw_release_ring_base_lsb = 0x0000037c,
++
++	/* WBM2SW release ring address */
++	.hal_wbm0_release_ring_base_lsb = 0x00000e08,
++	.hal_wbm1_release_ring_base_lsb = 0x00000e80,
++
++	/* reo2ppe ring base address */
++	.hal_reo2ppe_ring_base = 0x00000938,
++
++	/* PCIe base address */
++	.pcie_qserdes_sysclk_en_sel = 0x01e0c0a8,
++	.pcie_pcs_osc_dtct_config_base = 0x01e0d45c,
++
++	/* CE base address */
++	.hal_umac_ce0_src_reg_base = 0x01B80000,
++	.hal_umac_ce0_dest_reg_base = 0x01B81000,
++	.hal_umac_ce1_src_reg_base =  0x01B82000,
++	.hal_umac_ce1_dest_reg_base =  0x01B83000,
++};
++
+ static const struct ath12k_hw_hal_params ath12k_hw_hal_params_qcn9274 = {
+ 	.rx_buf_rbm = HAL_RX_BUF_RBM_SW3_BM,
+ 	.wbm2sw_cc_enable = HAL_WBM_SW_COOKIE_CONV_CFG_WBM2SW0_EN |
+@@ -1638,6 +1780,81 @@ static struct ath12k_hw_params ath12k_hw
+ 		.support_umac_reset = false,
+ 		.support_ce_manual_poll=true,
+ 	},
++	{
++		.name = "qcn6432 hw1.0",
++		.hw_rev = ATH12K_HW_QCN6432_HW10,
++		.fw = {
++			.dir = "QCN6432/hw1.0",
++			.board_size = 256 * 1024,
++			.cal_offset = 128 * 1024,
++		},
++		.max_radios = 1,
++		.single_pdev_only = false,
++		.qmi_service_ins_id = ATH12K_QMI_WLFW_SERVICE_INS_ID_V01_QCN6432,
++		.internal_sleep_clock = false,
++
++		.hw_ops = &ipq5332_ops,
++		.regs = &qcn6432_regs,
++		.ring_mask = &ath12k_hw_ring_mask_qcn6432,
++
++		.host_ce_config = ath12k_host_ce_config_ipq5332,
++		.ce_count = 12,
++		.target_ce_config = ath12k_target_ce_config_wlan_ipq5332,
++		.target_ce_count = 12,
++		.svc_to_ce_map = ath12k_target_service_to_ce_map_wlan_ipq5332,
++		.svc_to_ce_map_len = 19,
++
++		.hal_params = &ath12k_hw_hal_params_ipq5332,
++
++		.rxdma1_enable = true,
++		.num_rxmda_per_pdev = 1,
++		.num_rxdma_dst_ring = 0,
++		.rx_mac_buf_ring = false,
++		.vdev_start_delay = false,
++		.fixed_fw_mem = false,
++		.smp2p_wow_exit = false,
++
++		.interface_modes = BIT(NL80211_IFTYPE_STATION) |
++					BIT(NL80211_IFTYPE_AP) |
++					BIT(NL80211_IFTYPE_MESH_POINT),
++		.supports_monitor = true,
++
++		.idle_ps = false,
++		.cold_boot_calib = true,
++		.download_calib = true,
++		.supports_suspend = false,
++		.tcl_ring_retry = true,
++		.reoq_lut_support = true,
++		.supports_shadow_regs = false,
++
++		.hal_desc_sz = sizeof(struct hal_rx_desc_qcn9274),
++		.num_tcl_banks = 48,
++		.max_tx_ring = 4,
++		.static_window_map = true,
++
++		.wmi_init = ath12k_wmi_init_ipq5332,
++
++		.hal_ops = &hal_qcn6432_ops,
++
++		.supports_ap_ps = true,
++		.credit_flow = false,
++		.alloc_cacheable_memory = true,
++		.spectral = {
++			.fft_sz = 7,
++			.fft_pad_sz = 0,
++			.summary_pad_sz = 16,
++			.fft_hdr_len = 24,
++			.max_fft_bins = 512,
++			.fragment_160mhz = false,
++		},
++		.max_mlo_peer = ATH12K_MAX_MLO_PEER,
++		.num_local_link = 0,
++		.m3_fw_support = false,
++		.compact_rx_tlv = true,
++		.send_platform_model = true,
++		.en_fwlog = false,
++		.support_umac_reset = false,
++	},
+ };
+ 
+ void ath12k_dp_reset_interrupt_mask(struct ath12k_base *ab)
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -115,6 +115,7 @@ enum ath12k_hw_rate_ofdm {
+ enum ath12k_bus {
+ 	ATH12K_BUS_PCI,
+ 	ATH12K_BUS_AHB,
++	ATH12K_BUS_HYBRID,
+ };
+ 
+ /* Regular 12 Host DP interrupts + 3 PPEDS interrupts + 1 DP UMAC RESET interrupt*/
+--- a/drivers/net/wireless/ath/ath12k/mhi.c
++++ b/drivers/net/wireless/ath/ath12k/mhi.c
+@@ -14,6 +14,8 @@
+ #include "debug.h"
+ #include "mhi.h"
+ #include "pci.h"
++#include "pcic.h"
++#include "hif.h"
+ 
+ #define MHI_TIMEOUT_DEFAULT_MS	90000
+ #define OTP_INVALID_BOARD_ID	0xFFFF
+@@ -263,9 +265,9 @@ static int ath12k_mhi_get_msi(struct ath
+ 	int ret, num_vectors, i;
+ 	int *irq;
+ 
+-	ret = ath12k_pci_get_user_msi_assignment(ab,
+-						 "MHI", &num_vectors,
+-						 &user_base_data, &base_vector);
++	ret = ath12k_pcic_get_user_msi_assignment(ab,
++						  "MHI", &num_vectors,
++						  &user_base_data, &base_vector);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -277,7 +279,7 @@ static int ath12k_mhi_get_msi(struct ath
+ 		return -ENOMEM;
+ 
+ 	for (i = 0; i < num_vectors; i++)
+-		irq[i] = ath12k_pci_get_msi_irq(ab->dev,
++		irq[i] = ath12k_hif_get_msi_irq(ab,
+ 						base_vector + i);
+ 
+ 	ab_pci->mhi_ctrl->irq = irq;
+--- a/drivers/net/wireless/ath/ath12k/pci.c
++++ b/drivers/net/wireless/ath/ath12k/pci.c
+@@ -5,40 +5,22 @@
+  */
+ 
+ #include <linux/module.h>
+-#include <linux/msi.h>
+-#include <linux/pci.h>
+ #include <linux/of.h>
+ 
+ #include "pci.h"
+-#include "core.h"
+-#include "hif.h"
+ #include "mhi.h"
+ #include "debug.h"
+ #include "ppe.h"
++#include "pcic.h"
+ 
+ #define ATH12K_PCI_BAR_NUM		0
+ #define ATH12K_PCI_DMA_MASK		32
+ 
+-#define ATH12K_PCI_IRQ_CE0_OFFSET		3
+-
+-#define WINDOW_ENABLE_BIT		0x40000000
+-#define WINDOW_REG_ADDRESS		0x310c
+-#define WINDOW_VALUE_MASK		GENMASK(24, 19)
+-#define WINDOW_START			0x80000
+-#define WINDOW_RANGE_MASK		GENMASK(18, 0)
+ #define WINDOW_STATIC_MASK		GENMASK(31, 6)
+ 
+ #define TCSR_SOC_HW_VERSION		0x1B00000
+ #define TCSR_SOC_HW_VERSION_MAJOR_MASK	GENMASK(11, 8)
+ #define TCSR_SOC_HW_VERSION_MINOR_MASK	GENMASK(7, 4)
+-/* choose a little lower value for tx completion processing
+- * to give priority for enqueue */
+-unsigned int tx_comp_budget = 0x7F;
+-EXPORT_SYMBOL(tx_comp_budget);
+-module_param_named(tx_comp_budget, tx_comp_budget, uint, 0644);
+-MODULE_PARM_DESC(tx_comp_budget, "tx_comp_budget");
+-
+-
+ /* BAR0 + 4k is always accessible, and no
+  * need to force wakeup.
+  * 4K - 32 = 0xFE0
+@@ -51,20 +33,13 @@ MODULE_PARM_DESC(tx_comp_budget, "tx_com
+ #define PCIE_PCIE_LOCAL_REG_PCIE_LOCAL_RSV0	0x1E03164
+ #define QRTR_INSTANCE_MASK			0x000000FF
+ #define ATH12K_MAX_PCI_DOMAINS		0x5
+-#define DP_IRQ_NAME_LEN 20
+ 
+-char dp_irq_name[ATH12K_MAX_PCI_DOMAINS + 1][ATH12K_EXT_IRQ_DP_NUM_VECTORS][DP_IRQ_NAME_LEN] = {};
+ 
+ unsigned int ath12k_fw_mem_seg;
+ EXPORT_SYMBOL(ath12k_fw_mem_seg);
+ module_param_named(fw_mem_seg, ath12k_fw_mem_seg, uint, 0644);
+ MODULE_PARM_DESC(fw_mem_seg, "Enable/Disable FW segmentted memory");
+ 
+-unsigned int ath12k_napi_poll_budget = 0x7f;
+-EXPORT_SYMBOL(ath12k_napi_poll_budget);
+-module_param_named(napi_budget, ath12k_napi_poll_budget, uint, 0644);
+-MODULE_PARM_DESC(napi_budget, "Napi budget processing per rx intr");
+-
+ #ifdef CPTCFG_ATH12K_BONDED_DS_SUPPORT
+ extern int ath12k_mlo_capable;
+ extern int g_bonded_interface_model;
+@@ -86,79 +61,6 @@ static const struct ath12k_bus_params at
+ 	.fixed_bdf_addr = false,
+ };
+ 
+-/* TODO: revisit IRQ mapping for new SRNG's */
+-static const struct ath12k_msi_config ath12k_msi_config[] = {
+-	{
+-		/* MSI spec expects number of interrupts to be a power of 2 */
+-		.total_vectors = 32,
+-		.total_users = 3,
+-		.users = (struct ath12k_msi_user[]) {
+-			{ .name = "MHI", .num_vectors = 3, .base_vector = 0 },
+-			{ .name = "CE", .num_vectors = 5, .base_vector = 3 },
+-			{ .name = "DP", .num_vectors = 16, .base_vector = 8 },
+-		},
+-	},
+-};
+-
+-static const char *irq_name[ATH12K_IRQ_NUM_MAX] = {
+-	"bhi",
+-	"mhi-er0",
+-	"mhi-er1",
+-	"ce0",
+-	"ce1",
+-	"ce2",
+-	"ce3",
+-	"ce4",
+-	"ce5",
+-	"ce6",
+-	"ce7",
+-	"ce8",
+-	"ce9",
+-	"ce10",
+-	"ce11",
+-	"ce12",
+-	"ce13",
+-	"ce14",
+-	"ce15",
+-	"host2wbm-desc-feed",
+-	"host2reo-re-injection",
+-	"host2reo-command",
+-	"host2rxdma-monitor-ring3",
+-	"host2rxdma-monitor-ring2",
+-	"host2rxdma-monitor-ring1",
+-	"reo2ost-exception",
+-	"wbm2host-rx-release",
+-	"reo2host-status",
+-	"reo2host-destination-ring4",
+-	"reo2host-destination-ring3",
+-	"reo2host-destination-ring2",
+-	"reo2host-destination-ring1",
+-	"rxdma2host-monitor-destination-mac3",
+-	"rxdma2host-monitor-destination-mac2",
+-	"rxdma2host-monitor-destination-mac1",
+-	"ppdu-end-interrupts-mac3",
+-	"ppdu-end-interrupts-mac2",
+-	"ppdu-end-interrupts-mac1",
+-	"rxdma2host-monitor-status-ring-mac3",
+-	"rxdma2host-monitor-status-ring-mac2",
+-	"rxdma2host-monitor-status-ring-mac1",
+-	"host2rxdma-host-buf-ring-mac3",
+-	"host2rxdma-host-buf-ring-mac2",
+-	"host2rxdma-host-buf-ring-mac1",
+-	"rxdma2host-destination-ring-mac3",
+-	"rxdma2host-destination-ring-mac2",
+-	"rxdma2host-destination-ring-mac1",
+-	"host2tcl-input-ring4",
+-	"host2tcl-input-ring3",
+-	"host2tcl-input-ring2",
+-	"host2tcl-input-ring1",
+-	"wbm2host-tx-completions-ring4",
+-	"wbm2host-tx-completions-ring3",
+-	"wbm2host-tx-completions-ring2",
+-	"wbm2host-tx-completions-ring1",
+-	"tcl2host-status-ring",
+-};
+-
+ static int ath12k_pci_bus_wake_up(struct ath12k_base *ab)
+ {
+ 	struct ath12k_pci *ab_pci = ath12k_pci_priv(ab);
+@@ -204,8 +106,9 @@ static void ath12k_pci_select_window(str
+ 	}
+ }
+ 
+-static void ath12k_pci_select_static_window(struct ath12k_pci *ab_pci)
++static void ath12k_pci_select_static_window(struct ath12k_base *ab)
+ {
++	struct ath12k_pci *ab_pci = ath12k_pci_priv(ab);
+ 	u32 umac_window = u32_get_bits(HAL_SEQ_WCSS_UMAC_OFFSET, WINDOW_VALUE_MASK);
+ 	u32 ce_window = u32_get_bits(HAL_CE_WFSS_CE_REG_BASE, WINDOW_VALUE_MASK);
+ 	u32 window;
+@@ -216,24 +119,7 @@ static void ath12k_pci_select_static_win
+ 	ab_pci->register_window = window;
+ 	spin_unlock_bh(&ab_pci->window_lock);
+ 
+-	iowrite32(WINDOW_ENABLE_BIT | window, ab_pci->ab->mem + WINDOW_REG_ADDRESS);
+-}
+-
+-static u32 ath12k_pci_get_window_start(struct ath12k_base *ab,
+-				       u32 offset)
+-{
+-	u32 window_start;
+-
+-	/* If offset lies within DP register range, use 3rd window */
+-	if ((offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < WINDOW_RANGE_MASK)
+-		window_start = 3 * WINDOW_START;
+-	/* If offset lies within CE register range, use 2nd window */
+-	else if ((offset ^ HAL_CE_WFSS_CE_REG_BASE) < WINDOW_RANGE_MASK)
+-		window_start = 2 * WINDOW_START;
+-	else
+-		window_start = WINDOW_START;
+-
+-	return window_start;
++	iowrite32(WINDOW_ENABLE_BIT | window, ab->mem + WINDOW_REG_ADDRESS);
+ }
+ 
+ static void ath12k_pci_soc_global_reset(struct ath12k_base *ab)
+@@ -361,271 +247,6 @@ static void ath12k_pci_sw_reset(struct a
+ 	ath12k_mhi_set_mhictrl_reset(ab);
+ }
+ 
+-static void ath12k_pci_free_ext_irq(struct ath12k_base *ab)
+-{
+-	int i, j;
+-
+-	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
+-		struct ath12k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
+-
+-		for (j = 0; j < irq_grp->num_irq; j++)
+-			free_irq(ab->irq_num[irq_grp->irqs[j]], irq_grp);
+-
+-		netif_napi_del(&irq_grp->napi);
+-	}
+-}
+-
+-static void ath12k_pci_free_irq(struct ath12k_base *ab)
+-{
+-	int i, irq_idx;
+-
+-	for (i = 0; i < ab->hw_params->ce_count; i++) {
+-		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
+-			continue;
+-		irq_idx = ATH12K_PCI_IRQ_CE0_OFFSET + i;
+-		free_irq(ab->irq_num[irq_idx], &ab->ce.ce_pipe[i]);
+-	}
+-
+-	ath12k_pci_free_ext_irq(ab);
+-}
+-
+-static void ath12k_pci_ce_irq_enable(struct ath12k_base *ab, u16 ce_id)
+-{
+-	u32 irq_idx;
+-
+-	irq_idx = ATH12K_PCI_IRQ_CE0_OFFSET + ce_id;
+-	enable_irq(ab->irq_num[irq_idx]);
+-}
+-
+-static void ath12k_pci_ce_irq_disable(struct ath12k_base *ab, u16 ce_id)
+-{
+-	u32 irq_idx;
+-
+-	irq_idx = ATH12K_PCI_IRQ_CE0_OFFSET + ce_id;
+-	disable_irq_nosync(ab->irq_num[irq_idx]);
+-}
+-
+-static void ath12k_pci_ce_irqs_disable(struct ath12k_base *ab)
+-{
+-	int i;
+-
+-	for (i = 0; i < ab->hw_params->ce_count; i++) {
+-		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
+-			continue;
+-		ath12k_pci_ce_irq_disable(ab, i);
+-	}
+-}
+-
+-static void ath12k_pci_sync_ce_irqs(struct ath12k_base *ab)
+-{
+-	int i;
+-	int irq_idx;
+-
+-	for (i = 0; i < ab->hw_params->ce_count; i++) {
+-		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
+-			continue;
+-
+-		irq_idx = ATH12K_PCI_IRQ_CE0_OFFSET + i;
+-		synchronize_irq(ab->irq_num[irq_idx]);
+-	}
+-}
+-
+-static void ath12k_pci_ce_tasklet(struct tasklet_struct *t)
+-{
+-	struct ath12k_ce_pipe *ce_pipe = from_tasklet(ce_pipe, t, intr_tq);
+-
+-	ath12k_ce_per_engine_service(ce_pipe->ab, ce_pipe->pipe_num);
+-
+-	ath12k_pci_ce_irq_enable(ce_pipe->ab, ce_pipe->pipe_num);
+-}
+-
+-static irqreturn_t ath12k_pci_ce_interrupt_handler(int irq, void *arg)
+-{
+-	struct ath12k_ce_pipe *ce_pipe = arg;
+-
+-	/* last interrupt received for this CE */
+-	ce_pipe->timestamp = jiffies;
+-
+-	ath12k_pci_ce_irq_disable(ce_pipe->ab, ce_pipe->pipe_num);
+-	tasklet_schedule(&ce_pipe->intr_tq);
+-
+-	return IRQ_HANDLED;
+-}
+-
+-static void ath12k_pci_ext_grp_disable(struct ath12k_ext_irq_grp *irq_grp)
+-{
+-	int i;
+-
+-	for (i = 0; i < irq_grp->num_irq; i++)
+-		disable_irq_nosync(irq_grp->ab->irq_num[irq_grp->irqs[i]]);
+-}
+-
+-static void __ath12k_pci_ext_irq_disable(struct ath12k_base *sc)
+-{
+-	int i;
+-
+-	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
+-		struct ath12k_ext_irq_grp *irq_grp = &sc->ext_irq_grp[i];
+-
+-		ath12k_pci_ext_grp_disable(irq_grp);
+-
+-		napi_synchronize(&irq_grp->napi);
+-		napi_disable(&irq_grp->napi);
+-	}
+-}
+-
+-static void ath12k_pci_ext_grp_enable(struct ath12k_ext_irq_grp *irq_grp)
+-{
+-	int i;
+-
+-	for (i = 0; i < irq_grp->num_irq; i++)
+-		enable_irq(irq_grp->ab->irq_num[irq_grp->irqs[i]]);
+-}
+-
+-static void ath12k_pci_sync_ext_irqs(struct ath12k_base *ab)
+-{
+-	int i, j, irq_idx;
+-
+-	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
+-		struct ath12k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
+-
+-		for (j = 0; j < irq_grp->num_irq; j++) {
+-			irq_idx = irq_grp->irqs[j];
+-			synchronize_irq(ab->irq_num[irq_idx]);
+-		}
+-	}
+-}
+-
+-static int ath12k_pci_ext_grp_napi_poll(struct napi_struct *napi, int budget)
+-{
+-	struct ath12k_ext_irq_grp *irq_grp = container_of(napi,
+-						struct ath12k_ext_irq_grp,
+-						napi);
+-	struct ath12k_base *ab = irq_grp->ab;
+-	int work_done;
+-
+-	work_done = ath12k_dp_service_srng(ab, irq_grp, budget);
+-	if (work_done < budget) {
+-		napi_complete_done(napi, work_done);
+-		ath12k_pci_ext_grp_enable(irq_grp);
+-	}
+-
+-	if (work_done > budget)
+-		work_done = budget;
+-
+-	return work_done;
+-}
+-
+-static irqreturn_t ath12k_pci_ext_interrupt_handler(int irq, void *arg)
+-{
+-	struct ath12k_ext_irq_grp *irq_grp = arg;
+-
+-	ath12k_dbg(irq_grp->ab, ATH12K_DBG_PCI, "ext irq:%d\n", irq);
+-
+-	/* last interrupt received for this group */
+-	irq_grp->timestamp = jiffies;
+-
+-	ath12k_pci_ext_grp_disable(irq_grp);
+-
+-	napi_schedule(&irq_grp->napi);
+-
+-	return IRQ_HANDLED;
+-}
+-
+-static int ath12k_pci_ext_irq_config(struct ath12k_base *ab)
+-{
+-	int i, j, ret, num_vectors = 0;
+-	u32 user_base_data = 0, base_vector = 0, base_idx, budget;
+-	struct ath12k_pci *ar_pci = (struct ath12k_pci *)ab->drv_priv;
+-
+-	base_idx = ATH12K_PCI_IRQ_CE0_OFFSET + CE_COUNT_MAX;
+-	ret = ath12k_pci_get_user_msi_assignment(ab, "DP",
+-						 &num_vectors,
+-						 &user_base_data,
+-						 &base_vector);
+-	if (ret < 0)
+-		return ret;
+-
+-	if (ath12k_napi_poll_budget < NAPI_POLL_WEIGHT)
+-		ath12k_napi_poll_budget = NAPI_POLL_WEIGHT;
+-
+-	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
+-		struct ath12k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
+-		u32 num_irq = 0;
+-
+-		irq_grp->ab = ab;
+-		irq_grp->grp_id = i;
+-		init_dummy_netdev(&irq_grp->napi_ndev);
+-
+-		if (ab->hw_params->ring_mask->rx_mon_dest[i])
+-			budget = NAPI_POLL_WEIGHT;
+-		else
+-			budget = ath12k_napi_poll_budget;
+-
+-		/* Apply a reduced budget for tx completion to prioritize tx
+-		 * enqueue operation */
+-		if (ab->hw_params->ring_mask->tx[i])
+-			budget = tx_comp_budget;
+-
+-		netif_napi_add(&irq_grp->napi_ndev, &irq_grp->napi,
+-			       ath12k_pci_ext_grp_napi_poll, budget);
+-
+-		if (ab->hw_params->ring_mask->tx[i] ||
+-		    ab->hw_params->ring_mask->rx[i] ||
+-		    ab->hw_params->ring_mask->rx_err[i] ||
+-		    ab->hw_params->ring_mask->rx_wbm_rel[i] ||
+-		    ab->hw_params->ring_mask->reo_status[i] ||
+-		    ab->hw_params->ring_mask->host2rxdma[i] ||
+-		    ab->hw_params->ring_mask->ppe2tcl[i] ||
+-#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+-		    ab->hw_params->ring_mask->wbm2sw6_ppeds_tx_cmpln[i] ||
+-#endif
+-		    ab->hw_params->ring_mask->reo2ppe[i] ||
+-		    ab->hw_params->ring_mask->rx_mon_dest[i]) {
+-			num_irq = 1;
+-		}
+-
+-		irq_grp->num_irq = num_irq;
+-		irq_grp->irqs[0] = base_idx + i;
+-
+-		for (j = 0; j < irq_grp->num_irq; j++) {
+-			int irq_idx = irq_grp->irqs[j];
+-			int vector = (i % num_vectors) + base_vector;
+-			int irq = ath12k_pci_get_msi_irq(ab->dev, vector);
+-			u8 bus_id = pci_domain_nr(ar_pci->pdev->bus);
+-			if (bus_id > ATH12K_MAX_PCI_DOMAINS) {
+-				ath12k_warn(ab, ATH12K_DBG_PCI, "bus_id:%d\n",
+-					    bus_id);
+-				bus_id = ATH12K_MAX_PCI_DOMAINS;
+-			}
+-
+-			ab->irq_num[irq_idx] = irq;
+-
+-			ath12k_dbg(ab, ATH12K_DBG_PCI,
+-				   "irq:%d group:%d\n", irq, i);
+-
+-			scnprintf(dp_irq_name[bus_id][i], DP_IRQ_NAME_LEN,
+-				"pci%u_wlan_dp_%u", bus_id, i);
+-			ath12k_dbg(ab, ATH12K_DBG_PCI,
+-				"PCI bus id: pci:%d IRQ Name:%s\n",
+-						bus_id, dp_irq_name[bus_id][i]);
+-			irq_set_status_flags(irq, IRQ_DISABLE_UNLAZY);
+-			ret = request_irq(irq, ath12k_pci_ext_interrupt_handler,
+-					  IRQF_SHARED,
+-					  dp_irq_name[bus_id][i], irq_grp);
+-			if (ret) {
+-				ath12k_err(ab, "failed request irq %d: %d\n",
+-					   vector, ret);
+-				return ret;
+-			}
+-
+-			disable_irq_nosync(ab->irq_num[irq_idx]);
+-		}
+-	}
+-
+-	return 0;
+-}
+-
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ int ath12k_pci_ppeds_register_interrupts(struct ath12k_base *ab, int type, int vector,
+ 					int ring_num)
+@@ -646,7 +267,7 @@ int ath12k_pci_ppeds_register_interrupts
+ 		return -EINVAL;
+ 	}
+ 
+-	irq = ath12k_pci_get_msi_irq(ab->dev, vector);
++	irq = ath12k_hif_get_msi_irq(ab, vector);
+ 
+ 	irq_set_status_flags(irq, IRQ_DISABLE_UNLAZY);
+ 	if (type == HAL_PPE2TCL) {
+@@ -708,55 +329,12 @@ void ath12k_pci_ppeds_free_interrupts(st
+ }
+ #endif
+ 
+-static int ath12k_pci_config_irq(struct ath12k_base *ab)
++int ath12k_pci_get_msi_irq(struct ath12k_base *ab, unsigned int vector)
+ {
+-	struct ath12k_ce_pipe *ce_pipe;
+-	u32 msi_data_start;
+-	u32 msi_data_count, msi_data_idx;
+-	u32 msi_irq_start;
+-	unsigned int msi_data;
+-	int irq, i, ret, irq_idx;
+-
+-	ret = ath12k_pci_get_user_msi_assignment(ab,
+-						 "CE", &msi_data_count,
+-						 &msi_data_start, &msi_irq_start);
+-	if (ret)
+-		return ret;
+-
+-	/* Configure CE irqs */
+-
+-	for (i = 0, msi_data_idx = 0; i < ab->hw_params->ce_count; i++) {
+-		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
+-			continue;
+-
+-		msi_data = (msi_data_idx % msi_data_count) + msi_irq_start;
+-		irq = ath12k_pci_get_msi_irq(ab->dev, msi_data);
+-		ce_pipe = &ab->ce.ce_pipe[i];
+-
+-		irq_idx = ATH12K_PCI_IRQ_CE0_OFFSET + i;
+-
+-		tasklet_setup(&ce_pipe->intr_tq, ath12k_pci_ce_tasklet);
+-
+-		ret = request_irq(irq, ath12k_pci_ce_interrupt_handler,
+-				  IRQF_SHARED, irq_name[irq_idx],
+-				  ce_pipe);
+-		if (ret) {
+-			ath12k_err(ab, "failed to request irq %d: %d\n",
+-				   irq_idx, ret);
+-			return ret;
+-		}
+-
+-		ab->irq_num[irq_idx] = irq;
+-		msi_data_idx++;
+-
+-		ath12k_pci_ce_irq_disable(ab, i);
+-	}
+-
+-	ret = ath12k_pci_ext_irq_config(ab);
+-	if (ret)
+-		return ret;
++	struct device *dev = ab->dev;
++	struct pci_dev *pci_dev = to_pci_dev(dev);
+ 
+-	return 0;
++	return pci_irq_vector(pci_dev, vector);
+ }
+ 
+ static void ath12k_umac_reset_tasklet_handler(struct tasklet_struct *t)
+@@ -792,14 +370,13 @@ static int ath12k_dp_umac_pci_config_irq
+         int irq, ret;
+ 	struct ath12k_dp_umac_reset *umac_reset = &ab->dp_umac_reset;
+ 
+-        ret = ath12k_pci_get_user_msi_assignment(ab,
+-                                                 "DP", &msi_data_count,
+-                                                 &msi_data_start, &msi_irq_start);
++	ret = ath12k_pcic_get_user_msi_assignment(ab, "DP", &msi_data_count,
++						  &msi_data_start, &msi_irq_start);
+         if (ret)
+                 return ret;
+ 
+ 	msi_data = (umac_reset->intr_offset % msi_data_count) + msi_irq_start;
+-	irq = ath12k_pci_get_msi_irq(ab->dev, msi_data);
++	irq = ath12k_pci_get_msi_irq(ab, msi_data);
+ 	umac_reset->irq_num = irq;
+ 	tasklet_setup(&umac_reset->intr_tq, ath12k_umac_reset_tasklet_handler);
+ 
+@@ -841,17 +418,6 @@ static void ath12k_pci_init_qmi_ce_confi
+ 	ab->qmi.service_ins_id += ab_pci->instance;
+ }
+ 
+-static void ath12k_pci_ce_irqs_enable(struct ath12k_base *ab)
+-{
+-	int i;
+-
+-	for (i = 0; i < ab->hw_params->ce_count; i++) {
+-		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
+-			continue;
+-		ath12k_pci_ce_irq_enable(ab, i);
+-	}
+-}
+-
+ static void ath12k_pci_msi_config(struct ath12k_pci *ab_pci, bool enable)
+ {
+ 	struct pci_dev *dev = ab_pci->pdev;
+@@ -880,7 +446,7 @@ static void ath12k_pci_msi_disable(struc
+ static int ath12k_pci_msi_alloc(struct ath12k_pci *ab_pci)
+ {
+ 	struct ath12k_base *ab = ab_pci->ab;
+-	const struct ath12k_msi_config *msi_config = ab_pci->msi_config;
++	const struct ath12k_msi_config *msi_config = ab->msi.config;
+ 	struct msi_desc *msi_desc;
+ 	int num_vectors;
+ 	int ret;
+@@ -908,11 +474,11 @@ static int ath12k_pci_msi_alloc(struct a
+ 		goto free_msi_vector;
+ 	}
+ 
+-	ab_pci->msi_ep_base_data = msi_desc->msg.data;
++	ab->msi.ep_base_data = msi_desc->msg.data;
+ 	if (msi_desc->pci.msi_attrib.is_64)
+ 		set_bit(ATH12K_PCI_FLAG_IS_MSI_64, &ab_pci->flags);
+ 
+-	ath12k_dbg(ab, ATH12K_DBG_PCI, "msi base data is %d\n", ab_pci->msi_ep_base_data);
++	ath12k_dbg(ab, ATH12K_DBG_PCI, "msi base data is %d\n", ab->msi.ep_base_data);
+ 
+ 	return 0;
+ 
+@@ -1047,105 +613,6 @@ static void ath12k_pci_aspm_restore(stru
+ 					   ab_pci->link_ctl);
+ }
+ 
+-static void ath12k_pci_kill_tasklets(struct ath12k_base *ab)
+-{
+-	int i;
+-
+-	for (i = 0; i < ab->hw_params->ce_count; i++) {
+-		struct ath12k_ce_pipe *ce_pipe = &ab->ce.ce_pipe[i];
+-
+-		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
+-			continue;
+-
+-		tasklet_kill(&ce_pipe->intr_tq);
+-	}
+-}
+-
+-static void ath12k_pci_ce_irq_disable_sync(struct ath12k_base *ab)
+-{
+-	ath12k_pci_ce_irqs_disable(ab);
+-	ath12k_pci_sync_ce_irqs(ab);
+-	ath12k_pci_kill_tasklets(ab);
+-}
+-
+-int ath12k_pci_map_service_to_pipe(struct ath12k_base *ab, u16 service_id,
+-				   u8 *ul_pipe, u8 *dl_pipe)
+-{
+-	const struct service_to_pipe *entry;
+-	bool ul_set = false, dl_set = false;
+-	int i;
+-
+-	for (i = 0; i < ab->hw_params->svc_to_ce_map_len; i++) {
+-		entry = &ab->hw_params->svc_to_ce_map[i];
+-
+-		if (__le32_to_cpu(entry->service_id) != service_id)
+-			continue;
+-
+-		switch (__le32_to_cpu(entry->pipedir)) {
+-		case PIPEDIR_NONE:
+-			break;
+-		case PIPEDIR_IN:
+-			WARN_ON(dl_set);
+-			*dl_pipe = __le32_to_cpu(entry->pipenum);
+-			dl_set = true;
+-			break;
+-		case PIPEDIR_OUT:
+-			WARN_ON(ul_set);
+-			*ul_pipe = __le32_to_cpu(entry->pipenum);
+-			ul_set = true;
+-			break;
+-		case PIPEDIR_INOUT:
+-			WARN_ON(dl_set);
+-			WARN_ON(ul_set);
+-			*dl_pipe = __le32_to_cpu(entry->pipenum);
+-			*ul_pipe = __le32_to_cpu(entry->pipenum);
+-			dl_set = true;
+-			ul_set = true;
+-			break;
+-		}
+-	}
+-
+-	if (WARN_ON(!ul_set || !dl_set))
+-		return -ENOENT;
+-
+-	return 0;
+-}
+-
+-int ath12k_pci_get_msi_irq(struct device *dev, unsigned int vector)
+-{
+-	struct pci_dev *pci_dev = to_pci_dev(dev);
+-
+-	return pci_irq_vector(pci_dev, vector);
+-}
+-
+-int ath12k_pci_get_user_msi_assignment(struct ath12k_base *ab, char *user_name,
+-				       int *num_vectors, u32 *user_base_data,
+-				       u32 *base_vector)
+-{
+-	struct ath12k_pci *ab_pci = ath12k_pci_priv(ab);
+-	const struct ath12k_msi_config *msi_config = ab_pci->msi_config;
+-	int idx;
+-
+-	for (idx = 0; idx < msi_config->total_users; idx++) {
+-		if (strcmp(user_name, msi_config->users[idx].name) == 0) {
+-			*num_vectors = msi_config->users[idx].num_vectors;
+-			*user_base_data = msi_config->users[idx].base_vector
+-				+ ab_pci->msi_ep_base_data;
+-			*base_vector = msi_config->users[idx].base_vector;
+-
+-			ath12k_dbg(ab, ATH12K_DBG_PCI, "Assign MSI to user: %s, num_vectors: %d, user_base_data: %u, base_vector: %u\n",
+-				   user_name, *num_vectors, *user_base_data,
+-				   *base_vector);
+-
+-			return 0;
+-		}
+-	}
+-
+-	ath12k_err(ab, "Failed to find MSI assignment for %s!\n", user_name);
+-
+-	return -EINVAL;
+-}
+-
+ void ath12k_pci_get_msi_address(struct ath12k_base *ab, u32 *msi_addr_lo,
+ 				u32 *msi_addr_hi)
+ {
+@@ -1182,30 +649,12 @@ void ath12k_pci_get_ce_msi_idx(struct at
+ 
+ void ath12k_pci_hif_ce_irq_enable(struct ath12k_base *ab)
+ {
+-	ath12k_pci_ce_irqs_enable(ab);
++	ath12k_pcic_ce_irqs_enable(ab);
+ }
+ 
+ void ath12k_pci_hif_ce_irq_disable(struct ath12k_base *ab)
+ {
+-	ath12k_pci_ce_irq_disable_sync(ab);
+-}
+-
+-void ath12k_pci_ext_irq_enable(struct ath12k_base *ab)
+-{
+-	int i;
+-
+-	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
+-		struct ath12k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
+-
+-		napi_enable(&irq_grp->napi);
+-		ath12k_pci_ext_grp_enable(irq_grp);
+-	}
+-}
+-
+-void ath12k_pci_ext_irq_disable(struct ath12k_base *ab)
+-{
+-	__ath12k_pci_ext_irq_disable(ab);
+-	ath12k_pci_sync_ext_irqs(ab);
++	ath12k_pcic_ce_irq_disable_sync(ab);
+ }
+ 
+ int ath12k_pci_hif_suspend(struct ath12k_base *ab)
+@@ -1226,12 +675,6 @@ int ath12k_pci_hif_resume(struct ath12k_
+ 	return 0;
+ }
+ 
+-void ath12k_pci_stop(struct ath12k_base *ab)
+-{
+-	ath12k_pci_ce_irq_disable_sync(ab);
+-	ath12k_ce_cleanup_pipes(ab);
+-}
+-
+ int ath12k_pci_start(struct ath12k_base *ab)
+ {
+ 	struct ath12k_pci *ab_pci = ath12k_pci_priv(ab);
+@@ -1240,9 +683,7 @@ int ath12k_pci_start(struct ath12k_base
+ 
+ 	ath12k_pci_aspm_restore(ab_pci);
+ 
+-	ath12k_pci_ce_irqs_enable(ab);
+-	ath12k_ce_rx_post_buf(ab);
+-
++	ath12k_pcic_start(ab);
+ 	return 0;
+ }
+ 
+@@ -1273,7 +714,7 @@ u32 ath12k_pci_read32(struct ath12k_base
+ 		val = ioread32(ab->mem + offset);
+ 	} else {
+ 		if (ab->static_window_map)
+-			window_start = ath12k_pci_get_window_start(ab, offset);
++			window_start = ath12k_pcic_get_window_start(ab, offset);
+ 		else
+ 			window_start = WINDOW_START;
+ 
+@@ -1327,7 +768,7 @@ void ath12k_pci_write32(struct ath12k_ba
+ 		iowrite32(value, ab->mem + offset);
+ 	} else {
+ 		if (ab->static_window_map)
+-			window_start = ath12k_pci_get_window_start(ab, offset);
++			window_start = ath12k_pcic_get_window_start(ab, offset);
+ 		else
+ 			window_start = WINDOW_START;
+ 
+@@ -1387,7 +828,7 @@ int ath12k_pci_power_up(struct ath12k_ba
+ 	}
+ 
+ 	if (ab->static_window_map)
+-		ath12k_pci_select_static_window(ab_pci);
++		ath12k_pci_select_static_window(ab);
+ 
+ 	return 0;
+ }
+@@ -1411,18 +852,18 @@ void ath12k_pci_power_down(struct ath12k
+ 
+ static const struct ath12k_hif_ops ath12k_pci_hif_ops = {
+ 	.start = ath12k_pci_start,
+-	.stop = ath12k_pci_stop,
++	.stop = ath12k_pcic_stop,
+ 	.read32 = ath12k_pci_read32,
+ 	.write32 = ath12k_pci_write32,
+ 	.power_down = ath12k_pci_power_down,
+ 	.power_up = ath12k_pci_power_up,
+ 	.suspend = ath12k_pci_hif_suspend,
+ 	.resume = ath12k_pci_hif_resume,
+-	.irq_enable = ath12k_pci_ext_irq_enable,
+-	.irq_disable = ath12k_pci_ext_irq_disable,
++	.irq_enable = ath12k_pcic_ext_irq_enable,
++	.irq_disable = ath12k_pcic_ext_irq_disable,
+ 	.get_msi_address = ath12k_pci_get_msi_address,
+-	.get_user_msi_vector = ath12k_pci_get_user_msi_assignment,
+-	.map_service_to_pipe = ath12k_pci_map_service_to_pipe,
++	.get_user_msi_vector = ath12k_pcic_get_user_msi_assignment,
++	.map_service_to_pipe = ath12k_pcic_map_service_to_pipe,
+ 	.ce_irq_enable = ath12k_pci_hif_ce_irq_enable,
+ 	.ce_irq_disable = ath12k_pci_hif_ce_irq_disable,
+ 	.get_ce_msi_idx = ath12k_pci_get_ce_msi_idx,
+@@ -1435,6 +876,7 @@ static const struct ath12k_hif_ops ath12
+ 	.dp_umac_reset_irq_config = ath12k_dp_umac_pci_config_irq,
+ 	.dp_umac_reset_enable_irq = ath12k_dp_umac_reset_enable_irq,
+ 	.dp_umac_reset_free_irq = ath12k_dp_umac_reset_free_irq,
++	.get_msi_irq =  ath12k_pci_get_msi_irq,
+ };
+ 
+ static
+@@ -1517,7 +959,7 @@ static int ath12k_pci_probe(struct pci_d
+ 
+ 	switch (pci_dev->device) {
+ 	case QCN9274_DEVICE_ID:
+-		ab_pci->msi_config = &ath12k_msi_config[0];
++		ab->msi.config = &ath12k_msi_config[ATH12K_MSI_CONFIG_PCI];
+ 		ab->static_window_map = true;
+ 		ab_pci->pci_ops = &ath12k_pci_ops_qcn9274;
+ 		ath12k_pci_read_hw_version(ab, &soc_hw_version_major,
+@@ -1538,7 +980,7 @@ static int ath12k_pci_probe(struct pci_d
+ 		}
+ 		break;
+ 	case WCN7850_DEVICE_ID:
+-		ab_pci->msi_config = &ath12k_msi_config[0];
++		ab->msi.config = &ath12k_msi_config[ATH12K_MSI_CONFIG_PCI];
+ 		ab->static_window_map = false;
+ 		ab_pci->pci_ops = &ath12k_pci_ops_wcn7850;
+ 		ath12k_pci_read_hw_version(ab, &soc_hw_version_major,
+@@ -1591,7 +1033,7 @@ static int ath12k_pci_probe(struct pci_d
+ 
+ 	ath12k_pci_init_qmi_ce_config(ab);
+ 
+-	ret = ath12k_pci_config_irq(ab);
++	ret = ath12k_pcic_config_irq(ab);
+ 	if (ret) {
+ 		ath12k_err(ab, "failed to config irq: %d\n", ret);
+ 		goto err_ce_free;
+@@ -1606,7 +1048,7 @@ static int ath12k_pci_probe(struct pci_d
+ 	return 0;
+ 
+ err_free_irq:
+-	ath12k_pci_free_irq(ab);
++	ath12k_pcic_free_irq(ab);
+ 
+ err_ce_free:
+ 	ath12k_ce_free_pipes(ab);
+@@ -1650,7 +1092,7 @@ static void ath12k_pci_remove(struct pci
+ qmi_fail:
+ 	ath12k_mhi_unregister(ab_pci);
+ 
+-	ath12k_pci_free_irq(ab);
++	ath12k_pcic_free_irq(ab);
+ 	ath12k_pci_msi_free(ab_pci);
+ 	ath12k_pci_free_region(ab_pci);
+ 
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath12k/pcic.c
+@@ -0,0 +1,890 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * Copyright (c) 2019-2021 The Linux Foundation. All rights reserved.
++ * Copyright (c) 2021-2023 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#include <linux/module.h>
++#include "core.h"
++#include "pcic.h"
++#include "debug.h"
++
++unsigned int tx_comp_budget = 0x7F;
++module_param_named(tx_comp_budget, tx_comp_budget, uint, 0644);
++MODULE_PARM_DESC(tx_comp_budget, "tx_comp_budget");
++
++unsigned int ath12k_napi_poll_budget = 0x7f;
++module_param_named(napi_budget, ath12k_napi_poll_budget, uint, 0644);
++MODULE_PARM_DESC(napi_budget, "Napi budget processing per rx intr");
++
++static const char *irq_name[ATH12K_IRQ_NUM_MAX] = {
++	"bhi",
++	"mhi-er0",
++	"mhi-er1",
++	"ce0",
++	"ce1",
++	"ce2",
++	"ce3",
++	"ce4",
++	"ce5",
++	"ce6",
++	"ce7",
++	"ce8",
++	"ce9",
++	"ce10",
++	"ce11",
++	"ce12",
++	"ce13",
++	"ce14",
++	"ce15",
++	"host2wbm-desc-feed",
++	"host2reo-re-injection",
++	"host2reo-command",
++	"host2rxdma-monitor-ring3",
++	"host2rxdma-monitor-ring2",
++	"host2rxdma-monitor-ring1",
++	"reo2ost-exception",
++	"wbm2host-rx-release",
++	"reo2host-status",
++	"reo2host-destination-ring4",
++	"reo2host-destination-ring3",
++	"reo2host-destination-ring2",
++	"reo2host-destination-ring1",
++	"rxdma2host-monitor-destination-mac3",
++	"rxdma2host-monitor-destination-mac2",
++	"rxdma2host-monitor-destination-mac1",
++	"ppdu-end-interrupts-mac3",
++	"ppdu-end-interrupts-mac2",
++	"ppdu-end-interrupts-mac1",
++	"rxdma2host-monitor-status-ring-mac3",
++	"rxdma2host-monitor-status-ring-mac2",
++	"rxdma2host-monitor-status-ring-mac1",
++	"host2rxdma-host-buf-ring-mac3",
++	"host2rxdma-host-buf-ring-mac2",
++	"host2rxdma-host-buf-ring-mac1",
++	"rxdma2host-destination-ring-mac3",
++	"rxdma2host-destination-ring-mac2",
++	"rxdma2host-destination-ring-mac1",
++	"host2tcl-input-ring4",
++	"host2tcl-input-ring3",
++	"host2tcl-input-ring2",
++	"host2tcl-input-ring1",
++	"wbm2host-tx-completions-ring4",
++	"wbm2host-tx-completions-ring3",
++	"wbm2host-tx-completions-ring2",
++	"wbm2host-tx-completions-ring1",
++	"tcl2host-status-ring",
++};
++
++char dp_irq_name[ATH12K_MAX_PCI_DOMAINS + 1][ATH12K_EXT_IRQ_DP_NUM_VECTORS][DP_IRQ_NAME_LEN] = {};
++char ce_irq_name[ATH12K_MAX_PCI_DOMAINS + 1][ATH12K_IRQ_NUM_MAX][DP_IRQ_NAME_LEN] = {};
++
++void ath12k_pcic_config_static_window(struct ath12k_base *ab)
++{
++	u32 umac_window = u32_get_bits(HAL_SEQ_WCSS_UMAC_OFFSET, WINDOW_VALUE_MASK);
++	u32 ce_window = u32_get_bits(HAL_CE_WFSS_CE_REG_BASE, WINDOW_VALUE_MASK);
++	u32 window;
++
++	window = (umac_window << 12) | (ce_window << 6);
++
++	iowrite32(WINDOW_ENABLE_BIT | window, ab->mem + WINDOW_REG_ADDRESS);
++}
++
++static void ath12k_pcic_select_static_window(struct ath12k_base *ab, u32 addr)
++{
++	u32 curr_window, cur_val, prev_window = 0;
++	volatile u32 read_val = 0;
++	int retry = 0;
++	u32 window = u32_get_bits(addr, WINDOW_VALUE_MASK);
++
++	prev_window = readl_relaxed(ab->mem + WINDOW_REG_ADDRESS);
++
++	/* Clear out last 6 bits of window register */
++	prev_window = prev_window & ~(0x3f);
++
++	/* Write the new last 6 bits of window register. Only window 1 values
++	 * are changed. Window 2 and 3 are unaffected.
++	 */
++	curr_window = prev_window | window;
++
++	/* Skip writing into window register if the read value
++	 * is same as calculated value.
++	 */
++	if (curr_window == prev_window)
++		return;
++
++	cur_val = WINDOW_ENABLE_BIT | curr_window;
++	writel_relaxed(cur_val, ab->mem + WINDOW_REG_ADDRESS);
++
++	read_val = readl_relaxed(ab->mem + WINDOW_REG_ADDRESS);
++
++	/* If value written is not yet reflected, wait till it is reflected */
++	while ((read_val != cur_val) && (retry < 10)) {
++		mdelay(1);
++		read_val = readl_relaxed(ab->mem + WINDOW_REG_ADDRESS);
++		retry++;
++	}
++	if (retry == 10)
++		ath12k_warn(ab, "Failed to set static window for cmem init\n");
++}
++
++u32 ath12k_pcic_cmem_read32(struct ath12k_base *ab, u32 addr)
++{
++	u32 val;
++
++	if (addr < WINDOW_START)
++		return readl_relaxed(ab->mem + addr);
++
++	ath12k_pcic_select_static_window(ab, addr);
++
++	val = readl_relaxed(ab->mem + WINDOW_START + (addr & WINDOW_RANGE_MASK));
++
++	return val;
++}
++
++void ath12k_pcic_cmem_write32(struct ath12k_base *ab, u32 addr, u32 value)
++{
++	if (addr < WINDOW_START) {
++		writel_relaxed(value, ab->mem + addr);
++		return;
++	}
++
++	ath12k_pcic_select_static_window(ab, addr);
++
++	writel_relaxed(value, ab->mem + WINDOW_START + (addr & WINDOW_RANGE_MASK));
++}
++
++u32 ath12k_pcic_get_window_start(struct ath12k_base *ab, u32 offset)
++{
++	u32 window_start;
++
++	/* If offset lies within DP register range, use 3rd window */
++	if ((offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < WINDOW_RANGE_MASK)
++		window_start = 3 * WINDOW_START;
++	/* If offset lies within CE register range, use 2nd window */
++	else if ((offset ^ HAL_CE_WFSS_CE_REG_BASE) < WINDOW_RANGE_MASK)
++		window_start = 2 * WINDOW_START;
++	else
++		window_start = WINDOW_START;
++
++	return window_start;
++}
++
++static void ath12k_pcic_free_ext_irq(struct ath12k_base *ab)
++{
++	int i, j;
++
++	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
++		struct ath12k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
++
++		for (j = 0; j < irq_grp->num_irq; j++)
++			free_irq(ab->irq_num[irq_grp->irqs[j]], irq_grp);
++
++		netif_napi_del(&irq_grp->napi);
++	}
++}
++
++void ath12k_pcic_free_irq(struct ath12k_base *ab)
++{
++	int i, irq_idx;
++
++	for (i = 0; i < ab->hw_params->ce_count; i++) {
++		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
++			continue;
++		irq_idx = ATH12K_PCI_IRQ_CE0_OFFSET + i;
++		free_irq(ab->irq_num[irq_idx], &ab->ce.ce_pipe[i]);
++	}
++
++	ath12k_pcic_free_ext_irq(ab);
++}
++
++void ath12k_pcic_free_hybrid_irq(struct ath12k_base *ab)
++{
++	struct platform_device *pdev = ab->pdev;
++
++	ath12k_pcic_free_irq(ab);
++	platform_msi_domain_free_irqs(&pdev->dev);
++}
++
++static void ath12k_pcic_ce_irq_enable(struct ath12k_base *ab, u16 ce_id)
++{
++	u32 irq_idx;
++
++	irq_idx = ATH12K_PCI_IRQ_CE0_OFFSET + ce_id;
++	enable_irq(ab->irq_num[irq_idx]);
++}
++
++static void ath12k_pcic_ce_irq_disable(struct ath12k_base *ab, u16 ce_id)
++{
++	u32 irq_idx;
++
++	irq_idx = ATH12K_PCI_IRQ_CE0_OFFSET + ce_id;
++	disable_irq_nosync(ab->irq_num[irq_idx]);
++}
++
++static void ath12k_pcic_ce_irqs_disable(struct ath12k_base *ab)
++{
++	int i;
++
++	for (i = 0; i < ab->hw_params->ce_count; i++) {
++		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
++			continue;
++		ath12k_pcic_ce_irq_disable(ab, i);
++	}
++}
++
++static void ath12k_pcic_ce_tasklet(struct tasklet_struct *t)
++{
++	struct ath12k_ce_pipe *ce_pipe = from_tasklet(ce_pipe, t, intr_tq);
++
++	ath12k_ce_per_engine_service(ce_pipe->ab, ce_pipe->pipe_num);
++
++	ath12k_pcic_ce_irq_enable(ce_pipe->ab, ce_pipe->pipe_num);
++}
++
++static irqreturn_t ath12k_pcic_ce_interrupt_handler(int irq, void *arg)
++{
++	struct ath12k_ce_pipe *ce_pipe = arg;
++
++	/* last interrupt received for this CE */
++	ce_pipe->timestamp = jiffies;
++
++	ath12k_pcic_ce_irq_disable(ce_pipe->ab, ce_pipe->pipe_num);
++	tasklet_schedule(&ce_pipe->intr_tq);
++
++	return IRQ_HANDLED;
++}
++
++static void ath12k_pcic_ext_grp_disable(struct ath12k_ext_irq_grp *irq_grp)
++{
++	int i;
++
++	for (i = 0; i < irq_grp->num_irq; i++)
++		disable_irq_nosync(irq_grp->ab->irq_num[irq_grp->irqs[i]]);
++}
++
++static void __ath12k_pcic_ext_irq_disable(struct ath12k_base *sc)
++{
++	int i;
++
++	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
++		struct ath12k_ext_irq_grp *irq_grp = &sc->ext_irq_grp[i];
++
++		ath12k_pcic_ext_grp_disable(irq_grp);
++
++		napi_synchronize(&irq_grp->napi);
++		napi_disable(&irq_grp->napi);
++	}
++}
++
++static void ath12k_pcic_ext_grp_enable(struct ath12k_ext_irq_grp *irq_grp)
++{
++	int i;
++
++	for (i = 0; i < irq_grp->num_irq; i++)
++		enable_irq(irq_grp->ab->irq_num[irq_grp->irqs[i]]);
++}
++
++static void ath12k_pcic_sync_ext_irqs(struct ath12k_base *ab)
++{
++	int i, j, irq_idx;
++
++	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
++		struct ath12k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
++
++		for (j = 0; j < irq_grp->num_irq; j++) {
++			irq_idx = irq_grp->irqs[j];
++			synchronize_irq(ab->irq_num[irq_idx]);
++		}
++	}
++}
++
++static int ath12k_pcic_ext_grp_napi_poll(struct napi_struct *napi, int budget)
++{
++	struct ath12k_ext_irq_grp *irq_grp = container_of(napi,
++						struct ath12k_ext_irq_grp,
++						napi);
++	struct ath12k_base *ab = irq_grp->ab;
++	int work_done;
++
++	work_done = ath12k_dp_service_srng(ab, irq_grp, budget);
++	if (work_done < budget) {
++		napi_complete_done(napi, work_done);
++		ath12k_pcic_ext_grp_enable(irq_grp);
++	}
++
++	if (work_done > budget)
++		work_done = budget;
++
++	return work_done;
++}
++
++static irqreturn_t ath12k_pcic_ext_interrupt_handler(int irq, void *arg)
++{
++	struct ath12k_ext_irq_grp *irq_grp = arg;
++
++	ath12k_dbg(irq_grp->ab, ATH12K_DBG_PCI, "ext irq:%d\n", irq);
++
++	/* last interrupt received for this group */
++	irq_grp->timestamp = jiffies;
++
++	ath12k_pcic_ext_grp_disable(irq_grp);
++
++	napi_schedule(&irq_grp->napi);
++
++	return IRQ_HANDLED;
++}
++
++void ath12k_pcic_ce_irqs_enable(struct ath12k_base *ab)
++{
++	int i;
++
++	for (i = 0; i < ab->hw_params->ce_count; i++) {
++		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
++			continue;
++		ath12k_pcic_ce_irq_enable(ab, i);
++	}
++}
++
++static int ath12k_pcic_ext_config_gic_msi_irq(struct ath12k_base *ab,
++					      struct platform_device *pdev,
++					      struct msi_desc *msi_desc, int i)
++{
++	u32 user_base_data = 0, base_vector = 0, base_idx;
++	struct ath12k_ext_irq_grp *irq_grp;
++	int j, budget, ret = 0, num_vectors = 0;
++	u8 userpd_id;
++	u32 num_irq = 0;
++
++	userpd_id = ab->userpd_id;
++	base_idx = ATH12K_PCI_IRQ_CE0_OFFSET + CE_COUNT_MAX;
++	ret = ath12k_pcic_get_user_msi_assignment(ab, "DP", &num_vectors,
++						  &user_base_data, &base_vector);
++	if (ret < 0)
++		return ret;
++
++	irq_grp = &ab->ext_irq_grp[i];
++	irq_grp->ab = ab;
++	irq_grp->grp_id = i;
++	init_dummy_netdev(&irq_grp->napi_ndev);
++
++	if (ab->hw_params->ring_mask->rx_mon_dest[i])
++		budget = NAPI_POLL_WEIGHT;
++	else
++		budget = ath12k_napi_poll_budget;
++
++	/* Apply a reduced budget for tx completion to prioritize tx enqueue operation */
++	if (ab->hw_params->ring_mask->tx[i])
++		budget = tx_comp_budget;
++
++	netif_napi_add(&irq_grp->napi_ndev, &irq_grp->napi,
++		       ath12k_pcic_ext_grp_napi_poll, budget);
++
++	if (ab->hw_params->ring_mask->tx[i] ||
++	    ab->hw_params->ring_mask->rx[i] ||
++	    ab->hw_params->ring_mask->rx_err[i] ||
++	    ab->hw_params->ring_mask->rx_wbm_rel[i] ||
++	    ab->hw_params->ring_mask->reo_status[i] ||
++	    ab->hw_params->ring_mask->host2rxdma[i] ||
++	    ab->hw_params->ring_mask->ppe2tcl[i] ||
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	    ab->hw_params->ring_mask->wbm2sw6_ppeds_tx_cmpln[i] ||
++#endif
++	    ab->hw_params->ring_mask->reo2ppe[i] ||
++	    ab->hw_params->ring_mask->rx_mon_dest[i]) {
++		num_irq = 1;
++	}
++
++	irq_grp->num_irq = num_irq;
++	irq_grp->irqs[0] = base_idx + i;
++
++	for (j = 0; j < irq_grp->num_irq; j++) {
++		int irq_idx = irq_grp->irqs[j];
++		int vector = (i % num_vectors);
++
++		scnprintf(dp_irq_name[userpd_id][i], DP_IRQ_NAME_LEN,
++			  "pci%u_wlan_dp_%u", userpd_id, i);
++		irq_set_status_flags(msi_desc->irq, IRQ_DISABLE_UNLAZY);
++		ret = devm_request_irq(&pdev->dev, msi_desc->irq,
++				       ath12k_pcic_ext_interrupt_handler, IRQF_SHARED,
++				       dp_irq_name[userpd_id][i], irq_grp);
++		if (ret) {
++			ath12k_err(ab, "failed request irq %d: %d\n", irq_idx, ret);
++			return ret;
++		}
++		ab->irq_num[irq_idx] = msi_desc->irq;
++		ab->ipci.dp_irq_num[vector] = msi_desc->irq;
++		ab->ipci.dp_msi_data[i] = msi_desc->msg.data;
++		disable_irq_nosync(ab->irq_num[irq_idx]);
++	}
++	return ret;
++}
++
++static int ath12k_pcic_config_gic_msi_irq(struct ath12k_base *ab,
++					  struct platform_device *pdev,
++					  struct msi_desc *msi_desc, int i)
++{
++	struct ath12k_ce_pipe *ce_pipe = &ab->ce.ce_pipe[i];
++	int irq_idx, ret;
++	u8 userpd_id = ab->userpd_id;
++
++	tasklet_setup(&ce_pipe->intr_tq, ath12k_pcic_ce_tasklet);
++	irq_idx = ATH12K_PCI_IRQ_CE0_OFFSET + i;
++
++	scnprintf(ce_irq_name[userpd_id][irq_idx], DP_IRQ_NAME_LEN,
++		  "pci%u_wlan_ce_%u", userpd_id, i);
++
++	ret = devm_request_irq(&pdev->dev, msi_desc->irq,
++			       ath12k_pcic_ce_interrupt_handler, IRQF_SHARED,
++			       ce_irq_name[userpd_id][irq_idx], ce_pipe);
++	if (ret) {
++		ath12k_warn(ab, "failed to request irq %d: %d\n", irq_idx, ret);
++		return ret;
++	}
++
++	ab->irq_num[irq_idx] = msi_desc->irq;
++	ab->ipci.ce_msi_data[i] = msi_desc->msg.data;
++	ath12k_pcic_ce_irq_disable(ab, i);
++
++	return ret;
++}
++
++static void ath12k_pcic_kill_tasklets(struct ath12k_base *ab)
++{
++	int i;
++
++	for (i = 0; i < ab->hw_params->ce_count; i++) {
++		struct ath12k_ce_pipe *ce_pipe = &ab->ce.ce_pipe[i];
++
++		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
++			continue;
++
++		tasklet_kill(&ce_pipe->intr_tq);
++	}
++}
++
++static void ath12k_pci_sync_ce_irqs(struct ath12k_base *ab)
++{
++	int i;
++	int irq_idx;
++
++	for (i = 0; i < ab->hw_params->ce_count; i++) {
++		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
++			continue;
++
++		irq_idx = ATH12K_PCI_IRQ_CE0_OFFSET + i;
++		synchronize_irq(ab->irq_num[irq_idx]);
++	}
++}
++
++void ath12k_pcic_ce_irq_disable_sync(struct ath12k_base *ab)
++{
++	ath12k_pcic_ce_irqs_disable(ab);
++	ath12k_pci_sync_ce_irqs(ab);
++	ath12k_pcic_kill_tasklets(ab);
++}
++
++int ath12k_pcic_map_service_to_pipe(struct ath12k_base *ab, u16 service_id,
++				    u8 *ul_pipe, u8 *dl_pipe)
++{
++	const struct service_to_pipe *entry;
++	bool ul_set = false, dl_set = false;
++	int i;
++
++	for (i = 0; i < ab->hw_params->svc_to_ce_map_len; i++) {
++		entry = &ab->hw_params->svc_to_ce_map[i];
++
++		if (__le32_to_cpu(entry->service_id) != service_id)
++			continue;
++
++		switch (__le32_to_cpu(entry->pipedir)) {
++		case PIPEDIR_NONE:
++			break;
++		case PIPEDIR_IN:
++			WARN_ON(dl_set);
++			*dl_pipe = __le32_to_cpu(entry->pipenum);
++			dl_set = true;
++			break;
++		case PIPEDIR_OUT:
++			WARN_ON(ul_set);
++			*ul_pipe = __le32_to_cpu(entry->pipenum);
++			ul_set = true;
++			break;
++		case PIPEDIR_INOUT:
++			WARN_ON(dl_set);
++			WARN_ON(ul_set);
++			*dl_pipe = __le32_to_cpu(entry->pipenum);
++			*ul_pipe = __le32_to_cpu(entry->pipenum);
++			dl_set = true;
++			ul_set = true;
++			break;
++		}
++	}
++
++	if (WARN_ON(!ul_set || !dl_set))
++		return -ENOENT;
++
++	return 0;
++}
++
++int ath12k_pcic_get_msi_irq(struct ath12k_base *ab, unsigned int vector)
++{
++	return ab->msi.irqs[vector];
++}
++
++int ath12k_pcic_get_user_msi_assignment(struct ath12k_base *ab, char *user_name,
++					int *num_vectors, u32 *user_base_data,
++					u32 *base_vector)
++{
++	const struct ath12k_msi_config *msi_config = ab->msi.config;
++	int idx;
++
++	for (idx = 0; idx < msi_config->total_users; idx++) {
++		if (strcmp(user_name, msi_config->users[idx].name) == 0) {
++			*num_vectors = msi_config->users[idx].num_vectors;
++			*user_base_data = msi_config->users[idx].base_vector
++				+ ab->msi.ep_base_data;
++			*base_vector = msi_config->users[idx].base_vector;
++
++			ath12k_dbg(ab, ATH12K_DBG_PCI, "Assign MSI to user: %s, num_vectors: %d, user_base_data: %u, base_vector: %u\n",
++				   user_name, *num_vectors, *user_base_data,
++				   *base_vector);
++
++			return 0;
++		}
++	}
++
++	ath12k_err(ab, "Failed to find MSI assignment for %s!\n", user_name);
++
++	return -EINVAL;
++}
++
++void ath12k_pcic_get_msi_address(struct ath12k_base *ab, u32 *msi_addr_lo,
++				 u32 *msi_addr_hi)
++{
++	*msi_addr_lo = ab->msi.addr_lo;
++	*msi_addr_hi = ab->msi.addr_hi;
++}
++
++void ath12k_pcic_ext_irq_enable(struct ath12k_base *ab)
++{
++	int i;
++
++	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
++		struct ath12k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
++
++		napi_enable(&irq_grp->napi);
++		ath12k_pcic_ext_grp_enable(irq_grp);
++	}
++}
++
++void ath12k_pcic_ext_irq_disable(struct ath12k_base *ab)
++{
++	__ath12k_pcic_ext_irq_disable(ab);
++	ath12k_pcic_sync_ext_irqs(ab);
++}
++
++void ath12k_pcic_stop(struct ath12k_base *ab)
++{
++	ath12k_pcic_ce_irq_disable_sync(ab);
++	ath12k_ce_cleanup_pipes(ab);
++}
++
++int ath12k_pcic_start(struct ath12k_base *ab)
++{
++	ath12k_pcic_ce_irqs_enable(ab);
++	ath12k_ce_rx_post_buf(ab);
++
++	return 0;
++}
++
++u32 ath12k_pcic_ipci_read32(struct ath12k_base *ab, u32 offset)
++{
++	u32 val, window_start;
++
++	window_start = ath12k_pcic_get_window_start(ab, offset);
++	val = ioread32(ab->mem + window_start +
++		       (offset & WINDOW_RANGE_MASK));
++
++	return val;
++}
++
++void ath12k_pcic_ipci_write32(struct ath12k_base *ab, u32 offset, u32 value)
++{
++	u32 window_start;
++
++	window_start = ath12k_pcic_get_window_start(ab, offset);
++	iowrite32(value, ab->mem + window_start +
++		  (offset & WINDOW_RANGE_MASK));
++}
++
++static int ath12k_pci_ext_irq_config(struct ath12k_base *ab)
++{
++	int i, j, ret, num_vectors = 0;
++	u32 user_base_data = 0, base_vector = 0, base_idx, budget;
++	struct ath12k_pci *ar_pci = (struct ath12k_pci *)ab->drv_priv;
++
++	base_idx = ATH12K_PCI_IRQ_CE0_OFFSET + CE_COUNT_MAX;
++	ret = ath12k_pcic_get_user_msi_assignment(ab, "DP", &num_vectors,
++						  &user_base_data, &base_vector);
++	if (ret < 0)
++		return ret;
++
++	if (ath12k_napi_poll_budget < NAPI_POLL_WEIGHT)
++		ath12k_napi_poll_budget = NAPI_POLL_WEIGHT;
++
++	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX; i++) {
++		struct ath12k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
++		u32 num_irq = 0;
++
++		irq_grp->ab = ab;
++		irq_grp->grp_id = i;
++		init_dummy_netdev(&irq_grp->napi_ndev);
++
++		if (ab->hw_params->ring_mask->rx_mon_dest[i])
++			budget = NAPI_POLL_WEIGHT;
++		else
++			budget = ath12k_napi_poll_budget;
++
++		/* Apply a reduced budget for tx completion to prioritize tx
++		 * enqueue operation
++		 */
++		if (ab->hw_params->ring_mask->tx[i])
++			budget = tx_comp_budget;
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
++		netif_napi_add(&irq_grp->napi_ndev, &irq_grp->napi,
++			       ath12k_pcic_ext_grp_napi_poll, budget);
++#else
++		 netif_napi_add_weight(&irq_grp->napi_ndev, &irq_grp->napi,
++				       ath12k_pcic_ext_grp_napi_poll, budget);
++#endif
++
++		if (ab->hw_params->ring_mask->tx[i] ||
++		    ab->hw_params->ring_mask->rx[i] ||
++		    ab->hw_params->ring_mask->rx_err[i] ||
++		    ab->hw_params->ring_mask->rx_wbm_rel[i] ||
++		    ab->hw_params->ring_mask->reo_status[i] ||
++		    ab->hw_params->ring_mask->host2rxdma[i] ||
++		    ab->hw_params->ring_mask->ppe2tcl[i] ||
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++		    ab->hw_params->ring_mask->wbm2sw6_ppeds_tx_cmpln[i] ||
++#endif
++		    ab->hw_params->ring_mask->reo2ppe[i] ||
++		    ab->hw_params->ring_mask->rx_mon_dest[i]) {
++			num_irq = 1;
++		}
++
++		irq_grp->num_irq = num_irq;
++		irq_grp->irqs[0] = base_idx + i;
++
++		for (j = 0; j < irq_grp->num_irq; j++) {
++			int irq_idx = irq_grp->irqs[j];
++			int vector = (i % num_vectors) + base_vector;
++			int irq = ath12k_hif_get_msi_irq(ab, vector);
++			u8 bus_id = pci_domain_nr(ar_pci->pdev->bus);
++
++			if (bus_id > ATH12K_MAX_PCI_DOMAINS) {
++				ath12k_warn(ab, ATH12K_DBG_PCI, "bus_id:%d\n",
++					    bus_id);
++				bus_id = ATH12K_MAX_PCI_DOMAINS;
++			}
++
++			ab->irq_num[irq_idx] = irq;
++
++			ath12k_dbg(ab, ATH12K_DBG_PCI, "irq:%d group:%d\n", irq, i);
++
++			scnprintf(dp_irq_name[bus_id][i], DP_IRQ_NAME_LEN,
++				  "pci%u_wlan_dp_%u", bus_id, i);
++			ath12k_dbg(ab, ATH12K_DBG_PCI, "PCI bus id: pci:%d IRQ Name:%s\n",
++				   bus_id, dp_irq_name[bus_id][i]);
++			irq_set_status_flags(irq, IRQ_DISABLE_UNLAZY);
++			ret = request_irq(irq, ath12k_pcic_ext_interrupt_handler,
++					  IRQF_SHARED,
++					  dp_irq_name[bus_id][i], irq_grp);
++			if (ret) {
++				ath12k_err(ab, "failed request irq %d: %d\n",
++					   vector, ret);
++				return ret;
++			}
++
++			disable_irq_nosync(ab->irq_num[irq_idx]);
++		}
++	}
++
++	return 0;
++}
++
++int ath12k_pcic_config_irq(struct ath12k_base *ab)
++{
++	struct ath12k_ce_pipe *ce_pipe;
++	u32 msi_data_start;
++	u32 msi_data_count, msi_data_idx;
++	u32 msi_irq_start;
++	unsigned int msi_data;
++	int irq, i, ret, irq_idx;
++
++	ret = ath12k_pcic_get_user_msi_assignment(ab, "CE", &msi_data_count,
++						  &msi_data_start, &msi_irq_start);
++	if (ret)
++		return ret;
++
++	/* Configure CE irqs */
++	for (i = 0, msi_data_idx = 0; i < ab->hw_params->ce_count; i++) {
++		if (ath12k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
++			continue;
++
++		msi_data = (msi_data_idx % msi_data_count) + msi_irq_start;
++		irq = ath12k_hif_get_msi_irq(ab, msi_data);
++		ce_pipe = &ab->ce.ce_pipe[i];
++
++		irq_idx = ATH12K_PCI_IRQ_CE0_OFFSET + i;
++
++		tasklet_setup(&ce_pipe->intr_tq, ath12k_pcic_ce_tasklet);
++
++		ret = request_irq(irq, ath12k_pcic_ce_interrupt_handler,
++				  IRQF_SHARED, irq_name[irq_idx],
++				  ce_pipe);
++		if (ret) {
++			ath12k_err(ab, "failed to request irq %d: %d\n",
++				   irq_idx, ret);
++			return ret;
++		}
++
++		ab->irq_num[irq_idx] = irq;
++		msi_data_idx++;
++
++		ath12k_pcic_ce_irq_disable(ab, i);
++	}
++
++	ret = ath12k_pci_ext_irq_config(ab);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static void ath12k_msi_msg_handler(struct msi_desc *desc, struct msi_msg *msg)
++{
++	desc->msg.address_lo = msg->address_lo;
++	desc->msg.address_hi = msg->address_hi;
++	desc->msg.data = msg->data;
++}
++
++int ath12k_pcic_config_hybrid_irq(struct ath12k_base *ab)
++{
++	int ret;
++	struct platform_device *pdev = ab->pdev;
++	struct msi_desc *msi_desc;
++	bool ce_done = false;
++	int user_base_data, base_vector, num_vectors = 0;
++	int i = 0, j = 0, k = 0;
++
++	if (ab->userpd_id != USERPD_1 &&
++	    ab->userpd_id != USERPD_2) {
++		ath12k_warn(ab, "ath12k userpd invalid %d\n", ab->userpd_id);
++		return -ENODEV;
++	}
++
++	ab->msi.config = &ath12k_msi_config[ATH12K_MSI_CONFIG_IPCI];
++
++	ret = platform_msi_domain_alloc_irqs(&pdev->dev, ab->msi.config->total_vectors,
++					     ath12k_msi_msg_handler);
++
++	if (ret) {
++		ath12k_warn(ab, "failed to alloc irqs %d ab %pM\n", ret, ab);
++		return ret;
++	}
++
++	//TODO: Need to optimize the below code to have one loop
++	for_each_msi_entry(msi_desc, &pdev->dev) {
++		ret = ath12k_pcic_get_user_msi_assignment(ab, "CE", &num_vectors,
++                                                         &user_base_data, &base_vector);
++                if (ret < 0)
++                        return ret;
++
++		if (i < base_vector) {
++			i++;
++			continue;
++		}
++		if (j < ab->hw_params->ce_count && i < (num_vectors + base_vector)) {
++			while(j < ab->hw_params->ce_count &&
++			      ath12k_ce_get_attr_flags(ab, j) & CE_ATTR_DIS_INTR) {
++				++j;
++			}
++
++			ret = ath12k_pcic_config_gic_msi_irq(ab, pdev, msi_desc, j);
++			if (ret) {
++				ath12k_warn(ab, "failed to request irq %d\n", ret);
++				return ret;
++			}
++
++			if (j == 0) {
++				ab->msi.addr_lo = msi_desc->msg.address_lo;
++				ab->msi.addr_hi = msi_desc->msg.address_hi;
++				ab->msi.ep_base_data = msi_desc->msg.data;
++				ath12k_info(ab, "msi ep base data %d\n", ab->msi.ep_base_data);
++			}
++
++			j++;
++			if (j != ab->hw_params->ce_count)
++				ce_done = false;
++
++		} else {
++			ret = ath12k_pcic_ext_config_gic_msi_irq(ab, pdev, msi_desc, k);
++			if (ret) {
++				ath12k_warn(ab, "failed to config ext msi irq %d\n", ret);
++				return ret;
++			}
++			k++;
++		}
++		i++;
++	}
++
++	i = 0;
++
++	for_each_msi_entry(msi_desc, &pdev->dev) {
++		ret = ath12k_pcic_get_user_msi_assignment(ab, "CE", &num_vectors,
++							  &user_base_data, &base_vector);
++		if (ret < 0)
++                        return ret;
++
++                if (i < base_vector) {
++                        i++;
++                        continue;
++		}
++		if (i < (num_vectors + base_vector)) {
++			if (!ce_done  && j < ab->hw_params->ce_count) {
++				while(j < ab->hw_params->ce_count &&
++				      ath12k_ce_get_attr_flags(ab, j) & CE_ATTR_DIS_INTR) {
++					j++;
++				}
++				if (j == ab->hw_params->ce_count) {
++					ce_done = true;
++					i++;
++					continue;
++				}
++
++				ret = ath12k_pcic_config_gic_msi_irq(ab, pdev, msi_desc, j);
++				if (ret) {
++					ath12k_warn(ab, "failed to request irq %d\n", ret);
++					return ret;
++				}
++				j++;
++			}
++		} else {
++			if (k >= ATH12K_EXT_IRQ_GRP_NUM_MAX)
++				break;
++			ret = ath12k_pcic_ext_config_gic_msi_irq(ab, pdev, msi_desc, k);
++			if (ret) {
++				ath12k_warn(ab, "failed to config ext msi irq %d\n", ret);
++				return ret;
++			}
++			k++;
++		}
++		i++;
++	}
++	ab->ipci.gic_enabled = 1;
++	wake_up(&ab->ipci.gic_msi_waitq);
++
++	return ret;
++}
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath12k/pcic.h
+@@ -0,0 +1,74 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * Copyright (c) 2019-2021 The Linux Foundation. All rights reserved.
++ * Copyright (c) 2021-2023 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#ifndef _ATH11K_PCI_CMN_H
++#define _ATH11K_PCI_CMN_H
++
++#include <linux/platform_device.h>
++#include <linux/pci.h>
++#include "core.h"
++#include "hif.h"
++#include <linux/msi.h>
++
++#define ATH12K_PCI_IRQ_CE0_OFFSET		3
++
++#define WINDOW_ENABLE_BIT		0x40000000
++#define WINDOW_REG_ADDRESS		0x310c
++#define WINDOW_VALUE_MASK		GENMASK(24, 19)
++#define WINDOW_START			0x80000
++#define WINDOW_RANGE_MASK		GENMASK(18, 0)
++
++#define ATH12K_MAX_PCI_DOMAINS          0x5
++#define DP_IRQ_NAME_LEN 20
++
++static const struct ath12k_msi_config ath12k_msi_config[] = {
++	{
++		/* MSI spec expects number of interrupts to be a power of 2 */
++		.total_vectors = 32,
++		.total_users = 3,
++		.users = (struct ath12k_msi_user[]) {
++			{ .name = "MHI", .num_vectors = 3, .base_vector = 0 },
++			{ .name = "CE", .num_vectors = 5, .base_vector = 3 },
++			{ .name = "DP", .num_vectors = 16, .base_vector = 8 },
++		},
++	},
++	{
++		.total_vectors = 14,
++		.total_users = 3,
++		.users = (struct ath12k_msi_user[]) {
++			{ .name = "QDSS", .num_vectors = 1, .base_vector = 0 },
++			{ .name = "CE", .num_vectors = 5, .base_vector = 1 },
++			{ .name = "DP", .num_vectors = 8, .base_vector = 6 },
++		},
++	},
++};
++
++int ath12k_pcic_start(struct ath12k_base *ab);
++void ath12k_pcic_stop(struct ath12k_base *ab);
++void ath12k_pcic_ipci_write32(struct ath12k_base *ab, u32 offset, u32 value);
++u32 ath12k_pcic_ipci_read32(struct ath12k_base *ab, u32 offset);
++int ath12k_pcic_get_user_msi_assignment(struct ath12k_base *ab, char *user_name,
++					int *num_vectors, u32 *user_base_data,
++					u32 *base_vector);
++void ath12k_pcic_get_msi_address(struct ath12k_base *ab, u32 *msi_addr_lo,
++				 u32 *msi_addr_hi);
++void ath12k_pcic_config_static_window(struct ath12k_base *ab);
++int ath12k_pcic_map_service_to_pipe(struct ath12k_base *ab, u16 service_id,
++				    u8 *ul_pipe, u8 *dl_pipe);
++void ath12k_pcic_free_hybrid_irq(struct ath12k_base *ab);
++void ath12k_pcic_cmem_write32(struct ath12k_base *ab, u32 addr,
++			      u32 value);
++u32 ath12k_pcic_cmem_read32(struct ath12k_base *ab, u32 addr);
++void ath12k_pcic_ext_irq_enable(struct ath12k_base *ab);
++void ath12k_pcic_ext_irq_disable(struct ath12k_base *ab);
++u32 ath12k_pcic_get_window_start(struct ath12k_base *ab, u32 offset);
++void ath12k_pcic_ce_irqs_enable(struct ath12k_base *ab);
++void ath12k_pcic_ce_irq_disable_sync(struct ath12k_base *ab);
++int ath12k_pcic_get_msi_irq(struct ath12k_base *ab, unsigned int vector);
++int ath12k_pcic_config_hybrid_irq(struct ath12k_base *ab);
++int ath12k_pcic_config_irq(struct ath12k_base *ab);
++void ath12k_pcic_free_irq(struct ath12k_base *ab);
++#endif
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -1286,6 +1286,68 @@ static struct qmi_elem_info qmi_wlanfw_c
+ 	},
+ };
+ 
++static struct qmi_elem_info qmi_wlanfw_device_info_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_EOTI,
++		.array_type     = NO_ARRAY,
++		.tlv_type       = QMI_COMMON_TLV_TYPE,
++	},
++};
++
++struct qmi_elem_info qmi_wlanfw_device_info_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct qmi_wlanfw_device_info_resp_msg_v01,
++					   resp),
++		.ei_array       = qmi_response_type_v01_ei,
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct qmi_wlanfw_device_info_resp_msg_v01,
++					   bar_addr_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_8_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u64),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct qmi_wlanfw_device_info_resp_msg_v01,
++					   bar_addr),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset		= offsetof(struct qmi_wlanfw_device_info_resp_msg_v01,
++					   bar_size_valid),
++	},
++	{
++		.data_type	= QMI_UNSIGNED_4_BYTE,
++		.elem_len	= 1,
++		.elem_size	= sizeof(u32),
++		.array_type	= NO_ARRAY,
++		.tlv_type	= 0x11,
++		.offset		= offsetof(struct qmi_wlanfw_device_info_resp_msg_v01,
++					   bar_size),
++	},
++	{
++		.data_type      = QMI_EOTI,
++		.array_type     = NO_ARRAY,
++		.tlv_type       = QMI_COMMON_TLV_TYPE,
++	},
++};
++
+ static struct qmi_elem_info qmi_wlanfw_rf_chip_info_s_v01_ei[] = {
+ 	{
+ 		.data_type	= QMI_UNSIGNED_4_BYTE,
+@@ -4167,7 +4229,8 @@ skip_mlo_mem_init:
+ 		case CALDB_MEM_REGION_TYPE:
+ 			if (ath12k_cold_boot_cal &&
+ 			    ab->hw_params->cold_boot_calib) {
+-				if (ab->hif.bus == ATH12K_BUS_AHB) {
++				if (ab->hif.bus == ATH12K_BUS_AHB ||
++				    ab->hif.bus == ATH12K_BUS_HYBRID) {
+ 					if (of_property_read_u32_array(dev->of_node,
+ 								       "qcom,caldb-addr", caldb_location,
+ 								       ARRAY_SIZE(caldb_location))) {
+@@ -4231,6 +4294,22 @@ skip_mlo_mem_init:
+ 				} else {
+ 					ab->qmi.target_mem[idx].paddr = m3_dump.start;
+ 				}
++			} else if (ab->hif.bus == ATH12K_BUS_HYBRID) {
++				if (ab->userpd_id == USERPD_1)
++					dev_node = of_find_node_by_name(NULL, "m3_dump_qcn6432_1");
++				else if (ab->userpd_id == USERPD_2)
++					dev_node = of_find_node_by_name(NULL, "m3_dump_qcn6432_2");
++
++				if (of_address_to_resource(dev_node, 0, &m3_dump)) {
++					ath12k_err(ab, "M3_MEM_REGION Not defined in device_tree\n");
++					ret = -EINVAL;
++					goto out;
++				} else {
++					ab->qmi.target_mem[idx].paddr = m3_dump.start;
++				}
++
++			} else {
++				sz += ab->qmi.target_mem[i].size;
+ 			}
+                         ab->qmi.target_mem[idx].v.ioaddr =
+                                         ioremap(ab->qmi.target_mem[idx].paddr,
+@@ -4239,7 +4318,6 @@ skip_mlo_mem_init:
+ 					ab->qmi.target_mem[i].size;
+                         ab->qmi.target_mem[idx].type =
+ 					ab->qmi.target_mem[i].type;
+-			sz += ab->qmi.target_mem[i].size;
+ 			idx++;
+ 			break;
+ 		case MLO_GLOBAL_MEM_REGION_TYPE:
+@@ -4271,7 +4349,6 @@ skip_mlo_mem_init:
+ 				goto out;
+                         }
+ 			ab->qmi.target_mem[idx].paddr = bdf_location[0];
+-
+ 			ab->qmi.target_mem[idx].v.ioaddr =
+ 					ioremap(ab->qmi.target_mem[idx].paddr,
+ 						ab->qmi.target_mem[i].size);
+@@ -5280,7 +5357,7 @@ int ath12k_qmi_pci_alloc_qdss_mem(struct
+ 
+ 		ab->hremote_node = of_parse_phandle(dev->of_node, "memory-region", 0);
+ 		if (!ab->hremote_node) {
+-			ath12k_warn(ab, "qmi fail to get hremote_node\n");
++			ath12k_warn(ab, "qmi fail to get hremote_node for pci device\n");
+ 			return ret;
+ 		}
+ 
+@@ -5317,6 +5394,25 @@ int ath12k_qmi_pci_alloc_qdss_mem(struct
+ 	return 0;
+ }
+ 
++static
++struct device_node *ath12k_get_etr_dev_node(struct ath12k_base *ab)
++{
++	struct device_node *dev_node = NULL;
++
++	if (ab->userpd_id) {
++		if (ab->userpd_id == USERPD_1)
++			dev_node = of_find_node_by_name(NULL,
++							"q6_qcn6432_etr_1");
++		else if (ab->userpd_id == USERPD_2)
++			dev_node = of_find_node_by_name(NULL,
++							"q6_qcn6432_etr_2");
++	} else {
++		dev_node = of_find_node_by_name(NULL, "q6_etr_dump");
++	}
++
++	return dev_node;
++}
++
+ int ath12k_qmi_qdss_mem_alloc(struct ath12k_qmi *qmi)
+ {
+ 	int ret, i;
+@@ -5326,7 +5422,8 @@ int ath12k_qmi_qdss_mem_alloc(struct ath
+ 
+ 	switch (ab->hif.bus) {
+ 	case ATH12K_BUS_AHB:
+-		dev_node = of_find_node_by_name(NULL, "q6_etr_dump");
++	case ATH12K_BUS_HYBRID:
++		dev_node = ath12k_get_etr_dev_node(ab);
+ 		if (!dev_node) {
+ 			ath12k_err(ab, "No q6_etr_dump available in dts\n");
+ 			return -ENODEV;
+@@ -5458,6 +5555,84 @@ static void ath12k_qmi_event_qdss_trace_
+ 	ath12k_dbg(ab, ATH12K_DBG_QMI, "QDSS configuration is completed and trace started\n");
+ }
+ 
++static int ath12k_qmi_request_device_info(struct ath12k_base *ab)
++{
++	struct qmi_wlanfw_device_info_req_msg_v01 req;
++	struct qmi_wlanfw_device_info_resp_msg_v01 resp;
++	struct qmi_txn txn = {};
++	void *bar_addr_va = NULL;
++	int ret = 0;
++
++	/*device info message only supported for internal-PCI devices */
++	if (ab->hw_rev != ATH12K_HW_QCN6432_HW10)
++		return 0;
++
++	memset(&req, 0, sizeof(req));
++	memset(&resp, 0, sizeof(resp));
++
++	ret = qmi_txn_init(&ab->qmi.handle, &txn,
++			   qmi_wlanfw_device_info_resp_msg_v01_ei, &resp);
++	if (ret < 0)
++		goto out;
++
++	ret = qmi_send_request(&ab->qmi.handle, NULL, &txn,
++			       QMI_WLANFW_DEVICE_INFO_REQ_V01,
++			       QMI_WLANFW_DEVICE_INFO_REQ_MSG_V01,
++			       qmi_wlanfw_device_info_req_msg_v01_ei, &req);
++	if (ret < 0) {
++		ath12k_warn(ab, "qmi failed to send target device info request, err = %d\n",
++			    ret);
++		goto out;
++	}
++
++	ret = qmi_txn_wait(&txn, msecs_to_jiffies(ATH12K_QMI_WLANFW_TIMEOUT_MS));
++	if (ret < 0) {
++		ath12k_warn(ab, "qmi failed target device info request %d\n", ret);
++		goto out;
++	}
++
++	if (resp.resp.result != QMI_RESULT_SUCCESS_V01) {
++		ath12k_warn(ab, "qmi device info req failed, result: %d, err: %d\n",
++			    resp.resp.result, resp.resp.error);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (!resp.bar_addr_valid || !resp.bar_size_valid) {
++		ath12k_warn(ab, "qmi device info response invalid, result: %d, err: %d\n",
++			    resp.resp.result, resp.resp.error);
++		ret = -EINVAL;
++		goto out;
++	}
++	if (!resp.bar_addr ||
++	    resp.bar_size != QCN6432_DEVICE_BAR_SIZE) {
++		ath12k_warn(ab, "qmi device info invalid addr and size, result: %d, err: %d\n",
++			    resp.resp.result, resp.resp.error);
++		ret = -EINVAL;
++		goto out;
++	}
++
++	bar_addr_va = ioremap_nocache(resp.bar_addr, resp.bar_size);
++
++	if (!bar_addr_va) {
++		ath12k_warn(ab, "qmi device info ioremap failed\n");
++		ab->mem_len = 0;
++		ret = -EIO;
++		goto out;
++	}
++
++	ab->mem = bar_addr_va;
++	ab->mem_len = resp.bar_size;
++
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "Device BAR Info pa: 0x%llx, va: 0x%p, size: 0x%lx\n",
++		   resp.bar_addr, ab->mem, ab->mem_len);
++
++	ath12k_hif_config_static_window(ab);
++	return 0;
++out:
++	return ret;
++}
++
+ static int ath12k_qmi_event_load_bdf(struct ath12k_qmi *qmi)
+ {
+ 	struct ath12k_base *ab = qmi->ab;
+@@ -5469,6 +5644,12 @@ static int ath12k_qmi_event_load_bdf(str
+ 		return ret;
+ 	}
+ 
++	ret = ath12k_qmi_request_device_info(ab);
++	if (ret < 0) {
++		ath12k_warn(ab, "qmi failed to req device info:%d\n", ret);
++		return ret;
++	}
++
+ 	if (!ab->bus_params.fixed_bdf_addr) {
+ 		ret = ath12k_qmi_load_bdf_qmi(ab, ATH12K_QMI_BDF_TYPE_REGDB);
+ 		if (ret < 0) {
+@@ -5839,6 +6020,23 @@ static const struct qmi_ops ath12k_qmi_o
+ 	.del_server = ath12k_qmi_ops_del_server,
+ };
+ 
++static int ath12k_wait_for_gic_msi(struct ath12k_base *ab)
++{
++	int timeout;
++
++	if (ab->hw_rev != ATH12K_HW_QCN6432_HW10)
++		return 0;
++
++	timeout = wait_event_timeout(ab->ipci.gic_msi_waitq,
++				     (ab->ipci.gic_enabled == 1),
++				     ATH12K_RCV_GIC_MSI_HDLR_DELAY);
++	if (timeout <= 0) {
++		ath12k_warn(ab, "Receive gic msi handler timed out\n");
++		return -ETIMEDOUT;
++	}
++	return 0;
++}
++
+ static void ath12k_qmi_driver_event_work(struct work_struct *work)
+ {
+ 	struct ath12k_qmi *qmi = container_of(work, struct ath12k_qmi,
+@@ -5894,6 +6092,12 @@ static void ath12k_qmi_driver_event_work
+ 				clear_bit(ATH12K_FLAG_CRASH_FLUSH,
+ 					  &ab->dev_flags);
+ 				clear_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
++			ret = ath12k_wait_for_gic_msi(ab);
++			if (ret) {
++				ath12k_warn(ab, "failed to get qgic handler for dev %d ret: %d\n",
++					    ab->hw_rev, ret);
++				break;
++			}
+ 			ret = ath12k_core_qmi_firmware_ready(ab);
+ 			if (ret) {
+ 				ath12k_warn(ab, "failed to init after firmware ready: %d\n", ret);
+--- a/drivers/net/wireless/ath/ath12k/qmi.h
++++ b/drivers/net/wireless/ath/ath12k/qmi.h
+@@ -22,6 +22,7 @@
+ 
+ #define ATH12K_QMI_WLFW_SERVICE_INS_ID_V01_QCN9274	0x07
+ #define ATH12K_QMI_WLFW_SERVICE_INS_ID_V01_IPQ5332	0x2
++#define ATH12K_QMI_WLFW_SERVICE_INS_ID_V01_QCN6432	0x60
+ #define ATH12K_QMI_WLANFW_MAX_TIMESTAMP_LEN_V01	32
+ #define ATH12K_QMI_RESP_LEN_MAX			8192
+ #define ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01	52
+@@ -53,6 +54,8 @@
+ #define ATH12K_BOARD_ID_DEFAULT	0xFF
+ 
+ #define ATH12K_QMI_INVALID_RADIO	0xFF
++#define QCN6432_DEVICE_BAR_SIZE		0x200000
++#define ATH12K_RCV_GIC_MSI_HDLR_DELAY		(3 * HZ)
+ 
+ /* userpd_id in multi pd arch */
+ enum userpd_id {
+@@ -494,6 +497,8 @@ struct qmi_wlanfw_fw_cold_cal_done_ind_m
+ #define QMI_WLANFW_CAP_RESP_MSG_V01_MAX_LEN	207
+ #define QMI_WLANFW_CAP_REQ_V01			0x0024
+ #define QMI_WLANFW_CAP_RESP_V01			0x0024
++#define QMI_WLANFW_DEVICE_INFO_REQ_V01		0x004C
++#define QMI_WLANFW_DEVICE_INFO_REQ_MSG_V01	0
+ 
+ enum qmi_wlanfw_pipedir_enum_v01 {
+ 	QMI_WLFW_PIPEDIR_NONE_V01 = 0,
+@@ -605,6 +610,18 @@ struct qmi_wlanfw_cap_req_msg_v01 {
+ 	char placeholder;
+ };
+ 
++struct qmi_wlanfw_device_info_req_msg_v01 {
++	char placeholder;
++};
++
++struct qmi_wlanfw_device_info_resp_msg_v01 {
++	struct qmi_response_type_v01 resp;
++	u64 bar_addr;
++	u32 bar_size;
++	u8 bar_addr_valid;
++	u8 bar_size_valid;
++};
++
+ #define QMI_WLANFW_BDF_DOWNLOAD_REQ_MSG_V01_MAX_LEN	6182
+ #define QMI_WLANFW_BDF_DOWNLOAD_RESP_MSG_V01_MAX_LEN	7
+ #define QMI_WLANFW_BDF_DOWNLOAD_RESP_V01		0x0025
+--- a/drivers/net/wireless/ath/ath12k/pci.h
++++ b/drivers/net/wireless/ath/ath12k/pci.h
+@@ -129,7 +129,7 @@ static inline struct ath12k_pci *ath12k_
+ int ath12k_pci_get_user_msi_assignment(struct ath12k_base *ab, char *user_name,
+ 				       int *num_vectors, u32 *user_base_data,
+ 				       u32 *base_vector);
+-int ath12k_pci_get_msi_irq(struct device *dev, unsigned int vector);
++int ath12k_pci_get_msi_irq(struct ath12k_base *ab, unsigned int vector);
+ void ath12k_pci_write32(struct ath12k_base *ab, u32 offset, u32 value);
+ u32 ath12k_pci_read32(struct ath12k_base *ab, u32 offset);
+ int ath12k_pci_map_service_to_pipe(struct ath12k_base *ab, u16 service_id,

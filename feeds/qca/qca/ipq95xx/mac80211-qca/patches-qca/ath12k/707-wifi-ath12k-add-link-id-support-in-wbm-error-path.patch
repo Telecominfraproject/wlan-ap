@@ -1,0 +1,165 @@
+From 3626d9e220da44ce8e5a90151aa1454981ebbde7 Mon Sep 17 00:00:00 2001
+From: Karthikeyan Periyasamy <quic_periyasa@quicinc.com>
+Date: Thu, 12 Jan 2023 10:37:20 +0530
+Subject: [PATCH] wifi: ath12k: add link id support in wbm error path
+
+When more than one pdev supported in the chip/SoC, the Packet belong
+to second pdev is given to first pdev due to not identify the mac id
+in the wbm error path. So ping fails.
+
+In wbm error path, src link id information not available in the descriptor.
+So we get this information from the msdu_end 64bit tag. It necessary to get
+the src link id to identify the mac id in the given chip. Then only we can
+pass the skb to the corresponding pdev.
+
+Signed-off-by: Karthikeyan Periyasamy <quic_periyasa@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_rx.c   | 43 +++++++++++++----------
+ drivers/net/wireless/ath/ath12k/hal.c     |  7 ++++
+ drivers/net/wireless/ath/ath12k/hal.h     |  1 +
+ drivers/net/wireless/ath/ath12k/rx_desc.h |  4 +++
+ 4 files changed, 37 insertions(+), 18 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -247,6 +247,16 @@ static inline u8 ath12k_dp_rx_h_msdu_end
+        return ab->hw_params->hal_ops->rx_desc_get_ip_valid(desc);
+ }
+ 
++static inline u8 ath12k_dp_rx_get_msdu_src_link(struct ath12k_base *ab,
++						struct hal_rx_desc *desc)
++{
++	/* If the ops unassigned, return the first pdev idx */
++	if (!ab->hw_params->hal_ops->rx_desc_get_msdu_src_link_id)
++		return 0;
++
++	return ab->hw_params->hal_ops->rx_desc_get_msdu_src_link_id(desc);
++}
++
+ static int ath12k_dp_purge_mon_ring(struct ath12k_base *ab)
+ {
+	int i, reaped = 0;
+@@ -4446,16 +4456,16 @@ int ath12k_dp_rx_process_wbm_err(struct
+ 	struct hal_rx_wbm_rel_info err_info;
+ 	struct hal_srng *srng;
+ 	struct sk_buff *msdu;
+-	struct sk_buff_head msdu_list[MAX_RADIOS];
++	struct sk_buff_head msdu_list;
+ 	struct ath12k_skb_rxcb *rxcb;
+	void *rx_desc;
+ 	int mac_id;
+ 	int num_buffs_reaped = 0;
+ 	struct ath12k_rx_desc_info *desc_info;
+-	int ret, i;
++	int ret;
++	u8 src_link_id;
+ 
+-	for (i = 0; i < ab->num_radios; i++)
+-		__skb_queue_head_init(&msdu_list[i]);
++	__skb_queue_head_init(&msdu_list);
+ 
+ 	srng = &ab->hal.srng_list[dp->rx_rel_ring.ring_id];
+ 	rx_ring = &dp->rx_refill_buf_ring;
+@@ -4489,11 +4499,6 @@ int ath12k_dp_rx_process_wbm_err(struct
+ 			}
+ 		}
+ 
+-		/* FIXME: Extract mac id correctly. Since descs are not tied
+-		 * to mac, we can extract from vdev id in ring desc.
+-		 */
+-		mac_id = 0;
+-
+ 		if (desc_info->magic != ATH12K_DP_RX_DESC_MAGIC)
+ 			ath12k_warn(ab, "WBM RX err, Check HW CC implementation");
+ 
+@@ -4524,7 +4529,8 @@ int ath12k_dp_rx_process_wbm_err(struct
+ 		rxcb->err_rel_src = err_info.err_rel_src;
+ 		rxcb->err_code = err_info.err_code;
+ 		rxcb->rx_desc = (struct hal_rx_desc *)msdu->data;
+-		__skb_queue_tail(&msdu_list[mac_id], msdu);
++
++		__skb_queue_tail(&msdu_list, msdu);
+ 
+ 		rxcb->is_first_msdu = err_info.first_msdu;
+ 		rxcb->is_last_msdu = err_info.last_msdu;
+@@ -4542,21 +4548,26 @@ int ath12k_dp_rx_process_wbm_err(struct
+ 				    ab->hw_params->hal_params->rx_buf_rbm, true);
+ 
+ 	rcu_read_lock();
+-	for (i = 0; i <  ab->num_radios; i++) {
+-		if (!rcu_dereference(ab->pdevs_active[i])) {
+-			__skb_queue_purge(&msdu_list[i]);
++	while ((msdu = __skb_dequeue(&msdu_list)) != NULL) {
++
++		src_link_id = ath12k_dp_rx_get_msdu_src_link(ab, msdu->data);
++		if (src_link_id < ATH12K_GROUP_MAX_RADIO)
++			ar = rcu_dereference(ab->ag->hw_links[src_link_id]);
++		else
++			ar = NULL;
++
++		mac_id = ar ? ar->pdev_idx : 0;
++		if (!ar || !rcu_dereference(ar->ab->pdevs_active[mac_id])) {
++			dev_kfree_skb_any(msdu);
+ 			continue;
+ 		}
+ 
+-		ar = ab->pdevs[i].ar;
+-
+ 		if (test_bit(ATH12K_CAC_RUNNING, &ar->dev_flags)) {
+-			__skb_queue_purge(&msdu_list[i]);
++			dev_kfree_skb_any(msdu);
+ 			continue;
+ 		}
+ 
+-		while ((msdu = __skb_dequeue(&msdu_list[i])) != NULL)
+-			ath12k_dp_rx_wbm_err(ar, napi, msdu, &msdu_list[i]);
++		ath12k_dp_rx_wbm_err(ar, napi, msdu, &msdu_list);
+ 	}
+ 	rcu_read_unlock();
+ done:
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -495,6 +495,12 @@ static inline u32 ath12k_hal_rx_msdu_end
+ 	return MSDU_END_WMASK;
+ }
+ 
++static u8 ath12k_hw_qcn9274_rx_desc_get_msdu_src_link(struct hal_rx_desc *desc)
++{
++	return le64_get_bits(desc->u.qcn9274.msdu_end.msdu_end_tag,
++			     RX_MSDU_END_64_TLV_SRC_LINK_ID);
++}
++
+ static int ath12k_hal_srng_create_config_qcn9274(struct ath12k_base *ab)
+ {
+ 	struct ath12k_hal *hal = &ab->hal;
+@@ -700,6 +706,7 @@ const struct hal_ops hal_qcn9274_ops = {
+ 	.rx_desc_get_ip_valid = ath12k_hal_qcn9274_rx_desc_get_ip_valid,
+ 	.rxdma_ring_wmask_rx_mpdu_start = ath12k_hal_rx_mpdu_start_wmask_get,
+ 	.rxdma_ring_wmask_rx_msdu_end = ath12k_hal_rx_msdu_end_wmask_get,
++	.rx_desc_get_msdu_src_link_id = ath12k_hw_qcn9274_rx_desc_get_msdu_src_link,
+ };
+ 
+ static bool ath12k_hw_wcn7850_rx_desc_get_first_msdu(struct hal_rx_desc *desc)
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -1104,6 +1104,7 @@ struct hal_ops {
+ 	const struct ath12k_hal_tcl_to_wbm_rbm_map *tcl_to_wbm_rbm_map;
+ 	u16 (*rxdma_ring_wmask_rx_mpdu_start)(void);
+ 	u32 (*rxdma_ring_wmask_rx_msdu_end)(void);
++	u8 (*rx_desc_get_msdu_src_link_id)(struct hal_rx_desc *desc);
+ };
+ 
+ extern const struct hal_ops hal_qcn9274_ops;
+--- a/drivers/net/wireless/ath/ath12k/rx_desc.h
++++ b/drivers/net/wireless/ath/ath12k/rx_desc.h
+@@ -634,6 +634,10 @@ enum rx_msdu_start_reception_type {
+ 	RX_MSDU_START_RECEPTION_TYPE_UL_MU_OFDMA_MIMO,
+ };
+ 
++#define RX_MSDU_END_64_TLV_TAG			GENMASK(9, 1)
++#define RX_MSDU_END_64_TLV_LEN			GENMASK(21, 10)
++#define RX_MSDU_END_64_TLV_SRC_LINK_ID		GENMASK(24, 22)
++
+ #define RX_MSDU_END_INFO0_RXPCU_MPDU_FITLER	GENMASK(1, 0)
+ #define RX_MSDU_END_INFO0_SW_FRAME_GRP_ID	GENMASK(8, 2)
+ 

@@ -1,0 +1,534 @@
+From 1f85424185149a7db850e77644c35959ba0e0889 Mon Sep 17 00:00:00 2001
+From: Ganesh Babu Jothiram <quic_gjothira@quicinc.com>
+Date: Tue, 4 Apr 2023 15:12:23 +0530
+Subject: [PATCH 2/3] ath12k: sawf: add callback operation for dynamic msduq
+ allocation.
+
+Host driver supports the call back to allocate a MSDUQ per peer and map with service
+class details i.e service class ID. The MSDUQ allocation is peer specific and
+mapped with a service class ID.
+
+Host manages the allocation of user defined MSDUQs based on the detaild of number of user
+defined MSDUQ support from firmware during bootup.
+
+The ECM module received with five tuple inforation from SFE post routing.
+ECM will check with SPM, to find any matching rule with the five tuple inforation.
+Once the matching found, ECM will call to host driver to allocate a MSDUQ provided
+with service class ID, peer mac addr.
+
+Signed-off-by: Ganesh Babu Jothiram <quic_gjothira@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/peer.h   |   2 +
+ drivers/net/wireless/ath/ath12k/sawf.c   | 262 +++++++++++++++++++++--
+ drivers/net/wireless/ath/ath12k/sawf.h   |  34 +++
+ drivers/net/wireless/ath/ath12k/vendor.c |  19 +-
+ 4 files changed, 291 insertions(+), 26 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/peer.h
++++ b/drivers/net/wireless/ath/ath12k/peer.h
+@@ -8,6 +8,7 @@
+ #define ATH12K_PEER_H
+ 
+ #include "dp_rx.h"
++#include "sawf.h"
+ 
+ struct ppdu_user_delayba {
+ 	u16 sw_peer_id;
+@@ -29,6 +30,7 @@ struct ath12k_peer {
+ 	struct list_head list;
+ 	struct ieee80211_sta *sta;
+ 	struct ieee80211_vif *vif;
++	struct ath12k_sawf_peer_ctx sawf_ctx_peer;
+ 	int vdev_id;
+ 	u8 addr[ETH_ALEN];
+ 	int peer_id;
+--- a/drivers/net/wireless/ath/ath12k/sawf.c
++++ b/drivers/net/wireless/ath/ath12k/sawf.c
+@@ -7,7 +7,9 @@
+ #include "debug.h"
+ #include "wmi.h"
+ #include "sawf.h"
++#include "peer.h"
+ #include <linux/module.h>
++#include <qca-nss-ecm/ecm_classifier_emesh_public.h>
+ 
+ #define SVC_INDEX(svc_id) svc_id - 1
+ 
+@@ -15,6 +17,10 @@ bool ath12k_sawf_enable;
+ module_param_named(sawf, ath12k_sawf_enable, bool, 0444);
+ MODULE_PARM_DESC(sawf, "Enable SAWF feature (Default: false)");
+ 
++static struct ecm_classifier_emesh_sawf_callbacks ecm_wifi_sawf_callback = {
++	.update_service_id_get_msduq = ath12k_sawf_get_msduq,
++};
++
+ static struct ath12k_sawf_ctx *sawf_ctx;
+ 
+ void ath12k_sawf_init(struct ath12k_base *ab)
+@@ -38,6 +44,11 @@ void ath12k_sawf_init(struct ath12k_base
+ 		return;
+ 	}
+ 
++	if (ecm_classifier_emesh_sawf_msduq_callback_register(&ecm_wifi_sawf_callback))
++		ath12k_err(NULL, "ECM msduq cb reg fail\n");
++	else
++		ath12k_dbg(ab, ATH12K_DBG_SAWF, "ECM msduq callback register success\n");
++
+ 	ath12k_info(NULL, "SAWF context initialized\n");
+ }
+ 
+@@ -55,6 +66,9 @@ void ath12k_sawf_deinit(struct ath12k_ba
+ 	if (!sawf_ctx)
+ 		return;
+ 
++	ecm_classifier_emesh_sawf_msduq_callback_unregister();
++	ath12k_dbg(ab, ATH12K_DBG_SAWF, "ECM msduq callback unregister success\n");
++
+ 	kfree(sawf_ctx);
+ 	sawf_ctx = NULL;
+ 	ath12k_info(NULL, "SAWF context freed\n");
+@@ -80,7 +94,6 @@ void ath12k_update_svc_class(struct ath1
+ 		return;
+ 	}
+ 
+-	spin_lock_bh(&sawf_ctx->sawf_svc_lock);
+ 	new_param = &sawf_ctx->svc_classes[SVC_INDEX(sawf_params->svc_id)];
+ 	new_param->svc_id = sawf_params->svc_id;
+ 	memcpy(new_param->app_name, sawf_params->app_name, ATH12K_MAX_APP_NAME);
+@@ -94,7 +107,6 @@ void ath12k_update_svc_class(struct ath1
+ 	new_param->tid = sawf_params->tid;
+ 	new_param->msdu_rate_loss = sawf_params->msdu_rate_loss;
+ 	new_param->configured = sawf_params->configured;
+-	spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
+ }
+ 
+ bool ath12k_validate_sawf_param(struct ath12k_sawf_svc_params *params)
+@@ -183,13 +195,10 @@ bool ath12k_svc_id_configured(u8 svc_id)
+ 		return false;
+ 	}
+ 
+-	spin_lock_bh(&sawf_ctx->sawf_svc_lock);
+-	if (sawf_ctx->svc_classes[SVC_INDEX(svc_id)].configured) {
+-		spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
++	lockdep_assert_held(&sawf_ctx->sawf_svc_lock);
++	if (sawf_ctx->svc_classes[SVC_INDEX(svc_id)].configured)
+ 		return true;
+-	}
+ 
+-	spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
+ 	return false;
+ }
+ 
+@@ -202,10 +211,9 @@ int ath12k_get_tid(u8 svc_id)
+ 		return -ENODATA;
+ 	}
+ 
++	lockdep_assert_held(&sawf_ctx->sawf_svc_lock);
+ 	if (ath12k_svc_id_configured(svc_id)) {
+-		spin_lock_bh(&sawf_ctx->sawf_svc_lock);
+ 		tid = sawf_ctx->svc_classes[SVC_INDEX(svc_id)].tid;
+-		spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
+ 		return tid;
+ 	}
+ 
+@@ -235,10 +243,8 @@ bool ath12k_disable_svc_class(u8 svc_id)
+ 		return false;
+ 	}
+ 
+-	spin_lock_bh(&sawf_ctx->sawf_svc_lock);
+ 	sawf_svc_class = &sawf_ctx->svc_classes[SVC_INDEX(svc_id)];
+ 	memset(sawf_svc_class, 0, sizeof(*sawf_svc_class));
+-	spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
+ 
+ 	return true;
+ }
+@@ -326,6 +332,10 @@ static u32 ath12k_sawf_tid_calc(struct a
+ int ath12k_create_send_svc_params(struct ath12k_sawf_svc_params *param)
+ {
+ 	int ret = 0;
++	if (!sawf_ctx) {
++		ath12k_err(NULL, "SAWF context unavailable\n");
++		return -EINVAL;
++	}
+ 
+ 	if (!ath12k_svc_id_valid(param->svc_id)) {
+ 		ath12k_warn(NULL, "svc_id: %u is invalid, Service ID range: %d - %d\n",
+@@ -334,13 +344,16 @@ int ath12k_create_send_svc_params(struct
+ 		return -EINVAL;
+ 	}
+ 
++	spin_lock_bh(&sawf_ctx->sawf_svc_lock);
+ 	if (ath12k_svc_id_configured(param->svc_id)) {
+ 		if (ath12k_get_tid(param->svc_id) != param->tid) {
+ 			ath12k_err(NULL, "Updating service class failed for TID ID:%u",
+ 				   param->tid);
++			spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
+ 			return -EINVAL;
+ 		}
+ 	}
++	spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
+ 
+ 	if (param->tid == SAWF_SVC_PARAM_DEFAULT_TID)
+ 		param->tid = ath12k_sawf_tid_calc(param);
+@@ -351,36 +364,247 @@ int ath12k_create_send_svc_params(struct
+ 	}
+ 
+ 	ret = ath12k_send_sawf_configs_soc(param);
+-	if (ret) {
++	if (!ret) {
++		param->configured = true;
++		spin_lock_bh(&sawf_ctx->sawf_svc_lock);
++		ath12k_update_svc_class(param);
++		spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
++	} else {
+ 		ath12k_err(NULL, "service class configuration failed\n");
+-		return ret;
+ 	}
+ 
+-	param->configured = true;
+-	ath12k_update_svc_class(param);
+ 	return ret;
+ }
+ 
+ int ath12k_sawf_disable_config(u8 svc_id)
+ {
+ 	int ret;
++	if (!sawf_ctx) {
++		ath12k_err(NULL, "SAWF context unavailable\n");
++		return -EINVAL;
++	}
+ 
+ 	if (!ath12k_svc_id_valid(svc_id)) {
+ 		ath12k_err(NULL, "svc_id: %u is invalid\n", svc_id);
+ 		return -EINVAL;
+ 	}
+ 
++	spin_lock_bh(&sawf_ctx->sawf_svc_lock);
+ 	if (!ath12k_svc_id_configured(svc_id)) {
+ 		ath12k_err(NULL, "svc_id: %u is not configured\n", svc_id);
++		spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
+ 		return -EINVAL;
+ 	}
++	spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
+ 
+ 	ret = ath12k_sawf_send_disable_soc(svc_id);
+ 	if (ret) {
+ 		ath12k_err(NULL, "svc_id: %u disabling failed\n", svc_id);
+-		return ret;
++		return -EINVAL;
+ 	}
+ 
++	spin_lock_bh(&sawf_ctx->sawf_svc_lock);
+ 	ath12k_disable_svc_class(svc_id);
++	spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
++
+ 	return ret;
+ }
++
++struct ath12k_base *ath12k_sawf_get_ab_from_netdev(struct net_device *dev,
++						   u8 *peer_mac,
++						   u16 *peer_id)
++{
++	struct wireless_dev *wdev;
++	struct ieee80211_vif *vif;
++	struct ath12k_base *ab = NULL;
++	struct ath12k_peer *peer;
++	struct ath12k_vif *ahvif;
++	struct ath12k_link_vif *arvif;
++	u16 links_map;
++	u8 link_id;
++
++	if (!dev)
++		return NULL;
++
++	wdev = dev->ieee80211_ptr;
++	if (!wdev)
++		return NULL;
++
++	vif = wdev_to_ieee80211_vif(wdev);
++	if (!vif)
++		return NULL;
++
++	ahvif = (struct ath12k_vif *)vif->drv_priv;
++	if (!ahvif)
++		return NULL;
++
++	/* ToDo: Instead of mutex_lock, rcu locking will be used
++	   to access the ahvif->link
++	*/
++	links_map = ahvif->links_map;
++	/* Look into all the links, find the matching peer and
++	 * return with ab and peer_id detail */
++	for_each_set_bit(link_id, &links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
++		arvif = ahvif->link[link_id];
++
++		if (WARN_ON(!arvif))
++			continue;
++
++		ab = arvif->ar->ab;
++		spin_lock_bh(&ab->base_lock);
++		peer = ath12k_peer_find_by_addr(ab, peer_mac);
++		spin_unlock_bh(&ab->base_lock);
++		if (peer) {
++			*peer_id = peer->peer_id;
++			break;
++		}
++
++		ab = NULL;
++	}
++	return ab;
++}
++
++u8 ath12k_sawf_get_msduq_of_tid(struct ath12k_base *ab,
++				u8 tid,
++				u8 svc_id,
++				struct ath12k_peer *peer)
++{
++	struct ath12k_sawf_peer_ctx *peer_ctx = NULL;
++	struct ath12k_sawf_ctx *sawf_ctx;
++	u8 max_usr_def_q_sawf, def_msduq_max, q;
++	u8 msduq_id = SAWF_MSDUQ_ID_INVALID;
++
++	sawf_ctx = ath12k_get_sawf_context();
++	if (!sawf_ctx)
++		return SAWF_MSDUQ_ID_INVALID;
++
++	max_usr_def_q_sawf = sawf_ctx->max_msduq_per_tid -
++					sawf_ctx->default_msduq_per_tid;
++	def_msduq_max = sawf_ctx->default_msduq_per_tid *
++				ATH12K_SAWF_MAX_TID_SUPPORT;
++
++	peer_ctx = &peer->sawf_ctx_peer;
++	/* Find matching msduq with svc_id in the reserved pool*/
++	for (q = 0; q < max_usr_def_q_sawf; ++q) {
++		if (peer_ctx->msduq_table[tid][q].is_reserved &&
++		    peer_ctx->msduq_table[tid][q].svc_id == svc_id) {
++			msduq_id = peer_ctx->msduq_table[tid][q].msduq_id;
++			ath12k_dbg(ab, ATH12K_DBG_SAWF,
++				   "Resrv:msduq_id 0x%x:tid %u usrdefq %u\n",
++				   msduq_id, tid, q);
++			break;
++		}
++	}
++
++	if (msduq_id == SAWF_MSDUQ_ID_INVALID) {
++		/* Reserve a new one */
++		for (q = 0; q < max_usr_def_q_sawf; ++q) {
++			if (!peer_ctx->msduq_table[tid][q].is_reserved) {
++				peer_ctx->msduq_table[tid][q].is_reserved = true;
++				peer_ctx->msduq_table[tid][q].svc_id = svc_id;
++				peer_ctx->msduq_table[tid][q].msduq_id =
++						u16_encode_bits(q, MSDUQID_Q_MASK) |
++						u16_encode_bits(tid, MSDUQID_TID_MASK);
++				peer_ctx->msduq_table[tid][q].msduq_id +=
++								def_msduq_max;
++				msduq_id = peer_ctx->msduq_table[tid][q].msduq_id;
++				ath12k_dbg(ab, ATH12K_DBG_SAWF,
++					   "New:msduq_id 0x%x:tid %u usrdefq %u\n",
++					   msduq_id, tid, q);
++				break;
++			}
++		}
++	}
++
++	return msduq_id;
++}
++
++u16 ath12k_sawf_alloc_msduq(struct ath12k_base *ab,
++			    u8 svc_id,
++			    u16 peer_id)
++{
++	u8 msduq_id;
++	u8 svc_tid;
++	u16 ret_peer_msduq = SAWF_PEER_MSDUQ_INVALID;
++	struct ath12k_sawf_ctx *sawf_ctx;
++	struct ath12k_peer *peer;
++
++	sawf_ctx = ath12k_get_sawf_context();
++	if (!sawf_ctx)
++		return SAWF_PEER_MSDUQ_INVALID;
++
++	spin_lock_bh(&sawf_ctx->sawf_svc_lock);
++	if (!ath12k_svc_id_configured(svc_id)) {
++		spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
++		return SAWF_PEER_MSDUQ_INVALID;
++	}
++
++	svc_tid = ath12k_get_tid(svc_id);
++	spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
++
++	if ((svc_tid < 0) || (svc_tid >= ATH12K_SAWF_MAX_TID_SUPPORT))
++		return SAWF_PEER_MSDUQ_INVALID;
++
++	spin_lock_bh(&ab->base_lock);
++	peer = ath12k_peer_find_by_id(ab, peer_id);
++	if (!peer) {
++		spin_unlock_bh(&ab->base_lock);
++		return SAWF_PEER_MSDUQ_INVALID;
++	}
++
++	/* Allocate msduq from TID specified in SVC */
++	msduq_id = ath12k_sawf_get_msduq_of_tid(ab, svc_tid, svc_id, peer);
++
++	if (msduq_id == SAWF_MSDUQ_ID_INVALID) {
++		/* Look into lower TID */
++		u8 tid = svc_tid - 1;
++
++		while (tid >= 0 && tid < svc_tid) {
++			msduq_id = ath12k_sawf_get_msduq_of_tid(ab, tid, svc_id, peer);
++
++			if (msduq_id != SAWF_MSDUQ_ID_INVALID)
++				break;
++
++			--tid;
++		}
++	}
++
++	if (msduq_id == SAWF_MSDUQ_ID_INVALID) {
++		/* Look into Higher  TID */
++		u8 tid = svc_tid + 1;
++
++		while (tid < ATH12K_SAWF_MAX_TID_SUPPORT) {
++			msduq_id = ath12k_sawf_get_msduq_of_tid(ab, tid, svc_id, peer);
++
++			if (msduq_id != SAWF_MSDUQ_ID_INVALID)
++				break;
++
++			++tid;
++		}
++	}
++	spin_unlock_bh(&ab->base_lock);
++
++	if (msduq_id != SAWF_MSDUQ_ID_INVALID)
++		ret_peer_msduq = FIELD_PREP(SAWF_PEER_ID, peer_id) |
++				 FIELD_PREP(SAWF_MSDUQ_ID, msduq_id);
++
++	return ret_peer_msduq;
++}
++
++u16 ath12k_sawf_get_msduq(struct net_device *dev, u8 *peer_mac, u32 service_id,
++			       u32 dscp, u32 rule_id)
++{
++	struct ath12k_base *ab;
++	u16 peer_id;
++	u16 peer_msduq;
++
++	ab = ath12k_sawf_get_ab_from_netdev(dev, peer_mac, &peer_id);
++	if (!ab)
++		return SAWF_PEER_MSDUQ_INVALID;
++
++	peer_msduq = ath12k_sawf_alloc_msduq(ab, service_id, peer_id);
++	ath12k_dbg(ab, ATH12K_DBG_SAWF,
++		   "SAWF get msduq:peer %pM SvcId %u:msduq id 0x%x allocated\n",
++		   peer_mac, service_id, peer_msduq);
++	return peer_msduq;
++}
+--- a/drivers/net/wireless/ath/ath12k/sawf.h
++++ b/drivers/net/wireless/ath/ath12k/sawf.h
+@@ -10,6 +10,7 @@
+ #define ATH12K_SAWF_SVC_CLASS_MAX 128
+ #define ATH12K_MAX_APP_NAME 64
+ #define ATH12K_SAWF_MAX_TID_SUPPORT 8
++#define MAX_Q_PER_TID 8
+ /**
+  ** SAWF_metadata related information.
+  **/
+@@ -25,6 +26,13 @@
+ #define FLOW_OVERRIDE_FROM_Q_ID		BIT(3)
+ #define WHO_CLASSIFY_INFO_FROM_Q_ID	GENMASK(5, 4)
+ 
++#define SAWF_PEER_MSDUQ_INVALID	0xFFFF
++#define SAWF_MSDUQ_ID_INVALID	0x3F
++#define SAWF_MSDUQ_ID		GENMASK(5, 0)
++#define SAWF_PEER_ID		GENMASK(15, 6)
++
++#define MSDUQID_TID_MASK	GENMASK(2, 0)
++#define MSDUQID_Q_MASK		GENMASK(5, 3)
+ /*
+  * Min throughput limit 0 - 10 Gb/s
+  * Granularity: 1 Kb/s
+@@ -149,6 +157,29 @@ struct ath12k_sawf_ctx {
+ 	spinlock_t sawf_svc_lock;
+ };
+ 
++/**
++ * struct ath12k_msduq_map-  MSDU Q Map struct
++ * mapping of MSDUQ with service class ID
++ * @svc_id: Service Class ID
++ * @is_reserved: Flag to hold the allocaiton status.
++ * @msduq_id: unique id of the MSDUQ.
++ */
++struct ath12k_msduq_map {
++	u8 svc_id;
++	bool is_reserved;
++	u16 msduq_id;
++};
++
++/**
++ * struct ath12k_sawf_peer_ctx
++ * A Data base to maintain the allocation status of user deined MSDUQ.
++ * The allocation is mapped with the service class ID.
++ * @msduq_table: map table of msduq and svc id per peer
++ */
++struct ath12k_sawf_peer_ctx {
++	struct ath12k_msduq_map msduq_table[ATH12K_SAWF_MAX_TID_SUPPORT][MAX_Q_PER_TID];
++};
++
+ extern bool ath12k_sawf_enable;
+ struct ath12k_sawf_ctx *ath12k_get_sawf_context(void);
+ void ath12k_sawf_init(struct ath12k_base *ab);
+@@ -162,4 +193,7 @@ int ath12k_get_tid(u8 svc_id);
+ int ath12k_sawf_reconfigure_on_crash(struct ath12k_base *ab);
+ int ath12k_create_send_svc_params(struct ath12k_sawf_svc_params *param);
+ int ath12k_sawf_disable_config(u8 svc_id);
++u16 ath12k_sawf_get_msduq(struct net_device *netdev,
++			  u8 *peer_mac, u32 service_id,
++			  u32 dscp, u32 rule_id);
+ #endif /* ATH11K_SAWF_H */
+--- a/drivers/net/wireless/ath/ath12k/vendor.c
++++ b/drivers/net/wireless/ath/ath12k/vendor.c
+@@ -144,6 +144,12 @@ static int ath12k_vendor_view_sawf_confi
+ 	if (!ath12k_sawf_enable)
+ 		return -EOPNOTSUPP;
+ 
++	sawf_ctx = ath12k_get_sawf_context();
++	if (!sawf_ctx) {
++		ath12k_err(NULL, "SAWF context not available\n");
++		return -ENODATA;
++	}
++
+ 	ret = nla_parse(tb, QCA_WLAN_VENDOR_SAWF_ATTR_CONFIG_MAX, data, data_len,
+ 			ath12k_vendor_sawf_config_policy, NULL);
+ 
+@@ -153,12 +159,16 @@ static int ath12k_vendor_view_sawf_confi
+ 	}
+ 
+ 	if (tb[QCN_WLAN_VENDOR_ATTR_SAWF_SVC_ID]) {
++		bool isconfigured;
+ 		svc_id = nla_get_u8(tb[QCN_WLAN_VENDOR_ATTR_SAWF_SVC_ID]);
+ 		if (!ath12k_svc_id_valid(svc_id)) {
+ 			ath12k_err(NULL, "Invalid Service ID: %u\n", svc_id);
+ 			return -EINVAL;
+ 		}
+-		if (!ath12k_svc_id_configured(svc_id))
++		spin_lock_bh(&sawf_ctx->sawf_svc_lock);
++		isconfigured = ath12k_svc_id_configured(svc_id);
++		spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
++		if (!isconfigured)
+ 			return -EINVAL;
+ 	}
+ 
+@@ -166,13 +176,6 @@ static int ath12k_vendor_view_sawf_confi
+ 	if (storage && (*storage == ATH12K_SAWF_SVC_CLASS_MAX))
+ 		return 0;
+ 
+-	sawf_ctx = ath12k_get_sawf_context();
+-
+-	if (!sawf_ctx) {
+-		ath12k_err(NULL, "SAWF context not available\n");
+-		return -ENODATA;
+-	}
+-
+ 	sawf_svc_classes = nla_nest_start(msg,
+ 					  QCN_WLAN_VENDOR_ATTR_SAWF_SERVICE_CLASSES);
+ 

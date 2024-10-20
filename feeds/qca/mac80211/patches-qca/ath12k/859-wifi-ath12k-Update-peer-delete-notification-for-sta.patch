@@ -1,0 +1,154 @@
+From aa7d45a5199d49ab8b9c8a3532de1dde2e5dd9ae Mon Sep 17 00:00:00 2001
+From: Amit Pandit <quic_pamit@quicinc.com>
+Date: Mon, 18 Dec 2023 14:05:45 +0530
+Subject: [PATCH] wifi: ath12k: Update peer delete notification for sta
+
+Firmware crash as peer delete timedout due to local frame completion
+pending. When the WDS STA goes into dissoc state,
+the current flow is, sending out disassoc, post peer delete,
+followed by vdev stop, but the expected flow by Firmware is to have
+vdev stop followed by a peer delete irrespective of mlo or non
+mlo stations.
+
+Previous Flow (STA) -> peer_delete->vdev_stop;
+New Flow (STA) -> vdev_stop->peer_delete
+
+We ensure that the vdev stop notification is send out to the Firmware,
+first and then we send out peer delete.
+Vdev state machine changes w.r.t the driver is still intact.
+
+Signed-off-by: Amit Pandit <quic_pamit@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |   1 +
+ drivers/net/wireless/ath/ath12k/mac.c  | 108 +++++++++++++++++++------
+ 2 files changed, 85 insertions(+), 24 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -386,6 +386,7 @@ struct ath12k_link_vif {
+ 	struct device *dev;
+ 	struct ath12k *ar;
+ 	bool assoc_link;
++	bool vdev_stop_notify_done;
+ 	u8 pdev_idx;
+ 	u32 vdev_id;
+ 	u32 beacon_interval;
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -5076,24 +5076,26 @@ static int ath12k_mac_vdev_stop(struct a
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+ 
+-	reinit_completion(&ar->vdev_setup_done);
+-
+-	memset(&ar->wmm_stats, 0, sizeof(struct ath12k_wmm_stats));
++	if (!arvif->vdev_stop_notify_done) {
++		reinit_completion(&ar->vdev_setup_done);
+ 
+-	ret = ath12k_wmi_vdev_stop(ar, arvif->vdev_id);
+-	if (ret) {
+-		ath12k_warn(ar->ab, "failed to stop WMI vdev %i: %d\n",
+-			    arvif->vdev_id, ret);
+-		return ret;
+-	}
++		ret = ath12k_wmi_vdev_stop(ar, arvif->vdev_id);
++		if (ret) {
++			ath12k_warn(ar->ab, "failed to stop WMI vdev %i: %d\n",
++				    arvif->vdev_id, ret);
++			return ret;
++		}
++		arvif->vdev_stop_notify_done = true;
+ 
+-	ret = ath12k_mac_vdev_setup_sync(ar);
+-	if (ret) {
+-		ath12k_warn(ar->ab, "failed to synchronize setup for vdev %i: %d\n",
+-			    arvif->vdev_id, ret);
+-		return ret;
++		ret = ath12k_mac_vdev_setup_sync(ar);
++		if (ret) {
++			ath12k_warn(ar->ab, "failed to synchronize setup for vdev %i: %d\n",
++				    arvif->vdev_id, ret);
++			return ret;
++		}
+ 	}
+ 
++	memset(&ar->wmm_stats, 0, sizeof(struct ath12k_wmm_stats));
+ 	WARN_ON(ar->num_started_vdevs == 0);
+ 
+ 	ar->num_started_vdevs--;
+@@ -7574,6 +7576,35 @@ out:
+ 	return ret;
+ }
+ 
++static inline void ath12k_vdev_stop_notify(struct ath12k_link_vif *arvif)
++{
++	int ret = 0;
++	if (WARN_ON(!arvif || !arvif->ar))
++		return;
++
++	mutex_lock(&arvif->ar->conf_mutex);
++	reinit_completion(&arvif->ar->vdev_setup_done);
++	ret = ath12k_wmi_vdev_stop(arvif->ar, arvif->vdev_id);
++
++	if (ret) {
++		ath12k_warn(arvif->ar->ab,
++			    "failed to stop WMI vdev %i: %d\n",
++			    arvif->vdev_id, ret);
++		goto exit;
++	}
++
++	ret = ath12k_mac_vdev_setup_sync(arvif->ar);
++	if (ret)
++		ath12k_warn(arvif->ar->ab,
++			    "failed to synchronize setup for vdev %i: %d\n",
++			    arvif->vdev_id, ret);
++exit:
++	if (!ret)
++		arvif->vdev_stop_notify_done = true;
++
++	mutex_unlock(&arvif->ar->conf_mutex);
++}
++
+ int ath12k_mac_update_sta_state(struct ieee80211_hw *hw,
+ 				struct ieee80211_vif *vif,
+ 				struct ieee80211_sta *sta,
+@@ -7620,11 +7651,15 @@ int ath12k_mac_update_sta_state(struct i
+ 			ret = -EINVAL;
+ 			goto exit;
+ 		}
++		if (new_state == IEEE80211_STA_NOTEXIST &&
++		    old_state == IEEE80211_STA_NONE &&
++		    ahvif->vdev_type == WMI_VDEV_TYPE_STA)
++			ath12k_vdev_stop_notify(arvif);
+ 
+ 		ret = ath12k_mac_handle_link_sta_state(hw, arvif, arsta,
+ 						       old_state, new_state);
+ 		if (arvif->ar &&
+-				test_bit(ATH12K_FLAG_RECOVERY, &arvif->ar->ab->dev_flags))
++		    test_bit(ATH12K_FLAG_RECOVERY, &arvif->ar->ab->dev_flags))
+ 			ret = 0;
+ 
+ 		mutex_unlock(&ah->conf_mutex);
+@@ -7664,6 +7699,13 @@ int ath12k_mac_update_sta_state(struct i
+ 	}
+ 
+ 	if (new_state == IEEE80211_STA_NOTEXIST && old_state == IEEE80211_STA_NONE) {
++		if (ahvif->vdev_type == WMI_VDEV_TYPE_STA) {
++			for_each_set_bit(link_id, &sta->valid_links,
++					 IEEE80211_MLD_MAX_NUM_LINKS) {
++				arvif = ahvif->link[link_id];
++				ath12k_vdev_stop_notify(arvif);
++			}
++		}
+ 		ath12k_mac_ml_station_remove(ahvif, ahsta);
+ 		goto exit;
+  	}
+@@ -11787,7 +11829,7 @@ static int ath12k_mac_vdev_start_restart
+ 			    arg.vdev_id, restart ? "restart" : "start", ret);
+ 		return ret;
+ 	}
+-
++	arvif->vdev_stop_notify_done = false;
+ 	ar->num_started_vdevs++;
+ 	ath12k_dbg(ab, ATH12K_DBG_MAC,  "vdev %pM started, vdev_id %d\n",
+ 		   arvif->addr, arvif->vdev_id);

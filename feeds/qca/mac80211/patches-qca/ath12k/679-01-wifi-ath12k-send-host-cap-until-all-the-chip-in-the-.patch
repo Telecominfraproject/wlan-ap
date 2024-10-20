@@ -1,0 +1,239 @@
+From c7df4610729a1112efeb6618352bee9f2273c0d5 Mon Sep 17 00:00:00 2001
+From: Karthikeyan Periyasamy <quic_periyasa@quicinc.com>
+Date: Sun, 23 Oct 2022 19:05:47 +0530
+Subject: [PATCH 2/3] wifi: ath12k: send host cap until all the chip in the
+ group are ready
+
+Signed-off-by: Karthikeyan Periyasamy <quic_periyasa@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c | 23 ++++++++
+ drivers/net/wireless/ath/ath12k/qmi.c  | 82 ++++++++++++++++++++++++--
+ drivers/net/wireless/ath/ath12k/qmi.h  | 18 ++++++
+ 3 files changed, 118 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1154,6 +1154,27 @@ static int ath12k_core_start_firmware(st
+ 	return ret;
+ }
+ 
++static void ath12k_core_trigger_partner(struct ath12k_base *ab)
++{
++	struct ath12k_hw_group *ag = ab->ag;
++	struct ath12k_base *partner_ab;
++	int i;
++	bool found = false;
++
++	lockdep_assert_held(&ag->mutex_lock);
++
++	for (i = 0; i < ag->num_chip; i++) {
++		partner_ab = ag->ab[i];
++		if (!partner_ab)
++			continue;
++
++		if (found)
++			ath12k_qmi_trigger_host_cap(partner_ab);
++
++		found = (partner_ab == ab) ? true : false;
++	}
++}
++
+ int ath12k_core_qmi_firmware_ready(struct ath12k_base *ab)
+ {
+ 	struct ath12k_hw_group *ag;
+@@ -1201,6 +1222,8 @@ int ath12k_core_qmi_firmware_ready(struc
+ 		}
+ 
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT, "group %d started\n", ag->id);
++	} else {
++		ath12k_core_trigger_partner(ab);
+ 	}
+ 
+ 	mutex_unlock(&ag->mutex_lock);
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -19,6 +19,8 @@
+ #include <linux/module.h>
+ #include <linux/devcoredump.h>
+ 
++#define ATH12K_QMI_INVALID_RADIO	0xFF
++
+ #define SLEEP_CLOCK_SELECT_INTERNAL_BIT	0x02
+ #define HOST_CSTATE_BIT			0x04
+ #define PLATFORM_CAP_PCIE_GLOBAL_RESET	0x08
+@@ -2741,7 +2743,6 @@ static int ath12k_qmi_fill_mlo_host_caps
+ 	if (ag->id == ATH12K_INVALID_GRP_ID) {
+ 		ath12k_dbg(ab, ATH12K_DBG_QMI, "Skip MLO cap send for chip id %d\n",
+ 			   ab->chip_id);
+-
+ 		mutex_unlock(&ag->mutex_lock);
+ 		return 0;
+ 	}
+@@ -4108,9 +4109,77 @@ ath12k_qmi_driver_event_post(struct ath1
+ 	return 0;
+ }
+ 
++void ath12k_qmi_trigger_host_cap(struct ath12k_base *ab)
++{
++	struct ath12k_qmi *qmi = &ab->qmi;
++	bool block;
++
++	spin_lock(&qmi->event_lock);
++
++	block = ath12k_qmi_get_event_block(qmi);
++	if (block)
++		ath12k_qmi_set_event_block(qmi, false);
++
++	spin_unlock(&qmi->event_lock);
++
++	if (block) {
++		ath12k_dbg(ab, ATH12K_DBG_QMI, "Trigger host cap for chip id %d\n",
++			   ab->chip_id);
++
++		ath12k_qmi_driver_event_post(qmi, ATH12K_QMI_EVENT_HOST_CAP, NULL);
++	}
++}
++
++static bool ath12k_qmi_hw_group_host_cap_ready(struct ath12k_hw_group *ag)
++{
++	struct ath12k_base *ab;
++	int i;
++
++	lockdep_assert_held(&ag->mutex_lock);
++
++	for (i = 0; i < ag->num_chip; i++) {
++		ab = ag->ab[i];
++
++		if (!(ab && ab->qmi.num_radios != ATH12K_QMI_INVALID_RADIO))
++			return false;
++	}
++
++	return true;
++}
++
++static struct ath12k_base *
++ath12k_qmi_hw_group_find_blocked_chip(struct ath12k_hw_group *ag)
++{
++	struct ath12k_base *ab;
++	struct ath12k_qmi *qmi;
++	bool block;
++	int i;
++
++	lockdep_assert_held(&ag->mutex_lock);
++
++	for (i = 0; i < ag->num_chip; i++) {
++		ab = ag->ab[i];
++		if (!ab)
++			continue;
++
++		qmi = &ab->qmi;
++
++		spin_lock(&qmi->event_lock);
++		block = ath12k_qmi_get_event_block(qmi);
++		spin_unlock(&qmi->event_lock);
++
++		if (block)
++			return ab;
++	}
++
++	return NULL;
++}
++
+ static int ath12k_qmi_event_server_arrive(struct ath12k_qmi *qmi)
+ {
+-	struct ath12k_base *ab = qmi->ab;
++	struct ath12k_base *ab = qmi->ab, *block_ab;
++	struct ath12k_hw_group *ag = ab->ag;
++	bool host_cap_ready;
+ 	int ret;
+ 
+ 	ret = ath12k_qmi_fw_ind_register_send(ab);
+@@ -4119,6 +4188,29 @@ static int ath12k_qmi_event_server_arriv
+ 		return ret;
+ 	}
+ 
++	qmi->num_radios = ab->hw_params->num_local_link;
++
++	spin_lock(&qmi->event_lock);
++	ath12k_qmi_set_event_block(&ab->qmi, true);
++	spin_unlock(&qmi->event_lock);
++
++	mutex_lock(&ag->mutex_lock);
++	host_cap_ready = ath12k_qmi_hw_group_host_cap_ready(ag);
++	if (host_cap_ready) {
++		block_ab = ath12k_qmi_hw_group_find_blocked_chip(ag);
++		if (block_ab)
++			ath12k_qmi_trigger_host_cap(block_ab);
++	}
++	mutex_unlock(&ag->mutex_lock);
++
++	return ret;
++}
++
++static int ath12k_qmi_event_host_cap(struct ath12k_qmi *qmi)
++{
++	struct ath12k_base *ab = qmi->ab;
++	int ret;
++
+ 	ret = ath12k_qmi_host_cap_send(ab);
+ 	if (ret < 0) {
+ 		ath12k_warn(ab, "qmi failed to send host cap QMI:%d\n", ret);
+@@ -4816,6 +4908,11 @@ static void ath12k_qmi_driver_event_work
+ 		case ATH12K_QMI_EVENT_M3_DUMP_UPLOAD_REQ:
+ 			ath12k_qmi_event_m3_dump_upload_req(qmi, event->data);
+ 			break;
++		case ATH12K_QMI_EVENT_HOST_CAP:
++			ret = ath12k_qmi_event_host_cap(qmi);
++			if (ret < 0)
++				set_bit(ATH12K_FLAG_QMI_FAIL, &ab->dev_flags);
++			break;
+ 		default:
+ 			ath12k_warn(ab, "invalid event type: %d", event->type);
+ 			break;
+@@ -4835,6 +4932,7 @@ int ath12k_qmi_init_service(struct ath12
+ 	memset(&ab->qmi.target, 0, sizeof(struct target_info));
+ 	memset(&ab->qmi.target_mem, 0, sizeof(struct target_mem_chunk));
+ 	ab->qmi.ab = ab;
++	ab->qmi.num_radios = ATH12K_QMI_INVALID_RADIO;
+ 
+ 	ab->qmi.target_mem_mode = ATH12K_QMI_TARGET_MEM_MODE_DEFAULT;
+ 	ret = qmi_handle_init(&ab->qmi.handle, ATH12K_QMI_RESP_LEN_MAX,
+--- a/drivers/net/wireless/ath/ath12k/qmi.h
++++ b/drivers/net/wireless/ath/ath12k/qmi.h
+@@ -81,6 +81,7 @@ enum ath12k_qmi_event_type {
+ 	ATH12K_QMI_EVENT_QDSS_TRACE_REQ_MEM = 15,
+ 	ATH12K_QMI_EVENT_QDSS_TRACE_SAVE,
+ 	ATH12K_QMI_EVENT_M3_DUMP_UPLOAD_REQ = 18,
++	ATH12K_QMI_EVENT_HOST_CAP,
+ 	ATH12K_QMI_EVENT_MAX,
+ };
+ 
+@@ -163,6 +164,8 @@ struct ath12k_qmi {
+ 	bool target_mem_delayed;
+ 	u8 cal_done;
+ 	u8 cal_timeout;
++	bool block_event;	/* protect by event spinlock */
++	u8 num_radios;
+ 	struct target_info target;
+ 	struct m3_mem_region m3_mem;
+ 	unsigned int service_ins_id;
+@@ -756,4 +759,19 @@ int ath12k_enable_fwlog(struct ath12k_ba
+ int ath12k_qmi_m3_dump_upload_done_ind_send(struct ath12k_base *ab,
+ 					    u32 pdev_id, int status);
+ void ath12k_qmi_free_target_mem_chunk(struct ath12k_base *ab);
++void ath12k_qmi_trigger_host_cap(struct ath12k_base *ab);
++
++static inline void ath12k_qmi_set_event_block(struct ath12k_qmi *qmi, bool block)
++{
++	lockdep_assert_held(&qmi->event_lock);
++
++	qmi->block_event = block;
++}
++
++static inline bool ath12k_qmi_get_event_block(struct ath12k_qmi *qmi)
++{
++	lockdep_assert_held(&qmi->event_lock);
++
++	return qmi->block_event;
++}
+ #endif

@@ -1,0 +1,348 @@
+From be058793e3419957d4ad8fb39bb018dadfbebf52 Mon Sep 17 00:00:00 2001
+From: Sriram R <quic_srirrama@quicinc.com>
+Date: Wed, 29 Dec 2021 11:21:25 +0530
+Subject: [PATCH] ath12k: Support scan for single wiphy architecture
+
+When multiple radios are advertised as a single wiphy,
+supporing varios bands, a default scan request to mac80211
+will split the driver request based on band, so each request
+will have channels belonging to the same band.
+With this supported by default, the ath12k driver on receiving
+this request checks for one of the channels in the request and
+selects the corresponding radio(ar) on which the scan is going
+to be performed and creates a vdev on that radio.
+
+Note that on scan completion this vdev is not deleted. If a new
+scan request is seen on that same vif for a different band the
+vdev will be deleted and created on the new radio supporting the
+request.
+
+The reason for not deleting the vdev on scan stop is to avoid
+repeated delete-create sequence if the scan is on the same band.
+
+Also if the scan is requested when the vdev is in started state,
+no switching to new radio is allowed and scan on channels only
+within same radio is allowed.
+
+Signed-off-by: Sriram R <quic_srirrama@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 202 +++++++++++++++++++++-----
+ 1 file changed, 166 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index c1e1a6b..0c2d9dc 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -247,6 +247,7 @@ static const u32 ath12k_smps_map[] = {
+ 	[WLAN_HT_CAP_SM_PS_DISABLED] = WMI_PEER_SMPS_PS_NONE,
+ };
+ 
++static int ath12k_mac_vdev_create(struct ath12k *ar, struct ieee80211_vif *vif);
+ static int ath12k_start_vdev_delay(struct ieee80211_hw *hw,
+ 				   struct ieee80211_vif *vif);
+ 
+@@ -4006,6 +4007,81 @@ static void ath12k_mac_op_bss_info_changed(struct ieee80211_hw *hw,
+ 	mutex_unlock(&ar->conf_mutex);
+ }
+ 
++static int ath12k_mac_vdev_delete(struct ath12k *ar, struct ieee80211_vif *vif)
++{
++	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
++	unsigned long time_left;
++	int ret = 0;
++
++	lockdep_assert_held(&ar->conf_mutex);
++
++	reinit_completion(&ar->vdev_delete_done);
++
++	ret = ath12k_wmi_vdev_delete(ar, arvif->vdev_id);
++	if (ret) {
++		ath12k_warn(ar->ab, "failed to delete WMI scan vdev %d: %d\n",
++			    arvif->vdev_id, ret);
++		goto clean_up;
++	}
++
++	time_left = wait_for_completion_timeout(&ar->vdev_delete_done,
++						ATH12K_VDEV_DELETE_TIMEOUT_HZ);
++	if (time_left == 0) {
++		ath12k_warn(ar->ab, "Timeout in receiving vdev delete response\n");
++		ret = -ETIMEDOUT;
++		goto clean_up;
++	}
++
++	ar->ab->free_vdev_map |= 1LL << arvif->vdev_id;
++	ar->allocated_vdev_map &= ~(1LL << arvif->vdev_id);
++	ar->ab->free_vdev_stats_id_map &= ~(1LL << arvif->vdev_stats_id);
++	ar->num_created_vdevs--;
++	arvif->is_created = false;
++
++clean_up:
++	arvif->ar = NULL;
++
++	spin_lock_bh(&ar->data_lock);
++	list_del(&arvif->list);
++	spin_unlock_bh(&ar->data_lock);
++
++	return ret;
++}
++
++static struct ath12k*
++ath12k_mac_select_scan_device(struct ieee80211_hw *hw,
++			      struct ieee80211_vif *vif,
++			      struct ieee80211_scan_request *req)
++{
++	struct ath12k_hw *ah = hw->priv;
++	enum nl80211_band band;
++	struct ath12k *ar;
++	int i;
++
++	/* Loop through first channel and determine the scan radio
++	 * NOTE: There could be 5G low/high channels in that case
++	 * split the hw request and perform multiple scans
++	 */
++
++	if (req->req.channels[0]->center_freq < ATH12K_MIN_5G_FREQ)
++		band = NL80211_BAND_2GHZ;
++	else if (req->req.channels[0]->center_freq < ATH12K_MIN_6G_FREQ)
++		band = NL80211_BAND_5GHZ;
++	else
++		band = NL80211_BAND_6GHZ;
++
++	ar = ah->radio;
++
++	for (i = 0; i < ah->num_radio; i++) {
++		/* TODO 5G low high split changes */
++		if (ar->mac.sbands[band].channels)
++			return ar;
++		ar++;
++	}
++
++	return NULL;
++}
++
+ void __ath12k_mac_scan_finish(struct ath12k *ar)
+ {
+ 	lockdep_assert_held(&ar->data_lock);
+@@ -4172,12 +4248,60 @@ static int ath12k_mac_op_hw_scan(struct ieee80211_hw *hw,
+ 				 struct ieee80211_vif *vif,
+ 				 struct ieee80211_scan_request *hw_req)
+ {
+-	struct ath12k *ar = hw->priv;
++	struct ath12k_hw *ah = hw->priv;
+ 	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
++	struct ath12k *ar;
+ 	struct cfg80211_scan_request *req = &hw_req->req;
+ 	struct ath12k_wmi_scan_req_arg arg = {};
+ 	int ret;
+ 	int i;
++    bool create = true;
++
++	mutex_lock(&ah->conf_mutex);
++
++	/* Since the targeted scan device could depend on the frequency
++	 * requested in the hw_req, select the corresponding radio
++	 */
++	ar = ath12k_mac_select_scan_device(hw, vif, hw_req);
++	if (!ar) {
++		mutex_unlock(&ah->conf_mutex);
++		return -EINVAL;
++	}
++
++	/* If the vif is already assigned to a specific vdev of an ar,
++	 * check whether its already started, vdev which is started
++	 * are not allowed to switch to a new radio.
++	 * If the vdev is not started, but was earlier created on a
++	 * different ar, delete that vdev and create a new one. We don't
++	 * delete at the scan stop as an optimization to avoid redundant
++	 * delete-create vdev's for the same ar, in case the request is
++	 * always on the same band for the vif
++	 */
++	if (arvif->is_created) {
++		if (ar != arvif->ar && arvif->is_started) {
++			mutex_unlock(&ah->conf_mutex);
++			return -EINVAL;
++		} else if (ar != arvif->ar) {
++			ret = ath12k_mac_vdev_delete(arvif->ar, vif);
++			if (ret)
++				ath12k_warn(arvif->ar->ab, "unable to delete scan vdev %d\n", ret);
++		} else {
++			create = false;
++		}
++	}
++
++	if (create) {
++		mutex_lock(&ar->conf_mutex);
++		ret = ath12k_mac_vdev_create(ar, vif);
++		if (ret) {
++			mutex_unlock(&ar->conf_mutex);
++			mutex_unlock(&ah->conf_mutex);
++			ath12k_warn(ar->ab, "unable to create scan vdev %d\n", ret);
++			return -EINVAL;
++		}
++		mutex_unlock(&ar->conf_mutex);
++	}
++	mutex_unlock(&ah->conf_mutex);
+ 
+ 	mutex_lock(&ar->conf_mutex);
+ 
+@@ -4250,7 +4374,18 @@ exit:
+ static void ath12k_mac_op_cancel_hw_scan(struct ieee80211_hw *hw,
+ 					 struct ieee80211_vif *vif)
+ {
+-	struct ath12k *ar = hw->priv;
++	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar;
++
++	mutex_lock(&ah->conf_mutex);
++	if (!arvif->is_created) {
++		mutex_unlock(&ah->conf_mutex);
++		return;
++	}
++
++	ar = arvif->ar;
++	mutex_unlock(&ah->conf_mutex);
+ 
+ 	mutex_lock(&ar->conf_mutex);
+ 	ath12k_scan_abort(ar);
+@@ -6977,6 +7112,7 @@ static int ath12k_mac_vdev_create(struct ath12k *ar, struct ieee80211_vif *vif)
+ 
+ 	arvif->vdev_id = vdev_id;
+ 	arvif->vdev_subtype = WMI_VDEV_SUBTYPE_NONE;
++	arvif->ar = ar;
+ 
+ 	switch (vif->type) {
+ 	case NL80211_IFTYPE_UNSPECIFIED:
+@@ -7134,8 +7270,6 @@ static int ath12k_mac_vdev_create(struct ath12k *ar, struct ieee80211_vif *vif)
+ 	if (ret)
+ 		goto err_peer_del;
+ 
+-	mutex_unlock(&ar->conf_mutex);
+-
+ 	return ret;
+ 
+ err_peer_del:
+@@ -7170,6 +7304,7 @@ err_vdev_del:
+ 	spin_unlock_bh(&ar->data_lock);
+ 
+ err:
++	arvif->ar = NULL;
+ 	return ret;
+ }
+ 
+@@ -7217,7 +7352,6 @@ static struct ath12k *ath12k_mac_assign_vif_to_vdev(struct ieee80211_hw *hw,
+ 		ath12k_warn(ab, "failed to create vdev %d ret %d", bit, ret);
+ 		goto unlock;
+ 	}
+-	arvif->ar = ar;
+ 
+ 	/* TODO Apply any parameters for the vdev which were received after
+ 	 * add_interface, corresponding to this vif
+@@ -7308,7 +7442,6 @@ static void ath12k_mac_op_remove_interface(struct ieee80211_hw *hw,
+ 	struct ath12k *ar;
+ 	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
+ 	struct ath12k_base *ab;
+-	unsigned long time_left;
+ 	int ret;
+ 
+ 	mutex_lock(&ah->conf_mutex);
+@@ -7337,21 +7470,9 @@ static void ath12k_mac_op_remove_interface(struct ieee80211_hw *hw,
+ 				    arvif->vdev_id, ret);
+ 	}
+ 
+-	reinit_completion(&ar->vdev_delete_done);
+-
+-	ret = ath12k_wmi_vdev_delete(ar, arvif->vdev_id);
+-	if (ret) {
+-		ath12k_warn(ab, "failed to delete WMI vdev %d: %d\n",
+-			    arvif->vdev_id, ret);
+-		goto err_vdev_del;
+-	}
+-
+-	time_left = wait_for_completion_timeout(&ar->vdev_delete_done,
+-						ATH12K_VDEV_DELETE_TIMEOUT_HZ);
+-	if (time_left == 0) {
+-		ath12k_warn(ab, "Timeout in receiving vdev delete response\n");
++	ret = ath12k_mac_vdev_delete(ar, vif);
++	if (ret)
+ 		goto err_vdev_del;
+-	}
+ 
+ 	if (arvif->vdev_type == WMI_VDEV_TYPE_MONITOR) {
+ 		ar->monitor_vdev_id = -1;
+@@ -7361,20 +7482,10 @@ static void ath12k_mac_op_remove_interface(struct ieee80211_hw *hw,
+ 		ret = ath12k_mac_monitor_vdev_delete(ar);
+ 	}
+ 
+-	ab->free_vdev_map |= 1LL << (arvif->vdev_id);
+-	ar->allocated_vdev_map &= ~(1LL << arvif->vdev_id);
+-	ab->free_vdev_stats_id_map &= ~(1LL << arvif->vdev_stats_id);
+-	ar->num_created_vdevs--;
+-	arvif->is_created = false;
+-
+ 	ath12k_dbg(ab, ATH12K_DBG_MAC, "vdev %pM deleted, vdev_id %d\n",
+ 		   vif->addr, arvif->vdev_id);
+ 
+ err_vdev_del:
+-	spin_lock_bh(&ar->data_lock);
+-	list_del(&arvif->list);
+-	spin_unlock_bh(&ar->data_lock);
+-
+ 	ath12k_peer_cleanup(ar, arvif->vdev_id);
+ 
+ 	idr_for_each(&ar->txmgmt_idr,
+@@ -8584,7 +8695,7 @@ ath12k_mac_op_assign_vif_chanctx(struct ieee80211_hw *hw,
+ 				 struct ieee80211_chanctx_conf *ctx)
+ {
+ 	struct ath12k_hw *ah = hw->priv;
+-	struct ath12k *ar;
++	struct ath12k *ar, *arvif_ar;
+ 	struct ath12k_base *ab;
+ 	struct ath12k_vif *arvif = (void *)vif->drv_priv;
+ 	int ret;
+@@ -8602,7 +8713,7 @@ ath12k_mac_op_assign_vif_chanctx(struct ieee80211_hw *hw,
+ 			return -EINVAL;
+ 		}
+ 	} else {
+-		ar = arvif->ar;
++		ar = ath12k_get_ar_by_ctx(hw, ctx);
+ 		if (!ar) {
+ 			mutex_unlock(&ah->conf_mutex);
+ 			return -EINVAL;
+@@ -8611,10 +8722,29 @@ ath12k_mac_op_assign_vif_chanctx(struct ieee80211_hw *hw,
+ 		/* TODO If vif is already assigned, but now the chan is different and belongs
+ 		 * to a different ar, then delete the old vdev in different ar and create new
+ 		 */
+-		if (!ar->mac.sbands[ctx->def.chan->band].channels) {
+-			mutex_unlock(&ah->conf_mutex);
+-			WARN_ON(1);
+-			return -EINVAL;
++		if (ar != arvif->ar) {
++			if (WARN_ON(arvif->is_started)) {
++				mutex_unlock(&ah->conf_mutex);
++				return -EBUSY;
++			}
++
++			arvif_ar = arvif->ar;
++
++			mutex_lock(&arvif_ar->conf_mutex);
++			ret = ath12k_mac_vdev_delete(arvif_ar, vif);
++			mutex_unlock(&arvif_ar->conf_mutex);
++			if (ret)
++				ath12k_warn(arvif_ar->ab, "unable to delete vdev %d\n", ret);
++
++			mutex_lock(&ar->conf_mutex);
++			ret = ath12k_mac_vdev_create(ar, vif);
++			if (ret) {
++				mutex_unlock(&ar->conf_mutex);
++				mutex_unlock(&ah->conf_mutex);
++				ath12k_warn(ar->ab, "unable to create vdev %d\n", ret);
++				return -EINVAL;
++			}
++			mutex_unlock(&ar->conf_mutex);
+ 		}
+ 	}
+ 
+-- 
+2.17.1
+

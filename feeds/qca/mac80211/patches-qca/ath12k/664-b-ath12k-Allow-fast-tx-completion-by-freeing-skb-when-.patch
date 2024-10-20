@@ -1,0 +1,125 @@
+From c18a8eb7b8b13a0dfe8dc3d14470716a76f4cf25 Mon Sep 17 00:00:00 2001
+From: Pradeep Kumar Chitrapu <quic_pradeepc@quicinc.com>
+Date: Wed, 10 Aug 2022 11:21:47 -0700
+Subject: [PATCH] ath12k: Allow fast tx completion by freeing skb when stats is
+ disabled.
+
+Avoid reaping buffers and updating stats in tx status when stats
+are disabled from userspace. This helps in improving tx completion
+delays and improve performance.
+
+Signed-off-by: Pradeep Kumar Chitrapu <quic_pradeepc@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h  |  1 +
+ drivers/net/wireless/ath/ath12k/dp_tx.c | 40 +++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/mac.c   | 10 +++++++
+ 3 files changed, 51 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index 0939327..9160f48 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -82,6 +82,7 @@ static inline enum wme_ac ath12k_tid_to_ac(u32 tid)
+ enum ath12k_skb_flags {
+ 	ATH12K_SKB_HW_80211_ENCAP = BIT(0),
+ 	ATH12K_SKB_CIPHER_SET = BIT(1),
++	ATH12K_SKB_TX_STATUS = BIT(2),
+ };
+ 
+ struct ath12k_skb_cb {
+diff --git a/drivers/net/wireless/ath/ath12k/dp_tx.c b/drivers/net/wireless/ath/ath12k/dp_tx.c
+index 2add70e..7d3f3e0 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -398,6 +398,7 @@ ath12k_dp_tx_htt_tx_complete_buf(struct ath12k_base *ab,
+ 	struct ieee80211_tx_info *info;
+ 	struct ath12k_skb_cb *skb_cb;
+ 	struct ath12k *ar;
++	u8 flags = 0;
+ 
+ 	skb_cb = ATH12K_SKB_CB(msdu);
+ 	info = IEEE80211_SKB_CB(msdu);
+@@ -412,6 +413,27 @@ ath12k_dp_tx_htt_tx_complete_buf(struct ath12k_base *ab,
+ 		dma_unmap_single(ab->dev, skb_cb->paddr_ext_desc,
+ 				 sizeof(struct hal_tx_msdu_ext_desc), DMA_TO_DEVICE);
+ 
++	flags = skb_cb->flags;
++
++	/* Free skb here if stats is disabled */
++	if (ab->stats_disable && !(flags & ATH12K_SKB_TX_STATUS)) {
++		if (msdu->destructor) {
++			msdu->wifi_acked_valid = 1;
++			msdu->wifi_acked = ts->acked;
++		}
++		if (skb_has_frag_list(msdu)) {
++			kfree_skb_list(skb_shinfo(msdu)->frag_list);
++			skb_shinfo(msdu)->frag_list = NULL;
++		}
++		dev_kfree_skb(msdu);
++		return;
++	}
++
++	if (unlikely(!skb_cb->vif)) {
++		dev_kfree_skb_any(msdu);
++		return;
++	}
++
+ 	memset(&info->status, 0, sizeof(info->status));
+ 
+ 	if (ts->acked) {
+@@ -604,6 +626,7 @@ static void ath12k_dp_tx_complete_msdu(struct ath12k *ar,
+ 	struct ath12k_peer *peer;
+ 	struct ath12k_sta *arsta;
+ 	struct rate_info rate;
++	u8 flags = 0;
+ 
+ 
+ 	if (WARN_ON_ONCE(ts->buf_rel_source != HAL_WBM_REL_SRC_MODULE_TQM)) {
+@@ -618,6 +641,23 @@ static void ath12k_dp_tx_complete_msdu(struct ath12k *ar,
+ 		dma_unmap_single(ab->dev, skb_cb->paddr_ext_desc,
+ 				 sizeof(struct hal_tx_msdu_ext_desc), DMA_TO_DEVICE);
+ 
++	flags = skb_cb->flags;
++
++	/* Free skb here if stats is disabled */
++	if (ab->stats_disable && !(flags & ATH12K_SKB_TX_STATUS)) {
++		if (msdu->destructor) {
++			msdu->wifi_acked_valid = 1;
++			msdu->wifi_acked = ts->status ==
++					   HAL_WBM_TQM_REL_REASON_FRAME_ACKED;
++		}
++		if (skb_has_frag_list(msdu)) {
++			kfree_skb_list(skb_shinfo(msdu)->frag_list);
++			skb_shinfo(msdu)->frag_list = NULL;
++		}
++		dev_kfree_skb(msdu);
++		return;
++	}
++
+ 	rcu_read_lock();
+ 
+ 	if (!rcu_dereference(ab->pdevs_active[ar->pdev_idx])) {
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index c0baf9c..9865b13 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -6946,6 +6946,16 @@ static void ath12k_mac_op_tx(struct ieee80211_hw *hw,
+ 	if (control->sta)
+ 		arsta = (struct ath12k_sta *)control->sta->drv_priv;
+ 
++	/* Must call mac80211 tx status handler, else when stats is disabled we
++	 * free the skb from driver. Own tx packets on monitor will also be
++	 * disabled.
++	 */
++	if ((info->flags & (IEEE80211_TX_CTL_REQ_TX_STATUS |
++			    IEEE80211_TX_INTFL_NL80211_FRAME_TX)) ||
++	    info->ack_frame_id || vif->type == NL80211_IFTYPE_MESH_POINT ||
++	    test_bit(MONITOR_VDEV_CREATED, &ar->monitor_flags))
++		skb_cb->flags |= ATH12K_SKB_TX_STATUS;
++
+ 	ret = ath12k_dp_tx(ar, arvif, arsta, skb);
+ 	if (unlikely(ret)) {
+ 		if (ret == -ENOMEM)
+-- 
+2.17.1
+

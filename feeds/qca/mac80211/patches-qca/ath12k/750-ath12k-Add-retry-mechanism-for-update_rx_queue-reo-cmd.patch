@@ -1,0 +1,632 @@
+From 26c6f2a11c7a2ed8bfd265d630a1ab700397f4f3 Mon Sep 17 00:00:00 2001
+From: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+Date: Thu, 16 Mar 2023 18:24:03 +0530
+Subject: [PATCH] ath12k: Add retry mechanism for update_rx_queue reo cmd
+
+While reo_cmd ring is full, peer delete update rx queue
+will be failed as there is no space to send the command
+in ring. During the failure scenario, host will do
+dma_unmap and free the allocated address but the HW
+still have that particular vaddr. So, on next alloc
+cycle kernel will allocated the freed addr but HW will
+still have the address. This will result in memory
+corruption as the host will try to access/write that
+memory which is already in-use.
+
+To avoid this corruption, added new retry mechanism
+for HAL_REO_CMD_UPDATE_RX_QUEUE by adding new list to
+dp struct and protecting with new lock for access.
+This avoids the host free in failure case and will
+be freed only when HW freed that particular vaddr.
+
+Also, updated below changes
+ 1) reo_flush command for sending 1K desc in one
+ command instead of sending 11 command for single
+ TID.
+ 2) Set FWD_MPDU and valid bit flag so that reo
+ flush will happen soon instead of waiting to
+ flush the queue.
+ 3) memset reo lut addr after successful allocation.
+ 4) Clear qdesc cache clear after qref reset and before
+ freeing qdesc addr.
+
+Signed-off-by: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h     |   1 +
+ drivers/net/wireless/ath/ath12k/debugfs.c  |   4 +
+ drivers/net/wireless/ath/ath12k/dp.c       |   3 +
+ drivers/net/wireless/ath/ath12k/dp.h       |   6 +
+ drivers/net/wireless/ath/ath12k/dp_rx.c    | 315 +++++++++++++--------
+ drivers/net/wireless/ath/ath12k/dp_rx.h    |  10 +
+ drivers/net/wireless/ath/ath12k/hal.h      |   1 +
+ drivers/net/wireless/ath/ath12k/hal_desc.h |   1 +
+ drivers/net/wireless/ath/ath12k/hal_rx.c   |   3 +
+ 9 files changed, 223 insertions(+), 121 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1023,6 +1023,7 @@ struct ath12k_soc_dp_stats {
+ 
+ 	struct ath12k_soc_dp_tx_err_stats tx_err;
+	struct ath12k_dp_ring_bp_stats bp_stats;
++	u32 reo_cmd_update_rx_queue_error;
+ };
+ 
+ struct ath12k_reg_freq {
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -1574,6 +1574,10 @@ static ssize_t ath12k_debugfs_dump_soc_d
+ 			soc_stats->reo_cmd_cache_error);
+ 
+ 	len += scnprintf(buf + len, size - len,
++			"\nREO_CMD_UPDATE_RX_QUEUE Failure: %u\n",
++			soc_stats->reo_cmd_update_rx_queue_error);
++
++	len += scnprintf(buf + len, size - len,
+ 			"\nmcast reinject: %u\n",
+ 			soc_stats->mcast_reinject);
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -1701,7 +1701,9 @@ int ath12k_dp_alloc(struct ath12k_base *
+ 
+ 	INIT_LIST_HEAD(&dp->reo_cmd_list);
+ 	INIT_LIST_HEAD(&dp->reo_cmd_cache_flush_list);
++	INIT_LIST_HEAD(&dp->reo_cmd_update_rx_queue_list);
+ 	spin_lock_init(&dp->reo_cmd_lock);
++	spin_lock_init(&dp->reo_cmd_update_rx_queue_lock);
+ 
+ 	dp->reo_cmd_cache_flush_count = 0;
+ 	chip_id = (ab->ag->mlo_capable) ? ab->chip_id : 0;
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -350,6 +350,12 @@ struct ath12k_dp {
+ 	 * - reo_cmd_cache_flush_count
+ 	 */
+ 	spinlock_t reo_cmd_lock;
++	struct list_head reo_cmd_update_rx_queue_list;
++	/**
++	 * protects access to below field,
++	 * - reo_cmd_update_rx_queue_list
++	*/
++	spinlock_t reo_cmd_update_rx_queue_lock;
+ 	struct ath12k_hp_update_timer reo_cmd_timer;
+ 	struct ath12k_hp_update_timer tx_ring_timer[DP_TCL_NUM_RING_MAX];
+ 	struct ath12k_spt_info *spt_info;
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -28,6 +28,9 @@
+ 
+ #define ATH12K_DP_RX_FRAGMENT_TIMEOUT_MS (2 * HZ)
+ 
++static void ath12k_dp_rx_tid_del_func(struct ath12k_dp *dp, void *ctx,
++				      enum hal_reo_cmd_status status);
++
+ static enum hal_encrypt_type ath12k_dp_rx_h_enctype(struct ath12k_base *ab,
+ 						    struct hal_rx_desc *desc)
+ {
+@@ -578,57 +581,29 @@ static int ath12k_dp_rx_pdev_srng_alloc(
+ 	return 0;
+ }
+ 
+-void ath12k_dp_rx_reo_cmd_list_cleanup(struct ath12k_base *ab)
++static void ath12k_peer_rx_tid_qref_reset(struct ath12k_base *ab, u16 peer_id, u16 tid)
+ {
++	struct ath12k_reo_queue_ref *qref;
+ 	struct ath12k_dp *dp = &ab->dp;
+-	struct ath12k_dp_rx_reo_cmd *cmd, *tmp;
+-	struct ath12k_dp_rx_reo_cache_flush_elem *cmd_cache, *tmp_cache;
+-	struct ath12k_dp_rx_tid *rx_tid;
++	bool ml_peer = false;
+ 
+-	spin_lock_bh(&dp->reo_cmd_lock);
+-	list_for_each_entry_safe(cmd, tmp, &dp->reo_cmd_list, list) {
+-		list_del(&cmd->list);
+-		rx_tid = &cmd->data;
+-		if (rx_tid->vaddr) {
+-			dma_unmap_single(ab->dev, rx_tid->paddr,
+-					 rx_tid->size, DMA_BIDIRECTIONAL);
+-			kfree(rx_tid->vaddr);
+-			rx_tid->vaddr = NULL;
+-		}
+-		kfree(cmd);
+-	}
++	if (!ab->hw_params->reoq_lut_support)
++		return;
+ 
+-	list_for_each_entry_safe(cmd_cache, tmp_cache,
+-				 &dp->reo_cmd_cache_flush_list, list) {
+-		list_del(&cmd_cache->list);
+-		dp->reo_cmd_cache_flush_count--;
+-		rx_tid = &cmd_cache->data;
+-                if (rx_tid->vaddr) {
+-                       dma_unmap_single(ab->dev, rx_tid->paddr,
+-	                                 rx_tid->size, DMA_BIDIRECTIONAL);
+-                        kfree(rx_tid->vaddr);
+-                        rx_tid->vaddr = NULL;
+-                }
+-		kfree(cmd_cache);
++	if (peer_id & ATH12K_ML_PEER_ID_VALID) {
++		peer_id &= ~ATH12K_ML_PEER_ID_VALID;
++		ml_peer = true;
+ 	}
+-	spin_unlock_bh(&dp->reo_cmd_lock);
+-}
+-
+-static void ath12k_dp_reo_cmd_free(struct ath12k_dp *dp, void *ctx,
+-				   enum hal_reo_cmd_status status)
+-{
+-	struct ath12k_dp_rx_tid *rx_tid = ctx;
+ 
+-	if (status != HAL_REO_CMD_SUCCESS)
+-		ath12k_warn(dp->ab, "failed to flush rx tid hw desc, tid %d status %d\n",
+-			    rx_tid->tid, status);
++	if (ml_peer)
++		qref = (struct ath12k_reo_queue_ref *)dp->ml_reoq_lut.vaddr +
++				(peer_id * (IEEE80211_NUM_TIDS + 1) + tid);
++	else
++		qref = (struct ath12k_reo_queue_ref *)dp->reoq_lut.vaddr +
++				(peer_id * (IEEE80211_NUM_TIDS + 1) + tid);
+ 
+-	if (rx_tid->vaddr) {
+-		dma_unmap_single(dp->ab->dev, rx_tid->paddr, rx_tid->size,
+-			 DMA_BIDIRECTIONAL);
+-		kfree(rx_tid->vaddr);
+-		rx_tid->vaddr = NULL;
+-	}
++	qref->info0 = u32_encode_bits(0, BUFFER_ADDR_INFO0_ADDR);
++	qref->info1 = u32_encode_bits(0, BUFFER_ADDR_INFO1_ADDR);
+ }
+ 
+ static int ath12k_dp_reo_cmd_send(struct ath12k_base *ab, struct ath12k_dp_rx_tid *rx_tid,
+@@ -679,47 +654,124 @@ static int ath12k_dp_reo_cmd_send(struct
+ 	return 0;
+ }
+ 
+-static int ath12k_dp_reo_cache_flush(struct ath12k_base *ab,
+-				      struct ath12k_dp_rx_tid *rx_tid)
++static int ath12k_peer_rx_tid_delete_handler(struct ath12k_base *ab,
++					      struct ath12k_dp_rx_tid *rx_tid, u8 tid)
+ {
+ 	struct ath12k_hal_reo_cmd cmd = {0};
+-	unsigned long tot_desc_sz, desc_sz;
+-	int ret;
++	struct ath12k_dp *dp = &ab->dp;
+ 
+-	if (rx_tid->pending_desc_size)
+-		tot_desc_sz = rx_tid->pending_desc_size;
+-	else
+-		tot_desc_sz = rx_tid->size;
+-	desc_sz = ath12k_hal_reo_qdesc_size(0, HAL_DESC_REO_NON_QOS_TID);
++	lockdep_assert_held(&dp->reo_cmd_update_rx_queue_lock);
++
++	rx_tid->active = false;
++	cmd.flag = HAL_REO_CMD_FLG_NEED_STATUS;
++	cmd.addr_lo = lower_32_bits(rx_tid->paddr);
++	cmd.addr_hi = upper_32_bits(rx_tid->paddr);
++	cmd.upd0 |= HAL_REO_CMD_UPD0_VLD;
++	cmd.upd0 |= HAL_REO_CMD_UPD0_BA_WINDOW_SIZE;
++	cmd.ba_window_size = (tid == HAL_DESC_REO_NON_QOS_TID) ?
++			      rx_tid->ba_win_sz : DP_BA_WIN_SZ_MAX;
++	cmd.upd1 |= HAL_REO_CMD_UPD1_VLD;
++
++	return ath12k_dp_reo_cmd_send(ab, rx_tid,
++				      HAL_REO_CMD_UPDATE_RX_QUEUE, &cmd,
++				      ath12k_dp_rx_tid_del_func);
++}
++
++void ath12k_dp_rx_reo_cmd_list_cleanup(struct ath12k_base *ab)
++{
++	struct ath12k_dp *dp = &ab->dp;
++	struct ath12k_dp_rx_reo_cmd *cmd, *tmp;
++	struct ath12k_dp_rx_reo_cache_flush_elem *cmd_cache, *tmp_cache;
++	struct dp_reo_update_rx_queue_elem *cmd_queue, *tmp_queue;
++	struct ath12k_dp_rx_tid *rx_tid;
+ 
+-	while (tot_desc_sz > desc_sz) {
+-		tot_desc_sz -= desc_sz;
+-		cmd.addr_lo = lower_32_bits(rx_tid->paddr + tot_desc_sz);
+-		cmd.addr_hi = upper_32_bits(rx_tid->paddr);
+-		ret = ath12k_dp_reo_cmd_send(ab, rx_tid,
+-					     HAL_REO_CMD_FLUSH_CACHE, &cmd,
+-					     NULL);
+-		if (ret)
+-		{
+-			rx_tid->pending_desc_size = tot_desc_sz + desc_sz;
+-			/* If this fails with ring full condition, then
+-			 * no need to retry below as it is expected to
+-			 * fail within short time */
+-			if (ret == -ENOBUFS)
+-				goto exit;
++	spin_lock_bh(&dp->reo_cmd_update_rx_queue_lock);
++	list_for_each_entry_safe(cmd_queue, tmp_queue, &dp->reo_cmd_update_rx_queue_list,
++			list) {
++		list_del(&cmd_queue->list);
++		rx_tid = &cmd_queue->data;
++		if (rx_tid->vaddr) {
++			dma_unmap_single(ab->dev, rx_tid->paddr,
++	                                 rx_tid->size, DMA_BIDIRECTIONAL);
++                        kfree(rx_tid->vaddr);
++                        rx_tid->vaddr = NULL;
+ 		}
++		kfree(cmd_queue);
+ 	}
++	spin_unlock_bh(&dp->reo_cmd_update_rx_queue_lock);
++
++	spin_lock_bh(&dp->reo_cmd_lock);
++	list_for_each_entry_safe(cmd, tmp, &dp->reo_cmd_list, list) {
++		list_del(&cmd->list);
++		rx_tid = &cmd->data;
++		if (rx_tid->vaddr) {
++			dma_unmap_single(ab->dev, rx_tid->paddr,
++					 rx_tid->size, DMA_BIDIRECTIONAL);
++			kfree(rx_tid->vaddr);
++			rx_tid->vaddr = NULL;
++		}
++		kfree(cmd);
++	}
++
++	list_for_each_entry_safe(cmd_cache, tmp_cache,
++				 &dp->reo_cmd_cache_flush_list, list) {
++		list_del(&cmd_cache->list);
++		dp->reo_cmd_cache_flush_count--;
++		rx_tid = &cmd_cache->data;
++                if (rx_tid->vaddr) {
++                       dma_unmap_single(ab->dev, rx_tid->paddr,
++	                                 rx_tid->size, DMA_BIDIRECTIONAL);
++                        kfree(rx_tid->vaddr);
++                        rx_tid->vaddr = NULL;
++                }
++		kfree(cmd_cache);
++	}
++	spin_unlock_bh(&dp->reo_cmd_lock);
++}
++
++static void ath12k_dp_reo_cmd_free(struct ath12k_dp *dp, void *ctx,
++				   enum hal_reo_cmd_status status)
++{
++	struct ath12k_dp_rx_tid *rx_tid = ctx;
++
++	if (status != HAL_REO_CMD_SUCCESS)
++		ath12k_warn(dp->ab, "failed to flush rx tid hw desc, tid %d status %d\n",
++			    rx_tid->tid, status);
++
++	ath12k_hal_reo_shared_qaddr_cache_clear(dp->ab);
++
++	if (rx_tid->vaddr) {
++		dma_unmap_single(dp->ab->dev, rx_tid->paddr, rx_tid->size,
++			 DMA_BIDIRECTIONAL);
++		kfree(rx_tid->vaddr);
++		rx_tid->vaddr = NULL;
++	}
++}
++
++static int ath12k_dp_reo_cache_flush(struct ath12k_base *ab,
++				      struct ath12k_dp_rx_tid *rx_tid)
++{
++	struct ath12k_hal_reo_cmd cmd = {0};
++	int ret;
+ 
+-	rx_tid->pending_desc_size = desc_sz;
+ 	memset(&cmd, 0, sizeof(cmd));
+ 	cmd.addr_lo = lower_32_bits(rx_tid->paddr);
+ 	cmd.addr_hi = upper_32_bits(rx_tid->paddr);
+-	cmd.flag = HAL_REO_CMD_FLG_NEED_STATUS;
++	cmd.flag |= HAL_REO_CMD_FLG_NEED_STATUS |
++		    HAL_REO_CMD_FLG_FLUSH_FWD_ALL_MPDUS;
++
++	/* For all NON_QOS tid, driver allocates max window
++	 * size of 1024. For this, driver can send flush 1K Desc
++	 * in one command instead of sending 11 cmd for
++	 * single NON_QOS tid(s).
++	 */
++	if (rx_tid->tid != HAL_DESC_REO_NON_QOS_TID)
++		cmd.flag |= HAL_REO_CMD_FLG_FLUSH_QUEUE_1K_DESC;
++
+ 	ret = ath12k_dp_reo_cmd_send(ab, rx_tid,
+ 				     HAL_REO_CMD_FLUSH_CACHE,
+ 				     &cmd, ath12k_dp_reo_cmd_free);
+ 
+-exit:
+ 	return ret;
+ }
+ 
+@@ -727,8 +779,9 @@ static void ath12k_dp_rx_tid_del_func(st
+ 				      enum hal_reo_cmd_status status)
+ {
+ 	struct ath12k_base *ab = dp->ab;
+-	struct ath12k_dp_rx_tid *rx_tid = ctx;
++	struct ath12k_dp_rx_tid *rx_tid = ctx, *update_rx_tid;
+ 	struct ath12k_dp_rx_reo_cache_flush_elem *elem, *tmp;
++	struct dp_reo_update_rx_queue_elem *qelem, *qtmp;
+ 
+ 	if (status == HAL_REO_CMD_DRAIN) {
+ 		ab->soc_stats.hal_reo_cmd_drain++;
+@@ -740,6 +793,33 @@ static void ath12k_dp_rx_tid_del_func(st
+ 		return;
+ 	}
+ 
++	/* Check if there is any pending rx_queue, if yes then update it */
++	spin_lock_bh(&dp->reo_cmd_update_rx_queue_lock);
++	list_for_each_entry_safe(qelem, qtmp, &dp->reo_cmd_update_rx_queue_list,
++			list) {
++		if (qelem->reo_cmd_update_rx_queue_resend_flag &&
++				qelem->data.active) {
++			update_rx_tid = &qelem->data;
++
++			if (ath12k_peer_rx_tid_delete_handler(ab, update_rx_tid, qelem->tid)) {
++				update_rx_tid->active = true;
++				break;
++			}
++			ath12k_peer_rx_tid_qref_reset(ab,
++						      qelem->is_ml_peer ? qelem->ml_peer_id : qelem->peer_id,
++						      qelem->tid);
++			ath12k_hal_reo_shared_qaddr_cache_clear(ab);
++			update_rx_tid->vaddr = NULL;
++			update_rx_tid->paddr = 0;
++			update_rx_tid->size = 0;
++			update_rx_tid->pending_desc_size = 0;
++
++			list_del(&qelem->list);
++			kfree(qelem);
++		}
++	}
++	spin_unlock_bh(&dp->reo_cmd_update_rx_queue_lock);
++
+ 	elem = kzalloc(sizeof(*elem), GFP_ATOMIC);
+ 	if (!elem) {
+ 		 ath12k_warn(ab, "failed to alloc reo_cache_flush_elem, rx tid %d\n",
+@@ -769,12 +849,11 @@ static void ath12k_dp_rx_tid_del_func(st
+ 			 */
+ 			spin_unlock_bh(&dp->reo_cmd_lock);
+ 			if (ath12k_dp_reo_cache_flush(ab, &elem->data)) {
++				ab->soc_stats.reo_cmd_cache_error++;
+ 				/* In failure case, just update the timestamp
+ 				 * for flush cache elem and continue */
+-				ab->soc_stats.reo_cmd_cache_error++;
+ 				spin_lock_bh(&dp->reo_cmd_lock);
+-				elem->ts = jiffies +
+-					msecs_to_jiffies(ATH12K_DP_RX_REO_DESC_FREE_TIMEOUT_MS);
++				elem->ts = jiffies;
+ 				break;
+ 			}
+ 			spin_lock_bh(&dp->reo_cmd_lock);
+@@ -824,67 +903,59 @@ static void ath12k_peer_rx_tid_qref_setu
+ 	ath12k_hal_reo_shared_qaddr_cache_clear(ab);
+ }
+ 
+-static void ath12k_peer_rx_tid_qref_reset(struct ath12k_base *ab, u16 peer_id, u16 tid)
++void ath12k_dp_rx_peer_tid_delete(struct ath12k *ar,
++				  struct ath12k_peer *peer, u8 tid)
+ {
+-	struct ath12k_reo_queue_ref *qref;
++	struct ath12k_dp_rx_tid *rx_tid = &peer->rx_tid[tid];
++	struct dp_reo_update_rx_queue_elem *elem, *tmp;
++	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_dp *dp = &ab->dp;
+-	bool ml_peer = false;
+ 
+-	if (!ab->hw_params->reoq_lut_support)
++	if (!rx_tid->active)
+ 		return;
+ 
+-	if (peer_id & ATH12K_ML_PEER_ID_VALID) {
+-		peer_id &= ~ATH12K_ML_PEER_ID_VALID;
+-		ml_peer = true;
++	elem = kzalloc(sizeof(*elem), GFP_ATOMIC);
++	if (!elem) {
++		ath12k_warn(ar->ab, "failed to alloc reo_update_rx_queue_elem, rx tid %d\n",
++				rx_tid->tid);
++		return;
+ 	}
++	elem->reo_cmd_update_rx_queue_resend_flag = false;
++	elem->peer_id = peer->peer_id;
++	elem->tid = tid;
++	elem->is_ml_peer = peer->mlo ? true : false;
++	elem->ml_peer_id = peer->ml_peer_id;
+ 
+-	if (ml_peer)
+-		qref = (struct ath12k_reo_queue_ref *)dp->ml_reoq_lut.vaddr +
+-				(peer_id * (IEEE80211_NUM_TIDS + 1) + tid);
+-	else
+-		qref = (struct ath12k_reo_queue_ref *)dp->reoq_lut.vaddr +
+-				(peer_id * (IEEE80211_NUM_TIDS + 1) + tid);
+-
+-	qref->info0 = u32_encode_bits(0, BUFFER_ADDR_INFO0_ADDR);
+-	qref->info1 = u32_encode_bits(0, BUFFER_ADDR_INFO1_ADDR) |
+-		      u32_encode_bits(tid, DP_REO_QREF_NUM);
+-}
+-
+-void ath12k_dp_rx_peer_tid_delete(struct ath12k *ar,
+-				  struct ath12k_peer *peer, u8 tid)
+-{
+-	struct ath12k_hal_reo_cmd cmd = {0};
+-	struct ath12k_dp_rx_tid *rx_tid = &peer->rx_tid[tid];
+-	int ret;
++	memcpy(&elem->data, rx_tid, sizeof(*rx_tid));
+ 
+-	if (!rx_tid->active)
+-		return;
++	spin_lock_bh(&dp->reo_cmd_update_rx_queue_lock);
++	list_add_tail(&elem->list, &dp->reo_cmd_update_rx_queue_list);
+ 
+-	rx_tid->active = false;
+-	cmd.flag = HAL_REO_CMD_FLG_NEED_STATUS;
+-	cmd.addr_lo = lower_32_bits(rx_tid->paddr);
+-	cmd.addr_hi = upper_32_bits(rx_tid->paddr);
+-	cmd.upd0 = HAL_REO_CMD_UPD0_VLD;
+-	ret = ath12k_dp_reo_cmd_send(ar->ab, rx_tid,
+-				     HAL_REO_CMD_UPDATE_RX_QUEUE, &cmd,
+-				     ath12k_dp_rx_tid_del_func);
+-	if (ret) {
+-		ath12k_err(ar->ab, "failed to send HAL_REO_CMD_UPDATE_RX_QUEUE cmd, tid %d (%d)\n",
+-			   tid, ret);
+-		dma_unmap_single(ar->ab->dev, rx_tid->paddr, rx_tid->size,
+-				 DMA_BIDIRECTIONAL);
+-		kfree(rx_tid->vaddr);
++	list_for_each_entry_safe(elem, tmp, &dp->reo_cmd_update_rx_queue_list,
++			list) {
++		rx_tid = &elem->data;
++
++		if (ath12k_peer_rx_tid_delete_handler(ab, rx_tid, elem->tid)) {
++			rx_tid->active = true;
++			ab->soc_stats.reo_cmd_update_rx_queue_error++;
++			elem->reo_cmd_update_rx_queue_resend_flag = true;
++			break;
++		}
++		ath12k_peer_rx_tid_qref_reset(ab,
++					      elem->is_ml_peer ? elem->ml_peer_id : elem->peer_id,
++					      elem->tid);
++		ath12k_hal_reo_shared_qaddr_cache_clear(ab);
+ 		rx_tid->vaddr = NULL;
+-	}
++		rx_tid->paddr = 0;
++		rx_tid->size = 0;
++		rx_tid->pending_desc_size = 0;
+ 
+-	if (peer->mlo)
+-		ath12k_peer_rx_tid_qref_reset(ar->ab, peer->ml_peer_id, tid);
+-	else
+-		ath12k_peer_rx_tid_qref_reset(ar->ab, peer->peer_id, tid);
++		list_del(&elem->list);
++		kfree(elem);
++	}
++	spin_unlock_bh(&dp->reo_cmd_update_rx_queue_lock);
+ 
+-	rx_tid->vaddr = NULL;
+-	rx_tid->paddr = 0;
+-	rx_tid->size = 0;
++	return;
+ }
+ 
+ /* TODO: it's strange (and ugly) that struct hal_reo_dest_ring is converted
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -40,6 +40,16 @@ struct ath12k_dp_rx_reo_cache_flush_elem
+ 	unsigned long ts;
+ };
+ 
++struct dp_reo_update_rx_queue_elem {
++	struct list_head list;
++	struct ath12k_dp_rx_tid data;
++	int peer_id;
++	u8 tid;
++	bool reo_cmd_update_rx_queue_resend_flag;
++	bool is_ml_peer;
++	u16 ml_peer_id;
++};
++
+ struct ath12k_dp_rx_reo_cmd {
+ 	struct list_head list;
+ 	struct ath12k_dp_rx_tid data;
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -847,6 +847,7 @@ enum hal_rx_buf_return_buf_manager {
+ #define HAL_REO_CMD_FLG_FLUSH_ALL		BIT(6)
+ #define HAL_REO_CMD_FLG_UNBLK_RESOURCE		BIT(7)
+ #define HAL_REO_CMD_FLG_UNBLK_CACHE		BIT(8)
++#define HAL_REO_CMD_FLG_FLUSH_QUEUE_1K_DESC	BIT(9)
+ 
+ /* Should be matching with HAL_REO_UPD_RX_QUEUE_INFO0_UPD_* fields */
+ #define HAL_REO_CMD_UPD0_RX_QUEUE_NUM		BIT(8)
+--- a/drivers/net/wireless/ath/ath12k/hal_desc.h
++++ b/drivers/net/wireless/ath/ath12k/hal_desc.h
+@@ -923,53 +923,6 @@ struct hal_reo_dest_ring {
+  *		this ring has looped around the ring.
+  */
+ 
+-#define HAL_REO_TO_PPE_RING_INFO0_DATA_LENGTH	GENMASK(15, 0)
+-#define HAL_REO_TO_PPE_RING_INFO0_DATA_OFFSET	GENMASK(23, 16)
+-#define HAL_REO_TO_PPE_RING_INFO0_POOL_ID	GENMASK(28, 24)
+-#define HAL_REO_TO_PPE_RING_INFO0_PREHEADER	BIT(29)
+-#define HAL_REO_TO_PPE_RING_INFO0_TSO_EN	BIT(30)
+-#define HAL_REO_TO_PPE_RING_INFO0_MORE	BIT(31)
+-
+-struct hal_reo_to_ppe_ring {
+-	__le32 buffer_addr;
+-	__le32 info0; /* %HAL_REO_TO_PPE_RING_INFO0_ */
+-} __packed;
+-
+-/* hal_reo_to_ppe_ring
+- *
+- *		Producer: REO
+- *		Consumer: PPE
+- *
+- * buf_addr_info
+- *		Details of the physical address of a buffer or MSDU
+- *		link descriptor.
+- *
+- * data_length
+- *		Length of valid data in bytes
+- *
+- * data_offset
+- *		Offset to the data from buffer pointer. Can be used to
+- *		strip header in the data for tunnel termination etc.
+- *
+- * pool_id
+- *		REO has global configuration register for this field.
+- *		It may have several free buffer pools, each
+- *		RX-Descriptor ring can fetch free buffer from specific
+- *		buffer pool; pool id will indicate which pool the buffer
+- *		will be released to; POOL_ID Zero returned to SW
+- *
+- * preheader
+- *		Disabled: 0 (Default)
+- *		Enabled: 1
+- *
+- * tso_en
+- *		Disabled: 0 (Default)
+- *		Enabled: 1
+- *
+- * more
+- *		More Segments followed
+- */
+-
+ enum hal_reo_entr_rxdma_push_reason {
+ 	HAL_REO_ENTR_RING_RXDMA_PUSH_REASON_ERR_DETECTED,
+ 	HAL_REO_ENTR_RING_RXDMA_PUSH_REASON_ROUTING_INSTRUCTION,
+@@ -1209,6 +1162,7 @@ struct hal_reo_flush_queue {
+ #define HAL_REO_FLUSH_CACHE_INFO0_FLUSH_WO_INVALIDATE	BIT(12)
+ #define HAL_REO_FLUSH_CACHE_INFO0_BLOCK_CACHE_USAGE	BIT(13)
+ #define HAL_REO_FLUSH_CACHE_INFO0_FLUSH_ALL		BIT(14)
++#define HAL_REO_FLUSH_CACHE_INFO0_FLUSH_QUEUE_1K_DESC	BIT(15)
+ 
+ struct hal_reo_flush_cache {
+ 	struct hal_reo_cmd_hdr cmd;
+@@ -2935,18 +2889,15 @@ struct hal_reo_desc_thresh_reached_statu
+  *		entries into this Ring has looped around the ring.
+  */
+ 
+-#define HAL_TCL_ENTRANCE_FROM_PPE_RING_INFO0_DATA_LENGTH	GENMASK(13, 0)
+-#define HAL_TCL_ENTRANCE_FROM_PPE_RING_INFO0_L4_CSUM_STATUS	BIT(14)
+-#define HAL_TCL_ENTRANCE_FROM_PPE_RING_INFO0_L3_CSUM_STATUS	BIT(15)
+-#define HAL_TCL_ENTRANCE_FROM_PPE_RING_INFO0_PID		GENMASK(27, 24)
+-#define HAL_TCL_ENTRANCE_FROM_PPE_RING_INFO0_QDISC		BIT(28)
+-#define HAL_TCL_ENTRANCE_FROM_PPE_RING_INFO0_MULTICAST	BIT(29)
+-#define HAL_TCL_ENTRANCE_FROM_PPE_RING_INFO0_MORE		BIT(30)
+-#define HAL_TCL_ENTRANCE_FROM_PPE_RING_INFO0_VALID_TOGGLE	BIT(31)
+-
+ struct hal_tcl_entrance_from_ppe_ring {
+ 	__le32 buffer_addr;
+ 	__le32 info0;
++	__le32 opaque_lo;
++	__le32 opaque_hi;
++	__le32 info1;
++	__le32 info2;
++	__le32 info3;
++	__le32 info4;
+ } __packed;
+ 
+ struct hal_mon_buf_ring {
+--- a/drivers/net/wireless/ath/ath12k/hal_rx.c
++++ b/drivers/net/wireless/ath/ath12k/hal_rx.c
+@@ -89,6 +89,9 @@ static int ath12k_hal_reo_cmd_flush_cach
+ 	if (cmd->flag & HAL_REO_CMD_FLG_FLUSH_ALL)
+ 		desc->info0 |= cpu_to_le32(HAL_REO_FLUSH_CACHE_INFO0_FLUSH_ALL);
+ 
++	if (cmd->flag & HAL_REO_CMD_FLG_FLUSH_QUEUE_1K_DESC)
++		desc->info0 |= HAL_REO_FLUSH_CACHE_INFO0_FLUSH_QUEUE_1K_DESC;
++
+ 	return le32_get_bits(desc->cmd.info0, HAL_REO_CMD_HDR_INFO0_CMD_NUMBER);
+ }
+ 

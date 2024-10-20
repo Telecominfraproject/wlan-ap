@@ -1,0 +1,223 @@
+From 98a9ac466997d7b4e81aecc206d860ea5d268a3a Mon Sep 17 00:00:00 2001
+From: Arunpandi Kannan <quic_arunpand@quicinc.com>
+Date: Wed, 18 Oct 2023 10:15:11 +0530
+Subject: [PATCH] wifi: ath12k: Off-channel tx status handling
+
+Receive off-channel tx completion event and process it and
+send the completion status to upper layers. So that based on
+off chan tx completion status applications can take required
+action.
+
+Signed-off-by: Arunpandi Kannan <quic_arunpand@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c |  18 ++++-
+ drivers/net/wireless/ath/ath12k/wmi.c | 108 +++++++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/wmi.h |   7 ++
+ 3 files changed, 125 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 54a6467..b704993 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -8696,11 +8696,13 @@ static int __ath12k_set_antenna(struct ath12k *ar, u32 tx_ant, u32 rx_ant)
+ 
+ static void ath12k_mgmt_over_wmi_tx_drop(struct ath12k *ar, struct sk_buff *skb)
+ {
+-	int num_mgmt;
++	int num_mgmt = 0;
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 
+-	ieee80211_free_txskb(ar->ah->hw, skb);
++	if (!(info->flags & IEEE80211_TX_CTL_TX_OFFCHAN))
++		num_mgmt = atomic_dec_if_positive(&ar->num_pending_mgmt_tx);
+ 
+-	num_mgmt = atomic_dec_if_positive(&ar->num_pending_mgmt_tx);
++	ieee80211_free_txskb(ar->ah->hw, skb);
+ 
+ 	if (num_mgmt < 0)
+         	WARN_ON_ONCE(1);
+@@ -9091,6 +9093,7 @@ static int ath12k_mac_mgmt_tx(struct ath12k *ar, struct sk_buff *skb,
+ 			      bool is_prb_rsp)
+ {
+ 	struct sk_buff_head *q = &ar->wmi_mgmt_tx_queue;
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 
+ 	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, &ar->ab->dev_flags))
+ 		return -ESHUTDOWN;
+@@ -9113,7 +9116,14 @@ static int ath12k_mac_mgmt_tx(struct ath12k *ar, struct sk_buff *skb,
+ 	}
+ 
+ 	skb_queue_tail(q, skb);
+-	atomic_inc(&ar->num_pending_mgmt_tx);
++
++	/* For some of the off chan frames in DPP, host will not receive tx status,
++	 * due to that skipping incrementing pending frames for off channel frames
++	 * only to avoid the leak
++	 */
++	if (!(info->flags & IEEE80211_TX_CTL_TX_OFFCHAN))
++		atomic_inc(&ar->num_pending_mgmt_tx);
++
+ 	queue_work(ar->ab->workqueue_aux, &ar->wmi_mgmt_tx_work);
+ 
+ 	return 0;
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.c b/drivers/net/wireless/ath/ath12k/wmi.c
+index 452c2d9..e859b2a 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -157,10 +157,12 @@ static const struct wmi_tlv_policy wmi_tlv_policies[] = {
+ 		.min_len = sizeof(struct wmi_pdev_update_muedca_event) },
+ 	[WMI_TAG_TWT_ADD_DIALOG_COMPLETE_EVENT] = {
+ 		.min_len = sizeof(struct wmi_twt_add_dialog_event) },
+-	[WMI_TAG_OBSS_COLOR_COLLISION_EVT]
+-		= { .min_len = sizeof(struct wmi_obss_color_collision_event) },
+-	[WMI_TAG_CTRL_PATH_EVENT_FIXED_PARAM]
+-		= { .min_len = sizeof(struct wmi_cp_stats_event_fixed_param) },
++	[WMI_TAG_OBSS_COLOR_COLLISION_EVT] = {
++		.min_len = sizeof(struct wmi_obss_color_collision_event) },
++	[WMI_TAG_CTRL_PATH_EVENT_FIXED_PARAM] = {
++		.min_len = sizeof(struct wmi_cp_stats_event_fixed_param) },
++	[WMI_TAG_OFFCHAN_DATA_TX_COMPL_EVENT] = {
++		.min_len = sizeof(struct wmi_offchan_data_tx_compl_event) },
+ };
+ 
+ static const u32 eml_trans_timeout[EMLCAP_TIMEOUT_MAX] = {
+@@ -7328,6 +7330,68 @@ static int ath12k_pull_mgmt_tx_compl_param_tlv(struct ath12k_base *ab,
+ 	return 0;
+ }
+ 
++static void wmi_process_offchan_tx_comp(struct ath12k *ar, u32 desc_id,
++					u32 status)
++{
++	struct sk_buff *msdu;
++	struct ath12k_skb_cb *skb_cb;
++	struct ieee80211_tx_info *info;
++
++	spin_lock_bh(&ar->data_lock);
++	spin_lock_bh(&ar->txmgmt_idr_lock);
++	msdu = idr_find(&ar->txmgmt_idr, desc_id);
++
++	if (!msdu) {
++		spin_unlock_bh(&ar->txmgmt_idr_lock);
++		spin_unlock_bh(&ar->data_lock);
++		ath12k_warn(ar->ab, "received offchan tx compl for invalid msdu_id: %d\n",
++			    desc_id);
++		return;
++	}
++
++	idr_remove(&ar->txmgmt_idr, desc_id);
++	spin_unlock_bh(&ar->txmgmt_idr_lock);
++
++	skb_cb = ATH12K_SKB_CB(msdu);
++	dma_unmap_single(ar->ab->dev, skb_cb->paddr, msdu->len, DMA_TO_DEVICE);
++
++	spin_unlock_bh(&ar->data_lock);
++
++	info = IEEE80211_SKB_CB(msdu);
++	if (!(info->flags & IEEE80211_TX_CTL_NO_ACK) && !status)
++		info->flags |= IEEE80211_TX_STAT_ACK;
++
++	ieee80211_tx_status_irqsafe(ar->ah->hw, msdu);
++}
++
++static int ath12k_pull_offchan_tx_compl_param_tlv(struct ath12k_base *ab,
++						  struct sk_buff *skb,
++						  struct wmi_offchan_data_tx_compl_event *params)
++{
++	const void **tb;
++	const struct wmi_offchan_data_tx_compl_event *ev;
++	int ret;
++
++	tb = ath12k_wmi_tlv_parse_alloc(ab, skb->data, skb->len, GFP_ATOMIC);
++	if (IS_ERR(tb)) {
++		ret = PTR_ERR(tb);
++		ath12k_warn(ab, "failed to parse tlv: %d\n", ret);
++		return ret;
++	}
++
++	ev = tb[WMI_TAG_OFFCHAN_DATA_TX_COMPL_EVENT];
++	if (!ev) {
++		ath12k_warn(ab, "failed to fetch offchan tx compl ev\n");
++		kfree(tb);
++		return -EPROTO;
++	}
++
++	*params = *ev;
++
++	kfree(tb);
++	return 0;
++}
++
+ static void ath12k_wmi_event_scan_started(struct ath12k *ar)
+ {
+ 	lockdep_assert_held(&ar->data_lock);
+@@ -11234,6 +11298,39 @@ exit:
+ 	rcu_read_unlock();
+ }
+ 
++static void ath12k_offchan_tx_completion_event(struct ath12k_base *ab, struct sk_buff *skb)
++{
++	struct wmi_offchan_data_tx_compl_event offchan_tx_cmpl_params = {0};
++	u32 desc_id;
++	u32 pdev_id;
++	u32 status;
++	struct ath12k *ar;
++
++	if (ath12k_pull_offchan_tx_compl_param_tlv(ab, skb, &offchan_tx_cmpl_params) != 0) {
++		ath12k_warn(ab, "failed to extract mgmt tx compl event");
++		return;
++	}
++	status  = __le32_to_cpu(offchan_tx_cmpl_params.status);
++	pdev_id = __le32_to_cpu(offchan_tx_cmpl_params.pdev_id);
++	desc_id = __le32_to_cpu(offchan_tx_cmpl_params.desc_id);
++
++	rcu_read_lock();
++	ar = ath12k_mac_get_ar_by_pdev_id(ab, pdev_id);
++	if (!ar) {
++		ath12k_warn(ab, "invalid pdev id %d in offchan_tx_compl_event\n",
++			    pdev_id);
++		goto exit;
++	}
++
++	wmi_process_offchan_tx_comp(ar, desc_id, status);
++
++	ath12k_dbg(ab, ATH12K_DBG_MGMT,
++		   "off chan tx compl ev pdev_id %d, desc_id %d, status %d",
++		   pdev_id, desc_id, status);
++exit:
++	rcu_read_unlock();
++}
++
+ static struct ath12k *ath12k_get_ar_on_scan_state(struct ath12k_base *ab,
+ 						  u32 vdev_id,
+ 						  enum ath12k_scan_state state)
+@@ -13923,6 +14020,9 @@ static void ath12k_wmi_tlv_op_rx(struct ath12k_base *ab, struct sk_buff *skb)
+ 	case WMI_SPECTRAL_CAPABILITIES_EVENTID:
+ 		ath12k_wmi_spectral_capabilities_event(ab, skb);
+ 		break;
++	case WMI_OFFCHAN_DATA_TX_COMPLETION_EVENTID:
++		ath12k_offchan_tx_completion_event(ab, skb);
++		break;
+ 	/* add Unsupported events here */
+ 	case WMI_TBTTOFFSET_EXT_UPDATE_EVENTID:
+ 	case WMI_PEER_OPER_MODE_CHANGE_EVENTID:
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.h b/drivers/net/wireless/ath/ath12k/wmi.h
+index 935ef79..81fde2a 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -6453,6 +6453,13 @@ struct wmi_scan_event {
+ 	u32 tsf_timestamp;
+ } __packed;
+ 
++struct wmi_offchan_data_tx_compl_event {
++	__le32 desc_id;
++	__le32 status;
++	__le32 pdev_id;
++	__le32 ppdu_id;
++} __packed;
++
+ struct wmi_peer_sta_kickout_arg {
+ 	const u8 *mac_addr;
+ };
+-- 
+2.17.1
+

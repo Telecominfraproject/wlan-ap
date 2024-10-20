@@ -1,0 +1,225 @@
+From c1489ef11a1e9bcae1c78f5772e993db439883f1 Mon Sep 17 00:00:00 2001
+From: Aaradhana Sahu <quic_aarasahu@quicinc.com>
+Date: Tue, 10 Oct 2023 13:07:04 +0530
+Subject: [PATCH] ath11k: fix coredump collection issue
+
+Currenlty, we are not registering ssr atomic notifier.
+So, we are not able to get fatal notification from rproc driver.
+
+Fix this issue by register ssr atomic notifier.
+
+Signed-off-by: Aaradhana Sahu <quic_aarasahu@quicinc.com>
+---
+ drivers/net/wireless/ath/ath11k/ahb.c  | 13 +++++-
+ drivers/net/wireless/ath/ath11k/core.c | 63 ++++++++++++++++++--------
+ drivers/net/wireless/ath/ath11k/qmi.h  |  2 +
+ 3 files changed, 56 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/ahb.c b/drivers/net/wireless/ath/ath11k/ahb.c
+index 9772cf4..bd81f87 100644
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -734,12 +734,17 @@ static void ath11k_ahb_ssr_notifier_reg(struct ath11k_base *ab)
+ #if LINUX_VERSION_IS_LESS(5, 4, 0)
+ 	qcom_register_ssr_notifier(&ab->qmi.ssr_nb);
+ #else
+-#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+ 	struct ath11k_ahb *ab_ahb = ath11k_ahb_priv(ab);
++#if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0))
+ 	rproc_register_subsys_notifier(ab_ahb->tgt_rproc->name,
+ 				       &ab->qmi.ssr_nb, &ab->qmi.ssr_nb);
+ #else
+-	ab->qmi.ssr_handle = qcom_register_ssr_notifier("q6wcss", &ab->qmi.ssr_nb);
++	ab->qmi.atomic_ssr_handle = qcom_register_ssr_atomic_notifier(ab_ahb->tgt_rproc->name,
++								      &ab->qmi.atomic_ssr_nb);
++	if (!ab->qmi.atomic_ssr_handle)
++		ath11k_err(ab, "failed to register atomic ssr notifier\n");
++
++	ab->qmi.ssr_handle = qcom_register_ssr_notifier(ab_ahb->tgt_rproc->name, &ab->qmi.ssr_nb);
+ #endif
+ #endif
+ }
+@@ -755,6 +760,10 @@ static void ath11k_ahb_ssr_notifier_unreg(struct ath11k_base *ab)
+ 					 &ab->qmi.ssr_nb,
+ 					 &ab->qmi.ssr_nb);
+ #else
++	if (ab->qmi.atomic_ssr_handle)
++		qcom_unregister_ssr_atomic_notifier(ab->qmi.atomic_ssr_handle,
++						    &ab->qmi.atomic_ssr_nb);
++
+ 	if (ab->qmi.ssr_handle)
+ 		qcom_unregister_ssr_notifier(ab->qmi.ssr_handle, &ab->qmi.ssr_nb);
+ #endif
+diff --git a/drivers/net/wireless/ath/ath11k/core.c b/drivers/net/wireless/ath/ath11k/core.c
+index 9eb2b25..02693db 100644
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -18,6 +18,7 @@
+ #include "debug.h"
+ #include "hif.h"
+ #include "wow.h"
++#include "ahb.h"
+ 
+ unsigned int nss_offload;
+ #ifdef CPTCFG_ATH11K_NSS_SUPPORT
+@@ -1869,7 +1870,7 @@ void ath11k_core_dump_bp_stats(struct ath11k_base *ab)
+ 	const int size = 4096;
+ 	char *buf;
+ 
+-	buf = kzalloc(size, GFP_KERNEL);
++	buf = kzalloc(size, GFP_ATOMIC);
+ 	if (!buf)
+ 		return;
+ 
+@@ -1900,11 +1901,30 @@ void ath11k_core_wait_dump_collect(struct ath11k_base *ab)
+ 	return;
+ }
+ 
++static int ath11k_core_ssr_notifier_cb(struct notifier_block *nb,
++                                       const unsigned long event,
++                                       void *data)
++{
++	struct ath11k_qmi *qmi = container_of(nb, struct ath11k_qmi, ssr_nb);
++
++	if (test_bit(ATH11K_FLAG_FW_RESTART_FOR_HOST, &qmi->ab->dev_flags)) {
++                return NOTIFY_DONE;
++        }
++
++	if (ath11k_collect_dump && (event == ATH11K_SSR_POWERUP)) {
++                ath11k_collect_dump = false;
++                wake_up(&ath11k_ssr_dump_wq);
++                return NOTIFY_OK;
++        }
++
++        return NOTIFY_DONE;
++}
++
+ /* Print the driver stats and crash the system on receiving this notification */
+-int ath11k_core_ssr_notifier_cb(struct notifier_block *nb, unsigned long event,
++static int ath11k_core_atomic_ssr_notifier_cb(struct notifier_block *nb, unsigned long event,
+ 				void *data)
+ {
+-	struct ath11k_qmi *qmi = container_of(nb, struct ath11k_qmi, ssr_nb);
++	struct ath11k_qmi *qmi = container_of(nb, struct ath11k_qmi, atomic_ssr_nb);
+ 	struct ath11k_base *ab = qmi->ab;
+ 	struct device *dev = ab->dev;
+ 	bool multi_pd_arch = false;
+@@ -1915,24 +1935,19 @@ int ath11k_core_ssr_notifier_cb(struct notifier_block *nb, unsigned long event,
+ 	struct device_node *rproc_node = NULL;
+ 	struct platform_device *pdev = NULL;
+ 	struct platform_device *ssr_pdev = (struct platform_device *)data;
++	//struct ath11k_ahb *ab_ahb = ath11k_ahb_priv(ab);
+ #endif
+ 	if (test_bit(ATH11K_FLAG_FW_RESTART_FOR_HOST, &qmi->ab->dev_flags)) {
+-		return 0;
++		return NOTIFY_DONE;
+ 	}
+ 
+ #if LINUX_VERSION_IS_GEQ(5,4,0)
+-	if (ath11k_collect_dump && event == ATH11K_SSR_POWERUP) {
+-		ath11k_collect_dump = false;
+-		wake_up(&ath11k_ssr_dump_wq);
+-		return 0;
+-	}
+-
+ 	if (event != ATH11K_SSR_PREPARE_SHUTDOWN)
+-		return 0;
++		return NOTIFY_DONE;
+ 	ath11k_collect_dump = true;
+ #else
+ 	if (!test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags))
+-		return 0;
++		return NOTIFY_DONE;
+ #endif
+ 
+ 	/* Print the stats only if notification is received for expected PD*/
+@@ -1940,28 +1955,28 @@ int ath11k_core_ssr_notifier_cb(struct notifier_block *nb, unsigned long event,
+ 	if (multi_pd_arch) {
+ #if LINUX_VERSION_IS_LESS(5, 4, 0)
+ 		if (of_property_read_string(dev->of_node, "qcom,userpd-subsys-name", &name))
+-			return 0;
++			return NOTIFY_DONE;
+ 
+ 		if (strcmp((char*)data, name) != 0)
+-			return 0;
++			return NOTIFY_DONE;
+ #else
+ 		if (of_property_read_u32(dev->of_node, "qcom,rproc",
+ 					 &rproc_phandle))
+-			return 0;
++			return NOTIFY_DONE;
+ 		rproc_node = of_find_node_by_phandle(rproc_phandle);
+ 		if (!rproc_node) {
+ 			ath11k_warn(ab, "ssr notification failed to get rproc_node\n");
+-			return 0;
++			return NOTIFY_DONE;
+ 		}
+ 		pdev = of_find_device_by_node(rproc_node);
+ 		if (!pdev) {
+ 			ath11k_warn(ab, "Failed to get pdev from device node\n");
+-			return 0;
++			return NOTIFY_DONE;
+ 		}
+ 		if (strcmp(ssr_pdev->name, pdev->name) != 0) {
+ 			ath11k_warn(ab, "SSR notification mismatch %s  pdev name:%s\n",
+ 				    (char *)data, pdev->name);
+-			return 0;
++			return NOTIFY_DONE;
+ 		}
+ #endif
+ 	}
+@@ -1970,13 +1985,15 @@ int ath11k_core_ssr_notifier_cb(struct notifier_block *nb, unsigned long event,
+ 	ath11k_hal_dump_srng_stats(qmi->ab);
+ 	/* TODO Add more driver stats */
+ 
+-	ath11k_qmi_free_target_mem_chunk(qmi->ab);
++	if (!(test_bit(ATH11K_FLAG_UNREGISTERING, &ab->dev_flags))) {
++                queue_work(ab->workqueue_aux, &ab->reset_work);
++        }
+ 
+ 	/* Crash the system once all the stats are dumped */
+ 	if(!qmi->ab->fw_recovery_support)
+ 		BUG_ON(1);
+ 
+-	return 0;
++	return NOTIFY_OK;
+ }
+ #else
+ void ath11k_core_wait_dump_collect(struct ath11k_base *ab)
+@@ -2300,6 +2317,11 @@ static void ath11k_core_reset(struct work_struct *work)
+ 	int reset_count, fail_cont_count;
+ 	long time_left;
+ 
++	if (ab->hif.bus == ATH11K_BUS_AHB && ab->fw_recovery_support) {
++		ath11k_qmi_free_target_mem_chunk(ab);
++		return;
++	}
++
+ 	if (!(test_bit(ATH11K_FLAG_REGISTERED, &ab->dev_flags))) {
+ 		ath11k_warn(ab, "ignore reset dev flags 0x%lx\n", ab->dev_flags);
+ 		return;
+@@ -2423,6 +2445,7 @@ int ath11k_core_init(struct ath11k_base *ab)
+ 	 * to be called on fw crash
+ 	 */
+ 	ab->qmi.ssr_nb.notifier_call = ath11k_core_ssr_notifier_cb;
++	ab->qmi.atomic_ssr_nb.notifier_call = ath11k_core_atomic_ssr_notifier_cb;
+ 	ath11k_hif_ssr_notifier_reg(ab);
+ #endif
+ 
+diff --git a/drivers/net/wireless/ath/ath11k/qmi.h b/drivers/net/wireless/ath/ath11k/qmi.h
+index 2f33eb4..3b520f8 100644
+--- a/drivers/net/wireless/ath/ath11k/qmi.h
++++ b/drivers/net/wireless/ath/ath11k/qmi.h
+@@ -201,7 +201,9 @@ struct ath11k_qmi {
+ 	struct list_head event_list;
+ 	spinlock_t event_lock; /* spinlock for qmi event list */
+ 	struct notifier_block ssr_nb;
++	struct notifier_block atomic_ssr_nb;
+ 	void *ssr_handle;
++	void *atomic_ssr_handle;
+ 	struct ath11k_qmi_ce_cfg ce_cfg;
+ 	struct target_mem_chunk target_mem[ATH11K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01];
+ 	u32 mem_seg_count;
+-- 
+2.17.1
+

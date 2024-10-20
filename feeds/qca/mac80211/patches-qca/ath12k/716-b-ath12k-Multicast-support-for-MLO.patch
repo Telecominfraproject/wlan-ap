@@ -1,0 +1,562 @@
+From a07c45bb1f5a6d9063c146803a6d0fe750d2d2fd Mon Sep 17 00:00:00 2001
+From: Balamurugan Mahalingam <quic_bmahalin@quicinc.com>
+Date: Mon, 27 Feb 2023 02:26:27 -0800
+Subject: [PATCH 2/2] ath12k: Multicast support for MLO
+
+Deliver the Multicast/Broadcast frames on links of an MLD AP
+with a unique sequence number
+
+Signed-off-by: Balamurugan Mahalingam <quic_bmahalin@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h  |   2 +
+ drivers/net/wireless/ath/ath12k/dp.h    |  28 ++++--
+ drivers/net/wireless/ath/ath12k/dp_tx.c |  24 ++++-
+ drivers/net/wireless/ath/ath12k/dp_tx.h |   3 +-
+ drivers/net/wireless/ath/ath12k/mac.c   | 124 ++++++++++++++++++------
+ 5 files changed, 141 insertions(+), 40 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -360,6 +360,8 @@ struct ath12k_vif {
+ 	struct ath12k_mgmt_frame_stats mgmt_stats;
+ 	u8 num_vdev_created;
+ 	u8 num_vdev_started;
++	u16 mcbc_gsn;
++	spinlock_t mcbc_gsn_lock; /* Protect mcbc_gsn */
+ 	struct ath12k_vif_cache cache[IEEE80211_MLD_MAX_NUM_LINKS];
+ 	u8 last_scan_link;
+ #ifdef CPTCFG_ATH12K_DEBUGFS
+@@ -1045,6 +1047,8 @@ struct ath12k_soc_dp_tx_err_stats {
+ 	/* TCL Ring Buffers unavailable */
+ 	u32 txbuf_na[DP_TCL_NUM_RING_MAX];
+ 
++	u32 peers_not_present;
++
+ 	/* Other failures during dp_tx due to mem allocation failure
+ 	 * idr unavailable etc.
+ 	 */
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -381,21 +381,43 @@ struct ath12k_dp {
+ };
+ 
+ /* HTT definitions */
++#define HTT_TAG_TCL_METADATA_VERSION		5
+ 
+-#define HTT_TCL_META_DATA_TYPE			BIT(0)
+-#define HTT_TCL_META_DATA_VALID_HTT		BIT(1)
++#define HTT_TCL_META_DATA_TYPE_FTM		BIT(0)
++#define HTT_TCL_META_DATA_TYPE_MISSION		GENMASK(1, 0)
++
++#define HTT_TCL_META_DATA_VALID_HTT_FTM		BIT(1)
++#define HTT_TCL_META_DATA_VALID_HTT_MISSION     BIT(2)
++
++#define HTT_TCL_META_DATA_VALID_HTT		\
++			(ath12k_ftm_mode ? HTT_TCL_META_DATA_VALID_HTT_FTM : \
++					   HTT_TCL_META_DATA_VALID_HTT_MISSION)
+ 
+ /* vdev meta data */
+-#define HTT_TCL_META_DATA_VDEV_ID		GENMASK(9, 2)
+-#define HTT_TCL_META_DATA_PDEV_ID		GENMASK(11, 10)
+-#define HTT_TCL_META_DATA_HOST_INSPECTED	BIT(12)
++#define HTT_TCL_META_DATA_VDEV_ID_FTM		 GENMASK(9, 2)
++#define HTT_TCL_META_DATA_PDEV_ID_FTM		 GENMASK(11, 10)
++#define HTT_TCL_META_DATA_HOST_INSPECTED_FTM	 BIT(12)
++#define HTT_TCL_META_DATA_VDEV_ID_MISSION	 GENMASK(10, 3)
++#define HTT_TCL_META_DATA_PDEV_ID_MISSION	 GENMASK(12, 11)
++#define HTT_TCL_META_DATA_HOST_INSPECTED_MISSION BIT(13)
+ 
+ /* peer meta data */
+-#define HTT_TCL_META_DATA_PEER_ID		GENMASK(15, 2)
++#define HTT_TCL_META_DATA_PEER_ID_FTM		GENMASK(15, 2)
++#define HTT_TCL_META_DATA_PEER_ID_MISSION	GENMASK(15, 3)
++
++#define HTT_TCL_META_DATA_GET(_val, _mask)      \
++		(ath12k_ftm_mode ? u32_encode_bits(_val, _mask##_FTM) : \
++				   u32_encode_bits(_val, _mask##_MISSION))
+ 
+ #define HTT_TX_WBM_COMP_STATUS_OFFSET 8
+ 
+-/* HTT tx completion is overlaid in wbm_release_ring */
++/* Global sequence number */
++#define HTT_TCL_META_DATA_TYPE_GLOBAL_SEQ_NUM		3
++#define HTT_TCL_META_DATA_GLOBAL_SEQ_HOST_INSPECTED	BIT(2)
++#define HTT_TCL_META_DATA_GLOBAL_SEQ_NUM		GENMASK(14, 3)
++#define HTT_TX_MLO_MCAST_HOST_REINJECT_BASE_VDEV_ID	128
++
++/* HTT tx completion is overlayed in wbm_release_ring v3 version */
+ #define HTT_TX_WBM_COMP_INFO0_STATUS		GENMASK(16, 13)
+ #define HTT_TX_WBM_COMP_INFO1_REINJECT_REASON	GENMASK(3, 0)
+ #define HTT_TX_WBM_COMP_INFO1_EXCEPTION_FRAME	BIT(4)
+@@ -423,9 +445,15 @@ enum htt_h2t_msg_type {
+ };
+ 
+ #define HTT_VER_REQ_INFO_MSG_ID		GENMASK(7, 0)
++#define HTT_OPTION_TCL_METADATA_VER_V2	2
++#define HTT_OPTION_TAG			GENMASK(7, 0)
++#define HTT_OPTION_LEN			GENMASK(15, 8)
++#define HTT_OPTION_VALUE		GENMASK(31, 16)
++#define HTT_TCL_METADATA_VER_SZ		4
+ 
+ struct htt_ver_req_cmd {
+ 	__le32 ver_reg_info;
++	__le32 tcl_metadata_version;
+ } __packed;
+ 
+ enum htt_srng_ring_type {
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -155,7 +155,8 @@ static int ath12k_dp_prepare_htt_metadat
+ }
+ 
+ int ath12k_dp_tx(struct ath12k *ar, struct ath12k_link_vif *arvif,
+-		 struct ath12k_sta *ahsta, struct sk_buff *skb)
++		 struct ath12k_sta *ahsta, struct sk_buff *skb,
++		 bool gsn_valid, int mcbc_gsn)
+ {
+ 	struct ath12k_vif *ahvif = arvif->ahvif;
+ 	struct ath12k_base *ab = ar->ab;
+@@ -226,7 +227,8 @@ tcl_ring_sel:
+ 		ti.meta_data_flags = ahsta->deflink.tcl_metadata;
+ 		ti.flags0 |= FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_TO_FW, 1);
+ 		spin_lock_bh(&ab->base_lock);
+-		peer_id = FIELD_GET(HTT_TCL_META_DATA_PEER_ID, ti.meta_data_flags);
++		peer_id = FIELD_GET(HTT_TCL_META_DATA_PEER_ID_MISSION,
++				    ti.meta_data_flags);
+ 		peer = ath12k_peer_find_by_id(ab, peer_id);
+ 		if (!peer || !peer->sta) {
+ 			spin_unlock_bh(&ab->base_lock);
+@@ -241,13 +243,23 @@ tcl_ring_sel:
+ 		ti.meta_data_flags = arvif->tcl_metadata;
+ 	}
+ 
++	if (gsn_valid) {
++		ti.meta_data_flags = u32_encode_bits(HTT_TCL_META_DATA_TYPE_GLOBAL_SEQ_NUM,
++						     HTT_TCL_META_DATA_TYPE_MISSION) |
++				     u32_encode_bits(mcbc_gsn, HTT_TCL_META_DATA_GLOBAL_SEQ_NUM);
++	}
++
+ 	ti.encap_type = ath12k_dp_tx_get_encap_type(arvif, skb);
+ 	ti.addr_search_flags = arvif->hal_addr_search_flags;
+ 	ti.search_type = arvif->search_type;
+ 	ti.type = HAL_TCL_DESC_TYPE_BUFFER;
+ 	ti.pkt_offset = 0;
+ 	ti.lmac_id = ar->lmac_id;
+-	ti.vdev_id = arvif->vdev_id;
++	if (gsn_valid)
++		ti.vdev_id = arvif->vdev_id +
++			     HTT_TX_MLO_MCAST_HOST_REINJECT_BASE_VDEV_ID;
++	else
++		ti.vdev_id = arvif->vdev_id;
+ 	ti.bss_ast_hash = arvif->ast_hash;
+ 	ti.bss_ast_idx = arvif->ast_idx;
+ 	ti.dscp_tid_tbl_idx = 0;
+@@ -425,7 +437,12 @@ tcl_ring_sel:
+ 
+ 	ath12k_dbg_dump(ab, ATH12K_DBG_DP_TX, NULL, "dp tx msdu: ",
+ 			skb->data, skb->len);
+-	arvif->link_stats.tx_enqueued++;
++
++	if (gsn_valid)
++		arvif->link_stats.tx_bcast_mcast++;
++	else
++		arvif->link_stats.tx_enqueued++;
++
+ 	atomic_inc(&ar->dp.num_tx_pending);
+ 
+ 	return 0;
+@@ -1230,7 +1247,16 @@ int ath12k_dp_tx_htt_h2t_ver_req_msg(str
+ 	skb_put(skb, len);
+ 	cmd = (struct htt_ver_req_cmd *)skb->data;
+ 	cmd->ver_reg_info = le32_encode_bits(HTT_H2T_MSG_TYPE_VERSION_REQ,
+-					     HTT_VER_REQ_INFO_MSG_ID);
++					     HTT_OPTION_TAG);
++
++	if (!ath12k_ftm_mode) {
++		cmd->tcl_metadata_version = u32_encode_bits(HTT_TAG_TCL_METADATA_VERSION,
++							    HTT_OPTION_TAG);
++		cmd->tcl_metadata_version |= u32_encode_bits(HTT_TCL_METADATA_VER_SZ,
++							     HTT_OPTION_LEN);
++		cmd->tcl_metadata_version |= u32_encode_bits(HTT_OPTION_TCL_METADATA_VER_V2,
++							     HTT_OPTION_VALUE);
++	}
+ 
+ 	ret = ath12k_htc_send(&ab->htc, dp->eid, skb);
+ 	if (ret) {
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.h
+@@ -216,7 +216,8 @@ struct htt_tx_msdu_desc_ext {
+ void ath12k_dp_tx_update_txcompl(struct ath12k *ar, struct hal_tx_status *ts);
+ int ath12k_dp_tx_htt_h2t_ver_req_msg(struct ath12k_base *ab);
+ int ath12k_dp_tx(struct ath12k *ar, struct ath12k_link_vif *arvif,
+-		 struct ath12k_sta *ahsta, struct sk_buff *skb);
++		 struct ath12k_sta *ahsta, struct sk_buff *skb,
++		 bool gsn_valid, int mcbc_gsn);
+ void ath12k_dp_tx_completion_handler(struct ath12k_base *ab, int ring_id);
+ 
+ int ath12k_dp_tx_htt_h2t_ppdu_stats_req(struct ath12k *ar, u32 mask);
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -8447,6 +8447,21 @@ static int ath12k_mac_mgmt_tx(struct ath
+ 	return 0;
+ }
+ 
++static void ath12k_mlo_mcast_update_tx_link_address(struct ieee80211_vif *vif,
++						  u8 link, struct sk_buff *skb,
++						  u32 info_flags)
++{
++	struct ieee80211_bss_conf *bss_conf;
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++
++	if (info_flags & IEEE80211_TX_CTL_HW_80211_ENCAP)
++		return;
++
++	bss_conf = rcu_dereference(vif->link_conf[link]);
++	if (bss_conf)
++		ether_addr_copy(hdr->addr2, bss_conf->addr);
++}
++
+ static u8 ath12k_mac_get_tx_link(struct ieee80211_sta *sta, struct ieee80211_vif *vif,
+ 				 u8 link, struct sk_buff *skb, u32 info_flags)
+ {
+@@ -8466,54 +8481,77 @@ static u8 ath12k_mac_get_tx_link(struct
+ 
+ 	ahsta = (struct ath12k_sta *)sta->drv_priv;
+ 
+-	/* use default */
+-	if (!sta->mlo)
+-		return ahsta->deflink.link_id;
++	/* Below translation ensures we pass proper A2 & A3 for non ML clients.
++	 * Also it assumes for now support only for MLO AP in this path
++	 */
++	if (!sta->mlo) {
++		 link = ahsta->deflink.link_id;
++
++		 if (info_flags & IEEE80211_TX_CTL_HW_80211_ENCAP)
++			 return link;
++
++		 bss_conf = rcu_dereference(vif->link_conf[link]);
++		 if (bss_conf) {
++			 ether_addr_copy(hdr->addr2, bss_conf->addr);
++			 if (!ieee80211_has_tods(hdr->frame_control) &&
++			     !ieee80211_has_fromds(hdr->frame_control))
++				 ether_addr_copy(hdr->addr3, bss_conf->addr);
++		}
++		return link;
++	}
+ 
+ 	/* enqueue eth data frames on assoc link */
+ 	if (info_flags & IEEE80211_TX_CTL_HW_80211_ENCAP)
+ 		return ahsta->assoc_link_id;
++	else if (ieee80211_is_data(hdr->frame_control))
++		return ahsta->assoc_link_id;
+ 
+ 	/* 802.11 frame cases */
+ 	if (link == IEEE80211_LINK_UNSPECIFIED)
+ 		link = ahsta->deflink.link_id;
+ 
+-	/* Perform address conversion for ML STA Tx */
+-	bss_conf = rcu_dereference(vif->link_conf[link]);
+-	link_sta = rcu_dereference(sta->link[link]);
+-	if (bss_conf && link_sta) {
+-		ether_addr_copy(hdr->addr1, link_sta->addr);
+-		ether_addr_copy(hdr->addr2, bss_conf->addr);
+-	} else if (bss_conf) {
+-		/* In certain cases where a ML sta associated and added subset of links
+-		 * on which the ML AP is active, but now sends some frame (ex Probe request)
+-		 * on a different link which is active in our MLD but was not added during
+-		 * previous association, we can still honor the Tx to that ML STA via the
+-		 * requested link.
+-		 * The control would reach here in such case only when that link address
+-		 * is same as the MLD address or in worst case clients used MLD address at TA wrongly
+-		 * which would have helped identify the ML sta object and pass it here.
+-		 * If the link address of that STA is different from MLD address, then
+-		 * the sta object would be NULL and control wont reach here but return at the
+-		 * start of the function itself with !sta check. Also this would not need any
+-		 * translation at hdr->addr1 from MLD to link address since the RA is the
+-		 * MLD address (same as that link address ideally) already.
+-		 */
+-		ether_addr_copy(hdr->addr2, bss_conf->addr);
++	if (ieee80211_is_mgmt(hdr->frame_control)) {
++		/* Perform address conversion for ML STA Tx */
++		bss_conf = rcu_dereference(vif->link_conf[link]);
++		link_sta = rcu_dereference(sta->link[link]);
++		if (bss_conf && link_sta) {
++			ether_addr_copy(hdr->addr1, link_sta->addr);
++			ether_addr_copy(hdr->addr2, bss_conf->addr);
++			if (vif->type == NL80211_IFTYPE_STATION && bss_conf->bssid)
++				ether_addr_copy(hdr->addr3, bss_conf->bssid);
++		} else if (bss_conf) {
++			/* In certain cases where a ML sta associated and added subset of links
++			 * on which the ML AP is active, but now sends some frame (ex. Probe request)
++			 * on a different link which is active in our MLD but was not added during
++			 * previous association, we can still honor the Tx to that ML STA via the
++			 * requested link.
++			 * The control would reach here in such case only when that link address
++			 * is same as the MLD address or in worst case clients used MLD address at TA wrongly
++			 * which would have helped identify the ML sta object and pass it here.
++			 * If the link address of that STA is different from MLD address, then
++			 * the sta object would be NULL and control wont reach here but return at the
++			 * start of the function itself with !sta check. Also this would not need any
++			 * translation at hdr->addr1 from MLD to link address since the RA is the
++			 * MLD address (same as that link address ideally) already.
++			 */
++			ether_addr_copy(hdr->addr2, bss_conf->addr);
++			if (vif->type == NL80211_IFTYPE_STATION && bss_conf->bssid)
++				ether_addr_copy(hdr->addr3, bss_conf->bssid);
+ 
+-		ath12k_dbg(NULL, ATH12K_DBG_MAC,
+-			   "unable to determine link sta addr for translation - Frame control %x link %d sta links %x ahsta links %x\n",
+-			   hdr->frame_control, link, sta->valid_links, ahsta->links_map);
+-	} else {
+-		ath12k_err(NULL, "unable to determine Tx link for frame %x link %d\n vif links %x sta links %x ahvif links %x ahsta links %x",
+-			   hdr->frame_control, link, vif->valid_links,
+-			   sta->valid_links, ahvif->links_map, ahsta->links_map);
+-		link = IEEE80211_MLD_MAX_NUM_LINKS;
++
++			ath12k_dbg(NULL, ATH12K_DBG_MAC,
++				   "unable to determine link sta addr for translation - Frame control %x link %d sta links %x ahsta links %x\n",
++				   hdr->frame_control, link, sta->valid_links,
++				   ahsta->links_map);
++		} else {
++			ath12k_err(NULL, "unable to determine Tx link for frame %x link %d\n vif links %x sta links %x ahvif links %x ahsta links %x",
++				   hdr->frame_control, link, vif->valid_links,
++				   sta->valid_links, ahvif->links_map, ahsta->links_map);
++			link = IEEE80211_MLD_MAX_NUM_LINKS;
++		}
+ 	}
+ 
+-	/* todo nwifi/raw data frames */
+ 	return link;
+-
+ }
+ 
+ static void ath12k_mac_op_tx(struct ieee80211_hw *hw,
+@@ -8524,18 +8562,24 @@ static void ath12k_mac_op_tx(struct ieee
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 	struct ieee80211_vif *vif = info->control.vif;
+ 	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
+-	struct ath12k_link_vif *arvif;
+-	struct ath12k *ar;
++	struct ath12k_link_vif *arvif, *tmp_arvif;
++	struct ath12k *ar, *tmp_ar;
+ 	struct ath12k_hw *ah;
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++	struct ethhdr *eth = (struct ethhdr *)skb->data;
+ 	struct ieee80211_key_conf *key = info->control.hw_key;
+ 	struct ath12k_mgmt_frame_stats *mgmt_stats = &ahvif->mgmt_stats;
+ 	struct ath12k_sta *ahsta = NULL;
++	struct sk_buff *msdu_copied;
+ 	struct ath12k_link_sta *arsta = NULL;
+ 	struct ieee80211_sta *sta = control->sta;
++	struct ath12k_peer *peer;
+ 	u32 info_flags = info->flags;
+ 	bool is_prb_rsp;
++	bool is_mcast = false;
+ 	u16 frm_type = 0;
++	u8 link_id;
++	u16 mcbc_gsn;
+ 	int ret;
+ 	u8 link = u32_get_bits(info->control.flags, IEEE80211_TX_CTRL_MLO_LINK);
+ 
+@@ -8582,6 +8626,7 @@ static void ath12k_mac_op_tx(struct ieee
+ 
+ 	if (info_flags & IEEE80211_TX_CTL_HW_80211_ENCAP) {
+ 		skb_cb->flags |= ATH12K_SKB_HW_80211_ENCAP;
++		is_mcast = is_multicast_ether_addr(eth->h_dest);
+ 	} else if (ieee80211_is_mgmt(hdr->frame_control)) {
+ 		frm_type = FIELD_GET(IEEE80211_FCTL_STYPE, hdr->frame_control);
+ 		is_prb_rsp = ieee80211_is_probe_resp(hdr->frame_control);
+@@ -8600,7 +8645,9 @@ static void ath12k_mac_op_tx(struct ieee
+ 			spin_unlock_bh(&ar->data_lock);
+ 		}
+ 		return;
+-	}
++	} else
++		is_mcast = is_multicast_ether_addr(hdr->addr1);
++
+ 	if (sta)
+ 		ahsta = (struct ath12k_sta *)control->sta->drv_priv;
+ 
+@@ -8614,23 +8661,102 @@ static void ath12k_mac_op_tx(struct ieee
+ 	    test_bit(MONITOR_VDEV_CREATED, &ar->monitor_flags))
+ 		skb_cb->flags |= ATH12K_SKB_TX_STATUS;
+ 
+-	ret = ath12k_dp_tx(ar, arvif, ahsta, skb);
+-	if (unlikely(ret)) {
+-		if (ret == -ENOMEM)
+-			ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "failed to transmit frame %d\n",
+-				   ret);
+-		else
+-			ath12k_warn(ar->ab, "failed to transmit frame %d\n",
+-				    ret);
++	if (!vif->valid_links || !is_mcast ||
++	    test_bit(ATH12K_FLAG_RAW_MODE, &ar->ab->ag->dev_flags)) {
++		ret = ath12k_dp_tx(ar, arvif, ahsta, skb, false, 0);
++		if (unlikely(ret)) {
++			if (ret == -ENOMEM)
++				ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
++					   "failed to transmit frame %d\n", ret);
++			else
++				ath12k_warn(ar->ab, "failed to transmit frame %d\n", ret);
++
++			ieee80211_free_txskb(ah->hw, skb);
++		}
++		if (ath12k_debugfs_is_extd_tx_stats_enabled(ar) && ahsta) {
++			arsta = &ahsta->deflink;
++			atomic_inc(&arsta->drv_tx_pkts.pkts_in);
++			if (!ret)
++				atomic_inc(&arsta->drv_tx_pkts.pkts_out);
++		}
++	} else {
++		spin_lock(&ahvif->mcbc_gsn_lock);
++		mcbc_gsn = ahvif->mcbc_gsn++;
++		if (ahvif->mcbc_gsn > 0xFFF)
++			ahvif->mcbc_gsn = 0;
++		spin_unlock(&ahvif->mcbc_gsn_lock);
++
++		for_each_set_bit(link_id, &ahvif->links_map,
++				 IEEE80211_MLD_MAX_NUM_LINKS) {
++			tmp_arvif = ahvif->link[link_id];
++			if (!(tmp_arvif && tmp_arvif->is_up))
++				continue;
++
++			tmp_ar = tmp_arvif->ar;
++			msdu_copied = skb_copy(skb, GFP_ATOMIC);
++			if (!msdu_copied) {
++				ath12k_err(ar->ab,
++					   "skb copy failure link_id 0x%X vdevid 0x%X\n",
++					   link_id, tmp_arvif->vdev_id);
++				continue;
++			}
++
++			ath12k_mlo_mcast_update_tx_link_address(vif, link_id,
++								msdu_copied,
++								info_flags);
++			/* upper layer would not have handled the keys so
++			 * handle it here */
++			skb_cb = ATH12K_SKB_CB(msdu_copied);
++			info = IEEE80211_SKB_CB(msdu_copied);
++			skb_cb->link_id = link_id;
++
++			/* For open mode, skip peer find logic */
++			if (ahvif->key_cipher == INVALID_CIPHER)
++				goto skip_peer_find;
++
++			spin_lock_bh(&tmp_ar->ab->base_lock);
++			peer = ath12k_peer_find_by_addr(tmp_ar->ab, tmp_arvif->addr);
++			if (!peer) {
++				spin_unlock_bh(&tmp_ar->ab->base_lock);
++				ath12k_warn(tmp_ar->ab,
++					    "failed to find peer for vdev_id 0x%X addr %pM link_map 0x%X\n",
++					    tmp_arvif->vdev_id, tmp_arvif->addr,
++					    ahvif->links_map);
++				tmp_ar->ab->soc_stats.tx_err.peers_not_present++;
++				ieee80211_free_txskb(ah->hw, msdu_copied);
++				continue;
++			}
++
++			key = peer->keys[peer->mcast_keyidx];
++			if (key) {
++				skb_cb->cipher = key->cipher;
++				skb_cb->flags |= ATH12K_SKB_CIPHER_SET;
++				info->control.hw_key = key;
++
++				hdr = (struct ieee80211_hdr *)msdu_copied->data;
++				if (!ieee80211_has_protected(hdr->frame_control))
++					hdr->frame_control |=
++						cpu_to_le16(IEEE80211_FCTL_PROTECTED);
++			}
++			spin_unlock_bh(&tmp_ar->ab->base_lock);
++skip_peer_find:
++			ret = ath12k_dp_tx(tmp_ar, tmp_arvif, ahsta,
++					   msdu_copied, true, mcbc_gsn);
++
++			if (unlikely(ret)) {
++				if (ret == -ENOMEM)
++					ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "failed to transmit frame %d\n",
++						   ret);
++				else
++					ath12k_warn(ar->ab, "failed to transmit frame %d\n",
++						    ret);
++
++				ieee80211_free_txskb(ah->hw, msdu_copied);
++			}
++		}
+ 		ieee80211_free_txskb(ah->hw, skb);
+ 	}
+ 
+-	if (ath12k_debugfs_is_extd_tx_stats_enabled(ar) && ahsta) {
+-		arsta = &ahsta->deflink;
+-		atomic_inc(&arsta->drv_tx_pkts.pkts_in);
+-		if (!ret)
+-			atomic_inc(&arsta->drv_tx_pkts.pkts_out);
+-	}
+ }
+ 
+ void ath12k_mac_drain_tx(struct ath12k *ar)
+@@ -9745,6 +9871,7 @@ static int ath12k_mac_op_add_interface(s
+ 
+ 	ahvif->deflink.ahvif = ahvif;
+ 	ahvif->deflink.link_id = 0;
++	ahvif->mcbc_gsn = 0;
+ 	INIT_LIST_HEAD(&ahvif->deflink.list);
+ 	INIT_WORK(&ahvif->deflink.update_obss_color_notify_work,
+ 		  ath12k_update_obss_color_notify_work);
+@@ -14679,6 +14806,8 @@ static int ath12k_mac_hw_register(struct
+ 	if (ag->mlo_capable) {
+ 		ath12k_iftypes_ext_capa[2].eml_capabilities = cap->eml_cap;
+ 		ath12k_iftypes_ext_capa[2].mld_capa_and_ops = cap->mld_cap;
++		if (!test_bit(ATH12K_FLAG_RAW_MODE, &ag->dev_flags))
++			ieee80211_hw_set(hw, MLO_MCAST_MULTI_LINK_TX);
+ 	}
+ 	hw->wiphy->iftype_ext_capab = ath12k_iftypes_ext_capa;
+ 	hw->wiphy->num_iftype_ext_capab = ARRAY_SIZE(ath12k_iftypes_ext_capa);
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -1180,11 +1180,11 @@ void ath12k_dp_vdev_tx_attach(struct ath
+ {
+ 	struct ath12k_base *ab = ar->ab;
+ 
+-	arvif->tcl_metadata |= u32_encode_bits(1, HTT_TCL_META_DATA_TYPE) |
+-			       u32_encode_bits(arvif->vdev_id,
+-					       HTT_TCL_META_DATA_VDEV_ID) |
+-			       u32_encode_bits(ar->pdev->pdev_id,
+-					       HTT_TCL_META_DATA_PDEV_ID);
++	arvif->tcl_metadata |= HTT_TCL_META_DATA_GET(1, HTT_TCL_META_DATA_TYPE) |
++			       HTT_TCL_META_DATA_GET(arvif->vdev_id,
++						     HTT_TCL_META_DATA_VDEV_ID) |
++			       HTT_TCL_META_DATA_GET(ar->pdev->pdev_id,
++						     HTT_TCL_META_DATA_PDEV_ID);
+ 
+ 	/* set HTT extension valid bit to 0 by default */
+ 	arvif->tcl_metadata &= ~HTT_TCL_META_DATA_VALID_HTT;
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -501,9 +501,10 @@ int ath12k_peer_create(struct ath12k *ar
+ 	if (sta) {
+ 		ahsta = (struct ath12k_sta *)sta->drv_priv;
+ 		arsta = ahsta->link[link_id];
+-		arsta->tcl_metadata |= FIELD_PREP(HTT_TCL_META_DATA_TYPE, 0) |
+-				       FIELD_PREP(HTT_TCL_META_DATA_PEER_ID,
+-						  peer->peer_id);
++		arsta->tcl_metadata |= HTT_TCL_META_DATA_GET(0,
++							     HTT_TCL_META_DATA_TYPE) |
++				       HTT_TCL_META_DATA_GET(peer->peer_id,
++				       			     HTT_TCL_META_DATA_PEER_ID);
+ 		peer->link_id = arsta->link_id;
+ 
+ 		/* set HTT extension valid bit to 0 by default */
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -1583,6 +1583,10 @@ static ssize_t ath12k_debugfs_dump_soc_d
+ 			soc_stats->tx_enqueued[3]);
+ 
+ 	len += scnprintf(buf + len, size - len,
++			 "\nTx Peers Not Present: %d\n",
++			 soc_stats->tx_err.peers_not_present);
++
++	len += scnprintf(buf + len, size - len,
+ 			"\ntx_completed: 0:%u 1:%u 2:%u 3:%u\n",
+ 			soc_stats->tx_completed[0],
+ 			soc_stats->tx_completed[1],

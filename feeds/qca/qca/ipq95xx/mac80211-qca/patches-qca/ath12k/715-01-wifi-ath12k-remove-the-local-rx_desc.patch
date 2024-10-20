@@ -1,0 +1,464 @@
+From 89fb0526749002be7e04f43a52f1c5e8fe97ad5c Mon Sep 17 00:00:00 2001
+From: Karthikeyan Periyasamy <quic_periyasa@quicinc.com>
+Date: Fri, 10 Feb 2023 12:22:22 +0530
+Subject: [PATCH 1/4] wifi: ath12k: remove the local rx_desc
+
+Also moved the ppdu handler before mpdu handler.
+Since after undecap we should not access the hal_rx_desc since
+its overwritten by undecap handler.
+Introduce rx information structure to prefetch the information
+from the hal rx descriptor to avoid access the hal rx dscriptor
+access from skb after the undecap handler, since the undecap handler
+overwrite make it invalid data.
+
+Signed-off-by: Karthikeyan Periyasamy <quic_periyasa@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_rx.c | 160 +++++++++++++-----------
+ drivers/net/wireless/ath/ath12k/dp_rx.h |  15 ++-
+ drivers/net/wireless/ath/ath12k/hal.c   |   2 +-
+ 3 files changed, 99 insertions(+), 78 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -235,12 +235,6 @@ static void ath12k_dp_rx_desc_get_crypto
+ 	ab->hw_params->hal_ops->rx_desc_get_crypto_header(desc, crypto_hdr, enctype);
+ }
+ 
+-static u16 ath12k_dp_rxdesc_get_mpdu_frame_ctrl(struct ath12k_base *ab,
+-						struct hal_rx_desc *desc)
+-{
+-	return ab->hw_params->hal_ops->rx_desc_get_mpdu_frame_ctl(desc);
+-}
+-
+ static inline u8 ath12k_dp_rx_h_msdu_end_ip_valid(struct ath12k_base *ab,
+                                                     struct hal_rx_desc *desc)
+ {
+@@ -2449,10 +2443,9 @@ static void ath12k_get_dot11_hdr_from_rx
+ 	struct hal_rx_desc *rx_desc = rxcb->rx_desc;
+ 	struct ath12k_base *ab = ar->ab;
+ 	size_t hdr_len, crypto_len;
+-	struct ieee80211_hdr *hdr;
++	struct ieee80211_hdr hdr;
++	u8 *crypto_hdr, mesh_ctrl;
+ 	u16 qos_ctl;
+-	__le16 fc;
+-	u8 *crypto_hdr;
+ 
+ 	if (!(status->flag & RX_FLAG_IV_STRIPPED)) {
+ 		crypto_len = ath12k_dp_rx_crypto_param_len(ar, enctype);
+@@ -2460,22 +2453,21 @@ static void ath12k_get_dot11_hdr_from_rx
+ 		ath12k_dp_rx_desc_get_crypto_header(ab, rx_desc, crypto_hdr, enctype);
+ 	}
+ 
+-	fc = cpu_to_le16(ath12k_dp_rxdesc_get_mpdu_frame_ctrl(ab, rx_desc));
+-	hdr_len = ieee80211_hdrlen(fc);
+-	skb_push(msdu, hdr_len);
+-	hdr = (struct ieee80211_hdr *)msdu->data;
+-	hdr->frame_control = fc;
+-
+ 	/* Get wifi header from rx_desc */
+-	ath12k_dp_rx_desc_get_dot11_hdr(ab, rx_desc, hdr);
++	ath12k_dp_rx_desc_get_dot11_hdr(ab, rx_desc, &hdr);
++
++	hdr_len = ieee80211_hdrlen(hdr.frame_control);
++	mesh_ctrl = ath12k_dp_rx_h_mesh_ctl_present(ab, rx_desc);
++	skb_push(msdu, hdr_len);
++	memcpy(msdu->data, &hdr, min(hdr_len, sizeof(hdr)));
+ 
+ 	if (rxcb->is_mcbc)
+ 		status->flag &= ~RX_FLAG_PN_VALIDATED;
+ 
+ 	/* Add QOS header */
+-	if (ieee80211_is_data_qos(hdr->frame_control)) {
++	if (ieee80211_is_data_qos(hdr.frame_control)) {
+ 		qos_ctl = rxcb->tid;
+-		if (ath12k_dp_rx_h_mesh_ctl_present(ab, rx_desc))
++		if (mesh_ctrl)
+ 			qos_ctl |= IEEE80211_QOS_CTL_MESH_CONTROL_PRESENT;
+ 
+ 		/* TODO: Add other QoS ctl fields when required */
+@@ -2632,7 +2624,7 @@ static bool ath12k_dp_rx_check_fast_rx(s
+ static void ath12k_dp_rx_h_mpdu(struct ath12k *ar,
+ 				struct sk_buff *msdu,
+ 				struct hal_rx_desc *rx_desc,
+-				struct ieee80211_rx_status *rx_status,
++				struct ath12k_dp_rx_info *rx_info,
+ 				bool *fast_rx)
+ {
+ 	bool  fill_crypto_hdr;
+@@ -2642,6 +2634,7 @@ static void ath12k_dp_rx_h_mpdu(struct a
+ 	bool is_decrypted = false;
+ 	struct ieee80211_hdr *hdr;
+ 	struct ath12k_peer *peer;
++	struct ieee80211_rx_status *rx_status = rx_info->rx_status;
+ 	u32 err_bitmap;
+ #ifdef CPTCFG_MAC80211_PPE_SUPPORT
+ 	u32 vp;
+@@ -2729,8 +2722,7 @@ static void ath12k_dp_rx_h_mpdu(struct a
+ 	if (!is_decrypted || fill_crypto_hdr)
+ 		return;
+ 
+-	if (ath12k_dp_rx_h_decap_type(ar->ab, rx_desc) !=
+-	    DP_RX_DECAP_TYPE_ETHERNET2_DIX) {
++	if (rx_info->decap_type != DP_RX_DECAP_TYPE_ETHERNET2_DIX) {
+ 		hdr = (void *)msdu->data;
+ 		hdr->frame_control &= ~__cpu_to_le16(IEEE80211_FCTL_PROTECTED);
+ 	}
+@@ -2819,10 +2811,19 @@ static void ath12k_dp_rx_h_rate(struct a
+ 	}
+ }
+ 
++static void ath12k_dp_rx_h_fetch_info(struct ath12k_base *ab,
++				      struct hal_rx_desc *rx_desc,
++				      struct ath12k_dp_rx_info *rx_info)
++{
++	rx_info->decap_type = ath12k_dp_rx_h_decap_type(ab, rx_desc);
++	rx_info->filled |= BIT_ULL(ATH12K_RX_INFO_DECAP_TYPE);
++}
++
+ void ath12k_dp_rx_h_ppdu(struct ath12k *ar, struct hal_rx_desc *rx_desc,
+-			 struct ieee80211_rx_status *rx_status)
++			 struct ath12k_dp_rx_info *rx_info)
+ {
+ 	struct ath12k_base *ab = ar->ab;
++	struct ieee80211_rx_status *rx_status = rx_info->rx_status;
+ 	u8 channel_num;
+ 	u32 center_freq, meta_data;
+ 	struct ieee80211_channel *channel;
+@@ -2984,22 +2985,18 @@ static bool ath12k_dp_rx_check_max_nwifi
+ 						struct hal_rx_desc *rx_desc,
+ 						struct sk_buff *msdu)
+ {
+-	u8 decap_type;
+ 	struct ieee80211_hdr *hdr;
+ 	u32 hdr_len;
+ 
+-	decap_type = ath12k_dp_rx_h_decap_type(ab, rx_desc);
+-	if (decap_type == DP_RX_DECAP_TYPE_NATIVE_WIFI) {
+-		hdr = (struct ieee80211_hdr *)msdu->data;
+-		hdr_len = ieee80211_hdrlen(hdr->frame_control);
+-		if (unlikely(hdr_len > DP_MAX_NWIFI_HDR_LEN)) {
+-			ab->soc_stats.invalid_rbm++;
+-			ath12k_dbg_dump(ab, ATH12K_DBG_DATA, NULL, "msdu_data",
+-					msdu->data, msdu->len);
+-			ath12k_dbg_dump(ab, ATH12K_DBG_DATA, NULL, "rx_desc",
+-					rx_desc, sizeof(*rx_desc));
+-			return true;
+-		}
++	hdr = (struct ieee80211_hdr *)msdu->data;
++	hdr_len = ieee80211_hdrlen(hdr->frame_control);
++	if (unlikely(hdr_len > DP_MAX_NWIFI_HDR_LEN)) {
++		ab->soc_stats.invalid_rbm++;
++		ath12k_dbg_dump(ab, ATH12K_DBG_DATA, NULL, "msdu_data",
++				msdu->data, msdu->len);
++		ath12k_dbg_dump(ab, ATH12K_DBG_DATA, NULL, "rx_desc",
++				rx_desc, sizeof(*rx_desc));
++		return true;
+ 	}
+ 
+ 	return false;
+@@ -3008,12 +3005,11 @@ static bool ath12k_dp_rx_check_max_nwifi
+ static int ath12k_dp_rx_process_msdu(struct ath12k *ar,
+ 				     struct sk_buff *msdu,
+ 				     struct sk_buff_head *msdu_list,
+-				     struct ieee80211_rx_status *rx_status,
+-				     struct hal_rx_desc *rx_desc,
++				     struct ath12k_dp_rx_info *rx_info,
+ 				     bool *fast_rx)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+-	struct hal_rx_desc *lrx_desc;
++	struct hal_rx_desc *rx_desc, *lrx_desc;
+ 	struct ath12k_skb_rxcb *rxcb;
+ 	struct sk_buff *last_buf;
+ 	u8 l3_pad_bytes;
+@@ -3029,12 +3025,7 @@ static int ath12k_dp_rx_process_msdu(str
+ 		goto free_out;
+ 	}
+ 
+-	/*
+-	 * Store the hal_rx_desc into a local structure,
+-	 * further skb_push's will modify the headroom(rx_desc) in
+-	 * undecap
+-	 */
+-	*rx_desc = *(struct hal_rx_desc *)msdu->data;
++	rx_desc = (struct hal_rx_desc *)msdu->data;
+ 	lrx_desc = (struct hal_rx_desc *)last_buf->data;
+ 	if (!ath12k_dp_rx_h_msdu_done(ab, lrx_desc)) {
+ 		ath12k_warn(ab, "msdu_done bit in msdu_end is not set\n");
+@@ -3070,18 +3061,21 @@ static int ath12k_dp_rx_process_msdu(str
+ 		}
+ 	}
+ 
+-	if (ath12k_dp_rx_check_max_nwifi_hdr_len(ab, rx_desc, msdu)) {
++	ath12k_dp_rx_h_fetch_info(ab, rx_desc, rx_info);
++
++	if (rx_info->decap_type == DP_RX_DECAP_TYPE_NATIVE_WIFI &&
++	    ath12k_dp_rx_check_max_nwifi_hdr_len(ab, rx_desc, msdu)) {
+ 		ret = -EINVAL;
+ 		goto free_out;
+ 	}
+ 
+-	ath12k_dp_rx_h_mpdu(ar, msdu, rx_desc, rx_status, fast_rx);
++	ath12k_dp_rx_h_mpdu(ar, msdu, rx_desc, rx_info, fast_rx);
+ 	if (*fast_rx)
+ 		return 0;
+ 
+-	ath12k_dp_rx_h_ppdu(ar, rx_desc, rx_status);
++	ath12k_dp_rx_h_ppdu(ar, rx_desc, rx_info);
+ 
+-	rx_status->flag |= RX_FLAG_SKIP_MONITOR | RX_FLAG_DUP_VALIDATED;
++	rx_info->rx_status->flag |= RX_FLAG_SKIP_MONITOR | RX_FLAG_DUP_VALIDATED;
+ 
+ 	return 0;
+ 
+@@ -3096,6 +3090,7 @@ static void ath12k_dp_rx_process_receive
+ {
+ 	struct ieee80211_rx_status rx_status = {0};
+ 	struct ath12k_skb_rxcb *rxcb;
++	struct ath12k_dp_rx_info rx_info;
+ 	struct sk_buff *msdu;
+ 	struct ath12k *ar;
+ 	u8 mac_id, hw_link_id;
+@@ -3105,11 +3100,12 @@ static void ath12k_dp_rx_process_receive
+ 	if (skb_queue_empty(msdu_list))
+ 		return;
+ 
++	rx_info.filled = 0;
++	rx_info.rx_status = &rx_status;
++
+ 	rcu_read_lock();
+ 
+ 	while ((msdu = __skb_dequeue(msdu_list))) {
+-		struct hal_rx_desc rx_desc = {0};
+-
+ 		rxcb = ATH12K_SKB_RXCB(msdu);
+ 		/* Enable fast rx by default, the value will cahnge based on peer cap
+                 * and packet type */
+@@ -3141,8 +3137,8 @@ static void ath12k_dp_rx_process_receive
+ 			continue;
+ 		}
+ 
+-		ret = ath12k_dp_rx_process_msdu(ar, msdu, msdu_list, &rx_status,
+-				&rx_desc, &fast_rx);
++		ret = ath12k_dp_rx_process_msdu(ar, msdu, msdu_list, &rx_info,
++						&fast_rx);
+ 		if (ret) {
+ 			ath12k_dbg(ab, ATH12K_DBG_DATA,
+ 				   "Unable to process %s chip_id %d msdu %d",
+@@ -3451,6 +3447,7 @@ static int ath12k_dp_rx_h_verify_tkip_mi
+ 	struct ieee80211_key_conf *key_conf;
+ 	struct ieee80211_hdr *hdr;
+ 	u8 mic[IEEE80211_CCMP_MIC_LEN];
++	struct ath12k_dp_rx_info rx_info;
+ 	int head_len, tail_len, ret;
+ 	size_t data_len;
+ 	u32 hdr_len, hal_rx_desc_sz = ar->ab->hw_params->hal_desc_sz;
+@@ -3460,6 +3457,9 @@ static int ath12k_dp_rx_h_verify_tkip_mi
+ 	if (ath12k_dp_rx_h_enctype(ab, rx_desc) != HAL_ENCRYPT_TYPE_TKIP_MIC)
+ 		return 0;
+ 
++	rx_info.filled = 0;
++	rx_info.rx_status = &rxs;
++
+ 	hdr = (struct ieee80211_hdr *)(msdu->data + hal_rx_desc_sz);
+ 	hdr_len = ieee80211_hdrlen(hdr->frame_control);
+ 	head_len = hdr_len + hal_rx_desc_sz + IEEE80211_TKIP_IV_LEN;
+@@ -3490,7 +3490,7 @@ mic_fail:
+ 		    RX_FLAG_IV_STRIPPED | RX_FLAG_DECRYPTED;
+ 	skb_pull(msdu, hal_rx_desc_sz);
+ 
+-	ath12k_dp_rx_h_ppdu(ar, rx_desc, rxs);
++	ath12k_dp_rx_h_ppdu(ar, rx_desc, &rx_info);
+ 	ath12k_dp_rx_h_undecap(ar, msdu, rx_desc,
+ 			       HAL_ENCRYPT_TYPE_TKIP_MIC, rxs, true);
+ 	ieee80211_rx(ar->ah->hw, msdu);
+@@ -4155,7 +4155,7 @@ static void ath12k_dp_rx_null_q_desc_sg_
+ }
+ 
+ static int ath12k_dp_rx_h_null_q_desc(struct ath12k *ar, struct sk_buff *msdu,
+-				      struct ieee80211_rx_status *status,
++				      struct ath12k_dp_rx_info *rx_info,
+ 				      struct sk_buff_head *msdu_list)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+@@ -4221,12 +4221,16 @@ static int ath12k_dp_rx_h_null_q_desc(st
+ 		skb_put(msdu, hal_rx_desc_sz + l3pad_bytes + msdu_len);
+ 		skb_pull(msdu, hal_rx_desc_sz + l3pad_bytes);
+ 	}
+-	if (ath12k_dp_rx_check_max_nwifi_hdr_len(ab, desc, msdu))
++
++	ath12k_dp_rx_h_fetch_info(ab, desc, rx_info);
++
++	if (rx_info->decap_type == DP_RX_DECAP_TYPE_NATIVE_WIFI &&
++	    ath12k_dp_rx_check_max_nwifi_hdr_len(ab, desc, msdu))
+ 		return -EINVAL;
+ 
+-	ath12k_dp_rx_h_ppdu(ar, desc, status);
++	ath12k_dp_rx_h_ppdu(ar, desc, rx_info);
+ 	fast_rx = false;
+-	ath12k_dp_rx_h_mpdu(ar, msdu, desc, status, &fast_rx);
++	ath12k_dp_rx_h_mpdu(ar, msdu, desc, rx_info, &fast_rx);
+ 
+ 	rxcb->tid = ath12k_dp_rx_h_tid(ab, desc);
+ 
+@@ -4250,7 +4254,7 @@ static int ath12k_dp_rx_h_null_q_desc(st
+ }
+ 
+ static bool ath12k_dp_rx_h_reo_err(struct ath12k *ar, struct sk_buff *msdu,
+-				   struct ieee80211_rx_status *status,
++				   struct ath12k_dp_rx_info *rx_info,
+ 				   struct sk_buff_head *msdu_list)
+ {
+ 	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
+@@ -4258,7 +4262,7 @@ static bool ath12k_dp_rx_h_reo_err(struc
+ 
+ 	switch (rxcb->err_code) {
+ 	case HAL_REO_DEST_RING_ERROR_CODE_DESC_ADDR_ZERO:
+-		if (ath12k_dp_rx_h_null_q_desc(ar, msdu, status, msdu_list))
++		if (ath12k_dp_rx_h_null_q_desc(ar, msdu, rx_info, msdu_list))
+ 			drop = true;
+ 		break;
+ 	case HAL_REO_DEST_RING_ERROR_CODE_PN_CHECK_FAILED:
+@@ -4284,7 +4288,7 @@ static bool ath12k_dp_rx_h_reo_err(struc
+ }
+ 
+ static bool ath12k_dp_rx_h_tkip_mic_err(struct ath12k *ar, struct sk_buff *msdu,
+-					struct ieee80211_rx_status *status)
++					struct ath12k_dp_rx_info *rx_info)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+ 	u16 msdu_len;
+@@ -4309,18 +4313,19 @@ static bool ath12k_dp_rx_h_tkip_mic_err(
+ 	skb_put(msdu, hal_rx_desc_sz + l3pad_bytes + msdu_len);
+ 	skb_pull(msdu, hal_rx_desc_sz + l3pad_bytes);
+ 
+-	ath12k_dp_rx_h_ppdu(ar, desc, status);
++	ath12k_dp_rx_h_ppdu(ar, desc, rx_info);
+ 
+-	status->flag |= (RX_FLAG_MMIC_STRIPPED | RX_FLAG_MMIC_ERROR |
+-			 RX_FLAG_DECRYPTED);
++	rx_info->rx_status->flag |= (RX_FLAG_MMIC_STRIPPED | RX_FLAG_MMIC_ERROR |
++				     RX_FLAG_DECRYPTED);
+ 
+ 	ath12k_dp_rx_h_undecap(ar, msdu, desc,
+-			       HAL_ENCRYPT_TYPE_TKIP_MIC, status, false);
++			       HAL_ENCRYPT_TYPE_TKIP_MIC, rx_info->rx_status, false);
+ 	return false;
+ }
+ 
+-static bool ath12k_dp_rx_h_4addr_null_frame_handler(struct ath12k *ar,  struct sk_buff *msdu,
+-						    struct ieee80211_rx_status *status)
++static bool ath12k_dp_rx_h_4addr_null_frame_handler(struct ath12k *ar,
++						    struct sk_buff *msdu,
++						    struct ath12k_dp_rx_info *rx_info)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+ 	u16 msdu_len, peer_id;
+@@ -4353,12 +4358,13 @@ static bool ath12k_dp_rx_h_4addr_null_fr
+ 	skb_put(msdu, hal_rx_desc_sz + l3pad_bytes + msdu_len);
+ 	skb_pull(msdu, hal_rx_desc_sz + l3pad_bytes);
+ 
+-	if (ath12k_dp_rx_check_max_nwifi_hdr_len(ab, rx_desc, msdu))
++	if (rx_info->decap_type == DP_RX_DECAP_TYPE_NATIVE_WIFI &&
++	    ath12k_dp_rx_check_max_nwifi_hdr_len(ab, rx_desc, msdu))
+ 		return true;
+ 
+-	ath12k_dp_rx_h_ppdu(ar, rx_desc, status);
++	ath12k_dp_rx_h_ppdu(ar, rx_desc, rx_info);
+ 
+-	ath12k_dp_rx_h_mpdu(ar, msdu, rx_desc, status, &fast_rx);
++	ath12k_dp_rx_h_mpdu(ar, msdu, rx_desc, rx_info, &fast_rx);
+ 
+ 	rxcb->tid = ath12k_dp_rx_h_tid(ab, rx_desc);
+ 
+@@ -4373,7 +4379,7 @@ static bool ath12k_dp_rx_h_4addr_null_fr
+ 	return drop;
+ }
+ static bool ath12k_dp_rx_h_rxdma_err(struct ath12k *ar,  struct sk_buff *msdu,
+-				     struct ieee80211_rx_status *status)
++				     struct ath12k_dp_rx_info *rx_info)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
+@@ -4383,13 +4389,15 @@ static bool ath12k_dp_rx_h_rxdma_err(str
+ 
+ 	switch (rxcb->err_code) {
+ 	case HAL_REO_ENTR_RING_RXDMA_ECODE_UNAUTH_WDS_ERR:
+-		drop = ath12k_dp_rx_h_4addr_null_frame_handler(ar, msdu, status);
++		ath12k_dp_rx_h_fetch_info(ab, rx_desc, rx_info);
++
++		drop = ath12k_dp_rx_h_4addr_null_frame_handler(ar, msdu, rx_info);
+ 		break;
+ 	case HAL_REO_ENTR_RING_RXDMA_ECODE_DECRYPT_ERR:
+ 	case HAL_REO_ENTR_RING_RXDMA_ECODE_TKIP_MIC_ERR:
+ 		err_bitmap = ath12k_dp_rx_h_mpdu_err(ab, rx_desc);
+ 		if (err_bitmap & HAL_RX_MPDU_ERR_TKIP_MIC) {
+-			drop = ath12k_dp_rx_h_tkip_mic_err(ar, msdu, status);
++			drop = ath12k_dp_rx_h_tkip_mic_err(ar, msdu, rx_info);
+ 			break;
+ 		}
+ 		fallthrough;
+@@ -4416,14 +4424,18 @@ static void ath12k_dp_rx_wbm_err(struct
+ {
+ 	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
+ 	struct ieee80211_rx_status rxs = {0};
++	struct ath12k_dp_rx_info rx_info;
+ 	bool drop = true;
+ 
++	rx_info.filled = 0;
++	rx_info.rx_status = &rxs;
++
+ 	switch (rxcb->err_rel_src) {
+ 	case HAL_WBM_REL_SRC_MODULE_REO:
+-		drop = ath12k_dp_rx_h_reo_err(ar, msdu, &rxs, msdu_list);
++		drop = ath12k_dp_rx_h_reo_err(ar, msdu, &rx_info, msdu_list);
+ 		break;
+ 	case HAL_WBM_REL_SRC_MODULE_RXDMA:
+-		drop = ath12k_dp_rx_h_rxdma_err(ar, msdu, &rxs);
++		drop = ath12k_dp_rx_h_rxdma_err(ar, msdu, &rx_info);
+ 		break;
+ 	default:
+ 		/* msdu will get freed */
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -66,6 +66,19 @@ struct ath12k_dp_rx_rfc1042_hdr {
+ 	__be16 snap_type;
+ } __packed;
+ 
++enum ath12k_dp_rx_info_type {
++	ATH12K_RX_INFO_DECAP_TYPE,
++
++	/* keep last */
++	ATH12K_RX_INFO_MAX
++};
++
++struct ath12k_dp_rx_info {
++	u64 filled;
++	u8 decap_type;
++	struct ieee80211_rx_status *rx_status;
++};
++
+ static inline u32 ath12k_he_gi_to_nl80211_he_gi(u8 sgi)
+ {
+ 	u32 ret = 0;
+@@ -139,7 +152,7 @@ u8 ath12k_dp_rx_h_decap_type(struct ath1
+ u32 ath12k_dp_rx_h_mpdu_err(struct ath12k_base *ab,
+ 			    struct hal_rx_desc *desc);
+ void ath12k_dp_rx_h_ppdu(struct ath12k *ar, struct hal_rx_desc *rx_desc,
+-			 struct ieee80211_rx_status *rx_status);
++			 struct ath12k_dp_rx_info *rx_info);
+ struct ath12k_peer *
+ ath12k_dp_rx_h_find_peer(struct ath12k_base *ab, struct sk_buff *msdu);
+ 
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -463,7 +463,7 @@ static void ath12k_hw_qcn9274_rx_desc_ge
+ 	ether_addr_copy(hdr->addr2, desc->u.qcn9274.mpdu_start.addr2);
+ 	ether_addr_copy(hdr->addr3, desc->u.qcn9274.mpdu_start.addr3);
+ 	if (__le32_to_cpu(desc->u.qcn9274.mpdu_start.info4) &
+-			RX_MPDU_START_INFO4_MAC_ADDR4_VALID) {
++			  RX_MPDU_START_INFO4_MAC_ADDR4_VALID) {
+ 		ether_addr_copy(hdr->addr4, desc->u.qcn9274.mpdu_start.addr4);
+ 	}
+ 	hdr->seq_ctrl = desc->u.qcn9274.mpdu_start.seq_ctrl;

@@ -1,0 +1,158 @@
+From 869495108cdcfba908a123cadb6b9976b1b78064 Mon Sep 17 00:00:00 2001
+From: Aaradhana Sahu <quic_aarasahu@quicinc.com>
+Date: Wed, 15 Mar 2023 13:13:11 +0530
+Subject: [PATCH] ath12k: add support avg signal in station dump
+
+Currently, avg signal attribute "NL80211_STA_INFO_SIGNAL_AVG"
+is not filling when RSS(Receive side scaling) is enabled from
+the driver, so average signal isn't printed in the station dump.
+
+Fix this issue, by calculating the average signal from RSSI and
+appropriate bandwidth offset within driver and display in the
+station dump.
+
+Tag: FIX_ATH11K_TO_ATH12K
+
+Signed-off-by: Thiraviyam Mariyappan <quic_tmariyap@quicinc.com>
+Signed-off-by: Sowmiya Sree Elavalagan <quic_ssreeela@quicinc.com>
+Signed-off-by: Aaradhana Sahu <quic_aarasahu@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h   |  6 ++++++
+ drivers/net/wireless/ath/ath12k/dp_mon.c |  4 ++++
+ drivers/net/wireless/ath/ath12k/mac.c    | 12 ++++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.c    |  9 +++++++--
+ 4 files changed, 29 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -11,6 +11,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/irq.h>
+ #include <linux/bitfield.h>
++#include <linux/average.h>
+ #include "qmi.h"
+ #include "htc.h"
+ #include "wmi.h"
+@@ -521,6 +522,8 @@ struct ath12k_per_ppdu_tx_stats {
+ 	u32 retry_bytes;
+ };
+ 
++DECLARE_EWMA(avg_rssi, 10, 8)
++
+ struct ath12k_wbm_tx_stats {
+ 	u64 wbm_tx_comp_stats[HAL_WBM_REL_HTT_TX_COMP_STATUS_MAX];
+ };
+@@ -554,6 +557,8 @@ struct ath12k_link_sta {
+ 	u64 rx_duration;
+ 	u64 tx_duration;
+ 	u8 rssi_comb;
++	struct ewma_avg_rssi avg_rssi;
++
+ 	struct ath12k_htt_tx_stats *tx_stats;
+ 	struct ath12k_rx_peer_stats *rx_stats;
+ 	struct ath12k_driver_tx_pkts_flow drv_tx_pkts;
+@@ -564,6 +569,7 @@ struct ath12k_link_sta {
+ 	u16 tcl_metadata;
+ 	u8 link_id; /* IEEE link id */
+ 	u8 link_idx; /* for fw use only */
++	u32 last_tx_pkt_bw;
+ 
+ 	/* For now the assoc link will be considered primary */
+ 	bool is_assoc_link;
+@@ -791,6 +797,7 @@ struct ath12k {
+ 	u32 txpower_scale;
+ 	u32 power_scale;
+ 	u32 chan_tx_pwr;
++	s32 chan_noise_floor;
+ 	u32 num_stations;
+ 	u32 max_num_stations;
+ 	bool monitor_present;
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -3332,11 +3332,15 @@ static void ath12k_dp_mon_rx_update_peer
+ {
+ 	struct ath12k_rx_peer_stats *rx_stats = arsta->rx_stats;
+ 	u32 num_msdu;
++	u32 bw_offset;
+ 
+ 	if (!rx_stats)
+ 		return;
+ 
++	arsta->last_tx_pkt_bw = ppdu_info->bw;
++	bw_offset = arsta->last_tx_pkt_bw * 3;
+ 	arsta->rssi_comb = ppdu_info->rssi_comb;
++	ewma_avg_rssi_add(&arsta->avg_rssi, ppdu_info->rssi_comb + bw_offset);
+ 
+ 	if (!ath12k_debugfs_is_extd_rx_stats_enabled(ar))
+ 		return;
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -6753,6 +6753,7 @@ static int ath12k_mac_station_add(struct
+ 	INIT_WORK(&arsta->update_wk, ath12k_sta_rc_update_wk);
+ 
+ 	ahsta->ahvif = ahvif;
++	ewma_avg_rssi_init(&arsta->avg_rssi);
+ 	return 0;
+ 
+ free_tx_stats:
+@@ -13702,6 +13703,16 @@ static void ath12k_mac_op_sta_statistics
+ 	/* TODO: Use real NF instead of default one. */
+ 	sinfo->signal = arsta->rssi_comb + ATH12K_DEFAULT_NOISE_FLOOR;
+ 	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL);
++
++	if (ar->chan_noise_floor) {
++		sinfo->signal_avg = ewma_avg_rssi_read(&arsta->avg_rssi) +
++				    ar->chan_noise_floor;
++	} else {
++		sinfo->signal_avg = ewma_avg_rssi_read(&arsta->avg_rssi) +
++				    ATH12K_DEFAULT_NOISE_FLOOR;
++	}
++
++	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL_AVG);
+ }
+ 
+ int ath12k_mac_btcoex_config(struct ath12k *ar, struct ath12k_link_vif *arvif,
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -7595,9 +7595,11 @@ static int ath12k_pull_peer_assoc_conf_e
+ }
+ 
+ static void ath12k_wmi_pull_pdev_stats_base(const struct wmi_pdev_stats_base *src,
+-					    struct ath12k_fw_stats_pdev *dst)
++					    struct ath12k_fw_stats_pdev *dst,
++					    struct ath12k *ar)
+ {
+ 	dst->ch_noise_floor = src->chan_nf;
++	ar->chan_noise_floor = src->chan_nf;
+ 	dst->tx_frame_count = src->tx_frame_count;
+ 	dst->rx_frame_count = src->rx_frame_count;
+ 	dst->rx_clear_count = src->rx_clear_count;
+@@ -7702,6 +7704,7 @@ int ath12k_wmi_pull_fw_stats(struct ath1
+ 	const struct wmi_stats_event *ev;
+ 	const void *data;
+ 	int i, ret;
++	struct ath12k *ar;
+ 	u32 len = skb->len;
+ 
+ 	tb = ath12k_wmi_tlv_parse_alloc(ab, skb->data, len, GFP_ATOMIC);
+@@ -7728,6 +7731,11 @@ int ath12k_wmi_pull_fw_stats(struct ath1
+ 	stats->pdev_id = le32_to_cpu(ev->pdev_id);
+ 	stats->stats_id = 0;
+ 
++	ar = ath12k_mac_get_ar_by_pdev_id(ab, ev->pdev_id);
++
++	if (!ar)
++		return -EPROTO;
++
+ 	for (i = 0; i < le32_to_cpu(ev->num_pdev_stats); i++) {
+ 		const struct wmi_pdev_stats *src;
+ 		struct ath12k_fw_stats_pdev *dst;
+@@ -7747,7 +7755,7 @@ int ath12k_wmi_pull_fw_stats(struct ath1
+ 		if (!dst)
+ 			continue;
+ 
+-		ath12k_wmi_pull_pdev_stats_base(&src->base, dst);
++		ath12k_wmi_pull_pdev_stats_base(&src->base, dst, ar);
+ 		ath12k_wmi_pull_pdev_stats_tx(&src->tx, dst);
+ 		ath12k_wmi_pull_pdev_stats_rx(&src->rx, dst);
+ 		list_add_tail(&dst->list, &stats->pdevs);

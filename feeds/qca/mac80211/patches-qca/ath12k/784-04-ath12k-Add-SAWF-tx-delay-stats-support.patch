@@ -1,0 +1,1192 @@
+From 97c64777f2c00b4967660a18afdfd7e43bda6ed2 Mon Sep 17 00:00:00 2001
+From: Tamizh Chelvam Raja <quic_tamizhr@quicinc.com>
+Date: Wed, 7 Jun 2023 11:14:57 +0530
+Subject: [PATCH] ath12k: Add SAWF tx delay stats support
+
+Signed-off-by: Tamizh Chelvam Raja <quic_tamizhr@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h        |   5 +
+ drivers/net/wireless/ath/ath12k/debugfs_sta.c | 317 ++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/dp.c          |   5 +
+ drivers/net/wireless/ath/ath12k/dp.h          |   1 +
+ drivers/net/wireless/ath/ath12k/dp_rx.c       |   2 +
+ drivers/net/wireless/ath/ath12k/dp_tx.c       |  17 +-
+ drivers/net/wireless/ath/ath12k/hal.c         |  42 +++
+ drivers/net/wireless/ath/ath12k/hal.h         |  25 ++
+ drivers/net/wireless/ath/ath12k/hal_tx.h      |   2 +
+ drivers/net/wireless/ath/ath12k/sawf.c        | 122 ++++++-
+ drivers/net/wireless/ath/ath12k/sawf.h        |  25 +-
+ include/net/mac80211.h                        |   4 +
+ net/mac80211/tx.c                             |   1 +
+ 13 files changed, 563 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -611,6 +611,7 @@ struct ath12k_link_sta {
+ 
+ 	/* For check disable fixed rate check for peer */
+ 	bool disable_fixed_rate;
++	u8 sawf_svc_id;
+ };
+ 
+ struct ath12k_sta {
+@@ -964,6 +965,9 @@ struct ath12k {
+ 	struct completion mvr_complete;
+ 	struct cfg80211_chan_def agile_chandef;
+ 	struct ath12k_mgmt_rx_reo_pdev_info rx_reo_pdev_ctx;
++
++	u64 delta_tsf2;
++	u64 delta_tqm;
+ };
+ 
+ struct ath12k_hw {
+@@ -1054,6 +1058,11 @@ struct ath12k_pdev {
+ 	struct mlo_timestamp timestamp;
+ };
+ 
++struct pmm_remap {
++	u32 base;
++	u32 size;
++};
++
+ struct cmem_remap {
+ 	u32 base;
+ 	u32 size;
+@@ -1185,6 +1194,7 @@ struct ath12k_hw_group {
+ 	struct ath12k_mgmt_rx_reo_context rx_reo;
+ 	struct ath12k_host_mlo_mem_arena mlomem_arena;
+ 	atomic_t num_dp_tx_pending;
++	u64 mlo_tstamp_offset;
+ };
+ 
+ /* Master structure to hold the hw data which may be used in core module */
+@@ -1209,10 +1219,13 @@ struct ath12k_base {
+ 	void __iomem *mem;
+ 	void __iomem *mem_ce;
+ 	void __iomem *mem_cmem;
++	void __iomem *mem_pmm;
+ 	u32 ce_remap_base_addr;
+ 	u32 cmem_remap_base_addr;
++	u32 pmm_remap_base_addr;
+ 	bool ce_remap;
+ 	bool cmem_remap;
++	bool pmm_remap;
+ 	unsigned long mem_len;
+ 
+ 	struct {
+--- a/drivers/net/wireless/ath/ath12k/debugfs_sta.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs_sta.c
+@@ -1506,6 +1506,363 @@ static const struct file_operations fops
+ 	.llseek = default_llseek,
+ };
+ 
++#ifdef CPTCFG_ATH12K_SAWF
++static int ath12k_fill_sawf_tx_delay_stats(struct ath12k_base *ab, struct ath12k_peer *peer,
++					   char *buf, int len, int size,
++					   u8 q_id, u8 tid)
++{
++	struct ath12k_sawf_stats *sawf_stats;
++	struct sawf_tx_delay_stats *tx_delay_stats;
++
++	lockdep_assert_held(&ab->base_lock);
++
++	sawf_stats = &peer->sawf_stats;
++	if (!sawf_stats)
++		return 0;
++
++	tx_delay_stats = &sawf_stats->tx_delay_stats[tid][q_id];
++
++	len += scnprintf(buf + len, size - len, "Delay Bins\n");
++	len += scnprintf(buf + len, size - len, "Min %u\n", tx_delay_stats->delay_hist.min);
++	len += scnprintf(buf + len, size - len, "Max %u\n", tx_delay_stats->delay_hist.max);
++	len += scnprintf(buf + len, size - len, "Avg %u\n", tx_delay_stats->delay_hist.avg);
++	len += scnprintf(buf + len, size - len, "NWDelay moving avg %u\n", tx_delay_stats->nwdelay_avg);
++	len += scnprintf(buf + len, size - len, "SWDelay moving avg %u\n", tx_delay_stats->swdelay_avg);
++	len += scnprintf(buf + len, size - len, "HWDelay moving avg %u\n", tx_delay_stats->hwdelay_avg);
++	len += scnprintf(buf + len, size - len, "Delay Bound Success %llu\n", tx_delay_stats->success);
++	len += scnprintf(buf + len, size - len, "Delay Bound Failure %llu\n", tx_delay_stats->failure);
++
++	return len;
++}
++
++static ssize_t ath12k_dbg_sta_dump_sawf_tx_delay_stats(struct file *file,
++						       char __user *user_buf,
++						       size_t count, loff_t *ppos)
++{
++
++	struct ieee80211_link_sta *link_sta = file->private_data;
++	struct ieee80211_sta *sta = link_sta->sta;
++	struct ath12k_sta *ahsta = (struct ath12k_sta *)sta->drv_priv;
++	struct ath12k_sawf_peer_ctx *peer_ctx = NULL;
++	const int size = 2 * ATH12K_SAWF_STATS_SIZE;
++	struct ath12k_hw *ah = ahsta->ahvif->ah;
++	struct ath12k_sawf_ctx *sawf_ctx;
++	u8 q_id, tid, max_usr_def_q_sawf;
++	u8 link_id = link_sta->link_id;
++	struct ath12k_link_sta *arsta;
++	struct ath12k_peer *peer;
++	struct ath12k *ar;
++	int len = 0;
++	char *buf;
++
++	mutex_lock(&ah->conf_mutex);
++
++	if (!(BIT(link_id) & ahsta->links_map)) {
++		mutex_unlock(&ah->conf_mutex);
++		return -ENOENT;
++	}
++
++	arsta = ahsta->link[link_id];
++
++	if (!arsta || !arsta->arvif->ar) {
++		mutex_unlock(&ah->conf_mutex);
++		return -ENOENT;
++	}
++
++	ar = arsta->arvif->ar;
++	buf = kzalloc(size, GFP_KERNEL);
++	if (!buf) {
++		mutex_unlock(&ah->conf_mutex);
++		return -ENOMEM;
++	}
++
++	mutex_lock(&ar->conf_mutex);
++	spin_lock_bh(&ar->ab->base_lock);
++
++	peer = ath12k_peer_find(ar->ab, arsta->arvif->vdev_id, arsta->addr);
++	if (!peer) {
++		ath12k_warn(ar->ab, "mac sta rc update failed to find peer %pM on vdev %i\n",
++			   arsta->addr, arsta->arvif->vdev_id);
++		spin_unlock_bh(&ar->ab->base_lock);
++		len = -ENOENT;
++		goto unlock;
++	}
++
++	peer_ctx = &peer->sawf_ctx_peer;
++
++	sawf_ctx = ath12k_get_sawf_context();
++	if (!sawf_ctx || !peer_ctx) {
++		spin_unlock_bh(&ar->ab->base_lock);
++		len = -EINVAL;
++		goto unlock;
++	}
++
++	max_usr_def_q_sawf = sawf_ctx->max_msduq_per_tid -
++					sawf_ctx->default_msduq_per_tid;
++
++	if (!arsta->sawf_svc_id)
++		goto dump_stats;
++
++	for (tid = 0; tid < ATH12K_SAWF_MAX_TID_SUPPORT; tid++) {
++		for (q_id = 0; q_id < max_usr_def_q_sawf; q_id++) {
++			if (arsta->sawf_svc_id == peer_ctx->msduq_table[tid][q_id].svc_id) {
++				len = ath12k_fill_sawf_tx_delay_stats(ar->ab, peer, buf, len, size, q_id, tid);
++				goto exit;
++			}
++		}
++	}
++
++dump_stats:
++	for (tid = 0; tid < ATH12K_SAWF_MAX_TID_SUPPORT; tid++) {
++		for (q_id = 0; q_id < max_usr_def_q_sawf; q_id++)
++			len = ath12k_fill_sawf_tx_delay_stats(ar->ab, peer, buf, len, size, q_id, tid);
++	}
++
++exit:
++	spin_unlock_bh(&ar->ab->base_lock);
++	if (len > size)
++		len = size;
++	if (len)
++		len = simple_read_from_buffer(user_buf, count, ppos, buf, len);
++unlock:
++	mutex_unlock(&ar->conf_mutex);
++	mutex_unlock(&ah->conf_mutex);
++	kfree(buf);
++	return len;
++}
++
++static const struct file_operations fops_sawf_tx_delay_stats = {
++	.read = ath12k_dbg_sta_dump_sawf_tx_delay_stats,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static int ath12k_fill_sawf_tx_stats(struct ath12k_base *ab, struct ath12k_peer *peer,
++				     char *buf, int len, int size,
++				     u8 q_id, u8 tid)
++{
++	struct sawf_fw_mpdu_stats *svc_intval_stats;
++	struct sawf_fw_mpdu_stats *burst_size_stats;
++	struct ath12k_sawf_stats *sawf_stats;
++	struct sawf_tx_stats *tx_stats;
++
++	lockdep_assert_held(&ab->base_lock);
++
++	sawf_stats = &peer->sawf_stats;
++	if (!sawf_stats)
++		return 0;
++
++	tx_stats = &sawf_stats->tx_stats[tid][q_id];
++
++	svc_intval_stats = &sawf_stats->tx_stats[tid][q_id].svc_intval_stats;
++
++	burst_size_stats = &sawf_stats->tx_stats[tid][q_id].burst_size_stats;
++
++	len += scnprintf(buf + len, size - len, "tx_succ_pkts: %u\n",
++			 tx_stats->tx_success.num_pkts);
++	len += scnprintf(buf + len, size - len, "tx_succ_bytes: %llu\n",
++			 tx_stats->tx_success.bytes);
++	len += scnprintf(buf + len, size - len, "tx_ingress_pkts: %u\n",
++			 tx_stats->tx_ingress.num_pkts);
++	len += scnprintf(buf + len, size - len, "tx_ingress_bytes: %llu\n",
++			 tx_stats->tx_ingress.bytes);
++	len += scnprintf(buf + len, size - len, "tx_remove_mpdu_pkts: %u\n",
++			 tx_stats->dropped.fw_rem.num_pkts);
++	len += scnprintf(buf + len, size - len, "tx_remove_mpdu_bytes: %llu\n",
++			 tx_stats->dropped.fw_rem.bytes);
++	len += scnprintf(buf + len, size - len, "tx_remove_tx_pkts: %u\n",
++			 tx_stats->dropped.fw_rem_tx);
++	len += scnprintf(buf + len, size - len, "tx_remove_notx_pkts: %u\n",
++			 tx_stats->dropped.fw_rem_notx);
++	len += scnprintf(buf + len, size - len, "tx_remove_aged_pkts: %u\n",
++			 tx_stats->dropped.age_out);
++	len += scnprintf(buf + len, size - len, "tx_remove_fw_reason1: %u\n",
++			 tx_stats->dropped.fw_reason1);
++	len += scnprintf(buf + len, size - len, "tx_remove_fw_reason2: %u\n",
++			 tx_stats->dropped.fw_reason2);
++	len += scnprintf(buf + len, size - len, "tx_remove_fw_reason3: %u\n",
++			 tx_stats->dropped.fw_reason3);
++	len += scnprintf(buf + len, size - len, "tx_failed: %u\n",
++			 tx_stats->tx_failed);
++	len += scnprintf(buf + len, size - len, "queue_depth: %u\n",
++			 tx_stats->queue_depth);
++
++	if (svc_intval_stats) {
++		len += scnprintf(buf + len, size - len, "Service intvl success_cnt : %llu\n",
++				 svc_intval_stats->success_cnt);
++		len += scnprintf(buf + len, size - len, "Service intvl failure_cnt : %llu\n",
++				 svc_intval_stats->failure_cnt);
++	}
++
++	if (burst_size_stats) {
++		len += scnprintf(buf + len, size - len, "Burst Size success_cnt : %llu\n",
++				 burst_size_stats->success_cnt);
++		len += scnprintf(buf + len, size - len, "Burst Size failure_cnt : %llu\n",
++				 burst_size_stats->failure_cnt);
++	}
++
++	return len;
++}
++
++static ssize_t ath12k_dbg_sta_dump_sawf_tx_stats(struct file *file,
++						 char __user *user_buf,
++						 size_t count, loff_t *ppos)
++{
++
++	struct ieee80211_link_sta *link_sta = file->private_data;
++	struct ieee80211_sta *sta = link_sta->sta;
++	struct ath12k_sta *ahsta = (struct ath12k_sta *)sta->drv_priv;
++	struct ath12k_sawf_peer_ctx *peer_ctx = NULL;
++	const int size = 2 * ATH12K_SAWF_STATS_SIZE;
++	struct ath12k_hw *ah = ahsta->ahvif->ah;
++	struct ath12k_sawf_ctx *sawf_ctx;
++	u8 q_id, tid, max_usr_def_q_sawf;
++	u8 link_id = link_sta->link_id;
++	struct ath12k_link_sta *arsta;
++	struct ath12k_peer *peer;
++	struct ath12k *ar;
++	int len = 0;
++	char *buf;
++
++	mutex_lock(&ah->conf_mutex);
++
++	if (!(BIT(link_id) & ahsta->links_map)) {
++		mutex_unlock(&ah->conf_mutex);
++		return -ENOENT;
++	}
++
++	arsta = ahsta->link[link_id];
++
++	if (!arsta || !arsta->arvif->ar) {
++		mutex_unlock(&ah->conf_mutex);
++		return -ENOENT;
++	}
++
++	ar = arsta->arvif->ar;
++	buf = kzalloc(size, GFP_KERNEL);
++	if (!buf) {
++		mutex_unlock(&ah->conf_mutex);
++		return -ENOMEM;
++	}
++
++	mutex_lock(&ar->conf_mutex);
++	spin_lock_bh(&ar->ab->base_lock);
++
++	peer = ath12k_peer_find(ar->ab, arsta->arvif->vdev_id, arsta->addr);
++	if (!peer) {
++		ath12k_warn(ar->ab, "mac sta rc update failed to find peer %pM on vdev %i\n",
++			   arsta->addr, arsta->arvif->vdev_id);
++		spin_unlock_bh(&ar->ab->base_lock);
++		len = -ENOENT;
++		goto unlock;
++	}
++
++	peer_ctx = &peer->sawf_ctx_peer;
++
++	sawf_ctx = ath12k_get_sawf_context();
++	if (!sawf_ctx || !peer_ctx) {
++		spin_unlock_bh(&ar->ab->base_lock);
++		len = -EINVAL;
++		goto unlock;
++	}
++
++	max_usr_def_q_sawf = sawf_ctx->max_msduq_per_tid -
++					sawf_ctx->default_msduq_per_tid;
++
++	if (!arsta->sawf_svc_id)
++		goto dump_stats;
++
++	for (tid = 0; tid < ATH12K_SAWF_MAX_TID_SUPPORT; tid++) {
++		for (q_id = 0; q_id < max_usr_def_q_sawf; q_id++) {
++			if (arsta->sawf_svc_id == peer_ctx->msduq_table[tid][q_id].svc_id) {
++				len = ath12k_fill_sawf_tx_stats(ar->ab, peer, buf, len, size, q_id, tid);
++				goto exit;
++			}
++		}
++	}
++
++dump_stats:
++	for (tid = 0; tid < ATH12K_SAWF_MAX_TID_SUPPORT; tid++) {
++		for (q_id = 0; q_id < max_usr_def_q_sawf; q_id++)
++			len = ath12k_fill_sawf_tx_stats(ar->ab, peer, buf, len, size, q_id, tid);
++	}
++
++exit:
++	spin_unlock_bh(&ar->ab->base_lock);
++	if (len > size)
++		len = size;
++	if (len)
++		len = simple_read_from_buffer(user_buf, count, ppos, buf, len);
++
++unlock:
++	mutex_unlock(&ar->conf_mutex);
++	mutex_unlock(&ah->conf_mutex);
++	kfree(buf);
++	return len;
++}
++
++static const struct file_operations fops_sawf_tx_stats = {
++	.read = ath12k_dbg_sta_dump_sawf_tx_stats,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static ssize_t ath12k_dbg_sta_set_svc_id(struct file *file,
++					 const char __user *buf,
++					 size_t count, loff_t *ppos)
++{
++	struct ieee80211_link_sta *link_sta = file->private_data;
++	struct ieee80211_sta *sta = link_sta->sta;
++	struct ath12k_sta *ahsta = (struct ath12k_sta *)sta->drv_priv;
++	struct ath12k_hw *ah = ahsta->ahvif->ah;
++	u8 link_id = link_sta->link_id;
++	struct ath12k_link_sta *arsta;
++	struct ath12k *ar;
++	int ret, svc_id;
++
++	ret = kstrtoint_from_user(buf, count, 0, &svc_id);
++	if (ret)
++		return ret;
++
++	if (svc_id && (svc_id <  ATH12K_SAWF_SVC_CLASS_MIN ||
++	    svc_id > ATH12K_SAWF_SVC_CLASS_MAX))
++	    	return -EINVAL;
++
++	mutex_lock(&ah->conf_mutex);
++
++	if (!(BIT(link_id) & ahsta->links_map)) {
++		mutex_unlock(&ah->conf_mutex);
++		return -ENOENT;
++	}
++
++	arsta = ahsta->link[link_id];
++
++	if (!arsta || !arsta->arvif->ar) {
++		mutex_unlock(&ah->conf_mutex);
++		return -ENOENT;
++	}
++
++	ar = arsta->arvif->ar;
++
++	spin_lock_bh(&ar->ab->base_lock);
++	arsta->sawf_svc_id = svc_id;
++	spin_unlock_bh(&ar->ab->base_lock);
++	mutex_unlock(&ah->conf_mutex);
++
++	ret = count;
++	return ret;
++}
++
++static const struct file_operations fops_svc_id = {
++	.write = ath12k_dbg_sta_set_svc_id,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++#endif /* CPTCFG_ATH12K_SAWF */
++
+ void ath12k_debugfs_sta_op_add(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			       struct ieee80211_sta *sta, struct dentry *dir)
+ {
+@@ -1558,5 +1915,15 @@ void ath12k_debugfs_link_sta_op_add(stru
+ 		debugfs_create_file("htt_peer_stats_reset", 0600, dir, link_sta,
+ 				    &fops_htt_peer_stats_reset);
+ 
++#ifdef CPTCFG_ATH12K_SAWF
++	if (ath12k_debugfs_is_sawf_stats_enabled(ar)) {
++		debugfs_create_file("svc_id", 0400, dir, link_sta,
++				    &fops_svc_id);
++		debugfs_create_file("sawf_tx_stats", 0400, dir, link_sta,
++				    &fops_sawf_tx_stats);
++		debugfs_create_file("sawf_tx_delay_stats", 0400, dir, link_sta,
++				    &fops_sawf_tx_delay_stats);
++	}
++#endif
+ 	mutex_unlock(&ah->conf_mutex);
+ }
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -325,6 +325,7 @@ struct ath12k_tx_desc_info {
+ 	u8 mac_id;
+ 	u8 pool_id;
+ 	u8 recycler_fast_xmit;
++	ktime_t timestamp;
+ };
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -1894,9 +1894,11 @@ static void ath12k_htt_mlo_offset_event_
+ 						struct sk_buff *skb)
+ {
+ 	struct ath12k_htt_mlo_offset_msg *msg;
++	struct ath12k_hw_group *ag = ab->ag;
+ 	struct ath12k_pdev *pdev;
+ 	struct ath12k *ar;
+ 	u8 pdev_id;
++	int i, j;
+ 
+ 	msg = (struct ath12k_htt_mlo_offset_msg *)skb->data;
+ 	pdev_id = u32_get_bits(__le32_to_cpu(msg->info),
+@@ -1918,6 +1920,29 @@ static void ath12k_htt_mlo_offset_event_
+ 	pdev->timestamp.mlo_comp_clks = __le32_to_cpu(msg->mlo_comp_clks);
+ 	pdev->timestamp.mlo_comp_timer = __le32_to_cpu(msg->mlo_comp_timer);
+ 
++	ag->mlo_tstamp_offset =  ((u64)pdev->timestamp.mlo_offset_hi << 32 | pdev->timestamp.mlo_offset_lo);
++
++	/* MLO TSAMP OFFSET is common for all chips and
++	 * fetch delta_tsf2 for all the radios for this event
++	 */
++	for (i = 0; i < ag->num_chip; i++) {
++		struct ath12k_base *tmp_ab = ag->ab[i];
++
++		for (j = 0; j < tmp_ab->num_radios; j++) {
++			struct ath12k *tmp_ar;
++
++			pdev = &tmp_ab->pdevs[j];
++			tmp_ar = pdev->ar;
++			if (!tmp_ar)
++				continue;
++
++			if (tmp_ab->hw_params->hal_ops->hal_get_tsf2_scratch_reg)
++				tmp_ab->hw_params->hal_ops->hal_get_tsf2_scratch_reg(tmp_ab, tmp_ar->lmac_id,
++										     &tmp_ar->delta_tsf2);
++		}
++	}
++
++
+ 	spin_unlock_bh(&ar->data_lock);
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -275,10 +275,11 @@ int ath12k_dp_tx_direct(struct ath12k_li
+ 	void *hal_tcl_desc;
+ 	struct hal_tcl_data_cmd tcl_desc;
+ 	u8 hal_ring_id, ring_id;
+-	dma_addr_t paddr;
+ #ifdef CPTCFG_ATH12K_SAWF
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 	struct ath12k_peer *peer;
+ #endif
++	dma_addr_t paddr;
+ 	int ret;
+ 	int len = skb->fast_xmit ? 256 : skb->len;
+ 
+@@ -308,6 +309,7 @@ int ath12k_dp_tx_direct(struct ath12k_li
+ 	tx_desc->skb = skb;
+ 	tx_desc->mac_id = arvif->pdev_idx;
+ 	tx_desc->recycler_fast_xmit = 0;
++	tx_desc->timestamp = ktime_get_real();
+ 
+ 	/* the edma driver uses this flags to optimize the cache invalidation */
+ 	skb->fast_recycled = 1;
+@@ -374,6 +376,12 @@ int ath12k_dp_tx_direct(struct ath12k_li
+ 				ath12k_sawf_tx_enqueue_peer_stats(ab, peer, msduq_id, len);
+ 			spin_unlock_bh(&ab->base_lock);
+ 		}
++		/* Store the NWDELAY to skb->mark which can be fetched
++		 * during tx completion
++		 */
++		if (info->sawf.nw_delay > SAWF_NW_DELAY_MAX)
++			info->sawf.nw_delay = SAWF_NW_DELAY_MAX;
++		skb->mark = (SAWF_VALID_TAG << SAWF_TAG_SHIFT) | (info->sawf.nw_delay << SAWF_NW_DELAY_SHIFT) | msduq_id;
+ 	}
+ #endif
+ 	memcpy(hal_tcl_desc, &tcl_desc, sizeof(tcl_desc));
+@@ -407,6 +415,9 @@ int ath12k_dp_tx(struct ath12k *ar, stru
+ 	struct ath12k_peer *peer;
+ 	struct hal_tx_info ti = {0};
+ 	struct ath12k_tx_desc_info *tx_desc;
++#ifdef CPTCFG_ATH12K_SAWF
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++#endif
+ 	struct ath12k_skb_cb *skb_cb = ATH12K_SKB_CB(skb);
+ 	struct hal_tcl_data_cmd *hal_tcl_desc;
+ 	struct hal_tx_msdu_ext_desc *msg;
+@@ -585,6 +596,7 @@ int ath12k_dp_tx(struct ath12k *ar, stru
+ 	tx_desc->skb = skb;
+ 	tx_desc->mac_id = ar->pdev_idx;
+ 	tx_desc->recycler_fast_xmit = 0;
++	tx_desc->timestamp = ktime_get_real();
+ 	ti.desc_id = tx_desc->desc_id;
+ 	ti.data_len = skb->len - ti.pkt_offset;
+ 	skb_cb->pkt_offset = ti.pkt_offset;
+@@ -678,6 +690,12 @@ int ath12k_dp_tx(struct ath12k *ar, stru
+ 				ath12k_sawf_tx_enqueue_peer_stats(ab, peer, msduq_id, ti.data_len);
+ 			spin_unlock_bh(&ab->base_lock);
+ 		}
++		/* Store the NWDELAY to skb->mark which can be fetched
++		 * during tx completion
++		 */
++		if (info->sawf.nw_delay > SAWF_NW_DELAY_MAX)
++			info->sawf.nw_delay = SAWF_NW_DELAY_MAX;
++		skb->mark = (SAWF_VALID_TAG << SAWF_TAG_SHIFT) | (info->sawf.nw_delay << SAWF_NW_DELAY_SHIFT) | msduq_id;
+ 	}
+ #endif /* CPTCFG_ATH12K_SAWF */
+ 
+@@ -781,6 +799,9 @@ static inline void ath12k_dp_tx_status_p
+ 	ts->peer_id = FIELD_GET(HAL_WBM_RELEASE_TX_INFO3_PEER_ID, desc->info3);
+ 	ts->flags = FIELD_GET(HAL_WBM_RELEASE_TX_INFO2_FIRST_MSDU, desc->info2) |
+ 		    FIELD_GET(HAL_WBM_RELEASE_TX_INFO2_LAST_MSDU, desc->info2);
++	ts->buffer_timestamp = FIELD_GET(HAL_WBM_RELEASE_TX_INFO2_BUFFER_TIMESTAMP,
++					 desc->info2);
++	ts->tsf = desc->rate_stats.tsf;
+ }
+ 
+ static void
+@@ -789,7 +810,7 @@ ath12k_dp_tx_htt_tx_complete_buf(struct
+ 				 struct dp_tx_ring *tx_ring,
+ 				 struct ath12k_dp_htt_wbm_tx_status *ts,
+ 				 struct sk_buff *skb_ext_desc, u8 mac_id,
+-				 void *desc)
++				 void *desc, ktime_t timestamp)
+ {
+ 	struct ieee80211_tx_info *info;
+ 	struct ath12k_skb_cb *skb_cb;
+@@ -896,7 +917,7 @@ ath12k_dp_tx_htt_tx_complete_buf(struct
+ 				   "dp_tx: failed to find the peer with peer_id %d\n",
+ 				   ts_status.peer_id);
+ 		else
+-			ath12k_sawf_stats_update(ar, msdu, &ts, peer);
++			ath12k_sawf_stats_update(ar, msdu, &ts, peer, timestamp);
+ 		spin_unlock_bh(&ab->base_lock);
+ 	}
+ 
+@@ -911,7 +932,8 @@ ath12k_dp_tx_process_htt_tx_complete(str
+ 				     void *desc, u8 mac_id,
+ 				     struct sk_buff *msdu,
+ 				     struct dp_tx_ring *tx_ring,
+-				     struct sk_buff *skb_ext_desc)
++				     struct sk_buff *skb_ext_desc,
++				     ktime_t timestamp)
+ {
+ 	struct htt_tx_wbm_completion *status_desc;
+ 	struct ath12k_dp_htt_wbm_tx_status ts = {0};
+@@ -931,7 +953,7 @@ ath12k_dp_tx_process_htt_tx_complete(str
+ 		ts.acked = (htt_status == HAL_WBM_REL_HTT_TX_COMP_STATUS_OK);
+ 		ts.ack_rssi = le32_get_bits(status_desc->info2,
+ 					    HTT_TX_WBM_COMP_INFO2_ACK_RSSI);
+-		ath12k_dp_tx_htt_tx_complete_buf(ab, msdu, tx_ring, &ts, skb_ext_desc, mac_id, desc);
++		ath12k_dp_tx_htt_tx_complete_buf(ab, msdu, tx_ring, &ts, skb_ext_desc, mac_id, desc, timestamp);
+ 
+ 		break;
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_REINJ:
+@@ -1082,7 +1104,7 @@ static void ath12k_dp_tx_complete_msdu(s
+ 				       struct sk_buff *msdu,
+ 				       struct hal_wbm_release_ring *tx_status,
+ 				       enum hal_wbm_rel_src_module buf_rel_source,
+-				       int ring)
++				       int ring, ktime_t timestamp)
+ {
+ 	struct ieee80211_tx_status status = { 0 };
+ 	struct ieee80211_rate_status status_rate = { 0 };
+@@ -1168,7 +1190,7 @@ static void ath12k_dp_tx_complete_msdu(s
+ 						   "dp_tx: failed to find the peer with peer_id %d\n",
+ 						   ts.peer_id);
+ 				else
+-					ath12k_sawf_stats_update(ar, msdu, &ts, peer);
++					ath12k_sawf_stats_update(ar, msdu, &ts, peer, timestamp);
+ 				spin_unlock_bh(&ab->base_lock);
+ 			}
+ 			dev_kfree_skb_any(msdu);
+@@ -1242,7 +1264,7 @@ static void ath12k_dp_tx_complete_msdu(s
+ 	}
+ 
+ 	if (unlikely(ath12k_debugfs_is_sawf_stats_enabled(ar)))
+-		ath12k_sawf_stats_update(ar, msdu, &ts, peer);
++		ath12k_sawf_stats_update(ar, msdu, &ts, peer, timestamp);
+ 
+ 	spin_unlock_bh(&ab->base_lock);
+ 
+@@ -1475,6 +1497,7 @@ int ath12k_dp_tx_completion_handler(stru
+ 	int valid_entries;
+ 	int orig_budget = budget;
+ 	struct hal_wbm_completion_ring_tx *tx_status;
++	ktime_t timestamp;
+	enum hal_wbm_rel_src_module buf_rel_source;
+ 	enum hal_wbm_tqm_rel_reason rel_status;
+ 	struct sk_buff_head free_list_head;
+@@ -1520,6 +1543,7 @@ int ath12k_dp_tx_completion_handler(stru
+ 		mac_id = tx_desc->mac_id;
+ 		recycler_fast_xmit = tx_desc->recycler_fast_xmit;
+ 		skb_ext_desc = tx_desc->skb_ext_desc;
++		timestamp = tx_desc->timestamp;
+ 		/* Release descriptor as soon as extracting necessary info
+ 		 * to reduce contention
+ 		 */
+@@ -1537,7 +1561,8 @@ int ath12k_dp_tx_completion_handler(stru
+ 							     (void *)tx_status,
+ 							     mac_id, msdu,
+ 							     tx_ring,
+-							     skb_ext_desc);
++							     skb_ext_desc,
++							     timestamp);
+ 			continue;
+ 		}
+ 		ar = ab->pdevs[mac_id].ar;
+@@ -1593,7 +1618,7 @@ int ath12k_dp_tx_completion_handler(stru
+ 
+ 			ath12k_dp_tx_complete_msdu(ar, msdu, tx_status,
+ 						   buf_rel_source,
+-						   tx_ring->tcl_data_ring_id);
++						   tx_ring->tcl_data_ring_id, timestamp);
+ 		}
+ 	}
+ 	ath12k_hal_srng_access_umac_dst_ring_end_nolock(status_ring);
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -557,6 +557,56 @@ static u8 ath12k_hw_qcn9274_rx_desc_get_
+ 			     RX_MSDU_END_64_TLV_SRC_LINK_ID);
+ }
+ 
++#define PMM_REG_OFFSET	4
++
++static void ath12k_hal_get_tsf_reg(u8 mac_id, enum hal_scratch_reg_enum *tsf_enum_low,
++				  enum hal_scratch_reg_enum *tsf_enum_hi)
++{
++	if (!mac_id) {
++		*tsf_enum_low = PMM_MAC0_TSF2_OFFSET_LO_US;
++		*tsf_enum_hi = PMM_MAC0_TSF2_OFFSET_HI_US;
++	} else if (mac_id == 1) {
++		*tsf_enum_low = PMM_MAC1_TSF2_OFFSET_LO_US;
++		*tsf_enum_hi = PMM_MAC1_TSF2_OFFSET_HI_US;
++	}
++}
++
++static void ath12k_hal_qcn9274_get_tsf2_scratch_reg(struct ath12k_base *ab,
++						    u8 mac_id, u64 *value)
++{
++	enum hal_scratch_reg_enum enum_lo, enum_hi;
++	u32 offset_lo, offset_hi;
++
++	ath12k_hal_get_tsf_reg(mac_id, &enum_lo, &enum_hi);
++
++	if (ab->hif.ops->pmm_read32) {
++		offset_lo = ath12k_hif_pmm_read32(ab, ATH12K_PPT_ADDR_OFFSET(enum_lo));
++		offset_hi = ath12k_hif_pmm_read32(ab, ATH12K_PPT_ADDR_OFFSET(enum_hi));
++	} else {
++		offset_lo = ath12k_hif_read32(ab, PMM_REG_BASE_QCN9224 + ATH12K_PPT_ADDR_OFFSET(enum_lo));
++		offset_hi = ath12k_hif_read32(ab, PMM_REG_BASE_QCN9224 + ATH12K_PPT_ADDR_OFFSET(enum_hi));
++	}
++
++	*value = ((u64)(offset_hi) << 32 | offset_lo);
++}
++
++static void ath12k_hal_qcn9274_get_tqm_scratch_reg(struct ath12k_base *ab, u64 *value)
++{
++	u32 offset_lo, offset_hi;
++
++	if (ab->hif.ops->pmm_read32) {
++		offset_lo = ath12k_hif_pmm_read32(ab, ATH12K_PPT_ADDR_OFFSET(PMM_TQM_CLOCK_OFFSET_LO_US));
++		offset_hi = ath12k_hif_pmm_read32(ab, ATH12K_PPT_ADDR_OFFSET(PMM_TQM_CLOCK_OFFSET_HI_US));
++	} else {
++		offset_lo = ath12k_hif_read32(ab,
++					      PMM_REG_BASE_QCN9224 + ATH12K_PPT_ADDR_OFFSET(PMM_TQM_CLOCK_OFFSET_LO_US));
++		offset_hi = ath12k_hif_read32(ab,
++					      PMM_REG_BASE_QCN9224 + ATH12K_PPT_ADDR_OFFSET(PMM_TQM_CLOCK_OFFSET_HI_US));
++	}
++
++	*value = ((u64)(offset_hi) << 32 | offset_lo);
++}
++
+ static int ath12k_hal_srng_create_config_qcn9274(struct ath12k_base *ab)
+ {
+ 	struct ath12k_hal *hal = &ab->hal;
+@@ -821,6 +871,8 @@ const struct hal_ops hal_qcn9274_ops = {
+ 	.rx_get_desc_info = ath12k_hw_qcn9274_get_rx_desc_info,
+ 	.rx_get_desc_msdulen_l3pad = ath12k_hw_qcn9274_get_rx_msdulen_l3pad,
+ 	.rx_desc_get_first_last_msdu = ath12k_hw_qcn9274_get_rx_first_last_msdu,
++	.hal_get_tsf2_scratch_reg = ath12k_hal_qcn9274_get_tsf2_scratch_reg,
++	.hal_get_tqm_scratch_reg = ath12k_hal_qcn9274_get_tqm_scratch_reg,
+ };
+ 
+ static bool ath12k_hw_wcn7850_rx_desc_get_first_msdu(struct hal_rx_desc *desc)
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -435,6 +435,9 @@ struct ath12k_dp_rx_info;
+ #define HAL_IPQ5332_CMEM_SIZE		0x40000
+ #define HAL_IPQ5332_CMEM_BASE		0x100000
+ 
++#define HAL_IPQ5332_PMM_REG_BASE	0xCB500FC
++#define HAL_IPQ5332_PMM_SIZE		0x100
++
+ enum hal_srng_ring_id {
+ 	HAL_SRNG_RING_ID_REO2SW0 = 0,
+ 	HAL_SRNG_RING_ID_REO2SW1,
+@@ -606,6 +609,28 @@ enum hal_ring_type {
+ 	HAL_MAX_RING_TYPES,
+ };
+ 
++#define PMM_REG_BASE_QCN9224	0xB500FC
++
++enum hal_scratch_reg_enum {
++	PMM_QTIMER_GLOBAL_OFFSET_LO_US,
++	PMM_QTIMER_GLOBAL_OFFSET_HI_US,
++	PMM_MAC0_TSF1_OFFSET_LO_US,
++	PMM_MAC0_TSF1_OFFSET_HI_US,
++	PMM_MAC0_TSF2_OFFSET_LO_US,
++	PMM_MAC0_TSF2_OFFSET_HI_US,
++	PMM_MAC1_TSF1_OFFSET_LO_US,
++	PMM_MAC1_TSF1_OFFSET_HI_US,
++	PMM_MAC1_TSF2_OFFSET_LO_US,
++	PMM_MAC1_TSF2_OFFSET_HI_US,
++	PMM_MLO_OFFSET_LO_US,
++	PMM_MLO_OFFSET_HI_US,
++	PMM_TQM_CLOCK_OFFSET_LO_US,
++	PMM_TQM_CLOCK_OFFSET_HI_US,
++	PMM_Q6_CRASH_REASON,
++	PMM_SCRATCH_TWT_OFFSET,
++	PMM_PMM_REG_MAX
++};
++
+ #define WINDOW_RANGE_MASK GENMASK(18, 0)
+ #define HAL_RX_MAX_BA_WINDOW	256
+ 
+@@ -1165,6 +1190,9 @@ struct hal_ops {
+ 					  struct ath12k_dp_rx_info *info);
+ 	void (*rx_desc_get_first_last_msdu)(struct hal_rx_desc *desc,
+ 					    struct ath12k_dp_rx_info *info);
++	void (*hal_get_tsf2_scratch_reg)(struct ath12k_base *ab, u8 mac_id,
++					 u64 *value);
++	void (*hal_get_tqm_scratch_reg)(struct ath12k_base *ab, u64 *value);
+ };
+ 
+ extern const struct hal_ops hal_qcn9274_ops;
+--- a/drivers/net/wireless/ath/ath12k/hal_tx.h
++++ b/drivers/net/wireless/ath/ath12k/hal_tx.h
+@@ -64,6 +64,8 @@ struct hal_tx_status {
+ 	u8 tid;
+ 	u16 peer_id;
+ 	u32 rate_stats;
++	u32 buffer_timestamp;
++	u32 tsf;
+ };
+ 
+ #define HAL_TX_PHY_DESC_INFO0_BF_TYPE		GENMASK(17, 16)
+--- a/drivers/net/wireless/ath/ath12k/sawf.c
++++ b/drivers/net/wireless/ath/ath12k/sawf.c
+@@ -269,6 +269,25 @@ bool ath12k_disable_svc_class(u8 svc_id)
+ 	return true;
+ }
+ 
++struct ath12k_sawf_svc_params *ath12k_get_svc_class_params(u8 svc_id)
++{
++	struct ath12k_sawf_svc_params *sawf_svc_class;
++
++	if (!sawf_ctx) {
++		ath12k_err(NULL, "SAWF context unavailable\n");
++		return NULL;
++	}
++
++	if (!ath12k_svc_id_configured(svc_id)) {
++		ath12k_warn(NULL, "Serive id not available\n");
++		return NULL;
++	}
++
++	sawf_svc_class = &sawf_ctx->svc_classes[SVC_INDEX(svc_id)];
++
++	return sawf_svc_class;
++}
++
+ /* When fimware crash occurs/simulated with firmware recovery
+  * enabled, the service class records in the driver will be sent
+  * to the crashed chip for configuring in the firmware.
+@@ -1309,16 +1328,80 @@ void ath12k_sawf_tx_enqueue_peer_stats(s
+ 	return;
+ }
+ 
++#define	HW_TX_DELAY_MAX				0x1000000
++
++#define TX_COMPL_SHIFT_BUFFER_TIMESTAMP_US    10
++#define HW_TX_DELAY_MASK                      0x1FFFFFFF
++#define TX_COMPL_BUFFER_TSTAMP_US(TSTAMP) \
++        (((TSTAMP) << TX_COMPL_SHIFT_BUFFER_TIMESTAMP_US) & \
++         HW_TX_DELAY_MASK)
++
++#define ATH12K_DP_SAWF_DELAY_BOUND_MS_MULTIPLER	1000
++#define ATH12K_MOV_AVG_PKT_WIN	10
++
++void ath12k_sawf_compute_hw_delay(struct ath12k *ar, struct hal_tx_status *ts,
++				  u32 *hw_delay)
++{
++	/* low 32 alone will be filled for TSF2 from FW and the value can be
++	 * negative for both TSF2 and TQM delta
++	 */
++	int tmp_delta_tsf2 = ar->delta_tsf2, tmp_delta_tqm = ar->delta_tqm;
++	u32 msdu_tqm_enqueue_tstamp_us, final_msdu_tqm_enqueue_tstamp_us;
++	u32 msdu_compl_tsf_tstamp_us, final_msdu_compl_tsf_tstamp_us;
++	struct ath12k_hw_group *ag = ar->ab->ag;
++	/* MLO TSTAMP OFFSET can be negative
++	 */
++	int mlo_offset = ag->mlo_tstamp_offset;
++	int delta_tsf2, delta_tqm;
++
++	msdu_tqm_enqueue_tstamp_us =
++		TX_COMPL_BUFFER_TSTAMP_US(ts->buffer_timestamp);
++	msdu_compl_tsf_tstamp_us = ts->tsf;
++	delta_tsf2 = mlo_offset - tmp_delta_tsf2;
++	delta_tqm = mlo_offset - tmp_delta_tqm;
++
++	final_msdu_tqm_enqueue_tstamp_us =
++		(msdu_tqm_enqueue_tstamp_us + delta_tqm) & HW_TX_DELAY_MASK;
++	final_msdu_compl_tsf_tstamp_us =
++		(msdu_compl_tsf_tstamp_us + delta_tsf2) & HW_TX_DELAY_MASK;
++
++	*hw_delay = (final_msdu_compl_tsf_tstamp_us -
++			final_msdu_tqm_enqueue_tstamp_us) & HW_TX_DELAY_MASK;
++}
++
++#define	ATH12K_HIST_AVG_DIV	2
++
++void ath12k_update_hist_stats(struct ath12k_delay_hist_stats *hist_stats, u32 value)
++{
++	if (!hist_stats->min || value < hist_stats->min)
++		hist_stats->min = value;
++
++	if (value > hist_stats->max)
++		hist_stats->max = value;
++
++	if (unlikely(!hist_stats->avg))
++		hist_stats->avg = value;
++	else
++		hist_stats->avg = (hist_stats->avg + value) / ATH12K_HIST_AVG_DIV;
++
++}
++
+ void ath12k_sawf_stats_update(struct ath12k *ar, struct sk_buff *skb,
+ 			      struct hal_tx_status *ts,
+-			      struct ath12k_peer *peer)
++			      struct ath12k_peer *peer, ktime_t timestamp)
+ {
++	struct ath12k_sawf_peer_ctx *peer_ctx = &peer->sawf_ctx_peer;
++	struct ath12k_sawf_svc_params *svc_class_param;
++	struct sawf_tx_delay_stats *tx_delay_stats;
+ 	struct ath12k_sawf_stats *sawf_stats;
++	u32 hw_delay, sw_delay, nw_delay, pkt_win;
++	u64 entry_ts, enqueue_timestamp;
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct sawf_tx_stats *tx_stats;
+ 	u32 msduq_id, len, q_id, tid;
++	u8 svc_id;
+ 
+-	if (!ts)
++	if (!ts || !peer_ctx)
+ 		return;
+ 
+ 	if (u32_get_bits(skb->mark, SAWF_TAG_ID) != SAWF_VALID_TAG)
+@@ -1385,5 +1468,50 @@ void ath12k_sawf_stats_update(struct ath
+ 	tx_stats->queue_depth--;
+ 
+ latency_stats_update:
++
++	tx_delay_stats = &sawf_stats->tx_delay_stats[tid][q_id];
++
++	ath12k_sawf_compute_hw_delay(ar, ts, &hw_delay);
++	if (hw_delay > HW_TX_DELAY_MAX)
++		return;
++
++	tx_delay_stats->num_pkt++;
++	tx_delay_stats->hwdelay_win_total += hw_delay;
++	ath12k_update_hist_stats(&tx_delay_stats->delay_hist, hw_delay);
++	nw_delay = u32_get_bits(skb->mark, SAWF_NW_DELAY);
++	tx_delay_stats->nwdelay_win_total += nw_delay;
++
++	enqueue_timestamp = ktime_to_us(timestamp);
++	entry_ts = ktime_to_us(skb_get_ktime(skb));
++
++	if (!enqueue_timestamp)
++		sw_delay = 0;
++	else
++		sw_delay = (u32) (enqueue_timestamp - entry_ts);
++	tx_delay_stats->swdelay_win_total += sw_delay;
++
++	if (!(tx_delay_stats->num_pkt % pkt_win)) {
++		tx_delay_stats->nwdelay_avg = div_u64(tx_delay_stats->nwdelay_win_total,
++					  pkt_win);
++		tx_delay_stats->swdelay_avg = div_u64(tx_delay_stats->swdelay_win_total,
++					  pkt_win);
++		tx_delay_stats->hwdelay_avg = div_u64(tx_delay_stats->hwdelay_win_total,
++					  pkt_win);
++
++		tx_delay_stats->nwdelay_win_total = 0;
++		tx_delay_stats->swdelay_win_total = 0;
++		tx_delay_stats->hwdelay_win_total = 0;
++	}
++
++	svc_id = peer_ctx->msduq_table[tid][q_id].svc_id;
++	svc_class_param = ath12k_get_svc_class_params(svc_id);
++
++	if(svc_class_param) {
++		if (hw_delay > (svc_class_param->delay_bound *
++				ATH12K_DP_SAWF_DELAY_BOUND_MS_MULTIPLER))
++			tx_delay_stats->failure++;
++		else
++			tx_delay_stats->success++;
++	}
+ 	return;
+ }
+--- a/drivers/net/wireless/ath/ath12k/sawf.h
++++ b/drivers/net/wireless/ath/ath12k/sawf.h
+@@ -22,12 +22,16 @@ struct hal_tx_status;
+  ** SAWF_metadata related information.
+  **/
+ #define SAWF_VALID_TAG 0xAA
++#define SAWF_TAG_SHIFT	0x18
+ 
+ /* Skb mark for SAWF */
+ #define SAWF_MSDUQ_ID			GENMASK(5, 0)
+ #define SAWF_PEER_ID			GENMASK(15, 6)
+ #define SAWF_SERVICE_CLASS_ID		GENMASK(23, 16)
+ #define SAWF_TAG_ID			GENMASK(31, 24)
++#define SAWF_NW_DELAY			GENMASK(23, 6)
++#define SAWF_NW_DELAY_SHIFT		0x6
++#define SAWF_NW_DELAY_MAX		0x3FFFF
+ 
+ #define TID_FROM_Q_ID			GENMASK(2, 0)
+ #define FLOW_OVERRIDE_FROM_Q_ID		BIT(3)
+@@ -100,6 +104,8 @@ struct hal_tx_status;
+ #define ATH12K_SAWF_MIN_MSDU_LOSS_RATE 0
+ #define ATH12K_SAWF_MAX_MSDU_LOSS_RATE 10000
+ 
++#define ATH12K_SAWF_STATS_SIZE	4096
++
+ enum SAWF_SVC_PARAM_DEFAULTS {
+ 	SAWF_SVC_PARAM_DEFAULT_MIN_THRUPUT    = 0,
+ 	SAWF_SVC_PARAM_DEFAULT_MAX_THRUPUT    = 0xffffffff,
+@@ -536,6 +542,46 @@ struct sawf_tx_stats {
+ };
+ 
+ /**
++ * struct ath12k_delay_hist_stats - Histogram of a stats
++ * @max: Max frequency
++ * @min: Minimum frequency
++ * @avg: Average frequency
++ */
++
++struct ath12k_delay_hist_stats {
++	int max;
++	int min;
++	int avg;
++};
++
++/**
++ * struct sawf_tx_delay_stats- sawf Tx-delay stats
++ * @delay_hist: histogram for various delay-buckets
++ * @nwdelay_avg: moving average for nwdelay
++ * @swdelay_avg: moving average for swdelay
++ * @hwdelay_avg: moving average for hwdelay
++ * @num_pkt: count of pkts for which delay is calculated
++ * @nwdelay_win_total: total nwdelay for a window
++ * @swdelay_win_total: total swdelay for a window
++ * @hwdelay_win_total: total hwdelay for a window
++ * @success: count of pkts that met delay-bound
++ * @failure: count of pkts that did not meet delay-bound
++ */
++
++struct sawf_tx_delay_stats {
++	struct ath12k_delay_hist_stats delay_hist;
++
++	u32 nwdelay_avg;
++        u32 swdelay_avg;
++        u32 hwdelay_avg;
++        u32 num_pkt;
++        u64 nwdelay_win_total;
++        u64 swdelay_win_total;
++        u64 hwdelay_win_total;
++        u64 success;
++        u64 failure;
++};
++/**
+  * sawf_stats - sawf stats
+  * @delay: delay stats per host MSDU queue
+  * @tx_stats: Tx stats per host MSDU queue
+@@ -543,6 +589,7 @@ struct sawf_tx_stats {
+  */
+ struct ath12k_sawf_stats {
+ 	struct sawf_tx_stats tx_stats[ATH12K_SAWF_MAX_TID_SUPPORT][MAX_Q_PER_TID];
++        struct sawf_tx_delay_stats tx_delay_stats[ATH12K_SAWF_MAX_TID_SUPPORT][MAX_Q_PER_TID];
+ };
+ 
+ /* MSG_TYPE => HTT_H2T_MSG_TYPE_STREAMING_STATS_REQ
+@@ -735,7 +782,7 @@ void ath12k_htt_sawf_def_q_map_report_ha
+ 					      struct sk_buff *skb);
+ void ath12k_sawf_stats_update(struct ath12k *ar, struct sk_buff *skb,
+ 			      struct hal_tx_status *ts,
+-			      struct ath12k_peer *peer);
++			      struct ath12k_peer *peer, ktime_t timestamp);
+ void ath12k_sawf_tx_enqueue_peer_stats(struct ath12k_base *ab,
+ 				       struct ath12k_peer *peer,
+ 				       u32 msduq_id, u32 len);
+@@ -760,7 +807,8 @@ static inline void ath12k_sawf_deinit(st
+ 
+ static inline void ath12k_sawf_stats_update(struct ath12k *ar, struct sk_buff *skb,
+ 					    struct hal_tx_status *ts,
+-					    struct ath12k_peer *peer)
++			      		    struct ath12k_peer *peer,
++					    ktime_t timestamp)
+ {
+ 	return;
+ }
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -128,6 +128,14 @@ enum ext_irq_num {
+ 	tcl2host_status_ring,
+ };
+ 
++static inline u32 ath12k_ahb_pmm_read32(struct ath12k_base *ab, u32 offset)
++{
++	ath12k_dbg(ab, ATH12K_DBG_OFFSET, "Mem_pmm :%p offset:%x\n",
++		   ab->mem_pmm, offset);
++	return ioread32(ab->mem_pmm + offset);
++
++}
++
+ static inline u32 ath12k_ahb_cmem_read32(struct ath12k_base *ab, u32 offset)
+ {
+ 	offset = offset - HAL_IPQ5332_CMEM_BASE;
+@@ -649,6 +657,7 @@ static const struct ath12k_hif_ops ath12
+ 	.read32 = ath12k_ahb_read32,
+ 	.write32 = ath12k_ahb_write32,
+ 	.cmem_read32 = ath12k_ahb_cmem_read32,
++	.pmm_read32 = ath12k_ahb_pmm_read32,
+ 	.cmem_write32 = ath12k_ahb_cmem_write32,
+ 	.irq_enable = ath12k_ahb_ext_irq_enable,
+ 	.irq_disable = ath12k_ahb_ext_irq_disable,
+@@ -1022,6 +1031,19 @@ static int ath12k_ahb_probe(struct platf
+ 		ab->cmem_remap_base_addr = HAL_IPQ5332_CMEM_REG_BASE;
+ 	}
+ 
++	if (ab->hw_params->pmm_remap) {
++		const struct pmm_remap *pmm = ab->hw_params->pmm_remap;
++
++		ab->mem_pmm = ioremap(pmm->base, pmm->size);
++		if (IS_ERR(ab->mem_pmm)) {
++			dev_err(&pdev->dev, "pmm ioremap error\n");
++			ret = -ENOMEM;
++			goto err_core_free;
++		}
++		ab->pmm_remap = true;
++		ab->pmm_remap_base_addr = HAL_IPQ5332_PMM_REG_BASE;
++	}
++
+ 	ret = ath12k_ahb_setup_resources(ab);
+ 	if (ret)
+ 		goto err_core_free;
+--- a/drivers/net/wireless/ath/ath12k/hif.h
++++ b/drivers/net/wireless/ath/ath12k/hif.h
+@@ -15,6 +15,7 @@ struct ath12k_hif_ops {
+ 	void (*write32)(struct ath12k_base *sc, u32 address, u32 data);
+ 	u32 (*cmem_read32)(struct ath12k_base *sc, u32 address);
+ 	void (*cmem_write32)(struct ath12k_base *sc, u32 address, u32 data);
++	u32 (*pmm_read32)(struct ath12k_base *sc, u32 address);
+ 	void (*irq_enable)(struct ath12k_base *sc);
+ 	void (*irq_disable)(struct ath12k_base *sc);
+ 	int (*start)(struct ath12k_base *sc);
+@@ -205,6 +206,11 @@ static inline u32 ath12k_hif_cmem_read32
+ 	return ab->hif.ops->cmem_read32(ab, address);
+ }
+ 
++static inline u32 ath12k_hif_pmm_read32(struct ath12k_base *ab, u32 offset)
++{
++	return ab->hif.ops->pmm_read32(ab, offset);
++}
++
+ static inline void ath12k_hif_cmem_write32(struct ath12k_base *ab, u32 address,
+ 				      u32 data)
+ {
+--- a/drivers/net/wireless/ath/ath12k/hw.c
++++ b/drivers/net/wireless/ath/ath12k/hw.c
+@@ -1318,6 +1318,11 @@ const struct cmem_remap ath12k_cmem_ipq5
+ 	.size = HAL_IPQ5332_CMEM_SIZE,
+ };
+ 
++const struct pmm_remap ath12k_pmm_ipq5332 = {
++	.base = HAL_IPQ5332_PMM_REG_BASE,
++	.size = HAL_IPQ5332_PMM_SIZE,
++};
++
+ static const struct ath12k_hw_hal_params ath12k_hw_hal_params_ipq5332 = {
+ 	.rx_buf_rbm = HAL_RX_BUF_RBM_SW3_BM,
+ 	.wbm2sw_cc_enable = HAL_WBM_SW_COOKIE_CONV_CFG_WBM2SW0_EN |
+@@ -1618,6 +1623,7 @@ static const struct ath12k_hw_params ath
+ 		.ce_ie_addr = &ath12k_ce_ie_addr_ipq5332,
+ 		.ce_remap = &ath12k_ce_remap_ipq5332,
+ 		.cmem_remap = &ath12k_cmem_ipq5332,
++		.pmm_remap = &ath12k_pmm_ipq5332,
+ 		.send_platform_model = true,
+ 		.en_fwlog = true,
+ 	},
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -229,6 +229,7 @@ struct ath12k_hw_params {
+ 	const struct ce_remap *ce_remap;
+ 	const struct cmem_remap *cmem_remap;
+ 	bool compact_rx_tlv;
++	const struct pmm_remap *pmm_remap;
+ };
+ 
+ struct ath12k_hw_ops {
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -926,6 +926,8 @@ skip_lookup:
+ 	}
+ 
+ 	ar->mlo_setup_status = ev->status;
++	if (ab->hw_params->hal_ops->hal_get_tqm_scratch_reg)
++		ab->hw_params->hal_ops->hal_get_tqm_scratch_reg(ab, &ar->delta_tqm);
+ 	complete(&ar->mlo_setup_done);
+ 
+ out:
