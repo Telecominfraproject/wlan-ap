@@ -139,10 +139,16 @@ return {
 			}
 		});
 
+		let state = ctx.ubus.call('spotfilter', 'client_get', {
+			interface: ctx.spotfilter,
+			address: ctx.mac,
+		});
+
 		// start accounting
 		ctx.ubus.call('uspot', 'client_add', {
 			interface: ctx.spotfilter,
-			address: ctx.mac,
+			address: uc(ctx.mac),
+			state
 		});
 		
 		if (ctx.query_string.userurl)

@@ -2019,14 +2019,14 @@ int32 rtl8251b_phy_init(struct phy_device *phydev)
 {
     BOOL status = FAILURE;
     UINT16 i = 0;   /* SW_SDK: use UINT16 instead of UINT8, for MMD_REG array may over 255 entries */
-    UINT16 phydata = 0;
+    UINT16 phydata = 0, rev_num = 0, mod_num = 0;
     const UINT16 patchver = 0x0014, patchaddr = 0x8023;
 
     status = Rtl8251b_wait_for_bit(phydev, MMD_VEND2, 0xA420, 0x3, 1, 100);
     if (status != SUCCESS) {
         goto exit;
     }
-#if 0
+#if 1
     status = MmdPhyRead(phydev, MMD_PMAPMD, 0x03, &phydata);
     if (status != SUCCESS)
         goto exit;
@@ -2038,7 +2038,10 @@ int32 rtl8251b_phy_init(struct phy_device *phydev)
         osal_printf("rtl8251b and go init flow...\n");
     }
     else{
-        osal_printf("Not rtl8251b and skip init flow...id = %x \n",phydata);
+        if (phydata == 0xc868)
+            osal_printf("Realtek chip is RTL8251B-VB-CG\n");
+        else
+            osal_printf("Not rtl8251b and skip init flow...id = %x \n",phydata);
         goto exit;
     }
 #endif

@@ -20,8 +20,24 @@ function auth_client(ctx) {
 			payload.chap_password = ctx.query_string.response;
 			payload.chap_challenge = ctx.config.uam_secret ? uam.chap_challenge(challenge, ctx.config.uam_secret) : challenge;
 		} else if ("password" in ctx.query_string) {	// allow empty password
-			payload.password = !ctx.config.uam_secret ? ctx.query_string.password :
-				uam.password(uam.md5(ctx.config.challenge, ctx.format_mac), ctx.query_string.password, ctx.config.uam_secret);
+			if (!ctx.config.uam_secret)
+				payload.password = ctx.query_string.password;
+			else {
+				let rlen = length(ctx.query_string.password);
+				let clen = 32;
+				let pos = 0;
+				let passw = '';
+
+				while(rlen>0) {
+					if(rlen < 32)
+						clen = rlen;
+					let curr = substr(ctx.query_string.password, pos, clen);
+					passw = passw+uam.password(uam.md5(ctx.config.challenge, ctx.format_mac), curr, ctx.config.uam_secret);
+					rlen = rlen-32;
+					pos = pos+32;
+				}
+				payload.password = passw;
+			}
 		}
 	} else {
 		include('error.uc', ctx);
