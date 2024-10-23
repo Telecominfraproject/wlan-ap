@@ -213,16 +213,17 @@ function client_add(interface, mac, state) {
 	let accounting = settings.accounting;
 
 	// RFC: NAS local interval value *must* override RADIUS attribute
-	defval = settings.acct_interval;
-	let interval = +(defval || state.data?.radius?.reply['Acct-Interim-Interval'] || 0);
-
-	defval = settings.session_timeout;
-	let session = +(state.data?.radius?.reply['Session-Timeout'] || defval);
-
-	defval = settings.idle_timeout;
-	let idle = +(state.data?.radius?.reply['Idle-Timeout'] || defval);
-
-	let max_total = +(state.data?.radius?.reply['ChilliSpot-Max-Total-Octets'] || 0);
+	let interval = settings.acct_interval;
+	let session = settings.session_timeout;
+	let idle = settings.idle_timeout;
+	let max_total = 0;
+	
+	if (state.data?.radius?.reply) {
+		interval = +(interval || state.data?.radius?.reply['Acct-Interim-Interval'] || 0);
+		session = +(state.data.radius.reply['Session-Timeout'] || session);
+		idle = +(state.data.radius.reply['Idle-Timeout'] || idle);
+		max_total = +(state.data.radius.reply['ChilliSpot-Max-Total-Octets'] || 0);
+	}
 
 	let clients = interfaces[interface].clients;
 	clients[mac] = {
@@ -426,17 +427,9 @@ function run_service() {
 			call: function(req) {
 				let interface = req.args.interface;
 				let address = req.args.address;
-
-				if (!interface || !address)
-					return ubus.STATUS_INVALID_ARGUMENT;
-
-				address = uc(address);	// spotfilter uses ether_ntoa() which is uppercase
-
-				let state = ubus.call('spotfilter', 'client_get', {
-					interface,
-					address,
-				});
-				if (!state)
+				let state = req.args.state;
+				printf('%s %s %s\n', interface, address, state);
+				if (!interface || !address || !state)
 					return ubus.STATUS_INVALID_ARGUMENT;
 
 				if (!interfaces[interface].clients[address])
@@ -447,6 +440,7 @@ function run_service() {
 			args: {
 				interface:"",
 				address:"",
+				state: {},
 			}
 		},
 		client_remove: {
@@ -469,6 +463,13 @@ function run_service() {
 			args: {
 				interface:"",
 				address:"",
+			},
+		},
+		interface_list: {
+			call: function(req) {
+				return interfaces;
+			},
+			args: {
 			}
 		},
 	});
