@@ -420,7 +420,7 @@ mac80211_hostapd_setup_base() {
 			he_spr_sr_control:3 \
 			he_spr_psr_enabled:0 \
 			he_spr_non_srg_obss_pd_max_offset:0 \
-			he_bss_color:128 \
+			he_bss_color:0 \
 			he_bss_color_enabled:1
 
 		he_phy_cap=$(iw phy "$phy" info | sed -n '/HE Iftypes: AP/,$p' | awk -F "[()]" '/HE PHY Capabilities/ { print $2 }' | head -1)
