@@ -104,7 +104,7 @@ def update_patches():
 		)
 		os.chdir(openwrt)
 		run(
-			["git", "format-patch", config.get("revision", config["branch"]), "-o", "../patches"],
+			["git", "format-patch", config.get("revision", config["branch"]), "-o", base_dir / "patches"],
 			check=True,
 		)
 		print("### Updating done")
@@ -120,12 +120,12 @@ setup = False
 update = False
 rebase = False
 config = "config.yml"
-profiles = "../profiles"
+profiles = base_dir / "profiles"
 openwrt = "openwrt"
 git_ref = ""
 
 try:
-	opts, args = getopt.getopt(sys.argv[1:], "srdc:f:u2", ["setup", "rebase", "config=", "folder=", "reference=", "update", "20x" ])
+	opts, args = getopt.getopt(sys.argv[1:], "srd:c:f:u2", ["setup", "rebase", "config=", "folder=", "reference=", "update", "20x", "directory=" ])
 except getopt.GetoptError as err:
 	print(err)
 	sys.exit(2)
@@ -142,6 +142,8 @@ for o, a in opts:
 		config = a
 	elif o in ("--reference"):
 		git_ref = a
+	elif o in ("-d", "--directory"):
+		openwrt = a
 	else:
 		assert False, "unhandled option"
 
