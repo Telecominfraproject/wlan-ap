@@ -1,0 +1,188 @@
+From 45527e4f3b53755e529f5936a177f3836109d759 Mon Sep 17 00:00:00 2001
+From: Rajat Soni <quic_rajson@quicinc.com>
+Date: Thu, 6 Jan 2022 20:13:10 +0530
+Subject: [PATCH] ath12k: Send HT fixed rate in wmi peer fixed param
+
+Due to the firmware behavior with HT fixed rates, HT fixed
+mcs with nss > 1, are treated as nss1 HT rates in the
+firmware and  enables the nss1 rates alone, if nss2 rates
+only available and no nss1 rates are available at the fixed
+rate setting.
+
+This leads to HT fixed rate is configured for nss1 rates always
+even though we set nss2 mcs in the set bitrate command.
+
+Currently HT fixed mcs is sent via wmi peer assoc command.
+Fix this issue, by sending the HT fixed rate mcs in wmi peer
+fixed param instead of sending in peer assoc command.
+
+Signed-off-by: Maharaja Kennadyrajan <quic_mkenna@quicinc.com>
+Signed-off-by: Rajat Soni <quic_rajson@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 94 ++++++++++++++++++++++-----
+ 1 file changed, 78 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index cd3af38..f261f57 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -4732,6 +4732,20 @@ static int ath12k_mac_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 	return ret;
+ }
+ 
++static int
++ath12k_mac_bitrate_mask_num_ht_rates(struct ath12k *ar,
++				    enum nl80211_band band,
++				    const struct cfg80211_bitrate_mask *mask)
++{
++	int num_rates = 0;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(mask->control[band].ht_mcs); i++)
++		num_rates += hweight16(mask->control[band].ht_mcs[i]);
++
++	return num_rates;
++}
++
+ static int
+ ath12k_mac_bitrate_mask_num_vht_rates(struct ath12k *ar,
+ 				      enum nl80211_band band,
+@@ -4871,6 +4885,57 @@ ath12k_mac_set_peer_he_fixed_rate(struct ath12k_vif *arvif,
+ 	return ret;
+ }
+ 
++static int
++ath12k_mac_set_peer_ht_fixed_rate(struct ath12k_vif *arvif,
++				 struct ieee80211_sta *sta,
++				 const struct cfg80211_bitrate_mask *mask,
++				 enum nl80211_band band)
++{
++	struct ath12k *ar = arvif->ar;
++	u8 ht_rate, nss;
++	u32 rate_code;
++	int ret, i;
++
++	lockdep_assert_held(&ar->conf_mutex);
++
++	nss = 0;
++
++	for (i = 0; i < ARRAY_SIZE(mask->control[band].ht_mcs); i++) {
++		if (hweight16(mask->control[band].ht_mcs[i]) == 1) {
++			nss = i + 1;
++			ht_rate = ffs(mask->control[band].ht_mcs[i]) - 1;
++		}
++	}
++
++	if (!nss) {
++		ath12k_warn(ar->ab, "No single HT Fixed rate found to set for %pM",
++			    sta->addr);
++		return -EINVAL;
++	}
++
++	/* Avoid updating invalid nss as fixed rate*/
++	if (nss > sta->deflink.rx_nss)
++		return -EINVAL;
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
++			"Setting Fixed HT Rate for peer %pM. Device will not switch to any other selected rates",
++		  sta->addr);
++
++	rate_code = ATH12K_HW_RATE_CODE(ht_rate, nss - 1,
++					WMI_RATE_PREAMBLE_HT);
++	ret = ath12k_wmi_set_peer_param(ar, sta->addr,
++					arvif->vdev_id,
++					WMI_PEER_PARAM_FIXED_RATE,
++					rate_code);
++
++	if (ret)
++		ath12k_warn(ar->ab,
++			    "failed to update STA %pM HT Fixed Rate %d: %d\n",
++			    sta->addr, rate_code, ret);
++
++	return ret;
++}
++
+ static int
+ ath12k_mac_set_peer_eht_fixed_rate(struct ath12k_vif *arvif,
+ 				   struct ieee80211_sta *sta,
+@@ -4933,7 +4998,7 @@ static int ath12k_station_assoc(struct ath12k *ar,
+ 	struct cfg80211_chan_def def;
+ 	enum nl80211_band band;
+ 	struct cfg80211_bitrate_mask *mask;
+-	u8 num_vht_rates, num_he_rates, num_eht_rates;
++	u8 num_vht_rates, num_he_rates, num_eht_rates, num_ht_rates;
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+ 
+@@ -4961,6 +5026,7 @@ static int ath12k_station_assoc(struct ath12k *ar,
+ 	num_vht_rates = ath12k_mac_bitrate_mask_num_vht_rates(ar, band, mask);
+ 	num_he_rates = ath12k_mac_bitrate_mask_num_he_rates(ar, band, mask);
+ 	num_eht_rates = ath12k_mac_bitrate_mask_num_eht_rates(ar, band, mask);
++	num_ht_rates = ath12k_mac_bitrate_mask_num_ht_rates(ar, band, mask);
+ 
+ 	/* If single VHT/HE/EHT rate is configured (by set_bitrate_mask()),
+ 	 * peer_assoc will disable VHT/HE/EHT. This is now enabled by a peer
+@@ -4982,6 +5048,11 @@ static int ath12k_station_assoc(struct ath12k *ar,
+ 							 band);
+ 		if (ret)
+ 			return ret;
++	} else if (sta->deflink.ht_cap.ht_supported && num_ht_rates == 1) {
++		ret = ath12k_mac_set_peer_ht_fixed_rate(arvif, sta, mask,
++							band);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	/* Re-assoc is run only to update supported rates for given station. It
+@@ -5056,7 +5127,7 @@ static void ath12k_sta_rc_update_wk(struct work_struct *wk)
+ 	const u16 *he_mcs_mask;
+ 	const u16 *eht_mcs_mask;
+ 	u32 changed, bw, nss, smps, bw_prev;
+-	int err, num_vht_rates, num_he_rates, num_eht_rates;
++	int err, num_vht_rates, num_he_rates, num_eht_rates, num_ht_rates;
+ 	const struct cfg80211_bitrate_mask *mask;
+ 	struct ath12k_wmi_peer_assoc_arg peer_arg;
+ 	enum wmi_phy_mode peer_phymode;
+@@ -5169,6 +5240,8 @@ static void ath12k_sta_rc_update_wk(struct work_struct *wk)
+ 
+ 	if (changed & IEEE80211_RC_SUPP_RATES_CHANGED) {
+ 		mask = &arvif->bitrate_mask;
++		num_ht_rates = ath12k_mac_bitrate_mask_num_ht_rates(ar, band,
++								    mask);
+ 		num_vht_rates = ath12k_mac_bitrate_mask_num_vht_rates(ar, band,
+ 								      mask);
+ 		num_he_rates = ath12k_mac_bitrate_mask_num_he_rates(ar, band,
+@@ -5196,6 +5269,9 @@ static void ath12k_sta_rc_update_wk(struct work_struct *wk)
+ 		} else if (sta->deflink.eht_cap.has_eht && num_eht_rates == 1) {
+ 			ath12k_mac_set_peer_eht_fixed_rate(arvif, sta, mask,
+ 							   band);
++		} else if (sta->deflink.ht_cap.ht_supported && num_ht_rates == 1) {
++			ath12k_mac_set_peer_ht_fixed_rate(arvif, sta, mask,
++							  band);
+ 		} else {
+ 			/* If the peer is non-VHT/HE/EHT or no fixed VHT/HE/EHT
+ 			 * rate is provided in the new bitrate mask we set the
+@@ -9334,20 +9410,6 @@ out:
+ 	mutex_unlock(&ah->conf_mutex);
+ }
+ 
+-static int
+-ath12k_mac_bitrate_mask_num_ht_rates(struct ath12k *ar,
+-				     enum nl80211_band band,
+-				     const struct cfg80211_bitrate_mask *mask)
+-{
+-	int num_rates = 0;
+-	int i;
+-
+-	for (i = 0; i < ARRAY_SIZE(mask->control[band].ht_mcs); i++)
+-		num_rates += hweight16(mask->control[band].ht_mcs[i]);
+-
+-	return num_rates;
+-}
+-
+ static bool
+ ath12k_mac_has_single_legacy_rate(struct ath12k *ar,
+ 				  enum nl80211_band band,
+-- 
+2.17.1
+

@@ -1,0 +1,211 @@
+From ca46a0e64ea1cb99d654636e722e10382a0cb6d7 Mon Sep 17 00:00:00 2001
+From: Aloka Dixit <quic_alokad@quicinc.com>
+Date: Tue, 28 Nov 2023 10:35:27 -0800
+Subject: [PATCH 2/8] wifi: cfg80211: add radar handling for device BW
+ parameters
+
+Use the device bandwidth parameters (center frequency and width) instead
+of the operating bandwidth parameters to set the DFS state for channels
+if the values are different. Include device bandwidth and center freqeuncy
+parameters in the radar events sent to the userspace.
+When radar is detected in the non operating portion of the device
+bandwidth, handle it depending on the current state of the affected
+channels:
+- If the channels are available, mark those as unavailable and send
+the radar detection event to userspace.
+- If the channels are already unavailable, ignore the radar
+event until the no occupancy period expires.
+- If the channels are usable and if a background CAC is running then
+abort the CAC and send event to the userspace.
+
+Signed-off-by: Aloka Dixit <quic_alokad@quicinc.com>
+Signed-off-by: Shivani Tambatkar <quic_stambatk@quicinc.com>
+---
+ include/net/cfg80211.h | 37 ++++++++++++++++++++++++++++++++++
+ net/wireless/chan.c    | 45 ++++++++++++++++++++++++++++++++++++++++++
+ net/wireless/mlme.c    | 37 ++++++++++++++++++++++++++++++++++
+ net/wireless/nl80211.c |  5 +++++
+ 4 files changed, 124 insertions(+)
+
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -983,6 +983,21 @@ cfg80211_chandef_identical(const struct
+ }
+ 
+ /**
++ * cfg80211_chandef_device_present - check if channel definitions includes device
++ * bandwidth parameters different than the operating bandwidth parameters
++ * @chandef: channel definition
++ *
++ * Return: %true if the parameters are different
++ */
++static inline bool
++cfg80211_chandef_device_present(const struct cfg80211_chan_def *chandef)
++{
++	return (chandef->width_device && chandef->center_freq_device &&
++		chandef->width_device != chandef->width &&
++		chandef->center_freq_device != chandef->center_freq1);
++}
++
++/**
+  * cfg80211_chandef_is_edmg - check if chandef represents an EDMG channel
+  *
+  * @chandef: the channel definition
+@@ -1086,6 +1101,15 @@ bool cfg80211_chandef_dfs_available(stru
+ 				    const struct cfg80211_chan_def *chandef);
+ 
+ /**
++ * cfg80211_is_freq_device_non_oper - check if the given frequency falls under
++ * the non operating portion of the device bandwidth.
++ * @chandef: the channel definition to check
++ * @freq: frequency to check
++ * Returns: True if the frequency is part of the non operating bandwidth, false otherwise.
++ */
++bool cfg80211_is_freq_device_non_oper(const struct cfg80211_chan_def *chandef, u32 freq);
++
++/**
+  * ieee80211_chanwidth_rate_flags - return rate flags for channel width
+  * @width: the channel width of the channel
+  *
+--- a/net/wireless/chan.c
++++ b/net/wireless/chan.c
+@@ -606,6 +606,17 @@ void cfg80211_set_dfs_state(struct wiphy
+ 	if (WARN_ON(!cfg80211_chandef_valid(chandef)))
+ 		return;
+ 
++	if (cfg80211_chandef_device_present(chandef)) {
++		width = nl80211_chan_width_to_mhz(chandef->width_device);
++		if (width < 0)
++			return;
++
++		cfg80211_set_chans_dfs_state(wiphy, chandef->center_freq_device,
++					     width, dfs_state,
++					     chandef->radar_bitmap);
++		return;
++	}
++
+ 	width = cfg80211_chandef_get_width(chandef);
+ 	if (width < 0)
+ 		return;
+@@ -718,6 +729,25 @@ bool cfg80211_chandef_device_valid(const
+ 	return false;
+ }
+ 
++bool cfg80211_is_freq_device_non_oper(const struct cfg80211_chan_def *chandef,
++				      u32 freq)
++{
++	int width = nl80211_chan_width_to_mhz(chandef->width);
++
++	if (freq < cfg80211_get_start_freq_device(chandef) ||
++	    freq > cfg80211_get_end_freq_device(chandef))
++		return false;
++
++	if (width < 0)
++		return false;
++
++	if (freq >= cfg80211_get_start_freq(MHZ_TO_KHZ(chandef->center_freq1), width) &&
++	    freq <= cfg80211_get_end_freq(MHZ_TO_KHZ(chandef->center_freq1), width))
++		return false;
++
++	return true;
++}
++
+ static int cfg80211_get_chans_dfs_required(struct wiphy *wiphy,
+ 					    u32 center_freq,
+ 					    u32 bandwidth,
+--- a/net/wireless/mlme.c
++++ b/net/wireless/mlme.c
+@@ -960,6 +960,67 @@ void cfg80211_dfs_channels_update_work(s
+ 				   next_time);
+ }
+ 
++bool cfg80211_radar_event_device(struct wiphy *wiphy, struct cfg80211_chan_def *chandef)
++{
++	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
++	struct ieee80211_channel *c;
++	u32 freq, end_freq, start_freq;
++	bool nop_in_progress = false, non_oper_event = false;
++	int i;
++	unsigned long time_nop_entered = 0;
++
++	start_freq = cfg80211_get_start_freq_device(chandef);
++	end_freq = cfg80211_get_end_freq_device(chandef);
++
++	for (freq = start_freq, i = 0; freq <= end_freq; i++, freq += MHZ_TO_KHZ(20)) {
++		c = ieee80211_get_channel_khz(wiphy, freq);
++		if (c->dfs_state == NL80211_DFS_UNAVAILABLE) {
++			chandef->radar_bitmap &= ~BIT(i);
++			nop_in_progress = true;
++			time_nop_entered = c->dfs_state_entered;
++			break;
++		}
++	}
++
++	for (freq = start_freq, i = 0; freq <= end_freq; i++, freq += MHZ_TO_KHZ(20)) {
++		c = ieee80211_get_channel_khz(wiphy, freq);
++		if (!c || !(c->flags & IEEE80211_CHAN_RADAR))
++			continue;
++
++		if (!chandef->radar_bitmap)
++			break;
++
++		if (cfg80211_is_freq_device_non_oper(chandef, freq)) {
++			if (c->dfs_state != NL80211_DFS_UNAVAILABLE &&
++			    chandef->radar_bitmap & BIT(i)) {
++				non_oper_event = true;
++				c->dfs_state = NL80211_DFS_UNAVAILABLE;
++				if (time_nop_entered)
++					c->dfs_state_entered = time_nop_entered;
++				else {
++					c->dfs_state_entered = jiffies;
++					time_nop_entered = c->dfs_state_entered;
++				}
++			}
++		} else if (chandef->radar_bitmap & BIT(i)) {
++			if (rdev->background_radar_wdev &&
++			    cfg80211_chandef_identical(&rdev->background_radar_chandef,
++						       chandef))
++				queue_work(cfg80211_wq, &rdev->background_cac_abort_wk);
++			return false;
++		}
++	}
++
++	if (non_oper_event && !nop_in_progress) {
++		if (rdev->background_radar_wdev &&
++		    cfg80211_chandef_identical(&rdev->background_radar_chandef, chandef))
++			queue_work(cfg80211_wq, &rdev->background_cac_abort_wk);
++		return false;
++	}
++
++	chandef->radar_bitmap = 0;
++	return true;
++}
+ 
+ void __cfg80211_radar_event(struct wiphy *wiphy,
+ 			    struct cfg80211_chan_def *chandef,
+@@ -967,6 +1028,11 @@ void __cfg80211_radar_event(struct wiphy
+ {
+ 	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
+ 
++	if (chandef->radar_bitmap &&
++	    cfg80211_chandef_device_present(chandef) &&
++	    cfg80211_radar_event_device(wiphy, chandef) == true)
++		return;
++
+ 	trace_cfg80211_radar_event(wiphy, chandef, offchan);
+ 
+ 	/* only set the chandef supplied channel to unavailable, in
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -4236,6 +4236,11 @@ int nl80211_send_chandef(struct sk_buff
+ 	if (nla_put_u16(msg, NL80211_ATTR_RADAR_BITMAP, chandef->radar_bitmap))
+ 		return -ENOBUFS;
+ 
++	if (nla_put_u32(msg, NL80211_ATTR_CENTER_FREQ_DEVICE,
++			chandef->center_freq_device) ||
++	    nla_put_u32(msg, NL80211_ATTR_CHANNEL_WIDTH_DEVICE, chandef->width_device))
++		return -ENOBUFS;
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL(nl80211_send_chandef);

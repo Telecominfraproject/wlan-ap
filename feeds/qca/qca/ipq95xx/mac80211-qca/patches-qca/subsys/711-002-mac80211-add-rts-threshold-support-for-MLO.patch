@@ -1,0 +1,171 @@
+From 2966223bc67628725ef813e905336c8e69540f7e Mon Sep 17 00:00:00 2001
+From: Aaradhana Sahu <quic_aarasahu@quicinc.com>
+Date: Fri, 17 Feb 2023 15:43:05 +0530
+Subject: [PATCH] mac80211: add rts threshold support for MLO
+
+Currently, all vaps rts threshold update when we run
+"iw phy<x> set rts <rts threshold value|off>" for MLO.
+But, should be update only for one vap not for all vaps,
+this is happen because in MLO case we have only one phy.
+
+So, add changes to support rts threshold by parsing link id
+and moving iw phy command to iw dev command for MLO.
+
+command:
+iw dev wlan# set rts -l <link_id> <rts threshold|off>
+
+Signed-off-by: Aaradhana Sahu <quic_aarasahu@quicinc.com>
+---
+ include/net/mac80211.h    |  4 +++-
+ net/mac80211/cfg.c        | 45 +++++++++++++++++++++++++++++++++------
+ net/mac80211/driver-ops.h | 11 ++++++----
+ net/mac80211/link.c       |  1 +
+ net/mac80211/trace.h      |  4 ++--
+ net/mac80211/util.c       |  2 +-
+ 6 files changed, 53 insertions(+), 14 deletions(-)
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -823,6 +823,7 @@
+ 
+ 	/* Critical Update flag*/
+ 	u32 critical_update_flag;
++	u32 rts_threshold;
+ };
+ 
+ /**
+@@ -4470,7 +4471,8 @@
+ 			    struct ieee80211_key_conf *key,
+ 			    struct ieee80211_key_seq *seq);
+ 	int (*set_frag_threshold)(struct ieee80211_hw *hw, u32 value);
+-	int (*set_rts_threshold)(struct ieee80211_hw *hw, u32 value);
++	int (*set_rts_threshold)(struct ieee80211_hw *hw, u32 value,
++				 struct ieee80211_vif *vif, int link_id);
+ 	int (*sta_add)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		       struct ieee80211_sta *sta);
+ 	int (*sta_remove)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -3134,10 +3134,14 @@
+ 	return 0;
+ }
+ 
+-static int ieee80211_set_wiphy_params(struct wiphy *wiphy, u32 changed)
++static int ieee80211_set_wiphy_params(struct wiphy *wiphy, u32 changed,
++				       struct wireless_dev *wdev, unsigned int link_id)
+ {
+ 	struct ieee80211_local *local = wiphy_priv(wiphy);
+-	int err;
++	struct ieee80211_sub_if_data *sdata;
++	int err, old_rts_threshold = 0;
++	struct ieee80211_bss_conf *link_conf = NULL;
++
+ 
+ 	if (changed & WIPHY_PARAM_FRAG_THRESHOLD) {
+ 		ieee80211_check_fast_xmit_all(local);
+@@ -3162,11 +3166,42 @@
+ 			return err;
+ 	}
+ 
+-	if (changed & WIPHY_PARAM_RTS_THRESHOLD) {
+-		err = drv_set_rts_threshold(local, wiphy->rts_threshold);
++	if (wdev) {
++		sdata = IEEE80211_WDEV_TO_SUB_IF(wdev);
+ 
+-		if (err)
+-			return err;
++		rcu_read_lock();
++		link_conf = rcu_dereference(sdata->vif.link_conf[link_id]);
++
++		if (!link_conf) {
++			rcu_read_unlock();
++			return -ENOLINK;
++		}
++
++		old_rts_threshold = link_conf->rts_threshold;
++
++		if (changed & WIPHY_PARAM_RTS_THRESHOLD) {
++			link_conf->rts_threshold = wiphy->rts_threshold;
++			rcu_read_unlock();
++			err = drv_set_rts_threshold(local, wiphy->rts_threshold, sdata, link_id);
++
++			if (err) {
++				rcu_read_lock();
++				link_conf = rcu_dereference(sdata->vif.link_conf[link_id]);
++				link_conf->rts_threshold = old_rts_threshold;
++				rcu_read_unlock();
++				return err;
++			}
++		}
++
++	} else {
++		if (changed & WIPHY_PARAM_RTS_THRESHOLD && !wiphy->num_hw) {
++			err = drv_set_rts_threshold(local, wiphy->rts_threshold, NULL, link_id);
++
++			if (err)
++				return err;
++		} else {
++			return -EOPNOTSUPP;
++		}
+ 	}
+ 
+ 	if (changed & WIPHY_PARAM_RETRY_SHORT) {
+--- a/net/mac80211/driver-ops.h
++++ b/net/mac80211/driver-ops.h
+@@ -401,15 +401,18 @@
+ }
+ 
+ static inline int drv_set_rts_threshold(struct ieee80211_local *local,
+-					u32 value)
++					 u32 value, struct ieee80211_sub_if_data *sdata,
++					 int link_id)
+ {
+ 	int ret = 0;
+ 
+ 	might_sleep();
+ 
+-	trace_drv_set_rts_threshold(local, value);
+-	if (local->ops->set_rts_threshold)
+-		ret = local->ops->set_rts_threshold(&local->hw, value);
++	trace_drv_set_rts_threshold(local, value, &sdata->vif, link_id);
++	if (sdata && local->ops->set_rts_threshold)
++		ret = local->ops->set_rts_threshold(&local->hw, value, &sdata->vif, link_id);
++	else if (local->ops->set_rts_threshold)
++		ret = local->ops->set_rts_threshold(&local->hw, value, NULL, link_id);
+ 	trace_drv_return_int(local, ret);
+ 	return ret;
+ }
+--- a/net/mac80211/trace.h
++++ b/net/mac80211/trace.h
+@@ -824,8 +824,8 @@
+ );
+ 
+ DEFINE_EVENT(local_u32_evt, drv_set_rts_threshold,
+-	TP_PROTO(struct ieee80211_local *local, u32 value),
+-	TP_ARGS(local, value)
++	TP_PROTO(struct ieee80211_local *local, u32 value, struct ieee80211_vif *vif, int link_id),
++	TP_ARGS(local, value, vif, link_id)
+ );
+ 
+ TRACE_EVENT(drv_set_coverage_class,
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -2671,7 +2671,7 @@
+ 	drv_set_frag_threshold(local, hw->wiphy->frag_threshold);
+ 
+ 	/* setup RTS threshold */
+-	drv_set_rts_threshold(local, hw->wiphy->rts_threshold);
++	drv_set_rts_threshold(local, hw->wiphy->rts_threshold, NULL, 0);
+ 
+ 	/* reset coverage class */
+ 	drv_set_coverage_class(local, hw->wiphy->coverage_class);
+--- a/net/mac80211/link.c
++++ b/net/mac80211/link.c
+@@ -37,6 +37,7 @@
+ 	link->conf = link_conf;
+ 	link_conf->link_id = link_id;
+ 	link_conf->vif = &sdata->vif;
++	link_conf->rts_threshold = (u32) -1;
+ 
+ 	INIT_WORK(&link->csa_finalize_work,
+ 		  ieee80211_csa_finalize_work);

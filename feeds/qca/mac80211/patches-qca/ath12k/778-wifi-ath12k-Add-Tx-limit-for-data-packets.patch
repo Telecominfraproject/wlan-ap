@@ -1,0 +1,137 @@
+From 8ff1dcb57da132e32e3db9be63992ca93433aaae Mon Sep 17 00:00:00 2001
+From: Karthikeyan Periyasamy <quic_periyasa@quicinc.com>
+Date: Wed, 24 May 2023 15:46:32 +0530
+Subject: [PATCH] wifi: ath12k: Add Tx limit for data packets
+
+Limit the Tx data packet per pdev based on the threshold of 0x8000
+by reserving 1k for EAPOL frames. Which helps memory usage in Multiclient
+setup with heavy traffic. Without the Tx limit check Multicast frames
+send lead to out of memory in the system where HW capable of processing
+more than the system memory profile.
+
+Signed-off-by: Karthikeyan Periyasamy <quic_periyasa@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h    |  2 ++
+ drivers/net/wireless/ath/ath12k/debugfs.c |  4 +++
+ drivers/net/wireless/ath/ath12k/dp.h      |  3 ++
+ drivers/net/wireless/ath/ath12k/mac.c     | 43 ++++++++++++++++++++++-
+ 4 files changed, 51 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1071,6 +1071,8 @@ struct ath12k_soc_dp_tx_err_stats {
+ 	/* TCL Ring Buffers unavailable */
+ 	u32 txbuf_na[DP_TCL_NUM_RING_MAX];
+ 
++	u32 threshold_limit;
++
+ 	/* Other failures during dp_tx due to mem allocation failure
+ 	 * idr unavailable etc.
+ 	 */
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -1647,6 +1647,10 @@ static ssize_t ath12k_debugfs_dump_soc_d
+ 				 i, soc_stats->tx_err.txbuf_na[i]);
+ 
+ 	len += scnprintf(buf + len, size - len,
++			 "\nThreshold limit: %d\n",
++			 soc_stats->tx_err.threshold_limit);
++
++	len += scnprintf(buf + len, size - len,
+ 			 "\nMisc Transmit Failures: %d\n",
+ 			 atomic_read(&soc_stats->tx_err.misc_fail));
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -277,6 +277,9 @@ struct ath12k_pdev_dp {
+ #define DP_REO_QREF_NUM		GENMASK(31, 16)
+ #define DP_MAX_PEER_ID		2047
+ 
++#define ATH12K_NUM_EAPOL_RESERVE	1024
++#define ATH12K_DP_PDEV_TX_LIMIT		(ATH12K_NUM_POOL_TX_DESC - ATH12K_NUM_EAPOL_RESERVE)
++
+ /* Total size of the LUT is based on 2K peers, each having reference
+  * for 17tids, note each entry is of type ath12k_reo_queue_ref
+  * hence total size is 2048 * 17 * 8 = 278528
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -9119,6 +9119,19 @@ static u8 ath12k_mac_get_tx_link(struct
+ 	return link;
+ }
+ 
++static bool ath12k_mac_tx_check_max_limit(struct ath12k *ar, struct sk_buff *skb)
++{
++	if (atomic_read(&ar->dp.num_tx_pending) > ATH12K_DP_PDEV_TX_LIMIT) {
++		/* Allow EAPOL */
++		if (!(skb->protocol == cpu_to_be16(ETH_P_PAE))) {
++			ar->ab->soc_stats.tx_err.threshold_limit++;
++			return true;
++		}
++	}
++
++	return false;
++}
++
+ static void ath12k_mac_op_tx(struct ieee80211_hw *hw,
+ 			     struct ieee80211_tx_control *control,
+ 			     struct sk_buff *skb)
+@@ -9191,7 +9204,19 @@ static void ath12k_mac_op_tx(struct ieee
+ 		ieee80211_free_txskb(hw, skb);
+ 		return;
+ 	}
++
++	ar = arvif->ar;
++
+ 	if (skb->fast_xmit) {
++		ret = ath12k_mac_tx_check_max_limit(ar, skb);
++		if (ret) {
++			ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
++				   "failed fast tx due to limit check pdev idx %d\n",
++				   ar->pdev_idx);
++			ieee80211_free_txskb(hw, skb);
++			return;
++		}
++
+ 		ret = ath12k_dp_tx_direct(arvif, skb);
+ 		if (unlikely(ret)) {
+ 			ath12k_dbg(arvif->ar->ab, ATH12K_DBG_MAC,
+@@ -9201,7 +9226,6 @@ static void ath12k_mac_op_tx(struct ieee
+ 		return;
+ 	}
+ 
+-	ar = arvif->ar;
+ 	ah = ar->ah;
+ 
+ 	if (key) {
+@@ -9251,6 +9275,15 @@ static void ath12k_mac_op_tx(struct ieee
+ 
+ 	if (!vif->valid_links || !is_mcast ||
+ 	    test_bit(ATH12K_FLAG_RAW_MODE, &ar->ab->ag->dev_flags)) {
++		ret = ath12k_mac_tx_check_max_limit(ar, skb);
++		if (ret) {
++			ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
++				   "failed due to limit check pdev idx %d\n",
++				   ar->pdev_idx);
++			ieee80211_free_txskb(hw, skb);
++			return;
++		}
++
+ 		ret = ath12k_dp_tx(ar, arvif, ahsta, skb, false, 0);
+ 		if (unlikely(ret)) {
+ 			if (ret == -ENOMEM)
+@@ -9281,6 +9314,15 @@ static void ath12k_mac_op_tx(struct ieee
+ 				continue;
+ 
+ 			tmp_ar = tmp_arvif->ar;
++
++			ret = ath12k_mac_tx_check_max_limit(tmp_ar, skb);
++			if (ret) {
++				ath12k_dbg(tmp_ar->ab, ATH12K_DBG_MAC,
++					   "failed mcast tx due to limit check pdev idx %d\n",
++					   tmp_ar->pdev_idx);
++				continue;
++			}
++
+ 			msdu_copied = skb_copy(skb, GFP_ATOMIC);
+ 			if (!msdu_copied) {
+ 				ath12k_err(ar->ab,

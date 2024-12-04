@@ -1,0 +1,255 @@
+From 11cd3fa507873a97437033356c477e594fd8fd62 Mon Sep 17 00:00:00 2001
+From: Karthikeyan Periyasamy <quic_periyasa@quicinc.com>
+Date: Sun, 12 Feb 2023 16:34:10 +0530
+Subject: [PATCH 2/4] wifi: ath12k: avoid hal rx descriptor access in
+ ath12k_dp_rx_h_find_peer
+
+After undecap, hal rx descriptor data invalid. so avoid access
+by prefetch the required data in rx_info which is used by
+ath12k_dp_rx_h_find_peer
+
+Signed-off-by: Karthikeyan Periyasamy <quic_periyasa@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_mon.c | 12 ++--
+ drivers/net/wireless/ath/ath12k/dp_rx.c  | 71 ++++++++++++++++++------
+ drivers/net/wireless/ath/ath12k/dp_rx.h  |  7 ++-
+ 3 files changed, 65 insertions(+), 25 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -2142,14 +2142,14 @@ static void ath12k_dp_mon_update_radiota
+ static void ath12k_dp_mon_rx_deliver_msdu(struct ath12k *ar, struct napi_struct *napi,
+ 					  struct sk_buff *msdu, u32 mpdu_idx,
+ 					  struct hal_rx_mon_ppdu_info *ppduinfo,
+-					  struct ieee80211_rx_status *status)
++					  struct ath12k_dp_rx_info *rx_info)
+ {
+ 	static const struct ieee80211_radiotap_he known = {
+ 		.data1 = cpu_to_le16(IEEE80211_RADIOTAP_HE_DATA1_DATA_MCS_KNOWN |
+ 				     IEEE80211_RADIOTAP_HE_DATA1_BW_RU_ALLOC_KNOWN),
+ 		.data2 = cpu_to_le16(IEEE80211_RADIOTAP_HE_DATA2_GI_KNOWN),
+ 	};
+-	struct ieee80211_rx_status *rx_status;
++	struct ieee80211_rx_status *rx_status, *status = rx_info->rx_status;
+ 	struct ieee80211_radiotap_he *he = NULL;
+ 	struct ieee80211_sta *pubsta = NULL;
+ 	struct ath12k_peer *peer;
+@@ -2168,7 +2168,7 @@ static void ath12k_dp_mon_rx_deliver_msd
+ 	if (!(status->flag & RX_FLAG_ONLY_MONITOR))
+ 		decap = ppduinfo->cmn_mpdu_info.mon_mpdu[mpdu_idx].msdu_info[0].decap_format;
+ 	spin_lock_bh(&ar->ab->base_lock);
+-	peer = ath12k_dp_rx_h_find_peer(ar->ab, msdu);
++	peer = ath12k_dp_rx_h_find_peer(ar->ab, msdu, rx_info);
+ 	if (peer && peer->sta) {
+ 		pubsta = peer->sta;
+ 		if (pubsta->valid_links) {
+@@ -2229,8 +2229,12 @@ static int ath12k_dp_mon_rx_deliver(stru
+ 	struct ath12k_pdev_dp *dp = &ar->dp;
+ 	struct sk_buff *mon_skb, *skb_next, *header;
+ 	struct ieee80211_rx_status *rxs = &dp->rx_status;
++	struct ath12k_dp_rx_info rx_info;
+ 	bool fcs_err = false;
+ 
++	rx_info.filled = 0;
++	rx_info.rx_status = rxs;
++
+ 	mon_skb = ath12k_dp_mon_rx_merg_msdus(ar, mpdu_idx, head_msdu,
+ 					      rxs, &fcs_err, ppduinfo);
+ 	if (!mon_skb)
+@@ -2258,7 +2262,7 @@ static int ath12k_dp_mon_rx_deliver(stru
+ 		rxs->flag |= RX_FLAG_ONLY_MONITOR;
+ 		ath12k_dp_mon_update_radiotap(ar, ppduinfo, mon_skb, rxs);
+ 		ath12k_dp_mon_rx_deliver_msdu(ar, napi, mon_skb, mpdu_idx,
+-					      ppduinfo, rxs);
++					      ppduinfo, &rx_info);
+ 		mon_skb = skb_next;
+ 	} while (mon_skb);
+ 	rxs->flag = 0;
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -2549,7 +2549,8 @@ static void ath12k_dp_rx_h_undecap(struc
+ }
+ 
+ struct ath12k_peer *
+-ath12k_dp_rx_h_find_peer(struct ath12k_base *ab, struct sk_buff *msdu)
++ath12k_dp_rx_h_find_peer(struct ath12k_base *ab, struct sk_buff *msdu,
++			 struct ath12k_dp_rx_info *rx_info)
+ {
+ 	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
+ 	struct hal_rx_desc *rx_desc = rxcb->rx_desc;
+@@ -2563,12 +2564,18 @@ ath12k_dp_rx_h_find_peer(struct ath12k_b
+ 	if (peer)
+ 		return peer;
+ 
+-	if (!rx_desc || !(ath12k_dp_rxdesc_mac_addr2_valid(ab, rx_desc)))
+-		return NULL;
+-
+-	peer = ath12k_peer_find_by_addr(ab,
++	if (!(rx_info->filled & BIT_ULL(ATH12K_RX_INFO_ADDR2))) {
++		if (rx_desc && ath12k_dp_rxdesc_mac_addr2_valid(ab, rx_desc)) {
++			ether_addr_copy(rx_info->addr2,
+ 					ath12k_dp_rxdesc_get_mpdu_start_addr2(ab,
+ 									      rx_desc));
++			rx_info->filled |= BIT_ULL(ATH12K_RX_INFO_ADDR2);
++		} else {
++			return NULL;
++		}
++	}
++
++	peer = ath12k_peer_find_by_addr(ab, rx_info->addr2);
+ 	return peer;
+ }
+ 
+@@ -2650,7 +2657,7 @@ static void ath12k_dp_rx_h_mpdu(struct a
+ 		rxcb->peer_id = ath12k_dp_rx_h_peer_id(ar->ab, rx_desc);
+ 
+ 	spin_lock_bh(&ar->ab->base_lock);
+-	peer = ath12k_dp_rx_h_find_peer(ar->ab, msdu);
++	peer = ath12k_dp_rx_h_find_peer(ar->ab, msdu, rx_info);
+ 	if (peer) {
+ 		/* If the pkt is a valid IP packet and peer supports
+ 		 * fast rx, deliver directly to net, also note that
+@@ -2817,6 +2824,12 @@ static void ath12k_dp_rx_h_fetch_info(st
+ {
+ 	rx_info->decap_type = ath12k_dp_rx_h_decap_type(ab, rx_desc);
+ 	rx_info->filled |= BIT_ULL(ATH12K_RX_INFO_DECAP_TYPE);
++
++	if (ath12k_dp_rxdesc_mac_addr2_valid(ab, rx_desc)) {
++		ether_addr_copy(rx_info->addr2,
++				ath12k_dp_rxdesc_get_mpdu_start_addr2(ab, rx_desc));
++		rx_info->filled |= BIT_ULL(ATH12K_RX_INFO_ADDR2);
++	}
+ }
+ 
+ void ath12k_dp_rx_h_ppdu(struct ath12k *ar, struct hal_rx_desc *rx_desc,
+@@ -2883,7 +2896,7 @@ void ath12k_dp_rx_h_ppdu(struct ath12k *
+ 
+ static void ath12k_dp_rx_deliver_msdu(struct ath12k *ar, struct napi_struct *napi,
+ 				      struct sk_buff *msdu,
+-				      struct ieee80211_rx_status *status)
++				      struct ath12k_dp_rx_info *rx_info)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+ 	static const struct ieee80211_radiotap_he known = {
+@@ -2894,12 +2907,13 @@ static void ath12k_dp_rx_deliver_msdu(st
+ 	struct ieee80211_radiotap_he *he;
+ 	struct ieee80211_rx_status *rx_status;
+ 	struct ieee80211_sta *pubsta;
+-	struct ath12k_peer *peer;
++	struct ath12k_peer *peer = NULL;
+ 	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
+ 	u8 decap = DP_RX_DECAP_TYPE_RAW;
+ 	bool is_mcbc = rxcb->is_mcbc;
+ 	bool is_eapol = rxcb->is_eapol;
+ 	struct ath12k_link_sta *arsta = NULL;
++	struct ieee80211_rx_status *status = rx_info->rx_status;
+ 
+ 	if (status->encoding == RX_ENC_HE && !(status->flag & RX_FLAG_RADIOTAP_HE) &&
+ 	    !(status->flag & RX_FLAG_SKIP_MONITOR)) {
+@@ -2908,11 +2922,16 @@ static void ath12k_dp_rx_deliver_msdu(st
+ 		status->flag |= RX_FLAG_RADIOTAP_HE;
+ 	}
+ 
+-	if (!(status->flag & RX_FLAG_ONLY_MONITOR))
+-		decap = ath12k_dp_rx_h_decap_type(ab, rxcb->rx_desc);
++	if (!(status->flag & RX_FLAG_ONLY_MONITOR) &&
++	    rx_info->filled & BIT_ULL(ATH12K_RX_INFO_DECAP_TYPE))
++		decap = rx_info->decap_type;
+ 
+ 	spin_lock_bh(&ab->base_lock);
+-	peer = ath12k_dp_rx_h_find_peer(ab, msdu);
++	peer = ath12k_dp_rx_h_find_peer(ab, msdu, rx_info);
++	if (rxcb->peer_id)
++		peer = ath12k_peer_find_by_id(ab, rxcb->peer_id);
++	if (!peer && (rx_info->filled & BIT_ULL(ATH12K_RX_INFO_ADDR2)))
++		peer = ath12k_peer_find_by_addr(ab, rx_info->addr2);
+ 
+ 	if (peer && peer->sta) {
+ 		pubsta = peer->sta;
+@@ -2925,13 +2944,12 @@ static void ath12k_dp_rx_deliver_msdu(st
+ 	spin_unlock_bh(&ab->base_lock);
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_DATA,
+-		   "rx skb %pK len %u peer %pM %d %s sn %u %s%s%s%s%s%s%s%s%s%s rate_idx %u vht_nss %u freq %u band %u flag 0x%x fcs-err %i mic-err %i amsdu-more %i\n",
++		   "rx skb %pK len %u peer %pM %d %s %s%s%s%s%s%s%s%s%s%s rate_idx %u vht_nss %u freq %u band %u flag 0x%x fcs-err %i mic-err %i amsdu-more %i\n",
+ 		   msdu,
+ 		   msdu->len,
+ 		   peer ? peer->addr : NULL,
+ 		   rxcb->tid,
+ 		   is_mcbc ? "mcast" : "ucast",
+-		   ath12k_dp_rx_h_seq_no(ab, rxcb->rx_desc),
+ 		   (status->encoding == RX_ENC_LEGACY) ? "legacy" : "",
+ 		   (status->encoding == RX_ENC_HT) ? "ht" : "",
+ 		   (status->encoding == RX_ENC_VHT) ? "vht" : "",
+@@ -3149,7 +3167,7 @@ static void ath12k_dp_rx_process_receive
+ 		}
+ 
+ 		if (!fast_rx)
+-			ath12k_dp_rx_deliver_msdu(ar, napi, msdu, &rx_status);
++			ath12k_dp_rx_deliver_msdu(ar, napi, msdu, &rx_info);
+ 	}
+ 
+ 	rcu_read_unlock();
+@@ -3486,6 +3504,8 @@ mic_fail:
+ 	(ATH12K_SKB_RXCB(msdu))->is_first_msdu = true;
+ 	(ATH12K_SKB_RXCB(msdu))->is_last_msdu = true;
+ 
++	ath12k_dp_rx_h_fetch_info(ab, rx_desc, &rx_info);
++
+ 	rxs->flag |= RX_FLAG_MMIC_ERROR | RX_FLAG_MMIC_STRIPPED |
+ 		    RX_FLAG_IV_STRIPPED | RX_FLAG_DECRYPTED;
+ 	skb_pull(msdu, hal_rx_desc_sz);
+@@ -4397,6 +4417,8 @@ static bool ath12k_dp_rx_h_rxdma_err(str
+ 	case HAL_REO_ENTR_RING_RXDMA_ECODE_TKIP_MIC_ERR:
+ 		err_bitmap = ath12k_dp_rx_h_mpdu_err(ab, rx_desc);
+ 		if (err_bitmap & HAL_RX_MPDU_ERR_TKIP_MIC) {
++			ath12k_dp_rx_h_fetch_info(ab, rx_desc, rx_info);
++
+ 			drop = ath12k_dp_rx_h_tkip_mic_err(ar, msdu, rx_info);
+ 			break;
+ 		}
+@@ -4447,7 +4469,7 @@ static void ath12k_dp_rx_wbm_err(struct
+ 		return;
+ 	}
+ 
+-	ath12k_dp_rx_deliver_msdu(ar, napi, msdu, &rxs);
++	ath12k_dp_rx_deliver_msdu(ar, napi, msdu, &rx_info);
+ }
+ 
+ int ath12k_dp_rx_process_wbm_err(struct ath12k_base *ab,
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -68,6 +68,7 @@ struct ath12k_dp_rx_rfc1042_hdr {
+ 
+ enum ath12k_dp_rx_info_type {
+ 	ATH12K_RX_INFO_DECAP_TYPE,
++	ATH12K_RX_INFO_ADDR2,
+ 
+ 	/* keep last */
+ 	ATH12K_RX_INFO_MAX
+@@ -76,6 +77,7 @@ enum ath12k_dp_rx_info_type {
+ struct ath12k_dp_rx_info {
+ 	u64 filled;
+ 	u8 decap_type;
++	u8 addr2[ETH_ALEN];
+ 	struct ieee80211_rx_status *rx_status;
+ };
+ 
+@@ -146,15 +148,14 @@ int ath12k_dp_rx_pktlog_stop(struct ath1
+ u8 ath12k_dp_rx_h_l3pad(struct ath12k_base *ab,
+ 			struct hal_rx_desc *desc);
+ struct ath12k_peer *
+-ath12k_dp_rx_h_find_peer(struct ath12k_base *ab, struct sk_buff *msdu);
++ath12k_dp_rx_h_find_peer(struct ath12k_base *ab, struct sk_buff *msdu,
++			 struct ath12k_dp_rx_info *rx_info);
+ u8 ath12k_dp_rx_h_decap_type(struct ath12k_base *ab,
+ 			     struct hal_rx_desc *desc);
+ u32 ath12k_dp_rx_h_mpdu_err(struct ath12k_base *ab,
+ 			    struct hal_rx_desc *desc);
+ void ath12k_dp_rx_h_ppdu(struct ath12k *ar, struct hal_rx_desc *rx_desc,
+ 			 struct ath12k_dp_rx_info *rx_info);
+-struct ath12k_peer *
+-ath12k_dp_rx_h_find_peer(struct ath12k_base *ab, struct sk_buff *msdu);
+ 
+ int ath12k_dp_rxdma_ring_sel_config_qcn9274(struct ath12k_base *ab);
+ int ath12k_dp_rxdma_ring_sel_config_wcn7850(struct ath12k_base *ab);

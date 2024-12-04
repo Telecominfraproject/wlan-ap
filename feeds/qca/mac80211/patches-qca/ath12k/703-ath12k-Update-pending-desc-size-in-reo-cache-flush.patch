@@ -1,0 +1,135 @@
+From dc3e3547bae9181ddf2698e97b88b5ac2f3d225f Mon Sep 17 00:00:00 2001
+From: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+Date: Wed, 14 Dec 2022 12:01:35 +0530
+Subject: [PATCH] ath12k: Update pending desc size in reo cache flush
+
+During rx_tid_del, if the desc size is greater than
+128 bytes, total desc size will be splitted into
+respetive 128 byte low and high address format and
+updated in flush cache descriptor. During failure
+case, we will have the entire rx_tid will be saved
+to reo_cmd list to free in next cycle. In a scenario,
+where one 128 byte desc is actually freed and the
+next desc is failed, we are still saving the entrie
+rx_tid and in the next cycle we will try to flush
+the same desc again which results in memory corruption.
+
+To fix this, update pending desc size to rx_tid struct
+and use that in next cycle while calculating total
+desc size in order to avoid updating same desc again.
+
+Added two soc_dp_stats variable to capture reo_cmd
+send failure and drain cmd stats.
+
+Signed-off-by: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h    |  2 ++
+ drivers/net/wireless/ath/ath12k/debugfs.c |  8 ++++++++
+ drivers/net/wireless/ath/ath12k/dp_rx.c   | 19 +++++++++----------
+ drivers/net/wireless/ath/ath12k/dp_rx.h   |  1 +
+ 4 files changed, 20 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -915,6 +915,8 @@ struct ath12k_soc_dp_stats {
+ 	u32 reo_error_drop[HAL_REO_DEST_RING_ERROR_CODE_MAX];
+ 	u32 hal_reo_error[DP_REO_DST_RING_MAX];
+ 	u32 mon_drop_desc;
++	u32 hal_reo_cmd_drain;
++	u32 reo_cmd_cache_error;
+ 	struct ath12k_soc_dp_tx_err_stats tx_err;
+ };
+ 
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -810,6 +810,14 @@ static ssize_t ath12k_debugfs_dump_soc_d
+ 			 "\nMon drop descriptor: %u\n",
+ 			 soc_stats->mon_drop_desc);
+ 
++	len += scnprintf(buf + len, size - len,
++			"\nHAL_REO_CMD_DRAIN Counter: %u\n",
++			soc_stats->hal_reo_cmd_drain);
++
++	len += scnprintf(buf + len, size - len,
++			"\nREO_CMD_CACHE_FLUSH Failure: %u\n",
++			soc_stats->reo_cmd_cache_error);
++
+ 	len += ath12k_debugfs_dump_soc_ring_bp_stats(ab, buf + len, size - len);
+ 
+ 	if (len > size)
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -682,7 +682,10 @@ static int ath12k_dp_reo_cache_flush(str
+ 	unsigned long tot_desc_sz, desc_sz;
+ 	int ret;
+ 
+-	tot_desc_sz = rx_tid->size;
++	if (rx_tid->pending_desc_size)
++		tot_desc_sz = rx_tid->pending_desc_size;
++	else
++		tot_desc_sz = rx_tid->size;
+ 	desc_sz = ath12k_hal_reo_qdesc_size(0, HAL_DESC_REO_NON_QOS_TID);
+ 
+ 	while (tot_desc_sz > desc_sz) {
+@@ -694,9 +697,7 @@ static int ath12k_dp_reo_cache_flush(str
+ 					     NULL);
+ 		if (ret)
+ 		{
+-			ath12k_warn(ab,
+-				    "failed to send HAL_REO_CMD_FLUSH_CACHE, tid %d (%d) desc_sz(%ld)\n",
+-				    rx_tid->tid, ret, desc_sz);
++			rx_tid->pending_desc_size = tot_desc_sz + desc_sz;
+ 			/* If this fails with ring full condition, then
+ 			 * no need to retry below as it is expected to
+ 			 * fail within short time */
+@@ -705,6 +706,7 @@ static int ath12k_dp_reo_cache_flush(str
+ 		}
+ 	}
+ 
++	rx_tid->pending_desc_size = desc_sz;
+ 	memset(&cmd, 0, sizeof(cmd));
+ 	cmd.addr_lo = lower_32_bits(rx_tid->paddr);
+ 	cmd.addr_hi = upper_32_bits(rx_tid->paddr);
+@@ -712,9 +714,6 @@ static int ath12k_dp_reo_cache_flush(str
+ 	ret = ath12k_dp_reo_cmd_send(ab, rx_tid,
+ 				     HAL_REO_CMD_FLUSH_CACHE,
+ 				     &cmd, ath12k_dp_reo_cmd_free);
+-	if (ret)
+-		ath12k_err(ab, "failed to send HAL_REO_CMD_FLUSH_CACHE cmd, tid %d (%d)\n",
+-			   rx_tid->tid, ret);
+ 
+ exit:
+ 	return ret;
+@@ -728,6 +727,7 @@ static void ath12k_dp_rx_tid_del_func(st
+ 	struct ath12k_dp_rx_reo_cache_flush_elem *elem, *tmp;
+ 
+ 	if (status == HAL_REO_CMD_DRAIN) {
++		ab->soc_stats.hal_reo_cmd_drain++;
+ 		goto free_desc;
+ 	} else if (status != HAL_REO_CMD_SUCCESS) {
+ 		/* Shouldn't happen! Cleanup in case of other failure? */
+@@ -767,12 +767,11 @@ static void ath12k_dp_rx_tid_del_func(st
+ 			if (ath12k_dp_reo_cache_flush(ab, &elem->data)) {
+ 				/* In failure case, just update the timestamp
+ 				 * for flush cache elem and continue */
++				ab->soc_stats.reo_cmd_cache_error++;
+ 				spin_lock_bh(&dp->reo_cmd_lock);
+ 				elem->ts = jiffies +
+ 					msecs_to_jiffies(ATH12K_DP_RX_REO_DESC_FREE_TIMEOUT_MS);
+-				ath12k_warn(ab, "Failed to send HAL_REO_CMD_FLUSH_CACHE cmd"
+-						"Updating timestamp (%ld) in the list\n", elem->ts);
+-				continue;			
++				break;
+ 			}
+ 			spin_lock_bh(&dp->reo_cmd_lock);
+ 			list_del(&elem->list);
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -17,6 +17,7 @@ struct ath12k_dp_rx_tid {
+ 	u32 *vaddr;
+ 	dma_addr_t paddr;
+ 	u32 size;
++	u32 pending_desc_size;
+ 	u32 ba_win_sz;
+ 	bool active;
+ 

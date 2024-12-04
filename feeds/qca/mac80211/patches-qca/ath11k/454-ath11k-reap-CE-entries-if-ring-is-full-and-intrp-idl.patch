@@ -1,0 +1,145 @@
+From adce52457ce04834a2bdd16f46890772f4bce9c1 Mon Sep 17 00:00:00 2001
+From: Sriram R <quic_srirrama@quicinc.com>
+Date: Fri, 14 Jul 2023 15:48:23 +0530
+Subject: [PATCH 1/2] ath11k: reap CE entries if ring is full and intrp idle
+ for 500ms
+
+If there is no buffer to send packet via HTC, then check if
+interrupts are not processed from that CE for last 500ms.
+If so, reap the CE ring and check if we could proceed for new enqueue.
+
+This change is added because there is a case where intermittently
+completion interrupts are not received from CE3 and hence adding
+this WAR in host to come out of this issue scenario.
+
+Signed-off-by: Karthikeyan Kathirvel <quic_kathirve@quicinc.com>
+Signed-off-by: Sriram R <quic_srirrama@quicinc.com>
+---
+ drivers/net/wireless/ath/ath11k/ce.c   | 41 ++++++++++++++++++++++++--
+ drivers/net/wireless/ath/ath11k/ce.h   |  4 ++-
+ drivers/net/wireless/ath/ath11k/core.c |  1 +
+ drivers/net/wireless/ath/ath11k/hal.c  |  6 ++--
+ drivers/net/wireless/ath/ath11k/hw.h   |  1 +
+ 5 files changed, 47 insertions(+), 6 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath11k/ce.c
++++ b/drivers/net/wireless/ath/ath11k/ce.c
+@@ -814,6 +814,31 @@ void ath11k_ce_poll_send_completed(struc
+ }
+ EXPORT_SYMBOL(ath11k_ce_per_engine_service);
+ 
++#define ATH11K_CE_RING_FULL_THRESHOLD_TIME_MS 500
++#define ATH11K_MAX_CE_MANUAL_RETRY	3
++/* Ths function is called from ce_send path. Returns true If there is no buffer
++ * to send packet via HTC, then check if interrupts are not processed from that
++ * CE for last 500ms. If so, poll manually to reap available entries.
++ */
++static bool ath11k_is_manual_ce_poll_needed(struct ath11k_base *ab,
++					    struct ath11k_ce_pipe *pipe,
++					    struct hal_srng *srng)
++{
++	if (!ab->hw_params.support_ce_manual_poll)
++		return false;
++
++	if (time_after
++	    (jiffies, pipe->timestamp + msecs_to_jiffies(ATH11K_CE_RING_FULL_THRESHOLD_TIME_MS)) &&
++	    (srng->u.src_ring.hp == srng->u.src_ring.reap_hp) &&
++		 (srng->u.src_ring.reap_hp == *srng->u.src_ring.tp_addr)) {
++		pipe->ce_manual_poll_count++;
++		pipe->last_ce_manual_poll_ts = jiffies;
++		return true;
++	}
++
++	return false;
++}
++
+ int ath11k_ce_send(struct ath11k_base *ab, struct sk_buff *skb, u8 pipe_id,
+ 		   u16 transfer_id)
+ {
+@@ -824,7 +849,7 @@ int ath11k_ce_send(struct ath11k_base *a
+ 	unsigned int nentries_mask;
+ 	int ret = 0;
+ 	u8 byte_swap_data = 0;
+-	int num_used;
++	int num_used, retry = 0;
+ 
+ 	/* Check if some entries could be regained by handling tx completion if
+ 	 * the CE has interrupts disabled and the used entries is more than the
+@@ -851,6 +876,7 @@ int ath11k_ce_send(struct ath11k_base *a
+ 	if (test_bit(ATH11K_FLAG_CRASH_FLUSH, &ab->dev_flags))
+ 		return -ESHUTDOWN;
+ 
++retry:
+ 	spin_lock_bh(&ab->ce.ce_lock);
+ 
+ 	write_index = pipe->src_ring->write_index;
+@@ -871,8 +897,17 @@ int ath11k_ce_send(struct ath11k_base *a
+ 	desc = ath11k_hal_srng_src_get_next_reaped(ab, srng);
+ 	if (!desc) {
+ 		ath11k_hal_srng_access_end(ab, srng);
+-		ret = -ENOBUFS;
+-		goto err_unlock;
++		if (retry++ < ATH11K_MAX_CE_MANUAL_RETRY &&
++		    ath11k_is_manual_ce_poll_needed(ab, pipe, srng)) {
++			spin_unlock_bh(&srng->lock);
++			spin_unlock_bh(&ab->ce.ce_lock);
++
++			ath11k_ce_tx_process_cb(pipe);
++			goto retry;
++		} else {
++			ret = -ENOBUFS;
++			goto err_unlock;
++		}
+ 	}
+ 
+ 	if (pipe->attr_flags & CE_ATTR_BYTE_SWAP_DATA)
+--- a/drivers/net/wireless/ath/ath11k/ce.h
++++ b/drivers/net/wireless/ath/ath11k/ce.h
+@@ -187,7 +187,9 @@ struct ath11k_ce_pipe {
+ 	struct ath11k_ce_ring *src_ring;
+ 	struct ath11k_ce_ring *dest_ring;
+ 	struct ath11k_ce_ring *status_ring;
+-	u64 timestamp;
++	unsigned long timestamp;
++	u32 ce_manual_poll_count;
++	u64 last_ce_manual_poll_ts;
+ 
+ 	struct ce_tasklet_entry_ts tasklet_ts;
+ 	struct ce_tasklet_time tracker[CE_TIME_DURATION_MAX];
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -903,6 +903,7 @@ static const struct ath11k_hw_params ath
+ 		.m3_offset = ATH11K_QMI_IPQ9574_M3_OFFSET,
+ 		.caldb_offset = ATH11K_QMI_IPQ9574_CALDB_OFFSET,
+ 		.bdf_offset = ATH11K_QMI_IPQ9574_BDF_OFFSET,
++		.support_ce_manual_poll=true,
+ 	},
+ };
+ 
+--- a/drivers/net/wireless/ath/ath11k/hal.c
++++ b/drivers/net/wireless/ath/ath11k/hal.c
+@@ -1442,10 +1442,12 @@ void ath11k_hal_dump_srng_stats(struct a
+ 		if (ath11k_ce_get_attr_flags(ab, i) & CE_ATTR_DIS_INTR)
+ 			continue;
+ 
+-		ath11k_info(ab, "CE_id %d pipe_num %d %ums before, sched_delay_gt_500US %u, exec_delay_gt_500US %u\n",
++		ath11k_info(ab, "CE_id %d pipe_num %d %ums before, sched_delay_gt_500US %u, exec_delay_gt_500US %u ce_manual_poll_count %d ce_last_manual_poll_done %ums before\n",
+ 			   i, ce_pipe->pipe_num,
+ 			   jiffies_to_msecs(jiffies - ce_pipe->timestamp),
+-			   ce_pipe->sched_delay_gt_500US, ce_pipe->exec_delay_gt_500US);
++			   ce_pipe->sched_delay_gt_500US, ce_pipe->exec_delay_gt_500US,
++			   ce_pipe->ce_manual_poll_count,
++			   jiffies_to_msecs(jiffies - ce_pipe->last_ce_manual_poll_ts));
+ 
+ 		for (j = 0; j < CE_TIME_DURATION_MAX; j++) {
+ 			last_sched = jiffies_to_msecs(jiffies -
+--- a/drivers/net/wireless/ath/ath11k/hw.h
++++ b/drivers/net/wireless/ath/ath11k/hw.h
+@@ -258,6 +258,7 @@ struct ath11k_hw_params {
+ 	u32 caldb_offset;
+ 	u32 qdss_offset;
+ 	u32 pageable_offset;
++	bool support_ce_manual_poll;
+ };
+ 
+ struct ath11k_hw_ops {

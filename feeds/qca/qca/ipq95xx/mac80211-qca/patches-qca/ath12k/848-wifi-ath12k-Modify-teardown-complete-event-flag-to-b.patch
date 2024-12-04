@@ -1,0 +1,293 @@
+From 8fcb5ad7663256fc2def09846559ddb7feb7b87a Mon Sep 17 00:00:00 2001
+From: Vignesh C <quic_vignc@quicinc.com>
+Date: Fri, 17 Nov 2023 11:39:07 +0530
+Subject: [PATCH] wifi: ath12k: Modify teardown complete event flag to be pdev
+ specific
+
+Currently, mlo_complete_event flag is used to notify when umac
+reset is completed during SSR recovery. This flag is kept in
+ath12k_base struct but in split phy architecture where two
+pdev can be present, this logic leads to issue where complete
+event is triggered even before umac reset is actually done.
+Also, clearing partner peer after umac reset has similar
+problem as peer delete is sent for wrong pdev because of
+additional loop to fetch pdev which is not needed.
+
+Fix this by making following changes:
+ 1) Move mlo_complete_event flag to be pdev specific and
+ trigger the complete once teardown complete is received
+ for all the pdev(s).
+ 2) Remove the additional loop to fetch pdev struct, instead
+ use the 'ar' struct from VIF database.
+
+Fixes: I4fca55044453:  ath12k: Add support for Mode 1 recovery
+
+Signed-off-by: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+Signed-off-by: Vignesh C <quic_vignc@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |   3 +-
+ drivers/net/wireless/ath/ath12k/mac.c  | 141 ++++++++++++-------------
+ drivers/net/wireless/ath/ath12k/wmi.c  |  24 ++++-
+ 3 files changed, 89 insertions(+), 79 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index 43fef42..5c0d4c5 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1053,6 +1053,8 @@ struct ath12k {
+ 
+ 	u64 delta_tsf2;
+ 	u64 delta_tqm;
++
++	bool mlo_complete_event;
+ };
+ 
+ struct ath12k_hw {
+@@ -1566,7 +1568,6 @@ struct ath12k_base {
+ 	u32 *crash_info_address;
+ 	u32 *recovery_mode_address;
+ 
+-	bool mlo_complete_event;
+ 	/* to identify multipd_architecture */
+ 	bool multi_pd_arch;
+ 	/* Mode1 specific flag to identify recovering pdev */
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 6b0f2b3..4fad25f 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -1207,7 +1207,6 @@ int ath12k_mac_partner_peer_cleanup(struct ath12k_base *ab, bool disassoc)
+ 
+ 	struct ath12k_base *partner_ab;
+ 	struct ath12k *ar;
+-	struct ath12k_pdev *pdev;
+ 	struct ath12k_hw_group *ag;
+ 	struct ath12k_link_vif *arvif;
+ 	struct ath12k_vif *ahvif;
+@@ -1216,7 +1215,7 @@ int ath12k_mac_partner_peer_cleanup(struct ath12k_base *ab, bool disassoc)
+ 	struct ath12k_sta *ahsta;
+ 	struct ath12k_link_sta *arsta;
+ 	struct ath12k_peer *peer, *tmp;
+-	int idx, rad_idx, count=0, ret = 0;
++	int idx, ret = 0;
+ 	u8 link_id;
+ 
+ 	ag = ab->ag;
+@@ -1227,74 +1226,69 @@ int ath12k_mac_partner_peer_cleanup(struct ath12k_base *ab, bool disassoc)
+ 		if (ab == partner_ab)
+ 			continue;
+ 
+-		for (rad_idx = 0; rad_idx < partner_ab->num_radios; rad_idx++) {
+-			pdev = &partner_ab->pdevs[rad_idx];
+-			ar = pdev->ar;
++		list_for_each_entry_safe(peer, tmp, &partner_ab->peers, list) {
++			if (!peer->sta || !peer->mlo || !peer->vif)
++				continue;
+ 
+-			/* TODO: Need to see if ab peers list is suffice for
+-			 * split phy case also
+-			 */
+-			list_for_each_entry_safe(peer, tmp, &partner_ab->peers, list) {
+-				count++;
+-				if (!peer->sta || !peer->mlo || !peer->vif)
+-					continue;
++			link_id = peer->link_id;
++			/* get arsta */
++			sta = peer->sta;
++			ahsta = ath12k_sta_to_ahsta(sta);
+ 
+-				link_id = peer->link_id;
+-				/* get arsta */
+-				sta = peer->sta;
+-				ahsta = ath12k_sta_to_ahsta(sta);
+-
+-				if (!disassoc) {
+-					arsta = ahsta->link[link_id];
+-
+-					/* get arvif */
+-					vif = peer->vif;
+-					ahvif = (struct ath12k_vif *)vif->drv_priv;
+-					arvif = ahvif->link[link_id];
+-
+-					mutex_lock(&ar->conf_mutex);
+-					ret = ath12k_peer_delete_send(ar, arvif->vdev_id, arsta->addr);
+-					if (ret) {
+-						mutex_unlock(&ar->conf_mutex);
+-						ath12k_warn(ar->ab,
+-							    "failed to delete peer vdev_id %d addr %pM ret %d\n",
+-							    arvif->vdev_id, arsta->addr, ret);
+-						continue;
+-					}
+-					ret = ath12k_wait_for_peer_delete_done(ar, arvif->vdev_id, arsta->addr);
+-					if (ret) {
+-						mutex_unlock(&ar->conf_mutex);
+-						continue;
+-					}
++			if (!disassoc) {
++				arsta = ahsta->link[link_id];
++
++				/* get arvif */
++				vif = peer->vif;
++				ahvif = (struct ath12k_vif *)vif->drv_priv;
++				arvif = ahvif->link[link_id];
++
++				ar = arvif->ar;
++				if (!ar)
++					continue;
+ 
+-					ar->num_peers--;
+-					arvif->num_stations--;
+-					ath12k_mac_dec_num_stations(arvif, arsta);
++				mutex_lock(&ar->conf_mutex);
++				ret = ath12k_peer_delete_send(ar, arvif->vdev_id, arsta->addr);
++				if (ret) {
++					mutex_unlock(&ar->conf_mutex);
++					ath12k_warn(ar->ab,
++						    "failed to delete peer vdev_id %d addr %pM ret %d\n",
++						    arvif->vdev_id, arsta->addr, ret);
++					continue;
++				}
++				ret = ath12k_wait_for_peer_delete_done(ar, arvif->vdev_id, arsta->addr);
++				if (ret) {
+ 					mutex_unlock(&ar->conf_mutex);
+-					cancel_work_sync(&arsta->update_wk);
+-				} else {
+-					/* Send low ack to disassoc the MLD station
+-					 * Need to check on the sequence as FW has
+-					 * discarded the management packet at this
+-					 * sequence.
++					continue;
++				}
++
++				ar->num_peers--;
++				arvif->num_stations--;
++				ath12k_mac_dec_num_stations(arvif, arsta);
++				mutex_unlock(&ar->conf_mutex);
++				cancel_work_sync(&arsta->update_wk);
++			} else {
++				/* Send low ack to disassoc the MLD station
++				 * Need to check on the sequence as FW has
++				 * discarded the management packet at this
++				 * sequence.
++				 */
++				if (sta->mlo && !ahsta->low_ack_sent) {
++					ath12k_dbg(ar->ab, ATH12K_DBG_MODE1_RECOVERY,
++						   "sending low ack for/disassoc:%pM\n",
++						   sta->addr);
++					/* set num of packets to maximum so
++					 * that we distinguish in the hostapd
++					 * to send disassoc irrespective of
++					 * hostapd conf
+ 					 */
+-					if (sta->mlo && !ahsta->low_ack_sent) {
+-						ath12k_dbg(ar->ab, ATH12K_DBG_MODE1_RECOVERY,
+-							   "sending low ack for/disassoc:%pM\n",
+-							   sta->addr);
+-						/* set num of packets to maximum so
+-						 * that we distinguish in the hostapd
+-						 * to send disassoc irrespective of
+-						 * hostapd conf
+-						 */
+-						ieee80211_report_low_ack(sta, 0xFFFF);
+-						/* Using this flag to avoid certain
+-						 * known warnings which will be
+-						 * triggerred when umac reset is
+-						 * happening
+-						 */
+-						ahsta->low_ack_sent = true;
+-					}
++					ieee80211_report_low_ack(sta, 0xFFFF);
++					/* Using this flag to avoid certain
++					 * known warnings which will be
++					 * triggerred when umac reset is
++					 * happening
++					 */
++					ahsta->low_ack_sent = true;
+ 				}
+ 			}
+ 		}
+@@ -10154,14 +10148,6 @@ int ath12k_mac_mlo_teardown_with_umac_reset(struct ath12k_base *ab)
+ 	for (i = 0; i < ag->num_chip; i++) {
+ 		partner_ab = ag->ab[i];
+ 
+-		if (ab == partner_ab) {
+-			/* No need to send teardown event for asserted chip, as
+-			 * anyway there will be no completion event from FW.
+-			 */
+-			ab->mlo_complete_event = true;
+-			continue;
+-		}
+-
+ 		for (j = 0; j < partner_ab->num_radios; j++) {
+ 			pdev = &partner_ab->pdevs[j];
+ 			ar = pdev->ar;
+@@ -10169,6 +10155,15 @@ int ath12k_mac_mlo_teardown_with_umac_reset(struct ath12k_base *ab)
+ 			if (!ar)
+ 				continue;
+ 
++			if (ab == partner_ab) {
++				/* No need to send teardown event for asserted
++				 * chip, as anyway there will be no completion
++				 * event from FW.
++				 */
++				ar->mlo_complete_event = true;
++				continue;
++			}
++
+ 			/* Need to umac_reset as 1 for only one chip */
+ 			umac_reset = false;
+ 			if (!ag->trigger_umac_reset) {
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.c b/drivers/net/wireless/ath/ath12k/wmi.c
+index 07f7477..b6c1190 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -942,7 +942,9 @@ static void ath12k_wmi_event_teardown_complete(struct ath12k_base *ab,
+ 	const void **tb;
+ 	const struct wmi_mlo_teardown_complete_fixed_param *ev;
+ 	struct ath12k_hw_group *ag = ab->ag;
+-	int ret, i;
++	struct ath12k_pdev *pdev;
++	struct ath12k *ar;
++	int ret, i, j;
+ 	bool complete_flag = true;
+ 
+ 	tb = ath12k_wmi_tlv_parse_alloc(ab, skb->data, skb->len, GFP_ATOMIC);
+@@ -967,12 +969,24 @@ static void ath12k_wmi_event_teardown_complete(struct ath12k_base *ab,
+ 
+ 	kfree(tb);
+ 
+-	ab->mlo_complete_event = true;
++	ar = ath12k_mac_get_ar_by_pdev_id(ab, ev->pdev_id);
++	if (!ar) {
++		ath12k_warn(ab, "invalid pdev id in teardown complete ev %d",
++			    ev->pdev_id);
++		return;
++	}
++	ar->mlo_complete_event = true;
++
+ 	for (i = 0; i < ag->num_chip; i++) {
+ 		ab = ag->ab[i];
+ 
+-		if (!ab->mlo_complete_event)
+-			complete_flag = false;
++		for (j = 0; j < ab->num_radios; j++) {
++			pdev = &ab->pdevs[j];
++			ar = pdev->ar;
++
++			if (!ar->mlo_complete_event)
++				complete_flag = false;
++		}
+ 	}
+ 
+ 	if (complete_flag && ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1)
+@@ -14528,7 +14542,7 @@ int ath12k_wmi_mlo_teardown(struct ath12k *ar, bool umac_reset)
+ 		dev_kfree_skb(skb);
+ 	}
+ 
+-	ar->ab->mlo_complete_event = false;
++	ar->mlo_complete_event = false;
+ 	return ret;
+ }
+ 
+-- 
+2.17.1
+

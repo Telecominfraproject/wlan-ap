@@ -1,0 +1,117 @@
+From 4113d5b856195de2df560221e002b7399cf7e8c2 Mon Sep 17 00:00:00 2001
+From: Thiraviyam Mariyappan <quic_tmariyap@quicinc.com>
+Date: Thu, 16 Jun 2022 14:00:38 +0530
+Subject: [PATCH] ath12k: handle 4addr NULL/EAPOL frame from wbm err path
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The authorized_to_send_wds flag is introduced from 802.11be chipset to handle
+the 4addr security vulnerability. Currently, this flag is set by firmware
+only after the peer is authorized. If this flag is not set, then all the 4addr
+frames sent by any 4addr sta will be routed to wbm error ring instead of
+regular reo ring.
+This behavior causing regression in upstream 4addr mode. AP will look for 4addr
+NULL frame from 4addr STA before EAPOL handshake in regular data path. Since
+the 4addr null frame is not received in regular data path, it's failing to
+create 4addr AP VLAN.
+To fix this issue, using wbm error path to receive 4addr NULL frame in case of
+the error “UNAUTHORIZED_WDS” and check whether the received the 4addr
+frame is QOS NULL or not and allow only that frame and other frames will be
+dropped.
+
+Signed-off-by: Thiraviyam Mariyappan <quic_tmariyap@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_rx.c    | 53 ++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/hal_desc.h |  4 ++
+ 2 files changed, 57 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
+index 7eea37a..a2dac25 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -3690,6 +3690,56 @@ static void ath12k_dp_rx_h_tkip_mic_err(struct ath12k *ar, struct sk_buff *msdu,
+ 			       HAL_ENCRYPT_TYPE_TKIP_MIC, status, false);
+ }
+ 
++static bool ath12k_dp_rx_h_4addr_null_frame_handler(struct ath12k *ar,  struct sk_buff *msdu,
++						    struct ieee80211_rx_status *status)
++{
++	struct ath12k_base *ab = ar->ab;
++	u16 msdu_len, peer_id;
++	u8 l3pad_bytes;
++	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
++	struct hal_rx_desc *rx_desc = (struct hal_rx_desc*)msdu->data;
++	u32 hal_rx_desc_sz = ar->ab->hw_params->hal_desc_sz;
++	struct ieee80211_hdr *hdr;
++	size_t hdr_len;
++	struct ath12k_dp_rx_rfc1042_hdr *llc;
++	bool drop = false;
++
++	msdu_len = ath12k_dp_rx_h_msdu_len(ab, rx_desc);
++	peer_id = ath12k_dp_rx_h_peer_id(ab, rx_desc);
++	ar->ab->soc_stats.rxdma_error[rxcb->err_code]++;
++
++	spin_lock_bh(&ab->base_lock);
++	if(!ath12k_peer_find_by_id(ab, peer_id)) {
++		spin_unlock_bh(&ab->base_lock);
++		ath12k_dbg(ab, ATH12K_DBG_DATA, "invalid peer id received in wbm err pkt%d\n",
++			   peer_id);
++		return -EINVAL;
++	}
++	spin_unlock_bh(&ab->base_lock);
++	l3pad_bytes = ath12k_dp_rx_h_l3pad(ab, rx_desc);
++
++	if ((hal_rx_desc_sz + l3pad_bytes + msdu_len) > DP_RX_BUFFER_SIZE)
++		return -EINVAL;
++
++	skb_put(msdu, hal_rx_desc_sz + l3pad_bytes + msdu_len);
++	skb_pull(msdu, hal_rx_desc_sz + l3pad_bytes);
++
++	ath12k_dp_rx_h_ppdu(ar, rx_desc, status);
++
++	ath12k_dp_rx_h_mpdu(ar, msdu, rx_desc, status);
++
++	rxcb->tid = ath12k_dp_rx_h_tid(ab, rx_desc);
++
++	hdr = (struct ieee80211_hdr *)msdu->data;
++	hdr_len = ieee80211_hdrlen(hdr->frame_control);
++	llc = msdu->data + hdr_len;
++
++	if (!(llc->snap_type == cpu_to_be16(ETH_P_PAE) ||
++	      ieee80211_is_qos_nullfunc(hdr->frame_control)))
++		drop = true;
++
++	return drop;
++}
+ static bool ath12k_dp_rx_h_rxdma_err(struct ath12k *ar,  struct sk_buff *msdu,
+ 				     struct ieee80211_rx_status *status)
+ {
+@@ -3702,6 +3752,9 @@ static bool ath12k_dp_rx_h_rxdma_err(struct ath12k *ar,  struct sk_buff *msdu,
+ 	ar->ab->soc_stats.rxdma_error[rxcb->err_code]++;
+ 
+ 	switch (rxcb->err_code) {
++	case HAL_REO_ENTR_RING_RXDMA_ECODE_UNAUTH_WDS_ERR:
++		drop = ath12k_dp_rx_h_4addr_null_frame_handler(ar, msdu, status);
++		break;
+ 	case HAL_REO_ENTR_RING_RXDMA_ECODE_DECRYPT_ERR:
+ 	case HAL_REO_ENTR_RING_RXDMA_ECODE_TKIP_MIC_ERR:
+ 		err_bitmap = ath12k_dp_rx_h_mpdu_err(ab, rx_desc);
+diff --git a/drivers/net/wireless/ath/ath12k/hal_desc.h b/drivers/net/wireless/ath/ath12k/hal_desc.h
+index d7de934..d06fdec 100644
+--- a/drivers/net/wireless/ath/ath12k/hal_desc.h
++++ b/drivers/net/wireless/ath/ath12k/hal_desc.h
+@@ -993,6 +993,10 @@ enum hal_reo_entr_rxdma_ecode {
+ 	HAL_REO_ENTR_RING_RXDMA_ECODE_FLOW_TIMEOUT_ERR,
+ 	HAL_REO_ENTR_RING_RXDMA_ECODE_FLUSH_REQUEST_ERR,
+ 	HAL_REO_ENTR_RING_RXDMA_ECODE_AMSDU_FRAG_ERR,
++	HAL_REO_ENTR_RING_RXDMA_ECODE_MULTICAST_ECHO_ERR,
++	HAL_REO_ENTR_RING_RXDMA_ECODE_AMSDU_ADDR_MISMATCH_ERR,
++	HAL_REO_ENTR_RING_RXDMA_ECODE_UNAUTH_WDS_ERR,
++	HAL_REO_ENTR_RING_RXDMA_ECODE_GROUPCAST_AMSDU_OR_WDS_ERR,
+ 	HAL_REO_ENTR_RING_RXDMA_ECODE_MAX,
+ };
+ 
+-- 
+2.17.1
+

@@ -1,0 +1,602 @@
+From 4cd05a8f61ed39c747e63d91ef649c3b2d228529 Mon Sep 17 00:00:00 2001
+From: Ganesh Babu Jothiram <quic_gjothira@quicinc.com>
+Date: Thu, 6 Apr 2023 00:22:59 +0530
+Subject: [PATCH 2/2] ath12k: sawf: add uplink configuration support.
+
+Driver shall register to ECM to provide uplink configuration support.
+The uplink configuration routine fetches the uplink configuration
+parameters from service class configuration and send peer tid letency
+configuration to firmware via wmi command WMI_PEER_TID_LATENCY_CONFIG_CMDID.
+
+Signed-off-by: Ganesh Babu Jothiram <quic_gjothira@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c |  33 ++++
+ drivers/net/wireless/ath/ath12k/core.h |   1 +
+ drivers/net/wireless/ath/ath12k/sawf.c | 202 +++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/sawf.h | 149 ++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.h  |   8 +
+ 5 files changed, 393 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -17,6 +17,7 @@
+ #include "dp_rx.h"
+ #include "debug.h"
+ #include "hif.h"
++#include "sawf.h"
+ 
+ unsigned int ath12k_debug_mask;
+ module_param_named(debug_mask, ath12k_debug_mask, uint, 0644);
+@@ -2362,6 +2363,21 @@ int ath12k_sawf_send_disable_soc(u8 svc_
+ 	return ret;
+ }
+ 
++int ath12k_core_sawf_ul_config(struct net_device *dev, struct ath12k_sawf_wmi_peer_latency_param *latency_info)
++{
++	struct ath12k_base *ab;
++	u16 peer_id;
++	int ret = -EOPNOTSUPP;
++
++	if (!latency_info)
++		return -EINVAL;
++
++	ab = ath12k_sawf_get_ab_from_netdev(dev, latency_info->peer_mac, &peer_id);
++	if (ab)
++		ret = ath12k_sawf_wmi_config_ul(ab, latency_info);
++	return ret;
++}
++
+ static int ath12k_init(void)
+ {
+ 	int ret;
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1430,6 +1430,7 @@ void ath12k_fw_stats_reset(struct ath12k
+ void ath12k_fw_stats_free(struct ath12k_fw_stats *stats);
+ int ath12k_send_sawf_configs_soc(struct ath12k_sawf_svc_params *new_param);
+ int ath12k_sawf_send_disable_soc(u8 svc_id);
++int ath12k_core_sawf_ul_config(struct net_device *dev, struct ath12k_sawf_wmi_peer_latency_param *latency_info);
+ 
+ static inline const char *ath12k_scan_state_str(enum ath12k_scan_state state)
+ {
+--- a/drivers/net/wireless/ath/ath12k/sawf.c
++++ b/drivers/net/wireless/ath/ath12k/sawf.c
+@@ -20,6 +20,7 @@ MODULE_PARM_DESC(sawf, "Enable SAWF feat
+ 
+ static struct ecm_classifier_emesh_sawf_callbacks ecm_wifi_sawf_callback = {
+ 	.update_service_id_get_msduq = ath12k_sawf_get_msduq,
++	.sawf_conn_sync = ath12k_sawf_config_ul,
+ };
+ 
+ static struct ath12k_sawf_ctx *sawf_ctx;
+@@ -41,6 +42,9 @@ void ath12k_sawf_init(struct ath12k_base
+ 		sawf_ctx->max_msduq_per_tid = ab->max_msduq_per_tid;
+ 		sawf_ctx->default_msduq_per_tid = ab->default_msduq_per_tid;
+ 		spin_lock_init(&sawf_ctx->sawf_svc_lock);
++		sawf_ctx->workqueue = create_singlethread_workqueue("sawf_wq");
++		INIT_WORK(&sawf_ctx->ul_configure, ath12k_send_ul_configs);
++		INIT_LIST_HEAD(&sawf_ctx->list);
+ 	} else {/* Already initialized */
+ 		return;
+ 	}
+@@ -50,6 +54,12 @@ void ath12k_sawf_init(struct ath12k_base
+ 	else
+ 		ath12k_dbg(ab, ATH12K_DBG_SAWF, "ECM msduq callback register success\n");
+ 
++	if (ecm_classifier_emesh_sawf_conn_sync_callback_register(&ecm_wifi_sawf_callback))
++		ath12k_err(NULL, "ECM uplink cfg cb reg fail\n");
++	else
++		ath12k_dbg(ab, ATH12K_DBG_SAWF,
++			   "ECM uplink cfg callback register success\n");
++
+ 	ath12k_info(NULL, "SAWF context initialized\n");
+ }
+ 
+@@ -58,18 +68,25 @@ void ath12k_sawf_deinit(struct ath12k_ba
+ 	if (!ath12k_sawf_enable)
+ 		return;
+ 
++	if (!sawf_ctx)
++                return;
++
+ 	/* During firmware crash recovery scenario, the SAWF context
+ 	 * will be retained.
+ 	 */
+-	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags))
+-		return;
+-
+-	if (!sawf_ctx)
++	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags)) {
++		cancel_work_sync(&sawf_ctx->ul_configure);
+ 		return;
++	}
+ 
+ 	ecm_classifier_emesh_sawf_msduq_callback_unregister();
+ 	ath12k_dbg(ab, ATH12K_DBG_SAWF, "ECM msduq callback unregister success\n");
+ 
++	ecm_classifier_emesh_sawf_conn_sync_callback_unregister();
++	ath12k_dbg(ab, ATH12K_DBG_SAWF, "ECM uplink cfg callback unregister success\n");
++
++	cancel_work_sync(&sawf_ctx->ul_configure);
++	destroy_workqueue(sawf_ctx->workqueue);
+ 	kfree(sawf_ctx);
+ 	sawf_ctx = NULL;
+ 	ath12k_info(NULL, "SAWF context freed\n");
+@@ -874,3 +891,249 @@ unlock_ab_base:
+ 	spin_unlock_bh(&ab->base_lock);
+ 	rcu_read_unlock();
+ }
++
++static void ath12k_sawf_core_send_ul_config(struct net_device *dev, u8 svc_id, u8 *mac_addr, u8 add_or_sub)
++{
++	struct ath12k_sawf_svc_params *svc_param;
++	struct ath12k_sawf_wmi_peer_latency_param latency_info;
++	struct ath12k_sawf_ctx *sawf;
++	int ret;
++
++	sawf = ath12k_get_sawf_context();
++	if (!sawf || !mac_addr)
++		return;
++
++	spin_lock_bh(&sawf->sawf_svc_lock);
++	if (!ath12k_svc_id_valid(svc_id) ||
++	    !ath12k_svc_id_configured(svc_id)) {
++		spin_unlock_bh(&sawf->sawf_svc_lock);
++		return;
++	}
++
++	svc_param = &sawf->svc_classes[SVC_INDEX(svc_id)];
++
++	if (!svc_param->ul_service_interval ||
++	    !svc_param->ul_burst_size) {
++		spin_unlock_bh(&sawf->sawf_svc_lock);
++		return;
++	}
++
++	latency_info.svc_id = svc_id;
++	latency_info.ul_enable = 1;
++	latency_info.sawf_ul_param = 1;
++	latency_info.ac = ath12k_tid_to_ac(svc_param->tid);
++	latency_info.latency_tid = svc_param->tid;
++	latency_info.service_interval = svc_param->ul_service_interval;
++	latency_info.burst_size = svc_param->ul_burst_size;
++	latency_info.min_throughput = svc_param->ul_min_tput;
++	latency_info.max_latency = svc_param->ul_max_latency;
++	latency_info.add_or_sub = add_or_sub;
++	latency_info.ofdma_disable = svc_param->ul_ofdma_disable ? 1 : 0;
++	latency_info.mu_mimo_disable = svc_param->ul_mu_mimo_disable ? 1 : 0;
++
++	spin_unlock_bh(&sawf->sawf_svc_lock);
++	ether_addr_copy(latency_info.peer_mac, mac_addr);
++
++	ret = ath12k_core_sawf_ul_config(dev, &latency_info);
++	if (ret)
++		ath12k_err(NULL,
++			   "SAWF:ul cfg fail for src peer %pM ret %d\n",
++			   mac_addr, ret);
++}
++
++void ath12k_send_ul_configs(struct work_struct *work)
++{
++	struct ath12k_sawf_ctx *sawf;
++	struct ath12k_ul_params *ul_params, *tmp;
++
++	sawf = ath12k_get_sawf_context();
++	if (!sawf) {
++		ath12k_err(NULL, "SAWF ctx is invalid\n");
++		return;
++	}
++
++	spin_lock_bh(&sawf->sawf_svc_lock);
++	list_for_each_entry_safe(ul_params, tmp, &sawf->list, list) {
++		list_del(&ul_params->list);
++		spin_unlock_bh(&sawf->sawf_svc_lock);
++
++		ath12k_sawf_core_send_ul_config(ul_params->src_dev,
++						ul_params->fw_service_id,
++						ul_params->src_mac,
++						ul_params->add_or_sub);
++		ath12k_sawf_core_send_ul_config(ul_params->dest_dev,
++						ul_params->rv_service_id,
++						ul_params->dst_mac,
++						ul_params->add_or_sub);
++		kfree(ul_params);
++		spin_lock_bh(&sawf->sawf_svc_lock);
++	}
++	spin_unlock_bh(&sawf->sawf_svc_lock);
++}
++
++void ath12k_sawf_config_ul(struct net_device *dest_dev, u8 *dst_mac, struct net_device *src_dev, u8 *src_mac,
++			   u8 fw_service_id, u8 rv_service_id,
++			   u8 add_or_sub)
++{
++	struct ath12k_sawf_ctx *sawf;
++	struct ath12k_ul_params *ul_params;
++
++	sawf = ath12k_get_sawf_context();
++	if (!sawf) {
++		ath12k_err(NULL, "SAWF ctx is invalid\n");
++		return;
++	}
++
++	ul_params = kzalloc(sizeof(*ul_params), GFP_NOWAIT);
++	if (!ul_params) {
++		ath12k_err(NULL,"Failed to allocate memory during SAWF UL configuration\n");
++		return;
++	}
++	ul_params->dest_dev = dest_dev;
++	ul_params->src_dev = src_dev;
++	ether_addr_copy(ul_params->dst_mac, dst_mac);
++	ether_addr_copy(ul_params->src_mac, src_mac);
++	ul_params->fw_service_id = fw_service_id;
++	ul_params->rv_service_id = rv_service_id;
++	ul_params->add_or_sub = add_or_sub;
++	spin_lock_bh(&sawf->sawf_svc_lock);
++	list_add_tail(&ul_params->list, &sawf->list);
++	spin_unlock_bh(&sawf->sawf_svc_lock);
++
++	queue_work(sawf->workqueue, &sawf->ul_configure);
++}
++
++int ath12k_sawf_wmi_config_peer_latency(struct ath12k *ar,
++				   struct ath12k_sawf_wmi_peer_latency_param *latency_info)
++{
++	struct ath12k_pdev_wmi *wmi = ar->wmi;
++	struct wmi_tid_latency_info *tid_latency_info;
++	struct wmi_peer_tid_latency_config_fixed_param *cmd;
++	struct sk_buff *skb;
++	struct wmi_tlv *tlv;
++	u32 len;
++	u32 num_peer = 1;
++	int ret;
++
++	if (!latency_info)
++		return -EINVAL;
++
++	len = sizeof(*cmd) + TLV_HDR_SIZE + (num_peer * sizeof(*tid_latency_info));
++	skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, len);
++	if (!skb) {
++		ath12k_warn(ar->ab, "wmi cfg peer latency fail-Outof Memory\n");
++		return -ENOMEM;
++	}
++
++	cmd = (struct wmi_peer_tid_latency_config_fixed_param *)skb->data;
++	cmd->tlv_header =
++		le32_encode_bits(WMI_TAG_PEER_TID_LATENCY_CONFIG_FIXED_PARAM,
++				 WMI_TLV_TAG) |
++		le32_encode_bits((sizeof(*cmd) - TLV_HDR_SIZE),
++				 WMI_TLV_LEN);
++
++	cmd->pdev_id = cpu_to_le32(ar->pdev->pdev_id);
++
++	tlv = (struct wmi_tlv *)(skb->data + sizeof(*cmd));
++	len = sizeof(*tid_latency_info) * num_peer;
++
++	tlv->header = le32_encode_bits(WMI_TAG_ARRAY_STRUCT, WMI_TLV_TAG) |
++		      le32_encode_bits(len, WMI_TLV_LEN);
++
++	tid_latency_info =
++		(struct wmi_tid_latency_info *)(skb->data + sizeof(*cmd) + TLV_HDR_SIZE);
++
++	tid_latency_info->tlv_header =
++		le32_encode_bits(WMI_TAG_TID_LATENCY_INFO,
++				 WMI_TLV_TAG) |
++		le32_encode_bits((sizeof(*tid_latency_info) - TLV_HDR_SIZE),
++				 WMI_TLV_LEN);
++
++	tid_latency_info->service_interval = cpu_to_le32(latency_info->service_interval);
++	tid_latency_info->burst_size_diff = cpu_to_le32(latency_info->burst_size);
++	tid_latency_info->max_latency = cpu_to_le32(latency_info->max_latency);
++	tid_latency_info->min_tput = cpu_to_le32(latency_info->min_throughput);
++
++	ether_addr_copy(tid_latency_info->destmac.addr, latency_info->peer_mac);
++
++	tid_latency_info->latency_tid_info =
++		le32_encode_bits(latency_info->latency_tid, LATENCY_TID_INFO_TID_NUM) |
++		le32_encode_bits(latency_info->ac, LATENCY_TID_INFO_AC) |
++		le32_encode_bits(latency_info->dl_enable, LATENCY_TID_INFO_DL_EN) |
++		le32_encode_bits(latency_info->ul_enable, LATENCY_TID_INFO_UL_EN) |
++		le32_encode_bits(latency_info->add_or_sub, LATENCY_TID_INFO_BURST_SZ_SUM) |
++		le32_encode_bits(latency_info->sawf_ul_param, LATENCY_TID_INFO_SAWF_UL_PARAM)|
++		le32_encode_bits(latency_info->ofdma_disable,
++				 LATENCY_TID_INFO_UL_OFDMA_DISABLE)|
++		le32_encode_bits(latency_info->mu_mimo_disable,
++				 LATENCY_TID_INFO_UL_MU_MIMO_DISABLE);
++
++	ret = ath12k_wmi_cmd_send(wmi, skb, WMI_PEER_TID_LATENCY_CONFIG_CMDID);
++	if (ret) {
++		ath12k_warn(ar->ab,
++			    "failed to submit WMI_PEER_TID_LATENCY_CONFIG_CMDID cmd %d\n",
++			    ret);
++		dev_kfree_skb(skb);
++	}
++
++	return ret;
++}
++
++int ath12k_sawf_wmi_config_ul(struct ath12k_base *ab,
++                              struct ath12k_sawf_wmi_peer_latency_param *latency_info)
++{
++	struct ath12k *ar;
++	struct ath12k_peer *peer;
++	int ret = -EOPNOTSUPP;
++
++	if (!ab ||
++	    !latency_info)
++		return -EINVAL;
++
++	spin_lock_bh(&ab->base_lock);
++
++	peer = ath12k_peer_find_by_addr(ab, latency_info->peer_mac);
++	if (!peer)
++		goto unlock_base_lock;
++
++	ath12k_dbg(ab, ATH12K_DBG_SAWF,
++		   "SAWF:Peer Found:config uplink:MAC %pM:svc_id %u\n",
++		   latency_info->peer_mac,
++		   latency_info->svc_id);
++
++	ath12k_dbg(ab, ATH12K_DBG_SAWF,
++		   "AC %u,TID %u,SVC interval %u,min_tput %u,max_latency %u",
++		   latency_info->ac,
++		   latency_info->latency_tid,
++		   latency_info->service_interval,
++		   latency_info->min_throughput,
++		   latency_info->max_latency);
++
++	ath12k_dbg(ab, ATH12K_DBG_SAWF,
++		   "Burst Sz %u,add_or_sub %u dl_en %d ul_en %d sawf_ul %d\n",
++		   latency_info->burst_size,
++		   latency_info->add_or_sub,
++		   latency_info->dl_enable,
++		   latency_info->ul_enable,
++		   latency_info->sawf_ul_param);
++
++	ath12k_dbg(ab, ATH12K_DBG_SAWF,
++		   "ofdma disable %d mu mimo disable %d\n",
++		   latency_info->ofdma_disable,
++		   latency_info->mu_mimo_disable);
++
++	ar = ab->pdevs[peer->pdev_idx].ar;
++	if (ar) {
++		spin_unlock_bh(&ab->base_lock);
++		ret = ath12k_sawf_wmi_config_peer_latency(ar, latency_info);
++		return ret;
++	} else {
++		ath12k_err(ab,"SAWF UL Cfg fail, pdev_idx %d ar NULL \n",
++			   peer->pdev_idx);
++	}
++
++unlock_base_lock:
++	spin_unlock_bh(&ab->base_lock);
++
++	return ret;
++}
+--- a/drivers/net/wireless/ath/ath12k/sawf.h
++++ b/drivers/net/wireless/ath/ath12k/sawf.h
+@@ -167,6 +167,17 @@ struct ath12k_sawf_svc_params {
+ 	bool configured;
+ };
+ 
++struct ath12k_ul_params {
++	struct list_head list;
++	struct net_device *dest_dev;
++	struct net_device *src_dev;
++	u8 dst_mac[ETH_ALEN];
++	u8 src_mac[ETH_ALEN];
++	u8 fw_service_id;
++	u8 rv_service_id;
++	u8 add_or_sub;
++};
++
+ /**
+  * struct ath12k_sawf_ctx- SAWF context
+  * @svc_classes: List of all service classes
+@@ -176,6 +187,9 @@ struct ath12k_sawf_ctx {
+ 	u32 max_msduq_per_tid;
+ 	u32 default_msduq_per_tid;
+ 	spinlock_t sawf_svc_lock;
++	struct workqueue_struct *workqueue;
++	struct work_struct ul_configure;
++	struct list_head list;
+ };
+ 
+ /**
+@@ -317,6 +331,150 @@ struct ath12k_htt_t2h_sawf_q_map_report
+ 	u32 tid_report[ATH12K_SAWF_MAX_TID_SUPPORT]; //MAX_TIDT
+ } __packed;
+ 
++/**
++ * struct wmi_peer_latency_info_params - peer latency info params
++ * @peer_mac: peer mac address
++ * @service_interval: service interval in miliseconds
++ * @burst_size: burst size in bytes
++ * @latency_tid: tid associated with this latency information
++ * @ac: Access Category associated with this tid
++ * @ul_enable: Bit to indicate ul latency enable
++ * @dl_enable: Bit to indicate dl latency enable
++ * @flow_id: Flow id associated with tid
++ * @add_or_sub: Bit to indicate add/delete of latency params
++ * @sawf_ul_param: Bit to indicate if UL params are for SAWF/SCS
++ * @max_latency: Maximum latency in milliseconds
++ * @min_throughput: Minimum throughput in Kbps
++ */
++struct ath12k_sawf_wmi_peer_latency_param {
++	u8 svc_id;
++	u8 peer_mac[ETH_ALEN];
++	u32 service_interval;
++	u32 burst_size;
++	u32	latency_tid :8,
++		ac          :2,
++		ul_enable   :1,
++		dl_enable   :1,
++		flow_id     :4,
++		add_or_sub  :2,
++		sawf_ul_param :1,
++		ofdma_disable :1,
++		mu_mimo_disable :1,
++		reserved    :11;
++	u32 max_latency;
++	u32 min_throughput;
++};
++
++#define LATENCY_TID_INFO_TID_NUM		GENMASK(7, 0)
++#define LATENCY_TID_INFO_AC			GENMASK(9, 8)
++#define LATENCY_TID_INFO_DL_EN			BIT(10)
++#define LATENCY_TID_INFO_UL_EN			BIT(11)
++#define LATENCY_TID_INFO_BURST_SZ_SUM		GENMASK(13, 12)
++#define LATENCY_TID_INFO_MSDUQ_ID		GENMASK(17, 14)
++#define LATENCY_TID_INFO_UL_OFDMA_DISABLE	BIT(18)
++#define LATENCY_TID_INFO_UL_MU_MIMO_DISABLE	BIT(19)
++#define LATENCY_TID_INFO_SAWF_UL_PARAM		BIT(20)
++
++/* struct wmi_peer_tid_latency_config_fixed_param:
++ * Currently wmi_peer_tid_set_latency_request_fixed_param will be sent
++ * per TID per latency configured client.
++ * In future this command might come for multiple latency configured
++ * clients together.
++ * The clients are expected to be associated while receiving this command.
++ * @tlv_header
++ * 	TLV tag and len;
++ * @pdev_id
++ *	device ID
++ */
++struct wmi_peer_tid_latency_config_fixed_param {
++	__le32 tlv_header;
++	__le32 pdev_id;
++} __packed;
++
++/** struct wmi_tid_latency_info
++ * @tlv_header:
++ *	TLV Tag and Len
++ * @wmi_mac_addr destmac
++ * 	Mac address of end client
++ * @service_interval
++ * 	Maximum expected average delay between 2 schedules in milliseconds
++ * 	of given TID type when it has active traffic.
++ * 	0x0 is considered as invalid service interval.
++ * @burst_size_diff
++ * 	Cumulative number of bytes are expected to be transmitted or
++ * 	received in the service interval when this specific Peer-TID
++ * 	has active traffic.
++ * 	If cumulative number of bytes is 0x0, it is considered as
++ * 	invalid burst size.  In that case, firmware would try to transmit
++ * 	and receive as many bytes as it can for this specific Peer-TID.
++ * 	This burst size will be added or subtracted from vdev burst size
++ * 	based on burst size sum bit in latency tid info.
++ * 	The VDEV burst size will be considered to be 0 when no VDEV latency
++ * 	command is received.
++ * 	If host needs to set burst size for a peer then they can use the
++ * 	peer cmd and set burst size sum bit to 1.
++ * @max_latency
++ * 	The maximum end to end latency expectation, in milliseconds.
++ * 	If this value is 0x0, it shall be ignored.
++ * @max_per
++ * 	The maximum PER (as a percent) for the peer-TID, in range 1 - 100
++ * 	If this value is 0x0, it shall be ignored.
++ * @min_tput
++ * 	The minimum guaranteed throughput to the peer-TID, in Kbps.
++ * 	If this value is 0x0, it shall be ignored.
++ * @latency_tid_info
++ *  Bits 21-31      - Reserved (Shall be zero)
++ *  Bit  20         - Flag to indicate SAWF UL params (and not mesh latenc
++ *  Bit  19         - Disable UL MU-MIMO. If set, UL MU-MIMO is disabled
++ *                    for the specified AC. Note that TID level control is
++ *                    not possible for UL MU-MIMO (the granularity is AC).
++ *  Bit  18         - Disable UL OFDMA. If set, UL OFDMA is disabled for
++ *                    the specified AC. Note that TID level control is not
++ *                    possible for UL OFDMA (the granularity is AC).
++ *  Bits 14-17      - MSDU queue flow id within the TID for configuring
++ *                    latency info per MSDU flow queue
++ *  Bit  12-13      - burst size sum. Bit to indicate whether to add or
++ *                    subtract burst_size_diff from vdev cmd burst size:
++ *                    1 -> addition
++ *                    2 -> subtraction
++ *  Bit   11        - UL latency config indication.
++ *                    If this bit is set then this latency info will
++ *                    be used when triggering UL traffic.  Until the
++ *                    AC specified in bits 8-9 has transferred at least
++ *                    burst_size amount of UL data within the service
++ *                    period, the AP will continue sending UL triggers
++ *                    when the STA has data of the specified access
++ *                    category ready to transmit.
++ *                    Note that the TID specified in bits 0-7 does not
++ *                    apply to UL; the TID-to-AC mapping applied to DL
++ *                    data that can be adjusted by the TID specified
++ *                    in bits 0-7 and the AC specified in bits 8-9 is
++ *                    distinct from the TID-to-AC mapping applied to
++ *                    UL data.
++ *  Bit   10        - DL latency config indication. If the bit is set
++ *                    then DL TID will use this latency config.
++ *  Bits  8 - 9     - This bit has info on the custom AC of DL TID.
++ *                    Also if bit 11 is set, the AP will apply some
++ *                    of these latency specs (in particular, burst_size)
++ *                    to UL traffic for this AC, by sending UL triggers
++ *                    until the desired amount of data has been received
++ *                    within the service period.
++ *  Bits  0 - 7     - Specifies the TID of interest that corresponds
++ *                    to the AC specified in bits 8-9.  This can be
++ *                    used to adjust the TID-to-AC mapping applied to
++ *                    DL data (if bit 10 is set).
++ */
++struct wmi_tid_latency_info {
++	__le32 tlv_header;
++	struct wmi_mac_addr destmac;
++	__le32 service_interval;
++	__le32 burst_size_diff;
++	__le32 max_latency;
++	__le32 max_per;
++	__le32 min_tput;
++	__le32 latency_tid_info;
++} __packed;
++
+ extern bool ath12k_sawf_enable;
+ struct ath12k_sawf_ctx *ath12k_get_sawf_context(void);
+ void ath12k_sawf_init(struct ath12k_base *ab);
+@@ -330,9 +488,15 @@ int ath12k_get_tid(u8 svc_id);
+ int ath12k_sawf_reconfigure_on_crash(struct ath12k_base *ab);
+ int ath12k_create_send_svc_params(struct ath12k_sawf_svc_params *param);
+ int ath12k_sawf_disable_config(u8 svc_id);
++void ath12k_send_ul_configs(struct work_struct *work);
+ u16 ath12k_sawf_get_msduq(struct net_device *netdev,
+ 			  u8 *peer_mac, u32 service_id,
+ 			  u32 dscp, u32 rule_id);
++void ath12k_sawf_config_ul(struct net_device *dest_dev, u8 *dst_mac, struct net_device *src_dev,  u8 *src_mac,
++			   u8 fw_service_id, u8 rv_service_id,
++			   u8 add_or_sub);
++int ath12k_sawf_wmi_config_ul(struct ath12k_base *ab,
++			      struct ath12k_sawf_wmi_peer_latency_param *latency_info);
+ struct ath12k_base *ath12k_sawf_get_ab_from_netdev(struct net_device *dev,
+ 						u8 *peer_mac,
+ 						u16 *peer_id);
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -390,6 +390,7 @@ enum wmi_cmd_group {
+ 	WMI_GRP_TWT            = 0x3e,
+ 	WMI_GRP_MOTION_DET     = 0x3f,
+ 	WMI_GRP_SPATIAL_REUSE  = 0x40,
++	WMI_GRP_LATENCY        = 0x47,
+ 	WMI_GRP_MLO	       = 0x48,
+ 	WMI_GRP_SAWF           = 0x49,
+ };
+@@ -818,6 +819,11 @@ enum wmi_tlv_cmd_id {
+ 	WMI_PDEV_OBSS_PD_SPATIAL_REUSE_CMDID =
+ 				WMI_TLV_CMD(WMI_GRP_SPATIAL_REUSE),
+ 	WMI_PDEV_OBSS_PD_SPATIAL_REUSE_SET_DEF_OBSS_THRESH_CMDID,
++	/** WMI commands specific to Tid level Latency config **/
++	/** VDEV Latency Config command */
++	WMI_VDEV_TID_LATENCY_CONFIG_CMDID = WMI_TLV_CMD(WMI_GRP_LATENCY),
++	/** TID Latency Request command */
++	WMI_PEER_TID_LATENCY_CONFIG_CMDID,
+ 	WMI_MLO_LINK_SET_ACTIVE_CMDID = WMI_TLV_CMD(WMI_GRP_MLO),
+ 	WMI_MLO_SETUP_CMDID,
+ 	WMI_MLO_READY_CMDID,
+@@ -2142,6 +2148,8 @@ enum wmi_tlv_tag {
+ 	WMI_TAG_REG_CHAN_LIST_CC_EXT_EVENT,
+ 	WMI_TAG_VDEV_SET_TPC_POWER_CMD = 0x3B5,
+ 	WMI_TAG_VDEV_CH_POWER_INFO,
++	WMI_TAG_PEER_TID_LATENCY_CONFIG_FIXED_PARAM = 0x3B9,
++	WMI_TAG_TID_LATENCY_INFO,
+ 	WMI_CTRL_PATH_CAL_STATS = 0x3BC,
+ 	WMI_CTRL_PATH_BTCOEX_STATS = 0x3FD,
+ 	WMI_TAG_EHT_RATE_SET = 0x3C4,

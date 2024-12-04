@@ -1,0 +1,311 @@
+#!/usr/bin/ucode
+
+'use strict';
+
+import { ulog_open, ulog, ULOG_SYSLOG, ULOG_STDIO, LOG_DAEMON, LOG_INFO } from 'log';
+import * as libubus from 'ubus';
+import * as uloop from 'uloop';
+import * as libuci from 'uci';
+import * as math from 'math';
+import * as fs from 'fs';
+
+const DISCOVER = 0;
+const VALIDATING = 1;
+const ONLINE = 2;
+const OFFLINE = 3;
+const ORPHAN = 4;
+
+let ubus = libubus.connect();
+let uci = libuci.cursor();
+let state = DISCOVER;
+let validate_time;
+let offline_time;
+let orphan_time;
+let interval;
+let timeouts = {
+	'offline': 120,
+	'validate': 120,
+	'orphan': 120,
+};
+
+ulog_open(ULOG_SYSLOG | ULOG_STDIO, LOG_DAEMON, "cloud_discover");
+
+ulog(LOG_INFO, 'Start\n');
+
+uloop.init();
+
+function readjsonfile(path) {
+	let file = fs.readfile(path);
+	if (file)
+		file = json(file);
+	return file;
+}
+
+function timeouts_load(){
+	let data = uci.get_all('ucentral', 'timeouts');
+
+	for (let key in [ 'offline', 'validate', 'orphan' ])
+		if (data && data[key])
+			timeouts[key] = +data[key];
+	let time_skew = timeouts.offline / 50 * (math.rand() % 50);
+	timeouts.offline_skew = timeouts.offline + time_skew;
+	ulog(LOG_INFO, 'Randomizing offline time from %d->%d \n', timeouts.offline, timeouts.offline_skew);
+	
+	time_skew = timeouts.orphan / 50 * (math.rand() % 50);
+	timeouts.orphan_skew = timeouts.orphan + time_skew;
+	ulog(LOG_INFO, 'Randomizing orphan time from %d->%d \n', timeouts.orphan, timeouts.orphan_skew);
+}
+
+function client_start() {
+	ulog(LOG_INFO, '(re)starting client\n');
+	system('/etc/init.d/ucentral restart');
+}
+
+function dhcp_restart() {
+	ulog(LOG_INFO, 'restarting dhcp\n');
+	system('killall -USR1 udhcpc');
+}
+
+function ntp_restart() {
+	ulog(LOG_INFO, 'restarting ntp\n');
+	system('/etc/init.d/sysntpd restart');
+}
+
+function gateway_load() {
+	return readjsonfile('/etc/ucentral/gateway.json');
+}
+
+function gateway_write(data) {
+	let gateway = gateway_load();
+	gateway ??= {};
+	let new = {};
+	let changed = false;
+	for (let key in [ 'server', 'port', 'valid' ]) {
+		if (exists(data, key))
+			new[key] = data[key];
+		else if (exists(gateway, key))
+			new[key] = gateway[key];
+		if (new[key] != gateway[key])
+			changed = true;
+	}
+	if (changed)
+		fs.writefile('/etc/ucentral/gateway.json', new);
+	return changed;
+}
+
+function gateway_available() {
+	let gateway = gateway_load();
+	if (!gateway || !gateway.server || !gateway.port)
+		return false;
+	return true;
+}
+
+function set_state(set) {
+	if (state == set)
+		return;
+	let prev = state;
+	state = set;
+
+	switch(state) {
+	case DISCOVER:
+		ulog(LOG_INFO, 'Setting cloud to undiscovered\n');
+		fs.unlink('/tmp/cloud.json');
+		fs.unlink('/etc/ucentral/gateway.json');
+		gateway_write({ valid: false });
+		dhcp_restart();
+		break;
+
+	case VALIDATING:
+		ulog(LOG_INFO, 'Wait for validation\n');
+		validate_time = time();
+		state = VALIDATING;
+		break;
+
+	case ONLINE:
+		ulog(LOG_INFO, 'Connected to cloud\n');
+		if (prev == VALIDATING) {
+			ulog(LOG_INFO, 'Setting cloud controller to validated\n');
+			gateway_write({ valid: true });
+		}
+		break;
+
+	case OFFLINE:
+		ulog(LOG_INFO, 'Lost connection to cloud\n');
+		offline_time = time();
+		break;
+
+	case ORPHAN:
+		ulog(LOG_INFO, 'Device is an orphan\n');
+		orphan_time = time();
+		break;
+	}
+}
+
+function discover_dhcp() {
+	let dhcp = readjsonfile('/tmp/cloud.json');
+	if (dhcp?.dhcp_server && dhcp?.dhcp_port) {
+		if (gateway_write({ server: dhcp.dhcp_server, port:dhcp.dhcp_port, valid: false })) {
+			ulog(LOG_INFO, `Discovered cloud via DHCP ${dhcp.dhcp_server}:${dhcp.dhcp_port}\n`);
+			client_start();
+			set_state(VALIDATING);
+		}
+		return true;
+	}
+	return !dhcp?.lease;
+}
+
+function redirector_lookup() {
+	const path = '/tmp/ucentral.redirector';
+	ulog(LOG_INFO, 'Contact redirector service\n');
+	let serial = uci.get('ucentral', 'config', 'serial');
+
+	fs.unlink(path);
+	system(`wget http://ucentral.io/${serial} -O /tmp/ucentral.redirector`);
+	if (!fs.stat(path))
+		return;
+	let redir = readjsonfile(path);
+	if (redir?.server && redir?.port) {
+                if (gateway_write({ server: redir.server, port: redir.port, valid: false })) {
+			ulog(LOG_INFO, `Discovered cloud via lookup service ${redir.server}:${redir.port}\n`);
+                        client_start();
+                	set_state(VALIDATING);
+		}
+	}
+}
+
+function discover_flash() {
+	if (!fs.stat('/etc/ucentral/gateway.flash'))
+		return false;
+	ulog(LOG_INFO, 'Using pre-populated cloud information\n');
+	fs.writefile('/etc/ucentral/gateway.json', fs.readfile('/etc/ucentral/gateway.flash'));
+	client_start();
+	set_state(VALIDATING);
+}
+
+function time_is_valid() {
+	let valid = !!fs.stat('/tmp/ntp.set');
+	if (!valid)
+		ntp_restart();
+	ulog(LOG_INFO, `Time is ${valid ? '': 'not '}valid\n`);
+	return valid;
+}
+
+function interval_handler() {
+	printf(`State ${state}\n`);
+	switch(state) {
+	case ORPHAN:
+		if (time() - orphan_time <= timeouts.orphan_skew)
+			break;
+		orphan_time = time();
+	
+		/* fall through */
+
+	case DISCOVER:
+		ulog(LOG_INFO, 'Starting discover\n');
+	
+		if (!time_is_valid())
+			return;
+
+		if (discover_dhcp())
+			return;
+
+		if (discover_flash())
+			return;
+
+		redirector_lookup();
+		break;
+
+	case VALIDATING:
+		if (time() - validate_time <= timeouts.validate)		
+			break;
+		ulog(LOG_INFO, 'validation failed, restarting discovery process\n');
+		set_state(DISCOVER);
+		break;
+
+	case OFFLINE:
+		if (time() - offline_time <= timeouts.offline_skew)		
+			break;
+		ulog(LOG_INFO, 'offline for too long, setting device as orphaned\n');
+		set_state(ORPHAN);
+		break;
+	}
+}
+
+let ubus_methods = {
+	discover: {
+		call: function(req) {
+			set_state(DISCOVER);
+			return 0;
+		},
+		args: {
+		}
+	},
+	renew: {
+		call: function(req) {
+			if (state != ONLINE)
+				return;
+
+			ulog(LOG_INFO, 'Validate cloud due to DHCP renew event\n');
+
+			let gateway = gateway_load();
+			let cloud = readjsonfile('/tmp/cloud.json');
+			if (!cloud?.dhcp_server || !cloud?.dhcp_port)
+				return 0;
+
+			if (cloud.dhcp_server != gateway?.server || cloud.dhcp_port != gateway?.port)
+				set_state(DISCOVER);
+			else
+				ulog(LOG_INFO, 'Cloud has not changed\n');
+		},
+		args: {
+		}
+	},
+	online: {
+		call: function(req) {
+			set_state(ONLINE);
+			return 0;
+		},
+		args: {
+		}
+	},
+	offline: {
+		call: function(req) {
+			if (state == ONLINE)
+				set_state(OFFLINE);
+			return 0;
+		},
+		args: {
+		}
+	},
+	reload: {
+		call: function(req) {
+			timeouts_load();
+			return 0;
+		},
+		args: {
+
+		}
+	},
+};
+
+if (gateway_available()) {
+	let status = ubus.call('ucentral', 'status');
+	ulog(LOG_INFO, 'cloud is known\n');
+	if (status?.connected) {
+		state = ONLINE;
+	} else {
+		client_start();
+		set_state(VALIDATING);
+	}
+} else {
+	dhcp_restart();
+}
+
+timeouts_load();
+
+interval = uloop.interval(10000, interval_handler);
+
+ubus.publish('cloud', ubus_methods);
+
+uloop.run();
+uloop.done();

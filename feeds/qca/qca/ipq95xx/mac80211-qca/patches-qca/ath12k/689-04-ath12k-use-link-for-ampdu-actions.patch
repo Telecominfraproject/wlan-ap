@@ -1,0 +1,277 @@
+From 730447816c719660905e4b4d298139ef17663787 Mon Sep 17 00:00:00 2001
+From: Sriram R <quic_srirrama@quicinc.com>
+Date: Sat, 26 Nov 2022 07:41:45 +0530
+Subject: [PATCH] ath12: extend link based operations for ampdu actions and wmi
+ mgmt
+
+Apply tid queue setup based on link id on receiving ampdu action
+params.
+
+Also ensure right link vif is used for wmi based mgmt tx.
+
+Signed-off-by: Sriram R <quic_srirrama@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h  |  1 +
+ drivers/net/wireless/ath/ath12k/dp_rx.c | 32 ++++++++----
+ drivers/net/wireless/ath/ath12k/dp_rx.h |  6 ++-
+ drivers/net/wireless/ath/ath12k/mac.c   | 69 +++++++++++++++++++------
+ 4 files changed, 81 insertions(+), 27 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -100,6 +100,7 @@ struct ath12k_skb_cb {
+ 	dma_addr_t paddr_ext_desc;
+ 	u32 cipher;
+ 	u8 flags;
++	u8 link_id;
+ };
+ 
+ struct ath12k_skb_rxcb {
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -1123,16 +1123,23 @@ err_mem_free:
+ }
+ 
+ int ath12k_dp_rx_ampdu_start(struct ath12k *ar,
+-			     struct ieee80211_ampdu_params *params)
++			     struct ieee80211_ampdu_params *params,
++			     u8 link_id)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_sta *ahsta = (void *)params->sta->drv_priv;
+-	struct ath12k_link_sta *arsta = &ahsta->deflink;
+-	int vdev_id = arsta->arvif->vdev_id;
++	struct ath12k_link_sta *arsta;
++	int vdev_id;
+ 	int ret;
+ 
+-	/* TODO Handle per link in ath12k_mac_op_ampdu_action() for ML STA */
+-	ret = ath12k_dp_rx_peer_tid_setup(ar, params->sta->addr, vdev_id,
++	arsta = ahsta->link[link_id];
++
++	if (!arsta)
++		return -ENOENT;
++
++	vdev_id = arsta->arvif->vdev_id;
++
++	ret = ath12k_dp_rx_peer_tid_setup(ar, arsta->addr, vdev_id,
+ 					  params->tid, params->buf_size,
+ 					  params->ssn, ahsta->pn_type);
+ 	if (ret)
+@@ -1142,19 +1149,26 @@ int ath12k_dp_rx_ampdu_start(struct ath1
+ }
+ 
+ int ath12k_dp_rx_ampdu_stop(struct ath12k *ar,
+-			    struct ieee80211_ampdu_params *params)
++			    struct ieee80211_ampdu_params *params,
++			    u8 link_id)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_peer *peer;
+ 	struct ath12k_sta *ahsta = (void *)params->sta->drv_priv;
+-	struct ath12k_link_sta *arsta = &ahsta->deflink;
+-	int vdev_id = arsta->arvif->vdev_id;
++	struct ath12k_link_sta *arsta;
++	int vdev_id;
+ 	bool active;
+ 	int ret;
+ 
++	arsta = ahsta->link[link_id];
++
++	if (!arsta)
++		return -ENOENT;
++
++	vdev_id = arsta->arvif->vdev_id;
+ 	spin_lock_bh(&ab->base_lock);
+ 
+-	peer = ath12k_peer_find(ab, vdev_id, params->sta->addr);
++	peer = ath12k_peer_find(ab, vdev_id, arsta->addr);
+ 	if (!peer) {
+ 		spin_unlock_bh(&ab->base_lock);
+ 		ath12k_warn(ab, "failed to find the peer to stop rx aggregation\n");
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -85,9 +85,11 @@ static inline u32 ath12k_he_gi_to_nl8021
+ }
+ 
+ int ath12k_dp_rx_ampdu_start(struct ath12k *ar,
+-			     struct ieee80211_ampdu_params *params);
++			     struct ieee80211_ampdu_params *params,
++			     u8 link_id);
+ int ath12k_dp_rx_ampdu_stop(struct ath12k *ar,
+-			    struct ieee80211_ampdu_params *params);
++			    struct ieee80211_ampdu_params *params,
++			    u8 link_id);
+ int ath12k_dp_rx_peer_pn_replay_config(struct ath12k_link_vif *arvif,
+ 				       const u8 *peer_addr,
+ 				       enum set_key_cmd key_cmd,
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -7987,7 +7987,9 @@ static void ath12k_mgmt_over_wmi_tx_work
+ 	struct ath12k_link_vif *arvif;
+ 	struct sk_buff *skb;
+ 	int ret;
++	struct ath12k_hw *ah = ar->ah;
+ 
++	mutex_lock(&ah->conf_mutex);
+ 	while ((skb = skb_dequeue(&ar->wmi_mgmt_tx_queue)) != NULL) {
+ 		skb_cb = ATH12K_SKB_CB(skb);
+ 		if (!skb_cb->vif) {
+@@ -7997,8 +7999,23 @@ static void ath12k_mgmt_over_wmi_tx_work
+ 		}
+ 
+ 		ahvif = ath12k_vif_to_ahvif(skb_cb->vif);
+-		/* TODO check this for extending link specific */
+-		arvif = &ahvif->deflink;
++		if (!(ahvif->links_map & BIT(skb_cb->link_id))) {
++			ath12k_warn(ar->ab,
++				    "invalid linkid 0x%X in mgmt over wmi tx with linkmap 0x%X\n",
++				    skb_cb->link_id,
++				    ahvif->links_map);
++			ath12k_mgmt_over_wmi_tx_drop(ar, skb);
++			continue;
++		}
++
++		arvif = ahvif->link[skb_cb->link_id];
++		if (!arvif) {
++			ath12k_warn(ar->ab, "invalid arvif for mgmt tx - link %d\n",
++				    skb_cb->link_id);
++			ath12k_mgmt_over_wmi_tx_drop(ar, skb);
++			continue;
++		}
++
+ 		mutex_lock(&ar->conf_mutex);
+ 		if (ar->allocated_vdev_map & (1LL << arvif->vdev_id) &&
+ 		    arvif->is_started) {
+@@ -8010,13 +8027,15 @@ static void ath12k_mgmt_over_wmi_tx_work
+ 			}
+ 		} else {
+ 			ath12k_warn(ar->ab,
+-				    "dropping mgmt frame for vdev %d, is_started %d\n",
++				    "dropping mgmt frame for vdev %d, is_started %d link %d\n",
+ 				    arvif->vdev_id,
+-				    arvif->is_started);
++				    arvif->is_started,
++				    skb_cb->link_id);
+ 			ath12k_mgmt_over_wmi_tx_drop(ar, skb);
+ 		}
+ 		mutex_unlock(&ar->conf_mutex);
+ 	}
++	mutex_unlock(&ah->conf_mutex);
+ }
+ 
+ static int ath12k_mac_mgmt_tx(struct ath12k *ar, struct sk_buff *skb,
+@@ -8164,14 +8183,18 @@ static void ath12k_mac_op_tx(struct ieee
+ 			ieee80211_free_txskb(hw, skb);
+ 			return;
+ 		}
+-		if (WARN_ON(!ahvif->link[link])) {
+-			ieee80211_free_txskb(hw, skb);
+-			return;
+-		}
+-		arvif = ahvif->link[link];
+-		ar = arvif->ar;
++	} else {
++		link = 0;
++	}
++
++	arvif = ahvif->link[link];
++
++	if (!arvif || !arvif->ar) {
++		ieee80211_free_txskb(hw, skb);
++		return;
+ 	}
+ 
++	ar = arvif->ar;
+ 	ah = ar->ah;
+ 
+ 	if (key) {
+@@ -8184,6 +8207,7 @@ static void ath12k_mac_op_tx(struct ieee
+ 	} else if (ieee80211_is_mgmt(hdr->frame_control)) {
+ 		frm_type = FIELD_GET(IEEE80211_FCTL_STYPE, hdr->frame_control);
+ 		is_prb_rsp = ieee80211_is_probe_resp(hdr->frame_control);
++		skb_cb->link_id = link;
+ 		ret = ath12k_mac_mgmt_tx(ar, skb, is_prb_rsp);
+ 		if (ret) {
+ 			if (ret != -EBUSY)
+@@ -9528,24 +9552,20 @@ static int ath12k_mac_op_set_antenna(str
+ 	return ret;
+ }
+ 
+-static int ath12k_mac_op_ampdu_action(struct ieee80211_hw *hw,
+-				      struct ieee80211_vif *vif,
+-				      struct ieee80211_ampdu_params *params)
++static int ath12k_mac_ampdu_action(struct ieee80211_hw *hw,
++				   struct ieee80211_vif *vif,
++				   struct ieee80211_ampdu_params *params,
++				   u8 link_id)
+ {
+ 	struct ath12k_hw *ah = hw->priv;
+ 	struct ath12k *ar;
+ 	int ret = -EINVAL;
+ 
+-	/* TODO handle for ML link vifs */
+-	if (vif->valid_links)
+-		return 0;
+-
+-	mutex_lock(&ah->conf_mutex);
++	lockdep_assert_held(&ah->conf_mutex);
+ 
+-	ar = ath12k_get_ar_by_vif(hw, vif, 0);
++	ar = ath12k_get_ar_by_vif(hw, vif, link_id);
+ 	if (!ar) {
+ 		ath12k_err(NULL, "unable to determine device to set ampdu params\n");
+-		mutex_unlock(&ah->conf_mutex);
+ 		return -EPERM;
+ 	}
+ 
+@@ -9553,10 +9573,10 @@ static int ath12k_mac_op_ampdu_action(st
+ 
+ 	switch (params->action) {
+ 	case IEEE80211_AMPDU_RX_START:
+-		ret = ath12k_dp_rx_ampdu_start(ar, params);
++		ret = ath12k_dp_rx_ampdu_start(ar, params, link_id);
+ 		break;
+ 	case IEEE80211_AMPDU_RX_STOP:
+-		ret = ath12k_dp_rx_ampdu_stop(ar, params);
++		ret = ath12k_dp_rx_ampdu_stop(ar, params, link_id);
+ 		break;
+ 	case IEEE80211_AMPDU_TX_START:
+ 	case IEEE80211_AMPDU_TX_STOP_CONT:
+@@ -9570,7 +9590,36 @@ static int ath12k_mac_op_ampdu_action(st
+ 		break;
+ 	}
+ 
++	if (ret)
++		ath12k_warn(ar->ab, "unable to perform ampdu action %d ret %d\n",
++			    params->action, ret);
++
+ 	mutex_unlock(&ar->conf_mutex);
++
++	return ret;
++}
++
++static int ath12k_mac_op_ampdu_action(struct ieee80211_hw *hw,
++				      struct ieee80211_vif *vif,
++				      struct ieee80211_ampdu_params *params)
++{
++	struct ieee80211_sta *sta = params->sta;
++	struct ath12k_sta *ahsta = (struct ath12k_sta *)sta->drv_priv;
++	struct ath12k_hw *ah = hw->priv;
++	int ret = -EINVAL;
++	u8 link_id;
++
++	if (WARN_ON(!ahsta->links_map))
++		return -EINVAL;
++
++	mutex_lock(&ah->conf_mutex);
++
++	for_each_set_bit(link_id, &ahsta->links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
++		ret = ath12k_mac_ampdu_action(hw, vif, params, link_id);
++		if (ret)
++			break;
++	}
++
+ 	mutex_unlock(&ah->conf_mutex);
+ 
+ 	return ret;

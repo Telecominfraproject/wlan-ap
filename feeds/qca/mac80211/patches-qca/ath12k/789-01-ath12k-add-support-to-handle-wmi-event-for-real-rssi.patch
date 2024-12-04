@@ -1,0 +1,285 @@
+From 40ee0615f42394960e6a07dad91f9c90e4fddf12 Mon Sep 17 00:00:00 2001
+From: Raj Kumar Bhagat <quic_rajkbhag@quicinc.com>
+Date: Wed, 5 Jul 2023 14:34:50 +0530
+Subject: [PATCH 1/2] ath12k: add support to handle wmi event for real rssi
+ calculation
+
+Currently ATH12K_DEFAULT_NOISE_FLOOR (-95) is used for calculation
+of rssi in dbm. This is an approximate value of noise floor.
+
+Firmware sends wmi event WMI_PDEV_RSSI_DBM_CONVERSION_PARAMS_INFO_EVENTID,
+which has the run-time parameters that is required for the calculation
+of real rssi value in dbm. This event is received from Firmware during
+channel change, temperature offset change and HW chainmask change.
+
+Hence add support to handle and parse the wmi event
+WMI_PDEV_RSSI_DBM_CONVERSION_PARAMS_INFO_EVENTID. Also add support to
+update the parameters from this event in ath12k structure. These
+parameters will be used to calculate real rssi value.
+
+The offset parameter (ar->rssi_offsets.rssi_offset) value is initialized
+to ATH12K_DEFAULT_NOISE_FLOOR during mac register, this helps to keep
+backward compatibility for the devices that do not send wmi event
+WMI_PDEV_RSSI_DBM_CONVERSION_PARAMS_INFO_EVENTID.
+
+real signal strength calculation:
+real rssi = rssi_combi + min_nf + rssi_temp_offset
+
+Signed-off-by: Raj Kumar Bhagat <quic_rajkbhag@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |   2 +
+ drivers/net/wireless/ath/ath12k/mac.c  |   2 +
+ drivers/net/wireless/ath/ath12k/wmi.c  | 185 +++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.h  |  34 +++++
+ 4 files changed, 223 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1009,6 +1009,8 @@ struct ath12k {
+ 	u32 chan_bw_interference_bitmap;
+ 	bool awgn_intf_handling_in_prog;
+ 
++	struct wmi_rssi_dbm_conv_offsets rssi_offsets;
++
+ 	u8 tpc_stats_type;
+ 	/* tpc_stats ptr is protected by data lock */
+ 	struct wmi_tpc_stats_event *tpc_stats;
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -15441,6 +15441,8 @@ static int __ath12k_mac_register(struct
+ 	ar->max_num_stations = TARGET_NUM_STATIONS;
+ 	ar->max_num_peers = TARGET_NUM_PEERS_PDEV;
+ 
++	ar->rssi_offsets.rssi_offset = ATH12K_DEFAULT_NOISE_FLOOR;
++
+ 	hw->wiphy->interface_modes |= BIT(NL80211_IFTYPE_AP_VLAN);
+ 	hw->wiphy->software_iftypes |= BIT(NL80211_IFTYPE_AP_VLAN);
+ 
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -12188,6 +12188,160 @@ ath12k_wmi_pktlog_decode_info(struct ath
+ 	kfree(tb);
+ }
+ 
++static int
++ath12k_wmi_rssi_dbm_conv_subtlv_parser(struct ath12k_base *ab,
++				      u16 tag, u16 len,
++				      const void *ptr, void *data)
++{
++	struct wmi_rssi_dbm_conv_offsets *rssi_offsets =
++		(struct wmi_rssi_dbm_conv_offsets *) data;
++	struct wmi_rssi_dbm_conv_param_info *param_info;
++	struct wmi_rssi_dbm_conv_temp_offset *temp_offset_info;
++	int i, ret = 0;
++	s8 min_nf = 0;
++
++	switch (tag) {
++	case WMI_TAG_RSSI_DBM_CONVERSION_PARAMS_INFO:
++		if (len != sizeof(*param_info)) {
++			ath12k_warn(ab, "wmi rssi dbm conv subtlv 0x%x invalid len rcvd",
++				    tag);
++			return -EINVAL;
++		}
++		param_info = (struct wmi_rssi_dbm_conv_param_info *)ptr;
++
++		/* Using minimum pri20 Noise Floor across active chains instead
++		 * of all sub-bands*/
++		for (i = 0; i < MAX_NUM_ANTENNA; i++) {
++			if (param_info->curr_rx_chainmask & (0x01 << i))
++				min_nf = min(param_info->nf_hw_dbm[i][0], min_nf);
++		}
++		rssi_offsets->min_nf_dbm = min_nf;
++		break;
++	case WMI_TAG_RSSI_DBM_CONVERSION_TEMP_OFFSET_INFO:
++		if (len != sizeof(*temp_offset_info)) {
++			ath12k_warn(ab, "wmi rssi dbm conv subtlv 0x%x invalid len rcvd",
++				    tag);
++			return -EINVAL;
++		}
++		temp_offset_info = (struct wmi_rssi_dbm_conv_temp_offset *)ptr;
++		rssi_offsets->rssi_temp_offset = temp_offset_info->rssi_temp_offset;
++		break;
++	default:
++		ath12k_warn(ab, "Received invalid sub-tag for wmi rssi dbm conversion\n");
++		ret = -EINVAL;
++	}
++	return ret;
++}
++
++static int
++ath12k_wmi_rssi_dbm_conv_event_parser(struct ath12k_base *ab,
++				      u16 tag, u16 len,
++				      const void *ptr, void *data)
++{
++	int ret = 0;
++
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wmi rssi dbm conv tag 0x%x of len %d rcvd",
++		   tag, len);
++	switch (tag) {
++	case WMI_TAG_RSSI_DBM_CONVERSION_PARAMS_INFO_FIXED_PARAM:
++		/* Fixed param is already processed*/
++		break;
++	case WMI_TAG_ARRAY_STRUCT:
++		/* len 0 is expected for array of struct when there
++		 * is no content of that type inside that tlv
++		 */
++		if (len == 0)
++			return ret;
++		ret = ath12k_wmi_tlv_iter(ab, ptr, len,
++					  ath12k_wmi_rssi_dbm_conv_subtlv_parser,
++					  data);
++		break;
++	default:
++		ath12k_warn(ab, "Received invalid tag for wmi rssi dbm conv interference event\n");
++		ret = -EINVAL;
++		break;
++
++	}
++
++	return ret;
++}
++
++static struct
++ath12k *ath12k_wmi_rssi_dbm_process_fixed_param( struct ath12k_base *ab,
++						 u8 *ptr, size_t len)
++{
++	struct ath12k *ar;
++	const struct wmi_tlv *tlv;
++	struct wmi_rssi_dbm_conv_event_fixed_param *fixed_param;
++	u16 tlv_tag;
++
++	if(!ptr) {
++		ath12k_warn(ab, "No data present in rssi dbm conv event\n");
++		return NULL;
++	}
++
++	if (len < (sizeof(*fixed_param) + TLV_HDR_SIZE)) {
++		ath12k_warn(ab, "rssi dbm conv event size invalid\n");
++		return NULL;
++	}
++
++	tlv = (struct wmi_tlv *)ptr;
++	tlv_tag = FIELD_GET(WMI_TLV_TAG, tlv->header);
++	ptr += sizeof(*tlv);
++
++	if (tlv_tag == WMI_TAG_RSSI_DBM_CONVERSION_PARAMS_INFO_FIXED_PARAM) {
++		fixed_param = (struct wmi_rssi_dbm_conv_event_fixed_param *)ptr;
++
++		ar = ath12k_mac_get_ar_by_pdev_id(ab, fixed_param->pdev_id);
++		if (!ar) {
++			ath12k_warn(ab, "Failed to get ar for rssi dbm conv event\n");
++			return NULL;
++		}
++	} else {
++		ath12k_warn(ab, "rssi dbm conv event received without fixed param tlv at start\n");
++		return NULL;
++	}
++
++	return ar;
++}
++
++static void ath12k_wmi_rssi_dbm_conversion_param_info(struct ath12k_base *ab,
++						      struct sk_buff *skb)
++{
++	struct ath12k *ar;
++	struct wmi_rssi_dbm_conv_offsets *rssi_offsets;
++	int ret, i;
++
++	/* if pdevs are not active ignore the event */
++	for (i = 0; i < ab->num_radios; i++) {
++		if (!ab->pdevs_active[i])
++			return;
++	}
++
++	ar = ath12k_wmi_rssi_dbm_process_fixed_param(ab, skb->data,
++						     skb->len);
++	if(!ar) {
++		ath12k_warn(ab, "failed to get ar from rssi dbm conversion event\n");
++		return;
++	}
++
++	rssi_offsets = &ar->rssi_offsets;
++	ret = ath12k_wmi_tlv_iter(ab, skb->data, skb->len,
++				  ath12k_wmi_rssi_dbm_conv_event_parser,
++				  rssi_offsets);
++	if (ret) {
++		ath12k_warn(ab, "Unable to parse rssi dbm conversion event\n");
++		return;
++	}
++
++	rssi_offsets->rssi_offset = rssi_offsets->min_nf_dbm +
++				    rssi_offsets->rssi_temp_offset;
++
++	ath12k_dbg(ab, ATH12K_DBG_WMI,
++		   "RSSI offset updated, current offset is %d\n",
++		   rssi_offsets->rssi_offset);
++}
++
+ static void ath12k_wmi_tm_event_segmented(struct ath12k_base *ab, u32 cmd_id,
+ 					struct sk_buff *skb)
+ {
+@@ -13681,6 +13835,9 @@ static void ath12k_wmi_tlv_op_rx(struct
+ 	case WMI_PDEV_PKTLOG_DECODE_INFO_EVENTID:
+ 		ath12k_wmi_pktlog_decode_info(ab, skb);
+ 		break;
++	case WMI_PDEV_RSSI_DBM_CONVERSION_PARAMS_INFO_EVENTID:
++		ath12k_wmi_rssi_dbm_conversion_param_info(ab, skb);
++		break;
+ 	case WMI_MUEDCA_PARAMS_CONFIG_EVENTID:
+ 		ath12k_wmi_pdev_update_muedca_params_status_event(ab, skb);
+ 		break;
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -764,6 +764,7 @@ enum wmi_tlv_event_id {
+	WMI_PDEV_AOA_PHASEDELTA_EVENTID,
+	WMI_PDEV_FIPS_EXTEND_EVENTID,
+	WMI_PDEV_PKTLOG_DECODE_INFO_EVENTID,
++	WMI_PDEV_RSSI_DBM_CONVERSION_PARAMS_INFO_EVENTID,
+ 	WMI_VDEV_START_RESP_EVENTID = WMI_TLV_CMD(WMI_GRP_VDEV),
+ 	WMI_VDEV_STOPPED_EVENTID,
+ 	WMI_VDEV_INSTALL_KEY_COMPLETE_EVENTID,
+@@ -2065,6 +2066,9 @@ enum wmi_tlv_tag {
+	WMI_TAG_SPECTRAL_FFT_SIZE_CAPABILITIES,
+	WMI_TAG_PDEV_SSCAN_CHAN_INFO = 0X417,
+	WMI_TAG_PDEV_SSCAN_PER_DETECTOR_INFO,
++	WMI_TAG_RSSI_DBM_CONVERSION_PARAMS_INFO_FIXED_PARAM = 0x427,
++	WMI_TAG_RSSI_DBM_CONVERSION_PARAMS_INFO,
++	WMI_TAG_RSSI_DBM_CONVERSION_TEMP_OFFSET_INFO,
+ 	WMI_TAG_BCN_TMPL_ML_INFO_CMD = 0x436,
+ 	WMI_TAG_CTRL_PATH_CMD_FIXED_PARAM = 0x442,
+ 	WMI_TAG_CTRL_PATH_EVENT_FIXED_PARAM,
+@@ -8287,6 +8291,34 @@ struct wmi_chan_width_peer_list {
+ 	__le32 puncture_20mhz_bitmap;
+ } __packed;
+ 
++
++#define MAX_20MHZ_SEGS 16
++#define MAX_NUM_ANTENNA 8
++
++struct wmi_rssi_dbm_conv_event_fixed_param {
++	u32 pdev_id;
++} __packed;
++
++struct wmi_rssi_dbm_conv_param_info {
++	u32 curr_bw;
++	u32 curr_rx_chainmask;
++	u32 xbar_config;
++	u32 xlna_bypass_offset;
++	u32 xlna_bypass_threshold;
++	s8 nf_hw_dbm[MAX_NUM_ANTENNA][MAX_20MHZ_SEGS];
++} __packed;
++
++struct wmi_rssi_dbm_conv_temp_offset {
++	s32 rssi_temp_offset;
++} __packed;
++
++struct wmi_rssi_dbm_conv_offsets {
++	s32 rssi_temp_offset;
++	s8 min_nf_dbm;
++	/* rssi_offset is the sum of min_nf_dbm & rssi_temp_offset*/
++	s32 rssi_offset;
++};
++
+ #define ATH12K_FW_STATS_BUF_SIZE (1024 * 1024)
+ 
+ void ath12k_wmi_init_qcn9274(struct ath12k_base *ab,

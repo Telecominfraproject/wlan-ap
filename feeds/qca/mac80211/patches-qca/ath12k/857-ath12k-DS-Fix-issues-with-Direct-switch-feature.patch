@@ -1,0 +1,378 @@
+From 8a2c2d178507b52799abeef70058ea76ac1a502c Mon Sep 17 00:00:00 2001
+From: Balamurugan Mahalingam <quic_bmahalin@quicinc.com>
+Date: Tue, 12 Dec 2023 13:03:34 -0800
+Subject: [PATCH] ath12k: DS: Fix issues with Direct switch feature
+
+Fix the memory leaks, multicast to unicast handling and add sanity checks
+
+Signed-off-by: Balamurugan Mahalingam <quic_bmahalin@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/bondif.c  | 170 +++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/bondif.h  |   5 +
+ drivers/net/wireless/ath/ath12k/core.h    |   7 +
+ drivers/net/wireless/ath/ath12k/debugfs.c |  36 +++++
+ drivers/net/wireless/ath/ath12k/mac.c     |   3 +
+ 5 files changed, 214 insertions(+), 7 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/bondif.c
++++ b/drivers/net/wireless/ath/ath12k/bondif.c
+@@ -7,11 +7,13 @@
+ #include <linux/module.h>
+ #include <net/bonding.h>
+ #include <linux/ieee80211.h>
++#include <linux/if_vlan.h>
+ #include "core.h"
+ #include "ppe.h"
+ #include "bondif.h"
+ #include "debug.h"
+ #include "dp_tx.h"
++#include "peer.h"
+ 
+ static const struct net_device_ops ieee80211_link_dataif_8023_ops;
+ extern struct ath12k_link_vif *ath12k_mac_assign_link_vif( struct ath12k_hw *ah,
+@@ -377,6 +379,7 @@ int ath12k_mac_op_change_vif_links(struc
+ 		link_ndev_pvt->is_started = false;
+ 		link_ndev_pvt->is_bond_enslaved = false;
+ 		mldev->vif = vif;
++ 		mldev->ahvif = ath12k_vif_to_ahvif(vif);
+ 		mutex_lock(&vif->bond_mutex);
+ 		vif->link_ndev[link_num] = link_ndev;
+ 		mutex_unlock(&vif->bond_mutex);
+@@ -436,8 +439,8 @@ int ath12k_mac_op_change_vif_links(struc
+ 
+ static struct net_device *ath12k_mac_get_tx_link_netdev(struct ath12k_mld_dev *mldev, u8 *dst_mac_addr)
+ {
+-	struct net_device *ndev = NULL;
+-	struct ieee80211_sta *sta= NULL;
++	struct net_device *ndev = NULL, *dvlan_ndev;
++	struct ieee80211_sta *sta;
+ 	struct ath12k_sta *ahsta;
+ 	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(mldev->vif);
+ 
+@@ -462,18 +465,21 @@ static struct net_device *ath12k_mac_get
+ 		ath12k_dbg(NULL, ATH12K_DBG_DP_TX, "(%s,%d) PPE %s:%d pkt delivered to sta.deflink.link_id %d dev %s\n",
+ 				current->comm, current->pid, __func__, __LINE__,
+ 				ahsta->deflink.link_id, ndev->name);
+-		rcu_read_unlock();
+-		return ndev;
++		goto dvlan_check;
+ 	}
+ 
+ 	if (sta) {
+-		/* TODO: Use Primary Link */
+ 		ndev = mldev->vif->link_ndev[ahsta->assoc_link_id];
+ 		ath12k_dbg(NULL, ATH12K_DBG_DP_TX, "[%s] %s:%d deliver packets for sta %pM ahsta->assoc_link_id %d ndev %s\n",
+-				 current->comm, __func__, __LINE__,
+-				 sta, ahsta->assoc_link_id, ndev->name);
++			   current->comm, __func__, __LINE__,
++			   sta, ahsta->assoc_link_id, ndev->name);
+ 	}
+ 
++dvlan_check:
++	dvlan_ndev = ieee80211_sta_get_dvlan_iface(sta);
++	if (dvlan_ndev)
++		ndev = dvlan_ndev;
++
+ 	rcu_read_unlock();
+ 
+ 	/* TODO: Verify what happens with NULL. Understand what is the fall back*/
+@@ -650,6 +656,104 @@ fail_remove_tx_buf:
+ 	return ret;
+ }
+ 
++static int ath12k_update_da(struct sk_buff *skb, u8 *ucastaddr)
++{
++        int ret;
++        struct ethhdr *ethhdr;
++
++        ret  = skb_ensure_writable(skb, ETH_HLEN);
++        if (unlikely(ret))
++                return ret;
++
++        ethhdr = (void *)skb->data;
++        ether_addr_copy(ethhdr->h_dest, ucastaddr);
++
++        return 0;
++}
++
++static int ath12k_convert_to_unicast(struct ath12k_base *ab,
++				     struct sk_buff *skb,
++				     struct ath12k_vif *orig_ahvif,
++				     struct sk_buff_head *queue)
++{
++	const struct ethhdr *ethhdr;
++	struct ath12k_vif *ahvif;
++	struct ath12k_peer *peer;
++	struct ieee80211_vif *vif;
++	struct sk_buff *skb_new;
++	int ring_id;
++	int ret = 0;
++	int len = 0;
++
++	if (!skb)
++		return -EINVAL;
++
++	ethhdr = (struct ethhdr *)skb->data;
++
++	ring_id = ab->hw_params->hw_ops->get_ring_selector(skb);
++	ab->soc_stats.bond_mcast2ucast_tried[ring_id]++;
++
++	spin_lock_bh(&ab->base_lock);
++	list_for_each_entry(peer, &ab->peers, list) {
++		vif = peer->vif;
++		ahvif = ath12k_vif_to_ahvif(vif);
++		if (ahvif != orig_ahvif)
++			continue;
++
++		if(!peer->sta)
++			continue;
++
++		if (unlikely(ether_addr_equal(ethhdr->h_source, peer->sta->addr))) {
++			/* do not send back to source */
++			continue;
++		}
++
++		skb_new = skb_clone(skb, GFP_ATOMIC);
++		if (!skb_new) {
++			ab->soc_stats.bond_mcast2ucast_drop[ring_id]++;
++			ret = -ENOMEM;
++			goto purge;
++		}
++		if (unlikely(ath12k_update_da(skb_new, peer->sta->addr))) {
++			ab->soc_stats.bond_mcast2ucast_drop[ring_id]++;
++			dev_kfree_skb(skb_new);
++			ret = -ENOMEM;
++			goto purge;
++		}
++		__skb_queue_tail(queue, skb_new);
++		len++;
++	}
++	ab->soc_stats.bond_mcast2ucast_converted[ring_id] += len;
++	goto out;
++purge:
++	__skb_queue_purge(queue);
++out:
++	spin_unlock_bh(&ab->base_lock);
++	return ret;
++}
++
++static bool ath12k_dp_mlo_multicast_to_unicast(struct sk_buff *skb,
++					   struct net_device *bond_dev)
++{
++	const struct ethhdr *eth = (void *)skb->data;
++	const struct vlan_ethhdr *ethvlan = (void *)skb->data;
++	__be16 ethertype;
++
++	ethertype = eth->h_proto;
++	if (ethertype == htons(ETH_P_8021Q) && skb->len >= VLAN_ETH_HLEN)
++		ethertype = ethvlan->h_vlan_encapsulated_proto;
++	switch (ethertype) {
++	case htons(ETH_P_ARP):
++	case htons(ETH_P_IP):
++	case htons(ETH_P_IPV6):
++		break;
++	default:
++		return false;
++	}
++
++	return true;
++}
++
+ int ath12k_dp_mlo_xmit_netdev(struct sk_buff *skb, struct net_device *bond_dev)
+ {
+ 	struct net_device *link_dev = NULL;
+@@ -662,10 +766,13 @@ int ath12k_dp_mlo_xmit_netdev(struct sk_
+ 	struct ath12k *tmp_ar;
+ 	int is_mcast;
+ 	u16 mcbc_gsn;
+-	int ret;
++	struct sk_buff *skb1;
++	int ret, i;
++	bool is_convert;
+ 	int link_id, ring_id = 0;
+ 	struct ath12k_skb_cb *skb_cb;
+ 	struct ieee80211_tx_info *info;
++	struct sk_buff_head queue;
+ 
+ 	if (!(bond_dev->flags & IFF_UP)) {
+ 		dev_kfree_skb(skb);
+@@ -697,6 +804,34 @@ int ath12k_dp_mlo_xmit_netdev(struct sk_
+ 			return NETDEV_TX_OK;
+ 		}
+ 
++		if (ahvif->mcast_to_ucast_en) {
++			is_convert = ath12k_dp_mlo_multicast_to_unicast(skb, bond_dev);
++
++			if (is_convert) {
++				for (i = 0; i < IEEE80211_MLD_MAX_NUM_LINKS; i++) {
++					arvif = ahvif->link[i];
++					if (!arvif)
++						continue;
++
++					__skb_queue_head_init(&queue);
++					ath12k_convert_to_unicast(arvif->ab, skb, ahvif,  &queue);
++					while ((skb1 = __skb_dequeue(&queue))) {
++						eh = (struct ethhdr *)skb1->data;
++						link_dev = ath12k_mac_get_tx_link_netdev( mldev, eh->h_dest);
++#ifdef CPTCFG_MAC80211_SFE_SUPPORT
++						skb1->fast_xmit = 0;
++#endif
++						if (link_dev)
++							link_dev->netdev_ops->ndo_start_xmit(skb1, link_dev);
++						else
++							dev_kfree_skb_any(skb1);
++					}
++				}
++				dev_kfree_skb_any(skb);
++				return NETDEV_TX_OK;
++			}
++		}
++
+ 		spin_lock(&ahvif->mcbc_gsn_lock);
+ 		mcbc_gsn = ahvif->mcbc_gsn++;
+ 		if (ahvif->mcbc_gsn > 0xFFF)
+@@ -823,6 +958,7 @@ netdev_tx_t ieee80211_link_subif_start_x
+ 	skb_cb->link_id = arvif->link_id;
+ 	skb_cb->flags |= ATH12K_SKB_HW_80211_ENCAP;
+ 	info->flags |= IEEE80211_TX_CTL_HW_80211_ENCAP;
++	ATH12K_SKB_CB(skb)->link_id = arvif->link_id;
+ 
+ 	if (!arvif_pvt->is_started) {
+ 		ath12k_dbg(NULL, ATH12K_DBG_PPE, "Dropping frames as arvif is not started\n");
+@@ -882,6 +1018,9 @@ static int ieee80211_link_set_mtu(struct
+ 	struct ath12k_link_vif_pvt *arvif_pvt = netdev_priv(dev);
+ 	struct ath12k_link_vif *arvif = arvif_pvt->arvif;
+ 
++	if (!arvif)
++		return -EINVAL;
++
+ 	if (!(IEEE80211_MTU_MIN < mtu && mtu < IEEE80211_MTU_MAX))
+ 		return -EINVAL;
+ 
+@@ -1080,3 +1219,21 @@ int ath12k_bond_dev_cb(struct wireless_d
+ 	}
+ 	return 0;
+ }
++
++int ath12k_mac_op_set_multicast_to_unicast(struct ieee80211_hw *hw,
++					    struct ieee80211_vif *vif,
++					    const bool enabled)
++{
++	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
++	struct wireless_dev *wdev = ieee80211_vif_to_wdev(vif);
++
++	if (!g_bonded_interface_model)
++		return -ENOTSUPP;
++
++	if (!wdev->bond_netdev)
++		return -ENOTSUPP;
++
++	ahvif->mcast_to_ucast_en = enabled;
++
++	return 0;
++}
+--- a/drivers/net/wireless/ath/ath12k/bondif.h
++++ b/drivers/net/wireless/ath/ath12k/bondif.h
+@@ -23,6 +23,9 @@ void ath12k_enable_ppe_for_link_netdev(s
+ int ath12k_free_bonddev_for_sfe(struct wireless_dev *wdev,
+ 				struct ieee80211_vif *vif,
+ 				int link_num);
++int ath12k_mac_op_set_multicast_to_unicast(struct ieee80211_hw *hw,
++					   struct ieee80211_vif *vif,
++					   const bool enabled);
+ int ath12k_bond_link_enslave(struct ath12k_link_vif *arvif, struct net_device *link_dev);
+ void ath12k_bond_link_release(struct ath12k_link_vif *arvif);
+ void ath12k_bond_enable_ppe_ds(void);
+@@ -43,10 +46,12 @@ enum ath12k_bond_state {
+ struct ath12k_mld_dev {
+ 	struct net_device *netdev;
+ 	struct ieee80211_vif *vif;
++	struct ath12k_vif *ahvif;
+ 	struct wireless_dev *wdev; //dummy one for bond registration. Optimize Bond MLO API.
+ 	struct net_device *link_dev[MAX_MLO_CHIPS][MAX_PDEV_PER_SOC];
+ 	u8 primary_chipid, primary_pdevid;
+ 	bool mcast_dev_set;
++	bool mcast_to_ucast_en;
+ 	unsigned long bond_state;
+ };
+ 
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -490,6 +490,7 @@ struct ath12k_vif {
+ #ifdef CPTCFG_ATH12K_DEBUGFS
+ 	struct dentry *debugfs_linkstats;
+ #endif /* CPTCFG_ATH12K_DEBUGFS */
++	bool mcast_to_ucast_en;
+  };
+ 
+ struct ath12k_vif_iter {
+@@ -1233,6 +1234,12 @@ struct ath12k_soc_dp_stats {
+ 	u32 bond_tx_mcast_enqueued[MAX_TCL_RING];
+ 	u32 bond_tx_ucast_dropped[MAX_TCL_RING];
+ 	u32 bond_tx_mcast_dropped[MAX_TCL_RING];
++	/* Number of frames successfully converted to ucast from mcast */
++	u32 bond_mcast2ucast_converted[MAX_TCL_RING];
++	/* Number of mcast frames tried for ucast conversion*/
++	u32 bond_mcast2ucast_tried[MAX_TCL_RING];
++	/* Number of times mcast to ucast conversion failed*/
++	u32 bond_mcast2ucast_drop[MAX_TCL_RING];
+ 	u32 reo_rx[DP_REO_DST_RING_MAX] [ATH12K_MAX_SOCS];
+ 	u32 fast_rx[DP_REO_DST_RING_MAX] [ATH12K_MAX_SOCS];
+ 	u32 non_fast_rx[DP_REO_DST_RING_MAX] [ATH12K_MAX_SOCS];
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -1745,6 +1745,42 @@ static ssize_t ath12k_debugfs_dump_soc_d
+ 			soc_stats->tx_completed[2],
+ 			soc_stats->tx_completed[3]);
+ 
++
++	len += scnprintf(buf + len, size - len, "\nbond_tx_ucast_enqueued: ");
++	for (i = 0; i < MAX_TCL_RING; i++)
++		len += scnprintf(buf + len, size - len,"%u:%u ",
++				 i, soc_stats->bond_tx_ucast_enqueued[i]);
++
++	len += scnprintf(buf + len, size - len,	"\nbond_tx_mcast_enqueued: ");
++	for (i = 0; i < MAX_TCL_RING; i++)
++		len += scnprintf(buf + len, size - len,	"%u:%u ",
++				i, soc_stats->bond_tx_mcast_enqueued[i]);
++
++	len += scnprintf(buf + len, size - len, "\nbond_tx_ucast_dropped: ");
++	for (i = 0; i < MAX_TCL_RING; i++)
++		len += scnprintf(buf + len, size - len,	"%u:%u ",
++				i, soc_stats->bond_tx_ucast_dropped[i]);
++
++	len += scnprintf(buf + len, size - len, "\nbond_tx_mcast_dropped: ");
++	for (i = 0; i < MAX_TCL_RING; i++)
++		len += scnprintf(buf + len, size - len,	"%u:%u ",
++				i, soc_stats->bond_tx_mcast_dropped[i]);
++
++	len += scnprintf(buf + len, size - len, "\nbond_mcast2ucast_tried: ");
++	for (i = 0; i < MAX_TCL_RING; i++)
++		len += scnprintf(buf + len, size - len,	"%u:%u ",
++				i, soc_stats->bond_mcast2ucast_tried[i]);
++
++	len += scnprintf(buf + len, size - len, "\nbond_mcast2ucast_converted: ");
++	for (i = 0; i < MAX_TCL_RING; i++)
++		len += scnprintf(buf + len, size - len,	"%u:%u ",
++				i, soc_stats->bond_mcast2ucast_converted[i]);
++
++	len += scnprintf(buf + len, size - len,	"\nbond_mcast2ucast_drop: ");
++	for (i = 0; i < MAX_TCL_RING; i++)
++		len += scnprintf(buf + len, size - len,
++				"%u:%u ", i, soc_stats->bond_mcast2ucast_drop[i]);
++
+ 	len += scnprintf(buf + len, size - len,
+ 			 "\nag tx_pending: %u\n",
+ 			 atomic_read(&ab->ag->num_dp_tx_pending));
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -15760,6 +15760,9 @@ static const struct ieee80211_ops ath12k
+ 	.cancel_remain_on_channel       = ath12k_mac_op_cancel_remain_on_channel,
+ 	.get_txpower			= ath12k_mac_op_get_txpower,
+ 	.set_radar_background		= ath12k_mac_op_set_radar_background,
++#ifdef CPTCFG_ATH12K_BONDED_DS_SUPPORT
++	.set_multicast_to_unicast	= ath12k_mac_op_set_multicast_to_unicast,
++#endif
+ };
+ 
+ static void ath12k_mac_update_ch_list(struct ath12k *ar,

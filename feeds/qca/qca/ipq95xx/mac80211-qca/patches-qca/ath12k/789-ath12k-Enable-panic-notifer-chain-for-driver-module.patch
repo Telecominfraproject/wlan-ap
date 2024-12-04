@@ -1,0 +1,203 @@
+From 61430783d33b820bae8d538d03529607c37c0261 Mon Sep 17 00:00:00 2001
+From: P Praneesh <quic_ppranees@quicinc.com>
+Date: Thu, 6 Jul 2023 23:32:02 +0530
+Subject: [PATCH] ath12k: Enable panic notifer chain for driver module
+
+ath12k: Enable panic notifer chain for driver module
+
+Currently when driver crashes due to some unexpected descriptor
+from the rings, there is no logic to collect firmware rddm dump.
+To debug such issues, MAC/FW needs the rddm dump.
+
+Add panic notifier chain callback for ath12k module during insmod.
+So that whenever driver or host panics, through the notifier chain
+callback we collect the rddm dump of the firmware. Since
+ath12k_coredump_segment_info can be called from the atomic context (panic
+notifier chain), changing vzalloc to kzalloc to avoid sleep in
+atomic context.
+
+Signed-off-by: Balamurugan S <quic_bselvara@quicinc.com>
+Signed-off-by: P Praneesh <quic_ppranees@quicinc.com>
+Signed-off-by: Aishwarya R <quic_aisr@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c     | 52 +++++++++++++++++++---
+ drivers/net/wireless/ath/ath12k/core.h     |  1 +
+ drivers/net/wireless/ath/ath12k/coredump.c | 14 ++++--
+ drivers/net/wireless/ath/ath12k/mhi.c      |  2 +-
+ 4 files changed, 59 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1636,13 +1636,18 @@
+ 	struct ath12k_hw_group *ag = ab->ag;
+ 
+ 	if ((ag->mlo_capable &&
+-	    (atomic_read(&ath12k_coredump_ram_info.num_chip) >= ab->ag->num_started)) ||
+-	    (!ag->mlo_capable))
++	    (atomic_read(&ath12k_coredump_ram_info.num_chip) >= ab->ag->num_started) &&
++	    (!ab->in_panic)) || (!ag->mlo_capable)) {
++		/* set in_panic to true to avoid multiple rddm download during
++		 * firmware crash
++		 */
++		ab->in_panic = true;
+ 		BUG_ON(1);
+-	else
++	} else {
+ 		ath12k_info(ab,
+ 			    "%d chip dump collected and waiting for partner chips\n",
+ 			    atomic_read(&ath12k_coredump_ram_info.num_chip));
++	}
+ }
+ 
+ static void ath12k_coredump_download_ahb(struct ath12k_base *ab)
+@@ -1716,9 +1721,14 @@
+ 		ath12k_warn(ab, "Failed to get pdev from device node\n");
+ 		return NOTIFY_DONE;
+ 	}
+-	if (strcmp(ssr_pdev->name, pdev->name) != 0) {
++
++	/* incase of panic notifier ssr callback, ssr_pdev->name will not be same as
++	 * pdev->name because ssr_pdev->name is ab->pdev->name which is not similar
++	 * as dts entry
++	 */
++	if (!ab->in_panic && (strcmp(ssr_pdev->name, pdev->name) != 0)) {
+ 		ath12k_warn(ab, "SSR notification mismatch %s  pdev name:%s\n",
+-			    (char *)data, pdev->name);
++			    ssr_pdev->name, pdev->name);
+ 		return NOTIFY_DONE;
+ 	}
+ 
+@@ -2685,6 +2695,33 @@
+ 
+ #endif /* CPTCFG_ATH12K_SAWF */
+ 
++static void ath12k_rddm_notifier(struct notifier_block *this,
++				 unsigned long event, void *ptr)
++{
++	struct ath12k_base *ab;
++	struct ath12k_hw_group *ag;
++	int i;
++
++	list_for_each_entry(ag, &ath12k_hw_groups, list) {
++		for (i = 0; i < ag->num_chip; i++) {
++			ab = ag->ab[i];
++			if (ab->in_panic)
++				return;
++			ab->in_panic = true;
++			if (ab->hif.bus == ATH12K_BUS_AHB)
++				ath12k_core_atomic_ssr_notifier_cb(&ab->atomic_ssr_nb,
++								   SUBSYS_PREPARE_FOR_FATAL_SHUTDOWN,
++								   ab->pdev);
++			else
++				ath12k_coredump_download_rddm(ab);
++		}
++	}
++}
++
++static struct notifier_block rddm_notifier = {
++	.notifier_call  = ath12k_rddm_notifier,
++};
++
+ static int ath12k_init(void)
+ {
+ 	int ret;
+@@ -2695,6 +2732,10 @@
+ 		return ret;
+ 	}
+ 
++	/* Add notifier to an atomic notifier chain to get the callback during BUG_ON
++	 */
++	atomic_notifier_chain_register(&panic_notifier_list, &rddm_notifier);
++
+ 	ret = ath12k_ahb_init();
+ 	if (ret) {
+ 		ret = -ENODEV;
+@@ -2721,6 +2762,7 @@
+ 
+ static void ath12k_exit(void)
+ {
++	atomic_notifier_chain_unregister(&panic_notifier_list, &rddm_notifier);
+ 	ath12k_pci_exit();
+ 	ath12k_ahb_exit();
+ 	ath12k_debugfs_destroy();
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1435,6 +1435,7 @@
+ 	struct vendor_info id;
+ 	u32 max_msduq_per_tid;
+ 	u32 default_msduq_per_tid;
++	bool in_panic;
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ 	ppe_ds_wlan_handle_t *ppeds_handle;
+--- a/drivers/net/wireless/ath/ath12k/coredump.c
++++ b/drivers/net/wireless/ath/ath12k/coredump.c
+@@ -109,9 +109,11 @@
+ 	header_size = sizeof(*file_data);
+ 	header_size += num_seg * sizeof(*segments);
+ 	header_size = PAGE_ALIGN(header_size);
+-	buf = vzalloc(header_size);
+-	if (!buf)
++	buf = kzalloc(header_size, GFP_ATOMIC);
++	if (!buf) {
++		ath12k_warn(ab, "Failed to allocate memory for coredump\n");
+ 		return;
++	}
+ 
+ 	file_data = (struct ath12k_dump_file_data *)buf;
+ 	strscpy(file_data->df_magic, "ATH12K-FW-DUMP",
+@@ -150,7 +152,7 @@
+ 
+ 	/* Wait until the dump is read and free is called */
+ 	wait_for_completion(&dump_state.dump_done);
+-	vfree(file_data);
++	kfree(file_data);
+ }
+ 
+ static enum ath12k_fw_crash_dump_type
+@@ -195,8 +197,12 @@
+ 	struct ath12k_coredump_segment_info *chip_seg;
+ 	int dump_count;
+ 	struct ath12k_hw_group *ag = ab->ag;
++	bool state = false;
++
++	if (ab->in_panic)
++		state = true;
+ 
+-	ath12k_mhi_coredump(mhi_ctrl, false);
++	ath12k_mhi_coredump(mhi_ctrl, state);
+ 
+ 	rddm_img = mhi_ctrl->rddm_image;
+ 	fw_img = mhi_ctrl->fbc_image;
+@@ -217,9 +223,11 @@
+ 
+ 	len = num_seg * sizeof(*segment);
+ 
+-	segment = vzalloc(len);
+-	if (!segment)
++	segment = kzalloc(len, GFP_NOWAIT);
++	if (!segment) {
++		ath12k_err(ab, " Failed to allocate memory for segment for rddm download\n");
+ 		return;
++	}
+ 
+ 	seg_info = segment;
+ 	for (i = 0; i < fw_img->entries ; i++) {
+@@ -327,7 +335,7 @@
+ 		/* TODO dump collection for MLO when fw_recovery set */
+ 		ath12k_info(ab, "WLAN target is restarting");
+ 		ath12k_coredump_build_inline(ab, segment, num_seg);
+-		vfree(segment);
++		kfree(segment);
+ 	}
+ 
+ }
+--- a/drivers/net/wireless/ath/ath12k/mhi.c
++++ b/drivers/net/wireless/ath/ath12k/mhi.c
+@@ -686,5 +686,5 @@
+ 
+ void ath12k_mhi_coredump(struct mhi_controller *mhi_ctrl, bool state)
+ {
+-	mhi_download_rddm_image(mhi_ctrl, false);
++	mhi_download_rddm_image(mhi_ctrl, state);
+ }

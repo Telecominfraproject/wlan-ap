@@ -1,0 +1,997 @@
+From 298cb0d54a8efe04096d58a538ad695e4a284fab Mon Sep 17 00:00:00 2001
+From: Dinesh Karthikeyan <quic_dinek@quicinc.com>
+Date: Mon, 7 Mar 2022 21:38:21 +0530
+Subject: [PATCH] ath12k: Add support for QDSS dump collection
+
+Add QMI elements to allocate memory for QDSS trace
+collection and to save it. Add QMI message handlers
+for QDSS trace request memory indication and QDSS
+trace save indication.
+
+Add read and write file operations for QDSS
+trace support via debugfs. Add support to download
+QDSS trace config file to the FW. FW reads config file
+and requests memory indication.
+
+Add QMI functions to handle memory allocation. Host
+allocates 1MB of memory per target in the device
+tree. Add support to enable/disable QDSS trace mode.
+
+Enable QDSS trace mode to start the trace
+collection. FW writes data into the buffer.
+Disable QDSS trace mode to stop FW writing and
+collect the QDSS trace dump. FW indicates save
+trace collection indication to the Host.
+
+Signed-off-by: Dinesh Karthikeyan <quic_dinek@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c     |   3 +
+ drivers/net/wireless/ath/ath12k/core.h     |   3 +
+ drivers/net/wireless/ath/ath12k/coredump.c |  69 +++
+ drivers/net/wireless/ath/ath12k/coredump.h |   7 +
+ drivers/net/wireless/ath/ath12k/debugfs.c  |  75 +++
+ drivers/net/wireless/ath/ath12k/qmi.c      | 587 +++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/qmi.h      |  46 ++
+ 7 files changed, 790 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -691,6 +691,9 @@ int ath12k_core_qmi_firmware_ready(struc
+ 		goto err_core_stop;
+ 	}
+ 	ath12k_hif_irq_enable(ab);
++
++	ath12k_config_qdss(ab);
++
+ 	mutex_unlock(&ab->core_lock);
+ 
+ 	return 0;
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -782,6 +782,7 @@ struct ath12k_base {
+ 
+ 	const struct ath12k_hw_params *hw_params;
+ 	struct ath12k_bus_params bus_params;
++	bool is_qdss_tracing;
+ 
+ 	const struct firmware *cal_file;
+ 
+@@ -835,6 +836,7 @@ struct ath12k_base {
+ 
+ 	u64 fw_soc_drop_count;
+ 	bool static_window_map;
++	struct device_node *hremote_node;
+ 
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+@@ -982,6 +984,7 @@ int ath12k_core_check_dt(struct ath12k_b
+ void ath12k_core_halt(struct ath12k *ar);
+ int ath12k_core_resume(struct ath12k_base *ab);
+ int ath12k_core_suspend(struct ath12k_base *ab);
++int ath12k_config_qdss(struct ath12k_base *ab);
+ 
+ const struct firmware *ath12k_core_firmware_request(struct ath12k_base *ab,
+ 						    const char *filename);
+--- a/drivers/net/wireless/ath/ath12k/coredump.c
++++ b/drivers/net/wireless/ath/ath12k/coredump.c
+@@ -220,3 +220,72 @@ void ath12k_coredump_download_rddm(struc
+ 
+ 	kfree(segment);
+ }
++
++void ath12k_coredump_qdss_dump(struct ath12k_base *ab,
++			       struct ath12k_qmi_event_qdss_trace_save_data *event_data)
++{
++	struct ath12k_dump_segment *segment;
++	int len, num_seg;
++	void *dump;
++
++	num_seg = event_data->mem_seg_len;
++	len = sizeof(*segment);
++	segment = kzalloc(len, GFP_KERNEL);
++	if (!segment) {
++		ath12k_warn(ab, "fail to alloc memory for qdss\n");
++		return;
++	}
++
++	if (event_data->total_size &&
++	    event_data->total_size <= ab->qmi.qdss_mem[0].size)
++		dump = kzalloc(event_data->total_size, GFP_KERNEL);
++	if (!dump) {
++		kfree(segment);
++		return;
++	}
++
++	if (num_seg == 1) {
++		segment->len = event_data->mem_seg[0].size;
++		segment->vaddr = ab->qmi.qdss_mem[0].v.ioaddr;
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "seg vaddr is 0x%p len is 0x%x\n",
++			   segment->vaddr, segment->len);
++		segment->type = ATH12K_FW_QDSS_DATA;
++	} else if (num_seg == 2) {
++		/*FW sends 2 segments with segment 0 and segment 1 */
++
++		if (event_data->mem_seg[1].addr != ab->qmi.qdss_mem[0].paddr) {
++			ath12k_warn(ab, "Invalid seg 0 addr 0x%llx\n",
++			    event_data->mem_seg[1].addr);
++			goto out;
++		}
++		if (event_data->mem_seg[0].size + event_data->mem_seg[1].size !=
++		    ab->qmi.qdss_mem[0].size) {
++			ath12k_warn(ab, "Invalid total size 0x%x 0x%x\n",
++				    event_data->mem_seg[0].size,
++				    event_data->mem_seg[1].size);
++			goto out;
++		}
++
++		ath12k_dbg(ab, ATH12K_DBG_QMI, "qdss mem seg0 addr 0x%llx size 0x%x\n",
++			   event_data->mem_seg[0].addr, event_data->mem_seg[0].size);
++		ath12k_dbg(ab, ATH12K_DBG_QMI, "qdss mem seg1 addr 0x%llx size 0x%x\n",
++			   event_data->mem_seg[1].addr, event_data->mem_seg[1].size);
++
++		memcpy(dump,
++		       ab->qmi.qdss_mem[0].v.ioaddr + event_data->mem_seg[1].size,
++		       event_data->mem_seg[0].size);
++		memcpy(dump + event_data->mem_seg[0].size,
++		       ab->qmi.qdss_mem[0].v.ioaddr, event_data->mem_seg[1].size);
++
++		segment->len = event_data->mem_seg[0].size + event_data->mem_seg[1].size;
++		segment->vaddr = dump;
++		ath12k_dbg(ab, ATH12K_DBG_QMI, "seg vaddr is 0x%p and len is 0x%x\n",
++			   segment->vaddr, segment->len);
++		segment->type = ATH12K_FW_QDSS_DATA;
++	}
++	ath12k_coredump_build_inline(ab, segment, 1);
++out:
++	kfree(segment);
++	kfree(dump);
++}
++
+--- a/drivers/net/wireless/ath/ath12k/coredump.h
++++ b/drivers/net/wireless/ath/ath12k/coredump.h
+@@ -71,6 +71,8 @@ struct ath12k_coredump_segment_info {
+ void ath12k_coredump_download_rddm(struct ath12k_base *ab);
+ void ath12k_coredump_build_inline(struct ath12k_base *ab,
+ 				  struct ath12k_dump_segment *segments, int num_seg);
++void ath12k_coredump_qdss_dump(struct ath12k_base *ab,
++			       struct ath12k_qmi_event_qdss_trace_save_data *event_data);
+ #else
+ static inline void ath12k_coredump_download_rddm(struct ath12k_base *ab)
+ {
+@@ -81,6 +83,11 @@ static inline void ath12k_coredump_build
+ 						int num_seg)
+ {
+ }
++static inline void
++ath12k_coredump_qdss_dump(struct ath12k_base *ab,
++			  struct ath12k_qmi_event_qdss_trace_save_data *event_data)
++{
++}
+ #endif
+ 
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -839,6 +839,79 @@ static const struct file_operations fops
+ 	.llseek = default_llseek,
+ };
+ 
++static ssize_t ath12k_read_trace_qdss(struct file *file,
++				      char __user *user_buf,
++				      size_t count, loff_t *ppos)
++{
++	const char buf[] =
++	"1 - this will start qdss trace collection\n"
++	"0 - this will stop and save the qdss trace collection\n";
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, strlen(buf));
++}
++
++static ssize_t
++ath12k_write_trace_qdss(struct file *file,
++			const char __user *user_buf,
++			size_t count, loff_t *ppos)
++{
++	struct ath12k_base *ab = file->private_data;
++	struct ath12k_pdev *pdev;
++	struct ath12k *ar;
++	int i, ret;
++	bool radioup = false;
++	bool qdss_enable;
++
++	if (kstrtobool_from_user(user_buf, count, &qdss_enable))
++		return -EINVAL;
++
++	for (i = 0; i < ab->num_radios; i++) {
++		pdev = &ab->pdevs[i];
++		ar = pdev->ar;
++		if (ar && ar->state == ATH12K_STATE_ON) {
++			radioup = true;
++			break;
++		}
++	}
++
++	if (!radioup) {
++		ath12k_err(ab, "radio is not up\n");
++		ret = -ENETDOWN;
++		goto exit;
++	}
++
++	if (qdss_enable) {
++		if (ab->is_qdss_tracing) {
++			ret = count;
++			goto exit;
++		}
++		ath12k_config_qdss(ab);
++	} else {
++		if (!ab->is_qdss_tracing) {
++			ret = count;
++			goto exit;
++		}
++		ret = ath12k_send_qdss_trace_mode_req(ab,
++						      QMI_WLANFW_QDSS_TRACE_OFF_V01);
++		if (ret < 0)
++			ath12k_warn(ab,
++				    "Failed to stop QDSS: %d\n", ret);
++	}
++
++	ret = count;
++
++exit:
++	return ret;
++}
++
++static const struct file_operations fops_trace_qdss = {
++	.read = ath12k_read_trace_qdss,
++	.write = ath12k_write_trace_qdss,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
+ int ath12k_debugfs_pdev_create(struct ath12k_base *ab)
+ {
+ 	if (test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags))
+@@ -850,6 +923,8 @@ int ath12k_debugfs_pdev_create(struct at
+ 	debugfs_create_file("soc_dp_stats", 0600, ab->debugfs_soc, ab,
+ 			    &fops_soc_dp_stats);
+ 
++	debugfs_create_file("trace_qdss", 0600, ab->debugfs_soc, ab,
++			    &fops_trace_qdss);
+ 	return 0;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -9,6 +9,7 @@
+ #include "qmi.h"
+ #include "core.h"
+ #include "debug.h"
++#include "coredump.h"
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/ioport.h>
+@@ -178,6 +179,73 @@ static struct qmi_elem_info wlfw_host_ml
+ 	},
+ };
+ 
++static struct qmi_elem_info qmi_wlanfw_qdss_trace_mode_req_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct
++				qmi_wlanfw_qdss_trace_mode_req_msg_v01,
++				mode_valid),
++	},
++	{
++		.data_type      = QMI_SIGNED_4_BYTE_ENUM,
++		.elem_len       = 1,
++		.elem_size      = sizeof(enum qmi_wlanfw_qdss_trace_mode_enum_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct
++				qmi_wlanfw_qdss_trace_mode_req_msg_v01,
++				mode),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct
++				qmi_wlanfw_qdss_trace_mode_req_msg_v01,
++				option_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_8_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u64),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct
++				qmi_wlanfw_qdss_trace_mode_req_msg_v01,
++				option),
++	},
++	{
++		.data_type      = QMI_EOTI,
++		.array_type     = NO_ARRAY,
++		.tlv_type       = QMI_COMMON_TLV_TYPE,
++	},
++};
++
++static struct qmi_elem_info qmi_wlanfw_qdss_trace_mode_resp_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct qmi_response_type_v01),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct
++				qmi_wlanfw_qdss_trace_mode_resp_msg_v01,
++				resp),
++		.ei_array       = qmi_response_type_v01_ei,
++	},
++	{
++		.data_type      = QMI_EOTI,
++		.array_type     = NO_ARRAY,
++		.tlv_type       = QMI_COMMON_TLV_TYPE,
++	},
++};
++
+ static struct qmi_elem_info qmi_wlanfw_host_cap_req_msg_v01_ei[] = {
+ 	{
+ 		.data_type	= QMI_OPT_FLAG,
+@@ -864,6 +932,42 @@ static struct qmi_elem_info qmi_wlanfw_i
+ 					   cal_done_enable),
+ 	},
+ 	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x1C,
++		.offset         = offsetof(struct qmi_wlanfw_ind_register_req_msg_v01,
++		                           qdss_trace_req_mem_enable_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x1C,
++		.offset         = offsetof(struct qmi_wlanfw_ind_register_req_msg_v01,
++		                           qdss_trace_req_mem_enable),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x1D,
++		.offset         = offsetof(struct qmi_wlanfw_ind_register_req_msg_v01,
++		                           qdss_trace_save_enable_valid),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x1D,
++		.offset         = offsetof(struct qmi_wlanfw_ind_register_req_msg_v01,
++		                           qdss_trace_save_enable),
++	},
++	{
+ 		.data_type	= QMI_EOTI,
+ 		.array_type	= NO_ARRAY,
+ 		.tlv_type	= QMI_COMMON_TLV_TYPE,
+@@ -1996,6 +2100,85 @@ static struct qmi_elem_info qmi_wlanfw_w
+ 	},
+ };
+ 
++struct qmi_elem_info qmi_wlanfw_qdss_trace_save_ind_msg_v01_ei[] = {
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x01,
++		.offset         = offsetof(struct
++				qmi_wlanfw_qdss_trace_save_ind_msg_v01,
++				source),
++	},
++	{
++		.data_type      = QMI_UNSIGNED_4_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u32),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x02,
++		.offset         = offsetof(struct
++				qmi_wlanfw_qdss_trace_save_ind_msg_v01,
++				total_size),
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct
++				qmi_wlanfw_qdss_trace_save_ind_msg_v01,
++				mem_seg_valid),
++	},
++	{
++		.data_type      = QMI_DATA_LEN,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct
++				qmi_wlanfw_qdss_trace_save_ind_msg_v01,
++				mem_seg_len),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01,
++		.elem_size      = sizeof(struct qmi_wlanfw_mem_seg_resp_s_v01),
++		.array_type     = VAR_LEN_ARRAY,
++		.tlv_type       = 0x10,
++		.offset         = offsetof(struct
++				qmi_wlanfw_qdss_trace_save_ind_msg_v01,
++				mem_seg),
++		.ei_array       = qmi_wlanfw_mem_seg_resp_s_v01_ei,
++	},
++	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct
++				qmi_wlanfw_qdss_trace_save_ind_msg_v01,
++				file_name_valid),
++	},
++	{
++		.data_type      = QMI_STRING,
++		.elem_len       = QMI_WLANFW_MAX_STR_LEN_V01 + 1,
++		.elem_size      = sizeof(char),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x11,
++		.offset         = offsetof(struct
++				qmi_wlanfw_qdss_trace_save_ind_msg_v01,
++				file_name),
++	},
++	{
++		.data_type      = QMI_EOTI,
++		.array_type     = NO_ARRAY,
++		.tlv_type       = QMI_COMMON_TLV_TYPE,
++	},
++};
++
+ static struct qmi_elem_info qmi_wlanfw_mem_ready_ind_msg_v01_ei[] = {
+ 	{
+ 		.data_type = QMI_EOTI,
+@@ -2258,6 +2441,12 @@ static int ath12k_qmi_fw_ind_register_se
+ 	req->cal_done_enable = 1;
+ 	req->fw_init_done_enable_valid = 1;
+ 	req->fw_init_done_enable = 1;
++	req->qdss_trace_req_mem_enable_valid = 1;
++	req->qdss_trace_req_mem_enable = 1;
++	req->qdss_trace_save_enable_valid = 1;
++	req->qdss_trace_save_enable = 1;
++	req->qdss_trace_free_enable_valid = 1;
++	req->qdss_trace_free_enable = 1;
+ 
+ 	req->pin_connect_result_enable_valid = 0;
+ 	req->pin_connect_result_enable = 0;
+@@ -3069,6 +3258,18 @@ out:
+ 	return ret;
+ }
+ 
++int ath12k_config_qdss(struct ath12k_base *ab)
++{
++	int ret;
++
++	ret = ath12k_qmi_send_qdss_config(ab);
++	if (ret < 0)
++		ath12k_warn(ab,
++			    "Failed to download QDSS config to FW: %d\n",
++			    ret);
++	return ret;
++}
++
+ void ath12k_qmi_firmware_stop(struct ath12k_base *ab)
+ {
+ 	int ret;
+@@ -3126,6 +3327,37 @@ static int ath12k_qmi_process_coldboot_c
+ 	return 0;
+ }
+ 
++static void ath12k_qmi_qdss_mem_free(struct ath12k_qmi *qmi)
++{
++	struct ath12k_base *ab = qmi->ab;
++	int i;
++
++	for (i = 0; i < ab->qmi.qdss_mem_seg_len; i++) {
++		if (ab->qmi.qdss_mem[i].v.ioaddr) {
++			iounmap(ab->qmi.qdss_mem[i].v.ioaddr);
++			ab->qmi.qdss_mem[i].v.ioaddr = NULL;
++		}
++	}
++}
++
++static void ath12k_qmi_event_qdss_trace_save_hdlr(struct ath12k_qmi *qmi,
++						  void *data)
++{
++	struct ath12k_qmi_event_qdss_trace_save_data *event_data = data;
++	struct ath12k_base *ab = qmi->ab;
++
++	if (!ab->qmi.qdss_mem_seg_len) {
++		ath12k_warn(ab, "Memory for QDSS trace is not available\n");
++		return;
++	}
++
++	ath12k_coredump_qdss_dump(ab, event_data);
++
++	ath12k_qmi_qdss_mem_free(qmi);
++	ab->qmi.qdss_mem_seg_len = 0;
++	ab->is_qdss_tracing = false;
++}
++
+ static int
+ ath12k_qmi_driver_event_post(struct ath12k_qmi *qmi,
+ 			     enum ath12k_qmi_event_type type,
+@@ -3190,6 +3422,232 @@ static int ath12k_qmi_event_mem_request(
+ 	return ret;
+ }
+ 
++int ath12k_send_qdss_trace_mode_req(struct ath12k_base *ab,
++				    enum qmi_wlanfw_qdss_trace_mode_enum_v01 mode)
++{
++	int ret;
++	struct qmi_txn txn;
++	struct qmi_wlanfw_qdss_trace_mode_req_msg_v01 req = {};
++	struct qmi_wlanfw_qdss_trace_mode_resp_msg_v01 resp = {};
++
++	req.mode_valid = 1;
++	req.mode = mode;
++	req.option_valid = 1;
++	req.option = mode == QMI_WLANFW_QDSS_TRACE_OFF_V01 ?
++		     QMI_WLANFW_QDSS_STOP_ALL_TRACE : 0;
++	ret = qmi_txn_init(&ab->qmi.handle, &txn,
++			   qmi_wlanfw_qdss_trace_mode_resp_msg_v01_ei, &resp);
++	if (ret < 0)
++		return ret;
++
++	ret = qmi_send_request(&ab->qmi.handle, NULL, &txn,
++			       QMI_WLANFW_QDSS_TRACE_MODE_REQ_V01,
++			       QMI_WLANFW_QDSS_TRACE_MODE_REQ_MSG_V01_MAX_LEN,
++			       qmi_wlanfw_qdss_trace_mode_req_msg_v01_ei, &req);
++	if (ret < 0) {
++		ath12k_warn(ab, "Failed to send QDSS trace mode request,err = %d\n", ret);
++		qmi_txn_cancel(&txn);
++		goto out;
++	}
++
++	ret = qmi_txn_wait(&txn, msecs_to_jiffies(ATH12K_QMI_WLANFW_TIMEOUT_MS));
++	if (ret < 0)
++		goto out;
++	if (resp.resp.result != QMI_RESULT_SUCCESS_V01) {
++		ath12k_warn(ab, "QDSS trace mode request failed, result: %d, err: %d\n",
++			    resp.resp.result, resp.resp.error);
++		ret = -EINVAL;
++		goto out;
++	}
++out:
++	return ret;
++}
++
++int ath12k_qmi_pci_alloc_qdss_mem(struct ath12k_qmi *qmi)
++{
++	struct ath12k_base *ab = qmi->ab;
++	struct device *dev = ab->dev;
++	struct resource res;
++	int ret;
++
++	if (ab->qmi.qdss_mem_seg_len > 1) {
++		ath12k_warn(ab, "%s: FW requests %d segments, max allowed is 1\n",
++			    __func__, ab->qmi.qdss_mem_seg_len);
++		return -EINVAL;
++	}
++
++	switch (ab->qmi.qdss_mem[0].type) {
++	case QDSS_ETR_MEM_REGION_TYPE:
++		if (ab->qmi.qdss_mem[0].size > QMI_Q6_QDSS_ETR_SIZE_QCN9274) {
++			ath12k_warn(ab, "%s: FW requests more memory 0x%x\n",
++				    __func__, ab->qmi.qdss_mem[0].size);
++			return -ENOMEM;
++		}
++
++		ab->hremote_node = of_parse_phandle(dev->of_node, "memory-region", 0);
++		if (!ab->hremote_node) {
++			ath12k_warn(ab, "qmi fail to get hremote_node\n");
++			return ret;
++		}
++
++		ret = of_address_to_resource(ab->hremote_node, 0, &res);
++		of_node_put(ab->hremote_node);
++		if (ret) {
++			ath12k_warn(ab, "qmi fail to get reg from hremote\n");
++			return ret;
++		}
++
++		ab->qmi.qdss_mem[0].paddr = (phys_addr_t)res.start + QMI_Q6_QDSS_ETR_OFFSET_QCN9274;
++		ab->qmi.qdss_mem[0].v.ioaddr =
++			ioremap(ab->qmi.qdss_mem[0].paddr,
++				ab->qmi.qdss_mem[0].size);
++		if (!ab->qmi.qdss_mem[0].v.ioaddr) {
++			ath12k_warn(ab, "WARNING etr-addr remap failed\n");
++			return -ENOMEM;
++		}
++		break;
++	default:
++		ath12k_warn(ab, "qmi ignore invalid qdss mem req type %d\n",
++			    ab->qmi.qdss_mem[0].type);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++int ath12k_qmi_qdss_mem_alloc(struct ath12k_qmi *qmi)
++{
++	int ret, i;
++	struct ath12k_base *ab = qmi->ab;
++	struct device_node *dev_node = NULL;
++	struct resource q6_etr;
++
++	if (ab->bus_params.fixed_bdf_addr) {
++		dev_node = of_find_node_by_name(NULL, "q6_etr_dump");
++		if (!dev_node) {
++			ath12k_err(ab, "No q6_etr_dump available in dts\n");
++			return -ENOMEM;
++		}
++		ret = of_address_to_resource(dev_node, 0, &q6_etr);
++		if (ret) {
++			ath12k_err(ab, "Failed to get resource for q6_etr_dump\n");
++			return -EINVAL;
++		}
++		for (i = 0; i < ab->qmi.qdss_mem_seg_len; i++) {
++			ab->qmi.qdss_mem[i].paddr = q6_etr.start;
++			ab->qmi.qdss_mem[i].size = resource_size(&q6_etr);
++			ab->qmi.qdss_mem[i].type = QDSS_ETR_MEM_REGION_TYPE;
++			ab->qmi.qdss_mem[i].v.ioaddr =
++				ioremap(ab->qmi.qdss_mem[i].paddr,
++					ab->qmi.qdss_mem[i].size);
++			if (!ab->qmi.qdss_mem[i].v.ioaddr) {
++				ath12k_err(ab, "Error: etr-addr remap failed\n");
++				return -ENOMEM;
++			}
++			ath12k_dbg(ab, ATH12K_DBG_QMI,
++				   "QDSS mem addr pa 0x%x va 0x%p, size 0x%x",
++				   (unsigned int)ab->qmi.qdss_mem[i].paddr,
++				   ab->qmi.qdss_mem[i].v.ioaddr,
++				   (unsigned int)ab->qmi.qdss_mem[i].size);
++		}
++	} else {
++		ret = ath12k_qmi_pci_alloc_qdss_mem(qmi);
++	}
++	return ret;
++}
++
++int ath12k_qmi_qdss_trace_mem_info_send_sync(struct ath12k_base *ab)
++{
++	struct qmi_wlanfw_respond_mem_req_msg_v01 *req;
++	struct qmi_wlanfw_respond_mem_resp_msg_v01 resp = {};
++	struct qmi_txn txn;
++	int ret, i;
++
++	req = kzalloc(sizeof(*req), GFP_KERNEL);
++	if (!req)
++		return -ENOMEM;
++
++	req->mem_seg_len = ab->qmi.qdss_mem_seg_len;
++
++	for (i = 0; i < req->mem_seg_len ; i++) {
++		req->mem_seg[i].addr = ab->qmi.qdss_mem[i].paddr;
++		req->mem_seg[i].size = ab->qmi.qdss_mem[i].size;
++		req->mem_seg[i].type = ab->qmi.qdss_mem[i].type;
++	}
++
++	ret = qmi_txn_init(&ab->qmi.handle, &txn,
++			   qmi_wlanfw_respond_mem_resp_msg_v01_ei, &resp);
++
++	if (ret < 0) {
++		ath12k_warn(ab, "Fail to initialize txn for QDSS trace mem request: err %d\n",
++			    ret);
++		goto out;
++	}
++
++	ret = qmi_send_request(&ab->qmi.handle, NULL, &txn,
++			       QMI_WLFW_QDSS_TRACE_MEM_INFO_REQ_V01,
++			       QMI_WLANFW_RESPOND_MEM_REQ_MSG_V01_MAX_LEN,
++			       qmi_wlanfw_respond_mem_req_msg_v01_ei, req);
++
++	if (ret < 0) {
++		ath12k_warn(ab, "qmi failed to respond memory request, err = %d\n",
++			    ret);
++		qmi_txn_cancel(&txn);
++		goto out;
++	}
++
++	ret = qmi_txn_wait(&txn,
++			   msecs_to_jiffies(ATH12K_QMI_WLANFW_TIMEOUT_MS));
++	if (ret < 0) {
++		ath12k_warn(ab, "qmi failed memory request, err = %d\n", ret);
++		goto out;
++	}
++
++	if (resp.resp.result != QMI_RESULT_SUCCESS_V01) {
++		ath12k_warn(ab, "Respond mem req failed, result: %d, err: %d\n",
++			    resp.resp.result, resp.resp.error);
++		ret = -EINVAL;
++		goto out;
++	}
++out:
++	kfree(req);
++	return ret;
++}
++
++static void ath12k_qmi_event_qdss_trace_req_mem_hdlr(struct ath12k_qmi *qmi)
++{
++	int ret;
++	struct ath12k_base *ab = qmi->ab;
++
++	ret = ath12k_qmi_qdss_mem_alloc(qmi);
++	if (ret < 0) {
++		ath12k_err(ab, "failed to allocate memory for qdss:%d\n", ret);
++		return;
++	}
++
++	ret = ath12k_qmi_qdss_trace_mem_info_send_sync(ab);
++	if (ret < 0) {
++		ath12k_warn(ab,
++			    "qdss trace mem info send sync failed:%d\n", ret);
++		ath12k_qmi_qdss_mem_free(qmi);
++		return;
++	}
++	/* After qdss_trace_mem_info(QMI_WLFW_QDSS_TRACE_MEM_INFO_REQ_V01),
++	 * the firmware will take one second at max
++	 * for its configuration. We shouldn't send qdss_trace request
++	 * before that.
++	 */
++	msleep(1000);
++	ret = ath12k_send_qdss_trace_mode_req(ab, QMI_WLANFW_QDSS_TRACE_ON_V01);
++	if (ret < 0) {
++		ath12k_warn(ab, "Failed to enable QDSS trace: %d\n", ret);
++		ath12k_qmi_qdss_mem_free(qmi);
++		return;
++	}
++	ab->is_qdss_tracing = true;
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "QDSS configuration is completed and trace started\n");
++}
++
+ static int ath12k_qmi_event_load_bdf(struct ath12k_qmi *qmi)
+ {
+ 	struct ath12k_base *ab = qmi->ab;
+@@ -3313,6 +3771,84 @@ static void ath12k_qmi_msg_cold_boot_cal
+ 	ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi cold boot calibration done\n");
+ }
+ 
++static void ath12k_wlfw_qdss_trace_req_mem_ind_cb(struct qmi_handle *qmi_hdl,
++						  struct sockaddr_qrtr *sq,
++						  struct qmi_txn *txn,
++						  const void *data)
++{
++	struct ath12k_qmi *qmi = container_of(qmi_hdl,
++					      struct ath12k_qmi,
++					      handle);
++	struct ath12k_base *ab = qmi->ab;
++	const struct qmi_wlanfw_request_mem_ind_msg_v01 *msg = data;
++	int i;
++
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "qdss trace request memory from firmware\n");
++	ab->qmi.qdss_mem_seg_len = msg->mem_seg_len;
++
++	if (msg->mem_seg_len > 1) {
++		ath12k_warn(ab, "%s: FW requests %d segments, overwriting it with 1",
++			    __func__, msg->mem_seg_len);
++		ab->qmi.qdss_mem_seg_len = 1;
++	}
++
++	for (i = 0; i < ab->qmi.qdss_mem_seg_len; i++) {
++		ab->qmi.qdss_mem[i].type = msg->mem_seg[i].type;
++		ab->qmi.qdss_mem[i].size = msg->mem_seg[i].size;
++		ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi mem seg type %d size %d\n",
++			   msg->mem_seg[i].type, msg->mem_seg[i].size);
++	}
++
++	ath12k_qmi_driver_event_post(qmi,
++				     ATH12K_QMI_EVENT_QDSS_TRACE_REQ_MEM,
++				     NULL);
++}
++
++static void ath12k_wlfw_qdss_trace_save_ind_cb(struct qmi_handle *qmi_hdl,
++					       struct sockaddr_qrtr *sq,
++					       struct qmi_txn *txn,
++					       const void *data)
++{
++	struct ath12k_qmi *qmi = container_of(qmi_hdl,
++					      struct ath12k_qmi,
++					      handle);
++	struct ath12k_base *ab = qmi->ab;
++	const struct qmi_wlanfw_qdss_trace_save_ind_msg_v01 *ind_msg = data;
++	struct ath12k_qmi_event_qdss_trace_save_data *event_data;
++	int i;
++
++	if (ind_msg->source == 1)
++		return;
++
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "Received qdss trace save indication\n");
++	event_data = kzalloc(sizeof(*event_data), GFP_KERNEL);
++
++	if (!event_data)
++		return;
++
++	if (ind_msg->mem_seg_valid) {
++		if (ind_msg->mem_seg_len > QDSS_TRACE_SEG_LEN_MAX) {
++			ath12k_err(ab, "Invalid seg len %u\n",
++				   ind_msg->mem_seg_len);
++			goto free_event_data;
++		}
++
++		event_data->mem_seg_len = ind_msg->mem_seg_len;
++		for (i = 0; i < ind_msg->mem_seg_len; i++) {
++			event_data->mem_seg[i].addr = ind_msg->mem_seg[i].addr;
++			event_data->mem_seg[i].size = ind_msg->mem_seg[i].size;
++		}
++	}
++
++	event_data->total_size = ind_msg->total_size;
++	ath12k_qmi_driver_event_post(qmi, ATH12K_QMI_EVENT_QDSS_TRACE_SAVE,
++				     event_data);
++	return;
++
++free_event_data:
++	kfree(event_data);
++}
++
+ static const struct qmi_msg_handler ath12k_qmi_msg_handlers[] = {
+ 	{
+ 		.type = QMI_INDICATION,
+@@ -3343,6 +3879,30 @@ static const struct qmi_msg_handler ath1
+ 			sizeof(struct qmi_wlanfw_fw_cold_cal_done_ind_msg_v01),
+ 		.fn = ath12k_qmi_msg_cold_boot_cal_done_cb,
+ 	},
++	{
++                .type = QMI_INDICATION,
++                .msg_id = QMI_WLFW_COLD_BOOT_CAL_DONE_IND_V01,
++                .ei = qmi_wlanfw_cold_boot_cal_done_ind_msg_v01_ei,
++                .decoded_size =
++                        sizeof(struct qmi_wlanfw_fw_cold_cal_done_ind_msg_v01),
++                .fn = ath12k_qmi_msg_cold_boot_cal_done_cb,
++    },
++	{
++		.type = QMI_INDICATION,
++		.msg_id = QMI_WLFW_QDSS_TRACE_REQ_MEM_IND_V01,
++		.ei = qmi_wlanfw_request_mem_ind_msg_v01_ei,
++		.decoded_size =
++				sizeof(struct qmi_wlanfw_request_mem_ind_msg_v01),
++		.fn = ath12k_wlfw_qdss_trace_req_mem_ind_cb,
++	},
++	{
++		.type = QMI_INDICATION,
++		.msg_id = QMI_WLFW_QDSS_TRACE_SAVE_IND_V01,
++		.ei = qmi_wlanfw_qdss_trace_save_ind_msg_v01_ei,
++		.decoded_size =
++				sizeof(struct qmi_wlanfw_qdss_trace_save_ind_msg_v01),
++		.fn = ath12k_wlfw_qdss_trace_save_ind_cb,
++	},
+ };
+ 
+ static int ath12k_qmi_ops_new_server(struct qmi_handle *qmi_hdl,
+@@ -3443,6 +4003,12 @@ static void ath12k_qmi_driver_event_work
+ 			}
+ 
+ 			break;
++		case ATH12K_QMI_EVENT_QDSS_TRACE_REQ_MEM:
++			ath12k_qmi_event_qdss_trace_req_mem_hdlr(qmi);
++			break;
++		case ATH12K_QMI_EVENT_QDSS_TRACE_SAVE:
++			ath12k_qmi_event_qdss_trace_save_hdlr(qmi, event->data);
++			break;
+ 		case ATH12K_QMI_EVENT_COLD_BOOT_CAL_DONE:
+ 			break;
+ 		default:
+--- a/drivers/net/wireless/ath/ath12k/qmi.h
++++ b/drivers/net/wireless/ath/ath12k/qmi.h
+@@ -36,6 +36,10 @@
+ #define QMI_WLFW_FW_MEM_READY_IND_V01		0x0037
+ #define QMI_WLFW_COLD_BOOT_CAL_DONE_IND_V01	0x0021
+ #define QMI_WLFW_FW_READY_IND_V01		0x0038
++#define QMI_WLFW_QDSS_TRACE_REQ_MEM_IND_V01     0x003F
++#define QMI_Q6_QDSS_ETR_SIZE_QCN9274            0x100000
++#define QMI_WLFW_QDSS_TRACE_SAVE_IND_V01        0x0041
++#define QMI_Q6_QDSS_ETR_OFFSET_QCN9274		0x2500000
+ 
+ #define QMI_WLANFW_MAX_DATA_SIZE_V01		6144
+ #define ATH12K_FIRMWARE_MODE_OFF		4
+@@ -74,6 +78,8 @@ enum ath12k_qmi_event_type {
+ 	ATH12K_QMI_EVENT_FORCE_FW_ASSERT,
+ 	ATH12K_QMI_EVENT_POWER_UP,
+ 	ATH12K_QMI_EVENT_POWER_DOWN,
++	ATH12K_QMI_EVENT_QDSS_TRACE_REQ_MEM = 15,
++	ATH12K_QMI_EVENT_QDSS_TRACE_SAVE,
+ 	ATH12K_QMI_EVENT_MAX,
+ };
+ 
+@@ -207,6 +213,7 @@ struct qmi_wlanfw_qdss_trace_mode_resp_m
+ #define QMI_WLFW_MAX_NUM_GPIO_V01			32
+ #define QMI_WLANFW_MAX_PLATFORM_NAME_LEN_V01		64
+ #define QMI_WLANFW_MAX_HOST_DDR_RANGE_SIZE_V01		3
++#define QDSS_ETR_MEM_REGION_TYPE                        0x6
+ 
+ struct qmi_wlanfw_host_ddr_range {
+ 	u64 start;
+@@ -335,6 +342,12 @@ struct qmi_wlanfw_ind_register_req_msg_v
+ 	u8 xo_cal_enable;
+ 	u8 cal_done_enable_valid;
+ 	u8 cal_done_enable;
++	u8 qdss_trace_req_mem_enable_valid;
++	u8 qdss_trace_req_mem_enable;
++	u8 qdss_trace_save_enable_valid;
++	u8 qdss_trace_save_enable;
++	u8 qdss_trace_free_enable_valid;
++	u8 qdss_trace_free_enable;
+ };
+ 
+ struct qmi_wlanfw_ind_register_resp_msg_v01 {
+@@ -350,6 +363,7 @@ struct qmi_wlanfw_ind_register_resp_msg_
+ #define QMI_WLANFW_RESPOND_MEM_REQ_V01			0x0036
+ #define QMI_WLANFW_RESPOND_MEM_RESP_V01			0x0036
+ #define QMI_WLANFW_MAX_NUM_MEM_CFG_V01			2
++#define QMI_WLFW_QDSS_TRACE_MEM_INFO_REQ_V01            0x0040
+ #define QMI_WLANFW_MAX_STR_LEN_V01                      16
+ 
+ struct qmi_wlanfw_mem_cfg_s_v01 {
+@@ -616,6 +630,30 @@ struct qmi_wlanfw_wlan_cfg_resp_msg_v01
+ 	struct qmi_response_type_v01 resp;
+ };
+ 
++struct qmi_wlanfw_qdss_trace_save_ind_msg_v01 {
++	u32 source;
++	u32 total_size;
++	u8 mem_seg_valid;
++	u32 mem_seg_len;
++	struct qmi_wlanfw_mem_seg_resp_s_v01
++			mem_seg[ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01];
++	u8 file_name_valid;
++	char file_name[QMI_WLANFW_MAX_STR_LEN_V01 + 1];
++};
++
++#define QDSS_TRACE_SEG_LEN_MAX 32
++
++struct qdss_trace_mem_seg {
++	u64 addr;
++	u32 size;
++};
++
++struct ath12k_qmi_event_qdss_trace_save_data {
++	u32 total_size;
++	u32 mem_seg_len;
++	struct qdss_trace_mem_seg mem_seg[QDSS_TRACE_SEG_LEN_MAX];
++};
++
+ int ath12k_qmi_firmware_start(struct ath12k_base *ab,
+ 			      u32 mode);
+ void ath12k_qmi_firmware_stop(struct ath12k_base *ab);
+@@ -624,4 +662,6 @@ void ath12k_qmi_msg_recv_work(struct wor
+ void ath12k_qmi_deinit_service(struct ath12k_base *ab);
+ int ath12k_qmi_init_service(struct ath12k_base *ab);
+ 
++int ath12k_send_qdss_trace_mode_req(struct ath12k_base *ab,
++				    enum qmi_wlanfw_qdss_trace_mode_enum_v01 mode);
+ #endif

@@ -1,0 +1,198 @@
+From 5e81f421752af5dcb22d61de60e9091ee2268d16 Mon Sep 17 00:00:00 2001
+From: Ramanathan Choodamani <quic_rchoodam@quicinc.com>
+Date: Wed, 8 Mar 2023 07:05:09 -0800
+Subject: [PATCH 4/6] ath12k: Add ath12k_dp_tx_direct for
+ faster tx  processing
+
+Add a new routine to process the packets in the forwarding path
+faster and increase the throughput. Frame delivered to this function
+are frames identified through SFE and marked with fast_xmit flags.
+Flush only first 256 bytes in the skb data as there won't be any updates
+beyond that in the SFE path
+
+Initialize the descriptor memory once during init and avoid
+initializing the unused fields to 0 on a per packet basis
+
+Signed-off-by: Balamurugan Mahalingam <quic_bmahalin@quicinc.com>
+Signed-off-by: Ramanathan Choodamani <quic_rchoodam@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c       |  1 +
+ drivers/net/wireless/ath/ath12k/dp_tx.c    | 92 ++++++++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/dp_tx.h    |  1 +
+ drivers/net/wireless/ath/ath12k/hal_desc.h |  6 ++
+ drivers/net/wireless/ath/ath12k/mac.c      | 15 ++++-
+ 5 files changed, 113 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -266,6 +266,7 @@ int ath12k_dp_srng_setup(struct ath12k_b
+ 	if (!ring->vaddr_unaligned)
+ 		return -ENOMEM;
+ 
++	memset(ring->vaddr_unaligned, 0, ring->size);
+ 	ring->vaddr = PTR_ALIGN(ring->vaddr_unaligned, HAL_RING_BASE_ALIGN);
+ 	ring->paddr = ring->paddr_unaligned + ((unsigned long)ring->vaddr -
+ 		      (unsigned long)ring->vaddr_unaligned);
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -171,6 +171,100 @@ static int ath12k_dp_prepare_htt_metadat
+ 	return 0;
+ }
+ 
++int ath12k_dp_tx_direct(struct ath12k_link_vif *arvif, struct sk_buff *skb)
++{
++	struct ath12k *ar = arvif->ar;
++	struct ath12k_base *ab = arvif->ar->ab;
++	struct ath12k_dp *dp = &ab->dp;
++	struct ath12k_tx_desc_info *tx_desc = NULL;
++	struct ath12k_skb_cb *skb_cb = ATH12K_SKB_CB(skb);
++	struct hal_srng *tcl_ring;
++	struct dp_tx_ring *tx_ring;
++	void *hal_tcl_desc;
++	struct hal_tcl_data_cmd tcl_desc = { 0 };
++	u8 hal_ring_id, ring_id, rbm_id;
++	int ret;
++
++	ring_id = smp_processor_id();
++
++	rbm_id = ab->hal.ops->tcl_to_wbm_rbm_map[ring_id].rbm_id;
++
++	tx_ring = &dp->tx_ring[ring_id];
++
++	tx_desc = ath12k_dp_tx_assign_buffer_nolock(dp, ring_id);
++	if (unlikely(!tx_desc)) {
++		ab->soc_stats.tx_err.txbuf_na[ring_id]++;
++		return -ENOSPC;
++	}
++	skb_cb->paddr = dma_map_single(ab->dev, skb->data, 256,
++				       DMA_TO_DEVICE);
++	if (unlikely(dma_mapping_error(ab->dev, skb_cb->paddr))) {
++		atomic_inc(&ab->soc_stats.tx_err.misc_fail);
++		ath12k_warn(ab, "failed to DMA map data Tx buffer\n");
++		ret = -ENOMEM;
++		goto fail_remove_tx_buf;
++	}
++
++	tx_desc->skb = skb;
++	tx_desc->mac_id = ar->pdev_idx;
++	skb_cb->vif = arvif->ahvif->vif;
++	skb_cb->ar = ar;
++
++	hal_ring_id = tx_ring->tcl_data_ring.ring_id;
++	tcl_ring = &ab->hal.srng_list[hal_ring_id];
++
++	ath12k_hal_srng_access_src_ring_begin_nolock(ab, tcl_ring);
++
++	hal_tcl_desc = (void *)ath12k_hal_srng_src_get_next_entry_nolock(ab, tcl_ring);
++	if (unlikely(!hal_tcl_desc)) {
++		/* NOTE: It is highly unlikely we'll be running out of tcl_ring
++		 * desc because the desc is directly enqueued onto hw queue.
++		 */
++		ath12k_hal_srng_access_umac_src_ring_end_nolock(ab->mem, tcl_ring);
++		ab->soc_stats.tx_err.desc_na[ring_id]++;
++		ret = -ENOMEM;
++		goto fail_unmap_dma;
++	}
++
++	ab->soc_stats.tx_enqueued[ring_id]++;
++
++	tcl_desc.buf_addr_info.info0 = FIELD_PREP(BUFFER_ADDR_INFO0_ADDR, skb_cb->paddr);
++	tcl_desc.buf_addr_info.info1 = FIELD_PREP(BUFFER_ADDR_INFO1_ADDR,
++			((uint64_t)skb_cb->paddr >> HAL_ADDR_MSB_REG_SHIFT));
++	tcl_desc.buf_addr_info.info1 |=
++		FIELD_PREP(BUFFER_ADDR_INFO1_RET_BUF_MGR, rbm_id) |
++		FIELD_PREP(BUFFER_ADDR_INFO1_SW_COOKIE, tx_desc->desc_id);
++	tcl_desc.info0 =
++		FIELD_PREP(HAL_TCL_DATA_CMD_INFO0_DESC_TYPE, HAL_TCL_DESC_TYPE_BUFFER) |
++		FIELD_PREP(HAL_TCL_DATA_CMD_INFO0_BANK_ID, arvif->bank_id);
++	tcl_desc.info1 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO1_CMD_NUM,
++				    arvif->tcl_metadata);
++	if (likely(skb->ip_summed == CHECKSUM_PARTIAL))
++		tcl_desc.info2 |= TX_IP_CHECKSUM;
++	tcl_desc.info2 |= FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_DATA_LEN, skb->len);
++	tcl_desc.info3 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO3_PMAC_ID, ar->lmac_id) |
++		FIELD_PREP(HAL_TCL_DATA_CMD_INFO3_VDEV_ID, arvif->vdev_id);
++	tcl_desc.info4 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO4_SEARCH_INDEX, arvif->ast_idx) |
++		FIELD_PREP(HAL_TCL_DATA_CMD_INFO4_CACHE_SET_NUM, arvif->ast_hash);
++
++	memcpy(hal_tcl_desc, &tcl_desc, sizeof(tcl_desc));
++	dsb(st);
++	ath12k_hal_srng_access_umac_src_ring_end_nolock(ab->mem, tcl_ring);
++
++	atomic_inc(&ar->dp.num_tx_pending);
++
++	return 0;
++
++fail_unmap_dma:
++	dma_unmap_single(ab->dev, skb_cb->paddr, 256, DMA_TO_DEVICE);
++
++fail_remove_tx_buf:
++	ath12k_dp_tx_release_txbuf(dp, tx_desc, ring_id);
++
++	return ret;
++}
++EXPORT_SYMBOL(ath12k_dp_tx_direct);
++
+ int ath12k_dp_tx(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 		 struct ath12k_sta *ahsta, struct sk_buff *skb,
+ 		 bool gsn_valid, int mcbc_gsn)
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.h
+@@ -239,4 +239,5 @@ int ath12k_dp_tx_htt_tx_filter_setup(str
+ int ath12k_dp_tx_htt_tx_monitor_mode_ring_config(struct ath12k *ar, bool reset);
+ int ath12k_dp_tx_htt_monitor_mode_ring_config(struct ath12k *ar, bool reset);
+ int ath12k_dp_tx_htt_h2t_vdev_stats_ol_req(struct ath12k *ar, u64 reset_bitmask);
++int ath12k_dp_tx_direct(struct ath12k_link_vif *arvif, struct sk_buff *skb);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/hal_desc.h
++++ b/drivers/net/wireless/ath/ath12k/hal_desc.h
+@@ -1292,6 +1292,12 @@ enum hal_wbm_htt_tx_comp_status {
+ 	HAL_WBM_REL_HTT_TX_COMP_STATUS_MAX,
+ };
+ 
++#define TX_IP_CHECKSUM (HAL_TCL_DATA_CMD_INFO2_IP4_CKSUM_EN  | \
++			HAL_TCL_DATA_CMD_INFO2_UDP4_CKSUM_EN | \
++			HAL_TCL_DATA_CMD_INFO2_UDP6_CKSUM_EN | \
++			HAL_TCL_DATA_CMD_INFO2_TCP4_CKSUM_EN | \
++			HAL_TCL_DATA_CMD_INFO2_TCP6_CKSUM_EN)
++
+ struct hal_tcl_data_cmd {
+ 	struct ath12k_buffer_addr buf_addr_info;
+ 	u32 info0;
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -8474,7 +8474,7 @@ static void ath12k_mac_op_tx(struct ieee
+ 	struct ath12k_sta *ahsta = NULL;
+ 	struct sk_buff *msdu_copied;
+ 	struct ath12k_link_sta *arsta = NULL;
+-	struct ieee80211_sta *sta = control->sta;
++	struct ieee80211_sta *sta = NULL;
+ 	struct ath12k_peer *peer;
+ 	u32 info_flags = info->flags;
+ 	bool is_prb_rsp;
+@@ -8486,6 +8486,9 @@ static void ath12k_mac_op_tx(struct ieee
+ 	int ret;
+  	u8 link = u32_get_bits(info->control.flags, IEEE80211_TX_CTRL_MLO_LINK);
+ 
++	if (control)
++		sta = control->sta;
++
+ 	if (ahvif->vdev_type == WMI_VDEV_TYPE_MONITOR) {
+ 		ieee80211_free_txskb(hw, skb);
+ 		return;
+@@ -8512,6 +8514,15 @@ static void ath12k_mac_op_tx(struct ieee
+ 		ieee80211_free_txskb(hw, skb);
+ 		return;
+ 	}
++	if (skb->fast_xmit) {
++		ret = ath12k_dp_tx_direct(arvif, skb);
++		if (unlikely(ret)) {
++			ath12k_warn(ar->ab, "failed to transmit frame %d\n",
++				    ret);
++			ieee80211_free_txskb(hw, skb);
++		}
++		return;
++	}
+ 
+ 	ar = arvif->ar;
+ 	ah = ar->ah;

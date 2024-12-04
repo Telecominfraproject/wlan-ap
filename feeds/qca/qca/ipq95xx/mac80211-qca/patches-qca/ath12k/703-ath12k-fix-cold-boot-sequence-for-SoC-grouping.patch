@@ -1,0 +1,173 @@
+From daddcfdd1ac6bccf78017b7f2a29d73c0d14412f Mon Sep 17 00:00:00 2001
+From: Karthikeyan Kathirvel <quic_kathirve@quicinc.com>
+Date: Fri, 30 Dec 2022 14:15:16 +0530
+Subject: [PATCH] ath12k: fix cold boot sequence for SoC grouping
+
+With grouping of hardware(mlo_capable=1) host will power up the firmware
+only after all the expected num of hardwares has been grouped, then host
+has to do cold boot process but here in failure case cold boot process
+is started before grouping of hardware completes and also before
+firmware power up.
+
+In case of coldboot, boot the firmare without filling mlo details, fill
+the mlo details only while booting the firmware in
+mission mode.
+
+Also increase the coldboot timeout to 60secs since 5Ghz and 6Ghz radios
+are taking more time than the current timeout which is 40secs (~ 5ghz
+is taking 41secs, ~ 6ghz is taking 51secs)
+
+Signed-off-by: Karthikeyan Kathirvel <quic_kathirve@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c |  4 +++
+ drivers/net/wireless/ath/ath12k/hw.c   |  2 +-
+ drivers/net/wireless/ath/ath12k/pci.c  |  2 --
+ drivers/net/wireless/ath/ath12k/qmi.c  | 47 ++++++++++++++++----------
+ drivers/net/wireless/ath/ath12k/qmi.h  |  2 ++
+ 5 files changed, 36 insertions(+), 21 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1552,6 +1552,9 @@ static int ath12k_core_hw_group_create(s
+  		}
+ 		set_bit(ATH12K_FLAG_HW_GROUP_ATTACHED, &ab->dev_flags);
+ 		mutex_unlock(&ab->core_lock);
++
++		ath12k_qmi_fwreset_from_cold_boot(ab);
++
+ 	}
+ 
+ out:
+@@ -1761,6 +1764,7 @@ struct ath12k_base *ath12k_core_alloc(st
+ 	ab->dev = dev;
+ 	ab->bus_params = *bus_params;
+ 	ab->hif.bus = bus;
++	ab->qmi.num_radios = ATH12K_QMI_INVALID_RADIO;
+ 
+ 	return ab;
+ 
+--- a/drivers/net/wireless/ath/ath12k/hw.c
++++ b/drivers/net/wireless/ath/ath12k/hw.c
+@@ -1032,7 +1032,7 @@ static const struct ath12k_hw_params ath
+ 		.supports_monitor = false,
+ 
+ 		.idle_ps = false,
+-		.cold_boot_calib = false,
++		.cold_boot_calib = true,
+ 		.download_calib = true,
+ 		.supports_suspend = false,
+ 		.tcl_ring_retry = true,
+--- a/drivers/net/wireless/ath/ath12k/pci.c
++++ b/drivers/net/wireless/ath/ath12k/pci.c
+@@ -1393,8 +1393,6 @@ static int ath12k_pci_probe(struct pci_d
+ 		goto err_free_irq;
+ 	}
+ 
+-	ath12k_qmi_fwreset_from_cold_boot(ab);
+-
+ 	return 0;
+ 
+ err_free_irq:
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -19,8 +19,6 @@
+ #include <linux/module.h>
+ #include <linux/devcoredump.h>
+ 
+-#define ATH12K_QMI_INVALID_RADIO	0xFF
+-
+ #define SLEEP_CLOCK_SELECT_INTERNAL_BIT	0x02
+ #define HOST_CSTATE_BIT			0x04
+ #define PLATFORM_CAP_PCIE_GLOBAL_RESET	0x08
+@@ -2820,6 +2818,15 @@ static int ath12k_qmi_fill_mlo_host_caps
+ 		return 0;
+ 	}
+ 
++	if (ath12k_cold_boot_cal && ab->qmi.cal_done == 0 &&
++	    ab->hw_params->cold_boot_calib &&
++		ab->qmi.cal_timeout == 0) {
++		ath12k_dbg(ab, ATH12K_DBG_QMI, "Skip MLO cap send for chip id %d since it's in cold_boot\n",
++				ab->chip_id);
++		mutex_unlock(&ag->mutex_lock);
++		return 0;
++	}
++
+ 	if (ag->id == ATH12K_INVALID_GRP_ID || !ab->qmi.num_radios) {
+ 		ag->mlo_capable = false;
+ 
+@@ -4340,12 +4347,10 @@ void ath12k_qmi_trigger_host_cap(struct
+ 
+ 	spin_unlock(&qmi->event_lock);
+ 
+-	if (block) {
+-		ath12k_dbg(ab, ATH12K_DBG_QMI, "Trigger host cap for chip id %d\n",
+-			   ab->chip_id);
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "Trigger host cap for chip id %d\n",
++			ab->chip_id);
+ 
+-		ath12k_qmi_driver_event_post(qmi, ATH12K_QMI_EVENT_HOST_CAP, NULL);
+-	}
++	ath12k_qmi_driver_event_post(qmi, ATH12K_QMI_EVENT_HOST_CAP, NULL);
+ }
+ 
+ static bool ath12k_qmi_hw_group_host_cap_ready(struct ath12k_hw_group *ag)
+@@ -4408,18 +4413,25 @@ static int ath12k_qmi_event_server_arriv
+ 
+ 	ath12k_qmi_phy_cap_send(ab);
+ 
+-	spin_lock(&qmi->event_lock);
+-	ath12k_qmi_set_event_block(&ab->qmi, true);
+-	spin_unlock(&qmi->event_lock);
++	if (ath12k_cold_boot_cal && ab->qmi.cal_done == 0 &&
++			ab->hw_params->cold_boot_calib &&
++			ab->qmi.cal_timeout == 0) {
++		/* Coldboot calibration mode */
++		ath12k_qmi_trigger_host_cap(ab);
++	} else {
++		spin_lock(&qmi->event_lock);
++		ath12k_qmi_set_event_block(&ab->qmi, true);
++		spin_unlock(&qmi->event_lock);
+ 
+-	mutex_lock(&ag->mutex_lock);
+-	host_cap_ready = ath12k_qmi_hw_group_host_cap_ready(ag);
+-	if (host_cap_ready) {
+-		block_ab = ath12k_qmi_hw_group_find_blocked_chip(ag);
+-		if (block_ab)
+-			ath12k_qmi_trigger_host_cap(block_ab);
++		mutex_lock(&ag->mutex_lock);
++		host_cap_ready = ath12k_qmi_hw_group_host_cap_ready(ag);
++		if (host_cap_ready) {
++			block_ab = ath12k_qmi_hw_group_find_blocked_chip(ag);
++			if (block_ab)
++				ath12k_qmi_trigger_host_cap(block_ab);
++		}
++		mutex_unlock(&ag->mutex_lock);
+ 	}
+-	mutex_unlock(&ag->mutex_lock);
+ 
+ 	return ret;
+ }
+@@ -5179,7 +5191,6 @@ int ath12k_qmi_init_service(struct ath12
+ 	memset(&ab->qmi.target, 0, sizeof(struct target_info));
+ 	memset(&ab->qmi.target_mem, 0, sizeof(struct target_mem_chunk));
+ 	ab->qmi.ab = ab;
+-	ab->qmi.num_radios = ATH12K_QMI_INVALID_RADIO;
+ 
+ 	ab->qmi.target_mem_mode = ATH12K_QMI_TARGET_MEM_MODE_DEFAULT;
+ 	ret = qmi_handle_init(&ab->qmi.handle, ATH12K_QMI_RESP_LEN_MAX,
+--- a/drivers/net/wireless/ath/ath12k/qmi.h
++++ b/drivers/net/wireless/ath/ath12k/qmi.h
+@@ -47,10 +47,12 @@
+ #define QMI_WLANFW_MAX_DATA_SIZE_V01		6144
+ #define ATH12K_FIRMWARE_MODE_OFF		4
+ #define ATH12K_QMI_TARGET_MEM_MODE_DEFAULT	0
+-#define ATH12K_COLD_BOOT_FW_RESET_DELAY		(40 * HZ)
++#define ATH12K_COLD_BOOT_FW_RESET_DELAY		(60 * HZ)
+ 
+ #define ATH12K_BOARD_ID_DEFAULT	0xFF
+ 
++#define ATH12K_QMI_INVALID_RADIO	0xFF
++
+ struct ath12k_base;
+ 
+ enum ath12k_qmi_file_type {

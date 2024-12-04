@@ -1,0 +1,202 @@
+From 5443cdb6e19061ba88d0434414aa88b0384cdfe4 Mon Sep 17 00:00:00 2001
+From: Pradeep Kumar Chitrapu <quic_pradeepc@quicinc.com>
+Date: Wed, 2 Mar 2022 22:54:08 -0800
+Subject: [PATCH] ath12k: Fix setting msdu_ext_desc in Ethernet and RAW modes
+
+When VAP is configured in Ethernet or RAW mode, the per vdev
+bank is configred with VDEV specific encapsulation type.
+However, this results in transmit fail for packets received
+in other formats than what has been programmed in Bank
+registers, for eg, NWIFI/RAW packets in Ethernet mode.
+Fix this by overriding bank register config on per packet
+basis by setting msdu_ext_desc.
+
+NOTE: This supports Ethernet mode and RAW mode with encryption
+offloaded. RAW mode with Software based encryption is not yet
+supported.
+
+Signed-off-by: Pradeep Kumar Chitrapu <quic_pradeepc@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h  |  2 ++
+ drivers/net/wireless/ath/ath12k/dp.c    | 20 +++++++++--
+ drivers/net/wireless/ath/ath12k/dp.h    |  1 +
+ drivers/net/wireless/ath/ath12k/dp_tx.c | 45 ++++++++++++++++---------
+ drivers/net/wireless/ath/ath12k/mac.c   |  6 +++-
+ 5 files changed, 55 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index 84183e9..b97225d 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -46,6 +46,8 @@
+ #define ATH12K_RECONFIGURE_TIMEOUT_HZ		(10 * HZ)
+ #define ATH12K_RECOVER_START_TIMEOUT_HZ		(20 * HZ)
+ 
++#define INVALID_CIPHER 0xFFFFFFFF
++
+ enum wme_ac {
+ 	WME_AC_BE,
+ 	WME_AC_BK,
+diff --git a/drivers/net/wireless/ath/ath12k/dp.c b/drivers/net/wireless/ath/ath12k/dp.c
+index 67a9b55..8153fcb 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -314,18 +314,25 @@ static
+ u32 ath12k_dp_tx_get_vdev_bank_config(struct ath12k_base *ab, struct ath12k_vif *arvif)
+ {
+ 	u32 bank_config = 0;
++	enum hal_encrypt_type encrypt_type = 0;
+ 
+ 	/* Only valid for raw frames with HW crypto enabled.
+ 	 * With SW crypto, mac80211 sets key per packet
+ 	 */
+ 	if (arvif->tx_encap_type == HAL_TCL_ENCAP_TYPE_RAW &&
+-	    test_bit(ATH12K_FLAG_HW_CRYPTO_DISABLED, &ab->dev_flags))
++	    test_bit(ATH12K_FLAG_HW_CRYPTO_DISABLED, &ab->dev_flags) &&
++	    arvif->key_cipher != INVALID_CIPHER)
+ 		bank_config |=
+ 			u32_encode_bits(ath12k_dp_tx_get_encrypt_type(arvif->key_cipher),
+ 					HAL_TX_BANK_CONFIG_ENCRYPT_TYPE);
++	else
++		encrypt_type = HAL_ENCRYPT_TYPE_OPEN;
+ 
+ 	bank_config |= u32_encode_bits(arvif->tx_encap_type,
+-					HAL_TX_BANK_CONFIG_ENCAP_TYPE);
++					HAL_TX_BANK_CONFIG_ENCAP_TYPE) |
++					u32_encode_bits(encrypt_type,
++					HAL_TX_BANK_CONFIG_ENCRYPT_TYPE);
++
+ 	bank_config |= u32_encode_bits(0, HAL_TX_BANK_CONFIG_SRC_BUFFER_SWAP) |
+ 			u32_encode_bits(0, HAL_TX_BANK_CONFIG_LINK_META_SWAP) |
+ 			u32_encode_bits(0, HAL_TX_BANK_CONFIG_EPD);
+@@ -406,6 +413,15 @@ void ath12k_dp_tx_put_bank_profile(struct ath12k_dp *dp, u8 bank_id)
+ 	spin_unlock_bh(&dp->tx_bank_lock);
+ }
+ 
++void ath12k_dp_tx_update_bank_profile(struct ath12k_vif *arvif)
++{
++	struct ath12k_base *ab = arvif->ar->ab;
++	struct ath12k_dp *dp = &ab->dp;
++
++	ath12k_dp_tx_put_bank_profile(dp, arvif->bank_id);
++	arvif->bank_id = ath12k_dp_tx_get_bank_profile(ab, arvif, dp);
++}
++
+ static void ath12k_dp_deinit_bank_profiles(struct ath12k_base *ab)
+ {
+ 	struct ath12k_dp *dp = &ab->dp;
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+index 7c5dafc..9f22c37 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -1813,4 +1813,5 @@ struct ath12k_rx_desc_info *ath12k_dp_get_rx_desc(struct ath12k_base *ab,
+ 						  u32 cookie);
+ struct ath12k_tx_desc_info *ath12k_dp_get_tx_desc(struct ath12k_base *ab,
+ 						  u32 desc_id);
++void ath12k_dp_tx_update_bank_profile(struct ath12k_vif *arvif);
+ #endif
+diff --git a/drivers/net/wireless/ath/ath12k/dp_tx.c b/drivers/net/wireless/ath/ath12k/dp_tx.c
+index 1b69f3e..ea955b3 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -119,7 +119,7 @@ static void ath12k_hal_tx_cmd_ext_desc_setup(struct ath12k_base *ab, void *cmd,
+ 			       le32_encode_bits(ti->data_len,
+ 						HAL_TX_MSDU_EXT_INFO1_BUF_LEN);
+ 
+-	tcl_ext_cmd->info1 = le32_encode_bits(1, HAL_TX_MSDU_EXT_INFO1_EXTN_OVERRIDE) |
++	tcl_ext_cmd->info1 |= le32_encode_bits(1, HAL_TX_MSDU_EXT_INFO1_EXTN_OVERRIDE) |
+ 				le32_encode_bits(ti->encap_type,
+ 						 HAL_TX_MSDU_EXT_INFO1_ENCAP_TYPE) |
+ 				le32_encode_bits(ti->encrypt_type,
+@@ -182,21 +182,6 @@ tcl_ring_sel:
+ 	ti.bank_id = arvif->bank_id;
+ 	ti.meta_data_flags = arvif->tcl_metadata;
+ 
+-	if (arvif->tx_encap_type == HAL_TCL_ENCAP_TYPE_RAW &&
+-	    test_bit(ATH12K_FLAG_HW_CRYPTO_DISABLED, &ar->ab->dev_flags)) {
+-		if (skb_cb->flags & ATH12K_SKB_CIPHER_SET) {
+-			ti.encrypt_type =
+-				ath12k_dp_tx_get_encrypt_type(skb_cb->cipher);
+-
+-			if (ieee80211_has_protected(hdr->frame_control))
+-				skb_put(skb, IEEE80211_CCMP_MIC_LEN);
+-		} else {
+-			ti.encrypt_type = HAL_ENCRYPT_TYPE_OPEN;
+-		}
+-
+-		msdu_ext_desc = true;
+-	}
+-
+ 	ti.encap_type = ath12k_dp_tx_get_encap_type(arvif, skb);
+ 	ti.addr_search_flags = arvif->hal_addr_search_flags;
+ 	ti.search_type = arvif->search_type;
+@@ -250,6 +235,34 @@ tcl_ring_sel:
+ 		goto fail_remove_tx_buf;
+ 	}
+ 
++	if ((arvif->tx_encap_type == HAL_TCL_ENCAP_TYPE_ETHERNET &&
++	    !(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP))) {
++		msdu_ext_desc = true;
++
++		if (skb->protocol == cpu_to_be16(ETH_P_PAE)) {
++			ti.encap_type = HAL_TCL_ENCAP_TYPE_RAW;
++			ti.encrypt_type = HAL_ENCRYPT_TYPE_OPEN;
++		}
++	}
++
++	if (arvif->tx_encap_type == HAL_TCL_ENCAP_TYPE_RAW) {
++		if (skb->protocol == cpu_to_be16(ETH_P_ARP)) {
++			ti.encap_type = HAL_TCL_ENCAP_TYPE_RAW;
++			ti.encrypt_type = HAL_ENCRYPT_TYPE_OPEN;
++			msdu_ext_desc = true;
++		}
++
++		if (skb_cb->flags & ATH12K_SKB_CIPHER_SET) {
++			ti.encrypt_type =
++				ath12k_dp_tx_get_encrypt_type(skb_cb->cipher);
++
++			if (ieee80211_has_protected(hdr->frame_control))
++				skb_put(skb, IEEE80211_CCMP_MIC_LEN);
++		} else {
++			ti.encrypt_type = HAL_ENCRYPT_TYPE_OPEN;
++		}
++	}
++
+ 	tx_desc->skb = skb;
+ 	tx_desc->mac_id = ar->pdev_idx;
+ 	ti.desc_id = tx_desc->desc_id;
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index cd4269a..2f2a405 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -3312,8 +3312,10 @@ install:
+ 	if (!wait_for_completion_timeout(&ar->install_key_done, 1 * HZ))
+ 		return -ETIMEDOUT;
+ 
+-	if (ether_addr_equal(macaddr, arvif->vif->addr))
++	if (ether_addr_equal(macaddr, arvif->vif->addr)) {
+ 		arvif->key_cipher = key->cipher;
++		ath12k_dp_tx_update_bank_profile(arvif);
++	}
+ 
+ 	return ar->install_key_status ? -EINVAL : 0;
+ }
+@@ -5538,6 +5540,7 @@ static int ath12k_mac_op_add_interface(struct ieee80211_hw *hw,
+ 
+ 	INIT_LIST_HEAD(&arvif->list);
+ 
++	arvif->key_cipher = INVALID_CIPHER;
+ 	/* Should we initialize any worker to handle connection loss indication
+ 	 * from firmware in sta mode?
+ 	 */
+@@ -5825,6 +5828,7 @@ err_vdev_del:
+ 
+ 	ath12k_mac_vif_unref(&ab->dp, vif);
+ 	ath12k_dp_tx_put_bank_profile(&ab->dp, arvif->bank_id);
++	arvif->key_cipher = INVALID_CIPHER;
+ 
+ 	/* Recalc txpower for remaining vdev */
+ 	ath12k_mac_txpower_recalc(ar);
+-- 
+2.17.1
+

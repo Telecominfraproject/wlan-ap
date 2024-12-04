@@ -1,0 +1,462 @@
+From ce5dfd5b4d7b36a87e642033979b98ec47dd5efd Mon Sep 17 00:00:00 2001
+From: Pradeep Kumar Chitrapu <quic_pradeepc@quicinc.com>
+Date: Thu, 27 Jul 2023 10:54:24 -0700
+Subject: [PATCH] ath12k: optimize PPE direct switch rx path
+
+These optimizations showed 20% CPU saved for 5GHz 160MHz + 6GHz 320MHz case.
+ - Decrease number of branch jumps using separate srng access functions
+ - Currently, rx_desc is being removed from rx_desc_used_list
+   and added back after rxdma srng replenish. This increases cpu consumption
+   as attempts to acquire locks are made multiple times for each operation.
+ - Avoid this by maintaining index arrays and replenish rxdma while
+   rx descriptors continue to be in rx_desc_used_list. When no rxdma srng
+   has no space, rest of descriptors will be added to rx_desc_free_list
+   after cleaning up the skb's.
+ - Group frequently accessed data structure in rx_desc to avoid cache misses.
+   As part of this, replace ab with just chip_id inside rx_desc which helps
+   to reduce rx_desc size.
+ - increase REO2PPE ring size to handle more number of ring descriptors.
+
+Signed-off-by: Pradeep Kumar Chitrapu <quic_pradeepc@quicinc.com>
+Signed-off-by: P Praneesh <quic_ppranees@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c    |  2 +-
+ drivers/net/wireless/ath/ath12k/dp.h    |  7 +-
+ drivers/net/wireless/ath/ath12k/dp_rx.c |  1 +
+ drivers/net/wireless/ath/ath12k/hal.h   |  8 +++
+ drivers/net/wireless/ath/ath12k/ppe.c   | 88 +++++++++++--------------
+ 5 files changed, 54 insertions(+), 52 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -1690,18 +1690,6 @@ static void ath12k_dp_cc_cleanup(struct
+ 		dev_kfree_skb_any(skb);
+ 	}
+ 
+-	list_for_each_entry_safe(desc_info, tmp, &dp->rx_ppeds_reuse_list, list) {
+-		list_del(&desc_info->list);
+-		skb = desc_info->skb;
+-
+-		if (!skb)
+-			continue;
+-
+-		dma_unmap_single(ab->dev, ATH12K_SKB_RXCB(skb)->paddr,
+-				 skb->len + skb_tailroom(skb), DMA_FROM_DEVICE);
+-		dev_kfree_skb_any(skb);
+-	}
+-
+ 	for (i = 0; i < ATH12K_NUM_RX_SPT_PAGES; i++) {
+ 		if (!dp->spt_info->rxbaddr[i])
+ 			continue;
+@@ -2155,7 +2143,7 @@ static int ath12k_dp_cc_desc_init(struct
+ 		for (j = 0; j < ATH12K_MAX_SPT_ENTRIES; j++) {
+ 			rx_descs[j].cookie = ath12k_dp_cc_cookie_gen(ppt_idx, j);
+ 			rx_descs[j].magic = ATH12K_DP_RX_DESC_MAGIC;
+-			rx_descs[j].ab = ab;
++			rx_descs[j].chip_id = ab->chip_id;
+ 			list_add_tail(&rx_descs[j].list, &dp->rx_desc_free_list);
+ 
+ 			/* Update descriptor VA in SPT */
+@@ -2194,7 +2182,6 @@ static int ath12k_dp_cc_init(struct ath1
+ 
+ 	INIT_LIST_HEAD(&dp->rx_desc_free_list);
+ 	INIT_LIST_HEAD(&dp->rx_desc_used_list);
+-	INIT_LIST_HEAD(&dp->rx_ppeds_reuse_list);
+ 	spin_lock_init(&dp->rx_desc_lock);
+ 
+ 	for (i = 0; i < ATH12K_HW_MAX_QUEUES; i++) {
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -188,7 +188,7 @@ struct ath12k_pdev_dp {
+ #define DP_RX_BUFFER_SIZE_LITE	1024
+ #define DP_RX_BUFFER_ALIGN_SIZE	128
+ 
+-#define DP_REO2PPE_RING_SIZE 8192
++#define DP_REO2PPE_RING_SIZE 16384
+ #define DP_PPE2TCL_RING_SIZE 2048
+ #define DP_PPE_WBM2SW_RING_SIZE 8192
+ #define HAL_REO2PPE_DST_IND 6
+@@ -311,10 +311,11 @@ struct ath12k_hp_update_timer {
+ 
+ struct ath12k_rx_desc_info {
+ 	struct list_head list;
+-	struct sk_buff *skb;
+ 	u32 cookie;
++	dma_addr_t paddr;
++	u8 chip_id;
++	struct sk_buff *skb;
+ 	u32 magic;
+-	struct ath12k_base *ab;
+ };
+ 
+ struct ath12k_tx_desc_info {
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -307,6 +307,7 @@ int ath12k_dp_rx_bufs_replenish(struct a
+ 			}
+ 
+ 			rx_desc->skb = skb;
++			rx_desc->paddr = paddr;
+ 			cookie = rx_desc->cookie;
+ 			list_del(&rx_desc->list);
+ 			list_add_tail(&rx_desc->list, &dp->rx_desc_used_list);
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -1332,5 +1332,13 @@ void ath12k_hal_srng_access_dst_ring_end
+ 	srng->timestamp = jiffies;
+ }
+ 
++static inline
++void ath12k_hal_srng_access_lmac_src_ring_end_nolock(struct hal_srng *srng)
++{
++	srng->u.src_ring.last_tp = *(volatile u32 *)srng->u.src_ring.tp_addr;
++	*srng->u.src_ring.hp_addr = srng->u.src_ring.hp;
++}
++
++
+ ssize_t ath12k_debugfs_hal_dump_srng_stats(struct ath12k_base *ab, char *buf, int size);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -122,109 +122,90 @@ static inline void ath12k_ppeds_enable_s
+ 	}
+ }
+ 
+-int ath12k_dp_rx_bufs_replenish_ppeds(struct ath12k_base *ab,
+-				      struct dp_rxdma_ring *rx_ring,
+-				      int req_entries,
+-				      enum hal_rx_buf_return_buf_manager mgr)
++static bool ath12k_ppeds_free_rx_desc(struct ppe_ds_wlan_rxdesc_elem *arr,
++				      struct ath12k_base *ab, int index,
++				      u16 *idx_of_ab)
+ {
++	struct ath12k_rx_desc_info *rx_desc;
++	struct sk_buff *skb;
++
++	rx_desc = (struct ath12k_rx_desc_info *)arr[idx_of_ab[index]].cookie;
++	if (rx_desc->chip_id != ab->chip_id)
++        	return false;
++
++	skb = rx_desc->skb;
++	rx_desc->skb= NULL;
++	spin_lock_bh(&ab->dp.rx_desc_lock);
++	list_move_tail(&rx_desc->list, &ab->dp.rx_desc_free_list);
++	spin_unlock_bh(&ab->dp.rx_desc_lock);
++	if (!skb) {
++		ath12k_err(ab, "ppeds rx desc with no skb when freeing\n");
++		return false;
++	}
++
++	/* When recycled_for_ds is set, packet is used by DS rings and never has
++	 * touched by host. So, buffer unmap can be skipped. */
++	if (!skb->recycled_for_ds) {
++        	dmac_inv_range_no_dsb(skb->data, skb->data + (skb->len +
++				      skb_tailroom(skb)));
++		dma_unmap_single_attrs(ab->dev, ATH12K_SKB_RXCB(skb)->paddr,
++           			       skb->len + skb_tailroom(skb),
++				       DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
++	}
++
++	skb->recycled_for_ds = 0;
++	skb->fast_recycled = 0;
++	dev_kfree_skb_any(skb);
++	return true;
++}
++
++int ath12k_dp_rx_bufs_replenish_ppeds(struct ath12k_base *ab, int req_entries,
++				      u16 *idx_of_ab, struct ppe_ds_wlan_rxdesc_elem *arr)
++{
++	struct dp_rxdma_ring *rx_ring = &ab->dp.rx_refill_buf_ring;
+ 	struct hal_srng *rxdma_srng;
+ 	u32 *rxdma_desc;
+ 	u32 cookie;
+ 	dma_addr_t paddr;
+-	struct sk_buff *skb;
+-	struct ath12k_rx_desc_info *rx_desc, *cur;
+-	int count = 0, num_remain;
++	struct ath12k_rx_desc_info *rx_desc;
++	int count = 0, num_remain, i;
++	enum hal_rx_buf_return_buf_manager mgr = ab->hw_params->hal_params->rx_buf_rbm;
+ 
+ 	rxdma_srng = &ab->hal.srng_list[rx_ring->refill_buf_ring.ring_id];
+ 
+ 	spin_lock_bh(&rxdma_srng->lock);
+-	ath12k_hal_srng_access_begin(ab, rxdma_srng);
++	ath12k_hal_srng_access_src_ring_begin_nolock(rxdma_srng);
+ 
+ 	num_remain = req_entries;
+-	while (num_remain > 0) {
+-		spin_lock_bh(&ab->dp.rx_desc_lock);
++	for (i = 0 ; i < req_entries; i++) {
++		if ((i + 1) < (req_entries - 1))
++			prefetch((struct ath12k_rx_desc_info *)arr[idx_of_ab[i + 1]].cookie);
+ 
+-		rx_desc = list_first_entry_or_null(&ab->dp.rx_ppeds_reuse_list,
+-						   struct ath12k_rx_desc_info,
+-						   list);
+-		if (!rx_desc) {
+-			spin_unlock_bh(&ab->dp.rx_desc_lock);
++		rx_desc = (struct ath12k_rx_desc_info *)arr[idx_of_ab[i]].cookie;
++		if (!rx_desc)
+ 			break;
+-		}
+ 
+-		skb = rx_desc->skb;
+-		if (!skb) {
++		if (!rx_desc->skb) {
+ 			ath12k_err(ab, "ppeds rx desc with no skb when reusing!\n");
+-			spin_unlock_bh(&ab->dp.rx_desc_lock);
+ 			break;
+ 		}
+ 		cookie = rx_desc->cookie;
+-		list_move_tail(&rx_desc->list, &ab->dp.rx_desc_used_list);
+-		spin_unlock_bh(&ab->dp.rx_desc_lock);
++		paddr = rx_desc->paddr;
+ 
+ 		rxdma_desc = ath12k_hal_srng_src_get_next_entry(ab, rxdma_srng);
+-		if (!rxdma_desc) {
+-			/* Remove desc from used list when no rxdma entry is available */
+-			spin_lock_bh(&ab->dp.rx_desc_lock);
+-			list_move_tail(&rx_desc->list, &ab->dp.rx_ppeds_reuse_list);
+-			spin_unlock_bh(&ab->dp.rx_desc_lock);
++		if (!rxdma_desc)
+ 			break;
+-		}
+ 
+-		paddr = ATH12K_SKB_RXCB(skb)->paddr;
+ 		ath12k_hal_rx_buf_addr_info_set(rxdma_desc, paddr, cookie, mgr);
+-
+ 		num_remain--;
+-		count++;
+ 	}
+-        ath12k_hal_srng_access_end(ab, rxdma_srng);
+-        spin_unlock_bh(&rxdma_srng->lock);
+-
+-	if (!ab->stats_disable)
+-		ab->ppeds_stats.num_rx_desc_reused += count;
+ 
+-	if (count == req_entries)
+-		return 0;
++	ath12k_hal_srng_access_lmac_src_ring_end_nolock(rxdma_srng);
++	spin_unlock_bh(&rxdma_srng->lock);
+ 
+ 	/* move any remaining descriptors to free list */
+-	count = 0;
+-	while (num_remain) {
+-		spin_lock_bh(&ab->dp.rx_desc_lock);
+-		cur = list_first_entry_or_null(&ab->dp.rx_ppeds_reuse_list,
+-					       struct ath12k_rx_desc_info,
+-					       list);
+-		if (!cur) {
+-			/* break the loop as soon as list is empty */
+-			spin_unlock_bh(&ab->dp.rx_desc_lock);
+-			break;
+-		}
+-
+-		skb = cur->skb;
+-		cur->skb= NULL;
+-		list_move_tail(&cur->list, &ab->dp.rx_desc_free_list);
+-		spin_unlock_bh(&ab->dp.rx_desc_lock);
+-		num_remain--;
+-		count++;
+-
+-		if (!skb) {
+-			ath12k_err(ab, "ppeds rx desc with no skb when freeing\n");
+-			continue;
+-		}
+-
+-		/* When recycled_for_ds is set, packet is used by DS rings and never has
+-		 * touched by host. So, buffer unmap can be skipped. */
+-		if (!skb->recycled_for_ds) {
+-			dmac_inv_range_no_dsb(skb->data, skb->data + (skb->len +
+-					      skb_tailroom(skb)));
+-			dma_unmap_single_attrs(ab->dev, ATH12K_SKB_RXCB(skb)->paddr,
+-					       skb->len + skb_tailroom(skb),
+-					       DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
+-		}
+-
+-		skb->recycled_for_ds = 0;
+-		skb->fast_recycled = 0;
+-		dev_kfree_skb_any(skb);
+-	}
++	for (; i < req_entries; i++)
++		count += ath12k_ppeds_free_rx_desc(arr, ab, i, idx_of_ab);
+ 
+ 	if (!ab->stats_disable)
+ 		ab->ppeds_stats.num_rx_desc_freed += count;
+@@ -232,47 +213,82 @@ int ath12k_dp_rx_bufs_replenish_ppeds(st
+ 	return 0;
+ }
+ 
++/* TODO: Fetch this directly from ppe_ds.h file. allocating dynamically will increase CPU */
++#ifndef PPE_DS_TXCMPL_DEF_BUDGET
++#define PPE_DS_TXCMPL_DEF_BUDGET 256
++#endif
++
+ static void ath12k_ppeds_release_rx_desc(ppe_ds_wlan_handle_t *ppeds_handle,
+                                         struct ppe_ds_wlan_rxdesc_elem *arr, u16 count)
+ {
+ 	struct ath12k_base *ab = *(struct ath12k_base **)ppe_ds_wlan_priv(ppeds_handle);
+ 	struct ath12k_base *src_ab = NULL;
++	struct ath12k_hw_group *ag = ab->ag;
+ 	u32 rx_bufs_reaped[ATH12K_MAX_SOCS] = {0};
+ 	struct ath12k_rx_desc_info *rx_desc;
+-	struct dp_rxdma_ring *rx_ring;
+ 	int chip_id;
+-	int i = 0;
++	u32 i = 0, new_size, num_free_desc;
++	u16 *tmp;
+ 
+ 	if (!ab->stats_disable)
+ 		ab->ppeds_stats.release_rx_desc_cnt += count;
+ 
++	if (unlikely(count > ab->ppeds_rx_num_elem)) {
++		new_size = sizeof(u16) * count;
++		for (chip_id = 0; chip_id < ag->num_chip; chip_id++) {
++			tmp = krealloc(*ab->ppeds_rx_idx[chip_id], new_size, GFP_ATOMIC);
++			if (!tmp) {
++		        	ath12k_err(ab, "ppeds: rx desc realloc failed for size %u\n",
++					   count);
++				goto err_h_alloc_failure;
++			}
++
++			*ab->ppeds_rx_idx[chip_id] = tmp;
++		}
++
++		ab->ppeds_rx_num_elem = count;
++		ab->ppeds_stats.num_rx_desc_realloc =+ chip_id;
++	}
++
+ 	for (i = 0; i < count; i++) {
++		if ((i + 1) < (count - 1))
++			prefetch((struct ath12k_rx_desc_info *)arr[i + 1].cookie);
++
+ 		rx_desc = (struct ath12k_rx_desc_info *)arr[i].cookie;
+ 		if (rx_desc == NULL) {
+ 			ath12k_err(ab,"error: rx desc is null\n");
+ 			continue;
+ 		}
+-		src_ab = rx_desc->ab;
+-		/* TODO: review split phy */
+-		rx_bufs_reaped[src_ab->chip_id]++;
+-
+-		spin_lock_bh(&src_ab->dp.rx_desc_lock);
+-		list_move_tail(&rx_desc->list, &src_ab->dp.rx_ppeds_reuse_list);
+-		spin_unlock_bh(&src_ab->dp.rx_desc_lock);
++		chip_id = rx_desc->chip_id;
++		/* Maintain indexes of arr per ab seperately, which can accessed easily
++	 	 * during per ab's rxdma srng replenish
++	 	 */
++		ab->ppeds_rx_idx[chip_id][rx_bufs_reaped[chip_id]] = i;
++		rx_bufs_reaped[chip_id]++;
+ 	}
+ 
+-	for (chip_id = 0; chip_id < ATH12K_MAX_SOCS; chip_id++) {
++	for (chip_id = 0; chip_id < ag->num_chip; chip_id++) {
+ 		if (!rx_bufs_reaped[chip_id])
+ 			continue;
+ 
+-		src_ab = ab->ag->ab[chip_id];
+-		rx_ring = &src_ab->dp.rx_refill_buf_ring;
+-		ath12k_dp_rx_bufs_replenish_ppeds(src_ab, rx_ring,
+-						  rx_bufs_reaped[chip_id],
+-						  src_ab->hw_params->hal_params->rx_buf_rbm);
++		src_ab = ag->ab[chip_id];
++		ath12k_dp_rx_bufs_replenish_ppeds(src_ab, rx_bufs_reaped[chip_id],
++						  &ab->ppeds_rx_idx[chip_id][0], arr);
+ 	}
+ 
+ 	return;
++
++err_h_alloc_failure:
++	for (chip_id = 0; chip_id < ag->num_chip; chip_id++) {
++		src_ab = ag->ab[chip_id];
++		num_free_desc = 0;
++		for (i = 0; i < count; i++)
++		        num_free_desc +=
++				ath12k_ppeds_free_rx_desc(arr, src_ab, i,
++							  &src_ab->ppeds_rx_idx[chip_id][0]);
++		if (!src_ab->stats_disable)
++			src_ab->ppeds_stats.num_rx_desc_freed += num_free_desc;
++	}
+ }
+ 
+ static
+@@ -842,7 +858,27 @@ int ath12k_ppeds_attach(struct ath12k_ba
+ 	*abptr = ab;
+ 	ath12k_dbg(ab, ATH12K_DBG_PPE, "PPEDS attach success\n");
+ 
++	for (i = 0; i < ab->ag->num_chip; i++) {
++		ab->ppeds_rx_idx[i] = kzalloc((sizeof(u16) * PPE_DS_TXCMPL_DEF_BUDGET),
++					      GFP_ATOMIC);
++		if (!ab->ppeds_rx_idx[i]) {
++		        ath12k_err(ab, "Failed to alloc mem ppeds_rx_desc\n");
++			goto err_ppeds_attach;
++		}
++	}
++
++	ab->ppeds_rx_num_elem = PPE_DS_TXCMPL_DEF_BUDGET;
++
+ 	return 0;
++
++err_ppeds_attach:
++	ab->ppeds_rx_num_elem = 0;
++	for (i = i - 1; i >= 0; i--) {
++		kfree(ab->ppeds_rx_idx[i]);
++		ab->ppeds_rx_idx[i] = NULL;
++	}
++
++	return -ENOMEM;
+ }
+ 
+ int ath12k_ppeds_detach(struct ath12k_base *ab)
+@@ -871,6 +907,14 @@ int ath12k_ppeds_detach(struct ath12k_ba
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_PPE, "PPEDS detach success\n");
+ 
++	if (ab->ppeds_rx_num_elem) {
++		ab->ppeds_rx_num_elem = 0;
++		for (i = 0; i < ab->ag->num_chip; i++) {
++			kfree(ab->ppeds_rx_idx[i]);
++			ab->ppeds_rx_idx[i] = NULL;
++		}
++	}
++
+ 	return 0;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1223,7 +1223,7 @@ struct ath12k_ppeds_stats {
+ 	u32 release_tx_single_cnt;
+ 	u32 release_rx_desc_cnt;
+ 	u32 num_rx_desc_freed;
+-	u32 num_rx_desc_reused;
++	u32 num_rx_desc_realloc;
+ };
+ 
+ struct ath12k_ppeds_napi {
+@@ -1493,6 +1493,8 @@ struct ath12k_base {
+     u8 ppeds_int_mode_enabled;
+ 	u8 ppeds_stopped;
+ 	struct ath12k_ppeds_stats ppeds_stats;
++	u16 *ppeds_rx_idx[ATH12K_MAX_SOCS];
++	u16 ppeds_rx_num_elem;
+ #endif
+ 
+ 	int userpd_id;
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -2332,10 +2332,10 @@ static ssize_t ath12k_debugfs_dump_ppeds
+ 			 ppeds_stats->tx_desc_freed);
+ 	len += scnprintf(buf + len, size - len, "fw2wbm_pkt_drops %u\n",
+ 			 ppeds_stats->fw2wbm_pkt_drops);
+-	len += scnprintf(buf + len, size - len, "num_rx_desc_reused %u\n",
+-			 ppeds_stats->num_rx_desc_reused);
+ 	len += scnprintf(buf + len, size - len, "num_rx_desc_freed %u\n",
+ 			 ppeds_stats->num_rx_desc_freed);
++	len += scnprintf(buf + len, size - len, "num_rx_desc_realloc %u\n",
++			 ppeds_stats->num_rx_desc_realloc);
+ 
+ 	if (len > size)
+ 		len = size;

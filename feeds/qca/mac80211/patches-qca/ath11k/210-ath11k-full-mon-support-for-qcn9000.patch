@@ -1,0 +1,133 @@
+From 97cf0413cdb40444cc4f1e521dc6e7b912a8a61e Mon Sep 17 00:00:00 2001
+From: Anilkumar Kolli <akolli@codeaurora.org>
+Date: Mon, 14 Sep 2020 16:41:47 +0530
+Subject: [PATCH] ath11k: add full monitor support for QCN9000
+
+1) add hw specific callback to differentiate legacy and full
+   monitor mode support.
+2) config cmd HTT_H2T_MSG_TYPE_RX_FULL_MONITOR_MODE is
+   sent to configure full monitor mode.
+3) mon_dst_ring ring is read in sw_mon_ring decriptor format
+   instead of reo_entrance_ring descriptor format.
+4) Mon_dst_ring is reaped first and then mon_status ring.
+5) Status is available for all entries in mon_dst ring, this
+   is achieved by using HW lock-stepping.
+6) Interrupt received for each end of ppdu in dst ring, hw also
+   copies status for same PPDU.
+
+Signed-off-by: Anilkumar Kolli <akolli@codeaurora.org>
+---
+ drivers/net/wireless/ath/ath11k/ahb.c      |   1 +
+ drivers/net/wireless/ath/ath11k/core.c     |   3 +
+ drivers/net/wireless/ath/ath11k/dp.c       |   7 +-
+ drivers/net/wireless/ath/ath11k/dp.h       |  99 +++++++
+ drivers/net/wireless/ath/ath11k/dp_rx.c    | 425 +++++++++++++++++++++++++++--
+ drivers/net/wireless/ath/ath11k/dp_rx.h    |   4 -
+ drivers/net/wireless/ath/ath11k/dp_tx.c    |  39 +++
+ drivers/net/wireless/ath/ath11k/dp_tx.h    |   2 +
+ drivers/net/wireless/ath/ath11k/hal_desc.h |  19 ++
+ drivers/net/wireless/ath/ath11k/hal_rx.c   |  47 ++++
+ drivers/net/wireless/ath/ath11k/hal_rx.h   |  17 ++
+ drivers/net/wireless/ath/ath11k/hw.c       |  16 ++
+ drivers/net/wireless/ath/ath11k/hw.h       |  11 +
+ drivers/net/wireless/ath/ath11k/mac.c      |  11 +
+ 14 files changed, 677 insertions(+), 24 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -840,9 +840,10 @@ int ath11k_dp_service_srng(struct ath11k
+ 				if (ab->hw_params.ring_mask->rx_mon_status[grp_id] &
+ 					BIT(id)) {
+ 					work_done =
+-					ath11k_dp_rx_process_mon_rings(ab,
+-								       id,
+-								       napi, budget);
++						ath11k_dp_rx_process_mon_rings(ab,
++									       id,
++									       napi,
++									       budget);
+ 					budget -= work_done;
+ 					tot_work_done += work_done;
+ 
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -534,6 +534,8 @@ static void ath11k_dp_rx_pdev_srng_free(
+ 	}
+ 
+ 	ath11k_dp_srng_cleanup(ab, &dp->rxdma_mon_buf_ring.refill_buf_ring);
++	ath11k_dp_srng_cleanup(ar->ab, &dp->rxdma_mon_dst_ring);
++	ath11k_dp_srng_cleanup(ar->ab, &dp->rxdma_mon_desc_ring);
+ }
+ 
+ void ath11k_dp_pdev_reo_cleanup(struct ath11k_base *ab)
+@@ -5676,15 +5678,6 @@ int ath11k_dp_rx_process_mon_status(stru
+ 		ppdu_info->peer_id = HAL_INVALID_PEERID;
+ 		hal_status = ath11k_hal_rx_parse_mon_status(ab, ppdu_info, skb);
+ 
+-		if (test_bit(ATH11K_FLAG_MONITOR_STARTED, &ar->monitor_flags) &&
+-		    pmon->mon_ppdu_status == DP_PPDU_STATUS_START &&
+-		    hal_status == HAL_TLV_STATUS_PPDU_DONE) {
+-			rx_mon_stats->status_ppdu_done++;
+-			pmon->mon_ppdu_status = DP_PPDU_STATUS_DONE;
+-			ath11k_dp_rx_mon_dest_process(ar, mac_id, budget, napi);
+-			pmon->mon_ppdu_status = DP_PPDU_STATUS_START;
+-		}
+-
+ 		if (ppdu_info->peer_id == HAL_INVALID_PEERID ||
+ 		    hal_status != HAL_RX_MON_STATUS_PPDU_DONE) {
+ 			dev_kfree_skb_any(skb);
+@@ -5721,7 +5714,6 @@ int ath11k_dp_rx_process_mon_status(stru
+ next_skb:
+ 		spin_unlock_bh(&ab->base_lock);
+ 		rcu_read_unlock();
+-
+ 		dev_kfree_skb_any(skb);
+ 		memset(ppdu_info, 0, sizeof(*ppdu_info));
+ 		ppdu_info->peer_id = HAL_INVALID_PEERID;
+@@ -6088,12 +6080,10 @@ int ath11k_dp_rx_process_mon_rings(struc
+ 	struct ath11k *ar = ath11k_ab_to_ar(ab, mac_id);
+ 	int ret = 0;
+ 
+-	if (test_bit(ATH11K_FLAG_MONITOR_STARTED, &ar->monitor_flags) &&
+-	    ab->hw_params.full_monitor_mode)
+-		ret = ath11k_dp_full_mon_process_rx(ab, mac_id, napi, budget);
++	if (ab->hw_params.full_monitor_mode)
++		return ath11k_dp_full_mon_process_rx(ab, mac_id, napi, budget);
+ 	else
+-		ret = ath11k_dp_rx_process_mon_status(ab, mac_id, napi, budget);
+-
++		return ath11k_dp_rx_process_mon_status(ab, mac_id, napi, budget);
+ 	return ret;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.h
+@@ -130,16 +130,14 @@ int ath11k_dp_htt_tlv_iter(struct ath11k
+ 			   int (*iter)(struct ath11k_base *ar, u16 tag, u16 len,
+ 				       const void *ptr, void *data),
+ 			   void *data);
+-int ath11k_dp_rx_process_mon_rings(struct ath11k_base *ab, int mac_id,
+-				   struct napi_struct *napi, int budget);
+-int ath11k_dp_rx_process_mon_status(struct ath11k_base *ab, int mac_id,
+-				    struct napi_struct *napi, int budget);
+ int ath11k_dp_rx_mon_status_bufs_replenish(struct ath11k_base *ab, int mac_id,
+ 					   struct dp_rxdma_ring *rx_ring,
+ 					   int req_entries,
+ 					   enum hal_rx_buf_return_buf_manager mgr);
+ void ath11k_dp_rx_mon_dest_process(struct ath11k *ar, int mac_id, u32 quota,
+ 				   struct napi_struct *napi);
++int ath11k_dp_rx_process_mon_rings(struct ath11k_base *ab, int mac_id,
++				   struct napi_struct *napi, int budget);
+ int ath11k_dp_rx_pdev_mon_detach(struct ath11k *ar);
+ int ath11k_dp_rx_pdev_mon_attach(struct ath11k *ar);
+ int ath11k_peer_rx_frag_setup(struct ath11k *ar, const u8 *peer_mac, int vdev_id);
+--- a/drivers/net/wireless/ath/ath11k/hw.h
++++ b/drivers/net/wireless/ath/ath11k/hw.h
+@@ -129,6 +129,7 @@ enum ath11k_bus {
+ 
+ struct hal_rx_desc;
+ struct hal_tcl_data_cmd;
++struct napi_struct;
+ 
+ struct ath11k_hw_ring_mask {
+ 	u8 tx[ATH11K_EXT_IRQ_GRP_NUM_MAX];

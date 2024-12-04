@@ -1,0 +1,269 @@
+From 4654e36e81cfcbe799dd6908395ccdc578580855 Mon Sep 17 00:00:00 2001
+From: Ramya Gnanasekar <quic_rgnanase@quicinc.com>
+Date: Tue, 16 Aug 2022 14:33:04 +0530
+Subject: [PATCH] ath12k: Fix vdev restart/start sequence during channel switch
+
+When channel switch happens, host will send updated channel
+information through vdev restart for every vif without doing
+vdev down explicitly since FW internally will take care of
+vdev down/up for each VAP.
+In case of multi vif, this causes FW to create new vdev structure
+for every restart since other vifs will be operating in old channel.
+
+Expected sequence by FW during channel switch:
+	1. Bring down all vdev
+	2. Restart the vdev with new channel information
+	3. Beacon template for vdev
+	4. bring up all vdev (vdev up)
+
+This patch takes of sequencing the vdev down/restart/up in case of
+multi vif.
+Since beacon template will be sent only for transmitting vif, if
+non-transmitting vdev is brought up, FW will assert as there is no
+beacon template associated to transmitting vdev.
+Hence identified and bring up the transmitting vif before restarting the
+other non transmitting vif.
+
+Signed-off-by: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Signed-off-by: Ramya Gnanasekar <quic_rgnanase@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 170 ++++++++++++++++++++------
+ drivers/net/wireless/ath/ath12k/wmi.h |   2 +-
+ 2 files changed, 136 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 88fef37..b5b3a69 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -1044,8 +1044,10 @@ static int ath12k_mac_vdev_setup_sync(struct ath12k *ar)
+ 		   ATH12K_VDEV_SETUP_TIMEOUT_HZ);
+ 
+ 	if (!wait_for_completion_timeout(&ar->vdev_setup_done,
+-					 ATH12K_VDEV_SETUP_TIMEOUT_HZ))
++					 ATH12K_VDEV_SETUP_TIMEOUT_HZ)){
++		WARN_ON(1);
+ 		return -ETIMEDOUT;
++	}
+ 
+ 	return ar->last_wmi_vdev_start_status ? -EINVAL : 0;
+ }
+@@ -8233,9 +8235,88 @@ static int ath12k_mac_vdev_start(struct ath12k_vif *arvif,
+ }
+ 
+ static int ath12k_mac_vdev_restart(struct ath12k_vif *arvif,
+-				   const struct cfg80211_chan_def *chandef)
++				   const struct cfg80211_chan_def *chandef,
++				   bool pseudo_restart)
+ {
+-	return ath12k_mac_vdev_start_restart(arvif, chandef, true);
++	struct ath12k_base *ab = arvif->ar->ab;
++	int ret;
++
++	if(!pseudo_restart)
++		return ath12k_mac_vdev_start_restart(arvif, chandef, true);
++
++	ret = ath12k_mac_vdev_stop(arvif);
++	if (ret) {
++		ath12k_warn(ab, "failed to stop vdev %d: %d during restart\n",
++			    arvif->vdev_id, ret);
++		return ret;
++	}
++
++	ret = ath12k_mac_vdev_start(arvif, chandef);
++	if (ret) {
++		ath12k_warn(ab, "failed to start vdev %d: %d during restart\n",
++			    arvif->vdev_id, ret);
++		return ret;
++	}
++
++	return ret;
++}
++
++static int ath12k_vdev_restart_sequence(struct ath12k_vif *arvif,
++					struct ieee80211_chanctx_conf *new_ctx,
++					u64 vif_down_failed_map,
++					int vdev_index)
++{
++	struct ath12k *ar = arvif->ar;
++	struct ath12k_vif *tx_arvif;
++	struct ieee80211_chanctx_conf old_chanctx;
++	struct ieee80211_vif *tx_vif;
++	struct vdev_up_params params = { 0 };
++	int ret = -EINVAL;
++
++	if (vif_down_failed_map & BIT_ULL(vdev_index))
++		ret = ath12k_mac_vdev_restart(arvif, &new_ctx->def, false);
++	else
++		ret = ath12k_mac_vdev_restart(arvif, &new_ctx->def, true);
++
++	if (ret) {
++		ath12k_warn(ar->ab, "failed to restart vdev %d: %d\n",
++			    arvif->vdev_id, ret);
++		return ret;
++	}
++
++	spin_lock_bh(&ar->data_lock);
++	old_chanctx = arvif->chanctx;
++	memcpy(&arvif->chanctx, new_ctx, sizeof(*new_ctx));
++	spin_unlock_bh(&ar->data_lock);
++
++	if (!arvif->is_up)
++		return -EOPNOTSUPP;
++
++	ret = ath12k_mac_setup_bcn_tmpl(arvif);
++	if (ret) {
++		ath12k_warn(ar->ab, "failed to update bcn tmpl during csa: %d\n", arvif->vdev_id);
++		return ret;
++	}
++
++	params.vdev_id = arvif->vdev_id;
++	params.aid = arvif->aid;
++	params.bssid = arvif->bssid;
++	if (arvif->vif->mbssid_tx_vif) {
++		tx_vif = arvif->vif->mbssid_tx_vif;
++		tx_arvif = ath12k_vif_to_arvif(tx_vif);
++		params.tx_bssid = tx_arvif->bssid;
++		params.profile_idx = arvif->vif->bss_conf.bssid_index;
++		params.profile_count = tx_arvif->nontransmitting_vif_count;
++	}
++
++	ret = ath12k_wmi_vdev_up(arvif->ar, &params);
++	if (ret) {
++		ath12k_warn(ar->ab, "failed to bring vdev up %d: %d\n",
++			    arvif->vdev_id, ret);
++		return ret;
++	}
++
++	return ret;
+ }
+ 
+ struct ath12k_mac_change_chanctx_arg {
+@@ -8360,19 +8441,23 @@ ath12k_mac_update_vif_chan(struct ath12k *ar,
+ 	struct ath12k_vif *arvif, *tx_arvif;
+ 	struct cfg80211_chan_def *chandef = NULL;
+ 	int ret;
+-	int i;
++	int i, trans_vdev_index;
+ 	bool monitor_vif = false;
+-	struct ieee80211_chanctx_conf old_chanctx;
++	u64 vif_down_failed_map = 0;
++	struct ieee80211_vif *tx_vif;
+ 
+-	lockdep_assert_held(&ar->conf_mutex);
++	/* Each vif is mapped to each bit of vif_down_failed_map. */
++	if (n_vifs > sizeof(vif_down_failed_map)*__CHAR_BIT__) {
++		ath12k_warn(ar->ab, "%d n_vifs are not supported currently\n",
++			    n_vifs);
++		return;
++	}
+ 
+-	chandef = &vifs[0].new_ctx->def;
++	lockdep_assert_held(&ar->conf_mutex);
+ 
+-	ath12k_mac_update_rx_channel(ar, NULL, vifs, n_vifs);
++	tx_arvif = NULL;
+ 
+ 	for (i = 0; i < n_vifs; i++) {
+-		struct vdev_up_params params = { 0 };
+-
+ 		arvif = (void *)vifs[i].vif->drv_priv;
+ 
+ 		if (vifs[i].vif->type == NL80211_IFTYPE_MONITOR)
+@@ -8389,41 +8474,56 @@ ath12k_mac_update_vif_chan(struct ath12k *ar,
+ 		if (WARN_ON(!arvif->is_started))
+ 			continue;
+ 
+-		spin_lock_bh(&ar->data_lock);
+-                old_chanctx = arvif->chanctx;
+-		memcpy(&arvif->chanctx, vifs[i].new_ctx, sizeof(*(vifs[i].new_ctx)));
+-                spin_unlock_bh(&ar->data_lock);
++		if (!arvif->is_up)
++			continue;
+ 
+-		ret = ath12k_mac_vdev_restart(arvif, &vifs[i].new_ctx->def);
++		if (arvif->vif->mbssid_tx_vif &&
++		    arvif == (struct ath12k_vif *)arvif->vif->mbssid_tx_vif->drv_priv) {
++			tx_vif = arvif->vif->mbssid_tx_vif;
++			tx_arvif = ath12k_vif_to_arvif(tx_vif);
++			trans_vdev_index = i;
++		}
++
++		ret = ath12k_wmi_vdev_down(ar, arvif->vdev_id);
+ 		if (ret) {
+-			ath12k_warn(ab, "failed to restart vdev %d: %d\n",
++			vif_down_failed_map |= BIT_ULL(i);
++			ath12k_warn(ab, "failed to down vdev %d: %d\n",
+ 				    arvif->vdev_id, ret);
+-			spin_lock_bh(&ar->data_lock);
+-                        arvif->chanctx = old_chanctx;
+-                        spin_unlock_bh(&ar->data_lock);
+ 			continue;
+ 		}
++	}
+ 
+-		if (WARN_ON(!arvif->is_up))
+-			continue;
++	chandef = &vifs[0].new_ctx->def;
++
++	ath12k_mac_update_rx_channel(ar, NULL, vifs, n_vifs);
++
++	if (tx_arvif) {
++		ret = ath12k_vdev_restart_sequence(tx_arvif,
++						   vifs[trans_vdev_index].new_ctx,
++						   vif_down_failed_map,
++						   trans_vdev_index);
+ 
+-		ret = ath12k_mac_setup_bcn_tmpl(arvif);
+ 		if (ret)
+-			ath12k_warn(ab, "failed to update bcn tmpl during csa: %d\n",
+-				    ret);
++			ath12k_warn(ab, "failed to restart vdev:%d: %d\n",
++				    tx_arvif->vdev_id, ret);
++	}
++
++	for (i = 0; i < n_vifs; i++) {
++		arvif = (void *)vifs[i].vif->drv_priv;
++
++		if (vifs[i].vif->type == NL80211_IFTYPE_MONITOR)
++			monitor_vif = true;
++
++		if (arvif->vif->mbssid_tx_vif &&
++		    arvif == tx_arvif)
++			continue;
++
++		ret = ath12k_vdev_restart_sequence(arvif,
++						   vifs[i].new_ctx,
++						   vif_down_failed_map, i);
+ 
+-		params.vdev_id = arvif->vdev_id;
+-		params.aid = arvif->aid;
+-		params.bssid = arvif->bssid;
+-		if (arvif->vif->mbssid_tx_vif) {
+-			tx_arvif = (void *)arvif->vif->mbssid_tx_vif->drv_priv;
+-			params.tx_bssid = tx_arvif->bssid;
+-			params.profile_idx = arvif->vif->bss_conf.bssid_index;
+-			params.profile_count = tx_arvif->nontransmitting_vif_count;
+-		}
+-		ret = ath12k_wmi_vdev_up(arvif->ar, &params);
+ 		if (ret) {
+-			ath12k_warn(ab, "failed to bring vdev up %d: %d\n",
++			ath12k_warn(ab, "failed to bring up vdev %d: %d\n",
+ 				    arvif->vdev_id, ret);
+ 			continue;
+ 		}
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.h b/drivers/net/wireless/ath/ath12k/wmi.h
+index 97820da..8379352 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -3001,7 +3001,7 @@ struct ath12k_wmi_ssid_params {
+ 	u8 ssid[ATH12K_WMI_SSID_LEN];
+ } __packed;
+ 
+-#define ATH12K_VDEV_SETUP_TIMEOUT_HZ (5 * HZ)
++#define ATH12K_VDEV_SETUP_TIMEOUT_HZ (10 * HZ)
+ 
+ struct wmi_vdev_start_request_cmd {
+ 	__le32 tlv_header;
+-- 
+2.17.1
+
