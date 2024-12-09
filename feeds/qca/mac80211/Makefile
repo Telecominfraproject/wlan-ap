@@ -393,32 +393,13 @@ define Build/InstallDev
 	rm -f $(1)/usr/include/mac80211-backport/linux/module.h
 endef
 
-EXTERNAL_FILE_DIR:=$(CURDIR)/files
-#EXTERNAL_FILE_DIR:=$(CURDIR)/files-qca
-
 define KernelPackage/cfg80211/install
-	$(INSTALL_DIR) $(1)/lib/wifi $(1)/etc/hotplug.d/ieee80211
-	$(INSTALL_DIR) $(1)/lib/wifi $(1)/etc/hotplug.d/devcoredump
-	$(INSTALL_DIR) $(1)/lib/wifi $(1)/lib/netifd/wireless
-	$(INSTALL_DIR) $(1)/lib/wifi/sawf
-	$(INSTALL_DIR) $(1)/lib/wifi/sawf/telemetry
-	$(INSTALL_DATA) ./files/lib/wifi/mac80211.sh $(1)/lib/wifi
-	$(INSTALL_BIN) ./files/lib/netifd/wireless/mac80211.sh $(1)/lib/netifd/wireless
-#	$(INSTALL_BIN) $(EXTERNAL_FILE_DIR)/files/lib/wifi-config.sh $(1)/etc/hotplug.d/ieee80211/01-wifi-detect
-	$(INSTALL_DIR) $(1)/etc/hotplug.d/ieee80211
-	$(INSTALL_DATA) ./files/mac80211.hotplug $(1)/etc/hotplug.d/ieee80211/10-wifi-detect
+	$(CP) ./files/* $(1)/
 endef
 
 define KernelPackage/ath-qca/install
 	$(INSTALL_DIR) $(STAGING_DIR)/usr/include/
 	$(CP) $(PKG_BUILD_DIR)/include/ath/ath_sawf.h $(STAGING_DIR)/usr/include/
-endef
-
-define KernelPackage/ath11k-qca/install
-	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) $(EXTERNAL_FILE_DIR)/files/etc/init.d/ath11k_nss_enable.sh $(1)/etc/init.d
-	$(INSTALL_BIN) $(EXTERNAL_FILE_DIR)/files/etc/init.d/ath11k_uboot_mod_params.sh $(1)/etc/init.d
-	$(INSTALL_BIN) $(EXTERNAL_FILE_DIR)/files/etc/init.d/qca-nss-pbuf $(1)/etc/init.d
 endef
 
 define KernelPackage/ath12k-qca/install

@@ -1,6 +1,6 @@
 import * as nl80211 from "nl80211";
 import * as rtnl from "rtnl";
-import { readfile, glob, basename, readlink } from "fs";
+import { readfile, glob, basename, readlink, open } from "fs";
 
 const iftypes = {
 	ap: nl80211.const.NL80211_IFTYPE_AP,
@@ -8,6 +8,36 @@ const iftypes = {
 	sta: nl80211.const.NL80211_IFTYPE_STATION,
 	adhoc: nl80211.const.NL80211_IFTYPE_ADHOC,
 	monitor: nl80211.const.NL80211_IFTYPE_MONITOR,
+};
+
+const mesh_params = {
+	mesh_retry_timeout: "retry_timeout",
+	mesh_confirm_timeout: "confirm_timeout",
+	mesh_holding_timeout: "holding_timeout",
+	mesh_max_peer_links: "max_peer_links",
+	mesh_max_retries: "max_retries",
+	mesh_ttl: "ttl",
+	mesh_element_ttl: "element_ttl",
+	mesh_auto_open_plinks: "auto_open_plinks",
+	mesh_hwmp_max_preq_retries: "hwmp_max_preq_retries",
+	mesh_path_refresh_time: "path_refresh_time",
+	mesh_min_discovery_timeout: "min_discovery_timeout",
+	mesh_hwmp_active_path_timeout: "hwmp_active_path_timeout",
+	mesh_hwmp_preq_min_interval: "hwmp_preq_min_interval",
+	mesh_hwmp_net_diameter_traversal_time: "hwmp_net_diam_trvs_time",
+	mesh_hwmp_rootmode: "hwmp_rootmode",
+	mesh_hwmp_rann_interval: "hwmp_rann_interval",
+	mesh_gate_announcements: "gate_announcements",
+	mesh_sync_offset_max_neighor: "sync_offset_max_neighbor",
+	mesh_rssi_threshold: "rssi_threshold",
+	mesh_hwmp_active_path_to_root_timeout: "hwmp_path_to_root_timeout",
+	mesh_hwmp_root_interval: "hwmp_root_interval",
+	mesh_hwmp_confirmation_interval: "hwmp_confirmation_interval",
+	mesh_awake_window: "awake_window",
+	mesh_plink_timeout: "plink_timeout",
+	mesh_fwding: "forwarding",
+	mesh_power_mode: "power_mode",
+	mesh_nolearn: "nolearn"
 };
 
 function wdev_remove(name)
@@ -19,7 +49,7 @@ function __phy_is_fullmac(phyidx)
 {
 	let data = nl80211.request(nl80211.const.NL80211_CMD_GET_WIPHY, 0, { wiphy: phyidx });
 
-	return 0; //!data.software_iftypes.ap_vlan;
+	return !data.software_iftypes.monitor;
 }
 
 function phy_is_fullmac(phy)
@@ -44,6 +74,14 @@ function find_reusable_wdev(phyidx)
 	return null;
 }
 
+function wdev_set_radio_mask(name, mask)
+{
+	nl80211.request(nl80211.const.NL80211_CMD_SET_INTERFACE, 0, {
+		dev: name,
+		vif_radio_mask: mask
+	});
+}
+
 function wdev_create(phy, name, data)
 {
 	let phyidx = int(readfile(`/sys/class/ieee80211/${phy}/index`));
@@ -63,24 +101,24 @@ function wdev_create(phy, name, data)
 		req["4addr"] = data["4addr"];
 	if (data.macaddr)
 		req.mac = data.macaddr;
+	if (data.radio != null && data.radio >= 0)
+		req.vif_radio_mask = 1 << data.radio;
 
 	nl80211.error();
 
 	let reuse_ifname = find_reusable_wdev(phyidx);
 	if (reuse_ifname &&
 	    (reuse_ifname == name ||
-	     rtnl.request(rtnl.const.RTM_SETLINK, 0, { dev: reuse_ifname, ifname: name}) != false))
-		nl80211.request(
-			nl80211.const.NL80211_CMD_SET_INTERFACE, 0, {
-				wiphy: phyidx,
-				dev: name,
-				iftype: iftypes[data.mode],
-			});
-	else
+	     rtnl.request(rtnl.const.RTM_SETLINK, 0, { dev: reuse_ifname, ifname: name}) != false)) {
+		req.dev = req.ifname;
+		delete req.ifname;
+		nl80211.request(nl80211.const.NL80211_CMD_SET_INTERFACE, 0, req);
+	} else {
 		nl80211.request(
 			nl80211.const.NL80211_CMD_NEW_INTERFACE,
 			nl80211.const.NLM_F_CREATE,
 			req);
+	}
 
 	let error = nl80211.error();
 	if (error)
@@ -92,6 +130,31 @@ function wdev_create(phy, name, data)
 	}
 
 	return null;
+}
+
+function wdev_set_mesh_params(name, data)
+{
+	let mesh_cfg = {};
+
+	for (let key in mesh_params) {
+		let val = data[key];
+		if (val == null)
+			continue;
+		mesh_cfg[mesh_params[key]] = int(val);
+	}
+
+	if (!length(mesh_cfg))
+		return null;
+
+	nl80211.request(nl80211.const.NL80211_CMD_SET_MESH_CONFIG, 0,
+		{ dev: name, mesh_params: mesh_cfg });
+
+	return nl80211.error();
+}
+
+function wdev_set_up(name, up)
+{
+	rtnl.request(rtnl.const.RTM_SETLINK, 0, { dev: name, change: 1, flags: up ? 1 : 0 });
 }
 
 function phy_sysfs_file(phy, name)
@@ -135,7 +198,8 @@ const phy_proto = {
 	},
 
 	macaddr_generate: function(data) {
-		let phy = this.name;
+		let phy = this.phy;
+		let radio_idx = this.radio;
 		let idx = int(data.id ?? 0);
 		let mbssid = int(data.mbssid ?? 0) > 0;
 		let num_global = int(data.num_global ?? 1);
@@ -145,21 +209,29 @@ const phy_proto = {
 		if (!base_addr)
 			return null;
 
-		if (!idx && !mbssid)
-			return base_addr;
-
 		let base_mask = phy_sysfs_file(phy, "address_mask");
 		if (!base_mask)
 			return null;
 
-		if (base_mask == "00:00:00:00:00:00" && idx >= num_global) {
+		if (base_mask == "00:00:00:00:00:00" &&
+		    (radio_idx > 0 || idx >= num_global)) {
 			let addrs = split(phy_sysfs_file(phy, "addresses"), "\n");
 
-			if (idx < length(addrs))
-				return addrs[idx];
+			if (radio_idx != null) {
+				if (radio_idx && radio_idx < length(addrs))
+					base_addr = addrs[radio_idx];
+				else
+					idx += radio_idx * 16;
+			} else {
+				if (idx < length(addrs))
+					return addrs[idx];
 
-			base_mask = "ff:ff:ff:ff:ff:ff";
+				base_mask = "ff:ff:ff:ff:ff:ff";
+			}
 		}
+
+		if (!idx && !mbssid)
+			return base_addr;
 
 		let addr = macaddr_split(base_addr);
 		let mask = macaddr_split(base_mask);
@@ -220,27 +292,55 @@ const phy_proto = {
 		}
 	},
 
+	wdev_add: function(name, data) {
+		let phydev = this;
+		wdev_create(this.phy, name, {
+			...data,
+			radio: this.radio,
+		});
+	},
+
 	for_each_wdev: function(cb) {
-		let wdevs = glob(`/sys/class/ieee80211/${this.name}/device/net/*`);
-		wdevs = map(wdevs, (arg) => basename(arg));
+		let wdevs = nl80211.request(
+			nl80211.const.NL80211_CMD_GET_INTERFACE,
+			nl80211.const.NLM_F_DUMP,
+			{ wiphy: this.idx }
+		);
+
+		let mac_wdev = {};
 		for (let wdev in wdevs) {
-			if (basename(readlink(`/sys/class/net/${wdev}/phy80211`)) != this.name)
+			if (wdev.iftype == nl80211.const.NL80211_IFTYPE_AP_VLAN)
+				continue;
+			if (this.radio != null && wdev.vif_radio_mask != null &&
+			    !(wdev.vif_radio_mask & (1 << this.radio)))
+				continue;
+			mac_wdev[wdev.mac] = wdev;
+		}
+
+		for (let wdev in wdevs) {
+			if (!mac_wdev[wdev.mac])
 				continue;
 
-			cb(wdev);
+			cb(wdev.ifname);
 		}
 	}
 };
 
-function phy_open(phy)
+function phy_open(phy, radio)
 {
 	let phyidx = readfile(`/sys/class/ieee80211/${phy}/index`);
 	if (!phyidx)
 		return null;
 
+	let name = phy;
+	if (radio === "" || radio < 0)
+		radio = null;
+	if (radio != null)
+		name += "." + radio;
+
 	return proto({
-		name: phy,
-		idx: int(phyidx)
+		phy, name, radio,
+		idx: int(phyidx),
 	}, phy_proto);
 }
 
@@ -310,9 +410,9 @@ function is_equal(val1, val2) {
 
 function vlist_new(cb) {
 	return proto({
-			cb: cb,
-			data: {}
-		}, vlist_proto);
+		cb: cb,
+		data: {}
+	}, vlist_proto);
 }
 
-export { wdev_remove, wdev_create, is_equal, vlist_new, phy_is_fullmac, phy_open };
+export { wdev_remove, wdev_create, wdev_set_mesh_params, wdev_set_radio_mask, wdev_set_up, is_equal, vlist_new, phy_is_fullmac, phy_open };

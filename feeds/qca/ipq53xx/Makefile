@@ -22,7 +22,8 @@ DEFAULT_PACKAGES += \
 	kmod-qca-ssdk-qca-nohnat kmod-qca-nss-dp-qca \
 	kmod-qca-nss-ppe-bridge-mgr kmod-qca-nss-ppe-vlan-mgr \
 	iwinfo kmod-ath12k-qca ath12k-firmware-qcn92xx \
-	kmod-leds-gpio swconfig kmod-fs-ext4 losetup
+	kmod-leds-gpio swconfig kmod-fs-ext4 losetup wpad-openssl \
+	ucode-mod-nl80211 ucode-mod-rtnl
 
 GENERIC_LINUX_CONFIG = $(PLATFORM_DIR)/generic/config-$(KERNEL_PATCHVER)-platform
 
