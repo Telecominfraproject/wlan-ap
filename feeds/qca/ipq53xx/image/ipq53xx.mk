@@ -28,6 +28,7 @@ endef
 define Device/edgecore_eap105
   DEVICE_TITLE := Edgecore EAP105
   DEVICE_DTS := ipq5332-edgecore-eap105
+  DEVICE_DTS_DIR := ../dts
   DEVICE_DTS_CONFIG := config@mi01.6
   IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
   IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
@@ -35,4 +36,4 @@ define Device/edgecore_eap105
   IMAGE/nand-factory.ubi := append-ubi
   DEVICE_PACKAGES := ath12k-wifi-edgecore-eap105 ath12k-firmware-qcn92xx-split-phy ath12k-firmware-ipq53xx
 endef
-#TARGET_DEVICES += edgecore_eap105
+TARGET_DEVICES += edgecore_eap105
