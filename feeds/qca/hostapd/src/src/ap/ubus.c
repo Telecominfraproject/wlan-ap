@@ -72,25 +72,6 @@ static bool hostapd_ubus_init(void)
 	return true;
 }
 
-static void hostapd_ubus_ref_inc(void)
-{
-	ctx_ref++;
-}
-
-static void hostapd_ubus_ref_dec(void)
-{
-	ctx_ref--;
-	if (!ctx)
-		return;
-
-	if (ctx_ref)
-		return;
-
-	uloop_fd_delete(&ctx->sock);
-	ubus_free(ctx);
-	ctx = NULL;
-}
-
 void hostapd_ubus_add_iface(struct hostapd_iface *iface)
 {
 	if (!hostapd_ubus_init())
@@ -1759,7 +1740,6 @@ void hostapd_ubus_add_bss(struct hostapd_data *hapd)
 		obj->n_methods = bss_object_type.n_methods;
 	}
 	ret = ubus_add_object(ctx, obj);
-	hostapd_ubus_ref_inc();
 }
 
 void hostapd_ubus_free_bss(struct hostapd_data *hapd)
@@ -1775,10 +1755,8 @@ void hostapd_ubus_free_bss(struct hostapd_data *hapd)
 	if (!ctx)
 		return;
 
-	if (obj->id) {
+	if (obj->id)
 		ubus_remove_object(ctx, obj);
-		hostapd_ubus_ref_dec();
-	}
 
 	free(name);
 }

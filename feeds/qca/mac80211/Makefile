@@ -106,7 +106,7 @@ define KernelPackage/mac80211
   TITLE:=Linux 802.11 Wireless Networking Stack
   # +kmod-crypto-cmac is a runtime only dependency of net/mac80211/aes_cmac.c
   DEPENDS+= @TARGET_ipq95xx||TARGET_ipq53xx||TARGET_ipq50xx||TARGET_ipq60xx||TARGET_ipq807x||TARGET_ipq806x||TARGET_ipq||TARGET_ar71xx \
-	+kmod-cfg80211 +hostapd-common \
+	+kmod-cfg80211 \
 	+kmod-qca-nss-ppe \
 	+kmod-qca-nss-ppe-vp \
 	+kmod-qca-nss-ppe-ds \
