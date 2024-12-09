@@ -1,6 +1,6 @@
 let libubus = require("ubus");
 import { open, readfile } from "fs";
-import { wdev_create, wdev_remove, is_equal, vlist_new, phy_is_fullmac, phy_open } from "common";
+import { wdev_remove, is_equal, vlist_new, phy_is_fullmac, phy_open, wdev_set_radio_mask } from "common";
 
 let ubus = libubus.connect(null, 60);
 
@@ -22,6 +22,32 @@ hostapd.data.file_fields = {
 	eap_sim_db: true,
 };
 
+hostapd.data.iface_fields = {
+	ft_iface: true,
+	upnp_iface: true,
+	snoop_iface: true,
+	bridge: true,
+	iapp_interface: true,
+};
+
+hostapd.data.bss_info_fields = {
+	// radio
+	hw_mode: true,
+	channel: true,
+	ieee80211ac: true,
+	ieee80211ax: true,
+
+	// bss
+	bssid: true,
+	ssid: true,
+	wpa: true,
+	wpa_key_mgmt: true,
+	wpa_pairwise: true,
+	auth_algs: true,
+	ieee80211w: true,
+	owe_transition_ifname: true,
+};
+
 function iface_remove(cfg)
 {
 	if (!cfg || !cfg.bss || !cfg.bss[0] || !cfg.bss[0].ifname)
@@ -31,7 +57,7 @@ function iface_remove(cfg)
 		wdev_remove(bss.ifname);
 }
 
-function iface_gen_config(phy, config, start_disabled)
+function iface_gen_config(config, start_disabled)
 {
 	let str = `data:
 ${join("\n", config.radio.data)}
@@ -92,7 +118,7 @@ function iface_freq_info(iface, config, params)
 
 function iface_add(phy, config, phy_status)
 {
-	let config_inline = iface_gen_config(phy, config, !!phy_status);
+	let config_inline = iface_gen_config(config, !!phy_status);
 
 	let bss = config.bss[0];
 	let ret = hostapd.add_iface(`bss_config=${phy}:${config_inline}`);
@@ -123,12 +149,16 @@ function iface_config_macaddr_list(config)
 	return macaddr_list;
 }
 
-function iface_update_supplicant_macaddr(phy, config)
+function iface_update_supplicant_macaddr(phydev, config)
 {
 	let macaddr_list = [];
 	for (let i = 0; i < length(config.bss); i++)
 		push(macaddr_list, config.bss[i].bssid);
-	ubus.defer("wpa_supplicant", "phy_set_macaddr_list", { phy: phy, macaddr: macaddr_list });
+	ubus.defer("wpa_supplicant", "phy_set_macaddr_list", {
+		phy: phydev.name,
+		radio: phydev.radio ?? -1,
+		macaddr: macaddr_list
+	});
 }
 
 function __iface_pending_next(pending, state, ret, data)
@@ -143,19 +173,22 @@ function __iface_pending_next(pending, state, ret, data)
 	delete pending.defer;
 	switch (state) {
 	case "init":
-		let macaddr_list = [];
-		for (let i = 0; i < length(config.bss); i++)
-			push(macaddr_list, config.bss[i].bssid);
-		pending.call("wpa_supplicant", "phy_set_macaddr_list", { phy: phy, macaddr: macaddr_list });
+		iface_update_supplicant_macaddr(phydev, config);
 		return "create_bss";
 	case "create_bss":
-		let err = wdev_create(phy, bss.ifname, { mode: "ap" });
+		let err = phydev.wdev_add(bss.ifname, {
+			mode: "ap",
+			radio: phydev.radio,
+		});
 		if (err) {
 			hostapd.printf(`Failed to create ${bss.ifname} on phy ${phy}: ${err}`);
 			return null;
 		}
 
-		pending.call("wpa_supplicant", "phy_status", { phy: phy });
+		pending.call("wpa_supplicant", "phy_status", {
+			phy: phydev.phy,
+			radio: phydev.radio,
+		});
 		return "check_phy";
 	case "check_phy":
 		let phy_status = data;
@@ -165,12 +198,20 @@ function __iface_pending_next(pending, state, ret, data)
 
 			hostapd.printf(`Failed to bring up phy ${phy} ifname=${bss.ifname} with supplicant provided frequency`);
 		}
-		pending.call("wpa_supplicant", "phy_set_state", { phy: phy, stop: true });
+		pending.call("wpa_supplicant", "phy_set_state", {
+			phy: phydev.phy,
+			radio: phydev.radio,
+			stop: true
+		});
 		return "wpas_stopped";
 	case "wpas_stopped":
 		if (!iface_add(phy, config))
 			hostapd.printf(`hostapd.add_iface failed for phy ${phy} ifname=${bss.ifname}`);
-		pending.call("wpa_supplicant", "phy_set_state", { phy: phy, stop: false });
+		pending.call("wpa_supplicant", "phy_set_state", {
+			phy: phydev.phy,
+			radio: phydev.radio,
+			stop: false
+		});
 		return null;
 	case "done":
 	default:
@@ -185,9 +226,14 @@ function iface_pending_next(ret, data)
 	let cfg = this;
 
 	while (pending) {
-		this.next_state = __iface_pending_next(cfg, this.next_state, ret, data);
-		if (!this.next_state) {
-			__iface_pending_next(cfg, "done");
+		try {
+			this.next_state = __iface_pending_next(cfg, this.next_state, ret, data);
+			if (!this.next_state) {
+				__iface_pending_next(cfg, "done");
+				return;
+			}
+		} catch(e) {
+			hostapd.printf(`Exception: ${e}\n${e.stacktrace[0].context}`);
 			return;
 		}
 		pending = !this.defer;
@@ -229,6 +275,16 @@ function iface_pending_init(phydev, config)
 	pending.next();
 }
 
+function iface_macaddr_init(phydev, config, macaddr_list)
+{
+	let macaddr_data = {
+		num_global: config.num_global_macaddr ?? 1,
+		mbssid: config.mbssid ?? 0,
+	};
+
+	return phydev.macaddr_init(macaddr_list, macaddr_data);
+}
+
 function iface_restart(phydev, config, old_config)
 {
 	let phy = phydev.name;
@@ -246,7 +302,7 @@ function iface_restart(phydev, config, old_config)
 		return;
 	}
 
-	phydev.macaddr_init(iface_config_macaddr_list(config));
+	iface_macaddr_init(phydev, config, iface_config_macaddr_list(config));
 	for (let i = 0; i < length(config.bss); i++) {
 		let bss = config.bss[i];
 		if (bss.default_macaddr)
@@ -314,9 +370,24 @@ function bss_remove_file_fields(config)
 	return new_cfg;
 }
 
+function bss_ifindex_list(config)
+{
+	config = filter(config, (line) => !!hostapd.data.iface_fields[split(line, "=")[0]]);
+
+	return join(",", map(config, (line) => {
+		try {
+			let file = "/sys/class/net/" + split(line, "=")[1] + "/ifindex";
+			let val = trim(readfile(file));
+			return val;
+		} catch (e) {
+			return "";
+		}
+	}));
+}
+
 function bss_config_hash(config)
 {
-	return hostapd.sha1(remove_file_fields(config) + "");
+	return hostapd.sha1(remove_file_fields(config) + bss_ifindex_list(config));
 }
 
 function bss_find_existing(config, prev_config, prev_hash)
@@ -348,7 +419,7 @@ function get_config_bss(config, idx)
 	return hostapd.bss[ifname];
 }
 
-function iface_reload_config(phydev, config, old_config)
+function iface_reload_config(name, phydev, config, old_config)
 {
 	let phy = phydev.name;
 
@@ -358,13 +429,13 @@ function iface_reload_config(phydev, config, old_config)
 	if (is_equal(old_config.bss, config.bss))
 		return true;
 
-	if (hostapd.data.pending_config[phy])
+	if (hostapd.data.pending_config[name])
 		return false;
 
 	if (!old_config.bss || !old_config.bss[0])
 		return false;
 
-	let iface = hostapd.interfaces[phy];
+	let iface = hostapd.interfaces[name];
 	let iface_name = old_config.bss[0].ifname;
 	if (!iface) {
 		hostapd.printf(`Could not find previous interface ${iface_name}`);
@@ -459,7 +530,7 @@ function iface_reload_config(phydev, config, old_config)
 			return false;
 
 		let ifname = old_config.bss[i].ifname;
-		hostapd.printf(`Remove bss '${ifname}' on phy '${phy}'`);
+		hostapd.printf(`Remove bss '${ifname}' on phy '${name}'`);
 		prev_bss.delete();
 		wdev_remove(ifname);
 	}
@@ -500,11 +571,7 @@ function iface_reload_config(phydev, config, old_config)
 	}
 
 	// Step 6: assign BSSID for newly created interfaces
-	let macaddr_data = {
-		num_global: config.num_global_macaddr ?? 1,
-		mbssid: config.mbssid ?? 0,
-	};
-	macaddr_list = phydev.macaddr_init(macaddr_list, macaddr_data);
+	macaddr_list = iface_macaddr_init(phydev, config, macaddr_list);
 	for (let i = 0; i < length(config.bss); i++) {
 		if (bss_list[i])
 			continue;
@@ -528,13 +595,13 @@ function iface_reload_config(phydev, config, old_config)
 
 		let addr = phydev.macaddr_next(i);
 		if (!addr) {
-			hostapd.printf(`Failed to generate mac address for phy ${phy}`);
+			hostapd.printf(`Failed to generate mac address for phy ${name}`);
 			return false;
 		}
 		bsscfg.bssid = addr;
 	}
 
-	let config_inline = iface_gen_config(phy, config);
+	let config_inline = iface_gen_config(config);
 
 	// Step 7: fill in the gaps with new interfaces
 	for (let i = 0; i < length(config.bss); i++) {
@@ -544,17 +611,17 @@ function iface_reload_config(phydev, config, old_config)
 		if (bss)
 			continue;
 
-		hostapd.printf(`Add bss ${ifname} on phy ${phy}`);
+		hostapd.printf(`Add bss ${ifname} on phy ${name}`);
 		bss_list[i] = iface.add_bss(config_inline, i);
 		if (!bss_list[i]) {
-			hostapd.printf(`Failed to add new bss ${ifname} on phy ${phy}`);
+			hostapd.printf(`Failed to add new bss ${ifname} on phy ${name}`);
 			return false;
 		}
 	}
 
 	// Step 8: update interface bss order
 	if (!iface.set_bss_order(bss_list)) {
-		hostapd.printf(`Failed to update BSS order on phy '${phy}'`);
+		hostapd.printf(`Failed to update BSS order on phy '${name}'`);
 		return false;
 	}
 
@@ -585,7 +652,7 @@ function iface_reload_config(phydev, config, old_config)
 		if (is_equal(config.bss[i], bss_list_cfg[i]))
 			continue;
 
-		hostapd.printf(`Reload config for bss '${config.bss[0].ifname}' on phy '${phy}'`);
+		hostapd.printf(`Reload config for bss '${config.bss[0].ifname}' on phy '${name}'`);
 		if (bss.set_config(config_inline, i) < 0) {
 			hostapd.printf(`Failed to set config for bss ${ifname}`);
 			return false;
@@ -595,35 +662,36 @@ function iface_reload_config(phydev, config, old_config)
 	return true;
 }
 
-function iface_set_config(phy, config)
+function iface_set_config(name, config)
 {
-	let old_config = hostapd.data.config[phy];
+	let old_config = hostapd.data.config[name];
 
-	hostapd.data.config[phy] = config;
+	hostapd.data.config[name] = config;
 
 	if (!config) {
-		hostapd.remove_iface(phy);
+		hostapd.remove_iface(name);
 		return iface_remove(old_config);
 	}
 
-	let phydev = phy_open(phy);
+	let phy = config.phy;
+	let phydev = phy_open(phy, config.radio_idx);
 	if (!phydev) {
 		hostapd.printf(`Failed to open phy ${phy}`);
 		return false;
 	}
 
 	try {
-		let ret = iface_reload_config(phydev, config, old_config);
+		let ret = iface_reload_config(name, phydev, config, old_config);
 		if (ret) {
-			iface_update_supplicant_macaddr(phy, config);
-			hostapd.printf(`Reloaded settings for phy ${phy}`);
+			iface_update_supplicant_macaddr(phydev, config);
+			hostapd.printf(`Reloaded settings for phy ${name}`);
 			return 0;
 		}
 	} catch (e) {
-			hostapd.printf(`Error reloading config: ${e}\n${e.stacktrace[0].context}`);
+		hostapd.printf(`Error reloading config: ${e}\n${e.stacktrace[0].context}`);
 	}
 
-	hostapd.printf(`Restart interface for phy ${phy}`);
+	hostapd.printf(`Restart interface for phy ${name}`);
 	let ret = iface_restart(phydev, config, old_config);
 
 	return ret;
@@ -642,13 +710,18 @@ function config_add_bss(config, name)
 	return bss;
 }
 
-function iface_load_config(filename)
+function iface_load_config(phy, radio, filename)
 {
 	let f = open(filename, "r");
 	if (!f)
 		return null;
 
+	if (radio < 0)
+		radio = null;
+
 	let config = {
+		phy,
+		radio_idx: radio,
 		radio: {
 			data: []
 		},
@@ -675,7 +748,7 @@ function iface_load_config(filename)
 
 		if (val[0] == "#num_global_macaddr" ||
 		    val[0] == "mbssid")
-			config[val[0]] = int(val[1]);
+			config[substr(val[0], 1)] = int(val[1]);
 
 		push(config.radio.data, line);
 	}
@@ -723,16 +796,39 @@ function ex_wrap(func) {
 	};
 }
 
+function phy_name(phy, radio)
+{
+	if (!phy)
+		return null;
+
+	if (radio != null && radio >= 0)
+		phy += "." + radio;
+
+	return phy;
+}
+
+function bss_config(bss_name) {
+	for (let phy, config in hostapd.data.config) {
+		if (!config)
+			continue;
+
+		for (let bss in config.bss)
+			if (bss.ifname == bss_name)
+				return [ config, bss ];
+	}
+}
+
 let main_obj = {
 	reload: {
 		args: {
 			phy: "",
+			radio: 0,
 		},
 		call: ex_wrap(function(req) {
-			let phy_list = req.args.phy ? [ req.args.phy ] : keys(hostapd.data.config);
+			let phy_list = req.args.phy ? [ phy_name(req.args.phy, req.args.radio) ] : keys(hostapd.data.config);
 			for (let phy_name in phy_list) {
 				let phy = hostapd.data.config[phy_name];
-				let config = iface_load_config(phy.orig_file);
+				let config = iface_load_config(phy.phy, radio, phy.orig_file);
 				iface_set_config(phy_name, config);
 			}
 
@@ -742,6 +838,7 @@ let main_obj = {
 	apsta_state: {
 		args: {
 			phy: "",
+			radio: 0,
 			up: true,
 			frequency: 0,
 			sec_chan_offset: 0,
@@ -749,10 +846,10 @@ let main_obj = {
 			csa_count: 0,
 		},
 		call: ex_wrap(function(req) {
-			if (req.args.up == null || !req.args.phy)
+			let phy = phy_name(req.args.phy, req.args.radio);
+			if (req.args.up == null || !phy)
 				return libubus.STATUS_INVALID_ARGUMENT;
 
-			let phy = req.args.phy;
 			let config = hostapd.data.config[phy];
 			if (!config || !config.bss || !config.bss[0] || !config.bss[0].ifname)
 				return 0;
@@ -788,10 +885,11 @@ let main_obj = {
 	},
 	config_get_macaddr_list: {
 		args: {
-			phy: ""
+			phy: "",
+			radio: 0,
 		},
 		call: ex_wrap(function(req) {
-			let phy = req.args.phy;
+			let phy = phy_name(req.args.phy, req.args.radio);
 			if (!phy)
 				return libubus.STATUS_INVALID_ARGUMENT;
 
@@ -810,30 +908,34 @@ let main_obj = {
 	config_set: {
 		args: {
 			phy: "",
+			radio: 0,
 			config: "",
 			prev_config: "",
 		},
 		call: ex_wrap(function(req) {
 			let phy = req.args.phy;
+			let radio = req.args.radio;
+			let name = phy_name(phy, radio);
 			let file = req.args.config;
 			let prev_file = req.args.prev_config;
 
 			if (!phy)
 				return libubus.STATUS_INVALID_ARGUMENT;
 
-			if (prev_file && !hostapd.data.config[phy]) {
-				let config = iface_load_config(prev_file);
+			if (prev_file && !hostapd.data.config[name]) {
+				let config = iface_load_config(phy, radio, prev_file);
 				if (config)
 					config.radio.data = [];
-				hostapd.data.config[phy] = config;
+				hostapd.data.config[name] = config;
 			}
 
-			let config = iface_load_config(file);
+			let config = iface_load_config(phy, radio, file);
 
-			hostapd.printf(`Set new config for phy ${phy}: ${file}`);
-			iface_set_config(phy, config);
+			hostapd.printf(`Set new config for phy ${name}: ${file}`);
+			iface_set_config(name, config);
 
-			hostapd.data.auth_obj.notify("reload", { phy });
+			if (hostapd.data.auth_obj)
+				hostapd.data.auth_obj.notify("reload", { phy, radio });
 
 			return {
 				pid: hostapd.getpid()
@@ -869,10 +971,37 @@ let main_obj = {
 			return 0;
 		})
 	},
+	bss_info: {
+		args: {
+			iface: ""
+		},
+		call: ex_wrap(function(req) {
+			if (!req.args.iface)
+				return libubus.STATUS_INVALID_ARGUMENT;
+
+			let config = bss_config(req.args.iface);
+			if (!config)
+				return libubus.STATUS_NOT_FOUND;
+
+			let bss = config[1];
+			config = config[0];
+			let ret = {};
+
+			for (let line in [ ...config.radio.data, ...bss.data ]) {
+				let fields = split(line, "=", 2);
+				let name = fields[0];
+				if (hostapd.data.bss_info_fields[name])
+					ret[name] = fields[1];
+			}
+
+			return ret;
+		})
+	},
 };
 
 hostapd.data.ubus = ubus;
 hostapd.data.obj = ubus.publish("hostapd", main_obj);
+
 
 let auth_obj = {};
 hostapd.data.auth_obj = ubus.publish("hostapd-auth", auth_obj);
@@ -889,7 +1018,7 @@ function bss_event(type, name, data) {
 return {
 	shutdown: function() {
 		for (let phy in hostapd.data.config)
-			iface_set_config(phy, null);
+			iface_set_config(phy);
 		hostapd.ubus.disconnect();
 	},
 	afc_request: function(iface, data) {
@@ -898,13 +1027,22 @@ return {
 			return;
 		return ret.data;
 	},
-	bss_add: function(name, obj) {
+	bss_create: function(phy, name, obj) {
+		phy = hostapd.data.config[phy];
+		if (!phy)
+			return;
+
+		if (phy.radio_idx != null && phy.radio_idx >= 0)
+			wdev_set_radio_mask(name, 1 << phy.radio_idx);
+	},
+	bss_add: function(phy, name, obj) {
 		bss_event("add", name);
 	},
-	bss_reload: function(name, obj, reconf) {
-		bss_event("reload", name, { reconf: reconf != 0 });
+	bss_reload: function(phy, name, obj, reconf) {
+		//bss_event("reload", name, { reconf: reconf != 0 });
+		bss_event("reload", name, { reconf: false });
 	},
-	bss_remove: function(name, obj) {
+	bss_remove: function(phy, name, obj) {
 		bss_event("remove", name);
 	},
 	sta_auth: function(iface, sta) {
@@ -913,7 +1051,8 @@ return {
 		let data_cb = (type, data) => {
 			ret = { ...ret, ...data };
 		};
-		hostapd.data.auth_obj.notify("sta_auth", msg, data_cb, null, null, 1000);
+		if (hostapd.data.auth_obj)
+			hostapd.data.auth_obj.notify("sta_auth", msg, data_cb, null, null, 1000);
 		return ret;
 	},
 	sta_connected: function(iface, sta, data) {
@@ -922,7 +1061,8 @@ return {
 		let data_cb = (type, data) => {
 			ret = { ...ret, ...data };
 		};
-		hostapd.data.auth_obj.notify("sta_connected", msg, data_cb, null, null, 1000);
+		if (hostapd.data.auth_obj)
+			hostapd.data.auth_obj.notify("sta_connected", msg, data_cb, null, null, 1000);
 		return ret;
 	},
 };

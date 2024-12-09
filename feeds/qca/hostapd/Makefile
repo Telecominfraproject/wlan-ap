@@ -270,7 +270,7 @@ define Package/wpad/Default
   CATEGORY:=Network
   SUBMENU:=WirelessAPD
   TITLE:=IEEE 802.1x Auth/Supplicant (QCA)
-  DEPENDS:=$(DRV_DEPENDS) +hostapd-common +libubus
+  DEPENDS:=$(DRV_DEPENDS) +hostapd-common +libubus $(CORE_DEPENDS)
   EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-$(PKG_RELEASE))
   USERID:=network=101:network=101
   URL:=http://hostap.epitest.fi/
@@ -720,23 +720,24 @@ define Install/supplicant
 	$(INSTALL_DIR) $(1)/usr/sbin
 endef
 
-EXTERNAL_FILE_DIR:=$(CURDIR)/files
-#EXTERNAL_FILE_DIR:=$(CURDIR)/files-qca
 define Package/hostapd-common/install
 	$(INSTALL_DIR) $(1)/etc/capabilities $(1)/etc/rc.button $(1)/etc/hotplug.d/ieee80211 $(1)/etc/init.d $(1)/lib/netifd  $(1)/usr/share/acl.d
-	$(INSTALL_DATA) $(EXTERNAL_FILE_DIR)/hostapd.sh $(1)/lib/netifd/hostapd.sh
-	$(INSTALL_BIN) $(EXTERNAL_FILE_DIR)/wpad.init $(1)/etc/init.d/wpad
-	$(INSTALL_BIN) $(EXTERNAL_FILE_DIR)/wps-hotplug.sh $(1)/etc/rc.button/wps
-	$(INSTALL_DATA) $(EXTERNAL_FILE_DIR)/wpad_acl.json $(1)/usr/share/acl.d
-	$(INSTALL_DATA) $(EXTERNAL_FILE_DIR)/wpad.json $(1)/etc/capabilities
+	$(INSTALL_DATA) ./files/hostapd.sh $(1)/lib/netifd/hostapd.sh
+	$(INSTALL_BIN) ./files/wpad.init $(1)/etc/init.d/wpad
+	$(INSTALL_BIN) ./files/wps-hotplug.sh $(1)/etc/rc.button/wps
+	$(INSTALL_DATA) ./files/wpad_acl.json $(1)/usr/share/acl.d
+	$(INSTALL_DATA) ./files/wpad.json $(1)/etc/capabilities
 	$(INSTALL_DIR) $(1)/usr/share/hostap/
-	$(INSTALL_DATA) $(EXTERNAL_FILE_DIR)/*.uc $(1)/usr/share/hostap/
+	$(INSTALL_DATA) ./files/*.uc $(1)/usr/share/hostap/
+	$(INSTALL_BIN) ./files/mpskd $(1)/usr/share/hostap/
+	$(INSTALL_BIN) ./files/mpskd.init $(1)/etc/init.d/mpskd
 endef
 
 define Package/hostapd/install
 	$(call Install/hostapd,$(1))
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/hostapd/hostapd $(1)/usr/sbin/
 endef
+
 Package/hostapd-basic/install = $(Package/hostapd/install)
 Package/hostapd-basic-openssl/install = $(Package/hostapd/install)
 Package/hostapd-basic-wolfssl/install = $(Package/hostapd/install)

@@ -1,0 +1,355 @@
+#!/usr/bin/env ucode
+'use strict';
+import * as uloop from 'uloop';
+import * as libubus from 'ubus';
+
+uloop.init();
+let ubus = libubus.connect();
+
+let interfaces = {};
+let ssids = {};
+let cache = {};
+let subs_hapd = [];
+let reload_timer;
+let gc_timer;
+
+let timeout = 48 * 60 * 60;
+
+function event_cb_6g(req) {
+	//printf('6g %s %.J\n', req.data, req.type);
+	if (req.type != 'auth' && req.type != 'probe')
+		return 0;
+
+	let addr = req.data.address;
+	let iface = interfaces[req.data.ifname];
+	if (!iface)
+		return 0;
+
+	let ssid = iface.ssid;
+	if (!ssid || !length(ssids[ssid].keys))
+		return 0;
+
+	let ssid_cache = cache[ssid];
+	if (ssid_cache && ssid_cache[addr])
+		return 0;
+
+	if (req.type == 'probe') {
+		printf(`Ignore probe ${req.type} on ${req.data.ifname} from ${addr}\n`);
+		return 1;
+	}
+
+	printf(`reject ${req.type} on ${req.data.ifname} from ${addr}\n`);
+	return 5;
+}
+
+function event_cb(req) {
+	//printf('normal %s %.J\n', req.data, req.type);
+	if (req.type != 'probe')
+		return 0;
+
+	let addr = req.data.address;
+	let iface = interfaces[req.data.ifname];
+	if (!iface)
+		return 0;
+
+	let ssid = iface.ssid;
+	if (!ssid || !length(ssids[ssid].keys))
+		return 0;
+
+	let ssid_cache = cache[ssid];
+	if (ssid_cache && ssid_cache[addr])
+		return 0;
+
+	printf(`reply to ${req.type} on ${req.data.ifname} from ${addr} without 6G RNR\n`);
+	return 2; 
+}
+
+function create_6g_subscriber() {
+	for (let cur_sub in subs_hapd)
+		cur_sub.remove();
+	subs_hapd = [];
+	for (let ifname, iface in interfaces) {
+		let obj = 'hostapd.' + ifname;
+		let cur_sub;
+		if (iface.band == '6g')
+			cur_sub = ubus.subscriber((req) => event_cb_6g(req));
+		else
+			cur_sub = ubus.subscriber((req) => event_cb(req));
+		cur_sub.subscribe(obj);
+		push(subs_hapd, cur_sub);
+		printf(`subscribe ${ifname}\n`);
+		ubus.call(obj, 'notify_response', { notify_response: 1 });
+	}
+}
+
+function cache_gc() {
+	let ts = time();
+
+	for (let ssid in keys(cache)) {
+		if (!ssids[ssid]) {
+			delete cache[ssid];
+			continue;
+		}
+
+		let ssid_cache = cache[ssid];
+		ssid = ssids[ssid];
+
+		for (let addr in keys(ssid_cache)) {
+			let sta = ssid_cache[addr];
+			let keep = ts < cache.timeout;
+
+			if (keep && !ssid.keys[sta.key])
+				keep = false;
+			if (keep)
+				sta.keydata = ssid.keys[sta.key];
+			if (!keep)
+				delete cache[addr];
+		}
+	}
+}
+
+function netifd_reload() {
+	let data = ubus.call('network.wireless', 'status');
+
+	ssids = {};
+	interfaces = {};
+
+	for (let radio_name, radio in data) {
+		if (!radio.up)
+			continue;
+
+		for (let iface in radio.interfaces) {
+			let config = iface.config;
+
+			if (config.mode != 'ap' || !iface.ifname)
+				continue;
+
+			let band = radio.config.band;
+			let nr_data = ubus.call('hostapd.' + iface.ifname, 'rrm_nr_get_own');
+			let nr;
+			if (nr_data && nr_data.value && nr_data.value[2])
+				nr = nr_data.value[2];
+			interfaces[iface.ifname] = {
+				band, nr,
+				ssid: config.ssid,
+			};
+
+			ssids[config.ssid] ??= {
+				interfaces: [],
+				keys: {},
+				bands: {},
+			};
+			let ssid = ssids[config.ssid];
+
+			push(ssid.interfaces, iface.ifname);
+			ssid.bands[band] = iface.ifname;
+			for (let sta in iface.stations) {
+				let stacfg = sta.config;
+
+				let key = stacfg.key;
+				if (!key)
+					continue;
+
+				let keydata = {};
+				let vid = stacfg.vid;
+				if (vid)
+					keydata.vlan = +vid;
+				let mac = stacfg.mac;
+				if (mac)
+					keydata.mac = mac;
+				ssid.keys[key] = keydata;
+			}
+		}
+	}
+	printf('New config: %.J\n',  { ssids, interfaces });
+	cache_gc();
+	create_6g_subscriber();
+}
+
+function iface_ssid(ifname) {
+	let iface = interfaces[ifname];
+	if (!iface)
+		return;
+
+	return iface.ssid;
+}
+
+function sta_cache_entry_get(ssid, addr) {
+	let ssid_cache = cache[ssid] ?? {};
+
+	let entry = ssid_cache[addr];
+	if (entry)
+		entry.timeout = time() + timeout;
+
+	printf(`Get cache entry ssid=${ssid} addr=${addr}: ${entry}\n`);
+	return entry;
+}
+
+function sta_cache_entry_add(ssid, addr, key) {
+	cache[ssid] ??= {};
+	let ssid_cache = cache[ssid];
+	let ssid_data = ssids[ssid];
+	let keydata = ssid_data.keys[key];
+
+	let cache_data = {
+		timeout: time() + timeout,
+		ssid, key,
+		data: keydata ?? {},
+	};
+	ssid_cache[addr] = cache_data;
+	printf(`Added cache entry ssid=${ssid} addr=${addr}\n`);
+	return cache_data;
+}
+
+function ssid_psk(ssid, addr) {
+	ssid = ssids[ssid];
+	if (!ssid)
+		return [];
+
+	let specific = [];
+	let rest = [];
+	for (let k, v in ssid.keys)
+		if (v.mac == addr)
+			push(specific, k);
+		else if (!v.mac)
+			push(rest, k);
+
+	if (length(specific))
+		return specific;
+
+	return rest;
+}
+
+function sta_auth_psk(ifname, addr) {
+	let ssid = iface_ssid(ifname);
+	if (!ssid)
+		return;
+
+	if (interfaces[ifname]?.band == '6g') {
+		let cache = sta_cache_entry_get(ssid, addr);
+		if (cache)
+			return [ cache.key ];
+	} else if (cache[ssid]) {
+		delete cache[ssid][addr];
+	}
+
+	return ssid_psk(ssid, addr);
+}
+
+function sta_auth_cache(ifname, addr, idx, phrase) {
+	let ssid = iface_ssid(ifname);
+	if (!ssid)
+		return;
+
+	let cache = sta_cache_entry_get(ssid, addr);
+	if (cache)
+		return cache.data;
+
+	let psk = ssid_psk(ssid, addr);
+	if (!psk)
+		return;
+
+	psk = psk[idx];
+	if (!psk)
+		psk = phrase;
+
+	if (!psk)
+		return;
+
+	cache = sta_cache_entry_add(ssid, addr, psk);
+	if (!cache)
+		return;
+
+	let ssid_data = ssids[ssid];
+	if (!ssid_data)
+		return cache.data;
+
+	let target_ifname = ssid_data.bands['6g'];
+	if (!target_ifname)
+		return cache.data;
+
+	let target_iface = interfaces[target_ifname];
+	if (!target_iface)
+		return cache.data;
+
+	cache.timer = uloop.timer(30 * 1000, () => {
+		let msg = {
+			addr,
+			disassociation_imminent: false,
+			neighbors: [
+				target_iface.nr
+			],
+			abridged: false,
+		};
+		printf(`ubus call hostapd.${ifname} bss_transition_request '${msg}'\n`);
+		ubus.call('hostapd.' + ifname, 'bss_transition_request', msg);
+		delete cache.timer;
+	});
+
+	return cache.data;
+}
+
+function auth_cb(msg) {
+	let data = msg.data;
+
+	printf(`Event ${msg.type}: ${msg.data}\n`);
+	switch (msg.type) {
+	case 'sta_auth':
+		return {
+			psk: sta_auth_psk(data.iface, data.sta),
+			force_psk: true,
+		};
+	case 'sta_connected':
+		if (data.psk_idx == null)
+			return;
+		return sta_auth_cache(data.iface, data.sta, data.psk_idx, data.psk);
+	case 'reload':
+		netifd_reload();
+		reload_timer.set(5000);
+		break;
+	}
+}
+
+let ubus_methods = {
+	state: {
+		call: function(req) {
+			return {
+				interfaces,
+				ssids,
+				cache,
+			};
+		},
+		args: {
+		}
+	},
+	flush: {
+		call: function() {
+			for (let ssid, data in ssids) {
+				let band = '6g';
+				let iface = data.bands[band];
+				if (!iface)
+					continue;
+				let clients = ubus.call('hostapd.' + iface, 'get_clients');
+				for (let addr, client in clients.clients) {
+					if (!cache[ssid])
+						continue;
+					delete cache[ssid][addr];
+					ubus.call('hostapd.' + iface, 'del_client', { addr });
+				}
+			}
+		},
+		args: {}
+	},
+};
+
+reload_timer = uloop.timer(-1, () => { netifd_reload(); });
+gc_timer = uloop.timer(1000, () => { gc_timer.set(30 * 1000); cache_gc(); });
+ubus.publish('mpsk', ubus_methods);
+let sub = ubus.subscriber(auth_cb);
+let listener = ubus.listener('ubus.object.add', (event, msg) => {
+	if (msg.path == 'hostapd-auth')
+		sub.subscribe(msg.path);
+});
+sub.subscribe('hostapd-auth');
+netifd_reload();
+uloop.run();
