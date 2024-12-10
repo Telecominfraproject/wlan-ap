@@ -25,8 +25,8 @@
 #define   PHY_AUX_SPEED_MASK		GENMASK(4, 2)
 
 /* Registers on MDIO_MMD_VEND1 */
-#define MTK_PHY_LINK_STATUS_MISC               (0xa2)
-#define   MTK_PHY_FDX_ENABLE                   BIT(5)
+#define MTK_PHY_LINK_STATUS_MISC	(0xa2)
+#define   MTK_PHY_FDX_ENABLE		BIT(5)
 
 #define MTK_PHY_LPI_PCS_DSP_CTRL		(0x121)
 #define   MTK_PHY_LPI_SIG_EN_LO_THRESH100_MASK	GENMASK(12, 8)
@@ -46,10 +46,20 @@
 
 #define MTK_EXT_PAGE_ACCESS			0x1f
 #define MTK_PHY_PAGE_STANDARD			0x0000
+#define MTK_PHY_PAGE_EXTENDED_1			0x1
+#define MTK_PHY_AUX_CTRL_AND_STATUS		(0x14)
+#define   MTK_PHY_ENABLE_DOWNSHIFT		BIT(4)
+
+/* Registers on Token Ring debug nodes */
 #define MTK_PHY_PAGE_EXTENDED_52B5		0x52b5
+
+/* ch_addr = 0x0, node_addr = 0xf, data_addr = 0x3c */
+#define AUTO_NP_10XEN				BIT(6)
 
 struct mtk_i2p5ge_phy_priv {
 	bool fw_loaded;
+	u16 tr_low;
+	u16 tr_high;
 };
 
 enum {
@@ -58,6 +68,67 @@ enum {
 	PHY_AUX_SPD_1000,
 	PHY_AUX_SPD_2500,
 };
+
+static void tr_access(struct phy_device *phydev, bool read, u8 ch_addr, u8 node_addr, u8 data_addr)
+{
+	u16 tr_cmd = BIT(15); /* bit 14 & 0 are reserved */
+
+	if (read)
+		tr_cmd |= BIT(13);
+
+	tr_cmd |= (((ch_addr & 0x3) << 11) |
+		   ((node_addr & 0xf) << 7) |
+		   ((data_addr & 0x3f) << 1));
+	dev_dbg(&phydev->mdio.dev, "tr_cmd: 0x%x\n", tr_cmd);
+	__phy_write(phydev, 0x10, tr_cmd);
+}
+
+static void __tr_read(struct phy_device *phydev, u8 ch_addr, u8 node_addr, u8 data_addr)
+{
+	struct mtk_i2p5ge_phy_priv *priv = phydev->priv;
+
+	tr_access(phydev, true, ch_addr, node_addr, data_addr);
+	priv->tr_low = __phy_read(phydev, 0x11);
+	priv->tr_high = __phy_read(phydev, 0x12);
+	dev_dbg(&phydev->mdio.dev, "tr_high read: 0x%x, tr_low read: 0x%x\n",
+		priv->tr_high, priv->tr_low);
+}
+
+static void tr_read(struct phy_device *phydev, u8 ch_addr, u8 node_addr, u8 data_addr)
+{
+	phy_select_page(phydev, MTK_PHY_PAGE_EXTENDED_52B5);
+	__tr_read(phydev, ch_addr, node_addr, data_addr);
+	phy_restore_page(phydev, MTK_PHY_PAGE_STANDARD, 0);
+}
+
+static void __tr_write(struct phy_device *phydev, u8 ch_addr, u8 node_addr, u8 data_addr,
+		       u32 tr_data)
+{
+	__phy_write(phydev, 0x11, tr_data & 0xffff);
+	__phy_write(phydev, 0x12, tr_data >> 16);
+	tr_access(phydev, false, ch_addr, node_addr, data_addr);
+}
+
+static void tr_write(struct phy_device *phydev, u8 ch_addr, u8 node_addr, u8 data_addr, u32 tr_data)
+{
+	phy_select_page(phydev, MTK_PHY_PAGE_EXTENDED_52B5);
+	__tr_write(phydev, ch_addr, node_addr, data_addr, tr_data);
+	phy_restore_page(phydev, MTK_PHY_PAGE_STANDARD, 0);
+}
+
+static void tr_modify(struct phy_device *phydev, u8 ch_addr, u8 node_addr, u8 data_addr,
+		     u32 mask, u32 set)
+{
+	u32 tr_data;
+	struct mtk_i2p5ge_phy_priv *priv = phydev->priv;
+
+	phy_select_page(phydev, MTK_PHY_PAGE_EXTENDED_52B5);
+	__tr_read(phydev, ch_addr, node_addr, data_addr);
+	tr_data = (priv->tr_high << 16) | priv->tr_low;
+	tr_data = (tr_data & ~mask) | set;
+	__tr_write(phydev, ch_addr, node_addr, data_addr, tr_data);
+	phy_restore_page(phydev, MTK_PHY_PAGE_STANDARD, 0);
+}
 
 static int mtk_2p5ge_phy_read_page(struct phy_device *phydev)
 {
@@ -71,14 +142,14 @@ static int mtk_2p5ge_phy_write_page(struct phy_device *phydev, int page)
 
 static int mt7988_2p5ge_phy_probe(struct phy_device *phydev)
 {
-	struct mtk_i2p5ge_phy_priv *phy_priv;
+	struct mtk_i2p5ge_phy_priv *priv;
 
-	phy_priv = devm_kzalloc(&phydev->mdio.dev,
+	priv = devm_kzalloc(&phydev->mdio.dev,
 				sizeof(struct mtk_i2p5ge_phy_priv), GFP_KERNEL);
-	if (!phy_priv)
+	if (!priv)
 		return -ENOMEM;
 
-	phydev->priv = phy_priv;
+	phydev->priv = priv;
 
 	return 0;
 }
@@ -91,11 +162,11 @@ static int mt7988_2p5ge_phy_config_init(struct phy_device *phydev)
 	struct device_node *np;
 	void __iomem *pmb_addr;
 	void __iomem *md32_en_cfg_base;
-	struct mtk_i2p5ge_phy_priv *phy_priv = phydev->priv;
+	struct mtk_i2p5ge_phy_priv *priv = phydev->priv;
 	u16 reg;
 	struct pinctrl *pinctrl;
 
-	if (!phy_priv->fw_loaded) {
+	if (!priv->fw_loaded) {
 		np = of_find_compatible_node(NULL, NULL, "mediatek,2p5gphy-fw");
 		if (!np)
 			return -ENOENT;
@@ -131,9 +202,11 @@ static int mt7988_2p5ge_phy_config_init(struct phy_device *phydev)
 		writew(reg & ~MD32_EN, md32_en_cfg_base);
 		writew(reg | MD32_EN, md32_en_cfg_base);
 		phy_set_bits(phydev, 0, BIT(15));
+		/* We need a delay here to stabilize initialization of MCU */
+		usleep_range(7000, 8000);
 		dev_info(dev, "Firmware loading/trigger ok.\n");
 
-		phy_priv->fw_loaded = true;
+		priv->fw_loaded = true;
 	}
 
 	/* Setup LED */
@@ -154,10 +227,12 @@ static int mt7988_2p5ge_phy_config_init(struct phy_device *phydev)
 		       MTK_PHY_LPI_SIG_EN_LO_THRESH100_MASK, 0);
 
 	/* Enable 16-bit next page exchange bit if 1000-BT isn't advertizing */
-	phy_select_page(phydev, MTK_PHY_PAGE_EXTENDED_52B5);
-	__phy_write(phydev, 0x11, 0xfbfa);
-	__phy_write(phydev, 0x12, 0xc3);
-	__phy_write(phydev, 0x10, 0x87f8);
+	tr_modify(phydev, 0x0, 0xf, 0x3c, AUTO_NP_10XEN,
+		  FIELD_PREP(AUTO_NP_10XEN, 0x1));
+
+	/* Enable downshift */
+	phy_select_page(phydev, MTK_PHY_PAGE_EXTENDED_1);
+	__phy_set_bits(phydev, MTK_PHY_AUX_CTRL_AND_STATUS, MTK_PHY_ENABLE_DOWNSHIFT);
 	phy_restore_page(phydev, MTK_PHY_PAGE_STANDARD, 0);
 
 	return 0;
@@ -223,6 +298,7 @@ static int mt7988_2p5ge_phy_get_features(struct phy_device *phydev)
 static int mt7988_2p5ge_phy_read_status(struct phy_device *phydev)
 {
 	int ret;
+	u16 status;
 
 	ret = genphy_update_link(phydev);
 	if (ret)
@@ -247,31 +323,34 @@ static int mt7988_2p5ge_phy_read_status(struct phy_device *phydev)
 		linkmode_zero(phydev->lp_advertising);
 	}
 
-	ret = phy_read(phydev, PHY_AUX_CTRL_STATUS);
-	if (ret < 0)
-		return ret;
+	status = phy_read(phydev, MII_BMSR);
+	if (status & BMSR_LSTATUS) {
+		ret = phy_read(phydev, PHY_AUX_CTRL_STATUS);
+		if (ret < 0)
+			return ret;
 
-	switch (FIELD_GET(PHY_AUX_SPEED_MASK, ret)) {
-	case PHY_AUX_SPD_10:
-		phydev->speed = SPEED_10;
-		break;
-	case PHY_AUX_SPD_100:
-		phydev->speed = SPEED_100;
-		break;
-	case PHY_AUX_SPD_1000:
-		phydev->speed = SPEED_1000;
-		break;
-	case PHY_AUX_SPD_2500:
-		phydev->speed = SPEED_2500;
-		break;
+		switch (FIELD_GET(PHY_AUX_SPEED_MASK, ret)) {
+		case PHY_AUX_SPD_10:
+			phydev->speed = SPEED_10;
+			break;
+		case PHY_AUX_SPD_100:
+			phydev->speed = SPEED_100;
+			break;
+		case PHY_AUX_SPD_1000:
+			phydev->speed = SPEED_1000;
+			break;
+		case PHY_AUX_SPD_2500:
+			phydev->speed = SPEED_2500;
+			break;
+		}
+
+		ret = phy_read_mmd(phydev, MDIO_MMD_VEND1, MTK_PHY_LINK_STATUS_MISC);
+		if (ret < 0)
+			return ret;
+		phydev->duplex = (ret & MTK_PHY_FDX_ENABLE) ? DUPLEX_FULL : DUPLEX_HALF;
+		/* FIXME: The current firmware always enables rate adaptation mode. */
+		phydev->rate_matching = RATE_MATCH_PAUSE;
 	}
-
-	ret = phy_read_mmd(phydev, MDIO_MMD_VEND1, MTK_PHY_LINK_STATUS_MISC);
-	if (ret < 0)
-		return ret;
-	phydev->duplex = (ret & MTK_PHY_FDX_ENABLE) ? DUPLEX_FULL : DUPLEX_HALF;
-	/* FIXME: The current firmware always enables rate adaptation mode. */
-	phydev->rate_matching = RATE_MATCH_PAUSE;
 
 	return 0;
 }

@@ -1,9 +1,9 @@
-/*SPDX-License-Identifier: GPL-2.0*/
-/*FILE NAME:  an8801.h
- *PURPOSE:
- *Define Airoha phy driver function
+// SPDX-License-Identifier: GPL-2.0
+/* FILE NAME:  an8801.h
+ * PURPOSE:
+ *      Define Airoha phy driver function
  *
- *NOTES:
+ * NOTES:
  *
  */
 
@@ -12,13 +12,12 @@
 
 /* NAMING DECLARATIONS
  */
-#define AN8801_DRIVER_VERSION  "1.1.4"
+#define AN8801_DRIVER_VERSION  "1.1.0"
 
 #define DEBUGFS_COUNTER         "counter"
-#define DEBUGFS_INFO     "driver_info"
+#define DEBUGFS_DRIVER_INFO     "driver_info"
 #define DEBUGFS_PBUS_OP         "pbus_op"
 #define DEBUGFS_POLARITY        "polarity"
-#define DEBUGFS_MDIO            "mdio"
 
 #define AN8801_MDIO_PHY_ID      0x1
 #define AN8801_PHY_ID1          0xc0ff
@@ -98,7 +97,6 @@
 
 #define PHY_PRE_SPEED_REG               (0x2b)
 
-#define MMD_DEV_VSPEC1          (0x1E)
 #define MMD_DEV_VSPEC2          (0x1F)
 
 #define RGMII_DELAY_STEP_MASK       0x7
@@ -204,8 +202,6 @@ struct an8801_priv {
 #ifdef AN8801SB_DEBUGFS
 	struct dentry        *debugfs_root;
 #endif
-	int                   pol;
-	int                   surge;
 };
 
 enum an8801_polarity {
@@ -213,12 +209,6 @@ enum an8801_polarity {
 	AIR_POL_TX_REV_RX_REV,
 	AIR_POL_TX_NOR_RX_NOR,
 	AIR_POL_TX_REV_RX_NOR,
-};
-
-enum air_surge {
-	AIR_SURGE_0R,
-	AIR_SURGE_5R,
-	AIR_SURGE_LAST = 0xff
 };
 
 #endif /* End of __AN8801_H */

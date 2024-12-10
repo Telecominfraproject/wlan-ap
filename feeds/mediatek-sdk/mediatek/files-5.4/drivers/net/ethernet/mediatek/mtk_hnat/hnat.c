@@ -119,7 +119,7 @@ void cr_set_field(void __iomem *reg, u32 field, u32 val)
 }
 
 /*boundary entry can't be used to accelerate data flow*/
-static void exclude_boundary_entry(struct foe_entry *foe_table_cpu)
+void exclude_boundary_entry(struct foe_entry *foe_table_cpu)
 {
 	int entry_base = 0;
 	int bad_entry, i, j;
