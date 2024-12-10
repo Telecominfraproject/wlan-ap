@@ -74,6 +74,7 @@ platform_check_image() {
 	sonicfi,rap630w-311g|\
 	cybertan,eww631-a1|\
 	cybertan,eww631-b1|\
+	cybertan,rap630w-312g|\
 	edgecore,eap104|\
 	wallys,dr5018|\
 	hfcl,ion4x_w|\
@@ -145,16 +146,17 @@ platform_do_upgrade() {
 	sonicfi,rap630c-311g|\
 	sonicfi,rap630w-311g|\
 	cybertan,eww631-a1|\
-	cybertan,eww631-b1)
+	cybertan,eww631-b1|\
+	cybertan,rap630w-312g)
 		boot_part=$(fw_printenv bootfrom | cut  -d = -f2)
-		echo "Current bootfrom is $boot_part"
-		if [[ $boot_part == 1 ]]; then
-			CI_UBIPART="rootfs"
-			CI_FWSETENV="bootfrom 0"
-		else
-			CI_UBIPART="rootfs_1"
-			CI_FWSETENV="bootfrom 1"
-		fi
+			echo "Current bootfrom is $boot_part"
+			if [[ $boot_part == 1 ]]; then
+				CI_UBIPART="rootfs"
+				CI_FWSETENV="bootfrom 0"
+			elif [[ $boot_part == 0 ]]; then
+				CI_UBIPART="rootfs_1"
+				CI_FWSETENV="bootfrom 1"
+			fi
 		nand_upgrade_tar "$1"
 		;;
 	esac
