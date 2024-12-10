@@ -30,6 +30,24 @@
 #define MTK_FE_GDM1_FSM			0x228
 #define MTK_FE_GDM2_FSM			0x22C
 #define MTK_FE_GDM3_FSM			0x23C
+#define MTK_FE_CDM1_DBG1		0x200
+#define MTK_FE_CDM1_DBG2		0x204
+#define MTK_FE_CDM2_DBG1		0x208
+#define MTK_FE_CDM2_DBG2		0x20C
+#define MTK_FE_CDM3_DBG1		0x230
+#define MTK_FE_CDM3_DBG2		0x234
+#define MTK_FE_CDM4_DBG1		0x290
+#define MTK_FE_CDM4_DBG2		0x294
+#define MTK_FE_CDM5_DBG1		0x310
+#define MTK_FE_CDM5_DBG2		0x314
+#define MTK_FE_CDM6_DBG1		0x320
+#define MTK_FE_CDM6_DBG2		0x324
+#define MTK_FE_CDM7_DBG1		0x330
+#define MTK_FE_CDM7_DBG2		0x334
+#define MTK_FE_GDM1_DBG1		0x210
+#define MTK_FE_GDM1_DBG2		0x214
+#define MTK_FE_GDM2_DBG1		0x218
+#define MTK_FE_GDM2_DBG2		0x21C
 #define MTK_FE_PSE_FREE			0x240
 #define MTK_FE_DROP_FQ			0x244
 #define MTK_FE_DROP_FC			0x248
@@ -174,6 +192,46 @@
 	reg_val |= ((y) & 0x1) << MTK_RX_PORT_VALID_OFFSET;		\
 	mtk_w32(eth, reg_val, MTK_LRO_CTRL_DW2_CFG(x));			\
 }
+
+struct mtk_pse_fs_lgc_info_v2 {
+	u32 rev3 : 14;
+	u32 ppe_crsn: 5;
+	u32 sport : 4;
+	u32 is_l4f: 1;
+	u32 is_l4vld: 1;
+	u32 is_tack : 1;
+	u32 is_ip4f : 1;
+	u32 is_ip4 : 1;
+	u32 is_ip6 : 1;
+	u32 dr_idx : 2;
+	u32 rev2 : 4;
+	u32 l3_pidx : 2;
+	u32 rev : 2;
+	u32 fport : 4;
+	u32 l2_len : 7;
+	u32 l3_len : 14;
+} __packed;
+
+struct mtk_pse_fs_lgc_info_v3 {
+	u32 is_snap : 1;
+	u32 vofst : 3;
+	u32 l3_pidx : 2;
+	u32 pse_sport : 4;
+	u32 fport : 4;
+	u32 ppe_crsn: 5;
+	u32 sport : 4;
+	u32 is_l4f: 1;
+	u32 is_l4vld: 1;
+	u32 is_tack : 1;
+	u32 is_ip4f : 1;
+	u32 is_ip4 : 1;
+	u32 is_ip6 : 1;
+	u32 is_err_pkt : 1;
+	u32 err_pkt_action : 2;
+	u32 pl_end : 11;
+	u32 l2_len : 7;
+	u32 l3_len : 14;
+} __packed;
 
 struct mtk_lro_alt_v1_info0 {
 	u32 dtp : 16;

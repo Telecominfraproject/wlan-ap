@@ -40,6 +40,17 @@ define Device/cybertan_eww631_b1
 endef
 TARGET_DEVICES += cybertan_eww631_b1
 
+define Device/cybertan_rap630w_312g
+  DEVICE_TITLE := CyberTan RAP630W-312G
+  DEVICE_DTS := qcom-ipq5018-rap630w-312g
+  SUPPORTED_DEVICES := cybertan,rap630w-312g
+  DEVICE_PACKAGES := ath11k-wifi-cybertan-rap630w-312g ath11k-firmware-ipq50xx-map-spruce \
+                     -kmod-usb-dwc3-of-simple kmod-usb-dwc3-qcom kmod-usb3 \
+                     kmod-usb-uas kmod-fs-msdos kmod-fs-ntfs
+  DEVICE_DTS_CONFIG := config@mp03.3
+endef
+TARGET_DEVICES += cybertan_rap630w_312g
+
 define Device/sonicfi_rap630c_311g
   DEVICE_TITLE := Sonicfi RAP630C-311G
   DEVICE_DTS := qcom-ipq5018-rap630c-311g

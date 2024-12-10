@@ -145,6 +145,7 @@
 #define HASH_MODE (0x3 << 14) /* RW */
 #define SCAN_MODE (0x3 << 16) /* RW */
 #define XMODE (0x3 << 18) /* RW */
+#define HASH_DBG (0x3 << 21) /* RW */
 #define TICK_SEL (0x1 << 24) /* RW */
 #define DSCP_TRFC_ECN_EN (0x1 << 25) /* RW */
 
@@ -1146,6 +1147,7 @@ enum FoeIpAct {
 #define NR_WDMA1_PORT 9
 #define NR_WDMA2_PORT 13
 #define NR_GMAC3_PORT 15
+#define NR_QDMA_TPORT 1
 #define LAN_DEV_NAME hnat_priv->lan
 #define LAN2_DEV_NAME hnat_priv->lan2
 #define IS_WAN(dev)                                                            \
@@ -1310,6 +1312,7 @@ int hnat_enable_hook(void);
 int hnat_disable_hook(void);
 void hnat_cache_ebl(int enable);
 void hnat_qos_shaper_ebl(u32 id, u32 enable);
+void exclude_boundary_entry(struct foe_entry *foe_table_cpu);
 void set_gmac_ppe_fwd(int gmac_no, int enable);
 int entry_detail(u32 ppe_id, int index);
 int entry_delete_by_mac(u8 *mac);
