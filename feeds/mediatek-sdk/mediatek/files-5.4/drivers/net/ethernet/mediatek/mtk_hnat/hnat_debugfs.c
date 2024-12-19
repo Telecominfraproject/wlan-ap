@@ -755,7 +755,6 @@ int cr_set_usage(int level)
 	pr_info("              5     0~255      Set TCP keep alive interval\n");
 	pr_info("              6     0~255      Set UDP keep alive interval\n");
 	pr_info("              7     0~1        Set hnat counter update to nf_conntrack\n");
-	pr_info("              8     0~6        Set PPE hash debug mode\n");
 
 	return 0;
 }
@@ -867,56 +866,6 @@ int set_nf_update_toggle(int toggle)
 	return 0;
 }
 
-
-int set_hash_dbg_mode(int dbg_mode)
-{
-	static const char * const hash_dbg_mode[] = {
-		"Normal", "Source port[15:0]",
-		"IPv4 source IP[15:0]", "IPv6 source IP[15:0]", "Destination port[15:0]",
-		"IPv4 destination IP[15:0]", "IPv6 destination IP[15:0]" };
-	unsigned int foe_table_sz, foe_acct_tb_sz, ppe_id, i;
-
-	if (dbg_mode < 0 || dbg_mode > 6) {
-		pr_info("Invalid hash debug mode %d\n", dbg_mode);
-		pr_info("[debug mode]\n");
-		for (i = 0; i <= 6; i++)
-			pr_info("		%d	%s\n", i, hash_dbg_mode[i]);
-		return -EINVAL;
-	}
-
-	foe_table_sz = hnat_priv->foe_etry_num * sizeof(struct foe_entry);
-	foe_acct_tb_sz = hnat_priv->foe_etry_num * sizeof(struct hnat_accounting);
-
-	/* send all traffic back to the DMA engine */
-	set_gmac_ppe_fwd(NR_GMAC1_PORT, 0);
-	set_gmac_ppe_fwd(NR_GMAC2_PORT, 0);
-	set_gmac_ppe_fwd(NR_GMAC3_PORT, 0);
-
-	for (ppe_id = 0; ppe_id < CFG_PPE_NUM; ppe_id++) {
-		cr_set_field(hnat_priv->ppe_base[ppe_id] + PPE_TB_CFG,
-			     HASH_DBG, dbg_mode);
-
-		memset(hnat_priv->foe_table_cpu[ppe_id], 0, foe_table_sz);
-
-		if (hnat_priv->data->version == MTK_HNAT_V1_1)
-			exclude_boundary_entry(hnat_priv->foe_table_cpu[ppe_id]);
-
-		if (hnat_priv->data->per_flow_accounting)
-			memset(hnat_priv->acct[ppe_id], 0, foe_acct_tb_sz);
-	}
-
-	/* clear HWNAT cache */
-	hnat_cache_ebl(1);
-
-	set_gmac_ppe_fwd(NR_GMAC1_PORT, 1);
-	set_gmac_ppe_fwd(NR_GMAC2_PORT, 1);
-	set_gmac_ppe_fwd(NR_GMAC3_PORT, 1);
-
-	pr_info("Hash debug mode enabled, set to %s mode\n", hash_dbg_mode[dbg_mode]);
-
-	return 0;
-}
-
 static const debugfs_write_func hnat_set_func[] = {
 	[0] = hnat_set_usage,
 	[1] = hnat_cpu_reason,
@@ -938,7 +887,6 @@ static const debugfs_write_func cr_set_func[] = {
 	[2] = tcp_bind_lifetime, [3] = fin_bind_lifetime,
 	[4] = udp_bind_lifetime, [5] = tcp_keep_alive,
 	[6] = udp_keep_alive,    [7] = set_nf_update_toggle,
-	[8] = set_hash_dbg_mode,
 };
 
 int read_mib(struct mtk_hnat *h, u32 ppe_id,
@@ -1949,7 +1897,6 @@ ssize_t hnat_setting_write(struct file *file, const char __user *buffer,
 	case 5:
 	case 6:
 	case 7:
-	case 8:
 		p_token = strsep(&p_buf, p_delimiter);
 		if (!p_token)
 			arg1 = 0;
