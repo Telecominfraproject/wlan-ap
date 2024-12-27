@@ -46,8 +46,14 @@ platform_do_upgrade() {
 	tplink,ex227)	
 		qca_do_upgrade "$1"
 		;;
+        cig,wf196)
+                [ -f /proc/boot_info/rootfs/upgradepartition ] && {
+                        CI_UBIPART="$(cat /proc/boot_info/rootfs/upgradepartition)"
+                        CI_BOOTCFG=1
+                }
+                nand_upgrade_tar "$1"
+                ;;
 	cig,wf194c4|\
-	cig,wf196|\
 	tplink,ex447)
 		nand_upgrade_tar "$1"
 		;;

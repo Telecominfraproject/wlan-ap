@@ -145,7 +145,13 @@ platform_do_upgrade() {
 	cig,wf660a)
 		spi_nor_emmc_do_upgrade_bootconfig $1
 		;;
-	cig,wf188n|\
+	cig,wf188n)
+		[ -f /proc/boot_info/rootfs/upgradepartition ] && {
+			CI_UBIPART="$(cat /proc/boot_info/rootfs/upgradepartition)"
+			CI_BOOTCFG=1
+		}
+		nand_upgrade_tar "$1"
+		;;
 	glinet,ax1800|\
 	glinet,axt1800|\
 	wallys,dr6018|\
