@@ -78,13 +78,14 @@ for (let phy_name, phy in board.wlan) {
 
 		band_name = lc(band_name);
 
-		let country, defaults, num_global_macaddr;
+		let country, defaults, num_global_macaddr, macaddr_base;
 		if (board.wlan.defaults) {
 			defaults = board.wlan.defaults.ssids?.[band_name]?.ssid ? board.wlan.defaults.ssids?.[band_name] : board.wlan.defaults.ssids?.all;
 			country = board.wlan.defaults.country;
 			if (!country && band_name != '2g')
 				defaults = null;
 			num_global_macaddr = board.wlan.defaults.ssids?.[band_name]?.mac_count;
+			macaddr_base = board.wlan.defaults.ssids?.[band_name]?.macaddr_base;
 		}
 
 		if (length(info.radios) > 0)
@@ -98,6 +99,7 @@ set ${s}.ifname_prefix='phy${band_name}-'
 set ${s}.channel='${channel}'
 set ${s}.htmode='${htmode}'
 set ${s}.country='${country || ''}'
+set ${s}.macaddr_base='${macaddr_base || ''}'
 set ${s}.num_global_macaddr='${num_global_macaddr || ''}'
 set ${s}.disabled='${defaults ? 0 : 1}'
 `);
