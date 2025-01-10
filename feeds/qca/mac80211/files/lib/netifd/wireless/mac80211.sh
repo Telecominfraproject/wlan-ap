@@ -626,7 +626,7 @@ rename_board_phy_by_name() (
 	json_select "${phy%.*}" || return 0
 	json_get_vars path
 
-	prev_phy="$(iwinfo nl80211 phyname "path=$path${suffix:++$suffix}")"
+	prev_phy="$(/usr/share/iwinfo nl80211 phyname "path=$path${suffix:++$suffix}")"
 	[ -n "$prev_phy" ] || return 0
 
 	[ "$prev_phy" = "$phy" ] && return 0
@@ -640,7 +640,7 @@ find_phy() {
 		[ -d /sys/class/ieee80211/$phy ] && return 0
 	}
 	[ -n "$path" ] && {
-		phy="$(iwinfo nl80211 phyname "path=$path")"
+		phy="$(/usr/share/iwinfo nl80211 phyname "path=$path")"
 		[ -n "$phy" ] && {
 			rename_board_phy_by_path "$path"
 			return 0
@@ -649,7 +649,7 @@ find_phy() {
 	[ -n "$macaddr" ] && {
 		for phy in $(ls /sys/class/ieee80211 2>/dev/null); do
 			grep -i -q "$macaddr" "/sys/class/ieee80211/${phy}/macaddress" && {
-				path="$(iwinfo nl80211 path "$phy")"
+				path="$(/usr/share/iwinfo nl80211 path "$phy")"
 				rename_board_phy_by_path "$path"
 				return 0
 			}
