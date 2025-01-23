@@ -227,16 +227,19 @@ nand_qca_update_bootconfig() {
 	local mtdnum
 	local part
 
-	[ -f /proc/boot_info/rootfs/primaryboot ] || return
-	[ -f /proc/boot_info/getbinary_bootconfig ] || return
+	[ -f /proc/boot_info/bootconfig0/rootfs/primaryboot ] || [ -f /proc/boot_info/bootconfig1/rootfs/primaryboot ] || return
+	[ -f /proc/boot_info/bootconfig0/getbinary_bootconfig ] || [ -f /proc/boot_info/bootconfig1/rootfs/primaryboot ] || return
 
-	[ "$(cat /proc/boot_info/rootfs/primaryboot)" = "0" ] && primary="1"
-	echo "$primary" > /proc/boot_info/rootfs/primaryboot 2>/dev/null
+	[ "$(cat /proc/boot_info/bootconfig0/rootfs/primaryboot)" = "0" ] && [ "$(cat /proc/boot_info/bootconfig1/rootfs/primaryboot)" = "0" ] && primary="1"
+	echo "$primary" > /proc/boot_info/bootconfig0/rootfs/primaryboot 2>/dev/null
+	echo "$primary" > /proc/boot_info/bootconfig1/rootfs/primaryboot 2>/dev/null
 
 	for part in "0:BOOTCONFIG" "0:BOOTCONFIG1"; do
 		mtdnum="$(find_mtd_index "$part")"
 		[ -c "/dev/mtd${mtdnum}" ] && {
-			mtd -qq write /proc/boot_info/getbinary_bootconfig \
+			mtd -qq write /proc/boot_info/bootconfig0/getbinary_bootconfig \
+				"/dev/mtd${mtdnum}" 2>/dev/null &&\
+			mtd -qq write /proc/boot_info/bootconfig1/getbinary_bootconfig \
 				"/dev/mtd${mtdnum}" 2>/dev/null &&\
 			echo "partition '$part' updated"
 		}
