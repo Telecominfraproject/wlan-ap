@@ -27,6 +27,17 @@ platform_do_upgrade() {
 		nand_upgrade_tar "$1"
 		;;
 	edgecore,eap105)
+		if [ "$(find_mtd_chardev rootfs)" ]; then
+			CI_UBIPART="rootfs"
+		else
+			if grep -q rootfs1 /proc/cmdline; then
+				CI_UBIPART="rootfs2"
+				CI_FWSETENV="active 2"
+			else
+				CI_UBIPART="rootfs1"
+				CI_FWSETENV="active 1"
+			fi
+		fi
 		nand_upgrade_tar "$1"
 		;;
 	esac
