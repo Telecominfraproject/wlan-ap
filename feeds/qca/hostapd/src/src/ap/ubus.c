@@ -1757,6 +1757,7 @@ void hostapd_ubus_free_bss(struct hostapd_data *hapd)
 
 	if (obj->id)
 		ubus_remove_object(ctx, obj);
+	obj->name = NULL;
 
 	free(name);
 }
