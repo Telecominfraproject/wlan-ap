@@ -111,10 +111,10 @@ return {
 			return;
 		let channels;
 		let offset = 0;
-		printf('%s \n', global.phy.phys[phy].band[0]);
+		if (!global.phy.phys[phy])
+			return;
 		switch (global.phy.phys[phy].band[0]) {
 		case '2G':
-			printf('fooo abc\n');
 			channels = global.config.channels_2g;
 			break;
 		case '5G':
@@ -125,13 +125,9 @@ return {
 			return;
 		}
 
-		printf('fooo, %.J\n', channels);
-
 		if (!channels)
 			return;
-		printf('fooo2\n');
 		let num_chan = length(channels);
-		printf('fooo3\n');
 		phys[phy] = {
 			channels,
 			offset,
@@ -139,11 +135,6 @@ return {
 			curr_chan: 0,
 			delay: 5,
 		};
-
-		printf('%.J\n', phys[phy]);
-
-	//	scan(phy, { dev });
-//		scan(phy, { dev, scan_ssids: [ '' ], });
 	},
 	
 	status: function() {
