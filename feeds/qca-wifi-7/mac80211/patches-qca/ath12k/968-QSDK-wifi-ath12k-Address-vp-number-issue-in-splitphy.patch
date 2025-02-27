@@ -1,0 +1,149 @@
+From 08a5122efda30d595918791896b48545df49e523 Mon Sep 17 00:00:00 2001
+From: Pavankumar Nandeshwar <quic_pnandesh@quicinc.com>
+Date: Wed, 24 Jul 2024 08:20:24 +0530
+Subject: [PATCH] QSDK: wifi: ath12k: Address vp number issue in splitphy case
+
+In splitphy mlo DS case, the vp number in the ppe descriptor
+might get mapped to wrong entry in the ppe_vp table and hence
+wrong lmac_id causing a traffic halt. Address this issue
+by adding a work around to fallback to sfe mode in case
+the requested peer in the node id fetch API has a ppe table
+entry which will never get matched as explained above.
+
+Patch-depdendency: 652-01-ath12k-single-wiphy-registration-per-SOC.patch
+Signed-off-by: Pavankumar Nandeshwar <quic_pnandesh@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/accel_cfg.c | 77 ++++++++++++---------
+ drivers/net/wireless/ath/ath12k/debugfs.c   |  2 +
+ drivers/net/wireless/ath/ath12k/ppe.h       |  1 +
+ 3 files changed, 48 insertions(+), 32 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/accel_cfg.c
++++ b/drivers/net/wireless/ath/ath12k/accel_cfg.c
+@@ -66,57 +66,70 @@ static bool ath12k_ds_get_node_id(struct
+ 	if (ahvif->ppe_vp_type != PPE_VP_USER_TYPE_DS)
+ 		return false;
+ 
++	if (ahvif->vdev_type != WMI_VDEV_TYPE_STA &&
++			ahvif->vdev_type != WMI_VDEV_TYPE_AP) {
++		return false;
++	}
++
++	rcu_read_lock();
++
+ 	if (ahvif->vdev_type == WMI_VDEV_TYPE_STA) {
+-		rcu_read_lock();
+ 		sta = ieee80211_find_sta(vif,vif->cfg.ap_addr);
+ 
+ 		if (!sta) {
+ 			ath12k_warn(NULL, "ieee80211_sta is null");
+ 			goto unlock_n_fail;
+ 		}
+-
+-		ahsta = ath12k_sta_to_ahsta(sta);
+-		arvif = (!sta->mlo) ? ahvif->link[ahsta->deflink.link_id] :
+-				ahvif->link[ahsta->primary_link_id];
+-
+-		if (WARN_ON(!arvif))
+-			goto unlock_n_fail;
+-
+-		ab = arvif->ab;
+-
+-		/* Update and return DS node_id only if the chipset support DS*/
+-		if (!test_bit(ATH12K_FLAG_PPE_DS_ENABLED, &ab->dev_flags))
+-			goto unlock_n_fail;
+-
+-		*node_id = ab->ppe.ds_node_id;
+-		rcu_read_unlock();
+-		return true;
+-	}
+-
+-	if (ahvif->vdev_type == WMI_VDEV_TYPE_AP) {
+-		rcu_read_lock();
+-
++	} else if (ahvif->vdev_type == WMI_VDEV_TYPE_AP) {
+ 		sta = ieee80211_find_sta(vif, peer_mac);
+ 		if (!sta)
+ 			goto unlock_n_fail;
++	}
+ 
+-		ahsta = ath12k_sta_to_ahsta(sta);
++	ahsta = ath12k_sta_to_ahsta(sta);
++	arvif = (!sta->mlo) ? ahvif->link[ahsta->deflink.link_id] :
++			ahvif->link[ahsta->primary_link_id];
++
++	if (!arvif)
++		goto unlock_n_fail;
++
++	ab = arvif->ab;
++
++	/* Update and return DS node_id only if the chipset support DS*/
++	if (!test_bit(ATH12K_FLAG_PPE_DS_ENABLED, &ab->dev_flags))
++		goto unlock_n_fail;
++
++	/*
++	 * In splitphy mlo case, the vp number might get mapped to
++	 * wrong lmac_id causing a traffic halt. Address this issue
++	 * by adding a work around to fallback to sfe mode, in case
++	 * the requested peer has a pdev with incompatible primary lmac id
++	 */
++	if (ab->num_radios > 1) {
++		int idx = arvif->ppe_vp_profile_idx;
++		int link_id;
++		struct ath12k_link_vif *iter_arvif;
++
++		for_each_set_bit(link_id, &ahvif->links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
++			iter_arvif = ahvif->link[link_id];
++
++			if (!iter_arvif || iter_arvif == arvif ||
++				ab != iter_arvif->ab)
++				continue;
+ 
+-		arvif = (!sta->mlo) ? ahvif->link[ahsta->deflink.link_id] :
+-				ahvif->link[ahsta->primary_link_id];
+-		ab = arvif->ab;
++			if (iter_arvif->ppe_vp_profile_idx < idx) {
++				ab->ppe.ppeds_stats.splitphy_fallbacks++;
+ 
+-		/* Update and return DS node_id only if the chipset support DS*/
+-		if (!test_bit(ATH12K_FLAG_PPE_DS_ENABLED, &ab->dev_flags))
+-			goto unlock_n_fail;
++				goto unlock_n_fail;
++			}
++		}
++	}
+ 
+-		*node_id = ab->ppe.ds_node_id;
++	*node_id = ab->ppe.ds_node_id;
+ 
+-		rcu_read_unlock();
++	rcu_read_unlock();
+ 
+-		return true;
+-	}
+-	return false;
++	return true;
+ 
+ unlock_n_fail:
+ 	rcu_read_unlock();
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -3169,6 +3169,8 @@ static ssize_t ath12k_debugfs_dump_ppeds
+ 			 ppeds_stats->num_rx_desc_freed);
+ 	len += scnprintf(buf + len, size - len, "num_rx_desc_realloc %u\n",
+ 			 ppeds_stats->num_rx_desc_realloc);
++	len += scnprintf(buf + len, size - len, "splitphy_fallbacks %u\n",
++			 ppeds_stats->splitphy_fallbacks);
+ 	len += scnprintf(buf + len, size - len,
+ 			 "\ntqm_rel_reason: 0:%u 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u 7:%u 8:%u 9:%u 10:%u 11:%u 12:%u 13:%u 14:%u\n",
+ 			 ppeds_stats->tqm_rel_reason[0],
+--- a/drivers/net/wireless/ath/ath12k/ppe.h
++++ b/drivers/net/wireless/ath/ath12k/ppe.h
+@@ -49,6 +49,7 @@ struct ath12k_ppeds_stats {
+ 	u32 release_rx_desc_cnt;
+ 	u32 num_rx_desc_freed;
+ 	u32 num_rx_desc_realloc;
++	u32 splitphy_fallbacks;
+ 	u32 tqm_rel_reason[HAL_WBM_TQM_REL_REASON_MAX];
+ };
+ 

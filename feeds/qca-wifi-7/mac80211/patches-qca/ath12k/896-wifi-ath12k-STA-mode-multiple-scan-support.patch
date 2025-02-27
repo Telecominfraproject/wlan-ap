@@ -1,0 +1,284 @@
+From bedb777392deeab81f2cceca3b2b3e59bf35f5db Mon Sep 17 00:00:00 2001
+From: Arunpandi Kannan <quic_arunpand@quicinc.com>
+Date: Wed, 3 Apr 2024 11:56:56 +0530
+Subject: [PATCH] wifi: ath12k: Support to handle more than one scan request in
+ STA mode
+
+Add support to handle both off-channel scan and hw scan in same radio.
+In STA mode, if vdev is started during ROC scan, stop the vdev before
+making connection to an AP in both MLO and non-MLO mode.
+
+Signed-off-by: Arunpandi Kannan <quic_arunpand@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |  1 +
+ drivers/net/wireless/ath/ath12k/mac.c  | 95 ++++++++++++++++----------
+ drivers/net/wireless/ath/ath12k/wmi.c  | 20 +++++-
+ drivers/net/wireless/ath/ath12k/wmi.h  |  1 +
+ 4 files changed, 79 insertions(+), 38 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -936,6 +936,7 @@ struct ath12k {
+ 		struct completion on_channel;
+ 		struct delayed_work timeout;
+ 		enum ath12k_scan_state state;
++		int no_of_active_scans;
+ 		bool is_roc;
+ 		int vdev_id;
+ 		int roc_freq;
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -5375,6 +5375,8 @@ void __ath12k_mac_scan_finish(struct ath
+ 		ar->scan.roc_freq = 0;
+ 		cancel_delayed_work(&ar->scan.timeout);
+ 		complete(&ar->scan.completed);
++		if (ar->scan.no_of_active_scans > 0)
++			ar->scan.no_of_active_scans--;
+ 		ieee80211_queue_work(ah->hw, &ar->scan.vdev_del_wk);
+ 		break;
+ 	}
+@@ -5489,8 +5491,11 @@ static void ath12k_scan_vdev_del_work(st
+ 	mutex_lock(&ar->conf_mutex);
+ 	/* scan vdev got deleted already. This can happen when on same vif, new
+ 	 * scan request was requested with different frequeny which leads to
+-	 * movement of scan arvif from one radio to another radio */
+-	if (ar->scan.vdev_id == -1)
++	 * movement of scan arvif from one radio to another radio. Also in STA
++	 * mode both off-chan scan and hw scan might be active. So skip vdev del
++	 * if no of active scans are more than zero
++	 */
++	if (ar->scan.vdev_id == -1 || ar->scan.no_of_active_scans > 0)
+ 		goto work_complete;
+ 
+ 	mutex_unlock(&ar->conf_mutex);
+@@ -5717,6 +5722,7 @@ static int ath12k_mac_op_hw_scan(struct
+ 	 * on this vif
+ 	 */
+ 	ahvif->last_scan_link = arvif->link_id;
++	ar->scan.no_of_active_scans++;
+ 
+ 	/* Add a margin to account for event/command processing */
+ 	ieee80211_queue_delayed_work(ar->ah->hw, &ar->scan.timeout,
+@@ -12075,6 +12081,10 @@ static int ath12k_mac_vdev_start_restart
+ 	ath12k_dbg(ab, ATH12K_DBG_MAC,  "vdev %pM started, vdev_id %d\n",
+ 		   arvif->addr, arvif->vdev_id);
+ 
++	/* For scan vif, STA related configs are not needed */
++	if (ahvif->vdev_type == WMI_VDEV_TYPE_STA && arvif->is_scan_vif == true)
++		return 0;
++
+ 	ret = ath12k_mac_vdev_config_after_start(arvif, chandef);
+ 	if (ret)
+ 		ath12k_warn(ab, "failed to configure vdev %d after %s: %d\n",
+@@ -13472,6 +13482,40 @@ void ath12k_mac_parse_tx_pwr_env(struct
+ }
+ 
+ static int
++ath12k_validate_arvif(struct ath12k_link_vif *arvif)
++{
++	int ret = 0;
++	struct ath12k *arvif_ar = NULL;
++
++	if (!(arvif->is_scan_vif) && WARN_ON(arvif->is_started)) {
++		ath12k_warn(NULL, "arvif is already started");
++		return -EBUSY;
++	}
++
++	arvif_ar = arvif->ar;
++	if (WARN_ON(!arvif_ar)) {
++		ath12k_warn(NULL, "arvif_ar not found\n");
++		return -EINVAL;
++	}
++
++	mutex_lock(&arvif_ar->conf_mutex);
++	if (arvif->is_scan_vif && arvif->is_started) {
++		ret = ath12k_mac_vdev_stop(arvif);
++		if (ret) {
++			mutex_unlock(&arvif_ar->conf_mutex);
++			ath12k_warn(arvif_ar->ab, "failed to stop vdev %d: %d\n",
++				    arvif->vdev_id, ret);
++			return -EINVAL;
++		}
++		arvif->is_started = false;
++		arvif->is_scan_vif = false;
++	}
++	mutex_unlock(&arvif_ar->conf_mutex);
++
++	return ret;
++}
++
++static int
+ ath12k_mac_op_assign_vif_chanctx(struct ieee80211_hw *hw,
+ 				 struct ieee80211_vif *vif,
+ 				 struct ieee80211_bss_conf *link_conf,
+@@ -13510,12 +13554,13 @@ ath12k_mac_op_assign_vif_chanctx(struct
+ 			mutex_unlock(&ah->conf_mutex);
+ 			return -EINVAL;
+ 		}
+-	}else if (vif->valid_links){
+-		ar = arvif->ar;
+-		if (WARN_ON(!ar)) {
++	} else if (vif->valid_links) {
++		ret = ath12k_validate_arvif(arvif);
++		if (ret) {
+ 			mutex_unlock(&ah->conf_mutex);
+-			return -EINVAL;
++			return ret;
+ 		}
++		ar = arvif->ar;
+  	}  else {
+ 		ar = ath12k_get_ar_by_ctx(hw, ctx);
+ 		if (!ar) {
+@@ -13533,32 +13578,14 @@ ath12k_mac_op_assign_vif_chanctx(struct
+ 		 * before creating vdev for new connection
+ 		 */
+ 		if (ar != arvif->ar || (arvif->is_scan_vif)) {
+-			if (!(arvif->is_scan_vif) && WARN_ON(arvif->is_started)) {
++			ret = ath12k_validate_arvif(arvif);
++			if (ret) {
+ 				mutex_unlock(&ah->conf_mutex);
+-				return -EBUSY;
++				return ret;
+ 			}
+ 
+ 			arvif_ar = arvif->ar;
+-			if (!arvif_ar) {
+-				mutex_unlock(&ah->conf_mutex);
+-				ath12k_warn(NULL, "arvif_ar not found\n");
+-				return -EINVAL;
+-			}
+-
+ 			mutex_lock(&arvif_ar->conf_mutex);
+-			if (arvif->is_scan_vif && arvif->is_started) {
+-				ret = ath12k_mac_vdev_stop(arvif);
+-				if (ret) {
+-					mutex_unlock(&arvif_ar->conf_mutex);
+-					mutex_unlock(&ah->conf_mutex);
+-					ath12k_warn(arvif_ar->ab, "failed to stop vdev %d: %d\n",
+-						    arvif->vdev_id, ret);
+-					return -EINVAL;
+-				}
+-				arvif->is_started = false;
+-				arvif->is_scan_vif = false;
+-			}
+-
+ 			ret = ath12k_mac_vdev_delete(arvif_ar, arvif);
+ 			mutex_unlock(&arvif_ar->conf_mutex);
+ 			if (ret)
+@@ -15791,14 +15818,15 @@ static int ath12k_mac_op_remain_on_chann
+ 	if (!arvif->is_started && ahvif->vdev_type == WMI_VDEV_TYPE_STA) {
+ 		chandef.chan = chan;
+ 		chandef.center_freq1 = chan->center_freq;
++		arvif->is_scan_vif = true;
+ 		ret = ath12k_mac_vdev_start(arvif, &chandef, 0);
+ 		if (ret) {
++			arvif->is_scan_vif = false;
+ 			mutex_unlock(&ah->conf_mutex);
+ 			ath12k_err(ar->ab, "vdev start failed sta roc\n");
+ 			return -EINVAL;
+ 		}
+ 		arvif->is_started = true;
+-		arvif->is_scan_vif = true;
+ 	}
+ 
+ 	mutex_unlock(&ah->conf_mutex);
+@@ -15831,11 +15859,7 @@ static int ath12k_mac_op_remain_on_chann
+ 		return ret;
+ 	}
+ 
+-	if (duration <= 0)
+-		scan_time_msec = ah->hw->wiphy->max_remain_on_channel_duration * 2;
+-	else
+-		scan_time_msec = duration;
+-
++	scan_time_msec = ah->hw->wiphy->max_remain_on_channel_duration * 2;
+ 	ath12k_wmi_start_scan_init(ar, &arg);
+ 
+ 	arg.num_chan = 1;
+@@ -15849,7 +15873,7 @@ static int ath12k_mac_op_remain_on_chann
+ 	arg.chan_list[0] = chan->center_freq;
+ 
+ 	arg.vdev_id = arvif->vdev_id;
+-	arg.scan_id = ATH12K_SCAN_ID;
++	arg.scan_id = ATH12K_ROC_SCAN_ID;
+ 	arg.dwell_time_active = scan_time_msec;
+ 	arg.dwell_time_passive = scan_time_msec;
+ 	arg.max_scan_time = scan_time_msec;
+@@ -15874,6 +15898,7 @@ static int ath12k_mac_op_remain_on_chann
+ 		goto exit;
+ 	}
+ 
++	ar->scan.no_of_active_scans++;
+ 	ret = wait_for_completion_timeout(&ar->scan.on_channel, 3 * HZ);
+ 	if (ret == 0) {
+ 		ath12k_warn(ar->ab, "failed to switch to channel for roc scan\n");
+@@ -15885,7 +15910,7 @@ static int ath12k_mac_op_remain_on_chann
+ 	}
+ 
+ 	ieee80211_queue_delayed_work(ah->hw, &ar->scan.timeout,
+-				     msecs_to_jiffies(duration +
++				     msecs_to_jiffies(scan_time_msec +
+ 						      ATH12K_MAC_SCAN_TIMEOUT_MSECS));
+ 
+ 	ret = 0;
+@@ -17331,6 +17356,7 @@ static int ath12k_mac_setup(struct ath12
+ 	INIT_DELAYED_WORK(&ar->scan.timeout, ath12k_scan_timeout_work);
+ 	INIT_WORK(&ar->scan.vdev_del_wk, ath12k_scan_vdev_del_work);
+ 	ar->scan.vdev_id = -1;
++	ar->scan.no_of_active_scans = 0;
+ 	INIT_WORK(&ar->regd_update_work, ath12k_regd_update_work);
+ 	INIT_WORK(&ar->agile_cac_abort_wq, ath12k_agile_cac_abort_work);
+ 
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -8056,7 +8056,7 @@ static void ath12k_wmi_event_scan_comple
+ 	}
+ }
+ 
+-static void ath12k_wmi_event_scan_bss_chan(struct ath12k *ar)
++static void ath12k_wmi_event_scan_bss_chan(struct ath12k *ar, u32 freq, u32 scan_id)
+ {
+ 	lockdep_assert_held(&ar->data_lock);
+ 
+@@ -8069,7 +8069,20 @@ static void ath12k_wmi_event_scan_bss_ch
+ 		break;
+ 	case ATH12K_SCAN_RUNNING:
+ 	case ATH12K_SCAN_ABORTING:
+-		ar->scan_channel = NULL;
++		/*In order to support off channel tx/rx along with off channel scan,
++		 * scan vdev is created and started to do the tx. once we start the scan
++		 * driver will send the ROC scan request to FW. Due to this, the first scan
++		 * request is not treated as off channel scan in FW. So it sends bss scan event
++		 * instead of foreign channel scan
++		 */
++		if (scan_id ==  ATH12K_ROC_SCAN_ID) {
++			ar->scan_channel = ieee80211_get_channel(ar->ah->hw->wiphy,
++								 freq);
++			if (ar->scan.is_roc && ar->scan.roc_freq == freq)
++				complete(&ar->scan.on_channel);
++		} else {
++			ar->scan_channel = NULL;
++		}
+ 		break;
+ 	}
+ }
+@@ -12017,7 +12030,8 @@ static void ath12k_scan_event(struct ath
+ 		ath12k_wmi_event_scan_completed(ar);
+ 		break;
+ 	case WMI_SCAN_EVENT_BSS_CHANNEL:
+-		ath12k_wmi_event_scan_bss_chan(ar);
++		ath12k_wmi_event_scan_bss_chan(ar, le32_to_cpu(scan_ev.channel_freq),
++					       le32_to_cpu(scan_ev.scan_id));
+ 		break;
+ 	case WMI_SCAN_EVENT_FOREIGN_CHAN:
+ 		ath12k_wmi_event_scan_foreign_chan(ar, le32_to_cpu(scan_ev.channel_freq));
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -4170,6 +4170,7 @@ struct wmi_start_scan_arg {
+  * is trigger by HOST
+  */
+ #define ATH12K_SCAN_ID          0xA000
++#define ATH12K_ROC_SCAN_ID      0xA001
+ 
+ enum scan_cancel_req_type {
+ 	WLAN_SCAN_CANCEL_SINGLE = 1,

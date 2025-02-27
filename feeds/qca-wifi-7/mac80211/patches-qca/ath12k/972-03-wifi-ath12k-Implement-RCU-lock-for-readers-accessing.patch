@@ -1,0 +1,296 @@
+From 67af3282937ee262cd6c34272f75938b684e0089 Mon Sep 17 00:00:00 2001
+From: Sidhanta Sahu <quic_sidhanta@quicinc.com>
+Date: Tue, 13 Aug 2024 15:24:05 -0700
+Subject: [PATCH] wifi: ath12k: Implement RCU lock for readers accessing ahvif
+ link
+
+Replace the existing for_each_set_bit loop with a new
+`for_each_vif_active_link` where an active link is expected that uses an
+RCU lock. And `for_each_ahvif_link` where a valid arvif is expected.
+
+Improves synchronization and safety when traversing through the links of
+ahvif (vif).
+
+Patch-Dependency: 972-01-wifi-ath12k-Introduce-RCU-Protection-to-safeguard-ar.patch
+Patch-Work: None
+
+Signed-off-by: Sidhanta Sahu <quic_sidhanta@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/accel_cfg.c |  5 +-
+ drivers/net/wireless/ath/ath12k/debug.c     |  7 ++-
+ drivers/net/wireless/ath/ath12k/debugfs.c   | 13 ++---
+ drivers/net/wireless/ath/ath12k/fse.c       |  7 ++-
+ drivers/net/wireless/ath/ath12k/mac.c       | 58 ++++++++-------------
+ 5 files changed, 38 insertions(+), 52 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/debug.c
++++ b/drivers/net/wireless/ath/ath12k/debug.c
+@@ -44,15 +44,14 @@ void ath12k_debug_get_et_stats(struct ie
+ 	struct ath12k_link_vif *arvif;
+ 	u32 tx_errors = 0, rx_errors = 0, tx_dropped = 0, rx_dropped = 0;
+ 
+-	for_each_set_bit(link_id, &ahvif->links_map, ATH12K_NUM_MAX_LINKS) {
+-		arvif = ahvif->link[link_id];
+-		if (!arvif)
+-			continue;
++	rcu_read_lock();
++	for_each_ahvif_link(ahvif, arvif, link_id) {
+ 		tx_errors += arvif->link_stats.tx_errors;
+ 		rx_errors += arvif->link_stats.rx_errors;
+ 		tx_dropped += arvif->link_stats.tx_dropped;
+ 		rx_dropped += arvif->link_stats.rx_dropped;
+ 	}
++	rcu_read_unlock();
+ 
+ 	data[i++] = tx_errors;
+ 	data[i++] = rx_errors;
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -6015,6 +6015,7 @@ static const struct file_operations ath1
+ static int ath12k_open_link_stats(struct inode *inode, struct file *file)
+ {
+ 	struct ath12k_vif *ahvif = inode->i_private;
++	struct ath12k_link_vif *arvif;
+ 	struct ath12k_hw *ah;
+ 	struct host_link_stats *linkstat = NULL;
+ 	size_t len = 0, buf_len = PAGE_SIZE * 2;
+@@ -6031,16 +6032,12 @@ static int ath12k_open_link_stats(struct
+ 
+ 	file->private_data = buf;
+ 
+-	mutex_lock(&ah->conf_mutex);
+-	for_each_set_bit(link_id, &ahvif->links_map,
+-			 ATH12K_NUM_MAX_LINKS) {
++	rcu_read_lock();
++	for_each_ahvif_link(ahvif, arvif, link_id) {
+ 		if (link_id == ATH12K_DEFAULT_SCAN_LINK)
+ 			continue;
+ 
+-		if (ahvif->link[link_id])
+-			linkstat = &ahvif->link[link_id]->link_stats;
+-		else
+-			break;
++		linkstat = &arvif->link_stats;
+ 
+ 		len += scnprintf(buf + len, buf_len - len,
+ 				 "link[%d] tx_enqueued  = %d\n",
+@@ -6083,7 +6080,7 @@ static int ath12k_open_link_stats(struct
+ 		len += scnprintf(buf + len, buf_len - len,
+ 				"------------------------------------------------------\n");
+ 	}
+-	mutex_unlock(&ah->conf_mutex);
++	rcu_read_unlock();
+ 	return 0;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/fse.c
++++ b/drivers/net/wireless/ath/ath12k/fse.c
+@@ -64,11 +64,8 @@ void *ath12k_fse_get_ab_from_netdev(stru
+ 
+ 	ahvif = ath12k_vif_to_ahvif(vif);
+ 
+-	for_each_set_bit(link_id, &ahvif->links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
+-		arvif = ahvif->link[link_id];
+-
+-		if (!arvif)
+-			continue;
++	rcu_read_lock();
++	for_each_ahvif_mld_active_link(ahvif, ahvif->ah, arvif, link_id) {
+ 		ar = arvif->ar;
+ 		if (!ar)
+ 			continue;
+@@ -77,8 +74,9 @@ void *ath12k_fse_get_ab_from_netdev(stru
+ 		peer = ath12k_peer_find_by_addr(ab, peer_mac);
+ 		spin_unlock_bh(&ab->base_lock);
+ 		if (peer)
+-			return ab;
++			break;
+ 	}
++	rcu_read_unlock();
+ 	return ab;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -5497,10 +5497,11 @@ static void ath12k_mac_op_vif_cfg_change
+ 					  u64 changed)
+ {
+ 	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
++	struct ath12k_hw *ah = ahvif->ah;
+ 	struct ath12k_link_vif *arvif;
+ 	struct ath12k *ar;
+ 	unsigned long link_id;
+-	struct ieee80211_bss_conf *info;
++	struct ieee80211_bss_conf *link_conf;
+ 
+ 	if (changed & BSS_CHANGED_SSID &&
+ 	    vif->type == NL80211_IFTYPE_AP) {
+@@ -5509,27 +5510,23 @@ static void ath12k_mac_op_vif_cfg_change
+ 			memcpy(ahvif->u.ap.ssid, vif->cfg.ssid, vif->cfg.ssid_len);
+ 	}
+ 
+-	link_id = ahvif->deflink.link_id;
+-
++	mutex_lock(&ah->conf_mutex);
+ 	if (changed & BSS_CHANGED_ASSOC) {
+-		for_each_set_bit(link_id, &ahvif->links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
+-			arvif = ahvif->link[link_id];
+-			if (!arvif)
+-				continue;
+-
++		for_each_ahvif_mld_link_protected(ahvif, ah, arvif, link_id) {
+ 			if (!arvif->is_started)
+ 				continue;
+ 
+-			info = vif->link_conf[link_id];
++			link_conf = vif->link_conf[link_id];
+ 			ar = arvif->ar;
+ 			if (vif->cfg.assoc) {
+-				if (info)
+-					ath12k_bss_assoc(ar, arvif, info);
++				if (link_conf)
++					ath12k_bss_assoc(ar, arvif, link_conf);
+ 			} else {
+ 				ath12k_bss_disassoc(ar, arvif, false);
+ 			}
+ 		}
+ 	}
++	mutex_unlock(&ah->conf_mutex);
+ }
+ 
+ static void ath12k_mac_op_bss_info_changed(struct ieee80211_hw *hw,
+@@ -8817,10 +8814,9 @@ int ath12k_mac_update_sta_state(struct i
+ 		/* add case to prevent MLO assoc from happening when UMAC recovery
+ 		 * happens
+ 		 */
+-		for_each_set_bit(link, &ahvif->links_map, ATH12K_NUM_MAX_LINKS) {
+-			arvif = ahvif->link[link];
++		for_each_ahvif_link_protected(ahvif, ah, arvif, link) {
+ 
+-			if (!arvif || !arvif->ar ||
++			if (!arvif->ar ||
+ 			    (test_bit(ATH12K_FLAG_UMAC_RECOVERY_START,
+ 				      &arvif->ar->ab->dev_flags))){
+ 				ret = -EINVAL;
+@@ -10793,6 +10789,7 @@ static void ath12k_mac_op_tx(struct ieee
+ 	struct ieee80211_sta *sta = NULL;
+ 	struct ath12k_peer *peer;
+ 	struct ieee80211_mgmt *mgmt;
++	struct ieee80211_bss_conf *link_conf;
+ 	u32 info_flags;
+ 	bool is_prb_rsp;
+ 	bool is_mcast = false, is_eth = false;
+@@ -10979,9 +10976,9 @@ static void ath12k_mac_op_tx(struct ieee
+ 			ahvif->mcbc_gsn = 0;
+ 		spin_unlock(&ahvif->mcbc_gsn_lock);
+ 
+-		for_each_set_bit(link_id, &ahvif->links_map,
+-				 IEEE80211_MLD_MAX_NUM_LINKS) {
+-			tmp_arvif = ahvif->link[link_id];
++		rcu_read_lock();
++		for_each_vif_active_link(vif, link_conf, link_id) {
++			tmp_arvif = rcu_dereference(ahvif->link[link_id]);
+ 			if (!(tmp_arvif && tmp_arvif->is_up))
+ 				continue;
+ 
+@@ -11058,6 +11055,7 @@ skip_peer_find:
+ 				ieee80211_free_txskb(ah->hw, msdu_copied);
+ 			}
+ 		}
++		rcu_read_unlock();
+ 		ieee80211_free_txskb(ah->hw, skb);
+ 	}
+ 
+@@ -12776,14 +12774,8 @@ static void ath12k_mac_op_remove_interfa
+ 		vlan_master_ahvif = ahvif;
+ 	}
+ 
+-	for_each_set_bit(link_id, &vlan_master_ahvif->links_map, ATH12K_NUM_MAX_LINKS) {
+-		arvif = vlan_master_ahvif->link[link_id];
+-
+-		if (!arvif)
+-			continue;
+-
++	for_each_ahvif_link_protected(vlan_master_ahvif, ah, arvif, link_id) {
+ 		ar = arvif->ar;
+-
+ 		if (!ar)
+ 			continue;
+ 
+@@ -13135,15 +13127,10 @@ ath12k_mac_mlo_get_vdev_args(struct ath1
+ 
+ 	partner_info = ml_arg->partner_info;
+ 
+-	for_each_set_bit(link_id, &ahvif->links_map, ATH12K_NUM_MAX_LINKS) {
++	for_each_ahvif_link(ahvif, arvif_p, link_id) {
+ 		if (link_id == ATH12K_DEFAULT_SCAN_LINK)
+ 			continue;
+ 
+-		arvif_p = ahvif->link[link_id];
+-
+-		if (WARN_ON(arvif_p == NULL))
+-			continue;
+-
+ 		if (arvif == arvif_p)
+ 			continue;
+ 
+@@ -13627,15 +13614,10 @@ ath12k_mac_change_chanctx_cnt_iter(void
+ 	lockdep_assert_held(&ah->conf_mutex);
+ 	lockdep_assert_held(&arg->ar->conf_mutex);
+ 
+-	for_each_set_bit(link_id, &ahvif->links_map, ATH12K_NUM_MAX_LINKS) {
++	for_each_ahvif_link_protected(ahvif, ah, arvif, link_id) {
+ 		if (link_id == ATH12K_DEFAULT_SCAN_LINK)
+ 			continue;
+ 
+-		arvif = ahvif->link[link_id];
+- 
+-		if (WARN_ON(arvif == NULL))
+-			continue;
+-
+ 		if (!ath12k_mac_is_bridge_vdev(arvif)) {
+ 			link_conf = ath12k_get_link_bss_conf(arvif);
+ 
+@@ -13677,15 +13659,10 @@ ath12k_mac_change_chanctx_fill_iter(void
+ 
+ 	lockdep_assert_held(&ah->conf_mutex);
+ 
+-	for_each_set_bit(link_id, &ahvif->links_map, ATH12K_NUM_MAX_LINKS) {
++	for_each_ahvif_link_protected(ahvif, ah, arvif, link_id) {
+ 		if (link_id == ATH12K_DEFAULT_SCAN_LINK)
+ 			continue;
+ 
+-		arvif = ahvif->link[link_id];
+-
+-		if (WARN_ON(arvif == NULL))
+-			continue;
+-
+ 		if (!ath12k_mac_is_bridge_vdev(arvif)) {
+ 			link_conf = ath12k_get_link_bss_conf(arvif);
+ 
+@@ -16060,10 +16037,11 @@ static void ath12k_mac_op_flush(struct i
+ 				u32 queues, bool drop)
+ {
+ 	struct ath12k_hw *ah = hw->priv;
+-	struct ath12k *ar;
++	struct ath12k_link_vif *arvif;
+ 	struct ath12k_vif *ahvif;
+-	int i;
++	struct ath12k *ar;
+ 	u8 link_id;
++	int i;
+ 
+ 	if (drop)
+ 		return;
+@@ -16097,10 +16075,7 @@ static void ath12k_mac_op_flush(struct i
+ 	} else {
+ 		ahvif = (void *)vif->drv_priv;
+ 
+-		for_each_set_bit(link_id, &ahvif->links_map, ATH12K_NUM_MAX_LINKS) {
+-			if (!ahvif->link[link_id])
+-				continue;
+-
++		for_each_ahvif_link_protected(ahvif, ah, arvif, link_id) {
+ 			ar = ath12k_get_ar_by_vif(hw, vif, link_id);
+ 			if (!ar) {
+ 				ath12k_err(NULL,

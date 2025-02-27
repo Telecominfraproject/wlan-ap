@@ -1,0 +1,410 @@
+From dfc43242104c35e6057b239488258f1fb391e941 Mon Sep 17 00:00:00 2001
+From: Avula Sri Charan <quic_asrichar@quicinc.com>
+Date: Tue, 23 Apr 2024 12:02:32 +0530
+Subject: wifi: ath12k: Enable umac reset for IPQ5332
+
+Adding support to parse the dts for IPQ5332 umac_reset interrupt line
+and enabling it.
+
+In current implementation entire ring mask is being set to 0 during
+umac reset to avoid processing dp interrupts, instead of that
+disabling the dp interrupts during pre_reset_start state and then
+enabling them back after post_reset_complete of umac reset.
+
+As the umac reset will take place in atomic context bypassing
+napi_sync by checking on the flag ATH12K_FLAG_UMAC_PRERESET_START
+to avoid sleep from atmoic context issue.
+
+Patch-depdendency: 800-wifi-ath12k-Add-UMAC-DP-reset-support.patch
+
+Signed-off-by: Avula Sri Charan <quic_asrichar@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/ahb.c        | 41 ++++++++++++-
+ drivers/net/wireless/ath/ath12k/core.h       |  4 +-
+ drivers/net/wireless/ath/ath12k/dp.c         |  8 +--
+ drivers/net/wireless/ath/ath12k/hw.c         | 63 +-------------------
+ drivers/net/wireless/ath/ath12k/pci.c        | 37 ++----------
+ drivers/net/wireless/ath/ath12k/pci.h        |  2 +
+ drivers/net/wireless/ath/ath12k/pcic.c       | 15 ++++-
+ drivers/net/wireless/ath/ath12k/pcic.h       | 12 +++-
+ drivers/net/wireless/ath/ath12k/umac_reset.c | 23 ++++++-
+ 9 files changed, 99 insertions(+), 106 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -86,6 +86,7 @@ static const char *irq_name[ATH12K_IRQ_N
+ 	"wbm2host-tx-completions-ring2",
+ 	"wbm2host-tx-completions-ring1",
+ 	"tcl2host-status-ring",
++	"umac_reset"
+ };
+ 
+ /* enum ext_irq_num - irq numbers that can be used by external modules
+@@ -129,6 +130,7 @@ enum ext_irq_num {
+ 	wbm2host_tx_completions_ring2,
+ 	wbm2host_tx_completions_ring1,
+ 	tcl2host_status_ring,
++	umac_reset,
+ };
+ 
+ static inline u32 ath12k_ahb_pmm_read32(struct ath12k_base *ab, u32 offset)
+@@ -216,6 +218,10 @@ static void __ath12k_ahb_ext_irq_disable
+ 		struct ath12k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
+ 
+ 		ath12k_ahb_ext_grp_disable(irq_grp);
++
++		if (test_bit(ATH12K_FLAG_UMAC_PRERESET_START, &ab->dev_flags))
++			continue;
++
+ 		if (irq_grp->napi_enabled) {
+ 			napi_synchronize(&irq_grp->napi);
+ 			napi_disable(&irq_grp->napi);
+@@ -366,7 +372,9 @@ static void ath12k_ahb_ext_irq_enable(st
+ static void ath12k_ahb_ext_irq_disable(struct ath12k_base *ab)
+ {
+ 	__ath12k_ahb_ext_irq_disable(ab);
+-	ath12k_ahb_sync_ext_irqs(ab);
++
++	if (!test_bit(ATH12K_FLAG_UMAC_PRERESET_START, &ab->dev_flags))
++		ath12k_ahb_sync_ext_irqs(ab);
+ }
+ 
+ static void ath12k_ahb_stop(struct ath12k_base *ab)
+@@ -563,6 +571,34 @@ static int ath12k_ahb_config_ext_irq(str
+ 			}
+ 		}
+ 	}
++	return 0;
++}
++
++static int ath12k_dp_umac_ahb_config_irq(struct ath12k_base *ab)
++{
++	struct ath12k_dp_umac_reset *umac_reset = &ab->dp_umac_reset;
++	int irq, ret;
++
++	irq = platform_get_irq_byname(ab->pdev, "umac_reset");
++
++	if (irq < 0) {
++		ath12k_err(ab, "umac reset interrupt not found in dts\n");
++		return -ENXIO;
++	}
++
++	umac_reset->irq_num = irq;
++
++	tasklet_setup(&umac_reset->intr_tq, ath12k_umac_reset_tasklet_handler);
++
++	ret = request_irq(irq, ath12k_umac_reset_interrupt_handler,
++			  IRQF_NO_SUSPEND, "umac_dp_reset_ahb", ab);
++
++	if (ret) {
++		ath12k_err(ab, "failed to request irq %d for umac dp reset\n", irq);
++		return ret;
++	}
++
++	disable_irq_nosync(umac_reset->irq_num);
+ 
+ 	return 0;
+ }
+@@ -669,6 +705,9 @@ static const struct ath12k_hif_ops ath12
+ 	.power_up = ath12k_ahb_power_up,
+ 	.ssr_notifier_reg = ath12k_ahb_ssr_notifier_reg,
+ 	.ssr_notifier_unreg = ath12k_ahb_ssr_notifier_unreg,
++	.dp_umac_reset_irq_config = ath12k_dp_umac_ahb_config_irq,
++	.dp_umac_reset_enable_irq = ath12k_pcic_dp_umac_reset_enable_irq,
++	.dp_umac_reset_free_irq = ath12k_dp_umac_reset_free_irq,
+ };
+ 
+ static const struct ath12k_hif_ops ath12k_ahb_hif_ops_qcn6432 = {
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1378,8 +1378,6 @@ struct ath12k_mlo_dp_umac_reset {
+         spinlock_t lock;
+         u8 umac_reset_info;
+         u8 initiator_chip;
+-	u8 is_intr_bkup;
+-	struct ath12k_hw_ring_mask intr_bkup;
+ };
+ 
+ #define ATH12K_UMAC_RESET_IPC	451
+@@ -1807,6 +1805,8 @@ void ath12k_get_svc_int_nd_burst_sz_stat
+ 					  u64 *burst_sz_suc, u64 *burst_sz_fail);
+ #endif /* CPTCFG_ATH12K_SAWF */
+ void ath12k_dp_umac_reset_handle(struct ath12k_base *ab);
++irqreturn_t ath12k_umac_reset_interrupt_handler(int irq, void *arg);
++void ath12k_umac_reset_tasklet_handler(struct tasklet_struct *umac_cntxt);
+ int ath12k_dp_umac_reset_init(struct ath12k_base *ab);
+ void ath12k_dp_umac_reset_deinit(struct ath12k_base *ab);
+ void ath12k_umac_reset_completion(struct ath12k_base *ab);
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -208,15 +208,9 @@ static int ath12k_dp_srng_calculate_msi_
+ 					      enum hal_ring_type type, int ring_num)
+ {
+ 	const u8 *grp_mask;
+-	struct ath12k_hw_group *ag = ab->ag;
+-	struct ath12k_mlo_dp_umac_reset *umac_reset;
+ 	struct ath12k_hw_ring_mask *ring_mask;
+ 
+-	umac_reset = &ag->mlo_umac_reset;
+-	if (ath12k_dp_umac_reset_in_progress(ab) && umac_reset)
+-		ring_mask = &umac_reset->intr_bkup;
+-	else
+-		ring_mask = ab->hw_params->ring_mask;
++	ring_mask = ab->hw_params->ring_mask;
+ 
+ 	switch (type) {
+ 	case HAL_WBM2SW_RELEASE:
+--- a/drivers/net/wireless/ath/ath12k/hw.c
++++ b/drivers/net/wireless/ath/ath12k/hw.c
+@@ -2120,65 +2120,6 @@ static struct ath12k_hw_params ath12k_hw
+ 	},
+ };
+ 
+-void ath12k_dp_reset_interrupt_mask(struct ath12k_base *ab)
+-{
+-	struct ath12k_hw_ring_mask *ring_mask = ab->hw_params->ring_mask;
+-	struct ath12k_hw_group *ag = ab->ag;
+-	struct ath12k_mlo_dp_umac_reset *umac_reset = &ag->mlo_umac_reset;
+-	int i;
+-
+-	if (ag->mlo_umac_reset.is_intr_bkup)
+-		return;
+-
+-	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX(ab); i++) {
+-		umac_reset->intr_bkup.tx[i] = ring_mask->tx[i];
+-
+-		umac_reset->intr_bkup.rx_mon_dest[i] = ring_mask->rx_mon_dest[i];
+-		umac_reset->intr_bkup.rx[i] = ring_mask->rx[i];
+-		umac_reset->intr_bkup.rx_err[i] = ring_mask->rx_err[i];
+-		umac_reset->intr_bkup.rx_wbm_rel[i] = ring_mask->rx_wbm_rel[i];
+-		umac_reset->intr_bkup.reo_status[i] = ring_mask->reo_status[i];
+-		umac_reset->intr_bkup.host2rxdma[i] = ring_mask->host2rxdma[i];
+-		umac_reset->intr_bkup.tx_mon_dest[i] = ring_mask->tx_mon_dest[i];
+-
+-		ring_mask->tx[i] = 0;
+-		ring_mask->rx_mon_dest[i] = 0;
+-		ring_mask->rx[i] = 0;
+-		ring_mask->rx_err[i] = 0;
+-		ring_mask->rx_wbm_rel[i] = 0;
+-		ring_mask->reo_status[i] = 0;
+-		ring_mask->host2rxdma[i] = 0;
+-		ring_mask->tx_mon_dest[i] = 0;
+-	}
+-
+-	ag->mlo_umac_reset.is_intr_bkup = true;
+-}
+-
+-void ath12k_dp_restore_interrupt_mask(struct ath12k_base *ab)
+-{
+-	struct ath12k_hw_ring_mask *ring_mask = ab->hw_params->ring_mask;
+-	struct ath12k_hw_group *ag = ab->ag;
+-	struct ath12k_mlo_dp_umac_reset *umac_reset = &ag->mlo_umac_reset;
+-	int i;
+-
+-	if (!ag->mlo_umac_reset.is_intr_bkup)
+-		return;
+-
+-	for (i = 0; i < ATH12K_EXT_IRQ_GRP_NUM_MAX(ab); i++) {
+-		ring_mask->tx[i] = umac_reset->intr_bkup.tx[i];
+-		ring_mask->rx_mon_dest[i] = umac_reset->intr_bkup.rx_mon_dest[i];
+-		ring_mask->rx[i] = umac_reset->intr_bkup.rx[i];
+-		ring_mask->rx_err[i] = umac_reset->intr_bkup.rx_err[i];
+-		ring_mask->rx_wbm_rel[i] = umac_reset->intr_bkup.rx_wbm_rel[i];
+-		ring_mask->reo_status[i] = umac_reset->intr_bkup.reo_status[i];
+-		ring_mask->host2rxdma[i] = umac_reset->intr_bkup.host2rxdma[i];
+-		ring_mask->tx_mon_dest[i] = umac_reset->intr_bkup.tx_mon_dest[i];
+-	}
+-
+-	ag->mlo_umac_reset.is_intr_bkup = false;
+-
+-}
+-
+ int ath12k_hw_init(struct ath12k_base *ab)
+ {
+ 	const struct ath12k_hw_params *hw_params = NULL;
+--- a/drivers/net/wireless/ath/ath12k/pci.c
++++ b/drivers/net/wireless/ath/ath12k/pci.c
+@@ -327,33 +327,7 @@ int ath12k_pci_get_msi_irq(struct ath12k
+ 	return pci_irq_vector(pci_dev, vector);
+ }
+ 
+-static void ath12k_umac_reset_tasklet_handler(struct tasklet_struct *t)
+-{
+-	struct ath12k_dp_umac_reset *umac_reset = from_tasklet(umac_reset, t, intr_tq);
+-	struct ath12k_base *ab = container_of(umac_reset, struct ath12k_base, dp_umac_reset);
+-
+-	ath12k_dp_umac_reset_handle(ab);
+-	enable_irq(umac_reset->irq_num);
+-}
+-
+-static irqreturn_t ath12k_dp_umac_reset_interrupt_handler(int irq, void *arg)
+-{
+-	struct ath12k_base *ab = arg;
+-	struct ath12k_dp_umac_reset *umac_reset = &ab->dp_umac_reset;
+-
+-	disable_irq_nosync(umac_reset->irq_num);
+-	tasklet_schedule(&umac_reset->intr_tq);
+-	return IRQ_HANDLED;
+-}
+-
+-static void ath12k_dp_umac_reset_enable_irq(struct ath12k_base *ab)
+-{
+-	struct ath12k_dp_umac_reset *umac_reset = &ab->dp_umac_reset;
+-
+-	enable_irq(umac_reset->irq_num);
+-}
+-
+-static int ath12k_dp_umac_pci_config_irq(struct ath12k_base *ab)
++int ath12k_dp_umac_pci_config_irq(struct ath12k_base *ab)
+ {
+         u32 msi_data_start, msi_data_count, msi_irq_start;
+         unsigned int msi_data;
+@@ -366,11 +340,12 @@ static int ath12k_dp_umac_pci_config_irq
+                 return ret;
+ 
+ 	msi_data = (umac_reset->intr_offset % msi_data_count) + msi_irq_start;
+-	irq = ath12k_pci_get_msi_irq(ab, msi_data);
++	irq = ath12k_hif_get_msi_irq(ab, msi_data);
++
+ 	umac_reset->irq_num = irq;
+ 	tasklet_setup(&umac_reset->intr_tq, ath12k_umac_reset_tasklet_handler);
+ 
+-	ret = request_irq(irq, ath12k_dp_umac_reset_interrupt_handler,
++	ret = request_irq(irq, ath12k_umac_reset_interrupt_handler,
+ 			  IRQF_NO_SUSPEND, "umac_dp_reset", ab);
+ 	if (ret) {
+ 		ath12k_err(ab, "failed to request irq for umac dp reset %d\n", ret);
+@@ -382,7 +357,7 @@ static int ath12k_dp_umac_pci_config_irq
+ 	return 0;
+ }
+ 
+-static void ath12k_dp_umac_reset_free_irq(struct ath12k_base *ab)
++void ath12k_dp_umac_reset_free_irq(struct ath12k_base *ab)
+ {
+ 	struct ath12k_dp_umac_reset *umac_reset = &ab->dp_umac_reset;
+ 
+@@ -872,7 +847,7 @@ static const struct ath12k_hif_ops ath12
+ 	.ppeds_irq_disable = ath12k_pci_ppeds_irq_disable,
+ #endif
+ 	.dp_umac_reset_irq_config = ath12k_dp_umac_pci_config_irq,
+-	.dp_umac_reset_enable_irq = ath12k_dp_umac_reset_enable_irq,
++	.dp_umac_reset_enable_irq = ath12k_pcic_dp_umac_reset_enable_irq,
+ 	.dp_umac_reset_free_irq = ath12k_dp_umac_reset_free_irq,
+ 	.get_msi_irq =  ath12k_pci_get_msi_irq,
+ };
+--- a/drivers/net/wireless/ath/ath12k/pci.h
++++ b/drivers/net/wireless/ath/ath12k/pci.h
+@@ -156,4 +156,6 @@ struct pci_dev *ath12k_pci_get_dev_by_ab
+ void ath12k_pci_ppeds_irq_enable(struct ath12k_base *ab, enum ppeds_irq_type type);
+ void ath12k_pci_ppeds_irq_disable(struct ath12k_base *ab, enum ppeds_irq_type type);
+ #endif
++int ath12k_dp_umac_pci_config_irq(struct ath12k_base *ab);
++void ath12k_dp_umac_reset_free_irq(struct ath12k_base *ab);
+ #endif /* ATH12K_PCI_H */
+--- a/drivers/net/wireless/ath/ath12k/pcic.c
++++ b/drivers/net/wireless/ath/ath12k/pcic.c
+@@ -277,6 +277,14 @@ static void __ath12k_pcic_ext_irq_disabl
+ 		struct ath12k_ext_irq_grp *irq_grp = &sc->ext_irq_grp[i];
+ 
+ 		ath12k_pcic_ext_grp_disable(irq_grp);
++
++		/* As Umac reset will happen in atomic context doing napi_synchronize
++		 * will lead to sleep in atmoic context that's why avoiding napi sync
++		 * during umac reset.
++		 */
++		if (test_bit(ATH12K_FLAG_UMAC_PRERESET_START, &sc->dev_flags))
++			continue;
++
+ 		if (irq_grp->napi_enabled) {
+ 			napi_synchronize(&irq_grp->napi);
+ 			napi_disable(&irq_grp->napi);
+@@ -735,7 +743,16 @@ void ath12k_pcic_ext_irq_enable(struct a
+ void ath12k_pcic_ext_irq_disable(struct ath12k_base *ab)
+ {
+ 	__ath12k_pcic_ext_irq_disable(ab);
+-	ath12k_pcic_sync_ext_irqs(ab);
++
++	if (!test_bit(ATH12K_FLAG_UMAC_PRERESET_START, &ab->dev_flags))
++		ath12k_pcic_sync_ext_irqs(ab);
++}
++
++void ath12k_pcic_dp_umac_reset_enable_irq(struct ath12k_base *ab)
++{
++	struct ath12k_dp_umac_reset *umac_reset = &ab->dp_umac_reset;
++
++	enable_irq(umac_reset->irq_num);
+ }
+ 
+ void ath12k_pcic_stop(struct ath12k_base *ab)
+--- a/drivers/net/wireless/ath/ath12k/pcic.h
++++ b/drivers/net/wireless/ath/ath12k/pcic.h
+@@ -67,6 +67,7 @@ void ath12k_pcic_cmem_write32(struct ath
+ u32 ath12k_pcic_cmem_read32(struct ath12k_base *ab, u32 addr);
+ void ath12k_pcic_ext_irq_enable(struct ath12k_base *ab);
+ void ath12k_pcic_ext_irq_disable(struct ath12k_base *ab);
++void ath12k_pcic_dp_umac_reset_enable_irq(struct ath12k_base *ab);
+ u32 ath12k_pcic_get_window_start(struct ath12k_base *ab, u32 offset);
+ void ath12k_pcic_ce_irqs_enable(struct ath12k_base *ab);
+ void ath12k_pcic_ce_irq_disable_sync(struct ath12k_base *ab);
+@@ -79,7 +80,7 @@ int ath12k_pcic_ppeds_register_interrupt
+ void ath12k_pcic_ppeds_free_interrupts(struct ath12k_base *ab);
+ void ath12k_pcic_ppeds_irq_enable(struct ath12k_base *ab, enum ppeds_irq_type type);
+ void ath12k_pcic_ppeds_irq_disable(struct ath12k_base *ab, enum ppeds_irq_type type);
+-int ath12k_pcic_get_msi_data(struct ath12k_base *ab, struct msi_desc *msi_desc, int i);
+ #endif
++int ath12k_pcic_get_msi_data(struct ath12k_base *ab, struct msi_desc *msi_desc, int i);
+ void ath12k_pcic_free_irq(struct ath12k_base *ab);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/umac_reset.c
++++ b/drivers/net/wireless/ath/ath12k/umac_reset.c
+@@ -349,7 +349,7 @@ void ath12k_umac_reset_handle_pre_reset(
+ 	struct ath12k_mlo_dp_umac_reset *mlo_umac_reset = &ag->mlo_umac_reset;
+ 
+ 	set_bit(ATH12K_FLAG_UMAC_PRERESET_START, &ab->dev_flags);
+-	ath12k_dp_reset_interrupt_mask(ab);
++	ath12k_hif_irq_disable(ab);
+ 	atomic_inc(&mlo_umac_reset->response_chip);
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+@@ -375,7 +375,7 @@ void ath12k_umac_reset_handle_post_reset
+ 	clear_bit(ATH12K_FLAG_UMAC_PRERESET_START, &ab->dev_flags);
+ 
+ 	atomic_inc(&mlo_umac_reset->response_chip);
+-	ath12k_dp_restore_interrupt_mask(ab);
++	ath12k_hif_irq_enable(ab);
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ 	if (ab->ppeds_handle) {
+ 		ath12k_dp_ppeds_start(ab);
+@@ -416,6 +416,16 @@ void ath12k_dp_umac_reset_action(struct
+ 	return;
+ }
+ 
++irqreturn_t ath12k_umac_reset_interrupt_handler(int irq, void *arg)
++{
++	struct ath12k_base *ab = arg;
++	struct ath12k_dp_umac_reset *umac_reset = &ab->dp_umac_reset;
++
++	disable_irq_nosync(umac_reset->irq_num);
++	tasklet_schedule(&umac_reset->intr_tq);
++	return IRQ_HANDLED;
++}
++
+ void ath12k_dp_umac_reset_handle(struct ath12k_base *ab)
+ {
+ 	struct ath12k_dp_umac_reset *umac_reset = &ab->dp_umac_reset;
+@@ -477,6 +487,15 @@ void ath12k_dp_umac_reset_handle(struct
+ 	return;
+ }
+ 
++void ath12k_umac_reset_tasklet_handler(struct tasklet_struct *umac_cntxt)
++{
++	struct ath12k_dp_umac_reset *umac_reset = from_tasklet(umac_reset, umac_cntxt, intr_tq);
++	struct ath12k_base *ab = container_of(umac_reset, struct ath12k_base, dp_umac_reset);
++
++	ath12k_dp_umac_reset_handle(ab);
++	enable_irq(umac_reset->irq_num);
++}
++
+ void ath12k_dp_umac_reset_deinit(struct ath12k_base *ab)
+ {
+ 	struct ath12k_dp_umac_reset *umac_reset;

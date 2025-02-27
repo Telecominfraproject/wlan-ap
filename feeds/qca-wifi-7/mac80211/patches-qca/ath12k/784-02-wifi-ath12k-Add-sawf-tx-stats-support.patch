@@ -1,0 +1,473 @@
+From f04a2abadb25d5444650d9b58af8ad758675f705 Mon Sep 17 00:00:00 2001
+From: Nagarajan Maran <quic_nmaran@quicinc.com>
+Date: Tue, 6 Jun 2023 07:21:17 +0530
+Subject: [PATCH] wifi: ath12k: Add sawf tx stats support
+
+Add support to calculate the SAWF TX stats for SAWF packets.
+
+Signed-off-by: Nagarajan Maran <quic_nmaran@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_tx.c |  35 +++++++-
+ drivers/net/wireless/ath/ath12k/peer.h  |   1 +
+ drivers/net/wireless/ath/ath12k/sawf.c  | 112 ++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/sawf.h  |  74 ++++++++++++++++
+ 4 files changed, 219 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -276,6 +276,9 @@ int ath12k_dp_tx_direct(struct ath12k_li
+ 	struct hal_tcl_data_cmd tcl_desc;
+ 	u8 hal_ring_id, ring_id;
+ 	dma_addr_t paddr;
++#ifdef CPTCFG_ATH12K_SAWF
++	struct ath12k_peer *peer;
++#endif
+ 	int ret;
+ 	int len = skb->fast_xmit ? 256 : skb->len;
+ 
+@@ -348,7 +351,7 @@ int ath12k_dp_tx_direct(struct ath12k_li
+ #ifdef CPTCFG_ATH12K_SAWF
+ 	/* SAWF */
+ 	if (u32_get_bits(skb->mark, SAWF_TAG_ID) == SAWF_VALID_TAG) {
+-		u32 msduq_id    = u32_get_bits(skb->mark, SAWF_MSDUQ_ID);
++		u32 msduq_id = u32_get_bits(skb->mark, SAWF_MSDUQ_ID);
+ 
+ 		if (msduq_id < (ab->max_msduq_per_tid * ATH12K_SAWF_MAX_TID_SUPPORT)) {
+ 			u32 meta_data_flags;
+@@ -358,6 +361,19 @@ int ath12k_dp_tx_direct(struct ath12k_li
+ 			tcl_desc.info1 = u32_encode_bits(meta_data_flags,
+ 							 HAL_TCL_DATA_CMD_INFO1_CMD_NUM);
+ 		}
++
++		if (unlikely(ath12k_debugfs_is_sawf_stats_enabled(ar) & ATH12K_SAWF_STATS_BASIC)) {
++			u16 peer_id = u32_get_bits(skb->mark, SAWF_PEER_ID);
++			u32 len = skb_headlen(skb);
++			spin_lock_bh(&ab->base_lock);
++			peer = ath12k_peer_find_by_id(ab, peer_id);
++			if (unlikely(!peer || !peer->sta))
++				ath12k_dbg(ab, ATH12K_DBG_SAWF,
++					   "peer_id %u not found \n", peer_id);
++			else
++				ath12k_sawf_tx_enqueue_peer_stats(ab, peer, msduq_id, len);
++			spin_unlock_bh(&ab->base_lock);
++		}
+ 	}
+ #endif
+ 	memcpy(hal_tcl_desc, &tcl_desc, sizeof(tcl_desc));
+@@ -455,7 +471,7 @@ int ath12k_dp_tx(struct ath12k *ar, stru
+ 	 */
+ #ifdef CPTCFG_ATH12K_SAWF
+ 	if (u32_get_bits(skb->mark, SAWF_TAG_ID) == SAWF_VALID_TAG) {
+-		u32 msduq_id    = u32_get_bits(skb->mark, SAWF_MSDUQ_ID);
++		u32 msduq_id = u32_get_bits(skb->mark, SAWF_MSDUQ_ID);
+ 		if (msduq_id < (ab->max_msduq_per_tid * ATH12K_SAWF_MAX_TID_SUPPORT)) {
+ 			ti.meta_data_flags =
+ 				ath12k_sawf_get_tcl_metadata_update(skb->mark);
+@@ -645,12 +661,23 @@ int ath12k_dp_tx(struct ath12k *ar, stru
+ #ifdef CPTCFG_ATH12K_SAWF
+ 	/* SAWF */
+ 	if (u32_get_bits(skb->mark, SAWF_TAG_ID) == SAWF_VALID_TAG) {
+-		u32 msduq_id    = u32_get_bits(skb->mark, SAWF_MSDUQ_ID);
++		u32 msduq_id = u32_get_bits(skb->mark, SAWF_MSDUQ_ID);
+ 
+ 		if (msduq_id < (ab->max_msduq_per_tid * ATH12K_SAWF_MAX_TID_SUPPORT)) {
+ 			tcl_cmd->info3 |=
+ 				ath12k_sawf_get_tcl_cmd_info3_update(msduq_id);
+ 		}
++		if (unlikely(ath12k_debugfs_is_sawf_stats_enabled(ar) & ATH12K_SAWF_STATS_BASIC)) {
++			peer_id = u32_get_bits(skb->mark, SAWF_PEER_ID);
++			spin_lock_bh(&ab->base_lock);
++			peer = ath12k_peer_find_by_id(ab, peer_id);
++			if (unlikely(!peer || !peer->sta))
++				ath12k_dbg(ab, ATH12K_DBG_SAWF,
++					   "peer_id %u not found\n", peer_id);
++			else
++				ath12k_sawf_tx_enqueue_peer_stats(ab, peer, msduq_id, ti.data_len);
++			spin_unlock_bh(&ab->base_lock);
++		}
+ 	}
+ #endif /* CPTCFG_ATH12K_SAWF */
+ 
+@@ -726,19 +753,52 @@ static void ath12k_dp_tx_free_txbuf(stru
+ 	ath12k_dp_tx_decrement(ab->pdevs[mac_id].ar);
+ }
+ 
++static inline void ath12k_dp_tx_status_parse(struct ath12k_base *ab,
++                                             struct hal_wbm_completion_ring_tx *desc,
++                                             struct hal_tx_status *ts)
++{
++	ts->buf_rel_source =
++		FIELD_GET(HAL_WBM_COMPL_TX_INFO0_REL_SRC_MODULE, desc->info0);
++	if (ts->buf_rel_source != HAL_WBM_REL_SRC_MODULE_FW &&
++	    ts->buf_rel_source != HAL_WBM_REL_SRC_MODULE_TQM)
++		return;
++
++	if (ts->buf_rel_source == HAL_WBM_REL_SRC_MODULE_FW)
++		return;
++
++	ts->status = FIELD_GET(HAL_WBM_COMPL_TX_INFO0_TQM_RELEASE_REASON,
++			       desc->info0);
++	ts->ppdu_id = FIELD_GET(HAL_WBM_COMPL_TX_INFO1_TQM_STATUS_NUMBER,
++				desc->info1);
++	ts->ack_rssi = FIELD_GET(HAL_WBM_COMPL_TX_INFO2_ACK_FRAME_RSSI,
++				 desc->info2);
++	if (desc->rate_stats.info0 & HAL_TX_RATE_STATS_INFO0_VALID)
++		ts->rate_stats = desc->rate_stats.info0;
++	else
++		ts->rate_stats = 0;
++	ts->tid = FIELD_GET(HAL_WBM_RELEASE_TX_INFO3_TID, desc->info3);
++
++	ts->peer_id = FIELD_GET(HAL_WBM_RELEASE_TX_INFO3_PEER_ID, desc->info3);
++	ts->flags = FIELD_GET(HAL_WBM_RELEASE_TX_INFO2_FIRST_MSDU, desc->info2) |
++		    FIELD_GET(HAL_WBM_RELEASE_TX_INFO2_LAST_MSDU, desc->info2);
++}
++
+ static void
+ ath12k_dp_tx_htt_tx_complete_buf(struct ath12k_base *ab,
+ 				 struct sk_buff *msdu,
+ 				 struct dp_tx_ring *tx_ring,
+ 				 struct ath12k_dp_htt_wbm_tx_status *ts,
+-				 struct sk_buff *skb_ext_desc, u8 mac_id)
++				 struct sk_buff *skb_ext_desc, u8 mac_id,
++				 void *desc)
+ {
+ 	struct ieee80211_tx_info *info;
+ 	struct ath12k_skb_cb *skb_cb;
+ 	struct ath12k *ar;
+ 	struct ieee80211_vif *vif;
+-	unsigned long attrs = 0;
+ 	struct ath12k_vif *ahvif;
++	struct ath12k_peer *peer;
++	struct hal_tx_status ts_status = { 0 };
++	unsigned long attrs = 0;
+ 	u8 flags = 0;
+ 	bool drop_disable = false;
+ 
+@@ -827,6 +887,19 @@ ath12k_dp_tx_htt_tx_complete_buf(struct
+ 		}
+ 	}
+ 
++	if (unlikely(ath12k_debugfs_is_sawf_stats_enabled(ar))) {
++		spin_lock_bh(&ab->base_lock);
++		ath12k_dp_tx_status_parse(ab, desc, &ts_status);
++		peer = ath12k_peer_find_by_id(ab, ts_status.peer_id);
++		if (unlikely(!peer || !peer->sta))
++			ath12k_dbg(ab, ATH12K_DBG_DATA,
++				   "dp_tx: failed to find the peer with peer_id %d\n",
++				   ts_status.peer_id);
++		else
++			ath12k_sawf_stats_update(ar, msdu, &ts, peer);
++		spin_unlock_bh(&ab->base_lock);
++	}
++
+ 	if ((!flags & ATH12K_SKB_HW_80211_ENCAP))
+ 		ieee80211_tx_status_8023(ar->ah->hw, vif, msdu);
+ 	else
+@@ -858,7 +931,7 @@ ath12k_dp_tx_process_htt_tx_complete(str
+ 		ts.acked = (htt_status == HAL_WBM_REL_HTT_TX_COMP_STATUS_OK);
+ 		ts.ack_rssi = le32_get_bits(status_desc->info2,
+ 					    HTT_TX_WBM_COMP_INFO2_ACK_RSSI);
+-		ath12k_dp_tx_htt_tx_complete_buf(ab, msdu, tx_ring, &ts, skb_ext_desc, mac_id);
++		ath12k_dp_tx_htt_tx_complete_buf(ab, msdu, tx_ring, &ts, skb_ext_desc, mac_id, desc);
+ 
+ 		break;
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_REINJ:
+@@ -1005,36 +1078,6 @@ err_out:
+ 	spin_unlock_bh(&ab->base_lock);
+ }
+ 
+-static inline void ath12k_dp_tx_status_parse(struct ath12k_base *ab,
+-					     struct hal_wbm_completion_ring_tx *desc,
+-					     struct hal_tx_status *ts)
+-{
+-	ts->buf_rel_source =
+-		FIELD_GET(HAL_WBM_COMPL_TX_INFO0_REL_SRC_MODULE, desc->info0);
+-	if (ts->buf_rel_source != HAL_WBM_REL_SRC_MODULE_FW &&
+-	    ts->buf_rel_source != HAL_WBM_REL_SRC_MODULE_TQM)
+-		return;
+-
+-	if (ts->buf_rel_source == HAL_WBM_REL_SRC_MODULE_FW)
+-		return;
+-
+-	ts->status = FIELD_GET(HAL_WBM_COMPL_TX_INFO0_TQM_RELEASE_REASON,
+-			       desc->info0);
+-	ts->ppdu_id = FIELD_GET(HAL_WBM_COMPL_TX_INFO1_TQM_STATUS_NUMBER,
+-				desc->info1);
+-	ts->ack_rssi = FIELD_GET(HAL_WBM_COMPL_TX_INFO2_ACK_FRAME_RSSI,
+-				 desc->info2);
+-	if (desc->rate_stats.info0 & HAL_TX_RATE_STATS_INFO0_VALID)
+-		ts->rate_stats = desc->rate_stats.info0;
+-	else
+-		ts->rate_stats = 0;
+-	ts->tid = FIELD_GET(HAL_WBM_RELEASE_TX_INFO3_TID, desc->info3);
+-
+-	ts->peer_id = FIELD_GET(HAL_WBM_RELEASE_TX_INFO3_PEER_ID, desc->info3);
+-	ts->flags = FIELD_GET(HAL_WBM_RELEASE_TX_INFO2_FIRST_MSDU, desc->info2) |
+-		    FIELD_GET(HAL_WBM_RELEASE_TX_INFO2_LAST_MSDU, desc->info2);
+-}
+-
+ static void ath12k_dp_tx_complete_msdu(struct ath12k *ar,
+ 				       struct sk_buff *msdu,
+ 				       struct hal_wbm_release_ring *tx_status,
+@@ -1117,6 +1160,17 @@ static void ath12k_dp_tx_complete_msdu(s
+ 		case HAL_WBM_TQM_REL_REASON_DROP_THRESHOLD:
+ 		case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_AGED_FRAMES:
+ 		case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_TX:
++			if (unlikely(ath12k_debugfs_is_sawf_stats_enabled(ar))) {
++				spin_lock_bh(&ab->base_lock);
++				peer = ath12k_peer_find_by_id(ab, ts.peer_id);
++				if (unlikely(!peer || !peer->sta))
++					ath12k_dbg(ab, ATH12K_DBG_DATA,
++						   "dp_tx: failed to find the peer with peer_id %d\n",
++						   ts.peer_id);
++				else
++					ath12k_sawf_stats_update(ar, msdu, &ts, peer);
++				spin_unlock_bh(&ab->base_lock);
++			}
+ 			dev_kfree_skb_any(msdu);
+ 			return;
+ 		default:
+@@ -1187,6 +1241,9 @@ static void ath12k_dp_tx_complete_msdu(s
+ 			arsta->wbm_tx_stats->wbm_tx_comp_stats[wbm_status]++;
+ 	}
+ 
++	if (unlikely(ath12k_debugfs_is_sawf_stats_enabled(ar)))
++		ath12k_sawf_stats_update(ar, msdu, &ts, peer);
++
+ 	spin_unlock_bh(&ab->base_lock);
+ 
+ 	if (flags & ATH12K_SKB_HW_80211_ENCAP)
+--- a/drivers/net/wireless/ath/ath12k/sawf.c
++++ b/drivers/net/wireless/ath/ath12k/sawf.c
+@@ -1085,3 +1085,111 @@ unlock_base_lock:
+ 
+ 	return ret;
+ }
++
++void ath12k_sawf_tx_enqueue_peer_stats(struct ath12k_base *ab,
++				       struct ath12k_peer *peer,
++				       u32 msduq_id, u32 len)
++{
++	struct ath12k_sawf_stats *sawf_stats;
++	struct sawf_tx_stats *tx_stats;
++	u32 tid, q_id;
++
++	sawf_stats = &peer->sawf_stats;
++	if(unlikely(!sawf_stats)) {
++		ath12k_err(ab, "sawf stats not available\n");
++		return;
++	}
++
++	if (unlikely(msduq_id >= (ab->max_msduq_per_tid * ATH12K_SAWF_MAX_TID_SUPPORT) &&
++	    msduq_id < (ab->default_msduq_per_tid * ATH12K_SAWF_MAX_TID_SUPPORT)))
++		return;
++
++	tid = u32_get_bits(msduq_id, MSDUQID_TID_MASK);
++	q_id = u32_get_bits(msduq_id, MSDUQID_Q_MASK) - ab->default_msduq_per_tid;
++
++	tx_stats = &sawf_stats->tx_stats[tid][q_id];
++	tx_stats->queue_depth++;
++	tx_stats->tx_ingress.num_pkts++;
++	tx_stats->tx_ingress.bytes += len;
++
++	return;
++}
++
++void ath12k_sawf_stats_update(struct ath12k *ar, struct sk_buff *skb,
++			      struct hal_tx_status *ts,
++			      struct ath12k_peer *peer)
++{
++	struct ath12k_sawf_stats *sawf_stats;
++	struct ath12k_base *ab = ar->ab;
++	struct sawf_tx_stats *tx_stats;
++	u32 msduq_id, len, q_id, tid;
++
++	if (!ts)
++		return;
++
++	if (u32_get_bits(skb->mark, SAWF_TAG_ID) != SAWF_VALID_TAG)
++		return;
++
++	sawf_stats = &peer->sawf_stats;
++	if (!sawf_stats) {
++		ath12k_err(ab, "sawf stats not available\n");
++		return;
++	}
++
++	msduq_id = u32_get_bits(skb->mark, SAWF_MSDUQ_ID);
++	if (msduq_id >= (ab->max_msduq_per_tid * ATH12K_SAWF_MAX_TID_SUPPORT) &&
++	    msduq_id < (ab->default_msduq_per_tid * ATH12K_SAWF_MAX_TID_SUPPORT))
++		return;
++
++	tid = u32_get_bits(msduq_id, MSDUQID_TID_MASK);
++	q_id = u32_get_bits(msduq_id, MSDUQID_Q_MASK) - ab->default_msduq_per_tid;
++
++	if (!(ath12k_debugfs_is_sawf_stats_enabled(ar) & ATH12K_SAWF_STATS_BASIC))
++		goto latency_stats_update;
++
++	len = skb->len; /* Need to add frag length? */
++
++	tx_stats = &sawf_stats->tx_stats[tid][q_id];
++
++	switch (ts->status) {
++	case HAL_WBM_TQM_REL_REASON_FRAME_ACKED:
++		tx_stats->tx_success.num_pkts++;
++		tx_stats->tx_success.bytes += len;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_MPDU:
++		tx_stats->dropped.fw_rem.num_pkts++;
++		tx_stats->dropped.fw_rem.bytes += len;
++		tx_stats->tx_failed++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_TX:
++		tx_stats->dropped.fw_rem_tx++;
++		tx_stats->tx_failed++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_NOTX:
++		tx_stats->dropped.fw_rem_notx++;
++		tx_stats->tx_failed++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_AGED_FRAMES:
++		tx_stats->dropped.age_out++;
++		tx_stats->tx_failed++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_RESEAON1:
++		tx_stats->dropped.fw_reason1++;
++		tx_stats->tx_failed++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_RESEAON2:
++		tx_stats->dropped.fw_reason2++;
++		tx_stats->tx_failed++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_RESEAON3:
++		tx_stats->dropped.fw_reason3++;
++		tx_stats->tx_failed++;
++	default:
++		break;
++	}
++
++	tx_stats->queue_depth--;
++
++latency_stats_update:
++	return;
++}
+--- a/drivers/net/wireless/ath/ath12k/sawf.h
++++ b/drivers/net/wireless/ath/ath12k/sawf.h
+@@ -6,6 +6,8 @@
+ #ifndef ATH12K_SAWF_H
+ #define ATH12K_SAWF_H
+ 
++struct hal_tx_status;
++
+ #ifdef CPTCFG_ATH12K_SAWF
+ 
+ #define ATH12K_MAC_ADDR_SIZE	6
+@@ -477,6 +479,72 @@ enum ath12k_sawf_stats_level {
+ 
+ #define ATH12K_SAWF_STATS_MAX (ATH12K_SAWF_STATS_BASIC | ATH12K_SAWF_STATS_ADVNCD | ATH12K_SAWF_STATS_LATENCY)
+ 
++/**
++ * struct sawf_fw_mpdu_stats- per-mpdu Tx success/failure snapshot
++ * @success_cnt: count of pkts successfully transmitted
++ * @failure_cnt: count of pkts failed to transmit
++ */
++struct sawf_fw_mpdu_stats {
++	u64 success_cnt;
++	u64 failure_cnt;
++};
++
++/**
++ * struct dp_pkt_info - packet info
++ * @num: number of packets
++ * @bytes: total nunmber of bytes
++ */
++struct dp_pkt_info {
++	u32 num_pkts;
++	u64 bytes;
++};
++
++/**
++ * struct sawf_tx_stats- Tx stats
++ * @tx_success: transmit success stats
++ * @tx_ingress: enqueue success stats
++ * @dropped: detailed information for tx-drops
++ * @svc_intval_stats: success/failure stats per service-interval
++ * @burst_size_stats: success/failure stats per burst-size
++ * @tx_failed: tx failure count
++ * @queue_depth: transmit queue-depth
++ * @throughput: throughput
++ * @ingress_rate: ingress-rate
++ * @tid: tid used for transmit
++ * @msduq: MSDU queue used for transmit
++ */
++struct sawf_tx_stats {
++	struct dp_pkt_info tx_success;
++	struct dp_pkt_info tx_ingress;
++	struct {
++		struct dp_pkt_info fw_rem;
++		u32 fw_rem_notx;
++		u32 fw_rem_tx;
++		u32 age_out;
++		u32 fw_reason1;
++		u32 fw_reason2;
++		u32 fw_reason3;
++	} dropped;
++	struct sawf_fw_mpdu_stats svc_intval_stats;
++	struct sawf_fw_mpdu_stats burst_size_stats;
++	u32 tx_failed;
++	u32 queue_depth;
++	u32 throughput;
++	u32 ingress_rate;
++	u8 tid;
++	u8 msduq;
++};
++
++/**
++ * sawf_stats - sawf stats
++ * @delay: delay stats per host MSDU queue
++ * @tx_stats: Tx stats per host MSDU queue
++ * @lock: Protection for sawf-stats
++ */
++struct ath12k_sawf_stats {
++	struct sawf_tx_stats tx_stats[ATH12K_SAWF_MAX_TID_SUPPORT][MAX_Q_PER_TID];
++};
++
+ extern bool ath12k_sawf_enable;
+ struct ath12k_sawf_ctx *ath12k_get_sawf_context(void);
+ void ath12k_sawf_init(struct ath12k_base *ab);
+@@ -511,7 +579,12 @@ int ath12k_sawf_def_qmap_report_req(stru
+ 
+ void ath12k_htt_sawf_def_q_map_report_handler(struct ath12k_base *ab,
+ 					      struct sk_buff *skb);
+-
++void ath12k_sawf_stats_update(struct ath12k *ar, struct sk_buff *skb,
++			      struct hal_tx_status *ts,
++			      struct ath12k_peer *peer);
++void ath12k_sawf_tx_enqueue_peer_stats(struct ath12k_base *ab,
++				       struct ath12k_peer *peer,
++				       u32 msduq_id, u32 len);
+ #else /* CPTCFG_ATH12K_SAWF */
+ 
+ static inline void ath12k_sawf_init(struct ath12k_base *ab) {
+@@ -522,5 +595,11 @@ static inline void ath12k_sawf_deinit(st
+ 	return;
+ }
+ 
++static inline void ath12k_sawf_stats_update(struct ath12k *ar, struct sk_buff *skb,
++					    struct hal_tx_status *ts,
++			      		    struct ath12k_peer *peer)
++{
++	return;
++}
+ #endif /* CPTCFG_ATH12K_SAWF */
+ #endif /* ATH11K_SAWF_H */
+--- a/drivers/net/wireless/ath/ath12k/peer.h
++++ b/drivers/net/wireless/ath/ath12k/peer.h
+@@ -26,6 +26,7 @@ struct ath12k_peer {
+ 	struct ieee80211_vif *vif;
+ #ifdef CPTCFG_ATH12K_SAWF
+ 	struct ath12k_sawf_peer_ctx sawf_ctx_peer;
++	struct ath12k_sawf_stats sawf_stats;
+ #endif /* CPTCFG_ATH12K_SAWF */
+ 	int vdev_id;
+ 	u8 addr[ETH_ALEN];

@@ -1,0 +1,384 @@
+From 56ca5515aac22cddfbabdf2ef8ce5debf619903c Mon Sep 17 00:00:00 2001
+From: Rameshkumar Sundaram <quic_ramess@quicinc.com>
+Date: Sat, 4 Mar 2023 11:48:05 +0530
+Subject: [PATCH 2/4] mac80211: restructure vif and link conf for mlo mbssid
+ support
+
+For MLD, if Transmitting interface is MLD then tx link inside that MLD
+has to be saved inside non-tx MLD's link.
+Currently mbssid_tx_vif is inside vif structure which won't suffice for
+finding tx link for any non-tx link.
+Move mbssid_tx_vif to ieee80211_bss_conf and add mbssid_tx_vif_linkid to
+the same to find TX vif and Tx link inside the TX vif for any non-tx
+link.
+
+Modify CSA completion and BCCA event notifier routines to fetch
+non-tx vdev links based on mbssid_tx_vif and mbssid_tx_vif_linkid.
+
+Signed-off-by: Rameshkumar Sundaram <quic_ramess@quicinc.com>
+---
+ include/net/mac80211.h |  4 +--
+ net/mac80211/cfg.c     | 79 ++++++++++++++++++++++++++++++++++--------
+ net/mac80211/iface.c   | 18 +++++++---
+ 3 files changed, 79 insertions(+), 22 deletions(-)
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -756,6 +756,8 @@ struct ieee80211_bss_conf {
+ 	struct ieee80211_ftm_responder_params *ftmr_params;
+ 	/* Multiple BSSID data */
+ 	bool nontransmitted;
++	struct ieee80211_vif *mbssid_tx_vif;
++	int mbssid_tx_vif_linkid;
+ 	u8 transmitter_bssid[ETH_ALEN];
+ 	u8 bssid_index;
+ 	u8 bssid_indicator;
+@@ -1967,8 +1969,6 @@ struct ieee80211_vif {
+ 
+ 	bool noqueue_enable;
+ 
+-	struct ieee80211_vif *mbssid_tx_vif;
+-
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+ };
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -142,8 +142,10 @@ static int ieee80211_set_ap_mbssid_optio
+ 					   struct ieee80211_bss_conf *link_conf)
+ {
+ 	struct ieee80211_sub_if_data *tx_sdata;
++	struct ieee80211_link_data *tx_link;
+ 
+-	sdata->vif.mbssid_tx_vif = NULL;
++	link_conf->mbssid_tx_vif = NULL;
++	link_conf->mbssid_tx_vif_linkid = -1;
+ 	link_conf->bssid_index = 0;
+ 	link_conf->nontransmitted = false;
+ 	link_conf->ema_ap = false;
+@@ -157,9 +159,25 @@ static int ieee80211_set_ap_mbssid_optio
+ 		return -EINVAL;
+ 
+ 	if (tx_sdata == sdata) {
+-		sdata->vif.mbssid_tx_vif = &sdata->vif;
++		link_conf->mbssid_tx_vif = &sdata->vif;
++		link_conf->mbssid_tx_vif_linkid = link_conf->link_id;
+ 	} else {
+-		sdata->vif.mbssid_tx_vif = &tx_sdata->vif;
++		rcu_read_lock();
++		tx_link = rcu_dereference(tx_sdata->link[params.tx_link_id]);
++		if (!tx_link || !tx_link->conf) {
++			rcu_read_unlock();
++			return -ENOLINK;
++		}
++		/* Make sure input tx vif from user is really configured as a
++		 * transmitting vif as per our internal data before referring it.
++		 */
++		if (tx_link->conf->mbssid_tx_vif != &tx_sdata->vif) {
++			rcu_read_unlock();
++			return -EINVAL;
++		}
++		link_conf->mbssid_tx_vif = &tx_sdata->vif;
++		link_conf->mbssid_tx_vif_linkid = tx_link->link_id;
++		rcu_read_unlock();
+ 		link_conf->nontransmitted = true;
+ 		link_conf->bssid_index = params.index;
+ 	}
+@@ -1638,8 +1656,12 @@ static int ieee80211_stop_ap(struct wiph
+ 	struct cfg80211_chan_def chandef;
+ 	struct ieee80211_link_data *link =
+ 		sdata_dereference(sdata->link[link_id], sdata);
+-	struct ieee80211_bss_conf *link_conf = link->conf;
++	struct ieee80211_bss_conf *link_conf;
+ 
++	if (WARN_ON(!link))
++		return -ENOLINK;
++
++	link_conf = link->conf;
+ 	sdata_assert_lock(sdata);
+ 
+ 	old_beacon = sdata_dereference(link->u.ap.beacon, sdata);
+@@ -1702,7 +1724,6 @@ static int ieee80211_stop_ap(struct wiph
+ 	kfree(link_conf->ftmr_params);
+ 	link_conf->ftmr_params = NULL;
+ 
+-	sdata->vif.mbssid_tx_vif = NULL;
+ 	link_conf->bssid_index = 0;
+ 	link_conf->nontransmitted = false;
+ 	link_conf->ema_ap = false;
+@@ -1710,7 +1731,10 @@ static int ieee80211_stop_ap(struct wiph
+ 
+ 	__sta_info_flush(sdata, true);
+ 
++	ieee80211_stop_mbssid(sdata);
+ 	link_conf->enable_beacon = false;
++	link_conf->mbssid_tx_vif = NULL;
++	link_conf->mbssid_tx_vif_linkid = -1;
+ 	sdata->beacon_rate_set = false;
+ 	sdata->vif.cfg.ssid_len = 0;
+ 	clear_bit(SDATA_STATE_OFFCHANNEL_BEACON_STOPPED, &sdata->state);
+@@ -3771,23 +3795,41 @@ void ieee80211_csa_finish(struct ieee802
+ 		return;
+ 	}
+ 
+-	/* TODO: MBSSID with MLO changes */
+-	if (vif->mbssid_tx_vif == vif) {
++	if (link->conf->mbssid_tx_vif == vif &&
++	    link->conf->mbssid_tx_vif_linkid == link->conf->link_id) {
+ 		/* Trigger ieee80211_csa_finish() on the non-transmitting
+ 		 * interfaces when channel switch is received on
+ 		 * transmitting interface
+ 		 */
++		unsigned int link_id_iter;
++		unsigned long valid_links;
+ 		struct ieee80211_sub_if_data *iter;
++		struct ieee80211_link_data *link_iter;
+ 
+ 		list_for_each_entry_rcu(iter, &local->interfaces, list) {
+ 			if (!ieee80211_sdata_running(iter))
+ 				continue;
+ 
+-			if (iter == sdata || iter->vif.mbssid_tx_vif != vif)
++			if (iter == sdata)
+ 				continue;
+ 
+-			ieee80211_queue_work(&iter->local->hw,
+-					     &iter->deflink.csa_finalize_work);
++			/* check link 0 by default for Non-ML non-tx vif's deflinks */
++			valid_links = iter->vif.valid_links | BIT(0);
++			for_each_set_bit(link_id_iter, &valid_links,
++					 IEEE80211_MLD_MAX_NUM_LINKS) {
++				link_iter = rcu_dereference(iter->link[link_id_iter]);
++				if (!link_iter)
++					continue;
++				/* Check if any of link of iterator sdata belongs
++				 * to same mbssid group as the tx link
++				 */
++				if (link_iter->conf->mbssid_tx_vif != vif ||
++				    link_iter->conf->mbssid_tx_vif_linkid != link->link_id)
++					continue;
++
++				ieee80211_queue_work(&iter->local->hw,
++						     &link_iter->csa_finalize_work);
++			}
+ 		}
+ 	}
+ 	ieee80211_queue_work(&local->hw, &link->csa_finalize_work);
+@@ -5004,6 +5046,7 @@ ieee80211_color_change_bss_config_notify
+ {
+ 	struct ieee80211_sub_if_data *sdata = link->sdata;
+ 
++	sdata_assert_lock(sdata);
+ 	link->conf->he_bss_color.color = color;
+ 	link->conf->he_bss_color.enabled = enable;
+ 
+@@ -5011,19 +5054,38 @@ ieee80211_color_change_bss_config_notify
+ 
+ 	ieee80211_link_info_change_notify(sdata, link, changed);
+ 
+-	/* handle bss color in mbssid case with MLO */
+-	if (!link->conf->nontransmitted && sdata->vif.mbssid_tx_vif) {
++	if (!link->conf->nontransmitted && link->conf->mbssid_tx_vif) {
++		unsigned int link_id_iter;
++		unsigned long valid_links;
+ 		struct ieee80211_sub_if_data *child;
++		struct ieee80211_link_data *link_iter;
+ 
+ 		mutex_lock(&sdata->local->iflist_mtx);
+ 		list_for_each_entry(child, &sdata->local->interfaces, list) {
+-			if (child != sdata && child->vif.mbssid_tx_vif == &sdata->vif) {
+-				child->vif.bss_conf.he_bss_color.color = color;
+-				child->vif.bss_conf.he_bss_color.enabled = enable;
+-				ieee80211_link_info_change_notify(child,
+-								  &child->deflink,
++			if (child == sdata)
++				continue;
++			sdata_lock(child);
++			/* check deflink by default */
++			valid_links = child->vif.valid_links | BIT(0);
++			for_each_set_bit(link_id_iter, &valid_links,
++					 IEEE80211_MLD_MAX_NUM_LINKS) {
++				link_iter = sdata_dereference(child->link[link_id_iter],
++							      child);
++				if (!link_iter)
++					continue;
++				/* Check if any of link of iterator sdata belongs
++				 * to same mbssid group as the tx link
++				 */
++				if (link_iter->conf->mbssid_tx_vif != &sdata->vif ||
++				    link_iter->conf->mbssid_tx_vif_linkid != link->link_id)
++					continue;
++
++				link_iter->conf->he_bss_color.color = color;
++				link_iter->conf->he_bss_color.enabled = enable;
++				ieee80211_link_info_change_notify(child, link_iter,
+ 								  BSS_CHANGED_HE_BSS_COLOR);
+ 			}
++			sdata_unlock(child);
+ 		}
+ 		mutex_unlock(&sdata->local->iflist_mtx);
+ 	}
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -731,46 +731,96 @@ static void ieee80211_do_stop(struct iee
+ 		ieee80211_add_virtual_monitor(local);
+ }
+ 
+-static void ieee80211_stop_mbssid(struct ieee80211_sub_if_data *sdata)
++void ieee80211_stop_mbssid(struct ieee80211_sub_if_data *sdata)
+ {
+ 	struct ieee80211_sub_if_data *tx_sdata, *non_tx_sdata, *tmp_sdata;
+-	struct ieee80211_vif *tx_vif = sdata->vif.mbssid_tx_vif;
+-
+-	if (!tx_vif)
+-		return;
+-
+-	tx_sdata = vif_to_sdata(tx_vif);
+-	sdata->vif.mbssid_tx_vif = NULL;
+-
+-	list_for_each_entry_safe(non_tx_sdata, tmp_sdata,
+-				 &tx_sdata->local->interfaces, list) {
+-		if (non_tx_sdata != sdata && non_tx_sdata != tx_sdata &&
+-		    non_tx_sdata->vif.mbssid_tx_vif == tx_vif &&
+-		    ieee80211_sdata_running(non_tx_sdata)) {
+-			non_tx_sdata->vif.mbssid_tx_vif = NULL;
+-			dev_close(non_tx_sdata->wdev.netdev);
++	struct ieee80211_vif *tx_vif;
++	unsigned int link_id, tx_link_id, iter_link_id;
++	unsigned long iter_valid_links, valid_links;
++	struct ieee80211_link_data *link_iter, *link;
++
++	lockdep_assert_wiphy(sdata->local->hw.wiphy);
++	sdata_assert_lock(sdata);
++	/* Check link 0 by default for non MLO. */
++	iter_valid_links = sdata->vif.valid_links | BIT(0);
++	/* Check if any of the links of current sdata is an MBSSID. */
++	for_each_set_bit(iter_link_id, &iter_valid_links,
++			 IEEE80211_MLD_MAX_NUM_LINKS) {
++		link_iter = sdata_dereference(sdata->link[iter_link_id], sdata);
++		if (!link_iter)
++			continue;
++		tx_vif = link_iter->conf->mbssid_tx_vif;
++		tx_link_id = link_iter->conf->mbssid_tx_vif_linkid;
++		if (!tx_vif)
++			continue;
++		tx_sdata = vif_to_sdata(tx_vif);
++		link_iter->conf->mbssid_tx_vif = NULL;
++		/* If we are not tx sdata reset tx sdata's tx_vif to avoid recusrion while
++		 * closing tx sdata at the end of outer loop below.
++		 */
++		if (sdata != tx_sdata) {
++			sdata_lock(tx_sdata);
++			link = sdata_dereference(tx_sdata->link[tx_link_id], tx_sdata);
++			if (!link) {
++				sdata_unlock(tx_sdata);
++				continue;
++			}
++			link->conf->mbssid_tx_vif = NULL;
++			sdata_unlock(tx_sdata);
++		}
++		/* loop through sdatas to find if any of their links
++		 * belong to same mbssid group as the one getting deleted.
++		 */
++		list_for_each_entry_safe(non_tx_sdata, tmp_sdata,
++					 &tx_sdata->local->interfaces, list) {
++			if (non_tx_sdata != sdata && non_tx_sdata != tx_sdata &&
++			    ieee80211_sdata_running(non_tx_sdata)) {
++				sdata_lock(non_tx_sdata);
++				valid_links = non_tx_sdata->vif.valid_links | BIT(0);
++				for_each_set_bit(link_id, &valid_links,
++						 IEEE80211_MLD_MAX_NUM_LINKS) {
++					link = sdata_dereference(non_tx_sdata->link[link_id], non_tx_sdata);
++					if (!link)
++						continue;
++					/* If both tx vif and tx linkid is matching then it belongs to
++					 * same MBSSID group.
++					 */
++					if (link->conf->mbssid_tx_vif != tx_vif ||
++					    link->conf->mbssid_tx_vif_linkid != tx_link_id)
++						continue;
++					link->conf->mbssid_tx_vif = NULL;
++					/* Remove all links of matching MLD untill dynamic link removal
++					 * can be supported.
++					 */
++					cfg80211_stop_iface(non_tx_sdata->wdev.wiphy,
++							    &non_tx_sdata->wdev, GFP_KERNEL);
++				}
++				sdata_unlock(non_tx_sdata);
++			}
++		}
++		/* If we are not tx sdata, remove links of tx sdata and proceed.
++		 */
++		if (sdata != tx_sdata && ieee80211_sdata_running(tx_sdata)) {
++			sdata_lock(tx_sdata);
++			cfg80211_stop_iface(tx_sdata->wdev.wiphy,
++					    &tx_sdata->wdev, GFP_KERNEL);
++			sdata_unlock(tx_sdata);
+ 		}
+ 	}
+-
+-	if (sdata != tx_sdata && ieee80211_sdata_running(tx_sdata)) {
+-		tx_sdata->vif.mbssid_tx_vif = NULL;
+-		dev_close(tx_sdata->wdev.netdev);
+-	}
++	return;
+ }
+ 
+ static int ieee80211_stop(struct net_device *dev)
+ {
+ 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+ 
+-	/* close dependent VLAN and MBSSID interfaces before locking wiphy */
++	/* close dependent VLAN interfaces before locking wiphy */
+ 	if (sdata->vif.type == NL80211_IFTYPE_AP) {
+ 		struct ieee80211_sub_if_data *vlan, *tmpsdata;
+ 
+ 		list_for_each_entry_safe(vlan, tmpsdata, &sdata->u.ap.vlans,
+ 					 u.vlan.list)
+ 			dev_close(vlan->dev);
+-
+-		ieee80211_stop_mbssid(sdata);
+ 	}
+ 
+ 	cancel_work_sync(&sdata->activate_links_work);
+@@ -783,6 +833,14 @@ static int ieee80211_stop(struct net_dev
+ #endif
+ 
+ 	wiphy_lock(sdata->local->hw.wiphy);
++	/* Close the dependent MBSSID interfaces with wiphy lock as we may be terminating
++	 * its partner links too in case of MLD.
++	 */
++	if (sdata->vif.type == NL80211_IFTYPE_AP) {
++		sdata_lock(sdata);
++		ieee80211_stop_mbssid(sdata);
++		sdata_unlock(sdata);
++	}
+ 	ieee80211_do_stop(sdata, true);
+ 	wiphy_unlock(sdata->local->hw.wiphy);
+ 
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -2704,4 +2704,5 @@ ieee80211_eht_cap_ie_to_sta_eht_cap(stru
+ 				    const struct ieee80211_240mhz_vendor_oper *eht_240mhz_cap,
+ 				    u8 eht_240mhz_len,
+ 				    struct link_sta_info *link_sta);
++void ieee80211_stop_mbssid(struct ieee80211_sub_if_data *sdata);
+ #endif /* IEEE80211_I_H */
+--- a/net/wireless/sme.c
++++ b/net/wireless/sme.c
+@@ -1584,7 +1584,7 @@ void cfg80211_autodisconnect_wk(struct w
+ 		container_of(work, struct wireless_dev, disconnect_wk);
+ 	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wdev->wiphy);
+ 
+-	wiphy_lock(wdev->wiphy);
++	wiphy_lock(&rdev->wiphy);
+ 	wdev_lock(wdev);
+ 
+ 	if (wdev->conn_owner_nlportid) {
+@@ -1623,5 +1623,5 @@ void cfg80211_autodisconnect_wk(struct w
+ 	}
+ 
+ 	wdev_unlock(wdev);
+-	wiphy_unlock(wdev->wiphy);
++	wiphy_unlock(&rdev->wiphy);
+ }

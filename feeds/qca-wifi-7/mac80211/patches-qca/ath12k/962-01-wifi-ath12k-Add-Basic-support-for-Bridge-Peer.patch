@@ -1,0 +1,757 @@
+From 51aca9e37e79bda3374a3ce37ba6edf2445caa63 Mon Sep 17 00:00:00 2001
+From: Vignesh C <quic_vignc@quicinc.com>
+Date: Sun, 14 Jul 2024 02:57:48 +0530
+Subject: [PATCH 1/2] wifi: ath12k: Add Basic support for Bridge Peer
+
+When ML peer associates on diagonal links, create bridge peer on the
+device adjacent to each other. Bridge peer is an link peer created
+on the device for every peer associating (which are not adjacent to
+each other) which is known only to driver and firmware. Bridge peer
+will be created on bridge vap only.
+
+Summary of changes are as follows:
+ 1. Extend 2 more ath12k_link_sta links to accommodate bridge peer
+    creation apart from existing 16 links (0-15).
+ 2. Add an logic to determine bridge peer is required or not for the
+    every associating peer.
+ 3. Handle bridge peer creation, deletion and SSR recovery.
+ 4. Handle dp_tx and dp_rx specific to bridge peer.
+
+Patch-dependency:
+	961-01-wifi-ath12k-n-link-mlo-bridge-vdev-basic-handling.patch
+	961-02-wifi-ath12k-n-link-mlo-bridge-vdev-create-start.patch
+	961-03-wifi-ath12k-n-link-mlo-bridge-vdev-up-and-channel-switch.patch
+
+Tag: N_LINK_MLO
+
+Signed-off-by: Vignesh C <quic_vignc@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c |  59 ++-----
+ drivers/net/wireless/ath/ath12k/core.h |   5 +-
+ drivers/net/wireless/ath/ath12k/mac.c  | 234 ++++++++++++++++++++++---
+ drivers/net/wireless/ath/ath12k/peer.c |  25 ++-
+ drivers/net/wireless/ath/ath12k/peer.h |   3 +
+ drivers/net/wireless/ath/ath12k/wmi.c  |   8 +-
+ drivers/net/wireless/ath/ath12k/wmi.h  |   3 +
+ 7 files changed, 260 insertions(+), 77 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -2404,24 +2404,16 @@ static void ath12k_mac_peer_ab_disassoc(
+ 			continue;
+ 
+ 		ahsta = (struct ath12k_sta *)sta->drv_priv;
+-		if (!ahsta->low_ack_sent) {
+-			ath12k_dbg(ab, ATH12K_DBG_MAC,
+-				   "sending low ack event during recovery to clean "
+-				   "up peers (STA:%pM)\n", sta->addr);
+-
+-			/* Sending low ack event to hostapd to remove (free) the
+-			 * existing STAs since FW is crashed and recovering at the momemt.
+-			 * After recovery, FW comes up with no information about peers.
+-			 * To stop any operation related to peers coming from upper
+-			 * layers.
+-			 * Here, 0xFFFF is used to differentiate between low ack event
+-			 * sent during recovery versus normal low ack event. In normal,
+-			 * low ack event, num_packets is not expected to be 0xFFFF.
+-			 */
+-			ieee80211_report_low_ack(sta,
+-						 ATH12K_REPORT_LOW_ACK_NUM_PKT_SSR);
+-			ahsta->low_ack_sent = true;
+-		}
++		/* Sending low ack event to hostapd to remove (free) the
++		 * existing STAs since FW is crashed and recovering at the momemt.
++		 * After recovery, FW comes up with no information about peers.
++		 * To stop any operation related to peers coming from upper
++		 * layers.
++		 * Here, 0xFFFF is used to differentiate between low ack event
++		 * sent during recovery versus normal low ack event. In normal,
++		 * low ack event, num_packets is not expected to be 0xFFFF.
++		 */
++		ath12k_mac_peer_disassoc(ab, sta, ahsta, ATH12K_DBG_MAC);
+ 	}
+ 	spin_unlock_bh(&ab->base_lock);
+ }
+@@ -2584,8 +2576,8 @@ key_add:
+ 			}
+ 
+ 			if (sta->mlo) {
+-				links = sta->valid_links;
+-				for_each_set_bit(link_id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
++				links = ahsta->links_map;
++				for_each_set_bit(link_id, &links, ATH12K_NUM_MAX_LINKS) {
+ 					arvif = ahvif->link[link_id];
+ 					arsta = ahsta->link[link_id];
+ 					if (WARN_ON(!arvif || !arsta))
+@@ -3043,23 +3035,8 @@ static void ath12k_core_peer_disassoc(st
+ 			 * discarded the management packet at this
+ 			 * sequence.
+ 			 */
+-			if (!ahsta->low_ack_sent) {
+-				ath12k_dbg(ab, ATH12K_DBG_MODE1_RECOVERY,
+-					   "sending low ack for/disassoc:%pM\n",
+-					   sta->addr);
+-				/* set num of packets to maximum so
+-				 * that we distinguish in the hostapd
+-				 * to send disassoc irrespective of
+-				 * hostapd conf
+-				 */
+-				ieee80211_report_low_ack(sta, 0xFFFF);
+-				/* Using this flag to avoid certain
+-				 * known warnings which will be
+-				 * triggerred when umac reset is
+-				 * happening
+-				 */
+-				ahsta->low_ack_sent = true;
+-			}
++			ath12k_mac_peer_disassoc(ab, sta, ahsta,
++						 ATH12K_DBG_MODE1_RECOVERY);
+ 		}
+ 	}
+ }
+@@ -3305,9 +3282,6 @@ int ath12k_mode1_recovery_reconfig(struc
+ 				if (!ahvif)
+ 					continue;
+ 
+-				if (ath12k_mac_is_bridge_vdev(arvif))
+-					continue;
+-
+ 				/* unlock ar mutex here as the iterator will be called
+ 				 * within rcu lock.
+ 				 */
+@@ -3315,6 +3289,9 @@ int ath12k_mode1_recovery_reconfig(struc
+ 					ath12k_core_iterate_sta_list(ar, arvif);
+ 				}
+ 
++				if (ath12k_mac_is_bridge_vdev(arvif))
++					continue;
++
+ 				for (key_idx = 0; key_idx < WMI_MAX_KEY_INDEX; key_idx++) {
+ 					key = arvif->keys[key_idx];
+ 					if (key) {
+@@ -4302,7 +4279,7 @@ int ath12k_core_sawf_ul_config(struct ne
+ 	mutex_lock(&ahvif->ah->conf_mutex);
+ 	ahsta = ath12k_sta_to_ahsta(sta);
+ 	if (sta->mlo) {
+-		for_each_set_bit(link_id, &sta->valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++		for_each_set_bit(link_id, &ahsta->links_map, ATH12K_NUM_MAX_LINKS) {
+ 			arsta = ahsta->link[link_id];
+ 			ether_addr_copy(latency_info->peer_mac, arsta->addr);
+ 			ret = ath12k_sawf_wmi_config_ul(arsta->arvif->ar, latency_info);
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -721,6 +721,7 @@ struct ath12k_link_sta {
+ 	/* For now the assoc link will be considered primary */
+ 	bool is_assoc_link;
+ 
++	bool is_bridge_peer;
+ 	/* For check disable fixed rate check for peer */
+ 	bool disable_fixed_rate;
+ 	u8 sawf_svc_id;
+@@ -736,7 +737,7 @@ struct ath12k_link_sta {
+ #endif
+ };
+ 
+-#define ATH12K_REPORT_LOW_ACK_NUM_PKT_SSR 0xFFFF
++#define ATH12K_REPORT_LOW_ACK_NUM_PKT 0xFFFF
+ 
+ struct ath12k_sta {
+ 	struct ath12k_vif *ahvif;
+@@ -749,7 +750,7 @@ struct ath12k_sta {
+ 	enum hal_pn_type pn_type;
+ 
+ 	struct ath12k_link_sta deflink;
+-	struct ath12k_link_sta *link[IEEE80211_MLD_MAX_NUM_LINKS];
++	struct ath12k_link_sta *link[ATH12K_NUM_MAX_LINKS];
+ 	/* indicates bitmap of link sta created in FW */
+ 	unsigned long links_map;
+ 	u16 ml_peer_id;
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -4884,6 +4884,81 @@ void ath12k_mac_bridge_vdev_up(struct at
+ 	arvif->is_up = true;
+ }
+ 
++int ath12k_mac_get_bridge_link_id_from_ahvif(struct ath12k_vif *ahvif,
++					     u16 bridge_bitmap, u8 *link_id)
++{
++	int ret = -EINVAL;
++	struct ath12k_link_vif *arvif;
++
++	*link_id = ATH12K_BRIDGE_LINK_MIN;
++
++	for_each_set_bit_from(*link_id, &ahvif->links_map, ATH12K_NUM_MAX_LINKS) {
++		arvif = ahvif->link[*link_id];
++		if (!arvif)
++			continue;
++
++		if (bridge_bitmap & BIT(arvif->ab->wsi_info.chip_idx)) {
++			ath12k_dbg(arvif->ab, ATH12K_DBG_PEER,
++				   "arvif found link_id %d for bridge_bitmap 0x%x\n",
++				   *link_id, bridge_bitmap);
++			ret = 0;
++			break;
++		}
++	}
++
++	return ret;
++}
++
++bool ath12k_mac_is_bridge_required(u8 device_bitmap, u8 num_devices,
++				   u16 *bridge_bitmap)
++{
++	bool bridge_needed = false;
++	u8 adj_device[ATH12K_MAX_SOCS] = {0};
++	u8 i, next, prev;
++	u8 device_idx = 0;
++
++	/* There is no need to check for bridging in-case of
++	 * number of devices less than 3 and only one link is added.
++	 */
++	if (num_devices < ATH12K_MIN_NUM_DEVICES_NLINK ||
++	    hweight8(device_bitmap) < 2) {
++		return bridge_needed;
++	}
++
++	/* Consider given device_bitmap as circular bitmap of size num_devices.
++	 * For every given index, If set - check either of adjacent indexes
++	 * are set or not. else continue.
++	 */
++	for (i = 0; i < num_devices; i++) {
++		if (!(device_bitmap & BIT(i)))
++			continue;
++
++		next = (i + 1) % num_devices;
++		prev = ((i - 1) + num_devices) % num_devices;
++
++		/* If both adjacent bits are not set, bridging is needed and
++		 * device idx where bridge peer is required will be decided
++		 * based on maximum count of adj_device array
++		 */
++		if (!(device_bitmap & BIT(next) || device_bitmap & BIT(prev))) {
++			adj_device[prev]++;
++			adj_device[next]++;
++			bridge_needed = true;
++			*bridge_bitmap |= BIT(prev);
++			*bridge_bitmap |= BIT(next);
++			if (adj_device[prev] > adj_device[next])
++				device_idx = prev;
++			else
++				device_idx = next;
++		}
++	}
++	if (num_devices > ATH12K_MIN_NUM_DEVICES_NLINK &&
++	    hweight16(device_bitmap) == 2)
++		*bridge_bitmap = BIT(device_idx);
++
++	return bridge_needed;
++}
++
+ void ath12k_mac_bss_info_changed(struct ath12k *ar,
+ 				 struct ath12k_link_vif *arvif,
+ 				 struct ieee80211_bss_conf *info,
+@@ -6473,8 +6548,8 @@ static int ath12k_mac_op_set_key(struct
+ 	if (sta) {
+ 		ahsta = ath12k_sta_to_ahsta(sta);
+ 		if (sta->mlo) {
+-			links = sta->valid_links;
+-			for_each_set_bit(link_id, &sta->valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++			links = ahsta->links_map;
++			for_each_set_bit(link_id, &links, ATH12K_NUM_MAX_LINKS) {
+ 				arvif = ahvif->link[link_id];
+ 				arsta = ahsta->link[link_id];
+ 				if (WARN_ON(!arvif || !arsta))
+@@ -7519,7 +7594,7 @@ static void ath12k_sta_set_4addr_wk(stru
+ 	ahsta = container_of(wk, struct ath12k_sta, set_4addr_wk);
+ 	sta = container_of((void *)ahsta, struct ieee80211_sta, drv_priv);
+ 
+-	for_each_set_bit(link_id, &ahsta->links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
++	for_each_set_bit(link_id, &ahsta->links_map, ATH12K_NUM_MAX_LINKS) {
+ 		arsta = ahsta->link[link_id];
+ 		arvif = arsta->arvif;
+ 		ahvif = arvif->ahvif;
+@@ -7732,7 +7807,13 @@ static int ath12k_mac_station_add(struct
+ 
+ 	peer_param.vdev_id = arvif->vdev_id;
+ 	peer_param.peer_addr = arsta->addr;
+-	peer_param.peer_type = WMI_PEER_TYPE_DEFAULT;
++	if (arsta->is_bridge_peer) {
++		peer_param.peer_type = WMI_PEER_TYPE_MLO_BRIDGE;
++		peer_param.mlo_bridge_peer = true;
++	} else {
++		peer_param.peer_type = WMI_PEER_TYPE_DEFAULT;
++		peer_param.mlo_bridge_peer = false;
++	}
+ 	peer_param.ml_enabled = sta->mlo;
+ 
+ 	/*
+@@ -7881,10 +7962,11 @@ static int ath12k_mac_assign_link_sta(st
+ 	struct ieee80211_link_sta *link_sta;
+ 	struct ieee80211_sta *sta;
+ 	struct ath12k_base *ab;
++	bool is_bridge_peer;
+ 
+ 	lockdep_assert_held(&ah->conf_mutex);
+ 
+-	if (!arsta || link_id > IEEE80211_MLD_MAX_NUM_LINKS)
++	if (!arsta || link_id >= ATH12K_NUM_MAX_LINKS)
+ 		return -EINVAL;
+ 
+ 	if (WARN_ON(!ahvif->link[link_id]))
+@@ -7894,14 +7976,23 @@ static int ath12k_mac_assign_link_sta(st
+ 
+ 	memset(arsta, 0, sizeof(*arsta));
+ 
+-	rcu_read_lock();
+-	link_sta = rcu_dereference(sta->link[link_id]);
+-	if (!link_sta) {
++	/* For bridge peer, generate random mac_addr using kernel API
++	 */
++	is_bridge_peer = (ATH12K_BRIDGE_LINKS_MASK & BIT(link_id)) ? true :
++								     false;
++	if (is_bridge_peer) {
++		eth_random_addr(arsta->addr);
++		ahsta->primary_link_id = link_id;
++	} else {
++		rcu_read_lock();
++		link_sta = rcu_dereference(sta->link[link_id]);
++		if (!link_sta) {
++			rcu_read_unlock();
++			return -EINVAL;
++		}
++		ether_addr_copy(arsta->addr, link_sta->addr);
+ 		rcu_read_unlock();
+-		return -EINVAL;
+ 	}
+-	ether_addr_copy(arsta->addr, link_sta->addr);
+-	rcu_read_unlock();
+ 
+ 	/* logical index of the link sta in order of creation */
+ 	arsta->link_idx = ahsta->num_peer++;
+@@ -7914,6 +8005,7 @@ static int ath12k_mac_assign_link_sta(st
+ 	arsta->ahsta = ahsta;
+ 	arsta->link_id = link_id;
+ 	arsta->state = IEEE80211_STA_NONE;
++	arsta->is_bridge_peer = is_bridge_peer;
+ 
+ 	return 0;
+ }
+@@ -7927,7 +8019,7 @@ static int ath12k_mac_unassign_link_sta(
+ 
+ 	lockdep_assert_held(&ah->conf_mutex);
+ 
+-	if (link_id > IEEE80211_MLD_MAX_NUM_LINKS)
++	if (link_id >= ATH12K_NUM_MAX_LINKS)
+ 		return -EINVAL;
+ 
+ 	ahsta->link[link_id] = NULL;
+@@ -7945,7 +8037,7 @@ ath12k_mac_alloc_assign_link_sta(struct
+ 
+ 	lockdep_assert_held(&ah->conf_mutex);
+ 
+-	if (link_id > IEEE80211_MLD_MAX_NUM_LINKS)
++	if (link_id >= ATH12K_NUM_MAX_LINKS)
+ 		return NULL;
+ 
+ 	if (ahsta->link[link_id]) {
+@@ -7976,7 +8068,7 @@ static int ath12k_mac_free_unassign_link
+ 
+ 	lockdep_assert_held(&ah->conf_mutex);
+ 
+-	if (link_id > IEEE80211_MLD_MAX_NUM_LINKS)
++	if (link_id >= ATH12K_NUM_MAX_LINKS)
+ 		return -EINVAL;
+ 
+ 	arsta = ahsta->link[link_id];
+@@ -7991,6 +8083,92 @@ static int ath12k_mac_free_unassign_link
+ 	return 0;
+ }
+ 
++int ath12k_mac_create_bridge_peer(struct ath12k_hw *ah, struct ath12k_sta *ahsta,
++				  struct ath12k_vif *ahvif, u8 link_id)
++{
++	int ret = -EINVAL;
++	struct ath12k_link_sta *arsta;
++	struct ath12k_link_vif *arvif;
++	struct ath12k *ar;
++
++	lockdep_assert_held(&ah->conf_mutex);
++	if (ahsta->links_map & BIT(link_id)) {
++		/* Some assumptions went wrong */
++		ath12k_err(NULL, "Peer already exists on link: %d, unable to create Bridge peer\n",
++			   link_id);
++		return ret;
++	}
++
++	arvif = ahvif->link[link_id];
++	if (!arvif) {
++		ath12k_err(NULL, "Failed to get arvif to create bridge peer\n");
++		return ret;
++	}
++
++	arsta = ath12k_mac_alloc_assign_link_sta(ah, ahsta, ahvif, link_id);
++
++	if (!arsta) {
++		ath12k_err(NULL, "Failed to alloc/assign link sta");
++		return -ENOMEM;
++	}
++
++	ar = arvif->ar;
++	if (!ar) {
++		ath12k_err(NULL, "Failed to get ar to create bridge peer\n");
++		ath12k_mac_free_unassign_link_sta(ah, ahsta, link_id);
++		return ret;
++	}
++
++	mutex_lock(&ar->conf_mutex);
++	ret = ath12k_mac_station_add(ar, arvif, arsta);
++	if (ret) {
++		ath12k_warn(ar->ab, "Failed to add station: %pM for VDEV: %d\n",
++			    arsta->addr, arvif->vdev_id);
++		ath12k_mac_free_unassign_link_sta(ah, ahsta, link_id);
++	}
++	mutex_unlock(&ar->conf_mutex);
++
++	return ret;
++}
++
++int ath12k_mac_init_bridge_peer(struct ath12k_hw *ah, struct ieee80211_sta *sta,
++				struct ath12k_vif *ahvif, u16 bridge_bitmap)
++{
++	struct ath12k_base *bridge_ab = NULL;
++	struct ath12k_sta *ahsta = ath12k_sta_to_ahsta(sta);
++	u8 link_id = 0;
++	int ret = -EINVAL;
++
++	lockdep_assert_held(&ah->conf_mutex);
++	if (ath12k_mac_get_bridge_link_id_from_ahvif(ahvif, bridge_bitmap,
++						     &link_id)) {
++		ath12k_err(NULL, "Unable to find Bridge link vif for bitmap 0x%x\n",
++			   bridge_bitmap);
++		ret = -EINVAL;
++		goto out_err;
++	} else {
++		bridge_ab = ahvif->link[link_id]->ab;
++		if (!test_bit(WMI_TLV_SERVICE_N_LINK_MLO_SUPPORT,
++			      bridge_ab->wmi_ab.svc_map)) {
++			ath12k_warn(bridge_ab,
++				    "firmware doesn't support Bridge peer, so disconnect the sta %pM\n",
++				    sta->addr);
++			ret = -EINVAL;
++			goto out_err;
++		}
++		ret = ath12k_mac_create_bridge_peer(ah, ahsta, ahvif, link_id);
++		if (ret) {
++			ath12k_err(bridge_ab, "Couldnt create Bridge peer for sta %pM\n",
++				   sta->addr);
++			goto out_err;
++		}
++		ath12k_info(bridge_ab, "Bridge peer created on link %d for sta %pM\n",
++			    link_id, sta->addr);
++	}
++out_err:
++	return ret;
++}
++
+ static void ath12k_mac_ml_station_remove(struct ath12k_vif *ahvif,
+ 				        struct ath12k_sta *ahsta)
+ {
+@@ -8009,8 +8187,8 @@ static void ath12k_mac_ml_station_remove
+ 	ath12k_ml_link_peers_delete(ahvif, ahsta);
+ 
+ 	/* validate link station removal and clear arsta links */
+-	links = sta->valid_links;
+-	for_each_set_bit(link_id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
++	links = ahsta->links_map;
++	for_each_set_bit(link_id, &links, ATH12K_NUM_MAX_LINKS) {
+ 		arvif = ahvif->link[link_id];
+ 		arsta = ahsta->link[link_id];
+ 
+@@ -8084,7 +8262,7 @@ static int ath12k_mac_handle_link_sta_st
+ 
+ 		ath12k_cfr_decrement_peer_count(ar, arsta);
+ 
+-		if (sta->valid_links)
++		if (ahsta->links_map)
+ 			ath12k_mac_free_unassign_link_sta(arvif->ahvif->ah,
+ 							  arsta->ahsta, arsta->link_id);
+ 	} else if (old_state == IEEE80211_STA_AUTH &&
+@@ -8260,7 +8438,7 @@ static int ath12k_mac_reconfig_ahsta_lin
+ 	}
+ 
+ 	for_each_set_bit(link, &links_to_unmap,
+-			 IEEE80211_MLD_MAX_NUM_LINKS) {
++			 ATH12K_NUM_MAX_LINKS) {
+ 		arsta = ahsta->link[link];
+ 		arvif = ahvif->link[link];
+ 
+@@ -8273,7 +8451,7 @@ static int ath12k_mac_reconfig_ahsta_lin
+ 	}
+ 
+ 	for_each_set_bit(link, &links_to_assign,
+-			 IEEE80211_MLD_MAX_NUM_LINKS) {
++			 ATH12K_NUM_MAX_LINKS) {
+ 		ret = ath12k_mac_assign_link_sta(ah, ahsta,
+ 						 ahsta->link[link],
+ 						 ahvif, link);
+@@ -8297,7 +8475,7 @@ static int ath12k_mac_reconfig_ahsta_lin
+ 	int ret;
+ 
+ 	for_each_set_bit(link, &ahsta->links_map,
+-			 IEEE80211_MLD_MAX_NUM_LINKS) {
++			 ATH12K_NUM_MAX_LINKS) {
+ 		ret = ath12k_mac_assign_link_sta(ah, ahsta,
+ 						 ahsta->link[link],
+ 						 ahvif, link);
+@@ -8321,7 +8499,8 @@ int ath12k_mac_update_sta_state(struct i
+ 	struct ath12k_sta *ahsta = ath12k_sta_to_ahsta(sta);
+ 	unsigned long links;
+ 	int ret = 0;
+-	u8 link_id = 0, link;
++	u8 link_id = 0, link, num_devices = ah->ag->num_chip;
++	u16 bridge_bitmap = 0;
+ 
+ 	mutex_lock(&ah->conf_mutex);
+ 
+@@ -8341,7 +8520,7 @@ int ath12k_mac_update_sta_state(struct i
+ 		INIT_WORK(&ahsta->set_4addr_wk, ath12k_sta_set_4addr_wk);
+ 		if (!sta->mlo) {
+ 			ret = ath12k_mac_assign_link_sta(ah, ahsta, &ahsta->deflink,
+-							   ahvif, link_id);
++							 ahvif, link_id);
+ 			if (ret)
+ 				goto exit;
+ 		}
+@@ -8379,7 +8558,7 @@ int ath12k_mac_update_sta_state(struct i
+ 		/* add case to prevent MLO assoc from happening when UMAC recovery
+ 		 * happens
+ 		 */
+-		for_each_set_bit(link, &ahvif->links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
++		for_each_set_bit(link, &ahvif->links_map, ATH12K_NUM_MAX_LINKS) {
+ 			arvif = ahvif->link[link];
+ 
+ 			if (!arvif || !arvif->ar ||
+@@ -8443,9 +8622,18 @@ int ath12k_mac_update_sta_state(struct i
+ 			ieee80211_queue_work(ah->hw, &ahsta->set_4addr_wk);
+ 
+ 	}
++
++	if (ahvif->vdev_type == WMI_VDEV_TYPE_AP &&
++	    (old_state == IEEE80211_STA_AUTH && new_state == IEEE80211_STA_ASSOC) &&
++	    ath12k_mac_is_bridge_required(ahsta->device_bitmap, num_devices,
++					  &bridge_bitmap)) {
++		ret = ath12k_mac_init_bridge_peer(ah, sta, ahvif, bridge_bitmap);
++		if (ret)
++			goto exit;
++	}
+ 	links = ahsta->links_map;
+ 
+-	for_each_set_bit(link_id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
++	for_each_set_bit(link_id, &links, ATH12K_NUM_MAX_LINKS) {
+ 		arvif = ahvif->link[link_id];
+ 		arsta = ahsta->link[link_id];
+ 
+@@ -8559,7 +8747,7 @@ void ath12k_mac_assign_middle_link_id(st
+ 	for_each_set_bit(link_id, &ahsta->links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
+ 		arsta = ahsta->link[link_id];
+ 
+-		if (!arsta && !arsta->arvif)
++		if (!(arsta && arsta->arvif))
+ 			continue;
+ 
+ 		ab = arsta->arvif->ab;
+@@ -10375,7 +10563,8 @@ static void ath12k_mac_op_tx(struct ieee
+ 	if (vif->valid_links) {
+ 		link = ath12k_mac_get_tx_link(sta, vif, link, skb, info_flags);
+ 
+-		if (link >= IEEE80211_MLD_MAX_NUM_LINKS) {
++		if (link >= ATH12K_NUM_MAX_LINKS ||
++		    link == IEEE80211_MLD_MAX_NUM_LINKS) {
+ 			ieee80211_free_txskb(hw, skb);
+ 			return;
+ 		}
+@@ -10445,6 +10634,13 @@ static void ath12k_mac_op_tx(struct ieee
+ 			       sizeof(adjusted_tsf));
+ 		}
+ 		mgmt_stats = &ahvif->mgmt_stats;
++		if (ath12k_mac_is_bridge_vdev(arvif)) {
++			ieee80211_free_txskb(ah->hw, skb);
++			spin_lock_bh(&ar->data_lock);
++			mgmt_stats->tx_fail_cnt[frm_type]++;
++			spin_unlock_bh(&ar->data_lock);
++			return;
++		}
+ 		ret = ath12k_mac_mgmt_tx(ar, skb, is_prb_rsp);
+ 		if (ret) {
+ 			if (ret != -EBUSY)
+@@ -12389,7 +12585,7 @@ static int ath12k_mac_op_ampdu_action(st
+ 
+ 	mutex_lock(&ah->conf_mutex);
+ 
+-	for_each_set_bit(link_id, &ahsta->links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
++	for_each_set_bit(link_id, &ahsta->links_map, ATH12K_NUM_MAX_LINKS) {
+ 		ret = ath12k_mac_ampdu_action(hw, vif, params, link_id);
+ 		if (ret)
+ 			break;
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -449,6 +449,23 @@ static int ath12k_peer_rhash_add(struct
+         return 0;
+ }
+ 
++void ath12k_mac_peer_disassoc(struct ath12k_base *ab, struct ieee80211_sta *sta,
++			      struct ath12k_sta *ahsta,
++			      enum ath12k_debug_mask debug_mask)
++{
++	if (!ahsta->low_ack_sent) {
++		ath12k_dbg(ab, debug_mask, "sending low ack for/disassoc:%pM\n",
++			   sta->addr);
++		/* set num of packets to maximum so that we distinguish in
++		 * the hostapd to send disassoc irrespective of hostapd conf
++		 */
++		ieee80211_report_low_ack(sta, ATH12K_REPORT_LOW_ACK_NUM_PKT);
++		/* Using this flag to avoid certain known warnings which
++		 * will be triggerred when umac reset is happening
++		 */
++		ahsta->low_ack_sent = true;
++	}
++}
+ 
+ void ath12k_peer_cleanup(struct ath12k *ar, u32 vdev_id)
+ {
+@@ -661,8 +678,8 @@ int ath12k_ml_link_peers_delete(struct a
+ 	/* FW expects delete of all link peers at once before waiting for reception
+ 	 * of peer unmap or delete responses
+ 	 */
+-	links = sta->valid_links;
+-	for_each_set_bit(link_id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
++	links = ahsta->links_map;
++	for_each_set_bit(link_id, &links, ATH12K_NUM_MAX_LINKS) {
+ 		arvif = ahvif->link[link_id];
+ 		arsta = ahsta->link[link_id];
+ 
+@@ -691,8 +708,8 @@ int ath12k_ml_link_peers_delete(struct a
+ 	}
+ 
+ 	/* Ensure all link peers are deleted and unmapped */
+-	links = sta->valid_links;
+-	for_each_set_bit(link_id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
++	links = ahsta->links_map;
++	for_each_set_bit(link_id, &links, ATH12K_NUM_MAX_LINKS) {
+ 		arvif = ahvif->link[link_id];
+ 		arsta = ahsta->link[link_id];
+ 
+@@ -839,6 +856,7 @@ int ath12k_peer_create(struct ath12k *ar
+ 
+ 	peer->pdev_idx = ar->pdev_idx;
+ 	peer->sta = sta;
++	peer->is_bridge_peer = arg->mlo_bridge_peer;
+ 
+ 	if (vif->type == NL80211_IFTYPE_STATION) {
+ 		arvif->ast_hash = peer->ast_hash;
+--- a/drivers/net/wireless/ath/ath12k/peer.h
++++ b/drivers/net/wireless/ath/ath12k/peer.h
+@@ -79,6 +79,7 @@ struct ath12k_peer {
+ 	/* To check if the peer entry is part of rhash table or not */
+ 	bool rhash_done;
+ 
++	bool is_bridge_peer;
+ 	/* any other ML info common for all partners can be added
+ 	 * here and would be same for all partner peers
+ 	 */
+@@ -131,6 +132,9 @@ void ath12k_peer_mlo_unmap_event(struct
+ int ath12k_peer_delete_send(struct ath12k *ar, u32 vdev_id, const u8 *addr);
+ struct ath12k_peer *ath12k_peer_find_by_vdev_id(struct ath12k_base *ab,
+ 		                        int vdev_id);
++void ath12k_mac_peer_disassoc(struct ath12k_base *ab, struct ieee80211_sta *sta,
++			      struct ath12k_sta *ahsta,
++			      enum ath12k_debug_mask debug_mask);
+ static inline
+ struct ath12k_link_sta *ath12k_peer_get_link_sta(struct ath12k_base *ab,
+ 						 struct ath12k_peer *peer)
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -2037,12 +2037,12 @@ int ath12k_wmi_send_peer_create_cmd(stru
+ 	ml_param->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_MLO_PEER_CREATE_PARAMS) |
+ 				FIELD_PREP(WMI_TLV_LEN, sizeof(*ml_param) - TLV_HDR_SIZE);
+ 
+-	ml_param->flags = FIELD_PREP(ATH12K_WMI_FLAG_MLO_ENABLED, arg->ml_enabled);
+-
++	ml_param->flags = FIELD_PREP(ATH12K_WMI_FLAG_MLO_ENABLED, arg->ml_enabled) |
++			  FIELD_PREP(ATH12K_WMI_FLAG_MLO_BRIDGE_PEER, arg->mlo_bridge_peer);
+ 
+ 	ath12k_dbg(ar->ab, ATH12K_DBG_PEER,
+-		   "WMI peer create vdev_id %d peer_addr %pM ml_enabled %d\n",
+-		   arg->vdev_id, arg->peer_addr, arg->ml_enabled);
++		   "WMI peer create vdev_id %d peer_addr %pM ml_enabled %d bridge peer %d\n",
++		   arg->vdev_id, arg->peer_addr, arg->ml_enabled, arg->mlo_bridge_peer);
+ 
+ 	ret = ath12k_wmi_cmd_send(wmi, skb, WMI_PEER_CREATE_CMDID);
+ 	if (ret) {
+@@ -12425,7 +12425,7 @@ static void ath12k_mgmt_rx_event(struct
+ 		peer = ath12k_peer_find_by_addr(ab, hdr->addr2);
+ 		if (!peer)
+ 			peer = ath12k_peer_find_by_addr(ab, hdr->addr4);
+-		if (!peer) {
++		if (!peer || peer->is_bridge_peer) {
+ 			spin_unlock_bh(&ab->base_lock);
+ 			dev_kfree_skb(skb);
+ 			goto exit;
+@@ -12448,6 +12448,14 @@ static void ath12k_mgmt_rx_event(struct
+ 			spin_unlock_bh(&ab->base_lock);
+ 			goto skip_mgmt_stats;
+ 		}
++		if (peer->is_bridge_peer) {
++			ath12k_dbg(ab, ATH12K_DBG_MGMT,
++				   "mgmt rx on bridge peer link_id %d, drop it\n",
++				   peer->link_id);
++			spin_unlock_bh(&ab->base_lock);
++			dev_kfree_skb(skb);
++			goto exit;
++		}
+ 	}
+ 
+ 	vif = peer->vif;
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -3319,6 +3319,7 @@ struct wmi_vdev_create_mlo_params {
+ #define ATH12K_WMI_FLAG_MLO_EMLSR_SUPPORT		BIT(6)
+ #define ATH12K_WMI_FLAG_MLO_FORCED_INACTIVE		BIT(7)
+ #define ATH12K_WMI_FLAG_MLO_LINK_ADD			BIT(8)
++#define ATH12K_WMI_FLAG_MLO_BRIDGE_PEER			BIT(10)
+ 
+ struct wmi_vdev_start_mlo_params {
+ 	u32 tlv_header;
+@@ -3641,6 +3642,7 @@ struct ath12k_wmi_peer_create_arg {
+ 	u32 peer_type;
+ 	u32 vdev_id;
+ 	bool ml_enabled;
++	bool mlo_bridge_peer;
+ };
+ 
+ struct ath12k_wmi_pdev_set_regdomain_arg {
+@@ -3798,6 +3800,7 @@ enum wmi_peer_type {
+ 	WMI_PEER_TYPE_DEFAULT = 0,
+ 	WMI_PEER_TYPE_BSS = 1,
+ 	WMI_PEER_TYPE_TDLS = 2,
++	WMI_PEER_TYPE_MLO_BRIDGE = 7,
+ };
+ 
+ struct wmi_peer_create_mlo_params {
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -3219,6 +3219,14 @@ static void ath12k_dp_rx_deliver_msdu(st
+ 			status->link_valid = 1;
+ 			status->link_id = peer->link_id;
+ 		}
++		if (peer->is_bridge_peer) {
++			dev_kfree_skb_any(msdu);
++			ath12k_dbg(ab, ATH12K_DBG_DATA,
++				   "Packet received on bridge peer link_id %d, drop it\n",
++				   peer->link_id);
++			rcu_read_unlock();
++			return;
++		}
+ 	}
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_DATA,

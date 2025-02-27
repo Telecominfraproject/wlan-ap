@@ -1,0 +1,223 @@
+From 6e731627fde5941c8458a8496837df7e6fa382fe Mon Sep 17 00:00:00 2001
+From: Balamurugan Ramar <quic_bramar@quicinc.com>
+Date: Tue, 22 Oct 2024 19:17:17 +0530
+Subject: [PATCH] wifi: ath12k: Add cleanup in ath12k driver
+
+Issue observed during SSR mode0 + wifi restart
+	1. Vap goes to down state
+	2. Link id mis-match in arvif and it leads to the
+	   vap deletion
+	3. arvifs corruption and it leads to the multiple
+	   stability issues
+
+Changes:
+	1. Add cleanup in vdev stop, vdev delete,  mac-op
+	   remove interface and unassign_vif_chanctx
+	2. Avoid to overwrite deflink link id in add interface
+	3. Avoid to delete arvifs list if link is empty
+
+Signed-off-by: Balamurugan Ramar <quic_bramar@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 54 +++++++++++++--------------
+ 1 file changed, 27 insertions(+), 27 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -1580,6 +1580,9 @@ static int ath12k_mac_monitor_vdev_stop(
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+ 
++	if (unlikely(test_bit(ATH12K_FLAG_RECOVERY, &ar->ab->dev_flags)))
++		return 0;
++
+ 	reinit_completion(&ar->vdev_setup_done);
+ 
+ 	ret = ath12k_wmi_vdev_stop(ar, ar->monitor_vdev_id);
+@@ -4522,8 +4525,14 @@ void ath12k_bss_disassoc(struct ath12k *
+ 	struct ieee80211_bss_conf *link;
+ 	int ret;
+ 
++	if (!ar)
++		return;
++
+ 	lockdep_assert_held(&ar->conf_mutex);
+ 
++	if (unlikely(test_bit(ATH12K_FLAG_RECOVERY, &ar->ab->dev_flags)))
++		return;
++
+ 	if (do_vdev_down) {
+ 		ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac vdev %i disassoc bssid %pM\n",
+ 			   arvif->vdev_id, arvif->bssid);
+@@ -5545,6 +5554,8 @@ static void ath12k_mac_op_vif_cfg_change
+ 
+ 			link_conf = vif->link_conf[link_id];
+ 			ar = arvif->ar;
++			if (!ar)
++				continue;
+ 			if (vif->cfg.assoc) {
+ 				if (link_conf)
+ 					ath12k_bss_assoc(ar, arvif, link_conf);
+@@ -5610,7 +5621,7 @@ static int ath12k_mac_vdev_delete(struct
+ 	reinit_completion(&ar->vdev_delete_done);
+ 
+ 	if (unlikely(test_bit(ATH12K_FLAG_RECOVERY, &ar->ab->dev_flags)))
+-		goto clean_up;
++		goto vdev_clean_up;
+ 
+ 	ret = ath12k_wmi_vdev_delete(ar, arvif->vdev_id);
+ 	if (ret) {
+@@ -5628,6 +5639,7 @@ static int ath12k_mac_vdev_delete(struct
+ 		goto clean_up;
+ 	}
+ 
++vdev_clean_up:
+ 	spin_lock_bh(&ar->ab->base_lock);
+ 	ar->ab->free_vdev_map |= 1LL << arvif->vdev_id;
+ 	spin_unlock_bh(&ar->ab->base_lock);
+@@ -5643,14 +5655,15 @@ static int ath12k_mac_vdev_delete(struct
+ 	ath12k_dbg(ar->ab, ATH12K_DBG_SET(MAC, L1), "mac vdev delete id %d type %d subtype %d map %llx\n",
+ 		   arvif->vdev_id, ahvif->vdev_type, arvif->vdev_subtype,
+ 		   ar->ab->free_vdev_map);
++
+ clean_up:
+ 	arvif->is_created = false;
+ 	arvif->is_scan_vif = false;
+ 	arvif->ar = NULL;
+ 	spin_lock_bh(&ar->data_lock);
+-	list_del(&arvif->list);
++	if (!list_empty(&ar->arvifs))
++		list_del(&arvif->list);
+ 	spin_unlock_bh(&ar->data_lock);
+-
+ 	return ret;
+ }
+ 
+@@ -5664,19 +5677,21 @@ static int ath12k_mac_vdev_stop(struct a
+ 	if (!arvif->vdev_stop_notify_done) {
+ 		reinit_completion(&ar->vdev_setup_done);
+ 
+-		ret = ath12k_wmi_vdev_stop(ar, arvif->vdev_id);
+-		if (ret) {
+-			ath12k_warn(ar->ab, "failed to stop WMI vdev %i: %d\n",
+-				    arvif->vdev_id, ret);
+-			return ret;
+-		}
+-		arvif->vdev_stop_notify_done = true;
++		if (!test_bit(ATH12K_FLAG_RECOVERY, &ar->ab->dev_flags)) {
++			ret = ath12k_wmi_vdev_stop(ar, arvif->vdev_id);
++			if (ret) {
++				ath12k_warn(ar->ab, "failed to stop WMI vdev %i: %d\n",
++					    arvif->vdev_id, ret);
++				return ret;
++			}
++			arvif->vdev_stop_notify_done = true;
+ 
+-		ret = ath12k_mac_vdev_setup_sync(ar);
+-		if (ret) {
+-			ath12k_warn(ar->ab, "failed to synchronize setup for vdev %i: %d\n",
+-				    arvif->vdev_id, ret);
+-			return ret;
++			ret = ath12k_mac_vdev_setup_sync(ar);
++			if (ret) {
++				ath12k_warn(ar->ab, "failed to synchronize setup for vdev %i: %d\n",
++					    arvif->vdev_id, ret);
++				return ret;
++			}
+ 		}
+ 	}
+ 
+@@ -9336,12 +9351,12 @@ static int ath12k_mac_op_change_sta_link
+ 
+ 	if ((test_bit(ahvif->primary_link_id, &sta->valid_links))) {
+ 		arvif = ath12k_get_arvif_from_link_id(ahvif, ahvif->primary_link_id);
+-		if (arvif->ar->ab->hw_params->is_plink_preferable) {
++		if (arvif && arvif->ar && arvif->ar->ab->hw_params->is_plink_preferable) {
+ 			ahsta->primary_link_id = ahvif->primary_link_id;
+ 		} else {
+ 			ahsta->primary_link_id = ahsta->assoc_link_id;
+ 			arvif = ath12k_get_arvif_from_link_id(ahvif, ahsta->assoc_link_id);
+-			if (!arvif->ar->ab->hw_params->is_plink_preferable) {
++			if (arvif && arvif->ar && !arvif->ar->ab->hw_params->is_plink_preferable) {
+ 				for_each_set_bit(link_id, &sta->valid_links,
+ 						 IEEE80211_MLD_MAX_NUM_LINKS) {
+ 					if (link_id != ahsta->primary_link_id) {
+@@ -12598,9 +12613,9 @@ err_vdev_del:
+ 	spin_unlock_bh(&ar->ab->base_lock);
+ 	ab->free_vdev_stats_id_map &= ~(1LL << arvif->vdev_stats_id);
+ 	spin_lock_bh(&ar->data_lock);
+-	list_del(&arvif->list);
++	if (!list_empty(&ar->arvifs))
++		list_del(&arvif->list);
+ 	spin_unlock_bh(&ar->data_lock);
+-
+ err:
+ 	arvif->is_created = false;
+ 	arvif->ar = NULL;
+@@ -12877,7 +12892,6 @@ static int ath12k_mac_op_add_interface(s
+ 	ahvif->ah = ah;
+ 
+ 	ahvif->deflink.ahvif = ahvif;
+-	ahvif->deflink.link_id = 0;
+ 	ahvif->mcbc_gsn = 0;
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+@@ -13151,11 +13165,7 @@ static void ath12k_mac_op_remove_interfa
+ 		if (!ar)
+ 			continue;
+ 
+-		if (WARN_ON(arvif->link_id != link_id))
+-			continue;
+-
+-		if (unlikely(test_bit(ATH12K_FLAG_RECOVERY, &ar->ab->dev_flags)))
+-			continue;
++		WARN_ON(arvif->link_id != link_id);
+ 
+ 		if (vif->type == NL80211_IFTYPE_AP_VLAN) {
+ 			ath12k_ppeds_detach_link_apvlan_vif(arvif, ahvif->vlan_iface, link_id);
+@@ -16097,6 +16107,7 @@ stop_primary:
+ 		goto stop_primary;
+ 	}
+ 
++out:
+ 	mutex_unlock(&ar->conf_mutex);
+ 
+ 	ath12k_ppeds_detach_link_vif(arvif, arvif->ppe_vp_profile_idx);
+@@ -16104,8 +16115,6 @@ stop_primary:
+ 	ath12k_mac_remove_link_interface(hw, arvif);
+ 	ath12k_mac_unassign_link_vif(arvif);
+ 	return;
+-out:
+-	mutex_unlock(&ar->conf_mutex);
+ }
+ 
+ static void
+@@ -18067,9 +18076,8 @@ static void ath12k_mac_op_sta_statistics
+ 	struct ath12k_sta *ahsta = ath12k_sta_to_ahsta(sta);
+ 	struct ath12k_link_sta *arsta = &ahsta->deflink;
+ 	struct ath12k *ar = arsta->arvif->ar;
+-	struct ath12k_base *ab = ar->ab;
+-	bool db2dbm = test_bit(WMI_TLV_SERVICE_HW_DB2DBM_CONVERSION_SUPPORT,
+-			       ab->wmi_ab.svc_map);
++	struct ath12k_base *ab;
++	bool db2dbm;
+ 	u8 i;
+ 	s8 rssi;
+ 
+@@ -18080,6 +18088,17 @@ static void ath12k_mac_op_sta_statistics
+ 			   "unable to determine sta statistics \n");
+ 		return;
+ 	}
++
++	ab = ar->ab;
++	if (!ab) {
++		ath12k_err(NULL,
++			   "unable to determine sta statistics \n");
++		return;
++	}
++
++	db2dbm = test_bit(WMI_TLV_SERVICE_HW_DB2DBM_CONVERSION_SUPPORT,
++			  ab->wmi_ab.svc_map);
++
+ 	sinfo->rx_duration = arsta->rx_duration;
+ 	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_DURATION);
+ 

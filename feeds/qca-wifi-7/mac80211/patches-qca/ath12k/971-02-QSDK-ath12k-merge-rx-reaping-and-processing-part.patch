@@ -1,0 +1,182 @@
+From d5724a28af5513360289e0f70b5e3ae9a5ce9c1f Mon Sep 17 00:00:00 2001
+From: P Praneesh <quic_ppranees@quicinc.com>
+Date: Sat, 10 Aug 2024 22:47:36 +0530
+Subject: [PATCH 2/6] QSDK: ath12k: merge rx reaping and processing part
+
+Move rx processing part to reaping part which gets utilised for new fast
+rx path.
+
+Patch-Dependency: None
+
+Signed-off-by: P Praneesh <quic_ppranees@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_rx.c | 133 +++++++++---------------
+ 1 file changed, 52 insertions(+), 81 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -3427,81 +3427,6 @@ static void ath12k_soc_dp_rx_stats(struc
+ 	}
+ }
+ 
+-static void ath12k_dp_rx_process_received_packets(struct ath12k_base *ab,
+-						  struct napi_struct *napi,
+-						  struct sk_buff_head *msdu_list,
+-						  int ring_id)
+-{
+-	struct ieee80211_rx_status rx_status = {0};
+-	struct ath12k_skb_rxcb *rxcb;
+-	struct ath12k_dp_rx_info rx_info;
+-	struct sk_buff *msdu;
+-	struct ath12k *ar;
+-	u8 mac_id, hw_link_id;
+-	int ret;
+-	bool fast_rx;
+-	struct sk_buff *skb;
+-
+-	if (skb_queue_empty(msdu_list))
+-		return;
+-
+-	rx_info.filled = 0;
+-	rx_info.rx_status = &rx_status;
+-
+-	rcu_read_lock();
+-
+-	while ((msdu = __skb_dequeue(msdu_list))) {
+-		skb = msdu_list->next;
+-		if (likely(skb)) {
+-			prefetch(skb);
+-			prefetch(&skb->protocol);
+-			prefetch(&skb->data);
+-			prefetch(skb->data);
+-			prefetch(skb->data + 64);
+-			prefetch(skb->data + 128);
+-		}
+-		rxcb = ATH12K_SKB_RXCB(msdu);
+-		/* Enable fast rx by default, the value will cahnge based on peer cap
+-                * and packet type */
+-		fast_rx = true;
+-
+-		hw_link_id = rxcb->hw_link_id;
+-		ar = rcu_dereference(ab->ag->hw_links[hw_link_id]);
+-		if (!ar) {
+-			dev_kfree_skb_any(msdu);
+-			ath12k_warn(ab, "invalid pdev for hw link id %d\n", hw_link_id);
+-			continue;
+-		}
+-
+-		mac_id = ar->pdev_idx;
+-		if (!rcu_dereference(ar->ab->pdevs_active[mac_id])) {
+-			dev_kfree_skb_any(msdu);
+-			continue;
+-		}
+-
+-		ret = ath12k_dp_rx_process_msdu(ar, msdu, msdu_list, &rx_info,
+-						&fast_rx);
+-		if (ret) {
+-			ath12k_dbg(ab, ATH12K_DBG_DATA,
+-				   "Unable to process %s chip_id %d msdu %d",
+-				    (ab != ar->ab) ? "partner" : "own",
+-				    ar->ab->chip_id, ret);
+-			dev_kfree_skb_any(msdu);
+-			continue;
+-		}
+-
+-		if (!fast_rx) {
+-			if (!ab->stats_disable)
+-				ath12k_soc_dp_rx_stats(ar, msdu, &rx_info, ring_id);
+-			ath12k_dp_rx_deliver_msdu(ar, napi, msdu, &rx_info);
+-		} else {
+-			ab->soc_stats.fast_rx[ring_id][ar->ab->chip_id]++;
+-		}
+-	}
+-
+-	rcu_read_unlock();
+-}
+-
+ int ath12k_dp_rx_process(struct ath12k_base *ab, int ring_id,
+ 			 struct napi_struct *napi, int budget)
+ {
+@@ -3509,20 +3434,22 @@ int ath12k_dp_rx_process(struct ath12k_b
+ 	struct ath12k_rx_desc_info *desc_info;
+ 	struct ath12k_dp *dp = &ab->dp;
+ 	struct dp_rxdma_ring *rx_ring = &dp->rx_refill_buf_ring;
++	struct ieee80211_rx_status rx_status = {0};
++	struct ath12k_dp_rx_info rx_info;
+ 	int i, num_buffs_reaped[ATH12K_MAX_SOCS] = { };
+ 	struct sk_buff_head msdu_list;
+ 	struct ath12k_skb_rxcb *rxcb;
+ 	int total_msdu_reaped = 0;
+ 	struct hal_srng *srng;
+-	struct sk_buff *msdu;
++	struct sk_buff *msdu, *next_msdu;
+ 	u32 *rx_desc;
+-	bool done = false;
++	bool done = false, fast_rx = true;
+ 	u64 desc_va;
+ 	struct ath12k_link_sta *arsta = NULL;
+ 	struct ath12k_peer *peer = NULL;
+ 	struct ath12k *ar;
+-	u8 hw_link_id, chip_id;
+-	int valid_entries;
++	u8 hw_link_id, chip_id, mac_id;
++	int valid_entries, ret;
+ 	struct list_head rx_desc_used_list[ATH12K_MAX_SOCS];
+ 
+ 	__skb_queue_head_init(&msdu_list);
+@@ -3697,9 +3624,53 @@ try_again:
+ 					    num_buffs_reaped[i]);
+ 	}
+ 
+-	ath12k_dp_rx_process_received_packets(ab, napi, &msdu_list,
+-					      ring_id);
++	while ((msdu = __skb_dequeue(&msdu_list))) {
++		next_msdu = msdu_list.next;
++		if (likely(next_msdu)) {
++			prefetch(next_msdu);
++			prefetch(&next_msdu);
++			prefetch(&next_msdu);
++			prefetch(next_msdu);
++			prefetch(next_msdu + 64);
++			prefetch(next_msdu + 128);
++		}
++
++		rxcb = ATH12K_SKB_RXCB(msdu);
++		hw_link_id = rxcb->hw_link_id;
++		ar = rcu_dereference(ab->ag->hw_links[hw_link_id]);
++		if (!ar) {
++			dev_kfree_skb_any(msdu);
++			ath12k_warn(ab, "invalid pdev for hw link id %d\n", hw_link_id);
++			continue;
++		}
+ 
++		mac_id = ar->pdev_idx;
++		if (!rcu_dereference(ar->ab->pdevs_active[mac_id])) {
++			dev_kfree_skb_any(msdu);
++			continue;
++		}
++
++		rx_info.filled = 0;
++		rx_info.rx_status = &rx_status;
++		ret = ath12k_dp_rx_process_msdu(ar, msdu, &msdu_list, &rx_info,
++						&fast_rx);
++		if (ret) {
++			ath12k_dbg(ab, ATH12K_DBG_DATA,
++				   "Unable to process %s chip_id %d msdu %d",
++				    (ab != ar->ab) ? "partner" : "own",
++				    ar->ab->chip_id, ret);
++			dev_kfree_skb_any(msdu);
++			continue;
++		}
++
++		if (!fast_rx) {
++			if (!ab->stats_disable)
++				ath12k_soc_dp_rx_stats(ar, msdu, &rx_info, ring_id);
++			ath12k_dp_rx_deliver_msdu(ar, napi, msdu, &rx_info);
++		} else {
++			ab->soc_stats.fast_rx[ring_id][ar->ab->chip_id]++;
++		}
++	}
+ exit:
+ 	return total_msdu_reaped;
+ }

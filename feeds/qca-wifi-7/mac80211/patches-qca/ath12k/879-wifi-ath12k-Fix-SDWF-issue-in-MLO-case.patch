@@ -1,0 +1,624 @@
+From 567a6b3e8368d8f78e504cf326956c94fa8d721e Mon Sep 17 00:00:00 2001
+From: Nagarajan Maran <quic_nmaran@quicinc.com>
+Date: Thu, 1 Feb 2024 04:00:59 +0530
+Subject: [PATCH] QSDK: wifi: ath12k: Fix SDWF issue in a specific MLO case.
+
+When the peer has the MLO MAC address which is different from
+all the Link MACs, issue is seen in SDWF. Fix these issues by handling
+these cases.
+
+Patch-Dependency: 750-01-ath12k-Add-SAWF-support.patch
+750-02-ath12k-Add-vendor-command-support-for-SAWF.patch
+750-04-ath12k-Add-WMI-support-for-SAWF.patch
+753-01-ath12k-sawf-update-the-TCL-Data-command-when-SKB-has.patch
+753-02-ath12k-sawf-add-callback-operation-for-dynamic-msduq.patch
+753-03-ath12k-sawf-add-default-q-mapping-support.patch
+754-01-ath12k-sawf-add-uplink-configuration-paraeters-in-se.patch
+754-02-ath12k-sawf-uplink-configuration-support.patch
+779-ath12k-sawf-add-telemetry-configurations.patch
+782-wifi-ath12k-Move-SAWF-and-Telemetry-under-conditiona.patch
+784-01-ath12k-Add-debugfs-support-to-enable-and-disable.patch
+784-02-wifi-ath12k-Add-nwifi-header-length-check-in-tkip-pa.patch
+784-02-wifi-ath12k-Add-sawf-tx-stats-support.patch
+784-03-wifi-ath12k-Add-support-to-handle-streaming-stats.patch
+784-04-ath12k-Add-SAWF-tx-delay-stats-support.patch
+784-05-wifi-ath12k-Add-support-to-view-SAWF-stats.patch
+
+Signed-off-by: Nagarajan Maran <quic_nmaran@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c   |  85 +++++++++++-
+ drivers/net/wireless/ath/ath12k/core.h   |   3 +
+ drivers/net/wireless/ath/ath12k/dp_tx.c  |  17 ++-
+ drivers/net/wireless/ath/ath12k/peer.c   |  39 ++++++
+ drivers/net/wireless/ath/ath12k/peer.h   |   3 +
+ drivers/net/wireless/ath/ath12k/sawf.c   | 157 ++++++++++++++---------
+ drivers/net/wireless/ath/ath12k/sawf.h   |   4 +-
+ drivers/net/wireless/ath/ath12k/vendor.c |   2 +-
+ 8 files changed, 235 insertions(+), 75 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -4125,16 +4125,52 @@ int ath12k_sawf_send_disable_soc(u8 svc_
+ 
+ int ath12k_core_sawf_ul_config(struct net_device *dev, struct ath12k_sawf_wmi_peer_latency_param *latency_info)
+ {
+-	struct ath12k_base *ab;
+-	u16 peer_id;
++	struct ieee80211_sta *sta;
++	struct ath12k_sta *ahsta;
++	struct ath12k_link_sta *arsta;
++	struct wireless_dev *wdev;
++	struct ieee80211_vif *vif;
++	struct ath12k_vif *ahvif;
+ 	int ret = -EOPNOTSUPP;
++	u16 link_id;
+ 
+ 	if (!latency_info)
+ 		return -EINVAL;
+ 
+-	ab = ath12k_sawf_get_ab_from_netdev(dev, latency_info->peer_mac, &peer_id);
+-	if (ab)
+-		ret = ath12k_sawf_wmi_config_ul(ab, latency_info);
++	if (!dev)
++		return -EINVAL;
++
++	wdev = dev->ieee80211_ptr;
++	if (!wdev)
++		return -EINVAL;
++
++	vif = wdev_to_ieee80211_vif(wdev);
++	if (!vif)
++		return -EINVAL;
++
++	ahvif = (struct ath12k_vif *)vif->drv_priv;
++	if (!ahvif)
++		return -EINVAL;
++
++	sta = ieee80211_find_sta_by_ifaddr(ahvif->ah->hw, latency_info->peer_mac, NULL);
++	if (!sta) {
++		ath12k_dbg(NULL, ATH12K_DBG_SAWF, "Peer:%pM not present \n", latency_info->peer_mac);
++		return -EINVAL;
++	}
++
++	mutex_lock(&ahvif->ah->conf_mutex);
++	ahsta = ath12k_sta_to_ahsta(sta);
++	if (sta->mlo) {
++		for_each_set_bit(link_id, &sta->valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++			arsta = ahsta->link[link_id];
++			ether_addr_copy(latency_info->peer_mac, arsta->addr);
++			ret = ath12k_sawf_wmi_config_ul(arsta->arvif->ar, latency_info);
++		}
++	} else {
++		arsta = &ahsta->deflink;
++		ret = ath12k_sawf_wmi_config_ul(arsta->arvif->ar, latency_info);
++	}
++	mutex_unlock(&ahvif->ah->conf_mutex);
+ 	return ret;
+ }
+ 
+@@ -4175,6 +4211,46 @@ void *ath12k_get_ab_nd_peer_from_peer_ma
+ 	return peer;
+ }
+ 
++void ath12k_get_svc_int_nd_burst_sz_stats(u16 ml_peer_id, int tid, int q_idx,
++					  u64 *svc_int_suc, u64 *svc_int_fail,
++					  u64 *burst_sz_suc, u64 *burst_sz_fail)
++{
++	struct ath12k_hw_group *ag = NULL;
++	struct ath12k_base *ab = NULL;
++	struct ath12k_peer *peer = NULL;
++	struct sawf_tx_stats *stats = NULL;
++	int soc;
++
++	mutex_lock(&ath12k_hw_lock);
++	list_for_each_entry(ag, &ath12k_hw_groups, list) {
++		if (!ag) {
++			ath12k_warn(NULL, "unable to fetch hw group\n");
++			mutex_unlock(&ath12k_hw_lock);
++			return;
++		}
++		for (soc = ag->num_probed; soc > 0; soc--) {
++			ab = ag->ab[soc - 1];
++			if (!ab) {
++				/* Control should not reach here */
++				ath12k_info(NULL, "SOC not initialized\n");
++				continue;
++			}
++			spin_lock_bh(&ab->base_lock);
++			list_for_each_entry(peer, &ab->peers, list) {
++				if (ml_peer_id == peer->ml_peer_id) {
++					stats = &peer->sawf_stats.tx_stats[tid][q_idx];
++					*svc_int_suc += stats->svc_intval_stats.success_cnt;
++					*svc_int_suc += stats->svc_intval_stats.failure_cnt;
++					*burst_sz_suc += stats->burst_size_stats.success_cnt;
++					*burst_sz_fail += stats->burst_size_stats.failure_cnt;
++				}
++			}
++			spin_unlock_bh(&ab->base_lock);
++		}
++	}
++	mutex_unlock(&ath12k_hw_lock);
++	return;
++}
+ #endif /* CPTCFG_ATH12K_SAWF */
+ 
+ struct ath12k_base *ath12k_core_get_ab_by_wiphy(struct wiphy *wiphy, bool no_arvifs)
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1793,6 +1793,9 @@ int ath12k_send_sawf_configs_soc(struct
+ int ath12k_sawf_send_disable_soc(u8 svc_id);
+ int ath12k_core_sawf_ul_config(struct net_device *dev, struct ath12k_sawf_wmi_peer_latency_param *latency_info);
+ void *ath12k_get_ab_nd_peer_from_peer_mac(u8 *peer_mac, struct ath12k_base **ab_ref);
++void ath12k_get_svc_int_nd_burst_sz_stats(u16 ml_peer_id, int tid, int q_idx,
++					  u64 *svc_int_suc, u64 *svc_int_fail,
++					  u64 *burst_sz_suc, u64 *burst_sz_fail);
+ #endif /* CPTCFG_ATH12K_SAWF */
+ void ath12k_dp_umac_reset_handle(struct ath12k_base *ab);
+ int ath12k_dp_umac_reset_init(struct ath12k_base *ab);
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -943,7 +943,7 @@ ath12k_dp_tx_htt_tx_complete_buf(struct
+ 	if (unlikely(ath12k_debugfs_is_sawf_stats_enabled(ar))) {
+ 		spin_lock_bh(&ab->base_lock);
+ 		ath12k_dp_tx_status_parse(ab, desc, &ts_status);
+-		peer = ath12k_peer_find_by_id(ab, ts_status.peer_id);
++		peer = ath12k_peer_find_pri_by_id(ab, ts_status.peer_id);
+ 		if (unlikely(!peer || !peer->sta))
+ 			ath12k_dbg(ab, ATH12K_DBG_DATA,
+ 				   "dp_tx: failed to find the peer with peer_id %d\n",
+@@ -1216,7 +1216,7 @@ static void ath12k_dp_tx_complete_msdu(s
+ 		case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_TX:
+ 			if (unlikely(ath12k_debugfs_is_sawf_stats_enabled(ar))) {
+ 				spin_lock_bh(&ab->base_lock);
+-				peer = ath12k_peer_find_by_id(ab, ts.peer_id);
++				peer = ath12k_peer_find_pri_by_id(ab, ts.peer_id);
+ 				if (unlikely(!peer || !peer->sta))
+ 					ath12k_dbg(ab, ATH12K_DBG_DATA,
+ 						   "dp_tx: failed to find the peer with peer_id %d\n",
+@@ -1295,8 +1295,17 @@ static void ath12k_dp_tx_complete_msdu(s
+ 			arsta->wbm_tx_stats->wbm_tx_comp_stats[wbm_status]++;
+ 	}
+ 
+-	if (unlikely(ath12k_debugfs_is_sawf_stats_enabled(ar)))
+-		ath12k_sawf_stats_update(ar, msdu, &ts, peer, timestamp);
++	if (unlikely(ath12k_debugfs_is_sawf_stats_enabled(ar))) {
++		struct ath12k_peer *pri_peer = NULL;
++		pri_peer = ath12k_peer_find_pri_by_id(ab, ts.peer_id);
++		if (unlikely(!pri_peer || !pri_peer->sta)) {
++			ath12k_dbg(ab, ATH12K_DBG_DATA,
++				   "dp_tx: failed to find the peer with peer_id %d\n",
++				   ts.peer_id);
++		} else {
++			ath12k_sawf_stats_update(ar, msdu, &ts, pri_peer, timestamp);
++		}
++	}
+ 
+ 	spin_unlock_bh(&ab->base_lock);
+ 
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -164,6 +164,45 @@ struct ath12k_peer *ath12k_peer_find_by_
+ 	return NULL;
+ }
+ 
++#ifdef CPTCFG_ATH12K_SAWF
++
++static struct ath12k_peer *ath12k_peer_find_pri_by_ml_id(struct ath12k_base *ab,
++							 int ml_peer_id)
++{
++	struct ath12k_peer *peer;
++
++	lockdep_assert_held(&ab->base_lock);
++
++	list_for_each_entry(peer, &ab->peers, list) {
++		if (ml_peer_id == peer->ml_peer_id) {
++			if (peer->primary_link)
++				return peer;
++		}
++	}
++
++	return NULL;
++}
++
++struct ath12k_peer *ath12k_peer_find_pri_by_id(struct ath12k_base *ab,
++					       int peer_id)
++{
++	lockdep_assert_held(&ab->base_lock);
++
++	if (peer_id == ATH12K_PEER_ID_INVALID)
++		return NULL;
++
++	if (peer_id & ATH12K_ML_PEER_ID_VALID) {
++		return ath12k_peer_find_pri_by_ml_id(ab, peer_id);
++	} else {
++		if (!ab->rhead_peer_id)
++			return NULL;
++
++		return rhashtable_lookup_fast(ab->rhead_peer_id, &peer_id,
++					      ab->rhash_peer_id_param);
++	}
++}
++#endif
++
+ void ath12k_peer_unmap_event(struct ath12k_base *ab, u16 peer_id)
+ {
+ 	struct ath12k_peer *peer;
+--- a/drivers/net/wireless/ath/ath12k/peer.h
++++ b/drivers/net/wireless/ath/ath12k/peer.h
+@@ -105,6 +105,9 @@ struct ath12k_peer *ath12k_peer_find_lis
+ struct ath12k_peer *ath12k_peer_find_by_addr(struct ath12k_base *ab,
+ 					     const u8 *addr);
+ struct ath12k_peer *ath12k_peer_find_by_id(struct ath12k_base *ab, int peer_id);
++#ifdef CPTCFG_ATH12K_SAWF
++struct ath12k_peer *ath12k_peer_find_pri_by_id(struct ath12k_base *ab, int peer_id);
++#endif
+ void ath12k_peer_cleanup(struct ath12k *ar, u32 vdev_id);
+ int ath12k_peer_delete(struct ath12k *ar, u32 vdev_id, u8 *addr);
+ int ath12k_ml_link_peers_delete(struct ath12k_vif *ahvif, struct ath12k_sta *ahsta);
+--- a/drivers/net/wireless/ath/ath12k/sawf.c
++++ b/drivers/net/wireless/ath/ath12k/sawf.c
+@@ -13,6 +13,7 @@
+ #include <linux/module.h>
+ #include "telemetry.h"
+ #include "telemetry_agent_if.h"
++#include "net/mac80211.h"
+ 
+ #define SVC_INDEX(svc_id) svc_id - 1
+ #define DRV_TO_FW_SVC_ID(svc_id) (svc_id - 1)
+@@ -484,6 +485,9 @@ struct ath12k_base *ath12k_sawf_get_ab_f
+ 	struct ath12k_peer *peer;
+ 	struct ath12k_vif *ahvif;
+ 	struct ath12k_link_vif *arvif;
++	struct ieee80211_sta *sta;
++	struct ath12k_sta *ahsta;
++	u8 mac_addr[ETH_ALEN] = { 0 };
+ 	u8 link_id;
+ 
+ 	if (!dev)
+@@ -502,29 +506,47 @@ struct ath12k_base *ath12k_sawf_get_ab_f
+ 		return NULL;
+ 
+ 	/* ToDo: Instead of mutex_lock, rcu locking will be used
+-	   to access the ahvif->link
++	   to access the links.
+ 	*/
+-	/* Look into all the links, find the matching peer and
+-	 * return with ab and peer_id detail */
+-	for_each_set_bit(link_id, &ahvif->links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
++	sta = ieee80211_find_sta_by_ifaddr(ahvif->ah->hw, peer_mac, NULL);
++	if (!sta) {
++		ath12k_dbg(ab, ATH12K_DBG_SAWF, "Peer:%pM not present \n", peer_mac);
++		return NULL;
++	}
++	ahsta = (struct ath12k_sta *)sta->drv_priv;
++	if (!ahsta)
++		return NULL;
++
++	if (sta->mlo) {
++		link_id = ahsta->primary_link_id;
++		memcpy(mac_addr, ahsta->link[link_id]->addr, ETH_ALEN);
+ 		arvif = ahvif->link[link_id];
++	} else if (sta->valid_links) {
++		link_id = ahsta->deflink.link_id;
++		memcpy(mac_addr, peer_mac, ETH_ALEN);
++	} else {
++		link_id = 0;
++		memcpy(mac_addr, peer_mac, ETH_ALEN);
++	}
+ 
+-		if (WARN_ON(!arvif))
+-			continue;
+-		ar = arvif->ar;
+-		if (!ar)
+-			continue;
+-		ab = ar->ab;
+-		spin_lock_bh(&ab->base_lock);
+-		peer = ath12k_peer_find_by_addr(ab, peer_mac);
+-		spin_unlock_bh(&ab->base_lock);
+-		if (peer) {
+-			*peer_id = peer->peer_id;
+-			break;
+-		}
++	arvif = ahvif->link[link_id];
++	if (WARN_ON(!arvif))
++		return NULL;
+ 
+-		ab = NULL;
++	ar = arvif->ar;
++	if (!ar)
++		return NULL;
++
++	ab = ar->ab;
++	spin_lock_bh(&ab->base_lock);
++	peer = ath12k_peer_find_by_addr(ab, mac_addr);
++	if (!peer) {
++		ath12k_dbg(ab, ATH12K_DBG_SAWF, "Peer: %pM not present\n", mac_addr);
++		spin_unlock_bh(&ab->base_lock);
++		return NULL;
+ 	}
++	*peer_id = peer->peer_id;
++	spin_unlock_bh(&ab->base_lock);
+ 	return ab;
+ }
+ 
+@@ -992,10 +1014,6 @@ static void ath12k_sawf_core_send_ul_con
+ 	ether_addr_copy(latency_info.peer_mac, mac_addr);
+ 
+ 	ret = ath12k_core_sawf_ul_config(dev, &latency_info);
+-	if (ret)
+-		ath12k_err(NULL,
+-			   "SAWF:ul cfg fail for src peer %pM ret %d\n",
+-			   mac_addr, ret);
+ }
+ 
+ void ath12k_send_ul_configs(struct work_struct *work)
+@@ -1013,7 +1031,6 @@ void ath12k_send_ul_configs(struct work_
+ 	list_for_each_entry_safe(ul_params, tmp, &sawf->list, list) {
+ 		list_del(&ul_params->list);
+ 		spin_unlock_bh(&sawf->sawf_svc_lock);
+-
+ 		ath12k_sawf_core_send_ul_config(ul_params->src_dev,
+ 						ul_params->fw_service_id,
+ 						ul_params->src_mac,
+@@ -1040,7 +1057,6 @@ void ath12k_sawf_config_ul(struct net_de
+ 		ath12k_err(NULL, "SAWF ctx is invalid\n");
+ 		return;
+ 	}
+-
+ 	ul_params = kzalloc(sizeof(*ul_params), GFP_NOWAIT);
+ 	if (!ul_params) {
+ 		ath12k_err(NULL,"Failed to allocate memory during SAWF UL configuration\n");
+@@ -1136,22 +1152,18 @@ int ath12k_sawf_wmi_config_peer_latency(
+ 	return ret;
+ }
+ 
+-int ath12k_sawf_wmi_config_ul(struct ath12k_base *ab,
+-                              struct ath12k_sawf_wmi_peer_latency_param *latency_info)
++int ath12k_sawf_wmi_config_ul(struct ath12k *ar,
++			      struct ath12k_sawf_wmi_peer_latency_param *latency_info)
+ {
+-	struct ath12k *ar;
+-	struct ath12k_peer *peer;
+-	int ret = -EOPNOTSUPP;
+-
+-	if (!ab ||
+-	    !latency_info)
+-		return -EINVAL;
++	struct ath12k_base *ab;
++	int ret = -EINVAL;
+ 
+-	spin_lock_bh(&ab->base_lock);
++	if (!ar || !ar->ab) {
++		ath12k_err(NULL, "SAWF UL Cfg fail\n");
++		return ret;
++	}
+ 
+-	peer = ath12k_peer_find_by_addr(ab, latency_info->peer_mac);
+-	if (!peer)
+-		goto unlock_base_lock;
++	ab = ar->ab;
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_SAWF,
+ 		   "SAWF:Peer Found:config uplink:MAC %pM:svc_id %u\n",
+@@ -1179,20 +1191,7 @@ int ath12k_sawf_wmi_config_ul(struct ath
+ 		   latency_info->ofdma_disable,
+ 		   latency_info->mu_mimo_disable);
+ 
+-	ar = ab->pdevs[peer->pdev_idx].ar;
+-	if (ar) {
+-		spin_unlock_bh(&ab->base_lock);
+-		ret = ath12k_sawf_wmi_config_peer_latency(ar, latency_info);
+-		return ret;
+-	} else {
+-		ath12k_err(ab,"SAWF UL Cfg fail, pdev_idx %d ar NULL \n",
+-			   peer->pdev_idx);
+-	}
+-
+-unlock_base_lock:
+-	spin_unlock_bh(&ab->base_lock);
+-
+-	return ret;
++	return ath12k_sawf_wmi_config_peer_latency(ar, latency_info);
+ }
+ 
+ int ath12k_htt_sawf_streaming_stats_configure(struct ath12k *ar,
+@@ -1531,7 +1530,6 @@ void ath12k_sawf_stats_update(struct ath
+ 
+ 	if (u32_get_bits(skb->mark, SAWF_TAG_ID) != SAWF_VALID_TAG)
+ 		return;
+-
+ 	sawf_stats = &peer->sawf_stats;
+ 	if (!sawf_stats) {
+ 		ath12k_err(ab, "sawf stats not available\n");
+@@ -1630,7 +1628,6 @@ latency_stats_update:
+ 
+ 	if (!pkt_win)
+ 		pkt_win = ATH12K_MOV_AVG_PKT_WIN;
+-
+ 	if (!(tx_delay_stats->num_pkt % pkt_win)) {
+ 		tx_delay_stats->nwdelay_avg = div_u64(tx_delay_stats->nwdelay_win_total,
+ 					  pkt_win);
+@@ -1738,12 +1735,6 @@ static void ath12k_copy_tx_stats(struct
+ 	dst->dropped.fw_reason2 = src->dropped.fw_reason2;
+ 	dst->dropped.fw_reason3 = src->dropped.fw_reason3;
+ 
+-	dst->svc_intval_stats.success_cnt = src->svc_intval_stats.success_cnt;
+-	dst->svc_intval_stats.failure_cnt = src->svc_intval_stats.failure_cnt;
+-
+-	dst->burst_size_stats.success_cnt = src->burst_size_stats.success_cnt;
+-	dst->burst_size_stats.failure_cnt = src->burst_size_stats.failure_cnt;
+-
+ 	dst->tx_failed = src->tx_failed;
+ 	dst->queue_depth = src->queue_depth;
+ 
+@@ -1753,7 +1744,7 @@ static void ath12k_copy_tx_stats(struct
+ 
+ static int ath12k_telemetry_get_txstats(struct telemetry_sawftx_stats *tx_stats,
+ 					struct ath12k_base *ab,
+-					u8 *peer_mac, u8 svc_id)
++					u8 *peer_mac, u16 peer_id, u8 svc_id)
+ {
+ 	struct ath12k_sawf_stats *sawf_stats = NULL;
+ 	struct sawf_tx_stats *stats;
+@@ -1761,12 +1752,14 @@ static int ath12k_telemetry_get_txstats(
+ 	struct ath12k_peer *peer = NULL;
+ 	struct ath12k_sawf_peer_ctx *peer_ctx = NULL;
+ 	int ret = 0;
++	u16 tmp_peer_id = 0;
++	u64 svc_int_suc = 0, svc_int_fail = 0, burst_sz_suc = 0, burst_sz_fail = 0;
+ 	u32 throughput = 0, ingress_rate = 0, msduq = 0;
+ 	u8 sawf_max_user_queues;
+ 
+ 	sawf_max_user_queues = sawf_ctx->max_msduq_per_tid - sawf_ctx->default_msduq_per_tid;
+ 	spin_lock_bh(&ab->base_lock);
+-	peer = ath12k_peer_find_by_addr(ab, peer_mac);
++	peer = ath12k_peer_find_by_id(ab, peer_id);
+ 	if (!peer) {
+ 		ret = -ENOENT;
+ 		goto end_stats;
+@@ -1788,6 +1781,7 @@ static int ath12k_telemetry_get_txstats(
+ 		int tid, q_idx;
+ 		for (tid = 0; tid < ATH12K_SAWF_MAX_TID_SUPPORT; tid++) {
+ 			for (q_idx = 0; q_idx < sawf_max_user_queues; q_idx++) {
++				svc_int_suc = svc_int_fail = burst_sz_suc = burst_sz_fail = 0;
+ 				stats = &sawf_stats->tx_stats[tid][q_idx];
+ 				tx = &tx_stats->tx[tid][q_idx];
+ 				if (peer_ctx->telemetry_peer_ctx) {
+@@ -1802,6 +1796,24 @@ static int ath12k_telemetry_get_txstats(
+ 				stats->throughput = throughput;
+ 				stats->ingress_rate = ingress_rate;
+ 				ath12k_copy_tx_stats(stats, tx);
++				if (peer->mlo) {
++					tmp_peer_id = peer->ml_peer_id;
++					spin_unlock_bh(&ab->base_lock);
++					ath12k_get_svc_int_nd_burst_sz_stats(tmp_peer_id, tid, q_idx,
++									     &svc_int_suc, &svc_int_fail,
++									     &burst_sz_suc, &burst_sz_fail);
++					spin_lock_bh(&ab->base_lock);
++					tx->svc_intval_stats.success_cnt = svc_int_suc;
++					tx->svc_intval_stats.failure_cnt = svc_int_fail;
++					tx->burst_size_stats.success_cnt = burst_sz_suc;
++					tx->burst_size_stats.failure_cnt = burst_sz_fail;
++				} else {
++					tx->svc_intval_stats.success_cnt = stats->svc_intval_stats.success_cnt;
++					tx->svc_intval_stats.failure_cnt = stats->svc_intval_stats.failure_cnt;
++					tx->burst_size_stats.success_cnt = stats->burst_size_stats.success_cnt;
++					tx->burst_size_stats.failure_cnt = stats->burst_size_stats.failure_cnt;
++
++				}
+ 			}
+ 		}
+ 	} else {
+@@ -1821,6 +1833,24 @@ static int ath12k_telemetry_get_txstats(
+ 		stats->throughput = throughput;
+ 		stats->ingress_rate = ingress_rate;
+ 		ath12k_copy_tx_stats(stats, tx);
++		if (peer->mlo) {
++			tmp_peer_id = peer->ml_peer_id;
++			spin_unlock_bh(&ab->base_lock);
++			ath12k_get_svc_int_nd_burst_sz_stats(tmp_peer_id, tid, q_id,
++							     &svc_int_suc, &svc_int_fail,
++							     &burst_sz_suc, &burst_sz_fail);
++			spin_lock_bh(&ab->base_lock);
++			tx->svc_intval_stats.success_cnt = svc_int_suc;
++			tx->svc_intval_stats.failure_cnt = svc_int_fail;
++			tx->burst_size_stats.success_cnt = burst_sz_suc;
++			tx->burst_size_stats.failure_cnt = burst_sz_fail;
++		} else {
++			tx->svc_intval_stats.success_cnt = stats->svc_intval_stats.success_cnt;
++			tx->svc_intval_stats.failure_cnt = stats->svc_intval_stats.failure_cnt;
++			tx->burst_size_stats.success_cnt = stats->burst_size_stats.success_cnt;
++			tx->burst_size_stats.failure_cnt = stats->burst_size_stats.failure_cnt;
++		}
++
+ 		tx_stats->tid = tid;
+ 		tx_stats->msduq = q_id;
+ 	}
+@@ -1852,7 +1882,7 @@ static void ath12k_copy_delay_stats(stru
+ 
+ static int ath12k_telemetry_get_delaystats(struct telemetry_sawfdelay_stats *delay_stats,
+ 					   struct ath12k_base *ab,
+-					   u8 *peer_mac, u8 svc_id)
++					   u8 *peer_mac, u16 peer_id, u8 svc_id)
+ {
+ 	struct ath12k_sawf_stats *sawf_stats;
+ 	struct sawf_tx_delay_stats *stats;
+@@ -1865,7 +1895,7 @@ static int ath12k_telemetry_get_delaysta
+ 
+ 	sawf_max_user_queues = sawf_ctx->max_msduq_per_tid - sawf_ctx->default_msduq_per_tid;
+ 	spin_lock_bh(&ab->base_lock);
+-	peer = ath12k_peer_find_by_addr(ab, peer_mac);
++	peer = ath12k_peer_find_by_id(ab, peer_id);
+ 	if (!peer) {
+ 		ret = -ENOENT;
+ 		goto end_stats;
+@@ -1936,12 +1966,11 @@ end_stats:
+ int telemetry_extract_data(struct stats_config *cfg,
+ 			   struct telemetry_sawftx_stats *tx_stats,
+ 			   struct telemetry_sawfdelay_stats *delay_stats,
+-			   struct ath12k_base *ab)
++			   struct ath12k_base *ab, u16 peer_id)
+ {
+ 	u32 feat = 0;
+ 	int ret = 0;
+ 	u8 *mac_addr, svc_id;
+-
+ 	if (!sawf_ctx)
+ 		return -ENODATA;
+ 
+@@ -1959,13 +1988,13 @@ int telemetry_extract_data(struct stats_
+ 	mac_addr = cfg->mac;
+ 
+ 	if (feat & STATS_FEAT_FLG_SAWFDELAY) {
+-		ret = ath12k_telemetry_get_delaystats(delay_stats, ab, mac_addr, svc_id);
++		ret = ath12k_telemetry_get_delaystats(delay_stats, ab, mac_addr, peer_id, svc_id);
+ 		if (ret)
+ 			return ret;
+ 	}
+ 
+ 	if (feat & STATS_FEAT_FLG_SAWFTX)
+-		ret = ath12k_telemetry_get_txstats(tx_stats, ab, mac_addr, svc_id);
++		ret = ath12k_telemetry_get_txstats(tx_stats, ab, mac_addr, peer_id, svc_id);
+ 
+ 	return ret;
+ }
+@@ -2169,7 +2198,7 @@ void ath12k_telemetry_notify_breach(u8 *
+ 	if (peer && ab) {
+ 		spin_lock_bh(&ab->base_lock);
+ 		vif = peer->vif;
+-		if (peer->peer_id & ATH12K_ML_PEER_ID_VALID)
++		if (peer->mlo)
+ 			mld_addr = peer->ml_addr;
+ 		spin_unlock_bh(&ab->base_lock);
+ 		ath12k_vendor_telemetry_notify_breach(vif, mac_addr, svc_id, param,
+--- a/drivers/net/wireless/ath/ath12k/sawf.h
++++ b/drivers/net/wireless/ath/ath12k/sawf.h
+@@ -842,7 +842,7 @@ u16 ath12k_sawf_get_msduq(struct net_dev
+ void ath12k_sawf_config_ul(struct net_device *dest_dev, u8 *dst_mac, struct net_device *src_dev,  u8 *src_mac,
+ 			   u8 fw_service_id, u8 rv_service_id,
+ 			   u8 add_or_sub);
+-int ath12k_sawf_wmi_config_ul(struct ath12k_base *ab,
++int ath12k_sawf_wmi_config_ul(struct ath12k *ar,
+ 			      struct ath12k_sawf_wmi_peer_latency_param *latency_info);
+ struct ath12k_base *ath12k_sawf_get_ab_from_netdev(struct net_device *dev,
+ 						u8 *peer_mac,
+@@ -875,7 +875,7 @@ void ath12k_htt_sawf_streaming_stats_ind
+ int telemetry_extract_data(struct stats_config *cfg,
+ 			   struct telemetry_sawftx_stats *tx_stats,
+ 			   struct telemetry_sawfdelay_stats *delay_stats,
+-			   struct ath12k_base *ab);
++			   struct ath12k_base *ab, u16 peer_id);
+ int ath12k_telemetry_sla_reset_stats(u8 svc_id, u8 *peer_mac, u8 *mld_mac_addr,
+ 				     u8 set_clear);
+ int ath12k_telemetry_get_sawf_tx_stats_tput(void *ptr, void *stats, u64 *in_bytes,
+--- a/drivers/net/wireless/ath/ath12k/vendor.c
++++ b/drivers/net/wireless/ath/ath12k/vendor.c
+@@ -990,7 +990,7 @@ static int ath12k_vendor_telemetry_getst
+ 		stats->size[STATS_FEAT_SAWFDELAY] = sizeof(struct telemetry_sawfdelay_stats);
+ 	}
+ 
+-	ret = telemetry_extract_data(&cfg, tx_stats, delay_stats, ab);
++	ret = telemetry_extract_data(&cfg, tx_stats, delay_stats, ab, peer_id);
+ 	if (ret)
+ 		goto end_stats;
+ 

@@ -1,0 +1,199 @@
+From b72718200a890327772f32a616789bde6b248ccd Mon Sep 17 00:00:00 2001
+From: Pradeep Kumar Chitrapu <quic_pradeepc@quicinc.com>
+Date: Thu, 4 Apr 2024 15:20:58 -0700
+Subject: [PATCH] wifi: mac80211: Move DS stats support to new patch
+
+While bonded model is cleaned up, DS stats utility functions
+added in mac80211 are moved to new patch file.
+
+Signed-off-by: Pradeep Kumar Chitrapu <quic_pradeepc@quicinc.com>
+---
+ include/net/mac80211.h | 31 ++++++++++++++++++++++++
+ net/mac80211/rx.c      | 53 ++++++++++++++++++++++++++++++++++++++++++
+ net/mac80211/status.c  | 33 ++++++++++++++++++++++++++
+ 3 files changed, 117 insertions(+)
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -5060,6 +5060,11 @@ void ieee80211_restart_hw(struct ieee802
+ void ieee80211_rx_list(struct ieee80211_hw *hw, struct ieee80211_sta *sta,
+ 		       struct sk_buff *skb, struct list_head *list);
+ 
++#ifdef CPTCFG_MAC80211_DS_SUPPORT
++void ieee80211_rx_update_stats(struct ieee80211_hw *hw, struct ieee80211_sta *pubsta,
++			       int link_id, u32 len, struct ieee80211_rx_status *status);
++#endif /* CPTCFG_MAC80211_DS_SUPPORT */
++
+ /**
+  * ieee80211_rx_napi - receive frame from NAPI context
+  *
+@@ -5435,6 +5440,32 @@ void ieee80211_report_low_ack(struct iee
+ 
+ #define IEEE80211_MAX_CNTDWN_COUNTERS_NUM 2
+ 
++#ifdef CPTCFG_MAC80211_DS_SUPPORT
++/**
++ * ieee80211_ppeds_tx_update_stats - update tx stats for PPE DS path
++ *
++ * Call this function for all transmitted data frames after their transmit
++ * completion. This callback should only be called for data frames which
++ * are using driver's (or hardware's) offload capability of encap/decap
++ * 802.11 frames.
++ *
++ * This function may not be called in IRQ context. Calls to this function
++ * for a single hardware must be synchronized against each other and all
++ * calls in the same tx status family.
++ *
++ * @hw: the hardware the frame was transmitted by
++ * @pubsta: the station to update the tx rate for.
++ * @info: tx status information
++ * @rate: tx rate information
++ * @link_id: link id
++ * @len: length
++ */
++void ieee80211_ppeds_tx_update_stats(struct ieee80211_hw *hw,
++				     struct ieee80211_sta *pubsta,
++				     struct ieee80211_tx_info *info,
++				     struct rate_info rate, int link_id, u32 len);
++#endif /* CPTCFG_MAC80211_DS_SUPPORT */
++
+ /**
+  * struct ieee80211_mutable_offsets - mutable beacon offsets
+  * @tim_offset: position of TIM element
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@ -4930,6 +4930,62 @@ void ieee80211_check_fast_rx_iface(struc
+ 	mutex_unlock(&local->sta_mtx);
+ }
+ 
++#ifdef CPTCFG_MAC80211_DS_SUPPORT
++void ieee80211_rx_update_stats(struct ieee80211_hw *hw, struct ieee80211_sta *pubsta,
++			       int link_id, u32 len, struct ieee80211_rx_status *status)
++{
++	struct sta_info *sta = container_of(pubsta, struct sta_info, sta);
++	struct link_sta_info *link_sta;
++	struct ieee80211_sta_rx_stats *stats;
++
++	rcu_read_lock();
++	if (link_id >= 0) {
++		link_sta = rcu_dereference(sta->link[link_id]);
++		if (WARN_ON_ONCE(!link_sta)) {
++			rcu_read_unlock();
++			return;
++		}
++	} else {
++		link_sta = &sta->deflink;
++	}
++
++	if (ieee80211_hw_check(hw, USES_RSS))
++		stats = this_cpu_ptr(link_sta->pcpu_rx_stats);
++	else
++		stats = &link_sta->rx_stats;
++
++	if (!(status->flag & RX_FLAG_NO_SIGNAL_VAL)) {
++		stats->last_signal = status->signal;
++	}
++
++	if (status->chains) {
++		int i;
++
++		stats->chains = status->chains;
++		for (i = 0; i < ARRAY_SIZE(status->chain_signal); i++) {
++			int signal = status->chain_signal[i];
++
++			if (!(status->chains & BIT(i)))
++				continue;
++
++			stats->chain_signal_last[i] = signal;
++		}
++	}
++
++	stats->last_rx = jiffies;
++	stats->last_rate = sta_stats_encode_rate(status);
++
++	stats->fragments++;
++	stats->packets++;
++
++	u64_stats_update_begin(&stats->syncp);
++	stats->bytes += len;
++	u64_stats_update_end(&stats->syncp);
++	rcu_read_unlock();
++}
++EXPORT_SYMBOL(ieee80211_rx_update_stats);
++#endif /* CPTCFG_MAC80211_DS_SUPPORT */
++
+ static void ieee80211_rx_8023(struct ieee80211_rx_data *rx,
+ 			      struct ieee80211_fast_rx *fast_rx,
+ 			      int orig_len)
+--- a/net/mac80211/status.c
++++ b/net/mac80211/status.c
+@@ -1247,6 +1247,40 @@ void ieee80211_tx_rate_update(struct iee
+ }
+ EXPORT_SYMBOL(ieee80211_tx_rate_update);
+ 
++#ifdef CPTCFG_MAC80211_DS_SUPPORT
++void ieee80211_ppeds_tx_update_stats(struct ieee80211_hw *hw,
++				     struct ieee80211_sta *pubsta,
++				     struct ieee80211_tx_info *info,
++				     struct rate_info rate, int link_id, u32 len)
++{
++	struct sta_info *sta = container_of(pubsta, struct sta_info, sta);
++	struct link_sta_info *link_sta;
++	int rates_idx, retry_count;
++
++	rcu_read_lock();
++	if (link_id >= 0) {
++		link_sta = rcu_dereference(sta->link[link_id]);
++		if (WARN_ON_ONCE(!link_sta)) {
++			rcu_read_unlock();
++			return;
++		}
++	} else {
++		link_sta = &sta->deflink;
++	}
++
++	link_sta->tx_stats.packets[0]++;
++	link_sta->tx_stats.bytes[0] += len;
++	rates_idx = ieee80211_tx_get_rates(hw, info, &retry_count);
++	if (rates_idx != -1)
++		link_sta->tx_stats.last_rate = info->status.rates[rates_idx];
++	link_sta->tx_stats.last_rate_info = rate;
++
++	rcu_read_unlock();
++}
++EXPORT_SYMBOL(ieee80211_ppeds_tx_update_stats);
++#endif /* CPTCFG_MAC80211_DS_SUPPORT */
++
++
+ void ieee80211_tx_status_8023(struct ieee80211_hw *hw,
+                               struct ieee80211_vif *vif,
+                               struct sk_buff *skb)
+--- a/local-symbols
++++ b/local-symbols
+@@ -67,6 +67,7 @@ MAC80211_DEBUG_COUNTERS=
+ MAC80211_STA_HASH_MAX_SIZE=
+ MAC80211_NSS_SUPPORT=
+ MAC80211_PPE_SUPPORT=
++MAC80211_DS_SUPPORT=
+ MAC80211_SFE_SUPPORT=
+ QCOM_AOSS_QMP=
+ QCOM_COMMAND_DB=
+--- a/net/mac80211/Kconfig
++++ b/net/mac80211/Kconfig
+@@ -129,6 +129,16 @@ config MAC80211_PPE_SUPPORT
+ 
+          If unsure, say N.
+ 
++config MAC80211_DS_SUPPORT
++       bool "QTI mac80211 PPE DS support"
++       depends on ATH12K
++       default n
++       ---help---
++         Enables PPE DS support in MAC80211. Currently used only
++	 for updating per packet stats in DS case
++
++         If unsure, say N.
++
+ config MAC80211_NOINLINE
+ 	bool "Do not inline TX/RX handlers"
+ 	depends on MAC80211_DEBUG_MENU

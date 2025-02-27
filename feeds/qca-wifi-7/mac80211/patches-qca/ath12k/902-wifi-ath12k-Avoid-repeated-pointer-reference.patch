@@ -1,0 +1,356 @@
+From 8461cba2c41ae4b1ddfb01b542059974bac644d1 Mon Sep 17 00:00:00 2001
+From: Yuvasree Sivasankaran <quic_ysivasan@quicinc.com>
+Date: Mon, 1 Apr 2024 13:08:06 +0530
+Subject: [PATCH] wifi: ath12k: Avoid repeated pointer reference and 
+replicate usage of FIELD_GET/PREP
+
+Optimize CPU in tx path for throughput improvement. Below the
+optimization areas:
+
+1. Remove replicate usage of FIELD_GET/FIELD_PREP.
+2. Avoid repeated pointer deference to reduce cache miss
+
+Above mention optimization gives 50-70 mbps improvement.
+
+Patch Dependency: 718-f-ath12k-Add-ath12k_dp_tx_direct-for-faster-tx-process.patch
+		  719-d-ath12k-Optimize-tx-descriptor-updates.-Avoid-FIELD_P.patch 
+
+Signed-off-by: Yuvasree Sivasankaran <quic_ysivasan@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_tx.c | 78 +++++++++++++------------
+ 1 file changed, 40 insertions(+), 38 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -268,10 +268,10 @@ int ath12k_dp_tx_direct(struct ath12k_li
+ 	struct ath12k *ar = arvif->ar;
+ 	struct ath12k_base *ab = arvif->ab;
+ 	struct ath12k_dp *dp = arvif->dp;
++	struct ath12k_vif_tcl_desc_template *desc = &arvif->desc;
+ 	struct ath12k_tx_desc_info *tx_desc = NULL;
+ 	struct ath12k_skb_cb *skb_cb = ATH12K_SKB_CB(skb);
+ 	struct hal_srng *tcl_ring;
+-	struct dp_tx_ring *tx_ring;
+ 	struct device *dev = arvif->dev;
+ 	void *hal_tcl_desc;
+ 	struct hal_tcl_data_cmd tcl_desc;
+@@ -288,12 +288,11 @@ int ath12k_dp_tx_direct(struct ath12k_li
+ 	int len = skb->len;
+ #endif
+ 
+-	if (unlikely(test_bit(ATH12K_FLAG_CRASH_FLUSH, &ar->ab->dev_flags)))
++	if (unlikely(test_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags)))
+ 		return -ESHUTDOWN;
+ 
+ 	ring_id = smp_processor_id();
+ 
+-	tx_ring = &dp->tx_ring[ring_id];
+ 
+ 	tx_desc = ath12k_dp_tx_assign_buffer(dp, ring_id);
+ 	if (unlikely(!tx_desc)) {
+@@ -314,7 +313,6 @@ int ath12k_dp_tx_direct(struct ath12k_li
+ 	tx_desc->skb = skb;
+ 	tx_desc->mac_id = arvif->pdev_idx;
+ 	tx_desc->recycler_fast_xmit = 0;
+-	tx_desc->timestamp = ktime_get_real();
+ 
+ #ifdef CPTCFG_MAC80211_SFE_SUPPORT
+ 	/* the edma driver uses this flags to optimize the cache invalidation */
+@@ -326,6 +324,54 @@ int ath12k_dp_tx_direct(struct ath12k_li
+ 	skb_cb->vif = arvif->ahvif->vif;
+ 	skb_cb->paddr =  paddr;
+ 
++	tcl_desc.buf_addr_info.info0 = (u32)paddr;
++        tcl_desc.buf_addr_info.info1 = (tx_desc->desc_id << 12);
++        tcl_desc.info0 =  desc->info0;
++        tcl_desc.info1 =  desc->info1;
++        tcl_desc.info2 =  skb->len;
++
++        if (likely(skb->ip_summed == CHECKSUM_PARTIAL))
++                tcl_desc.info2 |= TX_IP_CHECKSUM;
++
++        tcl_desc.info3 = desc->info3;
++        tcl_desc.info4 = desc->info4;
++        tcl_desc.info5 = 0;
++#ifdef CPTCFG_ATH12K_SAWF
++        /* SAWF */
++        if (u32_get_bits(skb->mark, SAWF_TAG_ID) == SAWF_VALID_TAG) {
++                u32 msduq_id = u32_get_bits(skb->mark, SAWF_MSDUQ_ID);
++                tx_desc->timestamp = ktime_get_real();
++
++                if (msduq_id < (ab->max_msduq_per_tid * ATH12K_SAWF_MAX_TID_SUPPORT)) {
++                        u32 meta_data_flags;
++                        tcl_desc.info3 |= ath12k_sawf_get_tcl_cmd_info3_update(msduq_id);
++                        meta_data_flags =
++                                        ath12k_sawf_get_tcl_metadata_update(skb->mark);
++                        tcl_desc.info1 = u32_encode_bits(meta_data_flags,
++                                                         HAL_TCL_DATA_CMD_INFO1_CMD_NUM);
++                }
++
++                if (unlikely(ath12k_debugfs_is_sawf_stats_enabled(ar) & ATH12K_SAWF_STATS_BASIC)) {
++                        u16 peer_id = u32_get_bits(skb->mark, SAWF_PEER_ID);
++                        u32 len = skb_headlen(skb);
++                        spin_lock_bh(&ab->base_lock);
++                        peer = ath12k_peer_find_by_peer_list_index(ar, peer_id);
++                        if (unlikely(!peer || !peer->sta))
++                                ath12k_dbg(ab, ATH12K_DBG_SAWF,
++                                           "peer_id %u not found \n", peer_id);
++                        else
++                                ath12k_sawf_tx_enqueue_peer_stats(ab, peer, msduq_id, len);
++                        spin_unlock_bh(&ab->base_lock);
++                }
++                /* Store the NWDELAY to skb->mark which can be fetched
++                 * during tx completion
++                 */
++                if (info->sawf.nw_delay > SAWF_NW_DELAY_MAX)
++                        info->sawf.nw_delay = SAWF_NW_DELAY_MAX;
++                skb->mark = (SAWF_VALID_TAG << SAWF_TAG_SHIFT) | (info->sawf.nw_delay << SAWF_NW_DELAY_SHIFT) | msduq_id;
++        }
++#endif
++
+ 	hal_ring_id = ring_id + HAL_SRNG_RING_ID_SW2TCL1;
+ 	tcl_ring = &ab->hal.srng_list[hal_ring_id];
+ 	spin_lock_bh(&tcl_ring->lock);
+@@ -345,56 +391,6 @@ int ath12k_dp_tx_direct(struct ath12k_li
+ 
+ 	ab->soc_stats.tx_enqueued[ring_id]++;
+ 
+-	tcl_desc.buf_addr_info.info0 = (u32)paddr;
+-	tcl_desc.buf_addr_info.info1 = (tx_desc->desc_id << 12);
+-	tcl_desc.info0 =  arvif->desc.info0;
+-	tcl_desc.info1 =  arvif->desc.info1;
+-	tcl_desc.info2 =  skb->len;
+-
+-	if (likely(skb->ip_summed == CHECKSUM_PARTIAL))
+-		tcl_desc.info2 |= TX_IP_CHECKSUM;
+-
+-	tcl_desc.info3 = arvif->desc.info3;
+-	tcl_desc.info4 =  arvif->desc.info4;
+-	tcl_desc.info5 = 0;
+-#ifdef CPTCFG_ATH12K_SAWF
+-	/* SAWF */
+-	if (u32_get_bits(skb->mark, SAWF_TAG_ID) == SAWF_VALID_TAG) {
+-		u32 msduq_id = u32_get_bits(skb->mark, SAWF_MSDUQ_ID);
+-
+-		if (msduq_id < (ab->max_msduq_per_tid * ATH12K_SAWF_MAX_TID_SUPPORT)) {
+-			u32 meta_data_flags;
+-			tcl_desc.info3 |= ath12k_sawf_get_tcl_cmd_info3_update(msduq_id);
+-			meta_data_flags =
+-					ath12k_sawf_get_tcl_metadata_update(skb->mark);
+-			tcl_desc.info1 = u32_encode_bits(meta_data_flags,
+-							 HAL_TCL_DATA_CMD_INFO1_CMD_NUM);
+-		}
+-
+-		if (unlikely(ath12k_debugfs_is_sawf_stats_enabled(ar) & ATH12K_SAWF_STATS_BASIC)) {
+-			u16 peer_id = u32_get_bits(skb->mark, SAWF_PEER_ID);
+-			u32 len = skb_headlen(skb);
+-
+-			rcu_read_lock();
+-			peer = ath12k_peer_find_by_peer_list_index(ar, peer_id);
+-			if (unlikely(!peer || !peer->sta)) {
+-				ath12k_dbg(ab, ATH12K_DBG_SAWF,
+-					   "peer_id %u not found \n", peer_id);
+-			} else {
+-				spin_lock_bh(&ab->base_lock);
+-				ath12k_sawf_tx_enqueue_peer_stats(ab, peer, msduq_id, len);
+-				spin_unlock_bh(&ab->base_lock);
+-			}
+-			rcu_read_unlock();
+-		}
+-		/* Store the NWDELAY to skb->mark which can be fetched
+-		 * during tx completion
+-		 */
+-		if (info->sawf.nw_delay > SAWF_NW_DELAY_MAX)
+-			info->sawf.nw_delay = SAWF_NW_DELAY_MAX;
+-		skb->mark = (SAWF_VALID_TAG << SAWF_TAG_SHIFT) | (info->sawf.nw_delay << SAWF_NW_DELAY_SHIFT) | msduq_id;
+-	}
+-#endif
+ 	memcpy(hal_tcl_desc, &tcl_desc, sizeof(tcl_desc));
+ 	dsb(st);
+ 	ath12k_hal_srng_access_umac_src_ring_end_nolock(tcl_ring);
+@@ -449,7 +445,7 @@ int ath12k_dp_tx(struct ath12k *ar, stru
+ 	bool add_htt_metadata = false;
+ 	u32 info4 = arvif->desc.info4;;
+ 
+-	if (unlikely(test_bit(ATH12K_FLAG_CRASH_FLUSH, &ar->ab->dev_flags)) ||
++	if (unlikely(test_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags)) ||
+ 	    unlikely(test_bit(ATH12K_FLAG_UMAC_PRERESET_START, &ab->dev_flags)))
+ 		return -ESHUTDOWN;
+ 
+@@ -793,7 +789,6 @@ static inline void ath12k_dp_tx_decremen
+ 
+ static void ath12k_dp_tx_free_txbuf(struct ath12k_base *ab,
+ 				    struct sk_buff *msdu, u8 mac_id,
+-				    struct dp_tx_ring *tx_ring,
+ 				    struct sk_buff *skb_ext_desc)
+ {
+ 	struct ath12k_skb_cb *skb_cb;
+@@ -820,17 +815,15 @@ static inline void ath12k_dp_tx_status_p
+                                              struct hal_wbm_completion_ring_tx *desc,
+                                              struct hal_tx_status *ts)
+ {
+-	ts->buf_rel_source =
+-		FIELD_GET(HAL_WBM_COMPL_TX_INFO0_REL_SRC_MODULE, desc->info0);
+-	if (ts->buf_rel_source != HAL_WBM_REL_SRC_MODULE_FW &&
+-	    ts->buf_rel_source != HAL_WBM_REL_SRC_MODULE_TQM)
+-		return;
+ 
+-	if (ts->buf_rel_source == HAL_WBM_REL_SRC_MODULE_FW)
++	if (ts->buf_rel_source != HAL_WBM_REL_SRC_MODULE_TQM)
+ 		return;
+ 
+ 	ts->status = FIELD_GET(HAL_WBM_COMPL_TX_INFO0_TQM_RELEASE_REASON,
+ 			       desc->info0);
++
++	ab->soc_stats.tqm_rel_reason[ts->status]++;
++
+ 	ts->ppdu_id = FIELD_GET(HAL_WBM_COMPL_TX_INFO1_TQM_STATUS_NUMBER,
+ 				desc->info1);
+ 	ts->ack_rssi = FIELD_GET(HAL_WBM_COMPL_TX_INFO2_ACK_FRAME_RSSI,
+@@ -971,11 +964,10 @@ ath12k_dp_tx_process_htt_tx_complete(str
+ 				     struct sk_buff *msdu,
+ 				     struct dp_tx_ring *tx_ring,
+ 				     struct sk_buff *skb_ext_desc,
+-				     ktime_t timestamp)
++				     ktime_t timestamp, int htt_status)
+ {
+ 	struct htt_tx_wbm_completion *status_desc;
+ 	struct ath12k_dp_htt_wbm_tx_status ts = {0};
+-	int htt_status;
+ 
+ 	status_desc = desc + HTT_TX_WBM_COMP_STATUS_OFFSET;
+ 
+@@ -997,7 +989,7 @@ ath12k_dp_tx_process_htt_tx_complete(str
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_REINJ:
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_INSPECT:
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_VDEVID_MISMATCH:
+-		ath12k_dp_tx_free_txbuf(ab, msdu, mac_id, tx_ring, skb_ext_desc);
++		ath12k_dp_tx_free_txbuf(ab, msdu, mac_id, skb_ext_desc);
+ 		break;
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_MEC_NOTIFY:
+ 		/* This event is to be handled only when the driver decides to
+@@ -1146,7 +1138,7 @@ static void ath12k_dp_tx_complete_msdu(s
+ 				       struct sk_buff *msdu,
+ 				       struct hal_wbm_release_ring *tx_status,
+ 				       enum hal_wbm_rel_src_module buf_rel_source,
+-				       int ring, ktime_t timestamp)
++				       int ring, ktime_t timestamp, int wbm_status)
+ {
+ 	struct ieee80211_tx_status status = { 0 };
+ 	struct ieee80211_rate_status status_rate = { 0 };
+@@ -1157,7 +1149,6 @@ static void ath12k_dp_tx_complete_msdu(s
+ 	struct ath12k_link_sta *arsta;
+ 	struct rate_info rate;
+ 	struct hal_tx_status ts = { 0 };
+-	enum hal_wbm_htt_tx_comp_status wbm_status;
+ 	struct ieee80211_vif *vif;
+ 	struct ath12k_vif *ahvif;
+ 	u8 flags = 0;
+@@ -1180,6 +1171,7 @@ static void ath12k_dp_tx_complete_msdu(s
+                 return;
+         }
+ 
++	ts.buf_rel_source = buf_rel_source;
+ 	ath12k_dp_tx_status_parse(ab, (struct hal_wbm_completion_ring_tx *)tx_status, &ts);
+ 
+ 	ar->wmm_stats.tx_type = ath12k_tid_to_ac(ts.tid > ATH12K_DSCP_PRIORITY ? 0:ts.tid);
+@@ -1188,9 +1180,6 @@ static void ath12k_dp_tx_complete_msdu(s
+ 			ar->wmm_stats.total_wmm_tx_drop[ar->wmm_stats.tx_type]++;
+ 	}
+ 
+-	wbm_status = FIELD_GET(HTT_TX_WBM_COMP_INFO0_STATUS,
+-			       tx_status->info0);
+-
+ 	vif = skb_cb->vif;
+ 	ahvif = (void *)vif->drv_priv;
+ 	if (ahvif->links_map & BIT(skb_cb->link_id)) {
+@@ -1627,12 +1616,13 @@ int ath12k_dp_tx_completion_handler(stru
+ 	int valid_entries;
+ 	int orig_budget = budget;
+ 	struct hal_wbm_completion_ring_tx *tx_status;
+-	ktime_t timestamp;
++	ktime_t timestamp = 0;
+ 	enum hal_wbm_rel_src_module buf_rel_source;
+-	enum hal_wbm_tqm_rel_reason rel_status;
+ 	struct sk_buff_head free_list_head;
+ 	int recycler_fast_xmit;
+ 
++	struct htt_tx_wbm_completion *status_desc;
++	int htt_status;
+ 
+ 	INIT_LIST_HEAD(&desc_free_list);
+ 
+@@ -1652,8 +1642,19 @@ int ath12k_dp_tx_completion_handler(stru
+ 
+ 	while (budget && (tx_status = (struct hal_wbm_completion_ring_tx *)ath12k_hal_srng_dst_get_next_cache_entry(ab, status_ring))) {
+ 		budget--;
+-		if (!ath12k_dp_tx_completion_valid((struct hal_wbm_release_ring *)tx_status))
+-			continue;
++
++		/* Find the HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE value */
++		buf_rel_source = FIELD_GET(HAL_WBM_COMPL_TX_INFO0_REL_SRC_MODULE, tx_status->info0);
++		ab->soc_stats.tx_wbm_rel_source[buf_rel_source]++;
++
++		status_desc = ((u8 *) tx_status) + HTT_TX_WBM_COMP_STATUS_OFFSET;
++		htt_status = FIELD_GET(HTT_TX_WBM_COMP_INFO0_STATUS, status_desc->info0);
++
++		if (buf_rel_source == HAL_WBM_REL_SRC_MODULE_FW) {
++			/* Dont consider HTT_TX_COMP_STATUS_MEC_NOTIFY */
++			if (htt_status == HAL_WBM_REL_HTT_TX_COMP_STATUS_MEC_NOTIFY)
++				continue;
++		}
+ 
+ 		if (likely(HAL_WBM_COMPL_TX_INFO0_CC_DONE & tx_status->info0)) {
+ 			/* HW done cookie conversion */
+@@ -1676,7 +1677,10 @@ int ath12k_dp_tx_completion_handler(stru
+ 		mac_id = tx_desc->mac_id;
+ 		recycler_fast_xmit = tx_desc->recycler_fast_xmit;
+ 		skb_ext_desc = tx_desc->skb_ext_desc;
++
++#ifdef CPTCFG_ATH12K_SAWF
+ 		timestamp = tx_desc->timestamp;
++#endif
+ 
+ 		/* Release descriptor as soon as extracting necessary info
+ 		 * to reduce contention
+@@ -1698,21 +1702,13 @@ int ath12k_dp_tx_completion_handler(stru
+ 		prefetch(msdu);
+ 		prefetch( (u8 *) msdu + 64);
+ 
+-		/* Find the HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE value */
+-		buf_rel_source = tx_status->info0 & HAL_WBM_RELEASE_INFO0_REL_SRC_MASK;
+-		ab->soc_stats.tx_wbm_rel_source[buf_rel_source]++;
+-
+-		rel_status = FIELD_GET(HAL_WBM_COMPL_TX_INFO0_TQM_RELEASE_REASON,
+-				       tx_status->info0);
+-		ab->soc_stats.tqm_rel_reason[rel_status]++;
+-
+ 		if (unlikely(buf_rel_source == HAL_WBM_REL_SRC_MODULE_FW)) {
+ 			ath12k_dp_tx_process_htt_tx_complete(ab,
+ 							     (void *)tx_status,
+ 							     mac_id, msdu,
+ 							     tx_ring,
+ 							     skb_ext_desc,
+-							     timestamp);
++							     timestamp, htt_status);
+ 			continue;
+ 		}
+ 		ar = ab->pdevs[mac_id].ar;
+@@ -1753,7 +1749,7 @@ int ath12k_dp_tx_completion_handler(stru
+ 
+ 			if (unlikely(msdu->destructor)) {
+ 				msdu->wifi_acked_valid = 1;
+-				msdu->wifi_acked = rel_status == HAL_WBM_TQM_REL_REASON_FRAME_ACKED;
++				msdu->wifi_acked = htt_status == HAL_WBM_TQM_REL_REASON_FRAME_ACKED;
+ 			}
+ 			if (unlikely(skb_has_frag_list(msdu))) {
+ 				kfree_skb_list(skb_shinfo(msdu)->frag_list);
+@@ -1768,7 +1764,7 @@ int ath12k_dp_tx_completion_handler(stru
+ 
+ 			ath12k_dp_tx_complete_msdu(ar, msdu, (struct hal_wbm_release_ring  *)tx_status,
+ 						   buf_rel_source,
+-						   tx_ring->tcl_data_ring_id, timestamp);
++						   tx_ring->tcl_data_ring_id, timestamp, htt_status);
+ 		}
+ 	}
+ 

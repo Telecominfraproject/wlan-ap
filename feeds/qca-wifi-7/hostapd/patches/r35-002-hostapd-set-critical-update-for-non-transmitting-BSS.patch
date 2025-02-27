@@ -1,0 +1,600 @@
+From aa325dd502bdf6b1738915a132ea9db1d3541606 Mon Sep 17 00:00:00 2001
+From: Mohan Kumar G <quic_mkumarg@quicinc.com>
+Date: Wed, 29 May 2024 15:09:09 +0530
+Subject: [PATCH] hostapd: set critical update for non-transmitting BSS
+
+Currently, when non-transmitting (non-Tx) BSS elements are changed,
+non-Tx critical update flags are not set in transmitting (Tx) BSS.
+
+Also, doing CU in ieee802_11_set_beacon for non-Tx BSS and doing
+actual beacon (modification) change in ieee802_11_set_beacon of
+Tx BSS introduces a significant delay between CU and actual beacon
+change in air.
+
+Hence, update CU for non-Tx BSS when set beacon for Tx BSS is done
+since it's the one which carries non-Tx profiles and changes to it.
+
+Since the non-Tx CU changes are carried in Tx BSS set beacon, no need
+to build beacon parameters in ieee802_11_build_ap_params for non-Tx
+BSS.
+
+Finally, pass the CU for both Tx and non-Tx BSSes together through
+NL80211.
+
+Patch-depdendency: 04-007-hostapd-Add-NL-attribute-to-set-critical-update-para.patch r31-hostapd-Add-WMM-element-for-non-transmitted-profile.patch
+
+Signed-off-by: Mohan Kumar G <quic_mkumarg@quicinc.com>
+---
+ hostapd/ctrl_iface.c         |  3 +-
+ src/ap/beacon.c              | 63 +++++++++++++++---------------------
+ src/ap/hostapd.c             | 14 +++++---
+ src/ap/hostapd.h             |  2 +-
+ src/ap/ieee802_11.c          | 39 ++++++++++++++++++++--
+ src/ap/ieee802_11.h          |  6 +++-
+ src/drivers/driver.h         | 23 +++++++------
+ src/drivers/driver_nl80211.c | 42 +++++++++++++++---------
+ src/drivers/nl80211_copy.h   | 27 ++++++++++++++++
+ 9 files changed, 146 insertions(+), 73 deletions(-)
+
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -3145,6 +3145,7 @@ static int hostapd_ctrl_iface_wmm_param(
+ 	char *tmp;
+ 	int ac = 0, wmevalue = 0;
+ 	bool changed = false;
++	struct hostapd_data *tx_hapd = hostapd_mbssid_get_tx_bss(hapd);
+ 
+ 	if (os_strncmp(buf, "ac=", 3) == 0) {
+ 		tmp = buf + 3;
+@@ -3244,7 +3245,7 @@ static int hostapd_ctrl_iface_wmm_param(
+ 	}
+ 
+ 	if (changed)
+-		ieee802_11_set_beacon(hapd);
++		ieee802_11_set_beacon(tx_hapd);
+ 	return 0;
+ fail:
+ 	return -1;
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -595,6 +595,7 @@ ieee802_11_build_ap_params_mbssid(struct
+ 	size_t len, rnr_len = 0;
+ 	u8 elem_count = 0, *elem = NULL, **elem_offset = NULL, *end;
+ 	u8 rnr_elem_count = 0, *rnr_elem = NULL, **rnr_elem_offset = NULL;
++	u32 elemid_modified_bmap = 0;
+ 
+ 	if (!iface->mbssid_max_interfaces ||
+ 	    iface->num_bss > iface->mbssid_max_interfaces ||
+@@ -633,7 +634,8 @@ ieee802_11_build_ap_params_mbssid(struct
+ 
+ 	end = hostapd_eid_mbssid(tx_bss, elem, elem + len, WLAN_FC_STYPE_BEACON,
+ 				 elem_count, elem_offset, NULL, 0, rnr_elem,
+-				 &rnr_elem_count, rnr_elem_offset, rnr_len, false);
++				 &rnr_elem_count, rnr_elem_offset, rnr_len, false,
++				 &elemid_modified_bmap);
+ 
+ 	params->mbssid.mbssid_tx_iface = tx_bss->conf->iface;
+ 	params->mbssid.mbssid_index = hostapd_mbssid_get_bss_index(hapd);
+@@ -645,6 +647,7 @@ ieee802_11_build_ap_params_mbssid(struct
+ 	params->mbssid.rnr_elem_len = rnr_len;
+ 	params->mbssid.rnr_elem_count = rnr_elem_count;
+ 	params->mbssid.rnr_elem_offset = rnr_elem_offset;
++	params->elemid_modified_bmap |= elemid_modified_bmap;
+ 	if (iface->conf->mbssid == ENHANCED_MBSSID_ENABLED)
+ 		params->mbssid.ema = true;
+ 
+@@ -1207,7 +1210,7 @@ static u8 * hostapd_gen_probe_resp(struc
+ 	pos = hostapd_eid_bss_load(hapd, pos, epos - pos);
+ 	pos = hostapd_eid_mbssid(hapd_probed, pos, epos, WLAN_FC_STYPE_PROBE_RESP, 0,
+ 				 NULL, known_bss, known_bss_len, NULL, NULL,
+-				 NULL, 0, ml_probe);
++				 NULL, 0, ml_probe, NULL);
+ 	pos = hostapd_eid_rm_enabled_capab(hapd, pos, epos - pos);
+ 	pos = hostapd_get_mde(hapd, pos, epos - pos);
+ 
+@@ -2303,31 +2306,6 @@ static u8 * hostapd_fils_discovery(struc
+ #endif /* CONFIG_FILS */
+ 
+ 
+-#ifdef CONFIG_IEEE80211BE
+-static void hostapd_eid_update_cu_info(struct hostapd_data *hapd, u16 *elemid_modified,
+-				       const u8 *eid_pos, size_t eid_len,
+-				       enum elemid_cu eid_cu)
+-{
+-	u32 hash;
+-
+-	if (!hapd->conf->mld_ap)
+-		return;
+-	if (!eid_pos || (eid_len == 0) || (eid_len > 255))
+-		return;
+-	if (eid_cu >= ELEMID_CU_PARAM_MAX)
+-		return;
+-
+-	hash = ieee80211_crc32(eid_pos, eid_len);
+-	if ((hapd->cu_eid[eid_cu].eid_len != eid_len) ||
+-	    (hapd->cu_eid[eid_cu].hash != hash)) {
+-		hapd->cu_eid[eid_cu].eid_len = eid_len;
+-		hapd->cu_eid[eid_cu].hash = hash;
+-		*elemid_modified |= BIT(eid_cu);
+-	}
+-}
+-#endif
+-
+-
+ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 			       struct wpa_driver_ap_params *params)
+ {
+@@ -2343,8 +2321,10 @@ int ieee802_11_build_ap_params(struct ho
+ 	u8 *startpos;
+ 	u16 elemid_modified = 0;
+ #endif /* NEED_AP_MLME */
++	struct hostapd_data *tx_bss;
+ 
+ 	os_memset(params, 0, sizeof(*params));
++	tx_bss = hostapd_mbssid_get_tx_bss(hapd);
+ 
+ #ifdef NEED_AP_MLME
+ #define BEACON_HEAD_BUF_SIZE 256
+@@ -2526,8 +2506,10 @@ int ieee802_11_build_ap_params(struct ho
+ 	tailpos = hostapd_eid_ht_operation(hapd, tailpos);
+ 
+ #ifdef CONFIG_IEEE80211BE
+-	hostapd_eid_update_cu_info(hapd, &elemid_modified, startpos,
+-				   tailpos-startpos, ELEMID_CU_PARAM_HTOP);
++	if (hapd == tx_bss)
++		hostapd_eid_update_cu_info(hapd, &elemid_modified,
++					   startpos, tailpos-startpos,
++					   ELEMID_CU_PARAM_HTOP);
+ #endif
+ 
+ 	if (hapd->iconf->mbssid) {
+@@ -2576,8 +2558,10 @@ int ieee802_11_build_ap_params(struct ho
+ 		startpos = tailpos;
+ 		tailpos = hostapd_eid_vht_operation(hapd, tailpos);
+ #ifdef CONFIG_IEEE80211BE
+-		hostapd_eid_update_cu_info(hapd, &elemid_modified, startpos,
+-					   tailpos-startpos, ELEMID_CU_PARAM_VHTOP);
++		if (hapd == tx_bss)
++			hostapd_eid_update_cu_info(hapd, &elemid_modified,
++						   startpos, tailpos-startpos,
++						   ELEMID_CU_PARAM_VHTOP);
+ #endif
+ 		tailpos = hostapd_eid_txpower_envelope(hapd, tailpos);
+ 	}
+@@ -2610,7 +2594,8 @@ int ieee802_11_build_ap_params(struct ho
+ 		tailpos = hostapd_eid_he_operation(hapd, tailpos);
+ 
+ #ifdef CONFIG_IEEE80211BE
+-		hostapd_eid_update_cu_info(hapd, &elemid_modified, startpos,
++		if (hapd == tx_bss)
++			hostapd_eid_update_cu_info(hapd, &elemid_modified, startpos,
+ 					   tailpos-startpos, ELEMID_CU_PARAM_EXT_HEOP);
+ #endif
+ 		/* BSS Color Change Announcement element */
+@@ -2622,13 +2607,15 @@ int ieee802_11_build_ap_params(struct ho
+ 		startpos = tailpos;
+ 		tailpos = hostapd_eid_spatial_reuse(hapd, tailpos);
+ #ifdef CONFIG_IEEE80211BE
+-		hostapd_eid_update_cu_info(hapd, &elemid_modified, startpos,
++		if (hapd == tx_bss)
++			hostapd_eid_update_cu_info(hapd, &elemid_modified, startpos,
+ 					   tailpos-startpos, ELEMID_CU_PARAM_SPATIAL_REUSE);
+ #endif
+ 		startpos = tailpos;
+ 		tailpos = hostapd_eid_he_mu_edca_parameter_set(hapd, tailpos);
+ #ifdef CONFIG_IEEE80211BE
+-		hostapd_eid_update_cu_info(hapd, &elemid_modified, startpos,
++		if (hapd == tx_bss)
++			hostapd_eid_update_cu_info(hapd, &elemid_modified, startpos,
+ 					   tailpos-startpos, ELEMID_CU_PARAM_MU_EDCA);
+ #endif
+ 		tailpos = hostapd_eid_he_6ghz_band_cap(hapd, tailpos);
+@@ -2649,7 +2636,8 @@ int ieee802_11_build_ap_params(struct ho
+ 						IEEE80211_MODE_AP);
+ 		startpos = tailpos;
+ 		tailpos = hostapd_eid_eht_operation(hapd, tailpos, IEEE80211_MODE_AP);
+-		hostapd_eid_update_cu_info(hapd, &elemid_modified, startpos,
++		if (hapd == tx_bss)
++			hostapd_eid_update_cu_info(hapd, &elemid_modified, startpos,
+ 					   tailpos-startpos, ELEMID_CU_PARAM_EXT_EHTOP);
+ 		tailpos = hostapd_eid_vendor_240mhz(hapd, tailpos, IEEE80211_MODE_AP);
+ 	}
+@@ -2668,7 +2656,8 @@ int ieee802_11_build_ap_params(struct ho
+ 	startpos = tailpos;
+ 	tailpos = hostapd_eid_wmm(hapd, tailpos);
+ #ifdef CONFIG_IEEE80211BE
+-	hostapd_eid_update_cu_info(hapd, &elemid_modified, startpos,
++	if (hapd == tx_bss)
++		hostapd_eid_update_cu_info(hapd, &elemid_modified, startpos,
+ 				   tailpos-startpos, ELEMID_CU_PARAM_WMM);
+ 	tailpos = hostapd_add_scs_cap(tailpos, false, true);
+ #endif
+@@ -2815,7 +2804,7 @@ int ieee802_11_build_ap_params(struct ho
+ 	params->beacon_tx_mode = hapd->conf->beacon_tx_mode;
+ 
+ 	if (hapd->conf->mld_ap && elemid_modified)
+-		params->elemid_modified = 1;
++		params->elemid_modified_bmap |= BIT(hostapd_mbssid_get_bss_index(tx_bss));
+ 
+ #ifdef CONFIG_IEEE80211BE
+ 	if (hapd->conf->mld_ap && hapd->iconf->ieee80211be &&
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -108,10 +108,10 @@ struct hostapd_data * hostapd_mbssid_get
+ }
+ 
+ 
+-int hostapd_mbssid_get_bss_index(struct hostapd_data *hapd)
++unsigned int hostapd_mbssid_get_bss_index(struct hostapd_data *hapd)
+ {
+ 	if (hapd->iconf->mbssid) {
+-		size_t i;
++		unsigned int i;
+ 
+ 		for (i = 1; i < hapd->iface->num_bss; i++)
+ 			if (hapd->iface->bss[i] == hapd)
+@@ -4477,8 +4477,8 @@ static int hostapd_build_beacon_data(str
+ 		beacon->assocresp_ies_len = wpabuf_len(assocresp_extra);
+ 	}
+ 
+-	beacon->elemid_added = params.elemid_added;
+-	beacon->elemid_modified = params.elemid_modified;
++	beacon->elemid_added_bmap = params.elemid_added_bmap;
++	beacon->elemid_modified_bmap = params.elemid_modified_bmap;
+ 
+ 	/* MBSSID elem */
+ 	if (!params.mbssid.mbssid_elem_len) {
+@@ -4760,9 +4760,11 @@ static int hostapd_fill_csa_settings(str
+ 	iface->conf->punct_bitmap = settings->punct_bitmap;
+ #endif /* CONFIG_IEEE80211BE */
+ 	ret = hostapd_build_beacon_data(hapd, &settings->beacon_after);
+-	if (settings->beacon_after.elemid_modified)
++	if (settings->beacon_after.elemid_modified_bmap)
+ 		settings->beacon_after_cu = 1;
+ 
++	settings->bss_idx = hostapd_mbssid_get_bss_index(hapd);
++
+ 	/* change back the configuration */
+ #ifdef CONFIG_IEEE80211BE
+ 	iface->conf->punct_bitmap = old_punct_bitmap;
+@@ -5098,6 +5100,8 @@ int hostapd_fill_cca_settings(struct hos
+ 		settings->link_id = hapd->mld_link_id;
+ #endif /* CONFIG_IEEE80211BE */
+ 
++	settings->bss_idx = hostapd_mbssid_get_bss_index(hapd);
++
+ 	hostapd_interface_update_fils_ubpr(iface, true);
+ 
+ 	return 0;
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -925,7 +925,7 @@ void fst_hostapd_fill_iface_obj(struct h
+ int hostapd_set_acl(struct hostapd_data *hapd);
+ int hostapd_is_usable_ru_punct_bitmap(struct hostapd_iface *iface);
+ struct hostapd_data * hostapd_mbssid_get_tx_bss(struct hostapd_data *hapd);
+-int hostapd_mbssid_get_bss_index(struct hostapd_data *hapd);
++unsigned int hostapd_mbssid_get_bss_index(struct hostapd_data *hapd);
+ struct hostapd_data * hostapd_mld_get_link_bss(struct hostapd_data *hapd,
+ 					       u8 link_id);
+ bool hostapd_is_ml_partner(struct hostapd_data *hapd1,
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -12,6 +12,7 @@
+ 
+ #include "utils/common.h"
+ #include "utils/eloop.h"
++#include "utils/crc32.h"
+ #include "crypto/crypto.h"
+ #include "crypto/sha256.h"
+ #include "crypto/sha384.h"
+@@ -9397,6 +9398,29 @@ err_ext_capa:
+ 	return len;
+ }
+ 
++#ifdef CONFIG_IEEE80211BE
++void hostapd_eid_update_cu_info(struct hostapd_data *hapd, u16 *elemid_modified,
++				       const u8 *eid_pos, size_t eid_len,
++				       enum elemid_cu eid_cu)
++{
++	u32 hash;
++
++	if (!hapd->conf->mld_ap)
++		return;
++	if (!eid_pos || (eid_len == 0) || (eid_len > 255))
++		return;
++	if (eid_cu >= ELEMID_CU_PARAM_MAX)
++		return;
++
++	hash = ieee80211_crc32(eid_pos, eid_len);
++	if ((hapd->cu_eid[eid_cu].eid_len != eid_len) ||
++	    (hapd->cu_eid[eid_cu].hash != hash)) {
++		hapd->cu_eid[eid_cu].eid_len = eid_len;
++		hapd->cu_eid[eid_cu].hash = hash;
++		*elemid_modified |= BIT(eid_cu);
++	}
++}
++#endif
+ 
+ static size_t hostapd_eid_mbssid_elem_len(struct hostapd_data *hapd_probed,
+ 					  u32 frame_type, size_t *bss_index,
+@@ -9568,11 +9592,12 @@ static u8 * hostapd_eid_mbssid_elem(stru
+ 				    u32 frame_type, u8 max_bssid_indicator,
+ 				    size_t *bss_index, u8 elem_count,
+ 				    const u8 *known_bss, size_t known_bss_len,
+-				    bool ml_probe)
++				    bool ml_probe, u32 *elemid_modified_bmap)
+ {
+ 	struct hostapd_data *tx_bss = hostapd_mbssid_get_tx_bss(hapd_probed);
+ 	size_t i, tx_xrate_len;
+ 	u8 *eid_len_offset, *max_bssid_indicator_offset;
++	u8 *startpos;
+ 
+ 	hostapd_eid_ext_supp_rates(tx_bss, NULL, &tx_xrate_len);
+ 	*eid++ = WLAN_EID_MULTIPLE_BSSID;
+@@ -9589,6 +9614,7 @@ static u8 * hostapd_eid_mbssid_elem(stru
+ 		u8 *non_inherit_eid_len_offset;
+ 		size_t auth_len = 0, xrate_len = 0;
+ 		u16 capab_info;
++		u16 modified_flag = 0;
+ 
+ 		if (!bss || !bss->conf || !bss->started ||
+ 		    mbssid_known_bss(i, known_bss, known_bss_len))
+@@ -9669,7 +9695,13 @@ static u8 * hostapd_eid_mbssid_elem(stru
+ 
+ 		if (bss->conf->wmm_override) {
+ 			/* WMM IE */
++			startpos = eid;
+ 			eid = hostapd_eid_wmm(bss, eid);
++			hostapd_eid_update_cu_info(bss, &modified_flag, startpos,
++						   eid-startpos, ELEMID_CU_PARAM_WMM);
++			if (modified_flag && elemid_modified_bmap)
++				*elemid_modified_bmap |= BIT(i);
++
+ 			if (tx_bss->conf->wmm_enabled && !bss->conf->wmm_enabled)
+ 				non_inherit_ie[ie_count++] = WLAN_EID_VENDOR_SPECIFIC;
+ 		}
+@@ -9714,7 +9746,8 @@ u8 * hostapd_eid_mbssid(struct hostapd_d
+ 			unsigned int frame_stype, u8 elem_count,
+ 			u8 **elem_offset,
+ 			const u8 *known_bss, size_t known_bss_len, u8 *rnr_eid,
+-			u8 *rnr_count, u8 **rnr_offset, size_t rnr_len, bool ml_probe)
++			u8 *rnr_count, u8 **rnr_offset, size_t rnr_len,
++			bool ml_probe, u32 *elemid_modified_bmap)
+ {
+ 	size_t bss_index = 1, cur_len = 0;
+ 	u8 elem_index = 0, *rnr_start_eid = rnr_eid;
+@@ -9752,7 +9785,8 @@ u8 * hostapd_eid_mbssid(struct hostapd_d
+ 		eid = hostapd_eid_mbssid_elem(hapd_probed, eid, end, frame_stype,
+ 					      hostapd_max_bssid_indicator(hapd),
+ 					      &bss_index, elem_count,
+-					      known_bss, known_bss_len, ml_probe);
++					      known_bss, known_bss_len, ml_probe,
++					      elemid_modified_bmap);
+ 
+ 		if (add_rnr) {
+ 			struct mbssid_ie_profiles skip_profiles = {
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -274,10 +274,14 @@ u8 * hostapd_eid_mbssid(struct hostapd_d
+ 			unsigned int frame_stype, u8 elem_count,
+ 			u8 **elem_offset,
+ 			const u8 *known_bss, size_t known_bss_len, u8 *rnr_eid,
+-			u8 *rnr_count, u8 **rnr_offset, size_t rnr_len, bool ml_probe);
++			u8 *rnr_count, u8 **rnr_offset, size_t rnr_len, bool ml_probe,
++			u32 *elemid_modified_bmap);
+ u16 hostapd_critical_update_capab(struct hostapd_data *hapd);
+ void punct_update_legacy_bw(u16 bitmap, u8 pri_chan,
+ 			    enum oper_chan_width *width, u8 *seg0, u8 *seg1);
+ bool hostapd_is_mld_ap(struct hostapd_data *hapd);
++void hostapd_eid_update_cu_info(struct hostapd_data *hapd, u16 *elemid_modified,
++				       const u8 *eid_pos, size_t eid_len,
++				       enum elemid_cu eid_cu);
+ 
+ #endif /* IEEE802_11_H */
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -1942,8 +1942,8 @@ struct wpa_driver_ap_params {
+ 	struct unsol_bcast_probe_resp ubpr;
+ 
+ 	/* critical_update_flag - critical update flag*/
+-	bool elemid_added;
+-	bool elemid_modified;
++	u32 elemid_added_bmap;
++	u32 elemid_modified_bmap;
+ 	bool disable_cu;
+ 
+ 	/**
+@@ -2840,9 +2840,9 @@ struct beacon_data {
+ 	size_t assocresp_ies_len;
+ 	size_t probe_resp_len;
+ 
+-	/* critical_update_flag - critical update flag*/
+-	bool elemid_added;
+-	bool elemid_modified;
++	/* critical_update_bitmap - critical update bitmap */
++	u32 elemid_added_bmap;
++	u32 elemid_modified_bmap;
+ 
+ 	struct mbssid_data mbssid;
+ };
+@@ -2858,6 +2858,10 @@ struct beacon_data {
+  * @counter_offset_presp: Offset to the count field in probe resp.
+  * @punct_bitmap - Preamble puncturing bitmap
+  * @power_mode: 6 GHz Power mode
++ * @beacon_after_cu - critical update flag for beacon data after
++ * channel switch
++ * @bss_idx - BSS index of the BSS currently undergoing channel
++ * switch
+  */
+ struct csa_settings {
+ 	u8 cs_count;
+@@ -2874,9 +2878,9 @@ struct csa_settings {
+ 	bool handle_dfs;
+ 	struct unsol_bcast_probe_resp ubpr;
+ 
+-	/* critical_update_flag - critical update flag*/
+ 	bool beacon_after_cu;
+ 	int power_mode;
++	unsigned int bss_idx;
+ };
+ 
+ /**
+@@ -2897,6 +2901,9 @@ struct he_6ghz_pwr_mode_settings {
+  * @counter_offset_beacon: Offset to the count field in Beacon frame tail
+  * @counter_offset_presp: Offset to the count field in Probe Response frame
+  * @ubpr: unsolicited Probe Response frame
++ * @link_id: If >=0 indicates the link of the AP MLD to configure
++ * @bss_idx - BSS index of the BSS currently undergoing channel
++ * switch
+  */
+ struct cca_settings {
+ 	u8 cca_count;
+@@ -2909,10 +2916,8 @@ struct cca_settings {
+ 	u16 counter_offset_presp;
+ 	struct unsol_bcast_probe_resp ubpr;
+ 
+-	/**
+-	 * link_id: If >=0 indicates the link of the AP MLD to configure
+-	 */
+ 	int link_id;
++	unsigned int bss_idx;
+ };
+ 
+ /* TDLS peer capabilities for send_tdls_mgmt() */
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -5141,7 +5141,7 @@ static int wpa_driver_nl80211_set_ap(voi
+ #ifdef CONFIG_MESH
+ 	struct wpa_driver_mesh_bss_params mesh_params;
+ #endif /* CONFIG_MESH */
+-	u8 critical_update = 0;
++	struct nlattr *elems;
+ 
+ 	if (params->mld_ap) {
+ 		size_t i;
+@@ -5479,13 +5479,16 @@ static int wpa_driver_nl80211_set_ap(voi
+ 		goto fail;
+ #endif /* CONFIG_FILS */
+ 
+-	if (bss->n_links && (params->elemid_added || params->elemid_modified) && !params->disable_cu) {
+-		if (params->elemid_added)
+-			critical_update |= NL80211_CU_ELEMID_ADDED;
+-		if (params->elemid_modified)
+-			critical_update |= NL80211_CU_ELEMID_MODIFIED;
+-		if (nla_put_u8(msg, NL80211_ATTR_SET_CRITICAL_UPDATE, critical_update))
++	if (bss->n_links && (params->elemid_added_bmap || params->elemid_modified_bmap)
++	    && !params->disable_cu) {
++		elems = nla_nest_start(msg, NL80211_ATTR_SET_CRITICAL_UPDATE);
++		if (!elems || nla_put_u32(msg, NL80211_SET_CU_ATTR_ELEM_ADDED_BMAP,
++					  params->elemid_added_bmap))
+ 			goto fail;
++		if (nla_put_u32(msg, NL80211_SET_CU_ATTR_ELEM_MODIFIED_BMAP,
++				params->elemid_modified_bmap))
++			goto fail;
++		nla_nest_end(msg, elems);
+ 	}
+ 	if (params->punct_bitmap) {
+ 		wpa_printf(MSG_DEBUG, "nl80211: Puncturing bitmap=0x%04x",
+@@ -11372,11 +11375,11 @@ static int nl80211_switch_channel(void *
+ 	struct nl_msg *msg;
+ 	struct i802_bss *bss = priv;
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+-	struct nlattr *beacon_csa;
++	struct nlattr *beacon_csa, *elems;
+ 	int ret = -ENOBUFS;
+ 	int csa_off_len = 0;
+ 	int i;
+-	u8 critical_update = 0;
++	u32 cu_bmap = BIT(settings->bss_idx);
+ 
+ 	wpa_printf(MSG_DEBUG,
+ 		   "nl80211: Channel switch request (cs_count=%u block_tx=%u freq=%d channel=%d sec_channel_offset=%d width=%d cf1=%d cf2=%d puncturing_bitmap=0x%04x%s%s%s  puncturing bitmap=0x%04x, ru_punct_ofdma=%u power_mode=%u)",
+@@ -11501,9 +11504,11 @@ static int nl80211_switch_channel(void *
+ 		goto fail;
+ 
+ 	if (bss->n_links) {
+-		critical_update |= NL80211_CU_ELEMID_ADDED;
+-		if (nla_put_u8(msg, NL80211_ATTR_SET_CRITICAL_UPDATE, critical_update))
++		elems = nla_nest_start(msg, NL80211_ATTR_SET_CRITICAL_UPDATE);
++		if (!elems || nla_put_u32(msg, NL80211_SET_CU_ATTR_ELEM_ADDED_BMAP,
++					  cu_bmap))
+ 			goto fail;
++		nla_nest_end(msg, elems);
+ 	}
+ 	nla_nest_end(msg, beacon_csa);
+ 
+@@ -11527,8 +11532,11 @@ static int nl80211_switch_channel(void *
+ #endif /* CONFIG_IEEE80211AX */
+ 
+ 	if (bss->n_links) {
+-		if (nla_put_u8(msg, NL80211_ATTR_SET_CRITICAL_UPDATE, NL80211_CU_ELEMID_MODIFIED))
++		elems = nla_nest_start(msg, NL80211_ATTR_SET_CRITICAL_UPDATE);
++		if (!elems || nla_put_u32(msg, NL80211_SET_CU_ATTR_ELEM_MODIFIED_BMAP,
++					  cu_bmap))
+ 			goto fail;
++		nla_nest_end(msg, elems);
+ 	}
+ 
+ 	ret = send_and_recv_msgs(drv, msg, NULL, NULL, NULL, NULL);
+@@ -11593,10 +11601,10 @@ static int nl80211_switch_color(void *pr
+ {
+ 	struct i802_bss *bss = priv;
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+-	struct nlattr *beacon_cca;
++	struct nlattr *beacon_cca, *elems;
+ 	struct nl_msg *msg;
+ 	int ret = -ENOBUFS;
+-	u8 critical_update = 0;
++	u32 cu_bmap = BIT(settings->bss_idx);
+ 
+ 	wpa_printf(MSG_DEBUG,
+ 		   "nl80211: Color change request (cca_count=%u color=%d)",
+@@ -11671,9 +11679,10 @@ static int nl80211_switch_color(void *pr
+ 	}
+ 
+ 	if (bss->n_links) {
+-		critical_update |= NL80211_CU_ELEMID_ADDED;
+-		if (nla_put_u8(msg, NL80211_ATTR_SET_CRITICAL_UPDATE, critical_update))
++		elems = nla_nest_start(msg, NL80211_ATTR_SET_CRITICAL_UPDATE);
++		if (!elems || nla_put_u32(msg, NL80211_SET_CU_ATTR_ELEM_ADDED_BMAP, cu_bmap))
+ 			goto error;
++		nla_nest_end(msg, elems);
+ 	}
+ 	ret = send_and_recv_msgs(drv, msg, NULL, NULL, NULL, NULL);
+ 	if (ret) {
+--- a/src/drivers/nl80211_copy.h
++++ b/src/drivers/nl80211_copy.h
+@@ -8177,6 +8177,33 @@ enum nl80211_multi_hw_mac_chan_list_attr
+ };
+ 
+ /**
++ * enum nl80211_set_cu_attrs - set critical update attributes
++ *
++ * @NL80211_ATTR_SET_CU_ELEM_ADDED_BMAP: Bitmap of interfaces to which critical update
++ * happened due to addition of new beacon element. Bit 0 represents the (TX) interface
++ * in which the attribute is received. Other bits represents the MBSSID index of NON-TX
++ * BSSes in case this attribute is carried as part of set/update beacon for an
++ * MBSSID group's TX VAP.
++ *
++ * @NL80211_ATTR_SET_CU_ELEM_MODIFIED_BMAP: Bitmap of interfaces to which critical update
++ * happened due to modification of existing beacon element.
++ *
++ * @__NL80211_CU_MLD_LINK_ATTR_LAST : internal use
++ * @NL80211_SET_CU_ATTR_MAX : maximum set critical update attributes
++ *
++ */
++enum nl80211_set_cu_attrs {
++	__NL80211_SET_CU_ATTR_INVALID,
++
++	NL80211_SET_CU_ATTR_ELEM_ADDED_BMAP,
++	NL80211_SET_CU_ATTR_ELEM_MODIFIED_BMAP,
++
++	/* keep last */
++	__NL80211_SET_CU_ATTR_LAST,
++	NL80211_SET_CU_ATTR_MAX = __NL80211_SET_CU_ATTR_LAST - 1
++};
++
++/**
+  * nl80211_cu_attrs - critical update attributes
+  *
+  * @__NL80211_CU_ATTR_INVALID: invalid

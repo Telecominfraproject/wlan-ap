@@ -1,0 +1,110 @@
+From 86ba3cb742aa37220f5f7177617406baa14a0d1e Mon Sep 17 00:00:00 2001
+From: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+Date: Fri, 21 Oct 2022 08:56:09 +0530
+Subject: [PATCH] ath12k: Fix freeing hal reo status entry in host in failure
+ case
+
+Host free up the memory in ring full scenario
+for sending HAL_REO_CMD_*.
+
+But hardware has the memory uncleared since
+it might not received the command to flush. Due to this
+hardware may over write some value on the memory
+and that leads memory corruption in host.
+
+Fix this by keeping the flush cache list intact in
+failure case and retry later to avoid memory corruption.
+
+Signed-off-by: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_rx.c | 42 ++++++++++++++++---------
+ 1 file changed, 27 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
+index 8eb13ce..dbe4631 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -675,7 +675,7 @@ static int ath12k_dp_reo_cmd_send(struct ath12k_base *ab, struct ath12k_dp_rx_ti
+ 	return 0;
+ }
+ 
+-static void ath12k_dp_reo_cache_flush(struct ath12k_base *ab,
++static int ath12k_dp_reo_cache_flush(struct ath12k_base *ab,
+ 				      struct ath12k_dp_rx_tid *rx_tid)
+ {
+ 	struct ath12k_hal_reo_cmd cmd = {0};
+@@ -693,9 +693,16 @@ static void ath12k_dp_reo_cache_flush(struct ath12k_base *ab,
+ 					     HAL_REO_CMD_FLUSH_CACHE, &cmd,
+ 					     NULL);
+ 		if (ret)
++		{
+ 			ath12k_warn(ab,
+-				    "failed to send HAL_REO_CMD_FLUSH_CACHE, tid %d (%d)\n",
+-				    rx_tid->tid, ret);
++				    "failed to send HAL_REO_CMD_FLUSH_CACHE, tid %d (%d) desc_sz(%ld)\n",
++				    rx_tid->tid, ret, desc_sz);
++			/* If this fails with ring full condition, then
++			 * no need to retry below as it is expected to
++			 * fail within short time */
++			if (ret == -ENOBUFS)
++				goto exit;
++		}
+ 	}
+ 
+ 	memset(&cmd, 0, sizeof(cmd));
+@@ -705,14 +712,12 @@ static void ath12k_dp_reo_cache_flush(struct ath12k_base *ab,
+ 	ret = ath12k_dp_reo_cmd_send(ab, rx_tid,
+ 				     HAL_REO_CMD_FLUSH_CACHE,
+ 				     &cmd, ath12k_dp_reo_cmd_free);
+-	if (ret) {
++	if (ret)
+ 		ath12k_err(ab, "failed to send HAL_REO_CMD_FLUSH_CACHE cmd, tid %d (%d)\n",
+ 			   rx_tid->tid, ret);
+-		dma_unmap_single(ab->dev, rx_tid->paddr, rx_tid->size,
+-				 DMA_BIDIRECTIONAL);
+-		kfree(rx_tid->vaddr);
+-		rx_tid->vaddr = NULL;
+-	}
++
++exit:
++	return ret;
+ }
+ 
+ static void ath12k_dp_rx_tid_del_func(struct ath12k_dp *dp, void *ctx,
+@@ -750,9 +755,6 @@ static void ath12k_dp_rx_tid_del_func(struct ath12k_dp *dp, void *ctx,
+ 		if (dp->reo_cmd_cache_flush_count > ATH12K_DP_RX_REO_DESC_FREE_THRES ||
+ 		    time_after(jiffies, elem->ts +
+ 			       msecs_to_jiffies(ATH12K_DP_RX_REO_DESC_FREE_TIMEOUT_MS))) {
+-			list_del(&elem->list);
+-			dp->reo_cmd_cache_flush_count--;
+-
+ 			/* Unlock the reo_cmd_lock before using ath12k_dp_reo_cmd_send()
+ 			 * within ath12k_dp_reo_cache_flush. The reo_cmd_cache_flush_list
+ 			 * is used in only two contexts, one is in this function called
+@@ -762,10 +764,20 @@ static void ath12k_dp_rx_tid_del_func(struct ath12k_dp *dp, void *ctx,
+ 			 * delete to this list. Hence unlock-lock is safe here.
+ 			 */
+ 			spin_unlock_bh(&dp->reo_cmd_lock);
+-
+-			ath12k_dp_reo_cache_flush(ab, &elem->data);
+-			kfree(elem);
++			if (ath12k_dp_reo_cache_flush(ab, &elem->data)) {
++				/* In failure case, just update the timestamp
++				 * for flush cache elem and continue */
++				spin_lock_bh(&dp->reo_cmd_lock);
++				elem->ts = jiffies +
++					msecs_to_jiffies(ATH12K_DP_RX_REO_DESC_FREE_TIMEOUT_MS);
++				ath12k_warn(ab, "Failed to send HAL_REO_CMD_FLUSH_CACHE cmd"
++						"Updating timestamp (%ld) in the list\n", elem->ts);
++				continue;			
++			}
+ 			spin_lock_bh(&dp->reo_cmd_lock);
++			list_del(&elem->list);
++			dp->reo_cmd_cache_flush_count--;
++			kfree(elem);
+ 		}
+ 	}
+ 	spin_unlock_bh(&dp->reo_cmd_lock);
+-- 
+2.17.1
+

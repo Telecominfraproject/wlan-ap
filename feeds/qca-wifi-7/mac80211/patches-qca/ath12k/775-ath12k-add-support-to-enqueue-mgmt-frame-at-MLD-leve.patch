@@ -1,0 +1,204 @@
+From b8df97c3d80d790830653f82c3566e8e03636c6d Mon Sep 17 00:00:00 2001
+From: Sriram R <quic_srirrama@quicinc.com>
+Date: Sun, 7 May 2023 08:06:42 +0530
+Subject: [PATCH] ath12k: add support to enqueue mgmt frame at MLD level
+
+Currently, unicast management frames to a certain link station
+gets transmitted by FW or dropped due to retransmissions if that
+link station is inactive or in power save state. A ML client can
+decide to use only one of its links or can decide to put it in
+power save for longer periods while listening on the other link
+as per MLD listen interval. In such cases allow FW to decide on
+which link a certain management frame needs to be transmitted on.
+
+Initially we add support for only SA query action frames. But, this
+can be extended to all action frames except the ones which are not
+bufferable.
+
+Signed-off-by: Sriram R <quic_srirrama@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |  1 +
+ drivers/net/wireless/ath/ath12k/mac.c  | 35 +++++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/wmi.c  | 37 +++++++++++++++++++++++---
+ drivers/net/wireless/ath/ath12k/wmi.h  | 15 ++++++++++-
+ 4 files changed, 83 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -96,6 +96,7 @@ enum ath12k_skb_flags {
+ 	ATH12K_SKB_HW_80211_ENCAP = BIT(0),
+ 	ATH12K_SKB_CIPHER_SET = BIT(1),
+ 	ATH12K_SKB_TX_STATUS = BIT(2),
++	ATH12K_SKB_MGMT_LINK_AGNOSTIC = BIT(3),
+ };
+ 
+ struct ath12k_skb_cb {
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -8649,6 +8649,7 @@ static int ath12k_mac_mgmt_tx_wmi(struct
+ 	struct ath12k_skb_cb *skb_cb;
+ 	int buf_id;
+ 	int ret;
++	bool link_agnostic;
+ 
+ 	ATH12K_SKB_CB(skb)->ar = ar;
+ 	spin_lock_bh(&ar->txmgmt_idr_lock);
+@@ -8677,7 +8678,10 @@ static int ath12k_mac_mgmt_tx_wmi(struct
+ 
+ 	skb_cb->paddr = paddr;
+ 
+-	ret = ath12k_wmi_mgmt_send(ar, arvif->vdev_id, buf_id, skb);
++	link_agnostic = ATH12K_SKB_CB(skb)->flags & ATH12K_SKB_MGMT_LINK_AGNOSTIC;
++
++	ret = ath12k_wmi_mgmt_send(ar, arvif->vdev_id, buf_id, skb,
++				   link_agnostic);
+ 	if (ret) {
+ 		ath12k_warn(ar->ab, "failed to send mgmt frame: %d\n", ret);
+ 		goto err_unmap_buf;
+@@ -8810,6 +8814,22 @@ static void ath12k_mlo_mcast_update_tx_l
+ 		ether_addr_copy(hdr->addr2, bss_conf->addr);
+ }
+ 
++/* This function should be called only for a mgmt frame to a ML STA,
++ * hence, such sanity checks are skipped
++ */
++static bool ath12k_mac_is_mgmt_link_agnostic(struct sk_buff *skb)
++{
++	struct ieee80211_mgmt *mgmt;
++	mgmt = (struct ieee80211_mgmt *)skb->data;
++
++	if (ieee80211_is_deauth(mgmt->frame_control) ||
++		ieee80211_is_disassoc(mgmt->frame_control))
++		return true;
++
++	/* TODO Extend as per requirement */
++	return false;
++}
++
+ static u8 ath12k_mac_get_tx_link(struct ieee80211_sta *sta, struct ieee80211_vif *vif,
+ 				 u8 link, struct sk_buff *skb, u32 info_flags)
+ {
+@@ -8892,6 +8912,19 @@ static u8 ath12k_mac_get_tx_link(struct
+ 				   sta->valid_links, ahvif->links_map, ahsta->links_map);
+ 			link = IEEE80211_MLD_MAX_NUM_LINKS;
+ 		}
++
++		/* Check if this mgmt frame can be queued at MLD level, in that
++		 * case the FW can decide on which link it needs to be finally
++		 * transmitted based on the power state of that link.
++		 * The link param returned by this function still needs
++		 * to be valid to get queued to one of the valid link FW
++		 */
++		if (ath12k_mac_is_mgmt_link_agnostic(skb)) {
++			ATH12K_SKB_CB(skb)->flags |= ATH12K_SKB_MGMT_LINK_AGNOSTIC;
++			ath12k_dbg(NULL, ATH12K_DBG_MGMT,
++				   "Sending Mgmt Frame (fc %x) as link agnostic to ML STA %pM \n",
++				   hdr->frame_control, sta->addr);
++		}
+ 	}
+ 
+ 	return link;
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -1215,18 +1215,25 @@ struct sk_buff *ath12k_wmi_alloc_skb(str
+ }
+ 
+ int ath12k_wmi_mgmt_send(struct ath12k *ar, u32 vdev_id, u32 buf_id,
+-			 struct sk_buff *frame)
++			 struct sk_buff *frame, bool link_agnostic)
+ {
+ 	struct ath12k_wmi_pdev *wmi = ar->wmi;
+ 	struct wmi_mgmt_send_cmd *cmd;
++	struct wmi_mlo_mgmt_send_params *ml_params;
+ 	struct wmi_tlv *frame_tlv;
+ 	struct sk_buff *skb;
+ 	u32 buf_len;
+ 	int ret, len;
++	void *ptr;
++	struct wmi_tlv *tlv;
+ 
+ 	buf_len = min_t(int, frame->len, WMI_MGMT_SEND_DOWNLD_LEN);
+ 
+-	len = sizeof(*cmd) + sizeof(*frame_tlv) + roundup(buf_len, 4);
++	len = sizeof(*cmd) + sizeof(*frame_tlv) + roundup(buf_len, sizeof(u32));
++
++	if (link_agnostic)
++		len += sizeof(struct wmi_mgmt_send_params) +
++				TLV_HDR_SIZE + sizeof(*ml_params);
+ 
+ 	skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, len);
+ 	if (!skb)
+@@ -1245,10 +1252,34 @@ int ath12k_wmi_mgmt_send(struct ath12k *
+ 	cmd->tx_params_valid = 0;
+ 
+ 	frame_tlv = (struct wmi_tlv *)(skb->data + sizeof(*cmd));
+-	frame_tlv->header = ath12k_wmi_tlv_hdr(WMI_TAG_ARRAY_BYTE, buf_len);
++	frame_tlv->header = ath12k_wmi_tlv_hdr(WMI_TAG_ARRAY_BYTE, roundup(buf_len, sizeof(u32)));
+ 
+ 	memcpy(frame_tlv->value, frame->data, buf_len);
+ 
++	if (!link_agnostic)
++		goto send;
++
++	ptr = skb->data + sizeof(*cmd) + sizeof(*frame_tlv) + roundup(buf_len, sizeof(u32));
++
++	tlv = ptr;
++
++	/* Tx params not used currently */
++	tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_TX_SEND_PARAMS) |
++		      FIELD_PREP(WMI_TLV_LEN, sizeof(struct wmi_mgmt_send_params) - TLV_HDR_SIZE);
++	ptr += sizeof(struct wmi_mgmt_send_params);
++
++	tlv = ptr;
++	tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_STRUCT) |
++		      FIELD_PREP(WMI_TLV_LEN, sizeof(*ml_params));
++	ptr += TLV_HDR_SIZE;
++
++	ml_params = ptr;
++	ml_params->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_MLO_TX_SEND_PARAMS) |
++				FIELD_PREP(WMI_TLV_LEN, sizeof(*ml_params) - TLV_HDR_SIZE);
++
++	ml_params->hw_link_id = WMI_MLO_MGMT_TID;
++
++send:
+ 	ret = ath12k_wmi_cmd_send(wmi, skb, WMI_MGMT_TX_SEND_CMDID);
+ 	if (ret) {
+ 		ath12k_warn(ar->ab,
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -4415,6 +4415,7 @@ struct wmi_scan_chan_list_cmd {
+ 	__le32 pdev_id;
+ } __packed;
+ 
++#define WMI_MLO_MGMT_TID		0xFFFFFFFF
+ #define WMI_MGMT_SEND_DOWNLD_LEN	64
+ 
+ #define WMI_TX_PARAMS_DWORD0_POWER		GENMASK(7, 0)
+@@ -4442,6 +4443,18 @@ struct wmi_mgmt_send_cmd {
+ 	/* This TLV is followed by struct wmi_mgmt_frame */
+ 
+ 	/* Followed by struct wmi_mgmt_send_params */
++	/* Followed by struct wmi_mlo_mgmt_send_params */
++} __packed;
++
++struct wmi_mlo_mgmt_send_params {
++	u32 tlv_header;
++	u32 hw_link_id;
++} __packed;
++
++struct wmi_mgmt_send_params {
++	u32 tlv_header;
++	u32 tx_param_dword0;
++	u32 tx_param_dword1;
+ } __packed;
+ 
+ struct wmi_sta_powersave_mode_cmd {
+@@ -7692,7 +7705,7 @@ int ath12k_wmi_cmd_send(struct ath12k_wm
+ 			u32 cmd_id);
+ struct sk_buff *ath12k_wmi_alloc_skb(struct ath12k_wmi_base *wmi_sc, u32 len);
+ int ath12k_wmi_mgmt_send(struct ath12k *ar, u32 vdev_id, u32 buf_id,
+-			 struct sk_buff *frame);
++			 struct sk_buff *frame, bool link_agnostic);
+ int ath12k_wmi_bcn_tmpl(struct ath12k *ar, u32 vdev_id,
+ 			struct ieee80211_mutable_offsets *offs,
+ 			struct sk_buff *bcn, u32 ema_param);

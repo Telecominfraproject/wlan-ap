@@ -1,0 +1,181 @@
+From c3788c21a3d9357265d69b075f03c1c259ffaf39 Mon Sep 17 00:00:00 2001
+From: Muna Sinada <quic_msinada@quicinc.com>
+Date: Thu, 28 Mar 2024 15:57:52 -0700
+Subject: [PATCH] wifi: ath12k: reconfigure HTT Metadata for ext MSDU
+
+HTT Metadata is currently being added to the beginning of the packet
+skb which is causing VLAN pings and multicast traffic to be dropped
+in Firmware.
+
+This is due to HTT Metadata being utilized with ext MSDU. When used
+with ext MSDU, HTT Metadata should be added to the ext MSDU skb
+instead.
+
+This fix removes functionality to add HTT Metadata to the beginning of
+packet skb and adds functionality to add HTT Metadata to the end of
+the ext MSDU skb.
+
+Signed-off-by: Muna Sinada <quic_msinada@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_tx.c | 77 ++++++++++---------------
+ 1 file changed, 32 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp_tx.c b/drivers/net/wireless/ath/ath12k/dp_tx.c
+index 6f5bcdc18993..1d1afb2fa384 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -224,37 +224,40 @@ static void ath12k_hal_tx_cmd_ext_desc_setup(struct ath12k_base *ab, void *cmd,
+ 
+ #define HTT_META_DATA_ALIGNMENT	0x8
+ 
+-static int ath12k_dp_metadata_align_skb(struct sk_buff *skb, u8 align_len)
++static void *ath12k_dp_metadata_align_skb(struct sk_buff *skb, u8 tail_len)
+ {
+-	if (unlikely(skb_cow_head(skb, align_len)))
+-		return -ENOMEM;
++	struct sk_buff *tail;
++	void *metadata;
+ 
+-	skb_push(skb, align_len);
+-	memset(skb->data, 0, align_len);
+-	return 0;
++	if (unlikely(skb_cow_data(skb, tail_len, &tail) < 0))
++		return NULL;
++
++	metadata = pskb_put(skb, tail, tail_len);
++	memset(metadata, 0, tail_len);
++	return metadata;
+ }
+ 
+-static int ath12k_dp_prepare_htt_metadata(struct sk_buff *skb,
+-					  u8 *htt_metadata_size)
++/* Preparing HTT Metadata when utilized with ext MSDU */
++static int ath12k_dp_prepare_htt_metadata(struct sk_buff *skb)
+ {
++	struct htt_tx_msdu_desc_ext *desc_ext;
++	void *metadata;
+ 	u8 htt_desc_size;
+ 	/* Size rounded of multiple of 8 bytes */
+ 	u8 htt_desc_size_aligned;
+-	int ret;
+-	struct htt_tx_msdu_desc_ext *desc_ext;
++
+ 
+ 	htt_desc_size = sizeof(struct htt_tx_msdu_desc_ext);
+ 	htt_desc_size_aligned = ALIGN(htt_desc_size, HTT_META_DATA_ALIGNMENT);
+ 
+-	ret = ath12k_dp_metadata_align_skb(skb, htt_desc_size_aligned);
+-	if (unlikely(ret))
+-		return ret;
++	metadata = ath12k_dp_metadata_align_skb(skb, htt_desc_size_aligned);
++	if (!metadata)
++		return -ENOMEM;
+ 
+-	desc_ext = (struct htt_tx_msdu_desc_ext *)skb->data;
++	desc_ext = (struct htt_tx_msdu_desc_ext *)metadata;
+ 	desc_ext->valid_encrypt_type = 1;
+ 	desc_ext->encrypt_type = HAL_ENCRYPT_TYPE_WEP_40;
+ 	desc_ext->host_tx_desc_pool = 1;
+-	*htt_metadata_size = htt_desc_size_aligned;
+ 
+ 	return 0;
+ }
+@@ -436,7 +439,7 @@ int ath12k_dp_tx(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 	u16 peer_id;
+ 	bool msdu_ext_desc = false;
+ 	bool is_diff_encap = false, is_qos_null = false;
+-	u8 align_pad, htt_meta_size = 0;
++	bool add_htt_metadata = false;
+ 
+ 	if (unlikely(test_bit(ATH12K_FLAG_CRASH_FLUSH, &ar->ab->dev_flags)) ||
+ 	    unlikely(test_bit(ATH12K_FLAG_UMAC_PRERESET_START, &ab->dev_flags)))
+@@ -574,38 +577,19 @@ int ath12k_dp_tx(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 		}
+ 	}
+ 
+-	/* Add metadata for sw encrypted vlan group traffic */
+ 	if ((!test_bit(ATH12K_FLAG_HW_CRYPTO_DISABLED, &ar->ab->ag->dev_flags) &&
+ 	     !(skb_cb->flags & ATH12K_SKB_HW_80211_ENCAP) &&
+ 	     !(skb_cb->flags & ATH12K_SKB_CIPHER_SET) &&
+ 	     ieee80211_has_protected(hdr->frame_control)) ||
+ 	     is_diff_encap) {
+-		/**
+-		 * In MSDU EXT descriptor enqueue, TCL not considered the packet
+-		 * offset. So if we pack HTT META then it misbehave due to
+-		 * misconception of HTT META as packet data.
+-		 * So avoid the HTT META data pack for the MSDU EXT descriptor.
+-		 *
+-		 * TODO: Need to confirm the same for vlan group traffic cases.
+-		 */
+ 		if (is_qos_null && msdu_ext_desc)
+ 			goto skip_htt_meta;
+ 
+-		align_pad = ((unsigned long)skb->data) & (HTT_META_DATA_ALIGNMENT - 1);
+-		ret = ath12k_dp_metadata_align_skb(skb, align_pad);
+-		if (unlikely(ret))
+-			goto fail_remove_tx_buf;
+-
+-		ti.pkt_offset += align_pad;
+-		ret = ath12k_dp_prepare_htt_metadata(skb, &htt_meta_size);
+-		if (unlikely(ret))
+-			goto fail_remove_tx_buf;
++		/* Add metadata for sw encrypted vlan group traffic */
++		add_htt_metadata = true;
++		msdu_ext_desc = true;
+ 
+-		ti.pkt_offset += htt_meta_size;
+ 		ti.meta_data_flags |= HTT_TCL_META_DATA_VALID_HTT;
+-		ti.flags0 |= FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_PKT_OFFSET,
+-					ti.pkt_offset);
+-
+ skip_htt_meta:
+ 		ti.flags0 |= FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_TO_FW, 1);
+ 		ti.encap_type = HAL_TCL_ENCAP_TYPE_RAW;
+@@ -625,8 +609,7 @@ skip_htt_meta:
+ 	tx_desc->recycler_fast_xmit = 0;
+ 	tx_desc->timestamp = ktime_get_real();
+ 	ti.desc_id = tx_desc->desc_id;
+-	ti.data_len = skb->len - ti.pkt_offset;
+-	skb_cb->pkt_offset = ti.pkt_offset;
++	ti.data_len = skb->len;
+ 	skb_cb->paddr = ti.paddr;
+ 	skb_cb->vif = ahvif->vif;
+ 
+@@ -643,6 +626,15 @@ skip_htt_meta:
+ 		msg = (struct hal_tx_msdu_ext_desc *)skb_ext_desc->data;
+ 		ath12k_hal_tx_cmd_ext_desc_setup(ab, msg, &ti);
+ 
++		if (add_htt_metadata) {
++			ret = ath12k_dp_prepare_htt_metadata(skb_ext_desc);
++			if (ret < 0) {
++				ath12k_dbg(ab, ATH12K_DBG_DP_TX,
++					"Failed to add HTT meta data, dropping packet\n");
++				goto fail_unmap_dma;
++			}
++		}
++
+ 		ti.paddr = dma_map_single(ab->dev, skb_ext_desc->data,
+ 					  skb_ext_desc->len, DMA_TO_DEVICE);
+ 		ret = dma_mapping_error(ab->dev, ti.paddr);
+@@ -755,8 +747,6 @@ fail_unmap_dma:
+ 
+ fail_remove_tx_buf:
+ 	ath12k_dp_tx_release_txbuf(dp, tx_desc, ti.ring_id);
+-	if (ti.pkt_offset)
+-		skb_pull(skb, ti.pkt_offset);
+ 
+ 	return ret;
+ }
+@@ -915,9 +905,6 @@ ath12k_dp_tx_htt_tx_complete_buf(struct ath12k_base *ab,
+ 			    ahvif->links_map);
+ 	}
+ 
+-	if (skb_cb->pkt_offset)
+-		skb_pull(msdu, skb_cb->pkt_offset);
+-
+ 	memset(&info->status, 0, sizeof(info->status));
+ 
+ 	if (ts->acked) {
+-- 
+2.34.1
+

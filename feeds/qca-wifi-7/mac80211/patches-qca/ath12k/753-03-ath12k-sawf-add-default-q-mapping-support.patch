@@ -1,0 +1,734 @@
+From 014a5facd4e3bc2d5adf1794e5f947d8b0ed23bd Mon Sep 17 00:00:00 2001
+From: Ganesh Babu Jothiram <quic_gjothira@quicinc.com>
+Date: Tue, 4 Apr 2023 15:26:31 +0530
+Subject: [PATCH 3/3] ath12k: sawf: add default msduq mapping support.
+
+add support for mapping of service class ID to its default msduq.
+support for map, unmap and report via NL vendor command.
+
+Signed-off-by: Ganesh Babu Jothiram <quic_gjothira@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.h     |   4 +
+ drivers/net/wireless/ath/ath12k/dp_rx.c  |   4 +
+ drivers/net/wireless/ath/ath12k/sawf.c   | 263 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/sawf.h   | 132 ++++++++++++
+ drivers/net/wireless/ath/ath12k/vendor.c | 172 +++++++++++++++
+ drivers/net/wireless/ath/ath12k/vendor.h |  13 ++
+ 6 files changed, 588 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -452,6 +452,9 @@ enum htt_h2t_msg_type {
+ 	HTT_H2T_MSG_TYPE_PPDU_STATS_CFG		= 0x11,
+ 	HTT_H2T_MSG_TYPE_VDEV_TXRX_STATS_CFG	= 0x1a,
+ 	HTT_H2T_MSG_TYPE_TX_MONITOR_CFG		= 0x1b,
++	HTT_H2T_MSG_TYPE_SAWF_DEF_Q_MAP_REQ	= 0x1c,
++	HTT_H2T_MSG_TYPE_SAWF_DEF_Q_UNMAP_REQ	= 0x1d,
++	HTT_H2T_MSG_TYPE_SAWF_DEF_Q_MAP_REPORT_REQ = 0x1e,
+ };
+ 
+ #define HTT_VER_REQ_INFO_MSG_ID		GENMASK(7, 0)
+@@ -1319,6 +1322,7 @@ enum htt_t2h_msg_type {
+ 	HTT_T2H_MSG_TYPE_MLO_RX_PEER_UNMAP = 0x2a,
+ 	HTT_T2H_MSG_TYPE_PEER_MAP3	= 0x2b,
+ 	HTT_T2H_MSG_TYPE_VDEV_TXRX_STATS_PERIODIC_IND = 0x2c,
++	HTT_T2H_MSG_TYPE_SAWF_DEF_QUEUES_MAP_REPORT_CONF = 0x2d,
+ 	HTT_T2H_MSG_TYPE_SAWF_MSDUQ_INFO_IND = 0x2e,
+ };
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -21,6 +21,7 @@
+ #include "peer.h"
+ #include "dp_mon.h"
+ #include "hif.h"
++#include "sawf.h"
+ #ifdef CPTCFG_MAC80211_PPE_SUPPORT
+ #include <ppe_vp_public.h>
+ #include <ppe_vp_tx.h>
+@@ -2241,6 +2242,9 @@ void ath12k_dp_htt_htc_t2h_msg_handler(s
+ 	case HTT_T2H_MSG_TYPE_SAWF_MSDUQ_INFO_IND:
+ 		ath12k_htt_sawf_info_ind_handler(ab, skb);
+ 		break;
++	case HTT_T2H_MSG_TYPE_SAWF_DEF_QUEUES_MAP_REPORT_CONF:
++		ath12k_htt_sawf_def_q_map_report_handler(ab, skb);
++		break;
+ 	default:
+ 		ath12k_dbg(ab, ATH12K_DBG_DP_HTT, "dp_htt event %d not handled\n",
+ 			   type);
+--- a/drivers/net/wireless/ath/ath12k/sawf.c
++++ b/drivers/net/wireless/ath/ath12k/sawf.c
+@@ -12,6 +12,7 @@
+ #include <qca-nss-ecm/ecm_classifier_emesh_public.h>
+ 
+ #define SVC_INDEX(svc_id) svc_id - 1
++#define DRV_TO_FW_SVC_ID(svc_id) (svc_id - 1)
+ 
+ bool ath12k_sawf_enable;
+ module_param_named(sawf, ath12k_sawf_enable, bool, 0444);
+@@ -594,9 +595,14 @@ u16 ath12k_sawf_get_msduq(struct net_dev
+ 			       u32 dscp, u32 rule_id)
+ {
+ 	struct ath12k_base *ab;
++	struct ath12k_sawf_ctx *sawf_ctx;
+ 	u16 peer_id;
+ 	u16 peer_msduq;
+ 
++	sawf_ctx = ath12k_get_sawf_context();
++	if (!sawf_ctx)
++		return SAWF_PEER_MSDUQ_INVALID;
++
+ 	ab = ath12k_sawf_get_ab_from_netdev(dev, peer_mac, &peer_id);
+ 	if (!ab)
+ 		return SAWF_PEER_MSDUQ_INVALID;
+@@ -607,3 +613,258 @@ u16 ath12k_sawf_get_msduq(struct net_dev
+ 		   peer_mac, service_id, peer_msduq);
+ 	return peer_msduq;
+ }
++
++int ath12k_sawf_htt_h2t_def_q_map_req(struct ath12k_base *ab,
++				      u8 svc_id,
++				      u16 peer_id)
++{
++	struct ath12k_dp *dp = &ab->dp;
++	struct sk_buff *skb;
++	struct ath12k_htt_h2t_sawf_def_q_map_req *cmd;
++	int len = sizeof(*cmd);
++	int ret;
++
++	skb = ath12k_htc_alloc_skb(ab, len);
++	if (!skb) {
++		ath12k_err(ab, "Def Q Map Req:alloc skb fails\n");
++		return -ENOMEM;
++	}
++
++	skb_put(skb, len);
++	cmd = (struct htt_h2t_sawf_def_q_map_req *)skb->data;
++	cmd->info = u32_encode_bits(HTT_H2T_MSG_TYPE_SAWF_DEF_Q_MAP_REQ,
++				    HTT_H2T_MSG_TYPE_ID) |
++		    u32_encode_bits(DRV_TO_FW_SVC_ID(svc_id),
++				    HTT_H2T_SAWF_DEF_Q_MAP_SVC_ID) |
++		    u32_encode_bits(peer_id,
++				    HTT_H2T_SAWF_DEF_Q_MAP_PEER_ID);
++
++	ath12k_dbg(ab, ATH12K_DBG_SAWF, "Def Q Map req:0x%x\n", cmd->info);
++
++	ret = ath12k_htc_send(&ab->htc, dp->eid, skb);
++	if (ret) {
++		dev_kfree_skb_any(skb);
++		return ret;
++	}
++	return 0;
++}
++
++int ath12k_sawf_htt_h2t_def_q_unmap_req(struct ath12k_base *ab,
++					u8 svc_id,
++					u16 peer_id)
++{
++	struct ath12k_dp *dp = &ab->dp;
++	struct sk_buff *skb;
++	struct ath12k_htt_h2t_sawf_def_q_unmap_req *cmd;
++	int len = sizeof(*cmd);
++	int ret;
++
++	skb = ath12k_htc_alloc_skb(ab, len);
++	if (!skb) {
++		ath12k_err(ab, "Def Q unmap Req:alloc skb fails\n");
++		return -ENOMEM;
++	}
++
++	skb_put(skb, len);
++	cmd = (struct ath12k_htt_h2t_sawf_def_q_umap_req *)skb->data;
++	cmd->info = u32_encode_bits(HTT_H2T_MSG_TYPE_SAWF_DEF_Q_UNMAP_REQ,
++				    HTT_H2T_MSG_TYPE_ID) |
++		    u32_encode_bits(DRV_TO_FW_SVC_ID(svc_id),
++				    HTT_H2T_SAWF_DEF_Q_UMAP_SVC_ID) |
++		    u32_encode_bits(peer_id,
++				    HTT_H2T_SAWF_DEF_Q_UMAP_PEER_ID);
++
++	ath12k_dbg(ab, ATH12K_DBG_SAWF, "Def Q UnMap req:0x%x\n", cmd->info);
++
++	ret = ath12k_htc_send(&ab->htc, dp->eid, skb);
++	if (ret) {
++		dev_kfree_skb_any(skb);
++		return ret;
++	}
++	return 0;
++}
++
++int ath12k_sawf_htt_h2t_def_q_map_report_req(struct ath12k_base *ab,
++					     u8 tid_mask,
++					     u16 peer_id)
++{
++	struct ath12k_dp *dp = &ab->dp;
++	struct sk_buff *skb;
++	struct ath12k_htt_h2t_sawf_def_q_map_report_req *cmd;
++	int len = sizeof(*cmd);
++	int ret;
++
++	skb = ath12k_htc_alloc_skb(ab, len);
++	if (!skb) {
++		ath12k_err(ab, "Def Q map Report Req:alloc skb fails\n");
++		return -ENOMEM;
++	}
++
++	skb_put(skb, len);
++	cmd = (struct htt_h2c_sawf_def_q_map_req_report *)skb->data;
++
++	cmd->info = u32_encode_bits(HTT_H2T_MSG_TYPE_SAWF_DEF_Q_MAP_REPORT_REQ,
++				    HTT_H2T_MSG_TYPE_ID) |
++		    u32_encode_bits(tid_mask,
++				    HTT_H2T_SAWF_DEF_Q_MAP_TID_MASK_ID) |
++		    u32_encode_bits(peer_id,
++				    HTT_H2T_SAWF_DEF_Q_MAP_PEER_ID);
++
++	cmd->info1 = u32_encode_bits(0, HTT_H2T_SAWF_DEF_Q_MAP_ETO_ID);
++
++	ath12k_dbg(ab, ATH12K_DBG_SAWF, "Def Q Map Report req:0x%x, 0x%x\n",
++		   cmd->info, cmd->info1);
++
++	ret = ath12k_htc_send(&ab->htc, dp->eid, skb);
++	if (ret) {
++		dev_kfree_skb_any(skb);
++		return ret;
++	}
++	return 0;
++}
++
++int ath12k_sawf_def_qmap_req(struct ath12k_base *ab,
++			     u8 svc_id, u16 peer_id)
++{
++	int ret;
++	struct ath12k_sawf_ctx *sawf_ctx;
++
++	if (!ab)
++		return DP_SAWF_INVALID_PARAM;
++
++	sawf_ctx = ath12k_get_sawf_context();
++	if (!sawf_ctx)
++		return -EINVAL;
++
++	spin_lock_bh(&sawf_ctx->sawf_svc_lock);
++	if (!ath12k_svc_id_configured(svc_id)) {
++		spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
++		return -EINVAL;
++	}
++	spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
++
++	ret = ath12k_sawf_htt_h2t_def_q_map_req(ab, svc_id, peer_id);
++	if (ret) {
++		ath12k_dbg(ab, ATH12K_DBG_SAWF, "Def Q Map Req fail %d\n", ret);
++		return ret;
++	}
++
++	ret = ath12k_sawf_htt_h2t_def_q_map_report_req(ab, 0xFF, peer_id);
++
++	return ret;
++}
++
++int ath12k_sawf_def_qunmap_req(struct ath12k_base *ab,
++			       u8 svc_id, u16 peer_id)
++{
++	int ret;
++	struct ath12k_sawf_ctx *sawf_ctx;
++
++	if (!ab)
++		return DP_SAWF_INVALID_PARAM;
++
++	sawf_ctx = ath12k_get_sawf_context();
++	if (!sawf_ctx)
++		return -EINVAL;
++
++	spin_lock_bh(&sawf_ctx->sawf_svc_lock);
++	if (!ath12k_svc_id_configured(svc_id)) {
++		spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
++		return -EINVAL;
++	}
++	spin_unlock_bh(&sawf_ctx->sawf_svc_lock);
++
++	ret = ath12k_sawf_htt_h2t_def_q_unmap_req(ab, svc_id, peer_id);
++	if (ret) {
++		ath12k_dbg(ab, ATH12K_DBG_SAWF, "Def Q Unmap req fail ret %d\n", ret);
++		return ret;
++	}
++
++	ret = ath12k_sawf_htt_h2t_def_q_map_report_req(ab, 0xFF, peer_id);
++
++	return ret;
++}
++
++int ath12k_sawf_def_qmap_report_req(struct ath12k_base *ab,
++				    u16 peer_id)
++{
++	struct ath12k_sawf_def_queue_report def_q_map_report[ATH12K_SAWF_MAX_TID_SUPPORT] = {0};
++	struct ath12k_peer *peer;
++	int ret = -1;
++
++	if (!ab)
++		return DP_SAWF_INVALID_PARAM;
++
++	spin_lock_bh(&ab->base_lock);
++	peer = ath12k_peer_find_by_id(ab, peer_id);
++	if (peer)
++		memcpy(def_q_map_report,
++		       peer->sawf_ctx_peer.def_q_map,
++		       sizeof(def_q_map_report));
++
++	spin_unlock_bh(&ab->base_lock);
++	if (peer) {
++		int i;
++
++		ret = 0;
++		ath12k_dbg(ab, ATH12K_DBG_SAWF, "peer %pM map report\n", peer->addr);
++		ath12k_dbg(ab, ATH12K_DBG_SAWF, "TID: Active: Svc_Id\n");
++		for (i = 0; i < ATH12K_SAWF_MAX_TID_SUPPORT; ++i) {
++			bool  tid_active;
++			u8 svc_id;
++
++			svc_id = def_q_map_report[i].svc_class_id;
++			tid_active = (svc_id && svc_id != 0xFF);
++			ath12k_dbg(ab, ATH12K_DBG_SAWF,
++				   "%u :\t %u :\t %u\n",
++				   i,
++				   tid_active,
++				   svc_id);
++		}
++	}
++	return ret;
++}
++
++void ath12k_htt_sawf_def_q_map_report_handler(struct ath12k_base *ab,
++					      struct sk_buff *skb)
++{
++	struct ath12k_htt_t2h_sawf_q_map_report *resp =
++			(struct ath12k_htt_t2h_sawf_q_map_report *)skb->data;
++	struct ath12k_peer *peer;
++	unsigned int data_len = skb->len;
++	u16 peer_id;
++	int i;
++
++	peer_id = FIELD_GET(HTT_T2H_SAWF_Q_MAP_REPORT_INFO0_PEER_ID,
++			    resp->info);
++	data_len -= sizeof(resp->info);
++
++	rcu_read_lock();
++	spin_lock_bh(&ab->base_lock);
++
++	peer = ath12k_peer_find_by_id(ab, peer_id);
++	/* Default queue map report received on reqest,Hence peer should be valid */
++	if (WARN_ON_ONCE(!peer))
++		goto unlock_ab_base;
++
++	for (i = 0;
++	     data_len > 0 && i < ATH12K_SAWF_MAX_TID_SUPPORT;
++	     data_len -= sizeof(resp->tid_report[i]), ++i) {
++		u8 tid, svc_id;
++
++		tid = FIELD_GET(HTT_T2H_SAWF_Q_MAP_REPORT_TID_ID,
++				resp->tid_report[i]);
++		svc_id = FIELD_GET(HTT_T2H_SAWF_Q_MAP_REPORT_SVC_ID,
++				   resp->tid_report[i]);
++		svc_id += 1;
++		ath12k_dbg(ab, ATH12K_DBG_SAWF,
++			   "idx %d:MapReport:Tid[%u]Svc[%u]\n",
++			   i, tid, svc_id);
++		if (tid < ATH12K_SAWF_MAX_TID_SUPPORT)
++			peer->sawf_ctx_peer.def_q_map[tid].svc_class_id = svc_id;
++	}
++
++unlock_ab_base:
++	spin_unlock_bh(&ab->base_lock);
++	rcu_read_unlock();
++}
+--- a/drivers/net/wireless/ath/ath12k/sawf.h
++++ b/drivers/net/wireless/ath/ath12k/sawf.h
+@@ -6,6 +6,9 @@
+ #ifndef ATH12K_SAWF_H
+ #define ATH12K_SAWF_H
+ 
++#define ATH12K_MAC_ADDR_SIZE	6
++#define DP_SAWF_INVALID_PARAM	-1
++
+ #define ATH12K_SAWF_SVC_CLASS_MIN 1
+ #define ATH12K_SAWF_SVC_CLASS_MAX 128
+ #define ATH12K_MAX_APP_NAME 64
+@@ -171,15 +174,131 @@ struct ath12k_msduq_map {
+ };
+ 
+ /**
++ * struct ath12k_sawf_def_queue_report : default Q map report
++ */
++struct ath12k_sawf_def_queue_report {
++	u8 svc_class_id;
++};
++
++/**
+  * struct ath12k_sawf_peer_ctx
+  * A Data base to maintain the allocation status of user deined MSDUQ.
+  * The allocation is mapped with the service class ID.
+  * @msduq_table: map table of msduq and svc id per peer
++ * @def_q_map: default q map report
+  */
+ struct ath12k_sawf_peer_ctx {
+ 	struct ath12k_msduq_map msduq_table[ATH12K_SAWF_MAX_TID_SUPPORT][MAX_Q_PER_TID];
++	struct ath12k_sawf_def_queue_report def_q_map[ATH12K_SAWF_MAX_TID_SUPPORT];
++};
++
++/* MSG_TYPE => HTT_H2T_SAWF_DEF_QUEUES_MAP_REQ
++ *
++ * @details
++ * The SAWF_DEF_QUEUES_MAP_REQ message is sent by the host to link
++ * the default MSDU queues for one of the TIDs within the specified peer
++ * to the specified service class.
++ * The TID is indirectly specified - each service class is associated
++ * with a TID.  All default MSDU queues for this peer-TID will be
++ * linked to the service class in question.
++ *
++ * |31                          16|15           8|7            0|
++ * |------------------------------+--------------+--------------|
++ * |             peer ID          | svc class ID |   msg type   |
++ * |------------------------------------------------------------|
++ * Header fields:
++ * dword0 - b'7:0       - msg_type: This will be set to
++ *                        0x1c (HTT_H2T_SAWF_DEF_QUEUES_MAP_REQ)
++ *          b'15:8      - service class ID
++ *          b'31:16     - peer ID
++ */
++struct ath12k_htt_h2t_sawf_def_q_map_req {
++	u32 info;
+ };
+ 
++#define HTT_H2T_MSG_TYPE_ID			GENMASK(7, 0)
++#define HTT_H2T_SAWF_DEF_Q_MAP_SVC_ID		GENMASK(15, 8)
++#define HTT_H2T_SAWF_DEF_Q_UMAP_SVC_ID		GENMASK(15, 8)
++#define HTT_H2T_SAWF_DEF_Q_MAP_PEER_ID		GENMASK(31, 16)
++#define HTT_H2T_SAWF_DEF_Q_UMAP_PEER_ID		GENMASK(31, 16)
++#define	HTT_H2T_SAWF_DEF_Q_MAP_TID_MASK_ID	GENMASK(15, 8)
++#define HTT_H2T_SAWF_DEF_Q_MAP_ETO_ID		BIT(0)
++/* MSG_TYPE => HTT_H2T_SAWF_DEF_QUEUES_UNMAP_REQ
++ *
++ * @details
++ * The SAWF_DEF_QUEUES_UNMAP_REQ message is sent by the host to
++ * remove the linkage of the specified peer-TID's MSDU queues to
++ * service classes.
++ *
++ * |31                          16|15           8|7            0|
++ * |------------------------------+--------------+--------------|
++ * |             peer ID          | svc class ID |   msg type   |
++ * |------------------------------------------------------------|
++ * Header fields:
++ * dword0 - b'7:0       - msg_type: This will be set to
++ *                        0x1d (HTT_H2T_SAWF_DEF_QUEUES_UNMAP_REQ)
++ *          b'15:8      - service class ID
++ *          b'31:16     - peer ID
++ *                        A HTT_H2T_SAWF_DEF_QUEUES_UNMAP_PEER_ID_WILDCARD
++ *                        value for peer ID indicates that the target should
++ *                        apply the UNMAP_REQ to all peers.
++ */
++struct ath12k_htt_h2t_sawf_def_q_unmap_req {
++	u32 info;
++};
++
++/* MSG_TYPE => HTT_H2T_SAWF_DEF_QUEUES_MAP_REPORT_REQ
++ *
++ * @details
++ * The SAWF_DEF_QUEUES_MAP_REPORT_REQ message is sent by the host to
++ * request the target to report what service class the default MSDU queues
++ * of the specified TIDs within the peer are linked to.
++ * The target will respond with a SAWF_DEF_QUEUES_MAP_REPORT_CONF message
++ * to report what service class (if any) the default MSDU queues for
++ * each of the specified TIDs are linked to.
++ *
++ * |31                          16|15           8|7        1|  0|
++ * |------------------------------+--------------+--------------|
++ * |             peer ID          |   TID mask   |   msg type   |
++ * |------------------------------------------------------------|
++ * |                           reserved                     |ETO|
++ * |------------------------------------------------------------|
++ * Header fields:
++ * dword0 - b'7:0       - msg_type: This will be set to
++ *                        0x1e (HTT_H2T_SAWF_DEF_QUEUES_MAP_REPORT_REQ)
++ *          b'15:8      - TID mask
++ *          b'31:16     - peer ID
++ * dword1 - b'0         - "Existing Tids Only" flag
++ *                        If this flag is set, the DEF_QUEUES_MAP_REPORT_CONF
++ *                        message generated by this REQ will only show the
++ *                        mapping for TIDs that actually exist in the target's
++ *                        peer object.
++ *                        Any TIDs that are covered by a MAP_REQ but which
++ *                        do not actually exist will be shown as being
++ *                        unmapped (i.e. svc class ID 0xff).
++ *                        If this flag is cleared, the MAP_REPORT_CONF message
++ *                        will consider not only the mapping of TIDs currently
++ *                        existing in the peer, but also the mapping that will
++ *                        be applied for any TID objects created within this
++ *                        peer in the future.
++ *          b'31:1      - reserved for future use
++ */
++struct ath12k_htt_h2t_sawf_def_q_map_report_req {
++	u32 info;
++	u32 info1;
++};
++
++#define HTT_T2H_SAWF_Q_MAP_REPORT_INFO0_PEER_ID	GENMASK(31, 16)
++#define HTT_T2H_SAWF_Q_MAP_REPORT_TID_ID	GENMASK(7, 0)
++#define HTT_T2H_SAWF_Q_MAP_REPORT_SVC_ID	GENMASK(15, 8)
++
++#define HTT_SAWF_SVC_CLASS_INVALID_ID 0xff
++
++struct ath12k_htt_t2h_sawf_q_map_report {
++	u32 info;
++	u32 tid_report[ATH12K_SAWF_MAX_TID_SUPPORT]; //MAX_TIDT
++} __packed;
++
+ extern bool ath12k_sawf_enable;
+ struct ath12k_sawf_ctx *ath12k_get_sawf_context(void);
+ void ath12k_sawf_init(struct ath12k_base *ab);
+@@ -196,4 +315,17 @@ int ath12k_sawf_disable_config(u8 svc_id
+ u16 ath12k_sawf_get_msduq(struct net_device *netdev,
+ 			  u8 *peer_mac, u32 service_id,
+ 			  u32 dscp, u32 rule_id);
++struct ath12k_base *ath12k_sawf_get_ab_from_netdev(struct net_device *dev,
++						u8 *peer_mac,
++						u16 *peer_id);
++
++int ath12k_sawf_def_qmap_req(struct ath12k_base *ab,
++			     u8 svc_id, u16 peer_id);
++int ath12k_sawf_def_qunmap_req(struct ath12k_base *ab,
++			       u8 svc_id, u16 peer_id);
++int ath12k_sawf_def_qmap_report_req(struct ath12k_base *ab,
++				    u16 peer_id);
++
++void ath12k_htt_sawf_def_q_map_report_handler(struct ath12k_base *ab,
++					      struct sk_buff *skb);
+ #endif /* ATH11K_SAWF_H */
+--- a/drivers/net/wireless/ath/ath12k/vendor.c
++++ b/drivers/net/wireless/ath/ath12k/vendor.c
+@@ -7,6 +7,7 @@
+ #include "core.h"
+ #include "debug.h"
+ #include "mac.h"
++#include "sawf.h"
+ 
+ static const struct nla_policy
+ ath12k_vendor_sawf_config_policy[QCA_WLAN_VENDOR_SAWF_ATTR_CONFIG_MAX + 1] = {
+@@ -24,6 +25,17 @@ ath12k_vendor_sawf_config_policy[QCA_WLA
+ 	[QCN_WLAN_VENDOR_ATTR_SAWF_SVC_MSDU_RATE_LOSS] = {.type = NLA_U32},
+ };
+ 
++static const struct nla_policy
++ath12k_vendor_sawf_def_qmap_req_policy[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAX + 1] = {
++	[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_SVC_ID] = {.type = NLA_U8},
++	[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAC_ADDR] = {.type = NLA_STRING, .len = 18},
++};
++
++static const struct nla_policy
++ath12k_vendor_sawf_def_qmap_rep_req_policy[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAX + 1] = {
++	[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAC_ADDR] = {.type = NLA_STRING, .len = 18},
++};
++
+ static void ath12k_set_default_values(struct ath12k_sawf_svc_params *param)
+ {
+ 	param->min_throughput_rate = SAWF_SVC_PARAM_DEFAULT_MIN_THRUPUT;
+@@ -246,6 +258,142 @@ nla_put_failure:
+ 	return -ENOBUFS;
+ }
+ 
++static int ath12k_vendor_sawf_def_qmap_req(struct wiphy *wiphy,
++					   struct wireless_dev *wdev,
++					   const void *data,
++					   int data_len)
++{
++	struct nlattr *tb[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAX + 1];
++	struct ath12k_base *ab = NULL;
++	u8 svc_id;
++	u8 *mac_addr_p = NULL;
++	u16 peer_id = 0xFFFF;
++	u8 mac_addr[ATH12K_MAC_ADDR_SIZE] = { 0 };
++	int ret = 0;
++
++	ret = nla_parse(tb, QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAX, data, data_len,
++			ath12k_vendor_sawf_def_qmap_req_policy, NULL);
++	if (ret) {
++		ath12k_warn(NULL, "invalid sawf def q map policy attribute\n");
++		return ret;
++	}
++
++	if (tb[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAC_ADDR])	{
++		mac_addr_p = nla_data(tb[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAC_ADDR]);
++		if (sscanf(mac_addr_p,
++			   "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
++			   &mac_addr[0],
++			   &mac_addr[1],
++			   &mac_addr[2],
++			   &mac_addr[3],
++			   &mac_addr[4],
++			   &mac_addr[5]) != ATH12K_MAC_ADDR_SIZE) {
++			ath12k_warn(NULL, "invalid Macaddr %s\n", mac_addr_p);
++			return -1;
++		}
++	}
++	svc_id = nla_get_u8(tb[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_SVC_ID]);
++
++	ath12k_dbg(NULL, ATH12K_DBG_SAWF,
++		   "Default Q map:svcid[%u]macaddr[%pM]\n", svc_id, mac_addr);
++
++	ab = ath12k_sawf_get_ab_from_netdev(wdev->netdev, mac_addr, &peer_id);
++	if (ab)
++		ret = ath12k_sawf_def_qmap_req(ab, svc_id, peer_id);
++
++	return ret;
++}
++
++static int ath12k_vendor_sawf_def_qunmap_req(struct wiphy *wiphy,
++					     struct wireless_dev *wdev,
++					     const void *data,
++					     int data_len)
++{
++	struct nlattr *tb[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAX + 1];
++	struct ath12k_base *ab;
++	u8 svc_id;
++	u16 peer_id = 0xFFFF;
++	u8 *mac_addr_p = NULL;
++	u8 mac_addr[ATH12K_MAC_ADDR_SIZE] = { 0 };
++	int ret = 0;
++
++	ret = nla_parse(tb, QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAX, data, data_len,
++			ath12k_vendor_sawf_def_qmap_req_policy, NULL);
++	if (ret) {
++		ath12k_warn(NULL, "invalid sawf def q unmap policy attribute\n");
++		return ret;
++	}
++
++	if (tb[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAC_ADDR]) {
++		mac_addr_p = nla_data(tb[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAC_ADDR]);
++		if (sscanf(mac_addr_p,
++			   "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
++			   &mac_addr[0],
++			   &mac_addr[1],
++			   &mac_addr[2],
++			   &mac_addr[3],
++			   &mac_addr[4],
++			   &mac_addr[5]) != ATH12K_MAC_ADDR_SIZE) {
++			ath12k_warn(NULL, "invalid Macaddr %s\n", mac_addr_p);
++			return -1;
++		}
++	}
++	svc_id = nla_get_u8(tb[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_SVC_ID]);
++
++	ath12k_dbg(NULL, ATH12K_DBG_SAWF,
++		   "Default Q unmap:svcid[%u]macaddr[%pM]\n", svc_id, mac_addr);
++
++	ab = ath12k_sawf_get_ab_from_netdev(wdev->netdev, mac_addr, &peer_id);
++
++	if (ab)
++		ret = ath12k_sawf_def_qunmap_req(ab, svc_id, peer_id);
++
++	return ret;
++}
++
++static int ath12k_vendor_sawf_def_qmap_report_req(struct wiphy *wiphy,
++						  struct wireless_dev *wdev,
++						  const void *data,
++						  int data_len)
++{
++	struct nlattr *tb[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAX + 1];
++	struct ath12k_base *ab = NULL;
++	u16 peer_id = 0xFFFF;
++	u8 *mac_addr_p = NULL;
++	u8 mac_addr[ATH12K_MAC_ADDR_SIZE] = { 0 };
++	int ret = 0;
++
++	ret = nla_parse(tb, QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAX, data, data_len,
++			ath12k_vendor_sawf_def_qmap_rep_req_policy, NULL);
++	if (ret) {
++		ath12k_warn(NULL, "invalid sawf def q map report req policy attribute\n");
++		return ret;
++	}
++
++	if (tb[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAC_ADDR])	{
++		mac_addr_p = nla_data(tb[QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAC_ADDR]);
++		if (sscanf(mac_addr_p,
++			   "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
++			   &mac_addr[0],
++			   &mac_addr[1],
++			   &mac_addr[2],
++			   &mac_addr[3],
++			   &mac_addr[4],
++			   &mac_addr[5]) != ATH12K_MAC_ADDR_SIZE) {
++			ath12k_warn(NULL, "invalid Macaddr %s\n", mac_addr_p);
++			return -1;
++		}
++	}
++	ath12k_dbg(NULL, ATH12K_DBG_SAWF,
++		   "Default Q map report:macaddr[%pM]\n", mac_addr);
++
++	ab = ath12k_sawf_get_ab_from_netdev(wdev->netdev, mac_addr, &peer_id);
++	if (ab)
++		ret = ath12k_sawf_def_qmap_report_req(ab, peer_id);
++
++	return ret;
++}
++
+ static struct wiphy_vendor_command ath12k_vendor_commands[] = {
+ 	{
+ 		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+@@ -268,6 +416,30 @@ static struct wiphy_vendor_command ath12
+ 		.policy = ath12k_vendor_sawf_config_policy,
+ 		.maxattr = QCA_WLAN_VENDOR_SAWF_ATTR_CONFIG_MAX,
+ 	},
++	{
++		.info.vendor_id = QCA_NL80211_VENDOR_ID,
++		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_SAWF_DEF_Q_MAP,
++		.doit = ath12k_vendor_sawf_def_qmap_req,
++		.policy = ath12k_vendor_sawf_def_qmap_req_policy,
++		.maxattr = QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAX,
++		.flags = WIPHY_VENDOR_CMD_NEED_NETDEV,
++	},
++	{
++		.info.vendor_id = QCA_NL80211_VENDOR_ID,
++		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_SAWF_DEF_Q_UNMAP,
++		.doit = ath12k_vendor_sawf_def_qunmap_req,
++		.policy = ath12k_vendor_sawf_def_qmap_req_policy,
++		.maxattr = QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAX,
++		.flags = WIPHY_VENDOR_CMD_NEED_NETDEV,
++	},
++	{
++		.info.vendor_id = QCA_NL80211_VENDOR_ID,
++		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_SAWF_DEF_Q_MAP_REP,
++		.doit = ath12k_vendor_sawf_def_qmap_report_req,
++		.policy = ath12k_vendor_sawf_def_qmap_rep_req_policy,
++		.maxattr = QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAX,
++		.flags = WIPHY_VENDOR_CMD_NEED_NETDEV,
++	},
+ };
+ 
+ int ath12k_vendor_register(struct ath12k_hw *ah)
+--- a/drivers/net/wireless/ath/ath12k/vendor.h
++++ b/drivers/net/wireless/ath/ath12k/vendor.h
+@@ -14,6 +14,9 @@ enum qca_nl80211_vendor_subcmds {
+ 	QCA_NL80211_VENDOR_SUBCMD_SVC_CREATE = 204,
+ 	QCA_NL80211_VENDOR_SUBCMD_SVC_DISABLE = 205,
+ 	QCA_NL80211_VENDOR_SUBCMD_SVC_VIEW = 206,
++	QCA_NL80211_VENDOR_SUBCMD_SAWF_DEF_Q_MAP = 207,
++	QCA_NL80211_VENDOR_SUBCMD_SAWF_DEF_Q_UNMAP = 208,
++	QCA_NL80211_VENDOR_SUBCMD_SAWF_DEF_Q_MAP_REP = 209,
+ };
+ 
+ enum qca_wlan_vendor_sawf_attr_config {
+@@ -36,5 +39,15 @@ enum qca_wlan_vendor_sawf_attr_config {
+ 		QCA_WLAN_VENDOR_SAWF_ATTR_CONFIG_AFTER_LAST - 1,
+ };
+ 
++enum ath12k_vendor_attr_sawf_def_q_map {
++	QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_INVALID = 0,
++	QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_SVC_ID = 1,
++	QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAC_ADDR = 2,
++	/* keep last */
++	QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_AFTER_LAST,
++	QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_MAX =
++		QCN_WLAN_VENDOR_ATTR_SAWF_DEF_Q_MAP_AFTER_LAST - 1,
++};
++
+ int ath12k_vendor_register(struct ath12k_hw *ah);
+ #endif /* QCA_VENDOR_H */

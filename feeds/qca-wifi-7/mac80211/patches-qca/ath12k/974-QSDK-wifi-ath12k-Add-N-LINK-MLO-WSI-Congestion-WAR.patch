@@ -1,0 +1,468 @@
+From 77c82b35964133da4ca362fbe2aa52d3bfb29b41 Mon Sep 17 00:00:00 2001
+From: Mahendran P <quic_mahep@quicinc.com>
+Date: Tue, 27 Aug 2024 17:41:12 +0530
+Subject: [PATCH 2/2] QSDK: wifi: ath12k: Add N-LINK-MLO WSI Congestion WAR
+
+QCN9274 devices are connected for MLO communications using WSI (WLAN
+Serial interface). This interface connects all the devices on the
+board in a daisy chain and the interface is directional.
+
+As an example, find the WSI traffic flow of 4 QCN9274 devices.
+Note that direction of the WSI traffic flow may change depending on
+the platform as well as the devices can be connected in any order.
+
+		2 GHz                 5 GHz-lower
+		  +----------←----------+
+		  |                     |
+		  | Example connection  |
+		  ↓        of           ↑
+		  |  4 QCN9274 devices  |
+		  |                     |
+		  |                     |
+		  +---------→-----------+
+		5 GHz-upper           6 GHz
+
+Each device has an ingress WSI link coming from another device and
+an egress WSI link going to another device. each device also
+multiplexes (and demultiplexes) traffic coming from another device.
+
+In MLD case, WSI congestion may happen when a device has WSI egress
+traffic (where the current device acts as primary or bridge and is
+the source of WSI traffic) and ingress traffic (where the current
+device acts as bypass link for WSI traffic that will multiplex with
+the egress traffic).When the congestion happens on the egress link,
+the data is not reaped as fast enough from the ingress ring on the
+device. This results in firmware crash.
+
+Fix this issue by detecting congestion possibility where identifying
+both bypass traffic received by the ingress WSI link and traffic from
+current device passing through egress WSI link and limiting the MPDU
+size.
+
+  1. ath12k determines the number of egress traffic and ingress traffic
+     for each device every time a peer is associated or disassociated
+  2. ath12k reports to firmware by sending WMI command if there is any
+     change in egress or ingress traffic counts of each device in WSI
+     connected devices
+  3. Firmware administers the MPDU limit.
+
+Add support to calculate egress and ingress count for each device and
+send wmi command
+
+Details of the changes:
+	1. Initialization and Deinitialization of WSI load information
+	   database
+        2. For each device, update the WSI order in the database at the
+	   end of core start
+	3. whenever a client is associated or disassociated,
+		a) identify the primary link device and update egress
+		   count for the primary device
+		b) identify the secondary devices (non-primary links)
+		c) For each secondary device, calculate the number of
+		   hops from primary device and update ingress count
+		   for all the hop devices
+		d) Set notify as true for the count updated devices
+	4. send Pdev WSI stats info WMI command to firmware for the
+	   devices set with notify as true
+
+Patch-dependency:
+	955-wifi-ath12k-Add-support-for-four-link-MLO-in-AP-MLD.patch
+	972-01-wifi-ath12k-Introduce-RCU-Protection-to-safeguard-ar.patch
+	973-QSDK-wifi-ath12k-Add-WMI-support-to-notify-WSI-stats.patch
+
+Patch-work: None
+
+Signed-off-by: Mahendran P <quic_mahep@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c |  74 ++++++++
+ drivers/net/wireless/ath/ath12k/core.h |  24 +++
+ drivers/net/wireless/ath/ath12k/mac.c  | 224 +++++++++++++++++++++++++
+ 3 files changed, 322 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -145,6 +145,11 @@ void ath12k_core_put_hw_group(struct ath
+ 		ag->fst = NULL;
+ 	}
+ 
++	if (ag->wsi_load_info) {
++		ath12k_wsi_load_info_deinit(ab, ag->wsi_load_info);
++		ag->wsi_load_info = NULL;
++	}
++
+ 	mutex_lock(&ag->mutex_lock);
+ 
+ 	if (chip_id >= ag->num_chip) {
+@@ -226,6 +231,7 @@ ath12k_core_hw_group_alloc(u8 id, u8 max
+ 	ag->recovery_mode = ATH12K_MLO_RECOVERY_MODE0;
+ 	INIT_WORK(&ag->reset_work, ath12k_core_hw_group_reset);
+ 	ag->fst = NULL;
++	ag->wsi_load_info = NULL;
+ #ifdef CPTCFG_ATH12K_POWER_OPTIMIZATION
+ 	ath12k_global_ps_ctx.ag = ag;
+ #endif
+@@ -371,6 +377,10 @@ again:
+ 		ag->fst = ath12k_dp_rx_fst_attach(ab);
+ 
+ 	ab->ag = ag;
++
++	if (ath12k_wsi_load_info_init(ab))
++		ath12k_err(ab, "failed to initialize wsi load info\n");
++
+ 	return ag;
+ }
+ 
+@@ -1534,6 +1544,8 @@ static int ath12k_core_start(struct ath1
+ 	/* Indicate the core start in the appropriate group */
+ 	ab->ag->num_started++;
+ 
++	ath12k_wsi_load_info_wsiorder_update(ab);
++
+ 	return 0;
+ 
+ err_reo_cleanup:
+@@ -4412,6 +4424,69 @@ struct ath12k_base *ath12k_core_get_ab_b
+ 	return NULL;
+ }
+ 
++int ath12k_wsi_load_info_init(struct ath12k_base *ab)
++{
++	struct ath12k_mlo_wsi_load_info *wsi_load_info = NULL;
++	struct ath12k_mlo_wsi_device_group *mlo_grp_info;
++	struct ath12k_hw_group *ag = ab->ag;
++	int ret = 0;
++	u8 i;
++
++	if (!ag)
++		return ret;
++
++	if (ag->num_chip < ATH12K_MIN_NUM_DEVICES_NLINK)
++		return ret;
++
++	if (!ag->wsi_load_info) {
++		wsi_load_info = kzalloc(sizeof(*wsi_load_info), GFP_KERNEL);
++		if (!wsi_load_info)
++			return -ENOMEM;
++		ag->wsi_load_info = wsi_load_info;
++		mlo_grp_info = &wsi_load_info->mlo_device_grp;
++		mlo_grp_info->num_devices = 0;
++		for (i = 0; i < ATH12K_MAX_SOCS; i++)
++			mlo_grp_info->wsi_order[i] = WSI_INVALID_ORDER;
++		ath12k_dbg(ab, ATH12K_DBG_MAC, "successfully initialized wsi load info\n");
++	}
++	return ret;
++}
++
++void ath12k_wsi_load_info_deinit(struct ath12k_base *ab,
++				 struct ath12k_mlo_wsi_load_info *wsi_load_info)
++{
++	ath12k_dbg(ab, ATH12K_DBG_MAC, "successfully deinitialized wsi load info\n");
++	kfree(wsi_load_info);
++}
++
++void ath12k_wsi_load_info_wsiorder_update(struct ath12k_base *ab)
++{
++	struct ath12k_hw_group *ag = ab->ag;
++	struct ath12k_mlo_wsi_load_info *wsi_load_info;
++	struct ath12k_mlo_wsi_device_group *mlo_grp_info;
++	u8 i;
++
++	if (!ag || !ag->wsi_load_info)
++		return;
++
++	if (ag->num_chip < ATH12K_MIN_NUM_DEVICES_NLINK)
++		return;
++
++	wsi_load_info = ag->wsi_load_info;
++	mlo_grp_info = &wsi_load_info->mlo_device_grp;
++
++	for (i = 0; i < ATH12K_MAX_SOCS; i++) {
++		if (mlo_grp_info->wsi_order[i] == WSI_INVALID_ORDER) {
++			mlo_grp_info->wsi_order[i] = ab->wsi_info.chip_idx;
++			mlo_grp_info->num_devices++;
++			ath12k_dbg(ab, ATH12K_DBG_MAC,
++				   "wsi load info update for wsi order %d\n",
++				   ab->wsi_info.chip_idx);
++			break;
++		}
++	}
++}
++
+ static void ath12k_rddm_notifier(struct notifier_block *this,
+ 				 unsigned long event, void *ptr)
+ {
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1422,6 +1422,25 @@ struct ath12k_mlo_dp_umac_reset {
+ 
+ #define ATH12K_IS_UMAC_RESET_IN_PROGRESS	BIT(0)
+ 
++#define WSI_INVALID_ORDER	0xFF
++#define WSI_INVALID_INDEX	0xFF
++
++struct ath12k_mlo_wsi_device_group {
++	u8 wsi_order[ATH12K_MAX_SOCS];
++	u8 num_devices;
++};
++
++struct ath12k_mlo_wsi_device_load_stats {
++	u32 ingress_cnt;
++	u32 egress_cnt;
++	bool notify;
++};
++
++struct ath12k_mlo_wsi_load_info {
++	struct ath12k_mlo_wsi_device_group mlo_device_grp;
++	struct ath12k_mlo_wsi_device_load_stats load_stats[ATH12K_MAX_SOCS];
++};
++
+ /* Holds info on the group of SOCs that are registered as a single wiphy
+  * or single SOC where each radio registered as separate wiphy in non-MLO
+  */
+@@ -1459,6 +1478,7 @@ struct ath12k_hw_group {
+ 	struct completion umac_reset_complete;
+ 	bool trigger_umac_reset;
+ 	struct dp_rx_fst *fst;
++	struct ath12k_mlo_wsi_load_info *wsi_load_info;
+ };
+ 
+ struct wsi_info {
+@@ -1977,4 +1997,8 @@ void ath12k_erp_handle_trigger(struct wo
+ void ath12k_vendor_wlan_intf_stats(struct work_struct *work);
+ void ath12k_debug_print_dcs_wlan_intf_stats(struct ath12k_base *ab,
+ 				       struct wmi_dcs_wlan_interference_stats *wlan_info);
++int ath12k_wsi_load_info_init(struct ath12k_base *ab);
++void ath12k_wsi_load_info_deinit(struct ath12k_base *ab,
++				 struct ath12k_mlo_wsi_load_info *wsi_load_info);
++void ath12k_wsi_load_info_wsiorder_update(struct ath12k_base *ab);
+ #endif /* _CORE_H_ */
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -8298,6 +8298,209 @@ static int ath12k_mac_free_unassign_link
+ 	return 0;
+ }
+ 
++static struct ath12k *ath12k_get_ar_by_device_idx(struct ath12k_hw_group *ag,
++						  u8 device_idx)
++{
++	struct ath12k *ar = NULL;
++	struct ath12k_hw *ah;
++	u8 i, j;
++
++	for (i = 0; i < ag->num_hw; i++) {
++		ah = ag->ah[i];
++		if (!ah)
++			continue;
++
++		ar = ah->radio;
++		for (j = 0; j < ah->num_radio; j++) {
++			if (!ar)
++				continue;
++
++			if (ar->ab->wsi_info.chip_idx == device_idx)
++				return ar;
++			ar++;
++		}
++	}
++	return NULL;
++}
++
++u8 ath12k_get_device_index(struct ath12k_mlo_wsi_load_info *wsi_load_info, u8 device_id)
++{
++	for (u8 i = 0; i < wsi_load_info->mlo_device_grp.num_devices; i++) {
++		if (wsi_load_info->mlo_device_grp.wsi_order[i] == device_id)
++			return i;
++	}
++	return WSI_INVALID_INDEX;
++}
++
++static u8 ath12k_get_wsi_next_device(struct ath12k_mlo_wsi_device_group *mlo_device_grp,
++				     u8 prim_deviceid, u8 num_hop)
++{
++	u8 next_device_id = WSI_INVALID_ORDER;
++
++	if (!num_hop)
++		return next_device_id;
++
++	next_device_id = (prim_deviceid + num_hop) % mlo_device_grp->num_devices;
++
++	return next_device_id;
++}
++
++static int ath12k_send_wsi_load_info(struct ath12k_base *ab, u8 group_id)
++{
++	struct ath12k_wmi_wsi_stats_info_param param;
++	struct ath12k_hw_group *ag = ab->ag;
++	struct ath12k_mlo_wsi_load_info *wsi_load_info = ag->wsi_load_info;
++	struct ath12k *ar = NULL;
++	int ret = 0, i;
++
++	for (i = 0; i < ATH12K_MAX_SOCS; i++) {
++		if (wsi_load_info->load_stats[i].notify) {
++			ar = ath12k_get_ar_by_device_idx(ag,
++							 wsi_load_info->mlo_device_grp.wsi_order[i]);
++			if (!ar) {
++				ath12k_err(NULL, "ar is null");
++				continue;
++			}
++			param.wsi_ingress_load_info =
++				wsi_load_info->load_stats[i].ingress_cnt;
++			param.wsi_egress_load_info =
++				wsi_load_info->load_stats[i].egress_cnt;
++
++			ret = ath12k_wmi_send_wsi_stats_info(ar, &param);
++			if (ret)
++				ath12k_warn(ar->ab,
++					    "failed to initiate wmi pdev wsi stats info  %d",
++					    ret);
++			else
++				wsi_load_info->load_stats[i].notify = false;
++		}
++	}
++	return ret;
++}
++
++static int ath12k_wsi_load_info_stats_update(struct ath12k_vif *ahvif,
++					     struct ath12k_sta *ahsta, bool append)
++{
++	struct ieee80211_sta *sta = container_of((void *)ahsta,
++						 struct ieee80211_sta, drv_priv);
++	struct ath12k_hw_group *ag;
++	struct ath12k_mlo_wsi_device_group *mlo_device_grp;
++	struct ath12k_link_vif *primary_arvif;
++	struct ath12k_base *primary_ab;
++	struct ath12k_link_vif *arvif;
++	struct ath12k_mlo_wsi_load_info *wsi_load_info;
++	unsigned long links;
++	int ret = 0;
++	u8 i, link_id;
++	u8 prim_deviceid, hop_deviceid;
++	u8 sec_deviceids[ATH12K_MAX_SOCS];
++	u8 prim_deviceid_index, sec_deviceid_index, hop_deviceid_index;
++	u8 hop_counted, num_dev_found = 0;
++	u8 hops_from_primary;
++
++	if (ahvif->vif->type != NL80211_IFTYPE_AP)
++		return ret;
++
++	if (!sta || !sta->mlo)
++		return ret;
++
++	/* Primary link device id identification */
++	primary_arvif = ahvif->link[ahsta->primary_link_id];
++	primary_ab = primary_arvif->ar->ab;
++	ag = primary_ab->ag;
++
++	if (!ag || !ag->wsi_load_info)
++		return ret;
++
++	if (ag->num_chip < ATH12K_MIN_NUM_DEVICES_NLINK)
++		return ret;
++
++	wsi_load_info = ag->wsi_load_info;
++
++	prim_deviceid = primary_ab->wsi_info.chip_idx;
++
++	if (!test_bit(WMI_TLV_SERVICE_PDEV_WSI_STATS_INFO_SUPPORT,
++		      primary_ab->wmi_ab.svc_map))
++		return 0;
++
++	/* Secondary links device id identification */
++	links = ahsta->links_map;
++	for_each_set_bit(link_id, &links, ATH12K_NUM_MAX_LINKS) {
++		if (ahsta->primary_link_id == link_id)
++			continue;
++
++		arvif = ath12k_get_arvif_from_link_id(ahvif, link_id);
++
++		if (WARN_ON(!arvif))
++			continue;
++
++		if (!test_bit(WMI_TLV_SERVICE_PDEV_WSI_STATS_INFO_SUPPORT,
++			      arvif->ar->ab->wmi_ab.svc_map))
++			continue;
++
++		sec_deviceids[num_dev_found++] = arvif->ar->ab->wsi_info.chip_idx;
++	}
++
++	/* Egress and ingress load count updation */
++	prim_deviceid_index = ath12k_get_device_index(wsi_load_info, prim_deviceid);
++
++	if (prim_deviceid_index == WSI_INVALID_INDEX) {
++		ath12k_err(primary_ab, "primary device id not found in wsi_load_info\n");
++		return -EOPNOTSUPP;
++	}
++
++	mlo_device_grp = &wsi_load_info->mlo_device_grp;
++
++	if (num_dev_found) {
++		wsi_load_info->load_stats[prim_deviceid_index].notify = true;
++		wsi_load_info->load_stats[prim_deviceid_index].egress_cnt += append ? 1 : -1;
++	} else {
++		return ret;
++	}
++
++	hop_counted = 1;
++	for (i = 0; i < num_dev_found; i++) {
++		sec_deviceid_index = ath12k_get_device_index(wsi_load_info,
++							     sec_deviceids[i]);
++
++		if (sec_deviceid_index == WSI_INVALID_INDEX) {
++			ath12k_err(NULL, "secondary device id not found in wsi_load_info\n");
++			continue;
++		}
++		if (sec_deviceids[i] > prim_deviceid)
++			hops_from_primary = sec_deviceids[i] - prim_deviceid;
++		else
++			hops_from_primary = mlo_device_grp->num_devices -
++						(prim_deviceid - sec_deviceids[i]);
++
++		while (hops_from_primary > hop_counted) {
++			hop_deviceid = ath12k_get_wsi_next_device(mlo_device_grp,
++								  prim_deviceid,
++								  hop_counted);
++			hop_counted++;
++			if (hop_deviceid == WSI_INVALID_ORDER)
++				continue;
++
++			hop_deviceid_index = ath12k_get_device_index(wsi_load_info,
++								     hop_deviceid);
++			if (hop_deviceid_index == WSI_INVALID_INDEX) {
++				ath12k_err(NULL,
++					   "hop device id not found in wsi_load_info\n");
++				continue;
++			}
++			wsi_load_info->load_stats[hop_deviceid_index].notify = true;
++			wsi_load_info->load_stats[hop_deviceid_index].ingress_cnt +=
++									append ? 1 : -1;
++		}
++	}
++
++	ret = ath12k_send_wsi_load_info(primary_ab, ag->id);
++	if (ret)
++		ath12k_err(primary_ab, "failed to send wsi load info");
++
++	return ret;
++}
++
+ int ath12k_mac_create_bridge_peer(struct ath12k_hw *ah, struct ath12k_sta *ahsta,
+ 				  struct ath12k_vif *ahvif, u8 link_id)
+ {
+@@ -8442,6 +8645,8 @@ static void ath12k_mac_ml_station_remove
+ 
+ 	sta = container_of((void *)ahsta, struct ieee80211_sta, drv_priv);
+ 
++	ath12k_wsi_load_info_stats_update(ahvif, ahsta, false);
++
+ 	ath12k_ml_link_peers_delete(ahvif, ahsta);
+ 
+ 	/* validate link station removal and clear arsta links */
+@@ -8978,6 +9183,8 @@ int ath12k_mac_update_sta_state(struct i
+ 	}
+ 
+ 	if (old_state == IEEE80211_STA_AUTH &&  new_state == IEEE80211_STA_ASSOC) {
++		ath12k_wsi_load_info_stats_update(ahvif, ahsta, true);
++
+ 		/* TODO sync wait for ML peer map success, else clear ml peer info on
+ 		 * all partners? TBD on testing
+ 		 */

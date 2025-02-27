@@ -1,0 +1,343 @@
+From 4dc02f4d827f78782bde6d16475847dcc463c82a Mon Sep 17 00:00:00 2001
+From: Rameshkumar Sundaram <quic_ramess@quicinc.com>
+Date: Mon, 22 Apr 2024 14:57:37 +0530
+Subject: [PATCH 1/4] hostapd: ML reconfiguration: link addition support
+
+Support dynamic link addition using ADD bss_config command
+(IEEE P802.11be/D4.1 - 35.3.6.2). Modify interface initialization
+to use the existing hostapd_iface if already present, by checking
+the HW mode and operating channel. Allow to use same interface name
+only in case of MLD AP. Allow bring up of interface as MBSSID Tx
+BSS even if no Non-Tx BSS are present during first time initialization
+as it is possible that Non-Tx BSS'es can be added later point in time
+after TX BSS is brought up. So, when new Non-TX BSS are added later,
+TX BSS beacon can be updated with MBSSID IEs.
+
+Move mld link add before hostapd flush in setup bss to
+prevent station disconnection on new link addition
+
+Signed-off-by: Rameshkumar Sundaram <quic_ramess@quicinc.com>
+Co-developed-by: Sowmiya Sree Elavalagan <quic_ssreeela@quicinc.com>
+Signed-off-by: Sowmiya Sree Elavalagan <quic_ssreeela@quicinc.com>
+---
+ hostapd/ctrl_iface.c |  22 -------
+ src/ap/beacon.c      |  27 +++++----
+ src/ap/hostapd.c     | 134 ++++++++++++++++++++++++++++++-------------
+ src/ap/hostapd.h     |   3 +
+ 4 files changed, 113 insertions(+), 73 deletions(-)
+
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -5611,28 +5611,6 @@ hostapd_global_ctrl_iface_fst_detach(str
+ #endif /* CONFIG_FST */
+ 
+ 
+-static struct hostapd_data *
+-hostapd_interfaces_get_hapd(struct hapd_interfaces *interfaces,
+-			    const char *ifname)
+-{
+-	size_t i, j;
+-
+-	for (i = 0; i < interfaces->count; i++) {
+-		struct hostapd_iface *iface = interfaces->iface[i];
+-
+-		for (j = 0; j < iface->num_bss; j++) {
+-			struct hostapd_data *hapd;
+-
+-			hapd = iface->bss[j];
+-			if (os_strcmp(ifname, hapd->conf->iface) == 0)
+-				return hapd;
+-		}
+-	}
+-
+-	return NULL;
+-}
+-
+-
+ static int hostapd_ctrl_iface_dup_param(struct hostapd_data *src_hapd,
+ 					struct hostapd_data *dst_hapd,
+ 					const char *param)
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -2445,17 +2445,23 @@ int ieee802_11_build_ap_params(struct ho
+ 				   tailpos-startpos, ELEMID_CU_PARAM_HTOP);
+ #endif
+ 
+-	if (hapd->iconf->mbssid && hapd->iconf->num_bss > 1) {
+-		if (ieee802_11_build_ap_params_mbssid(hapd, params)) {
+-			os_free(head);
+-			os_free(tail);
+-			wpa_printf(MSG_ERROR,
+-				   "MBSSID: Failed to set beacon data");
+-			return -1;
++	if (hapd->iconf->mbssid) {
++		if (hapd->iconf->num_bss == 1) {
++			params->mbssid.mbssid_tx_iface = hapd->conf->iface;
++			params->mbssid.mbssid_index = hostapd_mbssid_get_bss_index(hapd);
++			complete = true;
++		} else {
++			if (ieee802_11_build_ap_params_mbssid(hapd, params)) {
++				os_free(head);
++				os_free(tail);
++				wpa_printf(MSG_ERROR,
++					   "MBSSID: Failed to set beacon data");
++				return -1;
++			}
++			complete = hapd->iconf->mbssid == MBSSID_ENABLED ||
++				   (hapd->iconf->mbssid == ENHANCED_MBSSID_ENABLED &&
++				    params->mbssid.mbssid_elem_count == 1);
+ 		}
+-		complete = hapd->iconf->mbssid == MBSSID_ENABLED ||
+-			(hapd->iconf->mbssid == ENHANCED_MBSSID_ENABLED &&
+-			 params->mbssid.mbssid_elem_count == 1);
+ 	}
+ 
+ 	tailpos = hostapd_eid_ext_capab(hapd, tailpos, complete);
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -79,7 +79,7 @@ static void hostapd_interface_update_fil
+ static void hostapd_mld_ref_inc(struct hostapd_mld *mld);
+ static void hostapd_mld_ref_dec(struct hostapd_mld *mld);
+ #endif /* CONFIG_IEEE80211BE */
+-
++static int ifname_in_use(struct hapd_interfaces *interfaces, const char *ifname) __attribute__((unused));
+ int hostapd_for_each_interface(struct hapd_interfaces *interfaces,
+ 			       int (*cb)(struct hostapd_iface *iface,
+ 					 void *ctx), void *ctx)
+@@ -1405,7 +1405,7 @@ int hostapd_setup_bss(struct hostapd_dat
+ 	char force_ifname[IFNAMSIZ];
+ 	u8 if_addr[ETH_ALEN];
+ 	int flush_old_stations = 1;
+-	struct hostapd_data *h_hapd = NULL;
++	struct hostapd_data *h_hapd = NULL, *tx_hapd;
+ 
+ #ifdef CONFIG_IEEE80211BE
+ 	if (!hostapd_mld_is_first_bss(hapd))
+@@ -1488,9 +1488,29 @@ int hostapd_setup_bss(struct hostapd_dat
+ 		}
+ 	}
+ 
+-	hostapd_ucode_create_bss(hapd);
+ 
+ setup_mld:
++	hostapd_ucode_create_bss(hapd);
++#ifdef CONFIG_IEEE80211BE
++	if (hapd->conf->mld_ap && (!first || first == -1)) {
++		wpa_printf(MSG_DEBUG,
++			   "MLD: Set link_id=%u, mld_addr=" MACSTR
++			   ", own_addr=" MACSTR,
++			   hapd->mld_link_id, MAC2STR(hapd->mld->mld_addr),
++			   MAC2STR(hapd->own_addr));
++
++		if (hostapd_drv_link_add(hapd, hapd->mld_link_id,
++					 hapd->own_addr)) {
++			wpa_printf(MSG_ERROR,
++				   "MLD: Failed to add link %d in MLD %s",
++				   hapd->mld_link_id, hapd->conf->iface);
++			return -1;
++		}
++		hostapd_mld_add_link(hapd);
++	}
++
++#endif /* CONFIG_IEEE80211BE */
++
+ 	if (is_zero_ether_addr(conf->bssid))
+ 		 os_memcpy(conf->bssid, hapd->own_addr, ETH_ALEN);
+ 
+@@ -1710,24 +1730,12 @@ setup_mld:
+ 		return -1;
+ 	}
+ 
+-#ifdef CONFIG_IEEE80211BE
+-	if (hapd->conf->mld_ap && !first) {
+-		wpa_printf(MSG_DEBUG,
+-			   "MLD: Set link_id=%u, mld_addr=" MACSTR
+-			   ", own_addr=" MACSTR,
+-			   hapd->mld_link_id, MAC2STR(hapd->mld->mld_addr),
+-			   MAC2STR(hapd->own_addr));
++	tx_hapd = hostapd_mbssid_get_tx_bss(hapd);
+ 
+-		if (hostapd_drv_link_add(hapd, hapd->mld_link_id,
+-					 hapd->own_addr)) {
+-			wpa_printf(MSG_ERROR,
+-				   "MLD: Failed to add link %d in MLD %s",
+-				   hapd->mld_link_id, hapd->conf->iface);
+-			return -1;
+-		}
+-		hostapd_mld_add_link(hapd);
+-	}
+-#endif /* CONFIG_IEEE80211BE */
++	/* If TX BSS is already beaconing, update it with newly added profile
++	 */
++	if (start_beacon && tx_hapd && tx_hapd != hapd && tx_hapd->beacon_set_done)
++		ieee802_11_set_beacon(tx_hapd);
+ 
+ 	if (start_beacon && hostapd_start_beacon(hapd, flush_old_stations) < 0)
+ 		return -1;
+@@ -1825,25 +1833,25 @@ static int start_ctrl_iface_bss(struct h
+ 	    !hapd->iface->interfaces->ctrl_iface_init)
+ 		return 0;
+ 
+-	if (hapd->iface->interfaces->ctrl_iface_init(hapd)) {
+ #ifdef CONFIG_IEEE80211BE
+-		os_memset(hapd->ctrl_sock_iface, '\0',
+-				sizeof(hapd->ctrl_sock_iface));
+-		os_strlcpy(hapd->ctrl_sock_iface, hapd->conf->iface,
+-				sizeof(hapd->ctrl_sock_iface));
++	os_memset(hapd->ctrl_sock_iface, '\0',
++			sizeof(hapd->ctrl_sock_iface));
++	os_strlcpy(hapd->ctrl_sock_iface, hapd->conf->iface,
++			sizeof(hapd->ctrl_sock_iface));
+ 
+-		if (hapd->conf->mld_ap) {
+-			char buf[128];
++	if (hapd->conf->mld_ap) {
++		char buf[128];
+ 
+-			os_memset(buf, '\0', sizeof(buf));
+-			os_snprintf(buf, sizeof(buf), "%s_%s%d",
+-					hapd->conf->iface, WPA_CTRL_IFACE_LINK_NAME,
+-					hapd->mld_link_id);
+-			os_memset(hapd->ctrl_sock_iface, '\0',
+-					sizeof(hapd->ctrl_sock_iface));
+-			os_strlcpy(hapd->ctrl_sock_iface, buf, sizeof(buf));
+-		}
++		os_memset(buf, '\0', sizeof(buf));
++		os_snprintf(buf, sizeof(buf), "%s_%s%d",
++				hapd->conf->iface, WPA_CTRL_IFACE_LINK_NAME,
++				hapd->mld_link_id);
++		os_memset(hapd->ctrl_sock_iface, '\0',
++				sizeof(hapd->ctrl_sock_iface));
++		os_strlcpy(hapd->ctrl_sock_iface, buf, sizeof(buf));
++	}
+ #endif /* CONFIG_IEEE80211BE */
++	if (hapd->iface->interfaces->ctrl_iface_init(hapd)) {
+ 		wpa_printf(MSG_ERROR,
+ 			   "Failed to setup control interface for %s",
+ 			   hapd->conf->iface);
+@@ -3368,6 +3376,13 @@ static int ifname_in_use(struct hapd_int
+ 	return 0;
+ }
+ 
++bool hostapd_is_existing_interface(struct hostapd_iface *iface,
++				   struct hostapd_config *new_conf)
++{
++	return (iface->conf->hw_mode == new_conf->hw_mode &&
++		((iface->conf->channel &&
++		iface->conf->channel == new_conf->channel)));
++}
+ 
+ /**
+  * hostapd_interface_init_bss - Read configuration file and init BSS data
+@@ -3388,12 +3403,18 @@ hostapd_interface_init_bss(struct hapd_i
+ 	struct hostapd_data *hapd;
+ 	int k;
+ 	size_t i, bss_idx;
++	struct hostapd_config *conf;
+ 
+ 	if (!phy || !*phy)
+ 		return NULL;
+ 
++	conf = interfaces->config_read_cb(config_fname);
++	if (!conf)
++		return NULL;
++
+ 	for (i = 0; i < interfaces->count; i++) {
+-		if (os_strcmp(interfaces->iface[i]->phy, phy) == 0) {
++		if (os_strcmp(interfaces->iface[i]->phy, phy) == 0 &&
++		    hostapd_is_existing_interface(interfaces->iface[i], conf)) {
+ 			iface = interfaces->iface[i];
+ 			break;
+ 		}
+@@ -3402,16 +3423,12 @@ hostapd_interface_init_bss(struct hapd_i
+ 	wpa_printf(MSG_INFO, "Configuration file: %s (phy %s)%s",
+ 		   config_fname, phy, iface ? "" : " --> new PHY");
+ 	if (iface) {
+-		struct hostapd_config *conf;
+ 		struct hostapd_bss_config **tmp_conf;
+-		struct hostapd_data **tmp_bss;
++		struct hostapd_data **tmp_bss, *tmp_hapd;
+ 		struct hostapd_bss_config *bss;
+ 		const char *ifname;
+ 
+ 		/* Add new BSS to existing iface */
+-		conf = interfaces->config_read_cb(config_fname);
+-		if (conf == NULL)
+-			return NULL;
+ 		if (conf->num_bss > 1) {
+ 			wpa_printf(MSG_ERROR, "Multiple BSSes specified in BSS-config");
+ 			hostapd_config_free(conf);
+@@ -3419,12 +3436,23 @@ hostapd_interface_init_bss(struct hapd_i
+ 		}
+ 
+ 		ifname = conf->bss[0]->iface;
+-		if (ifname[0] != '\0' && ifname_in_use(interfaces, ifname)) {
++		if (ifname[0] == '\0') {
+ 			wpa_printf(MSG_ERROR,
+-				   "Interface name %s already in use", ifname);
++				   "Invalid interface name %s", ifname);
+ 			hostapd_config_free(conf);
+ 			return NULL;
+ 		}
++		tmp_hapd = hostapd_interfaces_get_hapd(interfaces, ifname);
++		if (tmp_hapd) {
++			wpa_printf(MSG_ERROR,
++				   "Interface name %s already in use", ifname);
++			if (conf->bss[0]->mld_ap && tmp_hapd->conf->mld_ap)
++				wpa_printf(MSG_ERROR, "Proceed setup for ML AP link addition");
++			else {
++				hostapd_config_free(conf);
++				return NULL;
++			}
++		}
+ 
+ 		tmp_conf = os_realloc_array(
+ 			iface->conf->bss, iface->conf->num_bss + 1,
+@@ -3463,6 +3491,7 @@ hostapd_interface_init_bss(struct hapd_i
+ 		conf->bss[0] = NULL;
+ 		hostapd_config_free(conf);
+ 	} else {
++		hostapd_config_free(conf);
+ 		/* Add a new iface with the first BSS */
+ 		new_iface = iface = hostapd_init(interfaces, config_fname);
+ 		if (!iface)
+@@ -5220,6 +5249,29 @@ hostapd_interface_update_fils_ubpr(struc
+ 	return;
+ }
+ 
++
++struct hostapd_data *
++hostapd_interfaces_get_hapd(struct hapd_interfaces *interfaces,
++			    const char *ifname)
++{
++	size_t i, j;
++
++	for (i = 0; i < interfaces->count; i++) {
++		struct hostapd_iface *iface = interfaces->iface[i];
++
++		for (j = 0; j < iface->num_bss; j++) {
++			struct hostapd_data *hapd;
++
++			hapd = iface->bss[j];
++			if (os_strcmp(ifname, hapd->conf->iface) == 0)
++				return hapd;
++		}
++	}
++
++	return NULL;
++}
++
++
+ #ifdef CONFIG_IEEE80211BE
+ struct hostapd_data * hostapd_mld_get_link_bss(struct hostapd_data *hapd,
+ 					       u8 link_id)
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -942,4 +942,7 @@ bool hostapd_mld_is_first_bss(struct hos
+ struct hostapd_data * hostapd_mld_get_first_bss(struct hostapd_data *hapd);
+ void hostapd_bss_free(struct hostapd_data *hapd);
+ int hostapd_link_remove(struct hostapd_data *hapd, u32 count);
++struct hostapd_data *
++hostapd_interfaces_get_hapd(struct hapd_interfaces *interfaces,
++			    const char *ifname);
+ #endif /* HOSTAPD_H */

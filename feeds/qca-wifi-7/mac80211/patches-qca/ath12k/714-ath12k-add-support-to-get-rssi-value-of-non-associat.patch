@@ -1,0 +1,615 @@
+From b483635554370f2be82106db486963fcd2708dfc Mon Sep 17 00:00:00 2001
+From: Suresh Krishna <quic_sureshkr@quicinc.com>
+Date: Fri, 13 Jan 2023 14:41:57 +0530
+Subject: [PATCH] ath12k: add support to get rssi value of non-associated
+ client
+
+Monitor the surrounding network to get RSSI of non-associated
+client(i.e Neighbor-Peer associated to neighboring AP's).
+Obtaining the RSSI it is useful for roaming between AP's in a
+network and on deciding which AP the client should associate
+with.
+This is achieved through debugfs by providing the mac address
+of a nrp which creates a neighbor-peer object to store's the
+data associated with the nrp such as its mac, RSSI and timestamp.
+Once the nrp is added a file with the mac-address of nrp as its
+filename is created.
+Each time the file is read a peer object is created for the
+NRP and filter is set to get its ppdu_info for home channel
+thereby obtaining the RSSI and a corresponding unix
+timestamp is created, once the data collection is completed the
+peer object is destroyed to free-up peer count.
+Upto 6 NRPs can be created to keep the load and peer-count low.
+Once the rssi and timestamp are obtained the peer object
+created for NRP is deleted to free the peer id.
+In case the NRP packets are unavailable during scan the
+previous timestamped value is returned.
+
+Command to add a Neighbor-Peer:
+echo "add,<mac-addr-of-nrp>" >
+/sys/kernel/debug/ieee80211/phyX/ath12k_hwY/neighbor_peer
+
+Command to delete a Neighbor-Peer:
+echo "del,<mac-addr-of-nrp>" >
+/sys/kernel/debug/ieee80211/phyX/ath12k_hwY/neighbor_peer
+
+Command to display RSSI of Neighbor-Peer:
+cat /sys/kernel/debug/ieee80211/phyX/ath12k_hwY/nrp_rssi/<mac-addr-of-nrp>
+
+Signed-off-by: Suresh Krishna <quic_sureshkr@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c    |   3 +
+ drivers/net/wireless/ath/ath12k/core.h    |   4 +
+ drivers/net/wireless/ath/ath12k/debugfs.c | 348 ++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/debugfs.h |  30 ++
+ drivers/net/wireless/ath/ath12k/dp_mon.c  |  14 +
+ drivers/net/wireless/ath/ath12k/mac.c     |  35 +++
+ 6 files changed, 434 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1365,6 +1365,8 @@ static void ath12k_core_pre_reconfigure_
+ 		complete(&ar->scan.completed);
+ 		complete(&ar->peer_assoc_done);
+ 		complete(&ar->peer_delete_done);
++		if (!list_empty(&ab->neighbor_peers))
++			ath12k_debugfs_nrp_cleanup_all(ar);
+ 		complete(&ar->install_key_done);
+ 		complete(&ar->vdev_setup_done);
+ 		complete(&ar->vdev_delete_done);
+@@ -1857,6 +1859,7 @@ struct ath12k_base *ath12k_core_alloc(st
+ 	init_completion(&ab->reset_complete);
+ 
+ 	INIT_LIST_HEAD(&ab->peers);
++	INIT_LIST_HEAD(&ab->neighbor_peers);
+ 	init_waitqueue_head(&ab->peer_mapping_wq);
+ 	init_waitqueue_head(&ab->wmi_ab.tx_credits_wq);
+ 	init_waitqueue_head(&ab->qmi.cold_boot_waitq);
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -646,6 +646,7 @@ struct ath12k_debug {
+ 	struct list_head wmi_list;
+ 	struct completion wmi_ctrl_path_stats_rcvd;
+ 	u32 wmi_ctrl_path_stats_tagid;
++	struct dentry *debugfs_nrp;
+ };
+ 
+ struct ath12k_per_peer_tx_stats {
+@@ -1116,6 +1117,9 @@ struct ath12k_base {
+ #ifdef CPTCFG_ATH12K_DEBUGFS
+ 	struct dentry *debugfs_soc;
+ #endif
++	struct list_head neighbor_peers;
++	int num_nrps;
++
+ 	struct ath12k_soc_dp_stats soc_stats;
+ 
+ 	unsigned long dev_flags;
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -1012,6 +1012,359 @@ static const struct file_operations fops
+ 	.open = simple_open,
+ };
+ 
++static int ath12k_reset_nrp_filter(struct ath12k *ar,
++				   bool reset)
++{
++	int i = 0;
++	int ret = 0;
++	u32 ring_id = 0;
++	u32 rx_filter = 0;
++	struct htt_rx_ring_tlv_filter tlv_filter = {0};
++
++	if (!reset) {
++		rx_filter = ar->debug.rx_filter;
++		rx_filter |= HTT_RX_FILTER_TLV_FLAGS_MPDU_START;
++		rx_filter |= HTT_RX_FILTER_TLV_FLAGS_PPDU_START;
++		rx_filter |= HTT_RX_FILTER_TLV_FLAGS_PPDU_END;
++		rx_filter |= HTT_RX_FILTER_TLV_FLAGS_MPDU_END;
++
++		tlv_filter.rx_filter = rx_filter;
++		tlv_filter.pkt_filter_flags0 = HTT_RX_MO_MGMT_FILTER_FLAGS0;
++		tlv_filter.pkt_filter_flags1 = HTT_RX_MO_MGMT_FILTER_FLAGS1;
++		tlv_filter.pkt_filter_flags2 = HTT_RX_MO_CTRL_FILTER_FLASG2;
++		tlv_filter.pkt_filter_flags3 = HTT_RX_MON_MO_CTRL_FILTER_FLASG3 |
++			HTT_RX_MON_MO_DATA_FILTER_FLASG3;
++	} else {
++		tlv_filter.rx_filter = ar->debug.rx_filter;
++	}
++	tlv_filter.offset_valid = false;
++
++	for (i = 0; i < ar->ab->hw_params->num_rxmda_per_pdev; i++) {
++		ring_id = ar->dp.rxdma_mon_dst_ring[i].ring_id;
++		ret = ath12k_dp_tx_htt_rx_filter_setup(ar->ab, ring_id, ar->dp.mac_id + i,
++						       HAL_RXDMA_MONITOR_DST,
++						       DP_RXDMA_REFILL_RING_SIZE,
++						       &tlv_filter);
++		if (ret) {
++			ath12k_err(ar->ab,
++				   "failed to setup filter for monitor buf %d\n", ret);
++			return ret;
++		}
++	}
++	return ret;
++}
++
++void ath12k_debugfs_nrp_cleanup_all(struct ath12k *ar)
++{
++	struct ath12k_base *ab = ar->ab;
++	struct ath12k_neighbor_peer *nrp, *tmp;
++
++	spin_lock_bh(&ab->base_lock);
++	list_for_each_entry_safe(nrp, tmp, &ab->neighbor_peers, list) {
++		if (nrp->is_filter_on)
++			complete(&nrp->filter_done);
++		list_del(&nrp->list);
++		kfree(nrp);
++	}
++
++	ab->num_nrps = 0;
++	spin_unlock_bh(&ab->base_lock);
++
++	debugfs_remove_recursive(ar->debug.debugfs_nrp);
++}
++
++void ath12k_debugfs_nrp_clean(struct ath12k *ar, const u8 *addr)
++{
++	int i, j;
++	char fname[MAC_UNIT_LEN * ETH_ALEN] = {0};
++
++	for (i = 0, j = 0; i < (MAC_UNIT_LEN * ETH_ALEN); i += MAC_UNIT_LEN, j++) {
++		if (j == ETH_ALEN - 1) {
++			snprintf(fname + i, sizeof(fname) - i, "%02x", *(addr + j));
++			break;
++		}
++		snprintf(fname + i, sizeof(fname) - i, "%02x:", *(addr + j));
++	}
++
++	spin_lock_bh(&ar->ab->base_lock);
++	ar->ab->num_nrps--;
++	spin_unlock_bh(&ar->ab->base_lock);
++
++	debugfs_lookup_and_remove(fname, ar->debug.debugfs_nrp);
++	if (!ar->ab->num_nrps) {
++		debugfs_remove_recursive(ar->debug.debugfs_nrp);
++		ath12k_reset_nrp_filter(ar, true);
++	}
++}
++
++static ssize_t ath12k_read_nrp_rssi(struct file *file,
++				    char __user *ubuf,
++				    size_t count, loff_t *ppos)
++{
++	struct ath12k *ar = file->private_data;
++	struct ath12k_base *ab = ar->ab;
++	struct ath12k_link_vif *arvif = NULL;
++	struct ath12k_neighbor_peer *nrp = NULL, *tmp;
++	struct ath12k_wmi_peer_create_arg peer_param = {0};
++	u8 macaddr[ETH_ALEN] = {0};
++	loff_t file_pos = *ppos;
++	struct path *fpath = &file->f_path;
++	char *fname = fpath->dentry->d_iname;
++	char buf[128] = {0};
++	int i = 0;
++	int j = 0;
++	int len = 0;
++	int vdev_id = -1;
++	bool nrp_found = false;
++
++	mutex_lock(&ar->conf_mutex);
++	if (ar->state != ATH12K_STATE_ON) {
++		mutex_unlock(&ar->conf_mutex);
++		return -ENETDOWN;
++	}
++	mutex_unlock(&ar->conf_mutex);
++
++	if (file_pos > 0)
++		return 0;
++
++	list_for_each_entry(arvif, &ar->arvifs, list) {
++		if (arvif->ahvif->vdev_type == WMI_VDEV_TYPE_AP) {
++			vdev_id = arvif->vdev_id;
++			break;
++		}
++	}
++	if (vdev_id < 0) {
++		ath12k_warn(ab, "unable to get vdev for AP interface\n");
++		return 0;
++	}
++
++	for (i = 0, j = 0;  i < MAC_UNIT_LEN * ETH_ALEN; i += MAC_UNIT_LEN, j++) {
++		if (sscanf(fname + i, "%hhX", &macaddr[j]) <= 0)
++			return -EINVAL;
++	}
++
++	spin_lock_bh(&ab->base_lock);
++	list_for_each_entry(nrp, &ab->neighbor_peers, list) {
++		if (ether_addr_equal(macaddr, nrp->addr)) {
++			reinit_completion(&nrp->filter_done);
++			nrp->vdev_id = vdev_id;
++			nrp->is_filter_on = false;
++			break;
++		}
++	}
++	spin_unlock_bh(&ab->base_lock);
++
++	peer_param.vdev_id = nrp->vdev_id;
++	peer_param.peer_addr = nrp->addr;
++	peer_param.peer_type = WMI_PEER_TYPE_DEFAULT;
++
++	if (!ath12k_peer_create(ar, arvif, NULL, &peer_param)) {
++		spin_lock_bh(&ab->base_lock);
++		list_for_each_entry_safe(nrp, tmp, &ab->neighbor_peers, list) {
++			if (ether_addr_equal(nrp->addr, peer_param.peer_addr)) {
++				nrp_found = true;
++				break;
++			}
++		}
++		spin_unlock_bh(&ab->base_lock);
++
++		if (nrp_found) {
++			spin_lock_bh(&ab->base_lock);
++			nrp->is_filter_on = true;
++			spin_unlock_bh(&ab->base_lock);
++
++			wait_for_completion_interruptible_timeout(&nrp->filter_done, 5 * HZ);
++
++			spin_lock_bh(&ab->base_lock);
++			nrp->is_filter_on = false;
++			spin_unlock_bh(&ab->base_lock);
++
++			len = scnprintf(buf, sizeof(buf),
++					"Neighbor Peer MAC\t\tRSSI\t\tTime\n");
++			len += scnprintf(buf + len, sizeof(buf) - len, "%pM\t\t%u\t\t%lld\n",
++					 nrp->addr, nrp->rssi, nrp->timestamp);
++		} else {
++			ath12k_peer_delete(ar, vdev_id, macaddr);
++			ath12k_warn(ab, "%pM not found in nrp list\n", macaddr);
++			return -EINVAL;
++		}
++		ath12k_peer_delete(ar, vdev_id, macaddr);
++	} else {
++		ath12k_warn(ab, "unable to create peer for nrp[%pM]\n", macaddr);
++		return -EINVAL;
++	}
++
++	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
++}
++
++static const struct file_operations fops_read_nrp_rssi = {
++	.read = ath12k_read_nrp_rssi,
++	.open = simple_open,
++};
++
++static ssize_t ath12k_write_nrp_mac(struct file *file,
++				    const char __user *ubuf,
++				    size_t count, loff_t *ppos)
++{
++	struct ath12k *ar = file->private_data;
++	struct ath12k_base *ab = ar->ab;
++	struct ath12k_peer *peer = NULL;
++	struct ath12k_neighbor_peer *nrp = NULL, *tmp = NULL;
++	u8 mac[ETH_ALEN] = {0};
++	char fname[MAC_UNIT_LEN * ETH_ALEN] = {0};
++	char *str = NULL, *buf = NULL, *ptr = NULL;
++	int i = 0;
++	int j = 0;
++	int ret = count;
++	int action = 0;
++	ssize_t rc = 0;
++	bool del_nrp = false;
++
++	mutex_lock(&ar->conf_mutex);
++
++	buf = vmalloc(count);
++	if (!buf)
++		return -ENOMEM;
++
++	ptr = buf;
++	rc = simple_write_to_buffer(buf, count, ppos, ubuf, count);
++	if (rc <= 0)
++		goto exit;
++
++	/* To remove '\n' at end of buffer */
++	buf[count - 1] = '\0';
++
++	if (ar->state != ATH12K_STATE_ON) {
++		ret = -ENETDOWN;
++		goto exit;
++	}
++
++	str = strsep(&buf, ",");
++	if (!str) {
++		ret = -EINVAL;
++		goto exit;
++	}
++
++	if (!strcmp(str, "add"))
++		action = NRP_ACTION_ADD;
++	else if (!strcmp(str, "del"))
++		action = NRP_ACTION_DEL;
++	else {
++		ath12k_err(ab, "error: invalid argument\n");
++		goto exit;
++	}
++
++	memset(mac, 0, sizeof(mac));
++	while ((str = strsep(&buf, ":")) != NULL) {
++		if (i >= ETH_ALEN || kstrtou8(str, 16, mac + i)) {
++			ath12k_warn(ab, "error: invalid mac address\n");
++			goto exit;
++		}
++		i++;
++	}
++
++	if (i != ETH_ALEN) {
++		ath12k_warn(ab, "error: invalid mac address\n");
++		goto exit;
++	}
++
++	if (!is_valid_ether_addr(mac)) {
++		ath12k_err(ab, "error: invalid mac address\n");
++		goto exit;
++	}
++
++	for (i = 0, j = 0; i < (MAC_UNIT_LEN * ETH_ALEN); i += MAC_UNIT_LEN, j++) {
++		if (j == ETH_ALEN - 1) {
++			snprintf(fname + i, sizeof(fname) - i, "%02x", mac[j]);
++			break;
++		}
++		snprintf(fname + i, sizeof(fname) - i, "%02x:", mac[j]);
++	}
++
++	switch (action) {
++	case NRP_ACTION_ADD:
++		if (ab->num_nrps == (ATH12K_MAX_NRPS - 1)) {
++			ath12k_warn(ab, "max nrp reached, cannot create more\n");
++			goto exit;
++		}
++
++		list_for_each_entry(nrp, &ab->neighbor_peers, list) {
++			if (ether_addr_equal(nrp->addr, mac)) {
++				ath12k_warn(ab, "cannot add existing neighbor peer\n");
++				goto exit;
++			}
++		}
++
++		spin_lock_bh(&ab->base_lock);
++		peer = ath12k_peer_find_by_addr(ab, mac);
++		if (peer) {
++			ath12k_warn(ab, "cannot add exisitng peer [%pM] as nrp\n", mac);
++			spin_unlock_bh(&ab->base_lock);
++			goto exit;
++		}
++		spin_unlock_bh(&ab->base_lock);
++
++		nrp = kzalloc(sizeof(*nrp), GFP_KERNEL);
++		if (!nrp)
++			goto exit;
++
++		init_completion(&nrp->filter_done);
++		ether_addr_copy(nrp->addr, mac);
++
++		spin_lock_bh(&ab->base_lock);
++		list_add_tail(&nrp->list, &ab->neighbor_peers);
++		spin_unlock_bh(&ab->base_lock);
++
++		if (!ab->num_nrps) {
++			ar->debug.debugfs_nrp = debugfs_create_dir("nrp_rssi",
++								   ar->debug.debugfs_pdev);
++			ath12k_reset_nrp_filter(ar, false);
++		}
++		spin_lock_bh(&ab->base_lock);
++		ab->num_nrps++;
++		spin_unlock_bh(&ab->base_lock);
++
++		debugfs_create_file(fname, 0644,
++				    ar->debug.debugfs_nrp, ar,
++				    &fops_read_nrp_rssi);
++		break;
++	case NRP_ACTION_DEL:
++		if (!ar->ab->num_nrps) {
++			ath12k_err(ab, "error: no nac added\n");
++			goto exit;
++		}
++
++		spin_lock_bh(&ab->base_lock);
++		list_for_each_entry_safe(nrp, tmp, &ab->neighbor_peers, list) {
++			if (ether_addr_equal(nrp->addr, mac)) {
++				list_del(&nrp->list);
++				kfree(nrp);
++				del_nrp = true;
++				break;
++			}
++		}
++		spin_unlock_bh(&ab->base_lock);
++
++		if (!del_nrp)
++			ath12k_warn(ab, "cannot delete %pM not added to list\n", mac);
++		else
++			ath12k_debugfs_nrp_clean(ar, mac);
++		break;
++	default:
++		break;
++	}
++exit:
++	mutex_unlock(&ar->conf_mutex);
++
++	vfree(ptr);
++	return ret;
++}
++
++static const struct file_operations fops_write_nrp_mac = {
++	.write = ath12k_write_nrp_mac,
++	.open = simple_open,
++};
++
+ static int ath12k_fill_bp_stats(struct ath12k_base *ab,
+ 				struct ath12k_bp_stats *bp_stats,
+ 				char *buf, int len, int size)
+@@ -2904,6 +3257,9 @@ int ath12k_debugfs_register(struct ath12
+ 
+ 	init_completion(&ar->tpc_complete);
+ 
++	debugfs_create_file("neighbor_peer", 0644,
++			    ar->debug.debugfs_pdev, ar,
++			    &fops_write_nrp_mac);
+ 	debugfs_create_file("ext_tx_stats", 0644,
+ 			    ar->debug.debugfs_pdev, ar,
+ 			    &fops_extd_tx_stats);
+--- a/drivers/net/wireless/ath/ath12k/debugfs.h
++++ b/drivers/net/wireless/ath/ath12k/debugfs.h
+@@ -14,6 +14,9 @@
+ 
+ #define ATH12K_DRV_TX_STATS_SIZE 1024
+ 
++#define ATH12K_MAX_NRPS 7
++#define MAC_UNIT_LEN 3
++
+ /* htt_dbg_ext_stats_type */
+ enum ath12k_dbg_htt_ext_stats_type {
+ 	ATH12K_DBG_HTT_EXT_STATS_RESET                      =  0,
+@@ -211,6 +214,22 @@ enum ath12k_dbg_aggr_mode {
+ 	ATH12K_DBG_AGGR_MODE_MAX,
+ };
+ 
++enum {
++	NRP_ACTION_ADD,
++	NRP_ACTION_DEL,
++};
++
++struct ath12k_neighbor_peer {
++	struct list_head list;
++	struct completion filter_done;
++	bool is_filter_on;
++	int vdev_id;
++	u8 addr[ETH_ALEN];
++	u8 rssi;
++	s64 timestamp;
++	bool rssi_valid;
++};
++
+ void ath12k_wmi_crl_path_stats_list_free(struct ath12k *ar, struct list_head *head);
+ 
+ #ifdef CPTCFG_ATH12K_DEBUGFS
+@@ -227,6 +246,9 @@ void ath12k_debugfs_fw_stats_process(str
+ 
+ void ath12k_debugfs_fw_stats_init(struct ath12k *ar);
+ 
++void ath12k_debugfs_nrp_clean(struct ath12k *ar, const u8 *addr);
++void ath12k_debugfs_nrp_cleanup_all(struct ath12k *ar);
++
+ static inline bool ath12k_debugfs_is_pktlog_lite_mode_enabled(struct ath12k *ar)
+ {
+ 	return (ar->debug.pktlog_mode == ATH12K_PKTLOG_MODE_LITE);
+@@ -345,6 +367,14 @@ static inline int ath12k_debugfs_add_int
+ static inline void ath12k_debugfs_remove_interface(struct ath12k_link_vif *arvif)
+ {
+ }
++
++static inline void ath12k_debugfs_nrp_clean(struct ath12k *ar, const u8 *addr)
++{
++}
++
++static inline void ath12k_debugfs_nrp_cleanup_all(struct ath12k *ar)
++{
++}
+ #endif /* CPTCFG_MAC80211_DEBUGFS*/
+ 
+ #ifdef CPTCFG_ATH12K_PKTLOG
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -3828,6 +3828,7 @@ int ath12k_dp_mon_rx_process_stats(struc
+ 	struct ath12k_link_sta *arsta = NULL;
+ 	struct ath12k_peer *peer;
+ 	struct sk_buff_head skb_list;
++	struct ath12k_neighbor_peer *nrp, *tmp;
+ 	u64 cookie;
+ 	int num_buffs_reaped = 0, srng_id, buf_id;
+ 	u32 hal_status, end_reason, end_offset;
+@@ -3923,6 +3924,19 @@ move_next:
+ 		rcu_read_lock();
+ 		spin_lock_bh(&ab->base_lock);
+ 		peer = ath12k_peer_find_by_id(ab, ppdu_info->peer_id);
++		if (!list_empty(&ab->neighbor_peers)) {
++			if (peer && !peer->sta) {
++				list_for_each_entry_safe(nrp, tmp, &ab->neighbor_peers, list) {
++					if (nrp->is_filter_on && ether_addr_equal(nrp->addr, peer->addr)) {
++						nrp->rssi = ppdu_info->rssi_comb;
++						nrp->timestamp = ktime_to_ms(ktime_get_real());
++						complete(&nrp->filter_done);
++					}
++				}
++				goto next_skb;
++			}
++		}
++
+ 		if (!peer || !peer->sta) {
+ 			ath12k_dbg(ab, ATH12K_DBG_DATA,
+ 				   "failed to find the peer with monitor peer_id %d\n",
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -1156,6 +1156,9 @@ void ath12k_mac_peer_cleanup_all(struct
+ 	}
+ 	spin_unlock_bh(&ab->base_lock);
+ 
++	if (!list_empty(&ab->neighbor_peers))
++		ath12k_debugfs_nrp_cleanup_all(ar);
++
+ 	ar->num_peers = 0;
+ 	ar->num_stations = 0;
+ 
+@@ -6502,7 +6505,10 @@ static int ath12k_mac_station_add(struct
+ 	struct ath12k_sta *ahsta = arsta->ahsta;
+ 	struct ieee80211_sta *sta;
+ 	struct ath12k_wmi_peer_create_arg peer_param = {0};
++	struct ath12k_neighbor_peer *nrp, *tmp;
++	int nvdev_id;
+ 	int ret;
++	bool del_nrp = false;
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+ 
+@@ -6531,6 +6537,32 @@ static int ath12k_mac_station_add(struct
+ 	peer_param.peer_type = WMI_PEER_TYPE_DEFAULT;
+ 	peer_param.ml_enabled = sta->mlo;
+ 
++	/*
++	 * When the neighbor peer associates with this AP and successfully
++	 * becomes a station, check and clear the corresponding MAC from
++	 * NRP list and failing to do so would inadvertently cause the
++	 * STA association(peer creation for STA) to fail due to the NRP
++	 * having created a peer already for the same MAC address
++	 */
++	if (!list_empty(&ab->neighbor_peers)) {
++		spin_lock_bh(&ab->base_lock);
++		list_for_each_entry_safe(nrp, tmp, &ab->neighbor_peers, list) {
++			if (ether_addr_equal(nrp->addr, arsta->addr)) {
++				nvdev_id = nrp->vdev_id;
++				list_del(&nrp->list);
++				kfree(nrp);
++				del_nrp = true;
++				break;
++			}
++		}
++		spin_unlock_bh(&ab->base_lock);
++
++		if (del_nrp) {
++			ath12k_peer_delete(ar, nvdev_id, arsta->addr);
++			ath12k_debugfs_nrp_clean(ar, arsta->addr);
++		}
++	}
++
+ 	ret = ath12k_peer_create(ar, arvif, sta, &peer_param);
+ 	if (ret) {
+ 		ath12k_warn(ab, "Failed to add peer: %pM for VDEV: %d\n",
+@@ -8895,6 +8927,9 @@ static void ath12k_mac_radio_stop(struct
+ 	}
+ 	spin_unlock_bh(&ar->data_lock);
+ 
++	if (!list_empty(&ab->neighbor_peers))
++		ath12k_debugfs_nrp_cleanup_all(ar);
++
+ 	rcu_assign_pointer(ab->pdevs_active[ar->pdev_idx], NULL);
+ 
+ 	synchronize_rcu();

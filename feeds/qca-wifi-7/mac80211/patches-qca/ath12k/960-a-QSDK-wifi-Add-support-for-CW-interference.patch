@@ -1,0 +1,363 @@
+From fe7dfeb966a0d873d71638c4c0fe78e6fe3c2e1f Mon Sep 17 00:00:00 2001
+From: Naveen S <quic_naves@quicinc.com>
+Date: Fri, 5 Jul 2024 14:57:55 +0530
+Subject: [PATCH] QSDK: wifi: Add support for CW interference
+
+During the time when an access point is operational there might be
+chances of noise in the medium which would degrade the quality of the
+channel leading to higher channel access time, excessive packet
+failure/retries, which eventually degrades the user experience.
+Hence to address that we allow the driver to detect the channel quality
+during runtime and notify the user space, such that the userspace
+can take action to move to a new channel.
+
+Support for the below interference type is added.
+-> CW interference: this is due to the presence of a
+continuous wave interference from non-WLAN devices sharing
+the spectrum. eg., baby monitors, cordless phones, etc.
+
+The Driver would notify the userspace for the interference detect
+using command - NL80211_CMD_INTERFERENCE_DETECT,
+with attribute - NL80211_ATTR_INTERFERENCE_TYPE,
+NL80211_ATTR_WIPHY_FREQ, NL80211_ATTR_WIPHY_FREQ_OFFSET and
+attributes determining channel width.
+
+As part of NL80211_CMD_UPDATE_AP with attribute,
+NL80211_ATTR_INTERFERENCE_TYPE, marked as CW interference would
+be used to enable/disable this feature to the driver.
+
+Signed-off-by: Amit Pandit <quic_pamit@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |   1 +
+ drivers/net/wireless/ath/ath12k/mac.c  |  21 ++++
+ drivers/net/wireless/ath/ath12k/mac.h  |   1 +
+ drivers/net/wireless/ath/ath12k/wmi.c  | 147 +++++++++++++++++++------
+ drivers/net/wireless/ath/ath12k/wmi.h  |   6 +
+ net/mac80211/main.c                    |   1 +
+ 6 files changed, 141 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index 129eab3..8921b03 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1128,6 +1128,7 @@ struct ath12k {
+ 
+ 	u16 csa_active_cnt;
+ 	s32 sensitivity_level;
++	u8 dcs_enable_bitmap;
+ };
+ 
+ struct ath12k_6ghz_sp_reg_rule {
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index b5b90fc..4c6a59b 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -5132,6 +5132,10 @@ skip_pending_cs_up:
+ 		ar->ap_ps_enabled = info->ap_ps_enable;
+ 		ath12k_mac_ap_ps_recalc(ar);
+ 	}
++
++	if (changed & BSS_CHANGED_INTF_DETECT) {
++		ath12k_mac_set_cw_intf_detect(ar, info->intf_detect_bitmap);
++	}
+ }
+ 
+ static void ath12k_mac_op_vif_cfg_changed(struct ieee80211_hw *hw,
+@@ -15682,6 +15686,23 @@ exit:
+ 	return ret;
+ }
+ 
++void ath12k_mac_set_cw_intf_detect(struct ath12k *ar, u8 intf_detect_param) {
++	u8 cw_intf;
++
++	lockdep_assert_held(&ar->conf_mutex);
++	/* TODO: Since for now only CW Interference is supported on the set path,
++	 * later when there is support added for other interference types,
++	 * the driver would recieve intf_detect_bitmap
++	 */
++	cw_intf = ar->dcs_enable_bitmap & WMI_DCS_CW_INTF;
++	if ((~cw_intf & intf_detect_param) | (cw_intf & ~intf_detect_param)) {
++		ar->dcs_enable_bitmap &= ~WMI_DCS_CW_INTF;
++		ar->dcs_enable_bitmap |= intf_detect_param;
++		ath12k_wmi_pdev_set_param(ar, WMI_PDEV_PARAM_DCS,
++					  ar->dcs_enable_bitmap, ar->pdev->pdev_id);
++ 	}
++}
++
+ void ath12k_mac_ap_ps_recalc(struct ath12k *ar) {
+ 	struct ath12k_link_vif *arvif;
+ 	enum ath12k_ap_ps_state state = ATH12K_AP_PS_STATE_OFF;
+diff --git a/drivers/net/wireless/ath/ath12k/mac.h b/drivers/net/wireless/ath/ath12k/mac.h
+index bc29713..bbd64ef 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -114,6 +114,7 @@ enum ath12k_background_dfs_events {
+ 
+ extern const struct htt_rx_ring_tlv_filter ath12k_mac_mon_status_filter_default;
+ 
++void ath12k_mac_set_cw_intf_detect(struct ath12k *ar, u8 intf_bitmap);
+ void ath12k_mac_ap_ps_recalc(struct ath12k *ar);
+ void ath12k_mac_destroy(struct ath12k_hw_group *ag);
+ void ath12k_mac_unregister(struct ath12k_hw_group *ag);
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.c b/drivers/net/wireless/ath/ath12k/wmi.c
+index 59855bb..b7bdeab 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -13450,12 +13450,13 @@ ath12k_wmi_pdev_dfs_radar_detected_event(struct ath12k_base *ab, struct sk_buff
+ 		ath12k_dfs_calculate_subchannels(ab, ev, do_full_bw_nol);
+ }
+ 
+-static int ath12k_wmi_awgn_intf_subtlv_parser(struct ath12k_base *ab,
++static int ath12k_wmi_dcs_intf_subtlv_parser(struct ath12k_base *ab,
+                                               u16 tag, u16 len,
+                                               const void *ptr, void *data)
+ {
+         int ret = 0;
+         struct wmi_dcs_awgn_info *awgn_info;
++	struct wmi_dcs_cw_info *cw_info;
+ 
+         switch (tag) {
+         case WMI_TAG_DCS_AWGN_INT_TYPE:
+@@ -13467,17 +13468,22 @@ static int ath12k_wmi_awgn_intf_subtlv_parser(struct ath12k_base *ab,
+                            awgn_info->chan_bw_interference_bitmap);
+                 memcpy(data, awgn_info, sizeof(*awgn_info));
+                 break;
++	case WMI_TAG_WLAN_DCS_CW_INT:
++		cw_info = (struct wmi_dcs_cw_info *)ptr;
++		ath12k_dbg(ab, ATH12K_DBG_WMI, "CW Info: channel=%d", cw_info->channel);
++		memcpy(data, cw_info, sizeof(*cw_info));
++		break;
+         default:
+                 ath12k_warn(ab,
+                             "Received invalid tag for wmi dcs interference in subtlvs\n");
+-                return -EINVAL;
++                ret = -EINVAL;
+                 break;
+         }
+ 
+         return ret;
+ }
+ 
+-static int ath12k_wmi_dcs_awgn_event_parser(struct ath12k_base *ab,
++static int ath12k_wmi_dcs_event_parser(struct ath12k_base *ab,
+                                             u16 tag, u16 len,
+                                             const void *ptr, void *data)
+ {
+@@ -13497,7 +13503,7 @@ static int ath12k_wmi_dcs_awgn_event_parser(struct ath12k_base *ab,
+                 if (len == 0)
+                         return 0;
+                 ret = ath12k_wmi_tlv_iter(ab, ptr, len,
+-                                          ath12k_wmi_awgn_intf_subtlv_parser,
++                                          ath12k_wmi_dcs_intf_subtlv_parser,
+                                           data);
+                 break;
+         default:
+@@ -13577,6 +13583,58 @@ bool ath12k_wmi_validate_dcs_awgn_info(struct ath12k *ar, struct wmi_dcs_awgn_in
+         return true;
+ }
+ 
++static void
++ath12k_wmi_dcs_cw_interference_event(struct ath12k_base *ab,
++				     struct sk_buff *skb)
++{
++	struct ath12k *ar;
++	struct wmi_dcs_cw_info cw_info = {};
++	struct cfg80211_chan_def *chandef;
++	const struct wmi_dcs_interference_ev *dcs_intf_ev;
++	struct ath12k_mac_any_chandef_arg arg;
++	struct ath12k_hw *ah;
++	int ret;
++
++	ret = ath12k_wmi_tlv_iter(ab, skb->data, skb->len,
++				  ath12k_wmi_dcs_event_parser,
++				  &cw_info);
++	if (ret) {
++		ath12k_warn(ab, "failed to parse cw tlv %d\n", ret);
++		return;
++	}
++
++	rcu_read_lock();
++	ar = ath12k_mac_get_ar_by_pdev_id(ab, dcs_intf_ev->pdev_id);
++	if (!ar) {
++		ath12k_warn(ab, "CW detected in invalid pdev id(%d)\n",
++			    dcs_intf_ev->pdev_id);
++		goto exit;
++	}
++
++	if (!(ar->dcs_enable_bitmap & WMI_DCS_CW_INTF)) {
++		/* TODO - incase Fw missed the pdev set param to disable CW Interference */
++		goto exit;
++	}
++
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "CW Interference detected for pdev=%d\n",
++		   dcs_intf_ev->pdev_id);
++
++	ah = ar->ah;
++
++	arg.ar = ar;
++	arg.def = NULL;
++	ieee80211_iter_chan_contexts_atomic(ah->hw, ath12k_mac_get_any_chandef_iter,
++					    &arg);
++	chandef = arg.def;
++	if (!chandef) {
++		ath12k_warn(ab, "chandef is not available\n");
++		goto exit;
++	}
++	ieee80211_cw_detected(ah->hw, chandef->chan);
++exit:
++	rcu_read_unlock();
++}
++
+ static void
+ ath12k_wmi_dcs_awgn_interference_event(struct ath12k_base *ab,
+                                        struct sk_buff *skb)
+@@ -13586,10 +13644,7 @@ ath12k_wmi_dcs_awgn_interference_event(struct ath12k_base *ab,
+         struct cfg80211_chan_def *chandef;
+         struct ath12k_mac_any_chandef_arg arg;
+         struct ath12k *ar;
+-        const struct wmi_tlv *tlv;
+ 	struct ath12k_hw *ah;
+-        u16 tlv_tag;
+-        u8 *ptr;
+         int ret;
+ 
+         if (!test_bit(WMI_TLV_SERVICE_DCS_AWGN_INT_SUPPORT, ab->wmi_ab.svc_map)) {
+@@ -13597,35 +13652,8 @@ ath12k_wmi_dcs_awgn_interference_event(struct ath12k_base *ab,
+                 return;
+         }
+ 
+-        ptr = skb->data;
+-
+-        if (skb->len < (sizeof(*dcs_intf_ev) + TLV_HDR_SIZE)) {
+-                ath12k_warn(ab, "dcs interference event size invalid\n");
+-                return;
+-        }
+-
+-        tlv = (struct wmi_tlv *)ptr;
+-        tlv_tag = FIELD_GET(WMI_TLV_TAG, tlv->header);
+-        ptr += sizeof(*tlv);
+-
+-        if (tlv_tag == WMI_TAG_DCS_INTERFERENCE_EVENT) {
+-                dcs_intf_ev = (struct wmi_dcs_interference_ev*)ptr;
+-
+-                ath12k_dbg(ab, ATH12K_DBG_WMI,
+-                           "pdev awgn detected on pdev %d, interference type %d\n",
+-                           dcs_intf_ev->pdev_id, dcs_intf_ev->interference_type);
+-
+-                if (dcs_intf_ev->interference_type != WMI_DCS_AWGN_INTF) {
+-                        ath12k_warn(ab, "interference type is not awgn\n");
+-                        return;
+-                }
+-        } else {
+-                ath12k_warn(ab, "dcs interference event received with wrong tag\n");
+-                return;
+-        }
+-
+         ret = ath12k_wmi_tlv_iter(ab, skb->data, skb->len,
+-                                  ath12k_wmi_dcs_awgn_event_parser,
++                                  ath12k_wmi_dcs_event_parser,
+                                   &awgn_info);
+         if (ret) {
+                 ath12k_warn(ab, "failed to parse awgn tlv %d\n", ret);
+@@ -13687,6 +13715,53 @@ exit:
+         rcu_read_unlock();
+ }
+ 
++static void
++ath12k_wmi_dcs_interference_event(struct ath12k_base *ab,
++				  struct sk_buff *skb)
++{
++	const struct wmi_dcs_interference_ev *dcs_intf_ev;
++	const struct wmi_tlv *tlv;
++	u8 *ptr;
++	u16 tlv_tag;
++
++	ptr = skb->data;
++
++	if (skb->len < (sizeof(*dcs_intf_ev) + TLV_HDR_SIZE)) {
++		ath12k_warn(ab, "dcs interference event size invalid\n");
++		return;
++	}
++
++	tlv = (struct wmi_tlv *)ptr;
++	tlv_tag = FIELD_GET(WMI_TLV_TAG, tlv->header);
++	ptr += sizeof(*tlv);
++
++	if (tlv_tag == WMI_TAG_DCS_INTERFERENCE_EVENT) {
++		dcs_intf_ev = (struct wmi_dcs_interference_ev*)ptr;
++		ath12k_dbg(ab, ATH12K_DBG_WMI,
++			   "Interference detected on pdev %d, interference type %d\n",
++			   dcs_intf_ev->pdev_id, dcs_intf_ev->interference_type);
++	} else {
++		ath12k_warn(ab, "dcs interference event received with wrong tag\n");
++		return;
++	}
++
++	switch (le32_to_cpu(dcs_intf_ev->interference_type)) {
++	case WMI_DCS_CW_INTF:
++		ath12k_wmi_dcs_cw_interference_event(ab, skb);
++		break;
++
++	case WMI_DCS_AWGN_INTF:
++		ath12k_wmi_dcs_awgn_interference_event(ab, skb);
++		break;
++
++	default:
++		ath12k_warn(ab, ATH12K_DBG_WMI,
++			   "For pdev=%d, Invalid Interference type=%d recieved from FW",
++			   dcs_intf_ev->pdev_id, dcs_intf_ev->interference_type);
++		break;
++	}
++}
++
+ #ifdef CPTCFG_ATH12K_PKTLOG
+ static void
+ ath12k_wmi_pktlog_decode_info(struct ath12k_base *ab,
+@@ -15479,7 +15554,7 @@ static void ath12k_wmi_op_rx(struct ath12k_base *ab, struct sk_buff *skb)
+ 		ath12k_wmi_diag_event(ab, skb);
+ 		break;
+ 	case WMI_DCS_INTERFERENCE_EVENTID:
+-                ath12k_wmi_dcs_awgn_interference_event(ab, skb);
++		ath12k_wmi_dcs_interference_event(ab, skb);
+                 break;
+ 	case WMI_PDEV_PKTLOG_DECODE_INFO_EVENTID:
+ #ifdef CPTCFG_ATH12K_PKTLOG
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.h b/drivers/net/wireless/ath/ath12k/wmi.h
+index a38b33c..9cf69e4 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -5515,6 +5515,8 @@ struct wmi_pdev_radar_flags_param {
+ } __packed;
+ #define WMI_PDEV_RADAR_FLAGS_FULL_BW_NOL_MARK_BIT 0
+ 
++#define WMI_DCS_CW_INTF         0x01
++#define WMI_DCS_WLAN_INTF       0x02
+ #define WMI_DCS_AWGN_INTF       0x04
+ 
+ struct wmi_dcs_awgn_info {
+@@ -5525,6 +5527,10 @@ struct wmi_dcs_awgn_info {
+         u32 chan_bw_interference_bitmap;
+ } __packed;
+ 
++struct wmi_dcs_cw_info {
++	__le32 channel;
++};
++
+ struct wmi_dcs_interference_ev {
+         u32 interference_type;
+         u32 pdev_id;
+diff --git a/net/mac80211/main.c b/net/mac80211/main.c
+index 76523a1..6f42498 100644
+--- a/net/mac80211/main.c
++++ b/net/mac80211/main.c
+@@ -852,6 +852,7 @@ struct ieee80211_hw *ieee80211_alloc_hw_nm(size_t priv_data_len,
+ 	INIT_WORK(&local->cw_detected_work,
+ 		  ieee80211_cw_detected_work);
+ 	INIT_LIST_HEAD(&local->awgn_info_list);
++	INIT_LIST_HEAD(&local->cw_info_list);
+ 
+ 	INIT_WORK(&local->reconfig_filter, ieee80211_reconfig_filter);
+ 	local->smps_mode = IEEE80211_SMPS_OFF;
+-- 
+2.34.1
+

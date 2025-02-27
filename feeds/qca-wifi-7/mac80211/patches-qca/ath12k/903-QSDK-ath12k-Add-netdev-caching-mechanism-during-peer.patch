@@ -1,0 +1,218 @@
+From ce18ea933df8a0b71d5532a01a8232a1827dbbbd Mon Sep 17 00:00:00 2001
+From: P Praneesh <quic_ppranees@quicinc.com>
+Date: Mon, 22 Apr 2024 20:12:05 +0530
+Subject: [PATCH] QSDK: ath12k: Add netdev caching mechanism during peer
+ creation
+
+Fetch netdev from wdev only during peer creation and assign it to peer
+object. Avoid unnecessary multiple checks which is getting performed for
+per packet by reusing the cached netdev while delivering rx packets.
+
+Since msdu->dev is getting filled for each packet in eth_type_trans,
+avoid assigning it explicity in driver. Also remove unused function
+for assigning msdu checksum flags.
+
+Patch-depdendency: 653-002-ath12k-Allow-fast-rx-by-bypassing-stats-update.patch
+
+Signed-off-by: P Praneesh <quic_ppranees@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_rx.c | 44 +++++++------------------
+ drivers/net/wireless/ath/ath12k/peer.c  |  7 ++++
+ drivers/net/wireless/ath/ath12k/peer.h  |  1 +
+ 3 files changed, 20 insertions(+), 32 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -2490,18 +2490,6 @@ static struct sk_buff *ath12k_dp_rx_get_
+ 	return NULL;
+ }
+ 
+-static void ath12k_dp_rx_h_csum_offload(struct ath12k *ar, struct sk_buff *msdu,
+-					struct ath12k_dp_rx_info *rx_info)
+-{
+-	bool ip_csum_fail, l4_csum_fail;
+-
+-	ip_csum_fail = rx_info->ip_csum_fail;
+-	l4_csum_fail = rx_info->l4_csum_fail;
+-
+-	msdu->ip_summed = (ip_csum_fail || l4_csum_fail) ?
+-			  CHECKSUM_NONE : CHECKSUM_UNNECESSARY;
+-}
+-
+ static int ath12k_dp_rx_crypto_mic_len(struct ath12k *ar,
+ 				       enum hal_encrypt_type enctype)
+ {
+@@ -2849,9 +2837,8 @@ static bool ath12k_dp_rx_check_fast_rx(s
+ 
+ 	rxcb = ATH12K_SKB_RXCB(msdu);
+ 
+-	if (unlikely(!ar->ab->stats_disable ||
+-		decap != DP_RX_DECAP_TYPE_ETHERNET2_DIX ||
+-		peer->vif->type != NL80211_IFTYPE_AP))
++	if (unlikely(!peer->stats_disable ||
++	    decap != DP_RX_DECAP_TYPE_ETHERNET2_DIX))
+ 		return false;
+ 
+ 	/* mcbc packets go through mac80211 for PN validation */
+@@ -2920,10 +2907,6 @@ static void ath12k_dp_rx_h_mpdu(struct a
+ 	struct ath12k_peer *peer;
+ 	struct ieee80211_rx_status *rx_status = rx_info->rx_status;
+ 	u32 err_bitmap;
+-#if defined(CPTCFG_MAC80211_PPE_SUPPORT) || defined(CPTCFG_ATH12K_PPE_DS_SUPPORT)
+-	int vp;
+-#endif
+-	struct wireless_dev *wdev = NULL;
+ 
+ 	/* PN for multicast packets will be checked in mac80211 */
+ 	rxcb = ATH12K_SKB_RXCB(msdu);
+@@ -2933,6 +2916,8 @@ static void ath12k_dp_rx_h_mpdu(struct a
+ 	if (rxcb->is_mcbc)
+ 		rxcb->peer_id = rx_info->peer_id;
+ 
++	msdu->ip_summed = (rx_info->ip_csum_fail || rx_info->l4_csum_fail) ?
++			   CHECKSUM_NONE : CHECKSUM_UNNECESSARY;
+ 	rcu_read_lock();
+ 	peer = ath12k_peer_find_by_peer_list_index(ar, rxcb->peer_id);
+ 	if (likely(peer)) {
+@@ -2942,22 +2927,18 @@ static void ath12k_dp_rx_h_mpdu(struct a
+ 		 * path, so its safe to skip checking errors here */
+ 		if (*fast_rx &&
+ 		    ath12k_dp_rx_check_fast_rx(ar, msdu, rx_desc, peer, rx_info)) {
+-			wdev = ieee80211_vif_to_wdev(peer->vif);
+-		        if (wdev) {
+-#if defined(CPTCFG_MAC80211_PPE_SUPPORT) || defined(CPTCFG_ATH12K_PPE_DS_SUPPORT)
+-				vp = peer->ppe_vp_num;
+-#endif
+-				msdu->dev = wdev->netdev;
+-
+-				rcu_read_unlock();
+-				ath12k_dp_rx_h_csum_offload(ar, msdu, rx_info);
++			if (likely(peer->dev)) {
+ #if defined(CPTCFG_MAC80211_PPE_SUPPORT) || defined(CPTCFG_ATH12K_PPE_DS_SUPPORT)
+-				if (vp > 0) {
+-					if (likely(ppe_vp_tx_to_ppe(vp, msdu)))
++				if (peer->ppe_vp_num > 0) {
++					msdu->dev = peer->dev;
++					if (ppe_vp_tx_to_ppe(peer->ppe_vp_num, msdu)) {
++						rcu_read_unlock();
+ 						return;
++					}
+ 				}
+ #endif
+-				msdu->protocol = eth_type_trans(msdu, msdu->dev);
++				msdu->protocol = eth_type_trans(msdu, peer->dev);
++				rcu_read_unlock();
+ 				netif_receive_skb(msdu);
+ 				return;
+ 		        }
+@@ -3011,7 +2992,6 @@ static void ath12k_dp_rx_h_mpdu(struct a
+ 					   RX_FLAG_PN_VALIDATED;
+ 	}
+ 
+-	ath12k_dp_rx_h_csum_offload(ar, msdu, rx_info);
+ 	ath12k_dp_rx_h_undecap(ar, msdu, rx_desc,
+ 			       enctype, rx_status, is_decrypted);
+ 
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -703,6 +703,7 @@ int ath12k_peer_create(struct ath12k *ar
+ 	struct ath12k_peer *peer;
+ 	struct ath12k_sta *ahsta;
+ 	struct ath12k_link_sta *arsta;
++	struct wireless_dev *wdev;
+ 	u8 link_id = arvif->link_id;
+ 	struct ieee80211_vif *vif = arvif->ahvif->vif;
+ 	struct ath12k_ml_peer *ml_peer;
+@@ -815,6 +816,17 @@ int ath12k_peer_create(struct ath12k *ar
+ 	peer->sec_type = HAL_ENCRYPT_TYPE_OPEN;
+ 	peer->sec_type_grp = HAL_ENCRYPT_TYPE_OPEN;
+ 	peer->vif = vif;
++
++	/* cache net dev here and reuse it during process rx */
++	wdev = ieee80211_vif_to_wdev(vif);
++	if (wdev)
++		peer->dev = wdev->netdev;
++
++	if ((ab->stats_disable) && ((peer->vif->type == NL80211_IFTYPE_AP) ||
++	    (peer->vif->type == NL80211_IFTYPE_STATION))) {
++		peer->stats_disable = true;
++	}
++
+ #ifdef CPTCFG_MAC80211_PPE_SUPPORT
+ 	/* Do not deliver frames to PPE in fast rx incase of RFS
+ 	 * RFS is supported only in SFE Mode
+--- a/drivers/net/wireless/ath/ath12k/peer.h
++++ b/drivers/net/wireless/ath/ath12k/peer.h
+@@ -22,6 +22,8 @@ struct ppdu_user_delayba {
+ 
+ struct ath12k_peer {
+ 	struct list_head list;
++	bool stats_disable;
++	struct net_device *dev;
+ 	struct ieee80211_sta *sta;
+ 	struct ieee80211_vif *vif;
+ #ifdef CPTCFG_ATH12K_SAWF
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -7218,6 +7218,7 @@ static void ath12k_sta_set_4addr_wk(stru
+ 	struct ath12k_vif *ahvif;
+ 	struct ath12k_link_sta *arsta;
+ 	struct ieee80211_sta *sta;
++	struct ath12k_peer *peer;
+ 	int ret = 0;
+ 	u8 link_id;
+ 
+@@ -7244,6 +7245,26 @@ static void ath12k_sta_set_4addr_wk(stru
+ 		if (ahvif->tx_encap_type != ATH12K_HW_TXRX_ETHERNET)
+ 			continue;
+ 
++		spin_lock_bh(&ar->ab->base_lock);
++		peer = ath12k_peer_find_by_addr(ar->ab, arsta->addr);
++		if (!peer) {
++			spin_unlock_bh(&ar->ab->base_lock);
++			ath12k_warn(ar->ab,
++				    "failed to find peer for vdev_id 0x%X addr %pM link_map %lu\n",
++				    arvif->vdev_id, arsta->addr, ahvif->links_map);
++		} else {
++			if (peer->vif->type == NL80211_IFTYPE_AP)
++				peer->dev = peer->sta->dev;
++
++			if ((ar->ab->stats_disable) &&
++			    ((peer->vif->type == NL80211_IFTYPE_AP) ||
++			     (peer->vif->type == NL80211_IFTYPE_STATION))) {
++				peer->stats_disable = true;
++			}
++
++			spin_unlock_bh(&ar->ab->base_lock);
++		}
++
+ 		ret = ath12k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
+ 						    WMI_VDEV_PARAM_AP_ENABLE_NAWDS,
+ 						    WDS_EXT_ENABLE);
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -2330,6 +2330,7 @@ static ssize_t ath12k_write_stats_disabl
+ {
+ 	struct ath12k_base *ab = file->private_data;
+ 	struct ath12k_pdev *pdev;
++	struct ath12k_peer *peer;
+ 	bool disable;
+ 	int ret, i;
+ 	u32 mask = 0;
+@@ -2339,6 +2340,16 @@ static ssize_t ath12k_write_stats_disabl
+ 
+ 	if (disable != ab->stats_disable) {
+ 		ab->stats_disable = disable;
++
++		spin_lock_bh(&ab->base_lock);
++		list_for_each_entry(peer, &ab->peers, list) {
++			if ((peer->vif->type == NL80211_IFTYPE_AP) ||
++			    (peer->vif->type == NL80211_IFTYPE_STATION)) {
++				peer->stats_disable = disable ? true : false;
++			}
++		}
++		spin_unlock_bh(&ab->base_lock);
++
+ 		for (i = 0; i < ab->num_radios; i++) {
+ 			pdev = &ab->pdevs[i];
+ 			if (pdev && pdev->ar) {

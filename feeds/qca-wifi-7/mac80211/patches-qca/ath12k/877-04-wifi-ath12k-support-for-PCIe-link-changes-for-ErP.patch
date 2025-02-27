@@ -1,0 +1,272 @@
+From 9e82021f4a785f9fd1896dc357b4895a68c10002 Mon Sep 17 00:00:00 2001
+From: Aloka Dixit <quic_alokad@quicinc.com>
+Date: Mon, 5 Aug 2024 12:43:52 -0700
+Subject: [PATCH] wifi: ath12k: PCIe link speed and width configuration for ErP
+
+Reduce PCIe to Gen 1 Lane 1 during ErP entry and restore original
+configuration during exit. Pointer to root device may get changed
+during PCIe removal, hence, iterate over all devices on the bus
+to restore the speed and width of the correct devices.
+
+Signed-off-by: Aloka Dixit <quic_alokad@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/vendor.c | 116 +++++++++++++++++++++--
+ drivers/net/wireless/ath/ath12k/vendor.h |   4 +
+ 2 files changed, 111 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/vendor.c
++++ b/drivers/net/wireless/ath/ath12k/vendor.c
+@@ -159,6 +159,7 @@ ath12k_vendor_erp_config_policy[QCA_WLAN
+ 	[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_TRIGGER] =
+ 		NLA_POLICY_FULL_RANGE(NLA_U32, &ath12k_vendor_erp_config_trigger_range),
+ 	[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_PCIE_REMOVE] = { .type = NLA_FLAG},
++	[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_PCIE_SPEED_WIDTH] = { .type = NLA_FLAG},
+ };
+ 
+ static const struct nla_policy
+@@ -185,6 +186,8 @@ enum ath12k_erp_states {
+ struct ath12k_erp_pci_root {
+ 	struct pci_dev *dev;
+ 	struct pci_bus *bus;
++	u16 speed;
++	u16 width;
+ };
+ 
+ enum ath12k_erp_pcie_rescan {
+@@ -204,6 +207,7 @@ struct ath12k_erp_pci_dev {
+ struct ath12k_erp_active_ar {
+ 	struct ath12k *ar;
+ 	enum ath12k_routing_pkt_type trigger;
++	struct ath12k_erp_pci_root root;
+ };
+ 
+ struct ath12k_erp_state_machine {
+@@ -1472,8 +1476,54 @@ static int ath12k_erp_set_pkt_filter(str
+ 	return 0;
+ }
+ 
+-static int ath12k_erp_config_trigger(struct wiphy *wiphy, struct nlattr **attrs)
++static void ath12k_erp_config_pcie_speed_width(struct ath12k *ar,
++					       const struct pci_dev *root,
++					       struct ath12k_erp_pci_root *erp_pci_root,
++					       bool enter)
+ {
++	struct ath12k_base *ab = ar ? ar->ab : NULL;
++	u16 speed, width;
++
++	if (!root || !erp_pci_root)
++		return;
++
++	if (ath12k_pci_get_link_status(root, &speed, &width) < 0) {
++		ath12k_warn(ab, "failed to get PCIe link status\n");
++		return;
++	}
++
++	if (enter) {
++		erp_pci_root->dev = root;
++		if (speed != 1 && pcie_set_link_speed(root, 1))
++			ath12k_warn(ab, "failed to reduce PCIe speed\n");
++		erp_pci_root->speed = speed;
++
++		if (width != 1 && pcie_set_link_width(root, 1))
++			ath12k_warn(ab, "failed to reduce PCIe width\n");
++		erp_pci_root->width = width;
++	} else {
++		if (!erp_pci_root->dev)
++			return;
++
++		if (speed != erp_pci_root->speed &&
++		    pcie_set_link_speed(root, erp_pci_root->speed)) {
++			ath12k_warn(ab, "failed to reset PCIe speed\n");
++			return;
++		}
++
++		if (width != erp_pci_root->width &&
++		    pcie_set_link_width(root, erp_pci_root->width)) {
++			ath12k_warn(ab, "failed to reset PCIe width\n");
++			return;
++		}
++
++		erp_pci_root->dev = NULL;
++	}
++}
++
++static int ath12k_erp_config_active_ar(struct wiphy *wiphy, struct nlattr **attrs)
++{
++	struct pci_dev *pci_dev, *root;
+ 	struct net_device *netdev;
+ 	struct wireless_dev *wdev;
+ 	u32 trigger, if_index;
+@@ -1481,7 +1531,7 @@ static int ath12k_erp_config_trigger(str
+ 	struct ath12k_vif *ahvif;
+ 	struct ath12k *ar;
+ 
+-	ath12k_dbg(NULL, ATH12K_DBG_RM, "setting ErP wake up trigger\n");
++	ath12k_dbg(NULL, ATH12K_DBG_RM, "configuring ErP active interface\n");
+ 
+ 	if (!attrs[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_IFINDEX]) {
+ 		ath12k_err(NULL, "missing index for wake up interface\n");
+@@ -1518,9 +1568,32 @@ static int ath12k_erp_config_trigger(str
+ 
+ 	ar = ahvif->deflink.ar; /* current support is only for SLO */
+ 
+-	trigger = nla_get_u32(attrs[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_TRIGGER]);
+-	if (ath12k_erp_set_pkt_filter(ar, trigger, ATH12K_WMI_PKTROUTE_ADD))
+-		return -EINVAL;
++	if (attrs[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_TRIGGER]) {
++		trigger = nla_get_u32(attrs[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_TRIGGER]);
++		if (ath12k_erp_set_pkt_filter(ar, trigger, ATH12K_WMI_PKTROUTE_ADD))
++			return -EINVAL;
++
++		erp_sm.active_ar.ar = ar;
++	}
++
++	if (!ar->ab->hif.bus == ATH12K_BUS_PCI ||
++	    !attrs[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_PCIE_SPEED_WIDTH] ||
++	    !nla_get_flag(attrs[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_PCIE_SPEED_WIDTH]))
++		return 0;
++
++	pci_dev = ath12k_pci_get_dev_by_ab(ar->ab);
++	if (!pci_dev) {
++		ath12k_warn(ar->ab, "no PCIe device associated with wiphy\n");
++		return 0;
++	}
++
++	root = pcie_find_root_port(pci_dev);
++	if (!root) {
++		ath12k_warn(ar->ab, "failed to find PCIe root dev\n");
++		return 0;
++	}
++
++	ath12k_erp_config_pcie_speed_width(ar, root, &erp_sm.active_ar.root, true);
+ 
+ 	erp_sm.active_ar.ar = ar;
+ 	return 0;
+@@ -1550,7 +1623,8 @@ static void ath12k_erp_remove_pcie_work(
+ 			continue;
+ 		}
+ 
+-		erp_pci_dev->root.dev = root;
++		ath12k_erp_config_pcie_speed_width(NULL, root, &erp_pci_dev->root, true);
++
+ 		erp_pci_dev->root.bus = root->bus;
+ 		pci_stop_and_remove_bus_device_locked(root);
+ 		erp_pci_dev->active = false;
+@@ -1604,7 +1678,8 @@ static int ath12k_erp_config(struct wiph
+ 	}
+ 
+ 	if (!tb[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_TRIGGER] &&
+-	    !tb[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_PCIE_REMOVE]) {
++	    !tb[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_PCIE_REMOVE] &&
++	    !tb[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_PCIE_SPEED_WIDTH]) {
+ 		ath12k_err(NULL, "empty ErP parameters\n");
+ 		return ret;
+ 	}
+@@ -1616,8 +1691,9 @@ static int ath12k_erp_config(struct wiph
+ 		return ret;
+ 	}
+ 
+-	if (tb[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_TRIGGER])
+-		return ath12k_erp_config_trigger(wiphy, tb);
++	if (tb[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_TRIGGER] ||
++	    tb[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_PCIE_SPEED_WIDTH])
++		return ath12k_erp_config_active_ar(wiphy, tb);
+ 	else
+ 		return ath12k_erp_remove_pcie(wiphy);
+ }
+@@ -1695,6 +1771,7 @@ int ath12k_erp_exit(struct wiphy *wiphy,
+ {
+ 	struct ath12k_erp_active_ar *active_ar;
+ 	struct ath12k_erp_pci_dev *erp_pci_dev;
++	struct pci_dev *pci_dev, *root;
+ 	int ret, i;
+ 
+ 	lockdep_assert_held(&erp_sm.lock);
+@@ -1712,6 +1789,13 @@ int ath12k_erp_exit(struct wiphy *wiphy,
+ 			ath12k_err(NULL, "failed to reset pkt bitmap %d", ret);
+ 			return ret;
+ 		}
++
++		if (active_ar->ar->ab->hif.bus == ATH12K_BUS_PCI) {
++			ath12k_erp_config_pcie_speed_width(active_ar->ar,
++							   active_ar->root.dev,
++							   &active_ar->root,
++							   false);
++		}
+ 	}
+ 
+ 	for (i = 0; i < erp_sm.rescan_pci_dev_cnt; i++) {
+@@ -1727,6 +1811,18 @@ int ath12k_erp_exit(struct wiphy *wiphy,
+ 		pci_rescan_bus(erp_pci_dev->root.bus);
+ 		erp_pci_dev->active = true;
+ 		pci_unlock_rescan_remove();
++
++		list_for_each_entry(pci_dev, &erp_pci_dev->root.bus->devices, bus_list) {
++			root = pcie_find_root_port(pci_dev);
++			if (!root) {
++				ath12k_warn(ar->ab, "failed to find PCIe root dev\n");
++				return 0;
++			}
++
++			ath12k_erp_config_pcie_speed_width(NULL, root,
++							   &erp_pci_dev->root,
++							   false);
++		}
+ 	}
+ 
+ 	ath12k_erp_reset_state();
+--- a/drivers/net/wireless/ath/ath12k/vendor.h
++++ b/drivers/net/wireless/ath/ath12k/vendor.h
+@@ -687,12 +687,16 @@ enum qca_wlan_vendor_trigger_types {
+  *
+  * @QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_PCIE_REMOVE: flag, set if the driver should
+  * remove PCIe slot.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_PCIE_SPEED_WIDTH: flag, set if the driver
++ *	should reduce PCIe speed and width.
+  */
+ enum qca_wlan_vendor_attr_erp_ath_config {
+ 	QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_INVALID = 0,
+ 	QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_IFINDEX = 1,
+ 	QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_TRIGGER = 2,
+ 	QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_PCIE_REMOVE = 3,
++	QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_PCIE_SPEED_WIDTH = 4,
+ 
+ 	/* keep last */
+ 	QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_AFTER_LAST,
+--- a/drivers/net/wireless/ath/ath12k/pci.c
++++ b/drivers/net/wireless/ath/ath12k/pci.c
+@@ -896,6 +896,23 @@ void ath12k_pci_read_hw_version(struct a
+ 		    *major, *minor);
+ }
+ 
++int ath12k_pci_get_link_status(struct pci_dev *pdev, u16 *speed, u16 *width)
++{
++	u16 link_status;
++	int ret;
++
++	if (!pdev || !speed || !width)
++		return -EINVAL;
++
++	ret = pcie_capability_read_word(pdev, PCI_EXP_LNKSTA, &link_status);
++	if (ret)
++		return ret;
++
++	*speed = u16_get_bits(link_status, PCI_EXP_LNKSTA_CLS);
++	*width = u16_get_bits(link_status, PCI_EXP_LNKSTA_NLW);
++	return 0;
++}
++
+ static int ath12k_pci_probe(struct pci_dev *pdev,
+ 			    const struct pci_device_id *pci_dev)
+ {
+--- a/drivers/net/wireless/ath/ath12k/pci.h
++++ b/drivers/net/wireless/ath/ath12k/pci.h
+@@ -152,6 +152,7 @@ void ath12k_pci_ppeds_free_interrupts(st
+ int ath12k_pci_ppeds_register_interrupts(struct ath12k_base *ab, int type,
+ 					int vector, int ring_num);
+ struct pci_dev *ath12k_pci_get_dev_by_ab(struct ath12k_base *ab);
++int ath12k_pci_get_link_status(struct pci_dev *pdev, u16 *speed, u16 *width);
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ void ath12k_pci_ppeds_irq_enable(struct ath12k_base *ab, enum ppeds_irq_type type);
+ void ath12k_pci_ppeds_irq_disable(struct ath12k_base *ab, enum ppeds_irq_type type);

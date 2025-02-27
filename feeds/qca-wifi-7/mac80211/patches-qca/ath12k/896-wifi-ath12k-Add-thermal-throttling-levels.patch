@@ -1,0 +1,277 @@
+From c1bb39c2b7e67b08bb6da9b3e9186e51e9fecb28 Mon Sep 17 00:00:00 2001
+From: Nikhil Gurram <quic_nikhgurr@quicinc.com>
+Date: Thu, 4 Apr 2024 12:57:13 +0530
+Subject: QSDK: wifi: ath12k: Add thermal throttling levels and
+ handle stats event
+
+Currently only thermal level 0 is supported, add other
+three thermal levels and configure corresponding temperature and
+duty cycle values. Also handle thermal throttle stats event from firmware
+
+Patch-depdendency: 000-f-Revert-wifi-ath12k-wmi-remove-unused-thermal-command.patch 
+		   502-ath12k-add-thermal-support.patch
+	
+Signed-off-by: Nikhil Gurram <quic_nikhgurr@quicinc.com>
+Signed-off-by: Sowmiya Sree Elavalagan <quic_ssreeela@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c     |  7 +++
+ drivers/net/wireless/ath/ath12k/thermal.c | 58 ++++++++++++++++++-----
+ drivers/net/wireless/ath/ath12k/thermal.h | 21 ++++++--
+ drivers/net/wireless/ath/ath12k/wmi.c     | 41 ++++++++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.h     | 10 +++-
+ 5 files changed, 122 insertions(+), 15 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -10209,6 +10209,13 @@ int ath12k_mac_radio_start(struct ath12k
+ 		goto err;
+ 	}
+ 
++	ath12k_info(ab, "Enabling FW Thermal throttling\n");
++	ret = ath12k_thermal_set_throttling(ar, ATH12K_THERMAL_LVL0_DUTY_CYCLE);
++	if (ret) {
++		ath12k_err(ab, "failed to set thermal throttle: (%d)\n", ret);
++		goto err;
++	}
++
+ 	ret = ath12k_wmi_pdev_set_param(ar, WMI_PDEV_PARAM_PMF_QOS,
+ 					1, pdev->pdev_id);
+ 
+--- a/drivers/net/wireless/ath/ath12k/thermal.c
++++ b/drivers/net/wireless/ath/ath12k/thermal.c
+@@ -133,6 +133,29 @@ ath12k_pdev_notify_power_save_metric(u8
+ 	}
+ }
+ 
++static struct tt_level_config tt_level_configs[THERMAL_LEVELS] = {
++		{ /* Level 0 */
++			ATH12K_THERMAL_LVL0_TEMP_LOW_MARK,
++			ATH12K_THERMAL_LVL0_TEMP_HIGH_MARK,
++			ATH12K_THERMAL_LVL0_DUTY_CYCLE, 0
++		},
++		{ /* Level 1 */
++			ATH12K_THERMAL_LVL1_TEMP_LOW_MARK,
++			ATH12K_THERMAL_LVL1_TEMP_HIGH_MARK,
++			ATH12K_THERMAL_LVL1_DUTY_CYCLE, 0
++		},
++		{ /* Level 2 */
++			ATH12K_THERMAL_LVL2_TEMP_LOW_MARK,
++			ATH12K_THERMAL_LVL2_TEMP_HIGH_MARK,
++			ATH12K_THERMAL_LVL2_DUTY_CYCLE, 0
++		},
++		{ /* Level 3 */
++			ATH12K_THERMAL_LVL3_TEMP_LOW_MARK,
++			ATH12K_THERMAL_LVL3_TEMP_HIGH_MARK,
++			ATH12K_THERMAL_LVL3_DUTY_CYCLE, 0
++		}
++};
++
+ static int
+ netstandby_eawtp_wifi_notify_active_eth_ports(void *app_data,
+ 					      struct eawtp_port_info *ntfy_info)
+@@ -247,9 +270,9 @@ ath12k_thermal_get_cur_throttle_state(st
+ {
+ 	struct ath12k *ar = cdev->devdata;
+ 
+-	mutex_lock(&ar->conf_mutex);
++	spin_lock_bh(&ar->data_lock);
+ 	*state = ar->thermal.throttle_state;
+-	mutex_unlock(&ar->conf_mutex);
++	spin_unlock_bh(&ar->data_lock);
+ 
+ 	return 0;
+ }
+@@ -268,8 +291,6 @@ ath12k_thermal_set_cur_throttle_state(st
+ 	}
+ 	mutex_lock(&ar->conf_mutex);
+ 	ret = ath12k_thermal_set_throttling(ar, throttle_state);
+-	if (ret == 0)
+-		ar->thermal.throttle_state = throttle_state;
+ 	mutex_unlock(&ar->conf_mutex);
+ 	return ret;
+ }
+@@ -335,6 +356,16 @@ void ath12k_thermal_event_temperature(st
+ 	complete(&ar->thermal.wmi_sync);
+ }
+ 
++void ath12k_thermal_event_throt_level(struct ath12k *ar, int curr_level)
++{
++	if (curr_level >= THERMAL_LEVELS)
++		return;
++
++	spin_lock_bh(&ar->data_lock);
++	ar->thermal.throttle_state = tt_level_configs[curr_level].dcoffpercent;
++	spin_unlock_bh(&ar->data_lock);
++}
++
+ static SENSOR_DEVICE_ATTR(temp1_input, 0444, ath12k_thermal_show_temp,
+ 			  NULL, 0);
+ 
+@@ -348,7 +379,7 @@ int ath12k_thermal_set_throttling(struct
+ {
+ 	struct ath12k_base *sc = ar->ab;
+ 	struct ath12k_wmi_thermal_mitigation_arg param;
+-	int ret = 0;
++	int level, ret;
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+ 
+@@ -357,14 +388,19 @@ int ath12k_thermal_set_throttling(struct
+ 
+ 	memset(&param, 0, sizeof(param));
+ 	param.pdev_id = ar->pdev->pdev_id;
+-	param.enable = throttle_state ? 1 : 0;
++	param.enable = ATH12K_FW_THERMAL_THROTTLING_ENABLE;
+ 	param.dc = ATH12K_THERMAL_DEFAULT_DUTY_CYCLE;
+-	param.dc_per_event = 0xFFFFFFFF;
++	/* After how many duty cycles the FW sends stats to host */
++	param.dc_per_event = 0x2;
++
++	tt_level_configs[0].dcoffpercent = throttle_state;
++	for (level = 0; level < THERMAL_LEVELS; level++) {
++		param.levelconf[level].tmplwm = tt_level_configs[level].tmplwm;
++		param.levelconf[level].tmphwm = tt_level_configs[level].tmphwm;
++		param.levelconf[level].dcoffpercent = tt_level_configs[level].dcoffpercent;
++		param.levelconf[level].priority = 0; /* disable all data tx queues */
++	}
+ 
+-	param.levelconf[0].tmplwm = ATH12K_THERMAL_TEMP_LOW_MARK;
+-	param.levelconf[0].tmphwm = ATH12K_THERMAL_TEMP_HIGH_MARK;
+-	param.levelconf[0].dcoffpercent = throttle_state;
+-	param.levelconf[0].priority = 0; /* disable all data tx queues */
+ 	ret = ath12k_wmi_send_thermal_mitigation_cmd(ar, &param);
+ 	if (ret) {
+ 		ath12k_warn(sc, "failed to send thermal mitigation duty cycle %u ret %d\n",
+--- a/drivers/net/wireless/ath/ath12k/thermal.h
++++ b/drivers/net/wireless/ath/ath12k/thermal.h
+@@ -11,15 +11,27 @@
+ #ifndef _ATH12K_THERMAL_
+ #define _ATH12K_THERMAL_
+ 
+-#define ATH12K_THERMAL_TEMP_LOW_MARK -100
+-#define ATH12K_THERMAL_TEMP_HIGH_MARK 150
++/* Below temperatures are in celsius */
++#define ATH12K_THERMAL_LVL0_TEMP_LOW_MARK -100
++#define ATH12K_THERMAL_LVL0_TEMP_HIGH_MARK 100
++#define ATH12K_THERMAL_LVL1_TEMP_LOW_MARK 95
++#define ATH12K_THERMAL_LVL1_TEMP_HIGH_MARK 105
++#define ATH12K_THERMAL_LVL2_TEMP_LOW_MARK 100
++#define ATH12K_THERMAL_LVL2_TEMP_HIGH_MARK 110
++#define ATH12K_THERMAL_LVL3_TEMP_LOW_MARK 105
++#define ATH12K_THERMAL_LVL3_TEMP_HIGH_MARK 120
++
++#define ATH12K_THERMAL_LVL0_DUTY_CYCLE 0
++#define ATH12K_THERMAL_LVL1_DUTY_CYCLE 50
++#define ATH12K_THERMAL_LVL2_DUTY_CYCLE 90
++#define ATH12K_THERMAL_LVL3_DUTY_CYCLE 100
++
++#define ATH12K_FW_THERMAL_THROTTLING_ENABLE  1
+ #define ATH12K_THERMAL_THROTTLE_MAX     100
+ #define ATH12K_THERMAL_DEFAULT_DUTY_CYCLE 100
+ #define ATH12K_HWMON_NAME_LEN           15
+ #define ATH12K_THERMAL_SYNC_TIMEOUT_HZ (5 * HZ)
+ 
+-#define THERMAL_LEVELS  1
+-
+ #ifdef CPTCFG_ATH12K_POWER_OPTIMIZATION
+ #define ETH_PORT_COUNT 3
+ 
+@@ -76,6 +88,8 @@ int ath12k_thermal_register(struct ath12
+ void ath12k_thermal_unregister(struct ath12k_base *sc);
+ int ath12k_thermal_set_throttling(struct ath12k *ar, u32 throttle_state);
+ void ath12k_thermal_event_temperature(struct ath12k *ar, int temperature);
++void ath12k_thermal_event_throt_level(struct ath12k *ar, int curr_level);
++int ath12k_wmi_thermal_set_throttle(struct ath12k *ar);
+ #else
+ static inline int ath12k_thermal_register(struct ath12k_base *sc)
+ {
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -13360,6 +13360,44 @@ ath12k_wmi_pdev_temperature_event(struct
+ 	kfree(tb);
+ }
+ 
++static void ath12k_wmi_thermal_throt_stats_event(struct ath12k_base *ab,
++						 struct sk_buff *skb)
++{
++	struct ath12k *ar;
++	const void **tb;
++	int ret;
++	struct wmi_therm_throt_stats_event *ev;
++
++	tb = ath12k_wmi_tlv_parse_alloc(ab, skb->data, skb->len, GFP_ATOMIC);
++	if (IS_ERR(tb)) {
++		ret = PTR_ERR(tb);
++		ath12k_err(ab, "failed to parse tlv: %d\n", ret);
++		return;
++	}
++
++	ev = tb[WMI_TAG_THERM_THROT_STATS_EVENT];
++	if (!ev) {
++		ath12k_err(ab, "failed to fetch thermal throt stats ev");
++		goto err;
++	}
++
++	/* Print debug only if DUT temperature is not in optimal range as this
++	 * event is received once on every 2 DC
++	 */
++	if (ev->level > 0)
++		ath12k_dbg(ab, ATH12K_DBG_WMI, "thermal stats ev level %d pdev_id %d\n",
++			   ev->level, ev->pdev_id);
++
++	ar = ath12k_mac_get_ar_by_pdev_id(ab, ev->pdev_id);
++	if (!ar)
++		goto err;
++
++	ath12k_thermal_event_throt_level(ar, ev->level);
++
++err:
++	kfree(tb);
++}
++
+ static void ath12k_fils_discovery_event(struct ath12k_base *ab,
+ 					struct sk_buff *skb)
+ {
+@@ -14650,6 +14688,9 @@ static void ath12k_wmi_op_rx(struct ath1
+ 	case WMI_PDEV_TEMPERATURE_EVENTID:
+ 		ath12k_wmi_pdev_temperature_event(ab, skb);
+ 		break;
++	case WMI_THERM_THROT_STATS_EVENTID:
++		ath12k_wmi_thermal_throt_stats_event(ab, skb);
++		break;
+ 	case WMI_PDEV_DMA_RING_BUF_RELEASE_EVENTID:
+ 		ath12k_wmi_pdev_dma_ring_buf_release_event(ab, skb);
+ 		break;
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -1016,6 +1016,7 @@ enum wmi_tlv_event_id {
+ 	WMI_READ_DATA_FROM_FLASH_EVENTID,
+ 	WMI_REPORT_RX_AGGR_FAILURE_EVENTID,
+ 	WMI_PKGID_EVENTID,
++	WMI_THERM_THROT_STATS_EVENTID,
+ 	WMI_MUEDCA_PARAMS_CONFIG_EVENTID = 0x1d01e,
+ 	WMI_GPIO_INPUT_EVENTID = WMI_TLV_CMD(WMI_GRP_GPIO),
+ 	WMI_UPLOADH_EVENTID,
+@@ -4806,7 +4807,7 @@ struct wmi_init_country_cmd {
+ 	} cc_info;
+ } __packed;
+ 
+-#define THERMAL_LEVELS  1
++#define THERMAL_LEVELS  4
+ struct tt_level_config {
+ 	u32 tmplwm;
+ 	u32 tmphwm;
+@@ -4814,6 +4815,13 @@ struct tt_level_config {
+ 	u32 priority;
+ };
+ 
++struct wmi_therm_throt_stats_event {
++	__le32 pdev_id;
++	__le32 temp;
++	__le32 level;
++	__le32 therm_throt_levels;
++} __packed;
++
+ struct ath12k_wmi_thermal_mitigation_arg {
+ 	u32 pdev_id;
+ 	u32 enable;

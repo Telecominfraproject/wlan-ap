@@ -1,0 +1,143 @@
+From 077c7df9abec7849088f35d09f8c27d18fe995f2 Mon Sep 17 00:00:00 2001
+From: Hari Naraayana Desikan Kannan <quic_hnaraaya@quicinc.com>
+Date: Wed, 18 Sep 2024 11:22:32 +0530
+Subject: [PATCH] wifi: mac80211: handle radar detection on multiple radios.
+
+Currently DFS works under assumption there could be only one channel
+context in the hardware. Hence, drivers just calls the function
+ieee80211_radar_detected() passing the hardware structure. However,
+with MLO, this obviously will not work since number of channel
+contexts will be more than one and hence drivers would need to pass
+the channel information as well on which the radar is detected.
+
+Also, when radar is detected in one of the links, other link's CAC
+should not be cancelled.
+
+Hence, in order to support DFS with MLO, do the following changes -
+  * Add channel pointer as an argument to the function
+    ieee80211_dfs_cac_cancel(). During MLO, drivers would have to
+    pass on which channel context radar is detected.
+    Otherwise, drivers could just pass NULL.
+  * ieee80211_dfs_cac_cancel() will iterate over all links present and
+        * if channel is passed, only mark that link as radar detected
+        * if NULL is passed, then mark all channel contexts as radar
+          detected
+        * Then post cac ABORT to that link.
+
+This would also help in scenarios where there is split phy 5 GHz radio,
+which is capable of DFS channels in both lower and upper band. In this
+case, simultaneous radars can be detected.
+
+Signed-off-by: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Signed-off-by: Hari Naraayana Desikan Kannan <quic_hnaraaya@quicinc.com>
+---
+ net/mac80211/ieee80211_i.h |  3 ++-
+ net/mac80211/pm.c          |  2 +-
+ net/mac80211/util.c        | 31 ++++++++++++++++++-------------
+ 3 files changed, 21 insertions(+), 15 deletions(-)
+
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index a6a99d61d270..f5492a2def67 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -2663,7 +2663,8 @@ bool ieee80211_is_radar_required(struct ieee80211_local *local,
+ 
+ void ieee80211_dfs_cac_timer(unsigned long data);
+ void ieee80211_dfs_cac_timer_work(struct work_struct *work);
+-void ieee80211_dfs_cac_cancel(struct ieee80211_local *local);
++void ieee80211_dfs_cac_cancel(struct ieee80211_local *local,
++			      struct ieee80211_channel *chan);
+ void ieee80211_dfs_radar_detected_work(struct work_struct *work);
+ void ieee80211_awgn_detected_work(struct work_struct *work);
+ void ieee80211_cw_detected_work(struct work_struct *work);
+diff --git a/net/mac80211/pm.c b/net/mac80211/pm.c
+index 0ccb5701c7f3..1bf3fda704a3 100644
+--- a/net/mac80211/pm.c
++++ b/net/mac80211/pm.c
+@@ -32,7 +32,7 @@ int __ieee80211_suspend(struct ieee80211_hw *hw, struct cfg80211_wowlan *wowlan)
+ 
+ 	ieee80211_scan_cancel(local);
+ 
+-	ieee80211_dfs_cac_cancel(local);
++	ieee80211_dfs_cac_cancel(local, NULL);
+ 
+ 	ieee80211_roc_purge(local, NULL);
+ 
+diff --git a/net/mac80211/util.c b/net/mac80211/util.c
+index 9639d6c49f39..ef239b5c3b17 100644
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -4592,7 +4592,8 @@ u64 ieee80211_calculate_rx_timestamp(struct ieee80211_local *local,
+ 	return ts;
+ }
+ 
+-void ieee80211_dfs_cac_cancel(struct ieee80211_local *local)
++void ieee80211_dfs_cac_cancel(struct ieee80211_local *local,
++			      struct ieee80211_channel *chan)
+ {
+ 	struct ieee80211_sub_if_data *sdata;
+ 	struct cfg80211_chan_def chandef;
+@@ -4611,22 +4612,22 @@ void ieee80211_dfs_cac_cancel(struct ieee80211_local *local)
+ 		 */
+ 		for (link_id = 0; link_id < IEEE80211_MLD_MAX_NUM_LINKS; link_id++) {
+ 			link = sdata_dereference(sdata->link[link_id], sdata);
++			link_conf =
++				rcu_dereference(sdata->vif.link_conf[link_id]);
+ 
+-			if (!link)
++			if (!link || !link_conf)
+ 				continue;
+ 
+-			cancel_delayed_work(&link->dfs_cac_timer_work);
++			chandef = link_conf->chandef;
+ 
+-			if (!sdata->wdev.links[link_id].cac_started)
++			if (chan && chandef.chan != chan)
+ 				continue;
+ 
+-			link_conf =
+-				rcu_dereference(sdata->vif.link_conf[link_id]);
++			cancel_delayed_work(&link->dfs_cac_timer_work);
+ 
+-			if (!link_conf)
++			if (!sdata->wdev.links[link_id].cac_started)
+ 				continue;
+ 
+-			chandef = link_conf->chandef;
+ 			ieee80211_link_release_channel(link);
+ 			cfg80211_cac_event(sdata->dev, &chandef,
+ 					   NL80211_RADAR_CAC_ABORTED,
+@@ -4765,6 +4766,7 @@ ieee80211_dfs_radar_detected_processing(struct ieee80211_local *local,
+ 	struct cfg80211_chan_def *radar_chandef = NULL;
+ 	struct ieee80211_chanctx *ctx;
+ 	int num_chanctx = 0;
++	struct ieee80211_channel *chan;
+ 
+ 	mutex_lock(&local->chanctx_mtx);
+ 	list_for_each_entry(ctx, &local->chanctx_list, list) {
+@@ -4780,14 +4782,17 @@ ieee80211_dfs_radar_detected_processing(struct ieee80211_local *local,
+ 	}
+ 	mutex_unlock(&local->chanctx_mtx);
+ 
+-	wiphy_lock(local->hw.wiphy);
+-	ieee80211_dfs_cac_cancel(local);
+-	wiphy_unlock(local->hw.wiphy);
++	chan = chandef.chan;
++	chandef.radar_bitmap = radar_bitmap;
+ 
+-	if (radar_chandef)
++	if (radar_chandef) {
+ 		radar_chandef->radar_bitmap = radar_bitmap;
++		chan = radar_chandef->chan;
++	}
+ 
+-	chandef.radar_bitmap = radar_bitmap;
++	wiphy_lock(local->hw.wiphy);
++	ieee80211_dfs_cac_cancel(local, chan);
++	wiphy_unlock(local->hw.wiphy);
+ 
+ 	if (num_chanctx > 1) {
+ 		if (local->hw.wiphy->flags & WIPHY_FLAG_SUPPORTS_MLO) {
+-- 
+2.34.1
+

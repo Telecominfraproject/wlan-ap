@@ -1,0 +1,171 @@
+From 3d387ea1286e4c1925ee647647440be1bb848516 Mon Sep 17 00:00:00 2001
+From: Rameshkumar Sundaram <quic_ramess@quicinc.com>
+Date: Tue, 28 May 2024 22:03:06 +0530
+Subject: [PATCH] wifi: mac80211: set critical update for non-transmitting BSS
+
+Add support in MAC80211 to handle modified critical update bitmap
+for both transmitting and non-transmitting BSS.
+
+Patch-depdendency: 855-02-mac80211-cfg80211-Parse-NL-attribute-to-set-critical.patch
+
+Signed-off-by: Rameshkumar Sundaram <quic_ramess@quicinc.com>
+Signed-off-by: Mohan Kumar G <quic_mkumarg@quicinc.com>
+---
+ net/mac80211/cfg.c | 98 +++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 84 insertions(+), 14 deletions(-)
+
+diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
+index 5382926..58af8d6 100644
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -1408,6 +1408,78 @@ ieee80211_assign_beacon(struct ieee80211_sub_if_data *sdata,
+ 	return 0;
+ }
+ 
++static int ieee80211_set_critical_update(struct ieee80211_sub_if_data *sdata,
++					 unsigned int link_id,
++					 struct cfg80211_set_cu_params *params,
++					 bool update)
++{
++	struct ieee80211_vif *vif = &sdata->vif;
++	struct ieee80211_link_data *link;
++
++	if (!ieee80211_vif_is_mld(vif))
++		return 0;
++
++	rcu_read_lock();
++	link = rcu_dereference(sdata->link[link_id]);
++	if (!link || !params || (!params->elemid_added_bmap &&
++				 !params->elemid_modified_bmap)) {
++		rcu_read_unlock();
++		return -EINVAL;
++	}
++
++	if (BIT(link->conf->bssid_index) & params->elemid_added_bmap)
++		link->conf->elemid_added = update;
++	if (BIT(link->conf->bssid_index) & params->elemid_modified_bmap)
++		link->conf->elemid_modified = update;
++
++	if (!(params->elemid_added_bmap & ~BIT(0)) &&
++	    !(params->elemid_modified_bmap & ~BIT(0))) {
++		/* None of the Non-TX BSS is due for CU.
++		 */
++		rcu_read_unlock();
++		return 0;
++	}
++
++	/* Only TX BSS is allowed to set CU for its Non-TX BSSes and not
++	 * Vice versa.
++	 */
++	if (link->conf->mbssid_tx_vif == vif &&
++	    link->conf->mbssid_tx_vif_linkid == link->conf->link_id) {
++		unsigned int link_id_iter;
++		unsigned long valid_links;
++		struct ieee80211_sub_if_data *iter;
++		struct ieee80211_link_data *link_iter;
++
++		list_for_each_entry_rcu(iter, &sdata->local->interfaces, list) {
++			if (!ieee80211_sdata_running(iter) || iter == sdata)
++				continue;
++
++			/* check link 0 by default for Non-ML non-tx vif's deflinks */
++			valid_links = iter->vif.valid_links | BIT(0);
++			for_each_set_bit(link_id_iter, &valid_links,
++					 IEEE80211_MLD_MAX_NUM_LINKS) {
++				link_iter = rcu_dereference(iter->link[link_id_iter]);
++				if (!link_iter)
++					continue;
++				/* Check if any of link of iterator sdata belongs
++				 * to same mbssid group as the tx link
++				 */
++				if (link_iter->conf->mbssid_tx_vif != vif ||
++				    link_iter->conf->mbssid_tx_vif_linkid != link->link_id)
++					continue;
++				if (BIT(link_iter->conf->bssid_index) &
++					params->elemid_added_bmap)
++					link_iter->conf->elemid_added = update;
++				if (BIT(link_iter->conf->bssid_index) &
++					params->elemid_modified_bmap)
++					link_iter->conf->elemid_modified = update;
++			}
++		}
++	}
++	rcu_read_unlock();
++	return 0;
++}
++
+ static int ieee80211_start_ap(struct wiphy *wiphy, struct net_device *dev,
+ 			      struct cfg80211_ap_settings *params)
+ {
+@@ -1664,8 +1736,7 @@ static int ieee80211_start_ap(struct wiphy *wiphy, struct net_device *dev,
+ 		goto error;
+ 	changed |= BSS_CHANGED_UNSOL_BCAST_PROBE_RESP;
+ 
+-	link_conf->elemid_added = params->elemid_added;
+-	link_conf->elemid_modified = params->elemid_modified;
++	ieee80211_set_critical_update(sdata, link_id, &params->beacon.cu_params, true);
+ 	err = drv_start_ap(sdata->local, sdata, link_conf);
+ 	if (err) {
+ 		old = sdata_dereference(link->u.ap.beacon, sdata);
+@@ -1674,8 +1745,7 @@ static int ieee80211_start_ap(struct wiphy *wiphy, struct net_device *dev,
+ 			kfree_rcu(old, rcu_head);
+ 		RCU_INIT_POINTER(link->u.ap.beacon, NULL);
+ 		sdata->u.ap.active = false;
+-		link_conf->elemid_added = 0;
+-		link_conf->elemid_modified = 0;
++		ieee80211_set_critical_update(sdata, link_id, &params->beacon.cu_params, false);
+ 		goto error;
+ 	}
+ 
+@@ -1687,8 +1757,7 @@ static int ieee80211_start_ap(struct wiphy *wiphy, struct net_device *dev,
+ 	list_for_each_entry(vlan, &sdata->u.ap.vlans, u.vlan.list)
+ 		netif_carrier_on(vlan->dev);
+ 
+-	link_conf->elemid_added = 0;
+-	link_conf->elemid_modified = 0;
++	ieee80211_set_critical_update(sdata, link_id, &params->beacon.cu_params, false);
+ 	return 0;
+ 
+ error:
+@@ -1767,12 +1836,11 @@ static int ieee80211_update_ap(struct wiphy *wiphy, struct net_device *dev,
+ 		return err;
+ 	changed |= BSS_CHANGED_UNSOL_BCAST_PROBE_RESP;
+ 
+-	link_conf->elemid_added = params->elemid_added;
+-	link_conf->elemid_modified = params->elemid_modified;
+-
++	ieee80211_set_critical_update(sdata, link->link_id,
++				      &params->beacon.cu_params, true);
+ 	ieee80211_link_info_change_notify(sdata, link, changed);
+-	link_conf->elemid_added = 0;
+-	link_conf->elemid_modified = 0;
++	ieee80211_set_critical_update(sdata, link->link_id,
++				      &params->beacon.cu_params, false);
+ 	return 0;
+ }
+ 
+@@ -4530,8 +4598,9 @@ __ieee80211_channel_switch(struct wiphy *wiphy, struct net_device *dev,
+ 	if (err)
+ 		goto out;
+ 	changed |= BSS_CHANGED_UNSOL_BCAST_PROBE_RESP;
+-	link_conf->elemid_added = params->beacon_csa_cu;
+-	link->u.ap.after_beacon_cu = params->beacon_after_cu;
++	link_conf->elemid_added = params->beacon_csa.cu_params.elemid_added_bmap ? true : false;
++	link->u.ap.after_beacon_cu =
++		params->beacon_after.cu_params.elemid_modified_bmap ? true : false;
+ 
+ 	/* should we pass link_id here ? */
+ 	err = drv_pre_channel_switch(sdata, &ch_switch);
+@@ -5638,7 +5707,8 @@ ieee80211_color_change(struct wiphy *wiphy, struct net_device *dev,
+ 
+ 	link_conf->color_change_active = true;
+ 	link_conf->color_change_color = params->color;
+-	link_conf->elemid_added = params->elemid_added;
++	link_conf->elemid_added =
++		params->beacon_next.cu_params.elemid_added_bmap ? true : false;
+ 
+ 	err = ieee80211_set_unsol_bcast_probe_resp(sdata, &params->unsol_bcast_probe_resp,
+ 						   link, link_conf);
+-- 
+2.34.1
+

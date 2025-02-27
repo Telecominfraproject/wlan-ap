@@ -1,0 +1,846 @@
+From dbf7bf265a27b842f43444e9c583528ba497ed75 Mon Sep 17 00:00:00 2001
+From: Sriram R <quic_srirrama@quicinc.com>
+Date: Wed, 29 Dec 2021 11:35:10 +0530
+Subject: [PATCH] ath12k: Cache configs for vdev before actual vdev create
+
+Since the vdev create for a corresponding vif is deferred
+until a channel is assigned, cache the information which
+are received through mac80211 ops and set them once the
+vdev is created on one of the ath12k radios.
+
+Also get ar from arvif based on the state while handling
+mac80211 ops.
+
+Signed-off-by: Sriram R <quic_srirrama@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h        |  20 +
+ drivers/net/wireless/ath/ath12k/debugfs_sta.c |  13 +-
+ drivers/net/wireless/ath/ath12k/mac.c         | 367 ++++++++++++++----
+ drivers/net/wireless/ath/ath12k/mac.h         |   1 +
+ drivers/net/wireless/ath/ath12k/testmode.c    |  13 +-
+ 5 files changed, 345 insertions(+), 69 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index e7c56c8..6d87ce2 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -200,6 +200,25 @@ enum ath12k_monitor_flags {
+ 	MONITOR_CONF_ENABLED,
+ };
+ 
++struct ath12k_tx_conf {
++	bool changed;
++	u16 ac;
++	struct ieee80211_tx_queue_params tx_queue_params;
++};
++
++struct ath12k_key_conf {
++	bool changed;
++	enum set_key_cmd cmd;
++	struct ieee80211_sta *sta;
++	struct ieee80211_key_conf *key;
++};
++
++struct ath12k_vif_cache {
++	struct ath12k_tx_conf tx_conf;
++	struct ath12k_key_conf key_conf;
++	u64 bss_conf_changed;
++};
++
+ struct ath12k_vif {
+ 	u32 vdev_id;
+ 	enum wmi_vdev_type vdev_type;
+@@ -257,6 +276,7 @@ struct ath12k_vif {
+ 	u8 nontransmitting_vif_count;
+ 	bool bcca_zero_sent;
+ 	bool do_not_send_tmpl;
++	struct ath12k_vif_cache cache;
+ #ifdef CPTCFG_ATH12K_DEBUGFS
+ 	struct dentry *debugfs_twt;
+ #endif /* CPTCFG_ATH12K_DEBUGFS */
+diff --git a/drivers/net/wireless/ath/ath12k/debugfs_sta.c b/drivers/net/wireless/ath/ath12k/debugfs_sta.c
+index 88c08a9..6fb6831 100644
+--- a/drivers/net/wireless/ath/ath12k/debugfs_sta.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs_sta.c
+@@ -1059,7 +1059,16 @@ static const struct file_operations fops_htt_peer_stats_reset = {
+ void ath12k_debugfs_sta_op_add(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			       struct ieee80211_sta *sta, struct dentry *dir)
+ {
+-	struct ath12k *ar = hw->priv;
++	struct ath12k *ar;
++	struct ath12k_hw *ah = hw->priv;
++
++	mutex_lock(&ah->conf_mutex);
++
++	ar = ath12k_get_ar_by_vif(hw, vif);
++	if (!ar) {
++		mutex_unlock(&ah->conf_mutex);
++		return;
++	}
+ 
+ 	if (ath12k_debugfs_is_extd_tx_stats_enabled(ar))
+ 		debugfs_create_file("tx_stats", 0400, dir, sta,
+@@ -1083,4 +1092,6 @@ void ath12k_debugfs_sta_op_add(struct ieee80211_hw *hw, struct ieee80211_vif *vi
+ 		     ar->ab->wmi_ab.svc_map))
+ 		debugfs_create_file("htt_peer_stats_reset", 0600, dir, sta,
+ 				    &fops_htt_peer_stats_reset);
++
++	mutex_unlock(&ah->conf_mutex);
+ }
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 0c2d9dc..ab72e20 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -248,7 +248,7 @@ static const u32 ath12k_smps_map[] = {
+ };
+ 
+ static int ath12k_mac_vdev_create(struct ath12k *ar, struct ieee80211_vif *vif);
+-static int ath12k_start_vdev_delay(struct ieee80211_hw *hw,
++static int ath12k_start_vdev_delay(struct ath12k *ar,
+ 				   struct ieee80211_vif *vif);
+ 
+ enum nl80211_he_ru_alloc ath12k_mac_phy_he_ru_to_nl80211_he_ru_alloc(u16 ru_phy)
+@@ -795,6 +795,25 @@ static struct ath12k *ath12k_get_ar_by_ctx(struct ieee80211_hw *hw,
+ 	return ath12k_mac_get_ar_by_band(hw, ctx->def.chan->band);
+ }
+ 
++struct ath12k *ath12k_get_ar_by_vif(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
++{
++	struct ath12k_vif *arvif;
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar = NULL;
++
++	lockdep_assert_held(&ah->conf_mutex);
++
++	if (!vif)
++		return NULL;
++
++	arvif = ath12k_vif_to_arvif(vif);
++
++	if (arvif->is_created)
++		ar = arvif->ar;
++
++	return ar;
++}
++
+ struct ath12k *ath12k_mac_get_ar_by_vdev_id(struct ath12k_base *ab, u32 vdev_id)
+ {
+ 	int i;
+@@ -3233,11 +3252,10 @@ static bool ath12k_mac_set_eht_txbf_conf(struct ath12k_vif *arvif)
+ 	return true;
+ }
+ 
+-static void ath12k_bss_assoc(struct ieee80211_hw *hw,
++static void ath12k_bss_assoc(struct ath12k *ar,
+ 			     struct ieee80211_vif *vif,
+ 			     struct ieee80211_bss_conf *bss_conf)
+ {
+-	struct ath12k *ar = hw->priv;
+ 	struct ath12k_vif *arvif = (void *)vif->drv_priv;
+ 	struct ath12k_wmi_peer_assoc_arg peer_arg;
+ 	struct ieee80211_sta *ap_sta;
+@@ -3342,10 +3360,9 @@ static void ath12k_bss_assoc(struct ieee80211_hw *hw,
+ 			    arvif->vdev_id, ret);
+ }
+ 
+-static void ath12k_bss_disassoc(struct ieee80211_hw *hw,
++static void ath12k_bss_disassoc(struct ath12k *ar,
+ 				struct ieee80211_vif *vif)
+ {
+-	struct ath12k *ar = hw->priv;
+ 	struct ath12k_vif *arvif = (void *)vif->drv_priv, *tx_arvif;
+ 	int ret;
+ 
+@@ -3653,12 +3670,11 @@ static int ath12k_mac_config_obss_pd(struct ath12k *ar,
+ 	return 0;
+ }
+ 
+-static void ath12k_mac_op_bss_info_changed(struct ieee80211_hw *hw,
+-					   struct ieee80211_vif *vif,
+-					   struct ieee80211_bss_conf *info,
+-					   u64 changed)
++static void ath12k_mac_bss_info_changed(struct ath12k *ar,
++					struct ieee80211_vif *vif,
++					struct ieee80211_bss_conf *info,
++					u64 changed)
+ {
+-	struct ath12k *ar = hw->priv;
+ 	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
+ 	struct cfg80211_chan_def def;
+ 	u32 param_id, param_value;
+@@ -3673,7 +3689,7 @@ static void ath12k_mac_op_bss_info_changed(struct ieee80211_hw *hw,
+ 	u32 rate;
+ 	bool color_collision_detect;
+ 
+-	mutex_lock(&ar->conf_mutex);
++	lockdep_assert_held(&ar->conf_mutex);
+ 
+ 	if (changed & BSS_CHANGED_BEACON_INT) {
+ 		arvif->beacon_interval = info->beacon_int;
+@@ -3865,9 +3881,9 @@ static void ath12k_mac_op_bss_info_changed(struct ieee80211_hw *hw,
+ 
+ 	if (changed & BSS_CHANGED_ASSOC) {
+ 		if (vif->cfg.assoc)
+-			ath12k_bss_assoc(hw, vif, info);
++			ath12k_bss_assoc(ar, vif, info);
+ 		else
+-			ath12k_bss_disassoc(hw, vif);
++			ath12k_bss_disassoc(ar, vif);
+ 	}
+ 
+ 	if (changed & BSS_CHANGED_TXPOWER) {
+@@ -4007,6 +4023,31 @@ static void ath12k_mac_op_bss_info_changed(struct ieee80211_hw *hw,
+ 	mutex_unlock(&ar->conf_mutex);
+ }
+ 
++static void ath12k_mac_op_bss_info_changed(struct ieee80211_hw *hw,
++					   struct ieee80211_vif *vif,
++					   struct ieee80211_bss_conf *info,
++					   u64 changed)
++{
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
++	struct ath12k *ar;
++
++	mutex_lock(&ah->conf_mutex);
++	if (!arvif->is_created) {
++		arvif->cache.bss_conf_changed |= changed;
++		mutex_unlock(&ah->conf_mutex);
++		return;
++	}
++	ar = arvif->ar;
++
++	mutex_lock(&ar->conf_mutex);
++
++	ath12k_mac_bss_info_changed(ar, vif, info, changed);
++
++	mutex_unlock(&ar->conf_mutex);
++	mutex_unlock(&ah->conf_mutex);
++}
++
+ static int ath12k_mac_vdev_delete(struct ath12k *ar, struct ieee80211_vif *vif)
+ {
+ 	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
+@@ -4511,31 +4552,41 @@ static int ath12k_clear_peer_keys(struct ath12k_vif *arvif,
+ 	return first_errno;
+ }
+ 
+-static int ath12k_mac_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+-				 struct ieee80211_vif *vif, struct ieee80211_sta *sta,
+-				 struct ieee80211_key_conf *key)
++static int ath12k_mac_set_key(struct ath12k *ar, enum set_key_cmd cmd,
++			      struct ieee80211_vif *vif,
++			      struct ieee80211_sta *sta,
++			      struct ieee80211_key_conf *key)
+ {
+-	struct ath12k *ar = hw->priv;
+-	struct ath12k_base *ab = ar->ab;
+-	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
++	struct ath12k_base *ab;
+ 	struct ath12k_peer *peer;
+ 	struct ath12k_sta *arsta;
+ 	const u8 *peer_addr;
++	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
+ 	int ret = 0;
+ 	u32 flags = 0;
+ 
++	lockdep_assert_held(&ar->ab->ah->conf_mutex);
++
++	ab = ar->ab;
++
+ 	/* BIP needs to be done in software */
+ 	if (key->cipher == WLAN_CIPHER_SUITE_AES_CMAC ||
+ 	    key->cipher == WLAN_CIPHER_SUITE_BIP_GMAC_128 ||
+ 	    key->cipher == WLAN_CIPHER_SUITE_BIP_GMAC_256 ||
+-	    key->cipher == WLAN_CIPHER_SUITE_BIP_CMAC_256)
+-		return 1;
++	    key->cipher == WLAN_CIPHER_SUITE_BIP_CMAC_256) {
++		ret = 1;
++		goto out;
++	}
+ 
+-	if (test_bit(ATH12K_FLAG_HW_CRYPTO_DISABLED, &ar->ab->dev_flags))
+-		return 1;
++	if (test_bit(ATH12K_FLAG_HW_CRYPTO_DISABLED, &ar->ab->dev_flags)) {
++		ret = 1;
++		goto out;
++	}
+ 
+-	if (key->keyidx > WMI_MAX_KEY_INDEX)
+-		return -ENOSPC;
++	if (key->keyidx > WMI_MAX_KEY_INDEX) {
++		ret = -ENOSPC;
++		goto out;
++	}
+ 
+ 	mutex_lock(&ar->conf_mutex);
+ 
+@@ -4631,6 +4682,39 @@ static int ath12k_mac_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 
+ exit:
+ 	mutex_unlock(&ar->conf_mutex);
++out:
++	return ret;
++}
++
++static int ath12k_mac_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
++				 struct ieee80211_vif *vif, struct ieee80211_sta *sta,
++				 struct ieee80211_key_conf *key)
++{
++	struct ath12k *ar;
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
++	int ret;
++
++	mutex_lock(&ah->conf_mutex);
++
++	if (!arvif->is_created) {
++		arvif->cache.key_conf.cmd = cmd;
++		arvif->cache.key_conf.sta = sta;
++		arvif->cache.key_conf.key = key;
++		arvif->cache.key_conf.changed = true;
++
++		mutex_unlock(&ah->conf_mutex);
++
++		/* STA should be NULL before vdev create else need to warn */
++		WARN_ON(sta);
++
++		return 0;
++	}
++
++	ar = arvif->ar;
++	ret = ath12k_mac_set_key(ar, cmd, vif, sta, key);
++
++	mutex_unlock(&ah->conf_mutex);
+ 	return ret;
+ }
+ 
+@@ -5255,7 +5339,7 @@ static int ath12k_mac_station_add(struct ath12k *ar,
+ 	if (ab->hw_params->vdev_start_delay &&
+ 	    !arvif->is_started &&
+ 	    arvif->vdev_type != WMI_VDEV_TYPE_AP) {
+-		ret = ath12k_start_vdev_delay(ar->hw, vif);
++		ret = ath12k_start_vdev_delay(ar, vif);
+ 		if (ret) {
+ 			ath12k_warn(ab, "failed to delay vdev start: %d\n", ret);
+ 			goto free_tx_stats;
+@@ -5315,12 +5399,21 @@ static int ath12k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 				   enum ieee80211_sta_state old_state,
+ 				   enum ieee80211_sta_state new_state)
+ {
+-	struct ath12k *ar = hw->priv;
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar;
+ 	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
+ 	struct ath12k_sta *arsta = (struct ath12k_sta *)sta->drv_priv;
+ 	struct ath12k_peer *peer;
+ 	int ret = 0;
+ 
++	mutex_lock(&ah->conf_mutex);
++
++	ar = ath12k_get_ar_by_vif(hw, vif);
++	if (!ar) {
++		mutex_unlock(&ah->conf_mutex);
++		return -EINVAL;
++	}
++
+ 	/* cancel must be done outside the mutex to avoid deadlock */
+ 	if ((old_state == IEEE80211_STA_NONE &&
+ 	     new_state == IEEE80211_STA_NOTEXIST)) {
+@@ -5456,6 +5549,7 @@ static int ath12k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 	}
+ 
+ 	mutex_unlock(&ar->conf_mutex);
++	mutex_unlock(&ah->conf_mutex);
+ 	return ret;
+ }
+ 
+@@ -5463,21 +5557,34 @@ static int ath12k_mac_op_sta_set_txpwr(struct ieee80211_hw *hw,
+ 				       struct ieee80211_vif *vif,
+ 				       struct ieee80211_sta *sta)
+ {
+-	struct ath12k *ar = hw->priv;
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar;
+ 	struct ath12k_vif *arvif = (void *)vif->drv_priv;
+ 	int ret;
+ 	s16 txpwr;
+ 
++	mutex_lock(&ah->conf_mutex);
++
++	ar = ath12k_get_ar_by_vif(hw, vif);
++	if (!ar) {
++		ret = -EINVAL;
++		goto out;
++	}
++
+ 	if (sta->deflink.txpwr.type == NL80211_TX_POWER_AUTOMATIC) {
+ 		txpwr = 0;
+ 	} else {
+ 		txpwr = sta->deflink.txpwr.power;
+-		if (!txpwr)
+-			return -EINVAL;
++		if (!txpwr) {
++			ret = -EINVAL;
++			goto out;
++		}
+ 	}
+ 
+-	if (txpwr > ATH12K_TX_POWER_MAX_VAL || txpwr < ATH12K_TX_POWER_MIN_VAL)
+-		return -EINVAL;
++	if (txpwr > ATH12K_TX_POWER_MAX_VAL || txpwr < ATH12K_TX_POWER_MIN_VAL) {
++		ret = -EINVAL;
++		goto out;
++	}
+ 
+ 	mutex_lock(&ar->conf_mutex);
+ 
+@@ -5486,11 +5593,13 @@ static int ath12k_mac_op_sta_set_txpwr(struct ieee80211_hw *hw,
+ 	if (ret) {
+ 		ath12k_warn(ar->ab, "failed to set tx power for station ret: %d\n",
+ 			    ret);
+-		goto out;
++		goto err;
+ 	}
+ 
+-out:
++err:
+ 	mutex_unlock(&ar->conf_mutex);
++out:
++	mutex_unlock(&ah->conf_mutex);
+ 	return ret;
+ }
+ 
+@@ -5512,17 +5621,27 @@ static void ath12k_mac_op_sta_rc_update(struct ieee80211_hw *hw,
+ 					struct ieee80211_sta *sta,
+ 					u32 changed)
+ {
+-	struct ath12k *ar = hw->priv;
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar;
+ 	struct ath12k_sta *arsta = (struct ath12k_sta *)sta->drv_priv;
+ 	struct ath12k_vif *arvif = (void *)vif->drv_priv;
+ 	struct ath12k_peer *peer;
+ 	u32 bw, smps;
+ 
++	mutex_lock(&ah->conf_mutex);
++
++	ar = ath12k_get_ar_by_vif(hw, vif);
++	if (!ar) {
++		mutex_unlock(&ah->conf_mutex);
++		return;
++	}
++
+ 	spin_lock_bh(&ar->ab->base_lock);
+ 
+ 	peer = ath12k_peer_find(ar->ab, arvif->vdev_id, sta->addr);
+ 	if (!peer) {
+ 		spin_unlock_bh(&ar->ab->base_lock);
++		mutex_unlock(&ah->conf_mutex);
+ 		ath12k_warn(ar->ab, "mac sta rc update failed to find peer %pM on vdev %i\n",
+ 			    sta->addr, arvif->vdev_id);
+ 		return;
+@@ -5573,6 +5692,7 @@ static void ath12k_mac_op_sta_rc_update(struct ieee80211_hw *hw,
+ 	arsta->changed |= changed;
+ 
+ 	spin_unlock_bh(&ar->data_lock);
++	mutex_unlock(&ah->conf_mutex);
+ 
+ 	ieee80211_queue_work(hw, &arsta->update_wk);
+ }
+@@ -5634,17 +5754,18 @@ exit:
+ 	return ret;
+ }
+ 
+-static int ath12k_mac_op_conf_tx(struct ieee80211_hw *hw,
+-				 struct ieee80211_vif *vif,
+-				 unsigned int link_id, u16 ac,
+-				 const struct ieee80211_tx_queue_params *params)
++static int ath12k_mac_conf_tx(struct ath12k *ar,
++			      struct ieee80211_vif *vif, u16 ac,
++			      const struct ieee80211_tx_queue_params *params)
+ {
+-	struct ath12k *ar = hw->priv;
+ 	struct ath12k_vif *arvif = (void *)vif->drv_priv;
+ 	struct wmi_wmm_params_arg *p = NULL;
+ 	int ret;
+ 
+-	mutex_lock(&ar->conf_mutex);
++	lockdep_assert_held(&ar->conf_mutex);
++
++	if (!arvif->is_created)
++		return -EINVAL;
+ 
+ 	switch (ac) {
+ 	case IEEE80211_AC_VO:
+@@ -5684,7 +5805,38 @@ static int ath12k_mac_op_conf_tx(struct ieee80211_hw *hw,
+ 		ath12k_warn(ar->ab, "failed to set sta uapsd: %d\n", ret);
+ 
+ exit:
++	return ret;
++}
++
++static int ath12k_mac_op_conf_tx(struct ieee80211_hw *hw,
++				 struct ieee80211_vif *vif,
++				 unsigned int link_id, u16 ac,
++				 const struct ieee80211_tx_queue_params *params)
++{
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar;
++	struct ath12k_vif *arvif = (void *)vif->drv_priv;
++	int ret;
++
++	/* If the tx config is received before a vdev is assigned to vif
++	 * cache the info to be updated once vdev is created
++	 */
++	mutex_lock(&ah->conf_mutex);
++	if (!arvif->is_created) {
++		arvif->cache.tx_conf.changed = true;
++		arvif->cache.tx_conf.ac = ac;
++		arvif->cache.tx_conf.tx_queue_params = *params;
++		mutex_unlock(&ah->conf_mutex);
++		return 0;
++	}
++	mutex_unlock(&ah->conf_mutex);
++
++	ar = arvif->ar;
++
++	mutex_lock(&ar->conf_mutex);
++	ret = ath12k_mac_conf_tx(ar, vif, ac, params);
+ 	mutex_unlock(&ar->conf_mutex);
++
+ 	return ret;
+ }
+ 
+@@ -7030,10 +7182,9 @@ static int ath12k_mac_setup_vdev_create_args(struct ath12k_vif *arvif,
+ 	return 0;
+ }
+ 
+-static void ath12k_mac_op_update_vif_offload(struct ieee80211_hw *hw,
+-					     struct ieee80211_vif *vif)
++static void ath12k_mac_update_vif_offload(struct ath12k *ar,
++					  struct ieee80211_vif *vif)
+ {
+-	struct ath12k *ar = hw->priv;
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
+ 	u32 param_id, param_value;
+@@ -7077,6 +7228,31 @@ static void ath12k_mac_op_update_vif_offload(struct ieee80211_hw *hw,
+ 	}
+ }
+ 
++static void ath12k_mac_op_update_vif_offload(struct ieee80211_hw *hw,
++					     struct ieee80211_vif *vif)
++{
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar;
++	struct ath12k_vif *arvif = ath12k_vif_to_arvif(vif);
++
++	mutex_lock(&ah->conf_mutex);
++
++	/* If the update_vif_offload() is received from mac80211 before
++	 * vdev is created, no action is needed since the flags would
++	 * be applied right after vdev create based on vif->offload_flags
++	 */
++	ar = ath12k_get_ar_by_vif(hw, vif);
++	if (!ar) {
++		mutex_unlock(&ah->conf_mutex);
++		return;
++	}
++
++	ath12k_mac_update_vif_offload(ar, vif);
++	ath12k_dp_tx_update_bank_profile(arvif);
++
++	mutex_unlock(&ah->conf_mutex);
++}
++
+ static int ath12k_mac_vdev_create(struct ath12k *ar, struct ieee80211_vif *vif)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+@@ -7169,7 +7345,7 @@ static int ath12k_mac_vdev_create(struct ath12k *ar, struct ieee80211_vif *vif)
+ 	list_add(&arvif->list, &ar->arvifs);
+ 	spin_unlock_bh(&ar->data_lock);
+ 
+-	ath12k_mac_op_update_vif_offload(hw, vif);
++	ath12k_mac_update_vif_offload(ar, vif);
+ 
+ 	nss = hweight32(ar->cfg_tx_chainmask) ? : 1;
+ 	ret = ath12k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
+@@ -7308,6 +7484,39 @@ err:
+ 	return ret;
+ }
+ 
++static void ath12k_mac_vif_cache_flush(struct ath12k *ar,  struct ieee80211_vif *vif)
++{
++	struct ath12k_hw *ah = ar->ab->ah;
++	struct ath12k_vif *arvif = (void *)vif->drv_priv;
++	int ret;
++
++	lockdep_assert_held(&ah->conf_mutex);
++
++	if (arvif->cache.tx_conf.changed) {
++		ret = ath12k_mac_conf_tx(ar, vif, arvif->cache.tx_conf.ac,
++					 &arvif->cache.tx_conf.tx_queue_params);
++		if (ret)
++			ath12k_warn(ar->ab,
++				    "unable to apply tx config parameters to vdev %d\n", ret);
++	}
++
++	if (arvif->cache.bss_conf_changed) {
++		ath12k_mac_bss_info_changed(ar, vif, &vif->bss_conf,
++					    arvif->cache.bss_conf_changed);
++	}
++
++	if (arvif->cache.key_conf.changed) {
++		ret = ath12k_mac_set_key(ar, arvif->cache.key_conf.cmd,
++					 vif, arvif->cache.key_conf.sta,
++					 arvif->cache.key_conf.key);
++		if (ret)
++			ath12k_warn(ar->ab, "unable to apply set key param to vdev %d ret %d\n",
++				    arvif->vdev_id, ret);
++	}
++
++	memset(&arvif->cache, 0, sizeof(struct ath12k_vif_cache));
++}
++
+ static struct ath12k *ath12k_mac_assign_vif_to_vdev(struct ieee80211_hw *hw,
+ 						    struct ieee80211_vif *vif,
+ 						    struct ieee80211_chanctx_conf *ctx)
+@@ -7353,9 +7562,10 @@ static struct ath12k *ath12k_mac_assign_vif_to_vdev(struct ieee80211_hw *hw,
+ 		goto unlock;
+ 	}
+ 
+-	/* TODO Apply any parameters for the vdev which were received after
++	/* Apply any parameters for the vdev which were received after
+ 	 * add_interface, corresponding to this vif
+ 	 */
++	ath12k_mac_vif_cache_flush(ar, vif);
+ 
+ unlock:
+ 	mutex_unlock(&ar->conf_mutex);
+@@ -7445,12 +7655,13 @@ static void ath12k_mac_op_remove_interface(struct ieee80211_hw *hw,
+ 	int ret;
+ 
+ 	mutex_lock(&ah->conf_mutex);
+-	if (!arvif->is_created) {
++
++	ar = ath12k_get_ar_by_vif(hw, vif);
++	if (!ar) {
+ 		mutex_unlock(&ah->conf_mutex);
+ 		return;
+ 	}
+ 
+-	ar = arvif->ar;
+ 	ab = ar->ab;
+ 
+ 	mutex_lock(&ar->conf_mutex);
+@@ -7596,9 +7807,18 @@ static int ath12k_mac_op_ampdu_action(struct ieee80211_hw *hw,
+ 				      struct ieee80211_vif *vif,
+ 				      struct ieee80211_ampdu_params *params)
+ {
+-	struct ath12k *ar = hw->priv;
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar;
+ 	int ret = -EINVAL;
+ 
++	mutex_lock(&ah->conf_mutex);
++
++	ar = ath12k_get_ar_by_vif(hw, vif);
++	if (!ar) {
++		mutex_unlock(&ah->conf_mutex);
++		return -EPERM;
++	}
++
+ 	mutex_lock(&ar->conf_mutex);
+ 
+ 	switch (params->action) {
+@@ -7621,6 +7841,7 @@ static int ath12k_mac_op_ampdu_action(struct ieee80211_hw *hw,
+ 	}
+ 
+ 	mutex_unlock(&ar->conf_mutex);
++	mutex_unlock(&ah->conf_mutex);
+ 
+ 	return ret;
+ }
+@@ -8142,10 +8363,9 @@ unlock:
+ 	mutex_unlock(&ah->conf_mutex);
+ }
+ 
+-static int ath12k_start_vdev_delay(struct ieee80211_hw *hw,
++static int ath12k_start_vdev_delay(struct ath12k *ar,
+ 				   struct ieee80211_vif *vif)
+ {
+-	struct ath12k *ar = hw->priv;
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_vif *arvif = (void *)vif->drv_priv;
+ 	int ret;
+@@ -8855,13 +9075,12 @@ ath12k_mac_op_unassign_vif_chanctx(struct ieee80211_hw *hw,
+ 	 * remove_interface() or when there is a change in channel
+ 	 * that moves the vif to a new ar
+ 	 */
+-	if (!arvif->is_created) {
++	ar = ath12k_get_ar_by_vif(hw, vif);
++	if (!ar) {
+ 		mutex_unlock(&ah->conf_mutex);
+ 		WARN_ON(1);
+ 		return;
+ 	}
+-
+-	ar = arvif->ar;
+ 	ab = ar->ab;
+ 
+ 	mutex_lock(&ar->conf_mutex);
+@@ -8879,13 +9098,11 @@ ath12k_mac_op_unassign_vif_chanctx(struct ieee80211_hw *hw,
+ 
+ 	if (arvif->vdev_type == WMI_VDEV_TYPE_MONITOR) {
+ 		ret = ath12k_mac_monitor_stop(ar);
+-		if (ret) {
+-			mutex_unlock(&ar->conf_mutex);
+-			mutex_unlock(&ah->conf_mutex);
+-			return;
+-		}
++		if (ret)
++			goto out;
+ 
+ 		arvif->is_started = false;
++		goto out;
+ 	}
+ 
+ 	ret = ath12k_mac_vdev_stop(arvif);
+@@ -8904,6 +9121,7 @@ ath12k_mac_op_unassign_vif_chanctx(struct ieee80211_hw *hw,
+ 	    test_bit(MONITOR_VDEV_CREATED, &ar->monitor_flags))
+ 		ath12k_mac_monitor_stop(ar);
+ 
++out:
+ 	mutex_unlock(&ar->conf_mutex);
+ 	mutex_unlock(&ah->conf_mutex);
+ }
+@@ -9622,9 +9840,10 @@ ath12k_mac_op_set_bitrate_mask(struct ieee80211_hw *hw,
+ 			       struct ieee80211_vif *vif,
+ 			       const struct cfg80211_bitrate_mask *mask)
+ {
++	struct ath12k_hw *ah = hw->priv;
+ 	struct ath12k_vif *arvif = (void *)vif->drv_priv;
+ 	struct cfg80211_chan_def def;
+-	struct ath12k *ar = arvif->ar;
++	struct ath12k *ar;
+ 	enum nl80211_band band;
+ 	const u8 *ht_mcs_mask;
+ 	const u16 *vht_mcs_mask;
+@@ -9647,6 +9866,14 @@ ath12k_mac_op_set_bitrate_mask(struct ieee80211_hw *hw,
+ 	if (ath12k_mac_vif_chan(vif, &def))
+ 		return -EPERM;
+ 
++	mutex_lock(&ah->conf_mutex);
++
++	ar = ath12k_get_ar_by_vif(hw, vif);
++	if (!ar) {
++		ret = -EPERM;
++		goto out;
++	}
++
+ 	band = def.chan->band;
+ 	ht_mcs_mask = mask->control[band].ht_mcs;
+ 	vht_mcs_mask = mask->control[band].vht_mcs;
+@@ -9655,8 +9882,10 @@ ath12k_mac_op_set_bitrate_mask(struct ieee80211_hw *hw,
+ 	ldpc = !!(ar->ht_cap_info & WMI_HT_CAP_LDPC);
+ 
+ 	sgi = mask->control[band].gi;
+-	if (sgi == NL80211_TXRATE_FORCE_LGI)
+-		return -EINVAL;
++	if (sgi == NL80211_TXRATE_FORCE_LGI) {
++		ret = -EINVAL;
++		goto out;
++	}
+ 
+ 	he_gi = mask->control[band].he_gi;
+ 	he_ltf = mask->control[band].he_ltf;
+@@ -9678,7 +9907,7 @@ ath12k_mac_op_set_bitrate_mask(struct ieee80211_hw *hw,
+ 		if (ret) {
+ 			ath12k_warn(ar->ab, "failed to get single legacy rate for vdev %i: %d\n",
+ 				    arvif->vdev_id, ret);
+-			return ret;
++			goto out;
+ 		}
+ 		ieee80211_iterate_stations_atomic(ar->hw,
+ 						  ath12k_mac_disable_peer_fixed_rate,
+@@ -9735,7 +9964,8 @@ ath12k_mac_op_set_bitrate_mask(struct ieee80211_hw *hw,
+ 			 */
+ 			ath12k_warn(ar->ab,
+ 				    "Setting more than one MCS Value in bitrate mask not supported\n");
+-			return -EINVAL;
++			ret = -EINVAL;
++			goto out;
+ 		}
+ 
+ 		num_rates = ath12k_mac_bitrate_mask_num_he_rates(ar, band,
+@@ -9747,7 +9977,8 @@ ath12k_mac_op_set_bitrate_mask(struct ieee80211_hw *hw,
+ 		    num_rates > 1) {
+ 			ath12k_warn(ar->ab,
+ 				    "Setting more than one HE MCS Value in bitrate mask not supported\n");
+-			return -EINVAL;
++			ret = -EINVAL;
++			goto out;
+ 		}
+ 
+ 		num_rates = ath12k_mac_bitrate_mask_num_eht_rates(ar, band,
+@@ -9759,7 +9990,8 @@ ath12k_mac_op_set_bitrate_mask(struct ieee80211_hw *hw,
+ 		    num_rates > 1) {
+ 			ath12k_warn(ar->ab,
+ 				    "Setting more than one EHT MCS Value in bitrate mask not supported\n");
+-			return -EINVAL;
++			ret =-EINVAL;
++			goto out;
+ 		}
+ 
+ 		mutex_lock(&ar->conf_mutex);
+@@ -9786,7 +10018,8 @@ ath12k_mac_op_set_bitrate_mask(struct ieee80211_hw *hw,
+ 	}
+ 
+ 	mutex_unlock(&ar->conf_mutex);
+-
++out:
++	mutex_unlock(&ah->conf_mutex);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/mac.h b/drivers/net/wireless/ath/ath12k/mac.h
+index 28b1a79..8c4a092 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -94,4 +94,5 @@ void ath12k_mac_get_any_chandef_iter(struct ieee80211_hw *hw,
+                                      struct ieee80211_chanctx_conf *conf,
+                                      void *data);
+ void ath12k_mac_bcn_tx_event(struct ath12k_vif *arvif);
++struct ath12k *ath12k_get_ar_by_vif(struct ieee80211_hw *hw, struct ieee80211_vif *vif);
+ #endif
+diff --git a/drivers/net/wireless/ath/ath12k/testmode.c b/drivers/net/wireless/ath/ath12k/testmode.c
+index 07ceaf4..5b3c382 100644
+--- a/drivers/net/wireless/ath/ath12k/testmode.c
++++ b/drivers/net/wireless/ath/ath12k/testmode.c
+@@ -222,10 +222,21 @@ out:
+ int ath12k_tm_cmd(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		  void *data, int len)
+ {
+-	struct ath12k *ar = hw->priv;
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar;
+ 	struct nlattr *tb[ATH12K_TM_ATTR_MAX + 1];
+ 	int ret;
+ 
++	mutex_lock(&ah->conf_mutex);
++
++	ar = ath12k_get_ar_by_vif(hw, vif);
++	if (!ar) {
++		mutex_unlock(&ah->conf_mutex);
++		return -EINVAL;
++	}
++
++	mutex_unlock(&ah->conf_mutex);
++
+ 	ret = nla_parse(tb, ATH12K_TM_ATTR_MAX, data, len, ath12k_tm_policy,
+ 			NULL);
+ 	if (ret)
+-- 
+2.17.1
+

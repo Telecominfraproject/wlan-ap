@@ -1,0 +1,308 @@
+From 11009e6aa2ba8002d4f503d958b84b8ddba78ca9 Mon Sep 17 00:00:00 2001
+From: Aloka Dixit <quic_alokad@quicinc.com>
+Date: Mon, 23 Sep 2024 17:05:01 -0700
+Subject: [PATCH 4/4] QSDK: wifi: mac80211: add 240 MHz vendor IE support for
+ STA mode
+
+- Store Q-Q 240 MHz vendor IE in the bss data structure for STA mode
+and add it in the Association Request frame sent to AP.
+- Use same data to upgrade from 160 MHz to 320 MHz (with punturing
+bitmap) while generating channel data for the link.
+- Peer association parameters sent to firmware via WMI will reflect
+these bandwidth changes as well.
+
+Patch-dependency: 927-003-QSDK-wifi-mac80211-parse-and-store-240-MHz-vendor-IE.patch
+Patch-work: None
+
+Signed-off-by: Aloka Dixit <quic_alokad@quicinc.com>
+---
+ include/linux/ieee80211.h  |  1 +
+ net/mac80211/ieee80211_i.h |  5 ++++
+ net/mac80211/mlme.c        | 53 ++++++++++++++++++++++++++++++--------
+ net/mac80211/scan.c        |  7 +++++
+ net/mac80211/util.c        | 27 +++++++++++++++++++
+ 5 files changed, 82 insertions(+), 11 deletions(-)
+
+--- a/include/linux/ieee80211.h
++++ b/include/linux/ieee80211.h
+@@ -2165,6 +2165,11 @@ struct ieee80211_eht_operation_info {
+ 	u8 optional[];
+ } __packed;
+ 
++struct ieee80211_qcn_version_vendor_elem {
++	u8 version;
++	u8 subversion;
++}__packed;
++
+ struct ieee80211_240mhz_vendor_oper {
+ 	u8 ccfs1;
+ 	u8 ccfs0;
+@@ -4115,6 +4120,8 @@ struct ieee80211_multiple_bssid_configuration {
+ 
+ #define WLAN_OUI_QCN                           0x8CFDF0
+ #define WLAN_OUI_QCN_TYPE_1                    1
++#define WLAN_OUI_QCN_HEADER_LEN                4 /* WLAN_OUI_QCN + type */
++#define WLAN_OUI_QCN_ATTR_VER                  1
+ #define WLAN_OUI_QCN_ATTR_5GHZ_240MHZ_SUPP     0x0B
+ 
+ #define IEEE80211_EHT_OPER_CTRL_CHANWIDTH_20MHZ        0
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -128,6 +128,9 @@ struct ieee80211_bss {
+ 
+ 	/* Keep track of what bits of information we have valid info for. */
+ 	u8 valid_data;
++
++	struct ieee80211_240mhz_vendor_oper eht_240mhz_capab;
++	u8 eht_240mhz_len;
+ };
+ 
+ /**
+@@ -2602,6 +2605,8 @@ void ieee80211_add_s1g_capab_ie(struct ieee80211_sub_if_data *sdata,
+ void ieee80211_add_aid_request_ie(struct ieee80211_sub_if_data *sdata,
+ 				  struct sk_buff *skb);
+ u8 *ieee80211_ie_build_s1g_cap(u8 *pos, struct ieee80211_sta_s1g_cap *s1g_cap);
++u8 *ieee80211_add_qcn_vendor_ie(struct sk_buff *skb,
++				struct ieee80211_240mhz_vendor_oper *vendor_ie);
+ 
+ /* channel management */
+ bool ieee80211_chandef_ht_oper(const struct ieee80211_ht_operation *ht_oper,
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@ -238,11 +238,12 @@ ieee80211_determine_chantype(struct ieee80211_sub_if_data *sdata,
+ 			     const struct ieee80211_he_operation *he_oper,
+ 			     const struct ieee80211_eht_operation *eht_oper,
+ 			     const struct ieee80211_s1g_oper_ie *s1g_oper,
++			     const struct ieee80211_240mhz_vendor_oper *eht_240mhz_capab,
+ 			     struct cfg80211_chan_def *chandef, bool tracking)
+ {
+ 	struct cfg80211_chan_def vht_chandef;
+ 	struct ieee80211_sta_ht_cap sta_ht_cap;
+-	ieee80211_conn_flags_t ret;
++	ieee80211_conn_flags_t ret = 0;
+ 	u32 ht_cfreq;
+ 	const struct ieee80211_sta_eht_cap *eht_cap;
+ 	const struct ieee80211_sta_he_cap *he_cap;
+@@ -417,8 +418,7 @@ ieee80211_determine_chantype(struct ieee80211_sub_if_data *sdata,
+ 
+ 		eht_phy_cap = eht_cap->eht_cap_elem.phy_cap_info[0];
+ 		he_phy_cap = he_cap->he_cap_elem.phy_cap_info[0];
+-		support_320 =
+-			eht_phy_cap & IEEE80211_EHT_PHY_CAP0_320MHZ_IN_6GHZ;
++		support_320 = eht_phy_cap & IEEE80211_EHT_PHY_CAP0_320MHZ_IN_6GHZ;
+ 		support_160 =
+ 			he_phy_cap &
+ 			IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_160MHZ_IN_5G;
+@@ -428,6 +428,19 @@ ieee80211_determine_chantype(struct ieee80211_sub_if_data *sdata,
+ 					   support_320,
+ 					   &eht_chandef);
+ 
++		if (eht_240mhz_capab && eht_chandef.width == NL80211_CHAN_WIDTH_160) {
++			eht_chandef.width = NL80211_CHAN_WIDTH_320;
++			eht_chandef.center_freq1 =
++				ieee80211_channel_to_frequency(eht_240mhz_capab->ccfs0,
++							       chandef->chan->band);
++			eht_chandef.ru_punct_bitmap = eht_240mhz_capab->ru_punct_bitmap;
++
++			if (!cfg80211_ru_punct_bitmap_valid(chandef)) {
++				eht_chandef.ru_punct_bitmap = 0;
++				goto out;
++			}
++		}
++
+ 		if (!cfg80211_chandef_valid(&eht_chandef)) {
+ 			if (!(conn_flags & IEEE80211_CONN_DISABLE_EHT))
+ 				sdata_info(sdata,
+@@ -506,7 +519,9 @@ out:
+ 						  IEEE80211_CHAN_NO_EHT))
+ 		ret |= IEEE80211_CONN_DISABLE_EHT;
+ 
+-	if (chandef->width != vht_chandef.width && !tracking)
++	if (chandef->width != vht_chandef.width && !tracking &&
++	    !(chandef->chan->band == NL80211_BAND_5GHZ &&
++	      chandef->width == NL80211_CHAN_WIDTH_320))
+ 		sdata_info(sdata,
+ 			   "capabilities/regulatory prevented using AP HT/VHT configuration, downgraded\n");
+ 
+@@ -522,6 +537,7 @@ static int ieee80211_config_bw(struct ieee80211_link_data *link,
+ 			       const struct ieee80211_he_operation *he_oper,
+ 			       const struct ieee80211_eht_operation *eht_oper,
+ 			       const struct ieee80211_s1g_oper_ie *s1g_oper,
++			       const struct ieee80211_240mhz_vendor_oper *eht_240mhz_capab,
+ 			       const u8 *bssid, u64 *changed)
+ {
+ 	struct ieee80211_sub_if_data *sdata = link->sdata;
+@@ -575,7 +591,7 @@ static int ieee80211_config_bw(struct ieee80211_link_data *link,
+ 					     sband, chan, vht_cap_info,
+ 					     ht_oper, vht_oper,
+ 					     he_oper, eht_oper,
+-					     s1g_oper, &chandef, true);
++					     s1g_oper, eht_240mhz_capab, &chandef, true);
+ 
+ 	/*
+ 	 * Downgrade the new channel if we associated with restricted
+@@ -834,7 +850,8 @@ static void ieee80211_add_he_ie(struct ieee80211_sub_if_data *sdata,
+ 
+ static void ieee80211_add_eht_ie(struct ieee80211_sub_if_data *sdata,
+ 				 struct sk_buff *skb,
+-				 struct ieee80211_supported_band *sband)
++				 struct ieee80211_supported_band *sband,
++				 struct ieee80211_240mhz_vendor_oper *eht_240mhz_capab)
+ {
+ 	u8 *pos;
+ 	const struct ieee80211_sta_he_cap *he_cap;
+@@ -861,6 +878,9 @@ static void ieee80211_add_eht_ie(struct ieee80211_sub_if_data *sdata,
+ 	pos = skb_put(skb, eht_cap_size);
+ 	ieee80211_ie_build_eht_cap(pos, he_cap, eht_cap, pos + eht_cap_size,
+ 				   false);
++
++	if (eht_240mhz_capab && sband->band == NL80211_BAND_5GHZ)
++		pos = ieee80211_add_qcn_vendor_ie(skb, eht_240mhz_capab);
+ }
+ 
+ static void ieee80211_assoc_add_rates(struct sk_buff *skb,
+@@ -1067,6 +1087,7 @@ static size_t ieee80211_assoc_link_elems(struct ieee80211_sub_if_data *sdata,
+ 	struct ieee80211_if_managed *ifmgd = &sdata->u.mgd;
+ 	struct ieee80211_mgd_assoc_data *assoc_data = ifmgd->assoc_data;
+ 	struct cfg80211_bss *cbss = assoc_data->link[link_id].bss;
++	struct ieee80211_bss *bss = (void *)cbss->priv;
+ 	struct ieee80211_channel *chan = cbss->channel;
+ 	const struct ieee80211_sband_iftype_data *iftd;
+ 	struct ieee80211_local *local = sdata->local;
+@@ -1229,7 +1250,8 @@ static size_t ieee80211_assoc_link_elems(struct ieee80211_sub_if_data *sdata,
+ 	present_elems = NULL;
+ 
+ 	if (!(assoc_data->link[link_id].conn_flags & IEEE80211_CONN_DISABLE_EHT))
+-		ieee80211_add_eht_ie(sdata, skb, sband);
++		ieee80211_add_eht_ie(sdata, skb, sband,
++				     bss->eht_240mhz_len ? &bss->eht_240mhz_capab : NULL);
+ 
+ 	if (sband->band == NL80211_BAND_S1GHZ) {
+ 		ieee80211_add_aid_request_ie(sdata, skb);
+@@ -1450,6 +1472,7 @@ static int ieee80211_send_assoc(struct ieee80211_sub_if_data *sdata)
+ 
+ 	for (link_id = 0; link_id < IEEE80211_MLD_MAX_NUM_LINKS; link_id++) {
+ 		struct cfg80211_bss *cbss = assoc_data->link[link_id].bss;
++		struct ieee80211_bss *bss = (void *)cbss->priv;
+ 		const struct ieee80211_sband_iftype_data *iftd;
+ 		struct ieee80211_supported_band *sband;
+ 
+@@ -1493,6 +1516,11 @@ static int ieee80211_send_assoc(struct ieee80211_sub_if_data *sdata)
+ 		/* should be the same across all BSSes */
+ 		if (cbss->capability & WLAN_CAPABILITY_PRIVACY)
+ 			capab |= WLAN_CAPABILITY_PRIVACY;
++
++		if (bss->eht_240mhz_len && sband->band == NL80211_BAND_5GHZ)
++			size += (2 + WLAN_OUI_QCN_HEADER_LEN +
++				 2 + sizeof(struct ieee80211_qcn_version_vendor_elem) +
++				 2 + sizeof(struct ieee80211_240mhz_vendor_oper));
+ 	}
+ 
+ 	if (ieee80211_vif_is_mld(&sdata->vif)) {
+@@ -4045,6 +4073,7 @@ static bool ieee80211_assoc_config_link(struct ieee80211_link_data *link,
+ 	struct ieee80211_sub_if_data *sdata = link->sdata;
+ 	struct ieee80211_mgd_assoc_data *assoc_data = sdata->u.mgd.assoc_data;
+ 	struct ieee80211_bss_conf *bss_conf = link->conf;
++	struct ieee80211_bss *bss = (void *)cbss->priv;
+ 	struct ieee80211_local *local = sdata->local;
+ 	unsigned int link_id = link->link_id;
+ 	struct ieee80211_elems_parse_params parse_params = {
+@@ -4274,7 +4303,8 @@ static bool ieee80211_assoc_config_link(struct ieee80211_link_data *link,
+ 							    elems->he_cap_len,
+ 							    elems->eht_cap,
+ 							    elems->eht_cap_len,
+-							    NULL, NULL,
++							    &bss->eht_240mhz_capab,
++							    bss->eht_240mhz_len,
+ 							    link_sta);
+ 
+ 			bss_conf->eht_support = link_sta->pub->eht_cap.has_eht;
+@@ -5020,7 +5050,7 @@ static int ieee80211_prep_channel(struct ieee80211_sub_if_data *sdata,
+ 					     bss->vht_cap_info,
+ 					     ht_oper, vht_oper,
+ 					     he_oper, eht_oper,
+-					     s1g_oper,
++					     s1g_oper, elems->eht_240mhz_capab,
+ 					     &chandef, false);
+ 
+ 	if (link)
+@@ -6192,8 +6222,8 @@ static void ieee80211_rx_mgmt_beacon(struct ieee80211_link_data *link,
+ 	if (ieee80211_config_bw(link, elems->ht_cap_elem,
+ 				elems->vht_cap_elem, elems->ht_operation,
+ 				elems->vht_operation, elems->he_operation,
+-				elems->eht_operation,
+-				elems->s1g_oper, bssid, &changed)) {
++				elems->eht_operation, elems->s1g_oper,
++				elems->eht_240mhz_capab, bssid, &changed)) {
+ 		mutex_unlock(&local->sta_mtx);
+ 		sdata_info(sdata,
+ 			   "failed to follow AP %pM bandwidth change, disconnect\n",
+--- a/net/mac80211/scan.c
++++ b/net/mac80211/scan.c
+@@ -157,6 +157,13 @@ void ieee80211_inform_bss(struct wiphy *wiphy,
+ 	else
+ 		bss->vht_cap_info = 0;
+ 
++	if (cbss->channel->band == NL80211_BAND_5GHZ &&
++	    elems->eht_240mhz_len && elems->eht_240mhz_capab) {
++		bss->eht_240mhz_len = elems->eht_240mhz_len;
++		memcpy(&bss->eht_240mhz_capab, elems->eht_240mhz_capab,
++		       sizeof(struct ieee80211_240mhz_vendor_oper));
++	}
++
+ 	kfree(elems);
+ }
+ 
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -5787,6 +5787,50 @@ u8 *ieee80211_add_wmm_info_ie(u8 *buf, u8 qosinfo)
+ 	return buf;
+ }
+ 
++static u8 *ieee80211_add_qcn_version_vendor_ie(u8 *buf)
++{
++	*buf++ = WLAN_OUI_QCN_ATTR_VER;
++	*buf++ = 2; /* length */
++	*buf++ = 1; /* version */
++	*buf++ = 0; /* sub-version */
++	return buf;
++}
++
++static u8 *ieee80211_add_240mhz_vendor_ie(u8 *buf,
++					  struct ieee80211_240mhz_vendor_oper *eht_240mhz_capab)
++{
++	*buf++ = WLAN_OUI_QCN_ATTR_5GHZ_240MHZ_SUPP;
++	*buf++ = sizeof(struct ieee80211_240mhz_vendor_oper);
++	memcpy(buf, (u8 *) eht_240mhz_capab, sizeof(struct ieee80211_240mhz_vendor_oper));
++	buf += sizeof(struct ieee80211_240mhz_vendor_oper);
++	return buf;
++}
++
++u8 *ieee80211_add_qcn_vendor_ie(struct sk_buff *skb,
++				struct ieee80211_240mhz_vendor_oper *eht_240mhz_capab)
++{
++	size_t len = WLAN_OUI_QCN_HEADER_LEN;
++	u8 *pos;
++
++	len += (2 + sizeof(struct ieee80211_qcn_version_vendor_elem));
++
++	if (eht_240mhz_capab)
++		len += (2 + sizeof(struct ieee80211_240mhz_vendor_oper));
++
++	pos = skb_put(skb, 2 + len);
++	*pos++ = WLAN_EID_VENDOR_SPECIFIC;
++	*pos++ = len;
++	*pos++ = 0x8c; /* WLAN_OUI_QCN */
++	*pos++ = 0xfd;
++	*pos++ = 0xf0;
++	*pos++ = WLAN_OUI_QCN_TYPE_1;
++
++	pos = ieee80211_add_qcn_version_vendor_ie(pos);
++	pos = ieee80211_add_240mhz_vendor_ie(pos, eht_240mhz_capab);
++
++	return pos;
++}
++
+ void ieee80211_txq_get_depth(struct ieee80211_txq *txq,
+ 			     unsigned long *frame_cnt,
+ 			     unsigned long *byte_cnt)

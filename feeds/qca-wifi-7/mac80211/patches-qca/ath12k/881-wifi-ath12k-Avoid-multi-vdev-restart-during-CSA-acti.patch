@@ -1,0 +1,175 @@
+From 54d5e5a4fe6f271b92ace2517de0fc73e1ef3c2e Mon Sep 17 00:00:00 2001
+From: Sidhanta Sahu <quic_sidhanta@quicinc.com>
+Date: Thu, 15 Feb 2024 11:19:52 -0800
+Subject: [PATCH] wifi: ath12k: Avoid multi vdev restart during CSA active
+
+Host sends multi vdev restart (MVR) command to firmware for all active
+vdevs on a pdev from ath12k_mac_update_active_vif_chan() when channel
+switch is finished for any one vdev. In mesh+AP scenario this results
+in channel switch operation getting interrupted for the mesh link and
+it never moves to the new channel.
+
+Furthermore, firmware expects a single MVR command to restart all links
+on the same band during bandwidth reduction/expansion but host sends
+multiple commands with partial list of links in some cases as it
+receives multiple calls to ath12k_mac_op_switch_vif_chanctx() from
+mac80211. This puts firmware in a state where some links move to the
+new context while others remain on old resulting in crash.
+
+Fix both issues by tracking links with active channel switch on a pdev
+and waiting to send a single MVR command until all links finish
+channel switch countdown.
+
+Signed-off-by: Sidhanta Sahu <quic_sidhanta@quicinc.com>
+Co-developed-by: Aloka Dixit <quic_alokad@quicinc.com>
+Signed-off-by: Aloka Dixit <quic_alokad@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -12219,6 +12219,7 @@ struct ath12k_mac_change_chanctx_arg {
+ 	struct ieee80211_vif_chanctx_switch *vifs;
+ 	int n_vifs;
+ 	int next_vif;
++	bool set_csa_active;
+ 	struct ath12k *ar;
+ };
+ 
+@@ -12234,6 +12235,7 @@ ath12k_mac_change_chanctx_cnt_iter(void
+ 	struct ath12k_hw *ah = ahvif->ah;
+ 
+ 	lockdep_assert_held(&ah->conf_mutex);
++	lockdep_assert_held(&arg->ar->conf_mutex);
+ 
+ 	for_each_set_bit(link_id, &ahvif->links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
+ 		arvif = ahvif->link[link_id];
+@@ -12249,7 +12251,10 @@ ath12k_mac_change_chanctx_cnt_iter(void
+ 		if ((rcu_access_pointer(link_conf->chanctx_conf) != arg->ctx) ||
+ 		    (arvif->ar != arg->ar))
+ 			continue;
+-			
++
++		if (arg->set_csa_active && link_conf->csa_active)
++			arg->ar->csa_active_cnt++;
++
+ 		arg->n_vifs++;
+ 	}
+ }
+@@ -12766,7 +12771,9 @@ static void
+ ath12k_mac_update_active_vif_chan(struct ath12k *ar,
+ 				  struct ieee80211_chanctx_conf *ctx)
+ {
+-	struct ath12k_mac_change_chanctx_arg arg = { .ctx = ctx, .ar = ar };
++	struct ath12k_mac_change_chanctx_arg arg = { .ctx = ctx,
++						     .set_csa_active = true,
++						     .ar = ar };
+ 	struct ath12k_hw *ah = ar->ah;
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+@@ -12775,13 +12782,17 @@ ath12k_mac_update_active_vif_chan(struct
+ 						   IEEE80211_IFACE_ITER_NORMAL,
+ 						   ath12k_mac_change_chanctx_cnt_iter,
+ 						   &arg);
+-	if (arg.n_vifs == 0)
++
++	if (arg.n_vifs == 0 || ar->csa_active_cnt > 1)
+ 		return;
+ 
+ 	arg.vifs = kcalloc(arg.n_vifs, sizeof(arg.vifs[0]), GFP_KERNEL);
+ 	if (!arg.vifs)
+ 		return;
+ 
++	if (ar->csa_active_cnt)
++		ar->csa_active_cnt = 0;
++
+ 	ieee80211_iterate_active_interfaces_atomic(ah->hw,
+ 						   IEEE80211_IFACE_ITER_NORMAL,
+ 						   ath12k_mac_change_chanctx_fill_iter,
+@@ -13858,7 +13869,7 @@ ath12k_mac_op_switch_vif_chanctx(struct
+ 	struct ath12k_hw *ah = hw->priv;
+ 	struct ath12k *curr_ar, *new_ar, *ar;
+ 	struct ieee80211_chanctx_conf *curr_ctx;
+-	int i, ret = 0, next_ctx_idx = 0;
++	int i, ret = 0, next_ctx_idx = 0, curr_ctx_n_vifs = 0;
+ 
+ 	mutex_lock(&ah->conf_mutex);
+ 
+@@ -13909,19 +13920,64 @@ ath12k_mac_op_switch_vif_chanctx(struct
+ 	for (i = 0; i < n_vifs; i++) {
+ 		curr_ctx = vifs[i].old_ctx;
+ 		ar = ath12k_get_ar_by_ctx(hw, curr_ctx);
++		curr_ctx_n_vifs++;
+ 
+ 		if ((i + 1 < n_vifs) && (vifs[i + 1].old_ctx == curr_ctx))
+ 			continue;
+ 
+ 		mutex_lock(&ar->conf_mutex);
++
++		if (ar->csa_active_cnt >= curr_ctx_n_vifs)
++			ar->csa_active_cnt -= curr_ctx_n_vifs;
++
++		/* Control will reach here only for the last vif for curr_ctx */
++		if (ath12k_wmi_is_mvr_supported(ar->ab)) {
++			struct ath12k_mac_change_chanctx_arg arg = {};
++
++			arg.ar = ar;
++			arg.ctx = curr_ctx;
++			ieee80211_iterate_active_interfaces_atomic(ah->hw,
++								   IEEE80211_IFACE_ITER_NORMAL,
++								   ath12k_mac_change_chanctx_cnt_iter,
++								   &arg);
++			if (arg.n_vifs <= 1 || arg.n_vifs == curr_ctx_n_vifs)
++				goto update_vif_chan;
++
++			if (ar->csa_active_cnt)
++				goto next_ctx;
++
++			arg.vifs = kcalloc(arg.n_vifs, sizeof(arg.vifs[0]), GFP_KERNEL);
++			if (!arg.vifs) {
++				ret = -ENOBUFS;
++				mutex_unlock(&ar->conf_mutex);
++				goto unlock;
++			}
++
++			ieee80211_iterate_active_interfaces_atomic(ah->hw,
++								   IEEE80211_IFACE_ITER_NORMAL,
++								   ath12k_mac_change_chanctx_fill_iter,
++								   &arg);
++
++			ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
++				   "mac chanctx switch n_vifs %d mode %d\n",
++				   arg.n_vifs, mode);
++			ath12k_mac_process_update_vif_chan(ar, arg.vifs, arg.n_vifs);
++
++			kfree(arg.vifs);
++			goto next_ctx;
++		}
++
++update_vif_chan:
+ 		ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
+ 			   "mac chanctx switch n_vifs %d mode %d\n",
+ 			   i - next_ctx_idx + 1, mode);
+ 		ath12k_mac_process_update_vif_chan(ar, vifs + next_ctx_idx,
+ 						   i - next_ctx_idx + 1);
+-		mutex_unlock(&ar->conf_mutex);
+ 
++next_ctx:
+ 		next_ctx_idx = i + 1;
++		curr_ctx_n_vifs = 0;
++		mutex_unlock(&ar->conf_mutex);
+ 	}
+ 
+ unlock:
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1097,6 +1097,8 @@ struct ath12k {
+ 
+ 	bool erp_trigger_set;
+ 	struct work_struct erp_handle_trigger_work;
++
++	u16 csa_active_cnt;
+ };
+ 
+ struct ath12k_hw {

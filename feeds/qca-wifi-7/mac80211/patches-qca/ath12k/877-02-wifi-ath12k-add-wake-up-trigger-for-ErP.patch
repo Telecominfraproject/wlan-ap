@@ -1,0 +1,850 @@
+From 9e591af7ea33cd3efcdde842157b8ee25af5f891 Mon Sep 17 00:00:00 2001
+From: Aloka Dixit <quic_alokad@quicinc.com>
+Date: Mon, 8 Jan 2024 12:54:38 -0800
+Subject: [PATCH 2/3] wifi: ath12k: add wake-up trigger for ErP
+
+- Allow userspace to configure wake-up trigger for ErP using vendor
+subcommand QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC with attribute
+QCA_WLAN_VENDOR_ATTR_RM_ERP_ATH.
+- Send the same vendor command to userspace to when a packet matching
+the configured trigger is received.
+
+Signed-off-by: Aloka Dixit <quic_alokad@quicinc.com>
+Signed-off-by: P Praneesh <quic_ppranees@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c   |   8 +
+ drivers/net/wireless/ath/ath12k/core.h   |   7 +
+ drivers/net/wireless/ath/ath12k/dp_rx.c  |  66 +++++
+ drivers/net/wireless/ath/ath12k/dp_rx.h  |   5 +
+ drivers/net/wireless/ath/ath12k/vendor.c | 328 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/vendor.h | 163 +++++++++++
+ 6 files changed, 577 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -73,6 +73,10 @@ bool ath12k_debug_critical = false;
+ module_param_named(debug_critical, ath12k_debug_critical, bool, 0644);
+ MODULE_PARM_DESC(debug_critical, "Debug critical issue (0 - disable, 1 - enable)");
+ 
++bool ath12k_erp_support = false;
++module_param_named(erp_support, ath12k_erp_support, bool, 0444);
++MODULE_PARM_DESC(erp_support, "ErP support (0 - disable, 1 - enable)");
++
+ static DEFINE_MUTEX(ath12k_hw_lock);
+ static struct list_head ath12k_hw_groups = LIST_HEAD_INIT(ath12k_hw_groups);
+ 
+@@ -2168,6 +2172,11 @@ static void ath12k_core_pre_reconfigure_
+ 		ar->monitor_vdev_id = -1;
+ 		clear_bit(MONITOR_VDEV_STARTED, &ar->monitor_flags);
+ 		clear_bit(MONITOR_VDEV_CREATED, &ar->monitor_flags);
++
++		if (ath12k_erp_support) {
++			cancel_work_sync(&ar->erp_handle_trigger_work);
++			ar->erp_trigger_set = false;
++		}
+ 	}
+ 
+ 	wake_up(&ab->wmi_ab.tx_credits_wq);
+@@ -2247,6 +2256,11 @@ void ath12k_core_halt(struct ath12k *ar)
+ 		INIT_LIST_HEAD(&ar->arvifs);
+ 
+ 	idr_init(&ar->txmgmt_idr);
++
++	if (ath12k_erp_support) {
++		cancel_work_sync(&ar->erp_handle_trigger_work);
++		ar->erp_trigger_set = false;
++	}
+ }
+ 
+ static int ath12k_core_mode1_recovery_sta_list(void *data,
+@@ -4201,8 +4215,13 @@ static int ath12k_init(void)
+ 		goto error_ahb;
+ 	}
+ 
++	if (ath12k_erp_support && ath12k_erp_init())
++		goto error_pci;
++
+ 	return 0;
+ 
++error_pci:
++	ath12k_pci_exit();
+ error_ahb:
+ 	ath12k_ahb_exit();
+ error:
+@@ -4213,6 +4232,8 @@ error:
+ 
+ static void ath12k_exit(void)
+ {
++	if (ath12k_erp_support)
++		ath12k_erp_deinit();
+ 	atomic_notifier_chain_unregister(&panic_notifier_list, &rddm_notifier);
+ 	ath12k_pci_exit();
+ 	ath12k_ahb_exit();
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -49,6 +49,7 @@
+ #define	ATH12K_RX_RATE_TABLE_11AX_NUM	576
+ 
+ extern unsigned int ath12k_frame_mode;
++extern bool ath12k_erp_support;
+ 
+ #define ATH12K_PHY_2GHZ "phy00"
+ #define ATH12K_PHY_5GHZ "phy01"
+@@ -1085,6 +1086,9 @@ struct ath12k {
+ 	u32 ani_listen_period;
+ 	int ani_ofdm_level;
+ 	struct completion ani_ofdm_event;
++
++	bool erp_trigger_set;
++	struct work_struct erp_handle_trigger_work;
+ };
+ 
+ struct ath12k_hw {
+@@ -1868,4 +1872,10 @@ static inline int ath12k_ahb_init(void)
+ static inline void ath12k_ahb_exit(void) {};
+ #endif
+ 
++int ath12k_erp_init(void);
++void ath12k_erp_deinit(void);
++bool ath12k_erp_in_progress(void);
++int ath12k_erp_exit(struct wiphy *wiphy, struct ath12k *ar, bool send_reply);
++void ath12k_erp_handle_trigger(struct work_struct *work);
++
+ #endif /* _CORE_H_ */
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -2920,6 +2920,7 @@ static void ath12k_dp_rx_h_mpdu(struct a
+ 		rxcb->peer_id = rx_info->peer_id;
+ 
+ 	spin_lock_bh(&ar->ab->base_lock);
++
+ 	peer = ath12k_dp_rx_h_find_peer(ar->ab, msdu, rx_info);
+ 	if (peer) {
+ 		/* If the pkt is a valid IP packet and peer supports
+@@ -4701,6 +4702,13 @@ static bool ath12k_dp_rx_h_reo_err(struc
+ 	case HAL_REO_DEST_RING_ERROR_CODE_DESC_ADDR_ZERO:
+ 		if (ath12k_dp_rx_h_null_q_desc(ar, msdu, rx_info, msdu_list))
+ 			drop = true;
++
++		/* CCE rule configured for the ERP feature on REO RELEASE RING gets
++		 * handled under this specific error code
++		 * */
++		if (!drop && ar->erp_trigger_set)
++			queue_work(ar->ab->workqueue, &ar->erp_handle_trigger_work);
++
+ 		break;
+ 	case HAL_REO_DEST_RING_ERROR_CODE_PN_CHECK_FAILED:
+ 		/* TODO: Do not drop PN failed packets in the driver;
+@@ -4979,12 +4987,6 @@ int ath12k_dp_rx_process_wbm_err(struct
+ 		if (!err_info.continuation)
+ 			budget--;
+ 
+-		if (err_info.push_reason !=
+-		    HAL_REO_DEST_RING_PUSH_REASON_ERR_DETECTED) {
+-			dev_kfree_skb_any(msdu);
+-			continue;
+-		}
+-
+ 		rxcb->err_rel_src = err_info.err_rel_src;
+ 		rxcb->err_code = err_info.err_code;
+ 		rxcb->is_first_msdu = err_info.first_msdu;
+--- a/drivers/net/wireless/ath/ath12k/vendor.c
++++ b/drivers/net/wireless/ath/ath12k/vendor.c
+@@ -2,6 +2,7 @@
+ /*
+  * Copyright (c) 2023 Qualcomm Innovation Center, Inc. All rights reserved
+  */
++#include <linux/mutex.h>
+ #include <net/netlink.h>
+ #include <net/mac80211.h>
+ #include "core.h"
+@@ -10,6 +11,7 @@
+ #include "telemetry.h"
+ #include "sawf.h"
+ #include "bondif.h"
++#include "dp_rx.h"
+ 
+ #ifdef CPTCFG_ATH12K_SAWF
+ static const struct nla_policy
+@@ -142,6 +144,56 @@ ath12k_ds_policy[QCA_WLAN_VENDOR_ATTR_DS
+ 	[QCA_WLAN_VENDOR_ATTR_CONFIG_EHT_MLO_MODE] = {.type = NLA_U8},
+ };
+ 
++static const struct netlink_range_validation
++ath12k_vendor_erp_config_trigger_range = {
++	.min = 1,
++	.max = BIT(QCA_WLAN_VENDOR_TRIGGER_TYPE_MAX) - 1,
++};
++
++static const struct nla_policy
++ath12k_vendor_erp_config_policy[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_MAX + 1] = {
++	[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_IFINDEX] = {.type = NLA_U32},
++	[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_TRIGGER] =
++		NLA_POLICY_FULL_RANGE(NLA_U32, &ath12k_vendor_erp_config_trigger_range),
++};
++
++static const struct nla_policy
++ath12k_vendor_erp_policy[QCA_WLAN_VENDOR_ATTR_ERP_MAX + 1] = {
++	[QCA_WLAN_VENDOR_ATTR_ERP_ENTER_START] = { .type = NLA_FLAG},
++	[QCA_WLAN_VENDOR_ATTR_ERP_ENTER_COMPLETE] = { .type = NLA_FLAG},
++	[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG] =
++		NLA_POLICY_NESTED(ath12k_vendor_erp_config_policy),
++	[QCA_WLAN_VENDOR_ATTR_ERP_EXIT] = { .type = NLA_FLAG },
++};
++
++static const struct nla_policy
++ath12k_vendor_rm_generic_policy[QCA_WLAN_VENDOR_ATTR_RM_GENERIC_MAX + 1] = {
++	[QCA_WLAN_VENDOR_ATTR_RM_GENERIC_ERP] =
++		NLA_POLICY_NESTED(ath12k_vendor_erp_policy),
++};
++
++enum ath12k_erp_states {
++	ATH12K_ERP_OFF,
++	ATH12K_ERP_ENTER_STARTED,
++	ATH12K_ERP_ENTER_COMPLETE,
++};
++
++struct ath12k_erp_active_ar {
++	struct ath12k *ar;
++	enum ath12k_routing_pkt_type trigger;
++};
++
++struct ath12k_erp_state_machine {
++	bool initialized;
++	/* Protects the structure members */
++	struct mutex lock;
++	enum ath12k_erp_states state;
++	struct ath12k_erp_active_ar active_ar;
++	struct dentry *erp_dir;
++};
++
++static struct ath12k_erp_state_machine erp_sm = {};
++
+ #ifdef CPTCFG_ATH12K_SAWF
+ 
+ static void ath12k_set_default_values(struct ath12k_sawf_svc_params *param)
+@@ -1265,7 +1317,407 @@ static int ath12k_vendor_set_scs_qos_par
+ 	return ret;
+ }
+ 
++static void ath12k_erp_reset_state(void)
++{
++	erp_sm.state = ATH12K_ERP_OFF;
++	memset(&erp_sm.active_ar, 0, sizeof(erp_sm.active_ar));
++}
++
++static u32 ath12k_erp_convert_trigger_bitmap(u32 bitmap)
++{
++	u32 new_bitmap = 0;
++	u8 bit_set;
++
++	WARN_ON(sizeof(bitmap) > sizeof(new_bitmap));
++
++	while (bitmap) {
++		bit_set = ffs(bitmap);
++		if (bit_set > ATH12K_PKT_TYPE_MAX)
++			break;
++
++		bitmap &= ~BIT(bit_set - 1);
++
++		switch (bit_set - 1) {
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_ARP_IPV4:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_ARP_IPV4);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_NS_IPV6:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_NS_IPV6);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_IGMP_IPV4:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_IGMP_IPV4);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_MLD_IPV6:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_MLD_IPV6);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_DHCP_IPV4:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_DHCP_IPV4);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_DHCP_IPV6:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_DHCP_IPV6);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_DNS_TCP_IPV4:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_DNS_TCP_IPV4);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_DNS_TCP_IPV6:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_DNS_TCP_IPV6);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_DNS_UDP_IPV4:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_DNS_UDP_IPV4);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_DNS_UDP_IPV6:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_DNS_UDP_IPV6);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_ICMP_IPV4:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_ICMP_IPV4);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_ICMP_IPV6:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_ICMP_IPV6);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_TCP_IPV4:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_TCP_IPV4);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_TCP_IPV6:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_TCP_IPV6);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_UDP_IPV4:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_UDP_IPV4);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_UDP_IPV6:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_UDP_IPV6);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_IPV4:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_IPV4);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_IPV6:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_IPV6);
++			break;
++		case QCA_WLAN_VENDOR_TRIGGER_TYPE_EAP:
++			new_bitmap |= BIT(ATH12K_PKT_TYPE_EAP);
++			break;
++		default:
++			break;
++		}
++	}
++
++	return new_bitmap;
++}
++
++static int ath12k_erp_set_pkt_filter(struct ath12k *ar, u32 bitmap,
++				     enum ath12k_wmi_pkt_route_opcode op_code)
++{
++	struct ath12k_wmi_pkt_route_param param = {};
++
++	if (!bitmap)
++		return 0;
++
++	if (op_code == ATH12K_WMI_PKTROUTE_ADD) {
++		bitmap = ath12k_erp_convert_trigger_bitmap(bitmap);
++		if (!bitmap) {
++			ath12k_err(NULL, "invalid wake up trigger bitmap\n");
++			return -EINVAL;
++		}
++	}
++
++	param.opcode = op_code;
++	param.meta_data = ATH12K_RX_PROTOCOL_TAG_START_OFFSET + bitmap;
++	param.dst_ring = ATH12K_REO_RELEASE_RING;
++	param.dst_ring_handler = ATH12K_WMI_PKTROUTE_USE_CCE;
++	param.route_type_bmap = bitmap;
++	if (ath12k_wmi_send_pdev_pkt_route(ar, &param)) {
++		ath12k_err(NULL, "failed to set packet bitmap");
++		return -EINVAL;
++	}
++
++	spin_lock_bh(&ar->ab->base_lock);
++	if (op_code == ATH12K_WMI_PKTROUTE_ADD) {
++		ar->erp_trigger_set = true;
++		erp_sm.active_ar.trigger = bitmap;
++	} else if (op_code == ATH12K_WMI_PKTROUTE_DEL) {
++		ar->erp_trigger_set = false;
++		erp_sm.active_ar.trigger = 0;
++	}
++	spin_unlock_bh(&ar->ab->base_lock);
++
++	return 0;
++}
++
++static int ath12k_erp_config_trigger(struct wiphy *wiphy, struct nlattr **attrs)
++{
++	struct net_device *netdev;
++	struct wireless_dev *wdev;
++	u32 trigger, if_index;
++	struct ieee80211_vif *vif;
++	struct ath12k_vif *ahvif;
++	struct ath12k *ar;
++
++	ath12k_dbg(NULL, ATH12K_DBG_RM, "setting ErP wake up trigger\n");
++
++	if (!attrs[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_IFINDEX]) {
++		ath12k_err(NULL, "missing index for wake up interface\n");
++		return -EINVAL;
++	}
++
++	if_index = nla_get_u32(attrs[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_IFINDEX]);
++	netdev = dev_get_by_index(wiphy_net(wiphy), if_index);
++	if (!netdev) {
++		ath12k_err(NULL,
++			   "could not find netdev for wake up interface\n");
++		dev_put(netdev);
++		return -EINVAL;
++	}
++
++	wdev = netdev->ieee80211_ptr;
++	dev_put(netdev);
++	if (!wdev) {
++		ath12k_err(NULL, "could not find wdev for wake up interface\n");
++		return -EINVAL;
++	}
++
++	vif = wdev_to_ieee80211_vif(wdev);
++	if (!vif) {
++		ath12k_dbg(NULL, ATH12K_DBG_RM, "vif absent, ignoring packet bitmap");
++		return -EINVAL;
++	}
++
++	ahvif = ath12k_vif_to_ahvif(vif);
++	if (!ahvif) {
++		ath12k_dbg(NULL, ATH12K_DBG_RM, "ahvif absent, ignoring packet bitmap");
++		return -EINVAL;
++	}
++
++	ar = ahvif->deflink.ar; /* current support is only for SLO */
++
++	trigger = nla_get_u32(attrs[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_TRIGGER]);
++	if (ath12k_erp_set_pkt_filter(ar, trigger, ATH12K_WMI_PKTROUTE_ADD))
++		return -EINVAL;
++
++	erp_sm.active_ar.ar = ar;
++	return 0;
++}
++
++static int ath12k_erp_config(struct wiphy *wiphy, struct nlattr *attrs)
++{
++	struct nlattr *tb[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_MAX + 1];
++	int ret;
++
++	ret = nla_parse_nested(tb, QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_MAX,
++			       attrs, ath12k_vendor_erp_config_policy, NULL);
++	if (ret) {
++		ath12k_err(NULL, "failed to parse ErP parameters\n");
++		return ret;
++	}
++
++	if (!tb[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_TRIGGER]) {
++		ath12k_err(NULL, "empty ErP parameters\n");
++		return ret;
++	}
++
++	return ath12k_erp_config_trigger(wiphy, tb);
++}
++
++static int ath12k_erp_enter(struct wiphy *wiphy,
++			    struct wireless_dev *wdev,
++			    struct nlattr **attrs)
++{
++	int ret = -EINVAL;
++
++	mutex_lock(&erp_sm.lock);
++
++	if (nla_get_flag(attrs[QCA_WLAN_VENDOR_ATTR_ERP_ENTER_START])) {
++		if (erp_sm.state != ATH12K_ERP_OFF) {
++			ath12k_err(NULL, "driver is already in ErP mode\n");
++			goto out;
++		}
++		erp_sm.state = ATH12K_ERP_ENTER_STARTED;
++	} else if (erp_sm.state != ATH12K_ERP_ENTER_STARTED) {
++		ath12k_err(NULL,
++			   "driver has not started ErP mode configurations\n");
++		goto out;
++	}
++
++	if (attrs[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG]) {
++		ret = ath12k_erp_config(wiphy,
++					attrs[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG]);
++		if (ret)
++			goto out;
++	}
++
++	if (nla_get_flag(attrs[QCA_WLAN_VENDOR_ATTR_ERP_ENTER_COMPLETE]))
++		erp_sm.state = ATH12K_ERP_ENTER_COMPLETE;
++
++	mutex_unlock(&erp_sm.lock);
++	return 0;
++
++out:
++	mutex_unlock(&erp_sm.lock);
++	return ret;
++}
++
++static void ath12k_vendor_send_erp_trigger(struct wiphy *wiphy)
++{
++	struct sk_buff *skb;
++	struct nlattr *erp_ath;
++
++	if (!wiphy)
++		return;
++
++	skb = cfg80211_vendor_event_alloc(wiphy, NULL, NLMSG_DEFAULT_SIZE,
++					  QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC_INDEX,
++					  GFP_KERNEL);
++	if (!skb) {
++		ath12k_err(NULL, "No memory available to send ErP vendor event\n");
++		return;
++	}
++
++	erp_ath = nla_nest_start(skb, QCA_WLAN_VENDOR_ATTR_RM_GENERIC_ERP);
++	if (!erp_ath) {
++		ath12k_err(NULL, "failed to put ErP parameters\n");
++		kfree(skb);
++		return;
++	}
++
++	if (nla_put_flag(skb, QCA_WLAN_VENDOR_ATTR_ERP_EXIT)) {
++		ath12k_warn(NULL, "Failure to put ErP vendor event flag\n");
++		/* Allow this error case for now */
++	}
++
++	nla_nest_end(skb, erp_ath);
++	cfg80211_vendor_event(skb, GFP_KERNEL);
++}
++
++int ath12k_erp_exit(struct wiphy *wiphy, struct ath12k *ar, bool send_reply)
++{
++	struct ath12k_erp_active_ar *active_ar;
++	int ret, i;
++
++	mutex_lock(&erp_sm.lock);
++	if (erp_sm.state != ATH12K_ERP_ENTER_COMPLETE) {
++		ath12k_err(NULL, "driver is not in ErP mode\n");
++		mutex_unlock(&erp_sm.lock);
++		return -EINVAL;
++	}
++
++	active_ar = &erp_sm.active_ar;
++	if (active_ar->ar) {
++		ret = ath12k_erp_set_pkt_filter(active_ar->ar,
++						active_ar->trigger,
++						ATH12K_WMI_PKTROUTE_DEL);
++		if (ret) {
++			ath12k_err(NULL, "failed to reset pkt bitmap %d", ret);
++			mutex_unlock(&erp_sm.lock);
++			return ret;
++		}
++	}
++
++	ath12k_erp_reset_state();
++
++	if (send_reply)
++		ath12k_vendor_send_erp_trigger(wiphy);
++
++	mutex_unlock(&erp_sm.lock);
++	return 0;
++}
++
++static int ath12k_vendor_parse_rm_erp(struct wiphy *wiphy,
++				      struct wireless_dev *wdev,
++				      struct nlattr *attrs)
++{
++	struct nlattr *tb[QCA_WLAN_VENDOR_ATTR_ERP_MAX + 1];
++	int ret;
++
++	if (!erp_sm.initialized)
++		return -EINVAL;
++
++	ret = nla_parse_nested(tb, QCA_WLAN_VENDOR_ATTR_ERP_MAX, attrs,
++			       ath12k_vendor_erp_policy, NULL);
++	if (ret) {
++		ath12k_err(NULL, "failed to parse ErP attributes\n");
++		return ret;
++	}
++
++	if (nla_get_flag(tb[QCA_WLAN_VENDOR_ATTR_ERP_ENTER_START]) ||
++	    nla_get_flag(tb[QCA_WLAN_VENDOR_ATTR_ERP_ENTER_COMPLETE]) ||
++	    tb[QCA_WLAN_VENDOR_ATTR_ERP_CONFIG])
++		ret = ath12k_erp_enter(wiphy, wdev, tb);
++	else if (nla_get_flag(tb[QCA_WLAN_VENDOR_ATTR_ERP_EXIT]))
++		ret = ath12k_erp_exit(wiphy, NULL, false);
++
++	return ret;
++}
++
++static int ath12k_vendor_parse_rm(struct wiphy *wiphy,
++				  struct wireless_dev *wdev,
++				  const void *data,
++				  int data_len)
++{
++	struct nlattr *tb[QCA_WLAN_VENDOR_ATTR_RM_GENERIC_MAX + 1];
++	int ret;
++
++	ret = nla_parse(tb, QCA_WLAN_VENDOR_ATTR_RM_GENERIC_MAX,
++			data, data_len, ath12k_vendor_rm_generic_policy, NULL);
++	if (ret) {
++		ath12k_err(NULL, "failed to parse QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC\n");
++		return ret;
++	}
++
++	if (!tb[QCA_WLAN_VENDOR_ATTR_RM_GENERIC_ERP]) {
++		ath12k_err(NULL, "invalid attributes provided for QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC\n");
++		return ret;
++	}
++
++	return ath12k_vendor_parse_rm_erp(wiphy, wdev,
++					  tb[QCA_WLAN_VENDOR_ATTR_RM_GENERIC_ERP]);
++}
++
++void ath12k_erp_handle_trigger(struct work_struct *work)
++{
++	struct ath12k *ar = container_of(work, struct ath12k, erp_handle_trigger_work);
++
++	if (!ar->erp_trigger_set)
++		return;
++
++	(void)ath12k_erp_exit(ar->ah->hw->wiphy, ar, true);
++}
++
++int ath12k_erp_init(void)
++{
++	if (erp_sm.initialized)
++		return 0;
++
++	mutex_init(&erp_sm.lock);
++	ath12k_erp_reset_state();
++
++	erp_sm.erp_dir = ath12k_debugfs_erp_create();
++
++	erp_sm.initialized = true;
++	return 0;
++}
++
++void ath12k_erp_deinit(void)
++{
++	if (!erp_sm.initialized)
++		return;
++
++	mutex_lock(&erp_sm.lock);
++
++	erp_sm.erp_dir = NULL;
++
++	ath12k_erp_reset_state();
++	erp_sm.initialized = false;
++
++	mutex_unlock(&erp_sm.lock);
++	mutex_destroy(&erp_sm.lock);
++}
++
+ static struct wiphy_vendor_command ath12k_vendor_commands[] = {
++	{
++		.info.vendor_id = QCA_NL80211_VENDOR_ID,
++		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC,
++		.doit = ath12k_vendor_parse_rm,
++		.policy = ath12k_vendor_rm_generic_policy,
++		.maxattr = QCA_WLAN_VENDOR_ATTR_RM_GENERIC_MAX,
++	},
+ #ifdef CPTCFG_ATH12K_SAWF
+ 	{
+ 		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+@@ -1317,6 +1769,10 @@ static const struct nl80211_vendor_cmd_i
+ 		.subcmd = QCA_NL80211_VENDOR_SUBCMD_SDWF_DEV_OPS,
+ 	},
+ #endif
++	[QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC_INDEX] = {
++		.vendor_id = QCA_NL80211_VENDOR_ID,
++		.subcmd = QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC,
++	},
+ };
+ 
+ int ath12k_vendor_register(struct ath12k_hw *ah)
+--- a/drivers/net/wireless/ath/ath12k/vendor.h
++++ b/drivers/net/wireless/ath/ath12k/vendor.h
+@@ -10,6 +10,7 @@
+ enum qca_nl80211_vendor_subcmds {
+ 	/* Wi-Fi configuration subcommand */
+ 	QCA_NL80211_VENDOR_SUBCMD_SET_WIFI_CONFIGURATION = 74,
++	QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC = 206,
+ 	QCA_NL80211_VENDOR_SUBCMD_SCS_RULE_CONFIG = 218,
+ 	QCA_NL80211_VENDOR_SUBCMD_SDWF_PHY_OPS = 235,
+ 	QCA_NL80211_VENDOR_SUBCMD_SDWF_DEV_OPS = 236,
+@@ -18,6 +19,7 @@ enum qca_nl80211_vendor_subcmds {
+ 
+ enum qca_nl80211_vendor_events {
+ 	QCA_NL80211_VENDOR_SUBCMD_SDWF_DEV_OPS_INDEX = 0,
++	QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC_INDEX,
+ };
+ 
+ #ifdef CPTCFG_ATH12K_SAWF
+@@ -589,4 +591,109 @@ enum qca_wlan_vendor_attr_scs_rule_confi
+ 	QCA_WLAN_VENDOR_ATTR_SCS_RULE_CONFIG_AFTER_LAST - 1,
+ };
+ 
++/**
++ * enum qca_wlan_vendor_attr_rm_generic - Attributes required for vendor
++ * command %QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC to register a Resource Manager
++ * with the driver.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_RM_GENERIC_ERP: Nested attribute used for commands
++ * and events related to ErP (Energy related Products),
++ * see @enum qca_wlan_vendor_attr_erp_ath for details.
++ */
++enum qca_wlan_vendor_attr_rm_generic {
++	QCA_WLAN_VENDOR_ATTR_RM_GENERIC_ERP = 13,
++
++	/* keep last */
++	QCA_WLAN_VENDOR_ATTR_RM_GENERIC_AFTER_LAST,
++	QCA_WLAN_VENDOR_ATTR_RM_GENERIC_MAX =
++		QCA_WLAN_VENDOR_ATTR_RM_GENERIC_AFTER_LAST - 1,
++};
++
++/**
++ * enum qca_wlan_vendor_attr_erp_ath - Parameters to support ErP in ath driver.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_ERP_INVALID: Invalid attribute
++ *
++ * @QCA_WLAN_VENDOR_ATTR_ERP_ENTER_START: Flag, set to true will trigger
++ * driver's entry into ErP mode.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_ERP_ENTER_COMPLETE: Flag to indicate that ErP
++ * parameter configuration is complete. This can be included along with flags
++ * QCA_WLAN_VENDOR_ATTR_ERP_ENTER_START and
++ * QCA_WLAN_VENDOR_ATTR_ERP_CONFIG.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_ERP_CONFIG: Optional nested attribute for ErP
++ * parameters. Flag QCA_WLAN_VENDOR_ATTR_ERP_ENTER_START must be sent
++ * either before or when the first time this flag is included. See
++ * @enum qca_wlan_vendor_attr_erp_ath_config for details.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_ERP_EXIT: Flag, set to true will trigger exit from
++ * ErP mode. Driver uses this flag to send vendor event
++ * %QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC to userspace upon receiving a packet
++ * matching a previously configured filter. Userspace can also trigger driver's
++ * exit from ErP using this flag.
++ */
++enum qca_wlan_vendor_attr_erp_ath {
++	QCA_WLAN_VENDOR_ATTR_ERP_INVALID = 0,
++	QCA_WLAN_VENDOR_ATTR_ERP_ENTER_START = 1,
++	QCA_WLAN_VENDOR_ATTR_ERP_ENTER_COMPLETE = 2,
++	QCA_WLAN_VENDOR_ATTR_ERP_CONFIG = 3,
++	QCA_WLAN_VENDOR_ATTR_ERP_EXIT = 4,
++
++	/* keep last */
++	QCA_WLAN_VENDOR_ATTR_ERP_AFTER_LAST,
++	QCA_WLAN_VENDOR_ATTR_ERP_MAX = QCA_WLAN_VENDOR_ATTR_ERP_AFTER_LAST - 1,
++};
++
++/**
++ * enum qca_wlan_vendor_trigger_types - Types of ErP wake up trigger
++ */
++enum qca_wlan_vendor_trigger_types {
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_ARP_IPV4,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_NS_IPV6,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_IGMP_IPV4,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_MLD_IPV6,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_DHCP_IPV4,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_DHCP_IPV6,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_DNS_TCP_IPV4,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_DNS_TCP_IPV6,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_DNS_UDP_IPV4,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_DNS_UDP_IPV6,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_ICMP_IPV4,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_ICMP_IPV6,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_TCP_IPV4,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_TCP_IPV6,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_UDP_IPV4,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_UDP_IPV6,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_IPV4,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_IPV6,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_EAP,
++	QCA_WLAN_VENDOR_TRIGGER_TYPE_MAX,
++};
++
++/**
++ * enum qca_wlan_vendor_attr_erp_ath_config - Parameters to support ErP.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_INVALID: Invalid attribute
++ *
++ * @QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_IFINDEX: (u32) Interface index. This is
++ * a mandatory attribute for setting packet trigger for the designated wake up
++ * interface along with %QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_TRIGGER).
++ *
++ * @QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_TRIGGER: (u32) Attribute used
++ * to set wake-up trigger to bring the device out of ErP mode. This is bitmap
++ * where each bit corresponds to the values defined in
++ * enum qca_wlan_vendor_trigger_types.
++ */
++enum qca_wlan_vendor_attr_erp_ath_config {
++	QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_INVALID = 0,
++	QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_IFINDEX = 1,
++	QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_TRIGGER = 2,
++
++	/* keep last */
++	QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_AFTER_LAST,
++	QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_MAX =
++			QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_AFTER_LAST - 1,
++};
++
+ #endif /* QCA_VENDOR_H */
+--- a/drivers/net/wireless/ath/ath12k/debug.h
++++ b/drivers/net/wireless/ath/ath12k/debug.h
+@@ -34,6 +34,7 @@ enum ath12k_debug_mask {
+ 	ATH12K_DBG_DP_UMAC_RESET = 0x00100000,
+ 	ATH12K_DBG_MODE1_RECOVERY = 0x00200000,
+ 	ATH12K_DBG_DP_FST       = 0x00400000,
++	ATH12K_DBG_RM		= 0x00800000,
+ 
+ 	/* keep last*/
+ 	ATH12K_DBG_ANY		= 0xffffffff,
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -5700,3 +5700,8 @@ void ath12k_debugfs_remove_interface(str
+ 	debugfs_remove(arvif->debugfs_rtsthreshold);
+ 	arvif->debugfs_rtsthreshold = NULL;
+ }
++
++struct dentry *ath12k_debugfs_erp_create(void)
++{
++	return debugfs_create_dir("erp", debugfs_ath12k);
++}
+--- a/drivers/net/wireless/ath/ath12k/debugfs.h
++++ b/drivers/net/wireless/ath/ath12k/debugfs.h
+@@ -323,6 +323,7 @@ static inline int ath12k_debugfs_rx_filt
+ 
+ void ath12k_debugfs_add_interface(struct ath12k_link_vif *arvif);
+ void ath12k_debugfs_remove_interface(struct ath12k_link_vif *arvif);
++struct dentry *ath12k_debugfs_erp_create(void);
+ 
+ #else
+ static inline int ath12k_debugfs_create(void)
+@@ -415,6 +416,12 @@ static inline void ath12k_debugfs_nrp_cl
+ static inline void ath12k_debugfs_nrp_cleanup_all(struct ath12k *ar)
+ {
+ }
++
++struct dentry *ath12k_debugfs_erp_create(void)
++{
++	return NULL;
++}
++
+ #endif /* CPTCFG_MAC80211_DEBUGFS*/
+ 
+ #ifdef CPTCFG_ATH12K_PKTLOG
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -17154,8 +17154,11 @@ static int ath12k_mac_setup(struct ath12
+ 	ar->monitor_vdev_id = -1;
+ 	clear_bit(MONITOR_VDEV_CREATED, &ar->monitor_flags);
+ 	rcu_assign_pointer(ag->hw_links[hw_link_id], ar);
+- 
+- 	return 0;
++
++	if (ath12k_erp_support)
++		INIT_WORK(&ar->erp_handle_trigger_work, ath12k_erp_handle_trigger);
++
++	return 0;
+ }
+ 
+ int ath12k_mac_allocate(struct ath12k_hw_group *ag)
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -3587,6 +3587,15 @@ struct ath12k_wmi_pdev_set_regdomain_arg
+ 	u32 pdev_id;
+ };
+ 
++enum ath12k_dp_rx_routing_reo_dest_ring {
++	ATH12K_REO2SW0_RING,
++	ATH12K_REO2SW1_RING,
++	ATH12K_REO2SW2_RING,
++	ATH12K_REO2SW3_RING,
++	ATH12K_REO2SW4_RING,
++	ATH12K_REO_RELEASE_RING,
++};
++
+ /* Defines various options for routing policy */
+ enum wmi_pdev_dest_ring_handler_type {
+ 	ATH12K_WMI_PKTROUTE_USE_CCE  = 0,

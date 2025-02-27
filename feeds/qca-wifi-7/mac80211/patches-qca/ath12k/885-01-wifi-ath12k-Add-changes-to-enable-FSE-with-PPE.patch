@@ -1,0 +1,470 @@
+From 3abb2e57d5167cb3c8e7f67de02df8f0f02633e9 Mon Sep 17 00:00:00 2001
+From: Nandha Kishore Easwaran <quic_nandhaki@quicinc.com>
+Date: Thu, 7 Mar 2024 12:15:27 +0530
+Subject: [PATCH 1/3] wifi: ath12k: Add changes to enable FSE with PPE
+
+1) Add Hal changes to set PPE related fields on FSE flow entry
+2) Add ring_id, drop and use_ppe configuration to FSE flow entry
+3) Modularize code to remove code duplication
+
+Signed-off-by: Nandha Kishore Easwaran <quic_nandhaki@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_rx.c  | 130 ++++++++++++-----------
+ drivers/net/wireless/ath/ath12k/dp_rx.h  |   5 +-
+ drivers/net/wireless/ath/ath12k/fse.c    |  84 +++++++--------
+ drivers/net/wireless/ath/ath12k/fse.h    |  19 ++++
+ drivers/net/wireless/ath/ath12k/hal_rx.c |  22 ++--
+ drivers/net/wireless/ath/ath12k/hal_rx.h |   7 +-
+ 6 files changed, 145 insertions(+), 122 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
+index bd616e5..f60846f 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -25,6 +25,8 @@
+ #ifdef CPTCFG_MAC80211_PPE_SUPPORT
+ #include <ppe_vp_public.h>
+ #include <ppe_vp_tx.h>
++#include "ppe.h"
++#include <ppe_drv_sc.h>
+ #endif
+ 
+ 
+@@ -5852,9 +5854,8 @@ void ath12k_dp_rx_fst_detach(struct ath12k_base *ab, struct dp_rx_fst *fst)
+ 	ath12k_info(ab, "Rx FST detach successful");
+ }
+ 
+-void ath12k_dp_rx_flow_dump_flow_entry(struct ath12k_base *ab,
+-				       struct dp_rx_fst *fst,
+-				       struct hal_flow_tuple_info *tuple_info)
++static void ath12k_dp_rx_flow_dump_flow_entry(struct ath12k_base *ab,
++					      struct hal_flow_tuple_info *tuple_info)
+ {
+ 	ath12k_info(ab, "Dest IP address %x:%x:%x:%x",
+ 		    tuple_info->dest_ip_127_96,
+@@ -5911,7 +5912,7 @@ ath12k_dp_rx_flow_find_entry_by_tuple(struct ath12k_base *ab,
+ 						    &flow_idx);
+ 	if (status != 0) {
+ 		ath12k_err(ab, "Could not find tuple with hash %u", flow_hash);
+-		ath12k_dp_rx_flow_dump_flow_entry(ab, fst, &flow_info->flow_tuple_info);
++		ath12k_dp_rx_flow_dump_flow_entry(ab, &flow_info->flow_tuple_info);
+ 		return NULL;
+ 	}
+ 
+@@ -5976,13 +5977,37 @@ static inline int ath12k_dp_fst_get_reo_indication(struct ath12k_base *ab)
+ 	return reo_indication;
+ }
+ 
++static int ath12k_dp_rx_invalidate_entry(struct ath12k_base *ab,
++					 enum dp_htt_flow_fst_operation operation,
++					 struct hal_flow_tuple_info *tuple_info)
++{
++	int i;
++	int ret = 0;
++
++	for (i = 0; i < ab->ag->num_chip; i++) {
++		struct ath12k_base *partner_ab = ab->ag->ab[i];
++
++		if (!partner_ab)
++			continue;
++
++		/* Flush entries in the HW cache */
++		ret = ath12k_htt_rx_flow_fse_operation(partner_ab, operation,
++						       tuple_info);
++		if (ret) {
++			ath12k_err(partner_ab, "Unable to invalidate cache entry ret %d",
++				   ret);
++			return ret;
++		}
++	}
++	return ret;
++}
++
+ int ath12k_dp_rx_flow_add_entry(struct ath12k_base *ab,
+ 				struct rx_flow_info *flow_info)
+ {
+ 	struct hal_rx_flow flow = { 0 };
+ 	struct dp_rx_fse *fse;
+ 	struct dp_rx_fst *fst = ab->ag->fst;
+-	int i;
+ 	int ret;
+ 
+ 	if (!fst) {
+@@ -5997,44 +6022,47 @@ int ath12k_dp_rx_flow_add_entry(struct ath12k_base *ab,
+ 	fse = ath12k_dp_rx_flow_alloc_entry(ab, fst, flow_info, &flow);
+ 	if (!fse) {
+ 		ath12k_err(ab, "RX FSE alloc failed");
+-		ath12k_dp_rx_flow_dump_flow_entry(ab, fst, &flow_info->flow_tuple_info);
++		ath12k_dp_rx_flow_dump_flow_entry(ab, &flow_info->flow_tuple_info);
+ 		spin_unlock_bh(&fst->fst_lock);
+ 		return -ENOMEM;
+ 	}
+ 
+-	flow.reo_indication = ath12k_dp_fst_get_reo_indication(ab);
++	flow.drop = flow_info->drop;
++
++	/* Reo indication is required only when drop bit is not set */
++	if (!flow.drop) {
++		if (flow_info->ring_id && flow_info->ring_id <= DP_REO_DST_RING_MAX)
++			flow.reo_indication = flow_info->ring_id;
++		else
++			flow.reo_indication = ath12k_dp_fst_get_reo_indication(ab);
++	}
++
+ 	fse->reo_indication = flow.reo_indication;
+ 	flow.reo_destination_handler = HAL_RX_FSE_REO_DEST_FT;
+ 	flow.fse_metadata = flow_info->fse_metadata;
++	if (flow_info->use_ppe) {
++		flow.use_ppe = flow_info->use_ppe;
++		flow.service_code = PPE_DRV_SC_SPF_BYPASS;
++	}
+ 	fse->hal_fse = ath12k_hal_rx_flow_setup_fse(ab, fst->hal_rx_fst,
+ 						    fse->flow_id, &flow);
+ 	if (!fse->hal_fse) {
+ 		ath12k_err(ab, "Unable to alloc FSE entry");
+-		ath12k_dp_rx_flow_dump_flow_entry(ab, fst, &flow_info->flow_tuple_info);
++		ath12k_dp_rx_flow_dump_flow_entry(ab, &flow_info->flow_tuple_info);
+ 		fse->is_valid = false;
+ 		spin_unlock_bh(&fst->fst_lock);
+ 		return -EEXIST;
+ 	}
+ 
+-	for (i = 0; i < ab->ag->num_chip; i++) {
+-		struct ath12k_base *partner_ab = ab->ag->ab[i];
+-
+-		if (!partner_ab)
+-			continue;
+-
+-		ret = ath12k_htt_rx_flow_fse_operation(partner_ab,
+-						       DP_HTT_FST_CACHE_INVALIDATE_ENTRY,
+-						       &flow_info->flow_tuple_info);
+-		if (ret) {
+-			ath12k_err(partner_ab, "Unable to invalidate cache entry ret %d",
+-				   ret);
+-			ath12k_dp_rx_flow_dump_flow_entry(partner_ab, fst,
+-							  &flow_info->flow_tuple_info);
+-			ath12k_hal_rx_flow_delete_entry(partner_ab, fse->hal_fse);
+-			fse->is_valid = false;
+-			spin_unlock_bh(&fst->fst_lock);
+-			return ret;
+-		}
++	ret = ath12k_dp_rx_invalidate_entry(ab, DP_HTT_FST_CACHE_INVALIDATE_ENTRY,
++					    &flow_info->flow_tuple_info);
++	if (ret) {
++		ath12k_err(ab, "Unable to invalidate cache entry ret %d", ret);
++		ath12k_dp_rx_flow_dump_flow_entry(ab, &flow_info->flow_tuple_info);
++		ath12k_hal_rx_flow_delete_entry(ab, fse->hal_fse);
++		fse->is_valid = false;
++		spin_unlock_bh(&fst->fst_lock);
++		return ret;
+ 	}
+ 
+ 	fst->num_entries++;
+@@ -6061,7 +6089,6 @@ int ath12k_dp_rx_flow_delete_entry(struct ath12k_base *ab,
+ 	struct hal_rx_flow flow = { 0 };
+ 	struct dp_rx_fse *fse;
+ 	struct dp_rx_fst *fst = ab->ag->fst;
+-	int i;
+ 	int ret;
+ 
+ 	if (!fst) {
+@@ -6075,7 +6102,7 @@ int ath12k_dp_rx_flow_delete_entry(struct ath12k_base *ab,
+ 	fse = ath12k_dp_rx_flow_find_entry_by_tuple(ab, fst, flow_info, &flow);
+ 	if (!fse || !fse->is_valid) {
+ 		ath12k_err(ab, "RX flow delete entry failed");
+-		ath12k_dp_rx_flow_dump_flow_entry(ab, fst, &flow_info->flow_tuple_info);
++		ath12k_dp_rx_flow_dump_flow_entry(ab, &flow_info->flow_tuple_info);
+ 		spin_unlock_bh(&fst->fst_lock);
+ 		return -EINVAL;
+ 	}
+@@ -6089,24 +6116,13 @@ int ath12k_dp_rx_flow_delete_entry(struct ath12k_base *ab,
+ 	/* Decrement number of valid entries in table */
+ 	fst->num_entries--;
+ 
+-	for (i = 0; i < ab->ag->num_chip; i++) {
+-		struct ath12k_base *partner_ab = ab->ag->ab[i];
+-
+-		if (!partner_ab)
+-			continue;
+-
+-		ret = ath12k_htt_rx_flow_fse_operation(partner_ab,
+-						       DP_HTT_FST_CACHE_INVALIDATE_ENTRY,
+-						       &flow_info->flow_tuple_info);
+-		if (ret) {
+-			ath12k_err(partner_ab, "Unable to invalidate cache entry ret %d",
+-				   ret);
+-			ath12k_dp_rx_flow_dump_flow_entry(partner_ab, fst,
+-							  &flow_info->flow_tuple_info);
+-			/* Do not add entry back in DP FSE and HAL FSE */
+-			spin_unlock_bh(&fst->fst_lock);
+-			return ret;
+-		}
++	ret = ath12k_dp_rx_invalidate_entry(ab, DP_HTT_FST_CACHE_INVALIDATE_ENTRY,
++					    &flow_info->flow_tuple_info);
++	if (ret) {
++		ath12k_err(ab, "Unable to invalidate cache entry ret %d", ret);
++		ath12k_dp_rx_flow_dump_flow_entry(ab, &flow_info->flow_tuple_info);
++		spin_unlock_bh(&fst->fst_lock);
++		return ret;
+ 	}
+ 
+ 	spin_unlock_bh(&fst->fst_lock);
+@@ -6150,21 +6166,11 @@ int ath12k_dp_rx_flow_delete_all_entries(struct ath12k_base *ab)
+ 		fst->flows_per_reo[fse->reo_indication - 1]--;
+ 	}
+ 
+-	for (i = 0; i < ab->ag->num_chip; i++) {
+-		struct ath12k_base *partner_ab = ab->ag->ab[i];
+-
+-		if (!partner_ab)
+-			continue;
+-
+-		ret = ath12k_htt_rx_flow_fse_operation(partner_ab,
+-						       DP_HTT_FST_CACHE_INVALIDATE_FULL,
+-						       NULL);
+-		if (ret) {
+-			ath12k_err(partner_ab, "Unable to invalidate the entire cache ret %d",
+-				   ret);
+-			spin_unlock_bh(&fst->fst_lock);
+-			return ret;
+-		}
++	ret = ath12k_dp_rx_invalidate_entry(ab, DP_HTT_FST_CACHE_INVALIDATE_FULL, NULL);
++	if (ret) {
++		ath12k_err(ab, "Unable to invalidate cache entry ret %d", ret);
++		spin_unlock_bh(&fst->fst_lock);
++		return ret;
+ 	}
+ 
+ 	spin_unlock_bh(&fst->fst_lock);
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.h b/drivers/net/wireless/ath/ath12k/dp_rx.h
+index 8720bbd..0da14ab 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -164,9 +164,12 @@ struct dp_rx_fst {
+ };
+ 
+ struct rx_flow_info {
+-	bool is_addr_ipv4;
+ 	struct hal_flow_tuple_info flow_tuple_info;
+ 	u16 fse_metadata;
++	u8 ring_id;
++	u8 is_addr_ipv4	:1,
++	   use_ppe	:1,
++	   drop		:1;
+ };
+ 
+ struct dp_rx_fse {
+diff --git a/drivers/net/wireless/ath/ath12k/fse.c b/drivers/net/wireless/ath/ath12k/fse.c
+index 842c19b..3da304a 100644
+--- a/drivers/net/wireless/ath/ath12k/fse.c
++++ b/drivers/net/wireless/ath/ath12k/fse.c
+@@ -82,6 +82,41 @@ void *ath12k_fse_get_ab_from_netdev(struct net_device *dev,
+ 	return ab;
+ }
+ 
++static void ath12k_dp_rx_sfe_update_flow_info(struct ath12k_base *ab,
++					      struct rx_flow_info *flow_info,
++					      u32 *src_ip, u32 src_port,
++					      u32 *dest_ip, u32 dest_port,
++					      u8 protocol, u8 version, int operation)
++{
++	struct hal_flow_tuple_info *tuple_info = &flow_info->flow_tuple_info;
++
++	ath12k_dbg(ab, ATH12K_DBG_DP_FST, "%s S_IP:%x:%x:%x:%x,sPort:%u,D_IP:%x:%x:%x:%x,dPort:%u,Proto:%d,Ver:%d",
++		   fse_state_to_string(operation),
++		   src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port, dest_ip[0],
++		   dest_ip[1], dest_ip[2], dest_ip[3], dest_port, protocol, version);
++
++	tuple_info->src_port = src_port;
++	tuple_info->dest_port = dest_port;
++	tuple_info->l4_protocol = protocol;
++
++	flow_info->fse_metadata = ATH12K_RX_FSE_FLOW_MATCH_SFE;
++
++	if (version == 4) {
++		flow_info->is_addr_ipv4 = 1;
++		tuple_info->src_ip_31_0 = src_ip[0];
++		tuple_info->dest_ip_31_0 = dest_ip[0];
++	} else if (version == 6) {
++		tuple_info->src_ip_31_0 = src_ip[3];
++		tuple_info->src_ip_63_32 = src_ip[2];
++		tuple_info->src_ip_95_64 = src_ip[1];
++		tuple_info->src_ip_127_96 = src_ip[0];
++		tuple_info->dest_ip_31_0 = dest_ip[3];
++		tuple_info->dest_ip_63_32 = dest_ip[2];
++		tuple_info->dest_ip_95_64 = dest_ip[1];
++		tuple_info->dest_ip_127_96 = dest_ip[0];
++	}
++}
++
+ int ath12k_sfe_add_flow_entry(struct ath12k_base *ab,
+ 			      u32 *src_ip, u32 src_port,
+ 			      u32 *dest_ip, u32 dest_port,
+@@ -93,30 +128,9 @@ int ath12k_sfe_add_flow_entry(struct ath12k_base *ab,
+ 	if (!ath12k_fse_enable)
+ 		return -EINVAL;
+ 
+-	ath12k_dbg(ab, ATH12K_DBG_DP_FST, "ADD S_IP:%x:%x:%x:%x,sPort:%u,D_IP:%x:%x:%x:%x,dPort:%u,Proto:%d,Ver:%d",
+-		   src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port, dest_ip[0],
+-		   dest_ip[1], dest_ip[2], dest_ip[3], dest_port, protocol, version);
+-
+-	flow_info.flow_tuple_info.src_port = src_port;
+-	flow_info.flow_tuple_info.dest_port = dest_port;
+-	flow_info.flow_tuple_info.l4_protocol = protocol;
+-
+-	flow_info.fse_metadata = ATH12K_RX_FSE_FLOW_MATCH_SFE;
++	ath12k_dp_rx_sfe_update_flow_info(ab, &flow_info, src_ip, src_port, dest_ip,
++					  dest_port, protocol, version, FSE_RULE_ADD);
+ 
+-	if (version == 4) {
+-		flow_info.is_addr_ipv4 = 1;
+-		flow_info.flow_tuple_info.src_ip_31_0 = src_ip[0];
+-		flow_info.flow_tuple_info.dest_ip_31_0 = dest_ip[0];
+-	} else if (version == 6) {
+-		flow_info.flow_tuple_info.src_ip_31_0 = src_ip[3];
+-		flow_info.flow_tuple_info.src_ip_63_32 = src_ip[2];
+-		flow_info.flow_tuple_info.src_ip_95_64 = src_ip[1];
+-		flow_info.flow_tuple_info.src_ip_127_96 = src_ip[0];
+-		flow_info.flow_tuple_info.dest_ip_31_0 = dest_ip[3];
+-		flow_info.flow_tuple_info.dest_ip_63_32 = dest_ip[2];
+-		flow_info.flow_tuple_info.dest_ip_95_64 = dest_ip[1];
+-		flow_info.flow_tuple_info.dest_ip_127_96 = dest_ip[0];
+-	}
+ 	return ath12k_dp_rx_flow_add_entry(ab, &flow_info);
+ }
+ 
+@@ -130,28 +144,8 @@ int ath12k_sfe_delete_flow_entry(struct ath12k_base *ab,
+ 	if (!ath12k_fse_enable)
+ 		return -EINVAL;
+ 
+-	ath12k_dbg(ab, ATH12K_DBG_DP_FST, "DEL S_IP:%x:%x:%x:%x,sPort:%u,D_IP:%x:%x:%x:%x,dPort:%u,Proto:%d,Ver:%d",
+-		   src_ip[0], src_ip[1], src_ip[2], src_ip[3], src_port, dest_ip[0],
+-		   dest_ip[1], dest_ip[2], dest_ip[3], dest_port, protocol, version);
+-
+-	flow_info.flow_tuple_info.src_port = src_port;
+-	flow_info.flow_tuple_info.dest_port = dest_port;
+-	flow_info.flow_tuple_info.l4_protocol = protocol;
++	ath12k_dp_rx_sfe_update_flow_info(ab, &flow_info, src_ip, src_port, dest_ip,
++					  dest_port, protocol, version, FSE_RULE_DELETE);
+ 
+-	if (version == 4) {
+-		flow_info.is_addr_ipv4 = 1;
+-		flow_info.flow_tuple_info.src_ip_31_0 = src_ip[0];
+-		flow_info.flow_tuple_info.dest_ip_31_0 = dest_ip[0];
+-	} else if (version == 6) {
+-		flow_info.flow_tuple_info.src_ip_31_0 = src_ip[3];
+-		flow_info.flow_tuple_info.src_ip_63_32 = src_ip[2];
+-		flow_info.flow_tuple_info.src_ip_95_64 = src_ip[1];
+-		flow_info.flow_tuple_info.src_ip_127_96 = src_ip[0];
+-
+-		flow_info.flow_tuple_info.dest_ip_31_0 = dest_ip[3];
+-		flow_info.flow_tuple_info.dest_ip_63_32 = dest_ip[2];
+-		flow_info.flow_tuple_info.dest_ip_95_64 = dest_ip[1];
+-		flow_info.flow_tuple_info.dest_ip_127_96 = dest_ip[0];
+-	}
+ 	return ath12k_dp_rx_flow_delete_entry(ab, &flow_info);
+ }
+diff --git a/drivers/net/wireless/ath/ath12k/fse.h b/drivers/net/wireless/ath/ath12k/fse.h
+index bf0802d..0474421 100644
+--- a/drivers/net/wireless/ath/ath12k/fse.h
++++ b/drivers/net/wireless/ath/ath12k/fse.h
+@@ -9,6 +9,25 @@
+ #include <ath/ath_fse.h>
+ 
+ #define ATH12K_RX_FSE_FLOW_MATCH_SFE 0xAAAA
++
++enum fse_operation {
++	FSE_RULE_ADD,
++	FSE_RULE_DELETE,
++	FSE_RULE_MAX,
++};
++
++static inline char *fse_state_to_string(enum fse_operation operation)
++{
++	switch (operation) {
++	case FSE_RULE_ADD:
++		return "ADD";
++	case FSE_RULE_DELETE:
++		return "DELETE";
++	default:
++		return "UNKNOWN_COMMAND";
++	}
++}
++
+ void ath12k_fse_init(struct ath12k_base *ab);
+ void ath12k_fse_deinit(struct ath12k_base *ab);
+ void *ath12k_fse_get_ab_from_netdev(struct net_device *dev,
+diff --git a/drivers/net/wireless/ath/ath12k/hal_rx.c b/drivers/net/wireless/ath/ath12k/hal_rx.c
+index de7b44d..c346cd3 100644
+--- a/drivers/net/wireless/ath/ath12k/hal_rx.c
++++ b/drivers/net/wireless/ath/ath12k/hal_rx.c
+@@ -1179,6 +1179,11 @@ ssize_t ath12k_hal_rx_dump_fst_table(struct hal_rx_fst *fst, char *buf, int size
+ 				u32_get_bits(hal_fse->info2, HAL_RX_FSE_REO_INDICATION),
+ 				u32_get_bits(hal_fse->info2,
+ 					     HAL_RX_FSE_REO_DESTINATION_HANDLER));
++		len += scnprintf(buf + len, size - len,
++				"drop 0x%x use_ppe: 0x%x service_code 0x%x\n",
++				u32_get_bits(hal_fse->info2, HAL_RX_FSE_MSDU_DROP),
++				u32_get_bits(hal_fse->info2, HAL_RX_FSE_USE_PPE),
++				u32_get_bits(hal_fse->info2, HAL_RX_FSE_SERVICE_CODE));
+ 		len += scnprintf(buf + len, size - len, "metadata: 0x%x\n\n",
+ 				 hal_fse->metadata);
+ 	}
+@@ -1323,22 +1328,15 @@ void *ath12k_hal_rx_flow_setup_fse(struct ath12k_base *ab, struct hal_rx_fst *fs
+ 	hal_fse->info2 = u32_encode_bits(flow->tuple_info.l4_protocol,
+ 					 HAL_RX_FSE_L4_PROTOCOL);
+ 	hal_fse->info2 |= u32_encode_bits(1, HAL_RX_FSE_VALID);
+-	hal_fse->info2 |= u32_encode_bits(0, HAL_RX_FSE_RESERVED);
+-	hal_fse->info2 |= u32_encode_bits(0, HAL_RX_FSE_SERVICE_CODE);
+-	hal_fse->info2 |= u32_encode_bits(0, HAL_RX_FSE_PRIORITY_VALID);
+-	hal_fse->info2 |= u32_encode_bits(0, HAL_RX_FSE_USE_PPE);
++	hal_fse->info2 |= u32_encode_bits(flow->service_code, HAL_RX_FSE_SERVICE_CODE);
++	hal_fse->info2 |= u32_encode_bits(flow->use_ppe, HAL_RX_FSE_USE_PPE);
+ 	hal_fse->info2 |= u32_encode_bits(flow->reo_indication,
+ 					  HAL_RX_FSE_REO_INDICATION);
+-	hal_fse->info2 |= u32_encode_bits(0, HAL_RX_FSE_MSDU_DROP);
++	hal_fse->info2 |= u32_encode_bits(flow->drop, HAL_RX_FSE_MSDU_DROP);
+ 	hal_fse->info2 |= u32_encode_bits(flow->reo_destination_handler,
+ 					  HAL_RX_FSE_REO_DESTINATION_HANDLER);
+-
+-	hal_fse->info3 = u32_encode_bits(1, HAL_RX_FSE_AGGREGATION_COUNT);
+-	hal_fse->info3 |= u32_encode_bits(0, HAL_RX_FSE_LRO_ELIGIBLE);
+-	hal_fse->info3 |= u32_encode_bits(0, HAL_RX_FSE_MSDU_COUNT);
+-
+-	hal_fse->info4 = u32_encode_bits(0, HAL_RX_FSE_CUMULATIVE_IP_LEN);
+-	hal_fse->info4 |= u32_encode_bits(0, HAL_RX_FSE_CUMULATIVE_IP_LEN1);
++	hal_fse->info3 = 0;
++	hal_fse->info4 = 0;
+ 
+ 	ath12k_dbg_dump(ab, ATH12K_DBG_DP_FST, NULL, "Hal FSE setup:",
+ 			hal_fse, sizeof(*hal_fse));
+diff --git a/drivers/net/wireless/ath/ath12k/hal_rx.h b/drivers/net/wireless/ath/ath12k/hal_rx.h
+index 1859b88..f68e307 100644
+--- a/drivers/net/wireless/ath/ath12k/hal_rx.h
++++ b/drivers/net/wireless/ath/ath12k/hal_rx.h
+@@ -1174,9 +1174,12 @@ struct hal_flow_tuple_info {
+ 
+ struct hal_rx_flow {
+ 	struct hal_flow_tuple_info tuple_info;
++	u32 fse_metadata;
++	u16 service_code;
+ 	u8 reo_destination_handler;
+ 	u8 reo_indication;
+-	u32 fse_metadata;
++	u8 use_ppe	:1,
++	   drop		:1;
+ };
+ 
+ /* info1 subfields */
+@@ -1188,7 +1191,7 @@ struct hal_rx_flow {
+ #define HAL_RX_FSE_VALID			GENMASK(8, 8)
+ #define HAL_RX_FSE_RESERVED			GENMASK(12, 9)
+ #define HAL_RX_FSE_SERVICE_CODE			GENMASK(21, 13)
+-#define HAL_RX_FSE_PRIORITY_VALID		GENMASK(22, 22)
++#define HAL_RX_FSE_PRIORITY_VLD			GENMASK(22, 22)
+ #define HAL_RX_FSE_USE_PPE			GENMASK(23, 23)
+ #define HAL_RX_FSE_REO_INDICATION		GENMASK(28, 24)
+ #define HAL_RX_FSE_MSDU_DROP			GENMASK(29, 29)
+-- 
+2.34.1
+

@@ -1,0 +1,387 @@
+hostapd: Use BIGTK from the transmitted BSS for beacon protection
+
+MBSSID shares a single Beacon frame with multiple BSSs. This implies
+that the key used for beacon protection (BIGTK) needs to be shared. The
+nontransmitted BSSs managed their own BIGTK previously and that resulted
+in providing incorrect value to the stations associated with those BSSs.
+Use the BIGTK from the transmitted BSS to fix this.
+
+Signed-off-by: Jouni Malinen <quic_jouni@quicinc.com>
+Signed-off-by: Karthikeyan Kathirvel <quic_kathirve@quicinc.com>
+
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -735,6 +735,15 @@ struct wpa_authenticator * wpa_init(cons
+ 	}
+ #endif /* CONFIG_P2P */
+ 
++	if (conf->tx_bss_auth && conf->beacon_prot) {
++		conf->tx_bss_auth->non_tx_beacon_prot = true;
++		if (!conf->tx_bss_auth->conf.beacon_prot)
++			conf->tx_bss_auth->conf.beacon_prot = true;
++		if (!conf->tx_bss_auth->conf.group_mgmt_cipher)
++			conf->tx_bss_auth->conf.group_mgmt_cipher =
++				conf->group_mgmt_cipher;
++	}
++
+ 	return wpa_auth;
+ }
+ 
+@@ -3717,14 +3726,18 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING2)
+ static int ieee80211w_kde_len(struct wpa_state_machine *sm)
+ {
+ 	size_t len = 0;
++	struct wpa_authenticator *wpa_auth = sm->wpa_auth;
+ 
+ 	if (sm->mgmt_frame_prot) {
+ 		len += 2 + RSN_SELECTOR_LEN + WPA_IGTK_KDE_PREFIX_LEN;
+-		len += wpa_cipher_key_len(sm->wpa_auth->conf.group_mgmt_cipher);
++		len += wpa_cipher_key_len(wpa_auth->conf.group_mgmt_cipher);
+ 	}
++
++	if (wpa_auth->conf.tx_bss_auth)
++		wpa_auth = wpa_auth->conf.tx_bss_auth;
+ 	if (sm->mgmt_frame_prot && sm->wpa_auth->conf.beacon_prot) {
+ 		len += 2 + RSN_SELECTOR_LEN + WPA_BIGTK_KDE_PREFIX_LEN;
+-		len += wpa_cipher_key_len(sm->wpa_auth->conf.group_mgmt_cipher);
++		len += wpa_cipher_key_len(wpa_auth->conf.group_mgmt_cipher);
+ 	}
+ 
+ 	return len;
+@@ -3737,7 +3750,8 @@ static u8 * ieee80211w_kde_add(struct wp
+ 	struct wpa_bigtk_kde bigtk;
+ 	struct wpa_group *gsm = sm->group;
+ 	u8 rsc[WPA_KEY_RSC_LEN];
+-	struct wpa_auth_config *conf = &sm->wpa_auth->conf;
++	struct wpa_authenticator *wpa_auth = sm->wpa_auth;
++	struct wpa_auth_config *conf = &wpa_auth->conf;
+ 	size_t len = wpa_cipher_key_len(conf->group_mgmt_cipher);
+ 
+ 	if (!sm->mgmt_frame_prot)
+@@ -3769,7 +3783,14 @@ static u8 * ieee80211w_kde_add(struct wp
+ 			  NULL, 0);
+ 	forced_memzero(&igtk, sizeof(igtk));
+ 
+-	if (!conf->beacon_prot)
++	if (wpa_auth->conf.tx_bss_auth) {
++		wpa_auth = wpa_auth->conf.tx_bss_auth;
++		conf = &wpa_auth->conf;
++		len = wpa_cipher_key_len(conf->group_mgmt_cipher);
++		gsm = wpa_auth->group;
++	}
++
++	if (!sm->wpa_auth->conf.beacon_prot)
+ 		return pos;
+ 
+ 	bigtk.keyid[0] = gsm->GN_bigtk;
+@@ -3927,6 +3948,11 @@ void wpa_auth_ml_get_key_info(struct wpa
+ 	if (!beacon_prot)
+ 		return;
+ 
++	if (a->conf.tx_bss_auth) {
++		a = a->conf.tx_bss_auth;
++		gsm = a->group;
++	}
++
+ 	info->bigtkidx = gsm->GN_bigtk;
+ 	info->bigtk = gsm->BIGTK[gsm->GN_bigtk - 6];
+ 
+@@ -3978,6 +4004,9 @@ static size_t wpa_auth_ml_group_kdes_len
+ 			kde_len += (KDE_HDR_LEN + WPA_IGTK_KDE_PREFIX_LEN + 1);
+ 			kde_len += wpa_cipher_key_len(wpa_auth->conf.group_mgmt_cipher);
+ 
++			if (wpa_auth->conf.tx_bss_auth)
++				wpa_auth = wpa_auth->conf.tx_bss_auth;
++
+ 			if (wpa_auth->conf.beacon_prot) {
+ 				/* MLO BIGTK KDE
+ 				 * Header + Key-idx & IPN + Link-id
+@@ -5117,19 +5146,30 @@ static int wpa_gtk_update(struct wpa_aut
+ 				group->IGTK[group->GN_igtk - 4], len);
+ 	}
+ 
+-	if (conf->ieee80211w != NO_MGMT_FRAME_PROTECTION &&
+-	    conf->beacon_prot) {
+-		len = wpa_cipher_key_len(conf->group_mgmt_cipher);
+-		os_memcpy(group->GNonce, group->Counter, WPA_NONCE_LEN);
+-		inc_byte_array(group->Counter, WPA_NONCE_LEN);
+-		if (wpa_gmk_to_gtk(group->GMK, "BIGTK key expansion",
+-				   wpa_auth->addr, group->GNonce,
+-				   group->BIGTK[group->GN_bigtk - 6], len) < 0)
+-			ret = -1;
+-		wpa_hexdump_key(MSG_DEBUG, "BIGTK",
+-				group->BIGTK[group->GN_bigtk - 6], len);
++	if (!wpa_auth->non_tx_beacon_prot &&
++	    conf->ieee80211w == NO_MGMT_FRAME_PROTECTION)
++		return ret;
++	if (!conf->beacon_prot)
++		return ret;
++
++	if (wpa_auth->conf.tx_bss_auth) {
++		group = wpa_auth->conf.tx_bss_auth->group;
++		if (group->bigtk_set)
++			return ret;
++		wpa_printf(MSG_DEBUG, "Set up BIGTK for TX BSS");
+ 	}
+ 
++	len = wpa_cipher_key_len(conf->group_mgmt_cipher);
++	os_memcpy(group->GNonce, group->Counter, WPA_NONCE_LEN);
++	inc_byte_array(group->Counter, WPA_NONCE_LEN);
++	if (wpa_gmk_to_gtk(group->GMK, "BIGTK key expansion",
++			   wpa_auth->addr, group->GNonce,
++			   group->BIGTK[group->GN_bigtk - 6], len) < 0)
++		return -1;
++	group->bigtk_set = true;
++	wpa_hexdump_key(MSG_DEBUG, "BIGTK",
++			group->BIGTK[group->GN_bigtk - 6], len);
++
+ 	return ret;
+ }
+ 
+@@ -5313,9 +5353,10 @@ int wpa_wnmsleep_igtk_subelem(struct wpa
+ 
+ int wpa_wnmsleep_bigtk_subelem(struct wpa_state_machine *sm, u8 *pos)
+ {
+-	struct wpa_group *gsm = sm->group;
++	struct wpa_authenticator *wpa_auth = sm->wpa_auth;
++	struct wpa_group *gsm = wpa_auth->group;
+ 	u8 *start = pos;
+-	size_t len = wpa_cipher_key_len(sm->wpa_auth->conf.group_mgmt_cipher);
++	size_t len = wpa_cipher_key_len(wpa_auth->conf.group_mgmt_cipher);
+ 
+ 	/*
+ 	 * BIGTK subelement:
+@@ -5325,7 +5366,7 @@ int wpa_wnmsleep_bigtk_subelem(struct wp
+ 	*pos++ = 2 + 6 + len;
+ 	WPA_PUT_LE16(pos, gsm->GN_bigtk);
+ 	pos += 2;
+-	if (wpa_auth_get_seqnum(sm->wpa_auth, NULL, gsm->GN_bigtk, pos) != 0)
++	if (wpa_auth_get_seqnum(wpa_auth, NULL, gsm->GN_bigtk, pos) != 0)
+ 		return 0;
+ 	pos += 6;
+ 
+@@ -5421,12 +5462,21 @@ static int wpa_group_config_group_keys(s
+ 				     KEY_FLAG_GROUP_TX_DEFAULT) < 0)
+ 			ret = -1;
+ 
+-		if (ret == 0 && conf->beacon_prot &&
+-		    wpa_auth_set_key(wpa_auth, group->vlan_id, alg,
++		if (ret || !conf->beacon_prot)
++			return ret;
++		if (wpa_auth->conf.tx_bss_auth) {
++			wpa_auth = wpa_auth->conf.tx_bss_auth;
++			group = wpa_auth->group;
++			if (!group->bigtk_set || group->bigtk_configured)
++				return ret;
++		}
++		if (wpa_auth_set_key(wpa_auth, group->vlan_id, alg,
+ 				     broadcast_ether_addr, group->GN_bigtk,
+ 				     group->BIGTK[group->GN_bigtk - 6], len,
+ 				     KEY_FLAG_GROUP_TX_DEFAULT) < 0)
+ 			ret = -1;
++		else
++			group->bigtk_configured = true;
+ 	}
+ 
+ 	return ret;
+@@ -5609,9 +5659,11 @@ void wpa_gtk_rekey(struct wpa_authentica
+ 		tmp = group->GM_igtk;
+ 		group->GM_igtk = group->GN_igtk;
+ 		group->GN_igtk = tmp;
+-		tmp = group->GM_bigtk;
+-		group->GM_bigtk = group->GN_bigtk;
+-		group->GN_bigtk = tmp;
++		if (!wpa_auth->conf.tx_bss_auth) {
++			tmp = group->GM_bigtk;
++			group->GM_bigtk = group->GN_bigtk;
++			group->GN_bigtk = tmp;
++		}
+ 		wpa_gtk_update(wpa_auth, group);
+ 		wpa_group_config_group_keys(wpa_auth, group);
+ 	}
+--- a/src/ap/wpa_auth.h
++++ b/src/ap/wpa_auth.h
+@@ -280,6 +280,11 @@ struct wpa_auth_config {
+ 	u8 *mld_addr;
+ 	int link_id;
+ 	struct wpa_authenticator *first_link_auth;
++
++	/* Pointer to Multi-BSSID transmitted BSS authenticator instance.
++	 * Set only in nontransmitted BSSs, i.e., is NULL for transmitted BSS
++	 * and in BSSs that are not part of a Multi-BSSID set. */
++	struct wpa_authenticator *tx_bss_auth;
+ };
+ 
+ typedef enum {
+--- a/src/ap/wpa_auth_ft.c
++++ b/src/ap/wpa_auth_ft.c
+@@ -2673,7 +2673,8 @@ static u8 * wpa_ft_igtk_subelem(struct w
+ static u8 * wpa_ft_bigtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ {
+ 	u8 *subelem, *pos;
+-	struct wpa_group *gsm = sm->group;
++	struct wpa_authenticator *wpa_auth = sm->wpa_auth;
++	struct wpa_group *gsm = wpa_auth->group;
+ 	size_t subelem_len;
+ 	const u8 *kek, *bigtk;
+ 	size_t kek_len;
+@@ -2688,7 +2689,7 @@ static u8 * wpa_ft_bigtk_subelem(struct
+ 		kek_len = sm->PTK.kek_len;
+ 	}
+ 
+-	bigtk_len = wpa_cipher_key_len(sm->wpa_auth->conf.group_mgmt_cipher);
++	bigtk_len = wpa_cipher_key_len(wpa_auth->conf.group_mgmt_cipher);
+ 
+ 	/* Sub-elem ID[1] | Length[1] | KeyID[2] | BIPN[6] | Key Length[1] |
+ 	 * Key[16+8] */
+@@ -2702,7 +2703,7 @@ static u8 * wpa_ft_bigtk_subelem(struct
+ 	*pos++ = subelem_len - 2;
+ 	WPA_PUT_LE16(pos, gsm->GN_bigtk);
+ 	pos += 2;
+-	wpa_auth_get_seqnum(sm->wpa_auth, NULL, gsm->GN_bigtk, pos);
++	wpa_auth_get_seqnum(wpa_auth, NULL, gsm->GN_bigtk, pos);
+ 	pos += 6;
+ 	*pos++ = bigtk_len;
+ 	bigtk = gsm->IGTK[gsm->GN_bigtk - 6];
+--- a/src/ap/wpa_auth_glue.c
++++ b/src/ap/wpa_auth_glue.c
+@@ -38,9 +38,14 @@ static int hostapd_wpa_auth_config_sanit
+ 					    struct wpa_auth_config *_conf)
+ {
+ 	struct hostapd_data *lhapd = NULL;
++	struct hostapd_data *tx_bss;
+ 
+ 	_conf->msg_ctx = hapd->msg_ctx;
+ 
++	tx_bss = hostapd_mbssid_get_tx_bss(hapd);
++	if (tx_bss != hapd)
++		_conf->tx_bss_auth = tx_bss->wpa_auth;
++
+ 	if (hapd->iface->drv_flags & WPA_DRIVER_FLAGS_EAPOL_TX_STATUS)
+ 		_conf->tx_status = 1;
+ 
+--- a/src/ap/wpa_auth_i.h
++++ b/src/ap/wpa_auth_i.h
+@@ -224,6 +224,8 @@ struct wpa_group {
+ 	u8 BIGTK[2][WPA_IGTK_MAX_LEN];
+ 	int GN_igtk, GM_igtk;
+ 	int GN_bigtk, GM_bigtk;
++	bool bigtk_set;
++	bool bigtk_configured;
+ 	/* Number of references except those in struct wpa_group->next */
+ 	unsigned int references;
+ 	unsigned int num_setup_iface;
+@@ -259,6 +261,8 @@ struct wpa_authenticator {
+ 	struct rsn_pmksa_cache *pmksa;
+ 	struct wpa_ft_pmk_cache *ft_pmk_cache;
+ 
++	bool non_tx_beacon_prot;
++
+ #ifdef CONFIG_P2P
+ 	struct bitfield *ip_pool;
+ #endif /* CONFIG_P2P */
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -8394,6 +8394,39 @@ static bool mbssid_known_bss(unsigned in
+ 	return *known_bss & (u8) (BIT(i % 8));
+ }
+ 
++static size_t hostapd_mbssid_ext_capa(struct hostapd_data *bss,
++				      struct hostapd_data *tx_bss, u8 *buf)
++{
++	u8 *ext_capa_tx, *ext_capa_tx_end, *ext_capa, *ext_capa_end;
++	size_t ext_capa_len, ext_capa_tx_len, len = 0;
++
++	ext_capa_tx = os_malloc(hostapd_eid_ext_capab_len(tx_bss));
++	if (!ext_capa_tx)
++		return 0;
++
++	ext_capa = os_malloc(hostapd_eid_ext_capab_len(bss));
++	if (!ext_capa)
++		goto err_ext_capa;
++
++	ext_capa_tx_end = hostapd_eid_ext_capab(tx_bss, ext_capa_tx,
++						true);
++	ext_capa_tx_len = ext_capa_tx_end - ext_capa_tx;
++	ext_capa_end = hostapd_eid_ext_capab(bss, ext_capa, true);
++	ext_capa_len = ext_capa_end - ext_capa;
++	if (ext_capa_tx_len != ext_capa_len ||
++	    os_memcmp(ext_capa_tx, ext_capa, ext_capa_len) != 0) {
++		if (buf)
++			os_memcpy(buf, ext_capa, ext_capa_len);
++		len = ext_capa_len;
++	}
++
++	os_free(ext_capa);
++err_ext_capa:
++	os_free(ext_capa_tx);
++
++	return len;
++}
++
+ 
+ static size_t hostapd_eid_mbssid_elem_len(struct hostapd_data *hapd_probed,
+ 					  u32 frame_type, size_t *bss_index,
+@@ -8453,6 +8486,9 @@ static size_t hostapd_eid_mbssid_elem_le
+ 			if (rsnx)
+ 				nontx_profile_len += 2 + rsnx[1];
+ 		}
++
++		nontx_profile_len += hostapd_mbssid_ext_capa(bss, tx_bss, NULL);
++
+ 		if (!rsn && hostapd_wpa_ie(tx_bss, WLAN_EID_RSN))
+ 			ie_count++;
+ 		if (!rsnx && hostapd_wpa_ie(tx_bss, WLAN_EID_RSNX))
+@@ -8638,6 +8674,9 @@ static u8 * hostapd_eid_mbssid_elem(stru
+ 				eid += 2 + rsnx[1];
+ 			}
+ 		}
++
++		eid += hostapd_mbssid_ext_capa(bss, tx_bss, eid);
++
+ 		eid = hostapd_eid_ext_supp_rates(bss, eid, &xrate_len);
+ 		if (!rsn && hostapd_wpa_ie(tx_bss, WLAN_EID_RSN))
+ 			non_inherit_ie[ie_count++] = WLAN_EID_RSN;
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -457,12 +457,9 @@ static void hostapd_ext_capab_byte(struc
+ 	}
+ }
+ 
+-
+-u8 * hostapd_eid_ext_capab(struct hostapd_data *hapd, u8 *eid,
+-			   bool mbssid_complete)
++size_t hostapd_eid_ext_capab_len(struct hostapd_data *hapd)
+ {
+-	u8 *pos = eid;
+-	u8 len = EXT_CAPA_MAX_LEN, i;
++	u8 len = EXT_CAPA_MAX_LEN;
+ 
+ 	if (len < hapd->iface->extended_capa_len)
+ 		len = hapd->iface->extended_capa_len;
+@@ -470,6 +467,15 @@ u8 * hostapd_eid_ext_capab(struct hostap
+ 	 if (hapd->iconf->ext_cap_len > 0 && hapd->iconf->ext_cap_len < len)
+ 		 len = hapd->iconf->ext_cap_len;
+ 
++	 return len;
++}
++
++u8 * hostapd_eid_ext_capab(struct hostapd_data *hapd, u8 *eid,
++			   bool mbssid_complete)
++{
++	u8 *pos = eid;
++	u8 i, len = hostapd_eid_ext_capab_len(hapd);
++
+ 	*pos++ = WLAN_EID_EXT_CAPAB;
+ 	*pos++ = len;
+ 	for (i = 0; i < len; i++, pos++) {
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -58,6 +58,7 @@ static inline int ieee802_11_get_mib_sta
+ #endif /* NEED_AP_MLME */
+ u16 hostapd_own_capab_info(struct hostapd_data *hapd);
+ void ap_ht2040_timeout(void *eloop_data, void *user_data);
++size_t hostapd_eid_ext_capab_len(struct hostapd_data *hapd);
+ u8 * hostapd_eid_ext_capab(struct hostapd_data *hapd, u8 *eid,
+ 			   bool mbssid_complete);
+ u8 * hostapd_eid_qos_map_set(struct hostapd_data *hapd, u8 *eid);

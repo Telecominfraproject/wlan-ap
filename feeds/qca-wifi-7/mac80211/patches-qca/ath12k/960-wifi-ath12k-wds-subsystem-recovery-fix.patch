@@ -1,0 +1,476 @@
+From 54a8c165b256304c13f2c55d6c04f3d16d704435 Mon Sep 17 00:00:00 2001
+From: Sidhanta Sahu <quic_sidhanta@quicinc.com>
+Date: Fri, 29 Mar 2024 18:52:04 -0700
+Subject: [PATCH] wifi: ath12k: WDS subsystem recovery fix
+
+wifi: ath12k: WDS subsystem recovery fix
+
+In WDS, mode-0 recovery is broken due to package upgrade. The
+reconfiguration of active stations is changed and driven by mac80211
+reconfiguration.
+
+This change fixes the reconfiguration of the stations post recovery by
+following the same sequence as a fresh association.
+
+Change list:
+        - Fix memory leak arvif and arsta.
+        - Unmap ahsta links map during recovery and map ahsta links
+        during reconfiguration of BSSes post recovery.
+        - Fix Mode-0 SSR for WDS STA mode - by calling link_use channel
+        function before drv_change_sta_links.
+        - Set RECOVERY FLAG for ag dev flags and clear once all the
+        radios are recovered.
+
+Patch-depdendency: 801-04-wifi-ath12k-Add-support-for-Mode-1-recovery-cache.patch
+Patch-work: None
+
+Fixes: I4ecf663a20e("wifi: ath12k: handle ahsta links properly on
+reconfig")
+
+Signed-off-by: Sidhanta Sahu <quic_sidhanta@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c |  65 ++++++++++-
+ drivers/net/wireless/ath/ath12k/core.h |   5 +
+ drivers/net/wireless/ath/ath12k/mac.c  | 147 +++++++++++++++++++++----
+ drivers/net/wireless/ath/ath12k/mhi.c  |   1 +
+ 4 files changed, 191 insertions(+), 27 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1870,6 +1870,7 @@ int ath12k_core_qmi_firmware_ready(struc
+ 		/* initialize the mgmt rx re-order after
+ 		 * mlo mem is available
+ 		 */
++		clear_bit(ATH12K_FLAG_CRASH_FLUSH, &ag->dev_flags);
+ 		ath12k_mgmt_rx_reo_init_context(ab);
+ 		ath12k_qmi_mlo_global_snapshot_mem_init(ab);
+ 
+@@ -2217,15 +2218,21 @@ static void ath12k_core_pre_reconfigure_
+ 		if (!ar || ar->state == ATH12K_STATE_OFF)
+ 			continue;
+ 
+-		list_for_each_entry(arvif, &ar->arvifs, list)
++		mutex_lock(&ar->conf_mutex);
++		list_for_each_entry(arvif, &ar->arvifs, list) {
+ 			if (arvif->is_started)
+ 				ath12k_debugfs_remove_interface(arvif);
+-
+-		list_for_each_entry(arvif, &ar->arvifs, list) {
+ 			arvif->is_started = false;
+ 			arvif->is_created = false;
++			arvif->is_up = false;
+ 		}
+ 
++		ar->monitor_vdev_id = -1;
++		clear_bit(MONITOR_VDEV_STARTED, &ar->monitor_flags);
++		clear_bit(MONITOR_VDEV_CREATED, &ar->monitor_flags);
++
++		mutex_unlock(&ar->conf_mutex);
++
+ 		ath12k_mac_radio_drain_tx(ar);
+ 		complete(&ar->scan.started);
+ 		complete(&ar->scan.completed);
+@@ -2248,10 +2255,6 @@ static void ath12k_core_pre_reconfigure_
+ 		idr_destroy(&ar->txmgmt_idr);
+ 		wake_up(&ar->tx_empty_waitq);
+ 
+-		ar->monitor_vdev_id = -1;
+-		clear_bit(MONITOR_VDEV_STARTED, &ar->monitor_flags);
+-		clear_bit(MONITOR_VDEV_CREATED, &ar->monitor_flags);
+-
+ 		if (ath12k_erp_support) {
+ 			cancel_work_sync(&ar->erp_handle_trigger_work);
+ 			ar->erp_trigger_set = false;
+@@ -3242,23 +3245,10 @@ int ath12k_mode1_recovery_reconfig(struc
+ 		}
+ 	}
+ 
+-	for (i = 0; i < ag->num_hw; i++) {
+-		ah = ag->ah[i];
+-		if (!ah)
+-			continue;
+-
+-		for (j = 0; j < ab->num_radios; j++) {
+-			pdev = &ab->pdevs[j];
+-			ar = pdev->ar;
+-
+-			if (!ar)
+-				continue;
+-
+-			ath12k_mac_reconfig_complete(ah->hw,
+-						     IEEE80211_RECONFIG_TYPE_RESTART,
+-						     ar);
+-		}
+-	}
++	ah = ab->pdevs[0].ar->ah;
++	ath12k_mac_reconfig_complete(ah->hw,
++				     IEEE80211_RECONFIG_TYPE_RESTART,
++				     ab);
+ 
+ 	/* Send WMI_FW_HANG_CMD to FW after target has started. This is to
+ 	* update the target's SSR recovery mode after it has recovered.
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1829,6 +1829,11 @@ void ath12k_dp_umac_reset_deinit(struct
+ void ath12k_umac_reset_completion(struct ath12k_base *ab);
+ void ath12k_umac_reset_notify_pre_reset_done(struct ath12k_base *ab);
+ 
++static inline bool ath12k_hw_group_recovery_in_progress(const struct ath12k_hw_group *ag)
++{
++	return test_bit(ATH12K_FLAG_RECOVERY, &ag->dev_flags);
++}
++
+ static inline const char *ath12k_scan_state_str(enum ath12k_scan_state state)
+ {
+ 	switch (state) {
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -1338,7 +1338,6 @@ void ath12k_mac_peer_cleanup_all(struct
+ {
+ 	struct ath12k_peer *peer, *tmp;
+ 	struct ath12k_base *ab = ar->ab;
+-	struct ath12k_hw_group *ag = ab->ag;
+ 	struct ath12k_link_vif *arvif, *tmp_vif;
+ 	u16 peer_id, ml_peer_id;
+ 
+@@ -1385,10 +1384,8 @@ void ath12k_mac_peer_cleanup_all(struct
+ 	ar->num_peers = 0;
+ 	ar->num_stations = 0;
+ 
+-	if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1) {
+-		list_for_each_entry_safe_reverse(arvif, tmp_vif, &ar->arvifs, list)
+-			arvif->num_stations = 0;
+-	}
++	list_for_each_entry_safe_reverse(arvif, tmp_vif, &ar->arvifs, list)
++		arvif->num_stations = 0;
+ 	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "ath12k mac peer cleanup done\n");
+ }
+ 
+@@ -3693,10 +3690,14 @@ static void ath12k_peer_assoc_h_mlo(stru
+ 		if (i >= ATH12K_WMI_MLO_MAX_LINKS)
+ 			break;
+ 		arsta_p = ahsta->link[link_id];
+-		arvif = arsta_p->arvif;
++		arvif = ahsta->ahvif->link[link_id];
+ 
+ 		if (arsta_p == arsta)
+ 			continue;
++
++		if (!arvif->is_started)
++			continue;
++
+ 		ml->partner_info[i].vdev_id = arvif->vdev_id;
+ 		ml->partner_info[i].hw_link_id = arvif->ar->pdev->hw_link_id;
+ 		ml->partner_info[i].assoc_link = arsta_p->is_assoc_link;
+@@ -5205,6 +5206,12 @@ static void ath12k_mac_op_vif_cfg_change
+ 	if (changed & BSS_CHANGED_ASSOC) {
+ 		for_each_set_bit(link_id, &ahvif->links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
+ 			arvif = ahvif->link[link_id];
++			if (!arvif)
++				continue;
++
++			if (!arvif->is_started)
++				continue;
++
+ 			info = vif->link_conf[link_id];
+ 			ar = arvif->ar;
+ 			if (vif->cfg.assoc) {
+@@ -5412,8 +5419,14 @@ ath12k_mac_assign_link_vif( struct ath12
+ 
+ 	lockdep_assert_held(&ah->conf_mutex);
+ 
+-	if(ahvif->link[link_id])
++	if (ahvif->link[link_id]) {
++		ahvif->link[link_id]->link_id = link_id;
++		ahvif->links_map |= BIT(link_id);
++		ath12k_dbg(NULL, ATH12K_DBG_MAC | ATH12K_DBG_BOOT,
++			   "mac assign link vif: arvif found, link_id:%d\n",
++			   link_id);
+ 		return ahvif->link[link_id];
++	}
+ 
+ 	/* Not a ML vif */
+ 	if (!vif->valid_links && !ahvif->links_map) {
+@@ -7716,6 +7729,18 @@ static u32 ath12k_mac_ieee80211_sta_bw_t
+ 	return bw;
+ }
+ 
++static void ath12k_mac_map_link_sta(struct ath12k_sta *ahsta,
++				    const u8 link_id)
++{
++	ahsta->links_map |= BIT(link_id);
++}
++
++static void ath12k_mac_unmap_link_sta(struct ath12k_sta *ahsta,
++				      const u8 link_id)
++{
++	ahsta->links_map &= ~BIT(link_id);
++}
++
+ static int ath12k_mac_assign_link_sta(struct ath12k_hw *ah,
+ 				       struct ath12k_sta *ahsta,
+ 				       struct ath12k_link_sta *arsta,
+@@ -7751,7 +7776,7 @@ static int ath12k_mac_assign_link_sta(st
+ 	arsta->link_idx = ahsta->num_peer++;
+ 
+ 	ahsta->link[link_id] = arsta;
+-	ahsta->links_map |= BIT(link_id);
++	ath12k_mac_map_link_sta(ahsta, link_id);
+ 	arsta->arvif = ahvif->link[link_id];
+ 	ab = arsta->arvif->ab;
+ 	ahsta->device_bitmap |= BIT(ab->wsi_info.chip_idx);
+@@ -7775,7 +7800,7 @@ static int ath12k_mac_unassign_link_sta(
+ 		return -EINVAL;
+ 
+ 	ahsta->link[link_id] = NULL;
+-	ahsta->links_map &= ~BIT(link_id);
++	ath12k_mac_unmap_link_sta(ahsta, link_id);
+ 	ahsta->device_bitmap &= ~BIT(ab->wsi_info.chip_idx);
+ 
+ 	return 0;
+@@ -7792,9 +7817,13 @@ ath12k_mac_alloc_assign_link_sta(struct
+ 	if (link_id > IEEE80211_MLD_MAX_NUM_LINKS)
+ 		return NULL;
+ 
+-	if (ahsta->link[link_id]) {
+-		WARN_ON(1);
+-		return NULL;
++	arsta = ahsta->link[link_id];
++	if (arsta) {
++		ath12k_mac_assign_link_sta(ah, ahsta, arsta, ahvif, link_id);
++		ath12k_dbg(NULL, ATH12K_DBG_MAC | ATH12K_DBG_BOOT,
++			   "mac alloc assign link sta: arsta found, link_id:%d\n",
++			   link_id);
++		return arsta;
+ 	}
+ 
+ 	arsta = kzalloc(sizeof(*arsta), GFP_KERNEL);
+@@ -8076,6 +8105,79 @@ exit:
+ 	mutex_unlock(&arvif->ar->conf_mutex);
+ }
+ 
++static int ath12k_mac_reconfig_ahsta_links_mode0(struct ath12k_hw *ah,
++						 struct ath12k_sta *ahsta,
++						 struct ath12k_vif *ahvif,
++						 struct ieee80211_sta *sta)
++{
++	struct ath12k_link_vif *arvif;
++	struct ath12k_link_sta *arsta;
++	unsigned long links_to_unmap;
++	unsigned long links_to_assign;
++	u8 link;
++	int ret = 0;
++
++	if (ahvif->vdev_type == WMI_VDEV_TYPE_STA) {
++		links_to_unmap = ahsta->links_map;
++		/*
++		 * Link only 1 link at a time as addtional links are mapped
++		 * from drv_change_sta_links
++		 */
++		links_to_assign = BIT(ffs(sta->valid_links) - 1);
++	} else {
++		links_to_unmap = ahsta->links_map;
++		links_to_assign = sta->valid_links;
++	}
++
++	for_each_set_bit(link, &links_to_unmap,
++			 IEEE80211_MLD_MAX_NUM_LINKS) {
++		arsta = ahsta->link[link];
++		arvif = ahvif->link[link];
++
++		ath12k_mac_unmap_link_sta(ahsta, link);
++
++		ath12k_dbg(NULL, ATH12K_DBG_MAC | ATH12K_DBG_BOOT,
++			   "mac reconfig unmap link sta: link_id:%d sta link_map:0x%lx vif link_map:0x%lx sta valid links:%d\n",
++			   link, ahsta->links_map,
++			   ahvif->links_map, sta->valid_links);
++	}
++
++	for_each_set_bit(link, &links_to_assign,
++			 IEEE80211_MLD_MAX_NUM_LINKS) {
++		ret = ath12k_mac_assign_link_sta(ah, ahsta,
++						 ahsta->link[link],
++						 ahvif, link);
++		ath12k_dbg(NULL, ATH12K_DBG_MAC | ATH12K_DBG_BOOT,
++			   "mac reconfig assign link sta: link_id:%d sta link_map:0x%lx vif link_map:0x%lx sta valid links:%d\n",
++			   link, ahsta->links_map,
++			   ahvif->links_map, sta->valid_links);
++		if (ret)
++			return ret;
++	}
++
++	return ret;
++}
++
++static int ath12k_mac_reconfig_ahsta_links_mode1(struct ath12k_hw *ah,
++						 struct ath12k_sta *ahsta,
++						 struct ath12k_vif *ahvif,
++						 struct ieee80211_sta *sta)
++{
++	u8 link;
++	int ret;
++
++	for_each_set_bit(link, &ahsta->links_map,
++			 IEEE80211_MLD_MAX_NUM_LINKS) {
++		ret = ath12k_mac_assign_link_sta(ah, ahsta,
++						 ahsta->link[link],
++						 ahvif, link);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ int ath12k_mac_update_sta_state(struct ieee80211_hw *hw,
+ 				struct ieee80211_vif *vif,
+ 				struct ieee80211_sta *sta,
+@@ -8190,21 +8292,28 @@ int ath12k_mac_update_sta_state(struct i
+ 	    old_state == IEEE80211_STA_NOTEXIST &&
+ 	    new_state == IEEE80211_STA_NONE) {
+ 		ahsta->num_peer = 0;
++		arvif = ahvif->link[link_id];
++		arsta = ahsta->link[link_id];
++		/* Mode-0 mapping of ahsta links is done below for first
++		 * deflink and for additional link, it will be done in
++		 * drv_change_sta_links.
++		 */
++		if (arvif->ar->ab->ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE0)
++			ret = ath12k_mac_reconfig_ahsta_links_mode0(ah, ahsta,
++								    ahvif, sta);
++		else
++			ret = ath12k_mac_reconfig_ahsta_links_mode1(ah, ahsta,
++								    ahvif, sta);
+ 
+-		for_each_set_bit(link_id, &ahsta->links_map,
+-				 IEEE80211_MLD_MAX_NUM_LINKS) {
+-			arsta = ahsta->link[link_id];
+-			arvif = ahvif->link[link_id];
++		WARN_ON(ret != 0);
+ 
+-			ath12k_mac_assign_link_sta(ah, ahsta, arsta,
+-						   ahvif, link_id);
+-		}
+ 		ahsta->deflink.is_assoc_link = true;
+ 
+ 		if (ahsta->use_4addr_set)
+ 			ieee80211_queue_work(ah->hw, &ahsta->set_4addr_wk);
++
+ 	}
+-	links = sta->valid_links;
++	links = ahsta->links_map;
+ 
+ 	for_each_set_bit(link_id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
+ 		arvif = ahvif->link[link_id];
+@@ -11625,8 +11734,6 @@ static struct ath12k *ath12k_mac_assign_
+ 
+ 	lockdep_assert_held(&ah->conf_mutex);
+ 
+-	if (arvif->ar)
+-		goto out;
+ 
+ 	ar = ath12k_get_ar_by_ctx(hw, ctx);
+ 
+@@ -11717,7 +11824,9 @@ static int ath12k_mac_op_add_interface(s
+ 	}
+ #endif
+ 
+-	memset(ahvif, 0, sizeof(*ahvif));
++	if (!ath12k_hw_group_recovery_in_progress(ah->ag))
++		memset(ahvif, 0, sizeof(*ahvif));
++
+ 	ahvif->ppe_vp_num = ATH12K_INVALID_PPE_VP_NUM;
+ 	ahvif->vdev_type = vif->type;
+ 	ahvif->vif = vif;
+@@ -12285,7 +12394,7 @@ ath12k_mac_mlo_get_vdev_args(struct ath1
+ 
+ 		link_conf = rcu_dereference(ahvif->vif->link_conf[arvif_p->link_id]);
+ 
+-		if (!link_conf)
++		if (!link_conf || !arvif_p->is_created || !arvif_p->ar)
+ 			continue;
+ 
+ 		partner_info->vdev_id = arvif_p->vdev_id;
+@@ -14081,7 +14190,8 @@ ath12k_mac_op_assign_vif_chanctx(struct
+ 		}
+ 	}
+ 
+-	if (!ab->hw_params->vdev_start_delay &&
++	if (arvif->is_started &&
++	    !ab->hw_params->vdev_start_delay &&
+ 	    ahvif->vdev_type == WMI_VDEV_TYPE_STA && ahvif->chanctx_peer_del_done) {
+ 		rcu_read_lock();
+ 		sta = ieee80211_find_sta(vif, vif->cfg.ap_addr);
+@@ -15695,9 +15805,10 @@ static void ath12k_mac_reconfig_completi
+ void
+ ath12k_mac_reconfig_complete(struct ieee80211_hw *hw,
+ 			     enum ieee80211_reconfig_type reconfig_type,
+-			     struct ath12k *asserted_radio)
++			     struct ath12k_base *asserted_ab)
+ {
+ 	struct ath12k_hw *ah = hw->priv;
++	struct ath12k_pdev *pdev;
+ 	struct ath12k *ar;
+ 	u8 restart_count = 0;
+ 	int i;
+@@ -15707,13 +15818,21 @@ ath12k_mac_reconfig_complete(struct ieee
+ 
+ 	mutex_lock(&ah->conf_mutex);
+ 
+-	ar = ah->radio;
++	if (asserted_ab) {
++		for (i = 0; i < asserted_ab->num_radios; i++) {
++			pdev = &asserted_ab->pdevs[i];
++			ar = pdev->ar;
++
++			if (!ar)
++				continue;
+ 
+-	if (asserted_radio) {
+-		ath12k_mac_reconfig_completion(asserted_radio, &restart_count);
++			ath12k_mac_reconfig_completion(ar, &restart_count);
++		}
+ 		goto out;
+ 	}
+ 
++	ar = ah->radio;
++
+ 	for (i = 0; i < ah->num_radio; i++) {
+ 		ath12k_mac_reconfig_completion(ar, &restart_count);
+ 		ar++;
+@@ -15724,9 +15843,13 @@ out:
+ 	 * are up and running and wake queues once the reconfig is
+ 	 * done
+ 	 */
+- 	if (restart_count == ah->num_radio)
++	if (restart_count == ah->num_radio)
+ 		ieee80211_wake_queues(ah->hw);
+ 
++	clear_bit(ATH12K_FLAG_RECOVERY, &ah->ag->dev_flags);
++	ath12k_info(NULL, "HW group recovery flag cleared ag dev_flags:0x%lx\n",
++		    ah->ag->dev_flags);
++
+ 	mutex_unlock(&ah->conf_mutex);
+ 	ah->ag->hw_queues_stopped = false;
+ }
+--- a/drivers/net/wireless/ath/ath12k/mhi.c
++++ b/drivers/net/wireless/ath/ath12k/mhi.c
+@@ -386,6 +386,7 @@ static void ath12k_mhi_op_status_cb(stru
+ 		if (!(test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))) {
+ 			set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+ 			set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
++			set_bit(ATH12K_FLAG_RECOVERY, &ab->ag->dev_flags);
+ 			queue_work(ab->workqueue_aux, &ab->reset_work);
+ 			ath12k_dbg(ab, ATH12K_DBG_BOOT, "Schedule SSR Recovery reset work queue\n");
+ 			ath12k_hal_dump_srng_stats(ab);
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -208,7 +208,7 @@ int ath12k_mac_monitor_stop(struct ath12
+ int ath12k_set_vdev_param_to_all_vifs(struct ath12k *ar, int param, u32 value);
+ void ath12k_mac_reconfig_complete(struct ieee80211_hw *hw,
+ 				  enum ieee80211_reconfig_type reconfig_type,
+-				  struct ath12k *asserted_radio);
++				  struct ath12k_base *asserted_ab);
+ int ath12k_mac_partner_peer_cleanup(struct ath12k_base *ab);
+ void ath12k_bss_assoc(struct ath12k *ar,
+ 		      struct ath12k_link_vif *arvif,

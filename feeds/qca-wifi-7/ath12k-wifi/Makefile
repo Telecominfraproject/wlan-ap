@@ -1,0 +1,48 @@
+include $(TOPDIR)/rules.mk
+include $(INCLUDE_DIR)/version.mk
+
+PKG_NAME:=ath12k-wifi
+PKG_RELEASE:=1
+PKG_FLAGS:=nonshared
+
+include $(INCLUDE_DIR)/package.mk
+
+RSTRIP:=:
+STRIP:=:
+
+define Build/Prepare
+	mkdir -p $(PKG_BUILD_DIR)
+endef
+
+define Build/Compile
+endef
+
+#
+# This is intended to be used on an interim basis until device-specific
+# board data for new devices is available through the upstream compilation
+#
+# Please send a mail with your device-specific board files upstream.
+# You can find instructions and examples on the linux-wireless wiki:
+# <https://wireless.wiki.kernel.org/en/users/drivers/ath10k/boardfiles>
+#
+
+define Package/ath12k-wifi-default
+  SUBMENU:=ath12k Board-Specific Overrides
+  SECTION:=firmware
+  CATEGORY:=Firmware
+  TITLE:=Custom Board
+endef
+
+define Package/ath12k-wifi-edgecore-eap105
+$(call Package/ath12k-wifi-default)
+    TITLE:=board-2.bin for EAP105
+endef
+
+define Package/ath12k-wifi-edgecore-eap105/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
+	$(INSTALL_DATA) ./board-2.bin.eap105.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin
+	$(INSTALL_DATA) ./board-2.bin.eap105.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
+endef
+
+$(eval $(call BuildPackage,ath12k-wifi-edgecore-eap105))

@@ -1,0 +1,503 @@
+From 82745a6a74497688044b96b3f524e450764c00fd Mon Sep 17 00:00:00 2001
+From: P Praneesh <quic_ppranees@quicinc.com>
+Date: Mon, 23 Sep 2024 12:21:14 +0530
+Subject: [PATCH] wifi: ath12k: add dp mon stats support for tracking skbs
+
+Add new debugfs for tracking monitor related statistics.
+
+root@OpenWrt:/# cat /sys/kernel/debug/ath12k/qcn9274\ hw2.0_0001:01:00.0/mac0/dp_mon_stats
+DP MON STATS:
+
+Extended rx stats memory details:
+TLV skbs from dest ring: 82
+drop descriptor count: 0
+flush skbs count: 0
+truncated skbs count: 0
+skbs freed in tlv process: 82
+Total skbs freed: 0
+
+Monitor memory details:
+TLV skbs from dest ring: 25627
+drop descriptor count: 0
+flush skbs count: 0
+truncated skbs count: 0
+payload skbs received: 25844
+payload skbs delivered to mac80211: 20875
+payload skbs freed due to failure: 4969
+skbs freed after tlv process: 25627
+Exceed mpdu_limit: 0 msdu_limit: 0
+decap ether: 4954 nwifi: 32186 raw: 4715 8023: 0
+Total skbs freed: 0
+
+Overall monitor memory stats:
+Total skbs allocated: 55649
+Total skbs freed during alloc fail: 2
+Memory retained by hardware: 4094
+Memory retained by driver: 0
+
+Patch-dependency: 640-001-ath12k-Enable-monitor-interface-support.patch
+
+Signed-off-by: P Praneesh <quic_ppranees@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h    |  30 ++++-
+ drivers/net/wireless/ath/ath12k/debugfs.c | 155 +++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/dp_mon.c  |  52 ++++++--
+ 3 files changed, 221 insertions(+), 16 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -346,6 +346,31 @@ struct ath12k_reg_tpc_power_info {
+         struct chan_power_info chan_power_info[IEEE80211_MAX_NUM_PWR_LEVEL];
+ };
+ 
++struct ath12k_dp_mon_stats {
++	/* Extended rx stats related counters */
++	u32 ext_q_tlv_skb;
++	u32 ext_drop_desc;
++	u32 ext_flush;
++	u32 ext_trunc;
++	u32 ext_free_tlv_skb;
++
++	/* Monitor related counters */
++	u32 q_tlv_skb;
++	u32 drop_desc;
++	u32 flush;
++	u32 trunc;
++	u32 free_tlv_skb;
++	u32 payload_skb;
++	u32 payload_free;
++	u32 skb_ether;
++	u32 skb_nwifi;
++	u32 skb_raw;
++	u32 skb_8023;
++	u32 skb_to_mac80211;
++	u32 mpdu_max_limit;
++	u32 msdu_max_limit;
++};
++
+ #define ATH12K_STATS_MGMT_FRM_TYPE_MAX 16
+ 
+ struct ath12k_mgmt_frame_stats {
+@@ -1166,6 +1191,7 @@ struct ath12k {
+ 	struct work_struct wlan_intf_work;
+ 	u32 scan_min_rest_time;
+ 	u32 scan_max_rest_time;
++	struct ath12k_dp_mon_stats dp_mon_stats;
+ };
+ 
+ struct ath12k_6ghz_sp_reg_rule {
+@@ -1335,7 +1361,6 @@ struct ath12k_soc_dp_stats {
+ 	u32 reo_error[HAL_REO_DEST_RING_ERROR_CODE_MAX];
+ 	u32 reo_error_drop[HAL_REO_DEST_RING_ERROR_CODE_MAX];
+ 	u32 hal_reo_error[DP_REO_DST_RING_MAX];
+-	u32 mon_drop_desc;
+ 	u32 hal_reo_cmd_drain;
+ 	u32 reo_cmd_cache_error;
+ 	u32 mcast_enqueued;
+@@ -1693,6 +1718,9 @@ struct ath12k_base {
+ 	bool rxgainlut_support;
+ 
+ 	struct wsi_info wsi_info;
++	u32 dp_mon_alloc_cnt;
++	u32 dp_mon_alloc_fail_cnt;
++
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+ };
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -18,6 +18,7 @@
+ #include "peer.h"
+ #include "qmi.h"
+ #include "ppe.h"
++#include "dp_mon.h"
+ 
+ static struct dentry *debugfs_ath12k;
+ 
+@@ -1943,10 +1944,6 @@ static ssize_t ath12k_debugfs_dump_soc_d
+ 			 atomic_read(&soc_stats->tx_err.misc_fail));
+ 
+ 	len += scnprintf(buf + len, size - len,
+-			 "\nMon drop descriptor: %u\n",
+-			 soc_stats->mon_drop_desc);
+-
+-	len += scnprintf(buf + len, size - len,
+ 			"\nHAL_REO_CMD_DRAIN Counter: %u\n",
+ 			soc_stats->hal_reo_cmd_drain);
+ 
+@@ -5720,6 +5717,153 @@ static const struct file_operations fops
+ 	.llseek = default_llseek,
+ };
+ 
++static ssize_t ath12k_debugfs_write_dp_mon_stats(struct file *file,
++						 const char __user *user_buf,
++						 size_t count, loff_t *ppos)
++{
++	struct ath12k *ar = file->private_data;
++	char buf[20] = {0};
++	int ret;
++
++	if (count > 20)
++		return -EFAULT;
++
++	ret = copy_from_user(buf, user_buf, count);
++	if (ret)
++		return -EFAULT;
++
++	mutex_lock(&ar->conf_mutex);
++
++	if (ar->state != ATH12K_STATE_ON && ar->state != ATH12K_STATE_RESTARTED) {
++		ret = -ENETDOWN;
++		goto exit;
++	}
++
++	if (strstr(buf, "reset")) {
++		memset(&ar->dp_mon_stats, 0, sizeof(struct ath12k_dp_mon_stats));
++		ar->ab->dp_mon_alloc_cnt = 0;
++		ar->ab->dp_mon_alloc_fail_cnt = 0;
++	}
++
++	ret = count;
++exit:
++	mutex_unlock(&ar->conf_mutex);
++	return ret;
++}
++
++static size_t ath12k_debugfs_read_dp_mon_stats(struct file *file,
++					       char __user *user_buf,
++					       size_t count, loff_t *ppos)
++{
++	struct ath12k *ar = file->private_data;
++	char *buf;
++	u32 ext_total_skb, mon_total_skb, total_skb;
++	const int size = 4096;
++	int ret, len = 0;
++
++	buf = kzalloc(size, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	mutex_lock(&ar->conf_mutex);
++
++	if (ar->state != ATH12K_STATE_ON && ar->state != ATH12K_STATE_RESTARTED) {
++		ret = -ENETDOWN;
++		mutex_unlock(&ar->conf_mutex);
++		goto exit;
++	}
++
++	len += scnprintf(buf + len, size - len, "DP MON STATS:\n");
++	len += scnprintf(buf + len, size - len, "\nExtended rx stats memory details:\n");
++	len += scnprintf(buf + len, size - len, "TLV skbs from dest ring: %u\n",
++			 ar->dp_mon_stats.ext_q_tlv_skb);
++	len += scnprintf(buf + len, size - len, "drop descriptor count: %u\n",
++			 ar->dp_mon_stats.ext_drop_desc);
++	len += scnprintf(buf + len, size - len, "flush skbs count: %u\n",
++			 ar->dp_mon_stats.ext_flush);
++	len += scnprintf(buf + len, size - len, "truncated skbs count: %u\n",
++			 ar->dp_mon_stats.ext_trunc);
++	len += scnprintf(buf + len, size - len, "skbs freed in tlv process: %u\n",
++			 ar->dp_mon_stats.ext_free_tlv_skb);
++	ext_total_skb = ar->dp_mon_stats.ext_flush +\
++			ar->dp_mon_stats.ext_trunc +\
++			ar->dp_mon_stats.ext_free_tlv_skb;
++	len += scnprintf(buf + len, size - len, "Total skbs freed: %u\n",
++			 ext_total_skb);
++
++	len += scnprintf(buf + len, size - len, "\nMonitor memory details:\n");
++	len += scnprintf(buf + len, size - len, "TLV skbs from dest ring: %u\n",
++			 ar->dp_mon_stats.q_tlv_skb);
++	len += scnprintf(buf + len, size - len, "drop descriptor count: %u\n",
++			 ar->dp_mon_stats.drop_desc);
++	len += scnprintf(buf + len, size - len, "flush skbs count: %u\n",
++			 ar->dp_mon_stats.flush);
++	len += scnprintf(buf + len, size - len, "truncated skbs count: %u\n",
++			 ar->dp_mon_stats.trunc);
++	len += scnprintf(buf + len, size - len, "payload skbs received: %u\n",
++			 ar->dp_mon_stats.payload_skb);
++	len += scnprintf(buf + len, size - len, "payload skbs delivered to mac80211: %u\n",
++			 ar->dp_mon_stats.skb_to_mac80211);
++	len += scnprintf(buf + len, size - len, "payload skbs freed due to failure: %u\n",
++			 ar->dp_mon_stats.payload_free);
++	len += scnprintf(buf + len, size - len, "skbs freed after tlv process: %u\n",
++			 ar->dp_mon_stats.free_tlv_skb);
++	len += scnprintf(buf + len, size - len, "Exceed mpdu_limit: %u msdu_limit: %u\n",
++			 ar->dp_mon_stats.mpdu_max_limit,
++			 ar->dp_mon_stats.msdu_max_limit);
++	len += scnprintf(buf + len, size - len, "decap ether: %u nwifi: %u raw: %u 8023: %u\n",
++			 ar->dp_mon_stats.skb_ether,
++			 ar->dp_mon_stats.skb_nwifi,
++			 ar->dp_mon_stats.skb_raw,
++			 ar->dp_mon_stats.skb_8023);
++	mon_total_skb = ar->dp_mon_stats.flush +\
++			ar->dp_mon_stats.trunc +\
++			ar->dp_mon_stats.skb_to_mac80211 +\
++			ar->dp_mon_stats.payload_free +\
++			ar->dp_mon_stats.free_tlv_skb +\
++			ar->dp_mon_stats.mpdu_max_limit +\
++			ar->dp_mon_stats.msdu_max_limit;
++	len += scnprintf(buf + len, size - len, "Total skbs freed: %u\n",
++			 mon_total_skb);
++	len += scnprintf(buf + len, size - len, "\nOverall monitor memory stats:\n");
++	len += scnprintf(buf + len, size - len, "Total skbs allocated: %u\n",
++			 ar->ab->dp_mon_alloc_cnt);
++	len += scnprintf(buf + len, size - len, "Total skbs freed during alloc fail: %u\n",
++			 ar->ab->dp_mon_alloc_fail_cnt);
++	total_skb = ar->ab->dp_mon_alloc_fail_cnt +\
++		    ext_total_skb +\
++		    mon_total_skb;
++	len += scnprintf(buf + len, size - len, "Memory retained by hardware: %u\n",
++			 (ar->ab->dp_mon_alloc_cnt - total_skb));
++	total_skb = (ar->dp_mon_stats.ext_q_tlv_skb +\
++		     ar->dp_mon_stats.q_tlv_skb +\
++		     ar->dp_mon_stats.payload_skb) -\
++		    (ar->dp_mon_stats.skb_to_mac80211 +\
++		     ar->dp_mon_stats.payload_free +\
++		     ar->dp_mon_stats.free_tlv_skb +\
++		     ar->dp_mon_stats.ext_free_tlv_skb);
++	len += scnprintf(buf + len, size - len, "Memory retained by driver: %u\n",
++			 total_skb);
++
++	mutex_unlock(&ar->conf_mutex);
++
++	if (len > size)
++		len = size;
++
++	ret = simple_read_from_buffer(user_buf, count, ppos, buf, len);
++exit:
++	kfree(buf);
++	return ret;
++}
++
++static const struct file_operations fops_dp_mon_stats = {
++	.write = ath12k_debugfs_write_dp_mon_stats,
++	.read = ath12k_debugfs_read_dp_mon_stats,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
+ int ath12k_debugfs_register(struct ath12k *ar)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+@@ -5838,6 +5982,8 @@ int ath12k_debugfs_register(struct ath12
+ 			    &fops_sensitivity_level);
+ 	debugfs_create_file("scan_args_config", 0600, ar->debug.debugfs_pdev, ar,
+ 			    &fops_scan_args_config);
++	debugfs_create_file("dp_mon_stats", 0600, ar->debug.debugfs_pdev, ar,
++			    &fops_dp_mon_stats);
+ 	return 0;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -1919,12 +1919,13 @@ ath12k_dp_mon_rx_merg_msdus(struct ath12
+ 
+ 		prev_buf = head_msdu;
+ 		msdu = head_msdu->next;
+-
++		ar->dp_mon_stats.skb_raw++;
+ 		while (msdu) {
+ 			skb_pull(msdu, DP_MON_RX_PKT_OFFSET);
+ 
+ 			prev_buf = msdu;
+ 			msdu = msdu->next;
++			ar->dp_mon_stats.skb_raw++;
+ 		}
+ 
+ 		prev_buf->next = NULL;
+@@ -1942,6 +1943,7 @@ ath12k_dp_mon_rx_merg_msdus(struct ath12
+ 			qos_pkt = 1;
+ 
+ 		msdu = head_msdu;
++		ar->dp_mon_stats.skb_nwifi++;
+ 
+ 		while (msdu) {
+ 			skb_pull(msdu, DP_MON_RX_L2_HDR_OFFSET);
+@@ -1954,6 +1956,7 @@ ath12k_dp_mon_rx_merg_msdus(struct ath12
+ 			}
+ 			prev_buf = msdu;
+ 			msdu = msdu->next;
++			ar->dp_mon_stats.skb_nwifi++;
+ 		}
+ 		dest = skb_put(prev_buf, HAL_RX_FCS_LEN);
+ 		if (!dest)
+@@ -1963,6 +1966,10 @@ ath12k_dp_mon_rx_merg_msdus(struct ath12
+ 			   "mpdu_buf %pK mpdu_buf->len %u",
+ 			   prev_buf, prev_buf->len);
+ 	} else {
++		if (decap_format == DP_RX_DECAP_TYPE_8023)
++			ar->dp_mon_stats.skb_8023++;
++		else
++			ar->dp_mon_stats.skb_ether++;
+ 		ath12k_dbg(ab, ATH12K_DBG_DATA,
+ 			   "decap format %d is not supported!\n",
+ 			   decap_format);
+@@ -1976,6 +1983,7 @@ err_merge_fail:
+ 		ath12k_dbg(ab, ATH12K_DBG_DATA,
+ 			   "err_merge_fail mpdu_buf %pK", mpdu_buf);
+ 		/* Free the head buffer */
++		ar->dp_mon_stats.payload_free++;
+ 		dev_kfree_skb_any(mpdu_buf);
+ 	}
+ 	return NULL;
+@@ -2255,6 +2263,7 @@ static void ath12k_dp_mon_rx_deliver_msd
+ 	    !(is_mcbc && rx_status->flag & RX_FLAG_DECRYPTED))
+ 		rx_status->flag |= RX_FLAG_8023;
+ 
++	ar->dp_mon_stats.skb_to_mac80211++;
+ 	ieee80211_rx_napi(ar->ah->hw, pubsta, msdu, napi);
+ }
+ 
+@@ -2310,6 +2319,7 @@ mon_deliver_fail:
+ 	mon_skb = head_msdu;
+ 	while (mon_skb) {
+ 		skb_next = mon_skb->next;
++		ar->dp_mon_stats.payload_free++;
+ 		dev_kfree_skb_any(mon_skb);
+ 		mon_skb = skb_next;
+ 	}
+@@ -2385,6 +2395,7 @@ ath12k_dp_mon_parse_rx_dest_tlv(struct a
+ 			return;
+ 		}
+ 
++		ar->dp_mon_stats.payload_skb++;
+ 		rxcb = ATH12K_SKB_RXCB(msdu);
+ 		dma_unmap_single(ar->ab->dev, rxcb->paddr,
+ 				 msdu->len + skb_tailroom(msdu),
+@@ -2392,6 +2403,7 @@ ath12k_dp_mon_parse_rx_dest_tlv(struct a
+ 
+ 		mpdu_count = ppdu_info->cmn_mpdu_info.mpdu_count;
+ 		if (mpdu_count >= HAL_RX_MAX_MPDU) {
++			ar->dp_mon_stats.mpdu_max_limit++;
+ 			dev_kfree_skb_any(msdu);
+ 			ath12k_dp_mon_buf_replenish(ar->ab, buf_ring, 1);
+ 			return;
+@@ -2401,6 +2413,7 @@ ath12k_dp_mon_parse_rx_dest_tlv(struct a
+ 		msdu_count = ppdu_info->cmn_mpdu_info.mon_mpdu[mpdu_count].msdu_count;
+ 		if (ath12k_dp_pkt_set_pktlen(msdu, offset) ||
+ 		    msdu_count >= HAL_RX_MAX_MSDU) {
++			ar->dp_mon_stats.msdu_max_limit++;
+ 			dev_kfree_skb_any(msdu);
+ 			ath12k_dp_mon_buf_replenish(ar->ab, buf_ring, 1);
+ 			return;
+@@ -2547,6 +2560,8 @@ int ath12k_dp_mon_buf_replenish(struct a
+ 		if (unlikely(!skb))
+ 			goto fail_alloc_skb;
+ 
++		ab->dp_mon_alloc_cnt++;
++
+ 		if (!IS_ALIGNED((unsigned long)skb->data, DP_RX_BUFFER_ALIGN_SIZE)) {
+ 			skb_pull(skb,
+ 				 PTR_ALIGN(skb->data, DP_RX_BUFFER_ALIGN_SIZE) -
+@@ -2596,6 +2611,7 @@ fail_dma_unmap:
+ 	dma_unmap_single(ab->dev, paddr, skb->len + skb_tailroom(skb),
+ 			 DMA_FROM_DEVICE);
+ fail_free_skb:
++	ab->dp_mon_alloc_fail_cnt++;
+ 	dev_kfree_skb_any(skb);
+ fail_alloc_skb:
+ 	ath12k_hal_srng_access_end(ab, srng);
+@@ -3820,7 +3836,7 @@ int ath12k_dp_mon_srng_process(struct at
+ 			break;
+ 
+ 		if (u32_get_bits(mon_dst_desc->info0, HAL_MON_DEST_INFO0_EMPTY_DESC)) {
+-			ab->soc_stats.mon_drop_desc++;
++			ar->dp_mon_stats.drop_desc++;
+ 			goto move_next;
+ 		}
+ 
+@@ -3851,10 +3867,14 @@ int ath12k_dp_mon_srng_process(struct at
+ 				 DMA_FROM_DEVICE);
+ 		end_reason = u32_get_bits(mon_dst_desc->info0,
+ 					  HAL_MON_DEST_INFO0_END_REASON);
+-		if ((end_reason == HAL_MON_FLUSH_DETECTED) ||
+-		    (end_reason == HAL_MON_PPDU_TRUNCATED)) {
+-			ath12k_dbg(ab, ATH12K_DBG_DATA,
+-				   "Monitor dest descriptor end reason %d", end_reason);
++		if (unlikely(end_reason == HAL_MON_FLUSH_DETECTED)) {
++			ar->dp_mon_stats.flush++;
++			dev_kfree_skb_any(skb);
++			goto move_next;
++		}
++
++		if (unlikely(end_reason == HAL_MON_PPDU_TRUNCATED)) {
++			ar->dp_mon_stats.trunc++;
+ 			dev_kfree_skb_any(skb);
+ 			goto move_next;
+ 		}
+@@ -3876,6 +3896,7 @@ int ath12k_dp_mon_srng_process(struct at
+ 		}
+ 
+ 		__skb_queue_tail(&skb_list, skb);
++		ar->dp_mon_stats.q_tlv_skb++;
+ move_next:
+ 		ath12k_dp_mon_buf_replenish(ab, buf_ring, 1);
+ 		ath12k_hal_srng_dst_get_next_entry(ab, srng);
+@@ -3903,6 +3924,7 @@ move_next:
+ 
+ 		if (hal_status != HAL_RX_MON_STATUS_PPDU_DONE) {
+ 			ppdu_info->ppdu_continuation = true;
++			ar->dp_mon_stats.free_tlv_skb++;
+ 			dev_kfree_skb_any(skb);
+ 			continue;
+ 		}
+@@ -3950,6 +3972,7 @@ move_next:
+ next_skb:
+ 		rcu_read_unlock();
+ free_skb:
++		ar->dp_mon_stats.free_tlv_skb++;
+ 		dev_kfree_skb_any(skb);
+ 		ath12k_dp_mon_rx_memset_ppdu_info(ppdu_info);
+ 		ppdu_info->peer_id = HAL_INVALID_PEERID;
+@@ -3998,7 +4021,7 @@ int ath12k_dp_mon_rx_process_stats(struc
+ 			break;
+ 		
+ 		if (u32_get_bits(mon_dst_desc->info0, HAL_MON_DEST_INFO0_EMPTY_DESC)) {
+-			ab->soc_stats.mon_drop_desc++;
++			ar->dp_mon_stats.ext_drop_desc++;
+ 			goto move_next;
+ 		}
+ 
+@@ -4028,10 +4051,14 @@ int ath12k_dp_mon_rx_process_stats(struc
+ 				 DMA_FROM_DEVICE);
+ 		end_reason = u32_get_bits(mon_dst_desc->info0,
+ 					  HAL_MON_DEST_INFO0_END_REASON);
+-		if ((end_reason == HAL_MON_FLUSH_DETECTED) ||
+-		    (end_reason == HAL_MON_PPDU_TRUNCATED)) {
+-			ath12k_dbg(ab, ATH12K_DBG_DATA,
+-				    "Monitor dest descriptor end reason %d", end_reason);
++		if (unlikely(end_reason == HAL_MON_FLUSH_DETECTED)) {
++			ar->dp_mon_stats.ext_flush++;
++			dev_kfree_skb_any(skb);
++			goto move_next;
++		}
++
++		if (unlikely(end_reason == HAL_MON_PPDU_TRUNCATED)) {
++			ar->dp_mon_stats.ext_trunc++;
+ 			dev_kfree_skb_any(skb);
+ 			goto move_next;
+ 		}
+@@ -4051,6 +4078,7 @@ int ath12k_dp_mon_rx_process_stats(struc
+ 		}
+ 
+ 		__skb_queue_tail(&skb_list, skb);
++		ar->dp_mon_stats.ext_q_tlv_skb++;
+ move_next:
+ 		ath12k_dp_mon_buf_replenish(ab, buf_ring, 1);
+ 		ath12k_hal_srng_dst_get_next_entry(ab, srng);
+@@ -4082,6 +4110,7 @@ move_next:
+ 		hal_status = ath12k_dp_mon_parse_rx_dest(ar, ppdu_info, skb);
+ 		if (hal_status != HAL_RX_MON_STATUS_PPDU_DONE) {
+ 			ppdu_info->ppdu_continuation = true;
++			ar->dp_mon_stats.ext_free_tlv_skb++;
+ 			dev_kfree_skb_any(skb);
+ 			continue;
+ 		}
+@@ -4148,6 +4177,7 @@ move_next:
+ next_skb:
+ 		rcu_read_unlock();
+ free_skb:
++		ar->dp_mon_stats.ext_free_tlv_skb++;
+ 		dev_kfree_skb_any(skb);
+ 		ath12k_dp_mon_rx_memset_ppdu_info(ppdu_info);
+ 		ppdu_info->peer_id = HAL_INVALID_PEERID;

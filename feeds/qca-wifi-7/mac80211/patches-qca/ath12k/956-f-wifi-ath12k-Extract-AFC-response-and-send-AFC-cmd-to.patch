@@ -1,0 +1,942 @@
+From 8b3d54371558deae0073f9688928ee1a3aef8c0f Mon Sep 17 00:00:00 2001
+From: Hariharan Basuthkar <quic_hbasuthk@quicinc.com>
+Date: Mon, 10 Jun 2024 02:37:47 +0530
+Subject: [PATCH] wifi: ath12k: Extract AFC response and send AFC cmd to FW
+
+When AFC response data is received from the AFC application through
+QCA_NL80211_VENDOR_SUBCMD_AFC_RESPONSE, write the response to the
+shared memory location, and send the WMI_AFC_CMD with cmd_type
+ath12k_REG_AFC_CMD_SERV_RESP_READY.
+
+Patch dependency: 333-0020-mac80211-add-support-for-6G-channels-and-regulatory.patch
+Tag: 6G_REGULATORY
+
+Signed-off-by: Hariharan Basuthkar <quic_hbasuthk@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/reg.c    |  41 ++
+ drivers/net/wireless/ath/ath12k/reg.h    | 136 +++++++
+ drivers/net/wireless/ath/ath12k/vendor.c | 497 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/vendor.h |  76 ++++
+ drivers/net/wireless/ath/ath12k/wmi.c    |  31 ++
+ drivers/net/wireless/ath/ath12k/wmi.h    |  10 +
+ 6 files changed, 791 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath12k/reg.c b/drivers/net/wireless/ath/ath12k/reg.c
+index 8f2b2af..a7ba0d1 100644
+--- a/drivers/net/wireless/ath/ath12k/reg.c
++++ b/drivers/net/wireless/ath/ath12k/reg.c
+@@ -1117,6 +1117,47 @@ end:
+ 	return ret;
+ }
+ 
++int ath12k_copy_afc_response(struct ath12k *ar, char *afc_resp, u32 len)
++{
++	struct ath12k_base *ab = ar->ab;
++	struct target_mem_chunk *target_mem = ab->qmi.target_mem;
++	void __iomem *mem = NULL;
++	int i;
++	int slotid = ar->pdev_idx;
++	u32 *status;
++
++	if (len > AFC_SLOT_SIZE) {
++		ath12k_warn(ab, "len %d greater than slot size\n", len);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < ab->qmi.mem_seg_count; i++) {
++		if (target_mem[i].type == AFC_REGION_TYPE) {
++			mem = target_mem[i].v.addr;
++			status = mem + (slotid * AFC_SLOT_SIZE);
++			break;
++		}
++	}
++
++	if (!mem) {
++		ath12k_warn(ab, "AFC mem is not available\n");
++		return -ENOMEM;
++	}
++
++	status[AFC_AUTH_STATUS_OFFSET] = cpu_to_le32(AFC_AUTH_ERROR);
++	if (ab->userpd_id) {
++		memset_io(mem + (slotid * AFC_SLOT_SIZE), 0, AFC_SLOT_SIZE);
++		memcpy_toio(mem + (slotid * AFC_SLOT_SIZE), afc_resp, len);
++	} else {
++		memset(mem + (slotid * AFC_SLOT_SIZE), 0, AFC_SLOT_SIZE);
++		memcpy(mem + (slotid * AFC_SLOT_SIZE), afc_resp, len);
++	}
++
++	status[AFC_AUTH_STATUS_OFFSET] = cpu_to_le32(AFC_AUTH_SUCCESS);
++
++	return 0;
++}
++
+ void ath12k_regd_update_work(struct work_struct *work)
+ {
+ 	struct ath12k *ar = container_of(work, struct ath12k,
+diff --git a/drivers/net/wireless/ath/ath12k/reg.h b/drivers/net/wireless/ath/ath12k/reg.h
+index 4bbb913..a536e6e 100644
+--- a/drivers/net/wireless/ath/ath12k/reg.h
++++ b/drivers/net/wireless/ath/ath12k/reg.h
+@@ -13,6 +13,10 @@
+ struct ath12k_base;
+ struct ath12k;
+ 
++#define AFC_AUTH_STATUS_OFFSET	1
++#define AFC_AUTH_SUCCESS	1
++#define AFC_AUTH_ERROR		0
++
+ extern bool ath12k_afc_disable_timer_check;
+ extern bool ath12k_afc_disable_req_id_check;
+ extern bool ath12k_afc_test_enabled;
+@@ -105,6 +109,137 @@ struct ath12k_afc_info {
+ 	bool afc_regdom_configured;
+ };
+ 
++/**
++ * struct ath12k_afc_host_resp - Structure for AFC Host response to FW
++ * @header:Header for compatibility.
++ *         Valid value: 0
++ * @status:Flag to indicate validity of data. To be updated by TZ
++ *         1:  Success
++ *         -1: Failure
++ * @time_to_live: Period(in seconds) the data is valid for
++ * @length:       Length of the response message
++ * @resp_format:AFC response format.
++ *              0 - JSON format
++ *              1 - Binary data format
++ * @afc_resp:Response message from the AFC server for queried parameters
++ *
++ * The following is the layout of the AFC response.
++ *
++ * struct ath12k_afc_host_resp {
++ *     header;
++ *     status;
++ *     time_to_live;
++ *     length;
++ *     resp_format;
++ *     afc_resp {
++ *          struct ath12k_afc_bin_resp_data fixed_params;
++ *          struct ath12k_afc_resp_freq_psd_info obj[0];
++ *          ....
++ *          struct ath12k_afc_resp_freq_psd_info obj[num_frequency_obj - 1];
++ *          struct ath12k_afc_resp_opclass_info opclass[0];
++ *          {
++ *              struct ath12k_afc_resp_eirp_info eirp[0];
++ *              ....
++ *              struct ath12k_afc_resp_eirp_info eirp[num_channels - 1];
++ *          }
++ *          .
++ *          .
++ *          struct ath12k_afc_resp_opclass_info opclass[num_channel_obj - 1];
++ *          {
++ *              struct ath12k_afc_resp_eirp_info eirp[0];
++ *              ....
++ *              struct ath12k_afc_resp_eirp_info eirp[num_channels - 1];
++ *          }
++ *     }
++ * }
++ *
++ */
++struct ath12k_afc_host_resp {
++	u32 header;
++	s32 status;
++	u32 time_to_live;
++	u32 length;
++	u32 resp_format;
++	s8  afc_resp[];
++} __packed;
++
++/**
++ * struct at12k_afc_resp_opclass_info - Structure to populate operating class
++ * and channel information from AFC response.
++ * @opclass: Operating class
++ * @num_channels: Number of channels received in AFC response
++ */
++struct ath12k_afc_resp_opclass_info {
++	u32 opclass;
++	u32 num_channels;
++} __packed;
++
++/**
++ * struct ath12k_afc_resp_eirp_info - Structure to update EIRP values for channels
++ * @channel_cfi: Channel center frequency index
++ * @max_eirp_pwr: Maximum permissible EIRP(in dBm) for the Channel
++ */
++struct ath12k_afc_resp_eirp_info {
++	u32 channel_cfi;
++	s32 max_eirp_pwr;
++} __packed;
++
++/**
++ * struct ath12k_afc_resp_freq_psd_info - Structure to update PSD values for
++ * queried frequency ranges
++ * @freq_info: Frequency range in MHz :- bits 15:0  = u16 start_freq,
++ *                                       bits 31:16 = u16 end_freq
++ * @max_psd: Maximum PSD in dbm/MHz
++ */
++struct ath12k_afc_resp_freq_psd_info {
++	u32 freq_info;
++	u32 max_psd;
++} __packed;
++
++/**
++ * struct ath12k_afc_bin_resp_data - Structure to populate AFC binary response
++ * @local_err_code: Internal error code between AFC app and FW
++ *                  0 - Success
++ *                  1 - General failure
++ * @version: Internal version between AFC app and FW
++ *           Current version - 1
++ * @afc_wfa_version: AFC spec version info. Bits 15:0  - Minor version
++ *                                          Bits 31:16 - Major version
++ * @request_id: AFC unique request ID
++ * @avail_exp_time_d: Availability expiry date in UTC.
++ *                    Date format- bits 7:0   - DD (Day 1-31)
++ *                                 bits 15:8  - MM (Month 1-12)
++ *                                 bits 31:16 - YYYY (Year)
++ * @avail_exp_time_t: Availability expiry time in UTC.
++ *                    Time format- bits 7:0   - SS (Seconds 0-59)
++ *                                 bits 15:8  - MM (Minutes 0-59)
++ *                                 bits 23:16 - HH (Hours 0-23)
++ *                                 bits 31:24 - Reserved
++ * @afc_serv_resp_code: AFC server response code. The AFC server response codes
++ *                      are defined in the WiFi Spec doc for AFC as follows:
++ *                      0: Success.
++ *                      100 - 199 - General errors related to protocol.
++ *                      300 - 399 - Error events specific to message exchange
++ *                                  for the available Spectrum Inquiry.
++ * @num_frequency_obj: Number of frequency objects
++ * @num_channel_obj: Number of channel objects
++ * @shortdesc: Short description corresponding to resp_code field
++ * @reserved: Reserved for future use
++ */
++struct ath12k_afc_bin_resp_data {
++	u32 local_err_code;
++	u32 version;
++	u32 afc_wfa_version;
++	u32 request_id;
++	u32 avail_exp_time_d;
++	u32 avail_exp_time_t;
++	u32 afc_serv_resp_code;
++	u32 num_frequency_obj;
++	u32 num_channel_obj;
++	u8  shortdesc[64];
++	u32 reserved[2];
++} __packed;
++
+ enum ath12k_reg_cc_code {
+ 	REG_SET_CC_STATUS_PASS = 0,
+ 	REG_CURRENT_ALPHA2_NOT_FOUND = 1,
+@@ -178,4 +313,5 @@ int ath12k_reg_get_num_chans_in_band(struct ath12k *ar,
+ 				     struct ieee80211_supported_band *band,
+ 			             u32 freq_low, u32 freq_high);
+ int ath12k_reg_process_afc_power_event(struct ath12k *ar);
++int ath12k_copy_afc_response(struct ath12k *ar, char *afc_resp, u32 len);
+ #endif
+diff --git a/drivers/net/wireless/ath/ath12k/vendor.c b/drivers/net/wireless/ath/ath12k/vendor.c
+index 055cc86..c2813bc 100644
+--- a/drivers/net/wireless/ath/ath12k/vendor.c
++++ b/drivers/net/wireless/ath/ath12k/vendor.c
+@@ -1991,6 +1991,496 @@ out:
+ 	return ret;
+ }
+ 
++static const struct nla_policy
++ath12k_cfg80211_afc_response_policy[QCA_WLAN_VENDOR_ATTR_AFC_RESP_MAX + 1] = {
++	[QCA_WLAN_VENDOR_ATTR_AFC_RESP_TIME_TO_LIVE] = { .type = NLA_U32 },
++	[QCA_WLAN_VENDOR_ATTR_AFC_RESP_REQ_ID] = { .type = NLA_U32 },
++	[QCA_WLAN_VENDOR_ATTR_AFC_RESP_EXP_DATE] = { .type = NLA_U32 },
++	[QCA_WLAN_VENDOR_ATTR_AFC_RESP_EXP_TIME] = { .type = NLA_U32 },
++	[QCA_WLAN_VENDOR_ATTR_AFC_RESP_AFC_SERVER_RESP_CODE] = { .type = NLA_U32 },
++	[QCA_WLAN_VENDOR_ATTR_AFC_RESP_FREQ_PSD_INFO] = { .type = NLA_NESTED },
++	[QCA_WLAN_VENDOR_ATTR_AFC_RESP_OPCLASS_CHAN_EIRP_INFO] = { .type = NLA_NESTED },
++	[QCA_WLAN_VENDOR_ATTR_AFC_RESP_DATA] = { .type = NLA_BINARY,
++						 .len = QCA_NL80211_AFC_REQ_RESP_BUF_MAX_SIZE },
++};
++
++static void
++ath12k_afc_response_buffer_display(struct ath12k_base *ab,
++				   struct ath12k_afc_host_resp *afc_rsp)
++{
++	struct ath12k_afc_bin_resp_data *afc_bin = NULL;
++	struct ath12k_afc_resp_freq_psd_info *freq_obj = NULL;
++	struct ath12k_afc_resp_opclass_info *opclass_obj = NULL;
++	struct ath12k_afc_resp_eirp_info *eirp_obj = NULL;
++	u8 *tmp_ptr = NULL;
++	int iter, iter_j;
++
++	/* Display the AFC Response Fixed parameters */
++	ath12k_dbg(ab, ATH12K_DBG_AFC,
++		   "\n---------------------------\n"
++		   "         AFC Response Fixed params\n"
++		   "---------------------------\n");
++	ath12k_dbg(ab, ATH12K_DBG_AFC,
++		   "\nTLV header: %u\nStatus: %u\nTTL: %u\n"
++		   "Length: %u\nResponse format: %u\n"
++		   "---------------------------\n",
++		   afc_rsp->header,
++		   afc_rsp->status,
++		   afc_rsp->time_to_live,
++		   afc_rsp->length,
++		   afc_rsp->resp_format);
++
++	afc_bin = (struct ath12k_afc_bin_resp_data *)&afc_rsp->afc_resp[0];
++
++	ath12k_dbg(ab, ATH12K_DBG_AFC,
++		   "\n---------------------------\n"
++		   "         Binary fixed\n"
++		   "---------------------------\n");
++	ath12k_dbg(ab, ATH12K_DBG_AFC,
++		   "\nLocal Error code: %u\nVersion: 0x%x\n"
++		   "AFC Version: 0x%x\nRequest ID: %u\nDate: 0x%x\n"
++		   "Time: 0x%x\nServer resp: %u\n"
++		   "Freq objs: %u\nOpclass objs: %u\n"
++		   "---------------------------\n",
++		   afc_bin->local_err_code,
++		   afc_bin->version,
++		   afc_bin->afc_wfa_version,
++		   afc_bin->request_id,
++		   afc_bin->avail_exp_time_d,
++		   afc_bin->avail_exp_time_t,
++		   afc_bin->afc_serv_resp_code,
++		   afc_bin->num_frequency_obj,
++		   afc_bin->num_channel_obj);
++
++	/* Display Frequency/PSD info from AFC Response */
++	freq_obj = (struct ath12k_afc_resp_freq_psd_info *)
++		((u8 *)afc_bin +
++		 sizeof(struct ath12k_afc_bin_resp_data));
++	tmp_ptr = (u8 *)freq_obj;
++
++	ath12k_dbg(ab, ATH12K_DBG_AFC,
++		   "\n---------------------------\n"
++		   "         Freq Info\n"
++		   "---------------------------\n");
++	for (iter = 0; iter < afc_bin->num_frequency_obj; iter++) {
++		ath12k_dbg(ab, ATH12K_DBG_AFC,
++			   "Freq Info[%d]: 0x%x\nMax PSD[%d]: %u\n",
++			   iter, freq_obj->freq_info, iter, freq_obj->max_psd);
++		freq_obj = (struct ath12k_afc_resp_freq_psd_info *)
++			((u8 *)freq_obj +
++			 sizeof(struct ath12k_afc_resp_freq_psd_info));
++	}
++
++	ath12k_dbg(ab, ATH12K_DBG_AFC,
++		   "\n---------------------------\n");
++
++	/* Display Opclass and channel EIRP info from AFC Response */
++	opclass_obj = (struct ath12k_afc_resp_opclass_info *)
++		((u8 *)tmp_ptr +
++		 (afc_bin->num_frequency_obj *
++		  sizeof(struct ath12k_afc_resp_freq_psd_info)));
++	ath12k_dbg(ab, ATH12K_DBG_AFC,
++		   "\n---------------------------\n"
++		   "      Opclass Info\n"
++		   "---------------------------\n");
++	for (iter = 0; iter < afc_bin->num_channel_obj; iter++) {
++		ath12k_dbg(ab, ATH12K_DBG_AFC,
++			   "\nOpclass[%d]: %u\nNum channels[%d]: %u\n",
++			   iter, opclass_obj->opclass, iter, opclass_obj->num_channels);
++
++		eirp_obj = (struct ath12k_afc_resp_eirp_info *)
++			((u8 *)opclass_obj +
++			 sizeof(struct ath12k_afc_resp_opclass_info));
++		for (iter_j = 0; iter_j < opclass_obj->num_channels; iter_j++) {
++			ath12k_dbg(ab, ATH12K_DBG_AFC,
++				   "\nChannel Info[%d]:\nCFI: %u\nEIRP: %u\n\n",
++				   iter_j, eirp_obj->channel_cfi, eirp_obj->max_eirp_pwr);
++			eirp_obj = (struct ath12k_afc_resp_eirp_info *)
++				((u8 *)eirp_obj +
++				 sizeof(struct ath12k_afc_resp_eirp_info));
++		}
++
++		opclass_obj = (struct ath12k_afc_resp_opclass_info *)
++				((u8 *)opclass_obj +
++				 sizeof(struct ath12k_afc_resp_opclass_info) +
++				 (opclass_obj->num_channels *
++				  sizeof(struct ath12k_afc_resp_eirp_info)));
++	}
++
++	ath12k_dbg(ab, ATH12K_DBG_AFC,
++		   "\n---------------------------\n");
++}
++
++static struct ath12k_afc_host_resp *ath12k_extract_afc_resp(struct ath12k_base *ab,
++							    struct nlattr **attr,
++							    int *afc_resp_len)
++{
++	struct ath12k_afc_resp_opclass_info *start_opcls = NULL, *opclass_list = NULL;
++	struct nlattr *frange_info[QCA_WLAN_VENDOR_ATTR_AFC_FREQ_PSD_INFO_MAX + 1];
++	struct nlattr *opclass_info[QCA_WLAN_VENDOR_ATTR_AFC_OPCLASS_INFO_MAX + 1];
++	struct nlattr *chan_info[QCA_WLAN_VENDOR_ATTR_AFC_CHAN_EIRP_INFO_MAX + 1];
++	struct ath12k_afc_bin_resp_data *afc_fixed_params = NULL;
++	struct ath12k_afc_resp_freq_psd_info *frange_obj = NULL;
++	struct ath12k_afc_resp_eirp_info *chan_obj = NULL;
++	u16 start_freq = 0, end_freq = 0, nl_len = 0;
++	struct ath12k_afc_host_resp *afc_rsp = NULL;
++	u32 num_frange_obj = 0, num_channels = 0;
++	struct nlattr *nl, *nl_attr;
++	u32 total_channels = 0;
++	u8 num_opclas_obj = 0;
++	int rem, iter, i;
++	u8 *temp;
++
++	/* Calculate the total number of Frequency range objects received in the
++	 * AFC response
++	 */
++	if (attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_FREQ_PSD_INFO]) {
++		nla_for_each_nested(nl,
++				    attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_FREQ_PSD_INFO],
++				    rem) {
++			nl_len = nla_len(nl);
++			if (nl_len < QCA_WLAN_AFC_RESP_FREQ_PSD_INFO_INFO_MIN_LEN) {
++				ath12k_dbg(ab, ATH12K_DBG_AFC,
++					   "Insufficient length %d for Frequency PSD info",
++					   nl_len);
++				goto fail;
++			}
++			num_frange_obj++;
++		}
++	}
++
++	/* Calculate the total number of opclass objects and corresponding number
++	 * of channels in each opclass object received in the AFC response
++	 */
++	if (attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_OPCLASS_CHAN_EIRP_INFO]) {
++		nla_for_each_nested(nl,
++				    attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_OPCLASS_CHAN_EIRP_INFO],
++				    rem) {
++			num_channels = 0;
++			nl_len = nla_len(nl);
++			if (nl_len < QCA_WLAN_AFC_RESP_OPCLASS_CHAN_EIRP_INFO_MIN_LEN) {
++				ath12k_dbg(ab, ATH12K_DBG_AFC,
++					   "Insufficient length %d for Opclass/Channel EIRP info",
++					   nl_len);
++				goto fail;
++			}
++
++			if (nla_parse(opclass_info,
++				      QCA_WLAN_VENDOR_ATTR_AFC_OPCLASS_INFO_MAX,
++				      nla_data(nl),
++				      nla_len(nl),
++				      NULL, NULL)) {
++				goto fail;
++			}
++
++			nla_for_each_nested(nl_attr,
++					    opclass_info[QCA_WLAN_VENDOR_ATTR_AFC_OPCLASS_INFO_CHAN_LIST],
++					    iter) {
++				num_channels++;
++			}
++
++			num_opclas_obj++;
++			total_channels += num_channels;
++		}
++	}
++
++	/* Calculate the total length required for AFC response
++	 * buffer allocation.
++	 */
++	*afc_resp_len = (sizeof(struct ath12k_afc_host_resp) +
++			 sizeof(struct ath12k_afc_bin_resp_data) +
++			 (num_frange_obj * sizeof(struct ath12k_afc_resp_freq_psd_info)) +
++			 (num_opclas_obj * sizeof(struct ath12k_afc_resp_opclass_info)) +
++			 (total_channels * sizeof(struct ath12k_afc_resp_eirp_info)));
++
++	afc_rsp = kzalloc(*afc_resp_len, GFP_KERNEL);
++
++	if (!afc_rsp) {
++		ath12k_dbg(ab, ATH12K_DBG_AFC,
++			   "Error allocating buffer for AFC response");
++		goto fail;
++	}
++
++	if (attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_TIME_TO_LIVE]) {
++		afc_rsp->time_to_live =
++			nla_get_u32(attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_TIME_TO_LIVE]);
++	}
++
++	/* Update the AFC fixed parameters from the AFC response */
++	afc_fixed_params = (struct ath12k_afc_bin_resp_data *)afc_rsp->afc_resp;
++
++	if (attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_REQ_ID]) {
++		afc_fixed_params->request_id =
++			nla_get_u32(attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_REQ_ID]);
++	}
++
++	if (attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_EXP_DATE]) {
++		afc_fixed_params->avail_exp_time_d =
++			nla_get_u32(attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_EXP_DATE]);
++	}
++
++	if (attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_EXP_TIME]) {
++		afc_fixed_params->avail_exp_time_t =
++			nla_get_u32(attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_EXP_TIME]);
++	}
++
++	if (attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_AFC_SERVER_RESP_CODE]) {
++		afc_fixed_params->afc_serv_resp_code =
++			nla_get_u32(attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_AFC_SERVER_RESP_CODE]);
++	}
++
++	/* Update the number of frequency range objects and opclass objects
++	 * to the AFC response structure.
++	 */
++	afc_fixed_params->num_frequency_obj = num_frange_obj;
++	afc_fixed_params->num_channel_obj = num_opclas_obj;
++
++	/* Start parsing and updating the frequency range list */
++	temp = (u8 *)afc_fixed_params;
++	frange_obj =
++	(struct ath12k_afc_resp_freq_psd_info *)(temp +
++						 sizeof(struct ath12k_afc_bin_resp_data));
++
++	if (!frange_obj)
++		goto fail;
++
++	i = 0;
++	if (attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_FREQ_PSD_INFO]) {
++		nla_for_each_nested(nl, attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_FREQ_PSD_INFO],
++				    rem) {
++			if (nla_parse(frange_info,
++				      QCA_WLAN_VENDOR_ATTR_AFC_FREQ_PSD_INFO_MAX,
++				      nla_data(nl),
++				      nla_len(nl),
++				      NULL, NULL)) {
++				goto fail;
++			}
++
++			if (frange_info[QCA_WLAN_VENDOR_ATTR_AFC_FREQ_PSD_INFO_RANGE_START]) {
++				start_freq =
++				nla_get_u16(frange_info[QCA_WLAN_VENDOR_ATTR_AFC_FREQ_PSD_INFO_RANGE_START]);
++			}
++
++			if (frange_info[QCA_WLAN_VENDOR_ATTR_AFC_FREQ_PSD_INFO_RANGE_END]) {
++				end_freq =
++				nla_get_u16(frange_info[QCA_WLAN_VENDOR_ATTR_AFC_FREQ_PSD_INFO_RANGE_END]);
++			}
++			frange_obj[i].freq_info = ((start_freq) | (end_freq << 16));
++
++			if (frange_info[QCA_WLAN_VENDOR_ATTR_AFC_FREQ_PSD_INFO_PSD]) {
++				frange_obj[i].max_psd =
++				nla_get_u32(frange_info[QCA_WLAN_VENDOR_ATTR_AFC_FREQ_PSD_INFO_PSD]);
++			}
++
++			i++;
++		}
++	}
++
++	/* Start parsing and updating the opclass list and corresponding channel
++	 * and EIRP power information.
++	 */
++	temp = (u8 *)frange_obj;
++	start_opcls = (struct ath12k_afc_resp_opclass_info *)
++			(temp + sizeof(struct ath12k_afc_resp_freq_psd_info) *
++			 num_frange_obj);
++	opclass_list = start_opcls;
++
++	if (attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_OPCLASS_CHAN_EIRP_INFO]) {
++		nla_for_each_nested(nl,
++				    attr[QCA_WLAN_VENDOR_ATTR_AFC_RESP_OPCLASS_CHAN_EIRP_INFO],
++				    rem) {
++			if (nla_parse(opclass_info,
++				      QCA_WLAN_VENDOR_ATTR_AFC_OPCLASS_INFO_MAX,
++				      nla_data(nl),
++				      nla_len(nl),
++				      NULL, NULL)) {
++				goto fail;
++			}
++
++			if (opclass_info[QCA_WLAN_VENDOR_ATTR_AFC_OPCLASS_INFO_OPCLASS]) {
++				opclass_list->opclass =
++				nla_get_u8(opclass_info[QCA_WLAN_VENDOR_ATTR_AFC_OPCLASS_INFO_OPCLASS]);
++			}
++
++			temp = (u8 *)opclass_list;
++			chan_obj = (struct ath12k_afc_resp_eirp_info *)
++					(temp + sizeof(struct ath12k_afc_resp_opclass_info));
++			i = 0;
++			nla_for_each_nested(nl_attr,
++					    opclass_info[QCA_WLAN_VENDOR_ATTR_AFC_OPCLASS_INFO_CHAN_LIST],
++					    iter) {
++				if (nla_parse(chan_info,
++					      QCA_WLAN_VENDOR_ATTR_AFC_CHAN_EIRP_INFO_MAX,
++					      nla_data(nl_attr),
++					      nla_len(nl_attr),
++					      NULL, NULL)) {
++					goto fail;
++				}
++
++				if (chan_info[QCA_WLAN_VENDOR_ATTR_AFC_CHAN_EIRP_INFO_CHAN_NUM]) {
++					chan_obj[i].channel_cfi =
++					nla_get_u8(chan_info[QCA_WLAN_VENDOR_ATTR_AFC_CHAN_EIRP_INFO_CHAN_NUM]);
++				}
++
++				if (chan_info[QCA_WLAN_VENDOR_ATTR_AFC_CHAN_EIRP_INFO_EIRP]) {
++					chan_obj[i].max_eirp_pwr =
++					nla_get_s32(chan_info[QCA_WLAN_VENDOR_ATTR_AFC_CHAN_EIRP_INFO_EIRP]);
++				}
++
++				i++;
++			}
++
++			opclass_list->num_channels = i;
++			temp = (u8 *)chan_obj;
++			opclass_list = (struct ath12k_afc_resp_opclass_info *)
++					(temp + (sizeof(struct ath12k_afc_resp_eirp_info) *
++						 opclass_list->num_channels));
++		}
++	}
++
++	return afc_rsp;
++
++fail:
++	ath12k_dbg(ab, ATH12K_DBG_AFC, "Error parsing the AFC response from application");
++
++	if (!afc_rsp)
++		kfree(afc_rsp);
++
++	return NULL;
++}
++
++static int ath12k_vendor_receive_afc_response(struct wiphy *wiphy,
++					      struct wireless_dev *wdev,
++					      const void *data,
++					      int data_len)
++{
++	struct ieee80211_hw *hw = wiphy_to_ieee80211_hw(wiphy);
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar;
++	struct nlattr *tb[QCA_WLAN_VENDOR_ATTR_AFC_RESP_MAX + 1];
++	struct ath12_afc_host_resp *afc_rsp = NULL;
++	int afc_resp_len = 0;
++	enum ath12k_nl_afc_resp_type afc_resp_format;
++	int ret = 0;
++	u8 i;
++
++	ar = ah->radio;
++
++	for (i = 0; i < ah->num_radio; i++, ar++)
++		if (ar->supports_6ghz)
++			break;
++
++	if (!ar)
++		return -ENODATA;
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_AFC,
++		   "Received AFC response event\n");
++
++	if (!(data && data_len)) {
++		ath12k_dbg(ar->ab, ATH12K_DBG_AFC,
++			   "Invalid data length data ptr: %pK ", data);
++		return -EINVAL;
++	}
++
++	if (nla_parse(tb, QCA_WLAN_VENDOR_ATTR_AFC_RESP_MAX, data, data_len,
++		      ath12k_cfg80211_afc_response_policy, NULL)) {
++		ath12k_warn(ar->ab, ATH12K_DBG_AFC,
++			    "invalid set afc config policy attribute\n");
++		return -EINVAL;
++	}
++
++	afc_resp_format = QCA_WLAN_VENDOR_ATTR_AFC_BIN_RESP;
++	switch (afc_resp_format) {
++	case QCA_WLAN_VENDOR_ATTR_AFC_JSON_RESP:
++		if (tb[QCA_WLAN_VENDOR_ATTR_AFC_RESP_DATA]) {
++			/* Extract total AFC response buffer length */
++			afc_resp_len =
++				nla_len(tb[QCA_WLAN_VENDOR_ATTR_AFC_RESP_DATA]);
++
++			if (afc_resp_len) {
++				/* Memory allocation done to store AFC response
++				 * sent by AFC application
++				 */
++				afc_rsp = kzalloc(afc_resp_len, GFP_KERNEL);
++			} else {
++				ath12k_warn(ar->ab, ATH12K_DBG_AFC,
++					    "AFC JSON data is not present!");
++				return -EINVAL;
++			}
++
++			/* Extract the AFC response buffer */
++			if (afc_rsp) {
++				nla_memcpy((void *)afc_rsp,
++					   tb[QCA_WLAN_VENDOR_ATTR_AFC_RESP_DATA],
++					   afc_resp_len);
++			} else {
++				ath12k_warn(ar->ab, ATH12K_DBG_AFC,
++					    "Response buffer allocation failed");
++				return -EINVAL;
++			}
++
++		} else {
++			ath12k_warn(ar->ab, ATH12K_DBG_AFC,
++				    "AFC JSON data not found");
++			return -EINVAL;
++		}
++		break;
++
++	case QCA_WLAN_VENDOR_ATTR_AFC_BIN_RESP:
++		/* The AFC response received from the user space application
++		 * is expected to be packed in network byte order(Big endian).
++		 * Since q6 is little endian, Host needs to convert the afc
++		 * response to little endian format.
++		 *
++		 * Note: This conversion of data to little endian format is only
++		 *       required for Binary type data. For raw JSON data,
++		 *       no conversion is required since it is text string.
++		 *
++		 * Since all the members of the AFC response structure are defined
++		 * to be 32-bit words, convert the length appropriately for
++		 * conversion to little endian format.
++		 */
++		afc_rsp = ath12k_extract_afc_resp(ar->ab, tb, &afc_resp_len);
++
++		if (!afc_rsp)
++			return -EINVAL;
++
++		ath12k_dbg(ar->ab, ATH12K_DBG_AFC,
++			   "AFC response extraction successful!\n");
++
++		ath12k_afc_response_buffer_display(ar->ab, afc_rsp);
++
++		break;
++
++	default:
++		ath12k_warn(ar->ab, ATH12K_DBG_AFC, "Invalid response format type %d\n",
++			    afc_resp_format);
++		ret  = -EINVAL;
++		goto exit;
++	}
++
++	/* Copy the data buffer to AFC memory location */
++	ret = ath12k_copy_afc_response(ar, (char *)afc_rsp, afc_resp_len);
++	if (ret)
++		goto exit;
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_AFC,
++		   "AFC response copied to AFC memory\n");
++
++	ret = ath12k_wmi_send_afc_resp_rx_ind(ar, afc_resp_format);
++	if (ret) {
++		ath12k_warn(ar->ab,
++			    "AFC Rx indication to FW failed: %d\n", ret);
++		goto exit;
++	}
++	ath12k_dbg(ar->ab, ATH12K_DBG_AFC,
++		   "AFC Resp RX indication sent to target\n");
++
++exit:
++	kfree(afc_rsp);
++	return ret;
++}
++
+ #define nla_nest_end_checked(skb, start) do {           \
+ 	if ((skb) && (start))                           \
+ 		nla_nest_end(skb, start);               \
+@@ -2308,6 +2798,13 @@ static struct wiphy_vendor_command ath12k_vendor_commands[] = {
+ 		.maxattr = QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE_MAX,
+ 		.flags = WIPHY_VENDOR_CMD_NEED_NETDEV,
+ 	},
++	{
++		.info.vendor_id = QCA_NL80211_VENDOR_ID,
++		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_AFC_RESPONSE,
++		.doit = ath12k_vendor_receive_afc_response,
++		.policy = ath12k_cfg80211_afc_response_policy,
++		.maxattr = QCA_WLAN_VENDOR_ATTR_AFC_RESPONSE_MAX
++	},
+ };
+ 
+ static const struct nl80211_vendor_cmd_info ath12k_vendor_events[] = {
+diff --git a/drivers/net/wireless/ath/ath12k/vendor.h b/drivers/net/wireless/ath/ath12k/vendor.h
+index 39b5c5d..fcb32fc 100644
+--- a/drivers/net/wireless/ath/ath12k/vendor.h
++++ b/drivers/net/wireless/ath/ath12k/vendor.h
+@@ -9,6 +9,8 @@
+ #define QCA_NL80211_VENDOR_SUBCMD_6GHZ_PWR_MODE_EVT_IDX 101
+ #define QCA_NL80211_VENDOR_SUBCMD_AFC_EVENT_INDEX	100
+ #define QCA_NL80211_AFC_REQ_RESP_BUF_MAX_SIZE		5000
++#define QCA_WLAN_AFC_RESP_DESC_FIELD_START_OCTET	14
++#define QCA_WLAN_AFC_RESP_DESC_FIELD_END_OCTET		30
+ 
+ extern unsigned int ath12k_ppe_ds_enabled;
+ 
+@@ -18,6 +20,7 @@ enum qca_nl80211_vendor_subcmds {
+ 	QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC = 206,
+ 	QCA_NL80211_VENDOR_SUBCMD_SCS_RULE_CONFIG = 218,
+ 	QCA_NL80211_VENDOR_SUBCMD_AFC_EVENT = 222,
++	QCA_NL80211_VENDOR_SUBCMD_AFC_RESPONSE = 223,
+ 	QCA_NL80211_VENDOR_SUBCMD_SET_6GHZ_POWER_MODE = 233,
+ 	QCA_NL80211_VENDOR_SUBCMD_POWER_MODE_CHANGE_COMPLETED = 234,
+ 	QCA_NL80211_VENDOR_SUBCMD_SDWF_PHY_OPS = 235,
+@@ -1141,4 +1144,77 @@ enum qca_wlan_vendor_attr_afc_event {
+ 	QCA_WLAN_VENDOR_ATTR_AFC_EVENT_MAX =
+ 	QCA_WLAN_VENDOR_ATTR_AFC_EVENT_AFTER_LAST - 1,
+ };
++
++/**
++ * enum qca_wlan_vendor_attr_afc_response: Defines attributes to be used
++ * with vendor command QCA_NL80211_VENDOR_SUBCMD_AFC_RESPONSE. These attributes
++ * will support sending only a single AFC response to the driver at a time.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_AFC_RESP_DATA: Type is NLA_STRING. Required attribute.
++ * This attribute will be used to send a single Spectrum Inquiry response object
++ * from the 'availableSpectrumInquiryResponses' array object from the response
++ * JSON.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_AFC_RESP_TIME_TO_LIVE: Required u32 attribute.
++ *
++ * This attribute indicates the period (in seconds) for which the response
++ * data received is valid for.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_AFC_RESP_REQ_ID: Required u32 attribute.
++ *
++ * This attribute indicates the request ID for which the corresponding
++ * response is being sent for. See also QCA_WLAN_VENDOR_ATTR_AFC_EVENT_REQ_ID.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_AFC_RESP_EXP_DATE: Required u32 attribute.
++ *
++ * This attribute indicates the date until which the current response is
++ * valid for in UTC format.
++ * Date format: bits 7:0   - DD (Day 1-31)
++ *              bits 15:8  - MM (Month 1-12)
++ *              bits 31:16 - YYYY (Year)
++ *
++ * @QCA_WLAN_VENDOR_ATTR_AFC_RESP_EXP_TIME: Required u32 attribute.
++ *
++ * This attribute indicates the time until which the current response is
++ * valid for in UTC format.
++ * Time format: bits 7:0   - SS (Seconds 0-59)
++ *              bits 15:8  - MM (Minutes 0-59)
++ *              bits 23:16 - HH (Hours 0-23)
++ *              bits 31:24 - Reserved
++ *
++ * @QCA_WLAN_VENDOR_ATTR_AFC_RESP_AFC_SERVER_RESP_CODE: Required s32 attribute.
++ *
++ * This attribute indicates the AFC response code. The AFC response codes are
++ * in the following categories:
++ * -1: General Failure.
++ * 0: Success.
++ * 100 - 199: General errors related to protocol.
++ * 300 - 399: Error events specific to message exchange
++ *            for the Available Spectrum Inquiry.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_AFC_RESP_FREQ_PSD_INFO: Array of nested attributes
++ * for PSD info of all the queried frequency ranges. It uses the attributes
++ * defined in enum qca_wlan_vendor_attr_afc_freq_psd_info. Required attribute.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_AFC_RESP_OPCLASS_CHAN_EIRP_INFO: Array of nested
++ * attributes for EIRP info of all queried operating class/channels. It uses
++ * the attributes defined in enum qca_wlan_vendor_attr_afc_opclass_info and
++ * enum qca_wlan_vendor_attr_afc_chan_eirp_info. Required attribute.
++ *
++ */
++enum qca_wlan_vendor_attr_afc_response {
++	QCA_WLAN_VENDOR_ATTR_AFC_RESP_INVALID = 0,
++	QCA_WLAN_VENDOR_ATTR_AFC_RESP_DATA = 1,
++	QCA_WLAN_VENDOR_ATTR_AFC_RESP_TIME_TO_LIVE = 2,
++	QCA_WLAN_VENDOR_ATTR_AFC_RESP_REQ_ID = 3,
++	QCA_WLAN_VENDOR_ATTR_AFC_RESP_EXP_DATE = 4,
++	QCA_WLAN_VENDOR_ATTR_AFC_RESP_EXP_TIME = 5,
++	QCA_WLAN_VENDOR_ATTR_AFC_RESP_AFC_SERVER_RESP_CODE = 6,
++	QCA_WLAN_VENDOR_ATTR_AFC_RESP_FREQ_PSD_INFO = 7,
++	QCA_WLAN_VENDOR_ATTR_AFC_RESP_OPCLASS_CHAN_EIRP_INFO = 8,
++
++	QCA_WLAN_VENDOR_ATTR_AFC_RESP_AFTER_LAST,
++	QCA_WLAN_VENDOR_ATTR_AFC_RESP_MAX =
++	QCA_WLAN_VENDOR_ATTR_AFC_RESP_AFTER_LAST - 1,
++};
+ #endif /* QCA_VENDOR_H */
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.c b/drivers/net/wireless/ath/ath12k/wmi.c
+index 4f77124..12858f1 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -7421,6 +7421,37 @@ static void ath12k_wmi_afc_event(struct ath12k_base *ab,
+ 	}
+ }
+ 
++int ath12k_wmi_send_afc_resp_rx_ind(struct ath12k *ar, int data_type)
++{
++	struct ath12k_wmi_pdev *wmi = ar->wmi;
++	int ret = 0;
++	struct sk_buff *skb;
++	struct wmi_afc_cmd_fixed_param *cmd = NULL;
++
++	skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, sizeof(*cmd));
++	if (!skb)
++		return -ENOMEM;
++
++	cmd = (struct wmi_afc_cmd_fixed_param *)skb->data;
++	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_AFC_CMD_FIXED_PARAM) |
++			  FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
++	cmd->pdev_id = cpu_to_le32(ar->pdev->pdev_id);
++	cmd->cmd_type = cpu_to_le32(ath12k_REG_AFC_CMD_SERV_RESP_READY);
++	cmd->serv_resp_format = cpu_to_le32(data_type);
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_WMI,
++		   "Sending afc indication for pdev id %d resp format %d\n",
++		   cmd->pdev_id, cmd->serv_resp_format);
++
++	ret = ath12k_wmi_cmd_send(wmi, skb, WMI_AFC_CMDID);
++	if (ret) {
++		ath12k_warn(ar->ab, "Failed to send WMI_AFC_CMDID\n");
++		dev_kfree_skb(skb);
++	}
++
++	return ret;
++}
++
+ static struct ath12k_reg_rule
+ *create_ext_reg_rules_from_wmi(u32 num_reg_rules,
+ 			       struct ath12k_wmi_reg_rule_ext_params *wmi_reg_rule)
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.h b/drivers/net/wireless/ath/ath12k/wmi.h
+index bfb3caf..ccfeb73 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -818,6 +818,7 @@ enum wmi_tlv_cmd_id {
+ 	WMI_11D_SCAN_START_CMDID,
+ 	WMI_11D_SCAN_STOP_CMDID,
+ 	WMI_SET_INIT_COUNTRY_CMDID,
++	WMI_AFC_CMDID,
+ 	WMI_NDI_GET_CAP_REQ_CMDID = WMI_TLV_CMD(WMI_GRP_PROTOTYPE),
+ 	WMI_NDP_INITIATOR_REQ_CMDID,
+ 	WMI_NDP_RESPONDER_REQ_CMDID,
+@@ -2187,6 +2188,7 @@ enum wmi_tlv_tag {
+ 	WMI_TAG_MLO_PEER_CREATE_PARAMS = 0x3D5,
+ 	WMI_TAG_MLO_VDEV_START_PARAMS = 0x3D6,
+ 	WMI_TAG_MLO_VDEV_CREATE_PARAMS = 0x3D7,
++	WMI_TAG_AFC_CMD_FIXED_PARAM = 0x3DE,
+ 	WMI_TAG_AFC_EVENT_FIXED_PARAM,
+ 	WMI_TAG_AFC_EXPIRY_EVENT_PARAM,
+ 	WMI_TAG_AFC_POWER_EVENT_PARAM,
+@@ -8508,6 +8510,7 @@ struct wmi_peer_tid_latency_cmd {
+ #define WMI_ANI_EVENT_PDEV_ID_VALID	BIT(31)
+ #define WMI_ANI_EVENT_PDEV_ID		GENMASK(7, 0)
+ 
++#define ath12k_REG_AFC_CMD_SERV_RESP_READY	1
+ #define WMI_AFC_LOW_FREQUENCY			GENMASK(15, 0)
+ #define WMI_AFC_HIGH_FREQUENCY			GENMASK(31, 16)
+ 
+@@ -8553,6 +8556,12 @@ struct wmi_afc_power_event_param {
+ 	__le32 avail_exp_time_t;
+ };
+ 
++struct wmi_afc_cmd_fixed_param {
++	__le32 tlv_header;
++	__le32 pdev_id;
++	__le32 cmd_type;
++	__le32 serv_resp_format;
++} __packed;
+ #define ATH12K_FW_STATS_BUF_SIZE (1024 * 1024)
+ 
+ void ath12k_wmi_init_qcn9274(struct ath12k_base *ab,
+@@ -8724,6 +8733,7 @@ int ath12k_wmi_set_hw_mode(struct ath12k_base *ab,
+ int ath12k_wmi_send_vdev_set_tpc_power(struct ath12k *ar,
+                                         u32 vdev_id,
+                                         struct ath12k_reg_tpc_power_info *param);
++int ath12k_wmi_send_afc_resp_rx_ind(struct ath12k *ar, int data_type);
+ int ath12k_wmi_dbglog_cfg(struct ath12k *ar, u32 param, u64 value);
+ int ath12k_wmi_pdev_ap_ps_cmd_send(struct ath12k *ar, u8 pdev_id, u32 value);
+ int ath12k_wmi_pdev_m3_dump_enable(struct ath12k *ar, u32 enable);
+-- 
+2.34.1
+

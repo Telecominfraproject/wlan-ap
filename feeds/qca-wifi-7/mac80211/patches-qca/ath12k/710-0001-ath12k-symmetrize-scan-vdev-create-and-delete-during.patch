@@ -1,0 +1,171 @@
+From 4e7cb831af505a7ca0daa5f625fa1f63b84ff096 Mon Sep 17 00:00:00 2001
+From: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Date: Tue, 24 Jan 2023 18:08:32 +0530
+Subject: [PATCH] ath12k: symmetrize scan vdev create and delete during hw scan
+
+Currently, hw scan is started in driver on link_id 0. After mapping
+to proper ar based on the scan frequency, the vdev is created and scan
+is started. However, the vdev is only deleted during MLO scenario when
+after scan, channel assignent is going to happen. This unbalanced
+scenario leads to various hw scan issues where non-ML plus ML combination
+exists and the later tries to skip the scan and do a channel assignemnt
+while the former is still scanning. This will ead to FW assert.
+
+Address this issue by symmetrizing the scan vdev create and delete
+during hw scan operations itself. This means, create a vdev when scan
+starts and delete it once scan is completed or aborted.
+
+Signed-off-by: Aditya Kumar Singh <quic_adisi@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c |  1 +
+ drivers/net/wireless/ath/ath12k/core.h |  1 +
+ drivers/net/wireless/ath/ath12k/mac.c  | 76 ++++++++++++++++++++++----
+ 3 files changed, 68 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1442,6 +1442,7 @@ void ath12k_core_halt(struct ath12k *ar)
+ 	ath12k_mac_scan_finish(ar);
+ 	ath12k_mac_peer_cleanup_all(ar);
+ 	cancel_delayed_work_sync(&ar->scan.timeout);
++	cancel_work_sync(&ar->scan.vdev_del_wk);
+ 	cancel_work_sync(&ar->regd_update_work);
+ 	rcu_assign_pointer(ab->pdevs_active[ar->pdev_idx], NULL);
+ 	synchronize_rcu();
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -706,6 +706,7 @@ struct ath12k {
+ 		int vdev_id;
+ 		int roc_freq;
+ 		bool roc_notify;
++		struct work_struct vdev_del_wk;
+ 	} scan;
+ 
+ 	struct {
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -255,7 +255,8 @@ static void ath12k_mac_parse_tx_pwr_env(
+                                         struct ieee80211_chanctx_conf *ctx);
+ static void ath12k_update_bcn_template_work(struct work_struct *work);
+ static void ath12k_update_obss_color_notify_work(struct work_struct *work);
+-
++static void ath12k_mac_remove_link_interface(struct ieee80211_hw *hw,
++					     struct ath12k_link_vif *arvif);
+ enum nl80211_he_ru_alloc ath12k_mac_phy_he_ru_to_nl80211_he_ru_alloc(u16 ru_phy)
+ {
+ 	enum nl80211_he_ru_alloc ret;
+@@ -4740,6 +4741,7 @@ void __ath12k_mac_scan_finish(struct ath
+ 		ar->scan.roc_freq = 0;
+ 		cancel_delayed_work(&ar->scan.timeout);
+ 		complete(&ar->scan.completed);
++		ieee80211_queue_work(ah->hw, &ar->scan.vdev_del_wk);
+ 		break;
+ 	}
+ }
+@@ -4839,6 +4841,46 @@ static void ath12k_scan_timeout_work(str
+ 	mutex_unlock(&ar->conf_mutex);
+ }
+ 
++static void ath12k_scan_vdev_del_work(struct work_struct *work)
++{
++	struct ath12k *ar = container_of(work, struct ath12k,
++					 scan.vdev_del_wk);
++	struct ath12k_hw *ah = ar->ah;
++	struct ath12k_link_vif *arvif;
++
++	mutex_lock(&ar->conf_mutex);
++	/* scan vdev got deleted already. This can happen when on same vif, new
++	 * scan request was requested with different frequeny which leads to
++	 * movement of scan arvif from one radio to another radio */
++	if (ar->scan.vdev_id == -1)
++		goto work_complete;
++
++	mutex_unlock(&ar->conf_mutex);
++
++	arvif = ath12k_mac_get_arvif(ar, ar->scan.vdev_id);
++	/* should not happen */
++	if (!arvif) {
++		ath12k_warn(ar->ab, "mac scan vdev del on unknow vdev_id %d\n",
++			    ar->scan.vdev_id);
++		return;
++	}
++
++	if (arvif->is_started) {
++		mutex_lock(&ar->conf_mutex);
++		ar->scan.vdev_id = -1;
++		goto work_complete;
++	}
++
++	mutex_lock(&ah->conf_mutex);
++	ath12k_mac_remove_link_interface(ah->hw, arvif);
++	mutex_unlock(&ah->conf_mutex);
++
++	mutex_lock(&ar->conf_mutex);
++	ar->scan.vdev_id = -1;
++work_complete:
++	mutex_unlock(&ar->conf_mutex);
++}
++
+ static int ath12k_start_scan(struct ath12k *ar,
+ 			     struct ath12k_wmi_scan_req_arg *arg)
+ {
+@@ -4922,6 +4964,11 @@ static int ath12k_mac_op_hw_scan(struct
+ 			mutex_unlock(&ah->conf_mutex);
+ 			return -EINVAL;
+ 		} else if (ar != arvif->ar) {
++			mutex_lock(&arvif->ar->conf_mutex);
++			if (arvif->ar->scan.vdev_id != -1)
++				arvif->ar->scan.vdev_id = -1;
++			mutex_unlock(&arvif->ar->conf_mutex);
++
+ 			ret = ath12k_mac_vdev_delete(arvif->ar, arvif);
+ 			if (ret)
+ 				ath12k_warn(arvif->ar->ab, "unable to delete scan vdev %d\n", ret);
+@@ -4942,9 +4989,6 @@ static int ath12k_mac_op_hw_scan(struct
+ 		mutex_unlock(&ar->conf_mutex);
+ 	}
+ 
+-	if (vif->valid_links)
+-		ah->scan_arvif = arvif;
+-
+ 	mutex_unlock(&ah->conf_mutex);
+ 
+ 	mutex_lock(&ar->conf_mutex);
+@@ -8708,6 +8752,7 @@ static void ath12k_mac_radio_stop(struct
+ 	mutex_unlock(&ar->conf_mutex);
+ 
+ 	cancel_delayed_work_sync(&ar->scan.timeout);
++	cancel_work_sync(&ar->scan.vdev_del_wk);
+ 	cancel_work_sync(&ar->regd_update_work);
+ 
+ 	spin_lock_bh(&ar->data_lock);
+@@ -9353,6 +9398,7 @@ static struct ath12k *ath12k_mac_assign_
+ 	struct ath12k *ar;
+ 	struct ath12k_base *ab;
+ 	struct ieee80211_vif *vif = arvif->ahvif->vif;
++	struct ath12k_link_vif *scan_arvif;
+ 	int ret;
+ 
+ 	lockdep_assert_held(&ah->conf_mutex);
+@@ -11536,12 +11582,6 @@ ath12k_mac_op_assign_vif_chanctx(struct
+ 
+ 	mutex_lock(&ah->conf_mutex);
+ 
+-	/* clear any scan arvifs since its always attached to link 0 by default */
+-	if (ah->scan_arvif && vif->valid_links) {
+-		ath12k_mac_remove_link_interface(hw, ah->scan_arvif);
+-		ah->scan_arvif = NULL;
+-	}
+-
+ 	arvif = ath12k_mac_assign_link_vif(ah, vif, link_id);
+ 	if (!arvif) {
+ 		ath12k_err(NULL, "unable to allocate link vif\n");
+@@ -14479,6 +14519,8 @@ static int ath12k_mac_chip_setup(struct
+ 	init_completion(&ar->mvr_complete);
+ 
+ 	INIT_DELAYED_WORK(&ar->scan.timeout, ath12k_scan_timeout_work);
++	INIT_WORK(&ar->scan.vdev_del_wk, ath12k_scan_vdev_del_work);
++	ar->scan.vdev_id = -1;
+ 	INIT_WORK(&ar->regd_update_work, ath12k_regd_update_work);
+ 
+ 	INIT_WORK(&ar->wmi_mgmt_tx_work, ath12k_mgmt_over_wmi_tx_work);

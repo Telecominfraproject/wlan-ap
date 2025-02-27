@@ -1,0 +1,227 @@
+From 61ad523f791745d9562751753575df0897dc7773 Mon Sep 17 00:00:00 2001
+From: Sidhanta Sahu <quic_sidhanta@quicinc.com>
+Date: Mon, 12 Aug 2024 17:34:21 -0700
+Subject: [PATCH] wifi: ath12k: Introduce RCU Protection to safeguard arvif
+
+Address synchronization issues caused by traversing through the links of
+ahvif without a lock. Note that previously, ahvif->links and
+ahvif->links_map were protected by ah->conf_mutex, which cannot be
+acquired in an interrupt context.
+
+Fix the synchronization issue and retrieve an arvif safely with rcu
+
+Patch-Dependency: 676-01-ath12k-prepare-vif-and-sta-for-MLO-handling.patch
+Patch-work: None
+
+Signed-off-by: Sidhanta Sahu <quic_sidhanta@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |  4 +-
+ drivers/net/wireless/ath/ath12k/mac.c  | 89 ++++++++++++++++++++++++++
+ 2 files changed, 91 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -403,6 +403,7 @@ struct ath12k_prb_resp_tmpl_ml_info {
+ };
+ 
+ struct ath12k_link_vif {
++	struct rcu_head rcu_head;
+ 	struct ath12k_base *ab;
+ 	struct ath12k_dp *dp;
+ 	struct ath12k_vif_tcl_desc_template desc;
+@@ -512,7 +513,7 @@ struct ath12k_vif {
+ 	} u;
+ 
+ 	struct ath12k_link_vif deflink;
+-	struct ath12k_link_vif *link[ATH12K_NUM_MAX_LINKS];
++	struct ath12k_link_vif *__rcu link[ATH12K_NUM_MAX_LINKS];
+ 	/* indicates bitmap of link vdev created in FW */
+ 	unsigned long links_map;
+ 	u32 aid;
+@@ -1930,6 +1931,26 @@ static inline const char *ath12k_bus_str
+ 	return "unknown";
+ }
+ 
++/* Caller must call this function under rcu critical section */
++static inline struct ath12k_link_vif *
++ath12k_rcu_get_arvif_from_link_id(struct ath12k_vif *ahvif, int link_id)
++{
++	if (link_id >= ATH12K_NUM_MAX_LINKS)
++		return NULL;
++
++	return rcu_dereference(ahvif->link[link_id]);
++}
++
++static inline struct ath12k_link_vif *
++ath12k_get_arvif_from_link_id(struct ath12k_vif *ahvif, int link_id)
++{
++	if (link_id >= ATH12K_NUM_MAX_LINKS)
++		return NULL;
++
++	return rcu_dereference_protected(ahvif->link[link_id],
++					 lockdep_is_held(&ahvif->ah->conf_mutex));
++}
++
+ int ath12k_pci_init(void);
+ void ath12k_pci_exit(void);
+ #ifdef CPTCFG_ATH12K_AHB
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -914,6 +914,27 @@ ieee80211_link_sta *ath12k_get_link_sta(
+ 	return link_sta;
+ }
+ 
++static void ath12k_get_active_arvif_iter_rcu(void *data, u8 *mac,
++					     struct ieee80211_vif *vif)
++{
++	struct ath12k_vif *ahvif = (void *)vif->drv_priv;
++	struct ath12k_vif_iter *arvif_iter = data;
++	struct ath12k_link_vif *arvif = NULL;
++	struct ieee80211_bss_conf* link_conf;
++	u8 link_id;
++
++	for_each_vif_active_link(vif, link_conf, link_id) {
++		arvif = rcu_dereference(ahvif->link[link_id]);
++		if (arvif) {
++			if ((arvif->vdev_id == arvif_iter->vdev_id) &&
++			    (arvif->ar == arvif_iter->ar)) {
++				arvif_iter->arvif = arvif;
++				break;
++			}
++		}
++	}
++}
++
+ static void ath12k_get_arvif_iter(void *data, u8 *mac,
+ 				  struct ieee80211_vif *vif)
+ {
+@@ -926,12 +947,7 @@ static void ath12k_get_arvif_iter(void *
+ 	 * used with vif protected by rcu lock and since the ahvif->links_map
+ 	 * or link wont be modified it is safe to access below without its mutex
+ 	 */
+-	for_each_set_bit(link_id, &ahvif->links_map, ATH12K_NUM_MAX_LINKS) {
+-		arvif = ahvif->link[link_id];
+-
+-		if (WARN_ON(arvif == NULL))
+-			continue;
+-
++	for_each_ahvif_link(ahvif, arvif, link_id) {
+ 		if ((arvif->vdev_id == arvif_iter->vdev_id) &&
+ 		    (arvif->ar == arvif_iter->ar)) {
+ 			arvif_iter->arvif = arvif;
+@@ -940,6 +956,22 @@ static void ath12k_get_arvif_iter(void *
+ 	}
+ }
+ 
++struct ath12k_link_vif *ath12k_mac_get_active_arvif(struct ath12k *ar, u32 vdev_id)
++{
++	struct ath12k_vif_iter arvif_iter = {};
++	u32 flags;
++
++	arvif_iter.vdev_id = vdev_id;
++	arvif_iter.ar = ar;
++
++	flags = IEEE80211_IFACE_ITER_RESUME_ALL;
++	ieee80211_iterate_active_interfaces_atomic(ar->ah->hw,
++						   flags,
++						   ath12k_get_active_arvif_iter_rcu,
++						   &arvif_iter);
++	return arvif_iter.arvif;
++}
++
+ struct ath12k_link_vif *ath12k_mac_get_arvif(struct ath12k *ar, u32 vdev_id)
+ {
+ 	struct ath12k_vif_iter arvif_iter = {};
+@@ -5699,6 +5731,56 @@ void ath12k_mac_unassign_link_vif(struct
+ 		memset(arvif->addr, 0, ETH_ALEN);
+ }
+ 
++int ath12k_mac_add_update_link_vif_rcu(struct ath12k_vif *ahvif,
++				       int link_id,
++				       struct ath12k_link_vif *new_arvif)
++{
++	struct ath12k_link_vif *old_arvif;
++
++	if (link_id >= ATH12K_NUM_MAX_LINKS)
++		return -EINVAL;
++
++	old_arvif = rcu_dereference_protected(ahvif->link[link_id],
++				      lockdep_is_held(&ahvif->ah->conf_mutex));
++
++	rcu_assign_pointer(ahvif->link[link_id], new_arvif);
++
++	if (new_arvif)
++		set_bit(link_id, &ahvif->links_map);
++	else
++		clear_bit(link_id, &ahvif->links_map);
++
++	if (old_arvif && old_arvif != &ahvif->deflink)
++		kfree_rcu(old_arvif, rcu_head);
++
++	return 0;
++}
++
++int ath12k_mac_remove_link_vif_rcu(struct ath12k_vif *ahvif,
++				   int link_id)
++{
++	struct ath12k_link_vif *old_arvif;
++
++	if (link_id >= ATH12K_NUM_MAX_LINKS)
++		return -EINVAL;
++
++	old_arvif = rcu_dereference_protected(ahvif->link[link_id],
++					      lockdep_is_held(&ahvif->ah->conf_mutex));
++
++	if (WARN_ON(!old_arvif))
++		return -ENOENT;
++
++	rcu_assign_pointer(ahvif->link[link_id], NULL);
++	clear_bit(link_id, &ahvif->links_map);
++	if (old_arvif != &ahvif->deflink)
++		kfree_rcu(old_arvif, rcu_head);
++	else
++		memset(old_arvif->addr, 0, ETH_ALEN);
++
++	return 0;
++}
++
++
+ struct ath12k_link_vif *
+ ath12k_mac_assign_link_vif(struct ath12k_hw *ah, struct ieee80211_vif *vif,
+ 			   u8 link_id, bool is_bridge_vdev)
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -125,6 +125,33 @@ enum ath12k_background_dfs_events {
+ #define ATH12K_WLAN_PRIO_MAX    0x63
+ #define ATH12K_WLAN_PRIO_WEIGHT 0xff
+ 
++#define for_each_ahvif_link(ahvif, arvif, link_id)                        \
++        for (link_id = 0; link_id < ARRAY_SIZE((ahvif)->link); link_id++) \
++                if ((!(ahvif)->links_map ||                               \
++                    (ahvif)->links_map & BIT(link_id)) &&                 \
++                    (arvif = rcu_dereference((ahvif)->link[link_id])))
++
++#define for_each_ahvif_link_protected(ahvif, ah, arvif, link_id)                        	\
++        for (link_id = 0; link_id < ARRAY_SIZE((ahvif)->link); link_id++) 			\
++                if ((!(ahvif)->links_map ||                               			\
++                    (ahvif)->links_map & BIT(link_id)) &&                 			\
++                    (arvif = rcu_dereference_protected((ahvif)->link[link_id],			\
++						       lockdep_is_held(&(ah)->conf_mutex))))
++
++#define for_each_ahvif_mld_link_protected(ahvif, ah, arvif, link_id)                        	\
++        for (link_id = 0; link_id < IEEE80211_MLD_MAX_NUM_LINKS; link_id++) 			\
++                if ((!(ahvif)->links_map ||                               			\
++                    (ahvif)->links_map & BIT(link_id)) &&                 			\
++                    (arvif = rcu_dereference_protected((ahvif)->link[link_id],			\
++						       lockdep_is_held(&(ah)->conf_mutex))))
++
++#define for_each_ahvif_mld_active_link(ahvif, ah, arvif, link_id)				\
++	for (link_id = 0; link_id < IEEE80211_MLD_MAX_NUM_LINKS; link_id++)			\
++                if ((!(ahvif)->links_map ||                               			\
++                    (ahvif)->links_map & BIT(link_id)) &&                 			\
++                    (arvif = rcu_dereference((ahvif)->link[link_id])))				\
++		    	if (((arvif)->is_created) && ((arvif)->is_started))
++
+ extern const struct htt_rx_ring_tlv_filter ath12k_mac_mon_status_filter_default;
+ 
+ void ath12k_mac_set_cw_intf_detect(struct ath12k *ar, u8 intf_detect_param);

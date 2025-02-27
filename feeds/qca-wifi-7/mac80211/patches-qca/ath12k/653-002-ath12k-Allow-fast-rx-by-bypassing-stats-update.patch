@@ -1,0 +1,415 @@
+From aabe95eb049aa0b0c9fa6f6258d2e2f80a4748c6 Mon Sep 17 00:00:00 2001
+From: Balamurugan Selvarajan <quic_bselvara@quicinc.com>
+Date: Wed, 27 Jul 2022 16:18:59 +0530
+Subject: [PATCH] ath12k: Allow fast rx by bypassing stats update
+
+Add a provision to disable stats and enable fast rx support.
+for a peer when it is connected to an AP with ethernet decap support.
+All valid IP packets are directly passed to the net core stack
+bypassing mac80211 stats update.
+
+Signed-off-by: Balamurugan Selvarajan <quic_bselvara@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h    |   2 +
+ drivers/net/wireless/ath/ath12k/debugfs.c |  65 +++++++++++++
+ drivers/net/wireless/ath/ath12k/dp.h      |   1 +
+ drivers/net/wireless/ath/ath12k/dp_rx.c   | 108 ++++++++++++++++++++--
+ drivers/net/wireless/ath/ath12k/dp_tx.c   |   6 +-
+ drivers/net/wireless/ath/ath12k/hal.c     |  11 +++
+ drivers/net/wireless/ath/ath12k/hal.h     |   1 +
+ drivers/net/wireless/ath/ath12k/peer.c    |   2 +
+ drivers/net/wireless/ath/ath12k/peer.h    |   1 +
+ 9 files changed, 187 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -967,6 +967,7 @@ struct ath12k_base {
+ 	
+ 	struct device_node *hremote_node;
+ 	u32 host_ddr_fixed_mem_off;
++	bool stats_disable;
+ 
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -1084,6 +1084,67 @@ static const struct file_operations fops
+ 	.llseek = default_llseek,
+ };
+ 
++static void ath12k_debug_config_mon_status(struct ath12k *ar, bool enable)
++{
++	struct htt_rx_ring_tlv_filter tlv_filter = {0};
++	struct ath12k_base *ab = ar->ab;
++	int i;
++	u32 ring_id;
++
++	if (enable) {
++	        tlv_filter = ath12k_mac_mon_status_filter_default;
++		tlv_filter.rxmon_disable = false;
++	} else {
++		tlv_filter.rxmon_disable = true;
++	}
++
++	for (i = 0; i < ab->hw_params->num_rxmda_per_pdev; i++) {
++	        ring_id = ar->dp.rxdma_mon_dst_ring[i].ring_id;
++	        ath12k_dp_tx_htt_rx_filter_setup(ar->ab, ring_id,
++	                                         ar->dp.mac_id + i,
++	                                         HAL_RXDMA_MONITOR_DST,
++	                                         DP_RXDMA_REFILL_RING_SIZE,
++	                                         &tlv_filter);
++	}
++}
++
++static ssize_t ath12k_write_stats_disable(struct file *file,
++					  const char __user *user_buf,
++					  size_t count, loff_t *ppos)
++{
++	struct ath12k_base *ab = file->private_data;
++	struct ath12k_pdev *pdev;
++	bool disable;
++	int ret, i;
++	u32 mask = 0;
++
++	if (kstrtobool_from_user(user_buf, count, &disable))
++		return -EINVAL;
++
++	if (disable != ab->stats_disable) {
++		ab->stats_disable = disable;
++		for (i = 0; i < ab->num_radios; i++) {
++			pdev = &ab->pdevs[i];
++			if (pdev && pdev->ar) {
++				ath12k_debug_config_mon_status(pdev->ar, !disable);
++
++				if (!disable)
++					mask = HTT_PPDU_STATS_TAG_DEFAULT;
++
++				ath12k_dp_tx_htt_h2t_ppdu_stats_req(pdev->ar, mask);
++	                }
++	        }
++	 }
++	ret = count;
++
++	return ret;
++}
++
++static const struct file_operations fops_soc_stats_disable = {
++	.open = simple_open,
++	.write = ath12k_write_stats_disable,
++};
++
+ int ath12k_debugfs_pdev_create(struct ath12k_base *ab)
+ {
+ 	if (test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags))
+@@ -1103,6 +1164,10 @@ int ath12k_debugfs_pdev_create(struct at
+ 
+ 	debugfs_create_file("trace_qdss", 0600, ab->debugfs_soc, ab,
+ 			    &fops_trace_qdss);
++
++	debugfs_create_file("stats_disable", 0600, ab->debugfs_soc, ab,
++			    &fops_soc_stats_disable);
++
+ 	return 0;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -1145,6 +1145,7 @@ struct htt_rx_ring_tlv_filter {
+ 	u32 info0;
+ 	u32 info1;
+ 	bool drop_threshold_valid;
++	bool rxmon_disable;
+ };
+ 
+ #define HTT_STATS_FRAME_CTRL_TYPE_MGMT  0x0
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -236,6 +236,12 @@ static u16 ath12k_dp_rxdesc_get_mpdu_fra
+ 	return ab->hw_params->hal_ops->rx_desc_get_mpdu_frame_ctl(desc);
+ }
+ 
++static inline u8 ath12k_dp_rx_h_msdu_end_ip_valid(struct ath12k_base *ab,
++                                                    struct hal_rx_desc *desc)
++{
++       return ab->hw_params->hal_ops->rx_desc_get_ip_valid(desc);
++}
++
+ static int ath12k_dp_purge_mon_ring(struct ath12k_base *ab)
+ {
+ 	int i, reaped = 0;
+@@ -2441,10 +2447,60 @@ ath12k_dp_rx_h_find_peer(struct ath12k_b
+ 	return peer;
+ }
+ 
++static bool ath12k_dp_rx_check_fast_rx(struct ath12k *ar,
++                                       struct sk_buff *msdu,
++                                       struct hal_rx_desc *rx_desc,
++                                       struct ath12k_peer *peer)
++{
++	struct ethhdr *ehdr;
++	struct ath12k_peer *f_peer;
++	struct ath12k_skb_rxcb *rxcb;
++	u8 decap;
++
++	lockdep_assert_held(&ar->ab->base_lock);
++
++	decap = ath12k_dp_rx_h_decap_type(ar->ab, rx_desc);
++	rxcb = ATH12K_SKB_RXCB(msdu);
++
++	if (!ar->ab->stats_disable ||
++		decap != DP_RX_DECAP_TYPE_ETHERNET2_DIX ||
++		peer->vif->type != NL80211_IFTYPE_AP)
++		return false;
++
++	/* mcbc packets go through mac80211 for PN validation */
++	if (rxcb->is_mcbc)
++		return false;
++
++	if (!peer->is_authorized)
++		return false;
++
++	if (!ath12k_dp_rx_h_msdu_end_ip_valid(ar->ab, rx_desc))
++		return false;
++
++	/* fast rx is supported only on ethernet decap, so
++	 * we can directly gfet the ethernet header
++	 */
++	ehdr = (struct ethhdr *)msdu->data;
++
++	/* requires rebroadcast from mac80211 */
++	if (is_multicast_ether_addr(ehdr->h_dest))
++	        return false;
++
++	/* check if the msdu needs to be bridged to our connected peer */
++	f_peer = ath12k_peer_find_by_addr(ar->ab, ehdr->h_dest);
++
++	if (f_peer && f_peer != peer)
++		return false;
++
++	/* allow direct rx */
++	return true;
++}
++
+ static void ath12k_dp_rx_h_mpdu(struct ath12k *ar,
+ 				struct sk_buff *msdu,
+ 				struct hal_rx_desc *rx_desc,
+-				struct ieee80211_rx_status *rx_status)
++				struct ieee80211_rx_status *rx_status,
++				bool *fast_rx)
+ {
+ 	bool  fill_crypto_hdr;
+ 	struct ath12k_base *ab = ar->ab;
+@@ -2454,6 +2510,8 @@ static void ath12k_dp_rx_h_mpdu(struct a
+ 	struct ieee80211_hdr *hdr;
+ 	struct ath12k_peer *peer;
+ 	u32 err_bitmap;
++	struct wireless_dev *wdev = NULL;
++	struct ath12k_sta *arsta = NULL;
+ 
+ 	/* PN for multicast packets will be checked in mac80211 */
+ 	rxcb = ATH12K_SKB_RXCB(msdu);
+@@ -2466,6 +2524,27 @@ static void ath12k_dp_rx_h_mpdu(struct a
+ 	spin_lock_bh(&ar->ab->base_lock);
+ 	peer = ath12k_dp_rx_h_find_peer(ar->ab, msdu);
+ 	if (peer) {
++		/* If the pkt is a valid IP packet and peer supports
++		 * fast rx, deliver directly to net, also note that
++		 * pkts with crypto error are not expected to arrive in this
++		 * path, so its safe to skip checking errors here */
++		if (*fast_rx &&
++		    ath12k_dp_rx_check_fast_rx(ar, msdu, rx_desc, peer)) {
++		        wdev = ieee80211_vif_to_wdev(peer->vif);
++		        if (wdev) {
++				spin_unlock_bh(&ar->ab->base_lock);
++				ath12k_dp_rx_h_csum_offload(ar, msdu);
++				msdu->dev = wdev->netdev;
++				msdu->protocol = eth_type_trans(msdu, msdu->dev);
++				napi_gro_receive(rxcb->napi, msdu);
++				if (peer->sta)
++					arsta =
++				        (struct ath12k_sta *)peer->sta->drv_priv;
++
++				return;
++		        }
++		}
++		*fast_rx = false;
+ 		if (rxcb->is_mcbc)
+ 			enctype = peer->sec_type_grp;
+ 		else
+@@ -2745,7 +2824,8 @@ static void ath12k_dp_rx_deliver_msdu(st
+ static int ath12k_dp_rx_process_msdu(struct ath12k *ar,
+ 				     struct sk_buff *msdu,
+ 				     struct sk_buff_head *msdu_list,
+-				     struct ieee80211_rx_status *rx_status)
++				     struct ieee80211_rx_status *rx_status,
++				     bool *fast_rx)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct hal_rx_desc *rx_desc, *lrx_desc;
+@@ -2800,8 +2880,11 @@ static int ath12k_dp_rx_process_msdu(str
+ 		}
+ 	}
+ 
++	ath12k_dp_rx_h_mpdu(ar, msdu, rx_desc, rx_status, fast_rx);
++	if (*fast_rx)
++		return 0;
++
+ 	ath12k_dp_rx_h_ppdu(ar, rx_desc, rx_status);
+-	ath12k_dp_rx_h_mpdu(ar, msdu, rx_desc, rx_status);
+ 
+ 	rx_status->flag |= RX_FLAG_SKIP_MONITOR | RX_FLAG_DUP_VALIDATED;
+ 
+@@ -2822,6 +2905,7 @@ static void ath12k_dp_rx_process_receive
+ 	struct ath12k *ar;
+ 	u8 mac_id;
+ 	int ret;
++	bool fast_rx;
+ 
+ 	if (skb_queue_empty(msdu_list))
+ 		return;
+@@ -2830,6 +2914,10 @@ static void ath12k_dp_rx_process_receive
+ 
+ 	while ((msdu = __skb_dequeue(msdu_list))) {
+ 		rxcb = ATH12K_SKB_RXCB(msdu);
++		/* Enable fast rx by default, the value will cahnge based on peer cap
++                * and packet type */
++		fast_rx = true;
++
+ 		mac_id = rxcb->mac_id;
+ 		ar = ab->pdevs[mac_id].ar;
+ 		if (!rcu_dereference(ab->pdevs_active[mac_id])) {
+@@ -2842,7 +2930,7 @@ static void ath12k_dp_rx_process_receive
+ 			continue;
+ 		}
+ 
+-		ret = ath12k_dp_rx_process_msdu(ar, msdu, msdu_list, &rx_status);
++		ret = ath12k_dp_rx_process_msdu(ar, msdu, msdu_list, &rx_status, &fast_rx);
+ 		if (ret) {
+ 			ath12k_dbg(ab, ATH12K_DBG_DATA,
+ 				   "Unable to process msdu %d", ret);
+@@ -2850,7 +2938,8 @@ static void ath12k_dp_rx_process_receive
+ 			continue;
+ 		}
+ 
+-		ath12k_dp_rx_deliver_msdu(ar, napi, msdu, &rx_status);
++		if (!fast_rx)
++			ath12k_dp_rx_deliver_msdu(ar, napi, msdu, &rx_status);
+ 	}
+ 
+ 	rcu_read_unlock();
+@@ -3796,6 +3885,7 @@ static int ath12k_dp_rx_h_null_q_desc(st
+ 	u8 l3pad_bytes;
+ 	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
+ 	u32 hal_rx_desc_sz = ar->ab->hw_params->hal_desc_sz;
++	bool fast_rx;
+ 
+ 	msdu_len = ath12k_dp_rx_h_msdu_len(ab, desc);
+ 	peer_id = ath12k_dp_rx_h_peer_id(ab, desc);
+@@ -3851,8 +3941,8 @@ static int ath12k_dp_rx_h_null_q_desc(st
+ 		skb_pull(msdu, hal_rx_desc_sz + l3pad_bytes);
+ 	}
+ 	ath12k_dp_rx_h_ppdu(ar, desc, status);
+-
+-	ath12k_dp_rx_h_mpdu(ar, msdu, desc, status);
++	fast_rx = false;
++	ath12k_dp_rx_h_mpdu(ar, msdu, desc, status, &fast_rx);
+ 
+ 	rxcb->tid = ath12k_dp_rx_h_tid(ab, desc);
+ 
+@@ -3934,6 +4024,7 @@ static bool ath12k_dp_rx_h_4addr_null_fr
+ 	size_t hdr_len;
+ 	struct ath12k_dp_rx_rfc1042_hdr *llc;
+ 	bool drop = false;
++	bool fast_rx = false;
+ 
+ 	msdu_len = ath12k_dp_rx_h_msdu_len(ab, rx_desc);
+ 	peer_id = ath12k_dp_rx_h_peer_id(ab, rx_desc);
+@@ -3957,7 +4048,7 @@ static bool ath12k_dp_rx_h_4addr_null_fr
+ 
+ 	ath12k_dp_rx_h_ppdu(ar, rx_desc, status);
+ 
+-	ath12k_dp_rx_h_mpdu(ar, msdu, rx_desc, status);
++	ath12k_dp_rx_h_mpdu(ar, msdu, rx_desc, status, &fast_rx);
+ 
+ 	rxcb->tid = ath12k_dp_rx_h_tid(ab, rx_desc);
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -1127,8 +1127,10 @@ int ath12k_dp_tx_htt_rx_filter_setup(str
+ 				       HTT_RX_RING_SELECTION_CFG_CMD_OFFSET_VALID);
+ 	cmd->info0 |= u32_encode_bits(tlv_filter->drop_threshold_valid,
+ 				      HTT_RX_RING_SELECTION_CFG_CMD_DROP_THRES_VAL);					   
+-	cmd->info0 |= u32_encode_bits(true,
+-				      HTT_RX_RING_SELECTION_CFG_CMD_RXMON_GCONF_EN);
++	if (!tlv_filter->rxmon_disable)
++		cmd->info0 |= u32_encode_bits(true,
++					      HTT_RX_RING_SELECTION_CFG_CMD_RXMON_GCONF_EN);
++	
+ 	cmd->info1 = le32_encode_bits(rx_buf_size,
+ 				      HTT_RX_RING_SELECTION_CFG_CMD_INFO1_BUF_SIZE);
+ 	cmd->info1 |= u32_encode_bits(tlv_filter->conf_len_mgmt,
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -516,6 +516,16 @@ static u16 ath12k_hw_qcn9274_rx_desc_get
+ 	return __le16_to_cpu(desc->u.qcn9274.mpdu_start.frame_ctrl);
+ }
+ 
++static u8 ath12k_hal_qcn9274_rx_desc_get_ip_valid(struct hal_rx_desc *desc)
++{
++	bool ipv4, ipv6;
++	ipv4 = FIELD_GET(RX_MSDU_END_INFO11_IPV4,
++	                 __le32_to_cpu(desc->u.qcn9274.msdu_end.info11));
++	ipv6 = FIELD_GET(RX_MSDU_END_INFO11_IPV6,
++	                 __le32_to_cpu(desc->u.qcn9274.msdu_end.info11));
++	return (ipv4 || ipv6);
++}
++
+ static int ath12k_hal_srng_create_config_qcn9274(struct ath12k_base *ab)
+ {
+ 	struct ath12k_hal *hal = &ab->hal;
+@@ -719,6 +729,7 @@ const struct hal_ops hal_qcn9274_ops = {
+ 	.dp_rx_h_ip_cksum_fail = ath12k_hw_qcn9274_dp_rx_h_ip_cksum_fail,
+ 	.dp_rx_h_is_decrypted = ath12k_hw_qcn9274_dp_rx_h_is_decrypted,
+ 	.dp_rx_h_mpdu_err = ath12k_hw_qcn9274_dp_rx_h_mpdu_err,
++	.rx_desc_get_ip_valid = ath12k_hal_qcn9274_rx_desc_get_ip_valid,
+ };
+ 
+ static bool ath12k_hw_wcn7850_rx_desc_get_first_msdu(struct hal_rx_desc *desc)
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -1082,6 +1082,7 @@ struct hal_ops {
+ 	bool (*dp_rx_h_ip_cksum_fail)(struct hal_rx_desc *desc);
+ 	bool (*dp_rx_h_is_decrypted)(struct hal_rx_desc *desc);
+ 	u32 (*dp_rx_h_mpdu_err)(struct hal_rx_desc *desc);
++	u8 (*rx_desc_get_ip_valid)(struct hal_rx_desc *desc);
+ 	const struct ath12k_hal_tcl_to_wbm_rbm_map *tcl_to_wbm_rbm_map;
+ };
+ 
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -267,6 +267,7 @@ int ath12k_peer_create(struct ath12k *ar
+ {
+ 	struct ath12k_peer *peer;
+ 	struct ath12k_sta *arsta;
++	struct ieee80211_vif *vif = arvif->vif;
+ 	int ret;
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+@@ -334,6 +335,7 @@ int ath12k_peer_create(struct ath12k *ar
+ 
+ 	peer->sec_type = HAL_ENCRYPT_TYPE_OPEN;
+ 	peer->sec_type_grp = HAL_ENCRYPT_TYPE_OPEN;
++	peer->vif = vif;
+ 
+ 	if (sta) {
+ 		arsta = (struct ath12k_sta *)sta->drv_priv;
+--- a/drivers/net/wireless/ath/ath12k/peer.h
++++ b/drivers/net/wireless/ath/ath12k/peer.h
+@@ -22,6 +22,7 @@ struct ppdu_user_delayba {
+ struct ath12k_peer {
+ 	struct list_head list;
+ 	struct ieee80211_sta *sta;
++	struct ieee80211_vif *vif;
+ 	int vdev_id;
+ 	u8 addr[ETH_ALEN];
+ 	int peer_id;

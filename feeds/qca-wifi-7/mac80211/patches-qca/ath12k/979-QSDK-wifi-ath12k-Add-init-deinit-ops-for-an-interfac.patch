@@ -1,0 +1,450 @@
+From 391359fe97f33e43888749fe82ec3bf9a83e5d18 Mon Sep 17 00:00:00 2001
+From: Parikshit Gune <quic_pgune@quicinc.com>
+Date: Tue, 22 Oct 2024 19:38:44 +0530
+Subject: [PATCH] QSDK: wifi: ath12k: Add init - deinit ops for an  interface.
+
+Adding ndo_init and ndo_deinit ops for an interface.
+	1. This gives flexibility to initialize/deinitialize
+	   the interface specific data at the time of
+	   interface init/deinit.
+	2. For example - VP creation and deletion earlier
+	   was tied to interface add - destroy. These ops
+	   are called at every iface down / up operation,
+	   leading to VP deletion and creation which
+	   might not be appropriate as netdev is still
+	   present.
+	3. This creates a descripency between networking
+	   and driver's representation of an interface. At
+	   iface down/up - networking does not destroy the
+	   netdev and keeps on operating in the same state
+	   as it was before down.
+	4. Hence moved the VP creation and destroy at
+	   iface init / deinit to make it consistent across
+	   subsystems and not have any VP leaks, etc.
+
+Patch-dependency: None
+Patch-work: None
+
+Signed-off-by: Parikshit Gune <quic_pgune@quicinc.com>
+Signed-off-by: Hari Chandrakanthan <quic_haric@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c    | 123 ++++++++++++++++-------
+ drivers/net/wireless/ath/ath12k/ppe.c    |  62 +++++++-----
+ drivers/net/wireless/ath/ath12k/ppe.h    |   5 +-
+ drivers/net/wireless/ath/ath12k/vendor.c |  12 +--
+ 4 files changed, 133 insertions(+), 69 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 316331c..35667f3 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -12743,6 +12743,53 @@ static int ath12k_mac_op_set_mtu(struct ieee80211_hw *hw,
+ 
+ 	return ret;
+ }
++
++static int ath12k_mac_op_create_datapath_offload_if(struct ieee80211_hw *hw,
++						    struct ieee80211_vif *vif,
++						    struct net_device *dev)
++{
++	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
++	struct ath12k_hw *ah = hw->priv;
++	int ppe_vp_num;
++
++	/* Allocate a PASSIVE VP at VAP init.
++	 * Later update the VP type at the time of add interface
++	 */
++	mutex_lock(&ah->conf_mutex);
++	ppe_vp_num = ahvif->ppe_vp_num;
++	if (ppe_vp_num <= 0) {
++		ahvif->ppe_vp_num = ATH12K_INVALID_PPE_VP_NUM;
++		WARN_ON(ath12k_vif_alloc_vp(ahvif, PPE_VP_USER_TYPE_PASSIVE, NULL, dev));
++	}
++
++	mutex_unlock(&ah->conf_mutex);
++	return 0;
++}
++
++static int ath12k_mac_op_destroy_datapath_offload_if(struct ieee80211_hw *hw,
++						     struct ieee80211_vif *vif,
++						     struct net_device *dev)
++{
++	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
++	struct ath12k_hw *ah = hw->priv;
++	int ppe_vp_num;
++
++	/* No init method is registered for monitor VAP
++	 * and hence no VP will be created for the same.
++	 */
++	if (vif->type == NL80211_IFTYPE_MONITOR)
++		return 0;
++
++	/* Free the VP is not yet done in deinit
++	 */
++	mutex_lock(&ah->conf_mutex);
++	ppe_vp_num = ahvif->ppe_vp_num;
++	if (ppe_vp_num != ATH12K_INVALID_PPE_VP_NUM)
++		ath12k_vif_free_vp(ahvif, dev);
++
++	mutex_unlock(&ah->conf_mutex);
++	return 0;
++}
+ #endif
+ 
+ static int ath12k_mac_op_add_interface(struct ieee80211_hw *hw,
+@@ -12770,7 +12817,10 @@ static int ath12k_mac_op_add_interface(struct ieee80211_hw *hw,
+ 
+ 	mutex_lock(&ah->conf_mutex);
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+-	/* Reuse existing vp_num during Subsystem Recovery */
++	/* Reuse existing vp_num during Subsystem Recovery and
++	 * when the VAP is coming up.
++	 * Note: VP is already allocated at the time of netdev init
++	 */
+ 	if (ahvif->ppe_vp_num > 0) {
+ 		ppe_vp_num = ahvif->ppe_vp_num;
+ 		ppe_core_mask = ahvif->ppe_core_mask;
+@@ -12787,9 +12837,13 @@ static int ath12k_mac_op_add_interface(struct ieee80211_hw *hw,
+ 	else
+ 		memset(ahvif, 0, sizeof(*ahvif));
+ 
+-	ahvif->ppe_vp_num = ATH12K_INVALID_PPE_VP_NUM;
++	/* Restore the VP information if VP is allocated
++	 * successfully at the time of iface init.
++	 */
++	ahvif->ppe_vp_num = ppe_vp_num;
+ 	ahvif->vdev_type = vif->type;
+ 	ahvif->vif = vif;
++	ahvif->ppe_vp_type = ppe_vp_type;
+ 	ahvif->ah = ah;
+ 
+ 	ahvif->deflink.ahvif = ahvif;
+@@ -12797,20 +12851,9 @@ static int ath12k_mac_op_add_interface(struct ieee80211_hw *hw,
+ 	ahvif->mcbc_gsn = 0;
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+-	if (vif->type == NL80211_IFTYPE_AP_VLAN) {
+-		if (ppe_vp_num > 0)
+-			goto ppe_vp_config;
+-
+-		vlan_master_vif = wdev_to_ieee80211_vif_vlan(wdev, true);
+-		vlan_master_ahvif = ath12k_vif_to_ahvif(vlan_master_vif);
+-		ahvif->vdev_type = WMI_VDEV_TYPE_AP;
+-		if (!vlan_master_ahvif)
+-			goto exit;
+-		ppe_vp_type = vlan_master_ahvif->ppe_vp_type;
+-		ppe_core_mask = vlan_master_ahvif->ppe_core_mask;
+-		goto ppe_vp_config;
+-	}
+ 
++	/* Check the PPE VP type and update it accordingly.
++	 */
+ 	switch (wdev->ppe_vp_type) {
+ 	case PPE_VP_USER_TYPE_PASSIVE:
+ 	case PPE_VP_USER_TYPE_ACTIVE:
+@@ -12822,34 +12865,42 @@ static int ath12k_mac_op_add_interface(struct ieee80211_hw *hw,
+ 		break;
+ 	}
+ 
++	/* In case of AP VLAN, use the master vif's VP type. */
++	if (vif->type == NL80211_IFTYPE_AP_VLAN) {
++		vlan_master_vif = wdev_to_ieee80211_vif_vlan(wdev, true);
++		vlan_master_ahvif = ath12k_vif_to_ahvif(vlan_master_vif);
++		ahvif->vdev_type = WMI_VDEV_TYPE_AP;
++		if (!vlan_master_ahvif) {
++			/* Free the already allocated VP and exit. */
++			ath12k_vif_free_vp(ahvif, wdev->netdev);
++			goto exit;
++		}
++
++		ppe_vp_type = vlan_master_ahvif->ppe_vp_type;
++		ppe_core_mask = vlan_master_ahvif->ppe_core_mask;
++		goto ppe_vp_config;
++	}
++
+ 	if (vif->type == NL80211_IFTYPE_MESH_POINT &&
+ 	    ppe_vp_type == PPE_VP_USER_TYPE_DS) {
+ 		ppe_vp_type = PPE_VP_USER_TYPE_PASSIVE;
+ 	}
+ 
+ ppe_vp_config:
+-	if (ppe_vp_type != ATH12K_INVALID_PPE_VP_TYPE) {
+-		if (ppe_vp_num == ATH12K_INVALID_PPE_VP_NUM) {
+-			ahvif->ppe_vp_num = ATH12K_INVALID_PPE_VP_NUM;
+-			if (ppe_core_mask)
+-				ath12k_vif_alloc_vp(ahvif, ppe_vp_type, &ppe_core_mask);
+-			else
+-				ath12k_vif_alloc_vp(ahvif, ppe_vp_type, NULL);
+-		} else {
+-			ahvif->ppe_vp_num = ppe_vp_num;
+-			ahvif->ppe_core_mask = ppe_core_mask;
+-			ahvif->ppe_vp_type = ppe_vp_type;
+-			if (vif->type == NL80211_IFTYPE_AP_VLAN && vlan_iface) {
+-				ahvif->vlan_iface = vlan_iface;
+-				vlan_iface->attach_link_done = false;
+-				goto exit;
+-			}
++	if (ppe_vp_num != ATH12K_INVALID_PPE_VP_NUM) {
++		if (ppe_vp_type != ahvif->ppe_vp_type)
++			ath12k_vif_update_vp_config(ahvif, ppe_vp_type);
++
++		if (vif->type == NL80211_IFTYPE_AP_VLAN && vlan_iface) {
++			ahvif->vlan_iface = vlan_iface;
++			vlan_iface->attach_link_done = false;
++			goto exit;
+ 		}
+ 	}
+ 
+ #endif
+ 	if (vif->type == NL80211_IFTYPE_AP_VLAN &&
+-	    ahvif->ppe_vp_num != ATH12K_INVALID_PPE_VP_NUM) {
++			ahvif->ppe_vp_num != ATH12K_INVALID_PPE_VP_NUM) {
+ 		struct ath12k_vlan_iface *vlan_iface;
+ 		int ret;
+ 
+@@ -12860,7 +12911,7 @@ ppe_vp_config:
+ 				ret = ath12k_vif_update_vp_config(ahvif, PPE_VP_USER_TYPE_PASSIVE);
+ 
+ 			if (ret) {
+-				ath12k_vif_free_vp(ahvif);
++				ath12k_vif_free_vp(ahvif, wdev->netdev);
+ 				mutex_unlock(&ah->conf_mutex);
+ 				return ret;
+ 			}
+@@ -13055,8 +13106,6 @@ static void ath12k_mac_op_remove_interface(struct ieee80211_hw *hw,
+ 	mutex_lock(&ah->conf_mutex);
+ 	if (vif->type == NL80211_IFTYPE_AP_VLAN) {
+ 		if (!ahvif->vlan_iface) {
+-			if (ahvif->ppe_vp_num != ATH12K_INVALID_PPE_VP_NUM)
+-				ath12k_vif_free_vp(ahvif);
+ 			goto exit;
+ 		}
+ 
+@@ -13097,8 +13146,6 @@ static void ath12k_mac_op_remove_interface(struct ieee80211_hw *hw,
+ 	}
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+-	/* free ppe vp allocated for RFS */
+-	ath12k_vif_free_vp(ahvif);
+ 	kfree(ahvif->vlan_iface);
+ #endif
+ exit:
+@@ -18766,6 +18813,8 @@ static const struct ieee80211_ops ath12k_ops = {
+ 	.set_radar_background		= ath12k_mac_op_set_radar_background,
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ 	.change_mtu			= ath12k_mac_op_set_mtu,
++	.init_interface			= ath12k_mac_op_create_datapath_offload_if,
++	.deinit_interface		= ath12k_mac_op_destroy_datapath_offload_if,
+ #endif
+ };
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/ppe.c b/drivers/net/wireless/ath/ath12k/ppe.c
+index 002b302..34ea578 100644
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -1606,9 +1606,9 @@ int ath12k_change_core_mask_for_ppe_rfs(struct ath12k_base *ab,
+ 	if (core_mask == ahvif->ppe_core_mask)
+ 		return 0;
+ 
+-	ath12k_vif_free_vp(ahvif);
++	ath12k_vif_free_vp(ahvif, wdev->netdev);
+ 
+-	ret = ath12k_vif_alloc_vp(ahvif, PPE_VP_USER_TYPE_PASSIVE, &core_mask);
++	ret = ath12k_vif_alloc_vp(ahvif, PPE_VP_USER_TYPE_PASSIVE, &core_mask, wdev->netdev);
+ 	if (ret) {
+ 		ath12k_warn(ab, "error in enabling ppe vp for netdev %s\n",
+ 			    wdev->netdev->name);
+@@ -1641,13 +1641,8 @@ static bool ath12k_stats_update_ppe_vp(struct net_device *dev, ppe_vp_hw_stats_t
+ }
+ #endif
+ 
+-void ath12k_vif_free_vp(struct ath12k_vif *ahvif)
++void ath12k_vif_free_vp(struct ath12k_vif *ahvif, struct net_device *dev)
+ {
+-	struct wireless_dev *wdev = ieee80211_vif_to_wdev(ahvif->vif);
+-
+-	if (!wdev)
+-		return;
+-
+ 	if (ahvif->ppe_vp_num == ATH12K_INVALID_PPE_VP_NUM)
+ 		return;
+ 
+@@ -1655,7 +1650,7 @@ void ath12k_vif_free_vp(struct ath12k_vif *ahvif)
+ 
+ 	ath12k_info(NULL,
+ 		    "Destroyed PPE VP port no:%d for dev:%s vdev type %d\n",
+-		    ahvif->ppe_vp_num, wdev->netdev->name,
++		    ahvif->ppe_vp_num, dev->name,
+ 		    ahvif->vdev_type);
+ 	ahvif->ppe_vp_num = ATH12K_INVALID_PPE_VP_NUM;
+ }
+@@ -1664,15 +1659,30 @@ int ath12k_vif_update_vp_config(struct ath12k_vif *ahvif, int ppe_vp_type)
+ 
+ {
+ 	struct ppe_vp_ui vpui;
++	struct wireless_dev *wdev = ieee80211_vif_to_wdev(ahvif->vif);
+ 	int ret;
+ 
+-	if (ahvif->ppe_vp_num == ATH12K_INVALID_PPE_VP_NUM)
++	if (ahvif->ppe_vp_num == ATH12K_INVALID_PPE_VP_NUM || !wdev)
+ 		return -EINVAL;
+ 
+ 
+ 	memset(&vpui, 0, sizeof(struct ppe_vp_ui));
+ 	vpui.usr_type = ppe_vp_type;
+ 	vpui.core_mask = ahvif->ppe_core_mask;
++
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	/* Direct Switching */
++	switch (ppe_vp_type) {
++	case PPE_VP_USER_TYPE_PASSIVE:
++		vpui.core_mask = ath12k_ppe_rfs_get_core_mask(ahvif);
++		break;
++	case PPE_VP_USER_TYPE_DS:
++	case PPE_VP_USER_TYPE_ACTIVE:
++		vpui.core_mask = ATH12K_PPE_DEFAULT_CORE_MASK;
++		break;
++	}
++#endif
++
+ 	ret = ppe_vp_cfg_update(ahvif->ppe_vp_num, &vpui);
+ 
+ 	if (ret) {
+@@ -1683,6 +1693,9 @@ int ath12k_vif_update_vp_config(struct ath12k_vif *ahvif, int ppe_vp_type)
+ 
+ 	ahvif->ppe_vp_type = ppe_vp_type;
+ 
++	ath12k_info(NULL,
++		    "Updated PPE VP port no %d for dev %s type %d\n",
++		    ahvif->ppe_vp_num, wdev->netdev->name, ahvif->ppe_vp_type);
+ exit:
+ 	return ret;
+ }
+@@ -1706,16 +1719,13 @@ int ath12k_vif_set_mtu(struct ath12k_vif *ahvif, int mtu)
+ }
+ #endif
+ 
+-int ath12k_vif_alloc_vp(struct ath12k_vif *ahvif, int ppe_vp_type, int *core_mask)
++int ath12k_vif_alloc_vp(struct ath12k_vif *ahvif, int ppe_vp_type, int *core_mask,
++			struct net_device *dev)
+ {
+-	struct wireless_dev *wdev = ieee80211_vif_to_wdev(ahvif->vif);
+ 	int ppe_vp_num = ATH12K_INVALID_PPE_VP_NUM;
+ 	struct ppe_vp_ai vpai;
+ 
+-	if (!wdev)
+-		return -ENODEV;
+-
+-	if (ahvif->vdev_type == WMI_VDEV_TYPE_MONITOR || !wdev->netdev)
++	if (ahvif->vdev_type == WMI_VDEV_TYPE_MONITOR)
+ 		return 0;
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+@@ -1734,8 +1744,15 @@ int ath12k_vif_alloc_vp(struct ath12k_vif *ahvif, int ppe_vp_type, int *core_mas
+ 	ahvif->ppe_vp_num = ATH12K_INVALID_PPE_VP_NUM;
+ 
+ 	memset(&vpai, 0, sizeof(struct ppe_vp_ai));
++
++	/* Fill all the flags required by active as well as DS mode.
++	 * Later according to the VP type the relevant information is used.
++	 */
+ 	vpai.type = PPE_VP_TYPE_SW_L2;
+ 	vpai.net_dev_type = PPE_VP_NET_DEV_TYPE_WIFI;
++	vpai.queue_num = 0;
++	vpai.stats_cb = ath12k_stats_update_ppe_vp;
++	vpai.net_dev_flags = PPE_VP_NET_DEV_FLAG_IS_MLD;
+ 
+ 	/* RFS */
+ 	switch (ppe_vp_type) {
+@@ -1748,29 +1765,26 @@ int ath12k_vif_alloc_vp(struct ath12k_vif *ahvif, int ppe_vp_type, int *core_mas
+ 		else
+ 			vpai.core_mask = ath12k_ppe_rfs_get_core_mask(ahvif);
+ 
+-		ppe_vp_num = ppe_vp_alloc(wdev->netdev, &vpai);
++		ppe_vp_num = ppe_vp_alloc(dev, &vpai);
+ 		break;
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ 	/* Direct Switching */
+ 	case PPE_VP_USER_TYPE_DS:
+-		vpai.stats_cb = ath12k_stats_update_ppe_vp;
+-		vpai.queue_num = 0;
+ 		vpai.core_mask = ATH12K_PPE_DEFAULT_CORE_MASK;
+ 		vpai.usr_type = PPE_VP_USER_TYPE_DS;
+-		vpai.net_dev_flags = PPE_VP_NET_DEV_FLAG_IS_MLD;
+-		ppe_vp_num = ppe_ds_wlan_vp_alloc(NULL, wdev->netdev, &vpai);
++		ppe_vp_num = ppe_ds_wlan_vp_alloc(NULL, dev, &vpai);
+ 		break;
+ #endif
+ 	case PPE_VP_USER_TYPE_ACTIVE:
+ 		vpai.usr_type = PPE_VP_USER_TYPE_ACTIVE;
+ 		vpai.core_mask = ATH12K_PPE_DEFAULT_CORE_MASK;
+-		ppe_vp_num = ppe_vp_alloc(wdev->netdev, &vpai);
++		ppe_vp_num = ppe_vp_alloc(dev, &vpai);
+ 		break;
+ 	}
+ 
+ 	if (ppe_vp_num <= 0) {
+ 		ath12k_err(NULL, "Error in enabling PPE VP type %d for netdev %s err %d\n",
+-			   vpai.usr_type, wdev->netdev->name, ppe_vp_num);
++			   vpai.usr_type, dev->name, ppe_vp_num);
+ 		return -ENOSR;
+ 	}
+ 
+@@ -1780,7 +1794,7 @@ int ath12k_vif_alloc_vp(struct ath12k_vif *ahvif, int ppe_vp_type, int *core_mas
+ 
+ 	ath12k_info(NULL,
+ 		    "Enabling PPE VP type %d for dev %s vp_num %d core_mask 0x%x\n",
+-		    ppe_vp_type, wdev->netdev->name,
++		    ppe_vp_type, dev->name,
+ 		    ahvif->ppe_vp_num, ahvif->ppe_core_mask);
+ 
+ 	return 0;
+diff --git a/drivers/net/wireless/ath/ath12k/ppe.h b/drivers/net/wireless/ath/ath12k/ppe.h
+index c55118a..8ec7631 100644
+--- a/drivers/net/wireless/ath/ath12k/ppe.h
++++ b/drivers/net/wireless/ath/ath12k/ppe.h
+@@ -33,8 +33,9 @@ int ath12k_change_core_mask_for_ppe_rfs(struct ath12k_base *ab,
+ 					struct ath12k_vif *ahvif,
+ 					int core_mask);
+ int ath12k_vif_update_vp_config(struct ath12k_vif *ahvif, int vp_type);
+-int ath12k_vif_alloc_vp(struct ath12k_vif *ahvif, int vp_type, int *core_mask);
+-void ath12k_vif_free_vp(struct ath12k_vif *ahvif);
++int ath12k_vif_alloc_vp(struct ath12k_vif *ahvif, int vp_type, int *core_mask,
++			struct net_device *dev);
++void ath12k_vif_free_vp(struct ath12k_vif *ahvif, struct net_device *dev);
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ int ath12k_vif_set_mtu(struct ath12k_vif *ahvif, int mtu);
+ #endif
+diff --git a/drivers/net/wireless/ath/ath12k/vendor.c b/drivers/net/wireless/ath/ath12k/vendor.c
+index 2b836bb..aa44bd2 100644
+--- a/drivers/net/wireless/ath/ath12k/vendor.c
++++ b/drivers/net/wireless/ath/ath12k/vendor.c
+@@ -1164,6 +1164,12 @@ static int ath12k_vendor_wifi_config_handler(struct wiphy *wihpy,
+ 		return -EINVAL;
+ 	}
+ 
++	if (!ath12k_ppe_ds_enabled) {
++		type = "passive";
++		ppe_vp_type = 1;
++		ath12k_err(NULL, "Overriding offload type to passive as DS isn't enabled\n");
++	}
++
+ 	switch (ppe_vp_type) {
+ 	case PPE_VP_USER_TYPE_PASSIVE:
+ 		type = "passive";
+@@ -1180,12 +1186,6 @@ static int ath12k_vendor_wifi_config_handler(struct wiphy *wihpy,
+ 		break;
+ 	}
+ 
+-	if (!ath12k_ppe_ds_enabled) {
+-		type = "passive";
+-		ppe_vp_type = 1;
+-		ath12k_err(NULL, "Overriding offload type to passive as DS isn't enabled\n");
+-	}
+-
+ 	if (wdev->ppe_vp_type != ppe_vp_type)
+ 		wdev->ppe_vp_type = ppe_vp_type;
+ 	else
+-- 
+2.34.1
+

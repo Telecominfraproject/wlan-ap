@@ -1,0 +1,410 @@
+From 276ea451be6b406a615524db717eca0afaac25c7 Mon Sep 17 00:00:00 2001
+From: Sriram R <quic_srirrama@quicinc.com>
+Date: Sun, 29 Oct 2023 13:49:54 +0530
+Subject: [PATCH] wifi: ath12k: Start ML link vdevs individually rather than
+ wait-sync
+
+Currently all links of a ML vdev are started in sync where we wait
+for all the link vdevs to be created on start_ap and started/up
+together. This may not be ideal for certain cases when some links are
+in DFS channel.
+
+Hence add changes to add the link vdevs dynamically whenever a
+channel is assigned from mac80211 for a link vdev. During vdev
+start notify the FW that this link vdev is newly added and also
+indicate all its known partners so that FW can take necessary actions
+to internally update the partners on the new link being added.
+
+Signed-off-by: Sriram R <quic_srirrama@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c |  10 +-
+ drivers/net/wireless/ath/ath12k/core.h |   1 -
+ drivers/net/wireless/ath/ath12k/mac.c  | 242 +++++--------------------
+ drivers/net/wireless/ath/ath12k/wmi.c  |  10 +-
+ drivers/net/wireless/ath/ath12k/wmi.h  |   2 +
+ 5 files changed, 59 insertions(+), 206 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -2381,8 +2381,8 @@ static int ath12k_mlo_recovery_link_vif_
+ 			ath12k_info(NULL,
+ 				    "bss info parameter changes %llx cached to apply after vdev create on channel assign\n",
+ 				    changed);
+-
+ 			ahvif->cache[link_id].bss_conf_changed |= changed;
++
+ 			mutex_unlock(&ah->conf_mutex);
+ 			return 0;
+ 		}
+@@ -2534,14 +2534,6 @@ static int ath12k_mlo_core_recovery_reco
+ 		goto exit;
+ 	}
+ 
+-	if (ath12k_mac_is_ml_arvif(arvif) &&
+-	    ahvif->vdev_type == WMI_VDEV_TYPE_AP) {
+-		mutex_unlock(&ar->conf_mutex);
+-		ret = ath12k_mac_mlo_vdev_start(arvif, false);
+-		mutex_lock(&ar->conf_mutex);
+-		goto exit;
+-	}
+-
+ 	ret = ath12k_mac_vdev_start(arvif, &ctx->def, ctx->radar_enabled);
+ 	if (ret) {
+ 		ath12k_err(ab, "vdev start failed during recovery\n");
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -445,7 +445,6 @@ struct ath12k_vif {
+ 	u32 aid;
+ 	struct ath12k_mgmt_frame_stats mgmt_stats;
+ 	u8 num_vdev_created;
+-	u8 num_vdev_started;
+ 	u16 mcbc_gsn;
+ 	spinlock_t mcbc_gsn_lock; /* Protect mcbc_gsn */
+ 	struct ath12k_vif_cache cache[IEEE80211_MLD_MAX_NUM_LINKS];
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -4616,7 +4616,6 @@ void ath12k_mac_bss_info_changed(struct
+ 				/* skip non tx vif's */
+ 				goto skip_pending_cs_up;
+ 			}
+-
+ 			ret = ath12k_wmi_vdev_up(arvif->ar, &params);
+ 			if (ret)
+ 				ath12k_warn(ar->ab, "failed to bring vdev up %d: %d\n",
+@@ -4983,6 +4982,7 @@ static void ath12k_mac_op_bss_info_chang
+ 		mutex_unlock(&ah->conf_mutex);
+ 		return;
+ 	}
++
+ 	ar = arvif->ar;
+ 
+ 	if (!ar) {
+@@ -5955,51 +5955,6 @@ static int ath12k_mac_op_set_key(struct
+ 		goto out;
+ 	}
+ 
+-	if (key->link_id >= 0 && key->link_id < IEEE80211_MLD_MAX_NUM_LINKS) {
+-		arvif = ahvif->link[key->link_id];
+-		link_id = key->link_id;
+-	} else {
+-		arvif = &ahvif->deflink;
+-		link_id = 0;
+-	}
+-
+-	if (!arvif || !arvif->is_created) {
+-		key_conf = kzalloc(sizeof(*key_conf), GFP_ATOMIC);
+-
+-		if (!key_conf) {
+-			ath12k_info(NULL, "failed to alloc cache key config\n");
+-			goto out;
+-		}
+-
+-		key_conf->cmd = cmd;
+-		key_conf->sta = sta;
+-		key_conf->key = key;
+-
+-		list_add_tail(&key_conf->list,
+-			      &ahvif->cache[link_id].key_conf.list);
+-
+-		ath12k_info(NULL, "set key param cached since vif not assign to radio\n");
+-		mutex_unlock(&ah->conf_mutex);
+-
+-		/* STA should be NULL before vdev create else need to warn */
+-		WARN_ON(sta);
+-
+-		return 0;
+-	}
+-
+-	if (!(arvif && arvif->ar)) {
+-		ath12k_err(NULL, "Failed to set key.\n");
+-		mutex_unlock(&ah->conf_mutex);
+-		return -EINVAL;
+-	}
+-
+-	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, &arvif->ar->ab->dev_flags)) {
+-		ath12k_dbg(arvif->ar->ab, ATH12K_DBG_MODE1_RECOVERY,
+-				"cmd:%d called for crash flush set ab\n", cmd);
+-		mutex_unlock(&ah->conf_mutex);
+-		return 0;
+-	}
+-
+ 	if (sta) {
+ 		ahsta = ath12k_sta_to_ahsta(sta);
+ 		if (sta->mlo) {
+@@ -6026,6 +5981,48 @@ static int ath12k_mac_op_set_key(struct
+ 			arsta->keys[key->keyidx] = key;
+ 		}
+ 	} else {
++		if (key->link_id >= 0 && key->link_id < IEEE80211_MLD_MAX_NUM_LINKS) {
++			arvif = ahvif->link[key->link_id];
++			link_id = key->link_id;
++		} else {
++			arvif = &ahvif->deflink;
++			link_id = 0;
++		}
++
++		if (!arvif || !arvif->is_created) {
++			key_conf = kzalloc(sizeof(*key_conf), GFP_ATOMIC);
++
++			if (!key_conf) {
++				ath12k_info(NULL, "failed to alloc cache key config\n");
++				goto out;
++			}
++
++			key_conf->cmd = cmd;
++			key_conf->sta = sta;
++			key_conf->key = key;
++
++			list_add_tail(&key_conf->list,
++				      &ahvif->cache[link_id].key_conf.list);
++
++			ath12k_info(NULL, "set key param cached since vif not assign to radio\n");
++			mutex_unlock(&ah->conf_mutex);
++
++			return 0;
++		}
++
++		if (!(arvif && arvif->ar)) {
++			ath12k_err(NULL, "Failed to set key.\n");
++			mutex_unlock(&ah->conf_mutex);
++			return -EINVAL;
++		}
++
++		if (test_bit(ATH12K_FLAG_CRASH_FLUSH, &arvif->ar->ab->dev_flags)) {
++			ath12k_dbg(arvif->ar->ab, ATH12K_DBG_MODE1_RECOVERY,
++					"cmd:%d called for crash flush set ab\n", cmd);
++			mutex_unlock(&ah->conf_mutex);
++			return 0;
++		}
++
+ 		mutex_lock(&arvif->ar->conf_mutex);
+ 		ret = ath12k_mac_set_key(arvif->ar, cmd, arvif, arsta, key);
+ 		/* if sta is null, consider it has self peer */
+@@ -11568,6 +11565,13 @@ ath12k_mac_mlo_get_vdev_args(struct ath1
+ 	rcu_read_lock();
+ 
+ 	ml_arg->enabled = true;
++
++	/* We always add a new link via VDEV START, FW takes
++	 * care of internally adding this link to existing
++	 * link vdevs which are advertised as partners below
++	 */
++	ml_arg->link_add = true;
++
+ 	/* TODO check assoc and mcast vdev for AP mode */
+ 
+ 	links_map = ahvif->links_map;
+@@ -11949,142 +11953,6 @@ beacon_tmpl_setup:
+ 	return ret;
+ }
+ 
+-int ath12k_mac_mlo_vdev_start(struct ath12k_link_vif *arvif, bool flag)
+-{
+-	struct ath12k_vif *ahvif = arvif->ahvif;
+-	struct ath12k *ar = arvif->ar;
+-	struct ath12k_hw *ah = ar->ah;
+-	struct ath12k_link_vif *arvif_p;
+-	u8 link_id;
+-	int ret = 0;
+-	u16 links_map;
+-	bool radar_enabled = arvif->chanctx.radar_enabled;
+-	bool radar_vdev_create = false;
+-
+-	lockdep_assert_held(&ah->conf_mutex);
+-	/* FIXME Note that this logic is temp and wont work for MBSSID cases
+-	 * There are two options, 1, the set link should have some pre channel info
+-	 * or FW should support dynamic partner add/remove support
+-	 */
+-
+-	/* check if we need to do CAC here and allow the link to start.
+-	 */
+-	ret = cfg80211_chandef_dfs_required(ah->hw->wiphy,
+-					    &arvif->chanctx.def,
+-					    NL80211_IFTYPE_AP);
+-	if (ret > 0) {
+-		ret = cfg80211_chandef_dfs_available(ah->hw->wiphy,
+-						     &arvif->chanctx.def);
+-		if (!ret) {
+-			ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
+-				   "mac mlo vdev %d radar required",
+-				   arvif->vdev_id);
+-			radar_vdev_create = true;
+-		} else {
+-			ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
+-				   "mac mlo vdev %d radar available, wait for sync",
+-				   arvif->vdev_id);
+-			radar_vdev_create = false;
+-			ret = 0;
+-		}
+-	} else if (WARN_ON(ret < 0)) {
+-		/* should not reach here */
+-		return -EINVAL;
+-	}
+-
+-	/* As per DFS state machine, vdev should be allowed to get created for
+-	 * CAC to happen even if other link's vdevs are not yet created
+-	 */
+-	if (radar_vdev_create &&
+-	    (ahvif->num_vdev_created != hweight16(ahvif->vif->valid_links))) {
+-		ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac allowing MLO DFS vdev create");
+-
+-		mutex_lock(&ar->conf_mutex);
+-		ret = ath12k_mac_vdev_start(arvif, &arvif->chanctx.def,
+-					    radar_enabled);
+-		if (ret) {
+-			ath12k_warn(ar->ab, "failed to start vdev %i on freq %d: %d\n",
+-				    arvif->vdev_id, arvif->chanctx.def.chan->center_freq, ret);
+-			mutex_unlock(&ar->conf_mutex);
+-			goto out;
+-		}
+-
+-		arvif->is_started = true;
+-		mutex_unlock(&ar->conf_mutex);
+-		/* num vdev started is not needed during mode1 recovery
+-		 * as the arvif(s) updated are from the existing
+-		 * list
+-		 */
+-		if (!ar->ab->recovery_start)
+-			ahvif->num_vdev_started++;
+-		/* Beaconing not required in DFS channel assignment for CAC */
+-		return ret;
+-	}
+-
+-	/* we need to wait for all the link vdev in the vif to be created
+-	 * before we start
+-	 */
+-	if (ahvif->num_vdev_created != hweight16(ahvif->vif->valid_links))
+-		goto out;
+-
+-	links_map = ahvif->links_map;
+-	for_each_set_bit(link_id, &links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
+-		arvif_p = ahvif->link[link_id];
+-		radar_enabled = arvif_p->chanctx.radar_enabled;
+-
+-		if (!arvif_p->ar) {
+-			ath12k_warn(ar->ab, "invalid ar in the arvif_p from link_id %d links_map: %d\n",
+-				    link_id, links_map);
+-			continue;
+-		}
+-
+-		ar = arvif_p->ar;
+-
+-		if (!ar->ab->is_reset && !flag)
+-			continue;
+-
+-		/* TODO cant hold rcu lock due to call of ath12k_mac_bss_info_changed
+-		 * option is to take a backup if link info, anyways this function would
+-		 * change after FW support for dynamic add
+-		 */
+-		if (WARN_ON(!ahvif->vif->link_conf[link_id]))
+-			continue;
+-
+-		mutex_lock(&ar->conf_mutex);
+-		ret = ath12k_mac_vdev_start(arvif_p, &arvif_p->chanctx.def,
+-					    radar_enabled);
+-		if (ret) {
+-			ath12k_warn(ar->ab, "failed to start vdev %i on freq %d: %d\n",
+-				    arvif_p->vdev_id, arvif_p->chanctx.def.chan->center_freq, ret);
+-
+-			mutex_unlock(&ar->conf_mutex);
+-			/* The already started vdevs will be cleaned up during unassign */
+-			goto out;
+-		}
+-
+-		/* ToDO MLO AP + Monitor */
+-		arvif_p->is_started = true;
+-
+-		/* Enable beaconing now.
+-		 * this will be done by usual code flow from mac80211 for the last link
+-		 */
+-		if (arvif_p != arvif && arvif_p->pending_up) {
+-			ath12k_mac_bss_info_changed(ar, arvif_p, ahvif->vif->link_conf[link_id],
+-						    BSS_CHANGED_BEACON_ENABLED | BSS_CHANGED_BEACON);
+-			arvif_p->pending_up = false;
+-		}
+-		mutex_unlock(&ar->conf_mutex);
+-		/* num vdev started is not needed during mode1 recovery
+-		 * as the arvif(s) updated are from the existing
+-		 * list
+-		 */
+-		if (!ar->ab->recovery_start)
+-			ahvif->num_vdev_started++;
+-	}
+-out:
+-	return ret;
+-}
+-
+ struct ath12k_mac_change_chanctx_arg {
+ 	struct ieee80211_chanctx_conf *ctx;
+ 	struct ieee80211_vif_chanctx_switch *vifs;
+@@ -13444,13 +13312,6 @@ ath12k_mac_op_assign_vif_chanctx(struct
+ 	}
+ 
+ 	memcpy(&arvif->chanctx, ctx, sizeof(*ctx));
+-	if (ath12k_mac_is_ml_arvif(arvif) &&
+-	    ahvif->vdev_type == WMI_VDEV_TYPE_AP) {
+-		mutex_unlock(&ar->conf_mutex);
+-		ret = ath12k_mac_mlo_vdev_start(arvif, true);
+-		mutex_unlock(&ah->conf_mutex);
+-		return ret;
+-	}
+ 
+ 	ret = ath12k_mac_vdev_start(arvif, &ctx->def, ctx->radar_enabled);
+ 	if (ret) {
+@@ -13636,12 +13497,6 @@ stop_primary:
+ 
+ 	arvif->is_started = false;
+ 
+-	if (ath12k_mac_is_ml_arvif(arvif) &&
+-	    ahvif->vdev_type == WMI_VDEV_TYPE_AP) {
+-		WARN_ON(ahvif->num_vdev_started == 0);
+-		ahvif->num_vdev_started--;
+-	}
+-
+ 	peer = ath12k_peer_find_by_vdev_id(ab, arvif->vdev_id);
+ 	if (ahvif->vdev_type == WMI_VDEV_TYPE_STA && peer) {
+ 		struct ieee80211_sta *sta;
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -1745,7 +1745,12 @@ int ath12k_wmi_vdev_start(struct ath12k
+ 			   FIELD_PREP(ATH12K_WMI_FLAG_MLO_ASSOC_LINK,
+ 				      arg->ml.assoc_link) |
+ 			   FIELD_PREP(ATH12K_WMI_FLAG_MLO_MCAST_VDEV,
+-				      arg->ml.mcast_link);
++				      arg->ml.mcast_link) |
++			   FIELD_PREP(ATH12K_WMI_FLAG_MLO_LINK_ADD,
++				      arg->ml.link_add);
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_WMI, "vdev %d start ml flags 0x%x\n",
++		   arg->vdev_id, ml_params->flags);
+ 
+ 	ptr += sizeof(*ml_params);
+ 
+@@ -1765,6 +1770,9 @@ int ath12k_wmi_vdev_start(struct ath12k
+ 		partner_info->hw_link_id = arg->ml.partner_info[i].hw_link_id;
+ 		ether_addr_copy(partner_info->vdev_addr.addr, arg->ml.partner_info[i].addr);
+ 
++		ath12k_dbg(ar->ab, ATH12K_DBG_WMI, "partner vdev %d hw_link_id %d macaddr%pM\n",
++			   partner_info->vdev_id, partner_info->hw_link_id,
++			   partner_info->vdev_addr.addr);
+ 		partner_info++;
+ 	}
+ 
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -3249,6 +3249,7 @@ struct wmi_vdev_create_mlo_params {
+ #define ATH12K_WMI_FLAG_MLO_MCAST_VDEV			BIT(5)
+ #define ATH12K_WMI_FLAG_MLO_EMLSR_SUPPORT		BIT(6)
+ #define ATH12K_WMI_FLAG_MLO_FORCED_INACTIVE		BIT(7)
++#define ATH12K_WMI_FLAG_MLO_LINK_ADD			BIT(8)
+ 
+ struct wmi_vdev_start_mlo_params {
+ 	u32 tlv_header;
+@@ -3452,6 +3453,7 @@ struct wmi_ml_arg {
+ 	bool enabled;
+ 	bool assoc_link;
+ 	bool mcast_link;
++	bool link_add;
+ 	u8 num_partner_links;
+ 	struct wmi_ml_partner_info partner_info[ATH12K_WMI_MLO_MAX_LINKS];
+ };

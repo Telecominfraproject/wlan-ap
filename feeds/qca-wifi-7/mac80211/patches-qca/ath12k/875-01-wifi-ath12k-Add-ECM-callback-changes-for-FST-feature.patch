@@ -1,0 +1,481 @@
+From 6a29aa4703072cb9b9fe06b1c6116237fc79e2c8 Mon Sep 17 00:00:00 2001
+From: Nithyanantham Paramasivam <quic_nithp@quicinc.com>
+Date: Thu, 11 Jan 2024 23:11:24 +0530
+Subject: [PATCH] wifi: ath12k: Add ECM Callback changes for FST feature
+
+FSE feature requires UL flow to be identified and added to flow
+search table for cpu balancing. Ecm module invokes the ath layer
+function "ath_fse_add_rule" when there is a flow detected. This
+function passes the flow information to datapath layer to create
+the hash table entry. As soon as the flow is deleted or timed out,
+ecm module will invoke the ath layer function "ath_fse_delete_rule"
+to wipe off the hash table information.
+
+Signed-off-by: Nithyanantham Paramasivam <quic_nithp@quicinc.com>
+---
+ drivers/net/wireless/ath/Makefile        |   3 +-
+ drivers/net/wireless/ath/ath12k/Makefile |   3 +-
+ drivers/net/wireless/ath/ath12k/core.c   |   5 +-
+ drivers/net/wireless/ath/ath12k/fse.c    | 106 +++++++++++++
+ drivers/net/wireless/ath/ath12k/fse.h    |  24 +++
+ drivers/net/wireless/ath/ath_fse.c       | 186 +++++++++++++++++++++++
+ include/ath/ath_fse.h                    |  45 ++++++
+ 7 files changed, 369 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/net/wireless/ath/ath12k/fse.c
+ create mode 100644 drivers/net/wireless/ath/ath12k/fse.h
+ create mode 100644 drivers/net/wireless/ath/ath_fse.c
+ create mode 100644 include/ath/ath_fse.h
+
+diff --git a/drivers/net/wireless/ath/Makefile b/drivers/net/wireless/ath/Makefile
+index b179b41..5c05264 100644
+--- a/drivers/net/wireless/ath/Makefile
++++ b/drivers/net/wireless/ath/Makefile
+@@ -19,7 +19,8 @@ ath-objs :=	main.o \
+ 		debug.o \
+ 		dfs_pattern_detector.o \
+ 		dfs_pri_detector.o \
+-		ath_sawf.o
++		ath_sawf.o \
++		ath_fse.o
+ 
+ ath-$(CPTCFG_ATH_TRACEPOINTS) += trace.o
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/Makefile b/drivers/net/wireless/ath/ath12k/Makefile
+index 54c8a2b..cca8a0f 100644
+--- a/drivers/net/wireless/ath/ath12k/Makefile
++++ b/drivers/net/wireless/ath/ath12k/Makefile
+@@ -22,7 +22,8 @@ ath12k-y += core.o \
+ 	    pci.o \
+ 	    dp_mon.o \
+ 	    vendor.o \
+-	    umac_reset.o
++	    umac_reset.o \
++	    fse.o
+ 
+ ath12k-$(CPTCFG_ATH12K_DEBUGFS) += debugfs.o debugfs_htt_stats.o debugfs_sta.o
+ ath12k-$(CPTCFG_NL80211_TESTMODE) += testmode.o
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+index 5330270..49d1a00 100644
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Clear
+ /*
+  * Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
+- * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ * Copyright (c) 2021-2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ 
+ #include <linux/module.h>
+@@ -20,6 +20,7 @@
+ #include "debug.h"
+ #include "hif.h"
+ #include "sawf.h"
++#include "fse.h"
+ #include "ppe.h"
+ #include "ahb.h"
+ #include "telemetry.h"
+@@ -1256,6 +1257,7 @@ static int ath12k_core_pdev_init(struct ath12k_base *ab)
+ 
+ 	ath12k_sawf_init(ab);
+ 	ath12k_telemetry_init(ab);
++	ath12k_fse_init(ab);
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ 	ret = ath12k_dp_ppeds_start(ab);
+@@ -1284,6 +1286,7 @@ static void ath12k_core_pdev_deinit(struct ath12k_base *ab)
+ #endif
+ 	ath12k_spectral_deinit(ab);
+ 	ath12k_thermal_unregister(ab);
++	ath12k_fse_deinit(ab);
+ 	ath12k_telemetry_deinit(ab);
+ 	ath12k_sawf_deinit(ab);
+ }
+diff --git a/drivers/net/wireless/ath/ath12k/fse.c b/drivers/net/wireless/ath/ath12k/fse.c
+new file mode 100644
+index 0000000..08bd743
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath12k/fse.c
+@@ -0,0 +1,106 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#include "debug.h"
++#include "fse.h"
++#include "peer.h"
++#include <linux/module.h>
++
++bool ath12k_fse_enable;
++module_param_named(fse, ath12k_fse_enable, bool, 0444);
++MODULE_PARM_DESC(fse, "Enable FSE feature (Default: false)");
++
++static const struct ath_fse_ops ath_fse_ops_obj = {
++	.fse_rule_add = ath12k_sfe_add_flow_entry,
++	.fse_rule_delete = ath12k_sfe_delete_flow_entry,
++	.fse_get_ab = ath12k_fse_get_ab_from_netdev,
++};
++
++void ath12k_fse_init(struct ath12k_base *ab)
++{
++	struct ath_fse_ops *fse_ops_ptr;
++
++	fse_ops_ptr = &ath_fse_ops_obj;
++	if (!ath12k_fse_enable)
++		return;
++
++	if (ath_fse_ops_callback_register(fse_ops_ptr)) {
++		ath12k_err(ab, "ath12k callback register fail\n");
++		return;
++	}
++	ath12k_dbg(ab, ATH12K_DBG_DP_RX, "FSE context initialized\n");
++}
++
++void ath12k_fse_deinit(struct ath12k_base *ab)
++{
++	if (!ath12k_fse_enable)
++		return;
++
++	ath_fse_ops_callback_unregister();
++
++	ath12k_dbg(ab, ATH12K_DBG_DP_RX, "FSE context deinitialized\n");
++}
++
++void *ath12k_fse_get_ab_from_netdev(struct net_device *dev,
++				    const u8 *peer_mac)
++{
++	struct wireless_dev *wdev;
++	struct ieee80211_vif *vif;
++	struct ath12k_base *ab = NULL;
++	struct ath12k *ar;
++	struct ath12k_peer *peer;
++	struct ath12k_vif *ahvif;
++	struct ath12k_link_vif *arvif;
++	u16 links_map;
++	u8 link_id;
++
++	wdev = dev->ieee80211_ptr;
++
++	vif = wdev_to_ieee80211_vif(wdev);
++	if (!vif)
++		return NULL;
++
++	ahvif = ath12k_vif_to_ahvif(vif);
++
++	links_map = ahvif->links_map;
++
++	for_each_set_bit(link_id, &links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
++		arvif = ahvif->link[link_id];
++
++		if (WARN_ON(!arvif))
++			continue;
++		ar = arvif->ar;
++		if (!ar)
++			continue;
++		ab = ar->ab;
++		spin_lock_bh(&ab->base_lock);
++		peer = ath12k_peer_find_by_addr(ab, peer_mac);
++		spin_unlock_bh(&ab->base_lock);
++		if (peer)
++			return ab;
++	}
++	return ab;
++}
++
++int ath12k_sfe_add_flow_entry(struct ath12k_base *ab,
++			      u32 *src_ip, u32 src_port,
++			      u32 *dest_ip, u32 dest_port,
++			      u8 protocol, u8 version)
++
++{
++	int ret = 0;
++	/*TODO:integrate with dp fst changes*/
++	return ret;
++}
++
++int ath12k_sfe_delete_flow_entry(struct ath12k_base *ab,
++				 u32 *src_ip, u32 src_port,
++				 u32 *dest_ip, u32 dest_port,
++				 u8 protocol, u8 version)
++{
++	int ret = 0;
++	/*TODO:integrate with dp fst changes*/
++	return ret;
++}
+diff --git a/drivers/net/wireless/ath/ath12k/fse.h b/drivers/net/wireless/ath/ath12k/fse.h
+new file mode 100644
+index 0000000..9dc923f
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath12k/fse.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#ifndef ATH12K_FSE_H
++#define ATH12K_FSE_H
++
++#include <ath/ath_fse.h>
++
++#define ATH_RX_FSE_FLOW_MATCH_SFE 0xAAAA
++void ath12k_fse_init(struct ath12k_base *ab);
++void ath12k_fse_deinit(struct ath12k_base *ab);
++void *ath12k_fse_get_ab_from_netdev(struct net_device *dev,
++				    const u8 *peer_mac);
++int ath12k_sfe_add_flow_entry(struct ath12k_base *ab,
++			      u32 *src_ip, u32 src_port,
++			      u32 *dest_ip, u32 dest_port,
++			      u8 protocol, u8 version);
++int ath12k_sfe_delete_flow_entry(struct ath12k_base *ab,
++				 u32 *src_ip, u32 src_port,
++				 u32 *dest_ip, u32 dest_port,
++				 u8 protocol, u8 version);
++#endif
+diff --git a/drivers/net/wireless/ath/ath_fse.c b/drivers/net/wireless/ath/ath_fse.c
+new file mode 100644
+index 0000000..bdac23a
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath_fse.c
+@@ -0,0 +1,186 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#include <ath/ath_fse.h>
++#include <linux/module.h>
++
++struct ath_fse_ops *fse_cb;
++
++int ath_fse_ops_callback_register(const struct ath_fse_ops *ath_cb)
++{
++	if (!ath_cb) {
++		pr_err("Failed to register FSE callbacks\n");
++		return -EINVAL;
++	}
++	fse_cb = ath_cb;
++	pr_debug("FSE callbacks are registered successfully to ath\n");
++	return 0;
++}
++EXPORT_SYMBOL(ath_fse_ops_callback_register);
++
++void ath_fse_ops_callback_unregister(void)
++{
++	fse_cb = NULL;
++}
++EXPORT_SYMBOL(ath_fse_ops_callback_unregister);
++
++bool ath_fse_add_rule(struct ath_fse_flow_info *fse_info)
++{
++	int ret;
++	void *ab;
++
++	if (!fse_cb)
++		return false;
++
++	if (!fse_info->src_dev || !fse_info->dest_dev) {
++		pr_warn("Unable to find dev for FSE rule push\n");
++		return false;
++	}
++	if (!fse_info->src_dev->ieee80211_ptr && !fse_info->dest_dev->ieee80211_ptr) {
++		pr_warn("Not a wlan traffic for FSE rule push\n");
++		return false;
++	}
++	/* Based on src_dev / dest_dev is a VAP, get the 5 tuple info
++	 * to configure the FSE UL flow. If source is VAP, then
++	 * 5 tuple info is in UL direction, so straightaway
++	 * add a rule. If dest is VAP, it is 5 tuple info has to be
++	 * reversed for adding a rule.
++	 */
++	if (fse_info->src_dev->ieee80211_ptr) {
++		ab = fse_cb->fse_get_ab(fse_info->src_dev, fse_info->src_mac);
++		if (!ab) {
++			pr_err("%s: Failed to add a rule in FST<ab NULL>",
++			       netdev_name(fse_info->src_dev));
++			return false;
++		}
++
++		pr_info("ADD S_IP:%x:%x:%x:%x,sPort:%u,D_IP:%x:%x:%x:%x,dPort:%u,Proto:%d,Ver:%d",
++			fse_info->src_ip[0], fse_info->src_ip[1],
++			fse_info->src_ip[2], fse_info->src_ip[3], fse_info->src_port,
++			fse_info->dest_ip[0], fse_info->dest_ip[1],
++			fse_info->dest_ip[2], fse_info->dest_ip[3],
++			fse_info->dest_port, fse_info->protocol,
++			fse_info->version);
++
++		ret = fse_cb->fse_rule_add(ab,
++					   fse_info->src_ip, fse_info->src_port,
++					   fse_info->dest_ip, fse_info->dest_port,
++					   fse_info->protocol, fse_info->version);
++		if (ret) {
++			pr_err("%s: Failed to add a rule in FST",
++			       netdev_name(fse_info->src_dev));
++			return false;
++		}
++	}
++	if (fse_info->dest_dev->ieee80211_ptr) {
++		ab = fse_cb->fse_get_ab(fse_info->dest_dev, fse_info->dest_mac);
++		if (!ab) {
++			pr_err("%s: Failed to add a rule in FST<ab NULL>",
++			       netdev_name(fse_info->dest_dev));
++			return false;
++		}
++		pr_info("ADD S_IP:%x:%x:%x:%x,sPort:%u,D_IP:%x:%x:%x:%x,dPort:%u,Proto:%d,Ver:%d",
++			fse_info->src_ip[0], fse_info->src_ip[1],
++			fse_info->src_ip[2], fse_info->src_ip[3], fse_info->src_port,
++			fse_info->dest_ip[0], fse_info->dest_ip[1],
++			fse_info->dest_ip[2], fse_info->dest_ip[3],
++			fse_info->dest_port, fse_info->protocol,
++			fse_info->version);
++
++		ret = fse_cb->fse_rule_add(ab,
++					   fse_info->dest_ip, fse_info->dest_port,
++					   fse_info->src_ip, fse_info->src_port,
++					   fse_info->protocol, fse_info->version);
++		if (ret) {
++			/* In case of inter VAP flow, if one direction fails
++			 * to configure FSE rule, delete the rule added for
++			 * the other direction as well.
++			 */
++			if (fse_info->src_dev->ieee80211_ptr) {
++				fse_cb->fse_rule_delete(ab,
++						fse_info->src_ip, fse_info->src_port,
++						fse_info->dest_ip, fse_info->dest_port,
++						fse_info->protocol, fse_info->version);
++			}
++			pr_err("%s: Failed to add a rule in FST",
++			       netdev_name(fse_info->dest_dev));
++			return false;
++		}
++	}
++	return true;
++}
++EXPORT_SYMBOL(ath_fse_add_rule);
++
++bool ath_fse_delete_rule(struct ath_fse_flow_info *fse_info)
++{
++	void *ab;
++	int fw_ret = 0;
++	int rv_ret = 0;
++
++	if (!fse_cb)
++		return false;
++
++	if (!fse_info->src_dev || !fse_info->dest_dev) {
++		pr_info("Unable to find dev for FSE rule delete");
++		return false;
++	}
++	if (!fse_info->src_dev->ieee80211_ptr && !fse_info->dest_dev->ieee80211_ptr) {
++		pr_info("Not a wlan traffic for FSE rule delete");
++		return false;
++	}
++	/* Based on src_dev / dest_dev is a VAP, get the 5 tuple info
++	 * to delete the FSE UL flow. If source is VAP, then
++	 * 5 tuple info is in UL direction, so straightaway
++	 * delete a rule. If dest is VAP, it is 5 tuple info has to be
++	 * reversed to delete a rule.
++	 */
++	if (fse_info->src_dev->ieee80211_ptr) {
++		ab = fse_cb->fse_get_ab(fse_info->src_dev, fse_info->src_mac);
++		if (!ab) {
++			pr_err("Failed to delete a rule in FST<ab NULL>");
++			return false;
++		}
++
++		pr_info("DEL S_IP:%x:%x:%x:%x,sPort:%u,D_IP:%x:%x:%x:%x,dPort:%u,Proto:%d,Ver:%d",
++			fse_info->src_ip[0], fse_info->src_ip[1],
++			fse_info->src_ip[2], fse_info->src_ip[3], fse_info->src_port,
++			fse_info->dest_ip[0], fse_info->dest_ip[1],
++			fse_info->dest_ip[2], fse_info->dest_ip[3],
++			fse_info->dest_port, fse_info->protocol,
++			fse_info->version);
++
++		fw_ret  = fse_cb->fse_rule_delete(ab,
++						  fse_info->src_ip, fse_info->src_port,
++						  fse_info->dest_ip, fse_info->dest_port,
++						  fse_info->protocol, fse_info->version);
++	}
++
++	if (fse_info->dest_dev->ieee80211_ptr) {
++		ab = fse_cb->fse_get_ab(fse_info->dest_dev, fse_info->dest_mac);
++		if (!ab) {
++			pr_err("Failed to delete a rule in FST<ab NULL>");
++			return false;
++		}
++
++		pr_info("DEL S_IP:%x:%x:%x:%x,sPort:%u,D_IP:%x:%x:%x:%x,dPort:%u,Proto:%d,Ver:%d",
++			fse_info->src_ip[0], fse_info->src_ip[1],
++			fse_info->src_ip[2], fse_info->src_ip[3], fse_info->src_port,
++			fse_info->dest_ip[0], fse_info->dest_ip[1],
++			fse_info->dest_ip[2], fse_info->dest_ip[3],
++			fse_info->dest_port, fse_info->protocol,
++			fse_info->version);
++
++		rv_ret  = fse_cb->fse_rule_delete(ab,
++						  fse_info->dest_ip, fse_info->dest_port,
++						  fse_info->src_ip, fse_info->src_port,
++						  fse_info->protocol, fse_info->version);
++	}
++	if (!fw_ret && !rv_ret)
++		return true;
++
++	pr_err("Failed to delete a rule in FST");
++	return false;
++}
++EXPORT_SYMBOL(ath_fse_delete_rule);
+diff --git a/include/ath/ath_fse.h b/include/ath/ath_fse.h
+new file mode 100644
+index 0000000..4b5515f
+--- /dev/null
++++ b/include/ath/ath_fse.h
+@@ -0,0 +1,45 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++#ifndef ATH_FSE_H
++#define ATH_FSE_H
++#include <linux/netdevice.h>
++#define ATH_FSE_TID_INVALID 0xff
++
++struct ath_fse_ops {
++	int (*fse_rule_add)(void *ab,
++			    u32 *src_ip, u32 src_port,
++			    u32 *dest_ip, u32 dest_port,
++			    u8 protocol, u8 version);
++	int (*fse_rule_delete)(void *ab,
++			       u32 *src_ip, u32 src_port,
++			       u32 *dest_ip, u32 dest_port,
++			       u8 protocol, u8 version);
++	void* (*fse_get_ab)(struct net_device *src_dev, const u8 *peer_mac);
++};
++
++struct ath_fse_flow_info {
++	u32 src_ip[4];
++	u32 src_port;
++	u32 dest_ip[4];
++	u32 dest_port;
++	u8 protocol;
++	u8 version;
++	struct net_device *src_dev;
++	struct net_device *dest_dev;
++	u8 *src_mac;
++	u8 *dest_mac;
++	u32 fw_svc_id;
++	u32 rv_svc_id;
++};
++
++int ath_fse_ops_callback_register(const struct ath_fse_ops *ath_cb);
++
++void ath_fse_ops_callback_unregister(void);
++
++bool ath_fse_add_rule(struct ath_fse_flow_info *fse_info);
++
++bool ath_fse_delete_rule(struct ath_fse_flow_info *fse_info);
++
++#endif
+-- 
+2.17.1
+

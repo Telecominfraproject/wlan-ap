@@ -1,0 +1,363 @@
+From aa49f4d95358ddc2fa1a43020fa4c007d2682e3b Mon Sep 17 00:00:00 2001
+From: Vignesh C <quic_vignc@quicinc.com>
+Date: Wed, 29 May 2024 19:45:59 +0530
+Subject: [PATCH] wifi: ath12k: Split scan request for split band device
+
+When supplicant initiates scan req for split band device,
+mac80211 generates an single scan req to driver with all the
+channel frequencies. This is because mac80211 categorize the
+the frequencies based on band only.
+
+Driver checks the first freq from the channel list and initiates
+scan to firmware with all the frequencies. Firmware rejects the freq
+which are not supported. As a result of this, Supplicant receives
+the scan results from only one device and associates on one link.
+
+Fix this by splitting the scan request in driver and perform
+multiple scans, send completion notification to mac80211 after
+split scans are done.
+
+Patch-dependency:
+	652-04-ath12k-Support-scan-for-single-wiphy-architecture.patch
+
+Signed-off-by: Vignesh C <quic_vignc@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 132 +++++++++++++++++++++-----
+ 1 file changed, 108 insertions(+), 24 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -5327,14 +5327,15 @@ static int ath12k_mac_vdev_stop(struct a
+ }
+ 
+ static int
+-ath12k_mac_find_link_id_by_freq(struct ieee80211_vif *vif, struct ath12k *ar, u32 freq)
++ath12k_mac_find_link_id_by_freq(struct ieee80211_vif *vif, struct ath12k *ar,
++				u32 freq, bool split_scan)
+ {
+ 	struct ath12k_vif *ahvif = (void *)vif->drv_priv;
+ 	u16 link_id;
+ 
+ 	lockdep_assert_held(&ahvif->ah->conf_mutex);
+ 
+-	if (!vif->valid_links)
++	if (!(vif->valid_links || ahvif->links_map))
+ 		return 0;
+ 
+ 	for (link_id = 0; link_id < IEEE80211_MLD_MAX_NUM_LINKS; link_id++) {
+@@ -5346,6 +5347,16 @@ ath12k_mac_find_link_id_by_freq(struct i
+ 			return link_id;
+ 	}
+ 
++	/* When it comes to STA vdev, make sure to pick the next available link.
++	* There is cases where single scan req needs to be split in driver
++	* and initiate seperate scan requests to firmware based on device.
++	*/
++	if (ahvif->vdev_type == WMI_VDEV_TYPE_STA) {
++		if (!split_scan)
++			return 0;
++		return ffs(~ahvif->links_map) - 1;
++	}
++
+ 	/* Use a default link for scan purpose in driver if the request
+ 	 * cannot be mapped to any of the active links(channel assigned)
+ 	 */
+@@ -5381,7 +5392,7 @@ ath12k_mac_assign_link_vif( struct ath12
+ 		return ahvif->link[link_id];
+ 
+ 	/* Not a ML vif */
+-	if (!vif->valid_links) {
++	if (!vif->valid_links && !ahvif->links_map) {
+ 		link_id = 0;
+ 		arvif =  &ahvif->deflink;
+ 	} else {
+@@ -5469,6 +5480,38 @@ ath12k_mac_select_scan_device(struct iee
+ 	return NULL;
+ }
+ 
++void ath12k_mac_scan_send_complete(struct ath12k *ar,
++				   struct cfg80211_scan_info info)
++{
++	struct ath12k *partner_ar;
++	struct ath12k_pdev *pdev;
++	struct ath12k_base *ab;
++	struct ath12k_hw_group *ag = ar->ab->ag;
++	bool send_completion = true;
++	struct ath12k_hw *ah = ar->ah;
++	int i, j;
++
++	for (i = 0; i < ag->num_chip; i++) {
++		ab = ag->ab[i];
++		for (j = 0; j < ab->num_radios; j++) {
++			pdev = &ab->pdevs[j];
++			partner_ar = pdev->ar;
++
++			if (!partner_ar || partner_ar == ar)
++				continue;
++			if (partner_ar->scan.state == ATH12K_SCAN_RUNNING) {
++				send_completion = false;
++				break;
++			}
++		}
++		if (!send_completion)
++			break;
++	}
++	if (send_completion) {
++		ieee80211_scan_completed(ah->hw, &info);
++	}
++}
++
+ void __ath12k_mac_scan_finish(struct ath12k *ar)
+ {
+ 	struct ath12k_hw *ah = ar->ah;
+@@ -5492,11 +5535,12 @@ void __ath12k_mac_scan_finish(struct ath
+ 					 ATH12K_SCAN_STARTING))
+ 			};
+ 
+-			ieee80211_scan_completed(ah->hw, &info);
++			ath12k_mac_scan_send_complete(ar, info);
+ 		}
+ 		ar->scan.state = ATH12K_SCAN_IDLE;
+ 		ar->scan_channel = NULL;
+ 		ar->scan.roc_freq = 0;
++		ar->scan.is_split_scan = false;
+ 		cancel_delayed_work(&ar->scan.timeout);
+ 		complete(&ar->scan.completed);
+ 		if (ar->scan.no_of_active_scans > 0)
+@@ -5683,31 +5727,25 @@ static int ath12k_start_scan(struct ath1
+ 	return 0;
+ }
+ 
+-static int ath12k_mac_op_hw_scan(struct ieee80211_hw *hw,
+-				 struct ieee80211_vif *vif,
+-				 struct ieee80211_scan_request *hw_req)
++static int ath12k_mac_initiate_hw_scan(struct ieee80211_hw *hw,
++				       struct ieee80211_vif *vif,
++				       struct ieee80211_scan_request *hw_req,
++				       struct ath12k *ar,
++				       u8 from_index, u8 to_index,
++				       bool split_scan)
+ {
+ 	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
+ 	struct ath12k_hw *ah = hw->priv;
+ 	struct ath12k_link_vif *arvif;
+-	struct ath12k *ar;
+ 	struct cfg80211_scan_request *req = &hw_req->req;
+ 	struct ath12k_wmi_scan_req_arg arg = {};
+ 	int ret;
+ 	int i, link_id;
+ 	bool create = true;
+ 	u32 scan_timeout;
+-	mutex_lock(&ah->conf_mutex);
++	u8 n_channels = to_index - from_index;
+ 
+-	/* Since the targeted scan device could depend on the frequency
+-	 * requested in the hw_req, select the corresponding radio
+-	 */
+-	ar = ath12k_mac_select_scan_device(hw, vif, hw_req->req.channels[0]->center_freq);
+-	if (!ar) {
+-		ath12k_err(NULL, "unable to select device for scan\n");
+-		mutex_unlock(&ah->conf_mutex);
+-		return -EINVAL;
+-	}
++	lockdep_assert_held(&ah->conf_mutex);
+ 
+ 	if (unlikely(test_bit(ATH12K_FLAG_RECOVERY, &ar->ab->dev_flags))) {
+ 		mutex_unlock(&ah->conf_mutex);
+@@ -5715,7 +5753,8 @@ static int ath12k_mac_op_hw_scan(struct
+ 	}
+ 
+ 	link_id = ath12k_mac_find_link_id_by_freq(vif, ar,
+-						  hw_req->req.channels[0]->center_freq);
++						  hw_req->req.channels[from_index]->center_freq,
++						  split_scan);
+ 
+ 	arvif = ath12k_mac_assign_link_vif(ah, vif, link_id);
+ 	/* If the vif is already assigned to a specific vdev of an ar,
+@@ -5765,10 +5804,12 @@ static int ath12k_mac_op_hw_scan(struct
+ 		     !is_zero_ether_addr(req->bssid)))
+ 			memcpy(arvif->addr, req->bssid, ETH_ALEN);
+ 
++		arvif->is_scan_vif = true;
+ 		mutex_lock(&ar->conf_mutex);
+ 		ret = ath12k_mac_vdev_create(ar, arvif);
+ 		if (ret) {
+ 			mutex_unlock(&ar->conf_mutex);
++			ath12k_mac_unassign_link_vif(arvif);
+ 			mutex_unlock(&ah->conf_mutex);
+ 			ath12k_warn(ar->ab, "unable to create scan vdev %d\n", ret);
+ 			return -EINVAL;
+@@ -5788,6 +5829,10 @@ static int ath12k_mac_op_hw_scan(struct
+ 		ar->scan.state = ATH12K_SCAN_STARTING;
+ 		ar->scan.is_roc = false;
+ 		ar->scan.vdev_id = arvif->vdev_id;
++		if (split_scan) {
++			ar->scan.is_split_scan = true;
++			memcpy(ar->scan.split_scan_mac, arvif->addr, ETH_ALEN);
++		}
+ 		ret = 0;
+ 		break;
+ 	case ATH12K_SCAN_STARTING:
+@@ -5822,8 +5867,8 @@ static int ath12k_mac_op_hw_scan(struct
+ 		arg.scan_flags |= WMI_SCAN_FLAG_PASSIVE;
+ 	}
+ 
+-	if (req->n_channels) {
+-		arg.num_chan = req->n_channels;
++	if (n_channels) {
++		arg.num_chan = n_channels;
+ 		arg.chan_list = kcalloc(arg.num_chan, sizeof(*arg.chan_list),
+ 					GFP_KERNEL);
+ 
+@@ -5833,7 +5878,7 @@ static int ath12k_mac_op_hw_scan(struct
+ 		}
+ 
+ 		for (i = 0; i < arg.num_chan; i++)
+-			arg.chan_list[i] = req->channels[i]->center_freq;
++			arg.chan_list[i] = req->channels[i + from_index]->center_freq;
+ 	}
+ 	/* if duration is set, default dwell times will be overwritten */
+ 	if (req->duration) {
+@@ -5883,6 +5928,56 @@ exit:
+ 	return ret;
+ }
+ 
++static int ath12k_mac_op_hw_scan(struct ieee80211_hw *hw,
++				 struct ieee80211_vif *vif,
++				 struct ieee80211_scan_request *hw_req)
++{
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar, *prev_ar;
++	int i, from_index, to_index;
++	bool split_scan = false;
++
++	mutex_lock(&ah->conf_mutex);
++
++	/* Since the targeted scan device could depend on the frequency
++	 * requested in the hw_req, select the corresponding radio
++	 */
++	prev_ar = ath12k_mac_select_scan_device(hw, vif, hw_req->req.channels[0]->center_freq);
++	if (!prev_ar) {
++		ath12k_err(NULL, "unable to select device for scan\n");
++		mutex_unlock(&ah->conf_mutex);
++		return -EINVAL;
++	}
++
++	/* NOTE: There could be 5G low/high channels as mac80211 sees
++	 * it as an single band. In that case split the hw request and
++	 * perform multiple scans
++	 */
++	from_index = 0;
++	for (i = 1; i < hw_req->req.n_channels; i++) {
++		ar = ath12k_mac_select_scan_device(hw, vif, hw_req->req.channels[i]->center_freq);
++		if (!ar) {
++			ath12k_err(NULL, "unable to select device for scan\n");
++			mutex_unlock(&ah->conf_mutex);
++			return -EINVAL;
++		}
++		if (prev_ar == ar)
++			continue;
++
++		to_index = i;
++		split_scan = true;
++		hw_req->req.flags |= NL80211_SCAN_FLAG_RANDOM_ADDR;
++		ath12k_mac_initiate_hw_scan(hw, vif, hw_req, prev_ar, from_index,
++					    to_index, split_scan);
++		mutex_lock(&ah->conf_mutex);
++		from_index = to_index;
++		prev_ar = ar;
++	}
++
++	return ath12k_mac_initiate_hw_scan(hw, vif, hw_req, prev_ar, from_index,
++					   i, split_scan);
++}
++
+ static void ath12k_mac_op_cancel_hw_scan(struct ieee80211_hw *hw,
+ 					 struct ieee80211_vif *vif)
+ {
+@@ -11067,12 +11162,13 @@ static void ath12k_update_obss_color_not
+ 	struct ieee80211_hw *hw = ar->ah->hw;
+ 	struct ath12k_wmi_vdev_create_arg vdev_arg = {0};
+ 	struct ath12k_wmi_peer_create_arg peer_param = {0};
+-	struct ieee80211_bss_conf *link_conf;
++	struct ieee80211_bss_conf *link_conf = NULL;
+ 	u32 param_id, param_value;
+ 	u16 nss;
+ 	int i;
+ 	int ret, fbret, vdev_id;
+ 	u8 link_addr[ETH_ALEN];
++	u8 mask[ETH_ALEN] = {0xFF, 0xFF, 0xFF};
+ 	int txpower;
+ 	u8 link_id;
+ 
+@@ -11089,9 +11185,10 @@ static void ath12k_update_obss_color_not
+ 
+ 	rcu_read_lock();
+ 
+-	link_conf = rcu_dereference(vif->link_conf[link_id]);
++	if (link_id >=0 && link_id < IEEE80211_MLD_MAX_NUM_LINKS)
++		link_conf = rcu_dereference(vif->link_conf[link_id]);
+ 
+-	if (!link_conf) {
++	if (!link_conf && !arvif->is_scan_vif) {
+ 		rcu_read_unlock();
+ 		return -EINVAL;
+ 	}
+@@ -11099,12 +11196,18 @@ static void ath12k_update_obss_color_not
+ 	if (arvif->link_id == ATH12K_DEFAULT_SCAN_LINK &&
+ 	    !is_zero_ether_addr(arvif->addr)) {
+ 		memcpy(link_addr, arvif->addr, ETH_ALEN);
+-	} else {
++	} else if (link_conf) {
+ 		memcpy(link_addr, link_conf->addr, ETH_ALEN);
+ 		memcpy(arvif->addr, link_conf->addr, ETH_ALEN);
++	} else {
++		get_random_mask_addr(link_addr, ar->mac_addr, mask);
++		memcpy(arvif->addr, link_addr, ETH_ALEN);
+ 	}
+ 
+-	txpower = link_conf->txpower;
++	if (link_conf)
++		txpower = link_conf->txpower;
++	else
++		txpower = NL80211_TX_POWER_AUTOMATIC;
+ 	rcu_read_unlock();
+ 
+ 	/* Send vdev stats offload commands to firmware before first vdev
+@@ -16016,7 +16119,7 @@ static int ath12k_mac_op_remain_on_chann
+ 	}
+ 
+ 	link_id = ath12k_mac_find_link_id_by_freq(vif, ar,
+-						  chan->center_freq);
++						  chan->center_freq, false);
+ 
+ 	arvif = ath12k_mac_assign_link_vif(ah, vif, link_id);
+ 
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -956,6 +956,8 @@ struct ath12k {
+ 		int roc_freq;
+ 		bool roc_notify;
+ 		struct work_struct vdev_del_wk;
++		bool is_split_scan;
++		u8 split_scan_mac[ETH_ALEN];
+ 	} scan;
+ 
+ 	struct {
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -11987,6 +11987,14 @@ static void ath12k_mgmt_rx_event(struct
+ 
+ skip_mgmt_stats:
+ 
++	if (!peer && ieee80211_is_probe_resp(hdr->frame_control) &&
++	    ar->scan.is_split_scan) {
++		if (!ether_addr_equal(hdr->addr1, ar->scan.split_scan_mac)) {
++			dev_kfree_skb(skb);
++			goto exit;
++		}
++	}
++
+ 	/* Firmware is guaranteed to report all essential management frames via
+ 	 * WMI while it can deliver some extra via HTT. Since there can be
+ 	 * duplicates split the reporting wrt monitor/sniffing.

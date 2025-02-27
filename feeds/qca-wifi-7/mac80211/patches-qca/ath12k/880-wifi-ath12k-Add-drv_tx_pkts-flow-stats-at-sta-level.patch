@@ -1,0 +1,240 @@
+From d74d0e16f74660c36b36eed09d9b8f0355996a2c Mon Sep 17 00:00:00 2001
+From: Sarika Sharma <quic_sarishar@quicinc.com>
+Date: Thu, 8 Feb 2024 12:35:59 +0530
+Subject: [PATCH] wifi: ath12k: Add drv_tx_pkts flow stats at station level
+
+Currently drv_tx_pkts flow stats are incremented on deflink of the sta.
+However driver does not know which link is actually going to be used here.
+Hence moving drv_tx_pkts stats at ahsta level.
+
+To get drv_tx_pkts stats:
+root@OpenWrt:/# cat /sys/kernel/debug/ieee80211/phy00/netdev:wlan1/
+stations/02:03:7f:01:52:42/driver_tx_pkts_flow
+Tx packets inflow from mac80211: 1950
+Tx packets outflow to HW: 1950
+
+To reset drv_tx_pkts stats:
+root@OpenWrt:/# echo 1 > /sys/kernel/debug/ieee80211/phy00/netdev:wlan1/
+stations/02:03:7f:01:52:42/reset_tx_pkts_flow
+root@OpenWrt:/# cat /sys/kernel/debug/ieee80211/phy00/netdev:wlan1/
+stations/02:03:7f:01:52:42/driver_tx_pkts_flow
+Tx packets inflow from mac80211: 0
+Tx packets outflow to HW: 0
+
+Signed-off-by: Sarika Sharma <quic_sarishar@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h        |  2 +-
+ drivers/net/wireless/ath/ath12k/debugfs_sta.c | 90 +++++++++++++------
+ drivers/net/wireless/ath/ath12k/mac.c         |  6 +-
+ 3 files changed, 65 insertions(+), 33 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -697,7 +697,6 @@ struct ath12k_link_sta {
+ 
+ 	struct ath12k_htt_tx_stats *tx_stats;
+ 	struct ath12k_rx_peer_stats *rx_stats;
+-	struct ath12k_driver_tx_pkts_flow drv_tx_pkts;
+ 	struct ath12k_driver_rx_pkts_flow drv_rx_pkts;
+ 	struct ath12k_wbm_tx_stats *wbm_tx_stats;
+ 	u32 bw_prev;
+@@ -741,6 +740,7 @@ struct ath12k_sta {
+ 	 * ONLY used currently in recovery case
+ 	 */
+ 	bool low_ack_sent;
++	struct ath12k_driver_tx_pkts_flow drv_tx_pkts;
+ };
+ 
+ #define ATH12K_HALF_20MHZ_BW 10
+--- a/drivers/net/wireless/ath/ath12k/debugfs_sta.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs_sta.c
+@@ -1271,12 +1271,9 @@ ath12k_dbg_sta_dump_driver_tx_pkts_flow(
+ 					const char __user *user_buf,
+ 					size_t count, loff_t *ppos)
+ {
+-	struct ieee80211_link_sta *link_sta = file->private_data;
+-	struct ieee80211_sta *sta = link_sta->sta;
+-	u8 link_id = link_sta->link_id;
++	struct ieee80211_sta *sta = file->private_data;
+ 	struct ath12k_sta *ahsta = ath12k_sta_to_ahsta(sta);
+ 	struct ath12k_hw *ah = ahsta->ahvif->ah;
+-	struct ath12k_link_sta *arsta;
+ 	struct ath12k *ar;
+ 	int len = 0, ret_val;
+ 	const int size = ATH12K_DRV_TX_STATS_SIZE;
+@@ -1284,24 +1281,7 @@ ath12k_dbg_sta_dump_driver_tx_pkts_flow(
+ 
+ 	mutex_lock(&ah->conf_mutex);
+ 
+-	if (!(BIT(link_id) & ahsta->links_map)) {
+-		mutex_unlock(&ah->conf_mutex);
+-		return -ENOENT;
+-	}
+-
+-	arsta = ahsta->link[link_id];
+-
+-	if (!arsta || !arsta->arvif->ar) {
+-		mutex_unlock(&ah->conf_mutex);
+-		return -ENOENT;
+-	}
+-
+-	ar = arsta->arvif->ar;
+-
+-	if (!arsta->tx_stats) {
+-		mutex_unlock(&ah->conf_mutex);
+-		return -ENOENT;
+-	}
++	ar = ahsta->deflink.arvif->ar;
+ 
+ 	buf = kzalloc(ATH12K_DRV_TX_STATS_SIZE, GFP_KERNEL);
+ 	if (!buf) {
+@@ -1310,13 +1290,18 @@ ath12k_dbg_sta_dump_driver_tx_pkts_flow(
+ 	}
+ 
+ 	mutex_lock(&ar->conf_mutex);
++	if (ar->state != ATH12K_STATE_ON) {
++		ret_val = count;
++		goto out;
++	}
++
+ 	spin_lock_bh(&ar->ab->base_lock);
+ 	len += scnprintf(buf + len, size - len,
+ 			 "Tx packets inflow from mac80211: %u\n",
+-			 atomic_read(&arsta->drv_tx_pkts.pkts_in));
++			 atomic_read(&ahsta->drv_tx_pkts.pkts_in));
+ 	len += scnprintf(buf + len, size - len,
+ 			 "Tx packets outflow to HW: %u\n",
+-			 atomic_read(&arsta->drv_tx_pkts.pkts_out));
++			 atomic_read(&ahsta->drv_tx_pkts.pkts_out));
+ 	spin_unlock_bh(&ar->ab->base_lock);
+ 
+ 	if (len > size)
+@@ -1325,6 +1310,7 @@ ath12k_dbg_sta_dump_driver_tx_pkts_flow(
+ 	ret_val = simple_read_from_buffer(user_buf, count, ppos, buf, len);
+ 	kfree(buf);
+ 
++out:
+ 	mutex_unlock(&ar->conf_mutex);
+ 	mutex_unlock(&ah->conf_mutex);
+ 	return ret_val;
+@@ -1337,6 +1323,39 @@ static const struct file_operations fops
+ 	.llseek = default_llseek,
+ };
+ 
++static ssize_t ath12k_dbg_sta_reset_tx_pkts_flow(struct file *file,
++						 const char __user *buf,
++						 size_t count, loff_t *ppos)
++{
++	struct ieee80211_sta *sta = file->private_data;
++	struct ath12k_sta *ahsta = ath12k_sta_to_ahsta(sta);
++	struct ath12k_hw *ah = ahsta->ahvif->ah;
++	int ret, reset;
++
++	ret = kstrtoint_from_user(buf, count, 0, &reset);
++	if (ret)
++		return ret;
++
++	if (!reset || reset > 1)
++		return -EINVAL;
++
++	mutex_lock(&ah->conf_mutex);
++	atomic_set(&ahsta->drv_tx_pkts.pkts_in, 0);
++	atomic_set(&ahsta->drv_tx_pkts.pkts_out, 0);
++
++	mutex_unlock(&ah->conf_mutex);
++
++	ret = count;
++	return ret;
++}
++
++static const struct file_operations fops_reset_tx_pkts_flow = {
++	.write = ath12k_dbg_sta_reset_tx_pkts_flow,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
+ static ssize_t ath12k_dbg_sta_reset_tx_stats(struct file *file,
+ 					     const char __user *buf,
+ 					     size_t count, loff_t *ppos)
+@@ -1379,8 +1398,6 @@ static ssize_t ath12k_dbg_sta_reset_tx_s
+ 	}
+ 	spin_lock_bh(&ar->ab->base_lock);
+ 	memset(arsta->tx_stats, 0, sizeof(*arsta->tx_stats));
+-	atomic_set(&arsta->drv_tx_pkts.pkts_in, 0);
+-	atomic_set(&arsta->drv_tx_pkts.pkts_out, 0);
+ 	memset(arsta->wbm_tx_stats->wbm_tx_comp_stats, 0, sizeof(*arsta->wbm_tx_stats));
+ 	spin_unlock_bh(&ar->ab->base_lock);
+ 
+@@ -1892,11 +1909,39 @@ static const struct file_operations fops
+ void ath12k_debugfs_sta_op_add(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			       struct ieee80211_sta *sta, struct dentry *dir)
+ {
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *ar;
++
+ 	debugfs_create_file("aggr_mode", 0644, dir, sta, &fops_aggr_mode);
+ 	debugfs_create_file("addba", 0200, dir, sta, &fops_addba);
+ 	debugfs_create_file("addba_resp", 0200, dir, sta, &fops_addba_resp);
+ 	debugfs_create_file("delba", 0200, dir, sta, &fops_delba);
+ 	debugfs_create_file("primary_link_id", 0400, dir, sta, &fops_primary_link_id);
++
++	mutex_lock(&ah->conf_mutex);
++
++	/* Link 0 will always exist whether it is mlo or non-mlo sta
++	 */
++	ar = ath12k_get_ar_by_vif(hw, vif, 0);
++
++	if (!ar) {
++		mutex_unlock(&ah->conf_mutex);
++		return;
++	}
++
++	mutex_lock(&ar->conf_mutex);
++	if (ar->state != ATH12K_STATE_ON)
++		goto out;
++
++	if (ath12k_debugfs_is_extd_tx_stats_enabled(ar)) {
++		debugfs_create_file("reset_tx_pkts_flow", 0600, dir, sta,
++				    &fops_reset_tx_pkts_flow);
++		debugfs_create_file("driver_tx_pkts_flow", 0400, dir, sta,
++				    &fops_driver_tx_pkts_flow);
++	}
++out:
++	mutex_unlock(&ar->conf_mutex);
++	mutex_unlock(&ah->conf_mutex);
+ }
+ 
+ void ath12k_debugfs_link_sta_op_add(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+@@ -1919,8 +1964,6 @@ void ath12k_debugfs_link_sta_op_add(stru
+ 				    &fops_tx_stats);
+ 		debugfs_create_file("reset_tx_stats", 0600, dir, link_sta,
+ 				    &fops_reset_tx_stats);
+-		debugfs_create_file("driver_tx_pkts_flow", 0400, dir, link_sta,
+-				    &fops_driver_tx_pkts_flow);
+ 	}
+ 	if (ath12k_debugfs_is_extd_rx_stats_enabled(ar)) {
+ 		debugfs_create_file("rx_stats", 0400, dir, link_sta,
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -9641,7 +9641,6 @@ static void ath12k_mac_op_tx(struct ieee
+ 	struct ath12k_mgmt_frame_stats *mgmt_stats;
+ 	struct ath12k_sta *ahsta = NULL;
+ 	struct sk_buff *msdu_copied;
+-	struct ath12k_link_sta *arsta = NULL;
+ 	struct ieee80211_sta *sta = NULL;
+ 	struct ath12k_peer *peer;
+ 	u32 info_flags;
+@@ -9790,10 +9789,9 @@ static void ath12k_mac_op_tx(struct ieee
+ 			ieee80211_free_txskb(ah->hw, skb);
+ 		}
+ 		if (ath12k_debugfs_is_extd_tx_stats_enabled(ar) && ahsta) {
+-			arsta = &ahsta->deflink;
+-			atomic_inc(&arsta->drv_tx_pkts.pkts_in);
++			atomic_inc(&ahsta->drv_tx_pkts.pkts_in);
+ 			if (!ret)
+-				atomic_inc(&arsta->drv_tx_pkts.pkts_out);
++				atomic_inc(&ahsta->drv_tx_pkts.pkts_out);
+ 		}
+ 	} else {
+ 		spin_lock(&ahvif->mcbc_gsn_lock);

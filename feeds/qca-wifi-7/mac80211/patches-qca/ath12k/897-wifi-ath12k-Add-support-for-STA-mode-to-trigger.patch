@@ -1,0 +1,272 @@
+From 50969e55740f0939471ef1d1c9986a470e5a9af9 Mon Sep 17 00:00:00 2001
+From: Arulanbu Balusamy <quic_abalusam@quicinc.com>
+Date: Thu, 14 Mar 2024 21:28:23 +0530
+Subject: [PATCH] wifi: ath12k: Add support for STA mode to  trigger the disconnection
+by using ieee80211_beacon_loss.
+
+When AP goes down or at inactive state without indication to STA,
+firmware will detect missing beacon,then firmware sends
+WMI_PEER_STA_KICKOUT_EVENTID with the reason of
+WMI_PEER_STA_KICKOUT_REASON_INACTIVITY to the host.
+Then the host consider as low ack. So instead of low ack
+report add support for STA mode to trigger disconnection
+from AP as the reason as beacon loss.
+
+
+Signed-off-by: Arulanbu Balusamy <quic_abalusam@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |  2 +
+ drivers/net/wireless/ath/ath12k/mac.c  | 76 +++++++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/mac.h  |  2 +
+ drivers/net/wireless/ath/ath12k/wmi.c  | 17 +++---
+ 4 files changed, 87 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -46,6 +46,7 @@
+ #define ATH12K_PRB_RSP_DROP_THRESHOLD ((ATH12K_TX_MGMT_TARGET_MAX_SUPPORT_WMI * 3) / 4)
+ 
+ #define ATH12K_INVALID_HW_MAC_ID	0xFF
++#define ATH12K_CONNECTION_LOSS_HZ	(3 * HZ)
+ #define	ATH12K_RX_RATE_TABLE_NUM	320
+ #define	ATH12K_RX_RATE_TABLE_11AX_NUM	576
+ 
+@@ -406,7 +407,6 @@ struct ath12k_link_vif {
+ 	struct ath12k_base *ab;
+ 	struct ath12k_dp *dp;
+ 	struct ath12k_vif_tcl_desc_template desc;
+-	struct ieee80211_vif *vif;
+ 	struct device *dev;
+ 	struct ath12k *ar;
+ 	bool assoc_link;
+@@ -437,6 +437,7 @@ struct ath12k_link_vif {
+ 	bool spectral_enabled;
+ 	u8 bssid[ETH_ALEN];
+ 	struct cfg80211_bitrate_mask bitrate_mask;
++	struct delayed_work connection_loss_work;
+ 	int num_legacy_stations;
+ 	int rtscts_prot_mode;
+ 	int txpower;
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -2167,6 +2167,76 @@ static void ath12k_control_beaconing(str
+ 	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac vdev %d up\n", arvif->vdev_id);
+ }
+ 
++static void ath12k_mac_handle_beacon_iter(void *data, u8 *mac,
++					  struct ieee80211_vif *vif)
++{
++	struct sk_buff *skb = data;
++	struct ieee80211_mgmt *mgmt = (void *)skb->data;
++	struct ath12k_vif *ahvif = (void *)vif->drv_priv;
++
++	if (vif->type != NL80211_IFTYPE_STATION)
++		return;
++
++	if (!ether_addr_equal(mgmt->bssid, vif->bss_conf.bssid))
++		return;
++
++	cancel_delayed_work(&ahvif->deflink.connection_loss_work);
++}
++
++void ath12k_mac_handle_beacon(struct ath12k *ar, struct sk_buff *skb)
++{
++	ieee80211_iterate_active_interfaces_atomic(ar->ah->hw,
++						   IEEE80211_IFACE_ITER_NORMAL,
++						   ath12k_mac_handle_beacon_iter,
++						   skb);
++}
++
++static void ath12k_mac_handle_beacon_miss_iter(void *data, u8 *mac,
++					       struct ieee80211_vif *vif)
++{
++	struct ath12k_vif *ahvif = (void *)vif->drv_priv;
++	struct ath12k *ar = ahvif->deflink.ar;
++	struct ieee80211_hw *hw = ar->ah->hw;
++	u32 *vdev_id = data;
++
++	if (ahvif->deflink.vdev_id != *vdev_id)
++		return;
++
++	if (!ahvif->deflink.is_up)
++		return;
++
++	ieee80211_beacon_loss(vif);
++
++	/* Firmware doesn't report beacon loss events repeatedly. If AP probe
++	 * (done by mac80211) succeeds but beacons do not resume then it
++	 * doesn't make sense to continue operation. Queue connection loss work
++	 * which can be cancelled when beacon is received.
++	 */
++	ieee80211_queue_delayed_work(hw, &ahvif->deflink.connection_loss_work,
++				     ATH12K_CONNECTION_LOSS_HZ);
++}
++
++void ath12k_mac_handle_beacon_miss(struct ath12k *ar, u32 vdev_id)
++{
++	ieee80211_iterate_active_interfaces_atomic(ar->ah->hw,
++						   IEEE80211_IFACE_ITER_NORMAL,
++						   ath12k_mac_handle_beacon_miss_iter,
++						   &vdev_id);
++}
++
++static void ath12k_mac_vif_sta_connection_loss_work(struct work_struct
++								*work)
++{
++	struct ath12k_link_vif *arvif = container_of(work, struct ath12k_link_vif,
++						     connection_loss_work.work);
++	struct ieee80211_vif *vif = arvif->ahvif->vif;
++
++	if (!arvif->is_up)
++		return;
++
++	ieee80211_connection_loss(vif);
++}
++
+ static void ath12k_peer_assoc_h_basic(struct ath12k *ar,
+ 				      struct ath12k_link_vif *arvif,
+ 				      struct ath12k_link_sta *arsta,
+@@ -4289,6 +4359,7 @@ void ath12k_bss_disassoc(struct ath12k *
+ {
+ 	struct ath12k_vif *tx_ahvif;
+ 	struct ath12k_link_vif *tx_arvif;
++	struct ath12k_vif *ahvif = arvif->ahvif;
+ 	struct ieee80211_bss_conf *link;
+ 	int ret;
+ 
+@@ -4326,7 +4397,8 @@ void ath12k_bss_disassoc(struct ath12k *
+ 		lockdep_assert_held(&tx_arvif->ar->conf_mutex);
+ 	}
+ 
+-	/* TODO: cancel connection_loss_work */
++	cancel_delayed_work(&ahvif->deflink.connection_loss_work);
++
+ unlock:
+ 	rcu_read_unlock();
+ }
+@@ -11351,6 +11423,8 @@ static int ath12k_mac_op_add_interface(s
+ 	}
+ 
+ 	INIT_LIST_HEAD(&ahvif->deflink.list);
++	INIT_DELAYED_WORK(&ahvif->deflink.connection_loss_work,
++			ath12k_mac_vif_sta_connection_loss_work);
+ 	INIT_WORK(&ahvif->deflink.update_obss_color_notify_work,
+ 		  ath12k_update_obss_color_notify_work);
+ 	INIT_WORK(&ahvif->deflink.update_bcn_template_work,
+@@ -11415,6 +11489,7 @@ static void ath12k_mac_remove_link_inter
+ 	cancel_work_sync(&arvif->update_obss_color_notify_work);
+ 	cancel_work_sync(&arvif->update_bcn_template_work);
+ 	cancel_work_sync(&arvif->peer_ch_width_switch_work);
++	cancel_delayed_work_sync(&ahvif->deflink.connection_loss_work);
+ 
+ 	lockdep_assert_held(&ah->conf_mutex);
+ 
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -149,6 +149,8 @@ enum nl80211_he_ru_alloc ath12k_mac_he_r
+ enum nl80211_eht_ru_alloc ath12k_mac_eht_ru_tones_to_nl80211_eht_ru_alloc(u16 ru_tones);
+ enum ath12k_supported_bw ath12k_mac_mac80211_bw_to_ath12k_bw(enum rate_info_bw bw);
+ enum hal_encrypt_type ath12k_dp_tx_get_encrypt_type(u32 cipher);
++void ath12k_mac_handle_beacon(struct ath12k *ar, struct sk_buff *skb);
++void ath12k_mac_handle_beacon_miss(struct ath12k *ar, u32 vdev_id);
+ void ath12k_mac_get_any_chandef_iter(struct ieee80211_hw *hw,
+                                      struct ieee80211_chanctx_conf *conf,
+                                      void *data);
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -11883,10 +11883,8 @@ skip_mgmt_stats:
+ 		}
+ 	}
+ 
+-	/* TODO: Pending handle beacon implementation
+-	 *if (ieee80211_is_beacon(hdr->frame_control))
+-	 *	ath12k_mac_handle_beacon(ar, skb);
+-	 */
++	if (ieee80211_is_beacon(hdr->frame_control))
++		ath12k_mac_handle_beacon(ar, skb);
+ 
+ 	if (!(ag->mlo_mem.is_mlo_mem_avail && ag->mgmt_rx_reorder))
+ 		goto pass_up;
+@@ -12123,6 +12121,7 @@ static void ath12k_peer_sta_kickout_even
+ 	struct wmi_peer_sta_kickout_arg arg = {};
+ 	struct ieee80211_sta *sta;
+ 	struct ath12k_peer *peer;
++	struct ath12k_vif *ahvif;
+ 	struct ath12k *ar;
+ 	unsigned int link_id;
+ 
+@@ -12150,6 +12149,8 @@ static void ath12k_peer_sta_kickout_even
+ 		goto exit;
+ 	}
+ 
++	ahvif = ath12k_vif_to_ahvif(peer->vif);
++
+ 	if (peer->mlo)
+ 		sta = ieee80211_find_sta_by_link_addrs(ar->ah->hw, arg.mac_addr,
+ 						       NULL, &link_id);
+@@ -12172,7 +12173,12 @@ static void ath12k_peer_sta_kickout_even
+ 	ath12k_dbg(ab, ATH12K_DBG_PEER, "peer sta kickout event %pM reason:%d",
+ 		   arg.mac_addr, arg.reason);
+ 
+-	ieee80211_report_low_ack(sta, 10);
++	if (ar->ab->hw_params->handle_beacon_miss &&
++	    ahvif->vif->type == NL80211_IFTYPE_STATION &&
++	    arg.reason == WMI_PEER_STA_KICKOUT_REASON_INACTIVITY)
++		ath12k_mac_handle_beacon_miss(ar, peer->vdev_id);
++	else
++		ieee80211_report_low_ack(sta, 10);
+ 
+ exit:
+ 	spin_unlock_bh(&ab->base_lock);
+--- a/drivers/net/wireless/ath/ath12k/hw.c
++++ b/drivers/net/wireless/ath/ath12k/hw.c
+@@ -1735,6 +1735,7 @@ static struct ath12k_hw_params ath12k_hw
+ 		.fw_mem_mode = ATH12K_QMI_TARGET_MEM_MODE,
+ 		.is_plink_preferable = true,
+ 		.support_fse = true,
++		.handle_beacon_miss = true,
+ 		.cfr_support = true,
+ 		.cfr_dma_hdr_size = sizeof(struct ath12k_cfir_enh_dma_hdr),
+ 		.cfr_num_stream_bufs = 127,
+@@ -1817,6 +1818,7 @@ static struct ath12k_hw_params ath12k_hw
+ 		.fw_mem_mode = ATH12K_QMI_TARGET_MEM_MODE,
+ 		.is_plink_preferable = true,
+ 		.support_fse = true,
++		.handle_beacon_miss = false,
+ 		.cfr_support = true,
+ 		.cfr_dma_hdr_size = sizeof(struct ath12k_cfir_enh_dma_hdr),
+ 		.cfr_num_stream_bufs = 255,
+@@ -1912,6 +1914,7 @@ static struct ath12k_hw_params ath12k_hw
+ 		.fw_mem_mode = ATH12K_QMI_TARGET_MEM_MODE,
+ 		.is_plink_preferable = true,
+ 		.support_fse = true,
++		.handle_beacon_miss = true,
+ 		.cfr_support = true,
+ 		.cfr_dma_hdr_size = sizeof(struct ath12k_cfir_enh_dma_hdr),
+ 		.cfr_num_stream_bufs = 127,
+@@ -2011,6 +2014,7 @@ static struct ath12k_hw_params ath12k_hw
+ 		.fw_mem_mode = ATH12K_QMI_TARGET_MEM_MODE,
+ 		.is_plink_preferable = false,
+ 		.support_fse = true,
++		.handle_beacon_miss = true,
+ 		.cfr_support = true,
+ 		.cfr_dma_hdr_size = sizeof(struct ath12k_cfir_enh_dma_hdr),
+ 		.cfr_num_stream_bufs = 255,
+@@ -2103,6 +2107,7 @@ static struct ath12k_hw_params ath12k_hw
+ 		.fw_mem_mode = ATH12K_QMI_TARGET_MEM_MODE,
+ 		.is_plink_preferable = true,
+ 		.support_fse = true,
++		.handle_beacon_miss = true,
+ 		.cfr_support = true,
+ 		.cfr_dma_hdr_size = sizeof(struct ath12k_cfir_enh_dma_hdr),
+ 		.cfr_num_stream_bufs = 128,
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -258,6 +258,7 @@ struct ath12k_hw_params {
+ 	int fw_mem_mode;
+ 	bool is_plink_preferable;
+ 	bool support_fse;
++	bool handle_beacon_miss;
+ 	bool cfr_support;
+ 	u32 cfr_dma_hdr_size;
+ 	u32 cfr_num_stream_bufs;

@@ -1,0 +1,276 @@
+From 8ba3a73b7d1a52db8ec38d23b55c4d7aad6ee77e Mon Sep 17 00:00:00 2001
+From: Ramya Gnanasekar <quic_rgnanase@quicinc.com>
+Date: Tue, 12 Sep 2023 15:22:41 +0530
+Subject: [PATCH] wifi: ath12k: Add mode 1 recovery support for DS
+
+Add changes to support mode 1 recovery for Direct Switch.
+When FW asserts in mode1, following actions to be done
+in sequence:
+	* Stop queue for bonded netdev and link netdev without
+disabling DS for link netdev and not releasing the link netdev
+from bond netdev
+	* After UMAC recovery done, traffic can resume for
+non-asserted chips. Hence enable the bond netdev, start queues
+for bond dev and netdev in non-asserted chips
+	* Finally after recovery, start queues for netdev associated
+with asserted chips.
+
+Patch-dependency:SSR Mode1 patches
+		 801-04-wifi-ath12k-Add-support-for-Mode-1-recovery-cache.patch
+		 838-wifi-ath12k-Add-mode-1-recovery-support-for-DS.patch
+
+Signed-off-by: Ramya Gnanasekar <quic_rgnanase@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c | 52 ++++++++++++++++++--------
+ drivers/net/wireless/ath/ath12k/mac.c  | 38 ++++++++++++++++---
+ drivers/net/wireless/ath/ath12k/mac.h  |  3 +-
+ 3 files changed, 70 insertions(+), 23 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -3310,6 +3310,7 @@ static void ath12k_core_disable_ppe_rtnl
+ 	struct ath12k *ar;
+ 	struct ath12k_pdev *pdev;
+ 	struct ath12k_link_vif *arvif;
++	struct net_device *link_ndev;
+ 	int i;
+ 
+ 	rtnl_lock();
+@@ -3324,16 +3325,21 @@ static void ath12k_core_disable_ppe_rtnl
+ 		mutex_lock(&ar->conf_mutex);
+ 		list_for_each_entry(arvif, &ar->arvifs, list) {
+ 			if (arvif->ndev_pvt) {
++				link_ndev = arvif->ndev_pvt->link_ndev;
+ 				if (arvif->ndev_pvt->bond_dev &&
+ 				    arvif->ndev_pvt->bond_dev->flags & IFF_UP) {
+ 					netif_tx_stop_all_queues(arvif->ndev_pvt->bond_dev);
+ 					arvif->ndev_pvt->bond_dev->flags &= ~IFF_UP;
+ 				}
+ 
+-				if (arvif->ndev_pvt->link_ndev) {
+-					netif_tx_stop_all_queues(arvif->ndev_pvt->link_ndev);
+-					ath12k_bond_link_release(arvif);
+-					ath12k_disable_ppe_for_link_netdev(ab, arvif, arvif->ndev_pvt->link_ndev);
++				if (link_ndev) {
++					netif_tx_stop_all_queues(link_ndev);
++					if (ab->ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE0) {
++						ath12k_bond_link_release(arvif);
++						ath12k_disable_ppe_for_link_netdev(ab,
++										   arvif,
++										   link_ndev);
++					}
+ 				}
+ 			}
+ 		}
+@@ -3350,19 +3356,12 @@ static void ath12k_core_reset(struct wor
+ 	struct ath12k_hw_group *ag = ab->ag;
+ 	struct ath12k_hw *ah;
+ 	struct ath12k_base *partner_ab;
+-	int reset_count, fail_cont_count, i;
++	struct ath12k_pdev *pdev;
++	struct ath12k *ar;
++	int reset_count, fail_cont_count, i, j;
+ 	long time_left;
+ 	bool teardown = false;
+ 
+-#ifdef CPTCFG_ATH12K_BONDED_DS_SUPPORT
+-	if (!ab->is_reset) {
+-		ath12k_hif_ppeds_irq_disable(ab, PPEDS_IRQ_PPE2TCL);
+-		ath12k_hif_ppeds_irq_disable(ab, PPEDS_IRQ_REO2PPE);
+-		ath12k_hif_ppeds_irq_disable(ab, PPEDS_IRQ_PPE_WBM2SW_REL);
+-		ath12k_core_disable_ppe_rtnl_bond_release(ab);
+-	}
+-#endif
+-
+ 	/* Initializing this flag to false, as this flag will be only
+ 	 * set true on Mode1 SSR.
+ 	 */
+@@ -3388,6 +3387,15 @@ static void ath12k_core_reset(struct wor
+ 		ath12k_info(ab, "Recovery is initiated with Mode%s\n",
+ 			   (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE0 ? "0" : "1"));
+ 
++#ifdef CPTCFG_ATH12K_BONDED_DS_SUPPORT
++	if (!ab->is_reset) {
++		ath12k_hif_ppeds_irq_disable(ab, PPEDS_IRQ_PPE2TCL);
++		ath12k_hif_ppeds_irq_disable(ab, PPEDS_IRQ_REO2PPE);
++		ath12k_hif_ppeds_irq_disable(ab, PPEDS_IRQ_PPE_WBM2SW_REL);
++		ath12k_core_disable_ppe_rtnl_bond_release(ab);
++	}
++#endif
++
+ 	/* Sometimes the recovery will fail and then the next all recovery fail,
+ 	 * this is to avoid infinite recovery since it can not recovery success.
+ 	 */
+@@ -3449,8 +3457,26 @@ static void ath12k_core_reset(struct wor
+ 	if (ag->num_started && ab->fw_recovery_support)
+ 		ag->num_started--;
+ 
+-	if (!ag->hw_queues_stopped)
++	if (!ag->hw_queues_stopped) {
+ 		ath12k_core_mlo_hw_queues_stop(ag, ab);
++#ifdef CPTCFG_ATH12K_BONDED_DS_SUPPORT
++		if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1) {
++			for (i = 0; i < ag->num_chip; i++) {
++				partner_ab = ag->ab[i];
++				if (ab == partner_ab)
++					continue;
++				for (j = 0; j < partner_ab->num_radios; j++) {
++					pdev = &partner_ab->pdevs[j];
++					ar = pdev->ar;
++					if (!ar)
++						continue;
++					ath12k_ppeds_partner_link_stop_queues(ar);
++				}
++			}
++		}
++#endif
++	}
++
+ 
+ 	for (i = 0; i < ag->num_chip; i++) {
+ 		partner_ab = ag->ab[i];
+@@ -3498,6 +3524,7 @@ static void ath12k_core_reset(struct wor
+ 			 * failed
+ 			 */
+ 			ag->recovery_mode = ATH12K_MLO_RECOVERY_MODE0;
++			ath12k_core_disable_ppe_rtnl_bond_release(ab);
+ 			ath12k_info(ab, "Recovery is falling back to Mode0\n");
+ 		} else {
+ 			/* wake queues here as ping should continue for
+@@ -3509,9 +3536,24 @@ static void ath12k_core_reset(struct wor
+ 					continue;
+ 
+ 				ieee80211_wake_queues(ah->hw);
+-				ath12k_dbg(ab, ATH12K_DBG_MODE1_RECOVERY,
+-					   "Queues are started as umac reset is completed for partner chipset\n");
+ 			}
++#ifdef CPTCFG_ATH12K_BONDED_DS_SUPPORT
++			for (i = 0; i < ag->num_chip; i++) {
++				partner_ab = ag->ab[i];
++				if (ab == partner_ab)
++					continue;
++				for (j = 0; j < partner_ab->num_radios; j++) {
++					pdev = &partner_ab->pdevs[j];
++					ar = pdev->ar;
++
++					if (!ar)
++						continue;
++					ath12k_ppeds_partner_link_start_queues(ar);
++				}
++			}
++#endif
++			ath12k_dbg(ab, ATH12K_DBG_MODE1_RECOVERY,
++				   "Queues are started as umac reset is completed for partner chipset\n");
+ 		}
+ 	}
+ 
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -10811,8 +10811,7 @@ static void ath12k_update_obss_color_not
+ 				ath12k_free_bonddev_for_sfe(wdev, vif, link_id);
+ 				arvif->ndev_pvt = NULL;
+ 				arvif->ppe_vp_num = -1;
+-			}
+-			else if (link_ndev) {
++			} else if (link_ndev && !arvif->ndev_pvt->is_bond_enslaved) {
+ 				ath12k_enable_ppe_for_link_netdev(ab, arvif,
+ 								 arvif->ndev_pvt->link_ndev);
+ 				netif_tx_start_all_queues(arvif->ndev_pvt->bond_dev);
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -933,11 +933,19 @@ int ath12k_ppeds_attach(struct ath12k_ba
+ 	}
+ 
+ 	for (i = 0; i < PPE_VP_ENTRIES_MAX; i++) {
++		if (ab->ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1 &&
++		    ab->dp.ppe_vp_profile[i].is_configured)
++			goto skip_vp_reset;
++		else
++			ath12k_dbg(ab, ATH12K_DBG_PPE,
++				   "PPEDS attach reset PPE VP table");
++
+ 		ab->ppe_vp_tbl_registered[i] = 0;
+ 		ab->ppe_vp_search_idx_tbl_set[i] = 0;
+ 		ab->dp.ppe_vp_profile[i].is_configured = false;
+ 	}
+ 
++skip_vp_reset:
+ 	ret = ath12k_ppeds_get_handle(ab);
+ 	if (ret)
+ 		return ret;
+@@ -1001,11 +1009,18 @@ int ath12k_ppeds_detach(struct ath12k_ba
+ 	atomic_dec(&num_ppeds_nodes);
+ 
+ 	for (i = 0; i < PPE_VP_ENTRIES_MAX; i++) {
++		if (ab->ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1 &&
++		    ab->dp.ppe_vp_profile[i].is_configured)
++			goto skip_vp_reset;
++		else
++			ath12k_dbg(ab, ATH12K_DBG_PPE,
++				   "PPEDS deatch reset VP table");
+ 		ab->ppe_vp_tbl_registered[i] = 0;
+ 		ab->ppe_vp_search_idx_tbl_set[i] = 0;
+ 		ab->dp.ppe_vp_profile[i].is_configured = false;
+ 	}
+ 
++skip_vp_reset:
+ 	ath12k_dbg(ab, ATH12K_DBG_PPE, "PPEDS detach success\n");
+ 
+ 	if (ab->ppeds_rx_num_elem) {
+@@ -1079,6 +1094,46 @@ void ath12k_dp_ppeds_stop(struct ath12k_
+ 	ath12k_dbg(ab, ATH12K_DBG_PPE, "PPEDS stop success\n");
+ }
+ 
++void ath12k_ppeds_partner_link_stop_queues(struct ath12k *ar)
++{
++	struct ath12k_link_vif *arvif;
++
++	rtnl_lock();
++	mutex_lock(&ar->conf_mutex);
++	list_for_each_entry(arvif, &ar->arvifs, list) {
++		if (!arvif)
++			continue;
++		if (arvif->ndev_pvt &&
++		    arvif->ndev_pvt->link_ndev)
++			netif_tx_stop_all_queues(arvif->ndev_pvt->link_ndev);
++	}
++	mutex_unlock(&ar->conf_mutex);
++	rtnl_unlock();
++}
++
++void ath12k_ppeds_partner_link_start_queues(struct ath12k *ar)
++{
++	struct ath12k_link_vif *arvif;
++
++	rtnl_lock();
++	mutex_lock(&ar->conf_mutex);
++	list_for_each_entry(arvif, &ar->arvifs, list) {
++		if (!arvif)
++			continue;
++		if (arvif->ndev_pvt) {
++			if (arvif->ndev_pvt->bond_dev &&
++			    !(arvif->ndev_pvt->bond_dev->flags & IFF_UP)) {
++				arvif->ndev_pvt->bond_dev->flags |= IFF_UP;
++				netif_tx_start_all_queues(arvif->ndev_pvt->bond_dev);
++			}
++			if (arvif->ndev_pvt->link_ndev)
++				netif_tx_start_all_queues(arvif->ndev_pvt->link_ndev);
++		}
++	}
++	mutex_unlock(&ar->conf_mutex);
++	rtnl_unlock();
++}
++
+ int ath12k_dp_ppeds_register_soc(struct ath12k_dp *dp,
+ 				 struct dp_ppe_ds_idxs *idx)
+ {
+--- a/drivers/net/wireless/ath/ath12k/ppe.h
++++ b/drivers/net/wireless/ath/ath12k/ppe.h
+@@ -45,5 +45,7 @@ void ath12k_dp_ppeds_service_enable_disa
+ void ath12k_dp_ppeds_interrupt_stop(struct ath12k_base *ab);
+ void ath12k_dp_ppeds_stop(struct ath12k_base *ab);
+ void ath12k_dp_ppeds_interrupt_start(struct ath12k_base *ab);
++void ath12k_ppeds_partner_link_start_queues(struct ath12k *ar);
++void ath12k_ppeds_partner_link_stop_queues(struct ath12k *ar);
+ #endif
+ #endif

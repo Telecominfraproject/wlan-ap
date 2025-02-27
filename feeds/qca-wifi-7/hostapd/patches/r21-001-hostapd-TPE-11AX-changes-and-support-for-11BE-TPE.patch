@@ -1,0 +1,609 @@
+From 0e4c9063e7fcc15fdb94a894fbb63eb9f5fe1e1e Mon Sep 17 00:00:00 2001
+From: Arunpandi Kannan <quic_arunpand@quicinc.com>
+Date: Thu, 14 Mar 2024 09:38:38 +0530
+Subject: [PATCH] hostapd: TPE 11AX changes and support for 11BE TPE
+
+Changes added as per IEEE P802.11be/D4.1 section 9.4.2.160
+
+TPE IE carries configurable power value for each 20MHZ sub
+channel for given bandwidth.
+
+1)Add support to enable tx power envelope IE in probe and
+beacon packets for 11AX and 11BE modes.
+
+2)For 11AX, add support to have more than one power value
+in TPE IE. Add Support to get PSD power values different
+channels based on current BW and operating channel.
+
+3)For 11BE, support to have extension element in TPE IE to
+carry 320 MHZ TPE power values.
+
+4)If a channel is punctured in 11BE, find the minimum BW which
+is not punctured and contains the primary channel. Store the
+PSD values of that BW in 11AX TPE. And store the remaining PSD
+values in extension TPE. Also set the power value of punctured
+channel to minimum possible power value.
+
+Signed-off-by: Arunpandi Kannan <quic_arunpand@quicinc.com>
+---
+ src/ap/beacon.c              |  19 +-
+ src/ap/ieee802_11.c          | 411 +++++++++++++++++++++++++++++------
+ src/common/ieee802_11_defs.h |   8 +-
+ src/drivers/driver.h         |   4 +
+ 4 files changed, 374 insertions(+), 68 deletions(-)
+
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index 0871100..5ba2ffe 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -947,11 +947,14 @@ static u8 * hostapd_gen_probe_resp(struc
+ 		if (is_6ghz_op_class(hapd->iconf->op_class)) {
+ 			buflen += sizeof(struct ieee80211_he_6ghz_oper_info) +
+ 				3 + sizeof(struct ieee80211_he_6ghz_band_cap);
++			buflen += 3 + MAX_PSD_TPE_POWER_COUNT +
++				  1 + MAX_PSD_TPE_EXT_POWER_COUNT;
+ 			 /* An additional Transmit Power Envelope element for
+ 			  * subordinate client */
+ 			if (hapd->iconf->he_6ghz_reg_pwr_type ==
+ 			    HE_6GHZ_INDOOR_AP)
+-				buflen += 4;
++				buflen += 3 + MAX_PSD_TPE_POWER_COUNT +
++					  1 + MAX_PSD_TPE_EXT_POWER_COUNT;
+ 		}
+ 	}
+ #endif /* CONFIG_IEEE80211AX */
+@@ -2015,9 +2018,11 @@ static u8 * hostapd_gen_fils_discovery(s
+ #ifdef CONFIG_IEEE80211AX
+ 	/* Transmit Power Envelope element(s) */
+ 	if (is_6ghz_op_class(hapd->iconf->op_class)) {
+-		total_len += 4;
++		total_len += 3 + MAX_PSD_TPE_POWER_COUNT +
++			     1 + MAX_PSD_TPE_EXT_POWER_COUNT;
+ 		if (hapd->iconf->he_6ghz_reg_pwr_type == HE_6GHZ_INDOOR_AP)
+-			total_len += 4;
++			total_len += 3 + MAX_PSD_TPE_POWER_COUNT +
++				     1 + MAX_PSD_TPE_EXT_POWER_COUNT;
+ 	}
+ #endif /* CONFIG_IEEE80211AX */
+ 
+@@ -2220,11 +2225,15 @@ int ieee802_11_build_ap_params(struct ho
+ 		if (is_6ghz_op_class(hapd->iconf->op_class)) {
+ 			tail_len += sizeof(struct ieee80211_he_6ghz_oper_info) +
+ 				3 + sizeof(struct ieee80211_he_6ghz_band_cap);
++			tail_len += 3 + MAX_PSD_TPE_POWER_COUNT +
++				    1 + MAX_PSD_TPE_EXT_POWER_COUNT;
+ 			 /* An additional Transmit Power Envelope element for
+ 			  * subordinate client */
+ 			if (hapd->iconf->he_6ghz_reg_pwr_type ==
+-			    HE_6GHZ_INDOOR_AP)
+-				tail_len += 4;
++			    HE_6GHZ_INDOOR_AP) {
++				tail_len += 3 + MAX_PSD_TPE_POWER_COUNT +
++					    1 + MAX_PSD_TPE_EXT_POWER_COUNT;
++			}
+ 		}
+ 	}
+ #endif /* CONFIG_IEEE80211AX */
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index b54e688..685a9d7 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -7269,14 +7269,30 @@ static u8 hostapd_get_6g_tx_power(struct
+ }
+ #endif
+ 
+-static u8 * hostapd_add_tpe_info(u8 *eid, u8 tx_pwr_count,
+-				 enum max_tx_pwr_interpretation tx_pwr_intrpn,
+-				 u8 tx_pwr_cat, u8 tx_pwr)
++static u8 *hostapd_add_tpe_info(u8 *eid, enum max_tx_pwr_interpretation tx_pwr_intrpn,
++				u8 tx_pwr_count, s8 *tx_pwr_array,
++				u8 tx_pwr_ext_count, s8 *tx_pwr_ext_array,
++				u8 tx_pwr_cat)
+ {
++	u8 *length, total_tx_pwr_count;
+ 	int i;
+ 
++	if (!tx_pwr_array || (tx_pwr_ext_count && !tx_pwr_ext_array))
++		return eid;
++
++	if (tx_pwr_intrpn == LOCAL_EIRP_PSD || tx_pwr_intrpn == REGULATORY_CLIENT_EIRP_PSD) {
++		total_tx_pwr_count = tx_pwr_count ? 1 << (tx_pwr_count - 1) : 1;
++	} else if (tx_pwr_intrpn == LOCAL_EIRP || tx_pwr_intrpn == REGULATORY_CLIENT_EIRP) {
++		total_tx_pwr_count = tx_pwr_count + 1;
++	} else {
++		wpa_printf(MSG_ERROR, "Invalid tx power interpretation:%d", tx_pwr_intrpn);
++		return eid;
++	}
++
++	/* Maximum Transmit Power field */
+ 	*eid++ = WLAN_EID_TRANSMIT_POWER_ENVELOPE; /* Element ID */
+-	*eid++ = 2 + tx_pwr_count; /* Length */
++	length = eid;
++	*eid++ = 1 + total_tx_pwr_count; /* Length */
+ 
+ 	/*
+ 	 * Transmit Power Information field
+@@ -7286,24 +7302,327 @@ static u8 * hostapd_add_tpe_info(u8 *eid
+ 	 */
+ 	*eid++ = tx_pwr_count | (tx_pwr_intrpn << 3) | (tx_pwr_cat << 6);
+ 
+-	/* Maximum Transmit Power field */
+-	for (i = 0; i <= tx_pwr_count; i++)
+-		*eid++ = tx_pwr;
++	for (i = 0; i < total_tx_pwr_count; i++)
++		*eid++ = tx_pwr_array[i];
+ 
++#ifdef CONFIG_IEEE80211BE
++	if (tx_pwr_intrpn == LOCAL_EIRP || tx_pwr_intrpn == REGULATORY_CLIENT_EIRP) {
++		if (tx_pwr_ext_count) {
++			if (tx_pwr_ext_count > MAX_EIRP_TPE_POWER_EXT_COUNT) {
++				wpa_printf(MSG_WARNING, "Invalid EIRP tx power extension count:%d",
++					   tx_pwr_ext_count);
++				return eid;
++			}
++			*eid++ = *tx_pwr_ext_array;
++			*length += tx_pwr_ext_count;
++		}
++	} else if (tx_pwr_intrpn == LOCAL_EIRP_PSD || tx_pwr_intrpn == REGULATORY_CLIENT_EIRP_PSD) {
++		if (tx_pwr_ext_count) {
++			if (tx_pwr_ext_count > MAX_PSD_TPE_EXT_POWER_COUNT) {
++				wpa_printf(MSG_WARNING, "Invalid PSD tx power extension count:%d",
++					   tx_pwr_ext_count);
++				return eid;
++			}
++			*eid++ = tx_pwr_ext_count;
++			for (i = 0; i < tx_pwr_ext_count; i++)
++				*eid++ = tx_pwr_ext_array[i];
++			*length += 1 + tx_pwr_ext_count;
++		}
++	} else {
++		wpa_printf(MSG_ERROR, "Invalid TPE power interpretation");
++	}
++#endif
+ 	return eid;
+ }
+ 
+-u8 * hostapd_eid_txpower_envelope(struct hostapd_data *hapd, u8 *eid)
++static int get_chan_list(struct hostapd_data *hapd, int *non_11be_start_idx,
++			 int *chan_start_idx, int *non_11be_chan_count,
++			 int *total_chan_count, struct ieee_chan_data chan_data)
+ {
++	u8 seg0 = hostapd_get_oper_centr_freq_seg0_idx(hapd->iconf);
++	u8 seg1 = hostapd_get_oper_centr_freq_seg1_idx(hapd->iconf);
+ 	struct hostapd_iface *iface = hapd->iface;
+-	struct hostapd_config *iconf = iface->conf;
++	enum oper_chan_width chan_width = hostapd_get_oper_chwidth(iface->conf);
++	int start_chan = -1, non11be_start_chan = -1, i = 0, res = -1;
+ 	struct hostapd_hw_modes *mode = iface->current_mode;
++	int sec_chan = iface->conf->secondary_channel;
++	u8 pri_chan = iface->conf->channel;
+ 	struct hostapd_channel_data *chan;
++
++	switch (chan_width) {
++	case CONF_OPER_CHWIDTH_320MHZ:
++		non11be_start_chan = start_chan = seg0 - 30;
++		*total_chan_count = 16;
++		if (pri_chan > seg0)
++			non11be_start_chan = seg0 + 2;
++		*non_11be_chan_count = 8;
++		break;
++	case CONF_OPER_CHWIDTH_160MHZ:
++		non11be_start_chan = start_chan = seg0 - 14;
++		*non_11be_chan_count = *total_chan_count = 8;
++		break;
++	case CONF_OPER_CHWIDTH_80MHZ:
++		non11be_start_chan = start_chan = seg0 - 6;
++		*non_11be_chan_count = *total_chan_count = 4;
++		break;
++	case CONF_OPER_CHWIDTH_USE_HT:
++		*non_11be_chan_count = *total_chan_count = 1;
++		non11be_start_chan = start_chan = pri_chan;
++		if (sec_chan) {
++			if (sec_chan == -1)
++				non11be_start_chan = start_chan = pri_chan - 4;
++			*non_11be_chan_count = *total_chan_count = 2;
++		}
++		break;
++	default:
++		wpa_printf(MSG_ERROR, "unsupported BW :%d", chan_width);
++		break;
++	}
++
++	if (hapd->iconf->ru_punct_bitmap) {
++		punct_update_legacy_bw(hapd->iconf->ru_punct_bitmap, pri_chan,
++				       &chan_width, &seg0, &seg1);
++		switch (chan_width) {
++		case CONF_OPER_CHWIDTH_160MHZ:
++			non11be_start_chan = seg0 - 14;
++			*non_11be_chan_count = 8;
++			break;
++		case CONF_OPER_CHWIDTH_80MHZ:
++			non11be_start_chan = seg0 - 6;
++			*non_11be_chan_count = 4;
++			break;
++		case CONF_OPER_CHWIDTH_USE_HT:
++			if (!seg0) {
++				non11be_start_chan = pri_chan;
++				*non_11be_chan_count = 1;
++			} else {
++				non11be_start_chan = seg0 - 2;
++				*non_11be_chan_count = 2;
++			}
++			break;
++		default:
++			wpa_printf(MSG_ERROR,
++				   "unsupported BW for puncturing:%d",
++				   chan_width);
++			break;
++		}
++	}
++	for (i = 0; i < chan_data.num_channels; i++) {
++		chan = &chan_data.channels[i];
++		if (chan->chan == non11be_start_chan) {
++			*non_11be_start_idx = i;
++			res++;
++		}
++		if (chan->chan == start_chan) {
++			*chan_start_idx = i;
++			res++;
++		}
++		if (res > 0)
++			break;
++	}
++	if (res > 0)
++		return 0;
++
++	wpa_printf(MSG_ERROR, "Invalid channel and bw");
++	return -1;
++}
++
++static u8 num_psd_values_to_psd_count(int n_chans)
++{
++	switch (n_chans) {
++	case 1:
++		return 1;
++	case 2:
++		return 2;
++	case 4:
++		return 3;
++	case 8:
++		return 4;
++	default:
++		return 0;
++	}
++}
++
++static int get_psd_values(struct hostapd_data *hapd, int non_11be_start_idx,
++			  int chan_start_idx, int non_11be_chan_count,
++			  int total_chan_count, u8 *tx_pwr_count,
++			  s8 *tx_pwr_array, u8 *tx_pwr_ext_count,
++			  s8 *tx_pwr_ext_array, int pwr_mode, struct ieee_chan_data chan_data)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	u16 ru_punct_bitmap = iface->conf->ru_punct_bitmap;
++	u16 non_be_chan_index_map = 0;
++	int is_different_psd = 0, non11be_chan_pos = non_11be_start_idx - chan_start_idx;
++	s8 psd_pwr;
++	int i = 0, j = 0;
++
++	if (!tx_pwr_array || ((total_chan_count - non_11be_chan_count) && !tx_pwr_ext_array))
++		return -1;
++	if (chan_start_idx >= chan_data.num_channels ||
++	    chan_start_idx + total_chan_count >= chan_data.num_channels) {
++		wpa_printf(MSG_ERROR, "Invalid start index: %d, num_chan:%d",
++			   chan_start_idx, total_chan_count);
++		return -1;
++	}
++
++	psd_pwr = chan_data.channels[non_11be_start_idx].psd_values[pwr_mode];
++	for (i = non_11be_start_idx; i < non_11be_start_idx + non_11be_chan_count;
++	     i++, non11be_chan_pos++) {
++		if (i >= chan_data.num_channels) {
++			wpa_printf(MSG_ERROR, "Invalid channel index :%d", i);
++			return -1;
++		}
++		non_be_chan_index_map |= BIT(non11be_chan_pos);
++		*tx_pwr_array = chan_data.channels[i].psd_values[pwr_mode] * 2;
++		tx_pwr_array++;
++		if (!is_different_psd && (psd_pwr != chan_data.channels[i].psd_values[pwr_mode]))
++			is_different_psd = 1;
++	}
++
++	if (!is_different_psd && !ru_punct_bitmap) {
++		*tx_pwr_count = 0;
++	} else {
++		*tx_pwr_count = num_psd_values_to_psd_count(non_11be_chan_count);
++		if (*tx_pwr_count == 0) {
++			wpa_printf(MSG_ERROR, "Invalid channel count:%d", non_11be_chan_count);
++			return -1;
++		}
++	}
++#ifdef CONFIG_IEEE80211BE
++	/* For 11be the TPE extension parameter added if the bw is 320MHZ or if
++	 * any channel is punctured in 320MHZ/160MHZ/80MHZ
++	 */
++	for (i = chan_start_idx, j = 0; i < chan_start_idx + total_chan_count; i++, j++) {
++		if (i >= chan_data.num_channels) {
++			wpa_printf(MSG_ERROR, "Invalid channel index :%d", i);
++			return -1;
++		}
++		if (non_be_chan_index_map & BIT(j)) { /* filled in 11ax TPE*/
++			continue;
++		}
++		if (ru_punct_bitmap & BIT(j)) {
++			/* Punctured channel. set power value to
++			 * RNR_20_MHZ_PSD_MAX_TXPOWER (127) which
++			 * indicates "no maximum transmit power is specified"
++			 */
++			*tx_pwr_ext_array = RNR_20_MHZ_PSD_MAX_TXPOWER;
++		} else {
++			*tx_pwr_ext_array = chan_data.channels[i].psd_values[pwr_mode] * 2;
++		}
++		tx_pwr_ext_array++;
++		*tx_pwr_ext_count += 1;
++	}
++#endif
++	return 0;
++}
++
++static int set_ieee_order_chan_list(struct hostapd_hw_modes *mode,
++				       struct ieee_chan_data *chan_data)
++{
++	int ieee_6g_chan[60] = {2,
++				1, 5, 9, 13, 17, 21, 25, 29,
++				33, 37, 41, 45, 49, 53, 57, 61,
++				65, 69, 73, 77, 81, 85, 89, 93,
++				97, 101, 105, 109, 113, 117, 121, 125,
++				129, 133, 137, 141, 145, 149, 153, 157,
++				161, 165, 169, 173, 177, 181, 185, 189,
++				193, 197, 201, 205, 209, 213, 217, 221,
++				225, 229, 233};
++	struct hostapd_channel_data *channels =  NULL, tmp_chan;
++	int i, j;
++	int chan_data_size = mode->num_channels * sizeof(struct hostapd_channel_data);
++
++	if (mode->num_channels == 0) {
++		wpa_printf(MSG_ERROR, "Invalid num channels or chan data");
++		return -1;
++	}
++
++	channels = os_malloc(chan_data_size);
++	if (channels ==  NULL) {
++		wpa_printf(MSG_ERROR, "Failed to alloc memory");
++		return -1;
++	}
++
++	os_memcpy(channels, mode->channels, chan_data_size);
++
++	for (i = 0; i < mode->num_channels && i < 60; i++) {
++		if (ieee_6g_chan[i] != channels[i].chan) {
++			for (j = 0; j < mode->num_channels; j++) {
++				if (ieee_6g_chan[i] == channels[j].chan) {
++					os_memcpy(&tmp_chan, &channels[j],
++						  sizeof(struct hostapd_channel_data));
++					os_memcpy(&channels[j], &channels[i],
++						  sizeof(struct hostapd_channel_data));
++					os_memcpy(&channels[i], &tmp_chan,
++						  sizeof(struct hostapd_channel_data));
++				}
++			}
++		}
++	}
++	chan_data->channels = channels;
++	chan_data->num_channels = mode->num_channels;
++
++	return 0;
++}
++
++static void free_ieee_ordered_chan_list(struct ieee_chan_data *chan_data)
++{
++	os_free(chan_data->channels);
++}
++
++static u8 *hostapd_add_psd_tpe(struct hostapd_data *hapd, u8 pwr_mode, u8 *eid,
++			       u8 tx_pwr_cat, enum max_tx_pwr_interpretation tx_pwr_intrpn)
++{
++	s8 tx_pwr_ext_array[MAX_PSD_TPE_EXT_POWER_COUNT] = {0};
++	int non_11be_chan_count = 0, total_chan_count = 0;
++	int non_11be_start_idx = 0, chan_start_idx = 0;
++	s8 tx_pwr_array[MAX_PSD_TPE_POWER_COUNT] = {0};
++	u8 tx_pwr_count = 0, tx_pwr_ext_count = 0;
++	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	struct ieee_chan_data chan_data;
++
++	if (set_ieee_order_chan_list(mode, &chan_data))
++		return eid;
++#ifdef REG_DOM_SUPPORT_TX_POWER
++	if (get_chan_list(hapd, &non_11be_start_idx, &chan_start_idx,
++			  &non_11be_chan_count, &total_chan_count, chan_data)) {
++		wpa_printf(MSG_ERROR, "Unable to get chan list");
++		goto free;
++	}
++	if (get_psd_values(hapd, non_11be_start_idx, chan_start_idx,
++			   non_11be_chan_count, total_chan_count, &tx_pwr_count,
++			   tx_pwr_array, &tx_pwr_ext_count, tx_pwr_ext_array,
++			   pwr_mode, chan_data)) {
++		wpa_printf(MSG_ERROR, "failed to get the PSD values");
++		goto free;
++	}
++#else
++	tx_pwr_array[0] = (hostapd_get_6g_tx_power(hapd,
++					  iconf->he_6ghz_reg_pwr_type,
++					  REG_DEFAULT_CLIENT) * 2);
++#endif /* REG_DOM_SUPPORT_TX_POWER */
++	eid = hostapd_add_tpe_info(eid, tx_pwr_intrpn, tx_pwr_count,
++				   tx_pwr_array, tx_pwr_ext_count, tx_pwr_ext_array,
++				   tx_pwr_cat);
++
++free:
++	free_ieee_ordered_chan_list(&chan_data);
++
++	return eid;
++}
++
++u8 *hostapd_eid_txpower_envelope(struct hostapd_data *hapd, u8 *eid)
++{
++	s8 eirp_tx_pwr_array[MAX_TPE_EIRP_NUM_POWER_SUPPORTED];
++	u8 channel, tx_pwr_count, local_pwr_constraint, pwr_mode;
++	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	struct hostapd_config *iconf = iface->conf;
++	struct hostapd_channel_data *chan;
++	s8 max_tx_power, tx_pwr;
+ 	int dfs, i;
+-	u8 channel, tx_pwr_count, local_pwr_constraint;
+-	int max_tx_power;
+-	u8 tx_pwr;
+-	s8 psd;
+ 
+ 	if (!mode)
+ 		return eid;
+@@ -7311,15 +7630,6 @@ u8 * hostapd_eid_txpower_envelope(struct
+ 	if (ieee80211_freq_to_chan(iface->freq, &channel) == NUM_HOSTAPD_MODES)
+ 		return eid;
+ 
+-	for (i = 0; i < mode->num_channels; i++) {
+-		if (mode->channels[i].freq == iface->freq)
+-			break;
+-	}
+-	if (i == mode->num_channels)
+-		return eid;
+-
+-	chan = &mode->channels[i];
+-
+ #ifdef CONFIG_IEEE80211AX
+ 	/* IEEE Std 802.11ax-2021, Annex E.2.7 (6 GHz band in the United
+ 	 * States): An AP that is an Indoor Access Point per regulatory rules
+@@ -7331,52 +7641,31 @@ u8 * hostapd_eid_txpower_envelope(struct
+ 	 *	Unit interpretation = Regulatory client EIRP PSD
+ 	 */
+ 	if (is_6ghz_op_class(iconf->op_class)) {
+-		enum max_tx_pwr_interpretation tx_pwr_intrpn;
+-
+-		/* Same Maximum Transmit Power for all 20 MHz bands */
+-		tx_pwr_count = 0;
+-		tx_pwr_intrpn = REGULATORY_CLIENT_EIRP_PSD;
+-
+-		psd = chan->psd_values[NL80211_REG_REGULAR_CLIENT_LPI +
+-				       iconf->he_6ghz_reg_pwr_type];
+-#ifdef REG_DOM_SUPPORT_TX_POWER
+-		if (psd)
+-			tx_pwr = psd * 2;
+-		else
+-			tx_pwr = chan->max_tx_power;
+-#else
+-		tx_pwr = (hostapd_get_6g_tx_power(hapd,
+-						  iconf->he_6ghz_reg_pwr_type,
+-						  REG_DEFAULT_CLIENT) * 2);
+-#endif /* REG_DOM_SUPPORT_TX_POWER */
+-		eid = hostapd_add_tpe_info(eid, tx_pwr_count, tx_pwr_intrpn,
+-					   REG_DEFAULT_CLIENT, tx_pwr);
++		pwr_mode = NL80211_REG_REGULAR_CLIENT_LPI + iconf->he_6ghz_reg_pwr_type;
++		eid = hostapd_add_psd_tpe(hapd, pwr_mode, eid, REG_DEFAULT_CLIENT,
++					  REGULATORY_CLIENT_EIRP_PSD);
+ 
+ 		/* Indoor Access Point must include an additional TPE for
+ 		 * subordinate devices */
+ 		if (iconf->he_6ghz_reg_pwr_type == HE_6GHZ_INDOOR_AP) {
+-			psd = chan->psd_values[NL80211_REG_AP_LPI +
+-					       iconf->he_6ghz_reg_pwr_type];
+-#ifdef REG_DOM_SUPPORT_TX_POWER
+-			if (psd)
+-				tx_pwr = psd * 2;
+-			else
+-				tx_pwr = chan->max_tx_power;
+-#else
+-			tx_pwr = (hostapd_get_6g_tx_power(hapd,
+-							  iconf->he_6ghz_reg_pwr_type,
+-							  REG_SUBORDINATE_CLIENT) * 2);
+-#endif /* REG_DOM_SUPPORT_TX_POWER */
+-			eid = hostapd_add_tpe_info(eid, tx_pwr_count,
+-						   tx_pwr_intrpn,
+-						   REG_SUBORDINATE_CLIENT,
+-						   tx_pwr);
++			pwr_mode = NL80211_REG_SUBORDINATE_CLIENT_LPI;
++			eid = hostapd_add_psd_tpe(hapd, pwr_mode, eid, REG_SUBORDINATE_CLIENT,
++						  REGULATORY_CLIENT_EIRP_PSD);
+ 		}
+-
+ 		return eid;
+ 	}
+ #endif /* CONFIG_IEEE80211AX */
+ 
++	for (i = 0; i < mode->num_channels; i++) {
++		if (mode->channels[i].freq == iface->freq)
++			break;
++	}
++
++	if (i == mode->num_channels)
++		return eid;
++
++	chan = &mode->channels[i];
++
+ 	switch (hostapd_get_oper_chwidth(iconf)) {
+ 	case CONF_OPER_CHWIDTH_USE_HT:
+ 		if (iconf->secondary_channel == 0) {
+@@ -7448,9 +7737,12 @@ u8 * hostapd_eid_txpower_envelope(struct
+ 	else
+ 		tx_pwr = max_tx_power;
+ 
+-	return hostapd_add_tpe_info(eid, tx_pwr_count, LOCAL_EIRP,
+-				    0 /* Reserved for bands other than 6 GHz */,
+-				    tx_pwr);
++	for (i = 0; i < tx_pwr_count; i++)
++		eirp_tx_pwr_array[0] = tx_pwr;
++
++	eid = hostapd_add_tpe_info(eid, LOCAL_EIRP, tx_pwr_count, eirp_tx_pwr_array,
++			           0, NULL, REG_MAX_CLIENT_TYPE);
++	return eid;
+ }
+ 
+ 
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index a8abd03..47851f0 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -2060,8 +2060,14 @@ enum max_tx_pwr_interpretation {
+ enum reg_6g_client_type {
+ 	REG_DEFAULT_CLIENT = 0,
+ 	REG_SUBORDINATE_CLIENT = 1,
++	REG_MAX_CLIENT_TYPE = 2,
+ };
+ 
++#define MAX_EIRP_TPE_POWER_EXT_COUNT		1
++#define MAX_PSD_TPE_POWER_COUNT			8
++#define MAX_PSD_TPE_EXT_POWER_COUNT		15
++#define MAX_TPE_EIRP_NUM_POWER_SUPPORTED	4
++
+ #define RRM_CAPABILITIES_IE_LEN 5
+ 
+ /* IEEE Std 802.11-2012, 8.5.7.4 - Link Measurement Request frame format */
+@@ -2507,7 +2513,7 @@ struct ieee80211_he_mu_edca_parameter_se
+ #define RNR_BSS_PARAM_MEMBER_CO_LOCATED_ESS         BIT(4)
+ #define RNR_BSS_PARAM_UNSOLIC_PROBE_RESP_ACTIVE     BIT(5)
+ #define RNR_BSS_PARAM_CO_LOCATED                    BIT(6)
+-#define RNR_20_MHZ_PSD_MAX_TXPOWER                  255 /* dBm */
++#define RNR_20_MHZ_PSD_MAX_TXPOWER                  127 /* dBm */
+ 
+ /* IEEE P802.11be/D2.3, 9.4.2.311 - EHT Operation element */
+ 
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 97fad98..0dfc40d 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -254,6 +254,10 @@ struct ieee80211_edmg_config {
+ 	enum edmg_bw_config bw_config;
+ };
+ 
++struct ieee_chan_data {
++	int num_channels;
++	struct hostapd_channel_data *channels;
++};
+ /**
+  * struct hostapd_hw_modes - Supported hardware mode information
+  */
+-- 
+2.17.1
+

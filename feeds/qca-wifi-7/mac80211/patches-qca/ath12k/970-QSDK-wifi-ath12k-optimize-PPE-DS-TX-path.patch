@@ -1,0 +1,742 @@
+From 613adcd27860aa6c8c5ed5f5cc46e925436c5446 Mon Sep 17 00:00:00 2001
+From: Pradeep Kumar Chitrapu <quic_pradeepc@quicinc.com>
+Date: Thu, 11 Jul 2024 13:39:22 -0700
+Subject: [PATCH] QSDK: wifi: ath12k: optimize PPE DS TX path
+
+The changes include:
+ - remove ppeds_desc_used_list and instead use in_use flag to
+   determine which descriptors are in use. This will help in
+   reducing number of instructions in per packet path.
+ - Remove un-necessary check of fragmented frames in PPE DS
+   TX completions.
+ - use fast skb free even when TX completion source is firmware.
+ - bulk releasing decriptors into PPE DS hotlist:
+	Currently, during tx completions for PPE DS descriptors,
+	each descriptor fetched from hardware ring is added
+	separately to dp->ppeds_tx_desc_reuse_list, causing next
+	and prev pointers of the nodes updated on per descriptor
+	basis. Convert this to maintain in local list and moving
+	into ppeds_tx_desc_reuse_list as bulk operation. This
+	showed 25% improvement in single core CPU usage in 5G
+	240 MHz + 6G 320 MHz MLO UDP Downlink scenario.
+
+Patch-dependency: 951-c-QSDK-wifi-ath12k-support-DS-for-SLO-and-MLO-AP-modes.patch
+Patch-work: None
+
+Signed-off-by: Pradeep Kumar Chitrapu <quic_pradeepc@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c    | 96 +++++++++++--------------
+ drivers/net/wireless/ath/ath12k/dp.h    |  2 +-
+ drivers/net/wireless/ath/ath12k/dp_tx.c | 38 +++++-----
+ 3 files changed, 60 insertions(+), 76 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -2024,43 +2024,37 @@ void ath12k_dp_ppeds_tx_cmem_init(struct
+ 
+ static void ath12k_dp_ppeds_tx_desc_cleanup(struct ath12k_base *ab)
+ {
+-	struct ath12k_ppeds_tx_desc_info *ppeds_tx_desc_info, *tmp2;
++	struct ath12k_ppeds_tx_desc_info *ppeds_tx_descs;
+ 	struct ath12k_dp *dp = &ab->dp;
+ 	struct sk_buff *skb;
++	int i, j;
+ 
+ 	/* PPEDS TX Descriptor cleanup */
+ 	spin_lock_bh(&dp->ppeds_tx_desc_lock);
+ 
+-	/* clean up used desc list */
+-	list_for_each_entry_safe(ppeds_tx_desc_info, tmp2,
+-				 &dp->ppeds_tx_desc_used_list, list) {
+-		list_move_tail(&ppeds_tx_desc_info->list, &dp->ppeds_tx_desc_free_list);
+-		skb = ppeds_tx_desc_info->skb;
+-		ppeds_tx_desc_info->skb = NULL;
+-		if (!skb) {
+-			WARN_ON_ONCE(1);
+-			continue;
+-		}
+-		dma_unmap_single_attrs(ab->dev, ATH12K_SKB_CB(skb)->paddr,
+-				       skb->len, DMA_TO_DEVICE,
+-				       DMA_ATTR_SKIP_CPU_SYNC);
+-		dev_kfree_skb_any(skb);
+-	}
++	for (i = 0; i < ATH12K_NUM_PPEDS_TX_SPT_PAGES; i++) {
++		ppeds_tx_descs = dp->spt_info->ppedstxbaddr[i];
+ 
+-	/* clean up descriptors and skbs from reuse list */
+-	list_for_each_entry_safe(ppeds_tx_desc_info, tmp2,
+-				 &dp->ppeds_tx_desc_reuse_list, list) {
+-		list_move_tail(&ppeds_tx_desc_info->list, &dp->ppeds_tx_desc_free_list);
+-		skb = ppeds_tx_desc_info->skb;
+-		ppeds_tx_desc_info->skb = NULL;
+-		if (!skb) {
+-			WARN_ON_ONCE(1);
+-			continue;
++		for (j = 0; j < ATH12K_MAX_SPT_ENTRIES; j++) {
++			if (!ppeds_tx_descs[j].in_use)
++				continue;
++
++			skb = ppeds_tx_descs[j].skb;
++			if (!skb) {
++				WARN_ON(1);
++				continue;
++			}
++
++			ppeds_tx_descs[j].skb = NULL;
++			ppeds_tx_descs[j].in_use = false;
++			dma_unmap_single_attrs(ab->dev, ppeds_tx_descs[j].paddr,
++					       skb->len, DMA_TO_DEVICE,
++					       DMA_ATTR_SKIP_CPU_SYNC);
++
++			dev_kfree_skb_any(skb);
++
++			list_add_tail(&ppeds_tx_descs[j].list, &dp->ppeds_tx_desc_free_list);
+ 		}
+-		dma_unmap_single_attrs(ab->dev, ppeds_tx_desc_info->paddr,
+-				       skb->len, DMA_TO_DEVICE,
+-				       DMA_ATTR_SKIP_CPU_SYNC);
+-		dev_kfree_skb_any(skb);
+ 	}
+ 
+ 	dp->ppeds_tx_desc_reuse_list_len = 0;
+@@ -2070,10 +2064,10 @@ static void ath12k_dp_ppeds_tx_desc_clea
+ 
+ int ath12k_dp_cc_ppeds_desc_cleanup(struct ath12k_base *ab)
+ {
+-	struct ath12k_ppeds_tx_desc_info *ppeds_tx_desc_info, *tmp2;
++	struct ath12k_ppeds_tx_desc_info *ppeds_tx_descs;
+ 	struct ath12k_dp *dp = &ab->dp;
+ 	struct sk_buff *skb;
+-	int i;
++	int i, j;
+ 
+ 	if (!dp->spt_info) {
+ 		ath12k_err(ab,"ath12k_dp_cc_ppeds_desc_cleanup failed");
+@@ -2083,32 +2077,26 @@ int ath12k_dp_cc_ppeds_desc_cleanup(stru
+ 	/* PPEDS TX Descriptor cleanup */
+ 	spin_lock_bh(&dp->ppeds_tx_desc_lock);
+ 
+-	/* clean up used desc list */
+-	list_for_each_entry_safe(ppeds_tx_desc_info, tmp2,
+-				 &dp->ppeds_tx_desc_used_list, list) {
+-		list_del(&ppeds_tx_desc_info->list);
+-		skb = ppeds_tx_desc_info->skb;
+-		if (!skb)
+-			continue;
++	for (i = 0; i < ATH12K_NUM_PPEDS_TX_SPT_PAGES; i++) {
+ 
+-		dma_unmap_single(ab->dev, ATH12K_SKB_CB(skb)->paddr,
+-				 skb->len, DMA_TO_DEVICE);
+-		dev_kfree_skb_any(skb);
+-	}
++		ppeds_tx_descs = dp->spt_info->ppedstxbaddr[i];
+ 
+-	/* clean up descriptors and skbs from reuse list */
+-	list_for_each_entry_safe(ppeds_tx_desc_info, tmp2,
+-				 &dp->ppeds_tx_desc_reuse_list, list) {
+-		list_del(&ppeds_tx_desc_info->list);
+-		skb = ppeds_tx_desc_info->skb;
+-		if (!skb)
+-			continue;
++		for (j = 0; j < ATH12K_MAX_SPT_ENTRIES; j++) {
++			skb = ppeds_tx_descs[j].skb;
+ 
+-		dma_unmap_single(ab->dev, ppeds_tx_desc_info->paddr,
+-				 skb->len, DMA_TO_DEVICE);
+-		dev_kfree_skb_any(skb);
++			if (!skb)
++				continue;
++
++			ppeds_tx_descs[j].skb = NULL;
++			ppeds_tx_descs[j].in_use = false;
++			ppeds_tx_descs[j].paddr = NULL;
++
++			dev_kfree_skb_any(skb);
++		}
+ 	}
+ 
++	dp->ppeds_tx_desc_reuse_list_len = 0;
++
+ 	for (i = 0; i < ATH12K_NUM_PPEDS_TX_SPT_PAGES; i++) {
+ 		if (!dp->spt_info->ppedstxbaddr[i])
+ 			continue;
+@@ -2133,7 +2121,6 @@ int ath12k_dp_cc_ppeds_desc_init(struct
+ 
+ 	INIT_LIST_HEAD(&dp->ppeds_tx_desc_free_list);
+ 	INIT_LIST_HEAD(&dp->ppeds_tx_desc_reuse_list);
+-	INIT_LIST_HEAD(&dp->ppeds_tx_desc_used_list);
+ 	spin_lock_init(&dp->ppeds_tx_desc_lock);
+ 	dp->ppeds_tx_desc_reuse_list_len = 0;
+ 
+@@ -2156,6 +2143,7 @@ int ath12k_dp_cc_ppeds_desc_init(struct
+ 		for (j = 0; j < ATH12K_MAX_SPT_ENTRIES; j++) {
+ 			ppt_idx = ATH12K_PPEDS_TX_SPT_PAGE_OFFSET + i;
+ 			ppeds_tx_descs[j].desc_id = ath12k_dp_cc_cookie_gen(ppt_idx, j);
++			ppeds_tx_descs[j].in_use = false;
+ 			list_add_tail(&ppeds_tx_descs[j].list,
+ 				      &dp->ppeds_tx_desc_free_list);
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -22,6 +22,7 @@ struct ath12k_ext_irq_grp;
+ 
+ #define DP_MON_PURGE_TIMEOUT_MS     100
+ #define DP_MON_SERVICE_BUDGET       128
++#define DP_PPEDS_SERVICE_BUDGET     256
+ 
+ struct dp_srng {
+ 	u32 *vaddr_unaligned;
+@@ -47,6 +48,7 @@ struct dp_ppeds_tx_comp_ring {
+ 	struct hal_wbm_completion_ring_tx *tx_status;
+ 	int tx_status_head;
+ 	int tx_status_tail;
++	u8 macid[DP_PPEDS_SERVICE_BUDGET];
+ };
+ #endif
+ 
+@@ -227,7 +229,7 @@ struct ath12k_pdev_dp {
+ #define ATH12K_SHADOW_CTRL_TIMER_INTERVAL 10
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+-#define ATH12K_NUM_POOL_PPEDS_TX_DESC 0x10000
++#define ATH12K_NUM_POOL_PPEDS_TX_DESC 0x8000
+ #else
+ #define ATH12K_NUM_POOL_PPEDS_TX_DESC 0
+ #endif
+@@ -350,6 +352,7 @@ struct ath12k_ppeds_tx_desc_info {
+ 	struct sk_buff *skb;
+ 	dma_addr_t paddr;
+ 	u32 desc_id; /* Cookie */
++	bool in_use;
+ 	u8 mac_id;
+ 	u8 pool_id;
+ 	u8 flags;
+@@ -472,7 +475,6 @@ struct ath12k_dp {
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ 	struct list_head ppeds_tx_desc_free_list;
+ 	struct list_head ppeds_tx_desc_reuse_list;
+-	struct list_head ppeds_tx_desc_used_list;
+ 	int ppeds_tx_desc_reuse_list_len;
+ 	/* protects the free and used desc lists */
+ 	spinlock_t ppeds_tx_desc_lock;
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -101,68 +101,84 @@ enum hal_encrypt_type ath12k_dp_tx_get_e
+ }
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+-#define ATH12K_PPEDS_HOTLIST_LEN_MAX 1024
+-struct sk_buff *
+-ath12k_dp_ppeds_tx_release_desc_nolock(struct ath12k_dp *dp,
+-				struct ath12k_ppeds_tx_desc_info *tx_desc)
++static void
++ath12k_dp_ppeds_tx_release_desc_list_bulk(struct ath12k_dp *dp,
++					  struct list_head *local_list,
++					  int local_list_len)
+ {
+-	struct sk_buff *skb = NULL;
++	struct ath12k_ppeds_tx_desc_info *desc = NULL, *first_desc = NULL, *last_desc = NULL, *tmp;
++	int hotlist_remaining_len;
++	struct sk_buff_head free_list_head;
++	struct sk_buff *skb;
++	int count = 0;
++	struct list_head local_list_for_reuse;
+ 
+-	lockdep_assert_held(&dp->ppeds_tx_desc_lock);
+-	if (dp->ppeds_tx_desc_reuse_list_len < ATH12K_PPEDS_HOTLIST_LEN_MAX &&
+-	    tx_desc->skb) {
+-		list_move_tail(&tx_desc->list, &dp->ppeds_tx_desc_reuse_list);
+-		dp->ppeds_tx_desc_reuse_list_len++;
+-	} else {
+-		skb = tx_desc->skb;
+-		tx_desc->skb = NULL;
+-		list_move_tail(&tx_desc->list, &dp->ppeds_tx_desc_free_list);
++	spin_lock_bh(&dp->ppeds_tx_desc_lock);
++
++	hotlist_remaining_len = ATH12K_PPEDS_HOTLIST_LEN_MAX - dp->ppeds_tx_desc_reuse_list_len;
++
++	if (likely(hotlist_remaining_len >= local_list_len)) {
++		list_splice_tail(local_list, &dp->ppeds_tx_desc_reuse_list);
++		dp->ppeds_tx_desc_reuse_list_len += local_list_len;
++		spin_unlock_bh(&dp->ppeds_tx_desc_lock);
++		return;
+ 	}
+ 
+-	return skb;
+-}
++	if (hotlist_remaining_len == 0)
++		goto skip_reuse_list;
+ 
+-struct ath12k_ppeds_tx_desc_info *
+-ath12k_dp_ppeds_tx_assign_desc_nolock(struct ath12k_dp *dp)
+-{
+-	struct ath12k_ppeds_tx_desc_info *desc, *next;
++	/* Identify the first and last descriptors in local_list with length of
++	 * available room in hotlist
++	 */
++	list_for_each_entry_safe(desc, tmp, local_list, list) {
++		if (count == 0)
++			first_desc = desc;
+ 
+-	lockdep_assert_held(&dp->ppeds_tx_desc_lock);
+-	/* first try to fetch descriptor from hotlist if not use free list */
+-	desc = list_first_entry_or_null(&dp->ppeds_tx_desc_reuse_list,
+-					struct ath12k_ppeds_tx_desc_info,
+-					list);
+-	if (desc) {
+-		list_move_tail(&desc->list, &dp->ppeds_tx_desc_used_list);
+-		dp->ppeds_tx_desc_reuse_list_len--;
+-		/* Prefetch next hotlist descriptor */
+-		if (dp->ppeds_tx_desc_reuse_list_len)
+-			next = list_first_entry_or_null(&dp->ppeds_tx_desc_reuse_list,
+-							struct ath12k_ppeds_tx_desc_info,
+-							list);
+-		else
+-			next = list_first_entry_or_null(&dp->ppeds_tx_desc_free_list,
+-							struct ath12k_ppeds_tx_desc_info,
+-							list);
+-		prefetch(next);
++		if (count == (hotlist_remaining_len - 1)) {
++			last_desc = desc;
++			break;
++		}
+ 
+-		return desc;
++		count++;
+ 	}
+ 
+-	/* Fetch desc from Freelist if hotlist is empty */
+-	desc = list_first_entry_or_null(&dp->ppeds_tx_desc_free_list,
+-					struct ath12k_ppeds_tx_desc_info,
+-					list);
+-	if (unlikely(!desc)) {
+-		ath12k_warn(dp->ab, "failed to allocate data Tx buffer\n");
+-		return NULL;
++	INIT_LIST_HEAD(&local_list_for_reuse);
++
++	if (first_desc && last_desc) {
++		/* cut the local_list into local_list_for_reuse and local_list */
++		list_cut_position(&local_list_for_reuse, local_list, &last_desc->list);
++
++		/* merge local_list_for_reuse into global dp->ppeds_tx_desc_reuse_list */
++		list_splice_tail(&local_list_for_reuse, &dp->ppeds_tx_desc_reuse_list);
++		dp->ppeds_tx_desc_reuse_list_len += count + 1;
+ 	}
+ 
+-	list_move_tail(&desc->list, &dp->ppeds_tx_desc_used_list);
++skip_reuse_list:
++	skb_queue_head_init(&free_list_head);
+ 
+-	return desc;
+-}
++	list_for_each_entry_safe(desc, tmp, local_list, list) {
++		skb = desc->skb;
++		desc->skb = NULL;
++		desc->paddr = NULL;
++		desc->in_use = false;
++		if (!skb) {
++			ath12k_warn(NULL, "no skb in ds completion path");
++			continue;
++		}
++
++		if (likely(skb->is_from_recycler))
++			__skb_queue_head(&free_list_head, skb);
++		else
++			dev_kfree_skb(skb);
++	}
++
++	/* Add the remaining descriptors to the free list */
++	list_splice_tail(local_list, &dp->ppeds_tx_desc_free_list);
+ 
++	spin_unlock_bh(&dp->ppeds_tx_desc_lock);
++
++	dev_kfree_skb_list_fast(&free_list_head);
++}
+ #endif
+ 
+ static void ath12k_dp_tx_release_txbuf(struct ath12k_dp *dp,
+@@ -1305,36 +1321,31 @@ static inline bool ath12k_dp_tx_completi
+ }
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+-static void ath12k_ppeds_tx_update_stats(struct ath12k *ar, struct sk_buff *msdu,
++static void ath12k_ppeds_tx_update_stats(struct ath12k *ar,
+ 					 struct hal_wbm_release_ring *tx_status)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+-	struct ieee80211_tx_info *info;
+ 	struct ath12k_peer *peer;
+ 	struct ath12k_link_sta *arsta;
+ 	struct hal_tx_status ts = { 0 };
+ 	bool tx_drop = false;
+ 	bool tx_error = false;
+ 	bool tx_status_default = false;
++	struct ieee80211_tx_info info;
+ 
+-	info = IEEE80211_SKB_CB(msdu);
+-	memset(&info->status, 0, sizeof(info->status));
+-	info->status.rates[0].idx = -1;
++	memset(&info, 0, sizeof(info));
++	info.status.rates[0].idx = -1;
+ 
+ 	ath12k_dp_tx_status_parse(ab, (struct hal_wbm_completion_ring_tx *)tx_status, &ts);
+-	if (ts.status == HAL_WBM_TQM_REL_REASON_FRAME_ACKED &&
+-	    !(info->flags & IEEE80211_TX_CTL_NO_ACK)) {
+-		info->flags |= IEEE80211_TX_STAT_ACK;
+-		info->status.ack_signal = ATH12K_DEFAULT_NOISE_FLOOR +
++	info.status.ack_signal = ATH12K_DEFAULT_NOISE_FLOOR +
+ 					  ts.ack_rssi;
+-		info->status.flags = IEEE80211_TX_STATUS_ACK_SIGNAL_VALID;
+-	}
+-	
++	info.status.flags = IEEE80211_TX_STATUS_ACK_SIGNAL_VALID;
+ 	ab->ppe.ppeds_stats.tqm_rel_reason[ts.status]++;
+ 
+-	if (ts.status == HAL_WBM_TQM_REL_REASON_CMD_REMOVE_TX &&
+-	    (info->flags & IEEE80211_TX_CTL_NO_ACK))
+-		info->flags |= IEEE80211_TX_STAT_NOACK_TRANSMITTED;
++	if (ts.status == HAL_WBM_TQM_REL_REASON_FRAME_ACKED)
++		info.flags |= IEEE80211_TX_STAT_ACK;
++	else if (ts.status == HAL_WBM_TQM_REL_REASON_CMD_REMOVE_TX)
++		info.flags |= IEEE80211_TX_STAT_NOACK_TRANSMITTED;
+ 
+ 	if (ts.status != HAL_WBM_TQM_REL_REASON_FRAME_ACKED) {
+ 		switch (ts.status) {
+@@ -1387,8 +1398,8 @@ static void ath12k_ppeds_tx_update_stats
+ 	}
+ 
+ #ifdef CPTCFG_MAC80211_DS_SUPPORT
+-	ieee80211_ppeds_tx_update_stats(ar->ah->hw, peer->sta, info, arsta->txrate,
+-					peer->link_id, msdu->len);
++	ieee80211_ppeds_tx_update_stats(ar->ah->hw, peer->sta, &info, arsta->txrate,
++					peer->link_id, 0);
+ #endif
+ 	rcu_read_unlock();
+ }
+@@ -1422,23 +1433,23 @@ int ath12k_ppeds_tx_completion_handler(s
+ 	int hal_ring_id = tx_ring->ppe_wbm2sw_ring.ring_id;
+ 	struct hal_srng *status_ring = &ab->hal.srng_list[hal_ring_id];
+ 	struct ath12k_ppeds_tx_desc_info *tx_desc = NULL;
+-	struct sk_buff *msdu;
++	int valid_entries, count = 0, i;
+ 	u32 *desc;
+-	u8 mac_id;
+-	int valid_entries, count = 0, i = 0;
+ 	struct hal_wbm_completion_ring_tx *tx_status;
+ 	struct htt_tx_wbm_completion *status_desc;
+ 	enum hal_wbm_rel_src_module buf_rel_source;
+-	struct sk_buff_head free_list_head;
+-	int work_done = 0, htt_status;
++	int htt_status;
++	struct list_head local_list;
+ 	size_t stat_size;
+ 
++	BUG_ON(budget > DP_PPEDS_SERVICE_BUDGET);
++
+ 	if (likely(ab->stats_disable))
+ 		/* only need buf_addr_info and info0 */
+ 		stat_size = 3 * sizeof(u32);
+ 	else
+ 		stat_size = sizeof(struct hal_wbm_release_ring);
+-
++	INIT_LIST_HEAD(&local_list);
+ 	spin_lock_bh(&status_ring->lock);
+ 
+ 	ath12k_hal_srng_access_dst_ring_begin_nolock(ab, status_ring);
+@@ -1447,92 +1458,66 @@ int ath12k_ppeds_tx_completion_handler(s
+ 	if (!valid_entries) {
+ 		ath12k_hal_srng_access_dst_ring_end_nolock(status_ring);
+ 		spin_unlock_bh(&status_ring->lock);
+-		return work_done;
++		return count;
+ 	}
+ 
+ 	if (valid_entries >= budget)
+ 		valid_entries = budget;
+ 
+ 	ath12k_hal_srng_ppeds_dst_inv_entry(ab, status_ring, valid_entries);
+-	skb_queue_head_init(&free_list_head);
+ 
+ 	while (likely(valid_entries--)) {
+-		desc = (struct hal_wbm_completion_ring_tx *)ath12k_hal_srng_dst_get_next_cache_entry(ab, status_ring);
++		desc = (struct hal_wbm_completion_ring_tx *)
++			ath12k_hal_srng_dst_get_next_cache_entry(ab, status_ring);
+ 		if (!desc || !ath12k_dp_tx_completion_valid(desc))
+ 			continue;
+ 
+-		memcpy(&tx_ring->tx_status[count], desc, stat_size);
+-		count++;
+-
+-		if (count == valid_entries)
+-			break;
+-	}
+-
+-	ath12k_hal_srng_access_dst_ring_end_nolock(status_ring);
+-
+-	spin_lock_bh(&dp->ppeds_tx_desc_lock);
+-	spin_unlock_bh(&status_ring->lock);
++		tx_status = (struct hal_wbm_completion_ring_tx *)desc;
+ 
+-	while (count--) {
+-		tx_status = &tx_ring->tx_status[i++];
++		if (likely(!ab->stats_disable))
++			memcpy(&tx_ring->tx_status[count], desc, stat_size);
+ 
++		buf_rel_source = FIELD_GET(HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE,
++					   tx_status->info0);
+ 		ath12k_dp_ppeds_tx_comp_get_desc(ab, tx_status, &tx_desc);
+ 		if (unlikely(!tx_desc)) {
+ 			ath12k_warn(ab, "unable to retrieve ppe ds tx_desc!");
+ 			continue;
+ 		}
++		tx_ring->macid[count] = tx_desc->mac_id;
+ 
+-		mac_id = tx_desc->mac_id;
+-
+-		if (unlikely(!ab->stats_disable))
+-			ath12k_ppeds_tx_update_stats(ab->pdevs[mac_id].ar, tx_desc->skb,
+-						     tx_status);
+-
+-		/* Release descriptor as soon as extracting necessary info
+-		 * to reduce contention
+-		 */
+-		msdu = ath12k_dp_ppeds_tx_release_desc_nolock(dp, tx_desc);
+-		buf_rel_source = FIELD_GET(HAL_WBM_RELEASE_INFO0_REL_SRC_MODULE,
+-					   tx_status->info0);
+ 		if (unlikely(buf_rel_source == HAL_WBM_REL_SRC_MODULE_FW)) {
+ 			status_desc = ((void *)tx_status) + HTT_TX_WBM_COMP_STATUS_OFFSET;
+ 			htt_status = u32_get_bits(status_desc->info0,
+-						  HTT_TX_WBM_COMP_INFO0_STATUS);
+-			if (htt_status != HAL_WBM_REL_HTT_TX_COMP_STATUS_OK &&
+-			    !ab->stats_disable) {
++					HTT_TX_WBM_COMP_INFO0_STATUS);
++			if (htt_status != HAL_WBM_REL_HTT_TX_COMP_STATUS_OK) {
+ 				ab->ppe.ppeds_stats.fw2wbm_pkt_drops++;
++				ath12k_dbg(ab, ATH12K_DBG_PPE,
++					   "Frame received from unexpected source %d status %d!\n",
++					   buf_rel_source, htt_status);
+ 			}
+-			dev_kfree_skb_any(msdu);
+-			ath12k_warn(ab, "ath12k: Frame received from unexpected source %d status %d!\n",
+-				 buf_rel_source, htt_status);
+-			continue;
++			tx_ring->macid[count] = 0xF;
+ 		}
+ 
+-		/* is skb is being reused, avoid freeing it */
+-		if (!msdu)
+-			continue;
+-
+-		if (skb_has_frag_list(msdu)) {
+-			kfree_skb_list(skb_shinfo(msdu)->frag_list);
+-			skb_shinfo(msdu)->frag_list = NULL;
+-		}
++		/* add descriptor to local list to process in bulk */
++		tx_desc->in_use = false;
++		list_add_tail(&tx_desc->list, &local_list);
++		count++;
++	}
+ 
+-#ifdef CPTCFG_MAC80211_SFE_SUPPORT
+-		if (likely(msdu->is_from_recycler)) {
+-			__skb_queue_head(&free_list_head, msdu);
+-		} else {
+-			dev_kfree_skb(msdu);
+-		}
+-#else
+-		dev_kfree_skb(msdu);
+-#endif
++	ath12k_hal_srng_access_dst_ring_end_nolock(status_ring);
++	spin_unlock_bh(&status_ring->lock);
+ 
+-		work_done++;
++	if (likely(!ab->stats_disable)) {
++		for (i = 0; i < count; i++)
++			if (tx_ring->macid[i] != 0xF)
++				ath12k_ppeds_tx_update_stats(ab->pdevs[tx_ring->macid[i]].ar,
++							     &tx_ring->tx_status[i]);
+ 	}
+-	spin_unlock_bh(&dp->ppeds_tx_desc_lock);
+-	dev_kfree_skb_list_fast(&free_list_head);
+ 
+-	return work_done;
++	ath12k_dp_ppeds_tx_release_desc_list_bulk(dp, &local_list, count);
++
++	return count;
+ }
+ #endif
+ 
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -65,6 +65,10 @@ unsigned int ath12k_ppe_ds_enabled = tru
+ module_param_named(ppe_ds_enable, ath12k_ppe_ds_enabled, uint, 0644);
+ MODULE_PARM_DESC(ppe_ds_enable, "ppe_ds_enable: 0-disable, 1-enable");
+ 
++unsigned int ath12k_ppe_ds_hotlist_len = 1024;
++module_param_named(ppe_ds_hotlist_len, ath12k_ppe_ds_hotlist_len, uint, 0644);
++MODULE_PARM_DESC(ppe_ds_hotlist_len, "ppe_ds_hotlist_len: default: 1024");
++
+ unsigned int ath12k_ssr_failsafe_mode = true;
+ module_param_named(ssr_failsafe_mode, ath12k_ssr_failsafe_mode, uint, 0644);
+ MODULE_PARM_DESC(ssr_failsafe_mode, "ssr failsafe mode: 0-disable, 1-enable");
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.h
+@@ -10,6 +10,8 @@
+ #include "core.h"
+ #include "hal_tx.h"
+ 
++#define ATH12K_PPEDS_HOTLIST_LEN_MAX ath12k_ppe_ds_hotlist_len
++extern unsigned int ath12k_ppe_ds_hotlist_len;
+ /* htt_tx_msdu_desc_ext
+  *
+  * valid_pwr
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -317,64 +317,101 @@ static u32 ath12k_ppeds_get_batched_tx_d
+ {
+ 	struct ath12k_base *ab = *(struct ath12k_base **)ppe_ds_wlan_priv(ppeds_handle);
+ 	struct ath12k_dp *dp = &ab->dp;
+-	int i;
++	int i = 0;
+ 	int allocated = 0;
+ 	struct sk_buff *skb = NULL;
+ 	int flags = GFP_ATOMIC;
+ 	dma_addr_t paddr;
+-	struct ath12k_ppeds_tx_desc_info *tx_desc = NULL;
++	struct ath12k_ppeds_tx_desc_info *desc = NULL, *tmp;
++	struct ath12k_ppeds_stats *ppeds_stats = &ab->ppe.ppeds_stats;
+ 
+ #if LINUX_VERSION_IS_GEQ(4,4,0)
+ 	flags = flags & ~__GFP_KSWAPD_RECLAIM;
+ #endif
+-
+ 	spin_lock_bh(&dp->ppeds_tx_desc_lock);
+-	for (i = 0; i < num_buff_req; i++) {
+-		tx_desc = ath12k_dp_ppeds_tx_assign_desc_nolock(dp);
+-		if (unlikely(!tx_desc)) {
+-			ath12k_err(ab, "ran out of ppeds tx desc!\n");
+-			dsb(st);
++
++	list_for_each_entry_safe(desc, tmp, &dp->ppeds_tx_desc_reuse_list, list) {
++		if (!num_buff_req)
++			break;
++
++		list_del(&desc->list);
++		desc->in_use = true;
++
++		dp->ppeds_tx_desc_reuse_list_len--;
++
++		prefetch(list_next_entry(desc, list));
++		num_buff_req--;
++
++		arr[i].opaque_lo = desc->desc_id;
++		arr[i].opaque_hi = 0;
++		arr[i].buff_addr = desc->paddr;
++		allocated++;
++		i++;
++	}
++
++	if (!num_buff_req) {
++		spin_unlock_bh(&dp->ppeds_tx_desc_lock);
++		goto update_stats_and_ret;
++	}
++
++	list_for_each_entry_safe(desc, tmp, &dp->ppeds_tx_desc_free_list, list) {
++		if (!num_buff_req)
+ 			break;
+-		}
+ 
+-		/* allocate new skb only if one was not already found from reuse list */
+-		if (!tx_desc->skb) {
++		list_del(&desc->list);
++		desc->in_use = true;
++
++		if (likely(!desc->skb)) {
+ 			/* In skb recycler, if recyler module allocates the buffers
+-			 * already used by DS module to DS, then memzero, shinfo
+-			 * reset can be avoided, since the DS packets were not
+-			 * processed by SW
+-			 */
++			* already used by DS module to DS, then memzero, shinfo
++			* reset can be avoided, since the DS packets were not
++			* processed by SW
++			*/
+ 			skb = __netdev_alloc_skb_no_skb_reset(NULL, buff_size, flags);
+ 			if (unlikely(!skb)) {
+-				ath12k_dp_ppeds_tx_release_desc_nolock(dp, tx_desc);
++				desc->in_use = false;
++				list_add_tail(&desc->list, &dp->ppeds_tx_desc_free_list);
+ 				break;
+ 			}
+ 
+ 			skb_reserve(skb, headroom);
+ 			if (!skb->recycled_for_ds) {
+ 				dmac_inv_range_no_dsb((void *)skb->data,
+-						(void *)skb->data + buff_size - headroom);
+-				skb->recycled_for_ds = 1;
++						      (void *)skb->data + buff_size - headroom);
++						      skb->recycled_for_ds = 1;
+ 			}
+ 
+ 			paddr = virt_to_phys(skb->data);
+ 
+-			tx_desc->skb = skb;
+-			tx_desc->paddr = paddr;
++			desc->skb = skb;
++			desc->paddr = paddr;
++			desc->in_use = true;
++		} else {
++			ath12k_warn(NULL, "skb found in ppeds_tx_desc_free_list");
+ 		}
+ 
+-		arr[i].opaque_lo = tx_desc->desc_id;
++		prefetch(list_next_entry(desc, list));
++		num_buff_req--;
++
++		arr[i].opaque_lo = desc->desc_id;
+ 		arr[i].opaque_hi = 0;
+-		arr[i].buff_addr = tx_desc->paddr;
++		arr[i].buff_addr = desc->paddr;
+ 		allocated++;
++		i++;
+ 	}
++
+ 	spin_unlock_bh(&dp->ppeds_tx_desc_lock);
+ 
+ 	dsb(st);
+ 
+-	if (!ab->stats_disable) {
+-		ab->ppe.ppeds_stats.get_tx_desc_cnt++;
+-		ab->ppe.ppeds_stats.tx_desc_allocated += allocated;
++update_stats_and_ret:
++	if (unlikely(num_buff_req))
++		ppeds_stats->tx_desc_alloc_fails += num_buff_req;
++
++	if (unlikely(!ab->stats_disable)) {
++		ppeds_stats->get_tx_desc_cnt++;
++		ppeds_stats->tx_desc_allocated += allocated;
++
+ 	}
+ 
+ 	return allocated;
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -3182,6 +3182,8 @@ static ssize_t ath12k_debugfs_dump_ppeds
+ 			 ppeds_stats->release_rx_desc_cnt);
+ 	len += scnprintf(buf + len, size - len, "tx_desc_allocated %u\n",
+ 			 ppeds_stats->tx_desc_allocated);
++	len += scnprintf(buf + len, size - len, "tx_desc_alloc_fails %u\n",
++			 ppeds_stats->tx_desc_alloc_fails);
+ 	len += scnprintf(buf + len, size - len, "tx_desc_freed %u\n",
+ 			 ppeds_stats->tx_desc_freed);
+ 	len += scnprintf(buf + len, size - len, "fw2wbm_pkt_drops %u\n",
+--- a/drivers/net/wireless/ath/ath12k/ppe.h
++++ b/drivers/net/wireless/ath/ath12k/ppe.h
+@@ -44,6 +44,7 @@ struct ath12k_ppeds_stats {
+ 	u32 reo_cons_cnt;
+ 	u32 get_tx_desc_cnt;
+ 	u32 tx_desc_allocated;
++	u32 tx_desc_alloc_fails;
+ 	u32 tx_desc_freed;
+ 	u32 fw2wbm_pkt_drops;
+ 	u32 enable_intr_cnt;

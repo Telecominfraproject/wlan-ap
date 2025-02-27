@@ -1,0 +1,271 @@
+From 7bd2a415c4ea574d4d49015572e1205971c26132 Mon Sep 17 00:00:00 2001
+From: Karthikeyan Kathirvel <quic_kathirve@quicinc.com>
+Date: Wed, 28 Dec 2022 16:49:11 +0530
+Subject: [PATCH] ath12k: subscribe required word mask from rx tlv
+
+Selectively subscribe to required qwords within msdu_end
+and mpdu_start and modify rx_desc struct
+
+Configure the bit mask for Rx TLVs(msdu_end, mpdu_start, mpdu_end)
+via registers. With these registers SW can configure to DMA the
+partial TLV struct to Rx buffer.
+
+Each TLV type has its own register to configure the mask value.
+The mask value configured in register will indicate if a particular
+QWORD has to be written to rx buffer or not i.e., if Nth bit is enabled
+in the mask Nth QWORD will be written and it will not be written if the
+bit is disabled in mask. While 0th bit indicates weather TLV tag will be
+written or not.
+
+Advantages of Qword subscription of TLVs
+- Avoid multiple cache-line misses as the all the required fields
+of the TLV are with 128 bytes.
+- Memory optimization as TLVs + DATA + SHINFO can fit in 2k buffer
+even for 64 bit kernel.
+
+Signed-off-by: Karthikeyan Kathirvel <quic_kathirve@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.h      | 13 ++++++-
+ drivers/net/wireless/ath/ath12k/dp_rx.c   | 19 +++++++---
+ drivers/net/wireless/ath/ath12k/dp_tx.c   | 19 ++++++++++
+ drivers/net/wireless/ath/ath12k/hal.c     | 15 ++++++++
+ drivers/net/wireless/ath/ath12k/hal.h     |  2 ++
+ drivers/net/wireless/ath/ath12k/hw.c      |  3 ++
+ drivers/net/wireless/ath/ath12k/hw.h      |  1 +
+ drivers/net/wireless/ath/ath12k/rx_desc.h | 42 +++++++++++++++++++++--
+ 8 files changed, 106 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -777,6 +777,11 @@ enum htt_stats_internal_ppdu_frametype {
+ #define HTT_RX_RING_SELECTION_CFG_RX_MSDU_START_OFFSET  GENMASK(31, 16)
+ #define HTT_RX_RING_SELECTION_CFG_RX_ATTENTION_OFFSET   GENMASK(15, 0)
+ 
++#define HTT_RX_RING_SELECTION_CFG_WORD_MASK_COMPACTION_ENABLE_SET	BIT(23)
++#define HTT_RX_RING_SELECTION_CFG_RX_MPDU_START_MASK   GENMASK(15, 0)
++#define HTT_RX_RING_SELECTION_CFG_RX_MPDU_END_MASK   GENMASK(18, 16)
++#define HTT_RX_RING_SELECTION_CFG_RX_MSDU_END_MASK   GENMASK(16, 0)
++
+ enum htt_rx_filter_tlv_flags {
+ 	HTT_RX_FILTER_TLV_FLAGS_MPDU_START		= BIT(0),
+ 	HTT_RX_FILTER_TLV_FLAGS_MSDU_START		= BIT(1),
+@@ -1117,7 +1122,10 @@ struct htt_rx_ring_selection_cfg_cmd {
+ 	__le32 rx_msdu_offset;
+ 	__le32 rx_attn_offset;
+ 	__le32 info2;
+-	__le32 reserved[4];
++	__le32 reserved[2];
++	__le16 rx_mpdu_start_word_mask;
++	__le16 rx_mpdu_end_word_mask;
++	__le32 rx_msdu_end_word_mask;
+ 	__le32 info3;
+ } __packed;
+ 
+@@ -1154,6 +1162,9 @@ struct htt_rx_ring_tlv_filter {
+ 	u32 info1;
+ 	bool drop_threshold_valid;
+ 	bool rxmon_disable;
++	u16 rx_mpdu_start_wmask;
++	u16 rx_mpdu_end_wmask;
++	u32 rx_msdu_end_wmask;
+ };
+ 
+ #define HTT_STATS_FRAME_CTRL_TYPE_MGMT  0x0
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -4669,10 +4669,18 @@ int ath12k_dp_rxdma_ring_sel_config_qcn9
+ 	tlv_filter.rx_msdu_end_offset =
+ 		ab->hw_params->hal_ops->rx_desc_get_msdu_end_offset();
+ 
+-	/* TODO: Selectively subscribe to required qwords within msdu_end
+-	 * and mpdu_start and setup the mask in below msg
+-	 * and modify the rx_desc struct
+-	 */
++	if (ab->hw_params->compact_rx_tlv) {
++		if (ab->hw_params->hal_ops->rxdma_ring_wmask_rx_mpdu_start)
++			tlv_filter.rx_mpdu_start_wmask =
++				ab->hw_params->hal_ops->rxdma_ring_wmask_rx_mpdu_start();
++		if (ab->hw_params->hal_ops->rxdma_ring_wmask_rx_msdu_end)
++			tlv_filter.rx_msdu_end_wmask =
++				ab->hw_params->hal_ops->rxdma_ring_wmask_rx_msdu_end();
++		ath12k_dbg(ab, ATH12K_DBG_DATA,
++				"Configuring compact tlv masks rx_mpdu_start_wmask 0x%x rx_msdu_end_wmask 0x%x\n",
++				tlv_filter.rx_mpdu_start_wmask, tlv_filter.rx_msdu_end_wmask);
++	}
++
+ 	ret = ath12k_dp_tx_htt_rx_filter_setup(ab, ring_id, 0,
+ 					       HAL_RXDMA_BUF,
+ 					       DP_RXDMA_REFILL_RING_SIZE,
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -1271,6 +1271,25 @@ int ath12k_dp_tx_htt_rx_filter_setup(str
+ 					 HTT_RX_RING_SELECTION_CFG_RX_ATTENTION_OFFSET);
+ 	}
+ 
++	if (tlv_filter->rx_mpdu_start_wmask > 0 &&
++			tlv_filter->rx_msdu_end_wmask > 0) {
++		cmd->info2 |=
++			u32_encode_bits(true,
++					HTT_RX_RING_SELECTION_CFG_WORD_MASK_COMPACTION_ENABLE_SET);
++		cmd->rx_mpdu_start_word_mask =
++			u32_encode_bits(tlv_filter->rx_mpdu_start_wmask,
++					HTT_RX_RING_SELECTION_CFG_RX_MPDU_START_MASK);
++		/* mpdu_end is not used for any hardwares so far
++		 * please assign it in future if any chip is
++		 * using through hal ops
++		 */
++		cmd->rx_mpdu_end_word_mask =
++			u32_encode_bits(tlv_filter->rx_mpdu_end_wmask,
++					HTT_RX_RING_SELECTION_CFG_RX_MPDU_END_MASK);
++		cmd->rx_msdu_end_word_mask =
++			u32_encode_bits(tlv_filter->rx_msdu_end_wmask,
++					HTT_RX_RING_SELECTION_CFG_RX_MSDU_END_MASK);
++	}
+ 	ret = ath12k_htc_send(&ab->htc, ab->dp.eid, skb);
+ 	if (ret)
+ 		goto err_free;
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -527,6 +527,19 @@ static u8 ath12k_hal_qcn9274_rx_desc_get
+ 	return (ipv4 || ipv6);
+ }
+ 
++#define MPDU_START_WMASK 0xFFC
++#define MSDU_END_WMASK 0x13441
++
++static inline u16 ath12k_hal_rx_mpdu_start_wmask_get(void)
++{
++	return MPDU_START_WMASK;
++}
++
++static inline u32 ath12k_hal_rx_msdu_end_wmask_get(void)
++{
++	return MSDU_END_WMASK;
++}
++
+ static int ath12k_hal_srng_create_config_qcn9274(struct ath12k_base *ab)
+ {
+ 	struct ath12k_hal *hal = &ab->hal;
+@@ -731,6 +744,8 @@ const struct hal_ops hal_qcn9274_ops = {
+ 	.dp_rx_h_is_decrypted = ath12k_hw_qcn9274_dp_rx_h_is_decrypted,
+ 	.dp_rx_h_mpdu_err = ath12k_hw_qcn9274_dp_rx_h_mpdu_err,
+ 	.rx_desc_get_ip_valid = ath12k_hal_qcn9274_rx_desc_get_ip_valid,
++	.rxdma_ring_wmask_rx_mpdu_start = ath12k_hal_rx_mpdu_start_wmask_get,
++	.rxdma_ring_wmask_rx_msdu_end = ath12k_hal_rx_msdu_end_wmask_get,
+ };
+ 
+ static bool ath12k_hw_wcn7850_rx_desc_get_first_msdu(struct hal_rx_desc *desc)
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -1085,6 +1085,8 @@ struct hal_ops {
+ 	u32 (*dp_rx_h_mpdu_err)(struct hal_rx_desc *desc);
+ 	u8 (*rx_desc_get_ip_valid)(struct hal_rx_desc *desc);
+ 	const struct ath12k_hal_tcl_to_wbm_rbm_map *tcl_to_wbm_rbm_map;
++	u16 (*rxdma_ring_wmask_rx_mpdu_start)(void);
++	u32 (*rxdma_ring_wmask_rx_msdu_end)(void);
+ };
+ 
+ extern const struct hal_ops hal_qcn9274_ops;
+--- a/drivers/net/wireless/ath/ath12k/hw.c
++++ b/drivers/net/wireless/ath/ath12k/hw.c
+@@ -933,6 +933,7 @@ static const struct ath12k_hw_params ath
+ 		},
+ 		.max_mlo_peer = ATH12K_MAX_MLO_PEER,
+ 		.num_local_link = 0,
++		.compact_rx_tlv = true,
+ 	},
+ 	{
+ 		.name = "wcn7850 hw2.0",
+@@ -993,6 +994,7 @@ static const struct ath12k_hw_params ath
+ 		
+ 		.supports_ap_ps = true,
+ 		.credit_flow = false,
++		.compact_rx_tlv = false,
+ 	},
+ 	{
+ 		.name = "qcn9274 hw2.0",
+@@ -1064,6 +1066,7 @@ static const struct ath12k_hw_params ath
+ 		},
+ 		.max_mlo_peer = ATH12K_MAX_MLO_PEER,
+ 		.num_local_link = 0,
++		.compact_rx_tlv = true,
+ 	},
+ };
+ 
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -209,6 +209,7 @@ struct ath12k_hw_params {
+ 	bool alloc_cacheable_memory;
+ 	u16 max_mlo_peer;
+ 	u8 num_local_link;
++	bool compact_rx_tlv;
+ };
+ 
+ struct ath12k_hw_ops {
+--- a/drivers/net/wireless/ath/ath12k/rx_desc.h
++++ b/drivers/net/wireless/ath/ath12k/rx_desc.h
+@@ -119,6 +119,28 @@ enum rx_desc_decrypt_status_code {
+ #define RX_MPDU_START_INFO8_AUTH_TO_SEND_WDS		BIT(0)
+ 
+ struct rx_mpdu_start_qcn9274 {
++	__le32 info1;
++	__le32 pn[4];
++	__le32 info2;
++	__le32 peer_meta_data;
++	__le16 info3;
++	__le16 phy_ppdu_id;
++	__le16 ast_index;
++	__le16 sw_peer_id;
++	__le32 info4;
++	__le32 info5;
++	__le32 info6;
++	__le16 frame_ctrl;
++	__le16 duration;
++	u8 addr1[ETH_ALEN];
++	u8 addr2[ETH_ALEN];
++	u8 addr3[ETH_ALEN];
++	__le16 seq_ctrl;
++	u8 addr4[ETH_ALEN];
++	__le16 qos_ctrl;
++} __packed;
++
++struct rx_mpdu_start_wcn7850 {
+ 	__le32 info0;
+ 	__le32 reo_queue_desc_lo;
+ 	__le32 info1;
+@@ -741,6 +763,22 @@ enum rx_msdu_start_reception_type {
+ #define RX_MSDU_END_INFO14_MSDU_DONE		BIT(31)
+ 
+ struct rx_msdu_end_qcn9274 {
++	__le64 msdu_end_tag;
++	__le16 sa_sw_peer_id;
++	__le16 info5;
++	__le16 sa_idx;
++	__le16 da_idx_or_sw_peer_id;
++	__le32 info10;
++	__le32 info11;
++	__le32 info12;
++	__le32 flow_id_toeplitz;
++	__le32 ppdu_start_timestamp_63_32;
++	__le32 phy_meta_data;
++	__le32 info13;
++	__le32 info14;
++} __packed;
++
++struct rx_msdu_end_wcn7850 {
+ 	__le16 info0;
+ 	__le16 phy_ppdu_id;
+ 	__le16 ip_hdr_cksum;
+@@ -1414,10 +1452,10 @@ struct rx_pkt_hdr_tlv {
+ 
+ struct hal_rx_desc_wcn7850 {
+ 	__le64 msdu_end_tag;
+-	struct rx_msdu_end_qcn9274 msdu_end;
++	struct rx_msdu_end_wcn7850 msdu_end;
+ 	u8 rx_padding0[RX_BE_PADDING0_BYTES];
+ 	__le64 mpdu_start_tag;
+-	struct rx_mpdu_start_qcn9274 mpdu_start;
++	struct rx_mpdu_start_wcn7850 mpdu_start;
+ 	struct rx_pkt_hdr_tlv	 pkt_hdr_tlv;
+ 	u8 msdu_payload[];
+ };

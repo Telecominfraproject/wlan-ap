@@ -1,0 +1,146 @@
+From a9b495a4534ae0ccb780f4ff3638cdd718847b0e Mon Sep 17 00:00:00 2001
+From: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Date: Wed, 26 Jul 2023 14:21:31 +0530
+Subject: [PATCH] ath12k: fix ath12k_mac_op_switch_vif_chanctx() mac ops
+
+If more than 1 link switches channel at near by same time such that CSA is
+not completed on the first before it starts on later, then once the CSA is
+completed on both, mac80211 sends all the channel contexts in one shot to the
+driver via ath12k_mac_op_switch_vif_chanctx(). This is due to the single wiphy
+architecture since all channel contexts are maintained under single wiphy.
+
+Hence there could be a possibility that in the passed channel contexts array,
+there could be contexts belonging to different underlying radios. However,
+currently there is an assumption that the passed array will have channel context
+belonging to a single radio and hence only 1st member of the array is used to
+get the underlying radio info. This leads to sending incorrect vdev ids to
+firmware as well as stack corruption since now total number of elements in array
+could be more than that a radio supports.
+
+Modify the ath12k_mac_op_switch_vif_chanctx() mac ops to get all the consecutive
+contexts belonging to the same radio and further process it in a single shot.
+
+While at it, if channel is moved from one underlying radio to another, which is
+currently not supported, handle it accordingly and return operation not supported
+to upper layer.
+
+Signed-off-by: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Co-developed-by: Aloka Dixit <quic_alokad@quicinc.com>
+Signed-off-by: Aloka Dixit <quic_alokad@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 92 +++++++++++++++++++++++----
+ 1 file changed, 79 insertions(+), 13 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -12491,6 +12491,10 @@ ath12k_mac_process_update_vif_chan(struc
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+ 
++	/* should not happen */
++	if (WARN_ON(n_vifs > TARGET_NUM_VDEVS))
++		return;
++
+ 	if (ath12k_wmi_is_mvr_supported(ab))
+ 		ath12k_mac_update_vif_chan_mvr(ar, vifs, n_vifs);
+ 	else
+@@ -13552,36 +13556,78 @@ ath12k_mac_op_switch_vif_chanctx(struct
+ 				 int n_vifs,
+ 				 enum ieee80211_chanctx_switch_mode mode)
+ {
+-	struct ath12k *ar;
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k *curr_ar, *new_ar, *ar;
++	struct ieee80211_chanctx_conf *curr_ctx;
++	int i, ret = 0, next_ctx_idx = 0;
+ 
+-	/* TODO Swiching a vif between two radios require deleting of vdev
++	mutex_lock(&ah->conf_mutex);
++
++	/* TODO Switching a vif between two radios require deleting of vdev
+ 	 * in its current ar and creating a vdev and applying its cached params
+-	 * to the new vdev in ar.
+-	 * Currently only switching within same band allowed, also if ar's
+-	 * which are in same band (5G LB/HB needs to be handled)
++	 * to the new vdev in ar. So instead of returning error, handle it?
+ 	 */
+-	if (vifs->old_ctx->def.chan->band != vifs->new_ctx->def.chan->band) {
+-		WARN_ON(1);
+-		return -EINVAL;
+-	}
++	for (i = 0; i < n_vifs; i++) {
++		if (vifs[i].old_ctx->def.chan->band !=
++		    vifs[i].new_ctx->def.chan->band) {
++			WARN_ON(1);
++			ret = -EINVAL;
++			break;
++		}
+ 
+-	ar = ath12k_get_ar_by_ctx(hw, vifs->old_ctx);
+-	if (!ar) {
+-		ath12k_err(NULL,
+-			   "unable to determine device for the passed channel ctx\n");
+-		return -EINVAL;
++		curr_ar = ath12k_get_ar_by_ctx(hw, vifs[i].old_ctx);
++		new_ar = ath12k_get_ar_by_ctx(hw, vifs[i].new_ctx);
++		if (!curr_ar || !new_ar) {
++			ath12k_err(NULL,
++				   "unable to determine device for the passed channel ctx");
++			ath12k_err(NULL,
++				   "Old freq %d MHz (device %s) to new freq %d MHz (device %s)\n",
++				   vifs[i].old_ctx->def.chan->center_freq,
++				   curr_ar ? "valid" : "invalid",
++				   vifs[i].new_ctx->def.chan->center_freq,
++				   new_ar ? "valid" : "invalid");
++			ret = -EINVAL;
++			break;
++		}
++
++		/* Switching a vif between two radios is not allowed */
++		if (curr_ar != new_ar) {
++			ath12k_dbg(curr_ar->ab, ATH12K_DBG_MAC,
++				   "mac chanctx switch to another radio not supported.");
++			ret = -EOPNOTSUPP;
++			break;
++		}
+ 	}
+ 
+-	mutex_lock(&ar->conf_mutex);
++	if (ret)
++		goto unlock;
+ 
+-	ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
+-		   "mac chanctx switch n_vifs %d mode %d\n",
+-		   n_vifs, mode);
+-	ath12k_mac_process_update_vif_chan(ar, vifs, n_vifs);
++	/* List of vifs contains data grouped by the band, example: All 2 GHz vifs
++	 * ready to be switched to new context followed by all 5 GHz. The order of
++	 * bands is not fixed. Send MVR when the loop processes the last vif
++	 * for a particular band.
++	 */
++	for (i = 0; i < n_vifs; i++) {
++		curr_ctx = vifs[i].old_ctx;
++		ar = ath12k_get_ar_by_ctx(hw, curr_ctx);
+ 
+-	mutex_unlock(&ar->conf_mutex);
++		if ((i + 1 < n_vifs) && (vifs[i + 1].old_ctx == curr_ctx))
++			continue;
+ 
+-	return 0;
++		mutex_lock(&ar->conf_mutex);
++		ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
++			   "mac chanctx switch n_vifs %d mode %d\n",
++			   i - next_ctx_idx + 1, mode);
++		ath12k_mac_process_update_vif_chan(ar, vifs + next_ctx_idx,
++						   i - next_ctx_idx + 1);
++		mutex_unlock(&ar->conf_mutex);
++
++		next_ctx_idx = i + 1;
++	}
++
++unlock:
++	mutex_unlock(&ah->conf_mutex);
++	return ret;
+ }
+ 
+ int

@@ -1,0 +1,262 @@
+From 7fc5ac79406f22506e4eddba5a142ffb51b82878 Mon Sep 17 00:00:00 2001
+From: Dhanavandhana Kannan <quic_dhanavan@quicinc.com>
+Date: Thu, 9 May 2024 23:04:02 +0530
+Subject: [PATCH] wifi: ath12k: Add tx delay to tsf
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+An AP sending a beacon frame shall set the value of the beacon frame’s
+timestamp so that it equals the value of the STA’s TSF timer at the
+time that the data symbol containing the first bit of the timestamp
+is transmitted to the PHY plus the transmitting STA’s delays through
+its local PHY from the MAC-PHY interface to its interface with the WM.
+
+With this fix, tsf of beacon % beacon interval is greater than or equal
+to the minimum value provided in the spec.
+
+tx delay for 5G/6G:
+20(lsig)+2(service)+32(6mbps, 24 bytes) = 54us + 2us(MAC/BB DELAY)
+
+tx delay for 2.4G:
+144 us ( LPREAMBLE) + 48 (PLCP Header) + 192 (1Mbps, 24 ytes)
+= 384 us + 2us(MAC/BB DELAY)
+
+Signed-off-by: Dhanavandhana Kannan <quic_dhanavan@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |   1 +
+ drivers/net/wireless/ath/ath12k/mac.c  |  16 +++
+ drivers/net/wireless/ath/ath12k/wmi.c  | 137 ++++++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/wmi.h  |  18 ++++
+ 4 files changed, 171 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -462,6 +462,7 @@ struct ath12k_link_vif {
+ 	int ppe_vp_profile_idx;
+ 	/* Add per link DS specific information here */
+ #endif
++	u64 tbtt_offset;
+ 
+ };
+ 
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -1784,6 +1784,15 @@ static void ath12k_mac_setup_bcn_tmpl_vi
+ 				    WLAN_OUI_TYPE_MICROSOFT_WPA,
+ 				    ies, (skb_tail_pointer(bcn) - ies)))
+ 		ahvif->wpaie_present = true;
++
++	/* Make the TSF offset negative so beacons in the same
++	 * staggered batch have the same TSF.
++	 */
++	if (arvif->tbtt_offset) {
++		u64 adjusted_tsf = cpu_to_le64(0ULL - arvif->tbtt_offset);
++
++		memcpy(&mgmt->u.beacon.timestamp, &adjusted_tsf, sizeof(adjusted_tsf));
++	}
+ }
+ 
+ static bool ath12k_mac_setup_bcn_tmpl_nontx_vif_params(struct ath12k_link_vif *tx_arvif,
+@@ -9807,6 +9816,7 @@ static void ath12k_mac_op_tx(struct ieee
+ 	struct sk_buff *msdu_copied;
+ 	struct ieee80211_sta *sta = NULL;
+ 	struct ath12k_peer *peer;
++	struct ieee80211_mgmt *mgmt;
+ 	u32 info_flags;
+ 	bool is_prb_rsp;
+ 	bool is_mcast = false;
+@@ -9899,6 +9909,14 @@ static void ath12k_mac_op_tx(struct ieee
+ 	} else if (ieee80211_is_mgmt(hdr->frame_control)) {
+ 		frm_type = FIELD_GET(IEEE80211_FCTL_STYPE, hdr->frame_control);
+ 		is_prb_rsp = ieee80211_is_probe_resp(hdr->frame_control);
++		if (is_prb_rsp && arvif->tbtt_offset) {
++			u64 adjusted_tsf;
++
++			mgmt = (struct ieee80211_mgmt *)skb->data;
++			adjusted_tsf = cpu_to_le64(0ULL - arvif->tbtt_offset);
++			memcpy(&mgmt->u.probe_resp.timestamp, &adjusted_tsf,
++			       sizeof(adjusted_tsf));
++		}
+ 		mgmt_stats = &ahvif->mgmt_stats;
+ 		ret = ath12k_mac_mgmt_tx(ar, skb, is_prb_rsp);
+ 		if (ret) {
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -14662,6 +14662,137 @@ static void ath12k_wmi_parse_cfr_capture
+ 			    ret);
+ }
+ 
++static int ath12k_wmi_tbtt_offset_subtlv_parser(struct ath12k_base *ab, u16 tag,
++						u16 len, const void *ptr,
++						void *data)
++{
++	int ret = 0;
++	struct ath12k *ar;
++	u64 tx_delay = 0;
++	struct wmi_tbtt_offset_info *tbtt_offset_info;
++	struct ieee80211_chanctx_conf *conf;
++	struct ath12k_link_vif *arvif;
++	struct ieee80211_bss_conf *link_conf;
++	struct ieee80211_vif *vif;
++
++	tbtt_offset_info = (struct wmi_tbtt_offset_info *)ptr;
++
++	rcu_read_lock();
++	ar = ath12k_mac_get_ar_by_vdev_id(ab, tbtt_offset_info->vdev_id);
++	if (!ar) {
++		ath12k_warn(ab, "ar not found, vdev_id %d\n", tbtt_offset_info->vdev_id);
++		ret = -EINVAL;
++		goto exit;
++	}
++
++	arvif = ath12k_mac_get_arvif(ar, tbtt_offset_info->vdev_id);
++	if (!arvif) {
++		ath12k_warn(ab, "arvif not found, vdev_id %d\n",
++			    tbtt_offset_info->vdev_id);
++		ret = -EINVAL;
++		goto exit;
++	}
++
++	vif = arvif->ahvif->vif;
++	if (!arvif->is_up || arvif->ahvif->vdev_type != WMI_VDEV_TYPE_AP) {
++		ret = 0;
++		goto exit;
++	}
++
++	arvif->tbtt_offset = tbtt_offset_info->tbtt_offset;
++
++	if (!vif->link_conf[arvif->link_id]) {
++		ret = -ENOENT;
++		goto exit;
++	}
++
++	link_conf = rcu_dereference(vif->link_conf[arvif->link_id]);
++
++	if (!link_conf) {
++		ret = -ENOENT;
++		goto exit;
++	}
++
++	conf = rcu_dereference(link_conf->chanctx_conf);
++	if (!conf) {
++		ret = -ENOENT;
++		goto exit;
++	}
++
++	if (conf->def.chan->band == NL80211_BAND_2GHZ) {
++		/* 1Mbps Beacon: */
++		/* 144 us ( LPREAMBLE) + 48 (PLCP Header)
++		 * + 192 (1Mbps, 24 ytes)
++		 * = 384 us + 2us(MAC/BB DELAY
++		 */
++		tx_delay = 386;
++	} else if (conf->def.chan->band == NL80211_BAND_5GHZ ||
++		   conf->def.chan->band == NL80211_BAND_6GHZ) {
++		/* 6Mbps Beacon: */
++		/* 20(lsig)+2(service)+32(6mbps, 24 bytes)
++		 * = 54us + 2us(MAC/BB DELAY)
++		 */
++		tx_delay = 56;
++	}
++	arvif->tbtt_offset -= tx_delay;
++	ieee80211_queue_work(ar->ah->hw, &arvif->update_bcn_template_work);
++exit:
++	rcu_read_unlock();
++	return ret;
++}
++
++static int ath12k_wmi_tbtt_offset_event_parser(struct ath12k_base *ab,
++					       u16 tag, u16 len,
++					       const void *ptr, void *data)
++{
++	int ret = 0;
++
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wmi tbtt offset event tag 0x%x of len %d rcvd\n",
++		   tag, len);
++
++	switch (tag) {
++	case WMI_TAG_TBTT_OFFSET_EXT_EVENT:
++		break;
++	case WMI_TAG_ARRAY_STRUCT:
++		ret = ath12k_wmi_tlv_iter(ab, ptr, len,
++					  ath12k_wmi_tbtt_offset_subtlv_parser,
++					  data);
++		break;
++	default:
++		ath12k_warn(ab, "Received invalid tag 0x%x for wmi tbtt offset event\n", tag);
++		ret = -EINVAL;
++		break;
++	}
++
++	return ret;
++}
++
++static int ath12k_wmi_pull_tbtt_offset(struct ath12k_base *ab, struct sk_buff *skb,
++				       struct wmi_tbtt_offset_ev_arg *arg)
++{
++	struct wmi_tbtt_offset_info tbtt_offset_info = {0};
++	int ret;
++
++	ret = ath12k_wmi_tlv_iter(ab, skb->data, skb->len,
++				  ath12k_wmi_tbtt_offset_event_parser,
++				  &tbtt_offset_info);
++	if (ret) {
++		ath12k_warn(ab, "failed to parse tbtt tlv %d\n", ret);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++void ath12k_wmi_event_tbttoffset_update(struct ath12k_base *ab, struct sk_buff *skb)
++{
++	struct wmi_tbtt_offset_ev_arg arg = {};
++	int ret;
++
++	ret = ath12k_wmi_pull_tbtt_offset(ab, skb, &arg);
++	if (ret)
++		ath12k_warn(ab, "failed to parse tbtt offset event: %d\n", ret);
++}
++
+ static void ath12k_wmi_op_rx(struct ath12k_base *ab, struct sk_buff *skb)
+ {
+ 	struct wmi_cmd_hdr *cmd_hdr;
+@@ -14769,8 +14900,10 @@ static void ath12k_wmi_op_rx(struct ath1
+ 	case WMI_OFFCHAN_DATA_TX_COMPLETION_EVENTID:
+ 		ath12k_offchan_tx_completion_event(ab, skb);
+ 		break;
+-	/* add Unsupported events here */
+ 	case WMI_TBTTOFFSET_EXT_UPDATE_EVENTID:
++		ath12k_wmi_event_tbttoffset_update(ab, skb);
++		break;
++	/* add Unsupported events here */
+ 	case WMI_PEER_OPER_MODE_CHANGE_EVENTID:
+ 	case WMI_TWT_ENABLE_EVENTID:
+ 	case WMI_TWT_DISABLE_EVENTID:
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -5176,6 +5176,24 @@ struct wmi_vdev_stopped_event {
+ 	__le32 vdev_id;
+ } __packed;
+ 
++struct wmi_tbtt_offset_info {
++	u32 vdev_id;
++	u32 tbtt_offset;
++	u32 tbtt_qtime_low_us;
++	u32 tbtt_qtime_high_us;
++} __packed;
++
++struct wmi_tbtt_offset_event {
++	u32 num_vdevs;
++} __packed;
++
++struct wmi_tbtt_offset_ev_arg {
++	u32 vdev_id;
++	u32 tbtt_offset;
++	u32 tbtt_qtime_low_us;
++	u32 tbtt_qtime_high_us;
++} __packed;
++
+ struct wmi_pdev_bss_chan_info_event {
+ 	__le32 freq;	/* Units in MHz */
+ 	__le32 noise_floor;	/* units are dBm */

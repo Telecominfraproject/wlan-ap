@@ -1,0 +1,634 @@
+From 992202cd3d11941ad0c2d1d60a9b824423625881 Mon Sep 17 00:00:00 2001
+From: Pavankumar Nandeshwar <quic_pnandesh@quicinc.com>
+Date: Wed, 14 Aug 2024 09:11:09 +0530
+Subject: [PATCH] QSDK: ath12k: Reuse vp profiles in case of splitphy
+
+In case of splitphy, since, the mlo vifs are on the same soc,
+and because the vp table is on the soc, reuse the existing
+vp profile entry when new vp profile create request comes
+for the same vp number
+
+Patch-dependency: 968-QSDK-wifi-ath12k-Address-vp-number-issue-in-splitphy.patch
+
+Signed-off-by: Pavankumar Nandeshwar <quic_pnandesh@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/accel_cfg.c |  26 ---
+ drivers/net/wireless/ath/ath12k/core.h      |   1 +
+ drivers/net/wireless/ath/ath12k/debugfs.c   |   2 -
+ drivers/net/wireless/ath/ath12k/dp.c        |  22 +-
+ drivers/net/wireless/ath/ath12k/dp.h        |   4 +
+ drivers/net/wireless/ath/ath12k/hal_tx.h    |   1 +
+ drivers/net/wireless/ath/ath12k/mac.c       |   5 +
+ drivers/net/wireless/ath/ath12k/ppe.c       | 210 ++++++++++++++------
+ drivers/net/wireless/ath/ath12k/ppe.h       |   1 -
+ 9 files changed, 179 insertions(+), 93 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/accel_cfg.c
++++ b/drivers/net/wireless/ath/ath12k/accel_cfg.c
+@@ -97,32 +97,6 @@ static bool ath12k_ds_get_node_id(struct
+ 	if (!test_bit(ATH12K_FLAG_PPE_DS_ENABLED, &ab->dev_flags))
+ 		goto unlock_n_fail;
+ 
+-	/*
+-	 * In splitphy mlo case, the vp number might get mapped to
+-	 * wrong lmac_id causing a traffic halt. Address this issue
+-	 * by adding a work around to fallback to sfe mode, in case
+-	 * the requested peer has a pdev with incompatible primary lmac id
+-	 */
+-	if (ab->num_radios > 1) {
+-		int idx = arvif->ppe_vp_profile_idx;
+-		int link_id;
+-		struct ath12k_link_vif *iter_arvif;
+-
+-		for_each_set_bit(link_id, &ahvif->links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
+-			iter_arvif = ahvif->link[link_id];
+-
+-			if (!iter_arvif || iter_arvif == arvif ||
+-				ab != iter_arvif->ab)
+-				continue;
+-
+-			if (iter_arvif->ppe_vp_profile_idx < idx) {
+-				ab->ppe.ppeds_stats.splitphy_fallbacks++;
+-
+-				goto unlock_n_fail;
+-			}
+-		}
+-	}
+-
+ 	*node_id = ab->ppe.ds_node_id;
+ 
+ 	rcu_read_unlock();
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -416,6 +416,7 @@ struct ath12k_link_vif {
+ 	u8 hal_addr_search_flags;
+ 	u8 search_type;
+ 	int bank_id;
++	int splitphy_ds_bank_id;
+ 	u8 vdev_id_check_en;
+ 	bool beacon_prot;
+ 
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -3169,8 +3169,6 @@ static ssize_t ath12k_debugfs_dump_ppeds
+ 			 ppeds_stats->num_rx_desc_freed);
+ 	len += scnprintf(buf + len, size - len, "num_rx_desc_realloc %u\n",
+ 			 ppeds_stats->num_rx_desc_realloc);
+-	len += scnprintf(buf + len, size - len, "splitphy_fallbacks %u\n",
+-			 ppeds_stats->splitphy_fallbacks);
+ 	len += scnprintf(buf + len, size - len,
+ 			 "\ntqm_rel_reason: 0:%u 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u 7:%u 8:%u 9:%u 10:%u 11:%u 12:%u 13:%u 14:%u\n",
+ 			 ppeds_stats->tqm_rel_reason[0],
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -642,7 +642,7 @@ skip_dma_alloc:
+ }
+ 
+ static
+-u32 ath12k_dp_tx_get_vdev_bank_config(struct ath12k_base *ab, struct ath12k_link_vif *arvif)
++u32 ath12k_dp_tx_get_vdev_bank_config(struct ath12k_base *ab, struct ath12k_link_vif *arvif, bool vdev_id_check_en)
+ {
+ 	struct ath12k_vif *ahvif = arvif->ahvif;
+ 	u32 bank_config = 0;
+@@ -682,7 +682,7 @@ u32 ath12k_dp_tx_get_vdev_bank_config(st
+ 
+ 	bank_config |= u32_encode_bits(ieee80211_vif_is_mesh(ahvif->vif) ? 3 : 0,
+ 					HAL_TX_BANK_CONFIG_MESH_EN) |
+-			u32_encode_bits(arvif->vdev_id_check_en,
++			u32_encode_bits(vdev_id_check_en,
+ 					HAL_TX_BANK_CONFIG_VDEV_ID_CHECK_EN);
+ 
+ 	bank_config |= u32_encode_bits(0, HAL_TX_BANK_CONFIG_DSCP_TIP_MAP_ID);
+@@ -690,8 +690,8 @@ u32 ath12k_dp_tx_get_vdev_bank_config(st
+ 	return bank_config;
+ }
+ 
+-static int ath12k_dp_tx_get_bank_profile(struct ath12k_base *ab, struct ath12k_link_vif *arvif,
+-					 struct ath12k_dp *dp)
++int ath12k_dp_tx_get_bank_profile(struct ath12k_base *ab, struct ath12k_link_vif *arvif,
++				  struct ath12k_dp *dp, bool vdev_id_check_en)
+ {
+ 	int bank_id = DP_INVALID_BANK_ID;
+ 	int i;
+@@ -699,7 +699,7 @@ static int ath12k_dp_tx_get_bank_profile
+ 	bool configure_register = false;
+ 
+ 	/* convert vdev params into hal_tx_bank_config */
+-	bank_config = ath12k_dp_tx_get_vdev_bank_config(ab, arvif);
++	bank_config = ath12k_dp_tx_get_vdev_bank_config(ab, arvif, vdev_id_check_en);
+ 
+ 	spin_lock_bh(&dp->tx_bank_lock);
+ 	/* TODO: implement using idr kernel framework*/
+@@ -755,8 +755,15 @@ void ath12k_dp_tx_update_bank_profile(st
+ 	struct ath12k_base *ab = arvif->ar->ab;
+ 	struct ath12k_dp *dp = &ab->dp;
+ 
++	if (arvif->splitphy_ds_bank_id != DP_INVALID_BANK_ID) {
++		bool vdevid_chk_en = false;
++
++		ath12k_dp_tx_put_bank_profile(dp, arvif->splitphy_ds_bank_id);
++		arvif->splitphy_ds_bank_id = ath12k_dp_tx_get_bank_profile(ab, arvif, dp, vdevid_chk_en);
++	}
++
+ 	ath12k_dp_tx_put_bank_profile(dp, arvif->bank_id);
+-	arvif->bank_id = ath12k_dp_tx_get_bank_profile(ab, arvif, dp);
++	arvif->bank_id = ath12k_dp_tx_get_bank_profile(ab, arvif, dp, arvif->vdev_id_check_en);
+ 	arvif->desc.info0 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO0_BANK_ID,
+ 				       arvif->bank_id);
+ 
+@@ -1585,7 +1592,8 @@ void ath12k_dp_vdev_tx_attach(struct ath
+ 
+ 	ath12k_dp_update_vdev_search(arvif);
+ 	arvif->vdev_id_check_en = true;
+-	arvif->bank_id = ath12k_dp_tx_get_bank_profile(ab, arvif, &ab->dp);
++	arvif->bank_id = ath12k_dp_tx_get_bank_profile(ab, arvif, &ab->dp, arvif->vdev_id_check_en);
++	arvif->splitphy_ds_bank_id = DP_INVALID_BANK_ID;
+ 
+ 	arvif->desc.info0 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO0_BANK_ID,
+ 				       arvif->bank_id);
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -393,6 +393,7 @@ struct host_link_stats {
+ #define MAX_PPEDS_IRQS 3
+ struct ath12k_dp_ppe_vp_profile {
+ 	bool is_configured;
++	u8 ref_count;
+ 	u8 vp_num;
+ 	u8 ppe_vp_num_idx;
+ 	u8 search_idx_reg_num;
+@@ -2712,6 +2713,9 @@ struct ath12k_rx_desc_info *ath12k_dp_ge
+ struct ath12k_tx_desc_info *ath12k_dp_get_tx_desc(struct ath12k_base *ab,
+ 						  u32 desc_id);
+ void ath12k_dp_tx_update_bank_profile(struct ath12k_link_vif *arvif);
++
++int ath12k_dp_tx_get_bank_profile(struct ath12k_base *ab, struct ath12k_link_vif *arvif,
++					 struct ath12k_dp *dp, bool vdev_id_check_en);
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ int ath12k_ppeds_dp_srng_alloc(struct ath12k_base *ab, struct dp_srng *ring,
+ 			       enum hal_ring_type type, int ring_num,
+--- a/drivers/net/wireless/ath/ath12k/hal_tx.h
++++ b/drivers/net/wireless/ath/ath12k/hal_tx.h
+@@ -200,6 +200,7 @@ struct hal_tx_fes_status_end {
+ 
+ #define HAL_TX_PPE_VP_CONFIG_TABLE_ADDR		0x00a44194
+ #define HAL_TX_PPE_VP_CONFIG_TABLE_OFFSET	4
++#define HAL_TX_PPE_VP_CFG_WILDCARD_LMAC_ID	3
+ 
+ #define HAL_TX_PPE_VP_CFG_VP_NUM		GENMASK(7, 0)
+ #define HAL_TX_PPE_VP_CFG_PMAC_ID		GENMASK(9, 8)
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -12599,6 +12599,11 @@ err_vdev_del:
+ 
+ 	ath12k_mac_vif_unref(&ab->dp, vif);
+ 	ath12k_dp_tx_put_bank_profile(&ab->dp, arvif->bank_id);
++
++	if (arvif->splitphy_ds_bank_id != DP_INVALID_BANK_ID)
++		ath12k_dp_tx_put_bank_profile(&ab->dp,
++						arvif->splitphy_ds_bank_id);
++
+ 	ahvif->key_cipher = INVALID_CIPHER;
+ 
+ 	/* Recalc txpower for remaining vdev */
+@@ -14914,7 +14919,7 @@ ath12k_mac_assign_vif_chanctx_handle(str
+ 	ab = ar->ab;
+ 
+ 	ret = ath12k_ppeds_attach_link_vif(arvif, ahvif->ppe_vp_num,
+-					   &arvif->ppe_vp_profile_idx);
++					   &arvif->ppe_vp_profile_idx, vif);
+ 	if (ret)
+ 		ath12k_info(ab, "Unable to attach ppe ds node for arvif\n");
+ 
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -560,11 +560,24 @@ void ath12k_dp_peer_ppeds_route_setup(st
+ }
+ 
+ static int ath12k_dp_ppeds_alloc_ppe_vp_profile(struct ath12k_base *ab,
+-						struct ath12k_dp_ppe_vp_profile **vp_profile)
++						struct ath12k_dp_ppe_vp_profile **vp_profile,
++						int vp_num)
+ {
+ 	int i;
+ 
+ 	mutex_lock(&ab->ppe.ppe_vp_tbl_lock);
++
++	/* If a VP is already allocated with requested vp number, then return
++	 * the same VP instead of creating a new profile
++	 */
++	for (i = 0; i < PPE_VP_ENTRIES_MAX; i++) {
++		if (ab->dp.ppe_vp_profile[i].is_configured &&
++			vp_num == ab->dp.ppe_vp_profile[i].vp_num) {
++			ath12k_info(ab, "vp profile with num %d will be reused\n", vp_num);
++			goto end;
++		}
++	}
++
+ 	if (ab->ppe.num_ppe_vp_profiles == PPE_VP_ENTRIES_MAX) {
+ 		mutex_unlock(&ab->ppe.ppe_vp_tbl_lock);
+ 		ath12k_err(ab, "Maximum ppe_vp count reached for soc\n");
+@@ -584,6 +597,9 @@ static int ath12k_dp_ppeds_alloc_ppe_vp_
+ 	ab->ppe.num_ppe_vp_profiles++;
+ 
+ 	ab->dp.ppe_vp_profile[i].is_configured = true;
++
++end:
++	ab->dp.ppe_vp_profile[i].ref_count++;
+ 	*vp_profile = &ab->dp.ppe_vp_profile[i];
+ 	mutex_unlock(&ab->ppe.ppe_vp_tbl_lock);
+ 
+@@ -594,6 +610,8 @@ static void
+ ath12k_dp_ppeds_dealloc_ppe_vp_profile(struct ath12k_base *ab,
+ 				       int ppe_vp_profile_idx)
+ {
++	bool dealloced = false;
++
+ 	if (ppe_vp_profile_idx < 0 || ppe_vp_profile_idx >= PPE_VP_ENTRIES_MAX) {
+ 		ath12k_err(ab, "Invalid PPE VP profile free index");
+ 		return;
+@@ -606,10 +624,17 @@ ath12k_dp_ppeds_dealloc_ppe_vp_profile(s
+ 		return;
+ 	}
+ 
+-	ab->dp.ppe_vp_profile[ppe_vp_profile_idx].is_configured = false;
+-	ab->ppe.num_ppe_vp_profiles--;
++	ab->dp.ppe_vp_profile[ppe_vp_profile_idx].ref_count--;
++
++	if (!ab->dp.ppe_vp_profile[ppe_vp_profile_idx].ref_count) {
++		ab->dp.ppe_vp_profile[ppe_vp_profile_idx].is_configured = false;
++		ab->ppe.num_ppe_vp_profiles--;
++		dealloced = true;
++	}
+ 	mutex_unlock(&ab->ppe.ppe_vp_tbl_lock);
+-	ath12k_dbg(ab, ATH12K_DBG_PPE, "ath12k_dp_ppeds_dealloc_ppe_vp_profile success\n");
++
++	if (dealloced)
++		ath12k_dbg(ab, ATH12K_DBG_PPE, "ath12k_dp_ppeds_dealloc_ppe_vp_profile success\n");
+ }
+ 
+ static int ath12k_dp_ppeds_alloc_vp_tbl_entry(struct ath12k_base *ab)
+@@ -726,6 +751,24 @@ static void ath12k_dp_ppeds_setup_vp_ent
+ 					   struct ath12k_dp_ppe_vp_profile *ppe_vp_profile)
+ {
+ 	u32 ppe_vp_config = 0;
++	u8 lmac_id;
++	u8 bank_id;
++
++	/*
++	 * In splitphy DS case, when mlo vaps created on different radios,
++	 * the vp profile must be shared between these vaps with wildcard pmac_id,
++	 * as they share the same vp number. We need to create a separate bank
++	 * corresponding the shared vp. Also, this bank should have vdev id check
++	 * disabled, so that the FW can get the ast from any of the lmacs without
++	 * throwing vdev id mismatch error
++	 */
++	if (ppe_vp_profile->ref_count == 1) {
++		lmac_id = ar->lmac_id;
++		bank_id = arvif->bank_id;
++	} else {
++		lmac_id = HAL_TX_PPE_VP_CFG_WILDCARD_LMAC_ID;
++		bank_id = arvif->splitphy_ds_bank_id;
++	}
+ 
+ 	ppe_vp_config |=
+ 		u32_encode_bits(ppe_vp_profile->vp_num,
+@@ -738,8 +781,8 @@ static void ath12k_dp_ppeds_setup_vp_ent
+ 				HAL_TX_PPE_VP_CFG_TO_FW) |
+ 		u32_encode_bits(ppe_vp_profile->drop_prec_enable,
+ 				HAL_TX_PPE_VP_CFG_DROP_PREC_EN) |
+-		u32_encode_bits(arvif->bank_id, HAL_TX_PPE_VP_CFG_BANK_ID) |
+-		u32_encode_bits(ar->lmac_id, HAL_TX_PPE_VP_CFG_PMAC_ID) |
++		u32_encode_bits(bank_id, HAL_TX_PPE_VP_CFG_BANK_ID) |
++		u32_encode_bits(lmac_id, HAL_TX_PPE_VP_CFG_PMAC_ID) |
+ 		u32_encode_bits(arvif->vdev_id, HAL_TX_PPE_VP_CFG_VDEV_ID);
+ 
+ 	ath12k_hal_tx_set_ppe_vp_entry(ab, ppe_vp_config,
+@@ -751,7 +794,7 @@ static void ath12k_dp_ppeds_setup_vp_ent
+ 		   " lmac_id %d vdev_id %d ppe_vp_num_idx %d\n",
+ 		   ppe_vp_profile->vp_num, ppe_vp_profile->search_idx_reg_num,
+ 		   ppe_vp_profile->use_ppe_int_pri, ppe_vp_profile->to_fw,
+-		   ppe_vp_profile->drop_prec_enable, arvif->bank_id, ar->lmac_id,
++		   ppe_vp_profile->drop_prec_enable, bank_id, lmac_id,
+ 		   arvif->vdev_id, ppe_vp_profile->ppe_vp_num_idx);
+ 	return;
+ }
+@@ -807,42 +850,63 @@ static int ath12k_ppeds_attach_link_apvl
+ 	}
+ 
+ 	/*Allocate a ppe vp profile for a vap */
+-	ppe_vp_profile_idx = ath12k_dp_ppeds_alloc_ppe_vp_profile(ab, &vp_profile);
++	ppe_vp_profile_idx = ath12k_dp_ppeds_alloc_ppe_vp_profile(ab, &vp_profile, vp_num);
+ 	if (!vp_profile) {
+ 		ath12k_err(ab, "Failed to allocate PPE VP idx for vdev_id:%d", vdev_id);
+ 		ret = -ENOSR;
+ 		goto vp_free;
+ 	}
+ 
+-	ppe_vp_tbl_idx = ath12k_dp_ppeds_alloc_vp_tbl_entry(ab);
+-	if (ppe_vp_tbl_idx < 0) {
+-		ath12k_err(ab, "Failed to allocate PPE VP idx for vdev_id:%d", vdev_id);
+-		ret = -ENOSR;
+-		goto dealloc_vp_profile;
+-	}
+-
+-	if (arvif->ahvif->vif->type == NL80211_IFTYPE_STATION) {
+-		ppe_vp_search_tbl_idx = ath12k_dp_ppeds_alloc_vp_search_idx_tbl_entry(ab);
+-		if (ppe_vp_search_tbl_idx < 0) {
+-			ath12k_err(ab,
+-				   "Failed to allocate PPE VP search table idx for vdev_id:%d", vdev_id);
++	if (vp_profile->ref_count == 1) {
++		ppe_vp_tbl_idx = ath12k_dp_ppeds_alloc_vp_tbl_entry(ab);
++		if (ppe_vp_tbl_idx < 0) {
++			ath12k_err(ab, "Failed to allocate PPE VP idx for vdev_id:%d", vdev_id);
+ 			ret = -ENOSR;
+-			goto dealloc_vp_tbl_entry;
++			goto dealloc_vp_profile;
+ 		}
+-		vp_profile->search_idx_reg_num = ppe_vp_search_tbl_idx;
+-	}
+ 
+-	vp_profile->vp_num = vp_num;
+-	vp_profile->ppe_vp_num_idx = ppe_vp_tbl_idx;
+-	vp_profile->to_fw = 0;
+-	vp_profile->use_ppe_int_pri = 0;
+-	vp_profile->drop_prec_enable = 0;
+-	vp_profile->arvif = arvif;
++		if (arvif->ahvif->vif->type == NL80211_IFTYPE_STATION) {
++			ppe_vp_search_tbl_idx = ath12k_dp_ppeds_alloc_vp_search_idx_tbl_entry(ab);
++			if (ppe_vp_search_tbl_idx < 0) {
++				ath12k_err(ab,
++						"Failed to allocate PPE VP search table idx for vdev_id:%d", vdev_id);
++				ret = -ENOSR;
++				goto dealloc_vp_tbl_entry;
++			}
++			vp_profile->search_idx_reg_num = ppe_vp_search_tbl_idx;
++		}
+ 
+-	/* For the sta mode fill up the index reg number */
+-	ath12k_dp_ppeds_setup_vp_entry(ab, ar, arvif, vp_profile);
++		vp_profile->vp_num = vp_num;
++		vp_profile->ppe_vp_num_idx = ppe_vp_tbl_idx;
++		vp_profile->to_fw = 0;
++		vp_profile->use_ppe_int_pri = 0;
++		vp_profile->drop_prec_enable = 0;
++		vp_profile->arvif = arvif;
++
++		vlan_iface->ppe_vp_profile_idx[link_id] = ppe_vp_profile_idx;
++	} else {
++		int link_idx;
++		struct ath12k_link_vif *iter_arvif;
++		bool vdevid_chk_en = false;
++
++		vlan_iface->ppe_vp_profile_idx[link_id] = ppe_vp_profile_idx;
++
++		arvif->splitphy_ds_bank_id =
++			ath12k_dp_tx_get_bank_profile(ab, arvif, &ab->dp, vdevid_chk_en);
++
++		for_each_set_bit(link_idx, &ahvif->links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
++			iter_arvif = ahvif->link[link_idx];
++
++			if (!iter_arvif || iter_arvif == arvif ||
++					ab != iter_arvif->ab)
++				continue;
++
++			iter_arvif->splitphy_ds_bank_id =
++						arvif->splitphy_ds_bank_id;
++		}
++	}
+ 
+-	vlan_iface->ppe_vp_profile_idx[link_id] = ppe_vp_profile_idx;
++	ath12k_dp_ppeds_setup_vp_entry(ab, ar, arvif, vp_profile);
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_PPE,
+ 		   "PPEDS vdev attach success chip_id %d soc_idx %d ds_node_id %d vdev_id %d vpnum %d ppe_vp_profile_idx %d "
+@@ -891,12 +955,15 @@ void ath12k_ppe_ds_attach_vlan_vif_link(
+ }
+ 
+ int ath12k_ppeds_attach_link_vif(struct ath12k_link_vif *arvif, int vp_num,
+-				 int *link_ppe_vp_profile_idx)
++				 int *link_ppe_vp_profile_idx,
++				 struct ieee80211_vif *vif)
+ {
+ 	struct ath12k *ar = arvif->ar;
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_vif *ahvif = arvif->ahvif;
+ 	struct ath12k_dp_ppe_vp_profile *vp_profile = NULL;
++	struct ieee80211_sta *sta;
++	struct ath12k_sta *ahsta;
+ 	int ppe_vp_profile_idx, ppe_vp_tbl_idx;
+ 	int ppe_vp_search_tbl_idx = -1;
+ 	int vdev_id = arvif->vdev_id;
+@@ -920,42 +987,95 @@ int ath12k_ppeds_attach_link_vif(struct
+ 	}
+ 
+ 	/*Allocate a ppe vp profile for a vap */
+-	ppe_vp_profile_idx = ath12k_dp_ppeds_alloc_ppe_vp_profile(ab, &vp_profile);
++	ppe_vp_profile_idx = ath12k_dp_ppeds_alloc_ppe_vp_profile(ab, &vp_profile, vp_num);
+ 	if (!vp_profile) {
+ 		ath12k_err(ab, "Failed to allocate PPE VP idx for vdev_id:%d", vdev_id);
+ 		ret = -ENOSR;
+ 		goto vp_free;
+ 	}
+ 
+-	ppe_vp_tbl_idx = ath12k_dp_ppeds_alloc_vp_tbl_entry(ab);
+-	if (ppe_vp_tbl_idx < 0) {
+-		ath12k_err(ab, "Failed to allocate PPE VP idx for vdev_id:%d", vdev_id);
+-		ret = -ENOSR;
+-		goto dealloc_vp_profile;
+-	}
+-
+-	if (arvif->ahvif->vif->type == NL80211_IFTYPE_STATION) {
+-		ppe_vp_search_tbl_idx = ath12k_dp_ppeds_alloc_vp_search_idx_tbl_entry(ab);
+-		if (ppe_vp_search_tbl_idx < 0) {
+-			ath12k_err(ab,
+-				   "Failed to allocate PPE VP search table idx for vdev_id:%d", vdev_id);
++	if (vp_profile->ref_count == 1) {
++		ppe_vp_tbl_idx = ath12k_dp_ppeds_alloc_vp_tbl_entry(ab);
++		if (ppe_vp_tbl_idx < 0) {
++			ath12k_err(ab, "Failed to allocate PPE VP idx for vdev_id:%d", vdev_id);
+ 			ret = -ENOSR;
+-			goto dealloc_vp_tbl_entry;
++			goto dealloc_vp_profile;
+ 		}
+-		vp_profile->search_idx_reg_num = ppe_vp_search_tbl_idx;
+-	}
+ 
+-	vp_profile->vp_num = vp_num;
+-	vp_profile->ppe_vp_num_idx = ppe_vp_tbl_idx;
+-	vp_profile->to_fw = 0;
+-	vp_profile->use_ppe_int_pri = 0;
+-	vp_profile->drop_prec_enable = 0;
+-	vp_profile->arvif = arvif;
++		if (arvif->ahvif->vif->type == NL80211_IFTYPE_STATION) {
++			ppe_vp_search_tbl_idx = ath12k_dp_ppeds_alloc_vp_search_idx_tbl_entry(ab);
++			if (ppe_vp_search_tbl_idx < 0) {
++				ath12k_err(ab,
++						"Failed to allocate PPE VP search table idx for vdev_id:%d", vdev_id);
++				ret = -ENOSR;
++				goto dealloc_vp_tbl_entry;
++			}
++			vp_profile->search_idx_reg_num = ppe_vp_search_tbl_idx;
++		}
+ 
+-	/* For the sta mode fill up the index reg number */
+-	ath12k_dp_ppeds_setup_vp_entry(ab, ar, arvif, vp_profile);
++		vp_profile->vp_num = vp_num;
++		vp_profile->ppe_vp_num_idx = ppe_vp_tbl_idx;
++		vp_profile->to_fw = 0;
++		vp_profile->use_ppe_int_pri = 0;
++		vp_profile->drop_prec_enable = 0;
++		vp_profile->arvif = arvif;
++
++		*link_ppe_vp_profile_idx = ppe_vp_profile_idx;
++	} else {
++		int link_idx;
++		struct ath12k_link_vif *iter_arvif;
++		bool vdevid_chk_en = false;
++
++		if (arvif->ahvif->links_map &&
++			arvif->ahvif->vif->type == NL80211_IFTYPE_STATION) {
++			struct ath12k_link_vif *arvif;
++			struct ath12k_base *prim_ab;
++			struct ath12k_dp_ppe_vp_profile *prim_vp_profile;
++
++			rcu_read_lock();
++			sta = ieee80211_find_sta(vif, vif->cfg.ap_addr);
++			if (!sta) {
++				ath12k_warn(ab, "failed to find station entry for %pM",
++					    vif->cfg.ap_addr);
++				rcu_read_unlock();
++				return -ENOENT;
++			}
++
++			ahsta = ath12k_sta_to_ahsta(sta);
++			arvif = (!sta->mlo) ? ahvif->link[ahsta->deflink.link_id] :
++				ahvif->link[ahsta->primary_link_id];
++			if (!arvif) {
++				ath12k_warn(ab, "arvif not found for station:%pM",
++					    sta->addr);
++				rcu_read_unlock();
++				return -EINVAL;
++			}
++
++			prim_ab = arvif->ar->ab;
++			prim_vp_profile = &prim_ab->dp.ppe_vp_profile[arvif->ppe_vp_profile_idx];
++
++			vp_profile->search_idx_reg_num =
++					prim_vp_profile->search_idx_reg_num;
++			rcu_read_unlock();
++		}
++
++		*link_ppe_vp_profile_idx = ppe_vp_profile_idx;
++
++		arvif->splitphy_ds_bank_id = ath12k_dp_tx_get_bank_profile(ab, arvif, &ab->dp, vdevid_chk_en);
++
++		for_each_set_bit(link_idx, &ahvif->links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
++			iter_arvif = ahvif->link[link_idx];
++
++			if (!iter_arvif || iter_arvif == arvif ||
++					ab != iter_arvif->ab)
++				continue;
+ 
+-	*link_ppe_vp_profile_idx = ppe_vp_profile_idx;
++			iter_arvif->splitphy_ds_bank_id = arvif->splitphy_ds_bank_id;
++		}
++
++	}
++
++	ath12k_dp_ppeds_setup_vp_entry(ab, ar, arvif, vp_profile);
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_PPE,
+ 		   "PPEDS vdev attach success chip_id %d soc_idx %d ds_node_id %d vdev_id %d vpnum %d ppe_vp_profile_idx %d "
+--- a/drivers/net/wireless/ath/ath12k/ppe.h
++++ b/drivers/net/wireless/ath/ath12k/ppe.h
+@@ -52,7 +52,6 @@ struct ath12k_ppeds_stats {
+ 	u32 release_rx_desc_cnt;
+ 	u32 num_rx_desc_freed;
+ 	u32 num_rx_desc_realloc;
+-	u32 splitphy_fallbacks;
+ 	u32 tqm_rel_reason[HAL_WBM_TQM_REL_REASON_MAX];
+ };
+ 
+@@ -102,7 +101,8 @@ void ath12k_ppe_ds_attach_vlan_vif_link(
+ 					int ppe_vp_num);
+ int ath12k_ppeds_attach( struct ath12k_base *ab);
+ int ath12k_ppeds_attach_link_vif(struct ath12k_link_vif *arvif, int vp_num,
+-				 int *link_ppe_vp_profile_idx);
++				 int *link_ppe_vp_profile_idx,
++				 struct ieee80211_vif *vif);
+ void ath12k_ppeds_detach_link_apvlan_vif(struct ath12k_link_vif *arvif,
+ 					 struct ath12k_vlan_iface *vlan_iface,
+ 					 int link_id);
+@@ -179,7 +179,8 @@ int ath12k_ppeds_attach( struct ath12k_b
+ }
+ 
+ int ath12k_ppeds_attach_link_vif(struct ath12k_link_vif *arvif, int vp_num,
+-				 int *link_ppe_vp_profile_idx)
++				 int *link_ppe_vp_profile_idx,
++				 struct ieee80211_vif *vif)
+ {
+ 	return 0;
+ }
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -436,6 +436,7 @@ struct ath12k_link_vif {
+ 	bool pending_up;
+ 	bool pending_stop;
+ 	bool spectral_enabled;
++	bool primary_sta_link;
+ 	u8 bssid[ETH_ALEN];
+ 	struct cfg80211_bitrate_mask bitrate_mask;
+ 	struct delayed_work connection_loss_work;
+diff --git a/drivers/net/wireless/ath/ath12k/dp.c b/drivers/net/wireless/ath/ath12k/dp.c
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -92,6 +92,7 @@ int ath12k_dp_peer_setup(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 			 struct ath12k_link_sta *arsta)
+ {
+ 	struct ath12k_base *ab = ar->ab;
++	struct ieee80211_vif *vif = arvif->ahvif->vif;
+ 	struct ath12k_peer *peer;
+ 	struct crypto_shash *tfm;
+ 	int ret = 0, tid;
+@@ -112,10 +113,15 @@ int ath12k_dp_peer_setup(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 	if (peer->mlo && peer->link_id != arsta->ahsta->primary_link_id) {
+ 		ret = 0;
+ 		peer->primary_link = false;
++		arvif->primary_sta_link = false;
+ 		goto free_shash;
+ 	}
+ 
+ 	peer->primary_link = true;
++	arvif->primary_sta_link = true;
++
++	if (vif->type == NL80211_IFTYPE_STATION)
++		ath12k_dp_tx_ppeds_cfg_astidx_cache_mapping(ar->ab, arvif, true);
+ 
+ 	for (tid = 0; tid <= IEEE80211_NUM_TIDS; tid++) {
+ 		ret = ath12k_dp_rx_peer_tid_setup(ar, tid, 1, 0, HAL_PN_TYPE_NONE, peer);
+diff --git a/drivers/net/wireless/ath/ath12k/peer.c b/drivers/net/wireless/ath/ath12k/peer.c
+index 564a630..761bf90 100644
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -852,7 +852,6 @@ int ath12k_peer_create(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 		arvif->ast_idx = peer->hw_peer_id;
+ 		arvif->desc.info4 = FIELD_PREP(HAL_TCL_DATA_CMD_INFO4_SEARCH_INDEX, arvif->ast_idx) |
+ 				    FIELD_PREP(HAL_TCL_DATA_CMD_INFO4_CACHE_SET_NUM, arvif->ast_hash);
+-		ath12k_dp_tx_ppeds_cfg_astidx_cache_mapping(ar->ab, arvif, true);
+ 	}
+ 
+ 	peer->sec_type = HAL_ENCRYPT_TYPE_OPEN;
+diff --git a/drivers/net/wireless/ath/ath12k/ppe.c b/drivers/net/wireless/ath/ath12k/ppe.c
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -1137,7 +1137,8 @@ void ath12k_dp_tx_ppeds_cfg_astidx_cache_mapping(struct ath12k_base *ab,
+ 	int ppe_vp_profile_idx = arvif->ppe_vp_profile_idx;
+ 	struct ath12k_dp_ppe_vp_profile *vp_profile;
+ 
+-	if (!test_bit(ATH12K_FLAG_PPE_DS_ENABLED, &ab->dev_flags))
++	if (!test_bit(ATH12K_FLAG_PPE_DS_ENABLED, &ab->dev_flags) ||
++			!arvif->primary_sta_link)
+ 		return;
+ 
+ 	vp_profile = &ab->dp.ppe_vp_profile[ppe_vp_profile_idx];

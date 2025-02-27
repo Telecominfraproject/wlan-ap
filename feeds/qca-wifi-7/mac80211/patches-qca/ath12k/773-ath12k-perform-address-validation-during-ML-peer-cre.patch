@@ -1,0 +1,418 @@
+From f54fefe63c059acebcddd2fa3da4dbd33dd80330 Mon Sep 17 00:00:00 2001
+From: Sriram R <quic_srirrama@quicinc.com>
+Date: Fri, 12 May 2023 02:02:57 +0530
+Subject: [PATCH] ath12k: perform address validation during ML peer creation
+
+Add address validation to ensure we are not creating link
+peers (belonging to different clients) with same MLD address.
+Also, validate if the link peer getting added does not have
+its address same as any of the MLD address.
+To aid in this validation for faster lookup, add a new list
+of ML peers at ah level and use the same for parsing for
+the above address validation use cases.
+
+Signed-off-by: Sriram R <quic_srirrama@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |   6 ++
+ drivers/net/wireless/ath/ath12k/mac.c  |  68 ++++++------
+ drivers/net/wireless/ath/ath12k/peer.c | 137 ++++++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/peer.h |  16 +--
+ 4 files changed, 178 insertions(+), 49 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -969,6 +969,12 @@ struct ath12k_hw {
+ 	u8 supported_band_mask;
+ 	u8 num_radio;
+ 	DECLARE_BITMAP(free_ml_peer_id_map, ATH12K_MAX_MLO_PEERS);
++
++	/* Used for protecting objects used at ah level, ex. ath12k_ml_peer */
++	spinlock_t data_lock;
++
++	/* protected by ah->data_lock */
++	struct list_head ml_peers;
+ 	struct ath12k radio[0] __aligned(sizeof(void *));
+ };
+ 
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -6959,29 +6959,6 @@ static u32 ath12k_mac_ieee80211_sta_bw_t
+ 	return bw;
+ }
+ 
+-static u16 ath12k_mac_alloc_ml_peer_id(struct ath12k_hw *ah)
+-{
+-
+-	u16 ml_peer_id;
+-
+-	lockdep_assert_held(&ah->conf_mutex);
+-
+-	for (ml_peer_id = 0; ml_peer_id < ATH12K_MAX_MLO_PEERS; ml_peer_id++) {
+-		if (test_bit(ml_peer_id, ah->free_ml_peer_id_map))
+-			continue;
+-
+-		set_bit(ml_peer_id, ah->free_ml_peer_id_map);
+-		break;
+-	}
+-
+-	if (ml_peer_id == ATH12K_MAX_MLO_PEERS)
+-		ml_peer_id = ATH12K_MLO_PEER_ID_INVALID;
+-
+-	ath12k_dbg(NULL, ATH12K_DBG_PEER, "Allocated ml_peer_id:%d", ml_peer_id);
+-
+-	return ml_peer_id;
+-}
+-
+ static int ath12k_mac_assign_link_sta(struct ath12k_hw *ah,
+ 				       struct ath12k_sta *ahsta,
+ 				       struct ath12k_link_sta *arsta,
+@@ -7104,14 +7081,14 @@ static void ath12k_mac_ml_station_remove
+ 
+ 	sta = container_of((void *)ahsta, struct ieee80211_sta, drv_priv);
+ 
+-	ath12k_ml_peer_delete(ahvif, ahsta);
++	ath12k_ml_link_peers_delete(ahvif, ahsta);
+ 
+ 	/* validate link station removal and clear arsta links */
+ 	for_each_set_bit(link_id, &sta->valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
+ 		arvif = ahvif->link[link_id];
+ 		arsta = ahsta->link[link_id];
+ 
+-		if (WARN_ON(!arvif || !arsta))
++		if (!arvif || !arsta)
+ 			continue;
+ 
+ 		ar = arvif->ar;
+@@ -7122,8 +7099,7 @@ static void ath12k_mac_ml_station_remove
+ 
+ 		ath12k_mac_free_unassign_link_sta(ah, ahsta, link_id);
+ 	}
+-	clear_bit(ahsta->ml_peer_id, ah->free_ml_peer_id_map);
+-	ahsta->ml_peer_id = ATH12K_MLO_PEER_ID_INVALID;
++	ath12k_ml_peer_delete(ah, sta);
+ }
+ 
+ static int ath12k_mac_handle_link_sta_state(struct ieee80211_hw *hw,
+@@ -7353,12 +7329,11 @@ static int ath12k_mac_op_sta_state(struc
+ 	/* assign default link to the first link sta */
+ 	if (!ahsta->links_map && hweight16(sta->valid_links) == 1 &&
+ 	    new_state == IEEE80211_STA_NONE && old_state == IEEE80211_STA_NOTEXIST) {
+-		ahsta->ml_peer_id = ath12k_mac_alloc_ml_peer_id(ah);
+-
+-		if (ahsta->ml_peer_id == ATH12K_MLO_PEER_ID_INVALID) {
+-			ath12k_err(NULL, "unable to allocate ml peer id for sta %pM", sta->addr);
++		ret = ath12k_ml_peer_create(ah, sta);
++		if (ret) {
++			ath12k_err(NULL, "unable to create ML peer for sta %pM", sta->addr);
+ 			mutex_unlock(&ah->conf_mutex);
+-			return -ENOSPC;
++			return ret;
+ 		}
+ 
+ 		ath12k_mac_assign_link_sta(ah, ahsta, &ahsta->deflink,
+@@ -7386,6 +7361,16 @@ static int ath12k_mac_op_sta_state(struc
+ 		if (ret) {
+ 			ath12k_err(NULL, "unable to move link sta %d of sta %pM from state %d to %d",
+ 				   link_id, arsta->addr, old_state, new_state);
++
++			if (old_state == IEEE80211_STA_NOTEXIST && new_state == IEEE80211_STA_NONE) {
++
++				/* Unassign this link sta which couldnt be added to FW and
++				 * cleanup the other link stations added earlier
++				 */
++				ath12k_mac_free_unassign_link_sta(ah, ahsta, link_id);
++				ath12k_mac_ml_station_remove(ahvif, ahsta);
++			}
++
+ 			mutex_unlock(&ah->conf_mutex);
+ 			return ret;
+ 		}
+@@ -7415,11 +7400,17 @@ static int ath12k_mac_op_change_sta_link
+ 	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
+ 	struct ath12k_sta *ahsta = (struct ath12k_sta *)sta->drv_priv;
+ 	u8 link_id;
+-	int ret;
++	int ret = 0;
+ 
+ 	if (!sta->valid_links)
+ 		return -EINVAL;
+ 
++	/* FW doesnt support removal of one of link stas. All sta would be removed during ML STA
++	 * delete in sta_state(), hence link sta removal is not handled here.
++	 */
++	if (new_links < old_links)
++		return 0;
++
+ 	mutex_lock(&ah->conf_mutex);
+ 
+ 	if (ahsta->ml_peer_id == ATH12K_MLO_PEER_ID_INVALID) {
+@@ -7447,18 +7438,19 @@ static int ath12k_mac_op_change_sta_link
+ 
+ 		mutex_lock(&ar->conf_mutex);
+ 		ret = ath12k_mac_station_add(ar, arvif, arsta);
+-		if (ret)
++		if (ret) {
++			mutex_unlock(&ar->conf_mutex);
+ 			ath12k_warn(ar->ab, "Failed to add station: %pM for VDEV: %d\n",
+ 				    arsta->addr, arvif->vdev_id);
++			ath12k_mac_free_unassign_link_sta(ah, ahsta, link_id);
++			break;
++		}
+ 		mutex_unlock(&ar->conf_mutex);
+ 	}
+ 
+-	/* FW doesnt support removal of one of link stas. All sta would be removed during ML STA
+-	 * delete in sta_state(), hence link sta removal is not handled here.
+-	 */
+ 	mutex_unlock(&ah->conf_mutex);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static void ath12k_mac_op_sta_set_4addr(struct ieee80211_hw *hw,
+@@ -15541,6 +15533,8 @@ int ath12k_mac_allocate(struct ath12k_hw
+ 			     ah->num_radio, ag->id, ag->num_chip);
+ 
+ 		mutex_init(&ah->conf_mutex);
++		INIT_LIST_HEAD(&ah->ml_peers);
++		spin_lock_init(&ah->data_lock);
+ 
+ 		link_id = 0;
+ 		for (j = 0; j < num_radios; j++) {
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -8,9 +8,22 @@
+ #include "peer.h"
+ #include "debug.h"
+ 
+-/* TODO extend peer search apis for ml addr either combined or separately
+- * based on dp needs
+- */
++static struct ath12k_ml_peer *ath12k_ml_peer_find(struct ath12k_hw *ah,
++						  const u8 *addr)
++{
++	struct ath12k_ml_peer *ml_peer;
++
++	lockdep_assert_held(&ah->data_lock);
++
++	list_for_each_entry(ml_peer, &ah->ml_peers, list) {
++		if (!ether_addr_equal(ml_peer->addr, addr))
++			continue;
++
++		return ml_peer;
++	}
++
++	return NULL;
++}
+ 
+ struct ath12k_peer *ath12k_peer_find(struct ath12k_base *ab, int vdev_id,
+ 				     const u8 *addr)
+@@ -344,7 +357,7 @@ int ath12k_peer_delete(struct ath12k *ar
+ 	return 0;
+ }
+ 
+-int ath12k_ml_peer_delete(struct ath12k_vif *ahvif, struct ath12k_sta *ahsta)
++int ath12k_ml_link_peers_delete(struct ath12k_vif *ahvif, struct ath12k_sta *ahsta)
+ {
+ 	struct ath12k_link_vif *arvif;
+ 	struct ath12k_link_sta *arsta;
+@@ -368,7 +381,7 @@ int ath12k_ml_peer_delete(struct ath12k_
+ 		arvif = ahvif->link[link_id];
+ 		arsta = ahsta->link[link_id];
+ 
+-		if (WARN_ON(!arvif || !arsta))
++		if (!arvif || !arsta)
+ 			continue;
+ 
+ 		ar = arvif->ar;
+@@ -395,7 +408,7 @@ int ath12k_ml_peer_delete(struct ath12k_
+ 		arvif = ahvif->link[link_id];
+ 		arsta = ahsta->link[link_id];
+ 
+-		if (WARN_ON(!arvif || !arsta))
++		if (!arvif || !arsta)
+ 			continue;
+ 
+ 		ar = arvif->ar;
+@@ -428,6 +441,7 @@ int ath12k_peer_create(struct ath12k *ar
+ 	struct ath12k_link_sta *arsta;
+ 	u8 link_id = arvif->link_id;
+ 	struct ieee80211_vif *vif = arvif->ahvif->vif;
++	struct ath12k_ml_peer *ml_peer;
+ 	int ret;
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+@@ -438,6 +452,24 @@ int ath12k_peer_create(struct ath12k *ar
+ 		return -ENOBUFS;
+ 	}
+ 
++	/* Check if a ML peer with same address as this link peer already
++	 * exists
++	 */
++	if (sta) {
++		ahsta = (struct ath12k_sta *)sta->drv_priv;
++		spin_lock_bh(&ar->ah->data_lock);
++		ml_peer = ath12k_ml_peer_find(ar->ah, arg->peer_addr);
++		if (ml_peer && (!sta->mlo || ml_peer->id != ahsta->ml_peer_id)) {
++			spin_unlock_bh(&ar->ah->data_lock);
++			ath12k_warn(ar->ab,
++				    "failed to create link peer %pM due to conflicting address with already associated ML peer %pM with ml peer id %d\n",
++				    arg->peer_addr, ml_peer->addr,
++				    ml_peer->id);
++			return -EINVAL;
++		}
++		spin_unlock_bh(&ar->ah->data_lock);
++	}
++
+ 	spin_lock_bh(&ar->ab->base_lock);
+ 	peer = ath12k_peer_find_by_pdev_idx(ar->ab, ar->pdev_idx, arg->peer_addr);
+ 	if (peer) {
+@@ -517,9 +549,107 @@ int ath12k_peer_create(struct ath12k *ar
+ 
+ 	ar->num_peers++;
+ 
+-	ath12k_dbg(ar->ab, ATH12K_DBG_PEER, "peer created %pM\n", param->peer_addr);
++	ath12k_dbg(ar->ab, ATH12K_DBG_PEER, "peer created %pM\n", arg->peer_addr);
+ 
+ 	spin_unlock_bh(&ar->ab->base_lock);
+ 
+ 	return 0;
+ }
++
++static u16 ath12k_mac_alloc_ml_peer_id(struct ath12k_hw *ah)
++{
++
++	u16 ml_peer_id;
++
++	lockdep_assert_held(&ah->conf_mutex);
++
++	for (ml_peer_id = 0; ml_peer_id < ATH12K_MAX_MLO_PEERS; ml_peer_id++) {
++		if (test_bit(ml_peer_id, ah->free_ml_peer_id_map))
++			continue;
++
++		set_bit(ml_peer_id, ah->free_ml_peer_id_map);
++		break;
++	}
++
++	if (ml_peer_id == ATH12K_MAX_MLO_PEERS)
++		ml_peer_id = ATH12K_MLO_PEER_ID_INVALID;
++
++	ath12k_dbg(NULL, ATH12K_DBG_PEER, "Allocated ml_peer_id:%d", ml_peer_id);
++
++	return ml_peer_id;
++}
++
++int ath12k_ml_peer_create(struct ath12k_hw *ah, struct ieee80211_sta *sta)
++{
++	struct ath12k_sta *ahsta = (struct ath12k_sta *)sta->drv_priv;
++	struct ath12k_ml_peer *ml_peer;
++
++	lockdep_assert_held(&ah->conf_mutex);
++
++	if (!sta->mlo)
++		return -EINVAL;
++
++	spin_lock_bh(&ah->data_lock);
++	ml_peer = ath12k_ml_peer_find(ah, sta->addr);
++	if (ml_peer) {
++		spin_unlock_bh(&ah->data_lock);
++		ath12k_err(NULL, "ML peer(id=%d) exists already, unable to add new entry for %pM",
++			   ml_peer->id, sta->addr);
++		return -EEXIST;
++	}
++
++	ml_peer = kzalloc(sizeof(*ml_peer), GFP_ATOMIC);
++	if (!ml_peer) {
++		spin_unlock_bh(&ah->data_lock);
++		ath12k_err(NULL, "unable to allocate new ML peer for %pM",
++			   sta->addr);
++		return -ENOMEM;
++	}
++
++	ahsta->ml_peer_id = ath12k_mac_alloc_ml_peer_id(ah);
++
++	if (ahsta->ml_peer_id == ATH12K_MLO_PEER_ID_INVALID) {
++		kfree(ml_peer);
++		spin_unlock_bh(&ah->data_lock);
++		ath12k_err(NULL, "unable to allocate ml peer id for sta %pM", sta->addr);
++		return -ENOMEM;
++	}
++
++	ether_addr_copy(ml_peer->addr, sta->addr);
++	ml_peer->id = ahsta->ml_peer_id;
++	list_add(&ml_peer->list, &ah->ml_peers);
++	spin_unlock_bh(&ah->data_lock);
++
++	ath12k_dbg(NULL, ATH12K_DBG_PEER, "ML peer created for %pM id %d\n",
++		   sta->addr, ahsta->ml_peer_id);
++	return 0;
++}
++
++int ath12k_ml_peer_delete(struct ath12k_hw *ah, struct ieee80211_sta *sta)
++{
++	struct ath12k_sta *ahsta = (struct ath12k_sta *)sta->drv_priv;
++	struct ath12k_ml_peer *ml_peer;
++
++	lockdep_assert_held(&ah->conf_mutex);
++	if (!sta->mlo)
++		return -EINVAL;
++
++	clear_bit(ahsta->ml_peer_id, ah->free_ml_peer_id_map);
++	ahsta->ml_peer_id = ATH12K_MLO_PEER_ID_INVALID;
++
++	spin_lock_bh(&ah->data_lock);
++	ml_peer = ath12k_ml_peer_find(ah, sta->addr);
++	if (!ml_peer) {
++		spin_unlock_bh(&ah->data_lock);
++		ath12k_err(NULL, "ML peer for %pM not found", sta->addr);
++		return -EINVAL;
++	}
++
++	list_del(&ml_peer->list);
++	kfree(ml_peer);
++	spin_unlock_bh(&ah->data_lock);
++
++	ath12k_dbg(NULL, ATH12K_DBG_PEER, "ML peer deleted for %pM\n",
++		   sta->addr);
++	return 0;
++}
+--- a/drivers/net/wireless/ath/ath12k/peer.h
++++ b/drivers/net/wireless/ath/ath12k/peer.h
+@@ -20,12 +20,6 @@ struct ppdu_user_delayba {
+ 	u32 resp_rate_flags;
+ };
+ 
+-/* Note: The ml info is embedded into the link peer
+- * objects, based on hot dp requirements to fetch link peer
+- * or ml peer based on ml peer id and ml address separate
+- * ml peer list maintained in ah can be done. For now it
+- * doesnt seem to be needed
+- */
+ struct ath12k_peer {
+ 	struct list_head list;
+ 	struct ieee80211_sta *sta;
+@@ -80,6 +74,12 @@ struct ath12k_peer {
+ 	u8 ml_addr[ETH_ALEN];
+ };
+ 
++struct ath12k_ml_peer {
++	struct list_head list;
++	u8 addr[ETH_ALEN];
++	u16 id;
++};
++
+ void ath12k_peer_unmap_event(struct ath12k_base *ab, u16 peer_id);
+ void ath12k_peer_map_event(struct ath12k_base *ab, u8 vdev_id, u16 peer_id,
+ 			   u8 *mac_addr, u16 ast_hash, u16 hw_peer_id);
+@@ -90,7 +90,9 @@ struct ath12k_peer *ath12k_peer_find_by_
+ struct ath12k_peer *ath12k_peer_find_by_id(struct ath12k_base *ab, int peer_id);
+ void ath12k_peer_cleanup(struct ath12k *ar, u32 vdev_id);
+ int ath12k_peer_delete(struct ath12k *ar, u32 vdev_id, u8 *addr);
+-int ath12k_ml_peer_delete(struct ath12k_vif *ahvif, struct ath12k_sta *ahsta);
++int ath12k_ml_link_peers_delete(struct ath12k_vif *ahvif, struct ath12k_sta *ahsta);
++int ath12k_ml_peer_create(struct ath12k_hw *ah, struct ieee80211_sta *sta);
++int ath12k_ml_peer_delete(struct ath12k_hw *ah, struct ieee80211_sta *sta);
+ int ath12k_peer_create(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 		       struct ieee80211_sta *sta,
+ 		       struct ath12k_wmi_peer_create_arg *arg);

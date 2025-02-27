@@ -1,0 +1,304 @@
+From 6a71992b52a56f13f70c02fac05253940b06655f Mon Sep 17 00:00:00 2001
+From: Hariharan Basuthkar <quic_hbasuthk@quicinc.com>
+Date: Tue, 28 May 2024 12:27:23 +0530
+Subject: [PATCH] wifi: ath12k: Add 6 GHz switch power mode support
+
+Add support to parse the incoming
+QCA_NL80211_VENDOR_SUBCMD_SET_6GHZ_POWER_MODE and check whether
+current operating channel and bandwidth is supported
+for the given 6 GHz power mode configuration.
+
+If supported, send WMI_VDEV_SET_TPC_POWER_CMD command to the target
+switch power mode and send the
+QCA_NL80211_VENDOR_SUBCMD_POWER_MODE_CHANGE_COMPLETED to indicate
+hostapd, to update the power mode in the beacon and
+probe response frames.
+
+Patch-depdendency: 333-0020-mac80211-add-support-for-6G-channels-and-regulatory.patch
+                   916-wifi-mac80211-Add-cfg-and-mac-changes-for-power-mode.patch
+Tag: 6G_REGULATORY
+
+Signed-off-by: Hariharan Basuthkar <quic_hbasuthk@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c    |  31 ++++++
+ drivers/net/wireless/ath/ath12k/vendor.c | 114 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/vendor.h |  62 ++++++++++++
+ 3 files changed, 207 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -4716,6 +4716,13 @@ static int ath12k_mac_config_obss_pd(str
+ 	return 0;
+ }
+ 
++static void ath12k_mac_send_pwr_mode_update(struct ath12k *ar,
++					    struct wireless_dev *wdev)
++{
++	ath12k_vendor_send_6ghz_power_mode_update_complete(ar,
++							   wdev);
++}
++
+ void ath12k_mac_bss_info_changed(struct ath12k *ar,
+ 				 struct ath12k_link_vif *arvif,
+ 				 struct ieee80211_bss_conf *info,
+@@ -4738,12 +4745,36 @@ void ath12k_mac_bss_info_changed(struct
+ 	u32 rate;
+ 	bool color_collision_detect;
+ 	u8 link_id = arvif->link_id;
++	struct wireless_dev *wdev = ieee80211_vif_to_wdev(vif);
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+ 
+ 	if (unlikely(test_bit(ATH12K_FLAG_CRASH_FLUSH, &ar->ab->dev_flags)))
+ 		return;
+ 
++	if (changed & BSS_CHANGED_6GHZ_POWER_MODE) {
++		if (WARN_ON(ath12k_mac_vif_chan(ahvif->vif, &def, link_id))) {
++			ath12k_warn(ar->ab, "Failed to fetch chandef");
++			return;
++		}
++		if (ar->supports_6ghz && def.chan->band == NL80211_BAND_6GHZ &&
++		    ahvif->vdev_type == WMI_VDEV_TYPE_AP &&
++		    test_bit(WMI_TLV_SERVICE_EXT_TPC_REG_SUPPORT,
++			     ar->ab->wmi_ab.svc_map)) {
++			ath12k_mac_fill_reg_tpc_info(ar, arvif,
++						     &arvif->chanctx);
++			ret = ath12k_wmi_send_vdev_set_tpc_power(ar,
++								 arvif->vdev_id,
++								 &arvif->reg_tpc_info);
++			if (ret)
++				ath12k_warn(ar->ab, "Failed to set 6GHZ power mode\n");
++			else
++				ath12k_mac_send_pwr_mode_update(ar, wdev);
++		} else {
++			ath12k_warn(ar->ab, "Set 6GHZ power mode not applicable\n");
++		}
++	}
++
+ 	if (changed & BSS_CHANGED_BEACON_INT) {
+ 		arvif->beacon_interval = info->beacon_int;
+ 
+--- a/drivers/net/wireless/ath/ath12k/vendor.c
++++ b/drivers/net/wireless/ath/ath12k/vendor.c
+@@ -2007,6 +2007,112 @@ void ath12k_erp_deinit(void)
+ 	mutex_destroy(&erp_sm.lock);
+ }
+ 
++static const struct nla_policy
++ath12k_cfg80211_power_mode_set_policy[QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE_MAX + 1] = {
++	[QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE] = { .type = NLA_U8 },
++};
++
++static int ath12k_vendor_6ghz_power_mode_change(struct wiphy *wiphy,
++						struct wireless_dev *wdev,
++						const void *data,
++						int data_len)
++{
++	struct ath12k *ar;
++	u8 link_id = 0;
++	struct nlattr *tb[QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE + 1];
++	u8 ap_6ghz_pwr_mode;
++	struct cfg80211_chan_def *chan_def;
++	int err;
++
++	if (!wdev)
++		return -EINVAL;
++
++	if (!data || !data_len) {
++		ath12k_err(NULL, "Invalid data length data ptr: %pK ", data);
++		return -EINVAL;
++	}
++
++	if (nla_parse(tb, QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE, data,
++		      data_len, ath12k_cfg80211_power_mode_set_policy, NULL)) {
++		ath12k_err(NULL,
++			   "QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE parsing failed");
++		return -EINVAL;
++	}
++
++	for_each_valid_link(wdev, link_id) {
++		if (wdev->links[link_id].ap.chandef.chan->band ==
++		    NL80211_BAND_6GHZ)
++			break;
++	}
++
++	if (link_id >= IEEE80211_MLD_MAX_NUM_LINKS)
++		return -EINVAL;
++
++	ar = ath12k_get_ar_from_wdev(wdev, link_id);
++	if (!ar)
++		return -ENODATA;
++
++	chan_def = &wdev->links[link_id].ap.chandef;
++
++	if (!tb[QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE])
++		return -EINVAL;
++
++	ap_6ghz_pwr_mode =
++		nla_get_u8(tb[QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE]);
++
++	if (ap_6ghz_pwr_mode < QCA_WLAN_VENDOR_6GHZ_PWR_MODE_AP_LPI ||
++	    ap_6ghz_pwr_mode > QCA_WLAN_VENDOR_6GHZ_PWR_MODE_AP_VLP) {
++		ath12k_err(NULL, "Invalid 6 GHZ pwr mode configuration");
++		return -EINVAL;
++	}
++
++	err = cfg80211_validate_freq_width_for_pwr_mode(wiphy, chan_def,
++							ap_6ghz_pwr_mode);
++	if (err) {
++		ath12k_err(NULL, "Current chan does not support the power mode");
++		return err;
++	}
++
++	err = ieee80211_6ghz_power_mode_change(wiphy, wdev,
++					       ap_6ghz_pwr_mode, link_id);
++
++	return err;
++}
++
++int ath12k_vendor_send_6ghz_power_mode_update_complete(struct ath12k *ar,
++						       struct wireless_dev *wdev)
++{
++	struct sk_buff *vendor_event;
++	int ret = 0;
++	int vendor_buffer_len = nla_total_size(sizeof(u8));
++	u8 ap_power_mode = wdev->reg_6g_power_mode;
++
++	/* NOTE: lockdep_assert_held is called in ath12k_mac_bss_info_changed */
++	vendor_event =
++	cfg80211_vendor_event_alloc(ar->ah->hw->wiphy, wdev, vendor_buffer_len,
++				    QCA_NL80211_VENDOR_SUBCMD_6GHZ_PWR_MODE_EVT_IDX,
++				    GFP_KERNEL);
++	if (!vendor_event) {
++		ath12k_warn(ar->ab, "SKB alloc failed for 6 GHz power mode evt\n");
++		goto out;
++	}
++
++	ret = nla_put_u8(vendor_event,
++			 QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE,
++			 ap_power_mode);
++
++	if (ret) {
++		ath12k_warn(ar->ab, "6 GHZ power mode vendor evt failed\n");
++		goto out;
++	}
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_REG,
++		   "Send power mode update complete event\n");
++	cfg80211_vendor_event(vendor_event, GFP_KERNEL);
++out:
++	return ret;
++}
++
+ static struct wiphy_vendor_command ath12k_vendor_commands[] = {
+ 	{
+ 		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+@@ -2057,6 +2163,14 @@ static struct wiphy_vendor_command ath12
+ 		.maxattr = QCA_WLAN_VENDOR_ATTR_SCS_RULE_CONFIG_MAX,
+ 		.flags = WIPHY_VENDOR_CMD_NEED_NETDEV,
+ 	},
++	{
++		.info.vendor_id = QCA_NL80211_VENDOR_ID,
++		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_SET_6GHZ_POWER_MODE,
++		.doit = ath12k_vendor_6ghz_power_mode_change,
++		.policy = ath12k_cfg80211_power_mode_set_policy,
++		.maxattr = QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE_MAX,
++		.flags = WIPHY_VENDOR_CMD_NEED_NETDEV,
++	},
+ };
+ 
+ static const struct nl80211_vendor_cmd_info ath12k_vendor_events[] = {
+@@ -2070,6 +2184,10 @@ static const struct nl80211_vendor_cmd_i
+ 		.vendor_id = QCA_NL80211_VENDOR_ID,
+ 		.subcmd = QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC,
+ 	},
++	[QCA_NL80211_VENDOR_SUBCMD_6GHZ_PWR_MODE_EVT_IDX] = {
++		.vendor_id = QCA_NL80211_VENDOR_ID,
++		.subcmd = QCA_NL80211_VENDOR_SUBCMD_POWER_MODE_CHANGE_COMPLETED
++	},
+ };
+ 
+ int ath12k_vendor_register(struct ath12k_hw *ah)
+--- a/drivers/net/wireless/ath/ath12k/vendor.h
++++ b/drivers/net/wireless/ath/ath12k/vendor.h
+@@ -14,6 +14,8 @@ enum qca_nl80211_vendor_subcmds {
+ 	QCA_NL80211_VENDOR_SUBCMD_SET_WIFI_CONFIGURATION = 74,
+ 	QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC = 206,
+ 	QCA_NL80211_VENDOR_SUBCMD_SCS_RULE_CONFIG = 218,
++	QCA_NL80211_VENDOR_SUBCMD_SET_6GHZ_POWER_MODE = 233,
++	QCA_NL80211_VENDOR_SUBCMD_POWER_MODE_CHANGE_COMPLETED = 234,
+ 	QCA_NL80211_VENDOR_SUBCMD_SDWF_PHY_OPS = 235,
+ 	QCA_NL80211_VENDOR_SUBCMD_SDWF_DEV_OPS = 236,
+ 	QCA_NL80211_VENDOR_SUBCMD_TELEMETRIC_DATA = 334,
+@@ -22,6 +24,7 @@ enum qca_nl80211_vendor_subcmds {
+ enum qca_nl80211_vendor_events {
+ 	QCA_NL80211_VENDOR_SUBCMD_SDWF_DEV_OPS_INDEX = 0,
+ 	QCA_NL80211_VENDOR_SUBCMD_RM_GENERIC_INDEX,
++	QCA_NL80211_VENDOR_SUBCMD_6GHZ_PWR_MODE_EVT_IDX,
+ };
+ 
+ #ifdef CPTCFG_ATH12K_SAWF
+@@ -706,4 +709,63 @@ enum qca_wlan_vendor_attr_erp_ath_config
+ 			QCA_WLAN_VENDOR_ATTR_ERP_CONFIG_AFTER_LAST - 1,
+ };
+ 
++/**
++ * enum qca_wlan_vendor_6ghz_power_modes: Defines values of power modes a 6GHz
++ * radio can operate in.
++ * Enum used by QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE attribute.
++ *
++ * @QCA_WLAN_VENDOR_6GHZ_PWR_MODE_AP_LPI: LPI AP
++ *
++ * @QCA_WLAN_VENDOR_6GHZ_PWR_MODE_AP_SP: SP AP
++ *
++ * @QCA_WLAN_VENDOR_6GHZ_PWR_MODE_AP_VLP: VLP AP
++ *
++ * @QCA_WLAN_VENDOR_6GHZ_PWR_MODE_REGULAR_CLIENT_LPI: LPI Regular Client
++ *
++ * @QCA_WLAN_VENDOR_6GHZ_PWR_MODE_REGULAR_CLIENT_SP: SP Regular Client
++ *
++ * @QCA_WLAN_VENDOR_6GHZ_PWR_MODE_REGULAR_CLIENT_VLP: VLP Regular Client
++ *
++ * @QCA_WLAN_VENDOR_6GHZ_PWR_MODE_SUBORDINATE_CLIENT_LPI: LPI Subordinate Client
++ *
++ */
++enum qca_wlan_vendor_6ghz_power_modes {
++	QCA_WLAN_VENDOR_6GHZ_PWR_MODE_AP_LPI = 0,
++	QCA_WLAN_VENDOR_6GHZ_PWR_MODE_AP_SP = 1,
++	QCA_WLAN_VENDOR_6GHZ_PWR_MODE_AP_VLP = 2,
++	QCA_WLAN_VENDOR_6GHZ_PWR_MODE_REGULAR_CLIENT_LPI = 3,
++	QCA_WLAN_VENDOR_6GHZ_PWR_MODE_REGULAR_CLIENT_SP = 4,
++	QCA_WLAN_VENDOR_6GHZ_PWR_MODE_REGULAR_CLIENT_VLP = 5,
++	QCA_WLAN_VENDOR_6GHZ_PWR_MODE_SUBORDINATE_CLIENT_LPI = 6,
++	QCA_WLAN_VENDOR_6GHZ_PWR_MODE_SUBORDINATE_CLIENT_SP = 7,
++	QCA_WLAN_VENDOR_6GHZ_PWR_MODE_SUBORDINATE_CLIENT_VLP = 8,
++};
++
++/**
++ * enum qca_wlan_vendor_set_6ghz_power_mode - Used by the vendor command
++ * QCA_NL80211_VENDOR_SUBCMD_SET_6GHZ_POWER_MODE command to configure the
++ * 6 GHz power mode.
++ *
++ * QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE: Unsigned 8-bit integer representing
++ * the 6 GHz power mode
++ */
++enum qca_wlan_vendor_set_6ghz_power_mode {
++	QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE_INVALID = 0,
++	QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE = 1,
++
++	/* Keep last */
++	QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE_AFTER_LAST,
++	QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE_MAX =
++		QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE_AFTER_LAST - 1,
++};
++
++/**
++ * ath12k_vendor_send_6ghz_power_mode_update_complete - Send 6 GHz power mode
++ * update vendor NL event to the application.
++ *
++ * @ar - Pointer to ar
++ * @wdev - Pointer to wdev
++ */
++int ath12k_vendor_send_6ghz_power_mode_update_complete(struct ath12k *ar,
++						       struct wireless_dev *wdev);
+ #endif /* QCA_VENDOR_H */

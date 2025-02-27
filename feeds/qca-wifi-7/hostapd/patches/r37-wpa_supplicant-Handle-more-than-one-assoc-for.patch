@@ -1,0 +1,184 @@
+From 9fa1739678281397ef18741b73cc60a5ab84f551 Mon Sep 17 00:00:00 2001
+From: Maharaja Kennadyrajan <quic_mkenna@quicinc.com>
+Date: Tue, 6 Aug 2024 20:04:57 +0530
+Subject: [PATCH] wpa_supplicant: Avoid multiple ML link association on same hw
+in single wiphy station
+
+Currently in single wiphy ML station, while selecting links for
+MLO association, more than one link is selected under same hw,
+which will eventually fail since the underlying hw can support
+only one STA interface/link per hw.
+
+This happens in a scenario where candidate AP MLD has two partner
+links advertised which are part of same hw's frequency range of a
+single wiphy station. In this case the STA MLD can choose to
+associate only one among the two links advertised by MLD AP,
+as STAs underlying hw allows only one link association with
+that frequency range.
+
+Add changes to fetch the multi hw capabilities of the phy and
+allow link selection only upto the hw capabilities of the phy.
+
+Patch-work: None
+Patch-dependency: r03-027-wpa_s-add-support-to-parse-multiple-RNRs.patch
+Fixes: ef005a0201a (wpa_supplicant: add support to parse multiple RNRs and TBTTs)
+
+Signed-off-by: Maharaja Kennadyrajan <quic_mkenna@quicinc.com>
+---
+ wpa_supplicant/driver_i.h         | 10 ++++++++
+ wpa_supplicant/sme.c              | 42 ++++++++++++++++++++++++++++++-
+ wpa_supplicant/wpa_supplicant.c   | 31 ++++++++++++++++++++++-
+ wpa_supplicant/wpa_supplicant_i.h |  2 ++
+ 4 files changed, 83 insertions(+), 2 deletions(-)
+
+--- a/wpa_supplicant/driver_i.h
++++ b/wpa_supplicant/driver_i.h
+@@ -1204,4 +1204,14 @@ static inline int wpa_drv_mark_ppe_vp_ty
+ 
+ }
+ 
++static inline struct
++hostapd_multi_hw_info *wpa_get_multi_hw_info(struct wpa_supplicant *wpa_s,
++					     u8 *num_multi_hws) {
++	if (!wpa_s->driver->get_multi_hw_info)
++		return NULL;
++
++	return wpa_s->driver->get_multi_hw_info(wpa_s->drv_priv,
++						num_multi_hws);
++}
++
+ #endif /* DRIVER_I_H */
+--- a/wpa_supplicant/sme.c
++++ b/wpa_supplicant/sme.c
+@@ -380,6 +380,20 @@ static void sme_auth_handle_rrm(struct w
+ 	wpa_s->rrm.rrm_used = 1;
+ }
+ 
++s8 wpa_get_hw_idx_by_freq(struct wpa_supplicant *wpa_s, int partner_freq)
++{
++	struct hostapd_multi_hw_info *hw_info;
++	int i;
++
++	for (i = 0; i < wpa_s->num_multi_hws; i++) {
++		hw_info = &wpa_s->multi_hw_info[i];
++		if (partner_freq >= hw_info->freqs[0] &&
++		    partner_freq <= hw_info->freqs[hw_info->num_freqs - 1])
++			return i;
++	}
++
++	return -1;
++}
+ 
+ static bool wpas_ml_element(struct wpa_supplicant *wpa_s, struct wpa_bss *bss,
+ 			    struct wpa_ssid *ssid,
+@@ -392,6 +406,8 @@ static bool wpas_ml_element(struct wpa_s
+ 	const struct ieee80211_eht_ml *eht_ml;
+ 	const struct eht_ml_basic_common_info *ml_basic_common_info;
+ 	u8 i, mbssid_idx = 0;
++	s8 hw_idx;
++	u16 associated_hw_bmap = 0;
+ 	const u16 control =
+ 		host_to_le16(MULTI_LINK_CONTROL_TYPE_BASIC |
+ 			     BASIC_MULTI_LINK_CTRL_PRES_LINK_ID |
+@@ -469,6 +485,9 @@ static bool wpas_ml_element(struct wpa_s
+ 	mbssid_idx = wpa_bss_get_mbssid_idx(bss);
+ 	wpa_printf(MSG_DEBUG, "MLD: mbssid idx = %u for bss " MACSTR, mbssid_idx, MAC2STR(bss->bssid));
+ 
++	hw_idx = wpa_get_hw_idx_by_freq(wpa_s, bss->freq);
++	associated_hw_bmap |= BIT(hw_idx);
++
+ 	/* NOTE: Any changes in rnr ie len calculation or fetching the ap info
+ 	 * from rnr ie must be reflected in wpa_bss_update_scan_rnr_res API as
+ 	 * it uses similar logic for WAR
+@@ -536,6 +555,17 @@ static bool wpas_ml_element(struct wpa_s
+ 						wpa_printf(MSG_DEBUG, "ML Partner freq %d is not part of our scan list ignore this link", partner_freq);
+ 						goto cont;
+ 					}
++
++					hw_idx = wpa_get_hw_idx_by_freq(wpa_s, partner_freq);
++					if (hw_idx >= 0) {
++						if (!(associated_hw_bmap & BIT(hw_idx))) {
++							associated_hw_bmap |= BIT(hw_idx);
++						} else {
++							wpa_printf(MSG_DEBUG, "ML Partner freq %d is already part of this hw_idx: %d", partner_freq, hw_idx);
++							goto cont;
++						}
++					}
++
+ 					if (neigh_bss) {
+ 						wpa_scan_res_match(wpa_s, 0, neigh_bss,
+ 								   wpa_s->current_ssid,
+--- a/wpa_supplicant/wpa_supplicant.c
++++ b/wpa_supplicant/wpa_supplicant.c
+@@ -65,6 +65,7 @@
+ #include "wpas_kay.h"
+ #include "mesh.h"
+ #include "dpp_supplicant.h"
++#include "ap/hw_features.h"
+ #ifdef CONFIG_MESH
+ #include "ap/ap_config.h"
+ #include "ap/hostapd.h"
+@@ -7174,8 +7175,9 @@ static int wpa_supplicant_init_iface(str
+ 				     const struct wpa_interface *iface)
+ {
+ 	struct wpa_driver_capa capa;
++	struct hostapd_multi_hw_info *multi_hw_info;
+ 	int capa_res;
+-	u8 dfs_domain;
++	u8 dfs_domain, num_multi_hws = 0;
+ 
+ 	wpa_printf(MSG_DEBUG, "Initializing interface '%s' conf '%s' driver "
+ 		   "'%s' ctrl_interface '%s' bridge '%s'", iface->ifname,
+@@ -7354,6 +7356,31 @@ static int wpa_supplicant_init_iface(str
+ 		}
+ 	}
+ 
++	multi_hw_info = wpa_get_multi_hw_info(wpa_s, &num_multi_hws);
++	if (multi_hw_info != NULL) {
++		wpa_s->multi_hw_info = multi_hw_info;
++		wpa_s->num_multi_hws = num_multi_hws;
++
++		for (int i = 0; i < num_multi_hws; i++) {
++			struct hostapd_multi_hw_info *hw_info = &multi_hw_info[i];
++			char str[1000];
++			char *pos = str;
++			char *end = pos + sizeof(str);
++			int res;
++
++			for (int j = 0; j < hw_info->num_freqs; j++) {
++				res = os_snprintf(pos, end - pos, "%d, ", hw_info->freqs[j]);
++				if (os_snprintf_error(end - pos, res))
++					break;
++				pos += res;
++			}
++
++			*pos = '\0';
++			wpa_printf(MSG_DEBUG, "    %d. hw_idx=%u, frequencies: %s",
++				   i + 1, hw_info->hw_idx, str);
++		}
++	}
++
+ 	capa_res = wpa_drv_get_capa(wpa_s, &capa);
+ 	if (capa_res == 0) {
+ 		wpa_s->drv_capa_known = 1;
+@@ -7653,6 +7680,9 @@ static void wpa_supplicant_deinit_iface(
+ 		wpa_s->conf = NULL;
+ 	}
+ 
++	hostapd_free_multi_hw_info(wpa_s->multi_hw_info, wpa_s->num_multi_hws);
++	wpa_s->multi_hw_info = NULL;
++	wpa_s->num_multi_hws = 0;
+ 	os_free(wpa_s->ssids_from_scan_req);
+ 	os_free(wpa_s->last_scan_freqs);
+ 
+--- a/wpa_supplicant/wpa_supplicant_i.h
++++ b/wpa_supplicant/wpa_supplicant_i.h
+@@ -1543,6 +1543,8 @@ struct wpa_supplicant {
+ 	/* Minimum bandwidth the driver supports RU puncturing */
+ 	u8 ru_punct_supp_bw;
+ 	unsigned int ml_neigh_retries;
++	struct hostapd_multi_hw_info *multi_hw_info;
++	u8 num_multi_hws;
+ };
+ 
+ 

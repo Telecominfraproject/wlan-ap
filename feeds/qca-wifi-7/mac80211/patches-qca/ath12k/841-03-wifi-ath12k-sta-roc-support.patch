@@ -1,0 +1,255 @@
+From 73749d0b51d5347bdcc8c948f7104ec1725476cf Mon Sep 17 00:00:00 2001
+From: Arunpandi Kannan <quic_arunpand@quicinc.com>
+Date: Wed, 18 Oct 2023 00:14:37 +0530
+Subject: [PATCH] wifi: ath12k: STA mode off-channel scan support
+
+In STA mode, to do any tx vdev should be started. But vdev starts
+only when it initiates connection to AP. In off-channel tx, the tx
+needs to happen before any connection with AP. So start vdev
+when ROC initiated in STA mode and stop and delete that vdev
+when STA ready to make connection to AP. Also stop the vdev
+before issuing vdev delete if scan vdev started when vap
+delete command received from upper layers.
+
+Signed-off-by: Arunpandi Kannan <quic_arunpand@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |   1 +
+ drivers/net/wireless/ath/ath12k/mac.c  | 147 +++++++++++++++++--------
+ 2 files changed, 103 insertions(+), 45 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index e91184d..93cd646 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -421,6 +421,7 @@ struct ath12k_link_vif {
+ 
+ 	bool is_created;
+ 	bool is_started;
++	bool is_scan_vif;
+ 	bool is_up;
+ 	bool pending_up;
+ 	bool spectral_enabled;
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 8cffedc..0dfeed9 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -4973,6 +4973,7 @@ static int ath12k_mac_vdev_delete(struct ath12k *ar, struct ath12k_link_vif *arv
+ 		   ar->ab->free_vdev_map);
+ clean_up:
+ 	arvif->is_created = false;
++	arvif->is_scan_vif = false;
+ 	arvif->ar = NULL;
+ 	spin_lock_bh(&ar->data_lock);
+ 	list_del(&arvif->list);
+@@ -4981,6 +4982,46 @@ clean_up:
+ 	return ret;
+ }
+ 
++static int ath12k_mac_vdev_stop(struct ath12k_link_vif *arvif)
++{
++	struct ath12k *ar = arvif->ar;
++	int ret;
++
++	lockdep_assert_held(&ar->conf_mutex);
++
++	reinit_completion(&ar->vdev_setup_done);
++
++	memset(&ar->wmm_stats, 0, sizeof(struct ath12k_wmm_stats));
++
++	ret = ath12k_wmi_vdev_stop(ar, arvif->vdev_id);
++	if (ret) {
++		ath12k_warn(ar->ab, "failed to stop WMI vdev %i: %d\n",
++			    arvif->vdev_id, ret);
++		return ret;
++	}
++
++	ret = ath12k_mac_vdev_setup_sync(ar);
++	if (ret) {
++		ath12k_warn(ar->ab, "failed to synchronize setup for vdev %i: %d\n",
++			    arvif->vdev_id, ret);
++		return ret;
++	}
++
++	WARN_ON(ar->num_started_vdevs == 0);
++
++	ar->num_started_vdevs--;
++	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "vdev %pM stopped, vdev_id %d\n",
++		   arvif->addr, arvif->vdev_id);
++
++	if (test_bit(ATH12K_CAC_RUNNING, &ar->dev_flags)) {
++		clear_bit(ATH12K_CAC_RUNNING, &ar->dev_flags);
++		ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "CAC Stopped for vdev %d\n",
++			   arvif->vdev_id);
++	}
++
++	return 0;
++}
++
+ static int
+ ath12k_mac_find_link_id_by_freq(struct ieee80211_vif *vif, struct ath12k *ar, u32 freq)
+ {
+@@ -11080,8 +11121,10 @@ static void ath12k_mac_op_remove_interface(struct ieee80211_hw *hw,
+ 	struct ath12k_hw *ah = hw->priv;
+ 	struct ath12k_vif *ahvif = (void *)vif->drv_priv;
+ 	struct ath12k_link_vif *arvif;
++	struct ath12k *ar;
+ 	u16 links_map;
+ 	u8 link_id;
++	int ret;
+ 
+ 	mutex_lock(&ah->conf_mutex);
+ 
+@@ -11090,12 +11133,31 @@ static void ath12k_mac_op_remove_interface(struct ieee80211_hw *hw,
+ 	for_each_set_bit(link_id, &links_map, ATH12K_NUM_MAX_LINKS) {
+ 		arvif = ahvif->link[link_id];
+ 
+-		if (arvif == NULL)
++		if (!arvif)
++			continue;
++
++		ar = arvif->ar;
++
++		if (!ar)
+ 			continue;
+ 
+ 		if (WARN_ON(arvif->link_id != link_id))
+ 			continue;
+ 
++		if (arvif->is_scan_vif && arvif->is_started) {
++			mutex_lock(&ar->conf_mutex);
++			ret = ath12k_mac_vdev_stop(arvif);
++			mutex_unlock(&ar->conf_mutex);
++			if (ret) {
++				mutex_unlock(&ah->conf_mutex);
++				ath12k_warn(ar->ab, "failed to stop vdev %d: %d\n",
++					    arvif->vdev_id, ret);
++				return;
++			}
++			arvif->is_started = false;
++			arvif->is_scan_vif = false;
++		}
++
+ 		ath12k_mac_remove_link_interface(hw, arvif);
+ 		ath12k_mac_unassign_link_vif(arvif);
+ 	}
+@@ -11613,48 +11675,6 @@ ath12k_mac_vdev_start_restart(struct ath12k_link_vif *arvif,
+ 	return 0;
+ }
+ 
+-static int ath12k_mac_vdev_stop(struct ath12k_link_vif *arvif)
+-{
+-	struct ath12k *ar = arvif->ar;
+-	int ret;
+-
+-	lockdep_assert_held(&ar->conf_mutex);
+-
+-	reinit_completion(&ar->vdev_setup_done);
+-
+-	memset(&ar->wmm_stats, 0, sizeof(struct ath12k_wmm_stats));
+-
+-	ret = ath12k_wmi_vdev_stop(ar, arvif->vdev_id);
+-	if (ret) {
+-		ath12k_warn(ar->ab, "failed to stop WMI vdev %i: %d\n",
+-			    arvif->vdev_id, ret);
+-		goto err;
+-	}
+-
+-	ret = ath12k_mac_vdev_setup_sync(ar);
+-	if (ret) {
+-		ath12k_warn(ar->ab, "failed to synchronize setup for vdev %i: %d\n",
+-			    arvif->vdev_id, ret);
+-		goto err;
+-	}
+-
+-	WARN_ON(ar->num_started_vdevs == 0);
+-
+-	ar->num_started_vdevs--;
+-	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "vdev %pM stopped, vdev_id %d\n",
+-		   arvif->addr, arvif->vdev_id);
+-
+-	if (test_bit(ATH12K_CAC_RUNNING, &ar->dev_flags)) {
+-		clear_bit(ATH12K_CAC_RUNNING, &ar->dev_flags);
+-		ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "CAC Stopped for vdev %d\n",
+-			   arvif->vdev_id);
+-	}
+-
+-	return 0;
+-err:
+-	return ret;
+-}
+-
+ int ath12k_mac_vdev_start(struct ath12k_link_vif *arvif,
+ 				 const struct cfg80211_chan_def *chandef,
+ 				 bool radar_enabled)
+@@ -13216,15 +13236,36 @@ ath12k_mac_op_assign_vif_chanctx(struct ieee80211_hw *hw,
+ 		 * to a different ar, then delete the old vdev in different ar and create new
+ 		 * This is not expected for MLO
+ 		 */
+-		if (ar != arvif->ar) {
+-			if (WARN_ON(arvif->is_started)) {
++		/* If VIF is created for ROC scan, stop and delete the scan vif
++		 * before creating vdev for new connection
++		 */
++		if (ar != arvif->ar || (arvif->is_scan_vif)) {
++			if (!(arvif->is_scan_vif) && WARN_ON(arvif->is_started)) {
+ 				mutex_unlock(&ah->conf_mutex);
+ 				return -EBUSY;
+ 			}
+ 
+ 			arvif_ar = arvif->ar;
++			if (!arvif_ar) {
++				mutex_unlock(&ah->conf_mutex);
++				ath12k_warn(NULL, "arvif_ar not found\n");
++				return -EINVAL;
++			}
+ 
+ 			mutex_lock(&arvif_ar->conf_mutex);
++			if (arvif->is_scan_vif && arvif->is_started) {
++				ret = ath12k_mac_vdev_stop(arvif);
++				if (ret) {
++					mutex_unlock(&arvif_ar->conf_mutex);
++					mutex_unlock(&ah->conf_mutex);
++					ath12k_warn(arvif_ar->ab, "failed to stop vdev %d: %d\n",
++						    arvif->vdev_id, ret);
++					return -EINVAL;
++				}
++				arvif->is_started = false;
++				arvif->is_scan_vif = false;
++			}
++
+ 			ret = ath12k_mac_vdev_delete(arvif_ar, arvif);
+ 			mutex_unlock(&arvif_ar->conf_mutex);
+ 			if (ret)
+@@ -15218,6 +15259,8 @@ static int ath12k_mac_op_remain_on_channel(struct ieee80211_hw *hw,
+ 	struct ath12k_link_vif *arvif;
+ 	struct ath12k *ar;
+ 	struct ath12k_wmi_scan_req_arg arg = {0};
++	struct cfg80211_chan_def chandef = {};
++	struct ath12k_vif *ahvif;
+ 	int ret = 0, link_id;
+ 	u32 scan_time_msec;
+ 	bool create = true;
+@@ -15280,6 +15323,20 @@ static int ath12k_mac_op_remain_on_channel(struct ieee80211_hw *hw,
+ 		}
+ 	}
+ 
++	ahvif = arvif->ahvif;
++	if (!arvif->is_started && ahvif->vdev_type == WMI_VDEV_TYPE_STA) {
++		chandef.chan = chan;
++		chandef.center_freq1 = chan->center_freq;
++		ret = ath12k_mac_vdev_start(arvif, &chandef, 0);
++		if (ret) {
++			mutex_unlock(&ah->conf_mutex);
++			ath12k_err(ar->ab, "vdev start failed sta roc\n");
++			return -EINVAL;
++		}
++		arvif->is_started = true;
++		arvif->is_scan_vif = true;
++	}
++
+ 	mutex_unlock(&ah->conf_mutex);
+ 
+ 	mutex_lock(&ar->conf_mutex);
+-- 
+2.17.1
+

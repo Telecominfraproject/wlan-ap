@@ -1,0 +1,346 @@
+From 13ef45e0eb51be1ee53bb5a8b85bacfa1cc7d3c9 Mon Sep 17 00:00:00 2001
+From: P Praneesh <quic_ppranees@quicinc.com>
+Date: Tue, 28 May 2024 16:28:01 +0530
+Subject: [PATCH] ath12k: simplify rx buffer ring replenish logic
+
+Currently, the rx buffer ring's spin_lock is taken before skb allocation
+and dma mapping. This dma mapped buffer is attached to the buffer ring's
+descriptor and ring's spin_unlock is performed. Since this lock is common
+across the CPU cores, holding it during skb allocation and dma mapping
+can be optimised.
+
+Fix it by queuing the allocated skb in the skb queue without lock and
+utilising this skb queue during the ring replenishment helps to avoid
+lock contention. Add counter in soc_dp_stats to track any excess buffer
+getting allocated while following this simple replenishment path which
+helps to ensure any excess buffer got allocated.
+
+Patch-dependency : 504-ath12k-add-debugfs-support.patch
+
+Signed-off-by: P Praneesh <quic_ppranees@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h    |   1 +
+ drivers/net/wireless/ath/ath12k/debugfs.c |   4 +
+ drivers/net/wireless/ath/ath12k/dp.c      |  43 +++++++-
+ drivers/net/wireless/ath/ath12k/dp.h      |   3 +
+ drivers/net/wireless/ath/ath12k/dp_rx.c   | 116 +++++++++-------------
+ drivers/net/wireless/ath/ath12k/dp_rx.h   |  10 +-
+ 6 files changed, 101 insertions(+), 76 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1309,6 +1309,7 @@ struct ath12k_soc_dp_stats {
+ 	u32 reo_cmd_update_rx_queue_error;
+ 	u32 first_and_last_msdu_bit_miss;
+ 	u32 reo_excep_msdu_buf_type;
++	u32 free_excess_alloc_skb;
+ };
+ 
+ struct ath12k_reg_freq {
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -1870,6 +1870,10 @@ static ssize_t ath12k_debugfs_dump_soc_d
+ 			"\nFIRST/LAST MSDU BIT MISSING COUNT: %u\n",
+ 			soc_stats->first_and_last_msdu_bit_miss);
+ 
++	len += scnprintf(buf + len, size - len,
++			 "\nfree excess alloc skb: %u\n",
++			 soc_stats->free_excess_alloc_skb);
++
+ 	len += ath12k_debugfs_dump_soc_ring_bp_stats(ab, buf + len, size - len);
+ 
+ 	if (len > size)
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -1382,8 +1382,11 @@ int ath12k_dp_service_srng(struct ath12k
+ 		struct ath12k_dp *dp = &ab->dp;
+ 		struct dp_rxdma_ring *rx_ring = &dp->rx_refill_buf_ring;
+ 		LIST_HEAD(list);
++		size_t req_entries;
+ 
+-		ath12k_dp_rx_bufs_replenish(ab, rx_ring, &list, 0);
++		req_entries = ath12k_dp_get_req_entries_from_buf_ring(ab, rx_ring, &list);
++		if (req_entries)
++			ath12k_dp_rx_bufs_replenish(ab, rx_ring, &list, req_entries);
+ 	}
+ 
+ 	/* TODO: Implement handler for other interrupts */
+@@ -2472,9 +2475,10 @@ fail_link_desc_cleanup:
+ int ath12k_dp_rxdma_ring_setup(struct ath12k_base *ab)
+ {
+ 	struct ath12k_dp *dp = &ab->dp;
+-	int ret;
+ 	struct dp_rxdma_ring *rx_ring = &dp->rx_refill_buf_ring;
+ 	LIST_HEAD(list);
++	size_t req_entries;
++	int ret;
+ 
+ 	ret = ath12k_dp_srng_setup(ab,
+ 				   &dp->rx_refill_buf_ring.refill_buf_ring,
+@@ -2486,7 +2490,10 @@ int ath12k_dp_rxdma_ring_setup(struct at
+ 		return ret;
+ 	}
+ 
+-	ath12k_dp_rx_bufs_replenish(ab, rx_ring, &list, 0);
++	req_entries = ath12k_dp_get_req_entries_from_buf_ring(ab, rx_ring, &list);
++	if (req_entries)
++		ath12k_dp_rx_bufs_replenish(ab, rx_ring, &list, req_entries);
++
+ 	return 0;
+ }
+ 
+@@ -2546,3 +2553,33 @@ void ath12k_umac_reset_handle_post_reset
+ 
+ 	return;
+ }
++
++size_t ath12k_dp_get_req_entries_from_buf_ring(struct ath12k_base *ab,
++					       struct dp_rxdma_ring *rx_ring,
++					       struct list_head *list)
++{
++	struct hal_srng *srng;
++	struct ath12k_dp *dp = &ab->dp;
++	size_t num_free, req_entries;
++
++	srng = &ab->hal.srng_list[rx_ring->refill_buf_ring.ring_id];
++	spin_lock_bh(&srng->lock);
++	ath12k_hal_srng_access_begin(ab, srng);
++	num_free = ath12k_hal_srng_src_num_free(ab, srng, true);
++	if (!num_free) {
++		ath12k_hal_srng_access_end(ab, srng);
++		spin_unlock_bh(&srng->lock);
++		return 0;
++	}
++
++	spin_lock_bh(&dp->rx_desc_lock);
++	req_entries = ath12k_dp_list_cut_nodes(list,
++					       &dp->rx_desc_free_list,
++					       num_free);
++	spin_unlock_bh(&dp->rx_desc_lock);
++
++	ath12k_hal_srng_access_end(ab, srng);
++	spin_unlock_bh(&srng->lock);
++
++	return req_entries;
++}
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -2731,4 +2731,7 @@ void ath12k_umac_reset_notify_target_syn
+ void ath12k_dp_reset_interrupt_mask(struct ath12k_base *ab);
+ void ath12k_dp_restore_interrupt_mask(struct ath12k_base *ab);
+ bool ath12k_dp_umac_reset_in_progress(struct ath12k_base *ab);
++size_t ath12k_dp_get_req_entries_from_buf_ring(struct ath12k_base *ab,
++					       struct dp_rxdma_ring *rx_ring,
++					       struct list_head *list);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -225,9 +225,8 @@ static int ath12k_dp_purge_mon_ring(stru
+ 	return -ETIMEDOUT;
+ }
+ 
+-static size_t ath12k_dp_list_cut_nodes(struct list_head *list,
+-				       struct list_head *head,
+-				       size_t count)
++size_t ath12k_dp_list_cut_nodes(struct list_head *list, struct list_head *head,
++				size_t count)
+ {
+ 	struct list_head *cur;
+ 	struct ath12k_rx_desc_info *rx_desc;
+@@ -273,50 +272,25 @@ static void ath12k_dp_rx_enqueue_free(st
+ 	spin_unlock_bh(&dp->rx_desc_lock);
+ }
+ 
+-/* Returns number of Rx buffers replenished */
+-int ath12k_dp_rx_bufs_replenish(struct ath12k_base *ab,
+-				struct dp_rxdma_ring *rx_ring,
+-				struct list_head *used_list,
+-				int req_entries)
++void ath12k_dp_rx_bufs_replenish(struct ath12k_base *ab,
++				 struct dp_rxdma_ring *rx_ring,
++				 struct list_head *used_list,
++				 int req_entries)
+ {
++	struct ath12k_rx_desc_info *rx_desc;
+ 	struct ath12k_buffer_addr *desc;
++	struct sk_buff_head skb_list;
+ 	struct hal_srng *srng;
+ 	struct sk_buff *skb;
+-	int num_free;
+-	int num_remain;
+-	u32 cookie;
+ 	dma_addr_t paddr;
+-	struct ath12k_dp *dp = &ab->dp;
+-	struct ath12k_rx_desc_info *rx_desc;
+ 	enum hal_rx_buf_return_buf_manager mgr = ab->hw_params->hal_params->rx_buf_rbm;
+-
+-	req_entries = min(req_entries, rx_ring->bufs_max);
++	int num_remain;
+ 
+ 	srng = &ab->hal.srng_list[rx_ring->refill_buf_ring.ring_id];
+ 
+-	spin_lock_bh(&srng->lock);
+-
+-	ath12k_hal_srng_access_begin(ab, srng);
+-
+-	num_free = ath12k_hal_srng_src_num_free(ab, srng, true);
+-	if (!req_entries && (num_free > (rx_ring->bufs_max * 3) / 4))
+-		req_entries = num_free;
+-
+-	req_entries = min(num_free, req_entries);
+ 	num_remain = req_entries;
+ 
+-	if (!num_remain)
+-		goto skip_replenish;
+-
+-	/* Get the descriptor from free list */
+-	if (list_empty(used_list)) {
+-		spin_lock_bh(&dp->rx_desc_lock);
+-		req_entries = ath12k_dp_list_cut_nodes(used_list,
+-						       &dp->rx_desc_free_list,
+-						       num_remain);
+-		spin_unlock_bh(&dp->rx_desc_lock);
+-		num_remain = req_entries;
+-	}
++	__skb_queue_head_init(&skb_list);
+ 
+ 	while (num_remain > 0) {
+ #ifdef CPTCFG_MAC80211_SFE_SUPPORT
+@@ -340,55 +314,59 @@ int ath12k_dp_rx_bufs_replenish(struct a
+ 		paddr = dma_map_single_attrs(ab->dev, skb->data,
+ 					     skb->len + skb_tailroom(skb),
+ 					     DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
+-		if (dma_mapping_error(ab->dev, paddr))
++		if (unlikely(dma_mapping_error(ab->dev, paddr))) {
++			dev_kfree_skb_any(skb);
+ 			goto fail_free_skb;
++		}
+ 
++		ATH12K_SKB_RXCB(skb)->paddr = paddr;
++		__skb_queue_tail(&skb_list, skb);
++		num_remain--;
++	}
++
++	spin_lock_bh(&srng->lock);
++	ath12k_hal_srng_access_begin(ab, srng);
++	while ((skb = __skb_dequeue(&skb_list))) {
+ 		rx_desc = list_first_entry_or_null(used_list,
+ 						   struct ath12k_rx_desc_info,
+ 						   list);
+-		if (!rx_desc)
+-			goto fail_dma_unmap;
++		if (unlikely(!rx_desc)) {
++			__skb_queue_tail(&skb_list, skb);
++			goto fail_ring_unlock;
++		}
+ 
+ 		rx_desc->skb = skb;
+-		rx_desc->paddr = paddr;
+-		cookie = rx_desc->cookie;
++		rx_desc->paddr = ATH12K_SKB_RXCB(skb)->paddr;
+ 
+ 		desc = ath12k_hal_srng_src_get_next_entry(ab, srng);
+-		if (!desc)
+-			goto fail_dma_unmap;
++		if (unlikely(!desc)) {
++			__skb_queue_tail(&skb_list, skb);
++			goto fail_ring_unlock;
++		}
+ 
+ 		list_del(&rx_desc->list);
+-		ATH12K_SKB_RXCB(skb)->paddr = paddr;
+-
+-		num_remain--;
+-
+-		ath12k_hal_rx_buf_addr_info_set(desc, paddr, cookie, mgr);
++		ath12k_hal_rx_buf_addr_info_set(desc, rx_desc->paddr,
++						rx_desc->cookie, mgr);
++		if (req_entries-- <= 0)
++			break;
+ 	}
+ 
+-skip_replenish:
++fail_ring_unlock:
+ 	ath12k_hal_srng_access_end(ab, srng);
+ 
+-	if (!list_empty(used_list))
+-		ath12k_dp_rx_enqueue_free(dp, used_list);
++	if (unlikely(!list_empty(used_list)))
++		ath12k_dp_rx_enqueue_free(&ab->dp, used_list);
+ 
+ 	spin_unlock_bh(&srng->lock);
+ 
+-	return req_entries - num_remain;
+-
+-fail_dma_unmap:
+-	dma_unmap_single_attrs(ab->dev, paddr, skb->len + skb_tailroom(skb),
+-			       DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
+ fail_free_skb:
+-	dev_kfree_skb_any(skb);
+-
+-	ath12k_hal_srng_access_end(ab, srng);
+-
+-	if (!list_empty(used_list))
+-		ath12k_dp_rx_enqueue_free(dp, used_list);
+-
+-	spin_unlock_bh(&srng->lock);
+-
+-	return req_entries - num_remain;
++	while (unlikely(skb = __skb_dequeue(&skb_list))) {
++		dma_unmap_single_attrs(ab->dev, ATH12K_SKB_RXCB(skb)->paddr,
++				       skb->len + skb_tailroom(skb),
++				       DMA_FROM_DEVICE, DMA_ATTR_SKIP_CPU_SYNC);
++		dev_kfree_skb_any(skb);
++		ab->soc_stats.free_excess_alloc_skb++;
++	}
+ }
+ 
+ static int ath12k_dp_rxdma_buf_ring_free(struct ath12k_base *ab,
+@@ -438,15 +416,20 @@ static int ath12k_dp_rxdma_ring_buf_setu
+ {
+ 	LIST_HEAD(list);
+ 	int num_entries;
++	size_t req_entries;
+ 
+ 	num_entries = rx_ring->refill_buf_ring.size /
+ 		ath12k_hal_srng_get_entrysize(ab, ringtype);
+ 
+ 	rx_ring->bufs_max = num_entries;
+-	if ((ringtype == HAL_RXDMA_MONITOR_BUF) || (ringtype == HAL_TX_MONITOR_BUF))
++	if ((ringtype == HAL_RXDMA_MONITOR_BUF) || (ringtype == HAL_TX_MONITOR_BUF)) {
+ 		ath12k_dp_mon_buf_replenish(ab, rx_ring, num_entries);
+-	else
+-		ath12k_dp_rx_bufs_replenish(ab, rx_ring, &list, 0);
++	} else {
++		req_entries = ath12k_dp_get_req_entries_from_buf_ring(ab, rx_ring, &list);
++		if (req_entries)
++			ath12k_dp_rx_bufs_replenish(ab, rx_ring, &list, req_entries);
++	}
++
+ 	return 0;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -254,10 +254,10 @@ int ath12k_dp_rx_process_err(struct ath1
+ int ath12k_dp_rx_process(struct ath12k_base *ab, int mac_id,
+ 			 struct napi_struct *napi,
+ 			 int budget);
+-int ath12k_dp_rx_bufs_replenish(struct ath12k_base *ab,
+-				struct dp_rxdma_ring *rx_ring,
+-				struct list_head *used_list,
+-				int req_entries);
++void ath12k_dp_rx_bufs_replenish(struct ath12k_base *ab,
++				 struct dp_rxdma_ring *rx_ring,
++				 struct list_head *used_list,
++				 int req_entries);
+ int ath12k_dp_rx_pdev_mon_attach(struct ath12k *ar);
+ void ath12k_dp_rx_pdev_mon_detach(struct ath12k_base *ab, const int pdev_idx);
+ int ath12k_dp_rx_peer_frag_setup(struct ath12k *ar, struct ath12k_peer *peer,
+@@ -303,4 +303,6 @@ struct dp_rx_fst *ath12k_dp_rx_fst_attac
+ void ath12k_dp_rx_fst_init(struct ath12k_base *ab);
+ ssize_t ath12k_dp_dump_fst_table(struct ath12k_base *ab, char *buf, int size);
+ void ath12k_dp_fst_core_map_init(struct ath12k_base *ab);
++size_t ath12k_dp_list_cut_nodes(struct list_head *list, struct list_head *head,
++				size_t count);
+ #endif /* ATH12K_DP_RX_H */

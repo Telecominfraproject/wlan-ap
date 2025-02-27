@@ -1,0 +1,382 @@
+From e40c6f44f0560de659a3d9b72bb187b2522e1aac Mon Sep 17 00:00:00 2001
+From: Yuvasree Sivasankaran <quic_ysivasan@quicinc.com>
+Date: Wed, 19 Jun 2024 10:46:44 +0530
+Subject: [PATCH] QSDK: wifi: ath12k: Add new flag mask to check fast path
+
+Optimize tx completion routine by
+
+1. Add new flag mask in tx desc to decide fast or regular path
+Mask fast path flag DP_TX_DESC_FLAG_FAST in tx desc flags
+when packet is send and use the same fast path flag check
+to free skb in driver on arrival of completion.
+2. Move skb_ext_desc free to regular path since it get filled
+in regular path.
+3. Make common stats update for fast and regular path in one place
+and removal of link stats in fast path.
+
+Remove CHECKSUM_PARTIAL check in dp_tx_direct, since in SFE/Fast
+case ip_summed will be always CHECKSUM_PARTIAL.
+
+Patch Dependency : 720-c-ath12k-Optimize-the-tx-completion-routine-by-avoid-a.patch
+		   718-f-ath12k-Add-ath12k_dp_tx_direct-for-faster-tx-process.patch
+		   751-wifi-ath12k-avoid-dma-sync-cpu-during-dp_tx.patch
+		   720-f-ath12k-Enable-fast-recycling-the-skbs-for-performanc.patch
+		   
+
+Signed-off-by: Yuvasree Sivasankaran <quic_ysivasan@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.h    |   6 +-
+ drivers/net/wireless/ath/ath12k/dp_tx.c | 139 ++++++++----------------
+ 2 files changed, 48 insertions(+), 97 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -331,15 +331,17 @@ struct ath12k_rx_desc_info {
+ 	u32 magic;
+ };
+ 
++#define DP_TX_DESC_FLAG_FAST     0x1
++
+ struct ath12k_tx_desc_info {
+ 	struct list_head list;
+ 	struct sk_buff *skb;
+ 	struct sk_buff *skb_ext_desc;
+ 	u32 desc_id; /* Cookie */
+ 	u8 mac_id : 5,
+-	   in_use : 1;
++	   in_use : 1,
++	   flags  : 1;
+ 	u8 pool_id;
+-	u8 recycler_fast_xmit;
+ 	ktime_t timestamp;
+ };
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -282,7 +282,7 @@ int ath12k_dp_tx_direct(struct ath12k_li
+ 	dma_addr_t paddr;
+ 	int ret;
+ #ifdef CPTCFG_MAC80211_SFE_SUPPORT
+-	int len = skb->fast_xmit ? 256 : skb->len;
++	int len = 256;
+ #else
+ 	int len = skb->len;
+ #endif
+@@ -304,13 +304,13 @@ int ath12k_dp_tx_direct(struct ath12k_li
+ 
+ 	tx_desc->skb = skb;
+ 	tx_desc->mac_id = arvif->pdev_idx;
+-	tx_desc->recycler_fast_xmit = 0;
++	tx_desc->flags = 0;
+ 
+ #ifdef CPTCFG_MAC80211_SFE_SUPPORT
+ 	/* the edma driver uses this flags to optimize the cache invalidation */
+ 	skb->fast_recycled = 1;
+ 	if (skb->is_from_recycler)
+-		tx_desc->recycler_fast_xmit = 1;
++		tx_desc->flags |= DP_TX_DESC_FLAG_FAST;
+ #endif
+ 
+ 	skb_cb->vif = arvif->ahvif->vif;
+@@ -322,9 +322,7 @@ int ath12k_dp_tx_direct(struct ath12k_li
+         tcl_desc.info1 =  desc->info1;
+         tcl_desc.info2 =  skb->len;
+ 
+-        if (likely(skb->ip_summed == CHECKSUM_PARTIAL))
+-                tcl_desc.info2 |= TX_IP_CHECKSUM;
+-
++	tcl_desc.info2 |= TX_IP_CHECKSUM;
+         tcl_desc.info3 = desc->info3;
+         tcl_desc.info4 = desc->info4;
+         tcl_desc.info5 = 0;
+@@ -612,8 +610,8 @@ skip_htt_meta:
+ 
+ 	tx_desc->skb = skb;
+ 	tx_desc->mac_id = ar->pdev_idx;
+-	tx_desc->recycler_fast_xmit = 0;
+ 	tx_desc->timestamp = ktime_get_real();
++	tx_desc->flags = 0;
+ 	ti.desc_id = tx_desc->desc_id;
+ 	ti.data_len = skb->len;
+ 	skb_cb->paddr = ti.paddr;
+@@ -763,25 +761,24 @@ static inline void ath12k_dp_tx_decremen
+ 
+ static void ath12k_dp_tx_free_txbuf(struct ath12k_base *ab,
+ 				    struct sk_buff *msdu, u8 mac_id,
+-				    struct sk_buff *skb_ext_desc)
++				    struct ath12k_tx_desc_info *tx_desc)
+ {
+-	struct ath12k_skb_cb *skb_cb;
+ 	struct ath12k *ar;
+-	u8 flags = 0;
++	struct sk_buff *skb_ext_desc;
+ 
+-	skb_cb = ATH12K_SKB_CB(msdu);
+ 	ar = ab->pdevs[mac_id].ar;
+-	flags = skb_cb->flags;
++	ath12k_dp_tx_decrement(ar);
+ 
+-	if (unlikely(skb_ext_desc)) {
+-		dev_kfree_skb_any(skb_ext_desc);
+-	}
+-	if (ab->stats_disable && !(flags & ATH12K_SKB_TX_STATUS))
++	if (ab->stats_disable && tx_desc->flags & DP_TX_DESC_FLAG_FAST) {
+ 		dev_kfree_skb_any(msdu);
+-	else
+-		ieee80211_free_txskb(ar->ah->hw, msdu);
++		return;
++	}
+ 
+-	ath12k_dp_tx_decrement(ar);
++	skb_ext_desc = tx_desc->skb_ext_desc;
++	if (unlikely(skb_ext_desc))
++		dev_kfree_skb_any(skb_ext_desc);
++
++	ieee80211_free_txskb(ar->ah->hw, msdu);
+ }
+ 
+ static inline void ath12k_dp_tx_status_parse(struct ath12k_base *ab,
+@@ -819,7 +816,7 @@ static void
+ ath12k_dp_tx_htt_tx_complete_buf(struct ath12k_base *ab,
+ 				 struct sk_buff *msdu,
+ 				 int tcl_data_ring_id, int htt_status,
+-				 struct sk_buff *skb_ext_desc, u8 mac_id,
++				 u8 mac_id, struct ath12k_tx_desc_info *tx_desc,
+ 				 void *desc, ktime_t timestamp)
+ {
+ 	struct ieee80211_tx_info *info;
+@@ -829,49 +826,19 @@ ath12k_dp_tx_htt_tx_complete_buf(struct
+ 	struct ath12k_vif *ahvif;
+ 	struct ath12k_peer *peer;
+ 	struct hal_tx_status ts_status = { 0 };
++	struct sk_buff *skb_ext_desc;
+ 	struct htt_tx_wbm_completion *status_desc;
+-	unsigned long attrs = 0;
+ 	int ack_rssi;
+ 	u8 flags = 0;
+ 	u8 link_id;
+-	bool drop_disable = false;
+-
+-	skb_cb = ATH12K_SKB_CB(msdu);
+-	info = IEEE80211_SKB_CB(msdu);
+ 
+ 	ar = ab->pdevs[mac_id].ar;
+ 	ab->soc_stats.tx_completed[tcl_data_ring_id]++;
+ 
+ 	ath12k_dp_tx_decrement(ar);
+ 
+-	flags = skb_cb->flags;
+-	drop_disable = (ab->stats_disable && !(flags & ATH12K_SKB_TX_STATUS));
+-
+-	/* If drop disable case, avoid cpu_sync since we are not passed
+-	 * the skb to mac80211
+-	 */
+-	if (drop_disable)
+-		attrs |= DMA_ATTR_SKIP_CPU_SYNC;
+-
+-	if (unlikely(skb_ext_desc)) {
+-		dev_kfree_skb_any(skb_ext_desc);
+-	}
+-
+ 	/* Free skb here if stats is disabled */
+-	if (drop_disable) {
+-		if (skb_cb->vif) {
+-			ahvif = (void *)skb_cb->vif->drv_priv;
+-			if (ahvif->links_map & BIT(skb_cb->link_id)) {
+-				if (ahvif->link[skb_cb->link_id])
+-					ahvif->link[skb_cb->link_id]->link_stats.tx_completed++;
+-			} else {
+-				ath12k_warn(ab,
+-					    "invalid linkid 0x%X in htt tx complete buf linkmap %lu\n",
+-					    skb_cb->link_id,
+-					    ahvif->links_map);
+-			}
+-		}
+-
++	if (ab->stats_disable && tx_desc->flags & DP_TX_DESC_FLAG_FAST) {
+ 		if (msdu->destructor) {
+ 			msdu->wifi_acked_valid = 1;
+ 			msdu->wifi_acked = htt_status;
+@@ -884,6 +851,12 @@ ath12k_dp_tx_htt_tx_complete_buf(struct
+ 		return;
+ 	}
+ 
++	skb_ext_desc = tx_desc->skb_ext_desc;
++	if (unlikely(skb_ext_desc))
++		dev_kfree_skb_any(skb_ext_desc);
++
++	skb_cb = ATH12K_SKB_CB(msdu);
++
+ 	if (unlikely(!skb_cb->vif)) {
+ 		ieee80211_free_txskb(ar->ah->hw, msdu);
+ 		return;
+@@ -902,6 +875,8 @@ ath12k_dp_tx_htt_tx_complete_buf(struct
+ 			    ahvif->links_map);
+ 	}
+ 
++	flags = skb_cb->flags;
++	info = IEEE80211_SKB_CB(msdu);
+ 	memset(&info->status, 0, sizeof(info->status));
+ 
+ 	if (htt_status == HAL_WBM_REL_HTT_TX_COMP_STATUS_OK) {
+@@ -943,14 +918,14 @@ ath12k_dp_tx_process_htt_tx_complete(str
+ 				     void *desc, u8 mac_id,
+ 				     struct sk_buff *msdu,
+ 				     int data_ring_id,
+-				     struct sk_buff *skb_ext_desc,
++				     struct ath12k_tx_desc_info *tx_desc,
+ 				     ktime_t timestamp, int htt_status)
+ {
+ 
+ 	switch (htt_status) {
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_OK:
+ 		ath12k_dp_tx_htt_tx_complete_buf(ab, msdu, data_ring_id, htt_status,
+-						 skb_ext_desc, mac_id, desc, timestamp);
++						 mac_id, tx_desc, desc, timestamp);
+ 
+ 		break;
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_DROP:
+@@ -958,7 +933,7 @@ ath12k_dp_tx_process_htt_tx_complete(str
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_REINJ:
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_INSPECT:
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_VDEVID_MISMATCH:
+-		ath12k_dp_tx_free_txbuf(ab, msdu, mac_id, skb_ext_desc);
++		ath12k_dp_tx_free_txbuf(ab, msdu, mac_id, tx_desc);
+ 		break;
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_MEC_NOTIFY:
+ 		/* This event is to be handled only when the driver decides to
+@@ -1107,7 +1082,8 @@ static void ath12k_dp_tx_complete_msdu(s
+ 				       struct sk_buff *msdu,
+ 				       struct hal_wbm_completion_ring_tx *tx_status,
+ 				       enum hal_wbm_rel_src_module buf_rel_source,
+-				       int ring, ktime_t timestamp, int wbm_status)
++				       struct ath12k_tx_desc_info *tx_desc,
++				       ktime_t timestamp, int wbm_status)
+ {
+ 	struct ieee80211_tx_status status = { 0 };
+ 	struct ieee80211_rate_status status_rate = { 0 };
+@@ -1118,6 +1094,7 @@ static void ath12k_dp_tx_complete_msdu(s
+ 	struct ath12k_link_sta *arsta;
+ 	struct rate_info rate;
+ 	struct hal_tx_status ts = { 0 };
++	struct sk_buff *skb_ext_desc;
+ 	struct ieee80211_vif *vif;
+ 	struct ath12k_vif *ahvif;
+ 	u8 flags = 0;
+@@ -1127,10 +1104,12 @@ static void ath12k_dp_tx_complete_msdu(s
+ 	bool tx_error = false;
+ 
+ 	skb_cb = ATH12K_SKB_CB(msdu);
+-	ab->soc_stats.tx_completed[ring]++;
+-
+ 	flags = skb_cb->flags;
+ 
++	skb_ext_desc = tx_desc->skb_ext_desc;
++	if (unlikely(skb_ext_desc))
++		dev_kfree_skb_any(skb_ext_desc);
++
+ 	if (unlikely(!rcu_access_pointer(ab->pdevs_active[ar->pdev_idx]))) {
+                 ieee80211_free_txskb(ar->ah->hw, msdu);
+                 return;
+@@ -1578,20 +1557,16 @@ int ath12k_dp_tx_completion_handler(stru
+ 	struct hal_srng *status_ring = &ab->hal.srng_list[hal_ring_id];
+ 	struct ath12k_tx_desc_info *tx_desc = NULL;
+ 	struct list_head desc_free_list, *cur;
+-	struct sk_buff *msdu, *skb_ext_desc;
+-	struct ath12k_skb_cb *skb_cb;
++	struct sk_buff *msdu;
+ 	u8 mac_id;
+ 	u64 desc_va;
+-	struct ath12k_vif *ahvif;
+ 	u32 desc_id;
+-	u8 flags = 0;
+ 	int valid_entries;
+ 	int orig_budget = budget;
+ 	struct hal_wbm_completion_ring_tx *tx_status;
+ 	ktime_t timestamp = 0;
+ 	enum hal_wbm_rel_src_module buf_rel_source;
+ 	struct sk_buff_head free_list_head;
+-	int recycler_fast_xmit;
+ 
+ 	struct htt_tx_wbm_completion *status_desc;
+ 	int htt_status;
+@@ -1648,8 +1623,6 @@ int ath12k_dp_tx_completion_handler(stru
+ 
+ 		msdu = tx_desc->skb;
+ 		mac_id = tx_desc->mac_id;
+-		recycler_fast_xmit = tx_desc->recycler_fast_xmit;
+-		skb_ext_desc = tx_desc->skb_ext_desc;
+ 
+ #ifdef CPTCFG_ATH12K_SAWF
+ 		timestamp = tx_desc->timestamp;
+@@ -1680,7 +1653,7 @@ int ath12k_dp_tx_completion_handler(stru
+ 							     (void *)tx_status,
+ 							     mac_id, msdu,
+ 							     data_ring_id,
+-							     skb_ext_desc,
++							     tx_desc,
+ 							     timestamp, htt_status);
+ 			continue;
+ 		}
+@@ -1693,28 +1666,10 @@ int ath12k_dp_tx_completion_handler(stru
+ 			continue;
+ 		}
+ 
+-		skb_cb =  (struct ath12k_skb_cb *)&IEEE80211_SKB_CB(msdu)->driver_data;
+-		flags = skb_cb->flags;
+-		if (unlikely(skb_ext_desc)) {
+-			dev_kfree_skb_any(skb_ext_desc);
+-		}
+-		/* Free skb here if stats is disabled */
+-		if (ab->stats_disable && !(flags & ATH12K_SKB_TX_STATUS)) {
+-			ar->ab->soc_stats.tx_completed[tx_ring->tcl_data_ring_id]++;
+-
+-			if (skb_cb->vif) {
+-				ahvif = (void *)skb_cb->vif->drv_priv;
+-				if (ahvif->links_map & BIT(skb_cb->link_id)) {
+-					if (ahvif->link[skb_cb->link_id])
+-						ahvif->link[skb_cb->link_id]->link_stats.tx_completed++;
+-				} else {
+-					ath12k_warn(ab,
+-						    "invalid linkid 0x%X in tx completion handler for linkmap %lu\n",
+-						    skb_cb->link_id,
+-						    ahvif->links_map);
+-				}
+-			}
++		ab->soc_stats.tx_completed[data_ring_id]++;
+ 
++		/* Free skb here if stats is disabled */
++		if (ab->stats_disable && tx_desc->flags & DP_TX_DESC_FLAG_FAST) {
+ 			if (unlikely(msdu->destructor)) {
+ 				msdu->wifi_acked_valid = 1;
+ 				msdu->wifi_acked = htt_status == HAL_WBM_TQM_REL_REASON_FRAME_ACKED;
+@@ -1723,17 +1678,15 @@ int ath12k_dp_tx_completion_handler(stru
+ 				kfree_skb_list(skb_shinfo(msdu)->frag_list);
+ 				skb_shinfo(msdu)->frag_list = NULL;
+ 			}
+-			if (likely(recycler_fast_xmit)) {
+-				__skb_queue_head(&free_list_head, msdu);
+-			} else {
+-				dev_kfree_skb(msdu);
+-			}
++			__skb_queue_head(&free_list_head, msdu);
++
+ 		} else {
+ 
+ 			ath12k_dp_tx_complete_msdu(ar, msdu, tx_status, buf_rel_source,
+-						   data_ring_id, timestamp, htt_status);
++						   tx_desc, timestamp, htt_status);
+ 		}
+ 	}
++	ath12k_hal_srng_access_dst_ring_end_nolock(status_ring);
+ 
+ 	spin_lock_bh(&dp->tx_desc_lock[ring_id]);
+ 	list_for_each(cur, &desc_free_list) {
+@@ -1745,7 +1698,6 @@ int ath12k_dp_tx_completion_handler(stru
+ 	list_splice_tail(&desc_free_list, &dp->tx_desc_free_list[ring_id]);
+ 	spin_unlock_bh(&dp->tx_desc_lock[ring_id]);
+ 
+-	ath12k_hal_srng_access_dst_ring_end_nolock(status_ring);
+ 	dev_kfree_skb_list_fast(&free_list_head);
+ 	return (orig_budget - budget);
+ }

@@ -1,0 +1,893 @@
+From 41331dd906e2b372abc00322c8aba834c06e8fd3 Mon Sep 17 00:00:00 2001
+From: Hariharan Basuthkar <quic_hbasuthk@quicinc.com>
+Date: Mon, 10 Jun 2024 00:45:36 +0530
+Subject: [PATCH] wifi: ath12k: Add support for processing AFC power event
+
+Add the following changes to handle the AFC power event:
+
+1) Add a debug mask for AFC.
+2) Process the AFC payload received from the target, through the
+   WMI_AFC_EVENT and store in within the ath12k_afc_info.
+3) Intersect the frequency range received in the AFC payload with the
+   Standard Power regulatory rules received from the target and
+   update the regd.
+
+Currently AFC is supported on AP mode with SLO only, and it is
+supported on standalone stations.
+
+TODO:
+1) Retail AFC implementation
+2) AFC for 6 GHz Outdoor AP deployment support
+3) AFC support for SP AP operation on WDS and Mesh mode
+4) Puncturing support for AFC
+5) AFC support for SP AP for MLO
+
+Patch dependency: 333-0020-mac80211-add-support-for-6G-channels-and-regulatory.patch
+Tag: 6G_REGULATORY
+
+Signed-off-by: Hariharan Basuthkar <quic_hbasuthk@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h  |  12 +
+ drivers/net/wireless/ath/ath12k/debug.h |   1 +
+ drivers/net/wireless/ath/ath12k/reg.c   | 237 ++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/reg.h   |  67 ++++-
+ drivers/net/wireless/ath/ath12k/wmi.c   | 334 ++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.h   |  42 +++
+ 6 files changed, 689 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1121,6 +1121,7 @@ struct ath12k {
+ 	u32 ani_listen_period;
+ 	int ani_ofdm_level;
+ 	struct completion ani_ofdm_event;
++	struct ath12k_afc_info afc;
+ 
+ 	bool erp_trigger_set;
+ 	struct work_struct erp_handle_trigger_work;
+@@ -1129,6 +1130,11 @@ struct ath12k {
+ 	s32 sensitivity_level;
+ };
+ 
++struct ath12k_6ghz_sp_reg_rule {
++	int num_6ghz_sp_rule;
++	struct ieee80211_reg_rule sp_reg_rule[];
++};
++
+ struct ath12k_hw {
+ 	struct ieee80211_hw *hw;
+ 	const struct ieee80211_ops *ops;
+@@ -1505,6 +1511,12 @@ struct ath12k_base {
+ 	 */
+ 	struct ieee80211_regdomain *new_regd[MAX_RADIOS];
+ 
++	/* 6 GHz standard power rules from cc ext event are saved here
++	 * as it should not be updated to cfg unless we have a AFC
++	 * response
++	 */
++	struct ath12k_6ghz_sp_reg_rule *sp_rule;
++
+ 	/* Current DFS Regulatory */
+ 	enum ath12k_dfs_region dfs_region;
+ 	struct ath12k_reg_freq reg_freq_2g;
+--- a/drivers/net/wireless/ath/ath12k/debug.h
++++ b/drivers/net/wireless/ath/ath12k/debug.h
+@@ -37,6 +37,7 @@ enum ath12k_debug_mask {
+ 	ATH12K_DBG_RM		= 0x00800000,
+ 	ATH12K_DBG_CFR          = 0x01000000,
+ 	ATH12K_DBG_CFR_DUMP     = 0x02000000,
++	ATH12K_DBG_AFC          = 0x04000000,
+ 
+ 	/* keep last*/
+ 	ATH12K_DBG_ANY		= 0xffffffff,
+--- a/drivers/net/wireless/ath/ath12k/reg.c
++++ b/drivers/net/wireless/ath/ath12k/reg.c
+@@ -537,9 +537,94 @@ static u32 ath12k_map_fw_phy_flags(u32 p
+ 	return flags;
+ }
+ 
+-/* TODO: API ath12k_reg_can_intersect() to handle whether two
+- * ieee80211_reg_rules can intersect or not based on their
+- * frequency range and power mode. */
++static void ath12k_reg_intersect_sp_rules(struct ath12k *ar,
++					  struct ieee80211_reg_rule *rule1,
++					  struct ieee80211_reg_rule *rule2,
++					  struct ieee80211_reg_rule *new_rule)
++{
++	u32 start_freq1, end_freq1;
++	u32 start_freq2, end_freq2;
++	u32 freq_diff;
++
++	start_freq1 = rule1->freq_range.start_freq_khz;
++	start_freq2 = rule2->freq_range.start_freq_khz;
++
++	end_freq1 = rule1->freq_range.end_freq_khz;
++	end_freq2 = rule2->freq_range.end_freq_khz;
++
++	new_rule->freq_range.start_freq_khz = max_t(u32, start_freq1,
++						    start_freq2);
++	new_rule->freq_range.end_freq_khz = min_t(u32, end_freq1, end_freq2);
++
++	freq_diff = new_rule->freq_range.end_freq_khz -
++			new_rule->freq_range.start_freq_khz;
++	new_rule->freq_range.max_bandwidth_khz =
++			min_t(u32, freq_diff, rule1->freq_range.max_bandwidth_khz);
++	new_rule->power_rule.max_eirp = rule1->power_rule.max_eirp;
++	/* Use the flags of both the rules */
++	new_rule->flags = rule1->flags | rule2->flags;
++
++	if ((rule1->flags & NL80211_RRF_PSD) && (rule2->flags & NL80211_RRF_PSD))
++		new_rule->psd = min_t(s8, rule1->psd, rule2->psd);
++	else
++		new_rule->flags &= ~NL80211_RRF_PSD;
++
++	new_rule->mode = NL80211_REG_AP_SP;
++
++	/* To be safe, lets use the max cac timeout of both rules */
++	new_rule->dfs_cac_ms = max_t(u32, rule1->dfs_cac_ms,
++				     rule2->dfs_cac_ms);
++	ath12k_dbg(ar->ab, ATH12K_DBG_AFC,
++		   "Adding sp rule start freq %u end freq %u mac bw %u max eirp %d psd %d flags 0x%x\n",
++		   new_rule->freq_range.start_freq_khz,
++		   new_rule->freq_range.end_freq_khz,
++		   new_rule->freq_range.max_bandwidth_khz,
++		   new_rule->power_rule.max_eirp, new_rule->psd, new_rule->flags);
++}
++
++/* ath12k_reg_can_intersect() - Check whether two ieee80211_reg_rules can
++ * intersect or not based on their frequency range and power mode.
++ *
++ * @rule1: Pointer to rule1
++ * @rule2: Pointer to rule2
++ *
++ * Return: Return true if 2 rules can be intersected else false
++ **/
++static bool
++ath12k_reg_can_intersect(struct ieee80211_reg_rule *rule1,
++			 struct ieee80211_reg_rule *rule2)
++{
++	u32 start_freq1, end_freq1;
++	u32 start_freq2, end_freq2;
++	u8 reg_6ghz_pwr_mode1, reg_6ghz_pwr_mode2;
++
++	start_freq1 = rule1->freq_range.start_freq_khz;
++	start_freq2 = rule2->freq_range.start_freq_khz;
++
++	end_freq1 = rule1->freq_range.end_freq_khz;
++	end_freq2 = rule2->freq_range.end_freq_khz;
++
++	reg_6ghz_pwr_mode1 = rule1->mode;
++	reg_6ghz_pwr_mode2 = rule2->mode;
++
++	/* 6G reg rules can not intersect if power mode is not same.
++	 * NOTE: For 2G/5G rules, it will be always 0.
++	 */
++	if (reg_6ghz_pwr_mode1 != reg_6ghz_pwr_mode2)
++		return false;
++
++	if ((start_freq1 >= start_freq2 && start_freq1 < end_freq2) ||
++	    (start_freq2 > start_freq1 && start_freq2 < end_freq1))
++		return true;
++
++	/* TODO: Should we restrict intersection feasibility
++	 *  based on min bandwidth of the intersected region also,
++	 *  say the intersected rule should have a  min bandwidth
++	 * of 20MHz?
++	 */
++
++	return false;
++}
+ 
+ static const char *
+ ath12k_reg_get_regdom_str(enum nl80211_dfs_regions dfs_region)
+@@ -843,6 +928,200 @@ ath12k_reg_build_regd(struct ath12k_base
+ 	return new_regd;
+ }
+ 
++/* ath12k_reg_coalesce_afc_freq_info() - Coalesce the freq info objects received
++ * in the AFC power event.
++ *
++ * @afc_reg_info: Pointer to AFC response
++ *
++ * When freq info objects are a continuous sequence, coalesce them. The max_psd
++ * of the coalesced freq info obj should be the minimum of all psd values of the
++ * freq info objects that are being coalesced.
++ * Eg: If the freq info objects are as follows
++ * {freq_low: 6330, freq_high: 6361, max_psd: 11}
++ * {freq_low: 6361, freq_high: 6425, max_psd: 23}
++ * {freq_low: 6525, freq_high: 6540, max_psd: 23}
++ * {freq_low: 6540, freq_high: 6570, max_psd: 22}
++ *
++ * These should be coalesced into
++ * {freq_low: 6330, freq_high: 6425, max_psd: 11}
++ * {freq_low: 6525, freq_high: 6570, max_psd: 22}
++ **/
++static void
++ath12k_reg_coalesce_afc_freq_info(struct ath12k_afc_sp_reg_info *afc_reg_info)
++{
++	struct ath12k_afc_freq_obj *afc_freq_info = afc_reg_info->afc_freq_info;
++	u8 num_freq_objs = afc_reg_info->num_freq_objs;
++	int start_idx = 0;
++	int next_idx = start_idx + 1;
++
++	while (next_idx < num_freq_objs) {
++		if (afc_freq_info[start_idx].high_freq ==
++		    afc_freq_info[next_idx].low_freq) {
++			afc_freq_info[start_idx].high_freq = afc_freq_info[next_idx].high_freq;
++			afc_freq_info[start_idx].max_psd = min(afc_freq_info[start_idx].max_psd,
++							       afc_freq_info[next_idx].max_psd);
++			next_idx++;
++			afc_reg_info->num_freq_objs--;
++		} else {
++			start_idx++;
++			afc_freq_info[start_idx].low_freq = afc_freq_info[next_idx].low_freq;
++			afc_freq_info[start_idx].high_freq = afc_freq_info[next_idx].high_freq;
++			afc_freq_info[start_idx].max_psd = afc_freq_info[next_idx].max_psd;
++			next_idx++;
++		}
++	}
++}
++
++int ath12k_reg_process_afc_power_event(struct ath12k *ar)
++{
++	int new_reg_rule_cnt, num_regd_rules, num_afc_rules, num_sp_rules;
++	int ret = 0, num_old_sp_rules = 0, num_new_sp_rules = 0;
++	struct ieee80211_reg_rule *old_rule, *new_regd_rules;
++	struct ath12k_afc_sp_reg_info *afc_reg_info = NULL;
++	struct ath12k_6ghz_sp_reg_rule *sp_rule = NULL;
++	struct ieee80211_regdomain *new_regd = NULL;
++	struct ieee80211_regdomain *old_regd = NULL;
++	struct ath12k_afc_freq_obj *afc_freq_info;
++	struct ath12k_afc_freq_obj *afc_freq_obj;
++	struct ieee80211_reg_rule new_rule = {0};
++	struct ieee80211_regdomain *regd = NULL;
++	struct ath12k_base *ab = ar->ab;
++	struct ath12k_hw *ah = ar->ah;
++	int i, j, k, pdev_idx;
++	char alpha2[3] = {0};
++
++	pdev_idx = ar->pdev_idx;
++
++	if (!ab->sp_rule || !ar->afc.afc_reg_info)
++		return -EINVAL;
++
++	spin_lock_bh(&ar->data_lock);
++	sp_rule = ab->sp_rule;
++	afc_reg_info = ar->afc.afc_reg_info;
++	afc_freq_info = afc_reg_info->afc_freq_info;
++
++	if (afc_reg_info->fw_status_code != REG_FW_AFC_POWER_EVENT_SUCCESS) {
++		ath12k_warn(ab, "AFC Power event failure status code %d",
++			    afc_reg_info->fw_status_code);
++		ret = -EINVAL;
++		goto end;
++	}
++
++	if (!sp_rule->num_6ghz_sp_rule) {
++		ath12k_warn(ab, "No default 6 GHz sp rules present\n");
++		ret = -EINVAL;
++		goto end;
++	}
++
++	ar->afc.is_6ghz_afc_power_event_received = true;
++
++	if (ab->new_regd[pdev_idx])
++		regd = ab->new_regd[pdev_idx];
++	else
++		regd = ab->default_regd[pdev_idx];
++
++	if (!regd) {
++		ath12k_warn(ab, "Regulatory domain data not present\n");
++		ret = -EINVAL;
++		goto end;
++	}
++
++	num_sp_rules = ab->sp_rule->num_6ghz_sp_rule;
++	num_regd_rules = regd->n_reg_rules;
++	ath12k_reg_coalesce_afc_freq_info(afc_reg_info);
++	num_afc_rules = afc_reg_info->num_freq_objs;
++
++	for (i = 0; i < num_regd_rules; i++) {
++		old_rule = regd->reg_rules + i;
++		if (old_rule->mode == NL80211_REG_AP_SP)
++			num_old_sp_rules++;
++	}
++
++	for (i = 0; i < num_sp_rules; i++) {
++		old_rule = sp_rule->sp_reg_rule + i;
++
++		for (j = 0; j < num_afc_rules; j++) {
++			afc_freq_obj = afc_freq_info + j;
++			new_rule.freq_range.start_freq_khz =
++						MHZ_TO_KHZ(afc_freq_obj->low_freq);
++			new_rule.freq_range.end_freq_khz =
++						MHZ_TO_KHZ(afc_freq_obj->high_freq);
++			new_rule.mode = NL80211_REG_AP_SP;
++			if (ath12k_reg_can_intersect(old_rule, &new_rule))
++				num_new_sp_rules++;
++		}
++	}
++
++	/* Remove the old sp rule from regd and add the new intersected sp rules */
++	new_reg_rule_cnt = num_regd_rules  - num_old_sp_rules + num_new_sp_rules;
++	ath12k_dbg(ab, ATH12K_DBG_AFC,
++		   "Total reg rules %d old sp rules %d new sp rules after intersection %d\n",
++		   num_regd_rules, num_old_sp_rules, num_new_sp_rules);
++
++	new_regd = kzalloc(sizeof(*new_regd) +
++			   (sizeof(*new_regd_rules) * new_reg_rule_cnt),
++			   GFP_ATOMIC);
++	if (!new_regd) {
++		ret = -ENOMEM;
++		goto end;
++	}
++
++	new_regd->n_reg_rules = new_reg_rule_cnt;
++	memcpy(new_regd->alpha2, regd->alpha2, REG_ALPHA2_LEN + 1);
++	memcpy(alpha2, regd->alpha2, REG_ALPHA2_LEN + 1);
++	alpha2[2] = '\0';
++	new_regd->dfs_region = ath12k_map_fw_dfs_region(regd->dfs_region);
++	ath12k_dbg(ab, ATH12K_DBG_AFC,
++		   "\nAFC: Country %s, CFG Regdomain %s, num_reg_rules %d\n",
++		   alpha2, ath12k_reg_get_regdom_str(new_regd->dfs_region),
++		   new_reg_rule_cnt);
++	k = 0;
++	for (i = 0; i < num_regd_rules; i++) {
++		old_rule = regd->reg_rules + i;
++
++		if (old_rule->mode == NL80211_REG_AP_SP) {
++			continue;
++		} else {
++			memcpy((new_regd->reg_rules + k), old_rule, sizeof(*new_regd_rules));
++			k++;
++		}
++	}
++
++	for (i = 0; i < num_sp_rules; i++) {
++		old_rule = sp_rule->sp_reg_rule + i;
++		for (j = 0; j < num_afc_rules; j++) {
++			afc_freq_obj = afc_freq_info + j;
++				new_rule.freq_range.start_freq_khz =
++						MHZ_TO_KHZ(afc_freq_obj->low_freq);
++				new_rule.freq_range.end_freq_khz =
++						MHZ_TO_KHZ(afc_freq_obj->high_freq);
++				new_rule.mode = NL80211_REG_AP_SP;
++				if (ath12k_reg_can_intersect(old_rule, &new_rule)) {
++					new_rule.psd = (s8)(afc_freq_obj->max_psd / 100);
++					new_rule.flags |= NL80211_RRF_PSD;
++					ath12k_reg_intersect_sp_rules(ar, old_rule, &new_rule,
++								      new_regd->reg_rules + k);
++					k++;
++				}
++			}
++	}
++
++	spin_unlock_bh(&ar->data_lock);
++
++	spin_lock_bh(&ab->base_lock);
++	old_regd = ab->new_regd[pdev_idx];
++	ab->new_regd[pdev_idx] = new_regd;
++	spin_unlock_bh(&ab->base_lock);
++	kfree(old_regd);
++
++	ah->regd_updated = false;
++	queue_work(ab->workqueue, &ar->regd_update_work);
++	return ret;
++end:
++	spin_unlock_bh(&ar->data_lock);
++	return ret;
++}
++
+ void ath12k_regd_update_work(struct work_struct *work)
+ {
+ 	struct ath12k *ar = container_of(work, struct ath12k,
+--- a/drivers/net/wireless/ath/ath12k/reg.h
++++ b/drivers/net/wireless/ath/ath12k/reg.h
+@@ -36,6 +36,71 @@ enum ath12k_reg_phy_bitmap {
+ 	ATH12K_REG_PHY_BITMAP_NO11BE     = 0x0040,
+ };
+ 
++enum ath12k_afc_power_update_status {
++	ath12k_AFC_POWER_UPDATE_IGNORE = 0, /* Used for expiry event */
++	ath12k_AFC_POWER_UPDATE_SUCCESS = 1,
++	ath12k_AFC_POWER_UPDATE_FAIL = 3,
++};
++
++enum ath12k_afc_event_state {
++	ATH12K_AFC_EVENT_POWER_INFO   = 1,
++};
++
++enum ath12k_afc_power_event_status_code {
++	REG_FW_AFC_POWER_EVENT_SUCCESS = 0,
++	REG_FW_AFC_POWER_EVENT_RESP_NOT_RECEIVED = 1,
++	REG_FW_AFC_POWER_EVENT_RESP_PARSING_FAILURE = 2,
++	REG_FW_AFC_POWER_EVENT_FAILURE = 3,
++};
++
++enum ath12k_serv_resp_code {
++	REG_AFC_SERV_RESP_GENERAL_FAILURE = -1,
++	REG_AFC_SERV_RESP_SUCCESS = 0,
++	REG_AFC_SERV_RESP_VERSION_NOT_SUPPORTED = 100,
++	REG_AFC_SERV_RESP_DEVICE_UNALLOWED = 101,
++	REG_AFC_SERV_RESP_MISSING_PARAM = 102,
++	REG_AFC_SERV_RESP_INVALID_VALUE = 103,
++	REG_AFC_SERV_RESP_UNEXPECTED_PARAM = 106,
++	REG_AFC_SERV_RESP_UNSUPPORTED_SPECTRUM = 300,
++};
++
++struct ath12k_afc_freq_obj {
++	u32 low_freq;
++	u32 high_freq;
++	s16 max_psd;
++};
++
++struct ath12k_chan_eirp_obj {
++	u8 cfi;
++	u16 eirp_power;
++};
++
++struct ath12k_afc_chan_obj {
++	u8 global_opclass;
++	u8 num_chans;
++	struct ath12k_chan_eirp_obj *chan_eirp_info;
++};
++
++struct ath12k_afc_sp_reg_info {
++	u32 resp_id;
++	enum ath12k_afc_power_event_status_code fw_status_code;
++	enum ath12k_serv_resp_code serv_resp_code;
++	u32 afc_wfa_version;
++	u32 avail_exp_time_d;
++	u32 avail_exp_time_t;
++	u8 num_freq_objs;
++	u8 num_chan_objs;
++	struct ath12k_afc_freq_obj *afc_freq_info;
++	struct ath12k_afc_chan_obj *afc_chan_info;
++};
++
++struct ath12k_afc_info {
++	enum ath12k_afc_event_state event_type;
++	bool is_6ghz_afc_power_event_received;
++	struct ath12k_afc_sp_reg_info *afc_reg_info;
++	bool afc_regdom_configured;
++};
++
+ enum ath12k_reg_cc_code {
+ 	REG_SET_CC_STATUS_PASS = 0,
+ 	REG_CURRENT_ALPHA2_NOT_FOUND = 1,
+@@ -108,5 +173,5 @@ int ath12k_reg_update_chan_list(struct a
+ int ath12k_reg_get_num_chans_in_band(struct ath12k *ar,
+ 				     struct ieee80211_supported_band *band,
+ 			             u32 freq_low, u32 freq_high);
+-
++int ath12k_reg_process_afc_power_event(struct ath12k *ar);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -188,6 +188,16 @@ static const struct ath12k_wmi_tlv_polic
+ 		.min_len = sizeof(struct wmi_cp_stats_event_fixed_param) },
+ 	[WMI_TAG_OFFCHAN_DATA_TX_COMPL_EVENT] = {
+ 		.min_len = sizeof(struct wmi_offchan_data_tx_compl_event) },
++	[WMI_TAG_AFC_EVENT_FIXED_PARAM] = {
++		.min_len = sizeof(struct wmi_afc_event_fixed_param) },
++	[WMI_TAG_AFC_POWER_EVENT_PARAM]	= {
++		.min_len = sizeof(struct wmi_afc_power_event_param) },
++	[WMI_TAG_AFC_6GHZ_FREQUENCY_INFO] = {
++		.min_len = sizeof(struct wmi_6ghz_afc_frequency_info) },
++	[WMI_TAG_AFC_6GHZ_CHANNEL_INFO] = {
++		.min_len = sizeof(struct wmi_6ghz_afc_channel_info) },
++	[WMI_TAG_AFC_CHAN_EIRP_POWER_INFO] = {
++		.min_len = sizeof(struct wmi_afc_chan_eirp_power_info) },
+ };
+ 
+ static const u32 eml_trans_timeout[EMLCAP_TIMEOUT_MAX] = {
+@@ -7060,6 +7070,327 @@ static int ath12k_pull_vdev_start_resp_t
+ 	return 0;
+ }
+ 
++static void ath12k_free_afc_power_event_info(struct ath12k_afc_info *afc)
++{
++	struct ath12k *ar = container_of(afc, struct ath12k, afc);
++	struct ath12k_afc_sp_reg_info *afc_reg_info;
++	struct ath12k_afc_chan_obj *afc_chan_info;
++	struct ath12k_base *ab = ar->ab;
++	int num_chan_objs = 0;
++	int i;
++
++	if (!afc->afc_reg_info)
++		return;
++
++	ath12k_dbg(ab, ATH12K_DBG_AFC, "Freeing afc info\n");
++	spin_lock_bh(&ar->data_lock);
++	afc_reg_info = afc->afc_reg_info;
++	num_chan_objs = afc_reg_info->num_chan_objs;
++	kfree(afc_reg_info->afc_freq_info);
++
++	for (i = 0; i < num_chan_objs; i++) {
++		afc_chan_info = afc_reg_info->afc_chan_info + i;
++		kfree(afc_chan_info->chan_eirp_info);
++	}
++
++	kfree(afc_reg_info->afc_chan_info);
++	kfree(afc_reg_info);
++	afc->afc_reg_info = NULL;
++	spin_unlock_bh(&ar->data_lock);
++}
++
++static int ath12k_copy_afc_power_event_fixed_info(struct ath12k_base *ab,
++						  struct ath12k_afc_info *afc,
++						  const void *ptr,
++						  u16 len)
++{
++	struct wmi_afc_power_event_param *afc_pwr_param;
++	struct ath12k_afc_sp_reg_info *afc_reg_info;
++
++	afc_pwr_param = (struct wmi_afc_power_event_param *)ptr;
++	afc_reg_info = kzalloc(sizeof(*afc_reg_info), GFP_ATOMIC);
++
++	if (!afc_reg_info)
++		return -ENOMEM;
++
++	afc_reg_info->fw_status_code =
++				le32_to_cpu(afc_pwr_param->fw_status_code);
++	afc_reg_info->resp_id = le32_to_cpu(afc_pwr_param->resp_id);
++	afc_reg_info->serv_resp_code =
++				le32_to_cpu(afc_pwr_param->afc_serv_resp_code);
++	afc_reg_info->afc_wfa_version =
++				le32_to_cpu(afc_pwr_param->afc_wfa_version);
++	afc_reg_info->avail_exp_time_d =
++				le32_to_cpu(afc_pwr_param->avail_exp_time_d);
++	afc_reg_info->avail_exp_time_t =
++				le32_to_cpu(afc_pwr_param->avail_exp_time_t);
++	afc->afc_reg_info = afc_reg_info;
++
++	ath12k_dbg(ab, ATH12K_DBG_AFC,
++		   "pwr event-fw status %d req id %d server resp code %d wfa version %d expiry date %d time %d\n",
++		   afc_reg_info->fw_status_code, afc_reg_info->resp_id,
++		   afc_reg_info->serv_resp_code, afc_reg_info->afc_wfa_version,
++		   afc_reg_info->avail_exp_time_d, afc_reg_info->avail_exp_time_t);
++	return 0;
++}
++
++static int ath12k_wmi_afc_fill_freq_obj(struct ath12k_base *ab,
++					const void *ptr, u16 len,
++					struct ath12k_afc_info *afc)
++{
++	struct ath12k_afc_sp_reg_info *afc_reg_info = afc->afc_reg_info;
++	struct wmi_6ghz_afc_frequency_info *freq_buf = NULL;
++	struct ath12k_afc_freq_obj *freq_obj = NULL;
++	int i;
++
++	if (!afc_reg_info->num_freq_objs) {
++		ath12k_warn(ab, "No freq objects in afc power event\n");
++		return -EINVAL;
++	}
++
++	ath12k_dbg(ab, ATH12K_DBG_AFC, "Num afc freq obj received %d\n",
++		   afc_reg_info->num_freq_objs);
++	freq_obj = kzalloc(afc_reg_info->num_freq_objs * sizeof(*freq_obj),
++			   GFP_ATOMIC);
++	if (!freq_obj)
++		return -ENOMEM;
++
++	freq_buf = (struct wmi_6ghz_afc_frequency_info *)ptr;
++	for (i = 0; i < afc_reg_info->num_freq_objs; i++) {
++		freq_obj[i].low_freq =
++				le32_to_cpu(u32_get_bits(freq_buf[i].freq_info,
++							 WMI_AFC_LOW_FREQUENCY));
++		freq_obj[i].high_freq =
++				le32_to_cpu(u32_get_bits(freq_buf[i].freq_info,
++							 WMI_AFC_HIGH_FREQUENCY));
++		freq_obj[i].max_psd = le32_to_cpu(freq_buf[i].psd_power_info);
++		ath12k_dbg(ab, ATH12K_DBG_AFC,
++			   "Freq obj: low: %d high: %d psd: %d\n",
++			   freq_obj[i].low_freq, freq_obj[i].high_freq,
++			   freq_obj[i].max_psd);
++	}
++
++	afc_reg_info->afc_freq_info = freq_obj;
++
++	return 0;
++}
++
++static int ath12k_wmi_afc_fill_chan_obj(struct ath12k_base *ab,
++					const void *ptr, u16 len,
++					struct ath12k_afc_info *afc)
++{
++	struct ath12k_afc_sp_reg_info *afc_reg_info = afc->afc_reg_info;
++	struct ath12k_afc_chan_obj *chan_obj = NULL;
++	struct ath12k_chan_eirp_obj *eirp_info = NULL;
++	struct wmi_6ghz_afc_channel_info *chan_buf = NULL;
++	int i;
++
++	if (!afc_reg_info->num_chan_objs) {
++		ath12k_warn(ab, "No channel objects in afc power event\n");
++		return -EINVAL;
++	}
++
++	ath12k_dbg(ab, ATH12K_DBG_AFC, "Num chan objects received %d\n",
++		   afc_reg_info->num_chan_objs);
++	chan_obj = kzalloc(afc_reg_info->num_chan_objs * sizeof(*chan_obj),
++			   GFP_ATOMIC);
++	if (!chan_obj)
++		return -ENOMEM;
++
++	chan_buf = (struct wmi_6ghz_afc_channel_info *)ptr;
++	for (i = 0; i < afc_reg_info->num_chan_objs; i++) {
++		chan_obj[i].global_opclass =
++			le32_to_cpu(chan_buf[i].global_operating_class);
++		chan_obj[i].num_chans =
++				le32_to_cpu(chan_buf[i].num_channels);
++		ath12k_dbg(ab, ATH12K_DBG_AFC,
++			   "Chan obj %d  global_opclass : %d num_chans %d\n", i,
++			   chan_obj[i].global_opclass, chan_obj[i].num_chans);
++		eirp_info = kzalloc(chan_obj[i].num_chans * sizeof(*eirp_info),
++				    GFP_ATOMIC);
++		if (!eirp_info)
++			return -ENOMEM;
++
++		chan_obj[i].chan_eirp_info = eirp_info;
++	}
++
++	afc_reg_info->afc_chan_info = chan_obj;
++
++	return 0;
++}
++
++static int ath12k_wmi_afc_fill_chan_eirp_obj(struct ath12k_base *ab,
++					     const void *ptr, u16 len,
++					     struct ath12k_afc_info *afc,
++					     u32 total_eirp_info)
++{
++	struct ath12k_afc_sp_reg_info *afc_reg_info = afc->afc_reg_info;
++	struct wmi_afc_chan_eirp_power_info *eirp_buf = NULL;
++	struct ath12k_afc_chan_obj *chan_info = NULL;
++	struct ath12k_chan_eirp_obj *eirp_obj;
++	int eirp_count, idx1, idx2, count = 0;
++
++	eirp_buf = (struct wmi_afc_chan_eirp_power_info *)ptr;
++	chan_info = afc_reg_info->afc_chan_info;
++	for (idx1 = 0; idx1 < afc_reg_info->num_chan_objs; ++idx1) {
++		eirp_obj = chan_info[idx1].chan_eirp_info;
++		eirp_count = le32_to_cpu(chan_info[idx1].num_chans);
++		ath12k_dbg(ab, ATH12K_DBG_AFC, "Chan obj %d Chan eirp count %d\n",
++			   idx1, eirp_count);
++		for (idx2 = 0; idx2 < eirp_count; ++idx2) {
++			eirp_obj[idx2].cfi =
++				le32_to_cpu(eirp_buf[count].channel_cfi);
++			eirp_obj[idx2].eirp_power =
++					le32_to_cpu(eirp_buf[count].eirp_pwr);
++		ath12k_dbg(ab, ATH12K_DBG_AFC, "Chan eirp obj %d CFI %d EIRP %d\n",
++			   idx2, eirp_obj[idx2].cfi, eirp_obj[idx2].eirp_power);
++			++count;
++		}
++	}
++
++	return 0;
++}
++
++static int ath12k_wmi_afc_event_parser(struct ath12k_base *ab,
++				       u16 tag, u16 len,
++				       const void *ptr, void *data)
++{
++	struct ath12k_afc_info *afc = (struct ath12k_afc_info *)data;
++	int total_eirp_obj, sub_tlv_size, ret = 0;
++	struct wmi_tlv *tlv;
++	u16 tlv_tag;
++
++	ath12k_dbg(ab, ATH12K_DBG_AFC, "AFC event tag 0x%x of len %d type %d\n",
++		   tag, len, afc->event_type);
++
++	switch (tag) {
++	case WMI_TAG_AFC_EVENT_FIXED_PARAM:
++		/* Fixed param is already processed */
++		break;
++	case WMI_TAG_AFC_EXPIRY_EVENT_PARAM:
++		/* TBD */
++		break;
++	case WMI_TAG_AFC_POWER_EVENT_PARAM:
++		if (len == 0)
++			return 0;
++
++		if (afc->event_type != ATH12K_AFC_EVENT_POWER_INFO)
++			return 0;
++
++		ret = ath12k_copy_afc_power_event_fixed_info(ab, afc, ptr, len);
++		if (ret) {
++			ath12k_warn(ab, "Failed to copy power event fixed info\n");
++			return ret;
++		}
++		break;
++	case WMI_TAG_ARRAY_STRUCT:
++		struct ath12k_afc_sp_reg_info *afc_reg_info = afc->afc_reg_info;
++
++		if (len == 0)
++			return 0;
++
++		tlv = (struct wmi_tlv *)ptr;
++		tlv_tag = u32_get_bits(tlv->header, WMI_TLV_TAG);
++
++		if (tlv_tag == WMI_TAG_AFC_6GHZ_FREQUENCY_INFO) {
++			sub_tlv_size = sizeof(struct wmi_6ghz_afc_frequency_info);
++			afc_reg_info->num_freq_objs = len / sub_tlv_size;
++			ret = ath12k_wmi_afc_fill_freq_obj(ab, ptr, len, afc);
++		} else if (tlv_tag == WMI_TAG_AFC_6GHZ_CHANNEL_INFO) {
++			sub_tlv_size = sizeof(struct wmi_6ghz_afc_channel_info);
++			afc_reg_info->num_chan_objs = len / sub_tlv_size;
++			ret = ath12k_wmi_afc_fill_chan_obj(ab, ptr, len, afc);
++		} else if (tlv_tag == WMI_TAG_AFC_CHAN_EIRP_POWER_INFO) {
++			sub_tlv_size = sizeof(struct wmi_afc_chan_eirp_power_info);
++			total_eirp_obj = len / sub_tlv_size;
++			ret =  ath12k_wmi_afc_fill_chan_eirp_obj(ab, ptr, len, afc,
++								 total_eirp_obj);
++		}
++		break;
++	default:
++		ath12k_warn(ab, "Unknown afc event tag %d\n", tag);
++		return -EINVAL;
++	}
++
++	return ret;
++}
++
++static struct ath12k *ath12k_wmi_afc_process_fixed_param(struct ath12k_base *ab,
++							 void *ptr, size_t len)
++{
++	struct wmi_afc_event_fixed_param *fixed_param;
++	const struct wmi_tlv *tlv;
++	struct ath12k *ar = NULL;
++	u16 tlv_tag;
++	u8 pdev_id;
++
++	if (!ptr) {
++		ath12k_warn(ab, "No data present in afc event\n");
++		return NULL;
++	}
++
++	if (len < (sizeof(*fixed_param) + TLV_HDR_SIZE)) {
++		ath12k_warn(ab, "afc event size invalid\n");
++		return NULL;
++	}
++
++	tlv = (struct wmi_tlv *)ptr;
++	tlv_tag = u32_get_bits(tlv->header, WMI_TLV_TAG);
++	ptr += sizeof(*tlv);
++
++	if (tlv_tag == WMI_TAG_AFC_EVENT_FIXED_PARAM) {
++		fixed_param = (struct wmi_afc_event_fixed_param *)ptr;
++		pdev_id = le32_to_cpu(fixed_param->pdev_id);
++		ar = ab->pdevs[pdev_id].ar;
++		if (!ar) {
++			ath12k_warn(ab, "Failed to get ar for afc fixed param\n");
++			return NULL;
++		}
++	} else {
++		ath12k_warn(ab, "Wrong tag %d in afc fixed param\n", tlv_tag);
++		return NULL;
++	}
++
++	ath12k_free_afc_power_event_info(&ar->afc);
++	memset(&ar->afc, 0, sizeof(ar->afc));
++	ar->afc.event_type = le32_to_cpu(fixed_param->event_type);
++
++	return ar;
++}
++
++static void ath12k_wmi_afc_event(struct ath12k_base *ab,
++				 struct sk_buff *skb)
++{
++	struct ath12k_afc_info *afc_info;
++	struct ath12k *ar;
++	int ret;
++
++	ar = ath12k_wmi_afc_process_fixed_param(ab, skb->data, skb->len);
++	if (!ar) {
++		ath12k_warn(ab, "Failed to get ar for afc processing\n");
++		return;
++	}
++
++	afc_info = &ar->afc;
++	ath12k_dbg(ab, ATH12K_DBG_AFC, "Received AFC event of type %d\n",
++		   ar->afc.event_type);
++	ret = ath12k_wmi_tlv_iter(ab, skb->data, skb->len,
++				  ath12k_wmi_afc_event_parser, afc_info);
++	if (ret) {
++		ath12k_free_afc_power_event_info(afc_info);
++		ath12k_warn(ab, "Failed to parse afc event type %d ret = %d\n",
++			    afc_info->event_type, ret);
++		return;
++	}
++
++	if (afc_info->event_type == ATH12K_AFC_EVENT_POWER_INFO) {
++		ret = ath12k_reg_process_afc_power_event(ar);
++		if (ret)
++			ath12k_warn(ab, "AFC reg rule update failed ret : %d\n",
++				    ret);
++	}
++}
++
+ static struct ath12k_reg_rule
+ *create_ext_reg_rules_from_wmi(u32 num_reg_rules,
+ 			       struct ath12k_wmi_reg_rule_ext_params *wmi_reg_rule)
+@@ -15053,6 +15384,9 @@ static void ath12k_wmi_op_rx(struct ath1
+ 	case WMI_PDEV_ANI_OFDM_LEVEL_EVENTID:
+ 		ath12k_wmi_event_ani_ofdm_level(ab, skb);
+ 		break;
++	case WMI_AFC_EVENTID:
++		ath12k_wmi_afc_event(ab, skb);
++		break;
+ 	/* TODO: Add remaining events */
+ 	default:
+ 		ath12k_dbg(ab, ATH12K_DBG_WMI, "Unknown eventid: 0x%x\n", id);
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -1067,6 +1067,7 @@ enum wmi_tlv_event_id {
+ 	WMI_REG_CHAN_LIST_CC_EVENTID = WMI_TLV_CMD(WMI_GRP_REGULATORY),
+ 	WMI_11D_NEW_COUNTRY_EVENTID,
+ 	WMI_REG_CHAN_LIST_CC_EXT_EVENTID,
++	WMI_AFC_EVENTID,
+ 	WMI_NDI_CAP_RSP_EVENTID = WMI_TLV_CMD(WMI_GRP_PROTOTYPE),
+ 	WMI_NDP_INITIATOR_RSP_EVENTID,
+ 	WMI_NDP_RESPONDER_RSP_EVENTID,
+@@ -2190,6 +2191,12 @@ enum wmi_tlv_tag {
+ 	WMI_TAG_MLO_PEER_CREATE_PARAMS = 0x3D5,
+ 	WMI_TAG_MLO_VDEV_START_PARAMS = 0x3D6,
+ 	WMI_TAG_MLO_VDEV_CREATE_PARAMS = 0x3D7,
++	WMI_TAG_AFC_EVENT_FIXED_PARAM,
++	WMI_TAG_AFC_EXPIRY_EVENT_PARAM,
++	WMI_TAG_AFC_POWER_EVENT_PARAM,
++	WMI_TAG_AFC_6GHZ_FREQUENCY_INFO,
++	WMI_TAG_AFC_6GHZ_CHANNEL_INFO,
++	WMI_TAG_AFC_CHAN_EIRP_POWER_INFO,
+ 	WMI_TAG_VDEV_SET_INTRA_BSS_PARAMS = 0x3EE,
+ 	WMI_TAG_PEER_SET_INTRA_BSS_PARAMS,
+ 	WMI_TAG_PDEV_PKTLOG_DECODE_INFO = 0x414,
+@@ -8567,6 +8574,9 @@ struct wmi_peer_tid_latency_cmd {
+ #define WMI_ANI_EVENT_PDEV_ID_VALID	BIT(31)
+ #define WMI_ANI_EVENT_PDEV_ID		GENMASK(7, 0)
+ 
++#define WMI_AFC_LOW_FREQUENCY			GENMASK(15, 0)
++#define WMI_AFC_HIGH_FREQUENCY			GENMASK(31, 16)
++
+ struct wmi_pdev_ani_event {
+ 	__le32 tlv_header;
+ 	__s32 ani_level;
+@@ -8577,6 +8587,38 @@ struct wmi_pdev_ani_event {
+ 	__le32 pdev_id_bitmap;
+ } __packed;
+ 
++struct wmi_6ghz_afc_frequency_info {
++	__le32 tlv_header;
++	__le32 freq_info;
++	__le32 psd_power_info;
++} __packed;
++
++struct wmi_afc_chan_eirp_power_info {
++	__le32 tlv_header;
++	__le32 channel_cfi;
++	__le32 eirp_pwr;
++} __packed;
++
++struct wmi_6ghz_afc_channel_info {
++	__le32 tlv_header;
++	__le32 global_operating_class;
++	__le32 num_channels;
++} __packed;
++
++struct wmi_afc_event_fixed_param {
++	__le32 pdev_id;
++	__le32 event_type;
++} __packed;
++
++struct wmi_afc_power_event_param {
++	__le32 fw_status_code;
++	__le32 resp_id;
++	__le32 afc_serv_resp_code;
++	__le32 afc_wfa_version;
++	__le32 avail_exp_time_d;
++	__le32 avail_exp_time_t;
++};
++
+ #define ATH12K_FW_STATS_BUF_SIZE (1024 * 1024)
+ 
+ void ath12k_wmi_init_qcn9274(struct ath12k_base *ab,

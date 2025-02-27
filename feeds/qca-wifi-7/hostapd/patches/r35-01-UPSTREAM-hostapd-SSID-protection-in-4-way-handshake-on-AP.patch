@@ -1,0 +1,281 @@
+From ae63905627bde01f875d405764f80f7e89f3a8f8 Mon Sep 17 00:00:00 2001
+From: Jouni Malinen <quic_jouni@quicinc.com>
+Date: Wed, 10 Jul 2024 12:18:29 +0530
+Subject: [PATCH] hostapd: SSID protection in 4-way handshake on AP
+
+Add support for SSID protection in 4-way handshake based on the mechanism
+added in IEEE 802.11REVme/D6.0. This is a mitigation against
+CVE-2023-52424 (a.k.a. the SSID Confusion Attack).
+This functionality is disabled by default and can be enabled with
+ssid_protection=1.
+
+Signed-off-by: Jouni Malinen <quic_jouni@quicinc.com>
+Signed-off-by: Arunpandi Kannan <quic_arunpand@quicinc.com>
+---
+ hostapd/config_file.c      |  6 ++++++
+ hostapd/hostapd.conf       | 19 +++++++++++++++++++
+ src/ap/ap_config.h         |  2 ++
+ src/ap/ieee802_11.c        |  7 +++++++
+ src/ap/ieee802_11_shared.c | 24 +++++++++++++++++-------
+ src/ap/wpa_auth.c          | 17 +++++++++++++++++
+ src/ap/wpa_auth.h          |  4 +++-
+ src/ap/wpa_auth_glue.c     |  3 ++-
+ src/ap/wpa_auth_i.h        |  2 ++
+ src/ap/wpa_auth_ie.c       |  4 +++-
+ 10 files changed, 78 insertions(+), 10 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index f9cdefa..3c27d7d 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -4817,6 +4817,12 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 		conf->mbssid = atoi(pos);
+ 	} else if (os_strcmp(buf, "ema") == 0) {
+ 		conf->ema = atoi(pos);
++	} else if (os_strcmp(buf, "ssid_protection") == 0) {
++		int val = atoi(pos);
++
++		if (val < 0 || val > 1)
++			return 1;
++		bss->ssid_protection = val;
+ #ifdef CONFIG_IEEE80211BE
+ 	} else if (os_strcmp(buf, "ieee80211be") == 0) {
+ 		conf->ieee80211be = atoi(pos);
+diff --git a/hostapd/hostapd.conf b/hostapd/hostapd.conf
+index 3155f1e..3786d9d 100644
+--- a/hostapd/hostapd.conf
++++ b/hostapd/hostapd.conf
+@@ -2300,6 +2300,25 @@ own_ip_addr=127.0.0.1
+ #sae_pwe=2
+ 
+ 
++# SSID protection in 4-way handshake
++# The IEEE 802.11i-2004 RSN design did not provide means for protecting the
++# SSID in the general case. IEEE P802.11REVme/D6.0 added support for this in
++# 4-way handshake. This capability allows a STA to confirm that the AP has the
++# same understanding on which SSID is being used for an association in a
++# protected manner in cases where both the AP and the STA has this capability.
++# This can be used to mitigate CVE-2023-52424 (a.k.a. the SSID Confusion
++# Attack).
++#
++# Ideally, this capability would be enabled by default on the AP, but since this
++# is new functionality with limited testing, the default is to disable this for
++# now and require explicitly configuration to enable. The default behavior is
++# like to change once this capability has received more testing.
++#
++# 0 = SSID protection in 4-way handshake disabled (default)
++# 1 = SSID protection in 4-way handshake enabled
++#
++#ssid_protection=0
++
+ ##### IEEE 802.11r configuration ##############################################
+ 
+ # Mobility Domain identifier (dot11FTMobilityDomainID, MDID)
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 22f7423..e603477 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -954,6 +954,8 @@ struct hostapd_bss_config {
+ 	int beacon_tx_mode;
+ 	char *config_id;
+ 
++	bool ssid_protection;
++
+ #ifdef CONFIG_IEEE80211BE
+ 	/* The AP is part of an AP MLD */
+ 	u8 mld_ap;
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 01bb2f3..8f361af 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -4405,6 +4405,13 @@ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ 				       "association");
+ 			return WLAN_STATUS_CIPHER_REJECTED_PER_POLICY;
+ 		}
++
++		wpa_auth_set_ssid_protection(
++			sta->wpa_sm,
++			hapd->conf->ssid_protection &&
++			ieee802_11_rsnx_capab_len(
++				elems->rsnxe, elems->rsnxe_len,
++				WLAN_RSNX_CAPAB_SSID_PROTECTION));
+ #ifdef CONFIG_HS20
+ 	} else if (hapd->conf->osen) {
+ 		if (!elems->osen) {
+diff --git a/src/ap/ieee802_11_shared.c b/src/ap/ieee802_11_shared.c
+index 3c480e8..4499d58 100644
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -1089,7 +1089,7 @@ u8 * hostapd_eid_rsnxe(struct hostapd_data *hapd, u8 *eid, size_t len)
+ {
+ 	u8 *pos = eid;
+ 	bool sae_pk = false;
+-	u16 capab = 0;
++	u32 capab = 0, tmp;
+ 	size_t flen;
+ 
+ 	if (!(hapd->conf->wpa & WPA_PROTO_RSN))
+@@ -1118,18 +1118,28 @@ u8 * hostapd_eid_rsnxe(struct hostapd_data *hapd, u8 *eid, size_t len)
+ 		capab |= BIT(WLAN_RSNX_CAPAB_SECURE_RTT);
+ 	if (hapd->iface->drv_flags2 & WPA_DRIVER_FLAGS2_PROT_RANGE_NEG_AP)
+ 		capab |= BIT(WLAN_RSNX_CAPAB_URNM_MFPR);
++	if (hapd->conf->ssid_protection)
++		capab |= BIT(WLAN_RSNX_CAPAB_SSID_PROTECTION);
+ 
+-	flen = (capab & 0xff00) ? 2 : 1;
+-	if (len < 2 + flen || !capab)
++	if (!capab)
++		return eid; /* no supported extended RSN capabilities */
++	tmp = capab;
++	flen = 0;
++	while (tmp) {
++		flen++;
++		tmp >>= 8;
++	}
++
++	if (len < 2 + flen)
+ 		return eid; /* no supported extended RSN capabilities */
+ 	capab |= flen - 1; /* bit 0-3 = Field length (n - 1) */
+ 
+ 	*pos++ = WLAN_EID_RSNX;
+ 	*pos++ = flen;
+-	*pos++ = capab & 0x00ff;
+-	capab >>= 8;
+-	if (capab)
+-		*pos++ = capab;
++	while (capab) {
++		*pos++ = capab & 0xff;
++		capab >>= 8;
++	}
+ 
+ 	return pos;
+ }
+diff --git a/src/ap/wpa_auth.c b/src/ap/wpa_auth.c
+index 0c23473..2dd1655 100644
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -4619,6 +4619,9 @@ SM_STATE(WPA_PTK, PTKINITNEGOTIATING)
+ 
+ 	kde_len += wpa_auth_ml_kdes_len(sm);
+ 
++	if (sm->ssid_protection)
++		kde_len += 2 + conf->ssid_len;
++
+ 	kde = os_malloc(kde_len);
+ 	if (!kde)
+ 		goto done;
+@@ -4743,6 +4746,13 @@ SM_STATE(WPA_PTK, PTKINITNEGOTIATING)
+ 
+ 	pos = wpa_auth_ml_kdes(sm, pos);
+ 
++	if (sm->ssid_protection) {
++		*pos++ = WLAN_EID_SSID;
++		*pos++ = conf->ssid_len;
++		os_memcpy(pos, conf->ssid, conf->ssid_len);
++		pos += conf->ssid_len;
++	}
++
+ 	wpa_send_eapol(sm->wpa_auth, sm,
+ 		       (secure ? WPA_KEY_INFO_SECURE : 0) |
+ 		       (wpa_mic_len(sm->wpa_key_mgmt, sm->pmk_len) ?
+@@ -6746,6 +6756,13 @@ void wpa_auth_set_dpp_z(struct wpa_state_machine *sm, const struct wpabuf *z)
+ #endif /* CONFIG_DPP2 */
+ 
+ 
++void wpa_auth_set_ssid_protection(struct wpa_state_machine *sm, bool val)
++{
++	if (sm)
++		sm->ssid_protection = val;
++}
++
++
+ void wpa_auth_set_transition_disable(struct wpa_authenticator *wpa_auth,
+ 				     u8 val)
+ {
+diff --git a/src/ap/wpa_auth.h b/src/ap/wpa_auth.h
+index d22a9c5..f8aae64 100644
+--- a/src/ap/wpa_auth.h
++++ b/src/ap/wpa_auth.h
+@@ -205,9 +205,9 @@ struct wpa_auth_config {
+ #ifdef CONFIG_OCV
+ 	int ocv; /* Operating Channel Validation */
+ #endif /* CONFIG_OCV */
+-#ifdef CONFIG_IEEE80211R_AP
+ 	u8 ssid[SSID_MAX_LEN];
+ 	size_t ssid_len;
++#ifdef CONFIG_IEEE80211R_AP
+ 	u8 mobility_domain[MOBILITY_DOMAIN_ID_LEN];
+ 	u8 r0_key_holder[FT_R0KH_ID_MAX_LEN];
+ 	size_t r0_key_holder_len;
+@@ -292,6 +292,7 @@ struct wpa_auth_config {
+ 	 * Set only in nontransmitted BSSs, i.e., is NULL for transmitted BSS
+ 	 * and in BSSs that are not part of a Multi-BSSID set. */
+ 	struct wpa_authenticator *tx_bss_auth;
++	bool ssid_protection;
+ };
+ 
+ typedef enum {
+@@ -626,6 +627,7 @@ void wpa_auth_set_auth_alg(struct wpa_state_machine *sm, u16 auth_alg);
+ void wpa_auth_set_rsn_override(struct wpa_state_machine *sm, bool val);
+ void wpa_auth_set_rsn_override_2(struct wpa_state_machine *sm, bool val);
+ void wpa_auth_set_dpp_z(struct wpa_state_machine *sm, const struct wpabuf *z);
++void wpa_auth_set_ssid_protection(struct wpa_state_machine *sm, bool val);
+ void wpa_auth_set_transition_disable(struct wpa_authenticator *wpa_auth,
+ 				     u8 val);
+ 
+diff --git a/src/ap/wpa_auth_glue.c b/src/ap/wpa_auth_glue.c
+index 6afe999..d548b3a 100644
+--- a/src/ap/wpa_auth_glue.c
++++ b/src/ap/wpa_auth_glue.c
+@@ -149,11 +149,12 @@ static void hostapd_wpa_auth_conf(struct hostapd_bss_config *conf,
+ 	wconf->beacon_prot = conf->beacon_prot;
+ 	wconf->group_mgmt_cipher = conf->group_mgmt_cipher;
+ 	wconf->sae_require_mfp = conf->sae_require_mfp;
+-#ifdef CONFIG_IEEE80211R_AP
++	wconf->ssid_protection = conf->ssid_protection;
+ 	wconf->ssid_len = conf->ssid.ssid_len;
+ 	if (wconf->ssid_len > SSID_MAX_LEN)
+ 		wconf->ssid_len = SSID_MAX_LEN;
+ 	os_memcpy(wconf->ssid, conf->ssid.ssid, wconf->ssid_len);
++#ifdef CONFIG_IEEE80211R_AP
+ 	os_memcpy(wconf->mobility_domain, conf->mobility_domain,
+ 		  MOBILITY_DOMAIN_ID_LEN);
+ 	if (conf->nas_identifier &&
+diff --git a/src/ap/wpa_auth_i.h b/src/ap/wpa_auth_i.h
+index ae25a5b..d433863 100644
+--- a/src/ap/wpa_auth_i.h
++++ b/src/ap/wpa_auth_i.h
+@@ -197,6 +197,8 @@ struct wpa_state_machine {
+ 	} mld_links[MAX_NUM_MLD_LINKS];
+ 	bool ft_over_ds_ml;
+ #endif /* CONFIG_IEEE80211BE */
++
++	bool ssid_protection;
+ };
+ 
+ 
+diff --git a/src/ap/wpa_auth_ie.c b/src/ap/wpa_auth_ie.c
+index 26bc6de..06d45fa 100644
+--- a/src/ap/wpa_auth_ie.c
++++ b/src/ap/wpa_auth_ie.c
+@@ -478,7 +478,7 @@ static int wpa_write_rsne_override_2(struct wpa_auth_config *conf, u8 *buf,
+ 
+ static u32 rsnxe_capab(struct wpa_auth_config *conf, int key_mgmt)
+ {
+-	u16 capab = 0;
++	u32 capab = 0;
+ 
+ 	if (wpa_key_mgmt_sae(key_mgmt) &&
+ 	    (conf->sae_pwe == SAE_PWE_HASH_TO_ELEMENT ||
+@@ -497,6 +497,8 @@ static u32 rsnxe_capab(struct wpa_auth_config *conf, int key_mgmt)
+ 		capab |= BIT(WLAN_RSNX_CAPAB_SECURE_RTT);
+ 	if (conf->prot_range_neg)
+ 		capab |= BIT(WLAN_RSNX_CAPAB_URNM_MFPR);
++	if (conf->ssid_protection)
++		capab |= BIT(WLAN_RSNX_CAPAB_SSID_PROTECTION);
+ 
+ 	return capab;
+ }
+-- 
+2.34.1
+

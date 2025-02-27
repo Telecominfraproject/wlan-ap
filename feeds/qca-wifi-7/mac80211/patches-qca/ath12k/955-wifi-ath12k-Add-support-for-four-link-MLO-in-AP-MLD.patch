@@ -1,0 +1,511 @@
+From 3486252fc25f84ac90fe0900f1bd1a12a19697f2 Mon Sep 17 00:00:00 2001
+From: Aishwarya R <quic_aisr@quicinc.com>
+Date: Wed, 29 May 2024 09:20:48 +0530
+Subject: [PATCH] wifi: ath12k: Add support for four link MLO in AP MLD
+
+Bring up of four link MLO support in AP MLD.
+
+Currently hw_link_id value is based on bootup probing
+order value. When bootup order is different from
+WSI order then timesync issue is seen. To fix this
+read chip index from DTS and update hw_link_id based
+on WSI order.
+
+Maintain mlo_chip_info_v2 structure to keep hw_link_id
+and adjacent chip related information based on WSI order
+and update firmware through QMI. As mlo_chip_info_v2
+structure is specific to firmware supported
+firmware version has to be used.
+
+chip_info is maintained in below format in DTS
+<chip_idx num_adj_chips adj_chip_idx[0] adj_chip_idx[1]>
+
+Patch-dependency: 882-wifi-ath12k-Add-support-for-four-slot-PCIe-by-changi.patch
+Signed-off-by: Aishwarya R <quic_aisr@quicinc.com>
+Signed-off-by: Mahendran P <quic_mahep@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c |  47 ++++++++-
+ drivers/net/wireless/ath/ath12k/core.h |  14 ++-
+ drivers/net/wireless/ath/ath12k/dp.c   |   7 +-
+ drivers/net/wireless/ath/ath12k/hal.h  |   1 +
+ drivers/net/wireless/ath/ath12k/hw.h   |   2 +
+ drivers/net/wireless/ath/ath12k/ppe.h  |   3 +-
+ drivers/net/wireless/ath/ath12k/qmi.c  | 141 ++++++++++++++++++++++---
+ drivers/net/wireless/ath/ath12k/qmi.h  |  11 +-
+ drivers/net/wireless/ath/ath12k/wmi.h  |  11 +-
+ 9 files changed, 210 insertions(+), 27 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -223,8 +223,11 @@ static struct ath12k_hw_group *ath12k_co
+ 	struct ath12k_hw_group *ag = NULL;
+ 	struct device_node *mlo;
+ 	struct device *dev = ab->dev;
+-	u32 group_id, num_chips;
++	u32 group_id, num_chips = 0;
++	u32 wsi_index;
++	u32 offset = 0;
+ 	int ret;
++	int i;
+ 
+ 	lockdep_assert_held(&ath12k_hw_lock);
+ 
+@@ -263,7 +266,7 @@ again:
+ 		}
+ 
+ 		if (num_chips > ATH12K_MAX_SOCS) {
+-			ath12k_warn(ab, "num_chip advertised %d is more than limit %d\n",
++			ath12k_warn(ab, "num_chips advertised %d is more than limit %d\n",
+ 				    num_chips, ATH12K_MAX_SOCS);
+ 			group_id = ATH12K_INVALID_GRP_ID;
+ 			goto again;
+@@ -297,6 +300,48 @@ again:
+ 		}
+ 	}
+ 
++	if (of_property_read_u32(dev->of_node, "qcom,wsi_index", &wsi_index)) {
++		ath12k_err(ab, "qcom,wsi_index is not configured\n");
++		group_id = ATH12K_INVALID_GRP_ID;
++		goto again;
++	}
++
++	/* offset is calculated based on array_index of chip_info from DTS
++	 * <chip_idx num_adj_chips adj_chip_idx[0] adj_chip_idx[1]>
++	 */
++	if (num_chips <= 2)
++		offset = wsi_index * (num_chips + 1);
++	else
++		offset = wsi_index * ATH12K_WSI_MAX_ARGS;
++
++	if (of_property_read_u32_index(mlo, "chip_info", offset, &ab->wsi_info.chip_idx)) {
++		ath12k_err(ab, "chip_idx is not configured\n");
++		group_id = ATH12K_INVALID_GRP_ID;
++		goto again;
++	}
++
++	if (of_property_read_u32_index(mlo, "chip_info", offset + 1,
++				       &ab->wsi_info.num_adj_chips)) {
++		ath12k_err(ab, "num_adj_chips is not configured\n");
++		group_id = ATH12K_INVALID_GRP_ID;
++		goto again;
++	}
++	ath12k_dbg(ab, ATH12K_DBG_BOOT, "chip info: chip_idx = %d, num_adj_chips = %d\n",
++		   ab->wsi_info.chip_idx, ab->wsi_info.num_adj_chips);
++
++	for (i = 0; i < ab->wsi_info.num_adj_chips; i++) {
++
++		if (of_property_read_u32_index(mlo, "chip_info", offset + i + 2,
++					       &ab->wsi_info.adj_chip_idxs[i])) {
++			ath12k_err(ab, "adj_chip_idxs is not configured\n");
++			group_id = ATH12K_INVALID_GRP_ID;
++			goto again;
++		}
++
++		ath12k_dbg(ab, ATH12K_DBG_BOOT, "adj_chip_idxs = %d\n",
++			   ab->wsi_info.adj_chip_idxs[i]);
++	}
++
+ 	if (ag->num_probed >= ag->num_chip) {
+ 		ath12k_warn(ab, "unable to add new chip to group, max limit reached\n");
+ 		group_id = ATH12K_INVALID_GRP_ID;
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -229,13 +229,15 @@ struct ath12k_he {
+ 	u32 heop_param;
+ };
+ 
+-#define MAX_RADIOS             3
+-#define ATH12K_MAX_SOCS        3
++#define MAX_RADIOS	4
+ #define ATH12K_GROUP_MAX_RADIO (ATH12K_MAX_SOCS * MAX_RADIOS)
+ #define ATH12K_INVALID_GRP_ID  0xFF
+ #define ATH12K_INVALID_CHIP_ID 0xFF
+ #define ATH12K_MAX_MLO_PEER    0x100
+ 
++#define ATH12K_MAX_ADJACENT_CHIPS   2
++#define ATH12K_WSI_MAX_ARGS 4
++
+ enum {
+ 	WMI_HOST_TP_SCALE_MAX   = 0,
+ 	WMI_HOST_TP_SCALE_50    = 1,
+@@ -1408,6 +1410,12 @@ struct ath12k_hw_group {
+ 	struct dp_rx_fst *fst;
+ };
+ 
++struct wsi_info {
++        u32 chip_idx;
++        u32 num_adj_chips;
++        u32 adj_chip_idxs[ATH12K_MAX_ADJACENT_CHIPS];
++};
++
+ /* Master structure to hold the hw data which may be used in core module */
+ struct ath12k_base {
+ 	enum ath12k_hw_rev hw_rev;
+@@ -1603,6 +1611,8 @@ struct ath12k_base {
+ 
+ 	bool ce_pipe_init_done;
+ 	bool rxgainlut_support;
++
++	struct wsi_info wsi_info;
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+ };
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -2382,7 +2382,12 @@ int ath12k_dp_alloc(struct ath12k_base *
+ 
+ 	dp->reo_cmd_cache_flush_count = 0;
+ 	chip_id = (ab->ag->mlo_capable) ? ab->chip_id : 0;
+-	dp->idle_link_rbm_id = HAL_RX_BUF_RBM_WBM_CHIP0_IDLE_DESC_LIST + chip_id;
++	if (chip_id <= 2)
++		dp->idle_link_rbm_id = HAL_RX_BUF_RBM_WBM_CHIP0_IDLE_DESC_LIST + chip_id;
++	else if (chip_id == 3)
++		dp->idle_link_rbm_id = HAL_RX_BUF_RBM_WBM_CHIP3_IDLE_DESC_LIST;
++	else
++		ath12k_err(ab, "chip_id is more than expected %d\n", chip_id);
+ 
+ 	ret = ath12k_wbm_idle_ring_setup(ab, &n_link_desc);
+ 	if (ret) {
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -912,6 +912,7 @@ enum hal_rx_buf_return_buf_manager {
+ 	HAL_RX_BUF_RBM_SW4_BM,
+ 	HAL_RX_BUF_RBM_SW5_BM,
+ 	HAL_RX_BUF_RBM_SW6_BM,
++	HAL_RX_BUF_RBM_WBM_CHIP3_IDLE_DESC_LIST,
+ };
+ 
+ #define HAL_SRNG_DESC_LOOP_CNT		0xf0000000
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -108,6 +108,8 @@ struct ath12k_cfr_peer_tx_param;
+ #define ATH12K_UMAC_RESET_IPC_IPQ5332	451
+ #define ATH12K_UMAC_RESET_IPC_QCN6432	7
+ 
++#define ATH12K_MAX_SOCS 4
++
+ enum ath12k_hw_rate_cck {
+ 	ATH12K_HW_RATE_CCK_LP_11M = 0,
+ 	ATH12K_HW_RATE_CCK_LP_5_5M,
+--- a/drivers/net/wireless/ath/ath12k/ppe.h
++++ b/drivers/net/wireless/ath/ath12k/ppe.h
+@@ -10,12 +10,11 @@
+ #include <ppe_vp_public.h>
+ #include <ppe_drv_sc.h>
+ #include <ppe_drv.h>
++#include "hw.h"
+ 
+ struct ath12k_base;
+ struct ath12k_vif;
+ 
+-#define ATH12K_MAX_SOCS             3
+-
+ #define ATH12K_PPE_DEFAULT_CORE_MASK		ath12k_rfs_core_mask[0]
+ #define ATH12K_PPE_RFS_2GHZ_CORE_MASK		ath12k_rfs_core_mask[1]
+ #define ATH12K_PPE_RFS_5GHZ_CORE_MASK		ath12k_rfs_core_mask[2]
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -148,7 +148,7 @@ static struct qmi_elem_info wlfw_host_ml
+ 		.elem_len       = 1,
+ 		.elem_size      = sizeof(u8),
+ 		.array_type	= NO_ARRAY,
+-		.tlv_type       = 0,
++		.tlv_type       = 0x00,
+ 		.offset         = offsetof(struct wlfw_host_mlo_chip_info_s_v01,
+ 					   chip_id),
+ 	},
+@@ -157,7 +157,7 @@ static struct qmi_elem_info wlfw_host_ml
+ 		.elem_len       = 1,
+ 		.elem_size      = sizeof(u8),
+ 		.array_type	= NO_ARRAY,
+-		.tlv_type       = 0,
++		.tlv_type       = 0x00,
+ 		.offset         = offsetof(struct wlfw_host_mlo_chip_info_s_v01,
+ 					   num_local_links),
+ 	},
+@@ -166,7 +166,7 @@ static struct qmi_elem_info wlfw_host_ml
+ 		.elem_len       = QMI_WLFW_MAX_NUM_MLO_LINKS_PER_CHIP_V01,
+ 		.elem_size      = sizeof(u8),
+ 		.array_type     = STATIC_ARRAY,
+-		.tlv_type       = 0,
++		.tlv_type       = 0x00,
+ 		.offset         = offsetof(struct wlfw_host_mlo_chip_info_s_v01,
+ 					   hw_link_id),
+ 	},
+@@ -175,7 +175,7 @@ static struct qmi_elem_info wlfw_host_ml
+ 		.elem_len       = QMI_WLFW_MAX_NUM_MLO_LINKS_PER_CHIP_V01,
+ 		.elem_size      = sizeof(u8),
+ 		.array_type     = STATIC_ARRAY,
+-		.tlv_type       = 0,
++		.tlv_type       = 0x00,
+ 		.offset         = offsetof(struct wlfw_host_mlo_chip_info_s_v01,
+ 					   valid_mlo_link_id),
+ 	},
+@@ -186,6 +186,43 @@ static struct qmi_elem_info wlfw_host_ml
+ 	},
+ };
+ 
++static struct qmi_elem_info wlfw_host_mlo_chip_info_s_v02_ei[] = {
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = 1,
++		.elem_size      = sizeof(struct wlfw_host_mlo_chip_info_s_v01),
++		.array_type	= NO_ARRAY,
++		.tlv_type       = 0x00,
++		.offset         = offsetof(struct wlfw_host_mlo_chip_info_s_v02,
++					   mlo_chip_info),
++		.ei_array       = wlfw_host_mlo_chip_info_s_v01_ei,
++	},
++	{
++		.data_type      = QMI_UNSIGNED_1_BYTE,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type	= NO_ARRAY,
++		.tlv_type       = 0x00,
++		.offset         = offsetof(struct wlfw_host_mlo_chip_info_s_v02,
++					   num_adj_chips),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = QMI_WLFW_MAX_NUM_MLO_ADJ_CHIPS_V01,
++		.elem_size      = sizeof(struct wlfw_host_mlo_chip_info_s_v01),
++		.array_type     = STATIC_ARRAY,
++		.tlv_type       = 0x00,
++		.offset         = offsetof(struct wlfw_host_mlo_chip_info_s_v02,
++					   mlo_adj_chip_info),
++		.ei_array       = wlfw_host_mlo_chip_info_s_v01_ei,
++	},
++	{
++		.data_type      = QMI_EOTI,
++		.array_type	= NO_ARRAY,
++		.tlv_type       = QMI_COMMON_TLV_TYPE,
++	},
++};
++
+ static struct qmi_elem_info qmi_wlanfw_qdss_trace_mode_req_msg_v01_ei[] = {
+ 	{
+ 		.data_type      = QMI_OPT_FLAG,
+@@ -715,6 +752,25 @@ static struct qmi_elem_info qmi_wlanfw_h
+ 					   fw_cfg_support),
+ 	},
+ 	{
++		.data_type      = QMI_OPT_FLAG,
++		.elem_len       = 1,
++		.elem_size      = sizeof(u8),
++		.array_type     = NO_ARRAY,
++		.tlv_type       = 0x2F,
++		.offset         = offsetof(struct qmi_wlanfw_host_cap_req_msg_v01,
++							mlo_chip_v2_info_valid),
++	},
++	{
++		.data_type      = QMI_STRUCT,
++		.elem_len       = QMI_WLFW_MAX_NUM_MLO_CHIPS_V01,
++		.elem_size      = sizeof(struct wlfw_host_mlo_chip_info_s_v02),
++		.array_type     = STATIC_ARRAY,
++		.tlv_type       = 0x2F,
++		.offset         = offsetof(struct qmi_wlanfw_host_cap_req_msg_v01,
++							mlo_chip_info_v2),
++		.ei_array      = wlfw_host_mlo_chip_info_s_v02_ei,
++	},
++	{
+ 		.data_type	= QMI_EOTI,
+ 		.array_type	= NO_ARRAY,
+ 		.tlv_type	= QMI_COMMON_TLV_TYPE,
+@@ -3016,10 +3072,57 @@ out:
+ 	return ret;
+ }
+ 
++static int ath12k_qmi_fill_adj_info(struct ath12k_base *ab,
++				    struct wlfw_host_mlo_chip_info_s_v02 *info)
++{
++	struct wlfw_host_mlo_chip_info_s_v01 *adj_info;
++	struct ath12k_base *adjacent_ab;
++	struct ath12k_hw_group *ag = ab->ag;
++	u32 chip_idx;
++	bool adj_ab_found = false;
++	int i, j;
++	int adj_index;
++
++	for (i = 0; i < info->num_adj_chips; i++) {
++		chip_idx = ab->wsi_info.adj_chip_idxs[i];
++		adj_info = &info->mlo_adj_chip_info[i];
++
++		for (j = 0; j < ag->num_chip; j++) {
++			adjacent_ab = ag->ab[j];
++
++			if (adjacent_ab->wsi_info.chip_idx == chip_idx) {
++				adj_ab_found = true;
++				break;
++			}
++		}
++
++		if (!adj_ab_found) {
++			ath12k_err(ab, "MLO adjacent ab for chip idx not found: %d\n", chip_idx);
++			return -EINVAL;
++		}
++
++		adj_info->chip_id = adjacent_ab->chip_id;
++		adj_info->num_local_links = adjacent_ab->qmi.num_radios;
++
++		ath12k_dbg(ab, ATH12K_DBG_QMI, "MLO adj chip id %d num_link %d\n",
++			   adjacent_ab->chip_id, adj_info->num_local_links);
++
++		for (adj_index = 0; adj_index < adj_info->num_local_links; adj_index++) {
++			adj_info->hw_link_id[adj_index] = adjacent_ab->wsi_info.chip_idx + adj_index;
++			adj_info->valid_mlo_link_id[adj_index] = true;
++
++			ath12k_dbg(ab, ATH12K_DBG_QMI, "MLO adj chip link id %d\n",
++				   adj_info->hw_link_id[adj_index]);
++
++		}
++	}
++	return 0;
++}
++
+ static int ath12k_qmi_fill_mlo_host_caps(struct ath12k_base *ab,
+ 										 struct qmi_wlanfw_host_cap_req_msg_v01 *req)
+ {
+-	struct wlfw_host_mlo_chip_info_s_v01 *info;
++	struct wlfw_host_mlo_chip_info_s_v02 *info;
+ 	struct ath12k_hw_group *ag = ab->ag;
+ 	struct ath12k_base *partner_ab;
+ 	int ret, i, j, link_id;
+@@ -3075,7 +3178,7 @@ static int ath12k_qmi_fill_mlo_host_caps
+ 
+ 	link_id = 0;
+ 	for (i = 0; i < ag->num_chip; i++) {
+-		info = &req->mlo_chip_info[i];
++		info = &req->mlo_chip_info_v2[i];
+ 		partner_ab = ag->ab[i];
+ 
+ 		if (partner_ab->chip_id == ATH12K_INVALID_CHIP_ID) {
+@@ -3083,28 +3186,34 @@ static int ath12k_qmi_fill_mlo_host_caps
+ 			goto chip_cleanup;
+ 		}
+ 
+-		info->chip_id = partner_ab->chip_id;
+-
+-		info->num_local_links = partner_ab->qmi.num_radios;
++		info->mlo_chip_info.chip_id = partner_ab->chip_id;
++		info->mlo_chip_info.num_local_links = partner_ab->qmi.num_radios;
++		info->num_adj_chips = ab->wsi_info.num_adj_chips;
+ 
+ 		ath12k_dbg(ab, ATH12K_DBG_QMI, "MLO chip id %d num_link %d\n",
+-			    partner_ab->chip_id, info->num_local_links);
++			    partner_ab->chip_id, info->mlo_chip_info.num_local_links);
+ 
+-		for (j = 0; j < info->num_local_links; j++) {
+-			info->hw_link_id[j] = link_id;
+-			info->valid_mlo_link_id[j] = true;
++		for (j = 0; j < info->mlo_chip_info.num_local_links; j++) {
++			info->mlo_chip_info.hw_link_id[j] = partner_ab->wsi_info.chip_idx + j;
++			info->mlo_chip_info.valid_mlo_link_id[j] = true;
+ 
+ 			ath12k_dbg(ab, ATH12K_DBG_QMI, "MLO link id %d\n",
+-				    info->hw_link_id[j]);
++				    info->mlo_chip_info.hw_link_id[j]);
+ 
+ 			link_id++;
+ 		}
++
++		ret = ath12k_qmi_fill_adj_info(partner_ab, info);
++		if (ret < 0) {
++			ath12k_err(ab, "failed to update adjacent information\n");
++			goto chip_cleanup;
++		}
+ 	}
+ 
+ 	if (link_id <= 0)
+ 		ag->mlo_capable = false;
+ 
+-	req->mlo_chip_info_valid = true;
++	req->mlo_chip_v2_info_valid = true;
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_QMI, "MLO host cap chosen\n");
+ 
+@@ -3113,7 +3222,7 @@ static int ath12k_qmi_fill_mlo_host_caps
+ 
+ chip_cleanup:
+ 	for (i = i - 1; i >= 0; i--) {
+-		info = &req->mlo_chip_info[i];
++		info = &req->mlo_chip_info_v2[i];
+ 
+ 		memset(info, 0, sizeof(*info));
+ 	}
+--- a/drivers/net/wireless/ath/ath12k/qmi.h
++++ b/drivers/net/wireless/ath/ath12k/qmi.h
+@@ -287,8 +287,9 @@ enum qmi_wlanfw_host_build_type {
+ 	WLANFW_HOST_BUILD_TYPE_ENUM_MAX_VAL_V01 = INT_MAX,
+ };
+ 
+-#define QMI_WLFW_MAX_NUM_MLO_CHIPS_V01 3
++#define QMI_WLFW_MAX_NUM_MLO_CHIPS_V01 4
+ #define QMI_WLFW_MAX_NUM_MLO_LINKS_PER_CHIP_V01 2
++#define QMI_WLFW_MAX_NUM_MLO_ADJ_CHIPS_V01 2
+ 
+ struct wlfw_host_mlo_chip_info_s_v01 {
+ 	u8 chip_id;
+@@ -297,6 +298,12 @@ struct wlfw_host_mlo_chip_info_s_v01 {
+ 	u8 valid_mlo_link_id[QMI_WLFW_MAX_NUM_MLO_LINKS_PER_CHIP_V01];
+ };
+ 
++struct wlfw_host_mlo_chip_info_s_v02 {
++	struct wlfw_host_mlo_chip_info_s_v01 mlo_chip_info;
++	u8 num_adj_chips;
++	struct wlfw_host_mlo_chip_info_s_v01 mlo_adj_chip_info[QMI_WLFW_MAX_NUM_MLO_ADJ_CHIPS_V01];
++};
++
+ enum ath12k_qmi_cnss_feature {
+ 	CNSS_FEATURE_MIN_ENUM_VAL_V01 = INT_MIN,
+ 	CNSS_QDSS_CFG_MISS_V01 = 3,
+@@ -353,6 +360,8 @@ struct qmi_wlanfw_host_cap_req_msg_v01 {
+ 	u8 mlo_num_chips;
+ 	u8 mlo_chip_info_valid;
+ 	struct wlfw_host_mlo_chip_info_s_v01 mlo_chip_info[QMI_WLFW_MAX_NUM_MLO_CHIPS_V01];
++	u8 mlo_chip_v2_info_valid;
++	struct wlfw_host_mlo_chip_info_s_v02 mlo_chip_info_v2[QMI_WLFW_MAX_NUM_MLO_CHIPS_V01];
+ 	u8 feature_list_valid;
+ 	u64 feature_list;
+ 	u8 fw_cfg_support_valid;
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -2453,6 +2453,8 @@ enum wmi_tlv_service {
+ 	WMI_TLV_SERVICE_SAWF_LEVEL0 = 311,
+ 	WMI_TLV_SERVICE_PKTLOG_DECODE_INFO_SUPPORT = 320,
+ 	WMI_TLV_SERVICE_PEER_METADATA_V1A_V1B_SUPPORT = 365,
++	WMI_TLV_SERVICE_N_LINK_MLO_SUPPORT = 381,
++	WMI_TLV_SERVICE_BRIDGE_VDEV_SUPPORT = 384,
+ 	WMI_TLV_SERVICE_RADAR_FLAGS_SUPPORT = 390,
+ 	WMI_TLV_SERVICE_SW_PROG_DFS_SUPPORT = 395,
+ 	WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION = 410,
+@@ -3552,7 +3554,7 @@ static inline const char *ath12k_wmi_phy
+ 	return "<unknown>";
+ }
+ 
+-#define ATH12K_WMI_MLO_MAX_LINKS 3
++#define ATH12K_WMI_MLO_MAX_LINKS 4
+ 
+ struct wmi_ml_partner_info {
+ 	u32 vdev_id;
+@@ -5696,9 +5698,10 @@ struct ath12k_mlo_glb_shmem {
+ 	FIELD_GET(MLO_SHMEM_GLB_RX_REO_SNAPSHOT_PARAM_FW_CONSUMED_SNAPSHOT_VER_MASK, snapshot_ver_info)
+ 
+ #define MLO_SHMEM_CHIP_CRASH_INFO_PARAM_NO_OF_CHIPS_GET(chip_info) \
+-	FIELD_GET(MLO_SHMEM_CHIP_CRASH_INFO_PARAM_NO_OF_CHIPS_MASK, chip_info)
++	ATH12K_MLO_SHMEM_GET_BITS(chip_info, 0, 2) + \
++	(ATH12K_MLO_SHMEM_GET_BITS(chip_info, 12, 4) << 2)
+ #define MLO_SHMEM_CHIP_CRASH_INFO_PARAM_VALID_CHIP_BMAP_GET(chip_info) \
+-	FIELD_GET(MLO_SHMEM_CHIP_CRASH_INFO_PARAM_VALID_CHIP_BMAP_MASK, chip_info)
++	ATH12K_MLO_SHMEM_GET_BITS(chip_info, 2, 8)
+ 
+ /** Definition of the GLB_H_SHMEM arena tlv structures */
+ enum {
+@@ -8260,7 +8263,7 @@ struct wmi_dbglog_config_cmd_fixed_param
+ 
+ #define WMI_MAX_MEM_REQS 32
+ 
+-#define MAX_RADIOS 3
++#define MAX_RADIOS 4
+ 
+ #define WMI_MLO_CMD_TIMEOUT_HZ		(5 * HZ)
+ #define WMI_SERVICE_READY_TIMEOUT_HZ (5 * HZ)

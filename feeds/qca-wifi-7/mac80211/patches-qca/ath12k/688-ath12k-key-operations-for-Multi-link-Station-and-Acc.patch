@@ -1,0 +1,148 @@
+From 8b93ff3de4fb66d8045c6bdcb893eeff33c5ca22 Mon Sep 17 00:00:00 2001
+From: Rameshkumar Sundaram <quic_ramess@quicinc.com>
+Date: Fri, 18 Nov 2022 10:22:22 +0530
+Subject: [PATCH] ath12k: key operations for Multi-link Station and Access
+ point
+
+Mac80211 will provide valid link_id (in key_conf) only for
+group keys in an MLD, for pairwise keys add changes to set/delete key
+for all link STA if set key arrives for one (ML) STA.
+For non ML STA in Non ML Vap do set/delete key in default link STA.
+
+Also do set/delete key on default link if link_id is invalid(-1) for
+a group key in which case it is non ML VAP.
+
+Eapol frames are sent as 802.11 packets to mac80211, hence
+set rx_status's link_valid and link_id for packets from ML STA's
+before delivering it to Mac80211 RX path.
+
+Signed-off-by: Rameshkumar Sundaram <quic_ramess@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_rx.c |  7 +++-
+ drivers/net/wireless/ath/ath12k/mac.c   | 50 ++++++++++++++++++-------
+ 2 files changed, 42 insertions(+), 15 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -4998,7 +4998,8 @@ static int ath12k_mac_set_key(struct ath
+ 
+ 	ret = ath12k_install_key(arvif, key, cmd, peer_addr, flags);
+ 	if (ret) {
+-		ath12k_warn(ab, "ath12k_install_key failed (%d)\n", ret);
++		ath12k_warn(ab, "ath12k_install_key cmd %d failed (%d) for peer %pM on vdev %d (link id %d)\n",
++			    cmd, ret, peer_addr, arvif->vdev_id, link_id);
+ 		goto out;
+ 	}
+ 
+@@ -5057,7 +5058,6 @@ static int ath12k_mac_op_set_key(struct
+ 				 struct ieee80211_vif *vif, struct ieee80211_sta *sta,
+ 				 struct ieee80211_key_conf *key)
+ {
+-	struct ath12k *ar;
+ 	struct ath12k_hw *ah = hw->priv;
+ 	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
+ 	struct ath12k_hw_group *ag = ah->ag;
+@@ -5065,7 +5065,8 @@ static int ath12k_mac_op_set_key(struct
+ 	struct ath12k_link_vif *arvif;
+ 	struct ath12k_link_sta *arsta = NULL;
+ 	struct ath12k_sta *ahsta;
+-	int ret;
++	int ret = -ENOLINK;
++	u8 link_id;
+ 
+ 	mutex_lock(&ah->conf_mutex);
+ 
+@@ -5088,8 +5089,13 @@ static int ath12k_mac_op_set_key(struct
+ 		goto out;
+ 	}
+ 
+-	/* TODO modify for all link vif configuration */
+-	arvif = &ahvif->deflink;
++	if (key->link_id >= 0 && key->link_id < IEEE80211_MLD_MAX_NUM_LINKS) {
++		arvif = ahvif->link[key->link_id];
++		if (WARN_ON(!arvif))
++			goto out;
++	} else {
++		arvif = &ahvif->deflink;
++	}
+ 
+ 	if (!arvif->is_created) {
+ 		key_conf = kzalloc(sizeof(*key_conf), GFP_ATOMIC);
+@@ -5114,18 +5120,34 @@ static int ath12k_mac_op_set_key(struct
+ 		return 0;
+ 	}
+ 
+-	ar = arvif->ar;
+-
+ 	if (sta) {
+ 		ahsta = (struct ath12k_sta *)sta->drv_priv;
+-		arsta = &ahsta->deflink;
++		if (sta->mlo) {
++			for_each_set_bit(link_id, &sta->valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++				arvif = ahvif->link[link_id];
++				arsta = ahsta->link[link_id];
++				if (WARN_ON(!arvif || !arsta))
++					continue;
++				mutex_lock(&arvif->ar->conf_mutex);
++				ret = ath12k_mac_set_key(arvif->ar, cmd, arvif, arsta, key);
++				mutex_unlock(&arvif->ar->conf_mutex);
++				if (ret)
++					break;
++			}
++		} else {
++			arsta = &ahsta->deflink;
++			arvif = arsta->arvif;
++			if (WARN_ON(!arvif))
++				goto out;
++			mutex_lock(&arvif->ar->conf_mutex);
++			ret = ath12k_mac_set_key(arvif->ar, cmd, arvif, arsta, key);
++			mutex_unlock(&arvif->ar->conf_mutex);
++		}
++	} else {
++		mutex_lock(&arvif->ar->conf_mutex);
++		ret = ath12k_mac_set_key(arvif->ar, cmd, arvif, arsta, key);
++		mutex_unlock(&arvif->ar->conf_mutex);
+ 	}
+-
+-	mutex_lock(&ar->conf_mutex);
+-
+-	ret = ath12k_mac_set_key(ar, cmd, arvif, arsta, key);
+-
+-	mutex_unlock(&ar->conf_mutex);
+ out:
+ 	mutex_unlock(&ah->conf_mutex);
+ 	return ret;
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -2169,8 +2169,13 @@ static void ath12k_dp_mon_rx_deliver_msd
+ 		decap = ppduinfo->cmn_mpdu_info.mon_mpdu[mpdu_idx].msdu_info[0].decap_format;
+ 	spin_lock_bh(&ar->ab->base_lock);
+ 	peer = ath12k_dp_rx_h_find_peer(ar->ab, msdu);
+-	if (peer && peer->sta)
++	if (peer && peer->sta) {
+ 		pubsta = peer->sta;
++		if (pubsta->valid_links) {
++			status->link_valid = 1;
++			status->link_id = peer->link_id;
++		}
++	}
+ 	spin_unlock_bh(&ar->ab->base_lock);
+ 
+ 	ath12k_dbg(ar->ab, ATH12K_DBG_DATA,
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -2781,7 +2781,13 @@ static void ath12k_dp_rx_deliver_msdu(st
+ 	spin_lock_bh(&ab->base_lock);
+ 	peer = ath12k_dp_rx_h_find_peer(ab, msdu);
+ 
+-	pubsta = peer ? peer->sta : NULL;
++	if (peer && peer->sta) {
++		pubsta = peer->sta;
++		if (pubsta->valid_links) {
++			status->link_valid = 1;
++			status->link_id = peer->link_id;
++		}
++	}
+ 
+ 	spin_unlock_bh(&ab->base_lock);
+ 
