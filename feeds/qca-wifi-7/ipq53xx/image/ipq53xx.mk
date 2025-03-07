@@ -50,3 +50,17 @@ define Device/sonicfi_rap7110c_341x
   DEVICE_PACKAGES := ath12k-wifi-sonicfi-rap7110c-341x ath12k-firmware-qcn92xx ath12k-firmware-ipq5332
 endef
 TARGET_DEVICES += sonicfi_rap7110c_341x
+
+define Device/sonicfi_rap750w_311a
+  DEVICE_TITLE := SONICFI RAP750W-311A
+  DEVICE_DTS := ipq5332-rap750w-311a
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_DTS_CONFIG := config@mi01.3-c2
+  SUPPORTED_DEVICES := sonicfi,rap7110c-341x
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/nand-factory.ubi := append-ubi
+  DEVICE_PACKAGES := ath12k-wifi-sonicfi-rap750w-311a ath12k-firmware-ipq5332-peb
+endef
+TARGET_DEVICES += sonicfi_rap750w_311a

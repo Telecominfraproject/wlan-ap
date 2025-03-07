@@ -33,6 +33,15 @@ define Package/ath12k-firmware-ipq5332/description
 Standard ath12k firmware for IPQ5332 from QCA
 endef
 
+define Package/ath12k-firmware-ipq5332-peb
+$(Package/ath12k-firmware-default)
+  TITLE:=ath12k firmware for IPQ5332 + Pebble devices
+endef
+
+define Package/ath12k-firmware-ipq5332-peb/description
+Standard ath12k firmware for IPQ5332 + Pebble from QCA
+endef
+
 define Build/Compile
 
 endef
@@ -49,5 +58,12 @@ define Package/ath12k-firmware-ipq5332/install
 		$(1)/lib/firmware/IPQ5332/
 endef
 
+define Package/ath12k-firmware-ipq5332-peb/install
+	$(INSTALL_DIR) $(1)/lib/firmware/IPQ5332/
+	$(INSTALL_DATA) ./files/IPQ5332_peb/* \
+		$(1)/lib/firmware/IPQ5332/
+endef
+
 $(eval $(call BuildPackage,ath12k-firmware-qcn92xx))
 $(eval $(call BuildPackage,ath12k-firmware-ipq5332))
+$(eval $(call BuildPackage,ath12k-firmware-ipq5332-peb))
