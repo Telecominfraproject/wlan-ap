@@ -32,6 +32,17 @@ function channel_to_freq(cur_freq, channel) {
        return null;
 }
 
+function freq2band(freq) {
+	if (freq < 2500) {
+		return "2G";
+	} else if (freq <= 5885) {
+		return "5G";
+	} else if (freq < 7115){
+		return "6G";
+	}
+	return "na"
+}
+
 function channel_survey(dev) {
 	/* trigger the nl80211 call that gathers channel survey data */
 	let res = nl80211.request(def.NL80211_CMD_GET_SURVEY, def.NLM_F_DUMP, { dev });
@@ -151,6 +162,8 @@ function interfaces_subunsub(path, sub) {
 			interfaces[name][prop] = status[prop];
 	interfaces[name].config = cfg;
 	interfaces[name].phy = status.phy;
+	interfaces[name].virtual_phys = length(split(status.phy, ".")) > 1 ? true : false;
+	interfaces[name].band = freq2band(status?.freq);
 
 	/* ask hostapd for the local neighbourhood report data */
 	let rrm = global.ubus.conn.call(path, 'rrm_nr_get_own');
