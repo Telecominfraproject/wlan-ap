@@ -53,6 +53,7 @@ ALLWIFIBOARDS:= \
 	sonicfi-rap630c-311g \
 	sonicfi-rap630w-311g \
 	sonicfi-rap630w-312g \
+	sonicfi-rap650c \
 	tplink-ex227 \
 	tplink-ex447 \
 	yuncore-ax840 \
@@ -410,6 +411,7 @@ $(eval $(call generate-ath11k-wifi-package,indio-um-510axm-v1,Indio UM-510AXM V1
 $(eval $(call generate-ath11k-wifi-package,sonicfi-rap630c-311g,Sonicfi RAP630C 311G))
 $(eval $(call generate-ath11k-wifi-package,sonicfi-rap630w-311g,Sonicfi RAP630W 311G))
 $(eval $(call generate-ath11k-wifi-package,sonicfi-rap630w-312g,Sonicfi RAP630W 312G))
+$(eval $(call generate-ath11k-wifi-package,sonicfi-rap650c,SonicFi RAP650C))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex227,TP-Link EX227))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex447,TP-Link EX447))
 $(eval $(call generate-ath11k-wifi-package,yuncore-ax840,YunCore AX840))
