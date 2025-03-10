@@ -340,6 +340,7 @@ hostapd_common_add_bss_config() {
 		wpa_group_rekey wpa_pair_rekey wpa_master_rekey
 	config_add_boolean wpa_strict_rekey
 	config_add_boolean wpa_disable_eapol_key_retries
+	config_add_boolean multi_psk
 
 	config_add_boolean tdls_prohibit
 
@@ -724,7 +725,7 @@ hostapd_set_bss_options() {
 		airtime_bss_weight airtime_bss_limit airtime_sta_weight \
 		multicast_to_unicast_all proxy_arp per_sta_vif \
 		eap_server eap_user_file ca_cert server_cert private_key private_key_passwd server_id \
-		vendor_elements fils uci_section dynamic_probe_resp
+		vendor_elements fils uci_section dynamic_probe_resp multi_psk
 
 	set_default fils 0
 	set_default isolate 0
@@ -737,6 +738,7 @@ hostapd_set_bss_options() {
 	set_default wmm 1
 	set_default uapsd 1
 	set_default wpa_disable_eapol_key_retries 0
+	set_default multi_psk $multi_psk
 	set_default tdls_prohibit 0
 	set_default eapol_version $((wpa & 1))
 	set_default acct_port 1813
