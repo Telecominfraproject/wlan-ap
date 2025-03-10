@@ -28,6 +28,7 @@ platform_check_image() {
 	edgecore,eap102|\
 	edgecore,oap102|\
 	edgecore,eap106|\
+	sonicfi,rap650c|\
 	tplink,ex227|\
 	tplink,ex447)
 		[ "$magic_long" = "73797375" ] && return 0
@@ -81,5 +82,17 @@ platform_do_upgrade() {
 		fi
 		nand_upgrade_tar "$1"
 		;;
+	sonicfi,rap650c)
+		boot_part=$(fw_printenv -n bootfrom)
+		[ ${#boot_part} -eq 0 ] && boot_part=1
+		echo "Current bootfrom is $boot_part"
+		if [[ $boot_part == 1 ]]; then
+			CI_UBIPART="rootfs"
+			CI_FWSETENV="bootfrom 0"
+		elif [[ $boot_part == 0 ]]; then
+			CI_UBIPART="rootfs_1"
+			CI_FWSETENV="bootfrom 1"
+		fi
+		nand_upgrade_tar "$1"
 	esac
 }

@@ -48,6 +48,17 @@ define Device/edgecore_eap106
 endef
 #TARGET_DEVICES += edgecore_eap106
 
+define Device/sonicfi_rap650c
+  DEVICE_TITLE := SonicFi RAP650C
+  DEVICE_DTS := qcom-ipq807x-rap650c
+  DEVICE_DTS_CONFIG=config@hk09
+  SUPPORTED_DEVICES := sonicfi,rap650c
+  DEVICE_PACKAGES := ath11k-wifi-sonicfi-rap650c uboot-envtools
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  IMAGE/nand-factory.ubi := append-ubi
+endef
+TARGET_DEVICES += sonicfi_rap650c
+
 define Device/tplink_ex227
   DEVICE_TITLE := TP-Link EX227
   DEVICE_DTS := qcom-ipq807x-ex227
