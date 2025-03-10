@@ -345,6 +345,7 @@ ifneq ($(CONFIG_PACKAGE_kmod-cfg80211),)
 endif
 
 EXTERNAL_PATCH_DIR:=$(CURDIR)/patches-qca
+PATCH_TIP_DIR:=$(CURDIR)/patches-tip
 
 define Build/Patch
 	$(if $(QUILT),rm -rf $(PKG_BUILD_DIR)/patches; mkdir -p $(PKG_BUILD_DIR)/patches)
@@ -360,6 +361,7 @@ define Build/Patch
 	$(call PatchDir,$(PKG_BUILD_DIR),$(EXTERNAL_PATCH_DIR)/ath11k,ath11k/)
 	$(call PatchDir,$(PKG_BUILD_DIR),$(EXTERNAL_PATCH_DIR)/ath12k,ath12k/)
 	$(call PatchDir,$(PKG_BUILD_DIR),$(EXTERNAL_PATCH_DIR)/pending,pending/)
+	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_TIP_DIR)/pending,pending/)
 	$(if $(QUILT),touch $(PKG_BUILD_DIR)/.quilt_used)
 endef
 

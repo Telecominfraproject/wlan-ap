@@ -73,7 +73,14 @@ function lookup_phys() {
 	let phys = phy_get();
 	let ret = {};
 	for (let phy in phys) {
-		let phyname = 'phy' + phy.wiphy;
+		let phyname;
+		if (phy?.wiphy_name)
+			phyname = phy.wiphy_name;
+		else if (phy?.wiphy != null)
+			phyname = 'phy' + phy.wiphy;
+		else
+			continue;
+
 		let path = paths[phyname];
 		if (!path)
 			continue;
