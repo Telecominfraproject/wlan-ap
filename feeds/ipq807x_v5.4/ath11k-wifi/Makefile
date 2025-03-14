@@ -32,7 +32,6 @@ ALLWIFIBOARDS:= \
 	cybertan-eww622-a1 \
 	cybertan-eww631-a1 \
 	cybertan-eww631-b1 \
-	cybertan-rap630w-312g \
 	edgecore-eap101 \
 	gl-ax1800 \
 	gl-axt1800 \
@@ -52,6 +51,7 @@ ALLWIFIBOARDS:= \
 	wallys-dr6018-v4 \
 	sonicfi-rap630c-311g \
 	sonicfi-rap630w-311g \
+	sonicfi-rap630w-312g \
 	tplink-ex227 \
 	tplink-ex447 \
 	yuncore-ax840 \
@@ -394,7 +394,6 @@ $(eval $(call generate-ath11k-wifi-package,cig-wf194c4,Cigtech WF194c4))
 $(eval $(call generate-ath11k-wifi-package,cybertan-eww622-a1,CyberTan EWW622 A1))
 $(eval $(call generate-ath11k-wifi-package,cybertan-eww631-a1,CyberTan EWW631 A1))
 $(eval $(call generate-ath11k-wifi-package,cybertan-eww631-b1,CyberTan EWW631 B1))
-$(eval $(call generate-ath11k-wifi-package,cybertan-rap630w-312g,CyberTan RAP630W 312G))
 $(eval $(call generate-ath11k-wifi-package,sercomm-wallaby,Sercomm Kiwi))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018,Wallys DR6018))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr6018-v4,Wallys DR6018 V4))
@@ -408,6 +407,7 @@ $(eval $(call generate-ath11k-wifi-package,indio-um-510axp-v1,Indio UM-510AXP V1
 $(eval $(call generate-ath11k-wifi-package,indio-um-510axm-v1,Indio UM-510AXM V1))
 $(eval $(call generate-ath11k-wifi-package,sonicfi-rap630c-311g,Sonicfi RAP630C 311G))
 $(eval $(call generate-ath11k-wifi-package,sonicfi-rap630w-311g,Sonicfi RAP630W 311G))
+$(eval $(call generate-ath11k-wifi-package,sonicfi-rap630w-312g,Sonicfi RAP630W 312G))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex227,TP-Link EX227))
 $(eval $(call generate-ath11k-wifi-package,tplink-ex447,TP-Link EX447))
 $(eval $(call generate-ath11k-wifi-package,yuncore-ax840,YunCore AX840))
