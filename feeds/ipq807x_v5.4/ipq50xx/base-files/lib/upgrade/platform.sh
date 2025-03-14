@@ -72,9 +72,9 @@ platform_check_image() {
 	cig,wf186h|\
 	sonicfi,rap630c-311g|\
 	sonicfi,rap630w-311g|\
+	sonicfi,rap630w-312g|\
 	cybertan,eww631-a1|\
 	cybertan,eww631-b1|\
-	cybertan,rap630w-312g|\
 	edgecore,eap104|\
 	wallys,dr5018|\
 	hfcl,ion4x_w|\
@@ -143,11 +143,11 @@ platform_do_upgrade() {
 		}
 		nand_upgrade_tar "$1"
 		;;
-	sonicfi,rap630c-311g|\
-	sonicfi,rap630w-311g|\
 	cybertan,eww631-a1|\
 	cybertan,eww631-b1|\
-	cybertan,rap630w-312g)
+	sonicfi,rap630c-311g|\
+	sonicfi,rap630w-311g|\
+	sonicfi,rap630w-312g)
 		boot_part=$(fw_printenv bootfrom | cut  -d = -f2)
 			echo "Current bootfrom is $boot_part"
 			if [[ $boot_part == 1 ]]; then
