@@ -125,5 +125,8 @@ platform_do_upgrade() {
 	sercomm,ap72tip)
 		nand_upgrade_tar "$1"
 		;;
+	zyxel,nwa130be)
+		nand_upgrade_tar "$1"
+		;;
 	esac
 }
