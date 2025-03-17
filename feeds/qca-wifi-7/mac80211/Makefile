@@ -262,6 +262,11 @@ define KernelPackage/mt7601u
   AUTOLOAD:=$(call AutoProbe,mt7601u)
 endef
 
+ifdef CONFIG_TARGET_PROFILE
+TARGET_PROFILE=$(subst ",,$(CONFIG_TARGET_PROFILE))
+PATCH_PROFILE_NAME=patches-$(subst DEVICE_,,$(TARGET_PROFILE))
+endif
+
 ifdef CONFIG_PACKAGE_MAC80211_DEBUGFS
   config-y += \
 	CFG80211_DEBUGFS \
@@ -362,6 +367,7 @@ define Build/Patch
 	$(call PatchDir,$(PKG_BUILD_DIR),$(EXTERNAL_PATCH_DIR)/ath12k,ath12k/)
 	$(call PatchDir,$(PKG_BUILD_DIR),$(EXTERNAL_PATCH_DIR)/pending,pending/)
 	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_TIP_DIR)/pending,pending/)
+	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_PROFILE_NAME)/ath12k,ath12k/)
 	$(if $(QUILT),touch $(PKG_BUILD_DIR)/.quilt_used)
 endef
 

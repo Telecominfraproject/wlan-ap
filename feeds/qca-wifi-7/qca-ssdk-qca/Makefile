@@ -97,6 +97,11 @@ else ifneq ($(CONFIG_ARCH),)
 			      TARGET_NAME=$(subst ",,$(CONFIG_ARCH))-openwrt-linux$(if $(CONFIG_TARGET_SUFFIX),-$(subst ",,$(CONFIG_TARGET_SUFFIX)))
 endif
 
+ifdef CONFIG_TARGET_PROFILE
+TARGET_PROFILE=$(subst ",,$(CONFIG_TARGET_PROFILE))
+PATCH_PROFILE_NAME=patches-$(subst DEVICE_,,$(TARGET_PROFILE))
+endif
+
 QCASSDK_CONFIG_OPTS+= TOOL_PATH=$(TOOLCHAIN_BIN_PATH) \
                 SYS_PATH=$(LINUX_DIR) \
                 TOOLPREFIX=$(TARGET_CROSS) \
@@ -193,5 +198,10 @@ define KernelPackage/qca-ssdk-qca-hnat/install
 	$(INSTALL_BIN) ./files/qca-ssdk $(1)/etc/init.d/qca-ssdk
 endef
 
+define patch_profile
+	$(call PatchDir/Default,$(PKG_BUILD_DIR),./$(PATCH_PROFILE_NAME))
+endef
+
+Hooks/Prepare/Post += patch_profile
 $(eval $(call KernelPackage,qca-ssdk-qca-nohnat))
 $(eval $(call KernelPackage,qca-ssdk-qca-hnat))
