@@ -46,6 +46,7 @@ platform_do_upgrade() {
 		fi
 		nand_do_upgrade "$1"
 		;;
+	senao,iap2300m|\
 	senao,jeap6500)
 		CI_UBIPART="ubi_1"
 		nand_do_upgrade "$1"
@@ -66,6 +67,7 @@ platform_check_image() {
 	case "$board" in
 	edgecore,eap111|\
 	edgecore,eap112|\
+	senao,iap2300m|\
 	senao,jeap6500)
 		nand_do_platform_check "$board" "$1"
 		return $?
@@ -86,6 +88,7 @@ platform_post_upgrade_success() {
 	local board=$(board_name)
 
 	case "$board" in
+		senao,iap2300m|\
 		senao,jeap6500)
 			senao_swap_active_fw
 		;;
