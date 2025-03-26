@@ -64,8 +64,8 @@ platform_do_upgrade() {
 		nand_upgrade_tar "$1"
 		;;
 	edgecore,eap102|\
-	edgecore,oap103|\
-	edgecore,oap102)
+	edgecore,oap102|\
+	edgecore,oap103)
 		if [ "$(find_mtd_chardev rootfs)" ]; then
 			CI_UBIPART="rootfs"
 		else
