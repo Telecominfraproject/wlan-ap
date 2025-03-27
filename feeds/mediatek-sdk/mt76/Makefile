@@ -603,6 +603,9 @@ define KernelPackage/mt7981-firmware/install
 ifeq ($(CONFIG_TARGET_PROFILE), "DEVICE_edgecore_eap111")
 	cp $(PKG_BUILD_DIR)/firmware/edgecore_eap111_eeprom_dbdc.bin \
 		$(1)/lib/firmware/mediatek/mt7981_eeprom_mt7976_dbdc.bin
+else ifeq ($(CONFIG_TARGET_PROFILE), "DEVICE_edgecore_eap112")
+	cp $(PKG_BUILD_DIR)/firmware/edgecore_eap112_eeprom_dbdc.bin \
+		$(1)/lib/firmware/mediatek/mt7981_eeprom_mt7976_dbdc.bin
 else
 	cp $(PKG_BUILD_DIR)/firmware/mt7981_eeprom_mt7976_dbdc.bin $(1)/lib/firmware/mediatek
 endif
