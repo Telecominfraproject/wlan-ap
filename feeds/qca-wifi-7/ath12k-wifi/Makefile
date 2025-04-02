@@ -76,7 +76,11 @@ endef
 
 define Package/ath12k-wifi-sonicfi-rap750w-311a/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
-	$(INSTALL_DATA) ./ board-2.bin.rap750w_311a.IPQ5332$(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN6432/hw1.0/
+	$(INSTALL_DATA) ./board-2.bin.rap750w_311a.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
+	$(INSTALL_DATA) ./board-2.bin.rap750w_311a.QCN6432 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/board-2.bin
+#	$(INSTALL_DATA) ./ipq5332_qcn6432.regdb $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/regdb.bin
+	$(INSTALL_DATA) ./ipq5332_qcn6432.regdb $(1)/lib/firmware/ath12k/QCN6432/hw1.0/regdb.bin
 endef
 
 $(eval $(call BuildPackage,ath12k-wifi-cig-wf189))

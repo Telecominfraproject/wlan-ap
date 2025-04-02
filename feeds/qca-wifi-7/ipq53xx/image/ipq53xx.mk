@@ -53,10 +53,10 @@ TARGET_DEVICES += sonicfi_rap7110c_341x
 
 define Device/sonicfi_rap750w_311a
   DEVICE_TITLE := SONICFI RAP750W-311A
-  DEVICE_DTS := ipq5332-rap750w-311a
+  DEVICE_DTS := ipq5332-sonicfi-rap750w-311a
   DEVICE_DTS_DIR := ../dts
   DEVICE_DTS_CONFIG := config@mi01.3-c2
-  SUPPORTED_DEVICES := sonicfi,rap7110c-341x
+  SUPPORTED_DEVICES := sonicfi,rap750w-311a
   IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
   IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
   IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand

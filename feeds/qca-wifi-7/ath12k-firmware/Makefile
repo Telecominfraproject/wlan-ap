@@ -60,8 +60,11 @@ endef
 
 define Package/ath12k-firmware-ipq5332-peb/install
 	$(INSTALL_DIR) $(1)/lib/firmware/IPQ5332/
-	$(INSTALL_DATA) ./files/IPQ5332_peb/* \
+	$(INSTALL_DIR) $(1)/lib/firmware/qcn6432/
+	$(INSTALL_DATA) ./files/IPQ5332_peb/*.* \
 		$(1)/lib/firmware/IPQ5332/
+	$(INSTALL_DATA) ./files/IPQ5332_peb/qcn6432/* \
+		$(1)/lib/firmware/qcn6432/
 endef
 
 $(eval $(call BuildPackage,ath12k-firmware-qcn92xx))
