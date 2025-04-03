@@ -1107,6 +1107,36 @@ mac80211_set_suffix() {
 	set_default radio -1
 }
 
+setup_cig_wifi7() {
+
+	board=$(cat /tmp/sysinfo/board_name)
+        case $board in
+        cig,wf189)
+	for j in 68 69 70 71 75 88 92 96
+        do
+        echo 8 > /proc/irq/$j/smp_affinity
+        done
+
+        for j in 67 74 91 87
+        do
+        echo 4 > /proc/irq/$j/smp_affinity
+        done
+
+        for j in 66 73 86 90 93
+        do
+        echo 2 > /proc/irq/$j/smp_affinity
+        done
+
+        for j in 65 72 85 89
+        do
+        echo 1 > /proc/irq/$j/smp_affinity
+        done
+	;;
+        esac
+
+}
+
+
 drv_mac80211_setup() {
 	json_select config
 	json_get_vars \
@@ -1213,6 +1243,7 @@ drv_mac80211_setup() {
 
 	for_each_interface "ap sta adhoc mesh monitor" mac80211_set_vif_txpower
 	wireless_set_up
+	setup_cig_wifi7
 }
 
 _list_phy_interfaces() {
