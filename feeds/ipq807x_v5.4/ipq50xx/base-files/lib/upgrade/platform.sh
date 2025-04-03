@@ -76,6 +76,7 @@ platform_check_image() {
 	cybertan,eww631-b1|\
 	cybertan,rap630w-312g|\
 	edgecore,eap104|\
+	indio,um-325ax-v2|\
 	wallys,dr5018|\
 	hfcl,ion4x_w|\
 	hfcl,ion4xi_w|\
@@ -109,6 +110,7 @@ platform_do_upgrade() {
 	edgecore,oap101-6e|\
 	edgecore,oap101e|\
 	edgecore,oap101e-6e|\
+	indio,um-325ax-v2|\
 	edgecore,eap104)
 		CI_UBIPART="rootfs1"
 		[ "$(find_mtd_chardev rootfs)" ] && CI_UBIPART="rootfs"
