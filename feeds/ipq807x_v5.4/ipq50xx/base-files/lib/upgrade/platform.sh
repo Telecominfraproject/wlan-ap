@@ -79,6 +79,7 @@ platform_check_image() {
 	wallys,dr5018|\
 	hfcl,ion4x_w|\
 	hfcl,ion4xi_w|\
+	indio,um-525axm|\
 	optimcloud,d60|\
 	optimcloud,d60-5g|\
 	optimcloud,d50|\
@@ -109,7 +110,8 @@ platform_do_upgrade() {
 	edgecore,oap101-6e|\
 	edgecore,oap101e|\
 	edgecore,oap101e-6e|\
-	edgecore,eap104)
+	edgecore,eap104|\
+	indio,um-525axm)
 		CI_UBIPART="rootfs1"
 		[ "$(find_mtd_chardev rootfs)" ] && CI_UBIPART="rootfs"
 		nand_upgrade_tar "$1"
