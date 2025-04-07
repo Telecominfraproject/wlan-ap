@@ -45,6 +45,7 @@ ALLWIFIBOARDS:= \
 	indio-um-310ax-v1 \
 	indio-um-510axp-v1 \
 	indio-um-510axm-v1 \
+	indio-um-525axm \
 	muxi-ap3220l \
 	plasmacloud-pax1800 \
 	wallys-dr5018 \
@@ -404,6 +405,7 @@ $(eval $(call generate-ath11k-wifi-package,edgecore-oap102,Edgecore OAP102))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap104,Edgecore EAP104))
 $(eval $(call generate-ath11k-wifi-package,liteon-wpx8324,Liteon WPX8324))
 $(eval $(call generate-ath11k-wifi-package,indio-um-310ax-v1,Indio UM-310AX V1))
+$(eval $(call generate-ath11k-wifi-package,indio-um-525axm,Indio UM-525AXM))
 $(eval $(call generate-ath11k-wifi-package,indio-um-510axp-v1,Indio UM-510AXP V1))
 $(eval $(call generate-ath11k-wifi-package,indio-um-510axm-v1,Indio UM-510AXM V1))
 $(eval $(call generate-ath11k-wifi-package,sonicfi-rap630c-311g,Sonicfi RAP630C 311G))
