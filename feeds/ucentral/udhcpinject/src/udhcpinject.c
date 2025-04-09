@@ -34,12 +34,12 @@ static char *provided_ports = NULL;
 void cleanup_tc() {
     char cmd[1024];
     for (int i = 0; i < iface_count; i++) {
-        snprintf(cmd, sizeof(cmd), "tc filter del dev %s ingress 2>/dev/null",
+        snprintf(cmd, sizeof(cmd), "tc filter del dev %s ingress pref 32 2>/dev/null",
                  iface_map[i].iface);
         system(cmd);
-        snprintf(cmd, sizeof(cmd), "tc qdisc del dev %s ingress 2>/dev/null",
-                 iface_map[i].iface);
-        system(cmd);
+        // snprintf(cmd, sizeof(cmd), "tc qdisc del dev %s ingress 2>/dev/null",
+        //          iface_map[i].iface);
+        // system(cmd);
     }
 }
 
@@ -292,7 +292,7 @@ int setup_tc() {
         }
 
         snprintf(cmd, sizeof(cmd),
-                 "tc filter add dev %s ingress protocol ip u32 "
+                 "tc filter add dev %s ingress protocol ip pref 32 u32 "
                  "match ip protocol 17 0xff "
                  "match u16 0x0044 0xffff at 20 "
                  "match u16 0x0043 0xffff at 22 "
