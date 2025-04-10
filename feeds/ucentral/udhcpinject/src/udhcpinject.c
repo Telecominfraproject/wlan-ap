@@ -37,9 +37,6 @@ void cleanup_tc() {
         snprintf(cmd, sizeof(cmd), "tc filter del dev %s ingress pref 32 2>/dev/null",
                  iface_map[i].iface);
         system(cmd);
-        // snprintf(cmd, sizeof(cmd), "tc qdisc del dev %s ingress 2>/dev/null",
-        //          iface_map[i].iface);
-        // system(cmd);
     }
 }
 
@@ -261,7 +258,6 @@ int parse_ports(const char *port_list) {
     return 0;
 }
 
-// Function to setup tc rules (same as before but using iface_map)
 int setup_tc() {
     char cmd[1024];
 
@@ -314,7 +310,7 @@ void signal_handler(int sig) {
         exit(0);
     } else if (sig == SIGHUP) {
         syslog(LOG_INFO, "Received reload signal, reconfiguring...\n");
-        
+        sleep(5);
         // Clean up existing resources
         cleanup_tc();
         
@@ -564,6 +560,8 @@ int main(int argc, char *argv[]) {
 
     signal(SIGTERM, signal_handler);
     signal(SIGHUP, signal_handler);
+
+    sleep(5);
 
     provided_ssids = getenv("SSIDs");
     syslog(LOG_INFO, "Provided SSIDs: %s\n", provided_ssids);
