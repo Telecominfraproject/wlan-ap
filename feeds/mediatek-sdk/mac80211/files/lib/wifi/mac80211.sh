@@ -146,6 +146,40 @@ check_board_phy() {
 	fi
 }
 
+is_morse_phy() {
+	local dev="$1"
+	local morse_path="/sys/class/ieee80211/${dev}/device/morse/"
+
+	if [ -d "$morse_path" ]; then
+		return 0  # This is a Morse PHY
+	else
+		return 1  # Not a Morse PHY
+	fi
+}
+
+# Set up Morse-specific wireless configuration
+setup_morse_wireless() {
+	local dev="$1"
+	local name="$2"
+
+	# Create Morse-specific wireless configuration with exact settings
+	uci -q batch <<-EOF
+		set wireless.${name}=wifi-device
+		set wireless.${name}.disabled='0'
+		set wireless.${name}.mode='ap'
+		set wireless.${name}.type='morse'
+		set wireless.${name}.path='platform/11009000.spi/spi_master/spi1/spi1.0'
+		set wireless.${name}.channel='12'
+		set wireless.${name}.hwmode='a'
+		set wireless.${name}.band='s1g'
+		set wireless.${name}.htmode='8'
+		set wireless.${name}.country='US'
+		set wireless.${name}.channels=''
+EOF
+
+	uci -q commit wireless
+}
+
 detect_mac80211() {
 	devidx=0
 	config_load wireless
@@ -157,13 +191,6 @@ detect_mac80211() {
 		[ -e "$_dev" ] || continue
 
 		dev="${_dev##*/}"
-
-		mode_band=""
-		channel=""
-		htmode=""
-		ht_capab=""
-
-		get_band_defaults "$dev"
 
 		path="$(iwinfo nl80211 path "$dev")"
 		macaddr="$(cat /sys/class/ieee80211/${dev}/macaddress)"
@@ -183,35 +210,51 @@ detect_mac80211() {
 
 		name="radio${devidx}"
 		devidx=$(($devidx + 1))
-		case "$dev" in
-			phy*)
-				if [ -n "$path" ]; then
-					dev_id="set wireless.${name}.path='$path'"
-				else
-					dev_id="set wireless.${name}.macaddr='$macaddr'"
-				fi
-				;;
-			*)
-				dev_id="set wireless.${name}.phy='$dev'"
-				;;
-		esac
 
-		uci -q batch <<-EOF
-			set wireless.${name}=wifi-device
-			set wireless.${name}.type=mac80211
-			${dev_id}
-			set wireless.${name}.channel=${channel}
-			set wireless.${name}.band=${mode_band}
-			set wireless.${name}.htmode=$htmode
-			set wireless.${name}.disabled=1
+		# Check if this is a Morse PHY
+		if is_morse_phy "$dev"; then
+			# Use dedicated Morse configuration
+			setup_morse_wireless "$dev" "$name"
+		else
+			# Standard wireless configuration for non-Morse devices
+			mode_band=""
+			channel=""
+			htmode=""
+			ht_capab=""
 
-			set wireless.default_${name}=wifi-iface
-			set wireless.default_${name}.device=${name}
-			set wireless.default_${name}.network=lan
-			set wireless.default_${name}.mode=ap
-			set wireless.default_${name}.ssid=OpenWrt
-			set wireless.default_${name}.encryption=none
+			# Get default settings for standard devices
+			get_band_defaults "$dev"
+
+			case "$dev" in
+				phy*)
+					if [ -n "$path" ]; then
+						dev_id="set wireless.${name}.path='$path'"
+					else
+						dev_id="set wireless.${name}.macaddr='$macaddr'"
+					fi
+					;;
+				*)
+					dev_id="set wireless.${name}.phy='$dev'"
+					;;
+			esac
+
+			uci -q batch <<-EOF
+				set wireless.${name}=wifi-device
+				set wireless.${name}.type=mac80211
+				${dev_id}
+				set wireless.${name}.channel=${channel}
+				set wireless.${name}.band=${mode_band}
+				set wireless.${name}.htmode=$htmode
+				set wireless.${name}.disabled=1
+
+				set wireless.default_${name}=wifi-iface
+				set wireless.default_${name}.device=${name}
+				set wireless.default_${name}.network=lan
+				set wireless.default_${name}.mode=ap
+				set wireless.default_${name}.ssid=OpenWrt
+				set wireless.default_${name}.encryption=none
 EOF
-		uci -q commit wireless
+			uci -q commit wireless
+		fi
 	done
 }
