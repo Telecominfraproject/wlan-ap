@@ -34,12 +34,12 @@ static char *provided_ports = NULL;
 void cleanup_tc() {
     char cmd[1024];
     for (int i = 0; i < iface_count; i++) {
-        snprintf(cmd, sizeof(cmd), "tc filter del dev %s ingress pref 32 2>/dev/null",
+        snprintf(cmd, sizeof(cmd), "tc filter del dev %s ingress 2>/dev/null",
                  iface_map[i].iface);
         system(cmd);
-        // snprintf(cmd, sizeof(cmd), "tc qdisc del dev %s ingress 2>/dev/null",
-        //          iface_map[i].iface);
-        // system(cmd);
+        snprintf(cmd, sizeof(cmd), "tc qdisc del dev %s ingress 2>/dev/null",
+                 iface_map[i].iface);
+        system(cmd);
     }
 }
 
@@ -277,22 +277,18 @@ int setup_tc() {
     }
 
     for (int i = 0; i < iface_count; i++) {
-        snprintf(cmd, sizeof(cmd), "tc qdisc show dev %s ingress 2>/dev/null 1>2", 
+        snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s ingress 2>/dev/null 1>2", 
             iface_map[i].iface);
-        if (system(cmd) == 0) {
-            syslog(LOG_INFO, "Ingress qdisc already exists for %s\n", iface_map[i].iface);
+        int result = system(cmd);
+        if (result == 2) {
+            syslog(LOG_INFO, "Ingress qdisc already exists for %s on %s\n", iface_map[i].essid, iface_map[i].iface);
         }
-        else {
-            snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s ingress 2>/dev/null",
-                 iface_map[i].iface);
-            if (system(cmd) != 0) {
-                syslog(LOG_ERR, "Failed to add qdisc for %s\n", iface_map[i].iface);
-                return -1;
-            }
+        else if (result == 1) {
+            syslog(LOG_INFO, "Failed to add ingress qdisc for %s on %s\n", iface_map[i].essid, iface_map[i].iface);
         }
 
         snprintf(cmd, sizeof(cmd),
-                 "tc filter add dev %s ingress protocol ip pref 32 u32 "
+                 "tc filter add dev %s ingress protocol ip u32 "
                  "match ip protocol 17 0xff "
                  "match u16 0x0044 0xffff at 20 "
                  "match u16 0x0043 0xffff at 22 "
@@ -317,7 +313,7 @@ void signal_handler(int sig) {
         exit(0);
     } else if (sig == SIGHUP) {
         syslog(LOG_INFO, "Received reload signal, reconfiguring...\n");
-        
+        sleep(5);
         // Clean up existing resources
         cleanup_tc();
         
@@ -586,6 +582,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    sleep(5);
     if (parse_ssids(provided_ssids) != 0) {
         syslog(LOG_ERR, "Failed to parse SSIDs\n");
         cleanup();
