@@ -1,0 +1,411 @@
+From: Jouni Malinen <quic_jouni@quicinc.com>
+Date: Tue, 14 Feb 2023 11:29:30 +0200
+Subject: [PATCH] FT: Store PMK-R0/PMK-R1 after EAPOL-Key msg 2/4 MIC
+ validation
+
+hostapd was previously storing the derived PMK-R0 and PMK-R1 as soon as
+these keys were derived. While that is fine for most purposes, it is
+unnecessary to do that so quickly and if anything were to fail before
+the supplicant is able to return a valid EAPOL-Key msg 2/4, there would
+not really be any real use for the derived keys.
+
+For the special case of FT-PSK and VLAN determination based on the
+wpa_psk file, the VLAN information is set in the per-STA data structures
+only after the EAPOL-Key msg 2/4 MIC has been verified. This ended up
+storing the PMK-R0/PMK-R1 entries without correct VLAN assignment and as
+such, any use of the FT protocol would not be able to transfer the VLAN
+information through RRB.
+
+Split local storing of the FT key hierarchy for the cases using the FT
+4-way handshake so that PMK-R0 and PMK-R1 are first derived and then
+stored as a separate step after having verified the MIC in the EAPOL-Key
+msg 2/4 (i.e., after having confirmed the per-STA passphrase/PSK was
+selected) and VLAN update. This fixes VLAN information for the
+wpa_psk_file cases with FT-PSK.
+
+Signed-off-by: Jouni Malinen <quic_jouni@quicinc.com>
+---
+
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -58,7 +58,9 @@ static int wpa_group_config_group_keys(s
+ 				       struct wpa_group *group);
+ static int wpa_derive_ptk(struct wpa_state_machine *sm, const u8 *snonce,
+ 			  const u8 *pmk, unsigned int pmk_len,
+-			  struct wpa_ptk *ptk, int force_sha256);
++			  struct wpa_ptk *ptk, int force_sha256,
++			  u8 *pmk_r0, u8 *pmk_r1, u8 *pmk_r0_name,
++			  size_t *key_len);
+ static void wpa_group_free(struct wpa_authenticator *wpa_auth,
+ 			   struct wpa_group *group);
+ static void wpa_group_get(struct wpa_authenticator *wpa_auth,
+@@ -940,6 +942,10 @@ static int wpa_try_alt_snonce(struct wpa
+ 	const u8 *pmk = NULL;
+ 	size_t pmk_len;
+ 	int vlan_id = 0;
++	u8 pmk_r0[PMK_LEN_MAX], pmk_r0_name[WPA_PMK_NAME_LEN];
++	u8 pmk_r1[PMK_LEN_MAX];
++	size_t key_len;
++	int ret = -1;
+ 
+ 	os_memset(&PTK, 0, sizeof(PTK));
+ 	for (;;) {
+@@ -961,8 +967,8 @@ static int wpa_try_alt_snonce(struct wpa
+ 			pmk_len = sm->pmk_len;
+ 		}
+ 
+-		if (wpa_derive_ptk(sm, sm->alt_SNonce, pmk, pmk_len, &PTK, 0) <
+-		    0)
++		if (wpa_derive_ptk(sm, sm->alt_SNonce, pmk, pmk_len, &PTK, 0,
++				   pmk_r0, pmk_r1, pmk_r0_name, &key_len) < 0)
+ 			break;
+ 
+ 		if (wpa_verify_key_mic(sm->wpa_key_mgmt, pmk_len, &PTK,
+@@ -983,7 +989,7 @@ static int wpa_try_alt_snonce(struct wpa
+ 	if (!ok) {
+ 		wpa_printf(MSG_DEBUG,
+ 			   "WPA: Earlier SNonce did not result in matching MIC");
+-		return -1;
++		goto fail;
+ 	}
+ 
+ 	wpa_printf(MSG_DEBUG,
+@@ -992,14 +998,26 @@ static int wpa_try_alt_snonce(struct wpa
+ 
+ 	if (vlan_id && wpa_key_mgmt_wpa_psk(sm->wpa_key_mgmt) &&
+ 	    wpa_auth_update_vlan(sm->wpa_auth, sm->addr, vlan_id) < 0)
+-		return -1;
++		goto fail;
++
++#ifdef CONFIG_IEEE80211R_AP
++	if (wpa_key_mgmt_ft(sm->wpa_key_mgmt) && !sm->ft_completed) {
++		wpa_printf(MSG_DEBUG, "FT: Store PMK-R0/PMK-R1");
++		wpa_auth_ft_store_keys(sm, pmk_r0, pmk_r1, pmk_r0_name,
++				       key_len);
++	}
++#endif /* CONFIG_IEEE80211R_AP */
+ 
+ 	os_memcpy(sm->SNonce, sm->alt_SNonce, WPA_NONCE_LEN);
+ 	os_memcpy(&sm->PTK, &PTK, sizeof(PTK));
+ 	forced_memzero(&PTK, sizeof(PTK));
+ 	sm->PTK_valid = true;
+ 
+-	return 0;
++	ret = 0;
++fail:
++	forced_memzero(pmk_r0, sizeof(pmk_r0));
++	forced_memzero(pmk_r1, sizeof(pmk_r1));
++	return ret;
+ }
+ 
+ 
+@@ -2283,7 +2301,9 @@ SM_STATE(WPA_PTK, PTKSTART)
+ 
+ static int wpa_derive_ptk(struct wpa_state_machine *sm, const u8 *snonce,
+ 			  const u8 *pmk, unsigned int pmk_len,
+-			  struct wpa_ptk *ptk, int force_sha256)
++			  struct wpa_ptk *ptk, int force_sha256,
++			  u8 *pmk_r0, u8 *pmk_r1, u8 *pmk_r0_name,
++			  size_t *key_len)
+ {
+ 	const u8 *z = NULL;
+ 	size_t z_len = 0, kdk_len;
+@@ -2311,7 +2331,8 @@ static int wpa_derive_ptk(struct wpa_sta
+ 						 sm->pairwise,
+ 						 kdk_len);
+ 		}
+-		return wpa_auth_derive_ptk_ft(sm, ptk);
++		return wpa_auth_derive_ptk_ft(sm, ptk, pmk_r0, pmk_r1,
++					      pmk_r0_name, key_len);
+ 	}
+ #endif /* CONFIG_IEEE80211R_AP */
+ 
+@@ -2934,6 +2955,9 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 	struct wpa_eapol_ie_parse kde;
+ 	int vlan_id = 0;
+ 	int owe_ptk_workaround = !!wpa_auth->conf.owe_ptk_workaround;
++	u8 pmk_r0[PMK_LEN_MAX], pmk_r0_name[WPA_PMK_NAME_LEN];
++	u8 pmk_r1[PMK_LEN_MAX];
++	size_t key_len;
+ 
+ 	SM_ENTRY_MA(WPA_PTK, PTKCALCNEGOTIATING, wpa_ptk);
+ 	sm->EAPOLKeyReceived = false;
+@@ -2972,7 +2996,8 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 		}
+ 
+ 		if (wpa_derive_ptk(sm, sm->SNonce, pmk, pmk_len, &PTK,
+-				   owe_ptk_workaround == 2) < 0)
++				   owe_ptk_workaround == 2, pmk_r0, pmk_r1,
++				   pmk_r0_name, &key_len) < 0)
+ 			break;
+ 
+ 		if (mic_len &&
+@@ -3021,7 +3046,7 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 						 sm->last_rx_eapol_key,
+ 						 sm->last_rx_eapol_key_len);
+ 		sm->waiting_radius_psk = 1;
+-		return;
++		goto out;
+ 	}
+ 
+ 	if (!ok) {
+@@ -3029,7 +3054,7 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 				"invalid MIC in msg 2/4 of 4-Way Handshake");
+ 		if (psk_found)
+ 			wpa_auth_psk_failure_report(sm->wpa_auth, sm->addr);
+-		return;
++		goto out;
+ 	}
+ 
+ 	/*
+@@ -3043,12 +3068,12 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 	key_data_length = WPA_GET_BE16(mic + mic_len);
+ 	if (key_data_length > sm->last_rx_eapol_key_len - sizeof(*hdr) -
+ 	    sizeof(*key) - mic_len - 2)
+-		return;
++		goto out;
+ 
+ 	if (wpa_parse_kde_ies(key_data, key_data_length, &kde) < 0) {
+ 		wpa_auth_vlogger(wpa_auth, sm->addr, LOGGER_INFO,
+ 				 "received EAPOL-Key msg 2/4 with invalid Key Data contents");
+-		return;
++		goto out;
+ 	}
+ 	if (kde.rsn_ie) {
+ 		eapol_key_ie = kde.rsn_ie;
+@@ -3075,7 +3100,7 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 		/* MLME-DEAUTHENTICATE.request */
+ 		wpa_sta_disconnect(wpa_auth, sm->addr,
+ 				   WLAN_REASON_PREV_AUTH_NOT_VALID);
+-		return;
++		goto out;
+ 	}
+ 	if ((!sm->rsnxe && kde.rsnxe) ||
+ 	    (sm->rsnxe && !kde.rsnxe) ||
+@@ -3091,7 +3116,7 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 		/* MLME-DEAUTHENTICATE.request */
+ 		wpa_sta_disconnect(wpa_auth, sm->addr,
+ 				   WLAN_REASON_PREV_AUTH_NOT_VALID);
+-		return;
++		goto out;
+ 	}
+ #ifdef CONFIG_OCV
+ 	if (wpa_auth_uses_ocv(sm)) {
+@@ -3103,14 +3128,14 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 		if (wpa_channel_info(wpa_auth, &ci) != 0) {
+ 			wpa_auth_logger(wpa_auth, sm->addr, LOGGER_INFO,
+ 					"Failed to get channel info to validate received OCI in EAPOL-Key 2/4");
+-			return;
++			goto out;
+ 		}
+ 
+ 		if (get_sta_tx_parameters(sm,
+ 					  channel_width_to_int(ci.chanwidth),
+ 					  ci.seg1_idx, &tx_chanwidth,
+ 					  &tx_seg1_idx) < 0)
+-			return;
++			goto out;
+ 
+ 		res = ocv_verify_tx_params(kde.oci, kde.oci_len, &ci,
+ 					   tx_chanwidth, tx_seg1_idx);
+@@ -3127,7 +3152,7 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 					OCV_FAILURE "addr=" MACSTR
+ 					" frame=eapol-key-m2 error=%s",
+ 					MAC2STR(sm->addr), ocv_errorstr);
+-			return;
++			goto out;
+ 		}
+ 	}
+ #endif /* CONFIG_OCV */
+@@ -3135,7 +3160,7 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 	if (ft && ft_check_msg_2_of_4(wpa_auth, sm, &kde) < 0) {
+ 		wpa_sta_disconnect(wpa_auth, sm->addr,
+ 				   WLAN_REASON_PREV_AUTH_NOT_VALID);
+-		return;
++		goto out;
+ 	}
+ #endif /* CONFIG_IEEE80211R_AP */
+ #ifdef CONFIG_P2P
+@@ -3171,7 +3196,7 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 				   "DPP: Peer indicated it supports PFS and local configuration allows this, but PFS was not negotiated for the association");
+ 			wpa_sta_disconnect(wpa_auth, sm->addr,
+ 					   WLAN_REASON_PREV_AUTH_NOT_VALID);
+-			return;
++			goto out;
+ 		}
+ 	}
+ #endif /* CONFIG_DPP2 */
+@@ -3191,7 +3216,7 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 				    sm->sup_pmk_r1_name, WPA_PMK_NAME_LEN);
+ 			wpa_hexdump(MSG_DEBUG, "FT: Derived PMKR1Name",
+ 				    sm->pmk_r1_name, WPA_PMK_NAME_LEN);
+-			return;
++			goto out;
+ 		}
+ 	}
+ #endif /* CONFIG_IEEE80211R_AP */
+@@ -3200,7 +3225,7 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 	    wpa_auth_update_vlan(wpa_auth, sm->addr, vlan_id) < 0) {
+ 		wpa_sta_disconnect(wpa_auth, sm->addr,
+ 				   WLAN_REASON_PREV_AUTH_NOT_VALID);
+-		return;
++		goto out;
+ 	}
+ 
+ 	sm->pending_1_of_4_timeout = 0;
+@@ -3216,9 +3241,20 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 
+ 	sm->MICVerified = true;
+ 
++#ifdef CONFIG_IEEE80211R_AP
++	if (wpa_key_mgmt_ft(sm->wpa_key_mgmt) && !sm->ft_completed) {
++		wpa_printf(MSG_DEBUG, "FT: Store PMK-R0/PMK-R1");
++		wpa_auth_ft_store_keys(sm, pmk_r0, pmk_r1, pmk_r0_name,
++				       key_len);
++	}
++#endif /* CONFIG_IEEE80211R_AP */
++
+ 	os_memcpy(&sm->PTK, &PTK, sizeof(PTK));
+ 	forced_memzero(&PTK, sizeof(PTK));
+ 	sm->PTK_valid = true;
++out:
++	forced_memzero(pmk_r0, sizeof(pmk_r0));
++	forced_memzero(pmk_r1, sizeof(pmk_r1));
+ }
+ 
+ 
+--- a/src/ap/wpa_auth_ft.c
++++ b/src/ap/wpa_auth_ft.c
+@@ -2175,13 +2175,13 @@ int wpa_ft_store_pmk_fils(struct wpa_sta
+ }
+ 
+ 
+-int wpa_auth_derive_ptk_ft(struct wpa_state_machine *sm, struct wpa_ptk *ptk)
++int wpa_auth_derive_ptk_ft(struct wpa_state_machine *sm, struct wpa_ptk *ptk,
++			   u8 *pmk_r0, u8 *pmk_r1, u8 *pmk_r0_name,
++			   size_t *key_len)
+ {
+-	u8 pmk_r0[PMK_LEN_MAX], pmk_r0_name[WPA_PMK_NAME_LEN];
+ 	size_t pmk_r0_len = wpa_key_mgmt_sha384(sm->wpa_key_mgmt) ?
+ 		SHA384_MAC_LEN : PMK_LEN;
+ 	size_t pmk_r1_len = pmk_r0_len;
+-	u8 pmk_r1[PMK_LEN_MAX];
+ 	u8 ptk_name[WPA_PMK_NAME_LEN];
+ 	const u8 *mdid = sm->wpa_auth->conf.mobility_domain;
+ 	const u8 *r0kh = sm->wpa_auth->conf.r0_key_holder;
+@@ -2189,13 +2189,6 @@ int wpa_auth_derive_ptk_ft(struct wpa_st
+ 	const u8 *r1kh = sm->wpa_auth->conf.r1_key_holder;
+ 	const u8 *ssid = sm->wpa_auth->conf.ssid;
+ 	size_t ssid_len = sm->wpa_auth->conf.ssid_len;
+-	int psk_local = sm->wpa_auth->conf.ft_psk_generate_local;
+-	int expires_in = sm->wpa_auth->conf.r0_key_lifetime;
+-	struct vlan_description vlan;
+-	struct rate_description rate;
+-	const u8 *identity, *radius_cui;
+-	size_t identity_len, radius_cui_len;
+-	int session_timeout;
+ 	const u8 *mpmk;
+ 	size_t mpmk_len;
+ 
+@@ -2211,10 +2204,41 @@ int wpa_auth_derive_ptk_ft(struct wpa_st
+ 		return -1;
+ 	}
+ 
++	*key_len = pmk_r0_len;
++	if (wpa_derive_pmk_r0(mpmk, mpmk_len, ssid, ssid_len, mdid,
++			      r0kh, r0kh_len, sm->addr,
++			      pmk_r0, pmk_r0_name,
++			      pmk_r0_len == SHA384_MAC_LEN) < 0 ||
++	    wpa_derive_pmk_r1(pmk_r0, pmk_r0_len, pmk_r0_name, r1kh, sm->addr,
++			      pmk_r1, sm->pmk_r1_name) < 0)
++		return -1;
++
++	return wpa_pmk_r1_to_ptk(pmk_r1, pmk_r1_len, sm->SNonce, sm->ANonce,
++				 sm->addr, sm->wpa_auth->addr, sm->pmk_r1_name,
++				 ptk, ptk_name, sm->wpa_key_mgmt, sm->pairwise,
++				 0);
++}
++
++
++void wpa_auth_ft_store_keys(struct wpa_state_machine *sm, const u8 *pmk_r0,
++			    const u8 *pmk_r1, const u8 *pmk_r0_name,
++			    size_t key_len)
++{
++	int psk_local = sm->wpa_auth->conf.ft_psk_generate_local;
++	int expires_in = sm->wpa_auth->conf.r0_key_lifetime;
++	struct vlan_description vlan;
++	struct rate_description rate;
++	const u8 *identity, *radius_cui;
++	size_t identity_len, radius_cui_len;
++	int session_timeout;
++
++	if (psk_local && wpa_key_mgmt_ft_psk(sm->wpa_key_mgmt))
++		return;
++
+ 	if (wpa_ft_get_vlan(sm->wpa_auth, sm->addr, &vlan) < 0) {
+ 		wpa_printf(MSG_DEBUG, "FT: vlan not available for STA " MACSTR,
+ 			   MAC2STR(sm->addr));
+-		return -1;
++		return;
+ 	}
+ 
+ 	wpa_ft_get_rate_limit(sm->wpa_auth, sm->addr, &rate);
+@@ -2224,32 +2248,16 @@ int wpa_auth_derive_ptk_ft(struct wpa_st
+ 					       &radius_cui);
+ 	session_timeout = wpa_ft_get_session_timeout(sm->wpa_auth, sm->addr);
+ 
+-	if (wpa_derive_pmk_r0(mpmk, mpmk_len, ssid, ssid_len, mdid,
+-			      r0kh, r0kh_len, sm->addr,
+-			      pmk_r0, pmk_r0_name,
+-			      wpa_key_mgmt_sha384(sm->wpa_key_mgmt)) < 0)
+-		return -1;
+-	if (!psk_local || !wpa_key_mgmt_ft_psk(sm->wpa_key_mgmt))
+-		wpa_ft_store_pmk_r0(sm->wpa_auth, sm->addr, pmk_r0, pmk_r0_len,
+-				    pmk_r0_name,
+-				    sm->pairwise, &vlan, expires_in,
+-				    session_timeout, identity, identity_len,
+-				    radius_cui, radius_cui_len, &rate);
+-
+-	if (wpa_derive_pmk_r1(pmk_r0, pmk_r0_len, pmk_r0_name, r1kh, sm->addr,
+-			      pmk_r1, sm->pmk_r1_name) < 0)
+-		return -1;
+-	if (!psk_local || !wpa_key_mgmt_ft_psk(sm->wpa_key_mgmt))
+-		wpa_ft_store_pmk_r1(sm->wpa_auth, sm->addr, pmk_r1, pmk_r1_len,
+-				    sm->pmk_r1_name, sm->pairwise, &vlan,
+-				    expires_in, session_timeout, identity,
+-				    identity_len, radius_cui, radius_cui_len,
+-				    &rate);
+-
+-	return wpa_pmk_r1_to_ptk(pmk_r1, pmk_r1_len, sm->SNonce, sm->ANonce,
+-				 sm->addr, sm->wpa_auth->addr, sm->pmk_r1_name,
+-				 ptk, ptk_name, sm->wpa_key_mgmt, sm->pairwise,
+-				 0);
++	wpa_ft_store_pmk_r0(sm->wpa_auth, sm->addr, pmk_r0, key_len,
++			    pmk_r0_name,
++			    sm->pairwise, &vlan, expires_in,
++			    session_timeout, identity, identity_len,
++			    radius_cui, radius_cui_len, &rate);
++
++	wpa_ft_store_pmk_r1(sm->wpa_auth, sm->addr, pmk_r1, key_len,
++			    sm->pmk_r1_name, sm->pairwise, &vlan,
++			    expires_in, session_timeout, identity,
++			    identity_len, radius_cui, radius_cui_len, &rate);
+ }
+ 
+ 
+--- a/src/ap/wpa_auth_i.h
++++ b/src/ap/wpa_auth_i.h
+@@ -302,7 +302,12 @@ int wpa_write_ftie(struct wpa_auth_confi
+ 		   const u8 *anonce, const u8 *snonce,
+ 		   u8 *buf, size_t len, const u8 *subelem,
+ 		   size_t subelem_len, int rsnxe_used);
+-int wpa_auth_derive_ptk_ft(struct wpa_state_machine *sm, struct wpa_ptk *ptk);
++int wpa_auth_derive_ptk_ft(struct wpa_state_machine *sm, struct wpa_ptk *ptk,
++			   u8 *pmk_r0, u8 *pmk_r1, u8 *pmk_r0_name,
++			   size_t *key_len);
++void wpa_auth_ft_store_keys(struct wpa_state_machine *sm, const u8 *pmk_r0,
++			    const u8 *pmk_r1, const u8 *pmk_r0_name,
++			    size_t key_len);
+ struct wpa_ft_pmk_cache * wpa_ft_pmk_cache_init(void);
+ void wpa_ft_pmk_cache_deinit(struct wpa_ft_pmk_cache *cache);
+ void wpa_ft_install_ptk(struct wpa_state_machine *sm, int retry);
