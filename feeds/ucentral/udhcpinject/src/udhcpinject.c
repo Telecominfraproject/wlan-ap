@@ -277,18 +277,15 @@ int setup_tc() {
     }
 
     for (int i = 0; i < iface_count; i++) {
-        snprintf(cmd, sizeof(cmd), "tc qdisc show dev %s ingress 2>/dev/null 1>2", 
+        snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s ingress 2>/dev/null 1>2", 
             iface_map[i].iface);
-        if (system(cmd) == 0) {
+        int result = system(cmd);
+        if (result == 2) {
             syslog(LOG_INFO, "Ingress qdisc already exists for %s\n", iface_map[i].iface);
         }
-        else {
-            snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s ingress 2>/dev/null",
-                 iface_map[i].iface);
-            if (system(cmd) != 0) {
-                syslog(LOG_ERR, "Failed to add qdisc for %s\n", iface_map[i].iface);
-                return -1;
-            }
+        else if (result == 1) {
+            syslog(LOG_ERR, "Failed to add qdisc for %s\n", iface_map[i].iface);
+            return -1;
         }
 
         snprintf(cmd, sizeof(cmd),
