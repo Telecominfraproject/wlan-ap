@@ -77,3 +77,17 @@ define Device/cig_wf189w
   DEVICE_PACKAGES := ath12k-wifi-cig-wf189w ath12k-firmware-ipq5332-peb-peb
 endef
 TARGET_DEVICES += cig_wf189w
+
+
+define Device/cig_wf189h
+  DEVICE_TITLE := CIG WF189H
+  DEVICE_DTS := ipq5332-cig-wf189h
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_DTS_CONFIG := config@mi04.1
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/nand-factory.ubi := append-ubi
+  DEVICE_PACKAGES := ath12k-wifi-cig-wf189h ath12k-firmware-ipq5332-peb-peb
+endef
+TARGET_DEVICES += cig_wf189h

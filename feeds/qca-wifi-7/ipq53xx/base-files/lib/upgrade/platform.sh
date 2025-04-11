@@ -87,6 +87,7 @@ platform_do_upgrade() {
 	board=$(board_name)
 	case $board in
 	cig,wf189w|\
+	cig,wf189h|\
 	cig,wf189)
 		if [ -f /proc/boot_info/bootconfig0/rootfs/upgradepartition ]; then
 			CI_UBIPART="$(cat /proc/boot_info/bootconfig0/rootfs/upgradepartition)"
