@@ -35,35 +35,33 @@ do_flash_emmc() {
 	tar Oxf $tar_file ${board_dir}/$part | dd of=${emmcblock}
 }
 
+sonicfi_dualimage_check() {
+	local boot_part=""
+	boot_part=$(fw_printenv | grep bootfrom | awk -F'=' '{printf $2}')
+	[ -n "$boot_part" ] || boot_part="0"
+	echo "boot_part=$boot_part" > /dev/console
+
+	if [ "$boot_part" = "0" ]; then
+		block_kernel="0:HLOS_1"
+		block_rootfs="rootfs_1"
+		CI_UBIPART="rootfs_1"
+		fw_setenv bootfrom 1
+	elif [ "$boot_part" = "1" ]; then
+		block_kernel="0:HLOS"
+		block_rootfs="rootfs"
+		CI_UBIPART="rootfs"
+		fw_setenv bootfrom 0
+	else
+		echo "Invalid boot partition $boot_part! Skip upgrade....."
+		return
+	fi
+}
+
 emmc_do_upgrade() {
 	local tar_file="$1"
-	local block_kernel="0:HLOS"
-	local block_rootfs="rootfs"
 	local board_dir=$(tar tf $tar_file | grep -m 1 '^sysupgrade-.*/$')
 	board_dir=${board_dir%/}
-
-	board=$(board_name)
-	case $board in
-	sonicfi,rap7110c-341x)
-		local boot_part=""
-		boot_part=$(fw_printenv | grep bootfrom | awk -F'=' '{printf $2}')
-		[ -n "$boot_part" ] || boot_part="0"
-		echo "**** boot_part=$boot_part" > /dev/console
-
-		if [ "$boot_part" = "0" ]; then
-			block_kernel="0:HLOS_1"
-			block_rootfs="rootfs_1"
-			fw_setenv bootfrom 1
-		elif [ "$boot_part" = "1" ]; then
-			block_kernel="0:HLOS"
-			block_rootfs="rootfs"
-			fw_setenv bootfrom 0
-		else
-			echo "Invalid boot partition $boot_part! Skip upgrade....."
-			return
-		fi
-		;;
-	esac
+	echo "block_kernel=$block_kernel, block_rootfs=$block_rootfs" > /dev/console
 	do_flash_emmc $tar_file $block_kernel $board_dir kernel
 	do_flash_emmc $tar_file $block_rootfs $board_dir root
 
@@ -83,9 +81,12 @@ platform_do_upgrade() {
 	CI_UBIPART="rootfs"
 	CI_ROOTPART="ubi_rootfs"
 	CI_IPQ807X=1
+	block_kernel="0:HLOS"
+	block_rootfs="rootfs"
 
 	board=$(board_name)
 	case $board in
+	cig,wf189w|\
 	cig,wf189)
 		if [ -f /proc/boot_info/bootconfig0/rootfs/upgradepartition ]; then
 			CI_UBIPART="$(cat /proc/boot_info/bootconfig0/rootfs/upgradepartition)"
@@ -111,7 +112,12 @@ platform_do_upgrade() {
 		nand_upgrade_tar "$1"
 		;;
 	sonicfi,rap7110c-341x)
+		sonicfi_dualimage_check
 		emmc_do_upgrade $1 $1
-	;;
+		;;
+	sonicfi,rap750w-311a)
+		sonicfi_dualimage_check
+		nand_upgrade_tar "$1"
+		;;
 	esac
 }

@@ -53,10 +53,10 @@ TARGET_DEVICES += sonicfi_rap7110c_341x
 
 define Device/sonicfi_rap750w_311a
   DEVICE_TITLE := SONICFI RAP750W-311A
-  DEVICE_DTS := ipq5332-rap750w-311a
+  DEVICE_DTS := ipq5332-sonicfi-rap750w-311a
   DEVICE_DTS_DIR := ../dts
   DEVICE_DTS_CONFIG := config@mi01.3-c2
-  SUPPORTED_DEVICES := sonicfi,rap7110c-341x
+  SUPPORTED_DEVICES := sonicfi,rap750w-311a
   IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
   IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
   IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
@@ -64,3 +64,16 @@ define Device/sonicfi_rap750w_311a
   DEVICE_PACKAGES := ath12k-wifi-sonicfi-rap750w-311a ath12k-firmware-ipq5332-peb
 endef
 TARGET_DEVICES += sonicfi_rap750w_311a
+
+define Device/cig_wf189w
+  DEVICE_TITLE := CIG WF189W
+  DEVICE_DTS := ipq5332-cig-wf189w
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_DTS_CONFIG := config@mi04.1
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/nand-factory.ubi := append-ubi
+  DEVICE_PACKAGES := ath12k-wifi-cig-wf189w ath12k-firmware-ipq5332-peb-peb
+endef
+TARGET_DEVICES += cig_wf189w
