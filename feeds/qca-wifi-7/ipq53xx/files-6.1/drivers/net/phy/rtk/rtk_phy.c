@@ -80,7 +80,7 @@ static int rtkphy_config_init(struct phy_device *phydev)
         case REALTEK_PHY_ID_RTL8261N:
         case REALTEK_PHY_ID_RTL8264B:
             phydev_info(phydev, "%s:%u [RTL8261N/RTL826XB] phy_id: 0x%X PHYAD:%d\n", __FUNCTION__, __LINE__, phydev->drv->phy_id, phydev->mdio.addr);
-
+	    phy_modify_mmd_changed(phydev, 7, 0x20, BIT(12), 0);
 
           #if 1 /* toggle reset */
             phy_modify_mmd_changed(phydev, 30, 0x145, BIT(0)  , 1);
@@ -213,6 +213,7 @@ static int rtkphy_c45_aneg_done(struct phy_device *phydev)
 static int rtkphy_c45_read_status(struct phy_device *phydev)
 {
     int ret = 0, status = 0;
+    uint16_t local;
     phydev->speed = SPEED_UNKNOWN;
     phydev->duplex = DUPLEX_UNKNOWN;
     phydev->pause = 0;
@@ -230,6 +231,9 @@ static int rtkphy_c45_read_status(struct phy_device *phydev)
         ret = genphy_c45_read_lpa(phydev);
         if (ret)
             return ret;
+	
+	phy_write_mmd(phydev, 7, 0x20, 0x181);
+	local = phy_read_mmd(phydev, 7, 0x20);
 
         status =  phy_read_mmd(phydev, 31, 0xA414);
         if (status < 0)
@@ -238,6 +242,11 @@ static int rtkphy_c45_read_status(struct phy_device *phydev)
             phydev->lp_advertising, status & BIT(11));
 
         phy_resolve_aneg_linkmode(phydev);
+	if((phydev->speed == 10000) && (local == 0x181))
+        {
+                phydev->speed = 5000;
+                phydev->duplex = DUPLEX_FULL;
+        }
     }
     else
     {

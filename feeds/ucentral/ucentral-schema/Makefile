@@ -4,10 +4,10 @@ PKG_NAME:=ucentral-schema
 PKG_RELEASE:=1
 
 PKG_SOURCE_URL=https://github.com/Telecominfraproject/wlan-ucentral-schema.git
-PKG_MIRROR_HASH:=1b5fa61874afe49fb417f9a4b0f4476874f09b9c794af2cd0113ae278a0fc569
+PKG_MIRROR_HASH:=fe33f072d7bcbbb14c7c3415e0750699bb5dae8a9af06c59c90c020f8b192a15
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_DATE:=2025-01-27
-PKG_SOURCE_VERSION:=1c11c1bb67c21908787b8b1389eb334d2bdfe3c5
+PKG_SOURCE_VERSION:=5a6d23b76bc51289ae99d22fdf406516b0c630e6
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=BSD-3-Clause
 
@@ -37,6 +37,7 @@ define Package/ucentral-schema/install
 	$(CP) $(PKG_BUILD_DIR)/renderer/* $(1)/usr/share/ucentral
 	$(CP) $(PKG_BUILD_DIR)/command/*.uc $(1)/usr/share/ucentral
 	$(CP) $(PKG_BUILD_DIR)/system/*.uc $(1)/usr/share/ucentral
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/wifi_detect.sh $(1)/usr/share/ucentral
 	$(CP) ./files/* $(1)
 endef
 

@@ -73,6 +73,10 @@ hostapd_append_wpa_key_mgmt() {
 		owe)
 			append wpa_key_mgmt "OWE"
 		;;
+		psk2-radius)
+			append wpa_key_mgmt "WPA-PSK"
+			[ "${ieee80211r:-0}" -gt 0 ] && append wpa_key_mgmt "FT-PSK"
+		;;
 	esac
 
 	[ "$fils" -gt 0 ] && {
@@ -663,7 +667,7 @@ hostapd_set_bss_options() {
 			set_default sae_require_mfp 1
 			[ "$ppsk" -eq 0 ] && set_default sae_pwe 2
 		;;
-		psk-sae|eap-eap2)
+		psk-sae|psk2-radius|eap-eap2)
 			set_default ieee80211w 1
 			set_default sae_require_mfp 1
 			[ "$ppsk" -eq 0 ] && set_default sae_pwe 2
@@ -790,6 +794,10 @@ hostapd_set_bss_options() {
 			append bss_conf "wep_default_key=$wep_keyidx" "$N"
 			[ -n "$wep_rekey" ] && append bss_conf "wep_rekey_period=$wep_rekey" "$N"
 		;;
+		psk2-radius)
+			append bss_conf "wpa_psk_radius=3" "$N"
+			append_radius_server
+			vlan_possible=1
 	esac
 
 	case "$auth_type" in
