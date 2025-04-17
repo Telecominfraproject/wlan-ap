@@ -86,7 +86,7 @@ platform_do_upgrade() {
 		;;
 	sonicfi,rap650c)
 		boot_part=$(fw_printenv -n bootfrom)
-		[ ${#boot_part} -eq 0 ] && boot_part=1
+		[ ${#boot_part} -eq 0 ] && boot_part=0
 		echo "Current bootfrom is $boot_part"
 		if [[ $boot_part == 1 ]]; then
 			CI_UBIPART="rootfs"
