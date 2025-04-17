@@ -61,7 +61,7 @@ define Device/sonicfi_rap750w_311a
   IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
   IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
   IMAGE/nand-factory.ubi := append-ubi
-  DEVICE_PACKAGES := ath12k-wifi-sonicfi-rap750w-311a ath12k-firmware-ipq5332-peb
+  DEVICE_PACKAGES := ath12k-wifi-sonicfi-rap750w-311a ath12k-firmware-ipq5332-peb -ath12k-firmware-qcn92xx
 endef
 TARGET_DEVICES += sonicfi_rap750w_311a
 
