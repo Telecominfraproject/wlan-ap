@@ -290,6 +290,7 @@ function fixed_channel_config(iface, iface_num, fixed_channel_f, auto_channel_f,
 function get_chan_util(radio_band, sleep_time) {
 	let pdev_stats = {};
 	let chan_util = 0;
+    let total_usage = 0;
 
     let prev_values = {
 		txFrameCount: null,
@@ -348,7 +349,8 @@ function get_chan_util(radio_band, sleep_time) {
             if (ignore != 1) {
                 let cycle_count_delta = curr_values.cycleCount - prev_values.cycleCount;
                 let rx_clear_delta = curr_values.rxClearCount - prev_values.rxClearCount;
-                let total_usage = (rx_clear_delta * 100) / cycle_count_delta;
+                if (cycle_count_delta && cycle_count_delta > 0)
+                    total_usage = (rx_clear_delta * 100) / cycle_count_delta;
                 chan_util = total_usage;
             }
 
