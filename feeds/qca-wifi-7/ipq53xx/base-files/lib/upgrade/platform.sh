@@ -120,5 +120,9 @@ platform_do_upgrade() {
 		sonicfi_dualimage_check
 		nand_upgrade_tar "$1"
 		;;
+	sercomm,ap72tip-v4|\
+	sercomm,ap72tip)
+		nand_upgrade_tar "$1"
+		;;
 	esac
 }
