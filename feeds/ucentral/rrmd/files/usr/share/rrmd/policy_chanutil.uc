@@ -265,7 +265,7 @@ function dfs_chan_check(iface_num, rcs_channel) {
 }
 
 function fixed_channel_config(iface, iface_num, fixed_channel_f, auto_channel_f, fixed_chan_bkp, channel_config) {
-    // if fixed channel config is stored in the /tmp/fixed_channel_phyX file
+    // if fixed channel config is stored in the /tmp/fixed_channel_<radio_iface> file
     if (fixed_channel_f == 1) {
         if (auto_channel_f == 1) {
             // if current channel is auto => change to fixed
@@ -675,7 +675,7 @@ function channel_optimize() {
                 ulog_info(`[%s] Allowed consecutive Channel Utilization threshold breach count = %d \n`, radio_iface[j], config.consecutive_threshold_breach);
 
                 if (!current_threshold_breach_count || current_threshold_breach_count == null || current_threshold_breach_count == 'NaN') {
-                    // /tmp/phyX_breachcount file doesn't exist yet or has invalid value
+                    // /tmp/threshold_breach_count_<radio_iface> file doesn't exist yet or has invalid value
                     current_threshold_breach_count = 0;
                 }
                 ulog_info(`[%s] Previous consecutive Channel Utilization threshold breach count = %d \n`, radio_iface[j], current_threshold_breach_count);
