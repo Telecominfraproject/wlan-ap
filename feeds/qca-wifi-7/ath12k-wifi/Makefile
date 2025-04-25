@@ -48,6 +48,11 @@ $(call Package/ath12k-wifi-default)
     TITLE:=board-2.bin for RAP7710c_341x
 endef
 
+define Package/ath12k-wifi-sonicfi-rap750e-h
+$(call Package/ath12k-wifi-default)
+    TITLE:=board-2.bin for RAP750e_h
+endef
+
 define Package/ath12k-wifi-sonicfi-rap750w-311a
 $(call Package/ath12k-wifi-default)
     TITLE:=board-2.bin for RAP750W_311a
@@ -84,6 +89,15 @@ define Package/ath12k-wifi-sonicfi-rap7110c-341x/install
 	$(INSTALL_DATA) ./board-2.bin.rap7110c_341x.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
 endef
 
+define Package/ath12k-wifi-sonicfi-rap750e-h/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN6432/hw1.0/
+	$(INSTALL_DATA) ./board-2.bin.rap750e_h.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
+	$(INSTALL_DATA) ./board-2.bin.rap750e_h.QCN6432 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/board-2.bin
+#	$(INSTALL_DATA) ./ipq5332_qcn6432.regdb $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/regdb.bin
+	$(INSTALL_DATA) ./ipq5332_qcn6432.regdb $(1)/lib/firmware/ath12k/QCN6432/hw1.0/regdb.bin
+endef
+
 define Package/ath12k-wifi-sonicfi-rap750w-311a/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN6432/hw1.0/
@@ -113,6 +127,7 @@ endef
 $(eval $(call BuildPackage,ath12k-wifi-cig-wf189))
 $(eval $(call BuildPackage,ath12k-wifi-edgecore-eap105))
 $(eval $(call BuildPackage,ath12k-wifi-sonicfi-rap7110c-341x))
+$(eval $(call BuildPackage,ath12k-wifi-sonicfi-rap750e-h))
 $(eval $(call BuildPackage,ath12k-wifi-sonicfi-rap750w-311a))
 $(eval $(call BuildPackage,ath12k-wifi-cig-wf189w))
 $(eval $(call BuildPackage,ath12k-wifi-cig-wf189h))
