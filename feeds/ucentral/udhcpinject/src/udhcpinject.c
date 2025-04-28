@@ -26,6 +26,7 @@ struct iface_info *iface_map = NULL;
 static struct port_info *ports = NULL;
 int iface_count = 0;
 int port_count = 0;
+int total_iface = 0;
 static pcap_t *handle = NULL;
 static char *provided_ssids = NULL;
 static char *provided_ports = NULL;
@@ -192,6 +193,11 @@ int parse_ssids(const char *ssids) {
         return -1;
     }
 
+    if (iface_count != total_iface) {
+        syslog(LOG_ERR, "Expect %d but only %d interfaces were found.\n", total_iface, iface_count);
+        return -1;
+    }
+
     syslog(LOG_INFO, "Found %d matching interfaces\n", iface_count);
     return 0;
 }
@@ -310,7 +316,6 @@ void signal_handler(int sig) {
         exit(0);
     } else if (sig == SIGHUP) {
         syslog(LOG_INFO, "Received reload signal, reconfiguring...\n");
-        sleep(5);
         // Clean up existing resources
         cleanup_tc();
         
@@ -561,7 +566,19 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGHUP, signal_handler);
 
-    sleep(5);
+    // Read IFACEs from environment variable
+    char *iface_env = getenv("IFACEs");
+    if (!iface_env) {
+        syslog(LOG_ERR, "No IFACEs provided. Exiting...\n");
+        cleanup();
+        return 1;
+    }
+    total_iface = atoi(iface_env);
+    if (total_iface <= 0) {
+        syslog(LOG_ERR, "Invalid IFACEs value: %s. Exiting...\n", iface_env);
+        cleanup();
+        return 1;
+    }
 
     provided_ssids = getenv("SSIDs");
     syslog(LOG_INFO, "Provided SSIDs: %s\n", provided_ssids);
