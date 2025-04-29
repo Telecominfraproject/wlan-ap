@@ -307,3 +307,28 @@ define Device/senao_jeap6500
 endef
 TARGET_DEVICES += senao_jeap6500
 DEFAULT_DEVICE_VARS += FIT_KEY_DIR FIT_KEY_NAME
+
+define Device/emplus_wap588m
+   DEVICE_VENDOR := EMPLUS
+   DEVICE_MODEL := WAP588M
+   DEVICE_DTS := mt7981-emplus-wap588m
+   DEVICE_DTS_DIR := $(DTS_DIR)/mediatek
+   SUPPORTED_DEVICES := emplus,wap588m
+   DEVICE_PACKAGES := kmod-mt7981-firmware kmod-mt7915e uboot-envtools -procd-ujail
+   UBINIZE_OPTS := -E 5
+   BLOCKSIZE := 128k
+   PAGESIZE := 2048
+   IMAGE_SIZE := 65536k
+   KERNEL_IN_UBI := 1
+   FIT_KEY_DIR := $(DTS_DIR)/mediatek/keys/emplus_wap588m
+   FIT_KEY_NAME := fit_key
+   IMAGES += factory.bin
+   IMAGE/factory.bin := append-ubi | check-size $$$$(IMAGE_SIZE)
+   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+   KERNEL = kernel-bin | lzma | \
+     fit-sign lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
+   KERNEL_INITRAMFS = kernel-bin | lzma | \
+     fit-sign lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd
+ endef
+ TARGET_DEVICES += emplus_wap588m
+ DEFAULT_DEVICE_VARS += FIT_KEY_DIR FIT_KEY_NAME
