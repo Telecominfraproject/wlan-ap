@@ -7,6 +7,7 @@
 #include <linux/module.h>
 #include <linux/phy.h>
 #include <linux/delay.h>
+#include <linux/of.h>
 
 #include "phy_rtl826xb_patch.h"
 #include "phy_rtl8251b_patch.h"
@@ -30,6 +31,7 @@ static int rtl8251_match_phy_device(struct phy_device *phydev)
 static int rtl826xb_get_features(struct phy_device *phydev)
 {
     int ret;
+    struct device_node *np;
     ret = genphy_c45_pma_read_abilities(phydev);
     if (ret)
         return ret;
@@ -48,8 +50,13 @@ static int rtl826xb_get_features(struct phy_device *phydev)
     linkmode_clear_bit(ETHTOOL_LINK_MODE_10baseT_Full_BIT,
                        phydev->supported);
 
-    linkmode_clear_bit(ETHTOOL_LINK_MODE_10000baseT_Full_BIT,
-                       phydev->supported);
+    np = of_find_node_by_name(NULL, "mdio");
+    if (np)
+	if (of_property_read_bool(np, "limit_rtlphy_10g_ablity"))
+	{
+		linkmode_clear_bit(ETHTOOL_LINK_MODE_10000baseT_Full_BIT, phydev->supported);
+	}
+
 
     return 0;
 }
