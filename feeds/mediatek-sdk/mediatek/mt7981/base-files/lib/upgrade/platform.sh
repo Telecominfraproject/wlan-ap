@@ -2,13 +2,13 @@ REQUIRE_IMAGE_METADATA=1
 
 senao_swap_active_fw() {
 	echo "Doing swap active_fw" > /dev/console
-	tmp_active_fw=$(fw_printenv -n active_fw)
+        tmp_active_fw=$(fw_printenv | grep active_fw | awk -F= {'print $2'})
 	if [ $tmp_active_fw == "0" ]; then
 		fw_setenv active_fw 1
-		fw_setenv mtdparts nmbm0:1024k\(bl2\),512k\(u-boot-env\),2048k\(factory\),2048k\(fip\),112640k\(ubi_1\),112640k\(ubi\),384k\(cert\),640k\(userconfig\),384k\(crashdump\)
+                fw_setenv mtdparts nmbm0:1024k\(bl2\),512k\(u-boot-env\),2048k\(factory\),2048k\(fip\),56320k\(ubi_1\),56320k\(ubi\),384k\(cert\),640k\(userconfig\),384k\(crashdump\)
 	else
 		fw_setenv active_fw 0
-		fw_setenv mtdparts nmbm0:1024k\(bl2\),512k\(u-boot-env\),2048k\(factory\),2048k\(fip\),112640k\(ubi\),112640k\(ubi_1\),384k\(cert\),640k\(userconfig\),384k\(crashdump\)
+                fw_setenv mtdparts nmbm0:1024k\(bl2\),512k\(u-boot-env\),2048k\(factory\),2048k\(fip\),56320k\(ubi\),56320k\(ubi_1\),384k\(cert\),640k\(userconfig\),384k\(crashdump\)
 	fi
 }
 
@@ -47,6 +47,7 @@ platform_do_upgrade() {
 		nand_do_upgrade "$1"
 		;;
 	senao,iap2300m|\
+	emplus,wap588m|\
 	senao,jeap6500)
 		CI_UBIPART="ubi_1"
 		nand_do_upgrade "$1"
@@ -68,6 +69,7 @@ platform_check_image() {
 	edgecore,eap111|\
 	edgecore,eap112|\
 	senao,iap2300m|\
+	emplus,wap588m|\
 	senao,jeap6500)
 		nand_do_platform_check "$board" "$1"
 		return $?
