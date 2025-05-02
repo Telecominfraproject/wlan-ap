@@ -87,6 +87,7 @@ platform_do_upgrade() {
 	board=$(board_name)
 	case $board in
 	cig,wf189w|\
+	cig,wf189h|\
 	cig,wf189)
 		if [ -f /proc/boot_info/bootconfig0/rootfs/upgradepartition ]; then
 			CI_UBIPART="$(cat /proc/boot_info/bootconfig0/rootfs/upgradepartition)"
@@ -117,6 +118,10 @@ platform_do_upgrade() {
 		;;
 	sonicfi,rap750w-311a)
 		sonicfi_dualimage_check
+		nand_upgrade_tar "$1"
+		;;
+	sercomm,ap72tip-v4|\
+	sercomm,ap72tip)
 		nand_upgrade_tar "$1"
 		;;
 	esac
