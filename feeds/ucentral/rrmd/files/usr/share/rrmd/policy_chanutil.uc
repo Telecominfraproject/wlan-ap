@@ -572,6 +572,7 @@ function channel_optimize() {
     let radio_iface = {};
     let htmode = {};
     let radio_band = {};
+    let radio_disabled = {};
     let acs_exclude_dfs = {};
     let channel_config = {};
     let selected_channels = {};
@@ -604,11 +605,13 @@ function channel_optimize() {
 
         // get wireless interface uci config from "ubus call network.wireless status"
         let wireless_status = global.ubus.conn.call('network.wireless', 'status');
-        radio_iface[j] = wireless_status[radio_id].interfaces[0].ifname;
+        radio_disabled[j] = wireless_status[radio_id].disabled;
         radio_band[j] = wireless_status[radio_id].config.band;
 
-        if (radio_iface[j] == null) {
+        if (radio_disabled[j] == true) {
             radio_iface[j] = 'radio ' + radio_band[j];
+        } else {
+            radio_iface[j] = wireless_status[radio_id].interfaces[0].ifname;
         }
 
         // check wlan interface status
