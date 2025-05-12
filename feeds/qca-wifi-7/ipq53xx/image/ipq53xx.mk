@@ -134,3 +134,15 @@ define Device/zyxel_nwa130be
   DEVICE_PACKAGES := ath12k-wifi-zyxel-nwa130be ath12k-firmware-qcn92xx ath12k-firmware-ipq5332
 endef
 TARGET_DEVICES += zyxel_nwa130be
+
+define Device/cig_wf672
+  DEVICE_TITLE := CIG WF672
+  DEVICE_DTS := ipq5332-cig-wf672
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_DTS_CONFIG := config@mi01.6
+  IMAGES := sysupgrade.tar mmc-factory.bin
+  IMAGE/mmc-factory.bin := append-ubi | qsdk-ipq-factory-mmc
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  DEVICE_PACKAGES := ath12k-wifi-cig-wf672 ath12k-firmware-ipq5332 ath12k-firmware-qcn92xx
+endef
+TARGET_DEVICES += cig_wf672
