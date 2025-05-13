@@ -12,10 +12,10 @@
 
 /* NAMING DECLARATIONS
  */
-#define AN8801_DRIVER_VERSION  "1.1.4"
+#define AN8801_DRIVER_VERSION  "1.1.6"
 
 #define DEBUGFS_COUNTER         "counter"
-#define DEBUGFS_INFO     "driver_info"
+#define DEBUGFS_INFO            "driver_info"
 #define DEBUGFS_PBUS_OP         "pbus_op"
 #define DEBUGFS_POLARITY        "polarity"
 #define DEBUGFS_MDIO            "mdio"
@@ -88,7 +88,7 @@
 #define LED_BLK_EVT_1000M_RX        BIT(1)
 #define LED_BLK_EVT_1000M_TX        BIT(0)
 
-#define UNIT_LED_BLINK_DURATION     1024
+#define UNIT_LED_BLINK_DURATION     780
 
 /* Serdes auto negotation restart */
 #define AN8801SB_SGMII_AN0_ANRESTART    (0x0200)
@@ -134,6 +134,9 @@ For reference only
 
 #define LED_BLINK_DURATION(f)       (UNIT_LED_BLINK_DURATION << (f))
 #define LED_GPIO_SEL(led, gpio)     ((led) << ((gpio) * 3))
+
+/* Interrupt GPIO number, should not conflict with LED */
+#define AIR_INTERRUPT_GPIO	3
 
 /* DATA TYPE DECLARATIONS
  */
