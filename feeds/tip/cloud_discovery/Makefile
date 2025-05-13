@@ -12,6 +12,7 @@ define Package/cloud_discovery
   SECTION:=ucentral
   CATEGORY:=uCentral
   TITLE:=TIP cloud_discovery
+  DEPENDS:=+libest
 endef
 
 Build/Compile=
