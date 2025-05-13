@@ -113,7 +113,6 @@ static const struct AIR_LED_CFG_T led_cfg_dlt[MAX_LED_SIZE] = {
 	/* LED2 */
 	{LED_ENABLE, AIR_LED_GPIO9, AIR_ACTIVE_LOW,  AIR_LED2_ON, AIR_LED2_BLK},
 };
-
 static const u16 led_blink_cfg_dlt = AIR_LED_BLK_DUR_64M;
 /* RGMII delay */
 static const u8 rxdelay_force = FALSE;
@@ -140,7 +139,6 @@ static int __air_buckpbus_reg_write(struct phy_device *phydev, u32 addr,
 	err |= mbus->write(mbus, phy_addr, 0x13, (u16)(data >> 16));
 	err |= mbus->write(mbus, phy_addr, 0x14, (u16)(data & 0xffff));
 	err |= mbus->write(mbus, phy_addr, 0x1F, 0);
-
 	return err;
 }
 
@@ -167,6 +165,41 @@ static u32 __air_buckpbus_reg_read(struct phy_device *phydev, u32 addr)
 	return data;
 }
 
+static u32 __air_buckpbus_reg_modify(struct phy_device *phydev, u32 addr,
+					u32 mask, u32 set)
+{
+	int err = 0;
+	u32 data_h, data_l, data_old, data_new;
+	int phy_addr = phydev_phy_addr(phydev);
+	struct mii_bus *mbus = phydev_mdiobus(phydev);
+
+	err = mbus->write(mbus, phy_addr, 0x1F, 4);
+	err |= mbus->write(mbus, phy_addr, 0x10, 0);
+	err |= mbus->write(mbus, phy_addr, 0x15, (u16)(addr >> 16));
+	err |= mbus->write(mbus, phy_addr, 0x16, (u16)(addr & 0xffff));
+	data_h = mbus->read(mbus, phy_addr, 0x17);
+	data_l = mbus->read(mbus, phy_addr, 0x18);
+	if (err < 0) {
+		mbus->write(mbus, phy_addr, 0x1F, 0);
+		return INVALID_DATA;
+	}
+
+	data_old = ((data_h & 0xffff) << 16) | (data_l & 0xffff);
+	data_new = (data_old & ~mask) | set;
+	if (data_new == data_old) {
+		mbus->write(mbus, phy_addr, 0x1F, 0);
+		return 0;
+	}
+
+	err |= mbus->write(mbus, phy_addr, 0x11, (u16)(addr >> 16));
+	err |= mbus->write(mbus, phy_addr, 0x12, (u16)(addr & 0xffff));
+	err |= mbus->write(mbus, phy_addr, 0x13, (u16)(data_new >> 16));
+	err |= mbus->write(mbus, phy_addr, 0x14, (u16)(data_new & 0xffff));
+	err |= mbus->write(mbus, phy_addr, 0x1F, 0);
+
+	return err;
+}
+
 static int air_buckpbus_reg_write(struct phy_device *phydev, u32 addr, u32 data)
 {
 	int err = 0;
@@ -189,80 +222,16 @@ static u32 air_buckpbus_reg_read(struct phy_device *phydev, u32 addr)
 	return data;
 }
 
-static int __an8801_cl45_write(struct phy_device *phydev, int devad, u16 reg,
-				u16 val)
-{
-	u32 addr = (AN8801_EPHY_ADDR | AN8801_CL22 | (devad << 18) |
-				(reg << 2));
-
-	return __air_buckpbus_reg_write(phydev, addr, val);
-}
-
-static int __an8801_cl45_read(struct phy_device *phydev, int devad, u16 reg)
-{
-	u32 addr = (AN8801_EPHY_ADDR | AN8801_CL22 | (devad << 18) |
-				(reg << 2));
-
-	return __air_buckpbus_reg_read(phydev, addr);
-}
-
-int __an8801_modify_cl45_changed(struct phy_device *phydev, int devad, u32 regnum,
-				u16 mask, u16 set)
-{
-	int new, ret;
-
-	ret = __an8801_cl45_read(phydev, devad, regnum);
-	if (ret < 0)
-		return ret;
-
-	new = (ret & ~mask) | set;
-	if (new == ret)
-		return 0;
-
-	ret = __an8801_cl45_write(phydev, devad, regnum, new);
-
-	return ret < 0 ? ret : 1;
-}
-
-static int an8801_modify_cl45_changed(struct phy_device *phydev, int devad,
-				u32 regnum, u16 mask, u16 set)
+static int air_buckpbus_reg_modify(struct phy_device *phydev, u32 addr,
+					u32 mask, u32 set)
 {
 	int err = 0;
 
 	mdiobus_lock(phydev);
-	err = __an8801_modify_cl45_changed(phydev, devad, regnum, mask, set);
+	err = __air_buckpbus_reg_modify(phydev, addr, mask, set);
 	mdiobus_unlock(phydev);
 
 	return err;
-}
-
-static int an8801_cl45_write(struct phy_device *phydev, int devad, u16 reg,
-			      u16 val)
-{
-	int err = 0;
-
-	mdiobus_lock(phydev);
-	err = __an8801_cl45_write(phydev, devad, reg, val);
-	mdiobus_unlock(phydev);
-
-	return err;
-}
-
-static int an8801_cl45_read(struct phy_device *phydev, int devad, u16 reg,
-			     u16 *read_data)
-{
-	int data = 0;
-
-	mdiobus_lock(phydev);
-	data = __an8801_cl45_read(phydev, devad, reg);
-	mdiobus_unlock(phydev);
-
-	if (data == INVALID_DATA)
-		return -EINVAL;
-
-	*read_data = data;
-
-	return 0;
 }
 
 static int air_sw_reset(struct phy_device *phydev)
@@ -298,50 +267,36 @@ static int an8801_led_set_usr_def(struct phy_device *phydev, u8 entity,
 
 	on_evt |= LED_ON_EN;
 
-	err = an8801_cl45_write(phydev, 0x1f, LED_ON_CTRL(entity), on_evt);
+	err = phy_write_mmd(phydev, 0x1f, LED_ON_CTRL(entity), on_evt);
 	if (err)
 		return -1;
 
-	return an8801_cl45_write(phydev, 0x1f, LED_BLK_CTRL(entity), blk_evt);
+	return phy_write_mmd(phydev, 0x1f, LED_BLK_CTRL(entity), blk_evt);
 }
 
 static int an8801_led_set_mode(struct phy_device *phydev, u8 mode)
 {
-	int err;
-	u16 data;
-
-	err = an8801_cl45_read(phydev, 0x1f, LED_BCR, &data);
-	if (err)
-		return -1;
-
 	switch (mode) {
 	case AIR_LED_MODE_DISABLE:
-		data &= ~LED_BCR_EXT_CTRL;
-		data &= ~LED_BCR_MODE_MASK;
-		data |= LED_BCR_MODE_DISABLE;
-		break;
+		return phy_modify_mmd(phydev, 0x1f, LED_BCR,
+						(LED_BCR_EXT_CTRL | LED_BCR_CLK_EN),
+						0x0);
 	case AIR_LED_MODE_USER_DEFINE:
-		data |= (LED_BCR_EXT_CTRL | LED_BCR_CLK_EN);
+		return phy_modify_mmd(phydev, 0x1f, LED_BCR,
+						(LED_BCR_EXT_CTRL | LED_BCR_CLK_EN),
+						(LED_BCR_EXT_CTRL | LED_BCR_CLK_EN));
+	default:
 		break;
 	}
-	return an8801_cl45_write(phydev, 0x1f, LED_BCR, data);
+	dev_err(phydev_dev(phydev),
+				"LED mode %d is not supported\n", mode);
+	return -EINVAL;
 }
 
 static int an8801_led_set_state(struct phy_device *phydev, u8 entity, u8 state)
 {
-	u16 data;
-	int err;
-
-	err = an8801_cl45_read(phydev, 0x1f, LED_ON_CTRL(entity), &data);
-	if (err)
-		return err;
-
-	if (state)
-		data |= LED_ON_EN;
-	else
-		data &= ~LED_ON_EN;
-
-	return an8801_cl45_write(phydev, 0x1f, LED_ON_CTRL(entity), data);
+	return phy_modify_mmd(phydev, 0x1f, LED_ON_CTRL(entity), LED_ON_EN,
+					(state) ? LED_ON_EN : 0x0);
 }
 
 static int an8801_led_init(struct phy_device *phydev)
@@ -352,12 +307,12 @@ static int an8801_led_init(struct phy_device *phydev)
 	u32 data;
 	u16 led_blink_cfg = priv->led_blink_cfg;
 
-	ret = an8801_cl45_write(phydev, 0x1f, LED_BLK_DUR,
+	ret = phy_write_mmd(phydev, 0x1f, LED_BLK_DUR,
 				 LED_BLINK_DURATION(led_blink_cfg));
 	if (ret < 0)
 		return ret;
 
-	ret = an8801_cl45_write(phydev, 0x1f, LED_ON_DUR,
+	ret = phy_write_mmd(phydev, 0x1f, LED_ON_DUR,
 				 (LED_BLINK_DURATION(led_blink_cfg) >> 1));
 	if (ret < 0)
 		return ret;
@@ -406,6 +361,56 @@ static int an8801_led_init(struct phy_device *phydev)
 	return 0;
 }
 
+static int an8801_ack_interrupt(struct phy_device *phydev)
+{
+	u32 reg_val = 0;
+
+	air_buckpbus_reg_write(phydev, 0x10285404, 0x102);
+	reg_val = air_buckpbus_reg_read(phydev, 0x10285400);
+	air_buckpbus_reg_write(phydev, 0x10285400, 0x0);
+	air_buckpbus_reg_write(phydev, 0x10285400, reg_val | 0x10);
+	air_buckpbus_reg_write(phydev, 0x10285404, 0x12);
+	air_buckpbus_reg_write(phydev, 0x10285704, 0x1f);
+	return 0;
+}
+
+static int an8801_config_intr(struct phy_device *phydev)
+{
+	if (phydev->interrupts == PHY_INTERRUPT_ENABLED) {
+		air_buckpbus_reg_write(phydev, 0x1000007c, BIT(AIR_INTERRUPT_GPIO) << 16);
+		air_buckpbus_reg_modify(phydev, 0x10285700, 0x1, 0x1);
+	} else {
+		air_buckpbus_reg_write(phydev, 0x1000007c, 0x0);
+		air_buckpbus_reg_modify(phydev, 0x10285700, 0x1, 0x0);
+	}
+	an8801_ack_interrupt(phydev);
+	return 0;
+}
+
+static int an8801_did_interrupt(struct phy_device *phydev)
+{
+	u32 reg_val = 0;
+
+	reg_val = air_buckpbus_reg_read(phydev, 0x10285704);
+
+	if (reg_val & 0x11)
+		return 1;
+
+	return 0;
+}
+
+#if (KERNEL_VERSION(5, 11, 0) < LINUX_VERSION_CODE)
+static irqreturn_t an8801_handle_interrupt(struct phy_device *phydev)
+{
+	if (!an8801_did_interrupt(phydev))
+		return IRQ_NONE;
+
+	an8801_ack_interrupt(phydev);
+	phy_trigger_machine(phydev);
+	return IRQ_HANDLED;
+}
+#endif
+
 static int findClosestNumber(const u16 *arr, u16 size, u16 target)
 {
 	int left = 0, right = size - 1;
@@ -431,77 +436,77 @@ static int findClosestNumber(const u16 *arr, u16 size, u16 target)
 static int an8801sb_i2mpb_config(struct phy_device *phydev)
 {
 	int ret = 0;
-	u16 cl45_value = 0, temp_cl45 = 0, set = 0;
+	u16 cl45_value = 0, temp_cl45 = 0;
 	u16 mask = 0;
 
-	ret = an8801_cl45_read(phydev, MMD_DEV_VSPEC1, 0x12, &cl45_value);
+	cl45_value = phy_read_mmd(phydev, MMD_DEV_VSPEC1, 0x12);
 	dev_dbg(phydev_dev(phydev), "%s:%d cl45_value 0x%x!\n", __func__, __LINE__, cl45_value);
 	cl45_value = (cl45_value & GENMASK(15, 10)) + (6 << 10);
-	ret = an8801_modify_cl45_changed(phydev, MMD_DEV_VSPEC1, 0x12, GENMASK(15, 10), cl45_value);
+	ret = phy_modify_mmd(phydev, MMD_DEV_VSPEC1, 0x12, GENMASK(15, 10), cl45_value);
 	if (ret < 0)
 		return ret;
-	ret = an8801_cl45_read(phydev, MMD_DEV_VSPEC1, 0x16, &temp_cl45);
+	temp_cl45 = phy_read_mmd(phydev, MMD_DEV_VSPEC1, 0x16);
 	dev_dbg(phydev_dev(phydev), "%s:%d cl45_value 0x%x!\n", __func__, __LINE__, temp_cl45);
 	mask = GENMASK(15, 10) | GENMASK(5, 0);
 	cl45_value = (temp_cl45 & GENMASK(15, 10)) + (9 << 10);
 	cl45_value = ((temp_cl45 & GENMASK(5, 0)) + 6) | cl45_value;
-	ret = an8801_modify_cl45_changed(phydev, MMD_DEV_VSPEC1, 0x16, mask, cl45_value);
+	ret = phy_modify_mmd(phydev, MMD_DEV_VSPEC1, 0x16, mask, cl45_value);
 	if (ret < 0)
 		return ret;
-	ret = an8801_cl45_read(phydev, MMD_DEV_VSPEC1, 0x17, &cl45_value);
+	cl45_value = phy_read_mmd(phydev, MMD_DEV_VSPEC1, 0x17);
 	dev_dbg(phydev_dev(phydev), "%s:%d cl45_value 0x%x!\n", __func__, __LINE__, cl45_value);
 	cl45_value = (cl45_value & GENMASK(13, 8)) + (6 << 8);
-	ret = an8801_modify_cl45_changed(phydev, MMD_DEV_VSPEC1, 0x17, GENMASK(13, 8), cl45_value);
+	ret = phy_modify_mmd(phydev, MMD_DEV_VSPEC1, 0x17, GENMASK(13, 8), cl45_value);
 	if (ret < 0)
 		return ret;
-	ret = an8801_cl45_read(phydev, MMD_DEV_VSPEC1, 0x18, &temp_cl45);
+	temp_cl45 = phy_read_mmd(phydev, MMD_DEV_VSPEC1, 0x18);
 	dev_dbg(phydev_dev(phydev), "%s:%d cl45_value 0x%x!\n", __func__, __LINE__, temp_cl45);
 	mask = GENMASK(13, 8) | GENMASK(5, 0);
 	cl45_value = (temp_cl45 & GENMASK(13, 8)) + (9 << 8);
 	cl45_value = ((temp_cl45 & GENMASK(5, 0)) + 6) | cl45_value;
-	ret = an8801_modify_cl45_changed(phydev, MMD_DEV_VSPEC1, 0x18, mask, cl45_value);
+	ret = phy_modify_mmd(phydev, MMD_DEV_VSPEC1, 0x18, mask, cl45_value);
 	if (ret < 0)
 		return ret;
-	ret = an8801_cl45_read(phydev, MMD_DEV_VSPEC1, 0x19, &cl45_value);
+	cl45_value = phy_read_mmd(phydev, MMD_DEV_VSPEC1, 0x19);
 	dev_dbg(phydev_dev(phydev), "%s:%d cl45_value 0x%x!\n", __func__, __LINE__, cl45_value);
 	cl45_value = (cl45_value & GENMASK(13, 8)) + (6 << 8);
-	ret = an8801_modify_cl45_changed(phydev, MMD_DEV_VSPEC1, 0x19, GENMASK(13, 8), cl45_value);
+	ret = phy_modify_mmd(phydev, MMD_DEV_VSPEC1, 0x19, GENMASK(13, 8), cl45_value);
 	if (ret < 0)
 		return ret;
-	ret = an8801_cl45_read(phydev, MMD_DEV_VSPEC1, 0x20, &cl45_value);
+	cl45_value = phy_read_mmd(phydev, MMD_DEV_VSPEC1, 0x20);
 	dev_dbg(phydev_dev(phydev), "%s:%d cl45_value 0x%x!\n", __func__, __LINE__, cl45_value);
 	cl45_value = (cl45_value & GENMASK(5, 0)) + 6;
-	ret = an8801_modify_cl45_changed(phydev, MMD_DEV_VSPEC1, 0x20, GENMASK(5, 0), cl45_value);
+	ret = phy_modify_mmd(phydev, MMD_DEV_VSPEC1, 0x20, GENMASK(5, 0), cl45_value);
 	if (ret < 0)
 		return ret;
-	ret = an8801_cl45_read(phydev, MMD_DEV_VSPEC1, 0x21, &cl45_value);
+	cl45_value = phy_read_mmd(phydev, MMD_DEV_VSPEC1, 0x21);
 	dev_dbg(phydev_dev(phydev), "%s:%d cl45_value 0x%x!\n", __func__, __LINE__, cl45_value);
 	cl45_value = (cl45_value & GENMASK(13, 8)) + (6 << 8);
-	ret = an8801_modify_cl45_changed(phydev, MMD_DEV_VSPEC1, 0x21, GENMASK(13, 8), cl45_value);
+	ret = phy_modify_mmd(phydev, MMD_DEV_VSPEC1, 0x21, GENMASK(13, 8), cl45_value);
 	if (ret < 0)
 		return ret;
-	ret = an8801_cl45_read(phydev, MMD_DEV_VSPEC1, 0x22, &cl45_value);
+	cl45_value = phy_read_mmd(phydev, MMD_DEV_VSPEC1, 0x22);
 	dev_dbg(phydev_dev(phydev), "%s:%d cl45_value 0x%x!\n", __func__, __LINE__, cl45_value);
 	cl45_value = (cl45_value & GENMASK(5, 0)) + 6;
-	ret = an8801_modify_cl45_changed(phydev, MMD_DEV_VSPEC1, 0x22, GENMASK(5, 0), cl45_value);
+	ret = phy_modify_mmd(phydev, MMD_DEV_VSPEC1, 0x22, GENMASK(5, 0), cl45_value);
 	if (ret < 0)
 		return ret;
-	ret = an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0x23, 0x883);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0x24, 0x883);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0x25, 0x883);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0x26, 0x883);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0x0, 0x100);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0x1, 0x1bc);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0x2, 0x1d0);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0x3, 0x186);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0x4, 0x202);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0x5, 0x20e);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0x6, 0x300);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0x7, 0x3c0);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0x8, 0x3d0);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0x9, 0x317);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0xa, 0x206);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC1, 0xb, 0xe);
+	ret = phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0x23, 0x883);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0x24, 0x883);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0x25, 0x883);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0x26, 0x883);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0x0, 0x100);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0x1, 0x1bc);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0x2, 0x1d0);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0x3, 0x186);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0x4, 0x202);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0x5, 0x20e);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0x6, 0x300);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0x7, 0x3c0);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0x8, 0x3d0);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0x9, 0x317);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0xa, 0x206);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC1, 0xb, 0xe);
 	if (ret < 0)
 		return ret;
 
@@ -510,14 +515,14 @@ static int an8801sb_i2mpb_config(struct phy_device *phydev)
 }
 
 void update_r50_value(struct phy_device *phydev,
-			u16 *cl45_value, int pos1, int pos2)
+	u16 *cl45_value, int pos1, int pos2)
 {
 	*cl45_value &= ~(0x007f << 8);
 	*cl45_value |= ((r50ohm_table[pos1]) & 0x007f) << 8;
 	*cl45_value &= ~(0x007f);
 	*cl45_value |= (r50ohm_table[pos2]) & 0x007f;
 	dev_dbg(phydev_dev(phydev), "Read: r50ohm_tx_1=%d r50ohm_tx_2=%d\n",
-			r50ohm_table[pos1], r50ohm_table[pos2]);
+		r50ohm_table[pos1], r50ohm_table[pos2]);
 }
 
 int calculate_position(int pos, int shift, int table_size)
@@ -529,7 +534,7 @@ int calculate_position(int pos, int shift, int table_size)
 }
 
 int process_r50(struct phy_device *phydev, int reg,
-			u16 *cl45_value, u16 *r50ohm_tx_a, u16 *r50ohm_tx_b)
+	u16 *cl45_value, u16 *r50ohm_tx_a, u16 *r50ohm_tx_b)
 {
 	int pos1 = findClosestNumber(r50ohm_table, r50ohm_table_size, *r50ohm_tx_a);
 	int pos2 = findClosestNumber(r50ohm_table, r50ohm_table_size, *r50ohm_tx_b);
@@ -539,7 +544,7 @@ int process_r50(struct phy_device *phydev, int reg,
 		pos2 = calculate_position(pos2, R50_SHIFT, r50ohm_table_size);
 
 		update_r50_value(phydev, cl45_value, pos1, pos2);
-		return an8801_cl45_write(phydev, 0x1e, reg, *cl45_value);
+		return phy_write_mmd(phydev, 0x1e, reg, *cl45_value);
 	}
 	return 0;
 }
@@ -558,10 +563,10 @@ static int an8801r_of_init(struct phy_device *phydev)
 			return -1;
 		}
 		if (val < AIR_RGMII_DELAY_NOSTEP ||
-		    val > AIR_RGMII_DELAY_STEP_7) {
+			val > AIR_RGMII_DELAY_STEP_7) {
 			dev_err(phydev_dev(phydev),
-				   "airoha,rxclk-delay value %u out of range.",
-				   val);
+					"airoha,rxclk-delay value %u out of range.",
+					val);
 			return -1;
 		}
 		priv->rxdelay_force = TRUE;
@@ -574,14 +579,14 @@ static int an8801r_of_init(struct phy_device *phydev)
 		if (of_property_read_u32(of_node, "airoha,txclk-delay",
 					 &val) != 0) {
 			dev_err(phydev_dev(phydev),
-				   "airoha,txclk-delay value is invalid.");
+					"airoha,txclk-delay value is invalid.");
 			return -1;
 		}
 		if (val < AIR_RGMII_DELAY_NOSTEP ||
-		    val > AIR_RGMII_DELAY_STEP_7) {
+			val > AIR_RGMII_DELAY_STEP_7) {
 			dev_err(phydev_dev(phydev),
-				   "airoha,txclk-delay value %u out of range.",
-				   val);
+					"airoha,txclk-delay value %u out of range.",
+					val);
 			return -1;
 		}
 		priv->txdelay_force = TRUE;
@@ -603,10 +608,10 @@ static int an8801sb_of_init(struct phy_device *phydev)
 			return -1;
 		}
 		if (val < AIR_POL_TX_NOR_RX_REV ||
-		    val > AIR_POL_TX_REV_RX_NOR) {
+			val > AIR_POL_TX_REV_RX_NOR) {
 			dev_err(phydev_dev(phydev),
-				   "airoha,polarity value %u out of range.",
-				   val);
+					"airoha,polarity value %u out of range.",
+					val);
 			return -1;
 		}
 		priv->pol = val;
@@ -615,15 +620,15 @@ static int an8801sb_of_init(struct phy_device *phydev)
 
 	if (of_find_property(of_node, "airoha,surge", NULL)) {
 		if (of_property_read_u32(of_node, "airoha,surge",
-					&val) != 0) {
+					 &val) != 0) {
 			dev_err(phydev_dev(phydev), "airoha,surge value is invalid.");
 			return -1;
 		}
 		if (val < AIR_SURGE_0R ||
 			val > AIR_SURGE_5R) {
 			dev_err(phydev_dev(phydev),
-				"airoha,surge value %u out of range.",
-				val);
+					"airoha,surge value %u out of range.",
+					val);
 			return -1;
 		}
 		priv->surge = val;
@@ -693,23 +698,19 @@ int an8801sb_surge_protect_cfg(struct phy_device *phydev)
 	u16 cl45_value = 0;
 
 	if (priv->surge) {
-		ret = an8801_cl45_read(phydev, 0x1e, 0x174, &cl45_value);
-		if (ret < 0)
-			return ret;
+		cl45_value = phy_read_mmd(phydev, 0x1e, 0x174);
 		r50ohm_tx_a = (cl45_value >> 8) & 0x007f;
 		r50ohm_tx_b = cl45_value & 0x007f;
 		dev_dbg(phydev_dev(phydev), "Read: (0x174) value=0x%04x r50ohm_tx_a=%d r50ohm_tx_b=%d\n",
-		cl45_value, r50ohm_tx_a, r50ohm_tx_b);
+			cl45_value, r50ohm_tx_a, r50ohm_tx_b);
 		ret = process_r50(phydev, 0x174, &cl45_value, &r50ohm_tx_a, &r50ohm_tx_b);
 		if (ret < 0)
 			return ret;
-		ret = an8801_cl45_read(phydev, 0x1e, 0x175, &cl45_value);
-		if (ret < 0)
-			return ret;
+		cl45_value = phy_read_mmd(phydev, 0x1e, 0x175);
 		r50ohm_tx_c = (cl45_value >> 8) & 0x007f;
 		r50ohm_tx_d = cl45_value & 0x007f;
 		dev_dbg(phydev_dev(phydev), "Read: (0x175) value=0x%04x r50ohm_tx_c=%d r50ohm_tx_d=%d\n",
-		cl45_value, r50ohm_tx_c, r50ohm_tx_d);
+			cl45_value, r50ohm_tx_c, r50ohm_tx_d);
 		ret = process_r50(phydev, 0x175, &cl45_value, &r50ohm_tx_c, &r50ohm_tx_d);
 		if (ret < 0)
 			return ret;
@@ -764,10 +765,10 @@ static int an8801sb_config_init(struct phy_device *phydev)
 	dev_info(phydev_dev(phydev),
 		"Tx, Rx Polarity : %08x\n", pbus_value);
 
-	ret = an8801_cl45_write(phydev, MMD_DEV_VSPEC2, 0x600, 0x1e);
-	ret |= an8801_cl45_write(phydev, MMD_DEV_VSPEC2, 0x601, 0x02);
+	ret = phy_write_mmd(phydev, MMD_DEV_VSPEC2, 0x600, 0x1e);
+	ret |= phy_write_mmd(phydev, MMD_DEV_VSPEC2, 0x601, 0x02);
 
-	ret |= an8801_cl45_write(phydev, 7, 60, 0x0);
+	ret |= phy_write_mmd(phydev, 7, 60, 0x0);
 	if (ret != 0) {
 		dev_err(phydev_dev(phydev),
 			"AN8801SB initialize fail, ret %d !\n", ret);
@@ -940,7 +941,7 @@ static ssize_t an8801_polarity_write(struct file *file, const char __user *ptr,
 }
 
 static ssize_t an8801_mdio_write(struct file *file, const char __user *ptr,
-				size_t len, loff_t *off)
+					size_t len, loff_t *off)
 {
 	struct phy_device *phydev = file->private_data;
 	char buf[64], param1[32], param2[32];
@@ -955,7 +956,7 @@ static ssize_t an8801_mdio_write(struct file *file, const char __user *ptr,
 	if (count > sizeof(buf) - 1)
 		return -EINVAL;
 	if (copy_from_user(buf, ptr, len))
-	return -EFAULT;
+		return -EFAULT;
 
 	ret = sscanf(buf, "%s %s", param1, param2);
 	if (ret < 0)
@@ -991,16 +992,16 @@ static ssize_t an8801_mdio_write(struct file *file, const char __user *ptr,
 			pr_notice("\nphy=0x%x, devad=0x%x, reg=0x%x, val=0x%x\n",
 				phydev_phy_addr(phydev), devad, reg, val);
 
-			ret = an8801_cl45_write(phydev, devad, reg, val);
+			ret = phy_write_mmd(phydev, devad, reg, val);
 			if (ret < 0)
 				return ret;
-			an8801_cl45_read(phydev, devad, reg, &reg_val);
+			reg_val = phy_read_mmd(phydev, devad, reg);
 			pr_notice("\nphy=0x%x, devad=0x%x, reg=0x%x, val=0x%x confirm..\n",
 				phydev_phy_addr(phydev), devad, reg, reg_val);
 		} else if (!strncmp("r", param2, strlen("r"))) {
 			if (sscanf(buf, "cl45 r %x %x", &devad, &reg) == -1)
 				return -EFAULT;
-			an8801_cl45_read(phydev, devad, reg, &reg_val);
+			reg_val = phy_read_mmd(phydev, devad, reg);
 			pr_notice("\nphy=0x%x, devad=0x%x, reg=0x%x, val=0x%x\n",
 				phydev_phy_addr(phydev), devad, reg, reg_val);
 		} else {
@@ -1020,7 +1021,6 @@ static int an8801_counter_show(struct seq_file *seq, void *v)
 	struct phy_device *phydev = seq->private;
 	int ret = 0;
 	u32 pkt_cnt = 0;
-	struct mii_bus *mbus = phydev_mdiobus(phydev);
 
 	seq_puts(seq, "==========AIR PHY COUNTER==========\n");
 	seq_puts(seq, "|\t<<SERDES COUNTER>>\n");
@@ -1143,8 +1143,9 @@ static ssize_t an8801_debugfs_pbus(struct file *file,
 	if (buf[0] == 'w') {
 		if (sscanf(buf, "w %x %x", &reg, &val) == -1)
 			return -EFAULT;
+
 		pr_notice("\nphy=0x%x, reg=0x%x, val=0x%x\n",
-			phydev_phy_addr(phydev), reg, val);
+				phydev_phy_addr(phydev), reg, val);
 
 		ret = air_buckpbus_reg_write(phydev, reg, val);
 		if (ret < 0)
@@ -1188,10 +1189,9 @@ int an8801_info_show(struct seq_file *seq, void *v)
 	for (reg = MII_BMCR; reg <= MII_STAT1000; reg++) {
 		if ((reg <= MII_LPA) || (reg >= MII_CTRL1000))
 			seq_printf(seq, "| RG_MII 0x%02x     : 0x%08x\n",
-			reg, phy_read(phydev, reg));
+				reg, phy_read(phydev, reg));
 	}
 	seq_puts(seq, "\n");
-
 	return 0;
 }
 
@@ -1231,10 +1231,10 @@ static const struct file_operations an8801_polarity_fops = {
 };
 
 static const struct file_operations an8801_mdio_fops = {
-   .owner = THIS_MODULE,
-   .open = simple_open,
-   .write = an8801_mdio_write,
-   .llseek = noop_llseek,
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = an8801_mdio_write,
+	.llseek = noop_llseek,
 };
 
 int an8801_debugfs_init(struct phy_device *phydev)
@@ -1354,13 +1354,22 @@ static int an8801sb_read_status(struct phy_device *phydev)
 	if (phydev->link == LINK_DOWN) {
 		prespeed = 0;
 		phydev->speed = 0;
-		ret |= an8801_cl45_write(
+		ret |= phy_write_mmd(
 			phydev, MMD_DEV_VSPEC2, PHY_PRE_SPEED_REG, prespeed);
+
+		mdelay(10);        /* delay 10 ms */
+		reg_value = air_buckpbus_reg_read(phydev, 0x10220010);
+		reg_value &= 0x7fff;
+		air_buckpbus_reg_write(phydev, 0x10220010, reg_value);
+
+		reg_value = air_buckpbus_reg_read(phydev, 0x10220000);
+		reg_value |= AN8801SB_SGMII_AN0_ANRESTART;
+		air_buckpbus_reg_write(phydev, 0x10220000, reg_value);
 	}
 
 	if (prespeed != phydev->speed && phydev->link == LINK_UP) {
 		prespeed = phydev->speed;
-		ret |= an8801_cl45_write(
+		ret |= phy_write_mmd(
 			phydev, MMD_DEV_VSPEC2, PHY_PRE_SPEED_REG, prespeed);
 		dev_info(phydev_dev(phydev), "AN8801SB SPEED %d\n", prespeed);
 		while (an_retry > 0) {
@@ -1374,28 +1383,19 @@ static int an8801sb_read_status(struct phy_device *phydev)
 		mdelay(10);        /* delay 10 ms */
 
 
-		if (phydev->autoneg == AUTONEG_DISABLE) {
-			dev_info(phydev_dev(phydev),
-				"AN8801SB force speed = %d\n", prespeed);
-			if (prespeed == SPEED_1000) {
-				air_buckpbus_reg_write(
-					phydev, 0x10220010, 0xd801);
-			} else if (prespeed == SPEED_100) {
-				air_buckpbus_reg_write(
-					phydev, 0x10220010, 0xd401);
-			} else {
-				air_buckpbus_reg_write(
-					phydev, 0x10220010, 0xd001);
-			}
-
-			reg_value = air_buckpbus_reg_read(
-				phydev, 0x10220000);
-			reg_value |= AN8801SB_SGMII_AN0_ANRESTART;
+		if (prespeed == SPEED_1000) {
 			air_buckpbus_reg_write(
-				phydev, 0x10220000, reg_value);
+				phydev, 0x10220010, 0xd801);
+		} else if (prespeed == SPEED_100) {
+			air_buckpbus_reg_write(
+				phydev, 0x10220010, 0xd401);
+		} else {
+			air_buckpbus_reg_write(
+				phydev, 0x10220010, 0xd001);
 		}
+
 		reg_value = air_buckpbus_reg_read(phydev, 0x10220000);
-		reg_value |= AN8801SB_SGMII_AN0_RESET;
+		reg_value |= (AN8801SB_SGMII_AN0_RESET | AN8801SB_SGMII_AN0_ANRESTART);
 		air_buckpbus_reg_write(phydev, 0x10220000, reg_value);
 	}
 	return ret;
@@ -1451,9 +1451,12 @@ static struct phy_driver airoha_driver[] = {
 		.probe          = an8801_phy_probe,
 		.remove         = an8801_phy_remove,
 		.read_status    = an8801_read_status,
-#if (KERNEL_VERSION(4, 5, 0) < LINUX_VERSION_CODE)
-		.read_mmd       = __an8801_cl45_read,
-		.write_mmd      = __an8801_cl45_write,
+		.config_intr	= an8801_config_intr,
+#if (KERNEL_VERSION(5, 11, 0) < LINUX_VERSION_CODE)
+		.handle_interrupt = an8801_handle_interrupt,
+#else
+		.did_interrupt	= an8801_did_interrupt,
+		.ack_interrupt	= an8801_ack_interrupt,
 #endif
 	}
 };

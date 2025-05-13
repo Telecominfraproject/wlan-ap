@@ -587,7 +587,7 @@ static int en8801s_phase1_init(struct phy_device *phydev)
 
 	phydev->dev_flags = PHY_STATE_INIT;
 
-	dev_info(dev, "Phase1 initialize OK ! (%s)\n", EN8801S_DRIVER_VERSION);
+	dev_info(dev, "Phase1 initialize OK ! (%s) 10Te TP_IDL fixed.\n", EN8801S_DRIVER_VERSION);
 	if (priv->pro_version == 4) {
 		ret = en8801s_phase2_init(phydev);
 		if (ret != 0) {
@@ -811,14 +811,7 @@ static int en8801s_phase2_init(struct phy_device *phydev)
 		retry--;
 	}
 	pbus_data = airoha_pbus_read(mbus, pbus_addr, 0x1C38); /* RAW#2 */
-	ret = airoha_cl45_read(mbus, phy_addr, 0x1E, 0x12, &cl45_value);
-	if (ret < 0)
-		return ret;
-	GPHY_RG_1E_012.DATA = cl45_value;
-	GPHY_RG_1E_012.DataBitField.da_tx_i2mpb_a_tbt =
-				(u16)(pbus_data & 0x03f);
-	ret = airoha_cl45_write(mbus, phy_addr, 0x1E, 0x12,
-				GPHY_RG_1E_012.DATA);
+	ret = airoha_cl45_write(mbus, phy_addr, 0x1E, 0x12, 0xA018);
 	if (ret < 0)
 		return ret;
 	ret = airoha_cl45_read(mbus, phy_addr, 0x1E, 0x17, &cl45_value);
@@ -892,6 +885,17 @@ static int en8801s_phase2_init(struct phy_device *phydev)
 			mdelay(10);
 		}
 	}
+
+	//Fix 10Te TP_IDL
+	ret = airoha_cl45_read(mbus, phy_addr, 0x1E,
+				0x1A3, &cl45_value);
+	if (ret < 0)
+		return ret;
+	cl45_value &= ~0xf0;
+	ret = airoha_cl45_write(mbus, phy_addr, 0x1E,
+				0x1A3, cl45_value);
+	if (ret < 0)
+		return ret;
 
 	priv->first_init = false;
 	dev_info(phydev_dev(phydev), "Phase2 initialize OK !\n");
