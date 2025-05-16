@@ -19,6 +19,7 @@ switch(board_name) {
 case 'edgecore,eap105':
 case 'edgecore,oap101-6e':
 case 'edgecore,oap101e-6e':
+case 'zyxel,nwa130be':
     num_radios = 3;
     break;
 }
