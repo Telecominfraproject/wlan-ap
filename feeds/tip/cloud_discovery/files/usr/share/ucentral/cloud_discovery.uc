@@ -5,6 +5,7 @@ import * as fs from 'fs';
 
 let cmd = ARGV[0];
 let ifname = getenv("interface");
+let opt224 = getenv("opt138");
 let opt224 = getenv("opt224");
 
 if (cmd != 'bound' && cmd != 'renew')
@@ -21,6 +22,13 @@ if (file.server && file.port && file.valid)
 let cloud = {
 	lease: true,
 };
+if (opt138) {
+	let dhcp = hexdec(opt138);
+	dhcp = split(dhcp, ':');
+	cloud.dhcp_server = dhcp[0];
+	cloud.dhcp_port = dhcp[1] ?? 15002;
+	cloud.no_validation = true;
+}
 if (opt224) {
 	let dhcp = hexdec(opt224);
 	dhcp = split(dhcp, ':');
@@ -29,7 +37,7 @@ if (opt224) {
 }
 fs.writefile('/tmp/cloud.json', cloud);
 
-if (opt224 && cmd == 'renew') {
+if ((opt138 || opt224) && cmd == 'renew') {
 	let ubus = libubus.connect();
 	ubus.call('cloud', 'renew');
 }
