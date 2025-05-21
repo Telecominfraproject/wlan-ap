@@ -48,6 +48,11 @@ $(call Package/ath12k-wifi-default)
     TITLE:=board-2.bin for RAP7710c_341x
 endef
 
+define Package/ath12k-wifi-sonicfi-rap750e-h
+$(call Package/ath12k-wifi-default)
+    TITLE:=board-2.bin for RAP750e_h
+endef
+
 define Package/ath12k-wifi-sonicfi-rap750w-311a
 $(call Package/ath12k-wifi-default)
     TITLE:=board-2.bin for RAP750W_311a
@@ -78,6 +83,11 @@ $(call Package/ath12k-wifi-default)
     TITLE:=board-2.bin for WF672
 endef
 
+define Package/ath12k-wifi-zyxel-nwa130be
+$(call Package/ath12k-wifi-default)
+    TITLE:=board-2.bin for NWA130BE
+endef
+
 define Package/ath12k-wifi-cig-wf189/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
@@ -97,6 +107,15 @@ define Package/ath12k-wifi-sonicfi-rap7110c-341x/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
 	$(INSTALL_DATA) ./board-2.bin.rap7110c_341x.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin
 	$(INSTALL_DATA) ./board-2.bin.rap7110c_341x.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
+endef
+
+define Package/ath12k-wifi-sonicfi-rap750e-h/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN6432/hw1.0/
+	$(INSTALL_DATA) ./board-2.bin.rap750e_h.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
+	$(INSTALL_DATA) ./board-2.bin.rap750e_h.QCN6432 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/board-2.bin
+#	$(INSTALL_DATA) ./ipq5332_qcn6432.regdb $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/regdb.bin
+	$(INSTALL_DATA) ./ipq5332_qcn6432.regdb $(1)/lib/firmware/ath12k/QCN6432/hw1.0/regdb.bin
 endef
 
 define Package/ath12k-wifi-sonicfi-rap750w-311a/install
@@ -139,6 +158,7 @@ define Package/ath12k-wifi-sercomm-ap72tip-v4/install
 	$(INSTALL_DATA) ./board-2.bin.ap72tip-v4.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
 endef
 
+
 define Package/ath12k-wifi-cig-wf672/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
@@ -146,12 +166,21 @@ define Package/ath12k-wifi-cig-wf672/install
 	$(INSTALL_DATA) ./board-2.bin.wf672.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
 endef
 
+define Package/ath12k-wifi-zyxel-nwa130be/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
+	$(INSTALL_DATA) ./board-2.bin.nwa130be.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin
+	$(INSTALL_DATA) ./board-2.bin.nwa130be.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
+endef
+
 $(eval $(call BuildPackage,ath12k-wifi-cig-wf189))
 $(eval $(call BuildPackage,ath12k-wifi-edgecore-eap105))
 $(eval $(call BuildPackage,ath12k-wifi-sonicfi-rap7110c-341x))
+$(eval $(call BuildPackage,ath12k-wifi-sonicfi-rap750e-h))
 $(eval $(call BuildPackage,ath12k-wifi-sonicfi-rap750w-311a))
 $(eval $(call BuildPackage,ath12k-wifi-cig-wf189w))
 $(eval $(call BuildPackage,ath12k-wifi-cig-wf189h))
 $(eval $(call BuildPackage,ath12k-wifi-sercomm-ap72tip))
 $(eval $(call BuildPackage,ath12k-wifi-sercomm-ap72tip-v4))
 $(eval $(call BuildPackage,ath12k-wifi-cig-wf672))
+$(eval $(call BuildPackage,ath12k-wifi-zyxel-nwa130be))

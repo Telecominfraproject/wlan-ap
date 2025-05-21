@@ -163,14 +163,18 @@ platform_do_upgrade() {
 		;;
 	sonicfi,rap7110c-341x)
 		sonicfi_dualimage_check
-		emmc_do_upgrade $1 $1
+		emmc_do_upgrade "$1"
 		;;
+	sonicfi,rap750e-h|\
 	sonicfi,rap750w-311a)
 		sonicfi_dualimage_check
 		nand_upgrade_tar "$1"
 		;;
 	sercomm,ap72tip-v4|\
 	sercomm,ap72tip)
+		nand_upgrade_tar "$1"
+		;;
+	zyxel,nwa130be)
 		nand_upgrade_tar "$1"
 		;;
 	esac

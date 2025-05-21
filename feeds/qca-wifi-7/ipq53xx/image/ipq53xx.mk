@@ -65,6 +65,20 @@ define Device/sonicfi_rap7110c_341x
 endef
 TARGET_DEVICES += sonicfi_rap7110c_341x
 
+define Device/sonicfi_rap750e_h
+  DEVICE_TITLE := SONICFI RAP750E-H
+  DEVICE_DTS := ipq5332-sonicfi-rap750e-h
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_DTS_CONFIG := config@mi01.3-c2
+  SUPPORTED_DEVICES := sonicfi,rap750e-h
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/nand-factory.ubi := append-ubi
+  DEVICE_PACKAGES := ath12k-wifi-sonicfi-rap750e-h ath12k-firmware-ipq5332-peb -ath12k-firmware-qcn92xx
+endef
+TARGET_DEVICES += sonicfi_rap750e_h
+
 define Device/sonicfi_rap750w_311a
   DEVICE_TITLE := SONICFI RAP750W-311A
   DEVICE_DTS := ipq5332-sonicfi-rap750w-311a
@@ -117,3 +131,19 @@ define Device/cig_wf672
   DEVICE_PACKAGES := ath12k-wifi-cig-wf672 ath12k-firmware-ipq5332 ath12k-firmware-qcn92xx
 endef
 TARGET_DEVICES += cig_wf672
+
+define Device/zyxel_nwa130be
+  DEVICE_TITLE := Zyxel NWA130BE
+  DEVICE_DTS := ipq5332-zyxel-nwa130be
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_DTS_CONFIG := config@mi01.6
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  BLOCKSIZE := 256k
+  PAGESIZE := 4096
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/nand-factory.ubi := append-ubi
+  DEVICE_PACKAGES := ath12k-wifi-zyxel-nwa130be ath12k-firmware-qcn92xx ath12k-firmware-ipq5332
+endef
+TARGET_DEVICES += zyxel_nwa130be
+
