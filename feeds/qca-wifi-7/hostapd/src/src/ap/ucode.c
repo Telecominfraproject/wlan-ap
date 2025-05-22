@@ -785,6 +785,7 @@ int hostapd_ucode_sta_auth(struct hostapd_data *hapd, struct sta_info *sta)
 
 void hostapd_ucode_sta_connected(struct hostapd_data *hapd, struct sta_info *sta)
 {
+	struct hostapd_sta_wpa_psk_short *psk = sta->psk;
 	char addr[sizeof(MACSTR)];
 	uc_value_t *val, *cur;
 	int ret = 0;
@@ -801,6 +802,8 @@ void hostapd_ucode_sta_connected(struct hostapd_data *hapd, struct sta_info *sta
 	val = ucv_object_new(vm);
 	if (sta->psk_idx)
 		ucv_object_add(val, "psk_idx", ucv_int64_new(sta->psk_idx - 1));
+	if (sta->psk)
+		ucv_object_add(val, "psk", ucv_string_new(sta->psk->passphrase));
 	uc_value_push(ucv_get(val));
 
 	val = wpa_ucode_call(3);
