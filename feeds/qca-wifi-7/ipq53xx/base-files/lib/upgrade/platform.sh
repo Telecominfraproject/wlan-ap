@@ -117,6 +117,7 @@ platform_do_upgrade() {
 		emmc_do_upgrade "$1"
 		;;
 	sonicfi,rap750e-h|\
+	sonicfi,rap750e-s|\
 	sonicfi,rap750w-311a)
 		sonicfi_dualimage_check
 		nand_upgrade_tar "$1"
