@@ -79,6 +79,20 @@ define Device/sonicfi_rap750e_h
 endef
 TARGET_DEVICES += sonicfi_rap750e_h
 
+define Device/sonicfi_rap750e_s
+  DEVICE_TITLE := SONICFI RAP750E-S
+  DEVICE_DTS := ipq5332-sonicfi-rap750e-s
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_DTS_CONFIG := config@mi01.3-c2
+  SUPPORTED_DEVICES := sonicfi,rap750e-s
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/nand-factory.ubi := append-ubi
+  DEVICE_PACKAGES := ath12k-wifi-sonicfi-rap750e-s ath12k-firmware-ipq5332-peb -ath12k-firmware-qcn92xx
+endef
+TARGET_DEVICES += sonicfi_rap750e_s
+
 define Device/sonicfi_rap750w_311a
   DEVICE_TITLE := SONICFI RAP750W-311A
   DEVICE_DTS := ipq5332-sonicfi-rap750w-311a
@@ -134,3 +148,15 @@ define Device/zyxel_nwa130be
   DEVICE_PACKAGES := ath12k-wifi-zyxel-nwa130be ath12k-firmware-qcn92xx ath12k-firmware-ipq5332
 endef
 TARGET_DEVICES += zyxel_nwa130be
+
+define Device/cig_wf672
+  DEVICE_TITLE := CIG WF672
+  DEVICE_DTS := ipq5332-cig-wf672
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_DTS_CONFIG := config@mi01.6
+  IMAGES := sysupgrade.tar mmc-factory.bin
+  IMAGE/mmc-factory.bin := append-ubi | qsdk-ipq-factory-mmc
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  DEVICE_PACKAGES := ath12k-wifi-cig-wf672 ath12k-firmware-ipq5332 ath12k-firmware-qcn92xx
+endef
+TARGET_DEVICES += cig_wf672

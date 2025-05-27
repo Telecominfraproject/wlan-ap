@@ -702,3 +702,44 @@ define KernelPackage/llcc_perfmon/description
 endef
 
 $(eval $(call KernelPackage,llcc_perfmon))
+
+define KernelPackage/input-lsm303agr
+  SUBMENU:=$(OTHER_MENU)
+  TITLE:=LSM303AGR Driver
+  DEPENDS+=@TARGET_ipq53xx
+  KCONFIG:=CONFIG_INPUT_LSM303AGR=y
+endef
+
+define KernelPackage/input-lsm303agr/description
+  lsm303agr driver support
+endef
+
+$(eval $(call KernelPackage,input-lsm303agr))
+
+define KernelPackage/rtl8221d-phy
+  SUBMENU:=$(OTHER_MENU)
+  TITLE:=RTL8221d PHY Driver
+  DEPENDS+=@TARGET_ipq53xx
+  KCONFIG:=CONFIG_RTL8221D_PHY=y
+endef
+
+define KernelPackage/rtl8221d-phy/description
+  RTL8221d PHY driver support
+endef
+
+$(eval $(call KernelPackage,rtl8221d-phy))
+
+define KernelPackage/iio-ilps22qs
+  SUBMENU:=$(IIO_MENU)
+  TITLE:= pressure sensors ilps22qs Driver
+  DEPENDS+=@TARGET_ipq53xx +kmod-iio-core +kmod-industrialio-triggered-buffer
+  KCONFIG:=CONFIG_ILPS22QS
+  FILES:=$(LINUX_DIR)/drivers/iio/pressure/st_ilps22qs.ko
+  AUTOLOAD:=$(call AutoLoad,80,st_ilps22qs)
+endef
+
+define KernelPackage/iio-ilps22qs/description
+  pressure sensors ilps22qs driver support
+endef
+
+$(eval $(call KernelPackage,iio-ilps22qs))

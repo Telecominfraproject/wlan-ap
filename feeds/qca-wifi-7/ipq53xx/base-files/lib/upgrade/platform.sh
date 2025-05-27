@@ -57,6 +57,52 @@ sonicfi_dualimage_check() {
 	fi
 }
 
+spi_nor_emmc_do_upgrade_bootconfig() {
+	local tar_file="$1"
+
+	local board_dir=$(tar tf $tar_file | grep -m 1 '^sysupgrade-.*/$')
+	board_dir=${board_dir%/}
+	[ -f /proc/boot_info/bootconfig0/getbinary_bootconfig ] || {
+		echo "bootconfig does not exist"
+		exit
+	}
+	CI_ROOTPART="$(cat /proc/boot_info/bootconfig0/rootfs/upgradepartition)"
+	CI_KERNPART="$(cat /proc/boot_info/bootconfig0/0:HLOS/upgradepartition)"
+
+	[ -n "$CI_KERNPART" -a -n "$CI_ROOTPART" ] || {
+		echo "kernel or rootfs partition is unknown"
+		exit
+	}
+
+	local primary="0"
+	[ "$(cat /proc/boot_info/bootconfig0/rootfs/primaryboot)" = "0" ] && primary="1"
+	echo "$primary" > /proc/boot_info/bootconfig0/rootfs/primaryboot 2>/dev/null
+	echo "$primary" > /proc/boot_info/bootconfig0/0:HLOS/primaryboot 2>/dev/null
+	cp /proc/boot_info/bootconfig0/getbinary_bootconfig /tmp/bootconfig
+
+	do_flash_emmc $tar_file $CI_KERNPART $board_dir kernel
+	do_flash_emmc $tar_file $CI_ROOTPART $board_dir root
+
+	local emmcblock="$(find_mmc_part "rootfs_data")"
+	if [ -e "$emmcblock" ]; then
+		mkfs.ext4 -F "$emmcblock"
+	fi
+
+	for part in "0:BOOTCONFIG" "0:BOOTCONFIG1"; do
+				local mtdchar=$(echo $(find_mtd_chardev $part) | sed 's/^.\{5\}//')
+				if [ -n "$mtdchar" ]; then
+						echo start to update $mtdchar
+						mtd -qq write /proc/boot_info/bootconfig0/getbinary_bootconfig "/dev/${mtdchar}" 2>/dev/null && echo update mtd $mtdchar
+			   else
+						emmcblock=$(find_mmc_part $part)
+						echo erase ${emmcblock}
+						dd if=/dev/zero of=${emmcblock} 2> /dev/null
+						echo update $emmcblock
+						dd if=/tmp/bootconfig of=${emmcblock} 2> /dev/null
+				fi
+	done
+}
+
 emmc_do_upgrade() {
 	local tar_file="$1"
 	local board_dir=$(tar tf $tar_file | grep -m 1 '^sysupgrade-.*/$')
@@ -100,6 +146,9 @@ platform_do_upgrade() {
 		fi
 		nand_upgrade_tar "$1"
 		;;
+	cig,wf672)
+		spi_nor_emmc_do_upgrade_bootconfig $1
+		;;
 	edgecore,eap105)
 		if [ "$(find_mtd_chardev rootfs)" ]; then
 			CI_UBIPART="rootfs"
@@ -119,6 +168,7 @@ platform_do_upgrade() {
 		emmc_do_upgrade "$1"
 		;;
 	sonicfi,rap750e-h|\
+	sonicfi,rap750e-s|\
 	sonicfi,rap750w-311a)
 		sonicfi_dualimage_check
 		nand_upgrade_tar "$1"
