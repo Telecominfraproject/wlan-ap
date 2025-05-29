@@ -1,0 +1,181 @@
+diff -Nur a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+--- a/drivers/net/wireless/ath/ath12k/mac.c	2025-06-24 15:49:49.813180049 +0800
++++ b/drivers/net/wireless/ath/ath12k/mac.c	2025-06-24 15:50:19.499525336 +0800
+@@ -10451,6 +10451,30 @@
+ 	return 0;
+ }
+ 
++int ath12k_mac_set_antenna(struct ath12k *ar, u32 tx_ant, u32 rx_ant)
++{
++    int ret;
++    
++    if (!tx_ant || !rx_ant) {
++        ath12k_warn(ar->ab, "Invalid chainmask tx=0x%x rx=0x%x\n", tx_ant, rx_ant);
++        return -EINVAL;
++    }
++
++    /* return if it is no changed */
++    if (ar->cfg_tx_chainmask == tx_ant && ar->cfg_rx_chainmask == rx_ant)
++        return 0;
++
++    mutex_lock(&ar->conf_mutex);
++    ret = __ath12k_set_antenna(ar, tx_ant, rx_ant);
++    if (!ret) {
++        ar->cfg_tx_chainmask = tx_ant;
++        ar->cfg_rx_chainmask = rx_ant;
++    }
++    mutex_unlock(&ar->conf_mutex);
++
++    return ret;
++}
++
+ static void ath12k_mgmt_over_wmi_tx_drop(struct ath12k *ar, struct sk_buff *skb)
+ {
+ 	int num_mgmt = 0;
+diff -Nur a/drivers/net/wireless/ath/ath12k/mac.h b/drivers/net/wireless/ath/ath12k/mac.h
+--- a/drivers/net/wireless/ath/ath12k/mac.h	2025-06-24 15:49:49.719178955 +0800
++++ b/drivers/net/wireless/ath/ath12k/mac.h	2025-06-24 15:50:19.500525348 +0800
+@@ -168,6 +168,7 @@
+ 
+ extern const struct htt_rx_ring_tlv_filter ath12k_mac_mon_status_filter_default;
+ 
++int ath12k_mac_set_antenna(struct ath12k *ar, u32 tx_ant, u32 rx_ant);
+ void ath12k_mac_set_cw_intf_detect(struct ath12k *ar, u8 intf_detect_param);
+ void ath12k_mac_set_vendor_intf_detect(struct ath12k *ar, u8 intf_detect_bitmap);
+ void ath12k_mac_ap_ps_recalc(struct ath12k *ar);
+diff -Nur a/drivers/net/wireless/ath/ath12k/thermal.c b/drivers/net/wireless/ath/ath12k/thermal.c
+--- a/drivers/net/wireless/ath/ath12k/thermal.c	2025-06-24 15:49:49.388175103 +0800
++++ b/drivers/net/wireless/ath/ath12k/thermal.c	2025-06-24 15:50:19.500525348 +0800
+@@ -401,8 +401,25 @@
+ 	complete(&ar->thermal.wmi_sync);
+ }
+ 
++static void ath12k_thermal_antenna_switch_work(struct work_struct *work) {
++    struct ath12k_thermal_work *thermal_work = container_of(work, struct ath12k_thermal_work, work);
++    struct ath12k *ar = thermal_work->ar;
++    int ret;
++
++    ret = ath12k_mac_set_antenna(ar, thermal_work->tx_mask, thermal_work->rx_mask);
++    if (ret) {
++        ath12k_warn(ar->ab, "Radio %d: Failed to set antenna (tx=0x%x rx=0x%x, err=%d)\n",
++                   ar->pdev_idx, thermal_work->tx_mask, thermal_work->rx_mask, ret);
++    }
++    kfree(thermal_work);
++}
++
+ void ath12k_thermal_event_throt_level(struct ath12k *ar, int curr_level)
+ {
++	int temp = ar->thermal.temperature;
++    	u32 tx_mask, rx_mask;
++    	bool need_switch = false;
++
+ 	if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION, ar->ab->wmi_ab.svc_map) &&
+ 	    curr_level >= ENHANCED_THERMAL_LEVELS)
+ 		return;
+@@ -416,7 +433,37 @@
+ 	else
+ 		ar->thermal.throttle_state =
+ 			tt_level_configs[ATH12K_DEFAULT_THERMAL_LEVEL][curr_level].dcoffpercent;
+-	spin_unlock_bh(&ar->data_lock);
++	
++	/* configure ant mode */
++	if (temp >= 110 && ar->cfg_tx_chainmask != 0x1) {
++        	tx_mask = 0x1;
++        	rx_mask = 0x1;
++        	need_switch = true;
++    	} else if (temp <= 105 && ar->cfg_tx_chainmask != ar->thermal.default_tx_chainmask) {
++        	tx_mask = ar->thermal.default_tx_chainmask;
++        	rx_mask = ar->thermal.default_rx_chainmask;
++        	need_switch = true;
++    	}
++
++    	spin_unlock_bh(&ar->data_lock);
++
++    /* set param async*/ 
++    if (need_switch) {
++        struct ath12k_thermal_work *work = kmalloc(sizeof(*work), GFP_ATOMIC);
++        if (work) {
++            work->ar = ar;
++            work->tx_mask = tx_mask;
++            work->rx_mask = rx_mask;
++            INIT_WORK(&work->work, ath12k_thermal_antenna_switch_work);
++            schedule_work(&work->work);
++            
++            ath12k_info(ar->ab, "Radio %d: Temp %d°C, %s → %s antenna (level=%d)\n",
++                       ar->pdev_idx, temp,
++                       (ar->cfg_tx_chainmask > 0x1) ? "dual" : "single",
++                       (tx_mask > 0x1) ? "dual" : "single",
++                       curr_level);
++        }
++    }
+ }
+ 
+ static SENSOR_DEVICE_ATTR(temp1_input, 0444, ath12k_thermal_show_temp,
+@@ -459,6 +506,11 @@
+ 			param.levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][level].priority = 0;
+ 			param.levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][level].pout_reduction_db =
+ 				tt_level_configs[ATH12K_ENHANCED_THERMAL_LEVEL][level].pout_reduction_db;
++
++                        ath12k_info(NULL, "Using low=%d, high=%d; throttle_state=%d\n", 
++                                       param.levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][level].tmplwm,
++                                       param.levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][level].tmphwm,
++                                       param.levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][level].dcoffpercent);
+ 		}
+ 	} else {
+ 		tt_level_configs[ATH12K_DEFAULT_THERMAL_LEVEL][0].dcoffpercent = throttle_state;
+@@ -494,6 +546,10 @@
+ 	for (i = 0; i < ab->num_radios; i++) {
+ 		pdev = &ab->pdevs[i];
+ 		ar = pdev->ar;
++
++		ar->thermal.default_tx_chainmask = ar->pdev->cap.tx_chain_mask;
++        	ar->thermal.default_rx_chainmask = ar->pdev->cap.rx_chain_mask;
++
+ 		if (!ar)
+ 			continue;
+ 
+diff -Nur a/drivers/net/wireless/ath/ath12k/thermal.h b/drivers/net/wireless/ath/ath12k/thermal.h
+--- a/drivers/net/wireless/ath/ath12k/thermal.h	2025-06-24 15:49:49.388175103 +0800
++++ b/drivers/net/wireless/ath/ath12k/thermal.h	2025-06-24 15:53:27.288704303 +0800
+@@ -22,15 +22,15 @@
+ #define ATH12K_THERMAL_LVL3_TEMP_HIGH_MARK 120
+ 
+ #define ATH12K_THERMAL_LVL0_V2_TEMP_LOW_MARK -100
+-#define ATH12K_THERMAL_LVL0_V2_TEMP_HIGH_MARK 95
+-#define ATH12K_THERMAL_LVL1_V2_TEMP_LOW_MARK 90
+-#define ATH12K_THERMAL_LVL1_V2_TEMP_HIGH_MARK 100
+-#define ATH12K_THERMAL_LVL2_V2_TEMP_LOW_MARK 95
+-#define ATH12K_THERMAL_LVL2_V2_TEMP_HIGH_MARK 105
+-#define ATH12K_THERMAL_LVL3_V2_TEMP_LOW_MARK 100
+-#define ATH12K_THERMAL_LVL3_V2_TEMP_HIGH_MARK 110
+-#define ATH12K_THERMAL_LVL4_V2_TEMP_LOW_MARK 105
+-#define ATH12K_THERMAL_LVL4_V2_TEMP_HIGH_MARK 120
++#define ATH12K_THERMAL_LVL0_V2_TEMP_HIGH_MARK 100
++#define ATH12K_THERMAL_LVL1_V2_TEMP_LOW_MARK 95
++#define ATH12K_THERMAL_LVL1_V2_TEMP_HIGH_MARK 105
++#define ATH12K_THERMAL_LVL2_V2_TEMP_LOW_MARK 100
++#define ATH12K_THERMAL_LVL2_V2_TEMP_HIGH_MARK 115
++#define ATH12K_THERMAL_LVL3_V2_TEMP_LOW_MARK 110
++#define ATH12K_THERMAL_LVL3_V2_TEMP_HIGH_MARK 120
++#define ATH12K_THERMAL_LVL4_V2_TEMP_LOW_MARK 115
++#define ATH12K_THERMAL_LVL4_V2_TEMP_HIGH_MARK 125
+ 
+ #define ATH12K_THERMAL_LVL0_DUTY_CYCLE 0
+ #define ATH12K_THERMAL_LVL1_DUTY_CYCLE 50
+@@ -83,6 +83,16 @@
+ 	 * protected by data_lock
+ 	 */
+ 	int temperature;
++
++	u32 default_tx_chainmask;
++    	u32 default_rx_chainmask;
++};
++
++struct ath12k_thermal_work {
++    struct work_struct work;
++    struct ath12k *ar;
++    u32 tx_mask;
++    u32 rx_mask;
+ };
+ 
+ #ifdef CPTCFG_ATH12K_POWER_OPTIMIZATION
