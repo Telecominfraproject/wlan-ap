@@ -397,7 +397,7 @@ export function info(name) {
 			mode: data.mode,
 			channel: format_channel(data.wiphy_freq),
 			freq: format_frequency(data.wiphy_freq),
-			htmode: data.radio.htmode,
+			htmode: data?.radio?.htmode,
 			center_freq1: format_channel(data.center_freq1) || 'unknown',
 			center_freq2: format_channel(data.center_freq2) || 'unknown',
 			txpower: data.wiphy_tx_power_level / 100,
