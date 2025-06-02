@@ -76,6 +76,15 @@ define Device/edgecore_eap101
 endef
 TARGET_DEVICES += edgecore_eap101
 
+define Device/emplus_wap386v2
+  DEVICE_TITLE := Emplus WAP386v2
+  DEVICE_DTS := qcom-ipq6018-emplus-wap386v2
+  DEVICE_DTS_CONFIG := config@cp03-c1
+  SUPPORTED_DEVICES := emplus,wap386v2
+  DEVICE_PACKAGES := ath11k-wifi-qcom-ipq6018 uboot-env
+endef
+TARGET_DEVICES += emplus_wap386v2
+
 define Device/indio_um-310ax-v1
   DEVICE_TITLE := Indio UM-310AX V1
   DEVICE_DTS := qcom-ipq6018-indio-um-310ax-v1

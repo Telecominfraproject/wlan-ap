@@ -122,6 +122,7 @@ platform_check_image() {
 	wallys,dr6018|\
 	wallys,dr6018-v4|\
 	edgecore,eap101|\
+	emplus,wap386v2|\
 	hfcl,ion4xi|\
 	hfcl,ion4x|\
 	hfcl,ion4x_2|\
@@ -145,7 +146,8 @@ platform_do_upgrade() {
 	cig,wf660a)
 		spi_nor_emmc_do_upgrade_bootconfig $1
 		;;
-	cig,wf188n)
+	cig,wf188n|\
+	emplus,wap386v2)
 		[ -f /proc/boot_info/rootfs/upgradepartition ] && {
 			CI_UBIPART="$(cat /proc/boot_info/rootfs/upgradepartition)"
 			CI_BOOTCFG=1
