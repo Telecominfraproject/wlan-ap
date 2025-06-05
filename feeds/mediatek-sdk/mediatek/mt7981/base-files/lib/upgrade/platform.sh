@@ -1,6 +1,6 @@
 REQUIRE_IMAGE_METADATA=1
 
-senao_swap_active_fw() {
+swap_wap588m_active_fw() {
 	echo "Doing swap active_fw" > /dev/console
         tmp_active_fw=$(fw_printenv | grep active_fw | awk -F= {'print $2'})
 	if [ $tmp_active_fw == "0" ]; then
@@ -9,6 +9,18 @@ senao_swap_active_fw() {
 	else
 		fw_setenv active_fw 0
                 fw_setenv mtdparts nmbm0:1024k\(bl2\),512k\(u-boot-env\),2048k\(factory\),2048k\(fip\),56320k\(ubi\),56320k\(ubi_1\),384k\(cert\),640k\(userconfig\),384k\(crashdump\)
+	fi
+}
+
+senao_swap_active_fw() {
+	echo "Doing swap active_fw" > /dev/console
+	tmp_active_fw=$(fw_printenv -n active_fw)
+	if [ $tmp_active_fw == "0" ]; then
+		fw_setenv active_fw 1
+		fw_setenv mtdparts nmbm0:1024k\(bl2\),512k\(u-boot-env\),2048k\(factory\),2048k\(fip\),112640k\(ubi_1\),112640k\(ubi\),384k\(cert\),640k\(userconfig\),384k\(crashdump\)
+	else
+		fw_setenv active_fw 0
+		fw_setenv mtdparts nmbm0:1024k\(bl2\),512k\(u-boot-env\),2048k\(factory\),2048k\(fip\),112640k\(ubi\),112640k\(ubi_1\),384k\(cert\),640k\(userconfig\),384k\(crashdump\)
 	fi
 }
 
@@ -93,6 +105,9 @@ platform_post_upgrade_success() {
 		senao,iap2300m|\
 		senao,jeap6500)
 			senao_swap_active_fw
+		;;
+		emplus,wap588m)
+			swap_wap588m_active_fw
 		;;
 	esac
 }
