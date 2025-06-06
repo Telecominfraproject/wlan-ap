@@ -483,6 +483,14 @@ ifdef CONFIG_PACKAGE_kmod-mt7925e
   PKG_MAKE_FLAGS += CONFIG_MT7925E=m
 endif
 
+define Build/Prepare
+
+ifeq ($(CONFIG_TARGET_PROFILE), "DEVICE_emplus_wap588m")
+	$(CP) src/EMPLUS/3000-wifi-mt76-mt7915-emplus-wap588m-thermal-protech.patch patches/
+endif
+	$(Build/Prepare/Default)
+endef
+
 define Build/Compile
 	+$(MAKE) $(PKG_JOBS) -C "$(LINUX_DIR)" \
 		$(KERNEL_MAKE_FLAGS) \
@@ -492,6 +500,7 @@ define Build/Compile
 		modules
 	$(MAKE) -C $(PKG_BUILD_DIR)/tools
 endef
+
 
 define Build/Install
 	:
