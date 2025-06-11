@@ -56,6 +56,7 @@ void hostapd_ubus_notify_beacon_report(struct hostapd_data *hapd,
 				       size_t len);
 void hostapd_ubus_notify_radar_detected(struct hostapd_iface *iface, int frequency,
 					int chan_width, int cf1, int cf2);
+void hostapd_ubus_notify_rssi(struct hostapd_data *hapd, const char *type, const u8 *addr, int rssi);
 
 void hostapd_ubus_notify_bss_transition_response(
 	struct hostapd_data *hapd, const u8 *addr, u8 dialog_token, u8 status_code,
