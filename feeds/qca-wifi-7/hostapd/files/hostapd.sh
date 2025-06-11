@@ -121,8 +121,6 @@ hostapd_common_add_device_config() {
 	config_add_boolean legacy_rates
 	config_add_int cell_density
 	config_add_int rts_threshold
-	config_add_int rssi_reject_assoc_rssi
-	config_add_int rssi_ignore_probe_request
 	config_add_int maxassoc
 	config_add_int reg_power_type
 	config_add_boolean stationary_ap
@@ -147,7 +145,7 @@ hostapd_prepare_device_config() {
 
 	json_get_vars country country3 country_ie beacon_int:100 dtim_period:2 doth require_mode legacy_rates \
 		acs_chan_bias local_pwr_constraint spectrum_mgmt_required airtime_mode cell_density \
-		rts_threshold beacon_rate rssi_reject_assoc_rssi rssi_ignore_probe_request maxassoc \
+		rts_threshold beacon_rate maxassoc \
 		rnr_beacon mbssid:0 band reg_power_type stationary_ap acs_exclude_dfs\
 		maxassoc_ignore_probe band
 
@@ -244,8 +242,6 @@ hostapd_prepare_device_config() {
 		hostapd_add_rate brlist "$br"
 	done
 
-	[ -n "$rssi_reject_assoc_rssi" ] && append base_cfg "rssi_reject_assoc_rssi=$rssi_reject_assoc_rssi" "$N"
-	[ -n "$rssi_ignore_probe_request" ] && append base_cfg "rssi_ignore_probe_request=$rssi_ignore_probe_request" "$N"
 	[ -n "$beacon_rate" ] && append base_cfg "beacon_rate=$beacon_rate" "$N"
 	[ -n "$rlist" ] && append base_cfg "supported_rates=$rlist" "$N"
 	[ -n "$brlist" ] && append base_cfg "basic_rates=$brlist" "$N"
@@ -427,6 +423,9 @@ hostapd_common_add_bss_config() {
 
 	config_add_boolean apup
 	config_add_string apup_peer_ifname_prefix
+
+	config_add_int rssi_reject_assoc_rssi
+	config_add_int rssi_ignore_probe_request
 }
 
 hostapd_set_vlan_file() {
@@ -680,7 +679,8 @@ hostapd_set_bss_options() {
 		ppsk airtime_bss_weight airtime_bss_limit airtime_sta_weight \
 		multicast_to_unicast_all proxy_arp per_sta_vif \
 		eap_server eap_user_file ca_cert server_cert private_key private_key_passwd server_id radius_server_clients radius_server_auth_port \
-		vendor_elements fils ocv apup uci_section dynamic_probe_resp multi_psk
+		vendor_elements fils ocv apup uci_section dynamic_probe_resp multi_psk \
+		rssi_reject_assoc_rssi rssi_ignore_probe_request
 
 	set_default fils 0
 	set_default isolate 0
@@ -737,6 +737,8 @@ hostapd_set_bss_options() {
 	append bss_conf "uapsd_advertisement_enabled=$uapsd" "$N"
 	append bss_conf "utf8_ssid=$utf8_ssid" "$N"
 	append bss_conf "multi_ap=$multi_ap" "$N"
+	[ -n "$rssi_reject_assoc_rssi" ] && append bss_conf "rssi_reject_assoc_rssi=$rssi_reject_assoc_rssi" "$N"
+	[ -n "$rssi_ignore_probe_request" ] && append bss_conf "rssi_ignore_probe_request=$rssi_ignore_probe_request" "$N"
 	[ -n "$vendor_elements" ] && append bss_conf "vendor_elements=$vendor_elements" "$N"
 
 	[ "$tdls_prohibit" -gt 0 ] && append bss_conf "tdls_prohibit=$tdls_prohibit" "$N"
