@@ -1944,6 +1944,21 @@ void hostapd_ubus_notify(struct hostapd_data *hapd, const char *type, const u8 *
 	ubus_notify(ctx, &hapd->ubus.obj, type, b.head, -1);
 }
 
+void hostapd_ubus_notify_rssi(struct hostapd_data *hapd, const char *type, const u8 *addr, int rssi)
+{
+	if (!hapd->ubus.obj.has_subscribers)
+		return;
+
+	if (!addr)
+		return;
+
+	blob_buf_init(&b, 0);
+	blobmsg_add_macaddr(&b, "address", addr);
+	blobmsg_add_u32(&b, "rssi", rssi);
+
+	ubus_notify(ctx, &hapd->ubus.obj, type, b.head, -1);
+}
+
 void hostapd_ubus_notify_csa(struct hostapd_data *hapd, int freq)
 {
 	if (!hapd->ubus.obj.has_subscribers)
