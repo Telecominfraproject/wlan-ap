@@ -109,7 +109,7 @@ void parse_line(const char* line, const char* key, int* array) {
 	int values[NUM_VALUES];
 	int i;
 
-	if (sscanf(line, "%s %d %d %d %d %d", label, &values[0], &values[1], &values[2], &values[3], &values[4]) == 6) {
+	if (sscanf(line, "%s %d %d %d %d %d", label, &values[0], &values[1], &values[2], &values[3], &values[4]) == 5) {
 		for (i = 0; i < NUM_VALUES; ++i) {
 			array[i] = values[i];
 		}
@@ -119,7 +119,7 @@ void parse_line(const char* line, const char* key, int* array) {
 int load_config() {
 	FILE * fp = fopen(config_file, "r");
 	if (!fp) {
-		ULOG_ERR("opne config file error\n");
+		ULOG_ERR("open config file error\n");
 		return 1;
 	}
 
@@ -173,7 +173,7 @@ static void write_cur_state (const char *filename, int state) {
 
 	fp = fopen(filename, "w");
 	if (!fp){
-		ULOG_ERR("opne %s file error\n",filename);
+		ULOG_ERR("open %s file error\n",filename);
 	}
 	fprintf(fp, "%d", state);
 	fclose(fp);
@@ -184,7 +184,7 @@ int read_cur_state(const char *filename, char *buf, size_t buffer) {
 	
 	fp = fopen(filename, "r");
 	if (!fp) {
-		ULOG_ERR("opne %s file error\n",filename);
+		ULOG_ERR("open %s file error\n",filename);
 		return -1;
 	}
 	if (!fgets(buf, buffer, fp)) {
