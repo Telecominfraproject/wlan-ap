@@ -76,6 +76,7 @@ platform_check_image() {
 	cybertan,eww631-a1|\
 	cybertan,eww631-b1|\
 	edgecore,eap104|\
+	emplus,wap385c|\
 	wallys,dr5018|\
 	hfcl,ion4x_w|\
 	hfcl,ion4xi_w|\
@@ -129,6 +130,7 @@ platform_do_upgrade() {
                 ;;
 	cig,wf186w|\
 	cig,wf186h|\
+	emplus,wap385c|\
 	udaya,a6-id2|\
 	udaya,a6-od2|\
 	wallys,dr5018|\
