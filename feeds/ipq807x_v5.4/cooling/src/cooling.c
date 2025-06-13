@@ -66,7 +66,7 @@ u8 level_2g_low[4]={0, 105, 110, 115};
 u8 level_2g_mitigation[4]={0, 20, 50, 70};
 u8 level_5g_high[4]={105, 110, 115, 120};
 u8 level_5g_low[4]={0, 105, 110, 115};
-u8 level_5g_mitigatione[4]={0, 20, 50, 70};
+u8 level_5g_mitigation[4]={0, 20, 50, 70};
 u32 level_cpu_frequency[4]={1008000, 800000, 800000, 800000};
 #endif
 
