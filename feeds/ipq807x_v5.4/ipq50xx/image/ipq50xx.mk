@@ -154,6 +154,15 @@ define Device/edgecore_oap101e_6e
 endef
 TARGET_DEVICES += edgecore_oap101e_6e
 
+define Device/emplus_wap385c
+  DEVICE_TITLE := Emplus WAP385C
+  DEVICE_DTS := qcom-ipq5018-emplus-wap385c
+  SUPPORTED_DEVICES := emplus,wap385c
+  DEVICE_PACKAGES := ath11k-wifi-emplus-wap385c ath11k-firmware-ipq50xx-map-spruce
+  DEVICE_DTS_CONFIG := config@mp03.3
+endef
+TARGET_DEVICES += emplus_wap385c
+
 define Device/hfcl_ion4x_w
   DEVICE_TITLE := HFCL ION4x_w
   DEVICE_DTS := qcom-ipq5018-hfcl-ion4x_w
