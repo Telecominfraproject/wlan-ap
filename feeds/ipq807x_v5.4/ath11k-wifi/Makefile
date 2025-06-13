@@ -41,6 +41,7 @@ ALLWIFIBOARDS:= \
 	edgecore-oap102 \
 	edgecore-oap103 \
 	edgecore-eap104 \
+	emplus-wap385c \
 	emplus-wap386v2 \
 	liteon-wpx8324 \
 	indio-um-310ax-v1 \
@@ -405,6 +406,7 @@ $(eval $(call generate-ath11k-wifi-package,edgecore-eap102,Edgecore EAP102))
 $(eval $(call generate-ath11k-wifi-package,edgecore-oap102,Edgecore OAP102))
 $(eval $(call generate-ath11k-wifi-package,edgecore-oap103,Edgecore OAP103))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap104,Edgecore EAP104))
+$(eval $(call generate-ath11k-wifi-package,emplus-wap385c,Emplus WAP385C))
 $(eval $(call generate-ath11k-wifi-package,emplus-wap386v2,Emplus WAP386 V2))
 $(eval $(call generate-ath11k-wifi-package,liteon-wpx8324,Liteon WPX8324))
 $(eval $(call generate-ath11k-wifi-package,indio-um-310ax-v1,Indio UM-310AX V1))
