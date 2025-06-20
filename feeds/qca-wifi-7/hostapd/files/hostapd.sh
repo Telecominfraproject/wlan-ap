@@ -777,11 +777,16 @@ hostapd_set_bss_options() {
 			set_default sae_require_mfp 1
 			[ "$ppsk" -eq 0 ] && set_default sae_pwe 2
 		;;
-		psk-sae|psk2-radius|eap-eap2)
+		psk-sae|eap-eap2)
 			set_default ieee80211w 1
 			set_default sae_require_mfp 1
 			[ "$ppsk" -eq 0 ] && set_default sae_pwe 2
 		;;
+                psk2-radius)
+			set_default ieee80211w 1
+			set_default sae_require_mfp 0
+			[ "$ppsk" -eq 0 ] && set_default sae_pwe 4
+                ;;
 	esac
 	[ -n "$sae_require_mfp" ] && append bss_conf "sae_require_mfp=$sae_require_mfp" "$N"
 	[ -n "$sae_pwe" ] && append bss_conf "sae_pwe=$sae_pwe" "$N"
