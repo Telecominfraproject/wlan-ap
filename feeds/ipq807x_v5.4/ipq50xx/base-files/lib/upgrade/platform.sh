@@ -92,6 +92,7 @@ platform_check_image() {
 	edgecore,oap101|\
 	edgecore,oap101-6e|\
 	edgecore,oap101e|\
+	emplus,wap581|\
 	edgecore,oap101e-6e)
 		[ "$magic_long" = "73797375" ] && return 0
 		;;
@@ -139,6 +140,7 @@ platform_do_upgrade() {
 	optimcloud,d60-5g|\
 	optimcloud,d50|\
 	optimcloud,d50-5g|\
+	emplus,wap581|\
 	yuncore,fap655)
 		[ -f /proc/boot_info/rootfs/upgradepartition ] && {
 			CI_UBIPART="$(cat /proc/boot_info/rootfs/upgradepartition)"

@@ -239,3 +239,16 @@ define Device/glinet_b3000
   IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
 endef
 TARGET_DEVICES += glinet_b3000
+
+define Device/emplus_wap581
+  DEVICE_TITLE := Emplus WAP581
+  DEVICE_DTS := qcom-ipq5018-emplus-wap581
+  SUPPORTED_DEVICES := emplus,wap581
+  DEVICE_PACKAGES := ath11k-wifi-emplus-wap581 ath11k-firmware-ipq50xx-map-spruce
+  DEVICE_DTS_CONFIG := config@mp03.3
+  IMAGES := sysupgrade.tar nand-factory.bin
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand  
+endef
+TARGET_DEVICES += emplus_wap581
+
