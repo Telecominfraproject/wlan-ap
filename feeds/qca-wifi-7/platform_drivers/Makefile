@@ -475,6 +475,22 @@ endef
 
 $(eval $(call KernelPackage,usb-f-qdss))
 
+define KernelPackage/usb-serial-xr
+  TITLE:=USB xr Serial driver support
+  KCONFIG:=CONFIG_USB_SERIAL_XR
+  FILES:=\
+        $(LINUX_DIR)/drivers/usb/serial/xr_serial.ko
+  AUTOLOAD:=$(call AutoLoad,60,xr_serial)
+  DEPENDS:=+kmod-usb-serial
+  $(call AddPlatformDepends/usb)
+endef
+
+define KernelPackage/usb-serial-xr/description
+ USB MaxLinear/Exar USB to Serial driver
+endef
+
+$(eval $(call KernelPackage,usb-serial-xr))
+
 LEDS_MENU:=LED modules
 
 define KernelPackage/leds-tlc591xx
