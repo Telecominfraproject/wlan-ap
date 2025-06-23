@@ -63,7 +63,8 @@ ALLWIFIBOARDS:= \
 	yuncore-fap655 \
 	udaya-a6-id2 \
 	udaya-a6-od2 \
-	meshpp-s618
+	meshpp-s618 \
+	emplus-wap581
 
 ALLWIFIPACKAGES:=$(foreach BOARD,$(ALLWIFIBOARDS),ath11k-wifi-$(BOARD))
 
@@ -426,6 +427,7 @@ $(eval $(call generate-ath11k-wifi-package,yuncore-fap655,YunCore FAP655))
 $(eval $(call generate-ath11k-wifi-package,udaya-a6-id2,Udaya A6-ID2))
 $(eval $(call generate-ath11k-wifi-package,udaya-a6-od2,Udaya A6-OD2))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr5018,Wallys DR5018))
+$(eval $(call generate-ath11k-wifi-package,emplus-wap581,emplus-wap581))
 
 $(foreach PACKAGE,$(ALLWIFIPACKAGES),$(eval $(call BuildPackage,$(PACKAGE))))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq5018))
