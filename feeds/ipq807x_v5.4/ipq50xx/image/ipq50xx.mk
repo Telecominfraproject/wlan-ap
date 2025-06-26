@@ -73,6 +73,17 @@ define Device/sonicfi_rap630w_311g
 endef
 TARGET_DEVICES += sonicfi_rap630w_311g
 
+define Device/sonicfi_rap630e
+  DEVICE_TITLE := Sonicfi RAP630E
+  DEVICE_DTS := qcom-ipq5018-rap630e
+  SUPPORTED_DEVICES := sonicfi,rap630e
+  DEVICE_PACKAGES := ath11k-wifi-sonicfi-rap630e ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.5-c1
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  IMAGE/nand-factory.ubi := append-ubi
+endef
+TARGET_DEVICES += sonicfi_rap630e
+
 define Device/edgecore_eap104
   DEVICE_TITLE := EdgeCore EAP104
   DEVICE_DTS := qcom-ipq5018-eap104
