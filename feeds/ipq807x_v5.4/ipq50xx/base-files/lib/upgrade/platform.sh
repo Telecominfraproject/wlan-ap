@@ -73,6 +73,7 @@ platform_check_image() {
 	sonicfi,rap630c-311g|\
 	sonicfi,rap630w-311g|\
 	sonicfi,rap630w-312g|\
+	sonicfi,rap630e|\
 	cybertan,eww631-a1|\
 	cybertan,eww631-b1|\
 	edgecore,eap104|\
@@ -149,7 +150,8 @@ platform_do_upgrade() {
 	cybertan,eww631-b1|\
 	sonicfi,rap630c-311g|\
 	sonicfi,rap630w-311g|\
-	sonicfi,rap630w-312g)
+	sonicfi,rap630w-312g|\
+	sonicfi,rap630e)
 		boot_part=$(fw_printenv bootfrom | cut  -d = -f2)
 			echo "Current bootfrom is $boot_part"
 			if [[ $boot_part == 1 ]]; then
