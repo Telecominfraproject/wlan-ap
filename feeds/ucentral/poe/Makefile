@@ -31,9 +31,9 @@ endef
 
 define Package/poe/install
 	$(INSTALL_DIR) $(1)
-	$(INSTALL_DIR) $(1)/etc/board.d $(1)/etc/init.d
+	$(INSTALL_DIR) $(1)/etc/config $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/poe.init $(1)/etc/init.d/poe
-	$(INSTALL_BIN) ./files/05_poe $(1)/etc/board.d/05_poe
+	$(INSTALL_BIN) ./files/poe.config $(1)/etc/config/poe
 
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/tps23861-poe-ctrl $(1)/usr/bin
