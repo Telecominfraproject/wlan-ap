@@ -20,6 +20,7 @@ case 'edgecore,eap105':
 case 'edgecore,oap101-6e':
 case 'edgecore,oap101e-6e':
 case 'zyxel,nwa130be':
+case 'zyxel,nwa50be':
     num_radios = 3;
     break;
 }
