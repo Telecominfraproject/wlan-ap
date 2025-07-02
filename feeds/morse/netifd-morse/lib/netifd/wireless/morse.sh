@@ -832,6 +832,13 @@ morse_hostapd_add_bss(){
 	morse_override_hostapd_set_bss_options hostapd_cfg "$_phy" "$vif" || return 1
 	json_get_vars wds wds_bridge sae_pwe dtim_period max_listen_int start_disabled
 
+	local network_config network_values
+	json_get_values network_values network
+	network_config=$(echo "$network_values" | cut -d' ' -f1)
+
+	if [ "$wds" -gt 0 ] && [ -z "$wds_bridge" ]; then
+		wds_bridge="${network_config%%[0-9]*}"
+	fi
 
 	raw_block=
 	json_for_each_item morse_hostapd_add_raw raws
