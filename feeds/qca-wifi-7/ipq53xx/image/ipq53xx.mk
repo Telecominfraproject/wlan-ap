@@ -154,14 +154,14 @@ define Device/zyxel_nwa50be
   DEVICE_TITLE := Zyxel NWA50BE
   DEVICE_DTS := ipq5332-zyxel-nwa50be
   DEVICE_DTS_DIR := ../dts
-  DEVICE_DTS_CONFIG := config@mi01.6
+  DEVICE_DTS_CONFIG := config-mi01.3
   IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
-  BLOCKSIZE := 256k
-  PAGESIZE := 4096
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
   IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
   IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
   IMAGE/nand-factory.ubi := append-ubi
-  DEVICE_PACKAGES := ath12k-wifi-zyxel-nwa50be ath12k-firmware-qcn92xx ath12k-firmware-ipq5332
+  DEVICE_PACKAGES := ath12k-wifi-zyxel-nwa130be ath12k-firmware-qcn92xx ath12k-firmware-ipq5332
 endef
 TARGET_DEVICES += zyxel_nwa50be
 
