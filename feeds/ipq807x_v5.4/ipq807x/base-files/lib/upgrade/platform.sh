@@ -29,6 +29,7 @@ platform_check_image() {
 	edgecore,oap102|\
 	edgecore,oap103|\
 	edgecore,eap106|\
+	emplus,wap380c|\
 	sonicfi,rap650c|\
 	tplink,ex227|\
 	tplink,ex447)
@@ -48,7 +49,8 @@ platform_do_upgrade() {
 	tplink,ex227)	
 		qca_do_upgrade "$1"
 		;;
-        cig,wf196)
+    cig,wf196|\
+	emplus,wap380c)
                 [ -f /proc/boot_info/rootfs/upgradepartition ] && {
                         CI_UBIPART="$(cat /proc/boot_info/rootfs/upgradepartition)"
                         CI_BOOTCFG=1
