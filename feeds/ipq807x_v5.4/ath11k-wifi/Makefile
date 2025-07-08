@@ -41,8 +41,10 @@ ALLWIFIBOARDS:= \
 	edgecore-oap102 \
 	edgecore-oap103 \
 	edgecore-eap104 \
+	emplus-wap380c \
 	emplus-wap385c \
 	emplus-wap386v2 \
+	emplus-wap581 \
 	liteon-wpx8324 \
 	indio-um-310ax-v1 \
 	indio-um-510axp-v1 \
@@ -64,8 +66,7 @@ ALLWIFIBOARDS:= \
 	yuncore-fap655 \
 	udaya-a6-id2 \
 	udaya-a6-od2 \
-	meshpp-s618 \
-	emplus-wap581
+	meshpp-s618
 
 ALLWIFIPACKAGES:=$(foreach BOARD,$(ALLWIFIBOARDS),ath11k-wifi-$(BOARD))
 
@@ -408,8 +409,10 @@ $(eval $(call generate-ath11k-wifi-package,edgecore-eap102,Edgecore EAP102))
 $(eval $(call generate-ath11k-wifi-package,edgecore-oap102,Edgecore OAP102))
 $(eval $(call generate-ath11k-wifi-package,edgecore-oap103,Edgecore OAP103))
 $(eval $(call generate-ath11k-wifi-package,edgecore-eap104,Edgecore EAP104))
+$(eval $(call generate-ath11k-wifi-package,emplus-wap380c,Emplus WAP380C))
 $(eval $(call generate-ath11k-wifi-package,emplus-wap385c,Emplus WAP385C))
 $(eval $(call generate-ath11k-wifi-package,emplus-wap386v2,Emplus WAP386 V2))
+$(eval $(call generate-ath11k-wifi-package,emplus-wap581,Emplus WAP581))
 $(eval $(call generate-ath11k-wifi-package,liteon-wpx8324,Liteon WPX8324))
 $(eval $(call generate-ath11k-wifi-package,indio-um-310ax-v1,Indio UM-310AX V1))
 $(eval $(call generate-ath11k-wifi-package,indio-um-510axp-v1,Indio UM-510AXP V1))
@@ -429,7 +432,6 @@ $(eval $(call generate-ath11k-wifi-package,yuncore-fap655,YunCore FAP655))
 $(eval $(call generate-ath11k-wifi-package,udaya-a6-id2,Udaya A6-ID2))
 $(eval $(call generate-ath11k-wifi-package,udaya-a6-od2,Udaya A6-OD2))
 $(eval $(call generate-ath11k-wifi-package,wallys-dr5018,Wallys DR5018))
-$(eval $(call generate-ath11k-wifi-package,emplus-wap581,emplus-wap581))
 
 $(foreach PACKAGE,$(ALLWIFIPACKAGES),$(eval $(call BuildPackage,$(PACKAGE))))
 $(eval $(call BuildPackage,ath11k-wifi-qcom-ipq5018))

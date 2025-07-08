@@ -57,6 +57,15 @@ define Device/edgecore_eap106
 endef
 #TARGET_DEVICES += edgecore_eap106
 
+define Device/emplus_wap380c
+  DEVICE_TITLE := Emplus WAP380C
+  DEVICE_DTS := qcom-ipq807x-wap380c
+  DEVICE_DTS_CONFIG=config@hk07
+  SUPPORTED_DEVICES := emplus,wap380c
+  DEVICE_PACKAGES := ath11k-wifi-emplus-wap380c uboot-envtools
+endef
+TARGET_DEVICES += emplus_wap380c
+
 define Device/sonicfi_rap650c
   DEVICE_TITLE := SonicFi RAP650C
   DEVICE_DTS := qcom-ipq807x-rap650c
