@@ -100,6 +100,7 @@ endif
 ifdef CONFIG_TARGET_PROFILE
 TARGET_PROFILE=$(subst ",,$(CONFIG_TARGET_PROFILE))
 PATCH_PROFILE_NAME=patches-$(subst DEVICE_,,$(TARGET_PROFILE))
+FILES_PROFILE_NAME=files-$(subst DEVICE_,,$(TARGET_PROFILE))
 endif
 
 QCASSDK_CONFIG_OPTS+= TOOL_PATH=$(TOOLCHAIN_BIN_PATH) \
@@ -202,6 +203,15 @@ define patch_profile
 	$(call PatchDir/Default,$(PKG_BUILD_DIR),./$(PATCH_PROFILE_NAME))
 endef
 
+define files_profile
+
+	if [ -d "./$(FILES_PROFILE_NAME)" ]; then \
+		$(CP) ./$(FILES_PROFILE_NAME)/* ./files/ ; \
+	fi
+endef
+
 Hooks/Prepare/Post += patch_profile
+Hooks/Prepare/Post += files_profile
+
 $(eval $(call KernelPackage,qca-ssdk-qca-nohnat))
 $(eval $(call KernelPackage,qca-ssdk-qca-hnat))
