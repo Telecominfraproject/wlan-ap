@@ -136,7 +136,8 @@ platform_do_upgrade() {
 	sercomm,ap72tip|\
 	cig,wf189w|\
 	cig,wf189h|\
-	cig,wf189)
+	cig,wf189|\
+	emplus,wap7635)
 		if [ -f /proc/boot_info/bootconfig0/rootfs/upgradepartition ]; then
 			CI_UBIPART="$(cat /proc/boot_info/bootconfig0/rootfs/upgradepartition)"
 			CI_BOOTCFG=1
