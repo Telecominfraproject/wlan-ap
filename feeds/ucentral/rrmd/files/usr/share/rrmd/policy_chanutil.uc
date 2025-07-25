@@ -24,6 +24,10 @@ function stats_info_write(path, value) {
 	file.close();
 }
 
+function record_rrm_timestamp() {
+    stats_info_write("/tmp/rrm_timestamp", time());
+}
+
 // total number of radios: default=2
 let num_radios = 2;
 let phy_count;
@@ -136,20 +140,120 @@ function channel_to_freq(band, channel) {
     return freq;
 }
 
-function center_freq_calc(band, freq, bandwidth) {
-    if (bandwidth == 40)
-        return +freq + 10;
-    if (bandwidth == 80)
-        return +freq + 30;
-    if (bandwidth == 160)
-        return +freq + 70;
-    if (bandwidth == 320)
-        if (freq == 6115)
-            return +freq - 10;
-        else
-            return +freq + 150;
+// using mapping to get correct center channel, especially for 6G radio
+function get_center_channel(channel, band, bw) {
+    let center_channel = channel;
+    let center_channel_map = {};
 
-    return +freq;
+    switch (band) {
+    case '5g':
+        if (bw == 40) {
+            center_channel_map = {
+                "36": 38, "40": 38,
+                "44": 46, "48": 46,
+                "52": 54, "56": 54,
+                "60": 62, "64": 62,
+                "100": 102, "104": 102,
+                "108": 110, "112": 110,
+                "116": 118, "120": 118,
+                "124": 126, "128": 126,
+                "132": 134, "136": 134,
+                "140": 142, "144": 142,
+                "149": 151, "153": 151,
+                "157": 159, "161": 159,
+                "165": 167
+            };
+        } else if (bw == 80) {
+            center_channel_map = {
+                "36": 42, "40": 42, "44": 42, "48": 42,
+                "52": 58, "56": 58, "60": 58, "64": 58,
+                "100": 106, "104": 106, "108": 106, "112": 106,
+                "116": 122, "120": 122, "124": 122, "128": 122,
+                "132": 138, "136": 138, "140": 138, "144": 138,
+                "149": 155, "153": 155, "157": 155, "161": 155,
+                "165": 171
+            };
+        } else if (bw == 160) {
+            center_channel_map = {
+                "36": 50, "40": 50, "44": 50, "48": 50,
+                "52": 50, "56": 50, "60": 50, "64": 50,
+                "100": 114, "104": 114, "108": 114, "112": 114,
+                "116": 114, "120": 114, "124": 114, "128": 114
+            };
+        }
+        break;
+    case '6g':
+        if (bw == 40) {
+            center_channel_map = {
+                "1": 3, "5": 3, "9": 11, "13": 11,
+                "17": 19, "21": 19, "25": 27, "29": 27,
+                "33": 35, "37": 35, "41": 43, "45": 43,
+                "49": 51, "53": 51, "57": 59, "61": 59,
+                "65": 67, "69": 67, "73": 75, "77": 75,
+                "81": 83, "85": 83, "89": 91, "93": 91,
+                "97": 99, "101": 99, "105": 107, "109": 107,
+                "113": 115, "117": 115, "121": 123, "125": 123,
+                "129": 131, "133": 131, "137": 139, "141": 139,
+                "145": 147, "149": 147, "153": 155, "157": 155,
+                "161": 163, "165": 163, "169": 171, "173": 171,
+                "177": 179, "181": 179, "185": 187, "189": 187,
+                "193": 195, "197": 195, "201": 203, "205": 203,
+                "209": 211, "213": 211, "217": 219, "221": 219,
+                "225": 227
+            };
+        } else if (bw == 80) {
+            bw = {
+                "1": 7, "5": 7, "9": 7, "13": 7,
+                "17": 23, "21": 23, "25": 23, "29": 23,
+                "33": 39, "37": 39, "41": 39, "45": 39,
+                "49": 55, "53": 55, "57": 55, "61": 55,
+                "65": 71, "69": 71, "73": 71, "77": 71,
+                "81": 87, "85": 87, "89": 87, "93": 87,
+                "97": 103, "101": 103, "105": 103, "109": 103,
+                "113": 119, "117": 119, "121": 119, "125": 119,
+                "129": 135, "133": 135, "137": 135, "141": 135,
+                "145": 151, "149": 151, "153": 151, "157": 151,
+                "161": 167, "165": 167, "169": 167, "173": 167,
+                "177": 183, "181": 183, "185": 183, "189": 183,
+                "193": 199, "197": 199, "201": 199, "205": 199,
+                "209": 215
+            };
+        } else if (bw == 160) {
+            center_channel_map = {
+                "1": 15, "5": 15, "9": 15, "13": 15,
+                "17": 15, "21": 15, "25": 15, "29": 15,
+                "33": 47, "37": 47, "41": 47, "45": 47,
+                "49": 47, "53": 47, "57": 47, "61": 47,
+                "65": 79, "69": 79, "73": 79, "77": 79,
+                "81": 79, "85": 79, "89": 79, "93": 79,
+                "97": 111, "101": 111, "105": 111, "109": 111,
+                "113": 111, "117": 111, "121": 111, "125": 111,
+                "129": 143, "133": 143, "137": 143, "141": 143,
+                "145": 143, "149": 143, "153": 143, "157": 143,
+                "161": 175, "165": 175, "169": 175, "173": 175,
+                "177": 175, "181": 175, "185": 175, "189": 175,
+                "193": 207
+            };
+        } else if (bw == 320) {
+            center_channel_map = {
+                "33": 63, "37": 63, "41": 63, "45": 63,
+                "49": 63, "53": 63, "57": 63, "61": 63,
+                "65": 63, "69": 63, "73": 63, "77": 63,
+                "81": 63, "85": 63, "89": 63, "93": 63,
+                "97": 127, "101": 127, "105": 127, "109": 127,
+                "113": 127, "117": 127, "121": 127, "125": 127,
+                "129": 127, "133": 127, "137": 127, "141": 127,
+                "145": 127, "149": 127, "153": 127, "157": 127,
+                "161": 191
+            };
+        }
+        break;
+    }
+
+    if (center_channel_map[channel])
+        center_channel = center_channel_map[channel];
+
+    return center_channel;
 }
 
 function interface_status_check(iface) {
@@ -201,6 +305,9 @@ function check_current_channel(iface) {
 function hostapd_switch_channel(msg) {
     ulog_info(`[%s] Start switch channel to %d \n`, msg.iface, msg.channel);
 
+    // Channel switch in progress, set flag = 1
+    stats_info_write("/tmp/rrm_chan_switch", 1);
+
     let chan_switch_status = 0;
     let sec_channel_offset = null;
 
@@ -208,7 +315,8 @@ function hostapd_switch_channel(msg) {
     let bandwidth = replace(msg.htmode, /[^0-9]/g, '');
 
     let target_freq = channel_to_freq(msg.band, msg.channel);
-    let center_freq = center_freq_calc(msg.band, target_freq, bandwidth);
+    let center_channel = get_center_channel(msg.channel, msg.band, bandwidth);
+    let center_freq = channel_to_freq(msg.band, center_channel);
     if (bandwidth > 20)
         sec_channel_offset = 1;
 
@@ -245,8 +353,19 @@ function switch_status_check(iface, dfs_enabled_5g_flag) {
         ulog_info(`[%s] 5G radio might need some time to be UP (DFS enabled) \n`, iface);
 
         let p = 0;
-        // Max 65 seconds wait for the DFS enabled interface to be UP
+        // Default max 70 seconds wait for the DFS enabled interface to be UP
         let timer = 70;
+
+        // get real timer from hostapd_cli command
+        let check_cac_time = sprintf('hostapd_cli -i %s status | grep \"cac_time_left_seconds\" | awk -F "=" \'{print $2}\'', iface);
+        let _cac_time = fs.popen(check_cac_time);
+        let cac_time = trim(_cac_time.read('all'));
+        _cac_time.close();
+
+        // if cac_time is a valid number, set timer to cac_time + 5 seconds
+        if (cac_time > 0 && match(cac_time, /^[0-9]+$/)) {
+            timer = int(cac_time) + 5;
+        }
 
         while (p < timer) {
             ulog_info(`[%s] Check#%d \n `, iface, p);
@@ -266,6 +385,9 @@ function switch_status_check(iface, dfs_enabled_5g_flag) {
             }
         }
     }
+
+    // Channel switch done, set flag = 0
+    stats_info_write("/tmp/rrm_chan_switch", 0);
 
     let current_chan = check_current_channel(iface);
     return current_chan;
@@ -568,9 +690,28 @@ function random_channel_selection(iface, band, htmode, chan_list_valid) {
     return random_channel;
 }
 
+function check_center_channel(chosen_random_channel, current_channel, band, htmode) {
+    let ret = false;
+    let bw = replace(htmode, /[^0-9]/g, '');
+
+    if (band != '2g' || bw != 20) {
+        // for 2G band or 20MHz bandwidth, center channel is the same as the channel
+        let chosen_random_channel_center = get_center_channel(chosen_random_channel, band, bw);
+        let current_channel_center = get_center_channel(current_channel, band, bw);
+
+        ulog_info(`Center channel of the chosen random channel (%d) = %d; Center channel of the current channel (%d) = %d \n`, chosen_random_channel, chosen_random_channel_center, current_channel, current_channel_center);
+
+        if (chosen_random_channel_center == current_channel_center)
+            ret = true;
+    }
+
+    return ret;
+}
+
 function algo_rcs(iface, current_channel, band, htmode, selected_channels) {
     let chosen_random_channel = 0;
     let res = 0;
+    let same_center_channel = false;
 
     // random_channel_selection script will help to select random channel
     chosen_random_channel = random_channel_selection(iface, band, htmode, selected_channels);
@@ -580,8 +721,15 @@ function algo_rcs(iface, current_channel, band, htmode, selected_channels) {
         ulog_info(`[%s] RCS assigned the same channel = %d; Skip channel switch \n`, iface, chosen_random_channel);
         res = 0;
     } else if (chosen_random_channel > 0) {
-        ulog_info(`[%s] RCS done ... random channel found = %d\n`, iface, chosen_random_channel);
-        res = 1;
+        // check if the random channel has the same center channel as the current channel
+        same_center_channel = check_center_channel(chosen_random_channel, current_channel, band, htmode);
+        if (same_center_channel) {
+            ulog_info(`[%s] RCS found channel %d with the same center channel as current channel %d; Skip channel switch \n`, iface, chosen_random_channel, current_channel);
+            res = 0;
+        } else {
+            ulog_info(`[%s] RCS done ... random channel found = %d\n`, iface, chosen_random_channel);
+            res = 1;
+        }
     } else {
         ulog_info(`[%s] RCS scan FAIL. Retry Channel optimization at next cycle \n`, iface);
         res = 0;
@@ -610,6 +758,8 @@ function channel_optimize() {
         ulog_info(`RRM config threshold is 0, RRM channel optimization will not be executed \n`);
         return config.interval;
     }
+
+    record_rrm_timestamp();
 
     let current_rf_down = {};
 	let cool_down_f = {};
@@ -924,7 +1074,7 @@ function channel_optimize() {
                             }
                         } else {
                             // revert back to the original channel
-                            ulog_info(`[%s] Channel %d has a cac_time longer than 60 seconds, RRM failed for this interval (you might want to avoid selecting this channel) \n`, radio_iface[l], init_payload.channel);
+                            ulog_info(`[%s] Channel %d may have a cac_time longer than 60 seconds, RRM failed for this interval (you might want to avoid selecting this channel) \n`, radio_iface[l], init_payload.channel);
                         }
                     } else if (selected_algo == "ACS") {
                         let random_wait_time = random_time_calc();
@@ -939,6 +1089,9 @@ function channel_optimize() {
                             check_all_threshold_breach == num_radios: threshold breach count exceeded for all interfaces
                             check_all_threshold_breach >= 1: threshold breach count exceeded for one or more interfaces
                         */
+
+                        // Channel switch in progress, set flag = 1
+                        stats_info_write("/tmp/rrm_chan_switch", 1);
 
                         // flag to check if 5G radio was restarted
                         let radio_5g_restarted = 0;
@@ -1003,6 +1156,10 @@ function channel_optimize() {
                             sleep(30000);
                         }
                     }
+
+                    sleep(5000);
+                    // Channel switch done, set flag = 0
+                    stats_info_write("/tmp/rrm_chan_switch", 0);
                 } else {
                     if (threshold_breach_f[l] != 1) {
                         ulog_info(`[%s] Threshold breach count (=%d) < Allowed consecutive Channel Utilization threshold breach count (=%d), will be checked again in the next interval \n`, radio_iface[l], threshold_breach_count[l], config.consecutive_threshold_breach);
@@ -1016,6 +1173,7 @@ function channel_optimize() {
         }
     }
     ulog_info(`RRM with channel optimization finished; next RRM round starts in %d seconds \n`, config.interval/1000);
+    record_rrm_timestamp();
 
     return config.interval;
 }
