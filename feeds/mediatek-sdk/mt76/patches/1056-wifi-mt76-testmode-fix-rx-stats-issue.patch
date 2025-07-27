@@ -1,0 +1,470 @@
+From d43a156e8d7191a8643cf4d5975cd670f3c17aa6 Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Thu, 13 Mar 2025 15:25:31 +0800
+Subject: [PATCH] wifi: mt76: testmode: fix rx stats issue
+
+Originally, RX ok count is calculated by RX MDRDY count - FCS err count
+- len mismatch count.
+However, this is incorrect as the other err counts are not included in
+the FW event.
+Therefore, just use the RX ok count reported from FW.
+
+Additionally, rework testmode dump stats for dump order
+The orignal dump order is determined by the order of MT76 testmode
+attribute enums, and the order of the attribute enum cannot be exchanged.
+If a new attribute which is related to the previous attribute, the dump
+info of these two attributes will be separated.
+Therefore, use nla_for_each_nested instead of for loop to dump info, so
+that the dump order will be determined by the order of nla_put
+in driver.
+
+Finally, adjust the dump stats flow to adjust the order of dump
+info.
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+---
+ mac80211.c        |  4 +--
+ mt76.h            | 17 ++++++++--
+ mt7915/mac.c      | 12 +++----
+ mt7915/mt7915.h   |  9 -----
+ mt7915/testmode.c | 69 ++++++++-------------------------------
+ testmode.c        | 83 ++++++++++++++++++++++++++++++++++++++++++-----
+ testmode.h        |  5 ++-
+ tools/fields.c    | 30 ++++++++++-------
+ 8 files changed, 132 insertions(+), 97 deletions(-)
+
+diff --git a/mac80211.c b/mac80211.c
+index 750a642..ffff8a5 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -818,9 +818,9 @@ void mt76_rx(struct mt76_dev *dev, enum mt76_rxq_id q, struct sk_buff *skb)
+ #ifdef CONFIG_NL80211_TESTMODE
+ 	if (!(phy->test.flag & MT_TM_FW_RX_COUNT) &&
+ 	    phy->test.state == MT76_TM_STATE_RX_FRAMES) {
+-		phy->test.rx_stats.packets[q]++;
++		phy->test.rx_stats[q].packets++;
+ 		if (status->flag & RX_FLAG_FAILED_FCS_CRC)
+-			phy->test.rx_stats.fcs_error[q]++;
++			phy->test.rx_stats[q].fcs_error++;
+ 	}
+ #endif
+ 
+diff --git a/mt76.h b/mt76.h
+index 17400fd..67e3b2f 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -811,10 +811,21 @@ struct mt76_testmode_data {
+ 	u16 tx_queued_limit;
+ 	u32 tx_done;
+ 	struct {
+-		u64 packets[__MT_RXQ_MAX];
+-		u64 fcs_error[__MT_RXQ_MAX];
++		u64 packets;
++		u64 rx_success;
++		u64 fcs_error;
+ 		u64 len_mismatch;
+-	} rx_stats;
++	} rx_stats[__MT_RXQ_MAX];
++
++	struct {
++		s32 freq_offset;
++		u8 path;
++		u8 *rcpi;
++		s8 *rssi;
++		s8 *ib_rssi;
++		s8 *wb_rssi;
++		u8 snr;
++	} last_rx;
+ 
+ 	u8 offchan_ch;
+ 	u8 offchan_center_ch;
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index cff604e..46cfe35 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -572,10 +572,10 @@ mt7915_mac_fill_rx_vector(struct mt7915_dev *dev, struct sk_buff *skb)
+ 		if (i == 3)
+ 			wb_rssi = le32_to_cpu(rxv[9]);
+ 
+-		phy->test.last_rcpi[i] = rcpi & 0xff;
+-		phy->test.last_rssi[i] = to_rssi(GENMASK(7, 0), rcpi);
+-		phy->test.last_ib_rssi[i] = ib_rssi & 0xff;
+-		phy->test.last_wb_rssi[i] = wb_rssi & 0xff;
++		phy->mt76->test.last_rx.rcpi[i] = rcpi & 0xff;
++		phy->mt76->test.last_rx.rssi[i] = to_rssi(GENMASK(7, 0), rcpi);
++		phy->mt76->test.last_rx.ib_rssi[i] = ib_rssi & 0xff;
++		phy->mt76->test.last_rx.wb_rssi[i] = wb_rssi & 0xff;
+ 	}
+ 
+ 	v20 = le32_to_cpu(rxv[20]);
+@@ -586,8 +586,8 @@ mt7915_mac_fill_rx_vector(struct mt7915_dev *dev, struct sk_buff *skb)
+ 
+ 	snr = FIELD_GET(MT_CRXV_SNR, v20) - 16;
+ 
+-	phy->test.last_freq_offset = foe;
+-	phy->test.last_snr = snr;
++	phy->mt76->test.last_rx.freq_offset = foe;
++	phy->mt76->test.last_rx.snr = snr;
+ out:
+ #endif
+ 	dev_kfree_skb(skb);
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 073e65d..c67a9bb 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -339,16 +339,7 @@ struct mt7915_phy {
+ #ifdef CONFIG_NL80211_TESTMODE
+ 	struct {
+ 		u32 *reg_backup;
+-
+-		s32 last_freq_offset;
+-		u8 last_rcpi[4];
+-		s8 last_rssi[4];
+-		s8 last_ib_rssi[4];
+-		s8 last_wb_rssi[4];
+-		u8 last_snr;
+-
+ 		u8 spe_idx;
+-
+ 		bool bf_ever_en;
+ 	} test;
+ #endif
+diff --git a/mt7915/testmode.c b/mt7915/testmode.c
+index 8398edd..72cee21 100644
+--- a/mt7915/testmode.c
++++ b/mt7915/testmode.c
+@@ -1965,9 +1965,10 @@ mt7915_tm_get_rx_stats(struct mt7915_phy *phy, bool clear)
+ 	if (!clear) {
+ 		enum mt76_rxq_id q = req.band ? MT_RXQ_BAND1 : MT_RXQ_MAIN;
+ 
+-		td->rx_stats.packets[q] += le32_to_cpu(rs_band->mdrdy_cnt);
+-		td->rx_stats.fcs_error[q] += le16_to_cpu(rs_band->fcs_err);
+-		td->rx_stats.len_mismatch += le16_to_cpu(rs_band->len_mismatch);
++		td->rx_stats[q].packets += le32_to_cpu(rs_band->mdrdy_cnt);
++		td->rx_stats[q].rx_success += le16_to_cpu(rs_band->fcs_succ);
++		td->rx_stats[q].fcs_error += le16_to_cpu(rs_band->fcs_err);
++		td->rx_stats[q].len_mismatch += le16_to_cpu(rs_band->len_mismatch);
+ 	}
+ 
+ 	dev_kfree_skb(skb);
+@@ -2560,62 +2561,18 @@ mt7915_tm_set_params(struct mt76_phy *mphy, struct nlattr **tb,
+ static int
+ mt7915_tm_dump_stats(struct mt76_phy *mphy, struct sk_buff *msg)
+ {
++	struct mt76_testmode_data *td = &mphy->test;
+ 	struct mt7915_phy *phy = mphy->priv;
+ 	struct mt7915_dev *dev = phy->dev;
+-	void *rx, *rssi;
+-	int i;
+-
+-	rx = nla_nest_start(msg, MT76_TM_STATS_ATTR_LAST_RX);
+-	if (!rx)
+-		return -ENOMEM;
+-
+-	if (nla_put_s32(msg, MT76_TM_RX_ATTR_FREQ_OFFSET, phy->test.last_freq_offset))
+-		return -ENOMEM;
+-
+-	rssi = nla_nest_start(msg, MT76_TM_RX_ATTR_RCPI);
+-	if (!rssi)
+-		return -ENOMEM;
+-
+-	for (i = 0; i < ARRAY_SIZE(phy->test.last_rcpi); i++)
+-		if (nla_put_u8(msg, i, phy->test.last_rcpi[i]))
+-			return -ENOMEM;
+-
+-	nla_nest_end(msg, rssi);
+-
+-	rssi = nla_nest_start(msg, MT76_TM_RX_ATTR_RSSI);
+-	if (!rssi)
+-		return -ENOMEM;
+-
+-	for (i = 0; i < ARRAY_SIZE(phy->test.last_rssi); i++)
+-		if (nla_put_s8(msg, i, phy->test.last_rssi[i]))
+-			return -ENOMEM;
++	int band_idx = mphy->band_idx;
+ 
+-	nla_nest_end(msg, rssi);
+-
+-	rssi = nla_nest_start(msg, MT76_TM_RX_ATTR_IB_RSSI);
+-	if (!rssi)
+-		return -ENOMEM;
+-
+-	for (i = 0; i < ARRAY_SIZE(phy->test.last_ib_rssi); i++)
+-		if (nla_put_s8(msg, i, phy->test.last_ib_rssi[i]))
+-			return -ENOMEM;
+-
+-	nla_nest_end(msg, rssi);
+-
+-	rssi = nla_nest_start(msg, MT76_TM_RX_ATTR_WB_RSSI);
+-	if (!rssi)
+-		return -ENOMEM;
+-
+-	for (i = 0; i < ARRAY_SIZE(phy->test.last_wb_rssi); i++)
+-		if (nla_put_s8(msg, i, phy->test.last_wb_rssi[i]))
+-			return -ENOMEM;
+-
+-	nla_nest_end(msg, rssi);
+-
+-	if (nla_put_u8(msg, MT76_TM_RX_ATTR_SNR, phy->test.last_snr))
+-		return -ENOMEM;
+-
+-	nla_nest_end(msg, rx);
++	if (!td->last_rx.path) {
++		td->last_rx.path = hweight32(mphy->chainmask >> (dev->chainshift * band_idx));
++		td->last_rx.rcpi = devm_kzalloc(dev->mt76.dev, td->last_rx.path, GFP_KERNEL);
++		td->last_rx.rssi = devm_kzalloc(dev->mt76.dev, td->last_rx.path, GFP_KERNEL);
++		td->last_rx.ib_rssi = devm_kzalloc(dev->mt76.dev, td->last_rx.path, GFP_KERNEL);
++		td->last_rx.wb_rssi = devm_kzalloc(dev->mt76.dev, td->last_rx.path, GFP_KERNEL);
++	}
+ 
+ 	if (mphy->test.tx_rate_mode == MT76_TM_TX_MODE_HE_MU)
+ 		mphy->test.tx_done += mt76_rr(dev, MT_MIB_DR8(phy != &dev->phy));
+diff --git a/testmode.c b/testmode.c
+index 56b9205..c041b35 100644
+--- a/testmode.c
++++ b/testmode.c
+@@ -454,9 +454,8 @@ __mt76_testmode_set_state(struct mt76_phy *phy, enum mt76_testmode_state state)
+ 
+ 	if (state == MT76_TM_STATE_TX_FRAMES)
+ 		mt76_testmode_tx_start(phy);
+-	else if (state == MT76_TM_STATE_RX_FRAMES) {
++	else if (state == MT76_TM_STATE_RX_FRAMES)
+ 		memset(&phy->test.rx_stats, 0, sizeof(phy->test.rx_stats));
+-	}
+ 
+ 	phy->test.state = state;
+ 
+@@ -769,13 +768,77 @@ out:
+ }
+ EXPORT_SYMBOL(mt76_testmode_cmd);
+ 
++static int
++mt76_testmode_dump_last_rx_stats(struct mt76_phy *phy, struct sk_buff *msg)
++{
++	struct mt76_testmode_data *td = &phy->test;
++	void *rx, *rssi;
++	int i;
++
++	rx = nla_nest_start(msg, MT76_TM_STATS_ATTR_LAST_RX);
++	if (!rx)
++		return -ENOMEM;
++
++	rssi = nla_nest_start(msg, MT76_TM_RX_ATTR_RSSI);
++	if (!rssi)
++		return -ENOMEM;
++
++	for (i = 0; i < td->last_rx.path; i++)
++		if (nla_put_s8(msg, i, td->last_rx.rssi[i]))
++			return -ENOMEM;
++
++	nla_nest_end(msg, rssi);
++
++	rssi = nla_nest_start(msg, MT76_TM_RX_ATTR_RCPI);
++	if (!rssi)
++		return -ENOMEM;
++
++	for (i = 0; i < td->last_rx.path; i++)
++		if (nla_put_u8(msg, i, td->last_rx.rcpi[i]))
++			return -ENOMEM;
++
++	nla_nest_end(msg, rssi);
++
++	rssi = nla_nest_start(msg, MT76_TM_RX_ATTR_IB_RSSI);
++	if (!rssi)
++		return -ENOMEM;
++
++	for (i = 0; i < td->last_rx.path; i++)
++		if (nla_put_s8(msg, i, td->last_rx.ib_rssi[i]))
++			return -ENOMEM;
++
++	nla_nest_end(msg, rssi);
++
++	rssi = nla_nest_start(msg, MT76_TM_RX_ATTR_WB_RSSI);
++	if (!rssi)
++		return -ENOMEM;
++
++	for (i = 0; i < td->last_rx.path; i++)
++		if (nla_put_s8(msg, i, td->last_rx.wb_rssi[i]))
++			return -ENOMEM;
++
++	nla_nest_end(msg, rssi);
++
++	if (nla_put_s32(msg, MT76_TM_RX_ATTR_FREQ_OFFSET, td->last_rx.freq_offset))
++		return -ENOMEM;
++
++	if (nla_put_u8(msg, MT76_TM_RX_ATTR_SNR, td->last_rx.snr))
++		return -ENOMEM;
++
++	nla_nest_end(msg, rx);
++
++	return 0;
++}
++
+ static int
+ mt76_testmode_dump_stats(struct mt76_phy *phy, struct sk_buff *msg)
+ {
+ 	struct mt76_testmode_data *td = &phy->test;
+ 	struct mt76_dev *dev = phy->dev;
+ 	u64 rx_packets = 0;
++	u64 rx_success = 0;
+ 	u64 rx_fcs_error = 0;
++	u64 rx_len_mismatch = 0;
+ 	int i;
+ 
+ 	if (dev->test_ops->dump_stats) {
+@@ -786,9 +849,11 @@ mt76_testmode_dump_stats(struct mt76_phy *phy, struct sk_buff *msg)
+ 			return ret;
+ 	}
+ 
+-	for (i = 0; i < ARRAY_SIZE(td->rx_stats.packets); i++) {
+-		rx_packets += td->rx_stats.packets[i];
+-		rx_fcs_error += td->rx_stats.fcs_error[i];
++	for (i = 0; i < ARRAY_SIZE(td->rx_stats); i++) {
++		rx_packets += td->rx_stats[i].packets;
++		rx_success += td->rx_stats[i].rx_success;
++		rx_fcs_error += td->rx_stats[i].fcs_error;
++		rx_len_mismatch += td->rx_stats[i].len_mismatch;
+ 	}
+ 
+ 	if (nla_put_u32(msg, MT76_TM_STATS_ATTR_TX_PENDING, td->tx_pending) ||
+@@ -796,14 +861,15 @@ mt76_testmode_dump_stats(struct mt76_phy *phy, struct sk_buff *msg)
+ 	    nla_put_u32(msg, MT76_TM_STATS_ATTR_TX_DONE, td->tx_done) ||
+ 	    nla_put_u64_64bit(msg, MT76_TM_STATS_ATTR_RX_PACKETS, rx_packets,
+ 			      MT76_TM_STATS_ATTR_PAD) ||
++	    nla_put_u64_64bit(msg, MT76_TM_STATS_ATTR_RX_SUCCESS, rx_success,
++			      MT76_TM_STATS_ATTR_PAD) ||
+ 	    nla_put_u64_64bit(msg, MT76_TM_STATS_ATTR_RX_FCS_ERROR, rx_fcs_error,
+ 			      MT76_TM_STATS_ATTR_PAD) ||
+-	    nla_put_u64_64bit(msg, MT76_TM_STATS_ATTR_RX_LEN_MISMATCH,
+-			      td->rx_stats.len_mismatch,
++	    nla_put_u64_64bit(msg, MT76_TM_STATS_ATTR_RX_LEN_MISMATCH, rx_len_mismatch,
+ 			      MT76_TM_STATS_ATTR_PAD))
+ 		return -EMSGSIZE;
+ 
+-	return 0;
++	return mt76_testmode_dump_last_rx_stats(phy, msg);
+ }
+ 
+ int mt76_testmode_dump(struct ieee80211_hw *hw, struct sk_buff *msg,
+@@ -845,6 +911,7 @@ int mt76_testmode_dump(struct ieee80211_hw *hw, struct sk_buff *msg,
+ 		goto out;
+ 	}
+ 
++	/* the dump order follows the order of nla_put for each attribute */
+ 	if (tb[MT76_TM_ATTR_STATS]) {
+ 		err = -EINVAL;
+ 
+diff --git a/testmode.h b/testmode.h
+index 14ce948..d1be530 100644
+--- a/testmode.h
++++ b/testmode.h
+@@ -160,12 +160,14 @@ enum mt76_testmode_attr {
+  * @MT76_TM_STATS_ATTR_TX_QUEUED: queued tx frames (u32)
+  * @MT76_TM_STATS_ATTR_TX_QUEUED: completed tx frames (u32)
+  *
+- * @MT76_TM_STATS_ATTR_RX_PACKETS: number of rx packets (u64)
++ * @MT76_TM_STATS_ATTR_RX_PACKETS: number of rx mdrdy packets
++ *	with successfully parsed headers (u64)
+  * @MT76_TM_STATS_ATTR_RX_FCS_ERROR: number of rx packets with FCS error (u64)
+  * @MT76_TM_STATS_ATTR_LAST_RX: information about the last received packet
+  *	see &enum mt76_testmode_rx_attr
+  * @MT76_TM_STATS_ATTR_RX_LEN_MISMATCH: number of rx packets with length
+  *	mismatch error (u64)
++ * @MT76_TM_STATS_ATTR_RX_SUCCESS: number of successfully rx packets (u64)
+  */
+ enum mt76_testmode_stats_attr {
+ 	MT76_TM_STATS_ATTR_UNSPEC,
+@@ -179,6 +181,7 @@ enum mt76_testmode_stats_attr {
+ 	MT76_TM_STATS_ATTR_RX_FCS_ERROR,
+ 	MT76_TM_STATS_ATTR_LAST_RX,
+ 	MT76_TM_STATS_ATTR_RX_LEN_MISMATCH,
++	MT76_TM_STATS_ATTR_RX_SUCCESS,
+ 
+ 	/* keep last */
+ 	NUM_MT76_TM_STATS_ATTRS,
+diff --git a/tools/fields.c b/tools/fields.c
+index 027b8cd..2cf8af0 100644
+--- a/tools/fields.c
++++ b/tools/fields.c
+@@ -203,17 +203,14 @@ static void print_array(const struct tm_field *field, struct nlattr *attr)
+ 
+ static void print_nested(const struct tm_field *field, struct nlattr *attr)
+ {
+-	struct nlattr **tb = alloca(field->len * sizeof(struct nlattr *));
+ 	const struct tm_field *fields = field->fields;
+-	int i;
++	struct nlattr *cur;
++	int i, rem;
+ 
+-	nla_parse_nested(tb, field->len - 1, attr, field->policy);
+-	for (i = 0; i < field->len; i++) {
++	nla_for_each_nested(cur, attr, rem) {
+ 		int prefix_len = 0;
+ 
+-		if (!tb[i])
+-			continue;
+-
++		i = nla_type(cur);
+ 		if (!fields[i].print)
+ 			continue;
+ 
+@@ -226,7 +223,7 @@ static void print_nested(const struct tm_field *field, struct nlattr *attr)
+ 				sizeof(prefix) - prefix_len - 1);
+ 		}
+ 
+-		fields[i].print(&fields[i], tb[i]);
++		fields[i].print(&fields[i], cur);
+ 		if (fields[i].prefix)
+ 			prefix[prefix_len] = 0;
+ 
+@@ -234,20 +231,25 @@ static void print_nested(const struct tm_field *field, struct nlattr *attr)
+ 			printf("\n");
+ 	}
+ 
+-	if (field->print_extra)
++	if (field->print_extra) {
++		struct nlattr **tb = alloca(field->len * sizeof(struct nlattr *));
++
++		nla_parse_nested(tb, field->len - 1, attr, field->policy);
+ 		field->print_extra(field, tb);
++	}
+ }
+ 
+ static void print_extra_stats(const struct tm_field *field, struct nlattr **tb)
+ {
+-	float total, failed;
++	float total, success, failed;
+ 
+ 	if (!tb[MT76_TM_STATS_ATTR_RX_PACKETS] ||
+-	    !tb[MT76_TM_STATS_ATTR_RX_FCS_ERROR])
++	    !tb[MT76_TM_STATS_ATTR_RX_SUCCESS])
+ 		return;
+ 
+ 	total = nla_get_u64(tb[MT76_TM_STATS_ATTR_RX_PACKETS]);
+-	failed = nla_get_u64(tb[MT76_TM_STATS_ATTR_RX_FCS_ERROR]);
++	success = nla_get_u64(tb[MT76_TM_STATS_ATTR_RX_SUCCESS]);
++	failed = total - success;
+ 
+ 	printf("%srx_per=%.02f%%\n", prefix, 100 * failed / total);
+ }
+@@ -391,6 +393,8 @@ static const struct tm_field stats_fields[NUM_MT76_TM_STATS_ATTRS] = {
+ 	FIELD_RO(u32, TX_DONE, "tx_done"),
+ 	FIELD_RO(u64, RX_PACKETS, "rx_packets"),
+ 	FIELD_RO(u64, RX_FCS_ERROR, "rx_fcs_error"),
++	FIELD_RO(u64, RX_LEN_MISMATCH, "rx_len_mismatch"),
++	FIELD_RO(u64, RX_SUCCESS, "rx_success"),
+ 	FIELD_NESTED_RO(LAST_RX, rx, "last_"),
+ };
+ static struct nla_policy stats_policy[NUM_MT76_TM_STATS_ATTRS] = {
+@@ -399,6 +403,8 @@ static struct nla_policy stats_policy[NUM_MT76_TM_STATS_ATTRS] = {
+ 	[MT76_TM_STATS_ATTR_TX_DONE] = { .type = NLA_U32 },
+ 	[MT76_TM_STATS_ATTR_RX_PACKETS] = { .type = NLA_U64 },
+ 	[MT76_TM_STATS_ATTR_RX_FCS_ERROR] = { .type = NLA_U64 },
++	[MT76_TM_STATS_ATTR_RX_LEN_MISMATCH] = { .type = NLA_U64 },
++	[MT76_TM_STATS_ATTR_RX_SUCCESS] = { .type = NLA_U64 },
+ };
+ #undef FIELD_NAME
+ 
+-- 
+2.45.2
+

@@ -1,0 +1,355 @@
+From 5cfa5da26a0d68168b9771a0b2777e26edcdb8f7 Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Mon, 3 Mar 2025 14:51:20 +0800
+Subject: [PATCH] wifi: mt76: mt7915: rework radar rdd idx
+
+The definition of MT_RX_SEL (for rdd_rx_sel) is mixed with the definition of HWRDD idx.
+For example, MT_RX_SEL2 is for background HWRDD idx, not an option of rdd_rx_sel.
+Therefore, add mt7915_get_rdd_idx as a helper function to get the HWRDD idx for each
+variants.
+
+Additionally, remove some parts of the code inherited from the legacy chips.
+For instance,
+1. rdd_state is used for single-band-dual-HWRDD chips (for 80+80),
+especially the 76xx series.
+2. rdd_rx_sel is also used for single-band-dual-HWRDD chips
+rx_sel = 0 => RDD0 for WF0, RDD1 for WF2
+rx_sel = 1 => RDD0 for WF1, RDD1 for WF3
+
+Chip Variants                            | 5G HWRDD Index (= band idx) | Background HWRDD Index
+-----------------------------------------|-----------------------------|------------------------
+MT7915A (single band, 2G or 5G)          | 0                           | 2
+MT7915D (DBDC 2G + 5G)                   | 1                           | 2
+MT7916 2G + 5G (2T2R + ZWDFS)            | 1                           | 2
+MT7916 2G + 5G (3T3R)                    | 1                           | N/A
+MT7981 2G + 5G                           | 1                           | N/A
+MT7986 2G + 5G (one adie DBDC, AX4200)   | 1                           | N/A
+MT7986 5G single band (one adie, AX7800) | 1(first band idx = MT_BAND1)| N/A
+MT7986 2G + 5G (dual adie, AX6000)       | 1                           | N/A
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+---
+ mt7915/debugfs.c | 20 ++++++++++++----
+ mt7915/mac.c     | 60 +++++++++++++++++-------------------------------
+ mt7915/mcu.c     | 41 +++++++++++++++++++++++----------
+ mt7915/mcu.h     |  2 +-
+ mt7915/mt7915.h  | 22 +++++++++++++-----
+ 5 files changed, 82 insertions(+), 63 deletions(-)
+
+diff --git a/mt7915/debugfs.c b/mt7915/debugfs.c
+index 2043c77..fc7d0ee 100644
+--- a/mt7915/debugfs.c
++++ b/mt7915/debugfs.c
+@@ -226,18 +226,28 @@ static const struct file_operations mt7915_sys_recovery_ops = {
+ static int
+ mt7915_radar_trigger(void *data, u64 val)
+ {
+-	struct mt7915_dev *dev = data;
++#define RADAR_MAIN_CHAIN	1
++#define RADAR_BACKGROUND	2
++	struct mt7915_phy *phy = data;
++	struct mt7915_dev *dev = phy->dev;
++	int rdd_idx;
+ 
+-	if (val > MT_RX_SEL2)
++	if (!val || val > RADAR_BACKGROUND)
+ 		return -EINVAL;
+ 
+-	if (val == MT_RX_SEL2 && !dev->rdd2_phy) {
++	if (val == RADAR_BACKGROUND && !dev->rdd2_phy) {
+ 		dev_err(dev->mt76.dev, "Background radar is not enabled\n");
+ 		return -EINVAL;
+ 	}
+ 
++	rdd_idx = mt7915_get_rdd_idx(phy, val == RADAR_BACKGROUND);
++	if (rdd_idx < 0) {
++		dev_err(dev->mt76.dev, "No RDD found\n");
++		return -EINVAL;
++	}
++
+ 	return mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_RADAR_EMULATE,
+-				       val, 0, 0);
++				       rdd_idx, 0, 0);
+ }
+ 
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_radar_trigger, NULL,
+@@ -1575,7 +1585,7 @@ int mt7915_init_debugfs(struct mt7915_phy *phy)
+ 	if (!dev->dbdc_support || phy->mt76->band_idx) {
+ 		debugfs_create_u32("dfs_hw_pattern", 0400, dir,
+ 				   &dev->hw_pattern);
+-		debugfs_create_file("radar_trigger", 0200, dir, dev,
++		debugfs_create_file("radar_trigger", 0200, dir, phy,
+ 				    &fops_radar_trigger);
+ 		debugfs_create_devm_seqfile(dev->mt76.dev, "rdd_monitor", dir,
+ 					    mt7915_rdd_monitor);
+diff --git a/mt7915/mac.c b/mt7915/mac.c
+index cff604e..30f54d2 100644
+--- a/mt7915/mac.c
++++ b/mt7915/mac.c
+@@ -2127,16 +2127,15 @@ void mt7915_mac_work(struct work_struct *work)
+ static void mt7915_dfs_stop_radar_detector(struct mt7915_phy *phy)
+ {
+ 	struct mt7915_dev *dev = phy->dev;
++	int rdd_idx = mt7915_get_rdd_idx(phy, false);
+ 
+-	if (phy->rdd_state & BIT(0))
+-		mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_STOP, 0,
+-					MT_RX_SEL0, 0);
+-	if (phy->rdd_state & BIT(1))
+-		mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_STOP, 1,
+-					MT_RX_SEL0, 0);
++	if (rdd_idx < 0)
++		return;
++
++	mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_STOP, rdd_idx, 0, 0);
+ }
+ 
+-static int mt7915_dfs_start_rdd(struct mt7915_dev *dev, int chain)
++static int mt7915_dfs_start_rdd(struct mt7915_dev *dev, int rdd_idx)
+ {
+ 	int err, region;
+ 
+@@ -2153,52 +2152,38 @@ static int mt7915_dfs_start_rdd(struct mt7915_dev *dev, int chain)
+ 		break;
+ 	}
+ 
+-	err = mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_START, chain,
+-				      MT_RX_SEL0, region);
++	err = mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_START, rdd_idx, 0, region);
+ 	if (err < 0)
+ 		return err;
+ 
+ 	if (is_mt7915(&dev->mt76)) {
+-		err = mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_SET_WF_ANT, chain,
++		err = mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_SET_WF_ANT, rdd_idx,
+ 					      0, dev->dbdc_support ? 2 : 0);
+ 		if (err < 0)
+ 			return err;
+ 	}
+ 
+-	return mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_DET_MODE, chain,
+-				       MT_RX_SEL0, 1);
++	return mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_DET_MODE, rdd_idx, 0, 1);
+ }
+ 
+ static int mt7915_dfs_start_radar_detector(struct mt7915_phy *phy)
+ {
+-	struct cfg80211_chan_def *chandef = &phy->mt76->chandef;
+ 	struct mt7915_dev *dev = phy->dev;
+-	int err;
++	int err, rdd_idx;
++
++	rdd_idx = mt7915_get_rdd_idx(phy, false);
++	if (rdd_idx < 0)
++		return -EINVAL;
+ 
+ 	/* start CAC */
+-	err = mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_CAC_START,
+-				      phy->mt76->band_idx, MT_RX_SEL0, 0);
++	err = mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_CAC_START, rdd_idx, 0, 0);
+ 	if (err < 0)
+ 		return err;
+ 
+-	err = mt7915_dfs_start_rdd(dev, phy->mt76->band_idx);
++	err = mt7915_dfs_start_rdd(dev, rdd_idx);
+ 	if (err < 0)
+ 		return err;
+ 
+-	phy->rdd_state |= BIT(phy->mt76->band_idx);
+-
+-	if (!is_mt7915(&dev->mt76))
+-		return 0;
+-
+-	if (chandef->width == NL80211_CHAN_WIDTH_160 ||
+-	    chandef->width == NL80211_CHAN_WIDTH_80P80) {
+-		err = mt7915_dfs_start_rdd(dev, 1);
+-		if (err < 0)
+-			return err;
+-
+-		phy->rdd_state |= BIT(1);
+-	}
+-
+ 	return 0;
+ }
+ 
+@@ -2240,12 +2225,12 @@ int mt7915_dfs_init_radar_detector(struct mt7915_phy *phy)
+ {
+ 	struct mt7915_dev *dev = phy->dev;
+ 	enum mt76_dfs_state dfs_state, prev_state;
+-	int err;
++	int err, rdd_idx = mt7915_get_rdd_idx(phy, false);
+ 
+ 	prev_state = phy->mt76->dfs_state;
+ 	dfs_state = mt76_phy_dfs_state(phy->mt76);
+ 
+-	if (prev_state == dfs_state)
++	if (prev_state == dfs_state || rdd_idx < 0)
+ 		return 0;
+ 
+ 	if (prev_state == MT_DFS_STATE_UNKNOWN)
+@@ -2269,8 +2254,7 @@ int mt7915_dfs_init_radar_detector(struct mt7915_phy *phy)
+ 	if (dfs_state == MT_DFS_STATE_CAC)
+ 		return 0;
+ 
+-	err = mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_CAC_END,
+-				      phy->mt76->band_idx, MT_RX_SEL0, 0);
++	err = mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_CAC_END, rdd_idx, 0, 0);
+ 	if (err < 0) {
+ 		phy->mt76->dfs_state = MT_DFS_STATE_UNKNOWN;
+ 		return err;
+@@ -2280,15 +2264,13 @@ int mt7915_dfs_init_radar_detector(struct mt7915_phy *phy)
+ 	return 0;
+ 
+ stop:
+-	err = mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_NORMAL_START,
+-				      phy->mt76->band_idx, MT_RX_SEL0, 0);
++	err = mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_NORMAL_START, rdd_idx, 0, 0);
+ 	if (err < 0)
+ 		return err;
+ 
+ 	if (is_mt7915(&dev->mt76)) {
+ 		err = mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_SET_WF_ANT,
+-					      phy->mt76->band_idx, 0,
+-					      dev->dbdc_support ? 2 : 0);
++					      rdd_idx, 0, dev->dbdc_support ? 2 : 0);
+ 		if (err < 0)
+ 			return err;
+ 	}
+diff --git a/mt7915/mcu.c b/mt7915/mcu.c
+index bd32b0a..993d390 100644
+--- a/mt7915/mcu.c
++++ b/mt7915/mcu.c
+@@ -304,20 +304,35 @@ mt7915_mcu_rx_radar_detected(struct mt7915_dev *dev, struct sk_buff *skb)
+ {
+ 	struct mt76_phy *mphy = &dev->mt76.phy;
+ 	struct mt7915_mcu_rdd_report *r;
++	u32 sku;
+ 
+ 	r = (struct mt7915_mcu_rdd_report *)skb->data;
+ 
+-	if (r->band_idx > MT_RX_SEL2)
++	switch (r->rdd_idx) {
++	case MT_RDD_IDX_BAND0:
++		break;
++	case MT_RDD_IDX_BAND1:
++		sku = mt7915_check_adie(dev, true);
++		/* the main phy is bound to band 1 for this sku */
++		if (is_mt7986(&dev->mt76) &&
++		    (sku == MT7975_ONE_ADIE || sku == MT7976_ONE_ADIE))
++			break;
++		mphy = dev->mt76.phys[MT_BAND1];
++		break;
++	case MT_RDD_IDX_BACKGROUND:
++		if (!dev->rdd2_phy)
++			return;
++		mphy = dev->rdd2_phy->mt76;
++		break;
++	default:
++		dev_err(dev->mt76.dev, "Unknown RDD idx %d\n", r->rdd_idx);
+ 		return;
++	}
+ 
+-	if (r->band_idx == MT_RX_SEL2 && !dev->rdd2_phy)
++	if (!mphy)
+ 		return;
+ 
+-	if ((r->band_idx && !dev->phy.mt76->band_idx) &&
+-	    dev->mt76.phys[MT_BAND1])
+-		mphy = dev->mt76.phys[MT_BAND1];
+-
+-	if (r->band_idx == MT_RX_SEL2)
++	if (r->rdd_idx == MT_RDD_IDX_BACKGROUND)
+ 		cfg80211_background_radar_event(mphy->hw->wiphy,
+ 						&dev->rdd2_chandef,
+ 						GFP_ATOMIC);
+@@ -2907,11 +2922,14 @@ int mt7915_mcu_rdd_background_enable(struct mt7915_phy *phy,
+ 				     struct cfg80211_chan_def *chandef)
+ {
+ 	struct mt7915_dev *dev = phy->dev;
+-	int err, region;
++	int err, region, rdd_idx;
++
++	rdd_idx = mt7915_get_rdd_idx(phy, true);
++	if (rdd_idx < 0)
++		return -EINVAL;
+ 
+ 	if (!chandef) { /* disable offchain */
+-		err = mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_STOP, MT_RX_SEL2,
+-					      0, 0);
++		err = mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_STOP, rdd_idx, 0, 0);
+ 		if (err)
+ 			return err;
+ 
+@@ -2937,8 +2955,7 @@ int mt7915_mcu_rdd_background_enable(struct mt7915_phy *phy,
+ 		break;
+ 	}
+ 
+-	return mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_START, MT_RX_SEL2,
+-				       0, region);
++	return mt76_connac_mcu_rdd_cmd(&dev->mt76, RDD_START, rdd_idx, 0, region);
+ }
+ 
+ int mt7915_mcu_set_chan_info(struct mt7915_phy *phy, int cmd)
+diff --git a/mt7915/mcu.h b/mt7915/mcu.h
+index f476767..458263d 100644
+--- a/mt7915/mcu.h
++++ b/mt7915/mcu.h
+@@ -102,7 +102,7 @@ struct mt7915_mcu_bcc_notify {
+ struct mt7915_mcu_rdd_report {
+ 	struct mt76_connac2_mcu_rxd rxd;
+ 
+-	u8 band_idx;
++	u8 rdd_idx;
+ 	u8 long_detected;
+ 	u8 constant_prf_detected;
+ 	u8 staggered_prf_detected;
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 6a823b8..afd9850 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -316,8 +316,6 @@ struct mt7915_phy {
+ 	s16 coverage_class;
+ 	u8 slottime;
+ 
+-	u8 rdd_state;
+-
+ 	u32 trb_ts;
+ 
+ 	u32 rx_ampdu_ts;
+@@ -523,10 +521,10 @@ enum {
+ 	__MT_WFDMA_MAX,
+ };
+ 
+-enum {
+-	MT_RX_SEL0,
+-	MT_RX_SEL1,
+-	MT_RX_SEL2, /* monitor chain */
++enum rdd_idx {
++	MT_RDD_IDX_BAND0,	/* RDD idx for band idx 0 (single-band) */
++	MT_RDD_IDX_BAND1,	/* RDD idx for band idx 1 */
++	MT_RDD_IDX_BACKGROUND,	/* RDD idx for background chain */
+ };
+ 
+ enum mt7915_rdd_cmd {
+@@ -546,6 +544,18 @@ enum mt7915_rdd_cmd {
+ 	RDD_IRQ_OFF,
+ };
+ 
++static inline int
++mt7915_get_rdd_idx(struct mt7915_phy *phy, bool is_background)
++{
++	if (!phy->mt76->cap.has_5ghz)
++		return -1;
++
++	if (is_background)
++		return MT_RDD_IDX_BACKGROUND;
++
++	return phy->mt76->band_idx;
++}
++
+ static inline struct mt7915_phy *
+ mt7915_hw_phy(struct ieee80211_hw *hw)
+ {
+-- 
+2.45.2
+

@@ -1,0 +1,144 @@
+From 605a40dad37c685a49f2c7985e3a05806d7ac1fc Mon Sep 17 00:00:00 2001
+From: Benjamin Lin <benjamin-jw.lin@mediatek.com>
+Date: Thu, 25 Apr 2024 17:17:13 +0800
+Subject: [PATCH] wifi: mt76: mt7915: fix inconsistent QoS mapping between SW
+ and HW
+
+The mapping from IP DSCP to IEEE 802.11 user priority may be customized.
+Therefore, the mapping needs to be passed to HW, so that the QoS type of traffic can be mapped in a consistent manner for both SW and HW paths.
+
+Signed-off-by: Benjamin Lin <benjamin-jw.lin@mediatek.com>
+---
+ mt76_connac_mcu.h |  1 +
+ mt7915/main.c     | 59 ++++++++++++++++++++++++++++++++++++++++++++++-
+ mt7915/mt7915.h   |  4 ++++
+ 3 files changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/mt76_connac_mcu.h b/mt76_connac_mcu.h
+index 46dcd1c..e0255a2 100644
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1238,6 +1238,7 @@ enum {
+ 	MCU_EXT_CMD_GROUP_PRE_CAL_INFO = 0xab,
+ 	MCU_EXT_CMD_DPD_PRE_CAL_INFO = 0xac,
+ 	MCU_EXT_CMD_PHY_STAT_INFO = 0xad,
++	MCU_EXT_CMD_SET_QOS_MAP = 0xb4,
+ };
+ 
+ enum {
+diff --git a/mt7915/main.c b/mt7915/main.c
+index f40a900..71f3ad1 100644
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -209,7 +209,7 @@ static int mt7915_add_interface(struct ieee80211_hw *hw,
+ 	struct mt7915_phy *phy = mt7915_hw_phy(hw);
+ 	struct mt76_txq *mtxq;
+ 	bool ext_phy = phy != &dev->phy;
+-	int idx, ret = 0;
++	int idx, i, ret = 0;
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+ 
+@@ -255,6 +255,12 @@ static int mt7915_add_interface(struct ieee80211_hw *hw,
+ 	mvif->sta.wcid.tx_info |= MT_WCID_TX_INFO_SET;
+ 	mt76_wcid_init(&mvif->sta.wcid);
+ 
++	/* init Default QoS map, defined in section 2.3 of RFC8325.
++	 * Three most significant bits of DSCP are used as UP.
++	 */
++	for (i = 0; i < IP_DSCP_NUM; ++i)
++		mvif->qos_map[i] = i >> 3;
++
+ 	mt7915_mac_wtbl_update(dev, idx,
+ 			       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
+ 
+@@ -1619,6 +1625,56 @@ mt7915_set_frag_threshold(struct ieee80211_hw *hw, u32 val)
+ 	return 0;
+ }
+ 
++static int
++mt7915_set_qos_map(struct ieee80211_vif *vif, struct cfg80211_qos_map *usr_qos_map)
++{
++	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
++	struct {
++		u8 bss_idx;
++		u8 qos_map_enable;
++		u8 __rsv[2];
++		s8 qos_map[IP_DSCP_NUM];
++	} __packed req = {
++		.bss_idx = mvif->mt76.idx,
++		.qos_map_enable = usr_qos_map ? true : false,
++	};
++
++	/* Prevent access to members of mt7915_vif before its initialization. */
++	if (!mvif->phy)
++		return -EPERM;
++
++	if (usr_qos_map) {
++		struct cfg80211_dscp_exception *exception = usr_qos_map->dscp_exception;
++		struct cfg80211_dscp_range *range = usr_qos_map->up;
++		s8 i;
++
++		/* Default QoS map, defined in section 2.3 of RFC8325.
++		 * Three most significant bits of DSCP are used as UP.
++		 */
++		for (i = 0; i < IP_DSCP_NUM; ++i)
++			req.qos_map[i] = i >> 3;
++
++		/* User-defined QoS map */
++		for (i = 0; i < IEEE80211_NUM_UPS; ++i) {
++			u8 low = range[i].low, high = range[i].high;
++
++			if (low < IP_DSCP_NUM && high < IP_DSCP_NUM && low <= high)
++				memset(req.qos_map + low, i, high - low + 1);
++		}
++
++		for (i = 0; i < usr_qos_map->num_des; ++i) {
++			u8 dscp = exception[i].dscp, up = exception[i].up;
++
++			if (dscp < IP_DSCP_NUM && up < IEEE80211_NUM_UPS)
++				req.qos_map[dscp] = up;
++		}
++		memcpy(mvif->qos_map, req.qos_map, IP_DSCP_NUM);
++	}
++
++	return mt76_mcu_send_msg(&mvif->phy->dev->mt76, MCU_WA_EXT_CMD(SET_QOS_MAP),
++				 &req, sizeof(req), true);
++}
++
+ static int
+ mt7915_set_radar_background(struct ieee80211_hw *hw,
+ 			    struct cfg80211_chan_def *chandef)
+@@ -1751,6 +1807,7 @@ const struct ieee80211_ops mt7915_ops = {
+ 	.add_twt_setup = mt7915_mac_add_twt_setup,
+ 	.twt_teardown_request = mt7915_twt_teardown_request,
+ 	.set_frag_threshold = mt7915_set_frag_threshold,
++	.set_qos_map = mt7915_set_qos_map,
+ 	CFG80211_TESTMODE_CMD(mt76_testmode_cmd)
+ 	CFG80211_TESTMODE_DUMP(mt76_testmode_dump)
+ #ifdef CONFIG_MAC80211_DEBUGFS
+diff --git a/mt7915/mt7915.h b/mt7915/mt7915.h
+index 74cd8ca..bfac851 100644
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -83,6 +83,8 @@
+ #define MT7915_CRIT_TEMP		110
+ #define MT7915_MAX_TEMP			120
+ 
++#define IP_DSCP_NUM			64
++
+ struct mt7915_vif;
+ struct mt7915_sta;
+ struct mt7915_dfs_pulse;
+@@ -175,6 +177,8 @@ struct mt7915_vif {
+ 
+ 	struct ieee80211_tx_queue_params queue_params[IEEE80211_NUM_ACS];
+ 	struct cfg80211_bitrate_mask bitrate_mask;
++	/* QoS map support */
++	u8 qos_map[IP_DSCP_NUM];
+ };
+ 
+ /* crash-dump */
+-- 
+2.45.2
+
