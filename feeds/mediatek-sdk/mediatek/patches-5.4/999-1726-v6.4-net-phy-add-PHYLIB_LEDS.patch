@@ -1,0 +1,477 @@
+diff --git a/drivers/net/phy/Kconfig b/drivers/net/phy/Kconfig
+index e146955..291d5de 100644
+--- a/drivers/net/phy/Kconfig
++++ b/drivers/net/phy/Kconfig
+@@ -255,6 +255,13 @@ config LED_TRIGGER_PHY
+ 		<Speed in megabits>Mbps OR <Speed in gigabits>Gbps OR link
+ 		for any speed known to the PHY.
+ 
++config PHYLIB_LEDS
++	def_bool OF
++	depends on LEDS_CLASS=y || LEDS_CLASS=PHYLIB
++	---help---
++	  When LED class support is enabled, phylib can automatically
++	  probe LED setting from device tree.
++
+ 
+ comment "Switch configuration API + drivers"
+ 
+ diff --git a/drivers/net/phy/phy_device.c b/drivers/net/phy/phy_device.c
+index 99f265a..0325030 100644
+--- a/drivers/net/phy/phy_device.c
++++ b/drivers/net/phy/phy_device.c
+@@ -23,6 +23,7 @@
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/mii.h>
++#include <linux/of.h>
+ #include <linux/ethtool.h>
+ #include <linux/bitmap.h>
+ #include <linux/phy.h>
+@@ -621,6 +623,7 @@ struct phy_device *phy_device_create(struct mii_bus *bus, int addr, u32 phy_id,
+ 	device_initialize(&mdiodev->dev);
+ 
+ 	dev->state = PHY_DOWN;
++	INIT_LIST_HEAD(&dev->leds);
+ 
+ 	mutex_init(&dev->lock);
+ 	INIT_DELAYED_WORK(&dev->state_queue, phy_state_machine);
+@@ -2515,6 +2518,208 @@ static bool phy_drv_supports_irq(struct phy_driver *phydrv)
+ 	return phydrv->config_intr && phydrv->ack_interrupt;
+ }
+ 
++static int phy_led_set_brightness(struct led_classdev *led_cdev,
++				  enum led_brightness value)
++{
++	struct phy_led *phyled = to_phy_led(led_cdev);
++	struct phy_device *phydev = phyled->phydev;
++	int err;
++
++	mutex_lock(&phydev->lock);
++	err = phydev->drv->led_brightness_set(phydev, phyled->index, value);
++	mutex_unlock(&phydev->lock);
++
++	return err;
++}
++
++static int phy_led_blink_set(struct led_classdev *led_cdev,
++			     unsigned long *delay_on,
++			     unsigned long *delay_off)
++{
++	struct phy_led *phyled = to_phy_led(led_cdev);
++	struct phy_device *phydev = phyled->phydev;
++	int err;
++
++	mutex_lock(&phydev->lock);
++	err = phydev->drv->led_blink_set(phydev, phyled->index,
++					 delay_on, delay_off);
++	mutex_unlock(&phydev->lock);
++
++	return err;
++}
++
++static __maybe_unused struct device *
++phy_led_hw_control_get_device(struct led_classdev *led_cdev)
++{
++	struct phy_led *phyled = to_phy_led(led_cdev);
++	struct phy_device *phydev = phyled->phydev;
++
++	if (phydev->attached_dev)
++		return &phydev->attached_dev->dev;
++	return NULL;
++}
++
++static int __maybe_unused
++phy_led_hw_control_get(struct led_classdev *led_cdev,
++		       unsigned long *rules)
++{
++	struct phy_led *phyled = to_phy_led(led_cdev);
++	struct phy_device *phydev = phyled->phydev;
++	int err;
++
++	mutex_lock(&phydev->lock);
++	err = phydev->drv->led_hw_control_get(phydev, phyled->index, rules);
++	mutex_unlock(&phydev->lock);
++
++	return err;
++}
++
++static int __maybe_unused
++phy_led_hw_control_set(struct led_classdev *led_cdev,
++		       unsigned long rules)
++{
++	struct phy_led *phyled = to_phy_led(led_cdev);
++	struct phy_device *phydev = phyled->phydev;
++	int err;
++
++	mutex_lock(&phydev->lock);
++	err = phydev->drv->led_hw_control_set(phydev, phyled->index, rules);
++	mutex_unlock(&phydev->lock);
++
++	return err;
++}
++
++static __maybe_unused int phy_led_hw_is_supported(struct led_classdev *led_cdev,
++						  unsigned long rules)
++{
++	struct phy_led *phyled = to_phy_led(led_cdev);
++	struct phy_device *phydev = phyled->phydev;
++	int err;
++
++	mutex_lock(&phydev->lock);
++	err = phydev->drv->led_hw_is_supported(phydev, phyled->index, rules);
++	mutex_unlock(&phydev->lock);
++
++	return err;
++}
++
++static void phy_leds_unregister(struct phy_device *phydev)
++{
++	struct phy_led *phyled, *tmp;
++
++	list_for_each_entry_safe(phyled, tmp, &phydev->leds, list) {
++		led_classdev_unregister(&phyled->led_cdev);
++		list_del(&phyled->list);
++	}
++}
++
++static int of_phy_led(struct phy_device *phydev,
++		      struct device_node *led)
++{
++	struct device *dev = &phydev->mdio.dev;
++	struct led_init_data init_data = {};
++	struct led_classdev *cdev;
++	unsigned long modes = 0;
++	struct phy_led *phyled;
++	u32 index;
++	int err;
++
++	phyled = devm_kzalloc(dev, sizeof(*phyled), GFP_KERNEL);
++	if (!phyled)
++		return -ENOMEM;
++
++	cdev = &phyled->led_cdev;
++	phyled->phydev = phydev;
++
++	err = of_property_read_u32(led, "reg", &index);
++	if (err)
++		return err;
++	if (index > U8_MAX)
++		return -EINVAL;
++
++	if (of_property_read_bool(led, "active-high"))
++		set_bit(PHY_LED_ACTIVE_HIGH, &modes);
++	if (of_property_read_bool(led, "active-low"))
++		set_bit(PHY_LED_ACTIVE_LOW, &modes);
++	if (of_property_read_bool(led, "inactive-high-impedance"))
++		set_bit(PHY_LED_INACTIVE_HIGH_IMPEDANCE, &modes);
++
++	if (WARN_ON(modes & BIT(PHY_LED_ACTIVE_LOW) &&
++		    modes & BIT(PHY_LED_ACTIVE_HIGH)))
++		return -EINVAL;
++
++	if (modes) {
++		/* Return error if asked to set polarity modes but not supported */
++		if (!phydev->drv->led_polarity_set)
++			return -EINVAL;
++
++		err = phydev->drv->led_polarity_set(phydev, index, modes);
++		if (err)
++			return err;
++	}
++
++	phyled->index = index;
++	if (phydev->drv->led_brightness_set)
++		cdev->brightness_set_blocking = phy_led_set_brightness;
++	if (phydev->drv->led_blink_set)
++		cdev->blink_set = phy_led_blink_set;
++
++#ifdef CONFIG_LEDS_TRIGGERS
++	if (phydev->drv->led_hw_is_supported &&
++	    phydev->drv->led_hw_control_set &&
++	    phydev->drv->led_hw_control_get) {
++		cdev->hw_control_is_supported = phy_led_hw_is_supported;
++		cdev->hw_control_set = phy_led_hw_control_set;
++		cdev->hw_control_get = phy_led_hw_control_get;
++		cdev->hw_control_trigger = "netdev";
++	}
++
++	cdev->hw_control_get_device = phy_led_hw_control_get_device;
++#endif
++	cdev->max_brightness = 1;
++	init_data.devicename = dev_name(&phydev->mdio.dev);
++	init_data.fwnode = of_fwnode_handle(led);
++	init_data.devname_mandatory = true;
++
++	err = led_classdev_register_ext(dev, cdev, &init_data);
++	if (err)
++		return err;
++
++	list_add(&phyled->list, &phydev->leds);
++
++	return 0;
++}
++
++static int of_phy_leds(struct phy_device *phydev)
++{
++	struct device_node *node = phydev->mdio.dev.of_node;
++	struct device_node *leds, *led;
++	int err;
++
++	if (!IS_ENABLED(CONFIG_OF_MDIO))
++		return 0;
++
++	if (!node)
++		return 0;
++
++	leds = of_get_child_by_name(node, "leds");
++	if (!leds)
++		return 0;
++
++	for_each_available_child_of_node(leds, led) {
++		err = of_phy_led(phydev, led);
++		if (err) {
++			of_node_put(led);
++			of_node_put(leds);
++			phy_leds_unregister(phydev);
++			return err;
++		}
++	}
++
++	of_node_put(leds);
++	return 0;
++}
++
+ /**
+  * phy_probe - probe and init a PHY device
+  * @dev: device to probe and init
+@@ -2613,6 +2818,12 @@ static int phy_probe(struct device *dev)
+ 	/* Set the state to READY by default */
+ 	phydev->state = PHY_READY;
+ 
++	/* Get the LEDs from the device tree, and instantiate standard
++	 * LEDs for them.
++	 */
++	if (IS_ENABLED(CONFIG_PHYLIB_LEDS))
++		err = of_phy_leds(phydev);
++
+ out:
+ 	mutex_unlock(&phydev->lock);
+ 
+@@ -2625,6 +2836,9 @@ static int phy_remove(struct device *dev)
+ 
+ 	cancel_delayed_work_sync(&phydev->state_queue);
+ 
++	if (IS_ENABLED(CONFIG_PHYLIB_LEDS))
++		phy_leds_unregister(phydev);
++
+ 	mutex_lock(&phydev->lock);
+ 	phydev->state = PHY_DOWN;
+ 	mutex_unlock(&phydev->lock);
+diff --git a/include/linux/leds.h b/include/linux/leds.h
+index efb309d..d5ef91a 100644
+--- a/include/linux/leds.h
++++ b/include/linux/leds.h
+@@ -139,6 +139,49 @@ struct led_classdev {
+ 	void			*trigger_data;
+ 	/* true if activated - deactivate routine uses it to do cleanup */
+ 	bool			activated;
++
++	/* Unique trigger name supported by LED set in hw control mode */
++	const char		*hw_control_trigger;
++	/*
++	 * Check if the LED driver supports the requested mode provided by the
++	 * defined supported trigger to setup the LED to hw control mode.
++	 *
++	 * Return 0 on success. Return -EOPNOTSUPP when the passed flags are not
++	 * supported and software fallback needs to be used.
++	 * Return a negative error number on any other case  for check fail due
++	 * to various reason like device not ready or timeouts.
++	 */
++	int			(*hw_control_is_supported)(struct led_classdev *led_cdev,
++							   unsigned long flags);
++	/*
++	 * Activate hardware control, LED driver will use the provided flags
++	 * from the supported trigger and setup the LED to be driven by hardware
++	 * following the requested mode from the trigger flags.
++	 * Deactivate hardware blink control by setting brightness to LED_OFF via
++	 * the brightness_set() callback.
++	 *
++	 * Return 0 on success, a negative error number on flags apply fail.
++	 */
++	int			(*hw_control_set)(struct led_classdev *led_cdev,
++						  unsigned long flags);
++	/*
++	 * Get from the LED driver the current mode that the LED is set in hw
++	 * control mode and put them in flags.
++	 * Trigger can use this to get the initial state of a LED already set in
++	 * hardware blink control.
++	 *
++	 * Return 0 on success, a negative error number on failing parsing the
++	 * initial mode. Error from this function is NOT FATAL as the device
++	 * may be in a not supported initial state by the attached LED trigger.
++	 */
++	int			(*hw_control_get)(struct led_classdev *led_cdev,
++						  unsigned long *flags);
++	/*
++	 * Get the device this LED blinks in response to.
++	 * e.g. for a PHY LED, it is the network device. If the LED is
++	 * not yet associated to a device, return NULL.
++	 */
++	struct device		*(*hw_control_get_device)(struct led_classdev *led_cdev);
+ #endif
+ 
+ #ifdef CONFIG_LEDS_BRIGHTNESS_HW_CHANGED
+@@ -455,6 +498,24 @@ static inline void *led_get_trigger_data(struct led_classdev *led_cdev)
+ 
+ #endif /* CONFIG_LEDS_TRIGGERS */
+ 
++/* Trigger specific enum */
++enum led_trigger_netdev_modes {
++	TRIGGER_NETDEV_LINK = 0,
++	TRIGGER_NETDEV_LINK_10,
++	TRIGGER_NETDEV_LINK_100,
++	TRIGGER_NETDEV_LINK_1000,
++	TRIGGER_NETDEV_LINK_2500,
++	TRIGGER_NETDEV_LINK_5000,
++	TRIGGER_NETDEV_LINK_10000,
++	TRIGGER_NETDEV_HALF_DUPLEX,
++	TRIGGER_NETDEV_FULL_DUPLEX,
++	TRIGGER_NETDEV_TX,
++	TRIGGER_NETDEV_RX,
++
++	/* Keep last */
++	__TRIGGER_NETDEV_MAX,
++};
++
+ /* Trigger specific functions */
+ #ifdef CONFIG_LEDS_TRIGGER_DISK
+ extern void ledtrig_disk_activity(bool write);
+diff --git a/include/linux/phy.h b/include/linux/phy.h
+index fb21ddb..a9c2842 100644
+--- a/include/linux/phy.h
++++ b/include/linux/phy.h
+@@ -14,6 +14,7 @@
+ #include <linux/compiler.h>
+ #include <linux/spinlock.h>
+ #include <linux/ethtool.h>
++#include <linux/leds.h>
+ #include <linux/linkmode.h>
+ #include <linux/mdio.h>
+ #include <linux/mii.h>
+@@ -462,6 +463,7 @@ struct phy_device {
+ 
+ 	struct phy_led_trigger *led_link_trigger;
+ #endif
++	struct list_head leds;
+ 
+ 	/*
+ 	 * Interrupt number for this PHY
+@@ -502,6 +506,33 @@ struct phy_device {
+ #define to_phy_device(d) container_of(to_mdio_device(d), \
+ 				      struct phy_device, mdio)
+ 
++/**
++ * struct phy_led: An LED driven by the PHY
++ *
++ * @list: List of LEDs
++ * @phydev: PHY this LED is attached to
++ * @led_cdev: Standard LED class structure
++ * @index: Number of the LED
++ */
++struct phy_led {
++	struct list_head list;
++	struct phy_device *phydev;
++	struct led_classdev led_cdev;
++	u8 index;
++};
++
++#define to_phy_led(d) container_of(d, struct phy_led, led_cdev)
++
++/* Modes for PHY LED configuration */
++enum phy_led_modes {
++	PHY_LED_ACTIVE_HIGH = 0,
++	PHY_LED_ACTIVE_LOW = 1,
++	PHY_LED_INACTIVE_HIGH_IMPEDANCE = 2,
++
++	/* keep it last */
++	__PHY_LED_MODES_NUM,
++};
++
+ /* struct phy_driver: Driver structure for a particular PHY type
+  *
+  * driver_data: static driver data
+@@ -705,6 +736,73 @@ struct phy_driver {
+ 			    struct ethtool_tunable *tuna,
+ 			    const void *data);
+ 	int (*set_loopback)(struct phy_device *dev, bool enable);
++
++	/**
++	 * @led_brightness_set: Set a PHY LED brightness. Index
++	 * indicates which of the PHYs led should be set. Value
++	 * follows the standard LED class meaning, e.g. LED_OFF,
++	 * LED_HALF, LED_FULL.
++	 */
++	int (*led_brightness_set)(struct phy_device *dev,
++				  u8 index, enum led_brightness value);
++
++	/**
++	 * @led_blink_set: Set a PHY LED blinking.  Index indicates
++	 * which of the PHYs led should be configured to blink. Delays
++	 * are in milliseconds and if both are zero then a sensible
++	 * default should be chosen.  The call should adjust the
++	 * timings in that case and if it can't match the values
++	 * specified exactly.
++	 */
++	int (*led_blink_set)(struct phy_device *dev, u8 index,
++			     unsigned long *delay_on,
++			     unsigned long *delay_off);
++	/**
++	 * @led_hw_is_supported: Can the HW support the given rules.
++	 * @dev: PHY device which has the LED
++	 * @index: Which LED of the PHY device
++	 * @rules The core is interested in these rules
++	 *
++	 * Return 0 if yes,  -EOPNOTSUPP if not, or an error code.
++	 */
++	int (*led_hw_is_supported)(struct phy_device *dev, u8 index,
++				   unsigned long rules);
++	/**
++	 * @led_hw_control_set: Set the HW to control the LED
++	 * @dev: PHY device which has the LED
++	 * @index: Which LED of the PHY device
++	 * @rules The rules used to control the LED
++	 *
++	 * Returns 0, or a an error code.
++	 */
++	int (*led_hw_control_set)(struct phy_device *dev, u8 index,
++				  unsigned long rules);
++	/**
++	 * @led_hw_control_get: Get how the HW is controlling the LED
++	 * @dev: PHY device which has the LED
++	 * @index: Which LED of the PHY device
++	 * @rules Pointer to the rules used to control the LED
++	 *
++	 * Set *@rules to how the HW is currently blinking. Returns 0
++	 * on success, or a error code if the current blinking cannot
++	 * be represented in rules, or some other error happens.
++	 */
++	int (*led_hw_control_get)(struct phy_device *dev, u8 index,
++				  unsigned long *rules);
++
++	/**
++	 * @led_polarity_set: Set the LED polarity modes
++	 * @dev: PHY device which has the LED
++	 * @index: Which LED of the PHY device
++	 * @modes: bitmap of LED polarity modes
++	 *
++	 * Configure LED with all the required polarity modes in @modes
++	 * to make it correctly turn ON or OFF.
++	 *
++	 * Returns 0, or an error code.
++	 */
++	int (*led_polarity_set)(struct phy_device *dev, int index,
++				unsigned long modes);
+ };
+ #define to_phy_driver(d) container_of(to_mdio_common_driver(d),		\
+ 				      struct phy_driver, mdiodrv)
