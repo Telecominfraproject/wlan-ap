@@ -26,8 +26,8 @@ static int an8855_nl_response(struct sk_buff *skb, struct genl_info *info);
 static const struct nla_policy an8855_nl_cmd_policy[] = {
 	[AN8855_ATTR_TYPE_MESG] = { .type = NLA_STRING },
 	[AN8855_ATTR_TYPE_PHY] = { .type = NLA_S32 },
-	[AN8855_ATTR_TYPE_REG] = { .type = NLA_S32 },
-	[AN8855_ATTR_TYPE_VAL] = { .type = NLA_S32 },
+	[AN8855_ATTR_TYPE_REG] = { .type = NLA_U32 },
+	[AN8855_ATTR_TYPE_VAL] = { .type = NLA_U32 },
 	[AN8855_ATTR_TYPE_DEV_NAME] = { .type = NLA_S32 },
 	[AN8855_ATTR_TYPE_DEV_ID] = { .type = NLA_S32 },
 	[AN8855_ATTR_TYPE_DEVAD] = { .type = NLA_S32 },
@@ -202,15 +202,15 @@ err:
 static int an8855_nl_reply_read(struct genl_info *info, struct gsw_an8855 *gsw)
 {
 	struct sk_buff *rep_skb = NULL;
-	s32 phy, devad, reg;
-	int value;
+	s32 phy, devad;
+	u32 reg = 0;
+	int value = 0;
 	int ret = 0;
 
 	phy = an8855_nl_get_s32(info, AN8855_ATTR_TYPE_PHY, -1);
 	devad = an8855_nl_get_s32(info, AN8855_ATTR_TYPE_DEVAD, -1);
-	reg = an8855_nl_get_s32(info, AN8855_ATTR_TYPE_REG, -1);
 
-	if (reg < 0)
+	if (an8855_nl_get_u32(info, AN8855_ATTR_TYPE_REG, &reg))
 		goto err;
 
 	ret = an8855_nl_prepare_reply(info, AN8855_CMD_READ, &rep_skb);
@@ -226,11 +226,11 @@ static int an8855_nl_reply_read(struct genl_info *info, struct gsw_an8855 *gsw)
 		value = an8855_reg_read(gsw, reg);
 	}
 
-	ret = nla_put_s32(rep_skb, AN8855_ATTR_TYPE_REG, reg);
+	ret = nla_put_u32(rep_skb, AN8855_ATTR_TYPE_REG, reg);
 	if (ret < 0)
 		goto err;
 
-	ret = nla_put_s32(rep_skb, AN8855_ATTR_TYPE_VAL, value);
+	ret = nla_put_u32(rep_skb, AN8855_ATTR_TYPE_VAL, value);
 	if (ret < 0)
 		goto err;
 
@@ -246,18 +246,16 @@ err:
 static int an8855_nl_reply_write(struct genl_info *info, struct gsw_an8855 *gsw)
 {
 	struct sk_buff *rep_skb = NULL;
-	s32 phy, devad, reg;
-	u32 value;
+	s32 phy, devad;
+	u32 value = 0, reg = 0;
 	int ret = 0;
 
 	phy = an8855_nl_get_s32(info, AN8855_ATTR_TYPE_PHY, -1);
 	devad = an8855_nl_get_s32(info, AN8855_ATTR_TYPE_DEVAD, -1);
-	reg = an8855_nl_get_s32(info, AN8855_ATTR_TYPE_REG, -1);
-
-	if (an8855_nl_get_u32(info, AN8855_ATTR_TYPE_VAL, &value))
+	if (an8855_nl_get_u32(info, AN8855_ATTR_TYPE_REG, &reg))
 		goto err;
 
-	if (reg < 0)
+	if (an8855_nl_get_u32(info, AN8855_ATTR_TYPE_VAL, &value))
 		goto err;
 
 	ret = an8855_nl_prepare_reply(info, AN8855_CMD_WRITE, &rep_skb);
@@ -273,11 +271,11 @@ static int an8855_nl_reply_write(struct genl_info *info, struct gsw_an8855 *gsw)
 		an8855_reg_write(gsw, reg, value);
 	}
 
-	ret = nla_put_s32(rep_skb, AN8855_ATTR_TYPE_REG, reg);
+	ret = nla_put_u32(rep_skb, AN8855_ATTR_TYPE_REG, reg);
 	if (ret < 0)
 		goto err;
 
-	ret = nla_put_s32(rep_skb, AN8855_ATTR_TYPE_VAL, value);
+	ret = nla_put_u32(rep_skb, AN8855_ATTR_TYPE_VAL, value);
 	if (ret < 0)
 		goto err;
 

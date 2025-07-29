@@ -12,6 +12,8 @@
 
 #include <linux/bitops.h>
 
+#define AN8855_NUM_PHYS	5
+
 /*phy calibration use*/
 #define DEV_1E				0x1E
 /*global device 0x1f, always set P0*/
@@ -169,10 +171,68 @@
 /* PHY EEE Register bitmap of define */
 #define PHY_DEV07			0x07
 #define PHY_DEV07_REG_03C		0x3c
+#define ADV_EEE_100			0x2
+#define ADV_EEE_1000		0x4
 
 /* PHY DEV 0x1e Register bitmap of define */
 #define PHY_DEV1E			0x1e
+/* PHY TX PAIR DELAY SELECT Register */
+#define PHY_TX_PAIR_DLY_SEL_GBE		0x013
+/* PHY ADC Register */
+#define PHY_RXADC_CTRL				0x0d8
+#define PHY_RXADC_REV_0				0x0d9
+#define PHY_RXADC_REV_1				0x0da
+
+/* PHY LED Register bitmap of define */
+#define PHY_LED_CTRL_SELECT		0x3e8
+#define PHY_SINGLE_LED_ON_CTRL(i)	(0x3e0 + ((i) * 2))
+#define PHY_SINGLE_LED_BLK_CTRL(i)	(0x3e1 + ((i) * 2))
+#define PHY_SINGLE_LED_ON_DUR(i)	(0x3e9 + ((i) * 2))
+#define PHY_SINGLE_LED_BLK_DUR(i)	(0x3ea + ((i) * 2))
+
+#define PHY_PMA_CTRL	(0x340)
+
 #define PHY_DEV1F			0x1f
+
+#define PHY_LED_ON_CTRL(i)		(0x24 + ((i) * 2))
+#define LED_ON_EN				(1 << 15)
+#define LED_ON_POL				(1 << 14)
+#define LED_ON_EVT_MASK			(0x7f)
+
+/* LED ON Event */
+#define LED_ON_EVT_FORCE		(1 << 6)
+#define LED_ON_EVT_LINK_HD		(1 << 5)
+#define LED_ON_EVT_LINK_FD		(1 << 4)
+#define LED_ON_EVT_LINK_DOWN	(1 << 3)
+#define LED_ON_EVT_LINK_10M		(1 << 2)
+#define LED_ON_EVT_LINK_100M	(1 << 1)
+#define LED_ON_EVT_LINK_1000M	(1 << 0)
+
+#define PHY_LED_BLK_CTRL(i)		(0x25 + ((i) * 2))
+#define LED_BLK_EVT_MASK		(0x3ff)
+/* LED Blinking Event */
+#define LED_BLK_EVT_FORCE			(1 << 9)
+#define LED_BLK_EVT_10M_RX_ACT		(1 << 5)
+#define LED_BLK_EVT_10M_TX_ACT		(1 << 4)
+#define LED_BLK_EVT_100M_RX_ACT		(1 << 3)
+#define LED_BLK_EVT_100M_TX_ACT		(1 << 2)
+#define LED_BLK_EVT_1000M_RX_ACT	(1 << 1)
+#define LED_BLK_EVT_1000M_TX_ACT	(1 << 0)
+
+#define PHY_LED_BCR				(0x21)
+#define LED_BCR_EXT_CTRL		(1 << 15)
+#define LED_BCR_CLK_EN			(1 << 3)
+#define LED_BCR_TIME_TEST		(1 << 2)
+#define LED_BCR_MODE_MASK		(3)
+#define LED_BCR_MODE_DISABLE	(0)
+
+#define PHY_LED_ON_DUR			(0x22)
+#define LED_ON_DUR_MASK			(0xffff)
+
+#define PHY_LED_BLK_DUR			(0x23)
+#define LED_BLK_DUR_MASK		(0xffff)
+
+#define PHY_LED_BLINK_DUR_CTRL	(0x720)
 
 /* Proprietory Control Register of Internal Phy device 0x1e */
 #define PHY_TX_MLT3_BASE		0x0

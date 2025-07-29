@@ -26,6 +26,7 @@
 #include <linux/ethtool.h>
 #include <linux/phy.h>
 #include <linux/delay.h>
+#include <linux/debugfs.h>
 
 #include <linux/uaccess.h>
 #include <linux/version.h>
@@ -61,13 +62,16 @@ enum {
 	PHY_STATE_PROCESS = 2,
 	PHY_STATE_FAIL = 3,
 };
-
+#define CONFIG_EN8801S_DEBUGFS
 struct en8801s_priv {
 	bool first_init;
 	u16 count;
 	u16 pro_version;
 #if (KERNEL_VERSION(4, 16, 0) > LINUX_VERSION_CODE)
 	struct gpio_desc *hw_reset;
+#endif
+#ifdef CONFIG_EN8801S_DEBUGFS
+	struct dentry        *debugfs_root;
 #endif
 };
 
@@ -101,11 +105,48 @@ static const u16 led_dur = UNIT_LED_BLINK_DURATION << AIR_LED_BLK_DUR_64M;
 #endif
 
 /* User-defined.E */
+#ifdef CONFIG_EN8801S_DEBUGFS
+#define EN8801S_DEBUGFS_POLARITY_HELP_STRING \
+	"\nUsage: echo [tx_polarity] [rx_polarity] > /sys/" \
+	"kernel/debug/mdio-bus\':[phy_addr]/polarity" \
+	"\npolarity: tx_normal, tx_reverse, rx_normal, rx_reverse" \
+	"\ntx_normal is tx polarity is normal." \
+	"\ntx_reverse is tx polarity need to be swapped." \
+	"\nrx_normal is rx polarity is normal." \
+	"\nrx_reverse is rx polarity need to be swapped." \
+	"\nFor example tx polarity need to be swapped. " \
+	"But rx polarity is normal." \
+	"\necho tx_reverse rx_normal > /sys/" \
+	"kernel/debug/mdio-bus\':[phy_addr]/polarity" \
+	"\n"
+#define EN8801S_DEBUGFS_RX_ERROR_STRING \
+	"\nRx param is not correct." \
+	"\nrx_normal: rx polarity is normal." \
+	"rx_reverse: rx polarity is reverse.\n"
+#define EN8801S_DEBUGFS_TX_ERROR_STRING \
+	"\nTx param is not correct." \
+	"\ntx_normal: tx polarity is normal." \
+	"tx_reverse: tx polarity is reverse.\n"
+#define EN8801S_DEBUGFS_PBUS_HELP_STRING \
+	"\nUsage: echo w [pbus_addr] [pbus_reg] [value] > /sys/" \
+	"kernel/debug/mdio-bus\':[phy_addr]/pbus_reg_op" \
+	"\n       echo r [pbus_addr] [pbus_reg] > /sys/" \
+	"kernel/debug/mdio-bus\':[phy_addr]/pbus_reg_op" \
+	"\nRead example: PBUS addr 0x19, Register 0x19a4" \
+	"\necho r 0x19 0x19a4 > /sys/" \
+	"kernel/debug/mdio-bus\':[phy_addr]/pbus_reg_op" \
+	"\nWrite example: PBUS addr 0x19, Register 0xcf8 0x1a01503" \
+	"\necho w 0x19 0xcf8 0x1a01503> /sys/" \
+	"kernel/debug/mdio-bus\':[phy_addr]/pbus_reg_op" \
+	"\n"
+#endif
 
 /************************************************************************
 *                  F U N C T I O N S
 ************************************************************************/
 static int en8801s_phase2_init(struct phy_device *phydev);
+static void air_debugfs_remove(struct phy_device *phydev);
+static int en8801s_debugfs_init(struct phy_device *phydev);
 static unsigned int airoha_cl22_read(struct mii_bus *ebus, int phy_addr,
 			unsigned int phy_register, unsigned int *read_data)
 {
@@ -530,20 +571,19 @@ static int en8801s_phase1_init(struct phy_device *phydev)
 	mdelay(500);
 	if (priv->pro_version == 4) {
 		pbus_data = airoha_pbus_read(mbus, pbus_addr, 0x1900);
-		dev_dbg(dev, "Before 0x1900 0x%x\n", pbus_data);
+		dev_dbg(dev, "Before 0x1900 0x%lx\n", pbus_data);
 		ret = airoha_pbus_write(mbus, pbus_addr, 0x1900, 0x101009f);
 		if (ret < 0)
 			return ret;
 		pbus_data = airoha_pbus_read(mbus, pbus_addr, 0x1900);
-		dev_dbg(dev, "After 0x1900 0x%x\n", pbus_data);
+		dev_dbg(dev, "After 0x1900 0x%lx\n", pbus_data);
 		pbus_data = airoha_pbus_read(mbus, pbus_addr, 0x19a8);
-		dev_dbg(dev, "Before 19a8 0x%x\n", pbus_data);
-		ret = airoha_pbus_write(mbus, pbus_addr,
-				0x19a8, pbus_data & ~BIT(16));
+		dev_dbg(dev, "Before 19a8 0x%lx\n", pbus_data);
+		ret = airoha_pbus_write(mbus, pbus_addr, 0x19a8, pbus_data & ~BIT(16));
 		if (ret < 0)
 			return ret;
 		pbus_data = airoha_pbus_read(mbus, pbus_addr, 0x19a8);
-		dev_dbg(dev, "After 19a8 0x%x\n", pbus_data);
+		dev_dbg(dev, "After 19a8 0x%lx\n", pbus_data);
 	}
 	pbus_data = airoha_pbus_read(mbus, pbus_addr,
 				EN8801S_RG_SMI_ADDR); /* SMI ADDR */
@@ -587,7 +627,7 @@ static int en8801s_phase1_init(struct phy_device *phydev)
 
 	phydev->dev_flags = PHY_STATE_INIT;
 
-	dev_info(dev, "Phase1 initialize OK ! (%s) 10Te TP_IDL fixed.\n", EN8801S_DRIVER_VERSION);
+	dev_info(dev, "Phase1 initialize OK ! (%s)\n", EN8801S_DRIVER_VERSION);
 	if (priv->pro_version == 4) {
 		ret = en8801s_phase2_init(phydev);
 		if (ret != 0) {
@@ -811,7 +851,14 @@ static int en8801s_phase2_init(struct phy_device *phydev)
 		retry--;
 	}
 	pbus_data = airoha_pbus_read(mbus, pbus_addr, 0x1C38); /* RAW#2 */
-	ret = airoha_cl45_write(mbus, phy_addr, 0x1E, 0x12, 0xA018);
+	ret = airoha_cl45_read(mbus, phy_addr, 0x1E, 0x12, &cl45_value);
+	if (ret < 0)
+		return ret;
+	GPHY_RG_1E_012.DATA = cl45_value;
+	GPHY_RG_1E_012.DataBitField.da_tx_i2mpb_a_tbt =
+				(u16)(pbus_data & 0x03f);
+	ret = airoha_cl45_write(mbus, phy_addr, 0x1E, 0x12,
+				GPHY_RG_1E_012.DATA);
 	if (ret < 0)
 		return ret;
 	ret = airoha_cl45_read(mbus, phy_addr, 0x1E, 0x17, &cl45_value);
@@ -885,17 +932,6 @@ static int en8801s_phase2_init(struct phy_device *phydev)
 			mdelay(10);
 		}
 	}
-
-	//Fix 10Te TP_IDL
-	ret = airoha_cl45_read(mbus, phy_addr, 0x1E,
-				0x1A3, &cl45_value);
-	if (ret < 0)
-		return ret;
-	cl45_value &= ~0xf0;
-	ret = airoha_cl45_write(mbus, phy_addr, 0x1E,
-				0x1A3, cl45_value);
-	if (ret < 0)
-		return ret;
 
 	priv->first_init = false;
 	dev_info(phydev_dev(phydev), "Phase2 initialize OK !\n");
@@ -1055,6 +1091,7 @@ static int en8801s_probe(struct phy_device *phydev)
 	unsigned long phy_addr = phydev_phy_addr(phydev);
 	struct mii_bus *mbus = phydev_mdio_bus(phydev);
 	struct device *dev = &mbus->dev;
+	int ret = 0;
 #if (KERNEL_VERSION(4, 16, 0) > LINUX_VERSION_CODE)
 	struct gpio_desc *en8801s_reset;
 	int err = 0;
@@ -1068,7 +1105,15 @@ static int en8801s_probe(struct phy_device *phydev)
 
 	priv->count = 0;
 	priv->first_init = true;
-
+	phydev->priv = priv;
+#ifdef CONFIG_EN8801S_DEBUGFS
+	ret = en8801s_debugfs_init(phydev);
+	if (ret < 0) {
+		air_debugfs_remove(phydev);
+		kfree(priv);
+		return ret;
+	}
+#endif
 #if (KERNEL_VERSION(4, 16, 0) > LINUX_VERSION_CODE)
 	/* Assert the optional reset signal */
 	en8801s_reset = gpiod_get_optional(&phydev->dev,
@@ -1097,6 +1142,276 @@ static int en8801s_probe(struct phy_device *phydev)
 	phydev->priv = priv;
 
 	return 0;
+}
+
+static const char * const tx_rx_string[32] = {
+		"Tx Normal, Rx Reverse",
+		"Tx Reverse, Rx Reverse",
+		"Tx Normal, Rx Normal",
+		"Tx Reverse, Rx Normal",
+};
+
+static int en8801s_counter_show(struct seq_file *seq, void *v)
+{
+	struct phy_device *phydev = seq->private;
+	struct mii_bus *mbus = phydev_mdio_bus(phydev);
+	int ret = 0;
+	u32 pkt_cnt = 0;
+	int pbus_addr = phydev_pbus_addr(phydev);
+
+	seq_puts(seq, "==========AIR PHY COUNTER==========\n");
+	seq_puts(seq, "|\t<<FCM COUNTER>>\n");
+	seq_puts(seq, "| Rx from Line side_S        :");
+	pkt_cnt = airoha_pbus_read(mbus, pbus_addr, 0x1490);
+	seq_printf(seq, "%010u |\n", pkt_cnt);
+	seq_puts(seq, "| Rx from Line side_T        :");
+	pkt_cnt = airoha_pbus_read(mbus, pbus_addr, 0x1494);
+	seq_printf(seq, "%010u |\n", pkt_cnt);
+	seq_puts(seq, "| Tx to System side_S        :");
+	pkt_cnt = airoha_pbus_read(mbus, pbus_addr, 0x149c);
+	seq_printf(seq, "%010u |\n", pkt_cnt);
+	seq_puts(seq, "| Tx to System side_T        :");
+	pkt_cnt = airoha_pbus_read(mbus, pbus_addr, 0x14a0);
+	seq_printf(seq, "%010u |\n", pkt_cnt);
+	seq_puts(seq, "| Rx from System side_S      :");
+	pkt_cnt = airoha_pbus_read(mbus, pbus_addr, 0x1478);
+	seq_printf(seq, "%010u |\n", pkt_cnt);
+	seq_puts(seq, "| Rx from System side_T      :");
+	pkt_cnt = airoha_pbus_read(mbus, pbus_addr, 0x147c);
+	seq_printf(seq, "%010u |\n", pkt_cnt);
+	seq_puts(seq, "| Tx to Line side_S          :");
+	pkt_cnt = airoha_pbus_read(mbus, pbus_addr, 0x1484);
+	seq_printf(seq, "%010u |\n", pkt_cnt);
+	seq_puts(seq, "| Tx to Line side_T          :");
+	pkt_cnt = airoha_pbus_read(mbus, pbus_addr, 0x1488);
+	seq_printf(seq, "%010u |\n", pkt_cnt);
+	seq_puts(seq, "| Rx from Line side_PAUSE    :");
+	pkt_cnt = airoha_pbus_read(mbus, pbus_addr, 0x1498);
+	seq_printf(seq, "%010u |\n", pkt_cnt);
+	seq_puts(seq, "| Tx to System side_PAUSE    :");
+	pkt_cnt = airoha_pbus_read(mbus, pbus_addr, 0x14a4);
+	seq_printf(seq, "%010u |\n", pkt_cnt);
+	seq_puts(seq, "| Rx from System side_PAUSE  :");
+	pkt_cnt = airoha_pbus_read(mbus, pbus_addr, 0x1480);
+	seq_printf(seq, "%010u |\n", pkt_cnt);
+	seq_puts(seq, "| Tx to Line side_PAUSE      :");
+	pkt_cnt = airoha_pbus_read(mbus, pbus_addr, 0x148c);
+	seq_printf(seq, "%010u |\n", pkt_cnt);
+
+
+	ret = airoha_pbus_write(mbus, pbus_addr, 0x1474, 0x3);
+	if (ret < 0)
+		seq_puts(seq, "\nClear Counter fail\n");
+	else
+		seq_puts(seq, "\nClear Counter!!\n");
+
+	return ret;
+}
+
+static int en8801s_counter_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, en8801s_counter_show, inode->i_private);
+}
+
+int en8801s_info_show(struct seq_file *seq, void *v)
+{
+	struct phy_device *phydev = seq->private;
+	struct mii_bus *mbus = phydev_mdio_bus(phydev);
+	int pbus_addr = phydev_pbus_addr(phydev);
+	unsigned int tx_rx =
+		(airoha_pbus_read(mbus, pbus_addr, EN8801S_RG_LTR_CTL) & 0x3);
+	unsigned long pbus_data = 0;
+
+	seq_puts(seq, "<<AIR EN8801S Driver Info>>\n");
+	pbus_data = airoha_pbus_read(mbus, pbus_addr, EN8801S_RG_PROD_VER);
+	pbus_data &= 0xf;
+	seq_printf(seq, "| Product Version : E%ld\n", pbus_data);
+	seq_printf(seq, "| Driver Version  : %s\n", EN8801S_DRIVER_VERSION);
+	pbus_data = airoha_pbus_read(mbus, pbus_addr, 0xb04);
+	seq_printf(seq, "| Serdes Status   : Rx_Sync(%01ld), AN_Done(%01ld)\n",
+		GET_BIT(pbus_data, 4), GET_BIT(pbus_data, 0));
+	seq_printf(seq, "| Tx, Rx Polarity : %s(%02d)\n",
+		tx_rx_string[tx_rx], tx_rx);
+
+	seq_puts(seq, "\n");
+
+	return 0;
+}
+
+static int en8801s_info_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, en8801s_info_show, inode->i_private);
+}
+
+
+static int en8801s_debugfs_pbus_help(void)
+{
+	pr_notice(EN8801S_DEBUGFS_PBUS_HELP_STRING);
+	return 0;
+}
+
+static ssize_t en8801s_debugfs_pbus(struct file *file,
+		const char __user *buffer, size_t count,
+		loff_t *data)
+{
+	struct phy_device *phydev = file->private_data;
+	struct mii_bus *mbus = phydev_mdio_bus(phydev);
+	char buf[64];
+	int ret = 0;
+	unsigned int reg, addr;
+	unsigned long val;
+
+	memset(buf, 0, 64);
+
+	if (copy_from_user(buf, buffer, count))
+		return -EFAULT;
+
+	if (buf[0] == 'w') {
+		if (sscanf(buf, "w %x %x %lx", &addr, &reg, &val) == -1)
+			return -EFAULT;
+		if (addr > 0 && addr < 32) {
+			pr_notice("\nphy=0x%x, reg=0x%x, val=0x%lx\n",
+				addr, reg, val);
+
+			ret = airoha_pbus_write(mbus, addr, reg, val);
+			if (ret < 0)
+				return ret;
+			pr_notice("\nphy=%d, reg=0x%x, val=0x%lx confirm..\n",
+				addr, reg,
+				airoha_pbus_read(mbus, addr, reg));
+		} else {
+			pr_notice("addr is out of range(1~32)\n");
+		}
+	} else if (buf[0] == 'r') {
+		if (sscanf(buf, "r %x %x", &addr, &reg) == -1)
+			return -EFAULT;
+		if (addr > 0 && addr < 32) {
+			pr_notice("\nphy=0x%x, reg=0x%x, val=0x%lx\n",
+				addr, reg,
+				airoha_pbus_read(mbus, addr, reg));
+		} else {
+			pr_notice("addr is out of range(1~32)\n");
+		}
+	} else if (buf[0] == 'h') {
+		en8801s_debugfs_pbus_help();
+	}
+
+	return count;
+}
+
+static int dbg_regs_show(struct seq_file *seq, void *v)
+{
+	struct phy_device *phydev = seq->private;
+	struct mii_bus *mbus = phydev_mdio_bus(phydev);
+	int pbus_addr = phydev_pbus_addr(phydev), reg;
+
+	seq_puts(seq, "\t<<DEBUG REG DUMP>>\n");
+	for (reg = MII_BMCR; reg <= MII_STAT1000; reg++) {
+		if ((reg <= MII_LPA) || (reg >= MII_CTRL1000))
+			seq_printf(seq, "| RG_MII 0x%02x   : 0x%08x\n",
+				reg, phy_read(phydev, reg));
+	}
+	seq_printf(seq, "| RG_SERDES_1    : 0x%08lx |\n",
+		   airoha_pbus_read(mbus, pbus_addr, 0x600));
+	seq_printf(seq, "| RG_SERDES_2    : 0x%08lx |\n",
+		   airoha_pbus_read(mbus, pbus_addr, 0x10));
+	seq_printf(seq, "| RG_SERDES_3    : 0x%08lx |\n",
+		   airoha_pbus_read(mbus, pbus_addr, 0x0));
+	seq_printf(seq, "| RG_SERDES_4    : 0x%08lx |\n",
+		   airoha_pbus_read(mbus, pbus_addr, 0xa14));
+	seq_printf(seq, "| RG_SERDES_5    : 0x%08lx |\n",
+		   airoha_pbus_read(mbus, pbus_addr, 0x1404));
+	seq_printf(seq, "| RG_SERDES_6    : 0x%08lx |\n",
+		   airoha_pbus_read(mbus, pbus_addr, 0x140c));
+	seq_printf(seq, "| RG_SERDES_7    : 0x%08lx |\n",
+		   airoha_pbus_read(mbus, pbus_addr, 0x1694));
+	return 0;
+}
+
+static int airphy_dbg_regs_show_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, dbg_regs_show, inode->i_private);
+}
+
+static const struct file_operations airphy_dbg_reg_show_fops = {
+	.owner = THIS_MODULE,
+	.open = airphy_dbg_regs_show_open,
+	.read = seq_read,
+	.llseek = noop_llseek,
+	.release = single_release,
+};
+
+static const struct file_operations en8801s_debugfs_pbus_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = en8801s_debugfs_pbus,
+	.llseek = noop_llseek,
+};
+
+static const struct file_operations en8801s_info_fops = {
+	.owner = THIS_MODULE,
+	.open = en8801s_info_open,
+	.read = seq_read,
+	.llseek = noop_llseek,
+	.release = single_release,
+};
+
+static const struct file_operations en8801s_counter_fops = {
+	.owner = THIS_MODULE,
+	.open = en8801s_counter_open,
+	.read = seq_read,
+	.llseek = noop_llseek,
+	.release = single_release,
+};
+
+static int en8801s_debugfs_init(struct phy_device *phydev)
+{
+	int ret = 0;
+	struct en8801s_priv *priv = phydev->priv;
+
+	dev_info(phydev_dev(phydev), "Debugfs init start\n");
+	priv->debugfs_root =
+		debugfs_create_dir(dev_name(phydev_dev(phydev)), NULL);
+	if (!priv->debugfs_root) {
+		dev_err(phydev_dev(phydev), "Debugfs init err\n");
+		ret = -ENOMEM;
+	}
+	debugfs_create_file(DEBUGFS_DRIVER_INFO, 0444,
+					priv->debugfs_root, phydev,
+					&en8801s_info_fops);
+	debugfs_create_file(DEBUGFS_COUNTER, 0644,
+					priv->debugfs_root, phydev,
+					&en8801s_counter_fops);
+	debugfs_create_file(DEBUGFS_PBUS_OP, S_IFREG | 0200,
+					priv->debugfs_root, phydev,
+					&en8801s_debugfs_pbus_fops);
+	debugfs_create_file(DEBUGFS_DBG_REG_SHOW, S_IFREG | 0444,
+					priv->debugfs_root, phydev,
+					&airphy_dbg_reg_show_fops);
+	return ret;
+}
+
+static void air_debugfs_remove(struct phy_device *phydev)
+{
+	struct en8801s_priv *priv = phydev->priv;
+
+	if (priv->debugfs_root != NULL) {
+		debugfs_remove_recursive(priv->debugfs_root);
+		priv->debugfs_root = NULL;
+	}
+}
+
+static void en8801s_phy_remove(struct phy_device *phydev)
+{
+	struct en8801s_priv *priv = (struct en8801s_priv *)phydev->priv;
+
+	if (priv) {
+#ifdef CONFIG_EN8801S_DEBUGFS
+		air_debugfs_remove(phydev);
+#endif
+		kfree(priv);
+		dev_info(phydev_dev(phydev), "EN8801S remove OK!\n");
+	}
 }
 
 #if (KERNEL_VERSION(4, 5, 0) < LINUX_VERSION_CODE)

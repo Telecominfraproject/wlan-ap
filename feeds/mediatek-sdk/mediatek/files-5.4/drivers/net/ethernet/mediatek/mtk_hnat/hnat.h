@@ -10,12 +10,16 @@
  *   Copyright (C) 2014-2016 Sean Wang <sean.wang@mediatek.com>
  *   Copyright (C) 2016-2017 John Crispin <blogic@openwrt.org>
  */
+#ifndef NF_HNAT_H
+#define NF_HNAT_H
 
 #include <linux/debugfs.h>
 #include <linux/string.h>
 #include <linux/if.h>
 #include <linux/if_ether.h>
+#include <net/dsa.h>
 #include <net/netevent.h>
+#include <net/netfilter/nf_conntrack_zones.h>
 #include <linux/mod_devicetable.h>
 #include "hnat_mcast.h"
 #include "nf_hnat_mtk.h"
@@ -76,8 +80,8 @@
 #define PPE_MCAST_H_E 0xE0
 #define PPE_MCAST_L_F 0x100
 #define PPE_MCAST_H_F 0x104
-#define PPE_MCAST_L_10 0xC00
-#define PPE_MCAST_H_10 0xC04
+#define PPE_MCAST_L_10 (-0x200)
+#define PPE_MCAST_H_10 (-0x200 + 0x4)
 #define PPE_MTU_DRP 0x108
 #define PPE_MTU_VLYR_0 0x10C
 #define PPE_MTU_VLYR_1 0x110
@@ -103,31 +107,13 @@
 #define PPE_MIB_CAH_RDATA 0X160
 #define PPE_SB_FIFO_DBG 0x170
 #define PPE_SBW_CTRL 0x174
+#define PPE_SB_WED0_CNT 0x18C
+#define PPE_CAH_DBG 0x190
+#define PPE_FLOW_CHK_STATUS 0x1B0
 
 #define GDMA1_FWD_CFG 0x500
 #define GDMA2_FWD_CFG 0x1500
 #define GDMA3_FWD_CFG 0x540
-
-/* QDMA Tx queue configuration */
-#define QTX_CFG(x)			(QDMA_BASE + ((x) * 0x10))
-#define QTX_CFG_HW_RESV_CNT_OFFSET	(8)
-#define QTX_CFG_SW_RESV_CNT_OFFSET	(0)
-
-#define QTX_SCH(x)			(QDMA_BASE + 0x4 + ((x) * 0x10))
-#define QTX_SCH_MIN_RATE_EN		BIT(27)
-#define QTX_SCH_MAX_RATE_EN		BIT(11)
-#define QTX_SCH_MIN_RATE_MAN_OFFSET	(20)
-#define QTX_SCH_MIN_RATE_EXP_OFFSET	(16)
-#define QTX_SCH_MAX_RATE_WGHT_OFFSET	(12)
-#define QTX_SCH_MAX_RATE_MAN_OFFSET	(4)
-#define QTX_SCH_MAX_RATE_EXP_OFFSET	(0)
-
-/* QDMA Tx scheduler configuration */
-#define QDMA_PAGE			(QDMA_BASE + 0x1f0)
-#define QDMA_TX_2SCH_BASE		(QDMA_BASE + 0x214)
-#define QTX_MIB_IF			(QDMA_BASE + 0x2bc)
-#define QDMA_TX_4SCH_BASE(x)		(QDMA_BASE + 0x398 + (((x) >> 1) * 0x4))
-#define QDMA_TX_SCH_WFQ_EN		BIT(15)
 
 /*--------------------------------------------------------------------------*/
 /* Register Mask*/
@@ -145,13 +131,29 @@
 #define HASH_MODE (0x3 << 14) /* RW */
 #define SCAN_MODE (0x3 << 16) /* RW */
 #define XMODE (0x3 << 18) /* RW */
+#define HASH_DBG (0x3 << 21) /* RW */
 #define TICK_SEL (0x1 << 24) /* RW */
 #define DSCP_TRFC_ECN_EN (0x1 << 25) /* RW */
 
 
 /*PPE_CAH_CTRL mask*/
 #define CAH_EN (0x1 << 0) /* RW */
+#define CAH_REQ (0x1 << 8) /* RW */
 #define CAH_X_MODE (0x1 << 9) /* RW */
+#define CAH_CMD (0x3 << 12) /* RW */
+#define CAH_DATA_SEL (0x3 << 18) /* RW */
+
+/*PPE_CAH_LINE_RW mask*/
+#define LINE_RW (0xffff << 0) /* RW */
+#define OFFSET_RW (0xff << 16) /* RW */
+
+/*PPE_CAH_TAG_SRH mask*/
+#define TAG_SRH (0xffff << 0) /* RW */
+#define SRH_LNUM (0x7fff << 16) /* RW */
+#define SRH_HIT (0x1 << 31) /* RW */
+
+/*PPE_MIB_SER_CR mask*/
+#define BIT_MIB_BUSY (1 << 16) /* RW */
 
 /*PPE_UNB_AGE mask*/
 #define UNB_DLTA (0xff << 0) /* RW */
@@ -188,8 +190,10 @@
 #define TTL0_DRP (0x1 << 4) /* RW */
 #define MCAST_TB_EN (0x1 << 7) /* RW */
 #define MCAST_HASH (0x3 << 12) /* RW */
+#define NEW_IPV4_ID_INC_EN (0x1 << 20) /* RW */
 #define SP_CMP_EN (0x1 << 25) /* RW */
 
+#define MC_P4_PPSE (0xf << 16) /* RW */
 #define MC_P3_PPSE (0xf << 12) /* RW */
 #define MC_P2_PPSE (0xf << 8) /* RW */
 #define MC_P1_PPSE (0xf << 4) /* RW */
@@ -207,15 +211,11 @@
 #define GDM_ALL_FRC_MASK                                                      \
 	(GDM_UFRC_MASK | GDM_BFRC_MASK | GDM_MFRC_MASK | GDM_OFRC_MASK)
 
-/*QDMA_PAGE mask*/
-#define QTX_CFG_PAGE (0xf << 0) /* RW */
-
-/*QTX_MIB_IF mask*/
-#define MIB_ON_QTX_CFG (0x1 << 31) /* RW */
-#define VQTX_MIB_EN (0x1 << 28) /* RW */
-
 /* PPE Side Band FIFO Debug Mask */
 #define SB_MED_FULL_DRP_EN (0x1 << 11)
+
+/* PPE Cache Debug status Mask */
+#define CAH_DBG_BUSY (0xf << 0)
 
 /*--------------------------------------------------------------------------*/
 /* Descriptor Structure */
@@ -359,6 +359,48 @@ struct hnat_info_blk2_whnat {
 	u32 dscp : 8; /* DSCP value */
 } __packed;
 
+struct hnat_l2_bridge {
+	union {
+		struct hnat_bind_info_blk bfib1;
+		struct hnat_unbind_info_blk udib1;
+		u32 info_blk1;
+	};
+	u32 dmac_hi;
+	u16 smac_lo;
+	u16 dmac_lo;
+	u32 smac_hi;
+	u16 etype;
+	u16 hph; /* hash placeholder */
+	u16 vlan1;
+	u16 vlan2;
+	u32 resv1;
+	u32 resv2;
+	union {
+		struct hnat_info_blk2 iblk2;
+		struct hnat_info_blk2_whnat iblk2w;
+		u32 info_blk2;
+	};
+	u32 resv3;
+	u32 resv4 : 24;
+	u32 act_dp : 8; /* UDF */
+	u16 new_vlan1;
+	u16 sp_tag;
+	u32 new_dmac_hi;
+	u16 new_vlan2;
+	u16 new_dmac_lo;
+	u32 new_smac_hi;
+	u16 resv5;
+	u16 new_smac_lo;
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+	u32 resv6;
+	struct hnat_winfo winfo;
+	struct hnat_winfo_pao winfo_pao;
+#elif defined(CONFIG_MEDIATEK_NETSYS_V2)
+	u16 minfo;
+	struct hnat_winfo winfo;
+#endif
+} __packed;
+
 struct hnat_ipv4_hnapt {
 	union {
 		struct hnat_bind_info_blk bfib1;
@@ -385,13 +427,13 @@ struct hnat_ipv4_hnapt {
 	u32 resv3_1 : 9;
 	u32 eg_keep_ecn : 1;
 	u32 eg_keep_dscp : 1;
-	u32 resv3_2:13;
+	u32 resv3_2 : 13;
 #else
-	u32 resv3:24;
+	u32 resv3 : 24;
 #endif
 	u32 act_dp : 8; /* UDF */
 	u16 vlan1;
-	u16 etype;
+	u16 sp_tag;
 	u32 dmac_hi;
 	union {
 #if !defined(CONFIG_MEDIATEK_NETSYS_V2) && !defined(CONFIG_MEDIATEK_NETSYS_V3)
@@ -444,12 +486,12 @@ struct hnat_ipv4_dslite {
 	u8 priority;    /* in order to consist with Linux kernel (should be 8bits) */
 	u32 hop_limit : 8;
 #if defined(CONFIG_MEDIATEK_NETSYS_V3)
-		u32 resv2_1 : 1;
-		u32 eg_keep_ecn : 1;
-		u32 eg_keep_cls : 1;
-		u32 resv2_2 : 13;
+	u32 resv2_1 : 1;
+	u32 eg_keep_ecn : 1;
+	u32 eg_keep_cls : 1;
+	u32 resv2_2 : 13;
 #else
-		u32 resv2 : 16;
+	u32 resv2 : 16;
 #endif
 	u32 act_dp : 8; /* UDF */
 
@@ -460,7 +502,7 @@ struct hnat_ipv4_dslite {
 	};
 
 	u16 vlan1;
-	u16 etype;
+	u16 sp_tag;
 	u32 dmac_hi;
 	union {
 #if !defined(CONFIG_MEDIATEK_NETSYS_V2) && !defined(CONFIG_MEDIATEK_NETSYS_V3)
@@ -529,7 +571,7 @@ struct hnat_ipv4_mape {
 	};
 
 	u16 vlan1;
-	u16 etype;
+	u16 sp_tag;
 	u32 dmac_hi;
 	union {
 #if !defined(CONFIG_MEDIATEK_NETSYS_V2) && !defined(CONFIG_MEDIATEK_NETSYS_V3)
@@ -601,7 +643,7 @@ struct hnat_ipv6_3t_route {
 		u32 info_blk2;
 	};
 	u16 vlan1;
-	u16 etype;
+	u16 sp_tag;
 	u32 dmac_hi;
 	union {
 #if !defined(CONFIG_MEDIATEK_NETSYS_V2) && !defined(CONFIG_MEDIATEK_NETSYS_V3)
@@ -666,7 +708,7 @@ struct hnat_ipv6_5t_route {
 	};
 
 	u16 vlan1;
-	u16 etype;
+	u16 sp_tag;
 	u32 dmac_hi;
 	union {
 #if !defined(CONFIG_MEDIATEK_NETSYS_V2) && !defined(CONFIG_MEDIATEK_NETSYS_V3)
@@ -739,7 +781,7 @@ struct hnat_ipv6_6rd {
 	};
 
 	u16 vlan1;
-	u16 etype;
+	u16 sp_tag;
 	u32 dmac_hi;
 	union {
 #if !defined(CONFIG_MEDIATEK_NETSYS_V2) && !defined(CONFIG_MEDIATEK_NETSYS_V3)
@@ -801,7 +843,7 @@ struct hnat_ipv6_hnapt {
 	};
 
 	u16 vlan1;
-	u16 etype;
+	u16 sp_tag;
 	u32 dmac_hi;
 	u16 vlan2;
 	u16 dmac_lo;
@@ -837,6 +879,7 @@ struct foe_entry {
 	union {
 		struct hnat_unbind_info_blk udib1;
 		struct hnat_bind_info_blk bfib1;
+		struct hnat_l2_bridge l2_bridge;
 		struct hnat_ipv4_hnapt ipv4_hnapt;
 		struct hnat_ipv4_dslite ipv4_dslite;
 		struct hnat_ipv4_mape ipv4_mape;
@@ -868,6 +911,12 @@ struct foe_entry {
 #endif
 #define CFG_PPE_NUM		(hnat_priv->ppe_num)
 
+#if defined(CONFIG_MEDIATEK_NETSYS_V2) || defined(CONFIG_MEDIATEK_NETSYS_V3)
+#define MAX_PPE_CACHE_NUM	(128)
+#else
+#define MAX_PPE_CACHE_NUM	(32)
+#endif
+
 /* If the user wants to set skb->mark to prevent hardware acceleration
  * for the packet flow.
  */
@@ -885,6 +934,8 @@ struct mib_entry {
 struct hnat_accounting {
 	u64 bytes;
 	u64 packets;
+	struct nf_conntrack_zone zone;
+	u8 dir;
 };
 
 enum mtk_hnat_version {
@@ -957,7 +1008,19 @@ struct mtk_hnat {
 	struct timer_list hnat_mcast_check_timer;
 	bool nf_stat_en;
 	struct xlat_conf xlat;
+	spinlock_t		cah_lock;
 	spinlock_t		entry_lock;
+	spinlock_t		flow_entry_lock;
+	struct hlist_head *foe_flow[MAX_PPE_NUM];
+	int fe_irq2;
+};
+
+struct hnat_flow_entry {
+	struct hlist_node list;
+	struct foe_entry data;
+	unsigned long last_update;
+	u16 ppe_index;
+	u16 hash;
 };
 
 struct extdev_entry {
@@ -970,11 +1033,28 @@ struct tcpudphdr {
 	__be16 dst;
 };
 
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+struct ppe_flow_chk_status {
+	u32 entry : 15;
+	u32 sta : 1;
+	u32 state : 2;
+	u32 sp : 4;
+	u32 fp : 4;
+	u32 cah : 1;
+	u32 rmt : 1;
+	u32 psn : 1;
+	u32 dram : 1;
+	u32 resv : 1;
+	u32 valid : 1;
+};
+#endif
+
 enum FoeEntryState { INVALID = 0, UNBIND = 1, BIND = 2, FIN = 3 };
 
 enum FoeIpAct {
 	IPV4_HNAPT = 0,
 	IPV4_HNAT = 1,
+	L2_BRIDGE = 2,
 	IPV4_DSLITE = 3,
 	IPV6_3T_ROUTE = 4,
 	IPV6_5T_ROUTE = 5,
@@ -1012,9 +1092,11 @@ enum FoeIpAct {
 #define HASH_MODE_3 3
 
 /*PPE_FLOW_CFG*/
-#define BIT_FUC_FOE BIT(2)
-#define BIT_FMC_FOE BIT(1)
-#define BIT_FBC_FOE BIT(0)
+#define BIT_ALERT_TCP_FIN_RST_SYN BIT(0)
+#define BIT_MD_TOAP_BYP_CRSN0 BIT(1)
+#define BIT_MD_TOAP_BYP_CRSN1 BIT(2)
+#define BIT_MD_TOAP_BYP_CRSN2 BIT(3)
+#define BIT_TCP_IP4F_NAT_EN BIT(6) /*Enable IPv4 fragment + TCP packet NAT*/
 #define BIT_UDP_IP4F_NAT_EN BIT(7) /*Enable IPv4 fragment + UDP packet NAT*/
 #define BIT_IPV6_3T_ROUTE_EN BIT(8)
 #define BIT_IPV6_5T_ROUTE_EN BIT(9)
@@ -1023,7 +1105,8 @@ enum FoeIpAct {
 #define BIT_IPV4_NAT_EN BIT(12)
 #define BIT_IPV4_NAPT_EN BIT(13)
 #define BIT_IPV4_DSL_EN BIT(14)
-#define BIT_MIB_BUSY BIT(16)
+#define BIT_L2_BRG_EN BIT(15)
+#define BIT_IP_PROT_CHK_BLIST BIT(16)
 #define BIT_IPV4_NAT_FRAG_EN BIT(17)
 #define BIT_IPV4_HASH_GREK BIT(19)
 #define BIT_IPV6_HASH_GREK BIT(20)
@@ -1032,6 +1115,9 @@ enum FoeIpAct {
 #define BIT_IPV6_NAT_EN BIT(23)
 #define BIT_IPV6_NAPT_EN BIT(24)
 #define BIT_CS0_RM_ALL_IP6_IP_EN BIT(25)
+#define BIT_L2_HASH_ETH BIT(29)
+#define BIT_L2_HASH_VID BIT(30)
+#define BIT_L2_LRN_EN BIT(31)
 
 /*GDMA_FWD_CFG value*/
 #define BITS_GDM_UFRC_P_PPE (NR_PPE0_PORT << 12)
@@ -1057,6 +1143,14 @@ enum FoeIpAct {
 #define BITS_GDM_ALL_FRC_P_PPE2					\
 	(BITS_GDM_UFRC_P_PPE2 | BITS_GDM_BFRC_P_PPE2 |		\
 	 BITS_GDM_MFRC_P_PPE2 | BITS_GDM_OFRC_P_PPE2)
+
+#define BITS_GDM_UFRC_P_TDMA (NR_TDMA_PORT << 12)
+#define BITS_GDM_BFRC_P_TDMA (NR_TDMA_PORT << 8)
+#define BITS_GDM_MFRC_P_TDMA (NR_TDMA_PORT << 4)
+#define BITS_GDM_OFRC_P_TDMA (NR_TDMA_PORT << 0)
+#define BITS_GDM_ALL_FRC_P_TDMA					\
+	(BITS_GDM_UFRC_P_TDMA | BITS_GDM_BFRC_P_TDMA |		\
+	 BITS_GDM_MFRC_P_TDMA | BITS_GDM_OFRC_P_TDMA)
 
 #define BITS_GDM_UFRC_P_CPU_PDMA (NR_PDMA_PORT << 12)
 #define BITS_GDM_BFRC_P_CPU_PDMA (NR_PDMA_PORT << 8)
@@ -1144,22 +1238,36 @@ enum FoeIpAct {
 #define NR_DISCARD 7
 #define NR_WDMA0_PORT 8
 #define NR_WDMA1_PORT 9
+#define NR_TDMA_PORT 10
 #define NR_WDMA2_PORT 13
 #define NR_GMAC3_PORT 15
+#define NR_QDMA_TPORT 1
+#define NR_EIP197_TPORT 2
+#define NR_EIP197_QDMA_TPORT 3
+#define NR_TDMA_TPORT 4
+#define NR_TDMA_QDMA_TPORT 5
+#define NR_TDMA_EIP197_TPORT 8
+#define NR_TDMA_EIP197_QDMA_TPORT 9
+#define WAN_DEV_NAME hnat_priv->wan
 #define LAN_DEV_NAME hnat_priv->lan
 #define LAN2_DEV_NAME hnat_priv->lan2
-#define IS_WAN(dev)                                                            \
-	(!strncmp((dev)->name, hnat_priv->wan, strlen(hnat_priv->wan)))
+#define IS_ETH_GRP(dev) (IS_LAN_GRP(dev) || IS_WAN(dev))
+#define IS_WAN(dev) (!strncmp((dev)->name, WAN_DEV_NAME, strlen(WAN_DEV_NAME)))
 #define IS_LAN_GRP(dev) (IS_LAN(dev) | IS_LAN2(dev))
-#define IS_LAN(dev) (!strncmp(dev->name, LAN_DEV_NAME, strlen(LAN_DEV_NAME)))
-#define IS_LAN2(dev) (!strncmp(dev->name, LAN2_DEV_NAME,			\
-		      strlen(LAN2_DEV_NAME)))
+#define IS_LAN(dev)								\
+	(!strncmp(dev->name, LAN_DEV_NAME, strlen(LAN_DEV_NAME)) ||		\
+	 IS_BOND(dev))
+#define IS_LAN2(dev)								\
+	(!strncmp(dev->name, LAN2_DEV_NAME, strlen(LAN2_DEV_NAME)) ||		\
+	 IS_BOND(dev))
 #define IS_BR(dev) (!strncmp(dev->name, "br", 2))
+#define IS_BOND(dev) (!strncmp(dev->name, "bond", 4))
 #define IS_WHNAT(dev)								\
 	((hnat_priv->data->whnat &&						\
 	 (get_wifi_hook_if_index_from_dev(dev) != 0)) ? 1 : 0)
 #define IS_EXT(dev) ((get_index_from_dev(dev) != 0) ? 1 : 0)
 #define IS_PPD(dev) (!strcmp(dev->name, hnat_priv->ppd))
+#define IS_L2_BRIDGE(x) (((x)->bfib1.pkt_type == L2_BRIDGE) ? 1 : 0)
 #define IS_IPV4_HNAPT(x) (((x)->bfib1.pkt_type == IPV4_HNAPT) ? 1 : 0)
 #define IS_IPV4_HNAT(x) (((x)->bfib1.pkt_type == IPV4_HNAT) ? 1 : 0)
 #define IS_IPV4_GRP(x) (IS_IPV4_HNAPT(x) | IS_IPV4_HNAT(x))
@@ -1175,16 +1283,25 @@ enum FoeIpAct {
 	(IS_IPV6_3T_ROUTE(x) | IS_IPV6_5T_ROUTE(x) | IS_IPV6_6RD(x) |          \
 	 IS_IPV4_DSLITE(x) | IS_IPV4_MAPE(x) | IS_IPV4_MAPT(x) |	       \
 	 IS_IPV6_HNAPT(x) | IS_IPV6_HNAT(x))
-#define IS_BOND_MODE (!strncmp(LAN_DEV_NAME, "bond", 4))
 #define IS_GMAC1_MODE ((hnat_priv->gmac_num == 1) ? 1 : 0)
 #define IS_HQOS_MODE (qos_toggle == 1)
 #define IS_PPPQ_MODE (qos_toggle == 2)		/* Per Port Per Queue */
-#define IS_PPPQ_PATH(dev, skb) \
-	((IS_DSA_1G_LAN(dev) || IS_DSA_WAN(dev)) || \
-	 (FROM_WED(skb) && IS_DSA_LAN(dev)))
 #define IS_HQOS_DL_MODE (IS_HQOS_MODE && qos_dl_toggle)
 #define IS_HQOS_UL_MODE (IS_HQOS_MODE && qos_ul_toggle)
-#define MAX_PPPQ_PORT_NUM	6
+#define MAX_SWITCH_PORT_NUM		(6)
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+#define MAX_PPPQ_QUEUE_NUM		(2 * MAX_SWITCH_PORT_NUM + 2)
+#define IS_PPPQ_PATH(dev, skb)						\
+	((IS_DSA_1G_LAN(dev) || IS_DSA_WAN(dev)) ||			\
+	 (IS_ETH_GRP(dev) && is_eth_dev_speed_under(dev, SPEED_1000)) ||\
+	 (FROM_WED(skb) && (IS_DSA_LAN(dev) ||				\
+			    is_eth_dev_speed_under(dev, SPEED_2500))))
+#else
+#define MAX_PPPQ_QUEUE_NUM		(2 * MAX_SWITCH_PORT_NUM)
+#define IS_PPPQ_PATH(dev, skb)				\
+	((IS_DSA_1G_LAN(dev) || IS_DSA_WAN(dev)) ||	\
+	 (FROM_WED(skb) && IS_DSA_LAN(dev)))
+#endif
 
 #define es(entry) (entry_state[entry->bfib1.state])
 #define ei(entry, end) (hnat_priv->foe_etry_num - (int)(end - entry))
@@ -1212,14 +1329,13 @@ enum FoeIpAct {
 #define IS_DSA_1G_LAN(dev) (!strncmp(dev->name, "lan", 3) &&		       \
 			    strcmp(dev->name, "lan5"))
 #define IS_DSA_WAN(dev) (!strncmp(dev->name, "wan", 3))
+#define IS_DSA_TAG_PROTO_MXL862_8021Q(dp)				       \
+	(dp->cpu_dp->tag_ops->proto == DSA_TAG_PROTO_MXL862_8021Q)
 #define NONE_DSA_PORT 0xff
 #define MAX_CRSN_NUM 32
 #define IPV6_HDR_LEN 40
 #define IPV6_SNAT	0
 #define IPV6_DNAT	1
-
-/*QDMA_PAGE value*/
-#define NUM_OF_Q_PER_PAGE 16
 
 /*IPv6 Header*/
 #ifndef NEXTHDR_IPIP
@@ -1227,53 +1343,37 @@ enum FoeIpAct {
 #endif
 
 #define UDF_PINGPONG_IFIDX GENMASK(6, 0)
-#define UDF_HNAT_PRE_FILLED BIT(7)
 
-#define HQOS_FLAG(dev, skb, qid)			\
-	((IS_HQOS_UL_MODE && IS_WAN(dev)) ||		\
-	 (IS_HQOS_DL_MODE && IS_LAN_GRP(dev)) ||	\
-	 (IS_PPPQ_MODE && (IS_PPPQ_PATH(dev, skb) ||	\
-			   qid >= MAX_PPPQ_PORT_NUM)))
+#define HQOS_FLAG(dev, skb, qid)				\
+	((IS_HQOS_UL_MODE && IS_WAN(dev)) ||			\
+	 (IS_HQOS_DL_MODE && IS_LAN_GRP(dev)) ||		\
+	 (IS_PPPQ_MODE && (IS_PPPQ_PATH(dev, skb) ||		\
+			   qid >= MAX_PPPQ_QUEUE_NUM)))
+
+#define HNAT_GMAC_FP(mac_id)						\
+	((IS_GMAC1_MODE || mac_id == MTK_GMAC1_ID) ? NR_GMAC1_PORT :	\
+			  (mac_id == MTK_GMAC2_ID) ? NR_GMAC2_PORT :	\
+			  (mac_id == MTK_GMAC3_ID) ? NR_GMAC3_PORT :	\
+						    -EINVAL)
 
 extern const struct of_device_id of_hnat_match[];
 extern struct mtk_hnat *hnat_priv;
 
-static inline int is_hnat_pre_filled(struct foe_entry *entry)
-{
-	u32 udf = 0;
-
-	if (IS_IPV4_GRP(entry))
-		udf = entry->ipv4_hnapt.act_dp;
-	else
-		udf = entry->ipv6_5t_route.act_dp;
-
-	return !!(udf & UDF_HNAT_PRE_FILLED);
-}
-
-#if defined(CONFIG_NET_DSA_MT7530)
-u32 hnat_dsa_fill_stag(const struct net_device *netdev,
+int hnat_dsa_fill_stag(const struct net_device *netdev,
 		       struct foe_entry *entry,
 		       struct flow_offload_hw_path *hw_path,
 		       u16 eth_proto, int mape);
-
+int hnat_dsa_get_port(struct net_device **dev);
 static inline bool hnat_dsa_is_enable(struct mtk_hnat *priv)
 {
+#if defined(CONFIG_NET_DSA)
 	return (priv->wan_dsa_port != NONE_DSA_PORT);
-}
 #else
-static inline u32 hnat_dsa_fill_stag(const struct net_device *netdev,
-				     struct foe_entry *entry,
-				     struct flow_offload_hw_path *hw_path,
-				     u16 eth_proto, int mape)
-{
-	return 0;
+	return false;
+#endif
 }
 
-static inline bool hnat_dsa_is_enable(struct mtk_hnat *priv)
-{
-	return false;
-}
-#endif
+struct foe_entry *hnat_get_foe_entry(u32 ppe_id, u32 index);
 
 void hnat_deinit_debugfs(struct mtk_hnat *h);
 int hnat_init_debugfs(struct mtk_hnat *h);
@@ -1282,8 +1382,14 @@ void hnat_unregister_nf_hooks(void);
 int whnat_adjust_nf_hooks(void);
 int mtk_hqos_ptype_cb(struct sk_buff *skb, struct net_device *dev,
 		      struct packet_type *pt, struct net_device *unused);
+int hnat_search_cache_line(u32 ppe_id, u32 tag);
+int hnat_write_cache_line(u32 ppe_id, int line, u32 tag, u32 state, u32 *data);
+int hnat_dump_cache_entry(u32 ppe_id, int hash);
+int hnat_dump_ppe_entry(u32 ppe_id, u32 hash);
+bool is_eth_dev_speed_under(const struct net_device *dev, u32 speed);
 extern int dbg_cpu_reason;
 extern int debug_level;
+extern int mcast_mode;
 extern int xlat_toggle;
 extern struct hnat_desc headroom[DEF_ETRY_NUM];
 extern int qos_dl_toggle;
@@ -1291,9 +1397,21 @@ extern int qos_ul_toggle;
 extern int hook_toggle;
 extern int mape_toggle;
 extern int qos_toggle;
-
+extern int l2br_toggle;
+extern int l4s_toggle;
+extern int tnl_toggle;
+extern int (*mtk_tnl_encap_offload)(struct sk_buff *skb, struct ethhdr *eth);
+extern int (*mtk_tnl_decap_offload)(struct sk_buff *skb);
+extern bool (*mtk_tnl_decap_offloadable)(struct sk_buff *skb);
+extern bool (*mtk_crypto_offloadable)(struct sk_buff *skb);
+extern int hnat_bind_crypto_entry(struct sk_buff *skb,
+				  const struct net_device *dev,
+				  int fill_inner_info);
+extern void foe_clear_crypto_entry(struct xfrm_selector sel);
 int ext_if_add(struct extdev_entry *ext_entry);
 int ext_if_del(struct extdev_entry *ext_entry);
+void cr_set_bits(void __iomem *reg, u32 bs);
+void cr_clr_bits(void __iomem *reg, u32 bs);
 void cr_set_field(void __iomem *reg, u32 field, u32 val);
 int mtk_sw_nat_hook_tx(struct sk_buff *skb, int gmac_no);
 int mtk_sw_nat_hook_rx(struct sk_buff *skb);
@@ -1309,21 +1427,41 @@ uint32_t hnat_cpu_reason_cnt(struct sk_buff *skb);
 int hnat_enable_hook(void);
 int hnat_disable_hook(void);
 void hnat_cache_ebl(int enable);
+void __hnat_cache_ebl(u32 ppe_id, int enable);
+void hnat_cache_clr(u32 ppe_id);
+void __hnat_cache_clr(u32 ppe_id);
 void hnat_qos_shaper_ebl(u32 id, u32 enable);
+void exclude_boundary_entry(struct foe_entry *foe_table_cpu);
 void set_gmac_ppe_fwd(int gmac_no, int enable);
 int entry_detail(u32 ppe_id, int index);
 int entry_delete_by_mac(u8 *mac);
+int entry_delete_by_ip(bool is_ipv4, void *addr);
 int entry_delete(u32 ppe_id, int index);
+void __entry_delete(struct foe_entry *entry);
 int hnat_warm_init(void);
 u32 hnat_get_ppe_hash(struct foe_entry *entry);
 int mtk_ppe_get_xlat_v4_by_v6(struct in6_addr *ipv6, u32 *ipv4);
 int mtk_ppe_get_xlat_v6_by_v4(u32 *ipv4, struct in6_addr *ipv6,
 			      struct in6_addr *prefix);
+bool hnat_flow_entry_match(struct foe_entry *entry, struct foe_entry *data);
+void hnat_flow_entry_delete(struct hnat_flow_entry *flow_entry);
 
 struct hnat_accounting *hnat_get_count(struct mtk_hnat *h, u32 ppe_id,
 				       u32 index, struct hnat_accounting *diff);
 
-static inline u16 foe_timestamp(struct mtk_hnat *h)
+int mtk_hnat_skb_headroom_copy(struct sk_buff *new, struct sk_buff *old);
+static inline u16 foe_timestamp(struct mtk_hnat *h, bool mcast)
 {
-	return (readl(hnat_priv->fe_base + 0x0010)) & 0xffff;
+	u16 time_stamp;
+
+	if (mcast)
+		time_stamp = (readl(h->fe_base + 0x0010)) & 0xffff;
+	else if (h->data->version == MTK_HNAT_V2 || h->data->version == MTK_HNAT_V3)
+		time_stamp = readl(h->fe_base + 0x0010) & (0xFF);
+	else
+		time_stamp = readl(h->fe_base + 0x0010) & (0x7FFF);
+
+	return time_stamp;
 }
+
+#endif /* NF_HNAT_H */

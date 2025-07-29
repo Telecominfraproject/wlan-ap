@@ -44,7 +44,11 @@ struct hnat_desc {
 	u32 is_sp : 1;
 	u32 hf : 1;
 	u32 amsdu : 1;
-	u32 resv3 : 19;
+	u32 tops : 6;
+	u32 is_decap : 1;
+	u32 cdrt : 8;
+	u32 is_decrypt : 1;
+	u32 resv3 : 3;
 	u32 magic_tag_protect : 16;
 } __packed;
 #elif defined(CONFIG_MEDIATEK_NETSYS_RX_V2)
@@ -85,12 +89,36 @@ struct hnat_desc {
 #define HAS_HQOS_MAGIC_TAG(skb) (qos_toggle && skb->protocol == HQOS_MAGIC_TAG)
 
 #define HNAT_MAGIC_TAG 0x6789
+#define HNAT_INFO_FILLED 0x7
 #define WIFI_INFO_LEN 6
 #define FOE_INFO_LEN (10 + WIFI_INFO_LEN)
 #define IS_SPACE_AVAILABLE_HEAD(skb)                                           \
 	((((skb_headroom(skb) >= FOE_INFO_LEN) ? 1 : 0)))
 
 #define skb_hnat_info(skb) ((struct hnat_desc *)(skb->head))
+#if defined(CONFIG_MEDIATEK_NETSYS_V3)
+#define skb_hnat_tops(skb) (((struct hnat_desc *)((skb)->head))->tops)
+#define skb_hnat_is_decap(skb) (((struct hnat_desc *)((skb)->head))->is_decap)
+#define skb_hnat_is_encap(skb) (!skb_hnat_is_decap(skb))
+#define skb_hnat_set_tops(skb, tops) ((skb_hnat_tops(skb)) = (tops))
+#define skb_hnat_set_is_decap(skb, is_decap) ((skb_hnat_is_decap(skb)) = (is_decap))
+#define skb_hnat_cdrt(skb) (((struct hnat_desc *)((skb)->head))->cdrt)
+#define skb_hnat_is_decrypt(skb) (((struct hnat_desc *)((skb)->head))->is_decrypt)
+#define skb_hnat_is_encrypt(skb) (!skb_hnat_is_decrypt(skb))
+#define skb_hnat_set_cdrt(skb, cdrt) ((skb_hnat_cdrt(skb)) = (cdrt))
+#define skb_hnat_set_is_decrypt(skb, is_dec) ((skb_hnat_is_decrypt(skb)) = is_dec)
+#else /* !defined(CONFIG_MEDIATEK_NETSYS_V3) */
+#define skb_hnat_tops(skb) (0)
+#define skb_hnat_is_decap(skb) (0)
+#define skb_hnat_is_encap(skb) (0)
+#define skb_hnat_set_tops(skb, tops)
+#define skb_hnat_set_is_decap(skb, is_decap)
+#define skb_hnat_cdrt(skb) (0)
+#define skb_hnat_is_decrypt(skb) (0)
+#define skb_hnat_is_encrypt(skb) (0)
+#define skb_hnat_set_cdrt(skb, cdrt)
+#define skb_hnat_set_is_decrypt(skb, is_dec)
+#endif /* defined(CONFIG_MEDIATEK_NETSYS_V3) */
 #define skb_hnat_magic(skb) (((struct hnat_desc *)(skb->head))->magic)
 #define skb_hnat_reason(skb) (((struct hnat_desc *)(skb->head))->crsn)
 #define skb_hnat_entry(skb) (((struct hnat_desc *)(skb->head))->entry)
@@ -134,6 +162,7 @@ struct hnat_desc {
 #define set_to_ppe(skb) (HNAT_SKB_CB2(skb)->magic = 0x78681415)
 #define is_from_extge(skb) (HNAT_SKB_CB2(skb)->magic == 0x78786688)
 #define is_magic_tag_valid(skb) (skb_hnat_magic_tag(skb) == HNAT_MAGIC_TAG)
+#define is_hnat_info_filled(skb) (skb_hnat_filled(skb) == HNAT_INFO_FILLED)
 #define set_from_mape(skb) (HNAT_SKB_CB2(skb)->magic = 0x78787788)
 #define is_from_mape(skb) (HNAT_SKB_CB2(skb)->magic == 0x78787788)
 #define is_unreserved_port(hdr)						       \
@@ -164,6 +193,8 @@ struct hnat_desc {
 #define HIT_PRE_BIND 0x1A
 #define HIT_BIND_PACKET_SAMPLING 0x1B
 #define HIT_BIND_EXCEED_MTU 0x1C
+#define IPVERSION_V4 0x04
+#define IPVERSION_V6 0x06
 
 #define TPORT_ID(x) ((x) & GENMASK(3, 0))
 #define TOPS_ENTRY(x) ((x) & GENMASK(5, 0))

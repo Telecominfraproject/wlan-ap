@@ -196,6 +196,7 @@ struct mtk_pcie_port {
 	struct mtk_msi_set msi_sets[PCIE_MSI_SET_NUM];
 	enum mtk_msi_group_type msi_group_type;
 	struct mutex lock;
+	bool soft_off;
 	DECLARE_BITMAP(msi_irq_in_use, PCIE_MSI_IRQS_NUM);
 };
 
@@ -234,6 +235,11 @@ static void __iomem *mtk_pcie_map_bus(struct pci_bus *bus, unsigned int devfn,
 static int mtk_pcie_config_read(struct pci_bus *bus, unsigned int devfn,
 				int where, int size, u32 *val)
 {
+	struct mtk_pcie_port *port = bus->sysdata;
+
+	if (port->soft_off)
+		return 0;
+
 	mtk_pcie_config_tlp_header(bus, devfn, where, size);
 
 	return pci_generic_config_read32(bus, devfn, where, size, val);
@@ -242,6 +248,11 @@ static int mtk_pcie_config_read(struct pci_bus *bus, unsigned int devfn,
 static int mtk_pcie_config_write(struct pci_bus *bus, unsigned int devfn,
 				 int where, int size, u32 val)
 {
+	struct mtk_pcie_port *port = bus->sysdata;
+
+	if (port->soft_off)
+		return 0;
+
 	mtk_pcie_config_tlp_header(bus, devfn, where, size);
 
 	if (size <= 2)
@@ -1256,6 +1267,95 @@ static int __maybe_unused mtk_pcie_turn_off_link(struct mtk_pcie_port *port)
 				   PCIE_LTSSM_STATE_L2_IDLE), 20,
 				   50 * USEC_PER_MSEC);
 }
+
+int mtk_pcie_soft_off(struct pci_bus *bus)
+{
+	struct pci_host_bridge *host;
+	struct mtk_pcie_port *port;
+	struct pci_dev *dev;
+	int ret;
+	u32 val;
+
+	if (!bus) {
+		dev_err(port->dev, "There is no bus, please check the host driver\n");
+		return -ENODEV;
+	}
+
+	port = bus->sysdata;
+	if (port->soft_off) {
+		dev_err(port->dev, "The soft_off is true, can't soft off\n");
+		return -EPERM;
+	}
+
+	host = pci_host_bridge_from_priv(port);
+	dev = pci_get_slot(host->bus, 0);
+	if (!dev) {
+		dev_err(port->dev, "Failed to get device from bus\n");
+		return -ENODEV;
+	}
+
+	/* Trigger link to L2 state */
+	ret = mtk_pcie_turn_off_link(port);
+
+	pci_save_state(dev);
+	pci_dev_put(dev);
+	mtk_pcie_irq_save(port);
+	port->soft_off = true;
+	mtk_pcie_power_down(port);
+
+	dev_info(port->dev, "mtk pcie soft off done\n");
+
+	return ret;
+}
+EXPORT_SYMBOL(mtk_pcie_soft_off);
+
+int mtk_pcie_soft_on(struct pci_bus *bus)
+{
+	struct pci_host_bridge *host;
+	struct mtk_pcie_port *port;
+	struct pci_dev *dev;
+	int ret;
+
+	if (!bus) {
+		dev_err(port->dev, "There is no bus, please check the host driver\n");
+		return -ENODEV;
+	}
+
+	port = bus->sysdata;
+	if (!port->soft_off) {
+		dev_err(port->dev, "The soft_off is false, can't soft on\n");
+		return -EPERM;
+	}
+
+	host = pci_host_bridge_from_priv(port);
+	dev = pci_get_slot(host->bus, 0);
+	if (!dev) {
+		dev_err(port->dev, "Failed to get device from bus\n");
+		return -ENODEV;
+	}
+
+	ret = mtk_pcie_power_up(port);
+	if (ret) {
+		dev_err(port->dev, "Failed to power up RC\n");
+		return ret;
+	}
+
+	ret = mtk_pcie_startup_port(port);
+	if (ret) {
+		dev_err(port->dev, "Failed to detect EP\n");
+		return ret;
+	}
+
+	port->soft_off = false;
+	mtk_pcie_irq_restore(port);
+	pci_restore_state(dev);
+	pci_dev_put(dev);
+
+	dev_info(port->dev, "mtk pcie soft on done\n");
+
+	return ret;
+}
+EXPORT_SYMBOL(mtk_pcie_soft_on);
 
 static int __maybe_unused mtk_pcie_suspend_noirq(struct device *dev)
 {

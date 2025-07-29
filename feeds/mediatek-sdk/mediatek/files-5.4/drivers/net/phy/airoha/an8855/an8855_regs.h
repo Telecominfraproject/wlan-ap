@@ -85,10 +85,10 @@
 #define PMCR(p)					PORT_MAC_CTRL_REG(p, 0x00)
 #define PMSR(p)					PORT_MAC_CTRL_REG(p, 0x10)
 
-#define GMACCR					(PORT_MAC_CTRL_BASE + 0x30e0)
+#define GMACCR					(PORT_MAC_CTRL_BASE + 0x3e00)
 
-#define MAX_RX_JUMBO_S			2
-#define MAX_RX_JUMBO_M			0x3c
+#define MAX_RX_JUMBO_S			4
+#define MAX_RX_JUMBO_M			0xf0
 #define MAX_RX_PKT_LEN_S		0
 #define MAX_RX_PKT_LEN_M		0x3
 
@@ -172,6 +172,12 @@
 #define STATS_RSFTPC		0xF8
 #define STATS_RXCDPC		0xFC
 
+#define RG_CLK_CPU_ICG		0x10005034
+#define MCU_ENABLE			BIT(3)
+
+#define RG_TIMER_CTL		0x1000a100
+#define WDOG_ENABLE			BIT(25)
+
 #define SYS_CTRL			0x100050C0
 #define SW_SYS_RST			BIT(31)
 
@@ -182,7 +188,10 @@
 #define SYS_INT_STS			0x1021C014
 #define PHY_LC_INT(p)		BIT(p)
 
-#define CKGCR				(0x10213E1C)
-#define CKG_LNKDN_GLB_STOP	(0x01)
-#define CKG_LNKDN_PORT_STOP	(0x02)
+#define CKGCR				0x10213E1C
+#define CKG_LNKDN_GLB_STOP	0x01
+#define CKG_LNKDN_PORT_STOP	0x02
+
+#define PKG_SEL				0x10000094
+#define PAG_SEL_AN8855H		0x2
 #endif /* _AN8855_REGS_H_ */

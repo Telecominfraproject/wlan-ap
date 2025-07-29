@@ -23,8 +23,24 @@
 
 #define AN8855_DFL_CPU_PORT		5
 #define AN8855_NUM_PHYS			5
+#define AN8855_WORD_SIZE		4
 #define AN8855_DFL_SMI_ADDR		0x1
 #define AN8855_SMI_ADDR_MASK	0x1f
+#define AN8855_DFL_INTR_ID		0xd
+#define AN8855_DFL_EXT_SURGE	0x0
+
+#define LED_ON_EVENT	(LED_ON_EVT_LINK_1000M | \
+			LED_ON_EVT_LINK_100M | LED_ON_EVT_LINK_10M |\
+			LED_ON_EVT_LINK_HD | LED_ON_EVT_LINK_FD)
+
+#define LED_BLK_EVENT	(LED_BLK_EVT_1000M_TX_ACT | \
+			LED_BLK_EVT_1000M_RX_ACT | \
+			LED_BLK_EVT_100M_TX_ACT | \
+			LED_BLK_EVT_100M_RX_ACT | \
+			LED_BLK_EVT_10M_TX_ACT | \
+			LED_BLK_EVT_10M_RX_ACT)
+
+#define LED_FREQ	AIR_LED_BLK_DUR_64M
 
 struct gsw_an8855;
 
@@ -35,6 +51,60 @@ enum an8855_model {
 enum sgmii_mode {
 	SGMII_MODE_AN,
 	SGMII_MODE_FORCE,
+};
+
+enum phy_led_idx {
+	P0_LED0,
+	P0_LED1,
+	P0_LED2,
+	P0_LED3,
+	P1_LED0,
+	P1_LED1,
+	P1_LED2,
+	P1_LED3,
+	P2_LED0,
+	P2_LED1,
+	P2_LED2,
+	P2_LED3,
+	P3_LED0,
+	P3_LED1,
+	P3_LED2,
+	P3_LED3,
+	P4_LED0,
+	P4_LED1,
+	P4_LED2,
+	P4_LED3,
+	PHY_LED_MAX
+};
+
+/* TBD */
+enum an8855_led_blk_dur {
+	AIR_LED_BLK_DUR_32M,
+	AIR_LED_BLK_DUR_64M,
+	AIR_LED_BLK_DUR_128M,
+	AIR_LED_BLK_DUR_256M,
+	AIR_LED_BLK_DUR_512M,
+	AIR_LED_BLK_DUR_1024M,
+	AIR_LED_BLK_DUR_LAST
+};
+
+enum an8855_led_polarity {
+	LED_LOW,
+	LED_HIGH,
+};
+enum an8855_led_mode {
+	AN8855_LED_MODE_DISABLE,
+	AN8855_LED_MODE_USER_DEFINE,
+	AN8855_LED_MODE_LAST
+};
+
+struct an8855_led_cfg {
+	u16 en;
+	u8  phy_led_idx;
+	u16 pol;
+	u16 on_cfg;
+	u16 blk_cfg;
+	u8 led_freq;
 };
 
 struct an8855_port_cfg {
@@ -55,6 +125,8 @@ struct gsw_an8855 {
 	u32 smi_addr;
 	u32 new_smi_addr;
 	u32 phy_base;
+	u32 intr_pin;
+	u32 extSurge;
 
 	enum an8855_model model;
 	const char *name;

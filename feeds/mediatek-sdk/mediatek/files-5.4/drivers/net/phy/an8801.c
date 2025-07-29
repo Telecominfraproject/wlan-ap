@@ -1,6 +1,5 @@
-/*SPDX-License-Identifier: GPL-2.0*/
-/*FILE NAME:  an8801.c
- *PURPOSE:
+// SPDX-License-Identifier: GPL-2.0
+/*PURPOSE:
  *Airoha phy driver for Linux
  *NOTES:
  *
@@ -635,6 +634,23 @@ static int an8801sb_of_init(struct phy_device *phydev)
 	} else
 		priv->surge = AIR_SURGE_0R;
 
+	if (of_find_property(of_node, "airoha,sgmii-mode", NULL)) {
+		if (of_property_read_u32(of_node, "airoha,sgmii-mode",
+					 &val) != 0) {
+			dev_err(phydev_dev(phydev), "airoha,sgmii-mode value is invalid.");
+			return -1;
+		}
+		if (val < AIR_SGMII_AN ||
+			val > AIR_SGMII_FORCE) {
+			dev_err(phydev_dev(phydev),
+					"airoha,sgmii-mode value %u out of range.",
+					val);
+			return -1;
+		}
+		priv->sgmii_mode = val;
+	} else
+		priv->sgmii_mode = AIR_SGMII_AN;
+
 	return 0;
 }
 #else
@@ -732,27 +748,43 @@ static int an8801sb_config_init(struct phy_device *phydev)
 	u32 pbus_value = 0;
 	u32 reg_value = 0;
 
-	reg_value = phy_read(phydev, MII_BMSR);
-	if ((reg_value & MCS_LINK_STATUS_MASK) != 0) {
-		ret = air_buckpbus_reg_write(phydev, 0x10220010, 0x1801);
-		if (ret < 0)
-			return ret;
-		reg_value = air_buckpbus_reg_read(phydev, 0x10220010);
-		dev_dbg(phydev_dev(phydev),
-			"air_buckpbus_reg_read(0x10220010,0x%x).\n", reg_value);
-
-		ret = air_buckpbus_reg_write(phydev, 0x10220000, 0x9140);
-		if (ret < 0)
-			return ret;
-		reg_value = air_buckpbus_reg_read(phydev, 0x10220000);
-		dev_dbg(phydev_dev(phydev),
-			"air_buckpbus_reg_read(0x10220000,0x%x).\n", reg_value);
-		mdelay(80);
-	}
-
 	ret = an8801sb_of_init(phydev);
 	if (ret < 0)
 		return ret;
+	if (priv->sgmii_mode == AIR_SGMII_AN) {
+		dev_info(phydev_dev(phydev), "sgmii mode - AN\n");
+		reg_value = phy_read(phydev, MII_BMSR);
+		if ((reg_value & MCS_LINK_STATUS_MASK) != 0) {
+			ret = air_buckpbus_reg_write(phydev, 0x10220010, 0x1801);
+			if (ret < 0)
+				return ret;
+			reg_value = air_buckpbus_reg_read(phydev, 0x10220010);
+			dev_dbg(phydev_dev(phydev),
+				"air_buckpbus_reg_read(0x10220010,0x%x).\n", reg_value);
+
+			ret = air_buckpbus_reg_write(phydev, 0x10220000, 0x9140);
+			if (ret < 0)
+				return ret;
+			reg_value = air_buckpbus_reg_read(phydev, 0x10220000);
+			dev_dbg(phydev_dev(phydev),
+				"air_buckpbus_reg_read(0x10220000,0x%x).\n", reg_value);
+			mdelay(80);
+		}
+	} else {	/* SGMII force mode */
+		dev_info(phydev_dev(phydev), "sgmii mode - Force\n");
+		ret = air_buckpbus_reg_write(phydev, 0x102260E4, 0xFF11);
+		ret |= air_buckpbus_reg_write(phydev, 0x10224004, 0x0700);
+		ret |= air_buckpbus_reg_write(phydev, 0x10224018, 0x0);
+		ret |= air_buckpbus_reg_write(phydev, 0x1022450C, 0x0700);
+		ret |= air_buckpbus_reg_write(phydev, 0x1022A140, 0x5);
+		ret |= air_buckpbus_reg_write(phydev, 0x10226100, 0xF0000000);
+		ret |= air_buckpbus_reg_write(phydev, 0x10226300, 0x0);
+		ret |= air_buckpbus_reg_write(phydev, 0x1022A078, 0x10050);
+		ret |= air_buckpbus_reg_write(phydev, 0x10220034, 0x31120009);
+		ret |= air_buckpbus_reg_write(phydev, 0x10220000, 0x140);
+		if (ret < 0)
+			return ret;
+	}
 #ifdef CONFIG_OF
 	pbus_value = air_buckpbus_reg_read(phydev, 0x1022a0f8);
 	pbus_value &= ~0x3;
@@ -1347,6 +1379,7 @@ static void an8801_phy_remove(struct phy_device *phydev)
 static int an8801sb_read_status(struct phy_device *phydev)
 {
 	int ret, prespeed = phydev->speed;
+	struct an8801_priv *priv = phydev->priv;
 	u32 reg_value = 0;
 	u32 an_retry = MAX_SGMII_AN_RETRY;
 
@@ -1357,14 +1390,16 @@ static int an8801sb_read_status(struct phy_device *phydev)
 		ret |= phy_write_mmd(
 			phydev, MMD_DEV_VSPEC2, PHY_PRE_SPEED_REG, prespeed);
 
-		mdelay(10);        /* delay 10 ms */
-		reg_value = air_buckpbus_reg_read(phydev, 0x10220010);
-		reg_value &= 0x7fff;
-		air_buckpbus_reg_write(phydev, 0x10220010, reg_value);
+		if (priv->sgmii_mode == AIR_SGMII_AN) {
+			mdelay(10);        /* delay 10 ms */
+			reg_value = air_buckpbus_reg_read(phydev, 0x10220010);
+			reg_value &= 0x7fff;
+			air_buckpbus_reg_write(phydev, 0x10220010, reg_value);
 
-		reg_value = air_buckpbus_reg_read(phydev, 0x10220000);
-		reg_value |= AN8801SB_SGMII_AN0_ANRESTART;
-		air_buckpbus_reg_write(phydev, 0x10220000, reg_value);
+			reg_value = air_buckpbus_reg_read(phydev, 0x10220000);
+			reg_value |= AN8801SB_SGMII_AN0_ANRESTART;
+			air_buckpbus_reg_write(phydev, 0x10220000, reg_value);
+		}
 	}
 
 	if (prespeed != phydev->speed && phydev->link == LINK_UP) {
@@ -1372,31 +1407,59 @@ static int an8801sb_read_status(struct phy_device *phydev)
 		ret |= phy_write_mmd(
 			phydev, MMD_DEV_VSPEC2, PHY_PRE_SPEED_REG, prespeed);
 		dev_info(phydev_dev(phydev), "AN8801SB SPEED %d\n", prespeed);
-		while (an_retry > 0) {
-			mdelay(1);       /* delay 1 ms */
-			reg_value = air_buckpbus_reg_read(
-				phydev, 0x10220b04);
-			if (reg_value & AN8801SB_SGMII_AN0_AN_DONE)
-				break;
-			an_retry--;
+		if (priv->sgmii_mode == AIR_SGMII_AN) {
+			while (an_retry > 0) {
+				mdelay(1);       /* delay 1 ms */
+				reg_value = air_buckpbus_reg_read(
+					phydev, 0x10220b04);
+				if (reg_value & AN8801SB_SGMII_AN0_AN_DONE)
+					break;
+				an_retry--;
+			}
+			mdelay(10);        /* delay 10 ms */
+
+
+			if (prespeed == SPEED_1000) {
+				air_buckpbus_reg_write(
+					phydev, 0x10220010, 0xd801);
+			} else if (prespeed == SPEED_100) {
+				air_buckpbus_reg_write(
+					phydev, 0x10220010, 0xd401);
+			} else {
+				air_buckpbus_reg_write(
+					phydev, 0x10220010, 0xd001);
+			}
+
+			reg_value = air_buckpbus_reg_read(phydev, 0x10220000);
+			reg_value |= (AN8801SB_SGMII_AN0_RESET | AN8801SB_SGMII_AN0_ANRESTART);
+			air_buckpbus_reg_write(phydev, 0x10220000, reg_value);
+		} else {	/* SGMII force mode */
+			if (prespeed == SPEED_1000) {
+				ret = air_buckpbus_reg_write(phydev, 0x102260E4, 0xFF11);
+				ret |= air_buckpbus_reg_write(phydev, 0x10224004, 0x0700);
+				ret |= air_buckpbus_reg_write(phydev, 0x10224018, 0x0);
+				ret |= air_buckpbus_reg_write(phydev, 0x1022450C, 0x0700);
+				ret |= air_buckpbus_reg_write(phydev, 0x1022A140, 0x5);
+				ret |= air_buckpbus_reg_write(phydev, 0x10226100, 0xF0000000);
+				ret |= air_buckpbus_reg_write(phydev, 0x10270100, 0xF);
+			} else if (prespeed == SPEED_100) {
+				ret = air_buckpbus_reg_write(phydev, 0x102260E4, 0xFF11);
+				ret |= air_buckpbus_reg_write(phydev, 0x10224004, 0x0755);
+				ret |= air_buckpbus_reg_write(phydev, 0x10224018, 0x14);
+				ret |= air_buckpbus_reg_write(phydev, 0x1022450C, 0x0755);
+				ret |= air_buckpbus_reg_write(phydev, 0x1022A140, 0x10);
+				ret |= air_buckpbus_reg_write(phydev, 0x10226100, 0xF000000C);
+				ret |= air_buckpbus_reg_write(phydev, 0x10270100, 0xC);
+			} else {
+				ret = air_buckpbus_reg_write(phydev, 0x102260E4, 0xFFAA);
+				ret |= air_buckpbus_reg_write(phydev, 0x10224004, 0x07AA);
+				ret |= air_buckpbus_reg_write(phydev, 0x10224018, 0x4);
+				ret |= air_buckpbus_reg_write(phydev, 0x1022450C, 0x07AA);
+				ret |= air_buckpbus_reg_write(phydev, 0x1022A140, 0x20);
+				ret |= air_buckpbus_reg_write(phydev, 0x10226100, 0xF000000F);
+				ret |= air_buckpbus_reg_write(phydev, 0x10270100, 0xC);
+			}
 		}
-		mdelay(10);        /* delay 10 ms */
-
-
-		if (prespeed == SPEED_1000) {
-			air_buckpbus_reg_write(
-				phydev, 0x10220010, 0xd801);
-		} else if (prespeed == SPEED_100) {
-			air_buckpbus_reg_write(
-				phydev, 0x10220010, 0xd401);
-		} else {
-			air_buckpbus_reg_write(
-				phydev, 0x10220010, 0xd001);
-		}
-
-		reg_value = air_buckpbus_reg_read(phydev, 0x10220000);
-		reg_value |= (AN8801SB_SGMII_AN0_RESET | AN8801SB_SGMII_AN0_ANRESTART);
-		air_buckpbus_reg_write(phydev, 0x10220000, reg_value);
 	}
 	return ret;
 }

@@ -491,6 +491,7 @@ static int mt7531_mac_port_setup(struct gsw_mt753x *gsw, u32 port,
 		mt7531_set_port_rgmii(gsw, port);
 		break;
 	case PHY_INTERFACE_MODE_SGMII:
+	case PHY_INTERFACE_MODE_2500BASEX:
 		if (port_cfg->force_link)
 			mt7531_set_port_sgmii_force_mode(gsw, port, port_cfg);
 		else

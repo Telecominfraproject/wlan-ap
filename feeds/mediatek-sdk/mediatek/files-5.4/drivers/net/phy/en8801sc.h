@@ -12,7 +12,7 @@
 
 /* NAMING DECLARATIONS
  */
-#define EN8801S_DRIVER_VERSION  "1.1.8_Generic"
+#define EN8801S_DRIVER_VERSION  "1.1.9_Generic"
 #define EN8801S_PBUS_DEFAULT_ADDR 0x1e
 #define EN8801S_PHY_DEFAULT_ADDR 0x1d
 #define EN8801S_RG_ETHER_PHY_OUI 0x19a4
@@ -25,6 +25,12 @@
 #define EN8801S_PHY_ID1         0x03a2
 #define EN8801S_PHY_ID2         0x9461
 #define EN8801SC_PHY_ID         0x03a29471
+
+#define DEBUGFS_COUNTER         "counter"
+#define DEBUGFS_DRIVER_INFO     "driver_info"
+#define DEBUGFS_PBUS_OP         "pbus_op"
+#define DEBUGFS_POLARITY        "polarity"
+#define DEBUGFS_DBG_REG_SHOW    "dbg_regs_show"
 
 #define LED_ON_CTRL(i)              (0x024 + ((i)*2))
 #define LED_ON_EN                   (1 << 15)

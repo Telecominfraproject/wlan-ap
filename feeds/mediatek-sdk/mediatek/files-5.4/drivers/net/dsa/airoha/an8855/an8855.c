@@ -20,12 +20,72 @@
 #include <linux/gpio/consumer.h>
 #include <net/dsa.h>
 #include <linux/of_address.h>
+#include <linux/seq_file.h>
+#include <linux/proc_fs.h>
+#include <linux/version.h>
 
 #include "an8855.h"
 #include "an8855_nl.h"
+#include "an8855_phy.h"
 
 /* AN8855 driver version */
-#define ARHT_AN8855_DSA_DRIVER_VER	"1.0.1-L5.4"
+#define ARHT_AN8855_DSA_DRIVER_VER	"1.0.2"
+
+#define ARHT_CHIP_NAME                  "an8855"
+#define ARHT_PROC_DIR                   "air_sw"
+#define ARHT_PROC_NODE_DEVICE           "device"
+
+struct proc_dir_entry *proc_an8855_dsa_dir;
+
+/* T830 AN8855 Reference Board */
+static const struct an8855_led_cfg led_cfg[] = {
+/*************************************************************************
+ * Enable, LED idx, LED Polarity, LED ON event,  LED Blink event  LED Freq
+ *************************************************************************
+ */
+	/* GPIO0 */
+	{1, P4_LED0, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO1 */
+	{1, P4_LED1, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO2 */
+	{1, P0_LED0, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO3 */
+	{1, P0_LED1, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO4 */
+	{1, P1_LED0, LED_LOW,  LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO5 */
+	{1, P1_LED1, LED_LOW,  LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO6 */
+	{0, PHY_LED_MAX, LED_LOW,  LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO7 */
+	{0, PHY_LED_MAX, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO8 */
+	{0, PHY_LED_MAX, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO9 */
+	{1, P2_LED0, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO10 */
+	{1, P2_LED1, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO11 */
+	{1, P3_LED0, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO12 */
+	{1, P3_LED1, LED_HIGH,  LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO13 */
+	{0, PHY_LED_MAX, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO14 */
+	{0, PHY_LED_MAX, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO15 */
+	{0, PHY_LED_MAX, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO16 */
+	{0, PHY_LED_MAX, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO17 */
+	{0, PHY_LED_MAX, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO18 */
+	{0, PHY_LED_MAX, LED_HIGH, LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO19 */
+	{0, PHY_LED_MAX, LED_LOW,  LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+	/* GPIO20 */
+	{0, PHY_LED_MAX, LED_LOW,  LED_ON_EVENT, LED_BLK_EVENT, LED_FREQ},
+};
 
 /* String, offset, and register size in bytes if different from 4 bytes */
 static const struct an8855_mib_desc an8855_mib[] = {
@@ -99,7 +159,6 @@ an8855_mii_write(struct an8855_priv *priv, u32 reg, u32 val)
 	ret = bus->write(bus, priv->phy_base, 0x14, (val & 0xFFFF));
 
 	ret = bus->write(bus, priv->phy_base, 0x1f, 0);
-	ret = bus->write(bus, priv->phy_base, 0x10, 0);
 
 	if (ret < 0) {
 		dev_err(&bus->dev, "failed to write an8855 register\n");
@@ -130,7 +189,6 @@ an8855_mii_read(struct an8855_priv *priv, u32 reg)
 	hi = bus->read(bus, priv->phy_base, 0x17);
 
 	ret = bus->write(bus, priv->phy_base, 0x1f, 0);
-	ret = bus->write(bus, priv->phy_base, 0x10, 0);
 	if (ret < 0) {
 		dev_err(&bus->dev, "failed to read an8855 register\n");
 		return ret;
@@ -327,16 +385,22 @@ an8855_phy_write(struct dsa_switch *ds, int port, int regnum,
 static int
 an8855_cl45_read(struct an8855_priv *priv, int port, int devad, int regnum)
 {
-	regnum = MII_ADDR_C45 | (devad << 16) | regnum;
-	return mdiobus_read_nested(priv->bus, port, regnum);
+	an8855_cl22_write(priv, port, 0x0d, devad);
+	an8855_cl22_write(priv, port, 0x0e, regnum);
+	an8855_cl22_write(priv, port, 0x0d, devad | (0x4000));
+	return an8855_cl22_read(priv, port, 0x0e);
 }
 
 static int
 an8855_cl45_write(struct an8855_priv *priv, int port, int devad, int regnum,
 		      u16 val)
 {
-	regnum = MII_ADDR_C45 | (devad << 16) | regnum;
-	return mdiobus_write_nested(priv->bus, port, regnum, val);
+	an8855_cl22_write(priv, port, 0x0d, devad);
+	an8855_cl22_write(priv, port, 0x0e, regnum);
+	an8855_cl22_write(priv, port, 0x0d, devad | (0x4000));
+	an8855_cl22_write(priv, port, 0x0e, val);
+
+	return 0;
 }
 
 int
@@ -457,7 +521,6 @@ an8855_port_enable(struct dsa_switch *ds, int port, struct phy_device *phy)
 	priv->ports[port].pm |= PORTMATRIX_MATRIX(BIT(AN8855_CPU_PORT));
 	priv->ports[port].enable = true;
 	an8855_write(priv, AN8855_PORTMATRIX_P(port), priv->ports[port].pm);
-	an8855_clear(priv, AN8855_PMCR_P(port), PMCR_LINK_SETTINGS_MASK);
 
 	mutex_unlock(&priv->reg_mutex);
 
@@ -479,7 +542,6 @@ an8855_port_disable(struct dsa_switch *ds, int port)
 	 */
 	priv->ports[port].enable = false;
 	an8855_write(priv, AN8855_PORTMATRIX_P(port), PORTMATRIX_CLR);
-	an8855_clear(priv, AN8855_PMCR_P(port), PMCR_LINK_SETTINGS_MASK);
 
 	mutex_unlock(&priv->reg_mutex);
 }
@@ -1089,13 +1151,223 @@ setup_unused_ports(struct dsa_switch *ds, u32 pm)
 	return 0;
 }
 
+static int an8855_led_set_usr_def(struct dsa_switch *ds, u8 entity,
+		int polar, u16 on_evt, u16 blk_evt, u8 led_freq)
+{
+	struct an8855_priv *priv = ds->priv;
+	u32 cl45_data = 0;
+
+	if (polar == LED_HIGH)
+		on_evt |= LED_ON_POL;
+	else
+		on_evt &= ~LED_ON_POL;
+
+	/* LED on event */
+	an8855_phy_cl45_write(priv, (entity / 4), PHY_DEV1E,
+		PHY_SINGLE_LED_ON_CTRL(entity % 4), on_evt | LED_ON_EN);
+
+	/* LED blink event */
+	an8855_phy_cl45_write(priv, (entity / 4), PHY_DEV1E,
+		PHY_SINGLE_LED_BLK_CTRL(entity % 4), blk_evt);
+
+	/* LED freq */
+	switch (led_freq) {
+	case AIR_LED_BLK_DUR_32M:
+		cl45_data = 0x30e;
+		break;
+	case AIR_LED_BLK_DUR_64M:
+		cl45_data = 0x61a;
+		break;
+	case AIR_LED_BLK_DUR_128M:
+		cl45_data = 0xc35;
+		break;
+	case AIR_LED_BLK_DUR_256M:
+		cl45_data = 0x186a;
+		break;
+	case AIR_LED_BLK_DUR_512M:
+		cl45_data = 0x30d4;
+		break;
+	case AIR_LED_BLK_DUR_1024M:
+		cl45_data = 0x61a8;
+		break;
+	default:
+		break;
+	}
+	an8855_phy_cl45_write(priv, (entity / 4), PHY_DEV1E,
+		PHY_SINGLE_LED_BLK_DUR(entity % 4), cl45_data);
+
+	an8855_phy_cl45_write(priv, (entity / 4), PHY_DEV1E,
+		PHY_SINGLE_LED_ON_DUR(entity % 4), (cl45_data >> 1));
+
+	/* Disable DATA & BAD_SSD for port LED blink behavior */
+	cl45_data = an8855_phy_cl45_read(priv, (entity / 4), PHY_DEV1E,
+		PHY_PMA_CTRL);
+	cl45_data &= ~BIT(0);
+	cl45_data &= ~BIT(15);
+	an8855_phy_cl45_write(priv, (entity / 4), PHY_DEV1E,
+		PHY_PMA_CTRL, cl45_data);
+
+	return 0;
+}
+
+static int an8855_led_set_mode(struct dsa_switch *ds, u8 mode)
+{
+	struct an8855_priv *priv = ds->priv;
+	u16 cl45_data;
+
+	cl45_data = an8855_phy_cl45_read(priv, 0, PHY_DEV1F, PHY_LED_BCR);
+	switch (mode) {
+	case AN8855_LED_MODE_DISABLE:
+		cl45_data &= ~LED_BCR_EXT_CTRL;
+		cl45_data &= ~LED_BCR_MODE_MASK;
+		cl45_data |= LED_BCR_MODE_DISABLE;
+		break;
+	case AN8855_LED_MODE_USER_DEFINE:
+		cl45_data |= LED_BCR_EXT_CTRL;
+		cl45_data |= LED_BCR_CLK_EN;
+		break;
+	default:
+		dev_err(priv->dev, "LED mode%d is not supported!\n", mode);
+		return -EINVAL;
+	}
+	an8855_phy_cl45_write(priv, 0, PHY_DEV1F, PHY_LED_BCR, cl45_data);
+
+	return 0;
+}
+
+static int an8855_led_set_state(struct dsa_switch *ds, u8 entity, u8 state)
+{
+	struct an8855_priv *priv = ds->priv;
+	u16 cl45_data = 0;
+
+	/* Change to per port contorl */
+	cl45_data = an8855_phy_cl45_read(priv, (entity / 4), PHY_DEV1E,
+		PHY_LED_CTRL_SELECT);
+
+	if (state == 1)
+		cl45_data |= (1 << (entity % 4));
+	else
+		cl45_data &= ~(1 << (entity % 4));
+
+	an8855_phy_cl45_write(priv, (entity / 4), PHY_DEV1E,
+		PHY_LED_CTRL_SELECT, cl45_data);
+
+	/* LED enable setting */
+	cl45_data = an8855_phy_cl45_read(priv, (entity / 4),
+		PHY_DEV1E, PHY_SINGLE_LED_ON_CTRL(entity % 4));
+
+	if (state == 1)
+		cl45_data |= LED_ON_EN;
+	else
+		cl45_data &= ~LED_ON_EN;
+
+	an8855_phy_cl45_write(priv, (entity / 4), PHY_DEV1E,
+		PHY_SINGLE_LED_ON_CTRL(entity % 4), cl45_data);
+
+	return 0;
+}
+
+static int an8855_led_init(struct dsa_switch *ds)
+{
+	struct an8855_priv *priv = ds->priv;
+	u32 val, led_count = ARRAY_SIZE(led_cfg);
+	int ret = 0, id;
+	u32 tmp_val = 0;
+	u32 tmp_id = 0;
+
+	ret = an8855_led_set_mode(ds, AN8855_LED_MODE_USER_DEFINE);
+	if (ret != 0) {
+		dev_err(priv->dev, "led_set_mode fail(ret:%d)!\n", ret);
+		return ret;
+	}
+
+	for (id = 0; id < led_count; id++) {
+		ret = an8855_led_set_state(ds,
+			led_cfg[id].phy_led_idx, led_cfg[id].en);
+		if (ret != 0) {
+			dev_err(priv->dev, "led_set_state fail(ret:%d)!\n", ret);
+			return ret;
+		}
+		if (led_cfg[id].en == 1) {
+			ret = an8855_led_set_usr_def(ds,
+				led_cfg[id].phy_led_idx,
+				led_cfg[id].pol, led_cfg[id].on_cfg,
+				led_cfg[id].blk_cfg,
+				led_cfg[id].led_freq);
+			if (ret != 0) {
+				dev_err(priv->dev, "led_set_usr_def fail!\n");
+				return ret;
+			}
+		}
+	}
+
+	/* Setting for System LED & Loop LED */
+	an8855_write(priv, RG_GPIO_OE, 0x0);
+	an8855_write(priv, RG_GPIO_CTRL, 0x0);
+	val = 0;
+	an8855_write(priv, RG_GPIO_L_INV, val);
+
+	val = 0x1001;
+	an8855_write(priv, RG_GPIO_CTRL, val);
+	val = an8855_read(priv, RG_GPIO_DATA);
+	val |= BITS(1, 3);
+	val &= ~(BIT(0));
+	val &= ~(BIT(6));
+
+	an8855_write(priv, RG_GPIO_DATA, val);
+	val = an8855_read(priv, RG_GPIO_OE);
+	val |= 0x41;
+	an8855_write(priv, RG_GPIO_OE, val);
+
+	/* Mapping between GPIO & LED */
+	val = 0;
+	for (id = 0; id < led_count; id++) {
+		/* Skip GPIO6, due to GPIO6 does not support PORT LED */
+		if (id == 6)
+			continue;
+
+		if (led_cfg[id].en == 1) {
+			if (id < 7)
+				val |= led_cfg[id].phy_led_idx << ((id % 4) * 8);
+			else
+				val |= led_cfg[id].phy_led_idx << (((id - 1) % 4) * 8);
+		}
+
+		if (id < 7)
+			tmp_id = id;
+		else
+			tmp_id = id - 1;
+
+		if ((tmp_id % 4) == 0x3) {
+			an8855_write(priv, RG_GPIO_LED_SEL(tmp_id / 4), val);
+			tmp_val = an8855_read(priv, RG_GPIO_LED_SEL(tmp_id / 4));
+			val = 0;
+		}
+	}
+
+	/* Turn on LAN LED mode */
+	val = 0;
+	for (id = 0; id < led_count; id++) {
+		if (led_cfg[id].en == 1)
+			val |= 0x1 << id;
+	}
+	an8855_write(priv, RG_GPIO_LED_MODE, val);
+
+	/* Force clear blink pulse for per port LED */
+	an8855_phy_cl45_write(priv, 0, PHY_DEV1F, PHY_LED_BLINK_DUR_CTRL, 0x1f);
+	usleep_range(1000, 5000);
+	an8855_phy_cl45_write(priv, 0, PHY_DEV1F, PHY_LED_BLINK_DUR_CTRL, 0);
+
+	return 0;
+}
+
 static int
 an8855_setup(struct dsa_switch *ds)
 {
 	struct an8855_priv *priv = ds->priv;
 	struct an8855_dummy_poll p;
 	u32 unused_pm = 0;
-	u32 val, id;
+	u32 val, id, led_count = ARRAY_SIZE(led_cfg);
 	int ret, i;
 
 	/* Reset whole chip through gpio pin or memory-mapped registers for
@@ -1130,6 +1402,63 @@ an8855_setup(struct dsa_switch *ds)
 		priv->phy_base = priv->phy_base_new;
 	}
 
+	for (i = 0; i < AN8855_NUM_PHYS; i++) {
+		val = an8855_phy_read(ds, i, MII_BMCR);
+		val |= BMCR_ISOLATE;
+		an8855_phy_write(ds, i, MII_BMCR, val);
+	}
+
+	/* AN8855H need to setup before switch init */
+	val = an8855_read(priv, PKG_SEL);
+	if ((val & 0x7) == PAG_SEL_AN8855H) {
+		/* Invert for LED activity change */
+		val = an8855_read(priv, RG_GPIO_L_INV);
+		for (id = 0; id < led_count; id++) {
+			if ((led_cfg[id].pol == LED_HIGH) &&
+				(led_cfg[id].en == 1))
+				val |= 0x1 << id;
+		}
+		an8855_write(priv, RG_GPIO_L_INV, (val | 0x1));
+
+		/* MCU NOP CMD */
+		an8855_write(priv, RG_GDMP_RAM, 0x846);
+		an8855_write(priv, RG_GDMP_RAM + 4, 0x4a);
+
+		/* Enable MCU */
+		val = an8855_read(priv, RG_CLK_CPU_ICG);
+		an8855_write(priv, RG_CLK_CPU_ICG, val | MCU_ENABLE);
+		usleep_range(1000, 5000);
+
+		/* Disable MCU watchdog */
+		val = an8855_read(priv, RG_TIMER_CTL);
+		an8855_write(priv, RG_TIMER_CTL, (val & (~WDOG_ENABLE)));
+
+		/* Configure interrupt */
+		an8855_write(priv, RG_INTB_MODE, (0x1 << priv->intr_pin));
+
+		/* LED settings for T830 reference board */
+		ret = an8855_led_init(ds);
+		if (ret < 0) {
+			dev_err(priv->dev, "an8855_led_init fail. (ret=%d)\n", ret);
+			return ret;
+		}
+	}
+
+	/* Adjust to reduce noise */
+	for (i = 0; i < AN8855_NUM_PHYS; i++) {
+		an8855_phy_cl45_write(priv, i, PHY_DEV1E,
+			PHY_TX_PAIR_DLY_SEL_GBE, 0x4040);
+
+		an8855_phy_cl45_write(priv, i, PHY_DEV1E,
+			PHY_RXADC_CTRL, 0x1010);
+
+		an8855_phy_cl45_write(priv, i, PHY_DEV1E,
+			PHY_RXADC_REV_0, 0x100);
+
+		an8855_phy_cl45_write(priv, i, PHY_DEV1E,
+			PHY_RXADC_REV_1, 0x100);
+	}
+
 	/* Let phylink decide the interface later. */
 	priv->p5_interface = PHY_INTERFACE_MODE_NA;
 
@@ -1138,6 +1467,10 @@ an8855_setup(struct dsa_switch *ds)
 	//         BIT(AN8855_CPU_PORT));
 	an8855_rmw(priv, AN8855_BPC, AN8855_BPDU_PORT_FW_MASK,
 		   AN8855_BPDU_CPU_ONLY);
+
+	val = an8855_read(priv, AN8855_CKGCR);
+	val &= ~(CKG_LNKDN_GLB_STOP | CKG_LNKDN_PORT_STOP);
+	an8855_write(priv, AN8855_CKGCR, val);
 
 	/* Enable and reset MIB counters */
 	an8855_mib_reset(ds);
@@ -1157,7 +1490,17 @@ an8855_setup(struct dsa_switch *ds)
 			   PVC_EG_TAG(AN8855_VLAN_EG_CONSISTENT));
 	}
 
+	for (i = 0; i < AN8855_NUM_PHYS; i++) {
+		val = an8855_phy_read(ds, i, MII_BMCR);
+		val &= ~BMCR_ISOLATE;
+		an8855_phy_write(ds, i, MII_BMCR, val);
+	}
+
 	an8855_phy_setup(ds);
+
+	/* PHY restart AN*/
+	for (i = 0; i < AN8855_NUM_PHYS; i++)
+		an8855_phy_write(ds, i, MII_BMCR, 0x1240);
 
 	/* Group and enable unused ports as a standalone dumb switch. */
 	setup_unused_ports(ds, unused_pm);
@@ -1254,6 +1597,28 @@ static int
 an8855_set_hsgmii_mode(struct an8855_priv *priv)
 {
 	u32 val = 0;
+
+	/* TX FIR - improve TX EYE */
+	val = an8855_read(priv, INTF_CTRL_10);
+	val &= ~(0x3f << 16);
+	val |= BIT(21);
+	val &= ~(0x1f << 24);
+	val |= (0x4 << 24);
+	val |= BIT(29);
+	an8855_write(priv, INTF_CTRL_10, val);
+
+	val = an8855_read(priv, INTF_CTRL_11);
+	val &= ~(0x3f);
+	val |= BIT(6);
+	an8855_write(priv, INTF_CTRL_11, val);
+
+	/* RX CDR - improve RX Jitter Tolerance */
+	val = an8855_read(priv, RG_QP_CDR_LPF_BOT_LIM);
+	val &= ~(0x7 << 24);
+	val |= (0x5 << 24);
+	val &= ~(0x7 << 20);
+	val |= (0x5 << 20);
+	an8855_write(priv, RG_QP_CDR_LPF_BOT_LIM, val);
 
 	/* PLL */
 	val = an8855_read(priv, QP_DIG_MODE_CTRL_1);
@@ -1384,7 +1749,7 @@ an8855_set_hsgmii_mode(struct an8855_priv *priv)
 	val &= ~(0xf << 25);
 	val |= (0x1 << 25);
 	val &= ~(0x7 << 29);
-	val |= (0x3 << 29);
+	val |= (0x6 << 29);
 	an8855_write(priv, RG_QP_CDR_LPF_SETVALUE, val);
 
 	val = an8855_read(priv, RG_QP_CDR_PR_CKREF_DIV1);
@@ -1415,12 +1780,9 @@ an8855_set_hsgmii_mode(struct an8855_priv *priv)
 	val |= (0x4 << 24);
 	an8855_write(priv, RG_QP_CDR_PR_CKREF_DIV1, val);
 
-	val = an8855_read(priv, PLL_CTRL_0);
-	val |= BIT(0);
-	an8855_write(priv, PLL_CTRL_0, val);
-
 	val = an8855_read(priv, RX_CTRL_26);
-	val &= ~BIT(23);
+	val |= BIT(23);
+	val &= ~BIT(24);
 	val |= BIT(26);
 	an8855_write(priv, RX_CTRL_26, val);
 
@@ -1448,8 +1810,8 @@ an8855_set_hsgmii_mode(struct an8855_priv *priv)
 	val = an8855_read(priv, RX_CTRL_8);
 	val &= ~(0xfff << 16);
 	val |= (0x200 << 16);
-	val &= ~(0x7fff << 14);
-	val |= (0xfff << 14);
+	val &= ~(0x7fff << 0);
+	val |= (0xfff << 0);
 	an8855_write(priv, RX_CTRL_8, val);
 
 	/* Frequency memter */
@@ -1467,6 +1829,10 @@ an8855_set_hsgmii_mode(struct an8855_priv *priv)
 	val &= ~(0xfffff << 0);
 	val |= (0x2710 << 0);
 	an8855_write(priv, RX_CTRL_7, val);
+
+	val = an8855_read(priv, PLL_CTRL_0);
+	val |= BIT(0);
+	an8855_write(priv, PLL_CTRL_0, val);
 
 	/* PCS Init */
 	val = an8855_read(priv, RG_HSGMII_PCS_CTROL_1);
@@ -1506,6 +1872,28 @@ static int
 an8855_sgmii_setup(struct an8855_priv *priv, int mode)
 {
 	u32 val = 0;
+
+	/* TX FIR - improve TX EYE */
+	val = an8855_read(priv, INTF_CTRL_10);
+	val &= ~(0x3f << 16);
+	val |= BIT(21);
+	val &= ~(0x1f << 24);
+	val |= BIT(29);
+	an8855_write(priv, INTF_CTRL_10, val);
+
+	val = an8855_read(priv, INTF_CTRL_11);
+	val &= ~(0x3f);
+	val |= (0xd << 0);
+	val |= BIT(6);
+	an8855_write(priv, INTF_CTRL_11, val);
+
+	/* RX CDR - improve RX Jitter Tolerance */
+	val = an8855_read(priv, RG_QP_CDR_LPF_BOT_LIM);
+	val &= ~(0x7 << 24);
+	val |= (0x6 << 24);
+	val &= ~(0x7 << 20);
+	val |= (0x6 << 20);
+	an8855_write(priv, RG_QP_CDR_LPF_BOT_LIM, val);
 
 	/* PMA Init */
 	/* PLL */
@@ -1666,15 +2054,10 @@ an8855_sgmii_setup(struct an8855_priv *priv, int mode)
 	val |= (0x4 << 24);
 	an8855_write(priv, RG_QP_CDR_PR_CKREF_DIV1, val);
 
-	val = an8855_read(priv, PLL_CTRL_0);
-	val |= BIT(0);
-	an8855_write(priv, PLL_CTRL_0, val);
-
 	val = an8855_read(priv, RX_CTRL_26);
-	val &= ~BIT(23);
-	if (mode == SGMII_MODE_AN)
+	val |= BIT(23);
+	val &= ~BIT(24);
 		val |= BIT(26);
-
 	an8855_write(priv, RX_CTRL_26, val);
 
 	val = an8855_read(priv, RX_DLY_0);
@@ -1720,6 +2103,10 @@ an8855_sgmii_setup(struct an8855_priv *priv, int mode)
 	val &= ~(0xfffff << 0);
 	val |= (0x2710 << 0);
 	an8855_write(priv, RX_CTRL_7, val);
+
+	val = an8855_read(priv, PLL_CTRL_0);
+	val |= BIT(0);
+	an8855_write(priv, PLL_CTRL_0, val);
 
 	if (mode == SGMII_MODE_FORCE) {
 		/* PCS Init */
@@ -1805,7 +2192,6 @@ an8855_sgmii_setup(struct an8855_priv *priv, int mode)
 		/* Restart AN */
 		val = an8855_read(priv, SGMII_REG_AN0);
 		val |= BIT(9);
-		val |= BIT(15);
 		an8855_write(priv, SGMII_REG_AN0, val);
 	}
 
@@ -1920,16 +2306,6 @@ unsupported:
 
 	if (mcr_new != mcr_cur)
 		an8855_write(priv, AN8855_PMCR_P(port), mcr_new);
-}
-
-static void
-an8855_phylink_mac_link_down(struct dsa_switch *ds, int port,
-					 unsigned int mode,
-					 phy_interface_t interface)
-{
-	struct an8855_priv *priv = ds->priv;
-
-	an8855_clear(priv, AN8855_PMCR_P(port), PMCR_LINK_SETTINGS_MASK);
 }
 
 static void
@@ -2194,6 +2570,51 @@ an8855_sw_phy_write(struct dsa_switch *ds, int port, int regnum, u16 val)
 	return priv->info->phy_write(ds, port, regnum, val);
 }
 
+static int an8855_proc_device_read(struct seq_file *seq, void *v)
+{
+	seq_printf(seq, "%s\n", ARHT_CHIP_NAME);
+
+	return 0;
+}
+
+static int an8855_proc_device_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, an8855_proc_device_read, 0);
+}
+
+#if (KERNEL_VERSION(5, 6, 0) <= LINUX_VERSION_CODE)
+static const struct proc_ops an8855_proc_device_fops = {
+	.proc_open	= an8855_proc_device_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+};
+#else
+static const struct file_operations an8855_proc_device_fops = {
+	.owner	= THIS_MODULE,
+	.open	= an8855_proc_device_open,
+	.read	= seq_read,
+	.llseek	= seq_lseek,
+	.release	= single_release,
+};
+#endif
+
+static int an8855_proc_device_init(void)
+{
+	if (!proc_an8855_dsa_dir)
+		proc_an8855_dsa_dir = proc_mkdir(ARHT_PROC_DIR, 0);
+
+	proc_create(ARHT_PROC_NODE_DEVICE, 0400, proc_an8855_dsa_dir,
+			&an8855_proc_device_fops);
+
+	return 0;
+}
+
+static void an8855_proc_device_exit(void)
+{
+	remove_proc_entry(ARHT_PROC_NODE_DEVICE, 0);
+}
+
 static const struct dsa_switch_ops an8855_switch_ops = {
 	.get_tag_protocol = air_get_tag_protocol,
 	.setup = an8855_sw_setup,
@@ -2217,10 +2638,6 @@ static const struct dsa_switch_ops an8855_switch_ops = {
 	.port_mirror_add = an8855_port_mirror_add,
 	.port_mirror_del = an8855_port_mirror_del,
 	.phylink_validate = an8855_phylink_validate,
-	.phylink_mac_link_state = an8855_sw_phylink_mac_link_state,
-	.phylink_mac_config = an8855_phylink_mac_config,
-	.phylink_mac_link_down = an8855_phylink_mac_link_down,
-	.phylink_mac_link_up = an8855_phylink_mac_link_up,
 	.get_mac_eee = an8855_get_mac_eee,
 	.set_mac_eee = an8855_set_mac_eee,
 };
@@ -2308,6 +2725,13 @@ an8855_probe(struct mdio_device *mdiodev)
 	if ((ret < 0) || (priv->phy_base_new > 0x1f))
 		priv->phy_base_new = -1;
 
+	/* Assign AN8855 interrupt pin */
+	if (of_property_read_u32(dn, "airoha,intr", &priv->intr_pin))
+		priv->intr_pin = AN8855_DFL_INTR_ID;
+
+	if (of_property_read_u32(dn, "airoha,extSurge", &priv->extSurge))
+		priv->extSurge = AN8855_DFL_EXT_SURGE;
+
 	priv->bus = mdiodev->bus;
 	priv->dev = &mdiodev->dev;
 	priv->ds->priv = priv;
@@ -2324,6 +2748,7 @@ an8855_probe(struct mdio_device *mdiodev)
 	}
 	an8855_nl_init(&priv);
 
+	an8855_proc_device_init();
 	return 0;
 }
 
@@ -2337,6 +2762,8 @@ an8855_remove(struct mdio_device *mdiodev)
 
 	if (priv->base)
 		iounmap(priv->base);
+
+	an8855_proc_device_exit();
 
 	an8855_nl_exit();
 }

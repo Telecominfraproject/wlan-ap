@@ -125,7 +125,7 @@ static int an8855_get_port_pvid(struct switch_dev *dev, int port, int *val)
 {
 	struct gsw_an8855 *gsw = container_of(dev, struct gsw_an8855, swdev);
 
-	if (port >= AN8855_NUM_PORTS)
+	if (port < 0 || port >= AN8855_NUM_PORTS)
 		return -EINVAL;
 
 	*val = an8855_reg_read(gsw, PVID(port));
@@ -138,7 +138,7 @@ static int an8855_set_port_pvid(struct switch_dev *dev, int port, int pvid)
 {
 	struct gsw_an8855 *gsw = container_of(dev, struct gsw_an8855, swdev);
 
-	if (port >= AN8855_NUM_PORTS)
+	if (port < 0 || port >= AN8855_NUM_PORTS)
 		return -EINVAL;
 
 	if (pvid < AN8855_MIN_VID || pvid > AN8855_MAX_VID)
@@ -300,18 +300,20 @@ static int an8855_set_port_link(struct switch_dev *dev, int port,
 static u64 get_mib_counter(struct gsw_an8855 *gsw, int i, int port)
 {
 	unsigned int offset;
-	u64 lo, hi, hi2;
+	u64 lo = 0, hi = 0, hi2 = 0;
 
-	offset = an8855_mibs[i].offset;
+	if (i >= 0) {
+		offset = an8855_mibs[i].offset;
 
-	if (an8855_mibs[i].size == 1)
-		return an8855_reg_read(gsw, MIB_COUNTER_REG(port, offset));
+		if (an8855_mibs[i].size == 1)
+			return an8855_reg_read(gsw, MIB_COUNTER_REG(port, offset));
 
-	do {
-		hi = an8855_reg_read(gsw, MIB_COUNTER_REG(port, offset + 4));
-		lo = an8855_reg_read(gsw, MIB_COUNTER_REG(port, offset));
-		hi2 = an8855_reg_read(gsw, MIB_COUNTER_REG(port, offset + 4));
-	} while (hi2 != hi);
+		do {
+			hi = an8855_reg_read(gsw, MIB_COUNTER_REG(port, offset + 4));
+			lo = an8855_reg_read(gsw, MIB_COUNTER_REG(port, offset));
+			hi2 = an8855_reg_read(gsw, MIB_COUNTER_REG(port, offset + 4));
+		} while (hi2 != hi);
+	}
 
 	return (hi << 32) | lo;
 }
@@ -370,7 +372,7 @@ static void an8855_port_isolation(struct gsw_an8855 *gsw)
 	an8855_reg_write(gsw, PORTMATRIX(gsw->cpu_port), PORT_MATRIX_M);
 
 	for (i = 0; i < AN8855_NUM_PORTS; i++) {
-		u32 pvc_mode = 0x8100 << STAG_VPID_S;
+		u32 pvc_mode = 0x9100 << STAG_VPID_S;
 
 		if (gsw->port5_cfg.stag_on && i == 5)
 			pvc_mode |= PVC_PORT_STAG | PVC_STAG_REPLACE;

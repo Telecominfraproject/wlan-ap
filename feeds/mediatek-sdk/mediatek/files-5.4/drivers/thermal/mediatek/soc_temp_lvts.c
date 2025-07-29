@@ -23,10 +23,36 @@
 #include <linux/string.h>
 #include <linux/thermal.h>
 #include "soc_temp_lvts.h"
+#include "../thermal_hwmon.h"
 
 /*
  * Definition or macro function
  */
+#define STOP_COUNTING_V6	     (DEVICE_WRITE | RG_TSFM_CTRL_0 << 8 | 0x00)
+#define SET_RG_TSFM_LPDLY_V6	     (DEVICE_WRITE | RG_TSFM_CTRL_4 << 8 | 0xA6)
+#define SET_COUNTING_WINDOW_20US1_V6 (DEVICE_WRITE | RG_TSFM_CTRL_2 << 8 | 0x00)
+#define SET_COUNTING_WINDOW_20US2_V6 (DEVICE_WRITE | RG_TSFM_CTRL_1 << 8 | 0x20)
+#define TOGGLE_TSDIV_EN_AND_TSVCO_TG_1_V6                                      \
+	(DEVICE_WRITE | RG_TSV2F_CTRL_0 << 8 | 0xC7)
+#define TOGGLE_TSDIV_EN_AND_TSVCO_TG_2_V6                                      \
+	(DEVICE_WRITE | RG_TSV2F_CTRL_0 << 8 | 0xCE)
+#define SET_TS_EN_V6	    (DEVICE_WRITE | RG_TSV2F_CTRL_0 << 8 | 0xC7)
+#define SET_TSBG_CHOP_EN_V6 (DEVICE_WRITE | RG_TSV2F_CTRL_1 << 8 | 0x8D)
+#define SET_TS_RSV_V6	    (DEVICE_WRITE | RG_TSV2F_CTRL_4 << 8 | 0x7C)
+#define SET_TSBG_RSV_V6	    (DEVICE_WRITE | RG_TSV2F_CTRL_2 << 8 | 0xA8)
+#define SET_STR_EN_V6	    (DEVICE_WRITE | RG_TSV2F_CTRL_3 << 8 | 0x04)
+
+#define SET_MANUAL_RCK_V6	  (DEVICE_WRITE | RG_TSV2F_CTRL_6 << 8 | 0x00)
+#define SET_RG_TSV2F_RSV_V6	  (DEVICE_WRITE | RG_TSV2F_CTRL_3 << 8 | 0x0C)
+#define SELECT_SENSOR_RCK_V6(id)  (DEVICE_WRITE | RG_TSV2F_CTRL_5 << 8 | (id))
+#define SET_DEVICE_SINGLE_MODE_V6 (DEVICE_WRITE | RG_TSFM_CTRL_3 << 8 | 0x78)
+#define KICK_OFF_RCK_COUNTING_V6  (DEVICE_WRITE | RG_TSFM_CTRL_0 << 8 | 0x02)
+#define GET_RCK_COUNT_DATA_V6	  (DEVICE_WRITE | RG_TSFM_DATA_0 << 8 | 0x02)
+#define SET_SENSOR_NO_RCK_V6(id)                                               \
+	(DEVICE_WRITE | RG_TSV2F_CTRL_5 << 8 | 0x10 | (id))
+#define SET_DEVICE_LOW_POWER_SINGLE_MODE_V6                                    \
+	(DEVICE_WRITE | RG_TSFM_CTRL_3 << 8 | 0xB8)
+
 #define STOP_COUNTING_V5	     (DEVICE_WRITE | RG_TSFM_CTRL_0 << 8 | 0x00)
 #define SET_RG_TSFM_LPDLY_V5	     (DEVICE_WRITE | RG_TSFM_CTRL_4 << 8 | 0xA6)
 #define SET_COUNTING_WINDOW_20US1_V5 (DEVICE_WRITE | RG_TSFM_CTRL_2 << 8 | 0x00)
@@ -911,6 +937,8 @@ static int lvts_register_thermal_zones(struct lvts_data *lvts_data)
 			lvts_close(lvts_data);
 			return ret;
 		}
+
+		thermal_add_hwmon_sysfs(tzdev);
 	}
 
 	return 0;
@@ -1234,6 +1262,105 @@ static int device_read_count_rc_n_v5(struct lvts_data *lvts_data)
 	return 0;
 }
 
+
+/*
+ * LVTS v6 common code
+ */
+static void device_enable_and_init_v6(struct lvts_data *lvts_data)
+{
+	unsigned int i;
+
+	for (i = 0; i < lvts_data->num_tc; i++) {
+		lvts_write_device(lvts_data, STOP_COUNTING_V6, i);
+		lvts_write_device(lvts_data, SET_COUNTING_WINDOW_20US2_V6, i);
+		lvts_write_device(lvts_data, SET_COUNTING_WINDOW_20US1_V6, i);
+		lvts_write_device(lvts_data, SET_RG_TSFM_LPDLY_V6, i);
+		lvts_write_device(lvts_data, SET_TS_EN_V6, i);
+		lvts_write_device(lvts_data, SET_TSBG_CHOP_EN_V6, i);
+		lvts_write_device(lvts_data, SET_TS_RSV_V6, i);
+		lvts_write_device(lvts_data, SET_TSBG_RSV_V6, i);
+		lvts_write_device(lvts_data, TOGGLE_TSDIV_EN_AND_TSVCO_TG_2_V6,
+				  i);
+		lvts_write_device(lvts_data, TOGGLE_TSDIV_EN_AND_TSVCO_TG_1_V6,
+				  i);
+		lvts_write_device(lvts_data, SET_STR_EN_V6, i);
+	}
+
+	lvts_data->counting_window_us = 20;
+}
+
+static int device_read_count_rc_n_v6(struct lvts_data *lvts_data)
+{
+	/* Resistor-Capacitor Calibration */
+	/* count_RC_N: count RC now */
+	struct device *dev = lvts_data->dev;
+	struct tc_settings *tc = lvts_data->tc;
+	struct sensor_cal_data *cal_data = &lvts_data->cal_data;
+	unsigned int offset, size, s_index, data;
+	void __iomem *base;
+	int ret, i, j;
+	char buffer[512];
+
+	cal_data->count_rc_now =
+		devm_kcalloc(dev, lvts_data->num_sensor,
+			     sizeof(*cal_data->count_rc_now), GFP_KERNEL);
+	if (!cal_data->count_rc_now)
+		return -ENOMEM;
+
+	for (i = 0; i < lvts_data->num_tc; i++) {
+		base = GET_BASE_ADDR(i);
+		lvts_write_device(lvts_data, SET_MANUAL_RCK_V6, i);
+
+		for (j = 0; j < tc[i].num_sensor; j++) {
+			s_index = tc[i].sensor_map[j];
+
+			lvts_write_device(lvts_data, SET_RG_TSV2F_RSV_V6, i);
+			lvts_write_device(lvts_data, SELECT_SENSOR_RCK_V6(j),
+					  i);
+			lvts_write_device(lvts_data, SET_DEVICE_SINGLE_MODE_V6,
+					  i);
+			lvts_write_device(lvts_data, KICK_OFF_RCK_COUNTING_V6,
+					  i);
+			lvts_write_device(lvts_data, GET_RCK_COUNT_DATA_V6, i);
+
+			udelay(50);
+
+			ret = readl_poll_timeout(
+				LVTS_CONFIG_0 + base, data,
+				!(data & DEVICE_SENSING_STATUS), 2, 200);
+			if (ret)
+				dev_err(dev,
+					"Error: LVTS %d DEVICE_SENSING_STATUS didn't ready\n",
+					i);
+
+			data = lvts_read_device(lvts_data, 0x00, i);
+
+			cal_data->count_rc_now[s_index] =
+				(data & GENMASK(23, 0));
+
+			/* Recover Setting for Normal Access on
+			 * temperature fetch
+			 */
+			lvts_write_device(lvts_data, SET_SENSOR_NO_RCK_V6(j),
+					  i);
+			lvts_write_device(lvts_data,
+					  SET_DEVICE_LOW_POWER_SINGLE_MODE_V6,
+					  i);
+		}
+	}
+
+	size = sizeof(buffer);
+	offset = snprintf(buffer, size, "[COUNT_RC_NOW] ");
+	for (i = 0; i < lvts_data->num_sensor; i++)
+		offset += snprintf(buffer + offset, size - offset, "%d:%d ", i,
+				   cal_data->count_rc_now[i]);
+
+	buffer[offset] = '\0';
+	dev_info(dev, "%s\n", buffer);
+
+	return 0;
+}
+
 /*
  * LVTS MT6873
  */
@@ -1479,8 +1606,8 @@ static struct tc_settings mt7988_tc_settings[] = {
 			       MT7988_TS2_3},
 		.tc_speed = SET_TC_SPEED_IN_US(118, 118, 118, 118),
 		.hw_filter = LVTS_FILTER_16_OF_18,
-		.dominator_sensing_point = SENSING_POINT0,
-		.hw_reboot_trip_point = 117000,
+		.dominator_sensing_point = ALL_SENSING_POINTS,
+		.hw_reboot_trip_point = 125000,
 		.irq_bit = BIT(4),
 	},
 	[1] = {
@@ -1491,8 +1618,8 @@ static struct tc_settings mt7988_tc_settings[] = {
 			       MT7988_TS3_3},
 		.tc_speed = SET_TC_SPEED_IN_US(118, 118, 118, 118),
 		.hw_filter = LVTS_FILTER_16_OF_18,
-		.dominator_sensing_point = SENSING_POINT0,
-		.hw_reboot_trip_point = 117000,
+		.dominator_sensing_point = ALL_SENSING_POINTS,
+		.hw_reboot_trip_point = 125000,
 		.irq_bit = BIT(5),
 	}
 
@@ -1513,6 +1640,72 @@ static struct lvts_data mt7988_lvts_data = {
 	},
 	.feature_bitmap = 0,
 	.num_efuse_addr = 10,
+	.num_efuse_block = 1,
+	.cal_data = {
+		.default_golden_temp = 60,
+		.default_count_r = 19380,
+		.default_count_rc = 5330,
+	},
+	.coeff = {
+		.a = -204650,
+		.b = 204650,
+	},
+};
+
+/*
+ * LVTS MT7987
+ */
+
+#define MT7987_NUM_LVTS (ARRAY_SIZE(mt7987_tc_settings))
+
+enum mt7987_lvts_domain { MT7987_AP_DOMAIN, MT7987_NUM_DOMAIN };
+
+enum mt7987_lvts_sensor_enum {
+	MT7987_TS2_0,
+	MT7987_TS2_1,
+	MT7987_NUM_TS
+};
+
+static void mt7987_efuse_to_cal_data(struct lvts_data *lvts_data)
+{
+	struct sensor_cal_data *cal_data = &lvts_data->cal_data;
+
+	cal_data->golden_temp = GET_CAL_DATA_BITMASK(0, 31, 24);
+
+	cal_data->count_r[MT7987_TS2_0] = GET_CAL_DATA_BITMASK(1, 31, 0);
+	cal_data->count_r[MT7987_TS2_1] = GET_CAL_DATA_BITMASK(2, 31, 0);
+	cal_data->count_rc[MT7987_TS2_0] = GET_CAL_DATA_BITMASK(3, 31, 0);
+}
+
+static struct tc_settings mt7987_tc_settings[] = {
+	[0] = {
+		.domain_index = MT7987_AP_DOMAIN,
+		.addr_offset = 0x0,
+		.num_sensor = 2,
+		.sensor_map = {MT7987_TS2_0, MT7987_TS2_1},
+		.tc_speed = SET_TC_SPEED_IN_US(118, 118, 118, 118),
+		.hw_filter = LVTS_FILTER_16_OF_18,
+		.dominator_sensing_point = ALL_SENSING_POINTS,
+		.hw_reboot_trip_point = 125000,
+		.irq_bit = BIT(4),
+	},
+};
+
+static struct lvts_data mt7987_lvts_data = {
+	.num_domain = MT7987_NUM_DOMAIN,
+	.num_tc = MT7987_NUM_LVTS,
+	.tc = mt7987_tc_settings,
+	.num_sensor = MT7987_NUM_TS,
+	.ops = {
+		.efuse_to_cal_data = mt7987_efuse_to_cal_data,
+		.device_enable_and_init = device_enable_and_init_v6,
+		.device_enable_auto_rck = device_enable_auto_rck_v4,
+		.device_read_count_rc_n = device_read_count_rc_n_v6,
+		.set_cal_data = set_calibration_data_v4,
+		.init_controller = init_controller_v4,
+	},
+	.feature_bitmap = 0,
+	.num_efuse_addr = 4,
 	.num_efuse_block = 1,
 	.cal_data = {
 		.default_golden_temp = 60,
@@ -1873,6 +2066,10 @@ static const struct of_device_id lvts_of_match[] = {
 	{
 		.compatible = "mediatek,mt7988-lvts",
 		.data = (void *)&mt7988_lvts_data,
+	},
+	{
+		.compatible = "mediatek,mt7987-lvts",
+		.data = (void *)&mt7987_lvts_data,
 	},
 	{},
 };

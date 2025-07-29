@@ -488,6 +488,16 @@ static const struct mtk_gate_regs infra2_cg_regs = {
 		.ops = &mtk_clk_gate_ops_setclr,	\
 	}
 
+#define GATE_INFRA0_FLAGS(_id, _name, _parent, _shift, _flags) {	\
+		.id = _id,				\
+		.name = _name,				\
+		.parent_name = _parent,			\
+		.regs = &infra0_cg_regs,			\
+		.shift = _shift,			\
+		.flags = _flags,            \
+		.ops = &mtk_clk_gate_ops_setclr,	\
+	}
+
 static const struct mtk_gate infra_clks[] __initconst = {
 	/* INFRA0 */
 	GATE_INFRA0(CK_INFRA_PWM_HCK, "infra_pwm_hck", "infra_66m_mck", 1),
@@ -506,7 +516,7 @@ static const struct mtk_gate infra_clks[] __initconst = {
 	GATE_INFRA0(CK_INFRA_AP_DMA_CK, "infra_ap_dma", "infra_66m_mck", 16),
 	GATE_INFRA0(CK_INFRA_SEJ_CK, "infra_sej", "infra_66m_mck", 24),
 	GATE_INFRA0(CK_INFRA_SEJ_13M_CK, "infra_sej_13m", "infra_ck_f26m", 25),
-	GATE_INFRA0(CK_INFRA_TRNG_CK, "infra_trng", "infra_hd_133m", 26),
+	GATE_INFRA0_FLAGS(CK_INFRA_TRNG_CK, "infra_trng", "infra_hd_133m", 26, CLK_IS_CRITICAL),
 	/* INFRA1 */
 	GATE_INFRA1(CK_INFRA_THERM_CK, "infra_therm", "infra_ck_f26m", 0),
 	GATE_INFRA1(CK_INFRA_I2CO_CK, "infra_i2co", "infra_i2cs", 1),

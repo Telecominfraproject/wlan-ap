@@ -55,7 +55,7 @@ static const struct mtk_fixed_factor infra_divs[] __initconst = {
 	FACTOR(CK_INFRA_MUX_SPI1, "infra_mux_spi1", "infra_spi1_sel", 1, 1),
 	FACTOR(CK_INFRA_MUX_SPI2, "infra_mux_spi2", "infra_spi2_sel", 1, 1),
 	FACTOR(CK_INFRA_RTC_32K, "infra_rtc_32k", "cb_rtc_32k", 1, 1),
-	FACTOR(CK_INFRA_FMSDC_CK, "infra_fmsdc", "emmc_400m", 1, 1),
+	FACTOR(CK_INFRA_FMSDC_CK, "infra_fmsdc", "emmc_208m", 1, 1),
 	FACTOR(CK_INFRA_FMSDC_HCK_CK, "infra_fmsdc_hck", "emmc_208m", 1, 1),
 	FACTOR(CK_INFRA_PERI_133M, "infra_peri_133m", "sysaxi", 1, 1),
 	FACTOR(CK_INFRA_133M_PHCK, "infra_133m_phck", "sysaxi", 1, 1),

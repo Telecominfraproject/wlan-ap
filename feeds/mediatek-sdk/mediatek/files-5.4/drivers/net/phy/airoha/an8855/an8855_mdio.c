@@ -1,4 +1,4 @@
-// SPDX-License-Identifian8855_gsw_ider: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2023 Airoha Inc.
  * Author: Min Yao <min.yao@airoha.com>
@@ -18,6 +18,9 @@
 #include <linux/of_net.h>
 #include <linux/of_irq.h>
 #include <linux/phy.h>
+#include <linux/version.h>
+#include <linux/seq_file.h>
+#include <linux/proc_fs.h>
 
 #include "an8855.h"
 #include "an8855_swconfig.h"
@@ -25,11 +28,15 @@
 #include "an8855_nl.h"
 
 /* AN8855 driver version */
-#define ARHT_AN8855_SWCFG_DRIVER_VER	"1.0.1-L5.4"
+#define ARHT_AN8855_SWCFG_DRIVER_VER	"1.0.6"
+#define ARHT_CHIP_NAME                  "an8855"
+#define ARHT_PROC_DIR                   "air_sw"
+#define ARHT_PROC_NODE_DEVICE           "device"
 
 static u32 an8855_gsw_id;
 struct list_head an8855_devs;
 static DEFINE_MUTEX(an8855_devs_lock);
+struct proc_dir_entry *proc_an8855_gsw_dir;
 
 static struct an8855_sw_id *an8855_sw_ids[] = {
 	&an8855_id,
@@ -53,7 +60,6 @@ u32 an8855_reg_read(struct gsw_an8855 *gsw, u32 reg)
 	high = gsw->host_bus->read(gsw->host_bus, gsw->smi_addr, 0x17);
 
 	gsw->host_bus->write(gsw->host_bus, gsw->smi_addr, 0x1f, 0x0);
-	gsw->host_bus->write(gsw->host_bus, gsw->smi_addr, 0x10, 0x0);
 
 	mutex_unlock(&gsw->host_bus->mdio_lock);
 
@@ -78,7 +84,6 @@ void an8855_reg_write(struct gsw_an8855 *gsw, u32 reg, u32 val)
 			     (val & 0xFFFF));
 
 	gsw->host_bus->write(gsw->host_bus, gsw->smi_addr, 0x1f, 0x0);
-	gsw->host_bus->write(gsw->host_bus, gsw->smi_addr, 0x10, 0x0);
 
 	mutex_unlock(&gsw->host_bus->mdio_lock);
 }
@@ -110,13 +115,17 @@ void an8855_mii_write(struct gsw_an8855 *gsw, int phy, int reg, u16 val)
 int an8855_mmd_read(struct gsw_an8855 *gsw, int addr, int devad, u16 reg)
 {
 	int val;
-	u32 regnum = MII_ADDR_C45 | (devad << 16) | reg;
 
 	if (addr < AN8855_NUM_PHYS)
 		addr = (gsw->phy_base + addr) & AN8855_SMI_ADDR_MASK;
 
 	mutex_lock(&gsw->host_bus->mdio_lock);
-	val = gsw->host_bus->read(gsw->host_bus, addr, regnum);
+
+	gsw->host_bus->write(gsw->host_bus, addr, 0x0d, devad);
+	gsw->host_bus->write(gsw->host_bus, addr, 0x0e, reg);
+	gsw->host_bus->write(gsw->host_bus, addr, 0x0d, devad | (0x4000));
+	val = gsw->host_bus->read(gsw->host_bus, addr, 0xe);
+
 	mutex_unlock(&gsw->host_bus->mdio_lock);
 
 	return val;
@@ -125,13 +134,16 @@ int an8855_mmd_read(struct gsw_an8855 *gsw, int addr, int devad, u16 reg)
 void an8855_mmd_write(struct gsw_an8855 *gsw, int addr, int devad, u16 reg,
 		      u16 val)
 {
-	u32 regnum = MII_ADDR_C45 | (devad << 16) | reg;
-
 	if (addr < AN8855_NUM_PHYS)
 		addr = (gsw->phy_base + addr) & AN8855_SMI_ADDR_MASK;
 
 	mutex_lock(&gsw->host_bus->mdio_lock);
-	gsw->host_bus->write(gsw->host_bus, addr, regnum, val);
+
+	gsw->host_bus->write(gsw->host_bus, addr, 0x0d, devad);
+	gsw->host_bus->write(gsw->host_bus, addr, 0x0e, reg);
+	gsw->host_bus->write(gsw->host_bus, addr, 0x0d, devad | (0x4000));
+	gsw->host_bus->write(gsw->host_bus, addr, 0x0e, val);
+
 	mutex_unlock(&gsw->host_bus->mdio_lock);
 }
 
@@ -146,6 +158,10 @@ static void an8855_load_port_cfg(struct gsw_an8855 *gsw)
 	struct device_node *fixed_link_node;
 	struct an8855_port_cfg *port_cfg;
 	u32 port;
+#if (KERNEL_VERSION(5, 5, 0) <= LINUX_VERSION_CODE)
+	int ret;
+
+#endif
 
 	for_each_child_of_node(gsw->dev->of_node, port_np) {
 		if (!of_device_is_compatible(port_np, "airoha,an8855-port"))
@@ -172,9 +188,13 @@ static void an8855_load_port_cfg(struct gsw_an8855 *gsw)
 		}
 
 		port_cfg->np = port_np;
-
+#if (KERNEL_VERSION(5, 5, 0) <= LINUX_VERSION_CODE)
+		ret = of_get_phy_mode(port_np, &port_cfg->phy_mode);
+		if (ret < 0) {
+#else
 		port_cfg->phy_mode = of_get_phy_mode(port_np);
 		if (port_cfg->phy_mode < 0) {
+#endif
 			dev_info(gsw->dev, "incorrect phy-mode %d\n", port);
 			continue;
 		}
@@ -296,6 +316,7 @@ static int an8855_hw_reset(struct gsw_an8855 *gsw)
 	}
 
 	gpio_direction_output(gsw->reset_pin, 0);
+	gpio_set_value(gsw->reset_pin, 0);
 	usleep_range(100000, 150000);
 	gpio_set_value(gsw->reset_pin, 1);
 	usleep_range(100000, 150000);
@@ -312,6 +333,51 @@ static irqreturn_t an8855_irq_handler(int irq, void *dev)
 	schedule_work(&gsw->irq_worker);
 
 	return IRQ_HANDLED;
+}
+
+static int an8855_proc_device_read(struct seq_file *seq, void *v)
+{
+	seq_printf(seq, "%s\n", ARHT_CHIP_NAME);
+
+	return 0;
+}
+
+static int an8855_proc_device_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, an8855_proc_device_read, 0);
+}
+
+#if (KERNEL_VERSION(5, 6, 0) <= LINUX_VERSION_CODE)
+static const struct proc_ops an8855_proc_device_fops = {
+	.proc_open	= an8855_proc_device_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+};
+#else
+static const struct file_operations an8855_proc_device_fops = {
+	.owner	= THIS_MODULE,
+	.open	= an8855_proc_device_open,
+	.read	= seq_read,
+	.llseek	= seq_lseek,
+	.release	= single_release,
+};
+#endif
+
+static int an8855_proc_device_init(struct gsw_an8855 *gsw)
+{
+	if (!proc_an8855_gsw_dir)
+		proc_an8855_gsw_dir = proc_mkdir(ARHT_PROC_DIR, 0);
+
+	proc_create(ARHT_PROC_NODE_DEVICE, 0400, proc_an8855_gsw_dir,
+			&an8855_proc_device_fops);
+
+	return 0;
+}
+
+static void an8855_proc_device_exit(void)
+{
+	remove_proc_entry(ARHT_PROC_NODE_DEVICE, 0);
 }
 
 static int an8855_probe(struct platform_device *pdev)
@@ -355,6 +421,14 @@ static int an8855_probe(struct platform_device *pdev)
 	if (of_property_read_u32(np, "airoha,smi-addr", &gsw->new_smi_addr))
 		gsw->new_smi_addr = AN8855_DFL_SMI_ADDR;
 
+	/* Assign AN8855 interrupt pin */
+	if (of_property_read_u32(np, "airoha,intr", &gsw->intr_pin))
+		gsw->intr_pin = AN8855_DFL_INTR_ID;
+
+	/* AN8855 surge enhancement */
+	if (of_property_read_u32(np, "airoha,extSurge", &gsw->extSurge))
+		gsw->extSurge = AN8855_DFL_EXT_SURGE;
+
 	/* Get LAN/WAN port mapping */
 	map = an8855_find_mapping(np);
 	if (map) {
@@ -394,6 +468,8 @@ static int an8855_probe(struct platform_device *pdev)
 
 	gsw->irq = platform_get_irq(pdev, 0);
 	if (gsw->irq >= 0) {
+		INIT_WORK(&gsw->irq_worker, an8855_irq_worker);
+
 		ret = devm_request_irq(gsw->dev, gsw->irq, an8855_irq_handler,
 				       0, dev_name(gsw->dev), gsw);
 		if (ret) {
@@ -401,8 +477,6 @@ static int an8855_probe(struct platform_device *pdev)
 				gsw->irq);
 			goto fail;
 		}
-
-		INIT_WORK(&gsw->irq_worker, an8855_irq_worker);
 	}
 
 	platform_set_drvdata(pdev, gsw);
@@ -410,6 +484,8 @@ static int an8855_probe(struct platform_device *pdev)
 	an8855_add_gsw(gsw);
 
 	an8855_gsw_nl_init();
+
+	an8855_proc_device_init(gsw);
 
 	an8855_swconfig_init(gsw);
 
@@ -440,6 +516,8 @@ static int an8855_remove(struct platform_device *pdev)
 #ifdef CONFIG_SWCONFIG
 	an8855_swconfig_destroy(gsw);
 #endif
+
+	an8855_proc_device_exit();
 
 	an8855_gsw_nl_exit();
 

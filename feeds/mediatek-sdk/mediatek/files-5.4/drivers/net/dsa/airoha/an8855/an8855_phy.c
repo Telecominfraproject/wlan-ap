@@ -14,32 +14,36 @@
 #include "an8855.h"
 #include "an8855_phy.h"
 
-#define AN8855_NUM_PHYS 5
+#define AN8855_EFUSE_DATA0	0x1000a500
 
-static u32
-an8855_phy_read_dev_reg(struct dsa_switch *ds, u32 port_num,
-				   u32 dev_addr, u32 reg_addr)
+const u8 dsa_r50ohm_table[] = {
+	127, 127, 127, 127, 127, 127, 127, 127, 127, 127,
+	127, 127, 127, 127, 127, 127, 127, 126, 122, 117,
+	112, 109, 104, 101,  97,  94,  90,  88,  84,  80,
+	78,  74,  72,  68,  66,  64,  61,  58,  56,  53,
+	51,  48,  47,  44,  42,  40,  38,  36,  34,  32,
+	31,  28,  27,  24,  24,  22,  20,  18,  16,  16,
+	14,  12,  11,   9
+};
+
+static u8 shift_check(u8 base)
 {
-	struct an8855_priv *priv = ds->priv;
-	u32 phy_val;
-	u32 addr;
+	u8 i;
+	u32 sz = sizeof(dsa_r50ohm_table)/sizeof(u8);
 
-	addr = MII_ADDR_C45 | (dev_addr << 16) | (reg_addr & 0xffff);
-	phy_val = priv->info->phy_read(ds, port_num, addr);
+	for (i = 0; i < sz; ++i)
+		if (dsa_r50ohm_table[i] == base)
+			break;
 
-	return phy_val;
+	if (i < 8 || i >= sz)
+		return 25; /* index of 94 */
+
+	return (i - 8);
 }
 
-static void
-an8855_phy_write_dev_reg(struct dsa_switch *ds, u32 port_num,
-				     u32 dev_addr, u32 reg_addr, u32 write_data)
+static u8 get_shift_val(u8 idx)
 {
-	struct an8855_priv *priv = ds->priv;
-	u32 addr;
-
-	addr = MII_ADDR_C45 | (dev_addr << 16) | (reg_addr & 0xffff);
-
-	priv->info->phy_write(ds, port_num, addr, write_data);
+	return dsa_r50ohm_table[idx];
 }
 
 static void
@@ -64,7 +68,10 @@ static void
 an8855_phy_setting(struct dsa_switch *ds)
 {
 	struct an8855_priv *priv = ds->priv;
-	int i;
+	int i, j;
+	u8 shift_sel = 0, rsel_tx_a = 0, rsel_tx_b = 0;
+	u8 rsel_tx_c = 0, rsel_tx_d = 0;
+	u16 cl45_data = 0;
 	u32 val;
 
 	/* Release power down */
@@ -82,48 +89,89 @@ an8855_phy_setting(struct dsa_switch *ds)
 		val |= ADVERTISE_PAUSE_ASYM;
 		an8855_switch_phy_write(ds, i, MII_ADVERTISE, val);
 	}
+
+	if (priv->extSurge) {
+		for (i = 0; i < AN8855_NUM_PHYS; i++) {
+			/* Read data */
+			for (j = 0; j < AN8855_WORD_SIZE; j++) {
+				val = an8855_read(priv, AN8855_EFUSE_DATA0 +
+					(AN8855_WORD_SIZE * (3 + j + (4 * i))));
+
+				shift_sel = shift_check((val & 0x7f000000) >> 24);
+				switch (j) {
+				case 0:
+					rsel_tx_a = get_shift_val(shift_sel);
+					break;
+				case 1:
+					rsel_tx_b = get_shift_val(shift_sel);
+					break;
+				case 2:
+					rsel_tx_c = get_shift_val(shift_sel);
+					break;
+				case 3:
+					rsel_tx_d = get_shift_val(shift_sel);
+					break;
+				default:
+					continue;
+				}
+			}
+			cl45_data = an8855_phy_cl45_read(priv, i, PHY_DEV1E, 0x174);
+			cl45_data &= ~(0x7f7f);
+			cl45_data |= (rsel_tx_a << 8);
+			cl45_data |= rsel_tx_b;
+			an8855_phy_cl45_write(priv, i, PHY_DEV1E, 0x174, cl45_data);
+			cl45_data = an8855_phy_cl45_read(priv, i, PHY_DEV1E, 0x175);
+			cl45_data &= ~(0x7f7f);
+			cl45_data |= (rsel_tx_c << 8);
+			cl45_data |= rsel_tx_d;
+			an8855_phy_cl45_write(priv, i, PHY_DEV1E, 0x175, cl45_data);
+		}
+	}
 }
 
 static void
 an8855_low_power_setting(struct dsa_switch *ds)
 {
 	int port, addr;
+	struct an8855_priv *priv = ds->priv;
 
 	for (port = 0; port < AN8855_NUM_PHYS; port++) {
-		an8855_phy_write_dev_reg(ds, port, 0x1e, 0x11, 0x0f00);
-		an8855_phy_write_dev_reg(ds, port, 0x1e, 0x3c, 0x0000);
-		an8855_phy_write_dev_reg(ds, port, 0x1e, 0x3d, 0x0000);
-		an8855_phy_write_dev_reg(ds, port, 0x1e, 0x3e, 0x0000);
-		an8855_phy_write_dev_reg(ds, port, 0x1e, 0xc6, 0x53aa);
+		an8855_phy_cl45_write(priv, port, 0x1e, 0x11, 0x0f00);
+		an8855_phy_cl45_write(priv, port, 0x1e, 0x3c, 0x0000);
+		an8855_phy_cl45_write(priv, port, 0x1e, 0x3d, 0x0000);
+		an8855_phy_cl45_write(priv, port, 0x1e, 0x3e, 0x0000);
+		an8855_phy_cl45_write(priv, port, 0x1e, 0xc6, 0x53aa);
 	}
 
-	an8855_phy_write_dev_reg(ds, 0, 0x1f, 0x268, 0x07f1);
-	an8855_phy_write_dev_reg(ds, 0, 0x1f, 0x269, 0x2111);
-	an8855_phy_write_dev_reg(ds, 0, 0x1f, 0x26a, 0x0000);
-	an8855_phy_write_dev_reg(ds, 0, 0x1f, 0x26b, 0x0074);
-	an8855_phy_write_dev_reg(ds, 0, 0x1f, 0x26e, 0x00f6);
-	an8855_phy_write_dev_reg(ds, 0, 0x1f, 0x26f, 0x6666);
-	an8855_phy_write_dev_reg(ds, 0, 0x1f, 0x271, 0x2c02);
-	an8855_phy_write_dev_reg(ds, 0, 0x1f, 0x272, 0x0c22);
-	an8855_phy_write_dev_reg(ds, 0, 0x1f, 0x700, 0x0001);
-	an8855_phy_write_dev_reg(ds, 0, 0x1f, 0x701, 0x0803);
-	an8855_phy_write_dev_reg(ds, 0, 0x1f, 0x702, 0x01b6);
-	an8855_phy_write_dev_reg(ds, 0, 0x1f, 0x703, 0x2111);
+	an8855_phy_cl45_write(priv, 0, 0x1f, 0x268, 0x07f1);
+	an8855_phy_cl45_write(priv, 0, 0x1f, 0x269, 0x2111);
+	an8855_phy_cl45_write(priv, 0, 0x1f, 0x26a, 0x0000);
+	an8855_phy_cl45_write(priv, 0, 0x1f, 0x26b, 0x0074);
+	an8855_phy_cl45_write(priv, 0, 0x1f, 0x26e, 0x00f6);
+	an8855_phy_cl45_write(priv, 0, 0x1f, 0x26f, 0x6666);
+	an8855_phy_cl45_write(priv, 0, 0x1f, 0x271, 0x2c02);
+	an8855_phy_cl45_write(priv, 0, 0x1f, 0x272, 0x0c22);
+	an8855_phy_cl45_write(priv, 0, 0x1f, 0x700, 0x0001);
+	an8855_phy_cl45_write(priv, 0, 0x1f, 0x701, 0x0803);
+	an8855_phy_cl45_write(priv, 0, 0x1f, 0x702, 0x01b6);
+	an8855_phy_cl45_write(priv, 0, 0x1f, 0x703, 0x2111);
 
-	an8855_phy_write_dev_reg(ds, 1, 0x1f, 0x700, 0x0001);
+	an8855_phy_cl45_write(priv, 1, 0x1f, 0x700, 0x0001);
 
 	for (addr = 0x200; addr <= 0x230; addr += 2)
-		an8855_phy_write_dev_reg(ds, 0, 0x1f, addr, 0x2020);
+		an8855_phy_cl45_write(priv, 0, 0x1f, addr, 0x2020);
 
 	for (addr = 0x201; addr <= 0x231; addr += 2)
-		an8855_phy_write_dev_reg(ds, 0, 0x1f, addr, 0x0020);
+		an8855_phy_cl45_write(priv, 0, 0x1f, addr, 0x0020);
 }
 
 static void
 an8855_eee_setting(struct dsa_switch *ds, u32 port)
 {
+	struct an8855_priv *priv = ds->priv;
+
 	/* Disable EEE */
-	an8855_phy_write_dev_reg(ds, port, PHY_DEV07, PHY_DEV07_REG_03C, 0);
+	an8855_phy_cl45_write(priv, port, PHY_DEV07, PHY_DEV07_REG_03C, 0);
 }
 
 int

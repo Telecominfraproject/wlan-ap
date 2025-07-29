@@ -387,6 +387,21 @@ struct cb_rx_desc_info4 {
 	(((struct pdma_rx_desc_info4 *)((long)((skb_end_pointer(skb)) - FOE_INFO_LEN)))->WCID)
 #define FOE_BSS_ID_TAIL(skb)  \
 	(((struct pdma_rx_desc_info4 *)((long)((skb_end_pointer(skb)) - FOE_INFO_LEN)))->BSSID)
+#define FOE_USR_INFO_TAIL(skb)	\
+	(((struct dmad_rx_descinfo4 *)((long)((skb_end_pointer(skb)) - FOE_INFO_LEN)))->USR_INFO)
+#define FOE_TID_TAIL(skb)  \
+	(((struct dmad_rx_descinfo4 *)((long)((skb_end_pointer(skb)) - FOE_INFO_LEN)))->TID)
+#define FOE_IS_FIXEDRATE_TAIL(skb)  \
+	(((struct dmad_rx_descinfo4 *)  \
+	((long)((skb_end_pointer(skb)) - FOE_INFO_LEN)))->IS_FIXEDRATE)
+#define FOE_IS_PRIOR_TAIL(skb)  \
+	(((struct dmad_rx_descinfo4 *)((long)((skb_end_pointer(skb)) - FOE_INFO_LEN)))->IS_PRIOR)
+#define FOE_IS_SP_TAIL(skb)	 \
+	(((struct dmad_rx_descinfo4 *)((long)((skb_end_pointer(skb)) - FOE_INFO_LEN)))->IS_SP)
+#define FOE_HF_TAIL(skb)  \
+	(((struct dmad_rx_descinfo4 *)((long)((skb_end_pointer(skb)) - FOE_INFO_LEN)))->HF)
+#define FOE_AMSDU_TAIL(skb)  \
+	(((struct dmad_rx_descinfo4 *)((long)((skb_end_pointer(skb)) - FOE_INFO_LEN)))->AMSDU)
 
 #define FOE_PPE_TAIL(skb)  \
 	(((struct pdma_rx_desc_info4 *)((long)((skb_end_pointer(skb)) - FOE_INFO_LEN)))->ppe)

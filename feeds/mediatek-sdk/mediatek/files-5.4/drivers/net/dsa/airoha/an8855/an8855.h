@@ -10,10 +10,13 @@
 
 #define AN8855_NUM_PORTS				6
 #define AN8855_CPU_PORT					5
+#define AN8855_WORD_SIZE				4
 #define AN8855_NUM_FDB_RECORDS			2048
 #define AN8855_ALL_MEMBERS				0x3f
 #define AN8855_RESERVED_VLAN			2
 #define AN8855_GPHY_SMI_ADDR_DEFAULT	1
+#define AN8855_DFL_INTR_ID				0xd
+#define AN8855_DFL_EXT_SURGE			0x0
 
 enum an8855_id {
 	ID_AN8855 = 0,
@@ -286,6 +289,8 @@ enum an8855_vlan_port_attr {
 #define AN8855_CKGCR			(0x10213e1c)
 #define LPI_TXIDLE_THD			14
 #define LPI_TXIDLE_THD_MASK		BITS(14, 31)
+#define CKG_LNKDN_GLB_STOP	0x01
+#define CKG_LNKDN_PORT_STOP	0x02
 
 /* Register for MIB */
 #define AN8855_PORT_MIB_COUNTER(x)	(0x10214000 + (x) * 0x200)
@@ -303,18 +308,14 @@ enum an8855_vlan_port_attr {
 					 CCR_RX_OCT_CNT_BAD | \
 					 CCR_TX_OCT_CNT_GOOD | \
 					 CCR_TX_OCT_CNT_BAD | \
-					 CCR_RX_OCT_CNT_GOOD_2 | \
 					 CCR_RX_OCT_CNT_BAD_2 | \
-					 CCR_TX_OCT_CNT_GOOD_2 | \
 					 CCR_TX_OCT_CNT_BAD_2)
 #define	 CCR_MIB_ACTIVATE		(CCR_MIB_ENABLE | \
 					 CCR_RX_OCT_CNT_GOOD | \
 					 CCR_RX_OCT_CNT_BAD | \
 					 CCR_TX_OCT_CNT_GOOD | \
 					 CCR_TX_OCT_CNT_BAD | \
-					 CCR_RX_OCT_CNT_GOOD_2 | \
 					 CCR_RX_OCT_CNT_BAD_2 | \
-					 CCR_TX_OCT_CNT_GOOD_2 | \
 					 CCR_TX_OCT_CNT_BAD_2)
 
 /* AN8855 SGMII register group */
@@ -331,6 +332,22 @@ enum an8855_vlan_port_attr {
 #define AN8855_RST_CTRL			0x100050c0
 #define	 SYS_CTRL_SYS_RST		BIT(31)
 
+#define INT_MASK			0x100050F0
+#define INT_SYS_BIT			BIT(15)
+
+#define RG_CLK_CPU_ICG		0x10005034
+#define MCU_ENABLE			BIT(3)
+
+#define RG_TIMER_CTL		0x1000a100
+#define WDOG_ENABLE			BIT(25)
+
+#define CKGCR				0x10213E1C
+#define CKG_LNKDN_GLB_STOP	0x01
+#define CKG_LNKDN_PORT_STOP	0x02
+
+#define PKG_SEL				0x10000094
+#define PAG_SEL_AN8855H		0x2
+
 /* Register for hw trap status */
 #define AN8855_HWTRAP			0x1000009c
 
@@ -339,6 +356,15 @@ enum an8855_vlan_port_attr {
 
 #define SCU_BASE				0x10000000
 #define RG_RGMII_TXCK_C			(SCU_BASE + 0x1d0)
+#define RG_GPIO_LED_MODE		(SCU_BASE + 0x0054)
+#define RG_GPIO_LED_SEL(i)	(SCU_BASE + (0x0058 + ((i) * 4)))
+#define RG_INTB_MODE			(SCU_BASE + 0x0080)
+#define RG_GDMP_RAM				(SCU_BASE + 0x10000)
+
+#define RG_GPIO_L_INV			(SCU_BASE + 0x0010)
+#define RG_GPIO_CTRL			(SCU_BASE + 0xa300)
+#define RG_GPIO_DATA			(SCU_BASE + 0xa304)
+#define RG_GPIO_OE			(SCU_BASE + 0xa314)
 
 #define HSGMII_AN_CSR_BASE		0x10220000
 #define SGMII_REG_AN0			(HSGMII_AN_CSR_BASE + 0x000)
@@ -382,6 +408,8 @@ enum an8855_vlan_port_attr {
 #define SS_LCPLL_TDC_PCW_1			(QP_PMA_TOP_BASE + 0x248)
 #define INTF_CTRL_8			(QP_PMA_TOP_BASE + 0x320)
 #define INTF_CTRL_9			(QP_PMA_TOP_BASE + 0x324)
+#define INTF_CTRL_10		(QP_PMA_TOP_BASE + 0x328)
+#define INTF_CTRL_11		(QP_PMA_TOP_BASE + 0x32c)
 #define PLL_CTRL_0			(QP_PMA_TOP_BASE + 0x400)
 #define PLL_CTRL_2			(QP_PMA_TOP_BASE + 0x408)
 #define PLL_CTRL_3			(QP_PMA_TOP_BASE + 0x40c)
@@ -399,6 +427,7 @@ enum an8855_vlan_port_attr {
 #define QP_ANA_CSR_BASE				0x1022f000
 #define RG_QP_RX_DAC_EN				(QP_ANA_CSR_BASE + 0x00)
 #define RG_QP_RXAFE_RESERVE			(QP_ANA_CSR_BASE + 0x04)
+#define RG_QP_CDR_LPF_BOT_LIM		(QP_ANA_CSR_BASE + 0x08)
 #define RG_QP_CDR_LPF_MJV_LIM		(QP_ANA_CSR_BASE + 0x0c)
 #define RG_QP_CDR_LPF_SETVALUE		(QP_ANA_CSR_BASE + 0x14)
 #define RG_QP_CDR_PR_CKREF_DIV1		(QP_ANA_CSR_BASE + 0x18)
@@ -435,6 +464,74 @@ struct an8855_fdb {
 	u8 type;
 	u8 fid;
 	u8 ivl;
+};
+
+/* Definition of LED */
+#define LED_ON_EVENT	(LED_ON_EVT_LINK_1000M | \
+			LED_ON_EVT_LINK_100M | LED_ON_EVT_LINK_10M |\
+			LED_ON_EVT_LINK_HD | LED_ON_EVT_LINK_FD)
+
+#define LED_BLK_EVENT	(LED_BLK_EVT_1000M_TX_ACT | \
+			LED_BLK_EVT_1000M_RX_ACT | \
+			LED_BLK_EVT_100M_TX_ACT | \
+			LED_BLK_EVT_100M_RX_ACT | \
+			LED_BLK_EVT_10M_TX_ACT | \
+			LED_BLK_EVT_10M_RX_ACT)
+
+#define LED_FREQ	AIR_LED_BLK_DUR_64M
+
+enum phy_led_idx {
+	P0_LED0,
+	P0_LED1,
+	P0_LED2,
+	P0_LED3,
+	P1_LED0,
+	P1_LED1,
+	P1_LED2,
+	P1_LED3,
+	P2_LED0,
+	P2_LED1,
+	P2_LED2,
+	P2_LED3,
+	P3_LED0,
+	P3_LED1,
+	P3_LED2,
+	P3_LED3,
+	P4_LED0,
+	P4_LED1,
+	P4_LED2,
+	P4_LED3,
+	PHY_LED_MAX
+};
+
+/* TBD */
+enum an8855_led_blk_dur {
+	AIR_LED_BLK_DUR_32M,
+	AIR_LED_BLK_DUR_64M,
+	AIR_LED_BLK_DUR_128M,
+	AIR_LED_BLK_DUR_256M,
+	AIR_LED_BLK_DUR_512M,
+	AIR_LED_BLK_DUR_1024M,
+	AIR_LED_BLK_DUR_LAST
+};
+
+enum an8855_led_polarity {
+	LED_LOW,
+	LED_HIGH,
+};
+enum an8855_led_mode {
+	AN8855_LED_MODE_DISABLE,
+	AN8855_LED_MODE_USER_DEFINE,
+	AN8855_LED_MODE_LAST
+};
+
+struct an8855_led_cfg {
+	u16 en;
+	u8  phy_led_idx;
+	u16 pol;
+	u16 on_cfg;
+	u16 blk_cfg;
+	u8 led_freq;
 };
 
 /* struct an8855_port -	This is the main data structure for holding the state
@@ -522,11 +619,13 @@ struct an8855_priv {
 	unsigned int phy_base;
 	int phy_base_new;
 	unsigned int id;
+	u32 intr_pin;
 	phy_interface_t p5_interface;
 	unsigned int p5_intf_sel;
 	u8 mirror_rx;
 	u8 mirror_tx;
 	u8 eee_enable;
+	u32 extSurge;
 
 	struct an8855_port ports[AN8855_NUM_PORTS];
 	/* protect among processes for registers access */

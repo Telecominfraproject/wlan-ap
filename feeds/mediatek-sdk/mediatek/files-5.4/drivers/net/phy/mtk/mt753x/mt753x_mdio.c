@@ -765,6 +765,8 @@ static int mt753x_probe(struct platform_device *pdev)
 
 	gsw->irq = platform_get_irq(pdev, 0);
 	if (gsw->irq >= 0) {
+		INIT_WORK(&gsw->irq_worker, mt753x_irq_worker);
+
 		ret = devm_request_irq(gsw->dev, gsw->irq, mt753x_irq_handler,
 				       0, dev_name(gsw->dev), gsw);
 		if (ret) {
@@ -772,8 +774,6 @@ static int mt753x_probe(struct platform_device *pdev)
 				gsw->irq);
 			goto fail;
 		}
-
-		INIT_WORK(&gsw->irq_worker, mt753x_irq_worker);
 	}
 
 	platform_set_drvdata(pdev, gsw);

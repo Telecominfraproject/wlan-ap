@@ -11,19 +11,19 @@ struct an8855_mapping an8855_def_mapping[] = {
 		.name = "llllw",
 		.pvids = { 1, 1, 1, 1, 2, 1 },
 		.members = { 0, 0x2f, 0x30 },
-		.etags = { 0, 0, 0x20 },
+		.etags = { 0, 0, 0 },
 		.vids = { 0, 1, 2 },
 	}, {
 		.name = "wllll",
 		.pvids = { 2, 1, 1, 1, 1, 1 },
 		.members = { 0, 0x3e, 0x21 },
-		.etags = { 0, 0, 0x20 },
+		.etags = { 0, 0, 0 },
 		.vids = { 0, 1, 2 },
 	}, {
 		.name = "lwlll",
 		.pvids = { 1, 2, 1, 1, 1, 1 },
 		.members = { 0, 0x3d, 0x22 },
-		.etags = { 0, 0, 0x20 },
+		.etags = { 0, 0, 0 },
 		.vids = { 0, 1, 2 },
 	}, {
 		.name = "lllll",
@@ -124,14 +124,14 @@ void an8855_apply_vlan_config(struct gsw_an8855 *gsw)
 
 	/* set all untag-only ports as transparent and the rest as user port */
 	for (i = 0; i < AN8855_NUM_PORTS; i++) {
-		u32 pvc_mode = 0x8100 << STAG_VPID_S;
+		u32 pvc_mode = 0x9100 << STAG_VPID_S;
 
 		if (untag_ports & BIT(i) && !(tag_ports & BIT(i)))
-			pvc_mode = (0x8100 << STAG_VPID_S) |
+			pvc_mode = (0x9100 << STAG_VPID_S) |
 				(VA_TRANSPARENT_PORT << VLAN_ATTR_S);
 
 		if (gsw->port5_cfg.stag_on && i == 5)
-			pvc_mode = (u32)((0x8100 << STAG_VPID_S) | PVC_PORT_STAG
+			pvc_mode = (u32)((0x9100 << STAG_VPID_S) | PVC_PORT_STAG
 						| PVC_STAG_REPLACE);
 
 		an8855_reg_write(gsw, PVC(i), pvc_mode);
@@ -159,7 +159,8 @@ void an8855_apply_vlan_config(struct gsw_an8855 *gsw)
 		u16 pvid = 0;
 		u32 val;
 
-		if (vlan < AN8855_NUM_VLANS && gsw->vlan_entries[vlan].member)
+		if ((vlan >= 0) && (vlan < AN8855_NUM_VLANS)
+			&& (gsw->vlan_entries[vlan].member))
 			pvid = gsw->vlan_entries[vlan].vid;
 
 		val = an8855_reg_read(gsw, PVID(i));

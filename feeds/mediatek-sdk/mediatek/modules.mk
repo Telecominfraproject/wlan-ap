@@ -67,6 +67,35 @@ endef
 
 $(eval $(call KernelPackage,crypto-eip197))
 
+define KernelPackage/crypto-eip196
+  TITLE:= EIP-196 Crypto Engine module
+  DEPENDS:=@TARGET_mediatek_mt7987 +eip197-mini-firmware
+  DEFAULT:=y
+  KCONFIG:= \
+	CONFIG_CRYPTO_HW=y \
+	CONFIG_CRYPTO_AUTHENC=y \
+	CONFIG_CRYPTO_AES=y \
+	CONFIG_CRYPTO_AEAD=y \
+	CONFIG_CRYPTO_DES=y \
+	CONFIG_CRYPTO_MD5=y \
+	CONFIG_CRYPTO_SHA1=y \
+	CONFIG_CRYPTO_SHA256=y \
+	CONFIG_CRYPTO_SHA512=y \
+	CONFIG_CRYPTO_SHA3=y \
+	CONFIG_CRYPTO_HMAC=y \
+	CONFIG_CRYPTO_CHACHA20POLY1305=y \
+	CONFIG_CRYPTO_DEV_SAFEXCEL
+  FILES:=$(LINUX_DIR)/drivers/crypto/inside-secure/crypto_safexcel.ko
+  AUTOLOAD:=$(call AutoLoad,90,crypto-safexcel)
+  $(call AddDepends/crypto)
+endef
+
+define KernelPackage/crypto-eip196/description
+  EIP-196 Cryptographic Engine driver.
+endef
+
+$(eval $(call KernelPackage,crypto-eip196))
+
 define KernelPackage/mediatek_hnat
   SUBMENU:=Network Devices
   TITLE:=Mediatek HNAT module
