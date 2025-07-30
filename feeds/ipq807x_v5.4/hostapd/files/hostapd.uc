@@ -900,7 +900,10 @@ return {
 				hostapd.printf(`Sending AFC request: ${data}`);
 				writefile("/tmp/afc-request.json", data);
 
-				system(`curl -s -X POST ${afc_server.url} -H \'accept: \*\/\*\' -H \'Authorization: Bearer ${afc_server.access_token}\' -H \'Content-Type: application/json\' -d \'${data}\' --output /tmp/afc-response.json`);
+				if (afc_server.access_token)
+					system(`curl -s -X POST ${afc_server.url} -H \'accept: \*\/\*\' -H \'Authorization: Bearer ${afc_server.access_token}\' -H \'Content-Type: application/json\' -d \'${data}\' --output /tmp/afc-response.json`);
+				else if (afc_server.cert)
+					system(`curl -s -X POST ${afc_server.url} -H \'accept: \*\/\*\' --cert \'${afc_server.cert}\' -H \'Content-Type: application/json\' -d \'${data}\' --output /tmp/afc-response.json`);
 
 				let afc_response = (readfile("/tmp/afc-response.json"));
 				if (afc_response)
