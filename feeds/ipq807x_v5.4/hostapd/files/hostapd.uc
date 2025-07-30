@@ -1,7 +1,8 @@
 let libubus = require("ubus");
-import { open, readfile } from "fs";
+import { open, readfile, writefile } from "fs";
 import { wdev_create, wdev_remove, is_equal, vlist_new, phy_is_fullmac, phy_open } from "common";
 
+let uci = require('uci').cursor();
 let ubus = libubus.connect(null, 60);
 
 hostapd.data.config = {};
@@ -893,10 +894,21 @@ return {
 		hostapd.ubus.disconnect();
 	},
 	afc_request: function(iface, data) {
-		let ret = ubus.call("afc", "request", { data });
-		if (type(ret) != "object")
-			return;
-		return ret.data;
+		let wireless_config = uci.get_all('wireless');
+		for (let l, afc_server in wireless_config) {
+			if (afc_server['.type'] == 'afc-server' && afc_server.url && data) {
+				hostapd.printf(`Sending AFC request: ${data}`);
+				writefile("/tmp/afc-request.json", data);
+
+				system(`curl -s -X POST ${afc_server.url} -H \'accept: \*\/\*\' -H \'Authorization: Bearer ${afc_server.access_token}\' -H \'Content-Type: application/json\' -d \'${data}\' --output /tmp/afc-response.json`);
+
+				let afc_response = (readfile("/tmp/afc-response.json"));
+				if (afc_response)
+					return afc_response;
+				else
+					return;
+			}
+		}
 	},
 	bss_add: function(name, obj) {
 		bss_event("add", name);
