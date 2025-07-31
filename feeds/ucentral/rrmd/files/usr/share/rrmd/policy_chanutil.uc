@@ -202,7 +202,7 @@ function get_center_channel(channel, band, bw) {
                 "225": 227
             };
         } else if (bw == 80) {
-            bw = {
+            center_channel_map = {
                 "1": 7, "5": 7, "9": 7, "13": 7,
                 "17": 23, "21": 23, "25": 23, "29": 23,
                 "33": 39, "37": 39, "41": 39, "45": 39,
@@ -236,6 +236,8 @@ function get_center_channel(channel, band, bw) {
             };
         } else if (bw == 320) {
             center_channel_map = {
+                "1": 31, "5": 31, "9": 31, "13": 31,
+                "17": 31, "21": 31, "25": 31, "29": 31,
                 "33": 63, "37": 63, "41": 63, "45": 63,
                 "49": 63, "53": 63, "57": 63, "61": 63,
                 "65": 63, "69": 63, "73": 63, "77": 63,
@@ -558,7 +560,7 @@ function random_channel_selection(iface, band, htmode, chan_list_valid) {
     ulog_info(`[%s] Selected channel list from config (default channel list shall be used in case channels haven't been selected) = %s \n`, iface, (chan_list_valid || '[]'));
 
     if (band == '2g' && bw >= 40) {
-        ulog_info(`[%s] It is highly recommended to NOT use %dMHz bandwidth for 2.4G radio \n`, iface, bw);
+        ulog_info(`[%s] It is highly recommended to NOT use %dMHz bandwidth for 2.4G radio (RRM will not work properly) \n`, iface, bw);
     } else if (band == '5g' && bw > 160) {
         ulog_info(`[%s] %dMHz bandwidth not supported for 5G radio. Please use a bandwidth of 160MHz or lower\n`, iface, bw);
     }
