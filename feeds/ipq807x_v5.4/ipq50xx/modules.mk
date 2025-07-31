@@ -242,3 +242,17 @@ define KernelPackage/bootconfig/description
 endef
 
 $(eval $(call KernelPackage,bootconfig))
+
+define KernelPackage/mdio-qca
+  SUBMENU:=$(NETWORK_DEVICES_MENU)
+  TITLE:=Model for MDIO to QCA PHY connection
+  KCONFIG:=CONFIG_MDIO_QCA
+  FILES:=$(LINUX_DIR)/drivers/net/phy/mdio-qca.ko
+  AUTOLOAD:=$(call AutoLoad,30,mdio-qca)
+endef
+
+define KernelPackage/mdio-qca/description
+ This driver supports the MDIO interface found in Qualcomm Atheros ipq Soc chip.
+endef
+
+$(eval $(call KernelPackage,mdio-qca))
