@@ -107,29 +107,42 @@ platform_do_upgrade() {
 
 	board=$(board_name)
 	case $board in
-	glinet,b3000|\
 	edgecore,oap101|\
 	edgecore,oap101-6e|\
 	edgecore,oap101e|\
 	edgecore,oap101e-6e|\
 	edgecore,eap104)
+		if [ "$(find_mtd_chardev rootfs)" ]; then
+			CI_UBIPART="rootfs"
+		else
+			if grep -q rootfs1 /proc/cmdline; then
+				CI_UBIPART="rootfs2"
+				CI_FWSETENV="active 2"
+			else
+				CI_UBIPART="rootfs1"
+				CI_FWSETENV="active 1"
+			fi
+		fi
+		nand_upgrade_tar "$1"
+		;;
+	glinet,b3000)
 		CI_UBIPART="rootfs1"
 		[ "$(find_mtd_chardev rootfs)" ] && CI_UBIPART="rootfs"
 		nand_upgrade_tar "$1"
 		;;
-        hfcl,ion4x_w|\
+	hfcl,ion4x_w|\
 	hfcl,ion4xi_w)
-                wp_part=$(fw_printenv primary | cut  -d = -f2)
-                echo "Current Primary is $wp_part"
-                if [[ $wp_part == 1 ]]; then
-                        CI_UBIPART="rootfs"
-                        CI_FWSETENV="primary 0"
-                else
-                        CI_UBIPART="rootfs_1"
-                        CI_FWSETENV="primary 1"
-                fi
-                nand_upgrade_tar "$1"
-                ;;
+		wp_part=$(fw_printenv primary | cut  -d = -f2)
+		echo "Current Primary is $wp_part"
+		if [[ $wp_part == 1 ]]; then
+				CI_UBIPART="rootfs"
+				CI_FWSETENV="primary 0"
+		else
+				CI_UBIPART="rootfs_1"
+				CI_FWSETENV="primary 1"
+		fi
+		nand_upgrade_tar "$1"
+		;;
 	cig,wf186w|\
 	cig,wf186h|\
 	emplus,wap385c|\
