@@ -122,8 +122,12 @@ endef
 define Package/ath12k-wifi-sonicfi-rap7110c-341x/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
-	$(INSTALL_DATA) ./board-2.bin.rap7110c_341x.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin
-	$(INSTALL_DATA) ./board-2.bin.rap7110c_341x.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
+	$(INSTALL_DATA) ./board-2.bin.rap7110c_341x-us.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin.US
+	$(INSTALL_DATA) ./board-2.bin.rap7110c_341x-us.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin.US
+	$(INSTALL_DATA) ./board-2.bin.rap7110c_341x-au.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin.AU
+	$(INSTALL_DATA) ./board-2.bin.rap7110c_341x-au.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin.AU
+	$(INSTALL_DATA) ./board-2.bin.rap7110c_341x-sg.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin.SG
+	$(INSTALL_DATA) ./board-2.bin.rap7110c_341x-sg.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin.SG
 endef
 
 define Package/ath12k-wifi-sonicfi-rap750e-h/install
@@ -147,8 +151,12 @@ endef
 define Package/ath12k-wifi-sonicfi-rap750w-311a/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN6432/hw1.0/
-	$(INSTALL_DATA) ./board-2.bin.rap750w_311a.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
-	$(INSTALL_DATA) ./board-2.bin.rap750w_311a.QCN6432 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/board-2.bin
+	$(INSTALL_DATA) ./board-2.bin.rap750w_311a-us.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin.US
+	$(INSTALL_DATA) ./board-2.bin.rap750w_311a-us.QCN6432 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/board-2.bin.US
+	$(INSTALL_DATA) ./board-2.bin.rap750w_311a-au.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin.AU
+	$(INSTALL_DATA) ./board-2.bin.rap750w_311a-au.QCN6432 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/board-2.bin.AU
+	$(INSTALL_DATA) ./board-2.bin.rap750w_311a-sg.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin.SG
+	$(INSTALL_DATA) ./board-2.bin.rap750w_311a-sg.QCN6432 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/board-2.bin.SG
 #	$(INSTALL_DATA) ./ipq5332_qcn6432.regdb $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/regdb.bin
 	$(INSTALL_DATA) ./ipq5332_qcn6432.regdb $(1)/lib/firmware/ath12k/QCN6432/hw1.0/regdb.bin
 endef
