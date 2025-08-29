@@ -24,7 +24,9 @@ endef
 
 define KernelPackage/cig-wifi-mode-sw/install
 	$(INSTALL_DIR) $(1)/usr/sbin/
+	$(INSTALL_DIR) $(1)/etc/init.d/
 	$(INSTALL_BIN) ./files/cig_wifi_mode_sw $(1)/usr/sbin/cig_wms
+	$(INSTALL_BIN) ./files/cig_wifi_mode_boot $(1)/etc/init.d/cig_wmb
 endef
 
 $(eval $(call KernelPackage,cig-wifi-mode-sw))
