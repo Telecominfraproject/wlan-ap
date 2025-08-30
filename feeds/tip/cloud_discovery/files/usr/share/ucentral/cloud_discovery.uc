@@ -5,7 +5,7 @@ import * as fs from 'fs';
 
 let cmd = ARGV[0];
 let ifname = getenv("interface");
-let opt224 = getenv("opt138");
+let opt138 = getenv("opt138");
 let opt224 = getenv("opt224");
 
 if (cmd != 'bound' && cmd != 'renew')
