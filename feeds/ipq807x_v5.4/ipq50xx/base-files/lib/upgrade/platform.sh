@@ -82,6 +82,7 @@ platform_check_image() {
 	hfcl,ion4x_w|\
 	hfcl,ion4xi_w|\
 	indio,um-325ax-v2|\
+	indio,um-525axp|\
 	optimcloud,d60|\
 	optimcloud,d60-5g|\
 	optimcloud,d50|\
@@ -109,6 +110,7 @@ platform_do_upgrade() {
 	board=$(board_name)
 	case $board in
 	indio,um-325ax-v2|\
+	indio,um-525axp|\
 	edgecore,oap101|\
 	edgecore,oap101-6e|\
 	edgecore,oap101e|\
