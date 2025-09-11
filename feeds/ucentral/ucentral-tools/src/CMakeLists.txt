@@ -1,36 +1,108 @@
-cmake_minimum_required(VERSION 2.6)
+cmake_minimum_required(VERSION 3.10)
 
-PROJECT(openwifi-tools C)
-INCLUDE(GNUInstallDirs)
-ADD_DEFINITIONS(-Os -ggdb -Wall -Werror --std=gnu99 -Wmissing-declarations)
+project(openwifi-tools C)
+include(GNUInstallDirs)
 
-SET(CMAKE_SHARED_LIBRARY_LINK_C_FLAGS "")
+# Set C standard
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
-ADD_EXECUTABLE(firstcontact firstcontact.c)
-TARGET_LINK_LIBRARIES(firstcontact curl crypto ssl ubox)
-INSTALL(TARGETS firstcontact
-	RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR}
+# Comprehensive warning flags (cross-compilation friendly)
+set(WARNING_FLAGS
+    -Wall
+    -Wextra
+    -Werror
+    -Wformat=2
+    -Wformat-security
+    -Wnull-dereference
+    -Warray-bounds=2
+    -Wimplicit-fallthrough=3
+    -Wshift-overflow=2
+    -Wcast-qual
+    -Wstringop-overflow=4
+    -Wlogical-op
+    -Wduplicated-cond
+    -Wduplicated-branches
+    -Wformat-overflow=2
+    -Wformat-truncation=2
+    -Wmissing-declarations
+    -Wredundant-decls
+    -Wshadow
+    -Wstrict-overflow=4
+    -Wundef
+    -Wstrict-prototypes
+    -Wswitch-default
+    -Wbad-function-cast
+    -Wwrite-strings
+    -Wjump-misses-init
+    -Wold-style-definition
+    -Wmissing-prototypes
 )
 
-ADD_EXECUTABLE(dhcpdiscover dhcpdiscover.c)
-INSTALL(TARGETS dhcpdiscover
-	RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR}
+# Security hardening flags (cross-compilation friendly)
+set(SECURITY_FLAGS
+    -fstack-protector-strong
 )
 
-ADD_EXECUTABLE(dnsprobe dnsprobe.c)
-TARGET_LINK_LIBRARIES(dnsprobe ubox resolv)
-INSTALL(TARGETS dnsprobe
-	RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR}
+# Linker security flags (cross-compilation friendly)
+set(SECURITY_LINKER_FLAGS
+    -Wl,-z,relro
+    -Wl,-z,now
 )
 
-ADD_EXECUTABLE(radiusprobe radiusprobe.c)
-TARGET_LINK_LIBRARIES(radiusprobe radcli)
-INSTALL(TARGETS radiusprobe
-	RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR}
+# Debug flags
+set(DEBUG_FLAGS
+    -g3
+    -ggdb
+    -fno-omit-frame-pointer
+    -fno-optimize-sibling-calls
 )
 
-ADD_EXECUTABLE(ip-collide ip-collide.c)
-TARGET_LINK_LIBRARIES(ip-collide ubox)
-INSTALL(TARGETS ip-collide
-	RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR}
+# Release optimization flags
+set(RELEASE_FLAGS
+    -O2
+    -flto
+    -ffunction-sections
+    -fdata-sections
 )
+
+set(RELEASE_LINKER_FLAGS
+    -Wl,--gc-sections
+    -flto
+)
+
+# Apply flags based on build type
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(${WARNING_FLAGS} ${SECURITY_FLAGS} ${DEBUG_FLAGS})
+    add_link_options(${SECURITY_LINKER_FLAGS})
+else()
+    add_compile_options(${WARNING_FLAGS} ${SECURITY_FLAGS} ${RELEASE_FLAGS})
+    add_link_options(${SECURITY_LINKER_FLAGS} ${RELEASE_LINKER_FLAGS})
+endif()
+
+set(CMAKE_SHARED_LIBRARY_LINK_C_FLAGS "")
+
+# Define all targets
+set(TARGETS firstcontact dhcpdiscover dnsprobe radiusprobe)
+
+# firstcontact executable
+add_executable(firstcontact firstcontact.c)
+target_link_libraries(firstcontact PRIVATE curl crypto ssl ubox)
+
+# dhcpdiscover executable  
+add_executable(dhcpdiscover dhcpdiscover.c)
+
+# dnsprobe executable
+add_executable(dnsprobe dnsprobe.c)
+target_link_libraries(dnsprobe PRIVATE ubox resolv)
+
+# radiusprobe executable
+add_executable(radiusprobe radiusprobe.c)
+target_link_libraries(radiusprobe PRIVATE radcli)
+
+# Install all targets
+install(TARGETS ${TARGETS}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR}
+    COMPONENT Runtime
+)
+

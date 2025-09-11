@@ -16,54 +16,54 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-//config:config NSLOOKUP_OPENWRT
-//config:	bool "nslookup_openwrt"
-//config:	depends on !NSLOOKUP
-//config:	default y
-//config:	help
-//config:	  nslookup is a tool to query Internet name servers (LEDE flavor).
-//config:
-//config:config FEATURE_NSLOOKUP_OPENWRT_LONG_OPTIONS
-//config:       bool "Enable long options"
-//config:       default y
-//config:       depends on NSLOOKUP_OPENWRT && LONG_OPTS
-//config:       help
-//config:         Support long options for the nslookup applet.
+// config:config NSLOOKUP_OPENWRT
+// config:	bool "nslookup_openwrt"
+// config:	depends on !NSLOOKUP
+// config:	default y
+// config:	help
+// config:	  nslookup is a tool to query Internet name servers (LEDE flavor).
+// config:
+// config:config FEATURE_NSLOOKUP_OPENWRT_LONG_OPTIONS
+// config:       bool "Enable long options"
+// config:       default y
+// config:       depends on NSLOOKUP_OPENWRT && LONG_OPTS
+// config:       help
+// config:         Support long options for the nslookup applet.
 
-//applet:IF_NSLOOKUP_OPENWRT(APPLET(nslookup, BB_DIR_USR_BIN, BB_SUID_DROP))
+// applet:IF_NSLOOKUP_OPENWRT(APPLET(nslookup, BB_DIR_USR_BIN, BB_SUID_DROP))
 
-//kbuild:lib-$(CONFIG_NSLOOKUP_OPENWRT) += nslookup_lede.o
+// kbuild:lib-$(CONFIG_NSLOOKUP_OPENWRT) += nslookup_lede.o
 
-//usage:#define nslookup_lede_trivial_usage
-//usage:       "[HOST] [SERVER]"
-//usage:#define nslookup_lede_full_usage "\n\n"
-//usage:       "Query the nameserver for the IP address of the given HOST\n"
-//usage:       "optionally using a specified DNS server"
-//usage:
-//usage:#define nslookup_lede_example_usage
-//usage:       "$ nslookup localhost\n"
-//usage:       "Server:     default\n"
-//usage:       "Address:    default\n"
-//usage:       "\n"
-//usage:       "Name:       debian\n"
-//usage:       "Address:    127.0.0.1\n"
+// usage:#define nslookup_lede_trivial_usage
+// usage:       "[HOST] [SERVER]"
+// usage:#define nslookup_lede_full_usage "\n\n"
+// usage:       "Query the nameserver for the IP address of the given HOST\n"
+// usage:       "optionally using a specified DNS server"
+// usage:
+// usage:#define nslookup_lede_example_usage
+// usage:       "$ nslookup localhost\n"
+// usage:       "Server:     default\n"
+// usage:       "Address:    default\n"
+// usage:       "\n"
+// usage:       "Name:       debian\n"
+// usage:       "Address:    127.0.0.1\n"
 
-#include <stdio.h>
-#include <resolv.h>
-#include <string.h>
-#include <errno.h>
-#include <time.h>
-#include <poll.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
+#include <errno.h>
 #include <net/if.h>
 #include <netdb.h>
+#include <poll.h>
+#include <resolv.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <libubox/ulog.h>
 
-#define ENABLE_FEATURE_IPV6	1
+#define ENABLE_FEATURE_IPV6 1
 
 typedef struct len_and_sockaddr {
 	socklen_t len;
@@ -91,171 +91,169 @@ struct query {
 	int rcode, n_ns;
 };
 
-static const char *rcodes[] = {
-	"NOERROR",
-	"FORMERR",
-	"SERVFAIL",
-	"NXDOMAIN",
-	"NOTIMP",
-	"REFUSED",
-	"YXDOMAIN",
-	"YXRRSET",
-	"NXRRSET",
-	"NOTAUTH",
-	"NOTZONE",
-	"RESERVED11",
-	"RESERVED12",
-	"RESERVED13",
-	"RESERVED14",
-	"RESERVED15",
-	"BADVERS"
-};
+static const char *rcodes[] = { "NOERROR",    "FORMERR",    "SERVFAIL",   "NXDOMAIN",
+	                        "NOTIMP",     "REFUSED",    "YXDOMAIN",   "YXRRSET",
+	                        "NXRRSET",    "NOTAUTH",    "NOTZONE",    "RESERVED11",
+	                        "RESERVED12", "RESERVED13", "RESERVED14", "RESERVED15",
+	                        "BADVERS" };
 
 static unsigned int default_port = 53;
 static unsigned int default_retry = 1;
 static unsigned int default_timeout = 2;
 
 
-static int parse_reply(const unsigned char *msg, size_t len, int *bb_style_counter)
+static int parse_reply(const unsigned char *msg, size_t len)
 {
 	ns_msg handle;
 	ns_rr rr;
 	int i, n, rdlen;
-	const char *format = NULL;
 	char astr[INET6_ADDRSTRLEN], dname[MAXDNAME];
 	const unsigned char *cp;
 
 	if (ns_initparse(msg, len, &handle) != 0) {
-		//fprintf(stderr, "Unable to parse reply: %s\n", strerror(errno));
+		// fprintf(stderr, "Unable to parse reply: %s\n", strerror(errno));
 		return -1;
 	}
 
 	for (i = 0; i < ns_msg_count(handle, ns_s_an); i++) {
 		if (ns_parserr(&handle, ns_s_an, i, &rr) != 0) {
-			//fprintf(stderr, "Unable to parse resource record: %s\n", strerror(errno));
+			// fprintf(stderr, "Unable to parse resource record: %s\n",
+			// strerror(errno));
 			return -1;
 		}
 
 		rdlen = ns_rr_rdlen(rr);
 
-		switch (ns_rr_type(rr))
-		{
-		case ns_t_a:
-			if (rdlen != 4) {
-				//fprintf(stderr, "Unexpected A record length\n");
-				return -1;
-			}
-			inet_ntop(AF_INET, ns_rr_rdata(rr), astr, sizeof(astr));
-			printf("Name:\t%s\nAddress: %s\n", ns_rr_name(rr), astr);
-			break;
+		switch (ns_rr_type(rr)) {
+			case ns_t_a:
+				if (rdlen != 4) {
+					// fprintf(stderr, "Unexpected A record length\n");
+					return -1;
+				}
+				inet_ntop(AF_INET, ns_rr_rdata(rr), astr, sizeof(astr));
+				printf("Name:\t%s\nAddress: %s\n", ns_rr_name(rr), astr);
+				break;
 
 #if ENABLE_FEATURE_IPV6
-		case ns_t_aaaa:
-			if (rdlen != 16) {
-				//fprintf(stderr, "Unexpected AAAA record length\n");
-				return -1;
-			}
-			inet_ntop(AF_INET6, ns_rr_rdata(rr), astr, sizeof(astr));
-			printf("%s\thas AAAA address %s\n", ns_rr_name(rr), astr);
-			break;
+			case ns_t_aaaa:
+				if (rdlen != 16) {
+					// fprintf(stderr, "Unexpected AAAA record length\n");
+					return -1;
+				}
+				inet_ntop(AF_INET6, ns_rr_rdata(rr), astr, sizeof(astr));
+				printf("%s\thas AAAA address %s\n", ns_rr_name(rr), astr);
+				break;
 #endif
 
-		case ns_t_ns:
-			if (!format)
-				format = "%s\tnameserver = %s\n";
-			/* fall through */
+			case ns_t_ns:
+				if (ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle),
+				                       ns_rr_rdata(rr), dname, sizeof(dname)) < 0) {
+					// fprintf(stderr, "Unable to uncompress domain: %s\n",
+					// strerror(errno));
+					return -1;
+				}
+				printf("%s\tnameserver = %s\n", ns_rr_name(rr), dname);
+				break;
 
-		case ns_t_cname:
-			if (!format)
-				format = "%s\tcanonical name = %s\n";
-			/* fall through */
+			case ns_t_cname:
+				if (ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle),
+				                       ns_rr_rdata(rr), dname, sizeof(dname)) < 0) {
+					// fprintf(stderr, "Unable to uncompress domain: %s\n",
+					// strerror(errno));
+					return -1;
+				}
+				printf("%s\tcanonical name = %s\n", ns_rr_name(rr), dname);
+				break;
 
-		case ns_t_ptr:
-			if (!format)
-				format = "%s\tname = %s\n";
-			if (ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle),
-				ns_rr_rdata(rr), dname, sizeof(dname)) < 0) {
-				//fprintf(stderr, "Unable to uncompress domain: %s\n", strerror(errno));
-				return -1;
-			}
-			printf(format, ns_rr_name(rr), dname);
-			break;
+			case ns_t_ptr:
+				if (ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle),
+				                       ns_rr_rdata(rr), dname, sizeof(dname)) < 0) {
+					// fprintf(stderr, "Unable to uncompress domain: %s\n",
+					// strerror(errno));
+					return -1;
+				}
+				printf("%s\tname = %s\n", ns_rr_name(rr), dname);
+				break;
 
-		case ns_t_mx:
-			if (rdlen < 2) {
-				fprintf(stderr, "MX record too short\n");
-				return -1;
-			}
-			n = ns_get16(ns_rr_rdata(rr));
-			if (ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle),
-				ns_rr_rdata(rr) + 2, dname, sizeof(dname)) < 0) {
-				//fprintf(stderr, "Cannot uncompress MX domain: %s\n", strerror(errno));
-				return -1;
-			}
-			printf("%s\tmail exchanger = %d %s\n", ns_rr_name(rr), n, dname);
-			break;
+			case ns_t_mx:
+				if (rdlen < 2) {
+					fprintf(stderr, "MX record too short\n");
+					return -1;
+				}
+				n = ns_get16(ns_rr_rdata(rr));
+				if (ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle),
+				                       ns_rr_rdata(rr) + 2, dname,
+				                       sizeof(dname)) < 0) {
+					// fprintf(stderr, "Cannot uncompress MX domain: %s\n",
+					// strerror(errno));
+					return -1;
+				}
+				printf("%s\tmail exchanger = %d %s\n", ns_rr_name(rr), n, dname);
+				break;
 
-		case ns_t_txt:
-			if (rdlen < 1) {
-				//fprintf(stderr, "TXT record too short\n");
-				return -1;
-			}
-			n = *(unsigned char *)ns_rr_rdata(rr);
-			if (n > 0) {
-				memset(dname, 0, sizeof(dname));
-				memcpy(dname, ns_rr_rdata(rr) + 1, n);
-				printf("%s\ttext = \"%s\"\n", ns_rr_name(rr), dname);
-			}
-			break;
+			case ns_t_txt:
+				if (rdlen < 1) {
+					// fprintf(stderr, "TXT record too short\n");
+					return -1;
+				}
+				n = *((const unsigned char *) ns_rr_rdata(rr));
+				if (n > 0) {
+					memset(dname, 0, sizeof(dname));
+					memcpy(dname, ns_rr_rdata(rr) + 1, n);
+					printf("%s\ttext = \"%s\"\n", ns_rr_name(rr), dname);
+				}
+				break;
 
-		case ns_t_soa:
-			if (rdlen < 20) {
-				//fprintf(stderr, "SOA record too short\n");
-				return -1;
-			}
+			case ns_t_soa:
+				if (rdlen < 20) {
+					// fprintf(stderr, "SOA record too short\n");
+					return -1;
+				}
 
-			printf("%s\n", ns_rr_name(rr));
+				printf("%s\n", ns_rr_name(rr));
 
-			cp = ns_rr_rdata(rr);
-			n = ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle),
-			                       cp, dname, sizeof(dname));
+				cp = ns_rr_rdata(rr);
+				n = ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle), cp,
+				                       dname, sizeof(dname));
 
-			if (n < 0) {
-				//fprintf(stderr, "Unable to uncompress domain: %s\n", strerror(errno));
-				return -1;
-			}
+				if (n < 0) {
+					// fprintf(stderr, "Unable to uncompress domain: %s\n",
+					// strerror(errno));
+					return -1;
+				}
 
-			printf("\torigin = %s\n", dname);
-			cp += n;
+				printf("\torigin = %s\n", dname);
+				cp += n;
 
-			n = ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle),
-			                       cp, dname, sizeof(dname));
+				n = ns_name_uncompress(ns_msg_base(handle), ns_msg_end(handle), cp,
+				                       dname, sizeof(dname));
 
-			if (n < 0) {
-				//fprintf(stderr, "Unable to uncompress domain: %s\n", strerror(errno));
-				return -1;
-			}
+				if (n < 0) {
+					// fprintf(stderr, "Unable to uncompress domain: %s\n",
+					// strerror(errno));
+					return -1;
+				}
 
-			printf("\tmail addr = %s\n", dname);
-			cp += n;
+				printf("\tmail addr = %s\n", dname);
+				cp += n;
 
-			printf("\tserial = %lu\n", ns_get32(cp));
-			cp += 4;
+				printf("\tserial = %lu\n", ns_get32(cp));
+				cp += 4;
 
-			printf("\trefresh = %lu\n", ns_get32(cp));
-			cp += 4;
+				printf("\trefresh = %lu\n", ns_get32(cp));
+				cp += 4;
 
-			printf("\tretry = %lu\n", ns_get32(cp));
-			cp += 4;
+				printf("\tretry = %lu\n", ns_get32(cp));
+				cp += 4;
 
-			printf("\texpire = %lu\n", ns_get32(cp));
-			cp += 4;
+				printf("\texpire = %lu\n", ns_get32(cp));
+				cp += 4;
 
-			printf("\tminimum = %lu\n", ns_get32(cp));
-			break;
+				printf("\tminimum = %lu\n", ns_get32(cp));
+				break;
 
-		default:
-			break;
+			default:
+				break;
 		}
 	}
 
@@ -326,7 +324,7 @@ static unsigned long mtime(void)
 {
 	struct timespec ts;
 	clock_gettime(CLOCK_REALTIME, &ts);
-	return (unsigned long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+	return (unsigned long) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 #if ENABLE_FEATURE_IPV6
@@ -335,11 +333,9 @@ static void to_v4_mapped(len_and_sockaddr *a)
 	if (a->u.sa.sa_family != AF_INET)
 		return;
 
-	memcpy(a->u.sin6.sin6_addr.s6_addr + 12,
-	       &a->u.sin.sin_addr, 4);
+	memcpy(a->u.sin6.sin6_addr.s6_addr + 12, &a->u.sin.sin_addr, 4);
 
-	memcpy(a->u.sin6.sin6_addr.s6_addr,
-	       "\0\0\0\0\0\0\0\0\0\0\xff\xff", 12);
+	memcpy(a->u.sin6.sin6_addr.s6_addr, "\0\0\0\0\0\0\0\0\0\0\xff\xff", 12);
 
 	a->u.sin6.sin6_family = AF_INET6;
 	a->u.sin6.sin6_flowinfo = 0;
@@ -356,8 +352,10 @@ static void to_v4_mapped(len_and_sockaddr *a)
 static int send_queries(struct ns *ns, int n_ns, struct query *queries, int n_queries)
 {
 	int fd;
-	int timeout = default_timeout * 1000, retry_interval, servfail_retry = 0;
-	len_and_sockaddr from = { };
+	unsigned long timeout = default_timeout * 1000;
+	unsigned long retry_interval;
+	int servfail_retry = 0;
+	len_and_sockaddr from = {};
 #if ENABLE_FEATURE_IPV6
 	int one = 1;
 #endif
@@ -381,12 +379,12 @@ static int send_queries(struct ns *ns, int n_ns, struct query *queries, int n_qu
 #endif
 
 	/* Get local address and open/bind a socket */
-	fd = socket(from.u.sa.sa_family, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
+	fd = socket(from.u.sa.sa_family, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
 
 #if ENABLE_FEATURE_IPV6
 	/* Handle case where system lacks IPv6 support */
 	if (fd < 0 && from.u.sa.sa_family == AF_INET6 && errno == EAFNOSUPPORT) {
-		fd = socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
+		fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
 		from.u.sa.sa_family = AF_INET;
 	}
 #endif
@@ -432,13 +430,13 @@ static int send_queries(struct ns *ns, int n_ns, struct query *queries, int n_qu
 		}
 
 		/* Wait for a response, or until time to retry */
-		if (poll(&pfd, 1, t1+retry_interval-t2) <= 0)
+		if (poll(&pfd, 1, t1 + retry_interval - t2) <= 0)
 			continue;
 
 		while (1) {
-			recvlen = recvfrom(fd, queries[next_query].reply,
-			                   sizeof(queries[next_query].reply), 0,
-			                   &from.u.sa, &from.len);
+			recvlen =
+			    recvfrom(fd, queries[next_query].reply,
+			             sizeof(queries[next_query].reply), 0, &from.u.sa, &from.len);
 
 			/* read error */
 			if (recvlen < 0)
@@ -474,20 +472,21 @@ static int send_queries(struct ns *ns, int n_ns, struct query *queries, int n_qu
 			 * retry immediately on server failure, and ignore
 			 * all other codes such as refusal. */
 			switch (queries[qn].rcode) {
-			case 0:
-			case 3:
-				break;
+				case 0:
+				case 3:
+					break;
 
-			case 2:
-				if (servfail_retry && servfail_retry--) {
-					ns[nn].failures++;
-					sendto(fd, queries[qn].query, queries[qn].qlen,
-					       MSG_NOSIGNAL, &ns[nn].addr.u.sa, ns[nn].addr.len);
-				}
-				/* fall through */
+				case 2:
+					if (servfail_retry && servfail_retry--) {
+						ns[nn].failures++;
+						sendto(fd, queries[qn].query, queries[qn].qlen,
+						       MSG_NOSIGNAL, &ns[nn].addr.u.sa,
+						       ns[nn].addr.len);
+					}
+					/* fall through */
 
-			default:
-				continue;
+				default:
+					continue;
 			}
 
 			/* Store answer */
@@ -502,8 +501,7 @@ static int send_queries(struct ns *ns, int n_ns, struct query *queries, int n_qu
 
 					next_query++;
 				}
-			}
-			else {
+			} else {
 				memcpy(queries[qn].reply, queries[next_query].reply, recvlen);
 			}
 
@@ -518,12 +516,10 @@ static int send_queries(struct ns *ns, int n_ns, struct query *queries, int n_qu
 static struct ns *add_ns(struct ns **ns, int *n_ns, const char *addr)
 {
 	char portstr[sizeof("65535")], *p;
-	len_and_sockaddr a = { };
+	len_and_sockaddr a = {};
 	struct ns *tmp;
-	struct addrinfo *ai, *aip, hints = {
-		.ai_flags = AI_NUMERICSERV,
-		.ai_socktype = SOCK_DGRAM
-	};
+	struct addrinfo *ai, *aip,
+	    hints = { .ai_flags = AI_NUMERICSERV, .ai_socktype = SOCK_DGRAM };
 
 	if (parse_nsaddr(addr, &a)) {
 		/* Maybe we got a domain name, attempt to resolve it using the standard
@@ -531,7 +527,7 @@ static struct ns *add_ns(struct ns **ns, int *n_ns, const char *addr)
 
 		p = strchr(addr, '#');
 		snprintf(portstr, sizeof(portstr), "%hu",
-		         (unsigned short)(p ? strtoul(p, NULL, 10) : default_port));
+		         (unsigned short) (p ? strtoul(p, NULL, 10) : default_port));
 
 		if (!getaddrinfo(addr, portstr, &hints, &ai)) {
 			for (aip = ai; aip; aip = aip->ai_next) {
@@ -539,7 +535,7 @@ static struct ns *add_ns(struct ns **ns, int *n_ns, const char *addr)
 				    aip->ai_addr->sa_family != AF_INET6)
 					continue;
 
-#if ! ENABLE_FEATURE_IPV6
+#if !ENABLE_FEATURE_IPV6
 				if (aip->ai_addr->sa_family != AF_INET)
 					continue;
 #endif
@@ -584,8 +580,7 @@ static struct ns *add_ns(struct ns **ns, int *n_ns, const char *addr)
 	return &(*ns)[(*n_ns)++];
 }
 
-static struct query *add_query(struct query **queries, int *n_queries,
-                               int type, const char *dname)
+static struct query *add_query(struct query **queries, int *n_queries, int type, const char *dname)
 {
 	struct query *tmp;
 	ssize_t qlen;
@@ -597,8 +592,8 @@ static struct query *add_query(struct query **queries, int *n_queries,
 
 	memset(&tmp[*n_queries], 0, sizeof(*tmp));
 
-	qlen = res_mkquery(QUERY, dname, C_IN, type, NULL, 0, NULL,
-	                   tmp[*n_queries].query, sizeof(tmp[*n_queries].query));
+	qlen = res_mkquery(QUERY, dname, C_IN, type, NULL, 0, NULL, tmp[*n_queries].query,
+	                   sizeof(tmp[*n_queries].query));
 
 	tmp[*n_queries].qlen = qlen;
 	tmp[*n_queries].name = dname;
@@ -615,8 +610,8 @@ int main(int argc, char **argv)
 	int n_ns = 0, n_queries = 0;
 	int c = 0;
 
-	char *url = "telecominfraproject.com";
-	char *server = "127.0.0.1";
+	const char *url = "telecominfraproject.com";
+	const char *server = "127.0.0.1";
 	int v6 = 0;
 
 	while (1) {
@@ -626,29 +621,28 @@ int main(int argc, char **argv)
 			break;
 
 		switch (option) {
-		case '6':
-			v6 = 1;
-			break;
-		case 'u':
-			url = optarg;
-			break;
-		case 's':
-			server = optarg;
-			break;
-		default:
-		case 'h':
-			printf("Usage: dnsprobe OPTIONS\n"
-			       "  -6 - use ipv6\n"
-			       "  -u <url>\n"
-			       "  -s <server>\n");
-			return -1;
+			case '6':
+				v6 = 1;
+				break;
+			case 'u':
+				url = optarg;
+				break;
+			case 's':
+				server = optarg;
+				break;
+			default:
+			case 'h':
+				printf("Usage: dnsprobe OPTIONS\n"
+				       "  -6 - use ipv6\n"
+				       "  -u <url>\n"
+				       "  -s <server>\n");
+				return -1;
 		}
 	}
 
 	ulog_open(ULOG_SYSLOG | ULOG_STDIO, LOG_DAEMON, "dnsprobe");
 
-	ULOG_INFO("attempting to probe dns - %s %s %s\n",
-		url, server, v6 ? "ipv6" : "");
+	ULOG_INFO("attempting to probe dns - %s %s %s\n", url, server, v6 ? "ipv6" : "");
 
 
 	add_query(&queries, &n_queries, v6 ? T_AAAA : T_A, url);
@@ -663,13 +657,12 @@ int main(int argc, char **argv)
 	}
 
 	if (queries[0].rcode != 0) {
-		printf("** server can't find %s: %s\n", queries[0].name,
-		rcodes[queries[0].rcode]);
+		printf("** server can't find %s: %s\n", queries[0].name, rcodes[queries[0].rcode]);
 		goto out;
 	}
 
 	if (queries[0].rlen) {
-		c = parse_reply(queries[0].reply, queries[0].rlen, NULL);
+		c = parse_reply(queries[0].reply, queries[0].rlen);
 	}
 
 	if (c == 0)
