@@ -7,7 +7,7 @@ obj-y := udhcpinject.o
 all: udhcpinject
 
 udhcpinject: $(obj-y)
-	$(CC) $(LDFLAGS) -lpcap -o $@ $(obj-y)
+	$(CC) $(LDFLAGS) -lpcap -luci -o $@ $(obj-y)
 
 %.o: %.c
 	$(CC) $(CFLAGS) $(TARGET_CFLAGS) -c $< -o $@
