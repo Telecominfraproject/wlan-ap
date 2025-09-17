@@ -147,6 +147,21 @@ define Device/cig_wf189h
 endef
 TARGET_DEVICES += cig_wf189h
 
+define Device/zyxel_nwa210be
+  DEVICE_TITLE := Zyxel NWA210BE
+  DEVICE_DTS := ipq5332-zyxel-nwa210be
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_DTS_CONFIG := config@mi01.6
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/nand-factory.ubi := append-ubi
+  DEVICE_PACKAGES := ath12k-wifi-zyxel-nwa210be ath12k-firmware-qcn92xx ath12k-firmware-ipq5332
+endef
+TARGET_DEVICES += zyxel_nwa210be
+
 define Device/zyxel_nwa130be
   DEVICE_TITLE := Zyxel NWA130BE
   DEVICE_DTS := ipq5332-zyxel-nwa130be
@@ -162,6 +177,20 @@ define Device/zyxel_nwa130be
 endef
 TARGET_DEVICES += zyxel_nwa130be
 
+define Device/zyxel_nwa55be
+  DEVICE_TITLE := Zyxel NWA55BE
+  DEVICE_DTS := ipq5332-zyxel-nwa55be
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_DTS_CONFIG := config@mi01.3
+  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
+  IMAGE/nand-factory.ubi := append-ubi
+  DEVICE_PACKAGES := ath12k-wifi-zyxel-nwa55be ath12k-firmware-ipq5332-peb-peb -ath12k-firmware-qcn92xx
+endef
+TARGET_DEVICES += zyxel_nwa55be
 
 define Device/zyxel_nwa50be
   DEVICE_TITLE := Zyxel NWA50BE
@@ -177,21 +206,6 @@ define Device/zyxel_nwa50be
   DEVICE_PACKAGES := ath12k-wifi-zyxel-nwa50be ath12k-firmware-ipq5332-peb-peb -ath12k-firmware-qcn92xx
 endef
 TARGET_DEVICES += zyxel_nwa50be
-
-define Device/zyxel_nwa210be
-  DEVICE_TITLE := Zyxel NWA210BE
-  DEVICE_DTS := ipq5332-zyxel-nwa210be
-  DEVICE_DTS_DIR := ../dts
-  DEVICE_DTS_CONFIG := config@mi01.6
-  IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
-  BLOCKSIZE := 128k
-  PAGESIZE := 2048
-  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
-  IMAGE/nand-factory.bin := append-ubi | qsdk-ipq-factory-nand
-  IMAGE/nand-factory.ubi := append-ubi
-  DEVICE_PACKAGES := ath12k-wifi-zyxel-nwa210be ath12k-firmware-qcn92xx ath12k-firmware-ipq5332
-endef
-TARGET_DEVICES += zyxel_nwa210be
 
 define Device/cig_wf672
   DEVICE_TITLE := CIG WF672

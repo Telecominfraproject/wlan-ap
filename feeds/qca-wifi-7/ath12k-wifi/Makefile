@@ -88,19 +88,24 @@ $(call Package/ath12k-wifi-default)
     TITLE:=board-2.bin for AP72TIP-v4
 endef
 
+define Package/ath12k-wifi-zyxel-nwa210be
+$(call Package/ath12k-wifi-default)
+    TITLE:=board-2.bin for NWA210BE
+endef
+
 define Package/ath12k-wifi-zyxel-nwa130be
 $(call Package/ath12k-wifi-default)
     TITLE:=board-2.bin for NWA130BE
 endef
 
+define Package/ath12k-wifi-zyxel-nwa55be
+$(call Package/ath12k-wifi-default)
+    TITLE:=board-2.bin for NWA55BE
+endef
+
 define Package/ath12k-wifi-zyxel-nwa50be
 $(call Package/ath12k-wifi-default)
     TITLE:=board-2.bin for NWA50BE
-endef
-
-define Package/ath12k-wifi-zyxel-nwa210be
-$(call Package/ath12k-wifi-default)
-    TITLE:=board-2.bin for NWA210BE
 endef
 
 define Package/ath12k-wifi-cig-wf672
@@ -199,11 +204,26 @@ define Package/ath12k-wifi-sercomm-ap72tip-v4/install
 	$(INSTALL_DATA) ./board-2.bin.ap72tip-v4.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
 endef
 
+define Package/ath12k-wifi-zyxel-nwa210be/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
+	$(INSTALL_DATA) ./board-2.bin.nwa210be.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin
+	$(INSTALL_DATA) ./board-2.bin.nwa210be.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
+endef
+
 define Package/ath12k-wifi-zyxel-nwa130be/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
 	$(INSTALL_DATA) ./board-2.bin.nwa130be.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin
 	$(INSTALL_DATA) ./board-2.bin.nwa130be.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
+endef
+
+define Package/ath12k-wifi-zyxel-nwa55be/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN6432/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
+	$(INSTALL_DATA) ./board-2.bin.nwa55be.QCN6432 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/board-2.bin
+	$(INSTALL_DATA) ./board-2.bin.nwa55be.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
+	$(INSTALL_DATA) ./ipq5332_qcn6432.regdb $(1)/lib/firmware/ath12k/QCN6432/hw1.0/regdb.bin
 endef
 
 define Package/ath12k-wifi-zyxel-nwa50be/install
@@ -212,13 +232,6 @@ define Package/ath12k-wifi-zyxel-nwa50be/install
 	$(INSTALL_DATA) ./board-2.bin.nwa50be.QCN6432 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/board-2.bin
 	$(INSTALL_DATA) ./board-2.bin.nwa50be.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
 	$(INSTALL_DATA) ./ipq5332_qcn6432.regdb $(1)/lib/firmware/ath12k/QCN6432/hw1.0/regdb.bin
-endef
-
-define Package/ath12k-wifi-zyxel-nwa210be/install
-	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
-	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
-	$(INSTALL_DATA) ./board-2.bin.nwa210be.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin
-	$(INSTALL_DATA) ./board-2.bin.nwa210be.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
 endef
 
 define Package/ath12k-wifi-cig-wf672/install
@@ -246,8 +259,9 @@ $(eval $(call BuildPackage,ath12k-wifi-cig-wf189w))
 $(eval $(call BuildPackage,ath12k-wifi-cig-wf189h))
 $(eval $(call BuildPackage,ath12k-wifi-sercomm-ap72tip))
 $(eval $(call BuildPackage,ath12k-wifi-sercomm-ap72tip-v4))
-$(eval $(call BuildPackage,ath12k-wifi-zyxel-nwa130be))
-$(eval $(call BuildPackage,ath12k-wifi-zyxel-nwa50be))
 $(eval $(call BuildPackage,ath12k-wifi-zyxel-nwa210be))
+$(eval $(call BuildPackage,ath12k-wifi-zyxel-nwa130be))
+$(eval $(call BuildPackage,ath12k-wifi-zyxel-nwa55be))
+$(eval $(call BuildPackage,ath12k-wifi-zyxel-nwa50be))
 $(eval $(call BuildPackage,ath12k-wifi-cig-wf672))
 $(eval $(call BuildPackage,ath12k-wifi-asterfusion-ap7330))
