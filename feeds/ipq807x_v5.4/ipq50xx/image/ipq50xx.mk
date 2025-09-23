@@ -102,6 +102,15 @@ define Device/indio_um-325ax-v2
 endef
 TARGET_DEVICES += indio_um-325ax-v2
 
+define Device/indio_um-335ax
+  DEVICE_TITLE := Indio UM-335ax
+  DEVICE_DTS := qcom-ipq5018-indio-um-335ax
+  SUPPORTED_DEVICES := indio,um-335ax
+  DEVICE_PACKAGES := ath11k-wifi-indio-um-335ax ath11k-firmware-qcn9000 ath11k-firmware-ipq50xx-spruce
+  DEVICE_DTS_CONFIG := config@mp03.1
+endef
+TARGET_DEVICES += indio_um-335ax
+
 define Device/indio_um-525axp
   DEVICE_TITLE := Indio UM-525axp
   DEVICE_DTS := qcom-ipq5018-indio-um-525axp
