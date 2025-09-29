@@ -93,6 +93,33 @@ define Device/edgecore_eap104
 endef
 TARGET_DEVICES += edgecore_eap104
 
+define Device/indio_um-325ax-v2
+  DEVICE_TITLE := Indio UM-325ax-V2
+  DEVICE_DTS := qcom-ipq5018-indio-um-325ax-v2
+  SUPPORTED_DEVICES := indio,um-325ax-v2
+  DEVICE_PACKAGES := ath11k-wifi-indio-um-325ax-v2 ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.5-c1
+endef
+TARGET_DEVICES += indio_um-325ax-v2
+
+define Device/indio_um-335ax
+  DEVICE_TITLE := Indio UM-335ax
+  DEVICE_DTS := qcom-ipq5018-indio-um-335ax
+  SUPPORTED_DEVICES := indio,um-335ax
+  DEVICE_PACKAGES := ath11k-wifi-indio-um-335ax ath11k-firmware-qcn9000 ath11k-firmware-ipq50xx-spruce
+  DEVICE_DTS_CONFIG := config@mp03.1
+endef
+TARGET_DEVICES += indio_um-335ax
+
+define Device/indio_um-525axp
+  DEVICE_TITLE := Indio UM-525axp
+  DEVICE_DTS := qcom-ipq5018-indio-um-525axp
+  SUPPORTED_DEVICES := indio,um-525axp
+  DEVICE_PACKAGES := ath11k-wifi-indio-um-525axp ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
+  DEVICE_DTS_CONFIG := config@mp03.5-c1
+endef
+TARGET_DEVICES += indio_um-525axp
+
 define Device/udaya_a6_id2
   DEVICE_TITLE := Udaya A6 - ID2
   DEVICE_DTS := qcom-ipq5018-udaya-a6-id2

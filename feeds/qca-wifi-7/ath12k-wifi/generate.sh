@@ -18,3 +18,6 @@ $encoder -c board-2-ap72tip-v4-QCN92XX.json -o board-2.bin.ap72tip-v4.QCN92XX
 
 $encoder -c board-2-nwa130be-IPQ5332.json -o board-2.bin.nwa130be.IPQ5332
 $encoder -c board-2-nwa130be-QCN92XX.json -o board-2.bin.nwa130be.QCN92XX
+
+$encoder -c board-2-nwa50be-IPQ5332.json -o board-2.bin.nwa50be.IPQ5332
+$encoder -c board-2-nwa50be-QCN6432.json -o board-2.bin.nwa50be.QCN6432
