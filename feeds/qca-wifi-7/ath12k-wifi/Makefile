@@ -43,6 +43,11 @@ $(call Package/ath12k-wifi-default)
     TITLE:=board-2.bin for EAP105
 endef
 
+define Package/ath12k-wifi-edgecore-oap106
+$(call Package/ath12k-wifi-default)
+    TITLE:=board-2.bin for OAP106
+endef
+
 define Package/ath12k-wifi-emplus-wap7635
 $(call Package/ath12k-wifi-default)
     TITLE:=board-2.bin for WAP7635
@@ -111,6 +116,13 @@ define Package/ath12k-wifi-cig-wf189/install
 endef
 
 define Package/ath12k-wifi-edgecore-eap105/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
+	$(INSTALL_DATA) ./board-2.bin.eap105.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin
+	$(INSTALL_DATA) ./board-2.bin.eap105.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
+endef
+
+define Package/ath12k-wifi-edgecore-oap106/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
 	$(INSTALL_DATA) ./board-2.bin.eap105.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin
@@ -213,6 +225,7 @@ endef
 
 $(eval $(call BuildPackage,ath12k-wifi-cig-wf189))
 $(eval $(call BuildPackage,ath12k-wifi-edgecore-eap105))
+$(eval $(call BuildPackage,ath12k-wifi-edgecore-oap106))
 $(eval $(call BuildPackage,ath12k-wifi-emplus-wap7635))
 $(eval $(call BuildPackage,ath12k-wifi-sonicfi-rap7110c-341x))
 $(eval $(call BuildPackage,ath12k-wifi-sonicfi-rap750e-h))

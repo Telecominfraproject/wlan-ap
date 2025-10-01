@@ -52,6 +52,19 @@ define Device/edgecore_eap105
 endef
 TARGET_DEVICES += edgecore_eap105
 
+define Device/edgecore_oap106
+  DEVICE_TITLE := Edgecore OAP106
+  DEVICE_DTS := ipq5332-edgecore-oap106
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_DTS_CONFIG := config@mi01.13
+  IMAGES := sysupgrade.tar kernel.bin rootfs.bin
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  IMAGE/kernel.bin := append-kernel
+  IMAGE/rootfs.bin := append-rootfs
+  DEVICE_PACKAGES := ath12k-wifi-edgecore-oap106 ath12k-firmware-qcn92xx ath12k-firmware-ipq5332
+endef
+TARGET_DEVICES += edgecore_oap106
+
 define Device/emplus_wap7635
   DEVICE_TITLE := EMPLUS WAP7635
   DEVICE_DTS := ipq5332-emplus-wap7635
