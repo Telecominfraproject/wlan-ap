@@ -30,6 +30,7 @@ platform_check_image() {
 	edgecore,oap103|\
 	edgecore,eap106|\
 	emplus,wap380c|\
+	indio,um-345ax|\
 	sonicfi,rap650c|\
 	tplink,ex227|\
 	tplink,ex447)
@@ -61,7 +62,8 @@ platform_do_upgrade() {
 	tplink,ex447)
 		nand_upgrade_tar "$1"
 		;;
-	edgecore,eap106)
+	edgecore,eap106|\
+	indio,um-345ax)
 		CI_UBIPART="rootfs1"
 		[ "$(find_mtd_chardev rootfs)" ] && CI_UBIPART="rootfs"
 		nand_upgrade_tar "$1"
