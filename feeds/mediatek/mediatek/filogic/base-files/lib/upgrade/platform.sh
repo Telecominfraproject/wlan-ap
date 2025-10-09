@@ -1,6 +1,19 @@
 REQUIRE_IMAGE_METADATA=1
 RAMFS_COPY_BIN='fitblk fw_setenv'
 
+swap_wap588m_active_fw() {
+	echo "Doing swap active_fw" > /dev/console
+        tmp_active_fw=$(fw_printenv | grep active_fw | awk -F= {'print $2'})
+	if [ $tmp_active_fw == "0" ]; then
+		fw_setenv active_fw 1
+		fw_setenv mtdparts nmbm0:1024k\(bl2\),512k\(u-boot-env\),2048k\(factory\),2048k\(fip\),56320k\(ubi_1\),56320k\(ubi\),384k\(cert\),640k\(userconfig\),384k\(crashdump\)
+	else
+		fw_setenv active_fw 0
+		fw_setenv mtdparts nmbm0:1024k\(bl2\),512k\(u-boot-env\),2048k\(factory\),2048k\(fip\),56320k\(ubi\),56320k\(ubi_1\),384k\(cert\),640k\(userconfig\),384k\(crashdump\)
+	fi
+}
+
+
 asus_initial_setup()
 {
 	# initialize UBI if it's running on initramfs
@@ -200,7 +213,8 @@ platform_do_upgrade() {
 		fi
 		nand_do_upgrade "$1"
 		;;
-	*)
+	emplus,wap588m)
+		CI_UBIPART="ubi_1"
 		nand_do_upgrade "$1"
 		;;
 	esac
@@ -283,6 +297,15 @@ platform_pre_upgrade() {
 	xiaomi,mi-router-wr30u-stock|\
 	xiaomi,redmi-router-ax6000-stock)
 		xiaomi_initial_setup
+		;;
+	esac
+}
+
+platform_post_upgrade_success() {
+	local board=$(board_name)
+	case "$board" in	
+		emplus,wap588m)
+			swap_wap588m_active_fw
 		;;
 	esac
 }

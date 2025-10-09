@@ -518,6 +518,17 @@ define Build/Install
 	:
 endef
 
+ifdef CONFIG_TARGET_PROFILE
+TARGET_PROFILE=$(subst ",,$(CONFIG_TARGET_PROFILE))
+PATCH_PROFILE_NAME=patches-$(subst DEVICE_,,$(TARGET_PROFILE))
+endif
+
+define Build/Patch
+	$(Build/Patch/Default)
+	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_PROFILE_NAME)/,profile/)
+endef
+
+
 define Package/kmod-mt76/install
 	true
 endef
