@@ -66,6 +66,15 @@ define Device/emplus_wap380c
 endef
 TARGET_DEVICES += emplus_wap380c
 
+define Device/indio_um-345ax
+  DEVICE_TITLE := Indio UM-345AX
+  DEVICE_DTS := qcom-ipq807x-indio-um-345ax
+  DEVICE_DTS_CONFIG=config@hk09
+  SUPPORTED_DEVICES := indio,um-345ax
+  DEVICE_PACKAGES := ath11k-wifi-indio-um-345ax uboot-envtools
+endef
+TARGET_DEVICES += indio_um-345ax
+
 define Device/sonicfi_rap650c
   DEVICE_TITLE := SonicFi RAP650C
   DEVICE_DTS := qcom-ipq807x-rap650c

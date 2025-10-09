@@ -119,6 +119,7 @@ platform_check_image() {
 	cig,wf196|\
 	glinet,ax1800|\
 	glinet,axt1800|\
+	indio,um-310ax-v1|\
 	wallys,dr6018|\
 	wallys,dr6018-v4|\
 	edgecore,eap101|\
@@ -156,6 +157,7 @@ platform_do_upgrade() {
 		;;
 	glinet,ax1800|\
 	glinet,axt1800|\
+	indio,um-310ax-v1|\
 	wallys,dr6018|\
 	wallys,dr6018-v4|\
 	yuncore,ax840|\
