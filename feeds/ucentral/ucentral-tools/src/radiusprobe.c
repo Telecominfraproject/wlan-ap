@@ -1,10 +1,11 @@
+#include <radcli/radcli.h>
 #include <stdio.h>
 #include <string.h>
-#include <radcli/radcli.h>
 
-int
-main(int argc, char **argv)
+int main(int argc, char **argv)
 {
+	(void) argc;
+	(void) argv;
 	int result;
 	char username[128];
 	char passwd[AUTH_PASS_LEN + 1];
