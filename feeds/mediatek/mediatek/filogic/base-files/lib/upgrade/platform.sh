@@ -217,6 +217,9 @@ platform_do_upgrade() {
 		CI_UBIPART="ubi_1"
 		nand_do_upgrade "$1"
 		;;
+	*)
+		nand_do_upgrade "$1"
+		;;
 	esac
 }
 
