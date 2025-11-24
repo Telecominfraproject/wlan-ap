@@ -14,7 +14,7 @@
 
 #define CONFIG_PATH "/etc/config/dhcpinject"
 
-#define IWINFO_CMD "iwinfo | grep %s -A2 | grep '.*Channel:.*\\(%s\\..*\\) GHz' -B2 | awk '/ESSID/{print $1} /Access Point/{gsub(/:/, \"\", $3); print $3}'"
+#define IWINFO_CMD "iwinfo | grep '\"%s\"$' -A2 | grep '.*Channel:.*\\(%s\\..*\\) GHz' -B2 | awk '/ESSID/{print $1} /Access Point/{gsub(/:/, \"\", $3); print $3}'"
 
 static pcap_t 		*handle = NULL;
 
