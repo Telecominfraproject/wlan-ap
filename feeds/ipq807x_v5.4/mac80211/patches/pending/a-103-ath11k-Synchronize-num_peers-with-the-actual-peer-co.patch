@@ -1,0 +1,174 @@
+From 6a9ba11a6c58ddf6a9902c0f0396507778ef83ec Mon Sep 17 00:00:00 2001
+From: Venkat Chimata <venkat@nearhop.com>
+Date: Mon, 1 Dec 2025 07:25:36 +0530
+Subject: [PATCH] ath11k: Synchronize num_peers with the actual peer count when
+  out of sync
+
+Description:
+The num_peers counter does not always update at the exact moment a peer is deleted.
+Since deletion and decrement are not fully atomic, there are scenarios where
+num_peers can drift out of sync with the actual number of peers.
+
+Fix:
+A complete rewrite of the num_peers update logic—ensuring fully correct
+increment/decrement handling during peer insertion and deletion—would require
+significant effort and QA validation. As an immediate and effective solution,
+this patch synchronizes num_peers with the actual peer count whenever a mismatch
+is detected.
+
+Signed-off-by: Venkat Chimata <venkat@nearhop.com>
+---
+ drivers/net/wireless/ath/ath11k/mac.c  |  4 +-
+ drivers/net/wireless/ath/ath11k/peer.c | 70 +++++++++++++++++++-------
+ 2 files changed, 53 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index f300c4f..5d936d9 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -5745,7 +5745,7 @@ static int ath11k_mac_op_sta_state(struct ieee80211_hw *hw,
+ 		/* Skip if peer deletion already in progress to prevent
+ 		 * double-delete and num_peers underflow
+ 		 */
+-		if (peer && peer->sta == sta && !peer->delete_in_progress) {
++		if (peer && peer->sta == sta) {
+ 			ath11k_warn(ar->ab, "Found peer entry %pM n vdev %i after it was supposedly removed\n",
+ 				    vif->addr, arvif->vdev_id);
+ 			ath11k_peer_rhash_delete(ar->ab, peer);
+@@ -7947,7 +7947,7 @@ static void ath11k_mac_op_remove_interface(struct ieee80211_hw *hw,
+ 	if (arvif->vdev_type == WMI_VDEV_TYPE_AP) {
+ 		ret = ath11k_peer_delete(ar, arvif->vdev_id, vif->addr);
+ 		if (ret)
+-			ath11k_warn(ab, "failed to submit AP self-peer removal on vdev %d: %d\n",
++			ath11k_warn(ab, "%s: failed to submit AP self-peer removal on vdev %d: %d\n", __func__,
+ 				    arvif->vdev_id, ret);
+ 
+ 		list_for_each_entry_safe(ap_vlan_arvif, tmp, &arvif->ap_vlan_arvifs,
+diff --git a/drivers/net/wireless/ath/ath11k/peer.c b/drivers/net/wireless/ath/ath11k/peer.c
+index 877ea30..3433857 100644
+--- a/drivers/net/wireless/ath/ath11k/peer.c
++++ b/drivers/net/wireless/ath/ath11k/peer.c
+@@ -882,48 +882,38 @@ int ath11k_peer_delete(struct ath11k *ar, u32 vdev_id, u8 *addr)
+ 	/* If timeout occurred, manually remove peer from list since firmware
+ 	 * won't send unmap event. This prevents peer leaks and num_peers corruption.
+ 	 */
++	mutex_lock(&ar->ab->tbl_mtx_lock);
++	spin_lock_bh(&ar->ab->base_lock);
+ 	if (ret == -ETIMEDOUT) {
+ 		ath11k_warn(ar->ab, "peer delete timeout %pM vdev %d, manually cleaning up\n",
+ 			    addr, vdev_id);
+ 
+-		mutex_lock(&ar->ab->tbl_mtx_lock);
+-		spin_lock_bh(&ar->ab->base_lock);
+ 		peer = ath11k_peer_find(ar->ab, vdev_id, addr);
+ 		if (peer) {
+ 			list_del(&peer->list);
+ 			kfree(peer);
+-			ar->num_peers--;
+ 			ath11k_dbg(ar->ab, ATH11K_DBG_PEER,
+ 				   "%s peer deleted (timeout) %pM vdev_id: %d num_peers: %d\n",
+ 				   __func__, addr, vdev_id, ar->num_peers);
+ 		}
+-		spin_unlock_bh(&ar->ab->base_lock);
+-		mutex_unlock(&ar->ab->tbl_mtx_lock);
+ 	} else {
+ 		/* Normal path - but firmware may not send unmap event, so decrement here
+ 		 * after successful peer deletion wait
+ 		 */
+-		mutex_lock(&ar->ab->tbl_mtx_lock);
+-		spin_lock_bh(&ar->ab->base_lock);
+ 		peer = ath11k_peer_find(ar->ab, vdev_id, addr);
+ 		if (peer) {
+ 			/* Peer still in list - firmware didn't send unmap event yet */
+ 			list_del(&peer->list);
+ 			kfree(peer);
+-			ar->num_peers--;
+ 			ath11k_dbg(ar->ab, ATH11K_DBG_PEER,
+ 				   "%s peer deleted (no unmap event) %pM vdev_id: %d num_peers: %d\n",
+ 				   __func__, addr, vdev_id, ar->num_peers);
+-		} else {
+-			/* Peer already removed by unmap event - still need to decrement */
+-			ar->num_peers--;
+-			ath11k_dbg(ar->ab, ATH11K_DBG_PEER,
+-				   "%s peer deleted (via unmap event) %pM vdev_id: %d num_peers: %d\n",
+-				   __func__, addr, vdev_id, ar->num_peers);
+ 		}
+-		spin_unlock_bh(&ar->ab->base_lock);
+-		mutex_unlock(&ar->ab->tbl_mtx_lock);
+ 	}
++	// Peer can be deleted in the unmap or here, so only decrement num_peers once
++	ar->num_peers--;
++	spin_unlock_bh(&ar->ab->base_lock);
++	mutex_unlock(&ar->ab->tbl_mtx_lock);
+ 
+ 	return 0;
+ }
+@@ -933,6 +923,31 @@ static int ath11k_wait_for_peer_created(struct ath11k *ar, int vdev_id, const u8
+ 	return ath11k_wait_for_peer_common(ar->ab, vdev_id, addr, true);
+ }
+ 
++static int ath11k_get_peer_count(struct rhashtable *ht)
++{
++	struct rhashtable_iter iter;
++	struct rhash_head *pos;
++	int count = 0;
++
++	rhashtable_walk_enter(ht, &iter);
++	rhashtable_walk_start(&iter);
++
++	while ((pos = rhashtable_walk_next(&iter))) {
++		if (IS_ERR(pos)) {
++			if (PTR_ERR(pos) == -EAGAIN)
++				continue;   // retry due to resize
++			break;          // some other error
++		}
++		count++;
++	}
++
++	rhashtable_walk_stop(&iter);
++	rhashtable_walk_exit(&iter);
++
++	return count;
++}
++
++
+ int ath11k_peer_create(struct ath11k *ar, struct ath11k_vif *arvif,
+ 		       struct ieee80211_sta *sta, struct peer_create_params *param)
+ {
+@@ -941,13 +956,30 @@ int ath11k_peer_create(struct ath11k *ar, struct ath11k_vif *arvif,
+ 	struct ath11k_sta *arsta;
+ 	int ret, fbret;
+ 	u8 vdev_id = 0;
++	int rhash_count;
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+ 
+-	if (ar->num_peers > (ar->max_num_peers - 1)) {
++	// Check for peer count desynchronization
++	// If num_peers is negative or exceeds max_num_peers - 1, recalculate from rhashtable
++	if ((ar->num_peers < 0) || (ar->num_peers > (ar->max_num_peers - 1))) {
++		// This can happen if rhash table and num_peers get out of sync
++		// e.g. during peer delete for some unknown reason
++		// Recalculate num_peers from rhash table
+ 		ath11k_warn(ar->ab,
+-			    "failed to create peer due to insufficient peer entry resource in firmware\n");
+-		return -ENOBUFS;
++			    "failed to create peer due to insufficient peer entry resource in firmware ar->num_peers = %d "
++			    "ar->max_num_peers = %d ar->num_stations = %d\n", ar->num_peers, ar->max_num_peers, ar->num_stations);
++		mutex_lock(&ar->ab->tbl_mtx_lock);
++		spin_lock_bh(&ar->ab->base_lock);
++		rhash_count = ath11k_get_peer_count(ar->ab->rhead_peer_addr);
++		spin_unlock_bh(&ar->ab->base_lock);
++		mutex_unlock(&ar->ab->tbl_mtx_lock);
++		if (rhash_count > ar->max_num_peers -1 ) {
++			ath11k_warn(ar->ab,
++				"rhash_count %d exceeds max_num_peers %d\n", rhash_count, ar->max_num_peers);
++			return -ENOBUFS;
++		}
++		ar->num_peers = rhash_count;
+ 	}
+ 
+ 	mutex_lock(&ar->ab->tbl_mtx_lock);
+-- 
+2.34.1
+
