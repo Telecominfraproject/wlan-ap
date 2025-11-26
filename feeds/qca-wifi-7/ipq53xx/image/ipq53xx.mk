@@ -217,3 +217,15 @@ define Device/asterfusion_ap7330
   DEVICE_PACKAGES := ath12k-wifi-asterfusion-ap7330 ath12k-firmware-qcn92xx ath12k-firmware-ipq5332
 endef
 TARGET_DEVICES += asterfusion_ap7330
+
+define Device/cig_wf672b
+  DEVICE_TITLE := CIG WF672B
+  DEVICE_DTS := ipq5332-cig-wf672b
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_DTS_CONFIG := config@mi01.6
+  IMAGES := sysupgrade.tar mmc-factory.bin
+  IMAGE/mmc-factory.bin := append-ubi | qsdk-ipq-factory-mmc
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+  DEVICE_PACKAGES := ath12k-wifi-cig-wf672b ath12k-firmware-ipq5332 ath12k-firmware-qcn92xx
+endef
+TARGET_DEVICES += cig_wf672b
