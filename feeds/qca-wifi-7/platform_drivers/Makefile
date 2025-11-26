@@ -759,3 +759,18 @@ define KernelPackage/iio-ilps22qs/description
 endef
 
 $(eval $(call KernelPackage,iio-ilps22qs))
+
+define KernelPackage/pcie_mhi
+  SUBMENU:=$(WWAN_MENU)
+  TITLE:= PCIE MHI driver
+  DEPENDS+=@TARGET_ipq53xx
+  KCONFIG:=CONFIG_PCIE_MHI_QUECTEL
+  FILES:=$(LINUX_DIR)/drivers/net/wwan/pcie_mhi/pcie_mhi.ko
+  AUTOLOAD:=$(call AutoProbe,pcie_mhi)
+endef
+
+define KernelPackage/pcie_mhi/description
+  PCIE MHI driver
+endef
+
+$(eval $(call KernelPackage,pcie_mhi))
