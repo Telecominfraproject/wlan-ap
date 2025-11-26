@@ -147,6 +147,7 @@ platform_do_upgrade() {
 		fi
 		nand_upgrade_tar "$1"
 		;;
+	cig,wf672b|\
 	cig,wf672)
 		spi_nor_emmc_do_upgrade_bootconfig $1
 		;;
