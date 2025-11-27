@@ -6,286 +6,81 @@
 #include <linux/ip.h>
 #include <linux/udp.h>
 #include <net/if.h>
-#include <netinet/in.h>
+
 #include <pcap.h>
 #include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+
 #include <sys/socket.h>
 #include <syslog.h>
 #include <unistd.h>
+#include <uci.h>
 
 #include "udhcpinject.h"
 
-#define MAX_INTERFACES 48
-#define MAX_PORTS 8
-
-// Global variables
-struct iface_info *iface_map = NULL;
-static struct port_info *ports = NULL;
-int iface_count = 0;
-int port_count = 0;
-int total_iface = 0;
-static pcap_t *handle = NULL;
-static char *provided_ssids = NULL;
-static char *provided_ports = NULL;
-
-// Function to cleanup tc rules
-void cleanup_tc() {
-    char cmd[1024];
-    for (int i = 0; i < iface_count; i++) {
-        snprintf(cmd, sizeof(cmd), "tc filter del dev %s ingress pref 32 2>/dev/null",
-                 iface_map[i].iface);
-        system(cmd);
-    }
-}
-
 // Cleanup function
-void cleanup() {
+void cleanup()
+{
     syslog(LOG_INFO, "Cleaning up resources...\n");
-    cleanup_tc();
 
-    if (handle) {
+    if (handle)
+    {
         pcap_close(handle);
         handle = NULL;
     }
-    if (ports) {
-        for (int i = 0; i < port_count; i++) {
-            if (ports[i].sock >= 0) {
-                close(ports[i].sock);
-            }
+
+    if (iface_map)
+    {
+        char cmd[1024];
+        for (int i = 0; i < iface_map_size; i++)
+        {
+            snprintf(cmd, sizeof(cmd), "tc filter del dev %s ingress pref 32 2>/dev/null",
+                     iface_map[i].iface);
+            system(cmd);
         }
-        free(ports);
-        ports = NULL;
-        port_count = 0;
-    }
-    if (iface_map) {
         free(iface_map);
-        iface_map = NULL;
-        iface_count = 0;
     }
-    if (provided_ssids) {
-        free(provided_ssids);
-        provided_ssids = NULL;
+
+    if (port_map)
+    {
+        for (int i = 0; i < port_map_size; i++)
+        {
+            close(port_map[i].sock);
+        }
+        free(port_map);
     }
-    if (provided_ports) {
-        free(provided_ports);
-        provided_ports = NULL;
-    }
+
     syslog(LOG_INFO, "Cleanup complete.\n");
 }
 
-// Function to parse SSIDs and populate iface_map
-int parse_ssids(const char *ssids) {
-    if (iface_map) {
-        free(iface_map);
-        iface_map = NULL;
-        iface_count = 0;
-    }
+int setup_tc()
+{
+    char cmd[512];
 
-    // Create a set of provided SSIDs for efficient lookup
-    char ssids_copy[256];
-    strncpy(ssids_copy, ssids, sizeof(ssids_copy) - 1);
-    ssids_copy[sizeof(ssids_copy) - 1] = '\0';
-
-    // Count number of SSIDs for allocation
-    int ssid_count = 1; // Start at 1 for first SSID
-    for (int i = 0; ssids_copy[i]; i++) {
-        if (ssids_copy[i] == ',')
-            ssid_count++;
-    }
-
-    char **ssid_set = malloc(ssid_count * sizeof(char *));
-    if (!ssid_set) {
-        syslog(LOG_ERR, "Failed to allocate memory for SSID set\n");
-        return -1;
-    }
-
-    int ssid_idx = 0;
-    char *token = strtok(ssids_copy, ",");
-    while (token) {
-        ssid_set[ssid_idx++] = token;
-        token = strtok(NULL, ",");
-    }
-
-    // Execute iwinfo command and capture output
-    FILE *pipe = popen("iwinfo | grep wlan -A1 | grep -v \"^--\" | tr -d '\"' "
-                       "| awk '/wlan/ {name=$1; essid=$3} /Access Point/ "
-                       "{print name \"=\" essid \",\" $3}' | tr -d ':'",
-                       "r");
-    if (!pipe) {
-        syslog(LOG_ERR, "Failed to execute iwinfo command\n");
-        free(ssid_set);
-        return -1;
-    }
-
-    char line[256];
-    while (fgets(line, sizeof(line), pipe) != NULL) {
-        // Remove trailing newline
-        line[strcspn(line, "\n")] = 0;
-
-        // Parse line format: wlanX=SSID,BSSID
-        char *iface = strtok(line, "=");
-        char *rest = strtok(NULL, "=");
-        if (!iface || !rest)
-            continue;
-
-        char *essid = strtok(rest, ",");
-        char *bssid = strtok(NULL, ",");
-        if (!essid || !bssid)
-            continue;
-
-        // Check if this SSID is in our provided set
-        int match = 0;
-        for (int i = 0; i < ssid_idx; i++) {
-            if (strcmp(essid, ssid_set[i]) == 0) {
-                match = 1;
-                break;
-            }
-        }
-
-        if (!match)
-            continue;
-
-        // Add matching interface to iface_map
-        if (iface_count >= MAX_INTERFACES) {
-            syslog(LOG_ERR, "Too many matching interfaces, max is %d\n",
-                   MAX_INTERFACES);
-            pclose(pipe);
-            free(ssid_set);
-            return -1;
-        }
-
-        iface_map =
-            realloc(iface_map, (iface_count + 1) * sizeof(struct iface_info));
-        if (!iface_map) {
-            syslog(LOG_ERR, "Failed to reallocate iface_map\n");
-            pclose(pipe);
-            free(ssid_set);
-            return -1;
-        }
-
-        struct iface_info *info = &iface_map[iface_count];
-        info->serial = iface_count + 1;
-
-        strncpy(info->iface, iface, LEN_IFACE);
-        info->iface[LEN_IFACE] = '\0';
-
-        strncpy(info->essid, essid, LEN_ESSID);
-        info->essid[LEN_ESSID] = '\0';
-
-        strncpy(info->bssid, bssid, LEN_BSSID);
-        info->bssid[LEN_BSSID] = '\0';
-
-        iface_count++;
-    }
-
-    int pipe_status = pclose(pipe);
-    if (pipe_status == -1) {
-        syslog(LOG_ERR, "Error closing iwinfo pipe: %s\n", strerror(errno));
-    }
-
-    free(ssid_set);
-
-    if (iface_count == 0) {
-        syslog(LOG_ERR, "No matching interfaces found for provided SSIDs\n");
-        return -1;
-    }
-
-    if (iface_count != total_iface) {
-        syslog(LOG_ERR, "Expect %d but only %d interfaces were found.\n", total_iface, iface_count);
-        return -1;
-    }
-
-    syslog(LOG_INFO, "Found %d matching interfaces\n", iface_count);
-    return 0;
-}
-
-int parse_ports(const char *port_list) {
-    if (ports) {
-        for (int i = 0; i < port_count; i++) {
-            if (ports[i].sock >= 0) {
-                close(ports[i].sock);
-            }
-        }
-        free(ports);
-        ports = NULL;
-        port_count = 0;
-    }
-
-    char ports_copy[256];
-    strncpy(ports_copy, port_list, sizeof(ports_copy) - 1);
-    ports_copy[sizeof(ports_copy) - 1] = '\0';
-
-    port_count = 1;
-    for (int i = 0; ports_copy[i]; i++) {
-        if (ports_copy[i] == ',') {
-            port_count++;
-        }
-    }
-
-    if (port_count > MAX_PORTS) {
-        syslog(LOG_ERR, "Too many ports specified, maximum is %d\n", MAX_PORTS);
-        return -1;
-    }
-
-    ports = calloc(port_count, sizeof(struct port_info));
-    if (!ports) {
-        syslog(LOG_ERR, "Failed to allocate memory for ports\n");
-        return -1;
-    }
-
-    char *token = strtok(ports_copy, ",");
-    int idx = 0;
-    while (token && idx < port_count) {
-        strncpy(ports[idx].name, token, LEN_IFACE);
-        ports[idx].name[LEN_IFACE] = '\0';
-
-        ports[idx].sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-        if (ports[idx].sock < 0) {
-            syslog(LOG_ERR, "Socket creation failed for %s: %s\n",
-                   ports[idx].name, strerror(errno));
-            return -1;
-        }
-
-        ports[idx].ifindex = if_nametoindex(ports[idx].name);
-        if (ports[idx].ifindex == 0) {
-            syslog(LOG_ERR, "Failed to get interface index for %s: %s\n",
-                   ports[idx].name, strerror(errno));
-            return -1;
-        }
-
-        token = strtok(NULL, ",");
-        idx++;
-    }
-
-    syslog(LOG_INFO, "Configured %d ports for forwarding\n", port_count);
-    return 0;
-}
-
-int setup_tc() {
-    char cmd[1024];
-
+    // check if ifb-inject exists, if not create it
     snprintf(cmd, sizeof(cmd), "ip link show ifb-inject >/dev/null 2>&1");
-    if (system(cmd) != 0) {
+    if (system(cmd) != 0)
+    {
         snprintf(cmd, sizeof(cmd),
                  "ip link add name ifb-inject type ifb && ip link set "
                  "ifb-inject up");
-        if (system(cmd) != 0) {
+        if (system(cmd) != 0)
+        {
             syslog(LOG_ERR, "Failed to setup ifb-inject\n");
             return -1;
         }
     }
 
-    for (int i = 0; i < iface_count; i++) {
-        snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s ingress 2>/dev/null 1>2", 
-            iface_map[i].iface);
+    for (int i = 0; i < iface_map_size; i++)
+    {
+        snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s ingress 2>/dev/null 1>2",
+                 iface_map[i].iface);
         int result = system(cmd);
-        if (result == 2) {
+        if (result == 2)
+        {
             syslog(LOG_INFO, "Ingress qdisc already exists for %s\n", iface_map[i].iface);
         }
-        else if (result == 1) {
+        else if (result == 1)
+        {
             syslog(LOG_ERR, "Failed to add qdisc for %s\n", iface_map[i].iface);
             return -1;
         }
@@ -300,7 +95,8 @@ int setup_tc() {
                  "action mirred egress mirror dev ifb-inject pipe "
                  "action drop",
                  iface_map[i].iface, iface_map[i].serial);
-        if (system(cmd) != 0) {
+        if (system(cmd) != 0)
+        {
             syslog(LOG_ERR, "Failed to setup tc for %s\n", iface_map[i].iface);
             return -1;
         }
@@ -308,82 +104,172 @@ int setup_tc() {
     return 0;
 }
 
-// Signal handler
-void signal_handler(int sig) {
-    if (sig == SIGTERM) {
-        syslog(LOG_INFO, "Received SIGTERM, cleaning up...\n");
-        cleanup();
-        exit(0);
-    } else if (sig == SIGHUP) {
-        syslog(LOG_INFO, "Received reload signal, reconfiguring...\n");
-        // Clean up existing resources
-        cleanup_tc();
-        
-        // Free old SSIDs and get new ones
-        if (provided_ssids) {
-            free(provided_ssids);
-        }
-        provided_ssids = getenv("SSIDs");
-        if (!provided_ssids) {
-            syslog(LOG_ERR, "No SSIDs provided on reload\n");
-            return;
-        }
-        
-        // Reload SSIDs
-        if (parse_ssids(provided_ssids) != 0) {
-            syslog(LOG_ERR, "Failed to reload SSIDs configuration\n");
-            return;
-        }
-        
-        // Free old ports and get new ones
-        if (provided_ports) {
-            free(provided_ports);
-        }
-        provided_ports = getenv("PORTs");
-        if (!provided_ports) {
-            syslog(LOG_ERR, "No PORTs provided on reload\n");
-            return;
-        }
-        
-        // Close existing sockets and reopen with new config
-        if (ports) {
-            for (int i = 0; i < port_count; i++) {
-                if (ports[i].sock >= 0) {
-                    close(ports[i].sock);
+int parse_iwinfo_by_essid(struct iface_info *iface)
+{
+    char cmd[256];
+    FILE *fp;
+    char output[128];
+    char *line;
+
+    snprintf(cmd, sizeof(cmd), IWINFO_CMD, iface->essid, iface->frequency);
+
+    fp = popen(cmd, "r");
+    if (fp == NULL)
+    {
+        syslog(LOG_ERR, "Failed to execute command: %s\n", cmd);
+        return 1;
+    }
+
+    // Read the first line (interface name)
+    line = fgets(output, sizeof(output), fp);
+    if (line)
+    {
+        output[strcspn(output, "\n")] = '\0'; // Remove trailing newline
+        snprintf(iface->iface, LEN_IFACE + 1, output);
+    }
+    else
+    {
+        return 1;
+    }
+
+    // Read the second line (BSSID)
+    line = fgets(output, sizeof(output), fp);
+    if (line)
+    {
+        output[strcspn(output, "\n")] = '\0'; // Remove trailing newline
+        snprintf(iface->bssid, LEN_BSSID + 1, output);
+    }
+    else
+    {
+        return 1;
+    }
+
+    // Close the pipe
+    pclose(fp);
+    return 0;
+}
+
+void add_iface_info(const char *essid, const char *upstream, const char *freq, int serial)
+{
+    iface_map = realloc(iface_map, (iface_map_size + 1) * sizeof(struct iface_info));
+    if (!iface_map)
+    {
+        syslog(LOG_ERR, "Memory allocation failed\n");
+        exit(1);
+    }
+    struct iface_info *info = &iface_map[iface_map_size];
+    memset(info, 0, sizeof(struct iface_info));
+    // use snprintf to copy essid to info->essid
+    snprintf(info->essid, LEN_ESSID + 1, essid);
+    snprintf(info->upstream, LEN_IFACE + 1, upstream);
+    snprintf(info->frequency, 2, freq);
+    info->serial = serial;
+    iface_map_size++;
+}
+
+int parse_uci_config()
+{
+    struct uci_context *ctx = uci_alloc_context();
+    if (!ctx)
+    {
+        syslog(LOG_ERR, "Failed to allocate UCI context\n");
+        return 1;
+    }
+
+    struct uci_package *pkg = NULL;
+    if (uci_load(ctx, CONFIG_PATH, &pkg) != UCI_OK)
+    {
+        syslog(LOG_ERR, "Failed to load UCI config\n");
+        uci_free_context(ctx);
+        return 1;
+    }
+
+    int serial = 1;
+    struct uci_element *e;
+    uci_foreach_element(&pkg->sections, e)
+    {
+        struct uci_section *s = uci_to_section(e);
+        if (!strcmp(s->type, "network"))
+        {
+            const char *upstream = uci_lookup_option_string(ctx, s, "upstream");
+            if (!upstream)
+                continue;
+            syslog(LOG_INFO, "Processing ssids with upstream %s", upstream);
+            struct uci_option *opt, *opt2;
+
+            opt = uci_lookup_option(ctx, s, "freq");
+            if (opt && opt->type == UCI_TYPE_LIST)
+            {
+                struct uci_element *i;
+                char *freq_type = NULL;
+                uci_foreach_element(&opt->v.list, i)
+                {
+                    // parse 6G ifaces
+                    if (!strcmp(i->name, "6G"))
+                    {
+                        opt2 = uci_lookup_option(ctx, s, "ssid6G");
+                        freq_type = "6";
+                    }
+                    // parse 5G ifaces
+                    else if (!strcmp(i->name, "5G"))
+                    {
+                        opt2 = uci_lookup_option(ctx, s, "ssid5G");
+                        freq_type = "5";
+                    }
+                    // parse 2G ifaces
+                    else if (!strcmp(i->name, "2G"))
+                    {
+                        opt2 = uci_lookup_option(ctx, s, "ssid2G");
+                        freq_type = "2";
+                    }
+
+                    if (opt2 && opt2->type == UCI_TYPE_LIST)
+                    {
+                        struct uci_element *i;
+                        uci_foreach_element(&opt2->v.list, i)
+                        {
+                            add_iface_info(i->name, upstream, freq_type, serial++);
+                        }
+                    }
                 }
             }
-            free(ports);
-            ports = NULL;
-            port_count = 0;
-        }
-        
-        // Reload ports
-        if (parse_ports(provided_ports) != 0) {
-            syslog(LOG_ERR, "Failed to reload ports configuration\n");
-            return;
-        }
-        
-        // Reapply tc rules
-        if (setup_tc() == 0) {
-            syslog(LOG_INFO, "Reloaded with SSIDs: %s and Ports: %s\n",
-                   provided_ssids, provided_ports);
-        } else {
-            syslog(LOG_ERR, "Failed to reload tc configuration\n");
+
+            // initialize socket to upstream interface, say "up0v0"
+            port_map = realloc(port_map, (port_map_size + 1) * sizeof(struct port_info));
+            int sock = socket(AF_PACKET, SOCK_RAW, 0);
+            if (sock < 0)
+            {
+                syslog(LOG_ERR, "Failed to create socket for %s\n", upstream);
+                continue;
+            }
+
+            // Get interface index
+            int ifindex = if_nametoindex(upstream);
+            if (ifindex == 0)
+            {
+                syslog(LOG_ERR, "Failed to get ifindex for %s\n", upstream);
+                close(sock);
+            }
+
+            // Store in port_map
+            snprintf(port_map[port_map_size].name, LEN_IFACE + 1, upstream);
+            port_map[port_map_size].sock = sock;
+            port_map[port_map_size].ifindex = ifindex;
+            port_map_size++;
+            syslog(LOG_INFO, "Initialized socket for upstream interface %s", upstream);
         }
     }
+
+    uci_free_context(ctx);
+    return 0;
 }
 
-char *get_hostname() {
-    static char hostname[256];
-    if (gethostname(hostname, sizeof(hostname)) != 0) {
-        strcpy(hostname, "unknown");
-    }
-    return hostname;
-}
-
-struct iface_info *find_iface_info_by_vlan(int vlan_id) {
-    for (int i = 0; i < iface_count; i++) {
-        if (iface_map[i].serial == vlan_id) {
+struct iface_info *find_iface_info_by_vlan(int vlan_id)
+{
+    for (int i = 0; i < iface_map_size; i++)
+    {
+        if (iface_map[i].serial == vlan_id)
+        {
             return &iface_map[i];
         }
     }
@@ -391,13 +277,15 @@ struct iface_info *find_iface_info_by_vlan(int vlan_id) {
 }
 
 void process_packet(unsigned char *user, const struct pcap_pkthdr *header,
-                    const unsigned char *packet) {
+                    const unsigned char *packet)
+{
     int orig_len = header->len;
     struct ethhdr *eth = (struct ethhdr *)packet;
     int vlan_id = -1;
     int eth_offset = sizeof(struct ethhdr);
 
-    if (ntohs(eth->h_proto) != ETH_P_8021Q) {
+    if (ntohs(eth->h_proto) != ETH_P_8021Q)
+    {
         syslog(LOG_DEBUG,
                "No VLAN header found in packet (EtherType: 0x%04x)\n",
                ntohs(eth->h_proto));
@@ -409,10 +297,13 @@ void process_packet(unsigned char *user, const struct pcap_pkthdr *header,
     eth_offset += sizeof(struct vlan_hdr);
 
     struct iface_info *info = find_iface_info_by_vlan(vlan_id);
-    if (!info) {
+    if (!info)
+    {
         syslog(LOG_ERR, "No interface info found for VLAN ID %d\n", vlan_id);
         return;
     }
+
+    syslog(LOG_INFO, "Received dhcp packet with vlan id %d from iface %s of length: %d", vlan_id, info->iface, header->len);
 
     char *hostname = get_hostname();
     int circuit_id_len = strlen(info->bssid) + 1 + strlen(info->essid);
@@ -429,13 +320,16 @@ void process_packet(unsigned char *user, const struct pcap_pkthdr *header,
     int dhcp_len = ntohs(udp->len) - sizeof(struct udphdr);
 
     int options_end = -1;
-    for (int i = dhcp_len - 1; i >= 0; i--) {
-        if (dhcp_start[i] == 0xFF) { // End option
+    for (int i = dhcp_len - 1; i >= 0; i--)
+    {
+        if (dhcp_start[i] == 0xFF)
+        { // End option
             options_end = i;
             break;
         }
     }
-    if (options_end == -1) {
+    if (options_end == -1)
+    {
         syslog(LOG_DEBUG, "Could not find DHCP options end tag\n");
         return;
     }
@@ -445,7 +339,8 @@ void process_packet(unsigned char *user, const struct pcap_pkthdr *header,
     int orig_options_len = options_end;
     int new_len = orig_len - 4 - 1 + opt82_len + 1;
     unsigned char *new_packet = malloc(new_len);
-    if (!new_packet) {
+    if (!new_packet)
+    {
         syslog(LOG_ERR, "Failed to allocate memory for new packet\n");
         return;
     }
@@ -501,10 +396,12 @@ void process_packet(unsigned char *user, const struct pcap_pkthdr *header,
     new_ip->check = 0;
     unsigned int sum = 0;
     unsigned short *ip_ptr = (unsigned short *)new_ip;
-    for (int i = 0; i < ip->ihl * 2; i++) {
+    for (int i = 0; i < ip->ihl * 2; i++)
+    {
         sum += *ip_ptr++;
     }
-    while (sum >> 16) {
+    while (sum >> 16)
+    {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     new_ip->check = ~sum;
@@ -524,13 +421,16 @@ void process_packet(unsigned char *user, const struct pcap_pkthdr *header,
     unsigned char *udp_start = (unsigned char *)new_udp;
     int udp_total_len = ntohs(new_udp->len);
     unsigned short *udp_ptr = (unsigned short *)udp_start;
-    for (int i = 0; i < udp_total_len / 2; i++) {
+    for (int i = 0; i < udp_total_len / 2; i++)
+    {
         sum += *udp_ptr++;
     }
-    if (udp_total_len % 2) {
+    if (udp_total_len % 2)
+    {
         sum += *(unsigned char *)udp_ptr;
     }
-    while (sum >> 16) {
+    while (sum >> 16)
+    {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     new_udp->check = ~sum;
@@ -542,92 +442,91 @@ void process_packet(unsigned char *user, const struct pcap_pkthdr *header,
     socket_address.sll_family = AF_PACKET;
     socket_address.sll_protocol = htons(ETH_P_ALL);
 
-    for (int i = 0; i < port_count; i++) {
-        socket_address.sll_ifindex = ports[i].ifindex;
-        
-        if (sendto(ports[i].sock, new_packet, new_len, 0,
-                  (struct sockaddr *)&socket_address,
-                  sizeof(socket_address)) < 0) {
-            syslog(LOG_ERR, "Failed to send packet to %s: %s\n",
-                   ports[i].name, strerror(errno));
-        } else {
-            syslog(LOG_DEBUG,
-                   "Successfully forwarded packet to %s (new length: %d)\n",
-                   ports[i].name, new_len);
+    for (int i = 0; i < port_map_size; i++)
+    {
+        if (!strcmp(info->upstream, port_map[i].name))
+        {
+            socket_address.sll_ifindex = port_map[i].ifindex;
+            if (sendto(port_map[i].sock, new_packet, new_len, 0, (struct sockaddr *)&socket_address,
+                       sizeof(socket_address)) < 0)
+            {
+                syslog(LOG_ERR, "Failed to send packet to %s: %s\n",
+                       info->upstream, strerror(errno));
+            }
+            else
+            {
+                syslog(LOG_INFO,
+                       "Successfully forwarded packet to %s (new length: %d)\n",
+                       info->upstream, new_len);
+            }
+            break;
         }
     }
 
     free(new_packet);
 }
 
-int main(int argc, char *argv[]) {
+void signal_handler(int sig)
+{
+    switch (sig)
+    {
+    case SIGTERM:
+    case SIGHUP:
+        cleanup();
+        break;
+    default:
+        break;
+    }
+}
+
+int main(int argc, char *argv[])
+{
     openlog("dhcp_inject:", LOG_PID | LOG_CONS, LOG_DAEMON);
 
     signal(SIGTERM, signal_handler);
     signal(SIGHUP, signal_handler);
 
-    // Read IFACEs from environment variable
-    char *iface_env = getenv("IFACEs");
-    if (!iface_env) {
-        syslog(LOG_ERR, "No IFACEs provided. Exiting...\n");
-        cleanup();
-        return 1;
-    }
-    total_iface = atoi(iface_env);
-    if (total_iface <= 0) {
-        syslog(LOG_ERR, "Invalid IFACEs value: %s. Exiting...\n", iface_env);
+    if (parse_uci_config() != 0)
+    {
+        syslog(LOG_ERR, "Failed to parse UCI configuration\n");
         cleanup();
         return 1;
     }
 
-    provided_ssids = getenv("SSIDs");
-    syslog(LOG_INFO, "Provided SSIDs: %s\n", provided_ssids);
-    if (!provided_ssids && argc > 1) {
-        provided_ssids = strdup(argv[1]);
-    }
-    if (!provided_ssids) {
-        syslog(LOG_ERR, "No SSIDs provided. Exiting...\n");
-        return 1;
-    }
-
-    provided_ports = getenv("PORTs");
-    syslog(LOG_INFO, "Provided PORTs: %s\n", provided_ports);
-    if (!provided_ports) {
-        syslog(LOG_ERR, "No PORTs provided. Exiting...\n");
-        cleanup();
-        return 1;
+    for (int i = 0; i < iface_map_size; i++)
+    {
+        if (parse_iwinfo_by_essid(&iface_map[i]) != 0)
+        {
+            syslog(LOG_ERR, "Failed to get iface info for ESSID: %s\n", iface_map[i].essid);
+            cleanup();
+            return 1;
+        }
+        else
+        {
+            syslog(LOG_INFO, "iface_info[%d]: iface='%s', freq='%s', essid='%s', bssid='%s', upstream='%s', serial=%d\n",
+                   i, iface_map[i].iface, iface_map[i].frequency, iface_map[i].essid, iface_map[i].bssid,
+                   iface_map[i].upstream, iface_map[i].serial);
+        }
     }
 
-    if (parse_ssids(provided_ssids) != 0) {
-        syslog(LOG_ERR, "Failed to parse SSIDs\n");
-        cleanup();
-        return 1;
-    }
-
-    if (parse_ports(provided_ports) != 0) {
-        syslog(LOG_ERR, "Failed to parse ports\n");
-        cleanup();
-        return 1;
-    }
-
-    if (setup_tc() != 0) {
+    if (setup_tc() != 0)
+    {
         syslog(LOG_ERR, "Setup failed\n");
         cleanup();
         return 1;
     }
 
-    syslog(LOG_INFO, "Setup complete for SSIDs: %s and Ports: %s\n",
-           provided_ssids, provided_ports);
-
     char errbuf[PCAP_ERRBUF_SIZE];
     handle = pcap_open_live("ifb-inject", BUFSIZ, 1, 1000, errbuf);
-    if (handle == NULL) {
+    if (handle == NULL)
+    {
         syslog(LOG_ERR, "Couldn't open device ifb-inject: %s\n", errbuf);
         cleanup();
         return 1;
     }
 
-    if (pcap_loop(handle, -1, process_packet, NULL) < 0) {
+    if (pcap_loop(handle, -1, process_packet, NULL) < 0)
+    {
         syslog(LOG_ERR, "pcap_loop failed: %s\n", pcap_geterr(handle));
         cleanup();
         return 1;

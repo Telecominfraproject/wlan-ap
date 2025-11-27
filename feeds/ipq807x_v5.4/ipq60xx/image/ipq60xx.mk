@@ -92,7 +92,7 @@ define Device/indio_um-310ax-v1
   SUPPORTED_DEVICES := indio,um-310ax-v1
   DEVICE_PACKAGES := ath11k-wifi-indio-um-310ax-v1 uboot-env
 endef
-#TARGET_DEVICES += indio_um-310ax-v1
+TARGET_DEVICES += indio_um-310ax-v1
 
 define Device/indio_um-510axp-v1
   DEVICE_TITLE := Indio UM-510AXP V1

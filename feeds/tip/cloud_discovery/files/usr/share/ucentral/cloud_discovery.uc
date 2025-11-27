@@ -5,8 +5,8 @@ import * as fs from 'fs';
 
 let cmd = ARGV[0];
 let ifname = getenv("interface");
-let opt138 = getenv("opt138");
-let opt224 = getenv("opt224");
+let opt138 = fs.readfile('/tmp/dhcp-option-138');
+let opt224 = fs.readfile('/tmp/dhcp-option-224');
 
 if (cmd != 'bound' && cmd != 'renew')
 	exit(0);
@@ -23,14 +23,14 @@ let cloud = {
 	lease: true,
 };
 if (opt138) {
-	let dhcp = hexdec(opt138);
+	let dhcp = opt138;
 	dhcp = split(dhcp, ':');
 	cloud.dhcp_server = dhcp[0];
 	cloud.dhcp_port = dhcp[1] ?? 15002;
 	cloud.no_validation = true;
 }
 if (opt224) {
-	let dhcp = hexdec(opt224);
+	let dhcp = opt224;
 	dhcp = split(dhcp, ':');
 	cloud.dhcp_server = dhcp[0];
 	cloud.dhcp_port = dhcp[1] ?? 15002;

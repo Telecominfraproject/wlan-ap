@@ -87,7 +87,7 @@ def setup_tree():
 		for patch in patches:
 			run(["git", "am", "-3", str(base_dir / patch)], check=True)
 		run(
-			["ln", "-s", profiles, "profiles"], check=True,
+			["ln", "-rs", profiles, "profiles"], check=True,
 		)
 		print("### Patches done")
 	except:
