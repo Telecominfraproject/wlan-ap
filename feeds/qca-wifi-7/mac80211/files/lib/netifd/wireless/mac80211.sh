@@ -519,15 +519,16 @@ mac80211_hostapd_setup_base() {
 		append base_cfg "he_mu_edca_ac_vo_ecwmax=7" "$N"
 		append base_cfg "he_mu_edca_ac_vo_timer=255" "$N"
 	fi
+	
+	[ "$band" = 6g ] && multiple_bssid=1
 
-	if [ "$enable_be" != "0" ]; then
-		append base_cfg "ieee80211be=1" "$N"
-		[ "$band" = 6g ] && multiple_bssid=1
-		[ "$hwmode" = "a" ] && {
-			append base_cfg "eht_oper_chwidth=$eht_oper_chwidth" "$N"
-			append base_cfg "eht_oper_centr_freq_seg0_idx=$eht_center_seg0" "$N"
-		}
-	fi
+        if [ "$enable_be" != "0" ]; then
+                append base_cfg "ieee80211be=1" "$N"
+                [ "$hwmode" = "a" ] && {
+                        append base_cfg "eht_oper_chwidth=$eht_oper_chwidth" "$N"
+                        append base_cfg "eht_oper_centr_freq_seg0_idx=$eht_center_seg0" "$N"
+                }
+        fi
 
 	hostapd_prepare_device_config "$hostapd_conf_file" nl80211
 	cat >> "$hostapd_conf_file" <<EOF
