@@ -108,6 +108,11 @@ $(call Package/ath12k-wifi-default)
     TITLE:=board-2.bin for WF672
 endef
 
+define Package/ath12k-wifi-asterfusion-ap7330
+$(call Package/ath12k-wifi-default)
+	TITLE:=board.bin for Asterfusion AP7330
+endef
+
 define Package/ath12k-wifi-cig-wf189/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
@@ -223,6 +228,13 @@ define Package/ath12k-wifi-cig-wf672/install
 	$(INSTALL_DATA) ./board-2.bin.wf672-us.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin.US
 endef
 
+define Package/ath12k-wifi-asterfusion-ap7330/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
+	$(INSTALL_DATA) ./board-2.bin.ap7330.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin
+	$(INSTALL_DATA) ./board-2.bin.ap7330.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin
+endef
+
 $(eval $(call BuildPackage,ath12k-wifi-cig-wf189))
 $(eval $(call BuildPackage,ath12k-wifi-edgecore-eap105))
 $(eval $(call BuildPackage,ath12k-wifi-emplus-wap7635))
@@ -238,3 +250,4 @@ $(eval $(call BuildPackage,ath12k-wifi-zyxel-nwa130be))
 $(eval $(call BuildPackage,ath12k-wifi-zyxel-nwa50be))
 $(eval $(call BuildPackage,ath12k-wifi-zyxel-nwa210be))
 $(eval $(call BuildPackage,ath12k-wifi-cig-wf672))
+$(eval $(call BuildPackage,ath12k-wifi-asterfusion-ap7330))
