@@ -364,9 +364,9 @@ function switch_status_check(iface, dfs_enabled_5g_flag) {
         let cac_time = trim(_cac_time.read('all'));
         _cac_time.close();
 
-        // if cac_time is a valid number, set timer to cac_time + 5 seconds
+        // if cac_time is a valid number, set timer to cac_time + 10 seconds
         if (cac_time > 0 && match(cac_time, /^[0-9]+$/)) {
-            timer = int(cac_time) + 5;
+            timer = int(cac_time) + 10;
         }
 
         while (p < timer) {
@@ -537,7 +537,7 @@ function get_chan_util(radio_band, sleep_time) {
     return chan_util;
 }
 
-function random_channel_selection(iface, band, htmode, chan_list_valid) {
+function random_channel_selection(iface, band, htmode, chan_list_valid, exclude_dfs) {
     let math = require('math');
     let bw = replace(htmode, /[^0-9]/g, '');
     let iface_num = replace(iface, /[^0-9]/g, '');
@@ -547,7 +547,9 @@ function random_channel_selection(iface, band, htmode, chan_list_valid) {
     }
 
     // channel list from the driver based on the country code
-    let chan_list_cc = global.phy.phys[phy_id].channels;
+    let chan_list_cc = uniq(sort(global.phy.phys[phy_id].channels, (a, b) => a - b));
+    // DFS channel list from the driver
+    let dfs_chan_list = global.phy.phys[phy_id].dfs_channels || [];
     // complete channel list
     let chan_list_default = {};
     // allowed channel list to select random channel from
@@ -555,6 +557,7 @@ function random_channel_selection(iface, band, htmode, chan_list_valid) {
 
     let chan_list_init = [];
     let chan_list_legal = [];
+    let _chan_list_legal = [];
 
     ulog_info(`[%s] Channel list from the driver = %s \n`, iface, chan_list_cc);
     ulog_info(`[%s] Selected channel list from config (default channel list shall be used in case channels haven't been selected) = %s \n`, iface, (chan_list_valid || '[]'));
@@ -663,9 +666,29 @@ function random_channel_selection(iface, band, htmode, chan_list_valid) {
 
     if (band == '5g' && (bw == "80" || bw == "40")) {
         // exclude last channels from the channel list when bw is 80MHz or 40MHz to avoid selecting a channel with a secondary channel that cannot be supported
-        chan_list_legal = slice(chan_list_init, 0, length(chan_list_init)-1) ;
+        _chan_list_legal = slice(chan_list_init, 0, length(chan_list_init)-1) ;
     } else {
-        chan_list_legal = chan_list_init;
+        _chan_list_legal = chan_list_init;
+    }
+
+    // check if dfs is enabled or disabled for 5G radio; if dfs is disabled, remove dfs channels from chan_list_legal
+    if (band == '5g' && exclude_dfs == true) {
+        ulog_info(`[%s] DFS Channel list from the driver = %s \n`, iface, dfs_chan_list);
+
+        for (let _legal_chan in _chan_list_legal) {
+            let is_dfs_chan = false;
+            for (let dfs_chan in dfs_chan_list) {
+                if (dfs_chan == _legal_chan) {
+                    is_dfs_chan = true;
+                    break;
+                }
+            }
+            if (is_dfs_chan == false) {
+                push(chan_list_legal, _legal_chan);
+            }
+        }
+    } else {
+        chan_list_legal = _chan_list_legal;
     }
 
     if (chan_list_valid) {
@@ -710,13 +733,13 @@ function check_center_channel(chosen_random_channel, current_channel, band, htmo
     return ret;
 }
 
-function algo_rcs(iface, current_channel, band, htmode, selected_channels) {
+function algo_rcs(iface, current_channel, band, htmode, selected_channels, exclude_dfs) {
     let chosen_random_channel = 0;
     let res = 0;
     let same_center_channel = false;
 
     // random_channel_selection script will help to select random channel
-    chosen_random_channel = random_channel_selection(iface, band, htmode, selected_channels);
+    chosen_random_channel = random_channel_selection(iface, band, htmode, selected_channels, exclude_dfs);
     stats_info_write("/tmp/rrm_random_channel_" + iface, chosen_random_channel);
 
     if (chosen_random_channel == current_channel) {
@@ -826,7 +849,7 @@ function channel_optimize() {
 
                 // get radio's uci config
                 htmode[j] = wireless_status[radio_id].config.htmode;
-                acs_exclude_dfs[j] = wireless_status[radio_id].config.acs_exclude_dfs;
+                acs_exclude_dfs[j] = wireless_status[radio_id].config.acs_exclude_dfs || false;
                 channel_config[j] = wireless_status[radio_id].config.channel;
                 selected_channels[j] = wireless_status[radio_id].config.channels;
 
@@ -961,7 +984,7 @@ function channel_optimize() {
                                 let assign_max_chan_util = 0;
 
                                 // call RCS for multiple random chan
-                                let chan_scan = algo_rcs(radio_iface[l], curr_chan_list[num_chan-1], radio_band[l], htmode[l], selected_channels[l]);
+                                let chan_scan = algo_rcs(radio_iface[l], curr_chan_list[num_chan-1], radio_band[l], htmode[l], selected_channels[l], acs_exclude_dfs[l]);
                                 curr_chan_list[num_chan] = stats_info_read("/tmp/rrm_random_channel_" + radio_iface[l]);
 
                                 if (chan_scan == 1) {
