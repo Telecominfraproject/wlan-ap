@@ -66,7 +66,7 @@ define Device/sonicfi_rap630w_311g
   DEVICE_TITLE := Sonicfi RAP630W-311G
   DEVICE_DTS := qcom-ipq5018-rap630w-311g
   SUPPORTED_DEVICES := sonicfi,rap630w-311g
-  DEVICE_PACKAGES := ath11k-wifi-sonicfi-rap630w-311g ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122
+  DEVICE_PACKAGES := ath11k-wifi-sonicfi-rap630w-311g ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122 multiple-country
   DEVICE_DTS_CONFIG := config@mp03.5-c1
   IMAGES := sysupgrade.tar nand-factory.bin nand-factory.ubi
   IMAGE/nand-factory.ubi := append-ubi
