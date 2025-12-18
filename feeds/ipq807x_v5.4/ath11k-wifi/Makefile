@@ -57,8 +57,6 @@ ALLWIFIBOARDS:= \
 	wallys-dr5018 \
 	wallys-dr6018 \
 	wallys-dr6018-v4 \
-	sonicfi-rap630c-311g \
-	sonicfi-rap630w-311g \
 	sonicfi-rap630w-312g \
 	sonicfi-rap650c \
 	sonicfi-rap630e \
@@ -119,6 +117,16 @@ endef
 define Package/ath11k-wifi-cig-wf186h
 $(call Package/ath11k-wifi-default)
     TITLE:=cig-wf186h bdf
+endef
+
+define Package/ath11k-wifi-sonicfi-rap630c-311g
+$(call Package/ath11k-wifi-default)
+    TITLE:=sonicfi-rap630c-311g bdf
+endef
+
+define Package/ath11k-wifi-sonicfi-rap630w-311g
+$(call Package/ath11k-wifi-default)
+    TITLE:=sonicfi-rap630w-311g bdf
 endef
 
 define Package/ath11k-wifi-gl-ax1800
@@ -315,6 +323,20 @@ define Package/ath11k-wifi-cig-wf186h/install
 	$(INSTALL_DATA) ./board-cig-wf186h-ca.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin.CA
 endef
 
+define Package/ath11k-wifi-sonicfi-rap630c-311g/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-sonicfi-rap630c-311g-us.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin.US
+	$(INSTALL_DATA) ./board-sonicfi-rap630c-311g-us.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin.US
+endef
+
+define Package/ath11k-wifi-sonicfi-rap630w-311g/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
+	$(INSTALL_DATA) ./board-sonicfi-rap630w-311g-us.bin.IPQ5018 $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/board.bin.US
+	$(INSTALL_DATA) ./board-sonicfi-rap630w-311g-us.bin.QCN6122 $(1)/lib/firmware/ath11k/qcn6122/hw1.0/board.bin.US
+endef
+
 define Package/ath11k-wifi-optimcloud-d50/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/QCN9074/hw1.0/
@@ -451,8 +473,6 @@ $(eval $(call generate-ath11k-wifi-package,indio-um-335ax,Indio UM-335AX))
 $(eval $(call generate-ath11k-wifi-package,indio-um-345ax,Indio UM-345AX))
 $(eval $(call generate-ath11k-wifi-package,indio-um-525axp,Indio UM-525AXP))
 $(eval $(call generate-ath11k-wifi-package,indio-um-525axm,Indio UM-525AXM))
-$(eval $(call generate-ath11k-wifi-package,sonicfi-rap630c-311g,Sonicfi RAP630C 311G))
-$(eval $(call generate-ath11k-wifi-package,sonicfi-rap630w-311g,Sonicfi RAP630W 311G))
 $(eval $(call generate-ath11k-wifi-package,sonicfi-rap630w-312g,Sonicfi RAP630W 312G))
 $(eval $(call generate-ath11k-wifi-package,sonicfi-rap650c,SonicFi RAP650C))
 $(eval $(call generate-ath11k-wifi-package,sonicfi-rap630e,SonicFi RAP630E))
@@ -476,6 +496,8 @@ $(eval $(call BuildPackage,ath11k-wifi-qcom-qcn9000))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf196))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf186w))
 $(eval $(call BuildPackage,ath11k-wifi-cig-wf186h))
+$(eval $(call BuildPackage,ath11k-wifi-sonicfi-rap630c-311g))
+$(eval $(call BuildPackage,ath11k-wifi-sonicfi-rap630w-311g))
 $(eval $(call BuildPackage,ath11k-wifi-motorola-q14))
 $(eval $(call BuildPackage,ath11k-wifi-optimcloud-d50))
 $(eval $(call BuildPackage,ath11k-wifi-optimcloud-d60))
