@@ -30,28 +30,6 @@ define Build/mt7988-bl31-uboot
 	cat $(STAGING_DIR_IMAGE)/mt7988_$1-u-boot.fip >> $@
 endef
 
-define Build/fit-sign
-	$(TOPDIR)/scripts/mkits-secure_boot.sh \
-		-D $(DEVICE_NAME) \
-		-o $@.its \
-		-k $@ \
-		$(if $(word 2,$(1)),-d $(word 2,$(1))) -C $(word 1,$(1)) \
-		-a $(KERNEL_LOADADDR) \
-		-e $(if $(KERNEL_ENTRY),$(KERNEL_ENTRY),$(KERNEL_LOADADDR)) \
-		-c $(if $(DEVICE_DTS_CONFIG),$(DEVICE_DTS_CONFIG),"config-1") \
-		-A $(LINUX_KARCH) \
-		-v $(LINUX_VERSION) \
-		$(if $(FIT_KEY_NAME),-S $(FIT_KEY_NAME)) \
-		$(if $(FW_AR_VER),-r $(FW_AR_VER)) \
-		$(if $(CONFIG_TARGET_ROOTFS_SQUASHFS),-R $(ROOTFS/squashfs/$(DEVICE_NAME)))
-		PATH=$(LINUX_DIR)/scripts/dtc:$(PATH) mkimage \
-		-f $@.its \
-		$(if $(FIT_KEY_DIR),-k $(FIT_KEY_DIR)) \
-		-r \
-		$@.new
-	@mv $@.new $@
-endef
-
 define Build/mt798x-gpt
 	cp $@ $@.tmp 2>/dev/null || true
 	ptgen -g -o $@.tmp -a 1 -l 1024 \
@@ -839,6 +817,34 @@ define Device/edgecore_eap111
   DEVICE_PACKAGES := kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware
 endef
 TARGET_DEVICES += edgecore_eap111
+
+define Device/sonicfi_rap630w_211g
+  DEVICE_VENDOR := SONICFI
+  DEVICE_MODEL := RAP630W-211G
+  DEVICE_DTS := mt7981b-sonicfi-rap630w-211g
+  DEVICE_DTS_DIR := ../dts
+  SUPPORTED_DEVICES := sonicfi,rap630w-211g
+  DEVICE_PACKAGES := kmod-mt7981-firmware kmod-mt7915e kmod-hwmon-tps23861 \
+	e2fsprogs f2fsck mkf2fs
+  KERNEL := kernel-bin | lzma | \
+	  fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
+  KERNEL_INITRAMFS := kernel-bin | lzma | \
+	fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 64k
+  KERNEL_INITRAMFS_SUFFIX := -recovery.itb
+  KERNEL_IN_UBI := 1
+  UBINIZE_OPTS := -E 5
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  IMAGE_SIZE := 65536k
+  ROOTFSNAME_IN_UBI := rootfs
+  UBOOTENV_IN_UBI := 1
+  IMAGES := sysupgrade.tar
+  IMAGE/sysupgrade.itb := append-kernel | \
+	 fit gzip $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb external-static-with-rootfs | \
+	 pad-rootfs | append-metadata
+  IMAGE/sysupgrade.tar := sysupgrade-tar | append-metadata
+endef
+TARGET_DEVICES += sonicfi_rap630w_211g
 
 define Device/gatonetworks_gdsp
   DEVICE_VENDOR := GatoNetworks
@@ -1930,29 +1936,3 @@ define Device/zyxel_nwa50ax-pro
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
 endef
 TARGET_DEVICES += zyxel_nwa50ax-pro
-
-define Device/emplus_wap588m
-   DEVICE_VENDOR := EMPLUS
-   DEVICE_MODEL := WAP588M
-   DEVICE_DTS := mt7981b-emplus-wap588m
-   DEVICE_DTS_DIR := ../dts
-   SUPPORTED_DEVICES := emplus,wap588m
-   DEVICE_PACKAGES := kmod-mt7981-firmware kmod-mt7915e uboot-envtools -procd-ujail
-   UBINIZE_OPTS := -E 5
-   BLOCKSIZE := 128k
-   PAGESIZE := 2048
-   IMAGE_SIZE := 65536k
-   KERNEL_IN_UBI := 1
-   FIT_KEY_DIR := $(DTS_DIR)/keys/emplus_wap588m
-   FIT_KEY_NAME := fit_key
-   IMAGES += factory.bin
-   IMAGE/factory.bin := append-ubi | check-size $$$$(IMAGE_SIZE)
-   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
-   KERNEL = kernel-bin | lzma | \
-     fit-sign lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
-   KERNEL_INITRAMFS = kernel-bin | lzma | \
-     fit-sign lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd
- endef
- TARGET_DEVICES += emplus_wap588m
- DEFAULT_DEVICE_VARS += FIT_KEY_DIR FIT_KEY_NAME
-
