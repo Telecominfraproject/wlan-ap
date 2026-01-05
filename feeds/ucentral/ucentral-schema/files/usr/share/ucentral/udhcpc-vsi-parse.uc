@@ -10,6 +10,39 @@ let value = getenv("opt43");
 if (!ifname)
         exit(0);
 
+function vendor_hex(vendor) {
+    let hex = "";
+    let firstchar =  "";
+
+    // The string contains either special characters
+    // or hex characters or any other alpha numberic character
+    // If it is special character, consider first character to include in the hex string
+    // If it is hex, consider two characters for the hex to include in the hex string.
+    // For any other alpha numeric character, consider it as it is into the hex string
+
+    for (let i = 0; i < length(vendor); i++) {
+        if (match(substr(vendor, i, 1), /[a-fA-F0-9]/)) {
+            if (firstchar != "") {
+                hex += firstchar + substr(vendor, i, 1);
+                firstchar = "";
+            } else {
+                firstchar = substr(vendor, i, 1);
+            }
+        } else {
+            if (firstchar != "") {
+                hex += firstchar;
+            }
+            if (match(substr(vendor, i, 1), /[a-zA-Z0-9]/)) {
+                hex += substr(vendor, i, 1);
+            } else {
+                hex +=  sprintf("%02x", ord(vendor, i));
+            }
+            firstchar = "";
+        }
+    }
+    return hex;
+}
+
 if (!vendor)
     vendor = "unknown";
 
@@ -32,6 +65,7 @@ if (cmd == "deconfig" || !vendor || !value) {
         }
 }
 else if (cmd == "bound") {
+    let vendor = vendor_hex(vendor);
     let vsi = { vendor, value };
 
     let vsi_list = {};
