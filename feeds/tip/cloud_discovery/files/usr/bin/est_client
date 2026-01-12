@@ -1,0 +1,228 @@
+#!/usr/bin/ucode
+
+'use strict';
+
+import { ulog_open, ulog, ULOG_SYSLOG, ULOG_STDIO, LOG_DAEMON, LOG_INFO } from 'log';
+import * as fs from 'fs';
+import * as libuci from 'uci';
+
+let store_operational_pem = false;
+let store_operational_ca = false;
+let est_server = 'est.certificates.open-lan.org';
+let cert_prefix = 'operational';
+
+function set_est_server() {
+	let pipe = fs.popen(`openssl x509 -in /etc/ucentral/cert.pem -noout -issuer`);
+	let issuer = pipe.read("all");
+	pipe.close();
+
+	if (match(issuer, /OpenLAN Demo Birth CA/)) {
+		ulog(LOG_INFO, 'Certificate type is "Demo" \n');
+		est_server = 'qaest.certificates.open-lan.org:8001';
+	} else if (match(issuer, /OpenLAN Birth Issuing CA/)) {
+		ulog(LOG_INFO, 'Certificate type is "Production"\n');
+	} else {
+		ulog(LOG_INFO, 'Certificate type is "TIP"\n');
+	}
+}
+
+if (getenv('EST_SERVER'))
+	est_server = getenv('EST_SERVER');
+
+if (getenv('CERT_PREFIX'))
+	cert_prefix = getenv('CERT_PREFIX');
+
+ulog_open(ULOG_SYSLOG | ULOG_STDIO, LOG_DAEMON, "est_client");
+
+function generate_csr(cert) {
+	if (!fs.stat('/tmp/csr.nohdr.p10')) {
+		let pipe = fs.popen(`openssl x509 -in ${cert} -noout -subject`);
+		let subject = pipe.read("all");
+		pipe.close();
+		subject = rtrim(subject);
+		subject = replace(subject, 'subject=', '/');
+		subject = replace(subject, ' = ', '=');
+		subject = replace(subject, ', ', '/');
+
+		let ret = system(`openssl req -subj "${subject}" -new -key /etc/ucentral/key.pem -out /tmp/csr.p10`);
+		if (ret) {
+			ulog(LOG_INFO, 'Failed to generate CSR\n');
+			return 1;
+		}
+
+		let input = fs.open('/tmp/csr.p10', 'r');
+		let output = fs.open('/tmp/csr.nohdr.p10', 'w');
+		let line;
+		while (line = input.read('line')) {
+		        if (substr(line, 0, 4) == '----')
+		                continue;
+			output.write(line);
+		}
+		input.close();
+		output.close();
+		ulog(LOG_INFO, 'Generated CSR\n');
+	}
+	return 0;
+}
+
+function store_operational_cert(path, target) {
+	system('mount_certs');
+	system(`cp ${path} /certificates/${target}`);
+
+	ulog(LOG_INFO, `Persistently stored ${target}\n`);
+}
+
+function p7_too_pem(src, dst) {
+	let input = fs.readfile(src);
+	let output = fs.open('/tmp/convert.p7', 'w');
+	output.write('-----BEGIN PKCS #7 SIGNED DATA-----\n');
+	output.write(`${input}\n-----END PKCS #7 SIGNED DATA-----`);
+	output.close();
+
+	let ret = system(`openssl pkcs7 -outform PEM -print_certs -in /tmp/convert.p7 -out ${dst}`);
+	if (ret) {
+		ulog(LOG_INFO, 'Failed to convert P7 to PEM\n');
+		return 1;
+	}
+	
+	ulog(LOG_INFO, 'Converted P7 to PEM\n');
+	
+	return 0;
+}
+
+function call_est_server(path, cert, target) {
+	if (generate_csr(cert))
+		return 1;
+
+	set_est_server();	
+
+	let ret = system('curl -m 10 -X POST https://' + est_server + '/.well-known/est/' + path + ' -d @/tmp/csr.nohdr.p10 -H "Content-Type: application/pkcs10" --cert ' + cert + ' --key /etc/ucentral/key.pem --cacert /etc/ucentral/insta.pem -o /tmp/operational.nohdr.p7');
+	if (ret) {
+		ulog(LOG_INFO, 'Failed to request operational certificate\n');
+		return 1;
+	}
+	ulog(LOG_INFO, 'EST succeeded\n');
+
+	return p7_too_pem('/tmp/operational.nohdr.p7', target);
+}
+
+
+function simpleenroll() {
+	if (fs.stat('/etc/ucentral/' + cert_prefix + '.pem')) {
+		ulog(LOG_INFO, 'Operational certificate is present\n');
+		return 0;
+	}
+
+	if (call_est_server('simpleenroll', '/etc/ucentral/cert.pem', '/etc/ucentral/' + cert_prefix + '.pem'))
+		return 1; 
+	
+	ulog(LOG_INFO, 'Operational cert acquired\n');
+	store_operational_pem = true;
+	return 0;
+}
+
+function simplereenroll() {
+	if (!fs.stat('/etc/ucentral/' + cert_prefix + '.pem')) {
+		ulog(LOG_INFO, 'Operational certificate was not found\n');
+		return 0;
+	}
+
+	if (call_est_server('simplereenroll', '/etc/ucentral/' + cert_prefix + '.pem', '/tmp/' + cert_prefix + '.pem'))
+		return 1;
+	
+	ulog(LOG_INFO, 'Operational cert updated\n');
+	store_operational_cert('/tmp/' + cert_prefix + '.pem', cert_prefix + '.pem');
+	system('cp /tmp/' + cert_prefix + '.pem /etc/ucentral/');
+	system('store_certs');
+
+	return 0;
+}
+
+function load_operational_ca() {
+	if (fs.stat('/etc/ucentral/' + cert_prefix + '.ca')) {
+		ulog(LOG_INFO, 'Operational CA is present\n');
+		return 0;
+	}
+
+	set_est_server();	
+
+	let ret = system('curl -m 10 -X GET https://' + est_server + '/.well-known/est/cacerts --cert /etc/ucentral/' + cert_prefix + '.pem --key /etc/ucentral/key.pem --cacert /etc/ucentral/insta.pem -o /tmp/' + cert_prefix + '.ca.nohdr.p7');
+	if (!ret)
+		ret = p7_too_pem('/tmp/' + cert_prefix + '.ca.nohdr.p7', '/etc/ucentral/' + cert_prefix + '.ca');
+	if (ret) {
+		ulog(LOG_INFO, 'Failed to load CA\n');
+		return 1;
+	}
+	system('cat /etc/ucentral/openlan.pem >> /etc/ucentral/' + cert_prefix + '.ca');
+	ulog(LOG_INFO, 'Acquired CA\n');
+	store_operational_ca = true;
+	return 0;
+}
+
+function fwtool() {
+	if (!fs.stat('/etc/ucentral/cert.pem'))
+		return 0;
+
+	let pipe = fs.popen(`openssl x509 -in /etc/ucentral/cert.pem -noout -issuer`);
+	let issuer = pipe.read("all");
+	pipe.close();
+
+	if (!(match(issuer, /OpenLAN/) && match(issuer, /Birth/)))
+		return 0;
+
+	ulog(LOG_INFO, 'The issuer is insta\n');
+
+	let metadata = fs.readfile('/tmp/sysupgrade.meta');
+	if (metadata)
+		metadata = json(metadata);
+	if (!metadata)
+		return 0;
+
+	if (!metadata.est_supported) {
+		ulog(LOG_INFO, 'The image does not support EST\n');
+		return 1;
+	}
+	ulog(LOG_INFO, 'The image supports EST\n');
+
+	return 0;
+}
+
+function check_cert() {
+	if (!fs.stat('/etc/ucentral/cert.pem'))
+		return 0;
+	let pipe = fs.popen("openssl x509 -in /etc/ucentral/cert.pem  -noout -subject -nameopt multiline | grep commonName | awk '{ print $3 }'");
+	let cn = pipe.read("all");
+	pipe.close();
+	if (!cn)
+		return 0;
+	cn = lc(trim(cn));
+	let uci = libuci.cursor();
+	let serial = uci.get('ucentral', 'config', 'serial');
+	return cn != serial;
+}
+
+switch(ARGV[0]) {
+case 'enroll':
+	let ret = simpleenroll();
+	if (!ret)
+		ret = load_operational_ca();
+	if (store_operational_pem)
+		store_operational_cert('/etc/ucentral/' + cert_prefix + '.pem', cert_prefix + '.pem');
+	if (store_operational_ca)
+		store_operational_cert('/etc/ucentral/' + cert_prefix + '.ca', cert_prefix + '.ca');
+	if (store_operational_pem || store_operational_ca)
+		system('store_certs');
+
+	exit(ret);
+
+case 'reenroll':
+	if (simplereenroll())
+		exit(1);
+	exit(0);
+
+case 'fwtool':
+	exit(fwtool());
+
+case 'check':
+	exit(check_cert());
+}
