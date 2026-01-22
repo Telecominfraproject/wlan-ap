@@ -293,6 +293,15 @@ return {
 		return -1;
 	},
 
+	bssid_to_ifname: function(bssid) {
+		for (let bss, v in interfaces) {
+			if (v.bssid == lc(bssid)) {
+				return bss;
+			}
+		}
+		return null;
+	},
+
 	txpower: function(bssid) {
 		for (let bss, v in interfaces) {
 			if (v.bssid != lc(bssid))

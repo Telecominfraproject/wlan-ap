@@ -163,10 +163,11 @@ return {
 	txpower: function(msg) {
 		if (!msg.bssid || !msg.level)
 			return false;
-		let wiphy = global.local.bssid_to_phy(msg.bssid);
-		if (wiphy < 0)
-			return false;	
-		global.nl80211.request(global.nl80211.const.NL80211_CMD_SET_WIPHY, 0, { wiphy, wiphy_tx_power_setting: 2, wiphy_tx_power_level: msg.level * 100});
+		let dev = global.local.bssid_to_ifname(msg.bssid);
+		if (dev == null) {
+			return false;
+		}
+		global.nl80211.request(global.nl80211.const.NL80211_CMD_SET_WIPHY, 0, { dev, wiphy_tx_power_setting: 2, wiphy_tx_power_level: msg.level * 100});
 		return true;
 	},
 };
