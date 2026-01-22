@@ -964,8 +964,8 @@ hostapd_set_bss_options() {
 		set_default rrm_beacon_report 0
 	fi
 
-	[ "$rrm_neighbor_report" -eq "1" ] && append bss_conf "rrm_neighbor_report=1" "$N"
-	[ "$rrm_beacon_report" -eq "1" ] && append bss_conf "rrm_beacon_report=1" "$N"
+	append bss_conf "rrm_neighbor_report=$rrm_neighbor_report" "$N"
+	append bss_conf "rrm_beacon_report=$rrm_beacon_report" "$N"
 	[ "$rnr" -eq "1" ] && append bss_conf "rnr=1" "$N"
 
 	json_get_vars ftm_responder stationary_ap lci civic
