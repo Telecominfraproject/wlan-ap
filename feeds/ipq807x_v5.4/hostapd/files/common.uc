@@ -184,10 +184,15 @@ const phy_proto = {
 			addr[0] ^= idx << 2;
 			break;
 		case "b5":
-			if (mbssid)
-				addr[0] |= 2;
-			addr[5] ^= idx;
-			break;
+			if (mbssid) {
+                                let b5 = addr[5];
+                                addr[5] = addr[3];
+                                addr[3] = b5;
+                                addr[5] &= ~0xf;
+                                addr[0] |= 2;
+                        }
+                        addr[5] ^= idx;
+                        break;
 		default:
 			for (let i = 5; i > 0; i--) {
 				addr[i] += idx;
