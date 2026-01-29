@@ -177,7 +177,6 @@ platform_do_upgrade() {
 					fi
 				fi
 			fi
-		fi
 		nand_upgrade_tar "$1"
 		;;
 	sonicfi,rap7110c-341x)
