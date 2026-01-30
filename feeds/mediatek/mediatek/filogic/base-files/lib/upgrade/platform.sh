@@ -13,6 +13,17 @@ swap_wap588m_active_fw() {
 	fi
 }
 
+swap_wap380m_active_fw() {
+	echo "Doing swap active_fw" > /dev/console
+        tmp_active_fw=$(fw_printenv | grep active_fw | awk -F= {'print $2'})
+	if [ $tmp_active_fw == "0" ]; then
+		fw_setenv active_fw 1
+		fw_setenv mtdparts nmbm0:1024k\(bl2\),512k\(u-boot-env\),2048k\(factory\),2048k\(fip\),112640k\(ubi_1\),112640k\(ubi\),384k\(cert\),640k\(userconfig\),384k\(crashdump\)
+	else
+		fw_setenv active_fw 0
+		fw_setenv mtdparts nmbm0:1024k\(bl2\),512k\(u-boot-env\),2048k\(factory\),2048k\(fip\),112640k\(ubi\),112640k\(ubi_1\),384k\(cert\),640k\(userconfig\),384k\(crashdump\)
+	fi
+}
 
 asus_initial_setup()
 {
@@ -213,6 +224,7 @@ platform_do_upgrade() {
 		fi
 		nand_do_upgrade "$1"
 		;;
+	emplus,wap380m|\
 	emplus,wap588m)
 		CI_UBIPART="ubi_1"
 		nand_do_upgrade "$1"
@@ -306,7 +318,10 @@ platform_pre_upgrade() {
 
 platform_post_upgrade_success() {
 	local board=$(board_name)
-	case "$board" in	
+	case "$board" in
+		emplus,wap380m)
+			swap_wap380m_active_fw
+		;;
 		emplus,wap588m)
 			swap_wap588m_active_fw
 		;;
