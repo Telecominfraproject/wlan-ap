@@ -151,7 +151,6 @@ function interfaces_subunsub(path, sub) {
 	//global.ubus.conn.call(path, 'notify_response', { 'notify_response': 1 });
 
 	/* tell hostapd to enable rrm/roaming */
-	global.ubus.conn.call(path, 'bss_mgmt_enable', { 'neighbor_report': 1, 'beacon_report': 1, 'bss_transition': 1 });
 
 	/* instantiate state */
 	interfaces[name] = { };
@@ -165,14 +164,21 @@ function interfaces_subunsub(path, sub) {
 	interfaces[name].virtual_phys = length(split(status.phy, ".")) > 1 ? true : false;
 	interfaces[name].band = freq2band(status?.freq);
 
-	/* ask hostapd for the local neighbourhood report data */
-	let rrm = global.ubus.conn.call(path, 'rrm_nr_get_own');
-	if (rrm && rrm.value) {
-		interfaces[name].rrm_nr = rrm.value;
-		global.neighbor.local_add(name, rrm.value);
-	}
+	uci.load("wireless");
+	let neigh = uci.get('wireless', interfaces[name].uci_section, 'ieee80211k');
+	if (neigh == "1") {
+		global.ubus.conn.call(path, 'bss_mgmt_enable', { 'neighbor_report': true, 'beacon_report': true, 'bss_transition': true});
+		/* ask hostapd for the local neighbourhood report data */
+		let rrm = global.ubus.conn.call(path, 'rrm_nr_get_own');
+		if (rrm && rrm.value) {
+			interfaces[name].rrm_nr = rrm.value;
+			global.neighbor.local_add(name, rrm.value);
+		}
 
-	global.neighbor.update();
+		global.neighbor.update();
+	} else {
+		global.ubus.conn.call(path, 'bss_mgmt_enable', { 'neighbor_report': false, 'beacon_report': true, 'bss_transition': true });
+	}
 	
 	/* trigger an initial channel survey */
 	//channel_survey(name);
