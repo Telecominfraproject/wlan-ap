@@ -42,7 +42,12 @@ const actions = {
 	tx_power: function(msg) {
 		if (!global.phy.txpower(msg))
 			return result(1, msg.event, 'BSS ' + msg.bssid + ' failed to set TX power', { action: 'tx_power', bssid: msg.bssid });
-	
+
+		// iw dev gives updated value
+		// But fetching it immediately failed once.
+		// Could n't reprouce it though
+		// Give few milliseconds to settle
+		sleep(10);	
 		let level = global.local.txpower(msg.bssid) / 100;
 		return result(0, msg.event, 'BSS ' + msg.bssid + ' changed TX power', { action: 'tx_power', bssid: msg.bssid, level });
 	},
