@@ -1952,7 +1952,32 @@ define Device/emplus_wap588m
      fit-sign lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
    KERNEL_INITRAMFS = kernel-bin | lzma | \
      fit-sign lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd
- endef
- TARGET_DEVICES += emplus_wap588m
- DEFAULT_DEVICE_VARS += FIT_KEY_DIR FIT_KEY_NAME
+endef
+TARGET_DEVICES += emplus_wap588m
+
+define Device/emplus_wap380m
+  DEVICE_VENDOR := EMPLUS
+  DEVICE_MODEL := WAP380M
+  DEVICE_DTS := mt7986a-emplus-wap380m
+  DEVICE_DTS_DIR := ../dts
+  SUPPORTED_DEVICES := emplus,wap380m
+  DEVICE_PACKAGES := kmod-mt7981-firmware kmod-mt7915e uboot-envtools kmod-mt7986-firmware mt7986-wo-firmware
+  UBINIZE_OPTS := -E 5
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  IMAGE_SIZE := 65536k
+  KERNEL_IN_UBI := 1
+  FIT_KEY_DIR := $(DTS_DIR)/keys/emplus_wap380m
+  FIT_KEY_NAME := fit_key
+  IMAGES += factory.bin
+  IMAGE/factory.bin := append-ubi | check-size $$$$(IMAGE_SIZE)
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+  KERNEL = kernel-bin | lzma | \
+    fit-sign lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
+  KERNEL_INITRAMFS = kernel-bin | lzma | \
+    fit-sign lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd
+endef
+TARGET_DEVICES += emplus_wap380m
+
+DEFAULT_DEVICE_VARS += FIT_KEY_DIR FIT_KEY_NAME
 
