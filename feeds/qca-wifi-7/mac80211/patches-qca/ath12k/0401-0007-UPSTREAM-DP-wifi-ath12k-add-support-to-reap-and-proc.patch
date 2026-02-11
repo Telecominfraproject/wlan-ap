@@ -1,0 +1,422 @@
+From 66dc3e9827d000528b20e294b9c1bb4e2846253b Mon Sep 17 00:00:00 2001
+From: Alok Singh <aloksing@qti.qualcomm.com>
+Date: Mon, 30 Jun 2025 15:18:26 +0530
+Subject: [PATCH 07/13] UPSTREAM: DP: wifi: ath12k: add support to reap and
+ process monitor status ring
+
+WCN7850 uses monitor status ring to store status buffer. Status buffer
+contains many TLVs such as MPDU START/END. From these TLVs, can get
+necessary information about related payload, such as PPDU ID.
+
+Add helper function to reap status buffer from monitor status ring so
+that can parse TLVs later by ath12k_dp_mon_parse_rx_dest().
+
+Patch-dependency:
+	0401-0006-UPSTREAM-DP-wifi-ath12k-add-monitor-mode-handler-by-.patch
+
+Signed-off-by: Alok Singh <aloksing@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.h     |  12 +
+ drivers/net/wireless/ath/ath12k/dp_mon.c | 268 ++++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/hal.c    |  29 +++
+ drivers/net/wireless/ath/ath12k/hal.h    |   3 +
+ 4 files changed, 310 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+index bc478a7..9d0d98d 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -79,6 +79,16 @@ struct ath12k_pdev_mon_stats {
+ 	u32 dest_mpdu_drop;
+ 	u32 dup_mon_linkdesc_cnt;
+ 	u32 dup_mon_buf_cnt;
++	u32 dest_mon_stuck;
++	u32 dest_mon_not_reaped;
++};
++
++enum dp_mon_status_buf_state {
++	DP_MON_STATUS_MATCH,
++	DP_MON_STATUS_NO_DMA,
++	DP_MON_STATUS_LAG,
++	DP_MON_STATUS_LEAD,
++	DP_MON_STATUS_REPLINISH,
+ };
+ 
+ struct dp_link_desc_bank {
+@@ -151,6 +161,7 @@ struct ath12k_mon_data {
+ 	u8 decap_format;
+ 
+ 	struct ath12k_pdev_mon_stats rx_mon_stats;
++	enum dp_mon_status_buf_state buf_state;
+ 	/* lock for monitor data */
+ 	spinlock_t mon_lock;
+ 	struct sk_buff_head rx_status_q;
+@@ -609,6 +620,7 @@ struct ath12k_dp_htt_rxdma_ppe_cfg_param {
+ 
+ struct ath12k_dp {
+ 	struct ath12k_base *ab;
++	u32 mon_dest_ring_stuck_cnt;
+ 	u8 num_bank_profiles;
+ 	/* protects the access and update of bank_profiles */
+ 	spinlock_t tx_bank_lock;
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.c b/drivers/net/wireless/ath/ath12k/dp_mon.c
+index 918775c..ac78f38 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -1746,6 +1746,90 @@ ath12k_dp_mon_rx_parse_status_tlv(struct ath12k_mon_data *pmon,
+ 	return HAL_RX_MON_STATUS_PPDU_NOT_DONE;
+ }
+ 
++static struct sk_buff
++*ath12k_dp_rx_alloc_mon_status_buf(struct ath12k_base *ab,
++				   struct dp_rxdma_mon_ring *rx_ring,
++				   int *buf_id)
++{
++	struct sk_buff *skb;
++	dma_addr_t paddr;
++
++	skb = dev_alloc_skb(RX_MON_STATUS_BUF_SIZE);
++
++	if (!skb)
++		goto fail_alloc_skb;
++
++	if (!IS_ALIGNED((unsigned long)skb->data,
++			RX_MON_STATUS_BUF_ALIGN)) {
++		skb_pull(skb, PTR_ALIGN(skb->data, RX_MON_STATUS_BUF_ALIGN) -
++			 skb->data);
++	}
++
++	paddr = dma_map_single(ab->dev, skb->data,
++			       skb->len + skb_tailroom(skb),
++			       DMA_FROM_DEVICE);
++	if (unlikely(dma_mapping_error(ab->dev, paddr)))
++		goto fail_free_skb;
++
++	spin_lock_bh(&rx_ring->idr_lock);
++	*buf_id = idr_alloc(&rx_ring->bufs_idr, skb, 0,
++			    rx_ring->bufs_max, GFP_ATOMIC);
++	spin_unlock_bh(&rx_ring->idr_lock);
++	if (*buf_id < 0)
++		goto fail_dma_unmap;
++
++	ATH12K_SKB_RXCB(skb)->paddr = paddr;
++	return skb;
++
++fail_dma_unmap:
++	dma_unmap_single(ab->dev, paddr, skb->len + skb_tailroom(skb),
++			 DMA_FROM_DEVICE);
++fail_free_skb:
++	dev_kfree_skb_any(skb);
++fail_alloc_skb:
++	return NULL;
++}
++
++static enum dp_mon_status_buf_state
++ath12k_dp_rx_mon_buf_done(struct ath12k_base *ab, struct hal_srng *srng,
++			  struct dp_rxdma_mon_ring *rx_ring)
++{
++	struct ath12k_skb_rxcb *rxcb;
++	struct hal_tlv_64_hdr *tlv;
++	struct sk_buff *skb;
++	struct ath12k_buffer_addr *status_desc;
++	dma_addr_t paddr;
++	u32 cookie;
++	int buf_id;
++	u8 rbm;
++
++	status_desc = ath12k_hal_srng_src_next_peek(ab, srng);
++	if (!status_desc)
++		return DP_MON_STATUS_NO_DMA;
++
++	ath12k_hal_rx_buf_addr_info_get(status_desc, &paddr, &cookie, &rbm);
++
++	buf_id = u32_get_bits(cookie, DP_RXDMA_BUF_COOKIE_BUF_ID);
++
++	spin_lock_bh(&rx_ring->idr_lock);
++	skb = idr_find(&rx_ring->bufs_idr, buf_id);
++	spin_unlock_bh(&rx_ring->idr_lock);
++
++	if (!skb)
++		return DP_MON_STATUS_NO_DMA;
++
++	rxcb = ATH12K_SKB_RXCB(skb);
++	dma_sync_single_for_cpu(ab->dev, rxcb->paddr,
++				skb->len + skb_tailroom(skb),
++				DMA_FROM_DEVICE);
++
++	tlv = (struct hal_tlv_64_hdr *)skb->data;
++	if (le64_get_bits(tlv->tl, HAL_TLV_HDR_TAG) != HAL_RX_STATUS_BUFFER_DONE)
++		return DP_MON_STATUS_NO_DMA;
++
++	return DP_MON_STATUS_REPLINISH;
++}
++
+ static void
+ ath12k_dp_mon_fill_rx_stats_info(struct hal_rx_mon_ppdu_info *ppdu_info,
+ 				 struct ieee80211_rx_status *rx_status)
+@@ -3893,12 +3977,192 @@ free_skb:
+ 	return num_buffs_reaped;
+ }
+ 
++static int ath12k_dp_rx_reap_mon_status_ring(struct ath12k_base *ab, int mac_id,
++					     int *budget, struct sk_buff_head *skb_list)
++{
++	const struct ath12k_hw_hal_params *hal_params;
++	int buf_id, srng_id, num_buffs_reaped = 0;
++	enum dp_mon_status_buf_state reap_status;
++	struct dp_rxdma_mon_ring *rx_ring;
++	struct ath12k_mon_data *pmon;
++	struct ath12k_skb_rxcb *rxcb;
++	struct hal_tlv_64_hdr *tlv;
++	struct ath12k_buffer_addr *rx_mon_status_desc;
++	struct hal_srng *srng;
++	struct ath12k_dp *dp;
++	struct sk_buff *skb;
++	struct ath12k *ar;
++	dma_addr_t paddr;
++	u32 cookie;
++	u8 rbm;
++
++	ar = ab->pdevs[ath12k_hw_mac_id_to_pdev_id(ab->hw_params, mac_id)].ar;
++	dp = ab->dp;
++	pmon = &ar->dp.mon_data;
++	srng_id = ath12k_hw_mac_id_to_srng_id(ab->hw_params, mac_id);
++	rx_ring = &dp->rx_mon_status_refill_ring[srng_id];
++
++	srng = &ab->hal.srng_list[rx_ring->refill_buf_ring.ring_id];
++
++	spin_lock_bh(&srng->lock);
++
++	ath12k_hal_srng_access_begin(ab, srng);
++
++	while (*budget) {
++		*budget -= 1;
++		rx_mon_status_desc = ath12k_hal_srng_src_peek(ab, srng);
++		if (!rx_mon_status_desc) {
++			pmon->buf_state = DP_MON_STATUS_REPLINISH;
++			break;
++		}
++		ath12k_hal_rx_buf_addr_info_get(rx_mon_status_desc, &paddr,
++						&cookie, &rbm);
++		if (paddr) {
++			buf_id = u32_get_bits(cookie, DP_RXDMA_BUF_COOKIE_BUF_ID);
++
++			spin_lock_bh(&rx_ring->idr_lock);
++			skb = idr_find(&rx_ring->bufs_idr, buf_id);
++			spin_unlock_bh(&rx_ring->idr_lock);
++
++			if (!skb) {
++				ath12k_warn(ab, "rx monitor status with invalid buf_id %d\n",
++					    buf_id);
++				pmon->buf_state = DP_MON_STATUS_REPLINISH;
++				goto move_next;
++			}
++
++			rxcb = ATH12K_SKB_RXCB(skb);
++
++			dma_sync_single_for_cpu(ab->dev, rxcb->paddr,
++						skb->len + skb_tailroom(skb),
++						DMA_FROM_DEVICE);
++
++			tlv = (struct hal_tlv_64_hdr *)skb->data;
++			if (le64_get_bits(tlv->tl, HAL_TLV_HDR_TAG) !=
++					HAL_RX_STATUS_BUFFER_DONE) {
++				pmon->buf_state = DP_MON_STATUS_NO_DMA;
++				ath12k_warn(ab,
++					    "mon status DONE not set %llx, buf_id %d\n",
++					    le64_get_bits(tlv->tl, HAL_TLV_HDR_TAG),
++					    buf_id);
++				/* RxDMA status done bit might not be set even
++				 * though tp is moved by HW.
++				 */
++
++				/* If done status is missing:
++				 * 1. As per MAC team's suggestion,
++				 *    when HP + 1 entry is peeked and if DMA
++				 *    is not done and if HP + 2 entry's DMA done
++				 *    is set. skip HP + 1 entry and
++				 *    start processing in next interrupt.
++				 * 2. If HP + 2 entry's DMA done is not set,
++				 *    poll onto HP + 1 entry DMA done to be set.
++				 *    Check status for same buffer for next time
++				 *    dp_rx_mon_status_srng_process
++				 */
++				reap_status = ath12k_dp_rx_mon_buf_done(ab, srng,
++									rx_ring);
++				if (reap_status == DP_MON_STATUS_NO_DMA)
++					continue;
++
++				spin_lock_bh(&rx_ring->idr_lock);
++				idr_remove(&rx_ring->bufs_idr, buf_id);
++				spin_unlock_bh(&rx_ring->idr_lock);
++
++				dma_unmap_single(ab->dev, rxcb->paddr,
++						 skb->len + skb_tailroom(skb),
++						 DMA_FROM_DEVICE);
++
++				dev_kfree_skb_any(skb);
++				pmon->buf_state = DP_MON_STATUS_REPLINISH;
++				goto move_next;
++			}
++
++			spin_lock_bh(&rx_ring->idr_lock);
++			idr_remove(&rx_ring->bufs_idr, buf_id);
++			spin_unlock_bh(&rx_ring->idr_lock);
++
++			dma_unmap_single(ab->dev, rxcb->paddr,
++					 skb->len + skb_tailroom(skb),
++					 DMA_FROM_DEVICE);
++
++			if (ath12k_dp_pkt_set_pktlen(skb, RX_MON_STATUS_BUF_SIZE)) {
++				dev_kfree_skb_any(skb);
++				goto move_next;
++			}
++			__skb_queue_tail(skb_list, skb);
++		} else {
++			pmon->buf_state = DP_MON_STATUS_REPLINISH;
++		}
++move_next:
++		skb = ath12k_dp_rx_alloc_mon_status_buf(ab, rx_ring,
++							&buf_id);
++
++		if (!skb) {
++			ath12k_warn(ab, "failed to alloc buffer for status ring\n");
++			hal_params = ab->hal.hal_params;
++			ath12k_hal_rx_buf_addr_info_set(rx_mon_status_desc, 0,
++							0,
++							hal_params->rx_buf_rbm);
++			num_buffs_reaped++;
++			break;
++		}
++		rxcb = ATH12K_SKB_RXCB(skb);
++
++		cookie = u32_encode_bits(mac_id, DP_RXDMA_BUF_COOKIE_PDEV_ID) |
++			 u32_encode_bits(buf_id, DP_RXDMA_BUF_COOKIE_BUF_ID);
++
++		ath12k_hal_rx_buf_addr_info_set(rx_mon_status_desc, rxcb->paddr,
++						cookie,
++						ab->hal.hal_params->rx_buf_rbm);
++		ath12k_hal_srng_src_get_next_entry(ab, srng);
++		num_buffs_reaped++;
++	}
++	ath12k_hal_srng_access_end(ab, srng);
++	spin_unlock_bh(&srng->lock);
++
++	return num_buffs_reaped;
++}
++
+ static int
+ __ath12k_dp_mon_process_ring(struct ath12k *ar, int mac_id,
+ 			     struct napi_struct *napi, int *budget)
+ {
+-	/* TODO:Implement monitor mode for WCN7850 here. */
+-	return 0;
++	struct ath12k_mon_data *pmon = (struct ath12k_mon_data *)&ar->dp.mon_data;
++	struct ath12k_pdev_mon_stats *rx_mon_stats = &pmon->rx_mon_stats;
++	struct hal_rx_mon_ppdu_info *ppdu_info = &pmon->mon_ppdu_info;
++	enum hal_rx_mon_status hal_status;
++	struct sk_buff_head skb_list;
++	int num_buffs_reaped;
++	struct sk_buff *skb;
++
++	__skb_queue_head_init(&skb_list);
++
++	num_buffs_reaped = ath12k_dp_rx_reap_mon_status_ring(ar->ab, mac_id,
++							     budget, &skb_list);
++	if (!num_buffs_reaped)
++		goto exit;
++
++	while ((skb = __skb_dequeue(&skb_list))) {
++		memset(ppdu_info, 0, sizeof(*ppdu_info));
++		ppdu_info->peer_id = HAL_INVALID_PEERID;
++
++		hal_status = ath12k_dp_mon_parse_rx_dest(&ar->dp, skb);
++
++		if (ar->monitor_started &&
++		    pmon->mon_ppdu_status == DP_PPDU_STATUS_START &&
++		    hal_status == HAL_TLV_STATUS_PPDU_DONE) {
++			rx_mon_stats->status_ppdu_done++;
++			pmon->mon_ppdu_status = DP_PPDU_STATUS_DONE;
++			/*TODO: add mon dest ring processing here.*/
++			pmon->mon_ppdu_status = DP_PPDU_STATUS_START;
++		}
++
++		dev_kfree_skb_any(skb);
++	}
++
++exit:
++	return num_buffs_reaped;
+ }
+ 
+ int ath12k_dp_mon_process_ring(struct ath12k_dp *dp, int mac_id,
+diff --git a/drivers/net/wireless/ath/ath12k/hal.c b/drivers/net/wireless/ath/ath12k/hal.c
+index 8bffaa3..5e8a2cd 100644
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -491,6 +491,24 @@ int ath12k_hal_srng_src_num_free(struct ath12k_base *ab, struct hal_srng *srng,
+ 		return ((srng->ring_size - hp + tp) / srng->entry_size) - 1;
+ }
+ 
++void *ath12k_hal_srng_src_next_peek(struct ath12k_base *ab,
++				    struct hal_srng *srng)
++{
++	void *desc;
++	u32 next_hp;
++
++	lockdep_assert_held(&srng->lock);
++
++	next_hp = (srng->u.src_ring.hp + srng->entry_size) % srng->ring_size;
++
++	if (next_hp == srng->u.src_ring.cached_tp)
++		return NULL;
++
++	desc = srng->ring_base_vaddr + next_hp;
++
++	return desc;
++}
++
+ void *ath12k_hal_srng_src_get_next_entry(struct ath12k_base *ab,
+ 					 struct hal_srng *srng)
+ {
+@@ -525,6 +543,17 @@ void *ath12k_hal_srng_src_get_next_entry(struct ath12k_base *ab,
+ }
+ EXPORT_SYMBOL(ath12k_hal_srng_src_get_next_entry);
+ 
++void *ath12k_hal_srng_src_peek(struct ath12k_base *ab, struct hal_srng *srng)
++{
++	lockdep_assert_held(&srng->lock);
++
++	if (((srng->u.src_ring.hp + srng->entry_size) % srng->ring_size) ==
++	    srng->u.src_ring.cached_tp)
++		return NULL;
++
++	return srng->ring_base_vaddr + srng->u.src_ring.hp;
++}
++
+ void *ath12k_hal_srng_src_reap_next(struct ath12k_base *ab,
+ 				    struct hal_srng *srng)
+ {
+diff --git a/drivers/net/wireless/ath/ath12k/hal.h b/drivers/net/wireless/ath/ath12k/hal.h
+index a9cd1fd..43bc056 100644
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -1422,6 +1422,7 @@ void *__ath12k_hal_srng_dst_get_next_cached_entry(struct hal_srng *srng,
+ void *ath12k_hal_srng_dst_get_next_cached_entry(struct ath12k_base *ab,
+ 						struct hal_srng *srng,
+ 						u32 *old_tp);
++void *ath12k_hal_srng_src_peek(struct ath12k_base *ab, struct hal_srng *srng);
+ void *ath12k_hal_srng_dst_peek(struct ath12k_base *ab, struct hal_srng *srng);
+ int __ath12k_hal_srng_dst_num_free(struct hal_srng *srng, bool sync_hw_ptr);
+ int ath12k_hal_srng_dst_num_free(struct ath12k_base *ab, struct hal_srng *srng,
+@@ -1434,6 +1435,8 @@ void *ath12k_hal_srng_src_get_next_reaped(struct ath12k_base *ab,
+ 					  struct hal_srng *srng);
+ void *ath12k_hal_srng_src_reap_next(struct ath12k_base *ab,
+ 				    struct hal_srng *srng);
++void *ath12k_hal_srng_src_next_peek(struct ath12k_base *ab,
++				    struct hal_srng *srng);
+ void *ath12k_hal_srng_src_get_next_entry(struct ath12k_base *ab,
+ 					 struct hal_srng *srng);
+ int ath12k_hal_srng_src_num_free(struct ath12k_base *ab, struct hal_srng *srng,
+-- 
+2.34.1
+

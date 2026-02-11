@@ -1,0 +1,239 @@
+From b232c8314bef09021abf75d3611c51c6dd022df3 Mon Sep 17 00:00:00 2001
+From: Balamurugan Ramar <quic_bramar@quicinc.com>
+Date: Thu, 10 Apr 2025 23:26:20 +0530
+Subject: [PATCH] mac80211: Enable PPE support
+
+Add ppe support. By default, ppe suport is disabled. This can be
+enabled through writing 1 to module params (/sys/module/mac80211/parameters/
+ppe_vp_accel) and wifi restart. When PPE is enabled the 802.3 frames are
+given to PPE and the NW stack is bypassed on Rx path. On failure the skb is
+given to NW stack. For Tx path PPE invokes call back which was assigned during
+registration, upon wich dev_queue_xmit() is invoked to route the
+skb to Wi-Fi driver Tx path.
+
+Signed-off-by: Balamurugan Selvarajan <quic_bselvara@quicinc.com>
+Signed-off-by: Balamurugan Ramar <quic_bramar@quicinc.com>
+---
+ include/net/mac80211.h     |  3 ++
+ net/mac80211/ieee80211_i.h |  8 ++++
+ net/mac80211/iface.c       | 82 ++++++++++++++++++++++++++++++++++++++
+ net/mac80211/rx.c          | 35 ++++++++++++++++
+ 4 files changed, 128 insertions(+)
+
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index 079138e..9569e89 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -2121,6 +2121,9 @@ struct ieee80211_vif {
+ 
+ 	bool noqueue_enable;
+ 
++#ifdef CPTCFG_MAC80211_PPE_SUPPORT
++	u32 ppe_vp_num;
++#endif
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+ };
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index d57371c..768fe19 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -39,6 +39,11 @@
+ #include <nss_api_if.h>
+ #endif
+ 
++#ifdef CPTCFG_MAC80211_PPE_SUPPORT
++#include <ppe_vp_public.h>
++#include <ppe_vp_tx.h>
++#endif
++
+ extern const struct cfg80211_ops mac80211_config_ops;
+ 
+ struct ieee80211_local;
+@@ -1205,6 +1210,9 @@ struct ieee80211_sub_if_data {
+ #ifdef CPTCFG_MAC80211_NSS_SUPPORT
+ 	struct nss_virt_if_handle *nssctx;
+ #endif
++#ifdef CPTCFG_MAC80211_PPE_SUPPORT
++	u32 ppe_vp_num;
++#endif
+ 
+ 	struct work_struct awgn_detected_work;
+ 	/* must be last, dynamically sized area in this! */
+diff --git a/net/mac80211/iface.c b/net/mac80211/iface.c
+index d9e3920..deb8e4b 100644
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -33,6 +33,12 @@ module_param(nss_redirect, bool, 0644);
+ MODULE_PARM_DESC(nss_redirect, "module param to enable NSS Redirect; 1-enable, 0-disable");
+ #endif
+ 
++#ifdef CPTCFG_MAC80211_PPE_SUPPORT
++bool ppe_vp_accel = false;
++module_param(ppe_vp_accel, bool, 0644);
++MODULE_PARM_DESC(ppe_vp_accel, "module param to enable PPE; 1-enable, 0-disable");
++#endif
++
+ /**
+  * DOC: Interface list locking
+  *
+@@ -827,6 +833,15 @@ static int ieee80211_stop(struct net_device *dev)
+ 	if (sdata->vif.type == NL80211_IFTYPE_AP)
+ 		ieee80211_stop_mbssid(sdata);
+ 
++#ifdef CPTCFG_MAC80211_PPE_SUPPORT
++	if (sdata->ppe_vp_num) {
++		ppe_vp_free(sdata->ppe_vp_num);
++		sdata_info(sdata, "Destroyed PPE VP port no:%d for dev:%s\n",
++			   sdata->ppe_vp_num, dev->name);
++		sdata->ppe_vp_num = 0;
++		sdata->vif.ppe_vp_num = 0;
++	}
++#endif
+ 	ieee80211_do_stop(sdata, true);
+ 
+ 	return 0;
+@@ -1264,6 +1279,55 @@ void receive_from_nss(struct net_device *dev, struct sk_buff *sk_buff, struct na
+ }
+ #endif
+ 
++#ifdef CPTCFG_MAC80211_PPE_SUPPORT
++/*
++ * This callback is registered for Tx path.
++ * PPE will invoke this callback and the skb is
++ * routed to the driver.
++ */
++static bool ieee80211_process_dst_ppe_vp(struct ppe_vp_cb_info *ppe_vp_info, void *cb_data)
++{
++	struct sk_buff *skb = ppe_vp_info->skb;
++	struct net_device *dev = ppe_vp_info->napi->dev;
++	if (unlikely(dev == NULL)) {
++		dev_kfree_skb_any(skb);
++		return false;
++	}
++
++	skb->dev = dev;
++	dev_queue_xmit(skb);
++
++	return true;
++}
++
++/*
++ * Register with PPE virtual port(vp) on VAP creation.
++ * Allocate a new virtual port and returns ppe vp no on success.
++ * on failure returns -1;
++ */
++static int ieee80211_ppe_vp_802_3_redir_vap(struct ieee80211_sub_if_data *sdata,
++					    struct net_device *dev)
++{
++	int vp;
++	struct ppe_vp_ai vpai;
++
++	memset(&vpai, 0, sizeof(struct ppe_vp_ai));
++
++	vpai.type = PPE_VP_TYPE_SW_L2;
++	vpai.dst_cb = ieee80211_process_dst_ppe_vp;
++	vpai.dst_cb_data = &sdata->vif;
++	vpai.src_cb = NULL;
++	vpai.src_cb_data = NULL;
++	vpai.queue_num = 0;
++
++	vp = ppe_vp_alloc(dev, &vpai);
++	if (vp <= 0)
++		return -1;
++
++	return vp;
++}
++#endif
++
+ /*
+  * NOTE: Be very careful when changing this function, it must NOT return
+  * an error on interface type changes that have been pre-checked, so most
+@@ -1277,6 +1341,9 @@ int ieee80211_do_open(struct wireless_dev *wdev, bool coming_up)
+ 	u64 changed = 0;
+ 	int link_id, res;
+ 	u32 hw_reconf_flags = 0;
++#ifdef CPTCFG_MAC80211_PPE_SUPPORT
++	int vp;
++#endif
+ 
+ 	lockdep_assert_wiphy(local->hw.wiphy);
+ 
+@@ -1530,6 +1597,21 @@ int ieee80211_do_open(struct wireless_dev *wdev, bool coming_up)
+        }
+ #endif
+ 
++#ifdef CPTCFG_MAC80211_PPE_SUPPORT
++	if (ppe_vp_accel) {
++		vp = ieee80211_ppe_vp_802_3_redir_vap(sdata, dev);
++		if (vp > 0) {
++			sdata->ppe_vp_num = vp;
++			sdata->vif.ppe_vp_num = sdata->ppe_vp_num;
++			sdata_info(sdata, "Allocated vp:%d for device:%s\n",
++				   sdata->ppe_vp_num, dev->name);
++		} else {
++			sdata->ppe_vp_num = 0;
++			sdata_err(sdata, "Failed to register with PPE VP\n");
++		}
++	}
++#endif
++
+ 	set_bit(SDATA_STATE_RUNNING, &sdata->state);
+ 
+ 	return 0;
+diff --git a/net/mac80211/rx.c b/net/mac80211/rx.c
+index f082306..578dc5d 100644
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@ -2645,6 +2645,34 @@ static bool ieee80211_frame_allowed(struct ieee80211_rx_data *rx, __le16 fc)
+ 	return true;
+ }
+ 
++#ifdef CPTCFG_MAC80211_PPE_SUPPORT
++static void ieee80211_netif_rx_ppe(struct ieee80211_rx_data *rx,
++				   struct sk_buff *skb)
++{
++	struct ieee80211_sub_if_data *sdata = rx->sdata;
++
++	skb->next = NULL;
++	/*
++	 * if the skb is shared, not sure when it has to be freed.
++	 * skip ppe and proceed with normal path.
++	 */
++	if (unlikely(skb_shared(skb)))
++		goto out;
++
++	if (likely(ppe_vp_tx_to_ppe(sdata->ppe_vp_num, skb)))
++		return;
++
++out:
++	skb->protocol = eth_type_trans(skb, sdata->dev);
++	skb->dev = sdata->dev;
++	if (rx->napi)
++		napi_gro_receive(rx->napi, skb);
++	else
++		netif_receive_skb(skb);
++
++}
++#endif
++
+ #ifdef CPTCFG_MAC80211_NSS_SUPPORT
+ #define case_rtn_string(val) case val: return #val
+ 
+@@ -4975,6 +5003,13 @@ static void ieee80211_rx_8023(struct ieee80211_rx_data *rx,
+ 			return;
+ 	}
+ 
++#ifdef CPTCFG_MAC80211_PPE_SUPPORT
++	if (rx->sdata->ppe_vp_num) {
++		ieee80211_netif_rx_ppe(rx, skb);
++		atomic_inc(&sta->rx_netif_pkts);
++		return;
++	}
++#endif
+ 	/* deliver to local stack */
+ 	skb->protocol = eth_type_trans(skb, fast_rx->dev);
+ 	ieee80211_deliver_skb_to_local_stack(skb, rx);
+-- 
+2.34.1
+

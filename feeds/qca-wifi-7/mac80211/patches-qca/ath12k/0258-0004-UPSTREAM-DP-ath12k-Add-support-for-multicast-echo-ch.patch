@@ -1,0 +1,311 @@
+From d9b920c262f6820b94e2248425dccdbd0999b546 Mon Sep 17 00:00:00 2001
+From: Thiraviyam Mariyappan <tmariyap@qti.qualcomm.com>
+Date: Wed, 7 May 2025 23:13:40 +0530
+Subject: [PATCH 4/5] UPSTREAM:DP:ath12k: Add support for multicast echo check
+
+Multicast echo check(MEC) is done to drop the multicast packets that
+are echoed back to station that is when packets transmitted through
+station received back by station.
+
+Below changes are done to support MEC for station vap
+
+* Set multicast packet control config as 0x10 for station at interface
+  up time for register HAL_TCL_R0_VDEV_MCAST_PACKET_CTRL_MAP_n_ADDR
+  according to vdev_id.
+  This is used by firmware to indicate MEC handling to be done in
+  firmware and hardware.
+  Firmware will set MEC drop bit in WBM error ring, to indicate host
+  that packet is echoed back and host will drop the packet.
+
+* Add check if MEC drop bit is set in WBM error ring, drop the packet and
+  increase the multicast echo drop count in soc_sp_stats and link_stats
+  drop packets count.
+
+* A WMI command WMI_PDEV_MEC_AGEING_TIMER_CONFIG_CMDID, is sent to
+  firmware to configure the MEC aging timer for freeing aged entries.
+
+* Correctly arrange htt_ast_entry_tlv() structure to map htt_stats
+  for AST entries.
+
+*  check WMI_SERVICE_MEC_AGING_TIMER_SUPPORT service bit set to know that
+multicast echo check(MEC) feature is supported by firmware. If host is
+enabling MEC feature with MEC agening timer, without checking for firmware
+ support, firmware crash is happening. Hence, add
+WMI_SERVICE_MEC_AGING_TIMER_SUPPORT service bit check before enabling MEC
+in host.
+
+Original Patch:
+958-wifi-ath12k-Add-support-for-MEC.patch
+959-wifi-ath12k-add-WMI-service-bit-for-MEC-support.patch
+
+Signed-off-by: Sarika Sharma <sarishar@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/debugfs.c     |  4 +++
+ drivers/net/wireless/ath/ath12k/dp.c          | 10 ++++++
+ drivers/net/wireless/ath/ath12k/dp.h          |  1 +
+ drivers/net/wireless/ath/ath12k/hal.c         | 22 ++++++++++++
+ drivers/net/wireless/ath/ath12k/hal.h         | 17 ++++++++++
+ drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c | 34 +++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.c         | 24 +++++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.h         | 12 +++++++
+ 8 files changed, 124 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -983,6 +983,10 @@ static int ath12k_open_link_stats(struct
+ 				 linkstat.tx_desc_type[1]);
+ 
+ 		len += scnprintf(buf + len, buf_len - len,
++				 "link[%d] Rx Frames Dropped = %d\n",
++				 link_id, linkstat.rx_dropped);
++
++		len += scnprintf(buf + len, buf_len - len,
+ 				"------------------------------------------------------\n");
+ 	}
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -978,6 +978,7 @@ void ath12k_dp_vdev_tx_attach(struct ath
+ 	struct ath12k_vif *ahvif = arvif->ahvif;
+ 	u8 link_id = arvif->link_id;
+ 	int bank_id;
++	bool mec_support;
+ 	struct ath12k_dp_link_vif *dp_link_vif = &ahvif->dp_vif.dp_link_vif[link_id];
+ 
+ 	dp_link_vif->tcl_metadata = u32_encode_bits(1, HTT_TCL_META_DATA_TYPE) |
+@@ -994,6 +995,15 @@ void ath12k_dp_vdev_tx_attach(struct ath
+ 	bank_id = ath12k_dp_tx_get_bank_profile(ab, arvif, ath12k_ab_to_dp(ab));
+ 	dp_link_vif->bank_id = bank_id;
+ 
++	mec_support = test_bit(WMI_SERVICE_MEC_AGING_TIMER_SUPPORT, ab->wmi_ab.svc_map);
++	if (ahvif->vdev_type == WMI_VDEV_TYPE_STA &&
++	    ath12k_frame_mode == ATH12K_HW_TXRX_ETHERNET && mec_support) {
++		ath12k_wmi_pdev_set_timer_for_mec(ar, arvif->vdev_id,
++						  WMI_PDEV_MEC_AGING_TIMER_THRESHOLD_VALUE);
++		ath12k_hal_vdev_mcast_ctrl_set(ab, arvif->vdev_id,
++					       HAL_TX_PACKET_CONTROL_CONFIG_MEC_NOTIFY);
++	}
++
+ 	/* TODO: error path for bank id failure */
+ 	if (bank_id == DP_INVALID_BANK_ID) {
+ 		ath12k_err(ar->ab, "Failed to initialize DP TX Banks");
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -385,6 +385,7 @@ struct ath12k_link_stats {
+ 	u32 tx_encap_type[DP_TCL_ENCAP_TYPE_MAX];
+ 	u32 tx_encrypt_type[HAL_ENCRYPT_TYPE_MAX];
+ 	u32 tx_desc_type[DP_TCL_DESC_TYPE_MAX];
++	u32 rx_dropped;
+ };
+ 
+ struct rx_flow_info {
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -780,3 +780,25 @@ void ath12k_hal_dump_srng_stats(struct a
+ 				   jiffies_to_msecs(jiffies - srng->timestamp));
+ 	}
+ }
++
++void ath12k_hal_vdev_mcast_ctrl_set(struct ath12k_base *ab, u32 vdev_id,
++				    u8 mcast_ctrl_val)
++{
++	u32 reg_addr, val, reg_val;
++	u8 reg_idx, index_in_reg;
++
++	reg_idx = HAL_TCL_VDEV_MCAST_PACKET_CTRL_REG_ID(vdev_id);
++	index_in_reg = HAL_TCL_VDEV_MCAST_PACKET_CTRL_INDEX_IN_REG(vdev_id);
++
++	reg_addr = HAL_TCL_R0_VDEV_MCAST_PACKET_CTRL_MAP_n_ADDR(reg_idx);
++	val = ath12k_hif_read32(ab, reg_addr);
++
++	val &= (~(HAL_TCL_VDEV_MCAST_PACKET_CTRL_MASK <<
++		  (HAL_TCL_VDEV_MCAST_PACKET_CTRL_SHIFT * index_in_reg)));
++
++	reg_val = val |
++		  ((HAL_TCL_VDEV_MCAST_PACKET_CTRL_MASK & mcast_ctrl_val) <<
++		   (HAL_TCL_VDEV_MCAST_PACKET_CTRL_SHIFT * index_in_reg));
++
++	ath12k_hif_write32(ab, reg_addr, reg_val);
++}
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -98,6 +98,20 @@ struct hal_rx_reo_queue;
+ 
+ #define HAL_ENCRYPT_TYPE_MAX	12
+ 
++/* To set mcast pkt ctrl vlaues */
++#define HAL_TCL_R0_VDEV_MCAST_PACKET_CTRL_MAP_n_ADDR(vdev_id) (0x00A4414C + (0x4 * (vdev_id)))
++#define HAL_TCL_VDEV_MCAST_PACKET_CTRL_REG_ID(vdev_id) ((vdev_id) >> 0x4)
++#define HAL_TCL_VDEV_MCAST_PACKET_CTRL_INDEX_IN_REG(vdev_id) ((vdev_id) & 0xF)
++#define HAL_TCL_VDEV_MCAST_PACKET_CTRL_MASK 0x3
++#define HAL_TCL_VDEV_MCAST_PACKET_CTRL_SHIFT 0x2
++
++enum ath12k_hal_tx_pkt_ctrl_config {
++       HAL_TX_PACKET_CONTROL_CONFIG_TO_FW_EXCEPTION,
++       HAL_TX_PACKET_CONTROL_CONFIG_DROP_PKT,
++       HAL_TX_PACKET_CONTROL_CONFIG_MEC_NOTIFY,
++       HAL_TX_PACKET_CONTROL_CONFIG_PKT_TO_TQM,
++};
++
+ enum hal_rx_su_mu_coding {
+ 	HAL_RX_SU_MU_CODING_BCC,
+ 	HAL_RX_SU_MU_CODING_LDPC,
+@@ -366,6 +380,7 @@ enum hal_reo_entr_rxdma_ecode {
+ 	HAL_REO_ENTR_RING_RXDMA_ECODE_FLOW_TIMEOUT_ERR,
+ 	HAL_REO_ENTR_RING_RXDMA_ECODE_FLUSH_REQUEST_ERR,
+ 	HAL_REO_ENTR_RING_RXDMA_ECODE_AMSDU_FRAG_ERR,
++	HAL_REO_ENTR_RING_RXDMA_ECODE_MULTICAST_ECHO_ERR,
+ 	HAL_REO_ENTR_RING_RXDMA_ECODE_MAX,
+ };
+ 
+@@ -1336,4 +1351,6 @@ void ath12k_hal_rx_buf_addr_info_get(str
+ void ath12k_hal_cc_config(struct ath12k_base *ab);
+ enum hal_rx_buf_return_buf_manager
+ ath12k_hal_get_idle_link_rbm(struct ath12k_hal *hal, u8 device_id);
++void ath12k_hal_vdev_mcast_ctrl_set(struct ath12k_base *ab, u32 vdev_id,
++				    u8 mcast_ctrl_val);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
+@@ -2132,6 +2132,42 @@ static bool ath12k_wifi7_dp_rx_h_tkip_mi
+ 	return false;
+ }
+ 
++static bool ath12k_dp_rx_h_mec_drop(struct ath12k_pdev_dp *dp_pdev,
++				    struct hal_rx_desc_data *rx_desc_data)
++{
++	struct ath12k_dp *dp = dp_pdev->dp;
++	struct ath12k_base *ab = dp->ab;
++	struct ath12k_link_sta *arsta = NULL;
++	struct ath12k_dp_link_peer *peer;
++
++	spin_lock_bh(&dp_pdev->dp->dp_lock);
++	peer = ath12k_dp_link_peer_find_by_id(dp_pdev->dp, rx_desc_data->peer_id);
++	if (!peer)
++		goto drop;
++
++	if (peer->vif && peer->vif->type != NL80211_IFTYPE_STATION) {
++		ath12k_warn(ab, "vif type is not station for peer with peer_id %u\n",
++			    rx_desc_data->peer_id);
++		goto drop;
++	}
++
++	if (peer && peer->sta) {
++		rcu_read_lock();
++
++		arsta = ath12k_peer_get_link_sta(ab, peer);
++		if (arsta) {
++			spin_lock_bh(&arsta->arvif->link_stats_lock);
++			arsta->arvif->link_stats.rx_dropped++;
++			spin_unlock_bh(&arsta->arvif->link_stats_lock);
++		}
++
++		rcu_read_unlock();
++	}
++drop:
++	spin_unlock_bh(&dp_pdev->dp->dp_lock);
++	return true;
++}
++
+ static bool ath12k_wifi7_dp_rx_h_rxdma_err(struct ath12k_pdev_dp *dp_pdev,
+ 					   struct sk_buff *msdu,
+ 					   struct ieee80211_rx_status *status,
+@@ -2144,6 +2180,9 @@ static bool ath12k_wifi7_dp_rx_h_rxdma_e
+ 	dp->device_stats.rxdma_error[rxcb->err_code]++;
+ 
+ 	switch (rxcb->err_code) {
++	case HAL_REO_ENTR_RING_RXDMA_ECODE_MULTICAST_ECHO_ERR:
++		drop = ath12k_dp_rx_h_mec_drop(dp_pdev, rx_desc_data);
++		break;
+ 	case HAL_REO_ENTR_RING_RXDMA_ECODE_DECRYPT_ERR:
+ 	case HAL_REO_ENTR_RING_RXDMA_ECODE_TKIP_MIC_ERR:
+ 		if (rx_desc_data->err_bitmap & HAL_RX_MPDU_ERR_TKIP_MIC) {
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -1695,6 +1695,30 @@ int ath12k_wmi_pdev_set_ps_mode(struct a
+ 	return ret;
+ }
+ 
++int ath12k_wmi_pdev_set_timer_for_mec(struct ath12k *ar, int vdev_id, u32 mec_timer)
++{
++	struct wmi_pdev_set_mec_timer_cmd *cmd;
++	struct ath12k_wmi_pdev *wmi = ar->wmi;
++	struct sk_buff *skb;
++	int ret;
++
++	skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, sizeof(*cmd));
++	if (!skb)
++		return -ENOMEM;
++
++	cmd = (struct wmi_pdev_set_mec_timer_cmd *)skb->data;
++	cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_PDEV_MEC_AGEING_TIMER_PARAMS,
++						 sizeof(*cmd));
++	cmd->vdev_id = cpu_to_le32(vdev_id);
++	cmd->mec_aging_timer_threshold = cpu_to_le32(mec_timer);
++	ret = ath12k_wmi_cmd_send(wmi, skb, WMI_PDEV_MEC_AGING_TIMER_CONFIG_CMDID);
++	if (ret) {
++		ath12k_warn(ar->ab, "failed to set mec timer\n");
++		dev_kfree_skb(skb);
++	}
++	return ret;
++}
++
+ int ath12k_wmi_pdev_suspend(struct ath12k *ar, u32 suspend_opt,
+ 			    u32 pdev_id)
+ {
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -385,6 +385,7 @@ enum wmi_tlv_cmd_id {
+ 	WMI_PDEV_SET_NON_SRG_OBSS_BSSID_ENABLE_BITMAP_CMDID,
+ 	WMI_PDEV_SET_BIOS_SAR_TABLE_CMDID = 0x4044,
+ 	WMI_PDEV_SET_BIOS_GEO_TABLE_CMDID = 0x4045,
++	WMI_PDEV_MEC_AGING_TIMER_CONFIG_CMDID = 0x4049,
+ 	WMI_PDEV_SET_BIOS_INTERFACE_CMDID = 0x404A,
+ 	WMI_VDEV_CREATE_CMDID = WMI_TLV_CMD(WMI_GRP_VDEV),
+ 	WMI_VDEV_DELETE_CMDID,
+@@ -2028,6 +2029,7 @@ enum wmi_tlv_tag {
+ 	WMI_TAG_MLO_VDEV_CREATE_PARAMS = 0x3D7,
+ 	WMI_TAG_PDEV_SET_BIOS_SAR_TABLE_CMD = 0x3D8,
+ 	WMI_TAG_PDEV_SET_BIOS_GEO_TABLE_CMD = 0x3D9,
++	WMI_TAG_PDEV_MEC_AGEING_TIMER_PARAMS = 0x3E9,
+ 	WMI_TAG_PDEV_SET_BIOS_INTERFACE_CMD = 0x3FB,
+ 	WMI_TAG_SPECTRAL_SCAN_BW_CAPABILITIES = 0x415,
+ 	WMI_TAG_SPECTRAL_FFT_SIZE_CAPABILITIES,
+@@ -2277,6 +2279,7 @@ enum wmi_tlv_service {
+ 
+ 	WMI_TLV_SERVICE_PEER_METADATA_V1A_V1B_SUPPORT = 365,
+ 	WMI_SERVICE_WDS_NULL_FRAME_SUPPORT = 421,
++	WMI_SERVICE_MEC_AGING_TIMER_SUPPORT = 423,
+ 
+ 	WMI_MAX_EXT2_SERVICE,
+ };
+@@ -2581,6 +2584,7 @@ struct wmi_init_cmd {
+ #define WMI_RSRC_CFG_FLAGS2_FW_AST_INDICATION_DISABLE          BIT(18)
+ #define WMI_RSRC_CFG_FLAGS2_WDS_NULL_FRAME_SUPPORT             BIT(22)
+ #define WMI_RSRC_CFG_FLAG1_THREE_WAY_COEX_CONFIG_OVERRIDE_SUPPORT BIT(25)
++#define WMI_PDEV_MEC_AGING_TIMER_THRESHOLD_VALUE 5000
+ 
+ struct ath12k_wmi_resource_config_params {
+ 	__le32 tlv_header;
+@@ -3341,6 +3345,12 @@ struct wmi_pdev_set_ps_mode_cmd {
+ 	__le32 sta_ps_mode;
+ } __packed;
+ 
++struct wmi_pdev_set_mec_timer_cmd {
++	__le32 tlv_header;
++	__le32 vdev_id;
++	__le32 mec_aging_timer_threshold;
++} __packed;
++
+ struct wmi_pdev_suspend_cmd {
+ 	__le32 tlv_header;
+ 	__le32 pdev_id;
+@@ -6760,6 +6770,8 @@ int ath12k_wmi_set_peer_param(struct ath
+ int ath12k_wmi_pdev_set_param(struct ath12k *ar, u32 param_id,
+ 			      u32 param_value, u8 pdev_id);
+ int ath12k_wmi_pdev_set_ps_mode(struct ath12k *ar, int vdev_id, u32 enable);
++int ath12k_wmi_pdev_set_timer_for_mec(struct ath12k *ar, int vdev_id,
++				      u32 mec_timer);
+ int ath12k_wmi_wait_for_unified_ready(struct ath12k_base *ab);
+ int ath12k_wmi_cmd_init(struct ath12k_base *ab);
+ int ath12k_wmi_wait_for_service_ready(struct ath12k_base *ab);

@@ -3,11 +3,11 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=qca-nss-ppe-vp
 PKG_SOURCE_PROTO:=git
-PKG_BRANCH:=ginger_open
+PKG_BRANCH:=master
 PKG_RELEASE:=2
 PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe
-PKG_MIRROR_HASH:=a488185b8416f35538c9dd07a5828a8eec4e375e0a837728f9ee350443488ecc
-PKG_VERSION:=30aab9c3973e6b950bfcd442b23d1156c3576148
+PKG_MIRROR_HASH:=3b5135f8ae5948f5f3df664c2ae4b2762c9cca6e4b79c581746d9c3fe45bfa41
+PKG_VERSION:=d53eff24bf257a8bb1b2f68beb3aa06332bfd567
 
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
 PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
@@ -26,7 +26,8 @@ define KernelPackage/qca-nss-ppe-vp
   CATEGORY:=Kernel modules
   SUBMENU:=Network Devices
   TITLE:=Kernel driver for PPE virtual port (core driver)
-  DEPENDS:=@TARGET_ipq95xx||TARGET_ipq53xx||TARGET_ipq54xx +kmod-qca-nss-ppe +kmod-qca-nss-dp-qca
+  DEPENDS:=@TARGET_ipq95xx||TARGET_ipq53xx||TARGET_ipq54xx \
+	   +kmod-qca-nss-ppe +kmod-qca-nss-dp-qca
   FILES:=$(PKG_BUILD_DIR)/drv/ppe_vp/qca-nss-ppe-vp.ko
   AUTOLOAD:=$(call AutoLoad,52,qca-nss-ppe-vp)
 endef

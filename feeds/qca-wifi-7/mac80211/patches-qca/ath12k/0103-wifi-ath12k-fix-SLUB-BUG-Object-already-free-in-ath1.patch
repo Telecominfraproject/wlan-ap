@@ -1,0 +1,115 @@
+From eb91dc299b2337b7843d878349a57048c2550ca4 Mon Sep 17 00:00:00 2001
+From: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Date: Thu, 9 Jan 2025 09:55:33 +0530
+Subject: [PATCH 131/141] wifi: ath12k: fix SLUB BUG - Object already free in
+ ath12k_reg_free()
+
+During rmmod of ath12k module with SLUB debug enabled, following print is
+seen -
+
+=============================================================================
+BUG kmalloc-1k (Not tainted): Object already free
+-----------------------------------------------------------------------------
+
+Allocated in ath12k_reg_build_regd+0x94/0xa20 [ath12k] age=10470 cpu=0 pid=0
+ __kmalloc_noprof+0xf4/0x368
+ ath12k_reg_build_regd+0x94/0xa20 [ath12k]
+ ath12k_wmi_op_rx+0x199c/0x2c14 [ath12k]
+ ath12k_htc_rx_completion_handler+0x398/0x554 [ath12k]
+ ath12k_ce_per_engine_service+0x248/0x368 [ath12k]
+ ath12k_pci_ce_workqueue+0x28/0x50 [ath12k]
+ process_one_work+0x14c/0x28c
+ bh_worker+0x22c/0x27c
+ workqueue_softirq_action+0x80/0x90
+ tasklet_action+0x14/0x3c
+ handle_softirqs+0x108/0x240
+ __do_softirq+0x14/0x20
+Freed in ath12k_reg_free+0x40/0x74 [ath12k] age=136 cpu=2 pid=166
+ kfree+0x148/0x248
+ ath12k_reg_free+0x40/0x74 [ath12k]
+ ath12k_core_hw_group_destroy+0x68/0xac [ath12k]
+ ath12k_core_deinit+0xd8/0x124 [ath12k]
+ ath12k_pci_remove+0x6c/0x130 [ath12k]
+ pci_device_remove+0x44/0xe8
+ device_remove+0x4c/0x80
+ device_release_driver_internal+0x1d0/0x22c
+ driver_detach+0x50/0x98
+ bus_remove_driver+0x70/0xf4
+ driver_unregister+0x30/0x60
+ pci_unregister_driver+0x24/0x9c
+ ath12k_pci_exit+0x18/0x24 [ath12k]
+ __arm64_sys_delete_module+0x1a0/0x2a8
+ invoke_syscall+0x48/0x110
+ el0_svc_common.constprop.0+0x40/0xe0
+Slab 0xfffffdffc0033600 objects=10 used=6 fp=0xffff000000cdcc00 flags=0x3fffe0000000240(workingset|head|node=0|zone=0|lastcpupid=0x1ffff)
+Object 0xffff000000cdcc00 @offset=19456 fp=0xffff000000cde400
+[...]
+
+This issue arises because in ath12k_core_hw_group_destroy(), each device
+calls ath12k_core_soc_destroy() for itself and all its partners within the
+same group. Since ath12k_core_hw_group_destroy() is invoked for each
+device, this results in a double free condition, eventually causing the
+SLUB bug.
+
+To resolve this, a new member regd_freed is introduced in the ath12k_base
+object. Once regd is freed, regd_freed is set to true. This ensures that
+in the removal context of other devices, regd is not freed again if
+regd_freed is already true. And since there could be a race condition to
+read this member, guard ath12k_core_soc_destroy() with the mutext lock.
+
+Fixes: 6f245ea0ec6c ("wifi: ath12k: introduce device group abstraction")
+Signed-off-by: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Signed-off-by: Rajat Soni <quic_rajson@quicinc.com>
+Signed-off-by: Raj Kumar Bhagat <quic_rajkbhag@quicinc.com>
+Signed-off-by: Jeff Johnson <jeff.johnson@oss.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h | 1 +
+ drivers/net/wireless/ath/ath12k/reg.c  | 4 ++++
+ drivers/net/wireless/ath/ath12k/wmi.c  | 2 ++
+ 3 files changed, 7 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index 5f76a099cb26..2bbc1cebca30 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1074,6 +1074,7 @@ struct ath12k_base {
+ 	 * This may or may not be used during the runtime
+ 	 */
+ 	struct ieee80211_regdomain *new_regd[MAX_RADIOS];
++	bool regd_freed;
+ 
+ 	/* Current DFS Regulatory */
+ 	enum ath12k_dfs_region dfs_region;
+diff --git a/drivers/net/wireless/ath/ath12k/reg.c b/drivers/net/wireless/ath/ath12k/reg.c
+index 2eefbb9c336e..ec41bfc3b435 100644
+--- a/drivers/net/wireless/ath/ath12k/reg.c
++++ b/drivers/net/wireless/ath/ath12k/reg.c
+@@ -713,10 +713,14 @@ void ath12k_reg_free(struct ath12k_base *ab)
+ {
+ 	int i;
+ 
++	if (ab->regd_freed)
++		return;
++
+ 	for (i = 0; i < ab->hw_params->max_radios; i++) {
+ 		kfree(ab->default_regd[i]);
+ 		kfree(ab->new_regd[i]);
+ 		ab->default_regd[i] = NULL;
+ 		ab->new_regd[i] = NULL;
++		ab->regd_freed = true;
+ 	}
+ }
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.c b/drivers/net/wireless/ath/ath12k/wmi.c
+index e610ae8da91c..3ba148d5aa10 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -6279,6 +6279,8 @@ static int ath12k_reg_chan_list_event(struct ath12k_base *ab, struct sk_buff *sk
+ 		/* This regd would be applied during mac registration */
+ 		ab->default_regd[pdev_idx] = regd;
+ 	}
++
++	ab->regd_freed = false;
+ 	ab->dfs_region = reg_info->dfs_region;
+ 	spin_unlock(&ab->base_lock);
+ 
+-- 

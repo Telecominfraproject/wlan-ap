@@ -1,0 +1,608 @@
+From 0b2c0e6cee6ea4770e32df4139b3a887dd49eb80 Mon Sep 17 00:00:00 2001
+From: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Date: Tue, 29 Nov 2022 16:16:13 +0530
+Subject: [PATCH 2/2] ath12k: add multi-vdev restart support
+
+Multi-vdev restart command is used to update the channel to all affected vdevs
+at once. Among all vdev params, only channel could vary in this command. Hence,
+during channel change, this command is useful.
+
+Currently, during channel change, each vdev is brought down first, then channel
+is changed followed by bringing vdev up. In multi-vif scenario, this might lead
+to FW buffer overflow. Instead, multi vdev restart comand could be used.
+
+Add support for multi vdev restart command and send it during channel switch.
+
+Signed-off-by: Aditya Kumar Singh <quic_adisi@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |   4 +
+ drivers/net/wireless/ath/ath12k/mac.c  | 189 +++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/wmi.c  | 235 ++++++++++++++++++++++---
+ drivers/net/wireless/ath/ath12k/wmi.h  |  47 +++++
+ 4 files changed, 448 insertions(+), 27 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -357,6 +357,7 @@ struct ath12k_link_vif {
+ 	u32 key_cipher;
+ 	bool spectral_enabled;
+ 	u32 vht_cap;
++	bool mvr_processing;
+ };
+ 
+ struct ath12k_dp_link_vif {
+@@ -803,6 +804,8 @@ struct ath12k {
+ 	struct cfg80211_chan_def awgn_chandef;
+ 	u32 chan_bw_interference_bitmap;
+ 	bool awgn_intf_handling_in_prog;
++
++	struct completion mvr_complete;
+ };
+ 
+ struct ath12k_hw {
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -10865,10 +10865,17 @@ static int ath12k_vdev_restart_sequence(
+ 	memcpy(&arvif->chanctx, new_ctx, sizeof(*new_ctx));
+ 	spin_unlock_bh(&ar->data_lock);
+ 
+-	if (vif_down_failed_map & BIT_ULL(vdev_index))
++	/* vdev is already restarted via mvr, need to setup
++	 * certain config alone after restart */
++	if (vdev_index == -1) {
++        	ret = ath12k_mac_vdev_config_after_start(arvif, &new_ctx->def);
++        	if (!ret)
++                	goto beacon_tmpl_setup;
++	} else if (vif_down_failed_map & BIT_ULL(vdev_index)) {
+ 		ret = ath12k_mac_vdev_restart(arvif, new_ctx, false);
+-	else
++	} else {
+ 		ret = ath12k_mac_vdev_restart(arvif, new_ctx, true);
++	}
+ 
+ 	if (ret) {
+ 		ath12k_warn(ar->ab, "failed to restart vdev %d: %d\n",
+@@ -10880,6 +10887,7 @@ static int ath12k_vdev_restart_sequence(
+ 		return ret;
+ 	}
+ 
++beacon_tmpl_setup:
+ 	if (!arvif->is_up)
+ 		return -EOPNOTSUPP;
+ 
+@@ -11006,6 +11014,43 @@ static void ath12k_mac_update_rx_channel
+ 	rcu_read_unlock();
+ }
+ 
++static int
++ath12k_mac_multi_vdev_restart(struct ath12k *ar,
++			      const struct cfg80211_chan_def *chandef,
++			      u32 *vdev_id, int len,
++			      bool radar_enabled)
++{
++	struct ath12k_base *ab = ar->ab;
++	struct wmi_pdev_multiple_vdev_restart_req_arg arg = {};
++	int ret, i;
++
++	arg.vdev_ids.id_len = len;
++
++	for (i = 0; i < len; i++)
++		arg.vdev_ids.id[i] = vdev_id[i];
++
++	arg.vdev_start_arg.freq = chandef->chan->center_freq;
++	arg.vdev_start_arg.band_center_freq1 = chandef->center_freq1;
++	arg.vdev_start_arg.band_center_freq2 = chandef->center_freq2;
++	arg.vdev_start_arg.mode =
++		ath12k_phymodes[chandef->chan->band][chandef->width];
++
++	arg.vdev_start_arg.min_power = 0;
++	arg.vdev_start_arg.max_power = chandef->chan->max_power;
++	arg.vdev_start_arg.max_reg_power = chandef->chan->max_reg_power;
++	arg.vdev_start_arg.max_antenna_gain = chandef->chan->max_antenna_gain;
++	arg.vdev_start_arg.chan_radar = !!(chandef->chan->flags & IEEE80211_CHAN_RADAR);
++	arg.vdev_start_arg.passive = arg.vdev_start_arg.chan_radar;
++	arg.vdev_start_arg.freq2_radar = radar_enabled;
++	arg.vdev_start_arg.passive |= !!(chandef->chan->flags & IEEE80211_CHAN_NO_IR);
++	arg.ru_punct_bitmap = ~chandef->punctured;
++	ret = ath12k_wmi_pdev_multiple_vdev_restart(ar, &arg);
++	if (ret)
++		ath12k_warn(ab, "mac failed to do mvr (%d)\n", ret);
++
++	return ret;
++}
++
+ static void
+ ath12k_mac_update_vif_chan_extras(struct ath12k *ar,
+ 				  struct ieee80211_vif_chanctx_switch *vifs,
+@@ -11013,7 +11058,6 @@ ath12k_mac_update_vif_chan_extras(struct
+ {
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct cfg80211_chan_def *chandef;
+-	int i;
+ 
+ 	chandef = &vifs[0].new_ctx->def;
+ 
+@@ -11140,7 +11184,6 @@ ath12k_mac_update_vif_chan(struct ath12k
+ 
+ 	for (i = 0; i < n_vifs; i++) {
+ 		ahvif = (void *)vifs[i].vif->drv_priv;
+-
+ 		link_id = vifs[i].link_conf->link_id;
+ 		arvif = ahvif->link[link_id];
+ 		if (WARN_ON(!arvif))
+@@ -11148,7 +11191,6 @@ ath12k_mac_update_vif_chan(struct ath12k
+ 		if (vifs[i].link_conf->mbssid_tx_vif &&
+ 		    arvif == tx_arvif)
+ 			continue;
+-
+ 		ret = ath12k_vdev_restart_sequence(arvif,
+ 						   vifs[i].new_ctx,
+ 						   vif_down_failed_map, i);
+@@ -11157,6 +11199,145 @@ ath12k_mac_update_vif_chan(struct ath12k
+ 				    arvif->vdev_id, ret);
+ 		}
+ 	}
++}
++
++static void
++ath12k_mac_update_vif_chan_mvr(struct ath12k *ar,
++			       struct ieee80211_vif_chanctx_switch *vifs,
++			       int n_vifs)
++{
++	struct ath12k_base *ab = ar->ab;
++	struct ath12k_link_vif *arvif, *tx_arvif;
++	struct ath12k_vif *ahvif, *tx_ahvif;
++	struct cfg80211_chan_def *chandef;
++	struct ieee80211_vif *tx_vif;
++	int ret, i, time_left, trans_vdev_index, vdev_idx, n_vdevs = 0;
++	u32 vdev_ids[TARGET_NUM_VDEVS];
++
++	chandef = &vifs[0].new_ctx->def;
++	tx_arvif = NULL;
++
++	ath12k_dbg(ab, ATH12K_DBG_MAC, "mac chanctx switch via mvr");
++
++	ath12k_mac_update_rx_channel(ar, NULL, vifs, n_vifs);
++
++	for (i = 0; i < n_vifs; i++) {
++		ahvif = (void *)vifs[i].vif->drv_priv;
++		arvif = ahvif->link[vifs[i].link_conf->link_id];
++
++		if (WARN_ON(!arvif))
++			continue;
++
++		ath12k_dbg(ab, ATH12K_DBG_MAC,
++			   "mac chanctx switch vdev_id %i freq %u->%u width %d->%d\n",
++			   arvif->vdev_id,
++			   vifs[i].old_ctx->def.chan->center_freq,
++			   vifs[i].new_ctx->def.chan->center_freq,
++			   vifs[i].old_ctx->def.width,
++			   vifs[i].new_ctx->def.width);
++
++		if (!arvif->is_started) {
++			memcpy(&arvif->chanctx, vifs[i].new_ctx, sizeof(*vifs[i].new_ctx));
++			continue;
++		}
++
++		if (vifs[i].link_conf->mbssid_tx_vif &&
++		    ahvif == (struct ath12k_vif *)vifs[i].link_conf->mbssid_tx_vif->drv_priv) {
++			tx_vif = vifs[i].link_conf->mbssid_tx_vif;
++			tx_ahvif = ath12k_vif_to_ahvif(tx_vif);
++			tx_arvif = tx_ahvif->link[vifs[i].link_conf->mbssid_tx_vif_linkid];
++			trans_vdev_index = i;
++		}
++
++		arvif->mvr_processing = true;
++		vdev_ids[n_vdevs++] = arvif->vdev_id;
++	}
++
++	if (!n_vdevs) {
++		ath12k_dbg(ab, ATH12K_DBG_MAC,
++			   "mac 0 vdevs available to switch chan ctx via mvr\n");
++		return;
++	}
++
++	reinit_completion(&ar->mvr_complete);
++
++	ret = ath12k_mac_multi_vdev_restart(ar, chandef, vdev_ids, n_vdevs,
++					    vifs[0].new_ctx->radar_enabled);
++	if (ret) {
++		ath12k_warn(ab, "mac failed to send mvr command (%d)\n", ret);
++		return;
++	}
++
++	time_left = wait_for_completion_timeout(&ar->mvr_complete,
++						WMI_MVR_CMD_TIMEOUT_HZ);
++	if (!time_left) {
++		ath12k_err(ar->ab, "mac mvr cmd response timed out\n");
++		/* fallback to restarting one-by-one */
++		return ath12k_mac_update_vif_chan(ar, vifs, n_vifs);
++	}
++
++	if (tx_arvif) {
++		vdev_idx = -1;
++
++		if (tx_arvif->mvr_processing) {
++			/* failed to restart tx vif via mvr, fallback */
++			arvif->mvr_processing = false;
++			vdev_idx = trans_vdev_index;
++			ath12k_err(ab,
++				   "mac failed to restart mbssid tx vdev %d via mvr cmd\n",
++				   tx_arvif->vdev_id);
++		}
++
++		ret = ath12k_vdev_restart_sequence(tx_arvif,
++						   vifs[trans_vdev_index].new_ctx,
++						   BIT_ULL(trans_vdev_index),
++						   vdev_idx);
++		if (ret)
++			ath12k_warn(ab,
++				    "mac failed to bring up mbssid tx vdev %d after mvr (%d)\n",
++				    tx_arvif->vdev_id, ret);
++	}
++
++	for (i = 0; i < n_vifs; i++) {
++		ahvif = (void *)vifs[i].vif->drv_priv;
++		arvif = ahvif->link[vifs[i].link_conf->link_id];
++
++		if (WARN_ON(!arvif))
++			continue;
++
++		vdev_idx = -1;
++
++		if (vifs[i].link_conf->mbssid_tx_vif && arvif == tx_arvif)
++			continue;
++
++		if (arvif->mvr_processing) {
++			/* failed to restart vdev via mvr, fallback */
++			arvif->mvr_processing = false;
++			vdev_idx = i;
++			ath12k_err(ab, "mac failed to restart vdev %d via mvr cmd\n",
++				   arvif->vdev_id);
++		}
++
++		ret = ath12k_vdev_restart_sequence(arvif, vifs[i].new_ctx,
++						   BIT_ULL(i), vdev_idx);
++		if (ret && ret != -EOPNOTSUPP)
++			ath12k_warn(ab, "mac failed to bring up vdev %d after mvr (%d)\n",
++				    arvif->vdev_id, ret);
++	}
++}
++
++static void
++ath12k_mac_process_update_vif_chan(struct ath12k *ar,
++				   struct ieee80211_vif_chanctx_switch *vifs,
++				   int n_vifs)
++{
++	struct ath12k_base *ab = ar->ab;
++
++	if (ath12k_wmi_is_mvr_supported(ab))
++		ath12k_mac_update_vif_chan_mvr(ar, vifs, n_vifs);
++	else
++		ath12k_mac_update_vif_chan(ar, vifs, n_vifs);
++
+ 	ath12k_mac_update_vif_chan_extras(ar, vifs, n_vifs);
+ }
+ 
+@@ -11185,7 +11366,7 @@ ath12k_mac_update_active_vif_chan(struct
+ 						   ath12k_mac_change_chanctx_fill_iter,
+ 						   &arg);
+ 
+-	ath12k_mac_update_vif_chan(ar, arg.vifs, arg.n_vifs);
++	ath12k_mac_process_update_vif_chan(ar, arg.vifs, arg.n_vifs);
+ 
+ 	kfree(arg.vifs);
+ }
+@@ -11433,7 +11614,7 @@ ath12k_mac_op_switch_vif_chanctx(struct
+ 	ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
+ 		   "mac chanctx switch n_vifs %d mode %d\n",
+ 		   n_vifs, mode);
+-	ath12k_mac_update_vif_chan(ar, vifs, n_vifs);
++	ath12k_mac_process_update_vif_chan(ar, vifs, n_vifs);
+ 
+ 	return 0;
+ }
+@@ -13831,6 +14012,7 @@ static void ath12k_mac_setup(struct ath1
+ 	init_completion(&ar->mlo_setup_done);
+ 	init_completion(&ar->completed_11d_scan);
+ 	init_completion(&ar->thermal.wmi_sync);
++	init_completion(&ar->mvr_complete);
+ 
+ 	INIT_DELAYED_WORK(&ar->scan.timeout, ath12k_scan_timeout_work);
+ 	wiphy_work_init(&ar->scan.vdev_clean_wk, ath12k_scan_vdev_clean_work);
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -548,6 +548,108 @@ ath12k_pull_mac_phy_cap_svc_ready_ext(st
+ 	return 0;
+ }
+ 
++static void ath12k_wmi_process_mvr_event(struct ath12k_base *ab, u32 *vdev_id_bm,
++					 u32 num_vdev_bm)
++{
++	struct ath12k *ar = NULL;
++	struct ath12k_link_vif *arvif = NULL;
++	u32 vdev_bitmap, bit_pos;
++
++	ath12k_dbg(ab, ATH12K_DBG_WMI,
++		   "wmi mvr resp num_vdev_bm %d vdev_id_bm[0]=0x%x vdev_id_bm[1]=0x%x\n",
++		   num_vdev_bm, vdev_id_bm[0],
++		   (num_vdev_bm == WMI_MVR_RESP_VDEV_BM_MAX_LEN ?
++				   vdev_id_bm[1] : 0x00));
++
++	/* 31-0 bits processing */
++	vdev_bitmap = vdev_id_bm[0];
++
++	for (bit_pos = 0; bit_pos < 32; bit_pos++) {
++
++		if (!(vdev_bitmap & BIT(bit_pos)))
++			continue;
++
++		arvif = ath12k_mac_get_arvif_by_vdev_id(ab, bit_pos);
++		if (!arvif) {
++			ath12k_warn(ab, "wmi mvr resp for unknown vdev %d", bit_pos);
++			continue;
++		}
++
++		arvif->mvr_processing = false;
++		ath12k_dbg(ab, ATH12K_DBG_WMI,
++			   "wmi mvr vdev %d restarted\n", bit_pos);
++	}
++
++	/* TODO: 63-32 bits processing
++	 * Add support to parse bitmap once support for
++	 * TARGET_NUM_VDEVS > 32 is added
++	 */
++
++	if (arvif)
++		ar = arvif->ar;
++
++	if (ar)
++		complete(&ar->mvr_complete);
++}
++
++static int ath12k_wmi_tlv_mvr_event_parse(struct ath12k_base *ab,
++					  u16 tag, u16 len,
++					  const void *ptr, void *data)
++{
++	struct wmi_pdev_mvr_resp_event_parse *parse = data;
++	struct wmi_pdev_mvr_resp_event_fixed_param *fixed_param;
++
++	switch(tag) {
++	case WMI_TAG_MULTIPLE_VDEV_RESTART_RESPONSE_EVENT:
++		fixed_param = (struct wmi_pdev_mvr_resp_event_fixed_param *)ptr;
++
++		if (fixed_param->status) {
++			ath12k_warn(ab, "wmi mvr resp event status %u\n",
++				    fixed_param->status);
++			return -EINVAL;
++		}
++
++		memcpy(&parse->fixed_param, fixed_param,
++		       sizeof(struct wmi_pdev_mvr_resp_event_fixed_param));
++		break;
++	case WMI_TAG_ARRAY_UINT32:
++		if ((len > WMI_MVR_RESP_VDEV_BM_MAX_LEN_BYTES) || (len == 0)) {
++			ath12k_warn(ab, "wmi invalid vdev id len in mvr resp %u\n",
++				    len);
++			return -EINVAL;
++		}
++
++		parse->num_vdevs_bm = len / sizeof(u32);
++		memcpy(parse->vdev_id_bm, ptr, len);
++		break;
++	default:
++		break;
++	}
++
++	return 0;
++}
++
++static void ath12k_wmi_event_mvr_response(struct ath12k_base *ab,
++					  struct sk_buff *skb)
++{
++	struct wmi_pdev_mvr_resp_event_parse parse = {};
++	int ret;
++
++	ret = ath12k_wmi_tlv_iter(ab, skb->data, skb->len,
++				  ath12k_wmi_tlv_mvr_event_parse,
++				  &parse);
++	if (ret) {
++		ath12k_warn(ab, "wmi failed to parse mvr response tlv %d\n",
++			    ret);
++		return;
++	}
++
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wmi mvr resp for pdev %d\n",
++		   parse.fixed_param.pdev_id);
++
++	ath12k_wmi_process_mvr_event(ab, parse.vdev_id_bm, parse.num_vdevs_bm);
++}
++
+ static int
+ ath12k_pull_reg_cap_svc_rdy_ext(struct ath12k_wmi_pdev *wmi_handle,
+ 				const struct ath12k_wmi_soc_hal_reg_caps_params *reg_caps,
+@@ -994,7 +1096,7 @@ static void ath12k_wmi_put_wmi_channel(s
+ 					cpu_to_le32(center_freq1 - 80);
+ 
+ 		chan->band_center_freq2 = cpu_to_le32(arg->band_center_freq1);
+-	} else if (arg->mode == MODE_11BE_EHT160) {
++	} else if ((arg->mode == MODE_11AX_HE160) || (arg->mode == MODE_11BE_EHT160)) {
+ 		chan->band_center_freq2 = cpu_to_le32(arg->band_center_freq2);
+ 	} else {
+ 		chan->band_center_freq2 = 0;
+@@ -10226,6 +10328,9 @@ static void ath12k_wmi_op_rx(struct ath1
+ 	case WMI_MUEDCA_PARAMS_CONFIG_EVENTID:
+ 		ath12k_wmi_pdev_update_muedca_params_status_event(ab, skb);
+ 		break;
++	case WMI_PDEV_MULTIPLE_VDEV_RESTART_RESP_EVENTID:
++		ath12k_wmi_event_mvr_response(ab, skb);
++		break;
+ 	default:
+ 		ath12k_dbg(ab, ATH12K_DBG_WMI, "Unknown eventid: 0x%x\n", id);
+ 		break;
+@@ -11446,3 +11551,82 @@ int ath12k_wmi_pdev_ap_ps_cmd_send(struc
+ 
+ 	return ret;
+ }
++
++bool ath12k_wmi_is_mvr_supported(struct ath12k_base *ab)
++{
++	struct ath12k_wmi_base *wmi_ab = &ab->wmi_ab;
++
++	return test_bit(WMI_TLV_SERVICE_MULTIPLE_VDEV_RESTART,
++			 wmi_ab->svc_map) &&
++		test_bit(WMI_TLV_SERVICE_MULTIPLE_VDEV_RESTART_RESPONSE_SUPPORT,
++			 wmi_ab->svc_map);
++}
++
++int ath12k_wmi_pdev_multiple_vdev_restart(struct ath12k *ar,
++					  struct wmi_pdev_multiple_vdev_restart_req_arg *arg)
++{
++	struct ath12k_wmi_pdev *wmi = ar->wmi;
++	struct wmi_pdev_multiple_vdev_restart_request_cmd *cmd;
++	struct ath12k_wmi_channel_params *chan;
++	struct wmi_tlv *tlv;
++	u32 num_vdev_ids;
++	__le32 *vdev_ids;
++	size_t vdev_ids_len;
++	struct sk_buff *skb;
++	void *ptr;
++	int ret, len, i;
++
++	if (WARN_ON(arg->vdev_ids.id_len > TARGET_NUM_VDEVS))
++		return -EINVAL;
++
++	num_vdev_ids = arg->vdev_ids.id_len;
++	vdev_ids_len = num_vdev_ids * sizeof(__le32);
++
++	len = sizeof(*cmd) + TLV_HDR_SIZE + vdev_ids_len +
++	      sizeof(*chan);
++
++	skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, len);
++	if (!skb)
++		return -ENOMEM;
++
++	cmd = (struct wmi_pdev_multiple_vdev_restart_request_cmd *)skb->data;
++	cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_PDEV_MULTIPLE_VDEV_RESTART_REQUEST_CMD,
++						 sizeof(*cmd));
++	cmd->pdev_id = cpu_to_le32(ar->pdev->pdev_id);
++	cmd->num_vdevs = cpu_to_le32(arg->vdev_ids.id_len);
++	cmd->puncture_20mhz_bitmap = cpu_to_le32(arg->ru_punct_bitmap);
++
++	cmd->flags = cpu_to_le32(WMI_MVR_RESPONSE_SUPPORT_EXPECTED);
++
++	ptr = skb->data + sizeof(*cmd);
++	tlv = (struct wmi_tlv *)ptr;
++
++	tlv->header = ath12k_wmi_tlv_hdr(WMI_TAG_ARRAY_UINT32, vdev_ids_len);
++	vdev_ids = (__le32 *)tlv->value;
++
++	for (i = 0; i < num_vdev_ids; i++)
++		vdev_ids[i] = cpu_to_le32(arg->vdev_ids.id[i]);
++
++	ptr += TLV_HDR_SIZE + vdev_ids_len;
++	chan = (struct ath12k_wmi_channel_params *)ptr;
++
++	ath12k_wmi_put_wmi_channel(chan, &arg->vdev_start_arg);
++
++	chan->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_CHANNEL, sizeof(*chan));
++	ptr += sizeof(*chan);
++
++	ret = ath12k_wmi_cmd_send(wmi, skb,
++				  WMI_PDEV_MULTIPLE_VDEV_RESTART_REQUEST_CMDID);
++	if (ret) {
++		ath12k_warn(ar->ab, "wmi failed to send mvr command (%d)\n",
++			    ret);
++		dev_kfree_skb(skb);
++		return ret;
++	}
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_WMI,
++		   "wmi mvr cmd sent num_vdevs %d freq %d\n",
++		   num_vdev_ids, arg->vdev_start_arg.freq);
++
++	return ret;
++}
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -745,6 +745,7 @@ enum wmi_tlv_event_id {
+ 	WMI_PDEV_RAP_INFO_EVENTID,
+ 	WMI_CHAN_RF_CHARACTERIZATION_INFO_EVENTID,
+ 	WMI_SERVICE_READY_EXT2_EVENTID,
++	WMI_PDEV_MULTIPLE_VDEV_RESTART_RESP_EVENTID,
+ 	WMI_PDEV_GET_HALPHY_CAL_STATUS_EVENTID =
+ 					WMI_SERVICE_READY_EXT2_EVENTID + 4,
+ 	WMI_VDEV_START_RESP_EVENTID = WMI_TLV_CMD(WMI_GRP_VDEV),
+@@ -1988,6 +1989,7 @@ enum wmi_tlv_tag {
+ 	WMI_TAG_SERVICE_READY_EXT2_EVENT = 0x334,
+ 	WMI_TAG_FILS_DISCOVERY_TMPL_CMD = 0x344,
+ 	WMI_TAG_PEER_CREATE_RESP_EVENT = 0x364,
++	WMI_TAG_MULTIPLE_VDEV_RESTART_RESPONSE_EVENT = 0x365,
+ 	WMI_TAG_MAC_PHY_CAPABILITIES_EXT = 0x36F,
+ 	WMI_TAG_PDEV_SRG_BSS_COLOR_BITMAP_CMD = 0x37b,
+ 	WMI_TAG_PDEV_SRG_PARTIAL_BSSID_BITMAP_CMD,
+@@ -2254,6 +2256,7 @@ enum wmi_tlv_service {
+ 	WMI_TLV_SERVICE_PER_PEER_HTT_STATS_RESET = 213,
+ 	WMI_TLV_SERVICE_FREQINFO_IN_METADATA = 219,
+ 	WMI_TLV_SERVICE_EXT2_MSG = 220,
++	WMI_TLV_SERVICE_MULTIPLE_VDEV_RESTART_RESPONSE_SUPPORT = 235,
+ 	WMI_TLV_SERVICE_SRG_SRP_SPATIAL_REUSE_SUPPORT = 249,
+ 	WMI_TLV_SERVICE_CTRL_PATH_STATS_REQUEST = 250,
+ 	WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT = 253,
+@@ -5458,6 +5461,47 @@ struct wmi_pdev_set_bios_geo_table_cmd {
+ 	__le32 geo_len;
+ } __packed;
+ 
++/* Inform FW that host expects response for multi-vdev
++ * restart command */
++#define WMI_MVR_RESPONSE_SUPPORT_EXPECTED     0x1
++#define WMI_MVR_CMD_TIMEOUT_HZ		      (2 * HZ)
++#define WMI_MVR_RESP_VDEV_BM_MAX_LEN	      2
++#define WMI_MVR_RESP_VDEV_BM_MAX_LEN_BYTES    (WMI_MVR_RESP_VDEV_BM_MAX_LEN * 4)
++
++struct wmi_vdev_ids_arg {
++	u32 id_len;
++	u32 id[17]; /* TARGET_NUM_VDEVS */
++};
++
++struct wmi_pdev_multiple_vdev_restart_req_arg {
++	struct wmi_vdev_ids_arg vdev_ids;
++	struct wmi_vdev_start_req_arg vdev_start_arg;
++	u16 ru_punct_bitmap;
++};
++
++struct wmi_pdev_multiple_vdev_restart_request_cmd {
++	__le32 tlv_header;
++	__le32 pdev_id;
++	__le32 requestor_id;
++	__le32 disable_hw_ack;
++	__le32 cac_duration_ms;
++	__le32 num_vdevs;
++	__le32 flags;
++	__le32 puncture_20mhz_bitmap;
++} __packed;
++
++struct wmi_pdev_mvr_resp_event_fixed_param {
++	u32 pdev_id;
++	u32 requestor_id;
++	u32 status;
++} __packed;
++
++struct wmi_pdev_mvr_resp_event_parse {
++	struct wmi_pdev_mvr_resp_event_fixed_param fixed_param;
++	u32 num_vdevs_bm;
++	u32 vdev_id_bm[WMI_MVR_RESP_VDEV_BM_MAX_LEN];
++} __packed;
++
+ #define ATH12K_FW_STATS_BUF_SIZE (1024 * 1024)
+ 
+ enum wmi_sys_cap_info_flags {
+@@ -6618,5 +6662,8 @@ void ath12k_wmi_fw_stats_dump(struct ath
+ int ath12k_wmi_pdev_m3_dump_enable(struct ath12k *ar, u32 enable);
+ int ath12k_wmi_dbglog_cfg(struct ath12k *ar, u32 param, u64 value);
+ int ath12k_wmi_pdev_ap_ps_cmd_send(struct ath12k *ar, u8 pdev_id, u32 value);
++bool ath12k_wmi_is_mvr_supported(struct ath12k_base *ab);
++int ath12k_wmi_pdev_multiple_vdev_restart(struct ath12k *ar,
++					  struct wmi_pdev_multiple_vdev_restart_req_arg *arg);
+ 
+ #endif

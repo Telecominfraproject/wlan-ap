@@ -1,0 +1,208 @@
+From 819e58bb18c974a8494a36954f79ed80a18db4ec Mon Sep 17 00:00:00 2001
+From: P Praneesh <ppranees@qti.qualcomm.com>
+Date: Tue, 8 Jul 2025 16:39:34 +0530
+Subject: [PATCH 5/9] Upstream: DP: wifi: ath12k: Free buffer address during HW
+ error condition
+
+During backpressure scenarios, hardware may signal end reasons such as PPDU
+Flush, PPDU Truncated, or Empty Descriptor. In the current implementation,
+only the status buffers are freed when handling these end reasons. However,
+these status buffers may contain Buffer Address TLV tags that reference
+another page memory for MSDU payloads.
+
+The existing code does not traverse the status buffer to locate and free
+these MSDU payload buffers, resulting in a memory leak. Fix this by
+iterating through the status buffer SKBs, identifying Buffer Address TLV
+tags, and explicitly freeing the associated MSDU payload memory before
+releasing the original status buffer. This ensures all dynamically
+allocated memory is properly reclaimed, preventing memory leaks during
+backpressure handling.
+
+Patch-dependency:
+0475-04-Upstream-DP-wifi-ath12k-add-page-fragment-support-in.patch
+
+Signed-off-by: P Praneesh <ppranees@qti.qualcomm.com>
+---
+ .../net/wireless/ath/ath12k/wifi7/dp_mon2.c   | 137 +++++++++++++++---
+ 1 file changed, 115 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+index 89ade8e..5457a2a 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+@@ -444,6 +444,99 @@ ath12k_wifi7_dp_mon_rx_parse_ppdu_status(struct ath12k_pdev_dp *dp_pdev,
+ 	return hal_status;
+ }
+ 
++static void ath12k_wifi7_dp_mon_h_flush_tlv(struct ath12k_pdev_dp *pdev_dp,
++					    struct ath12k_dp_mon_desc *mon_desc)
++{
++	struct ath12k_dp *dp = pdev_dp->dp;
++	struct dp_rxdma_mon_ring *buf_ring = &dp->dp_mon->rxdma_mon_buf_ring;
++	struct list_head mon_desc_used_list;
++	struct dp_mon_packet_info *packet_info;
++	struct hal_tlv_64_hdr *tlv;
++	struct ath12k_dp_mon_desc *pkt_desc;
++	u8 *mon_buf = mon_desc->mon_buf;
++	u16 tlv_tag, tlv_len, mon_buf_len = mon_desc->buf_len;
++	u8 *ptr = mon_buf;
++	int num_buf = 0;
++
++	INIT_LIST_HEAD(&mon_desc_used_list);
++
++	do {
++		tlv = (struct hal_tlv_64_hdr *)ptr;
++		tlv_tag = le64_get_bits(tlv->tl, HAL_TLV_64_HDR_TAG);
++		ptr += sizeof(*tlv);
++
++		/* The actual length of PPDU_END is the combined length of many PHY
++		 * TLVs that follow. Skip the TLV header and
++		 * rx_rxpcu_classification_overview that follows the header to get to
++		 * next TLV.
++		 */
++
++		if (tlv_tag == HAL_RX_PPDU_END)
++			tlv_len = sizeof(struct hal_rx_rxpcu_classification_overview);
++		else
++			tlv_len = le64_get_bits(tlv->tl, HAL_TLV_64_HDR_LEN);
++
++		if (tlv_tag == HAL_MON_BUF_ADDR) {
++			packet_info = (struct dp_mon_packet_info *)ptr;
++
++			pkt_desc = (struct ath12k_dp_mon_desc *)
++				    (uintptr_t)(packet_info->cookie);
++			if (unlikely(!pkt_desc)) {
++				ath12k_warn(dp,
++					    "mon_flush: NULL pkt_desc received in macid %d\n",
++					    pdev_dp->mac_id);
++				goto next_tlv;
++			}
++
++			pkt_desc->mon_buf = NULL;
++			list_add_tail(&pkt_desc->list, &mon_desc_used_list);
++			num_buf++;
++			if (unlikely(pkt_desc->magic != ATH12K_MON_MAGIC_VALUE)) {
++				ath12k_warn(dp,
++					    "mon_flush: invalid magic value in mac_id %d\n",
++					    pdev_dp->mac_id);
++				goto next_tlv;
++			}
++
++			if (unlikely(!pkt_desc->in_use)) {
++				ath12k_warn(dp,
++					    "mon_flush: in_use flag not set, mac_id %d\n",
++					    pdev_dp->mac_id);
++				goto next_tlv;
++			}
++
++			ath12k_core_dma_unmap_page(dp->dev, pkt_desc->paddr,
++						   ATH12K_DP_MON_RX_BUF_SIZE,
++						   DMA_FROM_DEVICE);
++			page_frag_free(pkt_desc->mon_buf);
++		}
++
++next_tlv:
++		ptr += tlv_len;
++		ptr = PTR_ALIGN(ptr, HAL_TLV_64_ALIGN);
++	} while ((ptr - mon_buf) <= mon_buf_len);
++
++	if (likely(!list_empty(&mon_desc_used_list)))
++		ath12k_dp_mon_buf_replenish(dp, buf_ring, &mon_desc_used_list, num_buf);
++
++	page_frag_free(mon_buf);
++	mon_desc->mon_buf = NULL;
++}
++
++static inline void
++ath12k_wifi7_dp_mon_flush_desc_chain(struct ath12k_pdev_dp *pdev_dp,
++				     struct list_head *mon_desc_used_list)
++{
++	struct ath12k_dp_mon_desc *prev, *tmp;
++
++	list_for_each_entry_safe_reverse(prev, tmp, mon_desc_used_list, list) {
++		if (prev->end_of_ppdu)
++			break;
++
++		ath12k_wifi7_dp_mon_h_flush_tlv(pdev_dp, prev);
++	}
++}
++
+ static void __maybe_unused
+ ath12k_dp_rx_pktlog_process(struct ath12k_pdev_dp *pdev_dp,
+ 			    struct ath12k_dp_link_peer *peer,
+@@ -522,8 +615,11 @@ int ath12k_dp_mon_rx_dual_ring_process(struct ath12k_pdev_dp *pdev_dp, int mac_i
+ 		 * continues.
+ 		 */
+ 		info0 = le32_to_cpu(mon_dst_desc->info0);
+-		if (u32_get_bits(info0, HAL_MON_DEST_INFO0_EMPTY_DESC))
++		if (u32_get_bits(info0, HAL_MON_DEST_INFO0_EMPTY_DESC)) {
++			ath12k_wifi7_dp_mon_flush_desc_chain(pdev_dp,
++							     &mon_desc_used_list);
+ 			goto move_next;
++		}
+ 
+ 		desc_va = le64_to_cpu(mon_dst_desc->cookie);
+ 		mon_desc = (struct ath12k_dp_mon_desc *)(uintptr_t)(desc_va);
+@@ -550,6 +646,21 @@ int ath12k_dp_mon_rx_dual_ring_process(struct ath12k_pdev_dp *pdev_dp, int mac_i
+ 		ath12k_core_dma_unmap_page(dp->dev, mon_desc->paddr,
+ 					   ATH12K_DP_MON_RX_BUF_SIZE, DMA_FROM_DEVICE);
+ 
++		end_offset = u32_get_bits(info0, HAL_MON_DEST_INFO0_END_OFFSET);
++		if (unlikely(end_offset > DP_RX_BUFFER_SIZE))
++			ath12k_warn(dp,
++				    "mon_dest: invalid offset %u received in mac_id %d\n",
++				    end_offset, pdev_dp->mac_id);
++
++		if (unlikely(end_offset > DP_RX_BUFFER_SIZE))
++			end_offset = DP_RX_BUFFER_SIZE - 1;
++
++		/* The hardware reports the buffer length as (actual_length - 1),
++		 * likely due to internal indexing or alignment constraints.
++		 * To obtain the true buffer length for processing, increment
++		 * the reported end_offset by 1 before using it.
++		 */
++		mon_desc->buf_len = end_offset + 1;
+ 		end_reason = u32_get_bits(info0, HAL_MON_DEST_INFO0_END_REASON);
+ 
+ 		/* HAL_MON_FLUSH_DETECTED implies that an rx flush received at the end of
+@@ -562,8 +673,9 @@ int ath12k_dp_mon_rx_dual_ring_process(struct ath12k_pdev_dp *pdev_dp, int mac_i
+ 			ath12k_dbg(ab, ATH12K_DBG_DATA,
+ 				   "mon_dest: descriptor end reason %d mac_id %d",
+ 				   end_reason, pdev_dp->mac_id);
+-			page_frag_free(mon_buf);
+-			mon_desc->mon_buf = NULL;
++			ath12k_wifi7_dp_mon_h_flush_tlv(pdev_dp, mon_desc);
++			ath12k_wifi7_dp_mon_flush_desc_chain(pdev_dp,
++							     &mon_desc_used_list);
+ 			goto move_next;
+ 		}
+ 
+@@ -576,25 +688,6 @@ int ath12k_dp_mon_rx_dual_ring_process(struct ath12k_pdev_dp *pdev_dp, int mac_i
+ 			mon_desc->end_of_ppdu = true;
+ 		}
+ 
+-		end_offset = u32_get_bits(info0, HAL_MON_DEST_INFO0_END_OFFSET);
+-		if (unlikely(end_offset > DP_RX_BUFFER_SIZE))
+-			ath12k_warn(ab,
+-				    "mon_dest: invalid offset %u received in mac_id %d\n",
+-				    end_offset, pdev_dp->mac_id);
+-
+-		if (unlikely(end_offset > DP_RX_BUFFER_SIZE)) {
+-			ath12k_warn(dp,
+-				    "mon_dest: end_off (%u) exceeds max buff size (%u), clamping to max\n",
+-				    end_offset, DP_RX_BUFFER_SIZE);
+-			end_offset = DP_RX_BUFFER_SIZE;
+-		}
+-
+-		/* The hardware reports the buffer length as (actual_length - 1),
+-		 * likely due to internal indexing or alignment constraints.
+-		 * To obtain the true buffer length for processing, increment
+-		 * the reported end_offset by 1 before using it.
+-		 */
+-		mon_desc->buf_len = end_offset + 1;
+ move_next:
+ 		ath12k_hal_srng_dst_get_next_entry(ab, srng);
+ 		num_buffs_reaped++;
+-- 
+2.34.1
+

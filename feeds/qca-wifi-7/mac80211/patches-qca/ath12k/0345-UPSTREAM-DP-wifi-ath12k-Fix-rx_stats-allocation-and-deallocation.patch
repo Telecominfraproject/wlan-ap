@@ -1,0 +1,128 @@
+From ee4089c48be210d6691cc3ef9f9110278cce973e Mon Sep 17 00:00:00 2001
+From: Aniruddha Mishra <anirmish@qti.qualcomm.com>
+Date: Tue, 10 Jun 2025 12:43:21 +0530
+Subject: [PATCH] wifi: ath12k: Fix rx_stats allocation and deallocation
+
+1. Currently, rx_stats is allocated before peer is created.
+When a sta is associating, rx_stats is allocated while peer
+is not created and hence is NULL. This NULL pointer dereferencing
+causes crash on STA associatiion.
+Hence moving rx_stats allocation after peer to
+ath12k_dp_link_peer_assign .
+Also removing return statement in case allocation fails,
+as this is not a critical functionality for peer operation
+
+2. Currently, rx_stats is freed during ath12k_peer_unmap_event
+This path may not always hit such as in error condition
+where ath12k_peer_delete is directly called leading to memory leak
+and in case of MLO clients called using
+ath12k_peer_mlo_link_peers_delete.
+Hence, freeing rx_stats in ath12k_dp_link_peer_unassign
+
+3. When displaying ext_rx_stats for a peer, buf is allocated using
+GFP_KERNEL while holding a mutex lock.
+GFP_KERNEL will sleep if memory is not available.
+Due to this call trace is displayed with the below warning.
+
+[  826.313538] BUG: sleeping function called from invalid context at include/linux/sched/mm.h:306
+[  826.319623] in_atomic(): 1, irqs_disabled(): 0, non_block: 0, pid: 10149, name: cat
+[  826.328123] preempt_count: 201, expected: 0
+[  826.335665] RCU nest depth: 0, expected: 0
+[  826.339840] CPU: 1 PID: 10149 Comm: cat Tainted: G        W  O       6.6.47+
+
+To avoid this using GFP_ATOMIC flag instead
+
+Signed-off-by: Aniruddha Mishra <anirmish@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/debugfs_sta.c |  2 +-
+ drivers/net/wireless/ath/ath12k/dp_peer.c     | 10 +++++++++-
+ drivers/net/wireless/ath/ath12k/peer.c        | 11 -----------
+ 3 files changed, 10 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/debugfs_sta.c b/drivers/net/wireless/ath/ath12k/debugfs_sta.c
+index ff6d683..ef48937 100644
+--- a/drivers/net/wireless/ath/ath12k/debugfs_sta.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs_sta.c
+@@ -763,7 +763,7 @@ static ssize_t ath12k_dbg_sta_dump_rx_stats(struct file *file,
+ 		return -ENOENT;
+ 	}
+ 
+-	u8 *buf __free(kfree) = kzalloc(size, GFP_KERNEL);
++	u8 *buf __free(kfree) = kzalloc(size, GFP_ATOMIC);
+ 	if (!buf) {
+ 		spin_unlock_bh(&dp->dp_lock);
+ 		wiphy_unlock(ah->hw->wiphy);
+diff --git a/drivers/net/wireless/ath/ath12k/dp_peer.c b/drivers/net/wireless/ath/ath12k/dp_peer.c
+index 5a22b00..c60c2fa 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.c
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.c
+@@ -7,6 +7,7 @@
+ #include "core.h"
+ #include "dp_peer.h"
+ #include "debug.h"
++#include "debugfs.h"
+ 
+ struct ath12k_dp_link_peer *
+ ath12k_dp_link_peer_find_by_vdev_id_and_addr(struct ath12k_dp *dp,
+@@ -187,7 +188,6 @@ void ath12k_peer_unmap_event(struct ath12k_base *ab, u16 peer_id)
+ 	ath12k_dbg(ab, ATH12K_DBG_PEER, "htt peer unmap vdev %d peer %pM id %d\n",
+ 		   peer->vdev_id, peer->addr, peer_id);
+ 
+-	kfree(peer->peer_stats.rx_stats);
+ 	list_del(&peer->list);
+ 	kfree(peer);
+ 	wake_up(&ab->peer_mapping_wq);
+@@ -626,6 +626,11 @@ int ath12k_dp_link_peer_assign(struct ath12k_dp *dp, u8 pdev_idx, u8 vdev_id,
+ 			      u32_encode_bits(peer->peer_id, HTT_TCL_META_DATA_PEER_ID);
+ 	peer->tcl_metadata &= ~HTT_TCL_META_DATA_VALID_HTT;
+ 
++	if (ath12k_debugfs_is_extd_rx_stats_enabled(dp_pdev->ar) &&
++				!peer->peer_stats.rx_stats) {
++		peer->peer_stats.rx_stats = kzalloc(sizeof(*peer->peer_stats.rx_stats), GFP_ATOMIC);
++	}
++
+ 	dp_peer->hw_links[peer->hw_link_id] = link_id;
+ 
+ 	peerid_index = ath12k_dp_peer_get_peerid_index(dp, peer->peer_id);
+@@ -681,6 +686,9 @@ void ath12k_dp_link_peer_unassign(struct ath12k_dp *dp, u8 pdev_idx,
+ 
+ 	spin_unlock_bh(&dp_hw->peer_lock);
+ 
++	if (peer->peer_stats.rx_stats)
++		kfree(peer->peer_stats.rx_stats);
++
+ 	ath12k_dp_link_peer_rhash_delete(dp, peer);
+ 
+ 	peer->dp_peer = NULL;
+diff --git a/drivers/net/wireless/ath/ath12k/peer.c b/drivers/net/wireless/ath/ath12k/peer.c
+index 12aa176..0851d3f 100644
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -8,7 +8,6 @@
+ #include "peer.h"
+ #include "dp_peer.h"
+ #include "debug.h"
+-#include "debugfs.h"
+ #ifdef CPTCFG_MAC80211_PPE_SUPPORT
+ #include "ppe.h"
+ #endif
+@@ -206,16 +205,6 @@ int ath12k_peer_create(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 		return ret;
+ 	}
+ 
+-	if (ath12k_debugfs_is_extd_rx_stats_enabled(ar) &&
+-				!peer->peer_stats.rx_stats) {
+-		peer->peer_stats.rx_stats = kzalloc(sizeof(*peer->peer_stats.rx_stats),
+-				GFP_ATOMIC);
+-		if (!peer->peer_stats.rx_stats) {
+-			kfree(peer);
+-			return -ENOMEM;
+-		}
+-	}
+-
+ 	ret = ath12k_wait_for_peer_created(ar, arg->vdev_id,
+ 					   arg->peer_addr);
+ 	if (ret)
+-- 
+2.34.1
+

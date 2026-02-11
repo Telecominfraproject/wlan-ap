@@ -1,0 +1,1304 @@
+From fb01a835e7a87b6eb7bb21e70c472357f9be004a Mon Sep 17 00:00:00 2001
+From: P Praneesh <ppranees@qti.qualcomm.com>
+Date: Mon, 7 Jul 2025 23:15:09 +0530
+Subject: [PATCH 4/9] Upstream: DP: wifi: ath12k: add page fragment support in
+ monitor path
+
+Currently, the driver allocates an skb for each frame received in the
+monitor destination ring, leading to higher memory consumption, especially
+in extended statistics and monitor modes. In extended statistics mode,
+hardware copies TLV tags and data into the skb->data area, leaving other
+members of the struct sk_buff unused and unnecessarily consuming memory.
+Similarly, in monitor mode, when AMSDU frames are received, all MSDUs
+are allocated within the struct sk_buff, which is inefficient.
+
+To address this, introduce fragmented memory allocation. Using the
+page fragment approach, payloads and TLVs are stored in 2K-sized page
+fragments, optimizing memory usage.
+
+Patch-dependency:
+0475-03-Upstream-DP-wifi-ath12k-Utilize-monitor-descriptor-d.patch
+
+Signed-off-by: P Praneesh <ppranees@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h        |  24 ++
+ drivers/net/wireless/ath/ath12k/dp_mon.c      | 236 ++++++----
+ drivers/net/wireless/ath/ath12k/dp_mon.h      |  33 +-
+ drivers/net/wireless/ath/ath12k/dp_rx.h       |   1 +
+ drivers/net/wireless/ath/ath12k/hal_mon_cmn.h |  11 +
+ .../net/wireless/ath/ath12k/wifi7/dp_mon1.c   |  13 +-
+ .../net/wireless/ath/ath12k/wifi7/dp_mon2.c   | 406 ++++++++++++------
+ .../net/wireless/ath/ath12k/wifi7/hal_mon.c   |  16 +-
+ .../net/wireless/ath/ath12k/wifi7/hal_mon.h   |   9 +-
+ 9 files changed, 543 insertions(+), 206 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -2150,6 +2150,30 @@ static inline void ath12k_core_dma_unmap
+ #endif
+ }
+ 
++static inline dma_addr_t
++ath12k_core_dma_map_page(struct device *dev, struct page *page,
++			 unsigned long offset, size_t size,
++			 enum dma_data_direction dir)
++{
++#ifndef CONFIG_IO_COHERENCY
++	dma_addr_t addr;
++
++	addr = dma_map_page(dev, page, offset, size, dir);
++
++	return addr;
++#else
++	return (virt_to_phys(page_address(page)) + offset);
++#endif
++}
++
++static inline void ath12k_core_dma_unmap_page(struct device *dev, dma_addr_t handle,
++					      size_t size, enum dma_data_direction dir)
++{
++#ifndef CONFIG_IO_COHERENCY
++	dma_unmap_page(dev, handle, size, dir);
++#endif
++}
++
+ static inline struct ath12k_base *ath12k_pdev_to_ab(struct ath12k_pdev *pdev)
+ {
+        if (!pdev)
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -54,7 +54,7 @@ ath12k_dp_mon_rx_ul_ofdma_ru_size_to_wid
+ 	}
+ }
+ 
+-static void
++void
+ ath12k_dp_mon_fill_rx_stats_info(struct hal_rx_mon_ppdu_info *ppdu_info,
+ 				 struct ieee80211_rx_status *rx_status)
+ {
+@@ -80,6 +80,7 @@ ath12k_dp_mon_fill_rx_stats_info(struct
+ 		rx_status->band = NUM_NL80211_BANDS;
+ 	}
+ }
++EXPORT_SYMBOL(ath12k_dp_mon_fill_rx_stats_info);
+ 
+ static void
+ ath12k_dp_mon_fill_rx_rate(struct ath12k_pdev_dp *dp_pdev,
+@@ -358,10 +359,10 @@ ath12k_dp_mon_rx_update_radiotap_he_mu(s
+ 	rtap_buf[rtap_len] = rx_status->he_RU[3];
+ }
+ 
+-static void ath12k_dp_mon_update_radiotap(struct ath12k_pdev_dp *dp_pdev,
+-					  struct hal_rx_mon_ppdu_info *ppduinfo,
+-					  struct sk_buff *mon_skb,
+-					  struct ieee80211_rx_status *rxs)
++void ath12k_dp_mon_update_radiotap(struct ath12k_pdev_dp *dp_pdev,
++				   struct hal_rx_mon_ppdu_info *ppduinfo,
++				   struct sk_buff *mon_skb,
++				   struct ieee80211_rx_status *rxs)
+ {
+ 	struct ieee80211_supported_band *sband;
+ 	u8 *ptr = NULL;
+@@ -454,12 +455,13 @@ static void ath12k_dp_mon_update_radiota
+ 
+ 	rxs->mactime = ppduinfo->tsft;
+ }
++EXPORT_SYMBOL(ath12k_dp_mon_update_radiotap);
+ 
+-static void ath12k_dp_mon_rx_deliver_msdu(struct ath12k_pdev_dp *dp_pdev, struct napi_struct *napi,
+-					  struct sk_buff *msdu,
+-					  struct ieee80211_rx_status *status,
+-					  struct hal_rx_mon_ppdu_info *ppduinfo,
+-					  u8 decap)
++void ath12k_dp_mon_rx_deliver_skb(struct ath12k_pdev_dp *dp_pdev,
++				  struct napi_struct *napi,
++				  struct sk_buff *msdu,
++				  struct ieee80211_rx_status *status,
++				  struct hal_rx_mon_ppdu_info *ppduinfo)
+ {
+ 	struct ath12k_dp *dp = dp_pdev->dp;
+ 	struct ath12k_base *ab = dp->ab;
+@@ -474,7 +476,6 @@ static void ath12k_dp_mon_rx_deliver_msd
+ 	struct ath12k_dp_link_peer *peer;
+ 	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
+ 	bool is_mcbc = rxcb->is_mcbc;
+-	bool is_eapol_tkip = rxcb->is_eapol;
+ 
+ 	status->link_valid = 0;
+ 	status->link_id = 0;
+@@ -527,19 +528,9 @@ static void ath12k_dp_mon_rx_deliver_msd
+ 	rx_status = IEEE80211_SKB_RXCB(msdu);
+ 	*rx_status = *status;
+ 
+-	/* TODO: trace rx packet */
+-
+-	/* PN for multicast packets are not validate in HW,
+-	 * so skip 802.3 rx path
+-	 * Also, fast_rx expects the STA to be authorized, hence
+-	 * eapol packets are sent in slow path.
+-	 */
+-	if (decap == DP_RX_DECAP_TYPE_ETHERNET2_DIX && !is_eapol_tkip &&
+-	    !(is_mcbc && rx_status->flag & RX_FLAG_DECRYPTED))
+-		rx_status->flag |= RX_FLAG_8023;
+-
+ 	ieee80211_rx_napi(ath12k_dp_pdev_to_hw(dp_pdev), pubsta, msdu, napi);
+ }
++EXPORT_SYMBOL(ath12k_dp_mon_rx_deliver_skb);
+ 
+ int ath12k_dp_mon_rx_deliver(struct ath12k_pdev_dp *dp_pdev,
+ 			     struct dp_mon_mpdu *mon_mpdu,
+@@ -579,7 +570,7 @@ int ath12k_dp_mon_rx_deliver(struct ath1
+ 			decap = mon_mpdu->decap_format;
+ 
+ 		ath12k_dp_mon_update_radiotap(dp_pdev, ppduinfo, mon_skb, rxs);
+-		ath12k_dp_mon_rx_deliver_msdu(dp_pdev, napi, mon_skb, rxs, ppduinfo, decap);
++		ath12k_dp_mon_rx_deliver_skb(dp_pdev, napi, mon_skb, rxs, ppduinfo);
+ 		mon_skb = skb_next;
+ 	} while (mon_skb);
+ 	rxs->flag = 0;
+@@ -620,13 +611,14 @@ static void
+ ath12k_dp_mon_handle_mon_desc(struct ath12k_dp *dp, struct ath12k_dp_mon_desc *mon_desc)
+ {
+ 	struct ath12k_dp_mon *dp_mon = dp->dp_mon;
+-	struct sk_buff *skb = mon_desc->skb;
++	u8 *mon_buf = mon_desc->mon_buf;
+ 
+-	if (skb) {
+-		ath12k_core_dma_unmap_single(dp->dev, mon_desc->paddr,
+-					     skb->len + skb_tailroom(skb),
+-					     DMA_FROM_DEVICE);
+-		dev_kfree_skb_any(skb);
++	if (mon_buf) {
++		ath12k_core_dma_unmap_page(dp->dev, mon_desc->paddr,
++					   ATH12K_DP_MON_RX_BUF_SIZE,
++					   DMA_FROM_DEVICE);
++		page_frag_free(mon_buf);
++		mon_desc->mon_buf = NULL;
+ 	}
+ 
+ 	spin_lock_bh(&dp->dp_mon->mon_desc_lock);
+@@ -641,13 +633,15 @@ int ath12k_dp_mon_buf_replenish(struct a
+ 				int req_entries)
+ {
+ 	struct ath12k_base *ab = dp->ab;
+-	struct hal_mon_buf_ring *mon_buf;
+-	struct sk_buff *skb;
++	struct hal_mon_buf_ring *mon_buf_desc;
+ 	struct hal_srng *srng;
+ 	struct ath12k_dp_mon *dp_mon = dp->dp_mon;
+ 	struct ath12k_dp_mon_desc *mon_desc, *tmp_mon_desc;
++	struct page *page;
++	u64 offset;
+ 	dma_addr_t paddr;
+ 	int ret = 0;
++	u8 *mon_buf;
+ 
+ 	list_for_each_entry_safe(mon_desc, tmp_mon_desc, used_list, list) {
+ 		if (unlikely(!mon_desc->in_use)) {
+@@ -657,39 +651,30 @@ int ath12k_dp_mon_buf_replenish(struct a
+ 			continue;
+ 		}
+ 
+-		skb = dev_alloc_skb(DP_RX_MON_BUFFER_SIZE + DP_RX_BUFFER_ALIGN_SIZE);
+-		if (unlikely(!skb)) {
++		mon_buf = page_frag_alloc(&dp_mon->rx_mon_pf_cache,
++					  ATH12K_DP_MON_RX_BUF_SIZE,
++					  GFP_ATOMIC);
++		if (unlikely(!mon_buf)) {
+ 			ret = -ENOMEM;
+ 			goto out;
+ 		}
+ 
+-		if (!IS_ALIGNED((unsigned long)skb->data, DP_RX_BUFFER_ALIGN_SIZE))
+-			skb_pull(skb,
+-				 PTR_ALIGN(skb->data, DP_RX_BUFFER_ALIGN_SIZE) -
+-				 skb->data);
+-
+-#ifndef CONFIG_IO_COHERENCY
+-		paddr = dma_map_single(ab->dev, skb->data, skb->len + skb_tailroom(skb),
+-				       DMA_FROM_DEVICE);
++		page = virt_to_head_page(mon_buf);
++		offset = ((void *)mon_buf) - page_address(page);
++		paddr = ath12k_core_dma_map_page(ab->dev, page, offset,
++						 ATH12K_DP_MON_RX_BUF_SIZE,
++						 DMA_FROM_DEVICE);
+ 		if (unlikely(dma_mapping_error(ab->dev, paddr))) {
+-			dev_kfree_skb_any(skb);
+-			ret = -EIO;
+-			goto out;
+-		}
+-#else
+-		paddr = virt_to_phys(skb->data);
+-		if (unlikely(!paddr)) {
+-			dev_kfree_skb_any(skb);
++			page_frag_free(mon_buf);
+ 			ret = -EIO;
+ 			goto out;
+ 		}
+-#endif
+ 
+-		ATH12K_SKB_RXCB(skb)->paddr = paddr;
+-		mon_desc->skb = skb;
++		mon_desc->mon_buf = mon_buf;
+ 		mon_desc->paddr = paddr;
+ 		mon_desc->magic = ATH12K_MON_MAGIC_VALUE;
+ 		mon_desc->buf_len = 0;
++		mon_desc->end_of_ppdu = 0;
+ 	}
+ 
+ 	srng = &ab->hal.srng_list[buf_ring->refill_buf_ring.ring_id];
+@@ -704,16 +689,16 @@ int ath12k_dp_mon_buf_replenish(struct a
+ 			goto ring_unlock;
+ 		}
+ 
+-		mon_buf = ath12k_hal_srng_src_get_next_entry(ab, srng);
+-		if (unlikely(!mon_buf)) {
++		mon_buf_desc = ath12k_hal_srng_src_get_next_entry(ab, srng);
++		if (unlikely(!mon_buf_desc)) {
+ 			ret = -ENOSPC;
+ 			goto ring_unlock;
+ 		}
+ 
+ 		list_del(&mon_desc->list);
+-		mon_buf->paddr_lo = cpu_to_le32(lower_32_bits(mon_desc->paddr));
+-		mon_buf->paddr_hi = cpu_to_le32(upper_32_bits(mon_desc->paddr));
+-		mon_buf->cookie = cpu_to_le64((uintptr_t)mon_desc);
++		mon_buf_desc->paddr_lo = cpu_to_le32(lower_32_bits(mon_desc->paddr));
++		mon_buf_desc->paddr_hi = cpu_to_le32(upper_32_bits(mon_desc->paddr));
++		mon_buf_desc->cookie = cpu_to_le64((uintptr_t)mon_desc);
+ 
+ 		req_entries--;
+ 	}
+@@ -726,12 +711,12 @@ out:
+ 	if (unlikely(!list_empty(used_list))) {
+ 		/* Reset the use flag */
+ 		list_for_each_entry_safe(mon_desc, tmp_mon_desc, used_list, list) {
+-			skb = mon_desc->skb;
+-			if (skb) {
+-				ath12k_core_dma_unmap_single(dp->dev, mon_desc->paddr,
+-							     skb->len + skb_tailroom(skb),
+-							     DMA_FROM_DEVICE);
+-				dev_kfree_skb_any(skb);
++			mon_buf = mon_desc->mon_buf;
++			if (mon_buf) {
++				ath12k_core_dma_unmap_page(ab->dev, mon_desc->paddr,
++							   ATH12K_DP_MON_RX_BUF_SIZE,
++							   DMA_FROM_DEVICE);
++				page_frag_free(mon_buf);
+ 			}
+ 
+ 			ath12k_dp_mon_desc_reset(mon_desc);
+@@ -1691,8 +1676,8 @@ EXPORT_SYMBOL(ath12k_dp_mon_rx_buf_setup
+ void ath12k_dp_mon_rx_buf_free(struct ath12k_dp *dp)
+ {
+ 	struct ath12k_dp_mon *dp_mon = dp->dp_mon;
+-	struct sk_buff *skb;
+ 	int i;
++	u8 *mon_buf;
+ 
+ 	spin_lock_bh(&dp_mon->mon_desc_lock);
+ 	if (!dp_mon->mon_desc_pool) {
+@@ -1704,16 +1689,16 @@ void ath12k_dp_mon_rx_buf_free(struct at
+ 		if (!dp_mon->mon_desc_pool[i].in_use)
+ 			continue;
+ 
+-		skb = dp_mon->mon_desc_pool[i].skb;
+-		if (!skb)
+-			continue;
++		mon_buf = dp_mon->mon_desc_pool[i].mon_buf;
++		if (!mon_buf)
++			goto reset_mon_desc;
++
++		ath12k_core_dma_unmap_page(dp->dev, dp_mon->mon_desc_pool[i].paddr,
++					   ATH12K_DP_MON_RX_BUF_SIZE, DMA_FROM_DEVICE);
++		page_frag_free(mon_buf);
+ 
+-		dp_mon->mon_desc_pool[i].skb = NULL;
+-		dma_unmap_single(dp->dev, ATH12K_SKB_RXCB(skb)->paddr,
+-				 skb->len + skb_tailroom(skb), DMA_FROM_DEVICE);
+-		dp_mon->mon_desc_pool[i].paddr = 0;
+-		dp_mon->mon_desc_pool[i].in_use = false;
+-		dev_kfree_skb_any(skb);
++reset_mon_desc:
++		ath12k_dp_mon_desc_reset(&dp_mon->mon_desc_pool[i]);
+ 	}
+ 
+ 	kfree(dp_mon->mon_desc_pool);
+@@ -2127,3 +2112,106 @@ int ath12k_dp_get_peer_telemetry_stats(s
+ 
+        return 0;
+ }
++
++static inline struct sk_buff *ath12k_mon_get_last_skb_from_fraglist(struct sk_buff *skb)
++{
++	struct sk_buff *last_skb;
++
++	for (last_skb = skb_shinfo(skb)->frag_list;
++	     last_skb && last_skb->next;
++	     last_skb = last_skb->next)
++		;
++
++	return last_skb;
++}
++
++struct sk_buff *
++ath12k_dp_mon_get_skb_valid_frag(struct ath12k_dp *dp, struct sk_buff *skb)
++{
++	struct sk_buff *last_skb;
++	u32 num_frags;
++
++	if (unlikely(!skb)) {
++		ath12k_warn(dp, "invalid skb, cannot retrieve valid skb\n");
++		return NULL;
++	}
++
++	num_frags = skb_shinfo(skb)->nr_frags;
++	if (likely(num_frags < MAX_SKB_FRAGS))
++		return skb;
++
++	if (unlikely(!skb_has_frag_list(skb))) {
++		ath12k_warn(dp, "skb has no frag_list, cannot retrieve last fragment\n");
++		return NULL;
++	}
++
++	last_skb = ath12k_mon_get_last_skb_from_fraglist(skb);
++	if (unlikely(!last_skb)) {
++		ath12k_warn(dp, "frag_list present but no valid last skb found\n");
++		return NULL;
++	}
++
++	num_frags = skb_shinfo(last_skb)->nr_frags;
++	if (likely(num_frags < MAX_SKB_FRAGS))
++		return last_skb;
++
++	ath12k_warn(dp, "no skb with available frag slots found in skb or frag_list\n");
++	return NULL;
++}
++EXPORT_SYMBOL(ath12k_dp_mon_get_skb_valid_frag);
++
++void ath12k_dp_mon_update_skb_len(struct sk_buff *skb_head, u32 frag_len)
++{
++	skb_head->data_len += frag_len;
++	skb_head->len += frag_len;
++}
++EXPORT_SYMBOL(ath12k_dp_mon_update_skb_len);
++
++void ath12k_dp_mon_append_skb(struct sk_buff *skb, struct sk_buff *tmp_skb)
++{
++	struct sk_buff *last_skb;
++
++	if (unlikely(!skb_has_frag_list(skb))) {
++		skb_shinfo(skb)->frag_list = tmp_skb;
++	} else {
++		last_skb = ath12k_mon_get_last_skb_from_fraglist(skb);
++		if (last_skb)
++			last_skb->next = tmp_skb;
++	}
++}
++EXPORT_SYMBOL(ath12k_dp_mon_append_skb);
++
++void ath12k_dp_mon_skb_remove_frag(struct ath12k_dp *dp, struct sk_buff *skb,
++				   u16 idx, u16 truesize)
++{
++	struct page *page;
++	u16 frag_len;
++
++	page = skb_frag_page(&skb_shinfo(skb)->frags[idx]);
++	if (unlikely(!page))
++		return;
++
++	frag_len = skb_frag_size(&skb_shinfo(skb)->frags[idx]);
++	put_page(page);
++	skb->len -= frag_len;
++	skb->data_len -= frag_len;
++	skb->truesize -= truesize;
++	skb_shinfo(skb)->nr_frags--;
++}
++EXPORT_SYMBOL(ath12k_dp_mon_skb_remove_frag);
++
++void ath12k_dp_mon_add_rx_frag(struct sk_buff *skb, const void *mon_buf,
++			       int offset, int frag_len, bool take_frag_ref)
++{
++	struct page *page = virt_to_head_page(mon_buf);
++	int frag_offset = mon_buf - page_address(page);
++	int nr_frags = skb_shinfo(skb)->nr_frags;
++
++	skb_add_rx_frag(skb, nr_frags, page,
++			(frag_offset + offset), frag_len,
++			ATH12K_DP_MON_RX_BUF_SIZE);
++
++	if (unlikely(take_frag_ref))
++		skb_frag_ref(skb, nr_frags);
++}
++EXPORT_SYMBOL(ath12k_dp_mon_add_rx_frag);
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.h
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.h
+@@ -14,7 +14,9 @@
+ 
+ #include "hal_mon_cmn.h"
+ 
++#define ATH12K_DP_MON_RX_BUF_SIZE	2048
+ #define ATH12K_MON_MAGIC_VALUE		0xDECAFEED
++#define ATH12K_DP_MON_MAX_RADIO_TAP_HDR 128
+ #define ATH12K_MON_RX_DOT11_OFFSET	5
+ #define ATH12K_MON_RX_PKT_OFFSET	8
+ #define ATH12K_DP_WLAN_MAX_AC		4
+@@ -113,6 +115,7 @@ struct ath12k_dp_mon {
+ 
+ 	/* lock for ath12k_dp_mon_desc */
+ 	spinlock_t mon_desc_lock;
++	struct page_frag_cache rx_mon_pf_cache;
+ };
+ 
+ enum dp_monitor_type {
+@@ -120,6 +123,11 @@ enum dp_monitor_type {
+ 	ATH12K_DP_MON_TYPE_DUAL_RING
+ };
+ 
++struct ath12k_dp_mon_mpdu_meta {
++	u8 decap_type;
++	u32 err_bitmap;
++};
++
+ enum dp_mon_tx_ppdu_info_type {
+ 	DP_MON_TX_PROT_PPDU_INFO,
+ 	DP_MON_TX_DATA_PPDU_INFO
+@@ -236,11 +244,12 @@ struct ath12k_pdev_mon_dp {
+ 
+ struct ath12k_dp_mon_desc {
+ 	struct list_head list;
+-	struct sk_buff *skb;
++	u8 *mon_buf;
+ 	dma_addr_t paddr;
+ 	u32 magic;
+ 	u16 buf_len:14,
+-	    in_use:1;
++	    in_use:1,
++	    end_of_ppdu:1;
+ };
+ 
+ static inline enum dp_monitor_type
+@@ -324,6 +333,26 @@ size_t ath12k_dp_mon_list_cut_nodes(stru
+ size_t ath12k_dp_mon_get_req_entries_from_buf_ring(struct ath12k_dp *dp,
+ 						   struct dp_rxdma_mon_ring *rx_ring,
+ 						   struct list_head *list);
++void ath12k_dp_mon_rx_deliver_skb(struct ath12k_pdev_dp *dp_pdev,
++				  struct napi_struct *napi, struct sk_buff *msdu,
++				  struct ieee80211_rx_status *status,
++				  struct hal_rx_mon_ppdu_info *ppduinfo);
++void ath12k_dp_mon_fill_rx_stats_info(struct hal_rx_mon_ppdu_info *ppdu_info,
++				      struct ieee80211_rx_status *rx_status);
++void ath12k_dp_mon_update_radiotap(struct ath12k_pdev_dp *dp_pdev,
++				   struct hal_rx_mon_ppdu_info *ppduinfo,
++				   struct sk_buff *mon_skb,
++				   struct ieee80211_rx_status *rxs);
++struct sk_buff *ath12k_dp_mon_get_skb_valid_frag(struct ath12k_dp *dp,
++						 struct sk_buff *skb);
++void ath12k_dp_mon_add_frag_list(struct sk_buff *skb_head, struct sk_buff *frag_list,
++				 u32 frag_len);
++void ath12k_dp_mon_update_skb_len(struct sk_buff *skb_head, u32 frag_len);
++void ath12k_dp_mon_append_skb(struct sk_buff *skb, struct sk_buff *tmp_skb);
++void ath12k_dp_mon_skb_remove_frag(struct ath12k_dp *dp, struct sk_buff *skb,
++				   u16 idx, u16 truesize);
++void ath12k_dp_mon_add_rx_frag(struct sk_buff *skb, const void *mon_buf,
++			       int offset, int frag_len, bool take_frag_ref);
+ void ath12k_dp_mon_pktlog_config_filter(struct ath12k_pdev_dp *dp_pdev,
+ 				enum ath12k_pktlog_mode mode, bool enable);
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -150,6 +150,7 @@ enum ath12k_dp_rx_decap_type {
+ 	DP_RX_DECAP_TYPE_NATIVE_WIFI,
+ 	DP_RX_DECAP_TYPE_ETHERNET2_DIX,
+ 	DP_RX_DECAP_TYPE_8023,
++	DP_RX_DECAP_TYPE_INVALID,
+ };
+ 
+ struct ath12k_dp_rx_rfc1042_hdr {
+--- a/drivers/net/wireless/ath/ath12k/hal_mon_cmn.h
++++ b/drivers/net/wireless/ath/ath12k/hal_mon_cmn.h
+@@ -81,6 +81,14 @@ struct hal_rx_eht_info {
+ 	u32 user_info[EHT_MAX_USER_INFO];
+ };
+ 
++struct hal_rx_mon_mpdu_info {
++	u8  decap_type:3,
++	    mpdu_start_received:1,
++	    first_rx_hdr_rcvd:1,
++	    rx_hdr_rcvd:1;
++	u32 err_bitmap;
++};
++
+ struct hal_rx_nrp_info {
+ 	uint32_t fc_valid : 1,
+ 		 frame_control : 16,
+@@ -186,6 +194,8 @@ struct hal_rx_mon_ppdu_info {
+ 	u8 grp_id;
+ 	u8 decap_format;
+ 	u16 mpdu_retry_cnt;
++	struct hal_rx_mon_mpdu_info mpdu_info;
++	struct sk_buff_head mpdu_q;
+ };
+ 
+ struct hal_rx_mon_status_tlv_hdr {
+@@ -201,6 +211,7 @@ enum hal_rx_mon_status {
+ 	HAL_RX_MON_STATUS_MPDU_START,
+ 	HAL_RX_MON_STATUS_MPDU_END,
+ 	HAL_RX_MON_STATUS_MSDU_END,
++	HAL_RX_MON_STATUS_RX_HDR,
+ };
+ 
+ enum hal_tx_mon_status {
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon1.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon1.c
+@@ -474,13 +474,17 @@ ath12k_wifi7_dp_mon_rx_parse_dest(struct
+ 	struct ath12k_mon_data *pmon = (struct ath12k_mon_data *)&dp_mon_pdev->mon_data;
+ 	struct hal_tlv_64_hdr *tlv;
+ 	struct ath12k_skb_rxcb *rxcb;
++	struct hal_tlv_parsed_hdr tlv_parsed_hdr = {0};
+ 	enum hal_rx_mon_status hal_status;
+-	u16 tlv_tag, tlv_len;
++	u16 tlv_tag, tlv_len, tlv_userid;
+ 	u8 *ptr = skb->data;
+ 
+ 	do {
+ 		tlv = (struct hal_tlv_64_hdr *)ptr;
+ 		tlv_tag = le64_get_bits(tlv->tl, HAL_TLV_64_HDR_TAG);
++		tlv_len = le64_get_bits(tlv->tl, HAL_TLV_64_HDR_LEN);
++		tlv_userid = le64_get_bits(tlv->tl, HAL_TLV_USR_ID);
++		ptr += sizeof(*tlv);
+ 
+ 		/* The actual length of PPDU_END is the combined length of many PHY
+ 		 * TLVs that follow. Skip the TLV header and
+@@ -493,10 +497,15 @@ ath12k_wifi7_dp_mon_rx_parse_dest(struct
+ 		else
+ 			tlv_len = le64_get_bits(tlv->tl, HAL_TLV_64_HDR_LEN);
+ 
++		tlv_parsed_hdr.tag = tlv_tag;
++		tlv_parsed_hdr.len = tlv_len;
++		tlv_parsed_hdr.userid = tlv_userid;
++		tlv_parsed_hdr.data = ptr;
++
+ 		hal_status =
+ 			ath12k_wifi7_hal_mon_rx_parse_status_tlv(dp_pdev->dp->hal,
+ 								 &pmon->mon_ppdu_info,
+-								 tlv);
++								 &tlv_parsed_hdr);
+ 		ptr += sizeof(*tlv) + tlv_len;
+ 		ptr = PTR_ALIGN(ptr, HAL_TLV_64_ALIGN);
+ 
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+@@ -43,17 +43,22 @@ const struct ath12k_dp_arch_mon_ops ath1
+ };
+ 
+ static inline void
+-ath12k_wifi7_dp_mon_rx_memset_ppdu_info(struct hal_rx_mon_ppdu_info *ppdu_info)
++ath12k_wifi7_dp_mon_rx_memset_ppdu_info(struct ath12k_pdev_dp *pdev_dp,
++					struct hal_rx_mon_ppdu_info *ppdu_info)
+ {
+ 	memset(ppdu_info, 0, sizeof(*ppdu_info));
+ 	ppdu_info->peer_id = HAL_INVALID_PEERID;
++	if (pdev_dp->ar->monitor_started)
++		skb_queue_head_init(&ppdu_info->mpdu_q);
+ }
+ 
+ static inline void
+-ath12k_wifi7_dp_mon_rx_parse_status_msdu_end(struct ath12k_mon_data *pmon,
+-					     struct hal_rx_mon_ppdu_info *ppdu_info)
++ath12k_wifi7_dp_mon_rx_parse_status_msdu_end(struct ath12k_mon_data *pmon)
+ {
++	struct hal_rx_mon_ppdu_info *ppdu_info = &pmon->mon_ppdu_info;
++
+ 	pmon->err_bitmap = ppdu_info->errmap;
++	pmon->mon_ppdu_info.mpdu_info.err_bitmap = ppdu_info->errmap;
+ 	pmon->decap_format = ppdu_info->decap_format;
+ }
+ 
+@@ -63,13 +68,14 @@ ath12k_wifi7_dp_mon_rx_parse_status_buf(
+ 					const struct dp_mon_packet_info *packet_info)
+ {
+ 	struct ath12k_dp *dp = dp_pdev->dp;
+-	struct ath12k_base *ab = dp->ab;
+ 	struct ath12k_dp_mon *dp_mon = dp->dp_mon;
+ 	struct dp_rxdma_mon_ring *buf_ring = &dp_mon->rxdma_mon_buf_ring;
+-	struct sk_buff *msdu;
++	struct hal_rx_mon_ppdu_info *ppdu_info = &pmon->mon_ppdu_info;
+ 	struct ath12k_dp_mon_desc *mon_desc;
+ 	struct list_head mon_desc_used_list;
+-	u32 offset;
++	struct sk_buff *skb, *tmp_skb;
++	u32 pkt_len;
++	u8 *mon_buf;
+ 	int ret = 0;
+ 
+ 	INIT_LIST_HEAD(&mon_desc_used_list);
+@@ -81,45 +87,88 @@ ath12k_wifi7_dp_mon_rx_parse_status_buf(
+ 		return ret;
+ 	}
+ 
+-	msdu = mon_desc->skb;
+-	mon_desc->skb = NULL;
++	mon_buf = mon_desc->mon_buf;
++	mon_desc->mon_buf = NULL;
+ 	list_add_tail(&mon_desc->list, &mon_desc_used_list);
+ 	if (unlikely(mon_desc->magic != ATH12K_MON_MAGIC_VALUE)) {
+ 		ath12k_warn(dp, "pkt buf: invalid magic value in mac_id %d\n",
+ 			    dp_pdev->mac_id);
+-		dev_kfree_skb_any(msdu);
+ 		ret = -EINVAL;
+ 		goto buf_replenish;
+ 	}
+ 
+-	ath12k_core_dma_unmap_single(ab->dev, ATH12K_SKB_RXCB(msdu)->paddr,
+-				     msdu->len + skb_tailroom(msdu),
+-				     DMA_FROM_DEVICE);
++	if (unlikely(!mon_desc->in_use)) {
++		ath12k_warn(dp, "pkt buf: in_use flag not set, mac_id %d\n",
++			    dp_pdev->mac_id);
++		ret = -EINVAL;
++		goto buf_replenish;
++	}
++
++	ath12k_core_dma_unmap_page(dp->dev, mon_desc->paddr, ATH12K_DP_MON_RX_BUF_SIZE,
++				   DMA_FROM_DEVICE);
+ 
+ 	/* The hardware reports the buffer length as (actual_length - 1),
+ 	 * likely due to internal indexing or alignment constraints.
+ 	 * To obtain the true buffer length for processing, increment
+ 	 * the reported end_offset by 1 before using it.
+ 	 */
+-	offset = packet_info->dma_length + 1;
+-	offset += ATH12K_MON_RX_DOT11_OFFSET;
++	pkt_len = packet_info->dma_length + 1;
+ 
+-	if (ath12k_dp_mon_rx_set_pktlen(msdu, offset)) {
+-		dev_kfree_skb_any(msdu);
++	if (unlikely(pkt_len > (ATH12K_DP_MON_RX_BUF_SIZE - ATH12K_MON_RX_PKT_OFFSET))) {
++		ath12k_warn(dp, "pkt buf: invalid dma length %d in mac_id %d\n",
++			    pkt_len, dp_pdev->mac_id);
++		page_frag_free(mon_buf);
+ 		goto buf_replenish;
+ 	}
+ 
+-	if (!pmon->mon_mpdu) {
+-		dev_kfree_skb_any(msdu);
++	if (unlikely(ppdu_info->mpdu_info.decap_type == DP_RX_DECAP_TYPE_INVALID)) {
++		ath12k_warn(dp, "pkt buf: invalid decap type in mac_id %d\n",
++			    dp_pdev->mac_id);
++		page_frag_free(mon_buf);
+ 		goto buf_replenish;
+ 	}
+ 
+-	if (!pmon->mon_mpdu->head)
+-		pmon->mon_mpdu->head = msdu;
+-	else
+-		pmon->mon_mpdu->tail->next = msdu;
++	skb = skb_peek_tail(&ppdu_info->mpdu_q);
++	if (unlikely(!skb)) {
++		ath12k_warn(dp, "pkt buf: empty mpdu queue in mac_id %d\n",
++			    dp_pdev->mac_id);
++		page_frag_free(mon_buf);
++		goto buf_replenish;
++	}
++
++	tmp_skb = ath12k_dp_mon_get_skb_valid_frag(dp, skb);
++	if (!tmp_skb) {
++		tmp_skb = dev_alloc_skb(ATH12K_DP_MON_MAX_RADIO_TAP_HDR);
++		if (!tmp_skb) {
++			page_frag_free(mon_buf);
++			goto buf_replenish;
++		}
+ 
+-	pmon->mon_mpdu->tail = msdu;
++		ath12k_dp_mon_append_skb(skb, tmp_skb);
++	}
++
++	if (ppdu_info->mpdu_info.decap_type == DP_RX_DECAP_TYPE_RAW) {
++		if (ppdu_info->mpdu_info.first_rx_hdr_rcvd) {
++			ath12k_dp_mon_skb_remove_frag(dp, tmp_skb, 0,
++						      ATH12K_DP_MON_RX_BUF_SIZE);
++			ath12k_dp_mon_add_rx_frag(tmp_skb, mon_buf,
++						  ATH12K_MON_RX_PKT_OFFSET,
++						  pkt_len, false);
++			ppdu_info->mpdu_info.first_rx_hdr_rcvd = false;
++		} else {
++			ath12k_dp_mon_add_rx_frag(tmp_skb, mon_buf,
++						  ATH12K_MON_RX_PKT_OFFSET,
++						  pkt_len, false);
++
++			/* Adjust parent skb length if a fragment gets added to the skb
++			 * which got fetched from frag_list.
++			 */
++			if (tmp_skb != skb)
++				ath12k_dp_mon_update_skb_len(skb, pkt_len);
++		}
++	} else {
++		page_frag_free(mon_buf);
++	}
+ 
+ buf_replenish:
+ 	ath12k_dp_mon_buf_replenish(dp, buf_ring, &mon_desc_used_list, 1);
+@@ -128,51 +177,86 @@ buf_replenish:
+ }
+ 
+ static int
++ath12k_wifi7_dp_mon_parse_status_rx_hdr(struct ath12k_pdev_dp *dp_pdev,
++					struct ath12k_mon_data *pmon,
++					struct hal_tlv_parsed_hdr *tlv_parsed_hdr,
++					const void *mon_buf)
++{
++	struct hal_rx_mon_ppdu_info *ppdu_info = &pmon->mon_ppdu_info;
++	struct sk_buff *skb;
++	const void *tlv_data = tlv_parsed_hdr->data;
++	int offset;
++	u16 tlv_len = tlv_parsed_hdr->len;
++
++	if (!ppdu_info->mpdu_info.mpdu_start_received) {
++		skb = dev_alloc_skb(ATH12K_DP_MON_MAX_RADIO_TAP_HDR);
++		if (unlikely(!skb)) {
++			ath12k_warn(dp_pdev->dp,
++				    "skb allocation for rx hdr failed\n");
++			return -ENOMEM;
++		}
++
++		skb_queue_tail(&ppdu_info->mpdu_q, skb);
++		offset = (const u8 *)tlv_data - (const u8 *)mon_buf;
++		offset += ATH12K_MON_RX_PKT_OFFSET;
++		ath12k_dp_mon_add_rx_frag(skb, mon_buf, offset,
++					  tlv_len - ATH12K_MON_RX_PKT_OFFSET, true);
++		ppdu_info->mpdu_info.mpdu_start_received = true;
++		ppdu_info->mpdu_info.first_rx_hdr_rcvd = true;
++		ppdu_info->mpdu_info.decap_type = DP_RX_DECAP_TYPE_INVALID;
++	}
++
++	ppdu_info->mpdu_info.rx_hdr_rcvd = true;
++
++	return 0;
++}
++
++static int
++ath12k_dp_mon_parse_mpdu_start(struct ath12k_dp *dp, struct ath12k_mon_data *pmon)
++{
++	struct hal_rx_mon_ppdu_info *ppdu_info = &pmon->mon_ppdu_info;
++	struct ath12k_dp_mon_mpdu_meta *mpdu_meta;
++	struct sk_buff *skb = skb_peek_tail(&ppdu_info->mpdu_q);
++
++	if (!ppdu_info->mpdu_info.rx_hdr_rcvd) {
++		ath12k_warn(dp, "MPDU start received without rx_hdr\n");
++		return -EINVAL;
++	}
++
++	if (unlikely(!skb)) {
++		ath12k_warn(dp, "No skb found in the mpdu skb queue\n");
++		return -ENODATA;
++	}
++
++	mpdu_meta = (struct ath12k_dp_mon_mpdu_meta *)skb->data;
++	mpdu_meta->decap_type =  ppdu_info->mpdu_info.decap_type;
++	return 0;
++}
++
++static int
+ ath12k_wifi7_dp_mon_rx_parse_dest_tlv(struct ath12k_pdev_dp *dp_pdev,
+ 				      struct ath12k_mon_data *pmon,
+ 				      enum hal_rx_mon_status hal_status,
+-				      const void *tlv_data)
++				      struct hal_tlv_parsed_hdr *tlv_parsed_hdr,
++				      const void *mon_buf)
+ {
++	const void *tlv_data = tlv_parsed_hdr->data;
++
+ 	switch (hal_status) {
+ 	case HAL_RX_MON_STATUS_MPDU_START:
+-		/* TODO: Hardware may encounter error scenarios such as DROP
+-		   descriptor, flush reason, or truncated reason. In these cases, some
+-		   status buffers associated with a PPDU may be freed prematurely, while
+-		   others continue to be processed. Current code assumes all TLVs for a
+-		   PPDU are present and accessible. When some buffers are missing due to
+-		   the above hardware conditions, driver may attempt to access NULL
+-		   pointers, leading to crashes or kernel warnings. This issue should be
+-		   addressed by adding full support for handling these hardware error
+-		   reasons which is spread across multiple buffers.
+-		   */
+-		if (pmon->mon_mpdu)
+-			break;
+-
+-		pmon->mon_mpdu = kzalloc(sizeof(*pmon->mon_mpdu), GFP_ATOMIC);
+-		if (!pmon->mon_mpdu)
+-			return -ENOMEM;
+-		break;
++		return ath12k_dp_mon_parse_mpdu_start(dp_pdev->dp, pmon);
+ 	case HAL_RX_MON_STATUS_BUF_ADDR:
+ 		return ath12k_wifi7_dp_mon_rx_parse_status_buf(dp_pdev, pmon, tlv_data);
+ 	case HAL_RX_MON_STATUS_MPDU_END:
+-		/* If no MSDU then free empty MPDU */
+-		if (!pmon->mon_mpdu)
+-			break;
+-
+-		if (pmon->mon_mpdu->tail) {
+-			pmon->mon_mpdu->tail->next = NULL;
+-			list_add_tail(&pmon->mon_mpdu->list, &pmon->dp_rx_mon_mpdu_list);
+-		} else {
+-			kfree(pmon->mon_mpdu);
+-		}
+-		pmon->mon_mpdu = NULL;
++		pmon->mon_ppdu_info.mpdu_info.mpdu_start_received = false;
+ 		break;
+ 	case HAL_RX_MON_STATUS_MSDU_END:
+-		ath12k_wifi7_dp_mon_rx_parse_status_msdu_end(pmon,
+-							     &pmon->mon_ppdu_info);
+-		pmon->mon_mpdu->decap_format = pmon->decap_format;
+-		pmon->mon_mpdu->err_bitmap = pmon->err_bitmap;
++		ath12k_wifi7_dp_mon_rx_parse_status_msdu_end(pmon);
+ 		break;
++	case HAL_RX_MON_STATUS_RX_HDR:
++		return ath12k_wifi7_dp_mon_parse_status_rx_hdr(dp_pdev, pmon,
++							       tlv_parsed_hdr,
++							       mon_buf);
+ 	default:
+ 		break;
+ 	}
+@@ -187,16 +271,20 @@ ath12k_wifi7_dp_mon_rx_parse_dest(struct
+ 	struct ath12k_pdev_mon_dp *dp_mon_pdev = dp_pdev->dp_mon_pdev;
+ 	struct ath12k_mon_data *pmon = (struct ath12k_mon_data *)&dp_mon_pdev->mon_data;
+ 	struct hal_tlv_64_hdr *tlv;
+-	struct ath12k_skb_rxcb *rxcb;
+-	struct sk_buff *skb = mon_desc->skb;
+-	enum hal_rx_mon_status hal_status;
+-	u16 tlv_tag, tlv_len, buf_len = mon_desc->buf_len;
+-	u8 *ptr = skb->data;
+ 	struct ath12k *ar = dp_pdev->ar;
++	struct hal_tlv_parsed_hdr tlv_parsed_hdr = {0};
++	enum hal_rx_mon_status hal_status;
++	u16 tlv_tag, tlv_len, buf_len = mon_desc->buf_len, tlv_userid;
++	u8 *mon_buf = (u8 *)mon_desc->mon_buf;
++	u8 *ptr = mon_buf;
++	int ret;
+ 
+ 	do {
+ 		tlv = (struct hal_tlv_64_hdr *)ptr;
+ 		tlv_tag = le64_get_bits(tlv->tl, HAL_TLV_64_HDR_TAG);
++		tlv_len = le64_get_bits(tlv->tl, HAL_TLV_64_HDR_LEN);
++		tlv_userid = le64_get_bits(tlv->tl, HAL_TLV_USR_ID);
++		ptr += sizeof(*tlv);
+ 
+ 		/* The actual length of PPDU_END is the combined length of many PHY
+ 		 * TLVs that follow. Skip the TLV header and
+@@ -206,38 +294,110 @@ ath12k_wifi7_dp_mon_rx_parse_dest(struct
+ 
+ 		if (tlv_tag == HAL_RX_PPDU_END)
+ 			tlv_len = sizeof(struct hal_rx_rxpcu_classification_overview);
+-		else
+-			tlv_len = le64_get_bits(tlv->tl, HAL_TLV_64_HDR_LEN);
++
++		tlv_parsed_hdr.tag = tlv_tag;
++		tlv_parsed_hdr.len = tlv_len;
++		tlv_parsed_hdr.userid = tlv_userid;
++		tlv_parsed_hdr.data = ptr;
+ 
+ 		hal_status =
+ 			ath12k_wifi7_hal_mon_rx_parse_status_tlv(dp_pdev->dp->hal,
+ 								 &pmon->mon_ppdu_info,
+-								 tlv);
++								 &tlv_parsed_hdr);
+ 
+-		if (ar->monitor_started &&
+-		    ath12k_wifi7_dp_mon_rx_parse_dest_tlv(dp_pdev, pmon, hal_status,
+-							  tlv->value))
+-			return HAL_RX_MON_STATUS_PPDU_DONE;
++		if (ar->monitor_started) {
++			ret = ath12k_wifi7_dp_mon_rx_parse_dest_tlv(dp_pdev, pmon,
++								    hal_status,
++								    &tlv_parsed_hdr,
++								    mon_buf);
++			/* During error case scenario, print the error type and continue
++			 * to TLV parsing to free the remaining buffer address TLVs.
++			 */
++			if (ret)
++				ath12k_warn(dp_pdev->dp,
++					    "mon_rx_parse_dest failed with ret %d", ret);
++		}
+ 
+-		ptr += sizeof(*tlv) + tlv_len;
++		ptr += tlv_len;
+ 		ptr = PTR_ALIGN(ptr, HAL_TLV_64_ALIGN);
+ 
+-		if ((ptr - skb->data) >= buf_len)
++		if ((ptr - mon_buf) >= buf_len)
+ 			break;
+ 
+ 	} while ((hal_status == HAL_RX_MON_STATUS_PPDU_NOT_DONE) ||
+ 		 (hal_status == HAL_RX_MON_STATUS_BUF_ADDR) ||
+ 		 (hal_status == HAL_RX_MON_STATUS_MPDU_START) ||
+ 		 (hal_status == HAL_RX_MON_STATUS_MPDU_END) ||
+-		 (hal_status == HAL_RX_MON_STATUS_MSDU_END));
++		 (hal_status == HAL_RX_MON_STATUS_MSDU_END) ||
++		 (hal_status == HAL_RX_MON_STATUS_RX_HDR));
+ 
+-	rxcb = ATH12K_SKB_RXCB(skb);
+-	if (rxcb->is_end_of_ppdu)
++	if (mon_desc->end_of_ppdu)
+ 		hal_status = HAL_RX_MON_STATUS_PPDU_DONE;
+ 
+ 	return hal_status;
+ }
+ 
++int ath12k_wifi7_dp_mon_update_band_and_get_freq(struct ath12k_base *ab, int pdev_id,
++						 u16 channel_num, u8 *band)
++{
++	struct ath12k *ar = ab->pdevs[pdev_id].ar;
++	struct ieee80211_channel *channel;
++	int freq = -1;
++
++	if (unlikely(*band == NUM_NL80211_BANDS ||
++		     !ath12k_ar_to_hw(ar)->wiphy->bands[*band])) {
++		ath12k_dbg(ab, ATH12K_DBG_DATA,
++			   "sband is NULL for status band %d channel_num %d pdev_id %d\n",
++			   *band, channel_num, ar->pdev_idx);
++
++		spin_lock_bh(&ar->data_lock);
++		channel = ar->rx_channel;
++		if (channel) {
++			*band = channel->band;
++			channel_num =
++				ieee80211_frequency_to_channel(channel->center_freq);
++		}
++		spin_unlock_bh(&ar->data_lock);
++	}
++
++	if (*band < NUM_NL80211_BANDS)
++		freq = ieee80211_channel_to_frequency(channel_num, *band);
++	return freq;
++}
++
++int
++ath12k_wifi7_dp_mon_rx_deliver_mpdu(struct ath12k_pdev_dp *dp_pdev,
++				    struct hal_rx_mon_ppdu_info *ppdu_info,
++				    struct sk_buff *mpdu,
++				    struct napi_struct *napi)
++{
++	struct ieee80211_rx_status rxs = {0};
++	int freq_update = -1;
++
++	ath12k_dp_mon_fill_rx_stats_info(ppdu_info, &rxs);
++
++	freq_update = ath12k_wifi7_dp_mon_update_band_and_get_freq(dp_pdev->dp->ab,
++								   dp_pdev->ar->pdev_idx,
++								   ppdu_info->chan_num,
++								   &rxs.band);
++	if (freq_update != -1)
++		rxs.freq = freq_update;
++
++	skb_reserve(mpdu, ATH12K_DP_MON_MAX_RADIO_TAP_HDR);
++	ath12k_dp_mon_update_radiotap(dp_pdev, ppdu_info, mpdu, &rxs);
++
++	rxs.flag |= RX_FLAG_ONLY_MONITOR;
++	if (skb_shinfo(mpdu)->nr_frags)
++		rxs.flag |= RX_FLAG_AMSDU_MORE;
++
++	if (ppdu_info->mpdu_info.err_bitmap & HAL_RX_MPDU_ERR_FCS)
++		rxs.flag |= RX_FLAG_FAILED_FCS_CRC;
++
++	ath12k_dp_mon_rx_deliver_skb(dp_pdev, napi, mpdu, &rxs, ppdu_info);
++
++	return 0;
++}
++
+ enum hal_rx_mon_status
+ ath12k_wifi7_dp_mon_rx_parse_ppdu_status(struct ath12k_pdev_dp *dp_pdev,
+ 					 struct ath12k_mon_data *pmon,
+@@ -245,27 +405,46 @@ ath12k_wifi7_dp_mon_rx_parse_ppdu_status
+ 					 struct napi_struct *napi)
+ {
+ 	struct hal_rx_mon_ppdu_info *ppdu_info = &pmon->mon_ppdu_info;
+-	struct dp_mon_mpdu *tmp;
+-	struct dp_mon_mpdu *mon_mpdu = pmon->mon_mpdu;
++	struct sk_buff *mpdu;
++	struct ath12k_dp_mon_mpdu_meta *mpdu_meta;
++	const skb_frag_t *frag;
+ 	enum hal_rx_mon_status hal_status;
++	u32 buf_size = ATH12K_DP_MON_RX_BUF_SIZE;
++	u8 fcs_len_left = FCS_LEN, last_frag_idx, last_frag_size;
+ 
+ 	hal_status = ath12k_wifi7_dp_mon_rx_parse_dest(dp_pdev, mon_desc);
+ 	if (hal_status != HAL_RX_MON_STATUS_PPDU_DONE)
+ 		return hal_status;
+ 
+-	list_for_each_entry_safe(mon_mpdu, tmp, &pmon->dp_rx_mon_mpdu_list, list) {
+-		list_del(&mon_mpdu->list);
+-
+-		if (mon_mpdu->head && mon_mpdu->tail)
+-			ath12k_dp_mon_rx_deliver(dp_pdev, mon_mpdu, ppdu_info, napi);
++	while ((mpdu = skb_dequeue(&ppdu_info->mpdu_q))) {
++		mpdu_meta = (struct ath12k_dp_mon_mpdu_meta *)mpdu->data;
++		if (mpdu_meta->decap_type == DP_RX_DECAP_TYPE_RAW) {
++			last_frag_idx = skb_shinfo(mpdu)->nr_frags - 1;
++			if (skb_shinfo(mpdu)->nr_frags >= 2) {
++				frag = &skb_shinfo(mpdu)->frags[last_frag_idx];
++				last_frag_size = skb_frag_size(frag);
++				if (last_frag_size < FCS_LEN) {
++					ath12k_dp_mon_skb_remove_frag(dp_pdev->dp, mpdu,
++								      last_frag_idx,
++								      buf_size);
++					fcs_len_left -= last_frag_size;
++				}
++			}
+ 
+-		kfree(mon_mpdu);
++			last_frag_idx = skb_shinfo(mpdu)->nr_frags - 1;
++			skb_coalesce_rx_frag(mpdu, last_frag_idx, -fcs_len_left, 0);
++			ath12k_wifi7_dp_mon_rx_deliver_mpdu(dp_pdev, ppdu_info,
++							    mpdu, napi);
++		} else {
++			dev_kfree_skb_any(mpdu);
++			continue;
++		}
+ 	}
+ 
+ 	return hal_status;
+ }
+ 
+-static void
++static void __maybe_unused
+ ath12k_dp_rx_pktlog_process(struct ath12k_pdev_dp *pdev_dp,
+ 			    struct ath12k_dp_link_peer *peer,
+ 			    struct hal_rx_mon_ppdu_info *ppdu_info,
+@@ -310,8 +489,6 @@ int ath12k_dp_mon_rx_dual_ring_process(s
+ 	struct ath12k_mon_data *pmon = (struct ath12k_mon_data *)&dp_mon_pdev->mon_data;
+ 	struct hal_rx_mon_ppdu_info *ppdu_info = &pmon->mon_ppdu_info;
+ 	struct hal_mon_dest_desc *mon_dst_desc;
+-	struct sk_buff *skb;
+-	struct ath12k_skb_rxcb *rxcb;
+ 	struct dp_srng *mon_dst_ring;
+ 	struct hal_srng *srng;
+ 	struct dp_rxdma_mon_ring *buf_ring;
+@@ -324,7 +501,7 @@ int ath12k_dp_mon_rx_dual_ring_process(s
+ 	int num_buffs_reaped = 0, srng_id;
+ 	u32 hal_status, end_offset, info0, end_reason;
+ 	u8 pdev_idx = ath12k_hw_mac_id_to_pdev_id(ab->hw_params, pdev_dp->mac_id);
+-	u8 filter_category = 0;
++	u8 filter_category = 0, *mon_buf;
+ 
+ 	INIT_LIST_HEAD(&mon_desc_used_list);
+ 	srng_id = ath12k_hw_mac_id_to_srng_id(ab->hw_params, pdev_idx);
+@@ -356,7 +533,6 @@ int ath12k_dp_mon_rx_dual_ring_process(s
+ 			goto move_next;
+ 		}
+ 
+-		skb = mon_desc->skb;
+ 		list_add_tail(&mon_desc->list, &mon_desc_used_list);
+ 		if (unlikely(mon_desc->magic != ATH12K_MON_MAGIC_VALUE)) {
+ 			ath12k_warn(dp, "mon_dest: invalid magic value in mac_id %d\n",
+@@ -364,16 +540,15 @@ int ath12k_dp_mon_rx_dual_ring_process(s
+ 			goto move_next;
+ 		}
+ 
+-		if (unlikely(!skb)) {
+-			ath12k_warn(dp, "mon_dest: NULL skb received in mac_id %d\n",
++		mon_buf = mon_desc->mon_buf;
++		if (unlikely(!mon_buf)) {
++			ath12k_warn(dp, "mon_dest: NULL mon_buf received in mac_id %d\n",
+ 				    pdev_dp->mac_id);
+ 			goto move_next;
+ 		}
+ 
+-		rxcb = ATH12K_SKB_RXCB(skb);
+-		ath12k_core_dma_unmap_single(ab->dev, rxcb->paddr,
+-					     skb->len + skb_tailroom(skb),
+-					     DMA_FROM_DEVICE);
++		ath12k_core_dma_unmap_page(dp->dev, mon_desc->paddr,
++					   ATH12K_DP_MON_RX_BUF_SIZE, DMA_FROM_DEVICE);
+ 
+ 		end_reason = u32_get_bits(info0, HAL_MON_DEST_INFO0_END_REASON);
+ 
+@@ -387,7 +562,8 @@ int ath12k_dp_mon_rx_dual_ring_process(s
+ 			ath12k_dbg(ab, ATH12K_DBG_DATA,
+ 				   "mon_dest: descriptor end reason %d mac_id %d",
+ 				   end_reason, pdev_dp->mac_id);
+-			dev_kfree_skb_any(skb);
++			page_frag_free(mon_buf);
++			mon_desc->mon_buf = NULL;
+ 			goto move_next;
+ 		}
+ 
+@@ -397,18 +573,14 @@ int ath12k_dp_mon_rx_dual_ring_process(s
+ 		 */
+ 		if (end_reason == HAL_MON_END_OF_PPDU) {
+ 			*budget -= 1;
+-			rxcb->is_end_of_ppdu = true;
++			mon_desc->end_of_ppdu = true;
+ 		}
+ 
+ 		end_offset = u32_get_bits(info0, HAL_MON_DEST_INFO0_END_OFFSET);
+-		if (likely(end_offset <= DP_RX_MON_BUFFER_SIZE)) {
+-			skb_put(skb, end_offset);
+-		} else {
++		if (unlikely(end_offset > DP_RX_BUFFER_SIZE))
+ 			ath12k_warn(ab,
+ 				    "mon_dest: invalid offset %u received in mac_id %d\n",
+ 				    end_offset, pdev_dp->mac_id);
+-			skb_put(skb, DP_RX_MON_BUFFER_SIZE);
+-		}
+ 
+ 		if (unlikely(end_offset > DP_RX_BUFFER_SIZE)) {
+ 			ath12k_warn(dp,
+@@ -439,28 +611,25 @@ move_next:
+ 	 * the memset of the ppdu_info structure and continue processing it.
+ 	 */
+ 	if (!ppdu_info->ppdu_continuation)
+-		ath12k_wifi7_dp_mon_rx_memset_ppdu_info(ppdu_info);
++		ath12k_wifi7_dp_mon_rx_memset_ppdu_info(pdev_dp, ppdu_info);
+ 
+ 	list_for_each_entry(mon_desc, &mon_desc_used_list, list) {
+-		if (!mon_desc->skb)
++		if (!mon_desc->mon_buf)
+ 			continue;
+ 
+-		skb = mon_desc->skb;
+-
+-		ath12k_dp_rx_pktlog_process(pdev_dp, peer,
+-					    ppdu_info, skb, end_offset);
++		mon_buf = mon_desc->mon_buf;
+ 
+ 		hal_status = ath12k_wifi7_dp_mon_rx_parse_ppdu_status(pdev_dp, pmon,
+ 								      mon_desc, napi);
+ 		if (hal_status != HAL_RX_MON_STATUS_PPDU_DONE) {
+ 			ppdu_info->ppdu_continuation = true;
+-			dev_kfree_skb_any(skb);
+-			mon_desc->skb = NULL;
++			page_frag_free(mon_buf);
++			mon_desc->mon_buf = NULL;
+ 			continue;
+ 		}
+ 
+ 		if (ppdu_info->peer_id == HAL_INVALID_PEERID)
+-			goto free_skb;
++			goto free_buf;
+ 
+ 		filter_category = ppdu_info->userstats[ppdu_info->userid].filter_category;
+ 		rcu_read_lock();
+@@ -473,7 +642,7 @@ move_next:
+ 							 ppdu_info->nrp_info.mac_addr2)) {
+ 					nrp->rssi = ppdu_info->rssi_comb;
+ 					nrp->timestamp = ktime_to_ms(ktime_get_real());
+-					goto next_skb;
++					goto next_buf;
+ 				}
+ 			}
+ 		}
+@@ -483,7 +652,7 @@ move_next:
+ 			ath12k_dbg(ab, ATH12K_DBG_DATA,
+ 				   "failed to find the peer with monitor peer_id %d\n",
+ 				   ppdu_info->peer_id);
+-			goto next_skb;
++			goto next_buf;
+ 		}
+ 
+ 		if (ppdu_info->reception_type == HAL_RX_RECEPTION_TYPE_SU) {
+@@ -491,10 +660,7 @@ move_next:
+ 			if (!arsta) {
+ 				ath12k_warn(ab, "link sta not found on peer %pM id %d\n",
+ 					    peer->addr, peer->peer_id);
+-				spin_unlock_bh(&dp->dp_lock);
+-				rcu_read_unlock();
+-				dev_kfree_skb_any(skb);
+-				continue;
++				goto next_buf;
+ 			}
+ 			ath12k_dp_mon_rx_update_peer_su_stats(pdev_dp, peer,
+ 							      ppdu_info);
+@@ -506,13 +672,13 @@ move_next:
+ 			ath12k_dp_mon_ppdu_rx_time_update(pdev_dp, ppdu_info, 0);
+ 		}
+ 
+-next_skb:
++next_buf:
+ 		spin_unlock_bh(&dp->dp_lock);
+ 		rcu_read_unlock();
+-free_skb:
+-		dev_kfree_skb_any(skb);
+-		mon_desc->skb = NULL;
+-		ath12k_wifi7_dp_mon_rx_memset_ppdu_info(ppdu_info);
++free_buf:
++		page_frag_free(mon_buf);
++		mon_desc->mon_buf = NULL;
++		ath12k_wifi7_dp_mon_rx_memset_ppdu_info(pdev_dp, ppdu_info);
+ 	}
+ 
+ 	ath12k_dp_mon_buf_replenish(dp, buf_ring, &mon_desc_used_list, num_buffs_reaped);
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_mon.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_mon.c
+@@ -1506,7 +1506,6 @@ ath12k_wifi7_hal_mon_rx_mpdu_start_info_
+ 	ppdu_info->nrp_info.fc_valid =
+ 		u32_get_bits(info[3],
+ 			     HAL_RX_MPDU_START_INFO3_FC_VALID);
+-
+ 	ppdu_info->mpdu_len += u32_get_bits(info[5],
+ 					    HAL_RX_MPDU_START_INFO5_MPDU_LEN);
+ 	ppdu_info->nrp_info.mcast_bcast =
+@@ -1577,7 +1576,8 @@ ath12k_wifi7_hal_mon_rx_mpdu_start_info_
+ 	ppdu_info->nrp_info.fc_valid =
+ 		u32_get_bits(info[3],
+ 			     HAL_RX_MPDU_START_INFO3_FC_VALID_CMPCT);
+-
++	ppdu_info->mpdu_info.decap_type =
++		u32_get_bits(info[4], HAL_RX_MPDU_START_INFO4_DECAP_TYPE_CMPCT);
+ 	ppdu_info->mpdu_len += u32_get_bits(info[5],
+ 					    HAL_RX_MPDU_START_INFO5_MPDU_LEN_CMPCT);
+ 	ppdu_info->nrp_info.mcast_bcast =
+@@ -1879,15 +1879,15 @@ ath12k_wifi7_hal_mon_rx_ppdu_eu_stats_in
+ enum hal_rx_mon_status
+ ath12k_wifi7_hal_mon_rx_parse_status_tlv(struct ath12k_hal *hal,
+ 					 struct hal_rx_mon_ppdu_info *ppdu_info,
+-					 const struct hal_tlv_64_hdr *tlv)
++					 struct hal_tlv_parsed_hdr *tlv_parsed_hdr)
+ {
+-	const void *tlv_data = tlv->value;
++	const void *tlv_data = tlv_parsed_hdr->data;
+ 	u32 userid;
+ 	u16 tlv_tag, tlv_len;
+ 
+-	tlv_tag = le64_get_bits(tlv->tl, HAL_TLV_64_HDR_TAG);
+-	tlv_len = le64_get_bits(tlv->tl, HAL_TLV_64_HDR_LEN);
+-	userid = le64_get_bits(tlv->tl, HAL_TLV_64_USR_ID);
++	tlv_tag = tlv_parsed_hdr->tag;
++	tlv_len = tlv_parsed_hdr->len;
++	userid = tlv_parsed_hdr->userid;
+ 
+ 	if (ppdu_info->tlv_aggr.in_progress && ppdu_info->tlv_aggr.tlv_tag != tlv_tag) {
+ 		ath12k_wifi7_hal_mon_parse_eht_sig_hdr(ppdu_info,
+@@ -2070,6 +2070,8 @@ ath12k_wifi7_hal_mon_rx_parse_status_tlv
+ 		break;
+ 	case HAL_DUMMY:
+ 		return HAL_RX_MON_STATUS_BUF_DONE;
++	case HAL_RX_HEADER:
++		return HAL_RX_MON_STATUS_RX_HDR;
+ 	case HAL_RX_PPDU_END_STATUS_DONE:
+ 	case 0:
+ 		return HAL_RX_MON_STATUS_PPDU_DONE;
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_mon.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_mon.h
+@@ -630,6 +630,13 @@ struct hal_tx_phy_desc {
+ 	__le32 info3;
+ } __packed;
+ 
++struct hal_tlv_parsed_hdr {
++	u16 tag;
++	u16 len;
++	u16 userid;
++	u8 *data;
++};
++
+ #define MPDU_START_SELECT_INFO0_ENCYRPT_TYP                      BIT(3)
+ #define MPDU_START_SELECT_INFO1_FILTER_GRPID_PPDUID              BIT(4)
+ #define MPDU_START_SELECT_INFO2_INFO3                            BIT(5)
+@@ -834,7 +841,7 @@ ath12k_wifi7_hal_mon_parse_rx_msdu_end_e
+ enum hal_rx_mon_status
+ ath12k_wifi7_hal_mon_rx_parse_status_tlv(struct ath12k_hal *hal,
+ 					 struct hal_rx_mon_ppdu_info *ppdu_info,
+-					 const struct hal_tlv_64_hdr *tlv);
++					 struct hal_tlv_parsed_hdr *tlv_parsed_hdr);
+ enum hal_tx_mon_status
+ ath12k_wifi7_hal_mon_tx_parse_status_tlv(struct hal_tx_mon_ppdu_info *tx_ppdu_info,
+ 					 u16 tlv_tag, const void *tlv_data, u32 userid);

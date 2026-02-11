@@ -1,0 +1,524 @@
+From 4edcbfda79cfd4924f53107c910cedfe86426361 Mon Sep 17 00:00:00 2001
+From: Adwait Nayak <adwaitn@qti.qualcomm.com>
+Date: Sun, 8 Jun 2025 14:54:42 +0530
+Subject: [PATCH] QSDK:CP: wifi: ath12k: Enable umac reset for 11BE chipsets
+
+Enable umac reset for IPQ5332, QCN6432 and IPQ5424
+
+Add support to parse the dts for umac_reset interrupt line
+and enabling it for IPQ5332, QCN6432 and IPQ5424.
+
+In current implementation entire ring mask is being set to 0 during
+umac reset to avoid processing dp interrupts, instead of that
+disabling the dp interrupts during pre_reset_start state and then
+enabling them back after post_reset_complete of umac reset.
+
+As the umac reset will take place in atomic context bypassing
+napi_sync by checking on the flag ATH12K_FLAG_UMAC_PRERESET_START
+to avoid sleep from atmoic context issue.
+
+QCN6432 support:
+As the Q6 of ipq5332 is shared between all the radios of qcn6432
+the umac reset interrupt line needs to be resetted for qcn6432
+every time after receiving the interrupt so that the next interrupt
+can be raised for that reason writing the value 0x00000100 into a pci
+slot specific address.
+
+Currently for qcn6432 MSI based interrupts are being used but as per the
+design one interrupt line is reserved for umac_reset interrupt so adding
+support to parse it from the dts.
+
+Following patches are partially implemented as part of this change:
+(Partially implemented as few of the patches are already
+added as part of package upgrade)
+
+900-wifi-ath12k-Enable-umac-reset-for-IPQ5332.patch
+901-wifi-ath12k-Enable-umac-reset-for-QCN6432.patch
+960-002-wifi-ath12k-Add-hw-params-configuration-for-ipq5424.patch
+(umac reset specific changes)
+
+Signed-off-by: Avula Sri Charan <asrichar@qti.qualcomm.com>
+Signed-off-by: Saravanakumar Duraisamy <saradura@qti.qualcomm.com>
+Signed-off-by: Adwait Nayak <adwaitn@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/ahb.c        | 118 +++++++++++++++++--
+ drivers/net/wireless/ath/ath12k/ahb.h        |   5 +
+ drivers/net/wireless/ath/ath12k/core.h       |   2 +-
+ drivers/net/wireless/ath/ath12k/hif.h        |   7 ++
+ drivers/net/wireless/ath/ath12k/hw.h         |   5 +-
+ drivers/net/wireless/ath/ath12k/pcic.c       |  13 +-
+ drivers/net/wireless/ath/ath12k/umac_reset.c |   1 +
+ drivers/net/wireless/ath/ath12k/wifi7/hw.c   |  18 ++-
+ 8 files changed, 148 insertions(+), 21 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -21,7 +21,7 @@
+ #include "wifi7/hal.h"
+ #include "ppe.h"
+ 
+-#define ATH12K_IRQ_PPE_OFFSET 53
++#define ATH12K_IRQ_PPE_OFFSET 54
+ #define ATH12K_IRQ_CE0_OFFSET 4
+ #define ATH12K_MAX_UPDS 1
+ #define ATH12K_UPD_IRQ_WRD_LEN  18
+@@ -87,6 +87,7 @@ static const char *irq_name[ATH12K_IRQ_N
+ 	"wbm2host-tx-completions-ring2",
+ 	"wbm2host-tx-completions-ring1",
+ 	"tcl2host-status-ring",
++	"umac_reset",
+ 	"reo2ppe",
+ 	"ppe_wbm_rel",
+ 	"ppe2tcl"
+@@ -130,6 +131,7 @@ enum ext_irq_num {
+ 	wbm2host_tx_completions_ring2,
+ 	wbm2host_tx_completions_ring1,
+ 	tcl2host_status_ring,
++	umac_reset,
+ 	reo2ppe,
+ 	ppe_wbm_rel,
+ 	ppe2tcl
+@@ -183,6 +185,10 @@ static void __ath12k_ahb_ext_irq_disable
+ 		struct ath12k_ext_irq_grp *irq_grp = &ab->ext_irq_grp[i];
+ 
+ 		ath12k_ahb_ext_grp_disable(irq_grp);
++
++		if (test_bit(ATH12K_FLAG_UMAC_PRERESET_START, &ab->dev_flags))
++			continue;
++
+ 		if (irq_grp->napi_enabled) {
+ 			napi_synchronize(&irq_grp->napi);
+ 			napi_disable(&irq_grp->napi);
+@@ -334,7 +340,9 @@ static void ath12k_ahb_ext_irq_enable(st
+ static void ath12k_ahb_ext_irq_disable(struct ath12k_base *ab)
+ {
+ 	__ath12k_ahb_ext_irq_disable(ab);
+-	ath12k_ahb_sync_ext_irqs(ab);
++
++	if (!test_bit(ATH12K_FLAG_UMAC_PRERESET_START, &ab->dev_flags))
++		ath12k_ahb_sync_ext_irqs(ab);
+ }
+ 
+ static void ath12k_ahb_kill_tasklets(struct ath12k_base *ab)
+@@ -924,6 +932,83 @@ void ath12k_ahb_ppeds_free_interrupts(st
+ }
+ #endif
+ 
++static int ath12k_ahb_dp_umac_config_irq(struct ath12k_base *ab)
++{
++        struct ath12k_dp_umac_reset *umac_reset = &ab->dp_umac_reset;
++        struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++        struct device *dev = ab->dev;
++        int irq, ret;
++        u32 interrupt_reset_addr;
++
++        irq = platform_get_irq_byname(ab->pdev, "umac_reset");
++
++        if (irq < 0) {
++                ath12k_err(ab, "umac reset interrupt not found in dts\n");
++                return -ENXIO;
++        }
++
++        umac_reset->irq_num = irq;
++
++        if (ab->hw_params->umac_irq_line_reset) {
++                if (of_property_read_u32(dev->of_node, "qcom,umac-irq-reset-addr", &interrupt_reset_addr)) {
++                        ath12k_err(ab, "qcom,umac-irq-reset-addr is not found in dts\n");
++                        return -ENXIO;
++                }
++
++                ab_ahb->interrupt_reset_base_addr = ioremap(interrupt_reset_addr, PCIE_MEM_SIZE);
++                if (!ab_ahb->interrupt_reset_base_addr) {
++                        ath12k_err(ab, "Not requesting irq %d for umac dp reset Due to I/O remap failure\n", irq);
++                        return -ENOMEM;
++                }
++        }
++
++        tasklet_setup(&umac_reset->intr_tq, ath12k_umac_reset_tasklet_handler);
++
++        ret = request_irq(irq, ath12k_umac_reset_interrupt_handler,
++                          IRQF_NO_SUSPEND, "umac_dp_reset_ahb", ab);
++
++        if (ret) {
++                ath12k_err(ab, "failed to request irq %d for umac dp reset\n", irq);
++                return ret;
++        }
++
++        disable_irq_nosync(umac_reset->irq_num);
++
++        return 0;
++}
++
++static void ath12k_ahb_dp_umac_reset_enable_irq(struct ath12k_base *ab)
++{
++        struct ath12k_dp_umac_reset *umac_reset = &ab->dp_umac_reset;
++
++        enable_irq(umac_reset->irq_num);
++}
++
++static void ath12k_ahb_dp_umac_reset_free_irq(struct ath12k_base *ab)
++{
++        struct ath12k_dp_umac_reset *umac_reset = &ab->dp_umac_reset;
++        struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++
++        if (ab->hw_params->umac_irq_line_reset) {
++                iounmap(ab_ahb->interrupt_reset_base_addr);
++                ab_ahb->interrupt_reset_base_addr = NULL;
++        }
++
++        disable_irq_nosync(umac_reset->irq_num);
++        free_irq(umac_reset->irq_num, ab);
++}
++
++void ath12k_ahb_umac_intr_line_reset(struct ath12k_base *ab)
++{
++        struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++
++        if (!ab_ahb->interrupt_reset_base_addr) {
++                ath12k_err(ab, "Base address is NULL\n");
++                return;
++        }
++        writel_relaxed(ATH12K_UMAC_INTR_LINE_RESET_VAL, ab_ahb->interrupt_reset_base_addr);
++}
++
+ static struct ath12k_hif_ops ath12k_ahb_hif_ops = {
+ 	.start = ath12k_ahb_start,
+ 	.stop = ath12k_ahb_stop,
+@@ -944,24 +1029,27 @@ static struct ath12k_hif_ops ath12k_ahb_
+ 	.ppeds_irq_enable = ath12k_ahb_ppeds_irq_enable,
+ 	.ppeds_irq_disable = ath12k_ahb_ppeds_irq_disable,
+ #endif
++	.dp_umac_reset_irq_config = ath12k_ahb_dp_umac_config_irq,
++	.dp_umac_reset_enable_irq = ath12k_ahb_dp_umac_reset_enable_irq,
++	.dp_umac_reset_free_irq = ath12k_ahb_dp_umac_reset_free_irq,
+ };
+ 
+ static const struct ath12k_hif_ops ath12k_ahb_hif_ops_qcn6432 = {
+ 	.start = ath12k_pcic_start,
+-        .stop = ath12k_pcic_stop,
++	.stop = ath12k_pcic_stop,
+ 	.cmem_read32 = ath12k_pcic_cmem_read32,
+ 	.cmem_write32 = ath12k_pcic_cmem_write32,
+-        .power_down = ath12k_ahb_power_down,
+-        .power_up = ath12k_ahb_power_up,
+-        .read32 = ath12k_pcic_ipci_read32,
+-        .write32 = ath12k_pcic_ipci_write32,
+-        .irq_enable = ath12k_pcic_ext_irq_enable,
+-        .irq_disable = ath12k_pcic_ext_irq_disable,
+-        .get_msi_address =  ath12k_pcic_get_msi_address,
+-        .get_user_msi_vector = ath12k_pcic_get_user_msi_assignment,
+-        .config_static_window = ath12k_pcic_config_static_window,
+-        .get_msi_irq = ath12k_pcic_get_msi_irq,
+-        .map_service_to_pipe = ath12k_pcic_map_service_to_pipe,
++	.power_down = ath12k_ahb_power_down,
++	.power_up = ath12k_ahb_power_up,
++	.read32 = ath12k_pcic_ipci_read32,
++	.write32 = ath12k_pcic_ipci_write32,
++	.irq_enable = ath12k_pcic_ext_irq_enable,
++	.irq_disable = ath12k_pcic_ext_irq_disable,
++	.get_msi_address =  ath12k_pcic_get_msi_address,
++	.get_user_msi_vector = ath12k_pcic_get_user_msi_assignment,
++	.config_static_window = ath12k_pcic_config_static_window,
++	.get_msi_irq = ath12k_pcic_get_msi_irq,
++	.map_service_to_pipe = ath12k_pcic_map_service_to_pipe,
+ 	.ce_irq_enable = ath12k_pcic_ce_irqs_enable,
+ 	.ce_irq_disable = ath12k_pcic_ce_irq_disable_sync,
+ 	.ext_irq_setup = ath12k_pcic_cfg_hybrid_ext_irq,
+@@ -972,6 +1060,10 @@ static const struct ath12k_hif_ops ath12
+ 	.ppeds_irq_enable = ath12k_pcic_ppeds_irq_enable,
+ 	.ppeds_irq_disable = ath12k_pcic_ppeds_irq_disable,
+ #endif
++	.dp_umac_intr_line_reset = ath12k_ahb_umac_intr_line_reset,
++	.dp_umac_reset_irq_config = ath12k_ahb_dp_umac_config_irq,
++	.dp_umac_reset_enable_irq = ath12k_ahb_dp_umac_reset_enable_irq,
++	.dp_umac_reset_free_irq = ath12k_ahb_dp_umac_reset_free_irq,
+ };
+ 
+ static void ath12k_core_dump_crash_reason(struct ath12k_base *ab)
+--- a/drivers/net/wireless/ath/ath12k/ahb.h
++++ b/drivers/net/wireless/ath/ath12k/ahb.h
+@@ -32,6 +32,10 @@
+ #define ATH12K_USERPD_FW_NAME_LEN		35
+ #define ATH12K_AHB_USERPD1			1
+ 
++#define ATH12K_UMAC_INTR_LINE_RESET_VAL         0x00000100
++/* Here PCIE_MEM_SIZE is of size 4 Bytes*/
++#define PCIE_MEM_SIZE 4
++
+ enum ath12k_ahb_smp2p_msg_id {
+ 	ATH12K_AHB_POWER_SAVE_ENTER = 1,
+ 	ATH12K_AHB_POWER_SAVE_EXIT,
+@@ -86,6 +90,7 @@ struct ath12k_ahb {
+ 	size_t mem_size;
+ 	void *mem_region;
+ 	void *rpd_notifier;
++	void *interrupt_reset_base_addr;
+ };
+ 
+ struct ath12k_ahb_driver {
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1625,7 +1625,7 @@ void ath12k_fw_stats_bcn_free(struct lis
+ void ath12k_fw_stats_free(struct ath12k_fw_stats *stats);
+ void ath12k_fw_stats_reset(struct ath12k *ar);
+ irqreturn_t ath12k_umac_reset_interrupt_handler(int irq, void *arg);
+-void ath12k_umac_reset_tasklet_handler(struct tasklet_struct *umac_cntxt);
++void ath12k_umac_reset_tasklet_handler(struct tasklet_struct *umac_ctxt);
+ void ath12k_dp_umac_reset_handle(struct ath12k_base *ab);
+ int ath12k_dp_umac_reset_init(struct ath12k_base *ab);
+ void ath12k_dp_umac_reset_deinit(struct ath12k_base *ab);
+--- a/drivers/net/wireless/ath/ath12k/hif.h
++++ b/drivers/net/wireless/ath/ath12k/hif.h
+@@ -53,6 +53,7 @@ struct ath12k_hif_ops {
+ 	void (*ppeds_irq_enable)(struct ath12k_base *ab, enum ppeds_irq_type type);
+ 	void (*ppeds_irq_disable)(struct ath12k_base *ab, enum ppeds_irq_type type);
+ #endif
++	void (*dp_umac_intr_line_reset)(struct ath12k_base *ab);
+ 	int (*dp_umac_reset_irq_config)(struct ath12k_base *ab);
+ 	void (*dp_umac_reset_enable_irq)(struct ath12k_base *ab);
+ 	void (*dp_umac_reset_free_irq)(struct ath12k_base *ab);
+@@ -238,6 +239,12 @@ static inline void ath12k_hif_ext_irq_cl
+ 	ab->hif.ops->ext_irq_cleanup(ab);
+ }
+ 
++static inline void ath12k_hif_dp_umac_intr_line_reset(struct ath12k_base *ab)
++{
++        if (ab->hif.ops->dp_umac_intr_line_reset)
++                ab->hif.ops->dp_umac_intr_line_reset(ab);
++}
++
+ static inline int ath12k_hif_dp_umac_reset_irq_config(struct ath12k_base *ab)
+ {
+         if (ab->hif.ops->dp_umac_reset_irq_config)
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -301,6 +301,7 @@ struct ath12k_hw_params {
+ 	bool credit_flow;
+ 	bool support_umac_reset;
+ 	u16 umac_reset_ipc;
++	bool umac_irq_line_reset;
+ 	bool is_plink_preferable;
+ };
+ 
+--- a/drivers/net/wireless/ath/ath12k/pcic.c
++++ b/drivers/net/wireless/ath/ath12k/pcic.c
+@@ -80,7 +80,7 @@ static const char *irq_name[ATH12K_IRQ_N
+ 	"tcl2host-status-ring",
+ };
+ 
+-char dp_irq_name[ATH12K_MAX_PCI_DOMAINS + 1][ATH12K_EXT_IRQ_GRP_NUM_MAX][DP_IRQ_NAME_LEN] = {};
++char dp_irq_name[ATH12K_MAX_PCI_DOMAINS + 1][ATH12K_EXT_IRQ_DP_NUM_VECTORS][DP_IRQ_NAME_LEN] = {};
+ char ce_irq_name[ATH12K_MAX_PCI_DOMAINS + 1][ATH12K_IRQ_NUM_MAX][DP_IRQ_NAME_LEN] = {};
+ 
+ void ath12k_pcic_config_static_window(struct ath12k_base *ab)
+@@ -287,6 +287,13 @@ static void __ath12k_pcic_ext_irq_disabl
+ 
+ 		ath12k_pcic_ext_grp_disable(irq_grp);
+ 
++		/* As Umac reset will happen in atomic context doing napi_synchronize
++		 * will lead to sleep in atmoic context that's why avoiding napi sync
++		 * during umac reset.
++		 */
++		if (test_bit(ATH12K_FLAG_UMAC_PRERESET_START, &sc->dev_flags))
++			continue;
++
+ 		if (irq_grp->napi_enabled) {
+ 			napi_synchronize(&irq_grp->napi);
+ 			napi_disable(&irq_grp->napi);
+@@ -825,7 +832,9 @@ void ath12k_pcic_ext_irq_disable(struct
+ 		return;
+ 
+ 	__ath12k_pcic_ext_irq_disable(ab);
+-	ath12k_pcic_sync_ext_irqs(ab);
++
++	if (!test_bit(ATH12K_FLAG_UMAC_PRERESET_START, &ab->dev_flags))
++		ath12k_pcic_sync_ext_irqs(ab);
+ }
+ 
+ void ath12k_pcic_stop(struct ath12k_base *ab)
+--- a/drivers/net/wireless/ath/ath12k/umac_reset.c
++++ b/drivers/net/wireless/ath/ath12k/umac_reset.c
+@@ -489,6 +489,7 @@ void ath12k_umac_reset_tasklet_handler(s
+ 	struct ath12k_dp_umac_reset *umac_reset = from_tasklet(umac_reset, umac_cntxt, intr_tq);
+ 	struct ath12k_base *ab = container_of(umac_reset, struct ath12k_base, dp_umac_reset);
+ 
++	ath12k_hif_dp_umac_intr_line_reset(ab);
+ 	ath12k_dp_umac_reset_handle(ab);
+ 	enable_irq(umac_reset->irq_num);
+ }
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -135,6 +135,7 @@ static const struct ath12k_hw_ops wcn785
+ 
+ #define ATH12K_TX_MON_RING_MASK_0 0x1
+ #define ATH12K_TX_MON_RING_MASK_1 0x2
++#define ATH12K_UMAC_RESET_INTR_MASK_0   0x1
+ 
+ /* To support 8 MSI DP grouping */
+ static struct ath12k_hw_ring_mask ath12k_wifi7_hw_ring_mask_qcn9274_msi8 = {
+@@ -202,17 +203,16 @@ static struct ath12k_hw_ring_mask ath12k
+ 		0, 0, 0, 0, 0, 0, 0
+         },
+ #endif
++#endif
+         .umac_dp_reset = {
+                 0, 0, 0, 0, 0, 0, 0,
+ 		ATH12K_UMAC_RESET_INTR_MASK_0
+         },
+-#endif
+ };
+ 
+ #define ATH12K_PPE2TCL_RING_MASK_0 0x1
+ #define ATH12K_REO2PPE_RING_MASK_0 0x1
+ #define ATH12K_PPE_WBM2SW_RELEASE_RING_MASK_0 0x1
+-#define ATH12K_UMAC_RESET_INTR_MASK_0   0x1
+ 
+ static struct ath12k_hw_ring_mask ath12k_wifi7_hw_ring_mask_qcn9274 = {
+ 	.tx  = {
+@@ -560,6 +560,8 @@ static struct ath12k_hw_params ath12k_wi
+ 		.credit_flow = false,
+ 		.is_plink_preferable = true,
+ 		.support_umac_reset = false,
++		.umac_irq_line_reset = false,
++		.umac_reset_ipc = 0,
+ 		.ds_support = false,
+ 	},
+ 	{
+@@ -655,6 +657,8 @@ static struct ath12k_hw_params ath12k_wi
+ 		.credit_flow = false,
+ 		.is_plink_preferable = true,
+ 		.support_umac_reset = false,
++		.umac_irq_line_reset = false,
++		.umac_reset_ipc = 0,
+ 		.ds_support = false,
+ 	},
+ 	{
+@@ -757,6 +761,8 @@ static struct ath12k_hw_params ath12k_wi
+ 		.credit_flow = false,
+ 		.is_plink_preferable = true,
+ 		.support_umac_reset = true,
++		.umac_irq_line_reset = false,
++		.umac_reset_ipc = 0,
+ 		.ds_support = true,
+ 	},
+ 	{
+@@ -850,6 +856,8 @@ static struct ath12k_hw_params ath12k_wi
+ 		.credit_flow = false,
+ 		.is_plink_preferable = false,
+ 		.support_umac_reset = true,
++		.umac_irq_line_reset = false,
++		.umac_reset_ipc = ATH12K_UMAC_RESET_IPC_IPQ5332,
+ 		.ds_support = false,
+ 	},
+ 	{
+@@ -923,6 +931,8 @@ static struct ath12k_hw_params ath12k_wi
+ 		.credit_flow = false,
+ 		.is_plink_preferable = true,
+ 		.support_umac_reset = true,
++		.umac_irq_line_reset = true,
++		.umac_reset_ipc = ATH12K_UMAC_RESET_IPC_QCN6432,
+ 		.ds_support = true,
+ 	},
+ 	{
+@@ -1016,6 +1026,8 @@ static struct ath12k_hw_params ath12k_wi
+ 		.credit_flow = false,
+ 		.is_plink_preferable = true,
+ 		.support_umac_reset = true,
++		.umac_irq_line_reset = false,
++		.umac_reset_ipc = ATH12K_UMAC_RESET_IPC_IPQ5332,
+ 		.ds_support = true,
+ 	},
+ };
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -603,7 +603,8 @@ static void ath12k_dp_srng_common_cleanu
+ 	}
+ 	ath12k_dp_srng_cleanup(ab, &dp->wbm_desc_rel_ring);
+ 
+-	ath12k_dp_srng_ppeds_cleanup(ab);
++	if (!ath12k_dp_umac_reset_in_progress(ab))
++		ath12k_dp_srng_ppeds_cleanup(ab);
+ }
+ 
+ static int ath12k_dp_srng_common_setup(struct ath12k_base *ab)
+@@ -707,13 +708,13 @@ static int ath12k_dp_srng_common_setup(s
+ 
+ 	ath12k_hal_reo_hw_setup(ab, ring_hash_map);
+ 
+-skip_reo_setup:
+ 	ret = ath12k_dp_srng_ppeds_setup(ab);
+ 	if (ret) {
+ 		ath12k_warn(ab, "failed to set up ppe-ds srngs :%d\n", ret);
+ 		goto err;
+ 	}
+ 
++skip_reo_setup:
+ 	return 0;
+ 
+ err:
+@@ -2021,11 +2022,10 @@ void ath12k_dp_srng_hw_ring_disable(stru
+ void ath12k_dp_umac_txrx_desc_cleanup(struct ath12k_base *ab)
+ {
+ 	struct ath12k_rx_desc_info *desc_info;
+-	struct ath12k_tx_desc_info *tx_desc_info;
++	struct ath12k_tx_desc_info *tx_desc_info, *tmp;
+ 	struct ath12k_dp *dp;
+ 	struct sk_buff *skb;
+-	int i, j, k;
+-	u32  tx_spt_page;
++	int i, j;
+ 
+ 	dp = ath12k_ab_to_dp(ab);
+ 	/* RX Descriptor cleanup */
+@@ -2059,24 +2059,25 @@ void ath12k_dp_umac_txrx_desc_cleanup(st
+ 	/* TX Descriptor cleanup */
+ 	for (i = 0; i < ATH12K_HW_MAX_QUEUES; i++) {
+ 		spin_lock_bh(&dp->tx_desc_lock[i]);
++		list_for_each_entry_safe(tx_desc_info, tmp, &dp->tx_desc_used_list[i],
++					 list) {
++			skb = tx_desc_info->skb;
++			if (!skb)
++				continue;
+ 
+-		for (j = 0; j < ATH12K_TX_SPT_PAGES_PER_POOL; j++) {
+-			tx_spt_page = j + i * ATH12K_TX_SPT_PAGES_PER_POOL;
+-			tx_desc_info = dp->txbaddr[tx_spt_page];
+-
+-			for (k = 0; k < ATH12K_MAX_SPT_ENTRIES; k++) {
+-				skb = tx_desc_info[k].skb;
+-				if (!skb)
+-					continue;
+-
+-				tx_desc_info[k].skb = NULL;
+-				tx_desc_info[k].skb_ext_desc = NULL;
+-				list_add_tail(&tx_desc_info[k].list, &dp->tx_desc_free_list[i]);
+-				if (tx_desc_info[k].skb_ext_desc) {
+-					dev_kfree_skb_any(tx_desc_info[k].skb_ext_desc);
+-				}
+-				dev_kfree_skb_any(skb);
++			tx_desc_info->skb = NULL;
++
++			if (tx_desc_info->skb_ext_desc) {
++				ath12k_core_dma_unmap_single(ab->dev,
++							     ATH12K_SKB_CB(skb)->paddr_ext_desc,
++							     tx_desc_info->skb_ext_desc->len,
++							     DMA_TO_DEVICE);
++				dev_kfree_skb_any(tx_desc_info->skb_ext_desc);
+ 			}
++
++			ath12k_core_dma_unmap_single(ab->dev, ATH12K_SKB_CB(skb)->paddr,
++						     skb->len, DMA_TO_DEVICE);
++			dev_kfree_skb_any(skb);
+ 		}
+ 		spin_unlock_bh(&dp->tx_desc_lock[i]);
+ 	}
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -957,6 +957,7 @@ struct ath12k_rx_desc_info *ath12k_dp_ge
+ struct ath12k_tx_desc_info *ath12k_dp_get_tx_desc(struct ath12k_dp *dp,
+ 						  u32 desc_id);
+ bool ath12k_dp_wmask_compaction_rx_tlv_supported(struct ath12k_base *ab);
++bool ath12k_dp_umac_reset_in_progress(struct ath12k_base *ab);
+ void ath12k_umac_reset_notify_target_sync_and_send(struct ath12k_base *ab,
+                                        enum dp_umac_reset_tx_cmd tx_event);
+ void ath12k_umac_reset_handle_post_reset_start(struct ath12k_base *ab);

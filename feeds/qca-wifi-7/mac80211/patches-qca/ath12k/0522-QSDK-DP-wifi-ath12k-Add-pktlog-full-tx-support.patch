@@ -1,0 +1,757 @@
+From 6e46ebe072c1cdf34cc46f7d3d4727d414e378a6 Mon Sep 17 00:00:00 2001
+From: Adwait Nayak <adwaitn@qti.qualcomm.com>
+Date: Wed, 20 Aug 2025 15:24:09 +0530
+Subject: [PATCH] QSDK: DP: wifi: ath12k: Add pktlog full tx support
+
+This change takes care of below items:
+1. Add sanity checks for pktlog buffer boundaries,
+   buffer pointer and size to prevent crash and buffer
+   overruns.
+2. Refactor ath12k_pktlog_read() to avoid below call trace:
+
+BUG: sleeping function called from invalid context at include/linux/uaccess.h:165
+in_atomic(): 1, irqs_disabled(): 0, non_block: 0, pid: 19638, name: cp
+preempt_count: 201, expected: 0
+RCU nest depth: 0, expected: 0
+CPU: 2 PID: 19638 Comm: cp Tainted: G           O       6.6.88+ #0
+Hardware name: Qualcomm Technologies, Inc. IPQ9574/RDP433/AP-AL02-C4 (DT)
+Call trace:
+ dump_backtrace+0xd4/0xf4
+ show_stack+0x14/0x1c
+ dump_stack_lvl+0x44/0x58
+ dump_stack+0x14/0x1c
+ __might_resched+0x124/0x13c
+ __might_sleep+0x60/0x6c
+ __might_fault+0x18/0x24
+ ath12k_erp_handle_ssr+0x268/0xe78 [ath12k]
+ full_proxy_read+0x54/0x80
+ vfs_read+0xac/0x21c
+ ksys_read+0x74/0xec
+ __arm64_sys_read+0x14/0x1c
+ el0_svc_common.constprop.0+0xc8/0x120
+ do_el0_svc+0x18/0x20
+ el0_svc+0x18/0x40
+ el0t_64_sync_handler+0x80/0x124
+ el0t_64_sync+0x150/0x154
+
+3. Update TLV subscription in case of LITE_T2H.
+  Below TLVs are needed in pktlog lite tx data during critical
+  issue debugging:
+  HTT_PPDU_STATS_USERS_INFO,
+  HTT_PPDU_STATS_USR_MPDU_ENQ_BITMAP_1024_TLV,
+  HTT_PPDU_STATS_USR_COMPLTN_BA_BITMAP_1024_TLV,
+
+  num_users and success_bytes info was missing the pktlog data.
+  Subscribing HTT_PPDU_STATS_USERS_INFO TLV fixes that issue.
+
+Signed-off-by: Adwait Nayak <adwaitn@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/debugfs.c     |   5 +-
+ drivers/net/wireless/ath/ath12k/dp_htt.c      |  15 +-
+ drivers/net/wireless/ath/ath12k/dp_htt.h      |   9 +
+ drivers/net/wireless/ath/ath12k/dp_mon.h      |  11 +-
+ .../net/wireless/ath/ath12k/dp_mon_filter.c   |   5 +-
+ drivers/net/wireless/ath/ath12k/pktlog.c      | 174 ++++++++++++------
+ drivers/net/wireless/ath/ath12k/pktlog.h      |  19 ++
+ .../net/wireless/ath/ath12k/wifi7/dp_mon2.c   |   6 +-
+ 8 files changed, 169 insertions(+), 75 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -5625,6 +5625,7 @@ static ssize_t ath12k_write_pktlog_filte
+ 		mode = ATH12K_PKTLOG_MODE_LITE;
+ 	else {
+ 		ath12k_err(ab, "Invalid mode: %d", mode);
++		ret = -EINVAL;
+ 		goto exit;
+ 	}
+ 
+@@ -5647,11 +5648,11 @@ static ssize_t ath12k_write_pktlog_filte
+ 		}
+ 	}
+ 
+-	ath12k_dp_mon_pktlog_config(ar, enable, mode);
++	ath12k_dp_mon_pktlog_config(ar, enable, mode, filter);
+ 	ret = ath12k_dp_mon_rx_update_filter(ar);
+ 	if (ret) {
+ 		ath12k_err(ab, "Failed to configure pktlog filters\n");
+-		ath12k_dp_mon_pktlog_config(ar, false, mode);
++		ath12k_dp_mon_pktlog_config(ar, false, mode, filter);
+ 		goto exit;
+ 	}
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_htt.c
++++ b/drivers/net/wireless/ath/ath12k/dp_htt.c
+@@ -877,9 +877,9 @@ static int ath12k_htt_pull_ppdu_stats(st
+ 	msg = (struct ath12k_htt_ppdu_stats_msg *)skb->data;
+ 	len = le32_get_bits(msg->info, HTT_T2H_PPDU_STATS_INFO_PAYLOAD_SIZE);
+ 	if (len > (skb->len - struct_size(msg, data, 0))) {
+-		ath12k_warn(ab,
+-			    "HTT PPDU STATS event has unexpected payload size %u, should be smaller than %u\n",
+-			    len, skb->len);
++		ath12k_dbg(ab, ATH12K_DBG_DP_HTT,
++			   "HTT PPDU STATS event has unexpected payload size %u, should be smaller than %u\n",
++			   len, skb->len);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -1112,35 +1112,34 @@ exit:
+ static void
+ ath12k_htt_pktlog_tx_handler(struct ath12k_base *ab, struct sk_buff *skb)
+ {
+-        struct ath12k_pktlog_hdr pl_hdr;
+-        struct ath12k *ar;
+-        u8 pdev_id;
+-        u32 *pl_tgt_hdr, *msg_word;
+-        u16 payload_size;
+-
+-        if (!skb->data)
+-                return;
+-
+-        msg_word = (u32 *)skb->data;
+-
+-        pdev_id = u32_get_bits(*msg_word, HTT_T2H_PKTLOG_PDEV_ID);
+-        ar = ath12k_mac_get_ar_by_pdev_id(ab, pdev_id);
+-        if (!ar) {
+-                ath12k_err(ab, "invalid pdev id %d on htt pktlog\n", pdev_id);
+-                return;
+-        }
+-
+-        payload_size = u32_get_bits(*msg_word,
+-                                    HTT_T2H_PKTLOG_PAYLOAD_SIZE);
+-        pl_tgt_hdr = (u32 *)(msg_word + 1);
+-        pl_hdr.size = u32_get_bits(*(pl_tgt_hdr +
+-				     HTT_T2H_PKTLOG_HDR_SIZE_OFFSET),
+-                                   HTT_T2H_PKTLOG_PAYLOAD_SIZE);
+-        trace_ath12k_htt_pktlog_tx_handler(ar, pl_tgt_hdr, pl_hdr.size,
++	struct ath12k *ar;
++	struct ath12k_htt_pktlog_msg *msg;
++	u16 payload_size;
++	u8 pdev_id;
++
++	if (!skb->data)
++		return;
++
++	msg = (struct ath12k_htt_pktlog_msg *)skb->data;
++
++	pdev_id = le32_get_bits(msg->header, HTT_T2H_PKTLOG_PDEV_ID);
++	if (pdev_id < 1) {
++		ath12k_warn(ab, "HTT PKTLOG MSG has invalid pdev id");
++		return;
++	}
++
++	ar = ath12k_mac_get_ar_by_pdev_id(ab, pdev_id);
++	if (!ar) {
++		ath12k_warn(ab, "pktlog tx: failed to get ar\n");
++		return;
++	}
++
++	payload_size = le32_get_bits(msg->header, HTT_T2H_PKTLOG_PAYLOAD_SIZE);
++	trace_ath12k_htt_pktlog_tx_handler(ar, msg->payload, payload_size,
+ 					   ar->ab->pktlog_defs_checksum);
+ 
+-        if (ar->debug.is_pkt_logging)
+-                ath12k_htt_pktlog_process(ar, (u8 *)pl_tgt_hdr);
++	if (ar->debug.is_pkt_logging)
++		ath12k_htt_pktlog_process(ar, (u8 *)msg->payload);
+ }
+ 
+ static void ath12k_htt_t2h_ppdu_id_fmt_handler(struct ath12k_dp *dp,
+--- a/drivers/net/wireless/ath/ath12k/dp_htt.h
++++ b/drivers/net/wireless/ath/ath12k/dp_htt.h
+@@ -533,6 +533,12 @@ enum htt_ppdu_stats_tag_type {
+ 	HTT_PPDU_STATS_TAG_INFO,
+ 	HTT_PPDU_STATS_TAG_TX_MGMTCTRL_PAYLOAD,
+ 	HTT_PPDU_STATS_USERS_INFO,
++	HTT_PPDU_STATS_USR_MPDU_ENQ_BITMAP_1024_TLV,
++	HTT_PPDU_STATS_USR_COMPLTN_BA_BITMAP_1024_TLV,
++	HTT_PPDU_STATS_RX_MGMTCTRL_PAYLOAD_TLV,
++	HTT_PPDU_STATS_FOR_SMU_TLV,
++	HTT_PPDU_STATS_MLO_TX_RESP_TLV,
++	HTT_PPDU_STATS_MLO_TX_NOTIFICATION_TLV,
+ 
+ 	/* New TLV's are added above to this line */
+ 	HTT_PPDU_STATS_TAG_MAX,
+@@ -559,10 +565,13 @@ enum htt_ppdu_stats_tag_type {
+ 
+ #define HTT_PPDU_STATS_TAG_PKTLOG  (BIT(HTT_PPDU_STATS_TAG_USR_MPDU_ENQ_BITMAP_64) | \
+ 				    BIT(HTT_PPDU_STATS_TAG_USR_MPDU_ENQ_BITMAP_256) | \
++				    BIT(HTT_PPDU_STATS_USR_MPDU_ENQ_BITMAP_1024_TLV) | \
+ 				    BIT(HTT_PPDU_STATS_TAG_USR_COMPLTN_BA_BITMAP_64) | \
+ 				    BIT(HTT_PPDU_STATS_TAG_USR_COMPLTN_BA_BITMAP_256) | \
++				    BIT(HTT_PPDU_STATS_USR_COMPLTN_BA_BITMAP_1024_TLV) | \
+ 				    BIT(HTT_PPDU_STATS_TAG_INFO) | \
+ 				    BIT(HTT_PPDU_STATS_TAG_TX_MGMTCTRL_PAYLOAD) | \
++				    BIT(HTT_PPDU_STATS_USERS_INFO) | \
+ 				    HTT_PPDU_STATS_TAG_DEFAULT)
+ 
+ enum htt_stats_internal_ppdu_frametype {
+@@ -1355,9 +1364,13 @@ enum htt_backpressure_lmac_ringid {
+  *     Purpose: explicitly specify the payload size
+  *     Value: payload size in bytes (payload size is a multiple of 4 bytes)
+  */
+-#define HTT_T2H_PKTLOG_HDR_SIZE_OFFSET 1
+-#define HTT_T2H_PKTLOG_PDEV_ID GENMASK(11, 10)
+-#define HTT_T2H_PKTLOG_PAYLOAD_SIZE GENMASK(31, 16)
++#define HTT_T2H_PKTLOG_PDEV_ID		GENMASK(11, 10)
++#define HTT_T2H_PKTLOG_PAYLOAD_SIZE	GENMASK(31, 16)
++
++struct ath12k_htt_pktlog_msg {
++	__le32 header;
++	u8 payload[];
++} __packed;
+ 
+ struct ath12k_htt_ppdu_stats_msg {
+ 	__le32 info;
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.h
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.h
+@@ -123,7 +123,8 @@ struct ath12k_dp_arch_mon_ops {
+ 	void (*rx_enable_packet_filters)(void *ptr,
+ 						struct htt_rx_ring_tlv_filter *filter);
+ 	void (*pktlog_config)(struct ath12k_pdev_dp *dp_pdev,
+-			      enum ath12k_pktlog_mode mode, bool enable);
++			      enum ath12k_pktlog_mode mode,
++			      u32 filter, bool enable);
+ };
+ 
+ struct ath12k_dp_mon {
+@@ -447,7 +448,8 @@ void ath12k_dp_mon_rx_process_low_thres(
+ void
+ ath12k_dp_mon_cnt_skb_and_frags(struct sk_buff *skb, u32 *skb_count, u32 *frag_count);
+ void ath12k_dp_mon_pktlog_config_filter(struct ath12k_pdev_dp *dp_pdev,
+-				enum ath12k_pktlog_mode mode, bool enable);
++					enum ath12k_pktlog_mode mode,
++					u32 filter, bool enable);
+ u32 ath12k_wifi7_dp_mon_get_frag_size_by_idx(struct ath12k_dp *dp, struct sk_buff *skb,
+ 					     u8 idx);
+ void *ath12k_dp_mon_skb_get_frag_addr(struct sk_buff *skb, u8 idx);
+@@ -764,7 +766,8 @@ ath12k_dp_mon_rx_config_packet_type_subt
+ 
+ static inline void
+ ath12k_dp_mon_pktlog_config(struct ath12k *ar, bool enable,
+-			    enum ath12k_pktlog_mode mode)
++			    enum ath12k_pktlog_mode mode,
++			    u32 filter)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+@@ -774,7 +777,7 @@ ath12k_dp_mon_pktlog_config(struct ath12
+ 	mon_ops = ath12k_dp_mon_ops_get(dp);
+ 
+ 	if(mon_ops && mon_ops->pktlog_config)
+-		mon_ops->pktlog_config(dp_pdev, mode, enable);
++		mon_ops->pktlog_config(dp_pdev, mode, filter, enable);
+ }
+ 
+ static inline void
+--- a/drivers/net/wireless/ath/ath12k/dp_mon_filter.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon_filter.c
+@@ -740,7 +740,7 @@ ath12k_dp_mon_rx_setup_pktlog_full(struc
+ 
+ void ath12k_dp_mon_pktlog_config_filter(struct ath12k_pdev_dp *dp_pdev,
+ 					enum ath12k_pktlog_mode mode,
+-					bool enable)
++					u32 filter, bool enable)
+ {
+ 	struct ath12k_dp *dp = dp_pdev->dp;
+ 	int ret = 0;
+@@ -764,6 +764,9 @@ void ath12k_dp_mon_pktlog_config_filter(
+ 			ath12k_dp_mon_rx_setup_pktlog_lite(dp_pdev);
+ 			break;
+ 		case ATH12K_PKTLOG_MODE_FULL:
++			if (!(filter & ATH12K_PKTLOG_RX))
++				return;
++
+ 			dp->rx_pktlog_mode = ATH12K_PKTLOG_MODE_FULL;
+ 
+ 			ath12k_dp_mon_rx_setup_pktlog_full(dp_pdev);
+--- a/drivers/net/wireless/ath/ath12k/pktlog.c
++++ b/drivers/net/wireless/ath/ath12k/pktlog.c
+@@ -201,48 +201,65 @@ static int ath12k_pktlog_mmap(struct fil
+ static ssize_t ath12k_pktlog_read(struct file *file, char __user *userbuf,
+                                   size_t count, loff_t *ppos)
+ {
+-	size_t bufhdr_size;
+-	size_t nbytes = 0, ret_val = 0;
+-	int rem_len;
+-	int start_offset, end_offset;
+-	int fold_offset, ppos_data, cur_rd_offset;
+ 	struct ath12k *ar = file->private_data;
+ 	struct ath12k_pktlog *info = &ar->debug.pktlog;
+ 	struct ath12k_pktlog_buf *log_buf;
++	size_t bufhdr_size, rem_len, nbytes = 0, ret_val = 0;
++	size_t start_offset, end_offset = 0;
++	size_t fold_offset = INVALID_OFFSET, ppos_data;
++	int cur_rd_offset;
++	char *buf;
++	ssize_t final_ret = 0;
++
++	if (count == 0 || !userbuf)
++		return 0;
++
++	wiphy_lock(ath12k_ar_to_hw(ar)->wiphy);
++	if (ar->ah->state != ATH12K_HW_STATE_ON) {
++		final_ret = -ENETDOWN;
++		goto unlock;
++	}
++
++	buf = vmalloc(count);
++	if (!buf) {
++		final_ret = -ENOMEM;
++		goto unlock;
++	}
+ 
+ 	spin_lock_bh(&info->lock);
+ 	log_buf = info->buf;
+-	if (!log_buf)
+-		return 0;
++	if (!log_buf) {
++		spin_unlock_bh(&info->lock);
++		final_ret = 0;
++		goto free;
++	}
+ 
+ 	bufhdr_size = sizeof(log_buf->bufhdr);
+-
+-	if (!info->fw_version_record || info->invalid_decode_info) {
++	if (!info->fw_version_record || info->invalid_decode_info)
+ 		bufhdr_size -= sizeof(struct ath12k_pktlog_decode_info);
+-	}
+ 
+ 	/* copy valid log entries from circular buffer into user space */
+ 	rem_len = count;
+ 
+-	nbytes = 0;
+-
+ 	if (*ppos < bufhdr_size) {
+-		nbytes = min((int)(bufhdr_size -  *ppos), rem_len);
+-		if (copy_to_user(userbuf,
+-				 ((char *)&log_buf->bufhdr) + *ppos, nbytes))
+-			return -EFAULT;
++		nbytes = min_t(size_t, bufhdr_size - (size_t)*ppos, rem_len);
++		if (*ppos + nbytes > sizeof(log_buf->bufhdr)) {
++			final_ret = -EFAULT;
++			spin_unlock_bh(&info->lock);
++			goto free;
++		}
++
++		memcpy(buf, ((char *)&log_buf->bufhdr) + *ppos, nbytes);
+ 		rem_len -= nbytes;
+ 		ret_val += nbytes;
+ 	}
+ 
+ 	start_offset = log_buf->rd_offset;
+-
+-	if ((rem_len == 0) || (start_offset < 0)) {
++	if (rem_len == 0 || start_offset == INVALID_OFFSET) {
+ 		spin_unlock_bh(&info->lock);
+-		goto read_done;
++		goto copy_to_user;
+ 	}
+ 
+-	fold_offset = -1;
+ 	cur_rd_offset = start_offset;
+ 
+ 	/* Find the last offset and fold-offset if the buffer is folded */
+@@ -250,17 +267,19 @@ static ssize_t ath12k_pktlog_read(struct
+ 		int log_data_offset;
+ 		struct ath12k_pktlog_hdr *log_hdr;
+ 
+-		log_hdr = (struct ath12k_pktlog_hdr *)(log_buf->log_data + cur_rd_offset);
++		log_hdr = (struct ath12k_pktlog_hdr *)(log_buf->log_data +
++						       cur_rd_offset);
+ 		log_data_offset = cur_rd_offset + info->hdr_size;
+ 
+-		if ((fold_offset == -1) &&
++		if (fold_offset == INVALID_OFFSET &&
+ 		    ((info->buf_size - log_data_offset) <= log_hdr->size))
+ 			fold_offset = log_data_offset - 1;
+ 
+ 		ath12k_pktlog_mov_rd_idx(info, &cur_rd_offset);
+ 
+-		if ((fold_offset == -1) && (cur_rd_offset == 0) &&
+-		    (cur_rd_offset != log_buf->wr_offset))
++		if (fold_offset == INVALID_OFFSET &&
++		    cur_rd_offset == 0 &&
++		    cur_rd_offset != log_buf->wr_offset)
+ 			fold_offset = log_data_offset + log_hdr->size - 1;
+ 
+ 		end_offset = log_data_offset + log_hdr->size - 1;
+@@ -271,59 +290,77 @@ static ssize_t ath12k_pktlog_read(struct
+ 
+ 	ppos_data = *ppos + ret_val - bufhdr_size + start_offset;
+ 
+-	if (fold_offset == -1) {
++	if (fold_offset == INVALID_OFFSET) {
+ 		if (ppos_data > end_offset)
+-			goto read_done;
++			goto copy_to_user;
+ 
+ 		nbytes = min(rem_len, end_offset - ppos_data + 1);
+ 		if (ppos_data < 0 || ppos_data + nbytes > info->buf_size) {
+-			ret_val = -EFAULT;
+-			goto out;
++			final_ret = -EFAULT;
++			goto free;
+ 		}
+ 
+-		if (copy_to_user(userbuf + ret_val,
+-				 log_buf->log_data + ppos_data, nbytes)) {
+-			ret_val = -EFAULT;
+-			goto out;
+-		}
++		memcpy(buf + ret_val, log_buf->log_data + ppos_data, nbytes);
+ 		ret_val += nbytes;
+-		rem_len -= nbytes;
+ 	} else {
+ 		if (ppos_data <= fold_offset) {
+ 			nbytes = min(rem_len, fold_offset - ppos_data + 1);
+-			if (copy_to_user(userbuf + ret_val,
+-					 log_buf->log_data + ppos_data,	nbytes)) {
+-				ret_val = -EFAULT;
+-				goto out;
++			if (ppos_data < 0 || ppos_data + nbytes >
++			    info->buf_size) {
++				final_ret = -EFAULT;
++				goto free;
+ 			}
++
++			memcpy(buf + ret_val, log_buf->log_data + ppos_data,
++			       nbytes);
+ 			ret_val += nbytes;
+ 			rem_len -= nbytes;
+ 		}
+ 
+-		if (rem_len == 0)
+-			goto read_done;
+-
+-		ppos_data =
+-			*ppos + ret_val - (bufhdr_size +
+-					(fold_offset - start_offset + 1));
+-
+-		if (ppos_data <= end_offset) {
+-			nbytes = min(rem_len, end_offset - ppos_data + 1);
+-			if (copy_to_user(userbuf + ret_val, log_buf->log_data
+-					 + ppos_data,
+-					 nbytes)) {
+-				ret_val = -EFAULT;
+-				goto out;
++		if (rem_len > 0) {
++			ppos_data =
++				*ppos + ret_val - (bufhdr_size +
++						   (fold_offset - start_offset + 1));
++
++			if (ppos_data <= end_offset) {
++				nbytes = min(rem_len, end_offset - ppos_data + 1);
++				if (ppos_data < 0 || ppos_data + nbytes >
++				    info->buf_size) {
++					final_ret = -EFAULT;
++					goto free;
++				}
++
++				memcpy(buf + ret_val, log_buf->log_data + ppos_data,
++				       nbytes);
++				ret_val += nbytes;
+ 			}
+-			ret_val += nbytes;
+-			rem_len -= nbytes;
+ 		}
+ 	}
+ 
+-read_done:
++	if (ret_val == 0) {
++		final_ret = 0;
++		goto free;
++	}
++
++copy_to_user:
++	if (ret_val < 0 || ret_val > count || *ppos + ret_val < *ppos) {
++		final_ret = -EFAULT;
++		goto free;
++	}
++
++	if (copy_to_user(userbuf, buf, ret_val)) {
++		final_ret = -EFAULT;
++		goto free;
++	}
++
+ 	*ppos += ret_val;
+-out:
+-	return ret_val;
++	final_ret = ret_val;
++
++free:
++	vfree(buf);
++unlock:
++	wiphy_unlock(ath12k_ar_to_hw(ar)->wiphy);
++	return final_ret;
+ }
+ 
+ static const struct file_operations fops_pktlog_dump = {
+@@ -389,7 +426,9 @@ static ssize_t ath12k_write_pktlog_start
+ 		ar->debug.is_pkt_logging = true;
+ 	} else {
+ 		ar->debug.is_pkt_logging = false;
+-		ath12k_dp_mon_pktlog_config(ar, false, ar->debug.pktlog_mode);
++		ath12k_dp_mon_pktlog_config(ar, false,
++					    ar->debug.pktlog_mode,
++					    ar->debug.pktlog_filter);
+ 		err = ath12k_dp_mon_rx_update_filter(ar);
+ 		if (err)
+ 			ath12k_err(ar->ab,
+@@ -528,84 +567,132 @@ void ath12k_deinit_pktlog(struct ath12k
+ }
+ 
+ static void ath12k_pktlog_pull_hdr(struct ath12k_pktlog_hdr_arg *arg,
+-                                  struct ath12k *ar, u8 *data)
++				   struct ath12k *ar, u8 *data)
+ {
+-        struct ath12k_pktlog_hdr *hdr = (struct ath12k_pktlog_hdr *)data;
++	struct ath12k_pktlog_hdr *hdr;
+ 
+-        hdr->flags = __le16_to_cpu(hdr->flags);
+-        hdr->missed_cnt = __le16_to_cpu(hdr->missed_cnt);
+-        hdr->log_type = __le16_to_cpu(hdr->log_type);
+-        hdr->size = __le16_to_cpu(hdr->size);
+-        hdr->timestamp = __le32_to_cpu(hdr->timestamp);
+-        hdr->type_specific_data = __le32_to_cpu(hdr->type_specific_data);
++	if (!arg || !data) {
++		ath12k_warn(ar->ab, "Invalid arguments to pktlog_pull_hdr\n");
++		return;
++	}
+ 
+-        arg->log_type = hdr->log_type;
+-        arg->payload = hdr->payload;
+-        arg->payload_size = hdr->size;
+-        arg->pktlog_hdr = data;
+-}
++	hdr = (struct ath12k_pktlog_hdr *)data;
+ 
+-static void ath12k_pktlog_write_buf(struct ath12k_pktlog *pl_info,
+-                                    struct ath12k_pktlog_hdr_arg *hdr_arg) {
++	arg->flags = __le16_to_cpu(hdr->flags);
++	arg->missed_cnt = __le16_to_cpu(hdr->missed_cnt);
++	arg->log_type = __le16_to_cpu(hdr->log_type);
++	arg->payload_size = __le16_to_cpu(hdr->size);
++	arg->timestamp = __le32_to_cpu(hdr->timestamp);
++	arg->type_specific_data = __le32_to_cpu(hdr->type_specific_data);
++
++	arg->payload = (u8 *)data;
++	arg->pktlog_hdr = (u8 *)hdr;
++}
++
++static void ath12k_pktlog_write_buf(struct ath12k *ar,
++				    struct ath12k_pktlog *pl_info,
++				    struct ath12k_pktlog_hdr_arg *hdr_arg)
++{
+ 	char *log_data;
+ 
++	if (!pl_info || !pl_info->buf || pl_info->buf_size <= 0) {
++		ath12k_warn(ar->ab, "Invalid pl_info or buffer\n");
++		return;
++	}
++
++	if (!hdr_arg || !hdr_arg->payload || hdr_arg->payload_size <= 0) {
++		ath12k_warn(ar->ab, "Invalid hdr_arg or payload\n");
++		return;
++	}
++
+ 	log_data = ath12k_pktlog_getbuf(pl_info, hdr_arg);
+-	if (!log_data)
++	if (!log_data) {
++		ath12k_warn(ar->ab, "pktlog data is NULL\n");
++		return;
++	}
++
++	if (hdr_arg->payload_size > pl_info->buf_size) {
++		ath12k_warn(ar->ab,
++			    "Payload size is too large : %d > buf_size: %d\n",
++			    hdr_arg->payload_size, pl_info->buf_size);
+ 		return;
++	}
++
++	if (log_data < pl_info->buf->log_data ||
++	    (log_data + hdr_arg->payload_size) >
++	    (pl_info->buf->log_data + pl_info->buf_size)) {
++		ath12k_warn(ar->ab,
++			    "memcpy out of bounds : log_data: %p size: %d\n",
++			    log_data, hdr_arg->payload_size);
++		return;
++	}
+ 
+ 	memcpy(log_data, hdr_arg->payload, hdr_arg->payload_size);
+ }
+ 
+ void ath12k_htt_pktlog_process(struct ath12k *ar, u8 *data)
+ {
+-        struct ath12k_pktlog *pl_info = &ar->debug.pktlog;
+-        struct ath12k_pktlog_hdr_arg hdr_arg;
++	struct ath12k_pktlog *pl_info;
++	struct ath12k_pktlog_hdr_arg hdr_arg;
++
++	if (!ar)
++		return;
+ 
+-        ath12k_pktlog_pull_hdr(&hdr_arg, ar, data);
+-        ath12k_pktlog_write_buf(pl_info, &hdr_arg);
++	pl_info = &ar->debug.pktlog;
++	ath12k_pktlog_pull_hdr(&hdr_arg, ar, data);
++	ath12k_pktlog_write_buf(ar, pl_info, &hdr_arg);
+ }
+ 
+ void ath12k_htt_ppdu_pktlog_process(struct ath12k *ar, u8 *data,
+                                     u32 len)
+ {
+-        struct ath12k_pktlog *pl_info = &ar->debug.pktlog;
+-        struct ath12k_pktlog_hdr hdr;
+-        struct ath12k_pktlog_hdr_arg hdr_arg;
+-
+-        hdr.flags = (1 << PKTLOG_FLG_FRM_TYPE_REMOTE_S);
+-        hdr.missed_cnt = 0;
+-        hdr.log_type = ATH12K_PKTLOG_TYPE_PPDU_STATS;
+-        hdr.timestamp = 0;
+-        hdr.size = len;
+-        hdr.type_specific_data = 0;
+-
+-        hdr_arg.log_type = hdr.log_type;
+-        hdr_arg.payload_size = hdr.size;
+-        hdr_arg.payload = (u8 *)data;
+-        hdr_arg.pktlog_hdr = (u8 *)&hdr;
++	struct ath12k_pktlog *pl_info;
++	struct ath12k_pktlog_hdr hdr;
++	struct ath12k_pktlog_hdr_arg hdr_arg;
+ 
+-        ath12k_pktlog_write_buf(pl_info, &hdr_arg);
++	if (!ar)
++		return;
++
++	pl_info = &ar->debug.pktlog;
++	hdr.flags = (1 << PKTLOG_FLG_FRM_TYPE_REMOTE_S);
++	hdr.missed_cnt = 0;
++	hdr.log_type = ATH12K_PKTLOG_TYPE_PPDU_STATS;
++	hdr.timestamp = 0;
++	hdr.size = len;
++	hdr.type_specific_data = 0;
++
++	hdr_arg.log_type = hdr.log_type;
++	hdr_arg.payload_size = hdr.size;
++	hdr_arg.payload = (u8 *)data;
++	hdr_arg.pktlog_hdr = (u8 *)&hdr;
++
++	ath12k_pktlog_write_buf(ar, pl_info, &hdr_arg);
+ }
+ 
+ void ath12k_dp_rx_stats_buf_pktlog_process(struct ath12k *ar, u8 *data,
+                                           u16 log_type, u32 len)
+ {
+-        struct ath12k_pktlog *pl_info = &ar->debug.pktlog;
+-        struct ath12k_pktlog_hdr hdr;
+-        struct ath12k_pktlog_hdr_arg hdr_arg;
+-
+-        hdr.flags = (1 << PKTLOG_FLG_FRM_TYPE_REMOTE_S);
+-        hdr.missed_cnt = 0;
+-        hdr.log_type = log_type;
+-        hdr.timestamp = 0;
+-        hdr.size = len;
+-        hdr.type_specific_data = 0;
+-
+-        hdr_arg.log_type = log_type;
+-        hdr_arg.payload_size = len;
+-        hdr_arg.payload = data;
+-        hdr_arg.pktlog_hdr = (u8 *)&hdr;
++	struct ath12k_pktlog *pl_info;
++	struct ath12k_pktlog_hdr hdr;
++	struct ath12k_pktlog_hdr_arg hdr_arg;
++
++	if (!ar)
++		return;
++
++	pl_info = &ar->debug.pktlog;
++
++	hdr.flags = (1 << PKTLOG_FLG_FRM_TYPE_REMOTE_S);
++	hdr.missed_cnt = 0;
++	hdr.log_type = log_type;
++	hdr.timestamp = 0;
++	hdr.size = len;
++	hdr.type_specific_data = 0;
++
++	hdr_arg.log_type = log_type;
++	hdr_arg.payload_size = len;
++	hdr_arg.payload = data;
++	hdr_arg.pktlog_hdr = (u8 *)&hdr;
+ 
+-        ath12k_pktlog_write_buf(pl_info, &hdr_arg);
++	ath12k_pktlog_write_buf(ar, pl_info, &hdr_arg);
+ }
+ EXPORT_SYMBOL(ath12k_dp_rx_stats_buf_pktlog_process);
+--- a/drivers/net/wireless/ath/ath12k/pktlog.h
++++ b/drivers/net/wireless/ath/ath12k/pktlog.h
+@@ -16,6 +16,22 @@
+ #define ATH12K_DEBUGFS_PKTLOG_SIZE_DEFAULT (10 * 1024 * 1024)
+ #define ATH12K_PKTLOG_SIZE_MIN  (16 * 1024)
+ #define ATH12K_PKTLOG_SIZE_MAX  (50 * 1024 * 1024)
++#define INVALID_OFFSET		((size_t)-1)
++
++#define ATH12K_PKTLOG_HDR_FLAGS_MASK 0xffff
++#define ATH12K_PKTLOG_HDR_FLAGS_SHIFT 0
++#define ATH12K_PKTLOG_HDR_FLAGS_OFFSET 0
++#define ATH12K_PKTLOG_HDR_MISSED_CNT_MASK 0xffff0000
++#define ATH12K_PKTLOG_HDR_MISSED_CNT_SHIFT 16
++#define ATH12K_PKTLOG_HDR_MISSED_CNT_OFFSET 0
++#define ATH12K_PKTLOG_HDR_LOG_TYPE_MASK 0xffff
++#define ATH12K_PKTLOG_HDR_LOG_TYPE_SHIFT 0
++#define ATH12K_PKTLOG_HDR_LOG_TYPE_OFFSET 1
++#define ATH12K_PKTLOG_HDR_SIZE_MASK 0xffff0000
++#define ATH12K_PKTLOG_HDR_SIZE_SHIFT 16
++#define ATH12K_PKTLOG_HDR_SIZE_OFFSET 1
++#define ATH12K_PKTLOG_HDR_TIMESTAMP_OFFSET 2
++#define ATH12K_PKTLOG_HDR_TYPE_SPECIFIC_DATA_OFFSET 3
+ 
+ enum ath12k_pktlog_flag {
+         PKTLOG_FLG_FRM_TYPE_LOCAL_S = 0,
+@@ -70,10 +86,14 @@ enum ath12k_pktlog_enum {
+ };
+ 
+ struct ath12k_pktlog_hdr_arg {
+-        u16 log_type;
+-        u8 *payload;
+-        u16 payload_size;
+-        u8 *pktlog_hdr;
++	__le16 log_type;
++	u8 *payload;
++	__le16 payload_size;
++	u8 *pktlog_hdr;
++	__le32 flags;
++	__le16 missed_cnt;
++	__le16 timestamp;
++	__le32 type_specific_data;
+ };
+ 
+ struct ath12k_pktlog_bufhdr {
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+@@ -1231,14 +1231,22 @@ ath12k_dp_rx_pktlog_process(struct ath12
+ 
+ 	if (!ar->debug.is_pkt_logging ||
+ 	    !status_desc->mon_buf ||
+-	    !status_desc->buf_len)
++	    !status_desc->buf_len) {
+ 		return;
++	}
+ 
+ 	if (dp->rx_pktlog_mode == ATH12K_PKTLOG_MODE_LITE)
+ 		log_type = ATH12K_PKTLOG_TYPE_LITE_RX;
+-	else if (dp->rx_pktlog_mode == ATH12K_PKTLOG_MODE_FULL)
++	else if ((dp->rx_pktlog_mode == ATH12K_PKTLOG_MODE_FULL) &&
++		 (ar->debug.pktlog_filter & ATH12K_PKTLOG_RX))
+ 		log_type = ATH12K_PKTLOG_TYPE_RX_STATBUF;
+ 
++	if (!log_type) {
++		ath12k_dbg(dp->ab, ATH12K_DBG_DATA,
++			   "pktlog: skipping processing with no log type\n");
++		return;
++	}
++
+ 	trace_ath12k_htt_rxdesc(ar, status_desc->mon_buf,
+ 				log_type, status_desc->buf_len);
+ 	ath12k_dp_rx_stats_buf_pktlog_process(ar, status_desc->mon_buf,

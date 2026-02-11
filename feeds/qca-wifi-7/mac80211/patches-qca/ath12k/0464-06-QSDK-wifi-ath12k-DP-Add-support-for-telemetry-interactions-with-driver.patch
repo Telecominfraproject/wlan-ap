@@ -1,0 +1,1390 @@
+From 58fc8ebc79530ffac96208843cccf6a2abe1b2e5 Mon Sep 17 00:00:00 2001
+From: Nagarajan Maran <nmaran@qti.qualcomm.com>
+Date: Tue, 8 Jul 2025 16:54:00 +0530
+Subject: [PATCH] QSDK: wifi: ath12k: DP: Add support for telemetry
+ interactions with driver
+
+Add support to
+	- Register and de-register telemetry peer context during
+MSDUQ allocation and link peer deletion respectively.
+	- Update service classes to the telemetry driver when
+configured and disabled.
+	- Update selected SDWF statistics to the telemetry driver.
+	- Send the requested statistics to the telemetry driver.
+	- Clear accumulated statistics in the telemetry driver
+via vendor interface.
+	- Notify userspace via vendor interface upon breach
+detection from the telemetry driver.
+
+Following patch changes are also present
+	- 784-06-ath12k-sawf-Add-telemetry-agent-interface-and-config.patch
+
+Signed-off-by: Nagarajan Maran <nmaran@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c        |  53 ++++++
+ drivers/net/wireless/ath/ath12k/core.h        |   2 +
+ drivers/net/wireless/ath/ath12k/dp_peer.c     |  53 +++++-
+ drivers/net/wireless/ath/ath12k/dp_peer.h     |   5 +-
+ drivers/net/wireless/ath/ath12k/mac.c         |   3 +
+ drivers/net/wireless/ath/ath12k/qos.h         |   9 ++
+ drivers/net/wireless/ath/ath12k/sdwf.c        | 153 +++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/sdwf.h        |   9 ++
+ drivers/net/wireless/ath/ath12k/telemetry.c   |  73 +++++++++
+ drivers/net/wireless/ath/ath12k/telemetry.h   |   6 +
+ .../wireless/ath/ath12k/telemetry_agent_if.c  | 143 ++++++++++++++++
+ .../wireless/ath/ath12k/telemetry_agent_if.h  |  42 +++++
+ drivers/net/wireless/ath/ath12k/vendor.c      | 140 +++++++++++++++-
+ drivers/net/wireless/ath/ath12k/vendor.h      |  36 +++++
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c | 107 +++++++++++-
+ 15 files changed, 820 insertions(+), 14 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -33,6 +33,7 @@
+ #include "accel_cfg.h"
+ #include "peer.h"
+ #include "qos.h"
++#include "vendor.h"
+ #include "telemetry.h"
+ #include "ppe.h"
+ #include "cfr.h"
+@@ -4916,5 +4917,62 @@ out:
+                     "%d chip dump collected and waiting for partner chips\n",
+                     atomic_read(&ath12k_coredump_ram_info.num_chip));
+ }
++
++void ath12k_telemetry_notify_breach(u8 *mac_addr, u8 svc_id, u8 param,
++				    bool set_clear, u8 tid)
++{
++	struct ath12k_hw_group *ag = NULL;
++	struct ieee80211_vif *vif = NULL;
++	struct ath12k_base *ab = NULL;
++	struct ath12k_dp_link_peer *peer = NULL;
++	int soc;
++	u8 *mld_addr = NULL;
++
++	if (!mac_addr)
++		return;
++
++	mutex_lock(&ath12k_hw_group_mutex);
++	list_for_each_entry(ag, &ath12k_hw_group_list, list) {
++		if (!ag) {
++			ath12k_err(NULL, "unable to fetch hw group\n");
++			continue;
++		}
++
++		for (soc = ag->num_probed; soc > 0; soc--) {
++			ab = ag->ab[soc - 1];
++			if (!ab) {
++				/* Control should not reach here */
++				ath12k_info(NULL, "SOC not initialized\n");
++				continue;
++			}
++
++			spin_lock_bh(&ab->dp->dp_lock);
++			peer = ath12k_dp_link_peer_find_by_addr(ab->dp, mac_addr);
++			if (peer) {
++				vif = peer->vif;
++				if (peer->mlo)
++					mld_addr = peer->ml_addr;
++				ath12k_dbg(ab, ATH12K_DBG_QOS, "Breach detected: Peer %pM\n",
++					   mac_addr);
++				spin_unlock_bh(&ab->dp->dp_lock);
++				mutex_unlock(&ath12k_hw_group_mutex);
++				ath12k_vendor_telemetry_notify_breach(vif,
++								      mac_addr,
++								      svc_id,
++								      param,
++								      set_clear,
++								      tid,
++								      mld_addr);
++				return;
++			}
++			spin_unlock_bh(&ab->dp->dp_lock);
++		}
++	}
++	mutex_unlock(&ath12k_hw_group_mutex);
++
++	ath12k_dbg(NULL, ATH12K_DBG_QOS, "Peer(%pM) not found for notifying breach",
++		   mac_addr);
++}
++
+ MODULE_DESCRIPTION("Driver support for Qualcomm Technologies WLAN devices");
+ MODULE_LICENSE("Dual BSD/GPL");
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.c
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.c
+@@ -8,6 +8,7 @@
+ #include "dp_peer.h"
+ #include "debug.h"
+ #include "debugfs.h"
++#include "telemetry_agent_if.h"
+ 
+ struct ath12k_dp_link_peer *
+ ath12k_dp_link_peer_find_by_vdev_id_and_addr(struct ath12k_dp *dp,
+@@ -576,6 +577,9 @@ void ath12k_dp_peer_delete(struct ath12k
+ 
+ 	list_del(&dp_peer->list);
+ 
++	if (dp_peer->qos && dp_peer->qos->telemetry_peer_ctx)
++		ath12k_telemetry_peer_ctx_free(dp_peer->qos->telemetry_peer_ctx);
++
+ 	spin_unlock_bh(&dp_hw->peer_lock);
+ 
+ 	synchronize_rcu();
+@@ -865,8 +869,12 @@ bool ath12k_dp_qos_stats_alloc(struct at
+ 
+ static u16 ath12k_get_tid_msduq(struct ath12k_base *ab,
+ 				struct ath12k_dp_peer_qos *qos,
+-				u16 qos_id, u8 tid)
++				struct ath12k_dp_link_peer *link_peer,
++				struct ath12k *ar,
++				u16 qos_id, u8 svc_id, u8 tid)
+ {
++	struct ath12k_dp_peer *mld_peer;
++	void *telemetry_peer_ctx;
+ 	u8 q, msduq = QOS_INVALID_MSDUQ;
+ 
+ 	/* Find matching msduq with qos_id in the reserved pool*/
+@@ -894,6 +902,23 @@ static u16 ath12k_get_tid_msduq(struct a
+ 				ath12k_dbg(ab, ATH12K_DBG_QOS,
+ 					   "New: msduq 0x%x:tid %u usrdefq %u",
+ 					   msduq, tid, q);
++				if (!qos->telemetry_peer_ctx &&
++				    link_peer && ar && ar->ah) {
++					mld_peer = link_peer->dp_peer;
++					telemetry_peer_ctx =
++						ath12k_telemetry_peer_ctx_alloc(&ar->ah->dp_hw,
++										mld_peer,
++										link_peer->addr,
++										svc_id,
++										(msduq - MSDUQ_MAX_DEF));
++					if (telemetry_peer_ctx) {
++						qos->telemetry_peer_ctx = telemetry_peer_ctx;
++
++					ath12k_dbg(ab, ATH12K_DBG_QOS, "telemetry peer"
++						   " ctx allocation with msduq_id:0x%x\n",
++						   msduq - MSDUQ_MAX_DEF);
++					}
++				}
+ 				break;
+ 			}
+ 		}
+@@ -903,7 +928,10 @@ static u16 ath12k_get_tid_msduq(struct a
+ }
+ 
+ u16 ath12k_dp_peer_qos_msduq(struct ath12k_base *ab,
+-			     struct ath12k_dp_peer_qos *qos, u16 qos_id)
++			     struct ath12k_dp_peer_qos *qos,
++			     struct ath12k_dp_link_peer *link_peer,
++			     struct ath12k *ar,
++			     u16 qos_id, u8 svc_id)
+ {
+ 	u16 msduq;
+ 	u8 qos_tid;
+@@ -915,14 +943,16 @@ u16 ath12k_dp_peer_qos_msduq(struct ath1
+ 	}
+ 
+ 	/* Get MSDUQ for excat QoS profile TID */
+-	msduq = ath12k_get_tid_msduq(ab, qos, qos_id, qos_tid);
++	msduq = ath12k_get_tid_msduq(ab, qos, link_peer, ar, qos_id,
++				     svc_id, qos_tid);
+ 
+ 	/* Get MSDUQ for lower QoS profile TID */
+ 	if (msduq == QOS_INVALID_MSDUQ && qos_tid != 0) {
+ 		u8 tid = qos_tid - 1;
+ 
+ 		while (tid < qos_tid) {
+-			msduq = ath12k_get_tid_msduq(ab, qos, qos_id, tid);
++			msduq = ath12k_get_tid_msduq(ab, qos, link_peer, ar,
++						     qos_id, svc_id, tid);
+ 			if (msduq != QOS_INVALID_MSDUQ)
+ 				break;
+ 			--tid;
+@@ -933,7 +963,8 @@ u16 ath12k_dp_peer_qos_msduq(struct ath1
+ 		u8 tid = qos_tid + 1;
+ 
+ 		while (tid < QOS_MAX_TID) {
+-			msduq = ath12k_get_tid_msduq(ab, qos, qos_id, tid);
++			msduq = ath12k_get_tid_msduq(ab, qos, link_peer, ar,
++						     qos_id, svc_id, tid);
+ 			if (msduq != QOS_INVALID_MSDUQ)
+ 				break;
+ 			++tid;
+@@ -1038,7 +1069,8 @@ int ath12k_dp_peer_scs_data(struct ath12
+ 	if (qos_id > QOS_UL_ID_MAX && qos_id < QOS_ID_INVALID)
+ 		msduq = qos_id - QOS_LEGACY_DL_ID_MIN;
+ 	else
+-		msduq = ath12k_dp_peer_qos_msduq(dp->ab, qos, qos_id);
++		msduq = ath12k_dp_peer_qos_msduq(dp->ab, qos, NULL,
++						 NULL, qos_id, scs_id);
+ 
+ 	if (msduq == QOS_INVALID_MSDUQ)
+ 		goto ret;
+@@ -1089,6 +1121,7 @@ void ath12k_peer_qos_queue_ind_handler(s
+ 	struct htt_t2h_qos_info_ind *resp;
+ 	struct ath12k_dp_peer_qos *qos;
+ 	struct ath12k_dp_link_peer *peer = NULL;
++	struct ath12k_dp_peer *mld_peer = NULL;
+ 	u32 htt_qtype, remapped_tid, peer_id;
+ 	u32 def_tid_msduq, max_def_msduq, qos_tid_msduq;
+ 	u32 hlos_tid, flow_or, ast_idx, who_cl, tgt_opaque_id;
+@@ -1151,6 +1184,13 @@ void ath12k_peer_qos_queue_ind_handler(s
+ 			qos->msduq_map[hlos_tid][q_id].tgt_opaque_id =
+ 							tgt_opaque_id;
+ 		}
+-	}
++
++		mld_peer = peer->dp_peer;
++		if (mld_peer->qos &&
++		    mld_peer->qos->telemetry_peer_ctx)
++			ath12k_telemetry_update_tid_msduq(mld_peer->qos->telemetry_peer_ctx,
++							  msduq_index, remapped_tid,
++							  (htt_qtype - def_tid_msduq));
++		}
+ 	spin_unlock_bh(&ab->dp->dp_lock);
+ }
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.h
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.h
+@@ -226,6 +226,7 @@ struct ath12k_dl_scs {
+ struct ath12k_dp_peer_qos {
+ 	struct ath12k_dl_scs scs_map[QOS_MAX_SCS_ID];
+ 	struct ath12k_msduq msduq_map[QOS_TID_MAX][QOS_TID_MDSUQ_MAX];
++	void *telemetry_peer_ctx;
+ };
+ 
+ void ath12k_peer_unmap_event(struct ath12k_base *ab, u16 peer_id);
+@@ -293,7 +294,10 @@ int ath12k_dp_peer_scs_data(struct ath12
+ u16 ath12k_dp_peer_scs_get_qos_id(struct ath12k_base *ab,
+ 				  struct ath12k_dp_peer_qos *qos, u8 scs_id);
+ u16 ath12k_dp_peer_qos_msduq(struct ath12k_base *ab,
+-			     struct ath12k_dp_peer_qos *qos, u16 qos_id);
++			     struct ath12k_dp_peer_qos *qos,
++			     struct ath12k_dp_link_peer *link_peer,
++			     struct ath12k *ar,
++			     u16 qos_id, u8 svc_id);
+ u16 dp_peer_msduq_qos_id(struct ath12k_base *ab,
+ 			 struct ath12k_dp_peer_qos *qos,
+ 			 u16 msduq);
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -30,6 +30,7 @@
+ #include "dp_cmn.h"
+ #include "dp_tx.h"
+ #include "vendor.h"
++#include "telemetry_agent_if.h"
+ #include "ppe.h"
+ #include "cfr.h"
+ #include "dp_mon.h"
+@@ -1468,6 +1469,8 @@ void ath12k_mac_dp_peer_cleanup(struct a
+ 			ah->num_ml_peers--;
+ 		}
+ 		list_del(&dp_peer->list);
++		if (dp_peer->qos && dp_peer->qos->telemetry_peer_ctx)
++			ath12k_telemetry_peer_ctx_free(dp_peer->qos->telemetry_peer_ctx);
+ 		kfree(dp_peer);
+ 	}
+ 
+--- a/drivers/net/wireless/ath/ath12k/qos.h
++++ b/drivers/net/wireless/ath/ath12k/qos.h
+@@ -163,6 +163,15 @@ enum qos_profile_dir {
+ #define ATH12K_QOS_STATS_MAX (ATH12K_QOS_STATS_CATEG_MASK |\
+ 			      ATH12K_QOS_STATS_COLLECTION_MASK)
+ 
++struct ath12k_tele_breach_params {
++	struct list_head list;
++	u8 mac_addr[ETH_ALEN];
++	u8 svc_id;
++	u8 param;
++	bool set_clear;
++	u8 tid;
++};
++
+ struct ath12k_qos_ctx *ath12k_get_qos(struct ath12k_base *ab);
+ 
+ void ath12k_qos_set_default(struct ath12k_qos_params *param);
+--- a/drivers/net/wireless/ath/ath12k/sdwf.c
++++ b/drivers/net/wireless/ath/ath12k/sdwf.c
+@@ -165,12 +165,13 @@ ath12k_sdwf_get_qos_ctx(struct ath12k_ba
+ 	return peer_qos;
+ }
+ 
+-static u8 ath12k_sdwf_alloc_msduq(struct ath12k_base *ab, u32 svc_id,
++static u8 ath12k_sdwf_alloc_msduq(struct ath12k *ar, u32 svc_id,
+ 				  u16 peer_id, bool scs)
+ {
+ 	struct ath12k_qos_ctx *qos_ctx;
+ 	struct ath12k_dp_link_peer *peer;
+ 	struct ath12k_dp_peer_qos *qos;
++	struct ath12k_base *ab = ar->ab;
+ 	u16 qos_id;
+ 	u8 scs_id; u8 qos_tag;
+ 	u16 msduq = QOS_INVALID_MSDUQ;
+@@ -211,7 +212,7 @@ static u8 ath12k_sdwf_alloc_msduq(struct
+ 	if (qos_id == QOS_ID_INVALID)
+ 		goto ret;
+ 
+-	msduq = ath12k_dp_peer_qos_msduq(ab, qos, qos_id);
++	msduq = ath12k_dp_peer_qos_msduq(ab, qos, peer, ar, qos_id, svc_id);
+ ret:
+ 	spin_unlock_bh(&ab->dp->dp_lock);
+ 	return msduq;
+@@ -468,7 +469,7 @@ u16 ath12k_sdwf_get_msduq(struct wireles
+ 		return ret_msduq;
+ 	}
+ 
+-	msduq = ath12k_sdwf_alloc_msduq(ar->ab, svc_id, peer_id, scs);
++	msduq = ath12k_sdwf_alloc_msduq(ar, svc_id, peer_id, scs);
+ 	if (msduq != QOS_INVALID_MSDUQ)
+ 		ret_msduq = FIELD_PREP(SDWF_PEER_ID, peer_id) |
+ 				FIELD_PREP(SDWF_MSDUQ_ID, msduq);
+@@ -592,3 +593,269 @@ int ath12k_htt_sawf_streaming_stats_conf
+ 		dev_kfree_skb_any(skb);
+ 	return ret;
+ }
++
++int ath12k_telemetry_get_msduq_tx_stats(void *ptr, void *arg,
++					void *msduq_tx_stats,
++					u8 msduq_id)
++{
++	struct ath12k_dp_hw *dp_hw = (struct ath12k_dp_hw *)ptr;
++	struct ath12k_dp_peer *mld_peer = (struct ath12k_dp_peer *)arg;
++	struct ath12k_dp_link_peer *tmp_peer = NULL;
++	struct msduq_tx_stats *tele_tx_stats = (struct msduq_tx_stats *)msduq_tx_stats;
++	struct ath12k_mld_qos_stats *mld_qos_stats;
++	struct tx_stats *qos_tx;
++	unsigned long peer_links_map, scan_links_map;
++	int ret = 0;
++	u8 tid, q_id, link_id, pkt_type, mcs;
++
++	if (!dp_hw || !mld_peer)
++		return -ENODATA;
++
++	tid = u8_get_bits(msduq_id, MSDUQ_TID_MASK);
++	q_id = u8_get_bits(msduq_id, MSDUQ_MASK);
++
++	if (q_id > QOS_TID_MDSUQ_MAX)
++		return -EINVAL;
++
++	rcu_read_lock();
++
++	spin_lock_bh(&dp_hw->peer_lock);
++	mld_peer = ath12k_dp_peer_find(dp_hw, mld_peer->addr);
++	if (!mld_peer) {
++		spin_unlock_bh(&dp_hw->peer_lock);
++		ret = -ENOENT;
++		goto end;
++	}
++	spin_unlock_bh(&dp_hw->peer_lock);
++
++	mld_qos_stats = &mld_peer->mld_qos_stats[tid][q_id];
++	if (!mld_qos_stats) {
++		ret = -ENOENT;
++		goto end;
++	}
++	tele_tx_stats->tx_failed = mld_qos_stats->tx_failed_pkts;
++
++	peer_links_map = mld_peer->peer_links_map;
++	scan_links_map = ATH12K_SCAN_LINKS_MASK;
++
++	for_each_andnot_bit(link_id, &peer_links_map,
++			    &scan_links_map,
++			    ATH12K_NUM_MAX_LINKS) {
++		tmp_peer = rcu_dereference(mld_peer->link_peers[link_id]);
++		if (!tmp_peer ||
++		    !tmp_peer->peer_stats.qos_stats) {
++			continue;
++		}
++
++		qos_tx = &tmp_peer->peer_stats.qos_stats->qos_tx[tid][q_id];
++		if (!mld_peer->qos_stats_lvl) {
++			if (tmp_peer->primary_link) {
++				tele_tx_stats->retry_count =
++					qos_tx->retry_count;
++				tele_tx_stats->total_retries_count =
++					qos_tx->total_retries_count;
++				for (pkt_type = 0; pkt_type < DOT11_MAX; pkt_type++) {
++					for (mcs = 0; mcs < MAX_MCS; mcs++) {
++						tele_tx_stats->pkt_type[pkt_type].mcs_count[mcs] =
++							qos_tx->pkt_type[pkt_type].mcs_count[mcs];
++					}
++				}
++				break;
++			}
++		} else {
++			tele_tx_stats->retry_count +=
++				qos_tx->retry_count;
++			tele_tx_stats->total_retries_count +=
++				qos_tx->total_retries_count;
++			for (pkt_type = 0; pkt_type < DOT11_MAX; pkt_type++) {
++				for (mcs = 0; mcs < MAX_MCS; mcs++) {
++					tele_tx_stats->pkt_type[pkt_type].mcs_count[mcs] +=
++						qos_tx->pkt_type[pkt_type].mcs_count[mcs];
++				}
++			}
++		}
++		tmp_peer = NULL;
++	}
++end:
++	rcu_read_unlock();
++	return ret;
++}
++
++int ath12k_telemetry_get_sawf_tx_stats_drop(void *ptr, void *peer, u64 *pass,
++					    u64 *drop, u64 *drop_ttl,
++					    u8 tid_v, u8 msduq_id)
++{
++	struct ath12k_dp_hw *dp_hw = (struct ath12k_dp_hw *)ptr;
++	struct ath12k_dp_peer *mld_peer = (struct ath12k_dp_peer *)peer;
++	struct ath12k_dp_link_peer *tmp_peer = NULL;
++	struct ath12k_mld_qos_stats *mld_qos_stats;
++	struct tx_stats *qos_tx;
++	unsigned long peer_links_map, scan_links_map;
++	int ret = 0;
++	u8 tid, q_id, link_id;
++
++	if (!dp_hw || !mld_peer)
++		return -ENODATA;
++
++	tid = u8_get_bits(msduq_id, MSDUQ_TID_MASK);
++	q_id = u8_get_bits(msduq_id, MSDUQ_MASK);
++
++	if (q_id > QOS_TID_MDSUQ_MAX)
++		return -EINVAL;
++
++	rcu_read_lock();
++	spin_lock_bh(&dp_hw->peer_lock);
++	mld_peer = ath12k_dp_peer_find(dp_hw, mld_peer->addr);
++	if (!mld_peer) {
++		spin_unlock_bh(&dp_hw->peer_lock);
++		ret = -ENOENT;
++		goto end;
++	}
++	spin_unlock_bh(&dp_hw->peer_lock);
++
++	mld_qos_stats = &mld_peer->mld_qos_stats[tid][q_id];
++	if (!mld_qos_stats) {
++		ret = -ENOENT;
++		goto end;
++	}
++
++	*pass = mld_qos_stats->tx_success_pkts;
++	*drop = mld_qos_stats->tx_failed_pkts;
++
++	peer_links_map = mld_peer->peer_links_map;
++	scan_links_map = ATH12K_SCAN_LINKS_MASK;
++
++	for_each_andnot_bit(link_id, &peer_links_map,
++			    &scan_links_map,
++			    ATH12K_NUM_MAX_LINKS) {
++		tmp_peer = rcu_dereference(mld_peer->link_peers[link_id]);
++		if (!tmp_peer ||
++		    !tmp_peer->peer_stats.qos_stats) {
++			continue;
++		}
++
++		qos_tx = &tmp_peer->peer_stats.qos_stats->qos_tx[tid][q_id];
++		if (!mld_peer->qos_stats_lvl) {
++			if (tmp_peer->primary_link) {
++				*drop_ttl = qos_tx->dropped.age_out;
++				break;
++			}
++		} else {
++			*drop_ttl += qos_tx->dropped.age_out;
++		}
++		tmp_peer = NULL;
++	}
++end:
++	rcu_read_unlock();
++	return ret;
++}
++
++int ath12k_telemetry_get_sawf_tx_stats_mpdu(void *ptr, void *peer, u64 *svc_int_pass,
++					    u64 *svc_int_fail, u64 *burst_pass,
++					    u64 *burst_fail, u8 tid_v, u8 msduq_id)
++{
++	struct ath12k_dp_hw *dp_hw = (struct ath12k_dp_hw *)ptr;
++	struct ath12k_dp_peer *mld_peer = (struct ath12k_dp_peer *)peer;
++	struct ath12k_mld_qos_stats *mld_qos_stats;
++	int ret = 0;
++	u8 tid, q_id;
++
++	if (!dp_hw || !mld_peer)
++		return -ENODATA;
++
++	tid = u8_get_bits(msduq_id, MSDUQ_TID_MASK);
++	q_id = u8_get_bits(msduq_id, MSDUQ_MASK);
++
++	if (q_id > QOS_TID_MDSUQ_MAX)
++		return -EINVAL;
++
++	rcu_read_lock();
++	spin_lock_bh(&dp_hw->peer_lock);
++	mld_peer = ath12k_dp_peer_find(dp_hw, mld_peer->addr);
++	if (!mld_peer) {
++		spin_unlock_bh(&dp_hw->peer_lock);
++		ret = -ENOENT;
++		goto end;
++	}
++	spin_unlock_bh(&dp_hw->peer_lock);
++
++	mld_qos_stats = &mld_peer->mld_qos_stats[tid][q_id];
++	if (!mld_qos_stats) {
++		ret = -ENOENT;
++		goto end;
++	}
++
++	*svc_int_pass = mld_qos_stats->svc_intval_stats.success_cnt;
++	*svc_int_fail = mld_qos_stats->svc_intval_stats.failure_cnt;
++	*burst_pass = mld_qos_stats->burst_size_stats.success_cnt;
++	*burst_fail = mld_qos_stats->burst_size_stats.failure_cnt;
++end:
++	rcu_read_unlock();
++	return ret;
++}
++
++int ath12k_telemetry_get_sawf_tx_stats_tput(void *ptr, void *peer, u64 *in_bytes,
++					    u64 *in_cnt, u64 *tx_bytes,
++					    u64 *tx_cnt, u8 tid_v, u8 msduq_id)
++{
++	struct ath12k_dp_hw *dp_hw = (struct ath12k_dp_hw *)ptr;
++	struct ath12k_dp_peer *mld_peer = (struct ath12k_dp_peer *)peer;
++	struct ath12k_dp_link_peer *tmp_peer = NULL;
++	struct tx_stats *qos_tx;
++	unsigned long peer_links_map, scan_links_map;
++	int ret = 0;
++	u8 tid, q_id, link_id;
++
++	if (!dp_hw || !mld_peer)
++		return -ENODATA;
++
++	tid = u8_get_bits(msduq_id, MSDUQ_TID_MASK);
++	q_id = u8_get_bits(msduq_id, MSDUQ_MASK);
++
++	if (q_id > QOS_TID_MDSUQ_MAX)
++		return -EINVAL;
++
++	rcu_read_lock();
++	spin_lock_bh(&dp_hw->peer_lock);
++	mld_peer = ath12k_dp_peer_find(dp_hw, mld_peer->addr);
++	if (!mld_peer) {
++		spin_unlock_bh(&dp_hw->peer_lock);
++		ret = -ENOENT;
++		goto end;
++	}
++	spin_unlock_bh(&dp_hw->peer_lock);
++
++	peer_links_map = mld_peer->peer_links_map;
++	scan_links_map = ATH12K_SCAN_LINKS_MASK;
++
++	for_each_andnot_bit(link_id, &peer_links_map,
++			    &scan_links_map,
++			    ATH12K_NUM_MAX_LINKS) {
++		tmp_peer = rcu_dereference(mld_peer->link_peers[link_id]);
++		if (!tmp_peer ||
++		    !tmp_peer->peer_stats.qos_stats) {
++			continue;
++		}
++
++		qos_tx = &tmp_peer->peer_stats.qos_stats->qos_tx[tid][q_id];
++		if (!mld_peer->qos_stats_lvl) {
++			if (tmp_peer->primary_link) {
++				*in_bytes = qos_tx->tx_ingress.bytes;
++				*in_cnt = qos_tx->tx_ingress.num;
++				*tx_bytes = qos_tx->tx_success.bytes;
++				*tx_cnt = qos_tx->tx_success.num;
++				break;
++			}
++		} else {
++			*in_bytes += qos_tx->tx_ingress.bytes;
++			*in_cnt += qos_tx->tx_ingress.num;
++			*tx_bytes += qos_tx->tx_success.bytes;
++			*tx_cnt += qos_tx->tx_success.num;
++		}
++		tmp_peer = NULL;
++	}
++
++end:
++	rcu_read_unlock();
++	return ret;
++}
+--- a/drivers/net/wireless/ath/ath12k/sdwf.h
++++ b/drivers/net/wireless/ath/ath12k/sdwf.h
+@@ -216,6 +216,17 @@ int ath12k_htt_sawf_streaming_stats_conf
+ 					      u32 config_param_1,
+ 					      u32 config_param_2,
+ 					      u32 config_param_3);
++int ath12k_telemetry_get_sawf_tx_stats_tput(void *ptr, void *stats, u64 *in_bytes,
++					    u64 *in_cnt, u64 *tx_bytes,
++					    u64 *tx_cnt, u8 tid_v, u8 msduq_id);
++int ath12k_telemetry_get_sawf_tx_stats_mpdu(void *ptr, void *stats, u64 *svc_int_pass,
++					    u64 *svc_int_fail, u64 *burst_pass,
++					    u64 *burst_fail, u8 tid_v, u8 msduq_id);
++int ath12k_telemetry_get_sawf_tx_stats_drop(void *ptr, void *stats, u64 *pass,
++					    u64 *drop, u64 *drop_ttl,
++					    u8 tid, u8 msduq_id);
++int ath12k_telemetry_get_msduq_tx_stats(void *soc, void *arg,
++					void *msduq_tx_stats, u8 msduq);
+ void
+ ath12k_sdwf_3_link_peer_dl_flow_count(struct wireless_dev *wdev,
+                                       struct ieee80211_vif *vif, u8 *mac_addr,
+--- a/drivers/net/wireless/ath/ath12k/telemetry.c
++++ b/drivers/net/wireless/ath/ath12k/telemetry.c
+@@ -26,6 +26,12 @@ void ath12k_telemetry_init(struct ath12k
+ 		ath12k_err(NULL, "telemetry context failed to initialize\n");
+ 		return;
+ 	}
++
++	spin_lock_init(&telemetry_ctx->breach_ind_lock);
++	telemetry_ctx->workqueue = create_singlethread_workqueue("breach_ind_wq");
++	INIT_WORK(&telemetry_ctx->indicate_breach, ath12k_send_breach_indication);
++	INIT_LIST_HEAD(&telemetry_ctx->list);
++
+ 	ath12k_info(NULL, "telemetry context initialized\n");
+ }
+ 
+@@ -34,6 +40,14 @@ void ath12k_telemetry_deinit(struct ath1
+ 	if (!telemetry_ctx)
+ 		return;
+ 
++	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags)) {
++		cancel_work_sync(&telemetry_ctx->indicate_breach);
++		return;
++	}
++
++	cancel_work_sync(&telemetry_ctx->indicate_breach);
++	destroy_workqueue(telemetry_ctx->workqueue);
++
+ 	kfree(telemetry_ctx);
+ 	telemetry_ctx = NULL;
+ 	ath12k_info(NULL, "telemetry context freed\n");
+@@ -190,6 +204,62 @@ int ath12k_telemetry_sdwf_sla_detection_
+ 	return ret;
+ }
+ 
++void ath12k_send_breach_indication(struct work_struct *work)
++{
++	struct ath12k_telemetry_ctx *telemetry_ctx = container_of(work, struct ath12k_telemetry_ctx, indicate_breach);
++	struct ath12k_tele_breach_params *breach_params, *tmp;
++
++	if (!telemetry_ctx) {
++		ath12k_err(NULL, "Telemetry ctx is unavailable\n");
++		return;
++	}
++
++	spin_lock_bh(&telemetry_ctx->breach_ind_lock);
++	list_for_each_entry_safe(breach_params, tmp, &telemetry_ctx->list, list) {
++		list_del(&breach_params->list);
++		spin_unlock_bh(&telemetry_ctx->breach_ind_lock);
++		ath12k_telemetry_notify_breach(breach_params->mac_addr,
++					       breach_params->svc_id,
++					       breach_params->param,
++					       breach_params->set_clear,
++					       breach_params->tid);
++		kfree(breach_params);
++		spin_lock_bh(&telemetry_ctx->breach_ind_lock);
++	}
++	spin_unlock_bh(&telemetry_ctx->breach_ind_lock);
++}
++
++void ath12k_telemetry_breach_indication(u8 *mac_addr, u8 svc_id, u8 param, bool set_clear, u8 tid)
++{
++	struct ath12k_tele_breach_params *breach_params;
++
++	if (!mac_addr)
++		return;
++
++	if (!telemetry_ctx) {
++		ath12k_err(NULL, "Breach detection received when telemetry ctx is unavailable\n");
++		return;
++	}
++
++	breach_params = kzalloc(sizeof(*breach_params), GFP_NOWAIT);
++	if (!breach_params) {
++		ath12k_err(NULL, "Failed to allocate memory to indicate breach detection\n");
++		return;
++	}
++
++	ether_addr_copy(breach_params->mac_addr, mac_addr);
++	breach_params->svc_id = svc_id;
++	breach_params->param = param;
++	breach_params->set_clear = set_clear;
++	breach_params->tid = tid;
++
++	spin_lock_bh(&telemetry_ctx->breach_ind_lock);
++	list_add_tail(&breach_params->list, &telemetry_ctx->list);
++	spin_unlock_bh(&telemetry_ctx->breach_ind_lock);
++
++	queue_work(telemetry_ctx->workqueue, &telemetry_ctx->indicate_breach);
++}
++
+ bool ath12k_telemetry_get_sla_mov_avg_num_pkt(u32 *mov_avg)
+ {
+ 	if (!telemetry_ctx) {
+--- a/drivers/net/wireless/ath/ath12k/telemetry.h
++++ b/drivers/net/wireless/ath/ath12k/telemetry.h
+@@ -88,6 +88,11 @@ struct ath12k_sla_detect_cfg {
+  */
+ struct ath12k_telemetry_ctx {
+ 	struct ath12k_sla_samples_cfg sla_samples_params;
++	/* Used to protect the list */
++	spinlock_t breach_ind_lock;
++	struct workqueue_struct *workqueue;
++	struct work_struct indicate_breach;
++	struct list_head list;
+ };
+ 
+ void ath12k_telemetry_init(struct ath12k_base *ab);
+@@ -97,4 +102,6 @@ int ath12k_telemetry_sdwf_sla_thershold_
+ int ath12k_telemetry_sdwf_sla_detection_config(struct ath12k_sla_detect_cfg param);
+ bool ath12k_telemetry_get_sla_num_pkts(u32 *pkt_num);
+ bool ath12k_telemetry_get_sla_mov_avg_num_pkt(u32 *mov_avg);
++void ath12k_send_breach_indication(struct work_struct *work);
++void ath12k_telemetry_breach_indication(u8 *mac_addr, u8 svc_id, u8 param, bool set_clear, u8 tid);
+ #endif /* ATH12K_TELEMETRY_H */
+--- a/drivers/net/wireless/ath/ath12k/telemetry_agent_if.c
++++ b/drivers/net/wireless/ath/ath12k/telemetry_agent_if.c
+@@ -7,6 +7,7 @@
+ #include "debug.h"
+ #include "telemetry.h"
+ #include "telemetry_agent_if.h"
++#include "sdwf.h"
+ #include <linux/module.h>
+ 
+ struct telemetry_agent_ops *g_agent_ops;
+@@ -24,6 +25,12 @@ int register_telemetry_agent_ops(struct
+ 	g_agent_ops->agent_get_emesh_pdev_stats = NULL;
+ 	g_agent_ops->agent_get_emesh_peer_stats = NULL;
+ 
++	g_agent_ops->sawf_get_tput_stats = ath12k_sawf_get_tput_stats;
++	g_agent_ops->sawf_get_mpdu_stats = ath12k_sawf_get_mpdu_stats;
++	g_agent_ops->sawf_get_drop_stats = ath12k_sawf_get_drop_stats;
++	g_agent_ops->sawf_get_msduq_tx_stats = ath12k_sawf_get_msduq_tx_stats;
++	g_agent_ops->sawf_notify_breach = ath12k_sawf_notify_breach;
++
+ 	ath12k_info(NULL, "registered telemetry agent ops: %p", g_agent_ops);
+ 
+ 	return 0;
+@@ -133,3 +140,148 @@ int ath12k_telemetry_set_sla_detect_cfg(
+ 
+ 	return -ENOENT;
+ }
++
++void *ath12k_telemetry_peer_ctx_alloc(void *peer, void *sawf_stats,
++				      u8 *mac_addr,
++				      u8 svc_id, u8 hostq_id)
++{
++	if (g_agent_ops)
++		return g_agent_ops->sawf_alloc_peer(peer, sawf_stats,
++						    mac_addr,
++						    svc_id,
++						    hostq_id);
++	return NULL;
++}
++
++void ath12k_telemetry_peer_ctx_free(void *telemetry_peer_ctx)
++{
++	if (g_agent_ops)
++		g_agent_ops->sawf_free_peer(telemetry_peer_ctx);
++}
++
++int ath12k_telemetry_update_tid_msduq(void *telemetry_peer_ctx,
++				      u8 hostq_id, u8 tid, u8 msduq_idx)
++{
++	if (g_agent_ops)
++		return g_agent_ops->sawf_updt_queue_info(telemetry_peer_ctx,
++							 hostq_id, tid,
++							 msduq_idx);
++	return -ENOENT;
++}
++
++int ath12k_telemetry_set_svclass_cfg(bool enable, u8 svc_id,
++				     u32 min_tput_rate,
++				     u32 max_tput_rate,
++				     u32 burst_size,
++				     u32 svc_interval,
++				     u32 delay_bound,
++				     u32 msdu_ttl,
++				     u32 msdu_rate_loss)
++{
++	if (g_agent_ops)
++		return g_agent_ops->sawf_set_svclass_cfg(enable, svc_id,
++							 min_tput_rate,
++							 max_tput_rate,
++							 burst_size,
++							 svc_interval,
++							 delay_bound,
++							 msdu_ttl,
++							 msdu_rate_loss);
++
++	return -ENOENT;
++}
++
++int ath12k_telemetry_update_delay(void *telemetry_ctx, u8 tid,
++				  u8 queue, u64 pass,
++				  u64 fail)
++{
++	if (g_agent_ops)
++		return g_agent_ops->sawf_push_delay(telemetry_ctx, tid,
++						 queue, pass, fail);
++	return -ENOENT;
++}
++EXPORT_SYMBOL(ath12k_telemetry_update_delay);
++
++int ath12k_telemetry_update_delay_mvng(void *telemetry_ctx,
++				       u8 tid, u8 queue,
++				       u64 nwdelay_winavg,
++				       u64 swdelay_winavg,
++				       u64 hwdelay_winavg)
++{
++	if (g_agent_ops)
++		return g_agent_ops->sawf_push_delay_mvng(telemetry_ctx,
++							 tid, queue,
++							 nwdelay_winavg,
++							 swdelay_winavg,
++							 hwdelay_winavg);
++
++	return -ENOENT;
++}
++EXPORT_SYMBOL(ath12k_telemetry_update_delay_mvng);
++
++bool ath12k_telemetry_update_msdu_drop(void *telemetry_ctx,
++				       u8 tid, u8 queue,
++				       u64 success,
++				       u64 failure_drop,
++				       u64 failure_ttl)
++{
++	if (g_agent_ops)
++		return (g_agent_ops->sawf_push_msdu_drop(telemetry_ctx, tid,
++							 queue, success,
++							 failure_drop,
++							 failure_ttl));
++	return -ENOENT;
++}
++EXPORT_SYMBOL(ath12k_telemetry_update_msdu_drop);
++
++int ath12k_telemetry_reset_peer_stats(u8 *peer_mac)
++{
++	if (g_agent_ops)
++		return g_agent_ops->sawf_reset_peer_stats(peer_mac);
++
++	return -ENOENT;
++}
++
++int ath12k_sawf_get_tput_stats(void *soc, void *arg, u64 *in_bytes,
++			       u64 *in_cnt, u64 *tx_bytes,
++			       u64 *tx_cnt, u8 tid, u8 msduq)
++{
++	return ath12k_telemetry_get_sawf_tx_stats_tput(soc, arg,
++						       in_bytes, in_cnt,
++						       tx_bytes, tx_cnt,
++						       tid, msduq);
++}
++
++int ath12k_sawf_get_mpdu_stats(void *soc, void *arg, u64 *svc_int_pass,
++			       u64 *svc_int_fail, u64 *burst_pass,
++			       u64 *burst_fail, u8 tid, u8 msduq)
++{
++	return ath12k_telemetry_get_sawf_tx_stats_mpdu(soc, arg, svc_int_pass,
++						       svc_int_fail, burst_pass,
++						       burst_fail, tid, msduq);
++}
++
++int ath12k_sawf_get_drop_stats(void *soc, void *arg, u64 *pass,
++			       u64 *drop, u64 *drop_ttl,
++			       u8 tid, u8 msduq)
++{
++	return ath12k_telemetry_get_sawf_tx_stats_drop(soc, arg, pass, drop,
++						       drop_ttl, tid, msduq);
++}
++
++int ath12k_sawf_get_msduq_tx_stats(void *soc, void *arg,
++				   void *msduq_tx_stats,
++				   u8 msduq)
++{
++	return ath12k_telemetry_get_msduq_tx_stats(soc, arg,
++						   msduq_tx_stats, msduq);
++}
++
++void ath12k_sawf_notify_breach(u8 *mac_addr,
++			       u8 svc_id,
++			       u8 param,
++			       bool set_clear,
++			       u8 tid, u8 queue)
++{
++	ath12k_telemetry_breach_indication(mac_addr, svc_id, param, set_clear, tid);
++}
+--- a/drivers/net/wireless/ath/ath12k/telemetry_agent_if.h
++++ b/drivers/net/wireless/ath/ath12k/telemetry_agent_if.h
+@@ -20,6 +20,51 @@ int ath12k_get_pdev_info(void *obj, stru
+ int ath12k_get_peer_stats(void *obj, struct agent_peer_iface_stats_obj *stats);
+ int ath12k_get_psoc_info(void *obj, struct agent_psoc_iface_init_obj *statis);
+ 
++int ath12k_sawf_get_tput_stats(void *soc, void *arg, u64 *in_bytes,
++			       u64 *in_cnt, u64 *tx_bytes,
++			       u64 *tx_cnt, u8 tid, u8 msduq);
++int ath12k_sawf_get_mpdu_stats(void *soc, void *arg, u64 *svc_int_pass,
++			       u64 *svc_int_fail, u64 *burst_pass,
++			       u64 *burst_fail, u8 tid, u8 msduq);
++int ath12k_sawf_get_drop_stats(void *soc, void *arg, u64 *pass,
++			       u64 *drop, u64 *drop_ttl,
++			       u8 tid, u8 msduq);
++int ath12k_sawf_get_msduq_tx_stats(void *soc, void *arg,
++				   void *msduq_tx_stats,
++				   u8 msduq);
++void ath12k_sawf_notify_breach(u8 *mac_addr, u8 svc_id, u8 param,
++			       bool set_clear, u8 tid, u8 queue);
++void *ath12k_telemetry_peer_ctx_alloc(void *peer, void *sawf_stats,
++				      u8 *mac_addr,
++				      u8 svc_id, u8 hostq_id);
++void ath12k_telemetry_peer_ctx_free(void *telemetry_peer_ctx);
++int ath12k_telemetry_update_tid_msduq(void *telemetry_peer_ctx,
++				      u8 hostq_id, u8 tid, u8 msduq_idx);
++int ath12k_telemetry_set_svclass_cfg(bool enable, u8 svc_id,
++				     u32 min_tput_rate,
++				     u32 max_tput_rate,
++				     u32 burst_size,
++				     u32 svc_interval,
++				     u32 delay_bound,
++				     u32 msdu_ttl,
++				     u32 msdu_rate_loss);
++int ath12k_telemetry_update_delay(void *telemetry_ctx, u8 tid,
++				  u8 queue, u64 pass, u64 fail);
++int ath12k_telemetry_update_delay_mvng(void *telemetry_ctx,
++				       u8 tid, u8 queue,
++				       u64 nwdelay_winavg,
++				       u64 swdelay_winavg,
++				       u64 hwdelay_winavg);
++bool ath12k_telemetry_update_msdu_drop(void *telemetry_ctx, u8 tid,
++				       u8 queue, u64 success,
++				       u64 failure_drop,
++				       u64 failure_ttl);
++bool ath12k_telemetry_get_rate(void *telemetry_ctx, u8 tid, u8 queue,
++			       u32 *egress_rate, u32 *ingress_rate);
++bool ath12k_telemetry_get_mov_avg(void *telemetry_ctx, u8 tid, u8 queue,
++				  u32 *nwdelay_avg, u32 *swdelay_avg,
++				  u32 *hwdelay_avg);
++int ath12k_telemetry_reset_peer_stats(u8 *peer_mac);
+ int ath12k_telemetry_set_mov_avg_params(u32 num_pkt, u32 num_win);
+ int ath12k_telemetry_set_sla_params(u32 num_pkt, u32 time_sec);
+ int ath12k_telemetry_set_sla_cfg(struct ath12k_sla_thershold_cfg param);
+--- a/drivers/net/wireless/ath/ath12k/vendor.c
++++ b/drivers/net/wireless/ath/ath12k/vendor.c
+@@ -13,6 +13,7 @@
+ #include "ppe.h"
+ #include "vendor.h"
+ #include "telemetry.h"
++#include "telemetry_agent_if.h"
+ #include "erp.h"
+ 
+ static const struct nla_policy
+@@ -4189,6 +4190,18 @@ ath12k_vendor_sdwf_streaming[QCA_WLAN_VE
+ 	[QCA_WLAN_VENDOR_ATTR_SDWF_MLO_LINK_ID] = {.type = NLA_U32},
+ };
+ 
++static const struct nla_policy
++ath12k_telemetric_sla_policy[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_MAX + 1] = {
++	[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_PEER_MAC] = {.type = NLA_BINARY,
++								 .len = ETH_ALEN},
++	[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_SVC_ID] = {.type = NLA_U8},
++	[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_TYPE] = {.type = NLA_U8},
++	[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_SET_CLEAR] = {.type = NLA_U8},
++	[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_PEER_MLD_MAC] = {.type = NLA_BINARY,
++								     .len = ETH_ALEN},
++	[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_AC] = {.type = NLA_U8},
++};
++
+ static int ath12k_vendor_set_sdwf_config(struct ath12k_base *ab,
+ 					 struct wiphy *wiphy,
+ 					 struct wireless_dev *wdev,
+@@ -4280,6 +4293,14 @@ static int ath12k_vendor_set_sdwf_config
+ 								 NULL);
+ 			}
+ 		}
++		ath12k_telemetry_set_svclass_cfg(true, svc_id,
++						 param_dl.min_data_rate,
++						 param_dl.mean_data_rate,
++						 param_dl.burst_size,
++						 param_dl.min_service_interval,
++						 param_dl.delay_bound,
++						 param_dl.msdu_life_time,
++						 param_dl.msdu_delivery_info);
+ 	}
+ 
+ 	if (ul_params) {
+@@ -4392,11 +4413,14 @@ static int ath12k_vendor_disable_sdwf_co
+ 	}
+ 
+ 	dl_qos_id = ath12k_sdwf_get_dl_qos_id(ab, svc_id);
+-	if (dl_qos_id != QOS_ID_INVALID)
++	if (dl_qos_id != QOS_ID_INVALID) {
+ 		ret = ath12k_qos_disable(ab, NULL,
+ 					 QOS_PROFILE_DL,
+ 					 dl_qos_id,
+ 					 NULL);
++		ath12k_telemetry_set_svclass_cfg(false, svc_id, 0, 0,
++						 0, 0, 0, 0, 0);
++	}
+ 
+ 	ul_qos_id = ath12k_sdwf_get_ul_qos_id(ab, svc_id);
+ 	if (ul_qos_id != QOS_ID_INVALID)
+@@ -5419,6 +5443,40 @@ static int ath12k_vendor_sdwf_streaming_
+ 	return ret;
+ }
+ 
++static int ath12k_vendor_telemetry_sla_reset_stats(struct nlattr *clr_stats)
++{
++	struct nlattr *tb[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_MAX + 1];
++	int ret = 0;
++	u8 svc_id, mac_addr[ETH_ALEN] = { 0 }, mld_mac_addr[ETH_ALEN] = { 0 }, set_clear;
++
++	ret = nla_parse_nested(tb, QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_MAX,
++			       clr_stats,
++			       ath12k_telemetric_sla_policy, NULL);
++
++	if (ret) {
++		ath12k_err(NULL, "Invalid attribute with telemetry sla reset stats command\n");
++		return ret;
++	}
++
++	if (tb[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_SVC_ID])
++		svc_id = nla_get_u8(tb[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_SVC_ID]);
++
++	if (tb[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_PEER_MAC] &&
++	    (nla_len(tb[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_PEER_MAC]) == ETH_ALEN))
++		memcpy(mac_addr, nla_data(tb[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_PEER_MAC]),
++		       ETH_ALEN);
++
++	if (tb[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_PEER_MLD_MAC] &&
++	    (nla_len(tb[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_PEER_MLD_MAC]) == ETH_ALEN))
++		memcpy(mld_mac_addr, nla_data(tb[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_PEER_MLD_MAC]),
++		       ETH_ALEN);
++
++	if (tb[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_SET_CLEAR])
++		set_clear = nla_get_u8(tb[QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_SET_CLEAR]);
++
++	return ath12k_telemetry_reset_peer_stats(mac_addr);
++}
++
+ static int ath12k_vendor_sdwf_dev_operations(struct wiphy *wiphy,
+ 					     struct wireless_dev *wdev,
+ 					     const void *data,
+@@ -5453,6 +5511,15 @@ static int ath12k_vendor_sdwf_dev_operat
+ 			goto end;
+ 		}
+ 		break;
++	case QCA_WLAN_VENDOR_SDWF_DEV_OPER_RESET_STATS:
++		if (tb[QCA_WLAN_VENDOR_ATTR_SDWF_DEV_RESET_STATS]) {
++			ret = ath12k_vendor_telemetry_sla_reset_stats(tb[QCA_WLAN_VENDOR_ATTR_SDWF_DEV_RESET_STATS]);
++		} else {
++			ath12k_err(NULL, "SAWF clear telemetry stats parameters missing\n");
++			ret = -EINVAL;
++			goto end;
++		}
++		break;
+ 	default:
+ 		ath12k_err(NULL, "Invalid operation = %d with SAWF device level commands\n", sdwf_oper);
+ 		ret = -EINVAL;
+@@ -5461,6 +5528,74 @@ end:
+ 	return ret;
+ }
+ 
++void ath12k_vendor_telemetry_notify_breach(struct ieee80211_vif *vif, u8 *mac_addr,
++					   u8 svc_id, u8 param, bool set_clear,
++					   u8 tid, u8 *mld_addr)
++{
++	struct nlattr *notify_params;
++	struct wireless_dev *wdev;
++	struct sk_buff *skb;
++	u8 access_category;
++
++	wdev = ieee80211_vif_to_wdev(vif);
++
++	if (!wdev)
++		return;
++
++	if (!wdev->wiphy)
++		return;
++
++	skb = cfg80211_vendor_event_alloc(wdev->wiphy, wdev, NLMSG_DEFAULT_SIZE,
++					  QCA_NL80211_VENDOR_SUBCMD_SDWF_DEV_OPS_INDEX,
++					  GFP_KERNEL);
++	if (!skb) {
++		ath12k_err(NULL, "No memory available to send notify breach event\n");
++		return;
++	}
++
++	switch (tid) {
++	case 0:
++	case 3:
++		access_category = 0; //AC_BE
++		break;
++	case 1:
++	case 2:
++		access_category = 1; //AC_BK
++		break;
++	case 4:
++	case 5:
++		access_category = 2; //AC_VI
++		break;
++	case 6:
++	case 7:
++		access_category = 3; //AC_VO
++		break;
++	default:
++		ath12k_err(NULL, "Invalid TID = %u for notifying breach event\n", tid);
++		goto err;
++	}
++
++	notify_params = nla_nest_start(skb, QCA_WLAN_VENDOR_ATTR_SDWF_DEV_SLA_BREACHED_PARAMS);
++	if (!notify_params)
++		goto err;
++	if (nla_put(skb, QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_PEER_MAC, ETH_ALEN, mac_addr) ||
++	    (mld_addr && nla_put(skb, QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_PEER_MLD_MAC,
++	    ETH_ALEN, mld_addr)) ||
++	    nla_put_u8(skb, QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_SVC_ID, svc_id) ||
++	    nla_put_u8(skb, QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_TYPE, param) ||
++	    nla_put_u8(skb, QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_SET_CLEAR, set_clear) ||
++	    nla_put_u8(skb, QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_AC, access_category)) {
++		ath12k_err(NULL, "No memory available at NL to send notify breach event\n");
++		goto err;
++	}
++
++	nla_nest_end(skb, notify_params);
++	cfg80211_vendor_event(skb, GFP_KERNEL);
++	return;
++err:
++	kfree(skb);
++}
++
+ static struct wiphy_vendor_command ath12k_vendor_commands[] = {
+ 	{
+ 		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+@@ -5615,6 +5750,10 @@ static const struct nl80211_vendor_cmd_i
+                 .vendor_id = QCA_NL80211_VENDOR_ID,
+                 .subcmd = QCA_NL80211_VENDOR_SUBCMD_IFACE_RELOAD
+         },
++	[QCA_NL80211_VENDOR_SUBCMD_SDWF_DEV_OPS_INDEX] = {
++		.vendor_id = QCA_NL80211_VENDOR_ID,
++		.subcmd = QCA_NL80211_VENDOR_SUBCMD_SDWF_DEV_OPS,
++	},
+ };
+ 
+ int ath12k_vendor_register(struct ath12k_hw *ah)
+--- a/drivers/net/wireless/ath/ath12k/vendor.h
++++ b/drivers/net/wireless/ath/ath12k/vendor.h
+@@ -62,6 +62,7 @@ enum qca_nl80211_vendor_events {
+ 	QCA_NL80211_VENDOR_SUBCMD_WLAN_WIPHY_TELEMETRY_EVENT = 3,
+ 	QCA_NL80211_VENDOR_SUBCMD_WLAN_WDEV_TELEMETRY_EVENT = 4,
+ 	QCA_NL80211_VENDOR_SUBCMD_IFACE_RELOAD_INDEX = 5,
++	QCA_NL80211_VENDOR_SUBCMD_SDWF_DEV_OPS_INDEX = 6,
+ };
+ 
+ /**
+@@ -1396,6 +1397,8 @@ enum qca_wlan_vendor_attr_sdwf_dev {
+ 	QCA_WLAN_VENDOR_ATTR_SDWF_DEV_OPERATION = 1,
+ 	QCA_WLAN_VENDOR_ATTR_SDWF_DEV_DEF_Q_PARAMS = 2,
+ 	QCA_WLAN_VENDOR_ATTR_SDWF_DEV_STREAMING_STATS_PARAMS = 3,
++	QCA_WLAN_VENDOR_ATTR_SDWF_DEV_RESET_STATS = 4,
++	QCA_WLAN_VENDOR_ATTR_SDWF_DEV_SLA_BREACHED_PARAMS = 5,
+ 
+ 	/* keep last */
+ 	QCA_WLAN_VENDOR_ATTR_SDWF_DEV_AFTER_LAST,
+@@ -1424,5 +1427,35 @@ enum qca_wlan_vendor_attr_sdwf_streaming
+ 	QCA_WLAN_VENDOR_ATTR_SDWF_STREAMING_AFTER_LAST - 1,
+ };
+ 
++enum qca_wlan_vendor_attr_sdwf_sla_breach_param {
++	QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_INVALID = 0,
++	QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_PEER_MAC = 1,
++	QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_SVC_ID = 2,
++	QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_TYPE = 3,
++	QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_SET_CLEAR = 4,
++	QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_PEER_MLD_MAC = 5,
++	QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_AC = 6,
++
++	/* Keep last */
++	QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_AFTER_LAST,
++	QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_MAX =
++	QCA_WLAN_VENDOR_ATTR_SDWF_SLA_BREACH_PARAM_AFTER_LAST - 1
++};
++
++enum qca_wlan_vendor_sdwf_sla_breach_type {
++	QCA_WLAN_VENDOR_SDWF_SLA_BREACH_PARAM_TYPE_INVALID = 0,
++	QCA_WLAN_VENDOR_SDWF_SLA_BREACH_PARAM_TYPE_MIN_THROUGHPUT,
++	QCA_WLAN_VENDOR_SDWF_SLA_BREACH_PARAM_TYPE_MAX_THROUGHPUT,
++	QCA_WLAN_VENDOR_SDWF_SLA_BREACH_PARAM_TYPE_BURST_SIZE,
++	QCA_WLAN_VENDOR_SDWF_SLA_BREACH_PARAM_TYPE_SERVICE_INTERVAL,
++	QCA_WLAN_VENDOR_SDWF_SLA_BREACH_PARAM_TYPE_DELAY_BOUND,
++	QCA_WLAN_VENDOR_SDWF_SLA_BREACH_PARAM_TYPE_MSDU_TTL,
++	QCA_WLAN_VENDOR_SDWF_SLA_BREACH_PARAM_TYPE_MSDU_LOSS,
++	QCA_WLAN_VENDOR_SDWF_SLA_BREACH_PARAM_TYPE_MAX,
++};
++
++void ath12k_vendor_telemetry_notify_breach(struct ieee80211_vif *vif, u8 *mac_addr,
++					   u8 svc_id, u8 param, bool set_clear,
++					   u8 tid, u8 *mld_addr);
+ int ath12k_vendor_register(struct ath12k_hw *ah);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -16,6 +16,7 @@
+ #include "../dp_stats.h"
+ #include "../dp_peer.h"
+ #include "../telemetry.h"
++#include "../telemetry_agent_if.h"
+ 
+ struct ath12k_tx_sw_metadata {
+ 	struct sk_buff *skb;
+@@ -439,9 +440,10 @@ void ath12k_qos_stats_update(struct ath1
+ 	struct ath12k_mld_qos_stats *mld_qos;
+ 	struct tx_stats *qos_tx;
+ 	struct delay_stats *qos_delay;
+-	u64 enqueue_timestamp, total_delay_pkts;
++	void *telemetry_peer_ctx;
++	u64 enqueue_timestamp, total_delay_pkts, tmp_div;
+ 	u32 len, q_id, tid, hw_delay, nw_delay, sw_delay, delay_bound;
+-	u32 nwdelay_avg, hwdelay_avg, swdelay_avg, pkt_win;
++	u32 pkt_win, num_pkts, dropped_age_out = 0;
+ 	u16 msduq_id;
+ 	u8 link_id, pri_link_id, qos_id;
+ 
+@@ -608,6 +610,44 @@ void ath12k_qos_stats_update(struct ath1
+ 		spin_unlock_bh(&dp_pdev->dp->dp_lock);
+ 	}
+ 
++	ath12k_telemetry_get_sla_num_pkts(&num_pkts);
++	telemetry_peer_ctx = mld_peer->qos->telemetry_peer_ctx;
++
++	tmp_div = mld_qos->tx_success_pkts + mld_qos->tx_failed_pkts;
++	if ((!(do_div(tmp_div, num_pkts))) &&
++	    telemetry_peer_ctx) {
++		if (mld_peer->qos_stats_lvl ==
++		    ATH12K_QOS_SINGLE_LINK_STATS) {
++			dropped_age_out = qos_tx->dropped.age_out;
++		} else {
++			struct ath12k_dp_link_peer *tmp_peer = NULL;
++			struct tx_stats *tmp_qos_tx = NULL;
++			unsigned long peer_links_map, scan_links_map;
++			u8 tmp_link_id;
++
++			peer_links_map = mld_peer->peer_links_map;
++			scan_links_map = ATH12K_SCAN_LINKS_MASK;
++
++			for_each_andnot_bit(tmp_link_id, &peer_links_map,
++					    &scan_links_map,
++					    ATH12K_NUM_MAX_LINKS) {
++				tmp_peer = rcu_dereference(mld_peer->link_peers[tmp_link_id]);
++				if (!tmp_peer ||
++				    !tmp_peer->peer_stats.qos_stats) {
++					continue;
++				}
++
++				tmp_qos_tx = &tmp_peer->peer_stats.qos_stats->qos_tx[tid][q_id];
++				dropped_age_out += tmp_qos_tx->dropped.age_out;
++				tmp_peer = NULL;
++			}
++		}
++		ath12k_telemetry_update_msdu_drop(telemetry_peer_ctx, tid, msduq_id,
++						  mld_qos->tx_success_pkts,
++						  mld_qos->tx_failed_pkts,
++						  dropped_age_out);
++	}
++
+ 	qos_delay = &link_peer->peer_stats.qos_stats->qos_delay[tid][q_id];
+ 
+ 	ath12k_sdwf_compute_hw_delay(ar, ts, &hw_delay);
+@@ -639,7 +679,10 @@ void ath12k_qos_stats_update(struct ath1
+ 	total_delay_pkts = mld_qos->tx_success_pkts +
+ 			   mld_qos->tx_failed_pkts -
+ 			   mld_qos->tx_invalid_delay_pkts;
+-	if (!(total_delay_pkts % pkt_win)) {
++	tmp_div = total_delay_pkts;
++
++	if (telemetry_peer_ctx && !(do_div(tmp_div, pkt_win))) {
++		u32 nwdelay_avg, hwdelay_avg, swdelay_avg;
+ 		nwdelay_avg = div_u64(mld_qos->nwdelay_win_total,
+ 				      pkt_win);
+ 		swdelay_avg = div_u64(mld_qos->swdelay_win_total,
+@@ -649,6 +692,12 @@ void ath12k_qos_stats_update(struct ath1
+ 		mld_qos->nwdelay_win_total = 0;
+ 		mld_qos->swdelay_win_total = 0;
+ 		mld_qos->hwdelay_win_total = 0;
++
++		ath12k_telemetry_update_delay_mvng(telemetry_peer_ctx,
++						   tid, msduq_id,
++						   nwdelay_avg,
++						   swdelay_avg,
++						   hwdelay_avg);
+ 	}
+ 
+ 	if (!mld_peer->qos) {
+@@ -665,6 +714,44 @@ void ath12k_qos_stats_update(struct ath1
+ 			qos_delay->delay_failure++;
+ 		else
+ 			qos_delay->delay_success++;
++
++		tmp_div = total_delay_pkts;
++		if (!(do_div(tmp_div, num_pkts)) && telemetry_peer_ctx) {
++			u64 delay_success = 0, delay_failure = 0;
++
++			if (mld_peer->qos_stats_lvl ==
++			    ATH12K_QOS_SINGLE_LINK_STATS) {
++				delay_success = qos_delay->delay_success;
++				delay_failure = qos_delay->delay_failure;
++			} else {
++				struct ath12k_dp_link_peer *tmp_peer = NULL;
++				struct delay_stats *tmp_qos_delay = NULL;
++				unsigned long peer_links_map, scan_links_map;
++				u8 tmp_link_id;
++
++				peer_links_map = mld_peer->peer_links_map;
++				scan_links_map = ATH12K_SCAN_LINKS_MASK;
++
++				for_each_andnot_bit(tmp_link_id, &peer_links_map,
++						    &scan_links_map,
++						    ATH12K_NUM_MAX_LINKS) {
++					tmp_peer = rcu_dereference(mld_peer->link_peers[tmp_link_id]);
++					if (!tmp_peer ||
++					    !tmp_peer->peer_stats.qos_stats) {
++						continue;
++					}
++
++					tmp_qos_delay = &tmp_peer->peer_stats.qos_stats->qos_delay[tid][q_id];
++					delay_success += tmp_qos_delay->delay_success;
++					delay_failure += tmp_qos_delay->delay_failure;
++					tmp_peer = NULL;
++				}
++			}
++			ath12k_telemetry_update_delay(telemetry_peer_ctx,
++						      tid, msduq_id,
++						      delay_success,
++						      delay_failure);
++		}
+ 	}
+ 
+ out:
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -2200,4 +2200,6 @@ struct ath12k_wsi_info *ath12k_core_get_
+ int ath12k_core_dynamic_wsi_remap(struct ath12k_base *ab);
+ void ath12k_core_pci_link_speed(struct ath12k_base *ab, u16 link_speed, u16 link_width);
+ void ath12k_core_radio_cleanup(struct ath12k *ar);
++void ath12k_telemetry_notify_breach(u8 *mac_addr, u8 svc_id, u8 param,
++				    bool set_clear, u8 tid);
+ #endif /* _CORE_H_ */
+--- a/drivers/net/wireless/ath/ath12k/dp_stats.h
++++ b/drivers/net/wireless/ath/ath12k/dp_stats.h
+@@ -235,6 +235,13 @@ struct dp_pkt_info {
+ 	u64 bytes;
+ };
+ 
++struct msduq_tx_stats {
++	u32 tx_failed;
++	u32 retry_count;
++	u32 total_retries_count;
++	struct pkt_type pkt_type[DOT11_MAX];
++};
++
+ struct tx_stats {
+ 	struct dp_pkt_info tx_success;
+ 	struct dp_pkt_info tx_failed;

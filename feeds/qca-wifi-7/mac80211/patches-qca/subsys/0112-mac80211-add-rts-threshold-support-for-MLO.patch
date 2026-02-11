@@ -1,0 +1,201 @@
+From f719978f8b4d4fc1dbf2deb6d5a9f11d3e2543ea Mon Sep 17 00:00:00 2001
+From: Balamurugan Ramar <quic_bramar@quicinc.com>
+Date: Thu, 10 Apr 2025 23:26:11 +0530
+Subject: [PATCH] mac80211: add rts threshold support for MLO
+
+Currently, all vaps rts threshold update when we run
+"iw phy<x> set rts <rts threshold value|off>" for MLO.
+But, should be update only for one vap not for all vaps,
+this is happen because in MLO case we have only one phy.
+
+So, add changes to support rts threshold by parsing link id
+and moving iw phy command to iw dev command for MLO.
+
+command:
+iw dev wlan# set rts -l <link_id> <rts threshold|off>
+
+Signed-off-by: Aaradhana Sahu <quic_aarasahu@quicinc.com>
+Signed-off-by: Balamurugan Ramar <quic_bramar@quicinc.com>
+---
+ include/net/mac80211.h    |  4 +++-
+ net/mac80211/cfg.c        | 41 +++++++++++++++++++++++++++++++++++----
+ net/mac80211/driver-ops.h | 12 ++++++++----
+ net/mac80211/link.c       |  1 +
+ net/mac80211/trace.h      | 11 +++++++----
+ net/mac80211/util.c       |  5 +++--
+ 6 files changed, 59 insertions(+), 15 deletions(-)
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -886,6 +886,7 @@ struct ieee80211_bss_conf {
+ 	bool ap_ps_enable;
+ 	/* Critical Update flag*/
+ 	u32 critical_update_flag;
++	u32 rts_threshold;
+ };
+ 
+ /**
+@@ -4669,7 +4670,8 @@ struct ieee80211_ops {
+ 			    struct ieee80211_key_conf *key,
+ 			    struct ieee80211_key_seq *seq);
+ 	int (*set_frag_threshold)(struct ieee80211_hw *hw, u32 value);
+-	int (*set_rts_threshold)(struct ieee80211_hw *hw, u8 radio_id, u32 value);
++	int (*set_rts_threshold)(struct ieee80211_hw *hw, u8 radio_id, u32 value,
++			struct ieee80211_vif *vif, u32 link_id);
+ 	int (*sta_add)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		       struct ieee80211_sta *sta);
+ 	int (*sta_remove)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -3122,7 +3122,10 @@ static int ieee80211_set_wiphy_params(st
+ 				      struct wireless_dev *wdev, unsigned int link_id)
+ {
+ 	struct ieee80211_local *local = wiphy_priv(wiphy);
+-	int err;
++	struct ieee80211_sub_if_data *sdata;
++	int err, old_rts_threshold = 0;
++	struct ieee80211_bss_conf *link_conf = NULL;
++
+ 
+ 	if (changed & WIPHY_PARAM_FRAG_THRESHOLD) {
+ 		ieee80211_check_fast_xmit_all(local);
+@@ -3147,18 +3150,48 @@ static int ieee80211_set_wiphy_params(st
+ 			return err;
+ 	}
+ 
+-	if (changed & WIPHY_PARAM_RTS_THRESHOLD) {
++	if (wdev) {
+ 		u32 rts_threshold;
+ 
++		sdata = IEEE80211_WDEV_TO_SUB_IF(wdev);
++		rcu_read_lock();
++		link_conf = rcu_dereference(sdata->vif.link_conf[link_id]);
++		if (!link_conf) {
++			rcu_read_unlock();
++			return -ENOLINK;
++		}
++		old_rts_threshold = link_conf->rts_threshold;
+ 		if (radio_id >= wiphy->n_radio)
+ 			rts_threshold = wiphy->rts_threshold;
+ 		else
+ 			rts_threshold = wiphy->radio_cfg[radio_id].rts_threshold;
+-		err = drv_set_rts_threshold(local, radio_id, rts_threshold);
++
++		if (changed & WIPHY_PARAM_RTS_THRESHOLD) {
++			link_conf->rts_threshold = rts_threshold;
++			rcu_read_unlock();
++			err = drv_set_rts_threshold(local, radio_id, rts_threshold, sdata, link_id);
++			if (err) {
++				rcu_read_lock();
++				link_conf = rcu_dereference(sdata->vif.link_conf[link_id]);
++				link_conf->rts_threshold = old_rts_threshold;
++				rcu_read_unlock();
++				return err;
++			}
++		}
++		rcu_read_unlock();
+ 
+ 		if (err)
+ 			return err;
+-	}
++	} else {
++		if (changed & WIPHY_PARAM_RTS_THRESHOLD && !wiphy->num_hw) {
++			err = drv_set_rts_threshold(local, radio_id, wiphy->rts_threshold, NULL, link_id);
++
++			if (err)
++				return err;
++		} else {
++			return -EOPNOTSUPP;
++		}
++        }
+ 
+ 	if (changed & WIPHY_PARAM_RETRY_SHORT) {
+ 		if (wiphy->retry_short > IEEE80211_MAX_TX_RETRY)
+--- a/net/mac80211/driver-ops.h
++++ b/net/mac80211/driver-ops.h
+@@ -419,16 +419,20 @@ static inline int drv_set_frag_threshold
+ }
+ 
+ static inline int drv_set_rts_threshold(struct ieee80211_local *local,
+-					u8 radio_id, u32 value)
++					u8 radio_id, u32 value,
++					struct ieee80211_sub_if_data *sdata,
++					u32 link_id)
+ {
+ 	int ret = 0;
+ 
+ 	might_sleep();
+ 	lockdep_assert_wiphy(local->hw.wiphy);
+ 
+-	trace_drv_set_rts_threshold(local, radio_id, value);
+-	if (local->ops->set_rts_threshold)
+-		ret = local->ops->set_rts_threshold(&local->hw, radio_id, value);
++	trace_drv_set_rts_threshold(local, radio_id, value, sdata, link_id);
++	if (sdata && local->ops->set_rts_threshold)
++		ret = local->ops->set_rts_threshold(&local->hw, radio_id, value, &sdata->vif, link_id);
++	else if (local->ops->set_rts_threshold)
++		ret = local->ops->set_rts_threshold(&local->hw, radio_id, value, NULL, link_id);
+ 	trace_drv_return_int(local, ret);
+ 	return ret;
+ }
+--- a/net/mac80211/link.c
++++ b/net/mac80211/link.c
+@@ -112,6 +112,7 @@ skip_vlan_conf:
+ 	link->ap_power_level = IEEE80211_UNSET_POWER_LEVEL;
+ 	link->user_power_level = sdata->local->user_power_level;
+ 	link_conf->txpower = INT_MIN;
++	link_conf->rts_threshold = (u32) -1;
+ 
+ 	wiphy_work_init(&link->csa.finalize_work,
+ 			ieee80211_csa_finalize_work);
+--- a/net/mac80211/trace.h
++++ b/net/mac80211/trace.h
+@@ -856,25 +856,28 @@ DEFINE_EVENT(local_u32_evt, drv_set_frag
+ );
+ 
+ TRACE_EVENT(drv_set_rts_threshold,
+-	TP_PROTO(struct ieee80211_local *local, u8 radio_id, u32 value),
++	TP_PROTO(struct ieee80211_local *local, u8 radio_id, u32 value,
++		struct ieee80211_sub_if_data *sdata, u32 link_id),
+ 
+-	TP_ARGS(local, radio_id, value),
++	TP_ARGS(local, radio_id, value, sdata, link_id),
+ 
+ 	TP_STRUCT__entry(
+ 		LOCAL_ENTRY
+ 		__field(u8, radio_id)
+ 		__field(u32, value)
++		__field(int, link_id)
+ 	),
+ 
+ 	TP_fast_assign(
+ 		LOCAL_ASSIGN;
+ 		__entry->radio_id = radio_id;
+ 		__entry->value = value;
++		__entry->link_id = link_id;
+ 	),
+ 
+ 	TP_printk(
+-		LOCAL_PR_FMT " value:%d",
+-		LOCAL_PR_ARG, __entry->value
++		LOCAL_PR_FMT " value:%d link_id:%d",
++		LOCAL_PR_ARG, __entry->value, __entry->link_id
+ 	)
+ );
+ 
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -1895,10 +1895,11 @@ int ieee80211_reconfig(struct ieee80211_
+ 	if (hw->wiphy->n_radio)
+ 		for (i = 0; i < hw->wiphy->n_radio; i++)
+ 			drv_set_rts_threshold(local, i,
+-					      hw->wiphy->radio_cfg[i].rts_threshold);
++					      hw->wiphy->radio_cfg[i].rts_threshold,
++					      sdata, 0);
+ 	else
+ 		drv_set_rts_threshold(local, NL80211_WIPHY_RADIO_ID_MAX,
+-				      hw->wiphy->rts_threshold);
++				      hw->wiphy->rts_threshold, sdata, 0);
+ 
+ 	/* reset coverage class */
+ 	drv_set_coverage_class(local, hw->wiphy->coverage_class);
