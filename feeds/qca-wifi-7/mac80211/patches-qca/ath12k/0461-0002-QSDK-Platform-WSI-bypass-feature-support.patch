@@ -1,0 +1,1283 @@
+From 6bb52ac56e4f73f02860d62d3075d4693e3e7120 Mon Sep 17 00:00:00 2001
+From: Kannan Saravanan <kannsara@qti.qualcomm.com>
+Date: Wed, 23 Jul 2025 15:39:58 +0530
+Subject: [PATCH 2/6] QSDK: Platform: wifi:ath12k Add Base support for WSI
+ Bypass feature.
+
+This patch implements support for bypassing the WSI hardware link to
+enable power savings in multi-target systems.
+This feature allows selective deactivation of interfaces while maintaining
+multi-link operation through the WSI ring.
+
+Changes added:
+
+During target bypass,
+
+1. Send MLO teardown for all links, including UMAC reset with the
+   appropriate reason code.
+2. Issue a PDEV suspend command for the interface to be bypassed.
+3. Clean up all resources associated with the bypassed interface.
+4. Transition the PCIe interface of the chip into low-speed mode.
+5. Send a new QMI message containing updated adjacency information post-bypass.
+6. Reinitialize MLO setup and readiness on the remaining active chips.
+7. Achieve power savings by sending the PDEV suspend and Mode OFF sequence to
+   firmware. The firmware includes a recipe to shut down all Q6 hardware blocks
+   except the WSI block, ensuring the WSI ring remains operational for
+   multi-link continuity.
+
+During target readdition,
+
+1. Restore the PCIe link to its default speed.
+2. Power down and then power up the Q6 subsystem.
+3. Allow Q6 to follow the default initialization flow, including QMI setup
+   and subsequent sequences.
+4. Send updated adjacency information to firmware using the QMI
+   MLO reconfiguration message.
+
+Add appropriate checks to ensure the bypassed chip is correctly handled
+throughout the process.
+
+Patch-dependency:
+	0461-0001-QSDK-Platform-Add-support-for-MLO-reconfig-QMI-messa.patch
+
+Signed-off-by: Kannan Saravanan <kannsara@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/ahb.c        |   8 +-
+ drivers/net/wireless/ath/ath12k/ahb.h        |   1 +
+ drivers/net/wireless/ath/ath12k/core.c       | 401 ++++++++++++++++---
+ drivers/net/wireless/ath/ath12k/core.h       |  11 +
+ drivers/net/wireless/ath/ath12k/debugfs.c    |   4 +-
+ drivers/net/wireless/ath/ath12k/dp.c         |   2 +-
+ drivers/net/wireless/ath/ath12k/dp_rx.c      |   2 +-
+ drivers/net/wireless/ath/ath12k/mac.c        |  63 ++-
+ drivers/net/wireless/ath/ath12k/mac.h        |   6 +-
+ drivers/net/wireless/ath/ath12k/pci.c        |   6 +
+ drivers/net/wireless/ath/ath12k/pci.h        |   5 +
+ drivers/net/wireless/ath/ath12k/ppe.c        |   2 +-
+ drivers/net/wireless/ath/ath12k/qmi.c        |   9 +
+ drivers/net/wireless/ath/ath12k/umac_reset.c |   3 +-
+ drivers/net/wireless/ath/ath12k/wmi.c        |   9 +-
+ drivers/net/wireless/ath/ath12k/wmi.h        |   1 +
+ 16 files changed, 458 insertions(+), 75 deletions(-)
+
+
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -735,7 +735,7 @@ static void ath12k_ahb_ce_tasklet(struct
+ 	ath12k_ahb_ce_irq_enable(ce_pipe->ab, ce_pipe->pipe_num);
+ }
+ 
+-static int ath12k_ahb_config_irq(struct ath12k_base *ab)
++int ath12k_ahb_config_irq(struct ath12k_base *ab)
+ {
+ 	int irq, irq_idx, i;
+ 	int ret;
+@@ -1224,7 +1224,8 @@ static void ath12k_ahb_queue_all_userpd_
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		partner_ab = ag->ab[i];
+ 
+-		if (partner_ab->hif.bus == ATH12K_BUS_PCI)
++		if (partner_ab->is_bypassed ||
++		    partner_ab->hif.bus == ATH12K_BUS_PCI)
+ 			continue;
+ 
+ 		if (!(test_bit(ATH12K_GROUP_FLAG_UNREGISTER, &ab->ag->flags)))
+@@ -1243,7 +1244,8 @@ static int ath12k_ahb_release_all_userpd
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		partner_ab = ag->ab[i];
+ 
+-		if (!(partner_ab->hif.bus == ATH12K_BUS_AHB ||
++		if (partner_ab->is_bypassed ||
++		    !(partner_ab->hif.bus == ATH12K_BUS_AHB ||
+ 		      partner_ab->hif.bus == ATH12K_BUS_HYBRID))
+ 			continue;
+ 
+--- a/drivers/net/wireless/ath/ath12k/ahb.h
++++ b/drivers/net/wireless/ath/ath12k/ahb.h
+@@ -107,4 +107,5 @@ static inline struct ath12k_ahb *ath12k_
+ int ath12k_ahb_register_driver(const enum ath12k_device_family device_id,
+ 			       struct ath12k_ahb_driver *driver);
+ void ath12k_ahb_unregister_driver(const enum ath12k_device_family device_id);
++int ath12k_ahb_config_irq(struct ath12k_base *ab);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -11,6 +11,7 @@
+ #include <linux/firmware.h>
+ #include <linux/of.h>
+ #include <linux/of_graph.h>
++#include <linux/pci.h>
+ #ifdef CONFIG_IO_COHERENCY
+ #include <linux/tmelcom_ipc.h>
+ #endif
+@@ -25,6 +26,7 @@
+ #include "fw.h"
+ #include "hif.h"
+ #include "pci.h"
++#include "pcic.h"
+ #include "wow.h"
+ #include "dp_cmn.h"
+ #include "fse.h"
+@@ -1454,7 +1456,7 @@ static void ath12k_core_hw_group_stop(st
+ 
+ 	for (i = ag->num_devices - 1; i >= 0; i--) {
+ 		ab = ag->ab[i];
+-		if (!ab)
++		if (!ab || ab->is_bypassed)
+ 			continue;
+ 		mutex_lock(&ab->core_lock);
+ 		ath12k_core_pdev_deinit(ab);
+@@ -1470,7 +1472,7 @@ static void ath12k_core_hw_group_stop(st
+ 
+ 	for (i = ag->num_devices - 1; i >= 0; i--) {
+ 		ab = ag->ab[i];
+-		if (!ab)
++		if (!ab || ab->is_bypassed)
+ 			continue;
+ 
+ 		clear_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags);
+@@ -1551,6 +1553,8 @@ int ath12k_mac_mlo_ready(struct ath12k_h
+ 
+ 		for_each_ar(ah, ar, j) {
+ 			ar = &ah->radio[j];
++			if (!ar || ar->ab->is_bypassed)
++				continue;
+ 			ret = __ath12k_mac_mlo_ready(ar);
+ 			if (ret)
+ 				return ret;
+@@ -1572,7 +1576,8 @@ static int ath12k_core_mlo_setup(struct
+ 		return ret;
+ 
+ 	for (i = 0; i < ag->num_devices; i++)
+-		ath12k_dp_partner_cc_init(ag->ab[i]);
++		if (!ag->ab[i]->is_bypassed)
++			ath12k_dp_partner_cc_init(ag->ab[i]);
+ 
+ 	ret = ath12k_mac_mlo_ready(ag);
+ 	if (ret)
+@@ -1617,17 +1622,26 @@ static int ath12k_core_hw_group_start(st
+ 	if (ath12k_frame_mode == ATH12K_HW_TXRX_RAW)
+ 		set_bit(ATH12K_GROUP_FLAG_RAW_MODE, &ag->flags);
+ 
+-	ret = ath12k_mac_allocate(ag);
+-	if (WARN_ON(ret))
+-		return ret;
++	/* Skip mac allocate and register during WSI remap,
++	 * as the devices will be already registered to mac
++	 * and only driver add/delete will be done.
++	 */
++
++	if (!ag->wsi_remap_in_progress) {
++		ret = ath12k_mac_allocate(ag);
++		if (WARN_ON(ret))
++			return ret;
++	}
+ 
+ 	ret = ath12k_core_mlo_setup(ag);
+ 	if (WARN_ON(ret))
+ 		goto err_mac_destroy;
+ 
+-	ret = ath12k_mac_register(ag);
+-	if (WARN_ON(ret))
+-		goto err_mlo_teardown;
++	if (!ag->wsi_remap_in_progress) {
++		ret = ath12k_mac_register(ag);
++		if (WARN_ON(ret))
++			goto err_mlo_teardown;
++	}
+ 
+ 	set_bit(ATH12K_GROUP_FLAG_REGISTERED, &ag->flags);
+ 
+@@ -1636,7 +1650,15 @@ static int ath12k_core_hw_group_start(st
+ core_pdev_create:
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+-		if (!ab)
++		if (!ab || ab->is_bypassed)
++			continue;
++
++		/* Skip pdev creation if WSI remap in progress and chip is not
++		 * in bypass Add state, as the pdev for other chips will be
++		 * already present.
++		 */
++		if (ag->wsi_remap_in_progress &&
++		    ab->wsi_remap_state != ATH12K_WSI_BYPASS_ADD_DEVICE)
+ 			continue;
+ 
+ 		if (ath12k_check_erp_power_down(ag) && !ab->powerup_triggered)
+@@ -1750,7 +1772,10 @@ bool ath12k_core_hw_group_start_ready(st
+ {
+ 	lockdep_assert_held(&ag->mutex);
+ 
+-	return (ag->num_started == ag->num_devices);
++	/* If some device is in bypass state, consider num_bypassed counter
++	 * to check the hw group ready.
++	 */
++	return (ag->num_started == (ag->num_devices - ag->num_bypassed));
+ }
+ 
+ static void ath12k_fw_stats_pdevs_free(struct list_head *head)
+@@ -1806,6 +1831,20 @@ void ath12k_fw_stats_reset(struct ath12k
+ 	spin_unlock_bh(&ar->data_lock);
+ }
+ 
++static void ath12k_core_wsi_remap_mlo_reconfig(struct ath12k_hw_group *ag)
++{
++	int i;
++	struct ath12k_base *partner_ab;
++
++	for (i = 0; i < ag->num_devices; i++) {
++		partner_ab = ag->ab[i];
++		if (!partner_ab->is_bypassed) {
++			ath12k_dbg(partner_ab, ATH12K_DBG_WSI_BYPASS, "WSI Bypass: Trigger MLO reconfig");
++			ath12k_qmi_trigger_mlo_reconfig(partner_ab);
++		}
++	}
++}
++
+ int ath12k_core_qmi_firmware_ready(struct ath12k_base *ab)
+ {
+ 	struct ath12k_hw_group *ag = ath12k_ab_to_ag(ab);
+@@ -1858,17 +1897,44 @@ int ath12k_core_qmi_firmware_ready(struc
+ 	mutex_unlock(&ab->core_lock);
+ 
+ 	if (ath12k_core_hw_group_start_ready(ag)) {
+-		ret = ath12k_qmi_mlo_global_snapshot_mem_init(ab);
+-		if (ret) {
+-			ath12k_warn(ab, "failure in global mem init\n");
+-			goto err_core_stop;
++		if (!ag->wsi_remap_in_progress) {
++			ret = ath12k_qmi_mlo_global_snapshot_mem_init(ab);
++			if (ret) {
++				ath12k_warn(ab, "failure in global mem init\n");
++				goto err_core_stop;
++			}
++		}
++
++		/* When the WSI remap is in progress or when one of the device
++		 * is in bypassed state, other device which is restarting
++		 * should update the remapped MLO config during bootup.
++		 */
++		if (ag->wsi_remap_in_progress ||
++		    (ag->num_bypassed > 0 &&
++		     test_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags))) {
++			ath12k_core_wsi_remap_mlo_reconfig(ag);
+ 		}
++
+ 		ret = ath12k_core_hw_group_start(ag);
+ 		if (ret) {
+ 			ath12k_warn(ab, "unable to start hw group\n");
+ 			goto err_core_stop;
+ 		}
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT, "group %d started\n", ag->id);
++		if (ag->wsi_remap_in_progress) {
++			/* During bypass, device will restart from start.
++			 * But the ath12k reference will be already present.
++			 * Hence reset the flags here.
++			 */
++			for (i = 0; i < ab->num_radios; i++) {
++				ar = ab->pdevs[i].ar;
++				ar->pdev_suspend = false;
++			}
++
++			/* Reset the WSI flags */
++			ag->wsi_remap_in_progress = false;
++			ab->wsi_remap_state = 0;
++		}
+ 	}
+ 
+ 	mutex_unlock(&ag->mutex);
+@@ -1878,7 +1944,7 @@ int ath12k_core_qmi_firmware_ready(struc
+ err_core_stop:
+ 	for (i = ag->num_devices - 1; i >= 0; i--) {
+ 		ab = ag->ab[i];
+-		if (!ab)
++		if (!ab || ab->is_bypassed)
+ 			continue;
+ 
+ 		mutex_lock(&ab->core_lock);
+@@ -2074,6 +2140,9 @@ void ath12k_core_halt(struct ath12k *ar)
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_hw_group *ag = ab->ag;
+ 
++	if (ab->is_bypassed)
++		return;
++
+ 	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
+ 
+ 	/* Send low ack disassoc to hostapd to free the peers from host
+@@ -2160,6 +2229,8 @@ static void ath12k_core_pre_reconfigure_
+ 
+ 		for (j = 0; j < ah->num_radio; j++) {
+ 			ar = &ah->radio[j];
++			if (ar->ab->is_bypassed)
++				continue;
+ 
+ 			if(ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1 && !ar->ab->is_reset)
+ 				continue;
+@@ -2257,6 +2328,8 @@ static void ath12k_core_post_reconfigure
+ 
+ 			for (j = 0; j < ah->num_radio; j++) {
+ 				ar = &ah->radio[j];
++				if (ar->ab->is_bypassed)
++					continue;
+ 
+ 				if(ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1 && !ar->ab->is_reset)
+ 					continue;
+@@ -2611,7 +2684,7 @@ static void ath12k_core_mlo_recover_stat
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+ 
+-		if (ab == assert_ab)
++		if (ab->is_bypassed || ab == assert_ab)
+ 			continue;
+ 
+ 		for (j = 0; j < ab->num_radios; j++) {
+@@ -2932,6 +3005,9 @@ static void ath12k_core_peer_disassoc(st
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+ 
++		if (ab->is_bypassed)
++			continue;
++
+ 		spin_lock_bh(&ab->dp->dp_lock);
+ 		list_for_each_entry_safe(peer, tmp, &ab->dp->peers, list) {
+ 			if (!peer->sta || !peer->vif)
+@@ -2992,7 +3068,7 @@ int ath12k_mode1_recovery_reconfig(struc
+ 		pdev = &ab->pdevs[j];
+ 		ar = pdev->ar;
+ 
+-		if (!ar)
++		if (!ar || ar->ab->is_bypassed)
+ 			continue;
+ 
+ 		list_for_each_entry_safe_reverse(arvif, tmp, &ar->arvifs, list) {
+@@ -3021,7 +3097,7 @@ int ath12k_mode1_recovery_reconfig(struc
+ 		pdev = &ab->pdevs[j];
+ 		ar = pdev->ar;
+ 
+-		if (!ar)
++		if (!ar || ar->ab->is_bypassed)
+ 			continue;
+ 
+ 		list_for_each_entry_safe_reverse(arvif, tmp, &ar->arvifs, list) {
+@@ -3058,6 +3134,8 @@ int ath12k_mode1_recovery_reconfig(struc
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		partner_ab = ag->ab[i];
++		if (partner_ab->is_bypassed)
++			continue;
+ 		clear_bit(ATH12K_FLAG_UMAC_RECOVERY_START, &partner_ab->dev_flags);
+ 	}
+ 
+@@ -3066,7 +3144,7 @@ int ath12k_mode1_recovery_reconfig(struc
+ 		pdev = &ab->pdevs[j];
+ 		ar = pdev->ar;
+ 
+-		if (!ar)
++		if (!ar || ar->ab->is_bypassed)
+ 			continue;
+ 
+ 		list_for_each_entry_safe_reverse(arvif, tmp, &ar->arvifs, list) {
+@@ -3119,6 +3197,8 @@ skip_link_info:
+ 	/* sta state part */
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		partner_ab = ag->ab[i];
++		if (partner_ab->is_bypassed)
++			continue;
+ 
+ 		for (j = 0; j < partner_ab->num_radios; j++) {
+ 			pdev = &partner_ab->pdevs[j];
+@@ -3186,6 +3266,8 @@ skip_link_info:
+ static void ath12k_core_mode1_recovery_work(struct work_struct *work)
+ {
+ 	struct ath12k_base *ab = container_of(work, struct ath12k_base, recovery_work);
++	if (ab->is_bypassed)
++		return;
+ 
+ 	ath12k_info(ab, "queued recovery work\n");
+ 	ath12k_mode1_recovery_reconfig(ab);
+@@ -3223,6 +3305,9 @@ static void ath12k_core_update_userpd_st
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+ 
++		if (ab->is_bypassed)
++			continue;
++
+ 		if (!ab->fw_recovery_support) {
+ 			if (ab->hif.bus == ATH12K_BUS_PCI &&
+ 			    !test_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags)) {
+@@ -3286,7 +3371,8 @@ static void ath12k_core_upd_power_down(s
+  */
+ 
+ #define ATH12K_UMAC_RESET_TIMEOUT_IN_MS         1000
+-static int ath12k_core_trigger_umac_reset(struct ath12k_base *ab)
++static int ath12k_core_trigger_umac_reset(struct ath12k_base *ab,
++					  enum wmi_mlo_tear_down_reason_code_type reason_code)
+ {
+ 	struct ath12k_hw_group *ag = ab->ag;
+ 	long time_left;
+@@ -3294,7 +3380,7 @@ static int ath12k_core_trigger_umac_rese
+ 
+ 	reinit_completion(&ag->umac_reset_complete);
+ 
+-	ath12k_mac_mlo_teardown_with_umac_reset(ab);
++	ath12k_mac_mlo_teardown_with_umac_reset(ab, reason_code);
+ 
+ 	time_left = wait_for_completion_timeout(&ag->umac_reset_complete,
+ 			msecs_to_jiffies(ATH12K_UMAC_RESET_TIMEOUT_IN_MS));
+@@ -3322,7 +3408,7 @@ static void ath12k_core_trigger_partner_
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		partner_ab = ag->ab[i];
+-		if (ab == partner_ab)
++		if (partner_ab->is_bypassed || ab == partner_ab)
+ 			continue;
+ 
+ 		/* If the partner chip is either AHB/Hybrid
+@@ -3447,7 +3533,7 @@ static void ath12k_core_reset(struct wor
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		partner_ab = ag->ab[i];
+-		if (ab == partner_ab)
++		if (partner_ab->is_bypassed || ab == partner_ab)
+ 			continue;
+ 
+ 		/* Need to check partner_ab flag to select recovery mode
+@@ -3482,7 +3568,7 @@ static void ath12k_core_reset(struct wor
+ 	ath12k_core_to_group_ref_put(ab);
+ 
+ 	if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1) {
+-		if (ath12k_core_trigger_umac_reset(ab) ||
++		if (ath12k_core_trigger_umac_reset(ab, WMI_MLO_TEARDOWN_SSR_REASON) ||
+ 		    ath12k_mac_partner_peer_cleanup(ab)) {
+ 			/* Fallback to Mode0 if umac reset/peer_cleanup is
+ 			 * failed
+@@ -3558,8 +3644,9 @@ static void ath12k_core_reset(struct wor
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+-		if (!ab->is_reset &&
+-		    !ath12k_check_erp_power_down(ag))
++		if ((!ab->is_reset &&
++		    !ath12k_check_erp_power_down(ag)) ||
++		    ab->is_bypassed)
+ 			continue;
+ 
+ 		ath12k_qmi_free_resource(ab);
+@@ -3676,8 +3763,6 @@ static struct ath12k_hw_group *ath12k_co
+ 	return NULL;
+ }
+ 
+-#define ATH12K_BYPASSED_WSI_INDEX ATH12K_MAX_SOCS
+-
+ static bool
+ ath12k_core_check_is_bypassed(struct ath12k_hw_group *ag, struct device_node *connected_dev) {
+ 	int i;
+@@ -3686,7 +3771,7 @@ ath12k_core_check_is_bypassed(struct ath
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+ 
+-		if (ab->dev->of_node == connected_dev && ab->wsi_info.index == ATH12K_BYPASSED_WSI_INDEX)
++		if (ab->dev->of_node == connected_dev && ab->is_bypassed)
+ 			return true;
+ 	}
+ 
+@@ -3699,7 +3784,8 @@ and 1 to get left side neighbour (Connec
+ */
+ 
+ static struct device_node *
+-ath12k_get_connected_dev(struct ath12k_base *ab,int reg) {
++ath12k_get_connected_dev(struct ath12k_base *ab, int reg,
++			 bool include_bypassed_device) {
+ 
+ 	struct device_node *endpoint, *next_endpoint, *connected_dev;
+ 	struct device_node *ab_dev = ab->dev->of_node;
+@@ -3730,7 +3816,8 @@ ath12k_get_connected_dev(struct ath12k_b
+ 		of_node_put(next_endpoint);
+ 		of_node_put(connected_dev);
+ 
+-		if (!ath12k_core_check_is_bypassed(ab->ag, connected_dev))
++		if (!include_bypassed_device ||
++		    !ath12k_core_check_is_bypassed(ab->ag, connected_dev))
+ 			return connected_dev;
+ 
+ 	} while (connected_dev != ab_dev);
+@@ -3810,24 +3897,32 @@ static void ath12k_core_fill_adj_info(st
+ 	struct ath12k_hw_group *ag = ab->ag;
+ 	int num_adj_chips = 0, i = 0;
+ 	u8 adj_device_idx_bmp = 0;
++	struct ath12k_wsi_info *wsi_info, *adj_wsi_info;
++	struct ath12k_base *partner_ab;
++	bool is_bypassed = ag->num_bypassed ? true : false;
++
++	wsi_info = ath12k_core_get_current_wsi_info(ab);
++
++	tx_neighbour = ath12k_get_connected_dev(ab, 0, is_bypassed);
+ 
+-	tx_neighbour = ath12k_get_connected_dev(ab, 0);
+ 	if (!tx_neighbour) {
+ 		of_node_put(ab_dev);
+ 		return;
+ 	}
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+-		if (tx_neighbour == ag->ab[i]->dev->of_node) {
+-			ab->wsi_info.adj_chip_idxs[num_adj_chips] = ag->ab[i]->wsi_info.index;
+-			adj_device_idx_bmp |= BIT(ab->wsi_info.adj_chip_idxs[num_adj_chips]);
++		partner_ab = ag->ab[i];
++		adj_wsi_info = ath12k_core_get_current_wsi_info(partner_ab);
++		if (tx_neighbour == partner_ab->dev->of_node) {
++			wsi_info->adj_chip_idxs[num_adj_chips] = adj_wsi_info->index;
++			adj_device_idx_bmp |= BIT(wsi_info->adj_chip_idxs[num_adj_chips]);
+ 			break;
+ 		}
+ 	}
+ 
+ 	num_adj_chips++;
+ 
+-	rx_neighbour = ath12k_get_connected_dev(ab, 1);
++	rx_neighbour = ath12k_get_connected_dev(ab, 1, is_bypassed);
+ 	if (!rx_neighbour) {
+ 		of_node_put(ab_dev);
+ 		return;
+@@ -3836,25 +3931,32 @@ static void ath12k_core_fill_adj_info(st
+ 	if (tx_neighbour != rx_neighbour) {
+ 
+ 		for (i = 0; i < ag->num_devices; i++) {
+-			if (rx_neighbour == ag->ab[i]->dev->of_node) {
+-				ab->wsi_info.adj_chip_idxs[num_adj_chips] = ag->ab[i]->wsi_info.index;
+-				adj_device_idx_bmp |= BIT(ab->wsi_info.adj_chip_idxs[num_adj_chips]);
++			partner_ab = ag->ab[i];
++			adj_wsi_info = ath12k_core_get_current_wsi_info(partner_ab);
++			if (rx_neighbour == partner_ab->dev->of_node) {
++				wsi_info->adj_chip_idxs[num_adj_chips] = adj_wsi_info->index;
++				adj_device_idx_bmp |= BIT(wsi_info->adj_chip_idxs[num_adj_chips]);
+ 				break;
+ 			}
+ 		}
+ 		num_adj_chips++;
+ 	}
+ 
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "Adj chip info:\n");
++	ath12k_dbg(ab, ATH12K_DBG_QMI, "num_adj_chips: %d\n", num_adj_chips);
++	for (i = 0; i < num_adj_chips; i++)
++		ath12k_dbg(ab, ATH12K_DBG_QMI, "[%d] : %d", i, ab->wsi_info.adj_chip_idxs[i]);
++
+ 	of_node_put(tx_neighbour);
+ 	of_node_put(rx_neighbour);
+ 	of_node_put(ab_dev);
+ 
+-	ab->wsi_info.num_adj_chips = num_adj_chips;
++	wsi_info->num_adj_chips = num_adj_chips;
+ 	for (i = 0; i < ag->num_devices && adj_device_idx_bmp; i++) {
+ 		if ((adj_device_idx_bmp & BIT(i)) ||
+-		    (i == ab->wsi_info.index))
++		    (i == wsi_info->index))
+ 			continue;
+-		ab->wsi_info.diag_device_idx_bmap |= BIT(i);
++		wsi_info->diag_device_idx_bmap |= BIT(i);
+  	}
+ }
+ 
+@@ -3885,6 +3987,8 @@ static int ath12k_core_get_wsi_index(str
+ 
+ 	ab->wsi_info.index = (ag->num_devices + node_index - wsi_controller_index) %
+ 		ag->num_devices;
++	ab->bypass_wsi_info.index = (ag->num_devices + node_index - wsi_controller_index) %
++		ag->num_devices;
+ 
+ 	return 0;
+ }
+@@ -3980,6 +4084,206 @@ exit:
+ 	return ag;
+ }
+ 
++static void ath12k_update_mlo_adj_chip(struct ath12k_hw_group *ag)
++{
++	int i;
++	struct ath12k_base *partner_ab;
++
++	for (i = 0; i < ag->num_devices; i++) {
++		partner_ab = ag->ab[i];
++		if (!partner_ab || partner_ab->is_bypassed)
++			continue;
++
++		mutex_lock(&partner_ab->core_lock);
++		ath12k_core_fill_adj_info(partner_ab);
++
++		mutex_unlock(&partner_ab->core_lock);
++	}
++}
++
++void ath12k_core_pci_link_speed(struct ath12k_base *ab, u16 link_speed,
++				u16 link_width)
++{
++	struct ath12k_pci *ab_pci;
++	struct pci_dev *root_port;
++
++	if (ab->hif.bus != ATH12K_BUS_PCI)
++		return;
++
++	ab_pci = ath12k_pci_priv(ab);
++	if (!ab_pci) {
++		ath12k_err(ab, "Error in getting the pci_priv\n");
++		return;
++	}
++
++	if (link_speed > ab_pci->def_link_speed)
++		link_speed = ab_pci->def_link_speed;
++
++	if (link_width > ab_pci->def_link_width)
++		link_width = ab_pci->def_link_width;
++
++	root_port = pcie_find_root_port(ab_pci->pdev);
++
++	if (!root_port) {
++		ath12k_err(ab, "Error in getting the root port\n");
++		return;
++	}
++
++	ath12k_info(ab, "Link speed is %d and width is %d\n", link_speed, link_width);
++
++	if (pcie_set_link_speed(root_port, link_speed))
++		ath12k_err(ab, "Failed to set the link speed\n");
++
++	if (pcie_set_link_width(root_port, link_width))
++		ath12k_err(ab, "Failed to set the link width\n");
++}
++
++static int ath12k_core_wsi_remap_pdev_suspend(struct ath12k_base *ab)
++{
++	int i, ret = 0;
++	struct ath12k *ar;
++
++	for (i = 0; i < ab->num_radios; i++) {
++		ar = ab->pdevs[i].ar;
++		if (!ar) {
++			ath12k_err(ab, "Invalid Radio\n");
++			return -EINVAL;
++		}
++		ath12k_dbg(ab, ATH12K_DBG_WSI_BYPASS, "WSI Bypass: PDEV suspend");
++		ret = ath12k_mac_pdev_suspend(ar);
++		if (ret) {
++			ath12k_err(ab, "PDEV suspend failed for wsi remap: %d\n", ret);
++			goto fail;
++		}
++	}
++
++fail:
++	return ret;
++}
++
++static void ath12k_core_wsi_remap_reset(struct ath12k_base *ab)
++{
++	mutex_lock(&ab->core_lock);
++	ath12k_core_pdev_deinit(ab);
++	ath12k_dp_pdev_free(ab);
++	ath12k_ce_cleanup_pipes(ab);
++	ath12k_wmi_detach(ab);
++	ath12k_dp_rx_pdev_reo_cleanup(ab);
++	mutex_unlock(&ab->core_lock);
++
++	ath12k_dp_cmn_device_deinit(ab->dp);
++	ath12k_hal_srng_deinit(ab);
++	ath12k_dp_umac_reset_deinit(ab);
++	ath12k_umac_reset_completion(ab);
++
++	if (ab->hif.bus == ATH12K_BUS_PCI)
++		ath12k_pcic_free_irq(ab);
++	else if (ab->hif.bus == ATH12K_BUS_HYBRID)
++		ath12k_pcic_free_hybrid_irq(ab);
++}
++
++int ath12k_core_dynamic_wsi_remap(struct ath12k_base *ab)
++{
++	int ret = 0;
++	struct ath12k_hw_group *ag;
++
++	ag = ab->ag;
++
++	ag->wsi_remap_in_progress = true;
++
++	ath12k_dbg(ab, ATH12K_DBG_WSI_BYPASS, "WSI Bypass: MLO teardown with Umac reset");
++	ath12k_core_trigger_umac_reset(ab, WMI_MLO_TEARDOWN_REASON_DYNAMIC_WSI_REMAP);
++
++	if (ab->wsi_remap_state == ATH12K_WSI_BYPASS_REMOVE_DEVICE) {
++		/* Send WMI_PDEV_SUSPEND for the chip which is bypassed */
++		ret = ath12k_core_wsi_remap_pdev_suspend(ab);
++		if (ret) {
++			ath12k_err(ab, "pdev suspend failed with error %d", ret);
++			goto fail;
++		}
++
++		ab->is_bypassed = true;
++
++		ath12k_dbg(ab, ATH12K_DBG_WSI_BYPASS, "WSI Bypass: Send Mode OFF for Q6");
++		ath12k_qmi_firmware_stop(ab);
++		ath12k_qmi_free_resource(ab);
++
++		/* Clean up the states for bypassed chip */
++		ath12k_core_wsi_remap_reset(ab);
++
++		/* Update the counters in the hw group */
++		ag->num_bypassed++;
++		ath12k_core_to_group_ref_put(ab);
++		ath12k_dbg(ab, ATH12K_DBG_WSI_BYPASS,
++			   "WSI Bypass: num_bypassed: %d num_started: %d",
++			   ag->num_bypassed, ag->num_started);
++
++		/* Update the new adj chip info */
++		ath12k_update_mlo_adj_chip(ag);
++
++		mutex_lock(&ag->mutex);
++		/* Trigger MLO reconfig QMI message to All active chips */
++		ath12k_core_wsi_remap_mlo_reconfig(ag);
++
++		/* Put PCIe link to low speed mode */
++		ath12k_dbg(ab, ATH12K_DBG_WSI_BYPASS, "WSI Bypass: Configure PCIe link to low speed");
++		ath12k_core_pci_link_speed(ab, 1, 1);
++
++		ath12k_dbg(ab, ATH12K_DBG_WSI_BYPASS, "WSI Bypass: Initiate MLO setup after bypass");
++		ath12k_core_mlo_setup(ag);
++		mutex_unlock(&ag->mutex);
++		/* Reset the flags */
++		ag->wsi_remap_in_progress = false;
++		ab->wsi_remap_state = 0;
++	} else if (ab->wsi_remap_state == ATH12K_WSI_BYPASS_ADD_DEVICE) {
++		ab->is_bypassed = false;
++		ag->num_bypassed--;
++
++		ath12k_hif_power_down(ab, false);
++		/* Reset the PCIe link speed */
++		ath12k_dbg(ab, ATH12K_DBG_WSI_BYPASS, "WSI Bypass: Reset PCIe link speed");
++		ath12k_core_pci_link_speed(ab, 3, 2);
++
++		/* Reconfigure the irqs for the readded chip */
++		if (ab->hif.bus == ATH12K_BUS_PCI) {
++			ret = ath12k_pcic_config_irq(ab);
++			if (ret) {
++				ath12k_err(ab, "failed to request irq: %d\n", ret);
++				goto fail;
++			}
++		} else {
++			ath12k_ahb_config_irq(ab);
++		}
++
++		/* Update the new adj chip info */
++		ath12k_update_mlo_adj_chip(ag);
++
++		/* Power on the Q6. After FW image load, FW will initiate
++		 * QMI sequence. After the normal bootup sequence, the
++		 * counter will be reset after WMI ready from the FW
++		 */
++		ret = ath12k_hal_srng_init(ab);
++		if (ret) {
++			ath12k_err(ab, "srng init failed %d\n", ret);
++			return ret;
++		}
++
++		ath12k_dbg(ab, ATH12K_DBG_WSI_BYPASS, "WSI Bypass: Power on Q6");
++		ret = ath12k_hif_power_up(ab);
++		if (ret) {
++			ath12k_err(ab, "failed to power up :%d\n", ret);
++			goto fail;
++		}
++
++		ath12k_dbg(ab, ATH12K_DBG_WSI_BYPASS,
++			   "WSI Bypass: num_bypassed %d num_started %d",
++			   ag->num_bypassed, ag->num_started);
++	}
++
++fail:
++	return ret;
++}
++
+ void ath12k_core_hw_group_unassign(struct ath12k_base *ab)
+ {
+ 	struct ath12k_hw_group *ag = ath12k_ab_to_ag(ab);
+@@ -4034,7 +4338,7 @@ static void ath12k_core_hw_group_destroy
+ 	mutex_lock(&ag->mutex);
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+-		if (!ab)
++		if (!ab || ab->is_bypassed)
+ 			continue;
+ 
+ 		mutex_lock(&ab->core_lock);
+@@ -4065,7 +4369,7 @@ static void ath12k_core_hw_group_cleanup
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+-		if (!ab)
++		if (!ab || ab->is_bypassed)
+ 			continue;
+ 
+ 		mutex_lock(&ab->core_lock);
+@@ -4085,7 +4389,7 @@ static int ath12k_core_hw_group_create(s
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+-		if (!ab)
++		if (!ab || ab->is_bypassed)
+ 			continue;
+ 
+ 		mutex_lock(&ab->core_lock);
+@@ -4135,7 +4439,7 @@ void ath12k_core_hw_group_set_mlo_capabl
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+-		if (!ab)
++		if (!ab || ab->is_bypassed)
+ 			continue;
+ 
+ 		/* even if 1 device's firmware feature indicates MLO
+@@ -4525,7 +4829,8 @@ void ath12k_core_issue_bug_on(struct ath
+         if (!ag->mlo_capable)
+                 BUG_ON(1);
+ 
+-        if (atomic_read(&ath12k_coredump_ram_info.num_chip) >= ab->ag->num_started)
++	if (atomic_read(&ath12k_coredump_ram_info.num_chip) >=
++			(ab->ag->num_started - ab->ag->num_bypassed))
+                 BUG_ON(1);
+         else
+                 goto out;
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -994,6 +994,12 @@ struct ath12k_chan_info {
+ 	u32 high_freq;
+ };
+ 
++enum ath12k_wsi_bypass_action {
++	ATH12K_WSI_BYPASS_DEFAULT,
++	ATH12K_WSI_BYPASS_REMOVE_DEVICE,
++	ATH12K_WSI_BYPASS_ADD_DEVICE,
++};
++
+ #define ATH12K_FLUSH_TIMEOUT (5 * HZ)
+ #define ATH12K_VDEV_DELETE_TIMEOUT_HZ (5 * HZ)
+ 
+@@ -1447,6 +1453,7 @@ struct ath12k_hw_group {
+ 	struct ath12k_qos_ctx qos;
+ 	struct ath12k_stats_work_context stats_work;
+ 	u8 num_bypassed;
++	bool wsi_remap_in_progress;
+ };
+ 
+ /* Holds WSI info specific to each device, excluding WSI group info */
+@@ -1751,6 +1758,8 @@ struct ath12k_base {
+ 	bool powerup_triggered;
+ 	struct completion power_up;
+ 	struct ath12k_wsi_info bypass_wsi_info;
++	bool is_bypassed;
++	enum ath12k_wsi_bypass_action wsi_remap_state;
+ 
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+@@ -2161,4 +2170,6 @@ u8 ath12k_core_get_ab_list_by_wiphy(cons
+ 				    u8 ab_list_size);
+ int ath12k_wifi_stats_reply_setup(struct ath12k_telemetry_command *cmd);
+ struct ath12k_wsi_info *ath12k_core_get_current_wsi_info(struct ath12k_base *ab);
++int ath12k_core_dynamic_wsi_remap(struct ath12k_base *ab);
++void ath12k_core_pci_link_speed(struct ath12k_base *ab, u16 link_speed, u16 link_width);
+ #endif /* _CORE_H_ */
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -5304,7 +5304,7 @@ static ssize_t ath12k_write_simulate_fw_
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		tmp_ab = ag->ab[i];
+-		if(!tmp_ab)
++		if (!tmp_ab || tmp_ab->is_bypassed)
+ 			continue;
+ 		if (test_bit(ATH12K_FLAG_RECOVERY, &tmp_ab->dev_flags)) {
+ 			ath12k_err(tmp_ab, "Already in recovery\n");
+@@ -5390,6 +5390,8 @@ void ath12k_send_fw_hang_cmd(struct ath1
+ 	if (ag->mlo_capable) {
+ 		for (i = 0; i < ag->num_devices; i++) {
+ 			ab = ag->ab[i];
++			if (ab->is_bypassed)
++				continue;
+ 			mutex_lock(&ab->core_lock);
+ 			ab->fw_recovery_support = value;
+ 			mutex_unlock(&ab->core_lock);
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -1790,7 +1790,7 @@ void ath12k_dp_partner_cc_init(struct at
+ 	int i;
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+-		if (ag->ab[i] == ab)
++		if (ag->ab[i]->is_bypassed || ag->ab[i] == ab)
+ 			continue;
+ 
+ 		ath12k_dp_cmem_init(ab, ag->ab[i]->dp, ATH12K_DP_RX_DESC);
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -1196,7 +1196,7 @@ int ath12k_hw_grp_dp_rx_invalidate_entry
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		struct ath12k_base *partner_ab = ag->ab[i];
+ 
+-		if (!partner_ab)
++		if (!partner_ab || partner_ab->is_bypassed)
+ 			continue;
+ 
+ 		/* Skip sending HTT command when recovery in progress */
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -1321,7 +1321,8 @@ int ath12k_mac_partner_peer_cleanup(stru
+ 	for (idx = 0; idx < ag->num_devices; idx++) {
+ 		partner_ab = ag->ab[idx];
+ 
+-		if (ab == partner_ab)
++		if (partner_ab->is_bypassed ||
++		    ab == partner_ab)
+ 			continue;
+ 
+ 		list_for_each_entry_safe(peer, tmp, &partner_ab->dp->peers, list) {
+@@ -7282,6 +7283,9 @@ static void ath12k_mac_scan_send_complet
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
++		if (ab->is_bypassed)
++			continue;
++
+ 		for (j = 0; j < ab->num_radios; j++) {
+ 			pdev = &ab->pdevs[j];
+ 			partner_ar = pdev->ar;
+@@ -14124,6 +14128,9 @@ int ath12k_mac_op_start(struct ieee80211
+ 		 * can be allowed
+ 		 */
+ 
++		if (ar->ab->is_bypassed)
++			continue;
++
+ 		if (ar->ab->ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE1 || ar->ab->is_reset) {
+ 			ret = ath12k_mac_start(ar);
+ 			if (ret) {
+@@ -14139,6 +14146,7 @@ int ath12k_mac_op_start(struct ieee80211
+ 				ar->pdev_suspend = false;
+ 			}
+ 		}
++		ar->pdev_suspend = false;
+ 	}
+ 
+ 	if (ath12k_check_erp_power_down(ag))
+@@ -15133,6 +15141,9 @@ static struct ath12k *ath12k_mac_assign_
+ 	}
+ 
+ 	if (arvif->ar) {
++		if (arvif->ar->ab->is_bypassed)
++			return arvif->ar;
++
+ 		/* This is not expected really */
+ 		if (!test_bit(ATH12K_FLAG_RECOVERY,&arvif->ar->ab->dev_flags) && !arvif->is_created) {
+ 			WARN_ON(1);
+@@ -17330,6 +17341,9 @@ ath12k_mac_assign_vif_chanctx_handle(str
+ 
+ 	ab = ar->ab;
+ 
++	if (ab->is_bypassed)
++		return 0;
++
+ 	ret = ath12k_ppeds_attach_link_vif(arvif, ahvif->dp_vif.ppe_vp_num,
+ 					   &arvif->ppe_vp_profile_idx, vif);
+ 	if (ret)
+@@ -17618,6 +17632,7 @@ static int ath12k_mac_get_link_idx_for_b
+ 	struct ath12k *ar1, *ar2;
+ 	int ret = -ENODATA;
+ 	u32 adj_device1, adj_device2;
++	struct ath12k_wsi_info *wsi_info, *adj_wsi_info;
+ 
+ 	ar1 = ah->radio;
+ 	ag = ar1->ab->ag;
+@@ -17636,13 +17651,15 @@ static int ath12k_mac_get_link_idx_for_b
+ 
+ 		if (BRIDGE_IN_RANGE(ar1)) {
+ 			ar2 = ar1;
++			wsi_info = ath12k_core_get_current_wsi_info(ar1->ab);
+ 			ar2++;
+-			adj_device1 = ar1->ab->wsi_info.adj_chip_idxs[0];
+-			adj_device2 = ar1->ab->wsi_info.adj_chip_idxs[1];
++			adj_device1 = wsi_info->adj_chip_idxs[0];
++			adj_device2 = wsi_info->adj_chip_idxs[1];
+ 			for (int j = 0; j < ah->num_radio - i; j++, ar2++) {
++				adj_wsi_info = ath12k_core_get_current_wsi_info(ar2->ab);
+ 				if (ar2 && BRIDGE_IN_RANGE(ar2) &&
+-				    (ar2->ab->wsi_info.index == adj_device1 ||
+-				     ar2->ab->wsi_info.index == adj_device2)) {
++				    (adj_wsi_info->index == adj_device1 ||
++				     adj_wsi_info->index == adj_device2)) {
+ 					*link_idx_bmp = BIT(ar1->hw_link_id) | BIT(ar2->hw_link_id);
+ 					ret = 0;
+ 					goto exit;
+@@ -17824,6 +17841,7 @@ static int ath12k_mac_create_and_start_b
+ 	struct ath12k_hw *ah = hw->priv;
+ 	struct ath12k *ar = ah->radio;
+ 	struct ath12k_hw_group *ag = ar->ab->ag;
++	struct ath12k_wsi_info *wsi_info;
+ 	struct ath12k_vif *ahvif = (void *)vif->drv_priv;
+ 	struct ieee80211_chanctx_conf *bridge_ctx = NULL;
+ 	struct ath12k_link_vif *arvif;
+@@ -17901,8 +17919,8 @@ static int ath12k_mac_create_and_start_b
+ 			arvif = ahvif->link[link_id];
+ 			if (!arvif->ar)
+ 				continue;
+-
+-			if (BIT(device_idx) & arvif->ar->ab->wsi_info.diag_device_idx_bmap) {
++			wsi_info = ath12k_core_get_current_wsi_info(arvif->ar->ab);
++			if (BIT(device_idx) & wsi_info->diag_device_idx_bmap) {
+ 				bridge_needed = true;
+ 				break;
+ 			}
+@@ -21261,7 +21279,7 @@ static void ath12k_mac_setup(struct ath1
+ 	INIT_WORK(&ar->ssr_erp_exit, ath12k_erp_ssr_exit);
+ }
+ 
+-static int __ath12k_mac_mlo_setup(struct ath12k *ar)
++int __ath12k_mac_mlo_setup(struct ath12k *ar)
+ {
+ 	u8 num_link = 0, partner_link_id[ATH12K_GROUP_MAX_RADIO] = {};
+ 	struct ath12k_base *partner_ab, *ab = ar->ab;
+@@ -21278,6 +21296,8 @@ static int __ath12k_mac_mlo_setup(struct
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		partner_ab = ag->ab[i];
++		if (partner_ab->is_bypassed)
++			continue;
+ 
+ 		if ((ab != partner_ab) && (max_ml_peers > partner_ab->max_ml_peer_supported))
+ 			max_ml_peers = min(max_ml_peers, partner_ab->max_ml_peer_supported);
+@@ -21328,7 +21348,8 @@ static int __ath12k_mac_mlo_setup(struct
+ 	return 0;
+ }
+ 
+-static int __ath12k_mac_mlo_teardown(struct ath12k *ar, bool umac_reset)
++static int __ath12k_mac_mlo_teardown(struct ath12k *ar, bool umac_reset,
++				     enum wmi_mlo_tear_down_reason_code_type reason_code)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+ 	int ret;
+@@ -21344,7 +21365,7 @@ static int __ath12k_mac_mlo_teardown(str
+ 		return 0;
+ 
+ 	ret = ath12k_wmi_mlo_teardown(ar, umac_reset,
+-				      WMI_MLO_TEARDOWN_SSR_REASON, false);
++				      reason_code, false);
+ 	if (ret) {
+ 		ath12k_warn(ab, "failed to send MLO teardown WMI command for pdev %d: %d\n",
+ 			    ar->pdev_idx, ret);
+@@ -21356,7 +21377,8 @@ static int __ath12k_mac_mlo_teardown(str
+ 	return 0;
+ }
+ 
+-int ath12k_mac_mlo_teardown_with_umac_reset(struct ath12k_base *ab)
++int ath12k_mac_mlo_teardown_with_umac_reset(struct ath12k_base *ab,
++					    enum wmi_mlo_tear_down_reason_code_type reason_code)
+ {
+ 	struct ath12k_hw_group *ag = ab->ag;
+ 	struct ath12k_hw* ah;
+@@ -21372,7 +21394,9 @@ int ath12k_mac_mlo_teardown_with_umac_re
+ 		for_each_ar(ah, ar, j) {
+ 			ar = &ah->radio[j];
+ 
+-			if (ar->ab == ab) {
++			if (ar->ab->is_bypassed ||
++			    (ar->ab == ab &&
++			     reason_code != WMI_MLO_TEARDOWN_REASON_DYNAMIC_WSI_REMAP)) {
+ 				/* No need to send teardown event for asserted
+ 				 * chip, as anyway there will be no completion
+ 				 * event from FW.
+@@ -21388,7 +21412,7 @@ int ath12k_mac_mlo_teardown_with_umac_re
+                                 ag->trigger_umac_reset = true;
+                         }
+ 
+-			ret = __ath12k_mac_mlo_teardown(ar, umac_reset);
++			ret = __ath12k_mac_mlo_teardown(ar, umac_reset, reason_code);
+ 			if (ret)
+ 				goto out;
+ 		}
+@@ -21412,6 +21436,9 @@ int ath12k_mac_mlo_setup(struct ath12k_h
+ 
+ 		for_each_ar(ah, ar, j) {
+ 			ar = &ah->radio[j];
++			if (!ar || ar->ab->is_bypassed)
++				continue;
++
+ 			ret = __ath12k_mac_mlo_setup(ar);
+ 			if (ret) {
+ 				ath12k_err(ar->ab, "failed to setup MLO: %d\n", ret);
+@@ -21433,7 +21460,8 @@ err_setup:
+ 			if (!ar)
+ 				continue;
+ 
+-			__ath12k_mac_mlo_teardown(ar, false);
++			__ath12k_mac_mlo_teardown(ar, false,
++						  WMI_MLO_TEARDOWN_REASON_HOST_INITIATED);
+ 		}
+ 	}
+ 
+@@ -21453,7 +21481,12 @@ void ath12k_mac_mlo_teardown(struct ath1
+ 
+ 		for_each_ar(ah, ar, j) {
+ 			ar = &ah->radio[j];
+-			ret = __ath12k_mac_mlo_teardown(ar, false);
++			if (ar->ab->is_bypassed) {
++				ath12k_info(ar->ab, "Chip is in bypassed state, skip mlo teardown");
++				continue;
++			}
++			ret = __ath12k_mac_mlo_teardown(ar, false,
++							WMI_MLO_TEARDOWN_REASON_HOST_INITIATED);
+ 			if (ret) {
+ 				ath12k_err(ar->ab, "failed to teardown MLO: %d\n", ret);
+ 				break;
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -245,12 +245,13 @@ int ath12k_mac_vif_set_keepalive(struct
+ u8 ath12k_mac_get_target_pdev_id(struct ath12k *ar);
+ int ath12k_mac_mlo_setup(struct ath12k_hw_group *ag);
+ int ath12k_mac_mlo_ready(struct ath12k_hw_group *ag);
+-void ath12k_mac_mlo_teardown(struct ath12k_hw_group *ag);
+ int ath12k_mac_vdev_stop(struct ath12k_link_vif *arvif);
++void ath12k_mac_mlo_teardown(struct ath12k_hw_group *ag);
+ void ath12k_mac_get_any_chanctx_conf_iter(struct ieee80211_hw *hw,
+ 					  struct ieee80211_chanctx_conf *conf,
+ 					  void *data);
+-int ath12k_mac_mlo_teardown_with_umac_reset(struct ath12k_base *ab);
++int ath12k_mac_mlo_teardown_with_umac_reset(struct ath12k_base *ab,
++					    enum wmi_mlo_tear_down_reason_code_type reason_code);
+ int ath12k_mac_partner_peer_cleanup(struct ath12k_base *ab);
+ u16 ath12k_mac_he_convert_tones_to_ru_tones(u16 tones);
+ enum nl80211_eht_ru_alloc ath12k_mac_eht_ru_tones_to_nl80211_eht_ru_alloc(u16 ru_tones);
+@@ -649,4 +650,5 @@ int ath12k_mac_reg_get_max_reg_eirp_from
+ 						   enum wmi_reg_6g_client_type client_type,
+ 						   bool is_client_needed,
+ 						   struct channel_power *chan_eirp_list);
++int __ath12k_mac_mlo_setup(struct ath12k *ar);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/pci.c
++++ b/drivers/net/wireless/ath/ath12k/pci.c
+@@ -1289,6 +1289,12 @@ static int ath12k_pci_probe(struct pci_d
+ 		ath12k_err(ab, "failed to init core: %d\n", ret);
+ 		goto err_free_dp;
+ 	}
++
++	ret = ath12k_pci_get_link_status(ab_pci->pdev, &ab_pci->def_link_speed,
++					 &ab_pci->def_link_width);
++	if (ret)
++		ath12k_err(ab, "failed to get PCIe link status %d\n", ret);
++
+ 	return 0;
+ 
+ err_free_dp:
+--- a/drivers/net/wireless/ath/ath12k/pci.h
++++ b/drivers/net/wireless/ath/ath12k/pci.h
+@@ -67,6 +67,9 @@
+ #define PCI_MHI_REGION_END	0x1E0EFFC
+ #define QRTR_PCI_DOMAIN_NR_MASK		GENMASK(7, 4)
+ #define QRTR_PCI_BUS_NUMBER_MASK	GENMASK(3, 0)
++#define PCI_EXP_LNKSTA_CLS     0x000f  /* Current Link Speed */
++#define PCI_EXP_LNKSTA_NLW     0x03f0  /* Negotiated Link Width */
++#define PCI_EXP_LNKSTA_NLW_SHIFT 4     /* start of NLW mask in link status */
+ 
+ struct ath12k_msi_user {
+ 	const char *name;
+@@ -126,6 +129,8 @@ struct ath12k_pci {
+ 	u32 qmi_instance;
+ 	const struct ath12k_pci_device_family_ops *device_ops;
+ 	const struct ath12k_reg_base *reg_base;
++	u16 def_link_speed;
++	u16 def_link_width;
+ };
+ 
+ struct ath12k_pci_driver {
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -1109,7 +1109,7 @@ int ath12k_ppeds_attach_link_vif(struct
+ 			iter_arvif = ahvif->link[link_idx];
+ 
+ 			if (!iter_arvif || iter_arvif == arvif ||
+-			    ab != iter_arvif->ar->ab)
++			    !iter_arvif->ar || ab != iter_arvif->ar->ab)
+ 				continue;
+ 
+ 			iter_arvif->splitphy_ds_bank_id = arvif->splitphy_ds_bank_id;
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -4216,6 +4216,9 @@ void ath12k_qmi_free_target_mem_chunk(st
+ 	for (i = 0, mlo_idx = 0; i < ab->qmi.mem_seg_count; i++) {
+ 
+ 		if (ab->qmi.target_mem[i].type == MLO_GLOBAL_MEM_REGION_TYPE) {
++			if (ab->is_bypassed)
++				continue;
++
+ 			ath12k_qmi_free_mlo_mem_chunk(ab,
+ 						      &ab->qmi.target_mem[i],
+ 						      mlo_idx++);
+@@ -5859,6 +5862,9 @@ static int ath12k_qmi_event_mlo_reconfig
+ 	struct ath12k_base *ab = qmi->ab;
+ 	int ret;
+ 
++	if (ab->is_bypassed)
++		return 0;
++
+ 	ret = ath12k_qmi_mlo_reconfig_send(ab);
+ 	if (ret < 0) {
+ 		ath12k_warn(ab, "failed to send qmi host cap for device id %d: %d\n",
+@@ -5896,6 +5902,9 @@ static bool ath12k_qmi_hw_group_host_cap
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+ 
++		if (ab->is_bypassed)
++			continue;
++
+ 		if (!(ab && ab->qmi.num_radios != U8_MAX))
+ 			return false;
+ 		if (!ab->mm_cal_support && ath12k_cold_boot_cal_needed(ab) ) {
+--- a/drivers/net/wireless/ath/ath12k/umac_reset.c
++++ b/drivers/net/wireless/ath/ath12k/umac_reset.c
+@@ -293,7 +293,8 @@ int ath12k_umac_reset_notify_target(stru
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		partner_ab = ag->ab[i];
+ 
+-		if (test_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags))
++		if (partner_ab->is_bypassed ||
++		    test_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags))
+ 			continue;
+ 
+ 		ath12k_umac_reset_send_htt(partner_ab, tx_event);
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -2009,6 +2009,11 @@ int ath12k_wmi_pdev_set_param(struct ath
+ 	if (!skb)
+ 		return -ENOMEM;
+ 
++	if (ar->ab->is_bypassed) {
++		ath12k_warn(ar->ab, "Chip is bypassed, skip Pdev set cmd");
++		return 0;
++	}
++
+ 	cmd = (struct wmi_pdev_set_param_cmd *)skb->data;
+ 	cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_PDEV_SET_PARAM_CMD,
+ 						 sizeof(*cmd));
+@@ -12452,8 +12457,8 @@ static void ath12k_wmi_event_teardown_co
+ 				complete_flag = false;
+ 		}
+ 	}
+-
+-        if (complete_flag && ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1)
++	if (complete_flag &&
++	    (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1 || ag->wsi_remap_in_progress))
+                 complete(&ag->umac_reset_complete);
+ 
+ }
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -7469,6 +7469,7 @@ enum wmi_mlo_tear_down_reason_code_type
+ 	WMI_MLO_TEARDOWN_SSR_REASON,
+ 	WMI_MLO_TEARDOWN_REASON_HOST_INITIATED,
+ 	WMI_MLO_TEARDOWN_REASON_STANDBY_DOWN,
++	WMI_MLO_TEARDOWN_REASON_DYNAMIC_WSI_REMAP = 3,
+ };
+ 
+ struct wmi_mlo_teardown_cmd {

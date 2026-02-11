@@ -1,0 +1,266 @@
+From dba3bbe0ddb3a27cdaf51a318ea2214bfccd50f4 Mon Sep 17 00:00:00 2001
+From: Balamurugan Ramar <quic_bramar@quicinc.com>
+Date: Thu, 10 Apr 2025 23:27:01 +0530
+Subject: [PATCH] mac80211: wifi Add support for link reconfigure removal
+
+This patchset adds mac80211 routine to support sending link removal command
+from userspace to offloaded driver which accepts reconfigure ML IE and the
+TBTT count for the link to be removed. Also, added mac80211 routine for
+sending TSF and current TBTT count received from diver during the
+following scenarios,
+
+  1) When first beacon with ML reconfigure IE is sent out in air, mac80211
+  will notify the userspace that link removal is started and it can proceed
+  with further action like BTM etc.,
+  2) When last beacon with ML reconfigure IE (i.e. with link removal tbtt
+  count as 0) is sent out in air, mac80211 will notify the userspace that
+  link removal is completed. After which, userspace shall initiate the
+  disassocitiation of the peer(s) connected and removal of the link
+  completely.
+
+New mac80211 ops "link_reconfig_remove" is introduced to initiate link
+removal procedure in driver with ML reconfiguration IE and TBTT count
+received from userspace.
+
+"ieee80211_update_link_reconfig_remove_status" API is exposed to driver to
+send STARTED or COMPLETED event to userspace based on the TBTT count
+received.
+
+Signed-off-by: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+Signed-off-by: Balamurugan Ramar <quic_bramar@quicinc.com>
+---
+ include/net/mac80211.h     | 25 +++++++++++++++++++++++++
+ net/mac80211/cfg.c         | 17 ++++++++++++++++-
+ net/mac80211/driver-ops.h  | 18 ++++++++++++++++++
+ net/mac80211/ieee80211_i.h |  4 ++++
+ net/mac80211/link.c        | 34 ++++++++++++++++++++++++++++++++++
+ net/mac80211/trace.h       | 30 ++++++++++++++++++++++++++++++
+ 6 files changed, 127 insertions(+), 1 deletion(-)
+
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index b0d6d9c..3013f84 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -4637,6 +4637,10 @@ struct ieee80211_ppe_vp_ds_params {
+  *      interface with the specified type would be added, and thus drivers that
+  *      implement this callback need to handle such cases. The type is the full
+  *      &enum nl80211_iftype.
++ * @link_reconfig_remove: Notifies the driver about the link to be
++ *	scheduled for removal with ML reconfigure element built for that particular
++ *	link along with the TBTT count until which the beacon with ML
++ *	reconfigure element should be sent.
+  */
+ struct ieee80211_ops {
+ 	void (*tx)(struct ieee80211_hw *hw,
+@@ -5031,6 +5035,9 @@ struct ieee80211_ops {
+ 	int (*sta_set_mgmt_rts_cts)(struct ieee80211_hw *hw,
+ 				    struct ieee80211_vif *vif,
+ 				    struct ieee80211_sta *sta);
++	int (*link_reconfig_remove)(struct ieee80211_hw *hw,
++				    struct ieee80211_vif *vif,
++				    const struct cfg80211_link_reconfig_removal_params *params);
+ };
+ 
+ /**
+@@ -8069,6 +8076,24 @@ int ieee80211_emulate_switch_vif_chanctx(struct ieee80211_hw *hw,
+ 					 int n_vifs,
+ 					 enum ieee80211_chanctx_switch_mode mode);
+ 
++/* Defines for ML Reconfigure removal offload */
++
++/**
++ * ieee80211_update_link_reconfig_remove_update - Inform userspace about
++ * the removal status of link which is scheduled for removal
++ * @vif: interface in which reconfig removal status is received.
++ * @link_id: Link which is undergoing removal
++ * @tbtt_count: Current tbtt_count to be updated.
++ * @tsf: Beacon's timestamp value
++ * @cmd: Inform started or completed action to userspace
++ *
++ * For description, check cfg80211_link_reconfig_remove_update
++ */
++int ieee80211_update_link_reconfig_remove_update(struct ieee80211_vif *vif,
++						 unsigned int link_id,
++						 u32 tbtt_count, u64 tsf,
++						 enum nl80211_commands cmd);
++
+ /* Defines for Mesh NSS offload */
+ 
+ enum ieee80211_mesh_path_offld_cmd {
+diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
+index 0560a6d..b8c88ab 100644
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -1817,7 +1817,6 @@ static int ieee80211_stop_ap(struct wiphy *wiphy, struct net_device *dev,
+ 
+ 	if (ieee80211_num_beaconing_links(sdata) <= 1) {
+ 		netif_carrier_off(dev);
+-		sdata->u.ap.active = false;
+ 	}
+ 
+ 	/* remove beacon and probe response */
+@@ -1833,6 +1832,10 @@ static int ieee80211_stop_ap(struct wiphy *wiphy, struct net_device *dev,
+ 	if (old_unsol_bcast_probe_resp)
+ 		kfree_rcu(old_unsol_bcast_probe_resp, rcu_head);
+ 
++	/* Reset active flag only for the last link */
++	if (!ieee80211_num_beaconing_links(sdata))
++		sdata->u.ap.active = false;
++
+ 	kfree(link_conf->ftmr_params);
+ 	link_conf->ftmr_params = NULL;
+ 
+@@ -5700,6 +5703,17 @@ static void ieee80211_del_intf_link(struct wiphy *wiphy,
+ 	ieee80211_vif_set_links(sdata, new_links, 0);
+ }
+ 
++static int
++ieee80211_link_reconfig_remove(struct wiphy *wiphy,
++			       struct net_device *dev,
++			       const struct cfg80211_link_reconfig_removal_params *params)
++{
++	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
++	struct ieee80211_local *local = wiphy_priv(wiphy);
++
++	return __ieee80211_link_reconfig_remove(local, sdata, params);
++}
++
+ static int
+ ieee80211_add_link_station(struct wiphy *wiphy, struct net_device *dev,
+ 			   struct link_station_parameters *params)
+@@ -5939,6 +5953,7 @@ const struct cfg80211_ops mac80211_config_ops = {
+ 	.add_link_station = ieee80211_add_link_station,
+ 	.mod_link_station = ieee80211_mod_link_station,
+ 	.del_link_station = ieee80211_del_link_station,
++	.link_reconfig_remove = ieee80211_link_reconfig_remove,
+ 	.set_hw_timestamp = ieee80211_set_hw_timestamp,
+ 	.set_ttlm = ieee80211_set_ttlm,
+ 	.get_radio_mask = ieee80211_get_radio_mask,
+diff --git a/net/mac80211/driver-ops.h b/net/mac80211/driver-ops.h
+index d13f567..2bc4660 100644
+--- a/net/mac80211/driver-ops.h
++++ b/net/mac80211/driver-ops.h
+@@ -1759,4 +1759,22 @@ void drv_config_mesh_offload_path(struct ieee80211_local *local,
+ 				  enum ieee80211_mesh_path_offld_cmd cmd,
+ 				  struct ieee80211_mesh_path_offld *path);
+ #endif /* CPTCFG_MAC80211_MESH */
++
++static inline int
++drv_link_reconfig_remove(struct ieee80211_local *local,
++			 struct ieee80211_sub_if_data *sdata,
++			 const struct cfg80211_link_reconfig_removal_params *params)
++{
++	int ret = -EOPNOTSUPP;
++
++	trace_drv_link_reconfig_remove(local, sdata, params);
++
++	if (local->ops->link_reconfig_remove)
++		ret = local->ops->link_reconfig_remove(&local->hw,
++						       &sdata->vif,
++						       params);
++	trace_drv_return_int(local, ret);
++
++	return ret;
++}
+ #endif /* __MAC80211_DRIVER_OPS */
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 8015152..49fdb90 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -2153,6 +2153,10 @@ static inline void ieee80211_vif_clear_links(struct ieee80211_sub_if_data *sdata
+ 
+ void ieee80211_apvlan_link_setup(struct ieee80211_sub_if_data *sdata);
+ 
++int __ieee80211_link_reconfig_remove(struct ieee80211_local *local,
++				     struct ieee80211_sub_if_data *sdata,
++				     const struct cfg80211_link_reconfig_removal_params *params);
++
+ /* tx handling */
+ void ieee80211_clear_tx_pending(struct ieee80211_local *local);
+ void ieee80211_tx_pending(struct tasklet_struct *t);
+diff --git a/net/mac80211/link.c b/net/mac80211/link.c
+index ffe62fa..4f79971 100644
+--- a/net/mac80211/link.c
++++ b/net/mac80211/link.c
+@@ -683,3 +683,37 @@ void ieee80211_set_active_links_async(struct ieee80211_vif *vif,
+ 	wiphy_work_queue(sdata->local->hw.wiphy, &sdata->activate_links_work);
+ }
+ EXPORT_SYMBOL_GPL(ieee80211_set_active_links_async);
++
++int __ieee80211_link_reconfig_remove(struct ieee80211_local *local,
++				     struct ieee80211_sub_if_data *sdata,
++				     const struct cfg80211_link_reconfig_removal_params *params)
++{
++	struct ieee80211_link_data *link;
++
++	if (!ieee80211_sdata_running(sdata))
++		return -ENETDOWN;
++
++	if (sdata->vif.type != NL80211_IFTYPE_AP)
++		return -EINVAL;
++
++	link = sdata_dereference(sdata->link[params->link_id], sdata);
++	if (!link)
++		return -ENOLINK;
++
++	return drv_link_reconfig_remove(local, sdata, params);
++}
++
++int ieee80211_update_link_reconfig_remove_update(struct ieee80211_vif *vif,
++						 unsigned int link_id,
++						 u32 tbtt_count, u64 tsf,
++						 enum nl80211_commands cmd)
++{
++	struct ieee80211_sub_if_data *sdata = vif_to_sdata(vif);
++
++	if (vif->type == NL80211_IFTYPE_AP)
++		return cfg80211_update_link_reconfig_remove_update(sdata->dev, link_id,
++								   tbtt_count, tsf,
++								   cmd);
++	return -EINVAL;
++}
++EXPORT_SYMBOL(ieee80211_update_link_reconfig_remove_update);
+diff --git a/net/mac80211/trace.h b/net/mac80211/trace.h
+index 2b23ee7..82ddb71 100644
+--- a/net/mac80211/trace.h
++++ b/net/mac80211/trace.h
+@@ -3377,6 +3377,36 @@ TRACE_EVENT(api_update_muedca_params,
+ 	)
+ );
+ 
++TRACE_EVENT(drv_link_reconfig_remove,
++	TP_PROTO(struct ieee80211_local *local,
++		 struct ieee80211_sub_if_data *sdata,
++		 const struct cfg80211_link_reconfig_removal_params *params),
++
++	TP_ARGS(local, sdata, params),
++
++	TP_STRUCT__entry(
++		LOCAL_ENTRY
++		VIF_ENTRY
++		__field(u32, link_id)
++		__field(u16, count)
++		__dynamic_array(u8, frame, params->elem_len)
++	),
++
++	TP_fast_assign(
++		LOCAL_ASSIGN;
++		VIF_ASSIGN;
++		__entry->link_id = params->link_id;
++		memcpy(__get_dynamic_array(frame), params->reconfigure_elem,
++		       params->elem_len);
++		__entry->count = params->link_removal_cntdown;
++	),
++
++	TP_printk(
++		LOCAL_PR_FMT ", " VIF_PR_FMT ", link_id :%u frame:0x%.2x count:%d",
++		LOCAL_PR_ARG, VIF_PR_ARG,
++		__entry->link_id, le16_to_cpup((__le16 *)__get_dynamic_array(frame)),
++		__entry->count)
++);
+ #endif /* !__MAC80211_DRIVER_TRACE || TRACE_HEADER_MULTI_READ */
+ 
+ #undef TRACE_INCLUDE_PATH
+-- 
+2.34.1
+

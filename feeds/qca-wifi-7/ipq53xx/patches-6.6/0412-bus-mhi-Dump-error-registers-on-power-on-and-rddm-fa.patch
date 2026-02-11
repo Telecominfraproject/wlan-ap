@@ -1,0 +1,202 @@
+From b24d09d94ba489925e546d4a80f962afd348279e Mon Sep 17 00:00:00 2001
+From: Vignesh Viswanathan <quic_viswanat@quicinc.com>
+Date: Thu, 30 Nov 2023 15:13:54 +0530
+Subject: [PATCH 406/500] bus: mhi: Dump error registers on power on and rddm
+ failures
+
+Dump ERRCODE and ERRDBG registers on power on, BHI, BHIe and RDDM
+download failures.
+
+Also expose the dumping of ERRCODE and ERRDBG registers as an API for
+use by drivers.
+
+Change-Id: If0bbe789c952958a7b8c38cd9d653c217fbb47b2
+Signed-off-by: Vignesh Viswanathan <quic_viswanat@quicinc.com>
+---
+ drivers/bus/mhi/host/boot.c     | 54 ++++++++++++++++++---------------
+ drivers/bus/mhi/host/internal.h |  1 +
+ drivers/bus/mhi/host/main.c     | 25 +++++++++++++++
+ drivers/bus/mhi/host/pm.c       |  4 ++-
+ include/linux/mhi.h             |  5 +++
+ 5 files changed, 64 insertions(+), 25 deletions(-)
+
+diff --git a/drivers/bus/mhi/host/boot.c b/drivers/bus/mhi/host/boot.c
+index ebbaab9adf2e..344317de94be 100644
+--- a/drivers/bus/mhi/host/boot.c
++++ b/drivers/bus/mhi/host/boot.c
+@@ -173,7 +173,7 @@ static int __mhi_download_rddm_in_panic(struct mhi_controller *mhi_cntrl)
+ error_exit_rddm:
+ 	dev_err(dev, "RDDM transfer failed. Current EE: %s\n",
+ 		TO_MHI_EXEC_STR(ee));
+-
++	mhi_dump_errdbg_reg(mhi_cntrl);
+ 	return -EIO;
+ }
+ 
+@@ -182,6 +182,7 @@ int mhi_download_rddm_image(struct mhi_controller *mhi_cntrl, bool in_panic)
+ {
+ 	void __iomem *base = mhi_cntrl->bhie;
+ 	struct device *dev = &mhi_cntrl->mhi_dev->dev;
++	rwlock_t *pm_lock = &mhi_cntrl->pm_lock;
+ 	struct mhi_buf *mhi_buf = NULL;
+ 	u32 rx_status;
+ 	int ret;
+@@ -231,6 +232,15 @@ int mhi_download_rddm_image(struct mhi_controller *mhi_cntrl, bool in_panic)
+ 		dma_unmap_single(mhi_cntrl->cntrl_dev, mhi_buf->dma_addr,
+ 				 mhi_buf->len, DMA_TO_DEVICE);
+ 
++	if (ret) {
++		dev_err(dev, "RDDM transfer failed. RXVEC_STATUS: 0x%x\n",
++			rx_status);
++		read_lock_bh(pm_lock);
++		if (MHI_REG_ACCESS_VALID(mhi_cntrl->pm_state))
++			mhi_dump_errdbg_reg(mhi_cntrl);
++		read_unlock_bh(pm_lock);
++	}
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(mhi_download_rddm_image);
+@@ -277,8 +287,22 @@ static int mhi_fw_load_bhie(struct mhi_controller *mhi_cntrl,
+ 						   &tx_status) || tx_status,
+ 				 msecs_to_jiffies(mhi_cntrl->timeout_ms));
+ 	if (MHI_PM_IN_ERROR_STATE(mhi_cntrl->pm_state) ||
+-	    tx_status != BHIE_TXVECSTATUS_STATUS_XFER_COMPL)
++	    tx_status != BHIE_TXVECSTATUS_STATUS_XFER_COMPL) {
++		dev_err(dev, "Upper:0x%x Lower:0x%x len:0x%zx sequence:%u\n",
++			upper_32_bits(mhi_buf->dma_addr),
++			lower_32_bits(mhi_buf->dma_addr),
++			mhi_buf->len, sequence_id);
++
++		dev_err(dev, "MHI pm_state: %s tx_status: %d ee: %s\n",
++			to_mhi_pm_state_str(mhi_cntrl->pm_state), tx_status,
++			TO_MHI_EXEC_STR(mhi_get_exec_env(mhi_cntrl)));
++
++		read_lock_bh(pm_lock);
++		if (MHI_REG_ACCESS_VALID(mhi_cntrl->pm_state))
++			mhi_dump_errdbg_reg(mhi_cntrl);
++		read_unlock_bh(pm_lock);
+ 		return -EIO;
++	}
+ 
+ 	return (!ret) ? -ETIMEDOUT : 0;
+ }
+@@ -287,21 +311,11 @@ static int mhi_fw_load_bhi(struct mhi_controller *mhi_cntrl,
+ 			   dma_addr_t dma_addr,
+ 			   size_t size)
+ {
+-	u32 tx_status, val, session_id;
+-	int i, ret;
++	u32 tx_status, session_id;
++	int ret;
+ 	void __iomem *base = mhi_cntrl->bhi;
+ 	rwlock_t *pm_lock = &mhi_cntrl->pm_lock;
+ 	struct device *dev = &mhi_cntrl->mhi_dev->dev;
+-	struct {
+-		char *name;
+-		u32 offset;
+-	} error_reg[] = {
+-		{ "ERROR_CODE", BHI_ERRCODE },
+-		{ "ERROR_DBG1", BHI_ERRDBG1 },
+-		{ "ERROR_DBG2", BHI_ERRDBG2 },
+-		{ "ERROR_DBG3", BHI_ERRDBG3 },
+-		{ NULL },
+-	};
+ 
+ 	read_lock_bh(pm_lock);
+ 	if (!MHI_REG_ACCESS_VALID(mhi_cntrl->pm_state)) {
+@@ -333,16 +347,8 @@ static int mhi_fw_load_bhi(struct mhi_controller *mhi_cntrl,
+ 	if (tx_status == BHI_STATUS_ERROR) {
+ 		dev_err(dev, "Image transfer failed\n");
+ 		read_lock_bh(pm_lock);
+-		if (MHI_REG_ACCESS_VALID(mhi_cntrl->pm_state)) {
+-			for (i = 0; error_reg[i].name; i++) {
+-				ret = mhi_read_reg(mhi_cntrl, base,
+-						   error_reg[i].offset, &val);
+-				if (ret)
+-					break;
+-				dev_err(dev, "Reg: %s value: 0x%x\n",
+-					error_reg[i].name, val);
+-			}
+-		}
++		if (MHI_REG_ACCESS_VALID(mhi_cntrl->pm_state))
++			mhi_dump_errdbg_reg(mhi_cntrl);
+ 		read_unlock_bh(pm_lock);
+ 		goto invalid_pm_state;
+ 	}
+diff --git a/drivers/bus/mhi/host/internal.h b/drivers/bus/mhi/host/internal.h
+index 675d83b15d29..a2047c7e19ab 100644
+--- a/drivers/bus/mhi/host/internal.h
++++ b/drivers/bus/mhi/host/internal.h
+@@ -443,4 +443,5 @@ void mhi_unmap_single_no_bb(struct mhi_controller *mhi_cntrl,
+ void mhi_unmap_single_use_bb(struct mhi_controller *mhi_cntrl,
+ 			     struct mhi_buf_info *buf_info);
+ 
++void mhi_dump_errdbg_reg(struct mhi_controller *mhi_cntrl);
+ #endif /* _MHI_INT_H */
+diff --git a/drivers/bus/mhi/host/main.c b/drivers/bus/mhi/host/main.c
+index a6d7c29025dc..a2956177e844 100644
+--- a/drivers/bus/mhi/host/main.c
++++ b/drivers/bus/mhi/host/main.c
+@@ -1682,3 +1682,28 @@ void mhi_unprepare_from_transfer(struct mhi_device *mhi_dev)
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(mhi_unprepare_from_transfer);
++
++void mhi_dump_errdbg_reg(struct mhi_controller *mhi_cntrl)
++{
++	struct device *dev = &mhi_cntrl->mhi_dev->dev;
++	u32 val, i;
++	struct {
++		char *name;
++		u32 offset;
++	} error_reg[] = {
++		{ "ERROR_CODE", BHI_ERRCODE },
++		{ "ERROR_DBG1", BHI_ERRDBG1 },
++		{ "ERROR_DBG2", BHI_ERRDBG2 },
++		{ "ERROR_DBG3", BHI_ERRDBG3 },
++		{ NULL },
++	};
++
++	for (i = 0; error_reg[i].name; i++) {
++		if (mhi_read_reg(mhi_cntrl, mhi_cntrl->bhi,
++				 error_reg[i].offset, &val))
++			break;
++
++		dev_err(dev, "reg:%s value:0x%x\n", error_reg[i].name, val);
++	}
++}
++EXPORT_SYMBOL_GPL(mhi_dump_errdbg_reg);
+diff --git a/drivers/bus/mhi/host/pm.c b/drivers/bus/mhi/host/pm.c
+index 5893bb4d1d49..302d98d9ec5c 100644
+--- a/drivers/bus/mhi/host/pm.c
++++ b/drivers/bus/mhi/host/pm.c
+@@ -1223,8 +1223,10 @@ int mhi_sync_power_up(struct mhi_controller *mhi_cntrl)
+ 			   msecs_to_jiffies(mhi_cntrl->timeout_ms));
+ 
+ 	ret = (MHI_IN_MISSION_MODE(mhi_cntrl->ee)) ? 0 : -ETIMEDOUT;
+-	if (ret)
++	if (ret) {
++		mhi_dump_errdbg_reg(mhi_cntrl);
+ 		mhi_power_down(mhi_cntrl, false);
++	}
+ 
+ 	return ret;
+ }
+diff --git a/include/linux/mhi.h b/include/linux/mhi.h
+index f5a466a72043..aea6378f4438 100644
+--- a/include/linux/mhi.h
++++ b/include/linux/mhi.h
+@@ -822,4 +822,9 @@ int mhi_queue_skb(struct mhi_device *mhi_dev, enum dma_data_direction dir,
+  */
+ bool mhi_queue_is_full(struct mhi_device *mhi_dev, enum dma_data_direction dir);
+ 
++/**
++ * mhi_dump_errdbg_reg - Dump error debug registers
++ * @mhi_cntrl: MHI controller
++ */
++void mhi_dump_errdbg_reg(struct mhi_controller *mhi_cntrl);
+ #endif /* _MHI_H_ */
+-- 
+2.34.1
+

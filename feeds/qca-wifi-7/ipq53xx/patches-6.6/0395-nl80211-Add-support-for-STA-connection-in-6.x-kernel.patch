@@ -1,0 +1,196 @@
+From 78c79cddb85484507fcafc4fd637c205773bbf56 Mon Sep 17 00:00:00 2001
+From: Shwetha G K <quic_kshwetha@quicinc.com>
+Date: Tue, 26 Dec 2023 18:34:40 +0530
+Subject: [PATCH 357/500] nl80211: Add support for STA connection in 6.x kernel
+
+Add changes to support MLD STA connection in 6.x kernel.
+
+Change-Id: I6d3089607b42d9737fd9b3a4cf01da400ba52cb4
+Signed-off-by: Shwetha G K <quic_kshwetha@quicinc.com>
+---
+ include/net/cfg80211.h |  12 +++++
+ net/wireless/nl80211.c | 110 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 122 insertions(+)
+
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index 17d3f37b60da..22f99feb8684 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -2893,6 +2893,8 @@ struct cfg80211_auth_request {
+  * struct cfg80211_assoc_link - per-link information for MLO association
+  * @bss: the BSS pointer, see also &struct cfg80211_assoc_request::bss;
+  *	if this is %NULL for a link, that link is not requested
++ * @bssid: AP BSSID
++ * @freq: frequency of the link
+  * @elems: extra elements for the per-STA profile for this link
+  * @elems_len: length of the elements
+  * @disabled: If set this link should be included during association etc. but it
+@@ -2900,6 +2902,8 @@ struct cfg80211_auth_request {
+  */
+ struct cfg80211_assoc_link {
+ 	struct cfg80211_bss *bss;
++	const u8 *bssid;
++	unsigned int freq;
+ 	const u8 *elems;
+ 	size_t elems_len;
+ 	bool disabled;
+@@ -3167,6 +3171,11 @@ struct cfg80211_bss_selection {
+  * @edmg: define the EDMG channels.
+  *	This may specify multiple channels and bonding options for the driver
+  *	to choose from, based on BSS configuration.
++ * @links: per-link information for MLO connections
++ * @link_id: >= 0 for MLO connections, where links are given, and indicates
++ *	the link on which the connection is being done
++ * @ap_mld_addr: AP MLD address in case of MLO association request,
++ *	valid iff @link_id >= 0
+  */
+ struct cfg80211_connect_params {
+ 	struct ieee80211_channel *channel;
+@@ -3201,6 +3210,9 @@ struct cfg80211_connect_params {
+ 	size_t fils_erp_rrk_len;
+ 	bool want_1x;
+ 	struct ieee80211_edmg edmg;
++	struct cfg80211_assoc_link links[IEEE80211_MLD_MAX_NUM_LINKS];
++	const u8 *ap_mld_addr;
++	s8 link_id;
+ };
+ 
+ /**
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index 740d3822b149..863a1aef8640 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -11839,6 +11839,13 @@ static int nl80211_connect(struct sk_buff *skb, struct genl_info *info)
+ 	struct cfg80211_cached_keys *connkeys = NULL;
+ 	u32 freq = 0;
+ 	int err;
++	struct nlattr **attrs = NULL;
++	unsigned int attrsize;
++	struct nlattr *link;
++	int rem = 0;
++	const u8 *ap_addr, *ssid;
++	unsigned int link_id;
++	int ssid_len;
+ 
+ 	memset(&connect, 0, sizeof(connect));
+ 
+@@ -12058,6 +12065,105 @@ static int nl80211_connect(struct sk_buff *skb, struct genl_info *info)
+ 
+ 	if (nla_get_flag(info->attrs[NL80211_ATTR_MLO_SUPPORT]))
+ 		connect.flags |= CONNECT_REQ_MLO_SUPPORT;
++	connect.link_id = nl80211_link_id_or_invalid(info->attrs);
++
++	if (info->attrs[NL80211_ATTR_MLO_LINKS]) {
++		attrsize = NUM_NL80211_ATTR * sizeof(*attrs);
++		if (connect.link_id < 0)
++			return -EINVAL;
++
++		if (!(rdev->wiphy.flags & WIPHY_FLAG_SUPPORTS_MLO))
++			return -EINVAL;
++
++		if (info->attrs[NL80211_ATTR_MAC] ||
++				info->attrs[NL80211_ATTR_WIPHY_FREQ] ||
++				!info->attrs[NL80211_ATTR_MLD_ADDR])
++			return -EINVAL;
++
++		connect.ap_mld_addr = nla_data(info->attrs[NL80211_ATTR_MLD_ADDR]);
++		ap_addr = connect.ap_mld_addr;
++
++		attrs = kzalloc(attrsize, GFP_KERNEL);
++		if (!attrs)
++			return -ENOMEM;
++
++		nla_for_each_nested(link,
++				info->attrs[NL80211_ATTR_MLO_LINKS],
++				rem) {
++			memset(attrs, 0, attrsize);
++
++			nla_parse_nested(attrs, NL80211_ATTR_MAX,
++					link, NULL, NULL);
++
++			if (!attrs[NL80211_ATTR_MLO_LINK_ID]) {
++				err = -EINVAL;
++				goto free;
++			}
++
++			link_id = nla_get_u8(attrs[NL80211_ATTR_MLO_LINK_ID]);
++			/* cannot use the same link ID again */
++			if (connect.links[link_id].bss) {
++				err = -EINVAL;
++				goto free;
++			}
++
++			connect.links[link_id].freq =
++				nla_get_u32(attrs[NL80211_ATTR_WIPHY_FREQ]);
++			connect.links[link_id].bssid =
++				nla_data(attrs[NL80211_ATTR_MAC]);
++			connect.links[link_id].bss =
++				nl80211_assoc_bss(rdev, ssid, ssid_len, attrs);
++
++			if (IS_ERR(connect.links[link_id].bss)) {
++				err = PTR_ERR(connect.links[link_id].bss);
++				connect.links[link_id].bss = NULL;
++				goto free;
++			}
++
++			if (attrs[NL80211_ATTR_IE]) {
++				connect.links[link_id].elems =
++					nla_data(attrs[NL80211_ATTR_IE]);
++				connect.links[link_id].elems_len =
++					nla_len(attrs[NL80211_ATTR_IE]);
++
++				if (cfg80211_find_elem(WLAN_EID_FRAGMENT,
++							connect.links[link_id].elems,
++							connect.links[link_id].elems_len)) {
++					GENL_SET_ERR_MSG(info,
++							"cannot deal with fragmentation");
++					err = -EINVAL;
++					goto free;
++				}
++
++				if (cfg80211_find_ext_elem(WLAN_EID_EXT_NON_INHERITANCE,
++							connect.links[link_id].elems,
++							connect.links[link_id].elems_len)) {
++					GENL_SET_ERR_MSG(info,
++							"cannot deal with non-inheritance");
++					err = -EINVAL;
++					goto free;
++				}
++			}
++		}
++
++		if (!connect.links[connect.link_id].bss) {
++			err = -EINVAL;
++			goto free;
++		}
++
++		if (connect.links[connect.link_id].elems_len) {
++			GENL_SET_ERR_MSG(info,
++					"cannot have per-link elems on assoc link");
++			err = -EINVAL;
++			goto free;
++		}
++
++		kfree(attrs);
++		attrs = NULL;
++	} else {
++		if (connect.link_id >= 0)
++			return -EINVAL;
++	}
+ 
+ 	wdev_lock(dev->ieee80211_ptr);
+ 
+@@ -12076,6 +12182,10 @@ static int nl80211_connect(struct sk_buff *skb, struct genl_info *info)
+ 	}
+ 
+ 	wdev_unlock(dev->ieee80211_ptr);
++free:
++	for (link_id = 0; link_id < ARRAY_SIZE(connect.links); link_id++)
++		cfg80211_put_bss(&rdev->wiphy, connect.links[link_id].bss);
++	kfree(attrs);
+ 
+ 	return err;
+ }
+-- 
+2.34.1
+

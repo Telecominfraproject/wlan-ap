@@ -1,0 +1,157 @@
+From 0a7294e719e31b6ef109e5f6a83855f80d1dbc21 Mon Sep 17 00:00:00 2001
+From: Himanshu Joshi <quic_himajosh@quicinc.com>
+Date: Fri, 7 Feb 2025 11:24:37 +0530
+Subject: [PATCH] [net] Add pppoe gso support.
+
+Change-Id: I496bf82cc303215ab81daa0a6cf7ddf7d546daba
+Signed-off-by: Himanshu Joshi <quic_himajosh@quicinc.com>
+---
+ drivers/net/ppp/ppp_generic.c |  3 ++
+ drivers/net/ppp/pppoe.c       | 77 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 80 insertions(+)
+
+diff --git a/drivers/net/ppp/ppp_generic.c b/drivers/net/ppp/ppp_generic.c
+index 417770305d80..6e603e03dd65 100644
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -53,6 +53,7 @@
+ #include <linux/nsproxy.h>
+ #include <net/net_namespace.h>
+ #include <net/netns/generic.h>
++#include <net/gso.h>
+ 
+ #define PPP_VERSION	"2.4.2"
+ 
+@@ -1651,6 +1652,8 @@ static void ppp_setup(struct net_device *dev)
+ 	SET_NETDEV_DEVTYPE(dev, &ppp_type);
+ 
+ 	dev->features |= NETIF_F_LLTX;
++	dev->hw_features |= (NETIF_F_FRAGLIST | NETIF_F_SG | NETIF_F_TSO | NETIF_F_GSO);
++	dev->hw_features |= (NETIF_F_TSO6 | NETIF_F_TSO_MANGLEID | NETIF_F_HW_CSUM);
+ 
+ 	dev->hard_header_len = PPP_HDRLEN;
+ 	dev->mtu = PPP_MRU;
+diff --git a/drivers/net/ppp/pppoe.c b/drivers/net/ppp/pppoe.c
+index 28c18abddaed..442ea5869b78 100644
+--- a/drivers/net/ppp/pppoe.c
++++ b/drivers/net/ppp/pppoe.c
+@@ -73,11 +73,13 @@
+ #include <linux/file.h>
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
++#include <linux/ipv6.h>
+ 
+ #include <linux/nsproxy.h>
+ #include <net/net_namespace.h>
+ #include <net/netns/generic.h>
+ #include <net/sock.h>
++#include <net/gso.h>
+ 
+ #include <linux/uaccess.h>
+ 
+@@ -85,6 +87,8 @@
+ #define PPPOE_HASH_SIZE (1 << PPPOE_HASH_BITS)
+ #define PPPOE_HASH_MASK	(PPPOE_HASH_SIZE - 1)
+ 
++#define PPP_PROTO_LEN   2
++
+ static int __pppoe_xmit(struct sock *sk, struct sk_buff *skb);
+ 
+ static const struct proto_ops pppoe_ops;
+@@ -513,6 +517,71 @@ static int pppoe_disc_rcv(struct sk_buff *skb, struct net_device *dev,
+ 	return NET_RX_SUCCESS; /* Lies... :-) */
+ }
+ 
++static struct sk_buff *pppoe_gso_segment(struct sk_buff *skb, netdev_features_t features)
++{
++	struct sk_buff *segs = ERR_PTR(-EINVAL);
++	__be16 protocol = skb->protocol;
++	u16 mac_len = skb->mac_len;
++	__be16 inner_protocol;
++
++	skb->mac_len = 0;
++	__skb_pull(skb, sizeof(struct pppoe_hdr));
++	memcpy(&inner_protocol, skb->data, sizeof(protocol));
++	switch (ntohs(inner_protocol)) {
++	case PPP_IP:
++		skb->protocol = htons(ETH_P_IP);
++		break;
++	case PPP_IPV6:
++		skb->protocol = htons(ETH_P_IPV6);
++		break;
++	default:
++		goto out;
++	}
++
++	__skb_pull(skb, PPP_PROTO_LEN);
++	skb_reset_network_header(skb);
++
++	segs = skb_mac_gso_segment(skb, features);
++	if (IS_ERR_OR_NULL(segs)) {
++		pr_warn_ratelimited("%p: pppoe segmentation failed\n", skb);
++		goto out;
++	}
++
++	skb = segs;
++
++	/* Reset back headers to original skb */
++	do {
++		struct pppoe_hdr *ph;
++		u8 len = 0;
++
++		skb->mac_len = mac_len;
++		skb->protocol = protocol;
++		skb_reset_mac_header(skb);
++		skb_set_network_header(skb, ETH_HLEN);
++
++		/* Set this based on protocol v4 or v6 */
++		ph = pppoe_hdr(skb);
++
++		if (ntohs(inner_protocol) == PPP_IP) {
++			struct iphdr *iph;
++
++			iph = (struct iphdr *)((uint8_t *)ph + sizeof(*ph) + PPP_PROTO_LEN);
++			len = iph->tot_len;
++		} else if (ntohs(inner_protocol == PPP_IPV6)) {
++			struct ipv6hdr *ip6h;
++
++			ip6h = (struct ipv6hdr *)((uint8_t *)ph + sizeof(*ph) + PPP_PROTO_LEN);
++			len = ip6h->payload_len + sizeof(*ip6h);
++		}
++
++		/* Adjust the header length as per segment */
++		ph->length = (len + PPP_PROTO_LEN);
++	} while ((skb = skb->next));
++
++out:
++	return segs;
++}
++
+ static struct packet_type pppoes_ptype __read_mostly = {
+ 	.type	= cpu_to_be16(ETH_P_PPP_SES),
+ 	.func	= pppoe_rcv,
+@@ -529,6 +598,13 @@ static struct proto pppoe_sk_proto __read_mostly = {
+ 	.obj_size = sizeof(struct pppox_sock),
+ };
+ 
++static struct packet_offload pppoe_poffload __read_mostly = {
++	.type = cpu_to_be16(ETH_P_PPP_SES),
++	.callbacks = {
++		.gso_segment = pppoe_gso_segment,
++	},
++};
++
+ /***********************************************************************
+  *
+  * Initialize a new struct sock.
+@@ -1263,6 +1339,7 @@ static int __init pppoe_init(void)
+ 
+ 	dev_add_pack(&pppoes_ptype);
+ 	dev_add_pack(&pppoed_ptype);
++	dev_add_offload(&pppoe_poffload);
+ 	register_netdevice_notifier(&pppoe_notifier);
+ 
+ 	return 0;
+-- 
+2.34.1
+

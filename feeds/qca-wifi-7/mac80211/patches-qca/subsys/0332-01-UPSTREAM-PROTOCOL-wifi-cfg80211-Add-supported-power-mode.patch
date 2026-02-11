@@ -1,0 +1,264 @@
+From bdd21b0f6f6c6dcda45b115425100cb2db1bc474 Mon Sep 17 00:00:00 2001
+From: Amith A <amitajit@qti.qualcomm.com>
+Date: Wed, 25 Jun 2025 11:02:32 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: wifi: cfg80211: Add supported power mode
+ and EIRP power info to NL80211_CMD_GET_WIPHY
+
+Extend the response of the NL80211_CMD_GET_WIPHY command to include
+supported power modes and EIRP values in those power modes for every
+6 GHz channel. If AFC is completed, the EIRP value to be programmed into
+the hardware for SP power mode should be the minimum of the EIRP value
+obtained in the AFC response and the regulatory EIRP value.
+
+Fixes: None
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Path-dependency:
+ath12k/0346-02-wifi-ath12k-Add-support-for-processing-AFC-power-eve.patch
+ath12k/0346-06-wifi-ath12k-Extract-AFC-response-and-send-AFC-cmd-to.patch
+
+Signed-off-by: Amith A <amitajit@qti.qualcomm.com>
+---
+ include/net/cfg80211.h       |  2 +
+ include/uapi/linux/nl80211.h | 25 +++++++++++++
+ net/wireless/nl80211.c       | 71 ++++++++++++++++++++++++++++++++++++
+ net/wireless/rdev-ops.h      | 15 ++++++++
+ net/wireless/reg.c           |  2 +-
+ net/wireless/reg.h           |  5 +++
+ net/wireless/trace.h         | 18 +++++++++
+ 7 files changed, 137 insertions(+), 1 deletion(-)
+
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -5405,6 +5405,9 @@ struct cfg80211_qm_resp_data {
+  *	traffic classification (TCLAS) and QoS attributes of a station.
+  *	The driver should parse the request, apply the configuration, and
+  *	populate the response structure with status for each descriptor.
++ *
++ * @get_afc_eirp_pwr: Get the EIRP power received in the AFC payload for the
++ *	given freq
+  */
+ struct cfg80211_ops {
+ 	int	(*suspend)(struct wiphy *wiphy, struct cfg80211_wowlan *wow);
+@@ -5788,6 +5791,8 @@ struct cfg80211_ops {
+ 	int	(*set_qos_mgmt_cfg)(struct wiphy *wiphy, struct net_device *dev,
+ 				    struct cfg80211_qm_req_data *qm_req,
+ 				    struct cfg80211_qm_resp_data *qm_resp);
++	int	(*get_afc_eirp_pwr)(struct wiphy *wiphy,
++				    u32 freq, u32 *eirp);
+ };
+ 
+ /*
+--- a/include/uapi/linux/nl80211.h
++++ b/include/uapi/linux/nl80211.h
+@@ -4593,6 +4593,9 @@ enum nl80211_wmm_rule {
+  *	very low power (VLP) AP, despite being NO_IR.
+  * @NL80211_FREQUENCY_ATTR_ALLOW_20MHZ_ACTIVITY: This channel can be acitve in
+  *	20 MHz bandwidth, despite being NO_IR.
++ * @NL80211_FREQUENCY_ATTR_6GHZ_SUPP_PWR_MODES: 6 Ghz power modes supported by
++ *	this channel
++ * @NL80211_FREQUENCY_ATTR_6GHZ_TXPOWERS: Tx powers in each supported power mode
+  * @NL80211_FREQUENCY_ATTR_MAX: highest frequency attribute number
+  *	currently defined
+  * @__NL80211_FREQUENCY_ATTR_AFTER_LAST: internal use
+@@ -4638,6 +4641,8 @@ enum nl80211_frequency_attr {
+ 	NL80211_FREQUENCY_ATTR_CAN_MONITOR,
+ 	NL80211_FREQUENCY_ATTR_ALLOW_6GHZ_VLP_AP,
+ 	NL80211_FREQUENCY_ATTR_ALLOW_20MHZ_ACTIVITY,
++	NL80211_FREQUENCY_ATTR_6GHZ_SUPP_PWR_MODES,
++	NL80211_FREQUENCY_ATTR_6GHZ_TXPOWERS,
+ 
+ 	/* keep last */
+ 	__NL80211_FREQUENCY_ATTR_AFTER_LAST,
+@@ -8889,4 +8894,25 @@ enum nl80211_qm_attrs {
+ 	NL80211_QM_ATTR_MAX = __NL80211_QM_ATTR_LAST - 1
+ };
+ 
++/**
++ * enum nl80211_6g_txpower_attr - Tx powers in each power mode
++ * @__NL80211_6GHZ_TXPOWER_ATTR_INVALID: attribute number 0 is reserved
++ * @NL80211_6GHZ_TXPOWER_ATTR_LPI: Tx power in LPI power mode
++ * @NL80211_6GHZ_TXPOWER_ATTR_SP: Tx power in SP power mode
++ * @NL80211_6GHZ_TXPOWER_ATTR_VLP: Tx power in VLP power mode
++ * @NL80211_6GHZ_TXPOWER_ATTR_MAX: Maximum power mode attribute number
++ *     currently defined
++ */
++enum nl80211_6ghz_txpower_attr {
++	__NL80211_6GHZ_TXPOWER_ATTR_INVALID,
++	NL80211_6GHZ_TXPOWER_ATTR_LPI,
++	NL80211_6GHZ_TXPOWER_ATTR_SP,
++	NL80211_6GHZ_TXPOWER_ATTR_VLP,
++
++	/* keep last */
++	__NL80211_6GHZ_TXPOWER_ATTR_AFTER_LAST,
++	NL80211_6GHZ_TXPOWER_ATTR_MAX =
++		__NL80211_6GHZ_TXPOWER_ATTR_AFTER_LAST - 1
++};
++
+ #endif /* __LINUX_NL80211_H */
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -1340,6 +1340,66 @@ nla_put_failure:
+ 	return -ENOBUFS;
+ }
+ 
++static int
++nl80211_msg_put_6ghz_power_attributes(struct sk_buff *msg,
++				      struct wiphy *wiphy,
++				      struct ieee80211_channel *chan)
++{
++	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
++	const struct ieee80211_regdomain *regd;
++	struct nlattr *nl_tx_pwrs;
++	u8 supp_pwr_modes = 0;
++	u32 center_freq_khz;
++	int i;
++
++	regd = get_wiphy_regdom(wiphy);
++	nl_tx_pwrs = nla_nest_start_noflag(msg,
++					   NL80211_FREQUENCY_ATTR_6GHZ_TXPOWERS);
++	if (!nl_tx_pwrs)
++		goto nla_put_failure;
++
++	center_freq_khz = ieee80211_channel_to_khz(chan);
++	for (i = NL80211_REG_AP_LPI; i <= NL80211_REG_AP_VLP; i++) {
++		const struct ieee80211_power_rule *power_rule;
++		const struct ieee80211_reg_rule *reg_rule;
++		struct nlattr *nl_txpwr;
++		u32 eirp_pwr;
++
++		nl_txpwr = nla_nest_start(msg, i + 1);
++		if (!nl_txpwr) {
++			nla_nest_end(msg, nl_tx_pwrs);
++			goto nla_put_failure;
++		}
++
++		reg_rule = freq_reg_info_regd(center_freq_khz, regd,
++					      MHZ_TO_KHZ(20), i);
++		if (IS_ERR(reg_rule))
++			continue;
++
++		supp_pwr_modes |= BIT(i);
++		power_rule = &reg_rule->power_rule;
++		if (i == NL80211_REG_AP_SP) {
++			rdev_get_afc_eirp_pwr(rdev, chan->center_freq, &eirp_pwr);
++			eirp_pwr = min(eirp_pwr, MBM_TO_DBM(power_rule->max_eirp));
++		} else {
++			eirp_pwr = MBM_TO_DBM(power_rule->max_eirp);
++		}
++		if (nla_put_u32(msg, i + 1, eirp_pwr))
++			goto nla_put_failure;
++		nla_nest_end(msg, nl_txpwr);
++	}
++	nla_nest_end(msg, nl_tx_pwrs);
++
++	if (nla_put_u8(msg, NL80211_FREQUENCY_ATTR_6GHZ_SUPP_PWR_MODES,
++		       supp_pwr_modes))
++		goto nla_put_failure;
++
++	return 0;
++
++nla_put_failure:
++	return -ENOBUFS;
++}
++
+ static int nl80211_msg_put_channel(struct sk_buff *msg, struct wiphy *wiphy,
+ 				   struct ieee80211_channel *chan,
+ 				   bool large)
+@@ -3164,6 +3224,13 @@ static int nl80211_send_wiphy(struct cfg
+ 							state->split))
+ 						goto nla_put_failure;
+ 
++					if (chan->band == NL80211_BAND_6GHZ) {
++						if (nl80211_msg_put_6ghz_power_attributes(msg,
++											  &rdev->wiphy,
++											  chan))
++							goto nla_put_failure;
++					}
++
+ 					nla_nest_end(msg, nl_freq);
+ 					if (state->split)
+ 						break;
+--- a/net/wireless/reg.c
++++ b/net/wireless/reg.c
+@@ -1617,7 +1617,7 @@ static u32 map_regdom_flags(u32 rd_flags
+ 	return channel_flags;
+ }
+ 
+-static const struct ieee80211_reg_rule *
++const struct ieee80211_reg_rule *
+ freq_reg_info_regd(u32 center_freq,
+ 		   const struct ieee80211_regdomain *regd, u32 bw,
+ 		   enum nl80211_regulatory_power_modes mode)
+--- a/net/wireless/reg.h
++++ b/net/wireless/reg.h
+@@ -179,6 +179,20 @@ void regulatory_propagate_dfs_state(stru
+ bool reg_dfs_domain_same(struct wiphy *wiphy1, struct wiphy *wiphy2);
+ 
+ /**
++ * freq_reg_info_regd - Returns the reg rule which matches the given power mode
++ *	and a channel with the given cener_freq with bw fits in.
++ * @center_freq - Input center frequency
++ * @regd - The driver's regulatory domain
++ * @bw - Input bandwidth
++ * @mode - Input power mode
++ */
++const struct ieee80211_reg_rule
++*freq_reg_info_regd(u32 center_freq,
++		    const struct ieee80211_regdomain *regd,
++		    u32 bw,
++		    enum nl80211_regulatory_power_modes mode);
++
++/**
+  * reg_reload_regdb - reload the regulatory.db firmware file
+  * Return: 0 for success, an error code otherwise
+  */
+--- a/net/wireless/trace.h
++++ b/net/wireless/trace.h
+@@ -4339,6 +4339,24 @@ TRACE_EVENT(rdev_erp,
+ 		  WIPHY_PR_ARG, WDEV_PR_ARG,
+ 		  __entry->cmd, __entry->link_id, __entry->trigger)
+ );
++
++TRACE_EVENT(rdev_get_afc_eirp_pwr,
++	TP_PROTO(struct wiphy *wiphy, int freq),
++
++	TP_ARGS(wiphy, freq),
++
++	TP_STRUCT__entry(
++		WIPHY_ENTRY
++		__field(u32, freq)
++	),
++
++	TP_fast_assign(
++		WIPHY_ASSIGN;
++		__entry->freq = freq;
++	),
++
++	TP_printk(WIPHY_PR_FMT, WIPHY_PR_ARG)
++);
+ #endif /* !__RDEV_OPS_TRACE || TRACE_HEADER_MULTI_READ */
+ 
+ #undef TRACE_INCLUDE_PATH
+--- a/net/wireless/rdev-ops.h
++++ b/net/wireless/rdev-ops.h
+@@ -1645,4 +1645,18 @@ rdev_set_qos_mgmt_cfg(struct cfg80211_re
+ 	return ret;
+ }
+ 
++static inline int
++rdev_get_afc_eirp_pwr(struct cfg80211_registered_device *rdev,
++		      u32 freq, u32 *eirp_pwr)
++{
++	int ret;
++
++	if (!rdev->ops->get_afc_eirp_pwr)
++		return -EOPNOTSUPP;
++
++	trace_rdev_get_afc_eirp_pwr(&rdev->wiphy, freq);
++	ret = rdev->ops->get_afc_eirp_pwr(&rdev->wiphy, freq, eirp_pwr);
++	trace_rdev_return_int(&rdev->wiphy, ret);
++	return ret;
++}
+ #endif /* __CFG80211_RDEV_OPS */

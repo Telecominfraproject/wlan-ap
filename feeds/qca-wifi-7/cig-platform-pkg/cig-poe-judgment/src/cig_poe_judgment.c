@@ -11,6 +11,7 @@
 #include <linux/interrupt.h>
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
+#include <linux/seq_file.h>
 #include <asm/uaccess.h>
 
 #define GPIO_MAX 		8 

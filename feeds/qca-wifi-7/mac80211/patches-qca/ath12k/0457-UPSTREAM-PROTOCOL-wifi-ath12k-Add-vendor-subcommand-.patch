@@ -1,0 +1,462 @@
+From 1be9a8fc23ecc1e65ebe11060df295ae7fce195c Mon Sep 17 00:00:00 2001
+From: Vignesh U <uvignesh@qti.qualcomm.com>
+Date: Tue, 22 Jul 2025 15:42:28 +0530
+Subject: [PATCH] UPSTREAM: PROTOCOL: wifi: ath12k: Add vendor subcommand to
+ retrieve max regulatory EIRP
+
+Provide a vendor subcommand to retrieve the maximum allowed EIRP values
+for 6 GHz channels from the host.
+
+During initial setup, the host receives regulatory power limits from
+firmware. These limits are not currently exposed to userspace, making
+it difficult to validate AFC response payloads against the regulatory
+constraints derived from the board data file.
+
+Introduce a vendor command that allows userspace to query the maximum
+EIRP values for each 6 GHz channel. Parse AP and client power mode
+attributes, map them to NL80211 regulatory power modes, and extract
+per-channel EIRP data. Package the results into nested netlink
+attributes and send them to userspace.
+
+Fixes: None
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+subsys/0048-cfg80211-mac80211-regulatory-awgn-and-6g-channel-cha.patch
+
+Signed-off-by: Vignesh U <uvignesh@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c    | 101 +++++++++++++
+ drivers/net/wireless/ath/ath12k/mac.h    |  36 +++++
+ drivers/net/wireless/ath/ath12k/vendor.c | 175 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/vendor.h |  52 +++++++
+ 4 files changed, 364 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 22b2d00..d42272b 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -22861,3 +22861,104 @@ int ath12k_mac_op_qos_mgmt_cfg(struct ieee80211_hw *hw,
+ 	}
+ }
+ EXPORT_SYMBOL(ath12k_mac_op_qos_mgmt_cfg);
++
++/**
++ * ath12k_get_nl_ap_pwr_mode - Map WMI AP/client power mode to NL80211 regulatory mode
++ * @ap_mode: AP power mode (WMI_REG_INDOOR_AP, WMI_REG_STD_POWER_AP, etc.)
++ * @client_type: Client type (WMI_REG_DEFAULT_CLIENT, WMI_REG_SUBORDINATE_CLIENT)
++ * @is_client_needed: Indicates whether the mapping is for a client or AP
++ *
++ * This function translates the WMI-defined AP or client power mode into the
++ * corresponding NL80211 regulatory power mode used for 6 GHz band configuration.
++ * It handles both AP and client mappings based on the input flags.
++ *
++ * Return: A valid enum nl80211_regulatory_power_modes value on success,
++ *         or NL80211_REG_NUM_POWER_MODES if the input combination is invalid.
++ */
++static enum nl80211_regulatory_power_modes
++ath12k_get_nl_ap_pwr_mode(enum wmi_reg_6g_ap_type ap_mode,
++			  enum wmi_reg_6g_client_type client_type,
++			  bool is_client_needed)
++{
++	if (!is_client_needed) {
++		switch (ap_mode) {
++		case WMI_REG_INDOOR_AP: return NL80211_REG_AP_LPI;
++		case WMI_REG_STD_POWER_AP: return NL80211_REG_AP_SP;
++		case WMI_REG_VLP_AP: return NL80211_REG_AP_VLP;
++		default: return NL80211_REG_NUM_POWER_MODES;
++		}
++	} else if (client_type == WMI_REG_DEFAULT_CLIENT) {
++		switch (ap_mode) {
++		case WMI_REG_INDOOR_AP: return NL80211_REG_REGULAR_CLIENT_LPI;
++		case WMI_REG_STD_POWER_AP: return NL80211_REG_REGULAR_CLIENT_SP;
++		case WMI_REG_VLP_AP: return NL80211_REG_REGULAR_CLIENT_VLP;
++		default: return NL80211_REG_NUM_POWER_MODES;
++		}
++	} else if (client_type == WMI_REG_SUBORDINATE_CLIENT) {
++		switch (ap_mode) {
++		case WMI_REG_INDOOR_AP: return NL80211_REG_SUBORDINATE_CLIENT_LPI;
++		case WMI_REG_STD_POWER_AP: return NL80211_REG_SUBORDINATE_CLIENT_SP;
++		case WMI_REG_VLP_AP: return NL80211_REG_SUBORDINATE_CLIENT_VLP;
++		default: return NL80211_REG_NUM_POWER_MODES;
++		}
++	}
++
++	return NL80211_REG_NUM_POWER_MODES;
++}
++
++/**
++ * ath12k_fill_chan_eirp_list - Populate EIRP list from 6 GHz channel data
++ * @chan_6g: Pointer to the 6 GHz channel structure containing channel info
++ * @chan_eirp_list: Output array to be filled with EIRP values per channel
++ *
++ * This helper function iterates over the list of 6 GHz channels and fills
++ * the corresponding entries in the provided channel_power array with:
++ * - tx_power: maximum regulatory transmit power
++ * - center_freq: center frequency of the channel
++ * - chan_num: hardware channel number
++ *
++ * This function is used to extract regulatory power information for each
++ * channel in the specified power mode band.
++ */
++static void
++ath12k_fill_chan_eirp_list(struct ieee80211_6ghz_channel *chan_6g,
++			   struct channel_power *chan_eirp_list)
++{
++	u8 i;
++
++	for (i = 0; i < chan_6g->n_channels; i++) {
++		struct ieee80211_channel *channels = &chan_6g->channels[i];
++
++		if (channels->flags & IEEE80211_CHAN_DISABLED)
++			continue;
++
++		chan_eirp_list[i].tx_power = channels->max_reg_power;
++		chan_eirp_list[i].center_freq = channels->center_freq;
++		chan_eirp_list[i].chan_num = channels->hw_value;
++	}
++}
++
++int ath12k_mac_reg_get_max_reg_eirp_from_chan_list(struct ath12k *ar,
++						   enum wmi_reg_6g_ap_type ap_6ghz_pwr_mode,
++						   enum wmi_reg_6g_client_type client_type,
++						   bool is_client_needed,
++						   struct channel_power *chan_eirp_list)
++{
++	enum nl80211_regulatory_power_modes nl_ap_pwr_mode;
++	struct ieee80211_6ghz_channel *chan_6g;
++	struct ieee80211_supported_band *band;
++
++	band = &ar->mac.sbands[NL80211_BAND_6GHZ];
++	nl_ap_pwr_mode = ath12k_get_nl_ap_pwr_mode(ap_6ghz_pwr_mode, client_type,
++						   is_client_needed);
++	if (nl_ap_pwr_mode == NL80211_REG_NUM_POWER_MODES)
++		return -EINVAL;
++
++	chan_6g = band->chan_6g[nl_ap_pwr_mode];
++	if (!chan_6g)
++		return -EINVAL;
++
++	ath12k_fill_chan_eirp_list(chan_6g, chan_eirp_list);
++
++	return 0;
++}
+diff --git a/drivers/net/wireless/ath/ath12k/mac.h b/drivers/net/wireless/ath/ath12k/mac.h
+index 536a5b6..6a1d512 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -604,4 +604,40 @@ int ath12k_mac_op_qos_mgmt_cfg(struct ieee80211_hw *hw,
+ 			       struct ieee80211_sta *sta,
+ 			       struct cfg80211_qm_req_data *qm_req,
+ 			       struct cfg80211_qm_resp_data *qm_resp);
++
++/**
++ * struct channel_power - Regulatory power information for a 6 GHz channel
++ * @center_freq: Center frequency (in MHz) of the channel
++ * @chan_num: Hardware channel number
++ * @tx_power: Maximum regulatory transmit power (in dBm)
++ *
++ * This structure holds the regulatory EIRP information for a specific 6 GHz
++ * channel. It is typically populated based on regulatory domain data.
++ */
++struct channel_power {
++	u16 center_freq;
++	u8 chan_num;
++	s8 tx_power;
++};
++
++/**
++ * ath12k_mac_reg_get_max_reg_eirp_from_chan_list - Populate EIRP list for 6 GHz channels
++ * @ar: Pointer to the ath12k device structure
++ * @ap_6ghz_pwr_mode: AP power mode (e.g., WMI_REG_INDOOR_AP, WMI_REG_STD_POWER_AP)
++ * @client_type: Client type (e.g., WMI_REG_DEFAULT_CLIENT, WMI_REG_SUBORDINATE_CLIENT)
++ * @is_client_needed: Flag indicating whether the EIRP list is for a client device
++ * @chan_eirp_list: Output array to be filled with channel power information
++ *
++ * This function determines the appropriate NL80211 regulatory power mode based on
++ * the AP/client configuration and fills the provided channel_power array with
++ * maximum regulatory transmit power, center frequency, and channel number for
++ * each 6 GHz channel in that mode.
++ *
++ * Return: 0 on success, -EINVAL if the power mode mapping is invalid.
++ */
++int ath12k_mac_reg_get_max_reg_eirp_from_chan_list(struct ath12k *ar,
++						   enum wmi_reg_6g_ap_type ap_6ghz_pwr_mode,
++						   enum wmi_reg_6g_client_type client_type,
++						   bool is_client_needed,
++						   struct channel_power *chan_eirp_list);
+ #endif
+diff --git a/drivers/net/wireless/ath/ath12k/vendor.c b/drivers/net/wireless/ath/ath12k/vendor.c
+index d7815c0..206ab7f 100644
+--- a/drivers/net/wireless/ath/ath12k/vendor.c
++++ b/drivers/net/wireless/ath/ath12k/vendor.c
+@@ -5139,6 +5139,173 @@ ath12k_vendor_atf_offload_config_handler(struct wiphy *wiphy,
+ 	return ret;
+ }
+ 
++static const struct nla_policy
++ath12k_reg_get_eirp_policy[QCA_WLAN_VENDOR_ATTR_REG_EIRP_MAX + 1] = {
++	[QCA_WLAN_VENDOR_ATTR_REG_EIRP_POWER_TYPE] = { .type = NLA_U8 },
++	[QCA_WLAN_VENDOR_ATTR_REG_EIRP_CLIENT_TYPE] = { .type = NLA_U8 },
++};
++
++/**
++ * wlan_cfg80211_send_reg_eirp_update - Send EIRP update to userspace
++ * @wiphy: Pointer to the wiphy structure
++ * @eirp_list: Array of channel_power structures
++ * @n_channels: Number of channels in the list
++ *
++ * This function packages the EIRP data (center frequency, channel number,
++ * and transmit power) into nested netlink attributes and sends it to
++ * userspace via a vendor command reply.
++ *
++ * Return: 0 on success, negative error code on failure.
++ */
++static int wlan_cfg80211_send_reg_eirp_update(struct wiphy *wiphy,
++					      struct channel_power *eirp_list,
++					      u8 n_channels)
++{
++	struct sk_buff *skb;
++	struct nlattr *nla_attr;
++	int i;
++
++	if (!eirp_list || n_channels == 0)
++		return -EINVAL;
++
++	skb = cfg80211_vendor_cmd_alloc_reply_skb(wiphy, NLMSG_DEFAULT_SIZE);
++	if (!skb)
++		return -ENOMEM;
++
++	/* Center Frequency */
++	nla_attr = nla_nest_start(skb, QCA_WLAN_VENDOR_ATTR_REG_EIRP_UPDATE_CENTER_FREQ);
++	if (!nla_attr)
++		goto fail;
++
++	for (i = 0; i < n_channels; i++) {
++		if (nla_put_u16(skb, i, eirp_list[i].center_freq))
++			goto fail;
++	}
++	nla_nest_end(skb, nla_attr);
++
++	/* Channel Number */
++	nla_attr = nla_nest_start(skb, QCA_WLAN_VENDOR_ATTR_REG_EIRP_UPDATE_CHAN_NUM);
++	if (!nla_attr)
++		goto fail;
++
++	for (i = 0; i < n_channels; i++) {
++		if (nla_put_u16(skb, i, eirp_list[i].chan_num))
++			goto fail;
++	}
++	nla_nest_end(skb, nla_attr);
++
++	/* Transmit Power */
++	nla_attr = nla_nest_start(skb, QCA_WLAN_VENDOR_ATTR_REG_EIRP_UPDATE_TX_POWER);
++	if (!nla_attr)
++		goto fail;
++
++	for (i = 0; i < n_channels; i++) {
++		if (nla_put_u16(skb, i, eirp_list[i].tx_power))
++			goto fail;
++	}
++	nla_nest_end(skb, nla_attr);
++
++	return cfg80211_vendor_cmd_reply(skb);
++
++fail:
++	kfree_skb(skb);
++	return -EMSGSIZE;
++}
++
++/**
++ * ath12k_vendor_get_reg_eirp_handler - Handle vendor command to get 6 GHz EIRP data
++ * @wiphy: Pointer to the wiphy structure
++ * @wdev: Pointer to the wireless device
++ * @data: Pointer to vendor command attributes
++ * @data_len: Length of the vendor command data
++ *
++ * This function parses vendor attributes to determine the 6 GHz AP/client power mode,
++ * retrieves the corresponding regulatory EIRP data, and sends it back to userspace.
++ *
++ * Return: 0 on success, negative error code on failure.
++ */
++static int ath12k_vendor_get_reg_eirp_handler(struct wiphy *wiphy, struct wireless_dev *wdev,
++					      const void *data, int data_len)
++{
++	enum wmi_reg_6g_client_type client_type = WMI_REG_MAX_CLIENT_TYPE;
++	struct nlattr *tb[QCA_WLAN_VENDOR_ATTR_REG_EIRP_MAX + 1];
++	enum wmi_reg_6g_ap_type ap_6ghz_pwr_mode;
++	struct ieee80211_supported_band *band;
++	struct channel_power *chan_eirp_list;
++	bool is_client_needed;
++	struct ath12k *ar;
++	int ret_val = 0;
++	u8 link_id;
++
++	if (!wdev || !data || !data_len) {
++		ath12k_err(NULL, "Invalid input to EIRP handler");
++		return -EINVAL;
++	}
++
++	for_each_valid_link(wdev, link_id) {
++		if (wdev->links[link_id].ap.chandef.chan &&
++		    wdev->links[link_id].ap.chandef.chan->band == NL80211_BAND_6GHZ)
++			break;
++	}
++	if (link_id >= IEEE80211_MLD_MAX_NUM_LINKS)
++		return -EINVAL;
++
++	ar = ath12k_get_ar_from_wdev(wdev, link_id);
++	if (!ar)
++		return -ENODATA;
++
++	band = &ar->mac.sbands[NL80211_BAND_6GHZ];
++	if (!band || band->n_channels == 0)
++		return -EINVAL;
++
++	chan_eirp_list = kzalloc(band->n_channels * sizeof(*chan_eirp_list), GFP_KERNEL);
++	if (!chan_eirp_list)
++		return -ENOMEM;
++
++	if (nla_parse(tb, QCA_WLAN_VENDOR_ATTR_REG_EIRP_POWER_TYPE, data,
++		      data_len, ath12k_reg_get_eirp_policy, NULL)) {
++		ath12k_err(NULL, "Failed to parse EIRP vendor attributes");
++		ret_val = -EINVAL;
++		goto free_eirp;
++	}
++	if (!tb[QCA_WLAN_VENDOR_ATTR_REG_EIRP_POWER_TYPE]) {
++		ath12k_err(NULL, "Missing mandatory EIRP power type attribute");
++		ret_val = -EINVAL;
++		goto free_eirp;
++	}
++
++	ap_6ghz_pwr_mode = nla_get_u8(tb[QCA_WLAN_VENDOR_ATTR_REG_EIRP_POWER_TYPE]);
++	if (ap_6ghz_pwr_mode < WMI_REG_INDOOR_AP || ap_6ghz_pwr_mode > WMI_REG_VLP_AP) {
++		ath12k_err(NULL, "Invalid 6 GHz AP power mode: %u", ap_6ghz_pwr_mode);
++		ret_val = -EINVAL;
++		goto free_eirp;
++	}
++
++	if (tb[QCA_WLAN_VENDOR_ATTR_REG_EIRP_CLIENT_TYPE])
++		client_type = nla_get_u8(tb[QCA_WLAN_VENDOR_ATTR_REG_EIRP_CLIENT_TYPE]);
++	if (client_type >= WMI_REG_MAX_CLIENT_TYPE) {
++		ath12k_err(NULL, "Invalid client type: %u", client_type);
++		ret_val = -EINVAL;
++		goto free_eirp;
++	}
++
++	is_client_needed = (client_type < WMI_REG_MAX_CLIENT_TYPE);
++
++	ret_val = ath12k_mac_reg_get_max_reg_eirp_from_chan_list(ar, ap_6ghz_pwr_mode,
++								 client_type, is_client_needed,
++								 chan_eirp_list);
++	if (ret_val) {
++		ath12k_err(NULL, "Failed to retrieve regulatory EIRP data");
++		goto free_eirp;
++	}
++
++	ret_val = wlan_cfg80211_send_reg_eirp_update(wiphy, chan_eirp_list, band->n_channels);
++
++free_eirp:
++	kfree(chan_eirp_list);
++	return ret_val;
++}
++
+ static struct wiphy_vendor_command ath12k_vendor_commands[] = {
+ 	{
+ 		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+@@ -5243,6 +5410,14 @@ static struct wiphy_vendor_command ath12k_vendor_commands[] = {
+ 		.policy = ath12k_wifi_config_policy,
+ 		.maxattr = QCA_WLAN_VENDOR_ATTR_CONFIG_MAX,
+ 	},
++	{
++		.info.vendor_id = QCA_NL80211_VENDOR_ID,
++		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_AFC_GET_REG_EIRP,
++		.doit = ath12k_vendor_get_reg_eirp_handler,
++		.policy = ath12k_reg_get_eirp_policy,
++		.maxattr = QCA_WLAN_VENDOR_ATTR_REG_EIRP_MAX,
++		.flags = WIPHY_VENDOR_CMD_NEED_NETDEV,
++	},
+ };
+ 
+ static const struct nl80211_vendor_cmd_info ath12k_vendor_events[] = {
+diff --git a/drivers/net/wireless/ath/ath12k/vendor.h b/drivers/net/wireless/ath/ath12k/vendor.h
+index cf4cea2..e89f380 100644
+--- a/drivers/net/wireless/ath/ath12k/vendor.h
++++ b/drivers/net/wireless/ath/ath12k/vendor.h
+@@ -50,6 +50,7 @@ enum qca_nl80211_vendor_subcmds {
+ 	QCA_NL80211_VENDOR_SUBCMD_IFACE_RELOAD = 267,
+ 	QCA_NL80211_VENDOR_SUBCMD_SET_WIPHY_CONFIGURATION = 268,
+ 	QCA_NL80211_VENDOR_SUBCMD_GET_WIPHY_CONFIGURATION = 269,
++	QCA_NL80211_VENDOR_SUBCMD_AFC_GET_REG_EIRP = 290,
+ };
+ 
+ enum qca_nl80211_vendor_events {
+@@ -623,6 +624,19 @@ enum qca_wlan_vendor_6ghz_power_modes {
+ 	QCA_WLAN_VENDOR_6GHZ_PWR_MODE_SUBORDINATE_CLIENT_VLP = 8,
+ };
+ 
++/**
++ * enum qca_wlan_vendor_client_type - Client types for 6 GHz operation
++ * @QCA_WLAN_VENDOR_CLIENT_TYPE_DEFAULT: Default client type operating under standard rules.
++ * @QCA_WLAN_VENDOR_CLIENT_TYPE_SUBORDINATE: Subordinate client type, typically operating under
++ *                                           a controlling AP.
++ * @QCA_WLAN_VENDOR_CLIENT_TYPE_MAX: Maximum value placeholder for bounds checking and validation.
++ */
++enum qca_wlan_vendor_client_type {
++	QCA_WLAN_VENDOR_CLIENT_TYPE_DEFAULT = 0,
++	QCA_WLAN_VENDOR_CLIENT_TYPE_SUBORDINATE = 1,
++	QCA_WLAN_VENDOR_CLIENT_TYPE_MAX,
++};
++
+ /**
+  * enum qca_wlan_vendor_set_6ghz_power_mode - Used by the vendor command
+  * QCA_NL80211_VENDOR_SUBCMD_SET_6GHZ_POWER_MODE command to configure the
+@@ -641,6 +655,44 @@ enum qca_wlan_vendor_set_6ghz_power_mode {
+ 		QCA_WLAN_VENDOR_ATTR_6GHZ_REG_POWER_MODE_AFTER_LAST - 1,
+ };
+ 
++/**
++ * enum qca_wlan_vendor_attr_reg_eirp - Vendor attributes for regulatory EIRP handling
++ * @QCA_WLAN_VENDOR_ATTR_REG_EIRP_INVALID: Invalid attribute (placeholder).
++ * @QCA_WLAN_VENDOR_ATTR_REG_EIRP_POWER_TYPE: Attribute indicating the AP power mode type
++ *                                            (e.g., LPI, SP, VLP) for 6 GHz regulatory
++ *                                            configuration.
++ * @QCA_WLAN_VENDOR_ATTR_REG_EIRP_CLIENT_TYPE: Attribute indicating the client type
++ *                                             (e.g., default or subordinate) for 6 GHz
++ *                                             regulatory configuration.
++ * @QCA_WLAN_VENDOR_ATTR_REG_EIRP_MAX: Maximum attribute index (internal use for bounds checking).
++ */
++enum qca_wlan_vendor_attr_reg_eirp {
++	QCA_WLAN_VENDOR_ATTR_REG_EIRP_INVALID = 0,
++	QCA_WLAN_VENDOR_ATTR_REG_EIRP_POWER_TYPE,
++	QCA_WLAN_VENDOR_ATTR_REG_EIRP_CLIENT_TYPE,
++	QCA_WLAN_VENDOR_ATTR_REG_EIRP_MAX,
++};
++
++/**
++ * enum qca_wlan_vendor_attr_reg_eirp_update - Vendor attributes for EIRP update
++ * @QCA_WLAN_VENDOR_ATTR_REG_EIRP_UPDATE_INVALID: Invalid attribute (placeholder).
++ * @QCA_WLAN_VENDOR_ATTR_REG_EIRP_UPDATE_CENTER_FREQ: Attribute representing the center
++ *                                                    frequency (in MHz) of the channel.
++ * @QCA_WLAN_VENDOR_ATTR_REG_EIRP_UPDATE_CHAN_NUM: Attribute representing the hardware channel
++ *                                                 number.
++ * @QCA_WLAN_VENDOR_ATTR_REG_EIRP_UPDATE_TX_POWER: Attribute representing the maximum regulatory
++ *                                                 transmit power (in dBm).
++ * @QCA_WLAN_VENDOR_ATTR_REG_EIRP_UPDATE_MAX: Maximum attribute index (used for validation and
++ *                                            bounds checking).
++ */
++enum qca_wlan_vendor_attr_reg_eirp_update {
++	QCA_WLAN_VENDOR_ATTR_REG_EIRP_UPDATE_INVALID = 0,
++	QCA_WLAN_VENDOR_ATTR_REG_EIRP_UPDATE_CENTER_FREQ,
++	QCA_WLAN_VENDOR_ATTR_REG_EIRP_UPDATE_CHAN_NUM,
++	QCA_WLAN_VENDOR_ATTR_REG_EIRP_UPDATE_TX_POWER,
++	QCA_WLAN_VENDOR_ATTR_REG_EIRP_UPDATE_MAX,
++};
++
+ /**
+  * ath12k_vendor_send_6ghz_power_mode_update_complete - Send 6 GHz power mode
+  * update vendor NL event to the application.
+-- 
+2.34.1
+
