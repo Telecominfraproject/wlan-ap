@@ -1,0 +1,370 @@
+From 413994c851d6917975ea610244d9cbfcfe684e72 Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Wed, 8 Jan 2025 11:26:00 +0800
+Subject: [PATCH 135/236] mtk: hostapd: Add DFS offchain control support
+
+Add DFS background chain channel switch command for testing purpose.
+This feature is implemented via hostapd_cli command.
+Command format:
+hostapd_cli -i <interface> raw SET_OFFCHAN_CTRL chan=<dfs_channel>
+
+Change the naming from offchan to offchain to avoid ambiguity
+between offchannel CAC and background radar (offchain) CAC
+
+Add get_offchain hostapd_cli command to get the current status
+of background radar.
+Please make sure the interface contains 5G radio
+Usage:
+hostapd_cli -i phy0.1-ap0 get_offchain
+hostapd_cli -i ap-mld-1 -l 1 get_offchain
+
+Enhance set_offchain to support configuring bandwidth & temp_ch/expand_ch flag
+Also, the control channel is not limited to the first channel; it can
+be any channel within the bandwidth.
+Usage:
+hostapd_cli -i <intf> set_offchain chan=<control channel> [bandwidth=<bw>]
+[is_temp_ch=<temp>] [expand=<expand>]
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+---
+ hostapd/ctrl_iface.c  | 249 ++++++++++++++++++++++++++++++++++++++----
+ hostapd/hostapd_cli.c |  18 +++
+ src/ap/dfs.c          |   1 -
+ src/ap/dfs.h          |   1 +
+ 4 files changed, 247 insertions(+), 22 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 5d73286d7..e82cfdff0 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -4851,6 +4851,230 @@ hostapd_ctrl_iface_set_dfs_detect_mode(struct hostapd_data *hapd, char *value,
+ }
+ 
+ 
++static int
++hostapd_ctrl_iface_set_offchain(struct hostapd_data *hapd, char *cmd,
++				char *buf, size_t buflen)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_channel_data *chan;
++	enum oper_chan_width chwidth;
++	int freq, channel = 0, width = 0, n_chans = 0, secondary_chan = 0;
++	int i, num_available_chandefs;
++	u8 seg0, seg1 = 0; /* 80p80 is not supported in offchain */
++	unsigned int temp_ch = 0, expand_ch = 0;
++	char *token, *context = NULL;
++	bool chan_found = false;
++
++	if (!iface->current_mode ||
++	    iface->current_mode->mode != HOSTAPD_MODE_IEEE80211A ||
++	    iface->current_mode->is_6ghz)
++		return -1;
++
++	if (!(iface->drv_flags2 & WPA_DRIVER_FLAGS2_RADAR_BACKGROUND))
++		return os_snprintf(buf, buflen, "No background radar capability\n");
++
++	if (!iface->conf->enable_background_radar)
++		return os_snprintf(buf, buflen, "Background radar is disabled\n");
++
++	while ((token = str_token(cmd, " ", &context))) {
++		if (os_strncmp(token, "chan=", 5) == 0) {
++			channel = strtol(token + 5, NULL, 10);
++			continue;
++		}
++
++		if (os_strncmp(token, "bandwidth=", 10) == 0) {
++			width = strtol(token + 10, NULL, 10);
++			continue;
++		}
++
++		if (os_strncmp(token, "is_temp_ch=", 11) == 0) {
++			temp_ch = strtol(token + 11, NULL, 2);
++			continue;
++		}
++
++		if (os_strncmp(token, "expand=", 7) == 0) {
++			expand_ch = strtol(token + 7, NULL, 2);
++			temp_ch = expand_ch;
++			continue;
++		}
++
++		wpa_printf(MSG_ERROR, "CTRL: Invalid SET_OFFCHAIN parameter: %s", token);
++		return -1;
++	}
++
++	if (!channel) {
++		wpa_printf(MSG_ERROR, "Background radar channel unspecified\n");
++		return -1;
++	}
++
++	switch (width) {
++	case 20:
++		chwidth = CONF_OPER_CHWIDTH_USE_HT;
++		n_chans = 1;
++		break;
++	case 40:
++		chwidth = CONF_OPER_CHWIDTH_USE_HT;
++		n_chans = 2;
++		break;
++	case 80:
++		chwidth = CONF_OPER_CHWIDTH_80MHZ;
++		n_chans = 4;
++		break;
++	case 160:
++		chwidth = CONF_OPER_CHWIDTH_160MHZ;
++		n_chans = 8;
++		break;
++	default:
++		chwidth = hostapd_get_oper_chwidth(iface->conf);
++		if (chwidth == CONF_OPER_CHWIDTH_USE_HT &&
++		    iface->conf->secondary_channel)
++			n_chans = 2;
++		else if (chwidth == CONF_OPER_CHWIDTH_80MHZ)
++			n_chans = 4;
++		else if (chwidth == CONF_OPER_CHWIDTH_160MHZ)
++			n_chans = 8;
++		else
++			n_chans = 1;
++		break;
++	}
++
++	num_available_chandefs = dfs_find_channel(iface, NULL, n_chans, 0, DFS_NO_CAC_YET);
++	for (i = 0; i < num_available_chandefs; i++) {
++		dfs_find_channel(iface, &chan, n_chans, i, DFS_NO_CAC_YET);
++		if (chan->chan <= channel && channel <= chan->chan + (n_chans - 1) * 4) {
++			chan_found = true;
++			break;
++		}
++	}
++
++	if (!chan_found) {
++		wpa_printf(MSG_ERROR, "Failed to find usable DFS channel %d\n", channel);
++		return -1;
++	}
++
++	freq = chan->freq + (channel - chan->chan) * 5;
++	seg0 = chan->chan + (n_chans - 1) * 2;
++	if (n_chans > 1)
++		secondary_chan = ((channel - chan->chan) / 4) % 2 ? -1 : 1;
++
++	if (hostapd_start_dfs_cac(iface, iface->conf->hw_mode,
++				  freq, channel,
++				  iface->conf->ieee80211n,
++				  iface->conf->ieee80211ac,
++				  iface->conf->ieee80211ax,
++				  iface->conf->ieee80211be,
++				  secondary_chan, chwidth,
++				  seg0, seg1, true)) {
++		wpa_printf(MSG_ERROR, "DFS failed to start CAC offchannel");
++		iface->radar_background.channel = -1;
++		return -1;
++	}
++
++	iface->radar_background.channel = channel;
++	iface->radar_background.freq = freq;
++	iface->radar_background.secondary_channel = secondary_chan;
++	iface->radar_background.centr_freq_seg0_idx = seg0;
++	iface->radar_background.centr_freq_seg1_idx = seg1;
++	if (chwidth != hostapd_get_oper_chwidth(iface->conf))
++		iface->radar_background.new_chwidth = chwidth;
++	else
++		iface->radar_background.new_chwidth = -1;
++	iface->radar_background.temp_ch = temp_ch;
++	iface->radar_background.expand_ch = expand_ch;
++
++	return os_snprintf(buf, buflen, "OK\n");
++}
++
++
++static int
++hostapd_ctrl_iface_get_offchain(struct hostapd_data *hapd, char *buf, size_t buflen)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	int chan, freq, seg0, seg1, sec, ret = 0;
++	enum oper_chan_width oper_width;
++	enum chan_width width;
++	char *pos, *end;
++
++	if (!iface->current_mode ||
++	    iface->current_mode->mode != HOSTAPD_MODE_IEEE80211A ||
++	    iface->current_mode->is_6ghz)
++		return -1;
++
++	if (!(iface->drv_flags2 & WPA_DRIVER_FLAGS2_RADAR_BACKGROUND))
++		return os_snprintf(buf, buflen, "No background radar capability\n");
++
++	if (!iface->conf->enable_background_radar)
++		return os_snprintf(buf, buflen, "Background radar is disabled\n");
++
++	if (iface->radar_background.channel == -1)
++		return os_snprintf(buf, buflen, "Background radar is temporary inactive\n");
++
++	chan = iface->radar_background.channel;
++	freq = iface->radar_background.freq;
++	seg0 = iface->radar_background.centr_freq_seg0_idx;
++	seg1 = iface->radar_background.centr_freq_seg1_idx;
++	sec = iface->radar_background.secondary_channel;
++	if (iface->radar_background.new_chwidth < 0)
++		oper_width = hostapd_get_oper_chwidth(iface->conf);
++	else
++		oper_width = iface->radar_background.new_chwidth;
++
++	switch (oper_width) {
++	case CONF_OPER_CHWIDTH_USE_HT:
++		if (sec)
++			width = CHAN_WIDTH_40;
++		else
++			width = CHAN_WIDTH_20;
++		break;
++	case CONF_OPER_CHWIDTH_80MHZ:
++		width = CHAN_WIDTH_80;
++		break;
++	case CONF_OPER_CHWIDTH_80P80MHZ:
++		width = CHAN_WIDTH_80P80;
++		break;
++	case CONF_OPER_CHWIDTH_160MHZ:
++		width = CHAN_WIDTH_160;
++		break;
++	case CONF_OPER_CHWIDTH_320MHZ:
++		width = CHAN_WIDTH_320;
++		break;
++	default:
++		wpa_printf(MSG_ERROR, "Unknown oper bandwidth: %d",
++			   oper_width);
++		return -1;
++	}
++
++	pos = buf;
++	end = buf + buflen;
++
++	ret = os_snprintf(pos, end - pos, "channel: %d (%d MHz) width: %s\n",
++			  chan, freq, channel_width_to_string(width));
++	if (os_snprintf_error(end - pos, ret))
++		return pos - buf;
++	pos += ret;
++	ret = os_snprintf(pos, end - pos,
++			  "center channel 1: %d center channel 2: %d\n",
++			  seg0, seg1);
++	if (os_snprintf_error(end - pos, ret))
++		return pos - buf;
++	pos += ret;
++	ret = os_snprintf(pos, end - pos, "secondary offset: %d\n", sec);
++	if (os_snprintf_error(end - pos, ret))
++		return pos - buf;
++	pos += ret;
++	ret = os_snprintf(pos, end - pos,
++			  "temporary ch: %u cac started: %u expand ch: %u\n",
++			  iface->radar_background.temp_ch,
++			  iface->radar_background.cac_started,
++			  iface->radar_background.expand_ch);
++	if (os_snprintf_error(end - pos, ret))
++		return pos - buf;
++	pos += ret;
++
++	return pos - buf;
++}
++
++
+ static int
+ hostapd_ctrl_iface_get_amsdu(struct hostapd_data *hapd, char *buf,
+ 					 size_t buflen)
+@@ -5169,27 +5393,6 @@ hostapd_ctrl_iface_set_background_radar_mode(struct hostapd_data *hapd, char *cm
+ 	return os_snprintf(buf, buflen, "OK\n");
+ }
+ 
+-struct hostapd_data *
+-hostapd_get_hapd_by_band_idx(struct hostapd_data *hapd, u8 band_idx)
+-{
+-	struct hostapd_data *link;
+-
+-	if (!hostapd_is_mld_ap(hapd))
+-		return hapd;
+-
+-	for_each_mld_link(link, hapd) {
+-		if (link->iconf->band_idx == band_idx)
+-			break;
+-	}
+-
+-	if (!link || link->iconf->band_idx != band_idx) {
+-		wpa_printf(MSG_ERROR, "Invalid band idx %d\n", band_idx);
+-		return NULL;
+-	}
+-
+-	return link;
+-}
+-
+ static int
+ hostapd_ctrl_iface_set_pp(struct hostapd_data *hapd, char *cmd, char *buf,
+ 			  size_t buflen)
+@@ -6185,6 +6388,10 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "DFS_DETECT_MODE ", 16) == 0) {
+ 		reply_len = hostapd_ctrl_iface_set_dfs_detect_mode(hapd, buf + 16,
+ 								   reply, reply_size);
++	} else if (os_strncmp(buf, "SET_OFFCHAIN", 12) == 0) {
++		reply_len = hostapd_ctrl_iface_set_offchain(hapd, buf + 12, reply, reply_size);
++	} else if (os_strncmp(buf, "GET_OFFCHAIN", 12) == 0) {
++		reply_len = hostapd_ctrl_iface_get_offchain(hapd, reply, reply_size);
+ 	} else if (os_strncmp(buf, "GET_AMSDU", 9) == 0) {
+ 		reply_len = hostapd_ctrl_iface_get_amsdu(hapd, reply, reply_size);
+ 	} else if (os_strncmp(buf, "GET_BSS_COLOR", 13) == 0) {
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 6dba9e7d4..7a44e8e7c 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1743,6 +1743,20 @@ static int hostapd_cli_cmd_get_ibf(struct wpa_ctrl *ctrl, int argc,
+ }
+ 
+ 
++static int hostapd_cli_cmd_set_offchain(struct wpa_ctrl *ctrl, int argc,
++					char *argv[])
++{
++	return hostapd_cli_cmd(ctrl, "SET_OFFCHAIN", 0, argc, argv);
++}
++
++
++static int hostapd_cli_cmd_get_offchain(struct wpa_ctrl *ctrl, int argc,
++					char *argv[])
++{
++	return hostapd_cli_cmd(ctrl, "GET_OFFCHAIN", 0, NULL, NULL);
++}
++
++
+ static int hostapd_cli_cmd_get_amsdu(struct wpa_ctrl *ctrl, int argc,
+ 					   char *argv[])
+ {
+@@ -2054,6 +2068,10 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+           "<tx type(0/1/2)> <interval> = runtime set inband discovery" },
+ 	{ "get_ibf", hostapd_cli_cmd_get_ibf, NULL,
+ 	  " = show iBF state (enabled/disabled)"},
++	{ "set_offchain", hostapd_cli_cmd_set_offchain, NULL,
++	  "chan=<control chan> [bandwidth=] [is_temp_ch=] [expand=] = set background radar chan"},
++	{ "get_offchain", hostapd_cli_cmd_get_offchain, NULL,
++	  " = show background radar status"},
+ 	{ "get_amsdu", hostapd_cli_cmd_get_amsdu, NULL,
+ 		" = show AMSDU state"},
+ 	{ "set_amnt", hostapd_cli_cmd_set_amnt, NULL,
+diff --git a/src/ap/dfs.c b/src/ap/dfs.c
+index c69e04f28..bbc722bd6 100644
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -20,7 +20,6 @@
+ #include "dfs.h"
+ #include "crypto/crypto.h"
+ 
+-
+ static struct hostapd_channel_data *
+ dfs_downgrade_bandwidth(struct hostapd_iface *iface, int *secondary_channel,
+ 			u8 *oper_centr_freq_seg0_idx,
+diff --git a/src/ap/dfs.h b/src/ap/dfs.h
+index 917f70744..16612fdb7 100644
+--- a/src/ap/dfs.h
++++ b/src/ap/dfs.h
+@@ -52,4 +52,5 @@ int hostapd_dfs_handle_csa(struct hostapd_iface *iface,
+ 			   struct csa_settings *background_settings,
+ 			   bool cac_required, bool bw_changed);
+ 
++
+ #endif /* DFS_H */
+-- 
+2.45.2
+

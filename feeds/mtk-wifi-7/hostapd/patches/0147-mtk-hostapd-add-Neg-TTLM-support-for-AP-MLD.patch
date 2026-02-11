@@ -1,0 +1,698 @@
+From 6bf71d5c6f80a8de3636dc76ef0f48f5ee58ef5a Mon Sep 17 00:00:00 2001
+From: Michael-CY Lee <michael-cy.lee@mediatek.com>
+Date: Thu, 24 Oct 2024 08:37:07 +0800
+Subject: [PATCH 147/236] mtk: hostapd: add Neg-TTLM support for AP MLD
+
+Add support to handle Neg-TTLM request and teardown from STA MLD.
+The AP MLD parses and checks the TTLM from the requst, setting the
+STA's TTLM to kernel if it is valid, and finally sends the reponse
+to STA MLD.
+
+And for the teardown, the AP set STA's TTLM without providing the
+bitmap, which means it's a teardown for the STA's TTLM. Then the
+NL80211_CMD_SET_STA_TTLM is sent to the kernel, but also without
+the attributes for bitmaps, meaning it's a teardown event.
+
+The combination of Adv-TTLM and Neg-TTLM is also implemented.
+1. Receive Neg-TTLM request while Adv-TTLM has been established: make
+   sure the Neg-TTLM does not map tid to the links disabled by Adv-TTLM.
+   If it does, reject the Neg-TTLM.
+2. Receive Neg-TTLM teardown while Adv-TTLM has been established: update
+   the STA TTLM to the Adv-TTLM.
+3. If Adv-TTLM is triggered with some STAs having successfully requested
+   neg-TTLM, each STA's TTLM will be check and be tore down if conflict
+   with Adv-TTLM exists.
+4. When Adv-TTLM finished, each STA's Neg-TTLM will be restored.
+
+There are some limitations about handling the Neg-TTLM event from the
+STA MLD
+1. only support bi-direction TTLM setup
+2. do not support suggesting another TTLM in the response
+
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+
+1. add the missing return
+2. rename hostapd_send_neg_ttlm_teardown() to
+   ieee802_11_send_neg_ttlm_teardown()
+
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+---
+ hostapd/ctrl_iface.c           |  36 ++++
+ hostapd/hostapd_cli.c          |  14 ++
+ src/ap/ap_drv_ops.c            |   9 +
+ src/ap/ap_drv_ops.h            |   2 +
+ src/ap/drv_callbacks.c         |  19 +++
+ src/ap/hostapd.h               |   4 +-
+ src/ap/ieee802_11.c            |   2 +-
+ src/ap/ieee802_11.h            |   2 +
+ src/ap/ieee802_11_eht.c        | 295 ++++++++++++++++++++++++++++++++-
+ src/ap/sta_info.h              |   1 +
+ src/common/ieee802_11_common.c |   7 +
+ src/common/ieee802_11_common.h |   3 +
+ src/drivers/driver.h           |   2 +
+ src/drivers/driver_nl80211.c   |  27 +++
+ 14 files changed, 420 insertions(+), 3 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 0912ca6fe..32d822697 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -4149,6 +4149,39 @@ static int hostapd_ctrl_iface_set_attlm(struct hostapd_data *hapd, char *cmd,
+ 
+ 	return hostapd_mld_set_attlm(hapd);
+ }
++
++static int hostapd_ctrl_iface_neg_ttlm_teardown(struct hostapd_data *hapd,
++						char *cmd)
++{
++	u8 addr[ETH_ALEN] = {};
++	struct hostapd_data *assoc_hapd;
++	struct sta_info *sta;
++
++	if (hwaddr_aton(cmd, addr)) {
++		wpa_printf(MSG_DEBUG, "Invalid STA MAC address");
++		return -1;
++	}
++
++	sta = ap_get_sta(hapd, addr);
++	if (!sta) {
++		wpa_printf(MSG_DEBUG, "STA " MACSTR " not found.", MAC2STR(addr));
++		return -1;
++	}
++
++	sta = hostapd_ml_get_assoc_sta(hapd, sta, &assoc_hapd);
++	if (!sta || !sta->mld_info.mld_sta || !sta->neg_ttlm.valid) {
++		wpa_printf(MSG_DEBUG, "Invalid STA\n");
++		return -1;
++	}
++
++	if (ieee802_11_send_neg_ttlm_teardown(hapd, sta->addr)) {
++		wpa_printf(MSG_DEBUG, "Failed sending Negotiated TTLM teardown");
++		return -1;
++	}
++
++	hostapd_teardown_neg_ttlm(assoc_hapd, sta);
++	return 0;
++}
+ #endif /* CONFIG_TESTING_OPTIONS */
+ #endif /* CONFIG_IEEE80211BE */
+ 
+@@ -6382,6 +6415,9 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 		if (hostapd_ctrl_iface_set_attlm(hapd, buf + 10, reply,
+ 						 reply_size))
+ 			reply_len = -1;
++	} else if (os_strncmp(buf, "NEG_TTLM_TEARDOWN ", 18) == 0) {
++		if (hostapd_ctrl_iface_neg_ttlm_teardown(hapd, buf + 18))
++			reply_len = -1;
+ #endif /* CONFIG_TESTING_OPTIONS */
+ #endif /* CONFIG_IEEE80211BE */
+ 	} else if (os_strncmp(buf, "SET_EDCCA ", 10) == 0) {
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 7a44e8e7c..4446d2c52 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1822,6 +1822,18 @@ static int hostapd_cli_cmd_set_attlm(struct wpa_ctrl *ctrl, int argc,
+ 	return hostapd_cli_cmd(ctrl, "SET_ATTLM", 1, argc, argv);
+ }
+ 
++static int hostapd_cli_cmd_neg_ttlm_teardown(struct wpa_ctrl *ctrl, int argc,
++					     char *argv[])
++{
++	if (argc != 1) {
++		printf("Invalid 'neg_ttlm_teardown' command - only one argument, "
++		       "STA address, is required.\n");
++		return -1;
++	}
++
++	return hostapd_cli_cmd(ctrl, "NEG_TTLM_TEARDOWN", 1, argc, argv);
++}
++
+ struct hostapd_cli_cmd {
+ 	const char *cmd;
+ 	int (*handler)(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+@@ -2094,6 +2106,8 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 		" [count=<count>] = Remove affiliated link of a MLD AP"},
+ 	{ "set_attlm", hostapd_cli_cmd_set_attlm, NULL,
+ 		" = Disable the affiliated AP of a MLD AP" },
++	{ "neg_ttlm_teardown", hostapd_cli_cmd_neg_ttlm_teardown, NULL,
++		" = Teardown the Negotiated TTLM with the STA" },
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+diff --git a/src/ap/ap_drv_ops.c b/src/ap/ap_drv_ops.c
+index 54f8f84fc..7115bb708 100644
+--- a/src/ap/ap_drv_ops.c
++++ b/src/ap/ap_drv_ops.c
+@@ -638,6 +638,15 @@ int hostapd_if_link_remove(struct hostapd_data *hapd,
+ }
+ 
+ 
++int hostapd_drv_set_sta_ttlm(struct hostapd_data *hapd, const u8 *addr,
++			     struct ieee80211_neg_ttlm *neg_ttlm)
++{
++	if (!hapd->driver || !hapd->drv_priv || !hapd->driver->set_sta_ttlm)
++		return -1;
++	return hapd->driver->set_sta_ttlm(hapd->drv_priv, addr, neg_ttlm);
++}
++
++
+ int hostapd_drv_set_attlm(struct hostapd_data *hapd)
+ {
+ 	if (!hapd->driver || !hapd->drv_priv || !hapd->driver->set_attlm)
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index dd3749e83..86c32ba42 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -68,6 +68,8 @@ int hostapd_if_remove(struct hostapd_data *hapd, enum wpa_driver_if_type type,
+ int hostapd_if_link_remove(struct hostapd_data *hapd,
+ 			   enum wpa_driver_if_type type,
+ 			   const char *ifname, u8 link_id);
++int hostapd_drv_set_sta_ttlm(struct hostapd_data *hapd, const u8 *addr,
++			     struct ieee80211_neg_ttlm *neg_ttlm);
+ int hostapd_drv_set_attlm(struct hostapd_data *hapd);
+ int hostapd_set_ieee8021x(struct hostapd_data *hapd,
+ 			  struct wpa_bss_params *params);
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 3879fbc7e..d2890920e 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -1490,6 +1490,18 @@ void hostapd_event_ch_switch(struct hostapd_data *hapd, int freq, int ht,
+ 
+ 
+ #ifdef CONFIG_IEEE80211BE
++static int teardown_sta_ttlm(struct hostapd_data *hapd, struct sta_info *sta,
++			     void *ctx)
++{
++	if (!sta->mld_info.mld_sta || sta->mld_assoc_sta != sta ||
++	    !sta->neg_ttlm.valid)
++		return 0;
++
++	ieee802_11_send_neg_ttlm_teardown(hapd, sta->addr);
++	hostapd_teardown_neg_ttlm(hapd, sta);
++	return 0;
++}
++
+ void hostapd_event_attlm(struct hostapd_data *hapd, struct attlm_event *attlm_event)
+ {
+ 	struct hostapd_mld *mld = hapd->mld;
+@@ -1511,6 +1523,13 @@ void hostapd_event_attlm(struct hostapd_data *hapd, struct attlm_event *attlm_ev
+ 						BSS_CRIT_UPDATE_EVENT_ATTLM);
+ 			mld->new_attlm.switch_time_tsf_tu =
+ 						attlm_event->switch_time_tsf_tu;
++
++			/* FIXME do Neg-TTLM teardown to prevent overlap
++			 * with Adv-TTLM
++			 */
++			for_each_mld_link(p_hapd, hapd)
++				ap_for_each_sta(p_hapd, teardown_sta_ttlm,
++						NULL);
+ 			break;
+ 		case EVENT_ATTLM_SWITCH_TIME_EXPIRED:
+ 			mld_indicate_disabled = true;
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index e1eb62178..45cc7991b 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -1027,7 +1027,6 @@ struct hostapd_data * hostapd_mld_get_link_bss(struct hostapd_data *hapd,
+ 					       u8 link_id);
+ int hostapd_link_remove(struct hostapd_data *hapd, u32 count);
+ void hostapd_link_remove_cb(struct hostapd_data *hapd, u16 removed_links);
+-int hostapd_mld_set_attlm(struct hostapd_data *hapd);
+ bool hostapd_is_ml_partner(struct hostapd_data *hapd1,
+ 			   struct hostapd_data *hapd2);
+ u8 hostapd_get_mld_id(struct hostapd_data *hapd);
+@@ -1043,8 +1042,11 @@ int hostapd_fill_cca_settings(struct hostapd_data *hapd,
+ 			      struct cca_settings *settings);
+ 
+ #ifdef CONFIG_IEEE80211BE
++#ifdef CONFIG_TESTING_OPTIONS
+ 
+ bool hostapd_is_attlm_active(struct hostapd_data *hapd);
++int hostapd_mld_set_attlm(struct hostapd_data *hapd);
++#endif /* CONFIG_TESTING_OPTIONS */
+ void hostapd_event_attlm(struct hostapd_data *hapd, struct attlm_event *attlm_event);
+ void hostapd_event_tsf_offset(struct hostapd_data *hapd, s64 *tsf_offset);
+ bool hostapd_mld_is_first_bss(struct hostapd_data *hapd);
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index ed80d1cee..31b3e4201 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -6508,7 +6508,7 @@ static int handle_action(struct hostapd_data *hapd,
+ 	struct sta_info *sta;
+ 	u8 *action __maybe_unused;
+ 
+-	if (len < IEEE80211_HDRLEN + 2 + 1) {
++	if (len < IEEE80211_HDRLEN + 2) {
+ 		hostapd_logger(hapd, mgmt->sa, HOSTAPD_MODULE_IEEE80211,
+ 			       HOSTAPD_LEVEL_DEBUG,
+ 			       "handle_action - too short payload (len=%lu)",
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index 96edd9521..bc4b985fe 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -326,4 +326,6 @@ void hostapd_link_reconf_resp_tx_status(struct hostapd_data *hapd,
+ 					const struct ieee80211_mgmt *mgmt,
+ 					size_t len, int ok);
+ 
++int ieee802_11_send_neg_ttlm_teardown(struct hostapd_data *hapd, const u8 *addr);
++void hostapd_teardown_neg_ttlm(struct hostapd_data *hapd, struct sta_info *sta);
+ #endif /* IEEE802_11_H */
+diff --git a/src/ap/ieee802_11_eht.c b/src/ap/ieee802_11_eht.c
+index d4cf732b3..73c98357c 100644
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -17,6 +17,7 @@
+ #include "ap_drv_ops.h"
+ #include "wpa_auth.h"
+ #include "ieee802_11.h"
++#include "ap_drv_ops.h"
+ 
+ 
+ static u16 ieee80211_eht_ppet_size(u16 ppe_thres_hdr, const u8 *phy_cap_info)
+@@ -2978,6 +2979,287 @@ out:
+ }
+ 
+ 
++static u16 ieee80211_get_link_map(u8 bm_size, const u8 *data)
++{
++	if (bm_size == 1)
++		return *data;
++	else
++		return WPA_GET_LE16(data);
++}
++
++static int ieee802_11_parse_neg_ttlm(struct hostapd_data *hapd,
++				     const u8 *ttlm_ie, size_t ttlm_ie_len,
++				     struct ieee80211_neg_ttlm *neg_ttlm,
++				     u8 *direction)
++{
++	u8 control, link_map_presence, map_size, tid;
++	const u8 *pos = ttlm_ie;
++	const size_t fixed_length = 1; /* Control Feild */
++
++	if (ttlm_ie_len < fixed_length)
++		return -EINVAL;
++
++	os_memset(neg_ttlm, 0, sizeof(*neg_ttlm));
++
++	control = *pos++;
++	ttlm_ie_len--;
++
++	/* mapping switch time and expected duration fields are not expected
++	 * in case of negotiated TTLM
++	 */
++	if (control & (IEEE80211_TTLM_CONTROL_SWITCH_TIME_PRESENT |
++		       IEEE80211_TTLM_CONTROL_EXPECTED_DUR_PRESENT)) {
++		wpa_printf(MSG_ERROR,
++			   "Invalid TTLM element in negotiated TTLM request\n");
++		return -EINVAL;
++	}
++
++	if (control & IEEE80211_TTLM_CONTROL_DEF_LINK_MAP) {
++		for (tid = 0; tid < IEEE80211_TTLM_NUM_TIDS; tid++) {
++			neg_ttlm->dlink[tid] = hapd->mld->active_links;
++			neg_ttlm->ulink[tid] = hapd->mld->active_links;
++		}
++		*direction = IEEE80211_TTLM_DIRECTION_BOTH;
++		neg_ttlm->valid = true;
++		return 0;
++	}
++
++	*direction = (control & IEEE80211_TTLM_CONTROL_DIRECTION);
++
++	/* Link Mapping Presence Bitmap */
++	if (ttlm_ie_len < 1)
++		return -EINVAL;
++
++	link_map_presence = *pos;
++	pos++;
++	ttlm_ie_len--;
++
++	if (control & IEEE80211_TTLM_CONTROL_LINK_MAP_SIZE)
++		map_size = 1;
++	else
++		map_size = 2;
++
++	for (tid = 0; tid < IEEE80211_TTLM_NUM_TIDS; tid++) {
++		u16 map;
++
++		if (!(link_map_presence & BIT(tid)))
++			continue;
++
++		if (ttlm_ie_len < map_size)
++			return -EINVAL;
++
++		map = ieee80211_get_link_map(map_size, pos);
++		if (!map) {
++			wpa_printf(MSG_ERROR, "No active links for TID %d", tid);
++			return -EINVAL;
++		}
++
++		switch (*direction) {
++		case IEEE80211_TTLM_DIRECTION_BOTH:
++			neg_ttlm->dlink[tid] = map;
++			neg_ttlm->ulink[tid] = map;
++			break;
++		case IEEE80211_TTLM_DIRECTION_DOWN:
++			neg_ttlm->dlink[tid] = map;
++			break;
++		case IEEE80211_TTLM_DIRECTION_UP:
++			neg_ttlm->ulink[tid] = map;
++			break;
++		default:
++			return -EINVAL;
++		}
++
++		pos += map_size;
++		ttlm_ie_len -= map_size;
++	}
++
++	neg_ttlm->valid = true;
++	return 0;
++}
++
++static int ieee802_11_send_neg_ttlm_resp(struct hostapd_data *hapd,
++					  const char *addr, u8 dialog_token,
++					  u16 status_code)
++{
++	struct wpabuf *buf;
++	size_t len = 5;
++	int ret;
++
++	/* TODO currently do not support suggest another mapping */
++	if (status_code == WLAN_STATUS_PREFERRED_TID_TO_LINK_MAPPING_SUGGESTED)
++		return -1;
++
++	buf = wpabuf_alloc(len);
++	if (!buf)
++		return -1;
++
++	wpabuf_put_u8(buf, WLAN_ACTION_PROTECTED_EHT);
++	wpabuf_put_u8(buf, WLAN_PROT_EHT_T2L_MAPPING_RESPONSE);
++	wpabuf_put_u8(buf, dialog_token);
++	wpabuf_put_le16(buf, status_code);
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++	wpabuf_free(buf);
++
++	return ret;
++}
++
++static void ieee802_11_rx_neg_ttlm_req(struct hostapd_data *hapd, const u8 *addr,
++				       const u8 *frm, size_t len)
++{
++	struct hostapd_data *assoc_hapd;
++	struct neg_ttlm_req *neg_ttlm_req;
++	struct ieee802_11_elems elems;
++	struct ieee80211_neg_ttlm *neg_ttlm;
++	struct sta_info *sta;
++	u8 direction;
++	u16 status_code = WLAN_STATUS_DENIED_TID_TO_LINK_MAPPING;
++	int ret = 0, tid;
++
++	/* TODO Check if AP MLD support Neg-TTLM */
++	if (!hostapd_is_mld_ap(hapd))
++		goto fail;
++
++	sta = ap_get_sta(hapd, addr);
++	if (!sta || !ap_sta_is_mld(hapd, sta))
++		goto fail;
++
++	sta = hostapd_ml_get_assoc_sta(hapd, sta, &assoc_hapd);
++	if (!sta)
++		goto fail;
++
++	/* TODO check the relationship between Adv-TTLM and Neg-TTLM */
++	if (hostapd_is_attlm_active(hapd))
++		goto fail;
++
++	neg_ttlm_req = (struct neg_ttlm_req *)frm;
++	if (ieee802_11_parse_elems(neg_ttlm_req->variable, len - 1, &elems, 1) ==
++	    ParseFailed || elems.ttlm_num == 0) {
++		wpa_printf(MSG_ERROR, "Invalid neg-TTLM request format\n");
++		goto fail;
++	}
++
++	/* TODO add support for handling more than one TTLM in the Neg-TTLM
++	 * request.
++	 */
++	if (elems.ttlm_num != 1) {
++		wpa_printf(MSG_ERROR, "Error: Only support Neg-TTLM in bi-direction");
++		goto fail;
++	}
++
++	neg_ttlm = &sta->neg_ttlm;
++	ret = ieee802_11_parse_neg_ttlm(hapd, elems.ttlm[0], elems.ttlm_len[0],
++					neg_ttlm, &direction);
++
++	if (ret) {
++		wpa_printf(MSG_ERROR, "Invalid TTLM format");
++		goto fail;
++	}
++
++	if (direction != IEEE80211_TTLM_DIRECTION_BOTH) {
++		wpa_printf(MSG_ERROR, "Error: Only support Neg-TTLM in bi-direction");
++		goto fail;
++	}
++
++	status_code = WLAN_STATUS_SUCCESS;
++fail:
++	ieee802_11_send_neg_ttlm_resp(hapd, addr, neg_ttlm_req->dialog_token,
++				      status_code);
++
++	if (status_code == WLAN_STATUS_SUCCESS) {
++		ret = hostapd_drv_set_sta_ttlm(assoc_hapd, addr, neg_ttlm);
++	} else {
++		os_memset(neg_ttlm, 0, sizeof(*neg_ttlm));
++		return;
++	}
++
++	if (ret) {
++		ieee802_11_send_neg_ttlm_teardown(hapd, addr);
++		hostapd_teardown_neg_ttlm(assoc_hapd, sta);
++		os_memset(neg_ttlm, 0, sizeof(*neg_ttlm));
++	}
++}
++
++static void ieee802_11_rx_neg_ttlm_teardown(struct hostapd_data *hapd, const u8 *addr)
++{
++	struct hostapd_data *assoc_hapd;
++	struct sta_info *sta;
++
++	if (!hostapd_is_mld_ap(hapd))
++		return;
++
++	sta = ap_get_sta(hapd, addr);
++	if (!sta || !ap_sta_is_mld(hapd, sta))
++		return;
++
++	sta = hostapd_ml_get_assoc_sta(hapd, sta, &assoc_hapd);
++	if (!sta || !sta->neg_ttlm.valid)
++		return;
++
++	os_memset(&sta->neg_ttlm, 0, sizeof(sta->neg_ttlm));
++
++	hostapd_teardown_neg_ttlm(assoc_hapd, sta);
++	return;
++}
++
++
++int ieee802_11_send_neg_ttlm_teardown(struct hostapd_data *hapd, const u8 *addr)
++{
++	struct wpabuf *buf;
++	size_t len = 2;
++	int ret;
++
++	buf = wpabuf_alloc(len);
++	if (!buf)
++		return -1;
++
++	if (hostapd_is_attlm_active(hapd) &&
++	    hapd->mld->new_attlm.disabled_links & BIT(hapd->mld_link_id)) {
++		wpa_printf(MSG_ERROR,
++			   "Request Neg-TTLM teardown on disabled link");
++		return -1;
++	}
++
++	wpabuf_put_u8(buf, WLAN_ACTION_PROTECTED_EHT);
++	wpabuf_put_u8(buf, WLAN_PROT_EHT_T2L_MAPPING_TEARDOWN);
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++	wpabuf_free(buf);
++
++	return ret;
++
++}
++
++void hostapd_teardown_neg_ttlm(struct hostapd_data *hapd, struct sta_info *sta)
++{
++	const u8 *addr = sta->addr;
++
++	sta->neg_ttlm.valid = false;
++
++	if (hostapd_is_attlm_active(hapd) && !hapd->mld->new_attlm.switch_time) {
++		struct attlm_settings *attlm = &hapd->mld->new_attlm;
++		struct ieee80211_neg_ttlm ttlm;
++		int tid;
++		u16 map;
++
++		ttlm.valid = true;
++		for (tid = 0; tid < IEEE80211_TTLM_NUM_TIDS; tid++) {
++			map = ~attlm->disabled_links & hapd->mld->active_links;
++			ttlm.dlink[tid] = map;
++			ttlm.ulink[tid] = map;
++		}
++
++		hostapd_drv_set_sta_ttlm(hapd, addr, &ttlm);
++		return;
++	}
++
++	hostapd_drv_set_sta_ttlm(hapd, addr, NULL);
++	return;
++}
++
++
+ void ieee802_11_rx_protected_eht_action(struct hostapd_data *hapd,
+ 					const struct ieee80211_mgmt *mgmt,
+ 					size_t len)
+@@ -3000,7 +3282,7 @@ void ieee802_11_rx_protected_eht_action(struct hostapd_data *hapd,
+ 
+ 	sta = ap_get_sta(hapd, mgmt->sa);
+ 	if (!sta) {
+-		wpa_printf(MSG_DEBUG, "EHT: Station " MACSTR,
++		wpa_printf(MSG_DEBUG, "EHT: Station " MACSTR
+ 			   " not found for received Protected EHT Action",
+ 			   MAC2STR(mgmt->sa));
+ 		return;
+@@ -3023,6 +3305,17 @@ void ieee802_11_rx_protected_eht_action(struct hostapd_data *hapd,
+ 
+ 		ieee802_11_rx_eml_omn(hapd, mgmt->sa, payload, plen);
+ 		return;
++	case WLAN_PROT_EHT_T2L_MAPPING_REQUEST:
++		wpa_printf(MSG_INFO, "EHT: TTLM request");
++		ieee802_11_rx_neg_ttlm_req(hapd, mgmt->sa, payload, plen);
++		return;
++	case WLAN_PROT_EHT_T2L_MAPPING_RESPONSE:
++		wpa_printf(MSG_INFO, "EHT: TTLM response");
++		return;
++	case WLAN_PROT_EHT_T2L_MAPPING_TEARDOWN:
++		wpa_printf(MSG_INFO, "EHT: TTLM teardown");
++		ieee802_11_rx_neg_ttlm_teardown(hapd, mgmt->sa);
++		return;
+ 	}
+ 
+ 	wpa_printf(MSG_DEBUG,
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index ea9c12a73..f90436b75 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -323,6 +323,7 @@ struct sta_info {
+ 	struct link_reconf_req_list *reconf_req;
+ 	struct sta_info *mld_assoc_sta;
+ 	struct scs_session_status scs_session[SCS_MAX_CFG_CNT];
++	struct ieee80211_neg_ttlm neg_ttlm;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	u16 max_idle_period; /* if nonzero, the granted BSS max idle period in
+diff --git a/src/common/ieee802_11_common.c b/src/common/ieee802_11_common.c
+index 5cae464a4..641ea504b 100644
+--- a/src/common/ieee802_11_common.c
++++ b/src/common/ieee802_11_common.c
+@@ -412,6 +412,13 @@ static int ieee802_11_parse_extension(const u8 *pos, size_t elen,
+ 					 show_errors))
+ 			return -1;
+ 		break;
++	case WLAN_EID_EXT_TID_TO_LINK_MAPPING:
++		if (elen < 2 || elems->ttlm_num == IEEE80211_TTLM_MAX_CNT)
++			break;
++		elems->ttlm[elems->ttlm_num] = pos;
++		elems->ttlm_len[elems->ttlm_num] = elen;
++		elems->ttlm_num++;
++		break;
+ 	case WLAN_EID_EXT_KNOWN_BSSID:
+ 		elems->mbssid_known_bss = pos;
+ 		elems->mbssid_known_bss_len = elen;
+diff --git a/src/common/ieee802_11_common.h b/src/common/ieee802_11_common.h
+index 5f52b573c..692d4c418 100644
+--- a/src/common/ieee802_11_common.h
++++ b/src/common/ieee802_11_common.h
+@@ -113,6 +113,7 @@ struct ieee802_11_elems {
+ 	const u8 *basic_mle;
+ 	const u8 *probe_req_mle;
+ 	const u8 *reconf_mle;
++	const u8 *ttlm[IEEE80211_TTLM_MAX_CNT];
+ 	const u8 *tdls_mle;
+ 	const u8 *prior_access_mle;
+ 	const u8 *mbssid_known_bss;
+@@ -182,6 +183,8 @@ struct ieee802_11_elems {
+ 	size_t basic_mle_len;
+ 	size_t probe_req_mle_len;
+ 	size_t reconf_mle_len;
++	size_t ttlm_len[IEEE80211_TTLM_MAX_CNT];
++	u8 ttlm_num;
+ 	size_t tdls_mle_len;
+ 	size_t prior_access_mle_len;
+ 	u8 mbssid_known_bss_len;
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 4fe60192a..ce3fb64b7 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -5451,6 +5451,8 @@ struct wpa_driver_ops {
+ 	int (*link_remove)(void *priv, enum wpa_driver_if_type type,
+ 			   const char *ifname, u8 link_id);
+ 
++	int (*set_sta_ttlm)(void *priv, const char *addr,
++			    struct ieee80211_neg_ttlm *neg_ttlm);
+ 	/**
+ 	 * set_attlm - Set AP MLD advertised Tid-to-Link Mapping
+ 	 * @priv: Private driver interface data
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 9216eea61..df803ec7d 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -11480,6 +11480,32 @@ static bool nl80211_is_drv_shared(void *priv, int link_id)
+ }
+ 
+ 
++static int nl80211_set_sta_ttlm(void *priv, const char *addr,
++				struct ieee80211_neg_ttlm *neg_ttlm)
++{
++	struct i802_bss *bss = priv;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++	struct nl_msg *msg;
++
++	if (!(msg = nl80211_bss_msg(bss, 0, NL80211_CMD_SET_STA_TTLM)) ||
++	    nla_put(msg, NL80211_ATTR_MAC, ETH_ALEN, addr))
++		goto fail;
++
++	if (neg_ttlm &&
++	    (nla_put(msg, NL80211_ATTR_MLO_TTLM_DLINK,
++		     sizeof(neg_ttlm->dlink), neg_ttlm->dlink) ||
++	    nla_put(msg, NL80211_ATTR_MLO_TTLM_ULINK,
++		    sizeof(neg_ttlm->ulink), neg_ttlm->ulink)))
++		goto fail;
++
++	return send_and_recv_cmd(drv, msg);
++fail:
++	nl80211_nlmsg_clear(msg);
++	nlmsg_free(msg);
++	return -1;
++}
++
++
+ static int nl80211_set_attlm(void *priv, struct attlm_settings *attlm)
+ {
+ 	struct nl_msg *msg;
+@@ -16940,6 +16966,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.link_add = nl80211_link_add,
+ #ifdef CONFIG_IEEE80211BE
+ 	.link_remove = driver_nl80211_link_remove,
++	.set_sta_ttlm = nl80211_set_sta_ttlm,
+ 	.set_attlm = nl80211_set_attlm,
+ 	.is_drv_shared = nl80211_is_drv_shared,
+ 	.link_sta_remove = wpa_driver_nl80211_link_sta_remove,
+-- 
+2.45.2
+

@@ -1,0 +1,1194 @@
+From 64c29a1a33fcbf84f112e6dd4b88e0a51e0142d0 Mon Sep 17 00:00:00 2001
+From: Benjamin Lin <benjamin-jw.lin@mediatek.com>
+Date: Mon, 6 Jan 2025 17:54:08 +0800
+Subject: [PATCH 159/236] mtk: hostapd: add support for EPCS
+
+Add AP support for EPCS, including following features:
+1. Define EPCS macros and data structures
+2. Add hostapd_cli command "epcs" for user to perform following tasks:
+	(1) Authorize/deauthorize STA MLD to use EPCS
+	(2) Set EPCS WMM parameters of STA MLD
+	(3) Send following EPCS action frames:
+		<1> Request
+		<2> Unsolicited response
+		<3> Teardown
+	(4) Show authorized STAs' EPCS info
+3. Build EPCS action frames
+4. Handle EPCS action frames received from STA
+5. Add vendor command to set EPCS in driver
+
+Remove redundant colon when showing EPCS info.
+
+Signed-off-by: Benjamin Lin <benjamin-jw.lin@mediatek.com>
+
+Add bitfield.o in Makefile for standalone hostapd.
+
+Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
+
+Deinit epcs if epcs is init to prevent hostapd crash.
+
+Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
+
+Fix following build warnings:
+(1) Access to out-of-scope EPCS data structures
+(2) Implicit type conversion
+
+Signed-off-by: Benjamin Lin <benjamin-jw.lin@mediatek.com>
+
+Prevent null pointer access for legacy STAs when handling EPCS.
+
+Signed-off-by: Benjamin Lin <benjamin-jw.lin@mediatek.com>
+---
+ hostapd/Makefile                  |   1 +
+ hostapd/ctrl_iface.c              | 303 ++++++++++++++++++++++++++++++
+ hostapd/hostapd_cli.c             |   7 +
+ hostapd/main.c                    |  32 ++++
+ src/ap/ap_drv_ops.c               |  25 +++
+ src/ap/ap_drv_ops.h               |   3 +
+ src/ap/hostapd.c                  |  15 ++
+ src/ap/hostapd.h                  |  16 ++
+ src/ap/ieee802_11.h               |   8 +
+ src/ap/ieee802_11_eht.c           | 273 +++++++++++++++++++++++++++
+ src/ap/sta_info.h                 |   5 +
+ src/ap/wmm.c                      |  76 ++++++++
+ src/common/ieee802_11_defs.h      |   8 +
+ src/common/mtk_vendor.h           |  16 ++
+ src/drivers/driver.h              |  13 ++
+ src/drivers/driver_nl80211.c      |  44 +++++
+ src/drivers/driver_nl80211.h      |   1 +
+ src/drivers/driver_nl80211_capa.c |   3 +
+ 18 files changed, 849 insertions(+)
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index f5d26f991..0235bbd1f 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -89,6 +89,7 @@ OBJS += ../src/ap/beacon.o
+ OBJS += ../src/ap/bss_load.o
+ OBJS += ../src/ap/neighbor_db.o
+ OBJS += ../src/ap/rrm.o
++OBJS += ../src/utils/bitfield.o
+ OBJS += ../src/common/ptksa_cache.o
+ 
+ OBJS_c = hostapd_cli.o
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 32d822697..2aaa0d845 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -31,6 +31,7 @@
+ #include "utils/common.h"
+ #include "utils/eloop.h"
+ #include "utils/module_tests.h"
++#include "utils/bitfield.h"
+ #include "common/version.h"
+ #include "common/ieee802_11_defs.h"
+ #include "common/ctrl_iface_common.h"
+@@ -5535,6 +5536,306 @@ fail:
+ 	return os_snprintf(buf, buflen, "FAIL\n");
+ }
+ 
++static int
++hostapd_epcs_set_wmm_params(struct hapd_interfaces *ifaces,
++			    struct epcs_entry *entry, char *arg)
++{
++	while (arg) {
++		size_t len = sizeof(struct hostapd_wmm_ac_params) * WMM_AC_NUM;
++		struct hostapd_wmm_ac_params params[WMM_AC_NUM] = {0};
++		char *pos, *endptr, *tok, *saveptr;
++		unsigned long link_id;
++		bool dup = false;
++		int i, j;
++
++		/* Parse link ID */
++		pos = os_strchr(arg, '=');
++		if (!pos)
++			return -EINVAL;
++		*pos++ = '\0';
++
++		if (os_strcmp(arg, "link") != 0)
++			return -EINVAL;
++
++		arg = pos;
++		pos = os_strchr(arg, ' ');
++		if (!pos)
++			return -EINVAL;
++
++		link_id = strtoul(arg, &endptr, 0);
++		if (endptr != pos || link_id >= MAX_NUM_MLD_LINKS)
++			return -EINVAL;
++
++		/* Parse WMM parameters */
++		arg = pos + 1;
++		pos = os_strchr(arg, '=');
++		if (!pos)
++			return -EINVAL;
++		*pos++ = '\0';
++
++		if (os_strcmp(arg, "params") != 0)
++			return -EINVAL;
++
++		arg = pos;
++		pos = os_strchr(arg, ' ');
++		if (pos)
++			*pos++ = '\0';
++
++		tok = strtok_r(arg, ",", &saveptr);
++		for (i = WMM_AC_BE; i < WMM_AC_NUM; ++i) {
++			for (j = 0; j < 4; ++j) {
++				unsigned long val;
++
++				if (!tok)
++					return -EINVAL;
++
++				val = strtoul(tok, &endptr, 0);
++				if (*endptr != '\0')
++					return -EINVAL;
++
++				if (j == 0)
++					params[i].aifs = val;
++				else if (j == 1)
++					params[i].cwmin = val;
++				else if (j == 2)
++					params[i].cwmax = val;
++				else
++					params[i].txop_limit = val;
++
++				tok = strtok_r(NULL, ",", &saveptr);
++			}
++		}
++		arg = pos;
++
++		/* Update WMM parameters */
++		for (i = 0; i < EPCS_MAX_WMM_PARAMS; ++i) {
++			if (os_memcmp(params, ifaces->epcs.wmm_tbl[i], len) == 0) {
++				entry->wmm_idx[link_id] = i;
++				dup = true;
++				break;
++			}
++		}
++
++		if (!dup) {
++			struct bitfield *bf = bitfield_alloc(EPCS_MAX_WMM_PARAMS);
++			struct epcs_entry *iter;
++
++			if (!bf)
++				return -ENOMEM;
++
++			/* Default WMM parameter set will not be overwritten */
++			bitfield_set(bf, 0);
++
++			dl_list_for_each(iter, &ifaces->epcs.list,
++					 struct epcs_entry, list) {
++				for (i = 0; i < MAX_NUM_MLD_LINKS; ++i)
++					bitfield_set(bf, iter->wmm_idx[i]);
++			}
++
++			i = bitfield_get_first_zero(bf);
++			bitfield_free(bf);
++			if (i == -1)
++				return -ENOBUFS;
++
++			os_memcpy(ifaces->epcs.wmm_tbl[i], params, len);
++			entry->wmm_idx[link_id] = i;
++		}
++	}
++
++	return 0;
++}
++
++static int
++hostapd_epcs_teardown(struct hostapd_data *hapd, struct epcs_entry *entry,
++		      struct mld_info *mld, char *buf, size_t len)
++{
++	mld->epcs.enabled = false;
++
++	if (hostapd_drv_set_epcs(hapd, entry, mld))
++		return os_snprintf(buf, len, "Fail to set EPCS in driver\n");
++
++	if (ieee802_11_send_epcs_teardown(hapd, mld))
++		return os_snprintf(buf, len, "Fail to send EPCS teardown\n");
++
++	return 0;
++}
++
++static int
++hostapd_ctrl_iface_epcs(struct hostapd_data *hapd, char *cmd, char *buf, size_t len)
++{
++	struct hapd_interfaces *ifaces = hapd->iface->interfaces;
++	struct epcs_entry *entry = NULL;
++	char *pos, *addr_str = NULL;
++	struct sta_info *sta;
++	struct mld_info *mld;
++	u8 addr[ETH_ALEN];
++	int ret;
++
++	if (!hapd->conf->mld_ap)
++		return os_snprintf(buf, len, "%s: not AP MLD\n", hapd->conf->iface);
++
++	pos = os_strchr(cmd, ' ');
++	if (pos) {
++		*pos++ = '\0';
++		addr_str = pos;
++		pos = os_strchr(pos, ' ');
++		if (pos)
++			*pos++ = '\0';
++
++		if (hwaddr_aton(addr_str, addr))
++			return os_snprintf(buf, len, "Invalid MAC address: %s\n", addr_str);
++
++		entry = hostapd_epcs_get_entry(ifaces, addr);
++	}
++
++	if (os_strcmp(cmd, "show")) {
++		if (!addr_str)
++			return os_snprintf(buf, len, "No MAC address\n");
++
++		if (!entry) {
++			if (os_strcmp(cmd, "send_request") == 0 ||
++			    os_strcmp(cmd, "send_update") == 0 ||
++			    os_strcmp(cmd, "send_teardown") == 0)
++				return os_snprintf(buf, len, "%s: unauthorized\n", addr_str);
++			else if (os_strcmp(cmd, "deauthorize") == 0)
++				return os_snprintf(buf, len, "%s: already unauthorized\n", addr_str);
++		}
++	}
++
++	if (os_strcmp(cmd, "authorize") == 0) {
++		if (!entry) {
++			if (dl_list_len(&ifaces->epcs.list) > EPCS_MAX_AUTH_STAS)
++				return os_snprintf(buf, len, "# authorized STAs > %u\n",
++						   EPCS_MAX_AUTH_STAS);
++
++			entry = os_zalloc(sizeof(struct epcs_entry));
++			if (!entry)
++				return os_snprintf(buf, len, "Fail to allocate EPCS entry\n");
++
++			os_memcpy(entry->addr, addr, ETH_ALEN);
++			dl_list_add(&ifaces->epcs.list, &entry->list);
++		}
++
++		if (hostapd_epcs_set_wmm_params(ifaces, entry, pos))
++			return os_snprintf(buf, len, "Fail to set EPCS WMM parameters\n");
++	} else if (os_strcmp(cmd, "deauthorize") == 0) {
++		sta = ap_get_sta(hapd, addr);
++		if (sta && sta->mld_assoc_sta) {
++			sta = sta->mld_assoc_sta;
++			hapd = hostapd_mld_get_link_bss(hapd, sta->mld_assoc_link_id);
++			mld = &sta->mld_info;
++			if (mld->epcs.enabled) {
++				ret = hostapd_epcs_teardown(hapd, entry, mld, buf, len);
++				if (ret)
++					return ret;
++			}
++		}
++
++		dl_list_del(&entry->list);
++		os_free(entry);
++	} else if (os_strcmp(cmd, "send_request") == 0) {
++		sta = ap_get_sta(hapd, addr);
++		if (!sta)
++			return os_snprintf(buf, len, "%s: not connected to %s\n",
++					   addr_str, hapd->conf->iface);
++
++		sta = sta->mld_assoc_sta;
++		if (!sta)
++			return os_snprintf(buf, len, "%s: not STA MLD\n", addr_str);
++
++		if (!(le_to_host16(sta->eht_capab->mac_cap) & EHT_MACCAP_EPCS_PRIO))
++			return os_snprintf(buf, len, "%s: not support EPCS\n", addr_str);
++
++		hapd = hostapd_mld_get_link_bss(hapd, sta->mld_assoc_link_id);
++		mld = &sta->mld_info;
++		if (mld->epcs.enabled)
++			return os_snprintf(buf, len, "%s: EPCS already enabled\n", addr_str);
++
++		if (ieee802_11_send_epcs_req(hapd, mld, entry->wmm_idx))
++			return os_snprintf(buf, len, "Fail to send EPCS request\n");
++	} else if (os_strcmp(cmd, "send_update") == 0) {
++		sta = ap_get_sta(hapd, addr);
++		if (!sta)
++			return os_snprintf(buf, len, "%s: not connected to %s\n",
++					   addr_str, hapd->conf->iface);
++
++		sta = sta->mld_assoc_sta;
++		if (!sta)
++			return os_snprintf(buf, len, "%s: not STA MLD\n", addr_str);
++
++		if (!(le_to_host16(sta->eht_capab->mac_cap) & EHT_MACCAP_UNSOL_EPCS_PARAM_UPDATE))
++			return os_snprintf(buf, len, "%s: not support unsolicited EPCS update\n", addr_str);
++
++		hapd = hostapd_mld_get_link_bss(hapd, sta->mld_assoc_link_id);
++		mld = &sta->mld_info;
++		if (!mld->epcs.enabled)
++			return os_snprintf(buf, len, "%s: EPCS not enabled\n", addr_str);
++
++		if (hostapd_drv_set_epcs(hapd, entry, mld))
++			return os_snprintf(buf, len, "Fail to set EPCS in driver\n");
++
++		if (ieee802_11_send_epcs_resp(hapd, mld, 0, WLAN_STATUS_SUCCESS, entry->wmm_idx))
++			return os_snprintf(buf, len, "Fail to send unsolicited EPCS response\n");
++	} else if (os_strcmp(cmd, "send_teardown") == 0) {
++		sta = ap_get_sta(hapd, addr);
++		if (!sta)
++			return os_snprintf(buf, len, "%s: not connected to %s\n",
++					   addr_str, hapd->conf->iface);
++
++		sta = sta->mld_assoc_sta;
++		if (!sta)
++			return os_snprintf(buf, len, "%s: not STA MLD\n", addr_str);
++
++		hapd = hostapd_mld_get_link_bss(hapd, sta->mld_assoc_link_id);
++		mld = &sta->mld_info;
++		if (!mld->epcs.enabled)
++			return os_snprintf(buf, len, "%s: EPCS not enabled\n", addr_str);
++
++		ret = hostapd_epcs_teardown(hapd, entry, mld, buf, len);
++		if (ret)
++			return ret;
++	} else if (os_strcmp(cmd, "show") == 0) {
++		wpa_printf(MSG_INFO, "EPCS authorized-STA list:");
++		dl_list_for_each(entry, &ifaces->epcs.list, struct epcs_entry, list) {
++			int i, j;
++
++			wpa_printf(MSG_INFO, "\tSTA " MACSTR, MAC2STR(entry->addr));
++
++			sta = ap_get_sta(hapd, entry->addr);
++			if (!sta || !sta->mld_assoc_sta) {
++				wpa_printf(MSG_INFO, "\t\tNot MLD connected to %s",
++					   hapd->conf->iface);
++				continue;
++			}
++
++			mld = &sta->mld_assoc_sta->mld_info;
++
++			wpa_printf(MSG_INFO, "\t\tState: %s",
++				   mld->epcs.enabled ? "enabled" : "torn down");
++			wpa_printf(MSG_INFO, "\t\tDialog token: %hhu", mld->epcs.dialog_token);
++			wpa_printf(MSG_INFO, "\t\tEDCA parameters:");
++			for (i = 0; i < MAX_NUM_MLD_LINKS; ++i) {
++				u16 idx = entry->wmm_idx[i];
++				struct hostapd_wmm_ac_params *params = ifaces->epcs.wmm_tbl[idx];
++
++				if (!mld->links[i].valid)
++					continue;
++
++				wpa_printf(MSG_INFO, "\t\t\tLink %hhu:", i);
++				wpa_printf(MSG_INFO, "\t\t\t\tWMM index: %hu", idx);
++				wpa_printf(MSG_INFO, "\t\t\t\tAC\tAIFSN\tECWmin\tECWmax\tTXOP");
++				for (j = WMM_AC_BE; j < WMM_AC_NUM; ++j)
++					wpa_printf(MSG_INFO, "\t\t\t\t%d\t%d\t%d\t%d\t%d", j,
++						   params[j].aifs, params[j].cwmin,
++						   params[j].cwmax, params[j].txop_limit);
++			}
++		}
++	} else
++		return os_snprintf(buf, len, "Unknown command: %s\n", cmd);
++
++	return os_snprintf(buf, len, "OK\n");
++}
++
+ static int
+ hostapd_ctrl_iface_set_csi(struct hostapd_data *hapd, char *cmd,
+ 			   char *buf, size_t buflen)
+@@ -6486,6 +6787,8 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 						   reply, reply_size);
+ 	} else if (os_strncmp(buf, "EML_RESP ", 9) == 0) {
+ 		reply_len = hostapd_ctrl_iface_set_eml_resp(hapd, buf + 9, reply, reply_size);
++	} else if (os_strncmp(buf, "EPCS ", 5) == 0) {
++		reply_len = hostapd_ctrl_iface_epcs(hapd, buf + 5, reply, reply_size);
+ 	} else {
+ 		os_memcpy(reply, "UNKNOWN COMMAND\n", 16);
+ 		reply_len = 16;
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 4446d2c52..ed0e70bdc 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1834,6 +1834,11 @@ static int hostapd_cli_cmd_neg_ttlm_teardown(struct wpa_ctrl *ctrl, int argc,
+ 	return hostapd_cli_cmd(ctrl, "NEG_TTLM_TEARDOWN", 1, argc, argv);
+ }
+ 
++static int hostapd_cli_cmd_epcs(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	return hostapd_cli_cmd(ctrl, "EPCS", 1, argc, argv);
++}
++
+ struct hostapd_cli_cmd {
+ 	const char *cmd;
+ 	int (*handler)(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+@@ -2108,6 +2113,8 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 		" = Disable the affiliated AP of a MLD AP" },
+ 	{ "neg_ttlm_teardown", hostapd_cli_cmd_neg_ttlm_teardown, NULL,
+ 		" = Teardown the Negotiated TTLM with the STA" },
++	{ "epcs", hostapd_cli_cmd_epcs, NULL,
++		" = Control EPCS priority access" },
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+diff --git a/hostapd/main.c b/hostapd/main.c
+index c73fb3b0f..d3346b84b 100644
+--- a/hostapd/main.c
++++ b/hostapd/main.c
+@@ -811,6 +811,36 @@ static void hostapd_global_cleanup_mld(struct hapd_interfaces *interfaces)
+ }
+ 
+ 
++static void hostapd_epcs_init(struct hapd_interfaces *ifaces)
++{
++	struct hostapd_wmm_ac_params default_params[WMM_AC_NUM] = {
++		{4, 9, 3, 0, 0},
++		{4, 9, 7, 0, 0},
++		{3, 4, 2, 188, 0},
++		{2, 3, 2, 102, 0}
++	};
++
++	dl_list_init(&ifaces->epcs.list);
++	os_memcpy(ifaces->epcs.wmm_tbl[0], default_params,
++		  sizeof(struct hostapd_wmm_ac_params) * WMM_AC_NUM);
++}
++
++
++static void hostapd_epcs_free(struct hapd_interfaces *ifaces)
++{
++	struct epcs_entry *entry, *n;
++
++	if (!ifaces->epcs.list.prev || !ifaces->epcs.list.next)
++		return;
++
++	dl_list_for_each_safe(entry, n, &ifaces->epcs.list,
++			      struct epcs_entry, list) {
++		dl_list_del(&entry->list);
++		os_free(entry);
++	}
++}
++
++
+ int main(int argc, char *argv[])
+ {
+ 	struct hapd_interfaces interfaces;
+@@ -1081,6 +1111,7 @@ int main(int argc, char *argv[])
+ 
+ 	hostapd_global_ctrl_iface_init(&interfaces);
+ 	hostapd_ucode_init(&interfaces);
++	hostapd_epcs_init(&interfaces);
+ 
+ 	if (hostapd_global_run(&interfaces, daemonize, pid_file)) {
+ 		wpa_printf(MSG_ERROR, "Failed to start eloop");
+@@ -1090,6 +1121,7 @@ int main(int argc, char *argv[])
+ 	ret = 0;
+ 
+  out:
++	hostapd_epcs_free(&interfaces);
+ 	hostapd_ucode_free();
+ 	hostapd_global_ctrl_iface_deinit(&interfaces);
+ 	/* Deinitialize all interfaces */
+diff --git a/src/ap/ap_drv_ops.c b/src/ap/ap_drv_ops.c
+index 85fcf9f28..25b4492e2 100644
+--- a/src/ap/ap_drv_ops.c
++++ b/src/ap/ap_drv_ops.c
+@@ -1751,6 +1751,31 @@ int hostapd_drv_set_eml_omn(struct hostapd_data *hapd, const u8 *mac,
+ 	return hapd->driver->set_eml_omn(hapd->drv_priv, link_id, mac, omn_ie);
+ }
+ 
++int hostapd_drv_set_epcs(struct hostapd_data *hapd, struct epcs_entry *entry,
++			 struct mld_info *mld)
++{
++	struct hapd_interfaces *ifaces = hapd->iface->interfaces;
++	int i, ret;
++
++	if (!hapd->driver || !hapd->driver->set_epcs || !hapd->conf->mld_ap)
++		return -EOPNOTSUPP;
++
++	for (i = 0; i < MAX_NUM_MLD_LINKS; i++) {
++		u16 wmm_idx = entry->wmm_idx[i];
++
++		if (!mld->links[i].valid)
++			continue;
++
++		ret = hapd->driver->set_epcs(hapd->drv_priv, entry->addr, i,
++					     mld->epcs.enabled, wmm_idx,
++					     ifaces->epcs.wmm_tbl[wmm_idx]);
++		if (ret)
++			return ret;
++	}
++
++	return ret;
++}
++
+ int hostapd_drv_csi_set(struct hostapd_data *hapd, u8 mode, u8 cfg, u8 v1, u32 v2, u8 *mac)
+ {
+ 	s8 link_id = -1;
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index 86c32ba42..c3e113ce2 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -15,6 +15,7 @@ struct wpa_driver_scan_params;
+ struct ieee80211_ht_capabilities;
+ struct ieee80211_vht_capabilities;
+ struct hostapd_freq_params;
++struct mld_info;
+ 
+ u32 hostapd_sta_flags_to_drv(u32 flags);
+ int hostapd_build_ap_extra_ies(struct hostapd_data *hapd,
+@@ -186,6 +187,8 @@ int hostapd_drv_pp_mode_set(struct hostapd_data *hapd);
+ int hostapd_drv_beacon_ctrl(struct hostapd_data *hapd, u8 beacon_mode);
+ int hostapd_drv_set_eml_omn(struct hostapd_data *hapd, const u8 *mac,
+ 			    struct eml_omn_element *omn_ie);
++int hostapd_drv_set_epcs(struct hostapd_data *hapd, struct epcs_entry *entry,
++			 struct mld_info *mld);
+ int hostapd_drv_csi_set(struct hostapd_data *hapd, u8 mode, u8 cfg, u8 v1, u32 v2, u8 *mac);
+ int hostapd_drv_csi_dump(struct hostapd_data *hapd, void *dump_buf);
+ 
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 5cd94a756..2e9681888 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -5825,3 +5825,18 @@ u16 hostapd_get_punct_bitmap(struct hostapd_data *hapd)
+ 
+ 	return punct_bitmap;
+ }
++
++
++struct epcs_entry *
++hostapd_epcs_get_entry(struct hapd_interfaces *ifaces, const u8 *addr)
++{
++	struct epcs_entry *entry;
++
++	dl_list_for_each(entry, &ifaces->epcs.list, struct epcs_entry, list) {
++		if (ether_addr_equal(addr, entry->addr))
++			return entry;
++	}
++
++	return NULL;
++}
++
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 2b032bdb3..b72e3e6ed 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -48,6 +48,15 @@ struct mesh_conf;
+ struct hostapd_iface;
+ struct hostapd_mld;
+ 
++#define EPCS_MAX_WMM_PARAMS	4
++#define EPCS_MAX_AUTH_STAS	64
++
++struct epcs_entry {
++	u8 addr[ETH_ALEN];
++	u16 wmm_idx[MAX_NUM_MLD_LINKS];
++	struct dl_list list;
++};
++
+ struct hapd_interfaces {
+ 	int (*reload_config)(struct hostapd_iface *iface);
+ 	struct hostapd_config * (*config_read_cb)(const char *config_fname);
+@@ -106,6 +115,11 @@ struct hapd_interfaces {
+ 	int (*mld_ctrl_iface_init)(struct hostapd_mld *mld);
+ 	void (*mld_ctrl_iface_deinit)(struct hostapd_mld *mld);
+ #endif /* CONFIG_IEEE80211BE */
++
++	struct {
++		struct dl_list list;
++		struct hostapd_wmm_ac_params wmm_tbl[EPCS_MAX_WMM_PARAMS][WMM_AC_NUM];
++	} epcs;
+ };
+ 
+ enum hostapd_chan_status {
+@@ -1070,6 +1084,8 @@ static inline bool hostapd_mld_is_first_bss(struct hostapd_data *hapd)
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ u16 hostapd_get_punct_bitmap(struct hostapd_data *hapd);
++struct epcs_entry *
++hostapd_epcs_get_entry(struct hapd_interfaces *ifaces, const u8 *addr);
+ 
+ static inline bool ap_pmf_enabled(struct hostapd_bss_config *conf)
+ {
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index bc4b985fe..8e97b5247 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -328,4 +328,12 @@ void hostapd_link_reconf_resp_tx_status(struct hostapd_data *hapd,
+ 
+ int ieee802_11_send_neg_ttlm_teardown(struct hostapd_data *hapd, const u8 *addr);
+ void hostapd_teardown_neg_ttlm(struct hostapd_data *hapd, struct sta_info *sta);
++size_t hostapd_eid_eht_epcs_ml_len(struct mld_info *mld);
++int hostapd_eid_eht_epcs_ml(struct hostapd_data *hapd, struct wpabuf *buf,
++			    struct mld_info *mld, u16 *wmm_idx_tbl);
++int ieee802_11_send_epcs_req(struct hostapd_data *hapd, struct mld_info *mld,
++			     u16 *wmm_idx_tbl);
++int ieee802_11_send_epcs_resp(struct hostapd_data *hapd, struct mld_info *mld,
++			      u8 dialog_token, u16 status, u16 *wmm_idx_tbl);
++int ieee802_11_send_epcs_teardown(struct hostapd_data *hapd, struct mld_info *mld);
+ #endif /* IEEE802_11_H */
+diff --git a/src/ap/ieee802_11_eht.c b/src/ap/ieee802_11_eht.c
+index 9d2911144..ab15ebb09 100644
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -3210,6 +3210,270 @@ static void ieee802_11_rx_neg_ttlm_teardown(struct hostapd_data *hapd, const u8
+ }
+ 
+ 
++int ieee802_11_send_epcs_req(struct hostapd_data *hapd, struct mld_info *mld,
++			     u16 *wmm_idx_tbl)
++{
++	struct wpabuf *buf = wpabuf_alloc(3 + hostapd_eid_eht_epcs_ml_len(mld));
++	int ret;
++
++	if (!buf)
++		return -ENOMEM;
++
++	mld->epcs.dialog_token++;
++	if (mld->epcs.dialog_token == 0)
++		mld->epcs.dialog_token++;
++
++	wpabuf_put_u8(buf, WLAN_ACTION_PROTECTED_EHT);
++	wpabuf_put_u8(buf, WLAN_PROT_EHT_EPCS_ENABLE_REQUEST);
++	wpabuf_put_u8(buf, mld->epcs.dialog_token);
++
++	ret = hostapd_eid_eht_epcs_ml(hapd, buf, mld, wmm_idx_tbl);
++	if (ret)
++		goto free;
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0,
++				      mld->common_info.mld_addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++free:
++	wpabuf_free(buf);
++
++	return ret;
++}
++
++int ieee802_11_send_epcs_resp(struct hostapd_data *hapd, struct mld_info *mld,
++			      u8 dialog_token, u16 status, u16 *wmm_idx_tbl)
++{
++	struct wpabuf *buf = wpabuf_alloc(5 + hostapd_eid_eht_epcs_ml_len(mld));
++	int ret;
++
++	if (!buf)
++		return -ENOMEM;
++
++	wpabuf_put_u8(buf, WLAN_ACTION_PROTECTED_EHT);
++	wpabuf_put_u8(buf, WLAN_PROT_EHT_EPCS_ENABLE_RESPONSE);
++	wpabuf_put_u8(buf, dialog_token);
++	wpabuf_put_le16(buf, status);
++
++	ret = hostapd_eid_eht_epcs_ml(hapd, buf, mld, wmm_idx_tbl);
++	if (ret)
++		goto free;
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0,
++				      mld->common_info.mld_addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++free:
++	wpabuf_free(buf);
++
++	return ret;
++}
++
++int ieee802_11_send_epcs_teardown(struct hostapd_data *hapd, struct mld_info *mld)
++{
++	struct wpabuf *buf = wpabuf_alloc(2);
++	int ret;
++
++	if (!buf)
++		return -ENOMEM;
++
++	wpabuf_put_u8(buf, WLAN_ACTION_PROTECTED_EHT);
++	wpabuf_put_u8(buf, WLAN_PROT_EHT_EPCS_ENABLE_TEARDOWN);
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0,
++				      mld->common_info.mld_addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++	wpabuf_free(buf);
++
++	return ret;
++}
++
++static void
++ieee802_11_rx_epcs_req(struct hostapd_data *hapd, const u8 *addr,
++		       const u8 *frm, size_t len)
++{
++	struct hapd_interfaces *ifaces = hapd->iface->interfaces;
++	struct epcs_entry *entry = hostapd_epcs_get_entry(ifaces, addr);
++	u16 status = WLAN_STATUS_SUCCESS;
++	struct sta_info *sta;
++	struct mld_info *mld;
++
++	wpa_printf(MSG_INFO, "Receive EPCS request from " MACSTR, MAC2STR(addr));
++
++	if (!hapd->conf->mld_ap) {
++		wpa_printf(MSG_ERROR, "%s: not AP MLD", hapd->conf->iface);
++		status = WLAN_STATUS_EPCS_DENIED;
++		goto send;
++	}
++
++	if (len != 1) {
++		wpa_printf(MSG_ERROR, "Malformed request");
++		status = WLAN_STATUS_EPCS_DENIED;
++		goto send;
++	}
++
++	if (!entry) {
++		wpa_printf(MSG_ERROR, MACSTR ": unauthorized", MAC2STR(addr));
++		status = WLAN_STATUS_EPCS_DENIED_UNAUTHORIZED;
++		goto send;
++	}
++
++	sta = ap_get_sta(hapd, addr);
++	if (!sta) {
++		wpa_printf(MSG_ERROR, "Fail to get STA info");
++		status = WLAN_STATUS_EPCS_DENIED;
++		goto send;
++	}
++
++	sta = sta->mld_assoc_sta;
++	if (!sta) {
++		wpa_printf(MSG_ERROR, MACSTR ": not STA MLD", MAC2STR(addr));
++		status = WLAN_STATUS_EPCS_DENIED;
++		goto send;
++	}
++
++	if (!(le_to_host16(sta->eht_capab->mac_cap) & EHT_MACCAP_EPCS_PRIO)) {
++		wpa_printf(MSG_ERROR, MACSTR ": not support EPCS", MAC2STR(addr));
++		status = WLAN_STATUS_EPCS_DENIED;
++		goto send;
++	}
++
++	mld = &sta->mld_info;
++	if (mld->epcs.enabled) {
++		wpa_printf(MSG_ERROR, MACSTR ": EPCS already enabled", MAC2STR(addr));
++		goto send;
++	}
++
++	mld->epcs.enabled = true;
++	if (hostapd_drv_set_epcs(hapd, entry, mld)) {
++		wpa_printf(MSG_ERROR, "Fail to set EPCS in driver");
++		mld->epcs.enabled = false;
++		status = WLAN_STATUS_EPCS_DENIED;
++	}
++send:
++	if (ieee802_11_send_epcs_resp(hapd, mld, *frm, status, entry->wmm_idx))
++		wpa_printf(MSG_ERROR, "Fail to send EPCS response");
++
++	return;
++}
++
++static void
++ieee802_11_rx_epcs_resp(struct hostapd_data *hapd, const u8 *addr,
++			const u8 *frm, size_t len)
++{
++	struct hapd_interfaces *ifaces = hapd->iface->interfaces;
++	struct epcs_entry *entry = hostapd_epcs_get_entry(ifaces, addr);
++	le16 *status = (le16 *)(frm + 1);
++	struct sta_info *sta;
++	struct mld_info *mld;
++
++	wpa_printf(MSG_INFO, "Receive EPCS response from " MACSTR, MAC2STR(addr));
++
++	if (!hapd->conf->mld_ap) {
++		wpa_printf(MSG_ERROR, "%s: not AP MLD", hapd->conf->iface);
++		return;
++	}
++
++	if (len != 3) {
++		wpa_printf(MSG_ERROR, "Malformed response");
++		return;
++	}
++
++	if (!entry) {
++		wpa_printf(MSG_ERROR, MACSTR ": unauthorized", MAC2STR(addr));
++		return;
++	}
++
++	sta = ap_get_sta(hapd, addr);
++	if (!sta) {
++		wpa_printf(MSG_ERROR, "Fail to get STA info");
++		return;
++	}
++
++	sta = sta->mld_assoc_sta;
++	if (!sta) {
++		wpa_printf(MSG_ERROR, MACSTR ": not STA MLD", MAC2STR(addr));
++		return;
++	}
++
++	if (!(le_to_host16(sta->eht_capab->mac_cap) & EHT_MACCAP_EPCS_PRIO)) {
++		wpa_printf(MSG_ERROR, MACSTR ": not support EPCS", MAC2STR(addr));
++		return;
++	}
++
++	mld = &sta->mld_info;
++	if (*frm != mld->epcs.dialog_token) {
++		wpa_printf(MSG_ERROR, "Mismatched dialog token");
++		return;
++	}
++
++	if (le_to_host16(*status) != WLAN_STATUS_SUCCESS) {
++		wpa_printf(MSG_ERROR, "Previous request denied (status: %u)",
++			   le_to_host16(*status));
++		return;
++	}
++
++	if (mld->epcs.enabled) {
++		wpa_printf(MSG_ERROR, MACSTR ": EPCS already enabled", MAC2STR(addr));
++		return;
++	}
++
++	mld->epcs.enabled = true;
++	if (hostapd_drv_set_epcs(hapd, entry, mld)) {
++		wpa_printf(MSG_ERROR, "Fail to set EPCS in driver");
++		mld->epcs.enabled = false;
++	}
++
++	return;
++}
++
++static void
++ieee802_11_rx_epcs_teardown(struct hostapd_data *hapd, const u8 *addr,
++			    const u8 *frm, size_t len)
++{
++	struct hapd_interfaces *ifaces = hapd->iface->interfaces;
++	struct epcs_entry *entry = hostapd_epcs_get_entry(ifaces, addr);
++	struct sta_info *sta;
++	struct mld_info *mld;
++
++	wpa_printf(MSG_INFO, "Receive EPCS teardown from " MACSTR, MAC2STR(addr));
++
++	if (!hapd->conf->mld_ap) {
++		wpa_printf(MSG_ERROR, "%s: not AP MLD", hapd->conf->iface);
++		return;
++	}
++
++	if (len != 0) {
++		wpa_printf(MSG_ERROR, "Malformed teardown");
++		return;
++	}
++
++	if (!entry) {
++		wpa_printf(MSG_ERROR, MACSTR ": unauthorized", MAC2STR(addr));
++		return;
++	}
++
++	sta = ap_get_sta(hapd, addr);
++	if (!sta) {
++		wpa_printf(MSG_ERROR, "Fail to get STA info");
++		return;
++	} else if (!sta->mld_assoc_sta) {
++		wpa_printf(MSG_ERROR, MACSTR ": not STA MLD", MAC2STR(addr));
++		return;
++	}
++
++	mld = &sta->mld_assoc_sta->mld_info;
++	if (!mld->epcs.enabled) {
++		wpa_printf(MSG_ERROR, MACSTR ": EPCS not enabled", MAC2STR(addr));
++		return;
++	}
++
++	mld->epcs.enabled = false;
++	if (hostapd_drv_set_epcs(hapd, entry, mld))
++		wpa_printf(MSG_ERROR, "Fail to set EPCS in driver");
++
++	return;
++}
++
++
+ int ieee802_11_send_neg_ttlm_teardown(struct hostapd_data *hapd, const u8 *addr)
+ {
+ 	struct wpabuf *buf;
+@@ -3322,6 +3586,15 @@ void ieee802_11_rx_protected_eht_action(struct hostapd_data *hapd,
+ 		wpa_printf(MSG_INFO, "EHT: TTLM teardown");
+ 		ieee802_11_rx_neg_ttlm_teardown(hapd, mgmt->sa);
+ 		return;
++	case WLAN_PROT_EHT_EPCS_ENABLE_REQUEST:
++		ieee802_11_rx_epcs_req(hapd, mgmt->sa, payload, plen);
++		return;
++	case WLAN_PROT_EHT_EPCS_ENABLE_RESPONSE:
++		ieee802_11_rx_epcs_resp(hapd, mgmt->sa, payload, plen);
++		return;
++	case WLAN_PROT_EHT_EPCS_ENABLE_TEARDOWN:
++		ieee802_11_rx_epcs_teardown(hapd, mgmt->sa, payload, plen);
++		return;
+ 	}
+ 
+ 	wpa_printf(MSG_DEBUG,
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index f90436b75..76866dab0 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -82,6 +82,11 @@ struct mld_info {
+ 	} common_info;
+ 
+ 	struct mld_link_info links[MAX_NUM_MLD_LINKS];
++
++	struct {
++		bool enabled;
++		u8 dialog_token;
++	} epcs;
+ };
+ 
+ struct sta_info {
+diff --git a/src/ap/wmm.c b/src/ap/wmm.c
+index dad768e7b..1c89fdd66 100644
+--- a/src/ap/wmm.c
++++ b/src/ap/wmm.c
+@@ -383,3 +383,79 @@ void hostapd_wmm_action(struct hostapd_data *hapd,
+ 		       "hostapd_wmm_action - unknown action code %d",
+ 		       action_code);
+ }
++
++size_t hostapd_eid_eht_epcs_ml_len(struct mld_info *mld)
++{
++	size_t len = 3 + sizeof(struct ieee80211_eht_ml) +
++		     sizeof(struct eht_ml_epcs_common_info);
++	int link_id;
++
++	for (link_id = 0; link_id < MAX_NUM_MLD_LINKS; ++link_id) {
++		if (!mld->links[link_id].valid)
++			continue;
++
++		/* Subelement ID + Length + STA Control + STA Profile
++		 * STA Profile: Contains only one WMM Parameter Element
++		 */
++		len += 2 + sizeof(struct ieee80211_eht_per_sta_profile) +
++		       2 + sizeof(struct wmm_parameter_element);
++	}
++
++	return len;
++}
++
++int hostapd_eid_eht_epcs_ml(struct hostapd_data *hapd, struct wpabuf *buf,
++			    struct mld_info *mld, u16 *wmm_idx_tbl)
++{
++	struct hapd_interfaces *ifaces = hapd->iface->interfaces;
++	int link_id;
++
++	wpabuf_put_u8(buf, WLAN_EID_EXTENSION);
++	wpabuf_put_u8(buf, hostapd_eid_eht_epcs_ml_len(mld) - 2);
++	wpabuf_put_u8(buf, WLAN_EID_EXT_MULTI_LINK);
++	wpabuf_put_le16(buf, MULTI_LINK_CONTROL_TYPE_PRIOR_ACCESS);
++
++	/* Common Info */
++	wpabuf_put_u8(buf, sizeof(struct eht_ml_epcs_common_info));
++	wpabuf_put_data(buf, hapd->mld->mld_addr, ETH_ALEN);
++
++	/* Link Info */
++	for (link_id = 0; link_id < MAX_NUM_MLD_LINKS; ++link_id) {
++		struct wmm_parameter_element *elem;
++		u16 idx = wmm_idx_tbl[link_id];
++		u8 *pos, ac;
++
++		if (!mld->links[link_id].valid)
++			continue;
++
++		/* Per-STA Profile subelement */
++		wpabuf_put_u8(buf, EHT_ML_SUB_ELEM_PER_STA_PROFILE);
++		wpabuf_put_u8(buf, sizeof(struct ieee80211_eht_per_sta_profile) +
++				   2 + sizeof(struct wmm_parameter_element));
++		wpabuf_put_le16(buf, link_id);
++
++		/* WMM Parameter Element */
++		pos = wpabuf_put(buf, 2 + sizeof(struct wmm_parameter_element));
++		if (!pos)
++			return -ENOBUFS;
++
++		if (hostapd_eid_wmm(hapd, pos) == pos)
++			return -EPERM;
++
++		/* Overwrite AC parameters with EPCS ones */
++		elem = (struct wmm_parameter_element *)(pos + 2);
++		for (ac = WMM_AC_BE; ac < WMM_AC_NUM; ++ac) {
++			struct hostapd_wmm_ac_params *epcs = &ifaces->epcs.wmm_tbl[idx][ac];
++			struct wmm_ac_parameter *params = &elem->ac[ac];
++
++			params->aci_aifsn = wmm_aci_aifsn(epcs->aifs,
++							  epcs->admission_control_mandatory,
++							  ac);
++			params->cw = wmm_ecw(epcs->cwmin, epcs->cwmax);
++			params->txop_limit = host_to_le16(epcs->txop_limit);
++		}
++	}
++
++	return 0;
++}
++
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 80989b751..e60c55f7a 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -2788,6 +2788,7 @@ struct ieee80211_eht_operation {
+ #define EHT_MACCAP_MAX_MPDU_LEN_7991		BIT(6)
+ #define EHT_MACCAP_MAX_MPDU_LEN_11454		BIT(7)
+ #define EHT_MACCAP_MAX_AMPDU_LEN_EXP_EXT	BIT(8)
++#define EHT_MACCAP_UNSOL_EPCS_PARAM_UPDATE	BIT(14)
+ 
+ /* Figure 9-1002ag: EHT PHY Capabilities Information field format
+  * _IDX indicates the octet index within the field */
+@@ -3054,6 +3055,13 @@ enum ieee80211_eht_ml_sub_elem {
+ 	EHT_ML_SUB_ELEM_FRAGMENT = 254,
+ };
+ 
++/* IEEE P802.11be/D7.0, 9.4.2.322.6 - Common Info field of EPCS Priority Access
++ * Multi-Link element */
++struct eht_ml_epcs_common_info {
++	u8 len;
++	u8 addr[ETH_ALEN];
++} STRUCT_PACKED;
++
+ /* IEEE P802.11be/D7.0, 9.4.2.329 (Bandwidth Indication element) defines the
+  * Bandwidth Indication Information field to have the same definition as the
+  * EHT Operation Information field in the EHT Operation element.
+diff --git a/src/common/mtk_vendor.h b/src/common/mtk_vendor.h
+index b85e73797..cc74f7a01 100644
+--- a/src/common/mtk_vendor.h
++++ b/src/common/mtk_vendor.h
+@@ -22,6 +22,7 @@ enum mtk_nl80211_vendor_subcmds {
+ 	MTK_NL80211_VENDOR_SUBCMD_TXPOWER_CTRL = 0xce,
+ 	MTK_NL80211_VENDOR_SUBCMD_SCS_CTRL = 0xd0,
+ 	MTK_NL80211_VENDOR_SUBCMD_EML_CTRL = 0xd3,
++	MTK_NL80211_VENDOR_SUBCMD_EPCS_CTRL = 0xd4,
+ };
+ 
+ enum mtk_nl80211_vendor_subevents {
+@@ -313,6 +314,21 @@ enum mtk_vendor_attr_eml_ctrl {
+ 		NUM_MTK_VENDOR_ATTRS_EML_CTRL -1
+ };
+ 
++enum mtk_vendor_attr_epcs_ctrl {
++	MTK_VENDOR_ATTR_EPCS_UNSPEC,
++
++	MTK_VENDOR_ATTR_EPCS_ADDR,
++	MTK_VENDOR_ATTR_EPCS_LINK_ID,
++	MTK_VENDOR_ATTR_EPCS_ENABLE,
++	MTK_VENDOR_ATTR_EPCS_WMM_IDX,
++	MTK_VENDOR_ATTR_EPCS_WMM_PARAMS,
++
++	/* keep last */
++	NUM_MTK_VENDOR_ATTRS_EPCS_CTRL,
++	MTK_VENDOR_ATTR_EPCS_CTRL_MAX =
++		NUM_MTK_VENDOR_ATTRS_EPCS_CTRL - 1
++};
++
+ enum mtk_vendor_attr_txpower_ctrl {
+ 	MTK_VENDOR_ATTR_TXPOWER_CTRL_UNSPEC,
+ 
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index fff88007e..1dc55ffaa 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -21,6 +21,7 @@
+ 
+ #include "common/defs.h"
+ #include "common/ieee802_11_defs.h"
++#include "common/ieee802_11_common.h"
+ #include "common/wpa_common.h"
+ #include "common/nan.h"
+ #ifdef CONFIG_MACSEC
+@@ -5628,6 +5629,18 @@ struct wpa_driver_ops {
+ 	int (*set_eml_omn)(void *priv, u8 link_id, const u8 *addr,
+                            struct eml_omn_element *omn_ie);
+ 
++	/**
++	 * set_epcs - Set EPCS state and WMM parameters for peer MLD in driver
++	 * @priv: Private driver interface data
++	 * @addr: Peer's MLD address
++	 * @link_id: Link ID to set state and parameters on
++	 * @enable: Enable/disable EPCS for peer MLD
++	 * @wmm_idx: Index of WMM parameters to set
++	 * @params: WMM parameters to set
++	 */
++	int (*set_epcs)(void *priv, u8 *addr, u8 link_id, bool enable,
++			u16 wmm_idx, struct hostapd_wmm_ac_params *params);
++
+ 	/**
+ 	 * three_wire_ctrl - set three_wire_ctrl mode
+ 	 * @priv: Private driver interface data
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index d8d690689..26d6a69f6 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -16464,6 +16464,49 @@ fail:
+ 	return ret;
+ }
+ 
++static int
++nl80211_set_epcs(void *priv, u8 *addr, u8 link_id, bool enable, u16 wmm_idx,
++		 struct hostapd_wmm_ac_params *params)
++{
++	struct i802_bss *bss = priv;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++	struct nlattr *data;
++	struct nl_msg *msg;
++	int ret;
++
++	if (!drv->mtk_epcs_vendor_cmd_avail) {
++		wpa_printf(MSG_ERROR, "nl80211: Driver does not support setting EPCS");
++		return -EOPNOTSUPP;
++	}
++
++	if (!(msg = nl80211_drv_msg(drv, 0, NL80211_CMD_VENDOR)) ||
++	    nla_put_u32(msg, NL80211_ATTR_VENDOR_ID, OUI_MTK) ||
++	    nla_put_u32(msg, NL80211_ATTR_VENDOR_SUBCMD,
++			MTK_NL80211_VENDOR_SUBCMD_EPCS_CTRL) ||
++	    !(data = nla_nest_start(msg, NL80211_ATTR_VENDOR_DATA)) ||
++	    nla_put(msg, MTK_VENDOR_ATTR_EPCS_ADDR, ETH_ALEN, addr) ||
++	    nla_put_u8(msg, MTK_VENDOR_ATTR_EPCS_LINK_ID, link_id) ||
++	    nla_put_u8(msg, MTK_VENDOR_ATTR_EPCS_ENABLE, enable) ||
++	    nla_put_u16(msg, MTK_VENDOR_ATTR_EPCS_WMM_IDX, wmm_idx) ||
++	    nla_put(msg, MTK_VENDOR_ATTR_EPCS_WMM_PARAMS,
++		    sizeof(struct hostapd_wmm_ac_params) * WMM_AC_NUM,
++		    params)) {
++		nlmsg_free(msg);
++		return -ENOBUFS;
++	}
++	nla_nest_end(msg, data);
++
++	wpa_printf(MSG_DEBUG, "nl80211: EPCS: addr=" MACSTR
++			      " link_id=%d enable=%hhu wmm_idx=%hu",
++			      MAC2STR(addr), link_id, enable, wmm_idx);
++
++	ret = send_and_recv_cmd(drv, msg);
++	if (ret)
++		wpa_printf(MSG_ERROR, "Fail to set EPCS. ret=%d (%s)",
++			   ret, strerror(-ret));
++	return ret;
++}
++
+ static int
+ nl80211_set_scs(void *priv, struct hostapd_scs_desc_info *info, u8 link_id)
+ {
+@@ -16964,6 +17007,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.mu_dump = nl80211_mu_dump,
+ 	.beacon_ctrl = nl80211_beacon_ctrl,
+ 	.set_eml_omn = nl80211_set_eml_omn,
++	.set_epcs = nl80211_set_epcs,
+ #ifdef CONFIG_DPP
+ 	.dpp_listen = nl80211_dpp_listen,
+ #endif /* CONFIG_DPP */
+diff --git a/src/drivers/driver_nl80211.h b/src/drivers/driver_nl80211.h
+index 2e757bbb1..9826f6a4c 100644
+--- a/src/drivers/driver_nl80211.h
++++ b/src/drivers/driver_nl80211.h
+@@ -214,6 +214,7 @@ struct wpa_driver_nl80211_data {
+ 	unsigned int mtk_beacon_ctrl_vendor_cmd_avail:1;
+ 	unsigned int mtk_csi_vendor_cmd_avail:1;
+ 	unsigned int mtk_eml_vendor_cmd_avail:1;
++	unsigned int mtk_epcs_vendor_cmd_avail:1;
+ 	unsigned int mtk_txpower_vendor_cmd_avail:1;
+ 	unsigned int mtk_scs_vendor_cmd_avail:1;
+ 
+diff --git a/src/drivers/driver_nl80211_capa.c b/src/drivers/driver_nl80211_capa.c
+index 1abe2e156..44006ec6b 100644
+--- a/src/drivers/driver_nl80211_capa.c
++++ b/src/drivers/driver_nl80211_capa.c
+@@ -1187,6 +1187,9 @@ static int wiphy_info_handler(struct nl_msg *msg, void *arg)
+ 				case MTK_NL80211_VENDOR_SUBCMD_EML_CTRL:
+ 					drv->mtk_eml_vendor_cmd_avail = 1;
+ 					break;
++				case MTK_NL80211_VENDOR_SUBCMD_EPCS_CTRL:
++					drv->mtk_epcs_vendor_cmd_avail = 1;
++					break;
+ 				case MTK_NL80211_VENDOR_SUBCMD_TXPOWER_CTRL:
+ 					drv->mtk_txpower_vendor_cmd_avail = 1;
+ 					break;
+-- 
+2.45.2
+

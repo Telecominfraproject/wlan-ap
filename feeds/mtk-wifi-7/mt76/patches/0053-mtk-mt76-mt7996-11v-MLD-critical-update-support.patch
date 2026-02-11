@@ -1,0 +1,196 @@
+From 7d497d51d39d92719faf9d01051e3927163fd8e5 Mon Sep 17 00:00:00 2001
+From: Michael-CY Lee <michael-cy.lee@mediatek.com>
+Date: Fri, 20 Dec 2024 17:31:09 +0800
+Subject: [PATCH 053/119] mtk: mt76: mt7996: 11v+MLD critical update support
+
+1. parse non transmitted BSSID capability and set the offeset
+2. if CU is triggered on non-TX BSS, provide the offset to FW
+
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+---
+ mt7996/mcu.c | 102 +++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 90 insertions(+), 12 deletions(-)
+
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 753df0d7..5b2f59ee 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -106,6 +106,8 @@ struct mbssid_sub_off {
+ 
+ struct mt7996_mbssid_data {
+ 	struct mbssid_sub_off mbssid_idx;
++	struct mbssid_sub_off ntx_bss_cap;
++	bool is_cu_link;
+ };
+ 
+ #define MCU_PATCH_ADDRESS		0x200000
+@@ -4131,33 +4133,52 @@ static void
+ mt7996_mcu_beacon_crit_update(struct sk_buff *rskb, struct sk_buff *skb,
+ 			      struct ieee80211_bss_conf *conf,
+ 			      struct mt7996_vif_link *mconf,
+-			      struct ieee80211_mutable_offsets *offs)
++			      struct ieee80211_mutable_offsets *offs,
++			      struct mt7996_mbssid_data *mbssid_data)
+ {
+ 	struct ieee80211_mgmt *mgmt = (void *)skb->data;
+ 	struct bss_bcn_crit_update_tlv *crit;
+ 	struct tlv *tlv;
+ 	u16 capab_info = le16_to_cpu(mgmt->u.beacon.capab_info);
++	int i;
+ 
+ 	if (!ieee80211_vif_is_mld(conf->vif) ||
+-	    !(capab_info & WLAN_CAPABILITY_PBCC))
++	    !(capab_info & (WLAN_CAPABILITY_PBCC |
++			    WLAN_CAPABILITY_NON_TX_BSSID_CU)))
+ 		return;
+ 
+ 	tlv = mt7996_mcu_add_uni_tlv(rskb, UNI_BSS_INFO_BCN_CRIT_UPDATE, sizeof(*crit));
+ 
+-	/* TODO: Support 11vMBSS */
+ 	crit = (struct bss_bcn_crit_update_tlv *)tlv;
+-	crit->bss_bitmap = cpu_to_le32(BIT(0));
++	if (capab_info & WLAN_CAPABILITY_PBCC)
++		crit->bss_bitmap = cpu_to_le32(BIT(0));
+ 	/* The beacon of the CU link should be set in sequence
+ 	 * to ensure it appears in the air before the beacon of
+ 	 * the non-CU link.
+ 	 */
+ 	if (!mt7996_mcu_beacon_is_cu_link(skb, mconf, offs->tim_offset))
+ 		crit->bypass_seq_bitmap = cpu_to_le32(BIT(0));
+-	else
+-		crit->bypass_seq_bitmap = cpu_to_le32(0);
+ 	crit->tim_ie_pos[0] = cpu_to_le16(offs->tim_offset);
+ 	crit->cap_info_ie_pos[0] = cpu_to_le16(offsetof(struct ieee80211_mgmt,
+ 							u.beacon.capab_info));
++
++	for (i = 1; i < MAX_BEACON_NUM; i++) {
++		u16 ntx_bss_capab_info, offset;
++
++		if (!mbssid_data[i].ntx_bss_cap.valid)
++			continue;
++
++		offset = mbssid_data[i].ntx_bss_cap.offset;
++		ntx_bss_capab_info = le16_to_cpu(*(skb->data + offset + 2));
++		if (!(ntx_bss_capab_info & WLAN_CAPABILITY_PBCC))
++			continue;
++
++		crit->cap_info_ie_pos[i] = cpu_to_le16(offset);
++		crit->bss_bitmap |= cpu_to_le32(BIT(i));
++		if (!mbssid_data[i].is_cu_link)
++			crit->bypass_seq_bitmap |= cpu_to_le32(BIT(i));
++	}
++
+ 	crit->require_event = true;
+ }
+ 
+@@ -4350,9 +4371,41 @@ mt7996_mcu_beacon_ttlm(struct mt7996_dev *dev, struct ieee80211_bss_conf *conf,
+ 	attlm_offset->offset = cpu_to_le16(offset);
+ }
+ 
++static bool
++mt7996_is_nontx_cu_link(struct mt7996_phy *phy,
++			   const struct element *sub_elem, u8 bssid_idx)
++{
++	const struct element *ml_elem;
++	struct mt7996_vif_link *mconf;
++	int bpcc;
++
++	ml_elem = cfg80211_find_ext_elem(WLAN_EID_EXT_EHT_MULTI_LINK,
++					 sub_elem->data, sub_elem->datalen);
++	if (!ml_elem || !ieee80211_mle_type_ok(ml_elem->data + 1,
++					       IEEE80211_ML_CONTROL_TYPE_BASIC,
++					       ml_elem->datalen - 1))
++		return false;
++
++	bpcc = ieee80211_mle_get_bss_param_ch_cnt(ml_elem->data + 1);
++	if (bpcc < 0)
++		return false;
++
++	rcu_read_lock();
++	mconf =	rcu_dereference(phy->mbssid_conf[bssid_idx]);
++	if (!mconf || bpcc == mconf->bpcc) {
++		rcu_read_unlock();
++		return false;
++	}
++
++	mconf->bpcc = bpcc;
++
++	rcu_read_unlock();
++	return true;
++}
++
+ static void
+-mt7996_parse_mbssid_elems(struct sk_buff *skb, u16 mbssid_off,
+-			  struct mt7996_mbssid_data *mbssid_data)
++mt7996_parse_mbssid_elems(struct mt7996_phy *phy, struct sk_buff *skb,
++			  u16 mbssid_off, struct mt7996_mbssid_data *mbssid_data)
+ {
+ 	const struct element *elem;
+ 
+@@ -4366,8 +4419,9 @@ mt7996_parse_mbssid_elems(struct sk_buff *skb, u16 mbssid_off,
+ 
+ 		for_each_element(sub_elem, elem->data + 1, elem->datalen - 1) {
+ 			const struct ieee80211_bssid_index *idx;
+-			const u8 *idx_ie;
++			const u8 *idx_ie, *ntx_bss_cap_ie;
+ 			u8 bssid_idx;
++			bool cu_flag = false;
+ 
+ 			/* not a valid BSS profile */
+ 			if (sub_elem->id || sub_elem->datalen < 4)
+@@ -4389,11 +4443,35 @@ mt7996_parse_mbssid_elems(struct sk_buff *skb, u16 mbssid_off,
+ 
+ 			idx = (void *)(idx_ie + 2);
+ 			bssid_idx = idx->bssid_index;
+-			if (!bssid_idx || bssid_idx > MAX_BEACON_NUM - 1)
++			if (!bssid_idx || bssid_idx > MT7996_MAX_MBSSID - 1)
+ 				continue;
+ 
+ 			mbssid_data[bssid_idx].mbssid_idx.offset = idx_ie - skb->data;
+ 			mbssid_data[bssid_idx].mbssid_idx.valid = true;
++
++			/* Find WLAN_EID_NON_TX_BSSID_CAP
++			 * in the merged nontransmitted profile
++			 */
++			ntx_bss_cap_ie = cfg80211_find_ie(WLAN_EID_NON_TX_BSSID_CAP,
++							  sub_elem->data,
++							  sub_elem->datalen);
++
++			if (ntx_bss_cap_ie && ntx_bss_cap_ie[1] == sizeof(u16)) {
++				mbssid_data[bssid_idx].ntx_bss_cap.offset =
++					ntx_bss_cap_ie - skb->data;
++				mbssid_data[bssid_idx].ntx_bss_cap.valid =
++					true;
++				cu_flag = le16_to_cpu(*(u16 *)(ntx_bss_cap_ie + 2)) &
++					  WLAN_CAPABILITY_PBCC;
++			}
++
++			/* Find WLAN_EID_EXT_EHT_MULTI_LINK
++			 * in the merged nontransmitted profile
++			 */
++			if (cu_flag)
++				mbssid_data[bssid_idx].is_cu_link =
++					mt7996_is_nontx_cu_link(phy, sub_elem,
++								bssid_idx);
+ 		}
+ 	}
+ }
+@@ -4458,13 +4536,13 @@ int mt7996_mcu_add_beacon(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		return -ENOMEM;
+ 	}
+ 
+-	mt7996_parse_mbssid_elems(skb, offs.mbssid_off, mbssid_data);
++	mt7996_parse_mbssid_elems(link->phy, skb, offs.mbssid_off, mbssid_data);
+ 	mt7996_mcu_beacon_cont(dev, link_conf, rskb, skb, bcn, &offs);
+ 	if (link_conf->bssid_indicator)
+ 		mt7996_mcu_beacon_mbss(rskb, skb, bcn, &offs, mbssid_data);
+ 	mt7996_mcu_beacon_cntdwn(rskb, skb, &offs, link_conf->csa_active);
+ 	mt7996_mcu_beacon_sta_prof_csa(rskb, link_conf, &offs);
+-	mt7996_mcu_beacon_crit_update(rskb, skb, link_conf, link, &offs);
++	mt7996_mcu_beacon_crit_update(rskb, skb, link_conf, link, &offs, mbssid_data);
+ 	mt7996_mcu_beacon_ml_reconf(dev, link_conf, rskb, skb, &offs);
+ 	mt7996_mcu_beacon_ttlm(dev, link_conf, rskb, skb, &offs);
+ 
+-- 
+2.45.2
+

@@ -1,0 +1,664 @@
+From ceeaf3642e5071212e4e9ded48eb14659fb3c2f9 Mon Sep 17 00:00:00 2001
+From: Howard Hsu <howard-yh.hsu@mediatek.com>
+Date: Sat, 3 Jun 2023 17:12:15 +0800
+Subject: [PATCH 033/236] mtk: hostapd: add connac3 PHY MURU manual mode config
+ support
+
+This commit supports read the following two formats to set MU/RU manual
+mode:
+1. hostapd_cli -i <intf> raw set_muru_manual_config=<field>:<value>
+2. hostapd_cli -i <intf> set_mu <field> <value>
+
+For the <field>, we support the following field:
+1. ul_comm_user_cnt/dl_comm_user_cnt: set the number of user
+2. ul_comm_bw/dl_comm_bw: set the bandwith
+3. ul_user_ru_alloc/dl_user_ru_alloc: set the RU band idx and RU
+allocate idx
+4. ul_user_mcs/dl_user_mcs: set the mcs for each user
+5. ul_user_ssAlloc_raru: set the number of ss for each user
+6. ul_comm_gi_ltf: set the combinations of gi and ltf for UL only.
+7. dl_comm_toneplan: fix ru toneplan allocation
+8. dl_comm_ack_policy: fix station ack policy
+9. update : trigger driver to send mcu command to set muru manual mode.
+
+For the value of each field, please check wiki to learn the details:
+https://wiki.mediatek.inc/display/GWKB/muru_mancfg_user_guide
+
+For the fields that mt76 support to use, we will update in this wiki:
+https://wiki.mediatek.inc/pages/viewpage.action?pageId=1271741116
+
+Please noted that this commit is only for connac 3 gen chips. If this
+feature is to be used in other generations, the following actions must
+be taken:
+1. Different data structue needs to be defined for different
+generations, e.g. connac4_muru_comm, connac4_muru_dl.
+2. hostapd_ctrl_iface_set_mu() shall be modified.
+3. A new code level configuration shall be defined to differentiate the
+code flow that different generations will go through.
+
+Add support new argument global_comm_band for muru manual config
+command. This argument can be used to specify the band to apply manual
+config.
+
+Signed-off-by: Howard Hsu <howard-yh.hsu@mediatek.com>
+---
+ hostapd/ctrl_iface.c         | 241 +++++++++++++++++++++++++++++++----
+ src/ap/ap_config.h           |   1 +
+ src/ap/ap_drv_ops.c          |   4 +-
+ src/ap/ap_drv_ops.h          |   2 +-
+ src/ap/hostapd.c             |   2 +-
+ src/common/mtk_vendor.h      | 166 +++++++++++++++++++++++-
+ src/drivers/driver.h         |   2 +-
+ src/drivers/driver_nl80211.c |  21 ++-
+ 8 files changed, 395 insertions(+), 44 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 8af65d84c..d07e77900 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -19,6 +19,7 @@
+ #include <netinet/ip.h>
+ #endif /* CONFIG_TESTING_OPTIONS */
+ 
++#include <math.h>
+ #include <sys/un.h>
+ #include <sys/stat.h>
+ #include <stddef.h>
+@@ -3963,7 +3964,6 @@ hostapd_ctrl_iface_get_edcca(struct hostapd_data *hapd, char *cmd, char *buf,
+ 	}
+ }
+ 
+-
+ #ifdef CONFIG_NAN_USD
+ 
+ static int hostapd_ctrl_nan_publish(struct hostapd_data *hapd, char *cmd,
+@@ -4262,21 +4262,61 @@ fail:
+ #endif /* CONFIG_NAN_USD */
+ 
+ 
++static int
++hostapd_parse_argument_helper(char *value, u16 **ptr_input)
++{
++#define MAX_MU_CTRL_NUM 17
++	u16 *input;
++	char *endptr;
++	int cnt = 0;
++
++	input = os_zalloc(MAX_MU_CTRL_NUM * sizeof(u16));
++	if (input == NULL) {
++		wpa_printf(MSG_ERROR, "Failed to allocate memory.\n");
++		return -1;
++	}
++	while (value) {
++		u8 val = strtol(value, &endptr, 10);
++
++		if (value != endptr) {
++			input[cnt++] = val;
++			value = os_strchr(endptr, ':');
++			if (value)
++				value++;
++		} else {
++			break;
++		}
++	}
++
++	*ptr_input = input;
++	return cnt;
++}
++
++#define MURU_CFG_DEPENDENCE_CHECK(_val, _mask) do {				\
++		if ((le_to_host32(_val) & (_mask)) != _mask) {			\
++			wpa_printf(MSG_ERROR, "Set %s first\n", #_mask);	\
++			goto fail;						\
++		}								\
++	} while(0)
++
+ static int
+ hostapd_ctrl_iface_set_mu(struct hostapd_data *hapd, char *cmd,
+-					 char *buf, size_t buflen)
++			  char *buf, size_t buflen)
+ {
+ 	char *pos, *config, *value;
+-	u8 mode;
++	u8 i;
++	int cnt = 0, ret;
++	u16 *val;
++	struct connac3_muru *muru;
++	struct connac3_muru_dl *dl;
++	struct connac3_muru_ul *ul;
++	struct connac3_muru_comm *comm;
+ 
+ 	config = cmd;
+ 	pos = os_strchr(config, ' ');
+-	if (pos == NULL)
+-		return -1;
+-	*pos++ = '\0';
++	if (pos != NULL)
++		*pos++ = '\0';
+ 
+-	if(pos == NULL)
+-		return -1;
+ 	value = pos;
+ 
+ 	if (os_strcmp(config, "onoff") == 0) {
+@@ -4286,24 +4326,170 @@ hostapd_ctrl_iface_set_mu(struct hostapd_data *hapd, char *cmd,
+ 			return -1;
+ 		}
+ 		hapd->iconf->mu_onoff = (u8) mu;
+-		mode = MU_CTRL_ONOFF;
+-	} else if (os_strcmp(config, "ul_user_cnt") == 0) {
+-		mode = MU_CTRL_UL_USER_CNT;
+-		wpa_printf(MSG_ERROR, "ul_user_cnt:%d\n", (u8)atoi(value));
+-	} else if (os_strcmp(config, "dl_user_cnt") == 0) {
+-		mode = MU_CTRL_DL_USER_CNT;
+-		wpa_printf(MSG_ERROR, "dl_user_cnt:%d\n", (u8)atoi(value));
+-	} else {
+-		wpa_printf(MSG_ERROR,
+-			"Unsupported parameter %s for SET_MU", config);
+-		return -1;
++
++		if (hostapd_drv_mu_ctrl(hapd, MU_CTRL_ONOFF) == 0)
++			return os_snprintf(buf, buflen, "OK\n");
++		else
++			goto fail;
+ 	}
+ 
+-	if(hostapd_drv_mu_ctrl(hapd, mode, (u8)atoi(value)) == 0) {
+-		return os_snprintf(buf, buflen, "OK\n");
++	if (hapd->iconf->muru_config == NULL)
++		hapd->iconf->muru_config = os_zalloc(sizeof(struct connac3_muru));
++
++	muru = hapd->iconf->muru_config;
++	dl = &muru->dl;
++	ul = &muru->ul;
++	comm = &muru->comm;
++
++	if (os_strncmp(config, "update", 6) == 0) {
++		ret = hostapd_drv_mu_ctrl(hapd, MU_CTRL_UPDATE);
++
++		os_free(hapd->iconf->muru_config);
++		hapd->iconf->muru_config = NULL;
++
++		if (ret)
++			goto fail;
++	} else if (os_strcmp(config, "ul_comm_user_cnt") == 0) {
++		ul->user_num = (u8)atoi(value);
++		comm->ppdu_format |= MURU_PPDU_HE_TRIG;
++		comm->sch_type |= MURU_OFDMA_SCH_TYPE_UL;
++		muru->cfg_comm |= host_to_le32(MURU_COMM_SET);
++		muru->cfg_ul |= host_to_le32(MURU_FIXED_UL_TOTAL_USER_CNT);
++	} else if (os_strcmp(config, "dl_comm_user_cnt") == 0) {
++		dl->user_num = (u8)atoi(value);
++		comm->ppdu_format |= MURU_PPDU_HE_MU;
++		comm->sch_type |= MURU_OFDMA_SCH_TYPE_DL;
++		muru->cfg_comm |= host_to_le32(MURU_COMM_SET);
++		muru->cfg_dl |= host_to_le32(MURU_FIXED_DL_TOTAL_USER_CNT);
++	} else if (os_strcmp(config, "dl_comm_bw") == 0) {
++		dl->bw = (u8)atoi(value);
++		muru->cfg_dl |= host_to_le32(MURU_FIXED_DL_BW);
++	} else if (os_strcmp(config, "ul_comm_bw") == 0) {
++		ul->bw = (u8)atoi(value);
++		muru->cfg_ul |= host_to_le32(MURU_FIXED_UL_BW);
++	} else if (os_strcmp(config, "dl_user_ru_alloc") == 0) {
++		MURU_CFG_DEPENDENCE_CHECK(muru->cfg_dl, MURU_FIXED_DL_TOTAL_USER_CNT);
++		cnt = hostapd_parse_argument_helper(value, &val);
++		if (cnt == -1)
++			goto fail;
++		if (cnt != (dl->user_num * 2))
++			goto para_fail;
++		for (i = 0; i < dl->user_num; i++) {
++			dl->usr[i].ru_alloc_seg = (val[2 * i] & 0x1);
++			dl->usr[i].ru_allo_ps160 = ((val[2 * i] & 0x2) >> 1);
++			dl->usr[i].ru_idx = val[(2 * i) + 1];
++		}
++		os_free(val);
++		muru->cfg_dl |= host_to_le32(MURU_FIXED_USER_DL_RU_ALLOC);
++	} else if (os_strcmp(config, "ul_user_ru_alloc") == 0) {
++		MURU_CFG_DEPENDENCE_CHECK(muru->cfg_ul, MURU_FIXED_UL_TOTAL_USER_CNT);
++		cnt = hostapd_parse_argument_helper(value, &val);
++		if (cnt == -1)
++			goto fail;
++		if (cnt != (ul->user_num * 2))
++			goto para_fail;
++		for (i = 0; i < ul->user_num; i++) {
++			ul->usr[i].ru_alloc_seg = (val[2 * i] & 0x1);
++			ul->usr[i].ru_allo_ps160 = ((val[2 * i] & 0x2) >> 1);
++			ul->usr[i].ru_idx = val[(2 * i) + 1];
++		}
++		os_free(val);
++		muru->cfg_ul |= host_to_le32(MURU_FIXED_USER_UL_RU_ALLOC);
++	} else if (os_strcmp(config, "dl_user_mcs") == 0) {
++		MURU_CFG_DEPENDENCE_CHECK(muru->cfg_dl, MURU_FIXED_DL_TOTAL_USER_CNT);
++		cnt = hostapd_parse_argument_helper(value, &val);
++		if (cnt == -1)
++			goto fail;
++		if (cnt != dl->user_num)
++			goto para_fail;
++		for (i = 0; i < cnt; i++)
++			dl->usr[i].mcs = (u8) val[i];
++		os_free(val);
++		muru->cfg_dl |= host_to_le32(MURU_FIXED_USER_DL_MCS);
++	} else if (os_strcmp(config, "ul_user_mcs") == 0) {
++		MURU_CFG_DEPENDENCE_CHECK(muru->cfg_ul, MURU_FIXED_UL_TOTAL_USER_CNT);
++		cnt = hostapd_parse_argument_helper(value, &val);
++		if (cnt == -1)
++			goto fail;
++		if (cnt != ul->user_num)
++			goto para_fail;
++		for (i = 0; i < cnt; i++)
++			ul->usr[i].mcs = (u8) val[i];
++		os_free(val);
++		muru->cfg_ul |= host_to_le32(MURU_FIXED_USER_UL_MCS);
++	} else if (os_strcmp(config, "dl_user_cod") == 0) {
++		MURU_CFG_DEPENDENCE_CHECK(muru->cfg_dl, MURU_FIXED_DL_TOTAL_USER_CNT);
++		cnt = hostapd_parse_argument_helper(value, &val);
++		if (cnt == -1)
++			goto fail;
++		if (cnt != dl->user_num)
++			goto para_fail;
++		for (i = 0; i < cnt; i++)
++			dl->usr[i].ldpc = (u8) val[i];
++		os_free(val);
++		muru->cfg_dl |= host_to_le32(MURU_FIXED_USER_DL_COD);
++	} else if (os_strcmp(config, "ul_user_cod") == 0) {
++		MURU_CFG_DEPENDENCE_CHECK(muru->cfg_ul, MURU_FIXED_UL_TOTAL_USER_CNT);
++		cnt = hostapd_parse_argument_helper(value, &val);
++		if (cnt == -1)
++			goto fail;
++		if (cnt != ul->user_num)
++			goto para_fail;
++		for (i = 0; i < cnt; i++)
++			ul->usr[i].ldpc = (u8) val[i];
++		os_free(val);
++		muru->cfg_ul |= host_to_le32(MURU_FIXED_USER_UL_COD);
++	} else if (os_strcmp(config, "ul_user_ssAlloc_raru") == 0) {
++		MURU_CFG_DEPENDENCE_CHECK(muru->cfg_ul, MURU_FIXED_UL_TOTAL_USER_CNT);
++		cnt = hostapd_parse_argument_helper(value, &val);
++		if (cnt == -1)
++			goto fail;
++		if (cnt != ul->user_num)
++			goto para_fail;
++		for (i = 0; i < cnt; i++)
++			ul->usr[i].nss = (u8) val[i];
++		os_free(val);
++		muru->cfg_ul |= host_to_le32(MURU_FIXED_USER_UL_NSS);
++	} else if (os_strcmp(config, "dl_comm_gi") == 0) {
++		dl->gi = (u8)atoi(value);
++		muru->cfg_dl |= host_to_le32(MURU_FIXED_DL_GI);
++	} else if (os_strcmp(config, "dl_comm_ltf") == 0) {
++		dl->ltf = (u8)atoi(value);
++		muru->cfg_dl |= host_to_le32(MURU_FIXED_DL_LTF);
++	} else if (os_strcmp(config, "ul_comm_gi_ltf") == 0) {
++		ul->gi_ltf = (u8)atoi(value);
++		muru->cfg_ul |= host_to_le32(MURU_FIXED_UL_GILTF);
++	} else if (os_strcmp(config, "dl_comm_ack_policy") == 0) {
++		dl->ack_policy = (u8)atoi(value);
++		muru->cfg_dl |= host_to_le32(MURU_FIXED_DL_ACK_PLY);
++	} else if (os_strcmp(config, "dl_comm_toneplan") == 0) {
++		MURU_CFG_DEPENDENCE_CHECK(muru->cfg_dl, MURU_FIXED_DL_BW);
++		cnt = hostapd_parse_argument_helper(value, &val);
++		if (cnt == -1)
++			goto fail;
++		i = pow(2, dl->bw);
++		if (cnt != i)
++			goto para_fail;
++		for (i = 0; i < cnt; i++)
++			dl->ru[i] = host_to_le16(val[i]);
++		os_free(val);
++		muru->cfg_dl |= host_to_le32(MURU_FIXED_DL_TONE_PLAN);
++	} else if (os_strcmp(config, "global_comm_band") == 0) {
++		comm->band = (u8)atoi(value);
++		muru->cfg_comm |= host_to_le32(MURU_COMM_BAND);
+ 	} else {
+-		return -1;
++		wpa_printf(MSG_ERROR,
++			   "Unsupported parameter %s for SET_MU", config);
++		goto fail;
+ 	}
++
++	return os_snprintf(buf, buflen, "OK\n");
++
++para_fail:
++	os_free(val);
++	wpa_printf(MSG_ERROR, "Input number or value is incorrect\n");
++fail:
++	return os_snprintf(buf, buflen, "FAIL\n");
+ }
+ 
+ 
+@@ -5282,8 +5468,7 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 		reply_len = hostapd_ctrl_iface_get_edcca(hapd, buf+10, reply,
+ 							  reply_size);
+ 	} else if (os_strncmp(buf, "SET_MU ", 7) == 0) {
+-		reply_len = hostapd_ctrl_iface_set_mu(hapd, buf + 7, reply,
+-							  reply_size);
++		reply_len = hostapd_ctrl_iface_set_mu(hapd, buf + 7, reply, reply_size);
+ 	} else if (os_strncmp(buf, "GET_MU", 6) == 0) {
+ 		reply_len = hostapd_ctrl_iface_get_mu(hapd, reply, reply_size);
+ 	} else if (os_strncmp(buf, "GET_IBF", 7) == 0) {
+@@ -5307,6 +5492,14 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "DUMP_AMNT", 9) == 0) {
+ 		reply_len = hostapd_ctrl_iface_dump_amnt(hapd, buf+10,
+ 							reply, reply_size);
++	} else if (os_strncmp(buf, "set_muru_manual_config=", 23) == 0) {
++		// Replace first ':' with a single space ' '
++		char *pos = buf + 23;
++
++		pos = os_strchr(pos, ':');
++		if (pos)
++			*pos = ' ';
++		reply_len = hostapd_ctrl_iface_set_mu(hapd, buf + 23, reply, reply_size);
+ 	} else {
+ 		os_memcpy(reply, "UNKNOWN COMMAND\n", 16);
+ 		reply_len = 16;
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 1973f5209..f4606dfe2 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1332,6 +1332,7 @@ struct hostapd_config {
+ 	u8 ibf_enable;
+ 	u8 dfs_detect_mode;
+ 	u8 amsdu;
++	void *muru_config;
+ };
+ 
+ enum three_wire_mode {
+diff --git a/src/ap/ap_drv_ops.c b/src/ap/ap_drv_ops.c
+index 6926ac90e..512b062ae 100644
+--- a/src/ap/ap_drv_ops.c
++++ b/src/ap/ap_drv_ops.c
+@@ -1466,11 +1466,11 @@ int hostapd_drv_get_edcca(struct hostapd_data *hapd, const u8 mode, u8 *value)
+ 	return hapd->driver->get_edcca(hapd->drv_priv, mode, value);
+ }
+ 
+-int hostapd_drv_mu_ctrl(struct hostapd_data *hapd, u8 mode, u8 val)
++int hostapd_drv_mu_ctrl(struct hostapd_data *hapd, u8 mode)
+ {
+ 	if (!hapd->driver || !hapd->driver->mu_ctrl)
+ 		return 0;
+-	return hapd->driver->mu_ctrl(hapd->drv_priv, mode, val);
++	return hapd->driver->mu_ctrl(hapd->drv_priv, mode, hapd->iconf);
+ }
+ 
+ int hostapd_drv_mu_dump(struct hostapd_data *hapd, u8 *mu_onoff)
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index 184ef6909..47554d170 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -162,7 +162,7 @@ int hostapd_drv_configure_edcca_enable(struct hostapd_data *hapd);
+ int hostapd_drv_configure_edcca_threshold(struct hostapd_data *hapd,
+ 					  const int *threshold);
+ int hostapd_drv_get_edcca(struct hostapd_data *hapd, const u8 mode, u8 *value);
+-int hostapd_drv_mu_ctrl(struct hostapd_data *hapd, u8 mode, u8 val);
++int hostapd_drv_mu_ctrl(struct hostapd_data *hapd, u8 mode);
+ int hostapd_drv_mu_dump(struct hostapd_data *hapd, u8 *mu_onoff);
+ int hostapd_drv_three_wire_ctrl(struct hostapd_data *hapd);
+ int hostapd_drv_ibf_ctrl(struct hostapd_data *hapd);
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 923a5e681..3c33f66ed 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -2816,7 +2816,7 @@ dfs_offload:
+ 	if (hostapd_drv_configure_edcca_threshold(hapd,
+ 						  hapd->iconf->edcca_threshold) < 0)
+ 		goto fail;
+-	if (hostapd_drv_mu_ctrl(hapd, MU_CTRL_ONOFF, hapd->iconf->mu_onoff) < 0)
++	if (hostapd_drv_mu_ctrl(hapd, MU_CTRL_ONOFF) < 0)
+ 		goto fail;
+ 	if (hostapd_drv_three_wire_ctrl(hapd) < 0)
+ 		goto fail;
+diff --git a/src/common/mtk_vendor.h b/src/common/mtk_vendor.h
+index 34238f098..f0abcb6b1 100644
+--- a/src/common/mtk_vendor.h
++++ b/src/common/mtk_vendor.h
+@@ -202,8 +202,11 @@ enum mtk_vendor_attr_mu_ctrl {
+ 
+ 	MTK_VENDOR_ATTR_MU_CTRL_ONOFF,
+ 	MTK_VENDOR_ATTR_MU_CTRL_DUMP,
+-	MTK_VENDOR_ATTR_MU_CTRL_OFDMA_MODE,
+-	MTK_VENDOR_ATTR_MU_CTRL_OFDMA_VAL,
++	/**
++	 * The above attrs are also used by connac 2. It is best not to modify the
++	 * above data structure.
++	 */
++	MTK_VENDOR_ATTR_MU_CTRL_STRUCT,
+ 
+ 	/* keep last */
+ 	NUM_MTK_VENDOR_ATTRS_MU_CTRL,
+@@ -278,8 +281,163 @@ struct amnt_resp_data {
+ };
+ 
+ enum {
++	MU_CTRL_UPDATE,
+ 	MU_CTRL_ONOFF,
+-	MU_CTRL_DL_USER_CNT,
+-	MU_CTRL_UL_USER_CNT,
+ };
++
++struct connac3_muru_comm {
++	u8 pda_pol;
++	u8 band;
++	u8 spe_idx;
++	u8 proc_type;
++
++	le16 mlo_ctrl;
++	u8 sch_type;
++	u8 ppdu_format;
++	u8 ac;
++	u8 _rsv[3];
++};
++
++struct connac3_muru_dl {
++	u8 user_num;
++	u8 tx_mode;
++	u8 bw;
++	u8 gi;
++
++	u8 ltf;
++	u8 mcs;
++	u8 dcm;
++	u8 cmprs;
++
++	le16 ru[16];
++
++	u8 c26[2];
++	u8 ack_policy;
++	u8 tx_power;
++
++	le16 mu_ppdu_duration;
++	u8 agc_disp_order;
++	u8 _rsv1;
++
++	u8 agc_disp_pol;
++	u8 agc_disp_ratio;
++	le16 agc_disp_linkMFG;
++
++	le16 prmbl_punc_bmp;
++	u8 _rsv2[2];
++
++	struct {
++		le16 wlan_idx;
++		u8 ru_alloc_seg;
++		u8 ru_idx;
++		u8 ldpc;
++		u8 nss;
++		u8 mcs;
++		u8 mu_group_idx;
++		u8 vht_groud_id;
++		u8 vht_up;
++		u8 he_start_stream;
++		u8 he_mu_spatial;
++		le16 tx_power_alpha;
++		u8 ack_policy;
++		u8 ru_allo_ps160;
++	} usr[16];
++};
++
++struct connac3_muru_ul {
++	u8 user_num;
++	u8 tx_mode;
++
++	u8 ba_type;
++	u8 _rsv;
++
++	u8 bw;
++	u8 gi_ltf;
++	le16 ul_len;
++
++	le16 trig_cnt;
++	u8 pad;
++	u8 trig_type;
++
++	le16 trig_intv;
++	u8 trig_ta[ETH_ALEN];
++	le16 ul_ru[16];
++
++	u8 c26[2];
++	le16 agc_disp_linkMFG;
++
++	u8 agc_disp_mu_len;
++	u8 agc_disp_pol;
++	u8 agc_disp_ratio;
++	u8 agc_disp_pu_idx;
++
++	struct {
++		le16 wlan_idx;
++		u8 ru_alloc_seg;
++		u8 ru_idx;
++		u8 ldpc;
++		u8 nss;
++		u8 mcs;
++		u8 target_rssi;
++		le32 trig_pkt_size;
++		u8 ru_allo_ps160;
++		u8 _rsv2[3];
++	} usr[16];
++};
++
++struct connac3_muru_dbg {
++	/* HE TB RX Debug */
++	le32 rx_hetb_nonsf_en_bitmap;
++	le32 rx_hetb_cfg[2];
++};
++
++struct connac3_muru {
++	le32 cfg_comm;
++	le32 cfg_dl;
++	le32 cfg_ul;
++	le32 cfg_dbg;
++
++	struct connac3_muru_comm comm;
++	struct connac3_muru_dl dl;
++	struct connac3_muru_ul ul;
++	struct connac3_muru_dbg dbg;
++};
++
++#define MURU_OFDMA_SCH_TYPE_DL	BIT(0)
++#define MURU_OFDMA_SCH_TYPE_UL	BIT(1)
++#define MURU_PPDU_HE_TRIG	BIT(2)
++#define MURU_PPDU_HE_MU		BIT(3)
++
++/* Common Config */
++#define MURU_COMM_PPDU_FMT	BIT(0)
++#define MURU_COMM_BAND		BIT(2)
++#define MURU_COMM_WMM		BIT(3)
++#define MURU_COMM_SPE_IDX	BIT(4)
++#define MURU_COMM_SET		(MURU_COMM_PPDU_FMT | MURU_COMM_BAND | \
++				 MURU_COMM_WMM | MURU_COMM_SPE_IDX)
++
++/* DL Common config */
++#define MURU_FIXED_DL_BW		BIT(0)
++#define MURU_FIXED_DL_GI		BIT(1)
++#define MURU_FIXED_DL_TONE_PLAN		BIT(3)
++#define MURU_FIXED_DL_TOTAL_USER_CNT	BIT(4)
++#define MURU_FIXED_DL_LTF		BIT(5)
++#define MURU_FIXED_DL_ACK_PLY		BIT(9)
++
++/* DL Per User Config */
++#define MURU_FIXED_USER_DL_COD		BIT(17)
++#define MURU_FIXED_USER_DL_MCS		BIT(18)
++#define MURU_FIXED_USER_DL_RU_ALLOC	BIT(20)
++
++/* UL Common Config */
++#define MURU_FIXED_UL_TOTAL_USER_CNT	BIT(4)
++#define MURU_FIXED_UL_BW		BIT(5)
++#define MURU_FIXED_UL_GILTF		BIT(6)
++
++/* UL Per User Config */
++#define MURU_FIXED_USER_UL_COD		BIT(18)
++#define MURU_FIXED_USER_UL_MCS		BIT(19)
++#define MURU_FIXED_USER_UL_NSS		BIT(20)
++#define MURU_FIXED_USER_UL_RU_ALLOC	BIT(21)
++
+ #endif /* MTK_VENDOR_H */
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 78643da10..20b149cae 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -5545,7 +5545,7 @@ struct wpa_driver_ops {
+ 	 * @priv: Private driver interface data
+ 	 *
+ 	 */
+-	 int (*mu_ctrl)(void *priv, u8 mode, u8 val);
++	 int (*mu_ctrl)(void *priv, u8 mode, void *config);
+ 	 int (*mu_dump)(void *priv, u8 *mu_onoff);
+ 
+ 	/**
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index c38dda464..e93d6fb32 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -14720,12 +14720,13 @@ fail:
+ 
+ 
+ #ifdef CONFIG_IEEE80211AX
+-static int nl80211_mu_ctrl(void *priv, u8 mode, u8 val)
++static int nl80211_mu_ctrl(void *priv, u8 mode, void *config)
+ {
+ 	struct i802_bss *bss = priv;
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+ 	struct nl_msg *msg;
+ 	struct nlattr *data;
++	struct hostapd_config *cfg = config;
+ 	int ret = -ENOBUFS;
+ 
+ 	if (!drv->mtk_mu_vendor_cmd_avail) {
+@@ -14742,17 +14743,16 @@ static int nl80211_mu_ctrl(void *priv, u8 mode, u8 val)
+ 
+ 	switch (mode) {
+ 	case MU_CTRL_ONOFF:
+-			if (nla_put_u8(msg, MTK_VENDOR_ATTR_MU_CTRL_ONOFF, val))
+-				goto fail;
++		if (nla_put_u8(msg, MTK_VENDOR_ATTR_MU_CTRL_ONOFF, cfg->mu_onoff))
++			goto fail;
+ 		break;
+-	case MU_CTRL_UL_USER_CNT:
+-	case MU_CTRL_DL_USER_CNT:
+-			if (nla_put_u8(msg, MTK_VENDOR_ATTR_MU_CTRL_OFDMA_MODE, mode) ||
+-			    nla_put_u8(msg, MTK_VENDOR_ATTR_MU_CTRL_OFDMA_VAL, val))
+-				goto fail;
++	case MU_CTRL_UPDATE:
++		if (nla_put(msg, MTK_VENDOR_ATTR_MU_CTRL_STRUCT,
++			    sizeof(struct connac3_muru), cfg->muru_config))
++			goto fail;
+ 		break;
+ 	default:
+-		wpa_printf(MSG_ERROR, "nl80211: Wrong mu mode !");
++		wpa_printf(MSG_ERROR, "nl80211: Wrong mu mode %u!", mode);
+ 		ret = -EINVAL;
+ 		goto fail;
+ 	}
+@@ -14760,9 +14760,8 @@ static int nl80211_mu_ctrl(void *priv, u8 mode, u8 val)
+ 	nla_nest_end(msg, data);
+ 
+ 	ret = send_and_recv_cmd(drv, msg);
+-	if(ret){
++	if (ret)
+ 		wpa_printf(MSG_ERROR, "Failed to set mu_ctrl. ret=%d (%s)", ret, strerror(-ret));
+-	}
+ 	return ret;
+ 
+ fail:
+-- 
+2.45.2
+

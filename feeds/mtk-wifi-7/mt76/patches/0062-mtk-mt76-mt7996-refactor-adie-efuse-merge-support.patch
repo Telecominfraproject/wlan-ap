@@ -1,0 +1,180 @@
+From a18ed90de5aab1c20d63ce7b0719d28d8de35d4e Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Thu, 2 Jan 2025 17:41:34 +0800
+Subject: [PATCH 062/123] mtk: mt76: mt7996: refactor adie efuse merge support
+
+Some calibration process (e.g. XTAL cal) during manufacturing test will
+require access to FT data from the driver's eeprom buffer, so the firmware
+offload efuse merge support should be reverted.
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+
+mtk: mt76: mt7996: fix adie efuse merge support
+
+Refactor due to firmware design change
+Notify the firmware that the driver has cal free data that should be
+patched back to hwcfg buffer.
+Therefore, don't trigger hwcfg buffer init until the patch back is
+complete.
+This avoid firmware using the eeprom without cal free data to init
+hw settings.
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+---
+ mt7996/mcu.c | 75 ++++++++++++++++++++--------------------------------
+ mt7996/mcu.h |  1 -
+ 2 files changed, 28 insertions(+), 48 deletions(-)
+
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 0f5a86b7..1d824017 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -5649,7 +5649,7 @@ int mt7996_mcu_set_chan_info(struct mt7996_phy *phy, u16 tag, bool sta)
+ 				 &req, sizeof(req), true);
+ }
+ 
+-static int mt7996_mcu_set_cal_free_data(struct mt7996_dev *dev)
++static int mt7996_mcu_get_cal_free_data(struct mt7996_dev *dev)
+ {
+ #define MT_EE_CAL_FREE_MAX_SIZE		30
+ #define MT_EE_7977BN_OFFSET		(0x1200 - 0x500)
+@@ -5695,6 +5695,7 @@ static int mt7996_mcu_set_cal_free_data(struct mt7996_dev *dev)
+ 	static const u16 *eep_offs[__MT_MAX_BAND];
+ 	static const u16 *adie_base;
+ 	int adie_id, band, i, ret;
++	u8 *eep;
+ 
+ 	switch (mt76_chip(&dev->mt76)) {
+ 	case MT7996_DEVICE_ID:
+@@ -5752,30 +5753,20 @@ static int mt7996_mcu_set_cal_free_data(struct mt7996_dev *dev)
+ 		return -EINVAL;
+ 	}
+ 
++	eep = (u8 *)dev->mt76.eeprom.data;
+ 	for (band = 0; band < __MT_MAX_BAND; band++) {
+-		struct {
+-			/* fixed field */
+-			u8 __rsv[4];
+-
+-			__le16 tag;
+-			__le16 len;
+-			__le16 adie_offset;
+-			__le16 eep_offset;
+-			__le16 count;
+-			u8 rsv[2];
+-		} __packed req = {
+-			.tag = cpu_to_le16(UNI_EFUSE_PATCH),
+-			.len = cpu_to_le16(sizeof(req) - 4),
+-			.count = cpu_to_le16(1),
+-		};
+-		u16 adie_offset, eep_offset;
++		u32 block_num, prev_block_num = -1;
+ 
+ 		if (!adie_offs[band])
+ 			continue;
+ 
+ 		for (i = 0; i < MT_EE_CAL_FREE_MAX_SIZE; i++) {
++			u16 adie_offset, eep_offset;
++			u8 buf[MT7996_EEPROM_BLOCK_SIZE];
++
+ 			adie_offset = adie_offs[band][i] + adie_base[band];
+ 			eep_offset = eep_offs[band][i];
++			block_num = adie_offset / MT7996_EEPROM_BLOCK_SIZE;
+ 
+ 			if (adie_offs[band][i] == MT_EE_END_OFFSET)
+ 				break;
+@@ -5784,19 +5775,26 @@ static int mt7996_mcu_set_cal_free_data(struct mt7996_dev *dev)
+ 			    band == MT_BAND1)
+ 				eep_offset -= MT_EE_7977BN_OFFSET;
+ 
+-			req.eep_offset = cpu_to_le16(eep_offset);
+-			req.adie_offset = cpu_to_le16(adie_offset);
+-			ret = mt76_mcu_send_msg(&dev->mt76, MCU_WM_UNI_CMD(EFUSE_CTRL),
+-						&req, sizeof(req), true);
+-			if (ret)
+-				return ret;
++			if (prev_block_num != block_num) {
++				ret = mt7996_mcu_get_eeprom(dev, adie_offset, buf,
++							    MT7996_EEPROM_BLOCK_SIZE,
++							    EFUSE_MODE);
++				if (ret) {
++					if (ret != -EINVAL)
++						return ret;
++					prev_block_num = -1;
++					continue;
++				}
++			}
++			eep[eep_offset] = buf[adie_offset % MT7996_EEPROM_BLOCK_SIZE];
++			prev_block_num = block_num;
+ 		}
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-int mt7996_mcu_set_eeprom_flash(struct mt7996_dev *dev)
++int mt7996_mcu_set_eeprom(struct mt7996_dev *dev)
+ {
+ #define MAX_PAGE_IDX_MASK	GENMASK(7, 5)
+ #define PAGE_IDX_MASK		GENMASK(4, 2)
+@@ -5808,11 +5806,15 @@ int mt7996_mcu_set_eeprom_flash(struct mt7996_dev *dev)
+ 	u16 eeprom_size = MT7996_EEPROM_SIZE;
+ 	u8 total = DIV_ROUND_UP(eeprom_size, PER_PAGE_SIZE);
+ 	u8 *eep = (u8 *)dev->mt76.eeprom.data;
+-	int eep_len, i;
++	int ret, eep_len, i;
++
++	ret = mt7996_mcu_get_cal_free_data(dev);
++	if (ret)
++		return ret;
+ 
+ 	for (i = 0; i < total; i++, eep += eep_len) {
+ 		struct sk_buff *skb;
+-		int ret, msg_len;
++		int msg_len;
+ 
+ 		if (i == total - 1 && !!(eeprom_size % PER_PAGE_SIZE))
+ 			eep_len = eeprom_size % PER_PAGE_SIZE;
+@@ -5841,27 +5843,6 @@ int mt7996_mcu_set_eeprom_flash(struct mt7996_dev *dev)
+ 	return 0;
+ }
+ 
+-int mt7996_mcu_set_eeprom(struct mt7996_dev *dev)
+-{
+-	struct mt7996_mcu_eeprom_update req = {
+-		.tag = cpu_to_le16(UNI_EFUSE_BUFFER_MODE),
+-		.len = cpu_to_le16(sizeof(req) - 4),
+-		.buffer_mode = EE_MODE_EFUSE,
+-		.format = EE_FORMAT_WHOLE
+-	};
+-	int ret;
+-
+-	if (dev->flash_mode || mt7996_has_ext_eeprom(dev))
+-		ret = mt7996_mcu_set_eeprom_flash(dev);
+-	else
+-		ret = mt76_mcu_send_msg(&dev->mt76, MCU_WM_UNI_CMD(EFUSE_CTRL),
+-					&req, sizeof(req), true);
+-	if (ret)
+-		return ret;
+-
+-	return mt7996_mcu_set_cal_free_data(dev);
+-}
+-
+ int mt7996_mcu_get_eeprom(struct mt7996_dev *dev, u32 offset, u8 *buf, u32 buf_len,
+ 			  enum mt7996_eeprom_mode mode)
+ {
+diff --git a/mt7996/mcu.h b/mt7996/mcu.h
+index d7975a07..1648b2c8 100644
+--- a/mt7996/mcu.h
++++ b/mt7996/mcu.h
+@@ -1124,7 +1124,6 @@ enum {
+ 	UNI_EFUSE_BUFFER_MODE,
+ 	UNI_EFUSE_FREE_BLOCK,
+ 	UNI_EFUSE_BUFFER_RD,
+-	UNI_EFUSE_PATCH,
+ };
+ 
+ enum {
+-- 
+2.45.2
+

@@ -1,0 +1,646 @@
+From eae05ceae114e4b9a67580ef190e81945f33777c Mon Sep 17 00:00:00 2001
+From: Peter Chiu <chui-hao.chiu@mediatek.com>
+Date: Fri, 21 Mar 2025 11:34:35 +0800
+Subject: [PATCH 084/123] mtk: mt76: mt7996: add low power control for mt7990
+
+1. Use module param 'lp_ctrl' to control low power features
+- bit0: pcie l1ss
+- bit1: PB-TPO
+- bit2: LP-TPO
+- bit3: MinTx-TPO
+- bit4: Ultra Save
+- bit5: PST
+
+2. Control pcie l1ss by CR and control the reset of features by
+unified commands
+
+3. Add debugfs
+3.1 Add debugfs knob for pcie l1ss
+- echo 0 > pcil1ss: disable
+- echo 1 > pcil1ss: enable
+- cat pcil1ss : check status of pcie l1ss
+
+3.2 Add debugfs knob for TPO
+- echo <type> <val> > tpt_option
+
+3.3 Add debugfs knob for ultra save
+- echo <arg0> <arg1> <arg2> <arg3> > lp_option
+
+3.4 Add debugfs knob for PST
+- echo <band> <type> <enable> > muru_low_pwr
+
+3.5 cat low_power_info
+
+Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
+
+if mt7990 run on one pcie mode, we don't have to set port1 in mt7996_set_pcie_l1ss
+
+Signed-off-by: Rex Lu <rex.lu@mediatek.com>
+
+mt7990 only has 2/5G band so set bit0/1.
+
+Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
+---
+ mt76_connac_mcu.h      |   1 +
+ mt7996/init.c          |  69 +++++++++++++++
+ mt7996/mcu.c           | 131 +++++++++++++++++++++++++++
+ mt7996/mcu.h           |  16 ++++
+ mt7996/mt7996.h        |  30 +++++++
+ mt7996/mtk_debugfs_i.c | 196 +++++++++++++++++++++++++++++++++++++++++
+ mt7996/regs.h          |   4 +
+ 7 files changed, 447 insertions(+)
+
+diff --git a/mt76_connac_mcu.h b/mt76_connac_mcu.h
+index 47ff2017..38b483ba 100644
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1343,6 +1343,7 @@ enum {
+ 	MCU_UNI_CMD_MLD = 0x82,
+ 	MCU_UNI_CMD_PEER_MLD = 0x83,
+ 	MCU_UNI_CMD_SDO = 0x88,
++	MCU_UNI_CMD_TPO = 0x8b,
+ };
+ 
+ enum {
+diff --git a/mt7996/init.c b/mt7996/init.c
+index 7ed82719..f9033c4b 100644
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -8,12 +8,23 @@
+ #include <linux/hwmon.h>
+ #include <linux/hwmon-sysfs.h>
+ #include <linux/thermal.h>
++#include <linux/module.h>
+ #include "mt7996.h"
+ #include "mac.h"
+ #include "mcu.h"
+ #include "coredump.h"
+ #include "eeprom.h"
+ 
++static int lp_ctrl = 0x3f;
++module_param(lp_ctrl, int, 0644);
++MODULE_PARM_DESC(lp_ctrl, "Low power control."
++			  "Bit0: PCIe L1ss."
++			  "Bit1: Tx Power Boost (PB-TPO)."
++			  "Bit2: Tx Power Reduction (LP-TPO)."
++			  "Bit3: Tx Antenna Reduction (MinTx-TPO)."
++			  "Bit4: Ultra Save."
++			  "Bit5: PST.");
++
+ static const struct ieee80211_iface_limit if_limits_global = {
+ 	.max = MT7996_MAX_INTERFACES * MT7996_MAX_RADIOS,
+ 	.types = BIT(NL80211_IFTYPE_STATION)
+@@ -927,6 +938,60 @@ mt7996_unregister_phy(struct mt7996_phy *phy)
+ 	mt7996_unregister_thermal(phy);
+ }
+ 
++void mt7996_set_pcie_l1ss(struct mt7996_dev *dev, bool en)
++{
++	u8 val = en ? 0x1 : 0xf;
++
++#ifdef CONFIG_MTK_DEBUG
++	dev->dbg.lp.pcie_l1ss_enable = en;
++#endif
++
++	mt76_rmw(dev, MT_PCIE_MAC_LOW_POWER,
++		 MT_PCIE_MAC_LOW_POWER_DISABLE_MASK,
++		 u32_encode_bits(val, MT_PCIE_MAC_LOW_POWER_DISABLE_MASK));
++	if (dev->hif2)
++		mt76_rmw(dev, MT_PCIE1_MAC_LOW_POWER,
++			 MT_PCIE_MAC_LOW_POWER_DISABLE_MASK,
++			 u32_encode_bits(val, MT_PCIE_MAC_LOW_POWER_DISABLE_MASK));
++}
++
++static void mt7996_low_power_config(struct mt7996_dev *dev)
++{
++#define MT7996_ULTRA_SAVE_CONFIG_ALL		2
++#define MT7996_ULTRA_SAVE_CONFIG_FEATURES	1
++#define MT7996_ULTRA_SAVE_1RPD			4
++#define MT7996_ULTRA_SAVE_DISABLE		0
++	bool pb_en = (lp_ctrl & BIT(LOW_POWER_TX_TPO_POWER_BOOST)) && dev->pwr_boost_cap;
++	bool lp_en = lp_ctrl & BIT(LOW_POWER_TX_TPO_POWER_REDUCE);
++	bool min_tx_en = lp_ctrl & BIT(LOW_POWER_TX_TPO_ANTENNA_REDUCE);
++	bool tpo_en = pb_en || lp_en || min_tx_en;
++	u8 arg[4];
++
++	if (!is_mt7990(&dev->mt76))
++		return;
++
++	/* Tx Power Optimization */
++	mt7996_mcu_set_tpo(dev, MT7996_LP_TPO_ALL, tpo_en);
++	mt7996_mcu_set_tpo(dev, MT7996_LP_TPO_PB, pb_en ? 3 : 0);
++	mt7996_mcu_set_tpo(dev, MT7996_LP_TPO_LP, lp_en ? 3 : 0);
++	mt7996_mcu_set_tpo(dev, MT7996_LP_TPO_MIN_TX, min_tx_en ? 3 : 0);
++
++	/* Ultra save */
++	memset(arg, 0, sizeof(arg));
++	arg[0] = MT7996_ULTRA_SAVE_CONFIG_ALL;
++	arg[1] = !!(lp_ctrl & BIT(LOW_POWER_RX_ULTRA_SAVE));
++	mt7996_mcu_set_lp_option(dev, arg);
++	/* Disable 1-Rx Packet Detection by default */
++	memset(arg, 0, sizeof(arg));
++	arg[0] = MT7996_ULTRA_SAVE_CONFIG_FEATURES;
++	arg[1] = MT7996_ULTRA_SAVE_1RPD;
++	arg[2] = MT7996_ULTRA_SAVE_DISABLE;
++	mt7996_mcu_set_lp_option(dev, arg);
++
++	/* Power Saving Transceiver */
++	mt7996_mcu_set_pst(dev, 0xff, 0, !!(lp_ctrl & BIT(LOW_POWER_TX_PST)));
++}
++
+ static void mt7996_init_work(struct work_struct *work)
+ {
+ 	struct mt7996_dev *dev = container_of(work, struct mt7996_dev,
+@@ -938,6 +1003,10 @@ static void mt7996_init_work(struct work_struct *work)
+ 
+ 	if (!is_mt7990(&dev->mt76))
+ 		mt7996_mcu_set_dup_wtbl(dev);
++
++	mt7996_low_power_config(dev);
++	mt7996_set_pcie_l1ss(dev,
++		is_mt7990(&dev->mt76) && (lp_ctrl & BIT(LOW_POWER_PCIE_L1SS)));
+ }
+ 
+ void mt7996_wfsys_reset(struct mt7996_dev *dev)
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 94bf6f05..4e959a83 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -8430,6 +8430,137 @@ int mt7996_mcu_epcs_ctrl(u32 cmd, struct mt7996_dev *dev,
+ 				 sizeof(req), false);
+ }
+ 
++int mt7996_mcu_set_tpo(struct mt7996_dev *dev, u8 type, u8 val)
++{
++	struct {
++		u8 __rsv[4];
++
++		__le16 tag;
++		__le16 len;
++
++		u8 type;
++		u8 val;
++		u8 __rsv2[2];
++	} __packed req = {
++		.tag = cpu_to_le16(UNI_CMD_TPO_CTRL),
++		.len = cpu_to_le16(sizeof(req) - 4),
++
++		.type = type,
++		.val = val,
++	};
++
++#ifdef CONFIG_MTK_DEBUG
++	switch (type) {
++	case MT7996_LP_TPO_ALL:
++		dev->dbg.lp.tpo = val;
++		break;
++	case MT7996_LP_TPO_PB:
++		dev->dbg.lp.pb_tpo = val;
++		break;
++	case MT7996_LP_TPO_LP:
++		dev->dbg.lp.lp_tpo = val;
++		break;
++	case MT7996_LP_TPO_MIN_TX:
++		dev->dbg.lp.min_tx_tpo = val;
++		break;
++	default:
++		break;
++	}
++#endif
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_WM_UNI_CMD(TPO),
++				 &req, sizeof(req), true);
++}
++
++int mt7996_mcu_set_lp_option(struct mt7996_dev *dev, u8 *arg)
++{
++	struct {
++		u8 __rsv[4];
++
++		__le16 tag;
++		__le16 len;
++
++		u8 arg[4];
++	} __packed req = {
++		.tag = cpu_to_le16(UNI_POWER_LOW_POWER),
++		.len = cpu_to_le16(sizeof(req) - 4),
++	};
++
++	memcpy(&req.arg, arg, sizeof(req.arg));
++
++#ifdef CONFIG_MTK_DEBUG
++#define ULTRA_SAVE_FEATURE	1
++#define ULTRA_SAVE_FEATURE_ALL	2
++#define ULTRA_SAVE_FEATURE_DCM	3
++#define ULTRA_SAVE_FEATURE_1RPD	4
++#define ULTRA_SAVE_FEATURE_MMPS	5
++#define ULTRA_SAVE_FEATURE_MDPC	6
++	if (arg[0] == ULTRA_SAVE_FEATURE_ALL) {
++		dev->dbg.lp.ultra_save = !!arg[1];
++		dev->dbg.lp.one_rpd = !!arg[1];
++		dev->dbg.lp.mmps = !!arg[1];
++		dev->dbg.lp.mdpc = !!arg[1];
++		dev->dbg.lp.dcm = !!arg[1];
++		dev->dbg.lp.alpl = !!arg[1];
++	} else if (arg[0] == ULTRA_SAVE_FEATURE) {
++		switch (arg[1]) {
++		case ULTRA_SAVE_FEATURE_DCM:
++			dev->dbg.lp.dcm = !!arg[2];
++			break;
++		case ULTRA_SAVE_FEATURE_1RPD:
++			dev->dbg.lp.one_rpd = !!arg[2];
++			break;
++		case ULTRA_SAVE_FEATURE_MMPS:
++			dev->dbg.lp.mmps = !!arg[2];
++			break;
++		case ULTRA_SAVE_FEATURE_MDPC:
++			dev->dbg.lp.mdpc = !!arg[2];
++			break;
++		default:
++			break;
++		}
++	}
++#endif
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_WM_UNI_CMD(POWER_CTRL), &req,
++				 sizeof(req), false);
++}
++
++int mt7996_mcu_set_pst(struct mt7996_dev *dev, u32 band, u32 cmd, u32 val)
++{
++	struct {
++		u8 __rsv[4];
++
++		__le16 tag;
++		__le16 len;
++
++		__le32 band;
++		__le32 cmd;
++		__le32 val;
++	} __packed req = {
++		.tag = cpu_to_le16(UNI_MURU_PST_LOW_POWER),
++		.len = cpu_to_le16(sizeof(req) - 4),
++
++		.band = cpu_to_le32(band),
++		.cmd = cpu_to_le32(cmd),
++		.val = cpu_to_le32(val),
++	};
++
++#ifdef CONFIG_MTK_DEBUG
++	if (!cmd) {
++		if (band == 0xff) {
++			dev->dbg.lp.pst = val ? GENMASK(2, 0) : 0;
++		} else if (band < __MT_MAX_BAND) {
++			dev->dbg.lp.pst &= ~BIT(band);
++			dev->dbg.lp.pst |= val ? BIT(band) : 0;
++		}
++
++	}
++#endif
++	return mt76_mcu_send_msg(&dev->mt76, MCU_WM_UNI_CMD(MURU), &req,
++				 sizeof(req), false);
++}
++
+ #ifdef CONFIG_MTK_VENDOR
+ void mt7996_set_wireless_vif(void *data, u8 *mac, struct ieee80211_vif *vif)
+ {
+diff --git a/mt7996/mcu.h b/mt7996/mcu.h
+index 979d4706..c3dedb95 100644
+--- a/mt7996/mcu.h
++++ b/mt7996/mcu.h
+@@ -994,6 +994,10 @@ enum {
+ 	UNI_RA_FIXED_RATE = 0xf,
+ };
+ 
++enum {
++	UNI_MURU_PST_LOW_POWER = 0x6e,
++};
++
+ #define MT7996_HDR_TRANS_MAX_SIZE	(sizeof(struct hdr_trans_en) +	 \
+ 					 sizeof(struct hdr_trans_vlan) + \
+ 					 sizeof(struct hdr_trans_blacklist))
+@@ -1144,6 +1148,7 @@ enum {
+ 
+ enum {
+ 	UNI_POWER_OFF,
++	UNI_POWER_LOW_POWER = 0x6,
+ };
+ 
+ enum {
+@@ -1705,6 +1710,17 @@ struct mt7996_mlo_agc_set {
+ 	__le16 mgf;
+ } __packed;
+ 
++enum {
++	UNI_CMD_TPO_CTRL,
++};
++
++enum {
++	MT7996_LP_TPO_ALL,
++	MT7996_LP_TPO_PB,
++	MT7996_LP_TPO_LP,
++	MT7996_LP_TPO_MIN_TX,
++};
++
+ #define MT7996_PATCH_SEC		GENMASK(31, 24)
+ #define MT7996_PATCH_SCRAMBLE_KEY	GENMASK(15, 8)
+ #define MT7996_PATCH_AES_KEY		GENMASK(7, 0)
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index 4926c985..21e102ec 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -391,6 +391,18 @@ enum vow_drr_ctrl_id {
+ 	VOW_DRR_CTRL_STA_PAUSE = 0x30
+ };
+ 
++enum {
++	LOW_POWER_PCIE_L1SS,
++	LOW_POWER_TX_TPO_POWER_BOOST,		/* PB-TPO */
++	LOW_POWER_TX_TPO_POWER_REDUCE,		/* LP-TPO */
++	LOW_POWER_TX_TPO_ANTENNA_REDUCE,	/* Min Tx TPO */
++	LOW_POWER_RX_ULTRA_SAVE,
++	LOW_POWER_TX_PST,
++};
++#define LOW_POWER_TPO (LOW_POWER_TX_TPO_POWER_BOOST | \
++		       LOW_POWER_TX_TPO_POWER_REDUCE | \
++		       LOW_POWER_TX_TPO_ANTENNA_REDUCE)
++
+ struct mt7996_vow_ctrl {
+ 	bool atf_enable;
+ 	bool watf_enable;
+@@ -954,6 +966,20 @@ struct mt7996_dev {
+ 		u32 rxd_read_cnt;
+ 		u32 txd_read_cnt;
+ 		u32 fid_idx;
++		struct {
++			bool pcie_l1ss_enable:1;
++			bool ultra_save:1;
++			bool one_rpd:1;
++			bool mmps:1;
++			bool mdpc:1;
++			bool dcm:1;
++			bool alpl:1;
++			u8 tpo;
++			u8 pb_tpo;
++			u8 lp_tpo;
++			u8 min_tx_tpo;
++			u8 pst;
++		} lp;
+ 	} dbg;
+ 	const struct mt7996_dbg_reg_desc *dbg_reg;
+ 	bool sr_pp_enable:1;
+@@ -1383,6 +1409,7 @@ mt7996_vow_should_enable(struct mt7996_dev *dev)
+ 	       mtk_wed_device_active(&dev->mt76.mmio.wed);
+ }
+ 
++void mt7996_set_pcie_l1ss(struct mt7996_dev *dev, bool en);
+ void mt7996_mac_init(struct mt7996_dev *dev);
+ u32 mt7996_mac_wtbl_lmac_addr(struct mt7996_dev *dev, u16 wcid, u8 dw);
+ bool mt7996_mac_wtbl_update(struct mt7996_dev *dev, int idx, u32 mask);
+@@ -1491,6 +1518,9 @@ int mt7996_vendor_tsf_offset_event(struct mt7996_phy *phy, s64 *tsf_offset, int
+ 
+ int mt7996_mcu_edcca_enable(struct mt7996_phy *phy, bool enable);
+ int mt7996_mcu_edcca_threshold_ctrl(struct mt7996_phy *phy, u8 *value, bool set);
++int mt7996_mcu_set_tpo(struct mt7996_dev *dev, u8 type, u8 val);
++int mt7996_mcu_set_lp_option(struct mt7996_dev *dev, u8 *arg);
++int mt7996_mcu_set_pst(struct mt7996_dev *dev, u32 band, u32 cmd, u32 val);
+ 
+ enum edcca_bw_id {
+ 	EDCCA_BW_20 = 0,
+diff --git a/mt7996/mtk_debugfs_i.c b/mt7996/mtk_debugfs_i.c
+index f0ca836f..98002279 100644
+--- a/mt7996/mtk_debugfs_i.c
++++ b/mt7996/mtk_debugfs_i.c
+@@ -1007,6 +1007,189 @@ mt7996_sr_pp_enable_set(void *data, u64 val)
+ DEFINE_DEBUGFS_ATTRIBUTE(fops_sr_pp_enable, mt7996_sr_pp_enable_get,
+ 			 mt7996_sr_pp_enable_set, "%lld\n");
+ 
++static int
++mt7996_pcie_l1ss_enable_get(void *data, u64 *val)
++{
++	struct mt7996_dev *dev = data;
++
++	*val = dev->dbg.lp.pcie_l1ss_enable;
++
++	return 0;
++}
++static int
++mt7996_pcie_l1ss_enable_set(void *data, u64 val)
++{
++	struct mt7996_dev *dev = data;
++
++	mt7996_set_pcie_l1ss(dev, !!val);
++
++	return 0;
++}
++DEFINE_DEBUGFS_ATTRIBUTE(fops_pcie_l1ss_enable, mt7996_pcie_l1ss_enable_get,
++			 mt7996_pcie_l1ss_enable_set, "%lld\n");
++
++static ssize_t mt7996_tpt_option_set(struct file *file,
++				     const char __user *user_buf,
++				     size_t count, loff_t *ppos)
++{
++	struct mt7996_dev *dev = file->private_data;
++	int ret = count, mcu_ret;
++	u8 type, val;
++	char *buf;
++
++	buf = kzalloc(count + 1, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	if (copy_from_user(buf, user_buf, count)) {
++		ret = -EFAULT;
++		goto out;
++	}
++
++	if (count && buf[count - 1] == '\n')
++		buf[count - 1] = '\0';
++	else
++		buf[count] = '\0';
++
++	if (sscanf(buf, "%hhu %hhu", &type, &val) != 2 || type > 4 || val > 7) {
++		dev_warn(dev->mt76.dev, "format: type val\n");
++		goto out;
++	}
++
++	mcu_ret = mt7996_mcu_set_tpo(dev, type, val);
++	ret = mcu_ret ? mcu_ret : ret;
++out:
++	kfree(buf);
++	return ret;
++}
++
++static const struct file_operations fops_tpt_option = {
++	.write = mt7996_tpt_option_set,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static ssize_t mt7996_lp_option_set(struct file *file,
++				   const char __user *user_buf,
++				   size_t count, loff_t *ppos)
++{
++	struct mt7996_dev *dev = file->private_data;
++	int ret = count, mcu_ret;
++	char *buf;
++	u8 arg[4];
++
++	buf = kzalloc(count + 1, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	if (copy_from_user(buf, user_buf, count)) {
++		ret = -EFAULT;
++		goto out;
++	}
++
++	if (count && buf[count - 1] == '\n')
++		buf[count - 1] = '\0';
++	else
++		buf[count] = '\0';
++
++	if (sscanf(buf, "%hhu %hhu %hhu %hhu",
++		   &arg[0], &arg[1], &arg[2], &arg[3]) != 4) {
++		dev_warn(dev->mt76.dev, "format: arg0 arg1 arg2 arg3\n");
++		goto out;
++	}
++
++	mcu_ret = mt7996_mcu_set_lp_option(dev, arg);
++	ret = mcu_ret ? mcu_ret : ret;
++out:
++	kfree(buf);
++	return ret;
++}
++
++static const struct file_operations fops_lp_option = {
++	.write = mt7996_lp_option_set,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static ssize_t mt7996_muru_low_pwr_set(struct file *file,
++				       const char __user *user_buf,
++				       size_t count, loff_t *ppos)
++{
++	struct mt7996_dev *dev = file->private_data;
++	int ret = count, mcu_ret;
++	u32 band, cmd, val;
++	char *buf;
++
++	buf = kzalloc(count + 1, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	if (copy_from_user(buf, user_buf, count)) {
++		ret = -EFAULT;
++		goto out;
++	}
++
++	if (count && buf[count - 1] == '\n')
++		buf[count - 1] = '\0';
++	else
++		buf[count] = '\0';
++
++	if (sscanf(buf, "%u %u %u", &band, &cmd, &val) != 3) {
++		dev_warn(dev->mt76.dev, "format: band command value\n");
++		goto out;
++	}
++
++	mcu_ret = mt7996_mcu_set_pst(dev, band, cmd, val);
++	ret = mcu_ret ? mcu_ret : ret;
++out:
++	kfree(buf);
++	return ret;
++}
++
++static const struct file_operations fops_muru_low_pwr = {
++	.write = mt7996_muru_low_pwr_set,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
++
++static int
++mt7996_low_power_info_read(struct seq_file *s, void *data)
++{
++	struct mt7996_dev *dev = dev_get_drvdata(s->private);
++
++#define _pr(_str, _cond) seq_printf(s, "%s %s\n", _str, \
++				    dev->dbg.lp._cond ? "enable" : "disable");
++
++	seq_printf(s, "Low Power Info:\n");
++
++	_pr("PCIe ASPM:", pcie_l1ss_enable);
++
++	seq_printf(s, "TPO: %d\n", dev->dbg.lp.tpo);
++	seq_printf(s, "\tPB-TPO: %d\n", dev->dbg.lp.pb_tpo);
++	seq_printf(s, "\tLP-TPO: %d \n", dev->dbg.lp.lp_tpo);
++	seq_printf(s, "\tMinTx-TPO: %d \n", dev->dbg.lp.min_tx_tpo);
++
++	_pr("Ultra Save:", ultra_save);
++	_pr("\t1RPD:", one_rpd);
++	_pr("\tMMPS:", mmps);
++	_pr("\tMDPC:", mdpc);
++	_pr("\tDCM:", dcm);
++	_pr("\tALPL:", alpl);
++
++	seq_printf(s, "PST band 0: %s\n",
++		   dev->dbg.lp.pst & BIT(MT_BAND0) ? "enable" : "disable");
++	seq_printf(s, "PST band 1: %s\n",
++		   dev->dbg.lp.pst & BIT(MT_BAND1) ? "enable" : "disable");
++	seq_printf(s, "PST band 2: %s\n",
++		   dev->dbg.lp.pst & BIT(MT_BAND2) ? "enable" : "disable");
++#undef _pr
++
++	return 0;
++}
++
+ static int
+ mt7996_uba_enable_get(void *data, u64 *val)
+ {
+@@ -1104,6 +1287,19 @@ int mt7996_mtk_init_dev_debugfs_internal(struct mt7996_phy *phy, struct dentry *
+ 				    &fops_sr_pp_enable);
+ 		debugfs_create_file("uba_enable", 0600, dir, dev, &fops_uba_enable);
+ 	}
++
++	if (is_mt7990(&dev->mt76)) {
++		debugfs_create_file("pci_l1ss", 0600, dir, dev,
++				    &fops_pcie_l1ss_enable);
++		debugfs_create_file("tpt_option", 0200, dir, dev,
++				    &fops_tpt_option);
++		debugfs_create_file("lp_option", 0200, dir, dev,
++				    &fops_lp_option);
++		debugfs_create_file("muru_low_pwr", 0200, dir, dev,
++				    &fops_muru_low_pwr);
++		debugfs_create_devm_seqfile(dev->mt76.dev, "low_power_info",
++					    dir, mt7996_low_power_info_read);
++	}
+ 	return 0;
+ }
+ 
+diff --git a/mt7996/regs.h b/mt7996/regs.h
+index 03867b94..f512b93f 100644
+--- a/mt7996/regs.h
++++ b/mt7996/regs.h
+@@ -754,11 +754,15 @@ enum offs_rev {
+ #define MT_PCIE_MAC_BASE			0x74030000
+ #define MT_PCIE_MAC(ofs)			(MT_PCIE_MAC_BASE + (ofs))
+ #define MT_PCIE_MAC_INT_ENABLE			MT_PCIE_MAC(0x188)
++#define MT_PCIE_MAC_LOW_POWER			MT_PCIE_MAC(0x194)
+ 
+ #define MT_PCIE1_MAC_BASE			0x74090000
+ #define MT_PCIE1_MAC(ofs)			(MT_PCIE1_MAC_BASE + (ofs))
+ 
+ #define MT_PCIE1_MAC_INT_ENABLE			MT_PCIE1_MAC(0x188)
++#define MT_PCIE1_MAC_LOW_POWER			MT_PCIE1_MAC(0x194)
++
++#define MT_PCIE_MAC_LOW_POWER_DISABLE_MASK	GENMASK(11, 8)
+ 
+ /* PHYRX CSD */
+ #define MT_WF_PHYRX_CSD_BASE			0x83000000
+-- 
+2.45.2
+

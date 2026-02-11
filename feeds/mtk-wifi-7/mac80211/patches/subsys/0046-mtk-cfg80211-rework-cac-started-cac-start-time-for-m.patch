@@ -1,0 +1,162 @@
+From 79112735bb5fed86269c1d4fe2281e0fe7d19f82 Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Thu, 1 Feb 2024 10:57:39 +0800
+Subject: [PATCH 046/115] mtk: cfg80211: rework cac started, cac start time for
+ multi-link support
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+
+During wifi reload, the dfs_cac_timer_work of a link in the pre-setup CAC stage
+will not be canceled in ieee80211_stop_ap since the AP of this
+link hasn't started up yet.
+If the link exists after the dfs_cac_timer_work that failed to be canceled
+reaches its timeout, then nothing will happen.
+On the contrary, if the link is released, then a call trace will occur
+since the dfs_cac_timer_work will access protected memory space.
+This explains why this call trace appears only when we switch from the
+MLD AP config to the legacy AP config, but not when we simply reload the MLD AP.
+
+The link in the pre-setup CAC stage will be released in
+ieee80211_tear_down_links when the interface is going to be deleted.
+Therefore, this commit adds wiphy_delayed_work_cancel for
+dfs_cac_timer_work in ieee80211_link_stop and ieee80211_do_stop.
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+---
+ include/net/cfg80211.h |  1 +
+ net/mac80211/cfg.c     | 10 +++++-----
+ net/mac80211/iface.c   | 19 +++++++++++++------
+ net/mac80211/pm.c      |  1 -
+ net/wireless/debugfs.c | 10 ++++++----
+ net/wireless/reg.c     |  1 -
+ 6 files changed, 25 insertions(+), 17 deletions(-)
+
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index 749251f2..f9d56d04 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -9016,6 +9016,7 @@ void cfg80211_sta_opmode_change_notify(struct net_device *dev, const u8 *mac,
+ /**
+  * cfg80211_cac_event - Channel availability check (CAC) event
+  * @netdev: network device
++ * @link_id: the link ID for MLO, must be 0 for non-MLO
+  * @chandef: chandef for the current channel
+  * @event: type of event
+  * @gfp: context flags
+diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
+index 5ac98358..b895f5a5 100644
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -5423,13 +5423,13 @@ ieee80211_skip_cac(struct wireless_dev *wdev, unsigned int link_id)
+ 
+ 	wiphy_delayed_work_cancel(sdata->local->hw.wiphy,
+ 				  &link->dfs_cac_timer_work);
+-	if (wdev->cac_started) {
++	if (wdev->cac_links & BIT(link_id)) {
+ 		ieee80211_link_release_channel(link);
+-		cac_time_ms = wdev->cac_time_ms;
+-		wdev->cac_start_time = jiffies -
+-				       msecs_to_jiffies(cac_time_ms + 1);
++		cac_time_ms = wdev->links[link_id].cac_time_ms;
++		wdev->links[link_id].cac_start_time = jiffies -
++						      msecs_to_jiffies(cac_time_ms + 1);
+ 		cfg80211_cac_event(wdev->netdev, &link->conf->chanreq.oper,
+-				   NL80211_RADAR_CAC_FINISHED, GFP_KERNEL);
++				   NL80211_RADAR_CAC_FINISHED, GFP_KERNEL, link_id);
+ 	}
+ }
+ 
+diff --git a/net/mac80211/iface.c b/net/mac80211/iface.c
+index dbcd5ec9..f073daf6 100644
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -456,6 +456,8 @@ static void ieee80211_do_stop(struct ieee80211_sub_if_data *sdata, bool going_do
+ 	struct cfg80211_chan_def chandef;
+ 	bool cancel_scan;
+ 	struct cfg80211_nan_func *func;
++	struct ieee80211_link_data *link;
++	unsigned int link_id;
+ 
+ 	lockdep_assert_wiphy(local->hw.wiphy);
+ 
+@@ -537,13 +539,18 @@ static void ieee80211_do_stop(struct ieee80211_sub_if_data *sdata, bool going_do
+ 	wiphy_delayed_work_cancel(local->hw.wiphy,
+ 				  &sdata->deflink.dfs_cac_timer_work);
+ 
+-	if (sdata->wdev.links[0].cac_started) {
+-		chandef = sdata->vif.bss_conf.chanreq.oper;
++	for_each_valid_link(&sdata->wdev, link_id) {
++		link = sdata_dereference(sdata->link[link_id], sdata);
++		if (!link)
++			continue;
++		chandef = link->conf->chanreq.oper;
+ 		WARN_ON(local->suspended);
+-		ieee80211_link_release_channel(&sdata->deflink);
+-		cfg80211_cac_event(sdata->dev, &chandef,
+-				   NL80211_RADAR_CAC_ABORTED,
+-				   GFP_KERNEL, 0);
++		wiphy_delayed_work_cancel(local->hw.wiphy, &link->dfs_cac_timer_work);
++		ieee80211_link_release_channel(link);
++		if (sdata->wdev.links[link_id].cac_started)
++			cfg80211_cac_event(sdata->dev, &chandef,
++					   NL80211_RADAR_CAC_ABORTED, GFP_KERNEL,
++					   link_id);
+ 	}
+ 
+ 	if (sdata->vif.type == NL80211_IFTYPE_AP) {
+diff --git a/net/mac80211/pm.c b/net/mac80211/pm.c
+index 24bb6fd5..5a508d99 100644
+--- a/net/mac80211/pm.c
++++ b/net/mac80211/pm.c
+@@ -22,7 +22,6 @@ int __ieee80211_suspend(struct ieee80211_hw *hw, struct cfg80211_wowlan *wowlan)
+ {
+ 	struct ieee80211_local *local = hw_to_local(hw);
+ 	struct ieee80211_sub_if_data *sdata;
+-	struct ieee80211_chanctx *ctx;
+ 	struct sta_info *sta;
+ 
+ 	if (!local->open_count)
+diff --git a/net/wireless/debugfs.c b/net/wireless/debugfs.c
+index b1ad7fe0..26fa47dd 100644
+--- a/net/wireless/debugfs.c
++++ b/net/wireless/debugfs.c
+@@ -187,10 +187,11 @@ static int dfs_status_read_wdev(struct wiphy *wiphy, struct wireless_dev *wdev,
+ 				if (remain_time > wait_time_ms)
+ 					remain_time = 0;
+ 			} else if (chan->dfs_state == NL80211_DFS_USABLE) {
+-				if (wdev->cac_started &&
++				if (wdev->links[link_id].cac_started &&
+ 				    cfg80211_is_sub_chan(chandef, chan, false)) {
+-					jiffies_passed = jiffies - wdev->cac_start_time;
+-					wait_time_ms = wdev->cac_time_ms;
++					jiffies_passed = jiffies -
++							 wdev->links[link_id].cac_start_time;
++					wait_time_ms = wdev->links[link_id].cac_time_ms;
+ 					remain_time = (wait_time_ms -
+ 						       jiffies_to_msecs(jiffies_passed));
+ 				}
+@@ -336,7 +337,8 @@ dfs_cac_skip(void *data, u64 val)
+ 					continue;
+ 
+ 				if (cfg80211_chandef_dfs_required(wiphy, c, wdev->iftype) > 0 &&
+-				    cfg80211_chandef_dfs_usable(wiphy, c) && wdev->cac_started) {
++				    cfg80211_chandef_dfs_usable(wiphy, c) &&
++				    wdev->links[link_id].cac_started) {
+ 					rdev_skip_cac(rdev, wdev, link_id);
+ 				}
+ 			}
+diff --git a/net/wireless/reg.c b/net/wireless/reg.c
+index 9172dfd7..dc8ff03d 100644
+--- a/net/wireless/reg.c
++++ b/net/wireless/reg.c
+@@ -4231,7 +4231,6 @@ EXPORT_SYMBOL(regulatory_pre_cac_allowed);
+ static void cfg80211_check_and_end_cac(struct cfg80211_registered_device *rdev)
+ {
+ 	struct wireless_dev *wdev;
+-	unsigned int link_id;
+ 
+ 	guard(wiphy)(&rdev->wiphy);
+ 
+-- 
+2.45.2
+

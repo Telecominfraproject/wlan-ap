@@ -1,0 +1,228 @@
+From d07a8fc9c3ac718c5357de2fd85d4c0aed54b3d5 Mon Sep 17 00:00:00 2001
+From: Howard Hsu <howard-yh.hsu@mediatek.com>
+Date: Fri, 7 Feb 2025 14:40:29 +0800
+Subject: [PATCH 161/236] mtk: hostapd: update preference val of neighbor
+ report in BTM req for mld ap
+
+Add support updating the preference values of all BSS neighbor reports
+for the MLD AP. Without this commit, hostapd can only update the
+preference value of the neighbor report for the current link.
+
+This commit also refactor hostapd_neighbor_set_own_report_pref(). We no
+longer need to traverse the neighbor report database; we can simply
+traverse the neighbor reports within the BTM request to determine
+whether to update the preference value.
+
+mbo_cert=1 is used to determine whether to modify the preference value
+of the own BSS report. This check is necessary for handling TGbe 4.2.5.6
+and 4.50; the former requires mbo_cert=1 to modify the preference value
+of all its neighbor reports, while the latter does not.
+
+Signed-off-by: Howard Hsu <howard-yh.hsu@mediatek.com>
+
+Refactor the parameter 'mbo_cert' for TGBe 4.50. Due to the change of
+upstream hostapd, we need to add mbo_cert=2 to bypass sending
+disassociation frame for TGBe 4.50.
+
+Signed-off-by: Howard Hsu <howard-yh.hsu@mediatek.com>
+---
+ src/ap/ctrl_iface_ap.c       | 14 ++++++--
+ src/ap/neighbor_db.c         | 67 +++++++++++++++++++++---------------
+ src/ap/neighbor_db.h         |  4 +--
+ src/ap/wnm_ap.c              |  5 +--
+ src/ap/wnm_ap.h              |  2 +-
+ src/common/ieee802_11_defs.h | 13 +++++++
+ 6 files changed, 70 insertions(+), 35 deletions(-)
+
+diff --git a/src/ap/ctrl_iface_ap.c b/src/ap/ctrl_iface_ap.c
+index 4c393efce..e53027bde 100644
+--- a/src/ap/ctrl_iface_ap.c
++++ b/src/ap/ctrl_iface_ap.c
+@@ -1391,6 +1391,7 @@ int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ 	int nei_len;
+ 	u8 mbo[10];
+ 	size_t mbo_len = 0;
++	u8 mbo_cert = 0;
+ 
+ 	if (hwaddr_aton(cmd, addr)) {
+ 		wpa_printf(MSG_DEBUG, "Invalid STA MAC address");
+@@ -1479,10 +1480,19 @@ int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ 	}
+ 	if (os_strstr(cmd, " abridged=1"))
+ 		req_mode |= WNM_BSS_TM_REQ_ABRIDGED;
++#ifdef CONFIG_MBO
++	pos = os_strstr(cmd, " mbo_cert=");
++	if (pos) {
++		pos += 10;
++		mbo_cert = atoi(pos);
++	}
++
++#endif
+ 	if (os_strstr(cmd, " disassoc_imminent=1")) {
+ 		req_mode |= WNM_BSS_TM_REQ_DISASSOC_IMMINENT;
+-		/* Set own BSS neighbor report preference value as 0 */
+-		hostapd_neighbor_set_own_report_pref(hapd, nei_rep, nei_len, 0);
++		if (mbo_cert == 1)
++			/* Set own BSS neighbor report preference value as 0 */
++			hostapd_neighbor_set_own_report_pref(hapd, nei_rep, nei_len, 0);
+ 	}
+ 	if (os_strstr(cmd, " link_removal_imminent=1"))
+ 		req_mode |= WNM_BSS_TM_REQ_LINK_REMOVAL_IMMINENT;
+diff --git a/src/ap/neighbor_db.c b/src/ap/neighbor_db.c
+index d1f5d05ef..d0f0e02aa 100644
+--- a/src/ap/neighbor_db.c
++++ b/src/ap/neighbor_db.c
+@@ -395,38 +395,49 @@ int hostapd_neighbor_sync_own_report(struct hostapd_data *hapd)
+ 	return 0;
+ }
+ 
+-void hostapd_neighbor_set_own_report_pref(struct hostapd_data *hapd, char *nei_buf,
+-			 size_t buflen, const int pref)
++
++static bool hostapd_find_own_bss_neighbor_report(struct hostapd_data *hapd, u8 *pos)
+ {
+-	struct hostapd_neighbor_entry *nr;
+-	char *pos, *next_nr;
++#ifdef CONFIG_IEEE80211BE
++	if (hostapd_is_mld_ap(hapd)) {
++		struct hostapd_data *h;
+ 
+-	pos = nei_buf;
+-	next_nr = nei_buf;
++		for_each_mld_link(h, hapd) {
++			if (os_memcmp(pos, h->own_addr, ETH_ALEN) == 0)
++				return true;
++		}
+ 
+-	dl_list_for_each(nr, &hapd->nr_db, struct hostapd_neighbor_entry,
+-			 list) {
+-		pos = next_nr;
+-		next_nr = pos + 2 + wpabuf_len(nr->nr);
+-		/* Shift 2 bytes for Element ID and Neighbor report length */
+-		pos = pos + 2;
+-		if(os_memcmp(pos, hapd->own_addr, ETH_ALEN) == 0) {
+-			/* Shift for BSSID + BSSID info + Op_class + channel num + PHY type */
+-			pos = pos + 6 + 4 + 1 + 1 + 1;
+-
+-			/* Iterate Subelement */
+-			while (next_nr - pos > 0) {
+-				if (*pos == 3) {
+-					pos = pos + 2;
+-					*pos = pref;
+-					return;
+-				} else {
+-					pos++;
+-					int shift_len = *pos++;
+-					pos = pos + shift_len;
+-				}
+-			}
++		return false;
++	}
++#endif
++	return os_memcmp(pos, hapd->own_addr, ETH_ALEN) == 0;
++}
++
++void hostapd_neighbor_set_own_report_pref(struct hostapd_data *hapd, u8 *nei_buf,
++					  size_t nei_len, const u8 pref)
++{
++	struct neighbor_report_element *nr;
++	size_t elem_len;
++
++	while (nei_len >= 2) {
++		nr = (struct neighbor_report_element *) nei_buf;
++		elem_len = nr->len + 2;
++
++		if (nei_len < elem_len)
++			break;
++
++		if (hostapd_find_own_bss_neighbor_report(hapd, nr->bssid)) {
++			size_t subelem_len = nei_buf + elem_len - nr->variable;
++			struct element *subelem =
++				(struct element *) get_ie(nr->variable, subelem_len,
++							  WNM_NEIGHBOR_BSS_TRANSITION_CANDIDATE);
++
++			if (subelem)
++				subelem->data[0] = pref;
+ 		}
++
++		nei_buf += elem_len;
++		nei_len -= elem_len;
+ 	}
+ }
+ 
+diff --git a/src/ap/neighbor_db.h b/src/ap/neighbor_db.h
+index cf1400256..87bec2597 100644
+--- a/src/ap/neighbor_db.h
++++ b/src/ap/neighbor_db.h
+@@ -28,8 +28,8 @@ void hostapd_free_neighbor_db(struct hostapd_data *hapd);
+ int hostapd_neighbor_count(struct hostapd_data *hapd);
+ int hostapd_neighbor_insert_buffer(struct hostapd_data *hapd, char *buf,
+         size_t buflen);
+-void hostapd_neighbor_set_own_report_pref(struct hostapd_data *hapd, char *nei_buf,
+-			 size_t buflen, const int pref);
++void hostapd_neighbor_set_own_report_pref(struct hostapd_data *hapd, u8 *nei_buf,
++					  size_t buflen, const u8 pref);
+ #ifdef CONFIG_MBO
+ void hostapd_neighbor_set_pref_by_non_pref_chan(struct hostapd_data *hapd,
+ 			 struct sta_info* sta, char *nei_buf, size_t buflen);
+diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
+index e3c6180f5..9856e6e22 100644
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -1007,7 +1007,7 @@ int wnm_send_bss_tm_req(struct hostapd_data *hapd, struct sta_info *sta,
+ 			u8 req_mode, int disassoc_timer, u8 valid_int,
+ 			const u8 *bss_term_dur, u8 dialog_token,
+ 			const char *url, const u8 *nei_rep, size_t nei_rep_len,
+-			const u8 *mbo_attrs, size_t mbo_len)
++			const u8 *mbo_attrs, size_t mbo_len, u8 mbo_cert)
+ {
+ 	u8 *buf, *pos;
+ 	struct ieee80211_mgmt *mgmt;
+@@ -1085,7 +1085,8 @@ int wnm_send_bss_tm_req(struct hostapd_data *hapd, struct sta_info *sta,
+ 		 * else schedule full disconnection.
+ 		 */
+ 		if (ap_sta_is_mld(hapd, sta) &&
+-		    (req_mode & WNM_BSS_TM_REQ_LINK_REMOVAL_IMMINENT)) {
++		    ((req_mode & WNM_BSS_TM_REQ_LINK_REMOVAL_IMMINENT) ||
++		     mbo_cert == 2)) {
+ 			int i;
+ 			unsigned int links = 0;
+ 
+diff --git a/src/ap/wnm_ap.h b/src/ap/wnm_ap.h
+index f86c6b2af..91b1946f3 100644
+--- a/src/ap/wnm_ap.h
++++ b/src/ap/wnm_ap.h
+@@ -22,7 +22,7 @@ int wnm_send_bss_tm_req(struct hostapd_data *hapd, struct sta_info *sta,
+ 			u8 req_mode, int disassoc_timer, u8 valid_int,
+ 			const u8 *bss_term_dur, u8 dialog_token,
+ 			const char *url, const u8 *nei_rep, size_t nei_rep_len,
+-			const u8 *mbo_attrs, size_t mbo_len);
++			const u8 *mbo_attrs, size_t mbo_len, u8 mbo_cert);
+ void ap_sta_reset_steer_flag_timer(void *eloop_ctx, void *timeout_ctx);
+ int wnm_send_coloc_intf_req(struct hostapd_data *hapd, struct sta_info *sta,
+ 			    unsigned int auto_report, unsigned int timeout);
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index e60c55f7a..20977cdb5 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -3311,4 +3311,17 @@ struct ieee80211_s1g_beacon_compat {
+ #pragma pack(pop)
+ #endif /* _MSC_VER */
+ 
++
++/* IEEE Std 802.11-2020, 9.4.2.36 - Neighbor Report element */
++struct neighbor_report_element {
++	u8 eid;
++	u8 len;
++	u8 bssid[ETH_ALEN];
++	le32 bssid_info;
++	u8 op_class;
++	u8 channel;
++	u8 phy_type;
++	u8 variable[0]; /* Optional Subelements */
++} STRUCT_PACKED;
++
+ #endif /* IEEE802_11_DEFS_H */
+-- 
+2.45.2
+

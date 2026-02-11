@@ -1,0 +1,429 @@
+From 55d08fa06aed6df77c80bf31c11683b43fb4090b Mon Sep 17 00:00:00 2001
+From: Michael-CY Lee <michael-cy.lee@mediatek.com>
+Date: Fri, 28 Jun 2024 13:45:15 +0800
+Subject: [PATCH 022/119] mtk: mt76: mt7996: add support for AP A-TTLM
+
+This add support for AP A-TTLM support by following actions
+1. request at2lm resource to FW and get switch time TSF value
+2. handle 2 events from FW and send notification to higher layer:
+   switch time erxpired and AT2LM end
+3. provide TTLM offset to FW if TTLM needs count down.
+
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+---
+ mt76_connac_mcu.h |   1 +
+ mt7996/main.c     |  14 +++
+ mt7996/mcu.c      | 218 +++++++++++++++++++++++++++++++++++++++++++++-
+ mt7996/mcu.h      |  46 ++++++++++
+ mt7996/mt7996.h   |   2 +
+ 5 files changed, 279 insertions(+), 2 deletions(-)
+
+diff --git a/mt76_connac_mcu.h b/mt76_connac_mcu.h
+index 6864c5d6..97d9a2e9 100644
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1414,6 +1414,7 @@ enum {
+ 	UNI_BSS_INFO_MLD_LINK_OP = 36,
+ 	UNI_BSS_INFO_BCN_STA_PROF_CSA = 37,
+ 	UNI_BSS_INFO_BCN_ML_RECONF = 38,
++	UNI_BSS_INFO_BCN_ATTLM = 39,
+ };
+ 
+ enum {
+diff --git a/mt7996/main.c b/mt7996/main.c
+index fe1c9623..289120f8 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -2727,6 +2727,19 @@ out:
+ 	return ret;
+ }
+ 
++static int
++mt7996_set_attlm(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++		 u16 disabled_links, u16 switch_time, u32 duration)
++{
++	struct mt7996_dev *dev = mt7996_hw_dev(hw);
++	int ret;
++
++	mutex_lock(&dev->mt76.mutex);
++	ret = mt7996_mcu_mld_set_attlm(dev, vif, disabled_links, switch_time, duration);
++	mutex_unlock(&dev->mt76.mutex);
++	return ret;
++}
++
+ static void
+ mt7996_event_callback(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		      const struct ieee80211_event *event)
+@@ -2882,4 +2895,5 @@ const struct ieee80211_ops mt7996_ops = {
+ 	.change_vif_links = mt7996_change_vif_links,
+ 	.change_sta_links = mt7996_mac_sta_change_links,
+ 	.set_qos_map = mt7996_set_qos_map,
++	.set_attlm = mt7996_set_attlm,
+ };
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index cde91c5f..4cef94ac 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -1421,6 +1421,22 @@ mt7996_mcu_mld_reconf_finish(void *priv, u8 *mac, struct ieee80211_vif *vif)
+ 	ieee80211_links_removed(vif, le16_to_cpu(reconf->link_bitmap));
+ }
+ 
++static void
++mt7996_mcu_mld_attlm_event(void *priv, u8 *mac, struct ieee80211_vif *vif)
++{
++	struct mt7996_mld_event_data *data = priv;
++	struct mt7996_mcu_mld_attlm_timeout_event *ttlm = (void *)data->data;
++
++	if (!ether_addr_equal(vif->addr, data->mld_addr))
++		return;
++
++	/*
++	 * TODO: Remap the FW event type to MAC80211 event type.
++	 * For now, we align it because this is a proprietary implementation.
++	 */
++	ieee80211_attlm_notify(vif, 0, ttlm->event_type, GFP_ATOMIC);
++}
++
+ static void
+ mt7996_mcu_mld_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ {
+@@ -1435,9 +1451,15 @@ mt7996_mcu_mld_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ 	len = skb->len;
+ 
+ 	while (len > 0 && le16_to_cpu(tlv->len) <= len) {
++		data.data = (u8 *)tlv;
++
+ 		switch (le16_to_cpu(tlv->tag)) {
++		case UNI_EVENT_MLD_ATTLM_TIMEOUT:
++			ieee80211_iterate_active_interfaces_atomic(dev->mt76.hw,
++					IEEE80211_IFACE_ITER_RESUME_ALL,
++					mt7996_mcu_mld_attlm_event, &data);
++			break;
+ 		case UNI_EVENT_MLD_RECONF_AP_REM_TIMER:
+-			data.data = (u8 *)tlv;
+ 			ieee80211_iterate_active_interfaces_atomic(dev->mt76.hw,
+ 					IEEE80211_IFACE_ITER_RESUME_ALL,
+ 					mt7996_mcu_mld_reconf_finish, &data);
+@@ -3690,7 +3712,7 @@ int mt7996_mcu_mld_reconf_stop_link(struct mt7996_dev *dev,
+ 
+ int mt7996_mcu_mld_link_oper(struct mt7996_phy *phy,
+ 			     struct ieee80211_bss_conf *conf,
+-			     struct mt7996_bss_conf *mconf, bool add)
++			     struct mt7996_vif_link *mconf, bool add)
+ {
+ 	struct ieee80211_vif *vif = conf->vif;
+ 	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
+@@ -3723,6 +3745,155 @@ int mt7996_mcu_mld_link_oper(struct mt7996_phy *phy,
+ 				     MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE), true);
+ }
+ 
++int mt7996_mcu_mld_set_attlm(struct mt7996_dev *dev, struct ieee80211_vif *vif,
++			     u16 disabled_links, u16 switch_time, u32 duration)
++{
++	struct mld_req_hdr hdr = { .mld_idx = 0xff };
++	struct mld_attlm_req *req;
++	struct mt7996_mcu_mld_attlm_resp_event *resp;
++	struct sk_buff *skb, *rskb;
++	struct tlv *tlv;
++	int len = sizeof(hdr) + sizeof(*req), ret;
++	unsigned long valid_disabled_links =
++			(unsigned long) vif->valid_links & disabled_links;
++	u8 link_id;
++	bool bss_idx_set = false;
++
++	memcpy(hdr.mld_addr, vif->addr, ETH_ALEN);
++
++	skb = mt76_mcu_msg_alloc(&dev->mt76, NULL, len);
++	if (!skb)
++		return -ENOMEM;
++
++	skb_put_data(skb, &hdr, sizeof(hdr));
++	tlv = mt7996_mcu_add_uni_tlv(skb, UNI_CMD_MLD_ATTLM_RES_REQ, sizeof(*req));
++	req = (struct mld_attlm_req *)tlv;
++
++	req->attlm_idx = 0;
++	req->mst_timer = 1;
++	req->e_timer = 1;
++	req->mst_timer_adv_time = cpu_to_le16(50);
++	req->e_timer_adv_time = cpu_to_le16(0);
++	req->mst_duration = cpu_to_le32(switch_time * USEC_PER_MSEC);
++	req->e_duration = cpu_to_le32(duration * USEC_PER_MSEC);
++	req->disabled_link_bitmap = cpu_to_le16(valid_disabled_links);
++	for_each_set_bit(link_id, &valid_disabled_links,
++			 IEEE80211_MLD_MAX_NUM_LINKS) {
++		struct mt7996_vif_link *mconf = mt7996_vif_link(dev, vif, link_id);
++
++		if (!mconf)
++			continue;
++
++		if (!bss_idx_set) {
++			req->bss_idx = mconf->mt76.idx;
++			bss_idx_set = true;
++		}
++
++		req->disabled_bss_idx[link_id] = mconf->mt76.idx;
++	}
++
++	if (!bss_idx_set) {
++		dev_kfree_skb(skb);
++		return -ENOLINK;
++	}
++
++	ret = mt76_mcu_skb_send_and_get_msg(&dev->mt76, skb, MCU_WM_UNI_CMD(MLD),
++					    true, &rskb);
++
++	if (ret)
++		return ret;
++
++	skb_pull(rskb, sizeof(struct mt7996_mcu_mld_event) - sizeof(struct mt7996_mcu_rxd));
++	resp = (struct mt7996_mcu_mld_attlm_resp_event *)rskb->data;
++	switch(le16_to_cpu(resp->tag)) {
++	case UNI_EVENT_MLD_ATTLM_RES_RSP: {
++		u32 tsf_0, tsf_1;
++		u64 switch_time_tsf;
++		u16 switch_time_tsf_tu;
++
++		tsf_0 = le32_to_cpu(resp->switch_time_tsf[0]);
++		tsf_1 = le32_to_cpu(resp->switch_time_tsf[1]);
++		switch_time_tsf = (u64)tsf_0 + ((u64)tsf_1 << 32);
++		switch_time_tsf_tu = (u16)u64_get_bits(switch_time_tsf,
++						   GENMASK_ULL(25, 10));
++		ieee80211_attlm_notify(vif, switch_time_tsf_tu,
++				       NL80211_ATTLM_STARTED, GFP_KERNEL);
++		break;
++	}
++	default:
++		break;
++	}
++
++	dev_kfree_skb(rskb);
++	return ret;
++}
++
++int mt7996_mcu_peer_mld_ttlm_req(struct mt7996_dev *dev, struct ieee80211_vif *vif,
++				 struct ieee80211_sta *sta,
++				 struct ieee80211_neg_ttlm *neg_ttlm)
++{
++	struct mt7996_sta_link *msta_link;
++	struct mt7996_sta *msta;
++	struct peer_mld_req_hdr hdr = { .mld_idx = 0xff };
++	struct peer_mld_ttlm_req *req;
++	struct sk_buff *skb;
++	struct tlv *tlv;
++	int len = sizeof(hdr) + sizeof(*req);
++	unsigned long valid_links = (unsigned long)vif->valid_links;
++	u8 link_id, tid;
++
++	if (vif->type != NL80211_IFTYPE_STATION &&
++	    vif->type != NL80211_IFTYPE_AP)
++		return -EOPNOTSUPP;
++
++	if (!sta || !neg_ttlm)
++		return -EINVAL;
++
++	memcpy(hdr.peer_mld_addr, sta->addr, ETH_ALEN);
++	msta = (struct mt7996_sta *)sta->drv_priv;
++
++	skb = mt76_mcu_msg_alloc(&dev->mt76, NULL, len);
++	if (!skb)
++		return -ENOMEM;
++
++	dev_dbg(dev->mt76.dev, "Setup TTLM for %pM\n", sta->addr);
++	skb_put_data(skb, &hdr, sizeof(hdr));
++	tlv = mt7996_mcu_add_uni_tlv(skb, UNI_CMD_PEER_MLD_TTLM_REQ,
++				     sizeof(*req));
++	req = (struct peer_mld_ttlm_req *)tlv;
++
++	memcpy(req->mld_addr, vif->addr, ETH_ALEN);
++	req->enabled_link_bitmap = cpu_to_le16(vif->valid_links);
++	rcu_read_lock();
++	for_each_set_bit(link_id, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++		msta_link = mt76_dereference(msta->link[link_id], &dev->mt76);
++		if (!msta_link)
++			continue;
++
++		req->link_to_wcid[link_id] = cpu_to_le16(msta_link->wcid.idx);
++
++		/* Skip all tid for tx paused link */
++		if (msta->vif->tx_paused_links & BIT(link_id))
++			continue;
++
++		for (tid = 0; tid < IEEE80211_TTLM_NUM_TIDS; tid++) {
++			if (neg_ttlm->downlink[tid] & BIT(link_id))
++				req->dl_tid_map[link_id] |= BIT(tid);
++			if (neg_ttlm->uplink[tid] & BIT(link_id))
++				req->ul_tid_map[link_id] |= BIT(tid);
++		}
++
++		dev_dbg(dev->mt76.dev, "link_id=%u, dl_bitmap=%u, ul_bitmap=%u\n",
++			link_id, req->dl_tid_map[link_id],
++			req->ul_tid_map[link_id]);
++	}
++
++	rcu_read_unlock();
++
++	return mt76_mcu_skb_send_msg(&dev->mt76, skb, MCU_WM_UNI_CMD(PEER_MLD),
++				     true);
++}
++
+ static void
+ mt7996_mcu_beacon_cntdwn(struct sk_buff *rskb, struct sk_buff *skb,
+ 			 struct ieee80211_mutable_offsets *offs,
+@@ -4001,6 +4172,48 @@ mt7996_mcu_beacon_ml_reconf(struct mt7996_dev *dev,
+ 	}
+ }
+ 
++static void
++mt7996_mcu_beacon_ttlm(struct mt7996_dev *dev, struct ieee80211_bss_conf *conf,
++		       struct sk_buff *rskb, struct sk_buff *skb,
++		       struct ieee80211_mutable_offsets *offs)
++{
++	u16 offset = 0, tail_offset = offs->tim_offset + offs->tim_length;
++	struct bss_bcn_attlm_offset_tlv *attlm_offset;
++	u8 *beacon_tail = skb->data + tail_offset;
++	const struct element *elem;
++	struct ieee80211_ttlm_elem *ttlm;
++	bool cntdown_ttlm = false;
++	struct tlv *tlv;
++
++	if (!ieee80211_vif_is_mld(conf->vif))
++		return;
++
++	for_each_element_extid(elem, WLAN_EID_EXT_TID_TO_LINK_MAPPING,
++			       beacon_tail, skb->len - tail_offset) {
++		if (ieee80211_tid_to_link_map_size_ok(elem->data + 1,
++						      elem->datalen - 1)) {
++			ttlm = (struct ieee80211_ttlm_elem *)elem->data + 1;
++			if (!(ttlm->control &
++			      IEEE80211_TTLM_CONTROL_SWITCH_TIME_PRESENT) &&
++			    (ttlm->control &
++			     IEEE80211_TTLM_CONTROL_EXPECTED_DUR_PRESENT)) {
++				offset = (u8 *)elem - skb->data;
++				cntdown_ttlm = true;
++				break;
++			}
++		}
++	}
++
++	if (!cntdown_ttlm)
++		return;
++
++	tlv = mt7996_mcu_add_uni_tlv(rskb, UNI_BSS_INFO_BCN_ATTLM,
++				     sizeof(*attlm_offset));
++	attlm_offset = (struct bss_bcn_attlm_offset_tlv *)tlv;
++	attlm_offset->valid_id_bitmap = BIT(0);
++	attlm_offset->offset = cpu_to_le16(offset);
++}
++
+ int mt7996_mcu_add_beacon(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			  struct ieee80211_bss_conf *link_conf, int en)
+ {
+@@ -4060,6 +4273,7 @@ int mt7996_mcu_add_beacon(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	mt7996_mcu_beacon_sta_prof_csa(rskb, link_conf, &offs);
+ 	mt7996_mcu_beacon_crit_update(rskb, skb, link_conf, link, &offs);
+ 	mt7996_mcu_beacon_ml_reconf(dev, link_conf, rskb, skb, &offs);
++	mt7996_mcu_beacon_ttlm(dev, link_conf, rskb, skb, &offs);
+ out:
+ 	dev_kfree_skb(skb);
+ 	return mt76_mcu_skb_send_msg(&dev->mt76, rskb,
+diff --git a/mt7996/mcu.h b/mt7996/mcu.h
+index 7078f1af..414b05cd 100644
+--- a/mt7996/mcu.h
++++ b/mt7996/mcu.h
+@@ -584,6 +584,14 @@ struct bss_bcn_ml_reconf_offset {
+ 	u8 rsv;
+ } __packed;
+ 
++struct bss_bcn_attlm_offset_tlv {
++	__le16 tag;
++	__le16 len;
++	u8 valid_id_bitmap;
++	u8 rsv;
++	__le16 offset;
++} __packed;
++
+ struct bss_txcmd_tlv {
+ 	__le16 tag;
+ 	__le16 len;
+@@ -1154,6 +1162,22 @@ struct mld_req_hdr {
+ 	u8 buf[];
+ } __packed;
+ 
++struct mld_attlm_req {
++	__le16 tag;
++	__le16 len;
++	u8 attlm_idx;
++	u8 bss_idx;
++	u8 mst_timer;
++	u8 e_timer;
++	__le16 mst_timer_adv_time;
++	__le16 e_timer_adv_time;
++	__le32 mst_duration;
++	__le32 e_duration;
++	__le16 disabled_link_bitmap;
++	u8 disabled_bss_idx[16];
++	u8 rsv[2];
++} __packed;
++
+ struct mld_reconf_timer {
+ 	__le16 tag;
+ 	__le16 len;
+@@ -1172,6 +1196,7 @@ struct mld_reconf_stop_link {
+ } __packed;
+ 
+ enum {
++	UNI_CMD_MLD_ATTLM_RES_REQ = 0x02,
+ 	UNI_CMD_MLD_RECONF_AP_REM_TIMER = 0x03,
+ 	UNI_CMD_MLD_RECONF_STOP_LINK = 0x04,
+ };
+@@ -1193,6 +1218,25 @@ struct mt7996_mld_event_data {
+ 	u8 *data;
+ };
+ 
++struct mt7996_mcu_mld_attlm_resp_event {
++	__le16 tag;
++	__le16 len;
++	u8 status;
++	u8 attlm_idx;
++	u8 bss_idx;
++	u8 rsv;
++	__le32 switch_time_tsf[2];
++	__le32 end_tsf[2];
++} __packed;
++
++struct mt7996_mcu_mld_attlm_timeout_event {
++	__le16 tag;
++	__le16 len;
++	u8 attlm_idx;
++	u8 event_type;
++	u8 rsv[2];
++} __packed;
++
+ struct mt7996_mcu_mld_ap_reconf_event {
+ 	__le16 tag;
+ 	__le16 len;
+@@ -1202,6 +1246,8 @@ struct mt7996_mcu_mld_ap_reconf_event {
+ } __packed;
+ 
+ enum {
++	UNI_EVENT_MLD_ATTLM_RES_RSP = 0x02,
++	UNI_EVENT_MLD_ATTLM_TIMEOUT = 0x03,
+ 	UNI_EVENT_MLD_RECONF_AP_REM_TIMER = 0x04,
+ };
+ 
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index f85979c5..6141cc98 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -1114,6 +1114,8 @@ int mt7996_mcu_mld_reconf_stop_link(struct mt7996_dev *dev,
+ int mt7996_mcu_mld_link_oper(struct mt7996_phy *phy,
+ 			     struct ieee80211_bss_conf *conf,
+ 			     struct mt7996_bss_conf *mconf, bool add);
++int mt7996_mcu_mld_set_attlm(struct mt7996_dev *dev, struct ieee80211_vif *vif,
++			     u16 disabled_links, u16 switch_time, u32 duration);
+ 
+ static inline u8 mt7996_max_interface_num(struct mt7996_dev *dev)
+ {
+-- 
+2.45.2
+

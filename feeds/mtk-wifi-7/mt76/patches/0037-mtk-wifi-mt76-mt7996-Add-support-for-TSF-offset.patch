@@ -1,0 +1,228 @@
+From 8a7cf69366c55a841ed7bc666a2cb2c8107e5142 Mon Sep 17 00:00:00 2001
+From: MeiChia Chiu <MeiChia.Chiu@mediatek.com>
+Date: Fri, 6 Sep 2024 17:21:46 +0800
+Subject: [PATCH 037/119] mtk: wifi: mt76: mt7996: Add support for TSF offset
+
+To add support for TSF (Timing Synchronization Function) offset and send
+these values to hostapd to populate the TSF offset in the per-station
+profile within the beacon
+
+Signed-off-by: MeiChia Chiu <MeiChia.Chiu@mediatek.com>
+---
+ mt76_connac_mcu.h |  1 +
+ mt7996/main.c     | 30 ++++++++++++++++++++++
+ mt7996/mcu.c      | 65 +++++++++++++++++++++++++++++++++++++++++++++++
+ mt7996/mcu.h      | 30 ++++++++++++++++++++++
+ mt7996/mt7996.h   |  5 ++++
+ 5 files changed, 131 insertions(+)
+
+diff --git a/mt76_connac_mcu.h b/mt76_connac_mcu.h
+index 1972ed80..f0c4c85f 100644
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1304,6 +1304,7 @@ enum {
+ 	MCU_UNI_CMD_SET_DOMAIN_INFO = 0x15,
+ 	MCU_UNI_CMD_SCAN_REQ = 0x16,
+ 	MCU_UNI_CMD_RDD_CTRL = 0x19,
++	MCU_UNI_CMD_GET_MAC_INFO = 0x1A,
+ 	MCU_UNI_CMD_GET_MIB_INFO = 0x22,
+ 	MCU_UNI_CMD_GET_STAT_INFO = 0x23,
+ 	MCU_UNI_CMD_SNIFFER = 0x24,
+diff --git a/mt7996/main.c b/mt7996/main.c
+index c107bb1c..12912b5c 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -936,6 +936,33 @@ mt7996_vif_cfg_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	mutex_unlock(&dev->mt76.mutex);
+ }
+ 
++static void mt7996_get_tsf_offset(struct ieee80211_vif *vif,
++				  struct mt7996_phy *phy,
++				  struct mt7996_dev *dev)
++{
++	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
++	struct mt7996_vif_link *rpted_mconf;
++	unsigned long valid_links = vif->valid_links;
++	unsigned int rpting_linkid, rpted_linkid;
++
++	for_each_set_bit(rpted_linkid, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++
++		rpted_mconf = mt7996_vif_link(dev, vif, rpted_linkid);
++		if (!rpted_mconf)
++			return;
++
++		for_each_set_bit(rpting_linkid, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++
++			if (rpted_linkid == rpting_linkid)
++				continue;
++			mt7996_mcu_get_tsf_offset(phy, mvif, rpting_linkid, rpted_linkid);
++		}
++
++		ieee80211_tsf_offset_notify(vif, rpted_linkid, rpted_mconf->tsf_offset,
++					    sizeof(rpted_mconf->tsf_offset), GFP_KERNEL);
++	}
++}
++
+ static void
+ mt7996_link_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			 struct ieee80211_bss_conf *info, u64 changed)
+@@ -1011,6 +1038,9 @@ mt7996_link_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		 */
+ 		if (!info->enable_beacon || !info->csa_active)
+ 			mt7996_mcu_add_beacon(hw, vif, info, info->enable_beacon);
++
++		if (!info->enable_beacon && hweight16(vif->valid_links) > 1)
++			mt7996_get_tsf_offset(vif, phy, dev);
+ 	}
+ 
+ 	if (changed & (BSS_CHANGED_UNSOL_BCAST_PROBE_RESP |
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 15f71f56..40e83457 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -2069,6 +2069,71 @@ out:
+ 				     MCU_WMWA_UNI_CMD(BSS_INFO_UPDATE), true);
+ }
+ 
++int mt7996_mcu_get_tsf_offset(struct mt7996_phy *phy,
++			      struct mt7996_vif *mvif,
++			      int rpting_link_id,
++			      int rpted_link_id)
++{
++	struct ieee80211_vif *vif = container_of((void *)mvif, struct ieee80211_vif,
++						 drv_priv);
++	struct mt7996_dev *dev = phy->dev;
++	struct mt7996_vif_link *rpting_conf, *rpted_conf;
++	struct mt7996_mcu_mac_info_tsf_diff *req;
++	struct mt7996_mcu_mac_info_tsf_diff_resp *resp;
++	struct sk_buff *skb, *rskb;
++	struct tlv *tlv;
++	struct {
++		u8 __rsv[4];
++		u8 buf[];
++	} __packed hdr;
++	int len = sizeof(hdr) + sizeof(*req), ret;
++	int32_t tsf0_31, tsf32_63;
++	int64_t tsf_rpted, tsf_rpting, tsf_offset;
++
++	rpted_conf = mt7996_vif_link(dev, vif, rpted_link_id);
++	rpting_conf = mt7996_vif_link(dev, vif, rpting_link_id);
++	if (!rpted_conf || !rpting_conf)
++		return -EINVAL;
++
++	skb = mt76_mcu_msg_alloc(&dev->mt76, NULL, len);
++	if (!skb)
++		return -ENOMEM;
++
++	skb_put_data(skb, &hdr, sizeof(hdr));
++	tlv = mt7996_mcu_add_uni_tlv(skb, UNI_CMD_MAC_INFO_TSF_DIFF, sizeof(*req));
++
++	req = (struct mt7996_mcu_mac_info_tsf_diff *)tlv;
++	req->bss_idx0 = rpted_link_id;
++	req->bss_idx1 = rpting_link_id;
++
++	ret = mt76_mcu_skb_send_and_get_msg(&dev->mt76, skb,
++					    MCU_WM_UNI_CMD(GET_MAC_INFO),
++					    true, &rskb);
++	if (ret)
++		return ret;
++
++	skb_pull(rskb, sizeof(struct mt7996_mcu_mac_info_event));
++	resp = (struct mt7996_mcu_mac_info_tsf_diff_resp *)rskb->data;
++
++	switch(le16_to_cpu(resp->tag)) {
++	case UNI_EVENT_MAC_INFO_TSF_DIFF:
++		tsf0_31 = le32_to_cpu(resp->tsf0_bit0_31);
++		tsf32_63 = le32_to_cpu(resp->tsf0_bit32_63);
++		tsf_rpted = (int64_t)tsf0_31 + ((int64_t)tsf32_63 << 32);
++		tsf0_31 = le32_to_cpu(resp->tsf1_bit0_31);
++		tsf32_63 = le32_to_cpu(resp->tsf1_bit32_63);
++		tsf_rpting = (int64_t)tsf0_31 + ((int64_t)tsf32_63 << 32);
++		tsf_offset = (tsf_rpted - tsf_rpting) / 2;
++		rpted_conf->tsf_offset[rpting_link_id] = tsf_offset;
++		break;
++	default:
++		break;
++	}
++
++	dev_kfree_skb(rskb);
++	return ret;
++}
++
+ int mt7996_mcu_set_timing(struct mt7996_phy *phy, struct ieee80211_vif *vif,
+ 			  struct ieee80211_bss_conf *link_conf)
+ {
+diff --git a/mt7996/mcu.h b/mt7996/mcu.h
+index a7851e51..53d5a7ee 100644
+--- a/mt7996/mcu.h
++++ b/mt7996/mcu.h
+@@ -1194,6 +1194,36 @@ enum {
+ 	UNI_CMD_THERMAL_PROTECT_DUTY_CONFIG,
+ };
+ 
++enum {
++	UNI_CMD_MAC_INFO_TSF_DIFF = 2,
++};
++
++enum {
++	UNI_EVENT_MAC_INFO_TSF_DIFF = 2,
++};
++
++struct mt7996_mcu_mac_info_tsf_diff {
++	__le16 tag;
++	__le16 len;
++	u8 bss_idx0;
++	u8 bss_idx1;
++	u8 rsv[2];
++} __packed;
++
++struct mt7996_mcu_mac_info_event {
++	u8 rsv[4];
++	u8 buf[];
++} __packed;
++
++struct mt7996_mcu_mac_info_tsf_diff_resp {
++	__le16 tag;
++	__le16 len;
++	__le32 tsf0_bit0_31;
++	__le32 tsf0_bit32_63;
++	__le32 tsf1_bit0_31;
++	__le32 tsf1_bit32_63;
++} __packed;
++
+ struct mld_req_hdr {
+ 	u8 ver;
+ 	u8 mld_addr[ETH_ALEN];
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index fa8b7f08..16e5d469 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -447,6 +447,8 @@ struct mt7996_vif_link {
+ 
+ 	u8 mld_idx;
+ 	u8 bpcc;
++
++	s64 tsf_offset[IEEE80211_MLD_MAX_NUM_LINKS];
+ };
+ 
+ struct mt7996_vif {
+@@ -1375,6 +1377,8 @@ int mt7996_mcu_set_pp_alg_ctrl(struct mt7996_phy *phy, u8 action);
+ int mt7996_mcu_set_eml_omn(struct ieee80211_vif *vif, u8 link_id,
+ 			   struct ieee80211_sta *sta, struct mt7996_dev *dev,
+ 			   struct mt7996_eml_omn *eml_omn);
++int mt7996_mcu_get_tsf_offset(struct mt7996_phy *phy, struct mt7996_vif *mvif,
++			      int rpting_link_id, int rpted_link_id);
+ #ifdef CONFIG_MAC80211_DEBUGFS
+ void mt7996_sta_add_debugfs(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			    struct ieee80211_sta *sta, struct dentry *dir);
+@@ -1404,6 +1408,7 @@ int mt7996_mcu_set_csi(struct mt7996_phy *phy, u8 mode,
+ 		       u8 cfg, u8 v1, u32 v2, u8 *mac_addr);
+ int mt7996_vendor_pp_bitmap_update(struct mt7996_phy *phy, u16 bitmap);
+ int mt7996_mcu_set_lpi_psd(struct mt7996_phy *phy, u8 enable);
++int mt7996_vendor_tsf_offset_event(struct mt7996_phy *phy, s64 *tsf_offset, int tsf_len);
+ #endif
+ 
+ int mt7996_mcu_edcca_enable(struct mt7996_phy *phy, bool enable);
+-- 
+2.45.2
+

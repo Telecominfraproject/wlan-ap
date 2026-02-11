@@ -1,0 +1,326 @@
+From 0aa1ee84c4f89b37bb375891fd683447d49d52eb Mon Sep 17 00:00:00 2001
+From: Allen Ye <allen.ye@mediatek.com>
+Date: Thu, 20 Mar 2025 11:42:04 +0800
+Subject: [PATCH 191/236] mtk: hostapd: FT: Set mld AP handle OTD roaming with
+ the same state machine
+
+Add support for ap handling mld sta OTD roaming.
+To handle the reassoc frame send to any possible link, ap will per link creates
+STA entry when receiving a OTD action auth and let these STAs indicates to the
+same state machine.
+
+When target AP receive a OTD action and da is its own mld address, hostapd will
+copy the action frame to all the links of the mld bss. AP will alloc STA enties
+for each links prepare for reassoc frame from each link. If AP creates several
+state machines, they will have different Anonce. That will make an
+unpredictable result of sta re-assoc frame.
+
+AP will remove all non assoc link stas in hostapd_deinit_ft_ds_link_sta() due
+to hostapd expect will handle these stas in hostapd_process_assoc_ml_info() and
+expects they would not be exist before. After we call ap_free_sta() we should
+add back sta entry in the kernel.
+
+Signed-off-by: Allen Ye <allen.ye@mediatek.com>
+
+Fix ft_ds_req_state is not reset in assoc phase with legacy sta and fix
+the compile warning.
+
+Signed-off-by: Allen Ye <allen.ye@mediatek.com>
+
+Add sta flag added_unassoc for mlo otd sta. This flag will affect hostapd send
+NL80211_CMD_SET_STATION instead NL80211_CMD_NEW_STA. The later cmd is unexpected
+and will destoryed the sta entry in the mac80211.
+Rest ft_over_ds flag to prevent sta entry go into ft otd handle flow. Which
+would not be reset in add_associated_sta() if we raise the added_unassoc flag.
+
+Signed-off-by: Allen Ye <allen.ye@mediatek.com>
+---
+ src/ap/ieee802_11.c    | 55 ++++++++++++++++++++++++++++++++++++++++++
+ src/ap/wpa_auth.c      | 13 ++++++++++
+ src/ap/wpa_auth.h      |  2 ++
+ src/ap/wpa_auth_ft.c   | 29 ++++++++++++++++++++--
+ src/ap/wpa_auth_glue.c | 37 +++++++++++++++++++++++++---
+ src/ap/wpa_auth_i.h    |  8 ++++++
+ 6 files changed, 138 insertions(+), 6 deletions(-)
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 0818c5747..c78dd7104 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -38,6 +38,7 @@
+ #include "sta_info.h"
+ #include "ieee802_1x.h"
+ #include "wpa_auth.h"
++#include "wpa_auth_i.h"
+ #include "pmksa_cache_auth.h"
+ #include "wmm.h"
+ #include "ap_list.h"
+@@ -5797,6 +5798,28 @@ static struct sta_info * handle_mlo_translate(struct hostapd_data *hapd,
+ }
+ #endif /* CONFIG_IEEE80211BE */
+ 
++#ifdef CONFIG_IEEE80211R_AP
++#ifdef CONFIG_IEEE80211BE
++static void hostapd_deinit_ft_ds_link_sta(struct hostapd_data *hapd, const u8 *sta_addr)
++{
++	struct sta_info *sta;
++	struct hostapd_data *link;
++
++	for_each_mld_link(link, hapd) {
++		if (link == hapd)
++			continue;
++
++		sta = ap_get_sta(link, sta_addr);
++		if (sta) {
++			/* do not deinit assoc sm */
++			sta->wpa_sm = NULL;
++			ap_free_sta(link, sta);
++		}
++	}
++}
++#endif /* CONFIG_IEEE80211BE */
++#endif
++
+ 
+ static void handle_assoc(struct hostapd_data *hapd,
+ 			 const struct ieee80211_mgmt *mgmt, size_t len,
+@@ -5906,6 +5929,8 @@ static void handle_assoc(struct hostapd_data *hapd,
+ 		 */
+ 		sta->flags |= WLAN_STA_AUTH;
+ 
++		if (sta->wpa_sm)
++			sta->wpa_sm->ft_ds_req_state = FT_OTD_IDLE;
+ #ifdef CONFIG_IEEE80211BE
+ 		/*
+ 		 * Since there is no auth processing in FT-OTD,
+@@ -5928,6 +5953,29 @@ static void handle_assoc(struct hostapd_data *hapd,
+ 			os_memcpy(sta->mld_info.links[hapd->mld_link_id].local_addr,
+ 				  hapd->own_addr, ETH_ALEN);
+ 			os_memcpy(sta->setup_link_addr, mgmt->sa, ETH_ALEN);
++
++			wpa_assign_wpa_auth_group(sta->wpa_sm, hapd->wpa_auth);
++			/* To align OTA, we should remove every (except current setup
++			 * link) sta added when receiving RRB frames for each link via
++			 * OTD.
++			 */
++			hostapd_deinit_ft_ds_link_sta(hapd, sta->addr);
++			/* To align ap_sta_re_add in handle_auth and WLAN_STA_AUTH flag
++			 * in handle_auth_cb, we should add a sta entry to mac80211.
++			 * That's for the following MAC address translation to work and
++			 * set auth state prepareing for the following assoc state.
++			 */
++			sta->added_unassoc = 1;
++			if (hostapd_sta_add(hapd, sta->addr, 0, 0,
++					    sta->supported_rates,
++					    sta->supported_rates_len,
++					    0, NULL, NULL, NULL, 0, NULL, 0, NULL,
++					    sta->flags, 0, 0, 0, 0,
++					    sta->setup_link_addr, false,
++					    sta->mld_info.common_info.eml_capa)) {
++				resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
++				goto fail;
++			}
+ 		}
+ #endif /* CONFIG_IEEE80211BE */
+ 	} else
+@@ -7322,6 +7370,13 @@ static void handle_assoc_cb(struct hostapd_data *hapd,
+ 		sta->pending_eapol_rx = NULL;
+ 	}
+ 
++#ifdef CONFIG_IEEE80211R_AP
++	if (sta->auth_alg == WLAN_AUTH_FT) {
++		wpa_ft_sta_roamed_notify(sta->wpa_sm, hapd->wpa_auth, sta->addr);
++		sta->ft_over_ds = 0;
++	}
++#endif
++
+ handle_ml:
+ 	hostapd_ml_handle_assoc_cb(hapd, sta, ok);
+ 	sta->sending_assoc = 0;
+diff --git a/src/ap/wpa_auth.c b/src/ap/wpa_auth.c
+index ee00e7bd7..00493f9fc 100644
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -7735,3 +7735,16 @@ void wpa_reset_assoc_sm_info(struct wpa_state_machine *assoc_sm,
+ 	assoc_sm->mld_assoc_link_id = mld_assoc_link_id;
+ #endif /* CONFIG_IEEE80211BE */
+ }
++
++
++void wpa_assign_wpa_auth_group(struct wpa_state_machine *sm,
++				  struct wpa_authenticator *wpa_auth)
++{
++	if (!sm || !sm->group || !wpa_auth || !wpa_auth->group)
++		return;
++
++	wpa_group_put(sm->wpa_auth, sm->group);
++	sm->wpa_auth = wpa_auth;
++	sm->group = wpa_auth->group;
++	wpa_group_get(sm->wpa_auth, sm->group);
++}
+diff --git a/src/ap/wpa_auth.h b/src/ap/wpa_auth.h
+index e51161ea9..5f6047fac 100644
+--- a/src/ap/wpa_auth.h
++++ b/src/ap/wpa_auth.h
+@@ -715,4 +715,6 @@ const u8 * wpa_auth_get_aa(const struct wpa_state_machine *sm);
+ const u8 * wpa_auth_get_spa(const struct wpa_state_machine *sm);
+ struct wpa_authenticator * wpa_get_link_auth(struct wpa_authenticator *wpa_auth,
+ 					     int link_id);
++void wpa_assign_wpa_auth_group(struct wpa_state_machine *sm,
++				  struct wpa_authenticator *wpa_auth);
+ #endif /* WPA_AUTH_H */
+diff --git a/src/ap/wpa_auth_ft.c b/src/ap/wpa_auth_ft.c
+index 94878fc2b..e73be8601 100644
+--- a/src/ap/wpa_auth_ft.c
++++ b/src/ap/wpa_auth_ft.c
+@@ -4130,10 +4130,16 @@ static void wpa_ft_rrb_rx_request_cb(void *ctx, const u8 *dst,
+ 				     const u8 *ies, size_t ies_len)
+ {
+ 	struct wpa_state_machine *sm = ctx;
++	int ret;
++
+ 	wpa_printf(MSG_DEBUG, "FT: Over-the-DS RX request cb for " MACSTR,
+ 		   MAC2STR(sm->addr));
+-	wpa_ft_send_rrb_auth_resp(sm, sm->ft_pending_current_ap, sm->addr,
+-				  WLAN_STATUS_SUCCESS, ies, ies_len);
++	ret = wpa_ft_send_rrb_auth_resp(sm, sm->ft_pending_current_ap, sm->addr,
++					resp, ies, ies_len);
++	if (resp == WLAN_STATUS_SUCCESS && !ret)
++		sm->ft_ds_req_state = FT_OTD_WAIT_REASSOC;
++	else
++		sm->ft_ds_req_state = FT_OTD_IDLE;
+ }
+ 
+ 
+@@ -4154,6 +4160,18 @@ static int wpa_ft_rrb_rx_request(struct wpa_authenticator *wpa_auth,
+ 			   "RRB Request");
+ 		return -1;
+ 	}
++	switch (sm->ft_ds_req_state) {
++	case FT_OTD_WAIT_PMKR1_RESP:
++		wpa_printf(MSG_DEBUG, "FT: Wait for pmk-r1 from remote r0kh");
++		return 0;
++	case FT_OTD_WAIT_REASSOC:
++		wpa_printf(MSG_DEBUG, "FT: Action auth req has been handled");
++		return 0;
++	default:
++		wpa_printf(MSG_ERROR, "FT: Invalid OTD request state");
++	case FT_OTD_IDLE:
++		break;
++	}
+ 
+ 	wpa_hexdump(MSG_MSGDUMP, "FT: RRB Request Frame body", body, len);
+ 
+@@ -4168,6 +4186,7 @@ static int wpa_ft_rrb_rx_request(struct wpa_authenticator *wpa_auth,
+ 	res = wpa_ft_process_auth_req(sm, body, len, &resp_ies,
+ 				      &resp_ies_len, link_id);
+ 	if (res < 0) {
++		sm->ft_ds_req_state = FT_OTD_WAIT_PMKR1_RESP;
+ 		wpa_printf(MSG_DEBUG, "FT: No immediate response available - wait for pull response");
+ 		return 0;
+ 	}
+@@ -4175,6 +4194,12 @@ static int wpa_ft_rrb_rx_request(struct wpa_authenticator *wpa_auth,
+ 
+ 	res = wpa_ft_send_rrb_auth_resp(sm, current_ap, sta_addr, status,
+ 					resp_ies, resp_ies_len);
++
++	if (status == WLAN_STATUS_SUCCESS && !res)
++		sm->ft_ds_req_state = FT_OTD_WAIT_REASSOC;
++	else
++		sm->ft_ds_req_state = FT_OTD_IDLE;
++
+ 	os_free(resp_ies);
+ 	return res;
+ }
+diff --git a/src/ap/wpa_auth_glue.c b/src/ap/wpa_auth_glue.c
+index b3311ae24..7b05997b9 100644
+--- a/src/ap/wpa_auth_glue.c
++++ b/src/ap/wpa_auth_glue.c
+@@ -32,6 +32,7 @@
+ #include "ieee802_11_auth.h"
+ #include "pmksa_cache_auth.h"
+ #include "wpa_auth.h"
++#include "wpa_auth_i.h"
+ #include "wpa_auth_glue.h"
+ 
+ 
+@@ -1161,25 +1162,53 @@ hostapd_wpa_auth_add_sta(void *ctx, const u8 *sta_addr)
+ 	if (ret < 0 && ret != -EOPNOTSUPP)
+ 		return NULL;
+ 
++	/* Since RRB would be duplicated and sent to all links in case of OTD, every link
++	 * hapd would run ap_sta_add separately. This is for the following FT reassoc
++	 * since we don't know which link would be chosen by the roaming STA. Also,
++	 * corresponding wpa_sm should be prepared.
++	 */
+ 	sta = ap_sta_add(hapd, sta_addr);
+ 	if (sta == NULL)
+ 		return NULL;
+ 	if (ret == 0)
+ 		sta->added_unassoc = 1;
+ 
++	/* Use the same wpa_sm to handle duplicated otd action frames */
++	if (sta->ft_over_ds && sta->wpa_sm)
++		goto out;
++
+ 	sta->ft_over_ds = 1;
+-	if (sta->wpa_sm) {
+-		sta->auth_alg = WLAN_AUTH_FT;
+-		return sta->wpa_sm;
++#ifdef CONFIG_IEEE80211BE
++	if (hapd->conf->mld_ap) {
++		struct hostapd_data *link;
++		for_each_mld_link(link, hapd) {
++			struct sta_info *s;
++
++			if (link == hapd)
++				continue;
++			for (s = link->sta_list; s; s = s->next) {
++				if (!os_memcmp(s->addr, sta_addr, 6) &&
++				    s->ft_over_ds && s->wpa_sm &&
++				    s->wpa_sm->ft_ds_req_state) {
++					wpa_auth_sta_deinit(sta->wpa_sm);
++					sta->wpa_sm = s->wpa_sm;
++					goto out;
++				}
++			}
++		}
+ 	}
++#endif
++	if (sta->wpa_sm)
++		goto out;
+ 
+ 	sta->wpa_sm = wpa_auth_sta_init(hapd->wpa_auth, sta->addr, NULL);
+ 	if (sta->wpa_sm == NULL) {
+ 		ap_free_sta(hapd, sta);
+ 		return NULL;
+ 	}
+-	sta->auth_alg = WLAN_AUTH_FT;
+ 
++out:
++	sta->auth_alg = WLAN_AUTH_FT;
+ 	return sta->wpa_sm;
+ }
+ 
+diff --git a/src/ap/wpa_auth_i.h b/src/ap/wpa_auth_i.h
+index 276582821..53320b22f 100644
+--- a/src/ap/wpa_auth_i.h
++++ b/src/ap/wpa_auth_i.h
+@@ -151,6 +151,14 @@ struct wpa_state_machine {
+ 	u8 ft_pending_auth_transaction;
+ 	u8 ft_pending_current_ap[ETH_ALEN];
+ 	int ft_pending_pull_left_retries;
++	u8 ft_ds_req_state;
++
++	enum {
++		FT_OTD_IDLE,
++		FT_OTD_WAIT_PMKR1_RESP,
++		FT_OTD_WAIT_REASSOC,
++	} ft_ds_request_state;
++
+ #endif /* CONFIG_IEEE80211R_AP */
+ 
+ 	int pending_1_of_4_timeout;
+-- 
+2.45.2
+

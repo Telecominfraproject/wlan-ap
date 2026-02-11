@@ -1,0 +1,770 @@
+From b73314e7b359fafdc800b2b9fcf88df183961da3 Mon Sep 17 00:00:00 2001
+From: Michael-CY Lee <michael-cy.lee@mediatek.com>
+Date: Wed, 3 Jul 2024 15:39:53 +0800
+Subject: [PATCH 106/236] mtk: hostapd: add A-TTLM support
+
+Add a data structure for AP MLD's Advertised Tid-to-Link Mapping (A-TTLM).
+Since it is MLD-level, this commit also adds it into struct hostapd_mld.
+
+There should be 'curr_attlm' and 'new_attlm', which means 2 TTLMs can be
+advertised at the same time ('curr_attlm' is used currently while
+'new_attlm' is about to be used)
+However, since the FW only support 1 attlm now, there is currently only
+'new_attlm'.
+
+There are 3 A-TTLM events from the driver, and hostap should handle them
+accordingly
+1. A-TTLM started: link(s) sould start to advertise TTLM in the beacon.
+2. A-TTLM switch time expired: enabled link(s) keep advertising TTLM in
+   the beacon with switch time excluded, whiel disabled link(s) should
+   stop TX/RX, including beacon
+3. A-TTLM ended: all links stop advertising TTLM in the beacon, and
+   disabled link recover to TX/RX.
+
+This commit adds the support to set ATTLM, from hostapd_cli to driver.
+Setting an ATTLM requires 3 parameters
+1. disabled_links: disabled link ID bitmap
+2. switch_time: how much time it takes to start the A-TTLM (in ms)
+3. duration: how long the A-TTLM lasts (in ms)
+
+Below is a hostapd_cli example that requires an A-TTLM starts to disable
+link_id=1 after 5 seconds and last for 20 seconds:
+$ hostapd_cli -i ap-mld-1 set_attlm disabled_links=2 switch_time=5000
+duration=20000
+
+1. move NL80211_ATTR_MLO_LINK_DISABLED_BMP to MTK internal
+2. change the order of NL80211_ATTR_MLO_ATTLM_EVENT
+3. add comment for Adv-TTLM related attributes
+
+Add critical update flag when ATTLM ends.
+According to the spec, critical update flag should be set
+when "An AP affiliated with the smae AP MLD as the reporting
+AP becomes disabled or enabled through a new advertised TTLM"
+
+Add TTLM length calculation
+
+Properly add CONFIG_TESTING_OPTION.
+Without adding this, compile with CONFIG_TESTING_OPTION not set will
+fail
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+---
+ hostapd/ctrl_iface.c               | 66 ++++++++++++++++++++
+ hostapd/hostapd_cli.c              |  8 +++
+ src/ap/ap_drv_ops.c                |  9 +++
+ src/ap/ap_drv_ops.h                |  1 +
+ src/ap/beacon.c                    |  6 ++
+ src/ap/drv_callbacks.c             | 57 ++++++++++++++++++
+ src/ap/hostapd.c                   |  8 +++
+ src/ap/hostapd.h                   |  4 ++
+ src/ap/ieee802_11.c                |  8 +++
+ src/ap/ieee802_11.h                |  2 +
+ src/ap/ieee802_11_eht.c            | 96 +++++++++++++++++++++++++++++-
+ src/common/ieee802_11_defs.h       | 13 ++++
+ src/drivers/driver.h               | 56 +++++++++++++++++
+ src/drivers/driver_nl80211.c       | 33 ++++++++++
+ src/drivers/driver_nl80211_event.c | 54 +++++++++++++++++
+ 15 files changed, 420 insertions(+), 1 deletion(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 5607e0d6d..536def442 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -4102,6 +4102,68 @@ out:
+ 	return ret;
+ }
+ 
++static int hostapd_ctrl_iface_set_attlm(struct hostapd_data *hapd, char *cmd,
++					char *buf, size_t buflen)
++{
++#define MAX_SWITCH_TIME_MS 30000
++#define MAX_DURATION_MS 16000000
++	struct attlm_settings *attlm;
++	struct hostapd_data *h;
++	char *token, *context = NULL;
++	u16 switch_time, disabled_links, valid_links = 0;
++	u32 duration;
++	int ret, i;
++
++	if (!hapd->conf->mld_ap || !hapd->mld)
++		return -1;
++
++	attlm = &hapd->mld->new_attlm;
++	if (attlm->valid) {
++		wpa_printf(MSG_ERROR, "Busy: A-TTLM is on-going");
++		return -1;
++	}
++
++	for_each_mld_link(h, hapd)
++		valid_links |= BIT(h->mld_link_id);
++
++	while ((token = str_token(cmd, " ", &context))) {
++		if (os_strncmp(token, "switch_time=", 12) == 0) {
++			switch_time = atoi(token + 12);
++			if (switch_time > 0 && switch_time <= MAX_SWITCH_TIME_MS)
++				continue;
++		}
++
++		if (os_strncmp(token, "disabled_links=", 15) == 0) {
++			disabled_links = atoi(token + 15);
++
++			if ((disabled_links & valid_links) &&
++			    !(disabled_links & ~valid_links))
++				continue;
++		}
++
++		if (os_strncmp(token, "duration=", 9) == 0) {
++			duration = atoi(token + 9);
++			if (duration > 0 && duration <= MAX_DURATION_MS)
++				continue;
++		}
++
++		wpa_printf(MSG_INFO, "CTRL: Invalid SET_ATTLM parameter: %s",
++			   token);
++		return -1;
++	}
++
++	wpa_printf(MSG_DEBUG,
++		   "MLD: set A-TTLM disabled_links=%u, switch_time=%u, duration=%u",
++		   disabled_links, switch_time, duration);
++
++	attlm->valid = true;
++	attlm->direction = IEEE80211_TTLM_DIRECTION_BOTH;
++	attlm->duration = duration;
++	attlm->switch_time = switch_time;
++	attlm->disabled_links = hapd->conf->mld_allowed_links & disabled_links;
++
++	return hostapd_mld_set_attlm(hapd);
++}
+ #endif /* CONFIG_TESTING_OPTIONS */
+ #endif /* CONFIG_IEEE80211BE */
+ 
+@@ -6112,6 +6174,10 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 		if (hostapd_ctrl_iface_link_add(hapd, buf + 9,
+ 						reply, reply_size))
+ 			reply_len = -1;
++	} else if (os_strncmp(buf, "SET_ATTLM ", 10) == 0) {
++		if (hostapd_ctrl_iface_set_attlm(hapd, buf + 10, reply,
++						 reply_size))
++			reply_len = -1;
+ #endif /* CONFIG_TESTING_OPTIONS */
+ #endif /* CONFIG_IEEE80211BE */
+ 	} else if (os_strncmp(buf, "SET_EDCCA ", 10) == 0) {
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index ab32cc5bf..1284360c7 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1788,6 +1788,12 @@ static int hostapd_cli_cmd_link_remove(struct wpa_ctrl *ctrl, int argc,
+ 	return hostapd_cli_cmd(ctrl, "LINK_REMOVE", 1, argc, argv);
+ }
+ 
++static int hostapd_cli_cmd_set_attlm(struct wpa_ctrl *ctrl, int argc,
++				     char *argv[])
++{
++	return hostapd_cli_cmd(ctrl, "SET_ATTLM", 1, argc, argv);
++}
++
+ struct hostapd_cli_cmd {
+ 	const char *cmd;
+ 	int (*handler)(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+@@ -2050,6 +2056,8 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 		" = Add a new link to a MLD AP"},
+ 	{ "link_remove", hostapd_cli_cmd_link_remove, NULL,
+ 		" [count=<count>] = Remove affiliated link of a MLD AP"},
++	{ "set_attlm", hostapd_cli_cmd_set_attlm, NULL,
++		" = Disable the affiliated AP of a MLD AP" },
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+diff --git a/src/ap/ap_drv_ops.c b/src/ap/ap_drv_ops.c
+index 8ee5749aa..da0344cfc 100644
+--- a/src/ap/ap_drv_ops.c
++++ b/src/ap/ap_drv_ops.c
+@@ -621,6 +621,15 @@ int hostapd_if_link_remove(struct hostapd_data *hapd,
+ 	return hapd->driver->link_remove(hapd->drv_priv, type, ifname,
+ 					 hapd->mld_link_id);
+ }
++
++
++int hostapd_drv_set_attlm(struct hostapd_data *hapd)
++{
++	if (!hapd->driver || !hapd->drv_priv || !hapd->driver->set_attlm)
++		return -1;
++
++	return hapd->driver->set_attlm(hapd->drv_priv, &hapd->mld->new_attlm);
++}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index 94c46d363..ed467e402 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -68,6 +68,7 @@ int hostapd_if_remove(struct hostapd_data *hapd, enum wpa_driver_if_type type,
+ int hostapd_if_link_remove(struct hostapd_data *hapd,
+ 			   enum wpa_driver_if_type type,
+ 			   const char *ifname, u8 link_id);
++int hostapd_drv_set_attlm(struct hostapd_data *hapd);
+ int hostapd_set_ieee8021x(struct hostapd_data *hapd,
+ 			  struct wpa_bss_params *params);
+ int hostapd_get_seqnum(const char *ifname, struct hostapd_data *hapd,
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index 63881b367..a6c84425d 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -954,6 +954,8 @@ static u8 * hostapd_probe_resp_fill_elems(struct hostapd_data *hapd,
+ 
+ 		pos = hostapd_eid_eht_capab(hapd, pos, IEEE80211_MODE_AP);
+ 		pos = hostapd_eid_eht_operation(hapd, pos);
++
++		pos = hostapd_eid_eht_attlm(hapd, pos);
+ 	}
+ 
+ 	if (hapd_probed != hapd && hapd_probed->conf->mld_ap)
+@@ -2315,6 +2317,8 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 			 * switch */
+ 			tail_len += 6;
+ 		}
++
++		tail_len += hostapd_eid_eht_attlm_len(hapd);
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+@@ -2525,6 +2529,7 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 		tailpos = hostapd_eid_eht_capab(hapd, tailpos,
+ 						IEEE80211_MODE_AP);
+ 		tailpos = hostapd_eid_eht_operation(hapd, tailpos);
++		tailpos = hostapd_eid_eht_attlm(hapd, tailpos);
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+@@ -2947,6 +2952,7 @@ static bool is_restricted_ext_eid_in_sta_profile(u8 ext_id)
+ {
+ 	switch (ext_id) {
+ 	case WLAN_EID_EXT_MULTI_LINK:
++	case WLAN_EID_EXT_TID_TO_LINK_MAPPING:
+ 		return true;
+ 	default:
+ 		return false;
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index e5098ca5d..c2141ede0 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -1475,6 +1475,58 @@ void hostapd_event_ch_switch(struct hostapd_data *hapd, int freq, int ht,
+ }
+ 
+ 
++#ifdef CONFIG_IEEE80211BE
++void hostapd_event_attlm(struct hostapd_data *hapd, struct attlm_event *attlm_event)
++{
++	struct hostapd_mld *mld = hapd->mld;
++	struct hostapd_data *p_hapd;
++	bool mld_indicate_disabled = false;
++
++	if (!hapd->conf->mld_ap || !mld)
++		return;
++
++	wpa_printf(MSG_DEBUG, "A-TTLM event");
++	/*
++	 * T0: driver notifies A-TTLM has started and reports Switch Time TSF in TUs
++	 * T1: driver notifies Switch Time Expiry of a started A-TTLM
++	 * T2: driver notifies Duration Expiry of a started A-TTLM.
++	 */
++	switch (attlm_event->event) {
++		case EVENT_ATTLM_STARTED:
++			ieee802_11_set_bss_critical_update(hapd,
++						BSS_CRIT_UPDATE_EVENT_ATTLM);
++			mld->new_attlm.switch_time_tsf_tu =
++						attlm_event->switch_time_tsf_tu;
++			break;
++		case EVENT_ATTLM_SWITCH_TIME_EXPIRED:
++			mld_indicate_disabled = true;
++			mld->new_attlm.switch_time_tsf_tu = 0;
++			os_get_reltime(&mld->new_attlm.start_time);
++			break;
++		case EVENT_ATTLM_END:
++			ieee802_11_set_bss_critical_update(hapd,
++						BSS_CRIT_UPDATE_EVENT_ATTLM);
++			mld->new_attlm.valid = false;
++			break;
++		default:
++			wpa_printf(MSG_DEBUG, "Unsupported A-TTLM event");
++			return;
++	}
++
++#ifdef CONFIG_TESTING_OPTIONS
++	for_each_mld_link(p_hapd, hapd) {
++		if (mld->new_attlm.disabled_links & BIT(p_hapd->mld_link_id))
++			p_hapd->conf->mld_indicate_disabled =
++							mld_indicate_disabled;
++	}
++#endif /* CONFIG_TESTING_OPTIONS */
++
++	ieee802_11_set_beacon(hapd);
++	hapd->eht_mld_bss_critical_update = 0;
++}
++#endif /* CONFIG_IEEE80211BE */
++
++
+ void hostapd_event_connect_failed_reason(struct hostapd_data *hapd,
+ 					 const u8 *addr, int reason_code)
+ {
+@@ -2902,6 +2954,11 @@ void hostapd_wpa_event(void *ctx, enum wpa_event_type event,
+ 					data->ch_switch.punct_bitmap,
+ 					event == EVENT_CH_SWITCH);
+ 		break;
++	case EVENT_ATTLM:
++#ifdef CONFIG_IEEE80211BE
++		hostapd_event_attlm(hapd, &data->attlm_event);
++#endif /* CONFIG_IEEE80211BE */
++		break;
+ 	case EVENT_CONNECT_FAILED_REASON:
+ 		if (!data)
+ 			break;
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index bf18c423c..5e1d45872 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -490,6 +490,14 @@ void hostapd_link_remove_cb(struct hostapd_data *hapd, u16 removed_links)
+ 	}
+ }
+ 
++
++int hostapd_mld_set_attlm(struct hostapd_data *hapd)
++{
++	if (!hapd->drv_priv)
++		return -1;
++
++	return hostapd_drv_set_attlm(hapd);
++}
+ #endif /* CONFIG_TESTING_OPTIONS */
+ #endif /* CONFIG_IEEE80211BE */
+ 
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 2bf03958d..27284a97a 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -580,6 +580,7 @@ struct hostapd_mld {
+ 	u16 active_links;
+ 	u16 removed_links;
+ 
++	struct attlm_settings new_attlm;
+ 	struct hostapd_data *fbss;
+ 	struct dl_list links; /* List head of all affiliated links */
+ 
+@@ -960,6 +961,7 @@ struct hostapd_data * hostapd_mld_get_link_bss(struct hostapd_data *hapd,
+ 					       u8 link_id);
+ int hostapd_link_remove(struct hostapd_data *hapd, u32 count);
+ void hostapd_link_remove_cb(struct hostapd_data *hapd, u16 removed_links);
++int hostapd_mld_set_attlm(struct hostapd_data *hapd);
+ bool hostapd_is_ml_partner(struct hostapd_data *hapd1,
+ 			   struct hostapd_data *hapd2);
+ u8 hostapd_get_mld_id(struct hostapd_data *hapd);
+@@ -976,6 +978,8 @@ int hostapd_fill_cca_settings(struct hostapd_data *hapd,
+ 
+ #ifdef CONFIG_IEEE80211BE
+ 
++void hostapd_event_attlm(struct hostapd_data *hapd, struct attlm_event *attlm_event);
++
+ bool hostapd_mld_is_first_bss(struct hostapd_data *hapd);
+ void hostapd_mld_interface_freed(struct hostapd_data *hapd);
+ 
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 2df6a7ed6..df5d59c8e 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -5428,6 +5428,7 @@ rsnxe_done:
+ 			p = hostapd_eid_eht_ml_assoc(hapd, sta, p);
+ 		p = hostapd_eid_eht_capab(hapd, p, IEEE80211_MODE_AP);
+ 		p = hostapd_eid_eht_operation(hapd, p);
++		p = hostapd_eid_eht_attlm(hapd, p);
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+@@ -6721,6 +6722,13 @@ int ieee802_11_mgmt(struct hostapd_data *hapd, const u8 *buf, size_t len,
+ 		wpa_printf(MSG_DEBUG, "MGMT: Drop the frame - MLD not ready");
+ 		return 1;
+ 	}
++
++	if (hapd->conf->mld_ap && hapd->mld->new_attlm.valid &&
++	    !hapd->mld->new_attlm.switch_time_tsf_tu &&
++	    (hapd->mld->new_attlm.disabled_links & BIT(hapd->mld_link_id))) {
++		wpa_printf(MSG_DEBUG, "MGMT: Drop the frame - Disabled link");
++		return 1;
++	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	if (fi && fi->freq)
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index 714d92337..96edd9521 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -280,6 +280,8 @@ u8 * hostapd_eid_eht_capab(struct hostapd_data *hapd, u8 *eid,
+ 			   enum ieee80211_op_mode opmode);
+ u8 * hostapd_eid_non_inheritance(struct hostapd_data *hapd, u8 *eid);
+ u8 * hostapd_eid_eht_operation(struct hostapd_data *hapd, u8 *eid);
++size_t hostapd_eid_eht_attlm_len(struct hostapd_data *hapd);
++u8 * hostapd_eid_eht_attlm(struct hostapd_data *hapd, u8 *eid);
+ u16 copy_sta_eht_capab(struct hostapd_data *hapd, struct sta_info *sta,
+ 		       enum ieee80211_op_mode opmode,
+ 		       const u8 *he_capab, size_t he_capab_len,
+diff --git a/src/ap/ieee802_11_eht.c b/src/ap/ieee802_11_eht.c
+index c7c0f72f8..409305824 100644
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -609,7 +609,7 @@ u8 * hostapd_eid_eht_basic_ml_common(struct hostapd_data *hapd,
+ 	mld_cap |= active_links & EHT_ML_MLD_CAPA_MAX_NUM_SIM_LINKS_MASK;
+ 
+ 	/* TODO: Advertise T2LM based on driver support as well */
+-	mld_cap &= ~EHT_ML_MLD_CAPA_TID_TO_LINK_MAP_NEG_SUPP_MSK;
++	mld_cap |= EHT_ML_MLD_CAPA_TID_TO_LINK_MAP_ALL_TO_ALL;
+ 
+ 	mld_cap |= EHT_ML_MLD_CAPA_LINK_RECONF_OP_SUPPORT;
+ 
+@@ -910,6 +910,100 @@ static u8 * hostapd_eid_eht_reconf_ml(struct hostapd_data *hapd, u8 *eid)
+ }
+ 
+ 
++size_t hostapd_eid_eht_attlm_len(struct hostapd_data * hapd)
++{
++	struct attlm_settings *attlm;
++	size_t len;
++
++	if (!hapd->conf->mld_ap)
++		return 0;
++
++	attlm = &hapd->mld->new_attlm;
++	if (!attlm || !attlm->valid)
++		return 0;
++
++	/* Element ID: 1 octet
++	 * Length: 1 octet
++	 * Extended Element ID: 1 octet
++	 * Control: 2 octets (Link Mapping Presence Bitmap set for all TIDs)
++	 * Mapping Switch Time: 0 or 2 octets
++	 * Expected Duration: 3 octets (must included in Adv-TTLM)
++	 * Link Mapping (size of 2) for All 8 TIDs: 2 * 8 octets
++	 */
++	len = 3 + 2 + 3 + 2 * 8;
++	if (attlm->switch_time_tsf_tu != 0)
++		len += 2;
++
++	return len;
++}
++
++
++u8 * hostapd_eid_eht_attlm(struct hostapd_data *hapd, u8 *eid)
++{
++	struct attlm_settings *attlm;
++	struct os_reltime now, res;
++	int i;
++	u16 control = 0;
++	u8 *pos = eid;
++	u16 enabled_links;
++
++	if (!hapd->conf->mld_ap)
++		return eid;
++
++	attlm = &hapd->mld->new_attlm;
++	if (!attlm || !attlm->valid)
++		return eid;
++
++	/* The length will be set at the end */
++	*pos++ = WLAN_EID_EXTENSION;
++	*pos++ = 0;
++	*pos++ = WLAN_EID_EXT_TID_TO_LINK_MAPPING;
++
++	/* Set the A-TTLM Control field */
++	control = (IEEE80211_TTLM_CONTROL_DIRECTION & attlm->direction) |
++		  IEEE80211_TTLM_CONTROL_EXPECTED_DUR_PRESENT |
++		  IEEE80211_TTLM_CONTROL_INDICATOR;
++
++	if (attlm->switch_time_tsf_tu != 0)
++		control |= IEEE80211_TTLM_CONTROL_SWITCH_TIME_PRESENT;
++
++	WPA_PUT_LE16(pos, control);
++	pos += 2;
++
++	/* switch time & expected duration */
++	if (attlm->switch_time_tsf_tu != 0) {
++		WPA_PUT_LE16(pos, attlm->switch_time_tsf_tu);
++		pos += 2;
++
++		WPA_PUT_LE24(pos, (attlm->duration * 1000) >> 10);
++		pos += 3;
++	} else {
++		u32 diff;
++
++		os_get_reltime(&now);
++		os_reltime_sub(&now, &attlm->start_time, &res);
++		diff = (u32)os_reltime_in_ms(&res);
++
++		if (attlm->duration <= diff)
++			return eid;
++
++		WPA_PUT_LE24(pos, ((attlm->duration - diff) * 1000) >> 10);
++		pos += 3;
++	}
++
++	/* Link Mapping of each TID (0 - 7) */
++	enabled_links = hapd->conf->mld_allowed_links & ~attlm->disabled_links;
++	for (i = 0; i < 8; i++) {
++		WPA_PUT_LE16(pos, enabled_links);
++		pos += 2;
++	}
++
++	eid[1] = pos - eid - 2;
++
++	return pos;
++}
++
++
+ static size_t hostapd_eid_eht_ml_len(struct mld_info *info,
+ 				     bool include_mld_id, bool include_bpcc,
+ 				     u8 eml_disable)
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index db26cfb34..e8328cd8e 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -3041,6 +3041,19 @@ struct ieee80211_bw_ind_element {
+ 
+ #define BW_IND_PARAMETER_DISABLED_SUBCHAN_BITMAP_PRESENT       BIT(1)
+ 
++/* IEEE P802.11be/D5.0, 9.4.2.314 - TID-to-Link Mapping control */
++#define IEEE80211_TTLM_CONTROL_DIRECTION		0x0003
++#define IEEE80211_TTLM_CONTROL_DEF_LINK_MAP		0x0004
++#define IEEE80211_TTLM_CONTROL_SWITCH_TIME_PRESENT	0x0008
++#define IEEE80211_TTLM_CONTROL_EXPECTED_DUR_PRESENT	0x0010
++#define IEEE80211_TTLM_CONTROL_LINK_MAP_SIZE		0x0020
++#define IEEE80211_TTLM_CONTROL_INDICATOR		0xff00
++
++/* TTLM direction */
++#define IEEE80211_TTLM_DIRECTION_DOWN		0
++#define IEEE80211_TTLM_DIRECTION_UP		1
++#define IEEE80211_TTLM_DIRECTION_BOTH		2
++
+ /* IEEE P802.11ay/D4.0, 9.4.2.251 - EDMG Operation element */
+ #define EDMG_BSS_OPERATING_CHANNELS_OFFSET	6
+ #define EDMG_OPERATING_CHANNEL_WIDTH_OFFSET	7
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 523e8c63f..de0c543ef 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -2906,6 +2906,29 @@ struct cca_settings {
+ 	int link_id;
+ };
+ 
++#ifdef CONFIG_IEEE80211BE
++/**
++ * struct attlm_settings - Setting for Advertised Tid-to-Link Mapping
++ * @valid: whether this A-TTLM is still valid
++ * @direction: direction of this A-TTLM
++ * @disabled_links: disabled link ID bitmap
++ * @switch_time: duration in ms to establish the A-TTLM
++ * @switch_time_tsf_tu: time in TUs that the A-TTLM is established. It should be
++ * the bits 10 to 25 of the TSF
++ * @duration_tu: duration in ms that the A-TTLM lasts
++ * @start_time: the relative time that this A-TTLM is entablished
++ */
++struct attlm_settings {
++	bool valid;
++	u8 direction;
++	u16 disabled_links;
++	u16 switch_time;
++	u16 switch_time_tsf_tu;
++	u32 duration;
++	struct os_reltime start_time;
++};
++#endif /* CONFIG_IEEE80211BE */
++
+ /* TDLS peer capabilities for send_tdls_mgmt() */
+ enum tdls_peer_capability {
+ 	TDLS_PEER_HT = BIT(0),
+@@ -5404,6 +5427,14 @@ struct wpa_driver_ops {
+ 	int (*link_remove)(void *priv, enum wpa_driver_if_type type,
+ 			   const char *ifname, u8 link_id);
+ 
++	/**
++	 * set_attlm - Set AP MLD advertised Tid-to-Link Mapping
++	 * @priv: Private driver interface data
++	 * @attlm: setting of Tid-to-Link Mapping
++	 * Returns: 0 on success, negative value on failure
++	 */
++	int (*set_attlm)(void *priv, struct attlm_settings *attlm);
++
+ 	/**
+ 	 * is_drv_shared - Check whether the driver interface is shared
+ 	 * @priv: Private driver interface data from init()
+@@ -6297,6 +6328,16 @@ enum wpa_event_type {
+ 	 */
+ 	EVENT_LINK_CH_SWITCH_STARTED,
+ 
++	/**
++	 * EVENT_ATTLM - MLD AP Advertised Tid-to-Link Mapping event
++	 *
++	 * This event is used by the driver to indicate the state transition of
++	 * A-TTLM.
++	 *
++	 * Described in wpa_event_data.attlm_event
++	 */
++	EVENT_ATTLM,
++
+ 	/**
+ 	 * EVENT_TID_LINK_MAP - MLD event to set TID-to-link mapping
+ 	 *
+@@ -7116,6 +7157,21 @@ union wpa_event_data {
+ 		u16 punct_bitmap;
+ 	} ch_switch;
+ 
++	/**
++	 * struct attlm_event
++	 * @switch_time_tsf_tu: the TSF of switch time in unit of TUs
++	 * @started: the ATTLM is started or has been done.
++	 * @switch_time_expired: the switch time has expired
++	 */
++	struct attlm_event {
++		enum {
++			EVENT_ATTLM_STARTED,
++			EVENT_ATTLM_SWITCH_TIME_EXPIRED,
++			EVENT_ATTLM_END
++		} event;
++		u16 switch_time_tsf_tu;
++	} attlm_event;
++
+ 	/**
+ 	 * struct connect_failed - Data for EVENT_CONNECT_FAILED_REASON
+ 	 * @addr: Remote client address
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 3a253a073..9c4dce3a1 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -11357,6 +11357,38 @@ static bool nl80211_is_drv_shared(void *priv, int link_id)
+ 	return true;
+ }
+ 
++
++static int nl80211_set_attlm(void *priv, struct attlm_settings *attlm)
++{
++	struct nl_msg *msg;
++	struct i802_bss *bss = priv;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++	int ret = -ENOBUFS;
++
++	wpa_printf(MSG_DEBUG, "nl80211: Set A-TTLM");
++
++	if (!(msg = nl80211_bss_msg(bss, 0, NL80211_CMD_SET_ATTLM)) ||
++	    nla_put_u16(msg, NL80211_ATTR_MLO_LINK_DISABLED_BMP,
++			attlm->disabled_links) ||
++	    nla_put_u16(msg, NL80211_ATTR_MLO_ATTLM_SWITCH_TIME,
++			attlm->switch_time) ||
++	    nla_put_u32(msg, NL80211_ATTR_MLO_ATTLM_DURATION,
++			attlm->duration))
++		goto error;
++
++	ret = send_and_recv_cmd(drv, msg);
++	if (ret) {
++		wpa_printf(MSG_DEBUG,
++			   "nl80211: disable link failed err=%d (%s)",
++			   ret, strerror(-ret));
++	}
++
++	return ret;
++error:
++	nlmsg_free(msg);
++	wpa_printf(MSG_DEBUG, "nl80211: Could not build link disabling request");
++	return ret;
++}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 
+@@ -16631,6 +16663,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.link_add = nl80211_link_add,
+ #ifdef CONFIG_IEEE80211BE
+ 	.link_remove = driver_nl80211_link_remove,
++	.set_attlm = nl80211_set_attlm,
+ 	.is_drv_shared = nl80211_is_drv_shared,
+ 	.link_sta_remove = wpa_driver_nl80211_link_sta_remove,
+ 	.can_share_drv = wpa_driver_nl80211_can_share_drv,
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index 7f2219e38..900f5f3cc 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -190,6 +190,8 @@ static const char * nl80211_command_to_string(enum nl80211_commands cmd)
+ 	C2S(NL80211_CMD_SET_TID_TO_LINK_MAPPING)
+ 	C2S(NL80211_CMD_ASSOC_MLO_RECONF)
+ 	C2S(NL80211_CMD_EPCS_CFG)
++	C2S(NL80211_CMD_ATTLM_EVENT)
++	C2S(NL80211_CMD_SET_ATTLM)
+ 	C2S(__NL80211_CMD_AFTER_LAST)
+ 	}
+ #undef C2S
+@@ -1383,6 +1385,53 @@ static void mlme_event_ch_switch(struct wpa_driver_nl80211_data *drv,
+ }
+ 
+ 
++static void mlme_event_attlm(struct wpa_driver_nl80211_data *drv,
++			     struct nlattr *ifindex,
++			     struct nlattr *event,
++			     struct nlattr *switch_time_tsf_tu)
++{
++	enum nl80211_attlm_event event_type;
++	union wpa_event_data data;
++	struct i802_bss *bss;
++	int ifidx;
++
++	ifidx = nla_get_u32(ifindex);
++	bss = get_bss_ifindex(drv, ifidx);
++	if (bss == NULL) {
++		wpa_printf(MSG_WARNING,
++			   "nl80211: Unknown ifindex (%d) for A-TTLM, ignoring",
++			   ifidx);
++		return;
++	}
++
++	if (!event)
++		return;
++
++	wpa_printf(MSG_DEBUG, "nl80211: %s: A-TTLM event", bss->ifname);
++
++	data.attlm_event.switch_time_tsf_tu = switch_time_tsf_tu ?
++					nla_get_u16(switch_time_tsf_tu) : 0;
++	event_type = nla_get_u32(event);
++	switch (event_type) {
++		case NL80211_ATTLM_STARTED:
++			data.attlm_event.event = EVENT_ATTLM_STARTED;
++			break;
++		case NL80211_ATTLM_SWITCH_TIME_EXPIRED:
++			data.attlm_event.event = EVENT_ATTLM_SWITCH_TIME_EXPIRED;
++			break;
++		case NL80211_ATTLM_END:
++			data.attlm_event.event = EVENT_ATTLM_END;
++			break;
++		default:
++			wpa_printf(MSG_DEBUG,
++				   "nl80211: Unsupported A-TTLM event");
++			return;
++	}
++
++	wpa_supplicant_event(bss->ctx, EVENT_ATTLM, &data);
++}
++
++
+ static void mlme_timeout_event(struct wpa_driver_nl80211_data *drv,
+ 			       enum nl80211_commands cmd, struct nlattr *addr)
+ {
+@@ -4346,6 +4395,11 @@ static void do_process_drv_event(struct i802_bss *bss, int cmd,
+ 				     NULL,
+ 				     1);
+ 		break;
++	case NL80211_CMD_ATTLM_EVENT:
++		mlme_event_attlm(drv, tb[NL80211_ATTR_IFINDEX],
++				 tb[NL80211_ATTR_MLO_ATTLM_EVENT],
++				 tb[NL80211_ATTR_MLO_ATTLM_SWITCH_TIME_TSF_TU]);
++		break;
+ 	case NL80211_CMD_DISCONNECT:
+ 		mlme_event_disconnect(drv, tb[NL80211_ATTR_REASON_CODE],
+ 				      tb[NL80211_ATTR_MAC],
+-- 
+2.45.2
+

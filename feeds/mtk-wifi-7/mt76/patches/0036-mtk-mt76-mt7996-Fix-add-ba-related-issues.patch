@@ -1,0 +1,170 @@
+From d4a3b778085135b16e95d01598a2d6522832c37d Mon Sep 17 00:00:00 2001
+From: Rex Lu <rex.lu@mediatek.com>
+Date: Fri, 13 Sep 2024 10:22:52 +0800
+Subject: [PATCH 036/119] mtk: mt76: mt7996: Fix add ba related issues
+
+mtk: mt76: mt7996: Fix add ba issue on tid not equal to zero
+
+Fix add ba issue
+when we received first free done event, we start addba and failed.
+Driver will not retry to add ba again because of the traffic are all go through hwpath and will make very low throughput.
+So change the hw path binding criteria, only add ba successful traffic can go through hw path.
+
+mtk: mt76: mt7996: check addba api return value
+
+Clear amptu_stat bit if ieee80211_start_tx_ba_session return fail.
+Without this patch, driver does not know ba is not established and would
+not send addba anymore.
+
+mtk: mt76: mt7996: refactor check for TX BA sesstion status
+
+Now mt76 checks TX BA session status under following cases
+1. receive TxS with no fixed rated
+2. receive TxFree from QoS data
+
+The status check includes
+1. if the TX BA session has existed, refresh the timer
+2. if the TX BA session does not exist, try to create the TX BA session
+   and record the current time
+3. do not retry the TX BA session request within ADDBA_RETRY_PERIOD
+   seconds
+
+1. revert feature: once the traffic add ba fail and will not do hw path binding
+2. if the traffic add ba failed at first time, we will do hw path binding.
+And use TXS to maintain add ba session.
+
+Signed-off-by: Rex Lu <rex.lu@mediatek.com>
+Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+---
+ mt76.h          |  2 ++
+ mt7996/mac.c    | 34 ++++++++++++++++++++++++++--------
+ mt7996/main.c   |  3 ++-
+ mt7996/mt7996.h |  3 +++
+ 4 files changed, 33 insertions(+), 9 deletions(-)
+
+diff --git a/mt76.h b/mt76.h
+index 90a592d2..c6b72615 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -74,6 +74,7 @@
+ #define MT_WED_RRO_Q_MSDU_PG(_n)	__MT_WED_RRO_Q(MT76_WED_RRO_Q_MSDU_PG, _n)
+ #define MT_WED_RRO_Q_IND	__MT_WED_RRO_Q(MT76_WED_RRO_Q_IND, 0)
+ 
++
+ struct mt76_dev;
+ struct mt76_phy;
+ struct mt76_wcid;
+@@ -430,6 +431,7 @@ struct mt76_wcid {
+ 
+ 	struct rate_info rate;
+ 	struct rate_info rx_rate;
++
+ 	unsigned long ampdu_state;
+ 
+ 	u16 idx;
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index 7fea460a..065bd856 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -1203,20 +1203,39 @@ u32 mt7996_wed_init_buf(void *ptr, dma_addr_t phys, int token_id)
+ 	return MT_TXD_SIZE + sizeof(*txp);
+ }
+ 
++static void
++mt7996_check_tx_ba_status(struct ieee80211_link_sta *link_sta,
++			  struct mt76_wcid *wcid, u8 tid)
++{
++	struct ieee80211_sta *sta = link_sta->sta;
++	struct mt7996_sta *msta;
++
++	if (!(link_sta->ht_cap.ht_supported || link_sta->he_cap.has_he))
++		return;
++
++	if (test_bit(tid, &wcid->ampdu_state)) {
++		ieee80211_refresh_tx_agg_session_timer(sta, tid);
++		return;
++	}
++
++	msta = (struct mt7996_sta *)sta->drv_priv;
++	if (!msta->last_addba_req_time[tid] ||
++	    time_after(jiffies, msta->last_addba_req_time[tid] + ADDBA_RETRY_PERIOD)) {
++		set_bit(tid, &wcid->ampdu_state);
++		if (ieee80211_start_tx_ba_session(sta, tid, 0) < 0)
++			clear_bit(tid, &wcid->ampdu_state);
++		msta->last_addba_req_time[tid] = jiffies;
++	}
++}
++
+ static void
+ mt7996_tx_check_aggr(struct ieee80211_link_sta *link_sta,
+ 		     struct mt76_wcid *wcid, struct sk_buff *skb)
+ {
+-	struct mt7996_sta *msta;
+-	struct mt7996_sta_link *msta_link;
+-	struct ieee80211_link_sta *link_sta;
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 	bool is_8023 = info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP;
+ 	u16 fc, tid;
+ 
+-	if (!(link_sta->ht_cap.ht_supported || link_sta->he_cap.has_he))
+-		return;
+-
+ 	tid = skb->priority & IEEE80211_QOS_CTL_TID_MASK;
+ 
+ 	if (is_8023) {
+@@ -1238,8 +1257,7 @@ mt7996_tx_check_aggr(struct ieee80211_link_sta *link_sta,
+ 	if (unlikely(fc != (IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA)))
+ 		return;
+ 
+-	if (!test_and_set_bit(tid, &wcid->ampdu_state))
+-		ieee80211_start_tx_ba_session(link_sta->sta, tid, 0);
++	mt7996_check_tx_ba_status(link_sta, wcid, tid);
+ }
+ 
+ static void
+diff --git a/mt7996/main.c b/mt7996/main.c
+index 35f7ff99..c107bb1c 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -2587,6 +2587,7 @@ mt7996_net_fill_forward_path(struct ieee80211_hw *hw,
+ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
+ 	struct mt7996_sta_link *msta_link;
+ 	struct mt76_vif_link *mlink;
++	u8 dscp = path->mtk_wdma.tid >> 2;
+ 
+ 	mlink = rcu_dereference(mvif->mt76.link[msta->deflink_id]);
+ 	if (!mlink)
+@@ -2633,7 +2634,7 @@ mt7996_net_fill_forward_path(struct ieee80211_hw *hw,
+ 	ctx->dev = NULL;
+ 
+ 	if (path->mtk_wdma.amsdu)
+-		path->mtk_wdma.tid = mvif->qos_map[path->mtk_wdma.tid >> 2];
++		path->mtk_wdma.tid = mvif->qos_map[dscp];
+ 
+ 	return 0;
+ }
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index bd5c2c65..fa8b7f08 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -166,6 +166,7 @@
+ #define MT7996_MAX_PROBE_TRIES		2
+ 
+ #define IP_DSCP_NUM			64
++#define ADDBA_RETRY_PERIOD		(5 * HZ)
+ 
+ #define MT7996_HW_DROP_STAT	4
+ #define MT7996_HW_DROP_REASON	0x20
+@@ -432,6 +433,8 @@ struct mt7996_sta {
+ 	struct mt7996_vif *vif;
+ 	u8 sec_link;
+ 	u16 valid_links;
++
++	unsigned long last_addba_req_time[IEEE80211_NUM_TIDS];
+ };
+ 
+ struct mt7996_vif_link {
+-- 
+2.45.2
+

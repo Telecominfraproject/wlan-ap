@@ -1,0 +1,227 @@
+From e686f39990ac3972990d96675ef6e3590bbbba75 Mon Sep 17 00:00:00 2001
+From: Michael-CY Lee <michael-cy.lee@mediatek.com>
+Date: Fri, 6 Jun 2025 13:50:48 +0800
+Subject: [PATCH 208/236] mtk: hostapd: refactor upstream 11v+MLD
+ implementation
+
+In the following context, "non-TX link" means a BSS that is a
+nontransmitted BSS in a MBSSID set and is also affiliciated with a MLD.
+
+This commit fixes serveral problems from upstream's implementation:
+1. The function hostapd_gen_probe_resp() generates elements of TX-link
+   even if the input "hapd" is a non-TX link. However, when it comes
+   to generate per-STA profile, the elements of non-TX link is needed.
+   Therefore a new variable "is_ml_sta_info" is added into struct
+   probe_resp_params so that in the function hostapd_gen_probe_resp()
+   it can be determined that whether elements of TX-BSS or non-TX link
+   should be generated.
+2. In the ML probe response, if the "hapd_probed" is a non-TX link,
+   there should be two MLE in the frame, one for the TX-link and the
+   other for the non-TX link. The non-TX link's MLE should carry MLD
+   ID and per-STA profile, while the TX link's MLE should NOT carry
+   MLD ID and per-STA profile.
+3. In the ML probe response, if the "hapd_probed" is a non-TX link,
+   there should not be MLE in the corresponding nontransmitted
+   profiles in MBSSID element because the MLE is carried directly in
+   the frame body.
+4. The ML probe response should be transmitted by TX-link, so we change
+   the "hapd" into TX-link before calling hostapd_drv_send_mlme() in
+   handle_probe_req().
+5. Extend the function hostapd_get_mld_id() so that it supported
+   returning MLD ID for non-TX link.
+6. In the function hostapd_skip_rnr(), if it's not for MLD update but
+   the BSS matches MBSSID index of TX link, the RNR inclusion should be
+   skipped because later RNR inclusion for MLO will handle it.
+
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+---
+ src/ap/beacon.c     | 63 +++++++++++++++++++++++++++------------------
+ src/ap/hostapd.c    |  5 +---
+ src/ap/ieee802_11.c |  3 ++-
+ 3 files changed, 41 insertions(+), 30 deletions(-)
+
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index db45fd61f..f2567c32a 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -705,6 +705,7 @@ static size_t he_elem_len(struct hostapd_data *hapd)
+ struct probe_resp_params {
+ 	const struct ieee80211_mgmt *req;
+ 	bool is_p2p;
++	bool is_ml_sta_info;
+ 
+ 	/* Generated IEs will be included inside an ML element */
+ 	struct hostapd_data *requested_mld_ap;
+@@ -743,7 +744,8 @@ static size_t hostapd_probe_resp_elems_len(struct hostapd_data *hapd,
+ #endif /* CONFIG_IEEE80211BE */
+ 	size_t buflen = 0;
+ 
+-	hapd = hostapd_mbssid_get_tx_bss(hapd);
++	if (!params->is_ml_sta_info)
++		hapd = hostapd_mbssid_get_tx_bss(hapd);
+ 
+ #ifdef CONFIG_WPS
+ 	if (hapd->wps_probe_resp_ie)
+@@ -772,32 +774,35 @@ static size_t hostapd_probe_resp_elems_len(struct hostapd_data *hapd,
+ 
+ #ifdef CONFIG_IEEE80211BE
+ 	if (hapd->iconf->ieee80211be && !hapd->conf->disable_11be) {
+-		struct hostapd_data *ml_elem_ap =
+-			params->requested_mld_ap ? params->requested_mld_ap : hapd;
+-
+ 		buflen += hostapd_eid_eht_capab_len(hapd, IEEE80211_MODE_AP);
+ 		buflen += 3 + sizeof(struct ieee80211_eht_operation);
+ 		if (hapd->iconf->punct_bitmap)
+ 			buflen += EHT_OPER_DISABLED_SUBCHAN_BITMAP_SIZE;
+ 
+-		if (ml_elem_ap->conf->mld_ap) {
++		/* For ML probe response, include MLE for the requested AP MLD
++		 *   - with per-sta profile (params->mld_info is not NULL)
++		 *   - with MLD ID if non-Tx BSS is requested
++		 */
++		if (hapd_probed->conf->mld_ap) {
+ 			buflen += hostapd_eid_eht_ml_beacon_len(
+-				ml_elem_ap, params->mld_info,
+-				!!params->requested_mld_ap);
++				hapd_probed, params->mld_info,
++				hapd_probed != hapd);
+ 
+ 			/* For Max Channel Switch Time element during channel
+ 			 * switch */
+ 			buflen += 6;
+ 		}
+ 
+-		if (hapd_probed != hapd && hapd_probed->conf->mld_ap)
+-			buflen += hostapd_eid_eht_basic_ml_len(hapd_probed,
+-							       NULL, true,
+-							       false);
++		/* Include MLE for the Tx BSS or non11v BSS
++		 *   - without per-sta profile
++		 *   - without MLD ID
++		 */
++		if (hapd_probed != hapd && hapd->conf->mld_ap)
++			buflen += hostapd_eid_eht_basic_ml_len(hapd, NULL, true, false);
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+-	buflen += hostapd_eid_mbssid_len(hapd, WLAN_FC_STYPE_PROBE_RESP, NULL,
++	buflen += hostapd_eid_mbssid_len(hapd_probed, WLAN_FC_STYPE_PROBE_RESP, NULL,
+ 					 params->known_bss,
+ 					 params->known_bss_len, NULL);
+ 	buflen += hostapd_eid_rnr_len(hapd, WLAN_FC_STYPE_PROBE_RESP, true);
+@@ -823,7 +828,8 @@ static u8 * hostapd_probe_resp_fill_elems(struct hostapd_data *hapd,
+ 	u8 *csa_pos;
+ 	u8 *epos;
+ 
+-	hapd = hostapd_mbssid_get_tx_bss(hapd);
++	if (!params->is_ml_sta_info)
++		hapd = hostapd_mbssid_get_tx_bss(hapd);
+ 	epos = pos + len;
+ 
+ 	*pos++ = WLAN_EID_SSID;
+@@ -859,7 +865,7 @@ static u8 * hostapd_probe_resp_fill_elems(struct hostapd_data *hapd,
+ 
+ 	pos = hostapd_get_rsne(hapd, pos, epos - pos);
+ 	pos = hostapd_eid_bss_load(hapd, pos, epos - pos);
+-	pos = hostapd_eid_mbssid(hapd, pos, epos, WLAN_FC_STYPE_PROBE_RESP, 0,
++	pos = hostapd_eid_mbssid(hapd_probed, pos, epos, WLAN_FC_STYPE_PROBE_RESP, 0,
+ 				 NULL, params->known_bss, params->known_bss_len,
+ 				 NULL, NULL, NULL, 0);
+ 	pos = hostapd_eid_rm_enabled_capab(hapd, pos, epos - pos);
+@@ -946,23 +952,27 @@ static u8 * hostapd_probe_resp_fill_elems(struct hostapd_data *hapd,
+ 
+ #ifdef CONFIG_IEEE80211BE
+ 	if (hapd->iconf->ieee80211be && !hapd->conf->disable_11be) {
+-		struct hostapd_data *ml_elem_ap =
+-			params->requested_mld_ap ? params->requested_mld_ap : hapd;
+-
+-		if (ml_elem_ap->conf->mld_ap)
++		/* For ML probe response, include MLE for the requested AP MLD
++		 *   - with per-sta profile (params->mld_info is not NULL)
++		 *   - with MLD ID if non-Tx BSS is requested
++		 */
++		if (hapd_probed->conf->mld_ap)
+ 			pos = hostapd_eid_eht_ml_beacon(
+-				ml_elem_ap, params->mld_info,
+-				pos, !!params->requested_mld_ap);
++				hapd_probed, params->mld_info,
++				pos, hapd_probed != hapd);
++
++		/* Include MLE for the Tx BSS or non11v BSS
++		 *   - without per-sta profile
++		 *   - without MLD ID
++		 */
++		if (hapd_probed != hapd && hapd->conf->mld_ap)
++			pos = hostapd_eid_eht_basic_ml_common(hapd, pos, NULL, true, false);
+ 
+ 		pos = hostapd_eid_eht_capab(hapd, pos, IEEE80211_MODE_AP);
+ 		pos = hostapd_eid_eht_operation(hapd, pos);
+ 
+ 		pos = hostapd_eid_eht_attlm(hapd, pos);
+ 	}
+-
+-	if (hapd_probed != hapd && hapd_probed->conf->mld_ap)
+-		pos = hostapd_eid_eht_basic_ml_common(hapd_probed, pos, NULL,
+-						      true, false);
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ #ifdef CONFIG_IEEE80211AC
+@@ -1035,7 +1045,8 @@ static void hostapd_gen_probe_resp(struct hostapd_data *hapd,
+ 	u8 *pos;
+ 	size_t buflen;
+ 
+-	hapd = hostapd_mbssid_get_tx_bss(hapd);
++	if (!params->is_ml_sta_info)
++		hapd = hostapd_mbssid_get_tx_bss(hapd);
+ 
+ #define MAX_PROBERESP_LEN 768
+ 	buflen = MAX_PROBERESP_LEN;
+@@ -1739,6 +1750,7 @@ void handle_probe_req(struct hostapd_data *hapd,
+ 				params.ecsa_pos - (u8 *) params.resp;
+ 	}
+ 
++	hapd = hostapd_mbssid_get_tx_bss(hapd);
+ 	ret = hostapd_drv_send_mlme(hapd, params.resp, params.resp_len, noack,
+ 				    csa_offs_len ? csa_offs : NULL,
+ 				    csa_offs_len, 0);
+@@ -2938,6 +2950,7 @@ static int hostapd_get_probe_resp_tmpl(struct hostapd_data *hapd,
+ 				       bool is_ml_sta_info)
+ {
+ 	os_memset(params, 0, sizeof(*params));
++	params->is_ml_sta_info = is_ml_sta_info;
+ 	hostapd_gen_probe_resp(hapd, params);
+ 	if (!params->resp)
+ 		return -1;
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 58c49bad6..e916b7819 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -5682,10 +5682,7 @@ u8 hostapd_get_mld_id(struct hostapd_data *hapd)
+ 	if (!hapd->conf->mld_ap)
+ 		return 255;
+ 
+-	/* MLD ID 0 represents self */
+-	return 0;
+-
+-	/* TODO: MLD ID for Multiple BSS cases */
++	return hostapd_mbssid_get_bss_index(hapd);
+ }
+ 
+ 
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index c9afd3e16..fc7a68a21 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -8291,7 +8291,8 @@ static bool hostapd_skip_rnr(size_t i, struct mbssid_ie_profiles *skip_profiles,
+ #ifdef CONFIG_IEEE80211BE
+ 	/* If building for co-location and they are ML partners, no need to
+ 	 * include since the ML RNR will carry this. */
+-	if (!mld_update && hostapd_is_ml_partner(reporting_hapd, bss))
++	if (!mld_update &&
++	    hostapd_mbssid_mld_match(reporting_hapd, bss, match_idx))
+ 		return true;
+ 
+ 	/* If building for ML RNR and they are not ML partners, don't include.
+-- 
+2.45.2
+

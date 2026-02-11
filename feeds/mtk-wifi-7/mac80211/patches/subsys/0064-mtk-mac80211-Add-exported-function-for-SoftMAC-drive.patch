@@ -1,0 +1,208 @@
+From 3cc937a7987f4ec1cf69511e690f75634073693f Mon Sep 17 00:00:00 2001
+From: Rex Lu <rex.lu@mediatek.com>
+Date: Fri, 7 Jun 2024 13:25:08 +0800
+Subject: [PATCH 064/115] mtk: mac80211: Add exported function for SoftMAC
+ driver to get QoS map
+
+Add exported function for SoftMAC driver to get QoS map.
+1. Because the mapping from IP DSCP to IEEE 802.11 user priority may be customized.
+Therefore, driver needs to pass the mapping to HW, so that the QoS type of traffic can be mapped in a consistent manner for both SW and HW paths.
+2. due to this change(https://github.com/torvalds/linux/commit/6fdb8b8781d59796324efa25909f3e2112833f01) in backport 6.10.
+we need to add a default QoS map. when hostapd config didn't set QoS map, we need pass default QoS map to HW.
+
+Signed-off-by: Rex Lu <rex.lu@mediatek.com>
+
+1. Remove exported function for SoftMAC driver to get QoS map.
+Instead, add callback function for mac80211 to set QoS map in HW, which is more intuitive.
+2. Fix inconsistent QoS mapping between AP and AP_VLAN IFs.
+Specifically, when WDS AP IF is connected by a WDS STA, the QoS map of the AP_VLAN VIF is NULL.
+So the QoS types of packets to the WDS STA will be determined using the default mapping rule.
+However, SoftMAC driver uses the QoS map of the AP VIF, which may already be set.
+Therefore, it is possible that the QoS mappings of SW and HW are inconsistent.
+Thus, sync QoS map of AP VIF to that of AP_VLAN VIF.
+
+Signed-off-by: Rex Lu <rex.lu@mediatek.com>
+
+Refactor drv_set_qos_map function.
+1. use dscp exception to instead of dscp range.
+for example: if dscp value is 15. Original way will translte to tid 0.
+but mac80211 will translate to tid 1.
+
+Signed-off-by: Rex Lu <rex.lu@mediatek.com>
+Signed-off-by: Benjamin Lin <benjamin-jw.lin@mediatek.com>
+
+Do not copy Qos map from AP to AP_VLAN IF, because AP_VLAN's map will not be freed when IF is removed, causing memory leak.
+Instead, assign pointer to AP's Qos map to AP_VLAN IF.
+And add support for dynamic Qos-map setting for AP_VLAN IF.
+
+Check if ieee80211_sub_if_data is ready before its usage to prevent later kernel warning.
+
+Signed-off-by: Benjamin Lin <benjamin-jw.lin@mediatek.com>
+---
+ include/net/mac80211.h    |  4 +++-
+ net/mac80211/cfg.c        | 12 ++++++++++--
+ net/mac80211/chan.c       |  7 +++++++
+ net/mac80211/driver-ops.h | 21 +++++++++++++++++++++
+ net/mac80211/iface.c      |  8 +++++++-
+ net/mac80211/trace.h      |  6 ++++++
+ net/mac80211/util.c       |  2 +-
+ 7 files changed, 55 insertions(+), 5 deletions(-)
+
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index 0a2efebb..97915271 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -4525,6 +4525,7 @@ struct ieee80211_prep_tx_info {
+  *      interface with the specified type would be added, and thus drivers that
+  *      implement this callback need to handle such cases. The type is the full
+  *      &enum nl80211_iftype.
++ * @set_qos_map: Set QoS mapping information to driver.
+  */
+ struct ieee80211_ops {
+ 	void (*tx)(struct ieee80211_hw *hw,
+@@ -4923,6 +4924,8 @@ struct ieee80211_ops {
+ 			struct ieee80211_neg_ttlm *ttlm);
+ 	void (*prep_add_interface)(struct ieee80211_hw *hw,
+ 				   enum nl80211_iftype type);
++	int (*set_qos_map)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++			   struct cfg80211_qos_map *qos_map);
+ };
+ 
+ /**
+@@ -7888,5 +7891,4 @@ int ieee80211_emulate_switch_vif_chanctx(struct ieee80211_hw *hw,
+  * @hw: pointer as obtained from ieee80211_alloc_hw()
+  */
+ unsigned long ieee80211_get_scanning(struct ieee80211_hw *hw);
+-
+ #endif /* MAC80211_H */
+diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
+index d130f4e0..45aec69a 100644
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -4655,9 +4655,12 @@ static int ieee80211_set_qos_map(struct wiphy *wiphy,
+ 				 struct net_device *dev,
+ 				 struct cfg80211_qos_map *qos_map)
+ {
+-	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
++	struct ieee80211_sub_if_data *vlan, *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+ 	struct mac80211_qos_map *new_qos_map, *old_qos_map;
+ 
++	if (!(sdata->flags & IEEE80211_SDATA_IN_DRIVER))
++		return -EIO;
++
+ 	if (qos_map) {
+ 		new_qos_map = kzalloc(sizeof(*new_qos_map), GFP_KERNEL);
+ 		if (!new_qos_map)
+@@ -4673,7 +4676,12 @@ static int ieee80211_set_qos_map(struct wiphy *wiphy,
+ 	if (old_qos_map)
+ 		kfree_rcu(old_qos_map, rcu_head);
+ 
+-	return 0;
++	if (sdata->vif.type == NL80211_IFTYPE_AP) {
++		list_for_each_entry(vlan, &sdata->u.ap.vlans, u.vlan.list)
++			rcu_assign_pointer(vlan->qos_map, new_qos_map);
++	}
++
++	return drv_set_qos_map(sdata->local, sdata);
+ }
+ 
+ static int ieee80211_set_ap_chanwidth(struct wiphy *wiphy,
+diff --git a/net/mac80211/chan.c b/net/mac80211/chan.c
+index 98c8b05a..6dc1565d 100644
+--- a/net/mac80211/chan.c
++++ b/net/mac80211/chan.c
+@@ -986,6 +986,13 @@ static int ieee80211_assign_link_chanctx(struct ieee80211_link_data *link,
+ 
+ 	ieee80211_check_fast_xmit_iface(sdata);
+ 
++	/* FIXME: QoS MAP should be configured for each link (BSS).
++	 * We use assign_link_chanctx for the time being.
++	 * The problematic part is that everytime channel switch happens
++	 * the qos_map would get redundantly configured once.
++	 */
++	drv_set_qos_map(local, sdata);
++
+ 	return ret;
+ }
+ 
+diff --git a/net/mac80211/driver-ops.h b/net/mac80211/driver-ops.h
+index a05a36a1..df9b77b7 100644
+--- a/net/mac80211/driver-ops.h
++++ b/net/mac80211/driver-ops.h
+@@ -1785,4 +1785,25 @@ drv_prep_add_interface(struct ieee80211_local *local,
+ 	trace_drv_return_void(local);
+ }
+ 
++static inline int drv_set_qos_map(struct ieee80211_local *local,
++				  struct ieee80211_sub_if_data *sdata)
++{
++	int ret = -EOPNOTSUPP;
++	struct mac80211_qos_map *qos_map;
++
++	might_sleep();
++	if (!check_sdata_in_driver(sdata))
++		return -EIO;
++
++	qos_map = sdata_dereference(sdata->qos_map, sdata);
++
++	trace_drv_set_qos_map(local, sdata);
++	if (local->ops->set_qos_map)
++		ret = local->ops->set_qos_map(&local->hw, &sdata->vif,
++					      qos_map ? &qos_map->qos_map : NULL);
++	trace_drv_return_int(local, ret);
++
++	return ret;
++}
++
+ #endif /* __MAC80211_DRIVER_OPS */
+diff --git a/net/mac80211/iface.c b/net/mac80211/iface.c
+index 8feacfff..48c6ead8 100644
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -381,8 +381,14 @@ static int ieee80211_check_concurrent_iface(struct ieee80211_sub_if_data *sdata,
+ 			 * can only add VLANs to enabled APs
+ 			 */
+ 			if (iftype == NL80211_IFTYPE_AP_VLAN &&
+-			    nsdata->vif.type == NL80211_IFTYPE_AP)
++			    nsdata->vif.type == NL80211_IFTYPE_AP) {
+ 				sdata->bss = &nsdata->u.ap;
++
++				rcu_read_lock();
++				rcu_assign_pointer(sdata->qos_map,
++						   rcu_dereference(nsdata->qos_map));
++				rcu_read_unlock();
++			}
+ 		}
+ 	}
+ 
+diff --git a/net/mac80211/trace.h b/net/mac80211/trace.h
+index 95318f16..5accbbaf 100644
+--- a/net/mac80211/trace.h
++++ b/net/mac80211/trace.h
+@@ -3373,6 +3373,12 @@ TRACE_EVENT(bss_color_bitmap,
+ 		"color=%u color_bitmap=0x%llx", __entry->color, __entry->color_bitmap
+ 	)
+ );
++
++DEFINE_EVENT(local_sdata_evt, drv_set_qos_map,
++	TP_PROTO(struct ieee80211_local *local,
++		 struct ieee80211_sub_if_data *sdata),
++	TP_ARGS(local, sdata)
++);
+ #endif /* !__MAC80211_DRIVER_TRACE || TRACE_HEADER_MULTI_READ */
+ 
+ #undef TRACE_INCLUDE_PATH
+diff --git a/net/mac80211/util.c b/net/mac80211/util.c
+index a9f19e21..ac9d09cc 100644
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -4541,4 +4541,4 @@ unsigned long ieee80211_get_scanning(struct ieee80211_hw *hw)
+ 
+ 	return local->scanning;
+ }
+-EXPORT_SYMBOL(ieee80211_get_scanning);
++EXPORT_SYMBOL(ieee80211_get_scanning);
+\ No newline at end of file
+-- 
+2.45.2
+

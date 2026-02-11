@@ -1,0 +1,196 @@
+From b873d7ab0b76cb239d12eab49f4573d964845896 Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Tue, 3 Jun 2025 13:37:39 +0800
+Subject: [PATCH 092/123] mtk: mt76: mt7996: fix tx non-stop issue when radar
+ is detected
+
+RDD_DET_MODE is used only for testing radar detection rate, so remove it
+during normal setup.
+When the RDD detection mode is set to 1, FW will avoid stopping TX during radar
+detection.
+This patch need to upstream
+
+The RDD_DET_MODE will move to mt76 vendor part in the following patch for user
+to trigger it via hostapd_cli cmd.
+
+FW require this additional cmd to resume TXQ.
+Add radar detected log in driver to notify that the TXQ is paused until
+channel switch is finished, for debugging purposes.
+Also, resume the TXQ when stopping a phy for error handling.
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+---
+ mt76.h          |  2 ++
+ mt7996/mac.c    |  8 ++------
+ mt7996/main.c   |  3 +++
+ mt7996/mcu.c    | 47 ++++++++++++++++++++++++++++++++++++++++++-----
+ mt7996/mcu.h    |  1 +
+ mt7996/mt7996.h |  1 +
+ 6 files changed, 51 insertions(+), 11 deletions(-)
+
+diff --git a/mt76.h b/mt76.h
+index 181cfd4d..55c65a5b 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -1136,6 +1136,8 @@ struct mt76_phy {
+ 	struct mt76_tx_debug tx_dbg_stats;
+ 	struct mt76_rx_debug rx_dbg_stats;
+ 	int tokens;
++
++	bool rdd_txq_paused;
+ };
+ 
+ struct mt76_dev {
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index 873f40b6..17c68e27 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -3232,7 +3232,7 @@ static void mt7996_dfs_stop_radar_detector(struct mt7996_phy *phy)
+ 
+ static int mt7996_dfs_start_rdd(struct mt7996_dev *dev, int rdd_idx)
+ {
+-	int err, region;
++	int region;
+ 
+ 	switch (dev->mt76.region) {
+ 	case NL80211_DFS_ETSI:
+@@ -3247,11 +3247,7 @@ static int mt7996_dfs_start_rdd(struct mt7996_dev *dev, int rdd_idx)
+ 		break;
+ 	}
+ 
+-	err = mt7996_mcu_rdd_cmd(dev, RDD_START, rdd_idx, region);
+-	if (err < 0)
+-		return err;
+-
+-	return mt7996_mcu_rdd_cmd(dev, RDD_DET_MODE, rdd_idx, 1);
++	return mt7996_mcu_rdd_cmd(dev, RDD_START, rdd_idx, region);
+ }
+ 
+ static int mt7996_dfs_start_radar_detector(struct mt7996_phy *phy)
+diff --git a/mt7996/main.c b/mt7996/main.c
+index dc558dd7..b33cb772 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -130,6 +130,7 @@ static void mt7996_stop_phy(struct mt7996_phy *phy)
+ 
+ 	mutex_lock(&dev->mt76.mutex);
+ 
++	mt7996_mcu_rdd_resume_tx(phy);
+ 	mt7996_mcu_set_radio_en(phy, false);
+ 
+ 	clear_bit(MT76_STATE_RUNNING, &phy->mt76->state);
+@@ -1168,6 +1169,8 @@ mt7996_post_channel_switch(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	struct mt7996_phy *phy = mt7996_band_phy(dev, chandef->chan->band);
+ 	int ret;
+ 
++	mt7996_mcu_rdd_resume_tx(phy);
++
+ 	ret = cfg80211_chandef_dfs_required(hw->wiphy, chandef, NL80211_IFTYPE_AP);
+ 	if (ret <= 0)
+ 		return ret;
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index cd9e779a..f64ea3c3 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -444,25 +444,35 @@ mt7996_mcu_rx_radar_detected(struct mt7996_dev *dev, struct sk_buff *skb)
+ 		break;
+ 	case MT_RDD_IDX_BACKGROUND:
+ 		if (!dev->rdd2_phy)
+-			return;
++			goto err;
+ 		mphy = dev->rdd2_phy->mt76;
+ 		break;
+ 	default:
+-		dev_err(dev->mt76.dev, "Unknown RDD idx %d\n", r->rdd_idx);
+-		return;
++		goto err;
+ 	}
+ 
+ 	if (!mphy)
+-		return;
++		goto err;
+ 
+ 	if (r->rdd_idx == MT_RDD_IDX_BACKGROUND) {
+ 		dev->bg_nxt_freq = 0;
+ 		cfg80211_background_radar_event(mphy->hw->wiphy,
+ 						&dev->rdd2_chandef,
+ 						GFP_ATOMIC);
+-	} else
++	} else {
++		mphy->rdd_txq_paused = true;
+ 		ieee80211_radar_detected(mphy->hw, NULL);
++	}
+ 	dev->hw_pattern++;
++
++	dev_info(dev->mt76.dev, "radar detected on %s\n",
++		 r->rdd_idx == MT_RDD_IDX_BACKGROUND ?
++		 "background radar" : "main radio (pause TXQ until csa is finished)");
++	return;
++
++err:
++	dev_err(dev->mt76.dev, "Unknown RDD idx %d\n", r->rdd_idx);
++	return;
+ }
+ 
+ static void
+@@ -6901,6 +6911,33 @@ int mt7996_mcu_set_radio_en(struct mt7996_phy *phy, bool enable)
+ 				 &req, sizeof(req), true);
+ }
+ 
++int mt7996_mcu_rdd_resume_tx(struct mt7996_phy *phy)
++{
++	struct mt76_phy *mphy = phy->mt76;
++	struct {
++		u8 band_idx;
++		u8 _rsv[3];
++
++		__le16 tag;
++		__le16 len;
++		u8 mac_enable;
++		u8 _rsv2[3];
++	} __packed req = {
++		.band_idx = mphy->band_idx,
++		.tag = cpu_to_le16(UNI_BAND_CONFIG_MAC_ENABLE_CTRL),
++		.len = cpu_to_le16(sizeof(req) - 4),
++		.mac_enable = 2,
++	};
++
++	if (!mphy->rdd_txq_paused)
++		return 0;
++
++	mphy->rdd_txq_paused = false;
++
++	return mt76_mcu_send_msg(&phy->dev->mt76, MCU_WM_UNI_CMD(BAND_CONFIG),
++				 &req, sizeof(req), true);
++}
++
+ int mt7996_mcu_rdd_cmd(struct mt7996_dev *dev, int cmd, u8 rdd_idx, u8 val)
+ {
+ 	struct mt7996_rdd_ctrl req = {
+diff --git a/mt7996/mcu.h b/mt7996/mcu.h
+index c3dedb95..53110d20 100644
+--- a/mt7996/mcu.h
++++ b/mt7996/mcu.h
+@@ -1107,6 +1107,7 @@ enum {
+ 	UNI_BAND_CONFIG_RTS_THRESHOLD = 0x08,
+ 	UNI_BAND_CONFIG_RTS_SIGTA_EN = 0x09,
+ 	UNI_BAND_CONFIG_DIS_SECCH_CCA_DET = 0x0a,
++	UNI_BAND_CONFIG_MAC_ENABLE_CTRL = 0x0c,
+ 	UNI_BAND_CONFIG_LPI_CTRL = 0x0d,
+ 	UNI_BAND_CONFIG_BSSID_MAPPING_ADDR = 0x12,
+ };
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index 21e102ec..c24fb9c6 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -1290,6 +1290,7 @@ int mt7996_mcu_set_thermal_throttling(struct mt7996_phy *phy, u8 state);
+ int mt7996_mcu_set_thermal_protect(struct mt7996_phy *phy, bool enable);
+ int mt7996_mcu_set_txpower_sku(struct mt7996_phy *phy,
+ 			       int txpower_setting);
++int mt7996_mcu_rdd_resume_tx(struct mt7996_phy *phy);
+ int mt7996_mcu_rdd_cmd(struct mt7996_dev *dev, int cmd, u8 rdd_idx, u8 val);
+ int mt7996_alloc_afc_table(struct mt7996_dev *dev);
+ void mt7996_free_afc_table(struct mt7996_dev *dev);
+-- 
+2.45.2
+

@@ -1,0 +1,288 @@
+From 863db567557b85cd4d1b2f9a8ae5b55acfc7acea Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Fri, 28 Jun 2024 14:05:21 +0800
+Subject: [PATCH 099/236] mtk: hostapd: add support for link add
+
+Add support for adding affiliated APs to AP MLD via the following link add command
+hostapd_cli -i <mld intf> raw LINK_ADD bss_config=phyX:<bss_config>
+<bss_config> is per-bss config
+
+Add another cmd format:
+hostapd_cli -i <mld intf> link_add bss_config=phyX:<bss_config>
+
+Current link removal is implemented by hostapd_disable_iface for
+the sake of simplicity.
+When a link is added back after removal, hostapd_enable_iface should be
+called instead of hostapd_add_iface.
+Therefore, this patch is added to support iface enablement in link add cmd
+as a temporary workaround.
+
+Avoid modifying the original cmd str before entering hostapd_add_iface.
+Otherwise, hostapd_add_iface will fail to parse the cmd str correctly.
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+---
+ hostapd/ctrl_iface.c  | 104 ++++++++++++++++++++++++++++++++++++++++++
+ hostapd/hostapd_cli.c |   8 ++++
+ src/ap/beacon.c       |  17 ++++++-
+ src/ap/hostapd.c      |  24 +++++++---
+ src/ap/hostapd.h      |   1 +
+ 5 files changed, 146 insertions(+), 8 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index e8c66e85d..1eef79ad0 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -3971,6 +3971,105 @@ static int hostapd_ctrl_iface_link_remove(struct hostapd_data *hapd, char *cmd,
+ 
+ 	return ret;
+ }
++
++
++static int hostapd_ctrl_iface_link_add(struct hostapd_data *hapd, char *cmd,
++				       char *buf, size_t buflen)
++{
++	struct hapd_interfaces *interfaces = hapd->iface->interfaces;
++	struct hostapd_iface *iface = NULL;
++	struct hostapd_data *h;
++	struct hostapd_config *conf;
++	const char *ifname, *conf_file, *phy;
++	u16 old_valid_links = 0;
++	bool hapd_existed = false;
++	char *pos, *tmp;
++	int i, ret = -1;
++	size_t len;
++
++	if (!hapd || !hapd->conf->mld_ap || !hapd->mld) {
++		wpa_printf(MSG_ERROR,
++			   "Trying to add link to non-MLD AP or non-existed AP");
++		return -1;
++	}
++
++	if (os_strncmp(cmd, "bss_config=", 11))
++		return -1;
++
++	len = os_strlen(cmd) + 1;
++	tmp = os_malloc(len);
++	if (!tmp)
++		return -1;
++
++	os_snprintf(tmp, len, "%s", cmd);
++	phy = tmp + 11;
++	pos = os_strchr(phy, ':');
++	if (!pos)
++		goto out;
++	*pos++ = '\0';
++	conf_file = pos;
++	if (!os_strlen(conf_file))
++		goto out;
++
++	conf = interfaces->config_read_cb(conf_file);
++	if (!conf)
++		goto out;
++
++	ifname = conf->bss[0]->iface;
++	if (ifname[0] != '\0' &&
++	    os_strncmp(ifname, hapd->conf->iface, sizeof(hapd->conf->iface))) {
++		wpa_printf(MSG_ERROR,
++			   "Interface name %s mismatch (expected %s)",
++			   ifname, hapd->conf->iface);
++		hostapd_config_free(conf);
++		goto out;
++	}
++
++	if (!conf->bss[0]->mld_ap) {
++		wpa_printf(MSG_ERROR, "The added interface is not MLD AP");
++		hostapd_config_free(conf);
++		goto out;
++	}
++
++	for (i = 0; i < interfaces->count; i++) {
++		if (os_strcmp(interfaces->iface[i]->phy, phy) == 0) {
++			iface = interfaces->iface[i];
++			break;
++		}
++	}
++	if (iface && iface->state == HAPD_IFACE_DISABLED) {
++		for (i = 0; i < iface->num_bss; i++) {
++			h = iface->bss[i];
++			if (ifname[0] != '\0' &&
++			    !os_strncmp(ifname, h->conf->iface, sizeof(h->conf->iface)))
++				hapd_existed = true;
++		}
++	}
++	hostapd_config_free(conf);
++
++	for_each_mld_link(h, hapd)
++		old_valid_links |= BIT(h->mld_link_id);
++	hapd->mld->link_reconf_in_progress = old_valid_links;
++
++	if (hapd_existed)
++		ret = hostapd_enable_iface(iface);
++	else
++		ret = hostapd_add_iface(interfaces, cmd);
++	if (ret < 0)
++		goto out;
++
++	ret = os_snprintf(buf, buflen, "%s\n", "OK");
++	if (os_snprintf_error(buflen, ret))
++		ret = -1;
++	else
++		ret = 0;
++
++out:
++	os_free(tmp);
++
++	return ret;
++}
++
+ #endif /* CONFIG_TESTING_OPTIONS */
+ #endif /* CONFIG_IEEE80211BE */
+ 
+@@ -5992,6 +6091,10 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 		if (hostapd_ctrl_iface_link_remove(hapd, buf + 12,
+ 						   reply, reply_size))
+ 			reply_len = -1;
++	} else if (os_strncmp(buf, "LINK_ADD ", 9) == 0) {
++		if (hostapd_ctrl_iface_link_add(hapd, buf + 9,
++						reply, reply_size))
++			reply_len = -1;
+ #endif /* CONFIG_TESTING_OPTIONS */
+ #endif /* CONFIG_IEEE80211BE */
+ 	} else if (os_strncmp(buf, "SET_EDCCA ", 10) == 0) {
+@@ -6830,6 +6933,7 @@ void hostapd_ctrl_iface_deinit(struct hostapd_data *hapd)
+ static int hostapd_ctrl_iface_add(struct hapd_interfaces *interfaces,
+ 				  char *buf)
+ {
++	/* TODO: handle link add via global ADD command */
+ 	if (hostapd_add_iface(interfaces, buf) < 0) {
+ 		wpa_printf(MSG_ERROR, "Adding interface %s failed", buf);
+ 		return -1;
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 642ffba29..e6401af9f 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1776,6 +1776,12 @@ static int hostapd_cli_cmd_wmm(struct wpa_ctrl *ctrl, int argc,
+ 	return hostapd_cli_cmd(ctrl, "WMM", 1, argc, argv);
+ }
+ 
++static int hostapd_cli_cmd_link_add(struct wpa_ctrl *ctrl, int argc,
++				    char *argv[])
++{
++	return hostapd_cli_cmd(ctrl, "LINK_ADD", 1, argc, argv);
++}
++
+ struct hostapd_cli_cmd {
+ 	const char *cmd;
+ 	int (*handler)(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+@@ -2034,6 +2040,8 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 		" = Get preamble puncture status"},
+ 	{ "wmm", hostapd_cli_cmd_wmm, NULL,
+ 		" = <ac> [cwmin=] [cwmax=] [aifs=] [txop_limit=]"},
++	{ "link_add", hostapd_cli_cmd_link_add, NULL,
++		" = Add a new link to a MLD AP"},
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index 9495b6d7d..9ccf1ea6c 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -2793,6 +2793,14 @@ static int __ieee802_11_set_beacon(struct hostapd_data *hapd)
+ 		return 0;
+ 	}
+ 
++#ifdef CONFIG_IEEE80211BE
++#ifdef CONFIG_TESTING_OPTIONS
++	if (hapd->conf->mld_ap && hapd->mld &&
++	    (hapd->mld->link_reconf_in_progress & BIT(hapd->mld_link_id)))
++		ieee802_11_set_bss_critical_update(hapd, BSS_CRIT_UPDATE_EVENT_ADD_LINK);
++#endif /* CONFIG_TESTING_OPTIONS */
++#endif /* CONFIG_IEEE80211BE */
++
+ 	hapd->beacon_set_done = 1;
+ 
+ 	if (ieee802_11_build_ap_params(hapd, &params) < 0)
+@@ -3393,11 +3401,16 @@ int ieee802_11_set_beacon(struct hostapd_data *hapd)
+ 	for_each_mld_link(link_bss, hapd) {
+ 		hostapd_gen_per_sta_profiles(link_bss);
+ 
+-		/* clear critical update flag for UPDATE_SINGLE type, for other types,
+-		 * we should get some notified events from driver
++		/* clear critical update flag for UPDATE_SINGLE type & link adding,
++		 * for other types, we should get some notified events from driver
+ 		 */
+ 		if (h->eht_mld_bss_critical_update == BSS_CRIT_UPDATE_SINGLE)
+ 			h->eht_mld_bss_critical_update = 0;
++		if (h->eht_mld_bss_critical_update == BSS_CRIT_UPDATE_FLAG &&
++		    (h->mld->link_reconf_in_progress & BIT(h->mld_link_id))) {
++			h->mld->link_reconf_in_progress &= ~BIT(h->mld_link_id);
++			h->eht_mld_bss_critical_update = 0;
++		}
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index be77c3337..a9c827467 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -581,6 +581,10 @@ void hostapd_free_hapd_data(struct hostapd_data *hapd)
+ 	    hapd->iface->bss[0] != hapd)
+ 		hostapd_if_link_remove(hapd, WPA_IF_AP_BSS, hapd->conf->iface,
+ 				       hapd->mld_link_id);
++	/* Clear the link reconfiguration flag when the added link failed to setup */
++	if (hapd->conf->mld_ap && hapd->mld &&
++	    !(hapd->mld->link_reconf_in_progress & BIT(hapd->mld_link_id)))
++		hapd->mld->link_reconf_in_progress = 0;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	wpabuf_free(hapd->time_adv);
+@@ -3516,11 +3520,20 @@ hostapd_interface_init_bss(struct hapd_interfaces *interfaces, const char *phy,
+ 		}
+ 
+ 		ifname = conf->bss[0]->iface;
+-		if (ifname[0] != '\0' && ifname_in_use(interfaces, ifname)) {
+-			wpa_printf(MSG_ERROR,
+-				   "Interface name %s already in use", ifname);
+-			hostapd_config_free(conf);
+-			return NULL;
++		if (conf->bss[0]->mld_ap) {
++			if (!iface->bss[0]->conf->mld_ap) {
++				wpa_printf(MSG_ERROR,
++					   "Cannot add a MLO BSS when the first BSS is non-MLO");
++				hostapd_config_free(conf);
++				return NULL;
++			}
++		} else {
++			if (ifname[0] != '\0' && ifname_in_use(interfaces, ifname)) {
++				wpa_printf(MSG_ERROR,
++					   "Interface name %s already in use", ifname);
++				hostapd_config_free(conf);
++				return NULL;
++			}
+ 		}
+ 
+ 		tmp_conf = os_realloc_array(
+@@ -3552,7 +3565,6 @@ hostapd_interface_init_bss(struct hapd_interfaces *interfaces, const char *phy,
+ 		hapd->msg_ctx = hapd;
+ 		hostapd_bss_setup_multi_link(hapd, interfaces);
+ 
+-
+ 		bss_idx = iface->num_bss++;
+ 		conf->num_bss--;
+ 		conf->bss[0] = NULL;
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index cf0efed8c..f5a7eb55e 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -576,6 +576,7 @@ struct hostapd_mld {
+ 	 */
+ 	u8 refcount;
+ 	bool started;
++	u16 link_reconf_in_progress;
+ 
+ 	struct hostapd_data *fbss;
+ 	struct dl_list links; /* List head of all affiliated links */
+-- 
+2.45.2
+

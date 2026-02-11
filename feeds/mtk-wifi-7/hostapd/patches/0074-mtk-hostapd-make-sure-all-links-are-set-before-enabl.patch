@@ -1,0 +1,192 @@
+From c6f1670ce2994e54fc23dbf6148436d21846b266 Mon Sep 17 00:00:00 2001
+From: Shayne Chen <shayne.chen@mediatek.com>
+Date: Thu, 11 Apr 2024 18:16:38 +0800
+Subject: [PATCH 074/236] mtk: hostapd: make sure all links are set before
+ enabling beacon
+
+NL80211_CMD_NEW_BEACON will first be set, but we've modified mac80211 to
+disable this beacon. After that, hostapd will block
+NL80211_CMD_SET_BEACON until all links are setting up.
+(use NL80211_CMD_START_AP event to check if all expected links are enabled)
+
+Update: in wpa_driver_nl80211_set_ap(), send_and_recv() is used, implies
+that hostapd should already sync with driver, so don't need to use
+NL80211_CMD_START_AP event.
+
+This can make sure that the first beacon of each link includes the
+correct RNR and per-STA profile.
+
+Note that in NL80211_CMD_NEW_BEACON, we also set beacon interval to 0,
+which helps to bypass some mac80211 beacon active checks, e.g., during ACS.
+
+Add is_mld_finished check for ucode need.
+This function returns ture only if all links fromt all MLD APs are
+ready.
+
+Only after hostapd sets beacon for all links that hapd->mld->started is
+set to true. However, if the interface is about to do CAC,
+hapd->mld->started will be false until the CAC is done.
+
+For ucode, it only have to ckeck whether all link is added. Instead of
+checking hapd->mld->started, this commits check the link one by one, and
+return false if there are links unadded.
+
+Signed-off-by: Shayne Chen <shayne.chen@mediatek.com>
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+
+In Extender setup, ucode checks whether all AP MLDs finish the setup
+by matching hapd->mld->valid_links and hapd->conf->mld_allowed_links.
+
+However, for cases like CAC and ACS, the MLD link finishes the setup
+without updating mld->valid_links, which then causes Extender STA
+setup failure.
+
+To avoid such failure, we check mld->refcount instead, which is
+updated once the link is added to the MLD.
+
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+---
+ hostapd/config_file.c |  2 ++
+ src/ap/ap_config.h    |  2 ++
+ src/ap/beacon.c       | 10 ++++++++++
+ src/ap/hostapd.c      | 14 ++++++++++++++
+ src/ap/hostapd.h      |  1 +
+ src/ap/ucode.c        | 24 ++++++++++++++++++++++++
+ 6 files changed, 53 insertions(+)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index af6b1cc9d..5efe34bcd 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -5241,6 +5241,8 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 		bss->mld_ap = !!atoi(pos);
+ 	} else if (os_strcmp(buf, "mld_primary") == 0) {
+ 		bss->mld_primary = !!atoi(pos);
++	} else if (os_strcmp(buf, "mld_allowed_links") == 0) {
++		bss->mld_allowed_links = atoi(pos);
+ 	} else if (os_strcmp(buf, "mld_addr") == 0) {
+ 		if (hwaddr_aton(pos, bss->mld_addr)) {
+ 			wpa_printf(MSG_ERROR, "Line %d: Invalid mld_addr",
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 67cae363f..bd8994866 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -969,6 +969,8 @@ struct hostapd_bss_config {
+ 
+ 	/* The AP is the primary AP of an AP MLD */
+ 	u8 mld_primary;
++	/* Allowed link bitmap of the AP MLD to which the AP is affiliated */
++	u16 mld_allowed_links;
+ 
+ 	/* The MLD ID to which the AP MLD is affiliated with */
+ 	u8 mld_id;
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index c2eda15cb..d4fac01a9 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -2290,6 +2290,12 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 	os_memcpy(head->bssid, hapd->own_addr, ETH_ALEN);
+ 	head->u.beacon.beacon_int =
+ 		host_to_le16(hapd->iconf->beacon_int);
++	/* if MLD AP hasn't finished setting up all links, also set beacon interval
++	 * to 0. This allows mac80211 to bypass some beacon active checks, for
++	 * example, when doing ACS
++	 */
++	if (hapd->conf->mld_ap && !hapd->mld->started)
++		head->u.beacon.beacon_int = host_to_le16(0);
+ 
+ 	/* hardware or low-level driver will setup seq_ctrl and timestamp */
+ 	capab_info = hostapd_own_capab_info(hapd);
+@@ -2690,6 +2696,10 @@ static int __ieee802_11_set_beacon(struct hostapd_data *hapd)
+ 	int res, ret = -1, i;
+ 	struct hostapd_hw_modes *mode;
+ 
++	/* skip setting beacon if other links are not started yet */
++	if (hapd->conf->mld_ap && !hapd->mld->started && hapd->beacon_set_done)
++		return 0;
++
+ 	if (!hapd->drv_priv) {
+ 		wpa_printf(MSG_ERROR, "Interface is disabled");
+ 		return -1;
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index fd7e6a82b..c4b4224b9 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -1336,6 +1336,20 @@ static int hostapd_start_beacon(struct hostapd_data *hapd,
+ 	if (!conf->start_disabled && ieee802_11_set_beacon(hapd) < 0)
+ 		return -1;
+ 
++	if (hapd->conf->mld_ap && !hapd->mld->started) {
++		struct hostapd_data *p_hapd;
++		u16 valid_links = 0;
++
++		for_each_mld_link(p_hapd, hapd)
++			valid_links |= BIT(p_hapd->mld_link_id);
++
++		if (valid_links == hapd->conf->mld_allowed_links ||
++		    !hapd->conf->mld_allowed_links) {
++			hapd->mld->started = 1;
++			ieee802_11_set_beacon(hapd);
++		}
++	}
++
+ 	if (flush_old_stations && !conf->start_disabled &&
+ 	    conf->broadcast_deauth) {
+ 		u8 addr[ETH_ALEN];
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 5fdd75276..40c1a588e 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -566,6 +566,7 @@ struct hostapd_mld {
+ 	 * freed when num_links is 0.
+ 	 */
+ 	u8 refcount;
++	bool started;
+ 
+ 	struct hostapd_data *fbss;
+ 	struct dl_list links; /* List head of all affiliated links */
+diff --git a/src/ap/ucode.c b/src/ap/ucode.c
+index 8730616fb..eda4f5c58 100644
+--- a/src/ap/ucode.c
++++ b/src/ap/ucode.c
+@@ -750,6 +750,29 @@ uc_hostapd_iface_switch_channel(uc_vm_t *vm, size_t nargs)
+ 	return ucv_boolean_new(!ret);
+ }
+ 
++static uc_value_t *
++uc_hostapd_iface_is_mld_finished(uc_vm_t *vm, size_t nargs)
++{
++	struct hostapd_iface *iface = uc_fn_thisval("hostapd.iface");
++	bool finished = true;
++	int i;
++
++	for (i = 0; i < iface->num_bss; i++) {
++		struct hostapd_data *bss = iface->bss[i];
++
++		if (bss->conf->mld_ap && bss->mld) {
++			if (bss->conf->mld_allowed_links > 0 &&
++			    (1 << bss->mld->refcount) - 1 !=
++			    bss->conf->mld_allowed_links) {
++				finished = false;
++				break;
++			}
++		}
++	}
++
++	return ucv_boolean_new(finished);
++}
++
+ static uc_value_t *
+ uc_hostapd_bss_rename(uc_vm_t *vm, size_t nargs)
+ {
+@@ -927,6 +950,7 @@ int hostapd_ucode_init(struct hapd_interfaces *ifaces)
+ 		{ "stop", uc_hostapd_iface_stop },
+ 		{ "start", uc_hostapd_iface_start },
+ 		{ "switch_channel", uc_hostapd_iface_switch_channel },
++		{ "is_mld_finished", uc_hostapd_iface_is_mld_finished },
+ 	};
+ 	uc_value_t *data, *proto;
+ 
+-- 
+2.45.2
+

@@ -1,0 +1,722 @@
+From 358b929e674c6c9f7de621f11d2496eb48c34197 Mon Sep 17 00:00:00 2001
+From: Allen Ye <allen.ye@mediatek.com>
+Date: Thu, 1 Aug 2024 11:25:03 +0800
+Subject: [PATCH 031/119] mtk: mt76: mt7996: Add AFC and lpi power support
+
+This patch receiving and storing the power table from hostapd vendor cmd.
+The power table would be use to compare the sku table in standard power
+mode every time when setting power and mt76 would set the minimum values
+between afc and sku table to fw.
+The AFC table format is like below:
+col\row  bw20  bw40  ...  ru26  ...  ru3472
+chan 1
+chan 6
+...
+chan 233
+To compare the afc and sku table, mt76 will find the power list of current
+channel in AFC table. And mtk sku table design serveral rates for each
+bandwidth, so a power value of afc table could compare with serveral
+rates in mtk sku table.
+
+ - Add a new vendor attibute lpi mode, due to the lpi is tuntime decided by AFC
+not like wifi6 switch lpi and standard power should reload interface.
+
+Add dump afc table and information.
+Add the bf on value offset logic. The offset is antenna/beamform gain
+offset = 10 * (log(num of ant) - log(num of NSS)).
+
+Signed-off-by: Allen Ye <allen.ye@mediatek.com>
+---
+ mt76.h               |   2 +
+ mt7996/mac.c         |   2 +-
+ mt7996/main.c        |   2 +-
+ mt7996/mcu.c         | 186 ++++++++++++++++++++++++++++++++++++++++---
+ mt7996/mcu.h         | 139 ++++++++++++++++++++++++++++++++
+ mt7996/mt7996.h      |   2 +
+ mt7996/mtk_debugfs.c |  37 +++++++++
+ mt7996/vendor.c      |  81 +++++++++++++++----
+ mt7996/vendor.h      |   3 +
+ 9 files changed, 429 insertions(+), 25 deletions(-)
+
+diff --git a/mt76.h b/mt76.h
+index 8b5faae8..edf9b694 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -1135,6 +1135,8 @@ struct mt76_dev {
+ 	bool lpi_psd;
+ 	bool lpi_bcn_enhance;
+ 	bool mgmt_pwr_enhance;
++	bool lpi_mode;
++	s8 **afc_power_table;
+ 
+ #ifdef CONFIG_NL80211_TESTMODE
+ 	const struct mt76_testmode_ops *test_ops;
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index a3563719..37be4c55 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -986,7 +986,7 @@ void mt7996_mac_write_txwi(struct mt7996_dev *dev, __le32 *txwi,
+ 		if (mcast)
+ 			val |= MT_TXD6_DIS_MAT;
+ 		if (dev->mt76.phys[band_idx]->cap.has_6ghz &&
+-		    dev->mt76.lpi_bcn_enhance &&
++		    dev->mt76.lpi_mode && dev->mt76.lpi_bcn_enhance &&
+ 		    ieee80211_is_mgmt(hdr->frame_control))
+ 			val |= FIELD_PREP(MT_TXD6_BW, FW_CDBW_80MHZ);
+ 		txwi[6] |= cpu_to_le32(val);
+diff --git a/mt7996/main.c b/mt7996/main.c
+index c2fc34db..c7143149 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -860,7 +860,7 @@ mt7996_get_rates_table(struct mt7996_phy *phy, struct ieee80211_bss_conf *conf,
+ 		if (dev->cert_mode && phy->mt76->band_idx == MT_BAND2 &&
+ 		    conf->he_support && !conf->eht_support)
+ 			rate = 0x0200;
+-		else if (dev->mt76.lpi_bcn_enhance)
++		else if (dev->mt76.lpi_mode && dev->mt76.lpi_bcn_enhance)
+ 			rate = FR_RATE_IDX_OFDM_6M;
+ 
+ 		/* odd index for driver, even index for firmware */
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 7146fe0f..103d099f 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -6607,7 +6607,8 @@ int mt7996_mcu_set_fixed_rate_table(struct mt7996_phy *phy, u8 table_idx,
+ 
+ 	if (beacon) {
+ 		req.spe_idx_sel = SPE_IXD_SELECT_TXD;
+-		req.spe_idx = dev->mt76.mgmt_pwr_enhance ? 0 : 24 + band_idx;
++		req.spe_idx = dev->mt76.lpi_mode && dev->mt76.mgmt_pwr_enhance ?
++			0 : 24 + band_idx;
+ 		phy->beacon_rate = rate_idx;
+ 	} else {
+ 		req.spe_idx_sel = SPE_IXD_SELECT_BMC_WTBL;
+@@ -6904,6 +6905,126 @@ mt7996_update_max_txpower_cur(struct mt7996_phy *phy, int tx_power)
+ 		mphy->txpower_cur = e2p_power_limit;
+ }
+ 
++static int mt7996_afc_update_power_limit(struct mt7996_dev *dev,
++					 struct ieee80211_channel *chan,
++					 struct mt76_power_limits *la,
++					 struct mt76_power_path_limits *la_path,
++					 int *tx_power,
++					 struct cfg80211_chan_def *chandef)
++{
++	s8 *power_list, bw320_offset, target_power;
++	int table_idx, i, bw, mcs, ru, eht, path;
++	s8 bf_offset_ofdm[] = {6, 10, 12, 14};
++	s8 bf_offset[] = {0, 6, 10, 12, 14, 0, 4, 6, 8, 0, 3, 5, 0, 2, 0};
++
++	table_idx = chan->hw_value / 4;
++	if (table_idx < 0 || table_idx > MAX_CHANNEL_NUM_6G ||
++	    !dev->mt76.afc_power_table[table_idx])
++		return -EINVAL;
++
++	power_list = dev->mt76.afc_power_table[table_idx];
++
++	switch (chan->center_freq) {
++	case 31:
++	case 95:
++	case 159:
++		bw320_offset = 1;
++		break;
++	case 63:
++	case 127:
++	case 191:
++		bw320_offset = 2;
++		break;
++	default:
++		bw320_offset = 0;
++		break;
++	}
++
++	if (chandef) {
++		switch (chandef->width) {
++		case NL80211_CHAN_WIDTH_20:
++			target_power = power_list[afc_power_bw20];
++			break;
++		case NL80211_CHAN_WIDTH_40:
++			target_power = power_list[afc_power_bw40];
++			break;
++		case NL80211_CHAN_WIDTH_80:
++			target_power = power_list[afc_power_bw80];
++			break;
++		case NL80211_CHAN_WIDTH_160:
++			target_power = power_list[afc_power_bw160];
++			break;
++		case NL80211_CHAN_WIDTH_320:
++			if (bw320_offset == 1)
++				target_power = power_list[afc_power_bw320_1];
++			else
++				target_power = power_list[afc_power_bw320_2];
++			break;
++		default:
++			break;
++		}
++		*tx_power = min_t(int, *tx_power, target_power);
++	}
++
++	target_power = min_t(s8, (s8)*tx_power, power_list[afc_power_bw20]);
++	for (i = 0; i < sizeof(la->cck); i++)
++		la->cck[i] = min_t(s8, la->cck[i], power_list[afc_power_bw20]);
++	for (i = 0; i < sizeof(la->ofdm); i++)
++		la->ofdm[i] = min_t(s8, la->ofdm[i], target_power);
++
++	for (i = 0; i < sizeof(la_path->cck); i++)
++		la_path->cck[i] = min_t(s8, la_path->cck[i], power_list[afc_power_bw20]);
++	for (i = 0; i < sizeof(la_path->ofdm); i++)
++		la_path->ofdm[i] = min_t(s8, la_path->ofdm[i], target_power);
++	for (i = 0; i < sizeof(la_path->ofdm_bf); i++) {
++		la_path->ofdm_bf[i] =
++			min_t(s8, la_path->ofdm_bf[i],
++			      target_power - bf_offset_ofdm[i]);
++	}
++
++	for (bw = afc_power_bw20; bw < afc_power_table_num; bw++) {
++		if ((bw == afc_power_bw320_1 && bw320_offset == 2) ||
++		    (bw == afc_power_bw320_2 && bw320_offset == 1))
++			continue;
++
++		if (power_list[bw] == AFC_INVALID_POWER)
++			continue;
++
++		/* Negative index means doesn't need to update powers of the type. */
++		if (mt7996_get_bw_power_table_idx(bw, &mcs, &ru, &eht, &path))
++			return -EINVAL;
++
++		if (mcs >= 0) {
++			for (i = 0; i < sizeof(la->mcs[0]); i++)
++				la->mcs[mcs][i] =
++					min_t(s8, la->mcs[mcs][i], power_list[bw]);
++		}
++
++		if (ru >= 0) {
++			for (i = 0; i < sizeof(la->ru[0]); i++)
++				la->ru[ru][i] = min_t(s8, la->ru[ru][i], power_list[bw]);
++		}
++
++		if (eht >= 0) {
++			for (i = 0; i < sizeof(la->eht[0]); i++)
++				la->eht[eht][i] =
++					min_t(s8, la->eht[eht][i], power_list[bw]);
++		}
++
++		if (path >= 0) {
++			for (i = 0; i < sizeof(la_path->ru[0]); i++) {
++				la_path->ru[path][i] =
++					min_t(s8, la_path->ru[path][i], power_list[bw]);
++				la_path->ru_bf[path][i] =
++					min_t(s8, la_path->ru_bf[path][i],
++					      power_list[bw] - bf_offset[i]);
++			}
++		}
++	}
++
++	return 0;
++}
++
+ bool mt7996_is_psd_country(char *country)
+ {
+ 	char psd_country_list[][3] = {"US", "KR", "BR", "CL", "MY", ""};
+@@ -6962,15 +7083,22 @@ int mt7996_mcu_set_txpower_sku(struct mt7996_phy *phy,
+ 		txpower_setting = 127;
+ 	txpower_limit = mt7996_get_power_bound(phy, txpower_setting);
+ 
+-	if (phy->sku_limit_en) {
+-		txpower_limit = mt76_get_rate_power_limits(mphy, mphy->chandef.chan,
+-							   &la, &la_path, txpower_limit);
+-		mt7996_update_max_txpower_cur(phy, txpower_limit);
+-	} else {
++	if (!phy->sku_limit_en) {
+ 		mt7996_update_max_txpower_cur(phy, txpower_limit);
+ 		return 0;
+ 	}
+ 
++	txpower_limit = mt76_get_rate_power_limits(mphy, mphy->chandef.chan,
++						   &la, &la_path, txpower_limit);
++	if(phy->mt76->cap.has_6ghz && dev->mt76.afc_power_table) {
++		ret = mt7996_afc_update_power_limit(dev, mphy->main_chandef.chan, &la, &la_path,
++						    &txpower_limit, &mphy->chandef);
++		if (ret)
++			return ret;
++	}
++
++	mt7996_update_max_txpower_cur(phy, txpower_limit);
++
+ 	skb = mt76_mcu_msg_alloc(&dev->mt76, NULL,
+ 				 sizeof(req) + MT7996_SKU_PATH_NUM);
+ 	if (!skb)
+@@ -6983,7 +7111,7 @@ int mt7996_mcu_set_txpower_sku(struct mt7996_phy *phy,
+ 	/* FW would compensate for PSD countries
+ 	 * driver doesn't need to do it
+ 	 */
+-	if (phy->mt76->cap.has_6ghz && mphy->dev->lpi_psd &&
++	if (phy->mt76->cap.has_6ghz && mphy->dev->lpi_mode && mphy->dev->lpi_psd &&
+ 	    !mt7996_is_psd_country(dev->mt76.alpha2)) {
+ 		switch (mphy->chandef.width) {
+ 		case NL80211_CHAN_WIDTH_20:
+@@ -7049,7 +7177,7 @@ int mt7996_mcu_set_txpower_sku(struct mt7996_phy *phy,
+ 	/* FW would NOT compensate in the case of BF backoff table
+ 	 * driver needs to compensate for LPI PSD
+ 	 */
+-	if (phy->mt76->cap.has_6ghz && mphy->dev->lpi_psd) {
++	if (phy->mt76->cap.has_6ghz && mphy->dev->lpi_mode && mphy->dev->lpi_psd) {
+ 		switch (mphy->chandef.width) {
+ 		case NL80211_CHAN_WIDTH_20:
+ 			skb_put_data(skb, &la_path.ru[5], sizeof(la_path.ofdm));
+@@ -7111,13 +7239,53 @@ int mt7996_mcu_set_lpi_psd(struct mt7996_phy *phy, u8 enable)
+ 		.tag = cpu_to_le16(UNI_BAND_CONFIG_LPI_CTRL),
+ 		.len = cpu_to_le16(sizeof(req) - 4),
+ 		.lpi_enable = enable,
+-		.psd_limit = enable ? mt7996_is_psd_country(dev->mt76.alpha2) : 0,
++		.psd_limit = enable && dev->mt76.lpi_mode ?
++				mt7996_is_psd_country(dev->mt76.alpha2) : 0,
+ 	};
+ 
+ 	return mt76_mcu_send_msg(&phy->dev->mt76, MCU_WM_UNI_CMD(BAND_CONFIG),
+ 				 &req, sizeof(req), false);
+ }
+ 
++int mt7996_alloc_afc_table(struct mt7996_dev *dev)
++{
++	struct mt76_dev *mdev = &dev->mt76;
++	int i;
++
++	mdev->afc_power_table =
++		(s8**)devm_kzalloc(dev->mt76.dev,
++				   MAX_CHANNEL_NUM_6G * sizeof(s8*),
++				   GFP_KERNEL);
++
++	if (!mdev->afc_power_table)
++		return -ENOMEM;
++
++	for (i = 0; i < MAX_CHANNEL_NUM_6G; i++) {
++		mdev->afc_power_table[i] =
++			(s8*)devm_kzalloc(dev->mt76.dev,
++					  afc_power_table_num * sizeof(s8),
++					  GFP_KERNEL);
++		if (!mdev->afc_power_table[i]) {
++			mt7996_free_afc_table(dev);
++			return -ENOMEM;
++		}
++	}
++	return 0;
++}
++
++void mt7996_free_afc_table(struct mt7996_dev *dev)
++{
++	struct mt76_dev *mdev = &dev->mt76;
++	int i;
++
++	if (mdev->afc_power_table) {
++		for (i = 0; i < MAX_CHANNEL_NUM_6G; i++)
++			devm_kfree(mdev->dev, mdev->afc_power_table[i]);
++		devm_kfree(mdev->dev, mdev->afc_power_table);
++	}
++	mdev->afc_power_table = NULL;
++}
++
+ int mt7996_mcu_cp_support(struct mt7996_dev *dev, u8 mode)
+ {
+ 	__le32 cp_mode;
+diff --git a/mt7996/mcu.h b/mt7996/mcu.h
+index 2f7e9e5f..416d3523 100644
+--- a/mt7996/mcu.h
++++ b/mt7996/mcu.h
+@@ -1310,6 +1310,145 @@ enum {
+ 	UNI_TXPOWER_SHOW_INFO = 7,
+ };
+ 
++#define MAX_CHANNEL_NUM_6G 59
++#define AFC_INVALID_POWER 127
++enum afc_table_info {
++	afc_power_bw20,
++	afc_power_bw40,
++	afc_power_bw80,
++	afc_power_bw160,
++	afc_power_bw320_1,
++	afc_power_bw320_2,
++	afc_power_ru26,
++	afc_power_ru52,
++	afc_power_ru78,
++	afc_power_ru106,
++	afc_power_ru132,
++	afc_power_ru726,
++	afc_power_ru1480,
++	afc_power_ru1772,
++	afc_power_ru2476,
++	afc_power_ru2988,
++	afc_power_ru3472,
++	afc_power_table_num,
++};
++
++static inline int mt7996_get_bw_power_table_idx(int bw, int *mcs, int *ru, int *eht,
++						int *path)
++{
++	switch (bw) {
++	case afc_power_bw20:
++		*mcs = 0;
++		*ru = 3;
++		*eht = 3;
++		*path = 5;
++		break;
++	case afc_power_bw40:
++		*mcs = 1;
++		*ru = 4;
++		*eht = 4;
++		*path = 6;
++		break;
++	case afc_power_bw80:
++		*mcs = 2;
++		*ru = 5;
++		*eht = 5;
++		*path = 8;
++		break;
++	case afc_power_bw160:
++		*mcs = 3;
++		*ru = 6;
++		*eht = 6;
++		*path = 11;
++		break;
++	case afc_power_bw320_1:
++		*mcs = -1;
++		*ru = -1;
++		*eht = 7;
++		*path = 15;
++		break;
++	case afc_power_bw320_2:
++		*mcs = -1;
++		*ru = -1;
++		*eht = 7;
++		*path = 15;
++		break;
++	case afc_power_ru26:
++		*mcs = -1;
++		*ru = 0;
++		*eht = 0;
++		*path = 0;
++		break;
++	case afc_power_ru52:
++		*mcs = -1;
++		*ru = 1;
++		*eht = 1;
++		*path = 1;
++		break;
++	case afc_power_ru78:
++		*mcs = -1;
++		*ru = -1;
++		*eht = 8;
++		*path = 2;
++		break;
++	case afc_power_ru106:
++		*mcs = -1;
++		*ru = 2;
++		*eht = 2;
++		*path = 3;
++		break;
++	case afc_power_ru132:
++		*mcs = -1;
++		*ru = -1;
++		*eht = 9;
++		*path = 4;
++		break;
++	case afc_power_ru726:
++		*mcs = -1;
++		*ru = -1;
++		*eht = 10;
++		*path = 7;
++		break;
++	case afc_power_ru1480:
++		*mcs = -1;
++		*ru = -1;
++		*eht = 11;
++		*path = 9;
++		break;
++	case afc_power_ru1772:
++		*mcs = -1;
++		*ru = -1;
++		*eht = 12;
++		*path = 10;
++		break;
++	case afc_power_ru2476:
++		*mcs = -1;
++		*ru = -1;
++		*eht = 13;
++		*path = 12;
++		break;
++	case afc_power_ru2988:
++		*mcs = -1;
++		*ru = -1;
++		*eht = 14;
++		*path = 13;
++		break;
++	case afc_power_ru3472:
++		*mcs = -1;
++		*ru = -1;
++		*eht = 15;
++		*path = 14;
++		break;
++	default:
++		*mcs = -1;
++		*ru = -1;
++		*eht = -1;
++		*path = -1;
++		return -EINVAL;
++	}
++	return 0;
++}
++
+ enum {
+ 	UNI_CMD_ACCESS_REG_BASIC = 0x0,
+ 	UNI_CMD_ACCESS_RF_REG_BASIC,
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index 8eb2f958..b05631ab 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -1126,6 +1126,8 @@ int mt7996_mcu_set_thermal_protect(struct mt7996_phy *phy, bool enable);
+ int mt7996_mcu_set_txpower_sku(struct mt7996_phy *phy,
+ 			       int txpower_setting);
+ int mt7996_mcu_rdd_cmd(struct mt7996_dev *dev, int cmd, u8 rdd_idx, u8 val);
++int mt7996_alloc_afc_table(struct mt7996_dev *dev);
++void mt7996_free_afc_table(struct mt7996_dev *dev);
+ int mt7996_mcu_rdd_background_disable_timer(struct mt7996_dev *dev,
+ 					    bool disable_timer);
+ int mt7996_mcu_rdd_background_enable(struct mt7996_phy *phy,
+diff --git a/mt7996/mtk_debugfs.c b/mt7996/mtk_debugfs.c
+index e969c57b..9a47e445 100644
+--- a/mt7996/mtk_debugfs.c
++++ b/mt7996/mtk_debugfs.c
+@@ -2529,6 +2529,11 @@ mt7996_get_txpower_info(struct file *file, char __user *user_buf,
+ 	len += scnprintf(buf + len, size - len,
+ 			 "    RegDB:  %s\n",
+ 			 !np ? "enable" : "disable");
++	len += scnprintf(buf + len, size - len,
++			 "    sku_index:  %d\n", phy->mt76->sku_idx);
++	len += scnprintf(buf + len, size - len,
++			 "    lpi:  %s\n",
++			 phy->mt76->dev->lpi_mode ? "enable" : "disable");
+ 	ret = simple_read_from_buffer(user_buf, count, ppos, buf, len);
+ 
+ out:
+@@ -4411,6 +4416,37 @@ static int mt7996_pp_alg_show(struct seq_file *s, void *data)
+ }
+ DEFINE_SHOW_ATTRIBUTE(mt7996_pp_alg);
+ 
++static int mt7996_afc_table_show(struct seq_file *s, void *data)
++{
++	struct mt7996_dev *dev = s->private;
++
++	char str[200] = {0}, *pos;
++	char *end = str + sizeof(str);
++	int i, j;
++
++	if (!dev->mt76.afc_power_table || !dev->mt76.afc_power_table[0]) {
++		seq_printf(s, "afc table doesn't exist.\n");
++		return 0;
++	}
++
++	seq_printf(s, "bw/ru :    20    40    80   160  320-1 320-2   26    52    78   "
++		   "106   132   726  1480  1772  2476  2988  3472\n");
++	for(i = 0; i < MAX_CHANNEL_NUM_6G; i ++) {
++		pos = str;
++		for (j = 0; j < afc_power_table_num; j ++) {
++			pos += snprintf(pos, end - pos, "%5d ",
++					dev->mt76.afc_power_table[i][j]);
++		}
++		seq_printf(s, "ch %3d: %s\n", i * 4 + 1, str);
++		memset(str, 0, sizeof(str));
++	}
++	seq_printf(s, "Unit : 0.5 dBm\n");
++	seq_printf(s, "NOTE : power of the table is translated to single path.\n");
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mt7996_afc_table);
++
+ void mt7996_mtk_init_band_debugfs(struct mt7996_phy *phy, struct dentry *dir)
+ {
+ 	/* agg */
+@@ -4537,6 +4573,7 @@ void mt7996_mtk_init_dev_debugfs(struct mt7996_dev *dev, struct dentry *dir)
+ 
+ 	debugfs_create_file("muru_dbg", 0200, dir, dev, &fops_muru_dbg_info);
+ 	debugfs_create_bool("mgmt_pwr_enhance", 0600, dir, &dev->mt76.mgmt_pwr_enhance);
++	debugfs_create_file("afc_table", 0200, dir, dev, &mt7996_afc_table_fops);
+ }
+ 
+ #endif
+diff --git a/mt7996/vendor.c b/mt7996/vendor.c
+index 805a93f8..206fc06a 100644
+--- a/mt7996/vendor.c
++++ b/mt7996/vendor.c
+@@ -163,6 +163,8 @@ txpower_ctrl_policy[NUM_MTK_VENDOR_ATTRS_TXPOWER_CTRL] = {
+ 	[MTK_VENDOR_ATTR_TXPOWER_CTRL_SKU_IDX] = { .type = NLA_U8 },
+ 	[MTK_VENDOR_ATTR_TXPOWER_CTRL_LPI_BCN_ENHANCE] = { .type = NLA_U8 },
+ 	[MTK_VENDOR_ATTR_TXPOWER_CTRL_LINK_ID] = { .type = NLA_U8 },
++	[MTK_VENDOR_ATTR_TXPOWER_CTRL_AFC_TABLE] = { .type = NLA_BINARY },
++	[MTK_VENDOR_ATTR_TXPOWER_CTRL_AFC_LPI] = { .type = NLA_U8 },
+ };
+ 
+ struct mt7996_amnt_data {
+@@ -1486,6 +1488,34 @@ out:
+ 	return err;
+ }
+ 
++static int mt7996_parse_afc_table(struct mt7996_dev *dev, struct nlattr *tb, int delta)
++{
++	int ch, bw, err = 0;
++	struct mt76_dev *mdev = &dev->mt76;
++	s8 **table;
++
++	if (!mdev->afc_power_table)
++		err = mt7996_alloc_afc_table(dev);
++
++	if (err) {
++		mt7996_free_afc_table(dev);
++		return err;
++	}
++
++	table = nla_data(tb);
++
++	for (ch = 0; ch < MAX_CHANNEL_NUM_6G; ch++) {
++		memcpy(mdev->afc_power_table[ch], table[ch],
++			afc_power_table_num * sizeof(s8));
++		for (bw = 0; bw < afc_power_table_num; bw++)
++			if (mdev->afc_power_table[ch][bw] != AFC_INVALID_POWER)
++				mdev->afc_power_table[ch][bw] -= delta;
++	}
++
++	return 0;
++}
++
++
+ static int mt7996_vendor_txpower_ctrl(struct wiphy *wiphy,
+ 				      struct wireless_dev *wdev,
+ 				      const void *data,
+@@ -1495,12 +1525,13 @@ static int mt7996_vendor_txpower_ctrl(struct wiphy *wiphy,
+ 	struct mt7996_dev *dev;
+ 	struct mt7996_phy *phy;
+ 	struct mt76_phy *mphy;
++	struct mt76_dev *mdev;
+ 	struct ieee80211_vif *vif = wdev_to_ieee80211_vif(wdev);
+ 	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
+ 	struct mt7996_vif_link *mconf;
+-	struct nlattr *tb[NUM_MTK_VENDOR_ATTRS_TXPOWER_CTRL];
+-	struct mt76_power_limits la = {};
+-	struct mt76_power_path_limits la_path = {};
++	struct nlattr *tb[NUM_MTK_VENDOR_ATTRS_TXPOWER_CTRL], *table;
++	struct mt76_power_limits *la;
++	struct mt76_power_path_limits *la_path;
+ 	int err, current_txpower, delta;
+ 	u8 val, link_id = 0, idx;
+ 
+@@ -1528,6 +1559,14 @@ static int mt7996_vendor_txpower_ctrl(struct wiphy *wiphy,
+ 	rcu_read_unlock();
+ 
+ 	mphy = phy->mt76;
++	mdev = mphy->dev;
++	delta = mt76_tx_power_path_delta(hweight16(mphy->chainmask));
++
++	if (mphy->cap.has_6ghz &&
++	    tb[MTK_VENDOR_ATTR_TXPOWER_CTRL_AFC_LPI]) {
++		val = nla_get_u8(tb[MTK_VENDOR_ATTR_TXPOWER_CTRL_AFC_LPI]);
++		mphy->dev->lpi_mode = !!val;
++	}
+ 
+ 	if (mphy->cap.has_6ghz &&
+ 	    tb[MTK_VENDOR_ATTR_TXPOWER_CTRL_LPI_PSD]) {
+@@ -1536,7 +1575,7 @@ static int mt7996_vendor_txpower_ctrl(struct wiphy *wiphy,
+ 
+ 		err = mt7996_mcu_set_lpi_psd(phy, val);
+ 		if (err)
+-			return err;
++			goto out;
+ 	}
+ 
+ 	if (tb[MTK_VENDOR_ATTR_TXPOWER_CTRL_SKU_IDX]) {
+@@ -1547,19 +1586,22 @@ static int mt7996_vendor_txpower_ctrl(struct wiphy *wiphy,
+ 
+ 		phy->sku_limit_en = true;
+ 		phy->sku_path_en = true;
+-		mt76_get_rate_power_limits(mphy, mphy->chandef.chan, &la, &la_path, 127);
+-		if (!la_path.ofdm[0])
++		la = kzalloc(sizeof(struct mt76_power_limits), GFP_KERNEL);
++		la_path = kzalloc(sizeof(struct mt76_power_path_limits), GFP_KERNEL);
++
++		mt76_get_rate_power_limits(mphy, mphy->chandef.chan, la, la_path, 127);
++		if (!la_path->ofdm[0])
+ 			phy->sku_path_en = false;
+ 
+ 		dev = phy->dev;
+ 		err = mt7996_mcu_set_tx_power_ctrl(phy, UNI_TXPOWER_SKU_POWER_LIMIT_CTRL,
+ 						   dev->dbg.sku_disable ? 0 : phy->sku_limit_en);
+ 		if (err)
+-			return err;
++			goto out;
+ 		err = mt7996_mcu_set_tx_power_ctrl(phy, UNI_TXPOWER_BACKOFF_POWER_LIMIT_CTRL,
+ 						   dev->dbg.sku_disable ? 0 : phy->sku_path_en);
+ 		if (err)
+-			return err;
++			goto out;
+ 	}
+ 
+ 	if (mphy->cap.has_6ghz &&
+@@ -1568,19 +1610,30 @@ static int mt7996_vendor_txpower_ctrl(struct wiphy *wiphy,
+ 		mphy->dev->lpi_bcn_enhance = val;
+ 		idx = MT7996_BEACON_RATES_TBL + 2 * phy->mt76->band_idx;
+ 
+-		err = mt7996_mcu_set_fixed_rate_table(phy, idx, FR_RATE_IDX_OFDM_6M, true);
++		err = mt7996_mcu_set_fixed_rate_table(phy, idx, FR_RATE_IDX_OFDM_6M,
++						      true);
+ 		if (err)
+-			return err;
++			goto out;
++	}
++
++	if (mphy->cap.has_6ghz) {
++		table = tb[MTK_VENDOR_ATTR_TXPOWER_CTRL_AFC_TABLE];
++		if (table) {
++			err = mt7996_parse_afc_table(dev, table, delta);
++			if (err)
++				goto out;
++		} else
++			mt7996_free_afc_table(dev);
+ 	}
+ 
+-	delta = mt76_tx_power_nss_delta(hweight16(mphy->chainmask));
+ 	current_txpower = DIV_ROUND_UP(mphy->txpower_cur + delta, 2);
+ 
+ 	err = mt7996_mcu_set_txpower_sku(phy, current_txpower);
+-	if (err)
+-		return err;
+ 
+-	return 0;
++out:
++	kfree(la);
++	kfree(la_path);
++	return err;
+ }
+ 
+ static const struct wiphy_vendor_command mt7996_vendor_commands[] = {
+diff --git a/mt7996/vendor.h b/mt7996/vendor.h
+index 11bea06e..617ec347 100644
+--- a/mt7996/vendor.h
++++ b/mt7996/vendor.h
+@@ -339,12 +339,15 @@ enum mtk_vendor_attr_txpower_ctrl {
+ 	MTK_VENDOR_ATTR_TXPOWER_CTRL_SKU_IDX,
+ 	MTK_VENDOR_ATTR_TXPOWER_CTRL_LPI_BCN_ENHANCE,
+ 	MTK_VENDOR_ATTR_TXPOWER_CTRL_LINK_ID,
++	MTK_VENDOR_ATTR_TXPOWER_CTRL_AFC_TABLE,
++	MTK_VENDOR_ATTR_TXPOWER_CTRL_AFC_LPI,
+ 
+ 	/* keep last */
+ 	NUM_MTK_VENDOR_ATTRS_TXPOWER_CTRL,
+ 	MTK_VENDOR_ATTR_TXPOWER_CTRL_MAX =
+ 		NUM_MTK_VENDOR_ATTRS_TXPOWER_CTRL - 1
+ };
++
+ #endif
+ 
+ #endif
+-- 
+2.45.2
+

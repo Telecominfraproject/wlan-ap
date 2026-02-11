@@ -1,0 +1,200 @@
+From 85af8d33b0ca87322a995a284f1425393c2bd313 Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Mon, 27 May 2024 13:23:59 +0800
+Subject: [PATCH 061/115] mtk: mac80211: rework radar notify for MLO
+
+Rework radar notify for MLO.
+A netdev/wdev containing 5G link is required for all radar events since
+userspace daemon will only process the event with the first netdev
+(might not include 5G links) if netdev/wdev is not specified.
+For instance, the radar event will be ignored in the following
+configuration.
+wdev 1: MLD AP (2+6G)
+wdev 2: MLD AP (2+5+6G)
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+
+There is a chance that the DFS pre-CAC check, triggered by a non-5G interface,
+is executed during the switching time of 5G interfaces.
+In this case, cfg80211_any_wiphy_oper_chan of target channel  will return 0,
+as the 5G interface is not yet operating on the target channel.
+Therefore, a pre-CAC expired event of the target channel will be issued to hostapd.
+This causes the AP to re-CAC the target channel after switching to it,
+which usually occurs after background radar CAC is completed.
+
+=> Avoid scheduling dfs channel update work for non-5G link.
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+
+revert rework radar notfiy for MLO
+With the following hostapd patch, wdev is not necessary for radar event.
+nl80211: Handle radar event properly during MLO
+https://w1.fi/cgit/hostap/commit/?id=bfc89d757b723eecfac034c15f6ab0e6ae7dd2ed
+
+This also fixes the following issue for the 7975 ifem background radar BW160 HWITS:
+When the AP is configured to channel 100 BW 160 with background radar enabled,
+due to the HWITS, the background radar will be forced to channel 116 BW 80,
+and send the NL80211_RADAR_BACKGROUND_CHAN_UPDATE event to notify hostapd
+about the channel update.
+Then, the AP will start on a random BW160 non-DFS channel.
+
+However, the NL80211_RADAR_BACKGROUND_CHAN_UPDATE event will be returned since the
+AP hasn't started, so wiphy_get_band_first_wdev cannot find any available wdev.
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+---
+ net/wireless/chan.c    | 34 +++++++++-------------------------
+ net/wireless/mlme.c    |  6 +-----
+ net/wireless/nl80211.c |  7 ++++---
+ 3 files changed, 14 insertions(+), 33 deletions(-)
+
+diff --git a/net/wireless/chan.c b/net/wireless/chan.c
+index 9aa8b715..629d98b1 100644
+--- a/net/wireless/chan.c
++++ b/net/wireless/chan.c
+@@ -1580,21 +1580,6 @@ bool cfg80211_any_usable_channels(struct wiphy *wiphy,
+ }
+ EXPORT_SYMBOL(cfg80211_any_usable_channels);
+ 
+-static void cfg80211_sta_radar_notify(struct wiphy *wiphy,
+-				      const struct cfg80211_chan_def *chandef,
+-				      enum nl80211_radar_event event)
+-{
+-	struct wireless_dev *wdev;
+-
+-	list_for_each_entry(wdev, &wiphy->wdev_list, list) {
+-		if (cfg80211_chandef_dfs_required(wiphy, chandef, wdev->iftype) > 0) {
+-			nl80211_radar_notify(wiphy_to_rdev(wiphy), chandef,
+-					     event, wdev->netdev, GFP_KERNEL);
+-			return;
+-		}
+-	}
+-}
+-
+ void cfg80211_sta_update_dfs_state(struct wireless_dev *wdev,
+ 				   const struct cfg80211_chan_def *bss_chandef,
+ 				   const struct cfg80211_chan_def *csa_chandef,
+@@ -1607,7 +1592,7 @@ void cfg80211_sta_update_dfs_state(struct wireless_dev *wdev,
+ 	enum nl80211_dfs_state dfs_state = NL80211_DFS_USABLE;
+ 	enum nl80211_radar_event event = NL80211_RADAR_STA_CAC_EXPIRED;
+ 
+-	lockdep_assert_wiphy(wdev->wiphy);
++	lockdep_assert_wiphy(wiphy);
+ 
+ 	if (!bss_chandef || !bss_chandef->chan ||
+ 	    bss_chandef->chan->band != NL80211_BAND_5GHZ)
+@@ -1620,14 +1605,14 @@ void cfg80211_sta_update_dfs_state(struct wireless_dev *wdev,
+ 		cfg80211_set_dfs_state(wiphy, csa_chandef, NL80211_DFS_AVAILABLE);
+ 		/* avoid the dfs state from expired during csa countdown */
+ 		cfg80211_update_last_available(wiphy, csa_chandef, csa_time);
+-		nl80211_radar_notify(rdev, csa_chandef,
+-				     NL80211_RADAR_STA_CAC_SKIPPED, GFP_KERNEL);
++		nl80211_radar_notify(rdev, csa_chandef, NL80211_RADAR_STA_CAC_SKIPPED,
++				     wdev->netdev, GFP_KERNEL);
+ 		netdev_info(wdev->netdev, "Set CSA channel's DFS state to available\n");
+ 	}
+ 
+ 	/* avoid updating the dfs state during nop */
+-	if (!cfg80211_chandef_dfs_usable(wdev->wiphy, bss_chandef) &&
+-	    !cfg80211_chandef_dfs_available(wdev->wiphy, bss_chandef))
++	if (!cfg80211_chandef_dfs_usable(wiphy, bss_chandef) &&
++	    !cfg80211_chandef_dfs_available(wiphy, bss_chandef))
+ 		return;
+ 
+ 	if (associated && !csa_active) {
+@@ -1639,13 +1624,12 @@ void cfg80211_sta_update_dfs_state(struct wireless_dev *wdev,
+ 	 * when other interfaces still operate on this channel
+ 	 */
+ 	if (dfs_state == NL80211_DFS_USABLE &&
+-	    (cfg80211_is_wiphy_oper_chan(wdev->wiphy, bss_chandef->chan) ||
+-	     cfg80211_offchan_chain_is_active(wiphy_to_rdev(wdev->wiphy),
+-					      bss_chandef->chan)))
++	    (cfg80211_is_wiphy_oper_chan(wiphy, bss_chandef->chan) ||
++	     cfg80211_offchan_chain_is_active(rdev, bss_chandef->chan)))
+ 		return;
+ 
+-	cfg80211_set_dfs_state(wdev->wiphy, bss_chandef, dfs_state);
+-	cfg80211_sta_radar_notify(wdev->wiphy, bss_chandef, event);
++	cfg80211_set_dfs_state(wiphy, bss_chandef, dfs_state);
++	nl80211_radar_notify(rdev, bss_chandef, event, wdev->netdev, GFP_KERNEL);
+ 
+ 	if (csa_active)
+ 		netdev_info(wdev->netdev, "Set origin channel's DFS state to usable\n");
+diff --git a/net/wireless/mlme.c b/net/wireless/mlme.c
+index 8f7ff8f7..8f8757d7 100644
+--- a/net/wireless/mlme.c
++++ b/net/wireless/mlme.c
+@@ -1181,7 +1181,6 @@ __cfg80211_background_cac_event(struct cfg80211_registered_device *rdev,
+ 				enum nl80211_radar_event event)
+ {
+ 	struct wiphy *wiphy = &rdev->wiphy;
+-	struct net_device *netdev;
+ 
+ 	lockdep_assert_wiphy(&rdev->wiphy);
+ 
+@@ -1197,13 +1196,11 @@ __cfg80211_background_cac_event(struct cfg80211_registered_device *rdev,
+ 		memcpy(&rdev->cac_done_chandef, chandef, sizeof(*chandef));
+ 		queue_work(cfg80211_wq, &rdev->propagate_cac_done_wk);
+ 		cfg80211_sched_dfs_chan_update(rdev);
+-		wdev = rdev->background_radar_wdev;
+ 		rdev->background_cac_started = false;
+ 		break;
+ 	case NL80211_RADAR_CAC_ABORTED:
+ 		if (!cancel_delayed_work(&rdev->background_cac_done_wk))
+ 			return;
+-		wdev = rdev->background_radar_wdev;
+ 		rdev->background_cac_started = false;
+ 		break;
+ 	case NL80211_RADAR_CAC_STARTED:
+@@ -1213,8 +1210,7 @@ __cfg80211_background_cac_event(struct cfg80211_registered_device *rdev,
+ 		return;
+ 	}
+ 
+-	netdev = wdev ? wdev->netdev : NULL;
+-	nl80211_radar_notify(rdev, chandef, event, netdev, GFP_KERNEL);
++	nl80211_radar_notify(rdev, chandef, event, NULL, GFP_KERNEL);
+ }
+ 
+ static void
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index ccd2664d..b9f4872e 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -20506,7 +20506,8 @@ void cfg80211_ch_switch_notify(struct net_device *dev,
+ 	}
+ 
+ 	cfg80211_schedule_channels_check(wdev);
+-	cfg80211_sched_dfs_chan_update(rdev);
++	if (chandef->chan && chandef->chan->band == NL80211_BAND_5GHZ)
++		cfg80211_sched_dfs_chan_update(rdev);
+ 
+ 	nl80211_ch_switch_notify(rdev, dev, link_id, chandef, GFP_KERNEL,
+ 				 NL80211_CMD_CH_SWITCH_NOTIFY, 0, false);
+@@ -20589,6 +20590,7 @@ nl80211_radar_notify(struct cfg80211_registered_device *rdev,
+ 		     enum nl80211_radar_event event,
+ 		     struct net_device *netdev, gfp_t gfp)
+ {
++	struct wiphy *wiphy = &rdev->wiphy;
+ 	struct sk_buff *msg;
+ 	void *hdr;
+ 
+@@ -20605,7 +20607,6 @@ nl80211_radar_notify(struct cfg80211_registered_device *rdev,
+ 	if (nla_put_u32(msg, NL80211_ATTR_WIPHY, rdev->wiphy_idx))
+ 		goto nla_put_failure;
+ 
+-	/* NOP and radar events don't need a netdev parameter */
+ 	if (netdev) {
+ 		struct wireless_dev *wdev = netdev->ieee80211_ptr;
+ 
+@@ -20623,7 +20624,7 @@ nl80211_radar_notify(struct cfg80211_registered_device *rdev,
+ 
+ 	genlmsg_end(msg, hdr);
+ 
+-	genlmsg_multicast_netns(&nl80211_fam, wiphy_net(&rdev->wiphy), msg, 0,
++	genlmsg_multicast_netns(&nl80211_fam, wiphy_net(wiphy), msg, 0,
+ 				NL80211_MCGRP_MLME, gfp);
+ 	return;
+ 
+-- 
+2.45.2
+

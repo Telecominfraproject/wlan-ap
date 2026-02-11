@@ -1,0 +1,263 @@
+From 1ea883abc60bf6bb3180b55c6289d5b8f30e5f79 Mon Sep 17 00:00:00 2001
+From: Michael-CY Lee <michael-cy.lee@mediatek.com>
+Date: Tue, 2 Apr 2024 15:36:29 +0800
+Subject: [PATCH 072/236] mtk: hostapd: add support for basic MLD Extender
+
+Add basic MLD Extender support, including
+1. Extender STA stops all Extender AP's links before scaning.
+2. After finishing the connection with root AP, Extender STA
+   synchronizes control channel with each link on the Extender
+   AP.
+
+Advanced support includes BW cynchronization and channel switch.
+
+Add a check for band_idx, if the iface has different band_idx from the
+one wpa_s provided, this iface is not the target.
+
+Also add a log for switching iface.
+
+Legacy AP interfaces that sharing the same hostapd_iface with the target
+hapd should also be disabled.
+
+If parsing 'band_idx' fails, iface starting only works for current
+iface.
+
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+---
+ src/ap/ucode.c         | 60 ++++++++++++++++++++++++++++++++++++++----
+ src/utils/ucode.c      |  3 ++-
+ wpa_supplicant/ucode.c | 45 +++++++++++++++++++++++++------
+ 3 files changed, 94 insertions(+), 14 deletions(-)
+
+diff --git a/src/ap/ucode.c b/src/ap/ucode.c
+index b61eaa0fe..8730616fb 100644
+--- a/src/ap/ucode.c
++++ b/src/ap/ucode.c
+@@ -10,6 +10,7 @@
+ #include "dfs.h"
+ #include "acs.h"
+ #include "ieee802_11_auth.h"
++#include "ieee802_11.h"
+ #include <libubox/uloop.h>
+ 
+ static uc_resource_type_t *global_type, *bss_type, *iface_type;
+@@ -494,14 +495,16 @@ static uc_value_t *
+ uc_hostapd_iface_stop(uc_vm_t *vm, size_t nargs)
+ {
+ 	struct hostapd_iface *iface = uc_fn_thisval("hostapd.iface");
+-	int i;
+-
+-	wpa_printf(MSG_INFO, "ucode: mtk: stop iface for %s in state %s\n",
+-			iface->phy, hostapd_state_text(iface->state));
++	struct hostapd_data *first_hapd;
++	struct hostapd_bss_config *conf;
++	int i, j;
+ 
+ 	if (!iface)
+ 		return NULL;
+ 
++	wpa_printf(MSG_INFO, "ucode: mtk: stop iface for %s in state %s\n",
++			iface->phy, hostapd_state_text(iface->state));
++
+ 	if (iface->state != HAPD_IFACE_ENABLED)
+ 		uc_hostapd_disable_iface(iface);
+ 
+@@ -512,6 +515,34 @@ uc_hostapd_iface_stop(uc_vm_t *vm, size_t nargs)
+ 		hapd->beacon_set_done = 0;
+ 	}
+ 
++#ifdef CONFIG_IEEE80211BE
++	first_hapd = iface->bss[0];
++	conf = first_hapd->conf;
++	for (i = 0; conf->mld_ap && i < iface->interfaces->count; i++) {
++		struct hostapd_iface *h = iface->interfaces->iface[i];
++		struct hostapd_data *h_hapd = h->bss[0];
++		struct hostapd_bss_config *hconf = h_hapd->conf;
++
++		if (h == iface) {
++			wpa_printf(MSG_DEBUG, "MLD: Skip own interface");
++			continue;
++		}
++
++		if (!hconf->mld_ap) {
++			wpa_printf(MSG_DEBUG,
++				   "MLD: Skip non MLD");
++			continue;
++		}
++
++		if (hostapd_is_ml_partner(first_hapd, h_hapd)) {
++			for (j = 0; j < h->num_bss; j++) {
++				hostapd_drv_stop_ap(h->bss[j]);
++				h->bss[j]->beacon_set_done = 0;
++			}
++		}
++	}
++#endif /* CONFIG_IEEE80211BE */
++
+ 	return NULL;
+ }
+ 
+@@ -519,11 +550,12 @@ static uc_value_t *
+ uc_hostapd_iface_start(uc_vm_t *vm, size_t nargs)
+ {
+ 	struct hostapd_iface *iface = uc_fn_thisval("hostapd.iface");
++	struct hostapd_data *tmp_hapd;
+ 	uc_value_t *info = uc_fn_arg(0);
+ 	struct hostapd_config *conf;
+ 	bool changed = false;
+ 	uint64_t intval;
+-	int i;
++	int i, band_idx;
+ 
+ 	wpa_printf(MSG_INFO, "ucode: mtk: start iface for %s in state %s\n",
+ 			iface->phy, hostapd_state_text(iface->state));
+@@ -539,6 +571,24 @@ uc_hostapd_iface_start(uc_vm_t *vm, size_t nargs)
+ 	if (ucv_type(info) != UC_OBJECT)
+ 		return NULL;
+ 
++	intval = ucv_int64_get(ucv_object_get(info, "band_idx", NULL));
++	band_idx = errno ? iface->conf->band_idx : intval;
++
++#ifdef CONFIG_IEEE80211BE
++	if (hostapd_is_mld_ap(iface->bss[0])) {
++		for_each_mld_link(tmp_hapd, iface->bss[0]) {
++			if (band_idx == tmp_hapd->iconf->band_idx) {
++				wpa_printf(MSG_INFO, "ucode: mtk: MLD: switch to iface with band_idx %d \n", band_idx);
++				iface = tmp_hapd->iface;
++				break;
++			}
++		}
++	}
++
++	if (band_idx != iface->bss[0]->iconf->band_idx)
++		return NULL;
++#endif /* CONFIG_IEEE80211BE */
++
+ #define UPDATE_VAL(field, name)							\
+ 	do {									\
+ 		intval = ucv_int64_get(ucv_object_get(info, name, NULL));	\
+diff --git a/src/utils/ucode.c b/src/utils/ucode.c
+index 8fc46dfd3..05f128c78 100644
+--- a/src/utils/ucode.c
++++ b/src/utils/ucode.c
+@@ -110,7 +110,7 @@ uc_value_t *uc_wpa_freq_info(uc_vm_t *vm, size_t nargs)
+ 	uc_value_t *freq = uc_fn_arg(0);
+ 	uc_value_t *sec = uc_fn_arg(1);
+ 	int width = ucv_uint64_get(uc_fn_arg(2));
+-	int bw320_offset = 1;
++	int bw320_offset = 1, band_idx;
+ 	int freq_val, center_idx, center_ofs;
+ 	enum oper_chan_width chanwidth;
+ 	enum hostapd_hw_mode hw_mode;
+@@ -123,6 +123,7 @@ uc_value_t *uc_wpa_freq_info(uc_vm_t *vm, size_t nargs)
+ 		return NULL;
+ 
+ 	freq_val = ucv_int64_get(freq);
++	band_idx = ucv_int64_get(uc_fn_arg(4));
+ 	if (ucv_type(sec) == UC_INTEGER)
+ 		sec_channel = ucv_int64_get(sec);
+ 	else if (sec)
+diff --git a/wpa_supplicant/ucode.c b/wpa_supplicant/ucode.c
+index 60eb216e2..826b7ea6d 100644
+--- a/wpa_supplicant/ucode.c
++++ b/wpa_supplicant/ucode.c
+@@ -247,12 +247,13 @@ uc_wpas_iface_status(uc_vm_t *vm, size_t nargs)
+ {
+ 	struct wpa_supplicant *wpa_s = uc_fn_thisval("wpas.iface");
+ 	struct wpa_bss *bss;
+-	uc_value_t *ret, *val;
++	uc_value_t *ret, *val, *link_obj = uc_fn_arg(0);
+ 	struct wpa_channel_info ci;
+ 	u8 op_class, channel;
+-	enum oper_chan_width ch_width;
+-	int center_freq1, bw320_offset = 1, is_24ghz;
++	enum oper_chan_width ch_width = CONF_OPER_CHWIDTH_USE_HT;
++	int center_freq1, bw320_offset = 1, is_24ghz, band_idx;
+ 	enum hostapd_hw_mode hw_mode;
++	int link_id = ucv_int64_get(link_obj);
+ 
+ 	if (!wpa_s)
+ 		return NULL;
+@@ -262,13 +263,25 @@ uc_wpas_iface_status(uc_vm_t *vm, size_t nargs)
+ 	val = ucv_string_new(wpa_supplicant_state_txt(wpa_s->wpa_state));
+ 	ucv_object_add(ret, "state", ucv_get(val));
+ 
+-	bss = wpa_s->current_bss;
++	bss = link_id == -1 ? wpa_s->current_bss : wpa_s->links[link_id].bss;
+ 	if (bss) {
+ 		int sec_chan = 0;
+ 
+ 		hw_mode = ieee80211_freq_to_chan(bss->freq, &channel);
+ 		is_24ghz = hw_mode == HOSTAPD_MODE_IEEE80211G ||
+ 			hw_mode == HOSTAPD_MODE_IEEE80211B;
++		/*
++		 * Assume that the mapping between band and band_idx is
++		 * 2 GHz band: band_idx 0
++		 * 5 GHz band: band_idx 1
++		 * 6 GHz band: band_idx 2
++		 * */
++		if (is_24ghz)
++			band_idx = 0;
++		else if (IS_5GHZ(bss->freq))
++			band_idx = 1;
++		else if (is_6ghz_freq(bss->freq))
++			band_idx = 2;
+ 
+ 		wpa_drv_channel_info(wpa_s, &ci);
+ 		center_freq1 = ci.center_frq1;
+@@ -280,11 +293,10 @@ uc_wpas_iface_status(uc_vm_t *vm, size_t nargs)
+ 				sec_chan = (bss->freq / 20) & 1 ? 1 : -1;
+ 		}
+ 
+-		if (ieee80211_chaninfo_to_channel(ci.frequency, ci.chanwidth,
+-						  sec_chan, &op_class, &channel))
+-			return NULL;
++		if (!ieee80211_chaninfo_to_channel(ci.frequency, ci.chanwidth,
++						   sec_chan, &op_class, &channel))
++			ch_width = op_class_to_ch_width(op_class);
+ 
+-		ch_width = op_class_to_ch_width(op_class);
+ 		if (ch_width == CONF_OPER_CHWIDTH_320MHZ &&
+ 		    (center_freq1 == 6265) || center_freq1 == 6585 ||
+ 		     center_freq1 == 6905) {
+@@ -296,6 +308,7 @@ uc_wpas_iface_status(uc_vm_t *vm, size_t nargs)
+ 		ucv_object_add(ret, "frequency", ucv_int64_new(bss->freq));
+ 		ucv_object_add(ret, "ch_width", ucv_int64_new(ch_width));
+ 		ucv_object_add(ret, "bw320_offset", ucv_int64_new(bw320_offset));
++		ucv_object_add(ret, "band_idx", ucv_int64_new(band_idx));
+ 	}
+ 
+ #ifdef CONFIG_MESH
+@@ -335,6 +348,21 @@ uc_wpas_iface_ctrl(uc_vm_t *vm, size_t nargs)
+ 	return ret;
+ }
+ 
++static uc_value_t *
++uc_wpas_iface_get_valid_links(uc_vm_t *vm, size_t nargs)
++{
++	struct wpa_supplicant *wpa_s = uc_fn_thisval("wpas.iface");
++	uc_value_t *ret;
++
++	if (!wpa_s)
++		return NULL;
++
++	ret = ucv_object_new(vm);
++	ucv_object_add(ret, "valid_links", ucv_uint64_new(wpa_s->valid_links));
++
++	return ret;
++}
++
+ int wpas_ucode_init(struct wpa_global *gl)
+ {
+ 	static const uc_function_list_t global_fns[] = {
+@@ -347,6 +375,7 @@ int wpas_ucode_init(struct wpa_global *gl)
+ 	static const uc_function_list_t iface_fns[] = {
+ 		{ "status", uc_wpas_iface_status },
+ 		{ "ctrl", uc_wpas_iface_ctrl },
++		{ "get_valid_links", uc_wpas_iface_get_valid_links },
+ 	};
+ 	uc_value_t *data, *proto;
+ 
+-- 
+2.45.2
+

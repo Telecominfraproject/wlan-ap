@@ -1,0 +1,606 @@
+From ad4e378b68b64afcd05a64b358a804387aaf3623 Mon Sep 17 00:00:00 2001
+From: Howard Hsu <howard-yh.hsu@mediatek.com>
+Date: Tue, 4 Feb 2025 10:15:51 +0800
+Subject: [PATCH 170/236] mtk: hostapd: support handle mscs protocol
+
+Support handle mscs descriptor element through MSCS action frame or
+Assoc req/rsp. This commit also create a netlink socket to send mscs
+configuration to qos management kernel module, responsible for
+monitor/modify the DSCP of IP Header.
+
+Signed-off-by: Howard Hsu <howard-yh.hsu@mediatek.com>
+
+
+Do not exit the hostapd main function if there is an error connecting to
+the MTK mscs daemon, as some projects may not require it. This commit
+make sure the hostapd can work without mscs daemon.
+
+Signed-off-by: Howard Hsu <howard-yh.hsu@mediatek.com>
+
+---
+ hostapd/main.c                 |  13 ++
+ src/ap/hostapd.h               |   2 +
+ src/ap/ieee802_11.c            |  41 +++++-
+ src/ap/scs.c                   | 252 ++++++++++++++++++++++++++++++++-
+ src/ap/scs.h                   |  20 ++-
+ src/ap/sta_info.h              |   2 +
+ src/common/ieee802_11_common.c |   4 +
+ src/common/ieee802_11_common.h |   2 +
+ src/common/ieee802_11_defs.h   |  12 ++
+ src/drivers/driver.h           |  13 ++
+ src/drivers/driver_nl80211.c   |   3 +
+ 11 files changed, 360 insertions(+), 4 deletions(-)
+
+diff --git a/hostapd/main.c b/hostapd/main.c
+index d3346b84b..bbd41ca99 100644
+--- a/hostapd/main.c
++++ b/hostapd/main.c
+@@ -33,6 +33,10 @@
+ #include "ctrl_iface.h"
+ #include "build_features.h"
+ 
++#ifdef CONFIG_IEEE80211BE
++#include "ap/scs.h"
++#endif
++
+ struct hapd_global {
+ 	void **drv_priv;
+ 	size_t drv_count;
+@@ -1113,6 +1117,12 @@ int main(int argc, char *argv[])
+ 	hostapd_ucode_init(&interfaces);
+ 	hostapd_epcs_init(&interfaces);
+ 
++#ifdef CONFIG_IEEE80211BE
++	if (hostapd_mtk_mscs_daemon_init(&interfaces)) {
++		wpa_printf(MSG_ERROR, "Failed to start MTK MSCS daemon");
++	}
++#endif
++
+ 	if (hostapd_global_run(&interfaces, daemonize, pid_file)) {
+ 		wpa_printf(MSG_ERROR, "Failed to start eloop");
+ 		goto out;
+@@ -1121,6 +1131,9 @@ int main(int argc, char *argv[])
+ 	ret = 0;
+ 
+  out:
++#ifdef CONFIG_IEEE80211BE
++	hostapd_mtk_mscs_daemon_deinit(&interfaces);
++#endif
+ 	hostapd_epcs_free(&interfaces);
+ 	hostapd_ucode_free();
+ 	hostapd_global_ctrl_iface_deinit(&interfaces);
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index b72e3e6ed..fab4b796f 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -114,6 +114,8 @@ struct hapd_interfaces {
+ 	size_t mld_count;
+ 	int (*mld_ctrl_iface_init)(struct hostapd_mld *mld);
+ 	void (*mld_ctrl_iface_deinit)(struct hostapd_mld *mld);
++	int mtk_mscs_sock;
++	int mtk_mscs_pid;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	struct {
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index db1095d6f..6ea95cfd5 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -186,6 +186,26 @@ u8 * hostapd_eid_supp_rates(struct hostapd_data *hapd, u8 *eid)
+ 	return pos;
+ }
+ 
++u8 * hostapd_eid_mscs_desc(u8 *eid, u16 status)
++{
++	u8 *pos = eid;
++
++	*pos++ = WLAN_EID_EXTENSION; /* Element ID */
++	*pos++ = MSCS_DESCRIPTOR_FIXED_LEN + 4; /* With one subelement MSCS Status */
++	*pos++ = WLAN_EID_EXT_MSCS_DESCRIPTOR;
++	*pos++ = SCS_REQ_ADD;
++
++	os_memset(pos, 0, 6);
++	pos += 6;
++
++	/* Optional subelement */
++	*pos++ = MCSC_SUBELEM_STATUS;
++	*pos++ = 2; /* MSCS Status Subelement Length */
++	WPA_PUT_LE16(pos, status);
++	pos += 2;
++
++	return pos;
++}
+ 
+ u8 * hostapd_eid_ext_supp_rates(struct hostapd_data *hapd, u8 *eid)
+ {
+@@ -3814,6 +3834,18 @@ static u16 check_wmm(struct hostapd_data *hapd, struct sta_info *sta,
+ 	return WLAN_STATUS_SUCCESS;
+ }
+ 
++static void check_mscs_desc_elem(struct hostapd_data *hapd, struct sta_info *sta,
++				 struct ieee802_11_elems *elems)
++{
++	if (!sta || !elems->mscs_desc)
++		return;
++
++	sta->mscs_assoc_setup_status =
++		hostapd_set_mscs(hapd, sta->addr, elems->mscs_desc,
++				 elems->mscs_desc_len);
++	sta->mscs_assoc_included = 1;
++}
++
+ static u16 check_multi_ap(struct hostapd_data *hapd, struct sta_info *sta,
+ 			  const u8 *multi_ap_ie, size_t multi_ap_len)
+ {
+@@ -4412,6 +4444,8 @@ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ 	}
+ #endif /* CONFIG_IEEE80211AX */
+ #ifdef CONFIG_IEEE80211BE
++	check_mscs_desc_elem(hapd, sta, elems);
++
+ 	if (hapd->iconf->ieee80211be && !hapd->conf->disable_11be) {
+ 		resp = copy_sta_eht_capab(hapd, sta, IEEE80211_MODE_AP,
+ 					  elems->he_capabilities,
+@@ -5444,6 +5478,11 @@ rsnxe_done:
+ #endif /* CONFIG_TESTING_OPTIONS */
+ 
+ #ifdef CONFIG_IEEE80211BE
++	if (sta && sta->mscs_assoc_included) {
++		p = hostapd_eid_mscs_desc(p, sta->mscs_assoc_setup_status);
++		sta->mscs_assoc_included = 0;
++	}
++
+ 	if (hapd->iconf->ieee80211be && !hapd->conf->disable_11be) {
+ 		if (hapd->conf->mld_ap)
+ 			p = hostapd_eid_eht_ml_assoc(hapd, sta, p);
+@@ -6706,7 +6745,7 @@ static int handle_action(struct hostapd_data *hapd,
+ 		ieee802_11_rx_protected_eht_action(hapd, mgmt, len);
+ 		return 1;
+ 	case WLAN_ACTION_ROBUST_AV_STREAMING:
+-		hostapd_handle_scs(hapd, (const u8 *) mgmt, len);
++		hostapd_handle_robust_av_streaming(hapd, (const u8 *) mgmt, len);
+ 		return 1;
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+diff --git a/src/ap/scs.c b/src/ap/scs.c
+index fbdaac90e..321ed664a 100644
+--- a/src/ap/scs.c
++++ b/src/ap/scs.c
+@@ -8,8 +8,251 @@
+ #include "sta_info.h"
+ #include "ap_config.h"
+ #include "ap_drv_ops.h"
++#include "drivers/netlink.h"
++#include "drivers/priv_netlink.h"
+ #include "scs.h"
+ 
++static int send_mtk_mscs_nl_msg(struct hostapd_data *hapd,
++				 struct hostapd_mscs_desc_info *info)
++{
++	ssize_t info_len = sizeof(struct hostapd_mscs_desc_info);
++	ssize_t buf_len = info_len + sizeof(struct qos_netlink_msg);
++	struct qos_netlink_msg *qos_msg;
++	struct sockaddr_nl dest_addr;
++	struct nlmsghdr *nlh;
++	struct msghdr msg;
++	struct iovec iov;
++
++	if (!hapd->iface || !hapd->iface->interfaces ||
++	    hapd->iface->interfaces->mtk_mscs_sock <= 0) {
++		wpa_printf(MSG_ERROR, "%s: socket is not ready", __func__);
++		return -1;
++	}
++
++	nlh = (struct nlmsghdr *) os_zalloc(NLMSG_SPACE(buf_len));
++	if (!nlh) {
++		wpa_printf(MSG_ERROR, "%s: Error to alloc mem", __func__);
++		return -1;
++	}
++
++	nlh->nlmsg_len = NLMSG_SPACE(buf_len);
++	nlh->nlmsg_pid = hapd->iface->interfaces->mtk_mscs_pid;
++	nlh->nlmsg_flags = 0;
++
++	qos_msg = NLMSG_DATA(nlh);
++	qos_msg->type = MSCS_POLICY;
++	qos_msg->len = info_len;
++	os_memcpy(&qos_msg->variable[0], info, info_len);
++
++	iov.iov_base = (void *)nlh;
++	iov.iov_len = nlh->nlmsg_len;
++
++	os_memset(&dest_addr, 0, sizeof(struct sockaddr_nl));
++	dest_addr.nl_family= AF_NETLINK;
++	dest_addr.nl_pid= 0;
++	dest_addr.nl_groups= 0;
++
++	os_memset(&msg, 0, sizeof(struct msghdr));
++	msg.msg_name = (void *)&dest_addr;
++	msg.msg_namelen = sizeof(dest_addr);
++	msg.msg_iov = &iov;
++	msg.msg_iovlen = 1;
++
++	if (sendmsg(hapd->iface->interfaces->mtk_mscs_sock, &msg, 0) < 0)
++		wpa_printf(MSG_ERROR, "%s: sendmsg failed: %s",
++			   __func__, strerror(errno));
++	os_free(nlh);
++
++	return 0;
++}
++
++int hostapd_mtk_mscs_daemon_init(struct hapd_interfaces *ifaces)
++{
++	struct sockaddr_nl src_addr;
++
++	ifaces->mtk_mscs_sock = socket(PF_NETLINK, SOCK_RAW, NETLINK_QOS_CTRL);
++	if (ifaces->mtk_mscs_sock < 0) {
++		wpa_printf(MSG_ERROR, "%s: Error to create socket", __func__);
++		return -1;
++	}
++
++	ifaces->mtk_mscs_pid = getpid();
++
++	os_memset(&src_addr, 0, sizeof(src_addr));
++	src_addr.nl_family = AF_NETLINK;
++	src_addr.nl_pid = ifaces->mtk_mscs_pid;
++
++	if (bind(ifaces->mtk_mscs_sock, (struct sockaddr *) &src_addr, sizeof(src_addr)) < 0) {
++		wpa_printf(MSG_ERROR, "%s: Error to bind socket", __func__);
++		close(ifaces->mtk_mscs_sock);
++		return -1;
++	}
++
++	return 0;
++}
++
++void hostapd_mtk_mscs_daemon_deinit(struct hapd_interfaces *ifaces)
++{
++	if (ifaces->mtk_mscs_sock <= 0)
++		return;
++
++	close(ifaces->mtk_mscs_sock);
++	ifaces->mtk_mscs_sock = 0;
++	ifaces->mtk_mscs_pid = 0;
++}
++
++static void send_mscs_response(struct hostapd_data *hapd, const u8 *da,
++			       u8 dialog_token, u16 status)
++{
++	struct wpabuf *buf;
++	size_t len = 5;
++
++	/* Reference to 802_11be_D5.0 Figure 9-960 */
++	buf = wpabuf_alloc(len);
++	if (!buf)
++		return;
++
++	wpabuf_put_u8(buf, WLAN_ACTION_ROBUST_AV_STREAMING);
++	wpabuf_put_u8(buf, ROBUST_AV_MSCS_RESP);
++	wpabuf_put_u8(buf, dialog_token);
++	wpabuf_put_le16(buf, status);
++
++	len = wpabuf_len(buf);
++	hostapd_drv_send_action(hapd, hapd->iface->freq, 0, da,
++				wpabuf_head(buf), len);
++	wpabuf_free(buf);
++}
++
++static u16 hostapd_parse_mscs_desc_elem(struct hostapd_mscs_desc_info *info,
++					const u8 *pos, size_t len)
++{
++#define FRAME_CLASS_TYPE_IP_AND_HIGHER_PARAMS 4
++	bool tclas_mask_required = true;
++	const struct element *elem;
++
++	/* Check for enough bytes: (1B)Req Type + (2B)User Priority Control +
++	 * (4B) Stream Timeout.
++	 */
++	if (!pos || len < MSCS_DESCRIPTOR_FIXED_LEN - 1) {
++		wpa_printf(MSG_ERROR, "%s MSCS Desc len %zu is not enough!",
++			   __func__, len);
++		return WLAN_STATUS_REQUEST_DECLINED;
++	}
++
++	info->req_type = *pos++;
++	info->up_bitmap = *pos++;
++	info->up_limit = *pos++ & 0x7;
++	info->stream_timeout = WPA_GET_LE32(pos);
++	pos += 4;
++
++	switch (info->req_type) {
++	case SCS_REQ_REMOVE:
++		tclas_mask_required = false;
++		break;
++	case SCS_REQ_ADD:
++	case SCS_REQ_CHANGE:
++		break;
++	default:
++		wpa_printf(MSG_ERROR, "%s Unsupported MSCS req type %u!",
++			   __func__, info->req_type);
++		return WLAN_STATUS_REQUEST_DECLINED;
++	}
++
++	for_each_element(elem, pos, len - 7) {
++		switch (elem->id) {
++		case WLAN_EID_EXTENSION:
++			if (elem->data[0] != WLAN_EID_EXT_TCLAS_MASK) {
++				wpa_printf(MSG_ERROR, "%s: Unexpected ext element %d",
++					   __func__, elem->data[0]);
++
++				return WLAN_STATUS_REQUEST_DECLINED;
++			}
++
++			if (!tclas_mask_required)
++				return WLAN_STATUS_REQUEST_DECLINED;
++
++			info->classifier_type = elem->data[1];
++			info->classifier_mask = elem->data[2];
++			break;
++		default:
++			/* the rest elements would be ignored now. */
++			break;
++		}
++	}
++
++	switch (info->req_type) {
++	case SCS_REQ_ADD:
++	case SCS_REQ_CHANGE:
++		if (info->classifier_type != FRAME_CLASS_TYPE_IP_AND_HIGHER_PARAMS) {
++			wpa_printf(MSG_ERROR, "%s: Unsupported Classifier type.\n",
++				   __func__);
++			return WLAN_STATUS_REQUESTED_TCLAS_NOT_SUPPORTED;
++		}
++
++		return WLAN_STATUS_SUCCESS;
++	case SCS_REQ_REMOVE:
++		return WLAN_STATUS_TCLAS_PROCESSING_TERMINATED;
++	default:
++		return WLAN_STATUS_REQUEST_DECLINED;
++	}
++}
++
++u16 hostapd_set_mscs(struct hostapd_data *hapd, const u8 *addr,
++		     const u8 *elem, size_t elem_len)
++{
++	struct hostapd_mscs_desc_info info;
++	u16 status;
++
++	os_memset(&info, 0, sizeof(info));
++	os_memcpy(info.peer_addr, addr, ETH_ALEN);
++
++	status = hostapd_parse_mscs_desc_elem(&info, elem, elem_len);
++
++	switch (status) {
++	case WLAN_STATUS_SUCCESS:
++	case WLAN_STATUS_TCLAS_PROCESSING_TERMINATED:
++		if (send_mtk_mscs_nl_msg(hapd, &info))
++			status = WLAN_STATUS_REQUEST_DECLINED;
++		break;
++	case WLAN_STATUS_REQUEST_DECLINED:
++	default:
++		break;
++	}
++
++	return status;
++}
++
++static void hostapd_handle_mscs_req(struct hostapd_data *hapd,
++				    const u8 *buf, size_t len)
++{
++	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
++	const struct element *elem;
++	struct sta_info *sta;
++	u8 token;
++
++	sta = ap_get_sta(hapd, mgmt->sa);
++	if (!sta) {
++		wpa_printf(MSG_ERROR, "Station " MACSTR " not found "
++			   "for MSCS Request frame", MAC2STR(mgmt->sa));
++		return;
++	}
++
++	token = mgmt->u.action.u.mscs.dialog_token;
++	elem = (const struct element *) mgmt->u.action.u.mscs.variable;
++
++	if (elem->id != WLAN_EID_EXTENSION ||
++	    elem->data[0] != WLAN_EID_EXT_MSCS_DESCRIPTOR) {
++		wpa_printf(MSG_ERROR, "%s: no MSCS Descriptor element", __func__);
++		return;
++	}
++
++	sta->mscs_assoc_setup_status =
++		hostapd_set_mscs(hapd, mgmt->sa, &elem->data[1], elem->datalen - 1);
++
++	send_mscs_response(hapd, mgmt->sa, token,
++			   sta->mscs_assoc_setup_status);
++}
++
+ static bool hostapd_find_scs_session(struct sta_info *sta, u8 scsid,
+ 				     int *session_idx)
+ {
+@@ -219,7 +462,8 @@ static void hostapd_handle_scs_req(struct hostapd_data *hapd,
+ 	send_scs_response(hapd, scs_status_list, mgmt->sa, token, index);
+ }
+ 
+-void hostapd_handle_scs(struct hostapd_data *hapd, const u8 *buf, size_t len)
++void hostapd_handle_robust_av_streaming(struct hostapd_data *hapd, const u8 *buf,
++					size_t len)
+ {
+ 	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
+ 
+@@ -228,7 +472,7 @@ void hostapd_handle_scs(struct hostapd_data *hapd, const u8 *buf, size_t len)
+ 	 * (1B)Dialog Token.
+ 	 */
+ 	if (len < IEEE80211_HDRLEN + 3) {
+-		wpa_printf(MSG_ERROR, "%s SCS frame len %lu is not enough!",
++		wpa_printf(MSG_ERROR, "%s Robust AV frame len %zu is not enough!",
+ 			   __func__, len);
+ 		return;
+ 	}
+@@ -237,7 +481,11 @@ void hostapd_handle_scs(struct hostapd_data *hapd, const u8 *buf, size_t len)
+ 	case ROBUST_AV_SCS_REQ:
+ 		hostapd_handle_scs_req(hapd, buf, len);
+ 		break;
++	case ROBUST_AV_MSCS_REQ:
++		hostapd_handle_mscs_req(hapd, buf, len);
++		break;
+ 	case ROBUST_AV_SCS_RESP:
++	case ROBUST_AV_MSCS_RESP:
+ 		/* Not supported yet. */
+ 		break;
+ 	default:
+diff --git a/src/ap/scs.h b/src/ap/scs.h
+index 1b75af2ed..825039ea5 100644
+--- a/src/ap/scs.h
++++ b/src/ap/scs.h
+@@ -16,5 +16,23 @@ struct scs_session_status {
+ 	bool alive;
+ };
+ 
+-void hostapd_handle_scs(struct hostapd_data *hapd, const u8 *buf, size_t len);
++struct qos_netlink_msg {
++    u8 type;
++    u8 rsv;
++    u16 len;
++    u8 variable[];
++};
++
++enum qos_netlink_type {
++	MSCS_POLICY,
++};
++
++#define NETLINK_QOS_CTRL 27
++
++void hostapd_handle_robust_av_streaming(struct hostapd_data *hapd,
++					const u8 *buf, size_t len);
++u16 hostapd_set_mscs(struct hostapd_data *hapd, const u8 *addr,
++		     const u8 *pos, size_t len);
++int hostapd_mtk_mscs_daemon_init(struct hapd_interfaces *ifaces);
++void hostapd_mtk_mscs_daemon_deinit(struct hapd_interfaces *ifaces);
+ #endif
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index 76866dab0..55efb2932 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -150,6 +150,7 @@ struct sta_info {
+ 	unsigned int ft_over_ds:1;
+ 	unsigned int external_dh_updated:1;
+ 	unsigned int post_csa_sa_query:1;
++	unsigned int mscs_assoc_included:1;
+ 
+ 	u16 auth_alg;
+ 
+@@ -329,6 +330,7 @@ struct sta_info {
+ 	struct sta_info *mld_assoc_sta;
+ 	struct scs_session_status scs_session[SCS_MAX_CFG_CNT];
+ 	struct ieee80211_neg_ttlm neg_ttlm;
++	u16 mscs_assoc_setup_status;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	u16 max_idle_period; /* if nonzero, the granted BSS max idle period in
+diff --git a/src/common/ieee802_11_common.c b/src/common/ieee802_11_common.c
+index 641ea504b..8c49a5ac8 100644
+--- a/src/common/ieee802_11_common.c
++++ b/src/common/ieee802_11_common.c
+@@ -405,6 +405,10 @@ static int ieee802_11_parse_extension(const u8 *pos, size_t elen,
+ 		elems->eht_operation = pos;
+ 		elems->eht_operation_len = elen;
+ 		break;
++	case WLAN_EID_EXT_MSCS_DESCRIPTOR:
++		elems->mscs_desc = pos;
++		elems->mscs_desc_len = elen;
++		break;
+ 	case WLAN_EID_EXT_MULTI_LINK:
+ 		if (elen < 2)
+ 			break;
+diff --git a/src/common/ieee802_11_common.h b/src/common/ieee802_11_common.h
+index 692d4c418..adca0bce8 100644
+--- a/src/common/ieee802_11_common.h
++++ b/src/common/ieee802_11_common.h
+@@ -123,6 +123,7 @@ struct ieee802_11_elems {
+ 	const u8 *rsnxe_override;
+ 	const u8 *rsn_selection;
+ 	const u8 *wfa_capab;
++	const u8 *mscs_desc;
+ 
+ 	u8 ssid_len;
+ 	u8 supp_rates_len;
+@@ -194,6 +195,7 @@ struct ieee802_11_elems {
+ 	size_t rsnxe_override_len;
+ 	size_t rsn_selection_len;
+ 	u8 wfa_capab_len;
++	size_t mscs_desc_len;
+ 
+ 	struct mb_ies_info mb_ies;
+ 
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 20977cdb5..0a3fee096 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -1267,6 +1267,11 @@ struct ieee80211_mgmt {
+ 					u8 dialog_token;
+ 					u8 variable[];
+ 				} STRUCT_PACKED scs;
++				struct {
++					u8 action;
++					u8 dialog_token;
++					u8 variable[];
++				} STRUCT_PACKED mscs;
+ 			} u;
+ 		} STRUCT_PACKED action;
+ 	} u;
+@@ -3192,6 +3197,13 @@ enum mscs_description_subelem {
+ 	MCSC_SUBELEM_STATUS = 1,
+ };
+ 
++/*
++ * MSCS Descriptor element fixed field
++ * Element ID Extension(1) + Request Type(1) + User Priority Control(2) +
++ * Stream Timeout(4)
++ */
++#define MSCS_DESCRIPTOR_FIXED_LEN 8
++
+ /*
+  * IEEE Std 802.11-2020, 9.6.7.36 FILS Discovery frame format,
+  * Figure 9-900 - FILS Discovery Frame Control subfield format
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 38a724d58..8a515d2f6 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -95,6 +95,19 @@ struct hostapd_scs_desc_info {
+ 	u8 qos_ie_len;
+ };
+ 
++/**
++ * struct hostapd_mscs_desc_info - MSCS Req information
++ */
++struct hostapd_mscs_desc_info {
++	u8 peer_addr[ETH_ALEN];
++	u8 req_type;
++	u8 up_bitmap;
++	u32 stream_timeout;
++	u8 up_limit;
++	u8 classifier_type;
++	u8 classifier_mask;
++};
++
+ /**
+  * enum reg_change_initiator - Regulatory change initiator
+  */
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 4bce8c508..537fd8b38 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -3032,6 +3032,9 @@ static int nl80211_action_subscribe_ap(struct i802_bss *bss)
+ 	/* Robust AV SCS Request */
+ 	if (nl80211_register_action_frame(bss, (u8 *) "\x13\x00", 2) < 0)
+ 		ret = -1;
++	/* Robust AV MSCS Request */
++	if (nl80211_register_action_frame(bss, (u8 *) "\x13\x04", 2) < 0)
++		ret = -1;
+ 	/* Vendor-specific */
+ 	if (nl80211_register_action_frame(bss, (u8 *) "\x7f", 1) < 0)
+ 		ret = -1;
+-- 
+2.45.2
+

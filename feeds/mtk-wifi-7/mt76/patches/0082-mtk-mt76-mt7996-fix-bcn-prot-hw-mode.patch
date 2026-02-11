@@ -1,0 +1,152 @@
+From 9d78637bb61745d985a23a4f2178ab06a75c829a Mon Sep 17 00:00:00 2001
+From: Peter Chiu <chui-hao.chiu@mediatek.com>
+Date: Wed, 16 Apr 2025 11:04:00 +0800
+Subject: [PATCH 082/123] mtk: mt76: mt7996: fix bcn prot hw mode
+
+Fix beacon protection hw mode.
+1. Set TXD_BIP when it is beacon and beacon protection is enabled.
+2. Set TXD_WLAN_IDX to BMC wcid when it is beacon and beacon
+protection is enabled.
+3. Update beacon content after add beacon bigtk. Remove beacon before
+adding new beacon content to update the beacon TxD.
+
+Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
+---
+ mt76.h        |  1 +
+ mt7996/mac.c  |  3 ++-
+ mt7996/main.c | 11 +++++++++--
+ mt7996/mcu.c  | 19 +++++++++++++++++--
+ 4 files changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/mt76.h b/mt76.h
+index 23382d5d..181cfd4d 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -457,6 +457,7 @@ struct mt76_wcid {
+ 	u8 amsdu:1;
+ 	u8 phy_idx:2;
+ 	u8 link_id:4;
++	u8 hw_bcn_prot:1;
+ 	bool link_valid;
+ 
+ 	u8 rx_check_pn;
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index 5fe3cddd..f1eadf89 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -821,7 +821,8 @@ mt7996_mac_write_txwi_80211(struct mt7996_dev *dev, __le32 *txwi,
+ 	    info->flags & IEEE80211_TX_CTL_USE_MINRATE)
+ 		val |= MT_TXD1_FIXED_RATE;
+ 
+-	if (key && multicast && ieee80211_is_robust_mgmt_frame(skb)) {
++	if ((key && multicast && ieee80211_is_robust_mgmt_frame(skb)) ||
++	    (ieee80211_is_beacon(fc) && wcid->hw_bcn_prot)) {
+ 		val |= MT_TXD1_BIP;
+ 		txwi[3] &= ~cpu_to_le32(MT_TXD3_PROTECT_FRAME);
+ 	}
+diff --git a/mt7996/main.c b/mt7996/main.c
+index 5895294d..6102b099 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -692,6 +692,7 @@ static int mt7996_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 	int err = 0;
+ 	unsigned long add;
+ 	unsigned int link_id;
++	bool is_bigtk = idx == 6 || idx == 7;
+ 
+ 	if (cmd != SET_KEY && cmd != DISABLE_KEY)
+ 		return -EINVAL;
+@@ -739,7 +740,7 @@ static int mt7996_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 		case WLAN_CIPHER_SUITE_BIP_CMAC_256:
+ 		case WLAN_CIPHER_SUITE_BIP_GMAC_128:
+ 		case WLAN_CIPHER_SUITE_BIP_GMAC_256:
+-			if (key->keyidx == 6 || key->keyidx == 7) {
++			if (is_bigtk) {
+ 				wcid_keyidx = &msta_link->wcid.hw_key_idx2;
+ 				key->flags |= IEEE80211_KEY_FLAG_GENERATE_MMIE;
+ 				break;
+@@ -765,7 +766,7 @@ static int mt7996_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 		}
+ 
+ 		/* To remove BIGTK independently, FW needs an extra inband command */
+-		if (cmd == DISABLE_KEY && !(idx == 6 || idx == 7))
++		if (cmd == DISABLE_KEY && !is_bigtk)
+ 			goto out;
+ 
+ 		mt76_wcid_key_setup(&dev->mt76, &msta_link->wcid, key);
+@@ -773,6 +774,12 @@ static int mt7996_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 		err = mt7996_mcu_add_key(&dev->mt76, mconf, key,
+ 					 MCU_WMWA_UNI_CMD(STA_REC_UPDATE),
+ 					 &msta_link->wcid, cmd);
++
++		if (cmd == SET_KEY && is_bigtk && conf && conf->enable_beacon) {
++			/* Remove beacon first to update beacon Txd for beacon protection */
++			mt7996_mcu_add_beacon(hw, vif, conf, false);
++			mt7996_mcu_add_beacon(hw, vif, conf, true);
++		}
+ 	}
+ out:
+ 	mutex_unlock(&dev->mt76.mutex);
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 88026725..32561aed 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -3718,11 +3718,20 @@ mt7996_mcu_sta_key_tlv(struct mt76_dev *dev,
+ 				sec_key->cipher_id = MCU_CIPHER_BCN_PROT_GMAC_256;
+ 				break;
+ 			case WLAN_CIPHER_SUITE_BIP_CMAC_256:
++				if (is_mt7990(dev)) {
++					sec_key->cipher_id = MCU_CIPHER_BCN_PROT_CMAC_256;
++					break;
++				}
++				fallthrough;
+ 			default:
+ 				dev_err(dev->dev, "Unsupported BIGTK cipher\n");
+ 				return -EOPNOTSUPP;
+ 			}
+ 			sec_key->bcn_mode = BP_SW_MODE;
++			if (is_mt7990(dev)) {
++				sec_key->bcn_mode = BP_HW_MODE;
++				wcid->hw_bcn_prot = true;
++			}
+ 		}
+ 
+ 		if (cipher == MCU_CIPHER_TKIP) {
+@@ -3734,6 +3743,8 @@ mt7996_mcu_sta_key_tlv(struct mt76_dev *dev,
+ 		/* connac3 fw use set key action to apply removing bigtk and other
+ 		 * group keys should just use set key to overwrite the old ones. */
+ 		sec->add = SET_KEY;
++		if (is_mt7990(dev) && (sec_key->key_id == 6 || sec_key->key_id == 7))
++			wcid->hw_bcn_prot = false;
+ 	}
+ 
+ 	return 0;
+@@ -4225,11 +4236,15 @@ mt7996_mcu_beacon_cont(struct mt7996_dev *dev,
+ 		       struct ieee80211_bss_conf *link_conf,
+ 		       struct sk_buff *rskb, struct sk_buff *skb,
+ 		       struct bss_bcn_content_tlv *bcn,
+-		       struct ieee80211_mutable_offsets *offs)
++		       struct ieee80211_mutable_offsets *offs,
++		       struct mt7996_vif_link *link)
+ {
+ 	struct mt76_wcid *wcid = &dev->mt76.global_wcid;
+ 	u8 *buf;
+ 
++	if (link->msta_link.wcid.hw_bcn_prot)
++		wcid = &link->msta_link.wcid;
++
+ 	bcn->pkt_len = cpu_to_le16(MT_TXD_SIZE + skb->len);
+ 	bcn->tim_ie_pos = cpu_to_le16(offs->tim_offset);
+ 
+@@ -4548,7 +4563,7 @@ int mt7996_mcu_add_beacon(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	}
+ 
+ 	mt7996_parse_mbssid_elems(link->phy, skb, offs.mbssid_off, mbssid_data);
+-	mt7996_mcu_beacon_cont(dev, link_conf, rskb, skb, bcn, &offs);
++	mt7996_mcu_beacon_cont(dev, link_conf, rskb, skb, bcn, &offs, link);
+ 	if (link_conf->bssid_indicator)
+ 		mt7996_mcu_beacon_mbss(rskb, skb, bcn, &offs, mbssid_data);
+ 	mt7996_mcu_beacon_cntdwn(rskb, skb, &offs, link_conf->csa_active);
+-- 
+2.45.2
+

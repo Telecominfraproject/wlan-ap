@@ -1,0 +1,495 @@
+From 48908a19c9127a4a29e11443ff52f88deae22cf5 Mon Sep 17 00:00:00 2001
+From: Allen Ye <allen.ye@mediatek.com>
+Date: Thu, 16 Jan 2025 18:08:33 +0800
+Subject: [PATCH 156/236] mtk: hostapd: FT: Add AP FT-Assoc mld support
+
+Add AP ftie mlo groups support and add fragmentation of ftie in case
+multi-links may cause the length of ftie larger than 255.
+
+Signed-off-by: Allen Ye <allen.ye@mediatek.com>
+---
+ src/ap/drv_callbacks.c |   2 +-
+ src/ap/ieee802_11.c    |   3 +-
+ src/ap/wpa_auth.h      |   2 +-
+ src/ap/wpa_auth_ft.c   | 273 ++++++++++++++++++++++++++++++-----------
+ 4 files changed, 208 insertions(+), 72 deletions(-)
+
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index d2890920e..88da61ac8 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -799,7 +799,7 @@ skip_wpa_check:
+ #ifdef CONFIG_IEEE80211R_AP
+ 	p = wpa_sm_write_assoc_resp_ies(sta->wpa_sm, buf, sizeof(buf),
+ 					sta->auth_alg, req_ies, req_ies_len,
+-					!elems.rsnxe);
++					!elems.rsnxe, ap_sta_is_mld(hapd, sta));
+ 	if (!p) {
+ 		wpa_printf(MSG_DEBUG, "FT: Failed to write AssocResp IEs");
+ 		return WLAN_STATUS_UNSPECIFIED_FAILURE;
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 20bf18d77..0fad7c6d0 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -5349,7 +5349,8 @@ static u16 send_assoc_resp(struct hostapd_data *hapd, struct sta_info *sta,
+ 		p = wpa_sm_write_assoc_resp_ies(sta->wpa_sm, p,
+ 						buf + buflen - p,
+ 						sta->auth_alg, ies, ies_len,
+-						omit_rsnxe);
++						omit_rsnxe,
++						ap_sta_is_mld(hapd, sta));
+ 		if (!p) {
+ 			wpa_printf(MSG_DEBUG,
+ 				   "FT: Failed to write AssocResp IEs");
+diff --git a/src/ap/wpa_auth.h b/src/ap/wpa_auth.h
+index 305c1c99b..35e93e497 100644
+--- a/src/ap/wpa_auth.h
++++ b/src/ap/wpa_auth.h
+@@ -554,7 +554,7 @@ void wpa_auth_eapol_key_tx_status(struct wpa_authenticator *wpa_auth,
+ u8 * wpa_sm_write_assoc_resp_ies(struct wpa_state_machine *sm, u8 *pos,
+ 				 size_t max_len, int auth_alg,
+ 				 const u8 *req_ies, size_t req_ies_len,
+-				 int omit_rsnxe);
++				 int omit_rsnxe, bool mld_sta);
+ void wpa_ft_process_auth(struct wpa_state_machine *sm,
+ 			 u16 auth_transaction, const u8 *ies, size_t ies_len,
+ 			 void (*cb)(void *ctx, const u8 *dst,
+diff --git a/src/ap/wpa_auth_ft.c b/src/ap/wpa_auth_ft.c
+index 209e2507a..c5f6dc884 100644
+--- a/src/ap/wpa_auth_ft.c
++++ b/src/ap/wpa_auth_ft.c
+@@ -2213,7 +2213,8 @@ static inline int wpa_auth_get_seqnum(struct wpa_authenticator *wpa_auth,
+ }
+ 
+ 
+-static u8 * wpa_ft_gtk_subelem(struct wpa_state_machine *sm, size_t *len)
++static u8 * wpa_ft_gtk_subelem(struct wpa_state_machine *sm, size_t *len,
++			       int link_id)
+ {
+ 	u8 *subelem;
+ 	struct wpa_auth_config *conf = &sm->wpa_auth->conf;
+@@ -2224,6 +2225,8 @@ static u8 * wpa_ft_gtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ 	u8 keybuf[WPA_GTK_MAX_LEN];
+ 	const u8 *kek;
+ 	size_t kek_len;
++	bool is_mld = false;
++	size_t offset;
+ 
+ 	if (wpa_key_mgmt_fils(sm->wpa_key_mgmt)) {
+ 		kek = sm->PTK.kek2;
+@@ -2233,6 +2236,14 @@ static u8 * wpa_ft_gtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ 		kek_len = sm->PTK.kek_len;
+ 	}
+ 
++#ifdef CONFIG_IEEE80211BE
++	if (link_id >= 0 && link_id < MAX_NUM_MLD_LINKS &&
++	    sm->mld_links[link_id].valid) {
++		is_mld = true;
++		conf = &sm->mld_links[link_id].wpa_auth->conf;
++		gsm = sm->mld_links[link_id].wpa_auth->group;
++	}
++#endif
+ 	key_len = gsm->GTK_len;
+ 	if (key_len > sizeof(keybuf))
+ 		return NULL;
+@@ -2273,21 +2284,32 @@ static u8 * wpa_ft_gtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ 	}
+ 
+ 	/*
+-	 * Sub-elem ID[1] | Length[1] | Key Info[2] | Key Length[1] | RSC[8] |
+-	 * Key[5..32].
++	 * Sub-elem ID[1] | Length[1] | Key Info[2] | [Link ID Info[1]] |
++	 * Key Length[1] | RSC[8] | Key[5..32].
+ 	 */
+ 	subelem_len = 13 + key_len + 8;
++	if (is_mld)
++		subelem_len += 1;
+ 	subelem = os_zalloc(subelem_len);
+ 	if (subelem == NULL)
+ 		return NULL;
+ 
+-	subelem[0] = FTIE_SUBELEM_GTK;
+-	subelem[1] = 11 + key_len + 8;
++	if (!is_mld) {
++		subelem[0] = FTIE_SUBELEM_GTK;
++		subelem[1] = 11 + key_len + 8;
++		subelem[4] = gsm->GTK_len;
++		offset = 5;
++	} else {
++		subelem[0] = FTIE_SUBELEM_MLO_GTK;
++		subelem[1] = 12 + key_len + 8;
++		subelem[4] = link_id;
++		subelem[5] = gsm->GTK_len;
++		offset = 6;
++	}
+ 	/* Key ID in B0-B1 of Key Info */
+ 	WPA_PUT_LE16(&subelem[2], gsm->GN & 0x03);
+-	subelem[4] = gsm->GTK_len;
+-	wpa_auth_get_seqnum(sm->wpa_auth, NULL, gsm->GN, subelem + 5);
+-	if (aes_wrap(kek, kek_len, key_len / 8, key, subelem + 13)) {
++	wpa_auth_get_seqnum(sm->wpa_auth, NULL, gsm->GN, subelem + offset);
++	if (aes_wrap(kek, kek_len, key_len / 8, key, subelem + offset + 8)) {
+ 		wpa_printf(MSG_DEBUG,
+ 			   "FT: GTK subelem encryption failed: kek_len=%d",
+ 			   (int) kek_len);
+@@ -2302,7 +2324,8 @@ static u8 * wpa_ft_gtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ }
+ 
+ 
+-static u8 * wpa_ft_igtk_subelem(struct wpa_state_machine *sm, size_t *len)
++static u8 * wpa_ft_igtk_subelem(struct wpa_state_machine *sm, size_t *len,
++				int link_id)
+ {
+ 	u8 *subelem, *pos;
+ 	struct wpa_auth_config *conf = &sm->wpa_auth->conf;
+@@ -2312,6 +2335,7 @@ static u8 * wpa_ft_igtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ 	size_t kek_len;
+ 	size_t igtk_len;
+ 	u8 stub_igtk[WPA_IGTK_MAX_LEN];
++	bool is_mld = false;
+ 
+ 	if (wpa_key_mgmt_fils(sm->wpa_key_mgmt)) {
+ 		kek = sm->PTK.kek2;
+@@ -2321,22 +2345,36 @@ static u8 * wpa_ft_igtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ 		kek_len = sm->PTK.kek_len;
+ 	}
+ 
++#ifdef CONFIG_IEEE80211BE
++	if (link_id >= 0 && link_id < MAX_NUM_MLD_LINKS &&
++	    sm->mld_links[link_id].valid) {
++		is_mld = true;
++		conf = &sm->mld_links[link_id].wpa_auth->conf;
++		gsm = sm->mld_links[link_id].wpa_auth->group;
++	}
++#endif
+ 	igtk_len = wpa_cipher_key_len(sm->wpa_auth->conf.group_mgmt_cipher);
+ 
+-	/* Sub-elem ID[1] | Length[1] | KeyID[2] | IPN[6] | Key Length[1] |
+-	 * Key[16+8] */
++	/*
++	 * Sub-elem ID[1] | Length[1] | KeyID[2] | IPN[6] | [Link ID Info[1]] |
++	 * Key Length[1] | Key[16+8].
++	 */
+ 	subelem_len = 1 + 1 + 2 + 6 + 1 + igtk_len + 8;
++	if (is_mld)
++		subelem_len += 1;
+ 	subelem = os_zalloc(subelem_len);
+ 	if (subelem == NULL)
+ 		return NULL;
+ 
+ 	pos = subelem;
+-	*pos++ = FTIE_SUBELEM_IGTK;
++	*pos++ = is_mld ? FTIE_SUBELEM_MLO_IGTK : FTIE_SUBELEM_IGTK;
+ 	*pos++ = subelem_len - 2;
+ 	WPA_PUT_LE16(pos, gsm->GN_igtk);
+ 	pos += 2;
+ 	wpa_auth_get_seqnum(sm->wpa_auth, NULL, gsm->GN_igtk, pos);
+ 	pos += 6;
++	if (is_mld)
++		*pos++ = link_id;
+ 	*pos++ = igtk_len;
+ 	igtk = gsm->IGTK[gsm->GN_igtk - 4];
+ 	if (conf->disable_gtk) {
+@@ -2363,7 +2401,8 @@ static u8 * wpa_ft_igtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ }
+ 
+ 
+-static u8 * wpa_ft_bigtk_subelem(struct wpa_state_machine *sm, size_t *len)
++static u8 * wpa_ft_bigtk_subelem(struct wpa_state_machine *sm, size_t *len,
++				 int link_id)
+ {
+ 	u8 *subelem, *pos;
+ 	struct wpa_authenticator *wpa_auth = sm->wpa_auth;
+@@ -2372,6 +2411,7 @@ static u8 * wpa_ft_bigtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ 	const u8 *kek, *bigtk;
+ 	size_t kek_len;
+ 	size_t bigtk_len;
++	bool is_mld = false;
+ 
+ 	if (wpa_key_mgmt_fils(sm->wpa_key_mgmt)) {
+ 		kek = sm->PTK.kek2;
+@@ -2381,22 +2421,36 @@ static u8 * wpa_ft_bigtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ 		kek_len = sm->PTK.kek_len;
+ 	}
+ 
++#ifdef CONFIG_IEEE80211BE
++	if (link_id >= 0 && link_id < MAX_NUM_MLD_LINKS &&
++	    sm->mld_links[link_id].valid) {
++		is_mld = true;
++		wpa_auth = sm->mld_links[link_id].wpa_auth;
++		gsm = sm->mld_links[link_id].wpa_auth->group;
++	}
++#endif
+ 	bigtk_len = wpa_cipher_key_len(wpa_auth->conf.group_mgmt_cipher);
+ 
+-	/* Sub-elem ID[1] | Length[1] | KeyID[2] | BIPN[6] | Key Length[1] |
+-	 * Key[16+8] */
++	/*
++	 * Sub-elem ID[1] | Length[1] | KeyID[2] | BIPN[6] |
++	 * [Link ID Info[1]] | Key Length[1] | Key[16+8].
++	 */
+ 	subelem_len = 1 + 1 + 2 + 6 + 1 + bigtk_len + 8;
++	if (is_mld)
++		subelem_len += 1;
+ 	subelem = os_zalloc(subelem_len);
+ 	if (subelem == NULL)
+ 		return NULL;
+ 
+ 	pos = subelem;
+-	*pos++ = FTIE_SUBELEM_BIGTK;
++	*pos++ = is_mld ? FTIE_SUBELEM_MLO_BIGTK : FTIE_SUBELEM_BIGTK;
+ 	*pos++ = subelem_len - 2;
+ 	WPA_PUT_LE16(pos, gsm->GN_bigtk);
+ 	pos += 2;
+ 	wpa_auth_get_seqnum(wpa_auth, NULL, gsm->GN_bigtk, pos);
+ 	pos += 6;
++	if (is_mld)
++		*pos++ = link_id;
+ 	*pos++ = bigtk_len;
+ 	bigtk = gsm->BIGTK[gsm->GN_bigtk - 6];
+ 	if (aes_wrap(kek, kek_len, bigtk_len / 8, bigtk, pos)) {
+@@ -2412,6 +2466,75 @@ static u8 * wpa_ft_bigtk_subelem(struct wpa_state_machine *sm, size_t *len)
+ }
+ 
+ 
++static u8 * wpa_ft_group_key_subelem(struct wpa_state_machine *sm, size_t *len,
++				  int link_id)
++{
++	u8 *subelem;
++	struct wpa_auth_config *conf;
++
++#ifdef CONFIG_IEEE80211BE
++	if (link_id >= 0 && link_id < MAX_NUM_MLD_LINKS)
++		conf = &sm->mld_links[link_id].wpa_auth->conf;
++	else
++#endif /* CONFIG_IEEE80211BE */
++		conf = &sm->wpa_auth->conf;
++
++	subelem = wpa_ft_gtk_subelem(sm, len, link_id);
++	if (!subelem) {
++		wpa_printf(MSG_DEBUG, "FT: Failed to add GTK subelement");
++		return NULL;
++	}
++	if (conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {
++		u8 *igtk;
++		size_t igtk_len;
++		u8 *nbuf;
++
++		igtk = wpa_ft_igtk_subelem(sm, &igtk_len, link_id);
++		if (!igtk) {
++			wpa_printf(MSG_DEBUG, "FT: Failed to add IGTK"
++				   "subelement");
++			os_free(subelem);
++			return NULL;
++		}
++		nbuf = os_realloc(subelem, *len + igtk_len);
++		if (!nbuf) {
++			os_free(subelem);
++			os_free(igtk);
++			return NULL;
++		}
++		subelem = nbuf;
++		os_memcpy(subelem + *len, igtk, igtk_len);
++		*len += igtk_len;
++		os_free(igtk);
++
++		if (conf->beacon_prot) {
++			u8 *bigtk;
++			size_t bigtk_len;
++
++			bigtk = wpa_ft_bigtk_subelem(sm, &bigtk_len, link_id);
++			if (!bigtk) {
++				wpa_printf(MSG_DEBUG, "FT: Failed to add BIGTK"
++					   "subelement");
++				os_free(subelem);
++				return NULL;
++			}
++			nbuf = os_realloc(subelem, *len + bigtk_len);
++			if (!nbuf) {
++				os_free(subelem);
++				os_free(bigtk);
++				return NULL;
++			}
++			subelem = nbuf;
++			os_memcpy(subelem + *len, bigtk, bigtk_len);
++			*len += bigtk_len;
++			os_free(bigtk);
++		}
++	}
++
++	return subelem;
++}
++
++
+ static u8 * wpa_ft_process_rdie(struct wpa_state_machine *sm,
+ 				u8 *pos, u8 *end, u8 id, u8 descr_count,
+ 				const u8 *ies, size_t ies_len)
+@@ -2546,10 +2669,10 @@ static u8 * wpa_ft_process_ric(struct wpa_state_machine *sm, u8 *pos, u8 *end,
+ u8 * wpa_sm_write_assoc_resp_ies(struct wpa_state_machine *sm, u8 *pos,
+ 				 size_t max_len, int auth_alg,
+ 				 const u8 *req_ies, size_t req_ies_len,
+-				 int omit_rsnxe)
++				 int omit_rsnxe, bool mld_sta)
+ {
+ 	u8 *end, *mdie, *ftie, *rsnie = NULL, *r0kh_id, *subelem = NULL;
+-	u8 *fte_mic, *elem_count;
++	u8 *fte_mic, *elem_count, *buf;
+ 	size_t mdie_len, ftie_len, rsnie_len = 0, r0kh_id_len, subelem_len = 0;
+ 	u8 rsnxe_buf[10], *rsnxe = rsnxe_buf;
+ 	size_t rsnxe_len;
+@@ -2562,6 +2685,7 @@ u8 * wpa_sm_write_assoc_resp_ies(struct wpa_state_machine *sm, u8 *pos,
+ 	const u8 *kck;
+ 	size_t kck_len;
+ 	size_t key_len;
++	size_t slice_len;
+ 
+ 	if (sm == NULL)
+ 		return pos;
+@@ -2636,60 +2760,51 @@ u8 * wpa_sm_write_assoc_resp_ies(struct wpa_state_machine *sm, u8 *pos,
+ 
+ 	/* Fast BSS Transition Information */
+ 	if (auth_alg == WLAN_AUTH_FT) {
+-		subelem = wpa_ft_gtk_subelem(sm, &subelem_len);
+-		if (!subelem) {
+-			wpa_printf(MSG_DEBUG,
+-				   "FT: Failed to add GTK subelement");
+-			return NULL;
+-		}
+ 		r0kh_id = sm->r0kh_id;
+ 		r0kh_id_len = sm->r0kh_id_len;
+ 		anonce = sm->ANonce;
+ 		snonce = sm->SNonce;
+-		if (sm->mgmt_frame_prot) {
+-			u8 *igtk;
+-			size_t igtk_len;
+-			u8 *nbuf;
+-			igtk = wpa_ft_igtk_subelem(sm, &igtk_len);
+-			if (igtk == NULL) {
+-				wpa_printf(MSG_DEBUG,
+-					   "FT: Failed to add IGTK subelement");
+-				os_free(subelem);
++		if (!mld_sta) {
++			subelem = wpa_ft_group_key_subelem(sm, &subelem_len, -1);
++			if (!subelem) {
++				wpa_printf(MSG_DEBUG, "FT: Failed to add group"
++					   "key subelement");
+ 				return NULL;
+ 			}
+-			nbuf = os_realloc(subelem, subelem_len + igtk_len);
+-			if (nbuf == NULL) {
+-				os_free(subelem);
+-				os_free(igtk);
+-				return NULL;
+-			}
+-			subelem = nbuf;
+-			os_memcpy(subelem + subelem_len, igtk, igtk_len);
+-			subelem_len += igtk_len;
+-			os_free(igtk);
+-		}
+-		if (sm->mgmt_frame_prot && conf->beacon_prot) {
+-			u8 *bigtk;
+-			size_t bigtk_len;
++		} else {
++			u8 *link_key_subelem;
++			size_t link_key_len;
+ 			u8 *nbuf;
+-
+-			bigtk = wpa_ft_bigtk_subelem(sm, &bigtk_len);
+-			if (!bigtk) {
+-				wpa_printf(MSG_DEBUG,
+-					   "FT: Failed to add BIGTK subelement");
+-				os_free(subelem);
+-				return NULL;
+-			}
+-			nbuf = os_realloc(subelem, subelem_len + bigtk_len);
+-			if (!nbuf) {
+-				os_free(subelem);
+-				os_free(bigtk);
+-				return NULL;
++			int link_id;
++
++			for (link_id = 0; link_id < MAX_NUM_MLD_LINKS; link_id++) {
++				if (!sm->mld_links[link_id].valid)
++					continue;
++
++				link_key_subelem =
++					wpa_ft_group_key_subelem(sm,
++								 &link_key_len,
++								 link_id);
++				if (!link_key_subelem) {
++					wpa_printf(MSG_DEBUG,
++						   "FT: Failed to build MLO "
++						   "group key subelements "
++						   "with link %d", link_id);
++					os_free(subelem);
++					return NULL;
++				}
++				nbuf = os_realloc(subelem, subelem_len + link_key_len);
++				if (!nbuf) {
++					os_free(subelem);
++					os_free(link_key_subelem);
++					return NULL;
++				}
++				subelem = nbuf;
++				os_memcpy(subelem + subelem_len,
++					  link_key_subelem, link_key_len);
++				subelem_len += link_key_len;
++				os_free(link_key_subelem);
+ 			}
+-			subelem = nbuf;
+-			os_memcpy(subelem + subelem_len, bigtk, bigtk_len);
+-			subelem_len += bigtk_len;
+-			os_free(bigtk);
+ 		}
+ #ifdef CONFIG_OCV
+ 		if (wpa_auth_uses_ocv(sm)) {
+@@ -2837,7 +2952,7 @@ u8 * wpa_sm_write_assoc_resp_ies(struct wpa_state_machine *sm, u8 *pos,
+ 	}
+ 	if (auth_alg == WLAN_AUTH_FT &&
+ 	    wpa_ft_mic(sm->wpa_key_mgmt, kck, kck_len,
+-		       sm->addr, sm->wpa_auth->addr, 6,
++		       wpa_auth_get_spa(sm), wpa_auth_get_aa(sm), 6,
+ 		       mdie, mdie_len, ftie, ftie_len,
+ 		       rsnie, rsnie_len,
+ 		       ric_start, ric_start ? pos - ric_start : 0,
+@@ -2849,13 +2964,33 @@ u8 * wpa_sm_write_assoc_resp_ies(struct wpa_state_machine *sm, u8 *pos,
+ 		goto fail;
+ 	}
+ 
+-	os_free(sm->assoc_resp_ftie);
+-	sm->assoc_resp_ftie = os_malloc(ftie_len);
+-	if (!sm->assoc_resp_ftie) {
++	buf = os_malloc(ftie_len + ((ftie_len - 2 - 1)/ 255) * 2);
++	if (!buf) {
+ 		pos = NULL;
+ 		goto fail;
+ 	}
+-	os_memcpy(sm->assoc_resp_ftie, ftie, ftie_len);
++	os_free(sm->assoc_resp_ftie);
++	sm->assoc_resp_ftie = buf;
++
++	/* First slice includes the original FTIE tag and length */
++	slice_len = (ftie_len <= 257) ? ftie_len : 257;
++
++	os_memcpy(buf, ftie, slice_len);
++	ftie += slice_len;
++	buf += slice_len;
++	ftie_len -= slice_len;
++
++	while (ftie_len) {
++		slice_len = (ftie_len <= 255) ? ftie_len : 255;
++
++		*buf++ = WLAN_EID_FRAGMENT;
++		*buf++ = slice_len;
++		os_memcpy(buf, ftie, slice_len);
++
++		ftie += slice_len;
++		buf += slice_len;
++		ftie_len -= slice_len;
++	}
+ 
+ fail:
+ 	wpa_ft_parse_ies_free(&parse);
+-- 
+2.45.2
+

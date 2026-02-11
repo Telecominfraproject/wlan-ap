@@ -1,0 +1,247 @@
+From 8b74f02f5ce886d780cd23f4005585ba30b53a55 Mon Sep 17 00:00:00 2001
+From: Michael-CY Lee <michael-cy.lee@mediatek.com>
+Date: Mon, 28 Oct 2024 17:35:10 +0800
+Subject: [PATCH 088/115] mtk: mac80211: refactor STA set Neg-TTLM
+
+The refactors include:
+1. call the driver operation to set TTLM to driver in ieee80211_apply_neg_ttlm()
+2. accept teardown request from user space. To avoid creating a new
+   NL80211 command, the absent of bitmap attributes is seen as a
+   teardown.
+3. handle teardown request from AP MLD.
+
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+---
+ include/net/mac80211.h     |  2 ++
+ net/mac80211/cfg.c         |  4 +++-
+ net/mac80211/driver-ops.h  | 13 +++++++++++++
+ net/mac80211/ieee80211_i.h |  1 +
+ net/mac80211/mlme.c        | 35 ++++++++++++++++++++++++++++++-----
+ net/mac80211/trace.h       | 17 +++++++++++++++++
+ net/wireless/nl80211.c     | 22 +++++++++++++---------
+ 7 files changed, 79 insertions(+), 15 deletions(-)
+
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index 6de2b552..ba0e9a4e 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -4543,6 +4543,7 @@ struct ieee80211_prep_tx_info {
+  *	flow offloading for flows originating from the vif.
+  *	Note that the driver must not assume that the vif driver_data is valid
+  *	at this point, since the callback can be called during netdev teardown.
++ * @set_ttlm: For non-AP MLD, set its own TTLM.
+  * @set_sta_ttlm: For AP MLD, set a specific non-AP MLD's TID-To-Link mapping.
+  * @set_attlm: For AP MLD to request a advertised TID-To-Link mapping.
+  * @can_neg_ttlm: for managed interface, requests the driver to determine
+@@ -4950,6 +4951,7 @@ struct ieee80211_ops {
+ 			    struct net_device *dev,
+ 			    enum tc_setup_type type,
+ 			    void *type_data);
++	int (*set_ttlm)(struct ieee80211_hw *hw, struct ieee80211_vif *vif);
+ 	int (*set_sta_ttlm)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			    struct ieee80211_sta *sta,
+ 			    struct ieee80211_neg_ttlm *neg_ttlm);
+diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
+index 408feaa1..3b6f7242 100644
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -5517,7 +5517,9 @@ ieee80211_set_ttlm(struct wiphy *wiphy, struct net_device *dev,
+ 
+ 	lockdep_assert_wiphy(sdata->local->hw.wiphy);
+ 
+-	return ieee80211_req_neg_ttlm(sdata, params);
++	return params->is_teardown ?
++		ieee80211_teardown_neg_ttlm(sdata) :
++		ieee80211_req_neg_ttlm(sdata, params);
+ }
+ 
+ static int
+diff --git a/net/mac80211/driver-ops.h b/net/mac80211/driver-ops.h
+index 45b72534..180c565f 100644
+--- a/net/mac80211/driver-ops.h
++++ b/net/mac80211/driver-ops.h
+@@ -1807,6 +1807,19 @@ static inline int drv_set_qos_map(struct ieee80211_local *local,
+ 	return ret;
+ }
+ 
++static inline int drv_set_ttlm(struct ieee80211_local *local,
++			       struct ieee80211_sub_if_data *sdata)
++{
++	int ret = -EOPNOTSUPP;
++
++	trace_drv_set_ttlm(local, sdata);
++	if (local->ops->set_ttlm)
++		ret = local->ops->set_ttlm(&local->hw, &sdata->vif);
++	trace_drv_return_int(local, ret);
++
++	return ret;
++}
++
+ static inline int drv_set_sta_ttlm(struct ieee80211_local *local,
+ 				   struct ieee80211_sub_if_data *sdata,
+ 				   struct ieee80211_sta *sta,
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 7bc65e3d..1df55bb0 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -2849,6 +2849,7 @@ void ieee80211_process_neg_ttlm_res(struct ieee80211_sub_if_data *sdata,
+ int ieee80211_req_neg_ttlm(struct ieee80211_sub_if_data *sdata,
+ 			   struct cfg80211_ttlm_params *params);
+ void ieee80211_process_ttlm_teardown(struct ieee80211_sub_if_data *sdata);
++int ieee80211_teardown_neg_ttlm(struct ieee80211_sub_if_data *sdata);
+ 
+ void ieee80211_check_wbrf_support(struct ieee80211_local *local);
+ void ieee80211_add_wbrf(struct ieee80211_local *local, struct cfg80211_chan_def *chandef);
+diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
+index f9f2fb58..73b41697 100644
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@ -7045,6 +7045,8 @@ static void ieee80211_tid_to_link_map_work(struct wiphy *wiphy,
+ 		container_of(work, struct ieee80211_sub_if_data,
+ 			     u.mgd.ttlm_work.work);
+ 
++	lockdep_assert_wiphy(sdata->local->hw.wiphy);
++
+ 	new_active_links = sdata->vif.adv_ttlm.map &
+ 			   sdata->vif.valid_links;
+ 	new_dormant_links = ~sdata->vif.adv_ttlm.map &
+@@ -7058,6 +7060,9 @@ static void ieee80211_tid_to_link_map_work(struct wiphy *wiphy,
+ 		sdata->vif.adv_ttlm.active = false;
+ 		return;
+ 	}
++
++	if (drv_set_ttlm(sdata->local, sdata))
++		ieee80211_disconnect(&sdata->vif, false);
+ }
+ 
+ static u16 ieee80211_get_ttlm(u8 bm_size, u8 *data)
+@@ -7178,9 +7183,8 @@ static void ieee80211_process_adv_ttlm(struct ieee80211_sub_if_data *sdata,
+ 				return;
+ 			}
+ 			sdata->vif.adv_ttlm.active = false;
+-			ieee80211_vif_cfg_change_notify(sdata,
+-							BSS_CHANGED_MLD_VALID_LINKS |
+-							BSS_CHANGED_MLD_ADV_TTLM);
++			if (drv_set_ttlm(sdata->local, sdata))
++				ieee80211_disconnect(&sdata->vif, false);
+ 		}
+ 		memset(&sdata->vif.adv_ttlm, 0,
+ 		       sizeof(sdata->vif.adv_ttlm));
+@@ -7235,6 +7239,13 @@ static void ieee80211_process_adv_ttlm(struct ieee80211_sub_if_data *sdata,
+ 				delay_jiffies = 0;
+ 
+ 			sdata->vif.adv_ttlm = ttlm_info;
++
++			/* FIXME do Neg-TTLM teardown to prevent overlap
++			 * with Adv-TTLM
++			 */
++			if (sdata->vif.neg_ttlm.valid)
++				ieee80211_teardown_neg_ttlm(sdata);
++
+ 			wiphy_delayed_work_cancel(sdata->local->hw.wiphy,
+ 						  &sdata->u.mgd.ttlm_work);
+ 			wiphy_delayed_work_queue(sdata->local->hw.wiphy,
+@@ -7737,6 +7748,7 @@ static void ieee80211_apply_neg_ttlm(struct ieee80211_sub_if_data *sdata,
+ 
+ 	sdata->vif.neg_ttlm = neg_ttlm;
+ 	sdata->vif.neg_ttlm.valid = true;
++	drv_set_ttlm(sdata->local, sdata);
+ }
+ 
+ static void ieee80211_neg_ttlm_timeout_work(struct wiphy *wiphy,
+@@ -7866,6 +7878,20 @@ int ieee80211_req_neg_ttlm(struct ieee80211_sub_if_data *sdata,
+ 	return 0;
+ }
+ 
++int ieee80211_teardown_neg_ttlm(struct ieee80211_sub_if_data *sdata)
++{
++	if (!ieee80211_vif_is_mld(&sdata->vif) ||
++	    !(sdata->vif.cfg.mld_capa_op &
++	      IEEE80211_MLD_CAP_OP_TID_TO_LINK_MAP_NEG_SUPP))
++		return -EINVAL;
++
++	ieee80211_send_teardown_neg_ttlm(&sdata->vif);
++	wiphy_work_queue(sdata->local->hw.wiphy,
++			 &sdata->u.mgd.teardown_ttlm_work);
++
++	return 0;
++}
++
+ static void
+ ieee80211_send_neg_ttlm_res(struct ieee80211_sub_if_data *sdata,
+ 			    enum ieee80211_neg_ttlm_res ttlm_res,
+@@ -8095,8 +8121,7 @@ void ieee80211_process_ttlm_teardown(struct ieee80211_sub_if_data *sdata)
+ 	sdata->vif.suspended_links = 0;
+ 	ieee80211_vif_set_links(sdata, sdata->vif.valid_links,
+ 				new_dormant_links);
+-	ieee80211_vif_cfg_change_notify(sdata, BSS_CHANGED_MLD_NEG_TTLM |
+-					       BSS_CHANGED_MLD_VALID_LINKS);
++	drv_set_ttlm(sdata->local, sdata);
+ }
+ 
+ static void ieee80211_teardown_ttlm_work(struct wiphy *wiphy,
+diff --git a/net/mac80211/trace.h b/net/mac80211/trace.h
+index 230e80b1..02f6426b 100644
+--- a/net/mac80211/trace.h
++++ b/net/mac80211/trace.h
+@@ -3384,6 +3384,23 @@ DEFINE_EVENT(local_sdata_evt, drv_set_qos_map,
+ 	TP_ARGS(local, sdata)
+ );
+ 
++TRACE_EVENT(drv_set_ttlm,
++	TP_PROTO(struct ieee80211_local *local,
++		 struct ieee80211_sub_if_data *sdata),
++
++	TP_ARGS(local, sdata),
++
++	TP_STRUCT__entry(LOCAL_ENTRY
++			 VIF_ENTRY
++	),
++
++	TP_fast_assign(LOCAL_ASSIGN;
++		       VIF_ASSIGN;
++	),
++
++	TP_printk(LOCAL_PR_FMT  VIF_PR_FMT, LOCAL_PR_ARG, VIF_PR_ARG)
++);
++
+ TRACE_EVENT(drv_set_sta_ttlm,
+ 	TP_PROTO(struct ieee80211_local *local,
+ 		 struct ieee80211_sub_if_data *sdata,
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index 7d40c9a4..0736f5b2 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -17298,16 +17298,20 @@ nl80211_set_ttlm(struct sk_buff *skb, struct genl_info *info)
+ 	if (!wdev->connected)
+ 		return -ENOLINK;
+ 
+-	if (!info->attrs[NL80211_ATTR_MLO_TTLM_DLINK] ||
+-	    !info->attrs[NL80211_ATTR_MLO_TTLM_ULINK])
++	if (info->attrs[NL80211_ATTR_MLO_TTLM_DLINK] &&
++	    info->attrs[NL80211_ATTR_MLO_TTLM_ULINK]) {
++		nla_memcpy(params.dlink,
++			   info->attrs[NL80211_ATTR_MLO_TTLM_DLINK],
++			   sizeof(params.dlink));
++		nla_memcpy(params.ulink,
++			   info->attrs[NL80211_ATTR_MLO_TTLM_ULINK],
++			   sizeof(params.ulink));
++	} else if (!info->attrs[NL80211_ATTR_MLO_TTLM_DLINK] &&
++		   !info->attrs[NL80211_ATTR_MLO_TTLM_ULINK]) {
++		params.is_teardown = true;
++	} else {
+ 		return -EINVAL;
+-
+-	nla_memcpy(params.dlink,
+-		   info->attrs[NL80211_ATTR_MLO_TTLM_DLINK],
+-		   sizeof(params.dlink));
+-	nla_memcpy(params.ulink,
+-		   info->attrs[NL80211_ATTR_MLO_TTLM_ULINK],
+-		   sizeof(params.ulink));
++	}
+ 
+ 	return rdev_set_ttlm(rdev, dev, &params);
+ }
+-- 
+2.45.2
+

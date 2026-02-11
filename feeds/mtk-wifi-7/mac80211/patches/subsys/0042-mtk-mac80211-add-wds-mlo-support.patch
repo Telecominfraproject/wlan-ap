@@ -1,0 +1,304 @@
+From 9c818d1023512260235ac27b93aac59d70900c77 Mon Sep 17 00:00:00 2001
+From: Peter Chiu <chui-hao.chiu@mediatek.com>
+Date: Fri, 19 Jan 2024 15:22:00 +0800
+Subject: [PATCH 042/115] mtk: mac80211: add wds mlo support
+
+Support WDS mode when using MLO.
+1. Remove use_4addr check.
+2. Copy link information to AP_VLAN interface.
+3. Fill 4addr nullfunc by mld address.
+
+Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
+
+1. For the MLO AP_VLAN interface, it would use the same link_data and
+bss_conf as AP interface. AP interface would maintain the bss_conf
+and link_data so AP_VLAN interface should not modify them.
+2. ieee80211_check_concurrent_iface is used to check if interface
+setting are valid so copy AP link information to AP_VLAN in
+ieee80211_do_open.
+3. Assign station's valid links to AP_VLAN's valid links so the iw
+command can show correct link information.
+4. Reassign AP_VLAN link information when AP set links.
+5. Use AP's sdata in ieee80211_sta_remove_link to prevent kernel warning
+in drv_change_sta_links.
+
+The link->reserved of the AP VLAN might be used in the following commit
+change.
+However, the link->reserved of the AP VLAN is not initialized and not
+assigned during the channel switch, so we should use the link->reserved
+of the AP instead.
+Without this fix, wds ap & sta will crash during the channel switch.
+
+Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+---
+ net/mac80211/cfg.c         | 13 +++++--------
+ net/mac80211/chan.c        | 18 ++++++++++++++++--
+ net/mac80211/ieee80211_i.h |  2 ++
+ net/mac80211/iface.c       | 10 +++-------
+ net/mac80211/link.c        | 31 +++++++++++++++++++++++++++++++
+ net/mac80211/mlme.c        | 15 +++++++++------
+ net/mac80211/sta_info.c    |  7 ++++++-
+ 7 files changed, 72 insertions(+), 24 deletions(-)
+
+diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
+index f457a5b6..df769a52 100644
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -257,6 +257,7 @@ static int ieee80211_change_iface(struct wiphy *wiphy,
+ 
+ 	if (type == NL80211_IFTYPE_AP_VLAN && params->use_4addr == 0) {
+ 		RCU_INIT_POINTER(sdata->u.vlan.sta, NULL);
++		sdata->wdev.valid_links = 0;
+ 		ieee80211_check_fast_rx_iface(sdata);
+ 	} else if (type == NL80211_IFTYPE_STATION && params->use_4addr >= 0) {
+ 		struct ieee80211_if_managed *ifmgd = &sdata->u.mgd;
+@@ -264,10 +265,6 @@ static int ieee80211_change_iface(struct wiphy *wiphy,
+ 		if (params->use_4addr == ifmgd->use_4addr)
+ 			return 0;
+ 
+-		/* FIXME: no support for 4-addr MLO yet */
+-		if (ieee80211_vif_is_mld(&sdata->vif))
+-			return -EOPNOTSUPP;
+-
+ 		sdata->u.mgd.use_4addr = params->use_4addr;
+ 		if (!ifmgd->associated)
+ 			return 0;
+@@ -2370,11 +2367,14 @@ static int ieee80211_change_station(struct wiphy *wiphy,
+ 			rcu_assign_pointer(vlansdata->u.vlan.sta, sta);
+ 			__ieee80211_check_fast_rx_iface(vlansdata);
+ 			drv_sta_set_4addr(local, sta->sdata, &sta->sta, true);
++			vlansdata->wdev.valid_links = sta->sta.valid_links;
+ 		}
+ 
+ 		if (sta->sdata->vif.type == NL80211_IFTYPE_AP_VLAN &&
+-		    sta->sdata->u.vlan.sta)
++		    sta->sdata->u.vlan.sta) {
+ 			RCU_INIT_POINTER(sta->sdata->u.vlan.sta, NULL);
++			sta->sdata->wdev.valid_links = 0;
++		}
+ 
+ 		if (test_sta_flag(sta, WLAN_STA_AUTHORIZED))
+ 			ieee80211_vif_dec_num_mcast(sta->sdata);
+@@ -5253,9 +5253,6 @@ static int ieee80211_add_intf_link(struct wiphy *wiphy,
+ 
+ 	lockdep_assert_wiphy(sdata->local->hw.wiphy);
+ 
+-	if (wdev->use_4addr)
+-		return -EOPNOTSUPP;
+-
+ 	return ieee80211_vif_set_links(sdata, wdev->valid_links, 0);
+ }
+ 
+diff --git a/net/mac80211/chan.c b/net/mac80211/chan.c
+index d9e35fc5..edbb90e2 100644
+--- a/net/mac80211/chan.c
++++ b/net/mac80211/chan.c
+@@ -472,6 +472,16 @@ static void ieee80211_chan_bw_change(struct ieee80211_local *local,
+ 			else
+ 				new_chandef = &link_conf->chanreq.oper;
+ 
++			/* Access the reserved chanreq of the AP when it is AP VLAN */
++			if (reserved && sdata->vif.type == NL80211_IFTYPE_AP_VLAN) {
++				struct ieee80211_sub_if_data *ap;
++				struct ieee80211_link_data *ap_link;
++
++				ap = container_of(sdata->bss, struct ieee80211_sub_if_data, u.ap);
++				ap_link = rcu_dereference(ap->link[link_id]);
++				new_chandef = &ap_link->reserved.oper;
++			}
++
+ 			new_sta_bw = _ieee80211_sta_cur_vht_bw(link_sta,
+ 							       new_chandef);
+ 
+@@ -1069,7 +1079,8 @@ __ieee80211_link_copy_chanctx_to_vlans(struct ieee80211_link_data *link,
+ 	struct ieee80211_sub_if_data *vlan;
+ 	struct ieee80211_chanctx_conf *conf;
+ 
+-	if (WARN_ON(sdata->vif.type != NL80211_IFTYPE_AP))
++	if (WARN_ON(sdata->vif.type != NL80211_IFTYPE_AP) ||
++	    ieee80211_vif_is_mld(&sdata->vif))
+ 		return;
+ 
+ 	lockdep_assert_wiphy(local->hw.wiphy);
+@@ -1328,7 +1339,7 @@ ieee80211_link_update_chanreq(struct ieee80211_link_data *link,
+ 
+ 	link->conf->chanreq = *chanreq;
+ 
+-	if (sdata->vif.type != NL80211_IFTYPE_AP)
++	if (sdata->vif.type != NL80211_IFTYPE_AP || ieee80211_vif_is_mld(&sdata->vif))
+ 		return;
+ 
+ 	list_for_each_entry(vlan, &sdata->u.ap.vlans, u.vlan.list) {
+@@ -2179,6 +2190,9 @@ void ieee80211_link_vlan_copy_chanctx(struct ieee80211_link_data *link)
+ 
+ 	ap = container_of(sdata->bss, struct ieee80211_sub_if_data, u.ap);
+ 
++	if (ieee80211_vif_is_mld(&ap->vif))
++		return;
++
+ 	ap_conf = wiphy_dereference(local->hw.wiphy,
+ 				    ap->vif.link_conf[link_id]);
+ 	conf = wiphy_dereference(local->hw.wiphy,
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index b6f2afb1..0843be9e 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -2129,6 +2129,8 @@ void ieee80211_link_init(struct ieee80211_sub_if_data *sdata,
+ void ieee80211_link_stop(struct ieee80211_link_data *link);
+ int ieee80211_vif_set_links(struct ieee80211_sub_if_data *sdata,
+ 			    u16 new_links, u16 dormant_links);
++void __ieee80211_copy_links_to_vlan(struct ieee80211_sub_if_data *vlan,
++				    struct ieee80211_sub_if_data *ap);
+ static inline void ieee80211_vif_clear_links(struct ieee80211_sub_if_data *sdata)
+ {
+ 	ieee80211_vif_set_links(sdata, 0, 0);
+diff --git a/net/mac80211/iface.c b/net/mac80211/iface.c
+index f0a7c8e0..dbcd5ec9 100644
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -377,13 +377,6 @@ static int ieee80211_check_concurrent_iface(struct ieee80211_sub_if_data *sdata,
+ 							nsdata->vif.type))
+ 				return -ENOTUNIQ;
+ 
+-			/* No support for VLAN with MLO yet */
+-			if (iftype == NL80211_IFTYPE_AP_VLAN &&
+-			    sdata->wdev.use_4addr &&
+-			    nsdata->vif.type == NL80211_IFTYPE_AP &&
+-			    nsdata->vif.valid_links)
+-				return -EOPNOTSUPP;
+-
+ 			/*
+ 			 * can only add VLANs to enabled APs
+ 			 */
+@@ -1340,6 +1333,9 @@ int ieee80211_do_open(struct wireless_dev *wdev, bool coming_up)
+ 		       sizeof(sdata->vif.hw_queue));
+ 		sdata->vif.bss_conf.chanreq = master->vif.bss_conf.chanreq;
+ 
++		if (ieee80211_vif_is_mld(&master->vif))
++			__ieee80211_copy_links_to_vlan(sdata, master);
++
+ 		sdata->crypto_tx_tailroom_needed_cnt +=
+ 			master->crypto_tx_tailroom_needed_cnt;
+ 
+diff --git a/net/mac80211/link.c b/net/mac80211/link.c
+index 7639eee1..7141b982 100644
+--- a/net/mac80211/link.c
++++ b/net/mac80211/link.c
+@@ -318,6 +318,36 @@ deinit:
+ 	return ret;
+ }
+ 
++void __ieee80211_copy_links_to_vlan(struct ieee80211_sub_if_data *vlan,
++				    struct ieee80211_sub_if_data *ap)
++{
++	int i;
++
++	vlan->vif.valid_links = ap->vif.valid_links;
++	vlan->vif.active_links = ap->vif.active_links;
++	vlan->vif.dormant_links = ap->vif.dormant_links;
++	memcpy(vlan->wdev.links, ap->wdev.links, sizeof(vlan->wdev.links));
++
++	for (i = 0; i < IEEE80211_MLD_MAX_NUM_LINKS; i++) {
++		rcu_assign_pointer(vlan->link[i], ap->link[i]);
++		rcu_assign_pointer(vlan->vif.link_conf[i], ap->vif.link_conf[i]);
++	}
++}
++
++static void ieee80211_copy_links_to_vlan(struct ieee80211_sub_if_data *sdata)
++{
++	struct ieee80211_sub_if_data *vlan;
++
++	if (sdata->vif.type != NL80211_IFTYPE_AP || !ieee80211_vif_is_mld(&sdata->vif))
++		return;
++
++	list_for_each_entry(vlan, &sdata->u.ap.vlans, u.vlan.list) {
++		__ieee80211_copy_links_to_vlan(vlan, sdata);
++		/* Todo: modify it when reconfiguration */
++		vlan->wdev.valid_links &= sdata->wdev.valid_links;
++	}
++}
++
+ int ieee80211_vif_set_links(struct ieee80211_sub_if_data *sdata,
+ 			    u16 new_links, u16 dormant_links)
+ {
+@@ -326,6 +356,7 @@ int ieee80211_vif_set_links(struct ieee80211_sub_if_data *sdata,
+ 
+ 	ret = ieee80211_vif_update_links(sdata, links, new_links,
+ 					 dormant_links);
++	ieee80211_copy_links_to_vlan(sdata);
+ 	ieee80211_free_links(sdata, links);
+ 
+ 	return ret;
+diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
+index 1aacd447..96525e16 100644
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@ -2376,6 +2376,7 @@ void ieee80211_send_4addr_nullfunc(struct ieee80211_local *local,
+ {
+ 	struct sk_buff *skb;
+ 	struct ieee80211_hdr *nullfunc;
++	u8 assoc_link_id = ifmgd->assoc_data->assoc_link_id;
+ 	__le16 fc;
+ 
+ 	if (WARN_ON(sdata->vif.type != NL80211_IFTYPE_STATION))
+@@ -2391,11 +2392,17 @@ void ieee80211_send_4addr_nullfunc(struct ieee80211_local *local,
+ 	fc = cpu_to_le16(IEEE80211_FTYPE_DATA | IEEE80211_STYPE_NULLFUNC |
+ 			 IEEE80211_FCTL_FROMDS | IEEE80211_FCTL_TODS);
+ 	nullfunc->frame_control = fc;
+-	memcpy(nullfunc->addr1, sdata->deflink.u.mgd.bssid, ETH_ALEN);
+ 	memcpy(nullfunc->addr2, sdata->vif.addr, ETH_ALEN);
+-	memcpy(nullfunc->addr3, sdata->deflink.u.mgd.bssid, ETH_ALEN);
+ 	memcpy(nullfunc->addr4, sdata->vif.addr, ETH_ALEN);
+ 
++	if (ieee80211_vif_is_mld(&sdata->vif)) {
++		memcpy(nullfunc->addr1, sdata->vif.cfg.ap_addr, ETH_ALEN);
++		memcpy(nullfunc->addr3, sdata->vif.cfg.ap_addr, ETH_ALEN);
++	} else {
++		memcpy(nullfunc->addr1, sdata->deflink.u.mgd.bssid, ETH_ALEN);
++		memcpy(nullfunc->addr3, sdata->deflink.u.mgd.bssid, ETH_ALEN);
++	}
++
+ 	IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_INTFL_DONT_ENCRYPT;
+ 	IEEE80211_SKB_CB(skb)->flags |= IEEE80211_TX_CTL_USE_MINRATE;
+ 	ieee80211_tx_skb(sdata, skb);
+@@ -9576,10 +9583,6 @@ int ieee80211_mgd_assoc(struct ieee80211_sub_if_data *sdata,
+ 	for (i = 0; i < IEEE80211_MLD_MAX_NUM_LINKS; i++)
+ 		size += req->links[i].elems_len;
+ 
+-	/* FIXME: no support for 4-addr MLO yet */
+-	if (sdata->u.mgd.use_4addr && req->link_id >= 0)
+-		return -EOPNOTSUPP;
+-
+ 	assoc_data = kzalloc(size, GFP_KERNEL);
+ 	if (!assoc_data)
+ 		return -ENOMEM;
+diff --git a/net/mac80211/sta_info.c b/net/mac80211/sta_info.c
+index 7eb45955..0df6ff13 100644
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@ -1331,8 +1331,10 @@ static int __must_check __sta_info_destroy_part1(struct sta_info *sta)
+ 		drv_sta_pre_rcu_remove(local, sta->sdata, sta);
+ 
+ 	if (sdata->vif.type == NL80211_IFTYPE_AP_VLAN &&
+-	    rcu_access_pointer(sdata->u.vlan.sta) == sta)
++	    rcu_access_pointer(sdata->u.vlan.sta) == sta) {
+ 		RCU_INIT_POINTER(sdata->u.vlan.sta, NULL);
++		sdata->wdev.valid_links = 0;
++	}
+ 
+ 	return 0;
+ }
+@@ -3385,6 +3387,9 @@ void ieee80211_sta_remove_link(struct sta_info *sta, unsigned int link_id)
+ 
+ 	sta->sta.valid_links &= ~BIT(link_id);
+ 
++	if (sdata->vif.type == NL80211_IFTYPE_AP_VLAN && sdata->bss)
++		sdata = container_of(sdata->bss, struct ieee80211_sub_if_data, u.ap);
++
+ 	if (!WARN_ON(!test_sta_flag(sta, WLAN_STA_INSERTED)))
+ 		drv_change_sta_links(sdata->local, sdata, &sta->sta,
+ 				     old_links, sta->sta.valid_links);
+-- 
+2.45.2
+

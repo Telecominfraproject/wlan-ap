@@ -1,0 +1,291 @@
+From 6a6d0e2eb60d8cc1670a04d57b9ba4d1b725df48 Mon Sep 17 00:00:00 2001
+From: Peter Chiu <chui-hao.chiu@mediatek.com>
+Date: Thu, 4 Sep 2025 14:54:49 +0800
+Subject: [PATCH 122/123] mtk: mt76: mt7996: add BA recovery mechanism
+
+Send a mcu commnad to FW to enable AUTO BA mechanism.
+FW will notify host to establish BA session when station is using HW
+path but BA session is not established.
+For mt7992/mt7996, receive event through EXT_CMD.
+For mt7990, receive event through SDO event.
+
+Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
+---
+ mt76_connac.h     |  1 +
+ mt76_connac_mcu.h |  2 ++
+ mt7996/init.c     |  1 +
+ mt7996/mac.c      | 73 +++++++++++++++++++++++++++++++++++++++++++++++
+ mt7996/mac.h      | 10 +++++++
+ mt7996/mcu.c      | 46 +++++++++++++++++++++++++++++
+ mt7996/mcu.h      |  9 ++++++
+ mt7996/mt7996.h   |  2 ++
+ 8 files changed, 144 insertions(+)
+
+diff --git a/mt76_connac.h b/mt76_connac.h
+index 192dcc37..56443617 100644
+--- a/mt76_connac.h
++++ b/mt76_connac.h
+@@ -17,6 +17,7 @@ enum rx_pkt_type {
+ 	PKT_TYPE_RX_EVENT,
+ 	PKT_TYPE_NORMAL_MCU,
+ 	PKT_TYPE_RX_FW_MONITOR	= 0x0c,
++	PKT_TYPE_SDO_EVENT	= 0x0d,
+ 	PKT_TYPE_TXRX_NOTIFY_V0	= 0x18,
+ };
+ 
+diff --git a/mt76_connac_mcu.h b/mt76_connac_mcu.h
+index 17df0f90..ac688a87 100644
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1052,6 +1052,7 @@ enum {
+ 	MCU_EXT_EVENT_THERMAL_PROTECT = 0x22,
+ 	MCU_EXT_EVENT_ASSERT_DUMP = 0x23,
+ 	MCU_EXT_EVENT_RDD_REPORT = 0x3a,
++	MCU_EXT_EVENT_BA_TRIGGER = 0x4e,
+ 	MCU_EXT_EVENT_CSA_NOTIFY = 0x4f,
+ 	MCU_EXT_EVENT_BSS_ACQ_PKT_CNT = 0x52,
+ 	MCU_EXT_EVENT_WA_TX_STAT = 0x74,
+@@ -1259,6 +1260,7 @@ enum {
+ 	MCU_EXT_CMD_RX_AIRTIME_CTRL = 0x4a,
+ 	MCU_EXT_CMD_SET_RX_PATH = 0x4e,
+ 	MCU_EXT_CMD_EFUSE_FREE_BLOCK = 0x4f,
++	MCU_EXT_CMD_AUTO_BA = 0x51,
+ 	MCU_EXT_CMD_TX_POWER_FEATURE_CTRL = 0x58,
+ 	MCU_EXT_CMD_RXDCOC_CAL = 0x59,
+ 	MCU_EXT_CMD_GET_MIB_INFO = 0x5a,
+diff --git a/mt7996/init.c b/mt7996/init.c
+index a4b2f825..c31c3cf5 100644
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -1020,6 +1020,7 @@ static void mt7996_init_work(struct work_struct *work)
+ 	mt7996_low_power_config(dev);
+ 	mt7996_set_pcie_l1ss(dev,
+ 		is_mt7990(&dev->mt76) && (lp_ctrl & BIT(LOW_POWER_PCIE_L1SS)));
++	mt7996_mcu_ba_trigger_enable(dev, true);
+ }
+ 
+ void mt7996_wfsys_reset(struct mt7996_dev *dev)
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index eabb37bd..11da9334 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -1668,6 +1668,73 @@ out:
+ 	rcu_read_unlock();
+ }
+ 
++void mt7996_mac_ba_trigger(struct mt7996_dev *dev, u16 wlan_idx, u8 tid)
++{
++	struct ieee80211_link_sta *link_sta;
++	struct ieee80211_sta *sta;
++	struct mt7996_sta *msta;
++	struct mt76_wcid *wcid;
++
++	if (wlan_idx >= mt7996_wtbl_size(dev) || tid >= IEEE80211_NUM_TIDS) {
++		dev_err(dev->mt76.dev,
++			"Invalid ba parameters wlan_idx = %d, tid = %d\n",
++			wlan_idx, tid);
++		return;
++	}
++
++	rcu_read_lock();
++	wcid = rcu_dereference(dev->mt76.wcid[wlan_idx]);
++	sta = wcid_to_sta(wcid);
++	if (!sta)
++		goto out;
++
++	msta = (struct mt7996_sta *)sta->drv_priv;
++	link_sta = rcu_dereference(sta->link[wcid->link_id]);
++	if (!link_sta)
++		goto out;
++
++	mt7996_check_tx_ba_status(link_sta, &msta->deflink.wcid, tid);
++out:
++	rcu_read_unlock();
++}
++
++static void
++mt7996_mac_rx_sdo_event(struct mt7996_dev *dev, void *data, int len)
++{
++	void *end = data + len;
++	__le32 *event = (__le32 *)data, *cur_info;
++	u16 total, count = 0;
++
++	total = le32_get_bits(event[0], MT7996_SDO_EVENT_COUNT);
++	for (cur_info = &event[2]; count < total;) {
++		u32 info;
++		u16 wlan_idx;
++		u8 tid;
++
++		if ((void *)cur_info >= end) {
++		        dev_info(dev->mt76.dev,
++				 "sdo event: count=%u total=%u\n", count, total);
++			return;
++		}
++		info = le32_to_cpu(*cur_info);
++
++		switch(u32_get_bits(info, MT7996_SDO_EVENT_ID)) {
++		case MT7996_SDO_EVENT_BA_TRIGGER:
++			tid = u32_get_bits(info, MT7996_SDO_EVENT_BA_TRIG_TID);
++			wlan_idx = u32_get_bits(info,
++					MT7996_SDO_EVENT_BA_TRIG_WLAN_IDX);
++
++			mt7996_mac_ba_trigger(dev, wlan_idx, tid);
++			break;
++		default:
++			break;
++		}
++		/* Each event length is 1 plus MT_SDO_EVENT_DW_LEN */
++		cur_info += 1 + u32_get_bits(info, MT7996_SDO_EVENT_DW_LEN);
++		count++;
++	}
++}
++
+ bool mt7996_rx_check(struct mt76_dev *mdev, void *data, int len)
+ {
+ 	struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
+@@ -1688,6 +1755,9 @@ bool mt7996_rx_check(struct mt76_dev *mdev, void *data, int len)
+ 	case PKT_TYPE_TXRX_NOTIFY:
+ 		mt7996_mac_tx_free(dev, data, len);
+ 		return false;
++	case PKT_TYPE_SDO_EVENT:
++		mt7996_mac_rx_sdo_event(dev, data, len);
++		return false;
+ 	case PKT_TYPE_TXS:
+ 		for (rxd += MT_TXS_HDR_SIZE; rxd + MT_TXS_SIZE <= end; rxd += MT_TXS_SIZE)
+ 			mt7996_mac_add_txs(dev, rxd);
+@@ -1739,6 +1809,9 @@ void mt7996_queue_rx_skb(struct mt76_dev *mdev, enum mt76_rxq_id q,
+ 	case PKT_TYPE_RX_EVENT:
+ 		mt7996_mcu_rx_event(dev, skb);
+ 		break;
++	case PKT_TYPE_SDO_EVENT:
++		mt7996_mac_rx_sdo_event(dev, skb->data, skb->len);
++		break;
+ 	case PKT_TYPE_TXS:
+ 		for (rxd += MT_TXS_HDR_SIZE; rxd + MT_TXS_SIZE <= end; rxd += MT_TXS_SIZE)
+ 			mt7996_mac_add_txs(dev, rxd);
+diff --git a/mt7996/mac.h b/mt7996/mac.h
+index e629324a..a1205f3a 100644
+--- a/mt7996/mac.h
++++ b/mt7996/mac.h
+@@ -42,4 +42,14 @@ struct mt7996_dfs_radar_spec {
+ 	struct mt7996_dfs_pattern radar_pattern[16];
+ };
+ 
++#define MT7996_SDO_EVENT_COUNT			GENMASK(26, 20)
++#define MT7996_SDO_EVENT_DW_LEN			GENMASK(31, 27)
++#define MT7996_SDO_EVENT_ID			GENMASK(26, 21)
++
++#define MT7996_SDO_EVENT_BA_TRIG_WLAN_IDX	GENMASK(13, 0)
++#define MT7996_SDO_EVENT_BA_TRIG_TID		GENMASK(16, 14)
++enum {
++	MT7996_SDO_EVENT_BA_TRIGGER,
++};
++
+ #endif
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index c1944a8d..4c4eda42 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -1287,6 +1287,48 @@ mt7996_mcu_rx_bss_acq_pkt_cnt(struct mt7996_dev *dev, struct sk_buff *skb)
+ 	}
+ }
+ 
++int mt7996_mcu_ba_trigger_enable(struct mt7996_dev *dev, u8 enable)
++{
++#define MT7996_BA_TIMEOUT 1000
++	struct {
++		u8 rsv[4];
++		__le16 tag;
++		__le16 len;
++		struct {
++			u8 enable;
++			u8 target;
++			u8 rsv[2];
++			__le32 timeout;
++		} __packed data;
++	} __packed req = {
++		.tag = cpu_to_le16(UNI_CMD_SDO_AUTO_BA),
++		.len = cpu_to_le16(sizeof(req) - 4),
++		.data.enable = enable,
++		.data.target = 0,
++		.data.timeout = cpu_to_le32(MT7996_BA_TIMEOUT),
++	};
++	int ret;
++
++	if (is_mt7990(&dev->mt76))
++		ret = mt76_mcu_send_msg(&dev->mt76, MCU_WA_UNI_CMD(SDO),
++					&req, sizeof(req), false);
++	else
++		ret = mt76_mcu_send_msg(&dev->mt76, MCU_WA_EXT_CMD(AUTO_BA),
++					&req.data, sizeof(req.data), true);
++
++	return ret;
++}
++
++static void mt7996_mcu_rx_ba_trigger(struct mt7996_dev *dev, struct sk_buff *skb)
++{
++	struct mt7996_mcu_ba_trigger *event = (struct mt7996_mcu_ba_trigger *)skb->data;
++	u16 wlan_idx = u16_encode_bits(event->wlan_idx_hi, GENMASK(15, 8)) |
++		       u16_encode_bits(event->wlan_idx_lo, GENMASK(7, 0));
++	u8 tid = event->tid;
++
++	mt7996_mac_ba_trigger(dev, wlan_idx, tid);
++}
++
+ static void
+ mt7996_mcu_rx_ext_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ {
+@@ -1298,6 +1340,10 @@ mt7996_mcu_rx_ext_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ 		break;
+ 	case MCU_EXT_EVENT_BSS_ACQ_PKT_CNT:
+ 		mt7996_mcu_rx_bss_acq_pkt_cnt(dev, skb);
++		break;
++	case MCU_EXT_EVENT_BA_TRIGGER:
++		mt7996_mcu_rx_ba_trigger(dev, skb);
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/mt7996/mcu.h b/mt7996/mcu.h
+index 18456f17..25c8a417 100644
+--- a/mt7996/mcu.h
++++ b/mt7996/mcu.h
+@@ -460,6 +460,15 @@ struct mt7996_mcu_bss_acq_pkt_cnt_event {
+ 	} __packed bss[BSS_ACQ_PKT_CNT_BSS_NUM];
+ } __packed;
+ 
++struct mt7996_mcu_ba_trigger {
++	struct mt7996_mcu_rxd rxd;
++
++	u8 wlan_idx_lo;
++	u8 tid;
++	u8 wlan_idx_hi;
++	u8 rsv;
++} __packed;
++
+ enum {
+ 	MCU_WA_PARAM_PDMA_RX = 0x04,
+ 	MCU_WA_PARAM_CPU_UTIL = 0x0b,
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index 7c52328b..cd9b254b 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -1342,6 +1342,7 @@ int mt7996_mcu_set_vow_drr_ctrl(struct mt7996_phy *phy,
+ 				enum vow_drr_ctrl_id id);
+ int mt7996_mcu_set_vow_feature_ctrl(struct mt7996_phy *phy);
+ void mt7996_mcu_wmm_pbc_work(struct work_struct *work);
++int mt7996_mcu_ba_trigger_enable(struct mt7996_dev *dev, u8 enable);
+ int mt7996_mcu_mld_reconf_stop_link(struct mt7996_dev *dev,
+ 				    struct ieee80211_vif *vif, u16 removed_links);
+ int mt7996_mcu_mld_link_oper(struct mt7996_phy *phy,
+@@ -1507,6 +1508,7 @@ void mt7996_link_add_debugfs(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ int mt7996_mmio_wed_init(struct mt7996_dev *dev, void *pdev_ptr,
+ 			 bool hif2, int *irq);
+ u32 mt7996_wed_init_buf(void *ptr, dma_addr_t phys, int token_id);
++void mt7996_mac_ba_trigger(struct mt7996_dev *dev, u16 wlan_idx, u8 tid);
+ 
+ #ifdef CONFIG_MTK_VENDOR
+ void mt7996_set_wireless_vif(void *data, u8 *mac, struct ieee80211_vif *vif);
+-- 
+2.45.2
+
