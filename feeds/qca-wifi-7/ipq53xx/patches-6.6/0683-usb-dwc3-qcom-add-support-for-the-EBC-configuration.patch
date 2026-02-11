@@ -1,0 +1,1073 @@
+From dbe22c3ca6ab286c8fa7ae508e72e0413c4fb627 Mon Sep 17 00:00:00 2001
+From: Sridharan S N <quic_sridsn@quicinc.com>
+Date: Thu, 3 Oct 2024 15:28:16 +0530
+Subject: [PATCH] usb: dwc3: qcom: add support for the EBC configuration
+
+Add External Buffer Control(EBC) EP configurations and initialize
+TRB buffer rings.
+
+Change-Id: Ie48a1b68c4c9f2066c764e42488b808c81548646
+Signed-off-by: Kathiravan Thirumoorthy <quic_kathirav@quicinc.com>
+Signed-off-by: Sridharan S N <quic_sridsn@quicinc.com>
+---
+ drivers/usb/dwc3/dwc3-qcom.c | 1002 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 1002 insertions(+)
+
+diff --git a/drivers/usb/dwc3/dwc3-qcom.c b/drivers/usb/dwc3/dwc3-qcom.c
+index c3df950f15ec..20e3b9ad3199 100644
+--- a/drivers/usb/dwc3/dwc3-qcom.c
++++ b/drivers/usb/dwc3/dwc3-qcom.c
+@@ -17,6 +17,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/phy/phy.h>
++#include <linux/usb/dwc3-qcom.h>
+ #include <linux/usb/of.h>
+ #include <linux/reset.h>
+ #include <linux/iopoll.h>
+@@ -25,6 +26,7 @@
+ #include <linux/regmap.h>
+ #include <linux/mfd/syscon.h>
+ #include "core.h"
++#include "gadget.h"
+ 
+ /* USB QSCRATCH Hardware registers */
+ #define QSCRATCH_HS_PHY_CTRL			0x10
+@@ -47,6 +49,22 @@
+ #define SDM845_QSCRATCH_SIZE			0x400
+ #define SDM845_DWC3_CORE_SIZE			0xcd00
+ 
++/* EBC/LPC Configuration */
++#define LPC_SCAN_MASK				0x1C8
++#define LPC_REG					0x1CC
++
++#define LPC_SPEED_INDICATOR			BIT(0)
++#define LPC_SSP_MODE				BIT(1)
++#define LPC_BUS_CLK_EN				BIT(12)
++
++#define USB30_MODE_SEL_REG			0x1D4
++#define USB30_QDSS_MODE_SEL			BIT(0)
++#define USB30_QDSS_CONFIG_REG			0x1D8
++
++#define DWC3_DEPCFG_EBC_MODE			BIT(15)
++#define DWC3_DEPCFG_RETRY			BIT(15)
++#define DWC3_DEPCFG_TRB_WB			BIT(14)
++
+ /* Interconnect path bandwidths in MBps */
+ #define USB_MEMORY_AVG_HS_BW MBps_to_icc(240)
+ #define USB_MEMORY_PEAK_HS_BW MBps_to_icc(700)
+@@ -66,6 +84,24 @@ struct dwc3_acpi_pdata {
+ 	bool			is_urs;
+ };
+ 
++struct dwc3_hw_ep {
++	struct dwc3_ep		*dep;
++	enum usb_hw_ep_mode	mode;
++	struct dwc3_trb		*ebc_trb_pool;
++	u8 dbm_ep_num;
++	int num_trbs;
++
++	unsigned long flags;
++#define DWC3_QCOM_HW_EP_TRANSFER_STARTED BIT(0)
++};
++
++struct dwc3_qcom_req_complete {
++	struct list_head list_item;
++	struct usb_request *req;
++	void (*orig_complete)(struct usb_ep *ep,
++			      struct usb_request *req);
++};
++
+ struct dwc3_qcom {
+ 	struct device		*dev;
+ 	void __iomem		*qscratch_base;
+@@ -96,6 +132,10 @@ struct dwc3_qcom {
+ 	u32			phy_mux_reg;
+ 	struct icc_path		*icc_path_ddr;
+ 	struct icc_path		*icc_path_apps;
++	struct dwc3_hw_ep	hw_eps[DWC3_ENDPOINTS_NUM];
++	struct dwc3_trb		*ebc_desc_addr;
++	const struct usb_ep_ops	*original_ep_ops[DWC3_ENDPOINTS_NUM];
++	struct list_head	req_complete_list;
+ };
+ 
+ static inline void dwc3_qcom_setbits(void __iomem *base, u32 offset, u32 val)
+@@ -122,6 +162,963 @@ static inline void dwc3_qcom_clrbits(void __iomem *base, u32 offset, u32 val)
+ 	readl(base + offset);
+ }
+ 
++static inline void dwc3_qcom_ep_writel(void __iomem *base, u32 offset, u32 value)
++{
++	/*
++	 * We requested the mem region starting from the Globals address
++	 * space, see dwc3_probe in core.c.
++	 * However, the offsets are given starting from xHCI address space.
++	 */
++	writel_relaxed(value, base + offset - DWC3_GLOBALS_REGS_START);
++
++	/* Ensure writes to DWC3 ep registers are completed */
++	mb();
++}
++
++static inline u32 dwc3_qcom_ep_readl(void __iomem *base, u32 offset)
++{
++	/*
++	 * We requested the mem region starting from the Globals address
++	 * space, see dwc3_probe in core.c.
++	 * However, the offsets are given starting from xHCI address space.
++	 */
++	return readl_relaxed(base + offset - DWC3_GLOBALS_REGS_START);
++}
++
++/**
++ *
++ * Read register with debug info.
++ *
++ * @base - DWC3 base virtual address.
++ * @offset - register offset.
++ *
++ * @return u32
++ */
++static inline u32 dwc3_qcom_read_reg(void __iomem *base, u32 offset)
++{
++	u32 val = ioread32(base + offset);
++	return val;
++}
++
++/**
++ *
++ * Write register with debug info.
++ *
++ * @base - DWC3 base virtual address.
++ * @offset - register offset.
++ * @val - value to write.
++ *
++ */
++static inline void dwc3_qcom_write_reg(void __iomem *base, u32 offset, u32 val)
++{
++	iowrite32(val, base + offset);
++}
++
++static int qcom_ep_setup_ebc_trbs(struct usb_ep *ep, struct usb_request *req)
++{
++	struct dwc3_ep *dep = to_dwc3_ep(ep);
++	struct dwc3 *dwc = dep->dwc;
++	struct dwc3_qcom *mdwc = dev_get_drvdata(dwc->dev->parent);
++	struct dwc3_hw_ep *edep;
++	struct dwc3_trb *trb;
++	u32 desc_offset = 0, scan_offset = 0x4000;
++	int i, num_trbs;
++
++	if (!mdwc->ebc_desc_addr) {
++		dev_err(mdwc->dev, "%s: ebc_desc_addr not specified\n", __func__);
++		return -EINVAL;
++	}
++
++	if (!dep->direction) {
++		desc_offset = 0x200;
++		scan_offset = 0x8000;
++	}
++
++	edep = &mdwc->hw_eps[dep->number];
++	edep->ebc_trb_pool = mdwc->ebc_desc_addr + desc_offset;
++	num_trbs = req->length / EBC_TRB_SIZE;
++	mdwc->hw_eps[dep->number].num_trbs = num_trbs;
++
++	for (i = 0; i < num_trbs; i++) {
++		struct dwc3_trb tmp;
++
++		trb = &edep->ebc_trb_pool[i];
++		memset(trb, 0, sizeof(*trb));
++
++		/* Setup n TRBs pointing to valid buffers */
++		tmp.bpl = scan_offset;
++		tmp.bph = 0x8000;
++		tmp.size = EBC_TRB_SIZE;
++		tmp.ctrl = DWC3_TRBCTL_NORMAL | DWC3_TRB_CTRL_CHN |
++				DWC3_TRB_CTRL_HWO;
++		if (i == (num_trbs-1)) {
++			tmp.bpl = desc_offset;
++			tmp.bph = 0x8000;
++			tmp.size = 0;
++			tmp.ctrl = DWC3_TRBCTL_LINK_TRB | DWC3_TRB_CTRL_HWO;
++		}
++		memcpy(trb, &tmp, sizeof(*trb));
++		scan_offset += trb->size;
++	}
++
++	return 0;
++}
++
++static int ebc_ep_config(struct usb_ep *ep, struct usb_request *request)
++{
++	struct dwc3_ep *dep = to_dwc3_ep(ep);
++	struct dwc3 *dwc = dep->dwc;
++	struct dwc3_qcom *mdwc = dev_get_drvdata(dwc->dev->parent);
++	u32 reg, ep_num;
++	int ret;
++
++	reg = dwc3_qcom_read_reg(mdwc->qscratch_base, LPC_REG);
++
++	switch (dwc3_qcom_ep_readl(dwc->regs, DWC3_DSTS) & DWC3_DSTS_CONNECTSPD) {
++	case DWC3_DSTS_SUPERSPEED_PLUS:
++		reg |= LPC_SSP_MODE;
++		break;
++	case DWC3_DSTS_SUPERSPEED:
++		reg |= LPC_SPEED_INDICATOR;
++		break;
++	default:
++		reg &= ~(LPC_SSP_MODE | LPC_SPEED_INDICATOR);
++		break;
++	}
++
++	dwc3_qcom_write_reg(mdwc->qscratch_base, LPC_REG, reg);
++	ret = qcom_ep_setup_ebc_trbs(ep, request);
++	if (ret < 0) {
++		dev_err(mdwc->dev, "error %d setting up ebc trbs\n", ret);
++		return ret;
++	}
++
++	ep_num = !dep->direction ? dep->number + 15 :
++				   dep->number >> 1;
++	reg = dwc3_qcom_read_reg(mdwc->qscratch_base, LPC_SCAN_MASK);
++	reg |= BIT(ep_num);
++	dwc3_qcom_write_reg(mdwc->qscratch_base, LPC_SCAN_MASK, reg);
++
++	reg = dwc3_qcom_read_reg(mdwc->qscratch_base, LPC_REG);
++	reg |= LPC_BUS_CLK_EN;
++	dwc3_qcom_write_reg(mdwc->qscratch_base, LPC_REG, reg);
++
++	reg = dwc3_qcom_read_reg(mdwc->qscratch_base, USB30_MODE_SEL_REG);
++	reg |= USB30_QDSS_MODE_SEL;
++	dwc3_qcom_write_reg(mdwc->qscratch_base, USB30_MODE_SEL_REG, reg);
++
++	return 0;
++}
++
++/**
++ * Configure QCOM endpoint.
++ * This function do specific configurations
++ * to an endpoint which need specific implementaion
++ * in the QCOM architecture.
++ *
++ * This function should be called by usb function/class
++ * layer which need a support from the specific QCOM HW
++ * which wrap the USB3 core. (like EBC or DBM specific endpoints)
++ *
++ * @ep - a pointer to some usb_ep instance
++ *
++ * @return int - 0 on success, negetive on error.
++ */
++int qcom_ep_config(struct usb_ep *ep, struct usb_request *request, u32 bam_opts)
++{
++	struct dwc3_ep *dep = to_dwc3_ep(ep);
++	struct dwc3 *dwc = dep->dwc;
++	struct dwc3_qcom *mdwc = dev_get_drvdata(dwc->dev->parent);
++	int ret = 0;
++	unsigned long flags;
++
++	spin_lock_irqsave(&dwc->lock, flags);
++
++	if (mdwc->hw_eps[dep->number].mode == USB_EP_EBC) {
++		ret = ebc_ep_config(ep, request);
++		if (ret < 0) {
++			dev_err(mdwc->dev,
++				"error %d after calling ebc_ep_config\n", ret);
++			spin_unlock_irqrestore(&dwc->lock, flags);
++			return ret;
++		}
++	}
++
++	mdwc->hw_eps[dep->number].dep = dep;
++	spin_unlock_irqrestore(&dwc->lock, flags);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(qcom_ep_config);
++
++/**
++ * Un-configure QCOM endpoint.
++ * Tear down configurations done in the
++ * dwc3_qcom_ep_config function.
++ *
++ * @ep - a pointer to some usb_ep instance
++ *
++ * @return int - 0 on success, negative on error.
++ */
++int qcom_ep_unconfig(struct usb_ep *ep)
++{
++	struct dwc3_ep *dep = to_dwc3_ep(ep);
++	struct dwc3 *dwc = dep->dwc;
++	struct dwc3_qcom *mdwc = dev_get_drvdata(dwc->dev->parent);
++	unsigned long flags;
++	u32 reg, ep_num;
++
++	spin_lock_irqsave(&dwc->lock, flags);
++	if (mdwc->hw_eps[dep->number].mode == USB_EP_EBC) {
++		ep_num = !dep->direction ? dep->number + 15 :
++					   dep->number >> 1;
++		reg = dwc3_qcom_read_reg(mdwc->qscratch_base, LPC_SCAN_MASK);
++		reg &= ~BIT(ep_num);
++		dwc3_qcom_write_reg(mdwc->qscratch_base, LPC_SCAN_MASK, reg);
++
++		dwc3_qcom_write_reg(mdwc->qscratch_base, LPC_SCAN_MASK, 0);
++		reg = dwc3_qcom_read_reg(mdwc->qscratch_base, LPC_REG);
++		reg &= ~LPC_BUS_CLK_EN;
++
++		dwc3_qcom_write_reg(mdwc->qscratch_base, LPC_REG, reg);
++	}
++
++	mdwc->hw_eps[dep->number].dep = 0;
++	spin_unlock_irqrestore(&dwc->lock, flags);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(qcom_ep_unconfig);
++
++/**
++ * qcom_ep_clear_ops - Restore default endpoint operations
++ * @ep: The endpoint to restore
++ *
++ * Resets the usb endpoint operations to the default callbacks previously saved
++ * when calling qcom_ep_update_ops.
++ */
++int qcom_ep_clear_ops(struct usb_ep *ep)
++{
++	struct dwc3_ep *dep = to_dwc3_ep(ep);
++	struct dwc3 *dwc = dep->dwc;
++	struct dwc3_qcom *mdwc = dev_get_drvdata(dwc->dev->parent);
++	struct usb_ep_ops *old_ep_ops;
++	unsigned long flags;
++
++	spin_lock_irqsave(&dwc->lock, flags);
++
++	/* Restore original ep ops */
++	if (!mdwc->original_ep_ops[dep->number]) {
++		spin_unlock_irqrestore(&dwc->lock, flags);
++		dev_err(mdwc->dev,
++			"ep [%s,%d] was not configured as qcom endpoint\n",
++			ep->name, dep->number);
++		return -EINVAL;
++	}
++	old_ep_ops = (struct usb_ep_ops *)ep->ops;
++	ep->ops = mdwc->original_ep_ops[dep->number];
++	mdwc->original_ep_ops[dep->number] = NULL;
++	kfree(old_ep_ops);
++
++	spin_unlock_irqrestore(&dwc->lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(qcom_ep_clear_ops);
++
++static int dwc3_core_send_gadget_ep_cmd(struct dwc3_ep *dep, unsigned int cmd,
++		struct dwc3_gadget_ep_cmd_params *params)
++{
++	const struct usb_endpoint_descriptor *desc = dep->endpoint.desc;
++	struct dwc3 *dwc = dep->dwc;
++	struct dwc3_qcom *mdwc = dev_get_drvdata(dwc->dev->parent);
++	u32 timeout = 5000;
++	u32 saved_config = 0;
++	u32 reg;
++	int cmd_status = 0;
++	int ret = -EINVAL;
++
++	/*
++	 * When operating in USB 2.0 speeds (HS/FS), if GUSB2PHYCFG.ENBLSLPM or
++	 * GUSB2PHYCFG.SUSPHY is set, it must be cleared before issuing an
++	 * endpoint command.
++	 *
++	 * Save and clear both GUSB2PHYCFG.ENBLSLPM and GUSB2PHYCFG.SUSPHY
++	 * settings. Restore them after the command is completed.
++	 *
++	 * DWC_usb3 3.30a and DWC_usb31 1.90a programming guide section 3.2.2
++	 */
++	if (dwc->gadget->speed <= USB_SPEED_HIGH) {
++		reg = dwc3_qcom_ep_readl(dwc->regs, DWC3_GUSB2PHYCFG(0));
++		if (unlikely(reg & DWC3_GUSB2PHYCFG_SUSPHY)) {
++			saved_config |= DWC3_GUSB2PHYCFG_SUSPHY;
++			reg &= ~DWC3_GUSB2PHYCFG_SUSPHY;
++		}
++
++		if (reg & DWC3_GUSB2PHYCFG_ENBLSLPM) {
++			saved_config |= DWC3_GUSB2PHYCFG_ENBLSLPM;
++			reg &= ~DWC3_GUSB2PHYCFG_ENBLSLPM;
++		}
++
++		if (saved_config) {
++			dwc3_qcom_ep_writel(dwc->regs, DWC3_GUSB2PHYCFG(0), reg);
++		}
++	}
++
++	dwc3_qcom_ep_writel(dep->regs, DWC3_DEPCMDPAR0, params->param0);
++	dwc3_qcom_ep_writel(dep->regs, DWC3_DEPCMDPAR1, params->param1);
++	dwc3_qcom_ep_writel(dep->regs, DWC3_DEPCMDPAR2, params->param2);
++
++	/*
++	 * Synopsys Databook 2.60a states in section 6.3.2.5.6 of that if we're
++	 * not relying on XferNotReady, we can make use of a special "No
++	 * Response Update Transfer" command where we should clear both CmdAct
++	 * and CmdIOC bits.
++	 *
++	 * With this, we don't need to wait for command completion and can
++	 * straight away issue further commands to the endpoint.
++	 *
++	 * NOTICE: We're making an assumption that control endpoints will never
++	 * make use of Update Transfer command. This is a safe assumption
++	 * because we can never have more than one request at a time with
++	 * Control Endpoints. If anybody changes that assumption, this chunk
++	 * needs to be updated accordingly.
++	 */
++	if (DWC3_DEPCMD_CMD(cmd) == DWC3_DEPCMD_UPDATETRANSFER &&
++			!usb_endpoint_xfer_isoc(desc))
++		cmd &= ~(DWC3_DEPCMD_CMDIOC | DWC3_DEPCMD_CMDACT);
++	else
++		cmd |= DWC3_DEPCMD_CMDACT;
++
++	dwc3_qcom_ep_writel(dep->regs, DWC3_DEPCMD, cmd);
++	do {
++		reg = dwc3_qcom_ep_readl(dep->regs, DWC3_DEPCMD);
++		if (!(reg & DWC3_DEPCMD_CMDACT)) {
++			cmd_status = DWC3_DEPCMD_STATUS(reg);
++
++			switch (cmd_status) {
++			case 0:
++				ret = 0;
++				break;
++			case DEPEVT_TRANSFER_NO_RESOURCE:
++				dev_WARN(dwc->dev, "No resource for %s\n",
++					 dep->name);
++				ret = -EINVAL;
++				break;
++			case DEPEVT_TRANSFER_BUS_EXPIRY:
++				/*
++				 * SW issues START TRANSFER command to
++				 * isochronous ep with future frame interval. If
++				 * future interval time has already passed when
++				 * core receives the command, it will respond
++				 * with an error status of 'Bus Expiry'.
++				 *
++				 * Instead of always returning -EINVAL, let's
++				 * give a hint to the gadget driver that this is
++				 * the case by returning -EAGAIN.
++				 */
++				ret = -EAGAIN;
++				break;
++			default:
++				dev_WARN(dwc->dev, "UNKNOWN cmd status\n");
++			}
++
++			break;
++		}
++	} while (--timeout);
++
++	if (timeout == 0) {
++		ret = -ETIMEDOUT;
++		cmd_status = -ETIMEDOUT;
++	}
++
++	if (DWC3_DEPCMD_CMD(cmd) == DWC3_DEPCMD_STARTTRANSFER) {
++		if (ret == 0) {
++			if (mdwc->hw_eps[dep->number].mode == USB_EP_GSI)
++				mdwc->hw_eps[dep->number].flags |=
++					DWC3_QCOM_HW_EP_TRANSFER_STARTED;
++			else
++				dep->flags |= DWC3_EP_TRANSFER_STARTED;
++		}
++
++		if (ret != -ETIMEDOUT) {
++			u32 res_id;
++
++			res_id = dwc3_qcom_ep_readl(dep->regs, DWC3_DEPCMD);
++			dep->resource_index = DWC3_DEPCMD_GET_RSC_IDX(res_id);
++		}
++	}
++
++	if (saved_config) {
++		reg = dwc3_qcom_ep_readl(dwc->regs, DWC3_GUSB2PHYCFG(0));
++		reg |= saved_config;
++		dwc3_qcom_ep_writel(dwc->regs, DWC3_GUSB2PHYCFG(0), reg);
++	}
++
++	return ret;
++}
++
++/**
++ * dwc3_qcom_depcfg_params - Set depcfg parameters for QCOM eps
++ * @ep: Endpoint being configured
++ * @params: depcmd param being passed to the controller
++ *
++ * Initializes the dwc3_gadget_ep_cmd_params structure being passed as part of
++ * the depcfg command.  This API is explicitly used for initializing the params
++ * for QCOM specific HW endpoints.
++ *
++ * Supported EP types:
++ * - USB GSI
++ * - USB BAM
++ * - USB EBC
++ */
++static void dwc3_qcom_depcfg_params(struct usb_ep *ep, struct dwc3_gadget_ep_cmd_params *params)
++{
++	struct dwc3_ep *dep = to_dwc3_ep(ep);
++	struct dwc3 *dwc = dep->dwc;
++	struct dwc3_qcom *mdwc = dev_get_drvdata(dwc->dev->parent);
++	const struct usb_endpoint_descriptor *desc = ep->desc;
++	const struct usb_ss_ep_comp_descriptor *comp_desc = ep->comp_desc;
++
++	params->param0 = DWC3_DEPCFG_EP_TYPE(usb_endpoint_type(desc))
++		| DWC3_DEPCFG_MAX_PACKET_SIZE(usb_endpoint_maxp(desc));
++
++	/* Burst size is only needed in SuperSpeed mode */
++	if (dwc->gadget->speed >= USB_SPEED_SUPER) {
++		u32 burst = dep->endpoint.maxburst;
++
++		params->param0 |= DWC3_DEPCFG_BURST_SIZE(burst - 1);
++	}
++
++	if (usb_ss_max_streams(comp_desc) && usb_endpoint_xfer_bulk(desc)) {
++		params->param1 |= DWC3_DEPCFG_STREAM_CAPABLE
++					| DWC3_DEPCFG_STREAM_EVENT_EN;
++		dep->stream_capable = true;
++	}
++
++	/* Set EP number */
++	params->param1 |= DWC3_DEPCFG_EP_NUMBER(dep->number);
++	if (dep->direction)
++		params->param0 |= DWC3_DEPCFG_FIFO_NUMBER(dep->number >> 1);
++
++	params->param0 |= DWC3_DEPCFG_ACTION_INIT;
++
++	if (mdwc->hw_eps[dep->number].mode == USB_EP_EBC) {
++		params->param1 |= DWC3_DEPCFG_RETRY | DWC3_DEPCFG_TRB_WB;
++		params->param0 |= DWC3_DEPCFG_EBC_MODE;
++	}
++}
++
++static int dwc3_qcom_set_ep_config(struct dwc3_ep *dep, unsigned int action)
++{
++	const struct usb_ss_ep_comp_descriptor *comp_desc;
++	const struct usb_endpoint_descriptor *desc;
++	struct dwc3_gadget_ep_cmd_params params;
++	struct usb_ep *ep = &dep->endpoint;
++
++	comp_desc = dep->endpoint.comp_desc;
++	desc = dep->endpoint.desc;
++
++	memset(&params, 0x00, sizeof(params));
++	dwc3_qcom_depcfg_params(ep, &params);
++
++	return dwc3_core_send_gadget_ep_cmd(dep, DWC3_DEPCMD_SETEPCONFIG, &params);
++}
++
++/**
++ * dwc3_core_calc_tx_fifo_size - calculates the txfifo size value
++ * @dwc: pointer to the DWC3 context
++ * @nfifos: number of fifos to calculate for
++ *
++ * Calculates the size value based on the equation below:
++ *
++ * fifo_size = mult * ((max_packet + mdwidth)/mdwidth + 1) + 1
++ *
++ * The max packet size is set to 1024, as the txfifo requirements mainly apply
++ * to super speed USB use cases.  However, it is safe to overestimate the fifo
++ * allocations for other scenarios, i.e. high speed USB.
++ */
++static int dwc3_core_calc_tx_fifo_size(struct dwc3 *dwc, int mult)
++{
++	int max_packet = 1024;
++	int fifo_size;
++	int mdwidth;
++
++	mdwidth = dwc3_mdwidth(dwc);
++
++	/* MDWIDTH is represented in bits, we need it in bytes */
++	mdwidth >>= 3;
++
++	fifo_size = mult * ((max_packet + mdwidth) / mdwidth) + 1;
++	return fifo_size;
++}
++
++/*
++ * dwc3_core_resize_tx_fifos - reallocate fifo spaces for current use-case
++ * @dwc: pointer to our context structure
++ *
++ * This function will a best effort FIFO allocation in order
++ * to improve FIFO usage and throughput, while still allowing
++ * us to enable as many endpoints as possible.
++ *
++ * Keep in mind that this operation will be highly dependent
++ * on the configured size for RAM1 - which contains TxFifo -,
++ * the amount of endpoints enabled on coreConsultant tool, and
++ * the width of the Master Bus.
++ *
++ * In general, FIFO depths are represented with the following equation:
++ *
++ * fifo_size = mult * ((max_packet + mdwidth)/mdwidth + 1) + 1
++ *
++ * Conversions can be done to the equation to derive the number of packets that
++ * will fit to a particular FIFO size value.
++ */
++static int dwc3_core_resize_tx_fifos(struct dwc3_ep *dep)
++{
++	struct dwc3 *dwc = dep->dwc;
++	int fifo_0_start;
++	int ram1_depth;
++	int fifo_size;
++	int min_depth;
++	int num_in_ep;
++	int remaining;
++	int num_fifos = 1;
++	int fifo;
++	int tmp;
++
++	if (!dwc->do_fifo_resize)
++		return 0;
++
++	/* resize IN endpoints except ep0 */
++	if (!usb_endpoint_dir_in(dep->endpoint.desc) || dep->number <= 1)
++		return 0;
++
++	ram1_depth = DWC3_RAM1_DEPTH(dwc->hwparams.hwparams7);
++
++	if ((dep->endpoint.maxburst > 1 &&
++	     usb_endpoint_xfer_bulk(dep->endpoint.desc)) ||
++	    usb_endpoint_xfer_isoc(dep->endpoint.desc))
++		num_fifos = 3;
++
++	if (dep->endpoint.maxburst > 6 &&
++	    usb_endpoint_xfer_bulk(dep->endpoint.desc) && DWC3_IP_IS(DWC31))
++		num_fifos = dwc->tx_fifo_resize_max_num;
++
++	/* FIFO size for a single buffer */
++	fifo = dwc3_core_calc_tx_fifo_size(dwc, 1);
++
++	/* Calculate the number of remaining EPs w/o any FIFO */
++	num_in_ep = dwc->max_cfg_eps;
++	num_in_ep -= dwc->num_ep_resized;
++
++	/* Reserve at least one FIFO for the number of IN EPs */
++	min_depth = num_in_ep * (fifo + 1);
++	remaining = ram1_depth - min_depth - dwc->last_fifo_depth;
++	remaining = max_t(int, 0, remaining);
++	/*
++	 * We've already reserved 1 FIFO per EP, so check what we can fit in
++	 * addition to it.  If there is not enough remaining space, allocate
++	 * all the remaining space to the EP.
++	 */
++	fifo_size = (num_fifos - 1) * fifo;
++	if (remaining < fifo_size)
++		fifo_size = remaining;
++
++	fifo_size += fifo;
++	/* Last increment according to the TX FIFO size equation */
++	fifo_size++;
++
++	/* Check if TXFIFOs start at non-zero addr */
++	tmp = dwc3_qcom_ep_readl(dwc->regs, DWC3_GTXFIFOSIZ(0));
++	fifo_0_start = DWC3_GTXFIFOSIZ_TXFSTADDR(tmp);
++
++	fifo_size |= (fifo_0_start + (dwc->last_fifo_depth << 16));
++	if (DWC3_IP_IS(DWC3))
++		dwc->last_fifo_depth += DWC3_GTXFIFOSIZ_TXFDEP(fifo_size);
++	else
++		dwc->last_fifo_depth += DWC31_GTXFIFOSIZ_TXFDEP(fifo_size);
++
++	/* Check fifo size allocation doesn't exceed available RAM size. */
++	if (dwc->last_fifo_depth >= ram1_depth) {
++		dev_err(dwc->dev, "Fifosize(%d) > RAM size(%d) %s depth:%d\n",
++			dwc->last_fifo_depth, ram1_depth,
++			dep->endpoint.name, fifo_size);
++		if (DWC3_IP_IS(DWC3))
++			fifo_size = DWC3_GTXFIFOSIZ_TXFDEP(fifo_size);
++		else
++			fifo_size = DWC31_GTXFIFOSIZ_TXFDEP(fifo_size);
++
++		dwc->last_fifo_depth -= fifo_size;
++		return -ENOMEM;
++	}
++
++	dwc3_qcom_ep_writel(dwc->regs, DWC3_GTXFIFOSIZ(dep->number >> 1), fifo_size);
++	dwc->num_ep_resized++;
++
++	return 0;
++}
++
++static inline dma_addr_t dwc3_trb_dma_offset(struct dwc3_ep *dep,
++		struct dwc3_trb *trb)
++{
++	u32 offset = (char *) trb - (char *) dep->trb_pool;
++
++	return dep->trb_pool_dma + offset;
++}
++
++static int __dwc3_qcom_ep_enable(struct dwc3_ep *dep, unsigned int action)
++{
++	struct dwc3 *dwc = dep->dwc;
++	const struct usb_endpoint_descriptor *desc = dep->endpoint.desc;
++	u32 reg;
++	int ret;
++
++	ret = dwc3_qcom_set_ep_config(dep, action);
++	if (ret) {
++		dev_err(dwc->dev, "set_ep_config() failed for %s\n", dep->name);
++		return ret;
++	}
++
++	if (!(dep->flags & DWC3_EP_ENABLED)) {
++		struct dwc3_trb	*trb_st_hw;
++		struct dwc3_trb	*trb_link;
++
++		dwc3_core_resize_tx_fifos(dep);
++
++		dep->type = usb_endpoint_type(desc);
++		dep->flags |= DWC3_EP_ENABLED;
++
++		reg = dwc3_qcom_ep_readl(dwc->regs, DWC3_DALEPENA);
++		reg |= DWC3_DALEPENA_EP(dep->number);
++		dwc3_qcom_ep_writel(dwc->regs, DWC3_DALEPENA, reg);
++
++		/* Initialize the TRB ring */
++		dep->trb_dequeue = 0;
++		dep->trb_enqueue = 0;
++		memset(dep->trb_pool, 0,
++		       sizeof(struct dwc3_trb) * DWC3_TRB_NUM);
++
++		/* Link TRB. The HWO bit is never reset */
++		trb_st_hw = &dep->trb_pool[0];
++
++		trb_link = &dep->trb_pool[DWC3_TRB_NUM - 1];
++		trb_link->bpl = lower_32_bits(dwc3_trb_dma_offset(dep, trb_st_hw));
++		trb_link->bph = upper_32_bits(dwc3_trb_dma_offset(dep, trb_st_hw));
++		trb_link->ctrl |= DWC3_TRBCTL_LINK_TRB;
++		trb_link->ctrl |= DWC3_TRB_CTRL_HWO;
++	}
++
++	return 0;
++}
++
++static int dwc3_qcom_ep_enable(struct usb_ep *ep,
++			      const struct usb_endpoint_descriptor *desc)
++{
++	struct dwc3_ep *dep;
++	struct dwc3 *dwc;
++	struct dwc3_qcom *mdwc;
++	unsigned long flags;
++	int ret;
++
++	if (!ep || !desc || desc->bDescriptorType != USB_DT_ENDPOINT) {
++		pr_debug("dwc3: invalid parameters\n");
++		return -EINVAL;
++	}
++
++	if (!desc->wMaxPacketSize) {
++		pr_debug("dwc3: missing wMaxPacketSize\n");
++		return -EINVAL;
++	}
++
++	dep = to_dwc3_ep(ep);
++	dwc = dep->dwc;
++	mdwc = dev_get_drvdata(dwc->dev->parent);
++
++	if (dev_WARN_ONCE(dwc->dev, dep->flags & DWC3_EP_ENABLED,
++					"%s is already enabled\n",
++					dep->name))
++		return 0;
++
++	if (pm_runtime_suspended(dwc->sysdev)) {
++		dev_err(dwc->dev, "fail ep_enable %s device is into LPM\n",
++					dep->name);
++		return -EINVAL;
++	}
++
++	spin_lock_irqsave(&dwc->lock, flags);
++	ret = __dwc3_qcom_ep_enable(dep, DWC3_DEPCFG_ACTION_INIT);
++	/*dbg_event(dep->number, "ENABLE", ret);*/
++	spin_unlock_irqrestore(&dwc->lock, flags);
++
++	return ret;
++}
++
++static int __dwc3_qcom_ebc_ep_queue(struct dwc3_ep *dep, struct dwc3_request *req)
++{
++	struct dwc3_gadget_ep_cmd_params params;
++	u32 cmd, param1;
++	int ret = 0;
++
++	req->status = DWC3_REQUEST_STATUS_STARTED;
++	req->num_trbs++;
++	dep->trb_enqueue++;
++	list_add_tail(&req->list, &dep->started_list);
++	if (dep->direction)
++		param1 = 0x0;
++	else
++		param1 = 0x200;
++
++	/* Now start the transfer */
++	memset(&params, 0, sizeof(params));
++	params.param0 = 0x8000; /* TDAddr High */
++	params.param1 = param1; /* DAddr Low */
++
++	cmd = DWC3_DEPCMD_STARTTRANSFER;
++	ret = dwc3_core_send_gadget_ep_cmd(dep, cmd, &params);
++	if (ret < 0) {
++		dev_dbg(dep->dwc->dev,
++			"%s: failed to send STARTTRANSFER command\n",
++			__func__);
++
++		list_del(&req->list);
++		return ret;
++	}
++
++	return ret;
++}
++
++/**
++ * Cleanups for qcom endpoint on request complete.
++ *
++ * Also call original request complete.
++ *
++ * @usb_ep - pointer to usb_ep instance.
++ * @request - pointer to usb_request instance.
++ *
++ * @return int - 0 on success, negative on error.
++ */
++static void dwc3_qcom_req_complete_func(struct usb_ep *ep,
++				       struct usb_request *request)
++{
++	struct dwc3_ep *dep = to_dwc3_ep(ep);
++	struct dwc3 *dwc = dep->dwc;
++	struct dwc3_qcom *mdwc = dev_get_drvdata(dwc->dev->parent);
++	struct dwc3_qcom_req_complete *req_complete = NULL;
++
++	/* Find original request complete function and remove it from list */
++	list_for_each_entry(req_complete, &mdwc->req_complete_list, list_item) {
++		if (req_complete->req == request)
++			break;
++	}
++	if (!req_complete || req_complete->req != request) {
++		dev_err(dep->dwc->dev, "%s: could not find the request\n",
++					__func__);
++		return;
++	}
++	list_del(&req_complete->list_item);
++
++	/*
++	 * Call original complete function, notice that dwc->lock is already
++	 * taken by the caller of this function (dwc3_gadget_giveback()).
++	 */
++	request->complete = req_complete->orig_complete;
++	if (request->complete)
++		request->complete(ep, request);
++
++	kfree(req_complete);
++}
++
++/**
++ * Queue a usb request to the DBM endpoint.
++ * This function should be called after the endpoint
++ * was enabled by the ep_enable.
++ *
++ * This function prepares special structure of TRBs which
++ * is familiar with the DBM HW, so it will possible to use
++ * this endpoint in DBM mode.
++ *
++ * The TRBs prepared by this function, is one normal TRB
++ * which point to a fake buffer, followed by a link TRB
++ * that points to the first TRB.
++ *
++ * The API of this function follow the regular API of
++ * usb_ep_queue (see usb_ep_ops in include/linuk/usb/gadget.h).
++ *
++ * @usb_ep - pointer to usb_ep instance.
++ * @request - pointer to usb_request instance.
++ * @gfp_flags - possible flags.
++ *
++ * @return int - 0 on success, negative on error.
++ */
++static int dwc3_qcom_ep_queue(struct usb_ep *ep,
++			     struct usb_request *request, gfp_t gfp_flags)
++{
++	struct dwc3_request *req = to_dwc3_request(request);
++	struct dwc3_ep *dep = to_dwc3_ep(ep);
++	struct dwc3 *dwc = dep->dwc;
++	struct dwc3_qcom *mdwc = dev_get_drvdata(dwc->dev->parent);
++	struct dwc3_qcom_req_complete *req_complete;
++	unsigned long flags;
++	int ret = 0;
++
++	/*
++	 * We must obtain the lock of the dwc3 core driver,
++	 * including disabling interrupts, so we will be sure
++	 * that we are the only ones that configure the HW device
++	 * core and ensure that we queuing the request will finish
++	 * as soon as possible so we will release back the lock.
++	 */
++	spin_lock_irqsave(&dwc->lock, flags);
++	if (!dep->endpoint.desc) {
++		dev_err(mdwc->dev,
++			"%s: trying to queue request %pK to disabled ep %s\n",
++			__func__, request, ep->name);
++		spin_unlock_irqrestore(&dwc->lock, flags);
++		return -EPERM;
++	}
++
++	if (!mdwc->original_ep_ops[dep->number]) {
++		dev_err(mdwc->dev,
++			"ep [%s,%d] was unconfigured as qcom endpoint\n",
++			ep->name, dep->number);
++		spin_unlock_irqrestore(&dwc->lock, flags);
++		return -EINVAL;
++	}
++
++	if (!request) {
++		dev_err(mdwc->dev, "%s: request is NULL\n", __func__);
++		spin_unlock_irqrestore(&dwc->lock, flags);
++		return -EINVAL;
++	}
++
++	/* HW restriction regarding TRB size (8KB) */
++	if (mdwc->hw_eps[dep->number].mode == USB_EP_BAM && req->request.length < 0x2000) {
++		dev_err(mdwc->dev, "%s: Min TRB size is 8KB\n", __func__);
++		spin_unlock_irqrestore(&dwc->lock, flags);
++		return -EINVAL;
++	}
++
++	if (dep->number == 0 || dep->number == 1) {
++		dev_err(mdwc->dev,
++			"%s: trying to queue dbm request %pK to ep %s\n",
++			__func__, request, ep->name);
++		spin_unlock_irqrestore(&dwc->lock, flags);
++		return -EPERM;
++	}
++
++	if (dep->trb_dequeue != dep->trb_enqueue
++					|| !list_empty(&dep->pending_list)
++					|| !list_empty(&dep->started_list)) {
++		dev_err(mdwc->dev,
++			"%s: trying to queue dbm request %pK tp ep %s\n",
++			__func__, request, ep->name);
++		spin_unlock_irqrestore(&dwc->lock, flags);
++		return -EPERM;
++	}
++	dep->trb_dequeue = 0;
++	dep->trb_enqueue = 0;
++
++	/*
++	 * Override req->complete function, but before doing that,
++	 * store it's original pointer in the req_complete_list.
++	 */
++	req_complete = kzalloc(sizeof(*req_complete), gfp_flags);
++
++	if (!req_complete) {
++		spin_unlock_irqrestore(&dwc->lock, flags);
++		return -ENOMEM;
++	}
++
++	req_complete->req = request;
++	req_complete->orig_complete = request->complete;
++	list_add_tail(&req_complete->list_item, &mdwc->req_complete_list);
++	request->complete = dwc3_qcom_req_complete_func;
++
++	dev_vdbg(dwc->dev, "%s: queuing request %pK to ep %s length %d\n",
++			__func__, request, ep->name, request->length);
++
++	if (mdwc->hw_eps[dep->number].mode == USB_EP_EBC)
++		ret = __dwc3_qcom_ebc_ep_queue(dep, req);
++	if (ret < 0) {
++		dev_err(mdwc->dev,
++			"error %d after queuing %s req\n", ret,
++			mdwc->hw_eps[dep->number].mode == USB_EP_EBC ? "ebc" : "dbm");
++		goto err;
++	}
++
++	spin_unlock_irqrestore(&dwc->lock, flags);
++
++	return 0;
++
++err:
++	spin_unlock_irqrestore(&dwc->lock, flags);
++	kfree(req_complete);
++	return ret;
++}
++
++/**
++ * qcom_ep_update_ops - Override default USB ep ops w/ QCOM specific ops
++ * @ep: The endpoint to override
++ *
++ * Replaces the default endpoint operations with QCOM specific operations for
++ * handling HW based endpoints, such as DBM or EBC eps.  This does not depend
++ * on calling qcom_ep_config beforehand.
++ */
++int qcom_ep_update_ops(struct usb_ep *ep)
++{
++	struct dwc3_ep *dep = to_dwc3_ep(ep);
++	struct dwc3 *dwc = dep->dwc;
++	struct dwc3_qcom *mdwc = dev_get_drvdata(dwc->dev->parent);
++	struct usb_ep_ops *new_ep_ops;
++	unsigned long flags;
++
++	spin_lock_irqsave(&dwc->lock, flags);
++
++	/* Save original ep ops for future restore*/
++	if (mdwc->original_ep_ops[dep->number]) {
++		spin_unlock_irqrestore(&dwc->lock, flags);
++		dev_err(mdwc->dev,
++			"ep [%s,%d] already configured as qcom endpoint\n",
++			ep->name, dep->number);
++		return -EPERM;
++	}
++	mdwc->original_ep_ops[dep->number] = ep->ops;
++
++	/* Set new usb ops as we like */
++	new_ep_ops = kzalloc(sizeof(struct usb_ep_ops), GFP_ATOMIC);
++	if (!new_ep_ops) {
++		spin_unlock_irqrestore(&dwc->lock, flags);
++		return -ENOMEM;
++	}
++
++	(*new_ep_ops) = (*ep->ops);
++	new_ep_ops->queue = dwc3_qcom_ep_queue;
++	new_ep_ops->enable = dwc3_qcom_ep_enable;
++
++	ep->ops = new_ep_ops;
++
++	spin_unlock_irqrestore(&dwc->lock, flags);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(qcom_ep_update_ops);
++
++int qcom_ep_set_mode(struct usb_ep *ep, enum usb_hw_ep_mode mode)
++{
++	struct dwc3_ep *dep = to_dwc3_ep(ep);
++	struct dwc3 *dwc = dep->dwc;
++	struct dwc3_qcom *mdwc = dev_get_drvdata(dwc->dev->parent);
++
++	/* Reset QCOM HW ep parameters for subsequent uses */
++	if (mode == USB_EP_NONE)
++		memset(&mdwc->hw_eps[dep->number], 0,
++			sizeof(mdwc->hw_eps[dep->number]));
++
++	mdwc->hw_eps[dep->number].mode = mode;
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(qcom_ep_set_mode);
++
+ static void dwc3_qcom_vbus_override_enable(struct dwc3_qcom *qcom, bool enable)
+ {
+ 	if (enable) {
+@@ -920,6 +1917,11 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
+ 		goto clk_disable;
+ 	}
+ 
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	if (res)
++		qcom->ebc_desc_addr = devm_ioremap_resource(&pdev->dev, res);
++
++	INIT_LIST_HEAD(&qcom->req_complete_list);
+ 	ret = dwc3_qcom_setup_irq(pdev);
+ 	if (ret) {
+ 		dev_err(dev, "failed to setup IRQs, err=%d\n", ret);
+-- 
+2.34.1
+

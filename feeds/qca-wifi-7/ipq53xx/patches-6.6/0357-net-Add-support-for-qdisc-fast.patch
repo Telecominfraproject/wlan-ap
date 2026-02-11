@@ -1,0 +1,293 @@
+From 763a7b3e372482e19efaed02c25ce9e60e61b8b3 Mon Sep 17 00:00:00 2001
+From: Sourav Poddar <quic_souravp@quicinc.com>
+Date: Fri, 18 Nov 2022 09:45:57 +0530
+Subject: [PATCH 368/500] net: Add support for qdisc fast
+
+Add API to process qdisc on a given virtual interface
+and directly transmit to a given underlying interface
+after the qdisc is run
+
+Change-Id: Ia7ebc94ef5c612ca85964d82eea6036dcce0b5c7
+Signed-off-by: Sourav Poddar <quic_souravp@quicinc.com>
+Signed-off-by: Tushar Ganatra <quic_tganatra@quicinc.com>
+---
+ include/linux/netdevice.h |   1 +
+ net/core/dev.c            | 122 +++++++++++++++++++++++++++++++++++++-
+ net/sched/sch_generic.c   |  94 ++++++++++++++++++++++++++++-
+ 3 files changed, 213 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 57a73285cc71..1a04f9876690 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -3147,6 +3147,7 @@ static inline int dev_direct_xmit(struct sk_buff *skb, u16 queue_id)
+ bool dev_fast_xmit_vp(struct sk_buff *skb, struct net_device *dev);
+ bool dev_fast_xmit(struct sk_buff *skb, struct net_device *dev,
+ 		   netdev_features_t features);
++bool dev_fast_xmit_qdisc(struct sk_buff *skb, struct net_device *top_qdisc_dev, struct net_device *bottom_dev);
+ int register_netdevice(struct net_device *dev);
+ void unregister_netdevice_queue(struct net_device *dev, struct list_head *head);
+ void unregister_netdevice_many(struct list_head *head);
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 4d923dcef82d..1b094bb0987f 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3598,7 +3598,6 @@ struct sk_buff *dev_hard_start_xmit(struct sk_buff *first, struct net_device *de
+ 
+ 	while (skb) {
+ 		struct sk_buff *next = skb->next;
+-
+ 		skb_mark_not_on_list(skb);
+ 		rc = xmit_one(skb, dev, txq, next != NULL);
+ 		if (unlikely(!dev_xmit_complete(rc))) {
+@@ -3785,6 +3784,60 @@ static int dev_qdisc_enqueue(struct sk_buff *skb, struct Qdisc *q,
+ 	return rc;
+ }
+ 
++static inline int __dev_xmit_skb_qdisc(struct sk_buff *skb, struct Qdisc *q,
++				 struct net_device *top_qdisc_dev,
++				 struct netdev_queue *top_txq)
++{
++	spinlock_t *root_lock = qdisc_lock(q);
++	struct sk_buff *to_free = NULL;
++	bool contended;
++	int rc;
++
++	qdisc_calculate_pkt_len(skb, q);
++
++	if (q->flags & TCQ_F_NOLOCK) {
++		rc = q->enqueue(skb, q, &to_free) & NET_XMIT_MASK;
++		if (likely(!netif_xmit_frozen_or_stopped(top_txq)))
++			qdisc_run(q);
++
++		if (unlikely(to_free))
++			kfree_skb_list(to_free);
++		return rc;
++	}
++
++	/*
++	 * Heuristic to force contended enqueues to serialize on a
++	 * separate lock before trying to get qdisc main lock.
++	 * This permits qdisc->running owner to get the lock more
++	 * often and dequeue packets faster.
++	 */
++	contended = qdisc_is_running(q);
++	if (unlikely(contended))
++		spin_lock(&q->busylock);
++
++	spin_lock(root_lock);
++	if (unlikely(test_bit(__QDISC_STATE_DEACTIVATED, &q->state))) {
++		__qdisc_drop(skb, &to_free);
++		rc = NET_XMIT_DROP;
++	} else {
++		rc = q->enqueue(skb, q, &to_free) & NET_XMIT_MASK;
++		if (qdisc_run_begin(q)) {
++			if (unlikely(contended)) {
++				spin_unlock(&q->busylock);
++				contended = false;
++			}
++			__qdisc_run(q);
++			qdisc_run_end(q);
++		}
++	}
++	spin_unlock(root_lock);
++	if (unlikely(to_free))
++		kfree_skb_list(to_free);
++	if (unlikely(contended))
++		spin_unlock(&q->busylock);
++	return rc;
++}
++
+ static inline int __dev_xmit_skb(struct sk_buff *skb, struct Qdisc *q,
+ 				 struct net_device *dev,
+ 				 struct netdev_queue *txq)
+@@ -4327,6 +4380,73 @@ bool dev_fast_xmit_vp(struct sk_buff *skb,
+ }
+ EXPORT_SYMBOL(dev_fast_xmit_vp);
+ 
++/**
++ *	dev_fast_xmit_qdisc - fast xmit the skb along with qdisc processing
++ *	@skb:buffer to transmit
++ *	@top_qdisc_dev: the top device on which qdisc is enabled.
++ *	@bottom_dev: the device on which transmission should happen after qdisc processing.
++ *	sucessful return true
++ *	failed return false
++ */
++bool dev_fast_xmit_qdisc(struct sk_buff *skb, struct net_device *top_qdisc_dev, struct net_device *bottom_dev)
++{
++        struct netdev_queue *txq;
++	struct Qdisc *q;
++	int rc = -ENOMEM;
++
++	if (unlikely(!(top_qdisc_dev->flags & IFF_UP))) {
++		return false;
++	}
++
++	skb_reset_mac_header(skb);
++
++	/* Disable soft irqs for various locks below. Also
++	 * stops preemption for RCU.
++	 */
++	rcu_read_lock_bh();
++
++	txq = netdev_core_pick_tx(top_qdisc_dev, skb, NULL);
++	q = rcu_dereference_bh(txq->qdisc);
++	if (unlikely(!q->enqueue)) {
++		rcu_read_unlock_bh();
++		return false;
++	}
++
++	skb_update_prio(skb);
++
++	qdisc_pkt_len_init(skb);
++#ifdef CONFIG_NET_CLS_ACT
++	skb->tc_at_ingress = 0;
++#ifdef CONFIG_NET_EGRESS
++	if (static_branch_unlikely(&egress_needed_key)) {
++		skb = sch_handle_egress(skb, &rc, top_qdisc_dev);
++		if (!skb) {
++			rcu_read_unlock_bh();
++			return true;
++		}
++	}
++#endif
++#endif
++	/* If device/qdisc don't need skb->dst, release it right now while
++	 * its hot in this cpu cache.
++	 * TODO: do we need this ?
++	 */
++	if (top_qdisc_dev->priv_flags & IFF_XMIT_DST_RELEASE)
++		skb_dst_drop(skb);
++	else
++		skb_dst_force(skb);
++
++	trace_net_dev_queue(skb);
++
++	/* Update the dev so that we can transmit to bottom device after qdisc */
++	skb->dev = bottom_dev;
++	rc = __dev_xmit_skb_qdisc(skb, q, top_qdisc_dev, txq);
++
++	rcu_read_unlock_bh();
++	return true;
++}
++EXPORT_SYMBOL(dev_fast_xmit_qdisc);
++
+ /**
+  *	dev_fast_xmit - fast xmit the skb
+  *	@skb:buffer to transmit
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index 8807756a4772..c518ad631cb6 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -311,6 +311,68 @@ static struct sk_buff *dequeue_skb(struct Qdisc *q, bool *validate,
+  *				false  - hardware queue frozen backoff
+  *				true   - feel free to send more pkts
+  */
++bool sch_direct_xmit_fast(struct sk_buff *first, struct Qdisc *q, struct net_device *dev, spinlock_t *root_lock)
++{
++	struct sk_buff *skb = first;
++	int rc = NETDEV_TX_OK;
++	struct netdev_queue *txq;
++	int cpu;
++
++	if (unlikely(!(dev->flags & IFF_UP))) {
++		dev_kfree_skb_any(skb);
++		return true;
++	}
++
++	/*
++	 * If GSO is enabled then handle segmentation through dev_queue_xmit
++	 */
++	if (unlikely(skb_is_gso(skb))) {
++		if (root_lock)
++			spin_unlock(root_lock);
++		dev_queue_xmit(first);
++		if (root_lock)
++			spin_lock(root_lock);
++		return true;
++	}
++
++	cpu = smp_processor_id();
++
++	txq = netdev_core_pick_tx(dev, skb, NULL);
++
++	if (likely(txq->xmit_lock_owner != cpu)) {
++		HARD_TX_LOCK(dev, txq, smp_processor_id());
++		if (likely(!netif_xmit_stopped(txq))) {
++			rc = netdev_start_xmit(skb, dev, txq, 0);
++			if (unlikely(!dev_xmit_complete(rc))) {
++				HARD_TX_UNLOCK(dev, txq);
++				/*
++				 * If we dont able to enqueue this to bottom interface, then we
++				 * cannot requeue the packet back, as qdisc was enabled on different
++				 * interface and transmit interface is different
++				 */
++				dev_kfree_skb_any(skb);
++				return true;
++			}
++		} else {
++			dev_kfree_skb_any(skb);
++		}
++		HARD_TX_UNLOCK(dev, txq);
++	} else {
++		dev_kfree_skb_any(skb);
++	}
++
++	return true;
++}
++
++/*
++ * Transmit possibly several skbs, and handle the return status as
++ * required. Owning running seqcount bit guarantees that
++ * only one CPU can execute this function.
++ *
++ * Returns to the caller:
++ *				false  - hardware queue frozen backoff
++ *				true   - feel free to send more pkts
++ */
+ bool sch_direct_xmit(struct sk_buff *skb, struct Qdisc *q,
+ 		     struct net_device *dev, struct netdev_queue *txq,
+ 		     spinlock_t *root_lock, bool validate)
+@@ -401,10 +463,36 @@ static inline bool qdisc_restart(struct Qdisc *q, int *packets)
+ 	if (!(q->flags & TCQ_F_NOLOCK))
+ 		root_lock = qdisc_lock(q);
+ 
+-	dev = qdisc_dev(q);
+-	txq = skb_get_tx_queue(dev, skb);
++	while (skb) {
++		struct sk_buff *next = skb->next;
++		skb->next = NULL;
+ 
+-	return sch_direct_xmit(skb, q, dev, txq, root_lock, validate);
++		if (likely(skb->fast_forwarded)) {
++			/*
++			 * For SFE fast forwarded packets, we send packets directly
++			 * to physical interface pointed to by skb->dev
++			 */
++			if (!sch_direct_xmit_fast(skb, q, skb->dev, root_lock)) {
++				return false;
++			}
++		} else {
++			dev = qdisc_dev(q);
++			txq = skb_get_tx_queue(dev, skb);
++
++			if (!sch_direct_xmit(skb, q, dev, txq, root_lock, validate)) {
++				if (next) {
++					skb = next;
++					dev_requeue_skb(skb, q);
++				}
++
++				return false;
++			}
++		}
++
++		skb = next;
++	}
++
++	return true;
+ }
+ 
+ void __qdisc_run(struct Qdisc *q)
+-- 
+2.34.1
+

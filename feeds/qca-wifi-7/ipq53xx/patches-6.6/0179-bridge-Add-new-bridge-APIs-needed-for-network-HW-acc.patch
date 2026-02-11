@@ -1,0 +1,170 @@
+From 6447fffde1be8235684aaa6b94e016e9c18f7776 Mon Sep 17 00:00:00 2001
+From: Murat Sezgin <quic_msezgin@quicinc.com>
+Date: Wed, 10 May 2023 13:15:19 -0700
+Subject: [PATCH 212/500] bridge: Add new bridge APIs needed for network HW
+ acceleration
+
+Bridge acceleration hardware needs to perform certain operations,
+ currently unsupported by the existing bridge code:
+ *given a certain bridge device and a MAC@, figure out on
+  which underlying slave port this MAC@ is located
+ *trigger an FDB entry refresh from outside the bridge code: packets will
+  not be seen anymore in the host, once a flow has been accelerated.
+  So the hardware accelerator driver needs to keep track of the accelerated
+  flows and refresh the MACs accordingly.
+ *update bridge interface statistics from outside the bridge code:
+  once acceleration is enabled on a connection, packets will not flow
+  through the host CPU, so we need the hardware accelerator driver to
+  maintain the statistics on the host and update them and add whatever
+  flows through the hardware.
+ These change adds the corresponding functions, and make it available
+ to other through EXPORT_SYMBOLS().
+
+Change-Id: I67afb325796004053897d9916e2df91827b65139
+Signed-off-by: Murat Sezgin <msezgin@codeaurora.org>
+
+net: bridge: Rework APIs added for network HW acceleration
+
+This change is to rework the bridge APIs based on the feedback from the
+chromium community
+
+Change-Id: I92a65f1eb26c6700d871f9deb40bccf302cf18eb
+Signed-off-by: Murat Sezgin <msezgin@codeaurora.org>
+Signed-off-by: Murat Sezgin <quic_msezgin@quicinc.com>
+---
+ include/linux/if_bridge.h |  8 ++++++
+ net/bridge/br_fdb.c       | 38 ++++++++++++++++++++++++++++
+ net/bridge/br_if.c        | 52 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 98 insertions(+)
+
+diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
+index cff03a1dfd68..c62613c8ea1e 100644
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -71,6 +71,14 @@ void brioctl_set(int (*hook)(struct net *net, struct net_bridge *br,
+ 			     void __user *uarg));
+ int br_ioctl_call(struct net *net, struct net_bridge *br, unsigned int cmd,
+ 		  struct ifreq *ifr, void __user *uarg);
++extern struct net_device *br_port_dev_get(struct net_device *dev,
++					  unsigned char *addr);
++extern void br_refresh_fdb_entry(struct net_device *dev, const char *addr);
++extern void br_dev_update_stats(struct net_device *dev,
++				struct rtnl_link_stats64 *nlstats);
++extern struct net_bridge_fdb_entry *br_fdb_has_entry(struct net_device *dev,
++						     const char *addr,
++						     __u16 vid);
+ 
+ #if IS_ENABLED(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_BRIDGE_IGMP_SNOOPING)
+ int br_multicast_list_adjacent(struct net_device *dev,
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index e69a872bfc1d..83c8e7b5a89a 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -914,6 +914,44 @@ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
+ 	}
+ }
+ 
++/* Refresh FDB entries for bridge packets being forwarded by offload engines */
++void br_refresh_fdb_entry(struct net_device *dev, const char *addr)
++{
++	struct net_bridge_port *p = br_port_get_rcu(dev);
++
++	if (!p || p->state == BR_STATE_DISABLED)
++		return;
++
++	if (!is_valid_ether_addr(addr)) {
++		pr_info("bridge: Attempt to refresh with invalid ether address %pM\n",
++			addr);
++		return;
++	}
++
++	rcu_read_lock();
++	br_fdb_update(p->br, p, addr, 0, true);
++	rcu_read_unlock();
++}
++EXPORT_SYMBOL_GPL(br_refresh_fdb_entry);
++
++/* Look up the MAC address in the device's bridge fdb table */
++struct net_bridge_fdb_entry *br_fdb_has_entry(struct net_device *dev,
++					      const char *addr, __u16 vid)
++{
++	struct net_bridge_port *p = br_port_get_rcu(dev);
++	struct net_bridge_fdb_entry *fdb;
++
++	if (!p || p->state == BR_STATE_DISABLED)
++		return NULL;
++
++	rcu_read_lock();
++	fdb = fdb_find_rcu(&p->br->fdb_hash_tbl, addr, vid);
++	rcu_read_unlock();
++
++	return fdb;
++}
++EXPORT_SYMBOL_GPL(br_fdb_has_entry);
++
+ /* Dump information about entries, in response to GETNEIGH */
+ int br_fdb_dump(struct sk_buff *skb,
+ 		struct netlink_callback *cb,
+diff --git a/net/bridge/br_if.c b/net/bridge/br_if.c
+index 2450690f98cf..aa7a5798bd34 100644
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@ -775,3 +775,55 @@ bool br_port_flag_is_set(const struct net_device *dev, unsigned long flag)
+ 	return p->flags & flag;
+ }
+ EXPORT_SYMBOL_GPL(br_port_flag_is_set);
++
++/* br_port_dev_get()
++ *      Using the given addr, identify the port to which it is reachable,
++ *      returing a reference to the net device associated with that port.
++ *
++ * NOTE: Return NULL if given dev is not a bridge or the mac has no
++ * associated port.
++ */
++struct net_device *br_port_dev_get(struct net_device *dev, unsigned char *addr)
++{
++	struct net_bridge_fdb_entry *fdbe;
++	struct net_bridge *br;
++	struct net_device *netdev = NULL;
++
++	/* Is this a bridge? */
++	if (!(dev->priv_flags & IFF_EBRIDGE))
++		return NULL;
++
++	br = netdev_priv(dev);
++
++	/* Lookup the fdb entry and get reference to the port dev */
++	rcu_read_lock();
++	fdbe = br_fdb_find_rcu(br, addr, 0);
++	if (fdbe && fdbe->dst) {
++		netdev = fdbe->dst->dev; /* port device */
++		dev_hold(netdev);
++	}
++	rcu_read_unlock();
++	return netdev;
++}
++EXPORT_SYMBOL_GPL(br_port_dev_get);
++
++/* Update bridge statistics for bridge packets processed by offload engines */
++void br_dev_update_stats(struct net_device *dev,
++			 struct rtnl_link_stats64 *nlstats)
++{
++	struct pcpu_sw_netstats *stats;
++
++	/* Is this a bridge? */
++	if (!(dev->priv_flags & IFF_EBRIDGE))
++		return;
++
++	stats = per_cpu_ptr(dev->tstats, 0);
++
++	u64_stats_update_begin(&stats->syncp);
++	u64_stats_add(&stats->rx_packets, nlstats->rx_packets);
++	u64_stats_add(&stats->rx_bytes, nlstats->rx_bytes);
++	u64_stats_add(&stats->tx_packets, nlstats->tx_packets);
++	u64_stats_add(&stats->tx_bytes, nlstats->tx_bytes);
++	u64_stats_update_end(&stats->syncp);
++}
++EXPORT_SYMBOL_GPL(br_dev_update_stats);
+-- 
+2.34.1
+

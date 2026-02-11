@@ -1,0 +1,261 @@
+From 8b2fc28f1a1280663d30466c788ae80774fa1f29 Mon Sep 17 00:00:00 2001
+From: Murat Sezgin <msezgin@codeaurora.org>
+Date: Fri, 24 Apr 2020 11:00:19 -0700
+Subject: [PATCH 303/500] inet: pptp: Enable offload mode for PPTP GRE sequence
+ number handling
+
+Changes in this patch will allow all PPTP Data and LCP packets
+to go via packet acceleration hardware. The hardware will take
+care of Seq/Ack numbers update.
+
+Change-Id: Ia5cd7893d9fda180174f78c3468279678422794d
+Signed-off-by: Shyam Sunder <ssunde@codeaurora.org>
+Signed-off-by: Murat Sezgin <msezgin@codeaurora.org>
+---
+ drivers/net/ppp/pptp.c   | 136 +++++++++++++++++++++++++++++++++++++--
+ include/linux/if_pppox.h |  21 ++++++
+ 2 files changed, 153 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ppp/pptp.c b/drivers/net/ppp/pptp.c
+index a7c1f06a1cc4..e4e8cd696a6c 100644
+--- a/drivers/net/ppp/pptp.c
++++ b/drivers/net/ppp/pptp.c
+@@ -50,6 +50,8 @@ static struct proto pptp_sk_proto __read_mostly;
+ static const struct ppp_channel_ops pptp_chan_ops;
+ static const struct proto_ops pptp_ops;
+ 
++static pptp_gre_seq_offload_callback_t __rcu pptp_gre_offload_xmit_cb;
++
+ static struct pppox_sock *lookup_chan(u16 call_id, __be32 s_addr)
+ {
+ 	struct pppox_sock *sock;
+@@ -116,6 +118,28 @@ static int lookup_session_dst(struct pptp_opt *opt, u16 call_id, __be32 d_addr)
+ 	return -EINVAL;
+ }
+ 
++/* If offload mode set then this function sends all packets to
++ * offload module instead of network stack
++ */
++static int pptp_client_skb_xmit(struct sk_buff *skb,
++				struct net_device *pptp_dev)
++{
++	pptp_gre_seq_offload_callback_t pptp_gre_offload_cb_f;
++	int ret;
++
++	rcu_read_lock();
++	pptp_gre_offload_cb_f = rcu_dereference(pptp_gre_offload_xmit_cb);
++
++	if (!pptp_gre_offload_cb_f) {
++		rcu_read_unlock();
++		return -1;
++	}
++
++	ret = pptp_gre_offload_cb_f(skb, pptp_dev);
++	rcu_read_unlock();
++	return ret;
++}
++
+ static int add_chan(struct pppox_sock *sock,
+ 		    struct pptp_addr *sa)
+ {
+@@ -188,8 +212,11 @@ static int pptp_xmit(struct ppp_channel *chan, struct sk_buff *skb)
+ 
+ 	struct rtable *rt;
+ 	struct net_device *tdev;
++	struct net_device *pptp_dev;
+ 	struct iphdr  *iph;
+ 	int    max_headroom;
++	int    pptp_ifindex;
++	int ret;
+ 
+ 	if (sk_pppox(po)->sk_state & PPPOX_DEAD)
+ 		goto tx_error;
+@@ -283,14 +310,33 @@ static int pptp_xmit(struct ppp_channel *chan, struct sk_buff *skb)
+ 	ip_select_ident(net, skb, NULL);
+ 	ip_send_check(iph);
+ 
++	pptp_ifindex = ppp_dev_index(chan);
++
+ 	/* set incoming interface as the ppp interface */
+ 	if (skb->skb_iif)
+-		skb->skb_iif = ppp_dev_index(chan);
++		skb->skb_iif = pptp_ifindex;
++
++	/* If the PPTP GRE seq number offload module is not enabled yet
++	 * then sends all PPTP GRE packets through linux network stack
++	 */
++	if (!opt->pptp_offload_mode) {
++		ip_local_out(net, skb->sk, skb);
++		return 1;
++	}
+ 
+-	ip_local_out(net, skb->sk, skb);
++	pptp_dev = dev_get_by_index(&init_net, pptp_ifindex);
++	if (!pptp_dev)
++		goto tx_error;
+ 
+-	return 1;
++	 /* If PPTP offload module is enabled then forward all PPTP GRE
++	  * packets to PPTP GRE offload module
++	  */
++	ret = pptp_client_skb_xmit(skb, pptp_dev);
++	dev_put(pptp_dev);
++	if (ret < 0)
++		goto tx_error;
+ 
++	return 1;
+ tx_error:
+ 	kfree_skb(skb);
+ 	return 1;
+@@ -344,6 +390,13 @@ static int pptp_rcv_core(struct sock *sk, struct sk_buff *skb)
+ 		goto drop;
+ 
+ 	payload = skb->data + headersize;
++
++	 /* If offload is enabled, we expect the offload module
++	  * to handle PPTP GRE sequence number checks
++	  */
++	if (opt->pptp_offload_mode)
++		goto allow_packet;
++
+ 	/* check for expected sequence number */
+ 	if (seq < opt->seq_recv + 1 || WRAPPED(opt->seq_recv, seq)) {
+ 		if ((payload[0] == PPP_ALLSTATIONS) && (payload[1] == PPP_UI) &&
+@@ -504,7 +557,7 @@ static int pptp_connect(struct socket *sock, struct sockaddr *uservaddr,
+ 
+ 	opt->dst_addr = sp->sa_addr.pptp;
+ 	sk->sk_state |= PPPOX_CONNECTED;
+-
++	opt->pptp_offload_mode = false;
+  end:
+ 	release_sock(sk);
+ 	return error;
+@@ -678,6 +731,81 @@ int pptp_session_find(struct pptp_opt *opt, __be16 peer_call_id,
+ }
+ EXPORT_SYMBOL(pptp_session_find);
+ 
++ /* Function to change the offload mode true/false for a PPTP session */
++static int pptp_set_offload_mode(bool accel_mode,
++				 __be16 peer_call_id, __be32 peer_ip_addr)
++{
++	struct pppox_sock *sock;
++	int i = 1;
++
++	rcu_read_lock();
++	for_each_set_bit_from(i, callid_bitmap, MAX_CALLID) {
++		sock = rcu_dereference(callid_sock[i]);
++		if (!sock)
++			continue;
++
++		if (sock->proto.pptp.dst_addr.call_id == peer_call_id &&
++		    sock->proto.pptp.dst_addr.sin_addr.s_addr == peer_ip_addr) {
++			sock_hold(sk_pppox(sock));
++			sock->proto.pptp.pptp_offload_mode = accel_mode;
++			sock_put(sk_pppox(sock));
++			rcu_read_unlock();
++			return 0;
++		}
++	}
++	rcu_read_unlock();
++	return -EINVAL;
++}
++
++/* Enable the PPTP session offload flag */
++int pptp_session_enable_offload_mode(__be16 peer_call_id, __be32 peer_ip_addr)
++{
++	return pptp_set_offload_mode(true, peer_call_id, peer_ip_addr);
++}
++EXPORT_SYMBOL(pptp_session_enable_offload_mode);
++
++/* Disable the PPTP session offload flag */
++int pptp_session_disable_offload_mode(__be16 peer_call_id, __be32 peer_ip_addr)
++{
++	return pptp_set_offload_mode(false, peer_call_id, peer_ip_addr);
++}
++EXPORT_SYMBOL(pptp_session_disable_offload_mode);
++
++/* Register the offload callback function on behalf of the module which
++ * will own the sequence and acknowledgment number updates for all
++ * PPTP GRE packets. All PPTP GRE packets are then transmitted to this
++ * module after encapsulation in order to ensure the correct seq/ack
++ * fields are set in the packets before transmission. This is required
++ * when PPTP flows are offloaded to acceleration engines, in-order to
++ * ensure consistency in sequence and ack numbers between PPTP control
++ * (PPP LCP) and data packets
++ */
++int pptp_register_gre_seq_offload_callback(pptp_gre_seq_offload_callback_t
++					   pptp_gre_offload_cb)
++{
++	pptp_gre_seq_offload_callback_t pptp_gre_offload_cb_f;
++
++	rcu_read_lock();
++	pptp_gre_offload_cb_f = rcu_dereference(pptp_gre_offload_xmit_cb);
++
++	if (pptp_gre_offload_cb_f) {
++		rcu_read_unlock();
++		return -1;
++	}
++
++	rcu_assign_pointer(pptp_gre_offload_xmit_cb, pptp_gre_offload_cb);
++	rcu_read_unlock();
++	return 0;
++}
++EXPORT_SYMBOL(pptp_register_gre_seq_offload_callback);
++
++/* Unregister the PPTP GRE packets sequence number offload callback */
++void pptp_unregister_gre_seq_offload_callback(void)
++{
++	rcu_assign_pointer(pptp_gre_offload_xmit_cb, NULL);
++}
++EXPORT_SYMBOL(pptp_unregister_gre_seq_offload_callback);
++
+ /* pptp_hold_chan() */
+ static void pptp_hold_chan(struct ppp_channel *chan)
+ {
+diff --git a/include/linux/if_pppox.h b/include/linux/if_pppox.h
+index 9516fa885a20..112b83ec8ef1 100644
+--- a/include/linux/if_pppox.h
++++ b/include/linux/if_pppox.h
+@@ -37,6 +37,7 @@ struct pptp_opt {
+ 	u32 ack_sent, ack_recv;
+ 	u32 seq_sent, seq_recv;
+ 	int ppp_flags;
++	bool pptp_offload_mode;
+ };
+ #include <net/sock.h>
+ 
+@@ -101,6 +102,10 @@ struct pppoe_channel_ops {
+ 	int (*get_addressing)(struct ppp_channel *, struct pppoe_opt *);
+ };
+ 
++/* PPTP client callback */
++typedef int (*pptp_gre_seq_offload_callback_t)(struct sk_buff *skb,
++					       struct net_device *pptp_dev);
++
+ /* Return PPPoE channel specific addressing information */
+ extern int pppoe_channel_addressing_get(struct ppp_channel *chan,
+ 					 struct pppoe_opt *addressing);
+@@ -113,4 +118,20 @@ extern int pptp_session_find(struct pptp_opt *opt, __be16 peer_call_id,
+ extern void pptp_channel_addressing_get(struct pptp_opt *opt,
+ 					struct ppp_channel *chan);
+ 
++/* Enable the PPTP session offload flag */
++extern int pptp_session_enable_offload_mode(__be16 peer_call_id,
++					    __be32 peer_ip_addr);
++
++/* Disable the PPTP session offload flag */
++extern int pptp_session_disable_offload_mode(__be16 peer_call_id,
++					     __be32 peer_ip_addr);
++
++/* Register the PPTP GRE packets sequence number offload callback */
++extern int
++pptp_register_gre_seq_offload_callback(pptp_gre_seq_offload_callback_t
++				       pptp_client_cb);
++
++/* Unregister the PPTP GRE packets sequence number offload callback */
++extern void pptp_unregister_gre_seq_offload_callback(void);
++
+ #endif /* !(__LINUX_IF_PPPOX_H) */
+-- 
+2.34.1
+

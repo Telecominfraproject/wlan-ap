@@ -1,0 +1,195 @@
+From 494e35df754351c3dc56f98d55125312468de0c9 Mon Sep 17 00:00:00 2001
+From: Md Sadre Alam <quic_mdalam@quicinc.com>
+Date: Fri, 3 Nov 2023 12:24:39 +0530
+Subject: [PATCH 477/500] crypto: qce - Add cmd descriptor support for SHA
+
+Add support for cmd descriptor support for SHA algorithm
+with cmd descriptor support all the register read/write
+will go via bam.
+
+Change-Id: Iceeaaacc949697e29fc0809cde278fabd63dab97
+Signed-off-by: Md Sadre Alam <quic_mdalam@quicinc.com>
+---
+ drivers/crypto/qce/common.c | 108 +++++++++++++++++++++++++++++++++++-
+ drivers/crypto/qce/sha.c    |  18 ++++++
+ 2 files changed, 125 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/crypto/qce/common.c b/drivers/crypto/qce/common.c
+index 043930f3804f..4d2788c79845 100644
+--- a/drivers/crypto/qce/common.c
++++ b/drivers/crypto/qce/common.c
+@@ -46,6 +46,15 @@ static inline void qce_write_array(struct qce_device *qce, u32 offset,
+ 		qce_write(qce, offset + i * sizeof(u32), val[i]);
+ }
+ 
++static inline void
++qce_clear_array_dma(struct qce_device *qce, u32 offset, unsigned int len)
++{
++	int i;
++
++	for (i = 0; i < len; i++)
++		qce_write_reg_dma(qce, offset + i * sizeof(u32), 0, 1);
++}
++
+ static inline void
+ qce_clear_array(struct qce_device *qce, u32 offset, unsigned int len)
+ {
+@@ -165,6 +174,100 @@ static u32 qce_auth_cfg(unsigned long flags, u32 key_size, u32 auth_size)
+ #endif
+ 
+ #ifdef CONFIG_CRYPTO_DEV_QCE_SHA
++static int qce_setup_regs_ahash_dma(struct crypto_async_request *async_req)
++{
++	struct ahash_request *req = ahash_request_cast(async_req);
++	struct crypto_ahash *ahash = __crypto_ahash_cast(async_req->tfm);
++	struct qce_sha_reqctx *rctx = ahash_request_ctx(req);
++	struct qce_alg_template *tmpl = to_ahash_tmpl(async_req->tfm);
++	struct qce_device *qce = tmpl->qce;
++	unsigned int digestsize = crypto_ahash_digestsize(ahash);
++	unsigned int blocksize = crypto_tfm_alg_blocksize(async_req->tfm);
++	__be32 auth[SHA256_DIGEST_SIZE / sizeof(__be32)] = {0};
++	__be32 mackey[QCE_SHA_HMAC_KEY_SIZE / sizeof(__be32)] = {0};
++	u32 auth_cfg = 0, config;
++	unsigned int iv_words;
++	int ret;
++
++	/* if not the last, the size has to be on the block boundary */
++	if (!rctx->last_blk && req->nbytes % blocksize)
++		return -EINVAL;
++
++	qce_clear_bam_transaction(qce);
++
++	qce_setup_config_dma(qce);
++
++	if (IS_CMAC(rctx->flags)) {
++		qce_write_reg_dma(qce, REG_AUTH_SEG_CFG, 0, 1);
++		qce_write_reg_dma(qce, REG_ENCR_SEG_CFG, 0, 1);
++		qce_write_reg_dma(qce, REG_ENCR_SEG_SIZE, 0, 1);
++		qce_clear_array_dma(qce, REG_AUTH_IV0, 16);
++		qce_clear_array_dma(qce, REG_AUTH_KEY0, 16);
++		qce_clear_array_dma(qce, REG_AUTH_BYTECNT0, 4);
++
++		auth_cfg = qce_auth_cfg(rctx->flags, rctx->authklen, digestsize);
++	}
++
++	if (IS_SHA_HMAC(rctx->flags) || IS_CMAC(rctx->flags)) {
++		u32 authkey_words = rctx->authklen / sizeof(u32);
++
++		qce_cpu_to_be32p_array(mackey, rctx->authkey, rctx->authklen);
++		qce_write_array_dma(qce, REG_AUTH_KEY0, (u32 *)mackey,
++				authkey_words);
++	}
++
++	if (IS_CMAC(rctx->flags))
++		goto go_proc;
++
++	if (rctx->first_blk)
++		memcpy(auth, rctx->digest, digestsize);
++	else
++		qce_cpu_to_be32p_array(auth, rctx->digest, digestsize);
++
++	iv_words = (IS_SHA1(rctx->flags) || IS_SHA1_HMAC(rctx->flags)) ? 5 : 8;
++	qce_write_array_dma(qce, REG_AUTH_IV0, (u32 *)auth, iv_words);
++
++	if (rctx->first_blk)
++		qce_clear_array_dma(qce, REG_AUTH_BYTECNT0, 4);
++	else
++		qce_write_array_dma(qce, REG_AUTH_BYTECNT0,
++				(u32 *)rctx->byte_count, 2);
++
++	auth_cfg = qce_auth_cfg(rctx->flags, 0, digestsize);
++
++	if (rctx->last_blk)
++		auth_cfg |= BIT(AUTH_LAST_SHIFT);
++	else
++		auth_cfg &= ~BIT(AUTH_LAST_SHIFT);
++
++	if (rctx->first_blk)
++		auth_cfg |= BIT(AUTH_FIRST_SHIFT);
++	else
++		auth_cfg &= ~BIT(AUTH_FIRST_SHIFT);
++
++go_proc:
++	qce_write_reg_dma(qce, REG_AUTH_SEG_CFG, auth_cfg, 1);
++	qce_write_reg_dma(qce, REG_AUTH_SEG_SIZE, req->nbytes, 1);
++	qce_write_reg_dma(qce, REG_AUTH_SEG_START, 0, 1);
++	qce_write_reg_dma(qce, REG_ENCR_SEG_CFG, 0, 1);
++	qce_write_reg_dma(qce, REG_SEG_SIZE, req->nbytes, 1);
++
++	/* get little endianness */
++	config = qce_config_reg(qce, 1);
++	qce_write_reg_dma(qce, REG_CONFIG, config, 1);
++
++	qce_write_reg_dma(qce, REG_GOPROC,  BIT(GO_SHIFT) |
++			BIT(RESULTS_DUMP_SHIFT), 1);
++
++	ret = qce_submit_cmd_desc(qce, 0);
++	if (ret) {
++		dev_err(qce->dev, "Error in submitting cmd descriptor\n");
++		return ret;
++	}
++
++	return 0;
++}
++
+ static int qce_setup_regs_ahash(struct crypto_async_request *async_req)
+ {
+ 	struct ahash_request *req = ahash_request_cast(async_req);
+@@ -718,7 +821,10 @@ int qce_start(struct crypto_async_request *async_req, u32 type)
+ #endif
+ #ifdef CONFIG_CRYPTO_DEV_QCE_SHA
+ 	case CRYPTO_ALG_TYPE_AHASH:
+-		return qce_setup_regs_ahash(async_req);
++		if (qce->qce_cmd_desc_enable)
++			return qce_setup_regs_ahash_dma(async_req);
++		else
++			return qce_setup_regs_ahash(async_req);
+ #endif
+ #ifdef CONFIG_CRYPTO_DEV_QCE_AEAD
+ 	case CRYPTO_ALG_TYPE_AEAD:
+diff --git a/drivers/crypto/qce/sha.c b/drivers/crypto/qce/sha.c
+index fc72af8aa9a7..e4a77d495478 100644
+--- a/drivers/crypto/qce/sha.c
++++ b/drivers/crypto/qce/sha.c
+@@ -42,6 +42,7 @@ static void qce_ahash_done(void *data)
+ 	struct qce_alg_template *tmpl = to_ahash_tmpl(async_req->tfm);
+ 	struct qce_device *qce = tmpl->qce;
+ 	struct qce_result_dump *result = qce->dma.result_buf;
++	struct qce_bam_transaction *qce_bam_txn = qce->dma.qce_bam_txn;
+ 	unsigned int digestsize = crypto_ahash_digestsize(ahash);
+ 	int error;
+ 	u32 status;
+@@ -60,6 +61,19 @@ static void qce_ahash_done(void *data)
+ 	rctx->byte_count[0] = cpu_to_be32(result->auth_byte_count[0]);
+ 	rctx->byte_count[1] = cpu_to_be32(result->auth_byte_count[1]);
+ 
++	if (qce->qce_cmd_desc_enable) {
++		if (qce_bam_txn->qce_read_sgl_cnt)
++			dma_unmap_sg(qce->dev,
++				qce_bam_txn->qce_reg_read_sgl,
++				qce_bam_txn->qce_read_sgl_cnt,
++				DMA_DEV_TO_MEM);
++		if (qce_bam_txn->qce_write_sgl_cnt)
++			dma_unmap_sg(qce->dev,
++				qce_bam_txn->qce_reg_write_sgl,
++				qce_bam_txn->qce_write_sgl_cnt,
++				DMA_MEM_TO_DEV);
++	}
++
+ 	error = qce_check_status(qce, &status);
+ 	if (error < 0)
+ 		dev_dbg(qce->dev, "ahash operation error (%x)\n", status);
+@@ -90,6 +104,10 @@ static int qce_ahash_async_req_handle(struct crypto_async_request *async_req)
+ 		rctx->authklen = AES_KEYSIZE_128;
+ 	}
+ 
++	/* Get the LOCK for this request */
++	if (qce->qce_cmd_desc_enable)
++		qce_read_dma_get_lock(qce);
++
+ 	rctx->src_nents = sg_nents_for_len(req->src, req->nbytes);
+ 	if (rctx->src_nents < 0) {
+ 		dev_err(qce->dev, "Invalid numbers of src SG.\n");
+-- 
+2.34.1
+
