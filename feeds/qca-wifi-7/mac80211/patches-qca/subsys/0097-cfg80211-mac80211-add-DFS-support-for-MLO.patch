@@ -1,0 +1,333 @@
+From 34d9c1eb12c761e3ee2fb77565aa9bfb6a988709 Mon Sep 17 00:00:00 2001
+From: Balamurugan Ramar <quic_bramar@quicinc.com>
+Date: Thu, 10 Apr 2025 23:26:03 +0530
+Subject: [PATCH] mac80211: add DFS support for MLO
+
+Currently, Dynamic Frequency Selection (DFS) and its related radar
+events was supported only for non-MLO case where deflink
+(or link_id 0) was always considered.
+However, with MLO in place, there is need to handle DFS in per-link
+manner instead of always assuming link_id 0.
+
+Add support to handle DFS and radar related events per-link basis.
+
+Signed-off-by: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Signed-off-by: Balamurugan Ramar <quic_bramar@quicinc.com>
+---
+ include/net/cfg80211.h     | 11 +++++++
+ include/net/mac80211.h     |  5 ++-
+ net/mac80211/ieee80211_i.h |  4 +--
+ net/mac80211/link.c        | 24 +++++++++++++-
+ net/mac80211/pm.c          |  2 +-
+ net/mac80211/util.c        | 66 ++++++++++++++++++++++++++------------
+ net/wireless/chan.c        |  5 +--
+ net/wireless/nl80211.c     |  4 +++
+ net/wireless/trace.h       | 12 +++++--
+ 9 files changed, 102 insertions(+), 31 deletions(-)
+
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -1130,6 +1130,16 @@ int cfg80211_chandef_primary(const struc
+ int nl80211_send_chandef(struct sk_buff *msg, const struct cfg80211_chan_def *chandef);
+ 
+ /**
++ * cfg80211_chandef_dfs_available - checks if radar is already available
++ * @wiphy: the wiphy to validate against
++ * @chandef: the channel definition to check
++ * Returns:
++ *	true if all channels are radar available, false otherwise
++ */
++bool cfg80211_chandef_dfs_available(struct wiphy *wiphy,
++				    const struct cfg80211_chan_def *chandef);
++
++/**
+  * ieee80211_chanwidth_rate_flags - return rate flags for channel width
+  * @width: the channel width of the channel
+  *
+@@ -8930,6 +8940,7 @@ struct cfg80211_tx_status {
+  * @wdev: wireless device receiving the frame
+  * @status: TX status data
+  * @gfp: context flags
++ * @link_id: valid link_id for MLO operation or 0 otherwise.
+  *
+  * This function is called whenever a management frame was requested to be
+  * transmitted with cfg80211_ops::mgmt_tx() to report the TX status of the
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -6920,8 +6920,11 @@ void ieee80211_radar_detected(struct iee
+  * 	with bitmap
+  * @hw: pointer as obtained from ieee80211_alloc_hw()
+  * @radar_bitmap: denotes the bitmap of radar.
++ * @radar_channel: Channel pointer on which radar is detected. Mandatory to pass
++ *	for MLO drivers. For non-MLO %NULL can be passed
+  */
+-void ieee80211_radar_detected_bitmap(struct ieee80211_hw *hw, u16 radar_bitmap);
++void ieee80211_radar_detected_bitmap(struct ieee80211_hw *hw, u16 radar_bitmap,
++				     struct ieee80211_channel *radar_channel);
+ 
+ 
+ /**
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1361,6 +1361,7 @@ struct mac80211_memory_stats {
+ struct channel_radar_info {
+ 	struct list_head list;
+ 	u16 radar_bitmap;
++	struct ieee80211_channel *radar_channel;
+ };
+ 
+ struct ieee80211_local {
+@@ -2748,8 +2749,7 @@ void ieee80211_recalc_chanctx_min_def(st
+ bool ieee80211_is_radar_required(struct ieee80211_local *local);
+ 
+ void ieee80211_dfs_cac_timer_work(struct wiphy *wiphy, struct wiphy_work *work);
+-void ieee80211_dfs_cac_cancel(struct ieee80211_local *local,
+-			      struct ieee80211_chanctx *chanctx);
++void ieee80211_dfs_cac_cancel(struct ieee80211_local *local);
+ void ieee80211_dfs_radar_detected_work(struct wiphy *wiphy, struct wiphy_work *work);
+ void ieee80211_awgn_detected_work(struct work_struct *work);
+ int ieee80211_send_action_csa(struct ieee80211_sub_if_data *sdata,
+--- a/net/mac80211/link.c
++++ b/net/mac80211/link.c
+@@ -201,9 +201,31 @@ static void ieee80211_free_links(struct
+ 				 struct link_container **links)
+ {
+ 	unsigned int link_id;
++	struct ieee80211_link_data *link;
++	struct ieee80211_bss_conf *link_conf;
++	struct cfg80211_chan_def chandef;
++
++	for (link_id = 0; link_id < IEEE80211_MLD_MAX_NUM_LINKS; link_id++) {
++		link = &links[link_id]->data;
++		link_conf = &links[link_id]->conf;
++
++		if (!link || !link_conf)
++			continue;
++
++		wiphy_delayed_work_cancel(link->sdata->local->hw.wiphy,
++					  &link->dfs_cac_timer_work);
++		if (sdata->wdev.links[link_id].cac_started) {
++			chandef = link_conf->chanreq.oper;
++			WARN_ON(sdata->local->suspended);
++			ieee80211_link_release_channel(link);
++			cfg80211_cac_event(sdata->dev,
++					   &chandef,
++					   NL80211_RADAR_CAC_ABORTED,
++					   GFP_KERNEL, link_id);
++		}
+ 
+-	for (link_id = 0; link_id < IEEE80211_MLD_MAX_NUM_LINKS; link_id++)
+ 		kfree(links[link_id]);
++	}
+ }
+ 
+ static int ieee80211_check_dup_link_addrs(struct ieee80211_sub_if_data *sdata)
+--- a/net/mac80211/pm.c
++++ b/net/mac80211/pm.c
+@@ -32,7 +32,7 @@ int __ieee80211_suspend(struct ieee80211
+ 
+ 	ieee80211_scan_cancel(local);
+ 
+-	ieee80211_dfs_cac_cancel(local, NULL);
++	ieee80211_dfs_cac_cancel(local);
+ 
+ 	ieee80211_roc_purge(local, NULL);
+ 
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -885,17 +885,23 @@ struct wireless_dev *ieee80211_vif_to_wd
+ }
+ EXPORT_SYMBOL(ieee80211_vif_to_wdev_relaxed);
+ 
+-void ieee80211_radar_detected_bitmap(struct ieee80211_hw *hw, u16 radar_bitmap)
++void ieee80211_radar_detected_bitmap(struct ieee80211_hw *hw, u16 radar_bitmap,
++				     struct ieee80211_channel *radar_channel)
+ {
+ 	struct ieee80211_local *local = hw_to_local(hw);
+ 	struct channel_radar_info *radar_info;
+ 
++	if (WARN_ON(local->hw.wiphy->flags & WIPHY_FLAG_SUPPORTS_MLO &&
++		    !radar_channel))
++		return;
++
+ 	radar_info = kzalloc(sizeof(*radar_info), GFP_ATOMIC);
+ 	if (!radar_info)
+ 		return;
+ 
+ 	INIT_LIST_HEAD(&radar_info->list);
+ 	radar_info->radar_bitmap = radar_bitmap;
++	radar_info->radar_channel = radar_channel;
+ 
+ 	list_add_tail(&radar_info->list, &local->radar_info_list);
+ 	wiphy_work_queue(hw->wiphy, &local->radar_detected_work);
+@@ -3628,13 +3634,11 @@ u64 ieee80211_calculate_rx_timestamp(str
+ /* Cancel CAC for the interfaces under the specified @local. If @ctx is
+  * also provided, only the interfaces using that ctx will be canceled.
+  */
+-void ieee80211_dfs_cac_cancel(struct ieee80211_local *local,
+-			      struct ieee80211_chanctx *ctx)
++void ieee80211_dfs_cac_cancel(struct ieee80211_local *local)
+ {
+ 	struct ieee80211_sub_if_data *sdata;
+ 	struct cfg80211_chan_def chandef;
+ 	struct ieee80211_link_data *link;
+-	struct ieee80211_chanctx_conf *chanctx_conf;
+ 	unsigned int link_id;
+ 
+ 	lockdep_assert_wiphy(local->hw.wiphy);
+@@ -3647,11 +3651,6 @@ void ieee80211_dfs_cac_cancel(struct iee
+ 			if (!link)
+ 				continue;
+ 
+-			chanctx_conf = sdata_dereference(link->conf->chanctx_conf,
+-							 sdata);
+-			if (ctx && &ctx->conf != chanctx_conf)
+-				continue;
+-
+ 			wiphy_delayed_work_cancel(local->hw.wiphy,
+ 						  &link->dfs_cac_timer_work);
+ 
+@@ -3693,10 +3692,13 @@ void ieee80211_awgn_detected_work(struct
+ 
+ static void
+ ieee80211_dfs_radar_detected_processing(struct ieee80211_local *local,
+-                                       u16 radar_bitmap)
++					u16 radar_bitmap,
++					struct ieee80211_channel *radar_channel)
+ {
+-	struct cfg80211_chan_def chandef;
++	struct cfg80211_chan_def chandef = local->hw.conf.chandef;
++	struct cfg80211_chan_def *radar_chandef = NULL;
+ 	struct ieee80211_chanctx *ctx;
++	int num_chanctx = 0;
+ 
+ 	lockdep_assert_wiphy(local->hw.wiphy);
+ 
+@@ -3704,23 +3706,36 @@ ieee80211_dfs_radar_detected_processing(
+ 		if (ctx->replace_state == IEEE80211_CHANCTX_REPLACES_OTHER)
+ 			continue;
+ 
+-		if (!ctx->radar_detected)
+-			continue;
++		num_chanctx++;
++		chandef = ctx->conf.def;
+ 
+-		ctx->radar_detected = false;
++		if (radar_channel &&
++	    	    (chandef.chan == radar_channel))
++		    radar_chandef = &ctx->conf.def;
++	}
++	ieee80211_dfs_cac_cancel(local);
+ 
+-		chandef = ctx->conf.def;
++	if (radar_chandef)
++		radar_chandef->radar_bitmap = radar_bitmap;
+ 
+-		wiphy_lock(local->hw.wiphy);
+-		ieee80211_dfs_cac_cancel(local, ctx);
+-		wiphy_unlock(local->hw.wiphy);
++	chandef.radar_bitmap = radar_bitmap;
+ 
+-		chandef.radar_bitmap = radar_bitmap;
++	if (num_chanctx > 1) {
++		if (local->hw.wiphy->flags & WIPHY_FLAG_SUPPORTS_MLO) {
++			if (WARN_ON(!radar_chandef))
++				return;
+ 
++			cfg80211_radar_event(local->hw.wiphy, radar_chandef, GFP_KERNEL);
++		} else {
++			/* XXX: multi-channel is not supported yet */
++			WARN_ON(1);
++		}
++	} else {
+ 		cfg80211_radar_event(local->hw.wiphy, &chandef, GFP_KERNEL);
+ 	}
+ }
+ 
++
+ static void
+ ieee80211_radar_mark_chan_ctx_iterator(struct ieee80211_hw *hw,
+ 				       struct ieee80211_chanctx_conf *chanctx_conf,
+@@ -3745,14 +3760,18 @@ void ieee80211_dfs_radar_detected_work(s
+ 		container_of(work, struct ieee80211_local, radar_detected_work);
+ 	struct channel_radar_info *radar_info, *temp;
+ 	u16 radar_bitmap;
++	struct ieee80211_channel *radar_channel = NULL;
+ 
+ 	if (list_empty(&local->radar_info_list))
+-		return ieee80211_dfs_radar_detected_processing(local, 0);
++		return ieee80211_dfs_radar_detected_processing(local, 0,
++							       radar_channel);
+ 
+ 	list_for_each_entry_safe(radar_info, temp, &local->radar_info_list, list) {
+ 		radar_bitmap = radar_info->radar_bitmap;
++		radar_channel = radar_info->radar_channel;
+ 
+-		ieee80211_dfs_radar_detected_processing(local, radar_bitmap);
++		ieee80211_dfs_radar_detected_processing(local, radar_bitmap,
++							radar_channel);
+ 
+ 		list_del(&radar_info->list);
+ 		kfree(radar_info);
+--- a/net/wireless/chan.c
++++ b/net/wireless/chan.c
+@@ -1016,8 +1016,8 @@ bool cfg80211_any_wiphy_oper_chan(struct
+ 	return false;
+ }
+ 
+-static bool cfg80211_chandef_dfs_available(struct wiphy *wiphy,
+-				const struct cfg80211_chan_def *chandef)
++bool cfg80211_chandef_dfs_available(struct wiphy *wiphy,
++				    const struct cfg80211_chan_def *chandef)
+ {
+ 	struct ieee80211_channel *c;
+ 	int width;
+@@ -1054,6 +1054,7 @@ static bool cfg80211_chandef_dfs_availab
+ 
+ 	return true;
+ }
++EXPORT_SYMBOL(cfg80211_chandef_dfs_available);
+ 
+ unsigned int
+ cfg80211_chandef_dfs_cac_time(struct wiphy *wiphy,
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -17143,6 +17143,10 @@ nl80211_epcs_cfg(struct sk_buff *skb, st
+ 	SELECTOR(__sel, NETDEV_UP_LINK,			\
+ 		 NL80211_FLAG_NEED_NETDEV_UP |		\
+ 		 NL80211_FLAG_MLO_VALID_LINK_ID)	\
++	SELECTOR(__sel, NETDEV_UP_LINK_NOMTX,		\
++		 NL80211_FLAG_NEED_NETDEV_UP |		\
++		 NL80211_FLAG_NO_WIPHY_MTX |		\
++		 NL80211_FLAG_MLO_VALID_LINK_ID)	\
+ 	SELECTOR(__sel, NETDEV_UP_NO_MLO,		\
+ 		 NL80211_FLAG_NEED_NETDEV_UP |		\
+ 		 NL80211_FLAG_MLO_UNSUPPORTED)		\
+--- a/net/wireless/trace.h
++++ b/net/wireless/trace.h
+@@ -805,7 +805,7 @@ DEFINE_EVENT(wiphy_netdev_evt, rdev_flus
+ 	TP_ARGS(wiphy, netdev)
+ );
+ 
+-TRACE_EVENT(rdev_end_cac,
++DECLARE_EVENT_CLASS(wiphy_netdev_link_evt,
+ 	TP_PROTO(struct wiphy *wiphy, struct net_device *netdev,
+ 		 unsigned int link_id),
+ 	TP_ARGS(wiphy, netdev, link_id),
+@@ -819,8 +819,14 @@ TRACE_EVENT(rdev_end_cac,
+ 		NETDEV_ASSIGN;
+ 		__entry->link_id = link_id;
+ 	),
+-	TP_printk(WIPHY_PR_FMT ", " NETDEV_PR_FMT ", link_id: %d",
+-		  WIPHY_PR_ARG, NETDEV_PR_ARG, __entry->link_id)
++	TP_printk(WIPHY_PR_FMT ", " NETDEV_PR_FMT ", link_id: %u",
++      		  WIPHY_PR_ARG, NETDEV_PR_ARG, __entry->link_id)
++);
++
++DEFINE_EVENT(wiphy_netdev_link_evt, rdev_end_cac,
++	TP_PROTO(struct wiphy *wiphy, struct net_device *netdev,
++		 unsigned int link_id),
++	TP_ARGS(wiphy, netdev, link_id)
+ );
+ 
+ DECLARE_EVENT_CLASS(station_add_change,

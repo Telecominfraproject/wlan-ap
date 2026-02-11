@@ -1,0 +1,325 @@
+From 58946d55d6accfbd8645139b17522b9e93420ca9 Mon Sep 17 00:00:00 2001
+From: Thiraviyam Mariyappan <tmariyap@qti.qualcomm.com>
+Date: Thu, 22 May 2025 14:14:49 +0530
+Subject: [PATCH 1/2] ath12k:allocate dst ring descriptors from cacheable
+ memory
+
+tcl_data and reo_dst rings are currently being allocated
+using dma_allocate_coherent() which is non cachable.
+
+Allocating ring memory from cacheable memory area allows
+cached descriptor access and prefetch next descriptors to
+optimize CPU usage during descriptor processing on NAPI.
+
+Orginal patch:
+653-001-ath12k-allocate-dst-ring-descriptors-from-cacheable-.patch
+
+Signed-off-by: Balamurugan Selvarajan <bselvara@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c          | 36 +++++++++--
+ drivers/net/wireless/ath/ath12k/dp.h          |  1 +
+ drivers/net/wireless/ath/ath12k/hal.c         | 64 +++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/hal.h         |  5 ++
+ drivers/net/wireless/ath/ath12k/hw.h          |  1 +
+ drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c | 11 +++-
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c | 12 +++-
+ drivers/net/wireless/ath/ath12k/wifi7/hw.c    |  5 ++
+ 8 files changed, 128 insertions(+), 7 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -120,8 +120,11 @@ void ath12k_dp_srng_cleanup(struct ath12
+ 	if (!ring->vaddr_unaligned)
+ 		return;
+ 
+-	dma_free_coherent(ab->dev, ring->size, ring->vaddr_unaligned,
+-			  ring->paddr_unaligned);
++	if (ring->cached)
++		kfree(ring->vaddr_unaligned);
++	else
++		dma_free_coherent(ab->dev, ring->size, ring->vaddr_unaligned,
++				  ring->paddr_unaligned);
+ 
+ 	ring->vaddr_unaligned = NULL;
+ }
+@@ -252,6 +255,7 @@ int ath12k_dp_srng_setup(struct ath12k_b
+ 	int entry_sz = ath12k_hal_srng_get_entrysize(ab, type);
+ 	int max_entries = ath12k_hal_srng_get_max_entries(ab, type);
+ 	int ret;
++	bool cached = false;
+ 
+ 	if (max_entries < 0 || entry_sz < 0)
+ 		return -EINVAL;
+@@ -260,9 +264,26 @@ int ath12k_dp_srng_setup(struct ath12k_b
+ 		num_entries = max_entries;
+ 
+ 	ring->size = (num_entries * entry_sz) + HAL_RING_BASE_ALIGN - 1;
+-	ring->vaddr_unaligned = dma_alloc_coherent(ab->dev, ring->size,
+-						   &ring->paddr_unaligned,
+-						   GFP_KERNEL);
++	if (ab->hw_params->alloc_cacheable_memory) {
++		/* Allocate the reo dst and tx completion rings from cacheable memory */
++		switch (type) {
++		case HAL_REO_DST:
++		case HAL_WBM2SW_RELEASE:
++			cached = true;
++			break;
++		default:
++			cached = false;
++		}
++	}
++
++	if (cached) {
++		ring->vaddr_unaligned = kzalloc(ring->size, GFP_KERNEL);
++		ring->paddr_unaligned = virt_to_phys(ring->vaddr_unaligned);
++	} else {
++		ring->vaddr_unaligned = dma_alloc_coherent(ab->dev, ring->size,
++							   &ring->paddr_unaligned,
++							   GFP_KERNEL);
++	}
+ 	if (!ring->vaddr_unaligned)
+ 		return -ENOMEM;
+ 
+@@ -328,6 +349,11 @@ int ath12k_dp_srng_setup(struct ath12k_b
+ 		return -EINVAL;
+ 	}
+ 
++	if (cached) {
++		params.flags |= HAL_SRNG_FLAGS_CACHED;
++		ring->cached = 1;
++	}
++
+ 	ret = ath12k_hal_srng_setup(ab, type, ring_num, mac_id, &params);
+ 	if (ret < 0) {
+ 		ath12k_warn(ab, "failed to setup srng: %d ring_id %d\n",
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -40,6 +40,7 @@ struct dp_srng {
+ 	dma_addr_t paddr;
+ 	int size;
+ 	u32 ring_id;
++	u8 cached;
+ };
+ 
+ struct dp_rxdma_mon_ring {
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -322,10 +322,37 @@ void *ath12k_hal_srng_dst_get_next_entry
+         if (srng->u.dst_ring.tp == srng->ring_size)
+                 srng->u.dst_ring.tp = 0;
+ 
++	if (srng->flags & HAL_SRNG_FLAGS_CACHED)
++		dma_sync_single_for_cpu(ab->dev, virt_to_phys(desc),
++					(srng->entry_size * sizeof(u32)),
++					DMA_FROM_DEVICE);
++
+ 	return desc;
+ }
+ EXPORT_SYMBOL(ath12k_hal_srng_dst_get_next_entry);
+ 
++void *ath12k_hal_srng_dst_get_next_cached_entry(struct ath12k_base *ab,
++						struct hal_srng *srng)
++{
++	void *desc;
++
++	lockdep_assert_held(&srng->lock);
++
++	if (srng->u.dst_ring.tp == srng->u.dst_ring.cached_hp)
++		return NULL;
++
++	desc = srng->ring_base_vaddr + srng->u.dst_ring.tp;
++
++	srng->u.dst_ring.tp = (srng->u.dst_ring.tp + srng->entry_size);
++
++        /* wrap around to start of ring*/
++        if (srng->u.dst_ring.tp == srng->ring_size)
++                srng->u.dst_ring.tp = 0;
++
++	return desc;
++}
++EXPORT_SYMBOL(ath12k_hal_srng_dst_get_next_cached_entry);
++
+ int ath12k_hal_srng_dst_num_free(struct ath12k_base *ab, struct hal_srng *srng,
+ 				 bool sync_hw_ptr)
+ {
+@@ -349,6 +376,37 @@ int ath12k_hal_srng_dst_num_free(struct
+ }
+ EXPORT_SYMBOL(ath12k_hal_srng_dst_num_free);
+ 
++void ath12k_hal_srng_dst_invalidate_entry(struct ath12k_base *ab,
++					  struct hal_srng *srng, int entries)
++{
++	u32 *desc, tp, hp;
++
++	lockdep_assert_held(&srng->lock);
++
++	if (!(srng->flags & HAL_SRNG_FLAGS_CACHED) || !entries)
++	        return;
++
++	tp = srng->u.dst_ring.tp;
++	hp = srng->u.dst_ring.cached_hp;
++
++	desc = srng->ring_base_vaddr + tp;
++	if (hp > tp) {
++		dma_sync_single_for_cpu(ab->dev, virt_to_phys(desc),
++					entries * srng->entry_size * sizeof(u32),
++					DMA_FROM_DEVICE);
++	} else {
++		entries = srng->ring_size - tp;
++		dma_sync_single_for_cpu(ab->dev, virt_to_phys(desc),
++					entries * sizeof(u32),
++					DMA_FROM_DEVICE);
++		entries = hp;
++		dma_sync_single_for_cpu(ab->dev, virt_to_phys(srng->ring_base_vaddr),
++					entries * sizeof(u32),
++					DMA_FROM_DEVICE);
++	}
++}
++EXPORT_SYMBOL(ath12k_hal_srng_dst_invalidate_entry);
++
+ /* Returns number of available entries in src ring */
+ int ath12k_hal_srng_src_num_free(struct ath12k_base *ab, struct hal_srng *srng,
+ 				 bool sync_hw_ptr)
+@@ -548,6 +606,12 @@ int ath12k_hal_srng_setup(struct ath12k_
+ 	memset(srng->ring_base_vaddr, 0,
+ 	       (srng->entry_size * srng->num_entries) << 2);
+ 
++	if (srng->flags & HAL_SRNG_FLAGS_CACHED) {
++		dma_sync_single_for_cpu(ab->dev, virt_to_phys(srng->ring_base_vaddr),
++					(srng->entry_size * srng->num_entries * sizeof(u32)),
++					DMA_FROM_DEVICE);
++	}
++
+ 	if (srng->ring_dir == HAL_SRNG_DIR_SRC) {
+ 		srng->u.src_ring.hp = 0;
+ 		srng->u.src_ring.cached_tp = 0;
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -726,6 +726,7 @@ struct wbm_idle_scatter_list {
+ #define HAL_SRNG_FLAGS_MSI_INTR			0x00020000
+ #define HAL_SRNG_FLAGS_HIGH_THRESH_INTR_EN	0x00080000
+ #define HAL_SRNG_FLAGS_LMAC_RING		0x80000000
++#define HAL_SRNG_FLAGS_CACHED                   0x20000000
+ 
+ /* Common SRNG ring structure for source and destination rings */
+ struct hal_srng {
+@@ -1295,9 +1296,13 @@ void ath12k_hal_srng_get_params(struct a
+ 				struct hal_srng_params *params);
+ void *ath12k_hal_srng_dst_get_next_entry(struct ath12k_base *ab,
+ 					 struct hal_srng *srng);
++void *ath12k_hal_srng_dst_get_next_cached_entry(struct ath12k_base *ab,
++						struct hal_srng *srng);
+ void *ath12k_hal_srng_dst_peek(struct ath12k_base *ab, struct hal_srng *srng);
+ int ath12k_hal_srng_dst_num_free(struct ath12k_base *ab, struct hal_srng *srng,
+ 				 bool sync_hw_ptr);
++void ath12k_hal_srng_dst_invalidate_entry(struct ath12k_base *ab,
++					  struct hal_srng *srng, int entries);
+ void *ath12k_hal_srng_src_get_next_reaped(struct ath12k_base *ab,
+ 					  struct hal_srng *srng);
+ void *ath12k_hal_srng_src_reap_next(struct ath12k_base *ab,
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -271,6 +271,7 @@ struct ath12k_hw_params {
+ 	bool supports_ap_ps;
+ 	bool support_ce_manual_poll;
+ 	bool ftm_responder;
++	bool alloc_cacheable_memory;
+ 	bool credit_flow;
+ };
+ 
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
+@@ -1103,6 +1103,7 @@ int ath12k_wifi7_dp_rx_process(struct at
+ 	struct sk_buff *msdu;
+ 	bool done = false;
+ 	u64 desc_va;
++	int valid_entries;
+ 
+ 	__skb_queue_head_init(&msdu_list);
+ 
+@@ -1116,7 +1117,15 @@ int ath12k_wifi7_dp_rx_process(struct at
+ try_again:
+ 	ath12k_hal_srng_access_begin(ab, srng);
+ 
+-	while ((desc = ath12k_hal_srng_dst_get_next_entry(ab, srng))) {
++	valid_entries = ath12k_hal_srng_dst_num_free(ab, srng, false);
++	if (unlikely(!valid_entries)) {
++		ath12k_hal_srng_access_end(ab, srng);
++		spin_unlock_bh(&srng->lock);
++		return -EINVAL;
++	}
++	ath12k_hal_srng_dst_invalidate_entry(ab, srng, valid_entries);
++
++	while ((desc = ath12k_hal_srng_dst_get_next_cached_entry(ab, srng))) {
+ 		struct rx_mpdu_desc *mpdu_info;
+ 		struct rx_msdu_desc *msdu_info;
+ 		enum hal_reo_dest_ring_push_reason push_reason;
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -909,13 +909,23 @@ void ath12k_wifi7_dp_tx_completion_handl
+ 	struct hal_wbm_release_ring *desc;
+ 	u8 pdev_id;
+ 	u64 desc_va;
++	int valid_entries;
+ 
+ 	spin_lock_bh(&status_ring->lock);
+ 
+ 	ath12k_hal_srng_access_begin(ab, status_ring);
+ 
++	valid_entries = ath12k_hal_srng_dst_num_free(ab, status_ring, false);
++	if (!valid_entries) {
++		ath12k_hal_srng_access_end(ab, status_ring);
++		spin_unlock_bh(&status_ring->lock);
++		return;
++	}
++
++	ath12k_hal_srng_dst_invalidate_entry(ab, status_ring, valid_entries);
++
+ 	while (ATH12K_TX_COMPL_NEXT(tx_ring->tx_status_head) != tx_ring->tx_status_tail) {
+-		desc = ath12k_hal_srng_dst_get_next_entry(ab, status_ring);
++		desc = ath12k_hal_srng_dst_get_next_cached_entry(ab, status_ring);
+ 		if (!desc)
+ 			break;
+ 
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -413,6 +413,7 @@ static const struct ath12k_hw_params ath
+ 		.handle_beacon_miss = true,
+ 		.en_qdsslog = true,
+ 		.support_fse = false,
++		.alloc_cacheable_memory = true,
+ 		.spectral = {
+ 			.fft_sz = 0,
+ 			.fft_pad_sz = 0,
+@@ -610,6 +611,7 @@ static const struct ath12k_hw_params ath
+ 		.handle_beacon_miss = true,
+ 		.en_qdsslog = true,
+ 		.support_fse = true,
++		.alloc_cacheable_memory = true,
+ 		.spectral = {
+ 			.fft_sz = 0,
+ 			.fft_pad_sz = 0,
+@@ -699,6 +701,7 @@ static const struct ath12k_hw_params ath
+ 		.ce_remap = &ath12k_wifi7_ce_remap_ipq5332,
+ 		.en_qdsslog = true,
+ 		.support_fse = true,
++		.alloc_cacheable_memory = true,
+ 		.spectral = {
+ 			.fft_sz = 7,
+ 			.fft_pad_sz = 0,
+@@ -768,6 +771,7 @@ static const struct ath12k_hw_params ath
+ 		.send_platform_model = true,
+ 		.en_qdsslog = true,
+ 		.support_fse = true,
++		.alloc_cacheable_memory = true,
+ 		.spectral = {
+ 			.fft_sz = 7,
+ 			.fft_pad_sz = 0,
+@@ -857,6 +861,7 @@ static const struct ath12k_hw_params ath
+ 		.ce_remap = &ath12k_wifi7_ce_remap_ipq5424,
+ 		.en_qdsslog = true,
+ 		.support_fse = true,
++		.alloc_cacheable_memory = true,
+ 		.spectral = {
+ 			.fft_sz = 7,
+ 			.fft_pad_sz = 0,

@@ -1,0 +1,609 @@
+From 1954ec8dea80059f5e7c40813f3686c2fb08a25e Mon Sep 17 00:00:00 2001
+From: Vivek Chettri <vchettri@qti.qualcomm.com>
+Date: Thu, 3 Jul 2025 00:12:06 +0530
+Subject: [PATCH 3/3] QSDK: DP Add fast path DP support for QoS features
+
+For fast path QoS feature support, NSS queries the WLAN driver for  QoS
+meta data
+Based on the meta data, NSS updates the QoS Meta data in per packet
+path.
+Use the QoS meta provided by NSS to update the MSDUQ and QoS ID in per
+packet path.
+
+For Uplink SDWF, NSS calls the WLAN driver to apply uplink QoS
+
+Add support for sending WMI for sending UL triggers when matching uplink
+SDWF flow are indetified by NSS.
+
+Signed-off-by: Vivek Chettri <vchettri@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/accel_cfg.c   | 110 +++++++++-
+ drivers/net/wireless/ath/ath12k/sdwf.c        | 201 ++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/sdwf.h        |  25 +++
+ .../wireless/ath/ath12k/telemetry_agent_if.c  |   6 -
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c |  36 +++-
+ drivers/net/wireless/ath/ath_accel_cfg.c      |  20 +-
+ include/ath/ath_dp_accel_cfg.h                |  14 ++
+ include/ath/ath_sawf.h                        |  13 --
+ 8 files changed, 395 insertions(+), 30 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/accel_cfg.c
++++ b/drivers/net/wireless/ath/ath12k/accel_cfg.c
+@@ -7,6 +7,7 @@
+ #include "accel_cfg.h"
+ #include "core.h"
+ #include "peer.h"
++#include "sdwf.h"
+ #include <linux/module.h>
+ #include <linux/if_vlan.h>
+ 
+@@ -135,11 +136,12 @@ struct wireless_dev *ath12k_get_wdev_fro
+ 	return wdev;
+ }
+ 
+-u32 ath_get_metadata_info(struct ath_dp_metadata_param *md_param)
++u32 ath12k_get_metadata_info(struct ath_dp_metadata_param *md_param)
+ {
+ 	struct net_device *dest_dev = NULL;
+ 	struct  wireless_dev *wdev = NULL;
+ 	u32 metadata = 0;
++	u16 msduq_peer;
+ 	u8 *dest_mac = NULL;
+ 	u8 link_id = ATH12k_MLO_LINK_ID_INVALID;
+ 	u8 node_id = ATH12k_DS_NODE_ID_INVALID;
+@@ -172,10 +174,111 @@ u32 ath_get_metadata_info(struct ath_dp_
+ 	if (link_id != ATH12k_MLO_LINK_ID_INVALID)
+ 		metadata |= ath_encode_mlo_metadata(link_id);
+ 
++	if (md_param->is_sawf_param_valid) {
++		msduq_peer = ath12k_sdwf_get_msduq_peer(wdev, dest_mac,
++							&md_param->sawf_param,
++							md_param->is_scs_mscs);
++		 /* Encode SDWF metadata only if msduq_id updated */
++		if (msduq_peer != SDWF_PEER_MSDUQ_INVALID)
++			metadata |= ath_encode_sdwf_metadata(msduq_peer);
++	}
++
+ 	return metadata;
++}
++
++static
++void ath12_sdwf_ul_config_peer(struct ieee80211_vif *vif,
++			       struct wireless_dev *wdev,
++			       u8 *mac, u8 start_or_stop,
++			       u16 svc_id)
++{
++
++	struct ath12k *ar = NULL;
++	u16 qos_id, peer_id;
++	struct ath12k_qos_ctx *qos_ctx;
++
++	ar = ath12k_sdwf_get_ar_from_vif(wdev, vif,
++					 mac, &peer_id);
++
++	if (!ar) {
++		ath12k_dbg(NULL, ATH12K_DBG_QOS, "sdwf_ul_config, ar is null\n");
++		return;
++	}
++
++	if (!ath12k_sdwf_service_configured(ar->ab, svc_id))
++		return;
++
++	qos_id = ath12k_sdwf_get_ul_qos_id(ar->ab, svc_id);
++	if (qos_id == QOS_ID_INVALID)
++		return;
++
++	qos_ctx = ath12k_get_qos(ar->ab);
++	if (!qos_ctx)
++		return;
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_QOS,
++		   "UL SDWF Configure: svc id:%d", svc_id);
++
++	ath12k_core_config_ul_qos(ar, &qos_ctx->profiles[qos_id].params,
++				  qos_id, mac, start_or_stop);
++}
+ 
++void ath12k_sdwf_ul_config(struct ath_ul_params *params)
++{
++	struct ieee80211_hw *hw;
++	struct ieee80211_vif *dest_vif, *src_vif;
++	struct wireless_dev *dest_wdev, *src_wdev;
++
++	src_wdev = ath12k_get_wdev_from_netdev(params->src_dev);
++	dest_wdev = ath12k_get_wdev_from_netdev(params->dst_dev);
++
++	if (!src_wdev && !dest_wdev) {
++		ath12k_dbg(NULL, ATH12K_DBG_QOS, "wdev src_and_dest are null");
++		return;
++	}
++
++	if (src_wdev) {
++		hw = wiphy_to_ieee80211_hw(src_wdev->wiphy);
++		if (!ieee80211_hw_check(hw, SUPPORT_ECM_REGISTRATION)) {
++			ath12k_dbg(NULL, ATH12K_DBG_QOS, "hw1 is null");
++			return;
++		}
++	}
++
++	if (dest_wdev) {
++		hw = wiphy_to_ieee80211_hw(dest_wdev->wiphy);
++		if (!ieee80211_hw_check(hw, SUPPORT_ECM_REGISTRATION)) {
++			ath12k_dbg(NULL, ATH12K_DBG_QOS, "hw2 is null");
++			return;
++		}
++	}
++
++	if (dest_wdev)
++		dest_vif = wdev_to_ieee80211_vif_vlan(dest_wdev, false);
++	else
++		dest_vif = NULL;
++	if (src_wdev)
++		src_vif = wdev_to_ieee80211_vif_vlan(src_wdev, false);
++	else
++		src_vif = NULL;
++
++	if (!dest_vif && !src_vif) {
++		ath12k_dbg(NULL, ATH12K_DBG_QOS, "src_and_dest vif is null");
++		return;
++	}
++	if (src_vif) {
++		ath12_sdwf_ul_config_peer(src_vif, src_wdev,
++					  params->src_mac,
++					  params->start_or_stop,
++					  params->fw_service_id);
++	}
++	if (dest_vif) {
++		ath12_sdwf_ul_config_peer(dest_vif, dest_wdev,
++					  params->src_mac,
++					  params->start_or_stop,
++					  params->rv_service_id);
++	}
+ }
+-EXPORT_SYMBOL(ath_get_metadata_info);
+ 
+ /**
+  * ath12k_ds_get_node_id() - Retrieve ds node id
+@@ -253,7 +356,8 @@ unlock_n_fail:
+ 
+ static const struct ath_dp_accel_cfg_ops ath_dp_accel_cfg_ops_obj = {
+ 	.ppeds_get_node_id = ath12k_ds_get_node_id,
+-	.get_metadata_info = ath_get_metadata_info,
++	.get_metadata_info = ath12k_get_metadata_info,
++	.sdwf_ul_config = ath12k_sdwf_ul_config,
+ };
+ 
+ /**
+--- a/drivers/net/wireless/ath/ath12k/sdwf.c
++++ b/drivers/net/wireless/ath/ath12k/sdwf.c
+@@ -5,6 +5,7 @@
+ 
+ #include "core.h"
+ #include "sdwf.h"
++#include "dp_peer.h"
+ #include "debug.h"
+ #include <linux/module.h>
+ 
+@@ -149,3 +150,203 @@ u16 ath12k_sdwf_get_ul_qos_id(struct ath
+ 
+ 	return ul_qos_id;
+ }
++
++static struct ath12k_dp_peer_qos*
++ath12k_sdwf_get_qos_ctx(struct ath12k_base *ab,
++			struct ath12k_dp_peer *peer)
++{
++	struct ath12k_dp_peer_qos *peer_qos = peer->qos;
++
++	if (!peer_qos)
++		peer_qos = ath12k_dp_peer_qos_alloc(ab->dp, peer);
++
++	return peer_qos;
++}
++
++static u8 ath12k_sdwf_alloc_msduq(struct ath12k_base *ab, u32 svc_id,
++				  u16 peer_id, bool scs)
++{
++	struct ath12k_qos_ctx *qos_ctx;
++	struct ath12k_dp_link_peer *peer;
++	struct ath12k_dp_peer_qos *qos;
++	u16 qos_id;
++	u8 scs_id; u8 qos_tag;
++	u16 msduq = QOS_INVALID_MSDUQ;
++
++	qos_ctx = ath12k_get_qos(ab);
++	if (!qos_ctx) {
++		ath12k_err(ab, "QoS Context is NULL");
++		return msduq;
++	}
++
++	spin_lock_bh(&ab->dp->dp_lock);
++	peer = ath12k_dp_link_peer_find_by_id(ab->dp, peer_id);
++	if (!peer) {
++		ath12k_err(ab, "Unable to find peer");
++		goto ret;
++	}
++
++	qos = ath12k_sdwf_get_qos_ctx(ab, peer->dp_peer);
++	if (!qos) {
++		ath12k_err(ab, "Unable to find peer qos ctx");
++		goto ret;
++	}
++
++	if  (scs) {
++		qos_tag = u32_get_bits(svc_id, SCS_PROTOCOL_MASK);
++		if (qos_tag == QOS_SCS_TAG) {
++			scs_id = u32_get_bits(svc_id, SCS_SVC_ID_MASK);
++			ath12k_dp_peer_scs_data(ab->dp, qos, scs_id,
++						&msduq, &qos_id);
++			goto ret;
++		} else {
++			msduq = u32_get_bits(svc_id, SCS_SVC_ID_MASK);
++			goto ret;
++		}
++	}
++
++	qos_id = ath12k_sdwf_get_dl_qos_id(ab, svc_id);
++	if (qos_id == QOS_ID_INVALID)
++		goto ret;
++
++	msduq = ath12k_dp_peer_qos_msduq(ab, qos, qos_id);
++
++ret:
++	spin_unlock_bh(&ab->dp->dp_lock);
++	return msduq;
++}
++
++u32 ath_encode_sdwf_metadata(u16 msduq_id)
++{
++	u32 sawf_metadata = 0;
++
++	sawf_metadata = u32_encode_bits(SDWF_VALID,
++					SDWF_VALID_MASK) |
++	u32_encode_bits(SDWF_VALID_TAG,
++			SDWF_TAG_ID) |
++	u32_encode_bits(msduq_id,
++			SDWF_PEER_MSDUQ_ID);
++	return sawf_metadata;
++}
++
++struct ath12k *ath12k_sdwf_get_ar_from_vif(struct wireless_dev *wdev,
++					   struct ieee80211_vif *vif,
++					   u8 *peer_mac, u16 *peer_id)
++{
++	struct ath12k_base *ab = NULL;
++	struct ath12k *ar = NULL;
++	struct ath12k_vif *ahvif;
++	struct ath12k_link_vif *arvif;
++	struct ieee80211_sta *sta;
++	struct ath12k_sta *ahsta;
++	u8 mac_addr[ETH_ALEN] = { 0 };
++	u8 link_id;
++	struct ath12k_dp_link_peer *peer;
++
++	if (!wdev)
++		return NULL;
++
++	if (!vif)
++		return NULL;
++
++	ahvif = (struct ath12k_vif *)vif->drv_priv;
++	if (!ahvif)
++		return NULL;
++
++	sta = ieee80211_find_sta_by_ifaddr(ahvif->ah->hw, peer_mac, NULL);
++	if (!sta) {
++		pr_err("Peer:%pM not present", peer_mac);
++		sta = wdev_to_ieee80211_vlan_sta(wdev);
++		if (!sta)
++			return NULL;
++	}
++
++	ahsta = (struct ath12k_sta *)sta->drv_priv;
++	if (!ahsta)
++		return NULL;
++
++	rcu_read_lock();
++	if (sta->mlo) {
++		link_id = ahsta->primary_link_id;
++		memcpy(mac_addr, ahsta->link[link_id]->addr, ETH_ALEN);
++	} else if (sta->valid_links) {
++		link_id = ahsta->deflink.link_id;
++		memcpy(mac_addr, peer_mac, ETH_ALEN);
++	} else {
++		link_id = 0;
++		memcpy(mac_addr, peer_mac, ETH_ALEN);
++	}
++
++	arvif = rcu_dereference(ahvif->link[link_id]);
++
++	if (!arvif) {
++		rcu_read_unlock();
++		return NULL;
++	}
++
++	ar = arvif->ar;
++	if (!ar) {
++		rcu_read_unlock();
++		return NULL;
++	}
++	rcu_read_unlock();
++
++	ab = ar->ab;
++
++	spin_lock_bh(&ab->dp->dp_lock);
++	peer = ath12k_dp_link_peer_find_by_addr(ab->dp, mac_addr);
++	if (!peer) {
++		ath12k_dbg(ab, ATH12K_DBG_QOS,
++			   "Peer: %pM not present\n", mac_addr);
++		spin_unlock_bh(&ab->dp->dp_lock);
++		return NULL;
++	}
++
++	*peer_id = peer->peer_id;
++
++	spin_unlock_bh(&ab->dp->dp_lock);
++	return ar;
++}
++
++u16 ath12k_sdwf_get_msduq(struct wireless_dev *wdev,
++			  u8 *peer_mac, u32 svc_id, bool scs)
++{
++	struct ath12k *ar;
++	struct ieee80211_vif *vif;
++	u16 peer_id;
++	u16 ret_msduq = SDWF_PEER_MSDUQ_INVALID;
++	u8 msduq = QOS_INVALID_MSDUQ;
++
++	vif = wdev_to_ieee80211_vif(wdev);
++	if (!vif)
++		return ret_msduq;
++
++	ar = ath12k_sdwf_get_ar_from_vif(wdev, vif, peer_mac, &peer_id);
++	if (!ar) {
++		ath12k_err(NULL, "ar is NULL");
++		return ret_msduq;
++	}
++
++	if (!scs && !ath12k_sdwf_service_configured(ar->ab, svc_id))
++		return ret_msduq;
++
++	msduq = ath12k_sdwf_alloc_msduq(ar->ab, svc_id, peer_id, scs);
++	if (msduq != QOS_INVALID_MSDUQ)
++		ret_msduq = FIELD_PREP(SDWF_PEER_ID, peer_id) |
++				FIELD_PREP(SDWF_MSDUQ_ID, msduq);
++
++	return ret_msduq;
++}
++
++u16 ath12k_sdwf_get_msduq_peer(struct wireless_dev *wdev,
++			       u8 *peer_mac,
++			      struct sawf_param *dl_params,
++			      bool scs_mscs)
++{
++	if (!wdev)
++		return SDWF_PEER_MSDUQ_INVALID;
++
++	return ath12k_sdwf_get_msduq(wdev, peer_mac,
++					dl_params->service_id,
++					scs_mscs);
++}
+--- a/drivers/net/wireless/ath/ath12k/sdwf.h
++++ b/drivers/net/wireless/ath/ath12k/sdwf.h
+@@ -6,6 +6,22 @@
+ #ifndef ATH12K_SDWF_H
+ #define ATH12K_SDWF_H
+ 
++#include "ath/ath_dp_accel_cfg.h"
++
++#define SDWF_PEER_MSDUQ_INVALID 0xFFFF
++
++#define SDWF_VALID		1
++#define SDWF_VALID_MASK		BIT(22)
++#define SDWF_VALID_TAG		0xAA
++
++#define SDWF_TAG_ID		GENMASK(31, 24)
++#define SDWF_PEER_MSDUQ_ID	GENMASK(15, 0)
++#define SDWF_PEER_ID		GENMASK(15, 6)
++#define SDWF_MSDUQ_ID		GENMASK(5, 0)
++
++#define SCS_SVC_ID_MASK		GENMASK(15, 8)
++#define SCS_PROTOCOL_MASK	GENMASK(7, 0)
++
+ struct ath12k_sdwf_svc {
+ 	u16 dl_qos_id;
+ 	bool configured;
+@@ -20,4 +36,13 @@ bool ath12k_sdwf_service_configured(stru
+ u16 ath12k_sdwf_get_dl_qos_id(struct ath12k_base *ab, u16 svc_id);
+ u16 ath12k_sdwf_get_ul_qos_id(struct ath12k_base *ab, u16 svc_id);
+ 
++u32 ath_encode_sdwf_metadata(u16 msduq_peer);
++
++u16 ath12k_sdwf_get_msduq_peer(struct wireless_dev *wdev, u8 *peer_mac,
++			       struct sawf_param *dl_params,
++			       bool scs_mscs);
++
++struct ath12k *ath12k_sdwf_get_ar_from_vif(struct wireless_dev *wdev,
++					   struct ieee80211_vif *vif,
++					   u8 *peer_mac, u16 *peer_id);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/telemetry_agent_if.c
++++ b/drivers/net/wireless/ath/ath12k/telemetry_agent_if.c
+@@ -20,9 +20,3 @@ int unregister_telemetry_agent_ops(struc
+ 	return 0;
+ }
+ EXPORT_SYMBOL(unregister_telemetry_agent_ops);
+-
+-void ath_sawf_uplink(struct ath_ul_params *ecm_ath_ul_params)
+-{
+-	return;
+-}
+-EXPORT_SYMBOL(ath_sawf_uplink);
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -128,16 +128,30 @@ static inline u8 ath12k_get_qos_tag(u32
+ }
+ 
+ static inline void
+-ath12k_dp_qos_update(struct ath12k_dp *dp, u32 mark,
+-		     struct hal_tcl_data_cmd *desc, u8 qos_tag,
++ath12k_dp_qos_update(struct ath12k_dp *dp, struct ath12k_pdev_dp *dp_pdev,
++		     u32 mark, struct hal_tcl_data_cmd *desc, u8 qos_tag,
+ 		     u8 *addr)
+ {
+ 	struct ath12k_dp_link_peer *peer;
++	struct ath12k_dp_peer *dp_peer;
+ 	u8 scs_id;
+-	u16 msduq, qos_id;
++	u16 msduq, qos_id, peer_id;
+ 	int ret;
+ 
+-	if (qos_tag == QOS_SCS_TAG) {
++	if (mark & SDWF_VALID_MASK) {
++		rcu_read_lock();
++		peer_id = u32_get_bits(mark, SDWF_PEER_ID);
++		dp_peer = ath12k_dp_peer_find_by_peerid_index(dp, dp_pdev,
++							      peer_id);
++		if (!dp_peer) {
++			rcu_read_unlock();
++			return;
++		}
++		msduq = u32_get_bits(mark, SDWF_MSDUQ_ID);
++		qos_id = dp_peer_msduq_qos_id(dp->ab, dp_peer->qos,
++					      msduq);
++		rcu_read_unlock();
++	} else if (qos_tag == QOS_SCS_TAG) {
+ 		scs_id = u32_get_bits(mark, QOS_QOS_ID_MASK);
+ 
+ 		spin_lock_bh(&dp->dp_lock);
+@@ -628,13 +642,21 @@ skip_htt_metadata:
+ 
+ 	ath12k_wifi7_hal_tx_cmd_desc_setup(ab, hal_tcl_desc, &ti);
+ 
++	if (unlikely(skb->mark & SDWF_VALID_MASK)) {
++		ath12k_dp_qos_update(dp, dp_pdev, skb->mark, hal_tcl_desc,
++				     0, NULL);
++		goto qos_done;
++	}
++
+ 	if (unlikely(arsta)) {
+ 		qos_tag = ath12k_get_qos_tag(skb->mark);
+ 		if (qos_tag)
+-			ath12k_dp_qos_update(dp, skb->mark, hal_tcl_desc,
++			ath12k_dp_qos_update(dp, dp_pdev, skb->mark,
++					     hal_tcl_desc,
+ 					     qos_tag, arsta->addr);
+ 	}
+ 
++qos_done:
+ 	ath12k_hal_srng_access_end(ab, tcl_ring);
+ 
+ 	spin_unlock_bh(&tcl_ring->lock);
+@@ -867,7 +889,7 @@ ath12k_wifi7_dp_tx_process_htt_tx_comple
+ 
+ }
+ 
+-static void 
++static void
+ ath12k_wifi7_dp_tx_cache_peer_stats(struct ath12k *ar,
+ 					  struct sk_buff *msdu,
+ 					  struct hal_tx_status *ts)
+@@ -1133,7 +1155,7 @@ static void ath12k_wifi7_dp_tx_complete_
+ 			} else {
+ 				ar->cached_stats.is_ampdu = false;
+ 				ath12k_wifi7_dp_tx_update_txcompl(dp_pdev, ts);
+-				memset(&ar->cached_stats, 0, 
++				memset(&ar->cached_stats, 0,
+ 						sizeof(struct ath12k_per_peer_tx_stats));
+ 			}
+ 			ar->last_ppdu_id = ts->ppdu_id;
+--- a/drivers/net/wireless/ath/ath_accel_cfg.c
++++ b/drivers/net/wireless/ath/ath_accel_cfg.c
+@@ -1,6 +1,6 @@
+ // SPDX-License-Identifier: BSD-3-Clause-Clear
+ /*
+- * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. 
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+  */
+ 
+ #include <ath/ath_dp_accel_cfg.h>
+@@ -67,3 +67,21 @@ bool ath_dp_accel_cfg_fetch_ds_node_id(s
+ 						&info->out_ppe_ds_node_id);
+ }
+ EXPORT_SYMBOL(ath_dp_accel_cfg_fetch_ds_node_id);
++
++u32 ath_get_metadata_info(struct ath_dp_metadata_param *md_param)
++{
++	if (!ath_dp_accel_cfg_cb)
++		return 0;
++
++	return ath_dp_accel_cfg_cb->get_metadata_info(md_param);
++}
++EXPORT_SYMBOL(ath_get_metadata_info);
++
++void ath_sawf_uplink(struct ath_ul_params *params)
++{
++	if (!ath_dp_accel_cfg_cb)
++		return;
++
++	ath_dp_accel_cfg_cb->sdwf_ul_config(params);
++}
++EXPORT_SYMBOL(ath_sawf_uplink);
+--- a/include/ath/ath_dp_accel_cfg.h
++++ b/include/ath/ath_dp_accel_cfg.h
+@@ -74,6 +74,17 @@ struct	ath_dp_metadata_param {
+ 	struct	sawf_param	sawf_param;
+ };
+ 
++struct ath_ul_params {
++	struct net_device *dst_dev;
++	struct net_device *src_dev;
++	u8 *dst_mac;
++	u8 *src_mac;
++	u8 fw_service_id;
++	u8 rv_service_id;
++	u8 start_or_stop;
++	u32 fw_mark_metadata;
++	u32 rv_mark_metadata;
++};
+ 
+ /**
+  * struct ath_dp_accel_cfg_ops - dp accelerator configuraton ops
+@@ -84,7 +95,9 @@ struct ath_dp_accel_cfg_ops {
+ 	bool (*ppeds_get_node_id)(struct ieee80211_vif *vif,
+ 				  struct wireless_dev *wdev,
+ 				  const u8 *peer_mac, u8 *node_id);
++
+ 	uint32_t (*get_metadata_info)(struct ath_dp_metadata_param *md_param);
++	void (*sdwf_ul_config)(struct ath_ul_params *params);
+ };
+ 
+ /**
+@@ -124,4 +137,5 @@ void ath_dp_accel_cfg_ops_callback_unreg
+ bool ath_dp_accel_cfg_fetch_ds_node_id(struct ath_dp_accel_cfg *info);
+ 
+ u32 ath_get_metadata_info(struct ath_dp_metadata_param *dp_metadata_param);
++void ath_sawf_uplink(struct ath_ul_params *params);
+ #endif
+--- a/include/ath/ath_sawf.h
++++ b/include/ath/ath_sawf.h
+@@ -21,19 +21,6 @@ struct ath_sawf_callbacks {
+ 				 u32 rv_mark_metadata);
+ };
+ 
+-struct ath_ul_params {
+-	struct net_device *dst_dev;
+-	struct net_device *src_dev;
+-	u8 *dst_mac;
+-	u8 *src_mac;
+-	u8 fw_service_id;
+-	u8 rv_service_id;
+-	u8 start_or_stop;
+-	u32 fw_mark_metadata;
+-	u32 rv_mark_metadata;
+-};
+-
+ int ath_sawf_msduq_callback_register(struct ath_sawf_callbacks *ath_cb);
+ void ath_sawf_msduq_callback_unregister(void);
+-void ath_sawf_uplink(struct ath_ul_params *ecm_ath_ul_params);
+ #endif

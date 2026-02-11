@@ -1,0 +1,549 @@
+From 5b2528f6567959f9fca6cabcd90dae40e2e34b2e Mon Sep 17 00:00:00 2001
+From: Sidhanta Sahu <sidhanta.sahu@oss.qualcomm.com>
+Date: Wed, 13 Aug 2025 12:21:26 -0700
+Subject: [PATCH] wifi: ath12k: QSDK: CP: protect vendor info code with mutex
+ to prevent race conditions
+
+Add mutex protection to vendor service resources to prevent race conditions
+when multiple processes access the same kernel resource concurrently. While
+rtnl lock naturally protects resources during userspace to kernel space
+input, mixed contexts can still access common vendor service resources
+simultaneously.
+
+Implement a vendor_lock spin lock to protect critical sections
+and ensure thread-safe access to shared vendor service data structures.
+
+Patch-dependency:
+	0480-11-QSDK-CP-wifi-ath12K-implement-handshake-between-driv.patch
+
+Signed-off-by: Sidhanta Sahu <sidhanta.sahu@oss.qualcomm.com>
+---
+ .../net/wireless/ath/ath12k/vendor_services.c | 175 ++++++++++++++----
+ .../net/wireless/ath/ath12k/vendor_services.h |   2 +-
+ 2 files changed, 145 insertions(+), 32 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/vendor_services.c
++++ b/drivers/net/wireless/ath/ath12k/vendor_services.c
+@@ -11,9 +11,37 @@
+ #define AGENT_NOTIFY_EVENT_DEINIT 1
+ 
+ static struct ath12k_vendor_service_info vendor_info;
++static bool resources_created;
++
++/* These macros directly access the fields of the provided vendor_info structure.
++ * This is necessary for functions like ath12k_telemetry_destroy_resources that
++ * are called during module unload and need direct access to the wiphy/wdev pointers.
++ */
+ #define GET_WIPHY(vendor_info) ((vendor_info).wiphy)
+ #define GET_WDEV(vendor_info) ((vendor_info).wdev)
+ 
++static struct wiphy *ath12k_vendor_get_wiphy(void)
++{
++	struct wiphy *wiphy;
++
++	spin_lock(&vendor_info.vendor_lock);
++	wiphy = vendor_info.wiphy;
++	spin_unlock(&vendor_info.vendor_lock);
++
++	return wiphy;
++}
++
++struct wireless_dev *ath12k_vendor_get_wdev(void)
++{
++	struct wireless_dev *wdev;
++
++	spin_lock(&vendor_info.vendor_lock);
++	wdev = vendor_info.wdev;
++	spin_unlock(&vendor_info.vendor_lock);
++
++	return wdev;
++}
++
+ struct ath12k_vendor_work {
+ 	struct work_struct work;
+ 	struct ath12k_vendor_service_info *vendor_info;
+@@ -31,6 +59,85 @@ static int
+ 	struct ath12k_vendor_service_info *info
+ );
+ 
++/* Helper functions for thread-safe vendor_info operations */
++static void ath12k_vendor_set_init_done(bool done)
++{
++	spin_lock(&vendor_info.vendor_lock);
++	vendor_info.is_vendor_init_done = done;
++	spin_unlock(&vendor_info.vendor_lock);
++}
++
++static bool ath12k_vendor_get_init_done(void)
++{
++	bool done;
++
++	spin_lock(&vendor_info.vendor_lock);
++	done = vendor_info.is_vendor_init_done;
++	spin_unlock(&vendor_info.vendor_lock);
++
++	return done;
++}
++
++static void ath12k_vendor_set_service_enabled(u8 service_id, bool enabled)
++{
++	if (service_id >= ATH12K_RM_MAX_SERVICE) {
++		ath12k_err(NULL, "service_id is out of range %d\n", service_id);
++		return;
++	}
++
++	spin_lock(&vendor_info.vendor_lock);
++	vendor_info.service_enabled[service_id] = enabled;
++	spin_unlock(&vendor_info.vendor_lock);
++}
++
++static void ath12k_vendor_set_dynamic_service_bit(u8 service_id, bool set)
++{
++	if (service_id >= ATH12K_RM_MAX_SERVICE) {
++		ath12k_err(NULL, "service_id is out of range %d\n", service_id);
++		return;
++	}
++
++	spin_lock(&vendor_info.vendor_lock);
++	if (set)
++		set_bit(service_id, &vendor_info.dynamic_svc_bitmask);
++	else
++		clear_bit(service_id, &vendor_info.dynamic_svc_bitmask);
++	spin_unlock(&vendor_info.vendor_lock);
++}
++
++static void ath12k_vendor_update_service_state(u8 service_id, bool enabled,
++					       bool init_done, bool is_dynamic,
++					       bool set_dynamic_bit)
++{
++	if (service_id >= ATH12K_RM_MAX_SERVICE) {
++		ath12k_err(NULL, "service_id is out of range %d\n", service_id);
++		return;
++	}
++
++	spin_lock(&vendor_info.vendor_lock);
++	vendor_info.service_enabled[service_id] = enabled;
++	vendor_info.is_vendor_init_done = init_done;
++
++	if (is_dynamic) {
++		if (set_dynamic_bit)
++			set_bit(service_id, &vendor_info.dynamic_svc_bitmask);
++		else
++			clear_bit(service_id, &vendor_info.dynamic_svc_bitmask);
++	}
++	spin_unlock(&vendor_info.vendor_lock);
++}
++
++static void ath12k_vendor_check_and_set_init_done(u8 service_id, bool *should_queue_work)
++{
++	spin_lock(&vendor_info.vendor_lock);
++	if (service_id == ATH12K_RM_MAIN_SERVICE ||
++	    test_bit(service_id, &vendor_info.dynamic_svc_bitmask)) {
++		vendor_info.is_vendor_init_done = true;
++		*should_queue_work = true;
++	}
++	spin_unlock(&vendor_info.vendor_lock);
++}
++
+ static int ath12k_vendor_service_common(struct ath12k_hw *ah,
+ 					struct ath12k_vendor_service_info *info,
+ 					const u8 event_type, bool enable)
+@@ -40,13 +147,15 @@ static int ath12k_vendor_service_common(
+ 		return -EINVAL;
+ 
+ 	if (event_type == AGENT_NOTIFY_EVENT_DEINIT)
+-		vendor_info.is_vendor_init_done = false;
++		ath12k_vendor_update_service_state(info->id, enable, false,
++						   false, false);
++	else
++		ath12k_vendor_set_service_enabled(info->id, enable);
+ 
+-	vendor_info.service_enabled[info->id] = enable;
+ 	ath12k_dbg(NULL, ATH12K_DBG_RM,
+ 		   "vendor svc %s id: %d Enable: %d\n",
+ 		   (event_type == AGENT_NOTIFY_EVENT_INIT) ? "init" : "deinit",
+-		   info->id, vendor_info.service_enabled[info->id]);
++		   info->id, enable);
+ 
+ 	return 0;
+ }
+@@ -83,9 +192,17 @@ void ath12k_vendor_create_resources(stru
+ 	if (id >= ATH12K_RM_MAX_SERVICE)
+ 		return;
+ 
+-	ath12k_telemetry_create_resources(ag);
+-	ath12k_dbg(NULL, ATH12K_DBG_RM,
+-		   "Created ta resources using service id : %d\n", id);
++	/* Only create resources if they haven't been created yet */
++	if (!resources_created) {
++		ath12k_telemetry_create_resources(ag);
++		resources_created = true;
++		ath12k_dbg(NULL, ATH12K_DBG_RM,
++			   "Created ta resources using service id : %d\n", id);
++	} else {
++		ath12k_dbg(NULL, ATH12K_DBG_RM,
++			   "Resources already created, skipping for service id : %d\n",
++			   id);
++	}
+ }
+ 
+ void ath12k_vendor_destroy_resources(struct ath12k_vendor_service_info *vendor_info,
+@@ -99,9 +216,17 @@ void ath12k_vendor_destroy_resources(str
+ 	if (id >= ATH12K_RM_MAX_SERVICE)
+ 		return;
+ 
+-	ath12k_telemetry_destroy_resources(ag);
+-	ath12k_dbg(NULL, ATH12K_DBG_RM,
+-		   "Destroyed telemetry resources using id: %d\n", id);
++	/* Only destroy resources if they have been created */
++	if (resources_created) {
++		ath12k_telemetry_destroy_resources(ag);
++		resources_created = false;
++		ath12k_dbg(NULL, ATH12K_DBG_RM,
++			   "Destroyed telemetry resources using id: %d\n", id);
++	} else {
++		ath12k_dbg(NULL, ATH12K_DBG_RM,
++			   "Resources not created or already destroyed, skipping for service id : %d\n",
++			   id);
++	}
+ }
+ 
+ static int ath12k_vendor_main_service_deinit(struct ath12k_hw *ah,
+@@ -113,7 +238,8 @@ static int ath12k_vendor_main_service_de
+ 	if (!info)
+ 		return -EINVAL;
+ 
+-	vendor_info.is_vendor_init_done = false;
++	ath12k_vendor_set_init_done(false);
++
+ 	for (id = 0; id < ATH12K_RM_MAX_SERVICE; id++) {
+ 		tmp_info.id = id;
+ 		if (ath12k_vendor_service_common(ah, &tmp_info,
+@@ -129,9 +255,13 @@ static int ath12k_vendor_main_service_de
+ static int ath12k_vendor_main_service_init(struct ath12k_hw *ah,
+ 					   struct ath12k_vendor_service_info *info)
+ {
++	bool is_init_done;
++
+ 	if (!info)
+ 		return -EINVAL;
+ 
++	is_init_done = ath12k_vendor_get_init_done();
++
+ 	ath12k_dbg(NULL, ATH12K_DBG_RM,
+ 		   "main svc init started for id: %d Enable: %d\n",
+ 		   info->id, vendor_info.service_enabled[info->id]);
+@@ -139,13 +269,13 @@ static int ath12k_vendor_main_service_in
+ 	if (ath12k_telemetry_is_agent_loaded())
+ 		ath12k_vendor_destroy_resources(&vendor_info, info->id);
+ 
+-	if (vendor_info.is_vendor_init_done) {
++	if (is_init_done) {
+ 		if (ath12k_vendor_service_common(ah, info,
+ 						 AGENT_NOTIFY_EVENT_DEINIT,
+ 						 false))
+ 			return -EINVAL;
+ 
+-		vendor_info.is_vendor_init_done = false;
++		ath12k_vendor_set_init_done(false);
+ 	}
+ 
+ 	ath12k_vendor_create_resources(&vendor_info, info->id);
+@@ -159,32 +289,41 @@ static int ath12k_vendor_main_service_in
+ static int ath12k_vendor_dynamic_service_init(struct ath12k_hw *ah,
+ 					      struct ath12k_vendor_service_info *info)
+ {
+-	set_bit(info->id, &vendor_info.dynamic_svc_bitmask);
++	if (ath12k_telemetry_is_agent_loaded())
++		ath12k_vendor_destroy_resources(&vendor_info, info->id);
++
++	ath12k_vendor_set_dynamic_service_bit(info->id, true);
++
++	ath12k_vendor_create_resources(&vendor_info, info->id);
++
+ 	if (ath12k_telemetry_dynamic_app_init_deinit_notify(AGENT_NOTIFY_EVENT_INIT,
+ 							    info->id,
+ 							    info->service_data,
+ 							    info->is_container_app))
+ 		return -EINVAL;
+-	vendor_info.service_enabled[info->id] = true;
++
++	ath12k_vendor_set_service_enabled(info->id, true);
++
+ 	ath12k_dbg(NULL, ATH12K_DBG_RM, "Dynamic Init service ID: %d Enabled: %d\n",
+-		   info->id, vendor_info.service_enabled[info->id]);
++		   info->id, true);
+ 	return 0;
+ }
+ 
+ static int ath12k_vendor_dynamic_service_deinit(struct ath12k_hw *ah,
+ 						struct ath12k_vendor_service_info *info)
+ {
+-	clear_bit(info->id, &vendor_info.dynamic_svc_bitmask);
++	ath12k_vendor_set_dynamic_service_bit(info->id, false);
++
+ 	if (ath12k_telemetry_dynamic_app_init_deinit_notify(AGENT_NOTIFY_EVENT_DEINIT,
+ 							    info->id,
+ 							    info->service_data,
+ 							    info->is_container_app))
+ 		return -EINVAL;
+ 
+-	vendor_info.service_enabled[info->id] = false;
+-	vendor_info.is_vendor_init_done = false;
++	ath12k_vendor_update_service_state(info->id, false, false, false, false);
++
+ 	ath12k_dbg(NULL, ATH12K_DBG_RM, "Dynamic De-Init service ID: %d Enabled: %d\n",
+-		   info->id, vendor_info.service_enabled[info->id]);
++		   info->id, false);
+ 	return 0;
+ }
+ 
+@@ -311,9 +450,10 @@ error:
+ 	return -1;
+ }
+ 
+-int ath12k_vendor_send_link_info(struct ath12k_vendor_soc_device_info *soc_info,
+-				 struct ath12k_vendor_link_info *link_info,
+-				 u8 service_id)
++static int
++ath12k_vendor_send_link_info(struct ath12k_vendor_soc_device_info *soc_info,
++			     struct ath12k_vendor_link_info *link_info,
++			     u8 service_id)
+ {
+ 	int vendor_data_len =
+ 		nla_total_size(sizeof(struct ath12k_vendor_soc_device_info));
+@@ -332,7 +472,7 @@ static void ath12k_vendor_link_initializ
+ 	int ret, id;
+ 	bool service_sent = false;
+ 
+-	mutex_lock(&vendor_info->list_lock);
++	spin_lock(&vendor_info->vendor_lock);
+ 	list_for_each_entry_safe(soc_info, tmp, &vendor_info->soc_list, list) {
+ 		link_info = &soc_info->link_info[0];
+ 		/* Send to all enabled services */
+@@ -388,28 +528,54 @@ static void ath12k_vendor_link_initializ
+ 		list_del(&soc_info->list);
+ 		kfree(soc_info);
+ 	}
+-	mutex_unlock(&vendor_info->list_lock);
++	spin_unlock(&vendor_info->vendor_lock);
+ 
+ 	kfree(vendor_work);
+ }
+ 
++static bool ath12k_vendor_check_work_queue_ready(void)
++{
++	bool ready;
++
++	spin_lock(&vendor_info.vendor_lock);
++	ready = vendor_info.is_vendor_init_done && vendor_info.wq;
++	spin_unlock(&vendor_info.vendor_lock);
++
++	return ready;
++}
++
+ static int ath12k_vendor_queue_vendor_work(void)
+ {
+ 	struct ath12k_vendor_work *vendor_work;
++	bool queued;
++	struct workqueue_struct *wq;
+ 
+-	if (!vendor_info.is_vendor_init_done || !vendor_info.wq) {
++	if (!ath12k_vendor_check_work_queue_ready()) {
+ 		ath12k_err(NULL, "failed to schedule vendor work as workqueue not initialized");
+ 		return -EINVAL;
+ 	}
+ 
+-	vendor_work = kmalloc(sizeof(*vendor_work), GFP_KERNEL);
++	vendor_work = kmalloc(sizeof(*vendor_work), GFP_ATOMIC);
+ 	if (!vendor_work)
+ 		return -ENOMEM;
+ 
+ 	INIT_WORK(&vendor_work->work, ath12k_vendor_link_initialize_process);
+ 	vendor_work->vendor_info = &vendor_info;
+ 
+-	queue_work(vendor_info.wq, &vendor_work->work);
++	/* Get workqueue reference without holding lock to avoid deadlock
++	 * since the work function also acquires the same lock
++	 */
++	spin_lock(&vendor_info.vendor_lock);
++	wq = vendor_info.wq;
++	spin_unlock(&vendor_info.vendor_lock);
++
++	queued = queue_work(wq, &vendor_work->work);
++
++	if (!queued) {
++		kfree(vendor_work);
++		ath12k_dbg(NULL, ATH12K_DBG_RM, "Work already queued, skipping duplicate");
++		return -EBUSY;
++	}
+ 
+ 	return 0;
+ }
+@@ -420,9 +586,10 @@ void ath12k_vendor_services_init(void)
+ 		return;
+ 
+ 	memset(&vendor_info, 0, sizeof(struct ath12k_vendor_service_info));
++	resources_created = false;
+ 
+ 	INIT_LIST_HEAD(&vendor_info.soc_list);
+-	mutex_init(&vendor_info.list_lock);
++	spin_lock_init(&vendor_info.vendor_lock);
+ 
+ 	vendor_info.wq = create_singlethread_workqueue("ath12k_vendor_wq");
+ 	if (!vendor_info.wq) {
+@@ -463,7 +630,7 @@ void ath12k_vendor_services_deinit(void)
+ 
+ 	info.id = ATH12K_RM_MAIN_SERVICE;
+ 	if (ath12k_vendor_service_deinit[info.id] &&
+-	    vendor_info.is_vendor_init_done)
++	    ath12k_vendor_get_init_done())
+ 		ath12k_vendor_service_deinit[info.id](NULL, &info);
+ 
+ 	for (id = 0; id < ATH12K_RM_MAX_SERVICE; id++) {
+@@ -473,7 +640,6 @@ void ath12k_vendor_services_deinit(void)
+ 
+ 	flush_workqueue(vendor_info.wq);
+ 	destroy_workqueue(vendor_info.wq);
+-	mutex_destroy(&vendor_info.list_lock);
+ 	list_for_each_entry_safe(soc_info, tmp, &vendor_info.soc_list, list) {
+ 		list_del(&soc_info->list);
+ 		kfree(soc_info);
+@@ -493,8 +659,10 @@ bool ath12k_vendor_is_service_enabled(co
+ static int ath12k_vendor_set_wireless_references(struct wiphy *wiphy,
+ 					     struct wireless_dev *wdev)
+ {
++	spin_lock(&vendor_info.vendor_lock);
+ 	vendor_info.wiphy = wiphy;
+ 	vendor_info.wdev = wdev;
++	spin_unlock(&vendor_info.vendor_lock);
+ 
+ 	return 0;
+ }
+@@ -553,7 +721,7 @@ int ath12k_vendor_initialize_service(str
+ 
+ int ath12k_vendor_generic_app_init_reply(struct sk_buff *vendor_event)
+ {
+-	struct wiphy *wiphy = GET_WIPHY(vendor_info);
++	struct wiphy *wiphy = ath12k_vendor_get_wiphy();
+ 	struct ieee80211_hw *hw = wiphy_to_ieee80211_hw(wiphy);
+ 	struct ath12k_hw *ah = hw->priv;
+ 	struct ath12k_hw_group *ag = ah->radio->ab->ag;
+@@ -827,7 +995,7 @@ static int ath12k_vendor_generic_report_
+ static void ath12k_vendor_generic_response(void *out_data,
+ 					   u8 service_id, u8 category)
+ {
+-	struct wiphy *wiphy = GET_WIPHY(vendor_info);
++	struct wiphy *wiphy = ath12k_vendor_get_wiphy();
+ 	int vendor_data_len = ath12k_vendor_get_len_vendor_generic_response();
+ 	struct sk_buff *vendor_event;
+ 
+@@ -913,6 +1081,7 @@ void ath12k_telemetry_vendor_callback(u8
+ {
+ 	static int data;
+ 	void *ptr = &data;
++	bool should_queue_work = false;
+ 
+ 	if (id >= ATH12K_RM_MAX_SERVICE)
+ 		return;
+@@ -926,9 +1095,8 @@ void ath12k_telemetry_vendor_callback(u8
+ 		 * both non-containerized based vendor app and containerized
+ 		 * based vendor app
+ 		 */
+-		if (id == ATH12K_RM_MAIN_SERVICE ||
+-		    test_bit(id, &vendor_info.dynamic_svc_bitmask)) {
+-			vendor_info.is_vendor_init_done = true;
++		ath12k_vendor_check_and_set_init_done(id, &should_queue_work);
++		if (should_queue_work) {
+ 			ath12k_dbg(NULL, ATH12K_DBG_RM,
+ 				   "Received init event from ta for service %s (ID: %d)",
+ 				   id == ATH12K_RM_MAIN_SERVICE ? "main" : "dynamic", id);
+@@ -941,8 +1109,7 @@ void ath12k_telemetry_vendor_callback(u8
+ 	if (init == 0) {
+ 		ath12k_vendor_generic_response(ptr, id, category);
+ 		/* Queue vendor work for both main service and dynamic services */
+-		if (id == ATH12K_RM_MAIN_SERVICE ||
+-		    test_bit(id, &vendor_info.dynamic_svc_bitmask))
++		if (should_queue_work)
+ 			ath12k_vendor_queue_vendor_work();
+ 	} else {
+ 		ath12k_telemetry_destroy_peer_agent_resources();
+@@ -952,7 +1119,7 @@ void ath12k_telemetry_vendor_callback(u8
+ int ath12k_vendor_send_assoc_event(void *event_data, u8 category)
+ {
+ 	/* Only report if any of the vendor app is enabled */
+-	if (!vendor_info.is_vendor_init_done)
++	if (!ath12k_vendor_get_init_done())
+ 		return -EOPNOTSUPP;
+ 
+ 	/* Check if vendor serive app is enabled
+@@ -984,14 +1151,15 @@ static void ath12k_vendor_report_link_in
+ 	}
+ 
+ 	/* Only report if vendor services are initialized */
+-	if (!vendor_info.is_vendor_init_done || !vendor_info.wq)
++	if (!ath12k_vendor_check_work_queue_ready()) {
++		ath12k_dbg(ab, ATH12K_DBG_RM,
++			   "failed to schedule vendor work as workqueue not initialized");
+ 		return;
++	}
+ 
+ 	soc_info = kmalloc(sizeof(*soc_info), GFP_KERNEL);
+-	if (!soc_info) {
+-		//ath12k_warn(ab, "Failed to create soc info for rm");
++	if (!soc_info)
+ 		return;
+-	}
+ 
+ 	soc_info->soc_id = ath12k_get_ab_device_id(ab);
+ 	soc_info->num_radios = ab->num_radios;
+@@ -1004,9 +1172,9 @@ static void ath12k_vendor_report_link_in
+ 	link_info->tx_chain_mask = ar->pdev->cap.tx_chain_mask;
+ 	link_info->rx_chain_mask = ar->pdev->cap.rx_chain_mask;
+ 
+-	mutex_lock(&vendor_info.list_lock);
++	spin_lock(&vendor_info.vendor_lock);
+ 	list_add(&soc_info->list, &vendor_info.soc_list);
+-	mutex_unlock(&vendor_info.list_lock);
++	spin_unlock(&vendor_info.vendor_lock);
+ 
+ 	/* Queue work with any valid service ID - the work handler will send
+ 	 * link info to all enabled services regardless of which service ID
+@@ -1016,10 +1184,10 @@ static void ath12k_vendor_report_link_in
+ 	if (ret) {
+ 		ath12k_dbg(ab, ATH12K_DBG_RM,
+ 			   "Failed to queue link info work, cleaning up");
+-		mutex_lock(&vendor_info.list_lock);
++		spin_lock(&vendor_info.vendor_lock);
+ 		list_del(&soc_info->list);
+ 		kfree(soc_info);
+-		mutex_unlock(&vendor_info.list_lock);
++		spin_unlock(&vendor_info.vendor_lock);
+ 	} else {
+ 		ath12k_dbg(ab, ATH12K_DBG_RM,
+ 			   "Queued link info work successfully");
+@@ -1080,4 +1248,3 @@ int ath12k_vendor_link_state_update(cons
+ 
+ 	return 0;
+ }
+-
+--- a/drivers/net/wireless/ath/ath12k/vendor_services.h
++++ b/drivers/net/wireless/ath/ath12k/vendor_services.h
+@@ -93,7 +93,7 @@ struct ath12k_vendor_service_info {
+ 	bool is_vendor_init_done;
+ 	struct workqueue_struct *wq;
+ 	struct list_head soc_list;
+-	struct mutex list_lock;
++	spinlock_t vendor_lock;	/* Protecting vendor info */
+ };
+ 
+ struct ath12k_vendor_mld_peer_link_entry {
+@@ -136,8 +136,4 @@ int ath12k_vendor_link_state_update(cons
+ 				    struct ath12k_link_vif *arvif,
+ 				    enum ath12k_vendor_link_state new_state);
+ 
+-int ath12k_vendor_send_link_info(struct ath12k_vendor_soc_device_info *soc_info,
+-				 struct ath12k_vendor_link_info *link_info,
+-				 u8 service_id);
+-
+ #endif /* ATH12K_VENDOR_SERVICES_H */

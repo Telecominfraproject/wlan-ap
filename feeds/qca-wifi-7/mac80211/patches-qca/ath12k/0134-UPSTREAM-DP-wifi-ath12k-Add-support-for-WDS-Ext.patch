@@ -1,0 +1,234 @@
+From df414a488f80800cc53ced545c991fe13134de36 Mon Sep 17 00:00:00 2001
+From: Tamizh Chelvam Raja <tamizhr@qti.qualcomm.com>
+Date: Fri, 16 May 2025 14:20:18 +0530
+Subject: [PATCH] UPSTREAM:DP:wifi:ath12k: Add support for WDS Ext
+
+In WDS offload(ETH) mode add support to create AP_VLAN
+interface from 4addr data packet also. Convert the 802.3
+rx frame to 80211 frame in case of both from_ds and to_ds is
+set in the frame. mac80211 frame will take care of handling
+the frame and creating AP_VLAN interface.
+
+Patch dependency: 0123-0001-UPSTREAM-CP-DP-ath12k-Add-4addr-AP-STA-mode-support.patch 
+                  0123-0002-UPSTREAM-DP-ath12k-Add-4addr-tx-multicast-packet-sup.patch
+ 
+Signed-off-by: Tamizh Chelvam Raja <tamizhr@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_peer.h     |  2 ++
+ drivers/net/wireless/ath/ath12k/dp_rx.c       |  5 +----
+ drivers/net/wireless/ath/ath12k/hal.h         |  4 +++-
+ drivers/net/wireless/ath/ath12k/mac.c         |  1 +
+ drivers/net/wireless/ath/ath12k/peer.c        |  3 +++
+ drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c | 22 ++++++++++++++-----
+ .../wireless/ath/ath12k/wifi7/hal_qcn9274.c   |  1 +
+ .../wireless/ath/ath12k/wifi7/hal_qcn9274.h   | 21 ++++++++++++------
+ 8 files changed, 42 insertions(+), 17 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.h
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.h
+@@ -140,6 +140,8 @@ struct ath12k_dp_peer {
+ 	struct ieee80211_key_conf *keys[WMI_MAX_KEY_INDEX + 1];
+ 	struct ath12k_dp_rx_tid rx_tid[IEEE80211_NUM_TIDS + 1];
+ 
++	bool use_4addr;
++
+ 	/* Info used in MMIC verification of * RX fragments */
+ 	struct crypto_shash *tfm_mmic;
+ 	u8 mcast_keyidx;
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -1007,7 +1007,6 @@ void ath12k_dp_rx_deliver_msdu(struct at
+ 	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
+ 	u8 decap = rx_desc_data->decap;
+ 	bool is_mcbc = rxcb->is_mcbc;
+-	bool is_eapol = rxcb->is_eapol;
+ 
+ 	if (status->encoding == RX_ENC_HE && !(status->flag & RX_FLAG_RADIOTAP_HE) &&
+ 	    !(status->flag & RX_FLAG_SKIP_MONITOR)) {
+@@ -1069,8 +1068,7 @@ void ath12k_dp_rx_deliver_msdu(struct at
+ 	 * Also, fast_rx expects the STA to be authorized, hence
+ 	 * eapol packets are sent in slow path.
+ 	 */
+-	if (decap == DP_RX_DECAP_TYPE_ETHERNET2_DIX && !is_eapol &&
+-	    !(is_mcbc && rx_status->flag & RX_FLAG_DECRYPTED))
++	if (decap == DP_RX_DECAP_TYPE_ETHERNET2_DIX && !rx_desc_data->no_8023_flag)
+ 		rx_status->flag |= RX_FLAG_8023;
+ 
+ 	ieee80211_rx_napi(ath12k_dp_pdev_to_hw(dp_pdev), pubsta, msdu, napi);
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -678,7 +678,9 @@ struct hal_rx_desc_data {
+ 	bool is_mcbc;
+ 	bool is_4addr_sta;
+ 	bool is_drop_packet;
+-	bool is_to_ds;
++	u8 is_to_ds:1,
++	   is_from_ds:1;
++	bool no_8023_flag;
+ };
+ 
+ struct ath12k_buffer_address {
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -6100,6 +6100,7 @@ static void ath12k_sta_set_4addr_wk(stru
+ 		if (peer) {
+ 			peer->dp_peer->vdev_type_4addr |= BIT(peer->vif->type);
+ 			peer->dp_peer->is_reset_mcbc = true;
++			peer->dp_peer->use_4addr = true;
+ 			arsta->tcl_metadata = peer->tcl_metadata;
+ 			arsta->ast_hash = peer->ast_hash;
+ 		}
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -249,6 +249,9 @@ int ath12k_peer_create(struct ath12k *ar
+ 				   sta ? sta->addr : NULL, arg->peer_addr,
+ 				   link_id, ar->hw_link_id);
+ 
++	if (vif->type == NL80211_IFTYPE_AP)
++		peer->dp_peer->is_reset_mcbc = true;
++
+ 	return 0;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
+@@ -564,12 +564,13 @@ static void ath12k_wifi7_dp_rx_h_undecap
+ 					     struct sk_buff *msdu,
+ 					     enum hal_encrypt_type enctype,
+ 					     struct ieee80211_rx_status *status,
+-					     bool mesh_ctrl_present)
++					     struct hal_rx_desc_data *rx_desc_data)
+ {
+ 	struct ieee80211_hdr *hdr;
+ 	struct ethhdr *eth;
+ 	u8 da[ETH_ALEN];
+ 	u8 sa[ETH_ALEN];
++	bool mesh_ctrl_present = rx_desc_data->mesh_ctrl_present;
+ 	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
+ 	struct ath12k_dp_rx_rfc1042_hdr rfc = {0xaa, 0xaa, 0x03, {0x00, 0x00, 0x00}};
+ 
+@@ -589,6 +590,7 @@ static void ath12k_wifi7_dp_rx_h_undecap
+ 	hdr = (struct ieee80211_hdr *)msdu->data;
+ 	ether_addr_copy(ieee80211_get_DA(hdr), da);
+ 	ether_addr_copy(ieee80211_get_SA(hdr), sa);
++	rx_desc_data->no_8023_flag = true;
+ }
+ 
+ static void ath12k_wifi7_dp_rx_h_undecap(struct ath12k_pdev_dp *dp_pdev,
+@@ -597,7 +599,8 @@ static void ath12k_wifi7_dp_rx_h_undecap
+ 					 enum hal_encrypt_type enctype,
+ 					 struct ieee80211_rx_status *status,
+ 					 bool decrypted,
+-					 struct hal_rx_desc_data *rx_desc_data)
++					 struct hal_rx_desc_data *rx_desc_data,
++					 struct ath12k_dp_peer *peer)
+ {
+ 	struct ethhdr *ehdr;
+ 
+@@ -618,8 +621,7 @@ static void ath12k_wifi7_dp_rx_h_undecap
+ 		    enctype == HAL_ENCRYPT_TYPE_TKIP_MIC) {
+ 			ATH12K_SKB_RXCB(msdu)->is_eapol = true;
+ 			ath12k_wifi7_dp_rx_h_undecap_eth(dp_pdev, msdu, enctype,
+-							 status,
+-							 rx_desc_data->mesh_ctrl_present);
++							 status, rx_desc_data);
+ 			break;
+ 		}
+ 
+@@ -632,14 +634,20 @@ static void ath12k_wifi7_dp_rx_h_undecap
+ 			return;
+ 		}
+ 
++		if (rx_desc_data->is_from_ds && rx_desc_data->is_to_ds && peer && !peer->use_4addr) {
++			ath12k_wifi7_dp_rx_h_undecap_eth(dp_pdev, msdu, enctype,
++							status, rx_desc_data);
++			break;
++		}
++
+ 
+ 		/* PN for mcast packets will be validated in mac80211;
+ 		 * remove eth header and add 802.11 header.
+ 		 */
+ 		if (ATH12K_SKB_RXCB(msdu)->is_mcbc && decrypted)
+ 			ath12k_wifi7_dp_rx_h_undecap_eth(dp_pdev, msdu, enctype,
+-							 status,
+-							 rx_desc_data->mesh_ctrl_present);
++							 status, rx_desc_data);
++
+ 		break;
+ 	case DP_RX_DECAP_TYPE_8023:
+ 		/* TODO: Handle undecap for these formats */
+@@ -729,7 +737,7 @@ static void ath12k_wifi7_dp_rx_h_mpdu(st
+ 
+ 	ath12k_wifi7_dp_rx_h_csum_offload(msdu, rx_desc_data);
+ 	ath12k_wifi7_dp_rx_h_undecap(dp_pdev, msdu, rx_desc,
+-				     enctype, rx_status, is_decrypted, rx_desc_data);
++				     enctype, rx_status, is_decrypted, rx_desc_data, peer);
+ 
+ 	if (!is_decrypted || rxcb->is_mcbc)
+ 		return;
+@@ -1285,7 +1293,7 @@ mic_fail:
+ 
+ 	ath12k_wifi7_dp_rx_h_ppdu(dp_pdev, rxs, rx_desc_data);
+ 	ath12k_wifi7_dp_rx_h_undecap(dp_pdev, msdu, rx_desc,
+-				     HAL_ENCRYPT_TYPE_TKIP_MIC, rxs, true, rx_desc_data);
++				     HAL_ENCRYPT_TYPE_TKIP_MIC, rxs, true, rx_desc_data, NULL);
+ 	if (rx_desc_data->is_drop_packet)
+ 		return -EINVAL;
+ 
+@@ -2117,7 +2125,7 @@ static bool ath12k_wifi7_dp_rx_h_tkip_mi
+ 
+ 	ath12k_wifi7_dp_rx_h_undecap(dp_pdev, msdu, desc,
+ 				     HAL_ENCRYPT_TYPE_TKIP_MIC, status, false,
+-				     rx_desc_data);
++				     rx_desc_data, NULL);
+ 	if (rx_desc_data->is_drop_packet)
+ 		return true;
+ 
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.c
+@@ -795,6 +795,7 @@ void ath12k_wifi7_hal_extract_rx_desc_da
+ 			ath12k_wifi7_hal_rx_h_seq_ctrl_valid_qcn9274(rx_desc);
+ 	rx_desc_data->fc_valid = ath12k_wifi7_hal_rx_h_fc_valid_qcn9274(rx_desc);
+ 	rx_desc_data->enctype = ath12k_wifi7_hal_rx_h_enctype_qcn9274(rx_desc);
++	rx_desc_data->is_from_ds = ath12k_wifi7_hal_rx_h_from_ds_qcn9274(rx_desc);
+ 	rx_desc_data->is_to_ds = ath12k_wifi7_hal_rx_h_to_ds_qcn9274(rx_desc);
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.h
+@@ -62,13 +62,6 @@ u32 ath12k_wifi7_hal_rx_h_enctype_qcn927
+ }
+ 
+ static inline
+-bool ath12k_wifi7_hal_rx_h_to_ds_qcn9274(struct hal_rx_desc *desc)
+-{
+-	return le16_get_bits(desc->u.qcn9274_compact.msdu_end.info5,
+-			     RX_MSDU_END_INFO5_TO_DS);
+-}
+-
+-static inline
+ u8 ath12k_wifi7_hal_rx_h_decap_type_qcn9274(struct hal_rx_desc *desc)
+ {
+ 	return le32_get_bits(desc->u.qcn9274_compact.msdu_end.info11,
+@@ -159,6 +152,20 @@ u8 ath12k_wifi7_hal_rx_h_tid_qcn9274(str
+ }
+ 
+ static inline
++u8 ath12k_wifi7_hal_rx_h_from_ds_qcn9274(struct hal_rx_desc *desc)
++{
++	return le16_get_bits(desc->u.qcn9274_compact.msdu_end.info5,
++			     RX_MSDU_END_INFO5_FROM_DS);
++}
++
++static inline
++u8 ath12k_wifi7_hal_rx_h_to_ds_qcn9274(struct hal_rx_desc *desc)
++{
++	return le16_get_bits(desc->u.qcn9274_compact.msdu_end.info5,
++			     RX_MSDU_END_INFO5_TO_DS);
++}
++
++static inline
+ u16 ath12k_wifi7_hal_rx_h_peer_id_qcn9274(struct hal_rx_desc *desc)
+ {
+ 	return __le16_to_cpu(desc->u.qcn9274_compact.mpdu_start.sw_peer_id);

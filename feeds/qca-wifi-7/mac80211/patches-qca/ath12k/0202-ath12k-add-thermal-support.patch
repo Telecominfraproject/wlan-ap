@@ -1,0 +1,518 @@
+From 694a8b448e81ae536b83ca3ad4d759377029de06 Mon Sep 17 00:00:00 2001
+From: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Date: Thu, 1 Sep 2022 15:50:33 +0530
+Subject: [PATCH] Revert "ath12k: remove thermal support"
+
+This reverts commit bd2a2d5c554cc2fa2a320519a100dc161d5cecf7.
+
+This patch also covers the changes from below patch:
+000-f-Revert-wifi-ath12k-wmi-remove-unused-thermal-command.patch
+
+Removed unused structure thermal_mitigation_params from thermal.h
+
+Signed-off-by: Aditya Kumar Singh <quic_adisi@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/Makefile  |   1 +
+ drivers/net/wireless/ath/ath12k/core.c    |  12 ++
+ drivers/net/wireless/ath/ath12k/core.h    |   2 +
+ drivers/net/wireless/ath/ath12k/mac.c     |   1 +
+ drivers/net/wireless/ath/ath12k/thermal.c | 227 ++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/thermal.h |  71 +++++++
+ drivers/net/wireless/ath/ath12k/wmi.c     |   2 +
+ 7 files changed, 316 insertions(+)
+ create mode 100644 drivers/net/wireless/ath/ath12k/thermal.c
+ create mode 100644 drivers/net/wireless/ath/ath12k/thermal.h
+
+--- a/drivers/net/wireless/ath/ath12k/Makefile
++++ b/drivers/net/wireless/ath/ath12k/Makefile
+@@ -36,6 +36,7 @@ ath12k-$(CONFIG_PM) += wow.o
+ ath12k-$(CPTCFG_NL80211_TESTMODE) += testmode.o
+ ath12k-$(CPTCFG_ATH12K_SPECTRAL) += spectral.o
+ ath12k-$(CPTCFG_WANT_DEV_COREDUMP) += coredump.o
++ath12k-$(CONFIG_THERMAL) += thermal.o
+ 
+ # for tracing framework to find trace.h
+ CFLAGS_trace.o := -I$(src)
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1007,6 +1007,7 @@ static void ath12k_core_soc_destroy(stru
+ static int ath12k_core_pdev_init(struct ath12k_base *ab)
+ {
+ 	ath12k_fse_init(ab);
++	ath12k_thermal_register(ab);
+ 
+ 	return 0;
+ }
+@@ -1014,6 +1015,7 @@ static int ath12k_core_pdev_init(struct
+ static void ath12k_core_pdev_deinit(struct ath12k_base *ab)
+ {
+ 	ath12k_fse_deinit(ab);
++	ath12k_thermal_unregister(ab);
+ }
+ 
+ static int ath12k_core_pdev_create(struct ath12k_base *ab)
+@@ -1683,6 +1685,7 @@ static void ath12k_core_pre_reconfigure_
+ 			complete(&ar->vdev_setup_done);
+ 			complete(&ar->vdev_delete_done);
+ 			complete(&ar->bss_survey_done);
++			complete(&ar->thermal.wmi_sync);
+ 
+ 			wake_up(&ar->dp.tx_empty_waitq);
+ 			idr_for_each(&ar->txmgmt_idr,
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -27,6 +27,7 @@
+ #include "mac.h"
+ #include "hw.h"
+ #include "reg.h"
++#include "thermal.h"
+ #include "dbring.h"
+ #include "fw.h"
+ #include "acpi.h"
+@@ -827,6 +828,7 @@ struct ath12k {
+ 	struct ath12k_fw_stats fw_stats;
+ 	unsigned long last_signal_update;
+ 	unsigned long last_tx_power_update;
++	struct ath12k_thermal thermal;
+ };
+ 
+ struct ath12k_hw {
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -12782,6 +12782,7 @@ static void ath12k_mac_setup(struct ath1
+ 	init_completion(&ar->scan.on_channel);
+ 	init_completion(&ar->mlo_setup_done);
+ 	init_completion(&ar->completed_11d_scan);
++	init_completion(&ar->thermal.wmi_sync);
+ 
+ 	INIT_DELAYED_WORK(&ar->scan.timeout, ath12k_scan_timeout_work);
+ 	wiphy_work_init(&ar->scan.vdev_clean_wk, ath12k_scan_vdev_clean_work);
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath12k/thermal.c
+@@ -0,0 +1,237 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * Copyright (c) 2020-2021 The Linux Foundation. All rights reserved.
++ * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#include <linux/device.h>
++#include <linux/sysfs.h>
++#include <linux/thermal.h>
++#include <linux/hwmon.h>
++#include <linux/hwmon-sysfs.h>
++#include "core.h"
++#include "debug.h"
++
++static int
++ath12k_thermal_get_max_throttle_state(struct thermal_cooling_device *cdev,
++				      unsigned long *state)
++{
++	*state = ATH12K_THERMAL_THROTTLE_MAX;
++
++	return 0;
++}
++
++static int
++ath12k_thermal_get_cur_throttle_state(struct thermal_cooling_device *cdev,
++				      unsigned long *state)
++{
++	struct ath12k *ar = cdev->devdata;
++
++	guard(wiphy)(ath12k_ar_to_hw(ar)->wiphy);
++	*state = ar->thermal.throttle_state;
++
++	return 0;
++}
++
++static int
++ath12k_thermal_set_cur_throttle_state(struct thermal_cooling_device *cdev,
++				      unsigned long throttle_state)
++{
++	struct ath12k *ar = cdev->devdata;
++	int ret;
++
++	if (throttle_state > ATH12K_THERMAL_THROTTLE_MAX) {
++		ath12k_warn(ar->ab, "throttle state %ld is exceeding the limit %d\n",
++			    throttle_state, ATH12K_THERMAL_THROTTLE_MAX);
++		return -EINVAL;
++	}
++	guard(wiphy)(ath12k_ar_to_hw(ar)->wiphy);
++	ret = ath12k_thermal_set_throttling(ar, throttle_state);
++	if (ret == 0)
++		ar->thermal.throttle_state = throttle_state;
++	return ret;
++}
++
++static const struct thermal_cooling_device_ops ath12k_thermal_ops = {
++	.get_max_state = ath12k_thermal_get_max_throttle_state,
++	.get_cur_state = ath12k_thermal_get_cur_throttle_state,
++	.set_cur_state = ath12k_thermal_set_cur_throttle_state,
++};
++
++static ssize_t ath12k_thermal_show_temp(struct device *dev,
++					struct device_attribute *attr,
++					char *buf)
++{
++	struct ath12k *ar = dev_get_drvdata(dev);
++	struct ath12k_hw *ah = ath12k_ar_to_ah(ar);
++	int ret, temperature;
++	unsigned long time_left;
++
++	guard(wiphy)(ath12k_ar_to_hw(ar)->wiphy);
++
++	/* Can't get temperature when the card is off */
++	if (ar->ab->fw_mode != ATH12K_FIRMWARE_MODE_FTM && ah->state != ATH12K_HW_STATE_ON) {
++		ret = -ENETDOWN;
++		goto out;
++	}
++
++	reinit_completion(&ar->thermal.wmi_sync);
++	ret = ath12k_wmi_send_pdev_temperature_cmd(ar);
++	if (ret) {
++		ath12k_warn(ar->ab, "failed to read temperature %d\n", ret);
++		goto out;
++	}
++
++	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, &ar->ab->dev_flags)) {
++		ret = -ESHUTDOWN;
++		goto out;
++	}
++
++	time_left = wait_for_completion_timeout(&ar->thermal.wmi_sync,
++						ATH12K_THERMAL_SYNC_TIMEOUT_HZ);
++	if (!time_left) {
++		ath12k_warn(ar->ab, "failed to synchronize thermal read\n");
++		ret = -ETIMEDOUT;
++		goto out;
++	}
++
++	spin_lock_bh(&ar->data_lock);
++	temperature = ar->thermal.temperature;
++	spin_unlock_bh(&ar->data_lock);
++
++	/* display in millidegree celcius */
++	ret = snprintf(buf, PAGE_SIZE, "%d\n", temperature * 1000);
++out:
++	return ret;
++}
++
++void ath12k_thermal_event_temperature(struct ath12k *ar, int temperature)
++{
++	spin_lock_bh(&ar->data_lock);
++	ar->thermal.temperature = temperature;
++	spin_unlock_bh(&ar->data_lock);
++	complete(&ar->thermal.wmi_sync);
++}
++
++static SENSOR_DEVICE_ATTR(temp1_input, 0444, ath12k_thermal_show_temp,
++			  NULL, 0);
++
++static struct attribute *ath12k_hwmon_attrs[] = {
++	&sensor_dev_attr_temp1_input.dev_attr.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(ath12k_hwmon);
++
++int ath12k_thermal_set_throttling(struct ath12k *ar, u32 throttle_state)
++{
++	struct ath12k_base *sc = ar->ab;
++	struct ath12k_hw *ah = ath12k_ar_to_ah(ar);
++	struct ath12k_wmi_thermal_mitigation_arg param;
++	int ret = 0;
++
++	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
++
++	if (ah->state != ATH12K_HW_STATE_ON)
++		return 0;
++
++	memset(&param, 0, sizeof(param));
++	param.pdev_id = ar->pdev->pdev_id;
++	param.enable = throttle_state ? 1 : 0;
++	param.dc = ATH12K_THERMAL_DEFAULT_DUTY_CYCLE;
++	param.dc_per_event = 0xFFFFFFFF;
++
++	param.levelconf[0].tmplwm = ATH12K_THERMAL_TEMP_LOW_MARK;
++	param.levelconf[0].tmphwm = ATH12K_THERMAL_TEMP_HIGH_MARK;
++	param.levelconf[0].dcoffpercent = throttle_state;
++	param.levelconf[0].priority = 0; /* disable all data tx queues */
++	ret = ath12k_wmi_send_thermal_mitigation_cmd(ar, &param);
++	if (ret) {
++		ath12k_warn(sc, "failed to send thermal mitigation duty cycle %u ret %d\n",
++			    throttle_state, ret);
++	}
++	return ret;
++}
++
++int ath12k_thermal_register(struct ath12k_base *sc)
++{
++	struct thermal_cooling_device *cdev;
++	struct device *hwmon_dev;
++	struct ath12k *ar;
++	struct ath12k_pdev *pdev;
++	struct ieee80211_hw *hw;
++	char pdev_name[20];
++	int i, ret;
++
++	for (i = 0; i < sc->num_radios; i++) {
++		pdev = &sc->pdevs[i];
++		ar = pdev->ar;
++		if (!ar)
++			continue;
++		hw = ar->ah->hw;
++		memset(pdev_name, 0, sizeof(pdev_name));
++
++		cdev = thermal_cooling_device_register("ath12k_thermal", ar,
++						       &ath12k_thermal_ops);
++
++		if (IS_ERR(cdev)) {
++			ath12k_err(sc, "failed to setup thermal device result: %ld\n",
++				   PTR_ERR(cdev));
++			ret = -EINVAL;
++			goto err_thermal_destroy;
++		}
++
++		ar->thermal.cdev = cdev;
++		snprintf(pdev_name, sizeof(pdev_name), "%s%d", "cooling_device",
++			 ar->hw_link_id);
++
++		ret = sysfs_create_link(&hw->wiphy->dev.kobj, &cdev->device.kobj,
++					pdev_name);
++		if (ret) {
++			ath12k_err(sc, "failed to create cooling device symlink\n");
++			goto err_thermal_destroy;
++		}
++
++		if (!IS_REACHABLE(CONFIG_HWMON))
++			return 0;
++
++		hwmon_dev = devm_hwmon_device_register_with_groups(&hw->wiphy->dev,
++								   "ath12k_hwmon", ar,
++								   ath12k_hwmon_groups);
++		if (IS_ERR(hwmon_dev)) {
++			ath12k_err(ar->ab, "failed to register hwmon device: %ld\n",
++				   PTR_ERR(hwmon_dev));
++			ret = -EINVAL;
++			goto err_thermal_destroy;
++		}
++	}
++
++	return 0;
++
++err_thermal_destroy:
++	ath12k_thermal_unregister(sc);
++	return ret;
++}
++
++void ath12k_thermal_unregister(struct ath12k_base *sc)
++{
++	struct ath12k *ar;
++	struct ath12k_pdev *pdev;
++	struct ieee80211_hw *hw;
++	char pdev_name[20];
++	int i;
++
++	for (i = 0; i < sc->num_radios; i++) {
++		pdev = &sc->pdevs[i];
++		ar = pdev->ar;
++		if (!ar)
++			continue;
++
++		hw = ar->ah->hw;
++		memset(pdev_name, 0, sizeof(pdev_name));
++
++		snprintf(pdev_name, sizeof(pdev_name), "%s%d", "cooling_device",
++			 ar->hw_link_id);
++		sysfs_remove_link(&hw->wiphy->dev.kobj, pdev_name);
++		thermal_cooling_device_unregister(ar->thermal.cdev);
++	}
++}
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath12k/thermal.h
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * Copyright (c) 2020-2021 The Linux Foundation. All rights reserved.
++ * Copyright (c) 2021-2022 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#ifndef _ATH12K_THERMAL_
++#define _ATH12K_THERMAL_
++
++#define ATH12K_THERMAL_TEMP_LOW_MARK -100
++#define ATH12K_THERMAL_TEMP_HIGH_MARK 150
++#define ATH12K_THERMAL_THROTTLE_MAX     100
++#define ATH12K_THERMAL_DEFAULT_DUTY_CYCLE 100
++#define ATH12K_HWMON_NAME_LEN           15
++#define ATH12K_THERMAL_SYNC_TIMEOUT_HZ (5 * HZ)
++#define THERMAL_LEVELS  1
++
++struct ath12k_thermal {
++	struct thermal_cooling_device *cdev;
++	struct completion wmi_sync;
++
++	/* protected by conf_mutex */
++	u32 throttle_state;
++	/* temperature value in Celcius degree
++	 * protected by data_lock
++	 */
++	int temperature;
++};
++
++#if IS_REACHABLE(CONFIG_THERMAL)
++int ath12k_thermal_register(struct ath12k_base *sc);
++void ath12k_thermal_unregister(struct ath12k_base *sc);
++int ath12k_thermal_set_throttling(struct ath12k *ar, u32 throttle_state);
++void ath12k_thermal_event_temperature(struct ath12k *ar, int temperature);
++#else
++static inline int ath12k_thermal_register(struct ath12k_base *sc)
++{
++	return 0;
++}
++
++static inline void ath12k_thermal_unregister(struct ath12k_base *sc)
++{
++}
++
++static inline int ath12k_thermal_set_throttling(struct ath12k *ar, u32 throttle_state)
++{
++	return 0;
++}
++
++static inline void ath12k_thermal_event_temperature(struct ath12k *ar,
++						    int temperature)
++{
++}
++
++#endif
++#endif /* _ATH12K_THERMAL_ */
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -3464,6 +3464,67 @@ int ath12k_wmi_send_set_current_country_
+ 	return ret;
+ }
+ 
++int
++ath12k_wmi_send_thermal_mitigation_cmd(struct ath12k *ar,
++				       struct ath12k_wmi_thermal_mitigation_arg *arg)
++{
++	struct ath12k_wmi_pdev *wmi = ar->wmi;
++	struct wmi_therm_throt_config_request_cmd *cmd;
++	struct wmi_therm_throt_level_config_info *lvl_conf;
++	struct wmi_tlv *tlv;
++	struct sk_buff *skb;
++	int i, ret, len;
++
++	len = sizeof(*cmd) + TLV_HDR_SIZE + THERMAL_LEVELS * sizeof(*lvl_conf);
++
++	skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, len);
++	if (!skb)
++		return -ENOMEM;
++
++	cmd = (struct wmi_therm_throt_config_request_cmd *)skb->data;
++
++	cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_THERM_THROT_CONFIG_REQUEST,
++						 sizeof(*cmd));
++
++	cmd->pdev_id = cpu_to_le32(ar->pdev->pdev_id);
++	cmd->enable = cpu_to_le32(arg->enable);
++	cmd->dc = cpu_to_le32(arg->dc);
++	cmd->dc_per_event = cpu_to_le32(arg->dc_per_event);
++	cmd->therm_throt_levels = cpu_to_le32(THERMAL_LEVELS);
++
++	tlv = (struct wmi_tlv *)(skb->data + sizeof(*cmd));
++	tlv->header = ath12k_wmi_tlv_hdr(WMI_TAG_ARRAY_STRUCT,
++					 THERMAL_LEVELS * sizeof(*lvl_conf));
++
++	lvl_conf = (struct wmi_therm_throt_level_config_info *)(skb->data +
++								sizeof(*cmd) +
++								TLV_HDR_SIZE);
++	for (i = 0; i < THERMAL_LEVELS; i++) {
++		lvl_conf->tlv_header =
++			ath12k_wmi_tlv_cmd_hdr(WMI_TAG_THERM_THROT_LEVEL_CONFIG_INFO,
++					       sizeof(*lvl_conf));
++
++		lvl_conf->temp_lwm = arg->levelconf[i].tmplwm;
++		lvl_conf->temp_hwm = arg->levelconf[i].tmphwm;
++		lvl_conf->dc_off_percent = arg->levelconf[i].dcoffpercent;
++		lvl_conf->prio = arg->levelconf[i].priority;
++		lvl_conf++;
++	}
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_WMI,
++		   "WMI vdev set thermal throt pdev_id %d enable %d dc %d dc_per_event %x levels %d\n",
++		   ar->pdev->pdev_id, arg->enable, arg->dc,
++		   arg->dc_per_event, THERMAL_LEVELS);
++
++	ret = ath12k_wmi_cmd_send(wmi, skb, WMI_THERM_THROT_SET_CONF_CMDID);
++	if (ret) {
++		ath12k_warn(ar->ab, "failed to send THERM_THROT_SET_CONF cmd\n");
++		dev_kfree_skb(skb);
++	}
++
++	return ret;
++}
++
+ int ath12k_wmi_send_11d_scan_start_cmd(struct ath12k *ar,
+ 				       struct wmi_11d_scan_start_arg *arg)
+ {
+@@ -8192,6 +8253,7 @@ ath12k_wmi_pdev_temperature_event(struct
+ 		goto exit;
+ 	}
+ 
++	ath12k_thermal_event_temperature(ar, ev.temp);
+ exit:
+ 	rcu_read_unlock();
+ }
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -4090,6 +4090,39 @@ enum set_init_cc_flags {
+ 	ALPHA_IS_SET,
+ };
+ 
++#define THERMAL_LEVELS		1
++struct tt_level_config {
++	u32 tmplwm;
++	u32 tmphwm;
++	u32 dcoffpercent;
++	u32 priority;
++};
++
++struct ath12k_wmi_thermal_mitigation_arg {
++	u32 pdev_id;
++	u32 enable;
++	u32 dc;
++	u32 dc_per_event;
++	struct tt_level_config levelconf[THERMAL_LEVELS];
++};
++
++struct wmi_therm_throt_config_request_cmd {
++	__le32 tlv_header;
++	__le32 pdev_id;
++	__le32 enable;
++	__le32 dc;
++	__le32 dc_per_event;
++	__le32 therm_throt_levels;
++} __packed;
++
++struct wmi_therm_throt_level_config_info {
++	__le32 tlv_header;
++	__le32 temp_lwm;
++	__le32 temp_hwm;
++	__le32 dc_off_percent;
++	__le32 prio;
++} __packed;
++
+ struct ath12k_wmi_init_country_arg {
+ 	union {
+ 		u16 country_code;
+@@ -6329,6 +6362,9 @@ int ath12k_wmi_send_bcn_offload_control_
+ int ath12k_wmi_send_init_country_cmd(struct ath12k *ar,
+ 				     struct ath12k_wmi_init_country_arg *arg);
+ int
++ath12k_wmi_send_thermal_mitigation_cmd(struct ath12k *ar,
++				       struct ath12k_wmi_thermal_mitigation_arg *arg);
++int
+ ath12k_wmi_send_set_current_country_cmd(struct ath12k *ar,
+ 					struct wmi_set_current_country_arg *arg);
+ int ath12k_wmi_peer_rx_reorder_queue_setup(struct ath12k *ar,

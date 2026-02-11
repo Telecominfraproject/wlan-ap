@@ -1,0 +1,172 @@
+From 3a0cf1c84be57ca7720a6cd7d4857a739444d561 Mon Sep 17 00:00:00 2001
+From: Surya Prakash Raajen <sraajen@qti.qualcomm.com>
+Date: Thu, 28 Aug 2025 12:08:59 +0530
+Subject: [PATCH] UPSTREAM:CP:wifi:ath12k: Fix beacon stats fetch failure due
+ to vif completion mismatch
+
+Beacon stats fetch failed as 'fw stats done' event expected completions
+for all VIFs in the radio, while the request was sent for a single VIF.
+Additionally, only the last VIF's stats were printed when fetched.
+
+Regression in recent design caused error return on timeout, whereas
+previous behavior returned success even without all completions.
+Since reset stats is called each time, only the last VIF's stats
+were maintained.
+
+Updated logic to avoid returning error on such timeouts.
+Optimized beacon stats path to use per-VIF stat path separately,
+avoiding wait for all VIF completions when a single VIF is targeted.
+Reset stats initially once to ensure correct accumulation.
+
+Fixes: I75e33d1ee4f ("UPSTREAM:CP: wifi:ath12k: fixes to firmware stats")
+Patch-Dependency: 0484-0002-UPSTREAM-CP-wifi-ath12k-avoid-burning-CPU
+-while-wait.patch
+Patch-work: None
+
+Signed-off-by: Surya Prakash Raajen <sraajen@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/debugfs.c | 11 ++--
+ drivers/net/wireless/ath/ath12k/mac.c     | 64 ++++++++++++++++++-----
+ drivers/net/wireless/ath/ath12k/mac.h     |  2 +
+ 3 files changed, 58 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/debugfs.c b/drivers/net/wireless/ath/ath12k/debugfs.c
+index e86cf2e..66ba6fd 100644
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -4180,17 +4180,18 @@ static int ath12k_open_bcn_stats(struct inode *inode, struct file *file)
+ 	param.pdev_id = ath12k_mac_get_target_pdev_id(ar);
+ 	param.stats_id = WMI_REQUEST_BCN_STAT;
+ 
++	ath12k_fw_stats_reset(ar);
++
+ 	/* loop all active VDEVs for bcn stats */
+ 	list_for_each_entry(arvif, &ar->arvifs, list) {
+ 		if (!arvif->is_up)
+ 			continue;
+ 
+ 		param.vdev_id = arvif->vdev_id;
+-		ret = ath12k_mac_get_fw_stats(ar, &param);
+-		if (ret) {
+-			ath12k_warn(ar->ab, "failed to request fw bcn stats: %d\n", ret);
+-			return ret;
+-		}
++		ret = ath12k_mac_get_fw_stats_per_vif(ar, &param);
++		if (ret)
++			ath12k_warn(ar->ab, "failed to request fw bcn stats: %d\n for vdev %d",
++				    ret, arvif->vdev_id);
+ 	}
+ 
+ 	ath12k_wmi_fw_stats_dump(ar, &ar->fw_stats, param.stats_id,
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 35be0a5..a9379de 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -7602,23 +7602,14 @@ static int ath12k_start_scan(struct ath12k *ar,
+ 	return 0;
+ }
+ 
+-int ath12k_mac_get_fw_stats(struct ath12k *ar,
+-			    struct ath12k_fw_stats_req_params *param)
++static int _ath12k_mac_get_fw_stats(struct ath12k *ar,
++				    struct ath12k_fw_stats_req_params *param)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+-	struct ath12k_hw *ah = ath12k_ar_to_ah(ar);
+ 	unsigned long time_left;
+ 	int ret;
+ 
+-	guard(mutex)(&ah->hw_mutex);
+-
+-	if (ah->state != ATH12K_HW_STATE_ON)
+-		return -ENETDOWN;
+-
+-	ath12k_fw_stats_reset(ar);
+-
+ 	reinit_completion(&ar->fw_stats_complete);
+-	reinit_completion(&ar->fw_stats_done);
+ 
+ 	ret = ath12k_wmi_send_stats_request_cmd(ar, param->stats_id,
+ 						param->vdev_id, param->pdev_id);
+@@ -7637,6 +7628,53 @@ int ath12k_mac_get_fw_stats(struct ath12k *ar,
+ 		return -ETIMEDOUT;
+ 	}
+ 
++	return 0;
++}
++
++int ath12k_mac_get_fw_stats_per_vif(struct ath12k *ar,
++				    struct ath12k_fw_stats_req_params *param)
++{
++	struct ath12k_base *ab = ar->ab;
++	struct ath12k_hw *ah = ath12k_ar_to_ah(ar);
++	int ret;
++
++	guard(mutex)(&ah->hw_mutex);
++
++	if (ah->state != ATH12K_HW_STATE_ON)
++		return -ENETDOWN;
++
++	ret = _ath12k_mac_get_fw_stats(ar, param);
++	if (ret) {
++		ath12k_warn(ab, "Failed to fetch stats per vif\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++int ath12k_mac_get_fw_stats(struct ath12k *ar,
++			    struct ath12k_fw_stats_req_params *param)
++{
++	struct ath12k_base *ab = ar->ab;
++	struct ath12k_hw *ah = ath12k_ar_to_ah(ar);
++	unsigned long time_left;
++	int ret;
++
++	guard(mutex)(&ah->hw_mutex);
++
++	if (ah->state != ATH12K_HW_STATE_ON)
++		return -ENETDOWN;
++
++	ath12k_fw_stats_reset(ar);
++
++	reinit_completion(&ar->fw_stats_done);
++
++	ret = _ath12k_mac_get_fw_stats(ar, param);
++	if (ret) {
++		ath12k_warn(ab, "Failed to fetch stats per vif\n");
++		return ret;
++	}
++
+ 	/* Firmware sends WMI_UPDATE_STATS_EVENTID back-to-back
+ 	 * when stats data buffer limit is reached. fw_stats_complete
+ 	 * is completed once host receives first event from firmware, but
+@@ -7644,10 +7682,8 @@ int ath12k_mac_get_fw_stats(struct ath12k *ar,
+ 	 * until firmware completes sending all the events.
+ 	 */
+ 	time_left = wait_for_completion_timeout(&ar->fw_stats_done, 3 * HZ);
+-	if (!time_left) {
++	if (!time_left)
+ 		ath12k_warn(ab, "time out while waiting for fw stats done\n");
+-		return -ETIMEDOUT;
+-	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/wireless/ath/ath12k/mac.h b/drivers/net/wireless/ath/ath12k/mac.h
+index c6ed476..66c4f84 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -283,6 +283,8 @@ struct ath12k *ath12k_get_ar_by_vif(struct ieee80211_hw *hw,
+ 				    struct ieee80211_vif *vif,
+ 				    u8 link_id);
+ int ath12k_mac_get_fw_stats(struct ath12k *ar, struct ath12k_fw_stats_req_params *param);
++int ath12k_mac_get_fw_stats_per_vif(struct ath12k *ar,
++				    struct ath12k_fw_stats_req_params *param);
+ int ath12k_mac_op_start(struct ieee80211_hw *hw);
+ void ath12k_mac_op_stop(struct ieee80211_hw *hw, bool suspend);
+ void
+-- 
+2.34.1
+

@@ -1,0 +1,325 @@
+From 879b8ed7d3a070d246d39d1fc868583259ffd581 Mon Sep 17 00:00:00 2001
+From: Vignesh U <uvignesh@qti.qualcomm.com>
+Date: Tue, 15 Jul 2025 16:03:17 +0530
+Subject: [PATCH 3/5] UPSTREAM: PROTOCOL: wifi: ath12k: Implement PSD
+ computation and mapping logic for SP mode
+
+Current code does not compute or populate Power Spectral Density (PSD)
+values for 6 GHz Standard Power (SP) AP mode. This limits the driver's
+ability to determine per-subchannel transmit power levels when puncturing
+is applied, which is critical for regulatory compliance and optimal
+performance.
+
+Improve this by implementing logic to compute OOBE-based PSD values for
+each supported bandwidth, generate sub-channel center frequencies, and
+map those PSD values to individual 20 MHz sub-channels. Derive the final
+PSD power table by applying the minimum of OOBE-based and regulatory PSD
+limits per sub-channel.
+
+Store the computed values in the TPC info structure and use them to
+program firmware. Handle orchestration through
+ath12k_mac_fill_reg_tpc_info_with_psd_for_sp_pwr_mode(), which is now
+invoked from the main TPC setup path.
+
+Fixes: None
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+ath12k/0420-b-UPSTREAM-PROTOCOL-ath12k-Add-bandwidth-mask-and-punc.patch
+
+Signed-off-by: Vignesh U <uvignesh@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 269 ++++++++++++++++++++++++++
+ 1 file changed, 269 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 0fa7645..73d3420 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -21916,6 +21916,273 @@ static u16 get_punc_bw(u16 punc_bitmap)
+ 	return (count * ATH12K_CHWIDTH_20);
+ }
+ 
++/**
++ * ath12k_mac_compute_oobe_psd - Compute OOBE-based PSD values for each
++ * bandwidth
++ * @ar: Pointer to ath12k device context
++ * @ctx: Channel context configuration
++ * @pri_freq: Primary channel frequency
++ * @max_bw: Maximum bandwidth in MHz
++ * @cfreqs: Array of center frequencies for each bandwidth
++ * @oobe_psd: Output array to store computed OOBE PSD values
++ *
++ * For each supported bandwidth, this function calculates the minimum
++ * out-of-band emission (OOBE) PSD value based on puncture patterns and
++ * effective bandwidth. The results are stored in the @oobe_psd array.
++ */
++static void ath12k_mac_compute_oobe_psd(struct ath12k *ar,
++					struct ieee80211_chanctx_conf *ctx,
++					u16 pri_freq, u16 max_bw, u32 *cfreqs,
++					s16 *oobe_psd,
++					u8 *num_oobe_psd)
++{
++	u16 bw;
++	int i;
++
++	for (i = 0, bw = ATH12K_CHWIDTH_20; bw <= max_bw; i++, bw *= 2) {
++		u16 punc = ath12k_mac_get_punc_pattern_for_bw(ctx, bw);
++
++		ath12_mac_reg_get_6g_min_psd(ar, pri_freq, cfreqs[i], punc, bw,
++					     &oobe_psd[i]);
++	}
++	*num_oobe_psd = i;
++}
++
++/**
++ * ath12k_mac_fill_subchans - Populate sub-channel center frequencies
++ * @sub_chans: Output array to hold sub-channel center frequencies
++ * @start_freq: Starting frequency in kHz
++ * @n_subchans: Number of 20 MHz sub-channels to generate
++ *
++ * Fills the @sub_chans array with center frequencies for each 20 MHz
++ * sub-channel, starting from @start_freq and incrementing by 20 MHz.
++ */
++static void
++ath12k_mac_fill_subchans(u16 *sub_chans, u32 start_freq, u8 n_subchans)
++{
++	u8 i;
++
++	for (i = 0; i < n_subchans; i++) {
++		sub_chans[i] = start_freq;
++		start_freq += ATH12K_CHWIDTH_20;
++	}
++}
++
++#define ATH12K_INVALID_IDX 0xFF
++/**
++ * find_start_idx - Find the index of a frequency in a sub-channel list
++ * @sub_chans: Array of sub-channel center frequencies
++ * @freq: Frequency to locate
++ * @n_subchans: Number of sub-channels in the array
++ *
++ * Searches the @sub_chans array for the given @freq and returns its index.
++ *
++ * Return: Index of @freq if found, otherwise 0xFF.
++ */
++static u8
++find_start_idx(u16 *sub_chans, u32 freq, u8 n_subchans)
++{
++	u8 i;
++
++	for (i = 0; i < n_subchans; i++) {
++		if (sub_chans[i] == freq) {
++			return i;
++		}
++	}
++
++	ath12k_dbg(NULL, ATH12K_DBG_MAC, "freq = %u, n_subchans = %u\n", freq, n_subchans);
++	ath12k_dbg(NULL, ATH12K_DBG_MAC, "subchans:\n");
++	for (i = 0; i < n_subchans; i++)
++		ath12k_dbg(NULL, ATH12K_DBG_MAC, "%u\n", sub_chans[i]);
++
++	return ATH12K_INVALID_IDX;
++}
++
++/**
++ * init_chan_def_for_start_freq - Initialize channel definition for a given bandwidth
++ * @ch_def: Pointer to the channel definition structure to initialize
++ * @cfreq: Center frequency (in MHz) to assign to center_freq1
++ * @bw: Bandwidth in MHz (e.g., ATH12K_CHWIDTH_20, _40, _80, etc.)
++ *
++ * This helper sets the center frequency and maps the internal bandwidth
++ * enumeration to the corresponding NL80211 channel width. It is used to
++ * prepare a cfg80211_chan_def structure for start frequency calculations.
++ */
++static void
++init_chan_def_for_start_freq(struct cfg80211_chan_def *ch_def, u32 cfreq, u16 bw)
++{
++	ch_def->center_freq1 = cfreq;
++	switch (bw) {
++	case ATH12K_CHWIDTH_320:
++		ch_def->width = NL80211_CHAN_WIDTH_320;
++		break;
++	case ATH12K_CHWIDTH_160:
++		ch_def->width = NL80211_CHAN_WIDTH_160;
++		break;
++	case ATH12K_CHWIDTH_80:
++		ch_def->width = NL80211_CHAN_WIDTH_80;
++		break;
++	case ATH12K_CHWIDTH_40:
++		ch_def->width = NL80211_CHAN_WIDTH_40;
++		break;
++	case ATH12K_CHWIDTH_20:
++		ch_def->width = NL80211_CHAN_WIDTH_20;
++		break;
++	}
++}
++
++/**
++ * ath12k_mac_map_psd_to_subchans - Map OOBE PSD values to 20 MHz sub-channels
++ * @cfreqs: Array of center frequencies for each bandwidth
++ * @oobe_psd: Array of OOBE PSD values per bandwidth
++ * @sub_chans: Array of 20 MHz sub-channel center frequencies
++ * @n_subchans: Number of sub-channels
++ * @max_bw: Maximum bandwidth in MHz
++ * @tpc_oobe_psd: Output array to store PSD values mapped to each sub-channel
++ *
++ * Example,
++ * cfreqs = [6115, 6125, 6145, 6185];  - for 20, 40, 80, 160 MHz
++ * sub_chans = [6115, 6135, 6155, 6175, 6195, 6215, 6235, 6255];
++ * n_subchans = 4;
++ * max_bw = 160;
++ * oobe_psd[] = {
++    22,  - for 20 MHz
++    19,  - for 40 MHz
++    16,  - for 80 MHz
++    13,  - for 160 MHz
++ * };
++ * tpc_oobe_psd[] = {
++    22, - 6115 MHz - 20MHz, oobe PSD value
++    19, - 6135 MHz - 40MHz, oobe PSD value
++    16, - 6155 MHz - 80MHz, oobe PSD value
++    16, - 6175 MHz - 80MHz, oobe PSD value
++    13, - 6195 MHz - 160MHz, oobe PSD value
++    13, - 6215 MHz - 160MHz, oobe PSD value
++    13, - 6235 MHz - 160MHz, oobe PSD value
++    13, - 6255 MHz - 160MHz, oobe PSD value
++ * };
++ * For each bandwidth level, this function determines the starting sub-channel
++ * index and fills the corresponding entries in @tpc_oobe_psd with the
++ * appropriate OOBE PSD value from @oobe_psd.
++ */
++static void
++ath12k_mac_map_psd_to_subchans(u32 *cfreqs, s16 *oobe_psd, u16 *sub_chans,
++			       u8 n_subchans, u16 max_bw, s16 *tpc_oobe_psd, u8 num_oobe_psd)
++{
++	u16 bw = max_bw;
++	int i;
++
++	for (i = num_oobe_psd; i > 0; i--) {
++		struct cfg80211_chan_def ch_def = {0};
++		u8 num_20mhz_channels;
++		u32 start_freq;
++		u8 start_idx;
++		int j;
++
++		init_chan_def_for_start_freq(&ch_def, cfreqs[i - 1], bw);
++		start_freq = ath12k_mac_get_6g_start_frequency(&ch_def);
++		num_20mhz_channels = bw / ATH12K_CHWIDTH_20;
++		start_idx = find_start_idx(sub_chans, start_freq, n_subchans);
++		if (start_idx == ATH12K_INVALID_IDX) {
++			ath12k_err(NULL, "Filling PSD TPC with -127dBm\n");
++			for (i = 0; i < n_subchans; i++)
++				tpc_oobe_psd[i] = -ATH12K_MAX_TX_POWER;
++			return;
++		}
++
++		for (j = start_idx;
++		     num_20mhz_channels > 0 && j < IEEE80211_MAX_NUM_PWR_LEVEL;
++		     j++, num_20mhz_channels--)
++			tpc_oobe_psd[j] = oobe_psd[i - 1];
++
++		bw /= 2;
++	}
++}
++
++/**
++ * ath12k_mac_finalize_psd_table - Finalize PSD power table with regulatory constraints
++ * @ar: Pointer to ath12k device context
++ * @reg_tpc_info: Pointer to TPC power info structure to populate
++ * @sub_chans: Array of 20 MHz sub-channel center frequencies
++ * @tpc_oobe_psd: Array of OOBE-based PSD values mapped to sub-channels
++ * @reg_psd: Array to store regulatory PSD values per sub-channel
++ * @ctx: Channel context configuration
++ *
++ * For each sub-channel, this function sets the channel center frequency and
++ * determines the final transmit power by applying the minimum of OOBE-based
++ * and regulatory PSD limits. The results are stored in the PSD power info table.
++ */
++static void
++ath12k_mac_finalize_psd_table(struct ath12k *ar,
++			      struct ath12k_reg_tpc_power_info *reg_tpc_info,
++			      u16 *sub_chans, s16 *tpc_oobe_psd, s16 *reg_psd,
++			      struct ieee80211_chanctx_conf *ctx)
++{
++	u16 start_freq = sub_chans[0];
++	s8 txpower;
++	int i;
++
++	for (i = 0; i < reg_tpc_info->num_psd_pwr_levels; i++) {
++		u16 cfreq;
++		struct ieee80211_channel *temp_chan;
++
++		reg_tpc_info->chan_psd_power_info[i].chan_cfreq = sub_chans[i];
++		reg_tpc_info->chan_psd_power_info[i].tx_power = tpc_oobe_psd[i];
++		ath12k_mac_get_psd_channel(ar, ATH12K_CHWIDTH_20, &start_freq,
++					   &cfreq, i, &temp_chan, &txpower,
++					   IEEE80211_REG_SP_AP);
++		if (temp_chan) {
++			reg_psd[i] = temp_chan->psd;
++			reg_tpc_info->chan_psd_power_info[i].tx_power =
++					min(tpc_oobe_psd[i], reg_psd[i]);
++		}
++	}
++}
++
++/**
++ * ath12k_mac_fill_reg_tpc_info_with_psd_for_sp_pwr_mode - Populate PSD power
++ * info for SP AP mode
++ * @ar: Pointer to ath12k device context
++ * @arvif: Virtual interface context
++ * @ctx: Channel context configuration
++ *
++ * Computes and fills the Power Spectral Density (PSD) transmit power levels
++ * for each 20 MHz sub-channel in 6 GHz Standard Power (SP) AP mode. It uses
++ * puncture patterns and regulatory constraints to determine the effective
++ * transmit power per sub-channel and stores the results in the PSD power info
++ * table of the virtual interface.
++ */
++static void
++ath12k_mac_fill_reg_tpc_info_with_psd_for_sp_pwr_mode(struct ath12k *ar,
++						      struct ath12k_link_vif *arvif,
++						      struct ieee80211_chanctx_conf *ctx)
++{
++	struct ath12k_reg_tpc_power_info *reg_tpc_info = &arvif->reg_tpc_info;
++	u16 max_bw = ath12k_mac_get_chan_width(ctx->def.width);
++	s16 tpc_oobe_psd[IEEE80211_MAX_NUM_PWR_LEVEL];
++	u16 sub_chans[IEEE80211_MAX_NUM_PWR_LEVEL];
++	u16 pri_freq = ctx->def.chan->center_freq;
++	s16  reg_psd[IEEE80211_MAX_NUM_PWR_LEVEL];
++	s16 oobe_psd[ATH12K_MAX_EIRP_VALS];
++	u32 cfreqs[ATH12K_MAX_EIRP_VALS];
++	u8 num_oobe_psd;
++	u32 start_freq;
++	u8 n_subchans;
++
++	reg_tpc_info->num_psd_pwr_levels =
++			ath12k_mac_get_num_pwr_levels(&ctx->def, true);
++	ath12k_mac_fill_cfreqs(&ctx->def, cfreqs);
++	ath12k_mac_compute_oobe_psd(ar, ctx, pri_freq, max_bw, cfreqs,
++				    oobe_psd, &num_oobe_psd);
++	start_freq = ath12k_mac_get_6g_start_frequency(&ctx->def);
++	n_subchans = max_bw / ATH12K_CHWIDTH_20;
++	ath12k_mac_fill_subchans(sub_chans, start_freq, n_subchans);
++	ath12k_mac_map_psd_to_subchans(cfreqs, oobe_psd, sub_chans, n_subchans,
++				       max_bw, tpc_oobe_psd, num_oobe_psd);
++	ath12k_mac_finalize_psd_table(ar, reg_tpc_info, sub_chans, tpc_oobe_psd,
++				      reg_psd, ctx);
++}
++
+ void
+ ath12k_mac_fill_reg_tpc_info_with_psd_eirp_pwr_for_sp(struct ath12k *ar,
+ 						      struct ath12k_link_vif *arvif,
+@@ -21930,6 +22197,8 @@ ath12k_mac_fill_reg_tpc_info_with_psd_eirp_pwr_for_sp(struct ath12k *ar,
+ 		   "punc_bitmap for 80MHz %u punc_bw %u", punc_bitmap, punc_bw);
+ 	 /* Host support for PSD and EIRP TLV for SP is implemented in subsequent patches */
+ 	ath12k_warn(ar->ab, "FW supports both PSD and EIRP TLV for SP. Add host support");
++	/* Fill reg psd tpc */
++	ath12k_mac_fill_reg_tpc_info_with_psd_for_sp_pwr_mode(ar, arvif, ctx);
+ }
+ 
+ static void
+-- 
+2.34.1
+

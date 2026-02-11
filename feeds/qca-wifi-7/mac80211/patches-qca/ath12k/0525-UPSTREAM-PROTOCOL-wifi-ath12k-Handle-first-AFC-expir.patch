@@ -1,0 +1,233 @@
+From 0a421b39c4144ce20783480076cf86ce9fdebb8e Mon Sep 17 00:00:00 2001
+From: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+Date: Wed, 17 Sep 2025 14:08:18 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: wifi: ath12k: Handle first AFC expiry
+ event
+
+During device bootup, as part of the initial WMI transactions, the
+firmware sends the regulatory WMI event 'WMI_REG_CHAN_LIST_CC_EXT_EVENTID'
+containing the regulatory rules for the default country. For devices that
+supports AFC, this is followed by the AFC expiry event.
+
+Currently, AFC expiry handling and AFC request generation are managed per
+radio (tied to struct ath12k). However, at the time the first AFC expiry
+event is received, the radio-level object is not yet allocated, causing
+the event to be ignored.
+
+This leads to unnecessary delays in AFC spectrum queries and results in
+sub-optimal performance when operating in LPI power mode. To address this,
+cache the AFC expiry event sent by the firmware during bootup and use it
+to generate the AFC request during mac registartion. Forward this request
+to higher layers to initiate querying of the AFC server.
+
+Fixes: Ib095b796fd5 ("UPSTREAM: PROTOCOL: Add AFC Expiry event changes")
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+ath12k/0373-a-UPSTREAM-PROTOCOL-Define-global-6GHz-operating-class.patch
+ath12k/0373-b-UPSTREAM-PROTOCOL-Prepare-complete-AFC-request-for-A.patch
+ath12k/0373-c-UPSTREAM-PROTOCOL-Add-support-to-send-AFC-request-as.patch
+ath12k/0373-d-UPSTREAM-PROTOCOL-Add-APIs-to-construct-AFC-frequenc.patch
+ath12k/0373-e-UPSTREAM-PROTOCOL-Add-functions-to-manage-6GHz-opera.patch
+ath12k/0373-f-UPSTREAM-PROTOCOL-Add-support-for-validating-and-fil.patch
+ath12k/0373-g-UPSTREAM-PROTOCOL-Add-API-to-construct-AFC-location-.patch
+ath12k/0373-h-UPSTREAM-PROTOCOL-Add-WMI-changes-to-handle-AFC-Expi.patch
+
+Signed-off-by: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |  6 +++
+ drivers/net/wireless/ath/ath12k/mac.c  | 17 +++++++
+ drivers/net/wireless/ath/ath12k/reg.h  |  6 +++
+ drivers/net/wireless/ath/ath12k/wmi.c  | 62 ++++++++++++++++----------
+ 4 files changed, 67 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index 0fedd5744c0b..9720bd34aac3 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1829,6 +1829,12 @@ struct ath12k_base {
+ 	struct ieee80211_regdomain *new_regd[MAX_RADIOS];
+ 	bool regd_freed;
+ 
++	/* afc_exp_info is used to store the AFC expiry
++	 * information for each radio. This is used to forward the
++	 * AFC expiry information to the user space during MAC
++	 * registration.
++	 */
++	struct ath12k_afc_expiry_info afc_exp_info[MAX_RADIOS];
+ 	/* 6 GHz standard power rules from cc ext event are saved here
+ 	 * as it should not be updated to cfg unless we have a AFC
+ 	 * response
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index f65a4f4a5bc2..627449780b6b 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -22407,6 +22407,23 @@ static int ath12k_mac_hw_register(struct ath12k_hw *ah)
+ 			goto err_unregister_hw;
+ 		}
+ 
++		if (ar->supports_6ghz && ar->ab->sp_rule &&
++		    ar->ab->sp_rule->num_6ghz_sp_rule) {
++			struct ath12k_afc_expiry_info *exp_info =
++			    &ar->ab->afc_exp_info[ar->pdev_idx];
++
++			if (exp_info->is_afc_exp_valid) {
++				ar->afc.event_type = ATH12K_AFC_EVENT_TIMER_EXPIRY;
++				ar->afc.event_subtype = exp_info->event_subtype;
++				ar->afc.request_id = exp_info->req_id;
++				if (ath12k_process_expiry_event(ar))
++					ath12k_warn(ab,
++						    "Failed to process expiry event\n");
++
++				exp_info->is_afc_exp_valid = false;
++			}
++		}
++
+ 		if (ar->ab->hw_params->current_cc_support && ab->new_alpha2[0]) {
+ 			struct wmi_set_current_country_arg current_cc = {};
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/reg.h b/drivers/net/wireless/ath/ath12k/reg.h
+index aad9f8b35234..44815a6f37f0 100644
+--- a/drivers/net/wireless/ath/ath12k/reg.h
++++ b/drivers/net/wireless/ath/ath12k/reg.h
+@@ -171,6 +171,12 @@ struct ath12k_afc_sp_reg_info {
+ 	struct ath12k_afc_chan_obj *afc_chan_info;
+ };
+ 
++struct ath12k_afc_expiry_info {
++	bool is_afc_exp_valid;
++	enum ath12k_afc_expiry_event_subtype event_subtype;
++	u32 req_id;
++};
++
+ /**
+  * struct ath12k_afc_freq_range_obj - Frequency range object
+  * @lowfreq: Lower frequency
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.c b/drivers/net/wireless/ath/ath12k/wmi.c
+index f5eec0828f12..2424a1ef56be 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -7676,24 +7676,23 @@ static int ath12k_wmi_afc_event_parser(struct ath12k_base *ab,
+ 	return ret;
+ }
+ 
+-static struct ath12k *
++static int
+ ath12k_wmi_afc_process_fixed_param(struct ath12k_base *ab,
+-				   void *ptr, size_t len, struct ath12k_afc_info *afc)
++				   void *ptr, size_t len, struct ath12k_afc_info *afc,
++				   u8 *pdev_id, struct ath12k **ar)
+ {
+ 	struct wmi_afc_event_fixed_param *fixed_param;
+ 	const struct wmi_tlv *tlv;
+-	struct ath12k *ar = NULL;
+ 	u16 tlv_tag;
+-	u8 pdev_id;
+ 
+ 	if (!ptr) {
+ 		ath12k_warn(ab, "No data present in afc event\n");
+-		return NULL;
++		return -1;
+ 	}
+ 
+ 	if (len < (sizeof(*fixed_param) + TLV_HDR_SIZE)) {
+ 		ath12k_warn(ab, "afc event size invalid\n");
+-		return NULL;
++		return -1;
+ 	}
+ 
+ 	tlv = (struct wmi_tlv *)ptr;
+@@ -7702,20 +7701,18 @@ ath12k_wmi_afc_process_fixed_param(struct ath12k_base *ab,
+ 
+ 	if (tlv_tag == WMI_TAG_AFC_EVENT_FIXED_PARAM) {
+ 		fixed_param = (struct wmi_afc_event_fixed_param *)ptr;
+-		pdev_id = le32_to_cpu(fixed_param->pdev_id);
+-		ar = ab->pdevs[pdev_id].ar;
+-		if (!ar) {
+-			ath12k_warn(ab, "Failed to get ar for afc fixed param\n");
+-			return NULL;
+-		}
++		*pdev_id = le32_to_cpu(fixed_param->pdev_id);
++		*ar = ab->pdevs[*pdev_id].ar;
++		if (!*ar)
++			ath12k_warn(ab, "Cannot get ar for afc fixed param\n");
+ 	} else {
+ 		ath12k_warn(ab, "Wrong tag %d in afc fixed param\n", tlv_tag);
+-		return NULL;
++		return -1;
+ 	}
+ 
+ 	afc->event_type = le32_to_cpu(fixed_param->event_type);
+ 
+-	return ar;
++	return 0;
+ }
+ 
+ static void ath12k_wmi_afc_event(struct ath12k_base *ab,
+@@ -7725,15 +7722,17 @@ static void ath12k_wmi_afc_event(struct ath12k_base *ab,
+ 	struct ath12k_afc_info *afc_info = &afc;
+ 	struct ath12k *ar;
+ 	int ret;
++	u8 pdev_id;
+ 
+-	ar = ath12k_wmi_afc_process_fixed_param(ab, skb->data, skb->len, afc_info);
+-	if (!ar) {
+-		ath12k_warn(ab, "Failed to get ar for afc processing\n");
++	ret = ath12k_wmi_afc_process_fixed_param(ab, skb->data, skb->len,
++						 afc_info, &pdev_id, &ar);
++	if (ret) {
++		ath12k_warn(ab, "Failed to process afc fixed param ret %d\n", ret);
+ 		return;
+ 	}
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_AFC, "Received AFC event of type %d for pdev: %d\n",
+-		   afc_info->event_type, ar->pdev->pdev_id);
++		   afc_info->event_type, pdev_id);
+ 	ret = ath12k_wmi_tlv_iter(ab, skb->data, skb->len,
+ 				  ath12k_wmi_afc_event_parser, afc_info);
+ 	if (ret) {
+@@ -7742,6 +7741,13 @@ static void ath12k_wmi_afc_event(struct ath12k_base *ab,
+ 			    afc_info->event_type, ret);
+ 		return;
+ 	}
++
++	if (!ar && afc_info->event_type != ATH12K_AFC_EVENT_TIMER_EXPIRY) {
++		ath12k_warn(ab, "Failed to get ar for afc processing\n");
++		ath12k_free_afc_power_event_info(afc_info);
++		return;
++	}
++
+ 	switch (afc_info->event_type) {
+ 	case ATH12K_AFC_EVENT_POWER_INFO:
+ 		ret = ath12k_reg_process_afc_power_event(ar, afc_info);
+@@ -7758,12 +7764,20 @@ static void ath12k_wmi_afc_event(struct ath12k_base *ab,
+ 
+ 		break;
+ 	case ATH12K_AFC_EVENT_TIMER_EXPIRY:
+-		ar->afc.event_type = afc_info->event_type;
+-		ar->afc.event_subtype = afc_info->event_subtype;
+-		ar->afc.request_id = afc_info->request_id;
+-		ret = ath12k_process_expiry_event(ar);
+-		if (ret)
+-			ath12k_warn(ab, "Failed to process expiry event\n");
++		if (ar) {
++			ar->afc.event_type = afc_info->event_type;
++			ar->afc.event_subtype = afc_info->event_subtype;
++			ar->afc.request_id = afc_info->request_id;
++			ret = ath12k_process_expiry_event(ar);
++			if (ret)
++				ath12k_warn(ab, "Failed to process expiry event\n");
++		} else {
++			ab->afc_exp_info[pdev_id].is_afc_exp_valid = true;
++			ab->afc_exp_info[pdev_id].event_subtype = afc_info->event_subtype;
++			ab->afc_exp_info[pdev_id].req_id = afc_info->request_id;
++			ath12k_dbg(ab, ATH12K_DBG_AFC,
++				   "AFC expiry event received without ar\n");
++		}
+ 		break;
+ 	default:
+ 		ath12k_warn(ab, "AFC reg rule update failed ret : %d\n", ret);
+-- 
+2.34.1
+

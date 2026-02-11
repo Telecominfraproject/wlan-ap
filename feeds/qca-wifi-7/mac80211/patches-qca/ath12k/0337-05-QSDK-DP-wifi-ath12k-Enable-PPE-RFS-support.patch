@@ -1,0 +1,250 @@
+From b0deb9dc2922b16fd81bddb1fde3d1105eee7b18 Mon Sep 17 00:00:00 2001
+From: Pradeep Kumar Chitrapu <pradeepc@qti.qualcomm.com>
+Date: Mon, 26 May 2025 18:11:53 -0700
+Subject: [PATCH 05/11] QSDK:DP:wifi: ath12k: Enable PPE RFS support
+
+This patch enables support for round-robin distribution of flows using
+Receive Flow Steering (RFS) on ethernet. Currently, TX packets are
+distributed by the hash-based distribution of 5-tuple flow rules when
+ethernet is giving these packets to the kernel. This results in uneven
+CPU load distribution due to hash collisions.
+
+The driver initializes PPE virtual port per netdevice also specifying
+core_mask to decide the CPU cores that need to be used for flows
+destined to this netdevice. The PPE module then follows round-robin
+flow distribution according to the core mask specified.
+
+By default, the core mask is set to constant 0xF specifying the use of
+core-0, core-1, core-2 and Core-3 as MLO can have dynamically added or
+deleted. When ath12k driver is loaded without MLO capability using
+mlo_capable=0 module param, core_mask will be chosen according to
+band the VAP is configured to.
+
+Module parameter to support this feature is set to be disabled by
+default and can be enabled by below command.
+        echo 1 > /sys/module/ath12k/parameters/ppe_rfs_support
+
+Different core masks can be configured using module paramter
+'rfs_core_mask'.
+example:
+   insmod ath12k.ko ppe_rfs_support=1 rfs_core_mask=0x7,0x7,0x7,0x7
+
+Patch-dependency:
+        325-QSDK-DP-wifi-Add-support-for-PPE-DS-Direct-switch-fe.patch
+Patch-work: None
+
+Signed-off-by: Pradeep Kumar Chitrapu <pradeepc@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c    | 10 ++++
+ drivers/net/wireless/ath/ath12k/core.h    |  3 +-
+ drivers/net/wireless/ath/ath12k/debugfs.c | 66 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/ppe.c     | 46 +++++++++++++++-
+ drivers/net/wireless/ath/ath12k/ppe.h     |  5 +-
+ 5 files changed, 126 insertions(+), 4 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -92,6 +92,16 @@ module_param_named(rx_nwifi_err_dump, at
+ MODULE_PARM_DESC(rx_nwifi_err_dump, "rx nwifi err dump: 0-disable, 1-enable");
+ EXPORT_SYMBOL(ath12k_rx_nwifi_err_dump);
+ 
++bool ath12k_ppe_rfs_support = true;
++module_param_named(ppe_rfs_support, ath12k_ppe_rfs_support, bool, 0644);
++MODULE_PARM_DESC(ppe_rfs_support, "Enable PPE RFS support for DL (0 - disable, 1 - enable)");
++
++unsigned int ath12k_rfs_core_mask[4] = {ATH12K_MAX_CORE_MASK, ATH12K_MAX_CORE_MASK,
++					ATH12K_MAX_CORE_MASK, ATH12K_MAX_CORE_MASK};
++module_param_array_named(rfs_core_mask, ath12k_rfs_core_mask, int, NULL, 0644);
++MODULE_PARM_DESC(rfs_core_mask, "Default RFS core mask, mask for 2G, mask for 5G,\n"
++		 "mask for 6G. One bit for one CPU core\n");
++
+ /* protected with ath12k_hw_group_mutex */
+ static struct list_head ath12k_hw_group_list = LIST_HEAD_INIT(ath12k_hw_group_list);
+ 
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -91,7 +91,7 @@
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ extern unsigned int ath12k_ppe_ds_enabled;
+ #endif
+-
++extern unsigned int ath12k_rfs_core_mask[4];
+ extern unsigned int ath12k_frame_mode;
+ extern bool ath12k_fse_3_tuple_enabled;
+ extern bool ath12k_rx_nwifi_err_dump;
+@@ -509,6 +509,7 @@ struct ath12k_vif {
+ 	enum wmi_vdev_subtype vdev_subtype;
+ 	struct ieee80211_vif *vif;
+ 	struct ath12k_hw *ah;
++	struct dentry *debugfs_rfs_core_mask;
+ 
+ 	union {
+ 		struct {
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -6,6 +6,9 @@
+ 
+ #include <linux/inet.h>
+ #include "core.h"
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++#include "ppe.h"
++#endif
+ #include "dp_tx.h"
+ #include "dp_rx.h"
+ #include "debug.h"
+@@ -2711,6 +2714,62 @@ static const struct file_operations fops
+ 	.open = simple_open
+ };
+ 
++static ssize_t ath12k_write_ppe_rfs_core_mask(struct file *file,
++					      const char __user *user_buf,
++					      size_t count, loff_t *ppos)
++{
++	struct ath12k_vif *ahvif = file->private_data;
++	struct ath12k_base *ab = ahvif->deflink.ar->ab;
++	u32 core_mask;
++	int ret;
++
++	if (kstrtou32_from_user(user_buf, count, 0, &core_mask))
++		return -EINVAL;
++
++	if (core_mask > 0xF)
++		return -EINVAL;
++
++	wiphy_lock(ahvif->ah->hw->wiphy);
++
++	if (core_mask == ahvif->dp_vif.ppe_core_mask)
++		goto out;
++
++	ret = ath12k_change_core_mask_for_ppe_rfs(ab, ahvif, core_mask);
++	if (ret) {
++		ath12k_warn(ab, "failed to change core_mask\n");
++		goto out;
++	}
++
++out:
++	ret = count;
++	wiphy_unlock(ahvif->ah->hw->wiphy);
++	return ret;
++}
++
++static ssize_t ath12k_read_ppe_rfs_core_mask(struct file *file,
++					     char __user *user_buf,
++					     size_t count, loff_t *ppos)
++{
++	struct ath12k_vif *ahvif = file->private_data;
++	char buf[32] = {0};
++	int len = 0;
++
++	wiphy_lock(ahvif->ah->hw->wiphy);
++	len = scnprintf(buf, sizeof(buf) - len, "%u\n",
++			ahvif->dp_vif.ppe_core_mask);
++
++	wiphy_unlock(ahvif->ah->hw->wiphy);
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static const struct file_operations ath12k_fops_rfs_core_mask = {
++	.read = ath12k_read_ppe_rfs_core_mask,
++	.write = ath12k_write_ppe_rfs_core_mask,
++	.open = simple_open,
++	.owner = THIS_MODULE,
++	.llseek = default_llseek,
++};
+ static
+ void ath12k_debugfs_fw_stats_register(struct ath12k *ar)
+ {
+@@ -4353,6 +4412,9 @@ void ath12k_debugfs_add_interface(struct
+ 	debugfs_create_file("resume_dialog", 0200, arvif->debugfs_twt,
+ 			    arvif, &ath12k_fops_twt_resume_dialog);
+ 
++	debugfs_create_file("rfs_core_mask", 0644, vif->debugfs_dir,
++			    ahvif, &ath12k_fops_rfs_core_mask);
++
+ 	/* Note: Add new AP mode only debugfs file before "ap_and_sta_debugfs_file" label.
+ 	 * Add new debugfs file for both AP and STA mode after the "ap_and_sta_debugfs_file"
+ 	 * label.
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -1313,6 +1313,48 @@ void ath12k_dp_srng_ppeds_cleanup(struct
+ 	ath12k_dp_srng_cleanup(ab, &dp->ppe.ppeds_comp_ring.ppe_wbm2sw_ring);
+ }
+ 
++int ath12k_ppe_rfs_get_core_mask(void)
++{
++	return ATH12K_PPE_DEFAULT_CORE_MASK;
++}
++
++/* User is expected to flush ecm entries before changing core mask */
++int ath12k_change_core_mask_for_ppe_rfs(struct ath12k_base *ab,
++					struct ath12k_vif *ahvif,
++					int core_mask)
++{
++	struct wireless_dev *wdev = ieee80211_vif_to_wdev(ahvif->vif);
++	int ret;
++
++	if (!wdev)
++		return -ENODEV;
++
++	if (ahvif->dp_vif.ppe_vp_num <= 0 ||
++	    ahvif->dp_vif.ppe_vp_type != PPE_VP_USER_TYPE_PASSIVE) {
++		ath12k_warn(ab, "invalid vp for dev %s\n", wdev->netdev->name);
++		return -EINVAL;
++	}
++
++	if (core_mask < 0) {
++		ath12k_warn(ab, "Invalid core_mask for PPE RFS\n");
++		return -EINVAL;
++	}
++
++	if (core_mask == ahvif->dp_vif.ppe_core_mask)
++		return 0;
++
++	ath12k_vif_free_vp(ahvif, wdev->netdev);
++
++	ret = ath12k_vif_alloc_vp(ahvif, PPE_VP_USER_TYPE_PASSIVE, &core_mask, wdev->netdev);
++	if (ret) {
++		ath12k_warn(ab, "error in enabling ppe vp for netdev %s\n",
++			    wdev->netdev->name);
++		return ret;
++	}
++
++	return 0;
++}
++
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ static bool ath12k_stats_update_ppe_vp(struct net_device *dev, ppe_vp_hw_stats_t *vp_stats)
+ {
+@@ -1373,7 +1415,7 @@ int ath12k_vif_update_vp_config(struct a
+ 	/* Direct Switching */
+ 	switch (ppe_vp_type) {
+ 	case PPE_VP_USER_TYPE_PASSIVE:
+-		vpui.core_mask = ATH12K_PPE_DEFAULT_CORE_MASK;
++		vpui.core_mask = ath12k_ppe_rfs_get_core_mask();
+ 		break;
+ 	case PPE_VP_USER_TYPE_DS:
+ 	case PPE_VP_USER_TYPE_ACTIVE:
+@@ -1465,7 +1507,7 @@ int ath12k_vif_alloc_vp(struct ath12k_vi
+ 		if (core_mask)
+ 			vpai.core_mask = *core_mask;
+ 		else
+-			vpai.core_mask = ATH12K_PPE_DEFAULT_CORE_MASK;
++			vpai.core_mask = ath12k_ppe_rfs_get_core_mask();
+ 
+ 		ppe_vp_num = ppe_vp_alloc(dev, &vpai);
+ 		break;
+--- a/drivers/net/wireless/ath/ath12k/ppe.h
++++ b/drivers/net/wireless/ath/ath12k/ppe.h
+@@ -29,7 +29,10 @@ enum ppeds_irq_type {
+ 
+ #define DP_PPEDS_SERVICE_BUDGET     256
+ 
+-#define ATH12K_PPE_DEFAULT_CORE_MASK		ATH12K_MAX_CORE_MASK
++#define ATH12K_PPE_DEFAULT_CORE_MASK		ath12k_rfs_core_mask[0]
++#define ATH12K_PPE_RFS_2GHZ_CORE_MASK		ath12k_rfs_core_mask[1]
++#define ATH12K_PPE_RFS_5GHZ_CORE_MASK		ath12k_rfs_core_mask[2]
++#define ATH12K_PPE_RFS_6GHZ_CORE_MASK		ath12k_rfs_core_mask[3]
+ 
+ #define ATH12K_INVALID_PPE_VP_NUM -1
+ #define ATH12K_INVALID_PPE_VP_TYPE -1

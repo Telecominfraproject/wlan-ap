@@ -1,0 +1,480 @@
+From 58042f2127cc0f35ea0bd9615f6c9548b10ae3f7 Mon Sep 17 00:00:00 2001
+From: Narendhar Reddy <nare@qti.qualcomm.com>
+Date: Wed, 7 May 2025 22:28:18 +0530
+Subject: [PATCH] ath12k: boot time optimisation along with cleanup.
+
+1)Parallel calbration request to FW
+Currently, QMI initialization for a radio occurred only after the
+calibration of the preceding radio was completed. Change this code flow
+to allow QMI initialization for each radio independently, without waiting
+for other radios to complete calibration.
+
+2) Sending host cap parallely.
+Currently, once calibration is completed, the host capability event is
+triggered for one radio. The host capability event for the next radio is only
+triggered after the firmware ready event is received for the first radio.
+Improve this by triggering the host cap event for all radios simultaneously.
+
+3) Calibaration in Mission mode supported by FW
+Currently, cold boot mode is sent to firmware, and calibration is performed in
+cold boot mode. After calibration completes, the radio is powered down/up, and
+mission mode is sent to firmware. FW as part of new feature supports calibration in
+mission mode, change this code flow to send mission mode to
+firmware and wait for calibration to complete, avoid power down/up.
+FW indicates support for calibration in mission mode through a bit in phy cap.
+Modify host to send the calibration bit while sending mode to indicate fw for calibration.
+
+Signed-off-by: Narendhar Reddy <nare@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c |  23 ---
+ drivers/net/wireless/ath/ath12k/core.h |   2 +
+ drivers/net/wireless/ath/ath12k/qmi.c  | 205 ++++++++++++++-----------
+ drivers/net/wireless/ath/ath12k/qmi.h  |  22 +--
+ 4 files changed, 120 insertions(+), 132 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -423,6 +423,9 @@ const struct firmware *ath12k_core_firmw
+ 	if (ret)
+ 		return ERR_PTR(ret);
+ 
++	if (fw && !fw->size)
++		return ERR_PTR(-ENOENT);
++
+ 	ath12k_dbg(ab, ATH12K_DBG_BOOT, "boot firmware request %s size %zu\n",
+ 		   path, fw->size);
+ 
+@@ -1661,25 +1664,6 @@ void ath12k_fw_stats_reset(struct ath12k
+ 	spin_unlock_bh(&ar->data_lock);
+ }
+ 
+-static void ath12k_core_trigger_partner(struct ath12k_base *ab)
+-{
+-	struct ath12k_hw_group *ag = ab->ag;
+-	struct ath12k_base *partner_ab;
+-	bool found = false;
+-	int i;
+-
+-	for (i = 0; i < ag->num_devices; i++) {
+-		partner_ab = ag->ab[i];
+-		if (!partner_ab)
+-			continue;
+-
+-		if (found)
+-			ath12k_qmi_trigger_host_cap(partner_ab);
+-
+-		found = (partner_ab == ab);
+-	}
+-}
+-
+ int ath12k_core_qmi_firmware_ready(struct ath12k_base *ab)
+ {
+ 	struct ath12k_hw_group *ag = ath12k_ab_to_ag(ab);
+@@ -1743,8 +1727,6 @@ int ath12k_core_qmi_firmware_ready(struc
+ 			goto err_core_stop;
+ 		}
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT, "group %d started\n", ag->id);
+-	} else {
+-		ath12k_core_trigger_partner(ab);
+ 	}
+ 
+ 	mutex_unlock(&ag->mutex);
+@@ -3908,9 +3890,7 @@ static int ath12k_core_hw_group_create(s
+ 
+ 		mutex_unlock(&ab->core_lock);
+ 
+-		ath12k_qmi_fwreset_from_cold_boot(ab);
+ 	}
+-
+ 	return 0;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1681,6 +1681,7 @@ struct ath12k_base {
+ 	/* Number of ML peers supported by firmware */
+ 	u32 max_ml_peer_supported;
+ 	u32 max_ml_peer_ids;
++	bool mm_cal_support;
+ 
+ 	u32 max_tid_msduq;
+ 	u32 def_tid_msduq;
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -1235,6 +1235,24 @@ static const struct qmi_elem_info qmi_wl
+ 					   single_chip_mlo_support),
+ 	},
+ 	{
++		.data_type  = QMI_OPT_FLAG,
++		.elem_len   = 1,
++		.elem_size  = sizeof(u8),
++		.array_type = NO_ARRAY,
++		.tlv_type   = 0x14,
++		.offset     = offsetof(struct qmi_wlanfw_phy_cap_resp_msg_v01,
++					mm_coldboot_cal_valid),
++	},
++	{
++		.data_type  = QMI_UNSIGNED_1_BYTE,
++		.elem_len   = 1,
++		.elem_size  = sizeof(u8),
++		.array_type = NO_ARRAY,
++		.tlv_type   = 0x14,
++		.offset     = offsetof(struct qmi_wlanfw_phy_cap_resp_msg_v01,
++					mm_coldboot_cal),
++	},
++	{
+ 		.data_type	= QMI_EOTI,
+ 		.array_type	= NO_ARRAY,
+ 		.tlv_type	= QMI_COMMON_TLV_TYPE,
+@@ -2507,6 +2525,24 @@ static const struct qmi_elem_info qmi_wl
+ 					   hw_debug),
+ 	},
+ 	{
++		.data_type  = QMI_OPT_FLAG,
++		.elem_len   = 1,
++		.elem_size  = sizeof(u8),
++		.array_type = NO_ARRAY,
++		.tlv_type   = 0x13,
++		.offset     = offsetof(struct qmi_wlanfw_wlan_mode_req_msg_v01,
++					   do_coldboot_cal_valid),
++	},
++	{
++		.data_type  = QMI_UNSIGNED_1_BYTE,
++		.elem_len   = 1,
++		.elem_size  = sizeof(u8),
++		.array_type = NO_ARRAY,
++		.tlv_type   = 0x13,
++		.offset     = offsetof(struct qmi_wlanfw_wlan_mode_req_msg_v01,
++					   do_coldboot_cal),
++	},
++	{
+ 		.data_type	= QMI_EOTI,
+ 		.array_type	= NO_ARRAY,
+ 		.tlv_type	= QMI_COMMON_TLV_TYPE,
+@@ -3143,6 +3179,11 @@ out:
+ 	return ret;
+ }
+ 
++static inline bool ath12k_cold_boot_cal_needed(struct ath12k_base *ab)
++{
++	return (!ab->early_cal_support && ab->hw_params->cold_boot_calib && ath12k_cold_boot_cal && ab->qmi.cal_done == 0);
++}
++
+ static int ath12k_qmi_send_qdss_trace_config_download_req(struct ath12k_base *ab,
+ 							  const u8 *buffer,
+ 							  unsigned int buffer_len)
+@@ -3339,9 +3380,8 @@ static int ath12k_host_cap_parse_mlo(str
+ 		return 0;
+ 	}
+ 
+-	if (ath12k_cold_boot_cal && ab->qmi.cal_done == 0 &&
+-            !ab->early_cal_support && ab->hw_params->cold_boot_calib &&
+-                ab->qmi.cal_timeout == 0) {
++	if (ath12k_cold_boot_cal_needed(ab) && !ab->mm_cal_support &&
++            ab->qmi.cal_timeout == 0) {
+                 ath12k_dbg(ab, ATH12K_DBG_QMI, "Skip MLO cap send for device id %d since it's in cold_boot\n",
+                                 ab->device_id);
+                 return 0;
+@@ -3386,7 +3426,8 @@ static int ath12k_host_cap_parse_mlo(str
+ 		info = &req->mlo_chip_info_v2[i];
+ 		partner_ab = ag->ab[i];
+ 
+-		if (partner_ab->device_id == ATH12K_INVALID_DEVICE_ID) {
++		if (partner_ab->device_id == ATH12K_INVALID_DEVICE_ID ||
++			partner_ab->qmi.num_radios == U8_MAX) {
+ 			ath12k_err(ab, "failed to send MLO cap due to invalid partner device id\n");
+ 			ret = -EINVAL;
+ 			goto device_cleanup;
+@@ -3597,6 +3638,9 @@ static void ath12k_qmi_phy_cap_send(stru
+ 		goto out;
+ 	}
+ 
++	if (ath12k_cold_boot_cal && resp.mm_coldboot_cal_valid && resp.mm_coldboot_cal)
++		ab->mm_cal_support = true;
++
+ 	ab->qmi.num_radios = resp.num_phy;
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_QMI,
+@@ -4963,6 +5007,13 @@ static int ath12k_qmi_wlanfw_mode_send(s
+ 	req.hw_debug_valid = 1;
+ 	req.hw_debug = 0;
+ 
++	if ((mode == ATH12K_FIRMWARE_MODE_NORMAL || ATH12K_FIRMWARE_MODE_FTM)
++	   && ab->mm_cal_support &&
++	    ath12k_cold_boot_cal_needed(ab)) {
++		ath12k_info(ab,"cold boot calibration is requested in MISSION/FTM MODE\n");
++		req.do_coldboot_cal_valid = 1;
++		req.do_coldboot_cal = 1;
++	}
+ 	ret = qmi_txn_init(&ab->qmi.handle, &txn,
+ 			   qmi_wlanfw_wlan_mode_resp_msg_v01_ei, &resp);
+ 	if (ret < 0)
+@@ -5158,7 +5209,7 @@ void ath12k_qmi_firmware_stop(struct ath
+ int ath12k_qmi_firmware_start(struct ath12k_base *ab,
+ 			      u32 mode)
+ {
+-	int ret;
++	int ret, timeout, calibration_time;
+ 
+ 	ret = ath12k_qmi_wlanfw_wlan_ini_send(ab);
+ 	if (ret < 0) {
+@@ -5173,6 +5224,25 @@ int ath12k_qmi_firmware_start(struct ath
+ 	}
+ 
+ 	ret = ath12k_qmi_wlanfw_mode_send(ab, mode);
++
++	if (ath12k_cold_boot_cal_needed(ab) && ab->mm_cal_support) {
++		calibration_time = jiffies;
++		ab->in_coldboot_fwreset = true;
++
++		ath12k_dbg(ab, ATH12K_DBG_QMI, "Coldboot calibration wait started\n");
++		timeout = wait_event_timeout(ab->qmi.cold_boot_waitq, (ab->qmi.cal_done  == 1),
++					     ATH12K_COLD_BOOT_FW_RESET_DELAY);
++
++		if (timeout <= 0) {
++			ath12k_warn(ab, "Coldboot Calibration failed - wait ended\n");
++			ab->qmi.cal_timeout = 1;
++			return -ETIMEDOUT;
++		}
++		ath12k_dbg(ab, ATH12K_DBG_QMI, "Coldboot calibration completed , calibration took %d ms\n",
++			   jiffies_to_msecs(jiffies - calibration_time));
++		ab->in_coldboot_fwreset = false;
++	}
++
+ 	if (ret < 0) {
+ 		ath12k_warn(ab, "qmi failed to send wlan fw mode:%d\n", ret);
+ 		return ret;
+@@ -5246,12 +5316,18 @@ static void ath12k_qmi_event_m3_dump_upl
+         ath12k_coredump_m3_dump(ab, event_data);
+ }
+ 
+-static int ath12k_qmi_process_coldboot_calibration(struct ath12k_base *ab)
++int ath12k_qmi_process_coldboot_calibration(struct ath12k_base *ab)
+ {
+ 	int timeout;
+ 	int ret;
++	unsigned long calibration_time;
++
++	calibration_time = jiffies;
++
++	ab->in_coldboot_fwreset = true;
+ 
+ 	ret = ath12k_qmi_wlanfw_mode_send(ab, ATH12K_FIRMWARE_MODE_COLD_BOOT);
++
+ 	if (ret < 0) {
+ 		ath12k_warn(ab, "qmi failed to send wlan fw mode:%d\n", ret);
+ 		return ret;
+@@ -5264,10 +5340,20 @@ static int ath12k_qmi_process_coldboot_c
+ 				     ATH12K_COLD_BOOT_FW_RESET_DELAY);
+ 	if (timeout <= 0) {
+ 		ath12k_warn(ab, "Coldboot Calibration failed - wait ended\n");
+-		return 0;
++	} else {
++		ath12k_dbg(ab, ATH12K_DBG_QMI, "Coldboot calibration completed, calibration took %d ms\n",
++              jiffies_to_msecs(jiffies - calibration_time));
+ 	}
+ 
+-	ath12k_dbg(ab, ATH12K_DBG_QMI, "Coldboot calibration done\n");
++	ath12k_info(ab, "power down to restart firmware in mission mode\n");
++	ath12k_qmi_firmware_stop(ab);
++	ath12k_hif_power_down(ab, true);
++	ath12k_qmi_free_target_mem_chunk(ab);
++	ath12k_info(ab, "power up to restart firmware in mission mode\n");
++	/* reset host fixed mem off to zero */
++	ab->host_ddr_fixed_mem_off = 0;
++	ath12k_hif_power_up(ab);
++	ab->in_coldboot_fwreset = false;
+ 
+ 	return 0;
+ }
+@@ -5302,45 +5388,6 @@ static void ath12k_qmi_event_qdss_trace_
+ 	ab->is_qdss_tracing = false;
+ }
+ 
+-int ath12k_qmi_fwreset_from_cold_boot(struct ath12k_base *ab)
+-{
+-	int timeout;
+-
+-	if (ab->early_cal_support || (ath12k_cold_boot_cal == 0 ||
+-		ab->hw_params->cold_boot_calib == 0)) {
+-		ath12k_info(ab, "Cold boot cal is not supported/enabled\n");
+-		return 0;
+-	}
+-
+-	ab->in_coldboot_fwreset = true;
+-
+-	ath12k_dbg(ab, ATH12K_DBG_QMI, "wait for cold boot done\n");
+-
+-	timeout = wait_event_timeout(ab->qmi.cold_boot_waitq,
+-				     (ab->qmi.cal_done  == 1),
+-				     ATH12K_COLD_BOOT_FW_RESET_DELAY);
+-
+-	if (timeout <= 0) {
+-		ath12k_warn(ab, "Coldboot Calibration timed out\n");
+-		/*set cal_timeout to switch to mission mode on firware reset*/
+-		ab->qmi.cal_timeout = 1;
+-        }
+-
+-	/* reset the firmware */
+-	ath12k_info(ab, "power down to restart firmware in mission mode\n");
+-	ath12k_qmi_firmware_stop(ab);
+-	ath12k_hif_power_down(ab, false);
+-	ath12k_qmi_free_target_mem_chunk(ab);
+-	ath12k_info(ab, "power up to restart firmware in mission mode\n");
+-	/* reset host fixed mem off to zero */
+-
+-	ath12k_hif_power_up(ab);
+-	ab->in_coldboot_fwreset = false;
+-	ath12k_dbg(ab, ATH12K_DBG_QMI, "exit wait for cold boot done\n");
+-	return 0;
+-}
+-EXPORT_SYMBOL(ath12k_qmi_fwreset_from_cold_boot);
+-
+ static int ath12k_qmi_event_qdss_trace_misc_hdlr(struct ath12k_qmi *qmi, void *data)
+ {
+ 	struct qmi_wlfw_qdss_trace_data_req_msg_v01 *req;
+@@ -5477,10 +5524,13 @@ void ath12k_qmi_trigger_host_cap(struct
+ 
+ 	spin_lock(&qmi->event_lock);
+ 
+-	if (ath12k_qmi_get_event_block(qmi))
++	if (ath12k_qmi_get_event_block(qmi)) {
+ 		ath12k_qmi_set_event_block(qmi, false);
+-
+-	spin_unlock(&qmi->event_lock);
++		spin_unlock(&qmi->event_lock);
++	} else {
++		spin_unlock(&qmi->event_lock);
++		return;
++	}
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_QMI, "trigger host cap for device id %d\n",
+ 		   ab->device_id);
+@@ -5498,34 +5548,14 @@ static bool ath12k_qmi_hw_group_host_cap
+ 
+ 		if (!(ab && ab->qmi.num_radios != U8_MAX))
+ 			return false;
+-	}
+-
+-	return true;
+-}
+-
+-static struct ath12k_base *ath12k_qmi_hw_group_find_blocked(struct ath12k_hw_group *ag)
+-{
+-	struct ath12k_base *ab;
+-	int i;
+-
+-	lockdep_assert_held(&ag->mutex);
+-
+-	for (i = 0; i < ag->num_devices; i++) {
+-		ab = ag->ab[i];
+-		if (!ab)
+-			continue;
+-
+-		spin_lock(&ab->qmi.event_lock);
+-
+-		if (ath12k_qmi_get_event_block(&ab->qmi)) {
+-			spin_unlock(&ab->qmi.event_lock);
+-			return ab;
++		if (!ab->mm_cal_support && ath12k_cold_boot_cal_needed(ab) ) {
++			/* don't send host caps until calibration is completed
++			 * for all the radios
++			 */
++			return false;
+ 		}
+-
+-		spin_unlock(&ab->qmi.event_lock);
+ 	}
+-
+-	return NULL;
++	return true;
+ }
+ 
+ static int ath12k_qmi_fw_cfg_send_sync(struct ath12k_base *ab,
+@@ -5617,9 +5647,9 @@ err:
+ static noinline_for_stack
+ int ath12k_qmi_event_server_arrive(struct ath12k_qmi *qmi)
+ {
+-	struct ath12k_base *ab = qmi->ab, *block_ab;
++	struct ath12k_base *ab = qmi->ab, *partner_ab;
+ 	struct ath12k_hw_group *ag = ab->ag;
+-	int ret;
++	int ret, i;
+ 
+ 	ath12k_qmi_phy_cap_send(ab);
+ 
+@@ -5629,25 +5659,25 @@ int ath12k_qmi_event_server_arrive(struc
+ 		return ret;
+ 	}
+ 
+-	if (!ab->early_cal_support && ath12k_cold_boot_cal && ab->qmi.cal_done == 0 &&
+-			ab->hw_params->cold_boot_calib &&
++	spin_lock(&qmi->event_lock);
++	ath12k_qmi_set_event_block(qmi, true);
++	spin_unlock(&qmi->event_lock);
++	if (!ab->mm_cal_support && ath12k_cold_boot_cal_needed(ab) &&
+ 			ab->qmi.cal_timeout == 0) {
+ 		/* Coldboot calibration mode */
+ 		ath12k_qmi_trigger_host_cap(ab);
+ 	} else {
+-		spin_lock(&qmi->event_lock);
+ 		ath12k_core_hw_group_set_mlo_capable(ag);
+-		ath12k_qmi_set_event_block(qmi, true);
+-
+-		spin_unlock(&qmi->event_lock);
+-
+ 		mutex_lock(&ag->mutex);
+ 
+ 		if (ath12k_qmi_hw_group_host_cap_ready(ag)) {
+ 
+-			block_ab = ath12k_qmi_hw_group_find_blocked(ag);
+-			if (block_ab)
+-				ath12k_qmi_trigger_host_cap(block_ab);
++			for (i = 0; i < ag->num_devices; i++) {
++				partner_ab = ag->ab[i];
++				if (!partner_ab)
++					continue;
++				ath12k_qmi_trigger_host_cap(partner_ab);
++			}
+ 		}
+ 		mutex_unlock(&ag->mutex);
+ 	}
+@@ -6478,8 +6508,7 @@ static void ath12k_qmi_driver_event_work
+ 					    ab->hw_rev, ret);
+ 				break;
+ 			}
+-			if (!ab->early_cal_support && ath12k_cold_boot_cal && ab->qmi.cal_done == 0 &&
+-			    ab->hw_params->cold_boot_calib) {
++			if (ath12k_cold_boot_cal_needed(ab) && !ab->mm_cal_support) {
+ 				ath12k_qmi_process_coldboot_calibration(ab);
+ 			} else {
+ 				clear_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+--- a/drivers/net/wireless/ath/ath12k/qmi.h
++++ b/drivers/net/wireless/ath/ath12k/qmi.h
+@@ -415,6 +415,8 @@ struct qmi_wlanfw_phy_cap_resp_msg_v01 {
+ 	u32 board_id;
+ 	u8 single_chip_mlo_support_valid;
+ 	u8 single_chip_mlo_support;
++	u8 mm_coldboot_cal_valid;
++	u8 mm_coldboot_cal;
+ };
+ 
+ #define QMI_WLANFW_IND_REGISTER_REQ_MSG_V01_MAX_LEN		54
+@@ -708,7 +710,7 @@ struct qmi_wlanfw_m3_info_resp_msg_v01 {
+ 	struct qmi_response_type_v01 resp;
+ };
+ 
+-#define QMI_WLANFW_WLAN_MODE_REQ_MSG_V01_MAX_LEN	11
++#define QMI_WLANFW_WLAN_MODE_REQ_MSG_V01_MAX_LEN	15
+ #define QMI_WLANFW_WLAN_MODE_RESP_MSG_V01_MAX_LEN	7
+ #define QMI_WLANFW_WLAN_CFG_REQ_MSG_V01_MAX_LEN		803
+ #define QMI_WLANFW_WLAN_CFG_RESP_MSG_V01_MAX_LEN	7
+@@ -726,6 +728,8 @@ struct qmi_wlanfw_wlan_mode_req_msg_v01
+ 	u32 mode;
+ 	u8 hw_debug_valid;
+ 	u8 hw_debug;
++	u8 do_coldboot_cal_valid;
++	u8 do_coldboot_cal;
+ };
+ 
+ struct qmi_wlanfw_wlan_mode_resp_msg_v01 {
