@@ -490,7 +490,6 @@ define Build/Compile
 		M="$(PKG_BUILD_DIR)" \
 		NOSTDINC_FLAGS="$(NOSTDINC_FLAGS)" \
 		modules
-	$(MAKE) -C $(PKG_BUILD_DIR)/tools
 endef
 
 
