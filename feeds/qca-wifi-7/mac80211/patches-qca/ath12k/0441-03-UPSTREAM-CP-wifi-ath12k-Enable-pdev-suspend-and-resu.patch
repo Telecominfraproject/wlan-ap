@@ -1,0 +1,312 @@
+From 3c8d055dec4d4d9c9ef34e7ec222e8ed02e7da9a Mon Sep 17 00:00:00 2001
+From: Aaradhana Sahu <aaradhana.sahu@oss.qualcomm.com>
+Date: Mon, 21 Jul 2025 12:39:42 +0530
+Subject: [PATCH 1/2] UPSTREAM:CP: wifi: ath12k: Enable pdev suspend and resume
+ command
+
+The pdev suspend command helps reduce power consumption. When the last
+vdev on a particular pdev is deleted, the host sends a
+WMI_PDEV_SUSPEND_CMDID to the firmware. In response, the firmware sends
+back a WMI_PDEV_SUSPEND_EVENTID to the host.
+
+Similarly, when the first vdev is created and the corresponding pdev is
+in suspend mode, the host sends a WMI_PDEV_RESUME_CMDID to the firmware.
+The firmware then responds with a WMI_PDEV_RESUME_EVENTID.
+
+Patch-dependency: "UPSTREAM:CP:wifi:ath12k: ErP support"
+Patch-work: None
+
+Signed-off-by: Aaradhana Sahu <aaradhana.sahu@oss.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c |  2 +
+ drivers/net/wireless/ath/ath12k/core.h |  3 +
+ drivers/net/wireless/ath/ath12k/mac.c  | 59 +++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/mac.h  |  3 +
+ drivers/net/wireless/ath/ath12k/wmi.c  | 82 ++++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.h  | 11 ++++
+ 6 files changed, 157 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -2326,6 +2326,8 @@ static void ath12k_core_radio_start(stru
+ 						mutex_unlock(&ag->mutex);
+ 						return;
+ 					}
++
++					ar->pdev_suspend = false;
+ 				}
+ 			}
+ 		}
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1226,6 +1226,9 @@ struct ath12k {
+ 	bool erp_trigger_set;
+ 	struct work_struct erp_handle_trigger_work;
+ 	struct completion standby_teardown;
++	struct completion suspend;
++	bool pdev_suspend;
++	struct completion pdev_resume;
+ };
+ 
+ struct ath12k_6ghz_sp_reg_rule {
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -14384,6 +14384,7 @@ int ath12k_mac_op_start(struct ieee80211
+ 
+ 			if (ath12k_check_erp_power_down(ag)) {
+ 				ar->ab->powerup_triggered = false;
++				ar->pdev_suspend = false;
+ 			}
+ 		}
+ 	}
+@@ -14892,6 +14893,7 @@ int ath12k_mac_vdev_create(struct ath12k
+ 	u8 mask[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00};
+ 	int txpower = NL80211_TX_POWER_AUTOMATIC;
+ 	u8 map_id;
++	unsigned long time_left;
+ 
+ 	lockdep_assert_wiphy(hw->wiphy);
+ 
+@@ -14901,6 +14903,24 @@ int ath12k_mac_vdev_create(struct ath12k
+ 	if (vif->type == NL80211_IFTYPE_MONITOR && ar->monitor_vdev_created)
+ 		return -EINVAL;
+ 
++	if (ar->pdev_suspend) {
++		reinit_completion(&ar->pdev_resume);
++		ret = ath12k_wmi_pdev_resume(ar, ar->pdev->pdev_id);
++
++		if (ret) {
++			ath12k_err(ar->ab, "failed to send wmi resume command %d\n", ret);
++			return ret;
++		}
++
++		time_left = wait_for_completion_timeout(&ar->pdev_resume,
++							ATH12K_PDEV_RESUME_TIMEOUT);
++		if (!time_left) {
++			ath12k_err(ar->ab, "Timeout in receiving pdev resume response: %d\n",
++				   ar->pdev->pdev_id);
++			return -ETIMEDOUT;
++		}
++	}
++
+ 	/* If no link is active and scan vdev is requested
+ 	 * use a default link conf for scan address purpose.
+ 	 */
+@@ -15608,6 +15628,32 @@ bool ath12k_mac_validate_active_radio_co
+ 	return true;
+ }
+ 
++int ath12k_mac_pdev_suspend(struct ath12k *ar)
++{
++	unsigned long time_left;
++	int ret = 0;
++
++	if (!test_bit(WMI_SERVICE_PDEV_SUSPEND_EVENT_SUPPORT, ar->ab->wmi_ab.svc_map))
++		goto exit;
++
++	reinit_completion(&ar->suspend);
++	ret = ath12k_wmi_pdev_suspend(ar, WMI_PDEV_SUSPEND_AND_DISABLE_INTR,
++				      ar->pdev->pdev_id);
++	if (ret) {
++		ath12k_err(ar->ab, "failed to send wmi suspend command %d\n", ret);
++		goto exit;
++	}
++	time_left = wait_for_completion_timeout(&ar->suspend,
++						ATH12K_PDEV_SUSPEND_TIMEOUT);
++	if (!time_left) {
++		ath12k_err(ar->ab, "Timeout in receiving pdev suspend response: %d\n", ar->pdev->pdev_id);
++		ret = -ETIMEDOUT;
++		goto exit;
++	}
++exit:
++	return ret;
++}
++
+ static int ath12k_mac_vdev_delete(struct ath12k *ar, struct ath12k_link_vif *arvif)
+ {
+ 	struct ath12k_vif *ahvif = arvif->ahvif;
+@@ -15691,9 +15737,14 @@ err_vdev_del:
+ 	ahvif->device_bitmap &= ~BIT(ar->ab->wsi_info.index);
+ 
+ 	if (!ar->allocated_vdev_map && !arvif->is_scan_vif) {
+-		if (ath12k_erp_get_sm_state() == ATH12K_ERP_ENTER_COMPLETE &&
+-		    ath12k_mac_validate_active_radio_count(ar->ah))
+-			ath12k_core_cleanup_power_down_q6(ar->ah);
++		if (ath12k_erp_get_sm_state() == ATH12K_ERP_ENTER_COMPLETE) {
++			ret = ath12k_mac_pdev_suspend(ar);
++			if (ret)
++				ath12k_warn(ab, "Pdev suspend command is failed %d\n", ret);
++
++			if (ath12k_mac_validate_active_radio_count(ar->ah))
++				ath12k_core_cleanup_power_down_q6(ar->ah);
++		}
+ 	}
+ 
+ 	/* TODO: recal traffic pause state based on the available vdevs */
+@@ -21504,6 +21555,8 @@ static void ath12k_mac_setup(struct ath1
+ 	init_completion(&ar->thermal.wmi_sync);
+ 	init_completion(&ar->mvr_complete);
+ 	init_completion(&ar->standby_teardown);
++	init_completion(&ar->suspend);
++	init_completion(&ar->pdev_resume);
+ 
+ 	INIT_DELAYED_WORK(&ar->scan.timeout, ath12k_scan_timeout_work);
+ 	wiphy_work_init(&ar->scan.vdev_clean_wk, ath12k_scan_vdev_clean_work);
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -100,6 +100,8 @@ struct ath12k_generic_iter {
+ 
+ #define ATH12K_MIN_TX_POWER		-127
+ #define ATH12K_TEARDOWN_STANDBY_TIMEOUT (2 * HZ)
++#define ATH12K_PDEV_SUSPEND_TIMEOUT	(2 * HZ)
++#define ATH12K_PDEV_RESUME_TIMEOUT	(2 * HZ)
+ 
+ enum ath12k_supported_bw {
+ 	ATH12K_BW_20    = 0,
+@@ -449,6 +451,7 @@ void ath12k_mac_op_set_dscp_tid(struct i
+ int ath12k_mac_mlo_standby_teardown(struct ath12k_hw *ah);
+ void ath12k_mac_stop(struct ath12k *ar);
+ bool ath12k_mac_validate_active_radio_count(struct ath12k_hw *ah);
++int ath12k_mac_pdev_suspend(struct ath12k *ar);
+ 
+ /* In the bitmap 0 indicates no puncturing and 1 indicated that sub channel is
+  * punctured
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -13726,6 +13726,82 @@ exit:
+ 	kfree(tb);
+ }
+ 
++static void ath12k_wmi_suspend_event(struct ath12k_base *ab, struct sk_buff *skb)
++{
++	struct ath12k *ar;
++	const struct wmi_suspend_resp_event *ev;
++	const void **tb;
++	u32 pdev_id;
++
++	tb = ath12k_wmi_tlv_parse_alloc(ab, skb, GFP_ATOMIC);
++	if (IS_ERR(tb)) {
++		ath12k_warn(ab, "failed to parse tlv: %ld\n", PTR_ERR(tb));
++		return;
++	}
++
++	ev = tb[WMI_PDEV_SUSPEND_EVENT_FIXED_PARAM];
++
++	if (!ev) {
++		ath12k_warn(ab, "failed to fetch peer delete all resp ev");
++		kfree(tb);
++		return;
++	}
++
++	pdev_id = le32_to_cpu(ev->pdev_id);
++	kfree(tb);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "WMI suspend event received for pdev_id %d\n", pdev_id);
++
++	rcu_read_lock();
++	ar = ath12k_mac_get_ar_by_pdev_id(ab, pdev_id);
++	if (!ar) {
++		ath12k_warn(ab, "invalid pdev_id received for WMI pdev suspend event\n");
++		rcu_read_unlock();
++		return;
++	}
++
++	ar->pdev_suspend = true;
++	complete(&ar->suspend);
++	rcu_read_unlock();
++}
++
++static void ath12k_wmi_pdev_resume_event(struct ath12k_base *ab, struct sk_buff *skb)
++{
++	const struct wmi_pdev_resume_resp_event *ev;
++	struct ath12k *ar;
++	const void **tb;
++	u32 pdev_id;
++
++	tb = ath12k_wmi_tlv_parse_alloc(ab, skb, GFP_ATOMIC);
++	if (IS_ERR(tb)) {
++		ath12k_warn(ab, "failed to parse tlv: %ld\n", PTR_ERR(tb));
++		return;
++	}
++
++	ev = tb[WMI_TAG_PDEV_RESUME_EVENT];
++
++	if (!ev) {
++		ath12k_warn(ab, "failed to fetch peer delete all resp ev");
++		kfree(tb);
++		return;
++	}
++
++	pdev_id = le32_to_cpu(ev->pdev_id);
++	kfree(tb);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "WMI resume event received for pdev_id %d\n", pdev_id);
++
++	rcu_read_lock();
++	ar = ath12k_mac_get_ar_by_pdev_id(ab, pdev_id);
++	if (!ar) {
++		ath12k_warn(ab, "invalid pdev_id received for WMI pdev resume event\n");
++		rcu_read_unlock();
++		return;
++	}
++
++	ar->pdev_suspend = false;
++	complete(&ar->pdev_resume);
++	rcu_read_unlock();
++}
++
+ static void
+ ath12k_wmi_obss_color_collision_event(struct ath12k_base *ab, struct sk_buff *skb)
+ {
+@@ -14968,6 +15044,12 @@ static void ath12k_wmi_op_rx(struct ath1
+ 	case WMI_SPECTRAL_CAPABILITIES_EVENTID:
+ 		ath12k_wmi_spectral_capabilities_event(ab, skb);
+ 		break;
++	case WMI_PDEV_RESUME_EVENTID:
++		ath12k_wmi_pdev_resume_event(ab, skb);
++		break;
++	case WMI_PDEV_SUSPEND_EVENTID:
++		ath12k_wmi_suspend_event(ab, skb);
++		break;
+ 	case WMI_PDEV_UTF_EVENTID:
+ 		if (test_bit(ATH12K_FLAG_FTM_SEGMENTED, &ab->dev_flags))
+ 			ath12k_tm_wmi_event_segmented(ab, id, skb);
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -989,6 +989,7 @@ enum wmi_tlv_event_id {
+ 	WMI_P2P_LISTEN_OFFLOAD_STOPPED_EVENTID,
+ 	WMI_AP_PS_EGAP_INFO_EVENTID = WMI_TLV_CMD(WMI_GRP_AP_PS),
+ 	WMI_PDEV_RESUME_EVENTID = WMI_TLV_CMD(WMI_GRP_SUSPEND),
++	WMI_PDEV_SUSPEND_EVENTID,
+ 	WMI_WOW_WAKEUP_HOST_EVENTID = WMI_TLV_CMD(WMI_GRP_WOW),
+ 	WMI_D0_WOW_DISABLE_ACK_EVENTID,
+ 	WMI_WOW_INITIAL_WAKEUP_EVENTID,
+@@ -2308,6 +2309,7 @@ enum wmi_tlv_tag {
+ 	WMI_TAG_MLO_PEER_LINK_CONTROL_PARAM = 0x48F,
+ 	WMI_TAG_TWT_VDEV_CONFIG_CMD = 0x4DE,
+ 	WMI_TAG_MLO_TLT_SELECTION_FOR_TID_SPRAY_EVENT_FIXED_PARAM = 0x4e0,
++	WMI_PDEV_SUSPEND_EVENT_FIXED_PARAM = 0x509,
+ 	WMI_TAG_MLO_PEER_TID_TO_LINK_MAP_EVENT_FIXED_PARAM = 0x544,
+ 	WMI_TAG_MAX
+ };
+@@ -2567,6 +2569,7 @@ enum wmi_tlv_service {
+ 
+ 	WMI_SERVICE_UMAC_MIGRATION_SUPPORT = 436,
+	WMI_SERVICE_STA_MLO_RCFG_SUPPORT = 448,
++	WMI_SERVICE_PDEV_SUSPEND_EVENT_SUPPORT = 449,
+ 
+ 	WMI_MAX_EXT2_SERVICE,
+ };
+@@ -3379,6 +3382,14 @@ struct wmi_vdev_down_cmd {
+ 	__le32 vdev_id;
+ } __packed;
+ 
++struct wmi_pdev_resume_resp_event {
++	__le32 pdev_id;
++} __packed;
++
++struct wmi_suspend_resp_event {
++	__le32 pdev_id;
++} __packed;
++
+ #define WMI_VDEV_START_HIDDEN_SSID  BIT(0)
+ #define WMI_VDEV_START_PMF_ENABLED  BIT(1)
+ #define WMI_VDEV_START_LDPC_RX_ENABLED BIT(3)

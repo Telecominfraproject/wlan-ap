@@ -1,0 +1,384 @@
+From fa62b88e526d2383d448f8a6c6ded57bf444a746 Mon Sep 17 00:00:00 2001
+From: Harsh Kumar Bijlani <quic_hbijlani@quicinc.com>
+Date: Tue, 25 Mar 2025 17:02:16 +0530
+Subject: [PATCH 3/5] wifi: ath12k: Add hash table for ath12k_link_sta in
+ ath12k_base
+
+Currently ath12k_base maintains a linked list of ath12k_dp_link_peer.
+This linked list is used for all kinds of peer search operations.
+
+In the common path, if there is a requirement to search for ath12k_link_sta
+using mac address, then below sequence is to be followed:
+  1. Find ath12k_dp_link_peer in the linked list using mac address
+  2. Fetch ieee80211_sta from ath12k_dp_link_peer
+  3. Fetch ath12k_sta from ieee80211_sta
+  4. Finally fetch ath12k_link_sta from ath12k_sta using link_id
+
+In the above sequence, there are too many indirections involved.
+
+In order to simplify this, add hash table for ath12k_link_sta in ath12k_base.
+This hash table is lock protected by existing spinlock "base_lock" in
+ath12k_base as this table can be concurrently accessed in different
+contexts.
+
+This table is used for ath12k_link_sta search operations using mac address
+in the common path.
+Ex: For the south-bound (WMI) and north-bound (MAC) interfaces in the
+common path, sta mac address is received and this hash table can be used to
+search for ath12k_link_sta directly instead of following the longer route
+mentioned above.
+
+ath11k driver has been taken as reference for implemenation of hash table.
+
+Signed-off-by: Harsh Kumar Bijlani <quic_hbijlani@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |   8 ++
+ drivers/net/wireless/ath/ath12k/mac.c  |  11 ++
+ drivers/net/wireless/ath/ath12k/peer.c | 181 +++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/peer.h |   6 +
+ drivers/net/wireless/ath/ath12k/wmi.c  |  17 ++-
+ 5 files changed, 214 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index 8ce37e4..a0e85c2 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -17,6 +17,7 @@
+ #include <linux/of_reserved_mem.h>
+ #include <linux/panic_notifier.h>
+ #include <linux/average.h>
++#include <linux/rhashtable.h>
+ #include "qmi.h"
+ #include "htc.h"
+ #include "wmi.h"
+@@ -584,6 +585,10 @@ struct ath12k_link_sta {
+ 
+ 	 /* for firmware use only */
+ 	u8 link_idx;
++
++	/* peer addr based rhashtable list pointer */
++	struct rhash_head rhash_addr;
++	bool rhash_done;
+ };
+ 
+ struct ath12k_sta {
+@@ -1204,6 +1209,9 @@ struct ath12k_base {
+ 
+ 	const struct ieee80211_ops *ath12k_ops;
+ 
++	struct rhashtable *rhead_sta_addr;
++	struct rhashtable_params rhash_sta_addr_param;
++
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+ };
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 075627f..f78ebfd 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -6287,6 +6287,10 @@ static int ath12k_mac_station_remove(struct ath12k *ar,
+ 
+ 	ath12k_dp_peer_cleanup(ar, arvif->vdev_id, arsta->addr);
+ 
++	spin_lock_bh(&ar->ab->base_lock);
++	ath12k_link_sta_rhash_delete(ar->ab, arsta);
++	spin_unlock_bh(&ar->ab->base_lock);
++
+ 	ret = ath12k_peer_delete(ar, arvif->vdev_id, arsta->addr);
+ 	if (ret)
+ 		ath12k_warn(ar->ab, "Failed to delete peer: %pM for VDEV: %d\n",
+@@ -6340,6 +6344,10 @@ static int ath12k_mac_station_add(struct ath12k *ar,
+ 		goto free_peer;
+ 	}
+ 
++	spin_lock_bh(&ab->base_lock);
++	ath12k_link_sta_rhash_add(ab, arsta);
++	spin_unlock_bh(&ab->base_lock);
++
+ 	ath12k_dbg(ab, ATH12K_DBG_MAC, "Added peer: %pM for VDEV: %d\n",
+ 		   arsta->addr, arvif->vdev_id);
+ 
+@@ -13070,6 +13078,8 @@ void ath12k_mac_destroy(struct ath12k_hw_group *ag)
+ 				continue;
+ 			pdev->ar = NULL;
+ 		}
++
++		ath12k_link_sta_rhash_tbl_destroy(ab);
+ 	}
+ 
+ 	for (i = 0; i < ag->num_hw; i++) {
+@@ -13106,6 +13116,7 @@ int ath12k_mac_allocate(struct ath12k_hw_group *ag)
+ 
+ 		ath12k_mac_set_device_defaults(ab);
+ 		total_radio += ab->num_radios;
++		ath12k_link_sta_rhash_tbl_init(ab);
+ 	}
+ 
+ 	if (!total_radio)
+diff --git a/drivers/net/wireless/ath/ath12k/peer.c b/drivers/net/wireless/ath/ath12k/peer.c
+index c7daf0c..aa41dd6 100644
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -367,6 +367,10 @@ int ath12k_peer_mlo_link_peers_delete(struct ath12k_vif *ahvif, struct ath12k_st
+ 
+ 		ath12k_dp_peer_cleanup(ar, arvif->vdev_id, arsta->addr);
+ 
++		spin_lock_bh(&ar->ab->base_lock);
++		ath12k_link_sta_rhash_delete(ar->ab, arsta);
++		spin_unlock_bh(&ar->ab->base_lock);
++
+ 		ret = ath12k_peer_delete_send(ar, arvif->vdev_id, arsta->addr);
+ 		if (ret) {
+ 			ath12k_warn(ar->ab,
+@@ -399,3 +403,180 @@ int ath12k_peer_mlo_link_peers_delete(struct ath12k_vif *ahvif, struct ath12k_st
+ 
+ 	return err_ret;
+ }
++
++static inline int ath12k_link_sta_rhash_insert(struct ath12k_base *ab,
++					       struct rhashtable *rtbl,
++					       struct rhash_head *rhead,
++					       struct rhashtable_params *params)
++{
++	struct ath12k_link_sta *tmp;
++
++	lockdep_assert_held(&ab->base_lock);
++
++	tmp = rhashtable_lookup_get_insert_fast(rtbl, rhead, *params);
++
++	if (!tmp)
++		return 0;
++	else if (IS_ERR(tmp))
++		return PTR_ERR(tmp);
++	else
++		return -EEXIST;
++}
++
++static inline int ath12k_link_sta_rhash_remove(struct ath12k_base *ab,
++					       struct rhashtable *rtbl,
++					       struct rhash_head *rhead,
++					       struct rhashtable_params *params)
++{
++	int ret;
++
++	lockdep_assert_held(&ab->base_lock);
++
++	ret = rhashtable_remove_fast(rtbl, rhead, *params);
++	if (ret && ret != -ENOENT)
++		return ret;
++
++	return 0;
++}
++
++int ath12k_link_sta_rhash_add(struct ath12k_base *ab,
++			      struct ath12k_link_sta *arsta)
++{
++	int ret;
++
++	lockdep_assert_held(&ab->base_lock);
++
++	if (!ab->rhead_sta_addr)
++		return -EPERM;
++
++	if (arsta->rhash_done)
++		return 0;
++
++	ret = ath12k_link_sta_rhash_insert(ab, ab->rhead_sta_addr,
++					   &arsta->rhash_addr,
++					   &ab->rhash_sta_addr_param);
++
++	if (ret) {
++		ath12k_warn(ab, "failed to add arsta %pM in rhash_addr ret %d\n",
++			    arsta->addr, ret);
++		arsta->rhash_done = false;
++	} else {
++		arsta->rhash_done = true;
++	}
++
++	return ret;
++}
++
++int ath12k_link_sta_rhash_delete(struct ath12k_base *ab,
++				 struct ath12k_link_sta *arsta)
++{
++	int ret;
++
++	lockdep_assert_held(&ab->base_lock);
++
++	if (!ab->rhead_sta_addr)
++		return -EPERM;
++
++	if (!arsta->rhash_done)
++		return 0;
++
++	ret = ath12k_link_sta_rhash_remove(ab, ab->rhead_sta_addr,
++					   &arsta->rhash_addr,
++					   &ab->rhash_sta_addr_param);
++
++	if (ret) {
++		ath12k_warn(ab,
++			    "failed to remove arsta %pM in rhash_addr ret %d\n",
++			    arsta->addr, ret);
++		return ret;
++	}
++
++	arsta->rhash_done = false;
++
++	return ret;
++}
++
++static int ath12k_link_sta_rhash_addr_tbl_init(struct ath12k_base *ab)
++{
++	struct rhashtable_params *param;
++	struct rhashtable *rhash_addr_tbl;
++	int ret;
++	size_t size;
++
++	lockdep_assert_held(&ab->base_lock);
++
++	if (ab->rhead_sta_addr)
++		return 0;
++
++	size = sizeof(*ab->rhead_sta_addr);
++	rhash_addr_tbl = kzalloc(size, GFP_KERNEL);
++	if (!rhash_addr_tbl)
++		return -ENOMEM;
++
++	param = &ab->rhash_sta_addr_param;
++
++	param->key_offset = offsetof(struct ath12k_link_sta, addr);
++	param->head_offset = offsetof(struct ath12k_link_sta, rhash_addr);
++	param->key_len = sizeof_field(struct ath12k_link_sta, addr);
++	param->automatic_shrinking = true;
++	param->nelem_hint = ab->num_radios * ath12k_core_get_max_peers_per_radio(ab);
++
++	ret = rhashtable_init(rhash_addr_tbl, param);
++	if (ret) {
++		ath12k_warn(ab, "failed to init peer addr rhash table %d\n",
++			    ret);
++		goto err_free;
++	}
++
++	if (!ab->rhead_sta_addr)
++		ab->rhead_sta_addr = rhash_addr_tbl;
++	else
++		goto cleanup_tbl;
++
++	return 0;
++
++cleanup_tbl:
++	rhashtable_destroy(rhash_addr_tbl);
++err_free:
++	kfree(rhash_addr_tbl);
++
++	return ret;
++}
++
++int ath12k_link_sta_rhash_tbl_init(struct ath12k_base *ab)
++{
++	int ret;
++
++	spin_lock_bh(&ab->base_lock);
++	ret = ath12k_link_sta_rhash_addr_tbl_init(ab);
++	spin_unlock_bh(&ab->base_lock);
++
++	return ret;
++}
++
++void ath12k_link_sta_rhash_tbl_destroy(struct ath12k_base *ab)
++{
++	spin_lock_bh(&ab->base_lock);
++
++	if (!ab->rhead_sta_addr)
++		goto unlock;
++
++	rhashtable_destroy(ab->rhead_sta_addr);
++	kfree(ab->rhead_sta_addr);
++	ab->rhead_sta_addr = NULL;
++
++unlock:
++	spin_unlock_bh(&ab->base_lock);
++}
++
++struct ath12k_link_sta *ath12k_link_sta_find_by_addr(struct ath12k_base *ab,
++						     const u8 *addr)
++{
++	lockdep_assert_held(&ab->base_lock);
++
++	if (!ab->rhead_sta_addr)
++		return NULL;
++
++	return rhashtable_lookup_fast(ab->rhead_sta_addr, addr,
++				      ab->rhash_sta_addr_param);
++}
+diff --git a/drivers/net/wireless/ath/ath12k/peer.h b/drivers/net/wireless/ath/ath12k/peer.h
+index 8910574..e6f8f93 100644
+--- a/drivers/net/wireless/ath/ath12k/peer.h
++++ b/drivers/net/wireless/ath/ath12k/peer.h
+@@ -26,6 +26,12 @@ int ath12k_peer_ml_create(struct ath12k_hw *ah, struct ieee80211_sta *sta);
+ int ath12k_peer_ml_delete(struct ath12k_hw *ah, struct ieee80211_sta *sta);
+ int ath12k_peer_mlo_link_peers_delete(struct ath12k_vif *ahvif, struct ath12k_sta *ahsta);
+ 
++int ath12k_link_sta_rhash_tbl_init(struct ath12k_base *ab);
++void ath12k_link_sta_rhash_tbl_destroy(struct ath12k_base *ab);
++int ath12k_link_sta_rhash_delete(struct ath12k_base *ab, struct ath12k_link_sta *arsta);
++int ath12k_link_sta_rhash_add(struct ath12k_base *ab, struct ath12k_link_sta *arsta);
++struct ath12k_link_sta *ath12k_link_sta_find_by_addr(struct ath12k_base *ab, const u8 *addr);
++
+ static inline
+ struct ath12k_link_sta *ath12k_peer_get_link_sta(struct ath12k_base *ab,
+ 						 struct ath12k_dp_link_peer *peer)
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.c b/drivers/net/wireless/ath/ath12k/wmi.c
+index 774db29..4f5fce5 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -6647,7 +6647,7 @@ static void ath12k_peer_sta_kickout_event(struct ath12k_base *ab, struct sk_buff
+ {
+ 	struct wmi_peer_sta_kickout_arg arg = {};
+ 	struct ieee80211_sta *sta;
+-	struct ath12k_dp_link_peer *peer;
++	struct ath12k_link_sta *arsta;
+ 	struct ath12k_vif *ahvif;
+ 	struct ath12k *ar;
+ 
+@@ -6660,22 +6660,21 @@ static void ath12k_peer_sta_kickout_event(struct ath12k_base *ab, struct sk_buff
+ 
+ 	spin_lock_bh(&ab->base_lock);
+ 
+-	peer = ath12k_dp_link_peer_find_by_addr(ab, arg.mac_addr);
++	arsta = ath12k_link_sta_find_by_addr(ab, arg.mac_addr);
+ 
+-	if (!peer) {
+-		ath12k_warn(ab, "peer not found %pM\n",
++	if (!arsta) {
++		ath12k_warn(ab, "arsta not found %pM\n",
+ 			    arg.mac_addr);
+ 		goto exit;
+ 	}
+ 
+-	ar = ath12k_mac_get_ar_by_vdev_id(ab, peer->vdev_id);
++	ar = arsta->arvif->ar;
+ 	if (!ar) {
+-		ath12k_warn(ab, "invalid vdev id in peer sta kickout ev %d",
+-			    peer->vdev_id);
++		ath12k_warn(ab, "invalid ar in peer sta kickout ev");
+ 		goto exit;
+ 	}
+ 
+-	ahvif = ath12k_vif_to_ahvif(peer->vif);
++	ahvif = arsta->arvif->ahvif;
+ 
+ 	sta = ieee80211_find_sta_by_ifaddr(ath12k_ar_to_hw(ar),
+ 					   arg.mac_addr, NULL);
+@@ -6688,7 +6687,7 @@ static void ath12k_peer_sta_kickout_event(struct ath12k_base *ab, struct sk_buff
+ 	if (ar->ab->hw_params->handle_beacon_miss &&
+ 	    ahvif->vif->type == NL80211_IFTYPE_STATION &&
+ 	    arg.reason == __cpu_to_le32(WMI_PEER_STA_KICKOUT_REASON_INACTIVITY))
+-		ath12k_mac_handle_beacon_miss(ar, peer->vdev_id);
++		ath12k_mac_handle_beacon_miss(ar, arsta->arvif->vdev_id);
+ 	else
+ 		ieee80211_report_low_ack(sta, 10);
+ 
+-- 
+2.34.1
+

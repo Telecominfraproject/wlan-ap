@@ -1,0 +1,1491 @@
+From 283d69ca70f3fb894e839ae9874d434d1d7a8ae8 Mon Sep 17 00:00:00 2001
+From: Uraj Sasan <usasan@qti.qualcomm.com>
+Date: Sun, 29 Jun 2025 20:40:16 +0530
+Subject: [PATCH 1/3] wifi: ath12k: Add INI framework support in driver
+
+Add infrastructure to parse INI files with support for multiple data types.
+Introduce basic infrastructure for driver to parse INI files supporting
+UINT, INT, STRING, BOOL, and MAC address types and implement dedicated
+handlers for each data type.
+
+Generate driver metadata at compile time with attributes such as name, min,
+max, and handler type to guide parsing logic. Add helper APIs to initialize
+and deinitialize parsing context. Include functions to print INI data
+and driver metadata.Implement global and section-based parsing logic to
+support structured configuration parsing.
+
+Signed-off-by: Uraj Sasan <usasan@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/debug.h |    1 +
+ drivers/net/wireless/ath/ath12k/ini.c   | 1065 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/ini.h   |  374 ++++++++
+ 3 files changed, 1440 insertions(+)
+ create mode 100644 drivers/net/wireless/ath/ath12k/ini.c
+ create mode 100644 drivers/net/wireless/ath/ath12k/ini.h
+
+diff --git a/drivers/net/wireless/ath/ath12k/debug.h b/drivers/net/wireless/ath/ath12k/debug.h
+index f7ac683..591c3ae 100644
+--- a/drivers/net/wireless/ath/ath12k/debug.h
++++ b/drivers/net/wireless/ath/ath12k/debug.h
+@@ -28,6 +28,7 @@ enum ath12k_debug_mask {
+ 	ATH12K_DBG_WOW		= 0x00008000,
+ 	ATH12K_DBG_DP_FST       = 0x00010000,
+ 	ATH12K_DBG_PEER         = 0x00020000,
++	ATH12K_DBG_INI          = 0x00040000,
+ 	ATH12K_DBG_AFC          = 0x04000000,
+ 	ATH12K_DBG_DP_UMAC_RESET= 0x00100000,
+ 	ATH12K_DBG_MODE1_RECOVERY= 0x00200000,
+diff --git a/drivers/net/wireless/ath/ath12k/ini.c b/drivers/net/wireless/ath/ath12k/ini.c
+new file mode 100644
+index 0000000..947e93d
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath12k/ini.c
+@@ -0,0 +1,1065 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++#include "core.h"
++#include "debug.h"
++#include "ini.h"
++#include <linux/vmalloc.h>
++
++/* Variable to track the ath12k cfg initialization */
++static bool ath12k_cfg_is_init;
++/* Pointer to ath12k_cfg_value_store */
++static struct ath12k_cfg_value_store *ath12k_cfg_global_store;
++/* list head to track the ath12k_cfg_store users*/
++struct list_head  ath12k_cfg_stores_list;
++/* spinlock to be used while changing the list */
++static spinlock_t ath12k_cfg_stores_lock;
++
++/**
++ * struct ath12k_cfg_ctx - configuration context
++ * @store: cfg value store reference
++ */
++struct ath12k_cfg_ctx {
++	struct ath12k_cfg_value_store *store;
++};
++
++/**
++ * struct ath12k_cfg_value_store - backing store for an ini file
++ * @path: file path of the ini file
++ * @node: internal list node for keeping track of all the allocated stores
++ * @users: number of references on the store
++ * @values: a values struct containing the parsed values from the ini file
++ */
++struct ath12k_cfg_value_store {
++	char *path;
++	struct list_head node;
++	atomic_t  users;
++	struct ath12k_cfg_values values;
++};
++
++/**
++ * enum ath12k_cfg_data_type - Enum for CFG/INI types
++ * @ATH12K_CFG_INT_ITEM: Integer CFG/INI
++ * @ATH12K_CFG_UINT_ITEM: Unsigned integer CFG/INI
++ * @ATH12K_CFG_BOOL_ITEM: Boolean CFG/INI
++ * @ATH12K_CFG_STRING_ITEM: String CFG/INI
++ * @ATH12K_CFG_MAC_ADDR_ITEM: Mac address CFG/INI
++ * @ATH12K_CFG_MAX_ITEM: Max CFG type
++ */
++enum ath12k_cfg_data_type {
++	ATH12K_CFG_INT_ITEM,
++	ATH12K_CFG_UINT_ITEM,
++	ATH12K_CFG_BOOL_ITEM,
++	ATH12K_CFG_STRING_ITEM,
++	ATH12K_CFG_MAC_ADDR_ITEM,
++	ATH12K_CFG_MAX_ITEM,
++};
++
++/**
++ * struct ath12k_cfg_meta - item metadata for dynamic lookup during parse
++ * @name: name of the config item used in the ini file (i.e. "gScanDwellTime")
++ * @field_offset: offset to find the desired value in the structure
++ * @cfg_data_type: configuration type that is being used
++ * @ath12k_cfg_item_handler: parsing callback based on type of the config item
++ * @min: minimum value for use in bounds checking (min_len for strings)
++ * @max: maximum value for use in bounds checking (max_len for strings)
++ * @fallback: the fallback behavior to use when configured values are invalid
++ */
++struct ath12k_cfg_meta {
++	const char *name;
++	const u32 field_offset;
++	const enum ath12k_cfg_data_type cfg_data_type;
++
++	void (*const ath12k_cfg_item_handler)(struct ath12k_cfg_value_store *store,
++					  const struct ath12k_cfg_meta *meta,
++					  const char *value);
++	const s32 min;
++	const s32 max;
++	const enum ath12k_cfg_fallback_behavior fallback;
++};
++
++#define ath12k_cfg_value_ptr(store, meta) \
++	((void *)&(store)->values + (meta)->field_offset)
++
++/**
++ * ath12k_cfg_int_item_handler - Integer handler to parse the values
++ * @store: cfg store pointer
++ * @meta: configuration meta information that is stored in the device
++ * @str_value: The value to be searched in the database for sanity
++ * Return: void
++ */
++static __maybe_unused void
++ath12k_cfg_int_item_handler(struct ath12k_cfg_value_store *store,
++			    const struct ath12k_cfg_meta *meta,
++			    const char *str_value)
++{
++	int ret;
++	s32 *store_value = ath12k_cfg_value_ptr(store, meta);
++	s32 value;
++
++	ret = kstrtoint(str_value, 10, &value);
++
++	if (ret) {
++		ath12k_err(NULL,
++			   "%s=%s -Invalid format (status %d) Using default %d",
++			   meta->name, str_value, ret, *store_value);
++		return;
++	}
++
++	while (*str_value && !isspace(*str_value)) str_value++;
++	while (*str_value && isspace(*str_value)) str_value++;
++
++	WARN_ON(!(meta->min <= meta->max));
++	if (meta->min > meta->max) {
++		ath12k_err(NULL,
++			   "Invalid config item meta for %s", meta->name);
++		return;
++	}
++
++	if (value >= meta->min && value <= meta->max) {
++		*store_value = value;
++		return;
++	}
++
++	switch (meta->fallback) {
++	default:
++		ath12k_err(NULL,
++			   "Unknown fallback method %d for cfg item '%s'",
++			   meta->fallback, meta->name);
++		fallthrough;
++	case ATH12K_CFG_VALUE_OR_CLAMP:
++		*store_value = ath12k_cfg_clamp(value, meta->min, meta->max);
++		break;
++	case ATH12K_CFG_VALUE_OR_DEFAULT:
++		/* store already contains default */
++		break;
++	}
++
++	ath12k_err(NULL,
++		   "%s=%d - Out of range [%d, %d]; Using %d", meta->name,
++		   value, meta->min, meta->max, *store_value);
++}
++
++/**
++ * ath12k_cfg_uint_item_handler - Unsigned integer handler to parse the values
++ * @store: cfg store pointer
++ * @meta: configuration meta information that is stored in the device
++ * @str_value: The value to be searched in the database for sanity
++ * Return: void
++ */
++static void
++ath12k_cfg_uint_item_handler(struct ath12k_cfg_value_store *store,
++			     const struct ath12k_cfg_meta *meta,
++			     const char *str_value)
++{
++	int ret;
++	u32 *store_value = ath12k_cfg_value_ptr(store, meta);
++	u32 value;
++	u32 min;
++	u32 max;
++
++	/**
++	 * Since meta min and max are of type int32_t
++	 * We need explicit type casting to avoid
++	 * implicit wrap around for uint32_t type cfg data.
++	 */
++	min = (uint32_t)meta->min;
++	max = (uint32_t)meta->max;
++
++	ret = kstrtouint(str_value, 10, &value);
++	if (ret) {
++		ath12k_err(NULL,
++			   "%s=%s-Invalid format (status %d); Using default %u",
++			   meta->name, str_value, ret, *store_value);
++		return;
++	}
++	while (*str_value && !isspace(*str_value)) str_value++;
++	while (*str_value && isspace(*str_value)) str_value++;
++
++	WARN_ON(!(min <= max));
++	if (min > max) {
++		ath12k_err(NULL,
++			   "Invalid config item meta for %s", meta->name);
++		return;
++	}
++
++	if (value >= min && value <= max) {
++		*store_value = value;
++		return;
++	}
++
++	switch (meta->fallback) {
++	default:
++		ath12k_err(NULL,
++			   "Unknown fallback method %d for cfg item '%s'",
++			   meta->fallback, meta->name);
++		fallthrough;
++	case ATH12K_CFG_VALUE_OR_CLAMP:
++		*store_value = ath12k_cfg_clamp(value, min, max);
++		break;
++	case ATH12K_CFG_VALUE_OR_DEFAULT:
++		/* store already contains default */
++		break;
++	}
++
++	ath12k_err(NULL,
++		   "%s=%u - Out of range [%d, %d]; Using %u",
++		   meta->name, value, min, max, *store_value);
++}
++
++/**
++ * ath12k_cfg_bool_item_handler - Bool handler to parse the values
++ * @store: cfg store pointer
++ * @meta: configuration meta information that is stored in the device
++ * @str_value: The value to be searched in the database for sanity
++ * Return: void
++ */
++static void
++ath12k_cfg_bool_item_handler(struct ath12k_cfg_value_store *store,
++			     const struct ath12k_cfg_meta *meta,
++			     const char *str_value)
++{
++	int ret;
++	bool *store_value = ath12k_cfg_value_ptr(store, meta);
++
++	ret = kstrtobool(str_value, store_value);
++	if (ret) {
++		ath12k_err(NULL,
++			   "%s=%s - Invalid format (status %d); Using default '%s'",
++			   meta->name, str_value, ret,
++			   *store_value ? "true" : "false");
++		return;
++	}
++	// Advance pointer past the parsed boolean token
++	while (*str_value && !isspace(*str_value)) str_value++;  // Skip the token
++	while (*str_value && isspace(*str_value)) str_value++;   // Skip whitespace
++}
++
++/**
++ * ath12k_cfg_string_item_handler - String handler to parse the values
++ * @store: cfg store pointer
++ * @meta: configuration meta information that is stored in the device
++ * @str_value: The value to be searched in the database for sanity
++ * Return: void
++ */
++static void
++ath12k_cfg_string_item_handler(struct ath12k_cfg_value_store *store,
++			       const struct ath12k_cfg_meta *meta,
++			       const char *str_value)
++{
++	char *store_value = ath12k_cfg_value_ptr(store, meta);
++	size_t len;
++
++	WARN_ON(!(meta->min >= 0));
++	WARN_ON(!(meta->min <= meta->max));
++	if (meta->min < 0 || meta->min > meta->max) {
++		ath12k_err(NULL,
++			   "Invalid config item meta for %s", meta->name);
++		return;
++	}
++
++	/* ensure min length */
++	len = strnlen(str_value, meta->min);
++	if (len < meta->min) {
++		ath12k_err(NULL,
++			   "%s=%s - Too short; Using default '%s'",
++			   meta->name, str_value, store_value);
++		return;
++	}
++
++	/* check max length */
++	len += strnlen(str_value + meta->min, meta->max - meta->min + 1);
++	if (len > meta->max) {
++		ath12k_err(NULL,
++			   "%s=%s - Too long; Using default '%s'",
++			   meta->name, str_value, store_value);
++		return;
++	}
++
++	strscpy(store_value, str_value, meta->max + 1);
++}
++
++/**
++ * ath12k_cfg_mac_addr_item_handler - MAC address handler to parse the values
++ * @store: cfg store pointer
++ * @meta: configuration meta information that is stored in the device
++ * @str_value: The value to be searched in the database for sanity
++ * Return: void
++ */
++static __maybe_unused void
++ath12k_cfg_mac_addr_item_handler(struct ath12k_cfg_value_store *store,
++				 const struct ath12k_cfg_meta *meta,
++				 const char *str_value)
++{
++	int ret;
++	struct ath12k_ini_mac_addr *store_value = ath12k_cfg_value_ptr(store, meta);
++
++	ret = mac_pton(str_value, store_value->bytes);
++	if (ret) {
++		ath12k_err(NULL,
++			   "%s=%s - Invalid format (status %d); Using default ",
++			   meta->name, str_value, ret);
++	}
++
++	return;
++}
++
++/* Refer to header file on how nested macros are expanded to generate table,
++ * set the default values and generate the cfg_value structure.
++ */
++#undef __ATH12K_CFG_INI
++#define __ATH12K_CFG_INI(_id, _mtype, _ctype, _name, _min, _max, _fallback, ...) \
++{ \
++	.name = _name, \
++	.field_offset = offsetof(struct ath12k_cfg_values, _id##_internal), \
++	.cfg_data_type = ATH12K_CFG_ ##_mtype ## _ITEM, \
++	.ath12k_cfg_item_handler = ath12k_cfg_ ## _mtype ## _item_handler, \
++	.min = _min, \
++	.max = _max, \
++	.fallback = _fallback, \
++},
++
++#define ath12k_cfg_INT_item_handler ath12k_cfg_int_item_handler
++#define ath12k_cfg_UINT_item_handler ath12k_cfg_uint_item_handler
++#define ath12k_cfg_BOOL_item_handler ath12k_cfg_bool_item_handler
++#define ath12k_cfg_STRING_item_handler ath12k_cfg_string_item_handler
++#define ath12k_cfg_MAC_ADDR_item_handler ath12k_cfg_mac_addr_item_handler
++
++static const struct ath12k_cfg_meta ath12k_cfg_meta_lookup_table[] = {
++	ATH12K_CFG_ALL
++};
++
++/**
++ * ath12k_cfg_store_set_defaults - Function to initialize the store
++ * @store: cfg store reference
++ * Return: void
++ */
++static void ath12k_cfg_store_set_defaults(struct ath12k_cfg_value_store *store)
++{
++#undef __ATH12K_CFG_INI
++#define __ATH12K_CFG_INI(id, mtype, ctype, name, min, max, fallback, desc, def...) \
++	ctype id = def;
++
++	ATH12K_CFG_ALL
++
++#undef __ATH12K_CFG_INI_STRING
++#define __ATH12K_CFG_INI_STRING(id, mtype, ctype, name, min_len, max_len, ...) \
++	strscpy((char *)&store->values.id##_internal, id, (max_len) + 1);
++
++#undef __ATH12K_CFG_INI
++#define __ATH12K_CFG_INI(id, mtype, ctype, name, min, max, fallback, desc, def...) \
++	*(ctype *)&store->values.id##_internal = id;
++
++	ATH12K_CFG_ALL
++}
++
++/**
++ * ath12k_cfg_lookup_meta - Function to lookup named value in the cfg meta data
++ * @name: The key to be searched in the cfg meta data
++ * Return: ath12k_cfg_meta reference if the data is found, else NULL
++ */
++static const struct ath12k_cfg_meta *ath12k_cfg_lookup_meta(const char *name)
++{
++	int i;
++	char *param1;
++	char param[ATH12K_CFG_META_NAME_LENGTH_MAX];
++	u8 ini_name[ATH12K_CFG_INI_LENGTH_MAX];
++
++	WARN_ON(!name);
++	if (!name)
++		return NULL;
++
++	ath12k_dbg(NULL, ATH12K_DBG_INI, "INI meta lookpup name %s ", name);
++	/* linear search for now; optimize in the future if needed */
++	for (i = 0; i < ARRAY_SIZE(ath12k_cfg_meta_lookup_table); i++) {
++		const struct ath12k_cfg_meta *meta = &ath12k_cfg_meta_lookup_table[i];
++
++		memset(ini_name, 0, ATH12K_CFG_INI_LENGTH_MAX);
++		memset(param, 0, ATH12K_CFG_META_NAME_LENGTH_MAX);
++		if (strlen(meta->name) >= ATH12K_CFG_META_NAME_LENGTH_MAX) {
++			ath12k_err(NULL, "Invalid meta name %s",
++				   meta->name);
++			continue;
++		}
++
++		memcpy(param, meta->name, strlen(meta->name));
++		param[strlen(meta->name)] = '\0';
++		param1 = param;
++		if (sscanf(param1, "%s", ini_name) != 1) {
++			ath12k_err(NULL,
++				   "Cannot get ini name %s", param1);
++			return NULL;
++		}
++		if (!strcmp(name, ini_name))
++			return meta;
++
++		param1 = strpbrk(param, " ");
++		while (param1) {
++			param1++;
++			if (sscanf(param1, "%s ", ini_name) != 1) {
++				ath12k_err(NULL,
++					   "Invalid ini name %s", meta->name);
++				return NULL;
++			}
++			if (!strcmp(name, ini_name))
++				return meta;
++
++			param1 = strpbrk(param1, " ");
++		}
++	}
++	return NULL;
++}
++
++/**
++ * ath12k_cfg_ini_item_handler - Function to parse various ini values
++ * @context: The cfg store context
++ * @key: The key to be searched in the cfg store
++ * @value: The value to check against the cfg store
++ * Return: 0 on success
++ */
++static int
++ath12k_cfg_ini_item_handler(void *context, const char *key, const char *value)
++{
++	struct ath12k_cfg_value_store *store = context;
++	const struct ath12k_cfg_meta *meta;
++
++	meta = ath12k_cfg_lookup_meta(key);
++	if (!meta) {
++		ath12k_err(NULL, "Unknown cfg item '%s'", key);
++		return 0;
++	}
++
++	WARN_ON(!(meta->ath12k_cfg_item_handler));
++	if (!meta->ath12k_cfg_item_handler)
++		return 0;
++
++	meta->ath12k_cfg_item_handler(store, meta, value);
++	return 0;
++}
++
++/**
++ * ath12k_cfg_store_alloc - Allocate cfg store
++ * @path: Path from where store is created
++ * @out_store: Reference to cfg value store
++ * Return: 0 on success, Non-zero on error
++ */
++static int
++ath12k_cfg_store_alloc(const char *path,
++		       struct ath12k_cfg_value_store **out_store)
++{
++	struct ath12k_cfg_value_store *store;
++	store = vzalloc(sizeof(*store));
++
++	if (!store)
++		return -ENOMEM;
++
++	store->path = kstrdup(path, GFP_KERNEL);
++	atomic_set(&store->users, 1);
++	spin_lock_bh(&ath12k_cfg_stores_lock);
++	list_add_tail(&store->node, &ath12k_cfg_stores_list);
++	spin_unlock_bh(&ath12k_cfg_stores_lock);
++	*out_store = store;
++
++	return 0;
++}
++
++/**
++ * ath12k_cfg_store_free - Free the cfg store
++ * @store: Reference to cfg value store
++ * Return: void
++ */
++static void ath12k_cfg_store_free(struct ath12k_cfg_value_store *store)
++{
++	spin_lock_bh(&ath12k_cfg_stores_lock);
++	list_del_init(&store->node);
++	spin_unlock_bh(&ath12k_cfg_stores_lock);
++	kfree(store->path);
++	vfree(store);
++}
++
++/**
++ * list_peek_front - Get the front of the list
++ * @list: list head reference
++ * @node2: The node that is in the front of the linked list
++ * Return: 0 on success, Non-zero on error
++ */
++static
++int list_peek_front(struct list_head *list,  struct list_head **node2)
++{
++	struct list_head *listptr;
++
++	if (list_empty(list))
++		return -EINVAL;
++
++	listptr = list->next;
++	*node2 = listptr;
++
++	return 0;
++}
++
++/**
++ * list_peek_next - Get the next element of the list
++ * @list: list head reference
++ * @node: node element from which the next element should be fetched
++ * @node2: The node element that is the next element from the node
++ * Return: 0 on success, Non-zero on error
++ */
++static
++int list_peek_next(struct list_head *list, struct list_head *node,
++		   struct list_head **node2)
++{
++	if (!list || !node || !node2)
++		return -EINVAL;
++
++	if (list_empty(list))
++		return -EINVAL;
++
++	if (node->next == list)
++		return -EINVAL;
++
++	*node2 = node->next;
++
++	return 0;
++}
++
++/**
++ * ath12k_cfg_store_get - Get the reference of the store
++ * @path: Path from where store is created
++ * @out_store: Reference to cfg value store
++ * Return: 0 on success, Non-zero on error
++ */
++static int
++ath12k_cfg_store_get(const char *path, struct ath12k_cfg_value_store **out_store)
++{
++	int ret;
++	struct list_head *node;
++
++	*out_store = NULL;
++
++	spin_lock_bh(&ath12k_cfg_stores_lock);
++	ret = list_peek_front(&ath12k_cfg_stores_list, &node);
++	while ((ret == 0)) {
++		struct ath12k_cfg_value_store *store =
++		    container_of(node, struct ath12k_cfg_value_store, node);
++
++		if (!strcmp(path, store->path)) {
++			atomic_inc(&store->users);
++			*out_store = store;
++			break;
++		}
++		ret = list_peek_next(&ath12k_cfg_stores_list, node, &node);
++	}
++	spin_unlock_bh(&ath12k_cfg_stores_lock);
++
++	return ret;
++}
++
++/**
++ * ath12k_cfg_store_put - release reference of the store
++ * @store: Reference to cfg value store
++ * Return: void
++ */
++static void ath12k_cfg_store_put(struct ath12k_cfg_value_store *store)
++{
++	if (atomic_dec_and_test(&store->users))
++		ath12k_cfg_store_free(store);
++}
++
++/**
++ * ath12k_cfg_store_set - set reference of the store to the ath12k_base
++ * @cfg_ctx: Pointer to ath12k_cfg_ctx
++ * Return: void
++ */
++static void ath12k_cfg_store_set(struct ath12k_cfg_ctx *cfg_ctx)
++{
++	atomic_inc(&ath12k_cfg_global_store->users);
++	cfg_ctx->store = ath12k_cfg_global_store;
++}
++
++/**
++ * ath12k_cfg_get_ctx - get the ath12k_cfg context from the base
++ * @ab: ath12k_base reference
++ * Return: reference to the cfg context on success , null on failure
++ */
++static struct ath12k_cfg_ctx *ath12k_cfg_get_ctx(struct ath12k_base *ab)
++{
++	struct ath12k_cfg_ctx *cfg_ctx;
++
++	if (!ab->cfg_ctx)
++		return NULL;
++	cfg_ctx = ab->cfg_ctx;
++	return cfg_ctx;
++}
++
++struct ath12k_cfg_values *ath12k_cfg_get_values(struct ath12k_base *ab)
++{
++	return &ath12k_cfg_get_ctx(ab)->store->values;
++}
++
++/**
++ * ath12k_cfg_ini_parse_to_store - Parse the ini file to populate the cfg store
++ * @path: Path from where store is created
++ * @store: Reference to cfg value store
++ * Return: 0 on success, Non-zero on error
++ */
++static int
++ath12k_cfg_ini_parse_to_store(const char *path,
++			      struct ath12k_cfg_value_store *store)
++{
++	int ret;
++
++	ret = ath12k_ini_parse(path, store, ath12k_cfg_ini_item_handler);
++	if (ret)
++		ath12k_err(NULL,
++			   "Failed to parse *.ini file @ %s; status:%d",
++			   path, ret);
++
++	return ret;
++}
++
++/**
++ * ath12k_cfg_ini_section_parse_to_store - Parse ini section to fill cfg store
++ * @path: Path from where store is created
++ * @section_name: Section name to be parsed
++ * @store: Reference to cfg value store
++ * Return: 0 on success, Non-zero on error
++ */
++static int
++ath12k_cfg_ini_section_parse_to_store(const char *path,
++				      const char *section_name,
++				      struct ath12k_cfg_value_store *store)
++{
++	int ret;
++
++	ret = ath12k_ini_section_parse(path, store,
++					  ath12k_cfg_ini_item_handler,
++					  section_name);
++	if (ret)
++		ath12k_err(NULL,
++			   "Failed to parse *.ini file @ %s; status:%d",
++			   path, ret);
++
++	return ret;
++}
++
++/**
++ * ath12k_cfg_parse_to_store - Parse the ini to populate the cfg store
++ * @ab: reference to ath12_base
++ * @path: Path from where store is created
++ * Return: 0 on success, Non-zero on error
++ */
++static int
++ath12k_cfg_parse_to_store(struct ath12k_base *ab, const char *path)
++{
++	return ath12k_cfg_ini_parse_to_store(path,
++					     ath12k_cfg_get_ctx(ab)->store);
++}
++
++/**
++ * ath12k_cfg_section_parse_to_store - Parse the section and populate the store
++ * @ab: reference to ath12_base
++ * @path: Path from where store is created
++ * @section_name: Section name to be parsed
++ * Return: 0 on success, Non-zero on error
++ */
++static int
++ath12k_cfg_section_parse_to_store(struct ath12k_base *ab,
++				  const char *path,
++				  const char *section_name)
++{
++	return ath12k_cfg_ini_section_parse_to_store(path, section_name,
++						     ath12k_cfg_get_ctx(ab)->store);
++}
++
++/**
++ * ath12k_cfg_on_create - Create the cfg store context
++ * @ab: reference to ath12_base
++ * Return: 0 on success, Non-zero on error
++ */
++static int
++ath12k_cfg_on_create(struct ath12k_base *ab)
++{
++	struct ath12k_cfg_ctx *cfg_ctx;
++
++	WARN_ON(!ath12k_cfg_global_store);
++	if (!ath12k_cfg_global_store)
++		return -EINVAL;
++
++	cfg_ctx = kzalloc(sizeof(*cfg_ctx), GFP_KERNEL);
++
++	if (!cfg_ctx)
++		return -ENOMEM;
++
++	ath12k_cfg_store_set(cfg_ctx);
++	ab->cfg_ctx = cfg_ctx;
++	return 0;
++}
++
++/**
++ * ath12k_cfg_on_destroy - Destroy the cfg store context
++ * @ab: reference to ath12_base
++ * Return: 0 on success, Non-zero on error
++ */
++static int
++ath12k_cfg_on_destroy(struct ath12k_base *ab)
++{
++	int ret = 0;
++	struct ath12k_cfg_ctx *cfg_ctx;
++
++	cfg_ctx = ath12k_cfg_get_ctx(ab);
++
++	if (!cfg_ctx)
++		return -EINVAL;
++	ab->cfg_ctx = NULL;
++	ath12k_cfg_store_put(cfg_ctx->store);
++	ath12k_cfg_global_store = NULL;
++	kfree(cfg_ctx);
++
++	return ret;
++}
++
++/**
++ * ath12k_cfg_parse - main function to start the parsing of file
++ * @path: path to the file
++ * Return: 0 on success, Non-zero on error
++ */
++int ath12k_cfg_parse(const char *path)
++{
++	int ret;
++	struct ath12k_cfg_value_store *store;
++
++	if (!ath12k_cfg_global_store) {
++		ret = ath12k_cfg_store_alloc(path, &store);
++		if (ret)
++			return ret;
++
++		ath12k_cfg_store_set_defaults(store);
++		ret = ath12k_cfg_ini_parse_to_store(path, store);
++		if (ret)
++			goto free_store;
++
++		ath12k_cfg_global_store = store;
++		return 0;
++	}
++	store = ath12k_cfg_global_store;
++	ret = ath12k_cfg_ini_parse_to_store(path, store);
++	return ret;
++
++free_store:
++	ath12k_cfg_store_free(store);
++
++	return ret;
++}
++
++/**
++ * ath12k_cfg_ab_parse - Parse the file to populate the ab cfg context
++ * @ab: reference to ath12_base
++ * @path: Path from where store is created
++ * Return: 0 on success, Non-zero on error
++ */
++static int
++ath12k_cfg_ab_parse(struct ath12k_base *ab, const char *path)
++{
++	int ret;
++	struct ath12k_cfg_value_store *store;
++	struct ath12k_cfg_ctx *cfg_ctx;
++
++	if (!ath12k_cfg_global_store || !ath12k_cfg_is_init || !ab || !path) {
++		ath12k_err(ab, "Failed to parse the file investigate \n");
++		return -EINVAL;
++	}
++
++	cfg_ctx = ath12k_cfg_get_ctx(ab);
++
++	WARN_ON(!(cfg_ctx->store == ath12k_cfg_global_store));
++	if (cfg_ctx->store != ath12k_cfg_global_store)
++		return 0;
++
++	/* check if @path has been parsed before */
++	ret = ath12k_cfg_store_get(path, &store);
++	if (ret) {
++		ret = ath12k_cfg_store_alloc(path, &store);
++		if (ret)
++			return ret;
++
++		/* inherit global configuration */
++		memcpy(&store->values, &ath12k_cfg_global_store->values,
++		       sizeof(store->values));
++
++		ret = ath12k_cfg_ini_parse_to_store(path, store);
++		if (ret)
++			goto put_store;
++	}
++
++	cfg_ctx->store = store;
++	ath12k_cfg_store_put(ath12k_cfg_global_store);
++
++	return 0;
++
++put_store:
++	ath12k_cfg_store_put(store);
++
++	return ret;
++}
++
++/**
++ * ath12k_cfg_parse_section_store - Parse the section to populate cfg store
++ * @ab: reference to ath12_base
++ * @ini_buf: ini buffer reference
++ * Return:  void
++ */
++static void ath12k_cfg_parse_section_store(struct ath12k_base *ab,
++					   char *ini_buf)
++{
++	ath12k_cfg_section_parse_to_store(ab, ini_buf, ATH12K_CFG_512M_SECTION);
++}
++
++int
++ath12k_cfg_store_print(struct ath12k_base *ab)
++{
++	struct ath12k_cfg_value_store *store;
++	struct ath12k_cfg_ctx *cfg_ctx;
++	void *offset;
++	u32 i;
++
++	cfg_ctx = ath12k_cfg_get_ctx(ab);
++	if (!cfg_ctx)
++		return -EINVAL;
++
++	store = cfg_ctx->store;
++	if (!store)
++		return -EINVAL;
++
++	for (i = 0; i < ARRAY_SIZE(ath12k_cfg_meta_lookup_table); i++) {
++		const struct ath12k_cfg_meta *meta = &ath12k_cfg_meta_lookup_table[i];
++
++		offset = ath12k_cfg_value_ptr(store, meta);
++		switch (meta->cfg_data_type) {
++		case ATH12K_CFG_INT_ITEM:
++			ath12k_dbg(NULL, ATH12K_DBG_INI, "%p %s %d", offset,
++				   meta->name, *((int32_t *)offset));
++			break;
++		case ATH12K_CFG_UINT_ITEM:
++			ath12k_dbg(NULL, ATH12K_DBG_INI, "%p %s %d", offset,
++				   meta->name, *((uint32_t *)offset));
++			break;
++		case ATH12K_CFG_BOOL_ITEM:
++			ath12k_dbg(NULL, ATH12K_DBG_INI, "%p %s %d", offset,
++				   meta->name, *((bool *)offset));
++			break;
++		case ATH12K_CFG_STRING_ITEM:
++			ath12k_dbg(NULL, ATH12K_DBG_INI, "%p %s %s", offset,
++				   meta->name, (char *)offset);
++			break;
++		case ATH12K_CFG_MAC_ADDR_ITEM:
++			ath12k_dbg(NULL, ATH12K_DBG_INI, "%p %s " MAC_ADDR_FMT,
++				   offset, meta->name,
++				   MAC_ADDR_REF((uint8_t *)offset));
++			break;
++		default:
++			continue;
++		}
++	}
++
++	return 0;
++}
++
++int
++ath12k_cfg_ini_config_print(struct ath12k_base *ab, uint8_t *buf,
++			    ssize_t *plen, ssize_t buflen)
++{
++	struct ath12k_cfg_value_store *store;
++	struct ath12k_cfg_ctx *cfg_ctx;
++	ssize_t len;
++	ssize_t total_len = buflen;
++	u32 i;
++	void *offset;
++
++	cfg_ctx = ath12k_cfg_get_ctx(ab);
++	if (!cfg_ctx)
++		return -1;
++
++	store = cfg_ctx->store;
++	if (!store)
++		return -1;
++
++	for (i = 0; i < ARRAY_SIZE(ath12k_cfg_meta_lookup_table); i++) {
++		const struct ath12k_cfg_meta *meta = &ath12k_cfg_meta_lookup_table[i];
++
++		offset = ath12k_cfg_value_ptr(store, meta);
++
++		switch (meta->cfg_data_type) {
++		case ATH12K_CFG_INT_ITEM:
++			len = scnprintf(buf, buflen, "%s %d\n", meta->name,
++					*((int32_t *)offset));
++			buf += len;
++			buflen -= len;
++			break;
++		case ATH12K_CFG_UINT_ITEM:
++			len = scnprintf(buf, buflen, "%s %d\n", meta->name,
++					*((uint32_t *)offset));
++			buf += len;
++			buflen -= len;
++			break;
++		case ATH12K_CFG_BOOL_ITEM:
++			len = scnprintf(buf, buflen, "%s %d\n", meta->name,
++					*((bool *)offset));
++			buf += len;
++			buflen -= len;
++			break;
++		case ATH12K_CFG_STRING_ITEM:
++			len = scnprintf(buf, buflen, "%s %s\n", meta->name,
++					(char *)offset);
++			buf += len;
++			buflen -= len;
++			break;
++		case ATH12K_CFG_MAC_ADDR_ITEM:
++			len = scnprintf(buf, buflen,
++					"%s " MAC_ADDR_FMT "\n",
++					meta->name,
++					MAC_ADDR_REF((uint8_t *)offset));
++			buf += len;
++			buflen -= len;
++			break;
++		default:
++			continue;
++		}
++	}
++
++	*plen = total_len - buflen;
++
++	return 0;
++}
++
++int ath12k_cfg_dispatcher_init(struct ath12k_base *ab)
++{
++	if (ath12k_cfg_is_init) {
++		ath12k_err(ab, "cfg dispatcher already initialized\n");
++		return 0;
++	}
++
++	INIT_LIST_HEAD(&ath12k_cfg_stores_list);
++	spin_lock_init(&ath12k_cfg_stores_lock);
++	ath12k_cfg_is_init = true;
++
++	return 0;
++}
++
++int ath12k_cfg_dispatcher_deinit(struct ath12k_base *ab)
++{
++	if (!ath12k_cfg_is_init) {
++		ath12k_warn(ab, "cfg dispatcher already de-initialized\n");
++		return -EINVAL;
++	}
++
++	ath12k_cfg_is_init = false;
++	spin_lock_bh(&ath12k_cfg_stores_lock);
++	spin_unlock_bh(&ath12k_cfg_stores_lock);
++
++	return 0;
++}
++
++int ath12k_cfg_get_ini_file_name(u32 target_type, struct ath12k_ini_file *ini)
++{
++	int ret = 0;
++
++	switch (target_type) {
++	case TARGET_TYPE_QCN9224:
++		ini->external = "QCN9224.ini";
++		ini->internal = "QCN9224_i.ini";
++		break;
++	default:
++		ini->external = NULL;
++		ini->internal = NULL;
++		ret = -EINVAL;
++		ath12k_err(NULL,
++			   "Target specific INI not found tgt_type %d",
++			   target_type);
++		break;
++	}
++	return ret;
++}
++
++int ath12k_cfg_init(struct ath12k_base *ab)
++{
++	struct ath12k_ini_file ini;
++	char ini_buf[ATH12K_CFG_FILE_NAME_MAX];
++	char ini_buf_ext[ATH12K_CFG_FILE_NAME_MAX];
++	char global_file[ATH12K_CFG_FILE_NAME_MAX];
++	int ret;
++
++	ret = ath12k_cfg_dispatcher_init(ab);
++	if (ret)
++		ath12k_warn(ab, "cfg dispatcher already initialized\n");
++
++	scnprintf(global_file, sizeof(global_file), "%s/global.ini",
++		  ATH12K_FW_DIR);
++	if (ath12k_cfg_parse(global_file)) {
++		ath12k_err(ab, "Failed to parse the global ini file\n");
++		return -EINVAL;
++	}
++	scnprintf(ini_buf, sizeof(ini_buf), "%s/internal/", ATH12K_FW_DIR);
++	scnprintf(ini_buf_ext, sizeof(ini_buf_ext), "%s/", ATH12K_FW_DIR);
++	if (ath12k_cfg_on_create(ab)) {
++		ath12k_err(ab, "Failed to create the cfg store context \n");
++		return -EINVAL;
++	}
++	/* Parse the target specific INI */
++	ret = ath12k_cfg_get_ini_file_name(TARGET_TYPE_QCN9224, &ini);
++
++	if (!ret) {
++		strlcat(ini_buf, ini.internal,
++			strlen(ini.internal) + strlen(ini_buf) + 1);
++		strlcat(ini_buf_ext,
++			ini.external,
++			strlen(ini.external) + strlen(ini_buf_ext) + 1);
++		if (ath12k_cfg_ab_parse(ab, ini_buf_ext) == 0)
++			ath12k_cfg_parse_to_store(ab, ini_buf);
++		else
++			ath12k_cfg_ab_parse(ab, ini_buf);
++
++		ath12k_cfg_parse_section_store(ab, ini_buf);
++	}
++	ath12k_info(ab, "Successfully initialized INI info \n");
++	return ret;
++}
++
++void ath12k_cfg_deinit(struct ath12k_base *ab)
++{
++	ath12k_cfg_on_destroy(ab);
++	ath12k_cfg_dispatcher_deinit(ab);
++	ath12k_info(ab, "Successfully deinitialized INI info \n");
++}
++
++void ath12k_cfg_parse_pdev_section(struct ath12k_base *ab)
++{
++	struct ath12k_pdev *pdev;
++	struct ath12k_ini_file ini;
++	char ini_buf[100];
++	int ret;
++	u32 i;
++
++	scnprintf(ini_buf, sizeof(ini_buf), "%s/internal/", ATH12K_FW_DIR);
++	if (!ab->cfg_ctx)
++		return;
++	/* Parse the target specific INI */
++	ret = ath12k_cfg_get_ini_file_name(TARGET_TYPE_QCN9224, &ini);
++	if (ret)
++		return;
++
++	strlcat(ini_buf, ini.internal,
++		strlen(ini.internal) + strlen(ini_buf) + 1);
++
++	for (i = 0; i < ab->num_radios; i++) {
++		pdev = &ab->pdevs[i];
++		if (!strcmp(pdev->phy_name, ATH12K_PHY_6GHZ)) {
++			ath12k_cfg_section_parse_to_store(ab, ini_buf,
++							  ATH12K_CFG_6GHZ_SECTION);
++		}
++		if (!strcmp(pdev->phy_name, ATH12K_PHY_5GHZ_LOW)) {
++			ath12k_cfg_section_parse_to_store(ab, ini_buf,
++							  ATH12K_CFG_5GHZ_LOW_SECTION);
++		}
++	}
++}
+diff --git a/drivers/net/wireless/ath/ath12k/ini.h b/drivers/net/wireless/ath/ath12k/ini.h
+new file mode 100644
+index 0000000..24df52b
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath12k/ini.h
+@@ -0,0 +1,374 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++
++#ifndef ATH12K_INI_H
++#define ATH12K_INI_H
++
++#include <linux/types.h>
++#include <net/netlink.h>
++#include <linux/bug.h>
++#include "core.h"
++#include "debug.h"
++
++/* Key components of the configuration generation using Macros
++ * 1. Configuration Macros: e.g ATH12K_CFG_ALL, ATH12K_CFG_DP, ATH12K_CFG_CP etc
++ * 2. Configuration Definitions: e.g #define ATH12K_CFG_DP_RXDMA_BUF_RING
++ * 3. Fallback Behavior which determines what happens if a config value
++ *    is out of range
++ * 4. Metadata Table : The macro expansion builds a table of config metadata.
++ *    Each entry includes name, offset, type, handler, min/max, and fallback.
++ * 5. Default Value Initialization: The function ath12k_cfg_store_set_defaults()
++ *    initializes the config store with default values using macro expansion.
++ * 6. CFG Value Structure: Generate the cfg_value structure based on type, id.
++ *    initializes the config store with default values using macro expansion.
++ *
++ * Macro Expansion Flow for Meta table population:
++ * 1. ATH12K_CFG_ALL expands to all config macros CP/DP etc.
++ * 2. Each config macro (like ATH12K_CFG_DP_RXDMA_BUF_RING) expands to an
++ *    ATH12K_CFG_INI_* macro.
++ * 3. These are then processed by __ATH12K_CFG_INI, which builds the metadata,
++ *    cfg_value structure and populates the default values.
++ * Eg flow :
++ * 1. ATH12K_CFG(ATH12K_CFG_DP_RXDMA_BUF_RING) is replaced with >>
++ * 2. _ATH12K_CFG(__ATH12K_CFG_DP_RXDMA_BUF_RING,
++ *    rm_parens ATH12K_CFG_DP_RXDMA_BUF_RING)
++ * 3. Since we have the internal macro as
++ * #define ATH12K_CFG_DP_RXDMA_BUF_RING \
++ *    ATH12K_CFG_INI_UINT("dp_rxdma_buf_ring", 1024, 8192, 1024,
++ *    ATH12K_CFG_VALUE_OR_DEFAULT, "DP RXDMA buffer ring size")
++ * 4. Our code with rm_parens ATH12K_CFG_DP_RXDMA_BUF_RING removes the
++ *    parentheses from ATH12K_CFG_DP_RXDMA_BUF_RING macro and we get
++ * 5. ATH12K_CFG_INI_UINT("dp_rxdma_buf_ring", 1024, 8192, 1024,
++ *    ATH12K_CFG_VALUE_OR_DEFAULT, "DP RXDMA buffer ring size")
++ * 6. This is passed to __ATH12K_CFG(...) which using token pasting (##)
++ *    to build the final macro name, like:
++ *    __ATH12K_CFG_INI_UINT(...) which finally becomes __ATH12K_CFG_INI(args)
++ * 7. Which finally expands as below for the meta population
++ *{
++ *    .name = "dp_rxdma_buf_ring",
++ *    .field_offset = offsetof(struct ath12k_cfg_values,
++ *                             __ATH12K_CFG_DP_RXDMA_BUF_RING_internal),
++ *    .cfg_data_type = ATH12K_CFG_UINT_ITEM,
++ *    .ath12k_cfg_item_handler = ath12k_cfg_uint_item_handler,
++ *    .min = 1024,
++ *    .max = 8192,
++ *    .fallback = ATH12K_CFG_VALUE_OR_DEFAULT,
++ *},
++ *
++ * Flow For Default value Initialization :
++ * 1. ath12k_cfg_store_set_defaults declares temporary variables with default
++ * value (e.g., uint32_t dp_rxdma_buf_ring = 1024;) using macro.
++ * 2. Copies default strings into the config store incase for string values.
++ * 3. Assigns the temporary default values to the actual config store for non
++ *    string based values e.g bool ,int etc.
++ *
++ * Flow for Populating the cfg_value structure
++ * 1. We use the similar macro expansion to initialize the structure with id.
++ * the following structure
++ * struct ath12k_cfg_values {
++ * 		const int32_t __ATH12K_CFG_DP_RXDMA_BUF_RING_internal;
++ */
++
++#define ATH12K_CFG_META_NAME_LENGTH_MAX 256
++#define ATH12K_CFG_INI_LENGTH_MAX 128
++#define ATH12K_CFG_FILE_NAME_MAX 128
++#define TARGET_TYPE_QCN9224      32
++#define ATH12K_MAX_CFG 0xffffffff
++
++#define ATH12K_CFG_ALL \
++	ATH12K_CFG_DP \
++	ATH12K_CFG_CP \
++
++#define ATH12K_CFG_CP \
++	ATH12K_CFG(ATH12K_CFG_MAX_DESC) \
++	ATH12K_CFG(ATH12K_CFG_LOW_MEM_SYSTEM) \
++	ATH12K_CFG(ATH12K_CFG_TWT_INTERFERENCE_THRESH_SETUP) \
++	ATH12K_CFG(ATH12K_CFG_PRI20_CFG_BLOCKCHANLIST) \
++
++#define ATH12K_CFG_DP \
++	ATH12K_CFG(ATH12K_CFG_DP_RXDMA_BUF_RING) \
++
++#define ATH12K_CFG_MAX_DESC \
++	ATH12K_CFG_INI_UINT("max_descs", \
++	0, 2198, 0, \
++	ATH12K_CFG_VALUE_OR_DEFAULT, "Override default max descriptors")
++
++#define ATH12K_CFG_LOW_MEM_SYSTEM \
++	ATH12K_CFG_INI_BOOL("low_mem_system", false, \
++	"Low Memory System")
++
++#define ATH12K_CFG_TWT_INTERFERENCE_THRESH_SETUP \
++	ATH12K_CFG_INI_UINT("twt_interference_thresh_setup", \
++	0, 100, 50, \
++	ATH12K_CFG_VALUE_OR_DEFAULT, "TWT Setup Interference threshold in percentage")
++
++#define ATH12K_CFG_PRI20_CFG_BLOCKCHANLIST \
++	ATH12K_CFG_INI_STRING("pri20_cfg_blockchanlist", \
++	0, 512, "", \
++	"Primary 20MHz CFG block channel list")
++
++#define WLAN_ATH12K_CFG_RXDMA_BUF_RING_SIZE_MIN 1024
++#define WLAN_ATH12K_CFG_RXDMA_BUF_RING_SIZE_MAX 8192
++#define WLAN_ATH12K_CFG_RXDMA_BUF_RING_SIZE 1024
++
++#define ATH12K_CFG_DP_RXDMA_BUF_RING \
++	ATH12K_CFG_INI_UINT("dp_rxdma_buf_ring", \
++	WLAN_ATH12K_CFG_RXDMA_BUF_RING_SIZE_MIN, \
++	WLAN_ATH12K_CFG_RXDMA_BUF_RING_SIZE_MAX, \
++	WLAN_ATH12K_CFG_RXDMA_BUF_RING_SIZE, \
++	ATH12K_CFG_VALUE_OR_DEFAULT, "DP RXDMA buffer ring size")
++
++/**
++ * enum ath12k_cfg_data_type - Enum for CFG/INI types
++ * @ATH12K_CFG_VALUE_OR_CLAMP: If values is not within the range the max value
++ *  will be set for that variable.
++ * @ATH12K_CFG_VALUE_OR_DEFAULT: If a value is not within range the default
++ * value will be set for that variable.
++ */
++enum ath12k_cfg_fallback_behavior {
++	ATH12K_CFG_VALUE_OR_CLAMP,
++	ATH12K_CFG_VALUE_OR_DEFAULT,
++};
++
++#define rm_parens(...) __VA_ARGS__
++#define ATH12K_CFG(id) _ATH12K_CFG(__##id, rm_parens id)
++#define _ATH12K_CFG(id, args) __ATH12K_CFG(id, args)
++#define __ATH12K_CFG(id, is_ini, mtype, args...) \
++	__ATH12K_CFG_##is_ini##_##mtype(id, mtype, args)
++
++#define __ATH12K_CFG_INI_INT(args...) __ATH12K_CFG_INI(args)
++#define __ATH12K_CFG_INI_UINT(args...) __ATH12K_CFG_INI(args)
++#define __ATH12K_CFG_INI_BOOL(args...) __ATH12K_CFG_INI(args)
++#define __ATH12K_CFG_INI_STRING(args...) __ATH12K_CFG_INI(args)
++#define __ATH12K_CFG_INI_MAC(args...) __ATH12K_CFG_INI(args)
++#define __ATH12K_CFG_INI(args...) (args)
++
++/* configuration available in ini */
++#define ATH12K_CFG_INI_INT(name, min, max, def, fallback, desc) \
++	(INI, INT, int32_t, name, min, max, fallback, desc, def)
++#define ATH12K_CFG_INI_UINT(name, min, max, def, fallback, desc) \
++	(INI, UINT, uint32_t, name, min, max, fallback, desc, def)
++#define ATH12K_CFG_INI_BOOL(name, def, desc) \
++	(INI, BOOL, bool, name, false, true, -1, desc, def)
++#define ATH12K_CFG_INI_STRING(name, min_len, max_len, def, desc) \
++	(INI, STRING, char *, name, min_len, max_len, -1, desc, def)
++#define ATH12K_CFG_INI_MAC(name, def, desc) \
++	(INI, MAC_ADDR, struct ini_mac_addr, name, -1, -1, -1, desc, def)
++
++#undef __ATH12K_CFG_INI_STRING
++#define __ATH12K_CFG_INI_STRING(id, mtype, ctype, name, min, max, fallback, desc, \
++			 def...) \
++	const char id##_internal[(max) + 1];
++#undef __ATH12K_CFG_INI
++#define __ATH12K_CFG_INI(id, mtype, ctype, name, min, max, fallback, desc, def...) \
++	const ctype id##_internal;
++
++struct ath12k_cfg_values {
++	/* e.g. const int32_t __ATH12K_CFG_SCAN_DWELL_TIME_internal; */
++	ATH12K_CFG_ALL
++};
++
++#undef __ATH12K_CFG_INI_STRING
++#define __ATH12K_CFG_INI_STRING(args...) __ATH12K_CFG_INI(args)
++#undef __ATH12K_CFG_INI
++#define __ATH12K_CFG_INI(args...) (args)
++
++/* Section Parsing - section names to be parsed */
++#define ATH12K_CFG_512M_SECTION "512M"
++#define ATH12K_CFG_2GHZ_SECTION "2G"
++#define ATH12K_CFG_5GHZ_SECTION "5G"
++#define ATH12K_CFG_5GHZ_LOW_SECTION "5GL"
++#define ATH12K_CFG_5GHZ_HIGH_SECTION "5GH"
++#define ATH12K_CFG_6GHZ_HIGH_SECTION "6GH"
++#define ATH12K_CFG_6GHZ_LOW_SECTION "6GL"
++#define ATH12K_CFG_6GHZ_SECTION "6G"
++
++#define MAC_ADDR_FMT "%pM"
++#define MAC_ADDR_REF(a) (a)
++
++#define ath12k_cfg_get(ab, id) __ath12_cfg_get(ab, __##id)
++#define __ath12k_cfg_get(ab, id) (ath12k_cfg_get_values( \
++			(struct ath12k_base *)ab)->id##_internal)
++
++/* Value-or-Clamped APIs */
++#define ath12k_cfg_clamp(val, min, max) \
++		    ((val) < (min) ? (min) : ((val) > (max) ? (max) : (val)))
++#define ath12k_cfg_clamp_id(id, value) ath12k_cfg_clamp(value, cfg_min(id), cfg_max(id))
++
++/**
++ * ath12k_cfg_init - Initialize the INI
++ * @ab: reference to ath12_base
++ * Return: void
++ */
++int ath12k_cfg_init(struct ath12k_base *ab);
++
++/**
++ * ath12k_cfg_deinit - De-initialize the INI
++ * @ab: reference to ath12_base
++ * Return: void
++ */
++void ath12k_cfg_deinit(struct ath12k_base *ab);
++
++/**
++ * ath12k_cfg_parse_pdev_section - Parse pdev section
++ * @ab: reference to ath12_base
++ * Return: void
++ */
++void ath12k_cfg_parse_pdev_section(struct ath12k_base *ab);
++
++/**
++ * ath12k_cfg_dispatcher_init - Initialize the store
++ * @ab: reference to ath12_base
++ * Return: 0 on success, Non-zero on error
++ */
++int ath12k_cfg_dispatcher_init(struct ath12k_base *ab);
++
++/**
++ * ath12k_cfg_dispatcher_deinit - Deinitialize the store
++ * @ab: reference to ath12_base
++ * Return: 0 on success, Non-zero on error
++ */
++int ath12k_cfg_dispatcher_deinit(struct ath12k_base *ab);
++
++/**
++ * ath12k_cfg_store_print - Print the contents of cfg store
++ * @ab: reference to ath12_base
++ * Return: 0 on success, Non-zero on error
++ */
++int ath12k_cfg_store_print(struct ath12k_base *ab);
++
++/**
++ * ath12k_cfg_ini_config_print - Print ini configuration
++ * @ab: reference to ath12_base
++ * @buf: buffer reference
++ * @plen: printable length from the supplied buffer
++ * @buf_len: length of supplied buffer
++ * Return: 0 on success, Non-zero on error
++ */
++int ath12k_cfg_ini_config_print(struct ath12k_base *ab, uint8_t *buf,
++				ssize_t *plen, ssize_t buflen);
++
++/**
++ * ath12k_cfg_get_values - get the values from the cfg context
++ * @ab: ath12k_base reference
++ * Return: reference to cfg value
++ */
++struct ath12k_cfg_values *ath12k_cfg_get_values(struct ath12k_base *ab);
++
++/**
++ * typedef ath12k_ini_section_cb - ath12k_ini section callback functions
++ * @context: context passed to the function
++ * @name: name of the section
++ * Return: 0 on success. Non-zero on error
++ */
++typedef int (*ath12k_ini_section_cb)(void *context, const char *name);
++
++/**
++ * typedef ath12k_ini_item_cb - ath12k_ini callback function
++ * @context: context passed to the function
++ * @key: Key passed to the function to search the data
++ * @value: Value to be validated against the store cfg store metadata
++ * Return: 0 on success. Non-zero on error
++ */
++typedef int (*ath12k_ini_item_cb)(void *context,
++				  const char *key,
++				  const char *value);
++/**
++ * struct ath12k_ini_mac_addr - A MAC address
++ * @bytes: the raw address bytes array
++ */
++struct ath12k_ini_mac_addr {
++	u8 bytes[ETH_ALEN];
++};
++
++/**
++ *struct ath12k_ini_file structure to point to ath12k_ini files
++ *@external: file name of external ini for particular target
++ *@internal: file name of internal ini for particular target
++ */
++struct ath12k_ini_file {
++	char *external;
++	char *internal;
++};
++
++/**
++ *@brief Get corresponding ini files for target
++ *@details
++ *   Get the corresponding ini files for a given target mainly to
++ *   parse particular section based on requirement and use it
++ *   accordingly
++ *
++ *@target_type: Target type to get the ini file
++ *Return: 0 on success. Non-zero on error
++ */
++int ath12k_cfg_get_ini_file_name(u32 target_type, struct ath12k_ini_file *ini);
++
++/**
++ * ath12k_ini_parse() - parse an ini file
++ * @ath12k_ini_path: the full file path of the ini file to parse
++ * @context: the caller supplied context to pass into callbacks
++ * @ath12k_item_cb: ini item (key/value pair) handler callback function
++ *	return status_success to continue parsing, else to abort
++ *
++ * the *.ini file format is a simple format consisting of a list of key/value
++ * pairs (items), separated by an '=' character. comments are initiated with
++ * a '#' character while other form of comments eg '//' are not supported
++ * Sections are also supported, using '[' and ']' around the
++ * section name. e.g.
++ *
++ *	# comments are started with a '#' character
++ *	# items are key/value string pairs, separated by the '=' character
++ *	somekey1=somevalue1
++ *	somekey2=somevalue2 # this is also a comment
++ *
++ *	# section headers are enclosed in square brackets
++ *	[some section header] # new section begins
++ *	somekey3=somevalue3
++ *
++ * return: status
++ */
++int
++ath12k_ini_parse(const char *ath12k_ini_path, void *context,
++		 ath12k_ini_item_cb item_cb);
++
++/**
++ * ath12k_ini_section_parse() - parse a section from ini file
++ * @ath12k_ini_path: the full file path of the ini file to parse
++ * @context: the caller supplied context to pass into callbacks
++ * @ath12k_item_cb: ini item (key/value pair) handler callback function
++ *	return status_success to continue parsing, else to abort
++ * @ath12k_section_name: ini section name to be parsed from file
++ *	return status_success to continue parsing, else to abort
++ *
++ * the *.ini file format is a simple format consisting of a list of key/value
++ * pairs (items), separated by an '=' character. comments are initiated with
++ * a '#' character while other form of comments eg '//' are not supported
++ * Sections are also supported, using '[' and ']' around the
++ * section name. e.g.
++ *
++ *	# comments are started with a '#' character
++ *	# items are key/value string pairs, separated by the '=' character
++ *	somekey1=somevalue1
++ *	somekey2=somevalue2 # this is also a comment
++ *
++ *	# section headers are enclosed in square brackets
++ *	[some section header] # new section begins
++ *	somekey3=somevalue3
++ *
++ * return: status
++ */
++int ath12k_ini_section_parse(const char *ath12k_ini_path, void *context,
++			     ath12k_ini_item_cb item_cb,
++			     const char *ath12k_section_name);
++
++/**
++ * valid_ini_check() - check ini file for invalid characters
++ * @path: path to ini file
++ *
++ * return: true if no invalid character found, false otherwise
++ */
++bool ath12k_valid_ini_check(const char *path);
++
++#endif /* ATH12K_INI_H */
+-- 
+2.34.1
+

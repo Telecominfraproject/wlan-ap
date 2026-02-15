@@ -1,0 +1,244 @@
+From 75a8100d8499327e4c634d26bdf5e756682f6d59 Mon Sep 17 00:00:00 2001
+From: Rameshkumar Sundaram <rameshkumar.sundaram@oss.qualcomm.com>
+Date: Mon, 10 Feb 2025 15:51:28 +0530
+Subject: [PATCH 094/141] wifi: ath12k: combine channel list for splitphy
+
+When two Splitphy SoCs having below combination are combined into an MLO
+group they will be part of same wiphy and hence the channel list
+(wiphy->bands[]) will be common for all of the radios (ar).
+1 - 2.4GHz/2x2 + 5GHz Low band 2x2
+2 - 5GHz High band/2x2 + 6GHz/2x2
+
+This brings in a situation where 5GHz band is split across two radio(ar)
+and whenever a radio updates channel list it updated the wiphy->bands[]
+in a way that only the channels that its HW are enabled.
+This results in wiphy->bands[NL80211_BAND_5GHZ] always having channels
+of last radio which updated the list.
+
+Fix this by updating only the channels which belongs to its range whenever
+a radio(ar) tries to update wiphy->bands.
+
+Signed-off-by: Rameshkumar Sundaram <rameshkumar.sundaram@oss.qualcomm.com>
+Signed-off-by: Raj Kumar Bhagat <quic_rajkbhag@quicinc.com>
+Signed-off-by: Jeff Johnson <jeff.johnson@oss.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |  1 +
+ drivers/net/wireless/ath/ath12k/mac.c  | 86 ++++++++++++++++++++++++--
+ drivers/net/wireless/ath/ath12k/reg.c  | 16 +++++
+ drivers/net/wireless/ath/ath12k/reg.h  |  2 +
+ 4 files changed, 99 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index 7247e16ce730..97db1a34e7c4 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -804,6 +804,7 @@ struct ath12k {
+ 	int monitor_vdev_id;
+ 
+ 	struct wiphy_radio_freq_range freq_range;
++	u32 num_channels;
+ 
+ 	struct completion fw_stats_complete;
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 56cce58ae79d..250ec23918ed 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -4607,11 +4607,15 @@ ath12k_mac_select_scan_device(struct ieee80211_hw *hw,
+ 		band = NL80211_BAND_6GHZ;
+ 
+ 	for_each_ar(ah, ar, i) {
+-		/* TODO 5 GHz low high split changes */
+-		if (ar->mac.sbands[band].channels)
++		if (band == NL80211_BAND_5GHZ || band == NL80211_BAND_6GHZ) {
++			if (center_freq >= KHZ_TO_MHZ(ar->freq_range.start_freq) &&
++			    center_freq <= KHZ_TO_MHZ(ar->freq_range.end_freq))
++				if (ar->mac.sbands[band].channels)
++					return ar;
++		} else if (ar->mac.sbands[band].channels) {
+ 			return ar;
++		}
+ 	}
+-
+ 	return NULL;
+ }
+ 
+@@ -11761,6 +11765,36 @@ static u32 ath12k_get_phy_id(struct ath12k *ar, u32 band)
+ 	return 0;
+ }
+ 
++static int ath12k_mac_update_band(struct ath12k *ar,
++				  struct ieee80211_supported_band *orig_band,
++				  struct ieee80211_supported_band *new_band)
++{
++	struct ath12k_base *ab = ar->ab;
++	int i;
++
++	if (!orig_band || !new_band)
++		return -EINVAL;
++
++	if (orig_band->band != new_band->band)
++		return -EINVAL;
++
++	if (WARN_ON(!ab->ag->mlo_capable))
++		return -EOPNOTSUPP;
++
++	for (i = 0; i < new_band->n_channels; i++) {
++		if (new_band->channels[i].flags & IEEE80211_CHAN_DISABLED)
++			continue;
++		/* An enabled channel in new_band should not be already enabled
++		 * in the orig_band
++		 */
++		if (WARN_ON(!(orig_band->channels[i].flags &
++			      IEEE80211_CHAN_DISABLED)))
++			return -ENOTRECOVERABLE;
++		orig_band->channels[i].flags &= ~IEEE80211_CHAN_DISABLED;
++	}
++	return 0;
++}
++
+ static int ath12k_mac_setup_channels_rates(struct ath12k *ar,
+ 					   u32 supported_bands,
+ 					   struct ieee80211_supported_band *bands[])
+@@ -11771,6 +11805,7 @@ static int ath12k_mac_setup_channels_rates(struct ath12k *ar,
+ 	struct ath12k_hw *ah = ar->ah;
+ 	void *channels;
+ 	u32 phy_id, freq_low, freq_high;
++	int ret;
+ 
+ 	BUILD_BUG_ON((ARRAY_SIZE(ath12k_2ghz_channels) +
+ 		      ARRAY_SIZE(ath12k_5ghz_channels) +
+@@ -11792,7 +11827,6 @@ static int ath12k_mac_setup_channels_rates(struct ath12k *ar,
+ 		band->channels = channels;
+ 		band->n_bitrates = ath12k_g_rates_size;
+ 		band->bitrates = ath12k_g_rates;
+-		bands[NL80211_BAND_2GHZ] = band;
+ 
+ 		if (ab->hw_params->single_pdev_only) {
+ 			phy_id = ath12k_get_phy_id(ar, WMI_HOST_WLAN_2GHZ_CAP);
+@@ -11807,6 +11841,19 @@ static int ath12k_mac_setup_channels_rates(struct ath12k *ar,
+ 		ath12k_mac_update_ch_list(ar, band,
+ 					  freq_low,
+ 					  freq_high);
++		ar->num_channels = ath12k_reg_get_num_chans_in_band(ar, band);
++		if (!bands[NL80211_BAND_2GHZ]) {
++			bands[NL80211_BAND_2GHZ] = band;
++		} else {
++			/* Split mac in same band under same wiphy during MLO */
++			ret = ath12k_mac_update_band(ar,
++						     bands[NL80211_BAND_2GHZ],
++						     band);
++			if (ret)
++				return ret;
++			ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac pdev %u identified as 2 GHz split mac during MLO\n",
++				   ar->pdev->pdev_id);
++		}
+ 	}
+ 
+ 	if (supported_bands & WMI_HOST_WLAN_5GHZ_CAP) {
+@@ -11825,7 +11872,6 @@ static int ath12k_mac_setup_channels_rates(struct ath12k *ar,
+ 			band->channels = channels;
+ 			band->n_bitrates = ath12k_a_rates_size;
+ 			band->bitrates = ath12k_a_rates;
+-			bands[NL80211_BAND_6GHZ] = band;
+ 
+ 			freq_low = max(reg_cap->low_5ghz_chan,
+ 				       ab->reg_freq_6g.start_freq);
+@@ -11836,6 +11882,19 @@ static int ath12k_mac_setup_channels_rates(struct ath12k *ar,
+ 						  freq_low,
+ 						  freq_high);
+ 			ah->use_6ghz_regd = true;
++			ar->num_channels = ath12k_reg_get_num_chans_in_band(ar, band);
++			if (!bands[NL80211_BAND_6GHZ]) {
++				bands[NL80211_BAND_6GHZ] = band;
++			} else {
++				/* Split mac in same band under same wiphy during MLO */
++				ret = ath12k_mac_update_band(ar,
++							     bands[NL80211_BAND_6GHZ],
++							     band);
++				if (ret)
++					return ret;
++				ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac pdev %u identified as 6 GHz split mac during MLO\n",
++					   ar->pdev->pdev_id);
++			}
+ 		}
+ 
+ 		if (reg_cap->low_5ghz_chan < ATH12K_MIN_6GHZ_FREQ) {
+@@ -11854,7 +11913,6 @@ static int ath12k_mac_setup_channels_rates(struct ath12k *ar,
+ 			band->channels = channels;
+ 			band->n_bitrates = ath12k_a_rates_size;
+ 			band->bitrates = ath12k_a_rates;
+-			bands[NL80211_BAND_5GHZ] = band;
+ 
+ 			if (ar->ab->hw_params->single_pdev_only) {
+ 				phy_id = ath12k_get_phy_id(ar, WMI_HOST_WLAN_5GHZ_CAP);
+@@ -11868,6 +11926,19 @@ static int ath12k_mac_setup_channels_rates(struct ath12k *ar,
+ 			ath12k_mac_update_ch_list(ar, band,
+ 						  freq_low,
+ 						  freq_high);
++			ar->num_channels = ath12k_reg_get_num_chans_in_band(ar, band);
++			if (!ah->hw->wiphy->bands[NL80211_BAND_5GHZ]) {
++				ah->hw->wiphy->bands[NL80211_BAND_5GHZ] = band;
++			} else {
++				/* Split mac in same band under same wiphy during MLO */
++				ret = ath12k_mac_update_band(ar,
++							     bands[NL80211_BAND_5GHZ],
++							     band);
++				if (ret)
++					return ret;
++				ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac pdev %u identified as 5 GHz split mac during MLO\n",
++					   ar->pdev->pdev_id);
++			}
+ 		}
+ 	}
+ 
+@@ -12492,6 +12563,9 @@ static int ath12k_mac_hw_register(struct ath12k_hw *ah)
+ 
+ 		ath12k_fw_stats_init(ar);
+ 		ath12k_debugfs_register(ar);
++		ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac pdev %u freq limits %u->%u MHz, no. of channels %u\n",
++			   ar->pdev->pdev_id, ar->freq_range.start_freq,
++			   ar->freq_range.end_freq, ar->num_channels);
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/net/wireless/ath/ath12k/reg.c b/drivers/net/wireless/ath/ath12k/reg.c
+index 2bba4227318b..b923af6cf951 100644
+--- a/drivers/net/wireless/ath/ath12k/reg.c
++++ b/drivers/net/wireless/ath/ath12k/reg.c
+@@ -261,6 +261,22 @@ static void ath12k_copy_regd(struct ieee80211_regdomain *regd_orig,
+ 		       sizeof(struct ieee80211_reg_rule));
+ }
+ 
++int ath12k_reg_get_num_chans_in_band(struct ath12k *ar,
++				     struct ieee80211_supported_band *band)
++{
++	int i, count = 0;
++	u32 center_freq;
++
++	for (i = 0; i < band->n_channels; i++) {
++		center_freq = band->channels[i].center_freq;
++		if (center_freq >= KHZ_TO_MHZ(ar->freq_range.start_freq) &&
++		    center_freq <= KHZ_TO_MHZ(ar->freq_range.end_freq))
++			count++;
++	}
++
++	return count;
++}
++
+ int ath12k_regd_update(struct ath12k *ar, bool init)
+ {
+ 	struct ath12k_hw *ah = ath12k_ar_to_ah(ar);
+diff --git a/drivers/net/wireless/ath/ath12k/reg.h b/drivers/net/wireless/ath/ath12k/reg.h
+index b1eb584ff34c..4f79c0e4f6f9 100644
+--- a/drivers/net/wireless/ath/ath12k/reg.h
++++ b/drivers/net/wireless/ath/ath12k/reg.h
+@@ -100,5 +100,7 @@ struct ieee80211_regdomain *ath12k_reg_build_regd(struct ath12k_base *ab,
+ 						  bool intersect);
+ int ath12k_regd_update(struct ath12k *ar, bool init);
+ int ath12k_reg_update_chan_list(struct ath12k *ar, bool wait);
++int ath12k_reg_get_num_chans_in_band(struct ath12k *ar,
++				     struct ieee80211_supported_band *band);
+ 
+ #endif
+-- 

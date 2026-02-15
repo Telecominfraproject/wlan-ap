@@ -1,0 +1,184 @@
+From 412d89225a98dfaa13d465e4ba482b4ed16c8513 Mon Sep 17 00:00:00 2001
+From: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+Date: Fri, 26 Sep 2025 16:25:18 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: wifi: ath12k: Fix WMI SET TPC for client
+ SP
+
+Currently, for a client which is connected to a Standard Power (SP)
+AP, ath12k driver sends WMI SET TPC command with PSD powers from the
+TPE IE in the AP's beacon. THis power is limited by the regulatory
+power for each subchannel. The regulatory power is calculated as
+the SP AP power for the subchannel - 6 dB (mandated power difference
+between AP and Client).
+
+This logic fails for cases when one or more subchannels are punctured
+and the punctured channel is not SP capable. In this case, the
+regulatory powers is calculated as 0 and hence the PSD power is
+sent as MIN(TPC_IE power, 0) which results in 0 power for the
+punctured channel.
+
+To fix this, use the primary channel for calculating the regulatory
+power instead of the each subchannel. Also, use Default Client SP
+power for lookup instead of AP SP power as SP AP powers may not
+be available in the regulatory database always.
+
+Also, add debugs to log the TPC computation.
+
+Fixes: Ia7b7b513fd9 ("UPSTREAM: PROTOCOL: wifi: ath12k: Add client SP mode support for PSD and EIRP-based reg TPC")
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+ath12k/0440-f-UPSTREAM-PROTOCOL-wifi-ath12k-Add-client-SP-mode-sup.patch
+
+Signed-off-by: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 78 +++++++++++++--------------
+ 1 file changed, 37 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 155a60bf5b3e..8b5b3ccfe03a 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -9676,29 +9676,28 @@ static void ath12k_mac_get_eirp_arr_for_6g(struct ath12k *ar,
+ 	}
+ }
+ 
+-void ath12k_mac_get_client_power_for_connecting_ap(struct ath12k *ar,
+-						   struct ieee80211_chanctx_conf *ctx,
+-						   u8 reg_6g_power_mode,
+-						   s8 *max_eirp_arr,
+-						   u16 start_freq,
+-						   u8 num_pwr_levels)
+-{
+-	struct ieee80211_channel *temp_chan;
++void
++ath12k_mac_get_sp_client_power_for_connecting_ap(struct ath12k *ar,
++						 struct ieee80211_chanctx_conf *ctx,
++						 s8 *max_eirp_arr,
++						 u8 num_pwr_levels)
++{
+ 	u16 bw = ATH12K_CHWIDTH_20;
+-	u16 center_freq = 0;
++	u16 center_freq = ctx->def.chan->center_freq;
+ 	u8 pwr_lvl_idx;
++	s8 sp_reg_eirp = ATH12K_MIN_TX_POWER, sp_reg_psd = ATH12K_MIN_TX_POWER;
++
++	ath12k_reg_get_regulatory_pwrs(ar, MHZ_TO_KHZ(center_freq),
++				       NL80211_REG_REGULAR_CLIENT_SP,
++				       &sp_reg_eirp, &sp_reg_psd);
+ 
+ 	for (pwr_lvl_idx = 0; pwr_lvl_idx < num_pwr_levels; pwr_lvl_idx++) {
+-		s8 tx_power = ATH12K_MAX_TX_POWER, eirp = ATH12K_MAX_TX_POWER;
+-
+-		ath12k_mac_get_psd_channel(ar, 20, &start_freq, &center_freq,
+-					   pwr_lvl_idx,
+-					   &temp_chan,
+-					   &tx_power,
+-					   reg_6g_power_mode);
+-		if (temp_chan)
+-			eirp = ath12k_reg_psd_2_eirp(temp_chan->psd, bw);
+-		max_eirp_arr[pwr_lvl_idx] = min(eirp, tx_power);
++		s8 tmp_eirp = ATH12K_MAX_TX_POWER;
++
++		if (ctx->def.chan->flags & IEEE80211_CHAN_PSD)
++			tmp_eirp = ath12k_reg_psd_2_eirp(sp_reg_psd, bw);
++
++		max_eirp_arr[pwr_lvl_idx] = min(sp_reg_eirp, tmp_eirp);
+ 		bw *= 2;
+ 	}
+ }
+@@ -9778,9 +9777,9 @@ void ath12k_mac_fill_reg_tpc_info_with_eirp_power(struct ath12k *ar,
+ 	 */
+ 	if (bss_conf->power_type == IEEE80211_REG_SP_AP &&
+ 	    !ar->afc.is_6ghz_afc_power_event_received) {
+-		ath12k_mac_get_client_power_for_connecting_ap(ar, ctx, IEEE80211_REG_SP_AP,
+-							      sta_max_eirp_arr, start_freq,
+-							      num_pwr_levels);
++		ath12k_mac_get_sp_client_power_for_connecting_ap(ar, ctx,
++								 sta_max_eirp_arr,
++								 num_pwr_levels);
+ 	} else {
+ 		ath12k_mac_get_eirp_arr_for_6g(ar, &ctx->def, reg_6g_power_mode,
+ 					       sta_max_eirp_arr, start_freq,
+@@ -23681,7 +23680,6 @@ ath12k_mac_finalize_psd_table(struct ath12k *ar,
+ 			      u16 *sub_chans, s8 *tpc_oobe_psd,
+ 			      struct ieee80211_chanctx_conf *ctx)
+ {
+-	s16 reg_psd[ATH12K_NUM_PWR_LEVELS];
+ 	u16 start_freq = sub_chans[0];
+ 	s8 txpower;
+ 	int i;
+@@ -23689,23 +23687,25 @@ ath12k_mac_finalize_psd_table(struct ath12k *ar,
+ 	for (i = 0; i < reg_tpc_info->num_psd_pwr_levels; i++) {
+ 		u16 cfreq;
+ 		struct ieee80211_channel *temp_chan;
++		s16 reg_psd = ATH12K_MAX_TX_POWER;
+ 
+-		reg_tpc_info->chan_psd_power_info[i].chan_cfreq = sub_chans[i];
+-		reg_tpc_info->chan_psd_power_info[i].tx_power = tpc_oobe_psd[i];
+ 		ath12k_mac_get_psd_channel(ar, ATH12K_CHWIDTH_20, &start_freq,
+ 					   &cfreq, i, &temp_chan, &txpower,
+ 					   IEEE80211_REG_SP_AP);
+ 
+-		ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "freq %u tpc_oobe_psd %d\n",
+-			   sub_chans[i], tpc_oobe_psd[i]);
+ 		if (temp_chan) {
+-			reg_psd[i] = temp_chan->psd;
++			reg_psd = temp_chan->psd;
+ 			if (reg_tpc_info->power_type_6g == REG_SP_CLIENT_TYPE)
+-				reg_psd[i] -= ATH12K_SP_AP_AND_CLIENT_POWER_DIFF_IN_DBM;
+-			reg_tpc_info->chan_psd_power_info[i].tx_power =
+-					min(tpc_oobe_psd[i], reg_psd[i]);
+-			ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "reg_psd %d\n", reg_psd[i]);
++				reg_psd -= ATH12K_SP_AP_AND_CLIENT_POWER_DIFF_IN_DBM;
+ 		}
++
++		reg_tpc_info->chan_psd_power_info[i].chan_cfreq = sub_chans[i];
++		reg_tpc_info->chan_psd_power_info[i].tx_power =
++				min(tpc_oobe_psd[i], reg_psd);
++
++		ath12k_dbg(ar->ab, ATH12K_DBG_AFC,
++			   "freq %u tpc_oobe_psd %d reg_psd %d\n",
++			   sub_chans[i], tpc_oobe_psd[i], reg_psd);
+ 	}
+ }
+ 
+@@ -23962,7 +23962,6 @@ ath12k_mac_get_min_psd_for_eirp(struct ath12k *ar, u16 *sub_chans,
+ 			min_psd = tpe_psd[j];
+ 	}
+ 
+-	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "min_psd %d\n", min_psd);
+ 	return min_psd;
+ }
+ 
+@@ -24015,9 +24014,9 @@ ath12k_mac_fill_eirp_power_level(struct ath12k *ar,
+ 
+ 	eirp_pwr_info->chan_cfreq = cfreq;
+ 	eirp_pwr_info->tx_power = min_eirp;
+-	ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
+-		   "cfreq %u tpe_eirp %d eirp_from_tpe_psd %d reg_eirp %d\n",
+-		   cfreq, tpe_eirp[idx], eirp_psd, reg_eirp[idx]);
++	ath12k_dbg(ar->ab, ATH12K_DBG_AFC,
++		   "BW %d EBW %d cf %u tpe_psd %d tpe_psd_eirp %d tpe_eirp %d reg_eirp %d\n",
++		   bw, eff_bw, cfreq, min_psd, eirp_psd, tpe_eirp[idx], reg_eirp[idx]);
+ }
+ 
+ /**
+@@ -24054,11 +24053,8 @@ ath12k_mac_fill_reg_tpc_info_with_eirp_for_client_sp_pwr_mode(struct ath12k *ar,
+ 	num_pwr_levels = ath12k_mac_get_num_pwr_levels(&ctx->def, false);
+ 	reg_tpc_info->num_eirp_pwr_levels = num_pwr_levels;
+ 
+-	ath12k_mac_get_client_power_for_connecting_ap(ar, ctx, IEEE80211_REG_SP_AP,
+-						      reg_eirp, start_freq,
+-						      num_pwr_levels);
+-	for (i = 0; i < ATH12K_MAX_EIRP_VALS; i++)
+-		reg_eirp[i] -= ATH12K_SP_AP_AND_CLIENT_POWER_DIFF_IN_DBM;
++	ath12k_mac_get_sp_client_power_for_connecting_ap(ar, ctx, reg_eirp,
++							 num_pwr_levels);
+ 
+ 	ath12k_mac_init_root_tpe(reg_tpc_info, &tpe_psd, true);
+ 	ath12k_mac_init_root_tpe(reg_tpc_info, &tpe_eirp, false);
+-- 
+2.34.1
+

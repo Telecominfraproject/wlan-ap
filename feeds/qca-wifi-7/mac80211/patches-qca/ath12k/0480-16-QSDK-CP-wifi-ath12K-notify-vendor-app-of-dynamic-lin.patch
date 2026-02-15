@@ -1,0 +1,200 @@
+From 3c74c470c4849ad0465e00ce90aba4ddea165e18 Mon Sep 17 00:00:00 2001
+From: Sidhanta Sahu <sidhanta.sahu@oss.qualcomm.com>
+Date: Mon, 7 Jul 2025 16:36:49 -0700
+Subject: [PATCH 16/24] QSDK:CP:wifi:ath12K: notify vendor app of dynamic link
+ state changes
+
+Implement vendor link state update function to update link state
+and notify vendor application of this change.
+
+Add vendor link state enum to represent different link states.
+
+Patch-dependency:
+0462-15-QSDK-CP-wifi-ath12K-allow-NSS-chains-config-via-vend.patch
+
+Signed-off-by: Sidhanta Sahu <sidhanta.sahu@oss.qualcomm.com>
+Signed-off-by: Aloka Dixit <aloka.dixit@oss.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c         | 15 +++
+ .../net/wireless/ath/ath12k/vendor_services.c | 99 +++++++++++++++++++
+ .../net/wireless/ath/ath12k/vendor_services.h | 14 +++
+ 3 files changed, 128 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -15739,6 +15739,9 @@ static int ath12k_mac_vdev_delete(struct
+ 
+ 	reinit_completion(&ar->vdev_delete_done);
+ 
++	ath12k_vendor_link_state_update(ar->pdev_idx, ar->ab, arvif,
++					ATH12K_VENDOR_LINK_STATE_REMOVED);
++
+ 	if (unlikely(test_bit(ATH12K_FLAG_RECOVERY, &ar->ab->dev_flags)))
+ 		goto err_vdev_del;
+ 
+@@ -17653,6 +17656,9 @@ ath12k_mac_assign_vif_chanctx_handle(str
+ 	if (ab->is_bypassed)
+ 		return 0;
+ 
++	ath12k_vendor_link_state_update(ar->pdev_idx, ab, arvif,
++					ATH12K_VENDOR_LINK_STATE_ADDED);
++
+ 	ret = ath12k_ppeds_attach_link_vif(arvif, ahvif->dp_vif.ppe_vp_num,
+ 					   &arvif->ppe_vp_profile_idx, vif);
+ 	if (ret)
+@@ -17738,6 +17744,12 @@ ath12k_mac_assign_vif_chanctx_handle(str
+ 
+ 	if (ctx) {
+ 		memcpy(&arvif->chanctx, ctx, sizeof(*ctx));
++
++		if (ahvif->vdev_type == WMI_VDEV_TYPE_AP) {
++			ath12k_vendor_link_state_update(ar->pdev_idx, ab, arvif,
++						ATH12K_VENDOR_LINK_STATE_ASSIGNED);
++		}
++
+ 		ret = ath12k_mac_vdev_start(arvif, ctx);
+ 		if (ret) {
+ 			ath12k_warn(ab, "failed to start vdev %i addr %pM on freq %d: %d\n",
+@@ -17803,6 +17815,9 @@ ath12k_mac_unassign_vif_chanctx_handle(s
+ 	ar = arvif->ar;
+ 	ab = ar->ab;
+ 
++	ath12k_vendor_link_state_update(ar->pdev_idx, ab, arvif,
++					ATH12K_VENDOR_LINK_STATE_UNASSIGNED);
++
+ 	if (unlikely(test_bit(ATH12K_FLAG_CRASH_FLUSH, &ar->ab->dev_flags)))
+ 		return;
+ 
+--- a/drivers/net/wireless/ath/ath12k/vendor_services.c
++++ b/drivers/net/wireless/ath/ath12k/vendor_services.c
+@@ -885,3 +885,102 @@ int ath12k_vendor_send_assoc_event(void
+ 	return 0;
+ }
+ 
++static void ath12k_vendor_report_link_info(struct ath12k_base *ab,
++					   struct ath12k_link_vif *arvif)
++{
++	struct ath12k_vendor_soc_device_info *soc_info;
++	struct ath12k_vendor_link_info *link_info;
++	struct ieee80211_chanctx_conf *ctx = NULL;
++	struct ath12k *ar = arvif->ar;
++
++	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
++
++	ctx = &arvif->chanctx;
++	if (!ctx) {
++		ath12k_warn(ab, "Failed to send link info due to no chan ctx");
++		return;
++	}
++
++	/* Only report if the service is enabled */
++	if (!vendor_info.is_vendor_init_done)
++		return;
++
++	soc_info = kmalloc(sizeof(*soc_info), GFP_KERNEL);
++	if (!soc_info) {
++		//ath12k_warn(ab, "Failed to create soc info for rm");
++		return;
++	}
++
++	soc_info->soc_id = ath12k_get_ab_device_id(ab);
++	soc_info->num_radios = ab->num_radios;
++
++	link_info = &soc_info->link_info[0];
++	link_info->hw_link_id = ar->pdev->hw_link_id;
++	ether_addr_copy(link_info->link_mac_addr, arvif->bssid);
++	link_info->chan_bw = ctx->def.width;
++	link_info->chan_freq = ctx->def.chan->center_freq;
++	link_info->tx_chain_mask = ar->pdev->cap.tx_chain_mask;
++	link_info->rx_chain_mask = ar->pdev->cap.rx_chain_mask;
++
++	mutex_lock(&vendor_info.list_lock);
++	list_add(&soc_info->list, &vendor_info.soc_list);
++	mutex_unlock(&vendor_info.list_lock);
++
++	ath12k_vendor_queue_vendor_work();
++}
++
++int ath12k_vendor_link_state_update(const u8 mac_id,
++				    struct ath12k_base *ab,
++				    struct ath12k_link_vif *arvif,
++				    enum ath12k_vendor_link_state new_state)
++{
++	struct ath12k_vendor_soc_device_info *soc_info;
++	struct ath12k_vendor_link_info *link_info;
++	u8 chip_id;
++
++	if (!ab || !arvif)
++		return -EINVAL;
++
++	if (arvif->ahvif->vdev_type != WMI_VDEV_TYPE_AP)
++		return -EOPNOTSUPP;
++
++	if (!ath12k_telemetry_is_agent_loaded()) {
++		ath12k_dbg(ab, ATH12K_DBG_RM,
++			   "vendor: vendor services are not initialized");
++		return -EINVAL;
++	}
++
++	if (new_state >= ATH12K_VENDOR_LINK_STATE_MAX)
++		return -EINVAL;
++
++	chip_id = ath12k_get_ab_device_id(ab);
++	soc_info = &vendor_info.app_info.soc_info[chip_id];
++	link_info = &soc_info->link_info[mac_id];
++
++	link_info->state.prev_state = link_info->state.curr_state;
++	link_info->state.curr_state = new_state;
++
++	if (link_info->state.prev_state == ATH12K_VENDOR_LINK_STATE_ADDED &&
++	    link_info->state.curr_state == ATH12K_VENDOR_LINK_STATE_ASSIGNED) {
++		ath12k_vendor_report_link_info(ab, arvif);
++		ath12k_dbg(ab, ATH12K_DBG_RM,
++			   "Vendor link notification is sent for chip id: %d mac id: %d when prev: %d curr: %d state",
++			   chip_id, mac_id,
++			   link_info->state.prev_state,
++			   link_info->state.curr_state);
++	} else {
++		/*
++		 * For rest of the state transition, no action required
++		 * Currently, RM doesn't support link removal for this
++		 * particular notification
++		 */
++		ath12k_dbg(ab, ATH12K_DBG_RM,
++			   "Vendor link notification is not reported for chip id: %d mac id: %d when prev: %d curr: %d state",
++			   chip_id, mac_id,
++			   link_info->state.prev_state,
++			   link_info->state.curr_state);
++	}
++
++	return 0;
++}
++
+--- a/drivers/net/wireless/ath/ath12k/vendor_services.h
++++ b/drivers/net/wireless/ath/ath12k/vendor_services.h
+@@ -23,6 +23,15 @@ enum ath12k_vendor_service_id {
+ 	ATH12K_RM_MAX_SERVICE
+ };
+ 
++enum ath12k_vendor_link_state {
++	ATH12K_VENDOR_LINK_STATE_NO_LINK,
++	ATH12K_VENDOR_LINK_STATE_REMOVED,
++	ATH12K_VENDOR_LINK_STATE_ADDED,
++	ATH12K_VENDOR_LINK_STATE_UNASSIGNED,
++	ATH12K_VENDOR_LINK_STATE_ASSIGNED,
++	ATH12K_VENDOR_LINK_STATE_MAX
++};
++
+ struct ath12k_vendor_service_ops {
+ 	int (*init)(struct ath12k_base *ab, const void *data, size_t len);
+ 	void (*deinit)(struct ath12k_base *ab);
+@@ -121,4 +130,9 @@ bool ath12k_vendor_is_service_enabled(co
+ int ath12k_vendor_send_assoc_event(void *event_data,
+ 				   u8 category, u8 service_id);
+ 
++int ath12k_vendor_link_state_update(const u8 mac_id,
++				    struct ath12k_base *ab,
++				    struct ath12k_link_vif *arvif,
++				    enum ath12k_vendor_link_state new_state);
++
+ #endif /* ATH12K_VENDOR_SERVICES_H */

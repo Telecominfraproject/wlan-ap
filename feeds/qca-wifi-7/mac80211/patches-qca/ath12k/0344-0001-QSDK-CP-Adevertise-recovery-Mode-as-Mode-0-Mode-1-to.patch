@@ -1,0 +1,1324 @@
+From ecec22b0cf277404d8934290642f845e0fd0b8d6 Mon Sep 17 00:00:00 2001
+From: Avula Sri Charan <asrichar@qti.qualcomm.com>
+Date: Thu, 12 Jun 2025 08:09:38 +0530
+Subject: [PATCH 1/2] QSDK:CP: Adevertise recovery Mode as Mode-0/Mode-1 to FW
+
+By default FW will operate in Mode-0 recovery Mode which means
+whenever there is a crash in Q6 the partner device crash indication
+is sent to all the Q6 that are part of the MLO. But for Mode-1
+recovery only the asserted readio should go for a Q6 restart.
+To achieve this and to toggle between Mode-0 and Mode-1 recovery
+modes FW rely on MLO global memory allocated during QMI seqeunce.
+
+This will be used a Shared mem between FW and host to advertise
+the recovery mode as Mode-0/Mode-1. Added changes to parse this MLO
+memory and get the address of shared memory and poulate in ath12k_base.
+
+Also add support to send the crash notification as userpd crash
+for AHB/HYBRID chipsets.
+
+Add support to trigger umac reset in case of Mode-1 recovery
+and also for the cleanup of ML peer in non asserted partner
+chipsets.
+
+Signed-off-by: Manish Dharanenthiran <mdharane@qti.qualcomm.com>
+Signed-off-by: Vignesh C <vignc@qti.qualcomm.com>
+Signed-off-by: Sidhanta Sahu <sidhanta@qti.qualcomm.com>
+Signed-off-by: Sowmiya Sree Elavalagan <ssreeela@qti.qualcomm.com>
+Signed-off-by: Avula Sri Charan <asrichar@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c    | 336 ++++++++++++++++++++--
+ drivers/net/wireless/ath/ath12k/core.h    |  12 +
+ drivers/net/wireless/ath/ath12k/debugfs.c |  47 ++-
+ drivers/net/wireless/ath/ath12k/mac.c     | 153 ++++++++--
+ drivers/net/wireless/ath/ath12k/mac.h     |   2 +
+ drivers/net/wireless/ath/ath12k/qmi.c     | 206 +++++++++++++
+ drivers/net/wireless/ath/ath12k/qmi.h     |  96 +++++++
+ drivers/net/wireless/ath/ath12k/wmi.c     |  37 ++-
+ drivers/net/wireless/ath/ath12k/wmi.h     |   4 +-
+ 9 files changed, 840 insertions(+), 53 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1048,6 +1048,64 @@ static void ath12k_core_soc_destroy(stru
+ 	ath12k_qmi_deinit_service(ab);
+ }
+ 
++static int ath12k_core_mlo_shmem_per_device_crash_info_addresses(
++		struct ath12k_base *ab,
++		struct ath12k_host_mlo_glb_device_crash_info *global_device_crash_info)
++{
++	int i;
++	struct ath12k_host_mlo_glb_per_device_crash_info *per_device_crash_info = NULL;
++
++	for (i = 0; i < global_device_crash_info->no_of_devices; i++)
++	{
++		per_device_crash_info = &global_device_crash_info->per_device_crash_info[i];
++
++		if (!per_device_crash_info)
++			return -EINVAL;
++
++		if (ab->device_id == per_device_crash_info->device_id)
++			break;
++	}
++
++	if (i >= global_device_crash_info->no_of_devices) {
++		ath12k_err(ab, "error in chip id:%d\n", ab->device_id);
++		return 0;
++	}
++
++	if (!per_device_crash_info ||
++	    !per_device_crash_info->crash_reason ||
++	    !per_device_crash_info->recovery_mode) {
++		ath12k_err(ab, "crash_reason address is null\n");
++		return 0;
++	}
++
++	ab->crash_info_address = per_device_crash_info->crash_reason;
++	ab->recovery_mode_address = per_device_crash_info->recovery_mode;
++
++	return 0;
++}
++
++static int ath12k_core_mlo_shmem_crash_info_init(struct ath12k_base *ab)
++{
++	struct ath12k_hw_group *ag = ab->ag;
++	struct ath12k_host_mlo_mem_arena *mlomem_arena_ctx;
++	struct ath12k_host_mlo_glb_device_crash_info *global_device_crash_info;
++
++	mlomem_arena_ctx = &ab->ag->mlomem_arena;
++
++	if (!(ag->mlo_mem.is_mlo_mem_avail))
++		return 0;
++
++	global_device_crash_info = &mlomem_arena_ctx->global_device_crash_info;
++
++	if (ath12k_core_mlo_shmem_per_device_crash_info_addresses(ab,
++				global_device_crash_info) < 0) {
++		ath12k_warn(ab, "per_device_crash_info is not set\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ static int ath12k_core_pdev_init(struct ath12k_base *ab)
+ {
+ 	ath12k_fse_init(ab);
+@@ -1437,6 +1495,11 @@ core_pdev_create:
+ 			goto err;
+ 		}
+ 
++                ret = ath12k_core_mlo_shmem_crash_info_init(ab);
++                if (ret) {
++                        ath12k_err(ab, "failed to parse crash info %d\n", ret);
++                }
++
+ 		if (ath12k_en_fwlog == true) {
+ 			if (ath12k_enable_fwlog(ab))
+ 				ath12k_err(ab, "failed to enable fwlog: %d\n", ret);
+@@ -1620,6 +1683,11 @@ int ath12k_core_qmi_firmware_ready(struc
+ 	mutex_unlock(&ab->core_lock);
+ 
+ 	if (ath12k_core_hw_group_start_ready(ag)) {
++		ret = ath12k_qmi_mlo_global_snapshot_mem_init(ab);
++		if (ret) {
++			ath12k_warn(ab, "failure in global mem init\n");
++			goto err_core_stop;
++		}
+ 		ret = ath12k_core_hw_group_start(ag);
+ 		if (ret) {
+ 			ath12k_warn(ab, "unable to start hw group\n");
+@@ -1875,6 +1943,35 @@ void ath12k_core_halt(struct ath12k *ar)
+ 	idr_init(&ar->txmgmt_idr);
+ }
+ 
++static void ath12k_core_mlo_hw_queues_stop(struct ath12k_hw_group *ag)
++{
++	struct ath12k_hw *ah;
++	int i;
++
++	lockdep_assert_held(&ag->mutex);
++
++	for (i = 0; i < ag->num_hw; i++) {
++		ah = ath12k_ag_to_ah(ag,i);
++		if (!ah)
++			continue;
++
++		wiphy_lock(ah->hw->wiphy);
++		/* If queue 0 is stopped, it is safe to assume that all
++		 * other queues are stopped by driver via
++		 * ieee80211_stop_queues() below. This means, there is
++		 * no need to stop it again and hence continue
++		 */
++
++		if (ieee80211_queue_stopped(ah->hw, 0)) {
++			wiphy_unlock(ah->hw->wiphy);
++			return;
++		}
++
++                ieee80211_stop_queues(ah->hw);
++		wiphy_unlock(ah->hw->wiphy);
++	}
++}
++
+ static void ath12k_core_pre_reconfigure_recovery(struct ath12k_base *ab)
+ {
+ 	struct ath12k_hw_group *ag = ab->ag;
+@@ -1893,26 +1990,16 @@ static void ath12k_core_pre_reconfigure_
+ 	for (i = 0; i < ag->num_hw; i++) {
+ 		ah = ath12k_ag_to_ah(ag, i);
+ 		if (!ah || ah->state == ATH12K_HW_STATE_OFF ||
+-		    ah->state == ATH12K_HW_STATE_TM)
++		    ah->state == ATH12K_HW_STATE_TM ||
++		    ah->state == ATH12K_HW_STATE_RESTARTING)
+ 			continue;
+ 
+-		wiphy_lock(ah->hw->wiphy);
+-
+-		/* If queue 0 is stopped, it is safe to assume that all
+-		 * other queues are stopped by driver via
+-		 * ieee80211_stop_queues() below. This means, there is
+-		 * no need to stop it again and hence continue
+-		 */
+-		if (ieee80211_queue_stopped(ah->hw, 0)) {
+-			wiphy_unlock(ah->hw->wiphy);
+-			continue;
+-		}
+-
+-		ieee80211_stop_queues(ah->hw);
+-
+ 		for (j = 0; j < ah->num_radio; j++) {
+ 			ar = &ah->radio[j];
+ 
++			if(ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1 && !ar->ab->is_reset)
++				continue;
++
+ 			list_for_each_entry(arvif, &ar->arvifs, list) {
+ 				if (arvif->is_started)
+ 					ath12k_debugfs_remove_interface(arvif);
+@@ -2004,6 +2091,10 @@ static void ath12k_core_post_reconfigure
+ 
+ 			for (j = 0; j < ah->num_radio; j++) {
+ 				ar = &ah->radio[j];
++
++				if(ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1 && !ar->ab->is_reset)
++					continue;
++
+ 				if (ar->scan.state == ATH12K_SCAN_RUNNING ||
+ 						ar->scan.state == ATH12K_SCAN_STARTING)
+ 					ar->scan.state = ATH12K_SCAN_ABORTING;
+@@ -2021,7 +2112,8 @@ static void ath12k_core_post_reconfigure
+ 			 */
+ 			for (j = 0; j < ah->num_radio; j++) {
+ 				ar = &ah->radio[j];
+-				ath12k_mac_dp_peer_cleanup(ar);
++				if(ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1 && ar->ab->is_reset)
++					ath12k_mac_dp_peer_cleanup(ar);
+ 			}
+ 
+ 			break;
+@@ -2167,10 +2259,105 @@ static void ath12k_core_update_userpd_st
+ 	}
+ }
+ 
++/* Asserted target's reboot handling for crash type ATH12K_RPROC_USERPD_CRASH */
++static void ath12k_core_upd_power_down(struct ath12k_base *ab)
++{
++	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++
++	/*
++	 * Stop user pd
++	 * Collect coredump using user pd
++	 */
++	if (ab_ahb->crash_type == ATH12K_RPROC_USERPD_CRASH) {
++		ath12k_hif_power_down(ab, false);
++		ath12k_coredump_ahb_collect(ab);
++	}
++
++	ab_ahb->crash_type = ATH12K_NO_CRASH;
++}
++
++/*
++ * Trigger umac_reset with umac_reset flag set. This is a
++ * waiting function which will return only after UMAC reset
++ * is complete on non-asserted chip set. UMAC reset completion
++ * is identified by waiting for MLO Teardown complete for all
++ * chipsets
++ */
++
++#define ATH12K_UMAC_RESET_TIMEOUT_IN_MS         1000
++static int ath12k_core_trigger_umac_reset(struct ath12k_base *ab)
++{
++	struct ath12k_hw_group *ag = ab->ag;
++	long time_left;
++	int ret = 0;
++
++	reinit_completion(&ag->umac_reset_complete);
++
++	ath12k_mac_mlo_teardown_with_umac_reset(ab);
++
++	time_left = wait_for_completion_timeout(&ag->umac_reset_complete,
++			msecs_to_jiffies(ATH12K_UMAC_RESET_TIMEOUT_IN_MS));
++
++	if (!time_left) {
++		ath12k_warn(ab, "UMAC reset didn't get completed within %d ms\n", ATH12K_UMAC_RESET_TIMEOUT_IN_MS);
++		ret = -ETIMEDOUT;
++	}
++
++	ag->trigger_umac_reset = false;
++	return ret;
++}
++
++static void ath12k_core_trigger_partner_device_crash(struct ath12k_base *ab)
++{
++	struct ath12k_hw_group *ag = ab->ag;
++	struct ath12k_ahb *ab_ahb = NULL;
++	struct ath12k_base *partner_ab;
++	int i;
++
++	lockdep_assert_held(&ag->mutex);
++
++	if (ab->hif.bus == ATH12K_BUS_AHB || ab->hif.bus == ATH12K_BUS_HYBRID)
++		ab_ahb = ath12k_ab_to_ahb(ab);
++
++	for (i = 0; i < ag->num_devices; i++) {
++		partner_ab = ag->ab[i];
++		if (ab == partner_ab)
++			continue;
++
++		/* If the partner chip is either AHB/Hybrid
++		 * and if it is a rootpd crash then the userpd
++		 * won't be responding to the FW Hang command
++		 * So skip to send it for AHB or Hybrid SOC's
++		 * in case of a rootpd crash as queueing this
++		 * reset_work will be taken care of AHB/Hybrid
++		 * inside ath12k_ahb_queue_all_userpd_reset().
++		 */
++		if (partner_ab->hif.bus != ATH12K_BUS_PCI && ab_ahb
++				&& ab_ahb->crash_type == ATH12K_RPROC_ROOTPD_CRASH)
++			continue;
++
++
++		/* issue FW Hang command on partner chips for Mode0. This is a fool proof
++		 * method to ensure recovery of all partner chips in MODE0 instead of
++		 * relying on firmware to crash partner chips
++		 */
++		if (!test_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags)) {
++			ath12k_info(ab, "sending fw_hang cmd to partner chipset(s)\n");
++			set_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags);
++			clear_bit(ATH12K_FLAG_UMAC_RECOVERY_START, &partner_ab->dev_flags);
++			partner_ab->qmi.num_radios = U8_MAX;
++			ath12k_wmi_force_fw_hang_cmd(partner_ab->pdevs[0].ar,
++					ATH12K_WMI_FW_HANG_ASSERT_TYPE,
++					ATH12K_WMI_FW_HANG_DELAY, true);
++		}
++	}
++}
++
+ static void ath12k_core_reset(struct work_struct *work)
+ {
+-	struct ath12k_base *ab = container_of(work, struct ath12k_base, reset_work);
++	struct ath12k_base *partner_ab, *ab = container_of(work, struct ath12k_base, reset_work);
+ 	struct ath12k_hw_group *ag = ab->ag;
++	struct ath12k_hw *ah;
+ 	int reset_count, fail_cont_count, i;
+ 	long time_left;
+ 
+@@ -2179,6 +2366,27 @@ static void ath12k_core_reset(struct wor
+ 		return;
+ 	}
+ 
++	ab->recovery_start = false;
++
++	if (ab->recovery_mode_address) {
++		switch (*ab->recovery_mode_address) {
++		case ATH12K_MLO_RECOVERY_MODE1:
++			ag->recovery_mode = ATH12K_MLO_RECOVERY_MODE1;
++			break;
++		case ATH12K_MLO_RECOVERY_MODE0:
++			fallthrough;
++		default:
++			ag->recovery_mode = ATH12K_MLO_RECOVERY_MODE0;
++		}
++
++		ath12k_dbg(ab, ATH12K_DBG_MODE1_RECOVERY,"mode:%d\n", ag->recovery_mode);
++	} else {
++		ag->recovery_mode = ATH12K_MLO_RECOVERY_MODE0;
++	}
++	if (ab->fw_recovery_support)
++		ath12k_info(ab, "Recovery is initiated with Mode%s\n",
++				(ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE0 ? "0" : "1"));
++
+ 	/* Sometimes the recovery will fail and then the next all recovery fail,
+ 	 * this is to avoid infinite recovery since it can not recovery success
+ 	 */
+@@ -2227,7 +2435,75 @@ static void ath12k_core_reset(struct wor
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_BOOT, "reset starting\n");
+ 
++	mutex_lock(&ag->mutex);
+ 	ab->is_reset = true;
++
++	ath12k_core_mlo_hw_queues_stop(ab->ag);
++
++	for (i = 0; i < ag->num_devices; i++) {
++		partner_ab = ag->ab[i];
++		if (ab == partner_ab)
++			continue;
++
++		/* Need to check partner_ab flag to select recovery mode
++		 * as Mode0, if continuous reset has happened
++		 */
++
++		if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1) {
++			if (test_bit(ATH12K_FLAG_UMAC_RECOVERY_START, &partner_ab->dev_flags) ||
++			    test_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags)) {
++				/* On receiving MHI Interrupt for pdev which is
++				 * already in UMAC Recovery, then fallback to
++				 * MODE0
++				 */
++				ag->recovery_mode = ATH12K_MLO_RECOVERY_MODE0;
++                        	ath12k_info(ab, "Recovery is falling back to Mode0 as one of the partner chip is already in recovery\n");
++				break;
++			} else {
++				/* Set dev flags to UMAC recovery START
++				 * and set flag to send teardown later
++				 */
++				ath12k_info(ab, "setting teardown to true\n");
++				set_bit(ATH12K_FLAG_UMAC_RECOVERY_START, &partner_ab->dev_flags);
++                        }
++                }
++        }
++
++	/* UMAC RESET relies on ag->num_started as barrier to make sure
++	 * umac related interrupts are received from all non-asserted chips
++	 * before writing to the shared memory. So need to decrement the
++	 * before trigerring umac reset.
++	 */
++	ath12k_core_to_group_ref_put(ab);
++
++	if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1) {
++		if (ath12k_core_trigger_umac_reset(ab) ||
++		    ath12k_mac_partner_peer_cleanup(ab)) {
++			/* Fallback to Mode0 if umac reset/peer_cleanup is
++			 * failed
++			 */
++			ag->recovery_mode = ATH12K_MLO_RECOVERY_MODE0;
++			/* TODO: DS: Handle any clean up necessary for Mode1 SSR */
++			ath12k_info(ab, "Recovery is falling back to Mode0\n");
++		} else {
++			/* wake queues here as ping should continue for
++			 * legacy clients in non-asserted chipsets
++			 */
++			for (i = 0; i < ag->num_hw; i++) {
++				ah = ag->ah[i];
++				if (!ah)
++					continue;
++
++				ieee80211_wake_queues(ah->hw);
++			}
++			ath12k_dbg(ab, ATH12K_DBG_MODE1_RECOVERY,
++					"Queues are started as umac reset is completed for partner chipset\n");
++		}
++	}
++
++	if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE0)
++		ath12k_core_trigger_partner_device_crash(ab);
++
+ 	/* prepare coredump */
+ 	if (ab->hif.bus == ATH12K_BUS_PCI) {
+ 		ath12k_coredump_download_rddm(ab);
+@@ -2239,6 +2515,7 @@ static void ath12k_core_reset(struct wor
+ 	atomic_set(&ab->recovery_count, 0);
+ 
+ 	ath12k_coredump_collect(ab);
++
+ 	ath12k_core_pre_reconfigure_recovery(ab);
+ 
+ 	ath12k_core_post_reconfigure_recovery(ab);
+@@ -2248,16 +2525,23 @@ static void ath12k_core_reset(struct wor
+ 	ath12k_hif_irq_disable(ab);
+ 	ath12k_hif_ce_irq_disable(ab);
+ 
+-	ath12k_hif_power_down(ab, false);
++	if (ab->hif.bus == ATH12K_BUS_PCI) {
++		ath12k_hif_power_down(ab, false);
++	} else {
++		ath12k_core_upd_power_down(ab);
++	}
+ 
+ 	/* prepare for power up */
+ 	ab->qmi.num_radios = U8_MAX;
+ 	//ab->single_chip_mlo_supp = false; TODO need to revisit
+ 
+-	mutex_lock(&ag->mutex);
+-	ath12k_core_to_group_ref_put(ab);
++	if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1)
++		ab->recovery_start = true;
+ 
+-	if (ag->num_started > 0) {
++	ab->recovery_mode_address = NULL;
++	ab->crash_info_address = NULL;
++
++	if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE0 && ag->num_started > 0) {
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT,
+ 			   "waiting for %d partner device(s) to reset\n",
+ 			   ag->num_started);
+@@ -2267,7 +2551,7 @@ static void ath12k_core_reset(struct wor
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+-		if (!ab)
++		if (!ab || !ab->is_reset)
+ 			continue;
+ 
+ 		ath12k_qmi_free_resource(ab);
+@@ -2337,6 +2621,7 @@ static struct ath12k_hw_group *ath12k_co
+ 	list_add(&ag->list, &ath12k_hw_group_list);
+ 	INIT_WORK(&ag->reset_group_work, ath12k_core_update_userpd_state);
+ 	mutex_init(&ag->mutex);
++	init_completion(&ag->umac_reset_complete);
+ 	ag->mlo_capable = false;
+ 	ag->recovery_mode = ATH12K_MLO_RECOVERY_MODE0;
+ 
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -335,6 +335,7 @@ enum ath12k_dev_flags {
+ 
+ enum ath12k_mlo_recovery_mode {
+ 	ATH12K_MLO_RECOVERY_MODE0 = 1,
++	ATH12K_MLO_RECOVERY_MODE1 = 2,
+ };
+ 
+ #define ATH12K_STATS_MGMT_FRM_TYPE_MAX 16
+@@ -837,6 +838,7 @@ struct ath12k_debug {
+ enum ath12k_fw_recovery_option {
+ 	 ATH12K_FW_RECOVERY_DISABLE = 0,
+ 	 ATH12K_FW_RECOVERY_ENABLE_AUTO, /* Automatically recover after FW assert */
++	 ATH12K_FW_RECOVERY_ENABLE_MODE1_AUTO,
+ 	 /* Enable only recovery. Send MPD SSR WMI */
+ 	 /* command to unlink UserPD assert from RootPD */
+ };
+@@ -1058,6 +1060,8 @@ struct ath12k {
+ 	u32 scan_min_rest_time;
+ 	u32 scan_max_rest_time;
+ 	s8 max_allowed_tx_power;
++
++	bool mlo_complete_event;
+ };
+ 
+ struct ath12k_hw {
+@@ -1164,6 +1168,7 @@ struct ath12k_mlo_memory {
+ 	struct target_mem_chunk chunk[ATH12K_QMI_WLANFW_MAX_NUM_MEM_SEG_V01];
+ 	int mlo_mem_size;
+ 	bool init_done;
++	bool is_mlo_mem_avail;
+ };
+ 
+ #define ATH12K_REPORT_LOW_ACK_NUM_PKT	0xFFFF
+@@ -1204,11 +1209,14 @@ struct ath12k_hw_group {
+ 	bool mlo_capable;
+ 	struct device_node *wsi_node[ATH12K_MAX_SOCS];
+ 	struct ath12k_mlo_memory mlo_mem;
++	struct ath12k_host_mlo_mem_arena mlomem_arena;
+ 	bool hw_link_id_init_done;
+ 	u8 num_userpd_started;
+ 	struct work_struct reset_group_work;
+ 	u32 recovery_mode;
+ 	struct ath12k_mlo_dp_umac_reset mlo_umac_reset;
++        struct completion umac_reset_complete;
++        bool trigger_umac_reset;
+ };
+ 
+ /* Holds WSI info specific to each device, excluding WSI group info */
+@@ -1386,6 +1394,10 @@ struct ath12k_base {
+ 
+ 	enum ath12k_fw_recovery_option fw_recovery_support;
+ 	u32 recovery_start_time;
++	bool recovery_start;
++
++        u32 *crash_info_address;
++        u32 *recovery_mode_address;
+ 
+ 	u32 fw_dbglog_param;
+ 	u64 fw_dbglog_val;
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -4094,6 +4094,40 @@ static const struct file_operations fops
+ 	.llseek = default_llseek,
+ };
+ 
++static void ath12k_debug_multipd_wmi_pdev_set_param(struct ath12k_base *ab,
++						    const unsigned int value)
++{
++	struct ath12k_pdev *pdev;
++	struct ath12k *ar;
++	bool assert_userpd;
++	int i;
++
++	if (ab->hif.bus == ATH12K_BUS_PCI)
++		return;
++
++	for (i = 0; i < ab->num_radios; i++) {
++		pdev = &ab->pdevs[i];
++		ar = pdev->ar;
++
++		/* Set pdev param to let firmware know which pd to use for
++		 * sending fatal IRQ.
++		 * Non-MLO, fatal error comes from asserted radios's user pd
++		 * MLO, fatal error comes from asserted radio's root pd
++		 */
++		if (!ab->ag->mlo_capable) {
++			assert_userpd = true;
++		} else {
++			if (value == ATH12K_FW_RECOVERY_DISABLE)
++				assert_userpd = false;
++			else
++				assert_userpd = true;
++		}
++
++		ath12k_wmi_pdev_set_param(ar, WMI_PDEV_PARAM_MPD_USERPD_SSR,
++					  assert_userpd, ar->pdev->pdev_id);
++	}
++}
++
+ void ath12k_send_fw_hang_cmd(struct ath12k_base *ab,
+                             unsigned int value)
+ {
+@@ -4107,8 +4141,8 @@ void ath12k_send_fw_hang_cmd(struct ath1
+ 	if (!value)
+ 		recovery_mode = ATH12K_WMI_DISABLE_FW_RECOVERY;
+ 	else
+-		recovery_mode = (value == ATH12K_FW_RECOVERY_ENABLE_AUTO) ?
+-			ATH12K_WMI_FW_HANG_RECOVERY_MODE0 : ATH12K_WMI_DISABLE_FW_RECOVERY;
++		recovery_mode = (value == ATH12K_FW_RECOVERY_ENABLE_MODE1_AUTO) ?
++			ATH12K_WMI_FW_HANG_RECOVERY_MODE1 : ATH12K_WMI_FW_HANG_RECOVERY_MODE0;
+ 
+ 	if (ag->mlo_capable) {
+ 		for (i = 0; i < ag->num_devices; i++) {
+@@ -4123,7 +4157,7 @@ void ath12k_send_fw_hang_cmd(struct ath1
+ 			 * TLV, need to check WMI caps once the support is
+ 			 * added from FW.
+ 			 */
+-			//if (ab->recovery_mode_address) {
++			if (ab->recovery_mode_address) {
+ 				for (radio_idx = 0; radio_idx < ab->num_radios; radio_idx++) {
+ 
+ 					pdev = &ab->pdevs[radio_idx];
+@@ -4135,13 +4169,14 @@ void ath12k_send_fw_hang_cmd(struct ath1
+ 				}
+ 
+ 				if (radioup) {
++					ath12k_debug_multipd_wmi_pdev_set_param(ab, ab->fw_recovery_support);
+ 					ret = ath12k_wmi_force_fw_hang_cmd(ar,
+ 									   recovery_mode,
+ 									   ATH12K_WMI_FW_HANG_DELAY, false);
+ 					ath12k_info(ab, "setting FW assert mode [%d] ret [%d]\n", recovery_mode, ret);
+ 				} else
+ 					continue;
+-			//}
++			}
+ 		}
+ 	}
+ }
+@@ -4158,8 +4193,8 @@ static ssize_t ath12k_debug_write_fw_rec
+ 		return -EINVAL;
+ 
+ 	if (value < ATH12K_FW_RECOVERY_DISABLE ||
+-	    value > ATH12K_FW_RECOVERY_ENABLE_AUTO) {
+-		ath12k_warn(ab, "Please enter: 0 = Disable, 1 = Enable (auto recovery)");
++	    value > ATH12K_FW_RECOVERY_ENABLE_MODE1_AUTO) {
++		ath12k_warn(ab, "Please enter: 0 = Disable, 1 = Mode - 0 recovery 2 = Mode - 1 recovery\n");
+ 		ret = -EINVAL;
+ 		goto exit;
+ 	}
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -1262,6 +1262,92 @@ void ath12k_mac_link_sta_rhash_cleanup(v
+ 	}
+ }
+ 
++static void ath12k_mac_dec_num_stations(struct ath12k_link_vif *arvif,
++					struct ath12k_link_sta *arsta)
++{
++	struct ieee80211_sta *sta = ath12k_ahsta_to_sta(arsta->ahsta);
++	struct ath12k *ar = arvif->ar;
++
++	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
++
++	if (arvif->ahvif->vdev_type == WMI_VDEV_TYPE_STA && !sta->tdls)
++		return;
++
++	WARN_ON(!ar->num_stations);
++	if (ar->num_stations)
++		ar->num_stations--;
++}
++
++int ath12k_mac_partner_peer_cleanup(struct ath12k_base *ab)
++{
++	struct ath12k_base *partner_ab;
++	struct ath12k_hw_group *ag = ab->ag;
++	struct ath12k_link_vif *arvif;
++	struct ath12k_vif *ahvif;
++	struct ieee80211_sta *sta;
++	struct ieee80211_vif *vif;
++	struct ath12k_sta *ahsta;
++	struct ath12k_link_sta *arsta;
++	struct ath12k_dp_link_peer *peer, *tmp;
++	struct ath12k *ar;
++	struct ath12k_hw *ah = ath12k_ag_to_ah(ag,0);
++	struct wiphy *wiphy = ah->hw->wiphy;
++	int idx, ret = 0;
++	u8 link_id;
++
++	wiphy_lock(wiphy);
++
++	for (idx = 0; idx < ag->num_devices; idx++) {
++		partner_ab = ag->ab[idx];
++
++		if (ab == partner_ab)
++			continue;
++
++		list_for_each_entry_safe(peer, tmp, &partner_ab->dp->peers, list) {
++			if (!peer->sta || !peer->mlo || !peer->vif)
++				continue;
++
++			link_id = peer->link_id;
++			/* get arsta */
++			sta = peer->sta;
++			ahsta = ath12k_sta_to_ahsta(sta);
++			arsta = ahsta->link[link_id];
++
++			/* get arvif */
++			vif = peer->vif;
++			ahvif = (struct ath12k_vif *)vif->drv_priv;
++			/* TODO: re-write this function or check if a data
++			 * structure needs to be modified to make a critical
++			 * section short.
++			 */
++			arvif = wiphy_dereference(wiphy, ahvif->link[link_id]);
++
++			ar = arvif->ar;
++			if (!ar)
++			continue;
++
++			ret = ath12k_peer_delete(ar, arvif->vdev_id, arsta->addr);
++			if (ret) {
++				ath12k_err(partner_ab,
++					   "failed to delete peer vdev_id %d addr %pM ret %d\n",
++					   arvif->vdev_id, arsta->addr, ret);
++				continue;
++			}
++
++			spin_lock_bh(&partner_ab->base_lock);
++			ath12k_link_sta_rhash_delete(partner_ab, arsta);
++			spin_unlock_bh(&partner_ab->base_lock);
++
++			arvif->num_stations--;
++			ath12k_mac_dec_num_stations(arvif, arsta);
++			wiphy_work_cancel(wiphy, &arsta->update_wk);
++		}
++	}
++
++	wiphy_unlock(wiphy);
++	return ret;
++}
++
+ void ath12k_mac_peer_cleanup_all(struct ath12k *ar)
+ {
+ 	struct ath12k_dp_link_peer *peer, *tmp;
+@@ -8458,22 +8544,6 @@ static int ath12k_mac_inc_num_stations(s
+ 	return 0;
+ }
+ 
+-static void ath12k_mac_dec_num_stations(struct ath12k_link_vif *arvif,
+-					struct ath12k_link_sta *arsta)
+-{
+-	struct ieee80211_sta *sta = ath12k_ahsta_to_sta(arsta->ahsta);
+-	struct ath12k *ar = arvif->ar;
+-
+-	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
+-
+-	if (arvif->ahvif->vdev_type == WMI_VDEV_TYPE_STA && !sta->tdls)
+-		return;
+-
+-	WARN_ON(!ar->num_stations);
+-	if (ar->num_stations)
+-		ar->num_stations--;
+-}
+-
+ static void ath12k_mac_station_post_remove(struct ath12k *ar,
+ 					   struct ath12k_link_vif *arvif,
+ 					   struct ath12k_link_sta *arsta)
+@@ -18465,7 +18535,7 @@ static int __ath12k_mac_mlo_setup(struct
+ 	return 0;
+ }
+ 
+-static int __ath12k_mac_mlo_teardown(struct ath12k *ar)
++static int __ath12k_mac_mlo_teardown(struct ath12k *ar, bool umac_reset)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+ 	int ret;
+@@ -18479,7 +18549,7 @@ static int __ath12k_mac_mlo_teardown(str
+ 	if (num_link == 0)
+ 		return 0;
+ 
+-	ret = ath12k_wmi_mlo_teardown(ar);
++	ret = ath12k_wmi_mlo_teardown(ar, umac_reset);
+ 	if (ret) {
+ 		ath12k_warn(ab, "failed to send MLO teardown WMI command for pdev %d: %d\n",
+ 			    ar->pdev_idx, ret);
+@@ -18491,6 +18561,48 @@ static int __ath12k_mac_mlo_teardown(str
+ 	return 0;
+ }
+ 
++int ath12k_mac_mlo_teardown_with_umac_reset(struct ath12k_base *ab)
++{
++	struct ath12k_hw_group *ag = ab->ag;
++	struct ath12k_hw* ah;
++	int i, j, ret = 0;
++	struct ath12k *ar;
++	bool umac_reset;
++
++	for(i = 0; i < ag->num_hw; i++){
++		ah = ag->ah[i];
++		if (!ah)
++			continue;
++
++		for_each_ar(ah, ar, j) {
++			ar = &ah->radio[j];
++
++			if (ar->ab == ab) {
++				/* No need to send teardown event for asserted
++				 * chip, as anyway there will be no completion
++				 * event from FW.
++				 */
++				ar->mlo_complete_event = true;
++				continue;
++			}
++
++			/* Need to umac_reset as 1 for only one chip */
++			umac_reset = false;
++			if (!ag->trigger_umac_reset) {
++                                umac_reset = true;
++                                ag->trigger_umac_reset = true;
++                        }
++
++			ret = __ath12k_mac_mlo_teardown(ar, umac_reset);
++			if (ret)
++				goto out;
++		}
++	}
++
++out:
++        return ret;
++}
++
+ int ath12k_mac_mlo_setup(struct ath12k_hw_group *ag)
+ {
+ 	struct ath12k_hw *ah;
+@@ -18526,7 +18638,7 @@ err_setup:
+ 			if (!ar)
+ 				continue;
+ 
+-			__ath12k_mac_mlo_teardown(ar);
++			__ath12k_mac_mlo_teardown(ar, false);
+ 		}
+ 	}
+ 
+@@ -18546,7 +18658,7 @@ void ath12k_mac_mlo_teardown(struct ath1
+ 
+ 		for_each_ar(ah, ar, j) {
+ 			ar = &ah->radio[j];
+-			ret = __ath12k_mac_mlo_teardown(ar);
++			ret = __ath12k_mac_mlo_teardown(ar, false);
+ 			if (ret) {
+ 				ath12k_err(ar->ab, "failed to teardown MLO: %d\n", ret);
+ 				break;
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -183,6 +183,8 @@ int ath12k_mac_vdev_stop(struct ath12k_l
+ void ath12k_mac_get_any_chanctx_conf_iter(struct ieee80211_hw *hw,
+ 					  struct ieee80211_chanctx_conf *conf,
+ 					  void *data);
++int ath12k_mac_mlo_teardown_with_umac_reset(struct ath12k_base *ab);
++int ath12k_mac_partner_peer_cleanup(struct ath12k_base *ab);
+ u16 ath12k_mac_he_convert_tones_to_ru_tones(u16 tones);
+ enum nl80211_eht_ru_alloc ath12k_mac_eht_ru_tones_to_nl80211_eht_ru_alloc(u16 ru_tones);
+ enum nl80211_eht_gi ath12k_mac_eht_gi_to_nl80211_eht_gi(u8 sgi);
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -3792,11 +3792,27 @@ void ath12k_qmi_reset_mlo_mem(struct ath
+ 	}
+ }
+ 
++/**
++ * ath12k_free_mlo_glb_per_device_crash_info() - Free MLO per_device crash info
++ * @snapshot_info: Pointer to MLO Global crash info
++ *
++ * Return: None
++ */
++static void ath12k_free_mlo_glb_per_device_crash_info(
++	struct ath12k_host_mlo_glb_device_crash_info *global_device_crash_info)
++{
++	if (global_device_crash_info->per_device_crash_info) {
++		kfree(global_device_crash_info->per_device_crash_info);
++		global_device_crash_info->per_device_crash_info = NULL;
++	}
++}
++
+ static void ath12k_qmi_free_mlo_mem_chunk(struct ath12k_base *ab,
+ 					  struct target_mem_chunk *chunk,
+ 					  int idx)
+ {
+ 	struct ath12k_hw_group *ag = ab->ag;
++	struct ath12k_host_mlo_mem_arena *mlomem_arena_ctx = &ag->mlomem_arena;
+ 	struct target_mem_chunk *mlo_chunk;
+ 	bool fixed_mem;
+ 
+@@ -3826,12 +3842,20 @@ static void ath12k_qmi_free_mlo_mem_chun
+ 
+ 	mlo_chunk->paddr = 0;
+ 	mlo_chunk->size = 0;
++	ag->mlo_mem.is_mlo_mem_avail = false;
+ 	if (fixed_mem)
+ 		chunk->v.ioaddr = NULL;
+ 	else
+ 		chunk->v.addr = NULL;
++
+ 	chunk->paddr = 0;
+ 	chunk->size = 0;
++
++	if (mlomem_arena_ctx->init_done) {
++		mlomem_arena_ctx->init_done = false;
++		ath12k_free_mlo_glb_per_device_crash_info
++			(&mlomem_arena_ctx->global_device_crash_info);
++	}
+ }
+ 
+ static void ath12k_qmi_free_target_mem_chunk(struct ath12k_base *ab)
+@@ -3862,6 +3886,8 @@ static void ath12k_qmi_free_target_mem_c
+ 		}
+ 	}
+ 
++	ab->host_ddr_fixed_mem_off = 0;
++
+ 	if (!ag->num_started && ag->mlo_mem.init_done) {
+ 		ag->mlo_mem.init_done = false;
+ 		ag->mlo_mem.mlo_mem_size = 0;
+@@ -3970,6 +3996,7 @@ static int ath12k_qmi_alloc_target_mem_c
+ 
+ 			chunk->paddr = mlo_chunk->paddr;
+ 			chunk->v.addr = mlo_chunk->v.addr;
++			ag->mlo_mem.is_mlo_mem_avail = true;
+ 			mlo_idx++;
+ 
+ 			break;
+@@ -4011,6 +4038,190 @@ err:
+ 	return ret;
+ }
+ 
++static void
++ath12k_mgmt_mlo_global_per_device_crash_info_tlv(struct ath12k_base *ab, const void *ptr,
++					       size_t len, u8 cur_device_id,
++					       struct ath12k_host_mlo_glb_per_device_crash_info *per_device_crash_info)
++{
++	struct mlo_glb_per_device_crash_info *tlv_data;
++	u8 *crash_reason, *recovery_mode;
++
++	tlv_data = (struct mlo_glb_per_device_crash_info *)ptr;
++	per_device_crash_info->device_id = cur_device_id;
++	crash_reason = (u8 *)&tlv_data->crash_reason;
++	recovery_mode = (u8 *)&tlv_data->recovery_mode;
++
++	per_device_crash_info->crash_reason = (void *)crash_reason;
++	per_device_crash_info->recovery_mode = (void *)recovery_mode;
++
++	return;
++}
++
++static int
++ath12k_mgmt_mlo_global_device_crash_info(struct ath12k_base *ab,
++				       const void *ptr,
++				       size_t len,
++				       struct ath12k_host_mlo_glb_device_crash_info *global_device_crash_info)
++{
++	u32 device_info;
++	struct mlo_glb_device_crash_info *tlv_data;
++
++	tlv_data = (struct  mlo_glb_device_crash_info *)ptr;
++	device_info = tlv_data->device_info;
++
++	global_device_crash_info->no_of_devices =
++			MLO_SHMEM_CHIP_CRASH_INFO_PARAM_NO_OF_DEVICES_GET(device_info);
++	global_device_crash_info->valid_devices_bmap =
++			MLO_SHMEM_CHIP_CRASH_INFO_PARAM_VALID_DEVICE_BMAP_GET(device_info);
++
++       /* Allocate memory to extrace per chip crash info */
++        global_device_crash_info->per_device_crash_info = kmalloc_array(
++						global_device_crash_info->no_of_devices,
++						sizeof(*global_device_crash_info->per_device_crash_info),
++						GFP_KERNEL);
++
++	if (!global_device_crash_info->per_device_crash_info) {
++		ath12k_warn(ab, "Couldn't allocate memory for per chip crash info!\n");
++		return -ENOBUFS;
++	}
++
++	return 0;
++}
++
++static const struct ath12k_qmi_shmem_tlv_policy ath12k_qmi_tlv_policies[] = {
++	[ATH12K_MLO_SHMEM_TLV_STRUCT_MLO_GLB_DEVICE_CRASH_INFO] =
++			{ .min_len = sizeof(struct mlo_glb_device_crash_info) },
++	[ATH12K_MLO_SHMEM_TLV_STRUCT_MLO_GLB_PER_DEVICE_CRASH_INFO] =
++			{ .min_len = sizeof(struct mlo_glb_per_device_crash_info) },
++};
++
++/* TODO:Calculate this dynamically in cleanup*/
++#define QMI_TLV_MAX_LEN	424
++
++/**
++ * ath12k_qmi_parse_mlo_mem_arena() - Parse MLO Global shared memory arena
++ * @ptr: Pointer to the start address of MLO memory
++ * @len: MLO memory size in bytes
++ * @mlomem_arena_ctx: Pointer to MLO Global shared memory arena context.
++ * Extracted information will be populated in this data structure.
++ *
++ * Return: On success, the number of bytes parsed. On failure, errno is returned.
++*/
++
++static int ath12k_qmi_parse_mlo_mem_arena(struct ath12k_base *ab,
++                                          const void *ptr, size_t len,
++        struct ath12k_host_mlo_mem_arena *mlomem_arena_ctx)
++{
++	int parsed_bytes = 0, ret = 0;
++	const struct wmi_tlv *tlv;
++	u16 tlv_tag, tlv_len;
++	u8 valid_devices_bmap = 0, cur_device_id;
++	struct ath12k_host_mlo_glb_device_crash_info *global_device_crash_info;
++	struct ath12k_host_mlo_glb_per_device_crash_info *per_device_crash_info;
++
++	if (!ptr)
++		return -EINVAL;
++
++	while (len > parsed_bytes && parsed_bytes < QMI_TLV_MAX_LEN) {
++		if (len < sizeof(*tlv)) {
++			ath12k_err(ab, "tlv parse failure (%zu bytes left, %zu expected)\n",
++					len, sizeof(*tlv));
++			return -EINVAL;
++		}
++		tlv = ptr;
++		tlv_tag = le32_get_bits(tlv->header, WMI_TLV_TAG);
++		tlv_len = le32_get_bits(tlv->header, WMI_TLV_LEN);
++		ptr += sizeof(*tlv);
++		parsed_bytes += sizeof(*tlv);
++
++		if (tlv_len > len - parsed_bytes) {
++			ath12k_err(ab, "qmi tlv parse failure of tag %u (%zu bytes left, %u expected)\n",
++					tlv_tag, len - parsed_bytes, tlv_len);
++			return -EINVAL;
++		}
++
++		if (tlv_tag < ARRAY_SIZE(ath12k_qmi_tlv_policies) &&
++		    ath12k_qmi_tlv_policies[tlv_tag].min_len &&
++		    ath12k_qmi_tlv_policies[tlv_tag].min_len > tlv_len) {
++			ath12k_err(ab, "qmi tlv parse failure of tag %u at byte %zd (%u bytes is less than min length %zu)\n",
++				   tlv_tag, len - parsed_bytes, tlv_len,
++				   ath12k_qmi_tlv_policies[tlv_tag].min_len);
++			return -EINVAL;
++		}
++
++		switch(tlv_tag) {
++		case ATH12K_MLO_SHMEM_TLV_STRUCT_MLO_GLB_DEVICE_CRASH_INFO:
++			global_device_crash_info = &mlomem_arena_ctx->global_device_crash_info;
++			ret = ath12k_mgmt_mlo_global_device_crash_info(ab, ptr, len,
++								     global_device_crash_info);
++			if (ret < 0){
++				ath12k_info(ab,"failed to parse %d so can't proceed to parse per chip crash info\n",tlv_tag);
++				return ret;
++			}
++			valid_devices_bmap = global_device_crash_info->valid_devices_bmap;
++			break;
++		case ATH12K_MLO_SHMEM_TLV_STRUCT_MLO_GLB_PER_DEVICE_CRASH_INFO:
++			if(!valid_devices_bmap) {
++				ath12k_info(ab,"This TLV is not expected as the valid_devices_bmap is 0\n");
++				break;
++			}
++			cur_device_id = ffs(valid_devices_bmap) - 1;
++			valid_devices_bmap &= ~BIT(cur_device_id);
++
++			per_device_crash_info = &global_device_crash_info->per_device_crash_info[cur_device_id];
++			ath12k_mgmt_mlo_global_per_device_crash_info_tlv(ab, ptr, len, cur_device_id,
++								       per_device_crash_info);
++			break;
++		default:
++			ath12k_dbg(ab, ATH12K_DBG_QMI,"Un supported tag %d skiping this TLV\n",tlv_tag);
++			break;
++		}
++		ptr += tlv_len;
++		parsed_bytes += tlv_len;
++	}
++
++        return parsed_bytes;
++}
++
++int ath12k_qmi_mlo_global_snapshot_mem_init(struct ath12k_base *ab)
++{
++	struct ath12k_host_mlo_mem_arena *mlomem_arena_ctx = &ab->ag->mlomem_arena;
++	struct ath12k_hw_group *ag = ab->ag;
++	struct target_mem_chunk *mlo_chunk;
++	int ret = 0, mlo_idx = 0;
++
++	if (!ag->mlo_mem.is_mlo_mem_avail)
++		return 0;
++
++	mlo_chunk = &ab->ag->mlo_mem.chunk[mlo_idx];
++
++	/* We need to initialize only for the first invocation */
++	if (mlomem_arena_ctx->init_done)
++		return 0;
++
++	if (test_bit(ATH12K_FLAG_FIXED_MEM_REGION, &ab->dev_flags))
++		ret = ath12k_qmi_parse_mlo_mem_arena(ab,
++						mlo_chunk->v.ioaddr,
++						mlo_chunk->size,
++						mlomem_arena_ctx);
++	else
++		ret = ath12k_qmi_parse_mlo_mem_arena(ab,
++						mlo_chunk->v.addr,
++						mlo_chunk->size,
++						mlomem_arena_ctx);
++
++	if (ret < 0) {
++		ath12k_err(ab, "parsing of mlo shared memory failed ret %d\n", ret);
++		ath12k_free_mlo_glb_per_device_crash_info
++			(&mlomem_arena_ctx->global_device_crash_info);
++		return ret;
++	}
++
++	mlomem_arena_ctx->init_done = true;
++
++	return 0;
++}
++
+ #define MAX_TGT_MEM_MODES 5
+ static int ath12k_qmi_assign_target_mem_chunk(struct ath12k_base *ab)
+ {
+@@ -4194,6 +4405,7 @@ static int ath12k_qmi_assign_target_mem_
+ 					ret = -EINVAL;
+ 					goto out;
+ 			}
++			ag->mlo_mem.is_mlo_mem_avail = true;
+ 			idx++;
+ 			break;
+ 		case AFC_REGION_TYPE:
+--- a/drivers/net/wireless/ath/ath12k/qmi.h
++++ b/drivers/net/wireless/ath/ath12k/qmi.h
+@@ -886,6 +886,99 @@ struct wlfw_ini_resp_msg_v01 {
+ 	struct qmi_response_type_v01 resp;
+ };
+ 
++enum {
++        ATH12K_MLO_SHMEM_TLV_STRUCT_MGMT_RX_REO_SNAPSHOT,
++        ATH12K_MLO_SHMEM_TLV_STRUCT_MLO_GLB_RX_REO_PER_LINK_SNAPSHOT_INFO,
++        ATH12K_MLO_SHMEM_TLV_STRUCT_MLO_GLB_RX_REO_SNAPSHOT_INFO,
++        ATH12K_MLO_SHMEM_TLV_STRUCT_MLO_GLB_LINK,
++        ATH12K_MLO_SHMEM_TLV_STRUCT_MLO_GLB_LINK_INFO,
++        ATH12K_MLO_SHMEM_TLV_STRUCT_MLO_GLB_H_SHMEM,
++        ATH12K_MLO_SHMEM_TLV_STRUCT_MLO_GLB_DEVICE_CRASH_INFO,
++        ATH12K_MLO_SHMEM_TLV_STRUCT_MLO_GLB_PER_DEVICE_CRASH_INFO,
++};
++
++/**
++ * Macros for getting and setting the required number of bits
++ * from the TLV params.
++ */
++#define ATH12K_MLO_SHMEM_GET_BITS(_val, _index, _num_bits) \
++        (((_val) >> (_index)) & ((1 << (_num_bits)) - 1))
++
++#define MLO_SHMEM_CHIP_CRASH_INFO_PARAM_NO_OF_DEVICES_GET(device_info) \
++        ATH12K_MLO_SHMEM_GET_BITS(device_info, 0, 2) + \
++        (ATH12K_MLO_SHMEM_GET_BITS(device_info, 12, 4) << 2)
++#define MLO_SHMEM_CHIP_CRASH_INFO_PARAM_VALID_DEVICE_BMAP_GET(device_info) \
++        ATH12K_MLO_SHMEM_GET_BITS(device_info, 2, 8)
++struct mlo_glb_device_crash_info {
++	/**
++	 * [1:0]:  no_of_devices
++	 * [4:2]:  valid_devices_bmap
++	 * For number of chips beyond 3, extension fields are added.
++	 * [9:5]:  valid_devices_bmap_ext
++	 * [15:12]: no_of_devices_ext
++	 * [31:16]: reserved
++	 */
++	u32 device_info;
++	/*
++	 * This TLV is followed by array of mlo_glb_per_device_crash_info:
++	 * mlo_glb_per_device_crash_info will have multiple instances equal to
++	 * num of partner devices received by no_of_chips
++	 * mlo_glb_per_device_crash_info per_device_crash_info[];
++	 */
++};
++
++struct mlo_glb_per_device_crash_info {
++	/*
++	 * crash reason, takes value in enum ath12k_mlo_chip_crash_reason
++         */
++        u32 crash_reason;
++
++        /*
++         * recovery mode, takes value in enum ath12k_mlo_recovery_mode
++         */
++        u32 recovery_mode;
++};
++
++/**
++ * ath12k_host_mlo_glb_per_device_crash_info - per chip crash
++ * information in MLO global shared memory
++ * @device_id: MLO chip id
++ * @crash_reason: Address of the crash_reason corresponding to device_id
++ * recovery_mode: Address of recovery mode corressponding to device_id
++ */
++struct ath12k_host_mlo_glb_per_device_crash_info {
++        u8 device_id;
++        void *crash_reason;
++        void *recovery_mode;
++};
++
++/**
++ * ath12k_host_mlo_glb_device_crash_info - chip crash information in MLO
++ * global shared memory
++ * @no_of_devices: No of partner chip to which crash information is shared
++ * @valid_devices_bmap: Valid chip bitmap
++ * @per_device_crash_info: pointer to per chip crash information.
++ */
++struct ath12k_host_mlo_glb_device_crash_info {
++	u8 no_of_devices;
++	u8 valid_devices_bmap;
++	struct ath12k_host_mlo_glb_per_device_crash_info *per_device_crash_info;
++};
++
++/**
++ * ath12k_host_mlo_mem_arena - MLO Global shared memory arena context
++ * @global_device_crash_info: shared memory for crash info, recovery info
++ * @init_done: Initialized snapshot info
++ */
++struct ath12k_host_mlo_mem_arena {
++	struct ath12k_host_mlo_glb_device_crash_info global_device_crash_info;
++        bool init_done;
++};
++
++struct ath12k_qmi_shmem_tlv_policy {
++	size_t min_len;
++};
++
+ int ath12k_qmi_firmware_start(struct ath12k_base *ab,
+ 			      u32 mode);
+ void ath12k_qmi_firmware_stop(struct ath12k_base *ab);
+@@ -900,4 +993,5 @@ int ath12k_qmi_m3_dump_upload_done_ind_s
+ int ath12k_send_qdss_trace_mode_req(struct ath12k_base *ab,
+ 				    enum qmi_wlanfw_qdss_trace_mode_enum_v01 mode, u64 value);
+ int ath12k_enable_fwlog(struct ath12k_base *ab);
++int ath12k_qmi_mlo_global_snapshot_mem_init(struct ath12k_base *ab);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -10712,8 +10712,12 @@ static void ath12k_wmi_event_teardown_co
+ 					       struct sk_buff *skb)
+ {
+ 	const struct wmi_mlo_teardown_complete_event *ev;
++	struct ath12k_hw_group *ag = ab->ag;
++	bool complete_flag = true;
++	struct ath12k_hw *ah;
++	struct ath12k *ar;
+ 	const void **tb;
+-	int ret;
++	int i, j, ret;
+ 
+ 	tb = ath12k_wmi_tlv_parse_alloc(ab, skb, GFP_ATOMIC);
+ 	if (IS_ERR(tb)) {
+@@ -10730,6 +10734,31 @@ static void ath12k_wmi_event_teardown_co
+ 	}
+ 
+ 	kfree(tb);
++
++	ar = ath12k_mac_get_ar_by_pdev_id(ab, ev->pdev_id);
++	if (!ar) {
++		ath12k_warn(ab, "invalid pdev id in teardown complete ev %d",
++			    ev->pdev_id);
++		return;
++	}
++	ar->mlo_complete_event = true;
++
++	for (i = 0; i < ag->num_hw; i++) {
++		ah = ag->ah[i];
++		if (!ah)
++			continue;
++
++		for_each_ar(ah, ar, j) {
++			ar = &ah->radio[j];
++
++			if (!ar->mlo_complete_event)
++				complete_flag = false;
++		}
++	}
++
++        if (complete_flag && ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1)
++                complete(&ag->umac_reset_complete);
++
+ }
+ 
+ #ifdef CPTCFG_ATH12K_DEBUGFS
+@@ -13865,6 +13894,7 @@ int ath12k_wmi_mlo_setup(struct ath12k *
+ 		return ret;
+ 	}
+ 
++	ar->mlo_complete_event = false;
+ 	return 0;
+ }
+ 
+@@ -13896,7 +13926,7 @@ int ath12k_wmi_mlo_ready(struct ath12k *
+ 	return 0;
+ }
+ 
+-int ath12k_wmi_mlo_teardown(struct ath12k *ar)
++int ath12k_wmi_mlo_teardown(struct ath12k *ar, bool umac_reset)
+ {
+ 	struct wmi_mlo_teardown_cmd *cmd;
+ 	struct ath12k_wmi_pdev *wmi = ar->wmi;
+@@ -13913,6 +13943,7 @@ int ath12k_wmi_mlo_teardown(struct ath12
+ 						 sizeof(*cmd));
+ 	cmd->pdev_id = cpu_to_le32(ar->pdev->pdev_id);
+ 	cmd->reason_code = WMI_MLO_TEARDOWN_SSR_REASON;
++	cmd->umac_reset = umac_reset;
+ 
+ 	ret = ath12k_wmi_cmd_send(wmi, skb, WMI_MLO_TEARDOWN_CMDID);
+ 	if (ret) {
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -1171,6 +1171,7 @@ enum wmi_tlv_pdev_param {
+ 	WMI_PDEV_PARAM_SET_CMD_OBSS_PD_THRESHOLD = 0xbc,
+ 	WMI_PDEV_PARAM_SET_CMD_OBSS_PD_PER_AC = 0xbe,
+ 	WMI_PDEV_PARAM_ENABLE_SR_PROHIBIT = 0xc6,
++	WMI_PDEV_PARAM_MPD_USERPD_SSR = 0xce,
+ };
+ 
+ enum wmi_tlv_vdev_param {
+@@ -6741,6 +6742,7 @@ struct wmi_mlo_teardown_cmd {
+ 	__le32 tlv_header;
+ 	__le32 pdev_id;
+ 	__le32 reason_code;
++	__le32 umac_reset;
+ } __packed;
+ 
+ struct wmi_mlo_setup_complete_event {
+@@ -7937,7 +7939,7 @@ int ath12k_wmi_sta_keepalive(struct ath1
+ 			     const struct wmi_sta_keepalive_arg *arg);
+ int ath12k_wmi_mlo_setup(struct ath12k *ar, struct wmi_mlo_setup_arg *mlo_params);
+ int ath12k_wmi_mlo_ready(struct ath12k *ar);
+-int ath12k_wmi_mlo_teardown(struct ath12k *ar);
++int ath12k_wmi_mlo_teardown(struct ath12k *ar, bool umac_reset);
+ void ath12k_wmi_fw_stats_dump(struct ath12k *ar,
+ 			      struct ath12k_fw_stats *fw_stats, u32 stats_id,
+ 			      char *buf);

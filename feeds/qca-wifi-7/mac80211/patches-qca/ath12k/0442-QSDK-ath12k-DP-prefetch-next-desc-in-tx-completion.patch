@@ -1,0 +1,111 @@
+From b466572005cda54856739d8f07e8726db90f63ce Mon Sep 17 00:00:00 2001
+From: Thiraviyam Mariyappan <tmariyap@qti.qualcomm.com>
+Date: Tue, 22 Jul 2025 18:15:00 +0530
+Subject: [PATCH 1/2] QSDK:ath12k:DP: prefetch next desc in tx completion
+
+In the DP TX completion handler, prefetching the next descriptor reduces
+cache misses and improves throughput. Also removed the software cookie
+based TX descriptor fetch, as all descriptors now use hardware cookie
+conversion.
+
+Patch-dependency: none
+
+Signed-off-by: Thiraviyam Mariyappan <tmariyap@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c | 37 ++++++++++---------
+ drivers/net/wireless/ath/ath12k/wifi7/hal.h   |  8 ++++
+ 2 files changed, 28 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+index 3165b73..38576e3 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -1422,12 +1422,12 @@ int ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id, int
+ 	struct ath12k_pdev_dp *dp_pdev;
+ 	int hal_ring_id = dp->tx_ring[ring_id].tcl_comp_ring.ring_id;
+ 	struct hal_srng *status_ring = &ab->hal.srng_list[hal_ring_id];
+-	struct ath12k_tx_desc_info *tx_desc = NULL;
++	struct ath12k_tx_desc_info *tx_desc = NULL, *next_tx_desc = NULL;
+ 	struct hal_tx_status ts = { 0 };
+ 	struct dp_tx_ring *tx_ring = &dp->tx_ring[ring_id];
+-	struct hal_wbm_release_ring *desc;
++	struct hal_wbm_release_ring *desc, *next_desc;
+ 	u8 pdev_id;
+-	u64 desc_va;
++	u64 desc_va, next_desc_va;
+ #ifndef CONFIG_IO_COHERENCY
+ 	int valid_entries;
+ #endif
+@@ -1454,7 +1454,7 @@ int ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id, int
+ 	struct ath12k_tx_sw_metadata *sw_metadata;
+ 	u8 n_entry = 0;
+ 	struct list_head desc_free_list, *cur;
+-	struct hal_wbm_completion_ring_tx *tx_status;
++	struct hal_wbm_completion_ring_tx *tx_status, *next_tx_status;
+ 	struct sk_buff_head free_list_head;
+ 	int tx_status_idx = smp_processor_id();
+ 
+@@ -1465,27 +1465,30 @@ int ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id, int
+ 	while (budget-- && (desc = __ath12k_hal_srng_dst_get_next_cached_entry(status_ring, NULL))) {
+ 		tx_status = (struct hal_wbm_completion_ring_tx *)desc;
+ 
+-		if (le32_get_bits(tx_status->info0, HAL_WBM_COMPL_TX_INFO0_CC_DONE)) {
+-			/* HW done cookie conversion */
+-			desc_va = ((u64)le32_to_cpu(tx_status->buf_va_hi) << 32 |
+-				   le32_to_cpu(tx_status->buf_va_lo));
+-			tx_desc = (struct ath12k_tx_desc_info *)((unsigned long)desc_va);
+-		} else {
+-			u32 desc_id;
++		/* HW done cookie conversion */
++		desc_va = ((u64)le32_to_cpu(tx_status->buf_va_hi) << 32 |
++			   le32_to_cpu(tx_status->buf_va_lo));
++		tx_desc = (struct ath12k_tx_desc_info *)((unsigned long)desc_va);
+ 
+-			/* SW does cookie conversion to VA */
+-			desc_id = le32_get_bits(tx_status->buf_va_hi,
+-						BUFFER_ADDR_INFO1_SW_COOKIE);
++		next_desc = ath12k_hal_srng_dst_peek_nolock(status_ring);
++		if (next_desc) {
++			next_tx_status = (struct hal_wbm_completion_ring_tx *)next_desc;
++		 	next_desc_va = ((u64)le32_to_cpu(next_tx_status->buf_va_hi) << 32 |
++					le32_to_cpu(next_tx_status->buf_va_lo));
+ 
+-			tx_desc = ath12k_dp_get_tx_desc(dp, desc_id);
++			if (next_desc_va) {
++				next_tx_desc = (struct ath12k_tx_desc_info *)((unsigned long)next_desc_va);
++				prefetch(next_tx_desc);
++			}
+ 		}
+-		if (!tx_desc) {
++
++		if (unlikely(!tx_desc)) {
+ 			DP_DEVICE_STATS_INC(dp, tx_err.tx_comp_err[DP_TX_COMP_ERR_INVALID_DESC][ring_id], 1);
+ 			ath12k_warn(ab, "unable to retrieve tx_desc!");
+ 			continue;
+ 		}
+ 
+-		if (!tx_desc->in_use) {
++		if (unlikely(!tx_desc->in_use)) {
+ 			DP_DEVICE_STATS_INC(dp, tx_err.tx_comp_err[DP_TX_COMP_ERR_DESC_INUSE][ring_id], 1);
+ 			continue;
+ 		}
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hal.h b/drivers/net/wireless/ath/ath12k/wifi7/hal.h
+index 11c3b8a..7d90cbe 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal.h
+@@ -776,4 +776,12 @@ void ath12k_hal_srng_access_dst_ring_end_nolock(struct hal_srng *srng)
+ 	writel_relaxed(srng->u.dst_ring.tp, srng->u.dst_ring.tp_addr_direct);
+ 	srng->timestamp = jiffies;
+ }
++static inline
++void *ath12k_hal_srng_dst_peek_nolock(struct hal_srng *srng)
++{
++	if (srng->u.dst_ring.tp != srng->u.dst_ring.cached_hp)
++		return (srng->ring_base_vaddr + srng->u.dst_ring.tp);
++
++	return NULL;
++}
+ #endif
+-- 
+2.34.1
+

@@ -1,0 +1,1044 @@
+From cc51c4d638df1d1ab4d1e90c957f4c588e57d577 Mon Sep 17 00:00:00 2001
+From: Sidhanta Sahu <sidhanta@qti.qualcomm.com>
+Date: Thu, 12 Jun 2025 00:29:11 -0700
+Subject: [PATCH] QSDK:DP:wifi: ath12k: Enable UMAC reset support for DS mode
+
+Add support for UMAC DP reset of partner SOC when
+one SOC crashes in MLO as a part of MODE 1 SSR for DS Mode.
+
+In this process shared memory will be used by Host and
+Firmware to communicate the sequence of events. Host will
+clear the data structures such as tx/rx descriptors and
+re-initialize the rings and reset hp/tp to 0.
+
+In addition to host handling, inform the umac reset progress
+to PPE through PPE handlers so that PPE will take necessary
+action to disable interrupts.
+
+Restore ppe2tcl and reo2ppe start indices during reset recovery.
+
+Patch-dependency:
+	0343-01-UPSTREAM-DP-wifi-ath12k-Add-DP-UMAC-Reset-support.patch
+	0343-02-UPSTREAM-DP-wifi-ath12k-Pending-tasks-for-DP-UMAC-re.patch
+	0343-03-QSDK-CP-wifi-ath12k-Enable-umac-reset-for-11BE-chips.patch
+Patchwork: None
+
+Signed-off-by:Sidhanta Sahu <sidhanta@qti.qualcomm.com>
+Signed-off-by:Ramya Gnanasekar <quic_rgnanase@qti.qualcomm.com>
+Signed-off-by:Balamurugan S <quic_bselvara@qti.qualcomm.com>
+Signed-off-by:Balamurugan Mahalingam <bmahalin@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/ce.c         |   2 +-
+ drivers/net/wireless/ath/ath12k/core.h       |   1 +
+ drivers/net/wireless/ath/ath12k/dp.c         |  65 ++++-
+ drivers/net/wireless/ath/ath12k/dp.h         |   5 +
+ drivers/net/wireless/ath/ath12k/hal.c        | 115 +++++++-
+ drivers/net/wireless/ath/ath12k/hal.h        |  18 +-
+ drivers/net/wireless/ath/ath12k/ppe.c        | 288 +++++++++++++++++--
+ drivers/net/wireless/ath/ath12k/ppe.h        |  20 +-
+ drivers/net/wireless/ath/ath12k/umac_reset.c |  28 +-
+ drivers/net/wireless/ath/ath12k/wifi7/hal.c  |  24 +-
+ drivers/net/wireless/ath/ath12k/wifi7/hal.h  |   4 +-
+ 11 files changed, 494 insertions(+), 76 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/ce.c b/drivers/net/wireless/ath/ath12k/ce.c
+index 48b961e..f8503f2 100644
+--- a/drivers/net/wireless/ath/ath12k/ce.c
++++ b/drivers/net/wireless/ath/ath12k/ce.c
+@@ -348,7 +348,7 @@ static int ath12k_ce_init_ring(struct ath12k_base *ab,
+ 
+ 	/* TODO: Init other params needed by HAL to init the ring */
+ 
+-	ret = ath12k_hal_srng_setup(ab, type, ce_id, 0, &params);
++	ret = ath12k_hal_srng_setup_idx(ab, type, ce_id, 0, &params, 0);
+ 	if (ret < 0) {
+ 		ath12k_warn(ab, "failed to setup srng: %d ring_id %d\n",
+ 			    ret, ce_id);
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index f267303..1c62c44 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1631,6 +1631,7 @@ void ath12k_dp_umac_reset_handle(struct ath12k_base *ab);
+ int ath12k_dp_umac_reset_init(struct ath12k_base *ab);
+ void ath12k_dp_umac_reset_deinit(struct ath12k_base *ab);
+ void ath12k_umac_reset_completion(struct ath12k_base *ab);
++void ath12k_umac_reset_notify_pre_reset_done(struct ath12k_base *ab);
+ struct reserved_mem *ath12k_core_get_reserved_mem_by_name(struct ath12k_base *ab,
+ 						  const char* name);
+ u8 ath12k_core_get_total_num_vdevs(struct ath12k_base *ab);
+diff --git a/drivers/net/wireless/ath/ath12k/dp.c b/drivers/net/wireless/ath/ath12k/dp.c
+index 37bdec8..da230b7 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -264,9 +264,9 @@ static int ath12k_dp_srng_calculate_msi_group(struct ath12k_base *ab,
+ 	return ath12k_dp_srng_find_ring_in_mask(ring_num, grp_mask);
+ }
+ 
+-static void ath12k_dp_srng_msi_setup(struct ath12k_base *ab,
+-				     struct hal_srng_params *ring_params,
+-				     enum hal_ring_type type, int ring_num)
++void ath12k_dp_srng_msi_setup(struct ath12k_base *ab,
++			      struct hal_srng_params *ring_params,
++			      enum hal_ring_type type, int ring_num)
+ {
+ 	int msi_group_number, msi_data_count;
+ 	u32 msi_data_start, msi_irq_start, addr_lo, addr_hi;
+@@ -309,7 +309,7 @@ static void ath12k_dp_srng_msi_setup(struct ath12k_base *ab,
+ 
+ 	vector = msi_irq_start  + (msi_group_number % msi_data_count);
+ 
+-	if (ab->hw_params->ds_support)
++	if (ab->hw_params->ds_support && !ath12k_dp_umac_reset_in_progress(ab))
+ 		ath12k_hif_ppeds_register_interrupts(ab, type, vector, ring_num);
+ }
+ 
+@@ -462,7 +462,7 @@ skip_dma_alloc:
+ 		ring->cached = 1;
+ 	}
+ 
+-	ret = ath12k_hal_srng_setup(ab, type, ring_num, mac_id, &params);
++	ret = ath12k_hal_srng_setup_idx(ab, type, ring_num, mac_id, &params, 0);
+ 	if (ret < 0) {
+ 		ath12k_warn(ab, "failed to setup srng: %d ring_id %d\n",
+ 			    ret, ring_num);
+@@ -595,8 +595,7 @@ static void ath12k_dp_srng_common_cleanup(struct ath12k_base *ab)
+ 	}
+ 	ath12k_dp_srng_cleanup(ab, &dp->wbm_desc_rel_ring);
+ 
+-	if (!ath12k_dp_umac_reset_in_progress(ab))
+-		ath12k_dp_srng_ppeds_cleanup(ab);
++	ath12k_dp_srng_ppeds_cleanup(ab);
+ }
+ 
+ static int ath12k_dp_srng_common_setup(struct ath12k_base *ab)
+@@ -700,15 +699,14 @@ static int ath12k_dp_srng_common_setup(struct ath12k_base *ab)
+ 
+ 	ath12k_hal_reo_hw_setup(ab, ring_hash_map);
+ 
++skip_reo_setup:
+ 	ret = ath12k_dp_srng_ppeds_setup(ab);
+ 	if (ret) {
+ 		ath12k_warn(ab, "failed to set up ppe-ds srngs :%d\n", ret);
+ 		goto err;
+ 	}
+ 
+-skip_reo_setup:
+ 	return 0;
+-
+ err:
+ 	ath12k_dp_srng_common_cleanup(ab);
+ 
+@@ -1454,6 +1452,46 @@ void ath12k_dp_ppeds_tx_cmem_init(struct ath12k_base *ab, struct ath12k_dp *dp)
+ 	}
+ }
+ 
++static void ath12k_dp_ppeds_tx_desc_cleanup(struct ath12k_base *ab)
++{
++	struct ath12k_ppeds_tx_desc_info *ppeds_tx_descs;
++	struct ath12k_dp *dp = ab->dp;
++	struct sk_buff *skb;
++	int i, j;
++
++	/* PPEDS TX Descriptor cleanup */
++	spin_lock_bh(&dp->ppe.ppeds_tx_desc_lock);
++
++	for (i = 0; i < ATH12K_NUM_PPEDS_TX_SPT_PAGES; i++) {
++		ppeds_tx_descs = dp->ppedstxbaddr[i];
++
++		for (j = 0; j < ATH12K_MAX_SPT_ENTRIES; j++) {
++			if (!ppeds_tx_descs[j].in_use)
++				continue;
++
++			skb = ppeds_tx_descs[j].skb;
++			if (!skb) {
++				WARN_ON(1);
++				continue;
++			}
++
++			ppeds_tx_descs[j].skb = NULL;
++			ppeds_tx_descs[j].in_use = false;
++			dma_unmap_single_attrs(ab->dev, ppeds_tx_descs[j].paddr,
++					       skb->len, DMA_TO_DEVICE,
++					       DMA_ATTR_SKIP_CPU_SYNC);
++
++			dev_kfree_skb_any(skb);
++
++			list_add_tail(&ppeds_tx_descs[j].list, &dp->ppe.ppeds_tx_desc_free_list);
++		}
++	}
++
++	dp->ppe.ppeds_tx_desc_reuse_list_len = 0;
++
++	spin_unlock_bh(&dp->ppe.ppeds_tx_desc_lock);
++}
++
+ int ath12k_dp_cc_ppeds_desc_cleanup(struct ath12k_base *ab)
+ {
+ 	struct ath12k_ppeds_tx_desc_info *ppeds_tx_descs;
+@@ -2156,7 +2194,7 @@ void ath12k_umac_reset_handle_post_reset_start(struct ath12k_base *ab)
+         if (ret)
+                 ath12k_warn(ab, "failed to setup wbm_idle_ring: %d\n", ret);
+ 
+-        dp = ath12k_ab_to_dp(ab);
++	dp = ath12k_ab_to_dp(ab);
+         srng = &ab->hal.srng_list[dp->wbm_idle_ring.ring_id];
+ 
+         ret = ath12k_dp_link_desc_setup(ab, dp->link_desc_banks,
+@@ -2164,9 +2202,14 @@ void ath12k_umac_reset_handle_post_reset_start(struct ath12k_base *ab)
+         if (ret)
+                 ath12k_warn(ab, "failed to setup link desc: %d\n", ret);
+ 
+-        ath12k_dp_srng_common_setup(ab);
++	ath12k_dp_srng_common_setup(ab);
+         ath12k_dp_umac_txrx_desc_cleanup(ab);
+ 
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	if (ab->dp->ppe.ppeds_handle)
++		ath12k_dp_ppeds_tx_desc_cleanup(ab);
++#endif
++
+         ath12k_dp_rxdma_ring_setup(ab);
+ 
+         for (i = 0; i < DP_REO_DST_RING_MAX; i++) {
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+index 25bb4dd..df3cf1a 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -641,6 +641,7 @@ struct ath12k_dp {
+ 	/*Neighbors Peer list for NAC RSSI*/
+ 	struct list_head neighbor_peers;
+ 	int num_nrps;
++	unsigned long ppeds_service_running;
+ };
+ /* @brief target -> host extended statistics upload
+  *
+@@ -961,8 +962,12 @@ bool ath12k_dp_umac_reset_in_progress(struct ath12k_base *ab);
+ void ath12k_umac_reset_notify_target_sync_and_send(struct ath12k_base *ab,
+                                        enum dp_umac_reset_tx_cmd tx_event);
+ void ath12k_umac_reset_handle_post_reset_start(struct ath12k_base *ab);
++bool ath12k_dp_umac_reset_in_progress(struct ath12k_base *ab);
+ void ath12k_dp_tx_update_bank_profile(struct ath12k_link_vif *arvif);
+ void ath12k_dp_reoq_lut_addr_reset(struct ath12k_dp *dp);
++void ath12k_dp_srng_msi_setup(struct ath12k_base *ab,
++			      struct hal_srng_params *ring_params,
++			      enum hal_ring_type type, int ring_num);
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ int ath12k_dp_tx_get_bank_profile(struct ath12k_base *ab, struct ath12k_link_vif *arvif,
+diff --git a/drivers/net/wireless/ath/ath12k/hal.c b/drivers/net/wireless/ath/ath12k/hal.c
+index b1efac9..bcf5ccb 100644
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -15,15 +15,17 @@ static void ath12k_hal_ce_dst_setup(struct ath12k_base *ab,
+ }
+ 
+ static void ath12k_hal_srng_src_hw_init(struct ath12k_base *ab,
+-					struct hal_srng *srng)
++					struct hal_srng *srng,
++					u32 restore_idx)
+ {
+-	ab->hal.hal_ops->srng_src_hw_init(ab, srng);
++	ab->hal.hal_ops->srng_src_hw_init(ab, srng, restore_idx);
+ }
+ 
+ static void ath12k_hal_srng_dst_hw_init(struct ath12k_base *ab,
+-					struct hal_srng *srng)
++					struct hal_srng *srng,
++					u32 restore_idx)
+ {
+-	ab->hal.hal_ops->srng_dst_hw_init(ab, srng);
++	ab->hal.hal_ops->srng_dst_hw_init(ab, srng, restore_idx);
+ }
+ 
+ static void ath12k_hal_set_umac_srng_ptr_addr(struct ath12k_base *ab,
+@@ -194,12 +196,13 @@ static void ath12k_hal_free_cont_wrp(struct ath12k_hal *hal)
+ }
+ 
+ static void ath12k_hal_srng_hw_init(struct ath12k_base *ab,
+-				    struct hal_srng *srng)
++				    struct hal_srng *srng,
++				    u32 idx)
+ {
+ 	if (srng->ring_dir == HAL_SRNG_DIR_SRC)
+-		ath12k_hal_srng_src_hw_init(ab, srng);
++		ath12k_hal_srng_src_hw_init(ab, srng, idx);
+ 	else
+-		ath12k_hal_srng_dst_hw_init(ab, srng);
++		ath12k_hal_srng_dst_hw_init(ab, srng, idx);
+ }
+ 
+ int ath12k_hal_srng_get_entrysize(struct ath12k_base *ab, u32 ring_type)
+@@ -568,16 +571,70 @@ void ath12k_hal_setup_link_idle_list(struct ath12k_base *ab,
+ 					      tot_link_desc, end_offset);
+ }
+ 
+-int ath12k_hal_srng_setup(struct ath12k_base *ab, enum hal_ring_type type,
+-			  int ring_num, int mac_id,
+-			  struct hal_srng_params *params)
++static bool hal_tx_ppe2tcl_ring_halt_get(struct ath12k_base *ab)
++{
++	u32 cmn_reg_addr;
++	u32 regval;
++
++	cmn_reg_addr = HAL_SEQ_WCSS_UMAC_TCL_REG + HAL_TCL1_RING_CMN_CTRL_REG;
++	regval = ath12k_hif_read32(ab, cmn_reg_addr);
++
++	return (regval &
++			1 << HWIO_TCL_R0_CONS_RING_CMN_CTRL_REG_PPE2TCL1_RNG_HALT_SHFT);
++}
++
++static void hal_tx_ppe2tcl_ring_halt_set(struct ath12k_base *ab)
++{
++	u32 cmn_reg_addr;
++	u32 regval;
++
++	cmn_reg_addr = HAL_SEQ_WCSS_UMAC_TCL_REG + HAL_TCL1_RING_CMN_CTRL_REG;
++	regval = ath12k_hif_read32(ab, cmn_reg_addr);
++
++	regval |= (1 << HWIO_TCL_R0_CONS_RING_CMN_CTRL_REG_PPE2TCL1_RNG_HALT_SHFT);
++
++	/* Enable ring halt for the ppe2tcl ring */
++	ath12k_hif_write32(ab, cmn_reg_addr, regval);
++}
++
++static void hal_tx_ppe2tcl_ring_halt_reset(struct ath12k_base *ab)
++{
++	u32 cmn_reg_addr;
++	u32 regval;
++
++	cmn_reg_addr = HAL_SEQ_WCSS_UMAC_TCL_REG + HAL_TCL1_RING_CMN_CTRL_REG;
++	regval = ath12k_hif_read32(ab, cmn_reg_addr);
++
++	regval &= ~(1 << HWIO_TCL_R0_CONS_RING_CMN_CTRL_REG_PPE2TCL1_RNG_HALT_SHFT);
++
++	/* Disable ring halt for the ppe2tcl ring */
++	ath12k_hif_write32(ab, cmn_reg_addr, regval);
++}
++
++static bool hal_tx_ppe2tcl_ring_halt_done(struct ath12k_base *ab)
++{
++	u32 cmn_reg_addr;
++	u32 regval;
++
++	cmn_reg_addr = HAL_SEQ_WCSS_UMAC_TCL_REG + HAL_TCL1_RING_CMN_CTRL_REG;
++
++	regval = ath12k_hif_read32(ab, cmn_reg_addr);
++
++	regval &= (1 << HWIO_TCL_R0_CONS_RING_CMN_CTRL_REG_PPE2TCL1_RNG_HALT_STAT_SHFT);
++
++	return !!regval;
++}
++
++int ath12k_hal_srng_setup_idx(struct ath12k_base *ab, enum hal_ring_type type,
++			      int ring_num, int mac_id,
++			      struct hal_srng_params *params, u32 restore_idx)
+ {
+ 	struct ath12k_hal *hal = &ab->hal;
+ 	struct hal_srng_config *srng_config = &ab->hal.srng_config[type];
+ 	struct hal_srng *srng;
+ 	int ring_id;
+ 	u32 idx;
+-	int i;
++	int i, retry_count = 0;
+ 
+ 	ring_id = ath12k_hal_srng_get_ring_id(hal, type, ring_num, mac_id);
+ 	if (ring_id < 0)
+@@ -676,7 +733,41 @@ int ath12k_hal_srng_setup(struct ath12k_base *ab, enum hal_ring_type type,
+ 	if (srng_config->mac_type != ATH12K_HAL_SRNG_UMAC)
+ 		return ring_id;
+ 
+-	ath12k_hal_srng_hw_init(ab, srng);
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	if (restore_idx) {
++		/* During UMAC reset Tx ring halt is set
++		 * by Wi-Fi FW during pre-reset stage.
++		 * Hence skip halting the rings again
++		 */
++		if (ath12k_dp_umac_reset_in_progress(ab)) {
++			if (!(hal_tx_ppe2tcl_ring_halt_get(ab))) {
++				ath12k_warn(ab, "TX ring halt not set\n");
++				WARN_ON(1);
++			}
++			ath12k_hal_srng_hw_init(ab, srng, restore_idx);
++		} else {
++			hal_tx_ppe2tcl_ring_halt_set(ab);
++			do {
++				ath12k_warn(ab, "Waiting for ring reset, retried count: %d\n",
++					    retry_count);
++				mdelay(RING_HALT_TIMEOUT);
++				retry_count++;
++			} while (!(hal_tx_ppe2tcl_ring_halt_done(ab)) &&
++				 (retry_count < RNG_HALT_STAT_RETRY_COUNT));
++
++			if (retry_count >= RNG_HALT_STAT_RETRY_COUNT)
++				ath12k_err(ab, "Ring halt is failed, retried count: %d\n",
++					   retry_count);
++
++			ath12k_hal_srng_hw_init(ab, srng, restore_idx);
++			hal_tx_ppe2tcl_ring_halt_reset(ab);
++		}
++	} else {
++		ath12k_hal_srng_hw_init(ab, srng, 0);
++	}
++#else
++	ath12k_hal_srng_hw_init(ab, srng, 0);
++#endif
+ 
+ 	if (type == HAL_CE_DST) {
+ 		srng->u.dst_ring.max_buffer_length = params->max_buffer_len;
+diff --git a/drivers/net/wireless/ath/ath12k/hal.h b/drivers/net/wireless/ath/ath12k/hal.h
+index 5918f58..d1793d8 100644
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -33,6 +33,11 @@ struct hal_rx_reo_queue;
+ #define HAL_ADDR_LSB_REG_MASK		0xffffffff
+ #define HAL_ADDR_MSB_REG_SHIFT		32
+ 
++#define HWIO_TCL_R0_CONS_RING_CMN_CTRL_REG_PPE2TCL1_RNG_HALT_SHFT 10
++#define HWIO_TCL_R0_CONS_RING_CMN_CTRL_REG_PPE2TCL1_RNG_HALT_STAT_SHFT  18
++#define RING_HALT_TIMEOUT 10
++#define RNG_HALT_STAT_RETRY_COUNT 10
++
+ #define HAL_WBM2SW_REL_ERR_RING_NUM 5
+ #define HAL_WBM2SW_PPEDS_TX_CMPLN_MAP_ID 11
+ #define HAL_WBM2SW_PPEDS_TX_CMPLN_RING_NUM 6
+@@ -1192,8 +1197,10 @@ struct hal_ops {
+ 	void (*set_umac_srng_ptr_addr)(struct ath12k_base *ab,
+ 				       struct hal_srng *srng,
+ 				       enum hal_ring_type type, int ring_num);
+-	void (*srng_src_hw_init)(struct ath12k_base *ab, struct hal_srng *srng);
+-	void (*srng_dst_hw_init)(struct ath12k_base *ab, struct hal_srng *srng);
++	void (*srng_src_hw_init)(struct ath12k_base *ab, struct hal_srng *srng,
++				 u32 restore_idx);
++	void (*srng_dst_hw_init)(struct ath12k_base *ab, struct hal_srng *srng,
++				 u32 restore_idx);
+ 	int (*srng_update_shadow_config)(struct ath12k_base *ab,
+ 					 enum hal_ring_type ring_type,
+ 					 int ring_num);
+@@ -1331,9 +1338,10 @@ int ath12k_hal_srng_src_num_free(struct ath12k_base *ab, struct hal_srng *srng,
+ void ath12k_hal_srng_access_begin(struct ath12k_base *ab,
+ 				  struct hal_srng *srng);
+ void ath12k_hal_srng_access_end(struct ath12k_base *ab, struct hal_srng *srng);
+-int ath12k_hal_srng_setup(struct ath12k_base *ab, enum hal_ring_type type,
+-			  int ring_num, int mac_id,
+-			  struct hal_srng_params *params);
++int ath12k_hal_srng_setup_idx(struct ath12k_base *ab, enum hal_ring_type type,
++			      int ring_num, int mac_id,
++			      struct hal_srng_params *params,
++			      u32 restore_idx);
+ void ath12k_hal_dump_srng_stats(struct ath12k_base *ab);
+ void ath12k_hal_srng_get_shadow_config(struct ath12k_base *ab,
+ 				       u32 **cfg, u32 *len);
+diff --git a/drivers/net/wireless/ath/ath12k/ppe.c b/drivers/net/wireless/ath/ath12k/ppe.c
+index ec35e14..369afa1 100644
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "core.h"
++#include "dp.h"
+ #include "dp_tx.h"
+ #include "debug.h"
+ #include "debugfs_sta.h"
+@@ -13,6 +14,7 @@
+ #include <linux/cacheflush.h>
+ #include "hif.h"
+ #include "ppe.h"
++#include "dp.h"
+ #include "fse.h"
+ #include "wifi7/hal.h"
+ 
+@@ -420,15 +422,23 @@ static int ath12k_dp_ppeds_tx_comp_poll(struct napi_struct *napi, int budget)
+ 	int total_budget = (budget << 2) - 1;
+ 	int work_done;
+ 
++	set_bit(ATH12K_DP_PPEDS_TX_COMP_NAPI_BIT, &dp->ppeds_service_running);
+ 	work_done = ath12k_ppeds_tx_completion_handler(ab, total_budget);
+ 	if (!ab->stats_disable)
+ 		ab->dp->ppe.ppeds_stats.tx_desc_freed += work_done;
+ 
+ 	work_done = (work_done + 1) >> 2;
++	clear_bit(ATH12K_DP_PPEDS_TX_COMP_NAPI_BIT, &dp->ppeds_service_running);
+ 
+ 	if (budget > work_done) {
+ 		napi_complete(napi);
+ 		ath12k_hif_ppeds_irq_enable(ab, PPEDS_IRQ_PPE_WBM2SW_REL);
++		if (ab->dp_umac_reset.umac_pre_reset_in_prog)
++			ath12k_umac_reset_notify_pre_reset_done(ab);
++	} else if (ab->dp_umac_reset.umac_pre_reset_in_prog) {
++		 /* UMAC reset may fail in this case.
++		  */
++		WARN_ON_ONCE(1);
+ 	}
+ 
+ 	return (work_done > budget) ? budget : work_done;
+@@ -476,6 +486,17 @@ static void ath12k_dp_ppeds_del_napi_ctxt(struct ath12k_base *ab)
+ 	ath12k_dbg(ab, ATH12K_DBG_PPE, "%s success\n", __func__);
+ }
+ 
++static void ath12k_ppeds_notify_napi_done(ppe_ds_wlan_handle_t *ppeds_handle)
++{
++	struct ath12k_base *ab = *(struct ath12k_base **)ppe_ds_wlan_priv(ppeds_handle);
++	struct ath12k_dp *dp = ab->dp;
++
++	clear_bit(ATH12K_DP_PPEDS_NAPI_DONE_BIT, &dp->ppeds_service_running);
++
++	if (ab->dp_umac_reset.umac_pre_reset_in_prog)
++		ath12k_umac_reset_notify_pre_reset_done(ab);
++}
++
+ static struct ppe_ds_wlan_ops ppeds_ops = {
+ 	.get_tx_desc_many = ath12k_ppeds_get_batched_tx_desc,
+ 	.release_tx_desc_single = ath12k_ppeds_release_tx_desc_single,
+@@ -485,6 +506,7 @@ static struct ppe_ds_wlan_ops ppeds_ops = {
+ 	.get_tcl_cons_idx = ath12k_ppeds_get_tcl_cons_idx,
+ 	.get_reo_prod_idx = ath12k_ppeds_get_reo_prod_idx,
+ 	.release_rx_desc = ath12k_ppeds_release_rx_desc,
++	.notify_napi_done = ath12k_ppeds_notify_napi_done,
+ };
+ 
+ void ath12k_dp_peer_ppeds_route_setup(struct ath12k *ar, struct ath12k_link_vif *arvif,
+@@ -1321,21 +1343,28 @@ int ath12k_ppeds_detach(struct ath12k_base *ab)
+ int ath12k_dp_ppeds_start(struct ath12k_base *ab)
+ {
+ 	struct ath12k_ppeds_napi *napi_ctxt = &ab->dp->ppe.ppeds_napi_ctxt;
++	struct ppe_ds_wlan_ctx_info_handle wlan_info_hdl;
+ 	int ds_node_id;
++	bool umac_reset_inprogress;
+ 
+ 	if (!test_bit(ATH12K_FLAG_PPE_DS_ENABLED, &ab->dev_flags))
+ 		return 0;
+ 
++	umac_reset_inprogress = ath12k_dp_umac_reset_in_progress(ab);
++
+ 	if (!ab->dp->ppe.ppeds_handle) {
+ 		ath12k_err(ab, "ppeds_handle is null");
+ 		return -EINVAL;
+ 	}
+ 
+-	napi_enable(&napi_ctxt->napi);
++	if (!umac_reset_inprogress)
++		napi_enable(&napi_ctxt->napi);
+ 
+ 	ab->dp->ppe.ppeds_stopped = 0;
++	wlan_info_hdl.umac_reset_inprogress = 0;
+ 
+-	if (ppe_ds_wlan_inst_start(ab->dp->ppe.ppeds_handle) != 0)
++	if (ppe_ds_wlan_instance_start(ab->dp->ppe.ppeds_handle,
++				       &wlan_info_hdl) != 0)
+ 		return -EINVAL;
+ 
+ 	ds_node_id = ppe_ds_wlan_get_node_id(ab->dp->ppe.ppeds_handle);
+@@ -1355,27 +1384,32 @@ void ath12k_dp_ppeds_stop(struct ath12k_base *ab)
+ {
+ 	struct ath12k_ppeds_napi *napi_ctxt = &ab->dp->ppe.ppeds_napi_ctxt;
+ 	struct ppe_ds_wlan_ctx_info_handle wlan_info_hdl;
++	bool umac_reset_in_progress;
+ 
+ 	if (!test_bit(ATH12K_FLAG_PPE_DS_ENABLED, &ab->dev_flags))
+ 		return;
+ 
++	umac_reset_in_progress = ath12k_dp_umac_reset_in_progress(ab);
++
+ 	if (!ab->dp->ppe.ppeds_handle || ab->dp->ppe.ppeds_stopped) {
+ 		ath12k_warn(ab, "PPE DS aleady stopped!\n");
+ 		return;
+ 	}
+ 
+ 	ab->dp->ppe.ppeds_stopped = 1;
+-	napi_disable(&napi_ctxt->napi);
+ 
+-	wlan_info_hdl.umac_reset_inprogress = false;
++	if (!umac_reset_in_progress)
++		napi_disable(&napi_ctxt->napi);
+ 
+-	ppe_ds_wlan_inst_stop(ab->dp->ppe.ppeds_handle);
+-	ppe_ds_wlan_instance_stop(ab->dp->ppe.ppeds_handle, &wlan_info_hdl);
+-	ath12k_dbg(ab, ATH12K_DBG_PPE, "PPEDS stop success\n");
++	wlan_info_hdl.umac_reset_inprogress = umac_reset_in_progress;
++
++	ppe_ds_wlan_instance_stop(ab->dp->ppe.ppeds_handle,
++				  &wlan_info_hdl);
+ 
++	ath12k_dbg(ab, ATH12K_DBG_PPE, "PPEDS stop success\n");
+ }
+ 
+-int ath12k_dp_ppeds_register_soc(struct ath12k_dp *dp)
++int ath12k_dp_ppeds_register_soc(struct ath12k_dp *dp, struct dp_ppe_ds_idxs *idx)
+ {
+ 	struct ath12k_base *ab = dp->ab;
+ 	struct hal_srng *ppe2tcl_ring, *reo2ppe_ring;
+@@ -1394,16 +1428,19 @@ int ath12k_dp_ppeds_register_soc(struct ath12k_dp *dp)
+ 
+ 	reg_info.ppe2tcl_ba = dp->ppe.ppe2tcl_ring.paddr;
+ 	reg_info.reo2ppe_ba = dp->ppe.reo2ppe_ring.paddr;
+-	reg_info.ppe2tcl_num_desc = ppe2tcl_ring->num_entries;
+-	reg_info.reo2ppe_num_desc = reo2ppe_ring->num_entries;
++	reg_info.ppe2tcl_num_desc = DP_PPE2TCL_RING_SIZE;
++	reg_info.reo2ppe_num_desc = DP_REO2PPE_RING_SIZE;
+ 	if (ppe_ds_wlan_inst_register(ab->dp->ppe.ppeds_handle, &reg_info) != true) {
+ 		ath12k_err(ab, "ppeds not attached");
+ 		return -EINVAL;
+ 	}
+ 
++	idx->ppe2tcl_start_idx = reg_info.ppe2tcl_start_idx;
++	idx->reo2ppe_start_idx = reg_info.reo2ppe_start_idx;
+ 	ab->dp->ppe.ppeds_int_mode_enabled = reg_info.ppe_ds_int_mode_enabled;
+ 
+-	ath12k_dbg(ab, ATH12K_DBG_PPE, "PPEDS register soc-success device_id %d", ab->device_id);
++	ath12k_dbg(ab, ATH12K_DBG_PPE, "PPEDS register soc-success device_id %d ppe2tcl_start_idx 0x%x reo2ppe_start_idx 0x%x",
++		   ab->device_id, idx->ppe2tcl_start_idx, idx->reo2ppe_start_idx);
+ 
+ 	return 0;
+ }
+@@ -1437,17 +1474,198 @@ void ath12k_hal_tx_config_rbm_mapping(struct ath12k_base *ab, u8 ring_num,
+ 			   HAL_TCL_RBM_MAPPING0_ADDR_OFFSET, new_map);
+ }
+ 
++static int ath12k_dp_srng_init_idx(struct ath12k_base *ab, struct dp_srng *ring,
++				   enum hal_ring_type type, int ring_num,
++				   int mac_id,
++				   int num_entries, u32 restore_idx)
++{
++	struct hal_srng_params params = { 0 };
++	bool cached = false;
++	int ret;
++	int vector = 0;
++
++	params.ring_base_vaddr = ring->vaddr;
++	params.ring_base_paddr = ring->paddr;
++	params.num_entries = num_entries;
++	ath12k_dp_srng_msi_setup(ab, &params, type, ring_num + mac_id);
++
++	if (ab->hw_params->ds_support && ab->hif.bus == ATH12K_BUS_AHB &&
++	    !ath12k_dp_umac_reset_in_progress(ab))
++		ath12k_hif_ppeds_register_interrupts(ab, type, vector, ring_num);
++
++	switch (type) {
++	case HAL_REO_DST:
++	case HAL_REO2PPE:
++			params.intr_batch_cntr_thres_entries =
++				HAL_SRNG_INT_BATCH_THRESHOLD_RX;
++			params.intr_timer_thres_us = HAL_SRNG_INT_TIMER_THRESHOLD_RX;
++			break;
++	case HAL_WBM2SW_RELEASE:
++		if (ab->hw_params->hw_ops->dp_srng_is_tx_comp_ring(ring_num)) {
++			params.intr_batch_cntr_thres_entries =
++				HAL_SRNG_INT_BATCH_THRESHOLD_TX;
++			params.intr_timer_thres_us =
++				HAL_SRNG_INT_TIMER_THRESHOLD_TX;
++			break;
++		}
++		params.intr_batch_cntr_thres_entries =
++			HAL_SRNG_INT_BATCH_THRESHOLD_OTHER;
++		params.intr_timer_thres_us = HAL_SRNG_INT_TIMER_THRESHOLD_OTHER;
++		break;
++	case HAL_PPE2TCL:
++		params.intr_batch_cntr_thres_entries =
++			HAL_SRNG_INT_BATCH_THRESHOLD_PPE2TCL;
++		params.intr_timer_thres_us = HAL_SRNG_INT_TIMER_THRESHOLD_PPE2TCL;
++		break;
++	default:
++		ath12k_warn(ab, "Not a valid ring type in dp :%d\n", type);
++		return -EINVAL;
++	}
++	if (cached) {
++		params.flags |= HAL_SRNG_FLAGS_CACHED;
++		ring->cached = 1;
++	}
++
++	ret = ath12k_hal_srng_setup_idx(ab, type, ring_num, mac_id, &params,
++					restore_idx);
++	if (ret < 0) {
++		ath12k_warn(ab, "failed to setup srng: %d ring_id %d\n",
++			    ret, ring_num);
++		return ret;
++	}
++
++	ring->ring_id = ret;
++
++	return 0;
++}
++
++static int ath12k_dp_srng_alloc(struct ath12k_base *ab, struct dp_srng *ring,
++				enum hal_ring_type type, int ring_num,
++				int num_entries)
++{
++	int entry_sz = ath12k_hal_srng_get_entrysize(ab, type);
++	int max_entries = ath12k_hal_srng_get_max_entries(ab, type);
++	bool cached = false;
++
++	if (max_entries < 0 || entry_sz < 0)
++		return -EINVAL;
++
++	if (num_entries > max_entries)
++		num_entries = max_entries;
++
++	ring->size = (num_entries * entry_sz) + HAL_RING_BASE_ALIGN - 1;
++#ifndef CONFIG_IO_COHERENCY
++	if (ab->hw_params->alloc_cacheable_memory) {
++		/* Allocate the reo dst and tx completion rings from cacheable memory */
++		switch (type) {
++		case HAL_REO_DST:
++		case HAL_WBM2SW_RELEASE:
++			cached = true;
++			break;
++		default:
++			cached = false;
++		}
++	}
++#else
++	cached = true;
++#endif
++	if (cached) {
++		ring->vaddr_unaligned = kzalloc(ring->size, GFP_KERNEL);
++		ring->paddr_unaligned = virt_to_phys(ring->vaddr_unaligned);
++	} else {
++		ring->vaddr_unaligned = dma_alloc_coherent(ab->dev, ring->size,
++							   &ring->paddr_unaligned,
++							   GFP_KERNEL);
++	}
++	if (!ring->vaddr_unaligned)
++		return -ENOMEM;
++
++	memset(ring->vaddr_unaligned, 0, ring->size);
++	ring->vaddr = PTR_ALIGN(ring->vaddr_unaligned, HAL_RING_BASE_ALIGN);
++	ring->paddr = ring->paddr_unaligned + ((unsigned long)ring->vaddr -
++			(unsigned long)ring->vaddr_unaligned);
++
++	return 0;
++}
++
++int ath12k_ppeds_dp_srng_alloc(struct ath12k_base *ab, struct dp_srng *ring,
++			       enum hal_ring_type type, int ring_num,
++			       int num_entries)
++{
++	int ret;
++
++	ret = ath12k_dp_srng_alloc(ab, ring, type, ring_num, num_entries);
++	if (ret != 0)
++		ath12k_warn(ab, "Failed to allocate dp srng ring.\n");
++
++	return 0;
++}
++
++static int ath12k_ppeds_dp_srng_init(struct ath12k_base *ab, struct dp_srng *ring,
++				     enum hal_ring_type type, int ring_num,
++				     int mac_id, int num_entries,
++				     u32 restore_idx)
++{
++	int ret;
++
++	ret = ath12k_dp_srng_init_idx(ab, ring, type, ring_num, mac_id,
++				      num_entries, restore_idx);
++	if (ret != 0)
++		ath12k_warn(ab, "Failed to initialize dp srng ring.\n");
++
++	return 0;
++}
++
+ int ath12k_dp_srng_ppeds_setup(struct ath12k_base *ab)
+ {
+ 	struct ath12k_dp *dp = ab->dp;
++	struct dp_ppe_ds_idxs restore_idx = {0};
+ 	int ret, size;
+ 
+ 	if (!test_bit(ATH12K_FLAG_PPE_DS_ENABLED, &ab->dev_flags))
+ 		return 0;
+ 
++	if (ath12k_dp_umac_reset_in_progress(ab))
++		goto skip_ppeds_dp_srng_ring_alloc;
++
+ 	/* TODO: retain and use ring idx fetched from ppe for avoiding edma hang during SSR */
+-	ret = ath12k_dp_srng_setup(ab, &dp->ppe.reo2ppe_ring, HAL_REO2PPE,
+-				   0, 0, DP_REO2PPE_RING_SIZE);
++	ret = ath12k_ppeds_dp_srng_alloc(ab, &dp->ppe.reo2ppe_ring, HAL_REO2PPE,
++					 0, DP_REO2PPE_RING_SIZE);
++	if (ret) {
++		ath12k_warn(ab, "failed to set up reo2ppe ring :%d\n", ret);
++		goto err;
++	}
++
++	/* TODO: retain and use ring idx fetched from ppe for avoiding edma hang during SSR */
++	ret = ath12k_ppeds_dp_srng_alloc(ab, &dp->ppe.ppe2tcl_ring, HAL_PPE2TCL,
++					 0, DP_PPE2TCL_RING_SIZE);
++	if (ret) {
++		ath12k_warn(ab, "failed to set up ppe2tcl ring :%d\n", ret);
++		goto err;
++	}
++
++	size = sizeof(struct hal_wbm_release_ring_tx) * DP_TX_COMP_RING_SIZE;
++	dp->ppe.ppeds_comp_ring.tx_status_head = 0;
++	dp->ppe.ppeds_comp_ring.tx_status_tail = DP_TX_COMP_RING_SIZE - 1;
++	dp->ppe.ppeds_comp_ring.tx_status = kmalloc(size, GFP_KERNEL);
++
++skip_ppeds_dp_srng_ring_alloc:
++	if (!dp->ppe.ppeds_comp_ring.tx_status) {
++		ath12k_err(ab, "PPE tx status completion buffer alloc failed\n");
++		ret = -ENOMEM;
++		goto err;
++	}
++
++	ret = ath12k_dp_ppeds_register_soc(dp, &restore_idx);
++	if (ret) {
++		ath12k_err(ab, "ppeds registration failed\n");
++		goto err;
++	}
++
++	/* TODO: retain and use ring idx fetched from ppe for avoiding edma hang during SSR */
++	ret = ath12k_ppeds_dp_srng_init(ab, &dp->ppe.reo2ppe_ring, HAL_REO2PPE,
++					0, 0, DP_REO2PPE_RING_SIZE,
++					restore_idx.reo2ppe_start_idx);
+ 	if (ret) {
+ 		ath12k_warn(ab, "failed to set up reo2ppe ring :%d\n", ret);
+ 		goto err;
+@@ -1456,8 +1674,9 @@ int ath12k_dp_srng_ppeds_setup(struct ath12k_base *ab)
+ 	ath12k_hal_reo_config_reo2ppe_dest_info(ab);
+ 
+ 	/* TODO: retain and use ring idx fetched from ppe for avoiding edma hang during SSR */
+-	ret = ath12k_dp_srng_setup(ab, &dp->ppe.ppe2tcl_ring, HAL_PPE2TCL,
+-			0, 0, DP_PPE2TCL_RING_SIZE);
++	ret = ath12k_ppeds_dp_srng_init(ab, &dp->ppe.ppe2tcl_ring, HAL_PPE2TCL,
++					0, 0, DP_PPE2TCL_RING_SIZE,
++					restore_idx.ppe2tcl_start_idx);
+ 	if (ret) {
+ 		ath12k_warn(ab, "failed to set up ppe2tcl ring :%d\n", ret);
+ 		goto err;
+@@ -1478,21 +1697,6 @@ int ath12k_dp_srng_ppeds_setup(struct ath12k_base *ab)
+ 					 HAL_WBM2SW_PPEDS_TX_CMPLN_MAP_ID,
+ 					 HAL_PPE2TCL);
+ 
+-	size = sizeof(struct hal_wbm_release_ring_tx) * DP_TX_COMP_RING_SIZE;
+-	dp->ppe.ppeds_comp_ring.tx_status_head = 0;
+-	dp->ppe.ppeds_comp_ring.tx_status_tail = DP_TX_COMP_RING_SIZE - 1;
+-	dp->ppe.ppeds_comp_ring.tx_status = kmalloc(size, GFP_KERNEL);
+-	if (!dp->ppe.ppeds_comp_ring.tx_status) {
+-		ath12k_err(ab, "PPE tx status completion buffer alloc failed\n");
+-		goto err;
+-	}
+-
+-	ret = ath12k_dp_ppeds_register_soc(dp);
+-	if (ret) {
+-		ath12k_err(ab, "ppeds registration failed\n");
+-		goto err;
+-	}
+-
+ err:
+ 	/* caller takes care of calling ath12k_dp_srng_ppeds_cleanup */
+ 	return ret;
+@@ -1916,3 +2120,27 @@ void ath12k_dp_rx_ppe_fse_unregister(void)
+ 
+ 	ppe_drv_fse_ops_unregister();
+ }
++
++void ath12k_dp_ppeds_service_enable_disable(struct ath12k_base *ab,
++					    bool enable)
++{
++	struct ath12k_dp *dp = ab->dp;
++
++	if (enable)
++		set_bit(ATH12K_DP_PPEDS_NAPI_DONE_BIT, &dp->ppeds_service_running);
++
++	ppe_ds_wlan_service_status_update(ab->dp->ppe.ppeds_handle, enable);
++}
++
++void ath12k_dp_ppeds_interrupt_stop(struct ath12k_base *ab)
++{
++	ath12k_hif_ppeds_irq_disable(ab, PPEDS_IRQ_REO2PPE);
++	ath12k_hif_ppeds_irq_disable(ab, PPEDS_IRQ_PPE_WBM2SW_REL);
++}
++
++void ath12k_dp_ppeds_interrupt_start(struct ath12k_base *ab)
++{
++	ath12k_hif_ppeds_irq_enable(ab, PPEDS_IRQ_REO2PPE);
++	ath12k_hif_ppeds_irq_enable(ab, PPEDS_IRQ_PPE_WBM2SW_REL);
++}
++
+diff --git a/drivers/net/wireless/ath/ath12k/ppe.h b/drivers/net/wireless/ath/ath12k/ppe.h
+index 76bdf29..15f9fdd 100644
+--- a/drivers/net/wireless/ath/ath12k/ppe.h
++++ b/drivers/net/wireless/ath/ath12k/ppe.h
+@@ -28,6 +28,14 @@ enum ppeds_irq_type {
+ 	PPEDS_IRQ_PPE_WBM2SW_REL,
+ };
+ 
++struct dp_ppe_ds_idxs {
++	u32 ppe2tcl_start_idx;
++	u32 reo2ppe_start_idx;
++};
++
++#define ATH12K_DP_PPEDS_NAPI_DONE_BIT		1
++#define ATH12K_DP_PPEDS_TX_COMP_NAPI_BIT	2
++
+ #define DP_PPEDS_SERVICE_BUDGET     256
+ 
+ #define ATH12K_PPE_DEFAULT_CORE_MASK		ath12k_rfs_core_mask[0]
+@@ -147,7 +155,8 @@ int ath12k_vif_set_mtu(struct ath12k_vif *ahvif, int mtu);
+ 
+ void ath12k_dp_srng_ppeds_cleanup(struct ath12k_base *ab);
+ int ath12k_dp_srng_ppeds_setup(struct ath12k_base *ab);
+-int ath12k_dp_ppeds_register_soc(struct ath12k_dp *dp);
++int ath12k_dp_ppeds_register_soc(struct ath12k_dp *dp,
++				 struct dp_ppe_ds_idxs *idx);
+ void ath12k_dp_ppeds_stop(struct ath12k_base *ab);
+ int ath12k_dp_ppeds_start(struct ath12k_base *ab);
+ int ath12k_ppeds_detach(struct ath12k_base *ab);
+@@ -178,6 +187,12 @@ void ath12k_ppeds_detach_link_vif(struct ath12k_link_vif *arvif,
+ 				  int ppe_vp_profile_idx);
+ void ath12k_vif_free_vp(struct ath12k_vif *ahvif, struct net_device *dev);
+ 
++void ath12k_dp_ppeds_service_enable_disable(struct ath12k_base *ab,
++					    bool enable);
++void ath12k_dp_ppeds_interrupt_stop(struct ath12k_base *ab);
++void ath12k_dp_ppeds_stop(struct ath12k_base *ab);
++void ath12k_dp_ppeds_interrupt_start(struct ath12k_base *ab);
++
+ #else
+ static inline void ath12k_dp_srng_ppeds_cleanup(struct ath12k_base *ab)
+ {
+@@ -188,7 +203,8 @@ static inline int ath12k_dp_srng_ppeds_setup(struct ath12k_base *ab)
+ 	return 0;
+ }
+ 
+-static inline int ath12k_dp_ppeds_register_soc(struct ath12k_dp *dp)
++static inline int ath12k_dp_ppeds_register_soc(struct ath12k_dp *dp,
++					       struct dp_ppe_ds_idxs *idx)
+ {
+ 	return 0;
+ }
+diff --git a/drivers/net/wireless/ath/ath12k/umac_reset.c b/drivers/net/wireless/ath/ath12k/umac_reset.c
+index f70167e..a596793 100644
+--- a/drivers/net/wireless/ath/ath12k/umac_reset.c
++++ b/drivers/net/wireless/ath/ath12k/umac_reset.c
+@@ -16,6 +16,9 @@
+ #include "debug.h"
+ #include "hif.h"
+ #include "dp.h"
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++#include "ppe.h"
++#endif
+ 
+ int ath12k_htt_umac_reset_msg_send(struct ath12k_base *ab,
+ 				   struct ath12k_htt_umac_reset_setup_cmd_params *params)
+@@ -347,6 +350,10 @@ void ath12k_umac_reset_notify_pre_reset_done(struct ath12k_base *ab)
+ 	struct ath12k_dp *dp;
+ 
+ 	dp = ath12k_ab_to_dp(ab);
++
++	if (dp->ppeds_service_running)
++		return;
++
+ 	ath12k_umac_reset_notify_target_sync_and_send(ab,
+ 						      ATH12K_UMAC_RESET_TX_CMD_PRE_RESET_DONE);
+ 	ab->dp_umac_reset.umac_pre_reset_in_prog = false;
+@@ -360,9 +367,18 @@ void ath12k_umac_reset_handle_pre_reset(struct ath12k_base *ab)
+ 	set_bit(ATH12K_FLAG_UMAC_PRERESET_START, &ab->dev_flags);
+ 	ath12k_hif_irq_disable(ab);
+ 	atomic_inc(&mlo_umac_reset->response_chip);
+-
+-	ath12k_umac_reset_notify_target_sync_and_send(ab,
+-						      ATH12K_UMAC_RESET_TX_CMD_PRE_RESET_DONE);
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	if (ab->dp->ppe.ppeds_handle) {
++		ath12k_dp_ppeds_service_enable_disable(ab, true);
++		ab->dp_umac_reset.umac_pre_reset_in_prog = true;
++		ath12k_dp_ppeds_interrupt_stop(ab);
++		ath12k_dp_ppeds_stop(ab);
++		ath12k_dp_ppeds_service_enable_disable(ab, false);
++	}
++#endif
++	if (!test_bit(ATH12K_FLAG_PPE_DS_ENABLED, &ab->dev_flags))
++		ath12k_umac_reset_notify_target_sync_and_send(ab,
++				ATH12K_UMAC_RESET_TX_CMD_PRE_RESET_DONE);
+ 	return;
+ }
+ 
+@@ -375,6 +391,12 @@ void ath12k_umac_reset_handle_post_reset_complete(struct ath12k_base *ab)
+ 
+ 	atomic_inc(&mlo_umac_reset->response_chip);
+ 	ath12k_hif_irq_enable(ab);
++#ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
++	if (ab->dp->ppe.ppeds_handle) {
++		ath12k_dp_ppeds_start(ab);
++		ath12k_dp_ppeds_interrupt_start(ab);
++	}
++#endif
+ 	ath12k_umac_reset_notify_target_sync_and_send(ab, ATH12K_UMAC_RESET_TX_CMD_POST_RESET_COMPLETE_DONE);
+ 	ath12k_dp_peer_tid_setup(ab);
+ 	return;
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hal.c b/drivers/net/wireless/ath/ath12k/wifi7/hal.c
+index 7ed34c2..0598e6e 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal.c
+@@ -103,7 +103,8 @@ void ath12k_wifi7_hal_ce_dst_setup(struct ath12k_base *ab,
+ }
+ 
+ void ath12k_wifi7_hal_srng_dst_hw_init(struct ath12k_base *ab,
+-				       struct hal_srng *srng)
++				       struct hal_srng *srng,
++				       u32 restore_idx)
+ {
+ 	struct ath12k_hal *hal = &ab->hal;
+ 	u32 val;
+@@ -161,10 +162,11 @@ void ath12k_wifi7_hal_srng_dst_hw_init(struct ath12k_base *ab,
+ 
+ 	/* Initialize head and tail pointers to indicate ring is empty */
+ 	reg_base = srng->hwreg_base[HAL_SRNG_REG_GRP_R2];
+-	ath12k_hif_write32(ab, reg_base, 0);
+-	ath12k_hif_write32(ab, reg_base + HAL_REO1_RING_TP_OFFSET, 0);
+-	*srng->u.dst_ring.hp_addr = 0;
+-	srng->u.dst_ring.tp = 0;
++	ath12k_hif_write32(ab, reg_base,  restore_idx * srng->entry_size);
++	ath12k_hif_write32(ab, reg_base + HAL_REO1_RING_TP_OFFSET,
++			   restore_idx * srng->entry_size);
++	*srng->u.dst_ring.hp_addr =  restore_idx * srng->entry_size;
++	srng->u.dst_ring.tp =  restore_idx * srng->entry_size;
+ 
+ 	reg_base = srng->hwreg_base[HAL_SRNG_REG_GRP_R0];
+ 	val = 0;
+@@ -180,7 +182,8 @@ void ath12k_wifi7_hal_srng_dst_hw_init(struct ath12k_base *ab,
+ }
+ 
+ void ath12k_wifi7_hal_srng_src_hw_init(struct ath12k_base *ab,
+-				       struct hal_srng *srng)
++				       struct hal_srng *srng,
++				       u32 restore_idx)
+ {
+ 	struct ath12k_hal *hal = &ab->hal;
+ 	u32 val;
+@@ -250,10 +253,11 @@ void ath12k_wifi7_hal_srng_src_hw_init(struct ath12k_base *ab,
+ 
+ 	/* Initialize head and tail pointers to indicate ring is empty */
+ 	reg_base = srng->hwreg_base[HAL_SRNG_REG_GRP_R2];
+-	ath12k_hif_write32(ab, reg_base, 0);
+-	ath12k_hif_write32(ab, reg_base + HAL_TCL1_RING_TP_OFFSET, 0);
+-	*srng->u.src_ring.tp_addr = 0;
+-	srng->u.src_ring.hp = 0;
++	ath12k_hif_write32(ab, reg_base, restore_idx * srng->entry_size);
++	ath12k_hif_write32(ab, reg_base + HAL_TCL1_RING_TP_OFFSET,
++			   restore_idx * srng->entry_size);
++	*srng->u.src_ring.tp_addr =  restore_idx * srng->entry_size;
++	srng->u.src_ring.hp =  restore_idx * srng->entry_size;
+ 
+ 	reg_base = srng->hwreg_base[HAL_SRNG_REG_GRP_R0];
+ 	val = 0;
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hal.h b/drivers/net/wireless/ath/ath12k/wifi7/hal.h
+index bacfa70..d1ad473 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal.h
+@@ -578,9 +578,9 @@ extern const struct hal_ops hal_wcn7850_ops;
+ void ath12k_wifi7_hal_ce_dst_setup(struct ath12k_base *ab,
+ 				   struct hal_srng *srng, int ring_num);
+ void ath12k_wifi7_hal_srng_dst_hw_init(struct ath12k_base *ab,
+-				       struct hal_srng *srng);
++				       struct hal_srng *srng, u32 restore_idx);
+ void ath12k_wifi7_hal_srng_src_hw_init(struct ath12k_base *ab,
+-				       struct hal_srng *srng);
++				       struct hal_srng *srng, u32 restore_idx);
+ void ath12k_wifi7_hal_set_umac_srng_ptr_addr(struct ath12k_base *ab,
+ 					     struct hal_srng *srng,
+ 					     enum hal_ring_type type, int ring_num);
+-- 
+2.34.1
+

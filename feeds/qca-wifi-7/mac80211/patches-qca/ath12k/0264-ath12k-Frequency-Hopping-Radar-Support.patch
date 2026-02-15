@@ -1,0 +1,217 @@
+From f7daa6246808ae1ebee3db696947df9e33925c48 Mon Sep 17 00:00:00 2001
+From: Thomas Wu <quic_wthomas@quicinc.com>
+Date: Thu, 14 Sep 2023 14:55:30 -0700
+Subject: [PATCH] wifi: ath12k: Add Frequency Hopping Radar handling support
+
+When frequency hopping radar is detected, firmware will send a control bit to
+determine whether to perform channel submarking or put all channels on NOL.
+Host will perform channel submarking unless it receives this message
+from firmware telling it to put all channels on NOL.
+
+Signed-off-by: Thomas Wu <quic_wthomas@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/debugfs.c | 19 +++--
+ drivers/net/wireless/ath/ath12k/wmi.c     | 97 +++++++++++++++++------
+ drivers/net/wireless/ath/ath12k/wmi.h     |  9 +++
+ 3 files changed, 96 insertions(+), 29 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -4631,6 +4631,8 @@ ath12k_wmi_copy_resource_config(struct a
+ 	if (ab->hw_params->reoq_lut_support)
+ 		wmi_cfg->host_service_flags |=
+ 			cpu_to_le32(1 << WMI_RSRC_CFG_HOST_SVC_FLAG_REO_QREF_SUPPORT_BIT);
++	wmi_cfg->host_service_flags |=
++			cpu_to_le32(1 << WMI_RSRC_CFG_HOST_SVC_FLAG_FULL_BW_NOL_SUPPORT_BIT);
+ 	wmi_cfg->ema_max_vap_cnt = cpu_to_le32(tg_cfg->ema_max_vap_cnt);
+ 	wmi_cfg->ema_max_profile_period = cpu_to_le32(tg_cfg->ema_max_profile_period);
+ 	wmi_cfg->flags2 |= cpu_to_le32(WMI_RSRC_CFG_FLAGS2_CALC_NEXT_DTIM_COUNT_SET);
+@@ -4858,6 +4860,8 @@ int ath12k_wmi_cmd_init(struct ath12k_ba
+ 	if (test_bit(WMI_TLV_SERVICE_REG_CC_EXT_EVENT_SUPPORT,
+ 		     ab->wmi_ab.svc_map))
+ 		arg.res_cfg.is_reg_cc_ext_event_supported = true;
++	if (test_bit(WMI_TLV_SERVICE_RADAR_FLAGS_SUPPORT, ab->wmi_ab.svc_map))
++		arg.res_cfg.is_full_bw_nol_feature_supported = true;
+ 
+ 	if (test_bit(WMI_SERVICE_WDS_NULL_FRAME_SUPPORT, ab->wmi_ab.svc_map))
+ 		arg.res_cfg.is_wds_null_frame_supported = true;
+@@ -9063,7 +9067,8 @@ ath12k_wmi_pdev_csa_switch_count_status_
+ 
+ static void
+ ath12k_dfs_calculate_subchannels(struct ath12k_base *ab,
+-				 const struct ath12k_wmi_pdev_radar_event *radar)
++				 const struct ath12k_wmi_pdev_radar_event *radar,
++				 bool do_full_bw_nol)
+ {
+ 	u32 radar_found_freq, sub_channel_cfreq, radar_found_freq_low, radar_found_freq_high;
+ 	struct ath12k_mac_get_any_chanctx_conf_arg arg;
+@@ -9095,12 +9100,17 @@ ath12k_dfs_calculate_subchannels(struct
+ 
+ 	width = chandef->width;
+ 	subchannel_count = ath12k_calculate_subchannel_count(width);
+-	if (!subchannel_count)
+-	{
+-		ath12k_warn(ab, "invalid subchannel count for bandwith=%d\n",width);
++	if (!subchannel_count) {
++		ath12k_warn(ab, "invalid subchannel count for bandwidth=%d\n", width);
+ 		goto mark_radar;
+ 	}
+ 
++	if (do_full_bw_nol) {
++		ath12k_dbg(ab, ATH12K_DBG_WMI, "put all channels in NOL\n");
++		goto mark_radar;
++	}
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "perform channel submarking\n");
++
+ 	center_freq = chandef->center_freq1;
+ 
+ 	radar_found_freq = center_freq + radar->freq_offset;
+@@ -9135,25 +9145,66 @@ mark_radar:
+ static void
+ ath12k_wmi_pdev_dfs_radar_detected_event(struct ath12k_base *ab, struct sk_buff *skb)
+ {
+-	const void **tb;
++	const struct wmi_pdev_radar_flags_param *rf_ev;
+ 	const struct ath12k_wmi_pdev_radar_event *ev;
+ 	struct ath12k *ar;
+ 	int ret;
++	bool do_full_bw_nol = false;
++	bool is_full_bw_nol_feature_supported = false;
++	const struct wmi_tlv *tlv;
++	u16 tlv_tag;
++	u32 len = 0;
++	void *ptr;
+ 
+-	tb = ath12k_wmi_tlv_parse_alloc(ab, skb, GFP_ATOMIC);
+-	if (IS_ERR(tb)) {
+-		ret = PTR_ERR(tb);
++	ptr = skb->data;
++
++	len += sizeof(*ev) + TLV_HDR_SIZE;
++	if (skb->len < len) {
+ 		ath12k_warn(ab, "failed to parse tlv: %d\n", ret);
+ 		return;
+ 	}
+ 
+-	ev = tb[WMI_TAG_PDEV_DFS_RADAR_DETECTION_EVENT];
++	tlv = ptr;
++	tlv_tag = le32_get_bits(tlv->header, WMI_TLV_TAG);
+ 
+-	if (!ev) {
+-		ath12k_warn(ab, "failed to fetch pdev dfs radar detected ev");
+-		kfree(tb);
++	ptr += sizeof(*tlv);
++	if (tlv_tag != WMI_TAG_PDEV_DFS_RADAR_DETECTION_EVENT) {
++		ath12k_warn(ab, "pdev dfs event received with wrong tag %x\n", tlv_tag);
+ 		return;
+ 	}
++	ev = ptr;
++	ptr += sizeof(*ev);
++
++	is_full_bw_nol_feature_supported = test_bit(WMI_TLV_SERVICE_RADAR_FLAGS_SUPPORT,
++						    ab->wmi_ab.svc_map);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "pdev dfs radar event found\n");
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "pdev dfs radar flags host support %x\n",
++		   is_full_bw_nol_feature_supported);
++	if (is_full_bw_nol_feature_supported) {
++		/* Expect an array TLV containing a single radar flags param TLV */
++		len += sizeof(*tlv) + sizeof(*tlv) + sizeof(*rf_ev);
++		if (skb->len < len) {
++			ath12k_warn(ab, "pdev dfs radar flag event size invalid\n");
++			return;
++		}
++
++		/* Skip Array TLV Tag */
++		ptr += sizeof(*tlv);
++
++		tlv = ptr;
++		tlv_tag = le32_get_bits(tlv->header, WMI_TLV_TAG);
++		ptr += sizeof(*tlv);
++		if (tlv_tag != WMI_TAG_PDEV_DFS_RADAR_FLAGS) {
++			ath12k_warn(ab, "pdev dfs radar flag event received with wrong tag\n");
++			return;
++		}
++
++		rf_ev = ptr;
++		do_full_bw_nol = le32_to_cpu(rf_ev->radar_flags) &
++				 (1 << WMI_PDEV_RADAR_FLAGS_FULL_BW_NOL_MARK_BIT);
++		ath12k_dbg(ab, ATH12K_DBG_WMI, "pdev dfs radar flag event found, radar_flag_bit %d\n",
++			   do_full_bw_nol);
++	}
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_WMI,
+ 		   "pdev dfs radar detected on pdev %d, detection mode %d, chan freq %d, chan_width %d, detector id %d, seg id %d, timestamp %d, chirp %d, freq offset %d, sidx %d",
+@@ -9164,11 +9215,11 @@ ath12k_wmi_pdev_dfs_radar_detected_event
+ 	rcu_read_lock();
+ 
+ 	ar = ath12k_mac_get_ar_by_pdev_id(ab, le32_to_cpu(ev->pdev_id));
+-
+ 	if (!ar) {
+ 		ath12k_warn(ab, "radar detected in invalid pdev %d\n",
+ 			    ev->pdev_id);
+-		goto exit;
++		rcu_read_unlock();
++		return;
+ 	}
+ 
+ 	ath12k_dbg(ar->ab, ATH12K_DBG_REG, "DFS Radar Detected in pdev %d\n",
+@@ -9177,12 +9228,9 @@ ath12k_wmi_pdev_dfs_radar_detected_event
+ 	if (ar->dfs_block_radar_events)
+ 		ath12k_info(ab, "DFS Radar detected, but ignored as requested\n");
+ 	else
+-		ath12k_dfs_calculate_subchannels(ab, ev);
++		ath12k_dfs_calculate_subchannels(ab, ev, do_full_bw_nol);
+ 
+-exit:
+ 	rcu_read_unlock();
+-
+-	kfree(tb);
+ }
+ 
+ static void ath12k_tm_wmi_event_segmented(struct ath12k_base *ab, u32 cmd_id,
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -2040,6 +2040,7 @@ enum wmi_tlv_tag {
+ 	WMI_TAG_RSSI_DBM_CONVERSION_TEMP_OFFSET_INFO,
+ 	WMI_TAG_HALPHY_CTRL_PATH_CMD_FIXED_PARAM = 0x442,
+ 	WMI_TAG_HALPHY_CTRL_PATH_EVENT_FIXED_PARAM,
++	WMI_TAG_PDEV_DFS_RADAR_FLAGS = 0x4b4,
+ 	WMI_TAG_MAX
+ };
+ 
+@@ -2278,6 +2279,7 @@ enum wmi_tlv_service {
+ 	WMI_TLV_SERVICE_WMSK_COMPACTION_RX_TLVS = 361,
+ 
+ 	WMI_TLV_SERVICE_PEER_METADATA_V1A_V1B_SUPPORT = 365,
++	WMI_TLV_SERVICE_RADAR_FLAGS_SUPPORT = 390,
+ 	WMI_SERVICE_WDS_NULL_FRAME_SUPPORT = 421,
+ 	WMI_SERVICE_MEC_AGING_TIMER_SUPPORT = 423,
+ 
+@@ -2517,6 +2519,7 @@ struct ath12k_wmi_resource_config_arg {
+ 	u32 ema_max_profile_period;
+ 	bool is_reg_cc_ext_event_supported;
+ 	bool is_wds_null_frame_supported;
++	bool is_full_bw_nol_feature_supported;
+ };
+ 
+ struct ath12k_wmi_init_cmd_arg {
+@@ -2577,6 +2580,7 @@ struct wmi_init_cmd {
+ 
+ #define WMI_RSRC_CFG_HOST_SVC_FLAG_REG_CC_EXT_SUPPORT_BIT 4
+ #define WMI_RSRC_CFG_HOST_SVC_FLAG_REO_QREF_SUPPORT_BIT   12
++#define WMI_RSRC_CFG_HOST_SVC_FLAG_FULL_BW_NOL_SUPPORT_BIT	14
+ #define WMI_RSRC_CFG_FLAGS2_RX_PEER_METADATA_VERSION		GENMASK(5, 4)
+ #define WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64	BIT(5)
+ #define WMI_RSRC_CFG_FLAGS2_CALC_NEXT_DTIM_COUNT_SET      BIT(9)
+@@ -4597,6 +4601,11 @@ struct ath12k_wmi_pdev_radar_event {
+ 	a_sle32 sidx;
+ } __packed;
+ 
++struct wmi_pdev_radar_flags_param {
++	__le32 radar_flags;
++} __packed;
++#define WMI_PDEV_RADAR_FLAGS_FULL_BW_NOL_MARK_BIT 0
++
+ #define WMI_DCS_AWGN_INTF       0x04
+ 
+ struct wmi_dcs_awgn_info {

@@ -1,0 +1,118 @@
+From 3ce53349d3af64418258d0f24fba9baf24be7245 Mon Sep 17 00:00:00 2001
+From: Nithyanantham Paramasivam <quic_nithp@quicinc.com>
+Date: Wed, 19 Feb 2025 06:05:09 +0530
+Subject: [PATCH 113/141] wifi: ath12k: Fix the handling of TX packets in
+ Ethernet mode
+
+When the virtual interface is configured in Ethernet mode, instruct
+the firmware to use a different encapsulation mode for QoS null frames
+and EAPOL frames received in native Wi-Fi format. For multicast or
+broadcast packets in native Wi-Fi or raw format, set the MSDU
+extension descriptor to override the bank register configuration
+on a per-packet basis.
+
+Signed-off-by: Nithyanantham Paramasivam <quic_nithp@quicinc.com>
+Signed-off-by: Raj Kumar Bhagat <quic_rajkbhag@quicinc.com>
+Signed-off-by: Jeff Johnson <jeff.johnson@oss.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_tx.c | 28 +++++++++++++++++++------
+ drivers/net/wireless/ath/ath12k/mac.c   |  6 +++---
+ 2 files changed, 25 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp_tx.c b/drivers/net/wireless/ath/ath12k/dp_tx.c
+index 5b137277cb06..0c6be52af660 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -244,6 +244,7 @@ int ath12k_dp_tx(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 	bool msdu_ext_desc = false;
+ 	bool add_htt_metadata = false;
+ 	u32 iova_mask = ab->hw_params->iova_mask;
++	bool is_diff_encap = false, is_null = false;
+ 
+ 	if (test_bit(ATH12K_FLAG_CRASH_FLUSH, &ar->ab->dev_flags))
+ 		return -ESHUTDOWN;
+@@ -331,10 +332,14 @@ int ath12k_dp_tx(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 	ti.flags1 |= u32_encode_bits(1, HAL_TCL_DATA_CMD_INFO3_TID_OVERWRITE);
+ 
+ 	ti.tid = ath12k_dp_tx_get_tid(skb);
+-
+ 	switch (ti.encap_type) {
+ 	case HAL_TCL_ENCAP_TYPE_NATIVE_WIFI:
+-		ath12k_dp_tx_encap_nwifi(skb);
++		is_null = ieee80211_is_nullfunc(hdr->frame_control);
++		if ((ahvif->vif->offload_flags & IEEE80211_OFFLOAD_ENCAP_ENABLED) &&
++		    (skb->protocol == cpu_to_be16(ETH_P_PAE) || is_null))
++			is_diff_encap = true;
++		else
++			ath12k_dp_tx_encap_nwifi(skb);
+ 		break;
+ 	case HAL_TCL_ENCAP_TYPE_RAW:
+ 		if (!test_bit(ATH12K_FLAG_RAW_MODE, &ab->dev_flags)) {
+@@ -353,6 +358,15 @@ int ath12k_dp_tx(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 		goto fail_remove_tx_buf;
+ 	}
+ 
++	if (unlikely(ahvif->tx_encap_type == HAL_TCL_ENCAP_TYPE_ETHERNET &&
++		     !(skb_cb->flags & ATH12K_SKB_HW_80211_ENCAP))) {
++		msdu_ext_desc = true;
++		if (skb->protocol == cpu_to_be16(ETH_P_PAE)) {
++			ti.encap_type = HAL_TCL_ENCAP_TYPE_RAW;
++			ti.encrypt_type = HAL_ENCRYPT_TYPE_OPEN;
++		}
++	}
++
+ 	if (iova_mask &&
+ 	    (unsigned long)skb->data & iova_mask) {
+ 		ret = ath12k_dp_tx_align_payload(ab, &skb);
+@@ -378,13 +392,15 @@ int ath12k_dp_tx(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 		goto fail_remove_tx_buf;
+ 	}
+ 
+-	if (!test_bit(ATH12K_FLAG_HW_CRYPTO_DISABLED, &ar->ab->dev_flags) &&
+-	    !(skb_cb->flags & ATH12K_SKB_HW_80211_ENCAP) &&
+-	    !(skb_cb->flags & ATH12K_SKB_CIPHER_SET) &&
+-	    ieee80211_has_protected(hdr->frame_control)) {
++	if ((!test_bit(ATH12K_FLAG_HW_CRYPTO_DISABLED, &ar->ab->dev_flags) &&
++	     !(skb_cb->flags & ATH12K_SKB_HW_80211_ENCAP) &&
++	     !(skb_cb->flags & ATH12K_SKB_CIPHER_SET) &&
++	     ieee80211_has_protected(hdr->frame_control)) ||
++	     is_diff_encap) {
+ 		/* Add metadata for sw encrypted vlan group traffic */
+ 		add_htt_metadata = true;
+ 		msdu_ext_desc = true;
++		ti.meta_data_flags |= HTT_TCL_META_DATA_VALID_HTT;
+ 		ti.flags0 |= u32_encode_bits(1, HAL_TCL_DATA_CMD_INFO2_TO_FW);
+ 		ti.meta_data_flags |= HTT_TCL_META_DATA_VALID_HTT;
+ 		ti.encap_type = HAL_TCL_ENCAP_TYPE_RAW;
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 7b2371be8e7d..a944c0ebc66f 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -8160,7 +8160,7 @@ static void ath12k_mac_op_tx(struct ieee80211_hw *hw,
+ 	struct ath12k *ar, *tmp_ar;
+ 	struct ath12k_peer *peer;
+ 	unsigned long links_map;
+-	bool is_mcast = false;
++	bool is_mcast = false, is_eth = false;
+ 	bool is_dvlan = false;
+ 	struct ethhdr *eth;
+ 	bool is_prb_rsp;
+@@ -8208,7 +8208,7 @@ static void ath12k_mac_op_tx(struct ieee80211_hw *hw,
+ 	if (info_flags & IEEE80211_TX_CTL_HW_80211_ENCAP) {
+ 		eth = (struct ethhdr *)skb->data;
+ 		is_mcast = is_multicast_ether_addr(eth->h_dest);
+-
++		is_eth = true;
+ 		skb_cb->flags |= ATH12K_SKB_HW_80211_ENCAP;
+ 	} else if (ieee80211_is_mgmt(hdr->frame_control)) {
+ 		ret = ath12k_mac_mgmt_tx(ar, skb, is_prb_rsp);
+@@ -8234,7 +8234,7 @@ static void ath12k_mac_op_tx(struct ieee80211_hw *hw,
+ 	    ieee80211_has_protected(hdr->frame_control))
+ 		is_dvlan = true;
+ 
+-	if (!vif->valid_links || !is_mcast || is_dvlan ||
++	if (!vif->valid_links || !is_mcast || is_dvlan || is_eth ||
+ 	    test_bit(ATH12K_FLAG_RAW_MODE, &ar->ab->dev_flags)) {
+ 		ret = ath12k_dp_tx(ar, arvif, skb, false, 0, is_mcast);
+ 		if (unlikely(ret)) {
+-- 

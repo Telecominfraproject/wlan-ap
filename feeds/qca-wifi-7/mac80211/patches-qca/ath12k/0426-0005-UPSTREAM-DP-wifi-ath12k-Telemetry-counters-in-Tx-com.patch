@@ -1,0 +1,526 @@
+From 9945df74bba4634c2389fda412f768a795875805 Mon Sep 17 00:00:00 2001
+From: Kenvish Butani <kbutani@qti.qualcomm.com>
+Date: Tue, 17 Jun 2025 20:20:57 +0530
+Subject: [PATCH 5/6] UPSTREAM: DP: wifi: ath12k: Telemetry counters in Tx comp
+ path
+
+- Introduced support for telemetry counters at the
+  Link Peer level in the per-packet Tx Completion path.
+- Added both Debug and Advanced counters to
+  enhance packet tracking during Tx.
+- Enhanced all packet drop conditions with
+  device-level stats counters to capture every
+  packet drop event.
+
+Command to enable:
+echo 1 > /sys/kernel/debug/ath12k/pci-XX/macX/enable_dp_stats
+echo 1 > /sys/kernel/debug/ath12k/pci-XX/macX/enable_dp_debug_stats
+
+Sample Output:
+STA DP TX STATS
+==============
+				       Total               Ring_X
+
+	Tx completion-packets          5374307             1254957
+	Tx completion-bytes            8125908438          1897471776
+	Tx success-packets             5374307             1254957
+	Tx success-bytes               8125908438          1897471776
+	Tx Failed                      0                   0
+	Release src not TQM            7                   5
+	Retry count                    29133               6071
+	Total MSDU retries             31150               6517
+	Multiple retry count           2017                446
+	OFDMA                          0                   0
+	AMSDU count                    5359576             1252097
+	Non AMSDU count                14722               2855
+	Invalid link ID packet count   0                   0
+	mcast                          0                   0
+	ucast                          0                   0
+	bcast                          0                   0
+
+	WBM release reason:	       7		   0
+
+	TQM release reason:	       5374298		   0
+===============
+
+Patch-dependency:
+	0426-0004-UPSTREAM-DP-wifi-ath12k-Telemetry-Configuration-Knob.patch
+
+Signed-off-by: Kenvish Butani <kbutani@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_stats.h    |   2 +
+ drivers/net/wireless/ath/ath12k/dp_tx.c       |  78 ++++++++++
+ drivers/net/wireless/ath/ath12k/dp_tx.h       |  10 ++
+ drivers/net/wireless/ath/ath12k/hal.h         |   6 +
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c | 146 ++++++++++++++----
+ 5 files changed, 214 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp_stats.h b/drivers/net/wireless/ath/ath12k/dp_stats.h
+index e595d39..9f0d44c 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_stats.h
++++ b/drivers/net/wireless/ath/ath12k/dp_stats.h
+@@ -41,11 +41,13 @@ enum ath12k_dp_tx_enq_error {
+ };
+ 
+ enum ath12k_dp_tx_comp_error {
++	DP_TX_COMP_ERR_MISC,
+ 	DP_TX_COMP_ERR_INVALID_DESC,
+ 	DP_TX_COMP_ERR_INVALID_PDEV,
+ 	DP_TX_COMP_ERR_INVALID_VIF,
+ 	DP_TX_COMP_ERR_INVALID_PEER,
+ 	DP_TX_COMP_ERR_INVALID_LINK_PEER,
++	DP_TX_COMP_ERR_DESC_INUSE,
+ 	DP_TX_COMP_ERR_MAX,
+ };
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/dp_tx.c b/drivers/net/wireless/ath/ath12k/dp_tx.c
+index 9b97ded..0702f03 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -14,6 +14,8 @@
+ #include "mac.h"
+ #include "ppe.h"
+ #include "hal.h"
++#include "dp_peer.h"
++#include "dp_stats.h"
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ static void
+@@ -440,6 +442,82 @@ ath12k_dp_tx_htt_h2t_vdev_stats_ol_req(struct ath12k *ar, u64 reset_bitmask)
+ 	return 0;
+ }
+ 
++u8 ath12k_dp_get_link_id(struct ath12k_pdev_dp *dp_pdev,
++			 struct hal_tx_status *ts,
++			 struct ath12k_dp_peer *peer)
++{
++	u8 hw_link_id = ts->hw_link_id;
++
++	if (hw_link_id >= ATH12K_DP_MAX_MLO_LINKS) {
++		/* For invalid Link_id update stats on primary link */
++		hw_link_id = dp_pdev->hw_link_id;
++	}
++
++	if (peer->hw_links[hw_link_id] > ATH12K_DP_MAX_MLO_LINKS)
++		return peer->hw_links[dp_pdev->hw_link_id];
++
++	return peer->hw_links[hw_link_id];
++}
++EXPORT_SYMBOL(ath12k_dp_get_link_id);
++
++void ath12k_dp_tx_update_peer_basic_stats(struct ath12k_dp_peer *peer,
++					  u32 msdu_len, u8 tx_status,
++					  u8 link_id, int ring_id)
++{
++	DP_PEER_STATS_PKT_LEN(peer, tx, ring_id, comp_pkt, link_id, 1, msdu_len);
++
++	if (tx_status == HAL_WBM_TQM_REL_REASON_FRAME_ACKED) {
++		DP_PEER_STATS_PKT_LEN(peer, tx, ring_id, tx_success, link_id,
++				      1, msdu_len);
++	} else {
++		DP_PEER_STATS_INC(peer, tx, ring_id, tx_failed, link_id, 1);
++	}
++}
++EXPORT_SYMBOL(ath12k_dp_tx_update_peer_basic_stats);
++
++void ath12k_dp_tx_comp_update_peer_stats(struct ath12k_dp_peer *peer,
++					 struct hal_tx_status *ts,
++					 int ring_id)
++{
++	u8 link_id = peer->stats_link_id;
++
++	if (ts->buf_rel_source != HAL_WBM_REL_SRC_MODULE_TQM) {
++		DP_PEER_STATS_INC(peer, tx, ring_id, release_src_not_tqm,
++				  link_id, 1);
++		DP_PEER_STATS_INC(peer, tx, ring_id, wbm_rel_reason[ts->status],
++				  link_id, 1);
++		return;
++	}
++
++	if (ts->status == HAL_WBM_TQM_REL_REASON_FRAME_ACKED) {
++		DP_PEER_STATS_COND_INC(peer, tx, ring_id, retry_count, link_id,
++				       ts->transmit_cnt > 1, 1);
++
++		DP_PEER_STATS_COND_INC(peer, tx, ring_id, total_msdu_retries,
++				       link_id,
++				       ts->transmit_cnt > 1,
++				       ts->transmit_cnt - 1);
++
++		DP_PEER_STATS_COND_INC(peer, tx, ring_id, multiple_retry_count,
++				       link_id, ts->transmit_cnt > 2, 1);
++
++		DP_PEER_STATS_COND_INC(peer, tx, ring_id, ofdma, link_id,
++				       ts->ofdma, 1);
++
++		DP_PEER_STATS_COND_INC(peer, tx, ring_id, amsdu_cnt, link_id,
++				       ts->msdu_part_of_amsdu, 1);
++
++		DP_PEER_STATS_COND_INC(peer, tx, ring_id, non_amsdu_cnt, link_id,
++				       !ts->msdu_part_of_amsdu, 1);
++	}
++
++	if (ts->status < HAL_WBM_TQM_REL_REASON_MAX) {
++		DP_PEER_STATS_INC(peer, tx, ring_id, tqm_rel_reason[ts->status],
++				  link_id, 1);
++	}
++}
++EXPORT_SYMBOL(ath12k_dp_tx_comp_update_peer_stats);
++
+ int ath12k_dp_tx_htt_pri_link_migr_msg(struct ath12k_base *ab, u16 vdev_id,
+ 				       u16 peer_id, u16 ml_peer_id, u8 pdev_id,
+ 				       u8 chip_id, u16 src_info, bool status)
+diff --git a/drivers/net/wireless/ath/ath12k/dp_tx.h b/drivers/net/wireless/ath/ath12k/dp_tx.h
+index 35c2acf..d2e7f96 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.h
+@@ -9,6 +9,9 @@
+ 
+ #include "core.h"
+ 
++#define DP_GET_HW_LINK_ID_FRM_PPDU_ID(PPDU_ID, LINK_ID_OFFSET, LINK_ID_BITS) \
++	(((PPDU_ID) >> (LINK_ID_OFFSET)) & ((1 << (LINK_ID_BITS)) - 1))
++
+ struct ath12k_ppeds_desc_params {
+ 	unsigned int num_ppeds_desc;
+ 	unsigned int ppeds_hotlist_len;
+@@ -30,6 +33,13 @@ void ath12k_dp_tx_release_txbuf(struct ath12k_dp *dp,
+ struct ath12k_tx_desc_info *ath12k_dp_tx_assign_buffer(struct ath12k_dp *dp,
+ 						       u8 pool_id);
+ int ath12k_dp_tx_htt_h2t_vdev_stats_ol_req(struct ath12k *ar, u64 reset_bitmask);
++u8 ath12k_dp_get_link_id(struct ath12k_pdev_dp *dp_pdev,
++			 struct hal_tx_status *ts, struct ath12k_dp_peer *peer);
++void ath12k_dp_tx_update_peer_basic_stats(struct ath12k_dp_peer *peer,
++					  u32 msdu_len, u8 tx_status,
++					  u8 link_id, int ring_id);
++void ath12k_dp_tx_comp_update_peer_stats(struct ath12k_dp_peer *peer,
++					 struct hal_tx_status *ts, int ring_id);
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ int ath12k_ppeds_tx_completion_handler(struct ath12k_base *ab, int ring_id);
+ struct ath12k_ppeds_tx_desc_info *
+diff --git a/drivers/net/wireless/ath/ath12k/hal.h b/drivers/net/wireless/ath/ath12k/hal.h
+index a6c599a..2441a0c 100644
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -543,6 +543,12 @@ struct hal_tx_status {
+ 	u8 mcs;
+ 	u16 tones;
+ 	u8 ofdma;
++	bool acked;
++	u8 transmit_cnt;
++	u8 first_msdu;
++	u8 last_msdu;
++	u8 msdu_part_of_amsdu;
++	u8 hw_link_id;
+ };
+ 
+ struct hal_srng_params {
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+index 4f3497d..14f7cb9 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -12,6 +12,8 @@
+ #include "hal_rx.h"
+ #include "../debugfs_sta.h"
+ #include "../debugfs.h"
++#include "../dp_stats.h"
++#include "../dp_peer.h"
+ 
+ struct ath12k_tx_sw_metadata {
+ 	struct sk_buff *skb;
+@@ -707,6 +709,15 @@ fail_remove_tx_buf:
+ 	return err;
+ }
+ 
++static inline void
++ath12k_wifi7_dp_tx_get_hw_link_id_from_ppdu_id(struct hal_tx_status *ts,
++					       struct ath12k_dp *dp)
++{
++	ts->hw_link_id = (DP_GET_HW_LINK_ID_FRM_PPDU_ID(ts->ppdu_id,
++							dp->link_id_offset,
++							dp->link_id_bits));
++}
++
+ static void ath12k_wifi7_dp_tx_free_txbuf(struct ath12k_dp *dp,
+ 					  struct sk_buff *msdu,
+ 					  struct dp_tx_ring *tx_ring,
+@@ -746,7 +757,7 @@ static void
+ ath12k_wifi7_dp_tx_htt_tx_complete_buf(struct ath12k_dp *dp,
+ 				       struct sk_buff *msdu,
+ 				       struct dp_tx_ring *tx_ring,
+-				       struct ath12k_dp_htt_wbm_tx_status *ts,
++				       struct hal_tx_status *ts,
+ 				       struct ath12k_tx_sw_metadata *sw_metadata,
+ 				       u16 peer_id)
+ {
+@@ -838,12 +849,17 @@ static void
+ ath12k_wifi7_dp_tx_process_htt_tx_complete(struct ath12k_dp *dp,
+ 					   void *desc, struct sk_buff *msdu,
+ 					   struct dp_tx_ring *tx_ring,
+-					   struct ath12k_tx_sw_metadata *sw_metadata)
++					   struct ath12k_tx_sw_metadata *sw_metadata,
++					   struct hal_tx_status *ts,
++					   int ring_id)
+ {
+ 	struct htt_tx_wbm_completion *status_desc;
+-	struct ath12k_dp_htt_wbm_tx_status ts = {0};
+ 	int htt_status;
+-	u16 peer_id;
++	struct ath12k_pdev_dp *dp_pdev;
++	u8 pdev_id;
++	struct ath12k_dp_peer *peer = NULL;
++	u8 link_id = 0;
++	u32 msdu_len = msdu->len;
+ 
+ 	status_desc = desc;
+ 
+@@ -851,18 +867,17 @@ ath12k_wifi7_dp_tx_process_htt_tx_complete(struct ath12k_dp *dp,
+ 				   HTT_TX_WBM_COMP_INFO0_STATUS);
+ 	dp->device_stats.fw_tx_status[htt_status]++;
+ 
+-	if (sw_metadata->flags & DP_TX_DESC_FLAG_FAST) {
+-		struct ath12k_pdev_dp *dp_pdev;
+-		u8 pdev_id;
++	pdev_id = ath12k_hw_mac_id_to_pdev_id(dp->hw_params, sw_metadata->mac_id);
+ 
+-		pdev_id = ath12k_hw_mac_id_to_pdev_id(dp->hw_params, sw_metadata->mac_id);
++	rcu_read_lock();
++	dp_pdev = ath12k_dp_to_dp_pdev(dp, pdev_id);
++	if (!dp_pdev) {
++		DP_DEVICE_STATS_INC(dp, tx_err.tx_comp_err[DP_TX_COMP_ERR_INVALID_PDEV][ring_id], 1);
++		rcu_read_unlock();
++		return;
++	}
+ 
+-		rcu_read_lock();
+-		dp_pdev = ath12k_dp_to_dp_pdev(dp, pdev_id);
+-		if (!dp_pdev) {
+-			rcu_read_unlock();
+-			return;
+-		}
++	if (sw_metadata->flags & DP_TX_DESC_FLAG_FAST) {
+ 
+ 		if (atomic_dec_and_test(&dp_pdev->num_tx_pending))
+ 			wake_up(&dp_pdev->tx_empty_waitq);
+@@ -872,21 +887,41 @@ ath12k_wifi7_dp_tx_process_htt_tx_complete(struct ath12k_dp *dp,
+ 		return;
+ 	}
+ 
++	ts->ppdu_id = le32_get_bits(status_desc->info2,
++				    HTT_TX_WBM_COMP_INFO2_PPDU_ID);
++	ath12k_wifi7_dp_tx_get_hw_link_id_from_ppdu_id(ts, dp);
++
++	if (le32_get_bits(status_desc->info3, HTT_TX_WBM_COMP_INFO3_VALID)) {
++		ts->peer_id = le32_get_bits(status_desc->info3,
++					    HTT_TX_WBM_COMP_INFO3_SW_PEER_ID);
++	} else {
++		ts->peer_id = HAL_INVALID_PEERID;
++	}
++
+ 	switch (htt_status) {
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_OK:
+-		ts.acked = (htt_status == HAL_WBM_REL_HTT_TX_COMP_STATUS_OK);
+-		ts.ack_rssi = le32_get_bits(status_desc->info2,
++		ts->acked = (htt_status == HAL_WBM_REL_HTT_TX_COMP_STATUS_OK);
++		ts->ack_rssi = le32_get_bits(status_desc->info2,
+ 					    HTT_TX_WBM_COMP_INFO2_ACK_RSSI);
+-		peer_id = le32_get_bits(((struct hal_wbm_completion_ring_tx *)desc)->
+-				info3, HAL_WBM_COMPL_TX_INFO3_PEER_ID);
+ 
+-		ath12k_wifi7_dp_tx_htt_tx_complete_buf(dp, msdu, tx_ring, &ts,
+-						       sw_metadata, peer_id);
++		ts->status = HAL_WBM_TQM_REL_REASON_FRAME_ACKED;
++		ath12k_wifi7_dp_tx_htt_tx_complete_buf(dp, msdu, tx_ring, ts,
++						       sw_metadata, ts->peer_id);
+ 		break;
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_DROP:
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_TTL:
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_REINJ:
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_INSPECT:
++		switch (htt_status) {
++		case HAL_WBM_REL_HTT_TX_COMP_STATUS_DROP:
++			ts->status = HAL_WBM_TQM_REL_REASON_CMD_REMOVE_MPDU;
++			break;
++		case HAL_WBM_REL_HTT_TX_COMP_STATUS_TTL:
++			ts->status = HAL_WBM_TQM_REL_REASON_CMD_REMOVE_TX;
++		default:
++			break;
++		}
++		fallthrough;
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_VDEVID_MISMATCH:
+ 		ath12k_wifi7_dp_tx_free_txbuf(dp, msdu, tx_ring, sw_metadata);
+ 		break;
+@@ -900,6 +935,22 @@ ath12k_wifi7_dp_tx_process_htt_tx_complete(struct ath12k_dp *dp,
+ 		break;
+ 	}
+ 
++	peer = ath12k_dp_peer_find_by_peerid_index(dp, dp_pdev, ts->peer_id);
++	if (peer) {
++		link_id = ath12k_dp_get_link_id(dp_pdev, ts, peer);
++		peer->stats_link_id = link_id;
++		ath12k_dp_tx_update_peer_basic_stats(peer, msdu_len,
++						     htt_status,
++						     link_id, ring_id);
++		if (unlikely(ath12k_debugfs_is_dp_stats_enabled(dp_pdev))) {
++			if (ath12k_debugfs_is_dp_debug_stats_enabled(dp_pdev))
++				ath12k_dp_tx_comp_update_peer_stats(peer, ts,
++								    ring_id);
++		}
++	} else {
++		DP_DEVICE_STATS_INC(dp, tx_err.tx_comp_err[DP_TX_COMP_ERR_INVALID_PEER][ring_id], 1);
++	}
++	rcu_read_unlock();
+ }
+ 
+ static void
+@@ -1060,9 +1111,13 @@ static void ath12k_wifi7_dp_tx_complete_msdu(struct ath12k_pdev_dp *dp_pdev,
+ 	struct ath12k_skb_cb *skb_cb;
+ 	struct ieee80211_vif *vif;
+ 	struct ath12k_vif *ahvif;
+-	struct ath12k_dp_link_peer *peer;
++	struct ath12k_dp_link_peer *link_peer;
+ 	struct sk_buff *skb_ext_desc = sw_metadata->skb_ext_desc;
+ 	struct ath12k *ar;
++	struct ath12k_dp_peer *peer = NULL;
++	u8 link_id = 0;
++	enum ath12k_dp_tx_comp_error drop_reason = DP_TX_COMP_ERR_MISC;
++	u32 msdu_len = msdu->len;
+ 
+ 	if (WARN_ON_ONCE(ts->buf_rel_source != HAL_WBM_REL_SRC_MODULE_TQM)) {
+ 		/* Must not happen */
+@@ -1092,11 +1147,13 @@ static void ath12k_wifi7_dp_tx_complete_msdu(struct ath12k_pdev_dp *dp_pdev,
+ 
+ 	if (!rcu_dereference(ab->pdevs_active[dp_pdev->mac_id])) {
+ 		ieee80211_free_txskb(ath12k_dp_pdev_to_hw(dp_pdev), msdu);
++		drop_reason = DP_TX_COMP_ERR_INVALID_PDEV;
+ 		goto exit;
+ 	}
+ 
+ 	if (!skb_cb->vif) {
+ 		ieee80211_free_txskb(ath12k_dp_pdev_to_hw(dp_pdev), msdu);
++		drop_reason = DP_TX_COMP_ERR_INVALID_VIF;
+ 		goto exit;
+ 	}
+ 
+@@ -1117,6 +1174,21 @@ static void ath12k_wifi7_dp_tx_complete_msdu(struct ath12k_pdev_dp *dp_pdev,
+ 	/* skip tx rate update from ieee80211_status*/
+ 	info->status.rates[0].idx = -1;
+ 
++	peer = ath12k_dp_peer_find_by_peerid_index(dp, dp_pdev, ts->peer_id);
++	if (peer) {
++		link_id = ath12k_dp_get_link_id(dp_pdev, ts, peer);
++		peer->stats_link_id = link_id;
++		ath12k_dp_tx_update_peer_basic_stats(peer, msdu_len, ts->status,
++						     link_id, ring);
++
++		if (unlikely(ath12k_debugfs_is_dp_stats_enabled(dp_pdev))) {
++			if (ath12k_debugfs_is_dp_debug_stats_enabled(dp_pdev))
++				ath12k_dp_tx_comp_update_peer_stats(peer, ts, ring);
++		}
++	} else {
++		DP_DEVICE_STATS_INC(dp, tx_err.tx_comp_err[DP_TX_COMP_ERR_INVALID_PEER][ring], 1);
++	}
++
+ 	if (ts->status == HAL_WBM_TQM_REL_REASON_FRAME_ACKED &&
+ 			!(info->flags & IEEE80211_TX_CTL_NO_ACK))	{
+ 		info->flags |= IEEE80211_TX_STAT_ACK;
+@@ -1180,20 +1252,21 @@ static void ath12k_wifi7_dp_tx_complete_msdu(struct ath12k_pdev_dp *dp_pdev,
+        	ath12k_wifi7_dp_tx_update_txcompl(dp_pdev, ts);
+ 
+ 	spin_lock_bh(&dp->dp_lock);
+-	peer = ath12k_dp_link_peer_find_by_id(dp, ts->peer_id);
+-	if (!peer || !peer->sta) {
++	link_peer = ath12k_dp_link_peer_find_by_id(dp, ts->peer_id);
++	if (!link_peer || !link_peer->sta) {
+ 		ath12k_dbg(ab, ATH12K_DBG_DATA,
+ 			   "dp_tx: failed to find the peer with peer_id %d\n",
+ 			   ts->peer_id);
+ 		spin_unlock_bh(&dp->dp_lock);
+ 		ieee80211_free_txskb(ath12k_dp_pdev_to_hw(dp_pdev), msdu);
++		drop_reason = DP_TX_COMP_ERR_INVALID_LINK_PEER;
+ 		goto exit;
+ 	}
+ 
+-	status.sta = peer->sta;
++	status.sta = link_peer->sta;
+ 	status.info = info;
+ 	status.skb = msdu;
+-	rate = peer->last_txrate;
++	rate = link_peer->last_txrate;
+ 
+ 	status_rate.rate_idx = rate;
+ 	status_rate.try_count = 1;
+@@ -1203,8 +1276,11 @@ static void ath12k_wifi7_dp_tx_complete_msdu(struct ath12k_pdev_dp *dp_pdev,
+ 	spin_unlock_bh(&dp->dp_lock);
+ 
+ 	ieee80211_tx_status_ext(ath12k_dp_pdev_to_hw(dp_pdev), &status);
++	rcu_read_unlock();
++	return;
+ 
+ exit:
++	DP_DEVICE_STATS_INC(dp, tx_err.tx_comp_err[drop_reason][ring], 1);
+ 	rcu_read_unlock();
+ }
+ 
+@@ -1237,6 +1313,16 @@ ath12k_wifi7_dp_tx_status_parse(struct ath12k_base *ab,
+ 	}
+ 
+ 	ts->tid = FIELD_GET(HAL_WBM_RELEASE_TX_INFO3_TID, desc->info3);
++	ts->transmit_cnt = le32_get_bits(desc->info1,
++					 HAL_WBM_COMPL_TX_INFO1_TRANSMIT_COUNT);
++	ts->first_msdu = le32_get_bits(desc->info2,
++				       HAL_WBM_COMPL_TX_INFO2_FIRST_MSDU);
++	ts->last_msdu = le32_get_bits(desc->info2,
++				      HAL_WBM_COMPL_TX_INFO2_LAST_MSDU);
++	ts->msdu_part_of_amsdu =
++			(ts->first_msdu && ts->last_msdu) ? false : true;
++
++	ath12k_wifi7_dp_tx_get_hw_link_id_from_ppdu_id(ts, ab->dp);
+ }
+ 
+ int ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id, int budget)
+@@ -1302,12 +1388,15 @@ int ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id, int
+ 			tx_desc = ath12k_dp_get_tx_desc(dp, desc_id);
+ 		}
+ 		if (!tx_desc) {
++			DP_DEVICE_STATS_INC(dp, tx_err.tx_comp_err[DP_TX_COMP_ERR_INVALID_DESC][ring_id], 1);
+ 			ath12k_warn(ab, "unable to retrieve tx_desc!");
+ 			continue;
+ 		}
+ 
+-		if (!tx_desc->in_use)
++		if (!tx_desc->in_use) {
++			DP_DEVICE_STATS_INC(dp, tx_err.tx_comp_err[DP_TX_COMP_ERR_DESC_INUSE][ring_id], 1);
+ 			continue;
++		}
+ 
+ 		memcpy(&tx_status_entry->tx_status, tx_status, sizeof(*tx_status));
+ 
+@@ -1373,7 +1462,7 @@ int ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id, int
+ 		if (ts.buf_rel_source == HAL_WBM_REL_SRC_MODULE_FW) {
+ 			ath12k_wifi7_dp_tx_process_htt_tx_complete(dp, (void *)tx_status,
+ 								   sw_metadata->skb,
+-								   tx_ring, sw_metadata);
++								   tx_ring, sw_metadata, &ts, ring_id);
+ 			continue;
+ 		}
+ 
+@@ -1394,6 +1483,7 @@ int ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id, int
+ 
+ 		dp_pdev = ath12k_dp_to_dp_pdev(dp, pdev_id);
+ 		if (!dp_pdev) {
++			DP_DEVICE_STATS_INC(dp, tx_err.tx_comp_err[DP_TX_COMP_ERR_INVALID_PDEV][ring_id], 1);
+ 			rcu_read_unlock();
+ 			continue;
+ 		}
+@@ -1406,7 +1496,7 @@ int ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id, int
+ 
+ 			ath12k_wifi7_dp_tx_complete_msdu(dp_pdev, sw_metadata->skb, &ts,
+ 							 sw_metadata, sw_metadata->mac_id,
+-							 tx_ring->tcl_data_ring_id);
++							 ring_id);
+ 		}
+ 
+ 		rcu_read_unlock();
+-- 
+2.34.1
+
