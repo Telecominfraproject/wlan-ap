@@ -42,6 +42,12 @@ endef
 define Kernel/Configure
 	$(call Kernel/Configure/Default)
 	echo '# CONFIG_INITRAMFS_PRESERVE_MTIME is not set' >> $(LINUX_DIR)/.config
+	echo '# CONFIG_ATHMEMDEBUG is not set' >> $(LINUX_DIR)/.config
+	echo 'CONFIG_NFT_NPT=m' >> $(LINUX_DIR)/.config
+	echo 'CONFIG_SKB_RECYCLE_SIZE=2304' >> $(LINUX_DIR)/.config
+	echo '# CONFIG_SKB_TIMESTAMP is not set' >> $(LINUX_DIR)/.config
+	echo '# CONFIG_SKB_FAST_RECYCLABLE_DEBUG_ENABLE is not set' >> $(LINUX_DIR)/.config
+	echo 'CONFIG_DEFAULT_QDISC_DISABLE=y' >> $(LINUX_DIR)/.config
 endef
 
 
