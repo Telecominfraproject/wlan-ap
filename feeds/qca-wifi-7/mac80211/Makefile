@@ -12,18 +12,26 @@ PKG_NAME:=mac80211
 
 PKG_VERSION:=6.6.15
 PKG_RELEASE:=2
-PKG_SOURCE_URL:=http://mirror2.openwrt.org/sources/
-PKG_HASH:=90550338f957db53cee014604b95349a1c571cbadeedbb0625139a983f7fd224
+PKG_LICENSE:=GPL-2.0-only
+PKG_LICENSE_FILES:=COPYING
+
+#PKG_SOURCE_URL:=http://mirror2.openwrt.org/sources/
+#PKG_HASH:=3bbc461121134fda9089c084a5eed577d05e7837a157edf9a3797937172a3ece
+PKG_BACKPORTS_VERSION:=965f73fc
+PKG_BACKPORTS_SOURCE_URL:=git://git.kernel.org/pub/scm/linux/kernel/git/backports/backports.git
+PKG_BACKPORTS_BRANCH:=master
+
 
 PKG_SOURCE:=backports-$(PKG_VERSION).tar.xz
-PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/backports-$(PKG_VERSION)
+PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(if $(BUILD_VARIANT),$(PKG_NAME)-$(BUILD_VARIANT)/)backports-$(PKG_VERSION)
+#PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/backports-$(PKG_VERSION)
 PKG_BUILD_PARALLEL:=1
 
+LOCAL_SRC:=$(TOPDIR)/feeds/qca/mac80211/src/
 PKG_MAINTAINER:=Felix Fietkau <nbd@nbd.name>
 
 PKG_DRIVERS = \
-	mac80211-hwsim \
-	mt7601u
+	mac80211-hwsim
 
 PKG_CONFIG_DEPENDS:= \
 	CONFIG_PACKAGE_kmod-mac80211 \
@@ -35,6 +43,7 @@ PKG_CONFIG_DEPENDS:= \
 	CONFIG_PACKAGE_IWLWIFI_DEBUG \
 	CONFIG_PACKAGE_IWLWIFI_DEBUGFS \
 	CONFIG_PACKAGE_RTLWIFI_DEBUG \
+	CONFIG_PACKAGE_QCN_EXTN \
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -46,11 +55,13 @@ define KernelPackage/mac80211/Default
   MAINTAINER:=Felix Fietkau <nbd@nbd.name>
 endef
 
-config_package=$(if $(CONFIG_PACKAGE_kmod-$(1)),m)
-
-ifneq (,$(findstring ipq,$(CONFIG_TARGET_BOARD)))
-	QCOM:=y
-endif
+# config_pacakge:
+# 1 = OpenWrt KernelPackage name
+# 2 = Optional list of variants for which the module may be selected:
+#     If empty, the module is only selected with the first variant
+#     Use $(ALL_VARIANTS) to allow module selection in all variants
+config_package=$(if $(and $(CONFIG_PACKAGE_kmod-$(1)),$(call mac80211_variant_check,$(2))),m)
+mac80211_variant_check=$(if $(ALL_VARIANTS),$(filter $(BUILD_VARIANT),$(if $(1),$(1),$(firstword $(ALL_VARIANTS)))),y)
 
 config-y:= \
 	WLAN \
@@ -60,14 +71,16 @@ config-y:= \
 	MAC80211_RC_MINSTREL_HT \
 	MAC80211_RC_MINSTREL_VHT \
 	MAC80211_RC_DEFAULT_MINSTREL \
-	WLAN_VENDOR_ATH
+	WLAN_VENDOR_ADMTEK \
+	WLAN_VENDOR_ATH \
+	WLAN_VENDOR_RSI \
 
-config-$(call config_package,cfg80211) += CFG80211
+config-$(call config_package,cfg80211,$(ALL_VARIANTS)) += CFG80211
 config-$(CONFIG_PACKAGE_CFG80211_TESTMODE) += NL80211_TESTMODE
 
-config-$(call config_package,mac80211) += MAC80211
+config-$(call config_package,mac80211,$(ALL_VARIANTS)) += MAC80211
 config-$(CONFIG_PACKAGE_MAC80211_MESH) += MAC80211_MESH
-
+config-$(CONFIG_PACKAGE_kmod-mac80211) += MAC80211_DEBUG_MENU MAC80211_STA_DEBUG MAC80211_MLME_DEBUG
 include ath.mk
 
 PKG_CONFIG_DEPENDS += \
@@ -77,7 +90,6 @@ define KernelPackage/cfg80211
   $(call KernelPackage/mac80211/Default)
   TITLE:=cfg80211 - wireless configuration API
   DEPENDS+= +iw +wireless-regdb +USE_RFKILL:kmod-rfkill +wifi-scripts
-  ABI_VERSION:=$(PKG_VERSION)-$(PKG_RELEASE)
   FILES:= \
 	$(PKG_BUILD_DIR)/compat/compat.ko \
 	$(PKG_BUILD_DIR)/net/wireless/cfg80211.ko
@@ -100,38 +112,26 @@ define KernelPackage/cfg80211/config
   endif
 endef
 
-
 define KernelPackage/mac80211
   $(call KernelPackage/mac80211/Default)
   TITLE:=Linux 802.11 Wireless Networking Stack
   # +kmod-crypto-cmac is a runtime only dependency of net/mac80211/aes_cmac.c
-  DEPENDS+= @TARGET_ipq95xx||TARGET_ipq53xx||TARGET_ipq50xx||TARGET_ipq60xx||TARGET_ipq807x||TARGET_ipq806x||TARGET_ipq||TARGET_ar71xx \
-	+kmod-cfg80211 \
+  DEPENDS+= +kmod-cfg80211 +kmod-crypto-cmac +kmod-crypto-ccm +kmod-crypto-gcm \
 	+kmod-qca-nss-ppe \
 	+kmod-qca-nss-ppe-vp \
 	+kmod-qca-nss-ppe-ds \
-	+kmod-bonding
-  PKG_BUILD_DEPENDS+= PACKAGE_kmod-qca-nss-drv:kmod-qca-nss-drv
-  PKG_BUILD_DEPENDS+= PACKAGE_kmod-qca-nss-ppe:kmod-qca-nss-ppe
-  PKG_BUILD_DEPENDS+= PACKAGE_kmod-qca-nss-ppe-vp:kmod-qca-nss-ppe-vp
-  PKG_BUILD_DEPENDS+= PACKAGE_kmod-qca-nss-ppe-ds:kmod-qca-nss-ppe-ds
-  PKG_BUILD_DEPENDS+= PACKAGE_kmod-bonding:kmod-bonding
+	+kmod-qca-nss-wifi-plugins
   KCONFIG:=\
-	CONFIG_AVERAGE=y
+	CONFIG_AVERAGE=y \
+	CONFIG_QCOM_RPROC_DISABLE_MPD_SUPPORT=y \
+	CONFIG_PCIE_QCOM_EARLY_CAL_SUPPORT=y
+
   FILES:= $(PKG_BUILD_DIR)/net/mac80211/mac80211.ko
   MENU:=1
 endef
 
 define KernelPackage/mac80211/config
   if PACKAGE_kmod-mac80211
-
-    if PACKAGE_kmod-qca-nss-drv
-	config PACKAGE_MAC80211_NSS_SUPPORT
-		bool "Enable NSS support for IPQ platform"
-		default y
-		help
-		  This option enables support for NSS in QCA boards.
-    endif
 
     if PACKAGE_kmod-qca-nss-ppe-vp
 	config PACKAGE_MAC80211_PPE_SUPPORT
@@ -178,65 +178,15 @@ define KernelPackage/mac80211/config
 		bool "Enable 802.11s mesh support"
 		default y
 
-	config PACKAGE_MAC80211_MESSAGE_TRACING
-		bool "Enable mac80211 message tracing"
-		default n
-		help
-		  Select this option to enable tracing.
+	config PACKAGE_MAC80211_ATHDEBUG
+                bool "Enable athdebug module support"
+                default y
+                help
+                  This option enables ATHDEBUG module support.
 
-	config PACKAGE_MAC80211_DEBUG_MENU
-		bool "Select mac80211 debugging features"
-		default n
-		help
-		  This option collects various mac80211 debug settings.
-
-	menu "mac80211 debugging features"
-		depends on PACKAGE_MAC80211_DEBUG_MENU
-
-	config PACKAGE_MAC80211_VERBOSE_DEBUG
-		bool "Verbose debugging output"
-		default n
-		help
-		  Selecting this option causes mac80211 to print out
-		  many debugging messages.
-
-	config PACKAGE_MAC80211_MLME_DEBUG
-		bool "Verbose managed MLME output"
-		default n
-		help
-		  Selecting this option causes mac80211 to print out
-		  debugging messages for the managed-mode MLME.
-
-	config PACKAGE_MAC80211_STA_DEBUG
-		bool "Verbose station debugging"
-		default n
-		help
-		  Selecting this option causes mac80211 to print out
-		  debugging messages for station addition/removal.
-
-	config PACKAGE_MAC80211_HT_DEBUG
-		bool "Verbose HT debugging"
-		default n
-		help
-		  This option enables 802.11n High Throughput features
-		  debug tracing output.
-
-	config PACKAGE_MAC80211_IBSS_DEBUG
-		bool "Verbose IBSS debugging"
-		default n
-		help
-		  Selecting this option causes mac80211 to print out
-		  very verbose IBSS debugging messages.
-
-	config PACKAGE_MAC80211_PS_DEBUG
-		bool "Verbose powersave mode debugging"
-		default n
-		help
-		  Selecting this option causes mac80211 to print out very
-		  verbose power save mode debugging messages (when mac80211
-		  is an AP and has power saving stations.)
-
-        endmenu
+	config PACKAGE_QCN_EXTN
+		bool "Enable QCN extensions support"
+		default y
 
   endif
 endef
@@ -249,7 +199,7 @@ define KernelPackage/mac80211-hwsim
   $(call KernelPackage/mac80211/Default)
   TITLE:=mac80211 HW simulation device
   DEPENDS+= +kmod-mac80211 +@DRIVER_11AX_SUPPORT +@DRIVER_11AC_SUPPORT
-  FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/mac80211_hwsim.ko
+  FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/virtual/mac80211_hwsim.ko
   AUTOLOAD:=$(call AutoProbe,mac80211_hwsim)
 endef
 
@@ -262,11 +212,6 @@ define KernelPackage/mt7601u
   AUTOLOAD:=$(call AutoProbe,mt7601u)
 endef
 
-ifdef CONFIG_TARGET_PROFILE
-TARGET_PROFILE=$(subst ",,$(CONFIG_TARGET_PROFILE))
-PATCH_PROFILE_NAME=patches-$(subst DEVICE_,,$(TARGET_PROFILE))
-endif
-
 ifdef CONFIG_PACKAGE_MAC80211_DEBUGFS
   config-y += \
 	CFG80211_DEBUGFS \
@@ -278,19 +223,14 @@ ifdef CONFIG_PACKAGE_MAC80211_TRACING
 	IWLWIFI_DEVICE_TRACING
 endif
 
-config-$(CONFIG_PACKAGE_MAC80211_NSS_SUPPORT) += MAC80211_NSS_SUPPORT
 config-$(CONFIG_PACKAGE_MAC80211_PPE_SUPPORT) += MAC80211_PPE_SUPPORT
-config-$(CONFIG_PACKAGE_MAC80211_DS_SUPPORT) += MAC80211_BONDED_SUPPORT ATH12K_PPE_DS_SUPPORT ATH12K_BONDED_DS_SUPPORT
+config-$(CONFIG_PACKAGE_MAC80211_DS_SUPPORT) += MAC80211_DS_SUPPORT ATH12K_PPE_DS_SUPPORT
 config-$(CONFIG_PACKAGE_MAC80211_SFE_SUPPORT) += MAC80211_SFE_SUPPORT
 config-$(CONFIG_PACKAGE_MAC80211_MESSAGE_TRACING) += MAC80211_MESSAGE_TRACING ATH10K_TRACING ATH11K_TRACING ATH12K_TRACING
 config-$(CONFIG_PACKAGE_MAC80211_DEBUG_MENU) += MAC80211_DEBUG_MENU
 config-$(CONFIG_PACKAGE_MAC80211_VERBOSE_DEBUG) += MAC80211_VERBOSE_DEBUG
-config-$(CONFIG_PACKAGE_MAC80211_MLME_DEBUG) += MAC80211_MLME_DEBUG
-config-$(CONFIG_PACKAGE_MAC80211_STA_DEBUG) += MAC80211_STA_DEBUG
-config-$(CONFIG_PACKAGE_MAC80211_HT_DEBUG) += MAC80211_HT_DEBUG
-config-$(CONFIG_PACKAGE_MAC80211_IBSS_DEBUG) += MAC80211_IBSS_DEBUG
 config-$(CONFIG_PACKAGE_MAC80211_PS_DEBUG) += MAC80211_PS_DEBUG
-
+config-$(CONFIG_PACKAGE_QCN_EXTN) += QCN_EXTN
 
 config-$(call config_package,mac80211-hwsim) += MAC80211_HWSIM
 
@@ -302,7 +242,7 @@ endif
 
 MAKE_OPTS:= \
 	$(subst -C $(LINUX_DIR),-C "$(PKG_BUILD_DIR)",$(KERNEL_MAKEOPTS)) \
-	EXTRA_CFLAGS="-I$(PKG_BUILD_DIR)/include -I$(STAGING_DIR)/usr/include/qca-nss-drv -I$(STAGING_DIR)/usr/include/qca-nss-ppe -I$(STAGING_DIR)/usr/include/qca-nss-clients -I$(PKG_BUILD_DIR)/include/telemetry_agent/inc -Wall -Werror -Wno-incompatible-pointer-types -Wno-discarded-qualifiers -Wno-int-conversion" \
+	EXTRA_CFLAGS="-I$(PKG_BUILD_DIR)/include $(IREMAP_CFLAGS) $(C_DEFINES) -I$(STAGING_DIR)/usr/include/qca-nss-drv -I$(STAGING_DIR)/usr/include/qca-nss-ppe -I$(STAGING_DIR)/usr/include/qca-nss-clients -I$(PKG_BUILD_DIR)/include/telemetry_agent/inc -Wall -Werror -Wno-incompatible-pointer-types -Wno-discarded-qualifiers -Wno-int-conversion" \
 	KLIB_BUILD="$(LINUX_DIR)" \
 	MODPROBE=true \
 	KLIB=$(TARGET_MODULES_DIR) \
@@ -319,27 +259,44 @@ $(call ConfigVars,m)$(call ConfigVars,y)
 endef
 $(eval $(call shexport,mac80211_config))
 
+SPATCH?=1
 define Build/Prepare
 	rm -rf $(PKG_BUILD_DIR)
 	mkdir -p $(PKG_BUILD_DIR)
-	$(PKG_UNPACK)
+#	cp -rf $(LOCAL_SRC)/* $(PKG_BUILD_DIR)
+#	$(PKG_UNPACK)
 	$(CP) ./src/* $(PKG_BUILD_DIR)
-	$(Build/Patch)
-	rm -rf \
-		$(PKG_BUILD_DIR)/include/linux/ssb \
-		$(PKG_BUILD_DIR)/include/linux/bcma \
-		$(PKG_BUILD_DIR)/include/net/bluetooth
+#	$(Build/Patch)
+#	rm -rf \
+#		$(PKG_BUILD_DIR)/include/linux/ssb \
+#		$(PKG_BUILD_DIR)/include/linux/bcma \
+#		$(PKG_BUILD_DIR)/include/net/bluetooth
+#
+#	rm -f \
+#		$(PKG_BUILD_DIR)/include/linux/cordic.h \
+#		$(PKG_BUILD_DIR)/include/linux/crc8.h \
+#		$(PKG_BUILD_DIR)/include/linux/eeprom_93cx6.h \
+#		$(PKG_BUILD_DIR)/include/linux/wl12xx.h \
+#		$(PKG_BUILD_DIR)/include/linux/mhi.h \
+#		$(PKG_BUILD_DIR)/include/net/ieee80211.h \
+#		$(PKG_BUILD_DIR)/backport-include/linux/bcm47xx_nvram.h
+#
+#	echo 'compat-wireless-$(PKG_VERSION)-$(PKG_RELEASE)-$(REVISION)' > $(PKG_BUILD_DIR)/compat_version
+#ifdef CONFIG_PACKAGE_QCN_EXTN
+#	$(CP) $(TOPDIR)/qca/src/wlan-open-extns/subsys/src $(PKG_BUILD_DIR)/net/mac80211/qcn_extns
+#	$(CP) $(TOPDIR)/qca/src/wlan-open-extns/ath/ath12k/src $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/qcn_extns
+#	$(CP) $(TOPDIR)/qca/src/wlan-open-extns/ath/wifi7/src $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/wifi7/qcn_extns
+#endif
+ifneq ($(CONFIG_DEBUG_MEM_USAGE),y)
+ ifneq ($(CONFIG_PACKAGE_MAC80211_ATHMEMDEBUG),y)
+  ifeq ($(CONFIG_PACKAGE_MAC80211_ATHDEBUG),y)
+    ifeq ($(SPATCH),1)
+	$(Build/refactor)
+    endif
+  endif
+ endif
+endif
 
-	rm -f \
-		$(PKG_BUILD_DIR)/include/linux/cordic.h \
-		$(PKG_BUILD_DIR)/include/linux/crc8.h \
-		$(PKG_BUILD_DIR)/include/linux/eeprom_93cx6.h \
-		$(PKG_BUILD_DIR)/include/linux/wl12xx.h \
-		$(PKG_BUILD_DIR)/include/linux/mhi.h \
-		$(PKG_BUILD_DIR)/include/net/ieee80211.h \
-		$(PKG_BUILD_DIR)/backport-include/linux/bcm47xx_nvram.h
-
-	echo 'compat-wireless-$(PKG_VERSION)-$(PKG_RELEASE)-$(REVISION)' > $(PKG_BUILD_DIR)/compat_version
 endef
 
 ifneq ($(CONFIG_PACKAGE_kmod-cfg80211),)
@@ -349,8 +306,8 @@ ifneq ($(CONFIG_PACKAGE_kmod-cfg80211),)
  endef
 endif
 
-EXTERNAL_PATCH_DIR:=$(CURDIR)/patches-qca
-PATCH_TIP_DIR:=$(CURDIR)/patches-tip
+EXTERNAL_PATCH_DIR:=$(CURDIR)/patches-qca1
+PATCH_TIP_DIR:=$(CURDIR)/patches-tip1
 
 define Build/Patch
 	$(if $(QUILT),rm -rf $(PKG_BUILD_DIR)/patches; mkdir -p $(PKG_BUILD_DIR)/patches)
@@ -374,12 +331,40 @@ endef
 define Quilt/Refresh/Package
 	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/build,build/)
 	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/subsys,subsys/)
+ifdef CONFIG_PACKAGE_QCN_EXTN
+	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(TOPDIR)/qca/src/wlan-open-extns/subsys/patches,patches/)
+endif
 	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/ath,ath/)
 #	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/ath5k,ath5k/)
 #	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/ath9k,ath9k/)
 #	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/ath10k,ath10k/)
 	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/ath11k,ath11k/)
 	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/ath12k,ath12k/)
+ifdef CONFIG_PACKAGE_QCN_EXTN
+	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(TOPDIR)/qca/src/wlan-open-extns/ath/ath12k/patches,patches/)
+	$(call Quilt/RefreshDir,$(PKG_BUILD_DIR),$(TOPDIR)/qca/src/wlan-open-extns/ath/wifi7/patches,patches/)
+endif
+endef
+
+define Build/refactor
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/ahb.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/ce.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/core.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/coredump.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/debugfs_htt_stats.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/dp_htt.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/dp_mon.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/dp_peer.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/dbring.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/debugfs.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/dp_rx.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/mac.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/peer.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/qmi.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/reg.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/wmi.c
+	spatch -sp_file alloc.cocci --in-place $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/wow.c
+	spatch -cocci_file alloc.cocci --in-place -dir $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/wifi7
 endef
 
 define Build/Compile
