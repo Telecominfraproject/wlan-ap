@@ -4,7 +4,6 @@ PKG_DRIVERS += \
 PKG_CONFIG_DEPENDS += \
 	CONFIG_PACKAGE_ATH_DEBUG \
 	CONFIG_PACKAGE_ATH_SPECTRAL \
-	CONFIG_ATH11K_THERMAL \
 	CONFIG_ATH_USER_REGD
 
 ifdef CONFIG_PACKAGE_MAC80211_DEBUGFS
@@ -30,7 +29,7 @@ ifdef CONFIG_PACKAGE_MAC80211_TRACING
 	WIL6210_TRACING
 endif
 
-config-$(call config_package,ath-qca,regular smallbuffers) += ATH_CARDS ATH_COMMON
+config-$(call config_package,ath-qca) += ATH_CARDS ATH_COMMON
 config-$(CONFIG_PACKAGE_ATH_DEBUG) += ATH_DEBUG ATH11K_DEBUG ATH12K_DEBUG
 config-$(CONFIG_PACKAGE_ATH_SPECTRAL) += ATH11K_SPECTRAL
 config-$(CONFIG_ATH_USER_REGD) += ATH_USER_REGD ATH_REG_DYNAMIC_USER_REG_HINTS
@@ -39,7 +38,7 @@ config-$(CONFIG_ATH11K_THERMAL) += ATH11K_THERMAL
 config-$(CONFIG_TARGET_ipq53xx) += ATH12K_AHB ATH12K_POWER_OPTIMIZATION
 
 config-$(call config_package,ath11k-qca) += ATH11K ATH11K_AHB ATH11K_PCI
-config-$(call config_package,ath12k-qca) += ATH12K ATH12K_CFR
+config-$(call config_package,ath12k-qca) += ATH12K
 
 config-$(CONFIG_PACKAGE_kmod-ath12k-qca) += ATH12K_SPECTRAL
 config-$(CONFIG_PACKAGE_ATH12K_SAWF) += ATH12K_SAWF
@@ -144,7 +143,9 @@ define KernelPackage/ath12k-qca
   $(call KernelPackage/mac80211/Default)
   TITLE:=QTI 802.11be wireless cards support
   URL:=https://wireless.wiki.kernel.org/en/users/drivers/ath12k
-  DEPENDS+= +kmod-ath-qca +@DRIVER_11N_SUPPORT +@DRIVER_11W_SUPPORT +@DRIVER_11AC_SUPPORT +@DRIVER_11AX_SUPPORT +kmod-hwmon-core
+  # TODO: Check a way to enable ATH_COMMON in config.
+  # 	  For now added kmod-ath11k-qca to enable ATH_COMMON config
+  DEPENDS+= +kmod-ath-qca +@DRIVER_11N_SUPPORT +@DRIVER_11W_SUPPORT +@DRIVER_11AC_SUPPORT +@DRIVER_11AX_SUPPORT +kmod-ath11k-qca
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/ath12k.ko \
          $(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath12k/wifi7/ath12k_wifi7.ko
 

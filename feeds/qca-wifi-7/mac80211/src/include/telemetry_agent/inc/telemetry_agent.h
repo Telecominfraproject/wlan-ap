@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -29,9 +29,15 @@
 #define STATUS_FAIL -1
 /* Maximum buffer size that is requied to transfer stats between
 agent and APP */
-#define EMESH_MAX_SUB_BUFFERS 10
-#define MAX_SUB_BUFFERS 10
-#define STATS_FREQUECY  1000 /*in milli seconds */
+#define EMESH_MAX_SUB_BUFFERS 2
+#define DETER_MAX_SUB_BUFFERS 5
+#define ADMCTRL_MAX_SUB_BUFFERS 2
+#define PMLO_MAX_SUB_BUFFERS 2
+#define ERP_MAX_SUB_BUFFERS 2
+#define ENERGY_SVC_MAX_SUB_BUFFERS 2
+#define QOSOPT_SVC_MAX_SUB_BUFFERS 2
+#define RM_MAIN_MAX_SUB_BUFFERS 1
+#define STATS_FREQUENCY  1000 /*in milli seconds */
 
 #define MAX_PDEV_LINKS_DB 3
 #define MAX_SOCS_DB 5
@@ -61,11 +67,41 @@ agent and APP */
     }                    \
 } while (0)
 
+struct agent_derived_peer_stats {
+	uint32_t eg_rate;
+	uint32_t min_throughput;
+	uint32_t max_throughput;
+	uint32_t avg_throughput;
+	uint32_t avg_counter;
+};
+
+struct agent_peer_per_retries {
+	uint64_t packet_error_rate;
+	uint64_t retries_percentage;
+};
+
+struct agent_peer_sla_threshold {
+	uint32_t packet_error_rate;
+	uint32_t retries_threshold;
+	uint32_t mcs_min_threshold;
+	uint32_t mcs_max_threshold;
+	uint32_t min_thruput_rate;
+	uint32_t max_thruput_rate;
+};
+
+struct agent_telemetry_peer_tx_ext_stats {
+	struct agent_peer_tx_ext_stats raw_peer_stats;
+	struct agent_derived_peer_stats derived_peer_stats;
+	struct agent_peer_per_retries peer_per_retries_stats;
+	struct agent_peer_sla_threshold peer_tx_stats_threshold;
+};
+
 struct agent_peer_db {
 	struct list_head node;
 	void *peer_obj_ptr;
 	void *pdev_obj_ptr;
 	void *psoc_obj_ptr;
+	uint16_t peer_id;
 	uint8_t peer_mac_addr[6];
 	uint32_t tx_mpdu_retried;
 	uint32_t tx_mpdu_total;
@@ -75,6 +111,7 @@ struct agent_peer_db {
 	uint16_t eff_chan_bw;
 	uint32_t tx_mcs_nss_map[WLAN_VENDOR_EHTCAP_TXRX_MCS_NSS_IDX_MAX];
 	uint32_t rx_mcs_nss_map[WLAN_VENDOR_EHTCAP_TXRX_MCS_NSS_IDX_MAX];
+	struct agent_telemetry_peer_tx_ext_stats peer_stats;
 };
 
 struct agent_pdev_db {
@@ -86,6 +123,7 @@ struct agent_pdev_db {
 	int num_peers;
 	spinlock_t peer_db_lock;
 	struct list_head peer_db_list;
+	// struct deter_peer_iface_stats_obj peer_stats;
 };
 
 struct agent_soc_db {
@@ -100,25 +138,72 @@ struct agent_telemtry_db {
 	struct agent_soc_db psoc_db[MAX_SOCS_DB];
 };
 
+struct agent_rm_telemetry {
+	bool app_init[RM_MAX_SERVICE];
+	bool init_stats_pending[RM_MAX_SERVICE];
+	bool is_container[RM_MAX_SERVICE];
+	/* relay(fs) channel for main service */
+	struct rchan *rfs_channel_main;
+	/* delyed work for main service */
+	struct delayed_work stats_work_init_main;
+	/* relay(fs) channel for pmlo service */
+	struct rchan *rfs_channel_pmlo;
+	/* delyed work for pmlo service */
+	struct delayed_work stats_work_init_pmlo;
+	/* delyed work periodic for pmlo service*/
+	struct delayed_work stats_work_periodic_pmlo;
+	/* relay(fs) telemetry channel for deterministic scheduler*/
+	struct rchan *rfs_channel_deter;
+	/* delyed work for deter sched service */
+	struct delayed_work stats_work_init_deter;
+	/* delayed telemetry deterministic stats work periodic*/
+	struct delayed_work stats_work_periodic_deter;
+	/* relay(fs) channel for erp service */
+	struct rchan *rfs_channel_erp;
+	/* delyed work for erp service */
+	struct delayed_work stats_work_init_erp;
+	/* delyed work periodic for erp service*/
+	struct delayed_work stats_work_periodic_erp;
+	/* erp wifi sample timer */
+	uint64_t erp_wifi_sample_timer;
+	/* relay(fs) channel for admission control service */
+	struct rchan *rfs_channel_admctrl;
+	/* delayed work init for admission control service */
+	struct delayed_work stats_work_init_admctrl;
+	/* delayed work periodic for admission control stats */
+	struct delayed_work stats_work_periodic_admctrl;
+	/* relay(fs) channel for energy service */
+	struct rchan *rfs_channel_energysvc;
+	/* delayed work init for energy service */
+	struct delayed_work stats_work_init_energysvc;
+	/* delayed work periodic for energy service */
+	struct delayed_work stats_work_periodic_energysvc;
+	/* relay(fs) channel for QoS Optimizer service */
+	struct rchan *rfs_channel_qos_optmzr;
+	/* delyed work for QoS Optimizer service */
+	struct delayed_work stats_work_dynamic_init_qos_optmzr;
+	/* delyed work for dynamic service init */
+	struct delayed_work stats_work_dynamic_init_main;
+};
+
 struct telemetry_agent_object {
 	/* RelayFS */
 	uint32_t num_subbufs;
 	uint32_t subbuf_size;
-	/* relay(fs) channel */
-	struct rchan *rfs_channel;
 	/* relay(fs) telemetry channel */
 	struct rchan *rfs_emesh_channel;
 	struct dentry *dir_ptr;
 	struct dentry *dir_emesh_ptr;
-	/* delyed work */
-	struct delayed_work stats_work_init;
-	/* delyed work periodic*/
-	struct delayed_work stats_work_periodic;
 	/* delayed telemetry work periodic*/
 	struct delayed_work emesh_stats_work_periodic;
 	/* pdev and peer objects */
 	struct agent_telemtry_db agent_db;
 	uint32_t debug_mask;
+	struct agent_rm_telemetry rm_telemetry;
+	/* lock for agent_db */
+	spinlock_t agent_lock;
+	struct timer_list peer_stats_timer;
+	bool peer_stats_timer_enabled;
 };
 
 

@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+# Copyright (c) 2024-2025 Qualcomm Innovation Center, Inc. All rights reserved.
 #
 # Permission to use, copy, modify, and/or distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -29,7 +29,7 @@ input=$@
 link_show="ip link show type"
 
 #add the supported link types
-link_type_list="gre"
+link_type_list="gre ip6tnl"
 
 Help() {
 	echo "supported types: $link_type_list"
@@ -61,14 +61,24 @@ gro_off() {
 	# add the type of tunnel to turn off GRO/GSO
 	local dev=''
 	local dev_list=''
+	local fallback_dev=''
 
 	#add the devices which are to be excluded from GRO off
-	local fallback_dev="gre0 gretap0"
-	get_devices 'gretap' dev
-	dev_list="$dev_list $dev"
+	case $1 in
+	gre)
+		fallback_dev="gre0 gretap0"
+		get_devices 'gretap' dev
+		dev_list="$dev_list $dev"
 
-	get_devices 'gre' dev
-	dev_list="$dev_list $dev"
+		get_devices 'gre' dev
+		dev_list="$dev_list $dev"
+	;;
+	ip6tnl)
+		fallback_dev="ip6tun"
+		get_devices 'ip6tnl' dev
+		dev_list="$dev_list $dev"
+	;;
+	esac
 
 	for dev in $dev_list; do
 		if ! echo "$fallback_dev" | grep -q $dev; then
@@ -80,11 +90,18 @@ gro_off() {
 #add GRETUN specific configuration
 enable_perf_config_gretun() {
 	#disable GRO
-	gro_off
+	gro_off gre
+}
+
+#add MAP-E/DSLITE specific configuration
+enable_perf_config_ip6tun() {
+	#disable GRO
+	gro_off ip6tnl
 }
 
 enable_perf_config_default() {
 	enable_perf_config_gretun
+	enable_perf_config_ip6tun
 }
 
 enable_perf_config() {
@@ -96,6 +113,9 @@ enable_perf_config() {
 		case $i in
 		gre)
 			enable_perf_config_gretun
+		;;
+		ip6tnl)
+			enable_perf_config_ip6tun
 		;;
 		esac
 	done

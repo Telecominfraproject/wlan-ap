@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -23,9 +23,6 @@
 
 #define SAWF_MIN_SVC_CLASS 1
 #define SAWF_MAX_SVC_CLASS 128
-#define SAWF_MAX_TID 8
-#define SAWF_MAXQ_PTID 2
-#define SAWF_MAX_QUEUES (SAWF_MAX_TID * SAWF_MAXQ_PTID)
 #define SAWF_MAX_LATENCY_TYPE 3
 
 #define MSEC_TO_JIFFIES(x) jiffies + msecs_to_jiffies(x)
@@ -35,7 +32,7 @@
 #define pr_sawf_dbg(...) printk(KERN_DEBUG "SAWF Telemetry: " __VA_ARGS__)
 
 #define DELAY_BOUND_UNIT 1000
-#define THROUGHPUT_UNIT 1024
+#define THROUGHPUT_UNIT (1000/8)
 #define MSDU_LOSS_UNIT 1/1000000
 
 #define MAC_ADDR_SIZE 6
@@ -85,6 +82,10 @@ enum telemetry_sawf_sla_detect_type {
  * @delay_bound: delay-bound
  * @msdu_ttl: TTL for msdu-drop
  * @msdu_rate_loss:  msdu-loss rate
+ * @packet_error_rate: packet error rate
+ * @mcs_min_threshold: mcs min threshold
+ * @mcs_max_threshold: mcs max threshold
+ * @retries_threshold: retries threshold
  */
 struct telemetry_sawf_sla_param {
 	uint8_t min_thruput_rate;
@@ -94,6 +95,10 @@ struct telemetry_sawf_sla_param {
 	uint8_t delay_bound;
 	uint8_t msdu_ttl;
 	uint8_t msdu_rate_loss;
+	uint8_t packet_error_rate;
+	uint8_t mcs_min_threshold;
+	uint8_t mcs_max_threshold;
+	uint8_t retries_threshold;
 };
 
 /**
@@ -105,6 +110,9 @@ struct telemetry_sawf_sla_param {
  * @SAWF_PARAM_DELAY_BOUND: delay-bound
  * @SAWF_PARAM_MSDU_TTL: TTL for msdu-drop
  * @SAWF_PARAM_MSDU_LOSS:  msdu-loss rate
+ * @SAWF_PARAM_PACKET_ERROR_RATE: packet error rate
+ * @SAWF_PARAM_RETRIES_PERCENTAGE: retries percentage
+ * @SAWF_PARAM_MCS_BOUND: mcs bound
  */
 enum telemetry_sawf_param {
 	SAWF_PARAM_INVALID,
@@ -115,6 +123,9 @@ enum telemetry_sawf_param {
 	SAWF_PARAM_DELAY_BOUND,
 	SAWF_PARAM_MSDU_TTL,
 	SAWF_PARAM_MSDU_LOSS,
+	SAWF_PARAM_PACKET_ERROR_RATE,
+	SAWF_PARAM_RETRIES_PERCENTAGE,
+	SAWF_PARAM_MCS_BOUND,
 	SAWF_PARAM_MAX,
 };
 
@@ -127,6 +138,10 @@ enum telemetry_sawf_param {
  * @delay_bound: delay-bound
  * @msdu_ttl: TTL for msdu-drop
  * @msdu_rate_loss:  msdu-loss rate
+ * @packet_error_rate: packet error rate
+ * @mcs_min_threshold: mcs min threshold
+ * @mcs_max_threshold: mcs max threshold
+ * @retries_threshold: retries threshold
  */
 struct telemetry_sawf_svc_class_param {
 	uint32_t min_thruput_rate;
@@ -136,6 +151,10 @@ struct telemetry_sawf_svc_class_param {
 	uint32_t delay_bound;
 	uint32_t msdu_ttl;
 	uint32_t msdu_rate_loss;
+	uint32_t packet_error_rate;
+	uint32_t mcs_min_threshold;
+	uint32_t mcs_max_threshold;
+	uint32_t retries_threshold;
 };
 
 /**
@@ -194,7 +213,11 @@ struct telemetry_sawf_ctx {
  * telemetry_sawf_throughput - telemetry sawf throughput-stats
  * @last_bytes: last byte-count
  * @last_count: last pkt-count
+ * @avg_counter: cycle counter
  * @rate: last rate
+ * @min_throughput: min throughput
+ * @max_throughput: max throughput
+ * @avg_throughput: avg_throughput
  */
 struct telemetry_sawf_throughput
 {
@@ -202,8 +225,12 @@ struct telemetry_sawf_throughput
 	uint64_t last_count;
 	uint64_t last_in_bytes;
 	uint64_t last_in_count;
+	uint64_t avg_counter;
 	uint32_t in_rate;
 	uint32_t eg_rate;
+	uint32_t min_throughput;
+	uint32_t max_throughput;
+	uint32_t avg_throughput;
 };
 
 /**
@@ -246,18 +273,33 @@ struct telemetry_burst_size
 	uint64_t last_failure;
 };
 
+
+/**
+ * telemetry_per_retries - telemetry per and retries stats
+ * @packet_error_rate: packet error rate
+ * @retries_percentage: retries percentage
+ */
+struct telemetry_per_retries {
+	uint64_t packet_error_rate;
+	uint64_t retries_percentage;
+};
+
 /**
  * telemetry_sawf_tx - telemetry sawf tx-stats
  * @throughput: throughput
  * @msdu_drop: msdu drop count
  * @service_interval: service-interval num
  * @burst_size: burst-size stats
+ * @retries_mcs_stats: retries and mcs stats
+ * @per_retries_stats: per and retreis stats
  */
 struct telemetry_sawf_tx {
 	struct telemetry_sawf_throughput throughput;
 	struct telemetry_sawf_drops msdu_drop;
 	struct telemetry_service_interval service_interval;
 	struct telemetry_burst_size burst_size;
+	struct telemetry_msduq_tx_stats retries_mcs_stats;
+	struct telemetry_per_retries per_retries_stats;
 };
 
 /**
@@ -315,7 +357,7 @@ struct sawf_msduq {
  */
 struct peer_sawf_queue {
 	DECLARE_BITMAP(active_queue, SAWF_MAX_QUEUES);
-	uint8_t msduq_map[SAWF_MAX_TID][SAWF_MAXQ_PTID];
+	uint8_t msduq_map[NUM_TIDS][SAWF_MAXQ_PTID];
 	struct sawf_msduq msduq[SAWF_MAX_QUEUES];
 };
 
@@ -384,6 +426,36 @@ int telemetry_sawf_set_sla_detect_cfg(uint8_t type,
 				      uint8_t msdu_rate_loss);
 
 /**
+ * telemetry_sawf_set_sla_detect_config- Set sla config per detection-type
+ * @svc_id: service-class id
+ * @min_thruput_rate: minimum throughput
+ * @max_thruput_rate: maximum throughput
+ * @burst_size: burst-size num-pkts
+ * @service_interval: service-interval
+ * @delay_bound: delay-bound
+ * @msdu_ttl: TTL for msdu-drop
+ * @msdu_rate_loss:  msdu-loss rate
+ * @packet_error_rate: packet error rate
+ * @mcs_min_threshold: mcs min threshold
+ * @mcs_max_threshold: mcs max threshold
+ * @retries_threshold: retries threshold
+ *
+ * Return: 0 on success
+ */
+int telemetry_sawf_set_sla_detect_config(uint8_t type,
+					 uint8_t min_thruput_rate,
+					 uint8_t max_thruput_rate,
+					 uint8_t burst_size,
+					 uint8_t service_interval,
+					 uint8_t delay_bound,
+					 uint8_t msdu_ttl,
+					 uint8_t msdu_rate_loss,
+					 uint8_t packet_error_rate,
+					 uint8_t mcs_min_threshold,
+					 uint8_t mcs_max_threshold,
+					 uint8_t retries_threshold);
+
+/**
  * telemetry_sawf_set_sla_cfg - set per-service-class sla config
  * @svc_id: service-class id
  * @min_thruput_rate: minimum throughput
@@ -404,6 +476,36 @@ int telemetry_sawf_set_sla_cfg(uint8_t svc_id,
 			       uint8_t delay_bound,
 			       uint8_t msdu_ttl,
 			       uint8_t msdu_rate_loss);
+
+/**
+ * telemetry_sawf_set_sla_config - set per-service-class sla config
+ * @svc_id: service-class id
+ * @min_thruput_rate: minimum throughput
+ * @max_thruput_rate: maximum throughput
+ * @burst_size: burst-size num-pkts
+ * @service_interval: service-interval
+ * @delay_bound: delay-bound
+ * @msdu_ttl: TTL for msdu-drop
+ * @msdu_rate_loss:  msdu-loss rate
+ * @packet_error_rate: packet error rate
+ * @mcs_min_threshold: mcs min threshold
+ * @mcs_max_threshold: mcs max threshold
+ * @retries_threshold: retries threshold
+ *
+ * Return: 0 on success
+ */
+int telemetry_sawf_set_sla_config(uint8_t svc_id,
+				  uint8_t min_thruput_rate,
+				  uint8_t max_thruput_rate,
+				  uint8_t burst_size,
+				  uint8_t service_interval,
+				  uint8_t delay_bound,
+				  uint8_t msdu_ttl,
+				  uint8_t msdu_rate_loss,
+				  uint8_t packet_error_rate,
+				  uint8_t mcs_min_threshold,
+				  uint8_t mcs_max_threshold,
+				  uint8_t retries_threshold);
 
 /**
  * telemetry_sawf_set_svclass_cfg - set per-service-class config
@@ -477,12 +579,43 @@ int telemetry_sawf_update_queue_info(void *telemetry_ctx,
 				     uint8_t msduq);
 
 /**
+ * telemetry_sawf_update_msdu_queue_info- Update msdu-queue info
+ * @telemetry_ctx: pointer to sawf-peer-telemetry ctx
+ * @hostq_id: host queue id
+ * @tid: tid no
+ * @msduq: msdu-queue no
+ * @svc-id: service-class id
+ *
+ * Return: 0 on success
+ */
+int telemetry_sawf_update_msdu_queue_info(void *telemetry_ctx,
+					  uint8_t hostq_id, uint8_t tid,
+					  uint8_t msduq, uint8_t svc_id);
+
+/**
+ * telemetry_sawf_clear_msdu_queue_info- CLear Msduq active bit
+ * @telemetry_ctx: pointer to sawf-peer-telemetry ctx
+ * @hostq_id: host queue id
+ *
+ * Return: 0 on success
+ */
+int telemetry_sawf_clear_msdu_queue_info(void *telemetry_ctx,
+					 uint8_t host_q_id);
+/**
  * telemetry_sawf_free_peer - Free telemetry-peer context
  * @telemetry_peer_ctx: telemetry-peer context
  *
  * Return: 0 on success
  */
 void telemetry_sawf_free_peer(void *telemetry_peer_ctx);
+
+/**
+ * telemetry_sawf_peer_stats_reset - Reset peer telemetry stats
+ * @telemetry_peer_ctx: telemetry-peer context
+ *
+ * Return: none
+ */
+void telemetry_sawf_peer_stats_reset(void *telemetry_peer_ctx);
 
 /**
  * telemetry_sawf_update_peer_delay - Update delay-stats
@@ -574,6 +707,25 @@ int telemtry_sawf_delay_window_free(uint64_t *mov_window);
  */
 int telemetry_sawf_get_rate(void *telemetry_ctx, uint8_t tid, uint8_t queue,
 			    uint32_t *egress_rate, uint32_t *ingress_rate);
+
+/**
+ * telemetry_sawf_get_tx_rate - Get rate stats
+ * @telemetry_ctx: pointer to sawf-peer-telemetry ctx
+ * @tid: tid no
+ * @queue: queue no
+ * @: pointer to min throughput
+ * @: pointer to max throughput
+ * @: pointer to average throughput
+ * @: pointer to Tx PER
+ * @: pointer to TX retries percentage
+ *
+ * Return: 0 on success
+ */
+
+int telemetry_sawf_get_tx_rate(void *telemetry_ctx, uint8_t tid, uint8_t queue,
+			    uint32_t *min_tput, uint32_t *max_tput,
+			    uint32_t *avg_tput, uint32_t *per,
+			    uint32_t *retries_pct);
 
 /**
  * telemetry_sawf_pull_mov_avg - Get moving window average stats
