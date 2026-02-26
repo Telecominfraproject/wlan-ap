@@ -1,0 +1,713 @@
+From c47e0584fbc7a6be54dc6670e790c83563f36a6f Mon Sep 17 00:00:00 2001
+From: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+Date: Wed, 25 Jun 2025 23:04:47 +0530
+Subject: [PATCH 1/4] UPSTREAM: PROTOCOL: hostapd: Add support for 6 GHz
+ dynamic puncturing
+
+Currently, if any of the 20 MHz subchannels in the operating
+bandwidth of a 6 GHz AP interface is marked as disabled or no IR
+for 6 GHz standard power (SP) mode, the channel is considered
+unavailable for SP operation. This is suboptimal as we operate
+in lower power modes even though such a channel can be used
+for SP operation, if the disabled or no IR subchannel is
+punctured.
+
+Also, if any subchannel in the operating bandwidth has very low
+SP EIRP based on the AFC payload, the EIRP of the entire
+bandwidth gets reduced due to few subchannels having lower power.
+The EIRP of the channel can be enhanced if the subchannel
+with lower EIRP is punctured.
+
+Add support for dynamic puncturing of 6 GHz standard power channels
+in hostapd. This allows the AP to dynamically puncture the
+subchannels that meet the criteria for dynamic puncturing:
+ - The subchannel which does not support SP operation due to regulatory
+    restrictions.
+ - The subchannel which is marked as disabled or no IR
+   for 6 GHz SP mode.
+ - The subchannel which has very low EIRP based on the AFC
+   payload.
+
+The resulting transmit power after further puncturing must exceed both
+    (1) the unpunctured channel EIRP for SP mode and
+    (2) the unpunctured channel EIRP of LPI or VLP modes (if best power
+        mode is enabled).
+If best power mode is disabled, only condition (1) is checked.
+
+If the user has provided a puncture pattern, dynamic puncturing will
+try to find a puncture pattern that also intersects with the
+user-provided puncture pattern.
+
+Use a balanced puncturing approach such that the puncturing
+is done in a way that minimizes the impact on the overall bandwidth
+while still allowing for higher power operation.
+
+Dynamic puncturing is enabled by default and can be turned off
+using the iface config 'puncture_strict_6ghz' option.
+When this option is set to 1, the AP will not puncture any subchannels.
+User given puncture pattern will be used as is.
+
+Fixes: None
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+n00-001-hostapd-add-support-for-6GHz-operation.patch
+r32-001-hostapd-Add-support-to-receive-AFC-power-update-comp.patch
+r72-a-UPSTREAM-PROTOCOL-hostapd-6-GHz-power-mode-channels-.patch
+r72-d-UPSTREAM-PROTOCOL-hostapd-Clean-up-and-refactor-6-GH.patch
+r72-e-UPSTREAM-PROTOCOL-hostapd-Support-for-SP-and-Punctur.patch
+r72-h-UPSTREAM-PROTOCOL-hostapd-Apply-best-power-mode-for-.patch
+r80-d-UPSTREAM-PROTOCOL-hostapd-Add-minimum-PSD-calculatio.patch
+r81-UPSTREAM-PROTOCOL-hostapd-Use-OOBE-compliant-PSD-for.patch
+
+Signed-off-by: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+---
+ hostapd/config_file.c        |   2 +
+ hostapd/ctrl_iface.c         |  13 ++
+ hostapd/hostapd.conf         |   6 +
+ src/ap/ap_config.c           |   1 +
+ src/ap/ap_config.h           |   8 +
+ src/ap/ctrl_iface_ap.c       |   9 +
+ src/ap/hostapd.c             | 345 ++++++++++++++++++++++++++++++++++-
+ src/ap/hostapd.h             |  44 +++++
+ src/ap/ucode.c               |   1 +
+ src/common/ieee802_11_defs.h |  76 ++++++++
+ 10 files changed, 498 insertions(+), 7 deletions(-)
+
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3655,6 +3655,8 @@ static int hostapd_config_fill(struct ho
+ 				   line);
+ 			return 1;
+ 		}
++	} else if (os_strcmp(buf, "puncture_strict_6ghz") == 0) {
++		conf->puncture_strict_6ghz = atoi(pos);
+ 	} else if (os_strcmp(buf, "reg_def_cli_eirp_psd") == 0) {
+ 		conf->reg_def_cli_eirp_psd = atoi(pos);
+ 	} else if (os_strcmp(buf, "reg_sub_cli_eirp_psd") == 0) {
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -2932,6 +2932,27 @@ static int hostapd_ctrl_iface_chan_switc
+ 		return -1;
+ 	}
+ 
++
++	if (settings.power_mode == -1 || settings.power_mode == HE_REG_INFO_6GHZ_AP_TYPE_SP) {
++		bool is_bpm_needed = iface->conf->enable_best_power_mode;
++
++		if (settings.power_mode == HE_REG_INFO_6GHZ_AP_TYPE_SP)
++			is_bpm_needed = false;
++
++		if (hostapd_allow_6ghz_dynamic_puncture(iface, settings.freq_params.freq,
++							settings.power_mode)) {
++			u16 best_6ghz_pp = settings.freq_params.punct_bitmap;
++
++			if (!hostapd_get_6ghz_best_pp(iface, settings.freq_params.freq,
++						      settings.freq_params.center_freq1,
++						      settings.freq_params.bandwidth,
++						      &best_6ghz_pp,
++						      is_bpm_needed)) {
++				settings.freq_params.punct_bitmap = best_6ghz_pp;
++			}
++		}
++	}
++
+ 	ret = hostapd_ctrl_check_freq_params(&settings.freq_params,
+ 					     settings.freq_params.punct_bitmap);
+ 	if (ret) {
+--- a/hostapd/hostapd.conf
++++ b/hostapd/hostapd.conf
+@@ -1139,6 +1139,12 @@ wmm_ac_vo_acm=0
+ # used to restrict the non-Tx BSS to 7 incase of MBSSID as EMA is not supported.
+ #ml_reconf_enabled=1
+ 
++# puncture_strict_6ghz: Enable strict puncturing for 6 GHz band. This is used to
++# control the hostapd capability to dynamically puncture 6 GHz channels in
++# standard power mode. If set to 1, hostapd will not dynamically puncture 6 GHz
++# channels.
++#puncture_strict_6ghz=0
++
+ ##### IEEE 802.1X-2004 related configuration ##################################
+ 
+ # Require IEEE 802.1X authorization
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -350,6 +350,7 @@ struct hostapd_config * hostapd_config_d
+ 	conf->discard_6g_awgn_event = 0;
+ 	conf->he_6ghz_reg_pwr_type = HE_REG_INFO_6GHZ_AP_TYPE_VLP;
+ 	conf->enable_best_power_mode = 1;
++	conf->puncture_strict_6ghz = 0;
+ 	conf->reg_def_cli_eirp_psd = -1;
+ 	conf->reg_sub_cli_eirp_psd = -1;
+ 	conf->reg_def_cli_eirp = -1;
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1227,6 +1227,14 @@ struct hostapd_config {
+ 	 * selection, etc.
+ 	 */
+ 	bool enable_best_power_mode;
++	/*
++	 * This controls the hostapd support for dynamically puncturing
++	 * the Low Power channels or disabled channels in 6 GHz band in
++	 * Standard Power mode. Setting this to false will allow hostapd
++	 * to dynamically puncture channels. Setting this to true will
++	 * disable dynamic puncturing.
++	 */
++	bool puncture_strict_6ghz;
+ 	bool discard_6g_awgn_event;
+ 
+ 	int reg_def_cli_eirp_psd;
+--- a/src/ap/ctrl_iface_ap.c
++++ b/src/ap/ctrl_iface_ap.c
+@@ -1156,6 +1156,15 @@ int hostapd_ctrl_iface_status(struct hos
+ 			len += ret;
+ 		}
+ 
++		if (is_6ghz_op_class(iface->conf->op_class)) {
++			ret = os_snprintf(buf + len, buflen - len,
++					  "puncture_strict_6ghz=%d\n",
++					  iface->conf->puncture_strict_6ghz);
++			if (os_snprintf_error(buflen - len, ret))
++				return len;
++			len += ret;
++		}
++
+ 		if (hapd->conf->mld_ap) {
+ 			struct hostapd_data *link_bss;
+ 
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -3030,6 +3030,7 @@ static int hostapd_setup_interface_compl
+ 		}
+ #endif /* CONFIG_MESH */
+ 
++		hostapd_apply_6ghz_dynamic_puncturing(iface);
+ 		if (is_6ghz_freq(iface->freq) && iface->conf->enable_best_power_mode) {
+ 			u8 best_power_mode;
+ 
+@@ -7065,6 +7066,342 @@ hostapd_get_bonded_chan_center_freq(u16
+ }
+ 
+ 
++/** hostapd_get_num_puncture_types() - Get the number of puncture types
++ * @bw: Bandwidth in MHz
++ * @num_punc_type1: Pointer to store the number of puncture patterns with
++ *                  the smallest granularity supported for the given bandwidth
++ * @num_punc_type2: Pointer to store the number of puncture patterns with
++ *                  the second smallest granularity supported for the given
++ *                  bandwidth, if applicable
++ * @num_punc_type3: Pointer to store the number of puncture patterns with
++ *                  the largest granularity supported for the given bandwidth,
++ *                  if applicable
++ *
++ * Return: None
++ */
++static void hostapd_get_num_puncture_types(u16 bw, u8 *num_punc_type1,
++					   u8 *num_punc_type2, u8 *num_punc_type3)
++{
++	*num_punc_type1 = 0;
++	*num_punc_type2 = 0;
++	*num_punc_type3 = 0;
++
++	switch (bw) {
++	case 320:
++		*num_punc_type1 = NUM_40PP_PUNC_320MHZ;
++		*num_punc_type2 = NUM_80PP_PUNC_320MHZ;
++		*num_punc_type3 = NUM_40P80PP_PUNC_320MHZ;
++		break;
++	case 160:
++		*num_punc_type1 = NUM_20PP_PUNC_160MHZ;
++		*num_punc_type2 = NUM_40PP_PUNC_160MHZ;
++		break;
++	case 80:
++		*num_punc_type1 = NUM_20PP_PUNC_80MHZ;
++		break;
++	}
++}
++
++
++/**
++ * hostapd_get_valid_puncture_pattern_arr() - Get the valid puncture pattern array
++ * @bw: Bandwidth in MHz
++ * @num_pp: Output pointer to store the number of valid puncture patterns
++ * @pp_mask: Output pointer to store the puncture pattern mask for the given bandwidth
++ *
++ * Return: Pointer to the valid puncture pattern array or NULL if not found
++ */
++static const u16 *
++hostapd_get_valid_puncture_pattern_arr(u16 bw, u16 *num_pp, u16 *pp_mask)
++{
++	u8 i;
++
++	for (i = 0; i < ARRAY_SIZE(bw_puncture_bitmap_pair_map); i++) {
++		if (bw == bw_puncture_bitmap_pair_map[i].bw) {
++			*num_pp = bw_puncture_bitmap_pair_map[i].array_size;
++			*pp_mask = bw_puncture_bitmap_pair_map[i].puncture_mask;
++			return bw_puncture_bitmap_pair_map[i].puncture_bitmap_arr;
++		}
++	}
++
++	return NULL;
++}
++
++
++/**
++ * hostapd_get_eirp_powers() - Get EIRP powers for all AP power modes
++ * @iface: Pointer to hostapd_iface
++ * @freq: Frequency in MHz
++ * @center_freq: Band center frequency
++ * @bw: Bandwidth in MHz
++ * @in_punc_pattern: Puncturing pattern
++ * @eirp_vals: Output array to store EIRP powers for each power mode
++ *
++ * This function retrieves the EIRP powers for all 6 GHz AP power modes and stores
++ * them in the provided eirp_vals array.
++ */
++static void
++hostapd_get_eirp_powers(struct hostapd_iface *iface, u16 freq,
++			u16 center_freq, u16 bw, u16 in_punc_pattern,
++			s16 *eirp_vals)
++{
++	u8 i;
++
++	for (i = NL80211_REG_AP_LPI; i <= NL80211_REG_AP_VLP; i++) {
++		eirp_vals[i] =
++		    hostapd_get_eirp_pwr(iface, freq, center_freq, bw,
++					 in_punc_pattern, i, false,
++					 NL80211_REG_NUM_POWER_MODES, false);
++		wpa_printf(MSG_DEBUG,
++			   "EIRP for freq %d, center_freq %d, bw %d, pp 0x%x, power mode %d: %d",
++			   freq, center_freq, bw, in_punc_pattern,
++			   i, eirp_vals[i]);
++	}
++}
++
++
++bool hostapd_allow_6ghz_dynamic_puncture(struct hostapd_iface *iface, u16 freq, u8 pwr_type)
++{
++	return (is_6ghz_freq(freq) && iface->conf->ieee80211be &&
++		!iface->conf->puncture_strict_6ghz &&
++		(pwr_type == NL80211_REG_AP_SP || iface->conf->enable_best_power_mode));
++}
++
++
++void hostapd_apply_6ghz_dynamic_puncturing(struct hostapd_iface *iface)
++{
++	u16 best_6ghz_pp, center_freq;
++	enum chan_width width;
++	u8 center_chan_no;
++	s8 ret;
++
++	if (!hostapd_allow_6ghz_dynamic_puncture(iface, iface->freq,
++						 iface->conf->he_6ghz_reg_pwr_type))
++		return;
++
++	center_chan_no = hostapd_get_oper_centr_freq_seg0_idx(iface->conf);
++	center_freq = ieee80211_chan_to_freq(NULL, iface->conf->op_class, center_chan_no);
++	width = hostapd_get_chan_width_from_oper_chan_width(iface->conf);
++	best_6ghz_pp = iface->conf->punct_bitmap;
++	ret = hostapd_get_6ghz_best_pp(iface, iface->freq,
++				       center_freq, channel_width_to_int(width),
++				       &best_6ghz_pp, iface->conf->enable_best_power_mode);
++	if (!ret)
++		iface->conf->punct_bitmap = best_6ghz_pp;
++
++	return;
++}
++
++
++/**
++ * hostapd_get_start_freq() - Get the start frequency for a given bandwidth
++ * @freq: Primary frequency in MHz
++ * @bw: Bandwidth in MHz
++ * @center_freq: Band center frequency
++ *
++ * Return: The start frequency for the given bandwidth
++ */
++static inline u16
++hostapd_get_start_freq(u16 freq, u16 bw, u16 center_freq)
++{
++	return (bw == 20) ? freq : center_freq - (bw / 2) + 10;
++}
++
++
++/**
++ * hostapd_is_pp_subset_and_valid() - Check if the new pp is a subset of the input pp
++ * @input_pp: Input puncture pattern
++ * @new_pp: New puncture pattern to check
++ * @pp_mask: Puncture pattern mask for the given bandwidth
++ * @pri_chan_pos: Primary channel position
++ *
++ * Return: True if the new puncture pattern is a valid subset of the input
++ * puncture pattern and does not puncture the primary channel.
++ */
++static inline bool
++hostapd_is_pp_subset_and_valid(u16 input_pp, u16 new_pp,
++			       u16 pp_mask, u16 pri_chan_pos)
++{
++	bool is_subset_pp = (new_pp == ((input_pp | new_pp) & pp_mask));
++	bool is_pri_chan_punctured = (BIT(pri_chan_pos) & new_pp);
++
++	return is_subset_pp && !is_pri_chan_punctured;
++}
++
++
++/**
++ * hostapd_is_optimal_pp_found() - Check if the optimal puncture pattern is found
++ * @n_punc_type1: Number of puncture patterns of type 1 for given BW
++ * @n_punc_type2: Number of puncture patterns of type 2 for given BW
++ * @n_punc_type3: Number of puncture patterns of type 3 for given BW
++ * @i: Current index in the loop
++ * @ref_eirp: Reference EIRP power
++ * @initial_sp_eirp: Initial SP EIRP power
++ *
++ * This function checks if an optimal puncture pattern is found at the end of a
++ * puncture type group for a given bandwidth. If the reference EIRP power
++ * is greater than the initial SP EIRP power at the end of a puncture
++ * type group, then stop further puncturing - no need to over-puncture.
++ *
++ * Return: True if the optimal puncture pattern is found at the end of a
++ * puncture type group, false otherwise
++ */
++static inline bool
++hostapd_is_optimal_pp_found(u8 n_punc_type1, u8 n_punc_type2, u8 n_punc_type3,
++			     u16 i, s16 ref_eirp, s16 initial_sp_eirp)
++{
++	bool is_end_of_group = (i == (n_punc_type1 - 1)) ||
++			       (i == (n_punc_type1 + n_punc_type2 - 1)) ||
++			       (i == (n_punc_type1 + n_punc_type2 + n_punc_type3 - 1));
++
++	return is_end_of_group && (ref_eirp > initial_sp_eirp);
++}
++
++
++/**
++ * hostapd_get_valid_pp() - Get a valid puncture pattern
++ * @pp: Input/output pointer to the puncture pattern
++ * @bw: Bandwidth in MHz
++ * @pri_chan_pos: Primary channel position
++ *
++ * Returns a valid puncture pattern that is a subset of the input
++ * puncture pattern.
++ * If no valid puncture pattern is found, return -1.
++ */
++static int
++hostapd_get_valid_pp(u16 *pp, u16 bw, u16 pri_chan_pos)
++{
++	const u16 *bw_pp_arr;
++	u16 num_pp, pp_mask;
++	u16 i;
++
++	bw_pp_arr = hostapd_get_valid_puncture_pattern_arr(bw, &num_pp, &pp_mask);
++	for  (i = 0; i < num_pp; i++) {
++		if (hostapd_is_pp_subset_and_valid(*pp, bw_pp_arr[i],
++						   pp_mask, pri_chan_pos)) {
++			*pp = bw_pp_arr[i];
++			return 0;
++		}
++	}
++
++	wpa_printf(MSG_ERROR,
++		   "Invalid PP: 0x%x, bw: %d, pri_chan_pos: %d",
++		   *pp, bw, pri_chan_pos);
++	return -1;
++}
++
++/**
++ * hostapd_get_optimal_pp() - Get the optimal puncture pattern
++ * @iface: Pointer to hostapd_iface
++ * @freq: Frequency in MHz
++ * @center_freq: Band center frequency
++ * @bw: Bandwidth in MHz
++ * @pp: Input puncture pattern
++ * @pri_chan_pos: Primary channel position
++ * @initial_sp_eirp: Initial SP EIRP power
++ * @ref_eirp: Output pointer to reference EIRP power
++ * @out_pp: Output pointer to optimal puncture pattern
++ *
++ * This function finds the optimal puncture pattern that maximizes the EIRP power.
++ */
++static void
++hostapd_get_optimal_pp(struct hostapd_iface *iface, u16 freq,
++		       u16 center_freq, u16 bw, u16 pp, u16 pri_chan_pos,
++		       s16 initial_sp_eirp, s16 *ref_eirp, u16 *out_pp)
++{
++	u8 n_punc_type1, n_punc_type2, n_punc_type3;
++	u16 num_pp, pp_mask;
++	const u16 *bw_pp_arr;
++	s16 tmp_eirp_pwr;
++	u16 i;
++
++	bw_pp_arr = hostapd_get_valid_puncture_pattern_arr(bw, &num_pp, &pp_mask);
++	if (!bw_pp_arr) {
++		wpa_printf(MSG_ERROR, "No valid puncture pattern array found for bw %d", bw);
++		return;
++	}
++
++	hostapd_get_num_puncture_types(bw, &n_punc_type1, &n_punc_type2,
++				       &n_punc_type3);
++
++	*ref_eirp = initial_sp_eirp;
++	for  (i = 0; i < num_pp; i++) {
++		if (!hostapd_is_pp_subset_and_valid(pp, bw_pp_arr[i], pp_mask, pri_chan_pos))
++			continue;
++		tmp_eirp_pwr = hostapd_get_eirp_pwr(iface, freq, center_freq, bw, bw_pp_arr[i],
++						    NL80211_REG_AP_SP, false,
++						    NL80211_REG_NUM_POWER_MODES, false);
++
++		wpa_printf(MSG_DEBUG, "Trying PP %x freq %d, cf %d, bw %d EIRP: %d > ref EIRP: %d",
++			   bw_pp_arr[i], freq, center_freq, bw, tmp_eirp_pwr, *ref_eirp);
++
++		if (tmp_eirp_pwr > *ref_eirp) {
++			*ref_eirp = tmp_eirp_pwr;
++			*out_pp = bw_pp_arr[i];
++		}
++
++		if (hostapd_is_optimal_pp_found(n_punc_type1, n_punc_type2, n_punc_type3,
++						 i, *ref_eirp, initial_sp_eirp)) {
++			wpa_printf(MSG_INFO,
++				   "SP Punc: Freq %d CF %d BW %d Input PP %x Final PP %x",
++				   freq, center_freq, bw, pp, *out_pp);
++			wpa_printf(MSG_INFO,
++				   "SP Punc: EIRP %d Initial EIRP %d",
++				   *ref_eirp, initial_sp_eirp);
++			return;
++		}
++	}
++
++	return;
++}
++
++
++s8 hostapd_get_6ghz_best_pp(struct hostapd_iface *iface, u16 freq,
++			    u16 center_freq, u16 bw, u16 *pp,
++			    bool is_bpm_enabled)
++{
++	u16 start_freq = hostapd_get_start_freq(freq, bw, center_freq);
++	u16 pri_chan_pos = (freq - start_freq) / 20;
++	s16 initial_sp_eirp, ref_eirp, non_sp_eirp;
++	s16 eirp_vals[NL80211_REG_AP_VLP + 1];
++	u16 out_pp = 0;
++
++	if (!is_punct_bitmap_valid(bw, pri_chan_pos, *pp)) {
++		if (hostapd_get_valid_pp(pp, bw, pri_chan_pos))
++			return -1;
++	}
++
++	hostapd_get_eirp_powers(iface, freq, center_freq, bw, *pp, eirp_vals);
++	initial_sp_eirp = eirp_vals[NL80211_REG_AP_SP];
++	if (initial_sp_eirp == CHAN_MIN_TX_POWER)
++		out_pp = PUNCTURE_INVALID;
++
++	hostapd_get_optimal_pp(iface, freq, center_freq, bw, *pp, pri_chan_pos,
++			       initial_sp_eirp, &ref_eirp, &out_pp);
++	if (out_pp == PUNCTURE_INVALID) {
++		wpa_printf(MSG_ERROR,
++			   "No valid SP PP found for freq %d, center_freq %d, bw %d",
++			   freq, center_freq, bw);
++		return -1;
++	}
++
++	/**
++	 * If best power mode is enabled, compare if the derived power is
++	 * greater than both the SP and non-SP EIRP powers.
++	 * Else, compare only with the SP EIRP power.
++	 */
++	non_sp_eirp = eirp_vals[NL80211_REG_AP_LPI];
++	if (eirp_vals[NL80211_REG_AP_VLP] > non_sp_eirp)
++		non_sp_eirp = eirp_vals[NL80211_REG_AP_VLP];
++
++	if ((!is_bpm_enabled && ref_eirp > initial_sp_eirp) ||
++	    (is_bpm_enabled && ref_eirp > MAX(initial_sp_eirp, non_sp_eirp)))
++		*pp = out_pp;
++
++	return 0;
++}
++
++
+ u8
+ hostapd_get_best_ap_6ghz_power_mode(struct hostapd_iface *iface,
+ 				    u16 freq, u16 center_freq, u16 bw,
+@@ -7078,6 +7415,7 @@ hostapd_get_best_ap_6ghz_power_mode(stru
+ 	int i;
+ 	u8 best_ap_pwr_mode = NL80211_REG_NUM_POWER_MODES;
+ 	s16 max_eirp_pwr = CHAN_MIN_TX_POWER;
++	s16 eirp_vals[NL80211_REG_AP_VLP + 1];
+ 
+ 	if (bw > 20 && !hostapd_get_bonded_chan_entry(freq, bw, center_freq)) {
+ 		wpa_printf(MSG_ERROR,
+@@ -7086,14 +7424,9 @@ hostapd_get_best_ap_6ghz_power_mode(stru
+ 		return best_ap_pwr_mode;
+ 	}
+ 
++	hostapd_get_eirp_powers(iface, freq, center_freq, bw, in_punc_pattern, eirp_vals);
+ 	for (i = 0; i < ARRAY_SIZE(p_mode_order); i++) {
+-		s16 tmp_eirp_pwr = hostapd_get_eirp_pwr(iface, freq,
+-							center_freq, bw,
+-							in_punc_pattern,
+-							p_mode_order[i],
+-							false,
+-							NL80211_REG_NUM_POWER_MODES,
+-							false);
++		s16 tmp_eirp_pwr = eirp_vals[p_mode_order[i]];
+ 
+ 		wpa_printf(MSG_INFO,
+ 			   "%s freq %d, cfreq %d, bw %d, pp %d, pwr_type %d, EIRP %d",
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -1074,6 +1074,14 @@ static inline bool hostapd_mld_is_first_
+ #define CHAN_MIN_TWICE_TX_POWER              (CHAN_MIN_TX_POWER * 2)
+ #define CHAN_MAX_TWICE_TX_POWER              ((CHAN_MAX_TX_POWER * 2) + 1)
+ 
++
++#define NUM_20PP_PUNC_80MHZ      4
++#define NUM_20PP_PUNC_160MHZ     8
++#define NUM_40PP_PUNC_160MHZ     4
++#define NUM_40PP_PUNC_320MHZ     8
++#define NUM_80PP_PUNC_320MHZ     4
++#define NUM_40P80PP_PUNC_320MHZ 12
++
+ /**
+  * hostapd_iface_get_6ghz_chan_list() - Find the 6 GHz channel data for the given freq
+  * @iface: Pointer to hostapd_iface
+@@ -1120,6 +1128,44 @@ enum chan_width
+ hostapd_get_chan_width_from_oper_chan_width(struct hostapd_config *iconf);
+ 
+ /**
++ * hostapd_allow_6ghz_dynamic_puncture() - Check if dynamic puncturing is allowed
++ * @iface: Pointer to hostapd_iface
++ * @freq: Frequency in MHz
++ * @pwr_type: 6 GHz Power type.
++ *
++ * Return: true if dynamic puncturing is allowed, false otherwise.
++ */
++bool hostapd_allow_6ghz_dynamic_puncture(struct hostapd_iface *iface, u16 freq,
++					 u8 pwr_type);
++
++/**
++ * hostapd_apply_6ghz_dynamic_puncturing() - Apply dynamic puncturing for 6 GHz
++ * @iface: Pointer to hostapd_iface
++ *
++ * This function applies dynamic puncturing for 6 GHz channels in SP power mode.
++ * It updates the puncturing pattern which gives the highest EIRP
++ * for the given channel parameters.
++ *
++ * Return: None
++ */
++void hostapd_apply_6ghz_dynamic_puncturing(struct hostapd_iface *iface);
++
++/**
++ * hostapd_get_6ghz_best_pp() - Get the best 6 GHz Puncturing Pattern
++ * @iface: Pointer to hostapd_iface
++ * @freq: Frequency in MHz
++ * @center_freq: Band center frequency
++ * @bw: Bandwidth in MHz
++ * @pp: Output pointer to the best Puncturing Pattern
++ * @is_bpm_enabled: Flag to indicate if the best power mode is enabled
++ *
++ * Return: 0 on success, -1 on failure.
++ */
++s8 hostapd_get_6ghz_best_pp(struct hostapd_iface *iface, u16 freq,
++			    u16 center_freq, u16 bw, u16 *pp,
++			    bool is_bpm_enabled);
++
++/**
+  * hostapd_get_best_ap_6ghz_power_mode() - Get the best 6 GHz AP power mode
+  * @iface: Pointer to hostapd_iface
+  * @freq: Frequency in MHz
+--- a/src/ap/ucode.c
++++ b/src/ap/ucode.c
+@@ -679,6 +679,7 @@ out:
+ 		return ucv_boolean_new(true);
+ 	}
+ 
++	hostapd_apply_6ghz_dynamic_puncturing(iface);
+ 	if (is_6ghz_freq(iface->freq) && iface->conf->enable_best_power_mode) {
+ 		u8 best_power_mode;
+ 
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -2395,6 +2395,82 @@ struct bw_bonded_array_pair bw_bonded_ar
+ 		ARRAY_SIZE(bonded_chan_320mhz_list_freq)},
+ };
+ 
++/* chan_80mhz_puncture_bitmap - Supported 80 MHz puncturing patterns */
++static const u16 chan_80mhz_puncture_bitmap[] = {
++	/* 20Mhz puncturing pattern */
++	0x1,
++	0x2,
++	0x4,
++	0x8
++};
++
++/* chan_160mhz_puncture_bitmap - Supported 160 Mhz puncturing pattern */
++static const u16 chan_160mhz_puncture_bitmap[] = {
++	/* 20Mhz puncturing pattern */
++	0x01,
++	0x02,
++	0x04,
++	0x08,
++	0x10,
++	0x20,
++	0x40,
++	0x80,
++	/* 40Mhz puncturing pattern */
++	0x03,
++	0x0c,
++	0x30,
++	0xc0
++};
++
++/* chan_320mhz_puncture_bitmap - Supported 320 Mhz puncturing patterns */
++static const u16 chan_320mhz_puncture_bitmap[] = {
++	/* 40Mhz puncturing pattern */
++	0x0003,
++	0x000c,
++	0x0030,
++	0x00c0,
++	0x0300,
++	0x0c00,
++	0x3000,
++	0xc000,
++	/* 80Mhz puncturing pattern */
++	0x000f,
++	0x00f0,
++	0x0f00,
++	0xf000,
++	/* 80+40Mhz puncturing pattern: Left 80MHz punctured */
++	0x003f,
++	0x00cf,
++	0x030f,
++	0x0c0f,
++	0x300f,
++	0xc00f,
++	/* 80+40Mhz puncturing pattern: Right 80MHz punctured */
++	0xf003,
++	0xf00c,
++	0xf030,
++	0xf0c0,
++	0xf300,
++	0xfc00
++};
++
++struct bw_puncture_bitmap_pair {
++	u16 bw;
++	const u16 *puncture_bitmap_arr;
++	u16 array_size;
++	u16 puncture_mask;
++};
++
++static const
++struct bw_puncture_bitmap_pair bw_puncture_bitmap_pair_map[] = {
++	{ 80, chan_80mhz_puncture_bitmap,
++		ARRAY_SIZE(chan_80mhz_puncture_bitmap),     0xF},
++	{160, chan_160mhz_puncture_bitmap,
++		ARRAY_SIZE(chan_160mhz_puncture_bitmap),   0xFF},
++	{320, chan_320mhz_puncture_bitmap,
++		ARRAY_SIZE(chan_320mhz_puncture_bitmap), 0xFFFF},
++};
++
+ #define RRM_CAPABILITIES_IE_LEN 5
+ 
+ /* IEEE Std 802.11-2020, 9.6.6.4 - Link Measurement Request frame format */

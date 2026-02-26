@@ -1,8 +1,7 @@
 let libubus = require("ubus");
-import { open, readfile, writefile } from "fs";
+import { open, readfile } from "fs";
 import { wdev_remove, is_equal, vlist_new, phy_is_fullmac, phy_open, wdev_set_radio_mask } from "common";
 
-let uci = require('uci').cursor();
 let ubus = libubus.connect(null, 60);
 
 hostapd.data.config = {};
@@ -46,16 +45,60 @@ hostapd.data.bss_info_fields = {
 	wpa_pairwise: true,
 	auth_algs: true,
 	ieee80211w: true,
-	owe_transition_ifname: true,
 };
 
-function iface_remove(cfg)
+//check if any ml bss is present on other radios
+function is_ml_bss(bss_name, radio_id) {
+	if (radio_id == -1)
+		return false;
+
+        for (let phy, config in hostapd.data.config) {
+                if (!config || config.radio_idx == null)
+                        continue;
+
+                if (config.radio_idx == radio_id)
+                        continue;
+
+                for (let bss in config.bss) {
+                       if (!bss.mld_ap)
+                               continue;
+                        if (bss.ifname == bss_name) {
+                                hostapd.printf(`[debug] confirmed ml vap ${bss.created} mld_ap : ${bss.mld_ap} in ${config.radio_idx} checked for ${radio_id}`);
+                               return bss.created;
+                       }
+               }
+        }
+
+       return false;
+}
+
+function update_bss(cfg)
+{
+	let flag;
+
+	if (!cfg || !cfg.bss || !cfg.bss[0] || !cfg.bss[0].ifname)
+		return;
+
+	if (cfg.bss[0].created)
+		flag = true;
+
+	for (let bss in cfg.bss) {
+		bss.created = true;
+	}
+}
+
+function iface_remove(cfg, radio)
 {
 	if (!cfg || !cfg.bss || !cfg.bss[0] || !cfg.bss[0].ifname)
 		return;
 
-	for (let bss in cfg.bss)
-		wdev_remove(bss.ifname);
+	for (let bss in cfg.bss) {
+		if (!is_ml_bss(bss.ifname, radio)) {
+			hostapd.printf(`[debug] removing ${bss.ifname}`);
+			wdev_remove(bss.ifname);
+			bss.created = false;
+		}
+	}
 }
 
 function iface_gen_config(config, start_disabled)
@@ -102,7 +145,7 @@ function iface_freq_info(iface, config, params)
 			continue;
 		}
 
-		let val = match(line, /^(vht_oper_chwidth|he_oper_chwidth)=(\d+)/);
+		let val = match(line, /^(vht_oper_chwidth|he_oper_chwidth|eht_oper_chwidth)=(\d+)/);
 		if (!val)
 			continue;
 
@@ -114,15 +157,26 @@ function iface_freq_info(iface, config, params)
 	if (freq < 4000)
 		width = 0;
 
-	return hostapd.freq_info(freq, sec_offset, width);
+	if (params.chan_width != null && params.chan_width <=1)
+		sec_offset = 0;
+
+	return hostapd.freq_info(freq, sec_offset, width, params.chan_width,
+				 params.center_freq1, params.center_freq2,
+				 params.punct_bitmap);
 }
 
 function iface_add(phy, config, phy_status)
 {
-	let config_inline = iface_gen_config(config, !!phy_status);
-
+	let id;
 	let bss = config.bss[0];
-	let ret = hostapd.add_iface(`bss_config=${phy}:${config_inline}`);
+
+	if (config.radio_idx == null)
+		id = -1;
+	else
+		id = config.radio_idx;
+
+	hostapd.printf(`iface_add phy ${phy} id ${id}`);
+	let ret = hostapd.add_iface(`bss_config=${phy}:/var/run/hostapd-${phy}.conf`, id, bss.ifname);
 	if (ret < 0)
 		return false;
 
@@ -177,14 +231,20 @@ function __iface_pending_next(pending, state, ret, data)
 		iface_update_supplicant_macaddr(phydev, config);
 		return "create_bss";
 	case "create_bss":
-		let err = phydev.wdev_add(bss.ifname, {
-			mode: "ap",
-			radio: phydev.radio,
-		});
-		if (err) {
-			hostapd.printf(`Failed to create ${bss.ifname} on phy ${phy}: ${err}`);
-			return null;
+		hostapd.printf(`[debug] create ${bss.ifname} on phy ${phy}`);
+		let skip_wdev_add = is_ml_bss(bss.ifname, config.radio_idx);
+		if (!skip_wdev_add) {
+			let err = phydev.wdev_add(bss.ifname, {
+				mode: "ap",
+				radio: phydev.radio,
+			});
+			if (err) {
+				hostapd.printf(`Failed to create ${bss.ifname} on phy ${phy}: ${err}`);
+				return null;
+			}
 		}
+		bss.created = true;
+		update_bss(config);
 
 		pending.call("wpa_supplicant", "phy_status", {
 			phy: phydev.phy,
@@ -280,7 +340,6 @@ function iface_macaddr_init(phydev, config, macaddr_list)
 {
 	let macaddr_data = {
 		num_global: config.num_global_macaddr ?? 1,
-		macaddr_base: config.macaddr_base,
 		mbssid: config.mbssid ?? 0,
 	};
 
@@ -295,9 +354,9 @@ function iface_restart(phydev, config, old_config)
 	if (pending)
 		pending.abort();
 
-	hostapd.remove_iface(phy);
-	iface_remove(old_config);
-	iface_remove(config);
+	hostapd.remove_iface(phy, phydev.radio);
+	iface_remove(old_config,  phydev.radio);
+	iface_remove(config,  phydev.radio);
 
 	if (!config.bss || !config.bss[0]) {
 		hostapd.printf(`No bss for phy ${phy}`);
@@ -664,15 +723,21 @@ function iface_reload_config(name, phydev, config, old_config)
 	return true;
 }
 
-function iface_set_config(name, config)
+function iface_set_config(name, radio, config)
 {
 	let old_config = hostapd.data.config[name];
+	let id;
 
 	hostapd.data.config[name] = config;
 
 	if (!config) {
-		hostapd.remove_iface(name);
-		return iface_remove(old_config);
+		hostapd.printf(`mac80211_reset_config: remove iface ${name} ${radio}`);
+		if (radio == null)
+			id = -1;
+		else
+			id = radio;
+		hostapd.remove_iface(name, -1);
+		return iface_remove(old_config, id);
 	}
 
 	let phy = config.phy;
@@ -748,12 +813,9 @@ function iface_load_config(phy, radio, filename)
 			continue;
 		}
 
-		if (val[0] == "#num_global_macaddr")
+		if (val[0] == "#num_global_macaddr" ||
+		    val[0] == "mbssid")
 			config[substr(val[0], 1)] = int(val[1]);
-		else if (val[0] == "#macaddr_base")
-			config[substr(val[0], 1)] = val[1];
-		else if (val[0] == "mbssid")
-			config[val[0]] = int(val[1]);
 
 		push(config.radio.data, line);
 	}
@@ -769,6 +831,10 @@ function iface_load_config(phy, radio, filename)
 		if (val[0] == "bssid") {
 			bss.bssid = lc(val[1]);
 			continue;
+		}
+
+		if (val[0] == "mld_ap" ) {
+			bss.mld_ap = lc(val[1]);
 		}
 
 		if (val[0] == "nas_identifier")
@@ -834,7 +900,7 @@ let main_obj = {
 			for (let phy_name in phy_list) {
 				let phy = hostapd.data.config[phy_name];
 				let config = iface_load_config(phy.phy, radio, phy.orig_file);
-				iface_set_config(phy_name, config);
+				iface_set_config(phy_name, req.args.radio, config);
 			}
 
 			return 0;
@@ -846,9 +912,13 @@ let main_obj = {
 			radio: 0,
 			up: true,
 			frequency: 0,
+			chan_width: 0,
 			sec_chan_offset: 0,
+			center_freq1: 0,
+			center_freq2: 0,
 			csa: true,
 			csa_count: 0,
+			punct_bitmap: 0,
 		},
 		call: ex_wrap(function(req) {
 			let phy = phy_name(req.args.phy, req.args.radio);
@@ -856,14 +926,19 @@ let main_obj = {
 				return libubus.STATUS_INVALID_ARGUMENT;
 
 			let config = hostapd.data.config[phy];
-			if (!config || !config.bss || !config.bss[0] || !config.bss[0].ifname)
+			if (!config || !config.bss || !config.bss[0] || !config.bss[0].ifname) {
+				hostapd.printf(`apsta_state: config not found for radio ${req.args.radio}`);
 				return 0;
+			}
 
 			let iface = hostapd.interfaces[phy];
-			if (!iface)
+			if (!iface) {
+				hostapd.printf(`apsta_state: iface not found for radio ${req.args.radio}`);
 				return 0;
+			}
 
 			if (!req.args.up) {
+				hostapd.printf(`apsta_state: Stopping interfaces for radio ${req.args.radio}`);
 				iface.stop();
 				return 0;
 			}
@@ -875,6 +950,7 @@ let main_obj = {
 			if (!freq_info)
 				return libubus.STATUS_UNKNOWN_ERROR;
 
+			hostapd.printf(`apsta_state: freq_info for radio ${req.args.radio} is ${freq_info}`);
 			let ret;
 			if (req.args.csa) {
 				freq_info.csa_count = req.args.csa_count ?? 10;
@@ -937,7 +1013,7 @@ let main_obj = {
 			let config = iface_load_config(phy, radio, file);
 
 			hostapd.printf(`Set new config for phy ${name}: ${file}`);
-			iface_set_config(name, config);
+			iface_set_config(name, radio, config);
 
 			if (hostapd.data.auth_obj)
 				hostapd.data.auth_obj.notify("reload", { phy, radio });
@@ -956,7 +1032,7 @@ let main_obj = {
 			if (!req.args.iface || !req.args.config)
 				return libubus.STATUS_INVALID_ARGUMENT;
 
-			if (hostapd.add_iface(`bss_config=${req.args.iface}:${req.args.config}`) < 0)
+			if (hostapd.add_iface(`bss_config=${req.args.iface}:${req.args.config}`, -1, null) < 0)
 				return libubus.STATUS_INVALID_ARGUMENT;
 
 			return {
@@ -972,7 +1048,7 @@ let main_obj = {
 			if (!req.args.iface)
 				return libubus.STATUS_INVALID_ARGUMENT;
 
-			hostapd.remove_iface(req.args.iface);
+			hostapd.remove_iface(req.args.iface, -1);
 			return 0;
 		})
 	},
@@ -1007,8 +1083,10 @@ let main_obj = {
 hostapd.data.ubus = ubus;
 hostapd.data.obj = ubus.publish("hostapd", main_obj);
 
+
 let auth_obj = {};
 hostapd.data.auth_obj = ubus.publish("hostapd-auth", auth_obj);
+hostapd.udebug_set("hostapd", hostapd.data.ubus);
 
 function bss_event(type, name, data) {
 	let ubus = hostapd.data.ubus;
@@ -1023,27 +1101,8 @@ return {
 	shutdown: function() {
 		for (let phy in hostapd.data.config)
 			iface_set_config(phy);
+		hostapd.udebug_set(null);
 		hostapd.ubus.disconnect();
-	},
-	afc_request: function(iface, data) {
-		let wireless_config = uci.get_all('wireless');
-		for (let l, afc_server in wireless_config) {
-			if (afc_server['.type'] == 'afc-server' && afc_server.url && data) {
-				hostapd.printf(`Sending AFC request: ${data}`);
-				writefile("/tmp/afc-request.json", data);
-
-				if (afc_server.access_token)
-					system(`curl -s -X POST ${afc_server.url} -H \'accept: \*\/\*\' -H \'Authorization: Bearer ${afc_server.access_token}\' -H \'Content-Type: application/json\' -d \'${data}\' --output /tmp/afc-response.json`);
-				else if (afc_server.cert)
-					system(`curl -s -X POST ${afc_server.url} -H \'accept: \*\/\*\' --cert \'${afc_server.cert}\' -H \'Content-Type: application/json\' -d \'${data}\' --output /tmp/afc-response.json`);
-
-				let afc_response = (readfile("/tmp/afc-response.json"));
-				if (afc_response)
-					return afc_response;
-				else
-					return;
-			}
-		}
 	},
 	bss_create: function(phy, name, obj) {
 		phy = hostapd.data.config[phy];
@@ -1081,5 +1140,97 @@ return {
 		if (hostapd.data.auth_obj)
 			hostapd.data.auth_obj.notify("sta_connected", msg, data_cb, null, null, 1000);
 		return ret;
+	},
+	config_nft_table: function(table, add) {
+                let add_del = {};
+                let ret = {};
+                if (add)
+                        add_del = "add";
+                else
+                        add_del = "delete";
+
+                ret = system(`nft ${add_del} table netdev ${table}`);
+	},
+	config_nft_chain: function(table, chain, iface, add) {
+                let add_del = {};
+                let hook = {};
+                let ret = {};
+                if (add) {
+                        add_del = "add";
+                } else {
+                        add_del = "delete";
+                }
+
+                hook = "{ type filter hook egress device " + iface + " priority 0\\; }";
+                ret = system(`nft ${add_del} chain netdev ${table} ${chain} ${hook}`);
+	},
+	config_nft_rule: function(table, chain, iface, add,
+				  dst_mac_addr, proto,
+				  v6_src_addr, v6_dst_addr, v4_src_addr, v4_dst_addr,
+				  sport, dport, mark, esp_spi, dscp) {
+		let cmd = {};
+		if (add) {
+                let rule = "nft add rule netdev" + " " + table + " " + chain;
+
+		if (dst_mac_addr)
+			rule = rule + " ether daddr " + dst_mac_addr;
+
+                if (v6_src_addr)
+                        rule = rule + " ip6 saddr " + v6_src_addr;
+
+                if (v6_dst_addr)
+                        rule = rule + " ip6 daddr " + v6_dst_addr;
+
+                if (v4_src_addr)
+                        rule = rule + " ip saddr " + v4_src_addr;
+
+                if (v4_dst_addr)
+                        rule = rule + " ip daddr " + v4_dst_addr;
+
+		if (proto == 6)
+			rule = rule + " tcp ";
+
+		if (proto == 17)
+			rule = rule + " udp ";
+
+                if (sport)
+                        rule = rule + " sport " + sport;
+
+                if (dport)
+                        rule = rule + " dport " + dport;
+
+                rule = rule + " meta mark set " + mark + " counter";
+
+                hostapd.printf(`${rule}`);
+		system(`${rule}`);
+
+		} else {
+			let cmd = `nft -a list chain  netdev wifi_qos_table ${chain} > /tmp/nft_info`;
+			system(`${cmd}`);
+
+			if (!mark || !dst_mac_addr) {
+				hostapd.printf(`ERROR: NFT Delete Rule, mandatory info not provided `);
+			} else {
+				let mark_hex = sprintf("%x", mark);
+				let f = open("/tmp/nft_info", "r");
+                                let line;
+                                while ((line = rtrim(f.read("line"), "\n")) != null) {
+					let rule = "nft delete rule netdev" + " " + table + " " + chain;
+					let handle;
+                                        if (match(line, regexp(mark_hex)) && match(line, regexp(dst_mac_addr))) {
+						handle = split(line, "#")[1];
+						rule = rule + handle;
+						hostapd.printf(`${rule}`);
+						system(`${rule}`);
+                                        }
+                                }
+                                f.close();
+
+			}
+
+			cmd = "rm /tmp/nft_info";
+			system(`${cmd}`);
+
+		}
 	},
 };
