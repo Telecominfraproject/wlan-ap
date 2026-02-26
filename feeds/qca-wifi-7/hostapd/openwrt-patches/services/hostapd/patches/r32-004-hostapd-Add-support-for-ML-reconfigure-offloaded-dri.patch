@@ -1,0 +1,646 @@
+From 011cc2d09a9f6300dd1860ba8192de5346c5c9be Mon Sep 17 00:00:00 2001
+From: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+Date: Tue, 13 Aug 2024 00:28:47 +0530
+Subject: [PATCH] hostapd: Add support for ML reconfigure offloaded driver(s)
+
+ML link removal offloaded drivers will take care of updating
+the reconfiguration MLE in self and partner beacons. It also updates
+the AP removal timer automatically and notifies once the counter is
+expired.
+
+For such drivers AP link removal count(TBTT) and reconfiguration MLE
+needs to be passed from userspace. AP link removal count indicates the
+number of beacons the reconfiguration MLE will be present, after which
+the link will be removed. To support this, NL80211_ATTR_AP_REMOVAL_COUNT
+and NL80211_ATTR_IE are used
+
+This patchset adds support for sending reconfiguration element along with
+TBTT count configured by the user in the existing NL command
+NL80211_CMD_REMOVE_LINK.
+
+Signed-off-by: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+---
+ hostapd/ctrl_iface.c         |  20 +++-
+ hostapd/hostapd_cli.c        |  17 ++++
+ src/ap/ap_drv_ops.c          |  14 +++
+ src/ap/ap_drv_ops.h          |   2 +
+ src/ap/hostapd.c             | 108 ++++++++++++++++++++++
+ src/ap/hostapd.h             |   3 +
+ src/ap/ieee802_11_eht.c      | 171 +++++++++++++++++++++--------------
+ src/drivers/driver.h         |  20 ++++
+ src/drivers/driver_nl80211.c |  70 ++++++++++++++
+ src/drivers/nl80211_copy.h   |   3 +-
+ 10 files changed, 357 insertions(+), 71 deletions(-)
+
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -81,6 +81,11 @@
+ #define HOSTAPD_GLOBAL_CTRL_IFACE_PORT_LIMIT	50
+ #endif /* CONFIG_CTRL_IFACE_UDP */
+ 
++#ifdef CONFIG_IEEE80211BE
++#define MIN_ML_RECONF_COUNT 5
++#define MAX_ML_RECONF_COUNT 50
++#endif /* CONFIG_IEEE80211BE */
++
+ static void hostapd_ctrl_iface_send(struct hostapd_data *hapd, int level,
+ 				    enum wpa_msg_type type,
+ 				    const char *buf, size_t len);
+@@ -4461,8 +4466,21 @@ static int hostapd_ctrl_iface_link_remov
+ 	int ret;
+ 	u32 count = atoi(cmd);
+ 
+-	if (!count)
+-		count = 1;
++	if (!count) {
++		count = MIN_ML_RECONF_COUNT;
++	} else if (count < MIN_ML_RECONF_COUNT || count > MAX_ML_RECONF_COUNT) {
++		wpa_printf(MSG_ERROR, "Invalid link removal count:%d allowed range %d-%d\n",
++			   count, MIN_ML_RECONF_COUNT, MAX_ML_RECONF_COUNT);
++		ret = os_snprintf(buf, buflen, "%s\n", "FAIL");
++		if (os_snprintf_error(buflen, ret))
++			return -1;
++	} else if (!hapd->conf->mld_ap) {
++		wpa_printf(MSG_ERROR, "ML reconfigure is not supported in non-MLO case\n");
++		ret = os_snprintf(buf, buflen, "%s\n", "FAIL");
++		if (os_snprintf_error(buflen, ret))
++			return -1;
++		return -1;
++	}
+ 
+ 	ret = hostapd_link_remove(hapd, count);
+ 	if (ret == 0) {
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -664,6 +664,21 @@ static int hostapd_cli_cmd_wps_config(st
+ }
+ 
+ 
++static int hostapd_cli_cmd_link_remove(struct wpa_ctrl *ctrl, int argc,
++				       char *argv[])
++{
++	char buf[256];
++
++	if (argc < 1) {
++		printf("Invalid 'link_removal' command  - atleast 2 args required\n");
++		return -1;
++	}
++
++	snprintf(buf, sizeof(buf), "LINK_REMOVE %s", argv[0]);
++	return wpa_ctrl_command(ctrl, buf);
++}
++
++
+ static int hostapd_cli_cmd_disassoc_imminent(struct wpa_ctrl *ctrl, int argc,
+ 					     char *argv[])
+ {
+@@ -1751,6 +1766,8 @@ static const struct hostapd_cli_cmd host
+ 	  "= show current WPS status" },
+ 	{ "disassoc_imminent", hostapd_cli_cmd_disassoc_imminent, NULL,
+ 	  "= send Disassociation Imminent notification" },
++	{ "link_remove", hostapd_cli_cmd_link_remove, NULL,
++	  "= remove the link after specified count" },
+ 	{ "ess_disassoc", hostapd_cli_cmd_ess_disassoc, NULL,
+ 	  "= send ESS Dissassociation Imminent notification" },
+ 	{ "bss_tm_req", hostapd_cli_cmd_bss_tm_req, NULL,
+--- a/src/ap/ap_drv_ops.c
++++ b/src/ap/ap_drv_ops.c
+@@ -621,6 +621,20 @@ int hostapd_if_remove(struct hostapd_dat
+ }
+ 
+ 
++#ifdef CONFIG_IEEE80211BE
++int hostapd_drv_ml_reconfig_link_remove(struct hostapd_data *hapd,
++					enum wpa_driver_if_type type,
++					const struct driver_reconfig_link_removal_params *params)
++{
++	if (hapd->driver == NULL || hapd->drv_priv == NULL ||
++	    hapd->driver->ml_reconfig_link_remove == NULL)
++		return -1;
++
++	return hapd->driver->ml_reconfig_link_remove(hapd->drv_priv, type, params);
++}
++#endif /* CONFIG_IEEE80211BE */
++
++
+ int hostapd_set_ieee8021x(struct hostapd_data *hapd,
+ 			  struct wpa_bss_params *params)
+ {
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -67,6 +67,8 @@ int hostapd_if_remove(struct hostapd_dat
+ int hostapd_if_link_remove(struct hostapd_data *hapd,
+ 			   enum wpa_driver_if_type type,
+ 			   const char *ifname, u8 link_id);
++int hostapd_drv_ml_reconfig_link_remove(struct hostapd_data *hapd, enum wpa_driver_if_type type,
++					const struct driver_reconfig_link_removal_params *params);
+ int hostapd_set_ieee8021x(struct hostapd_data *hapd,
+ 			  struct wpa_bss_params *params);
+ int hostapd_get_seqnum(const char *ifname, struct hostapd_data *hapd,
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -459,8 +459,111 @@ static void hostapd_link_remove_timeout_
+ }
+ 
+ 
++static int hostapd_send_ml_reconfig_link_removal(struct hostapd_data *hapd,
++						 u32 count)
++{
++	struct driver_reconfig_link_removal_params params;
++	int ret;
++
++	params.link_id = hapd->mld_link_id;
++	params.removal_count = count;
++
++	params.ml_reconfig_elem_len = hostapd_eid_eht_ml_reconfig_len(hapd);
++	params.ml_reconfig_elem = os_zalloc(params.ml_reconfig_elem_len);
++
++	if (!params.ml_reconfig_elem)
++		return -1;
++
++	hostapd_eid_eht_reconf_ml(hapd, params.ml_reconfig_elem);
++
++	/*send NL with tbtt count and ml reconfig ie */
++	ret = hostapd_drv_ml_reconfig_link_remove(hapd, WPA_IF_AP_BSS, &params);
++
++	os_free(params.ml_reconfig_elem);
++
++	return ret;
++}
++
++
++static bool is_link_reconfigure_allowed(struct hostapd_data *hapd)
++{
++	struct hostapd_mld *mld = hapd->mld;
++	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_data *link_bss, *bss;
++	size_t i;
++	u8 list_len;
++
++	if (!hapd->mld->num_links) {
++		wpa_printf(MSG_ERROR, "mld_ap is NOT set\n");
++		return false;
++	}
++
++	list_len = dl_list_len(&mld->links);
++	if (!list_len || list_len == 1) {
++		wpa_printf(MSG_INFO,
++			   "link reconfigure is currently not applicable for this mld links:%u\n",
++			   list_len);
++		return false;
++	}
++
++	if (iface->conf->mbssid != MBSSID_DISABLED &&
++	    hapd == hostapd_mbssid_get_tx_bss(hapd)) {
++		if (iface->conf->mbssid == MULTI_MBSSID_GROUP_ENABLED) {
++			struct hostapd_multi_mbssid_group *group = hapd->mbssid_group;
++
++			dl_list_for_each(bss, &group->bss_list,
++					 struct hostapd_data, mbssid_bss) {
++				if (bss == hapd)
++					continue;
++				if (!bss->conf->mld_ap)
++					return false;
++				mld = bss->mld;
++
++				list_len = dl_list_len(&mld->links);
++				if (list_len <= 1) {
++					wpa_printf(MSG_INFO, "link reconfigure is currently not applicable for this list:%u\n", list_len);
++					return false;
++				}
++			}
++		} else {
++			for (i = 1; i < hapd->iface->num_bss; i++) {
++				bss = hapd->iface->bss[i];
++				if (!bss->conf->mld_ap)
++					return false;
++				mld = bss->mld;
++
++				list_len = dl_list_len(&mld->links);
++				if (list_len <= 1) {
++					wpa_printf(MSG_INFO, "link reconfigure is currently not applicable for this list:%u\n", list_len);
++					return false;
++				}
++			}
++		}
++	}
++
++	for_each_mld_link(link_bss, hapd) {
++		if (link_bss == hapd)
++			continue;
++
++		/* Currently we support removing only one link
++		 * at a time from a MLD
++		 */
++		if (link_bss->eht_mld_link_removal_inprogress) {
++			wpa_printf(MSG_INFO, "Rejecting this request as Link reconfigure is already in-progress for" MACSTR,
++				  MAC2STR(link_bss->own_addr));
++			return false;
++		}
++	}
++
++	return true;
++}
++
++
+ int hostapd_link_remove(struct hostapd_data *hapd, u32 count)
+ {
++	struct hostapd_iface *iface = hapd->iface;
++	size_t i;
++
+ 	if (!hapd->conf->mld_ap)
+ 		return -1;
+ 
+@@ -470,6 +573,35 @@ int hostapd_link_remove(struct hostapd_d
+ 
+ 	hapd->eht_mld_link_removal_count = count;
+ 
++	if (iface->drv_flags2 & WPA_DRIVER_FLAG2_MLD_LINK_REMOVAL_OFFLOAD) {
++	    if (!is_link_reconfigure_allowed(hapd)) {
++		    hapd->eht_mld_link_removal_count = 0;
++		    wpa_printf(MSG_INFO, "link reconfigure is currently not applicable\n");
++		    return -1;
++	    }
++
++	    /* Check if the link removal is scheduled for tx BSS
++	     * If yes, schedule link removal for all non-tx BSS first
++	     */
++	    if (iface->conf->mbssid != MBSSID_DISABLED &&
++		hapd == hostapd_mbssid_get_tx_bss(hapd)) {
++		    for (i = 1; i < hapd->iface->num_bss; i++) {
++			    struct hostapd_data *bss = hapd->iface->bss[i];
++
++			    bss->eht_mld_link_removal_inprogress = true;
++			    bss->eht_mld_link_removal_count = count;
++			    if (hostapd_send_ml_reconfig_link_removal(bss, count)) {
++				    wpa_printf(MSG_DEBUG,
++					       "Failed to send link removal non-tx BSS");
++				    return -EINVAL;
++			   }
++		    }
++	    }
++
++	    hapd->eht_mld_link_removal_inprogress = true;
++	    return hostapd_send_ml_reconfig_link_removal(hapd, count);
++	}
++
+ 	eloop_register_timeout(0, TU_TO_USEC(hapd->iconf->beacon_int),
+ 			       hostapd_link_remove_timeout_handler,
+ 			       hapd, NULL);
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -561,6 +561,7 @@ struct hostapd_data {
+ 	char ctrl_sock_iface[IFNAMSIZ + 7 + 1];
+ 
+ 	u8 eht_mld_link_removal_count;
++	u8 eht_mld_link_removal_inprogress;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ #ifdef CONFIG_NAN_USD
+@@ -989,6 +990,8 @@ static inline bool hostapd_mld_is_first_
+ u16 hostapd_get_punct_bitmap(struct hostapd_data *hapd);
+ bool hostapd_is_usable_punct_bitmap(struct hostapd_iface *iface);
+ void hostapd_gen_per_sta_profiles(struct hostapd_data *hapd);
++size_t hostapd_eid_eht_ml_reconfig_len(struct hostapd_data *hapd);
++u8 * hostapd_eid_eht_reconf_ml(struct hostapd_data *hapd, u8 *eid);
+ 
+ static inline bool ap_pmf_enabled(struct hostapd_bss_config *conf)
+ {
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -773,75 +773,6 @@ out:
+ }
+ 
+ 
+-static u8 * hostapd_eid_eht_reconf_ml(struct hostapd_data *hapd, u8 *eid)
+-{
+-	struct hostapd_data *other_hapd;
+-	u16 control;
+-	u8 *pos = eid;
+-	unsigned int i;
+-
+-	wpa_printf(MSG_DEBUG, "MLD: Reconfiguration ML");
+-
+-	/* First check if the element needs to be added */
+-	for (i = 0; i < hapd->iface->interfaces->count; i++) {
+-		other_hapd = hapd->iface->interfaces->iface[i]->bss[0];
+-
+-		wpa_printf(MSG_DEBUG, "MLD: Reconfiguration ML: %u",
+-			   other_hapd->eht_mld_link_removal_count);
+-
+-		if (other_hapd->eht_mld_link_removal_count)
+-			break;
+-	}
+-
+-	/* No link is going to be removed */
+-	if (i == hapd->iface->interfaces->count)
+-		return eid;
+-
+-	wpa_printf(MSG_DEBUG, "MLD: Reconfiguration ML: Adding element");
+-
+-	/* The length will be set at the end */
+-	*pos++ = WLAN_EID_EXTENSION;
+-	*pos++ = 0;
+-	*pos++ = WLAN_EID_EXT_MULTI_LINK;
+-
+-	/* Set the Multi-Link Control field */
+-	control = MULTI_LINK_CONTROL_TYPE_RECONF;
+-	WPA_PUT_LE16(pos, control);
+-	pos += 2;
+-
+-	/* Common Info doesn't include any information */
+-	*pos++ = 1;
+-
+-	/* Add the per station profiles */
+-	for (i = 0; i < hapd->iface->interfaces->count; i++) {
+-		other_hapd = hapd->iface->interfaces->iface[i]->bss[0];
+-		if (!other_hapd->eht_mld_link_removal_count)
+-			continue;
+-
+-		/* Subelement ID is 0 */
+-		*pos++ = 0;
+-		*pos++ = 5;
+-
+-		control = other_hapd->mld_link_id |
+-			EHT_PER_STA_RECONF_CTRL_AP_REMOVAL_TIMER;
+-
+-		WPA_PUT_LE16(pos, control);
+-		pos += 2;
+-
+-		/* STA profile length */
+-		*pos++ = 3;
+-
+-		WPA_PUT_LE16(pos, other_hapd->eht_mld_link_removal_count);
+-		pos += 2;
+-	}
+-
+-	eid[1] = pos - eid - 2;
+-
+-	wpa_hexdump(MSG_DEBUG, "MLD: Reconfiguration ML", eid, eid[1] + 2);
+-	return pos;
+-}
+-
+-
+ static size_t hostapd_eid_eht_ml_len(struct mld_info *info,
+ 				     bool include_mld_id)
+ {
+@@ -888,7 +819,10 @@ u8 * hostapd_eid_eht_ml_beacon(struct ho
+ 			       u8 *eid, bool include_mld_id)
+ {
+ 	eid = hostapd_eid_eht_basic_ml_common(hapd, eid, info, include_mld_id);
+-	return hostapd_eid_eht_reconf_ml(hapd, eid);
++	if (hapd->iface->drv_flags2 & WPA_DRIVER_FLAG2_MLD_LINK_REMOVAL_OFFLOAD)
++		return eid;
++	else
++		return hostapd_eid_eht_reconf_ml(hapd, eid);
+ }
+ 
+ 
+@@ -902,7 +836,7 @@ u8 * hostapd_eid_eht_ml_assoc(struct hos
+ 	eid = hostapd_eid_eht_basic_ml_common(hapd, eid, &info->mld_info,
+ 					      false);
+ 	ap_sta_free_sta_profile(&info->mld_info);
+-	return hostapd_eid_eht_reconf_ml(hapd, eid);
++	return eid;
+ }
+ 
+ 
+@@ -1550,3 +1484,109 @@ void hostapd_get_eht_240mhz_capab(struct
+ 
+ 	os_memcpy(dest, src, len);
+ }
++
++
++/* Common info (1) + MLD Mac address (6) + STA Info
++ * length(1) + STA Mac address(6) + AP removal
++ * timer(2) + Operation parameters(3)
++ */
++#define ML_RECONFIG_FIXED_IE_LEN 19
++size_t hostapd_eid_eht_ml_reconfig_len(struct hostapd_data *hapd)
++{
++	size_t len, sta_prof_len = 0;
++	struct hostapd_data *link_bss;
++
++	/* Include WLAN_EID_EXT_MULTI_LINK (1) */
++	len = 1;
++	/* Control Field */
++	len += 2;
++	/* Common Info - Doesn't include any information */
++	len += 1;
++
++	for_each_mld_link(link_bss, hapd) {
++
++		/* Currently we support removing only one link
++		 * at a time from a MLD
++		 */
++		if (!link_bss->eht_mld_link_removal_count ||
++		    !link_bss->eht_mld_link_removal_inprogress)
++			continue;
++
++		/* Sub-Element field */
++		sta_prof_len += 2;
++
++		/* Per-STA profile */
++
++		/*STA-Control(2) field - only AP removal timer */
++		sta_prof_len += 2;
++
++		/* STA-Info(3) */
++
++		/* STA-Info length */
++		sta_prof_len += 1;
++
++		/* STA-Info AP removal timer */
++		sta_prof_len += 2;
++	}
++
++	/* If no Sta profile is present, element itself is not needed */
++	if (!sta_prof_len)
++		return 0;
++
++	/*WLAN_EID_EXTENSION (1) + length (1) */
++	return len + sta_prof_len + 2;
++}
++
++
++u8 *hostapd_eid_eht_reconf_ml(struct hostapd_data *hapd,
++			      u8 *eid)
++{
++	struct hostapd_data *link_bss;
++	u16 control;
++	u8 *pos = eid;
++
++	*pos++ = WLAN_EID_EXTENSION;
++	*pos++ = 0;
++	*pos++ = WLAN_EID_EXT_MULTI_LINK;
++
++	/* set the multi-link control field */
++	control = MULTI_LINK_CONTROL_TYPE_RECONF;
++	WPA_PUT_LE16(pos, control);
++	pos += 2;
++
++	/* common info doesn't include any information */
++	*pos++ = 1;
++
++	/* Need to have this in other API and make this generic or align with
++	 * the upstream
++	 */
++	for_each_mld_link(link_bss, hapd) {
++		/* Currently we support removing only one link
++		 * at a time from a MLD
++		 */
++		if (!link_bss->eht_mld_link_removal_count ||
++		    !link_bss->eht_mld_link_removal_inprogress)
++			continue;
++
++		/* sub element ID is 0 */
++		*pos++ = 0;
++		*pos++ = 5;
++
++		control = link_bss->mld_link_id |
++			  EHT_PER_STA_RECONF_CTRL_AP_REMOVAL_TIMER;
++		WPA_PUT_LE16(pos, control);
++		pos += 2;
++
++		/* STA Profile length */
++		*pos++ = 3;
++
++		WPA_PUT_LE16(pos, link_bss->eht_mld_link_removal_count);
++		pos += 2;
++	}
++
++	eid[1] = pos - eid - 2;
++
++	wpa_hexdump_ascii(MSG_INFO, "MLD: reconfiguration MLE dump: ",
++			  eid, eid[1]);
++	return pos;
++}
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -3248,6 +3248,15 @@ struct driver_sta_mlo_info {
+ 	} links[MAX_NUM_MLD_LINKS];
+ };
+ 
++#ifdef CONFIG_IEEE80211BE
++struct driver_reconfig_link_removal_params {
++	u8 link_id;
++	u8 *ml_reconfig_elem;
++	size_t ml_reconfig_elem_len;
++	u32 removal_count;
++};
++#endif /* CONFIG_IEEE80211BE */
++
+ /**
+  * struct wpa_driver_ops - Driver interface API definition
+  *
+@@ -5624,6 +5633,21 @@ struct wpa_driver_ops {
+ 	 */
+ 	struct hostapd_multi_hw_info *
+ 	(*get_multi_hw_info)(void *priv, unsigned int *num_multi_hws);
++
++#ifdef CONFIG_IEEE80211BE
++	/**
++	 * ml_reconfig_link_remove - Send Reconfig Multi-Link element to driver
++	 * 			     with tbtt count
++	 * @priv: Private driver interface data
++	 * @type: driver interface type
++	 * @params: reconfig link removal parameters
++	 * Returns: Success when NL command is successfully posted, failure
++	 * otherwise
++	 */
++	int (*ml_reconfig_link_remove)(void *priv, enum wpa_driver_if_type type,
++				       const struct driver_reconfig_link_removal_params *params);
++
++#endif /* CONFIG_IEEE80211BE */
+ };
+ 
+ /**
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -9917,6 +9917,66 @@ int nl80211_remove_link(struct i802_bss
+ }
+ 
+ 
++#ifdef CONFIG_IEEE80211BE
++int nl80211_ml_reconfig_link_remove(struct i802_bss *bss,
++				    const struct driver_reconfig_link_removal_params *params)
++{
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++	struct nl_msg *msg;
++	int ret = 0;
++
++	wpa_printf(MSG_DEBUG, "nl80211: Remove link (ifindex=%d)", bss->ifindex);
++	wpa_printf(MSG_DEBUG, "nl80211: MLD: remove link_id=%u", params->link_id);
++
++	wpa_hexdump(MSG_DEBUG, "nl80211: Reconfig ie", params->ml_reconfig_elem,
++		    params->ml_reconfig_elem_len);
++
++	if (!(bss->valid_links & BIT(params->link_id))) {
++		wpa_printf(MSG_DEBUG, "nl80211: MLD: remove link: Link not found");
++		return -1;
++	}
++
++	msg = nl80211_bss_msg(bss, 0, NL80211_CMD_REMOVE_LINK);
++	if (!msg ||
++	    nla_put_u8(msg, NL80211_ATTR_MLO_LINK_ID, params->link_id) ||
++	    nla_put_u32(msg, NL80211_ATTR_AP_REMOVAL_COUNT, params->removal_count) ||
++	    nla_put(msg, NL80211_ATTR_IE, params->ml_reconfig_elem_len,
++		    params->ml_reconfig_elem)) {
++		nlmsg_free(msg);
++		return -1;
++	}
++
++	ret = send_and_recv_resp(drv, msg, NULL, NULL);
++	if (ret)
++		wpa_printf(MSG_ERROR,
++			   "nl80211: reconfig link remove (%d) failed. ret=%d (%s)",
++			   params->link_id, ret, strerror(-ret));
++
++	return ret;
++}
++
++
++static int
++driver_nl80211_ml_reconfig_link_removal(void *priv,
++					enum wpa_driver_if_type type,
++					const struct driver_reconfig_link_removal_params *params)
++{
++	struct i802_bss *bss = priv;
++
++	if (params->link_id < 0 || params->link_id >= MAX_NUM_MLD_LINKS)
++		return -1;
++
++	if (type != WPA_IF_AP_BSS)
++		return -1;
++
++	if (!(bss->valid_links & BIT(params->link_id)))
++		return -1;
++
++	return nl80211_ml_reconfig_link_remove(bss, params);
++}
++#endif /* CONFIG_IEEE80211BE */
++
++
+ static void nl80211_remove_links(struct i802_bss *bss)
+ {
+ 	int ret;
+@@ -15292,6 +15352,7 @@ const struct wpa_driver_ops wpa_driver_n
+ 	.is_drv_shared = nl80211_is_drv_shared,
+ 	.link_sta_remove = wpa_driver_nl80211_link_sta_remove,
+ 	.can_share_drv = wpa_driver_nl80211_can_share_drv,
++	.ml_reconfig_link_remove = driver_nl80211_ml_reconfig_link_removal,
+ #endif /* CONFIG_IEEE80211BE */
+ #ifdef CONFIG_TESTING_OPTIONS
+ 	.register_frame = testing_nl80211_register_frame,
+--- a/src/drivers/nl80211_copy.h
++++ b/src/drivers/nl80211_copy.h
+@@ -3537,7 +3537,8 @@ enum nl80211_attrs {
+ 	NL80211_ATTR_CHANNEL_WIDTH_DEVICE,
+ 	NL80211_ATTR_CENTER_FREQ_DEVICE,
+ 	NL80211_ATTR_INTERFERENCE_TYPE,
+-
++	NL80211_ATTR_AP_REMOVAL_COUNT,
++	NL80211_ATTR_TSF,
+ 
+ 	/* add attributes here, update the policy in nl80211.c */
+ 

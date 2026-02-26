@@ -1,0 +1,392 @@
+From 23be0349472315d485145ea25c8246bfb7b95d1b Mon Sep 17 00:00:00 2001
+From: Arun Vikas T <vikast@qti.qualcomm.com>
+Date: Thu, 17 Jul 2025 13:56:37 +0530
+Subject: [PATCH 6/7] UPSTREAM:PROTOCOL:CP:HOSTAPD: Handle SCS response from
+ driver and update STA DB
+
+Add logic to handle and process SCS response from driver layer for
+each descriptor.
+
+Handle for response of SCS Add/Remove/Change request types to be
+added separately and set appropriate status codes as per spec.
+Allocate/free/rewrite scs_req_desc memory as needed for scs
+add/remove/change operations.
+Handle Error cases also with required error status codes.
+
+Based on the response, STA database of SCS is updated.
+
+Additional error handling is done on the parsing as per request types
+with help of STA database.
+
+Introduce hostapd_free_scs_data() to clean up scs_req_desc, and reset
+scs_session_count in sta_info. This ensures proper memory
+deallocation for SCS-related fields when a STA is removed. The cleanup
+is invoked from ap_free_sta().
+
+Patch-dependency:
+r92-05-UPSTREAM-PROTOCOL-CP-HOSTAPD-Copy-and-send-SCS-data-over-QM.patch
+Patch-work:
+https://lore.kernel.org/all/20250624205716.1052329-1-quic_rchoodam@quicinc.com/#r
+Tag: SCS
+
+Signed-off-by: Arun Vikas T <vikast@qti.qualcomm.com>
+---
+ src/ap/robust_av.c | 270 ++++++++++++++++++++++++++++++++++++++++++++-
+ src/ap/sta_info.c  |  24 ++++
+ 2 files changed, 293 insertions(+), 1 deletion(-)
+
+diff --git a/src/ap/robust_av.c b/src/ap/robust_av.c
+index 649860b..04a459e 100644
+--- a/src/ap/robust_av.c
++++ b/src/ap/robust_av.c
+@@ -39,6 +39,35 @@ u8 *hostapd_add_scs_ie(u8 *frm, bool scs)
+ }
+ 
+ 
++static u8 hostapd_get_scs_index(struct sta_info *sta, u8 scs_id)
++{
++	u8 idx = 0;
++
++	if (!sta || !sta->scs_session_count)
++		return HOSTAPD_SCS_MAX_DESCRIPTORS_PER_PEER;
++
++	while (idx < sta->scs_session_count) {
++		if (!sta->scs_req_desc[idx])
++			return HOSTAPD_SCS_MAX_DESCRIPTORS_PER_PEER;
++		if (scs_id == sta->scs_req_desc[idx]->scs_id)
++			return idx;
++		idx++;
++	}
++
++	return HOSTAPD_SCS_MAX_DESCRIPTORS_PER_PEER;
++}
++
++
++static bool hostapd_is_scs_present(struct sta_info *sta, u8 scs_id)
++{
++	if (hostapd_get_scs_index(sta, scs_id) >=
++				HOSTAPD_SCS_MAX_DESCRIPTORS_PER_PEER)
++		return false;
++
++	return true;
++}
++
++
+ static int hostapd_parse_tclas4_params(const u8 **payload,
+ 				       union tclas_elem *tclas_elem)
+ {
+@@ -403,6 +432,7 @@ static int hostapd_parse_scs_desc(
+ {
+ 	int ret = WLAN_STATUS_REQUEST_DECLINED;
+ 	u8 scs_id, req_type;
++	bool scs_avail;
+ 	u8 elem_id;
+ 
+ 	/* SCS ID */
+@@ -414,6 +444,36 @@ static int hostapd_parse_scs_desc(
+ 	scs_id = scs_req_desc->scs_id;
+ 	req_type = scs_req_desc->request_type;
+ 
++	scs_avail = hostapd_is_scs_present(sta, scs_id);
++
++	if (req_type == QM_REMOVE_REQ || req_type == QM_CHANGE_REQ) {
++		if (!sta->scs_session_count) {
++			wpa_printf(MSG_ERROR, "AP is declining this request: "
++				   "SCS session inactive");
++			goto decline;
++		}
++
++		if (!scs_avail) {
++			wpa_printf(MSG_ERROR, "scs id %d is not present",
++				   scs_id);
++			goto decline;
++		}
++
++	} else if (req_type == QM_ADD_REQ) {
++		if (sta->scs_session_count ==
++				HOSTAPD_SCS_MAX_DESCRIPTORS_PER_PEER) {
++			wpa_printf(MSG_ERROR, "AP has already configured "
++				   "maximum supported SCS desc per peer");
++			goto decline;
++		}
++
++		if (scs_avail) {
++			wpa_printf(MSG_ERROR, "scs id %d is already present",
++				   scs_id);
++			goto decline;
++		}
++	}
++
+ 	/* Only SCS ID and request type are present in Remove request */
+ 	if (req_type == SCS_REQ_REMOVE)
+ 		return WLAN_STATUS_SUCCESS;
+@@ -669,6 +729,209 @@ hostapd_copy_and_send_scs_data(struct hostapd_data *hapd, struct sta_info *sta,
+ }
+ 
+ 
++static int
++hostapd_process_scs_add(struct sta_info *sta,
++			struct hostapd_scs_req_desc_data *scs_req_desc_tmp,
++			u8 status)
++{
++	struct hostapd_scs_req_desc_data *scs_req_desc;
++	u8 scs_id = scs_req_desc_tmp->scs_id;
++	int idx;
++
++	if (status != HOSTAPD_QM_STATUS_SUCCESS) {
++		wpa_printf(MSG_ERROR, "SCS add request failed for scs_id:%u, "
++			   "status:%u", scs_id, status);
++		return -EINVAL;
++	}
++
++	idx = sta->scs_session_count;
++
++	if (idx >= HOSTAPD_SCS_MAX_DESCRIPTORS_PER_PEER) {
++		wpa_printf(MSG_ERROR, "SCS add request failed for scs_id:%u, "
++			   "maximum index exceeded", scs_id);
++		return -EINVAL;
++	}
++
++	scs_req_desc = os_memdup(scs_req_desc_tmp, sizeof(*scs_req_desc_tmp));
++	if (!scs_req_desc) {
++		wpa_printf(MSG_ERROR, "scs_req mem alloc failure size %zu",
++			   sizeof(*scs_req_desc));
++		return -ENOMEM;
++	}
++
++	/* Attach SCS data to STA node */
++	sta->scs_req_desc[idx] = scs_req_desc;
++	sta->scs_session_count++;
++
++	return 0;
++}
++
++
++static int
++hostapd_process_scs_remove(struct sta_info *sta,
++			   struct hostapd_scs_req_desc_data *scs_req_desc,
++			   u8 status)
++{
++	u8 scs_session_count = sta->scs_session_count;
++	u8 scs_id = scs_req_desc->scs_id;
++	int idx;
++
++	if (status != HOSTAPD_QM_STATUS_SUCCESS) {
++		wpa_printf(MSG_ERROR, "SCS del request failed for scs_id:%u, "
++			   "status:%u - Declined in driver", scs_id, status);
++	}
++
++	idx = hostapd_get_scs_index(sta, scs_id);
++
++	if (idx >= HOSTAPD_SCS_MAX_DESCRIPTORS_PER_PEER) {
++		wpa_printf(MSG_ERROR, "SCS del request failed for scs_id:%u, "
++			   "unable to find idx", scs_id);
++		return -EINVAL;
++	}
++
++	os_free(sta->scs_req_desc[idx]);
++
++	while (idx < (scs_session_count - 1)) {
++		sta->scs_req_desc[idx] = sta->scs_req_desc[idx + 1];
++		idx++;
++	}
++
++	sta->scs_session_count--;
++	sta->scs_req_desc[idx] = NULL;
++
++	return 0;
++}
++
++
++static int
++hostapd_process_scs_change(struct sta_info *sta,
++			   struct hostapd_scs_req_desc_data *scs_req_desc_tmp,
++			   u8 status)
++{
++	int idx;
++	u8 scs_id = scs_req_desc_tmp->scs_id;
++
++	if (status != HOSTAPD_QM_STATUS_SUCCESS) {
++		wpa_printf(MSG_ERROR, "SCS update request failed for scs_id:%u,"
++			   " status:%u - Old SCS data retained", scs_id,
++			   status);
++		return -EINVAL;
++	}
++
++	idx = hostapd_get_scs_index(sta, scs_id);
++
++	if (idx >= HOSTAPD_SCS_MAX_DESCRIPTORS_PER_PEER) {
++		wpa_printf(MSG_ERROR, "SCS update request failed for scs_id:%u,"
++			   " unable to find existing idx", scs_id);
++		return -EINVAL;
++	}
++
++	os_memcpy(sta->scs_req_desc[idx], scs_req_desc_tmp,
++		  sizeof(*scs_req_desc_tmp));
++
++	return 0;
++}
++
++
++static void hostapd_process_scs_req(struct sta_info *sta,
++				    struct hostapd_scs_req_data *scs_req,
++				    struct hostapd_scs_resp_data *scs_resp)
++{
++	struct hostapd_scs_resp_desc_data *scs_resp_desc;
++	u8 scs_id_req, scs_id_resp, request_type, status;
++	struct hostapd_scs_req_desc_data *scs_req_desc;
++	int idx, idx1, scs_req_idx;
++	bool idx_found;
++	int ret;
++
++	for (idx = 0; idx < scs_resp->num_scs_desc; idx++) {
++		scs_resp_desc = &scs_resp->scs_resp_desc[idx];
++		scs_id_resp = scs_resp_desc->scs_id;
++		status = scs_resp_desc->status;
++
++		/* Loop through SCS req desc to matching SCS ID */
++		idx_found = false;
++		for (idx1 = 0; idx1 < scs_req->num_scs_desc; idx1++) {
++			scs_id_req = scs_req->scs_req_desc[idx1].scs_id;
++			if (scs_id_resp == scs_id_req) {
++				scs_req_idx = idx1;
++				idx_found = true;
++				break;
++			}
++		}
++
++		if (idx_found != true) {
++			scs_resp_desc->status = WLAN_STATUS_REQUEST_DECLINED;
++			continue;
++		}
++
++		scs_req_desc = &scs_req->scs_req_desc[scs_req_idx];
++		request_type = scs_req_desc->request_type;
++
++		switch (request_type) {
++		case QM_ADD_REQ:
++			ret = hostapd_process_scs_add(sta, scs_req_desc,
++						      status);
++			if (!ret)
++				scs_resp_desc->status = WLAN_STATUS_SUCCESS;
++			else
++				scs_resp_desc->status =
++					WLAN_STATUS_REQUEST_DECLINED;
++
++			break;
++
++		case QM_REMOVE_REQ:
++			ret = hostapd_process_scs_remove(sta, scs_req_desc,
++							 status);
++			if (!ret)
++				scs_resp_desc->status =
++					WLAN_STATUS_TCLAS_PROCESSING_TERMINATED;
++			else
++				scs_resp_desc->status =
++					WLAN_STATUS_REQUEST_DECLINED;
++
++			break;
++
++		case QM_CHANGE_REQ:
++			ret = hostapd_process_scs_change(sta, scs_req_desc,
++							 status);
++			if (!ret)
++				scs_resp_desc->status = WLAN_STATUS_SUCCESS;
++			else
++				scs_resp_desc->status =
++					WLAN_STATUS_REQUEST_DECLINED;
++
++			break;
++
++		default:
++			wpa_printf(MSG_ERROR, "Invalid request type");
++			scs_resp_desc->status = WLAN_STATUS_REQUEST_DECLINED;
++		}
++
++	}
++}
++
++
++static void hostapd_update_scs_resp_err(struct hostapd_scs_req_data *scs_req,
++					struct hostapd_scs_resp_data *scs_resp)
++{
++	struct hostapd_scs_req_desc_data *scs_req_desc;
++	struct hostapd_scs_resp_desc_data *scs_resp_desc;
++	int idx;
++
++	scs_resp->dialog_token = scs_req->dialog_token;
++	scs_resp->num_scs_desc = scs_req->num_scs_desc;
++
++	for (idx = 0; idx < scs_resp->num_scs_desc; idx++) {
++		scs_req_desc = &scs_req->scs_req_desc[idx];
++		scs_resp_desc = &scs_resp->scs_resp_desc[idx];
++
++		scs_resp_desc->scs_id = scs_req_desc->scs_id;
++		scs_resp_desc->status = WLAN_STATUS_REQUEST_DECLINED;
++	}
++}
++
++
+ static int hostapd_handle_scs_req(struct hostapd_data *hapd, const u8 *buf,
+ 				  size_t frame_length)
+ {
+@@ -732,8 +995,13 @@ static int hostapd_handle_scs_req(struct hostapd_data *hapd, const u8 *buf,
+ 	scs_req.num_scs_desc = index;
+ 
+ 	ret = hostapd_copy_and_send_scs_data(hapd, sta, &scs_req, &scs_resp);
+-	if (ret)
++	if (ret) {
+ 		wpa_printf(MSG_ERROR, "Send SCS data failed, ret:%d", ret);
++		hostapd_update_scs_resp_err(&scs_req, &scs_resp);
++		return ret;
++	}
++
++	hostapd_process_scs_req(sta, &scs_req, &scs_resp);
+ 
+ 	return ret;
+ }
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index 0543e86..c3c202a 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -260,6 +260,24 @@ static void clear_wpa_sm_for_each_partner_link(struct hostapd_data *hapd,
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 
++#ifdef CONFIG_IEEE80211AX
++static void hostapd_free_scs_data(struct sta_info *sta)
++{
++	int i;
++
++	for (i = 0; i < HOSTAPD_SCS_MAX_DESCRIPTORS_PER_PEER; i++) {
++		if (sta->scs_req_desc[i]) {
++			os_free(sta->scs_req_desc[i]);
++			sta->scs_req_desc[i] = NULL;
++		}
++	}
++
++	sta->scs_session_count = 0;
++	wpa_printf(MSG_DEBUG, "SCS data freed");
++}
++#endif /* CONFIG_IEEE80211AX */
++
++
+ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ {
+ #ifndef CONFIG_NO_VLAN
+@@ -554,6 +572,12 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ 	forced_memzero(sta->last_tk, WPA_TK_MAX_LEN);
+ #endif /* CONFIG_TESTING_OPTIONS */
+ 
++#ifdef CONFIG_IEEE80211AX
++	if (hapd->conf->scs) {
++		hostapd_free_scs_data(sta);
++	}
++#endif /* CONFIG_IEEE80211AX */
++
+ 	os_free(sta);
+ }
+ 
+-- 
+2.34.1
+

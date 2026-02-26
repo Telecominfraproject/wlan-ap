@@ -1,0 +1,234 @@
+From 1b62155e2d7e62386c36b504392a7ae480265152 Mon Sep 17 00:00:00 2001
+From: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+Date: Tue, 13 Aug 2024 14:32:03 +0530
+Subject: [PATCH] Hostapd: Handle EVENT_RX_MGMT event for link reconfig removal
+ update
+
+In driver which supports link removal offload procedure, driver will send
+TBTT count value in the existing WMI_MGMT_RX_EVENTID in following two
+scenarios:
+
+  1) probe/association request is received in the link which is scheduled
+     for removal OR
+  2) If its broadcast request, firmware will send TLVs for all the MLDs
+     that are undergoing link removal.
+
+Also, add changes to update ML reconfigure element while constructing
+probe/association response with the value received from firmware.
+
+Signed-off-by: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+---
+ src/ap/ieee802_11.c                | 16 +++++-
+ src/drivers/driver_nl80211_event.c | 89 ++++++++++++++++++++++++++++--
+ src/drivers/nl80211_copy.h         |  2 +
+ 3 files changed, 99 insertions(+), 8 deletions(-)
+
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -9605,8 +9605,11 @@ static size_t hostapd_eid_mbssid_elem_le
+ 			ie_count++;
+ 
+ 		/* For ML Probe resp, solicited hapd's MLE will be in the frame body */
+-		if (bss->conf->mld_ap && (bss != hapd || frame_type != WLAN_FC_STYPE_PROBE_RESP))
++		if (bss->conf->mld_ap && (bss != hapd || frame_type != WLAN_FC_STYPE_PROBE_RESP)) {
+ 			nontx_profile_len += hostapd_eid_eht_ml_beacon_len(bss, NULL, true);
++			if (bss->eht_mld_link_removal_inprogress)
++				nontx_profile_len += hostapd_eid_eht_ml_reconfig_len(bss);
++		}
+ 
+ 		if (ie_count)
+ 			nontx_profile_len += 4 + ie_count;
+@@ -9778,8 +9781,11 @@ static u8 * hostapd_eid_mbssid_elem(stru
+ 			non_inherit_ie[ie_count++] = WLAN_EID_RSNX;
+ 
+ 		/* For ML Probe resp, solicited hapd's MLE will be in the frame body */
+-		if (bss->conf->mld_ap && (bss != hapd || frame_type != WLAN_FC_STYPE_PROBE_RESP))
++		if (bss->conf->mld_ap && (bss != hapd || frame_type != WLAN_FC_STYPE_PROBE_RESP)) {
+ 			eid = hostapd_eid_eht_ml_beacon(bss, NULL, eid, true);
++			if (bss->eht_mld_link_removal_inprogress)
++				eid = hostapd_eid_eht_reconf_ml(bss, eid);
++		}
+ 
+ 		if (ie_count) {
+ 			*eid++ = WLAN_EID_EXTENSION;
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -1445,10 +1445,80 @@ mlme_event_mgmt_critical_update(struct i
+ }
+ 
+ 
++static void
++mlme_event_mgmt_link_removal_update(struct i802_bss *bss,
++				    struct nlattr *rx_link_removal_params)
++{
++	struct nlattr *link_removal[NL80211_CU_ATTR_MAX + 1];
++	struct nlattr *mld_list;
++	struct nlattr *mld[NL80211_CU_MLD_ATTR_MAX + 1];
++	struct nlattr *link_list;
++	struct nlattr *link[NL80211_CU_MLD_LINK_ATTR_MAX + 1];
++	union wpa_event_data event;
++	int mld_list_rem, link_list_rem;
++
++	/* Link removal attribute policy */
++	static struct nla_policy
++		link_removal_attr_policy[NL80211_CU_ATTR_MAX + 1] = {
++			[NL80211_CU_ATTR_MLD_LIST] = { .type = NLA_NESTED },
++		};
++
++	/* MLD attribute policy */
++	static struct nla_policy
++		mld_attr_policy[NL80211_CU_MLD_ATTR_MAX + 1] = {
++			[NL80211_CU_MLD_ATTR_IFINDEX] = { .type = NLA_U32 },
++			[NL80211_CU_MLD_ATTR_LINK_LIST] = { .type = NLA_NESTED },
++		};
++
++	/* Link attribute policy */
++	static struct nla_policy
++		link_policy[NL80211_CU_MLD_LINK_ATTR_MAX + 1] = {
++			[NL80211_CU_MLD_LINK_ATTR_ID] = { .type = NLA_U8 },
++			[NL80211_CU_ATTR_AP_REMOVAL_COUNT] = { .type = NLA_U16 },
++		};
++
++	nla_parse_nested(link_removal, NL80211_CU_ATTR_MAX,
++			 rx_link_removal_params, link_removal_attr_policy);
++
++	if (!link_removal[NL80211_CU_ATTR_MLD_LIST]) {
++		wpa_printf(MSG_DEBUG, "nl80211: Couldn't parse link_removal attribute\n");
++		return;
++	}
++
++	nla_for_each_nested(mld_list, link_removal[NL80211_CU_ATTR_MLD_LIST], mld_list_rem) {
++		if (nla_parse_nested(mld, NL80211_CU_MLD_ATTR_MAX, mld_list,
++			mld_attr_policy) || !mld[NL80211_CU_MLD_ATTR_LINK_LIST])
++			return;
++
++		if (mld[NL80211_CU_MLD_ATTR_LINK_LIST]) {
++			nla_for_each_nested(link_list, mld[NL80211_CU_MLD_ATTR_LINK_LIST],
++					    link_list_rem) {
++				if (nla_parse_nested(link, NL80211_CU_MLD_LINK_ATTR_MAX,
++						     link_list, link_policy))
++					return;
++
++				os_memset(&event, 0, sizeof(event));
++				if (link[NL80211_CU_MLD_LINK_ATTR_ID]) {
++					event.link_removal_event.link_id =
++						nla_get_u8(link[NL80211_CU_MLD_LINK_ATTR_ID]);
++
++					if (link[NL80211_CU_ATTR_AP_REMOVAL_COUNT])
++						event.link_removal_event.link_removal_count =
++							nla_get_u16(link[NL80211_CU_ATTR_AP_REMOVAL_COUNT]);
++
++					wpa_supplicant_event(bss->ctx,
++							     EVENT_LINK_RECONFIG, &event);
++				}
++			}
++		}
++	}
++}
++
++
+ static void mlme_event_mgmt(struct i802_bss *bss,
+ 			    struct nlattr *freq, struct nlattr *sig,
+ 			    const u8 *frame, size_t len, struct nlattr *rx_cu_param,
+-			    int link_id)
++			    int link_id, struct nlattr *link_removal_param)
+ {
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+ 	const struct ieee80211_mgmt *mgmt;
+@@ -1490,6 +1560,10 @@ static void mlme_event_mgmt(struct i802_
+ 		|| (stype == WLAN_FC_STYPE_REASSOC_REQ)))
+ 		mlme_event_mgmt_critical_update(bss, rx_cu_param);
+ 
++	if (link_removal_param && ((stype == WLAN_FC_STYPE_PROBE_REQ) || (stype == WLAN_FC_STYPE_ASSOC_REQ)
++	    || (stype == WLAN_FC_STYPE_REASSOC_REQ)))
++		mlme_event_mgmt_link_removal_update(bss, link_removal_param);
++
+ 	event.rx_mgmt.ctx = bss->ctx;
+ 	event.rx_mgmt.link_id = link_id;
+ 
+@@ -1764,7 +1838,8 @@ static void mlme_event(struct i802_bss *
+ 		       struct nlattr *freq, struct nlattr *ack,
+ 		       struct nlattr *cookie, struct nlattr *sig,
+ 		       struct nlattr *wmm, struct nlattr *req_ie,
+-		       struct nlattr *rx_cu_param, struct nlattr *link)
++		       struct nlattr *rx_cu_param, struct nlattr *link,
++		       struct nlattr *link_removal_param)
+ {
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+ 	u16 stype = 0, auth_type = 0;
+@@ -1863,7 +1938,8 @@ static void mlme_event(struct i802_bss *
+ 		break;
+ 	case NL80211_CMD_FRAME:
+ 		mlme_event_mgmt(bss, freq, sig, nla_data(frame),
+-				nla_len(frame), rx_cu_param, link_id);
++				nla_len(frame), rx_cu_param, link_id,
++				link_removal_param);
+ 		break;
+ 	case NL80211_CMD_FRAME_TX_STATUS:
+ 		mlme_event_mgmt_tx_status(bss, cookie, nla_data(frame),
+@@ -4762,7 +4838,7 @@ static void do_process_drv_event(struct
+ 			   tb[NL80211_ATTR_RX_SIGNAL_DBM],
+ 			   tb[NL80211_ATTR_STA_WME],
+ 			   tb[NL80211_ATTR_REQ_IE], NULL,
+-			   tb[NL80211_ATTR_MLO_LINK_ID]);
++			   tb[NL80211_ATTR_MLO_LINK_ID], NULL);
+ 		break;
+ 	case NL80211_CMD_CONNECT:
+ 	case NL80211_CMD_ROAM:
+@@ -5072,7 +5148,8 @@ int process_bss_event(struct nl_msg *msg
+ 			   tb[NL80211_ATTR_RX_SIGNAL_DBM],
+ 			   tb[NL80211_ATTR_STA_WME], NULL,
+ 			   tb[NL80211_ATTR_RXMGMT_CRITICAL_UPDATE],
+-			   tb[NL80211_ATTR_MLO_LINK_ID]);
++			   tb[NL80211_ATTR_MLO_LINK_ID],
++			   tb[NL80211_ATTR_RXMGMT_LINK_REMOVAL_UPDATE]);
+ 		break;
+ 	case NL80211_CMD_UNEXPECTED_FRAME:
+ 		nl80211_spurious_frame(bss, tb, 0);
+--- a/src/drivers/nl80211_copy.h
++++ b/src/drivers/nl80211_copy.h
+@@ -3539,6 +3539,7 @@ enum nl80211_attrs {
+ 	NL80211_ATTR_INTERFERENCE_TYPE,
+ 	NL80211_ATTR_AP_REMOVAL_COUNT,
+ 	NL80211_ATTR_TSF,
++	NL80211_ATTR_RXMGMT_LINK_REMOVAL_UPDATE,
+ 
+ 	/* add attributes here, update the policy in nl80211.c */
+ 
+@@ -8468,6 +8469,7 @@ enum nl80211_cu_mld_link_attrs {
+ 	NL80211_CU_MLD_LINK_ATTR_CRITICAL_FLAG,
+ 	NL80211_CU_MLD_LINK_ATTR_BPCC,
+ 	NL80211_CU_MLD_LINK_ATTR_SWITCH_COUNT,
++	NL80211_CU_ATTR_AP_REMOVAL_COUNT,
+ 
+ 	/* keep last */
+ 	__NL80211_CU_MLD_LINK_ATTR_LAST,
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -797,6 +797,9 @@ static size_t hostapd_probe_resp_elems_l
+ 			/* For Max Channel Switch Time element during channel
+ 			 * switch */
+ 			buflen += 6;
++
++			if (hapd->eht_mld_link_removal_inprogress)
++				buflen += hostapd_eid_eht_ml_reconfig_len(ml_elem_ap);
+ 		}
+ 		/* QCN Vendor IE for 240MHz */
+ 		if (is_5ghz_freq(hapd->iface->freq))
+@@ -958,11 +961,15 @@ static u8 * hostapd_probe_resp_fill_elem
+ 		struct hostapd_data *ml_elem_ap =
+ 			params->mld_ap ? params->mld_ap : hapd;
+ 
+-		if (ml_elem_ap->conf->mld_ap)
++		if (ml_elem_ap->conf->mld_ap) {
+ 			pos = hostapd_eid_eht_ml_beacon(
+ 				ml_elem_ap, params->mld_info,
+ 				pos, !!params->mld_ap);
+ 
++			if (hapd->eht_mld_link_removal_inprogress)
++				pos = hostapd_eid_eht_reconf_ml(ml_elem_ap, pos);
++		}
++
+ 		pos = hostapd_eid_eht_capab(hapd, pos, IEEE80211_MODE_AP);
+ 		pos = hostapd_eid_eht_operation(hapd, pos);
+ 		pos = hostapd_eid_vendor_240mhz(hapd, pos, IEEE80211_MODE_AP);
