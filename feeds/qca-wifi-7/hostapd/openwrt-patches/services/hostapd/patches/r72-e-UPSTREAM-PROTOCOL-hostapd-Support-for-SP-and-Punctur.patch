@@ -1,0 +1,616 @@
+From 20372fb2080c7670dce65f9db36617d35d92a436 Mon Sep 17 00:00:00 2001
+From: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+Date: Thu, 12 Jun 2025 10:38:32 +0530
+Subject: [PATCH 05/10] UPSTREAM:PROTOCOL:hostapd: Support for SP and
+ Puncturing in EIRP API
+
+The existing API 'hostapd_get_eirp_pwr' gives the regulatory power
+for channels for a given 6 GHz power mode.
+This API does not use AFC payload for calculating the EIRP power
+for standard power (SP) mode. This API also does not have support
+to calculate the EIRP power for Punctured channels.
+
+To fix this, add support to this API to use AFC payload for
+calculating the EIRP power for standard power (SP) mode.
+For LPI and VLP power modes, continue to us the EIRP value from the
+regulatory channel lists for the corresponding power mode.
+
+For punctured channels, use effective bandwidth for calculation
+of EIRP power.
+
+Ensure that the EIRP power from the AFC payload is limited by the
+regulatory power for the corresponding channel and power mode.
+
+Fixes: None
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+n00-001-hostapd-add-support-for-6GHz-operation.patch
+r32-001-hostapd-Add-support-to-receive-AFC-power-update-comp.patch
+r65-QSDK-HOSTAPD-Implement-Min-PSD-Calculation-and-Punct.patch
+r72-a-UPSTREAM-PROTOCOL-hostapd-6-GHz-power-mode-channels-.patch
+r72-d-UPSTREAM-PROTOCOL-hostapd-Clean-up-and-refactor-6-GH.patch
+
+Signed-off-by: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+---
+ src/ap/hostapd.c | 532 ++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 522 insertions(+), 10 deletions(-)
+
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -6191,6 +6191,33 @@ static int hapd_psd_to_eirp(s16 psd, u8
+ 	return -1;
+ }
+ 
++/**
++ * hapd_eirp_to_psd() - Convert EIRP to PSD
++ * @eirp: EIRP Power
++ * @eirp_scale: EIRP power scale
++ * @ch_bw: Channel bandwidth
++ * @psd: Output pointer to PSD
++ *
++ * Return: 0 on success, -1 on failure
++ */
++static int hapd_eirp_to_psd(s16 eirp, u8 eirp_scale, u16 ch_bw, s16 *psd)
++{
++	s16 ten_log10_bw;
++	u8 i;
++	u8 num_bws;
++
++	/* PSD = EIRP - (10 * log10(CH_BW)) */
++	num_bws = ARRAY_SIZE(bw_to_10log10_map);
++	for (i = 0; i < num_bws; i++) {
++		if (ch_bw == bw_to_10log10_map[i].bw) {
++			ten_log10_bw = bw_to_10log10_map[i].ten_l_ten;
++			*psd = eirp - ten_log10_bw * eirp_scale;
++			return 0;
++		}
++	}
++
++	return -1;
++}
+ 
+ /**
+  * reg_get_eirp_from_psd_and_reg_max_eirp() - Get PSD limited EIRP
+@@ -6215,6 +6242,49 @@ reg_get_eirp_from_psd_and_reg_max_eirp(s
+ 
+ 
+ /**
++ * hostapd_reg_is_pwr_type_client() - Check if the power type is client
++ * @pwr_type: Power type
++ *
++ * Return: True if the power type is client, false otherwise
++ */
++static bool
++hostapd_reg_is_pwr_type_client(u8 pwr_type)
++{
++	return (pwr_type >= NL80211_REG_REGULAR_CLIENT_LPI &&
++		pwr_type <= NL80211_REG_SUBORDINATE_CLIENT_VLP);
++}
++
++
++/**
++ * hostapd_reg_find_non_punc_bw() - Find the non-punctured bandwidth
++ * @bw: Bandwidth in MHz
++ * @in_punc_pattern: Puncturing pattern
++ *
++ * Return: Non-punctured bandwidth
++ */
++static u16
++hostapd_reg_find_non_punc_bw(u16 bw, u16 in_punc_pattern)
++{
++	u8 num_punc_bw;
++
++	if (!in_punc_pattern)
++		return bw;
++
++	num_punc_bw = 0;
++	while (in_punc_pattern) {
++		if (in_punc_pattern & 0x1)
++			num_punc_bw++;
++		in_punc_pattern >>= 1;
++	}
++
++	if (bw <= num_punc_bw * 20)
++		return 0;
++
++	return (bw - num_punc_bw * 20);
++}
++
++
++/**
+  * hostapd_reg_get_eirp_from_chan_list() - Get the regulatory EIRP for the freq
+  * @iface: Pointer to hostapd_iface
+  * @freq: Frequency in MHz
+@@ -6240,17 +6310,62 @@ hostapd_reg_get_eirp_from_chan_list(stru
+ 	s16 psd_pwr;
+ 	u16 start_freq = (bw == 20) ? freq : center_freq - (bw / 2) + 10;
+ 	u8 pwr_type = (is_client_lookup) ? client_type : ap_pwr_type;
++	bool is_psd;
++	u16 effective_bw;
++	u8 num_channels_6ghz, chan_idx, i;
++	u8 num_bw_chans;
++	s16 tmp_eirp_pwr;
+ 
+ 	chan_6ghz = hostapd_iface_get_6ghz_chan_list(iface, start_freq, pwr_type,
+-						     NULL, NULL);
++						     &num_channels_6ghz, &chan_idx);
+ 	if (!chan_6ghz) {
+-		wpa_printf(MSG_ERROR, "Failed to get 6 GHz channel list");
++		wpa_printf(MSG_ERROR,
++			   "%s Error getting 6 GHz chan: power mode: %d freq: %d",
++			   __func__, pwr_type, start_freq);
++		return -1;
++	}
++
++	num_bw_chans = bw / 20;
++	if (chan_idx + num_bw_chans > num_channels_6ghz) {
++		wpa_printf(MSG_ERROR,
++			   "%s Invalid channel index: %d bw: %d num chans: %d",
++			   __func__, chan_idx, bw, num_channels_6ghz);
+ 		return -1;
+ 	}
+ 
+-	*eirp_pwr = chan_6ghz->eirp_power;
+-	psd_pwr = chan_6ghz->psd_power;
+-	reg_get_eirp_from_psd_and_reg_max_eirp(psd_pwr, bw, eirp_pwr);
++	*eirp_pwr = CHAN_MAX_TX_POWER;
++	effective_bw = hostapd_reg_find_non_punc_bw(bw, in_punc_pattern);
++	is_psd = chan_6ghz->flag & HOSTAPD_CHAN_PSD;
++	for (i = 0; i < num_bw_chans; i++) {
++		if (in_punc_pattern & BIT(i)) {
++			wpa_printf(MSG_INFO,
++				   "Channel idx: %d is punctured. PP: 0x%x",
++				   i, in_punc_pattern);
++			chan_6ghz++;
++			continue;
++		}
++
++		if ((chan_6ghz->flag & HOSTAPD_CHAN_DISABLED) ||
++		    (chan_6ghz->flag & HOSTAPD_CHAN_NO_IR)) {
++			wpa_printf(MSG_ERROR,
++				   "Freq [%d] is disabled. Flag: 0x%x, power type: %d",
++				   chan_6ghz->freq, chan_6ghz->flag, pwr_type);
++			return -1;
++		}
++
++		tmp_eirp_pwr = chan_6ghz->eirp_power;
++		if (is_psd) {
++			psd_pwr = chan_6ghz->psd_power;
++			reg_get_eirp_from_psd_and_reg_max_eirp(psd_pwr,
++							       effective_bw,
++							       &tmp_eirp_pwr);
++		}
++
++		if (tmp_eirp_pwr < *eirp_pwr)
++			*eirp_pwr = tmp_eirp_pwr;
++
++		chan_6ghz++;
++	}
+ 
+ 	if (is_twice_pwr)
+ 		*eirp_pwr *= 2;
+@@ -6259,20 +6374,417 @@ hostapd_reg_get_eirp_from_chan_list(stru
+ }
+ 
+ 
++/**
++ * hostapd_reg_get_psd_from_chan_list() - Get the regulatory PSD for the freq
++ * @iface: Pointer to hostapd_iface
++ * @freq: Frequency in MHz
++ * @center_freq: Band center frequency
++ * @bw: Bandwidth in MHz
++ * @in_punc_pattern: Puncturing pattern
++ * @ap_pwr_type: AP power type
++ * @client_type: Client type
++ * @is_client_lookup: Whether the lookup is for client
++ * @is_twice_pwr: Flag to indicate twice power
++ * @psd_pwr: Output pointer to PSD power
++ *
++ * Return: 0 on success, -1 on failure
++ */
++static int
++hostapd_reg_get_psd_from_chan_list(struct hostapd_iface *iface, u16 freq,
++				   u16 center_freq, u16 bw, u16 in_punc_pattern,
++				   u8 ap_pwr_type, u8 client_type,
++				   bool is_client_lookup, bool is_twice_pwr,
++				   s16 *psd_pwr)
++{
++	struct hostapd_channel_data *chan_6ghz = NULL;
++	u16 start_freq = (bw == 20) ? freq : center_freq - (bw / 2) + 10;
++	u8 pwr_type = (is_client_lookup) ? client_type : ap_pwr_type;
++	bool is_psd;
++	u16 effective_bw;
++	u8 num_channels_6ghz, chan_idx, i;
++	u8 num_bw_chans;
++	s16 tmp_psd_pwr;
++
++	chan_6ghz = hostapd_iface_get_6ghz_chan_list(iface, start_freq, pwr_type,
++						     &num_channels_6ghz, &chan_idx);
++	if (!chan_6ghz) {
++		wpa_printf(MSG_ERROR,
++			   "%s Error getting 6 GHz chan: power mode: %d freq: %d",
++			   __func__, pwr_type, start_freq);
++		return -1;
++	}
++
++	num_bw_chans = bw / 20;
++	if (chan_idx + num_bw_chans > num_channels_6ghz) {
++		wpa_printf(MSG_ERROR,
++			   "Invalid channel index: %d bw: %d num chans: %d",
++			   chan_idx, bw, num_channels_6ghz);
++		return -1;
++	}
++
++	*psd_pwr = CHAN_MAX_TX_POWER;
++	effective_bw = hostapd_reg_find_non_punc_bw(bw, in_punc_pattern);
++	is_psd = chan_6ghz->flag & HOSTAPD_CHAN_PSD;
++	if (!is_psd) {
++		s16 reg_eirp_pwr;
++		int ret;
++
++		wpa_printf(MSG_INFO,
++			   "Channel %d does not support PSD, flag: 0x%x",
++			   chan_6ghz->freq, chan_6ghz->flag);
++		reg_eirp_pwr = hostapd_reg_get_eirp_from_chan_list(iface, freq,
++								   center_freq,
++								   bw,
++								   in_punc_pattern,
++								   ap_pwr_type,
++								   client_type,
++								   is_client_lookup,
++								   is_twice_pwr,
++								   &reg_eirp_pwr);
++		ret = hapd_eirp_to_psd(reg_eirp_pwr, is_twice_pwr ? 2 : 1,
++				       effective_bw, psd_pwr);
++		if (ret) {
++			wpa_printf(MSG_ERROR,
++				   "Failed to convert EIRP to PSD for freq %d",
++				   chan_6ghz->freq);
++			return -1;
++		}
++
++		if (is_twice_pwr)
++			*psd_pwr *= 2;
++
++		return 0;
++	}
++
++	for (i = 0; i < num_bw_chans; i++) {
++		if (in_punc_pattern & BIT(i)) {
++			wpa_printf(MSG_INFO,
++				   "%s Channel idx: %d is punctured. PP: 0x%x",
++				   __func__, i, in_punc_pattern);
++			chan_6ghz++;
++			continue;
++		}
++
++		if ((chan_6ghz->flag & HOSTAPD_CHAN_DISABLED) ||
++		    (chan_6ghz->flag & HOSTAPD_CHAN_NO_IR)) {
++			wpa_printf(MSG_ERROR,
++				   "%s Freq [%d] is disabled. Flag: 0x%x, power type: %d",
++				   __func__, chan_6ghz->freq, chan_6ghz->flag, pwr_type);
++			return -1;
++		}
++
++		tmp_psd_pwr = chan_6ghz->psd_power;
++		if (tmp_psd_pwr < *psd_pwr)
++			*psd_pwr = tmp_psd_pwr;
++
++		chan_6ghz++;
++	}
++
++	if (is_twice_pwr)
++		*psd_pwr *= 2;
++
++	return 0;
++}
++
++
++/**
++ * hostapd_limit_afc_power_with_reg() - Limit the AFC EIRP
++ *
++ * This API limits AFC EIRP with SP regulatory EIRP power
++ *
++ * @reg_sp_eirp_pwr: Regulatory SP EIRP power
++ * @afc_eirp_pwr: AFC EIRP power
++ * @is_client_lookup: Whether the lookup is for client
++ * @client_type: Client type
++ * @is_twice_pwr: Flag to indicate twice power
++ *
++ * Return: AFC EIRP power limited with regulatory EIRP power
++ */
++static s16
++hostapd_limit_afc_power_with_reg(s16 reg_sp_eirp_pwr, s16 afc_eirp_pwr,
++				 bool is_client_lookup, u8 client_type,
++				 bool is_twice_pwr)
++{
++	if (is_client_lookup && hostapd_reg_is_pwr_type_client(client_type))
++		afc_eirp_pwr -= SP_AP_AND_CLIENT_POWER_DIFF_IN_SCALE;
++
++	reg_sp_eirp_pwr *= EIRP_PWR_SCALE;
++	afc_eirp_pwr = MIN(afc_eirp_pwr, reg_sp_eirp_pwr);
++
++	if (is_twice_pwr)
++		afc_eirp_pwr *= 2;
++
++	return afc_eirp_pwr / EIRP_PWR_SCALE;
++}
++
++
++/**
++ * hostapd_get_sp_punc_eirp() - Get the SP EIRP power for punctured channels.
++ * @iface: Pointer to hostapd_iface
++ * @freq: Frequency in MHz
++ * @center_freq: Band center frequency
++ * @bw: Bandwidth in MHz
++ * @in_punc_pattern: Puncturing pattern
++ * @client_type: Client type
++ * @is_client_lookup: Whether the lookup is for client
++ * @is_twice_pwr: Flag to indicate twice power
++ * @reg_sp_eirp_pwr: Regulatory SP EIRP power
++ * @sp_eirp_pwr: Output pointer to SP EIRP power, which is adjacent channel
++ *	compliant
++ *
++ * Return: 0 on success, -1 on failure
++ */
++static int
++hostapd_get_sp_punc_eirp(struct hostapd_iface *iface, u16 freq, u16 center_freq,
++			 u16 bw, u16 in_punc_pattern, u8 client_type,
++			 bool is_client_lookup, bool is_twice_pwr,
++			 s16 reg_sp_eirp_pwr, s16 *sp_eirp_pwr)
++{
++	u16 effective_bw = hostapd_reg_find_non_punc_bw(bw, in_punc_pattern);
++	s16 oobe_psd_pwr, afc_eirp_pwr;
++	int ret;
++
++	ret = hostapd_reg_get_psd_from_chan_list(iface, freq, center_freq, bw,
++						 in_punc_pattern, NL80211_REG_AP_SP,
++						 client_type, is_client_lookup,
++						 false, &oobe_psd_pwr);
++	if (ret)
++		return ret;
++
++	oobe_psd_pwr *= PSD_SCALE;
++	if (hapd_psd_to_eirp(oobe_psd_pwr, PSD_SCALE, effective_bw, &afc_eirp_pwr)) {
++		wpa_printf(MSG_ERROR, "Unable to get EIRP from PSD");
++		return -1;
++	}
++
++	*sp_eirp_pwr = hostapd_limit_afc_power_with_reg(reg_sp_eirp_pwr, afc_eirp_pwr,
++							is_client_lookup, client_type,
++							is_twice_pwr);
++
++	return 0;
++}
++
++
++/**
++ * hostapd_find_eirp_in_afc_eirp_obj() - Get the AFC eirp power
++ *
++ * This API gets the SP EIRP power from the AFC eirp object for the given channel
++ * and operating class.
++ *
++ * @eirp_obj: Pointer to eirp_obj
++ * @freq: Frequency in MHz
++ * @center_freq: Band center frequency
++ * @op_class: Operating class
++ * @afc_eirp: Output pointer to AFC EIRP power
++ *
++ * Return: 0 on success, -1 on failure
++ */
++static int
++hostapd_find_eirp_in_afc_eirp_obj(struct chan_eirp_obj *eirp_obj, u16 freq,
++				  u16 center_freq, u8 op_class, s16 *afc_eirp)
++{
++	u8 k, subchannels[MAX_NUM_20_MHZ_IN_CURR_BW], nchans;
++
++	if (is_320_opclass(op_class)) {
++		u16 cfi_freq = ieee80211_chan_to_freq(NULL, op_class, eirp_obj->cfi);
++
++		if (cfi_freq == center_freq) {
++			*afc_eirp = eirp_obj->eirp_power;
++			return 0;
++		}
++
++		return -1;
++	}
++
++	nchans = get_subchannels_for_opclass(eirp_obj->cfi, op_class, subchannels);
++	for (k = 0; k < nchans; k++)
++		if (ieee80211_chan_to_freq(NULL, op_class, subchannels[k]) == freq) {
++			*afc_eirp = eirp_obj->eirp_power;
++			return 0;
++		}
++
++	return -1;
++}
++
++
++/**
++ * hostapd_find_eirp_in_afc_chan_obj() - Get AFC eirp power
++ *
++ * This API get the SP EIRP power from the AFC channel object based on the
++ * channel center frequency and operating class.
++ *
++ * @chan_obj: Pointer to chan_obj
++ * @freq: Frequency in MHz
++ * @center_freq: Band center Frequency
++ * @op_class: Operating class
++ * @afc_eirp: Output pointer to AFC EIRP power
++ *
++ * Return: 0 on success, -1 on failure
++ */
++static int
++hostapd_find_eirp_in_afc_chan_obj(struct afc_chan_obj *chan_obj, u16 freq,
++				  u16 center_freq, u8 op_class, s16 *afc_eirp)
++{
++	u8 j;
++	int ret;
++
++	for (j = 0; j < chan_obj->num_chans; j++) {
++		struct chan_eirp_obj *eirp_obj = &chan_obj->chan_eirp_info[j];
++
++		ret = hostapd_find_eirp_in_afc_eirp_obj(eirp_obj, freq, center_freq,
++							op_class, afc_eirp);
++		if (!ret)
++			return 0;
++	}
++
++	return -1;
++}
++
++
++/**
++ * hostapd_get_sp_eirp() - Get SP EIRP for the given channel parameters.
++ * @iface: Pointer to iface
++ * @freq: Primary Frequency in MHz
++ * @cen320: Band center frequency
++ * @bw: Bandwidth in MHz
++ * @in_punc_pattern: Puncturing pattern
++ * @client_type: Client power type
++ * @is_client_lookup: Flag to indicate client lookup
++ * @is_twice_pwr: Flag to indicate twice power
++ * @sp_eirp_pwr: Output pointer to SP EIRP power
++ *
++ * Return: 0 on success, -1 on failure
++ */
++static int
++hostapd_get_sp_eirp(struct hostapd_iface *iface, u16 freq, u16 cen_freq,
++		    u16 bw, u16 in_punc_pattern, u8 client_type,
++		    bool is_client_lookup, bool is_twice_pwr, s16 *sp_eirp_pwr)
++{
++	s16 afc_eirp_pwr, reg_sp_eirp_pwr;
++	u8 i, op_class = 0;
++	struct afc_sp_reg_info *afc_info;
++	int ret = -1;
++	bool found = false;
++
++	if (!iface->is_afc_power_event_received) {
++		wpa_printf(MSG_ERROR, "AFC power event not received");
++		return -1;
++	}
++
++	afc_info = iface->afc_rsp_info;
++	if (!afc_info || !afc_info->num_chan_objs || !afc_info->num_freq_objs) {
++		wpa_printf(MSG_ERROR, "afc info is NULL");
++		return -1;
++	}
++
++	ret = hostapd_reg_get_eirp_from_chan_list(iface, freq, cen_freq, bw,
++						  in_punc_pattern, NL80211_REG_AP_SP,
++						  client_type, is_client_lookup,
++						  false, &reg_sp_eirp_pwr);
++	if (ret) {
++		wpa_printf(MSG_ERROR,
++			   "Unable to get reg EIRP for SP, Cli Type: %d ",
++			   client_type);
++		return ret;
++	}
++
++	if (in_punc_pattern) {
++		return hostapd_get_sp_punc_eirp(iface, freq, cen_freq, bw,
++						in_punc_pattern, client_type,
++						is_client_lookup, is_twice_pwr,
++						reg_sp_eirp_pwr, sp_eirp_pwr);
++	}
++
++	switch (bw) {
++	case 20:
++		if (freq == 5935)
++			op_class = 136;
++		else
++			op_class = 131;
++		break;
++	case 40:
++		op_class = 132;
++		break;
++	case 80:
++		op_class = 133;
++		break;
++	case 160:
++		op_class = 134;
++		break;
++#ifdef CONFIG_IEEE80211BE
++	case 320:
++		op_class = 137;
++		break;
++#endif
++	default:
++		wpa_printf(MSG_ERROR, "Invalid channel width");
++		return -1;
++	}
++
++	afc_eirp_pwr = CHAN_MIN_TX_POWER * EIRP_PWR_SCALE;
++	for (i = 0; i < afc_info->num_chan_objs; i++) {
++		struct afc_chan_obj *chan_obj = &afc_info->afc_chan_info[i];
++
++		if (chan_obj->global_opclass != op_class)
++			continue;
++
++		ret = hostapd_find_eirp_in_afc_chan_obj(chan_obj, freq, cen_freq,
++							op_class, &afc_eirp_pwr);
++		if (!ret) {
++			found = true;
++			break;
++		}
++	}
++
++	if (ret || !found)
++		return -1;
++
++	*sp_eirp_pwr = hostapd_limit_afc_power_with_reg(reg_sp_eirp_pwr, afc_eirp_pwr,
++							is_client_lookup, client_type,
++							is_twice_pwr);
++
++	return 0;
++}
++
++
+ s16 hostapd_get_eirp_pwr(struct hostapd_iface *iface, u16 freq, u16 center_freq,
+ 			 u16 bw, u16 in_punc_pattern, u8 ap_pwr_type,
+ 			 bool is_client_lookup, u8 client_type, bool is_twice_pwr)
+ {
+ 	int ret;
+ 	s16 eirp_pwr;
++	u16 start_freq = (bw == 20) ? freq : center_freq - (bw / 2) + 10;
++	u16 pri_chan_bit = (freq - start_freq) / 20;
+ 
+-	ret = hostapd_reg_get_eirp_from_chan_list(iface, freq, center_freq, bw,
+-						  in_punc_pattern, ap_pwr_type,
+-						  client_type, is_client_lookup,
+-						  is_twice_pwr, &eirp_pwr);
++	if (bw >= 80 &&
++	    !is_punct_bitmap_valid(bw, pri_chan_bit, in_punc_pattern)) {
++		wpa_printf(MSG_ERROR,
++			   "Invalid PP: 0x%x, bw: %d, pri_chan_bit: %d",
++			   in_punc_pattern, bw, pri_chan_bit);
++		return is_twice_pwr ? CHAN_MIN_TWICE_TX_POWER :
++				      CHAN_MIN_TX_POWER;
++	}
+ 
+-	if (ret)
++	if (ap_pwr_type == NL80211_REG_AP_SP)
++		ret = hostapd_get_sp_eirp(iface, freq, center_freq, bw,
++					  in_punc_pattern,
++					  client_type,
++					  is_client_lookup, is_twice_pwr,
++					  &eirp_pwr);
++	else
++		ret = hostapd_reg_get_eirp_from_chan_list(iface, freq, center_freq, bw,
++							  in_punc_pattern, ap_pwr_type,
++							  client_type, is_client_lookup,
++							  is_twice_pwr, &eirp_pwr);
++
++	if (ret) {
++		wpa_printf(MSG_ERROR,
++			   "Unable to get EIRP for freq: %d, cf: %d, bw: %d, pp 0x%x"
++			   " ap_pwr_type: %d, is_client_lookup: %d, client_type: %d",
++			   freq, center_freq, bw, in_punc_pattern,
++			   ap_pwr_type, is_client_lookup, client_type);
+ 		return is_twice_pwr ? CHAN_MIN_TWICE_TX_POWER : CHAN_MIN_TX_POWER;
++	}
+ 
+ 	return eirp_pwr;
+ }

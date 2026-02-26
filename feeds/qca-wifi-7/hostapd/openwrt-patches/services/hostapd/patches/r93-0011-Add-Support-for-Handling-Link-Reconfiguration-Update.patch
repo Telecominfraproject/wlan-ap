@@ -1,0 +1,378 @@
+From ea9848405e4ca8ecfd807a49f4de23980a5cbc18 Mon Sep 17 00:00:00 2001
+From: Kavita Kavita <kkavita@qti.qualcomm.com>
+Date: Mon, 21 Jul 2025 09:16:10 +0530
+Subject: [PATCH 11/13] Add Support for Handling Link Reconfiguration Updates 
+ from Kernel
+
+Add support for processing the NL80211_CMD_ASSOC_MLO_RECONF event from the
+Kernel. This event includes information about added links and the link
+reconfiguration response frame from the AP MLD. The event can be triggered
+by either supplicant or driver-initiated link reconfiguration updates.
+
+This commit also adds support for the installation of group keys
+(e.g., GTK, IGTK, BIGTK etc) received with the link reconfiguration
+response frame for the newly added links.
+
+For removed links, the existing NL80211_CMD_LINKS_REMOVED event is used,
+requiring no additional changes in the supplicant for both supplicant and
+driver-initiated link reconfiguration updates.
+
+Signed-off-by: Kavita Kavita <kkavita@qti.qualcomm.com>
+---
+ src/drivers/driver.h               | 14 +++++++
+ src/drivers/driver_common.c        |  1 +
+ src/drivers/driver_nl80211.c       | 58 ++++++++++++++++++++++++++
+ src/drivers/driver_nl80211.h       |  3 ++
+ src/drivers/driver_nl80211_event.c | 53 ++++++++++++++++++++++++
+ src/rsn_supp/wpa.c                 | 66 ++++++++++++++++++++++++++++++
+ src/rsn_supp/wpa.h                 |  2 +
+ wpa_supplicant/events.c            | 49 ++++++++++++++++++++++
+ 8 files changed, 246 insertions(+)
+
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -6735,6 +6735,11 @@ enum wpa_event_type {
+ 	 * received value
+ 	 */
+ 	EVENT_TTLM_EXPEC_DUR_UPDATE,
++
++	/**
++	 * EVENT_SETUP_LINK_RECONFIG - Notification that new AP links added
++	 */
++	EVENT_SETUP_LINK_RECONFIG,
+ };
+ 
+ 
+@@ -7817,6 +7822,15 @@ union wpa_event_data {
+ 		u8 link_id;
+ 		u32 expec_dur;
+ 	} ttlm_expec_dur_event;
++
++	/**
++	 * struct reconfig_info - Data for Link Reconfiguration Event
++	 */
++	struct reconfig_info {
++		u16 added_links;
++		const u8 *resp_ie;
++		u8 resp_ie_len;
++	} reconfig_info;
+ };
+ 
+ /**
+--- a/src/drivers/driver_common.c
++++ b/src/drivers/driver_common.c
+@@ -113,6 +113,7 @@ const char * event_to_string(enum wpa_ev
+ 	E2S(IFACE_RELOAD);
+ 	E2S(TTLM_UPDATE);
+ 	E2S(TTLM_EXPEC_DUR_UPDATE);
++	E2S(SETUP_LINK_RECONFIG);
+ 	}
+ 
+ 	return "UNKNOWN";
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -1171,6 +1171,19 @@ static int nl80211_get_sta_mlo_info(void
+ }
+ 
+ 
++int get_sta_mlo_interface_info(struct wpa_driver_nl80211_data *drv)
++{
++	struct nl_msg *msg;
++
++	msg = nl80211_drv_msg(drv, 0, NL80211_CMD_GET_INTERFACE);
++
++	if (send_and_recv_resp(drv, msg, get_mlo_info, &drv->sta_mlo_info))
++		return -1;
++
++	return 0;
++}
++
++
+ static void wpa_driver_nl80211_event_newlink(
+ 	struct nl80211_global *global, struct wpa_driver_nl80211_data *drv,
+ 	int ifindex, const char *ifname)
+@@ -1775,6 +1788,51 @@ try_again:
+ }
+ 
+ 
++u8 *nl80211_get_assoc_bssid(struct wpa_driver_nl80211_data *drv)
++{
++	struct nl_msg *msg;
++	int ret;
++	struct nl80211_get_assoc_freq_arg arg;
++	int count = 0;
++
++try_again:
++	msg = nl80211_drv_msg(drv, NLM_F_DUMP, NL80211_CMD_GET_SCAN);
++	os_memset(&arg, 0, sizeof(arg));
++	arg.drv = drv;
++	ret = send_and_recv_resp(drv, msg, nl80211_get_assoc_freq_handler,
++				 &arg);
++	if (ret == -EAGAIN) {
++		count++;
++		if (count >= 10) {
++			wpa_printf(MSG_INFO,
++				   "nl80211: Failed to receive consistent scan result dump for get_assoc_bssid");
++		} else {
++			wpa_printf(MSG_DEBUG,
++				   "nl80211: Failed to receive consistent scan result dump for get_assoc_bssid - try again");
++			goto try_again;
++		}
++	}
++	if (ret == 0) {
++		os_memcpy(drv->bssid, arg.assoc_bssid, ETH_ALEN);
++
++		if (drv->sta_mlo_info.valid_links) {
++			int i;
++
++			for (i = 0; i < MAX_NUM_MLD_LINKS; i++)
++				os_memcpy(drv->sta_mlo_info.links[i].bssid,
++					  arg.bssid[i], ETH_ALEN);
++		}
++
++		return drv->bssid;
++	}
++
++	wpa_printf(MSG_DEBUG, "nl80211: Scan result fetch failed: ret=%d (%s)",
++		   ret, strerror(-ret));
++
++	return NULL;
++}
++
++
+ static int get_link_noise(struct nl_msg *msg, void *arg)
+ {
+ 	struct nlattr *tb[NL80211_ATTR_MAX + 1];
+--- a/src/drivers/driver_nl80211.h
++++ b/src/drivers/driver_nl80211.h
+@@ -337,6 +337,7 @@ int nl80211_create_iface(struct wpa_driv
+ 			 void *arg, int use_existing, int ppe_vp_type);
+ void nl80211_remove_iface(struct wpa_driver_nl80211_data *drv, int ifidx);
+ unsigned int nl80211_get_assoc_freq(struct wpa_driver_nl80211_data *drv);
++u8 *nl80211_get_assoc_bssid(struct wpa_driver_nl80211_data *drv);
+ int nl80211_get_assoc_ssid(struct wpa_driver_nl80211_data *drv, u8 *ssid);
+ enum chan_width convert2width(int width);
+ void nl80211_mark_disconnected(struct wpa_driver_nl80211_data *drv);
+@@ -449,4 +450,6 @@ struct hostapd_multi_hw_info *
+ nl80211_get_multi_hw_info(struct i802_bss *bss, unsigned int *num_multi_hws);
+ u32 get_nl80211_protocol_features(struct wpa_driver_nl80211_data *drv);
+ 
++int get_sta_mlo_interface_info(struct wpa_driver_nl80211_data *drv);
++
+ #endif /* DRIVER_NL80211_H */
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -1921,6 +1921,56 @@ static void mlme_event_unprot_beacon(str
+ }
+ 
+ 
++static void mlme_event_link_addition(struct wpa_driver_nl80211_data *drv,
++				     const u8 *frame, size_t len)
++{
++	const struct ieee80211_mgmt *mgmt;
++	union wpa_event_data event;
++	u16 curr_valid_links, added_links;
++	u8 count;
++	const u8 *resp_ie;
++
++	os_memset(&event, 0, sizeof(event));
++
++	if (!frame) {
++		wpa_printf(MSG_DEBUG,
++			   "Link Reconfiguration Response Frame is NULL, Unspecified reason");
++		return;
++	}
++
++	mgmt = (const struct ieee80211_mgmt *) frame;
++
++	if (len < 24 + 1 + sizeof(mgmt->u.action.u.link_reconf_resp)) {
++		wpa_printf(MSG_DEBUG, "nl80211: Too short Link Reconfig Responseframe");
++		return;
++	}
++
++	count = mgmt->u.action.u.link_reconf_resp.count;
++	resp_ie = mgmt->u.action.u.link_reconf_resp.variable + 3*count;
++	curr_valid_links = drv->sta_mlo_info.valid_links;
++
++	if (get_sta_mlo_interface_info(drv) < 0) {
++		wpa_printf(MSG_ERROR, "Failed to get sta mlo info");
++		return;
++	}
++
++	if (!nl80211_get_assoc_bssid(drv)) {
++		wpa_printf(MSG_ERROR, "Failed to get BSSID info for newly added links");
++		return;
++	}
++
++	added_links = (~curr_valid_links & drv->sta_mlo_info.valid_links);
++
++	event.reconfig_info.resp_ie_len = sizeof(mgmt->u.action.u.link_reconf_resp) -
++						3 - 3*count;
++	event.reconfig_info.resp_ie = resp_ie;
++	event.reconfig_info.added_links = added_links;
++
++	drv->sta_mlo_info.req_links = drv->sta_mlo_info.valid_links;
++
++	wpa_supplicant_event(drv->ctx, EVENT_SETUP_LINK_RECONFIG, &event);
++}
++
+ static s8
+ nl80211_get_link_id_by_freq(struct i802_bss *bss, unsigned int freq)
+ {
+@@ -5318,6 +5368,9 @@ static void do_process_drv_event(struct
+ 	case NL80211_CMD_SET_TID_TO_LINK_MAPPING:
+ 		nl80211_ttlm_update_event(bss, tb);
+ 		break;
++	case NL80211_CMD_ASSOC_MLO_RECONF:
++		mlme_event_link_addition(drv, nla_data(frame), nla_len(frame));
++		break;
+ #endif /* CONFIG_IEEE80211BE */
+ 	default:
+ 		wpa_dbg(drv->ctx, MSG_DEBUG, "nl80211: Ignored unknown event "
+--- a/src/rsn_supp/wpa.c
++++ b/src/rsn_supp/wpa.c
+@@ -7287,3 +7287,69 @@ struct wpabuf * wpa_sm_known_sta_identif
+ 
+ 	return ie;
+ }
++
++
++static int mlo_ieee80211w_set_keys_for_new_links(struct wpa_sm *sm,
++						 struct wpa_eapol_ie_parse *ie,
++						 u16 added_links_bitmap)
++{
++	u8 i;
++
++	if (!wpa_cipher_valid_mgmt_group(sm->mgmt_group_cipher) ||
++	    sm->mgmt_group_cipher == WPA_CIPHER_GTK_NOT_USED)
++		return 0;
++
++	for_each_link(added_links_bitmap, i) {
++		if (_mlo_ieee80211w_set_keys(sm, i, ie))
++			return -1;
++	}
++
++	return 0;
++}
++
++
++static int wpa_supplicant_install_pairwise_mlo_gtk_keys(struct wpa_sm *sm,
++							struct wpa_eapol_ie_parse *ie,
++							u16 added_links_bitmap)
++{
++	u8 i;
++
++	for_each_link(added_links_bitmap, i) {
++		if (!ie->mlo_gtk[i]) {
++			wpa_msg(sm->ctx->msg_ctx, MSG_ERROR,
++				"MLO RSN: GTK not found for link ID %u", i);
++			return -1;
++		}
++
++		if (wpa_supplicant_mlo_gtk(sm, i, ie->mlo_gtk[i],
++					   ie->mlo_gtk_len[i], 0))
++			return -1;
++	}
++
++	return 0;
++}
++
++
++int wpa_sm_install_mlo_broadcast_keys(struct wpa_sm *sm, const u8 *key_data,
++				       u8 key_data_len, u16 added_links_bitmap)
++{
++	struct wpa_eapol_ie_parse ie;
++
++	if (!sm)
++		return -1;
++
++	wpa_hexdump(MSG_DEBUG, "WPA: IE KeyData", key_data, key_data_len);
++
++	if (wpa_supplicant_parse_ies(key_data, key_data_len, &ie) < 0)
++		return -1;
++
++	if (wpa_supplicant_install_pairwise_mlo_gtk_keys(sm, &ie,
++							 added_links_bitmap) < 0)
++		return -1;
++
++	if (mlo_ieee80211w_set_keys_for_new_links(sm, &ie,
++						  added_links_bitmap) < 0)
++		return -1;
++
++	return 0;
++}
+--- a/src/rsn_supp/wpa.h
++++ b/src/rsn_supp/wpa.h
+@@ -676,5 +676,7 @@ void wpa_sm_set_cur_pmksa(struct wpa_sm
+ const u8 * wpa_sm_get_auth_addr(struct wpa_sm *sm);
+ struct wpabuf * wpa_sm_known_sta_identification(struct wpa_sm *sm, const u8 *aa,
+ 						u64 timestamp);
++int wpa_sm_install_mlo_broadcast_keys(struct wpa_sm *sm, const u8 *key_data,
++				      u8 key_data_len, u16 added_links_bitmap);
+ 
+ #endif /* WPA_H */
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -6149,6 +6149,51 @@ static void wpas_tid_link_map(struct wpa
+ }
+ 
+ 
++static void wpas_setup_link_reconfig(struct wpa_supplicant *wpa_s,
++				     struct reconfig_info *info)
++{
++	const u8 *key_data = info->resp_ie;
++	u8 key_data_len;
++
++	if (!info->added_links) {
++		wpa_printf(MSG_ERROR, "No links to be added");
++		return;
++	}
++
++	if (wpa_drv_get_mlo_info(wpa_s) < 0) {
++		wpa_printf(MSG_ERROR,
++			   "SETUP_LINK_RECONFIG: Failed to set reconfig info to wpa_s");
++		return;
++	}
++
++	if (wpa_sm_set_ml_info(wpa_s)) {
++		wpa_printf(MSG_ERROR,
++			   "SETUP_LINK_RECONFIG: Failed to set reconfig info to wpa_sm");
++		return;
++	}
++
++	wpa_hexdump(MSG_DEBUG, "Resp IE: ", info->resp_ie, info->resp_ie_len);
++
++	if (!key_data || info->resp_ie_len < (key_data[0] + 1)) {
++		wpa_printf(MSG_ERROR, "Invalid keys in the Resp IE");
++		return;
++	}
++
++	key_data_len = key_data[0];
++	key_data++;
++
++	if (wpa_sm_install_mlo_broadcast_keys(wpa_s->wpa, key_data, key_data_len,
++					      info->added_links)) {
++		wpa_printf(MSG_ERROR,
++			   "SETUP_LINK_RECONFIG: Failed to install broadcast keys for added links");
++		return;
++	}
++
++	wpa_msg(wpa_s, MSG_INFO, WPA_EVENT_LINK_RECONFIG "valid_links=0x%x",
++		wpa_s->valid_links);
++}
++
++
+ static void wpas_link_reconfig(struct wpa_supplicant *wpa_s)
+ {
+ 	u8 bssid[ETH_ALEN];
+@@ -7199,6 +7244,10 @@ void supplicant_event(void *ctx, enum wp
+ 		if (data)
+ 			wpas_tid_link_map(wpa_s, &data->t2l_map_info);
+ 		break;
++	case EVENT_SETUP_LINK_RECONFIG:
++		if (data)
++			wpas_setup_link_reconfig(wpa_s, &data->reconfig_info);
++		break;
+ 	default:
+ 		wpa_msg(wpa_s, MSG_INFO, "Unknown event %d", event);
+ 		break;

@@ -1,0 +1,200 @@
+From fbf680248f752ab7c6eb8ba2b097ebc17832e6a2 Mon Sep 17 00:00:00 2001
+From: Shreedhar Parande <sparande@qti.qualcomm.com>
+Date: Tue, 27 May 2025 16:08:14 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL:HOSTAPD: Add MLO support for MLD BSS Max
+ Idle Period
+
+The current implementation uses only the default link's
+inactive time to determine the idle period of a connected
+STA. This approach overlooks activity on other links.
+
+To implement MLD max idle period management as defined
+in the IEEE std P802.11be/D7.0 of 35.3.12.3
+(MLD max idle period management), consider the activity
+of all links associated with the non-AP MLD.
+
+This change extracts the inactive time from
+NL80211_STA_INFO_INACTIVE_TIME attribute for each link
+using data provided by the driver, as referenced in
+the Depends-on patch.
+
+Parse the nested NL attributes to retrieve per-link
+statistics and update the hostapd structure accordingly.
+Select the link whose inactive time is the most recent
+among all available links to represent the STA's idle
+state.
+
+Patch-dependency: None
+Patch-work: None
+Internal-review: [RFC PATCH] driver: Add support for MLD max idle period
+
+Signed-off-by: Shreedhar Parande <sparande@qti.qualcomm.com>
+---
+ src/drivers/driver.h         |  2 +
+ src/drivers/driver_hostap.c  |  2 +-
+ src/drivers/driver_nl80211.c | 98 +++++++++++++++++++++++++++++++++---
+ 3 files changed, 95 insertions(+), 7 deletions(-)
+
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 8e16114..57c9638 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -2720,6 +2720,8 @@ struct hostap_sta_driver_data {
+ 	s8 avg_ack_signal; /* dBm */
+ 	enum guard_interval rx_guard_interval, tx_guard_interval;
+ 	u8 rx_dcm, tx_dcm;
++	u16 valid_links;
++	struct hostap_sta_driver_data *link_sta_data[MAX_NUM_MLD_LINKS];
+ };
+ 
+ struct hostapd_sta_add_params {
+diff --git a/src/drivers/driver_hostap.c b/src/drivers/driver_hostap.c
+index 785abb8..4480873 100644
+--- a/src/drivers/driver_hostap.c
++++ b/src/drivers/driver_hostap.c
+@@ -679,7 +679,7 @@ static int hostap_sta_remove(void *priv, const u8 *addr)
+ }
+ 
+ 
+-static int hostap_get_inact_sec(void *priv, const u8 *addr)
++static int hostap_get_inact_sec(void *priv, const u8 *addr, bool is_ml)
+ {
+ 	struct hostap_driver_data *drv = priv;
+ 	struct prism2_hostapd_param param;
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index f271cf6..09a67de 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -8171,6 +8171,66 @@ static void get_sta_tid_stats(struct hostap_sta_driver_data *data,
+ 	}
+ }
+ 
++static int get_link_sta_inactive_time(struct hostap_sta_driver_data *data,
++				      struct nlattr *link_sta_stats[],
++				      u8 mld_link_id)
++{
++	if (!data || !link_sta_stats || (mld_link_id > MAX_NUM_MLD_LINKS))
++		return -EINVAL;
++
++	if (!link_sta_stats[NL80211_STA_INFO_INACTIVE_TIME])
++		return 0;
++
++	data->link_sta_data[mld_link_id] = (struct hostap_sta_driver_data *)
++				os_zalloc(sizeof(struct hostap_sta_driver_data));
++	if (!data->link_sta_data[mld_link_id])
++		return -ENOMEM;
++
++	data->valid_links |= BIT(mld_link_id);
++	data->link_sta_data[mld_link_id]->inactive_msec =
++		nla_get_u32(link_sta_stats[NL80211_STA_INFO_INACTIVE_TIME]);
++
++	return 0;
++}
++
++static int get_link_sta_stats(struct hostap_sta_driver_data *data,
++			      struct nlattr **tb,
++			      struct nla_policy *stats_policy)
++{
++	struct nlattr *link_attr[NL80211_ATTR_MAX + 1];
++	struct nlattr *link_sta_stats[NL80211_STA_INFO_MAX + 1];
++	unsigned char mlo_link_id = MAX_NUM_MLD_LINKS;
++	struct nlattr *link;
++	int rem;
++
++	if (!data || !tb || !stats_policy)
++		return -1;
++
++	nla_for_each_nested(link, tb[NL80211_ATTR_MLO_LINKS], rem) {
++		if (link &&
++		    nla_parse_nested(link_attr, NL80211_ATTR_MAX, link,
++				     NULL) == 0) {
++			if (link_attr[NL80211_ATTR_MLO_LINK_ID])
++				mlo_link_id = nla_get_u8(link_attr[NL80211_ATTR_MLO_LINK_ID]);
++
++			if ((mlo_link_id < MAX_NUM_MLD_LINKS) &&
++			    link_attr[NL80211_ATTR_STA_INFO]) {
++				if (nla_parse_nested(link_sta_stats,
++						     NL80211_STA_INFO_MAX,
++						     link_attr[NL80211_ATTR_STA_INFO],
++						     stats_policy) == 0) {
++					if (get_link_sta_inactive_time(data,
++								       link_sta_stats,
++								       mlo_link_id))
++						wpa_printf(MSG_DEBUG, "failed to get %u link info",
++							   mlo_link_id);
++				}
++			}
++		}
++	}
++
++	return 0;
++}
+ 
+ static int get_sta_handler(struct nl_msg *msg, void *arg)
+ {
+@@ -8178,6 +8238,7 @@ static int get_sta_handler(struct nl_msg *msg, void *arg)
+ 	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
+ 	struct hostap_sta_driver_data *data = arg;
+ 	struct nlattr *stats[NL80211_STA_INFO_MAX + 1];
++	unsigned char mlo_link_id = MAX_NUM_MLD_LINKS;
+ 	static struct nla_policy stats_policy[NL80211_STA_INFO_MAX + 1] = {
+ 		[NL80211_STA_INFO_INACTIVE_TIME] = { .type = NLA_U32 },
+ 		[NL80211_STA_INFO_RX_BYTES] = { .type = NLA_U32 },
+@@ -8442,6 +8503,12 @@ static int get_sta_handler(struct nl_msg *msg, void *arg)
+ 		}
+ 	}
+ 
++	if (tb[NL80211_ATTR_MLO_LINKS])
++		if (get_link_sta_stats(data, tb, stats_policy))
++			wpa_printf(MSG_DEBUG,
++				   "nl80211: link=%d: failed to get link stats",
++				    mlo_link_id);
++
+ 	if (stats[NL80211_STA_INFO_TID_STATS])
+ 		get_sta_tid_stats(data, stats[NL80211_STA_INFO_TID_STATS]);
+ 
+@@ -8591,16 +8658,35 @@ static int i802_set_sta_vlan(struct i802_bss *bss, const u8 *addr,
+ static int i802_get_inact_sec(void *priv, const u8 *addr)
+ {
+ 	struct hostap_sta_driver_data data;
+-	int ret;
++	int ret, i;
++	unsigned long inactive_time;
+ 
+ 	os_memset(&data, 0, sizeof(data));
+-	data.inactive_msec = (unsigned long) -1;
++	data.inactive_msec = -1UL;
++
+ 	ret = i802_read_sta_data(priv, &data, addr);
+-	if (ret == -ENOENT)
+-		return -ENOENT;
+-	if (ret || data.inactive_msec == (unsigned long) -1)
++	if (ret)
++		goto free_link_sta_data;
++
++	inactive_time = data.inactive_msec;
++	for_each_link(data.valid_links, i) {
++		if (data.link_sta_data[i] &&
++		    (data.link_sta_data[i]->inactive_msec != -1UL) &&
++		    (inactive_time > data.link_sta_data[i]->inactive_msec))
++			inactive_time = data.link_sta_data[i]->inactive_msec;
++	}
++
++free_link_sta_data:
++	for_each_link(data.valid_links, i)
++		os_free(data.link_sta_data[i]);
++
++	if (ret || (inactive_time == -1UL)) {
++		if (ret == -ENOENT)
++			return ret;
+ 		return -1;
+-	return data.inactive_msec / 1000;
++	}
++
++	return (inactive_time / 1000);
+ }
+ 
+ 
+-- 
+2.34.1
+

@@ -1,0 +1,181 @@
+From be098481a0b94eca497544b34f3261908d8e4355 Mon Sep 17 00:00:00 2001
+From: Yuvarani V <yuvarani@qti.qualcomm.com>
+Date: Tue, 23 Sep 2025 12:39:15 +0530
+Subject: [PATCH] QSDK: PROTOCOL: Fix HT scan failure during ML Reconfig Link
+ Addition by updating radio mask
+
+Currently, radio_mask is set via ucode only during initial
+configuration. This causes HT scan to fail when ML Reconfig
+Link Addition is triggered at runtime, as the radio_mask
+is not set for the newly added interface.
+
+Fix this by updating the radio_mask during interface setup.
+Introduce `hostapd_get_current_hw_info()` to retrieve
+hardware info for a given frequency, and invoke
+`hostapd_ucode_update_radio_mask()` during setup to
+ensure the radio_mask is correctly updated.
+
+Signed-off-by: Yuvarani V <yuvarani@qti.qualcomm.com>
+---
+ src/ap/hostapd.c     |  9 +++++++++
+ src/ap/hw_features.c | 22 ++++++++++++++++++++++
+ src/ap/hw_features.h |  6 ++++++
+ src/ap/ucode.c       | 13 +++++++++++++
+ src/ap/ucode.h       |  5 +++++
+ 5 files changed, 55 insertions(+)
+
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -1800,6 +1800,11 @@ int hostapd_setup_bss(struct hostapd_dat
+ 	u8 if_addr[ETH_ALEN];
+ 	int flush_old_stations = 1;
+ 	struct hostapd_data *tx_hapd;
++	bool is_mesh = false;
++
++#ifdef CONFIG_MESH
++	is_mesh = hapd->iface->mconf ? true : false;
++#endif
+ 
+ 	wpa_printf(MSG_DEBUG, "%s(hapd=%p (%s), first=%d)",
+ 		   __func__, hapd, conf->iface, first);
+@@ -1904,6 +1909,14 @@ setup_mld:
+ 		hostapd_mld_add_link(hapd);
+ 		hostapd_validate_update_ml_max_rec_links(hapd);
+ 	}
++	if (!is_mesh && hapd->iface->current_hw_info &&
++	    !hostapd_ucode_update_radio_mask(hapd->conf->iface,
++					     hapd->iface->current_hw_info->hw_idx)) {
++		wpa_printf(MSG_ERROR,
++			   "Failed to update radio mask for %s",
++			   hapd->conf->iface);
++		return -1;
++	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	if (conf->wmm_enabled < 0)
+@@ -2722,6 +2735,12 @@ static void hostapd_set_6ghz_sec_chan(st
+ 
+ static int setup_interface2(struct hostapd_iface *iface)
+ {
++	struct hostapd_multi_hw_info *hw_info;
++	bool is_mesh = false;
++
++#ifdef CONFIG_MESH
++	is_mesh = iface->mconf ? true : false;
++#endif
+ 	iface->wait_channel_update = 0;
+ 	iface->is_afc_channel_change_pending = false;
+ 	iface->is_no_ir = false;
+@@ -2767,6 +2786,20 @@ static int setup_interface2(struct hosta
+ 		ret = hostapd_check_he_6ghz_capab(iface);
+ 		if (ret < 0)
+ 			goto fail;
++
++		if (!is_mesh) {
++			hw_info = hostapd_get_current_hw_info(iface, iface->freq);
++
++			if (hw_info &&
++			    !hostapd_ucode_update_radio_mask(iface->conf->bss[0]->iface,
++							     hw_info->hw_idx)) {
++				wpa_printf(MSG_ERROR,
++					   "Failed to update radio mask for %s",
++					   iface->conf->bss[0]->iface);
++				goto fail;
++			}
++		}
++
+ 		ret = hostapd_check_ht_capab(iface);
+ 		if (ret < 0)
+ 			goto fail;
+--- a/src/ap/hw_features.c
++++ b/src/ap/hw_features.c
+@@ -1506,3 +1506,25 @@ int hostapd_set_current_hw_info(struct h
+ 
+ 	return -1;
+ }
++
++
++struct hostapd_multi_hw_info *hostapd_get_current_hw_info(struct hostapd_iface *iface,
++							  int oper_freq)
++{
++	struct hostapd_multi_hw_info *hw_info;
++	unsigned int i;
++
++	if (!iface->num_multi_hws)
++		return NULL;
++
++	for (i = 0; i < iface->num_multi_hws; i++) {
++		hw_info = &iface->multi_hw_info[i];
++
++		if (hw_info->start_freq <= oper_freq &&
++		    hw_info->end_freq >= oper_freq) {
++			return hw_info;
++		}
++	}
++
++	return NULL;
++}
+--- a/src/ap/hw_features.h
++++ b/src/ap/hw_features.h
+@@ -32,6 +32,8 @@ int hostapd_hw_skip_mode(struct hostapd_
+ int hostapd_determine_mode(struct hostapd_iface *iface);
+ void hostapd_free_multi_hw_info(struct hostapd_multi_hw_info *multi_hw_info);
+ int hostapd_set_current_hw_info(struct hostapd_iface *iface, int oper_freq);
++struct hostapd_multi_hw_info *hostapd_get_current_hw_info(struct hostapd_iface *iface,
++							   int oper_freq);
+ 
+ /**
+  * hostapd_free_6ghz_channels() - Free 6 GHz channels for a given mode
+@@ -125,6 +127,12 @@ static inline int hostapd_set_current_hw
+ {
+ 	return 0;
+ }
++
++struct hostapd_multi_hw_info *hostapd_get_current_hw_info(struct hostapd_iface *iface,
++							   int oper_freq)
++{
++	return NULL;
++}
+ #endif /* NEED_AP_MLME */
+ 
+ #endif /* HW_FEATURES_H */
+--- a/src/ap/ucode.c
++++ b/src/ap/ucode.c
+@@ -1044,3 +1044,16 @@ void hostapd_ucode_config_nft_rule(struc
+ 	ucv_gc(vm);
+ }
+ #endif
++
++bool hostapd_ucode_update_radio_mask(char *ifname, u8 hw_idx)
++{
++	if (wpa_ucode_call_prepare("update_radio_mask"))
++		return false;
++
++	uc_value_push(ucv_string_new(ifname));
++	uc_value_push(ucv_int64_new(hw_idx));
++	ucv_put(wpa_ucode_call(2));
++	ucv_gc(vm);
++
++	return true;
++}
+--- a/src/ap/ucode.h
++++ b/src/ap/ucode.h
+@@ -31,6 +31,7 @@ void hostapd_ucode_free_iface(struct hos
+ void hostapd_ucode_add_bss(struct hostapd_data *hapd);
+ void hostapd_ucode_free_bss(struct hostapd_data *hapd);
+ void hostapd_ucode_reload_bss(struct hostapd_data *hapd);
++bool hostapd_ucode_update_radio_mask(char *ifname, u8 hw_idx);
+ 
+ #ifdef CONFIG_IEEE80211AX
+ void hostapd_ucode_config_nft_table(char *table, bool add);
+@@ -61,6 +62,10 @@ static inline void hostapd_ucode_add_bss
+ static inline void hostapd_ucode_free_bss(struct hostapd_data *hapd)
+ {
+ }
++static inline bool hostapd_ucode_update_radio_mask(char *ifname, u8 hw_idx)
++{
++	return true;
++}
+ #ifdef CONFIG_IEEE80211AX
+ static inline void hostapd_ucode_config_nft_table(char *table, bool add)
+ {

@@ -1,0 +1,150 @@
+From 74397042177e1a1e4cedd1863b2c4b0fd977c064 Mon Sep 17 00:00:00 2001
+From: Manish Dharanenthiran <mdharane@qti.qualcomm.com>
+Date: Fri, 7 Nov 2025 12:26:58 +0530
+Subject: [PATCH 3/3] hostapd: Fix usage of wrong capabilities during link
+ reconfiguraiton
+
+During link reconfiguraion add request, before sending the response to
+the requested station, all the station capabilities will be copied to
+reconf_sta_add_params struct, which in-turn will be used while adding
+the respective station to kernel. But, the capabilities saved were
+local address copy in add_associated_sta() which goes out of scope while
+it is being used in hostapd_handle_link_reconf_req(). This leads to
+updating wrong HT/VHT/HE/EHT capabilities of station to kernel, thus,
+link reconfiguration add request also failed.
+
+Fix this by allocating memory for each required capabilities in
+hostapd_sta_add(), as it is done for copying the hostapd_sta_add_params
+values.
+
+Also, introduce a new wrapper function
+hostapd_free_reconf_sta_add_params() to free the allocated memory after
+sending the response to the driver or in any failure cases.
+
+Signed-off-by: Dhanavandhana Kannan <dhanavan@qti.qualcomm.com>
+Signed-off-by: Manish Dharanenthiran <mdharane@qti.qualcomm.com>
+---
+ src/ap/ap_drv_ops.c     | 48 ++++++++++++++++++++++++++++++++++++-----
+ src/ap/ieee802_11.h     |  2 ++
+ src/ap/ieee802_11_eht.c | 22 +++++++++++++++----
+ 3 files changed, 63 insertions(+), 9 deletions(-)
+
+--- a/src/ap/ap_drv_ops.c
++++ b/src/ap/ap_drv_ops.c
+@@ -536,7 +536,7 @@ int hostapd_sta_add(struct hostapd_data
+ 		    int set, const u8 *link_addr, bool mld_link_sta,
+ 		    u16 eml_cap, int type)
+ {
+-	struct hostapd_sta_add_params params;
++	struct hostapd_sta_add_params params, *tmp = NULL;
+ 	struct hostapd_data *assoc_hapd;
+ 	struct sta_info *sta, *assoc_sta;
+ 
+@@ -593,16 +593,54 @@ int hostapd_sta_add(struct hostapd_data
+ 			wpa_printf(MSG_ERROR, "No assoc sta found");
+ 			return -1;
+ 		}
+-		assoc_sta->recfg_sta_add_params[hapd->mld_link_id] =
+-			os_zalloc(sizeof(struct hostapd_sta_add_params));
+ 
+-		os_memcpy(assoc_sta->recfg_sta_add_params[hapd->mld_link_id],
+-			  &params, sizeof(params));
++		tmp = os_zalloc(sizeof(*tmp));
++		if (!tmp) {
++			wpa_printf(MSG_ERROR, "Failed to allocate reconf_sta_add_params");
++			return -1;
++		}
++
++		os_memcpy(tmp, &params, sizeof(params));
++
++		if (params.ht_capabilities) {
++			tmp->ht_capabilities = os_memdup(params.ht_capabilities,
++							 sizeof(*params.ht_capabilities));
++			if (!tmp->ht_capabilities)
++				goto fail;
++		}
++		if (params.vht_capabilities) {
++			tmp->vht_capabilities = os_memdup(params.vht_capabilities,
++							  sizeof(*params.vht_capabilities));
++			if (!tmp->vht_capabilities)
++				goto fail;
++		}
++		if (params.he_capab && params.he_capab_len) {
++			tmp->he_capab = os_memdup(params.he_capab, params.he_capab_len);
++			if (!tmp->he_capab)
++				goto fail;
++		}
++		if (params.he_6ghz_capab) {
++			tmp->he_6ghz_capab = os_memdup(params.he_6ghz_capab,
++						       sizeof(*params.he_6ghz_capab));
++			if (!tmp->he_6ghz_capab)
++				goto fail;
++		}
++		if (params.eht_capab && params.eht_capab_len) {
++			tmp->eht_capab = os_memdup(params.eht_capab, params.eht_capab_len);
++			if (!tmp->eht_capab)
++				goto fail;
++		}
++
++		assoc_sta->recfg_sta_add_params[hapd->mld_link_id] = tmp;
+ 		return 0;
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	return hapd->driver->sta_add(hapd->drv_priv, &params);
++
++fail:
++	hostapd_free_reconf_sta_add_params(tmp);
++	return -1;
+ }
+ 
+ 
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -451,6 +451,8 @@ void hostapd_epcs_timeout_handler(void *
+ int hostapd_configure_epcs(struct hostapd_data *hapd,
+ 				  struct sta_info *sta,
+ 				  enum qos_mgmt_req_type req_type);
++void
++hostapd_free_reconf_sta_add_params(struct hostapd_sta_add_params *params);
+ #endif /* CONFIG_IEEE80211BE */
+ u8 * hostapd_fragment_multi_link_element(struct wpabuf *buf, u8 *pos);
+ unsigned int wnm_neighbor_report_get_pref_link_mask(const u8 *neigh_rep,
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -1439,6 +1439,21 @@ out:
+ }
+ 
+ #ifdef CONFIG_IEEE80211BE
++void
++hostapd_free_reconf_sta_add_params(struct hostapd_sta_add_params *params)
++{
++	if (!params)
++		return;
++
++	os_free((void *)params->eht_capab);
++	os_free((void *)params->he_6ghz_capab);
++	os_free((void *)params->he_capab);
++	os_free((void *)params->vht_capabilities);
++	os_free((void *)params->ht_capabilities);
++	os_free(params);
++}
++
++
+ void ml_deinit_link_reconf_req(struct link_reconf_req_list **req_list_ptr)
+ {
+ 	struct link_reconf_req_list *req_list;
+@@ -2668,10 +2683,9 @@ skip_oci_validation:
+ out:
+ 	if (assoc_sta) {
+ 		for (i = 0; i < MAX_NUM_MLD_LINKS; i++) {
+-			if (assoc_sta->recfg_sta_add_params[i]) {
+-				os_free(assoc_sta->recfg_sta_add_params[i]);
+-				assoc_sta->recfg_sta_add_params[i] = NULL;
+-			}
++			hostapd_free_reconf_sta_add_params(
++					assoc_sta->recfg_sta_add_params[i]);
++			assoc_sta->recfg_sta_add_params[i] = NULL;
+ 		}
+ 	}
+ 
