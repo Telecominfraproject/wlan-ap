@@ -1,0 +1,263 @@
+From 219a31a6e40c754aea5505d985e8262c488d30be Mon Sep 17 00:00:00 2001
+From: Shwetha G K <kshwetha@qti.qualcomm.com>
+Date: Mon, 30 Jun 2025 16:25:42 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: hostapd: Update expected duration using
+ value from probe request
+
+The expected duration configured by the user is stored in
+'struct ttlm_context ttlm_ctx' of struct hostapd_mld. When a probe
+request is sent to the userspace from driver, it also packs the current
+value of the expected duration as received from the firmware. In order
+to update the expected duration stored in the userspace with the latest
+value received from the driver, add the infrastructure to receive the
+update event, parse it and store the newly obtained value. All subsequent
+management frames (Beacon, Probe resp and Assoc resp) are to use this
+updated value.
+
+Signed-off-by: Shwetha G K <kshwetha@qti.qualcomm.com>
+Signed-off-by: Amith A <amitajit@qti.qualcomm.com>
+---
+ src/ap/drv_callbacks.c             |  15 +++++
+ src/drivers/driver.h               |  14 ++++
+ src/drivers/driver_common.c        |   1 +
+ src/drivers/driver_nl80211_event.c | 101 +++++++++++++++++++++++++++--
+ src/drivers/nl80211_copy.h         |   2 +
+ 5 files changed, 128 insertions(+), 5 deletions(-)
+
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -3003,6 +3003,18 @@ static void hostapd_event_update_ttlm_st
+ }
+ #endif /* CONFIG_IEEE80211BE */
+ 
++static void hostapd_event_update_expec_dur(struct hostapd_data *hapd,
++					  struct ttlm_expec_dur_event *ttlm_expec_dur_event)
++{
++	struct ttlm_context *ttlm_ctx = &hapd->mld->ttlm_ctx;
++
++	if (ttlm_ctx->established_ttlm.ttlm.expected_duration_present)
++		ttlm_ctx->established_ttlm.ttlm.expected_duration =
++			ttlm_expec_dur_event->expec_dur;
++	else if (ttlm_ctx->upcoming_ttlm.ttlm.expected_duration_present)
++		ttlm_ctx->upcoming_ttlm.ttlm.expected_duration =
++			ttlm_expec_dur_event->expec_dur;
++}
+ 
+ void hostapd_wpa_event(void *ctx, enum wpa_event_type event,
+ 		       union wpa_event_data *data)
+@@ -3418,6 +3430,11 @@ void hostapd_wpa_event(void *ctx, enum w
+ 		if (link_hapd->eht_mld_link_removal_inprogress)
+ 			link_hapd->eht_mld_link_removal_count = data->link_removal_event.link_removal_count;
+ 		break;
++	case EVENT_TTLM_EXPEC_DUR_UPDATE:
++		link_hapd = switch_link_hapd(hapd, data->ttlm_expec_dur_event.link_id);
++		if (link_hapd)
++			hostapd_event_update_expec_dur(hapd, &data->ttlm_expec_dur_event);
++		break;
+ #endif
+ 	default:
+ 		wpa_printf(MSG_DEBUG, "Unknown event %d", event);
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -6505,6 +6505,12 @@ enum wpa_event_type {
+ 	 * EVENT_TTLM_UPDATE - Notification about TTLM info update event
+ 	 */
+ 	EVENT_TTLM_UPDATE,
++
++	/**
++	 * EVENT_TTLM_EXPEC_DUR_UPDATE - Update the expected duration with the
++	 * received value
++	 */
++	EVENT_TTLM_EXPEC_DUR_UPDATE,
+ };
+ 
+ 
+@@ -7562,6 +7568,14 @@ union wpa_event_data {
+ 		enum ttlm_status status;
+ 		u32 mapping_switch_tsf;
+ 	} ttlm_update_event;
++
++	/**
++	 * Data for TTLM expected duration update
++	 */
++	struct ttlm_expec_dur_event {
++		u8 link_id;
++		u32 expec_dur;
++	} ttlm_expec_dur_event;
+ };
+ 
+ /**
+--- a/src/drivers/driver_common.c
++++ b/src/drivers/driver_common.c
+@@ -111,6 +111,7 @@ const char * event_to_string(enum wpa_ev
+ 	E2S(LINK_REMOVAL_COMPLETED);
+ 	E2S(AFC_RECEIVED);
+ 	E2S(TTLM_UPDATE);
++	E2S(TTLM_EXPEC_DUR_UPDATE);
+ 	}
+ 
+ 	return "UNKNOWN";
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -1526,10 +1526,92 @@ mlme_event_mgmt_link_removal_update(stru
+ }
+ 
+ 
++static void mlme_send_expec_dur_update_event(struct i802_bss *bss,
++					     struct nlattr *mld_list)
++{
++	struct nlattr *link[NL80211_CU_MLD_LINK_ATTR_MAX + 1];
++	struct nlattr *mld[NL80211_CU_MLD_ATTR_MAX + 1];
++	union wpa_event_data event;
++	struct nlattr *link_list;
++	int link_list_rem;
++
++	/* MLD attribute policy */
++	static struct nla_policy
++		mld_attr_policy[NL80211_CU_MLD_ATTR_MAX + 1] = {
++			[NL80211_CU_MLD_ATTR_IFINDEX] = { .type = NLA_U32 },
++			[NL80211_CU_MLD_ATTR_LINK_LIST] = { .type = NLA_NESTED },
++		};
++
++	/* Link attribute policy */
++	static struct nla_policy
++		link_policy[NL80211_CU_MLD_LINK_ATTR_MAX + 1] = {
++			[NL80211_CU_MLD_LINK_ATTR_ID] = { .type = NLA_U8 },
++			[NL80211_CU_ATTR_TTLM_EXPEC_DUR] = { .type = NLA_U32 },
++		};
++
++	if (nla_parse_nested(mld, NL80211_CU_MLD_ATTR_MAX, mld_list,
++			     mld_attr_policy) || !mld[NL80211_CU_MLD_ATTR_LINK_LIST])
++		return;
++
++	if (mld[NL80211_CU_MLD_ATTR_LINK_LIST]) {
++		nla_for_each_nested(link_list, mld[NL80211_CU_MLD_ATTR_LINK_LIST],
++				    link_list_rem) {
++			if (nla_parse_nested(link, NL80211_CU_MLD_LINK_ATTR_MAX,
++					     link_list, link_policy))
++				return;
++
++			os_memset(&event, 0, sizeof(event));
++			if (link[NL80211_CU_MLD_LINK_ATTR_ID]) {
++				event.ttlm_expec_dur_event.link_id =
++					nla_get_u8(link[NL80211_CU_MLD_LINK_ATTR_ID]);
++
++				if (link[NL80211_CU_ATTR_TTLM_EXPEC_DUR])
++					event.ttlm_expec_dur_event.expec_dur =
++						nla_get_u32(link[NL80211_CU_ATTR_TTLM_EXPEC_DUR]);
++
++				wpa_supplicant_event(bss->ctx,
++						     EVENT_TTLM_EXPEC_DUR_UPDATE, &event);
++			}
++		}
++	}
++}
++
++
++static void
++mlme_event_mgmt_ttlm_expec_dur_update(struct i802_bss *bss,
++				      struct nlattr *ttlm_expec_dur_update_param)
++{
++	struct nlattr *expec_dur_update[NL80211_CU_ATTR_MAX + 1];
++	struct nlattr *mld_list;
++	int mld_list_rem;
++
++	/* Link removal attribute policy */
++	static struct nla_policy
++		expec_dur_attr_policy[NL80211_CU_ATTR_MAX + 1] = {
++			[NL80211_CU_ATTR_MLD_LIST] = { .type = NLA_NESTED },
++		};
++
++	nla_parse_nested(expec_dur_update, NL80211_CU_ATTR_MAX,
++			 ttlm_expec_dur_update_param, expec_dur_attr_policy);
++
++	if (!expec_dur_update[NL80211_CU_ATTR_MLD_LIST]) {
++		wpa_printf(MSG_DEBUG, "nl80211: Couldn't parse expec_dur_update attribute\n");
++		return;
++	}
++
++	nla_for_each_nested(mld_list, expec_dur_update[NL80211_CU_ATTR_MLD_LIST],
++			    mld_list_rem) {
++
++		mlme_send_expec_dur_update_event(bss, mld_list);
++	}
++}
++
++
+ static void mlme_event_mgmt(struct i802_bss *bss,
+ 			    struct nlattr *freq, struct nlattr *sig,
+ 			    const u8 *frame, size_t len, struct nlattr *rx_cu_param,
+-			    int link_id, struct nlattr *link_removal_param)
++			    int link_id, struct nlattr *link_removal_param,
++			    struct nlattr *ttlm_expec_dur_update_param)
+ {
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+ 	const struct ieee80211_mgmt *mgmt;
+@@ -1575,6 +1657,9 @@ static void mlme_event_mgmt(struct i802_
+ 	    || (stype == WLAN_FC_STYPE_REASSOC_REQ)))
+ 		mlme_event_mgmt_link_removal_update(bss, link_removal_param);
+ 
++	if (ttlm_expec_dur_update_param && stype == WLAN_FC_STYPE_PROBE_REQ)
++		mlme_event_mgmt_ttlm_expec_dur_update(bss, ttlm_expec_dur_update_param);
++
+ 	event.rx_mgmt.ctx = bss->ctx;
+ 	event.rx_mgmt.link_id = link_id;
+ 
+@@ -1850,7 +1935,8 @@ static void mlme_event(struct i802_bss *
+ 		       struct nlattr *cookie, struct nlattr *sig,
+ 		       struct nlattr *wmm, struct nlattr *req_ie,
+ 		       struct nlattr *rx_cu_param, struct nlattr *link,
+-		       struct nlattr *link_removal_param)
++		       struct nlattr *link_removal_param,
++		       struct nlattr *ttlm_expec_dur_update_param)
+ {
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+ 	u16 stype = 0, auth_type = 0;
+@@ -1950,7 +2036,8 @@ static void mlme_event(struct i802_bss *
+ 	case NL80211_CMD_FRAME:
+ 		mlme_event_mgmt(bss, freq, sig, nla_data(frame),
+ 				nla_len(frame), rx_cu_param, link_id,
+-				link_removal_param);
++				link_removal_param,
++				ttlm_expec_dur_update_param);
+ 		break;
+ 	case NL80211_CMD_FRAME_TX_STATUS:
+ 		mlme_event_mgmt_tx_status(bss, cookie, nla_data(frame),
+@@ -4965,7 +5052,8 @@ static void do_process_drv_event(struct
+ 			   tb[NL80211_ATTR_RX_SIGNAL_DBM],
+ 			   tb[NL80211_ATTR_STA_WME],
+ 			   tb[NL80211_ATTR_REQ_IE], NULL,
+-			   tb[NL80211_ATTR_MLO_LINK_ID], NULL);
++			   tb[NL80211_ATTR_MLO_LINK_ID], NULL,
++			   NULL);
+ 		break;
+ 	case NL80211_CMD_CONNECT:
+ 	case NL80211_CMD_ROAM:
+@@ -5280,7 +5368,8 @@ int process_bss_event(struct nl_msg *msg
+ 			   tb[NL80211_ATTR_STA_WME], NULL,
+ 			   tb[NL80211_ATTR_RXMGMT_CRITICAL_UPDATE],
+ 			   tb[NL80211_ATTR_MLO_LINK_ID],
+-			   tb[NL80211_ATTR_RXMGMT_LINK_REMOVAL_UPDATE]);
++			   tb[NL80211_ATTR_RXMGMT_LINK_REMOVAL_UPDATE],
++			   tb[NL80211_ATTR_ADVERTISED_TTLM_EXPEC_DUR_UPDATE]);
+ 		break;
+ 	case NL80211_CMD_UNEXPECTED_FRAME:
+ 		nl80211_spurious_frame(bss, tb, 0);
+--- a/src/drivers/nl80211_copy.h
++++ b/src/drivers/nl80211_copy.h
+@@ -3553,6 +3553,7 @@ enum nl80211_attrs {
+ 	NL80211_ATTR_ERP,
+ 
+ 	NL80211_ATTR_ADVERTISED_TTLM,
++	NL80211_ATTR_ADVERTISED_TTLM_EXPEC_DUR_UPDATE,
+ 
+ 	/* add attributes here, update the policy in nl80211.c */
+ 
+@@ -8518,6 +8519,7 @@ enum nl80211_cu_mld_link_attrs {
+ 	NL80211_CU_MLD_LINK_ATTR_BPCC,
+ 	NL80211_CU_MLD_LINK_ATTR_SWITCH_COUNT,
+ 	NL80211_CU_ATTR_AP_REMOVAL_COUNT,
++	NL80211_CU_ATTR_TTLM_EXPEC_DUR,
+ 
+ 	/* keep last */
+ 	__NL80211_CU_MLD_LINK_ATTR_LAST,

@@ -1,0 +1,324 @@
+From 19725a84202dfce4412ba8c83ebf6bfa0df84d46 Mon Sep 17 00:00:00 2001
+From: Harshitha Prem <hprem@qti.qualcomm.com>
+Date: Mon, 22 Sep 2025 12:33:59 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL:hostapd: Add MLD support for accept policy
+
+Extend the existing hostapd ACL logic to support Multi-Link Device (MLD)
+addresses in addition to link addresses. This enhancement enables APs to
+apply ACL policies based on either address type.
+
+For the accept policy, if either the link address or the MLD address is
+present in the allowed list, the client association is accepted.
+
+For the deny policy, if either the link address or the MLD address is
+present in the deny list, the client association is rejected.
+
+Patch-dependency: None
+Patch-work: None
+
+Signed-off-by: Harshitha Prem <hprem@qti.qualcomm.com>
+---
+ src/ap/beacon.c          | 19 +++++++----
+ src/ap/ctrl_iface_ap.c   | 31 ++++++++++++++++++
+ src/ap/drv_callbacks.c   | 33 +++----------------
+ src/ap/ieee802_11.c      | 48 +++++++++++++++++++++++-----
+ src/ap/ieee802_11_auth.c | 69 ++++++++++++++++++++++++++++++++++++++++
+ src/ap/ieee802_11_auth.h |  2 +-
+ 6 files changed, 159 insertions(+), 43 deletions(-)
+
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -1552,6 +1552,7 @@ void handle_probe_req(struct hostapd_dat
+ 	struct radius_sta rad_info;
+ 	struct probe_resp_params params;
+ 	char *hex = NULL;
++	bool skip_acl = false;
+ #ifdef CONFIG_IEEE80211BE
+ 	int mld_id;
+ 	u16 links;
+@@ -1574,13 +1575,19 @@ void handle_probe_req(struct hostapd_dat
+ 		sta_track_add(hapd->iface, mgmt->sa, ssi_signal);
+ 	ie_len = len - IEEE80211_HDRLEN;
+ 
+-	ret = hostapd_allowed_address(hapd, mgmt->sa, (const u8 *) mgmt, len,
++#ifdef CONFIG_IEEE80211BE
++	if (hapd->conf->mld_ap)
++		skip_acl = true;
++#endif
++	if (!skip_acl) {
++		ret = hostapd_allowed_address(hapd, mgmt->sa, (const u8 *) mgmt, len,
+ 				      &rad_info, 1);
+-	if (ret == HOSTAPD_ACL_REJECT) {
+-		wpa_msg(hapd->msg_ctx, MSG_DEBUG,
+-			"Ignore Probe Request frame from " MACSTR
+-			" due to ACL reject ", MAC2STR(mgmt->sa));
+-		return;
++		if (ret == HOSTAPD_ACL_REJECT) {
++			wpa_msg(hapd->msg_ctx, MSG_DEBUG,
++				"Ignore Probe Request frame from " MACSTR
++				" due to ACL reject ", MAC2STR(mgmt->sa));
++			return;
++		}
+ 	}
+ 
+ 	for (i = 0; hapd->probereq_cb && i < hapd->num_probereq_cb; i++)
+--- a/src/ap/ctrl_iface_ap.c
++++ b/src/ap/ctrl_iface_ap.c
+@@ -2149,16 +2149,47 @@ int hostapd_disassoc_accept_mac(struct h
+ {
+ 	struct sta_info *sta;
+ 	struct vlan_description vlan_id;
++	bool disconnect_sta;
+ 
+ 	if (hapd->conf->macaddr_acl != DENY_UNLESS_ACCEPTED)
+ 		return 0;
+ 
+ 	for (sta = hapd->sta_list; sta; sta = sta->next) {
++#ifdef CONFIG_IEEE80211BE
++		int link_id;
++		struct mld_link_info *info;
++#endif /* CONFIG_IEEE80211BE */
++
++		disconnect_sta = false;
++
+ 		if (!hostapd_maclist_found(hapd->conf->accept_mac,
+ 					   hapd->conf->num_accept_mac,
+ 					   sta->addr, &vlan_id) ||
+ 		    (vlan_id.notempty &&
+ 		     vlan_compare(&vlan_id, sta->vlan_desc)))
++			disconnect_sta = true;
++
++#ifdef CONFIG_IEEE80211BE
++		for (link_id = 0; hapd->conf->mld_ap &&
++				  link_id < MAX_NUM_MLD_LINKS &&
++				  sta->mld_info.mld_sta; link_id++) {
++			info = &sta->mld_info.links[link_id];
++			if (!info->valid || link_id != hapd->mld_link_id)
++				continue;
++			if (!hostapd_maclist_found(hapd->conf->accept_mac,
++						   hapd->conf->num_accept_mac,
++						   info->peer_addr,
++						   &vlan_id) ||
++			    (vlan_id.notempty &&
++			     vlan_compare(&vlan_id, sta->vlan_desc))) {
++				disconnect_sta = true;
++			} else {
++				disconnect_sta = false;
++				break;
++			}
++		}
++#endif /* CONFIG_IEEE80211BE */
++		if (disconnect_sta)
+ 			ap_sta_disconnect(hapd, sta, sta->addr,
+ 					  WLAN_REASON_UNSPECIFIED);
+ 	}
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -476,35 +476,12 @@ int hostapd_notif_assoc(struct hostapd_d
+ 	 * For each peer link address, check the corresponding association
+ 	 * local link's ACL configuration whether it is acceptable.
+ 	 */
+-	if (!driver_acl && hapd->conf->mld_ap && link_addr) {
+-		int link_id;
+-		struct mld_link_info *info;
+-		struct hostapd_data *bss;
+-
+-		for (link_id = 0; link_id < MAX_NUM_MLD_LINKS; link_id++) {
+-			info = &sta->mld_info.links[link_id];
+-			if (!info->valid)
+-				continue;
+-
+-			bss = hostapd_mld_get_link_bss(hapd, link_id);
+-			if (bss != hapd &&
+-			    hostapd_check_acl(bss, addr, NULL) !=
+-			    HOSTAPD_ACL_ACCEPT) {
+-				wpa_printf(MSG_INFO, "STA " MACSTR
+-					   " not allowed to connect",
+-					   MAC2STR(addr));
+-				reason = WLAN_REASON_UNSPECIFIED;
+-				goto fail;
+-			}
+-			if (hostapd_check_acl(bss, info->peer_addr, NULL) !=
+-			    HOSTAPD_ACL_ACCEPT) {
+-				wpa_printf(MSG_INFO, "link addr" MACSTR
+-					   " not allowed to connect",
+-					   MAC2STR(info->peer_addr));
+-				reason = WLAN_REASON_UNSPECIFIED;
+-				goto fail;
+-			}
++	if (!driver_acl && hapd->conf->mld_ap) {
++		if (hostapd_check_ml_acl(hapd, sta) != HOSTAPD_ACL_ACCEPT) {
++			reason = WLAN_REASON_UNSPECIFIED;
++			goto fail;
+ 		}
++
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -3173,6 +3173,7 @@ static void handle_auth(struct hostapd_d
+ 	u16 seq_ctrl;
+ 	struct radius_sta rad_info;
+ 	const u8 *dst, *sa;
++	bool skip_acl = false;
+ #ifdef CONFIG_IEEE80211BE
+ 	bool mld_sta = false;
+ #endif /* CONFIG_IEEE80211BE */
+@@ -3210,6 +3211,10 @@ static void handle_auth(struct hostapd_d
+ 		mld_sta = true;
+ 	else
+ 		sa = mgmt->sa;
++
++	if (hapd->conf->mld_ap &&
++	    hapd->conf->macaddr_acl == DENY_UNLESS_ACCEPTED)
++		skip_acl = true;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	auth_alg = le_to_host16(mgmt->u.auth.auth_alg);
+@@ -3368,15 +3373,19 @@ static void handle_auth(struct hostapd_d
+ 		}
+ 	}
+ 
++
+ 	res = ieee802_11_allowed_address(hapd, sa, (const u8 *) mgmt, len,
+ 					 &rad_info);
+-	if (res == HOSTAPD_ACL_REJECT) {
++	if (res == HOSTAPD_ACL_REJECT && !skip_acl) {
+ 		wpa_msg(hapd->msg_ctx, MSG_DEBUG,
+ 			"Ignore Authentication frame from " MACSTR
+ 			" due to ACL reject", MAC2STR(sa));
+ 		resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
+ 		goto fail;
+ 	}
++	if (res == HOSTAPD_ACL_PENDING)
++		return;
++
+ 	ubus_resp = hostapd_ubus_handle_event(hapd, &req);
+ 	if (ubus_resp) {
+ 		wpa_printf(MSG_DEBUG, "Station " MACSTR " rejected by ubus handler.\n",
+@@ -3384,15 +3393,17 @@ static void handle_auth(struct hostapd_d
+ 		resp = ubus_resp > 0 ? (u16) ubus_resp : WLAN_STATUS_UNSPECIFIED_FAILURE;
+ 		goto fail;
+ 	}
+-	if (res == HOSTAPD_ACL_PENDING)
+-		return;
+ 
+ #ifdef CONFIG_IEEE80211BE
++	/* In case of ACCEPT_UNLESS_DENIED, check both mld address and
++	 * source address
++	 */
+ 	if (mld_sta) {
++
+ 		res = ieee802_11_allowed_address(hapd, mgmt->sa,
+ 						 (const u8 *) mgmt, len,
+ 						 &rad_info);
+-		if (res == HOSTAPD_ACL_REJECT) {
++		if (res == HOSTAPD_ACL_REJECT && !skip_acl) {
+ 			wpa_msg(hapd->msg_ctx, MSG_DEBUG,
+ 				"Ignore Authentication frame from " MACSTR
+ 				" due to ACL reject", MAC2STR(mgmt->sa));
+@@ -6553,6 +6564,16 @@ static void handle_assoc(struct hostapd_
+ 	}
+ #endif /* CONFIG_FILS */
+ 
++#ifdef CONFIG_IEEE80211BE
++	if (hapd->conf->mld_ap) {
++		wpa_printf(MSG_INFO, "STA " MACSTR " for acl checking",
++			   MAC2STR(sta->addr));
++		if (hostapd_check_ml_acl(hapd, sta) == HOSTAPD_ACL_REJECT) {
++			resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
++			goto fail;
++		}
++	}
++#endif /* CONFIG_IEEE80211BE */
+ 	ubus_resp = hostapd_ubus_handle_event(hapd, &req);
+ 	if (ubus_resp) {
+ 		wpa_printf(MSG_DEBUG, "Station " MACSTR " assoc rejected by ubus handler.\n",
+--- a/src/ap/ieee802_11_auth.c
++++ b/src/ap/ieee802_11_auth.c
+@@ -339,6 +339,75 @@ int hostapd_allowed_address(struct hosta
+ 	return HOSTAPD_ACL_REJECT;
+ }
+ 
++/**
++ * hostapd_check_ml_acl - Check a specified STA against accept/deny ACLs in
++ * 			that mld AP
++ * @hapd: hostapd BSS data
++ * @addr: MAC address of the STA
++ * Returns: HOSTAPD_ACL_ACCEPT, HOSTAPD_ACL_REJECT, or HOSTAPD_ACL_PENDING
++ */
++
++int hostapd_check_ml_acl(struct hostapd_data *hapd, struct sta_info *sta)
++{
++#ifdef CONFIG_IEEE80211BE
++	struct hostapd_data *tmp_hapd;
++	int acl_res, acl_res_linkaddr, accept = 0;
++
++	if (!ap_sta_is_mld(hapd, sta)) {
++		if (hostapd_check_acl(hapd, sta->addr, NULL) != HOSTAPD_ACL_ACCEPT) {
++			wpa_printf(MSG_INFO, "STA " MACSTR " not allowed to connect",
++				   MAC2STR(sta->addr));
++			return HOSTAPD_ACL_REJECT;
++		}
++		return HOSTAPD_ACL_ACCEPT;
++	}
++
++
++        for_each_mld_link(tmp_hapd, hapd) {
++                struct mld_link_info *link;
++
++
++                link = &sta->mld_info.links[tmp_hapd->mld_link_id];
++		if (!link->valid)
++			continue;
++
++		acl_res = hostapd_check_acl(tmp_hapd, sta->addr, NULL);
++
++		if (hapd->conf->macaddr_acl == ACCEPT_UNLESS_DENIED &&
++		    acl_res != HOSTAPD_ACL_ACCEPT) {
++			wpa_printf(MSG_INFO, "STA " MACSTR
++				   " not allowed to connect",
++				   MAC2STR(sta->addr));
++			return HOSTAPD_ACL_REJECT;
++		}
++
++		acl_res_linkaddr = hostapd_check_acl(tmp_hapd, link->peer_addr, NULL);
++		if (hapd->conf->macaddr_acl == ACCEPT_UNLESS_DENIED &&
++		    acl_res_linkaddr != HOSTAPD_ACL_ACCEPT) {
++			wpa_printf(MSG_INFO, "link addr" MACSTR
++				   " not allowed to connect",
++				   MAC2STR(link->peer_addr));
++			return HOSTAPD_ACL_REJECT;
++		}
++
++		if (hapd->conf->macaddr_acl == DENY_UNLESS_ACCEPTED &&
++		    (acl_res_linkaddr != HOSTAPD_ACL_REJECT ||
++		     acl_res != HOSTAPD_ACL_REJECT)) {
++			accept = 1;
++			break;
++		}
++
++        }
++
++	if (hapd->conf->macaddr_acl == DENY_UNLESS_ACCEPTED && !accept) {
++		wpa_printf(MSG_INFO, "STA " MACSTR " not accepted on any link",
++			   MAC2STR(sta->addr));
++		return HOSTAPD_ACL_REJECT;
++	}
++
++#endif /* CONFIG_IEEE80211BE */
++     return HOSTAPD_ACL_ACCEPT;
++}
+ 
+ #ifndef CONFIG_NO_RADIUS
+ static void hostapd_acl_expire_cache(struct hostapd_data *hapd,
+--- a/src/ap/ieee802_11_auth.h
++++ b/src/ap/ieee802_11_auth.h
+@@ -39,5 +39,5 @@ void hostapd_copy_psk_list(struct hostap
+ void hostapd_acl_req_radius_psk(struct hostapd_data *hapd, const u8 *addr,
+ 				int key_mgmt, const u8 *anonce,
+ 				const u8 *eapol, size_t eapol_len);
+-
++int hostapd_check_ml_acl(struct hostapd_data *hapd, struct sta_info *sta);
+ #endif /* IEEE802_11_AUTH_H */
