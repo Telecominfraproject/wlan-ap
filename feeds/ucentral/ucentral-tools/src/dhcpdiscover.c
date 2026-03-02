@@ -169,7 +169,7 @@ typedef struct dhcp_packet_struct {
 	char sname[MAX_DHCP_SNAME_LENGTH];            /* name of DHCP server */
 	char file[MAX_DHCP_FILE_LENGTH];              /* boot file name (used for diskless
 	                                                 booting?) */
-	char options[MAX_DHCP_OPTIONS_LENGTH];        /* options */
+	unsigned char options[MAX_DHCP_OPTIONS_LENGTH];        /* options */
 } dhcp_packet;
 
 typedef struct dhcp_offer_struct {
