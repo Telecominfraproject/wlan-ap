@@ -76,7 +76,7 @@ PKG_CONFIG_DEPENDS += \
 define KernelPackage/cfg80211
   $(call KernelPackage/mac80211/Default)
   TITLE:=cfg80211 - wireless configuration API
-  DEPENDS+= +iw +wireless-regdb +USE_RFKILL:kmod-rfkill
+  DEPENDS+= +iw +wireless-regdb +USE_RFKILL:kmod-rfkill +wifi-scripts
   ABI_VERSION:=$(PKG_VERSION)-$(PKG_RELEASE)
   FILES:= \
 	$(PKG_BUILD_DIR)/compat/compat.ko \
