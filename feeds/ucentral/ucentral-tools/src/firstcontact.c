@@ -1,15 +1,15 @@
 #define _GNU_SOURCE
-#include <stdio.h>
 #include <getopt.h>
+#include <stdio.h>
 
 #include <curl/curl.h>
 
 #include <libubox/ulog.h>
 
 static const char *file_cert = "/etc/open-wifi/client.pem";
-static const char *file_key  = "/etc/open-wifi/client_dec.key";
+static const char *file_key = "/etc/open-wifi/client_dec.key";
 static const char *file_json = "/etc/open-wifi/redirector.json";
-static const char *file_dbg  = "/tmp/firstcontact.hdr";
+static const char *file_dbg = "/tmp/firstcontact.hdr";
 
 int main(int argc, char **argv)
 {
@@ -27,26 +27,26 @@ int main(int argc, char **argv)
 			break;
 
 		switch (option) {
-		case 'k':
-			file_key = optarg;
-			break;
-		case 'c':
-			file_cert = optarg;
-			break;
-		case 'o':
-			file_json = optarg;
-			break;
-		case 'i':
-			devid = optarg;
-			break;
-		default:
-		case 'h':
-			printf("Usage: firstcontact OPTIONS\n"
-			       "  -k <keyfile>\n"
-			       "  -c <certfile>\n"
-			       "  -o <outfile>\n"
-			       "  -i <devid>\n");
-			return -1;
+			case 'k':
+				file_key = optarg;
+				break;
+			case 'c':
+				file_cert = optarg;
+				break;
+			case 'o':
+				file_json = optarg;
+				break;
+			case 'i':
+				devid = optarg;
+				break;
+			default:
+			case 'h':
+				printf("Usage: firstcontact OPTIONS\n"
+				       "  -k <keyfile>\n"
+				       "  -c <certfile>\n"
+				       "  -o <outfile>\n"
+				       "  -i <devid>\n");
+				return -1;
 		}
 	}
 
@@ -72,7 +72,8 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
-	if (asprintf(&url, "https://clientauth.demo.one.digicert.com/iot/api/v2/device/%s", devid) < 0) {
+	if (asprintf(&url, "https://clientauth.demo.one.digicert.com/iot/api/v2/device/%s", devid) <
+	    0) {
 		ULOG_ERR("failed to assemble url\n");
 		return -1;
 	}
