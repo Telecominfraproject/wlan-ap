@@ -45,8 +45,7 @@ define Device/sonicfi_rap630w_312g
   DEVICE_DTS := qcom-ipq5018-rap630w-312g
   SUPPORTED_DEVICES := sonicfi,rap630w-312g
   DEVICE_PACKAGES := ath11k-wifi-sonicfi-rap630w-312g ath11k-firmware-ipq50xx-map-spruce \
-                     -kmod-usb-dwc3-of-simple kmod-usb-dwc3-qcom kmod-usb3 \
-                     kmod-usb-uas kmod-fs-msdos kmod-fs-ntfs
+                     -kmod-usb-dwc3-of-simple kmod-usb-dwc3-qcom kmod-usb3
   DEVICE_DTS_CONFIG := config@mp03.3
 endef
 TARGET_DEVICES += sonicfi_rap630w_312g
