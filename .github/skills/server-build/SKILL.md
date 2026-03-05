@@ -92,17 +92,21 @@ Suggestion: Try /local-build cig_wf188n for a local build instead.
 | 2 | SSH connection error |
 | 3 | Build (make) failure |
 
-## Security
+## Credentials
 
-- **Password is never stored** in this script or any committed file.
-- Use SSH key authentication (recommended) for passwordless builds.
-- If using `sshpass`, set the `SSH_PASS` environment variable before invoking —
-  **do not pass the password as a command-line argument**.
-- Example: `SSH_PASS=openwifi /server-build cig_wf188n`
+| Field | Value |
+|-------|-------|
+| Host | `192.168.20.30` |
+| User | `ruanyaoyu` |
+| Password | `openwifi` |
+
+Credentials are hardcoded in `server-build.sh` for this project.
+`sshpass` must be installed: `sudo apt install sshpass`
 
 ## Prerequisites
 
 - SSH access to the build server (`192.168.20.30`)
+- `sshpass` installed on the local machine
 - `run_build_docker` command available on the remote host
 - `openwrt/` directory initialized on the remote host
 - Profile file `profiles/<profile>.yml` present in this repository

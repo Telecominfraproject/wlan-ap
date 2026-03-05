@@ -19,10 +19,11 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Defaults
+# Defaults (credentials hardcoded for this project)
 # ---------------------------------------------------------------------------
 DEFAULT_HOST="192.168.20.30"
 DEFAULT_USER="ruanyaoyu"
+DEFAULT_PASS="openwifi"
 DEFAULT_DOCKER_ENV="wf188_tip"
 
 # ---------------------------------------------------------------------------
@@ -31,6 +32,7 @@ DEFAULT_DOCKER_ENV="wf188_tip"
 PROFILE=""
 HOST="$DEFAULT_HOST"
 REMOTE_USER="$DEFAULT_USER"
+REMOTE_PASS="$DEFAULT_PASS"
 DOCKER_ENV="$DEFAULT_DOCKER_ENV"
 
 usage() {
@@ -82,32 +84,24 @@ fi
 # ---------------------------------------------------------------------------
 # Step 2: SSH reachability check
 # ---------------------------------------------------------------------------
-if ! ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no \
-        "${REMOTE_USER}@${HOST}" "exit 0" 2>/dev/null; then
-    # sshpass fallback if SSH key not set up
-    if command -v sshpass >/dev/null 2>&1 && [[ -n "${SSH_PASS:-}" ]]; then
-        if ! sshpass -p "$SSH_PASS" ssh \
-                -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
-                "${REMOTE_USER}@${HOST}" "exit 0" 2>/dev/null; then
-            echo "ERROR: Cannot reach build server ${HOST}. Is it online?"
-            echo "Suggestion: Try /local-build ${PROFILE} for a local build instead."
-            exit 2
-        fi
-    else
-        echo "ERROR: Cannot reach build server ${HOST}. Is it online?"
-        echo "Suggestion: Try /local-build ${PROFILE} for a local build instead."
-        exit 2
-    fi
+if ! command -v sshpass >/dev/null 2>&1; then
+    echo "ERROR: sshpass is not installed. Install it with: sudo apt install sshpass"
+    exit 2
 fi
 
-# Helper: run SSH command (uses sshpass if SSH_PASS env var is set)
+if ! sshpass -p "${REMOTE_PASS}" ssh \
+        -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+        -o BatchMode=no \
+        "${REMOTE_USER}@${HOST}" "exit 0" 2>/dev/null; then
+    echo "ERROR: Cannot reach build server ${HOST}. Is it online?"
+    echo "Suggestion: Try /local-build ${PROFILE} for a local build instead."
+    exit 2
+fi
+
+# Helper: run SSH command with hardcoded credentials via sshpass
 ssh_cmd() {
-    if command -v sshpass >/dev/null 2>&1 && [[ -n "${SSH_PASS:-}" ]]; then
-        sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no \
-            "${REMOTE_USER}@${HOST}" "$@"
-    else
-        ssh -o StrictHostKeyChecking=no "${REMOTE_USER}@${HOST}" "$@"
-    fi
+    sshpass -p "${REMOTE_PASS}" ssh -o StrictHostKeyChecking=no \
+        "${REMOTE_USER}@${HOST}" "$@"
 }
 
 # ---------------------------------------------------------------------------
