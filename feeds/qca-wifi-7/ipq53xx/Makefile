@@ -49,6 +49,8 @@ define Kernel/Configure
 	echo '# CONFIG_SKB_FAST_RECYCLABLE_DEBUG_ENABLE is not set' >> $(LINUX_DIR)/.config
 	echo 'CONFIG_DEFAULT_QDISC_DISABLE=y' >> $(LINUX_DIR)/.config
 	echo 'CONFIG_HWMON=y' >> $(LINUX_DIR)/.config
+	echo 'CONFIG_RTK_MSSDK_PHY=y' >> $(LINUX_DIR)/.config
+	echo 'CONFIG_RTL8221D_PHY=y' >> $(LINUX_DIR)/.config
 endef
 
 
