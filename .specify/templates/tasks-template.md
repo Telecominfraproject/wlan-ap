@@ -246,6 +246,8 @@ With multiple developers:
 - [Story] label maps task to specific user story for traceability
 - Each user story should be independently completable and testable
 - Verify tests fail before implementing
-- Commit after each task or logical group
+- **Principle V (Git Discipline)**: Commit to git after EACH phase completes. Commit message
+  MUST include: imperative subject (≤72 chars), body listing changed files and reasons,
+  and a phase reference (e.g., `Phase 2: foundational data models`).
 - Stop at any checkpoint to validate story independently
 - Avoid: vague tasks, same file conflicts, cross-story dependencies that break independence

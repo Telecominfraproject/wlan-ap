@@ -31,7 +31,13 @@
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-[Gates determined based on constitution file]
+[Gates determined based on constitution file. For the OpenWiFi AP NOS project, verify:]
+
+- [ ] **I. OpenWrt-Based Development**: Changes expressed as patches or feed packages?
+- [ ] **II. Cross-Platform Compatibility**: Does feature scope cover all relevant `profiles/` targets or is narrower scope justified?
+- [ ] **III. Test-First**: Acceptance scenarios defined in spec before implementation tasks begin?
+- [ ] **IV. Language Convention**: All artifacts (code, docs, commits) in English; agent responses in Chinese?
+- [ ] **V. Git Discipline**: Plan includes checkpoint commits after each phase?
 
 ## Project Structure
 
