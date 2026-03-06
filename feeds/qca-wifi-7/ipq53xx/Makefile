@@ -52,6 +52,7 @@ define Kernel/Configure
 	echo 'CONFIG_RTK_MSSDK_PHY=y' >> $(LINUX_DIR)/.config
 	echo 'CONFIG_REALTEK_PHY=y' >> $(LINUX_DIR)/.config
 	echo '# CONFIG_RTL8221D_PHY is not set' >> $(LINUX_DIR)/.config
+	echo '# CONFIG_QCOM_SCM_DOWNLOAD_MODE_DEFAULT is not set' >> $(LINUX_DIR)/.config
 endef
 
 
