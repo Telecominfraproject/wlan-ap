@@ -29,6 +29,9 @@ Build/Compile = $(Build/Compile/Default)
 
 define Package/ratelimit/install
 	$(CP) ./files/* $(1)
+ifeq ($(CONFIG_TARGET_mediatek),y)
+	$(SED) 's|qdisc replace dev $$$${iface} parent 1:$$$${id} handle $$$${id}: fq_codel flows 128 limit 800 quantum 300 noecn|qdisc add dev $$$${iface} parent 1:$$$${id} sfq perturb 10 limit 2000 quantum 1514|' $(1)/usr/bin/ratelimit
+endif
 endef
 
 $(eval $(call BuildPackage,ratelimit))
