@@ -36,9 +36,16 @@ endef
 define Build/Compile
 endef
 
+WIFI_SCRIPTS_UPSTREAM_DIR:=$(TOPDIR)/package/network/config/wifi-scripts/files
+
 define Package/wifi-scripts/install
 	$(INSTALL_DIR) $(1)
 	$(CP) ./files/* $(1)/
+	$(INSTALL_DIR) $(1)/lib/netifd
+	$(CP) $(WIFI_SCRIPTS_UPSTREAM_DIR)/lib/netifd/wireless.uc $(1)/lib/netifd/
+	$(CP) $(WIFI_SCRIPTS_UPSTREAM_DIR)/lib/netifd/wireless-device.uc $(1)/lib/netifd/
+	$(INSTALL_DIR) $(1)/usr/share/ucode/wifi
+	$(CP) $(WIFI_SCRIPTS_UPSTREAM_DIR)/usr/share/ucode/wifi/utils.uc $(1)/usr/share/ucode/wifi/
 endef
 
 $(eval $(call BuildPackage,wifi-scripts))
