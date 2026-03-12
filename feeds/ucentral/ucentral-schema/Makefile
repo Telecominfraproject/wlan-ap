@@ -38,6 +38,14 @@ define Package/ucentral-schema/install
 	$(CP) $(PKG_BUILD_DIR)/command/*.uc $(1)/usr/share/ucentral
 	$(CP) $(PKG_BUILD_DIR)/system/* $(1)/usr/share/ucentral
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/wifi_detect.sh $(1)/usr/share/ucentral
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/capabilities.uc $(1)/usr/share/ucentral
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/health.uc $(1)/usr/share/ucentral
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/ip-collide.uc $(1)/usr/share/ucentral
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/onlinecheck.uc $(1)/usr/share/ucentral
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/package_list.uc $(1)/usr/share/ucentral
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/reboot_cause.uc $(1)/usr/share/ucentral
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/state.uc $(1)/usr/share/ucentral
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/telemetry.uc $(1)/usr/share/ucentral
 	$(LN) /usr/share/ucentral/schemareader.uc $(1)/usr/share/ucode
 	$(LN) /usr/share/ucentral/ucentral.uc $(1)/usr/bin/ucentral_apply
 	$(CP) ./files/* $(1)
