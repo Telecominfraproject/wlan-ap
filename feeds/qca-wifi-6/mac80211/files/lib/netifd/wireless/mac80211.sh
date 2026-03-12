@@ -979,6 +979,8 @@ mac80211_reset_config() {
 }
 
 drv_mac80211_setup() {
+	[ "$1" = "#mlo" ] && return 0
+
 	json_select config
 	json_get_vars \
 		phy macaddr path \
@@ -1111,6 +1113,8 @@ list_phy_interfaces() {
 }
 
 drv_mac80211_teardown() {
+	[ "$1" = "#mlo" ] && return 0
+
 	json_select data
 	json_get_vars phy
 	json_select ..
