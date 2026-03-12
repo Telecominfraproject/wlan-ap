@@ -510,7 +510,6 @@ hostapd_bss_del_client_cb(struct hostapd_iface *iface, void *ctx)
 
 	hwaddr_aton(blobmsg_data(tb[DEL_CLIENT_ADDR]), addr);
 
-	syslog(0, "blogic %s:%s[%d]\n", __FILE__, __func__, __LINE__);
 	for (i = 0; i < iface->num_bss; i++) {
 		struct hostapd_data *bss = iface->bss[i];
 
