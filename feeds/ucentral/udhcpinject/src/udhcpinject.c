@@ -392,48 +392,58 @@ void process_packet(unsigned char *user, const struct pcap_pkthdr *header,
     new_ip->tot_len = htons(ntohs(ip->tot_len) + opt82_len);
     new_udp->len = htons(ntohs(udp->len) + opt82_len);
 
-    // Recalculate IP checksum
+    // Reset checksum to 0 before recalculating
     new_ip->check = 0;
-    unsigned int sum = 0;
-    unsigned short *ip_ptr = (unsigned short *)new_ip;
-    for (int i = 0; i < ip->ihl * 2; i++)
-    {
-        sum += *ip_ptr++;
-    }
-    while (sum >> 16)
-    {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    new_ip->check = ~sum;
 
-    // Recalculate UDP checksum
+    // Calculate checksum
+    uint32_t sum = 0;
+    uint16_t *ptr = (uint16_t *)new_ip;
+    int len = new_ip->ihl * 4;
+
+    for (int i = 0; i < len / 2; i++) {
+        sum += ntohs(ptr[i]);
+    }
+
+    // Fold 32-bit sum into 16 bits
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+
+    new_ip->check = htons((uint16_t)~sum);
+
+    // Reset checksum to 0 before recalculating
     new_udp->check = 0;
-    sum = 0;
-    // Pseudo-header
-    sum +=
-        (ntohs(new_ip->saddr) & 0xFFFF) + (ntohs(new_ip->saddr >> 16) & 0xFFFF);
-    sum +=
-        (ntohs(new_ip->daddr) & 0xFFFF) + (ntohs(new_ip->daddr >> 16) & 0xFFFF);
-    sum += htons(IPPROTO_UDP);
-    sum += new_udp->len;
 
-    // UDP header and data
-    unsigned char *udp_start = (unsigned char *)new_udp;
-    int udp_total_len = ntohs(new_udp->len);
-    unsigned short *udp_ptr = (unsigned short *)udp_start;
-    for (int i = 0; i < udp_total_len / 2; i++)
-    {
-        sum += *udp_ptr++;
+    // Build pseudo-header and compute checksum
+    sum = 0;
+    uint16_t udp_len = ntohs(new_udp->len);
+
+    // Pseudo-header: src IP, dst IP, zero+protocol, UDP length
+    sum += (ntohs(new_ip->saddr >> 16) & 0xFFFF);
+    sum += (ntohs(new_ip->saddr) & 0xFFFF);
+    sum += (ntohs(new_ip->daddr >> 16) & 0xFFFF);
+    sum += (ntohs(new_ip->daddr) & 0xFFFF);
+    sum += IPPROTO_UDP;
+    sum += udp_len;
+
+    // Sum the UDP header + payload
+    ptr = (uint16_t *)new_udp;
+    int i;
+    for (i = 0; i < udp_len / 2; i++) {
+        sum += ntohs(ptr[i]);
     }
-    if (udp_total_len % 2)
-    {
-        sum += *(unsigned char *)udp_ptr;
+
+    // If odd length, pad last byte
+    if (udp_len & 1) {
+        sum += ((uint8_t *)new_udp)[udp_len - 1] << 8;
     }
+
+    // Fold 32-bit sum into 16 bits
     while (sum >> 16)
-    {
         sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    new_udp->check = ~sum;
+
+    new_udp->check = htons((uint16_t)~sum);
+
+    // UDP allows 0xFFFF instead of 0x0000 (0 means "no checksum")
     if (new_udp->check == 0)
         new_udp->check = 0xFFFF;
 
