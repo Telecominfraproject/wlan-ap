@@ -3,7 +3,7 @@ include $(TOPDIR)/rules.mk
 PKG:=ftm
 PKG_NAME:=$(PKG)
 PKG_RELEASE:=1
-PKG_VERSION:=11.4-csu1
+PKG_VERSION:=11.4
 
 #PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG)
 
