@@ -417,11 +417,12 @@ void process_packet(unsigned char *user, const struct pcap_pkthdr *header,
     sum = 0;
     uint16_t udp_len = ntohs(new_udp->len);
 
-    // Pseudo-header: src IP, dst IP, zero+protocol, UDP length
-    sum += (ntohs(new_ip->saddr >> 16) & 0xFFFF);
-    sum += (ntohs(new_ip->saddr) & 0xFFFF);
-    sum += (ntohs(new_ip->daddr >> 16) & 0xFFFF);
-    sum += (ntohs(new_ip->daddr) & 0xFFFF);
+    uint32_t saddr = ntohl(new_ip->saddr);
+    uint32_t daddr = ntohl(new_ip->daddr);
+    sum += (saddr >> 16) & 0xFFFF;
+    sum += saddr & 0xFFFF;
+    sum += (daddr >> 16) & 0xFFFF;
+    sum += daddr & 0xFFFF;
     sum += IPPROTO_UDP;
     sum += udp_len;
 
