@@ -81,9 +81,11 @@ return view.extend({
 
 		var memfields = [
 			_('Total Available'), (mem.available) ? mem.available : (mem.total && mem.free && mem.buffered) ? mem.free + mem.buffered : null, mem.total,
-			_('Used'),            (mem.total && mem.free) ? (mem.total - mem.free) : null, mem.total,
-			_('Buffered'),        (mem.total && mem.buffered) ? mem.buffered : null, mem.total
+			_('Used'),            (mem.total && mem.free) ? (mem.total - mem.free) : null, mem.total
 		];
+
+		if (mem.buffered)
+			memfields.push(_('Buffered'), mem.buffered, mem.total);
 
 		if (mem.cached)
 			memfields.push(_('Cached'), mem.cached, mem.total);
