@@ -1,0 +1,358 @@
+From ff647b3a490692e23ec804e123be1f6f945dee14 Mon Sep 17 00:00:00 2001
+From: Venkat Chimata <venkat@nearhop.com>
+Date: Mon, 2 Feb 2026 14:42:02 +0530
+Subject: [PATCH]  hostapd: store RADIUS Class per STA instead of EAPOL SM; 
+ preserve Class for ACL/MAC auth and accounting
+
+Move storage of RADIUS Class attributes from the EAPOL state machine to
+struct sta_info and update all users accordingly. Previously, Class was
+kept only in eapol_state_machine->radius_class, which caused Class to be
+lost for authentication paths where eapol_sm is not created. As a result,
+Accounting messages and PMKSA cache operations could miss the
+Class attribute.
+
+This change makes sta_info->radius_class the single source of truth for
+RADIUS Class attributes and ensures they are preserved and echoed in
+Accounting regardless of whether an EAPOL state machine exists.
+
+Signed-off-by: Venkat Chimata <venkat@nearhop.com>
+---
+ src/ap/accounting.c              |  3 +-
+ src/ap/ieee802_11.c              | 63 ++++++++++++++++++++++++++++
+ src/ap/ieee802_11.h              |  5 +++
+ src/ap/ieee802_11_auth.c         |  3 ++
+ src/ap/ieee802_1x.c              | 70 +-------------------------------
+ src/ap/ieee802_1x.h              |  2 -
+ src/ap/pmksa_cache_auth.c        | 10 ++---
+ src/ap/sta_info.c                |  1 +
+ src/ap/sta_info.h                |  2 +
+ src/eapol_auth/eapol_auth_sm_i.h |  1 -
+ 10 files changed, 83 insertions(+), 77 deletions(-)
+
+diff --git a/src/ap/accounting.c b/src/ap/accounting.c
+index 9fc1886..99f8ac9 100644
+--- a/src/ap/accounting.c
++++ b/src/ap/accounting.c
+@@ -15,6 +15,7 @@
+ #include "radius/radius.h"
+ #include "radius/radius_client.h"
+ #include "hostapd.h"
++#include "ieee802_11.h"
+ #include "ieee802_1x.h"
+ #include "ap_config.h"
+ #include "sta_info.h"
+@@ -102,7 +103,7 @@ static struct radius_msg * accounting_msg(struct hostapd_data *hapd,
+ 
+ 	if (sta) {
+ 		for (i = 0; ; i++) {
+-			val = ieee802_1x_get_radius_class(sta->eapol_sm, &len,
++			val = radius_get_class(sta, &len,
+ 							  i);
+ 			if (val == NULL)
+ 				break;
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 1015100..a414248 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -7996,4 +7996,67 @@ u8 * hostapd_eid_rnr(struct hostapd_data *hapd, u8 *eid, u32 type)
+ 	return _hostapd_eid_rnr(hapd, eid, type, 1);
+ }
+ 
++void radius_store_class(struct hostapd_data *hapd,
++					  struct sta_info *sta,
++					  struct radius_msg *msg)
++{
++	u8 *attr_class;
++	size_t class_len;
++	int count, i;
++	struct radius_attr_data *nclass;
++	size_t nclass_count;
++
++	if (!hapd->conf->radius->acct_server || !hapd->radius)
++		return;
++
++	radius_free_class(&sta->radius_class);
++	count = radius_msg_count_attr(msg, RADIUS_ATTR_CLASS, 1);
++	if (count <= 0)
++		return;
++
++	nclass = os_calloc(count, sizeof(struct radius_attr_data));
++	if (!nclass)
++		return;
++
++	nclass_count = 0;
++
++	attr_class = NULL;
++	for (i = 0; i < count; i++) {
++		do {
++			if (radius_msg_get_attr_ptr(msg, RADIUS_ATTR_CLASS,
++						    &attr_class, &class_len,
++						    attr_class) < 0) {
++				i = count;
++				break;
++			}
++		} while (class_len < 1);
++
++		nclass[nclass_count].data = os_memdup(attr_class, class_len);
++		if (!nclass[nclass_count].data)
++			break;
++
++		nclass[nclass_count].len = class_len;
++		nclass_count++;
++	}
++
++	sta->radius_class.attr = nclass;
++	sta->radius_class.count = nclass_count;
++	wpa_printf(MSG_DEBUG,
++		   "IEEE 802.1X: Stored %lu RADIUS Class attributes for "
++		   MACSTR,
++		   (unsigned long) sta->radius_class.count,
++		   MAC2STR(sta->addr));
++}
++
++u8 * radius_get_class(struct sta_info *sta, size_t *len,
++				 int idx)
++{
++	if (!sta || !sta->radius_class.attr ||
++	    idx >= (int) sta->radius_class.count)
++		return NULL;
++
++	*len = sta->radius_class.attr[idx].len;
++	return sta->radius_class.attr[idx].data;
++}
++
+ #endif /* CONFIG_NATIVE_WINDOWS */
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index 953e8b9..e77b2c9 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -230,4 +230,9 @@ u8 * hostapd_get_rsne(struct hostapd_data *hapd, u8 *pos, size_t len);
+ u8 * hostapd_get_rsnxe(struct hostapd_data *hapd, u8 *pos, size_t len);
+ int ieee802_11_set_radius_info(struct hostapd_data *hapd, struct sta_info *sta,
+ 		                              int res, struct radius_sta *info);
++void radius_store_class(struct hostapd_data *hapd,
++					  struct sta_info *sta,
++					  struct radius_msg *msg);
++u8 * radius_get_class(struct sta_info *sta, size_t *len,
++				 int idx);
+ #endif /* IEEE802_11_H */
+diff --git a/src/ap/ieee802_11_auth.c b/src/ap/ieee802_11_auth.c
+index 5a9c138..cf2451b 100644
+--- a/src/ap/ieee802_11_auth.c
++++ b/src/ap/ieee802_11_auth.c
+@@ -498,6 +498,7 @@ hostapd_acl_recv_radius(struct radius_msg *msg, struct radius_msg *req,
+ 	struct hostapd_cached_radius_acl *cache;
+ 	struct radius_sta *info;
+ 	struct radius_hdr *hdr = radius_msg_get_hdr(msg);
++	struct sta_info *sta;
+ 
+ 	query = hapd->acl_queries;
+ 	prev = NULL;
+@@ -535,6 +536,7 @@ hostapd_acl_recv_radius(struct radius_msg *msg, struct radius_msg *req,
+ 	os_get_reltime(&cache->timestamp);
+ 	os_memcpy(cache->addr, query->addr, sizeof(cache->addr));
+ 	info = &cache->info;
++	sta = ap_get_sta(hapd, query->addr);
+ 	if (hdr->code == RADIUS_CODE_ACCESS_ACCEPT) {
+ 		u8 *buf;
+ 		size_t len;
+@@ -570,6 +572,7 @@ hostapd_acl_recv_radius(struct radius_msg *msg, struct radius_msg *req,
+ 			if (info->identity)
+ 				os_memcpy(info->identity, buf, len);
+ 		}
++		radius_store_class(hapd, sta, msg);
+ 		if (radius_msg_get_attr_ptr(
+ 			    msg, RADIUS_ATTR_CHARGEABLE_USER_IDENTITY,
+ 			    &buf, &len, NULL) == 0) {
+diff --git a/src/ap/ieee802_1x.c b/src/ap/ieee802_1x.c
+index d29df98..295b3ca 100644
+--- a/src/ap/ieee802_1x.c
++++ b/src/ap/ieee802_1x.c
+@@ -1399,7 +1399,7 @@ void ieee802_1x_free_station(struct hostapd_data *hapd, struct sta_info *sta)
+ 
+ #ifndef CONFIG_NO_RADIUS
+ 	radius_msg_free(sm->last_recv_radius);
+-	radius_free_class(&sm->radius_class);
++	radius_free_class(&sta->radius_class);
+ #endif /* CONFIG_NO_RADIUS */
+ 
+ 	eapol_auth_free(sm);
+@@ -1547,60 +1547,6 @@ static void ieee802_1x_get_keys(struct hostapd_data *hapd,
+ }
+ 
+ 
+-static void ieee802_1x_store_radius_class(struct hostapd_data *hapd,
+-					  struct sta_info *sta,
+-					  struct radius_msg *msg)
+-{
+-	u8 *attr_class;
+-	size_t class_len;
+-	struct eapol_state_machine *sm = sta->eapol_sm;
+-	int count, i;
+-	struct radius_attr_data *nclass;
+-	size_t nclass_count;
+-
+-	if (!hapd->conf->radius->acct_server || !hapd->radius || !sm)
+-		return;
+-
+-	radius_free_class(&sm->radius_class);
+-	count = radius_msg_count_attr(msg, RADIUS_ATTR_CLASS, 1);
+-	if (count <= 0)
+-		return;
+-
+-	nclass = os_calloc(count, sizeof(struct radius_attr_data));
+-	if (!nclass)
+-		return;
+-
+-	nclass_count = 0;
+-
+-	attr_class = NULL;
+-	for (i = 0; i < count; i++) {
+-		do {
+-			if (radius_msg_get_attr_ptr(msg, RADIUS_ATTR_CLASS,
+-						    &attr_class, &class_len,
+-						    attr_class) < 0) {
+-				i = count;
+-				break;
+-			}
+-		} while (class_len < 1);
+-
+-		nclass[nclass_count].data = os_memdup(attr_class, class_len);
+-		if (!nclass[nclass_count].data)
+-			break;
+-
+-		nclass[nclass_count].len = class_len;
+-		nclass_count++;
+-	}
+-
+-	sm->radius_class.attr = nclass;
+-	sm->radius_class.count = nclass_count;
+-	wpa_printf(MSG_DEBUG,
+-		   "IEEE 802.1X: Stored %lu RADIUS Class attributes for "
+-		   MACSTR,
+-		   (unsigned long) sm->radius_class.count,
+-		   MAC2STR(sta->addr));
+-}
+-
+-
+ /* Update sta->identity based on User-Name attribute in Access-Accept */
+ static void ieee802_1x_update_sta_identity(struct hostapd_data *hapd,
+ 					   struct sta_info *sta,
+@@ -2046,7 +1992,7 @@ ieee802_1x_receive_auth(struct radius_msg *msg, struct radius_msg *req,
+ 		override_eapReq = 1;
+ 		ieee802_1x_get_keys(hapd, sta, msg, req, shared_secret,
+ 				    shared_secret_len);
+-		ieee802_1x_store_radius_class(hapd, sta, msg);
++		radius_store_class(hapd, sta, msg);
+ 		ieee802_1x_update_sta_identity(hapd, sta, msg);
+ 		ieee802_1x_update_sta_cui(hapd, sta, msg);
+ 		ieee802_1x_check_hs20(hapd, sta, msg,
+@@ -2656,18 +2602,6 @@ u8 * ieee802_1x_get_identity(struct eapol_state_machine *sm, size_t *len)
+ }
+ 
+ 
+-u8 * ieee802_1x_get_radius_class(struct eapol_state_machine *sm, size_t *len,
+-				 int idx)
+-{
+-	if (!sm || !sm->radius_class.attr ||
+-	    idx >= (int) sm->radius_class.count)
+-		return NULL;
+-
+-	*len = sm->radius_class.attr[idx].len;
+-	return sm->radius_class.attr[idx].data;
+-}
+-
+-
+ struct wpabuf * ieee802_1x_get_radius_cui(struct eapol_state_machine *sm)
+ {
+ 	if (!sm)
+diff --git a/src/ap/ieee802_1x.h b/src/ap/ieee802_1x.h
+index 70dc11a..bd6ccf2 100644
+--- a/src/ap/ieee802_1x.h
++++ b/src/ap/ieee802_1x.h
+@@ -35,8 +35,6 @@ int ieee802_1x_tx_status(struct hostapd_data *hapd, struct sta_info *sta,
+ int ieee802_1x_eapol_tx_status(struct hostapd_data *hapd, struct sta_info *sta,
+ 			       const u8 *data, int len, int ack);
+ u8 * ieee802_1x_get_identity(struct eapol_state_machine *sm, size_t *len);
+-u8 * ieee802_1x_get_radius_class(struct eapol_state_machine *sm, size_t *len,
+-				 int idx);
+ struct wpabuf * ieee802_1x_get_radius_cui(struct eapol_state_machine *sm);
+ const u8 * ieee802_1x_get_key(struct eapol_state_machine *sm, size_t *len);
+ const u8 * ieee802_1x_get_session_id(struct eapol_state_machine *sm,
+diff --git a/src/ap/pmksa_cache_auth.c b/src/ap/pmksa_cache_auth.c
+index fe5f817..1ef0ee1 100644
+--- a/src/ap/pmksa_cache_auth.c
++++ b/src/ap/pmksa_cache_auth.c
+@@ -159,7 +159,7 @@ static void pmksa_cache_from_eapol_data(struct rsn_pmksa_cache_entry *entry,
+ 		entry->cui = wpabuf_dup(eapol->radius_cui);
+ 
+ #ifndef CONFIG_NO_RADIUS
+-	radius_copy_class(&entry->radius_class, &eapol->radius_class);
++	radius_copy_class(&entry->radius_class, &((struct sta_info *) eapol->sta)->radius_class);
+ #endif /* CONFIG_NO_RADIUS */
+ 
+ 	entry->eap_type_authsrv = eapol->eap_type_authsrv;
+@@ -202,12 +202,12 @@ void pmksa_cache_to_eapol_data(struct hostapd_data *hapd,
+ 	}
+ 
+ #ifndef CONFIG_NO_RADIUS
+-	radius_free_class(&eapol->radius_class);
+-	radius_copy_class(&eapol->radius_class, &entry->radius_class);
++	radius_free_class(&((struct sta_info *) eapol->sta)->radius_class);
++	radius_copy_class(&((struct sta_info *) eapol->sta)->radius_class, &entry->radius_class);
+ #endif /* CONFIG_NO_RADIUS */
+-	if (eapol->radius_class.attr) {
++	if (((struct sta_info *) eapol->sta)->radius_class.attr) {
+ 		wpa_printf(MSG_DEBUG, "Copied %lu Class attribute(s) from "
+-			   "PMKSA", (unsigned long) eapol->radius_class.count);
++			   "PMKSA", (unsigned long) ((struct sta_info *) eapol->sta)->radius_class.count);
+ 	}
+ 
+ 	eapol->eap_type_authsrv = entry->eap_type_authsrv;
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index 235ed89..4d69472 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -303,6 +303,7 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ #ifndef CONFIG_NO_RADIUS
+ 	if (hapd->radius)
+ 		radius_client_flush_auth(hapd->radius, sta->addr);
++	radius_free_class(&sta->radius_class);
+ #endif /* CONFIG_NO_RADIUS */
+ 
+ #ifndef CONFIG_NO_VLAN
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index 942bb3b..c22deac 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -16,6 +16,7 @@
+ #include "common/ieee802_11_defs.h"
+ #include "common/sae.h"
+ #include "crypto/sha384.h"
++#include "radius/radius.h"
+ 
+ /* STA flags */
+ #define WLAN_STA_AUTH BIT(0)
+@@ -337,6 +338,7 @@ struct sta_info {
+ 	struct pasn_data *pasn;
+ #endif /* CONFIG_PASN */
+ 	int signal_mgmt;
++	struct radius_class_data radius_class;
+ };
+ 
+ 
+diff --git a/src/eapol_auth/eapol_auth_sm_i.h b/src/eapol_auth/eapol_auth_sm_i.h
+index 3c68983..1026472 100644
+--- a/src/eapol_auth/eapol_auth_sm_i.h
++++ b/src/eapol_auth/eapol_auth_sm_i.h
+@@ -156,7 +156,6 @@ struct eapol_state_machine {
+ 	u8 eap_type_authsrv; /* EAP type of the last EAP packet from
+ 			      * Authentication server */
+ 	u8 eap_type_supp; /* EAP type of the last EAP packet from Supplicant */
+-	struct radius_class_data radius_class;
+ 	struct wpabuf *radius_cui; /* Chargeable-User-Identity */
+ 
+ 	struct eap_sm *eap;
+-- 
+2.34.1
+
