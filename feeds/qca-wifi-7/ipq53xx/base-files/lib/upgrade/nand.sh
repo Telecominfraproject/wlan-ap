@@ -33,12 +33,26 @@ ubi_mknod() {
 	mknod "$dev" c $major $minor
 }
 
+ubi_sysfs_root() {
+	if [ -d /sys/class/ubi ]; then
+		echo /sys/class/ubi
+	else
+		echo /sys/devices/virtual/ubi
+	fi
+}
+
 nand_find_volume() {
-	local ubidevdir ubivoldir
-	ubidevdir="/sys/devices/virtual/ubi/$1"
+	local ubidevdir ubivoldir ubiroot
+	ubiroot="$(ubi_sysfs_root)"
+	if [ "$ubiroot" = "/sys/class/ubi" ]; then
+		ubidevdir="$ubiroot"
+	else
+		ubidevdir="$ubiroot/$1"
+	fi
 	[ ! -d "$ubidevdir" ] && return 1
 	for ubivoldir in $ubidevdir/${1}_*; do
 		[ ! -d "$ubivoldir" ] && continue
+		[ ! -f "$ubivoldir/name" ] && continue
 		if [ "$( cat $ubivoldir/name )" = "$2" ]; then
 			basename $ubivoldir
 			ubi_mknod "$ubivoldir"
@@ -48,11 +62,13 @@ nand_find_volume() {
 }
 
 nand_find_ubi() {
-	local ubidevdir ubidev mtdnum
+	local ubidevdir ubidev mtdnum ubiroot
 	mtdnum="$( find_mtd_index $1 )"
 	[ ! "$mtdnum" ] && return 1
-	for ubidevdir in /sys/devices/virtual/ubi/ubi*; do
+	ubiroot="$(ubi_sysfs_root)"
+	for ubidevdir in $ubiroot/ubi*; do
 		[ ! -d "$ubidevdir" ] && continue
+		[ ! -f "$ubidevdir/mtd_num" ] && continue
 		cmtdnum="$( cat $ubidevdir/mtd_num )"
 		[ ! "$mtdnum" ] && continue
 		if [ "$mtdnum" = "$cmtdnum" ]; then
@@ -204,8 +220,9 @@ nand_upgrade_prepare_ubi() {
 
 	# create rootfs_data for non-ubifs rootfs
 	if [ "$rootfs_type" != "ubifs" ]; then
-		local availeb=$(cat /sys/devices/virtual/ubi/$ubidev/avail_eraseblocks)
-		local ebsize=$(cat /sys/devices/virtual/ubi/$ubidev/eraseblock_size)
+		local ubidevdir="$(ubi_sysfs_root)/$ubidev"
+		local availeb=$(cat $ubidevdir/avail_eraseblocks)
+		local ebsize=$(cat $ubidevdir/eraseblock_size)
 		local avail_size=$(( $availeb * $ebsize ))
 		local rootfs_data_size_param="-m"
 		if [ -n "$rootfs_data_max" ] &&
