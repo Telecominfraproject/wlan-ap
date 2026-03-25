@@ -10,12 +10,53 @@
 #include <linux/netdevice.h>
 
 #include "phy_rtl826xb_patch.h"
+#include "phy_rtl8251b_patch.h"
 
 #include "rtk_phylib_rtl826xb.h"
 #include "rtk_phylib_macsec.h"
 #include "rtk_phylib.h"
 
 #include "rtk_phy.h"
+
+static int rtl8251b_id_match(u32 id)
+{
+	return (id == REALTEK_PHY_ID_RTL8251B) ||
+	       (id == REALTEK_PHY_ID_RTL8251BE) ||
+	       (id == REALTEK_PHY_ID_RTL8251B_VB_CG);
+}
+
+static int rtl8251_match_phy_device(struct phy_device *phydev)
+{
+	/* C22 match */
+	if (rtl8251b_id_match(phydev->phy_id))
+		return 1;
+
+	/* C45 match: Detect C45 when C22 phy_id returns 0.
+	 * In that case phydev->phy_id == 0 and the
+	 * real ID is in c45_ids.device_ids[1] (PMA/PMD).
+	 */
+	if (phydev->is_c45 && rtl8251b_id_match(phydev->c45_ids.device_ids[1]))
+		return 1;
+
+	return 0;
+}
+
+static int rtl8251b_probe(struct phy_device *phydev)
+{
+    struct rtk_phy_priv *priv = NULL;
+
+    priv = devm_kzalloc(&phydev->mdio.dev, sizeof(struct rtk_phy_priv), GFP_KERNEL);
+    if (!priv)
+        return -ENOMEM;
+
+    priv->phytype   = RTK_PHYLIB_RTL8251L;  /* 2.5G-only variant, same family */
+    priv->isBasePort = 1;                   /* RTL8251B is a single-port PHY */
+    priv->patch     = NULL;                 /* uses rtl8251b_phy_init(), not patch framework */
+    phydev->priv    = priv;
+
+    return 0;
+}
+
 /*
 static int rtk_phy_cable_test_report_trans(rtk_rtct_channel_result_t *result)
 {
@@ -199,6 +240,18 @@ static int rtkphy_config_init(struct phy_device *phydev)
           #endif
 
             break;
+        case REALTEK_PHY_ID_RTL8251B:
+        case REALTEK_PHY_ID_RTL8251BE:
+            phydev_info(phydev, "%s:%u [RTL8251B] phy_id: 0x%X PHYAD:%d\n", __FUNCTION__, __LINE__, phydev->drv->phy_id, phydev->mdio.addr);
+
+            ret = rtl8251b_phy_init(phydev);
+            if (ret != SUCCESS)
+            {
+                phydev_err(phydev, "%s:%u [RTL8251B] patch failed!! 0x%X\n", __FUNCTION__, __LINE__, ret);
+                return -EIO;
+            }
+            ret = 0;
+            break;
         default:
             phydev_err(phydev, "%s:%u Unknow phy_id: 0x%X\n", __FUNCTION__, __LINE__, phydev->drv->phy_id);
             return -EPERM;
@@ -325,6 +378,8 @@ static int rtkphy_c45_read_status(struct phy_device *phydev)
             phydev->mdix = ETH_TP_MDI_INVALID;
             break;
     }
+
+    phydev->interface = PHY_INTERFACE_MODE_USXGMII;
 
     return ret;
 }
@@ -574,6 +629,32 @@ static struct phy_driver rtk_phy_drivers[] = {
         .set_wol            = rtl826xb_set_wol,
         .get_wol            = rtl826xb_get_wol,
     },
+    {
+        PHY_ID_MATCH_EXACT(REALTEK_PHY_ID_RTL8251B),
+        .name               = "Realtek RTL8251B",
+        .match_phy_device   = rtl8251_match_phy_device,
+        .probe              = rtl8251b_probe,
+        .get_features       = rtl826xb_get_features,
+        .config_init        = rtkphy_config_init,
+        .suspend            = rtkphy_c45_suspend,
+        .resume             = rtkphy_c45_resume,
+        .config_aneg        = rtkphy_c45_config_aneg,
+        .aneg_done          = rtkphy_c45_aneg_done,
+        .read_status        = rtkphy_c45_read_status,
+    },
+    {
+        PHY_ID_MATCH_EXACT(REALTEK_PHY_ID_RTL8251BE),
+        .name               = "Realtek RTL8251BE",
+        .match_phy_device   = rtl8251_match_phy_device,
+        .probe              = rtl8251b_probe,
+        .get_features       = rtl826xb_get_features,
+        .config_init        = rtkphy_config_init,
+        .suspend            = rtkphy_c45_suspend,
+        .resume             = rtkphy_c45_resume,
+        .config_aneg        = rtkphy_c45_config_aneg,
+        .aneg_done          = rtkphy_c45_aneg_done,
+        .read_status        = rtkphy_c45_read_status,
+    },
 };
 
 module_phy_driver(rtk_phy_drivers);
@@ -582,6 +663,9 @@ module_phy_driver(rtk_phy_drivers);
 static struct mdio_device_id __maybe_unused rtk_phy_tbl[] = {
     { PHY_ID_MATCH_EXACT(REALTEK_PHY_ID_RTL8261N) },
     { PHY_ID_MATCH_EXACT(REALTEK_PHY_ID_RTL8264B) },
+    { PHY_ID_MATCH_EXACT(REALTEK_PHY_ID_RTL8251B) },
+    { PHY_ID_MATCH_EXACT(REALTEK_PHY_ID_RTL8251BE) },
+    { PHY_ID_MATCH_EXACT(REALTEK_PHY_ID_RTL8251B_VB_CG) },
     { },
 };
 
