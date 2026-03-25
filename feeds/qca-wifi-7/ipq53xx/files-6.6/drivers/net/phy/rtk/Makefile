@@ -14,6 +14,7 @@ rtk-ms-phy-objs     += rtk_osal.o
 # files from SDK
 rtk-ms-phy-objs     += phy_patch.o
 rtk-ms-phy-objs     += phy_rtl826xb_patch.o
+rtk-ms-phy-objs     += phy_rtl8251b_patch.o
 
 # rtk phylib
 rtk-ms-phy-objs     += rtk_phylib.o
