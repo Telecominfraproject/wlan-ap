@@ -1370,10 +1370,19 @@ find_phy() {
 	}
 	[ -n "$path" ] && {
 		phy="$(iwinfo nl80211 phyname "path=$path")"
+		# Filter out iwinfo usage message printed to stdout on lookup failure
+		echo "$phy" | grep -qE "^Usage:" && phy=""
 		[ -n "$phy" ] && {
 			rename_board_phy_by_path "$path"
 			return 0
 		}
+		# Fallback: scan /sys/class/ieee80211 and match by resolved device path
+		for phy in $(ls /sys/class/ieee80211 2>/dev/null); do
+			local _dev_path
+			_dev_path=$(readlink -f "/sys/class/ieee80211/$phy/device" 2>/dev/null)
+			_dev_path="${_dev_path#/sys/devices/}"
+			[ "$_dev_path" = "$path" ] && return 0
+		done
 	}
 	[ -n "$macaddr" ] && {
 		for phy in $(ls /sys/class/ieee80211 2>/dev/null); do
@@ -1394,7 +1403,7 @@ mac80211_check_ap() {
 mac80211_get_band_name() {
 	local radio_id=$1
 
-	[ "$radio_id" = "-1" ] && return $band
+	[ "$radio_id" = "-1" ] && { echo "$band"; return 0; }
 
 	freq_range=$(iw ${phy} info | grep -A 2 "Idx $radio_id:" | grep "Frequency Range:" | awk '{print $3, $6}')
 	set -- $freq_range
@@ -2134,7 +2143,8 @@ drv_mac80211_setup() {
 	json_get_values scan_list scan_list
 	json_select ..
 
-	if [ ${#device} -eq 12 ]; then
+	# Detect multi-radio: option radio is set and >= 0 in UCI config
+	if [ -n "$radio" ] && [ "$radio" -ge 0 ] 2>/dev/null; then
 		is_wiphy_multi_radio=1
 	fi
 
