@@ -9,6 +9,7 @@
 #include <unistd.h>		/* UNIX standard function definitions */
 #include <fcntl.h>		/* File control definitions */
 #include <errno.h>		/* Error number definitions */
+#include <stdlib.h>		/* Standard library function definitions */
 #include <sys/ioctl.h>
 #include <linux/i2c.h>
 #include <linux/i2c-dev.h>  /* uapi/linux/i2c-dev.h */
