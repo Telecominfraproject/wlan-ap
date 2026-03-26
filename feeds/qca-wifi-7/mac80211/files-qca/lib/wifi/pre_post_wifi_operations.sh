@@ -1000,6 +1000,10 @@ post_wifi_updown() {
 	:
 }
 
+pre_wifi_config() {
+	:
+}
+
 post_wifi_config() {
 	post_mac80211 "update_pri_link"
 	:
