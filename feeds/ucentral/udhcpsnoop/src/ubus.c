@@ -76,11 +76,26 @@ dhcpsnoop_ubus_dump(struct ubus_context *ctx, struct ubus_object *obj,
 	return 0;
 }
 
+static int
+dhcpsnoop_ubus_leases(struct ubus_context *ctx, struct ubus_object *obj,
+		      struct ubus_request_data *req, const char *method,
+		      struct blob_attr *msg)
+{
+	blob_buf_init(&b, 0);
+
+	cache_dump_full(&b);
+
+	ubus_send_reply(ctx, req, b.head);
+
+	return 0;
+}
+
 static const struct ubus_method dhcpsnoop_methods[] = {
 	UBUS_METHOD("config", dhcpsnoop_ubus_config, dhcpsnoop_config_policy),
 	UBUS_METHOD("add_devices", dhcpsnoop_ubus_add_devices, dhcpsnoop_config_policy),
 	UBUS_METHOD_NOARG("check_devices", dhcpsnoop_ubus_check_devices),
 	UBUS_METHOD_NOARG("dump", dhcpsnoop_ubus_dump),
+	UBUS_METHOD_NOARG("leases", dhcpsnoop_ubus_leases),
 };
 
 static struct ubus_object_type dhcpsnoop_object_type =

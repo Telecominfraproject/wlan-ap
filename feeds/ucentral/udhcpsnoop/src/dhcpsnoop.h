@@ -23,10 +23,13 @@ void dhcpsnoop_ubus_init(void);
 void dhcpsnoop_ubus_done(void);
 void dhcpsnoop_ubus_notify(const char *type, const uint8_t *msg, size_t len);
 
-const char *dhcpsnoop_parse_ipv4(const void *buf, size_t len, uint16_t port, uint32_t *rebind);
+const char *dhcpsnoop_parse_ipv4(const void *buf, size_t len, uint16_t port, uint32_t *rebind,
+				  char *hostname, size_t hostname_len);
 const char *dhcpsnoop_parse_ipv6(const void *buf, size_t len, uint16_t port);
 
-void cache_entry(void *msg, uint32_t rebind);
+void cache_pending_hostname(const uint8_t *chaddr, const char *hostname);
+void cache_entry(void *msg, uint32_t rebind, const char *hostname);
 void cache_dump(struct blob_buf *b);
+void cache_dump_full(struct blob_buf *b);
 
 #endif
