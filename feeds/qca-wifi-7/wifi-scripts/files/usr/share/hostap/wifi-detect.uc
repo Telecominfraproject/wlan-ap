@@ -99,6 +99,7 @@ function wiphy_detect() {
 		let multi_radio = {};
 		let start_freq_list = [];
 		let end_freq_list = [];
+		let band_freq_data = {};
 
 		let bands = info.bands;
 		for (let band in phy.wiphy_bands) {
@@ -172,15 +173,22 @@ function wiphy_detect() {
 			if (eht_phy_cap && he_phy_cap & 2)
 				push(modes, "EHT40");
 
+			let _bmin = null, _bmax = null, _bfreqs = [], _bchans = [];
 			for (let freq in band.freqs) {
 				if (freq.disabled)
 					continue;
 				let chan = freq_to_channel(freq.freq);
 				if (!chan)
 					continue;
-				band_info.default_channel = chan;
-				break;
+				if (!band_info.default_channel)
+					band_info.default_channel = chan;
+				if (_bmin === null || freq.freq < _bmin) _bmin = freq.freq;
+				if (_bmax === null || freq.freq > _bmax) _bmax = freq.freq;
+				push(_bfreqs, freq.freq);
+				push(_bchans, chan);
 			}
+			if (_bmin !== null)
+				band_freq_data[band_name] = { min: _bmin, max: _bmax, freqs: _bfreqs, chans: _bchans };
 
 			if (band_name == "2G")
 				continue;
@@ -230,7 +238,33 @@ function wiphy_detect() {
 		entry.info = info;
 		if (phy.radios) {
 			entry.multi_radio = multi_radio;
- 		}
+		} else if (length(keys(band_freq_data)) > 1) {
+			// Synthesize multi_radio for multi-band phy when driver does not
+			// support NL80211_ATTR_WIPHY_RADIOS (e.g., older ath12k firmware)
+			let band_order = [ '2G', '5G', '6G', '60G' ];
+			let synth_multi = {};
+			let synth_radios = [];
+			let r_idx = 0;
+			for (let bn in band_order) {
+				if (!(bn in band_freq_data))
+					continue;
+				let fi = band_freq_data[bn];
+				synth_multi['radio' + r_idx] = {
+					idx: r_idx,
+					first_freq: fi.min,
+					last_freq: fi.max,
+				};
+				push(synth_radios, {
+					index: r_idx,
+					bands: { [bn]: { frequencies: fi.freqs, channels: fi.chans } },
+				});
+				r_idx++;
+			}
+			if (r_idx > 1) {
+				entry.multi_radio = synth_multi;
+				entry.info.radios = synth_radios;
+			}
+		}
 	}
 }
 

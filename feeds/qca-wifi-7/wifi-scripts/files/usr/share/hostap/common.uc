@@ -140,6 +140,16 @@ function wdev_create(phy, name, data)
 			nl80211.const.NL80211_CMD_NEW_INTERFACE,
 			nl80211.const.NLM_F_CREATE,
 			req);
+		// If vif_radio_mask caused EINVAL (driver does not support it),
+		// retry without the mask attribute
+		if (nl80211.error() && req.vif_radio_mask != null) {
+			delete req.vif_radio_mask;
+			nl80211.error();
+			nl80211.request(
+				nl80211.const.NL80211_CMD_NEW_INTERFACE,
+				nl80211.const.NLM_F_CREATE,
+				req);
+		}
 	}
 
 	let error = nl80211.error();
@@ -337,7 +347,7 @@ const phy_proto = {
 
 	wdev_add: function(name, data) {
 		let phydev = this;
-		wdev_create(this.phy, name, {
+		return wdev_create(this.phy, name, {
 			...data,
 			radio: this.radio,
 		});
@@ -357,6 +367,14 @@ const phy_proto = {
 			if (this.radio != null && wdev.vif_radio_mask != null &&
 			    !(wdev.vif_radio_mask & (1 << this.radio)))
 				continue;
+			// Fallback: when driver does not report vif_radio_mask, infer
+			// the radio index from the interface name suffix (e.g. "phy00.1-0"
+			// → radio 1) to prevent cross-band wdev cleanup in multi-radio phys.
+			if (this.radio != null && wdev.vif_radio_mask == null && wdev.ifname) {
+				let m = match(wdev.ifname, /\.(\d+)-\d+$/);
+				if (m && int(m[1]) != this.radio)
+					continue;
+			}
 			mac_wdev[wdev.mac] = wdev;
 		}
 
