@@ -19,6 +19,7 @@
 #include <libubox/avl-cmp.h>
 
 #include "dhcpsnoop.h"
+#include "msg.h"
 
 #define APPEND(_buf, _ofs, _format, ...) _ofs += snprintf(_buf + _ofs, sizeof(_buf) - _ofs, _format, ##__VA_ARGS__)
 
@@ -95,6 +96,7 @@ dhcpsnoop_packet_cb(struct packet *pkt)
 	const char *type;
 	bool ipv6 = false;
 	uint32_t rebind = 0;
+	char hostname[64] = {};
 
 inside_tunnel:
 	eth = pkt_pull(pkt, sizeof(*eth));
@@ -154,7 +156,8 @@ inside_tunnel:
 	port = ntohs(udp->uh_sport);
 
 	if (!ipv6)
-		type = dhcpsnoop_parse_ipv4(pkt->buffer, pkt->len, port, &rebind);
+		type = dhcpsnoop_parse_ipv4(pkt->buffer, pkt->len, port, &rebind,
+					    hostname, sizeof(hostname));
 	else
 		type = dhcpsnoop_parse_ipv6(pkt->buffer, pkt->len, port);
 
@@ -162,8 +165,13 @@ inside_tunnel:
 		return;
 
 	dhcpsnoop_ubus_notify(type, pkt->buffer, pkt->len);
-	if (!ipv6 && !strcmp(type, "ack") && rebind)
-		cache_entry(pkt->buffer, rebind);
+	if (!ipv6) {
+		const struct dhcpv4_message *dmsg = pkt->buffer;
+		if ((!strcmp(type, "discover") || !strcmp(type, "request")) && hostname[0])
+			cache_pending_hostname(dmsg->chaddr, hostname);
+		if (!strcmp(type, "ack") && rebind)
+			cache_entry(pkt->buffer, rebind, hostname);
+	}
 }
 
 static void

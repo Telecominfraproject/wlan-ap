@@ -6,12 +6,16 @@
 #include "dhcpsnoop.h"
 #include "msg.h"
 
-const char *dhcpsnoop_parse_ipv4(const void *buf, size_t len, uint16_t port, uint32_t *expire)
+const char *dhcpsnoop_parse_ipv4(const void *buf, size_t len, uint16_t port,
+				  uint32_t *expire, char *hostname, size_t hostname_len)
 {
 	const struct dhcpv4_message *msg = buf;
 	const uint8_t *pos, *end;
 	uint32_t leasetime = 0, rebind = 0, renew = 0;
 	char type = 0;
+
+	if (hostname && hostname_len > 0)
+		hostname[0] = '\0';
 
 	if (port != 67 && port != 68)
 		return NULL;
@@ -61,6 +65,16 @@ const char *dhcpsnoop_parse_ipv4(const void *buf, size_t len, uint16_t port, uin
 			if (opt[1] != 4)
 				continue;
 			renew = *((uint32_t *) &opt[2]);
+			break;
+		case DHCPV4_OPT_HOSTNAME:
+			/* Option 12 is a plain string, not NUL-terminated */
+			if (hostname && hostname_len > 0 && opt[1] > 0) {
+				size_t copy_len = opt[1];
+				if (copy_len >= hostname_len)
+					copy_len = hostname_len - 1;
+				memcpy(hostname, &opt[2], copy_len);
+				hostname[copy_len] = '\0';
+			}
 			break;
 		}
 	}
