@@ -37,7 +37,7 @@ do_flash_emmc() {
 
 sonicfi_dualimage_check() {
 	local boot_part=""
-	boot_part=$(fw_printenv | grep bootfrom | awk -F'=' '{printf $2}')
+	boot_part=$(fw_printenv -n bootfrom)
 	[ -n "$boot_part" ] || boot_part="0"
 	echo "boot_part=$boot_part" > /dev/console
 
