@@ -3,6 +3,66 @@
 RAMFS_COPY_BIN='fw_printenv fw_setenv'
 RAMFS_COPY_DATA='/etc/fw_env.config /var/lock/fw_printenv.lock'
 
+extract_version_number() {
+	local content="$1"
+	echo "$content" | sed -nE "s/.*DISTRIB_TIP_VERSION=['\"]?v([0-9.]+)['\"]?.*/\1/p"
+}
+
+get_current_version() {
+	[ -f /etc/openwrt_release ] && extract_version_number "$(cat /etc/openwrt_release)"
+}
+
+get_firmware_info() {
+	local tar_file="$1"
+
+	local fw_ver=""
+	local fw_build_date=""
+
+	local board_dir=$(tar tf "$tar_file" 2>/dev/null | grep -m 1 '^sysupgrade-.*/$')
+	board_dir=${board_dir%/}
+	[ -z "$board_dir" ] && { echo "$fw_ver" "$fw_build_date"; return; }
+
+	local root_path_in_tar="$board_dir/root"
+
+	local tmp_root_img="/tmp/fw_check_root.img"
+	local tmp_mount_point="/tmp/fw_check_mnt"
+
+	umount "$tmp_mount_point" 2>/dev/null
+	rm -rf "$tmp_root_img" "$tmp_mount_point" 2>/dev/null
+
+	mkdir -p "$tmp_mount_point"
+
+	if ! tar xOf "$tar_file" "$root_path_in_tar" > "$tmp_root_img" 2>/dev/null; then
+		rm -rf "$tmp_root_img" "$tmp_mount_point"
+		echo "$fw_ver" "$fw_build_date"
+		return
+	fi
+
+	if mount -t squashfs "$tmp_root_img" "$tmp_mount_point" -o loop,ro 2>/dev/null; then
+		if [ -f "$tmp_mount_point/etc/openwrt_release" ]; then
+			fw_ver=$(extract_version_number "$(cat "$tmp_mount_point/etc/openwrt_release")")
+		fi
+
+		if [ -f "$tmp_mount_point/bin/busybox" ]; then
+			fw_build_date=$(date -r "$tmp_mount_point/bin/busybox" +%Y%m%d 2>/dev/null)
+		fi
+
+		umount "$tmp_mount_point" 2>/dev/null
+	fi
+
+	rm -rf "$tmp_root_img" "$tmp_mount_point"
+	echo "${fw_ver}|${fw_build_date}"
+}
+
+version_le() {
+	local ver1="$1"
+	local ver2="$2"
+
+	[ -z "$ver1" ] || [ -z "$ver2" ] && return 1
+
+	[ "$(printf '%s\n' "$ver1" "$ver2" | sort -V | head -n1)" = "$ver1" ]
+}
+
 find_mmc_part() {
 	local DEVNAME PARTNAME
 
@@ -119,6 +179,80 @@ emmc_do_upgrade() {
 
 platform_check_image() {
 	local magic_long="$(get_magic_long "$1")"
+
+	board=$(board_name)
+	case $board in
+	sonicfi,rap7110c-341x)
+		local CURRENT_VER=$(get_current_version)
+
+		local FW_VER FW_BUILD_DATE
+		local info_output=$(get_firmware_info "$1")
+		FW_VER="${info_output%%|*}"
+		FW_BUILD_DATE="${info_output#*|}"
+
+		local LIMIT_VER="4.0.0"
+		local LIMIT_BUILD_DATE="20250630"
+
+		echo "Checking version for $board..."
+		echo "Current: v$CURRENT_VER, Firmware: v$FW_VER, Limit: <= v$LIMIT_VER"
+		echo "Firmware Build Date: $FW_BUILD_DATE, Limit: >= $LIMIT_BUILD_DATE"
+
+		local block_upgrade=0
+		if [ -n "$FW_VER" ] && [ -n "$LIMIT_VER" ]; then
+			if version_le "$FW_VER" "$LIMIT_VER"; then
+				echo "ERROR: Firmware version v$FW_VER is too old (Limit: >v$LIMIT_VER). Upgrade ABORTED."
+				return 1
+			fi
+		else
+			echo "Warning: Tip Version info missing. Will rely solely on Build Date check."
+		fi
+
+		if [ -z "$FW_BUILD_DATE" ]; then
+			echo "ERROR: Could not retrieve firmware build date. Upgrade ABORTED."
+			return 1
+		fi
+
+		if [ "$FW_BUILD_DATE" -lt "$LIMIT_BUILD_DATE" ]; then
+			echo "ERROR: Firmware build date $FW_BUILD_DATE is too old (Limit: $LIMIT_BUILD_DATE). Upgrade ABORTED."
+			return 1
+		fi
+		;;
+	sonicfi,rap750e-h|\
+	sonicfi,rap750e-s|\
+	sonicfi,rap750w-311a)
+		local CURRENT_VER=$(get_current_version)
+		local FW_VER FW_BUILD_DATE
+		local info_output=$(get_firmware_info "$1")
+		FW_VER="${info_output%%|*}"
+		FW_BUILD_DATE="${info_output#*|}"
+		local LIMIT_VER="4.2.3"
+		local LIMIT_BUILD_DATE="20260402"
+
+		echo "Checking version for $board..."
+		echo "Current: v$CURRENT_VER, Firmware: v$FW_VER, Limit: <= v$LIMIT_VER"
+		echo "Firmware Build Date: $FW_BUILD_DATE, Limit: >= $LIMIT_BUILD_DATE"
+
+		if [ -n "$FW_VER" ] && [ -n "$LIMIT_VER" ]; then
+			if version_le "$FW_VER" "$LIMIT_VER"; then
+				echo "ERROR: Firmware version v$FW_VER is too old (Limit: >v$LIMIT_VER). Upgrade ABORTED."
+				return 1
+			fi
+		else
+			echo "Warning: Tip Version info missing. Will rely solely on Build Date check."
+		fi
+
+		if [ -z "$FW_BUILD_DATE" ]; then
+			echo "ERROR: Could not retrieve firmware build date. Upgrade ABORTED."
+			return 1
+		fi
+
+		if [ "$FW_BUILD_DATE" -lt "$LIMIT_BUILD_DATE" ]; then
+			echo "ERROR: Firmware build date $FW_BUILD_DATE is too old (Limit: $LIMIT_BUILD_DATE). Upgrade ABORTED."
+			return 1
+		fi
+		;;
+	esac
+
 	[ "$magic_long" = "73797375" ] && return 0
 	return 1
 }
