@@ -1,0 +1,200 @@
+From 096a197b42227d12d63e79beb7cde7a24151d22b Mon Sep 17 00:00:00 2001
+From: Saahil Tomar <quic_saahtoma@quicinc.com>
+Date: Fri, 1 Dec 2023 20:25:33 +0530
+Subject: [PATCH 467/500] net: qrtr: Add qrtr log buffer support
+
+This change brings over qrtr log buffer support from 5.4
+
+Change-Id: I00b64dadfa67d673bb5f7159744f61b1dbaf738a
+Signed-off-by: Saahil Tomar <quic_saahtoma@quicinc.com>
+---
+ net/qrtr/af_qrtr.c | 150 ++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 148 insertions(+), 2 deletions(-)
+
+diff --git a/net/qrtr/af_qrtr.c b/net/qrtr/af_qrtr.c
+index 426cea019458..a76f941ce2d7 100644
+--- a/net/qrtr/af_qrtr.c
++++ b/net/qrtr/af_qrtr.c
+@@ -158,6 +158,28 @@ struct qrtr_tx_flow {
+ #define QRTR_TX_FLOW_HIGH	10
+ #define QRTR_TX_FLOW_LOW	5
+ 
++#define QRTR_LOG_SIZE		128
++/**
++ * struct qrtr_history - qrtr transaction history
++ * @timestamp: transaction timestamp
++ * @direction: transaction direction, 1 - TX, 0 - RX
++ * @qrtr_hdr: transaction qrtr header
++ * @msg_buffer: has control packet / data packet information
++ */
++struct qrtr_history {
++	u64 timestamp;
++	bool direction;
++	struct qrtr_hdr_v1 qrtr_hdr;
++	union {
++		struct qrtr_ctrl_pkt ctrl_pkt;
++		u8 data[64];
++	} msg_buffer;
++};
++
++struct qrtr_history qrtr_log[QRTR_LOG_SIZE];
++int qrtr_log_index;
++DEFINE_SPINLOCK(qrtr_log_spinlock);
++
+ static int qrtr_local_enqueue(struct qrtr_node *node, struct sk_buff *skb,
+ 			      int type, struct sockaddr_qrtr *from,
+ 			      struct sockaddr_qrtr *to);
+@@ -167,6 +189,124 @@ static int qrtr_bcast_enqueue(struct qrtr_node *node, struct sk_buff *skb,
+ static struct qrtr_sock *qrtr_port_lookup(int port);
+ static void qrtr_port_put(struct qrtr_sock *ipc);
+ 
++static void qrtr_buffer_log_tx(struct qrtr_node *node, struct qrtr_hdr_v1 *hdr,
++			       struct sk_buff *skb)
++{
++	const struct qrtr_ctrl_pkt *pkt;
++	struct qrtr_hdr_v1 *qrtr_hdr;
++	struct qrtr_ctrl_pkt *ctr;
++	unsigned long flags;
++	u32 type;
++
++	if (!hdr || !skb || !skb->data)
++		return;
++
++	spin_lock_irqsave(&qrtr_log_spinlock, flags);
++
++	/* Clear previous entry */
++	memset(&qrtr_log[qrtr_log_index], 0, sizeof(struct qrtr_history));
++
++	type = le32_to_cpu(hdr->type);
++	qrtr_log[qrtr_log_index].qrtr_hdr.type = type;
++	qrtr_log[qrtr_log_index].direction = 1;
++
++	qrtr_hdr = &qrtr_log[qrtr_log_index].qrtr_hdr;
++	ctr = &qrtr_log[qrtr_log_index].msg_buffer.ctrl_pkt;
++
++	if (type == QRTR_TYPE_DATA) {
++		qrtr_hdr->version = le32_to_cpu(hdr->version);
++		qrtr_hdr->src_node_id = le32_to_cpu(hdr->src_node_id);
++		qrtr_hdr->src_port_id = le32_to_cpu(hdr->src_port_id);
++		qrtr_hdr->confirm_rx = le32_to_cpu(hdr->confirm_rx);
++		qrtr_hdr->size = le32_to_cpu(hdr->size);
++		qrtr_hdr->dst_node_id = le32_to_cpu(hdr->dst_node_id);
++		qrtr_hdr->dst_port_id = le32_to_cpu(hdr->dst_port_id);
++		memcpy(qrtr_log[qrtr_log_index].msg_buffer.data,
++		       skb->data + QRTR_HDR_MAX_SIZE, 64);
++	} else {
++		pkt = (struct qrtr_ctrl_pkt *)(skb->data + QRTR_HDR_MAX_SIZE);
++		if (type == QRTR_TYPE_NEW_SERVER ||
++		    type == QRTR_TYPE_DEL_SERVER) {
++			ctr->server.service =
++				le32_to_cpu(pkt->server.service);
++			ctr->server.node = le32_to_cpu(pkt->server.node);
++			ctr->server.instance =
++				le32_to_cpu(pkt->server.instance);
++			ctr->server.port = le32_to_cpu(pkt->server.port);
++		} else if (type == QRTR_TYPE_DEL_CLIENT ||
++			   type == QRTR_TYPE_RESUME_TX) {
++			ctr->client.node = le32_to_cpu(pkt->client.node);
++			ctr->client.port = le32_to_cpu(pkt->client.port);
++		} else if (type == QRTR_TYPE_HELLO || type == QRTR_TYPE_BYE) {
++			qrtr_hdr->src_node_id = le32_to_cpu(hdr->src_node_id);
++		}
++	}
++
++	qrtr_log[qrtr_log_index++].timestamp = ktime_to_ms(ktime_get());
++
++	qrtr_log_index &= (QRTR_LOG_SIZE - 1);
++	spin_unlock_irqrestore(&qrtr_log_spinlock, flags);
++}
++
++static void qrtr_buffer_log_rx(struct qrtr_node *node, struct sk_buff *skb)
++{
++	const struct qrtr_ctrl_pkt *pkt;
++	struct qrtr_hdr_v1 *qrtr_hdr;
++	struct qrtr_ctrl_pkt *ctr;
++	unsigned long flags;
++	struct qrtr_cb *cb;
++
++	if (!skb || !skb->data)
++		return;
++
++	cb = (struct qrtr_cb *)skb->cb;
++
++	spin_lock_irqsave(&qrtr_log_spinlock, flags);
++
++	/* Clear previous entry */
++	memset(&qrtr_log[qrtr_log_index], 0, sizeof(struct qrtr_history));
++
++	qrtr_log[qrtr_log_index].qrtr_hdr.type = cb->type;
++	qrtr_log[qrtr_log_index].direction = 0;
++
++	qrtr_hdr = &qrtr_log[qrtr_log_index].qrtr_hdr;
++	ctr = &qrtr_log[qrtr_log_index].msg_buffer.ctrl_pkt;
++
++	if (cb->type == QRTR_TYPE_DATA) {
++		qrtr_hdr->confirm_rx = cb->confirm_rx;
++		qrtr_hdr->src_node_id = cb->src_node;
++		qrtr_hdr->src_port_id = cb->src_port;
++		qrtr_hdr->dst_node_id = cb->dst_node;
++		qrtr_hdr->dst_port_id = cb->dst_port;
++		memcpy(qrtr_log[qrtr_log_index].msg_buffer.data,
++		       skb->data, 64);
++
++	} else {
++		pkt = (struct qrtr_ctrl_pkt *)(skb->data);
++		if (cb->type == QRTR_TYPE_NEW_SERVER ||
++		    cb->type == QRTR_TYPE_DEL_SERVER) {
++			ctr->server.service =
++				le32_to_cpu(pkt->server.service);
++			ctr->server.node = le32_to_cpu(pkt->server.node);
++			ctr->server.instance =
++				le32_to_cpu(pkt->server.instance);
++			ctr->server.port = le32_to_cpu(pkt->server.port);
++		} else if (cb->type == QRTR_TYPE_DEL_CLIENT ||
++				cb->type == QRTR_TYPE_RESUME_TX) {
++			ctr->client.node = le32_to_cpu(pkt->client.node);
++			ctr->client.port = le32_to_cpu(pkt->client.port);
++		} else if (cb->type == QRTR_TYPE_HELLO ||
++				cb->type == QRTR_TYPE_BYE) {
++			qrtr_hdr->src_node_id = cb->src_node;
++		}
++	}
++
++	qrtr_log[qrtr_log_index++].timestamp = ktime_to_ms(ktime_get());
++
++	qrtr_log_index &= (QRTR_LOG_SIZE - 1);
++	spin_unlock_irqrestore(&qrtr_log_spinlock, flags);
++}
++
+ /* Release node resources and free the node.
+  *
+  * Do not call directly, use qrtr_node_release.  To be used with
+@@ -382,10 +522,15 @@ static int qrtr_node_enqueue(struct qrtr_node *node, struct sk_buff *skb,
+ 	if (!rc) {
+ 		mutex_lock(&node->ep_lock);
+ 		rc = -ENODEV;
+-		if (node->ep)
++		if (node->ep) {
++			qrtr_buffer_log_tx(node, hdr, skb);
+ 			rc = node->ep->xmit(node->ep, skb);
+-		else
++			if (rc)
++				pr_err("%s : Error in xmit : ret = %d\n",
++				       __func__, rc);
++		} else {
+ 			kfree_skb(skb);
++		}
+ 		mutex_unlock(&node->ep_lock);
+ 	}
+ 	/* Need to ensure that a subsequent message carries the otherwise lost
+@@ -523,6 +668,7 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
+ 		goto err;
+ 
+ 	skb_put_data(skb, data + hdrlen, size);
++	qrtr_buffer_log_rx(node, skb);
+ 
+ 	qrtr_node_assign(node, cb->src_node);
+ 
+-- 
+2.34.1
+

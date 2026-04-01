@@ -1,0 +1,166 @@
+From a1256084a289b30f8b1d34371fbdf076e462979b Mon Sep 17 00:00:00 2001
+From: Marco Elver <elver@google.com>
+Date: Mon, 5 Aug 2024 14:39:39 +0200
+Subject: [PATCH] kfence: introduce burst mode
+
+Introduce burst mode, which can be configured with kfence.burst=$count,
+where the burst count denotes the additional successive slab allocations
+to be allocated through KFENCE for each sample interval.
+
+The idea is that this can give developers an additional knob to make
+KFENCE more aggressive when debugging specific issues of systems where
+either rebooting or recompiling the kernel with KASAN is not possible.
+
+Experiment: To assess the effectiveness of the new option, we randomly
+picked a recent out-of-bounds [1] and use-after-free bug [2], each with a
+reproducer provided by syzbot, that initially detected these bugs with
+KASAN.  We then tried to reproduce the bugs with KFENCE below.
+
+[1] Fixed by: commit 7c55b78818cf ("jfs: xattr: fix buffer overflow for invalid xattr")
+    https://syzkaller.appspot.com/bug?id=9d1b59d4718239da6f6069d3891863c25f9f24a2
+[2] Fixed by: commit f8ad00f3fb2a ("l2tp: fix possible UAF when cleaning up tunnels")
+    https://syzkaller.appspot.com/bug?id=4f34adc84f4a3b080187c390eeef60611fd450e1
+
+The following KFENCE configs were compared. A pool size of 1023 objects
+was used for all configurations.
+
+	Baseline
+		kfence.sample_interval=100
+		kfence.skip_covered_thresh=75
+		kfence.burst=0
+
+	Aggressive
+		kfence.sample_interval=1
+		kfence.skip_covered_thresh=10
+		kfence.burst=0
+
+	AggressiveBurst
+		kfence.sample_interval=1
+		kfence.skip_covered_thresh=10
+		kfence.burst=1000
+
+Each reproducer was run 10 times (after a fresh reboot), with the
+following detection counts for each KFENCE config:
+
+                    | Detection Count out of 10 |
+                    |    OOB [1]  |    UAF [2]  |
+  ------------------+-------------+-------------+
+  Default           |     0/10    |     0/10    |
+  Aggressive        |     0/10    |     0/10    |
+  AggressiveBurst   |     8/10    |     8/10    |
+
+With the Default and even the Aggressive configs the results are
+unsurprising, given KFENCE has not been designed for deterministic bug
+detection of small test cases.
+
+However, when enabling burst mode with relatively large burst count,
+KFENCE can start to detect heap memory-safety bugs even in simpler test
+cases with high probability (in the above cases with ~80% probability).
+
+Link: https://lkml.kernel.org/r/20240805124203.2692278-1-elver@google.com
+Signed-off-by: Marco Elver <elver@google.com>
+Reviewed-by: Alexander Potapenko <glider@google.com>
+Cc: Andrey Konovalov <andreyknvl@gmail.com>
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Cc: Jann Horn <jannh@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit cc0a0f98553528791ae33ba5ee8c118b52ae2028)
+
+Change-Id: Icb1850af0de18acce41f76c2222757fe2b87078c
+Signed-off-by: Sridharan S N <sridsn@qti.qualcomm.com>
+---
+ Documentation/dev-tools/kfence.rst |  7 +++++++
+ include/linux/kfence.h             |  2 +-
+ mm/kfence/core.c                   | 14 ++++++++++----
+ 3 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/Documentation/dev-tools/kfence.rst b/Documentation/dev-tools/kfence.rst
+index 936f6aaa75c8..541899353865 100644
+--- a/Documentation/dev-tools/kfence.rst
++++ b/Documentation/dev-tools/kfence.rst
+@@ -53,6 +53,13 @@ configurable via the Kconfig option ``CONFIG_KFENCE_DEFERRABLE``.
+    The KUnit test suite is very likely to fail when using a deferrable timer
+    since it currently causes very unpredictable sample intervals.
+ 
++By default KFENCE will only sample 1 heap allocation within each sample
++interval. *Burst mode* allows to sample successive heap allocations, where the
++kernel boot parameter ``kfence.burst`` can be set to a non-zero value which
++denotes the *additional* successive allocations within a sample interval;
++setting ``kfence.burst=N`` means that ``1 + N`` successive allocations are
++attempted through KFENCE for each sample interval.
++
+ The KFENCE memory pool is of fixed size, and if the pool is exhausted, no
+ further KFENCE allocations occur. With ``CONFIG_KFENCE_NUM_OBJECTS`` (default
+ 255), the number of available guarded objects can be controlled. Each object
+diff --git a/include/linux/kfence.h b/include/linux/kfence.h
+index 401af4757514..674f0ecb0538 100644
+--- a/include/linux/kfence.h
++++ b/include/linux/kfence.h
+@@ -124,7 +124,7 @@ static __always_inline void *kfence_alloc(struct kmem_cache *s, size_t size, gfp
+ 	if (!static_branch_likely(&kfence_allocation_key))
+ 		return NULL;
+ #endif
+-	if (likely(atomic_read(&kfence_allocation_gate)))
++	if (likely(atomic_read(&kfence_allocation_gate) > 0))
+ 		return NULL;
+ 	return __kfence_alloc(s, size, flags);
+ }
+diff --git a/mm/kfence/core.c b/mm/kfence/core.c
+index 937bbae2611f..c4c911ece5ea 100644
+--- a/mm/kfence/core.c
++++ b/mm/kfence/core.c
+@@ -100,6 +100,10 @@ module_param_cb(sample_interval, &sample_interval_param_ops, &kfence_sample_inte
+ static unsigned long kfence_skip_covered_thresh __read_mostly = 75;
+ module_param_named(skip_covered_thresh, kfence_skip_covered_thresh, ulong, 0644);
+ 
++/* Allocation burst count: number of excess KFENCE allocations per sample. */
++static unsigned int kfence_burst __read_mostly;
++module_param_named(burst, kfence_burst, uint, 0644);
++
+ /* If true, use a deferrable timer. */
+ static bool kfence_deferrable __read_mostly = IS_ENABLED(CONFIG_KFENCE_DEFERRABLE);
+ module_param_named(deferrable, kfence_deferrable, bool, 0444);
+@@ -825,12 +829,12 @@ static void toggle_allocation_gate(struct work_struct *work)
+ 	if (!READ_ONCE(kfence_enabled))
+ 		return;
+ 
+-	atomic_set(&kfence_allocation_gate, 0);
++	atomic_set(&kfence_allocation_gate, -kfence_burst);
+ #ifdef CONFIG_KFENCE_STATIC_KEYS
+ 	/* Enable static key, and await allocation to happen. */
+ 	static_branch_enable(&kfence_allocation_key);
+ 
+-	wait_event_idle(allocation_wait, atomic_read(&kfence_allocation_gate));
++	wait_event_idle(allocation_wait, atomic_read(&kfence_allocation_gate) > 0);
+ 
+ 	/* Disable static key and reset timer. */
+ 	static_branch_disable(&kfence_allocation_key);
+@@ -1050,6 +1054,7 @@ void *__kfence_alloc(struct kmem_cache *s, size_t size, gfp_t flags)
+ 	unsigned long stack_entries[KFENCE_STACK_DEPTH];
+ 	size_t num_stack_entries;
+ 	u32 alloc_stack_hash;
++	int allocation_gate;
+ 
+ 	/*
+ 	 * Perform size check before switching kfence_allocation_gate, so that
+@@ -1079,14 +1084,15 @@ void *__kfence_alloc(struct kmem_cache *s, size_t size, gfp_t flags)
+ 	if (s->flags & SLAB_SKIP_KFENCE)
+ 		return NULL;
+ 
+-	if (atomic_inc_return(&kfence_allocation_gate) > 1)
++	allocation_gate = atomic_inc_return(&kfence_allocation_gate);
++	if (allocation_gate > 1)
+ 		return NULL;
+ #ifdef CONFIG_KFENCE_STATIC_KEYS
+ 	/*
+ 	 * waitqueue_active() is fully ordered after the update of
+ 	 * kfence_allocation_gate per atomic_inc_return().
+ 	 */
+-	if (waitqueue_active(&allocation_wait)) {
++	if (allocation_gate == 1 && waitqueue_active(&allocation_wait)) {
+ 		/*
+ 		 * Calling wake_up() here may deadlock when allocations happen
+ 		 * from within timer code. Use an irq_work to defer it.
+-- 
+2.34.1
+

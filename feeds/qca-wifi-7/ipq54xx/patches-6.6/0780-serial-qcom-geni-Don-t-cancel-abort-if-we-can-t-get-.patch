@@ -1,0 +1,125 @@
+From d3a2a76a983fbb79c1bcd306334db23498dc10dd Mon Sep 17 00:00:00 2001
+From: Douglas Anderson <dianders@chromium.org>
+Date: Fri, 12 Jan 2024 15:03:08 -0800
+Subject: [PATCH] serial: qcom-geni: Don't cancel/abort if we can't get the
+ port lock
+
+As of commit d7402513c935 ("arm64: smp: IPI_CPU_STOP and
+IPI_CPU_CRASH_STOP should try for NMI"), if we've got pseudo-NMI
+enabled then we'll use it to stop CPUs at panic time. This is nice,
+but it does mean that there's a pretty good chance that we'll end up
+stopping a CPU while it holds the port lock for the console
+UART. Specifically, I see a CPU get stopped while holding the port
+lock nearly 100% of the time on my sc7180-trogdor based Chromebook by
+enabling the "buddy" hardlockup detector and then doing:
+
+  sysctl -w kernel.hardlockup_all_cpu_backtrace=1
+  sysctl -w kernel.hardlockup_panic=1
+  echo HARDLOCKUP > /sys/kernel/debug/provoke-crash/DIRECT
+
+UART drivers are _supposed_ to handle this case OK and this is why
+UART drivers check "oops_in_progress" and only do a "trylock" in that
+case. However, before we enabled pseudo-NMI to stop CPUs it wasn't a
+very well-tested situation.
+
+Now that we're testing the situation a lot, it can be seen that the
+Qualcomm GENI UART driver is pretty broken. Specifically, when I run
+my test case and look at the console output I just see a bunch of
+garbled output like:
+
+  [  201.069084] NMI backtrace[  201.069084] NM[  201.069087] CPU: 6
+  PID: 10296 Comm: dnsproxyd Not tainted 6.7.0-06265-gb13e8c0ede12
+  #1 01112b9f14923cbd0b[  201.069090] Hardware name: Google Lazor
+  ([  201.069092] pstate: 80400009 (Nzcv daif +PAN -UAO -TCO -DI[
+  201.069095] pc : smp_call_function_man[  201.069099]
+
+That's obviously not so great. This happens because each call to the
+console driver exits after the data has been written to the FIFO but
+before it's actually been flushed out of the serial port. When we have
+multiple calls into the console one after the other then (if we can't
+get the lock) each call tells the UART to throw away any data in the
+FIFO that hadn't been transferred yet.
+
+I've posted up a patch to change the arm64 core to avoid this
+situation most of the time [1] much like x86 seems to do, but even if
+that patch lands the GENI driver should still be fixed.
+
+>From testing, it appears that we can just delete the cancel/abort in
+the case where we weren't able to get the UART lock and the output
+looks good. It makes sense that we'd be able to do this since that
+means we'll just call into __qcom_geni_serial_console_write() and
+__qcom_geni_serial_console_write() looks much like
+qcom_geni_serial_poll_put_char() but with a loop. However, it seems
+safest to poll the FIFO and make sure it's empty before our
+transfer. This should reliably make sure that we're not
+interrupting/clobbering any existing transfers.
+
+As part of this change, we'll also avoid re-setting up a TX at the end
+of the console write function if we weren't able to get the lock,
+since accessing "port->tx_remaining" without the lock is not
+safe. This is only needed to re-start userspace initiated transfers.
+
+[1] https://lore.kernel.org/r/20231207170251.1.Id4817adef610302554b8aa42b090d57270dc119c@changeid
+
+Change-Id: I3ec9befb2266d15578282c7e53f1d6fa1fe6f3c5
+Signed-off-by: Douglas Anderson <dianders@chromium.org>
+Link: https://lore.kernel.org/r/20240112150307.2.Idb1553d1d22123c377f31eacb4486432f6c9ac8d@changeid
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Poovendhan Selvaraj <quic_poovendh@quicinc.com>
+(cherry picked from commit 9e957a155005b16af057e86c6bcc1197cd70a6af)
+---
+ drivers/tty/serial/qcom_geni_serial.c | 30 +++++++++++++--------------
+ 1 file changed, 14 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/tty/serial/qcom_geni_serial.c b/drivers/tty/serial/qcom_geni_serial.c
+index b735e6dcc4ae..a22f84533591 100644
+--- a/drivers/tty/serial/qcom_geni_serial.c
++++ b/drivers/tty/serial/qcom_geni_serial.c
+@@ -500,18 +500,16 @@ static void qcom_geni_serial_console_write(struct console *co, const char *s,
+ 
+ 	geni_status = readl(uport->membase + SE_GENI_STATUS);
+ 
+-	/* Cancel the current write to log the fault */
+ 	if (!locked) {
+-		geni_se_cancel_m_cmd(&port->se);
+-		if (!qcom_geni_serial_poll_bit(uport, SE_GENI_M_IRQ_STATUS,
+-						M_CMD_CANCEL_EN, true)) {
+-			geni_se_abort_m_cmd(&port->se);
+-			qcom_geni_serial_poll_bit(uport, SE_GENI_M_IRQ_STATUS,
+-							M_CMD_ABORT_EN, true);
+-			writel(M_CMD_ABORT_EN, uport->membase +
+-							SE_GENI_M_IRQ_CLEAR);
+-		}
+-		writel(M_CMD_CANCEL_EN, uport->membase + SE_GENI_M_IRQ_CLEAR);
++		/*
++		 * We can only get here if an oops is in progress then we were
++		 * unable to get the lock. This means we can't safely access
++		 * our state variables like tx_remaining. About the best we
++		 * can do is wait for the FIFO to be empty before we start our
++		 * transfer, so we'll do that.
++		 */
++		qcom_geni_serial_poll_bit(uport, SE_GENI_M_IRQ_STATUS,
++					  M_TX_FIFO_NOT_EMPTY_EN, false);
+ 	} else if ((geni_status & M_GENI_CMD_ACTIVE) && !port->tx_remaining) {
+ 		/*
+ 		 * It seems we can't interrupt existing transfers if all data
+@@ -528,11 +526,11 @@ static void qcom_geni_serial_console_write(struct console *co, const char *s,
+ 
+ 	__qcom_geni_serial_console_write(uport, s, count);
+ 
+-	if (port->tx_remaining)
+-		qcom_geni_serial_setup_tx(uport, port->tx_remaining);
+-
+-	if (locked)
+-		spin_unlock_irqrestore(&uport->lock, flags);
++	if (locked) {
++		if (port->tx_remaining)
++			qcom_geni_serial_setup_tx(uport, port->tx_remaining);
++		uart_port_unlock_irqrestore(uport, flags);
++	}
+ }
+ 
+ static void handle_rx_console(struct uart_port *uport, u32 bytes, bool drop)
+-- 
+2.34.1
+
