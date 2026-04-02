@@ -173,15 +173,6 @@ define Device/edgecore_oap101
 endef
 TARGET_DEVICES += edgecore_oap101
 
-define Device/edgecore_oap101_6e
-  DEVICE_TITLE := EdgeCore OAP101 6E
-  DEVICE_DTS := qcom-ipq5018-oap101-6e
-  SUPPORTED_DEVICES := edgecore,oap101-6e
-  DEVICE_PACKAGES := ath11k-wifi-edgecore-oap101 ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122 kmod-hwmon-tmp102 kmod-gpio-pca953x ugps kmod-tpm-tis-i2c
-  DEVICE_DTS_CONFIG := config@mp03.5-c1
-endef
-TARGET_DEVICES += edgecore_oap101_6e
-
 define Device/edgecore_oap101e
   DEVICE_TITLE := EdgeCore OAP101 E
   DEVICE_DTS := qcom-ipq5018-oap101e
@@ -190,15 +181,6 @@ define Device/edgecore_oap101e
   DEVICE_DTS_CONFIG := config@mp03.5-c1
 endef
 TARGET_DEVICES += edgecore_oap101e
-
-define Device/edgecore_oap101e_6e
-  DEVICE_TITLE := EdgeCore OAP101 6E E
-  DEVICE_DTS := qcom-ipq5018-oap101e-6e
-  SUPPORTED_DEVICES := edgecore,oap101e-6e
-  DEVICE_PACKAGES := ath11k-wifi-edgecore-oap101e ath11k-firmware-ipq50xx-spruce ath11k-firmware-qcn6122 kmod-hwmon-tmp102 kmod-gpio-pca953x ugps kmod-tpm-tis-i2c
-  DEVICE_DTS_CONFIG := config@mp03.5-c1
-endef
-TARGET_DEVICES += edgecore_oap101e_6e
 
 define Device/emplus_wap385c
   DEVICE_TITLE := Emplus WAP385C
