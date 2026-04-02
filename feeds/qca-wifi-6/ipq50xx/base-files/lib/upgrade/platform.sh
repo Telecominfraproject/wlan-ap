@@ -94,10 +94,8 @@ platform_check_image() {
 	udaya,a6-id2|\
 	udaya,a6-od2|\
 	edgecore,oap101|\
-	edgecore,oap101-6e|\
 	edgecore,oap101e|\
-	emplus,wap581|\
-	edgecore,oap101e-6e)
+	emplus,wap581)
 		[ "$magic_long" = "73797375" ] && return 0
 		;;
 	esac
@@ -129,9 +127,7 @@ platform_do_upgrade() {
 		nand_upgrade_tar "$1"
 		;;
 	edgecore,oap101|\
-	edgecore,oap101-6e|\
 	edgecore,oap101e|\
-	edgecore,oap101e-6e|\
 	edgecore,eap104)
 		if [ "$(find_mtd_chardev rootfs)" ]; then
 			CI_UBIPART="rootfs"
