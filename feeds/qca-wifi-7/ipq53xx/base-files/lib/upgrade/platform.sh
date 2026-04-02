@@ -37,20 +37,20 @@ do_flash_emmc() {
 
 sonicfi_dualimage_check() {
 	local boot_part=""
-	boot_part=$(fw_printenv | grep bootfrom | awk -F'=' '{printf $2}')
+	boot_part=$(fw_printenv -n bootfrom)
 	[ -n "$boot_part" ] || boot_part="0"
 	echo "boot_part=$boot_part" > /dev/console
 
 	if [ "$boot_part" = "0" ]; then
-		block_kernel="0:HLOS_1"
-		block_rootfs="rootfs_1"
-		CI_UBIPART="rootfs_1"
-		fw_setenv bootfrom 1
-	elif [ "$boot_part" = "1" ]; then
 		block_kernel="0:HLOS"
 		block_rootfs="rootfs"
 		CI_UBIPART="rootfs"
 		fw_setenv bootfrom 0
+	elif [ "$boot_part" = "1" ]; then
+		block_kernel="0:HLOS_1"
+		block_rootfs="rootfs_1"
+		CI_UBIPART="rootfs_1"
+		fw_setenv bootfrom 1
 	else
 		echo "Invalid boot partition $boot_part! Skip upgrade....."
 		return
@@ -181,12 +181,57 @@ platform_do_upgrade() {
 		;;
 	sonicfi,rap7110c-341x)
 		sonicfi_dualimage_check
+		ram_root="/tmp/root"
+		boot_imgdir="/usr/share/boot_img"
+		boot_img="openwrt-ipq5332-u-boot.mbn"
+		boot_mmcname="0:APPSBL"
+		emmcblock=$(find_mmc_part ${boot_mmcname})
+
+		echo "emmcblock=${emmcblock}"
+		if [ -z "${emmcblock}" ]; then
+			echo "error: ${emmcblock} emmcblock not found, exiting" >&2
+			return 1
+		fi
+
+		if [ -f "${ram_root}/${boot_imgdir}/${boot_img}" ]; then
+			echo "dd if=/dev/zero of=${emmcblock} conv=fsync"
+			echo "dd if=${boot_imgdir}/${boot_img} of=${emmcblock} conv=fsync"
+			dd if=/dev/zero of=${emmcblock} conv=fsync
+			dd if=${ram_root}/${boot_imgdir}/${boot_img} of=${emmcblock} conv=fsync
+		else
+			echo "Failed to start image upgrade, exiting" >&2
+			return 1
+		fi
+
+		echo "Boot image upgrade successful"
 		emmc_do_upgrade "$1"
 		;;
 	sonicfi,rap750e-h|\
 	sonicfi,rap750e-s|\
 	sonicfi,rap750w-311a)
 		sonicfi_dualimage_check
+		ram_root="/tmp/root"
+		boot_imgdir="/usr/share/boot_img"
+		boot_img="openwrt-ipq5332-u-boot.mbn"
+		boot_mtdname="0:APPSBL"
+		boot_mtd=$(grep "\"${boot_mtdname}\"" /proc/mtd | awk -F: '{print $1}')
+		pgsz=$(cat /sys/class/mtd/${boot_mtd}/writesize)
+
+		echo "boot_mtd=${boot_mtd}, pgsz=${pgsz}"
+		if [ -z "$boot_mtd" ]; then
+                        echo "error: ${boot_mtdname} MTD partition not found, exiting" >&2
+                        return 1
+                fi
+
+		if [ -f "${ram_root}/${boot_imgdir}/${boot_img}" ]; then
+                        echo "dd if=${ram_root}/${boot_imgdir}/${boot_img} bs=${pgsz} conv=sync | mtd -e "/dev/${boot_mtd}" write - "/dev/${boot_mtd}""
+                        dd if=${ram_root}/${boot_imgdir}/${boot_img} bs=${pgsz} conv=sync | mtd -e "/dev/${boot_mtd}" write - "/dev/${boot_mtd}"
+                else
+                        echo "Failed to start image upgrade, exiting" >&2
+                        return 1
+                fi
+
+		echo "Boot image upgrade successful"
 		nand_upgrade_tar "$1"
 		;;
 	asterfusion,AP7330|\

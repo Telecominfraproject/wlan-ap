@@ -108,12 +108,34 @@ platform_do_upgrade() {
 		[ ${#boot_part} -eq 0 ] && boot_part=0
 		echo "Current bootfrom is $boot_part"
 		if [[ $boot_part == 1 ]]; then
-			CI_UBIPART="rootfs"
-			CI_FWSETENV="bootfrom 0"
-		elif [[ $boot_part == 0 ]]; then
 			CI_UBIPART="rootfs_1"
 			CI_FWSETENV="bootfrom 1"
+		elif [[ $boot_part == 0 ]]; then
+			CI_UBIPART="rootfs"
+			CI_FWSETENV="bootfrom 0"
 		fi
+		ram_root="/tmp/root"
+		boot_imgdir="/usr/share/boot_img"
+		boot_img="openwrt-ipq807x-u-boot.mbn"
+		boot_mtdname="0:APPSBL"
+		boot_mtd=$(grep "\"${boot_mtdname}\"" /proc/mtd | awk -F: '{print $1}')
+		pgsz=$(cat /sys/class/mtd/${boot_mtd}/writesize)
+
+		echo "boot_mtd=${boot_mtd}, pgsz=${pgsz}"
+		if [ -z "$boot_mtd" ]; then
+			echo "error: ${boot_mtdname} MTD partition not found, exiting" >&2
+			return 1
+		fi
+
+		if [ -f "${ram_root}/${boot_imgdir}/${boot_img}" ]; then
+			echo "dd if=${ram_root}/${boot_imgdir}/${boot_img} bs=${pgsz} conv=sync | mtd -e "/dev/${boot_mtd}" write - "/dev/${boot_mtd}""
+			dd if=${ram_root}/${boot_imgdir}/${boot_img} bs=${pgsz} conv=sync | mtd -e "/dev/${boot_mtd}" write - "/dev/${boot_mtd}"
+		else
+			echo "Failed to start image upgrade, exiting" >&2
+			return 1
+		fi
+
+		echo "Boot image upgrade successful"
 		nand_upgrade_tar "$1"
 	esac
 }
