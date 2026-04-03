@@ -221,7 +221,41 @@ platform_check_image() {
             return 1
         fi
         ;;
-		esac
+	sonicfi,rap750e-h|\
+	sonicfi,rap750e-s|\
+	sonicfi,rap750w-311a)
+		local CURRENT_VER=$(get_current_version)
+		local FW_VER FW_BUILD_DATE
+		local info_output=$(get_firmware_info "$1")
+		FW_VER="${info_output%%|*}"
+		FW_BUILD_DATE="${info_output#*|}"
+		local LIMIT_VER="4.2.3"
+		local LIMIT_BUILD_DATE="20260402"
+
+		echo "Checking version for $board..."
+		echo "Current: v$CURRENT_VER, Firmware: v$FW_VER, Limit: <= v$LIMIT_VER"
+		echo "Firmware Build Date: $FW_BUILD_DATE, Limit: >= $LIMIT_BUILD_DATE"
+
+		if [ -n "$FW_VER" ] && [ -n "$LIMIT_VER" ]; then
+			if version_le "$FW_VER" "$LIMIT_VER"; then
+				echo "ERROR: Firmware version v$FW_VER is too old (Limit: >v$LIMIT_VER). Upgrade ABORTED."
+				return 1
+			fi
+		else
+			echo "Warning: Tip Version info missing. Will rely solely on Build Date check."
+		fi
+
+		if [ -z "$FW_BUILD_DATE" ]; then
+			echo "ERROR: Could not retrieve firmware build date. Upgrade ABORTED."
+			return 1
+		fi
+
+		if [ "$FW_BUILD_DATE" -lt "$LIMIT_BUILD_DATE" ]; then
+			echo "ERROR: Firmware build date $FW_BUILD_DATE is too old (Limit: $LIMIT_BUILD_DATE). Upgrade ABORTED."
+			return 1
+		fi
+		;;
+	esac
 
 	[ "$magic_long" = "73797375" ] && return 0
 	return 1
