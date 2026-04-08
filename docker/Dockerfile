@@ -10,3 +10,4 @@ RUN apt-get update \
 RUN git config --global user.email "you@example.com"
 RUN git config --global user.name "Your Name"
 RUN pip3 install kconfiglib
+ENV WGET_OPTIONS="--timeout=30"
