@@ -414,6 +414,14 @@ export function info(name) {
 			channel_offset: data.hardware.channel_offset || 'none',
 		};
 
+		if (!data.wiphy_freq) {
+			dev.channel = format_channel(data.mlo_links[0].wiphy_freq);
+			dev.freq = format_frequency(data.mlo_links[0].wiphy_freq);
+			dev.center_freq1 = format_channel(data.mlo_links[0].center_freq1) || 'unknown';
+			dev.center_freq2 = format_channel(data.mlo_links[0].center_freq2) || 'unknown';
+			dev.txpower = data.mlo_links[0].wiphy_tx_power_level / 100;
+		}
+
 		let phy = find_phy(data.wiphy);
 		for (let limit in phy.interface_combinations[0]?.limits)
 			if (limit.types?.ap && limit.max > 1)
