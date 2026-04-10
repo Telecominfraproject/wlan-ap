@@ -227,6 +227,7 @@ drv_mac80211_init_device_config() {
 	config_add_string path phy 'macaddr:macaddr'
 	config_add_string tx_burst
 	config_add_string distance band
+	config_add_string macaddr_base
 	config_add_int radio beacon_int chanbw frag rts
 	config_add_int rxantenna txantenna txpower min_tx_power antenna_gain
 	config_add_int num_global_macaddr multiple_bssid
@@ -1308,7 +1309,7 @@ mac80211_generate_mac() {
 		mbssid=$multiple_bssid
 	fi
 
-	wdev_tool "$phy$phy_suffix" get_macaddr id=$id num_global=$num_global_macaddr mbssid=$mbssid mbssid_group_size=$group_size
+	wdev_tool "$phy$phy_suffix" get_macaddr id=$id num_global=$num_global_macaddr mbssid=$mbssid mbssid_group_size=$group_size macaddr_base=${macaddr_base}
 }
 
 get_board_phy_name() (
@@ -1939,6 +1940,7 @@ wpa_supplicant_set_config() {
 	json_add_string phy "$phy"
 	json_add_int radio "$radio"
 	json_add_int num_global_macaddr "$num_global_macaddr"
+	json_add_string macaddr_base "$macaddr_base"
 	json_add_boolean defer 1
 	[ -n "$mld" ] && json_add_boolean is_ml 1
 	json_add_string mon_if_name "$mon_if_name"
@@ -1988,7 +1990,7 @@ wpa_supplicant_start() {
 	[ -n "$wpa_supp_init" ] || return 0
 	[ -n "$mld" ] && is_mld="true"
 
-	ubus_call wpa_supplicant config_set '{ "phy": "'"$phy"'", "radio": '"$radio"', "num_global_macaddr": '"$num_global_macaddr"', "is_ml": '"$is_mld"' }' > /dev/null
+	ubus_call wpa_supplicant config_set '{ "phy": "'"$phy"'", "radio": '"$radio"', "num_global_macaddr": '"$num_global_macaddr"', "is_ml": '"$is_mld"', "macaddr_base" : '"$macaddr_base"' }' > /dev/null
 	if [ "${dpp}" -eq 1 ]; then
 		/usr/sbin/wpa_cli -i $ifname -p /var/run/wpa_supplicant -a /lib/netifd/dpp-supplicant-event-update -B
 	fi
@@ -2138,7 +2140,8 @@ drv_mac80211_setup() {
 		frag rts beacon_int:100 htmode \
 		num_global_macaddr:1 multiple_bssid \
 		eht_ulmumimo_80mhz eht_ulmumimo_160mhz eht_ulmumimo_320mhz \
-		ccfs disable_csa_dfs ru_punct_bitmap
+		ccfs disable_csa_dfs ru_punct_bitmap \
+		macaddr_base
 	json_get_values basic_rate_list basic_rate
 	json_get_values scan_list scan_list
 	json_select ..
