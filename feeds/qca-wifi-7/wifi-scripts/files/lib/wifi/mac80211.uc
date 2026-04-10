@@ -145,11 +145,21 @@ function generate_config(info, name, single_wiphy, id, radio_idx) {
 	else
 		htmode = "NOHT";
 
+	let country, num_global_macaddr, macaddr_base;
+	if (board.wlan.defaults) {
+		country = board.wlan.defaults.country;
+		num_global_macaddr = board.wlan.defaults.ssids?.[lc(band_name)]?.mac_count;
+		macaddr_base = board.wlan.defaults.ssids?.[lc(band_name)]?.macaddr_base;
+	}
+
 	print(`set ${s}=wifi-device
 set ${s}.type='mac80211'
 set ${s}.${id}
 set ${s}.band='${lc(band_name)}'
 set ${s}.channel='${channel}'
+set ${s}.country='${country || ''}'
+set ${s}.macaddr_base='${macaddr_base || ''}'
+set ${s}.num_global_macaddr='${num_global_macaddr || ''}'
 `);
 
 if (radio_idx != null) {
