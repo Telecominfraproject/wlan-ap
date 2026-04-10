@@ -2,7 +2,235 @@
 
 'use strict';
 
+import * as uci from 'uci';
 import * as fs from 'fs';
+import { ulog_open, ulog, ULOG_SYSLOG, LOG_DAEMON, LOG_INFO, LOG_ERR, LOG_WARNING } from 'log';
+
+ulog_open(ULOG_SYSLOG, LOG_DAEMON, "ucentral-pstore");
+
+const DEFAULT_BACKUP_DIR = "backup_storage";
+const DEFAULT_BACKUP_FILE = "backup.tgz";
+const DEFAULT_MAX_ROTATIONS = 3;
+const DEFAULT_SPACE_THRESH = 2048;
+const UCI_CONFIG_FILE = "log-helper";
+
+function log(level, message) {
+	let log_level;
+	if (level === 'info') log_level = LOG_INFO;
+	else if (level === 'error') log_level = LOG_ERR;
+	else if (level === 'warn') log_level = LOG_WARNING;
+	else log_level = LOG_INFO;
+	ulog(log_level, 'ucentral-pstore: ' + message);
+	print(sprintf('ucentral-pstore: %s: %s\n', level, message));
+}
+
+function file_exists(path) {
+	return !!fs.stat(path);
+}
+
+function rotate_logs(base_log_path, max_rotations) {
+	if (max_rotations <= 1) {
+		log('error', "max_rotations must be greater than 1: " + max_rotations);
+		return false;
+	}
+
+	let log_path = base_log_path;
+
+	if (!file_exists(log_path)) {
+		return true;
+	}
+
+	// Rename files in reverse order (from max_rotations-1 down to 1)
+	// This moves .2 to .3, .1 to .2, etc.
+	for (let i = max_rotations - 1; i >= 1; i--) {
+		let src = log_path + "." + i;
+		let dest = log_path + "." + (i + 1);
+
+		if (file_exists(src)) {
+			fs.rename(src, dest);
+		}
+	}
+
+	fs.rename(log_path, log_path + ".1");
+
+	// Remove the oldest backup file (at position max_rotations + 1)
+	// This keeps max_rotations backup files (.1 through .max_rotations)
+	let oldest = log_path + "." + (max_rotations + 1);
+	if (file_exists(oldest)) {
+		fs.unlink(oldest);
+	}
+
+	return true;
+}
+
+function move_file(src_path, dest_dir) {
+	let dest_path = dest_dir + "/" + fs.basename(src_path);
+	log('info', "Moving backup file to " + dest_path);
+	// The rename function cannot be used to move backup files from the /tmp directory to the target path
+	// so the system mv command is adopted instead.
+	let cmd = "mv '" + src_path + "' '" + dest_path + "'";
+	let proc = fs.popen(cmd, "r");
+	if (!proc) {
+		log('error', "Failed to start move command");
+		return false;
+	}
+	let ret = proc.close();
+	if (ret === 0) {
+		log('info', "Move successful");
+		return true;
+	} else {
+		log('error', "Failed to move " + src_path + " to " + dest_path + " (code: " + ret + ")");
+		return false;
+	}
+}
+
+function get_available_space_kb(target_dir) {
+	if (!target_dir) {
+		return -1;
+	}
+
+	// statvfs cannot be used to obtain filesystem size information
+	// the df command shall be used instead.
+	let cmd = "df -k '" + target_dir + "' 2>/dev/null | tail -1 | awk '{print $4}'";
+	let proc = fs.popen(cmd, "r");
+	if (!proc) {
+		log('info', "Cannot determine available space, skipping check");
+		return -1;
+	}
+
+	let available_kb = -1;
+	try {
+		let line = proc.read("line");
+		if (line) {
+			available_kb = +trim(line);
+		}
+		proc.close();
+	} catch (e) {
+		log('error', "Failed to read df output: " + e);
+		try {
+			proc.close();
+		} catch (e2) {}
+	}
+
+	return available_kb > 0 ? available_kb : -1;
+}
+
+function do_backup() {
+	let ctx = uci.cursor();
+	let pkg = ctx.get_all(UCI_CONFIG_FILE);
+	if (!pkg) {
+		log('error', "Failed to load UCI config: " + UCI_CONFIG_FILE);
+		return;
+	}
+
+	let global = pkg.global;
+	if (!global) {
+		log('error', "UCI section 'global' not found in " + UCI_CONFIG_FILE);
+		return;
+	}
+
+	if (global.enabled === '0') {
+		log('info', 'log-helper disabled, skipping backup');
+		return;
+	}
+
+	let file_list = [];
+	let cfg_files = global.file_list;
+	if (type(cfg_files) === "string") {
+		cfg_files = [cfg_files];
+	}
+
+	if (type(cfg_files) === "array") {
+		let i = 0;
+		while (i < length(cfg_files)) {
+			let f = cfg_files[i];
+			if (file_exists(f)) {
+				let rel = f;
+				if (substr(f, 0, 1) === "/") {
+					rel = substr(f, 1);
+				} else {
+					rel = f;
+				}
+				push(file_list, rel);
+			} else {
+				log('warn', "Backup source file not found: " + f);
+			}
+			i++;
+		}
+	}
+
+	if (length(file_list) === 0) {
+		log('info', "No backup source files exist, nothing to do");
+		return;
+	}
+
+	log('info', "Found " + length(file_list) + " file(s) to backup");
+
+	let backup_dir = global.backup_dir || DEFAULT_BACKUP_DIR;
+	if (substr(backup_dir, 0, 1) !== "/") {
+		backup_dir = "/" + backup_dir;
+	}
+	if (!fs.stat(backup_dir)) {
+		fs.mkdir(backup_dir, 0755);
+		if (fs.chmod(backup_dir, 0755) !== true) {
+			log('error', "Failed to set permissions on backup directory: " + backup_dir);
+		}
+	}
+
+	let backup_file_name = global.backup_file || DEFAULT_BACKUP_FILE;
+	let backup_file = backup_dir + "/" + backup_file_name;
+	let tmp_file = "/tmp/" + backup_file_name;
+
+	let tar_files = "";
+	for (let i = 0; i < length(file_list); i++) {
+		tar_files += " '" + file_list[i] + "'";
+	}
+	let cmd = "tar -C / -czf '" + tmp_file + "'" + tar_files;
+	log('info', "Creating backup archive");
+	let proc = fs.popen(cmd, "r");
+	if (!proc) {
+		log('error', "Failed to start tar command");
+		return;
+	}
+	let ret = proc.close();
+	if (ret !== 0) {
+		log('error', "Tar command failed with code: " + ret);
+		return;
+	}
+
+	let available_kb = get_available_space_kb(backup_dir);
+	let space_threshold = global.space_threshold ? +global.space_threshold : DEFAULT_SPACE_THRESH;
+	
+	let file_stat = fs.stat(tmp_file);
+	if (!file_stat) {
+		log('error', "Failed to stat backup file: " + tmp_file);
+		return;
+	}
+	
+	let file_kb = file_stat.size / 1024;
+	if (available_kb > 0 && available_kb < (file_kb + space_threshold)) {
+		log('error', "Insufficient space. Available: " + available_kb + "KB, Required: " + (file_kb + space_threshold) + "KB");
+		fs.unlink(tmp_file);
+		return;
+	} else if (available_kb < 0) {
+		log('warn', "Space check unavailable, proceeding anyway (backup size: " + file_kb + "KB)");
+	} else {
+		log('info', "Space check passed (available: " + available_kb + "KB, needed: " + (file_kb + space_threshold) + "KB)");
+	}
+
+	let max_rotations = global.max_rotations ? +global.max_rotations : DEFAULT_MAX_ROTATIONS;
+	if (max_rotations > 1 && file_exists(backup_file)) {
+		log('info', "Rotating backup files (keeping " + max_rotations + " versions)");
+		rotate_logs(backup_file, max_rotations);
+	}
+
+	if (move_file(tmp_file, backup_dir)) {
+		log('info', "Successfully backed up to " + backup_file);
+		log('info', "Backup file exists: " + !!fs.stat(backup_file));
+	} else {
+		log('error', "Failed to move file to backup directory");
+	}
+}
 
 function move_to_json(src, dst) {
 	if (!fs.stat(src))
@@ -23,6 +251,13 @@ function move_to_json(src, dst) {
 	msg[fs.basename(dst)] = lines;
 	fd.write(msg);
 	fd.close();
+}
+
+// Backup is performed only when log-helper is enabled (value = 1).
+let ctx = uci.cursor();
+let pkg = ctx.get_all(UCI_CONFIG_FILE);
+if (pkg && pkg.global && pkg.global.enabled === '1') {
+	do_backup();
 }
 
 move_to_json('/sys/fs/pstore/dmesg-ramoops-0', '/tmp/crashlog');
