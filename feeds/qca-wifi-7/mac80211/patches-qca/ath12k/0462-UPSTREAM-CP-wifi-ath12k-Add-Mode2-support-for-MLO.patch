@@ -1,0 +1,489 @@
+From 6a6833858d4e107b49daddcfc9a4f2dd77609340 Mon Sep 17 00:00:00 2001
+From: Kannan Saravanan <kannsara@qti.qualcomm.com>
+Date: Wed, 23 Jul 2025 15:44:44 +0530
+Subject: [PATCH 6/6] UPSTREAM:CP: wifi:ath12k: Add Mode2 recovery support for
+ MLO
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In the Mode 2 recovery design, the system is configured to support
+the MLD station during SSR recovery of the affected radio.
+
++-------------+--------------------------------------------------------------+
+| Recovery    | Behavior                                                     |
+| Mode        |                                                              |
++-------------+--------------------------------------------------------------+
+| Mode 1      | - Recover only the affected radio.                           |
+|             | - Active radio will serve only the legacy stations.          |
+|             | - MLD stations will be disconnected during recovery.         |
++-------------+--------------------------------------------------------------+
+| Mode 2      | - Recover only the affected radio.                           |
+|             | - Active radio will serve both legacy and MLD stations.      |
+|             | - Crashed radio will send disassoc to MLD stations during    |
+|             |   recovery.                                                  |
++-------------+--------------------------------------------------------------+
+
+The firmware is checked to determine whether it supports MLO peer
+recovery using the service bitmap. Based on this capability,
+SSR is toggled between Mode 1 and Mode 2.
+
+If Mode 2 is enabled on the host, all MLO peers and legacy peers from
+partner SoCs—are retained during the recovery of the asserted SoC.
+The current design ensures that MLD peer cleanup on partner SoCs is prevented.
+
+This follows same mode1 existing implementation, so the hardware queue is
+restarted, traffic flow resumes for SoCs that were not affected after umac
+reset. After recovery, key addition on partner SoCs is blocked,
+since cleanup was not performed for those unaffected SoCs.
+Disassociation messages are sent only for the MLD peers that were
+connected to the crashed radio.
+
+Signed-off-by: Gautham Kumar Senthilkumaran <gauthamk@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c    | 64 ++++++++++++++++-------
+ drivers/net/wireless/ath/ath12k/core.h    |  4 +-
+ drivers/net/wireless/ath/ath12k/debugfs.c | 28 +++++++---
+ drivers/net/wireless/ath/ath12k/dp_rx.c   |  2 +-
+ drivers/net/wireless/ath/ath12k/mac.c     | 48 ++++++++++++++---
+ drivers/net/wireless/ath/ath12k/wmi.c     |  9 +++-
+ drivers/net/wireless/ath/ath12k/wmi.h     |  2 +
+ 7 files changed, 120 insertions(+), 37 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1671,7 +1671,7 @@ core_pdev_create:
+ 
+ 		mutex_lock(&ab->core_lock);
+ 
+-		if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1 && !ab->recovery_start) {
++		if (ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE0 && !ab->recovery_start) {
+ 			mutex_unlock(&ab->core_lock);
+ 			continue;
+ 		}
+@@ -2300,7 +2300,8 @@ static void ath12k_core_pre_reconfigure_
+ 			if (ar->ab->is_bypassed)
+ 				continue;
+ 
+-			if(ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1 && !ar->ab->is_reset)
++			if (ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE0 &&
++			    !ar->ab->is_reset)
+ 				continue;
+ 
+ 			list_for_each_entry(arvif, &ar->arvifs, list) {
+@@ -2372,7 +2373,8 @@ static void ath12k_core_post_reconfigure
+ 				if (ar->ab->is_bypassed)
+ 					continue;
+ 
+-				if(ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1 && !ar->ab->is_reset)
++				if (ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE0 &&
++				    !ar->ab->is_reset)
+ 					continue;
+ 
+ 				if (ar->scan.state == ATH12K_SCAN_RUNNING ||
+@@ -2390,7 +2392,8 @@ static void ath12k_core_post_reconfigure
+ 			 * for all the radios through
+ 			 * ath12k_mac_peer_cleannup_all()
+ 			 */
+-			ath12k_mac_dp_peer_cleanup(ah, ag->recovery_mode);
++			if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1)
++				ath12k_mac_dp_peer_cleanup(ah, ag->recovery_mode);
+ 
+ 			break;
+ 		case ATH12K_HW_STATE_OFF:
+@@ -2502,7 +2505,7 @@ static void ath12k_core_restart(struct w
+ 			goto exit_restart;
+ 		}
+ 
+-		if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1) {
++		if (ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE0) {
+ 			queue_work(ab->workqueue_aux, &ab->recovery_work);
+ 			mutex_unlock(&ag->mutex);
+ 			goto exit_restart;
+@@ -2722,6 +2725,9 @@ static void ath12k_core_mlo_recover_stat
+ 	struct ath12k *ar;
+ 	int i, j;
+ 
++	if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE2)
++		return;
++
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+ 
+@@ -3049,6 +3055,11 @@ static void ath12k_core_peer_disassoc(st
+ 		if (ab->is_bypassed)
+ 			continue;
+ 
++		if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE2) {
++			if (ab != assert_ab)
++				continue;
++		}
++
+ 		spin_lock_bh(&ab->dp->dp_lock);
+ 		list_for_each_entry_safe(peer, tmp, &ab->dp->peers, list) {
+ 			if (!peer->sta || !peer->vif)
+@@ -3075,8 +3086,13 @@ static void ath12k_core_peer_disassoc(st
+ 	}
+ }
+ 
+-/* Wrapper function for recovery after crash */
+-int ath12k_mode1_recovery_reconfig(struct ath12k_base *ab)
++/* Wrapper function for recovery after crash
++ * This recovery function will be called for
++ * both Mode 1 and Mode 2. Because both Mode
++ * will recover only the crashed radio
++ * without affecting the other active radio
++ */
++int ath12k_recovery_reconfig(struct ath12k_base *ab)
+ {
+ 	struct ath12k *ar = NULL;
+ 	struct ath12k_pdev *pdev;
+@@ -3241,6 +3257,9 @@ skip_link_info:
+ 		if (partner_ab->is_bypassed)
+ 			continue;
+ 
++		if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE2)
++			continue;
++
+ 		for (j = 0; j < partner_ab->num_radios; j++) {
+ 			pdev = &partner_ab->pdevs[j];
+ 			ar = pdev->ar;
+@@ -3257,9 +3276,8 @@ skip_link_info:
+ 				if (!ahvif)
+ 					continue;
+ 
+-				if (ahvif->vdev_type != WMI_VDEV_TYPE_STA) {
++				if (ahvif->vdev_type != WMI_VDEV_TYPE_STA)
+ 					ath12k_core_iterate_sta_list(ar, arvif);
+-				}
+ 
+ 				if (ath12k_mac_is_bridge_vdev(arvif))
+ 					continue;
+@@ -3268,10 +3286,10 @@ skip_link_info:
+ 				spin_lock_bh(&dp->dp_lock);
+ 				peer = ath12k_dp_link_peer_find_by_vdev_id_and_addr(dp, arvif->vdev_id, arvif->bssid);
+ 				if (!peer) {
+-					ath12k_info(ab,"Failed to fetch the peer during reconfig\n");
++					ath12k_info(ab, "Failed to fetch the peer during reconfig\n");
+ 					spin_unlock_bh(&dp->dp_lock);
+ 					continue;
+-        			}
++				}
+ 				spin_unlock_bh(&dp->dp_lock);
+ 
+ 				for (key_idx = 0; key_idx < WMI_MAX_KEY_INDEX; key_idx++) {
+@@ -3303,15 +3321,17 @@ skip_link_info:
+ 	return ret;
+ }
+ 
+-
+-static void ath12k_core_mode1_recovery_work(struct work_struct *work)
++/* this recovery work is called for both
++ * mode 1 and mode 2 during the recovery.
++ */
++static void ath12k_core_recovery_work(struct work_struct *work)
+ {
+ 	struct ath12k_base *ab = container_of(work, struct ath12k_base, recovery_work);
+ 	if (ab->is_bypassed)
+ 		return;
+ 
+ 	ath12k_info(ab, "queued recovery work\n");
+-	ath12k_mode1_recovery_reconfig(ab);
++	ath12k_recovery_reconfig(ab);
+ }
+ 
+ static void ath12k_core_trigger_bug_on(struct ath12k_base *ab)
+@@ -3498,6 +3518,9 @@ static void ath12k_core_reset(struct wor
+ 
+ 	if (ab->recovery_mode_address) {
+ 		switch (*ab->recovery_mode_address) {
++		case ATH12K_MLO_RECOVERY_MODE2:
++			ag->recovery_mode = ATH12K_MLO_RECOVERY_MODE2;
++			break;
+ 		case ATH12K_MLO_RECOVERY_MODE1:
+ 			ag->recovery_mode = ATH12K_MLO_RECOVERY_MODE1;
+ 			break;
+@@ -3516,8 +3539,8 @@ static void ath12k_core_reset(struct wor
+ 		ag->recovery_mode = ATH12K_MLO_RECOVERY_MODE0;
+ 
+ 	if (ab->fw_recovery_support)
+-		ath12k_info(ab, "Recovery is initiated with Mode%s\n",
+-				(ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE0 ? "0" : "1"));
++		ath12k_info(ab, "Recovery is initiated with Mode%d\n",
++				ag->recovery_mode - 1);
+ 
+ 	/* Sometimes the recovery will fail and then the next all recovery fail,
+ 	 * this is to avoid infinite recovery since it can not recovery success
+@@ -3581,7 +3604,7 @@ static void ath12k_core_reset(struct wor
+ 		 * as Mode0, if continuous reset has happened
+ 		 */
+ 
+-		if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1) {
++		if (ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE0) {
+ 			if (test_bit(ATH12K_FLAG_UMAC_RECOVERY_START, &partner_ab->dev_flags) ||
+ 			    test_bit(ATH12K_FLAG_RECOVERY, &partner_ab->dev_flags)) {
+ 				/* On receiving MHI Interrupt for pdev which is
+@@ -3608,7 +3631,7 @@ static void ath12k_core_reset(struct wor
+ 	 */
+ 	ath12k_core_to_group_ref_put(ab);
+ 
+-	if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1) {
++	if (ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE0) {
+ 		if (ath12k_core_trigger_umac_reset(ab, WMI_MLO_TEARDOWN_SSR_REASON) ||
+ 		    ath12k_mac_partner_peer_cleanup(ab)) {
+ 			/* Fallback to Mode0 if umac reset/peer_cleanup is
+@@ -3621,6 +3644,7 @@ static void ath12k_core_reset(struct wor
+ 			/* wake queues here as ping should continue for
+ 			 * legacy clients in non-asserted chipsets
+ 			 */
++			ath12k_core_peer_disassoc(ag, ab);
+ 			for (i = 0; i < ag->num_hw; i++) {
+ 				ah = ag->ah[i];
+ 				if (!ah)
+@@ -3669,7 +3693,7 @@ static void ath12k_core_reset(struct wor
+ 	ab->qmi.num_radios = U8_MAX;
+ 	//ab->single_chip_mlo_supp = false; TODO need to revisit
+ 
+-	if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1)
++	if (ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE0)
+ 		ab->recovery_start = true;
+ 
+ 	ab->recovery_mode_address = NULL;
+@@ -4825,7 +4849,7 @@ struct ath12k_base *ath12k_core_alloc(st
+ 	init_waitqueue_head(&ab->qmi.cold_boot_waitq);
+ 	INIT_WORK(&ab->restart_work, ath12k_core_restart);
+ 	INIT_WORK(&ab->reset_work, ath12k_core_reset);
+-	INIT_WORK(&ab->recovery_work, ath12k_core_mode1_recovery_work);
++	INIT_WORK(&ab->recovery_work, ath12k_core_recovery_work);
+ 	INIT_WORK(&ab->rfkill_work, ath12k_rfkill_work);
+ 	INIT_WORK(&ab->dump_work, ath12k_coredump_upload);
+ 	INIT_WORK(&ab->update_11d_work, ath12k_update_11d);
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -403,6 +403,7 @@ enum ath12k_dev_flags {
+ enum ath12k_mlo_recovery_mode {
+ 	ATH12K_MLO_RECOVERY_MODE0 = 1,
+ 	ATH12K_MLO_RECOVERY_MODE1 = 2,
++	ATH12K_MLO_RECOVERY_MODE2 = 3,
+ };
+ 
+ #define ATH12K_STATS_MGMT_FRM_TYPE_MAX 16
+@@ -989,7 +990,8 @@ struct ath12k_debug {
+ enum ath12k_fw_recovery_option {
+ 	 ATH12K_FW_RECOVERY_DISABLE = 0,
+ 	 ATH12K_FW_RECOVERY_ENABLE_AUTO, /* Automatically recover after FW assert */
+-	 ATH12K_FW_RECOVERY_ENABLE_MODE1_AUTO,
++	 ATH12K_FW_RECOVERY_ENABLE_MODE1,
++	 ATH12K_FW_RECOVERY_ENABLE_MODE2,
+ 	 /* Enable only recovery. Send MPD SSR WMI */
+ 	 /* command to unlink UserPD assert from RootPD */
+ };
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -5509,12 +5509,26 @@ void ath12k_send_fw_hang_cmd(struct ath1
+ 	int ret, radio_idx, radioup = 0;
+ 	int i;
+ 
+-	if (!value)
+-		recovery_mode = ATH12K_WMI_DISABLE_FW_RECOVERY;
+-	else
+-		recovery_mode = (value == ATH12K_FW_RECOVERY_ENABLE_MODE1_AUTO) ?
+-			ATH12K_WMI_FW_HANG_RECOVERY_MODE1 : ATH12K_WMI_FW_HANG_RECOVERY_MODE0;
+ 
++	switch (value) {
++	case ATH12K_FW_RECOVERY_ENABLE_MODE2:
++		if (test_bit(WMI_SERVICE_MLO_MODE2_RECOVERY_SUPPORTED, ab->wmi_ab.svc_map)) {
++			recovery_mode = ATH12K_WMI_FW_HANG_RECOVERY_MODE2;
++		} else {
++			ath12k_info(ab, "FW does not support Mode 2 fallback to Mode 1 recovery");
++			recovery_mode = ATH12K_WMI_FW_HANG_RECOVERY_MODE1;
++		}
++		break;
++	case ATH12K_FW_RECOVERY_ENABLE_MODE1:
++		recovery_mode = ATH12K_WMI_FW_HANG_RECOVERY_MODE1;
++		break;
++	case ATH12K_FW_RECOVERY_ENABLE_AUTO:
++		recovery_mode = ATH12K_WMI_FW_HANG_RECOVERY_MODE0;
++		break;
++	default:
++		recovery_mode = ATH12K_WMI_DISABLE_FW_RECOVERY;
++		break;
++	}
+ 	if (ag->mlo_capable) {
+ 		for (i = 0; i < ag->num_devices; i++) {
+ 			ab = ag->ab[i];
+@@ -5570,8 +5584,8 @@ static ssize_t ath12k_debug_write_fw_rec
+ 		return -EINVAL;
+ 
+ 	if (value < ATH12K_FW_RECOVERY_DISABLE ||
+-	    value > ATH12K_FW_RECOVERY_ENABLE_MODE1_AUTO) {
+-		ath12k_warn(ab, "Please enter: 0 = Disable, 1 = Mode - 0 recovery 2 = Mode - 1 recovery\n");
++	    value > ATH12K_FW_RECOVERY_ENABLE_MODE2) {
++		ath12k_warn(ab, "Please enter: 0 = Disable, 1 = Mode - 0 recovery 2 = Mode - 1 recovery 3 = Mode - 2 recovery\n");
+ 		ret = -EINVAL;
+ 		goto exit;
+ 	}
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -1490,7 +1490,7 @@ void ath12k_dp_tid_setup(void *data, str
+         u8 link_id;
+ 	unsigned long links_map;
+ 
+-        if (sta->mlo)
++	if (sta->mlo && ab->ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE2)
+                 return;
+ 
+ 	links_map = ahsta->links_map;
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -1317,6 +1317,9 @@ int ath12k_mac_partner_peer_cleanup(stru
+ 	int idx, ret = 0;
+ 	u8 link_id;
+ 
++	if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE2)
++		return ret;
++
+ 	wiphy_lock(wiphy);
+ 
+ 	for (idx = 0; idx < ag->num_devices; idx++) {
+@@ -4744,7 +4747,7 @@ void ath12k_bss_assoc(struct ath12k *ar,
+ 		params.tx_bssid = bss_conf->transmitter_bssid;
+ 	}
+ 
+-	if (ar->ab->ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1 &&
++	if (ar->ab->ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE0 &&
+ 	    !ar->ab->is_reset)
+ 	    /* Skip sending vdev up for non-asserted links while
+ 	     * recovering station vif type
+@@ -8586,6 +8589,7 @@ static int ath12k_mac_set_6g_nonht_dup_c
+ 		           ahvif->vif->addr, arvif->vdev_id, param_id, value);
+ 		ret = ath12k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id, param_id, value);
+ 	}
++
+ 	return ret;
+ }
+ 
+@@ -10864,13 +10868,17 @@ static int ath12k_mac_handle_link_sta_st
+ 
+ 	lockdep_assert_wiphy(hw->wiphy);
+ 
+-	if (unlikely(test_bit(ATH12K_FLAG_CRASH_FLUSH, &ar->ab->dev_flags)))
++	if (unlikely(test_bit(ATH12K_FLAG_CRASH_FLUSH, &ar->ab->dev_flags)) &&
++	    ar->ab->ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE2)
+ 		return -ESHUTDOWN;
+ 
+ 	/* Shouldn't allow MLO STA assoc until UMAC_RECOVERY bit is cleared */
+ 
+-	if (sta->mlo && test_bit(ATH12K_FLAG_UMAC_RECOVERY_START, &ar->ab->dev_flags))
+-		return 0;
++	if (sta->mlo && test_bit(ATH12K_FLAG_UMAC_RECOVERY_START, &ar->ab->dev_flags)) {
++		if (old_state == IEEE80211_STA_NOTEXIST &&
++		    new_state == IEEE80211_STA_NONE)
++			return 0;
++	}
+ 
+ 	ath12k_dbg(ar->ab, ATH12K_DBG_PEER, "mac handle link %u sta %pM state %d -> %d\n",
+ 		   arsta->link_id, arsta->addr, old_state, new_state);
+@@ -13816,6 +13824,10 @@ u8 ath12k_mac_get_tx_link(struct ieee802
+ 	struct ieee80211_link_sta *link_sta;
+ 	struct ieee80211_bss_conf *bss_conf;
+ 	struct ath12k_sta *ahsta;
++	struct ath12k_link_sta *arsta;
++	u8 link_id;
++	unsigned long links;
++	struct ath12k_base *ab;
+ 
+ 	/* Use the link id passed or the default vif link */
+ 	if (!sta) {
+@@ -13861,6 +13873,30 @@ u8 ath12k_mac_get_tx_link(struct ieee802
+ 	if (!ieee80211_is_mgmt(hdr->frame_control))
+ 		return link;
+ 
++	if (ahsta->deflink.arvif->ar)
++		ab = ahsta->deflink.arvif->ar->ab;
++
++	if (test_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags) &&
++	    ab->ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE2) {
++		/* If disassoc frame comes in crash link, need to
++		 * change the link which is active at that instance.
++		 */
++		if (ieee80211_is_disassoc(hdr->frame_control)) {
++			link = ahsta->deflink.link_id;
++			links = ahsta->links_map;
++			for_each_set_bit(link_id, &links, ATH12K_NUM_MAX_LINKS) {
++				arsta = rcu_dereference(ahsta->link[link_id]);
++				if (!arsta)
++					continue;
++				ab = arsta->arvif->ar->ab;
++				if (!test_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags)) {
++					link = arsta->link_id;
++					ATH12K_SKB_CB(skb)->flags |= ATH12K_SKB_MGMT_LINK_AGNOSTIC;
++					break;
++				}
++			}
++		}
++	}
+ 	/* Perform address conversion for ML STA Tx */
+ 	bss_conf = rcu_dereference(vif->link_conf[link]);
+ 	link_sta = rcu_dereference(sta->link[link]);
+@@ -14098,7 +14134,7 @@ static void ath12k_drain_tx(struct ath12
+ 	lockdep_assert_wiphy(ah->hw->wiphy);
+ 
+ 	for_each_ar(ah, ar, i) {
+-		if (ar->ab->ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE1 || ar->ab->is_reset)
++		if (ar->ab->ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE0 || ar->ab->is_reset)
+ 			ath12k_mac_drain_tx(ar);
+ 	}
+ }
+@@ -14151,7 +14187,7 @@ int ath12k_mac_op_start(struct ieee80211
+ 		if (ar->ab->is_bypassed)
+ 			continue;
+ 
+-		if (ar->ab->ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE1 || ar->ab->is_reset) {
++		if (ar->ab->ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE0 || ar->ab->is_reset) {
+ 			ret = ath12k_mac_start(ar);
+ 			if (ret) {
+ 				ah->state = ATH12K_HW_STATE_OFF;
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -1045,7 +1045,12 @@ int ath12k_wmi_mgmt_send(struct ath12k *
+ 	ml_params->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_MLO_TX_SEND_PARAMS) |
+ 				FIELD_PREP(WMI_TLV_LEN, sizeof(*ml_params) - TLV_HDR_SIZE);
+ 
+-	ml_params->hw_link_id = WMI_MLO_MGMT_TID;
++	if (ath12k_hw_group_recovery_in_progress(ar->ab->ag) &&
++	    ar->ab->ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE2) {
++		ml_params->hw_link_id = ar->pdev->hw_link_id;
++	} else {
++		ml_params->hw_link_id = WMI_MLO_MGMT_TID;
++	}
+ 
+ 	if (tx_params_valid) {
+ 		params = (struct wmi_mgmt_send_params *)(skb->data + (len - sizeof(*params)));
+@@ -12458,7 +12463,7 @@ static void ath12k_wmi_event_teardown_co
+ 		}
+ 	}
+ 	if (complete_flag &&
+-	    (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1 || ag->wsi_remap_in_progress))
++	    (ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE0 || ag->wsi_remap_in_progress))
+                 complete(&ag->umac_reset_complete);
+ 
+ }
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -2561,6 +2561,7 @@ enum wmi_tlv_service {
+ 	WMI_TLV_SERVICE_PDEV_PARAM_IN_UTF_WMI = 394,
+ 	WMI_TLV_SERVICE_SW_PROG_DFS_SUPPORT = 395,
+ 	WMI_TLV_SERVICE_DYNAMIC_WSI_REMAP_SUPPORT = 403,
++	WMI_SERVICE_MLO_MODE2_RECOVERY_SUPPORTED = 406,
+ 	WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION = 410,
+ 	WMI_SERVICE_WDS_NULL_FRAME_SUPPORT = 421,
+ 	WMI_SERVICE_MEC_AGING_TIMER_SUPPORT = 423,
+@@ -4218,6 +4219,7 @@ enum wmi_fw_hang_recovery_mode_type {
+ 	ATH12K_WMI_DISABLE_FW_RECOVERY = 200,
+ 	ATH12K_WMI_FW_HANG_RECOVERY_MODE0,
+ 	ATH12K_WMI_FW_HANG_RECOVERY_MODE1,
++	ATH12K_WMI_FW_HANG_RECOVERY_MODE2,
+ };
+ 
+ /* type, 0:unused 1: ASSERT 2: not respond detect command

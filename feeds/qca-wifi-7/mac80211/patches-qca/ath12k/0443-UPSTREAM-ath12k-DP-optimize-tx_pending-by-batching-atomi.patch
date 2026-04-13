@@ -1,0 +1,105 @@
+From f56bdebb6d9c25a4a16e22a121504c785542206e Mon Sep 17 00:00:00 2001
+From: Thiraviyam Mariyappan <tmariyap@qti.qualcomm.com>
+Date: Tue, 22 Jul 2025 18:21:16 +0530
+Subject: [PATCH 2/2] UPSTREAM:ath12k:DP: optimize tx_pending by batching
+ atomic decrement
+
+Currently, the driver performs an atomic decrement on num_tx_pending
+for every completed packet, which incurs significant CPU overhead
+and causes cache line contention due to frequent atomic operations.
+
+This patch replaces the per-packet atomic_sub_and_test() with a
+single batched atomic_sub_return() per completion. This reduces
+the number of atomic operations and improves performance by
+minimizing cache misses.
+
+Patch dependency: none
+
+Signed-off-by: Thiraviyam Mariyappan <tmariyap@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c | 31 +++++++++++--------
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h |  1 +
+ 2 files changed, 19 insertions(+), 13 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -800,9 +800,6 @@ static void ath12k_wifi7_dp_tx_free_txbu
+ 		return;
+ 	}
+ 
+-	if (atomic_dec_and_test(&dp_pdev->num_tx_pending))
+-		wake_up(&dp_pdev->tx_empty_waitq);
+-
+ 	if (sw_metadata->flags & DP_TX_DESC_FLAG_FAST)
+ 		dev_kfree_skb_any(msdu);
+ 	else
+@@ -851,9 +848,6 @@ ath12k_wifi7_dp_tx_htt_tx_complete_buf(s
+ 		return;
+ 	}
+ 
+-	if (atomic_dec_and_test(&dp_pdev->num_tx_pending))
+-		wake_up(&dp_pdev->tx_empty_waitq);
+-
+ 	if (sw_metadata->flags & DP_TX_DESC_FLAG_FAST) {
+ 		dev_kfree_skb_any(msdu);
+ 		rcu_read_unlock();
+@@ -965,10 +959,6 @@ ath12k_wifi7_dp_tx_process_htt_tx_comple
+ 	}
+ 
+ 	if (sw_metadata->flags & DP_TX_DESC_FLAG_FAST) {
+-
+-		if (atomic_dec_and_test(&dp_pdev->num_tx_pending))
+-			wake_up(&dp_pdev->tx_empty_waitq);
+-
+ 		dev_kfree_skb_any(msdu);
+ 		rcu_read_unlock();
+ 		return;
+@@ -1433,6 +1423,8 @@ int ath12k_wifi7_dp_tx_completion_handle
+ #endif
+ 	int orig_budget = budget;
+ 	bool fast_flag;
++	int pdev_tx_comp_cnt[MAX_RADIOS] = {0};
++	u8 mac_id = 0;
+ 
+ 	ath12k_hal_srng_access_dst_ring_begin_nolock(ab, status_ring);
+ 
+@@ -1521,6 +1513,7 @@ int ath12k_wifi7_dp_tx_completion_handle
+ 		sw_metadata->ext_desc_len = tx_desc->ext_desc_len;
+ 		sw_metadata->flags = tx_desc->flags;
+ 		sw_metadata->mac_id = tx_desc->mac_id;
++		pdev_tx_comp_cnt[sw_metadata->mac_id]++;
+ 
+ 		tx_desc->skb = NULL;
+ 		tx_desc->skb_ext_desc = NULL;
+@@ -1533,6 +1526,21 @@ int ath12k_wifi7_dp_tx_completion_handle
+ 
+ 	spin_unlock_bh(&dp->tx_desc_lock[ring_id]);
+ 
++	for (mac_id = 0; mac_id < MAX_RADIOS; mac_id++) {
++		if (likely(pdev_tx_comp_cnt[mac_id])) {
++			pdev_id = ath12k_hw_mac_id_to_pdev_id(dp->hw_params, mac_id);
++			rcu_read_lock();
++			dp_pdev = ath12k_dp_to_dp_pdev(dp, pdev_id);
++			rcu_read_unlock();
++
++			if (unlikely(!dp_pdev))
++				continue;
++
++			if (atomic_sub_and_test(pdev_tx_comp_cnt[mac_id], &dp_pdev->num_tx_pending))
++				wake_up(&dp_pdev->tx_empty_waitq);
++		}
++	}
++
+ 	tx_status_entry = (struct ath12k_wifi7_tx_status_entry *)dp_hw_grp->tx_status_buf[tx_status_idx];
+ 	while (n_entry--) {
+ 		fast_flag = false;
+@@ -1580,9 +1588,6 @@ int ath12k_wifi7_dp_tx_completion_handle
+ 			continue;
+ 		}
+ 
+-		if (atomic_dec_and_test(&dp_pdev->num_tx_pending))
+-			wake_up(&dp_pdev->tx_empty_waitq);
+-
+ 		if (!fast_flag && sw_metadata->skb) {
+ 			ath12k_wifi7_dp_tx_status_parse(ab, tx_status, &ts);
+ 

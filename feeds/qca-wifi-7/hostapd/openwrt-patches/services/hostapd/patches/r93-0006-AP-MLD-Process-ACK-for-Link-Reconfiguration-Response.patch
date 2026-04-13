@@ -1,0 +1,311 @@
+From ae382fa6e8afa03f50db54eaded9931062ae0e5b Mon Sep 17 00:00:00 2001
+From: Pooventhiran G <pooventh@qti.qualcomm.com>
+Date: Tue, 8 Jul 2025 12:22:22 +0530
+Subject: [PATCH 06/13] AP MLD: Process ACK for Link Reconfiguration Response
+ frame
+
+When a Link Reconfiguration Response frame is ACK-ed, the AP MLD can
+complete reconfiguration operations. Process the accepted del-link
+requests, and if the link that is removed is the association link,
+assign a new (soft) association link to maintain ML setup and APIs.
+
+Reviewed-by: Rohan Dutta <drohan@qti.qualcomm.com>
+Signed-off-by: Pooventhiran G <pooventh@qti.qualcomm.com>
+---
+ src/ap/drv_callbacks.c  |   5 +-
+ src/ap/hostapd.h        |   4 +
+ src/ap/ieee802_11.c     |  11 +++
+ src/ap/ieee802_11.h     |   4 +
+ src/ap/ieee802_11_eht.c | 171 ++++++++++++++++++++++++++++++++++++++++
+ src/ap/wpa_auth.c       |  10 +++
+ src/ap/wpa_auth.h       |   3 +
+ 7 files changed, 205 insertions(+), 3 deletions(-)
+
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 46e5311..1e788e1 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -978,9 +978,8 @@ static void hostapd_remove_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ 
+ 
+ #ifdef CONFIG_IEEE80211BE
+-static void hostapd_notif_disassoc_mld(struct hostapd_data *assoc_hapd,
+-				       struct sta_info *sta,
+-				       const u8 *addr)
++void hostapd_notif_disassoc_mld(struct hostapd_data *assoc_hapd,
++				struct sta_info *sta, const u8 *addr)
+ {
+ 	unsigned int link_id, i;
+ 	struct hostapd_data *tmp_hapd;
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 3543a66..cc93a6a 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -978,6 +978,10 @@ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
+ 			const u8 *req_ie, size_t req_ielen, const u8 *resp_ie,
+ 			size_t resp_ielen, const u8 *link_addr, int reassoc);
+ void hostapd_notif_disassoc(struct hostapd_data *hapd, const u8 *addr);
++#ifdef CONFIG_IEEE80211BE
++void hostapd_notif_disassoc_mld(struct hostapd_data *assoc_hapd,
++				struct sta_info *sta, const u8 *addr);
++#endif /* CONFIG_IEEE80211BE */
+ void hostapd_event_sta_low_ack(struct hostapd_data *hapd, const u8 *addr,
+ 			       const u32 num_packets);
+ void hostapd_event_connect_failed_reason(struct hostapd_data *hapd,
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 2003299..6ae1be1 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -7774,6 +7774,17 @@ static void handle_action_cb(struct hostapd_data *hapd,
+ 	if (mgmt->u.action.category == WLAN_ACTION_PROTECTED_EHT &&
+ 	    mgmt->u.action.u.ttlm_teardown.action == WLAN_PROT_EHT_T2L_MAPPING_TEARDOWN)
+ 		hostapd_ttlm_teardown_tx_status(hapd, sta, ok);
++
++	/* IEEE header (24B) + Category (1B) + Action code (1B) +
++	 * Dialog token (1B) + Count (1B) + Status list (count * 3B)
++	 */
++	if (len >= IEEE80211_HDRLEN + 3 + 1 + 3 &&
++	    mgmt->u.action.category == WLAN_ACTION_PROTECTED_EHT &&
++	    mgmt->u.action.u.link_reconf_resp.action ==
++	    WLAN_PROT_EHT_LINK_RECONFIG_RESPONSE) {
++		hostapd_link_reconf_resp_tx_status(hapd, sta, mgmt, len, ok);
++		return;
++	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ #ifndef CONFIG_NO_RRM
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index 0ee5234..84416ce 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -435,6 +435,10 @@ void ieee80211_ml_build_assoc_resp(struct hostapd_data *hapd,
+ void ieee802_11_rx_protected_eht_action(struct hostapd_data *hapd,
+ 					const struct ieee80211_mgmt *mgmt,
+ 					size_t len);
++void hostapd_link_reconf_resp_tx_status(struct hostapd_data *hapd,
++					struct sta_info *sta,
++					const struct ieee80211_mgmt *mgmt,
++					size_t len, int ok);
+ void hostapd_epcs_timeout_handler(void *eloop_ctx, void *timeout_ctx);
+ #endif /* CONFIG_IEEE80211BE */
+ u8 * hostapd_fragment_multi_link_element(struct wpabuf *buf, u8 *pos);
+diff --git a/src/ap/ieee802_11_eht.c b/src/ap/ieee802_11_eht.c
+index ddbe422..614f6b1 100644
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -1492,6 +1492,177 @@ void ml_deinit_link_reconf_req(struct link_reconf_req_list **req_list_ptr)
+ }
+ 
+ 
++void hostapd_link_reconf_resp_tx_status(struct hostapd_data *hapd,
++					struct sta_info *sta,
++					const struct ieee80211_mgmt *mgmt,
++					size_t len, int ok)
++{
++	u8 dialog_token = mgmt->u.action.u.link_reconf_resp.dialog_token;
++	struct hostapd_data *assoc_hapd, *lhapd, *other_hapd;
++	struct sta_info *assoc_sta, *lsta, *other_sta;
++	struct link_reconf_req_list *req_list;
++	struct link_reconf_req_info *info;
++	uint8_t link_id;
++
++	wpa_printf(MSG_INFO, "MLD: Link Reconf response tx dialog token=%u",
++		   dialog_token);
++
++	assoc_sta = hostapd_ml_get_assoc_sta(hapd, sta, &assoc_hapd);
++	if (!assoc_sta) {
++		wpa_printf(MSG_ERROR, "MLD: Assoc STA not found for " MACSTR,
++			   MAC2STR(mgmt->da));
++		return;
++	}
++
++	if (!assoc_sta->reconf_req) {
++		wpa_printf(MSG_DEBUG, "MLD: Unexpected Link Reconf Request");
++		return;
++	}
++
++	req_list = assoc_sta->reconf_req;
++
++	if (!ether_addr_equal(mgmt->da, req_list->sta_mld_addr)) {
++		wpa_printf(MSG_DEBUG, "MLD: Link Reconfiguration Response "
++			   "tx status from wrong STA");
++		return;
++	}
++
++	if (dialog_token != req_list->dialog_token) {
++		wpa_printf(MSG_DEBUG,
++			   "MLD: Link Reconfiguration session expired for %u",
++			   dialog_token);
++		return;
++	}
++
++	if (!ok) {
++		wpa_printf(MSG_INFO, "MLD: Link Reconf Response ack failed; "
++			   "revert link additions");
++
++		dl_list_for_each(info, &req_list->del_req,
++				 struct link_reconf_req_info, list) {
++			if (info->status != WLAN_STATUS_SUCCESS)
++				continue;
++
++			lhapd = NULL; lsta = NULL;
++			lhapd = hostapd_mld_get_link_bss(hapd, info->link_id);
++			if (lhapd)
++				lsta = ap_get_sta(lhapd,
++						  req_list->sta_mld_addr);
++
++			if (lsta)
++				ap_free_sta(lhapd, lsta);
++		}
++		goto exit;
++	}
++
++	if (!req_list->num_del_req)
++		goto exit;
++
++	dl_list_for_each(info, &req_list->del_req, struct link_reconf_req_info,
++			 list) {
++		if (info->status != WLAN_STATUS_SUCCESS)
++			continue;
++
++		link_id = info->link_id;
++		lhapd = hostapd_mld_get_link_bss(hapd, link_id);
++		if (!lhapd) {
++			wpa_printf(MSG_ERROR,
++				   "MLD: Link (%u) hapd cannot be NULL",
++				   link_id);
++			continue;
++		}
++
++		lsta = ap_get_sta(lhapd, mgmt->da);
++		if (!lsta) {
++			wpa_printf(MSG_ERROR,
++				   "MLD: Link (%u) STA cannot be NULL",
++				   link_id);
++			continue;
++		}
++
++		/* Reassign assoc_sta to the link with lowest link ID */
++		if (!hostapd_sta_is_link_sta(lhapd, lsta) &&
++		    lsta == assoc_sta) {
++			struct mld_info *mld_info = &assoc_sta->mld_info;
++			int i;
++
++			for (i = 0; i < MAX_NUM_MLD_LINKS; i++) {
++				if (i == assoc_sta->mld_assoc_link_id ||
++				    !mld_info->links[i].valid ||
++				    req_list->links_del_ok & BIT(i)) {
++					continue;
++				}
++				break;
++			}
++
++			if (i == MAX_NUM_MLD_LINKS) {
++				wpa_printf(MSG_DEBUG, "MLD: No new assoc sta "
++					   "could be found; disconnect STA");
++				hostapd_notif_disassoc_mld(assoc_hapd, sta,
++							   sta->addr);
++				goto exit;
++			}
++			wpa_printf(MSG_INFO, "MLD: New assoc link=%d", i);
++
++			/* Reset wpa_auth and assoc link ID */
++			for_each_mld_link(other_hapd, lhapd) {
++				other_sta = ap_get_sta(other_hapd, mgmt->da);
++				if (other_sta)
++					other_sta->mld_assoc_link_id = i;
++			}
++
++			/* Reset reconfig request queue which will be freed
++			 * at the end */
++			assoc_sta->reconf_req = NULL;
++
++			/* assoc_sta switched */
++			assoc_sta = hostapd_ml_get_assoc_sta(lhapd, lsta,
++							     &assoc_hapd);
++
++			/* assoc_sta cannot be NULL since both AP and STA are
++			 * MLD and new valid assoc_sta is already found */
++			if (!assoc_sta)
++				goto exit;
++
++			if (assoc_hapd == lhapd) {
++				wpa_printf(MSG_ERROR, "MLD: assoc_hapd is not "
++					   "updated; please check");
++				goto exit;
++			}
++
++			assoc_sta->reconf_req = req_list;
++			wpa_reset_assoc_sm_info(assoc_sta->wpa_sm,
++						assoc_hapd->wpa_auth, i);
++		}
++
++		/* free as a link STA */
++		ap_free_sta(lhapd, lsta);
++
++		for_each_mld_link(other_hapd, lhapd) {
++			struct mld_link_info *link;
++
++			other_sta = ap_get_sta(other_hapd, mgmt->da);
++			if (!other_sta)
++				continue;
++
++			link = &other_sta->mld_info.links[link_id];
++			os_free(link->resp_sta_profile);
++			link->resp_sta_profile = NULL;
++			link->resp_sta_profile_len = 0;
++			link->valid = false;
++		}
++		wpa_auth_set_ml_info(assoc_sta->wpa_sm,
++				     assoc_sta->mld_assoc_link_id,
++				     &assoc_sta->mld_info);
++	}
++
++exit:
++	ml_deinit_link_reconf_req(&req_list);
++	if (assoc_sta && assoc_sta->reconf_req)
++		assoc_sta->reconf_req = NULL;
++}
++
++
+ static bool recover_from_zero_links(u16 *links_del_ok, u8 *recovery_link)
+ {
+ 	u8 pos = 0;
+diff --git a/src/ap/wpa_auth.c b/src/ap/wpa_auth.c
+index 91c0761..c1a073d 100644
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -7980,6 +7980,16 @@ bool wpa_auth_sm_known_sta_identification(struct wpa_state_machine *sm,
+ }
+ 
+ 
++void wpa_reset_assoc_sm_info(struct wpa_state_machine *assoc_sm,
++			     struct wpa_authenticator *wpa_auth,
++			     u8 mld_assoc_link_id)
++{
++#ifdef CONFIG_IEEE80211BE
++	assoc_sm->wpa_auth = wpa_auth;
++	assoc_sm->mld_assoc_link_id = mld_assoc_link_id;
++#endif /* CONFIG_IEEE80211BE */
++}
++
+ void wpa_auth_reset_ml_link_info(struct wpa_state_machine *sm, u8 mld_assoc_link_id) {
+ #ifdef CONFIG_IEEE80211BE
+ 	struct mld_link *link;
+diff --git a/src/ap/wpa_auth.h b/src/ap/wpa_auth.h
+index 5d3ff55..2827fa5 100644
+--- a/src/ap/wpa_auth.h
++++ b/src/ap/wpa_auth.h
+@@ -710,6 +710,9 @@ int wpa_auth_reconfig_wpa_auth_sm(struct hostapd_data *rhapd,
+ size_t wpa_auth_ml_group_kdes_len(struct wpa_state_machine *sm, u16 req_links);
+ u8 *wpa_auth_ml_group_kdes(struct wpa_state_machine *sm, u8 *pos,
+ 			   u16 req_links);
++void wpa_reset_assoc_sm_info(struct wpa_state_machine *assoc_sm,
++			     struct wpa_authenticator *wpa_auth,
++			     u8 mld_assoc_link_id);
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ #define for_each_sm_auth(sm, link_id) \
+-- 
+2.34.1
+

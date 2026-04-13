@@ -1,0 +1,200 @@
+From e4e51029a4ff8c73408b79464b8096e5781eda27 Mon Sep 17 00:00:00 2001
+From: Harsh Kumar Bijlani <hbijlani@qti.qualcomm.com>
+Date: Wed, 30 Jul 2025 16:18:31 +0530
+Subject: [PATCH] UPSTREAM: DP: wifi: ath12k: Pre-allocate the memory for
+ monitor pdev
+
+Currently the back pointers setting in ath12k_pdev_dp and memory
+required for monitor pdev is done in API ath12k_dp_pdev_alloc.
+
+With the above sequence, there is crash seen in rmmod and insmod flow
+because the ieee80211 registraion of hw is done with mac80211 first and
+pdev allocation is done.
+
+With the registraion done first, mac80211 send hw start command which
+results in access of back pointers and monitor pdev in ath12k_pdev_dp
+which are not yet intialized.
+
+In order to fix this, do the back pointers setting and allocate the
+monitor pdev memory as part of API ath12k_dp_pdev_pre_alloc() which is
+called before ieee80211 hw registration.
+
+Also add a new flag member "dp_mon_pdev_configured" in structure
+ath12k_pdev_dp to check the configuration status of monitor pdev memory
+for allocation and free.
+
+Fixes: 092a210a7f631 ("UPSTREAM: DP: wifi: ath12k: Modularization of monitor objects in Unified Driver Framework")
+
+Patch dependency: 0113-0007-wifi-ath12k-Refactor-data-path-pdev-struct.patch
+0402-0004-UPSTREAM-DP-wifi-ath12k-Segregation-of-Monitor-pdev-.patch
+0402-0005-UPSTREAM-DP-wifi-ath12k-Refactor-monitor-pdev-ring-a.patch
+
+Signed-off-by: Harsh Kumar Bijlani <hbijlani@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c  | 78 ++++++++++++++++++++++-----
+ drivers/net/wireless/ath/ath12k/dp.h  |  3 +-
+ drivers/net/wireless/ath/ath12k/mac.c |  9 +++-
+ 3 files changed, 73 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp.c b/drivers/net/wireless/ath/ath12k/dp.c
+index 25e5cd1..f1c2b50 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -1092,22 +1092,68 @@ void ath12k_dp_pdev_free(struct ath12k_base *ab)
+ 
+ 	for (i = 0; i < ab->num_radios; i++) {
+ 		ar = ab->pdevs[i].ar;
+-		ath12k_dp_mon_pdev_rx_free(&ar->dp);
+ 		ath12k_fw_stats_free(&ar->fw_stats);
+-		ath12k_dp_mon_pdev_deinit(&ar->dp);
++
++		if (ar->dp.dp_mon_pdev_configured) {
++			ath12k_dp_mon_pdev_rx_free(&ar->dp);
++			ath12k_dp_mon_pdev_deinit(&ar->dp);
++
++			ar->dp.dp_mon_pdev_configured = false;
++		}
+ 	}
+ 
+ 	ath12k_dp_ppeds_stop(ab);
+ }
+ 
+-void ath12k_dp_pdev_pre_alloc(struct ath12k *ar)
++int ath12k_dp_pdev_pre_alloc(struct ath12k *ar)
+ {
++	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_pdev_dp *dp = &ar->dp;
++	int ret;
+ 
++	dp->hw = ar->ah->hw;
++	dp->dp = ath12k_ab_to_dp(ar->ab);
+ 	dp->mac_id = ar->pdev_idx;
++	dp->ar = ar;
++	dp->dp_hw = &ar->ah->dp_hw;
++	dp->hw_link_id = ar->hw_link_id;
++
+ 	atomic_set(&dp->num_tx_pending, 0);
+ 	init_waitqueue_head(&dp->tx_empty_waitq);
++
++	if (!dp->dp_mon_pdev_configured) {
++		ret = ath12k_dp_mon_pdev_init(dp);
++		if (ret) {
++			ath12k_warn(ab, "failed to initialize mon pdev for pdev with mac_id: %d\n", dp->mac_id);
++			return ret;
++		}
++
++		ret = ath12k_dp_mon_pdev_rx_alloc(dp, dp->mac_id);
++		if (ret) {
++			ath12k_warn(ab, "failed to alloc rx filter for pdev with mac_id: %d\n", dp->mac_id);
++			goto mon_pdev_deinit;
++		}
++
++		ret = ath12k_dp_mon_pdev_rx_htt_setup(dp, dp->mac_id);
++		if (ret) {
++			ath12k_warn(ab, "failed to setup rx htt for pdev with mac_id: %d\n", dp->mac_id);
++			goto mon_pdev_rx_free;
++		}
++
++		dp->dp_mon_pdev_configured = true;
++	}
++
+ 	/* TODO: Add any RXDMA setup required per pdev */
++
++	return 0;
++
++mon_pdev_rx_free:
++	ath12k_dp_mon_pdev_rx_free(dp);
++
++mon_pdev_deinit:
++	ath12k_dp_mon_pdev_deinit(dp);
++
++	return ret;
+ }
+ 
+ int ath12k_dp_pdev_alloc(struct ath12k_base *ab)
+@@ -1150,19 +1196,23 @@ int ath12k_dp_pdev_alloc(struct ath12k_base *ab)
+ 		dp_pdev->dp_hw = &ar->ah->dp_hw;
+ 		dp_pdev->hw_link_id = ar->hw_link_id;
+ 
+-		ret = ath12k_dp_mon_pdev_init(dp_pdev);
+-		if (ret) {
+-			ath12k_warn(ab, "failed to initialize mon pdev %d\n", i);
+-			goto err;
+-		}
++		if (!dp_pdev->dp_mon_pdev_configured) {
++			ret = ath12k_dp_mon_pdev_init(dp_pdev);
++			if (ret) {
++				ath12k_warn(ab, "failed to initialize mon pdev %d\n", i);
++				goto err;
++			}
+ 
+-		ret = ath12k_dp_mon_pdev_rx_alloc(dp_pdev, i);
+-		if (ret)
+-			goto err;
++			ret = ath12k_dp_mon_pdev_rx_alloc(dp_pdev, i);
++			if (ret)
++				goto err;
+ 
+-		ret = ath12k_dp_mon_pdev_rx_htt_setup(dp_pdev, i);
+-		if (ret)
+-			goto err;
++			ret = ath12k_dp_mon_pdev_rx_htt_setup(dp_pdev, i);
++			if (ret)
++				goto err;
++
++			dp_pdev->dp_mon_pdev_configured = true;
++		}
+ 	}
+ 
+ 	ret = ath12k_dp_ppeds_start(ab);
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+index 25e29f1..cd000b1 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -137,6 +137,7 @@ struct ath12k_pdev_dp {
+ 	struct list_head ppdu_stats_info;
+ 	u32 ppdu_stat_list_depth;
+ 
++	bool dp_mon_pdev_configured;
+ 	struct ath12k_pdev_mon_dp *dp_mon_pdev;
+ 	struct ath12k_wmm_stats wmm_stats;
+ 	/* Protected by ab: base lock
+@@ -974,7 +975,7 @@ int ath12k_dp_pdev_alloc(struct ath12k_base *ab);
+ int ath12k_dp_get_pdev_telemetry_stats(struct ath12k_base *ab,
+                                       int pdev_id,
+                                       struct ath12k_pdev_telemetry_stats *stats);
+-void ath12k_dp_pdev_pre_alloc(struct ath12k *ar);
++int ath12k_dp_pdev_pre_alloc(struct ath12k *ar);
+ void ath12k_dp_pdev_free(struct ath12k_base *ab);
+ int ath12k_dp_tx_htt_srng_setup(struct ath12k_base *ab, u32 ring_id,
+ 				int mac_id, enum hal_ring_type ring_type);
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 53e24a7..7d38ec5 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -21828,7 +21828,7 @@ static struct ath12k_hw *ath12k_mac_hw_allocate(struct ath12k_hw_group *ag,
+ 	struct ath12k_base *ab;
+ 	struct ath12k_pdev *pdev;
+ 	struct ath12k_hw *ah;
+-	int i;
++	int i, ret;
+ 	u8 pdev_idx;
+ 
+ 	hw = ieee80211_alloc_hw_nm(struct_size(ah, radio, num_pdev_map),
+@@ -21864,7 +21864,12 @@ static struct ath12k_hw *ath12k_mac_hw_allocate(struct ath12k_hw_group *ag,
+ 		ath12k_dp_cmn_update_hw_links(ab->dp, ag, ar);
+ 
+ 		ath12k_mac_setup(ar);
+-		ath12k_dp_pdev_pre_alloc(ar);
++		ret = ath12k_dp_pdev_pre_alloc(ar);
++		if (ret) {
++			ath12k_mac_hw_destroy(ah);
++			ah = NULL;
++			break;
++		}
+ 	}
+ 
+ 	return ah;
+-- 
+2.34.1
+

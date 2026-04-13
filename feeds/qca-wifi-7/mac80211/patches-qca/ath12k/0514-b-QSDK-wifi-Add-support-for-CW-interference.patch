@@ -1,0 +1,753 @@
+From 63703efe72433f58d2da60ae6afa4cc95be35485 Mon Sep 17 00:00:00 2001
+From: Naveen Sivasamy <naves@qti.qualcomm.com>
+Date: Fri, 5 Jul 2024 15:00:44 +0530
+Subject: [PATCH] QSDK: wifi: Add support for WLAN interference stats collect
+
+In order to detect WLAN interference in the medium, FW monitors
+a set of variables like - last ack packet rssi, tx time, rx time,
+phy error count, channel noise to interpret if there is an interference
+in the medium that will degrade the channel quality leading to
+improper channel utilization, these parameters is forwaded by the FW to
+the driver, the driver would read the data and forward it to the
+userspace.
+This set of data would be made available to the userspace for every
+one second, it would be posted out using the vendor command -
+QCA_NL80211_VENDOR_SUBCMD_DCS_WLAN_INTERFERENCE_COMPUTE.
+
+Signed-off-by: Amit Pandit <quic_pamit@quicinc.com>
+Signed-off-by: Naveen Sivasamy <naves@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c   |  14 ++
+ drivers/net/wireless/ath/ath12k/core.h   |  12 +-
+ drivers/net/wireless/ath/ath12k/mac.c    |  27 ++++
+ drivers/net/wireless/ath/ath12k/mac.h    |   4 +-
+ drivers/net/wireless/ath/ath12k/vendor.c | 187 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/vendor.h | 100 ++++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.c    | 126 ++++++++++++---
+ drivers/net/wireless/ath/ath12k/wmi.h    |  18 +++
+ 8 files changed, 468 insertions(+), 20 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -2221,6 +2221,18 @@ static void ath12k_mac_peer_ab_disassoc(
+ 	spin_unlock_bh(&ab->dp->dp_lock);
+ }
+ 
++void ath12k_dcs_wlan_intf_cleanup(struct ath12k *ar)
++{
++	struct ath12k_dcs_wlan_interference *dcs_wlan_intf, *temp;
++
++	spin_lock_bh(&ar->data_lock);
++	list_for_each_entry_safe(dcs_wlan_intf, temp, &ar->wlan_intf_list, list) {
++		list_del(&dcs_wlan_intf->list);
++		kfree(dcs_wlan_intf);
++	}
++	spin_unlock_bh(&ar->data_lock);
++}
++
+ void ath12k_core_halt(struct ath12k *ar)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+@@ -2247,7 +2259,9 @@ void ath12k_core_halt(struct ath12k *ar)
+ 	ath12k_telemetry_ab_peer_agent_destroy(ab);
+ 
+ 	ath12k_mac_peer_cleanup_all(ar);
++	ath12k_dcs_wlan_intf_cleanup(ar);
+ 	cancel_work_sync(&ar->regd_update_work);
++	cancel_work_sync(&ar->wlan_intf_work);
+ 	cancel_work_sync(&ab->rfkill_work);
+ 	cancel_work_sync(&ab->update_11d_work);
+ 	wiphy_work_cancel(ath12k_ar_to_hw(ar)->wiphy, &ar->agile_cac_abort_wq);
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -90,6 +90,7 @@
+ 
+ #define ATH12K_MAX_MLO_PEERS            256
+ #define ATH12K_MLO_PEER_ID_INVALID      0xFFFF
++#define ATH12K_VENDOR_VALID_INTF_BITMAP WMI_DCS_WLAN_INTF
+ 
+ #define ATH12K_MAX_ADJACENT_CHIPS   2
+ #define ATH12K_WSI_MAX_ARGS 4
+@@ -1431,6 +1432,8 @@ struct ath12k {
+ 	bool commitatf;
+ 	bool atf_strict_scheduling;
+ 	u8 dcs_enable_bitmap;
++	struct list_head wlan_intf_list;
++	struct work_struct wlan_intf_work;
+ };
+ 
+ struct ath12k_6ghz_sp_reg_rule {
+@@ -2004,6 +2007,11 @@ struct ath12k_fw_stats_bcn {
+ 	u32 tx_bcn_outage_cnt;
+ };
+ 
++struct ath12k_dcs_wlan_interference {
++	struct list_head list;
++	struct wmi_dcs_wlan_interference_stats info;
++};
++
+ struct ath12k_fw_stats_pdev {
+ 	struct list_head list;
+ 
+@@ -2414,5 +2422,8 @@ void ath12k_core_pci_link_speed(struct a
+ void ath12k_core_radio_cleanup(struct ath12k *ar);
+ void ath12k_telemetry_notify_breach(u8 *mac_addr, u8 svc_id, u8 param,
+ 				    bool set_clear, u8 tid);
++void ath12k_vendor_wlan_intf_stats(struct work_struct *work);
++void ath12k_debug_print_dcs_wlan_intf_stats(struct ath12k_base *ab,
++					    struct wmi_dcs_wlan_interference_stats *info);
+ struct ath12k_hw_group *ath12k_core_get_ag(void);
+ #endif /* _CORE_H_ */
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -5168,6 +5168,24 @@ static void ath12k_mac_init_arvif(struct
+ 			   ahvif->links_map);
+ }
+ 
++void ath12k_mac_set_vendor_intf_detect(struct ath12k *ar, u8 intf_detect_bitmap)
++{
++	u8 prev_intf_bitmap, dcs_enable_bitmap;
++
++	spin_lock_bh(&ar->data_lock);
++	prev_intf_bitmap = ar->dcs_enable_bitmap & ATH12K_VENDOR_VALID_INTF_BITMAP;
++	if (intf_detect_bitmap != prev_intf_bitmap) {
++		ar->dcs_enable_bitmap &= ~ATH12K_VENDOR_VALID_INTF_BITMAP;
++		ar->dcs_enable_bitmap |= intf_detect_bitmap;
++		dcs_enable_bitmap = ar->dcs_enable_bitmap;
++		spin_unlock_bh(&ar->data_lock);
++		ath12k_wmi_pdev_set_param(ar, WMI_PDEV_PARAM_DCS,
++					  dcs_enable_bitmap, ar->pdev->pdev_id);
++		return;
++	}
++	spin_unlock_bh(&ar->data_lock);
++}
++
+ void ath12k_mac_ap_ps_recalc(struct ath12k *ar)
+ {
+ 	enum ath12k_ap_ps_state state = ATH12K_AP_PS_STATE_OFF;
+@@ -14499,6 +14517,7 @@ int ath12k_mac_start(struct ath12k *ar)
+ 	struct ath12k_pdev *pdev = ar->pdev;
+ 	int ret;
+ 	enum dp_mon_stats_mode mode = ATH12k_DP_MON_BASIC_STATS;
++	u8 dcs_enable_bitmap;
+ 
+ 	lockdep_assert_held(&ah->hw_mutex);
+ 	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
+@@ -14644,6 +14663,20 @@ int ath12k_mac_start(struct ath12k *ar)
+ 		}
+ 	}
+ 
++	spin_lock_bh(&ar->data_lock);
++	if (ar->dcs_enable_bitmap) {
++		dcs_enable_bitmap = ar->dcs_enable_bitmap;
++		spin_unlock_bh(&ar->data_lock);
++		ret = ath12k_wmi_pdev_set_param(ar, WMI_PDEV_PARAM_DCS,
++						dcs_enable_bitmap, ar->pdev->pdev_id);
++		if (ret) {
++			ath12k_err(ab, "failed to enable Interference Detect:%d\n", ret);
++			goto err;
++		}
++	} else {
++		spin_unlock_bh(&ar->data_lock);
++	}
++
+ 	rcu_assign_pointer(ab->pdevs_active[ar->pdev_idx],
+ 			   &ab->pdevs[ar->pdev_idx]);
+ 	return 0;
+@@ -14825,12 +14858,14 @@ void ath12k_mac_stop(struct ath12k *ar)
+ 			   ret);
+ 
+ 	clear_bit(ATH12K_FLAG_CAC_RUNNING, &ar->dev_flags);
++	ath12k_dcs_wlan_intf_cleanup(ar);
+ 
+ 	cancel_delayed_work_sync(&ar->scan.timeout);
+ 	wiphy_work_cancel(ath12k_ar_to_hw(ar)->wiphy, &ar->scan.vdev_clean_wk);
+ 	cancel_work_sync(&ar->regd_update_work);
+ 	cancel_work_sync(&ar->ab->rfkill_work);
+ 	cancel_work_sync(&ar->ab->update_11d_work);
++	cancel_work_sync(&ar->wlan_intf_work);
+ 	ar->state_11d = ATH12K_11D_IDLE;
+ 	complete(&ar->completed_11d_scan);
+ 
+@@ -22015,6 +22050,7 @@ static void ath12k_mac_setup(struct ath1
+ 	spin_lock_init(&ar->data_lock);
+ 	INIT_LIST_HEAD(&ar->arvifs);
+ 	INIT_LIST_HEAD(&ar->dp.ppdu_stats_info);
++	INIT_LIST_HEAD(&ar->wlan_intf_list);
+ 
+ 	init_completion(&ar->vdev_setup_done);
+ 	init_completion(&ar->vdev_delete_done);
+@@ -22039,6 +22075,7 @@ static void ath12k_mac_setup(struct ath1
+ 	wiphy_work_init(&ar->agile_cac_abort_wq, ath12k_agile_cac_abort_work);
+ 
+ 	wiphy_work_init(&ar->wmi_mgmt_tx_work, ath12k_mgmt_over_wmi_tx_work);
++	INIT_WORK(&ar->wlan_intf_work, ath12k_vendor_wlan_intf_stats);
+ 	skb_queue_head_init(&ar->wmi_mgmt_tx_queue);
+ 
+ 	ar->monitor_vdev_id = -1;
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -177,6 +177,7 @@ void ath12k_mac_11d_scan_stop(struct ath
+ void ath12k_mac_11d_scan_stop_all(struct ath12k_base *ab);
+ 
+ void ath12k_mac_set_cw_intf_detect(struct ath12k *ar, u8 intf_bitmap);
++void ath12k_mac_set_vendor_intf_detect(struct ath12k *ar, u8 intf_detect_bitmap);
+ void ath12k_mac_destroy(struct ath12k_hw_group *ag);
+ void ath12k_mac_unregister(struct ath12k_hw_group *ag);
+ int ath12k_mac_register(struct ath12k_hw_group *ag);
+@@ -247,6 +248,7 @@ void ath12k_mac_drain_tx(struct ath12k *
+ void ath12k_mac_peer_cleanup_all(struct ath12k *ar);
+ void ath12k_mac_dp_peer_cleanup(struct ath12k_hw *ah,
+ 				enum ath12k_mlo_recovery_mode recovery_mode);
++void ath12k_dcs_wlan_intf_cleanup(struct ath12k *ar);
+ int ath12k_mac_tx_mgmt_pending_free(int buf_id, void *skb, void *ctx);
+ enum rate_info_bw ath12k_mac_bw_to_mac80211_bw(enum ath12k_supported_bw bw);
+ enum ath12k_supported_bw ath12k_mac_mac80211_bw_to_ath12k_bw(enum rate_info_bw bw);
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
+  * Copyright (c) 2021-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
++#include "wmi.h"
+ #include <linux/skbuff.h>
+ #include <linux/ctype.h>
+ #include <net/mac80211.h>
+@@ -11363,6 +11364,36 @@ static void ath12k_pdev_ctl_failsafe_che
+ 	kfree(tb);
+ }
+ 
++void ath12k_debug_print_dcs_wlan_intf_stats(struct ath12k_base *ab,
++					    struct wmi_dcs_wlan_interference_stats *info)
++{
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: reg_tsf32=%u", info->reg_tsf32);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: last_ack_rssi=%u",
++		   info->last_ack_rssi);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: tx_waste_time=%u",
++		   info->tx_waste_time);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: rx_time=%u", info->rx_time);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: phyerr_cnt=%u", info->phyerr_cnt);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: listen_time=%u", info->listen_time);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: reg_tx_frame_cnt=%u",
++		   info->reg_tx_frame_cnt);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: reg_rx_frame_cnt=%u",
++		   info->reg_rx_frame_cnt);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: reg_rxclr_cnt=%u",
++		   info->reg_rxclr_cnt);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: reg_cycle_cnt=%u",
++		   info->reg_cycle_cnt);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: reg_rxclr_ext_cnt=%u",
++		   info->reg_rxclr_ext_cnt);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: reg_ofdm_phyerr_cnt=%u",
++		   info->reg_ofdm_phyerr_cnt);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: reg_cck_phyerr_cnt=%u",
++		   info->reg_cck_phyerr_cnt);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: chan_nf=%d", info->chan_nf);
++	ath12k_dbg(ab, ATH12K_DBG_WMI, "wlan_intf: my_bss_rx_cycle_count=%u",
++		   info->my_bss_rx_cycle_count);
++}
++
+ static int ath12k_wmi_dcs_intf_subtlv_parser(struct ath12k_base *ab,
+ 					     u16 tag, u16 len,
+ 					     const void *ptr, void *data)
+@@ -11370,6 +11401,8 @@ static int ath12k_wmi_dcs_intf_subtlv_pa
+ 	int ret = 0;
+ 	struct wmi_dcs_awgn_info *awgn_info;
+ 	struct wmi_dcs_cw_info *cw_info;
++	struct wmi_dcs_wlan_interference_stats_ev *wlan_info;
++	struct wmi_dcs_wlan_interference_stats *tmp;
+ 
+ 	switch (tag) {
+ 	case WMI_TAG_DCS_AWGN_INT_TYPE:
+@@ -11386,6 +11419,26 @@ static int ath12k_wmi_dcs_intf_subtlv_pa
+ 		ath12k_dbg(ab, ATH12K_DBG_WMI, "CW Info: channel=%d", cw_info->channel);
+ 		memcpy(data, cw_info, sizeof(*cw_info));
+ 		break;
++	case WMI_TAG_ATH_DCS_WLAN_INT_STAT:
++		wlan_info = (struct wmi_dcs_wlan_interference_stats_ev *)ptr;
++		tmp = (struct wmi_dcs_wlan_interference_stats *)data;
++		tmp->reg_tsf32 = le32_to_cpu(wlan_info->reg_tsf32);
++		tmp->last_ack_rssi = le32_to_cpu(wlan_info->last_ack_rssi);
++		tmp->tx_waste_time = le32_to_cpu(wlan_info->tx_waste_time);
++		tmp->rx_time = le32_to_cpu(wlan_info->rx_time);
++		tmp->phyerr_cnt = le32_to_cpu(wlan_info->phyerr_cnt);
++		tmp->listen_time = le32_to_cpu(wlan_info->listen_time);
++		tmp->reg_tx_frame_cnt = le32_to_cpu(wlan_info->reg_tx_frame_cnt);
++		tmp->reg_rx_frame_cnt = le32_to_cpu(wlan_info->reg_rx_frame_cnt);
++		tmp->reg_rxclr_cnt = le32_to_cpu(wlan_info->reg_rxclr_cnt);
++		tmp->reg_cycle_cnt = le32_to_cpu(wlan_info->reg_cycle_cnt);
++		tmp->reg_rxclr_ext_cnt = le32_to_cpu(wlan_info->reg_rxclr_ext_cnt);
++		tmp->reg_ofdm_phyerr_cnt = le32_to_cpu(wlan_info->reg_ofdm_phyerr_cnt);
++		tmp->reg_cck_phyerr_cnt = le32_to_cpu(wlan_info->reg_cck_phyerr_cnt);
++		tmp->chan_nf = le32_to_cpu(wlan_info->chan_nf);
++		tmp->my_bss_rx_cycle_count =
++			le32_to_cpu(wlan_info->my_bss_rx_cycle_count);
++		break;
+ 	default:
+ 		ath12k_warn(ab,
+ 			    "Received invalid tag for wmi dcs interference in subtlvs\n");
+@@ -11563,6 +11616,48 @@ exit:
+ }
+ 
+ static void
++ath12k_wmi_dcs_wlan_interference_event(struct ath12k_base *ab,
++				       struct sk_buff *skb,
++				       u32 pdev_id)
++{
++	struct wmi_dcs_wlan_interference_stats wlan_info = {};
++	struct ath12k *ar;
++	int ret;
++	struct ath12k_dcs_wlan_interference *dcs_wlan_intf;
++
++	ret = ath12k_wmi_tlv_iter(ab, skb->data, skb->len,
++				  ath12k_wmi_dcs_event_parser,
++				  &wlan_info);
++	if (ret)
++		return;
++
++	rcu_read_lock();
++	ar = ath12k_mac_get_ar_by_pdev_id(ab, pdev_id);
++	if (!ar)
++		goto exit;
++
++	spin_lock_bh(&ar->data_lock);
++	if (!(ar->dcs_enable_bitmap & WMI_DCS_WLAN_INTF)) {
++		spin_unlock_bh(&ar->data_lock);
++		goto exit;
++	}
++	spin_unlock_bh(&ar->data_lock);
++
++	dcs_wlan_intf = kzalloc(sizeof(*dcs_wlan_intf), GFP_ATOMIC);
++	if (!dcs_wlan_intf)
++		goto exit;
++
++	INIT_LIST_HEAD(&dcs_wlan_intf->list);
++	memcpy(&dcs_wlan_intf->info, &wlan_info, sizeof(wlan_info));
++	spin_lock_bh(&ar->data_lock);
++	list_add_tail(&dcs_wlan_intf->list, &ar->wlan_intf_list);
++	spin_unlock_bh(&ar->data_lock);
++	schedule_work(&ar->wlan_intf_work);
++exit:
++	rcu_read_unlock();
++}
++
++static void
+ ath12k_wmi_dcs_awgn_interference_event(struct ath12k_base *ab,
+ 				       struct sk_buff *skb,
+ 				       u32 pdev_id)
+@@ -11960,6 +12055,9 @@ ath12k_wmi_dcs_interference_event(struct
+ 	case WMI_DCS_CW_INTF:
+ 		ath12k_wmi_dcs_cw_interference_event(ab, skb, pdev_id);
+ 		break;
++	case WMI_DCS_WLAN_INTF:
++		ath12k_wmi_dcs_wlan_interference_event(ab, skb, pdev_id);
++		break;
+ 	case WMI_DCS_AWGN_INTF:
+ 		ath12k_wmi_dcs_awgn_interference_event(ab, skb, pdev_id);
+ 		break;
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -5390,6 +5390,42 @@ struct wmi_dcs_cw_info {
+ 	__le32 channel;
+ };
+ 
++struct wmi_dcs_wlan_interference_stats {
++	u32 reg_tsf32;
++	u32 last_ack_rssi;
++	u32 tx_waste_time;
++	u32 rx_time;
++	u32 phyerr_cnt;
++	u32 listen_time;
++	u32 reg_tx_frame_cnt;
++	u32 reg_rx_frame_cnt;
++	u32 reg_rxclr_cnt;
++	u32 reg_cycle_cnt;
++	u32 reg_rxclr_ext_cnt;
++	u32 reg_ofdm_phyerr_cnt;
++	u32 reg_cck_phyerr_cnt;
++	s32 chan_nf;
++	u32 my_bss_rx_cycle_count;
++};
++
++struct wmi_dcs_wlan_interference_stats_ev {
++	__le32 reg_tsf32;
++	__le32 last_ack_rssi;
++	__le32 tx_waste_time;
++	__le32 rx_time;
++	__le32 phyerr_cnt;
++	__le32 listen_time;
++	__le32 reg_tx_frame_cnt;
++	__le32 reg_rx_frame_cnt;
++	__le32 reg_rxclr_cnt;
++	__le32 reg_cycle_cnt;
++	__le32 reg_rxclr_ext_cnt;
++	__le32 reg_ofdm_phyerr_cnt;
++	__le32 reg_cck_phyerr_cnt;
++	__le32 chan_nf;
++	__le32 my_bss_rx_cycle_count;
++};
++
+ struct wmi_dcs_interference_ev {
+ 	__le32 interference_type;
+ 	__le32 pdev_id;
+--- a/drivers/net/wireless/ath/ath12k/vendor.c
++++ b/drivers/net/wireless/ath/ath12k/vendor.c
+@@ -111,6 +111,12 @@ ath12k_pri_link_migrate_policy[QCA_WLAN_
+ 	[QCA_WLAN_VENDOR_ATTR_PRI_LINK_MIGR_NEW_PRI_LINK_ID] = {.type =  NLA_U8},
+ };
+ 
++static const struct nla_policy
++ath12k_vendor_dcs_policy[QCA_WLAN_VENDOR_ATTR_DCS_MAX + 1] = {
++	[QCA_WLAN_VENDOR_ATTR_DCS_MLO_LINK_ID] = {.type = NLA_U8},
++	[QCA_WLAN_VENDOR_ATTR_DCS_WLAN_INTERFERENCE_CONFIGURE] = {.type = NLA_U8},
++};
++
+ static void
+ ath12k_afc_response_buffer_display(struct ath12k_base *ab,
+ 				   struct ath12k_afc_host_resp *afc_rsp)
+@@ -6927,6 +6933,195 @@ int ath12k_vendor_put_ab_num_links(struc
+ 	return 0;
+ }
+ 
++void ath12k_vendor_wlan_intf_stats(struct work_struct *work)
++{
++	struct ath12k *ar = container_of(work, struct ath12k, wlan_intf_work);
++	struct sk_buff *msg = NULL;
++	struct wireless_dev *wdev;
++	struct ath12k_link_vif *tmp_arvif = NULL, *arvif;
++	struct ath12k_dcs_wlan_interference *dcs_wlan_intf = NULL, *temp;
++	int tmp;
++	u8 dcs_enable_bitmap;
++	bool disable_wlan_intf = false;
++
++	if (!ar || !ar->ah || !ar->ah->hw || !ar->ah->hw->wiphy)
++		return;
++
++	wiphy_lock(ath12k_ar_to_hw(ar)->wiphy);
++
++	list_for_each_entry(arvif, &ar->arvifs, list) {
++		if (arvif->ahvif->vdev_type != WMI_VDEV_TYPE_AP) {
++			disable_wlan_intf = true;
++			break;
++		} else if (arvif->vdev_subtype == WMI_VDEV_SUBTYPE_MESH_11S) {
++			disable_wlan_intf = true;
++			break;
++		}
++
++		if (!tmp_arvif && arvif->is_started)
++			tmp_arvif = arvif;
++	}
++
++	if (disable_wlan_intf) {
++		spin_lock_bh(&ar->data_lock);
++		ar->dcs_enable_bitmap &= ~WMI_DCS_WLAN_INTF;
++		dcs_enable_bitmap = ar->dcs_enable_bitmap;
++		spin_unlock_bh(&ar->data_lock);
++		ath12k_wmi_pdev_set_param(ar, WMI_PDEV_PARAM_DCS,
++					  dcs_enable_bitmap, ar->pdev->pdev_id);
++		ath12k_err(ar->ab, "Disabling wlan interference, only AP mode supported.\n");
++		goto cleanup;
++	}
++
++	if (!tmp_arvif || !tmp_arvif->ahvif)
++		goto cleanup;
++
++	wdev = ieee80211_vif_to_wdev(tmp_arvif->ahvif->vif);
++
++	if (!wdev || !wdev->wiphy)
++		goto cleanup;
++
++	spin_lock_bh(&ar->data_lock);
++	list_for_each_entry_safe(dcs_wlan_intf, temp, &ar->wlan_intf_list, list) {
++		list_del(&dcs_wlan_intf->list);
++		spin_unlock_bh(&ar->data_lock);
++		ath12k_debug_print_dcs_wlan_intf_stats(ar->ab, &dcs_wlan_intf->info);
++		tmp = QCA_NL80211_VENDOR_SUBCMD_DCS_WLAN_INTERFERENCE_COMPUTE_INDEX;
++		msg = cfg80211_vendor_event_alloc(wdev->wiphy, wdev, NLMSG_DEFAULT_SIZE,
++						  tmp, GFP_KERNEL);
++		if (!msg)
++			goto nla_put_failure;
++
++		if (nla_put_u32(msg, QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_TSF,
++				dcs_wlan_intf->info.reg_tsf32))
++			goto nla_put_failure;
++
++		if (nla_put_u32(msg, QCA_WLAN_VENDOR_ATTR_WLAN_LAST_ACK_RSSI,
++				dcs_wlan_intf->info.last_ack_rssi))
++			goto nla_put_failure;
++
++		tmp = QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_TX_WASTE_TIME;
++		if (nla_put_u32(msg, tmp, dcs_wlan_intf->info.tx_waste_time))
++			goto nla_put_failure;
++
++		if (nla_put_u32(msg, QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_RX_TIME,
++				dcs_wlan_intf->info.rx_time))
++			goto nla_put_failure;
++
++		tmp = QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_PHY_ERR_COUNT;
++		if (nla_put_u32(msg, tmp, dcs_wlan_intf->info.phyerr_cnt))
++			goto nla_put_failure;
++
++		tmp = QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_LISTEN_TIME;
++		if (nla_put_u32(msg, tmp, dcs_wlan_intf->info.listen_time))
++			goto nla_put_failure;
++
++		tmp = QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_TX_FRAME_COUNT;
++		if (nla_put_u32(msg, tmp, dcs_wlan_intf->info.reg_tx_frame_cnt))
++			goto nla_put_failure;
++
++		tmp = QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_RX_FRAME_COUNT;
++		if (nla_put_u32(msg, tmp,
++				dcs_wlan_intf->info.reg_rx_frame_cnt))
++			goto nla_put_failure;
++
++		tmp = QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_RX_CLR_COUNT;
++		if (nla_put_u32(msg, tmp,
++				dcs_wlan_intf->info.reg_rxclr_cnt))
++			goto nla_put_failure;
++
++		tmp = QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_CYCLE_COUNT;
++		if (nla_put_u32(msg, tmp,
++				dcs_wlan_intf->info.reg_cycle_cnt))
++			goto nla_put_failure;
++
++		tmp = QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_RX_CLR_EXT_COUNT;
++		if (nla_put_u32(msg, tmp,
++				dcs_wlan_intf->info.reg_rxclr_ext_cnt))
++			goto nla_put_failure;
++
++		tmp = QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_OFDM_PHYERR_COUNT;
++		if (nla_put_u32(msg, tmp,
++				dcs_wlan_intf->info.reg_ofdm_phyerr_cnt))
++			goto nla_put_failure;
++
++		tmp = QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_CCK_PHYERR_COUNT;
++		if (nla_put_u32(msg, tmp,
++				dcs_wlan_intf->info.reg_cck_phyerr_cnt))
++			goto nla_put_failure;
++
++		tmp = QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_CHANNEL_NF;
++		if (nla_put_s32(msg, tmp,
++				dcs_wlan_intf->info.chan_nf))
++			goto nla_put_failure;
++
++		tmp = QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_MY_BSS_RX_CYCLE_COUNT;
++		if (nla_put_u32(msg, tmp,
++				dcs_wlan_intf->info.my_bss_rx_cycle_count))
++			goto nla_put_failure;
++
++		cfg80211_vendor_event(msg, GFP_KERNEL);
++		kfree(dcs_wlan_intf);
++		dcs_wlan_intf = NULL;
++		spin_lock_bh(&ar->data_lock);
++	}
++	spin_unlock_bh(&ar->data_lock);
++	goto exit;
++
++nla_put_failure:
++	kfree(dcs_wlan_intf);
++	kfree(msg);
++cleanup:
++	ath12k_dcs_wlan_intf_cleanup(ar);
++exit:
++	wiphy_unlock(ath12k_ar_to_hw(ar)->wiphy);
++}
++
++static int ath12k_vendor_dcs_handler(struct wiphy *wihpy,
++				     struct wireless_dev *wdev,
++				     const void *data,
++				     int data_len)
++{
++	int ret, link_id = 0, wlan_intf, vendor_intf_bitmap, tmp;
++	struct ath12k *ar;
++	struct nlattr *tb[QCA_WLAN_VENDOR_ATTR_DCS_MAX + 1];
++
++	ret = nla_parse(tb, QCA_WLAN_VENDOR_ATTR_DCS_MAX, data, data_len,
++			ath12k_vendor_dcs_policy, NULL);
++
++	if (ret) {
++		ath12k_err(NULL, "Invalid attribute in dcs_handler %d\n", ret);
++		return ret;
++	}
++
++	if (wdev->valid_links) { /* MLO case */
++		if (!tb[QCA_WLAN_VENDOR_ATTR_DCS_MLO_LINK_ID])
++			return -EINVAL;
++		link_id = nla_get_u8(tb[QCA_WLAN_VENDOR_ATTR_DCS_MLO_LINK_ID]);
++		if (!(wdev->valid_links & BIT(link_id)))
++			return -ENOLINK;
++	} else { /* NON-MLO case */
++		if (tb[QCA_WLAN_VENDOR_ATTR_DCS_MLO_LINK_ID])
++			return -EINVAL;
++		link_id = 0;
++	}
++
++	if (!tb[QCA_WLAN_VENDOR_ATTR_DCS_WLAN_INTERFERENCE_CONFIGURE])
++		return -EINVAL;
++
++	tmp = QCA_WLAN_VENDOR_ATTR_DCS_WLAN_INTERFERENCE_CONFIGURE;
++	wlan_intf = nla_get_u8(tb[tmp]);
++	tmp = ~WMI_DCS_WLAN_INTF & ATH12K_VENDOR_VALID_INTF_BITMAP;
++	vendor_intf_bitmap = wlan_intf ? WMI_DCS_WLAN_INTF : tmp;
++
++	ar = ath12k_get_ar_from_wdev(wdev, link_id);
++	if (!ar)
++		return -ENODATA;
++
++	ath12k_mac_set_vendor_intf_detect(ar, vendor_intf_bitmap);
++	return 0;
++}
++
+ static struct wiphy_vendor_command ath12k_vendor_commands[] = {
+ 	{
+ 		.info.vendor_id = QCA_NL80211_VENDOR_ID,
+@@ -7056,6 +7251,14 @@ static struct wiphy_vendor_command ath12
+ 		.maxattr = QCA_WLAN_VENDOR_ATTR_SDWF_DEV_MAX,
+ 		.flags = WIPHY_VENDOR_CMD_NEED_NETDEV,
+ 	},
++	{
++		.info.vendor_id = QCA_NL80211_VENDOR_ID,
++		.info.subcmd = QCA_NL80211_VENDOR_SUBCMD_DCS_WLAN_INTERFERENCE_COMPUTE,
++		.doit = ath12k_vendor_dcs_handler,
++		.policy = ath12k_vendor_dcs_policy,
++		.maxattr = QCA_WLAN_VENDOR_ATTR_DCS_MAX,
++		.flags = WIPHY_VENDOR_CMD_NEED_NETDEV,
++	},
+ };
+ 
+ static const struct nl80211_vendor_cmd_info ath12k_vendor_events[] = {
+@@ -7091,6 +7294,10 @@ static const struct nl80211_vendor_cmd_i
+ 		.vendor_id = QCA_NL80211_VENDOR_ID,
+ 		.subcmd = QCA_NL80211_VENDOR_SUBCMD_PRI_LINK_MIGRATE,
+ 	},
++	[QCA_NL80211_VENDOR_SUBCMD_DCS_WLAN_INTERFERENCE_COMPUTE_INDEX] = {
++		.vendor_id = QCA_NL80211_VENDOR_ID,
++		.subcmd = QCA_NL80211_VENDOR_SUBCMD_DCS_WLAN_INTERFERENCE_COMPUTE,
++	},
+ };
+ 
+ int ath12k_vendor_register(struct ath12k_hw *ah)
+--- a/drivers/net/wireless/ath/ath12k/vendor.h
++++ b/drivers/net/wireless/ath/ath12k/vendor.h
+@@ -68,6 +68,7 @@ enum qca_nl80211_vendor_subcmds {
+ 	QCA_NL80211_VENDOR_SUBCMD_SET_WIPHY_CONFIGURATION = 268,
+ 	QCA_NL80211_VENDOR_SUBCMD_GET_WIPHY_CONFIGURATION = 269,
+ 	QCA_NL80211_VENDOR_SUBCMD_AFC_GET_REG_EIRP = 290,
++	QCA_NL80211_VENDOR_SUBCMD_DCS_WLAN_INTERFERENCE_COMPUTE = 350,
+ };
+ 
+ enum qca_nl80211_vendor_events {
+@@ -79,6 +80,7 @@ enum qca_nl80211_vendor_events {
+ 	QCA_NL80211_VENDOR_SUBCMD_IFACE_RELOAD_INDEX = 5,
+ 	QCA_NL80211_VENDOR_SUBCMD_SDWF_DEV_OPS_INDEX = 6,
+ 	QCA_NL80211_VENDOR_SUBCMD_PRI_LINK_MIGRATE_INDEX = 7,
++	QCA_NL80211_VENDOR_SUBCMD_DCS_WLAN_INTERFERENCE_COMPUTE_INDEX = 8,
+ };
+ 
+ /**
+@@ -1755,6 +1757,105 @@ enum qca_wlan_vendor_attr_pri_link_migra
+        QCA_WLAN_VENDOR_ATTR_PRI_LINK_MIGR_MAX =
+        QCA_WLAN_VENDOR_ATTR_PRI_LINK_MIGR_AFTER_LAST - 1,
+ };
++
++enum qca_wlan_vendor_attr_dcs {
++	QCA_WLAN_VENDOR_ATTR_DCS_INVALID = 0,
++	QCA_WLAN_VENDOR_ATTR_DCS_MLO_LINK_ID,
++	QCA_WLAN_VENDOR_ATTR_DCS_WLAN_INTERFERENCE_CONFIGURE,
++
++	/* Keep last */
++	QCA_WLAN_VENDOR_ATTR_DCS_AFTER_LAST,
++	QCA_WLAN_VENDOR_ATTR_DCS_MAX =
++		QCA_WLAN_VENDOR_ATTR_DCS_AFTER_LAST - 1
++};
++
++/**
++ * @QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_TSF:
++ * Required (u32).
++ * Current running timestamp in the firmware; tsf - time synchronize function.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_WLAN_LAST_ACK_RSSI:
++ * Required (u32).
++ * RSSI value of Last ACK frame.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_TX_WASTE_TIME:
++ * Required (u32).
++ * Sum of all the failed durations in the last one second interval.
++ *
++ * It's the amount of time that we spent in backoff or waiting for other
++ * transmit/receive to complete; since these parameters are receieved
++ * in the userspace every one second, hence the calculation for
++ * wasted time would be _tx_waste_time/delta_tsf
++ *
++ * @QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_RX_TIME:
++ * Required (u32)
++ * Sum of all the Rx Frame Duration(microsecond), in a period of one second.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_PHY_ERR_COUNT:
++ * Required (u32).
++ * Current running phy error/CRC Error packet count.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_LISTEN_TIME:
++ * Required (u32)
++ * Listen time is the time spent by HW in Rx + noise reception in millisecond.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_TX_FRAME_COUNT:
++ * Required (u32)
++ * The current running tx frame count in micorsecond.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_RX_FRAME_COUNT:
++ * Required (u32)
++ * The current running rx frame count in microsecond.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_RX_CLR_COUNT:
++ * Required (u32)
++ * The current running rx clear count in microsecond.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_CYCLE_COUNT:
++ * Required (u32)
++ * Cycle count is just the fixed count Of a given period, here we
++ * sample cycle counter at 1 sec interval , the delta between successive
++ * counts will be ~ 1,000 ms
++ *
++ * QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_OFDM_PHYERR_COUNT:
++ * Required (u32)
++ * The current running OFDM phy Error Count in microsecond.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_CCK_PHYERR_COUNT:
++ * Required (u32)
++ * The current running CCK Phy Error Count in microsecond.
++ *
++ * @QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_CHANNEL_NF:
++ * Required (s32)
++ * Channel noise floor (units are dBr)
++ *
++ * @QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_MY_BSS_RX_CYCLE_COUNT:
++ * Required (u32)
++ * The Current running counter for th Rx Frames destined to my BSS in microsecond
++ *
++ */
++
++enum qca_wlan_vendor_wlan_interference_attr {
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_TSF,
++	QCA_WLAN_VENDOR_ATTR_WLAN_LAST_ACK_RSSI,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_TX_WASTE_TIME,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_RX_TIME,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_PHY_ERR_COUNT,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_LISTEN_TIME,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_TX_FRAME_COUNT,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_RX_FRAME_COUNT,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_RX_CLR_COUNT,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_CYCLE_COUNT,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_RX_CLR_EXT_COUNT,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_OFDM_PHYERR_COUNT,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_CCK_PHYERR_COUNT,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_CHANNEL_NF,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_MY_BSS_RX_CYCLE_COUNT,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_LAST,
++	QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_MAX =
++		QCA_WLAN_VENDOR_ATTR_WLAN_INTERFERENCE_PARAM_LAST - 1,
++};
++
+ /**
+  * enum qca_wlan_vendor_dynamic_init_conf - This enum defines the different
+  * dynamic app init/deinit configurations.

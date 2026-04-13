@@ -1,0 +1,166 @@
+From 95f8620bb2aa1a0b567b6186581874f8bda3a180 Mon Sep 17 00:00:00 2001
+From: Johan Hovold <johan+linaro@kernel.org>
+Date: Fri, 6 Sep 2024 15:13:34 +0200
+Subject: [PATCH] serial: qcom-geni: fix console corruption
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Qualcomm serial console implementation is broken and can lose
+characters when the serial port is also used for tty output.
+
+Specifically, the console code only waits for the current tx command to
+complete when all data has already been written to the fifo. When there
+are on-going longer transfers this often means that console output is
+lost when the console code inadvertently "hijacks" the current tx
+command instead of starting a new one.
+
+This can, for example, be observed during boot when console output that
+should have been interspersed with init output is truncated:
+
+	[    9.462317] qcom-snps-eusb2-hsphy fde000.phy: Registered Qcom-eUSB2 phy
+	[  OK  ] Found device KBG50ZNS256G KIOXIA Wi[    9.471743ndows.
+	[    9.539915] xhci-hcd xhci-hcd.0.auto: xHCI Host Controller
+
+Add a new state variable to track how much data has been written to the
+fifo and use it to determine when the fifo and shift register are both
+empty. This is needed since there is currently no other known way to
+determine when the shift register is empty.
+
+This in turn allows the console code to interrupt long transfers without
+losing data.
+
+Note that the oops-in-progress case is similarly broken as it does not
+cancel any active command and also waits for the wrong status flag when
+attempting to drain the fifo (TX_FIFO_NOT_EMPTY_EN is only set when
+cancelling a command leaves data in the fifo).
+
+Fixes: c4f528795d1a ("tty: serial: msm_geni_serial: Add serial driver support for GENI based QUP")
+Fixes: a1fee899e5be ("tty: serial: qcom_geni_serial: Fix softlock")
+Fixes: 9e957a155005 ("serial: qcom-geni: Don't cancel/abort if we can't get the port lock")
+Cc: stable@vger.kernel.org	# 4.17
+Reviewed-by: Douglas Anderson <dianders@chromium.org>
+Tested-by: Nícolas F. R. A. Prado <nfraprado@collabora.com>
+Change-Id: Ib7e85d2f9d999eeca9c6e8d5651d328b6cb5f8bd
+Signed-off-by: Johan Hovold <johan+linaro@kernel.org>
+Link: https://lore.kernel.org/r/20240906131336.23625-7-johan+linaro@kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Poovendhan Selvaraj <quic_poovendh@quicinc.com>
+(cherry picked from commit cc4a0e5754a16bbc1e215c091349a7c83a2c5e14)
+---
+ drivers/tty/serial/qcom_geni_serial.c | 44 +++++++++++++--------------
+ 1 file changed, 22 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/tty/serial/qcom_geni_serial.c b/drivers/tty/serial/qcom_geni_serial.c
+index 855dcfed7519..c1bddcb82581 100644
+--- a/drivers/tty/serial/qcom_geni_serial.c
++++ b/drivers/tty/serial/qcom_geni_serial.c
+@@ -131,6 +131,7 @@ struct qcom_geni_serial_port {
+ 	bool brk;
+ 
+ 	unsigned int tx_remaining;
++	unsigned int tx_queued;
+ 	int wakeup_irq;
+ 	bool rx_tx_swap;
+ 	bool cts_rts_swap;
+@@ -144,6 +145,8 @@ static const struct uart_ops qcom_geni_uart_pops;
+ static struct uart_driver qcom_geni_console_driver;
+ static struct uart_driver qcom_geni_uart_driver;
+ 
++static void qcom_geni_serial_cancel_tx_cmd(struct uart_port *uport);
++
+ static inline struct qcom_geni_serial_port *to_dev_port(struct uart_port *uport)
+ {
+ 	return container_of(uport, struct qcom_geni_serial_port, uport);
+@@ -414,6 +417,14 @@ static void qcom_geni_serial_poll_put_char(struct uart_port *uport,
+ #endif
+ 
+ #ifdef CONFIG_SERIAL_QCOM_GENI_CONSOLE
++static void qcom_geni_serial_drain_fifo(struct uart_port *uport)
++{
++	struct qcom_geni_serial_port *port = to_dev_port(uport);
++
++	qcom_geni_serial_poll_bitfield(uport, SE_GENI_M_GP_LENGTH, GP_LENGTH,
++			port->tx_queued);
++}
++
+ static void qcom_geni_serial_wr_char(struct uart_port *uport, unsigned char ch)
+ {
+ 	struct qcom_geni_private_data *private_data = uport->private_data;
+@@ -489,7 +500,6 @@ static void qcom_geni_serial_console_write(struct console *co, const char *s,
+ 	struct qcom_geni_serial_port *port;
+ 	bool locked = true;
+ 	unsigned long flags;
+-	u32 geni_status;
+ 
+ 	WARN_ON(co->index < 0 || co->index >= GENI_UART_CONS_PORTS);
+ 
+@@ -503,33 +513,20 @@ static void qcom_geni_serial_console_write(struct console *co, const char *s,
+ 	else
+ 		spin_lock_irqsave(&uport->lock, flags);
+ 
+-	geni_status = readl(uport->membase + SE_GENI_STATUS);
++	if (qcom_geni_serial_main_active(uport)) {
++		/* Wait for completion or drain FIFO */
++		if (!locked || port->tx_remaining == 0)
++			qcom_geni_serial_poll_tx_done(uport);
++		else
++			qcom_geni_serial_drain_fifo(uport);
+ 
+-	if (!locked) {
+-		/*
+-		 * We can only get here if an oops is in progress then we were
+-		 * unable to get the lock. This means we can't safely access
+-		 * our state variables like tx_remaining. About the best we
+-		 * can do is wait for the FIFO to be empty before we start our
+-		 * transfer, so we'll do that.
+-		 */
+-		qcom_geni_serial_poll_bit(uport, SE_GENI_M_IRQ_STATUS,
+-					  M_TX_FIFO_NOT_EMPTY_EN, false);
+-	} else if ((geni_status & M_GENI_CMD_ACTIVE) && !port->tx_remaining) {
+-		/*
+-		 * It seems we can't interrupt existing transfers if all data
+-		 * has been sent, in which case we need to look for done first.
+-		 */
+-		qcom_geni_serial_poll_tx_done(uport);
++		qcom_geni_serial_cancel_tx_cmd(uport);
+ 	}
+ 
+ 	__qcom_geni_serial_console_write(uport, s, count);
+ 
+-	if (locked) {
+-		if (port->tx_remaining)
+-			qcom_geni_serial_setup_tx(uport, port->tx_remaining);
++	if (locked)
+ 		uart_port_unlock_irqrestore(uport, flags);
+-	}
+ }
+ 
+ static void handle_rx_console(struct uart_port *uport, u32 bytes, bool drop)
+@@ -710,6 +707,7 @@ static void qcom_geni_serial_cancel_tx_cmd(struct uart_port *uport)
+ 	writel(M_CMD_CANCEL_EN, uport->membase + SE_GENI_M_IRQ_CLEAR);
+ 
+ 	port->tx_remaining = 0;
++	port->tx_queued = 0;
+ }
+ 
+ static void qcom_geni_serial_handle_rx_fifo(struct uart_port *uport, bool drop)
+@@ -936,6 +934,7 @@ static void qcom_geni_serial_handle_tx_fifo(struct uart_port *uport,
+ 	if (!port->tx_remaining) {
+ 		qcom_geni_serial_setup_tx(uport, pending);
+ 		port->tx_remaining = pending;
++		port->tx_queued = 0;
+ 
+ 		irq_en = readl(uport->membase + SE_GENI_M_IRQ_EN);
+ 		if (!(irq_en & M_TX_FIFO_WATERMARK_EN))
+@@ -944,6 +943,7 @@ static void qcom_geni_serial_handle_tx_fifo(struct uart_port *uport,
+ 	}
+ 
+ 	qcom_geni_serial_send_chunk_fifo(uport, chunk);
++	port->tx_queued += chunk;
+ 
+ 	/*
+ 	 * The tx fifo watermark is level triggered and latched. Though we had
+-- 
+2.34.1
+

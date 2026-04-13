@@ -6,9 +6,12 @@ PKG_SOURCE_PROTO:=git
 PKG_BRANCH:=ginger_open
 PKG_RELEASE:=2
 PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-ppe
-PKG_MIRROR_HASH:=a1115fbc90ae9489b761c56f505cf3bd29c0676917fa32b640c59c65ad054f79
-PKG_SOURCE_VERSION:=30aab9c3973e6b950bfcd442b23d1156c3576148
-PKG_VERSION:=1.0
+PKG_MIRROR_HASH:=f550164c3f7f5419254dbd2d67998ad4743d310ec4c7abee1f95ba381844f1b3
+PKG_VERSION:=d53eff24bf257a8bb1b2f68beb3aa06332bfd567
+
+PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
+PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
+PKG_SOURCE_VERSION:=$(PKG_VERSION)
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -32,7 +35,7 @@ define KernelPackage/qca-nss-ppe-ds
   SUBMENU:=Network Devices
   TITLE:=Kernel driver for PPE Direct Switch (core driver)
   DEPENDS:=@TARGET_ipq95xx||TARGET_ipq95xx_32||TARGET_ipq53xx||TARGET_ipq53xx_32||TARGET_ipq54xx \
-	+kmod-qca-nss-ppe-vp \
+	+kmod-qca-nss-ppe +kmod-qca-nss-ppe-vp \
 	+kmod-qca-nss-dp-qca
   FILES:=$(PKG_BUILD_DIR)/drv/ppe_ds/qca-nss-ppe-ds.ko
   AUTOLOAD:=$(call AutoLoad,51,qca-nss-ppe-ds)

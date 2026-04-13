@@ -1,0 +1,347 @@
+From 12ffba7295cca59ed3e76f835489b6ad70ce8bff Mon Sep 17 00:00:00 2001
+From: Nidhi Jain <nidhjain@qti.qualcomm.com>
+Date: Mon, 2 Jun 2025 10:27:30 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: hostapd: Add support to handle
+TTLM negotiation via association frames
+
+Add support to parse the TTLM element received in the association
+request from non-AP MLD and send association response from AP MLD
+based on user configured response status code.
+
+If the ttlm_enable flag is enabled, the default response code is
+set to accept the STA preference and AP MLD to send the association
+response without TTLM element which indicates the TTLM negotiation
+success as per Draft P80211.be_D3.0 section 35.3.7.1.3 Negotiation
+of Tid-to-link mapping.
+
+If the response status code is configured as reject,then send the
+association response with TTLM element having default mapping.
+
+Signed-off-by: Nidhi Jain <nidhjain@qti.qualcomm.com>
+Signed-off-by: Dhanavandhana Kannan <dhanavan@qti.qualcomm.com>
+---
+ src/ap/ap_config.h             |   1 +
+ src/ap/ieee802_11.c            |  19 +++++
+ src/ap/ttlm.c                  | 144 +++++++++++++++++++++++++++++++++
+ src/ap/ttlm.h                  |   2 +
+ src/common/ieee802_11_common.c |   3 +
+ src/common/ieee802_11_common.h |   4 +
+ src/common/ieee802_11_defs.h   |  11 +++
+ 7 files changed, 184 insertions(+)
+
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1010,6 +1010,7 @@ struct hostapd_bss_config {
+ 	struct ieee80211_he_mu_edca_parameter_set epcs_he_mu_edca;
+ 	int epcs_parameter_set_count;
+ 	bool is_epcs_enabled;
++	bool ttlm_enable;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ };
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -5336,6 +5336,11 @@ static int add_associated_sta(struct hos
+ 		p = hostapd_eid_eht_operation(hapd, p);
+ 		hostapd_get_epcs_capab(hapd, sta);
+ 	}
++
++	if (hapd->conf->ttlm_enable &&
++	    sta->mld_info.tid_map_info.ttlm_ongoing_negotiation_info.ttlm_resp_type ==
++	    WLAN_STATUS_SUCCESS)
++		hostapd_apply_ttlm_mapping_to_driver(hapd, sta);
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	/*
+@@ -5701,6 +5706,22 @@ rsnxe_done:
+ 	}
+ #endif /* CONFIG_FILS */
+ 
++#ifdef CONFIG_IEEE80211BE
++	if (hapd->conf->ttlm_enable && status_code == WLAN_STATUS_DENIED_TID_TO_LINK_MAPPING) {
++		struct ttlm_ongoing_negotiation_info *ongoing_ttlm;
++		size_t ttlm_elem_len;
++		u8 *ttlm_elem;
++
++		ongoing_ttlm = &sta->mld_info.tid_map_info.ttlm_ongoing_negotiation_info;
++
++		if (hostapd_build_ttlm_elem(ongoing_ttlm, &ttlm_elem, &ttlm_elem_len) < 0)
++			return -1;
++
++		send_len += ttlm_elem_len;
++		os_free(ttlm_elem);
++	}
++#endif /* CONFIG_IEEE80211BE */
++
+ 	if (hostapd_drv_send_mlme(hapd, reply, send_len, 0, NULL, 0, 0) < 0) {
+ 		wpa_printf(MSG_INFO, "Failed to send assoc resp: %s",
+ 			   strerror(errno));
+@@ -6086,6 +6107,12 @@ static void handle_assoc(struct hostapd_
+ 			}
+ 		}
+ 	}
++
++	if (sta) {
++		resp = hostapd_handle_ttlm_assoc_req(hapd, mgmt, len, sta, pos, left);
++		if (resp == TTLM_RESP_TYPE_DENIED_TID_TO_LINK_MAPPING)
++			goto fail;
++	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ #ifdef CONFIG_IEEE80211R_AP
+--- a/src/ap/ttlm.c
++++ b/src/ap/ttlm.c
+@@ -411,6 +411,27 @@ int hostapd_apply_ttlm_mapping_to_driver
+ }
+ 
+ 
++bool hostapd_is_mapping_homogeneous(struct ttlm_ongoing_negotiation_info *ongoing_ttlm)
++{
++	u8 tid, i;
++
++	for (i = 0; i < TTLM_DIRECTION_MAX; i++) {
++		for (tid = 1; tid < NUM_MAX_TIDS; tid++) {
++			if (ongoing_ttlm->ttlm_info[i].direction == TTLM_DIRECTION_INVALID)
++				break;
++
++			if (ongoing_ttlm->ttlm_info[i].ieee_link_map_tid[tid] !=
++			    ongoing_ttlm->ttlm_info[i].ieee_link_map_tid[0]) {
++				wpa_printf(MSG_DEBUG, "Mapping is not homogeneous");
++				return false;
++			}
++		}
++	}
++
++	return true;
++}
++
++
+ int hostapd_handle_ttlm_resp(struct hostapd_data *hapd, struct sta_info *sta,
+ 			     const u8 *buf, size_t len)
+ {
+@@ -444,3 +465,157 @@ int hostapd_handle_ttlm_resp(struct host
+ 
+ 	return ret;
+ }
++
++
++static int hostapd_parse_ttlm_elem(struct hostapd_data *hapd,
++				   const struct ieee80211_ttlm_elem *ttlm,
++				   struct ttlm_info *ttlm_info)
++{
++	u8 control, tid, link_mapping_presence_ind, map_size;
++	u8 *pos;
++	enum ttlm_dir dir;
++
++	if (!ttlm) {
++		wpa_printf(MSG_ERROR, "IE buffer is NULL");
++		return -1;
++	}
++
++	pos = (void *)ttlm->optional;
++	control = ttlm->control;
++
++	if (control == 0)
++		return -1;
++
++	if (control & (TTLM_CONTROL_MAPPING_SWITCH_TIME_PRESENT_MASK |
++		       TTLM_CONTROL_EXPECTED_DURATION_PRESENT_MASK)) {
++		wpa_printf(MSG_ERROR, "Invalid TTLM element");
++		return -1;
++	}
++
++	dir = control & TTLM_CONTROL_DIRECTION_MASK;
++
++	if (dir >= TTLM_DIRECTION_INVALID) {
++		wpa_printf(MSG_ERROR, "Invalid direction");
++		return -1;
++	}
++
++	ttlm_info->direction = dir;
++	ttlm_info->default_link_mapping = control & TTLM_CONTROL_DEFAULT_LINK_MAPPING_MASK;
++
++	if (ttlm_info->default_link_mapping) {
++		wpa_printf(MSG_DEBUG, "Default link mapping");
++		return 0;
++	}
++
++	ttlm_info->link_mapping_size = control & TTLM_CONTROL_LINK_MAPPING_SIZE_MASK;
++
++	link_mapping_presence_ind = *pos;
++	pos++;
++
++	if (ttlm_info->link_mapping_size) {
++		/* Link mapping of TIDs is 1 octet if link_mapping_size is set to 1*/
++		map_size = 1;
++	} else {
++		/* Link mapping of TIDs is 2 octet if link_mapping_size is set to 0*/
++		map_size = 2;
++	}
++
++	for (tid = 0; tid < NUM_MAX_TIDS; tid++) {
++		if (!(link_mapping_presence_ind & BIT(tid)))
++			continue;
++
++		if (map_size == 1)
++			ttlm_info->ieee_link_map_tid[tid] = *pos;
++		else
++			ttlm_info->ieee_link_map_tid[tid] = host_to_le16(*pos);
++
++		pos += map_size;
++	}
++
++	return 0;
++}
++
++
++int hostapd_handle_ttlm_assoc_req(struct hostapd_data *hapd, const struct ieee80211_mgmt *mgmt,
++				  size_t len, struct sta_info *sta, const u8 *elem,
++				  size_t elem_len)
++{
++	struct ttlm_ongoing_negotiation_info *ongoing_ttlm;
++	struct ieee802_11_elems elems;
++	struct ttlm_info ttlm_info;
++	enum ttlm_dir dir;
++	int retval;
++	u8 i;
++
++	sta->mld_info.tid_map_info.ttlm_ongoing_negotiation_info.ttlm_resp_type = -1;
++	if (!hapd->conf->ttlm_enable)
++		return WLAN_STATUS_REQUEST_DECLINED;
++
++	if (ieee802_11_parse_elems(elem, elem_len, &elems, 0) == ParseFailed) {
++		wpa_printf(MSG_ERROR, "Could not parse assocReq from " MACSTR,
++			   MAC2STR(mgmt->sa));
++		return WLAN_STATUS_INVALID_IE;
++	}
++
++	ongoing_ttlm = os_zalloc(sizeof(struct ttlm_ongoing_negotiation_info));
++	if (!ongoing_ttlm) {
++		wpa_printf(MSG_ERROR, "Memory allocation for ongoing_ttlm failed");
++		return -1;
++	}
++
++	if (!elems.ttlm_num) {
++		wpa_printf(MSG_ERROR, "No TTLM elements present");
++		os_free(ongoing_ttlm);
++		return -1;
++	}
++
++	for (dir = 0; dir < TTLM_DIRECTION_MAX; dir++)
++		ongoing_ttlm->ttlm_info[dir].direction = TTLM_DIRECTION_INVALID;
++
++	for (i = 0; i < elems.ttlm_num; i++) {
++		retval = hostapd_parse_ttlm_elem(hapd, elems.ttlm[i], &ttlm_info);
++		if (!retval && ttlm_info.direction < TTLM_DIRECTION_MAX) {
++			os_memcpy(&ongoing_ttlm->ttlm_info[ttlm_info.direction],
++				  &ttlm_info, sizeof(struct ttlm_info));
++		} else {
++			wpa_printf(MSG_ERROR, "Failed to parse TTLM IE");
++			os_free(ongoing_ttlm);
++			return WLAN_STATUS_INVALID_IE;
++		}
++	}
++
++	if ((ongoing_ttlm->ttlm_info[TTLM_DIRECTION_DL].direction == TTLM_DIRECTION_DL ||
++	     ongoing_ttlm->ttlm_info[TTLM_DIRECTION_UL].direction == TTLM_DIRECTION_UL) &&
++	    ongoing_ttlm->ttlm_info[TTLM_DIRECTION_BIDI].direction == TTLM_DIRECTION_BIDI) {
++		wpa_printf(MSG_DEBUG, "Both DL/UL and BIDI TTLM IEs cannot exist at same time");
++		os_memset(ongoing_ttlm, 0, sizeof(*ongoing_ttlm));
++		ongoing_ttlm->ttlm_resp_type = WLAN_STATUS_DENIED_TID_TO_LINK_MAPPING;
++	}
++
++	os_memcpy(&sta->mld_info.tid_map_info.ttlm_ongoing_negotiation_info, ongoing_ttlm,
++		  sizeof(struct ttlm_ongoing_negotiation_info));
++
++	if (ongoing_ttlm->ttlm_resp_type != 0) {
++		wpa_printf(MSG_DEBUG, "DENIED response type");
++		ongoing_ttlm->ttlm_info[TTLM_DIRECTION_BIDI].direction = TTLM_DIRECTION_BIDI;
++		ongoing_ttlm->ttlm_info[TTLM_DIRECTION_DL].direction = TTLM_DIRECTION_INVALID;
++		ongoing_ttlm->ttlm_info[TTLM_DIRECTION_UL].direction = TTLM_DIRECTION_INVALID;
++		ongoing_ttlm->ttlm_info->default_link_mapping = true;
++
++		os_memcpy(&sta->mld_info.tid_map_info.ttlm_ongoing_negotiation_info, ongoing_ttlm,
++			  sizeof(struct ttlm_ongoing_negotiation_info));
++
++		sta->mld_info.tid_map_info.ttlm_ongoing_negotiation_info.ttlm_resp_type =
++			WLAN_STATUS_DENIED_TID_TO_LINK_MAPPING;
++
++		os_free(ongoing_ttlm);
++		return WLAN_STATUS_DENIED_TID_TO_LINK_MAPPING;
++	}
++
++	sta->mld_info.tid_map_info.ttlm_ongoing_negotiation_info.ttlm_resp_type =
++		WLAN_STATUS_SUCCESS;
++
++	os_free(ongoing_ttlm);
++	wpa_printf(MSG_DEBUG, "TTLM IE in assoc request has been parsed successfully");
++	return WLAN_STATUS_SUCCESS;
++}
+--- a/src/ap/ttlm.h
++++ b/src/ap/ttlm.h
+@@ -140,5 +140,8 @@ int hostapd_build_ttlm_elem(struct ttlm_
+ int hostapd_handle_ttlm_resp(struct hostapd_data *hapd, struct sta_info *sta,
+ 			     const u8 *buf, size_t len);
+ int hostapd_apply_ttlm_mapping_to_driver(struct hostapd_data *hapd, struct sta_info *sta);
++int hostapd_handle_ttlm_assoc_req(struct hostapd_data *hapd, const struct ieee80211_mgmt *mgmt,
++				  size_t len, struct sta_info *sta, const u8 *ie, size_t ie_len);
++bool hostapd_is_mapping_homogeneous(struct ttlm_ongoing_negotiation_info *ongoing_ttlm);
+ 
+ #endif /* TTLM_H */
+--- a/src/common/ieee802_11_common.c
++++ b/src/common/ieee802_11_common.c
+@@ -546,6 +546,9 @@ static int ieee802_11_parse_extension(co
+ 		elems->pasn_encrypted_data = pos;
+ 		elems->pasn_encrypted_data_len = elen;
+ 		break;
++	case WLAN_EID_EXT_TID_TO_LINK_MAPPING:
++		elems->ttlm[elems->ttlm_num] = (void *)pos;
++		elems->ttlm_num++;
+ 	default:
+ 		if (show_errors) {
+ 			wpa_printf(MSG_MSGDUMP,
+--- a/src/common/ieee802_11_common.h
++++ b/src/common/ieee802_11_common.h
+@@ -37,6 +37,8 @@ struct multi_ap_params {
+ 	u16 vlanid;
+ };
+ 
++#define IEEE80211_TTLM_MAX_CNT 2 /* Maximum number of TTLM IE's */
++
+ /* Parsed Information Elements */
+ struct ieee802_11_elems {
+ 	const u8 *ssid;
+@@ -123,6 +125,7 @@ struct ieee802_11_elems {
+ 	const u8 *rsnxe_override;
+ 	const u8 *rsn_selection;
+ 	const u8 *wfa_capab;
++	const struct ieee80211_ttlm_elem *ttlm[IEEE80211_TTLM_MAX_CNT];
+ 
+ 	u8 ssid_len;
+ 	u8 supp_rates_len;
+@@ -205,6 +208,7 @@ struct ieee802_11_elems {
+ 	 * fragmented element.
+ 	 */
+ 	unsigned int num_frag_elems;
++	u8 ttlm_num;
+ };
+ 
+ typedef enum { ParseOK = 0, ParseUnknown = 1, ParseFailed = -1 } ParseRes;
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -3483,4 +3483,15 @@ struct elem_header {
+ 	u8 elem_id;
+ 	u8 elem_len;
+ } STRUCT_PACKED;
++
++/**
++ * struct ieee80211_ttlm_elem - TID-To-Link Mapping element
++ *
++ * @control: the first part of control field
++ * @optional: the second part of control field
++ */
++struct ieee80211_ttlm_elem {
++	u8 control;
++	u8 optional[];
++} STRUCT_PACKED;
+ #endif /* IEEE802_11_DEFS_H */

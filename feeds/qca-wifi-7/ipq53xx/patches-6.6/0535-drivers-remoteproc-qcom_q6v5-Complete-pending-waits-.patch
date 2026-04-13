@@ -1,0 +1,181 @@
+From 518442282ceee4dfbe4b4c4f0f914173c6fab310 Mon Sep 17 00:00:00 2001
+From: Sridharan S N <quic_sridsn@quicinc.com>
+Date: Thu, 7 Mar 2024 13:27:51 +0530
+Subject: [PATCH] drivers: remoteproc: qcom_q6v5: Complete pending waits on
+ rproc crash
+
+Rproc start/stop/spawn might be waiting for completion from IRQ when a
+rproc crashes. In such cases, the recovery waits for the timeout before
+proceeding as mutex is held by the boot/shutdown threads.
+
+Complete all pending waits for an rproc when fatal or wdog IRQ is
+received. In the wait_for_completion function, check if the
+corresponding ack flag is set and return success/failure. This will
+be set only if completion is from the IRQ and not from crash.
+
+Change-Id: I8ed32bb626fbc6f582b4639806bb64574926954a
+Signed-off-by: Vignesh Viswanathan <quic_viswanat@quicinc.com>
+Signed-off-by: Sridharan S N <quic_sridsn@quicinc.com>
+---
+ drivers/remoteproc/qcom_q6v5.c | 41 +++++++++++++++++++++++++++++-----
+ drivers/remoteproc/qcom_q6v5.h |  4 ++++
+ 2 files changed, 39 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/remoteproc/qcom_q6v5.c b/drivers/remoteproc/qcom_q6v5.c
+index d42b887d6821..aa80ef586563 100644
+--- a/drivers/remoteproc/qcom_q6v5.c
++++ b/drivers/remoteproc/qcom_q6v5.c
+@@ -60,9 +60,13 @@ int qcom_q6v5_prepare(struct qcom_q6v5 *q6v5)
+ 
+ 	reinit_completion(&q6v5->start_done);
+ 	reinit_completion(&q6v5->stop_done);
++	reinit_completion(&q6v5->spawn_done);
+ 
+ 	q6v5->running = true;
+ 	q6v5->handover_issued = false;
++	q6v5->start_ack = false;
++	q6v5->stop_ack = false;
++	q6v5->spawn_ack = false;
+ 
+ 	enable_irq(q6v5->handover_irq);
+ 
+@@ -96,6 +100,7 @@ static irqreturn_t q6v5_wdog_interrupt(int irq, void *data)
+ 
+ 	/* Sometimes the stop triggers a watchdog rather than a stop-ack */
+ 	if (!q6v5->running) {
++		q6v5->stop_ack = true;
+ 		complete(&q6v5->stop_done);
+ 		return IRQ_HANDLED;
+ 	}
+@@ -107,6 +112,11 @@ static irqreturn_t q6v5_wdog_interrupt(int irq, void *data)
+ 		dev_err(q6v5->dev, "watchdog without message\n");
+ 
+ 	q6v5->running = false;
++
++	/* Complete any pending waits for this rproc */
++	complete(&q6v5->spawn_done);
++	complete(&q6v5->start_done);
++	complete(&q6v5->stop_done);
+ 	rproc_report_crash(q6v5->rproc, RPROC_WATCHDOG);
+ 
+ 	return IRQ_HANDLED;
+@@ -128,6 +138,11 @@ irqreturn_t q6v5_fatal_interrupt(int irq, void *data)
+ 		dev_err(q6v5->dev, "fatal error without message\n");
+ 
+ 	q6v5->running = false;
++
++	/* Complete any pending waits for this rproc */
++	complete(&q6v5->spawn_done);
++	complete(&q6v5->start_done);
++	complete(&q6v5->stop_done);
+ 	rproc_report_crash(q6v5->rproc, RPROC_FATAL_ERROR);
+ 
+ 	return IRQ_HANDLED;
+@@ -137,6 +152,7 @@ irqreturn_t q6v5_ready_interrupt(int irq, void *data)
+ {
+ 	struct qcom_q6v5 *q6v5 = data;
+ 
++	q6v5->start_ack = true;
+ 	complete(&q6v5->start_done);
+ 
+ 	return IRQ_HANDLED;
+@@ -156,10 +172,13 @@ int qcom_q6v5_wait_for_start(struct qcom_q6v5 *q6v5, int timeout)
+ 	int ret;
+ 
+ 	ret = wait_for_completion_timeout(&q6v5->start_done, timeout);
+-	if (!ret)
+-		disable_irq(q6v5->handover_irq);
+ 
+-	return !ret ? -ETIMEDOUT : 0;
++	if (!ret) {
++		disable_irq(q6v5->handover_irq);
++		return -ETIMEDOUT;
++	} else {
++		return q6v5->start_ack ? 0 : -ERESTARTSYS;
++	}
+ }
+ EXPORT_SYMBOL_GPL(qcom_q6v5_wait_for_start);
+ 
+@@ -181,6 +200,7 @@ irqreturn_t q6v5_spawn_interrupt(int irq, void *data)
+ {
+ 	struct qcom_q6v5 *q6v5 = data;
+ 
++	q6v5->spawn_ack = true;
+ 	complete(&q6v5->spawn_done);
+ 
+ 	return IRQ_HANDLED;
+@@ -190,6 +210,7 @@ irqreturn_t q6v5_stop_interrupt(int irq, void *data)
+ {
+ 	struct qcom_q6v5 *q6v5 = data;
+ 
++	q6v5->stop_ack = true;
+ 	complete(&q6v5->stop_done);
+ 
+ 	return IRQ_HANDLED;
+@@ -207,7 +228,7 @@ int qcom_q6v5_request_stop(struct qcom_q6v5 *q6v5, struct qcom_sysmon *sysmon)
+ 	int ret;
+ 
+ 	q6v5->running = false;
+-
++	q6v5->stop_ack = false;
+ 	/* Don't perform SMP2P dance if remote isn't running */
+ 	if (q6v5->rproc->state != RPROC_RUNNING || qcom_sysmon_shutdown_acked(sysmon))
+ 		return 0;
+@@ -219,7 +240,10 @@ int qcom_q6v5_request_stop(struct qcom_q6v5 *q6v5, struct qcom_sysmon *sysmon)
+ 
+ 	qcom_smem_state_update_bits(q6v5->state, BIT(q6v5->stop_bit), 0);
+ 
+-	return ret == 0 ? -ETIMEDOUT : 0;
++	if (!ret)
++		return -ETIMEDOUT;
++	else
++		return q6v5->stop_ack ? 0 : -ERESTARTSYS;
+ }
+ EXPORT_SYMBOL_GPL(qcom_q6v5_request_stop);
+ 
+@@ -233,6 +257,7 @@ int qcom_q6v5_request_spawn(struct qcom_q6v5 *q6v5)
+ {
+ 	int ret;
+ 
++	q6v5->spawn_ack = false;
+ 	ret = qcom_smem_state_update_bits(q6v5->spawn_state,
+ 					  BIT(q6v5->spawn_bit), BIT(q6v5->spawn_bit));
+ 
+@@ -241,7 +266,10 @@ int qcom_q6v5_request_spawn(struct qcom_q6v5 *q6v5)
+ 	qcom_smem_state_update_bits(q6v5->spawn_state,
+ 				    BIT(q6v5->spawn_bit), 0);
+ 
+-	return ret == 0 ? -ETIMEDOUT : 0;
++	if (!ret)
++		return -ETIMEDOUT;
++	else
++		return q6v5->spawn_ack ? 0 : -ERESTARTSYS;
+ }
+ EXPORT_SYMBOL_GPL(qcom_q6v5_request_spawn);
+ 
+@@ -289,6 +317,7 @@ int qcom_q6v5_init(struct qcom_q6v5 *q6v5, struct platform_device *pdev,
+ 
+ 	init_completion(&q6v5->start_done);
+ 	init_completion(&q6v5->stop_done);
++	init_completion(&q6v5->spawn_done);
+ 
+ 	q6v5->wdog_irq = platform_get_irq_byname(pdev, "wdog");
+ 	if (q6v5->wdog_irq < 0)
+diff --git a/drivers/remoteproc/qcom_q6v5.h b/drivers/remoteproc/qcom_q6v5.h
+index d00568339d46..8a93d64ccea2 100644
+--- a/drivers/remoteproc/qcom_q6v5.h
++++ b/drivers/remoteproc/qcom_q6v5.h
+@@ -40,6 +40,10 @@ struct qcom_q6v5 {
+ 	struct completion stop_done;
+ 	struct completion spawn_done;
+ 
++	bool start_ack;
++	bool stop_ack;
++	bool spawn_ack;
++
+ 	int remote_id;
+ 	int crash_reason;
+ 
+-- 
+2.34.1
+

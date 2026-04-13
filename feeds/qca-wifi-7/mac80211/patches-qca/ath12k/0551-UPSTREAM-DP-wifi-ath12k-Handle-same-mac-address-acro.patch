@@ -1,0 +1,205 @@
+From a46274a625265a2b18f53ab82aaed18f1b6a6dd5 Mon Sep 17 00:00:00 2001
+From: Harsh Kumar Bijlani <hbijlani@qti.qualcomm.com>
+Date: Mon, 29 Sep 2025 18:07:54 +0530
+Subject: [PATCH] UPSTREAM:DP:wifi:ath12k: Handle same mac address across vdevs
+ on different radios
+
+In certain scenarios, same mac address can be used to create AP/monitor
+vdevs on different radios present on different devices.
+
+struct ath12k_dp_hw maintains a linked list of struct ath12k_dp_peer
+wherein this list is at the global level.
+
+Re-usage of the same mac address can result in creation and deletion
+of ath12k_dp_peer for AP vdev and also result in use-after-free scenarios.
+
+In order to fix this, add logic to separately handle ath12k_dp_peer for vdev
+by considering hw_link_id also in the create and delete paths.
+
+Signed-off-by: Harsh Kumar Bijlani <hbijlani@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_cmn.h  |  1 +
+ drivers/net/wireless/ath/ath12k/dp_peer.c | 46 ++++++++++++++++++++---
+ drivers/net/wireless/ath/ath12k/dp_peer.h |  5 ++-
+ drivers/net/wireless/ath/ath12k/mac.c     |  6 +--
+ 4 files changed, 48 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp_cmn.h b/drivers/net/wireless/ath/ath12k/dp_cmn.h
+index fed6c4d..ea9f685 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_cmn.h
++++ b/drivers/net/wireless/ath/ath12k/dp_cmn.h
+@@ -75,6 +75,7 @@ struct ath12k_dp_peer_create_params {
+ 	struct ieee80211_sta *sta;
+ 	bool is_mlo;
+ 	bool is_vdev_peer;
++	u8 hw_link_id;
+ 	u16 peer_id;
+ };
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/dp_peer.c b/drivers/net/wireless/ath/ath12k/dp_peer.c
+index 2d3bc44..0b75f37 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.c
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.c
+@@ -490,6 +490,22 @@ struct ath12k_dp_peer *ath12k_dp_peer_find_by_addr_and_sta(struct ath12k_dp_hw *
+ 	return NULL;
+ }
+ 
++static struct ath12k_dp_peer *ath12k_dp_vdev_peer_find(struct ath12k_dp_hw *dp_hw,
++						       u8 *addr, u8 hw_link_id)
++{
++	struct ath12k_dp_peer *dp_peer;
++
++	lockdep_assert_held(&dp_hw->peer_lock);
++
++	list_for_each_entry(dp_peer, &dp_hw->peers, list) {
++		if (ether_addr_equal(dp_peer->addr, addr) &&
++		    dp_peer->hw_link_id == hw_link_id)
++			return dp_peer;
++	}
++
++	return NULL;
++}
++
+ struct ath12k_dp_peer *ath12k_dp_peer_create_find(struct ath12k_dp_hw *dp_hw, u8 *addr,
+ 						  struct ieee80211_sta *sta,
+ 						  bool mlo_peer)
+@@ -566,7 +582,11 @@ int ath12k_dp_peer_create(struct ath12k_dp_hw *dp_hw, u8 *addr,
+ 	struct wireless_dev *wdev;
+ 
+ 	spin_lock_bh(&dp_hw->peer_lock);
+-	dp_peer = ath12k_dp_peer_create_find(dp_hw, addr, params->sta, params->is_mlo);
++	if (!params->is_vdev_peer)
++		dp_peer = ath12k_dp_peer_create_find(dp_hw, addr, params->sta,
++						     params->is_mlo);
++	else
++		dp_peer = ath12k_dp_vdev_peer_find(dp_hw, addr, params->hw_link_id);
+ 
+ 	if (dp_peer) {
+ 		spin_unlock_bh(&dp_hw->peer_lock);
+@@ -584,7 +604,9 @@ int ath12k_dp_peer_create(struct ath12k_dp_hw *dp_hw, u8 *addr,
+ 	dp_peer->is_mlo = params->is_mlo;
+ 	dp_peer->peer_id = params->is_mlo ? params->peer_id : ATH12K_DP_PEER_ID_INVALID;
+ 	dp_peer->is_vdev_peer = params->is_vdev_peer;
+-
++	/* Update hw_link_id for self bss peer */
++	if (dp_peer->is_vdev_peer)
++		dp_peer->hw_link_id = params->hw_link_id;
+ 	dp_peer->sec_type = HAL_ENCRYPT_TYPE_OPEN;
+ 	dp_peer->sec_type_grp = HAL_ENCRYPT_TYPE_OPEN;
+ 
+@@ -605,14 +627,19 @@ int ath12k_dp_peer_create(struct ath12k_dp_hw *dp_hw, u8 *addr,
+ 	return 0;
+ }
+ 
+-void ath12k_dp_peer_delete(struct ath12k_dp_hw *dp_hw, u8 *addr, struct ieee80211_sta *sta)
++void ath12k_dp_peer_delete(struct ath12k_dp_hw *dp_hw, u8 *addr,
++			   struct ieee80211_sta *sta, u8 hw_link_id)
+ {
+ 	struct ath12k_dp_peer *dp_peer;
+ 	u16 peerid_index;
+ 
+ 	spin_lock_bh(&dp_hw->peer_lock);
+ 
+-	dp_peer = ath12k_dp_peer_find_by_addr_and_sta(dp_hw, addr, sta);
++	if (sta)
++		dp_peer = ath12k_dp_peer_find_by_addr_and_sta(dp_hw, addr, sta);
++	else
++		dp_peer = ath12k_dp_vdev_peer_find(dp_hw, addr, hw_link_id);
++
+ 	if (!dp_peer) {
+ 		spin_unlock_bh(&dp_hw->peer_lock);
+ 		return;
+@@ -648,11 +675,14 @@ int ath12k_dp_link_peer_assign(struct ath12k *ar, u8 vdev_id,
+ 	u16 peerid_index;
+ 	int ret;
+ 	u8 *dp_peer_mac = !sta ? addr : sta->addr;
++	bool is_vdev_peer = false;
+ 
+ 	if (!sta) {
+ 		struct ath12k_dp_peer_create_params params = {0};
+ 
+ 		params.is_vdev_peer = true;
++		is_vdev_peer = true;
++		params.hw_link_id = hw_link_id;
+ 
+ 		ath12k_dp_peer_create(dp_hw, addr, &params, vif);
+ 	}
+@@ -667,7 +697,11 @@ int ath12k_dp_link_peer_assign(struct ath12k *ar, u8 vdev_id,
+ 
+ 	spin_lock_bh(&dp_hw->peer_lock);
+ 
+-	dp_peer = ath12k_dp_peer_find_by_addr_and_sta(dp_hw, dp_peer_mac, sta);
++	if (!is_vdev_peer)
++		dp_peer = ath12k_dp_peer_find_by_addr_and_sta(dp_hw, dp_peer_mac, sta);
++	else
++		dp_peer = ath12k_dp_vdev_peer_find(dp_hw, dp_peer_mac, hw_link_id);
++
+ 	if (!dp_peer) {
+ 		ret = -ENOENT;
+ 		goto err_dp_peer;
+@@ -789,7 +823,7 @@ void ath12k_dp_link_peer_unassign(struct ath12k *ar, u8 vdev_id, u8 *addr)
+ 	synchronize_rcu();
+ 
+ 	if (is_vdev_peer)
+-		ath12k_dp_peer_delete(dp_hw, addr, NULL);
++		ath12k_dp_peer_delete(dp_hw, addr, NULL, ar->hw_link_id);
+ }
+ 
+ void ath12k_link_peer_get_sta_rate_info_stats(struct ath12k_dp *dp, const u8 *addr,
+diff --git a/drivers/net/wireless/ath/ath12k/dp_peer.h b/drivers/net/wireless/ath/ath12k/dp_peer.h
+index c052048..58ecab9 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.h
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.h
+@@ -154,6 +154,8 @@ struct ath12k_dp_peer {
+ 	u8 addr[ETH_ALEN];
+ 	bool is_mlo;
+ 	bool is_vdev_peer;
++	/* hw_link_id of the radio, valid only for self bss peer */
++	u8 hw_link_id;
+ 
+ 	u8 primary_link_id;
+ 	u8 assoc_link_id;
+@@ -273,7 +275,8 @@ int ath12k_dp_link_peer_rhash_delete(struct ath12k_dp *dp,
+ int ath12k_dp_peer_create(struct ath12k_dp_hw *dp_hw, u8 *addr,
+ 			  struct ath12k_dp_peer_create_params *params,
+ 			  struct ieee80211_vif *vif);
+-void ath12k_dp_peer_delete(struct ath12k_dp_hw *dp_hw, u8 *addr, struct ieee80211_sta *sta);
++void ath12k_dp_peer_delete(struct ath12k_dp_hw *dp_hw, u8 *addr,
++			   struct ieee80211_sta *sta, u8 hw_link_id);
+ struct ath12k_dp_peer *ath12k_dp_peer_find_by_peerid_index(struct ath12k_dp *dp,
+ 							   struct ath12k_pdev_dp *dp_pdev,
+ 							   u16 peer_id);
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 181bf0b..a435b5d 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -1524,7 +1524,7 @@ void ath12k_mac_peer_cleanup_all(struct ath12k *ar)
+ 	 */
+ 	list_for_each_entry_safe_reverse(arvif, tmp_vif, &ar->arvifs, list) {
+ 		if (arvif->ahvif->vdev_type == WMI_VDEV_TYPE_AP) {
+-			ath12k_dp_peer_delete(dp_hw, arvif->bssid, NULL);
++			ath12k_dp_peer_delete(dp_hw, arvif->bssid, NULL, ar->hw_link_id);
+ 			arvif->num_stations = 0;
+ 		}
+ 	}
+@@ -11752,7 +11752,7 @@ ml_station_remove:
+ 			if (!WARN_ON(!arvif || !arsta))
+ 				ath12k_mac_station_remove(arvif->ar, arvif, arsta);
+ 		}
+-		ath12k_dp_peer_delete(&ah->dp_hw, sta->addr, sta);
++		ath12k_dp_peer_delete(&ah->dp_hw, sta->addr, sta, ar->hw_link_id);
+ 		wiphy_work_cancel(hw->wiphy, &ahsta->set_4addr_wk);
+ 	}
+ 
+@@ -11765,7 +11765,7 @@ ml_station_remove:
+ 
+ peer_delete:
+ 	if (ret)
+-		ath12k_dp_peer_delete(&ah->dp_hw, sta->addr, sta);
++		ath12k_dp_peer_delete(&ah->dp_hw, sta->addr, sta, ar->hw_link_id);
+ ml_peer_id_free:
+ 	if (ret)
+ 		ath12k_peer_ml_free(ah, ahsta);
+-- 
+2.34.1
+

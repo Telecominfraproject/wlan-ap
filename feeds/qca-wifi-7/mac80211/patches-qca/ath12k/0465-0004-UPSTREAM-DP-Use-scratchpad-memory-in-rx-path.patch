@@ -1,0 +1,526 @@
+From 497a87bfb74e44e4449573582996a6dc4cc1c6b2 Mon Sep 17 00:00:00 2001
+From: Pavankumar Nandeshwar <pnandesh@qti.qualcomm.com>
+Date: Tue, 22 Jul 2025 12:50:46 +0530
+Subject: [PATCH] UPSTREAM: DP: wifi: ath12k: Use scratchpad memory in rx path
+
+Use scratch-pad memory in rx path in place of
+rxcb area of skb for storing data. This will improve
+performance in RX as the new contiguous memory will provide
+better cache efficiency in rx path.
+
+patch-dependency:
+0400-0009-UPSTREAM-DP-Use-RX-HW-datastructures-in-rx-path.patch
+
+Signed-off-by: Pavankumar Nandeshwar <pnandesh@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c | 220 ++++++++++--------
+ drivers/net/wireless/ath/ath12k/wifi7/hal.h   |  10 +-
+ 2 files changed, 127 insertions(+), 103 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
+index eb3623b..d32701e 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
+@@ -104,20 +104,14 @@ static void ath12k_wifi7_dp_clean_up_skb_list(struct sk_buff_head *skb_list)
+ 		dev_kfree_skb_any(skb);
+ }
+ 
+-static struct sk_buff *ath12k_dp_rx_get_msdu_last_buf(struct sk_buff_head *msdu_list,
+-						      struct sk_buff *first)
++static struct sk_buff *ath12k_dp_rx_get_msdu_last_buf(struct hal_rx_spd_data *desc,
++						      int num_msdu, int msdu_idx)
+ {
+-	struct sk_buff *skb;
+-	struct hal_rx_spd_data *spd_desc_l =
+-			(struct hal_rx_spd_data *) ATH12K_SKB_RXCB_RAW(first);
+-
+-	if (!spd_desc_l->rx_msdu_info.msdu_continuation)
+-		return first;
++	int i;
+ 
+-	skb_queue_walk(msdu_list, skb) {
+-		spd_desc_l = (struct hal_rx_spd_data *) ATH12K_SKB_RXCB_RAW(skb);
+-		if (!spd_desc_l->rx_msdu_info.msdu_continuation)
+-			return skb;
++	for (i = msdu_idx; i < num_msdu; i++) {
++		if (!desc[i].rx_msdu_info.msdu_continuation)
++			return desc[i].msdu;
+ 	}
+ 
+ 	return NULL;
+@@ -549,10 +543,11 @@ static bool ath12k_wifi7_dp_rx_check_fast_rx(struct ath12k_dp *dp,
+ }
+ 
+ static int ath12k_wifi7_dp_rx_msdu_coalesce(struct ath12k_dp *dp,
+-					    struct sk_buff_head *msdu_list,
++					    struct hal_rx_spd_data *rx_status_desc,
+ 					    struct sk_buff *first, struct sk_buff *last,
+ 					    u8 l3pad_bytes, int msdu_len,
+-					    struct hal_rx_desc *desc)
++					    struct hal_rx_desc *desc,
++					    int msdu_idx, int num_msdus)
+ {
+ 	struct ath12k_base *ab = dp->ab;
+ 	struct sk_buff *skb;
+@@ -594,20 +589,26 @@ static int ath12k_wifi7_dp_rx_msdu_coalesce(struct ath12k_dp *dp,
+ 	if (space_extra > 0 &&
+ 	    (pskb_expand_head(first, 0, space_extra, GFP_ATOMIC) < 0)) {
+ 		/* Free up all buffers of the MSDU */
+-		while ((skb = __skb_dequeue(msdu_list)) != NULL) {
+-			spd_desc_l = ATH12K_SKB_RXCB_RAW(skb);
++		for (; msdu_idx < num_msdus; msdu_idx++) {
++			spd_desc_l = &rx_status_desc[msdu_idx];
++			if (!spd_desc_l->msdu)
++				continue;
++
+ 			if (!spd_desc_l->rx_msdu_info.msdu_continuation) {
+-				dev_kfree_skb_any(skb);
++				dev_kfree_skb_any(spd_desc_l->msdu);
++				spd_desc_l->msdu = NULL;
+ 				break;
+ 			}
+-			dev_kfree_skb_any(skb);
++			dev_kfree_skb_any(spd_desc_l->msdu);
++			spd_desc_l->msdu = NULL;
+ 		}
+ 		return -ENOMEM;
+ 	}
+ 
+ 	rem_len = msdu_len - buf_first_len;
+-	while ((skb = __skb_dequeue(msdu_list)) != NULL && rem_len > 0) {
+-		spd_desc_l = ATH12K_SKB_RXCB_RAW(skb);
++	for (; msdu_idx < num_msdus && rem_len > 0; msdu_idx++) {
++		spd_desc_l = &rx_status_desc[msdu_idx];
++		skb = spd_desc_l->msdu;
+ 		is_continuation = spd_desc_l->rx_msdu_info.msdu_continuation;
+ 		if (is_continuation)
+ 			buf_len = DP_RX_BUFFER_SIZE - hal_rx_desc_sz;
+@@ -617,6 +618,7 @@ static int ath12k_wifi7_dp_rx_msdu_coalesce(struct ath12k_dp *dp,
+ 		if (buf_len > (DP_RX_BUFFER_SIZE - hal_rx_desc_sz)) {
+ 			WARN_ON_ONCE(1);
+ 			dev_kfree_skb_any(skb);
++			spd_desc_l->msdu = NULL;
+ 			return -EINVAL;
+ 		}
+ 
+@@ -625,6 +627,7 @@ static int ath12k_wifi7_dp_rx_msdu_coalesce(struct ath12k_dp *dp,
+ 		skb_copy_from_linear_data(skb, skb_put(first, buf_len),
+ 					  buf_len);
+ 		dev_kfree_skb_any(skb);
++		spd_desc_l->msdu = NULL;
+ 
+ 		rem_len -= buf_len;
+ 		if (!is_continuation)
+@@ -871,21 +874,21 @@ static int ath12k_wifi7_dp_rx_h_mpdu(struct ath12k_pdev_dp *dp_pdev,
+ 
+ 	ath12k_wifi7_dp_rx_h_csum_offload(msdu, rx_msdu_info);
+ 
+-	if (peer) {
+-		/* restting 4addr da mcbc packets as in 4addr mcbc packets are
+-		 * unicast only and sta send sends unicast pkts only.
+-		 */
+-		rx_msdu_info->ra_is_mcbc =
+-				rx_msdu_info->da_is_mcbc && !peer->is_reset_mcbc;
+-
+-		if (*fast_rx &&
++	if (likely(peer)) {
++		if (likely(*fast_rx &&
+ 		    ath12k_wifi7_dp_rx_check_fast_rx(dp, msdu, rx_msdu_info,
+-							 tlv_info, peer)) {
++							 tlv_info, peer))) {
+ 			msdu->protocol = eth_type_trans(msdu, peer->dev);
+ 			netif_receive_skb(msdu);
+ 			return ret;
+ 		}
+ 
++		/* restting 4addr da mcbc packets as in 4addr mcbc packets are
++		 * unicast only and sta send sends unicast pkts only.
++		 */
++		rx_msdu_info->ra_is_mcbc =
++				rx_msdu_info->da_is_mcbc && !peer->is_reset_mcbc;
++
+ 		is_4addr_sta = peer->vdev_type_4addr & BIT(NL80211_IFTYPE_STATION);
+ 		if (rx_msdu_info->ra_is_mcbc)
+ 			enctype = peer->sec_type_grp;
+@@ -1135,9 +1138,9 @@ static bool ath12k_dp_rx_check_nwifi_hdr_len_valid(struct ath12k_dp *dp,
+ static enum ath12k_dp_rx_error
+ ath12k_wifi7_dp_rx_process_msdu(struct ath12k_pdev_dp *dp_pdev,
+ 				struct sk_buff *msdu,
+-				struct sk_buff_head *msdu_list,
++				struct hal_rx_spd_data *rx_status_desc,
++				int num_msdus, int msdu_idx,
+ 				struct ieee80211_rx_status *rx_status,
+-				struct hal_rx_desc_data *rx_desc_data,
+ 				bool *fast_rx, int ring_id)
+ {
+ 	struct rx_msdu_desc_info *rx_msdu_info;
+@@ -1157,21 +1160,13 @@ ath12k_wifi7_dp_rx_process_msdu(struct ath12k_pdev_dp *dp_pdev,
+ 	u16 peer_id = 0;
+ 	enum ath12k_dp_rx_error drop_reason = DP_RX_ERR_DROP_MISC;
+ 
+-	spd_desc_l = (struct hal_rx_spd_data *) ATH12K_SKB_RXCB_RAW(msdu);
++	spd_desc_l = &rx_status_desc[msdu_idx];
+ 	rx_msdu_info = &spd_desc_l->rx_msdu_info;
+ 	rx_mpdu_info = &spd_desc_l->rx_mpdu_info;
+ 	tlv_info = &spd_desc_l->tlv_info;
+ 	rx_desc = (struct hal_rx_desc *)msdu->data;
+ 	peer_id = rx_mpdu_info->peer_id;
+ 
+-	last_buf = ath12k_dp_rx_get_msdu_last_buf(msdu_list, msdu);
+-	if (unlikely(!last_buf)) {
+-		ath12k_warn(dp,
+-			    "No valid Rx buffer to access MSDU_END tlv\n");
+-		drop_reason = DP_RX_ERR_DROP_LAST_MSDU_NOT_FOUND;
+-		goto free_out;
+-	}
+-
+ 	ath12k_wifi7_dp_extract_rx_spd_data(hal, spd_desc_l, rx_desc, 0);
+ 
+ 	msdu_len = rx_msdu_info->msdu_length;
+@@ -1196,10 +1191,10 @@ ath12k_wifi7_dp_rx_process_msdu(struct ath12k_pdev_dp *dp_pdev,
+ 		DP_DEVICE_STATS_INC(dp, rx.rx_err[DP_RX_ERR_DROP_INV_PEER][ring_id], 1);
+ 	}
+ 
+-	if (rx_mpdu_info->fragment_flag) {
++	if (unlikely(rx_mpdu_info->fragment_flag)) {
+ 		skb_pull(msdu, hal_rx_desc_sz);
+-	} else if (!rx_msdu_info->msdu_continuation) {
+-		if ((msdu_len + hal_rx_desc_sz) > DP_RX_BUFFER_SIZE) {
++	} else if (likely(!rx_msdu_info->msdu_continuation)) {
++		if (unlikely((msdu_len + hal_rx_desc_sz) > DP_RX_BUFFER_SIZE)) {
+ 			ath12k_warn(dp, "invalid msdu len %u\n", msdu_len);
+ 			ath12k_dbg_dump(dp->ab, ATH12K_DBG_DATA, NULL, "", rx_desc,
+ 					sizeof(*rx_desc));
+@@ -1209,10 +1204,18 @@ ath12k_wifi7_dp_rx_process_msdu(struct ath12k_pdev_dp *dp_pdev,
+ 		skb_put(msdu, hal_rx_desc_sz + l3_pad_bytes + msdu_len);
+ 		skb_pull(msdu, hal_rx_desc_sz + l3_pad_bytes);
+ 	} else {
+-		ret = ath12k_wifi7_dp_rx_msdu_coalesce(dp, msdu_list,
++		last_buf = ath12k_dp_rx_get_msdu_last_buf(rx_status_desc, num_msdus,
++							  msdu_idx);
++		if (unlikely(!last_buf)) {
++			ath12k_warn(dp, "No valid Rx buffer to access MSDU_END tlv\n");
++			drop_reason = DP_RX_ERR_DROP_LAST_MSDU_NOT_FOUND;
++			goto free_out;
++		}
++
++		ret = ath12k_wifi7_dp_rx_msdu_coalesce(dp, rx_status_desc,
+ 						       msdu, last_buf,
+ 						       l3_pad_bytes, msdu_len,
+-						       rx_desc);
++						       rx_desc, msdu_idx, num_msdus);
+ 		if (ret) {
+ 			ath12k_warn(dp,
+ 				    "failed to coalesce msdu rx buffer%d\n", ret);
+@@ -1235,6 +1238,15 @@ ath12k_wifi7_dp_rx_process_msdu(struct ath12k_pdev_dp *dp_pdev,
+ 		goto free_out;
+ 	}
+ 
++	if (likely(msdu_idx + 1 < num_msdus)) {
++		struct hal_rx_spd_data *spd_desc_next =
++			&rx_status_desc[msdu_idx + 1];
++		struct sk_buff *next_msdu = spd_desc_next->msdu;
++
++		prefetch(next_msdu->data);
++		prefetch(&next_msdu->data[128]);
++	}
++
+ 	if (likely(*fast_rx)) {
+ 		DP_PEER_STATS_PKT_LEN(peer, rx, ring_id, sent_to_stack_fast, link_id, 1, msdu_len);
+ 		return DP_RX_SUCCESS;
+@@ -1258,24 +1270,20 @@ free_out:
+ 	return drop_reason;
+ }
+ 
+-static void ath12k_soc_dp_rx_stats(struct ath12k_dp *dp, struct sk_buff *msdu,
+-				   struct hal_rx_desc_data *rx_desc_data,
+-				   int ring_id)
++static void ath12k_soc_dp_rx_stats(struct ath12k_dp *dp, bool is_mcbc, int ring_id)
+ {
+-	if (rx_desc_data->is_mcbc) {
++	if (is_mcbc)
+ 		dp->device_stats.non_fast_mcast_rx[ring_id][dp->device_id]++;
+-	} else {
++	else
+ 		dp->device_stats.non_fast_unicast_rx[ring_id][dp->device_id]++;
+-	}
+ }
+ 
+ static void
+ ath12k_wifi7_dp_rx_process_received_packets(struct ath12k_dp *dp,
+ 					    struct napi_struct *napi,
+-					    struct sk_buff_head *msdu_list,
+-					    int ring_id)
++					    struct hal_rx_spd_data *rx_status_desc,
++					    int ring_id, int num_msdus)
+ {
+-	struct hal_rx_desc_data rx_desc_data = {0};
+ 	struct ath12k_dp_hw_group *dp_hw_grp = dp->dp_hw_grp;
+ 	struct ieee80211_rx_status rx_status = {0};
+ 	struct sk_buff *msdu;
+@@ -1284,24 +1292,28 @@ ath12k_wifi7_dp_rx_process_received_packets(struct ath12k_dp *dp,
+ 	struct ath12k_base *partner_ab;
+ 	struct ath12k_dp *partner_dp;
+ 	u8 hw_link_id, pdev_id;
+-	int tid;
++	int tid, msdu_idx;
+ 	bool fast_rx = true;
+ 	enum ath12k_dp_rx_error ret;
+ 
+-	if (unlikely(skb_queue_empty(msdu_list)))
+-		return;
+-
+ 	rcu_read_lock();
+ 
+-	while ((msdu = __skb_dequeue(msdu_list))) {
+-		struct hal_rx_spd_data *spd_desc_l = ATH12K_SKB_RXCB_RAW(msdu);
++	for (msdu_idx = 0; msdu_idx < num_msdus; msdu_idx++) {
++		struct hal_rx_spd_data *spd_desc_l = &rx_status_desc[msdu_idx];
++
++		msdu = spd_desc_l->msdu;
+ 
+ 		prefetch(msdu);
+ 		prefetch(&msdu->_skb_refdst);
+ 		prefetch(&msdu->__pkt_type_offset);
+-		prefetch(&msdu->head);
+-		prefetch(&msdu->data);
+-		prefetch(&msdu->data[128]);
++
++		if (likely(msdu_idx + 1 < num_msdus)) {
++			struct hal_rx_spd_data *spd_desc_next =
++				&rx_status_desc[msdu_idx + 1];
++			struct sk_buff *next_msdu = spd_desc_next->msdu;
++
++			prefetch(&next_msdu->head);
++		}
+ 
+ 		hw_link_id = spd_desc_l->src_link_id;
+ 		partner_dp = ath12k_dp_hw_grp_to_dp(dp_hw_grp,
+@@ -1312,6 +1324,7 @@ ath12k_wifi7_dp_rx_process_received_packets(struct ath12k_dp *dp,
+ 		if (unlikely(!rcu_dereference(partner_ab->pdevs_active[pdev_id]))) {
+ 			ath12k_dp_rx_skb_free(msdu, dp, ring_id,
+ 					      DP_RX_ERR_DROP_PDEV_NA);
++			spd_desc_l->msdu = NULL;
+ 			continue;
+ 		}
+ 
+@@ -1319,32 +1332,32 @@ ath12k_wifi7_dp_rx_process_received_packets(struct ath12k_dp *dp,
+ 		if (unlikely(!dp_pdev)) {
+ 			ath12k_dp_rx_skb_free(msdu, dp, ring_id,
+ 					      DP_RX_ERR_DROP_PDEV_NA);
++			spd_desc_l->msdu = NULL;
+ 			continue;
+ 		}
+ 
+-		tid = spd_desc_l->rx_mpdu_info.tid;
+-		dp_pdev->wmm_stats.rx_type =
+-				ath12k_tid_to_ac(tid > ATH12K_DSCP_PRIORITY ? 0: tid);
+-
+-		ret = ath12k_wifi7_dp_rx_process_msdu(dp_pdev, msdu, msdu_list,
+-						      &rx_status, &rx_desc_data,
+-						      &fast_rx, ring_id);
++		ret = ath12k_wifi7_dp_rx_process_msdu(dp_pdev, msdu, rx_status_desc,
++						      num_msdus, msdu_idx,
++						      &rx_status, &fast_rx, ring_id);
+ 		if (unlikely(ret)) {
+ 			ath12k_dbg(partner_ab, ATH12K_DBG_DATA,
+ 				   "Unable to process msdu %d", ret);
+ 			ath12k_dp_rx_skb_free(msdu, dp, ring_id, ret);
++			spd_desc_l->msdu = NULL;
+ 			continue;
+ 		}
+ 
+ 		if (unlikely(!fast_rx)) {
++			bool is_mcbc = spd_desc_l->rx_msdu_info.da_is_mcbc;
++
+ 			if (!partner_dp->stats_disable)
+-			        ath12k_soc_dp_rx_stats(partner_dp, msdu,
+-						       &rx_desc_data, ring_id);
++				ath12k_soc_dp_rx_stats(partner_dp, is_mcbc, ring_id);
++
+ 			ath12k_dp_rx_deliver_msdu(dp_pdev, napi, msdu, &rx_status,
+ 						  spd_desc_l->src_link_id,
+-						  spd_desc_l->rx_msdu_info.da_is_mcbc,
++						  is_mcbc,
+ 						  spd_desc_l->rx_mpdu_info.peer_id,
+-						  spd_desc_l->rx_mpdu_info.tid);
++						  tid);
+ 		} else {
+ 			partner_dp->device_stats.fast_rx[ring_id][partner_dp->device_id]++;
+ 		}
+@@ -1387,9 +1400,11 @@ int ath12k_wifi7_dp_rx_process(struct ath12k_dp *dp, int ring_id,
+ 	int num_buffs_reaped[ATH12K_MAX_SOCS] = {};
+ 	struct ath12k_rx_desc_info *desc_info;
+ 	struct dp_rxdma_ring *rx_ring = &dp->rx_refill_buf_ring;
++	int cpu_id = smp_processor_id();
++	struct hal_rx_spd_data *rx_status_desc =
++		(struct hal_rx_spd_data *)dp_hw_grp->rx_status_buf[cpu_id];
+ 	struct hal_reo_dest_ring *desc;
+ 	struct ath12k_dp *partner_dp;
+-	struct sk_buff_head msdu_list;
+ 	struct sk_buff_head local_msdu_list;
+ 	int total_msdu_reaped = 0;
+ 	u8 device_id;
+@@ -1401,7 +1416,7 @@ int ath12k_wifi7_dp_rx_process(struct ath12k_dp *dp, int ring_id,
+ #ifndef CONFIG_IO_COHERENCY
+ 	int valid_entries;
+ #endif
+-	__skb_queue_head_init(&msdu_list);
++	int incomplete_msdu_chain = 0;
+ 
+ 	for (device_id = 0; device_id < ATH12K_MAX_SOCS; device_id++)
+ 		INIT_LIST_HEAD(&rx_desc_used_list[device_id]);
+@@ -1423,15 +1438,14 @@ int ath12k_wifi7_dp_rx_process(struct ath12k_dp *dp, int ring_id,
+ #endif
+ 	while ((desc = __ath12k_hal_srng_dst_get_next_cached_entry(srng, &last_tp))) {
+ 		struct rx_mpdu_desc_info *mpdu_info;
+-		struct hal_rx_spd_data *spd_desc_l;
++		struct hal_rx_spd_data *spd_desc_l = &rx_status_desc[total_msdu_reaped];
+ 
+ 		desc_va = ((u64)le32_to_cpu(desc->buf_va_hi) << 32 |
+ 			   le32_to_cpu(desc->buf_va_lo));
+ 		desc_info = (struct ath12k_rx_desc_info *)((unsigned long)desc_va);
++		if (likely(desc_info))
++			prefetch(desc_info);
+ 
+-		msdu = desc_info->skb;
+-
+-		spd_desc_l = (struct hal_rx_spd_data *)ATH12K_SKB_RXCB_RAW(msdu);
+ 		spd_desc_l->info1 = le64_to_cpu(desc->info1);
+ 		spd_desc_l->info2 = le32_to_cpu(desc->info2);
+ 		spd_desc_l->info0 = le32_to_cpu(desc->info0);
+@@ -1464,19 +1478,9 @@ int ath12k_wifi7_dp_rx_process(struct ath12k_dp *dp, int ring_id,
+ 			}
+ 		}
+ 
+-		if (unlikely(desc_info->magic != ATH12K_DP_RX_DESC_MAGIC))
+-			ath12k_warn(ab, "Check HW CC implementation");
+-
+-		msdu = desc_info->skb;
+-		desc_info->skb = NULL;
+-
+-		ath12k_core_dma_unmap_single(partner_dp->dev, desc_info->paddr,
+-					     DP_RX_BUFFER_SIZE,
+-					     DMA_FROM_DEVICE);
+-
+ 		num_buffs_reaped[device_id]++;
+ 
+-		dp->device_stats.reo_rx[ring_id][ab->device_id]++;
++		dp->device_stats.reo_rx[ring_id][dp->device_id]++;
+ 
+ 		mpdu_info = &spd_desc_l->rx_mpdu_info;
+ 
+@@ -1484,12 +1488,22 @@ int ath12k_wifi7_dp_rx_process(struct ath12k_dp *dp, int ring_id,
+ 			ath12k_wifi7_dp_rx_get_peer_id(ab, dp->peer_metadata_ver,
+ 						       mpdu_info->peer_meta_data);
+ 
++		if (unlikely(desc_info->magic != ATH12K_DP_RX_DESC_MAGIC))
++			ath12k_warn(ab, "Check HW CC implementation");
++
++		ath12k_core_dma_unmap_single(partner_dp->dev, desc_info->paddr,
++					     DP_RX_BUFFER_SIZE,
++					     DMA_FROM_DEVICE);
++
++		msdu = desc_info->skb;
++		desc_info->skb = NULL;
++
+ 		/*
+-		 * Create local lists for msdus and rx_desc_info descriptors
++		 * Create local lists for rx_desc_info descriptors
+ 		 * to temporarily store in the scatter gather case.
+ 		 *
+ 		 * Once msdu_continuation is seen to be 0, append the
+-		 * local lists with the actual lists that are taken further
++		 * local list with the actual list that are taken further
+ 		 * for processing.
+ 		 *
+ 		 * If the list is seen to be incomplete in the current budget,
+@@ -1498,24 +1512,26 @@ int ath12k_wifi7_dp_rx_process(struct ath12k_dp *dp, int ring_id,
+ 		 * be fetched and processed again in the next NAPI cycle.
+ 		 *
+ 		 * For the regular non-sg msdus, we will add the datastructures
+-		 * to the corresponding lists directly, without using local lists.
++		 * to the corresponding list directly, without using local list.
+ 		 *
+ 		 */
+ 
+-		if (!spd_desc_l->rx_msdu_info.msdu_continuation) {
+-			if (!done) {
++		if (likely(!spd_desc_l->rx_msdu_info.msdu_continuation)) {
++			if (unlikely(!done)) {
+ 				list_splice_tail_init(&rx_desc_sg_list,
+ 						      &rx_desc_used_list[device_id]);
+-				skb_queue_splice_tail_init(&local_msdu_list, &msdu_list);
++				incomplete_msdu_chain = 0;
+ 			}
+ 
+ 			list_add_tail(&desc_info->list, &rx_desc_used_list[device_id]);
+-			__skb_queue_tail(&msdu_list, msdu);
++			spd_desc_l->msdu = msdu;
+ 			first_msdu_tp = last_tp;
+ 			done = true;
+ 		} else {
+ 			list_add_tail(&desc_info->list, &rx_desc_sg_list);
+-			__skb_queue_tail(&local_msdu_list, msdu);
++			spd_desc_l->msdu = msdu;
++			first_msdu_tp = last_tp;
++			incomplete_msdu_chain++;
+ 			done = false;
+ 		}
+ 
+@@ -1527,6 +1543,8 @@ int ath12k_wifi7_dp_rx_process(struct ath12k_dp *dp, int ring_id,
+ 
+ 	__ath12k_hal_srng_access_end(ab, srng);
+ 
++	total_msdu_reaped -= incomplete_msdu_chain;
++
+ 	if (!total_msdu_reaped)
+ 		goto exit;
+ 
+@@ -1541,8 +1559,8 @@ int ath12k_wifi7_dp_rx_process(struct ath12k_dp *dp, int ring_id,
+ 					    &rx_desc_used_list[device_id]);
+ 	}
+ 
+-	ath12k_wifi7_dp_rx_process_received_packets(dp, napi, &msdu_list,
+-						    ring_id);
++	ath12k_wifi7_dp_rx_process_received_packets(dp, napi, rx_status_desc,
++						    ring_id, total_msdu_reaped);
+ 
+ exit:
+ 	return total_msdu_reaped;
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hal.h b/drivers/net/wireless/ath/ath12k/wifi7/hal.h
+index 11c3b8a..272a10f 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal.h
+@@ -533,13 +533,16 @@ struct rx_tlv_info_1 {
+ 	    sgi			   	: 2,
+ 	    is_decrypted		: 1,
+ 	    mesh_ctrl_present	   	: 1,
+-	    msdu_done			: 1,
+ 	    pkt_type			: 4,
+-	    is_ip_valid			: 1,
+ 	    bw			   	: 3;
+ };
+ 
+ struct hal_rx_spd_data {
++	union {
++		u64 info3;
++		struct sk_buff *msdu;
++	};
++
+ 	union {
+ 		u64 info1;
+ 		struct rx_mpdu_desc_info rx_mpdu_info;
+@@ -568,6 +571,9 @@ struct hal_rx_spd_data {
+ 	};
+ } __packed;
+ 
++static_assert(sizeof(struct hal_rx_spd_data) == 32,
++	      "size of struct hal_rx_spd_data is not 32 bytes!");
++
+ struct hal_reo_status_queue_stats {
+ 	u16 ssn;
+ 	u16 curr_idx;
+-- 
+2.34.1
+

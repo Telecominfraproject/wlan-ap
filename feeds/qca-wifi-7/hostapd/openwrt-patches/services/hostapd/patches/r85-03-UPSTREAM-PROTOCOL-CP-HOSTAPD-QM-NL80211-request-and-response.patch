@@ -1,0 +1,519 @@
+From 93c65708dfd92f682430f7c01d0d4f3d958c4a8b Mon Sep 17 00:00:00 2001
+From: Arun Vikas T <vikast@qti.qualcomm.com>
+Date: Wed, 9 Jul 2025 16:43:46 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL:HOSTAPD: Add QoS Management support via
+ NL80211
+
+Introduce support for QoS Management (QM) request/response handling in
+hostapd using the NL80211 interface. This enables hostapd to initiate
+and process QoS Management operations synchronously with the kernel.
+
+Driver ops: Add .set_qos callback to wpa_driver_nl80211_ops to
+support synchronous QoS Management requests and responses via NL80211.
+
+Driver layer: Implement construction of Netlink messages for QoS
+descriptors, including TCLAS elements (Type 4 and 10), and nested
+QoS attributes. Add parsing logic for Netlink responses.
+
+Patch-dependency:
+r85-01-UPSTREAM-PROTOCOL-HOSTAPD-Introduce_QoS_Management_cmd_and_attr.patch
+r85-02-UPSTREAM-PROTOCOL-HOSTAPD-Define-QoS-Management-definitions.patch
+Patch-work: NA
+Tag: SCS
+
+Signed-off-by: Arun Vikas T <vikast@qti.qualcomm.com>
+---
+ src/drivers/driver.h         |  27 +++
+ src/drivers/driver_nl80211.c | 427 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 454 insertions(+)
+
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 33facc6..42961ce 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -146,6 +146,22 @@ enum qos_mgmt_type {
+ 	/* Future QM protocols to be added here */
+ };
+ 
++/**
++ * enum qos_mgmt_req_type - Define QoS Management request types
++ * @QM_ADD_REQ: Add a new QoS Management configuration
++ * @QM_REMOVE_REQ: Remove an existing QoS Management configuration
++ * @QM_CHANGE_REQ: Modify an existing QoS Management configuration
++ *
++ * Specify the type of operation requested in a QoS Management transaction.
++ * These request types are used to indicate the intent of the configuration
++ * being applied by user space.
++ */
++enum qos_mgmt_req_type {
++	QM_ADD_REQ,
++	QM_REMOVE_REQ,
++	QM_CHANGE_REQ,
++};
++
+ #define IPV4_LEN	4
+ #define IPV6_LEN	16
+ 
+@@ -5910,6 +5926,17 @@ struct wpa_driver_ops {
+ 				     struct driver_ttlm_info *params,
+ 				     const u8 *addr);
+ #endif /* CONFIG_IEEE80211BE */
++
++	/**
++	 * set_qos - Send QoS management request data to driver and get back
++	 *	     response data filled from driver.
++	 * @priv: Private driver interface data
++	 * @qm_req: QoS management request data
++	 * @qm_resp: QoS management response data
++	 * Returns: 0 on success, negative value on failure
++	 */
++	int (*set_qos)(void *priv, struct qm_req_data *qm_req,
++		       struct qm_resp_data *qm_resp);
+ };
+ 
+ /**
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 02a3038..3409644 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -15546,6 +15546,431 @@ static int wpa_driver_nl80211_set_ttlm_link_mapping(void *priv, enum wpa_driver_
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 
++static int
++nl80211_set_qm_tclas4_elem(struct nl_msg *msg,
++			   struct qm_tclas_type4_params type4_params)
++{
++	struct nlattr *tclas_type4;
++	u8 version;
++
++	tclas_type4 = nla_nest_start(msg, NL80211_TCLAS_ATTR_TYPE4_PARAMS);
++	if (!tclas_type4)
++		return -ENOBUFS;
++
++	if (nla_put_u8(msg, NL80211_TCLAS_TYPE4_ATTR_CLASSIFIER_MASK,
++		       type4_params.classifier_mask) ||
++	    nla_put_u8(msg, NL80211_TCLAS_TYPE4_ATTR_IP_VERSION,
++		       type4_params.ip_ver))
++		return -ENOBUFS;
++
++	version = type4_params.ip_ver;
++
++	if (version == IP_VERSION_4) {
++		if (nla_put(msg, NL80211_TCLAS_TYPE4_ATTR_SRC_IP, IPV4_LEN,
++			    type4_params.src_ip.ipv4) ||
++		    nla_put(msg, NL80211_TCLAS_TYPE4_ATTR_DST_IP, IPV4_LEN,
++			    type4_params.dst_ip.ipv4))
++			return -ENOBUFS;
++
++	} else if (version == IP_VERSION_6) {
++		if (nla_put(msg, NL80211_TCLAS_TYPE4_ATTR_SRC_IP, IPV6_LEN,
++			    type4_params.src_ip.ipv6) ||
++		    nla_put(msg, NL80211_TCLAS_TYPE4_ATTR_DST_IP, IPV6_LEN,
++			    type4_params.dst_ip.ipv6))
++			return -ENOBUFS;
++	}
++
++	if (nla_put_u16(msg, NL80211_TCLAS_TYPE4_ATTR_SRC_PORT,
++			type4_params.src_port) ||
++	    nla_put_u16(msg, NL80211_TCLAS_TYPE4_ATTR_DST_PORT,
++			type4_params.dst_port) ||
++	    nla_put_u8(msg, NL80211_TCLAS_TYPE4_ATTR_DSCP,
++		       type4_params.dscp))
++		return -ENOBUFS;
++
++	if (type4_params.ip_ver == IP_VERSION_4) {
++		if (nla_put_u8(msg, NL80211_TCLAS_TYPE4_ATTR_PROTOCOL,
++			       type4_params.protocol))
++			return -ENOBUFS;
++	} else if (type4_params.ip_ver == IP_VERSION_6) {
++		if (nla_put_u8(msg, NL80211_TCLAS_TYPE4_ATTR_NEXT_HEADER,
++			       type4_params.next_header) ||
++		    nla_put(msg, NL80211_TCLAS_TYPE4_ATTR_FLOW_LABEL,
++			    TCLAS4_FLOW_LABEL_SIZE, type4_params.flow_label))
++			return -ENOBUFS;
++	}
++
++	nla_nest_end(msg, tclas_type4);
++	return 0;
++}
++
++
++static int
++nl80211_set_qm_tclas10_elem(struct nl_msg *msg,
++			    struct qm_tclas_type10_params type10_params)
++{
++	struct nlattr *tclas_type10;
++
++	tclas_type10 = nla_nest_start(msg, NL80211_TCLAS_ATTR_TYPE10_PARAMS);
++	if (!tclas_type10)
++		return -ENOBUFS;
++
++	if (nla_put_u8(msg, NL80211_TCLAS_TYPE10_ATTR_PROT_INSTANCE,
++		       type10_params.protocol_instance) ||
++	    nla_put_u8(msg, NL80211_TCLAS_TYPE10_ATTR_PROT_NUMBER,
++		       type10_params.protocol_number) ||
++	    nla_put(msg, NL80211_TCLAS_TYPE10_ATTR_FILTER_VALUE,
++		    type10_params.filter_len, type10_params.filter_value) ||
++	    nla_put(msg, NL80211_TCLAS_TYPE10_ATTR_FILTER_MASK,
++		    type10_params.filter_len, type10_params.filter_mask))
++		return -ENOBUFS;
++
++	nla_nest_end(msg, tclas_type10);
++	return 0;
++}
++
++
++static int nl80211_set_qm_tclas_elem(struct nl_msg *msg,
++				     struct qm_tclas_elements tclas,
++				     int tclas_idx)
++{
++	struct nlattr *tclas_entry;
++
++	tclas_entry = nla_nest_start(msg, tclas_idx);
++	if (!tclas_entry)
++		return -ENOBUFS;
++
++	if (nla_put_u8(msg, NL80211_TCLAS_ATTR_USER_PRIORITY, tclas.up) ||
++	    nla_put_u8(msg, NL80211_TCLAS_ATTR_CLASSIFIER_TYPE,
++		       tclas.classifier_type)) {
++		wpa_printf(MSG_ERROR, "nl80211:set tclas parameter failed");
++		return -ENOBUFS;
++	}
++
++	switch (tclas.classifier_type) {
++	case QM_TCLAS_CLASSIFIER_TYPE4:
++		if (nl80211_set_qm_tclas4_elem(msg,
++					       tclas.tclas_elem.type4_params)) {
++			wpa_printf(MSG_ERROR,
++				   "nl80211:set tclas4 element failed");
++			return -ENOBUFS;
++		}
++		break;
++
++	case QM_TCLAS_CLASSIFIER_TYPE10:
++		if (nl80211_set_qm_tclas10_elem(msg,
++						tclas.tclas_elem.type10_params)) {
++			wpa_printf(MSG_ERROR,
++				   "nl80211:set tclas10 element failed");
++			return -ENOBUFS;
++		}
++		break;
++
++	default:
++		wpa_printf(MSG_ERROR, "Unknown TCLAS classifier:%d",
++			   tclas.classifier_type);
++		return -ENOBUFS;
++	}
++
++	nla_nest_end(msg, tclas_entry);
++	return 0;
++}
++
++
++static int nl80211_set_qm_tclas(struct nl_msg *msg,
++				struct qm_req_desc_data qm_req_desc)
++{
++	struct nlattr *qm_tclas;
++	int tclas_idx;
++
++	qm_tclas = nla_nest_start(msg, NL80211_QM_DESC_ATTR_TCLAS_ELEMENTS);
++
++	for (tclas_idx = 0;
++	     tclas_idx < qm_req_desc.num_tclas_elements;
++	     tclas_idx++) {
++		if (nl80211_set_qm_tclas_elem(msg, qm_req_desc.tclas[tclas_idx],
++					      tclas_idx)) {
++			wpa_printf(MSG_ERROR, "nl80211:set tclas failed");
++			return -ENOBUFS;
++		}
++	}
++
++	nla_nest_end(msg, qm_tclas);
++
++	if (qm_req_desc.num_tclas_elements > 1) {
++		if (nla_put_u8(msg, NL80211_QM_DESC_ATTR_TCLAS_PROCESSING,
++		    qm_req_desc.tclas_processing)) {
++			wpa_printf(MSG_ERROR,
++				   "nl80211:set tclas processing failed");
++			return -ENOBUFS;
++		}
++	}
++
++	return 0;
++}
++
++
++#ifdef CONFIG_IEEE80211BE
++static int nl80211_set_qm_qos_attr(struct nl_msg *msg,
++				   struct qm_qos_attributes qos_attr)
++{
++	struct nlattr *qos_element;
++	u32 control_info = 0;
++
++	qos_element = nla_nest_start(msg, NL80211_QM_DESC_ATTR_QOS_ATTRIBUTES);
++	if (!qos_element)
++		goto nla_fail;
++
++	SET_QM_CTRL_INFO(control_info, DIRECTION, qos_attr.direction);
++	SET_QM_CTRL_INFO(control_info, TID, qos_attr.tid);
++	SET_QM_CTRL_INFO(control_info, UP, qos_attr.up);
++	SET_QM_CTRL_INFO(control_info, BITMAP, qos_attr.bitmap);
++	SET_QM_CTRL_INFO(control_info, LINK_ID, qos_attr.link_id);
++
++	/* Mandatory QoS Parameters */
++	if (nla_put_u32(msg, NL80211_QM_QOS_ATTR_CONTROL_INFO, control_info) ||
++	    nla_put_u32(msg, NL80211_QM_QOS_ATTR_MIN_SVC_INTERVAL,
++			qos_attr.min_service_interval) ||
++	    nla_put_u32(msg, NL80211_QM_QOS_ATTR_MAX_SVC_INTERVAL,
++			qos_attr.max_service_interval) ||
++	    nla_put_u32(msg, NL80211_QM_QOS_ATTR_MIN_DATA_RATE,
++			qos_attr.min_data_rate) ||
++	    nla_put_u32(msg, NL80211_QM_QOS_ATTR_DELAY_BOUND,
++			qos_attr.delay_bound))
++		goto nla_fail;
++
++	/* Optional QoS Parameters */
++	if (QM_IS_QOS_ATTR_PRESENT(qos_attr.bitmap, MAX_MSDU_SIZE)) {
++		if (nla_put_u16(msg, NL80211_QM_QOS_ATTR_MAX_MSDU_SIZE,
++			    qos_attr.max_msdu_size))
++			goto nla_fail;
++	}
++
++	if (QM_IS_QOS_ATTR_PRESENT(qos_attr.bitmap, SVC_START_TIME)) {
++		if (nla_put_u32(msg, NL80211_QM_QOS_ATTR_SVC_START_TIME,
++				qos_attr.service_start_time))
++			goto nla_fail;
++	}
++
++	if (QM_IS_QOS_ATTR_PRESENT(qos_attr.bitmap,
++				   SVC_START_TIME_LINK_ID)) {
++		if (nla_put_u8(msg,
++			       NL80211_QM_QOS_ATTR_SVC_START_TIME_LINK_ID,
++			       qos_attr.service_start_time_link_id))
++			goto nla_fail;
++	}
++
++	if (QM_IS_QOS_ATTR_PRESENT(qos_attr.bitmap, MEAN_DATA_RATE)) {
++		if (nla_put_u32(msg, NL80211_QM_QOS_ATTR_MEAN_DATA_RATE,
++				qos_attr.mean_data_rate))
++			goto nla_fail;
++	}
++
++	if (QM_IS_QOS_ATTR_PRESENT(qos_attr.bitmap, BURST_SIZE)) {
++		if (nla_put_u32(msg, NL80211_QM_QOS_ATTR_BURST_SIZE,
++				qos_attr.burst_size))
++			goto nla_fail;
++	}
++
++	if (QM_IS_QOS_ATTR_PRESENT(qos_attr.bitmap, MSDU_LIFETIME)) {
++		if (nla_put_u16(msg, NL80211_QM_QOS_ATTR_MSDU_LIFETIME,
++				qos_attr.msdu_lifetime))
++			goto nla_fail;
++	}
++
++	if (QM_IS_QOS_ATTR_PRESENT(qos_attr.bitmap, MSDU_DELIVERY_INFO)) {
++		u8 msdu_delivery_info = 0;
++
++		SET_QM_MSDU_DELIVERY_INFO(msdu_delivery_info, RATIO,
++					  qos_attr.msdu_delivery_ratio);
++		SET_QM_MSDU_DELIVERY_INFO(msdu_delivery_info, COUNT_EXPONENT,
++					  qos_attr.msdu_count_exponent);
++		if (nla_put_u8(msg, NL80211_QM_QOS_ATTR_MSDU_DELIVERY_INFO,
++			       msdu_delivery_info))
++			goto nla_fail;
++	}
++
++	if (QM_IS_QOS_ATTR_PRESENT(qos_attr.bitmap, MEDIUM_TIME)) {
++		if (nla_put_u16(msg, NL80211_QM_QOS_ATTR_MEDIUM_TIME,
++				qos_attr.medium_time))
++			goto nla_fail;
++	}
++
++	nla_nest_end(msg, qos_element);
++	return 0;
++
++nla_fail:
++	wpa_printf(MSG_ERROR, "nl80211:set qos attr element failed");
++	return -ENOBUFS;
++}
++#endif /* CONFIG_IEEE80211BE */
++
++
++static int nl80211_set_qm_desc(struct nl_msg *msg,
++			       struct qm_req_desc_data qm_req_desc, int idx)
++{
++	struct nlattr *qm_desc_entry;
++
++	qm_desc_entry = nla_nest_start(msg, idx);
++	if (!qm_desc_entry)
++		goto nla_fail;
++
++	if (nla_put_u8(msg, NL80211_QM_DESC_ATTR_QM_ID, qm_req_desc.qm_id) ||
++	    nla_put_u8(msg, NL80211_QM_DESC_ATTR_REQUEST_TYPE,
++		       qm_req_desc.request_type))
++		goto nla_fail;
++
++	/* QM Remove request will have only QM_ID and Request type */
++	if (qm_req_desc.request_type == QM_REMOVE_REQ)
++		goto nla_end;
++
++	if (nla_put_u8(msg, NL80211_QM_DESC_ATTR_PRIORITY,
++		       qm_req_desc.priority))
++		goto nla_fail;
++
++	if (qm_req_desc.num_tclas_elements > 0) {
++		if (nl80211_set_qm_tclas(msg, qm_req_desc))
++			goto nla_fail;
++	}
++
++#ifdef CONFIG_IEEE80211BE
++	if (qm_req_desc.is_qos_present) {
++		if (nl80211_set_qm_qos_attr(msg, qm_req_desc.qos_attr))
++			goto nla_fail;
++	}
++#endif /* CONFIG_IEEE80211BE */
++
++nla_end:
++	nla_nest_end(msg, qm_desc_entry);
++	return 0;
++
++nla_fail:
++	wpa_printf(MSG_ERROR, "nl80211:set qm descriptor failed");
++	return -ENOBUFS;
++}
++
++
++static int qos_drv_resp_handler(struct nl_msg *msg, void *arg)
++{
++	struct nlattr *tb_qm_desc_entry[NL80211_QM_DESC_ATTR_MAX + 1];
++	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
++	struct nlattr *tb_qm[NL80211_QM_ATTR_MAX + 1];
++	struct nlattr *tb[NL80211_ATTR_MAX + 1];
++	struct qm_resp_data *qm_resp_data = arg;
++	struct nlattr *tb_qm_desc;
++	int rem_qm_desc;
++	int idx = 0;
++
++	nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
++		  genlmsg_attrlen(gnlh, 0), NULL);
++
++	if (gnlh->cmd != NL80211_CMD_QOS_MGMT) {
++		wpa_printf(MSG_ERROR, "nl80211: Unexpected NL event (%d)",
++			   gnlh->cmd);
++		goto error;
++	}
++
++	if (!tb[NL80211_ATTR_QOS_MGMT]) {
++		wpa_printf(MSG_ERROR, "QoS MGMT attr not received in response");
++		goto error;
++	}
++
++	if (nla_parse_nested(tb_qm, NL80211_QM_ATTR_MAX,
++			     tb[NL80211_ATTR_QOS_MGMT], NULL) ||
++	    !tb_qm[NL80211_QM_ATTR_QM_TYPE] ||
++	    !tb_qm[NL80211_QM_ATTR_DIALOG_TOKEN] ||
++	    !tb_qm[NL80211_QM_ATTR_DESCRIPTOR_PARAMS])
++		goto error;
++
++	qm_resp_data->qm_type = nla_get_u8(tb_qm[NL80211_QM_ATTR_QM_TYPE]);
++	qm_resp_data->dialog_token =
++			nla_get_u8(tb_qm[NL80211_QM_ATTR_DIALOG_TOKEN]);
++
++	nla_for_each_nested(tb_qm_desc,
++			    tb_qm[NL80211_QM_ATTR_DESCRIPTOR_PARAMS],
++			    rem_qm_desc) {
++
++		if (nla_parse_nested(tb_qm_desc_entry,
++				     NL80211_QM_DESC_ATTR_MAX,
++				     tb_qm_desc, NULL) ||
++		    !tb_qm_desc_entry[NL80211_QM_DESC_ATTR_QM_ID] ||
++		    !tb_qm_desc_entry[NL80211_QM_DESC_ATTR_STATUS])
++			goto error;
++
++		qm_resp_data->qm_resp_desc[idx].qm_id =
++			nla_get_u8(tb_qm_desc_entry[
++					NL80211_QM_DESC_ATTR_QM_ID]);
++
++		qm_resp_data->qm_resp_desc[idx].status =
++			nla_get_u8(tb_qm_desc_entry[
++					NL80211_QM_DESC_ATTR_STATUS]);
++
++		idx++;
++	}
++
++	qm_resp_data->num_qm_desc = idx;
++	return 0;
++
++error:
++	wpa_printf(MSG_ERROR, "QM driver response processing failed");
++	return -EINVAL;
++}
++
++
++static int nl80211_set_qos(void *priv, struct qm_req_data *qm_req,
++			  struct qm_resp_data *qm_resp)
++{
++	struct i802_bss *bss = priv;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++	struct nlattr *qm, *qm_desc;
++	struct nl_msg *msg;
++	int ret = -ENOBUFS;
++	int idx;
++
++	msg = nl80211_bss_msg(bss, 0, NL80211_CMD_QOS_MGMT);
++
++	if (!msg)
++		return ret;
++
++	qm = nla_nest_start(msg, NL80211_ATTR_QOS_MGMT);
++	if (!qm)
++		goto nla_fail;
++
++	if (nla_put(msg, NL80211_QM_ATTR_MAC_ADDR, ETH_ALEN,
++		    qm_req->peer_mac) ||
++	    nla_put_u8(msg, NL80211_QM_ATTR_QM_TYPE, qm_req->qm_type) ||
++	    nla_put_u8(msg, NL80211_QM_ATTR_DIALOG_TOKEN, qm_req->dialog_token))
++		goto nla_fail;
++
++	qm_desc = nla_nest_start(msg, NL80211_QM_ATTR_DESCRIPTOR_PARAMS);
++	if (!qm_desc)
++		goto nla_fail;
++
++	/* Nest the descriptor params array */
++	for (idx = 0; idx < qm_req->num_qm_desc; idx++) {
++		ret = nl80211_set_qm_desc(msg, qm_req->qm_req_desc[idx], idx);
++		if (ret)
++			goto nla_fail;
++	}
++
++	nla_nest_end(msg, qm_desc);
++	nla_nest_end(msg, qm);
++
++	ret = send_and_recv_resp(drv, msg, qos_drv_resp_handler, qm_resp);
++	if (ret)
++		wpa_printf(MSG_ERROR, "nl80211: QM send_and_recv_resp failed:%d",
++			   ret);
++
++	return ret;
++
++nla_fail:
++	nlmsg_free(msg);
++	wpa_printf(MSG_ERROR, "nl80211: Could not build QoS MGMT data, ret:%d",
++		   ret);
++	return ret;
++}
++
++
+ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.name = "nl80211",
+ 	.desc = "Linux nl80211/cfg80211",
+@@ -15727,4 +16153,5 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.set_epcs_cfg = wpa_driver_set_epcs_cfg,
+ 	.set_ttlm_link_mapping = wpa_driver_nl80211_set_ttlm_link_mapping,
+ #endif /* CONFIG_IEEE80211BE */
++	.set_qos = nl80211_set_qos,
+ };
+-- 
+2.34.1
+

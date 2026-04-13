@@ -1,0 +1,150 @@
+From 39f27d3a7a3c065fa9704218c0a4d718a8856b36 Mon Sep 17 00:00:00 2001
+From: Balamurugan Ramar <quic_bramar@quicinc.com>
+Date: Thu, 10 Apr 2025 23:25:59 +0530
+Subject: [PATCH] mac80211: use link conf and link sta
+
+Use link conf and link sta for link specific operations.
+The link conf is replaced in start ap.
+Link sta is updated with NSS during link station add.
+
+Also, moved the condition for link bss address validation
+to differentiate link bss address from ML address.
+
+Signed-off-by: Sriram R <quic_srirrama@quicinc.com>
+Signed-off-by: Balamurugan Ramar <quic_bramar@quicinc.com>
+---
+ net/mac80211/agg-rx.c | 52 +++++++++++++++++++++++++++++++++++++++++--
+ net/mac80211/cfg.c    | 19 +++++++++++-----
+ 2 files changed, 64 insertions(+), 7 deletions(-)
+
+diff --git a/net/mac80211/agg-rx.c b/net/mac80211/agg-rx.c
+index aa00c0e..b73d051 100644
+--- a/net/mac80211/agg-rx.c
++++ b/net/mac80211/agg-rx.c
+@@ -237,6 +237,8 @@ static void ieee80211_send_addba_resp(struct sta_info *sta, u8 *da, u16 tid,
+ 	struct ieee80211_mgmt *mgmt;
+ 	bool amsdu = ieee80211_hw_check(&local->hw, SUPPORTS_AMSDU_IN_AMPDU);
+ 	u16 capab;
++	struct ieee80211_link_data *link;
++	u8 link_id;
+ 
+ 	skb = dev_alloc_skb(sizeof(*mgmt) +
+ 		    2 + sizeof(struct ieee80211_addba_ext_ie) +
+@@ -247,6 +249,36 @@ static void ieee80211_send_addba_resp(struct sta_info *sta, u8 *da, u16 tid,
+ 	skb_reserve(skb, local->hw.extra_tx_headroom);
+ 	mgmt = ieee80211_mgmt_ba(skb, da, sdata);
+ 
++	memcpy(mgmt->da, da, ETH_ALEN);
++        memcpy(mgmt->sa, sdata->vif.addr, ETH_ALEN);
++
++	if (sdata->vif.type == NL80211_IFTYPE_AP) {
++		memcpy(mgmt->bssid, sdata->vif.addr, ETH_ALEN);
++		/* Override MLD address in A2/A3 with link addr
++		 * in case of AP MLO and a non ML STA
++		 */
++		if (sdata->vif.valid_links && sta && !sta->sta.mlo) {
++			link_id = sta->deflink.link_id;
++			rcu_read_lock();
++			link = rcu_dereference(sdata->link[link_id]);
++			if (link) {
++				memcpy(mgmt->sa, link->conf->addr, ETH_ALEN);
++				memcpy(mgmt->bssid, link->conf->addr, ETH_ALEN);
++			}
++			rcu_read_unlock();
++		}
++        } else if (sdata->vif.type == NL80211_IFTYPE_AP_VLAN ||
++                sdata->vif.type == NL80211_IFTYPE_MESH_POINT) {
++                memcpy(mgmt->bssid, sdata->vif.addr, ETH_ALEN);
++        } else if (sdata->vif.type == NL80211_IFTYPE_STATION) {
++                memcpy(mgmt->bssid, sdata->vif.cfg.ap_addr, ETH_ALEN);
++        } else if (sdata->vif.type == NL80211_IFTYPE_ADHOC) {
++                memcpy(mgmt->bssid, sdata->u.ibss.bssid, ETH_ALEN);
++        }
++
++        mgmt->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT |
++                                          IEEE80211_STYPE_ACTION);
++
+ 	skb_put(skb, 1 + sizeof(mgmt->u.action.u.addba_resp));
+ 	mgmt->u.action.category = WLAN_CATEGORY_BACK;
+ 	mgmt->u.action.u.addba_resp.action_code = WLAN_ACTION_ADDBA_RESP;
+@@ -286,6 +318,9 @@ void __ieee80211_start_rx_ba_session(struct sta_info *sta,
+ 	int i, ret = -EOPNOTSUPP;
+ 	u16 status = WLAN_STATUS_REQUEST_DECLINED;
+ 	u16 max_buf_size;
++	u8 link_id;
++	enum nl80211_band band;
++	struct ieee80211_bss_conf *link_conf;
+ 
+ 	lockdep_assert_wiphy(sta->local->hw.wiphy);
+ 
+@@ -296,8 +331,21 @@ void __ieee80211_start_rx_ba_session(struct sta_info *sta,
+ 		goto end;
+ 	}
+ 
+-	if (!sta->sta.deflink.ht_cap.ht_supported &&
+-	    !sta->sta.deflink.he_cap.has_he) {
++	link_id = sta->sta.deflink.link_id;
++	rcu_read_lock();
++	link_conf = rcu_dereference(sta->sdata->vif.link_conf[link_id]);
++
++	if (WARN_ON(!link_conf || (!link_conf->chanreq.oper.chan))) {
++		ht_dbg(sta->sdata,
++		       "STA %pM BA session couldnt setup due to invalid link %d\n",
++		       sta->sta.addr, link_id);
++		rcu_read_unlock();
++		goto end;
++	}
++	band = link_conf->chanreq.oper.chan->band;
++	rcu_read_unlock();
++
++	if (!sta->sta.deflink.ht_cap.ht_supported && band != NL80211_BAND_6GHZ) {
+ 		ht_dbg(sta->sdata,
+ 		       "STA %pM erroneously requests BA session on tid %d w/o HT\n",
+ 		       sta->sta.addr, tid);
+diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
+index ba59262..c7d9ae2 100644
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -1444,18 +1444,18 @@ static int ieee80211_start_ap(struct wiphy *wiphy, struct net_device *dev,
+ 	}
+ 
+ 	if (params->he_cap) {
+-		memcpy(&sdata->vif.bss_conf.he_cap_elem, params->he_cap,
++		memcpy(&link_conf->he_cap_elem, params->he_cap,
+ 		       sizeof(*params->he_cap));
+-		sdata->vif.bss_conf.he_su_beamformer =
++		link_conf->he_su_beamformer =
+ 			params->he_cap->phy_cap_info[3] &
+ 			IEEE80211_HE_PHY_CAP3_SU_BEAMFORMER;
+-		sdata->vif.bss_conf.he_su_beamformee =
++		link_conf->he_su_beamformee =
+ 			params->he_cap->phy_cap_info[4] &
+ 			IEEE80211_HE_PHY_CAP4_SU_BEAMFORMEE;
+-		sdata->vif.bss_conf.he_mu_beamformer =
++		link_conf->he_mu_beamformer =
+ 			params->he_cap->phy_cap_info[4] &
+ 			IEEE80211_HE_PHY_CAP4_MU_BEAMFORMER;
+-		sdata->vif.bss_conf.he_full_ul_mumimo =
++		link_conf->he_full_ul_mumimo =
+ 			params->he_cap->phy_cap_info[2] &
+ 			IEEE80211_HE_PHY_CAP2_UL_MU_FULL_MU_MIMO;
+ 	}
+@@ -2021,6 +2021,15 @@ static int sta_link_apply_parameters(struct ieee80211_local *local,
+ 
+ 	ieee80211_sta_init_nss(link_sta);
+ 
++	/* update nss if not done already for the link sta,
++	 * for the deflink the nss will be updated once the assoc
++	 * flag is set through set station. For the non-deflink sta
++	 * we would reach here only during assoc, so we would have all
++	 * caps to calculate the nss.
++	 */
++	if (&sta->deflink != link_sta)
++		ieee80211_sta_init_nss(link_sta);
++
+ 	if (params->opmode_notif_used) {
+ 		/* returned value is only needed for rc update, but the
+ 		 * rc isn't initialized here yet, so ignore it
+-- 
+2.34.1
+

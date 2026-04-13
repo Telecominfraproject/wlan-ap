@@ -1,0 +1,536 @@
+From 51d090ad4e4243f9c51c0135b2362dc1eff76126 Mon Sep 17 00:00:00 2001
+From: Ramasamy Kaliappan <quic_rkaliapp@quicinc.com>
+Date: Mon, 11 Mar 2024 14:46:29 +0530
+Subject: [PATCH] hostapd: Allow slo station connect to partner link
+
+AP MLD is 2 link (2 GHz + 5 GHz) and station connected with
+one link(2 GHz) in SLO. AP receives auth/assoc request with
+same authorized STA mld mac address to connect with partner
+link (5 GHz) in SLO.
+
+The issue is AP disconnect authorized station (2 GHz) and connect with
+new link (5 GHz) without validating whether the association request
+has come from the genuine client or from the attacker.
+
+Add support to trigger the SA query to authorized station,
+and send temporary rejection in assoc response with
+comeback time to new link (5 GHz).
+
+During auth request from new link with same MLD mac address,
+AP add STA MLD mac in sta_hash table in new link bss without adding in kernel
+and send auth response to the peer mac address.
+
+During assoc request with new link, AP trigger SA query to authorized STA and
+sends assoc response with temp rejection with comeback time to the peer mac address
+
+if no SA query response from authorized station, remove authorized STA
+and when receive next assoc request, add station to the kernel and allow
+to connect with new link.
+
+if receive SA query response from authorized station, add new function
+ap_free_unadded_link_sta to remove unadded station in hostapd sta_hash.
+
+if no SA query response from authorized station and no assoc request
+receive from unauthorized station after comeback time, remove unadded
+STA in new link from AP max inactivity timeout.
+
+Signed-off-by: Ramasamy Kaliappan <quic_rkaliapp@quicinc.com>
+Signed-off-by: Hari Naraayana Desikan Kannan <quic_hnaraaya@quicinc.com>
+---
+ src/ap/ieee802_11.c        | 126 ++++++++++++++++++++++++++++++-------
+ src/ap/ieee802_11_eht.c    |   7 ++-
+ src/ap/ieee802_11_shared.c |   2 +
+ src/ap/sta_info.c          | 104 +++++++++++++++++++++++++++++-
+ src/ap/sta_info.h          |   8 +++
+ 5 files changed, 221 insertions(+), 26 deletions(-)
+
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -855,6 +855,20 @@ static int auth_sae_send_commit(struct h
+ 	struct wpabuf *data;
+ 	int reply_res;
+ 	u16 status;
++	u8 *dst = sta->addr;
++#ifdef CONFIG_IEEE80211BE
++	u8 link_id = hapd->mld_link_id;
++
++	if (hapd->conf->mld_ap && sta && sta->mld_info.mld_sta) {
++		/*
++		 * dst address should be partner link peer address,
++		 * if receive auth frame from sta partner link with same mld address
++		 * before disconnect with assoc link,
++		 */
++		if (sta->unadded_sta)
++			dst = sta->mld_info.links[link_id].peer_addr;
++	}
++#endif /* CONFIG_IEEE80211BE */
+ 
+ 	data = auth_build_sae_commit(hapd, sta, update, status_code);
+ 	if (!data && sta->sae->tmp &&
+@@ -878,7 +892,7 @@ static int auth_sae_send_commit(struct h
+ 		status = hapd->conf->sae_commit_status;
+ 	}
+ #endif /* CONFIG_TESTING_OPTIONS */
+-	reply_res = send_auth_reply(hapd, sta, sta->addr,
++	reply_res = send_auth_reply(hapd, sta, dst,
+ 				    WLAN_AUTH_SAE, 1,
+ 				    status, wpabuf_head(data),
+ 				    wpabuf_len(data), "sae-send-commit");
+@@ -894,12 +908,28 @@ static int auth_sae_send_confirm(struct
+ {
+ 	struct wpabuf *data;
+ 	int reply_res;
++	u8 *dst = sta->addr;
++
++#ifdef CONFIG_IEEE80211BE
++	u8 link_id = hapd->mld_link_id;
++	if (hapd->conf->mld_ap && sta && sta->mld_info.mld_sta) {
++		if (sta->unadded_sta) {
++
++			/*
++			 * dst address should be partner link peer address,
++			 * if receive auth frame from sta partner link with same mld address
++			 * before disconnect with assoc link,
++			 */
++			dst = sta->mld_info.links[link_id].peer_addr;
++		}
++	}
++#endif /* CONFIG_IEEE80211BE */
+ 
+ 	data = auth_build_sae_confirm(hapd, sta);
+ 	if (data == NULL)
+ 		return WLAN_STATUS_UNSPECIFIED_FAILURE;
+ 
+-	reply_res = send_auth_reply(hapd, sta, sta->addr,
++	reply_res = send_auth_reply(hapd, sta, dst,
+ 				    WLAN_AUTH_SAE, 2,
+ 				    WLAN_STATUS_SUCCESS, wpabuf_head(data),
+ 				    wpabuf_len(data), "sae-send-confirm");
+@@ -1505,6 +1535,10 @@ static void handle_auth_sae(struct hosta
+ 	const u8 *pos, *end;
+ 	int sta_removed = 0;
+ 	bool success_status;
++	const u8 *dst = mgmt->sa;
++#ifdef CONFIG_IEEE80211BE
++	u8 link_id = hapd->mld_link_id;
++#endif
+ 
+ 	if (!groups) {
+ 		groups = default_groups;
+@@ -1514,13 +1548,22 @@ static void handle_auth_sae(struct hosta
+ 			default_groups[1] = 20;
+ 	}
+ 
++#ifdef CONFIG_IEEE80211BE
++	if (hapd->conf->mld_ap && sta && sta->mld_info.mld_sta) {
++		if (sta->unadded_sta) {
++			dst = sta->mld_info.links[link_id].peer_addr;
++		}
++	}
++#endif /* CONFIG_IEEE80211BE */
++
++
+ #ifdef CONFIG_TESTING_OPTIONS
+ 	if (hapd->conf->sae_reflection_attack && auth_transaction == 1) {
+ 		wpa_printf(MSG_DEBUG, "SAE: TESTING - reflection attack");
+ 		pos = mgmt->u.auth.variable;
+ 		end = ((const u8 *) mgmt) + len;
+ 		resp = status_code;
+-		send_auth_reply(hapd, sta, sta->addr,
++		send_auth_reply(hapd, sta, dst,
+ 				WLAN_AUTH_SAE,
+ 				auth_transaction, resp, pos, end - pos,
+ 				"auth-sae-reflection-attack");
+@@ -1529,7 +1572,7 @@ static void handle_auth_sae(struct hosta
+ 
+ 	if (hapd->conf->sae_commit_override && auth_transaction == 1) {
+ 		wpa_printf(MSG_DEBUG, "SAE: TESTING - commit override");
+-		send_auth_reply(hapd, sta, sta->addr,
++		send_auth_reply(hapd, sta, dst,
+ 				WLAN_AUTH_SAE,
+ 				auth_transaction, resp,
+ 				wpabuf_head(hapd->conf->sae_commit_override),
+@@ -1823,7 +1866,7 @@ reply:
+ 		    !data && end - pos >= 2)
+ 			data = wpabuf_alloc_copy(pos, 2);
+ 
+-		send_auth_reply(hapd, sta, sta->addr,
++		send_auth_reply(hapd, sta, dst,
+ 				WLAN_AUTH_SAE,
+ 				auth_transaction, resp,
+ 				data ? wpabuf_head(data) : (u8 *) "",
+@@ -3406,7 +3449,6 @@ static void handle_auth(struct hostapd_d
+ 			return;
+ 		}
+ #endif /* CONFIG_MESH */
+-
+ 		sta = ap_sta_add(hapd, sa);
+ 		if (!sta) {
+ 			wpa_printf(MSG_DEBUG, "ap_sta_add() failed");
+@@ -3487,10 +3529,17 @@ static void handle_auth(struct hostapd_d
+ 	    (!(sta->flags & WLAN_STA_MFP) || !ap_sta_is_authorized(sta)) &&
+ 	    !(hapd->conf->mesh & MESH_ENABLED) &&
+ 	    !(sta->added_unassoc) && auth_alg != WLAN_AUTH_PASN) {
+-		if (ap_sta_re_add(hapd, sta) < 0) {
+-			resp = WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
+-			goto fail;
++		res = ap_sta_check_link_sta(hapd, sta);
++		if (!res) {
++			if (ap_sta_re_add(hapd, sta) < 0) {
++				resp = WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
++				goto fail;
++			}
+ 		}
++#ifdef CONFIG_IEEE80211BE
++		if (res)
++			sta->unadded_sta = true;
++#endif /* CONFIG_IEEE80211BE */
+ 	}
+ 
+ 	switch (auth_alg) {
+@@ -3597,8 +3646,14 @@ static void handle_auth(struct hostapd_d
+ 	dst = mgmt->sa;
+ 
+ #ifdef CONFIG_IEEE80211BE
+-	if (ap_sta_is_mld(hapd, sta))
+-		dst = sta->addr;
++	if (ap_sta_is_mld(hapd, sta)) {
++		u8 link_id = hapd->mld_link_id;
++
++		if (!sta->unadded_sta)
++			dst = sta->addr;
++		else
++			dst = sta->mld_info.links[link_id].peer_addr;
++	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	reply_res = send_auth_reply(hapd, sta, dst, auth_alg,
+@@ -4284,7 +4339,6 @@ static bool hapd_is_known_sta(struct hos
+ 	return true;
+ }
+ 
+-
+ static bool check_sa_query(struct hostapd_data *hapd, struct sta_info *sta,
+ 			   int reassoc, const u8 *ies, size_t ies_len)
+ {
+@@ -4315,6 +4369,27 @@ static bool check_sa_query(struct hostap
+ 	return false;
+ }
+ 
++#ifdef CONFIG_IEEE80211BE
++static bool check_sa_query_partner_link(struct hostapd_data *hapd, struct sta_info *sta,
++					int reassoc, const u8 *ies, size_t ies_len)
++{
++	struct hostapd_data *bss;
++	struct sta_info *lsta;
++
++	if (sta->mld_info.mld_sta &&
++	    sta->unadded_sta &&
++	    (sta->flags & WLAN_STA_AUTH)) {
++		for_each_mld_link(bss, hapd) {
++			if (bss == hapd)
++				continue;
++			lsta = ap_get_sta(bss, sta->addr);
++			if (lsta && check_sa_query(bss, lsta, reassoc, ies, ies_len))
++				return true;
++		}
++	}
++	return false;
++}
++#endif /* CONFIG_IEEE80211BE */
+ 
+ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ 			     const u8 *ies, size_t ies_len,
+@@ -4500,6 +4575,11 @@ static int __check_assoc_ies(struct host
+ 		bool init = !sta->wpa_sm;
+ #endif /* CONFIG_IEEE80211BE */
+ 
++#ifdef CONFIG_IEEE80211BE
++		if (!link && check_sa_query_partner_link(hapd, sta, reassoc, ies, ies_len))
++			return WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY;
++#endif /* CONFIG_IEEE80211BE */
++
+ 		wpa_ie -= 2;
+ 		wpa_ie_len += 2;
+ 
+@@ -5149,7 +5229,7 @@ int hostapd_process_assoc_ml_info(struct
+ 			ap_sta_remove_link_sta(hapd, sta);
+ 			hostapd_drv_sta_remove(hapd, sta->addr);
+ 			sta->flags &= ~(WLAN_STA_ASSOC | WLAN_STA_AUTHORIZED);
+-
++			sta->unadded_sta = false;
+ 			if (hostapd_sta_add(hapd, sta->addr, 0, 0,
+ 					    sta->supported_rates,
+ 					    sta->supported_rates_len,
+@@ -5252,8 +5332,12 @@ static int add_associated_sta(struct hos
+ 			set = 0;
+ 		eml_cap = sta->mld_info.common_info.eml_capa;
+ 	}
+-#endif /* CONFIG_IEEE80211BE */
+ 
++	if (sta->unadded_sta) {
++		ap_sta_remove_link_sta(hapd, sta);
++		sta->unadded_sta = false;
++	}
++#endif /* CONFIG_IEEE80211BE */
+ 	/*
+ 	 * Remove the STA entry to ensure the STA PS state gets cleared and
+ 	 * configuration gets updated. This is relevant for cases, such as
+@@ -6063,11 +6147,14 @@ static void handle_assoc(struct hostapd_
+ 
+ #ifdef CONFIG_IEEE80211R_AP
+ 	if (!sta) {
+-		wpa_printf(MSG_DEBUG,
+-			   "FT over DS: Check for STA entry with ML address");
+-		sta = get_sta_from_ft_ds_list(hapd, mgmt, len, reassoc);
+-		if (sta)
+-			sa = sta->addr;
++		sta = ap_get_unadded_sta(hapd, mgmt->sa);
++		if (!sta) {
++			wpa_printf(MSG_DEBUG,
++				   "FT over DS: Check for STA entry with ML address");
++			sta = get_sta_from_ft_ds_list(hapd, mgmt, len, reassoc);
++			if (sta)
++				sa = sta->addr;
++		}
+ 	}
+ 
+ 	if (sta && sta->auth_alg == WLAN_AUTH_FT) {
+@@ -7145,10 +7232,13 @@ static void handle_auth_cb(struct hostap
+ 
+ 	sta = ap_get_sta(hapd, mgmt->da);
+ 	if (!sta) {
+-		wpa_printf(MSG_DEBUG, "handle_auth_cb: STA " MACSTR
+-			   " not found",
+-			   MAC2STR(mgmt->da));
+-		return;
++		sta = ap_get_unadded_sta(hapd, mgmt->da);
++		if (!sta) {
++			wpa_printf(MSG_DEBUG, "handle_auth_cb: STA " MACSTR
++				   " not found",
++				   MAC2STR(mgmt->da));
++			return;
++		}
+ 	}
+ 
+ 	if (len < IEEE80211_HDRLEN + sizeof(mgmt->u.auth)) {
+@@ -7322,9 +7412,12 @@ static void handle_assoc_cb(struct hosta
+ 
+ 	sta = ap_get_sta(hapd, mgmt->da);
+ 	if (!sta) {
+-		wpa_printf(MSG_INFO, "handle_assoc_cb: STA " MACSTR " not found",
+-			   MAC2STR(mgmt->da));
+-		return;
++		sta = ap_get_unadded_sta(hapd, mgmt->da);
++		if (!sta) {
++			wpa_printf(MSG_INFO, "handle_assoc_cb: STA " MACSTR " not found",
++				   MAC2STR(mgmt->da));
++			return;
++		}
+ 	}
+ 
+ #ifdef CONFIG_IEEE80211BE
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -961,8 +961,8 @@ sae_confirm_skip_fixed_fields(struct hos
+ 	 * on the MLD MAC address.
+ 	 */
+ 	sta = ap_get_sta(hapd, mgmt->sa);
+-	if (!sta) {
+-		wpa_printf(MSG_DEBUG, "SAE: No MLD STA for SAE confirm");
++	if (!sta && (sta = ap_get_unadded_sta(hapd, mgmt->sa)) == NULL) {
++
+ 		for (sta = hapd->sta_list; sta; sta = sta->next) {
+ 			int link_id = hapd->mld_link_id;
+ 
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -355,6 +355,9 @@ void ieee802_11_sa_query_action(struct h
+ 		return;
+ 	}
+ 
++#ifdef CONFIG_IEEE80211BE
++	ap_free_unadded_link_sta(hapd, sta);
++#endif /* CONFIG_IEEE80211BE */
+ 	hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
+ 		       HOSTAPD_LEVEL_DEBUG,
+ 		       "Reply to pending SA Query received");
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -223,6 +223,61 @@ void ap_free_sta_pasn(struct hostapd_dat
+ 
+ #endif /* CONFIG_PASN */
+ 
++#ifdef CONFIG_IEEE80211BE
++void ap_free_unadded_link_sta(struct hostapd_data *hapd, struct sta_info *sta)
++{
++	struct hostapd_data *phapd;
++	struct sta_info *psta;
++
++	if (!ap_sta_is_mld(hapd, sta))
++		return;
++
++	for_each_mld_link(phapd, hapd) {
++		psta = ap_get_sta(phapd, sta->addr);
++		if (!(psta && psta->unadded_sta))
++			continue;
++		wpa_printf(MSG_DEBUG, "Remove unadded parter sta: "MACSTR"\n", MAC2STR(sta->addr));
++
++		accounting_sta_stop(phapd, psta);
++		ap_sta_ip6addr_del(phapd, psta);
++
++		ap_sta_hash_del(phapd, psta);
++		ap_sta_list_del(phapd, psta);
++
++		phapd->num_sta--;
++
++#ifdef CONFIG_TAXONOMY
++		wpabuf_free(psta->probe_ie_taxonomy);
++		psta->probe_ie_taxonomy = NULL;
++		wpabuf_free(psta->assoc_ie_taxonomy);
++		psta->assoc_ie_taxonomy = NULL;
++#endif /* CONFIG_TAXONOMY */
++
++		rsn_preauth_free_station(phapd, psta);
++
++		eloop_cancel_timeout(ap_handle_timer, phapd, sta);
++
++		os_free(psta->challenge);
++		wpabuf_free(psta->wps_ie);
++		wpabuf_free(psta->p2p_ie);
++		wpabuf_free(psta->hs20_ie);
++		wpabuf_free(psta->roaming_consortium);
++		os_free(psta->ht_capabilities);
++		os_free(psta->vht_capabilities);
++		os_free(psta->vht_operation);
++		os_free(psta->he_capab);
++		os_free(psta->he_6ghz_capab);
++		os_free(psta->eht_capab);
++
++#ifdef CONFIG_SAE
++		sae_clear_data(psta->sae);
++		os_free(psta->sae);
++#endif /* CONFIG_SAE */
++		os_free(psta);
++	}
++}
++#endif /* CONFIG_IEEE80211BE */
++
+ 
+ static void __ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ {
+@@ -251,12 +306,36 @@ static void clear_wpa_sm_for_each_partne
+ 			continue;
+ 
+ 		lsta = ap_get_sta(lhapd, psta->addr);
+-		if (lsta)
++		if (lsta && (psta->mld_assoc_link_id == lsta->mld_assoc_link_id))
+ 			lsta->wpa_sm = NULL;
+ 	}
+ }
+ #endif /* CONFIG_IEEE80211BE */
+ 
++int ap_sta_check_link_sta(struct hostapd_data *hapd,
++			     struct sta_info *sta)
++{
++#ifdef CONFIG_IEEE80211BE
++	struct hostapd_data *bss;
++	struct sta_info *lsta;
++
++	if (sta && !sta->mld_info.mld_sta)
++		return 0;
++
++	for_each_mld_link(bss, hapd) {
++		if (bss == hapd)
++			continue;
++		lsta = ap_get_sta(bss, sta->addr);
++		if (lsta && ap_sta_is_authorized(lsta)) {
++			return 1;
++		}
++	}
++	return 0;
++#else
++	return 0;
++#endif
++}
++
+ 
+ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ {
+@@ -550,6 +629,22 @@ void ap_free_sta(struct hostapd_data *ha
+ 	os_free(sta);
+ }
+ 
++struct sta_info *ap_get_unadded_sta(struct hostapd_data *hapd, const u8 *addr)
++{
++#ifdef CONFIG_IEEE80211BE
++	struct sta_info *lsta;
++
++	for (lsta = hapd->sta_list; lsta; lsta = lsta->next) {
++		u8 link_id = lsta->mld_assoc_link_id;
++
++		if (lsta->mld_info.mld_sta && lsta->unadded_sta &&
++		    (os_memcmp(lsta->mld_info.links[link_id].peer_addr, addr, ETH_ALEN) == 0)) {
++			return lsta;
++		}
++	}
++#endif /* CONFIG_IEEE80211BE */
++	return NULL;
++}
+ 
+ void hostapd_free_stas(struct hostapd_data *hapd)
+ {
+@@ -611,6 +706,17 @@ void ap_handle_timer(void *eloop_ctx, vo
+ 	wpa_printf(MSG_DEBUG, "%s: %s: " MACSTR " flags=0x%x timeout_next=%d",
+ 		   hapd->conf->iface, __func__, MAC2STR(sta->addr), sta->flags,
+ 		   sta->timeout_next);
++
++#ifdef CONFIG_IEEE80211BE
++	if (sta->unadded_sta) {
++		wpa_msg(hapd->msg_ctx, MSG_DEBUG, " Unadded partner sta " MACSTR
++			" has been inactive",
++			MAC2STR(sta->addr));
++		ap_free_unadded_link_sta(hapd, sta);
++		return;
++	}
++#endif /* CONFIG_IEEE80211BE */
++
+ 	if (sta->timeout_next == STA_REMOVE) {
+ 		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
+ 			       HOSTAPD_LEVEL_INFO, "deauthenticated due to "
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -324,6 +324,11 @@ struct sta_info {
+ #ifdef CONFIG_IEEE80211BE
+ 	struct mld_info mld_info;
+ 	u8 mld_assoc_link_id;
++
++	/* if receive auth request from partner link, when partner sta exist,
++	 * response send without add the station in kernel.
++	 */
++	u8 unadded_sta;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	u16 max_idle_period; /* if nonzero, the granted BSS max idle period in
+@@ -357,10 +362,12 @@ int ap_for_each_sta(struct hostapd_data
+ struct hostapd_ft_over_ds_ml_sta_entry *ap_get_ft_ds_ml_sta(struct hostapd_data *hapd,
+ 							    const u8 *sta_mld);
+ struct sta_info * ap_get_sta(struct hostapd_data *hapd, const u8 *sta);
++struct sta_info *ap_get_unadded_sta(struct hostapd_data *hapd, const u8 *sta);
+ struct sta_info *ap_get_link_sta(struct hostapd_data *hapd, const u8 *link_addr);
+ struct sta_info * ap_get_sta_p2p(struct hostapd_data *hapd, const u8 *addr);
+ void ap_sta_hash_add(struct hostapd_data *hapd, struct sta_info *sta);
+ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta);
++void ap_free_unadded_link_sta(struct hostapd_data *hapd, struct sta_info *sta);
+ void ap_sta_ip6addr_del(struct hostapd_data *hapd, struct sta_info *sta);
+ void hostapd_free_stas(struct hostapd_data *hapd);
+ void ap_handle_timer(void *eloop_ctx, void *timeout_ctx);
+@@ -443,6 +450,8 @@ static inline void ap_sta_set_mld(struct
+ #ifdef CONFIG_IEEE80211BE
+ void ap_sta_remove_link_sta(struct hostapd_data *hapd,
+                             struct sta_info *sta);
++int ap_sta_check_link_sta(struct hostapd_data *hapd,
++			  struct sta_info *sta);
+ #endif
+ void ap_sta_free_sta_profile(struct mld_info *info);
+ 

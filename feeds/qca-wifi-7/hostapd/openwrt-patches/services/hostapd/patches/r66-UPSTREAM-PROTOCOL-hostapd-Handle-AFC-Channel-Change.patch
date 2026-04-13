@@ -1,0 +1,543 @@
+From f018ae21fbad743e2feb2a69363d0b772e116d0a Mon Sep 17 00:00:00 2001
+From: Priyadarshnee Srinivasan <priys@qti.qualcomm.com>
+Date: Thu, 12 Jun 2025 11:10:34 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL hostapd:Manage AFC Channel Change for
+ Retail Mode
+
+Currently, when AFC power events are received in retail mode, hostapd
+handles them without a structured mechanism to manage channel changes
+or payload resets.
+
+As a part of AFC retail feature, introduce an API to read the wiphy
+feature flag and determine if retail AFC is supported. Handle AFC power
+events and payload resets in hostapd by parsing relevant NL events. Trigger
+a random channel change to the optimal power mode upon receiving
+the NL8011_WIPHY_REG_CHANGE event. Add a boolean flag
+'afc_channel_change_pending' in the hostapd interface to coordinate
+this behavior. If channel change attempts fail, transition hostapd to
+the NO_IR state and deactivate the corresponding 6 GHz link interface.
+
+These changes ensure that AFC-related transitions are handled
+predictably and robustly, improving system reliability under
+retail AFC conditions.
+
+Feature: AFC
+Patch-dependency: n00-001-hostapd-add-support-for-6GHz-operation.patch,
+r65-UPSTREAM-PROTOCOL-hostapd-Fetch-AFC-support-from-wiphy.patch
+Tag: 6G_REGULATORY
+
+Signed-off-by: Priyadarshnee Srinivasan <priys@qti.qualcomm.com>
+---
+ src/ap/ap_drv_ops.h                | 14 ++++++
+ src/ap/drv_callbacks.c             | 72 ++++++++++++++++++++++++++++-
+ src/ap/hostapd.c                   | 74 ++++++++++++++++++++++++------
+ src/ap/hostapd.h                   | 73 +++++++++++++++++++++++++++++
+ src/common/qca-vendor.h            |  1 +
+ src/drivers/driver.h               | 11 +++++
+ src/drivers/driver_common.c        |  1 +
+ src/drivers/driver_nl80211.c       | 17 ++++++-
+ src/drivers/driver_nl80211_event.c | 58 ++++++++++++++++++++++-
+ 9 files changed, 305 insertions(+), 16 deletions(-)
+
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -466,6 +466,20 @@ static inline int hostapd_drv_channel_in
+ 	return hapd->driver->channel_info(hapd->drv_priv, ci);
+ }
+ 
++/**
++ * hostapd_drv_is_retail_afc_supported - Check if retail AFC is supported
++ * @hapd: hostapd data
++ *
++ * Return: True if retail AFC is supported, false otherwise.
++ */
++static inline bool
++hostapd_drv_is_retail_afc_supported(struct hostapd_data *hapd)
++{
++	if (!hapd->driver || !hapd->driver->is_retail_afc_supported)
++		return false;
++	return hapd->driver->is_retail_afc_supported(hapd->drv_priv);
++}
++
+ static inline int
+ hostapd_drv_send_external_auth_status(struct hostapd_data *hapd,
+ 				      struct external_auth *params)
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -2523,6 +2523,19 @@ static int hostapd_allocate_afc_rsp_info
+ 	return 0;
+ }
+ 
++void
++afc_channel_change_timeout(void *eloop_ctx, void *timeout_ctx)
++{
++	struct hostapd_iface *iface = eloop_ctx;
++
++	if (!iface->is_afc_channel_change_pending) {
++		wpa_printf(MSG_DEBUG, "AFC channel change already completed");
++		return;
++	}
++	wpa_printf(MSG_DEBUG, "AFC channel change timeout, try channel change once");
++	hostapd_handle_afc_channel_change(iface);
++}
++
+ static void hostapd_event_afc_update_complete(
+ 		struct hostapd_data *hapd,
+ 		struct afc_sp_reg_info *afc_rsp_info)
+@@ -2534,8 +2547,62 @@ static void hostapd_event_afc_update_com
+ 		wpa_printf(MSG_DEBUG, "AFC response memory  allocation failed");
+ 		return;
+ 	}
+-
+ 	iface->is_afc_power_event_received = true;
++	if (hostapd_drv_is_retail_afc_supported(hapd)) {
++		iface->is_afc_channel_change_pending = true;
++		/* Wait for NL8011_WIPHY_REG_CHANGE event to get the updated channel list */
++		eloop_register_timeout(5, 0, afc_channel_change_timeout, iface,
++				       NULL);
++	}
++}
++
++void
++hostapd_set_no_ir_state(struct hostapd_iface *iface)
++{
++	hostapd_set_state(iface, HAPD_IFACE_NO_IR);
++	hostapd_interface_update_fils_ubpr(iface, false);
++	iface->is_no_ir = true;
++	hostapd_drv_stop_ap(iface->bss[0]);
++	hostapd_no_ir_cleanup(iface->bss[0]);
++	wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, AP_EVENT_NO_IR);
++}
++
++/**
++ * hostapd_event_afc_payload_reset - Reset AFC payload of the hostapd.
++ *
++ * Mark a flag to signal that an AFC channel switch is pending. Once
++ * the NL8011_WIPHY_REG_CHANGE event is received, the channel change
++ * is attempted to best power mode available. If the  NL8011_WIPHY_REG_CHANGE
++ * is not received within the timeout period, afc_channel_change_timeout()
++ * is invoked to take further action.
++ *
++ * @hapd: Pointer to hostapd_data structure
++ * @afc_rsp_info: Pointer to afc_sp_reg_info structure
++ *
++ * Returns: None
++ */
++static void
++hostapd_event_afc_payload_reset(struct hostapd_data *hapd,
++				struct afc_sp_reg_info *afc_rsp_info)
++{
++	struct hostapd_iface *iface = hapd->iface;
++
++	wpa_printf(MSG_DEBUG, "Processing AFC payload reset event");
++	if (!iface->afc_rsp_info) {
++		wpa_printf(MSG_DEBUG, "No AFC payload to reset");
++		return;
++	}
++	/* Clear AFC payload */
++	hostapd_free_afc_data(iface);
++	iface->is_afc_power_event_received = false;
++	if (!hostapd_drv_is_retail_afc_supported(hapd)) {
++		wpa_printf(MSG_DEBUG, "AFC payload reset not supported");
++		return;
++	}
++	iface->is_afc_channel_change_pending = true;
++	/* Wait for NL8011_WIPHY_REG_CHANGE event to get the updated channel list */
++	eloop_register_timeout(5, 0,
++			       afc_channel_change_timeout, iface, NULL);
+ }
+ 
+ #ifdef CONFIG_OWE
+@@ -3277,6 +3344,9 @@ void hostapd_wpa_event(void *ctx, enum w
+ 		hostapd_event_afc_update_complete(hapd,
+ 						  &data->afc_rsp_info);
+ 		break;
++	case EVENT_AFC_PAYLOAD_RESET:
++		hostapd_event_afc_payload_reset(hapd, &data->afc_rsp_info);
++		break;
+ #ifdef CONFIG_IEEE80211BE
+ 	case EVENT_LINK_REMOVAL_STARTED:
+ 		hostapd_update_link_removal_field(hapd,
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -73,8 +73,6 @@ static void hostapd_switch_color_timeout
+ 						 void *user_ctx);
+ #endif /* CONFIG_IEEE80211AX */
+ 
+-static void hostapd_interface_update_fils_ubpr(struct hostapd_iface *iface,
+-					       bool iface_enabled);
+ 
+ int hostapd_for_each_interface(struct hapd_interfaces *interfaces,
+ 			       int (*cb)(struct hostapd_iface *iface,
+@@ -2218,7 +2216,7 @@ static int start_ctrl_iface(struct hosta
+  * deinitializing the driver and the control interfaces. A subsequent
+  * REG_CHANGE event can bring the AP back up.
+  */
+-static void hostapd_no_ir_cleanup(struct hostapd_data *bss)
++void hostapd_no_ir_cleanup(struct hostapd_data *bss)
+ {
+ 	hostapd_bss_deinit_no_free(bss);
+ 	hostapd_bss_link_deinit(bss);
+@@ -2227,8 +2225,7 @@ static void hostapd_no_ir_cleanup(struct
+ }
+ 
+ 
+-static int hostapd_no_ir_channel_list_updated(struct hostapd_iface *iface,
+-					      void *ctx)
++static int hostapd_no_ir_channel_list_updated(struct hostapd_iface *iface)
+ {
+ 	struct hostapd_data *hapd = iface->bss[0];
+ 	bool all_no_ir, is_6ghz;
+@@ -2301,12 +2298,7 @@ static int hostapd_no_ir_channel_list_up
+ 				   "NO_IR: All chan in new chanlist are NO_IR, stop AP.");
+ 		}
+ 
+-		hostapd_set_state(iface, HAPD_IFACE_NO_IR);
+-		hostapd_interface_update_fils_ubpr(iface, false);
+-		iface->is_no_ir = true;
+-		hostapd_drv_stop_ap(iface->bss[0]);
+-		hostapd_no_ir_cleanup(iface->bss[0]);
+-		wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, AP_EVENT_NO_IR);
++		hostapd_set_no_ir_state(iface);
+ 	} else if (iface->state == HAPD_IFACE_NO_IR) {
+ 		if (all_no_ir) {
+ 			wpa_printf(MSG_DEBUG,
+@@ -2365,12 +2357,66 @@ static void channel_list_update_timeout(
+ 	setup_interface2(iface);
+ }
+ 
++#ifdef HOSTAPD
++static int hostapd_find_random_chan_and_switch(struct hostapd_iface *iface)
++{
++
++	return 0;
++}
++
++int hostapd_handle_afc_channel_change(struct hostapd_iface *iface)
++{
++	int ret;
++
++	if (iface->state != HAPD_IFACE_ENABLED) {
++		wpa_printf(MSG_ERROR, "iface state: %u, not handling afc channel change\n",
++			   iface->state);
++		return -EOPNOTSUPP;
++	}
++
++	iface->is_afc_channel_change_pending = 0;
++	eloop_cancel_timeout(afc_channel_change_timeout, iface, NULL);
++	ret = hostapd_find_random_chan_and_switch(iface);
++	if (ret) {
++		wpa_printf(MSG_ERROR, "Failed to switch to a new channel, moving to NOIR");
++		hostapd_set_no_ir_state(iface);
++		return -EINVAL;
++	}
++	return 0;
++
++}
++#endif
++
++/**
++ * hostapd_handle_regchannel_update - Handle channel list update.
++ *
++ * Initiate a channel change upon receiving the NL8011_WIPHY_REG_CHANGE event.
++ * If afc_channel_change_pending is set (set only for 6 GHz iface which
++ * received AFC power event), then invoke random channel and switch to it.
++ * If not, then invoke no_ir_channel_list_updated() to handle
++ * NO_IR channel list update.
++ *
++ * @param iface: Pointer to hostapd interface data
++ * @param ctx:   Pointer to context
++ *
++ * Return: 0 on success, negative value on failure
++ */
++static int hostapd_handle_regchannel_update(struct hostapd_iface *iface,
++					    void *ctx)
++{
++	if (iface->is_afc_channel_change_pending) {
++		wpa_printf(MSG_DEBUG, "Handling AFC channel change");
++		return hostapd_handle_afc_channel_change(iface);
++	}
++	wpa_printf(MSG_DEBUG, "Handling AFC NOIR");
++	return hostapd_no_ir_channel_list_updated(iface);
++}
+ 
+ void hostapd_channel_list_updated(struct hostapd_iface *iface, int initiator)
+ {
+ 	if (initiator == REGDOM_SET_BY_DRIVER) {
+ 		hostapd_for_each_interface(iface->interfaces,
+-					   hostapd_no_ir_channel_list_updated,
++					   hostapd_handle_regchannel_update,
+ 					   NULL);
+ 		return;
+ 	}
+@@ -2525,6 +2571,7 @@ static int setup_interface2(struct hosta
+ 	iface->afc_rsp_info = NULL;
+ 	iface->is_afc_power_event_received = false;
+ 	iface->wait_channel_update = 0;
++	iface->is_afc_channel_change_pending = false;
+ 	iface->is_no_ir = false;
+ 	iface->power_mode_6ghz_before_change = -1;
+ 
+@@ -3371,6 +3418,7 @@ void hostapd_interface_deinit(struct hos
+ 
+ 	eloop_cancel_timeout(channel_list_update_timeout, iface, NULL);
+ 	iface->wait_channel_update = 0;
++	iface->is_afc_channel_change_pending = 0;
+ 	iface->power_mode_6ghz_before_change = -1;
+ 	iface->is_no_ir = false;
+ 	hostapd_free_afc_data(iface);
+@@ -5801,7 +5849,7 @@ void hostapd_ocv_check_csa_sa_query(void
+  * Lower band interfaces coming up: Disable FILS/UBPR for all 6GHz APs if not done
+  * already.
+  */
+-static void
++void
+ hostapd_interface_update_fils_ubpr(struct hostapd_iface *iface, bool iface_enabled)
+ {
+ 	int i, j;
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -834,6 +834,11 @@ struct hostapd_iface {
+ 	/* 6 GHz AFC information */
+ 	struct afc_sp_reg_info *afc_rsp_info;
+ 	bool is_afc_power_event_received;
++	/* After receiving AFC power event in retail mode, this flag is to set to
++	 * true to indicate that the channel change is pending. Channel is changed
++	 * once NL8011_WIPHY_REG_CHANGE event is received.
++	 */
++	bool is_afc_channel_change_pending;
+ 
+ 	struct hostapd_multi_hw_info *multi_hw_info;
+ 	unsigned int num_multi_hws;
+@@ -1022,4 +1027,72 @@ u8 hostapd_max_bssid_indicator(struct ho
+ int hostapd_allocate_mbssid_idx(struct hostapd_data *hapd);
+ int hostapd_get_mbssid_index(u32 *bmap);
+ void hostapd_free_mbssid_idx(struct hostapd_data *hapd);
++void hostapd_interface_update_fils_ubpr(struct hostapd_iface *iface,
++					bool iface_enabled);
++/**
++ * hostapd_set_no_ir_state - Set the NO_IR state for the interface
++ * and bring down the corresponding 6 GHz link.
++ * @iface: Pointer to hostapd interface data
++ *
++ * Return: None
++ */
++#ifdef HOSTAPD
++void hostapd_set_no_ir_state(struct hostapd_iface *iface);
++#else
++static inline void
++hostapd_set_no_ir_state(struct hostapd_iface *iface)
++{
++	/* No-op if hostapd is not defined */
++}
++#endif
++void hostapd_no_ir_cleanup(struct hostapd_data *bss);
++
++/**
++ * hostapd_handle_afc_channel_change - Handle retail AFC channel change.
++ *
++ * Following are the steps:
++ * 1. Fetch the updated channel list from the kernel using
++ * NL8011_WIPHY_REG_CHANGE event.
++ * 2. Randomly select a channel from the updated channel list.
++ * 3. Apply best power mode on the selected channel and then set the
++ * channel to the driver using drv_switch_channel.
++ * 4. If channel change fails, move hostapd to NO_IR state.
++ *
++ * @iface: Pointer to hostapd interface data
++ *
++ * Returns: 0 on success, -1 on failure.
++ */
++#ifdef HOSTAPD
++int hostapd_handle_afc_channel_change(struct hostapd_iface *iface);
++#else
++static inline int
++hostapd_handle_afc_channel_change(struct hostapd_iface *iface)
++{
++	/* No-op if hostapd is not defined */
++	return 0;
++}
++#endif
++
++/**
++ * afc_channel_change_timeout - Timeout handler for AFC channel change
++ *
++ * This function is called when the timeout for AFC channel change occurs.
++ * After AFC response is received by the hostapd, it waits for
++ * NL8011_WIPHY_REG_CHANGE event to get the updated channel list. If this
++ * event is not received within the timeout period, this function
++ * is invoked to set the hostapd state to no IR and clean up the AFC data.
++ *
++ * @eloop_ctx: Pointer to hostapd_iface structure
++ * @timeout_ctx: Pointer to timeout context (not used)
++ */
++#ifdef HOSTAPD
++void
++afc_channel_change_timeout(void *eloop_ctx, void *timeout_ctx);
++#else
++static inline void
++afc_channel_change_timeout(void *eloop_ctx, void *timeout_ctx)
++{
++	/* No-op if hostapd is not defined */
++}
++#endif
+ #endif /* HOSTAPD_H */
+--- a/src/common/qca-vendor.h
++++ b/src/common/qca-vendor.h
+@@ -16645,6 +16645,7 @@ enum qca_wlan_vendor_attr_afc_event {
+ 	QCA_WLAN_VENDOR_ATTR_AFC_EVENT_EXP_TIME = 9,
+ 	QCA_WLAN_VENDOR_ATTR_AFC_EVENT_FREQ_RANGE_LIST = 10,
+ 	QCA_WLAN_VENDOR_ATTR_AFC_EVENT_OPCLASS_CHAN_LIST = 11,
++	QCA_WLAN_VENDOR_ATTR_AFC_EVENT_HW_IDX = 12,
+ 
+ 	QCA_WLAN_VENDOR_ATTR_AFC_EVENT_AFTER_LAST,
+ 	QCA_WLAN_VENDOR_ATTR_AFC_EVENT_MAX =
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -5676,6 +5676,12 @@ struct wpa_driver_ops {
+ 				int ppe_vp_type, bool is_bss);
+ 
+ #endif /* CONFIG_IEEE80211BE */
++	/*
++	 * is_retail_afc_supported - Check if the driver supports retail AFC
++	 * @priv: Private driver interface data
++	 * Returns: true if the driver supports retail AFC, false otherwise
++	 */
++	bool (*is_retail_afc_supported)(void *priv);
+ };
+ 
+ /**
+@@ -6338,6 +6344,11 @@ enum wpa_event_type {
+ 	 * EVENT_AFC_POWER_UPDATE_COMPLETE_NOTIFY - Notify AFC data is processed
+ 	 */
+ 	EVENT_AFC_POWER_UPDATE_COMPLETE_NOTIFY,
++	/**
++	 * EVENT_AFC_PAYLOAD_RESET - Clear the AFC payload
++	 */
++
++	EVENT_AFC_PAYLOAD_RESET,
+ 
+ 	/**
+ 	 * EVENT_LINK_REMOVAL_STARTED - Update link_removal_count and TSF
+--- a/src/drivers/driver_common.c
++++ b/src/drivers/driver_common.c
+@@ -106,6 +106,7 @@ const char * event_to_string(enum wpa_ev
+ 	E2S(RX_CRITICAL_UPDATE);
+ 	E2S(6GHZ_POWER_MODE_NOTIFY);
+ 	E2S(AFC_POWER_UPDATE_COMPLETE_NOTIFY);
++	E2S(AFC_PAYLOAD_RESET);
+ 	E2S(LINK_REMOVAL_STARTED);
+ 	E2S(LINK_REMOVAL_COMPLETED);
+ 	}
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -13656,7 +13656,6 @@ static int nl80211_get_pref_freq_list(vo
+ 	return 0;
+ }
+ 
+-
+ static int nl80211_set_prob_oper_freq(void *priv, unsigned int freq)
+ {
+ 	struct i802_bss *bss = priv;
+@@ -15000,6 +14999,21 @@ fail:
+ }
+ 
+ 
++static bool nl80211_is_retail_afc_supported(void *priv)
++{
++	struct i802_bss *bss = priv;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++
++	if (!drv->afc_support)
++		return false;
++
++	if (!drv->afc_retail_support)
++		return false;
++
++	return true;
++}
++
++
+ #ifdef CONFIG_DPP
+ static int nl80211_dpp_listen(void *priv, bool enable)
+ {
+@@ -15539,4 +15553,5 @@ const struct wpa_driver_ops wpa_driver_n
+ 	.radio_disable = testing_nl80211_radio_disable,
+ #endif /* CONFIG_TESTING_OPTIONS */
+ 	.get_multi_hw_info = wpa_driver_get_multi_hw_info,
++	.is_retail_afc_supported = nl80211_is_retail_afc_supported,
+ };
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -4005,6 +4005,62 @@ qca_nl80211_afc_power_update_completed(s
+ 			     &event);
+ 	os_free(afc_freq_info);
+ 	os_free(afc_chan_info);
++	return 0;
++}
++
++static int
++qca_nl80211_handle_afc_events(struct i802_bss *bss,
++			      u8 *data, size_t len)
++{
++	struct nlattr *attr[QCA_WLAN_VENDOR_ATTR_AFC_EVENT_MAX + 1];
++	u8 event_type;
++	int received_hw_index;
++
++	if (!(data && len)) {
++		wpa_printf(MSG_ERROR, "Invalid data length data ptr: %pK ",
++			   data);
++		return -EINVAL;
++	}
++
++	if (nla_parse(attr, QCA_WLAN_VENDOR_ATTR_AFC_EVENT_MAX,
++		      (struct nlattr *)data, len, NULL)) {
++		wpa_printf(MSG_ERROR, "invalid set AFC config policy attribute\n");
++		return -EINVAL;
++	}
++
++	received_hw_index = -1;
++	if (attr[QCA_WLAN_VENDOR_ATTR_AFC_EVENT_HW_IDX])
++		received_hw_index = nla_get_u32(attr[QCA_WLAN_VENDOR_ATTR_AFC_EVENT_HW_IDX]);
++	wpa_printf(MSG_DEBUG, "received_hw_index = %d\n", received_hw_index);
++
++	if (!attr[QCA_WLAN_VENDOR_ATTR_AFC_EVENT_TYPE]) {
++		wpa_printf(MSG_ERROR, "AFC event type not present\n");
++		return -EINVAL;
++	}
++
++	event_type = nla_get_u32(attr[QCA_WLAN_VENDOR_ATTR_AFC_EVENT_TYPE]);
++	switch (event_type) {
++	case QCA_WLAN_VENDOR_AFC_EVENT_TYPE_POWER_UPDATE_COMPLETE:
++		qca_nl80211_afc_power_update_completed(bss, data, len);
++		wpa_printf(MSG_DEBUG, "Handle AFC event of type %d\n",
++			   event_type);
++		break;
++	case QCA_WLAN_VENDOR_AFC_EVENT_TYPE_PAYLOAD_RESET:
++		{
++			union wpa_event_data event;
++
++			os_memset(&event, 0, sizeof(event));
++			wpa_supplicant_event(bss->ctx, EVENT_AFC_PAYLOAD_RESET,
++					     &event);
++			wpa_printf(MSG_DEBUG, "Handle AFC event of type %d\n",
++				   event_type);
++		}
++		break;
++	default:
++		wpa_printf(MSG_DEBUG, "Ignore unsupported AFC event %d",
++			   event_type);
++		break;
++	}
+ 
+ 	return 0;
+ }
+@@ -4061,7 +4117,7 @@ static void nl80211_vendor_event_qca(str
+ 		qca_nl80211_6ghz_pwr_mode_change_completed(bss, data, len);
+ 		break;
+ 	case QCA_NL80211_VENDOR_SUBCMD_AFC_EVENT:
+-		qca_nl80211_afc_power_update_completed(bss, data, len);
++		qca_nl80211_handle_afc_events(bss, data, len);
+ 		break;
+ 	default:
+ 		wpa_printf(MSG_DEBUG,

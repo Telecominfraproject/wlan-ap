@@ -1,0 +1,170 @@
+From 90d1bb97b7f31ced30256378dce0935272f53921 Mon Sep 17 00:00:00 2001
+From: Sowmiya Sree Elavalagan <quic_ssreeela@quicinc.com>
+Date: Thu, 30 Jan 2025 10:48:38 +0530
+Subject: [PATCH 135/141] wifi: ath12k: Enable IPQ5424 WiFi device support
+
+Currently, ath12k AHB (in IPQ5332) uses SCM calls to authenticate the
+firmware image to bring up userpd. From IPQ5424 onwards, Q6 firmware can
+directly communicate with the Trusted Management Engine - Lite (TME-L),
+eliminating the need for SCM calls for userpd bring-up.
+
+Hence, to enable IPQ5424 device support, use qcom_mdt_load_no_init() and
+skip the SCM call as Q6 will directly authenticate the userpd firmware.
+
+Tested-on: IPQ5424 hw1.0 AHB WLAN.WBE.1.5-01053-QCAHKSWPL_SILICONZ-1
+Tested-on: IPQ5332 hw1.0 AHB WLAN.WBE.1.3.1-00130-QCAHKSWPL_SILICONZ-1
+
+Signed-off-by: Sowmiya Sree Elavalagan <quic_ssreeela@quicinc.com>
+Co-developed-by: Saravanakumar Duraisamy <quic_saradura@quicinc.com>
+Signed-off-by: Saravanakumar Duraisamy <quic_saradura@quicinc.com>
+Signed-off-by: Raj Kumar Bhagat <quic_rajkbhag@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/ahb.c | 68 ++++++++++++++++++++-------
+ drivers/net/wireless/ath/ath12k/ahb.h |  9 ++++
+ 2 files changed, 60 insertions(+), 17 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -20,6 +20,9 @@ static const struct of_device_id ath12k_
+ 	{ .compatible = "qcom,ipq5332-wifi",
+ 	  .data = (void *)ATH12K_HW_IPQ5332_HW10,
+ 	},
++	{ .compatible = "qcom,ipq5424-wifi",
++	  .data = (void *)ATH12K_HW_IPQ5424_HW10,
++	},
+ 	{ }
+ };
+ 
+@@ -409,9 +412,11 @@ static int ath12k_ahb_power_up(struct at
+ 		ATH12K_AHB_UPD_SWID;
+ 
+ 	/* Load FW image to a reserved memory location */
+-	ret = qcom_mdt_load(dev, fw, fw_name, pasid, ab_ahb->mem_region,
+-			    ab_ahb->mem_phys, ab_ahb->mem_size,
+-			    &ab_ahb->mem_phys);
++	ret = ab_ahb->ahb_ops->mdt_load(dev, fw, fw_name, pasid,
++					ab_ahb->mem_region,
++					ab_ahb->mem_phys,
++					ab_ahb->mem_size,
++					&ab_ahb->mem_phys);
+ 	if (ret) {
+ 		ath12k_err(ab, "Failed to load MDT segments: %d\n", ret);
+ 		goto err_fw;
+@@ -443,11 +448,13 @@ static int ath12k_ahb_power_up(struct at
+ 		goto err_fw2;
+ 	}
+ 
+-	/* Authenticate FW image using peripheral ID */
+-	ret = qcom_scm_pas_auth_and_reset(pasid);
+-	if (ret) {
+-		ath12k_err(ab, "failed to boot the remote processor %d\n", ret);
+-		goto err_fw2;
++	if (ab_ahb->scm_auth_enabled) {
++		/* Authenticate FW image using peripheral ID */
++		ret = qcom_scm_pas_auth_and_reset(pasid);
++		if (ret) {
++			ath12k_err(ab, "failed to boot the remote processor %d\n", ret);
++			goto err_fw2;
++		}
+ 	}
+ 
+ 	/* Instruct Q6 to spawn userPD thread */
+@@ -504,13 +511,15 @@ static void ath12k_ahb_power_down(struct
+ 
+ 	qcom_smem_state_update_bits(ab_ahb->stop_state, BIT(ab_ahb->stop_bit), 0);
+ 
+-	pasid = (u32_encode_bits(ab_ahb->userpd_id, ATH12K_USERPD_ID_MASK)) |
+-		ATH12K_AHB_UPD_SWID;
+-	/* Release the firmware */
+-	ret = qcom_scm_pas_shutdown(pasid);
+-	if (ret)
+-		ath12k_err(ab, "scm pas shutdown failed for userPD%d: %d\n",
+-			   ab_ahb->userpd_id, ret);
++	if (ab_ahb->scm_auth_enabled) {
++		pasid = (u32_encode_bits(ab_ahb->userpd_id, ATH12K_USERPD_ID_MASK)) |
++			 ATH12K_AHB_UPD_SWID;
++		/* Release the firmware */
++		ret = qcom_scm_pas_shutdown(pasid);
++		if (ret)
++			ath12k_err(ab, "scm pas shutdown failed for userPD%d\n",
++				   ab_ahb->userpd_id);
++	}
+ }
+ 
+ static void ath12k_ahb_init_qmi_ce_config(struct ath12k_base *ab)
+@@ -743,6 +752,14 @@ static int ath12k_ahb_map_service_to_pip
+ 	return 0;
+ }
+ 
++static const struct ath12k_ahb_ops ahb_ops_ipq5332 = {
++	.mdt_load = qcom_mdt_load,
++};
++
++static const struct ath12k_ahb_ops ahb_ops_ipq5424 = {
++	.mdt_load = qcom_mdt_load_no_init,
++};
++
+ static const struct ath12k_hif_ops ath12k_ahb_hif_ops_ipq5332 = {
+ 	.start = ath12k_ahb_start,
+ 	.stop = ath12k_ahb_stop,
+@@ -1038,13 +1055,32 @@ static int ath12k_ahb_probe(struct platf
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	ab_ahb = ath12k_ab_to_ahb(ab);
++	ab_ahb->ab = ab;
++
++	hw_rev = ath12k_ahb_get_hw_rev(pdev);
++	switch (hw_rev) {
++	case ATH12K_HW_IPQ5332_HW10:
++		hif_ops = &ath12k_ahb_hif_ops_ipq5332;
++		ab_ahb->userpd_id = ATH12K_IPQ5332_USERPD_ID;
++		ab_ahb->scm_auth_enabled = true;
++		ab_ahb->ahb_ops = &ahb_ops_ipq5332;
++		break;
++	case ATH12K_HW_IPQ5424_HW10:
++		hif_ops = &ath12k_ahb_hif_ops_ipq5332;
++		ab_ahb->userpd_id = ATH12K_IPQ5332_USERPD_ID;
++		ab_ahb->scm_auth_enabled = false;
++		ab_ahb->ahb_ops = &ahb_ops_ipq5424;
++		break;
++	default:
++		ret = -EOPNOTSUPP;
++		goto err_core_free;
++	}
++
+ 	ab->hif.ops = hif_ops;
+ 	ab->pdev = pdev;
+ 	ab->hw_rev = hw_rev;
+ 	platform_set_drvdata(pdev, ab);
+-	ab_ahb = ath12k_ab_to_ahb(ab);
+-	ab_ahb->ab = ab;
+-	ab_ahb->userpd_id = userpd_id;
+ 
+ 	/* Set fixed_mem_region to true for platforms that support fixed memory
+ 	 * reservation from DT. If memory is reserved from DT for FW, ath12k driver
+--- a/drivers/net/wireless/ath/ath12k/ahb.h
++++ b/drivers/net/wireless/ath/ath12k/ahb.h
+@@ -43,6 +43,13 @@ enum ath12k_ahb_userpd_irq {
+ 
+ struct ath12k_base;
+ 
++struct ath12k_ahb_ops {
++	int (*mdt_load)(struct device *dev, const struct firmware *fw,
++			const char *firmware, int pas_id, void *mem_region,
++			phys_addr_t mem_phys, size_t mem_size,
++			phys_addr_t *reloc_base);
++};
++
+ struct ath12k_ahb {
+ 	struct ath12k_base *ab;
+ 	struct rproc *tgt_rproc;
+@@ -59,6 +66,8 @@ struct ath12k_ahb {
+ 	u32 spawn_bit;
+ 	u32 stop_bit;
+ 	int userpd_irq_num[ATH12K_USERPD_MAX_IRQ];
++	bool scm_auth_enabled;
++	const struct ath12k_ahb_ops *ahb_ops;
+ };
+ 
+ static inline struct ath12k_ahb *ath12k_ab_to_ahb(struct ath12k_base *ab)

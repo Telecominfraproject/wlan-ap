@@ -1,0 +1,710 @@
+From 1945e67d017ca7f1ebb959c5ac03e9657e093fec Mon Sep 17 00:00:00 2001
+From: Alok Singh <aloksing@qti.qualcomm.com>
+Date: Mon, 30 Jun 2025 15:35:00 +0530
+Subject: [PATCH 10/13] UPSTREAM: DP: wifi: ath12k: add support to reap and
+ process mon dest ring
+
+WCN7850 uses error dst ring as mon dest ring. Each time hardware
+receives a packet, will fill the payload into mon dest ring.
+
+The mon dest ring may store many MSDUs, which belonged to different
+MPDUs. Need to retrieve MSDUs based on the PPDU ID, only processing the
+MSDUs with same PPDU ID each time.
+
+The PPDU ID is used in cycles,  the difference between the PPDU IDs
+of the two rings must be checked. If the status PPDU ID minus the
+dest PPDU ID is greater than 20000, it is considered a wrap-around
+case.
+
+After reaping the mon dest ring, should prepare packet and deliver it to
+mac80211 when status PPDU ID is equal to dest PPDU ID. Then start to
+process next PPDU if exists.
+
+But if dest PPDU ID > status PPDU ID, should hold on to mon dest ring
+processing. If it exceeds 16 consecutive times, status PPDU ID will be
+forcibly set to dest PPDU ID to avoid backpressure issue.
+
+Patch-dependency:
+	0401-0009-UPSTREAM-DP-wifi-ath12k-use-ath12k_buffer_addr-in-at.patch
+
+Signed-off-by: Alok Singh <aloksing@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_mon.c      | 363 +++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/dp_rx.c       |  10 +
+ drivers/net/wireless/ath/ath12k/dp_rx.h       |   4 +-
+ drivers/net/wireless/ath/ath12k/hal.c         |  39 ++
+ drivers/net/wireless/ath/ath12k/hal.h         |  26 ++
+ .../wireless/ath/ath12k/wifi7/hal_qcn9274.c   |   1 +
+ .../net/wireless/ath/ath12k/wifi7/hal_rx.c    |  81 ++++
+ .../net/wireless/ath/ath12k/wifi7/hal_rx.h    |   8 +
+ .../wireless/ath/ath12k/wifi7/hal_wcn7850.c   |   5 +
+ 9 files changed, 534 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.c b/drivers/net/wireless/ath/ath12k/dp_mon.c
+index ac78f38..43fbeb5 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -1830,6 +1830,42 @@ ath12k_dp_rx_mon_buf_done(struct ath12k_base *ab, struct hal_srng *srng,
+ 	return DP_MON_STATUS_REPLINISH;
+ }
+ 
++static u32 ath12k_dp_mon_comp_ppduid(u32 msdu_ppdu_id, u32 *ppdu_id)
++{
++	u32 ret = 0;
++
++	if ((*ppdu_id < msdu_ppdu_id) &&
++	    ((msdu_ppdu_id - *ppdu_id) < DP_NOT_PPDU_ID_WRAP_AROUND)) {
++		/* Hold on mon dest ring, and reap mon status ring. */
++		*ppdu_id = msdu_ppdu_id;
++		ret = msdu_ppdu_id;
++	} else if ((*ppdu_id > msdu_ppdu_id) &&
++		((*ppdu_id - msdu_ppdu_id) > DP_NOT_PPDU_ID_WRAP_AROUND)) {
++		/* PPDU ID has exceeded the maximum value and will
++		 * restart from 0.
++		 */
++		*ppdu_id = msdu_ppdu_id;
++		ret = msdu_ppdu_id;
++	}
++	return ret;
++}
++
++static
++void ath12k_dp_mon_next_link_desc_get(struct ath12k_base *ab,
++				      struct hal_rx_msdu_link *msdu_link,
++				      dma_addr_t *paddr, u32 *sw_cookie, u8 *rbm,
++				      struct ath12k_buffer_addr **pp_buf_addr_info)
++{
++	struct ath12k_buffer_addr *buf_addr_info;
++
++	buf_addr_info = &msdu_link->buf_addr_info;
++
++	ath12k_hal_rx_buf_addr_info_get(buf_addr_info,
++					paddr, sw_cookie, rbm);
++
++	*pp_buf_addr_info = buf_addr_info;
++}
++
+ static void
+ ath12k_dp_mon_fill_rx_stats_info(struct hal_rx_mon_ppdu_info *ppdu_info,
+ 				 struct ieee80211_rx_status *rx_status)
+@@ -2367,6 +2403,32 @@ static int ath12k_dp_pkt_set_pktlen(struct sk_buff *skb, u32 len)
+ 	return 0;
+ }
+ 
++/* Hardware fill buffer with 128 bytes aligned. So need to reap it
++ * with 128 bytes aligned.
++ */
++#define RXDMA_DATA_DMA_BLOCK_SIZE 128
++
++static void
++ath12k_dp_mon_get_buf_len(struct hal_rx_msdu_desc_info *info,
++			  bool *is_frag, u32 *total_len,
++			  u32 *frag_len, u32 *msdu_cnt)
++{
++	if (info->msdu_flags & RX_MSDU_DESC_INFO0_MSDU_CONTINUATION) {
++		*is_frag = true;
++		*frag_len = (RX_MON_STATUS_BASE_BUF_SIZE -
++			     sizeof(struct hal_rx_desc)) &
++			     ~(RXDMA_DATA_DMA_BLOCK_SIZE - 1);
++		*total_len += *frag_len;
++	} else {
++		if (*is_frag)
++			*frag_len = info->msdu_len - *total_len;
++		else
++			*frag_len = info->msdu_len;
++
++		*msdu_cnt -= 1;
++	}
++}
++
+ static int
+ ath12k_dp_mon_parse_status_buf(struct ath12k *ar,
+ 			       struct ath12k_mon_data *pmon,
+@@ -4124,6 +4186,305 @@ move_next:
+ 	return num_buffs_reaped;
+ }
+ 
++static u32
++ath12k_dp_rx_mon_mpdu_pop(struct ath12k *ar, int mac_id,
++			  void *ring_entry, struct sk_buff **head_msdu,
++			  struct sk_buff **tail_msdu,
++			  struct list_head *used_list,
++			  u32 *npackets, u32 *ppdu_id)
++{
++	struct ath12k_mon_data *pmon = (struct ath12k_mon_data *)&ar->dp.mon_data;
++	struct ath12k_buffer_addr *p_buf_addr_info, *p_last_buf_addr_info;
++	u32 msdu_ppdu_id = 0, msdu_cnt = 0, total_len = 0, frag_len = 0;
++	u32 rx_buf_size, rx_pkt_offset, sw_cookie;
++	bool is_frag, is_first_msdu, drop_mpdu = false;
++	struct hal_reo_entrance_ring *ent_desc =
++		(struct hal_reo_entrance_ring *)ring_entry;
++	u32 rx_bufs_used = 0, i = 0, desc_bank = 0;
++	struct hal_rx_desc *rx_desc, *tail_rx_desc;
++	struct hal_rx_msdu_link *msdu_link_desc;
++	struct sk_buff *msdu = NULL, *last = NULL;
++	struct ath12k_rx_desc_info *desc_info;
++	struct ath12k_buffer_addr buf_info;
++	struct hal_rx_msdu_list msdu_list;
++	struct ath12k_skb_rxcb *rxcb;
++	u16 num_msdus = 0;
++	dma_addr_t paddr;
++	u8 rbm;
++
++	ath12k_hal_rx_reo_ent_buf_paddr_get(&ar->ab->hal, ring_entry,
++					    &paddr,
++					    &sw_cookie,
++					    &p_last_buf_addr_info, &rbm,
++					    &msdu_cnt);
++
++	spin_lock_bh(&pmon->mon_lock);
++
++	if (le32_get_bits(ent_desc->info1,
++			  HAL_REO_ENTR_RING_INFO1_RXDMA_PUSH_REASON) ==
++			  HAL_REO_DEST_RING_PUSH_REASON_ERR_DETECTED) {
++		u8 rxdma_err = le32_get_bits(ent_desc->info1,
++					     HAL_REO_ENTR_RING_INFO1_RXDMA_ERROR_CODE);
++		if (rxdma_err == HAL_REO_ENTR_RING_RXDMA_ECODE_FLUSH_REQUEST_ERR ||
++		    rxdma_err == HAL_REO_ENTR_RING_RXDMA_ECODE_MPDU_LEN_ERR ||
++		    rxdma_err == HAL_REO_ENTR_RING_RXDMA_ECODE_OVERFLOW_ERR) {
++			drop_mpdu = true;
++			pmon->rx_mon_stats.dest_mpdu_drop++;
++		}
++	}
++
++	is_frag = false;
++	is_first_msdu = true;
++	rx_pkt_offset = sizeof(struct hal_rx_desc);
++
++	do {
++		if (pmon->mon_last_linkdesc_paddr == paddr) {
++			pmon->rx_mon_stats.dup_mon_linkdesc_cnt++;
++			spin_unlock_bh(&pmon->mon_lock);
++			return rx_bufs_used;
++		}
++
++		desc_bank = u32_get_bits(sw_cookie, DP_LINK_DESC_BANK_MASK);
++		msdu_link_desc =
++			ar->ab->dp->link_desc_banks[desc_bank].vaddr +
++			(paddr - ar->ab->dp->link_desc_banks[desc_bank].paddr);
++
++		ath12k_hal_rx_msdu_list_get(&ar->ab->hal, msdu_link_desc, &msdu_list,
++					    &num_msdus);
++		desc_info = ath12k_dp_get_rx_desc(ar->ab->dp,
++						  msdu_list.sw_cookie[num_msdus - 1]);
++		tail_rx_desc = (struct hal_rx_desc *)(desc_info->skb)->data;
++
++		for (i = 0; i < num_msdus; i++) {
++			u32 l2_hdr_offset;
++
++			if (pmon->mon_last_buf_cookie == msdu_list.sw_cookie[i]) {
++				ath12k_dbg(ar->ab, ATH12K_DBG_DATA,
++					   "i %d last_cookie %d is same\n",
++					   i, pmon->mon_last_buf_cookie);
++				drop_mpdu = true;
++				pmon->rx_mon_stats.dup_mon_buf_cnt++;
++				continue;
++			}
++
++			desc_info =
++				ath12k_dp_get_rx_desc(ar->ab->dp, msdu_list.sw_cookie[i]);
++			msdu = desc_info->skb;
++
++			if (!msdu) {
++				ath12k_dbg(ar->ab, ATH12K_DBG_DATA,
++					   "msdu_pop: invalid msdu (%d/%d)\n",
++					   i + 1, num_msdus);
++				goto next_msdu;
++			}
++			rxcb = ATH12K_SKB_RXCB(msdu);
++			if (rxcb->paddr != msdu_list.paddr[i]) {
++				ath12k_dbg(ar->ab, ATH12K_DBG_DATA,
++					   "i %d paddr %lx != %lx\n",
++					   i, (unsigned long)rxcb->paddr,
++					   (unsigned long)msdu_list.paddr[i]);
++				drop_mpdu = true;
++				continue;
++			}
++			if (!rxcb->unmapped) {
++				dma_unmap_single(ar->ab->dev, rxcb->paddr,
++						 msdu->len +
++						 skb_tailroom(msdu),
++						 DMA_FROM_DEVICE);
++				rxcb->unmapped = 1;
++			}
++			if (drop_mpdu) {
++				ath12k_dbg(ar->ab, ATH12K_DBG_DATA,
++					   "i %d drop msdu %p *ppdu_id %x\n",
++					   i, msdu, *ppdu_id);
++				dev_kfree_skb_any(msdu);
++				msdu = NULL;
++				goto next_msdu;
++			}
++
++			rx_desc = (struct hal_rx_desc *)msdu->data;
++			l2_hdr_offset = ath12k_hal_rx_h_l3pad_get(&ar->ab->hal,
++								  tail_rx_desc);
++			if (is_first_msdu) {
++				if (!ath12k_dp_rxdesc_mpdu_valid(ar->ab, rx_desc)) {
++					drop_mpdu = true;
++					dev_kfree_skb_any(msdu);
++					msdu = NULL;
++					pmon->mon_last_linkdesc_paddr = paddr;
++					goto next_msdu;
++				}
++				msdu_ppdu_id =
++					ath12k_hal_rx_desc_get_mpdu_ppdu_id(&ar->ab->hal,
++									    rx_desc);
++
++				if (ath12k_dp_mon_comp_ppduid(msdu_ppdu_id,
++							      ppdu_id)) {
++					spin_unlock_bh(&pmon->mon_lock);
++					return rx_bufs_used;
++				}
++				pmon->mon_last_linkdesc_paddr = paddr;
++				is_first_msdu = false;
++			}
++			ath12k_dp_mon_get_buf_len(&msdu_list.msdu_info[i],
++						  &is_frag, &total_len,
++						  &frag_len, &msdu_cnt);
++			rx_buf_size = rx_pkt_offset + l2_hdr_offset + frag_len;
++
++			if (ath12k_dp_pkt_set_pktlen(msdu, rx_buf_size)) {
++				dev_kfree_skb_any(msdu);
++				goto next_msdu;
++			}
++
++			if (!(*head_msdu))
++				*head_msdu = msdu;
++			else if (last)
++				last->next = msdu;
++
++			last = msdu;
++next_msdu:
++			pmon->mon_last_buf_cookie = msdu_list.sw_cookie[i];
++			rx_bufs_used++;
++			desc_info->skb = NULL;
++			list_add_tail(&desc_info->list, used_list);
++		}
++
++		ath12k_hal_rx_buf_addr_info_set(&buf_info,
++						paddr, sw_cookie, rbm);
++
++		ath12k_dp_mon_next_link_desc_get(ar->ab, msdu_link_desc, &paddr,
++						 &sw_cookie, &rbm,
++						 &p_buf_addr_info);
++
++		ath12k_dp_arch_rx_link_desc_return(ar->ab->dp,
++						   &buf_info,
++						   HAL_WBM_REL_BM_ACT_PUT_IN_IDLE);
++
++		p_last_buf_addr_info = p_buf_addr_info;
++
++	} while (paddr && msdu_cnt);
++
++	spin_unlock_bh(&pmon->mon_lock);
++
++	if (last)
++		last->next = NULL;
++
++	*tail_msdu = msdu;
++
++	if (msdu_cnt == 0)
++		*npackets = 1;
++
++	return rx_bufs_used;
++}
++
++/* The destination ring processing is stuck if the destination is not
++ * moving while status ring moves 16 PPDU. The destination ring processing
++ * skips this destination ring PPDU as a workaround.
++ */
++#define MON_DEST_RING_STUCK_MAX_CNT 16
++
++static void ath12k_dp_rx_mon_dest_process(struct ath12k *ar, int mac_id,
++					  u32 quota, struct napi_struct *napi)
++{
++	struct ath12k_mon_data *pmon = (struct ath12k_mon_data *)&ar->dp.mon_data;
++	struct ath12k_pdev_mon_stats *rx_mon_stats;
++	u32 ppdu_id, rx_bufs_used = 0, ring_id;
++	u32 mpdu_rx_bufs_used, npackets = 0;
++	struct ath12k_dp *dp = ar->ab->dp;
++	struct ath12k_base *ab = ar->ab;
++	void *ring_entry, *mon_dst_srng;
++	struct dp_mon_mpdu *tmp_mpdu;
++	LIST_HEAD(rx_desc_used_list);
++	struct hal_srng *srng;
++
++	ring_id = dp->rxdma_err_dst_ring[mac_id].ring_id;
++	srng = &ab->hal.srng_list[ring_id];
++
++	mon_dst_srng = &ab->hal.srng_list[ring_id];
++
++	spin_lock_bh(&srng->lock);
++
++	ath12k_hal_srng_access_begin(ab, mon_dst_srng);
++
++	ppdu_id = pmon->mon_ppdu_info.ppdu_id;
++	rx_mon_stats = &pmon->rx_mon_stats;
++
++	while ((ring_entry = ath12k_hal_srng_dst_peek(ar->ab, mon_dst_srng))) {
++		struct sk_buff *head_msdu, *tail_msdu;
++
++		head_msdu = NULL;
++		tail_msdu = NULL;
++
++		mpdu_rx_bufs_used = ath12k_dp_rx_mon_mpdu_pop(ar, mac_id, ring_entry,
++							      &head_msdu, &tail_msdu,
++							      &rx_desc_used_list,
++							      &npackets, &ppdu_id);
++
++		rx_bufs_used += mpdu_rx_bufs_used;
++
++		if (mpdu_rx_bufs_used) {
++			dp->mon_dest_ring_stuck_cnt = 0;
++		} else {
++			dp->mon_dest_ring_stuck_cnt++;
++			rx_mon_stats->dest_mon_not_reaped++;
++		}
++
++		if (dp->mon_dest_ring_stuck_cnt > MON_DEST_RING_STUCK_MAX_CNT) {
++			rx_mon_stats->dest_mon_stuck++;
++			ath12k_dbg(ar->ab, ATH12K_DBG_DATA,
++				   "status ring ppdu_id=%d dest ring ppdu_id=%d mon_dest_ring_stuck_cnt=%d dest_mon_not_reaped=%u dest_mon_stuck=%u\n",
++				   pmon->mon_ppdu_info.ppdu_id, ppdu_id,
++				   dp->mon_dest_ring_stuck_cnt,
++				   rx_mon_stats->dest_mon_not_reaped,
++				   rx_mon_stats->dest_mon_stuck);
++			spin_lock_bh(&pmon->mon_lock);
++			pmon->mon_ppdu_info.ppdu_id = ppdu_id;
++			spin_unlock_bh(&pmon->mon_lock);
++			continue;
++		}
++
++		if (ppdu_id != pmon->mon_ppdu_info.ppdu_id) {
++			spin_lock_bh(&pmon->mon_lock);
++			pmon->mon_ppdu_status = DP_PPDU_STATUS_START;
++			spin_unlock_bh(&pmon->mon_lock);
++			ath12k_dbg(ar->ab, ATH12K_DBG_DATA,
++				   "dest_rx: new ppdu_id %x != status ppdu_id %x dest_mon_not_reaped = %u dest_mon_stuck = %u\n",
++				   ppdu_id, pmon->mon_ppdu_info.ppdu_id,
++				   rx_mon_stats->dest_mon_not_reaped,
++				   rx_mon_stats->dest_mon_stuck);
++			break;
++		}
++
++		if (head_msdu && tail_msdu) {
++			tmp_mpdu = kzalloc(sizeof(*tmp_mpdu), GFP_ATOMIC);
++			if (!tmp_mpdu)
++				break;
++
++			tmp_mpdu->head = head_msdu;
++			tmp_mpdu->tail = tail_msdu;
++			tmp_mpdu->err_bitmap = pmon->err_bitmap;
++			tmp_mpdu->decap_format = pmon->decap_format;
++			ath12k_dp_mon_rx_deliver(&ar->dp, tmp_mpdu,
++						 &pmon->mon_ppdu_info, napi);
++			rx_mon_stats->dest_mpdu_done++;
++			kfree(tmp_mpdu);
++		}
++
++		ring_entry = ath12k_hal_srng_dst_get_next_entry(ar->ab,
++								mon_dst_srng);
++	}
++	ath12k_hal_srng_access_end(ar->ab, mon_dst_srng);
++
++	spin_unlock_bh(&srng->lock);
++
++	if (rx_bufs_used) {
++		rx_mon_stats->dest_ppdu_done++;
++		ath12k_dp_rx_bufs_replenish(ar->ab->dp,
++					    &dp->rx_refill_buf_ring,
++					    &rx_desc_used_list,
++					    rx_bufs_used);
++	}
++}
++
+ static int
+ __ath12k_dp_mon_process_ring(struct ath12k *ar, int mac_id,
+ 			     struct napi_struct *napi, int *budget)
+@@ -4154,7 +4515,7 @@ __ath12k_dp_mon_process_ring(struct ath12k *ar, int mac_id,
+ 		    hal_status == HAL_TLV_STATUS_PPDU_DONE) {
+ 			rx_mon_stats->status_ppdu_done++;
+ 			pmon->mon_ppdu_status = DP_PPDU_STATUS_DONE;
+-			/*TODO: add mon dest ring processing here.*/
++			ath12k_dp_rx_mon_dest_process(ar, mac_id, *budget, napi);
+ 			pmon->mon_ppdu_status = DP_PPDU_STATUS_START;
+ 		}
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
+index 134cfb0..2d378c8 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -1963,3 +1963,13 @@ int ath12k_dp_rx_pkt_type_filter(struct ath12k *ar,
+ 
+ 	return ret;
+ }
++
++bool ath12k_dp_rxdesc_mpdu_valid(struct ath12k_base *ab,
++				 struct hal_rx_desc *rx_desc)
++{
++	u32 tlv_tag;
++
++	tlv_tag = hal_rx_desc_get_mpdu_start_tag(&ab->hal, rx_desc);
++
++	return tlv_tag == HAL_RX_MPDU_START;
++}
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.h b/drivers/net/wireless/ath/ath12k/dp_rx.h
+index 736c65e..982402e 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -192,8 +192,6 @@ int ath12k_dp_rx_peer_frag_setup(struct ath12k *ar,
+ 				 struct ath12k_dp_link_peer *peer,
+ 				 struct crypto_shash *tfm);
+ 
+-u8 ath12k_dp_rx_h_l3pad(struct ath12k_base *ab,
+-			struct hal_rx_desc *desc);
+ struct ath12k_dp_link_peer *
+ ath12k_dp_rx_h_find_peer(struct ath12k_dp *dp, struct hal_rx_desc *rx_desc, u16 peer_id);
+ u8 ath12k_dp_rx_h_decap_type(struct ath12k_base *ab,
+@@ -260,4 +258,6 @@ ath12k_dp_peer_migrate(struct ath12k_sta *ahsta, u16 peer_id,
+ int ath12k_dp_rx_pkt_type_filter(struct ath12k *ar,
+ 				 enum ath12k_routing_pkt_type pkt_type,
+ 				 u32 meta_data);
++bool ath12k_dp_rxdesc_mpdu_valid(struct ath12k_base *ab,
++				 struct hal_rx_desc *rx_desc);
+ #endif /* ATH12K_DP_RX_H */
+diff --git a/drivers/net/wireless/ath/ath12k/hal.c b/drivers/net/wireless/ath/ath12k/hal.c
+index 5e8a2cd..dfc0a92 100644
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -170,6 +170,45 @@ bool ath12k_hal_rx_h_is_decrypted(struct ath12k_hal *hal, struct hal_rx_desc *de
+ }
+ EXPORT_SYMBOL(ath12k_hal_rx_h_is_decrypted);
+ 
++u32 ath12k_hal_rx_desc_get_mpdu_ppdu_id(struct ath12k_hal *hal,
++					struct hal_rx_desc *rx_desc)
++{
++	return hal->hal_ops->rx_desc_get_mpdu_ppdu_id(rx_desc);
++}
++
++u32 hal_rx_desc_get_mpdu_start_tag(struct ath12k_hal *hal,
++				   struct hal_rx_desc *rx_desc)
++{
++	return hal->hal_ops->rx_desc_get_mpdu_start_tag(rx_desc);
++}
++
++void ath12k_hal_rx_reo_ent_buf_paddr_get(struct ath12k_hal *hal,
++					 void *rx_desc, dma_addr_t *paddr,
++					 u32 *sw_cookie,
++					 struct ath12k_buffer_addr **pp_buf_addr,
++					 u8 *rbm, u32 *msdu_cnt)
++{
++	hal->hal_ops->rx_reo_ent_buf_paddr_get(rx_desc, paddr,
++					       sw_cookie, pp_buf_addr,
++					       rbm, msdu_cnt);
++}
++
++void ath12k_hal_rx_msdu_list_get(struct ath12k_hal *hal,
++				 void *link_desc,
++				 void *msdu_list,
++				 u16 *num_msdus)
++{
++	hal->hal_ops->rx_msdu_list_get(link_desc,
++				       msdu_list,
++				       num_msdus);
++}
++
++u8 ath12k_hal_rx_h_l3pad_get(struct ath12k_hal *hal,
++			     struct hal_rx_desc *desc)
++{
++	return hal->hal_ops->rx_h_l3pad_get(desc);
++}
++
+ static int ath12k_hal_alloc_cont_rdp(struct ath12k_hal *hal)
+ {
+ 	size_t size;
+diff --git a/drivers/net/wireless/ath/ath12k/hal.h b/drivers/net/wireless/ath/ath12k/hal.h
+index 43bc056..7bbc089 100644
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -1342,6 +1342,17 @@ struct hal_ops {
+ 	void (*reo_shared_qaddr_cache_clear)(struct ath12k_base *ab);
+ 	u8 *(*rxdesc_get_mpdu_start_addr2)(struct hal_rx_desc *desc);
+ 	bool (*rx_h_is_decrypted)(struct hal_rx_desc *desc);
++	u32 (*rx_desc_get_mpdu_ppdu_id)(struct hal_rx_desc *rx_desc);
++	u32 (*rx_desc_get_mpdu_start_tag)(struct hal_rx_desc *desc);
++	void (*rx_reo_ent_buf_paddr_get)(void *rx_desc,
++					 dma_addr_t *paddr,
++					 u32 *sw_cookie,
++					 struct ath12k_buffer_addr **pp_buf_addr,
++					 u8 *rbm, u32 *msdu_cnt);
++	void (*rx_msdu_list_get)(void *link_desc,
++				 void *msdu_list,
++				 u16 *num_msdus);
++	u8 (*rx_h_l3pad_get)(struct hal_rx_desc *desc);
+ };
+ 
+ static inline
+@@ -1504,4 +1515,19 @@ void ath12k_hal_reset_rx_reo_tid_q(struct ath12k_hal *hal, void *qdesc,
+ 				   u32 ba_window_size, u8 tid);
+ void ath12k_hal_srng_hw_disable(struct ath12k_base *ab,
+                                 struct hal_srng *srng);
++u32 ath12k_hal_rx_desc_get_mpdu_ppdu_id(struct ath12k_hal *hal,
++					struct hal_rx_desc *rx_desc);
++u32 hal_rx_desc_get_mpdu_start_tag(struct ath12k_hal *hal,
++				   struct hal_rx_desc *rx_desc);
++void ath12k_hal_rx_reo_ent_buf_paddr_get(struct ath12k_hal *hal,
++					 void *rx_desc, dma_addr_t *paddr,
++					 u32 *sw_cookie,
++					 struct ath12k_buffer_addr **pp_buf_addr,
++					 u8 *rbm, u32 *msdu_cnt);
++void ath12k_hal_rx_msdu_list_get(struct ath12k_hal *hal,
++				 void *link_desc,
++				 void *msdu_list,
++				 u16 *num_msdus);
++u8 ath12k_hal_rx_h_l3pad_get(struct ath12k_hal *hal,
++			     struct hal_rx_desc *desc);
+ #endif
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.c b/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.c
+index 0ed3c35..083543d 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.c
+@@ -1032,4 +1032,5 @@ const struct hal_ops hal_qcn9274_ops = {
+ 	.rxdesc_get_mpdu_start_addr2 =
+ 			ath12k_wifi7_hal_rxdesc_get_mpdu_start_addr2_qcn9274,
+ 	.rx_h_is_decrypted = ath12k_wifi7_hal_rx_h_is_decrypted_qcn9274,
++	.rx_desc_get_mpdu_ppdu_id = ath12k_wifi7_hal_rx_desc_get_mpdu_ppdu_id_qcn9274,
+ };
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.c b/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.c
+index 5f1c63a..18cfb21 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.c
+@@ -499,6 +499,87 @@ void ath12k_wifi7_hal_rx_reo_ent_paddr_get(struct ath12k_base *ab,
+ 	*cookie = le32_get_bits(buff_addr->info1, BUFFER_ADDR_INFO1_SW_COOKIE);
+ }
+ 
++void ath12k_wifi7_hal_rx_reo_ent_buf_paddr_get(void *rx_desc, dma_addr_t *paddr,
++					       u32 *sw_cookie,
++					       struct ath12k_buffer_addr **pp_buf_addr,
++					       u8 *rbm, u32 *msdu_cnt)
++{
++	struct hal_reo_entrance_ring *reo_ent_ring =
++		(struct hal_reo_entrance_ring *)rx_desc;
++	struct ath12k_buffer_addr *buf_addr_info;
++	struct rx_mpdu_desc *rx_mpdu_desc_info_details;
++
++	rx_mpdu_desc_info_details =
++			(struct rx_mpdu_desc *)&reo_ent_ring->rx_mpdu_info;
++
++	*msdu_cnt = le32_get_bits(rx_mpdu_desc_info_details->info0,
++				  RX_MPDU_DESC_INFO0_MSDU_COUNT);
++
++	buf_addr_info = (struct ath12k_buffer_addr *)&reo_ent_ring->buf_addr_info;
++
++	*paddr = (((u64)le32_get_bits(buf_addr_info->info1,
++				      BUFFER_ADDR_INFO1_ADDR)) << 32) |
++			le32_get_bits(buf_addr_info->info0,
++				      BUFFER_ADDR_INFO0_ADDR);
++
++	*sw_cookie = le32_get_bits(buf_addr_info->info1,
++				   BUFFER_ADDR_INFO1_SW_COOKIE);
++	*rbm = le32_get_bits(buf_addr_info->info1,
++			     BUFFER_ADDR_INFO1_RET_BUF_MGR);
++
++	*pp_buf_addr = (void *)buf_addr_info;
++}
++
++void ath12k_wifi7_hal_rx_msdu_list_get(void *desc,
++				       void *list,
++				       u16 *num_msdus)
++{
++	struct hal_rx_msdu_link *link_desc = (struct hal_rx_msdu_link *)desc;
++	struct hal_rx_msdu_list *msdu_list = (struct hal_rx_msdu_list *)list;
++	struct hal_rx_msdu_details *msdu_details = NULL;
++	struct rx_msdu_desc *msdu_desc_info = NULL;
++	u32 last = 0, first = 0;
++	u8 tmp = 0;
++	int i;
++
++	last = u32_encode_bits(last, RX_MSDU_DESC_INFO0_LAST_MSDU_IN_MPDU);
++	first = u32_encode_bits(first, RX_MSDU_DESC_INFO0_FIRST_MSDU_IN_MPDU);
++	msdu_details = &link_desc->msdu_link[0];
++
++	for (i = 0; i < HAL_RX_NUM_MSDU_DESC; i++) {
++		if (!i && le32_get_bits(msdu_details[i].buf_addr_info.info0,
++					BUFFER_ADDR_INFO0_ADDR) == 0)
++			break;
++		if (le32_get_bits(msdu_details[i].buf_addr_info.info0,
++				  BUFFER_ADDR_INFO0_ADDR) == 0) {
++			msdu_desc_info = &msdu_details[i - 1].rx_msdu_info;
++			msdu_desc_info->info0 |= cpu_to_le32(last);
++			break;
++		}
++		msdu_desc_info = &msdu_details[i].rx_msdu_info;
++
++		if (!i)
++			msdu_desc_info->info0 |= cpu_to_le32(first);
++		else if (i == (HAL_RX_NUM_MSDU_DESC - 1))
++			msdu_desc_info->info0 |= cpu_to_le32(last);
++		msdu_list->msdu_info[i].msdu_flags = le32_to_cpu(msdu_desc_info->info0);
++		msdu_list->msdu_info[i].msdu_len =
++			 HAL_RX_MSDU_PKT_LENGTH_GET(msdu_desc_info->info0);
++		msdu_list->sw_cookie[i] =
++			le32_get_bits(msdu_details[i].buf_addr_info.info1,
++				      BUFFER_ADDR_INFO1_SW_COOKIE);
++		tmp = le32_get_bits(msdu_details[i].buf_addr_info.info1,
++				    BUFFER_ADDR_INFO1_RET_BUF_MGR);
++		msdu_list->paddr[i] =
++			((u64)(le32_get_bits(msdu_details[i].buf_addr_info.info1,
++					     BUFFER_ADDR_INFO1_ADDR)) << 32) |
++			le32_get_bits(msdu_details[i].buf_addr_info.info0,
++				      BUFFER_ADDR_INFO0_ADDR);
++		msdu_list->rbm[i] = tmp;
++	}
++	*num_msdus = i;
++}
++
+ void
+ ath12k_wifi7_hal_rx_msdu_link_desc_set(struct ath12k_base *ab,
+ 				       struct hal_wbm_release_ring *desc,
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.h b/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.h
+index 29d7ef8..1a761a3 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.h
+@@ -329,6 +329,7 @@ struct hal_rx_msdu_desc_info {
+ #define HAL_RX_NUM_MSDU_DESC 6
+ struct hal_rx_msdu_list {
+ 	struct hal_rx_msdu_desc_info msdu_info[HAL_RX_NUM_MSDU_DESC];
++	u64 paddr[HAL_RX_NUM_MSDU_DESC];
+ 	u32 sw_cookie[HAL_RX_NUM_MSDU_DESC];
+ 	u8 rbm[HAL_RX_NUM_MSDU_DESC];
+ };
+@@ -970,4 +971,11 @@ void ath12k_wifi7_hal_rx_flow_delete_entry(struct ath12k_base *ab,
+ void ath12k_wifi7_hal_reset_rx_reo_tid_q(void *vaddr,
+ 					 u32 ba_window_size, u8 tid);
+ void ath12k_wifi7_hal_reo_shared_qaddr_cache_clear(struct ath12k_base *ab);
++void ath12k_wifi7_hal_rx_msdu_list_get(void *desc,
++				       void *list,
++				       u16 *num_msdus);
++void ath12k_wifi7_hal_rx_reo_ent_buf_paddr_get(void *rx_desc, dma_addr_t *paddr,
++					       u32 *sw_cookie,
++					       struct ath12k_buffer_addr **pp_buf_addr,
++					       u8 *rbm, u32 *msdu_cnt);
+ #endif
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hal_wcn7850.c b/drivers/net/wireless/ath/ath12k/wifi7/hal_wcn7850.c
+index 0f5a3b8..4b0c348 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_wcn7850.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_wcn7850.c
+@@ -640,4 +640,9 @@ const struct hal_ops hal_wcn7850_ops = {
+ 	.rxdesc_get_mpdu_start_addr2 =
+ 			ath12k_wifi7_hal_rxdesc_get_mpdu_start_addr2_wcn7850,
+ 	.rx_h_is_decrypted = ath12k_wifi7_hal_rx_h_is_decrypted_wcn7850,
++	.rx_desc_get_mpdu_ppdu_id = ath12k_wifi7_hal_rx_desc_get_mpdu_ppdu_id_wcn7850,
++	.rx_desc_get_mpdu_start_tag = ath12k_wifi7_hal_rx_desc_get_mpdu_start_tag_wcn7850,
++	.rx_reo_ent_buf_paddr_get = ath12k_wifi7_hal_rx_reo_ent_buf_paddr_get,
++	.rx_msdu_list_get = ath12k_wifi7_hal_rx_msdu_list_get,
++	.rx_h_l3pad_get = ath12k_wifi7_hal_rx_h_l3pad_wcn7850,
+ };
+-- 
+2.34.1
+

@@ -1,0 +1,324 @@
+From a45ace67deb1d20a3682b59ddb33bc3a19e838dd Mon Sep 17 00:00:00 2001
+From: Harish Rachakonda <rachakon@qti.qualcomm.com>
+Date: Thu, 31 Jul 2025 23:39:16 +0530
+Subject: [PATCH] QSDK: CP: hostapd: ATF: add support for commitatf cli
+
+Add hostapd_cli infra to pass all the commands for atf_offload module.
+Implement commitatf command, which would send the dynamic enable flag
+to driver and set the flag which would be used for starting
+algorithm. Implemented get_commitatf command, used to display the
+commitatf is set or cleared.
+
+commitatf triggers the operation to enable ATF functionality in both
+the driver and firmware. If ATF is not already enabled, activate it
+during the commitatf. If ATF offload is enabled, initiate the airtime
+allocation algorithm based on user-defined configurations. Start
+airtime distribution for SSIDs, SSID groups, or peers, and
+allocate airtime accordingly and send full update to FW with new
+airtime allocation.
+
+To enable ATF in firmware:
+MLO:
+hostapd_cli  -i <ifname> [-l <link_id>] atf_offload commitatf {1/0}
+hostapd_cli  -i <ifname> [-l <link_id>] atf_offload  get_commitatf
+Legacy:
+hostapd_cli  -i <ifname> atf_offload commitatf {1/0}
+hostapd_cli  -i <ifname> atf_offload  get_commitatf
+
+Signed-off-by: Harish Rachakonda <rachakon@qti.qualcomm.com>
+---
+ hostapd/ctrl_iface.c         |  9 +++++
+ hostapd/hostapd_cli.c        | 15 ++++++++
+ src/atf/atf_offload.c        | 45 ++++++++++++++++++++++
+ src/atf/atf_offload.h        |  2 +
+ src/atf/atf_offload_config.c | 74 ++++++++++++++++++++++++++++++++++++
+ src/atf/atf_offload_config.h |  3 ++
+ 6 files changed, 148 insertions(+)
+
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -74,6 +74,10 @@
+ #include "../src/drivers/driver_nl80211.h"
+ #include "ap/dscp_policy.h"
+ 
++#ifdef CONFIG_ATF_OFFLOAD
++#include "atf/atf_offload_config.h"
++#endif
++
+ #define HOSTAPD_CLI_DUP_VALUE_MAX_LEN 256
+ 
+ #ifdef CONFIG_CTRL_IFACE_UDP
+@@ -6580,6 +6584,11 @@ static int hostapd_ctrl_iface_receive_pr
+ 		reply_len = hostapd_ctrl_iface_driver_cmd(hapd, buf + 7, reply,
+ 							  reply_size);
+ #endif /* ANDROID */
++#ifdef CONFIG_ATF_OFFLOAD
++	} else if (os_strncmp(buf, "ATF_OFFLOAD ", 12) == 0) {
++		reply_len = hostapd_ctrl_iface_config_atf_offload(hapd, buf + 12,
++								  reply, reply_size);
++#endif
+ #ifdef CONFIG_IEEE80211BE
+ 	} else if (os_strcmp(buf, "ENABLE_MLD") == 0) {
+ 		if (hostapd_ctrl_iface_enable_mld(hapd->iface))
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1840,6 +1840,20 @@ static int hostapd_cli_cmd_afc(struct wp
+ }
+ 
+ 
++#ifdef CONFIG_ATF_OFFLOAD
++static int hostapd_cli_cmd_atf_offload(struct wpa_ctrl *ctrl,
++				       int argc, char *argv[])
++{
++	if (argc < 1) {
++		printf("Invalid ATF offload command: needs 1 argument atleast\n");
++		return -1;
++	}
++
++	return hostapd_cli_cmd(ctrl, "ATF_OFFLOAD", 1, argc, argv);
++}
++#endif /* CONFIG_ATF_OFFLOAD */
++
++
+ static int hostapd_cli_cmd_clear_afc_payload(struct wpa_ctrl *ctrl,
+ 					     int argc, char *argv[])
+ {
+@@ -2139,6 +2153,9 @@ static const struct hostapd_cli_cmd host
+ 	  "= Clear AFC payload stored in driver and firmware\n"},
+ 	{ "reset_afc", hostapd_cli_cmd_reset_afc, NULL,
+ 	  "= Reset AFC in target\n"},
++#ifdef CONFIG_ATF_OFFLOAD
++	{"atf_offload", hostapd_cli_cmd_atf_offload, NULL, "= send atf commands" },
++#endif /* CONFIG_ATF_OFFLOAD */
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+--- a/src/atf/atf_offload.c
++++ b/src/atf/atf_offload.c
+@@ -68,6 +68,39 @@ u8 atf_get_hw_idx(struct hostapd_iface *
+ }
+ 
+ 
++void atf_offload_send_feature_params(struct hostapd_data *hapd)
++{
++	struct hostapd_iface *iface;
++	struct atf_algo *algo;
++	int ret;
++	u8 radio_index;
++
++	if (!hapd->iface || !hapd->iface->atf_algo || !hapd->drv_priv) {
++		wpa_printf(MSG_ERROR, "ATF: Invalid hapd data\n");
++		return;
++	}
++
++	iface = hapd->iface;
++	algo = iface->atf_algo;
++
++	if (!iface->conf->atf_offload) {
++		wpa_printf(MSG_ERROR, "ATF: ATF offload feature is not enabled\n");
++		return;
++	}
++
++	radio_index = atf_get_hw_idx(iface);
++
++	if (algo->atf_enabled) {
++		ret = nl80211_atf_offload_enable_disable(hapd->drv_priv, radio_index,
++							 algo->atf_enabled);
++		if (ret) {
++			wpa_printf(MSG_ERROR, "ATF: Failed to enable ATF offload\n");
++			return;
++		}
++	}
++}
++
++
+ struct atf_peer_config *
+ atf_allocate_peer_config(u8 *macaddr, struct atf_algo *algo)
+ {
+@@ -1169,6 +1202,48 @@ atf_offload_build_wmm_ac_config(struct h
+ }
+ 
+ 
++int
++nl80211_atf_offload_enable_disable(void *priv, u8 radio_index, u8 value)
++{
++	struct i802_bss *bss = priv;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++	struct nl_msg *msg;
++	int ret;
++	struct nlattr *data;
++
++	msg = nl80211_bss_msg(bss, 0, NL80211_CMD_VENDOR);
++	if (!msg)
++		return -ENOBUFS;
++
++	if (nla_put_u32(msg, NL80211_ATTR_VENDOR_ID, OUI_QCA) ||
++	    nla_put_u32(msg, NL80211_ATTR_VENDOR_SUBCMD,
++			QCA_NL80211_VENDOR_SUBCMD_ATF_OFFLOAD_OPS))
++		goto fail;
++
++	data = nla_nest_start(msg, NL80211_ATTR_VENDOR_DATA);
++	if (!data ||
++	    nla_put_u8(msg, QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_OPERATION,
++		       QCA_WLAN_VENDOR_ATF_OFFLOAD_ENABLED) ||
++	    nla_put_u8(msg, QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_RADIO_ID,
++		       radio_index) ||
++	    nla_put_u8(msg, QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_ENABLE_DISABLE_CONFIG,
++		       value))
++		goto fail;
++
++	nla_nest_end(msg, data);
++
++	ret = send_and_recv_cmd(drv, msg);
++	if (ret)
++		wpa_printf(MSG_ERROR, "ATF: ATF offload enable/disable failed %s",
++			   strerror(-ret));
++
++	return ret;
++fail:
++	nlmsg_free(msg);
++	return -1;
++}
++
++
+ int
+ nl80211_atf_offload_send_group_config(void *priv, u8 radio_index, struct atf_group_params *param)
+ {
+--- a/src/atf/atf_offload.h
++++ b/src/atf/atf_offload.h
+@@ -324,11 +324,15 @@ void atf_offload_initialize_peer(struct
+ 
+ void atf_offload_deinitialize_peer(struct sta_info *sta);
+ 
++void atf_offload_send_feature_params(struct hostapd_data *hapd);
++
+ void atf_join_leave_update(struct hostapd_iface *iface, struct sta_info *sta,
+                            bool is_join);
+ 
+ u8 atf_get_hw_idx(struct hostapd_iface *iface);
+ 
++int nl80211_atf_offload_enable_disable(void *priv, u8 radio_index, u8 value);
++
+ #else
+ 
+ static inline void atf_offload_init(struct hapd_interfaces *ifaces)
+@@ -360,5 +364,8 @@ static inline void atf_offload_deinitial
+ {
+ }
+ 
++static inline void  atf_offload_send_feature_params(struct hostapd_data *hapd)
++{
++}
+ #endif /* CONFIG_ATF_OFFLOAD */
+ #endif /* ATF_OFFLOAD_H */
+--- a/src/atf/atf_offload_config.c
++++ b/src/atf/atf_offload_config.c
+@@ -343,3 +343,88 @@ exit:
+ 
+ 	return -1;
+ }
++
++
++static int
++hostapd_ctrl_iface_atf_offload_commitatf(struct hostapd_data *hapd,
++					 const char *cmd)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	struct atf_algo *algo;
++	u8 enabled, radio_index;
++	int ret;
++
++	if (!iface || !iface->atf_algo) {
++		wpa_printf(MSG_ERROR, "ATF: Missing atf algo\n");
++		return -1;
++	}
++
++	if (!hapd->drv_priv) {
++		wpa_printf(MSG_ERROR, "ATF: Invalid hapd data %s\n", __func__);
++		return -1;
++	}
++
++	algo = iface->atf_algo;
++	enabled = atoi(cmd);
++
++	if (enabled != 0 && enabled != 1) {
++		wpa_printf(MSG_ERROR, "ATF: Invalid input for atf enabled\n");
++		return -1;
++	}
++
++	radio_index = atf_get_hw_idx(iface);
++	if (algo->atf_enabled != enabled) {
++		ret = nl80211_atf_offload_enable_disable(hapd->drv_priv, radio_index, enabled);
++		if (ret) {
++			wpa_printf(MSG_ERROR, "ATF: Failed to enable ATF\n");
++			return -1;
++		}
++	}
++
++	algo->atf_enabled = enabled;
++	iface->conf->commitatf = enabled;
++
++	if (algo->atf_enabled) {
++		ATF_OFFLOAD_SET_FULL_UPDATE(algo);
++		atf_trigger_config_timer(iface);
++	}
++
++	return 0;
++}
++
++
++static int
++hostapd_ctrl_iface_atf_offload_get_commitatf(struct hostapd_data *hapd, char *buf, size_t buflen)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	struct atf_algo *algo;
++	int ret, len = 0;
++
++	if (!iface || !iface->atf_algo) {
++		wpa_printf(MSG_ERROR, "ATF: Missing atf algo\n");
++		return -1;
++	}
++
++	algo = iface->atf_algo;
++
++	ret = os_snprintf(buf, buflen, "ATF is %s\n",
++			  algo->atf_enabled ? "enabled" : "disabled");
++	if (!os_snprintf_error(buflen, ret))
++		len += ret;
++
++	return len;
++}
++
++
++int
++hostapd_ctrl_iface_config_atf_offload(struct hostapd_data *hapd,
++				      const char *cmd, char *buf, size_t buflen)
++{
++	if (os_strncmp(cmd, "commitatf ", 10) == 0)
++		return hostapd_ctrl_iface_atf_offload_commitatf(hapd, cmd + 10);
++	else if (os_strncmp(cmd, "get_commitatf", 13) == 0)
++		return hostapd_ctrl_iface_atf_offload_get_commitatf(hapd, buf, buflen);
++
++	return -1;
++}
++
+--- a/src/atf/atf_offload_config.h
++++ b/src/atf/atf_offload_config.h
+@@ -15,4 +15,7 @@ struct atf_algo;
+ 
+ int atf_read_config(struct atf_algo *algo, const char *fname);
+ 
++int hostapd_ctrl_iface_config_atf_offload(struct hostapd_data *hapd,
++					  const char *cmd, char *buf, size_t buflen);
++
+ #endif /* ATF_OFFLOAD_CONFIG_H */
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -3339,6 +3339,7 @@ dfs_offload:
+ 	if (iface->interfaces && iface->interfaces->count > 1)
+ 		ieee802_11_update_beacons(iface);
+ 
++	atf_offload_send_feature_params(hapd);
+ 	return 0;
+ 
+ fail:

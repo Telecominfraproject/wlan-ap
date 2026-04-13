@@ -1,0 +1,169 @@
+From 232ac7ca529230f4d4e0ff98418d4a0bcba77440 Mon Sep 17 00:00:00 2001
+From: Manish Dharanenthiran <mdharane@qti.qualcomm.com>
+Date: Tue, 10 Jun 2025 16:55:12 +0530
+Subject: [PATCH] wifi:ath12k: Refactor ath12k_dp_rx_peer_frag_setup API
+
+Currently, in ath12k_dp_rx_peer_frag_setup(), crypto allocation will be
+called and then assigned to the corressponding link_peer. But, for UMAC
+migration use case, this API will be called from an interrupt handler
+with spin_lock acquired. This will lead to warning as the allocation
+uses GFP_KERNEL flag which might go to sleep.
+
+Avoid this by refactoring the API to allocate the crypto hash and pass
+that as the argument for updating it to link_peer.
+
+Signed-off-by: Manish Dharanenthiran <mdharane@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c    | 14 ++++++++++---
+ drivers/net/wireless/ath/ath12k/dp_rx.c | 27 ++++---------------------
+ drivers/net/wireless/ath/ath12k/dp_rx.h |  4 +++-
+ 3 files changed, 18 insertions(+), 27 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -97,6 +97,7 @@ int ath12k_dp_peer_setup(struct ath12k *
+ 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+ 	struct ieee80211_sta *sta;
+ 	struct ath12k_sta *ahsta;
++	struct crypto_shash *tfm;
+ 
+ 	/* NOTE: reo_dest ring id starts from 1 unlike mac_id which starts from 0 */
+ 	reo_dest = ar->dp.mac_id + 1;
+@@ -110,12 +111,17 @@ int ath12k_dp_peer_setup(struct ath12k *
+ 		return ret;
+ 	}
+ 
++	tfm = crypto_alloc_shash("michael_mic", 0, 0);
++	if (IS_ERR(tfm))
++		return PTR_ERR(tfm);
++
+ 	spin_lock_bh(&dp->dp_lock);
+ 	peer = ath12k_dp_link_peer_find_by_vdev_id_and_addr(dp, vdev_id, addr);
+ 	if (!peer) {
+ 		ath12k_warn(ab, "failed to find the peer to del rx tid\n");
+ 		spin_unlock_bh(&dp->dp_lock);
+-		return -ENOENT;
++		ret = -ENOENT;
++		goto free_shash;
+ 	}
+ 
+ 	sta = peer->sta;
+@@ -123,7 +129,7 @@ int ath12k_dp_peer_setup(struct ath12k *
+ 	if (peer->mlo && peer->link_id != ahsta->primary_link_id) {
+ 		peer->primary_link = false;
+ 		spin_unlock_bh(&dp->dp_lock);
+-		return ret;
++		goto free_shash;
+ 	}
+ 
+ 	peer->primary_link = true;
+@@ -139,24 +145,44 @@ int ath12k_dp_peer_setup(struct ath12k *
+ 		}
+ 	}
+ 
+-	ret = ath12k_dp_rx_peer_frag_setup(ar, addr, vdev_id);
++	spin_lock_bh(&dp->dp_lock);
++	peer = ath12k_dp_link_peer_find_by_vdev_id_and_addr(dp, vdev_id, addr);
++	if (!peer) {
++		ath12k_warn(ab, "failed to find the peer to set up fragment info\n");
++		ret = -ENOENT;
++		spin_unlock_bh(&dp->dp_lock);
++		goto free_shash;
++	}
++
++	ret = ath12k_dp_rx_peer_frag_setup(ar, peer, tfm);
+ 	if (ret) {
+ 		ath12k_warn(ab, "failed to setup rx defrag context\n");
+-		goto peer_clean;
++		goto tid_clean;
+ 	}
+ 
++	spin_unlock_bh(&dp->dp_lock);
++
+ 	/* TODO: Setup other peer specific resource used in data path */
+ 
+ 	return 0;
+ 
+ peer_clean:
+ 	spin_lock_bh(&dp->dp_lock);
++	peer = ath12k_dp_link_peer_find_by_vdev_id_and_addr(dp, vdev_id, addr);
++	if (!peer) {
++		spin_unlock_bh(&dp->dp_lock);
++		ath12k_warn(ab, "failed to find the peer in err case of del rx tid\n");
++		goto free_shash;
++	}
+ 
++tid_clean:
+ 	for (; tid >= 0; tid--)
+ 		ath12k_dp_arch_rx_peer_tid_delete(ab->dp, ar, peer, tid);
+ 
+ 	spin_unlock_bh(&dp->dp_lock);
+ 
++free_shash:
++	crypto_free_shash(tfm);
+ 	return ret;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -1143,34 +1143,16 @@ static void ath12k_dp_rx_frag_timer(stru
+ 	spin_unlock_bh(&rx_tid->dp->dp_lock);
+ }
+ 
+-int ath12k_dp_rx_peer_frag_setup(struct ath12k *ar, const u8 *peer_mac, int vdev_id)
++int ath12k_dp_rx_peer_frag_setup(struct ath12k *ar,
++				 struct ath12k_dp_link_peer *peer,
++				 struct crypto_shash *tfm)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+-	struct crypto_shash *tfm;
+-	struct ath12k_dp_link_peer *peer;
++	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+ 	struct ath12k_dp_rx_tid *rx_tid;
+ 	int i;
+-	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+-
+-	tfm = crypto_alloc_shash("michael_mic", 0, 0);
+-	if (IS_ERR(tfm))
+-		return PTR_ERR(tfm);
+-
+-	spin_lock_bh(&dp->dp_lock);
+ 
+-	peer = ath12k_dp_link_peer_find_by_vdev_id_and_addr(dp, vdev_id, peer_mac);
+-	if (!peer) {
+-		spin_unlock_bh(&dp->dp_lock);
+-		crypto_free_shash(tfm);
+-		ath12k_warn(ab, "failed to find the peer to set up fragment info\n");
+-		return -ENOENT;
+-	}
+-
+-	if (!peer->primary_link) {
+-		spin_unlock_bh(&dp->dp_lock);
+-		crypto_free_shash(tfm);
+-		return 0;
+-	}
++	lockdep_assert(&dp->dp_lock);
+ 
+ 	for (i = 0; i <= IEEE80211_NUM_TIDS; i++) {
+ 		rx_tid = &peer->dp_peer->rx_tid[i];
+@@ -1181,7 +1163,6 @@ int ath12k_dp_rx_peer_frag_setup(struct
+ 
+ 	peer->dp_peer->tfm_mmic = tfm;
+ 	peer->dp_peer->primary_link_frag_setup = true;
+-	spin_unlock_bh(&dp->dp_lock);
+ 
+ 	return 0;
+ }
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -173,7 +173,9 @@ int ath12k_dp_rx_bufs_replenish(struct a
+ 				struct list_head *used_list,
+ 				int req_entries);
+ int ath12k_dp_rx_pdev_mon_attach(struct ath12k *ar);
+-int ath12k_dp_rx_peer_frag_setup(struct ath12k *ar, const u8 *peer_mac, int vdev_id);
++int ath12k_dp_rx_peer_frag_setup(struct ath12k *ar,
++				 struct ath12k_dp_link_peer *peer,
++				 struct crypto_shash *tfm);
+ 
+ u8 ath12k_dp_rx_h_l3pad(struct ath12k_base *ab,
+ 			struct hal_rx_desc *desc);

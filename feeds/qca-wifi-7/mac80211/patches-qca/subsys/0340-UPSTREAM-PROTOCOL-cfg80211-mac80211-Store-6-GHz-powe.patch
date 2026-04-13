@@ -1,0 +1,802 @@
+From 14cf7952f1a4d77b82d45b19bf36516515695501 Mon Sep 17 00:00:00 2001
+From: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+Date: Mon, 14 Jul 2025 12:43:44 +0530
+Subject: [PATCH] UPSTREAM: PROTOCOL: cfg80211: mac80211: Store 6 GHz power
+ mode per link.
+
+Currently, the 6 GHz power mode is stored at an interface level within
+the wdev structure. This does not work for multi-link devices where each
+6 GHz link can have a different power mode.
+
+To fix this, store the 6 GHz power mode in the link structure.
+Add code changes across mac80211 and cfg80211 to support this.
+  (1) Add a new field he_6ghz_power_type in the ap settings for parsing
+      and storing the 6 GHz power mode send by the user space.
+  (2) Copy the power mode configured in the settings to the
+      corresponding link's ieee80211_bss_conf structure.
+  (3) Modify the API 'ieee80211_get_ap_6ghz_pwr_mode' to return the
+      6 GHz power mode for the specific link.
+  (4) Update mac80211 APIs to take link id as an additional argument
+      to look up the 6 GHz power mode for the specific link.
+
+Fixes: None
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+subsys/0048-cfg80211-mac80211-regulatory-awgn-and-6g-channel-cha.patch
+
+Signed-off-by: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+---
+ include/net/cfg80211.h     |   8 ++-
+ net/mac80211/cfg.c         |  64 +++++++++++++++------
+ net/mac80211/ibss.c        |   2 +-
+ net/mac80211/ieee80211_i.h |  34 +++++++++++
+ net/mac80211/mesh.c        |   4 +-
+ net/mac80211/mlme.c        |   9 +--
+ net/mac80211/spectmgmt.c   |   6 +-
+ net/mac80211/util.c        |  36 ++++--------
+ net/wireless/chan.c        |   2 +
+ net/wireless/nl80211.c     | 114 +++++++++++++++++++++++++++++--------
+ net/wireless/rdev-ops.h    |  10 ++--
+ net/wireless/trace.h       |  17 ++++--
+ 12 files changed, 220 insertions(+), 86 deletions(-)
+
+Index: backports-20250213-6.6.88-9a0dddfb30f1/include/net/cfg80211.h
+===================================================================
+--- backports-20250213-6.6.88-9a0dddfb30f1.orig/include/net/cfg80211.h
++++ backports-20250213-6.6.88-9a0dddfb30f1/include/net/cfg80211.h
+@@ -1732,6 +1732,7 @@ struct cfg80211_ap_settings {
+ 	enum nl80211_beacon_tx_mode beacon_tx_mode;
+ 	bool ml_max_rec_links_valid;
+ 	u8 ml_max_rec_links;
++	enum nl80211_regulatory_power_modes he_6ghz_power_type;
+ };
+ 
+ 
+@@ -1782,6 +1783,7 @@ struct cfg80211_csa_settings {
+ 	u8 count;
+ 	u8 link_id;
+ 	struct cfg80211_unsol_bcast_probe_resp unsol_bcast_probe_resp;
++	enum nl80211_regulatory_power_modes he_6ghz_power_type;
+ };
+ 
+ /**
+@@ -5703,7 +5705,8 @@ struct cfg80211_ops {
+ 				    struct cfg80211_chan_def *chandef);
+ 
+ 	enum nl80211_regulatory_power_modes
+-		(*get_ap_6ghz_pwr_mode)(struct wireless_dev *wdev);
++		(*get_ap_6ghz_pwr_mode)(struct wireless_dev *wdev,
++					unsigned int link_id);
+ 
+ 	int	(*add_tx_ts)(struct wiphy *wiphy, struct net_device *dev,
+ 			     u8 tsid, const u8 *peer, u8 user_prio,
+@@ -7380,6 +7383,7 @@ struct wireless_dev {
+ 			struct cfg80211_chan_def preset_chandef;
+ 			u8 ssid[IEEE80211_MAX_SSID_LEN];
+ 			u8 ssid_len;
++			u8 preset_6g_power_mode;
+ 		} ap;
+ 		struct {
+ 			struct cfg80211_internal_bss *current_bss;
+@@ -7414,11 +7418,11 @@ struct wireless_dev {
+ 		u8 switch_count;
+ 		u32 link_removal_tbtt_count;
+ 		u32 ttlm_expec_dur;
++		u8 reg_6g_power_mode;
+ 	} links[IEEE80211_MLD_MAX_NUM_LINKS];
+ 	u16 valid_links;
+ 
+ 	u32 radio_mask;
+-	u8 reg_6g_power_mode;
+ 	bool critical_update;
+ 	bool is_netdev_going_down; /*Indicates netdev going down - wdev specific*/
+ 	u8 ppe_vp_type;
+Index: backports-20250213-6.6.88-9a0dddfb30f1/net/mac80211/cfg.c
+===================================================================
+--- backports-20250213-6.6.88-9a0dddfb30f1.orig/net/mac80211/cfg.c
++++ backports-20250213-6.6.88-9a0dddfb30f1/net/mac80211/cfg.c
+@@ -1646,6 +1646,12 @@ static int ieee80211_start_ap(struct wip
+ 			params->crypto.control_port_no_preauth;
+ 	}
+ 
++	if (params->chandef.chan->band == NL80211_BAND_6GHZ)
++		link_conf->power_type =
++		    ieee80211_cfg_to_mac_power_type(params->he_6ghz_power_type);
++	else
++		link_conf->power_type = IEEE80211_REG_UNSET_AP;
++
+ 	link_conf->dtim_period = params->dtim_period;
+ 	link_conf->enable_beacon = true;
+ 	link_conf->allow_p2p_go_ps = sdata->vif.p2p;
+@@ -4345,6 +4351,11 @@ static int __ieee80211_csa_finalize(stru
+ 
+ 	lockdep_assert_wiphy(local->hw.wiphy);
+ 
++	if (link_data->csa.power_mode != IEEE80211_REG_UNSET_AP) {
++		link_data->conf->power_type = link_data->csa.power_mode;
++		link_data->csa.power_mode = IEEE80211_REG_UNSET_AP;
++	}
++
+ 	/*
+ 	 * using reservation isn't immediate as it may be deferred until later
+ 	 * with multi-vif. once reservation is complete it will re-schedule the
+@@ -4671,6 +4682,12 @@ __ieee80211_channel_switch(struct wiphy
+ 		goto out;
+ 	}
+ 
++	if (params->chandef.chan->band == NL80211_BAND_6GHZ)
++		link_data->csa.power_mode =
++		    ieee80211_cfg_to_mac_power_type(params->he_6ghz_power_type);
++	else
++		link_data->csa.power_mode = IEEE80211_REG_UNSET_AP;
++
+ 	link_data->csa.chanreq = chanreq;
+ 	link_conf->csa_active = true;
+ 
+@@ -5034,37 +5051,48 @@ static int ieee80211_set_ap_chanwidth(st
+ }
+ 
+ static enum nl80211_regulatory_power_modes
+-ieee80211_get_ap_6ghz_pwr_mode(struct wireless_dev *wdev)
++ieee80211_get_ap_6ghz_pwr_mode(struct wireless_dev *wdev, unsigned int link_id)
+ {
+ 	struct ieee80211_sub_if_data *sdata;
+-	enum nl80211_regulatory_power_modes mode = NL80211_REG_AP_LPI;
++	enum nl80211_regulatory_power_modes mode = NL80211_REG_NUM_POWER_MODES;
+ 	enum ieee80211_ap_reg_power ap_power_type;
+ 
+ 	if (!wdev)
+ 		return mode;
+ 	switch (wdev->iftype) {
+ 	case NL80211_IFTYPE_AP:
+-		mode = wdev->reg_6g_power_mode;
+-		break;
+ 	case NL80211_IFTYPE_STATION:
++		unsigned long valid_links;
++		struct ieee80211_bss_conf *bss_conf;
++		enum nl80211_reg_client_types client_type;
++		enum nl80211_regulatory_power_modes ap_mode;
++
+ 		sdata = IEEE80211_WDEV_TO_SUB_IF(wdev);
+ 		if (!ieee80211_sdata_running(sdata) ||
+ 		    !(sdata->flags & IEEE80211_SDATA_IN_DRIVER)) {
+ 				sdata_info(sdata, "sdata not running");
+ 				return mode;
+ 		}
+-		/* If STA is not yet associated then assign power type
+-		 * by default as IEEE80211_REG_LPI_AP */
+-		if (sdata->vif.bss_conf.power_type ==
+-		    IEEE80211_REG_UNSET_AP) {
+-			ap_power_type = IEEE80211_REG_LPI_AP;
+-		} else {
+-			ap_power_type = sdata->vif.bss_conf.power_type;
+-		}
+-		/* ieee80211_ap_reg_power starts with 0 since they used
+-		 * IEEE80211_REG_UNSET_AP as first parameter. Hence reduced
+-		 * ap_power_type by offset 1 to match with 6g_reg_power_mode */
+-		mode = GET_POWER_MODE_FOR_NON_AP_STA(wdev->reg_6g_power_mode, ap_power_type - 1);
++
++		valid_links = sdata->vif.valid_links;
++		if (!valid_links)
++			bss_conf = &sdata->vif.bss_conf;
++		else if (valid_links & BIT(link_id))
++			bss_conf = rcu_dereference(sdata->vif.link_conf[link_id]);
++		else
++			return mode;
++
++		if (bss_conf->power_type != IEEE80211_REG_UNSET_AP)
++			ap_power_type = bss_conf->power_type;
++		else
++			return mode;
++
++		ap_mode = ieee80211_mac_to_cfg_power_type(ap_power_type);
++		if (wdev->iftype == NL80211_IFTYPE_AP)
++			return ap_mode;
++
++		client_type = NL80211_REG_REGULAR_CLIENT;
++		mode = GET_POWER_MODE_FOR_NON_AP_STA(client_type, ap_mode);
+ 		break;
+ 	default:
+ 		/* do nothing */
+@@ -5424,10 +5452,10 @@ ieee80211_6ghz_power_mode_change(struct
+ 		return -EINVAL;
+ 	}
+ 
+-	wdev->reg_6g_power_mode = ap_6ghz_pwr_mode;
++	link->conf->power_type = ieee80211_cfg_to_mac_power_type(ap_6ghz_pwr_mode);
+ 	changed = BSS_CHANGED_6GHZ_POWER_MODE;
+ 
+-	ieee80211_bss_info_change_notify(sdata, changed);
++	ieee80211_link_info_change_notify(sdata, link, changed);
+ 
+ 	return 0;
+ }
+Index: backports-20250213-6.6.88-9a0dddfb30f1/net/mac80211/ibss.c
+===================================================================
+--- backports-20250213-6.6.88-9a0dddfb30f1.orig/net/mac80211/ibss.c
++++ backports-20250213-6.6.88-9a0dddfb30f1/net/mac80211/ibss.c
+@@ -783,7 +783,7 @@ ieee80211_ibss_process_chanswitch(struct
+ 		vht_cap_info = le32_to_cpu(elems->vht_cap_elem->vht_cap_info);
+ 
+ 	memset(&params, 0, sizeof(params));
+-	err = ieee80211_parse_ch_switch_ie(sdata, elems,
++	err = ieee80211_parse_ch_switch_ie(sdata, 0, elems,
+ 					   ifibss->chandef.chan->band,
+ 					   vht_cap_info, &conn,
+ 					   ifibss->bssid, false,
+Index: backports-20250213-6.6.88-9a0dddfb30f1/net/mac80211/ieee80211_i.h
+===================================================================
+--- backports-20250213-6.6.88-9a0dddfb30f1.orig/net/mac80211/ieee80211_i.h
++++ backports-20250213-6.6.88-9a0dddfb30f1/net/mac80211/ieee80211_i.h
+@@ -1083,6 +1083,7 @@ struct ieee80211_link_data {
+ 	struct {
+ 		struct wiphy_work finalize_work;
+ 		struct ieee80211_chan_req chanreq;
++		enum ieee80211_ap_reg_power power_mode;
+ 	} csa;
+ 
+ 	struct wiphy_work color_change_finalize_work;
+@@ -1239,6 +1240,36 @@ struct ieee80211_sub_if_data *vif_to_sda
+ 	return container_of(p, struct ieee80211_sub_if_data, vif);
+ }
+ 
++static inline enum nl80211_regulatory_power_modes
++ieee80211_mac_to_cfg_power_type(enum ieee80211_ap_reg_power power_type)
++{
++	if (power_type < IEEE80211_REG_LPI_AP ||
++	    power_type > IEEE80211_REG_VLP_AP)
++		return NL80211_REG_NUM_POWER_MODES;
++
++	/**
++	 * power_type is of enum ieee80211_ap_reg_power which starts with 1 for
++	 * LPI, but nl80211_regulatory_power_modes starts with 0 for LPI.
++	 * So subtract 1 for conversion.
++	 */
++	return power_type - 1;
++}
++
++static inline enum ieee80211_ap_reg_power
++ieee80211_cfg_to_mac_power_type(enum nl80211_regulatory_power_modes power_type)
++{
++	if (power_type < NL80211_REG_AP_LPI ||
++	    power_type > NL80211_REG_AP_VLP)
++		return IEEE80211_REG_UNSET_AP;
++
++	/**
++	 * power_type is of enum nl80211_regulatory_power_modes which starts with 0
++	 * for LPI, but ieee80211_ap_reg_power starts with 1 for LPI.
++	 * So add 1 for conversion.
++	 */
++	return power_type + 1;
++}
++
+ #define sdata_dereference(p, sdata) \
+ 	wiphy_dereference(sdata->local->hw.wiphy, p)
+ 
+@@ -2395,6 +2426,7 @@ void ieee80211_process_measurement_req(s
+ /**
+  * ieee80211_parse_ch_switch_ie - parses channel switch IEs
+  * @sdata: the sdata of the interface which has received the frame
++ * @link_id: the link ID of the interface which has received the frame
+  * @elems: parsed 802.11 elements received with the frame
+  * @current_band: indicates the current band
+  * @vht_cap_info: VHT capabilities of the transmitter
+@@ -2408,6 +2440,7 @@ void ieee80211_process_measurement_req(s
+  * Return: 0 on success, <0 on error and >0 if there is nothing to parse.
+  */
+ int ieee80211_parse_ch_switch_ie(struct ieee80211_sub_if_data *sdata,
++				 int link_id,
+ 				 struct ieee802_11_elems *elems,
+ 				 enum nl80211_band current_band,
+ 				 u32 vht_cap_info,
+@@ -2777,6 +2810,7 @@ struct ieee80211_channel
+ 				     const int new_chan_idx);
+ 
+ bool ieee80211_chandef_he_6ghz_oper(struct ieee80211_sub_if_data *sdata,
++				    int link_id,
+ 				    const struct ieee80211_he_operation *he_oper,
+ 				    const struct ieee80211_eht_operation *eht_oper,
+ 				    struct cfg80211_chan_def *chandef);
+Index: backports-20250213-6.6.88-9a0dddfb30f1/net/mac80211/mesh.c
+===================================================================
+--- backports-20250213-6.6.88-9a0dddfb30f1.orig/net/mac80211/mesh.c
++++ backports-20250213-6.6.88-9a0dddfb30f1/net/mac80211/mesh.c
+@@ -109,7 +109,7 @@ bool mesh_matches_local(struct ieee80211
+ 	ieee80211_chandef_vht_oper(&sdata->local->hw, vht_cap_info,
+ 				   ie->vht_operation, ie->ht_operation,
+ 				   &sta_chan_def);
+-	ieee80211_chandef_he_6ghz_oper(sdata, ie->he_operation,
++	ieee80211_chandef_he_6ghz_oper(sdata, 0, ie->he_operation,
+ 				       ie->eht_operation,
+ 				       &sta_chan_def);
+ 
+@@ -1394,7 +1394,7 @@ ieee80211_mesh_process_chnswitch(struct
+ 			le32_to_cpu(elems->vht_cap_elem->vht_cap_info);
+ 
+ 	memset(&params, 0, sizeof(params));
+-	err = ieee80211_parse_ch_switch_ie(sdata, elems, sband->band,
++	err = ieee80211_parse_ch_switch_ie(sdata, 0, elems, sband->band,
+ 					   vht_cap_info, &conn,
+ 					   sdata->vif.addr, false,
+ 					   &csa_ie);
+Index: backports-20250213-6.6.88-9a0dddfb30f1/net/mac80211/mlme.c
+===================================================================
+--- backports-20250213-6.6.88-9a0dddfb30f1.orig/net/mac80211/mlme.c
++++ backports-20250213-6.6.88-9a0dddfb30f1/net/mac80211/mlme.c
+@@ -161,6 +161,7 @@ static int ecw2cw(int ecw)
+ 
+ static enum ieee80211_conn_mode
+ ieee80211_determine_ap_chan(struct ieee80211_sub_if_data *sdata,
++			    int link_id,
+ 			    struct ieee80211_channel *channel,
+ 			    u32 vht_cap_info,
+ 			    const struct ieee802_11_elems *elems,
+@@ -221,7 +222,7 @@ ieee80211_determine_ap_chan(struct ieee8
+ 			mode = IEEE80211_CONN_MODE_HE;
+ 		}
+ 
+-		if (!ieee80211_chandef_he_6ghz_oper(sdata, he_oper,
++		if (!ieee80211_chandef_he_6ghz_oper(sdata, link_id, he_oper,
+ 						    eht_oper, chandef)){
+ 			sdata_info(sdata, "bad HE/EHT 6 GHz operation\n");
+ 			return IEEE80211_CONN_MODE_LEGACY;
+@@ -950,7 +951,7 @@ again:
+ 	if (!elems)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	ap_mode = ieee80211_determine_ap_chan(sdata, channel, bss->vht_cap_info,
++	ap_mode = ieee80211_determine_ap_chan(sdata, link_id, channel, bss->vht_cap_info,
+ 					      elems, false, conn, ap_chandef);
+ 
+ 	/* this should be impossible since parsing depends on our mode */
+@@ -1165,7 +1166,7 @@ static int ieee80211_config_bw(struct ie
+ 	if (elems->vht_cap_elem)
+ 		vht_cap_info = le32_to_cpu(elems->vht_cap_elem->vht_cap_info);
+ 
+-	ap_mode = ieee80211_determine_ap_chan(sdata, channel, vht_cap_info,
++	ap_mode = ieee80211_determine_ap_chan(sdata, link->link_id, channel, vht_cap_info,
+ 					      elems, true, &link->u.mgd.conn,
+ 					      &ap_chandef);
+ 
+@@ -2628,7 +2629,7 @@ ieee80211_sta_process_chanswitch(struct
+ 		current_band = cbss->channel->band;
+ 		bss = (void *)cbss->priv;
+ 
+-		res = ieee80211_parse_ch_switch_ie(sdata, csa_elems,
++		res = ieee80211_parse_ch_switch_ie(sdata, link->link_id, csa_elems,
+ 						   current_band,
+ 						   bss->vht_cap_info,
+ 						   &link->u.mgd.conn,
+Index: backports-20250213-6.6.88-9a0dddfb30f1/net/mac80211/spectmgmt.c
+===================================================================
+--- backports-20250213-6.6.88-9a0dddfb30f1.orig/net/mac80211/spectmgmt.c
++++ backports-20250213-6.6.88-9a0dddfb30f1/net/mac80211/spectmgmt.c
+@@ -141,6 +141,7 @@ validate_chandef_by_ht_vht_oper(struct i
+ 
+ static void
+ validate_chandef_by_6ghz_he_eht_oper(struct ieee80211_sub_if_data *sdata,
++				     int link_id,
+ 				     struct ieee80211_conn_settings *conn,
+ 				     struct cfg80211_chan_def *chandef)
+ {
+@@ -212,12 +213,13 @@ validate_chandef_by_6ghz_he_eht_oper(str
+ 		eht_oper = &eht._oper;
+ 	}
+ 
+-	if (!ieee80211_chandef_he_6ghz_oper(sdata, &he._oper,
++	if (!ieee80211_chandef_he_6ghz_oper(sdata, link_id, &he._oper,
+ 					    eht_oper, chandef))
+ 		chandef->chan = NULL;
+ }
+ 
+ int ieee80211_parse_ch_switch_ie(struct ieee80211_sub_if_data *sdata,
++				 int link_id,
+ 				 struct ieee802_11_elems *elems,
+ 				 enum nl80211_band current_band,
+ 				 u32 vht_cap_info,
+@@ -372,7 +374,7 @@ int ieee80211_parse_ch_switch_ie(struct
+ 
+ 	/* check if the new chandef fits the capabilities */
+ 	if (new_band == NL80211_BAND_6GHZ)
+-		validate_chandef_by_6ghz_he_eht_oper(sdata, conn, &new_chandef);
++		validate_chandef_by_6ghz_he_eht_oper(sdata, link_id, conn, &new_chandef);
+ 	else
+ 		validate_chandef_by_ht_vht_oper(sdata, conn, vht_cap_info,
+ 						&new_chandef);
+Index: backports-20250213-6.6.88-9a0dddfb30f1/net/mac80211/util.c
+===================================================================
+--- backports-20250213-6.6.88-9a0dddfb30f1.orig/net/mac80211/util.c
++++ backports-20250213-6.6.88-9a0dddfb30f1/net/mac80211/util.c
+@@ -3453,12 +3453,10 @@ struct ieee80211_channel
+ 				     const struct ieee80211_he_operation *he_oper,
+ 				     const int new_chan_idx)
+ {
+-	enum nl80211_iftype iftype = ieee80211_vif_type_p2p(&sdata->vif);
+ 	enum nl80211_regulatory_power_modes mode;
+ 	struct ieee80211_channel *new_chan;
+ 	const struct ieee80211_he_6ghz_oper *he_6ghz_oper;
+ 	u8 reg_info;
+-	u8 reg_6g_power_mode;
+ 	u32 new_freq;
+ 
+ 
+@@ -3481,20 +3479,7 @@ struct ieee80211_channel
+ 	if (reg_info == IEEE80211_6GHZ_CTRL_REG_INDOOR_SP_AP)
+ 		reg_info = IEEE80211_6GHZ_CTRL_REG_SP_AP;
+ 
+-	/* 6G Power mode configured by the user */
+-	reg_6g_power_mode = sdata->wdev.reg_6g_power_mode;
+-
+-	/**
+-	 * For AP/AP_VLAN/MESH_POINT interfaces, the 6G power mode depends on the
+-	 * mode configured by user (LPI/SP/VLP). For other interfaces (for ex STA)
+-	 * mode depends on the power mode present in beacon as well as power mode
+-	 * configured by the user for that interface
+-	 */
+-	if (iftype == NL80211_IFTYPE_AP || iftype == NL80211_IFTYPE_AP_VLAN ||
+-	    iftype == NL80211_IFTYPE_MESH_POINT) {
+-		mode = reg_6g_power_mode;
+-	} else
+-		mode = GET_POWER_MODE_FOR_NON_AP_STA(reg_6g_power_mode, reg_info);
++	mode = GET_POWER_MODE_FOR_NON_AP_STA(NL80211_REG_REGULAR_CLIENT, reg_info);
+ 
+ 	/*
+ 	 * The EHT operation IE does not contain the primary channel so the
+@@ -3509,6 +3494,7 @@ struct ieee80211_channel
+ }
+ 
+ bool ieee80211_chandef_he_6ghz_oper(struct ieee80211_sub_if_data *sdata,
++				    int link_id,
+ 				    const struct ieee80211_he_operation *he_oper,
+ 				    const struct ieee80211_eht_operation *eht_oper,
+ 				    struct cfg80211_chan_def *chandef)
+@@ -3519,7 +3505,6 @@ bool ieee80211_chandef_he_6ghz_oper(stru
+ 	enum nl80211_regulatory_power_modes mode;
+ 	u32 freq;
+ 	u8 reg_info;
+-	u8 reg_6g_power_mode;
+ 
+ 	if (chandef->chan->band != NL80211_BAND_6GHZ)
+ 		return true;
+@@ -3542,21 +3527,22 @@ bool ieee80211_chandef_he_6ghz_oper(stru
+ 	if (reg_info == IEEE80211_6GHZ_CTRL_REG_INDOOR_SP_AP)
+ 		reg_info = IEEE80211_6GHZ_CTRL_REG_SP_AP;
+ 
+-	/* 6G Power mode configured by the user */
+-	reg_6g_power_mode = sdata->wdev.reg_6g_power_mode;
+-
+ 	/*
+ 	 * For AP/AP_VLAN/MESH_POINT interfaces, the 6G power mode depends on the
+ 	 * mode configured by user (LPI/SP/VLP). For other interfaces (for ex STA)
+ 	 * mode depends on the power mode present in beacon as well as power mode
+ 	 * configured by the user for that interface
+ 	 */
+-
+-	if (iftype == NL80211_IFTYPE_AP || iftype == NL80211_IFTYPE_AP_VLAN ||
+-	    iftype == NL80211_IFTYPE_MESH_POINT)
+-		mode = reg_6g_power_mode;
+-	else
+-		mode = 3 * (1 + reg_6g_power_mode) + reg_info;
++	if (iftype == NL80211_IFTYPE_AP || iftype == NL80211_IFTYPE_AP_VLAN) {
++		mode = sdata->wdev.links[link_id].reg_6g_power_mode;
++	} else if (iftype == NL80211_IFTYPE_MESH_POINT) {
++		struct cfg80211_chan_def *mesh_chandef = &sdata->wdev.u.mesh.chandef;
++
++		mode = cfg80211_get_6ghz_power_mode_from_chan(sdata->local->hw.wiphy,
++							      mesh_chandef->chan);
++	} else {
++		mode = GET_POWER_MODE_FOR_NON_AP_STA(NL80211_REG_REGULAR_CLIENT, reg_info);
++	}
+ 
+ 	/*
+ 	 * The EHT operation IE does not contain the primary channel so the
+Index: backports-20250213-6.6.88-9a0dddfb30f1/net/wireless/chan.c
+===================================================================
+--- backports-20250213-6.6.88-9a0dddfb30f1.orig/net/wireless/chan.c
++++ backports-20250213-6.6.88-9a0dddfb30f1/net/wireless/chan.c
+@@ -1915,6 +1915,7 @@ cfg80211_update_chandef_6ghz_power_mode(
+ 	}
+ 
+ 	chandef->chan = chan;
++	wdev->links[link_id].reg_6g_power_mode = power_mode;
+ 
+ 	return 0;
+ }
+@@ -1950,6 +1951,7 @@ cfg80211_get_6ghz_power_mode_from_chan(c
+ 
+ 	return NL80211_REG_NUM_POWER_MODES;
+ }
++EXPORT_SYMBOL(cfg80211_get_6ghz_power_mode_from_chan);
+ 
+ bool cfg80211_chandef_usable(struct wiphy *wiphy,
+ 			     const struct cfg80211_chan_def *chandef,
+Index: backports-20250213-6.6.88-9a0dddfb30f1/net/wireless/nl80211.c
+===================================================================
+--- backports-20250213-6.6.88-9a0dddfb30f1.orig/net/wireless/nl80211.c
++++ backports-20250213-6.6.88-9a0dddfb30f1/net/wireless/nl80211.c
+@@ -3908,7 +3908,7 @@ static int _nl80211_parse_chandef(struct
+ {
+ 	struct netlink_ext_ack *extack = info->extack;
+ 	struct nlattr **attrs = info->attrs;
+-	enum nl80211_regulatory_power_modes mode = NL80211_REG_AP_LPI;
++	enum nl80211_regulatory_power_modes mode = NL80211_REG_NUM_POWER_MODES;
+ 	u32 control_freq;
+ 	int err;
+ 
+@@ -3924,20 +3924,19 @@ static int _nl80211_parse_chandef(struct
+ 		control_freq +=
+ 		    nla_get_u32(info->attrs[NL80211_ATTR_WIPHY_FREQ_OFFSET]);
+ 
+-	if (info->attrs[NL80211_ATTR_6G_REG_POWER_MODE])
+-		mode = nla_get_u8(info->attrs[NL80211_ATTR_6G_REG_POWER_MODE]);
+-	else
+-		mode = rdev_get_ap_6ghz_pwr_mode(rdev, wdev);
+-
+ 	memset(chandef, 0, sizeof(*chandef));
+ 
+-	if (control_freq >= MHZ_TO_KHZ(5945) && control_freq <= MHZ_TO_KHZ(7125))
++	if (control_freq >= MHZ_TO_KHZ(5945) && control_freq <= MHZ_TO_KHZ(7125)) {
++		if (info->attrs[NL80211_ATTR_6G_REG_POWER_MODE])
++			mode = nla_get_u8(info->attrs[NL80211_ATTR_6G_REG_POWER_MODE]);
++
+ 		chandef->chan = ieee80211_get_6g_channel_khz(&rdev->wiphy,
+ 							     control_freq,
+ 							     mode);
+-	else
++	} else {
+ 		chandef->chan = ieee80211_get_channel_khz(&rdev->wiphy,
+ 							  control_freq);
++	}
+ 
+ 	chandef->width = NL80211_CHAN_WIDTH_20_NOHT;
+ 	chandef->center_freq1 = KHZ_TO_MHZ(control_freq);
+@@ -4120,6 +4119,7 @@ static int __nl80211_set_channel(struct
+ 	enum nl80211_iftype iftype = NL80211_IFTYPE_MONITOR;
+ 	struct wireless_dev *wdev = NULL;
+ 	int link_id = _link_id;
++	u8 reg_6g_power_mode = NL80211_REG_NUM_POWER_MODES;
+ 
+ 	if (dev)
+ 		wdev = dev->ieee80211_ptr;
+@@ -4141,11 +4141,11 @@ static int __nl80211_set_channel(struct
+ 		return result;
+ 
+ 	/* Userspace might advertise the 6G power mode (AP). Just parse and store
+-	 * it in wdev. No immediate action required. */
+-	if (wdev && info->attrs[NL80211_ATTR_6G_REG_POWER_MODE]) {
+-		wdev->reg_6g_power_mode =
+-				nla_get_u8(info->attrs[NL80211_ATTR_6G_REG_POWER_MODE]);
+-	}
++	 * it. No immediate action required.
++	 */
++	if (info->attrs[NL80211_ATTR_6G_REG_POWER_MODE])
++		reg_6g_power_mode =
++		    nla_get_u8(info->attrs[NL80211_ATTR_6G_REG_POWER_MODE]);
+ 
+ 	switch (iftype) {
+ 	case NL80211_IFTYPE_AP:
+@@ -4200,6 +4200,7 @@ static int __nl80211_set_channel(struct
+ 			wdev->links[link_id].ap.chandef = chandef;
+ 		} else {
+ 			wdev->u.ap.preset_chandef = chandef;
++			wdev->u.ap.preset_6g_power_mode = reg_6g_power_mode;
+ 		}
+ 		return 0;
+ 	case NL80211_IFTYPE_MESH_POINT:
+@@ -4732,10 +4733,6 @@ static int nl80211_send_iface(struct sk_
+ 	    nla_put_u32(msg, NL80211_ATTR_VIF_RADIO_MASK, wdev->radio_mask))
+ 		goto nla_put_failure;
+ 
+-	if (nla_put_u8(msg, NL80211_ATTR_6G_REG_POWER_MODE,
+-		       wdev->reg_6g_power_mode))
+-		goto nla_put_failure;
+-
+ 	switch (wdev->iftype) {
+ 	case NL80211_IFTYPE_AP:
+ 	case NL80211_IFTYPE_P2P_GO:
+@@ -4798,6 +4795,13 @@ static int nl80211_send_iface(struct sk_
+ 			if (ret == 0 && nl80211_send_chandef(msg, &chandef))
+ 				goto nla_put_failure;
+ 
++			if (chandef.chan && chandef.chan->band == NL80211_BAND_6GHZ) {
++				if (nla_put_u8(msg, NL80211_ATTR_6G_REG_POWER_MODE,
++					       rdev_get_ap_6ghz_pwr_mode(rdev, wdev,
++									 link_id)))
++					goto nla_put_failure;
++			}
++
+ 			if (rdev->ops->get_tx_power) {
+ 				int dbm, ret;
+ 
+@@ -4819,6 +4823,13 @@ static int nl80211_send_iface(struct sk_
+ 			ret = rdev_get_channel(rdev, wdev, 0, &chandef);
+ 			if (ret == 0 && nl80211_send_chandef(msg, &chandef))
+ 				goto nla_put_failure;
++
++			if (chandef.chan && chandef.chan->band == NL80211_BAND_6GHZ) {
++				if (nla_put_u8(msg, NL80211_ATTR_6G_REG_POWER_MODE,
++					       rdev_get_ap_6ghz_pwr_mode(rdev,
++									 wdev, 0)))
++					goto nla_put_failure;
++			}
+ 		}
+ 		if (rdev->ops->get_tx_power) {
+ 			int dbm, ret;
+@@ -5125,13 +5136,10 @@ static int nl80211_set_interface(struct
+ 		params.use_4addr = -1;
+ 	}
+ 
+-	/* For 6GHz client, userspace could set the client type.
+-	 * Just parse and store the value, no action required immediately.
+-	 */
+ 	if (info->attrs[NL80211_ATTR_6G_REG_POWER_MODE]) {
+-		struct wireless_dev *wdev = dev->ieee80211_ptr;
+-		wdev->reg_6g_power_mode =
+-			nla_get_u8(info->attrs[NL80211_ATTR_6G_REG_POWER_MODE]);
++		/* For 6GHz client, userspace could set the client type.
++		 * Ignore Client type and let the driver select the client type
++		 **/
+ 	}
+ 
+ 	err = nl80211_parse_mon_options(rdev, ntype, info, &params);
+@@ -7274,12 +7282,30 @@ static int nl80211_start_ap(struct sk_bu
+ 		err = nl80211_parse_chandef(rdev, info, &params->chandef, wdev);
+ 		if (err)
+ 			goto out;
++
++		/* 6 GHz Frequency requires 6 GHz power mode */
++		if (params->chandef.chan->band == NL80211_BAND_6GHZ) {
++			if (info->attrs[NL80211_ATTR_6G_REG_POWER_MODE]) {
++				params->he_6ghz_power_type =
++				    nla_get_u8(info->attrs[NL80211_ATTR_6G_REG_POWER_MODE]);
++			} else {
++				err = -EINVAL;
++				goto out;
++			}
++		}
+ 	} else if (wdev->valid_links) {
+ 		/* with MLD need to specify the channel configuration */
+ 		err = -EINVAL;
+ 		goto out;
+ 	} else if (wdev->u.ap.preset_chandef.chan) {
+ 		params->chandef = wdev->u.ap.preset_chandef;
++		params->he_6ghz_power_type = wdev->u.ap.preset_6g_power_mode;
++		/* 6 GHz Frequency requires 6 GHz power mode */
++		if (params->chandef.chan->band == NL80211_BAND_6GHZ &&
++		    params->he_6ghz_power_type == NL80211_REG_NUM_POWER_MODES) {
++			err = -EINVAL;
++			goto out;
++		}
+ 	} else if (!nl80211_get_ap_channel(rdev, params)) {
+ 		err = -EINVAL;
+ 		goto out;
+@@ -7402,6 +7428,8 @@ static int nl80211_start_ap(struct sk_bu
+ 	if (!err) {
+ 		wdev->links[link_id].ap.beacon_interval = params->beacon_interval;
+ 		wdev->links[link_id].ap.chandef = params->chandef;
++		wdev->links[link_id].reg_6g_power_mode =
++		    params->he_6ghz_power_type;
+ 		wdev->u.ap.ssid_len = params->ssid_len;
+ 		memcpy(wdev->u.ap.ssid, params->ssid,
+ 		       params->ssid_len);
+@@ -12055,6 +12083,17 @@ skip_beacons:
+ 	if (err)
+ 		goto free;
+ 
++	/* 6 GHz Frequency requires 6 GHz power mode */
++	if (params.chandef.chan->band == NL80211_BAND_6GHZ) {
++		if (info->attrs[NL80211_ATTR_6G_REG_POWER_MODE]) {
++			params.he_6ghz_power_type =
++			    nla_get_u8(info->attrs[NL80211_ATTR_6G_REG_POWER_MODE]);
++		} else {
++			err = -EINVAL;
++			goto free;
++		}
++	}
++
+ 	if (!cfg80211_reg_can_beacon_relax(&rdev->wiphy, &params.chandef,
+ 					   wdev->iftype)) {
+ 		err = -EINVAL;
+@@ -22729,6 +22768,30 @@ void cfg80211_pmksa_candidate_notify(str
+ }
+ EXPORT_SYMBOL(cfg80211_pmksa_candidate_notify);
+ 
++static int nl80211_send_6ghz_power_mode(struct sk_buff *msg,
++					struct cfg80211_chan_def *chandef,
++					struct cfg80211_registered_device *rdev)
++{
++	u8 power_mode;
++
++	if (chandef->chan->band != NL80211_BAND_6GHZ)
++		return 0;
++
++	power_mode = cfg80211_get_6ghz_power_mode_from_chan(&rdev->wiphy,
++							    chandef->chan);
++	if (power_mode == NL80211_REG_NUM_POWER_MODES)
++		return -1;
++
++	/* Client Power type to AP Power type conversion */
++	if (power_mode > NL80211_REG_AP_VLP)
++		power_mode %= 3;
++
++	if (nla_put_u8(msg, NL80211_ATTR_6G_REG_POWER_MODE, power_mode))
++		return -1;
++
++	return 0;
++}
++
+ static void nl80211_ch_switch_notify(struct cfg80211_registered_device *rdev,
+ 				     struct net_device *netdev,
+ 				     unsigned int link_id,
+@@ -22761,6 +22824,9 @@ static void nl80211_ch_switch_notify(str
+ 	if (nl80211_send_chandef(msg, chandef))
+ 		goto nla_put_failure;
+ 
++	if (nl80211_send_6ghz_power_mode(msg, chandef, rdev))
++		goto nla_put_failure;
++
+ 	if (notif == NL80211_CMD_CH_SWITCH_STARTED_NOTIFY) {
+ 		if (nla_put_u32(msg, NL80211_ATTR_CH_SWITCH_COUNT, count))
+ 			goto nla_put_failure;
+@@ -22806,6 +22872,8 @@ void cfg80211_ch_switch_notify(struct ne
+ 	case NL80211_IFTYPE_AP:
+ 	case NL80211_IFTYPE_P2P_GO:
+ 		wdev->links[link_id].ap.chandef = *chandef;
++		wdev->links[link_id].reg_6g_power_mode =
++		    rdev_get_ap_6ghz_pwr_mode(rdev, wdev, link_id);
+ 		break;
+ 	case NL80211_IFTYPE_ADHOC:
+ 		wdev->u.ibss.chandef = *chandef;
+Index: backports-20250213-6.6.88-9a0dddfb30f1/net/wireless/rdev-ops.h
+===================================================================
+--- backports-20250213-6.6.88-9a0dddfb30f1.orig/net/wireless/rdev-ops.h
++++ backports-20250213-6.6.88-9a0dddfb30f1/net/wireless/rdev-ops.h
+@@ -1150,12 +1150,14 @@ rdev_set_ap_chanwidth(struct cfg80211_re
+ 
+ static inline enum nl80211_regulatory_power_modes
+ rdev_get_ap_6ghz_pwr_mode(struct cfg80211_registered_device *rdev,
+-			  struct wireless_dev *wdev)
++			  struct wireless_dev *wdev,
++			  unsigned int link_id)
+ {
+-	enum nl80211_regulatory_power_modes ret = NL80211_REG_AP_LPI;
+-	trace_rdev_get_ap_6ghz_pwr_mode(wdev);
++	enum nl80211_regulatory_power_modes ret = NL80211_REG_NUM_POWER_MODES;
++
++	trace_rdev_get_ap_6ghz_pwr_mode(wdev, link_id);
+ 	if (rdev->ops->get_ap_6ghz_pwr_mode)
+-		ret = rdev->ops->get_ap_6ghz_pwr_mode(wdev);
++		ret = rdev->ops->get_ap_6ghz_pwr_mode(wdev, link_id);
+ 	trace_rdev_return_enum(&rdev->wiphy, ret);
+ 	return ret;
+ }
+Index: backports-20250213-6.6.88-9a0dddfb30f1/net/wireless/trace.h
+===================================================================
+--- backports-20250213-6.6.88-9a0dddfb30f1.orig/net/wireless/trace.h
++++ backports-20250213-6.6.88-9a0dddfb30f1/net/wireless/trace.h
+@@ -2527,11 +2527,18 @@ TRACE_EVENT(rdev_set_ap_chanwidth,
+ );
+ 
+ TRACE_EVENT(rdev_get_ap_6ghz_pwr_mode,
+-        TP_PROTO(struct wireless_dev *wdev),
+-        TP_ARGS(wdev),
+-        TP_STRUCT__entry(WDEV_ENTRY),
+-        TP_fast_assign(WDEV_ASSIGN),
+-        TP_printk(WDEV_PR_FMT, WDEV_PR_ARG)
++	TP_PROTO(struct wireless_dev *wdev, unsigned int link_id),
++	TP_ARGS(wdev, link_id),
++	TP_STRUCT__entry(
++		WDEV_ENTRY
++		__field(unsigned int, link_id)
++	),
++	TP_fast_assign(
++		WDEV_ASSIGN;
++		__entry->link_id = link_id;
++	),
++	TP_printk(WDEV_PR_FMT ", link:%d",
++		  WDEV_PR_ARG, __entry->link_id)
+ );
+ 
+ TRACE_EVENT(rdev_add_tx_ts,

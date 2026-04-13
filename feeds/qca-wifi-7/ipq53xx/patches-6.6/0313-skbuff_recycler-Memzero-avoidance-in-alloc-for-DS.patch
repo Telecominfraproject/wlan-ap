@@ -1,0 +1,142 @@
+From b9dbce93dae49be8db1e2711795dfc7088c9d483 Mon Sep 17 00:00:00 2001
+From: Nanda Krishnan <quic_nandkris@quicinc.com>
+Date: Tue, 15 Nov 2022 12:18:38 +0530
+Subject: [PATCH 260/500] skbuff_recycler: Memzero avoidance in alloc for DS
+
+Requirement:
+
+In skb recycler, if recyler module allocates the buffers
+already used by DS module to DS, then memzero, shinfo
+reset can be avoided, since the DS packets were not
+processed by SW (host).
+Hence, we will acheive good KPI with less CPU
+utlization.
+
+Fix:
+1) Introduced an API __netdev_alloc_skb_no_skb_reset for DS
+module.
+2) Added reset_skb flag as argument in skb_recycler_alloc
+to identify whether memzero, shinfo reset can be avoided
+or not.
+
+Change-Id: Ib7dc5f49775b6e35ac778ecf75cfecc601cee7b6
+Signed-off-by: Nanda Krishnan <quic_nandkris@quicinc.com>
+---
+ include/linux/skbuff.h |  3 ++
+ net/core/skbuff.c      | 78 ++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 79 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 67b9ef5af8f7..bca38a44fa47 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -3227,6 +3227,9 @@ static inline void *netdev_alloc_frag_align(unsigned int fragsz,
+ struct sk_buff *__netdev_alloc_skb(struct net_device *dev, unsigned int length,
+ 				   gfp_t gfp_mask);
+ 
++struct sk_buff *__netdev_alloc_skb_no_skb_reset(struct net_device *dev, unsigned int length,
++				   gfp_t gfp_mask);
++
+ /**
+  *	netdev_alloc_skb - allocate an skbuff for rx on a specific device
+  *	@dev: network device to receive on
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 44dbc4a52e1b..c862ce372d2a 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -739,9 +739,17 @@ struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
+ 	unsigned int len = length;
+ 
+ #ifdef CONFIG_SKB_RECYCLER
+-	skb = skb_recycler_alloc(dev, length);
+-	if (likely(skb))
++	bool reset_skb = true;
++	skb = skb_recycler_alloc(dev, length, reset_skb);
++	if (likely(skb)) {
++		/* SKBs in the recycler are from various unknown sources.
++		* Their truesize is unknown. We should set truesize
++		* as the needed buffer size before using it.
++		*/
++		skb->truesize = SKB_TRUESIZE(SKB_DATA_ALIGN(len + NET_SKB_PAD));
++		skb->recycled_for_ds = 0;
+ 		return skb;
++	}
+ 
+ 	len = SKB_RECYCLE_SIZE;
+ 	if (unlikely(length > SKB_RECYCLE_SIZE))
+@@ -811,6 +819,72 @@ struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
+ }
+ EXPORT_SYMBOL(__netdev_alloc_skb);
+ 
++#ifdef CONFIG_SKB_RECYCLER
++/* __netdev_alloc_skb_no_skb_reset - allocate an skbuff for rx on a specific device
++ *	@dev: network device to receive on
++ *	@length: length to allocate
++ *	@gfp_mask: get_free_pages mask, passed from wifi driver
++ *
++ *	Allocate a new &sk_buff and assign it a usage count of one. The
++ *	buffer has NET_SKB_PAD headroom built in. Users should allocate
++ *	the headroom they think they need without accounting for the
++ *	built in space. The built in space is used for optimisations.
++ *
++ *	Currently, using __netdev_alloc_skb_no_skb_reset for DS alone
++ *	and it invokes skb_recycler_alloc with reset_skb as false.
++ *	Hence, recycler pool will not do reset_struct when it
++ *	allocates DS used buffer to DS module, which will
++ *	improve the performance
++ *
++ *      %NULL is returned if there is no free memory.
++ */
++struct sk_buff *__netdev_alloc_skb_no_skb_reset(struct net_device *dev,
++						unsigned int length, gfp_t gfp_mask)
++{
++	struct sk_buff *skb;
++	unsigned int len = length;
++	bool reset_skb = false;
++
++	skb = skb_recycler_alloc(dev, length, reset_skb);
++	if (likely(skb)) {
++		/* SKBs in the recycler are from various unknown sources.
++		* Their truesize is unknown. We should set truesize
++		* as the needed buffer size before using it.
++		*/
++		skb->truesize = SKB_TRUESIZE(SKB_DATA_ALIGN(len + NET_SKB_PAD));
++		skb->fast_recycled = 0;
++		return skb;
++	}
++
++	len = SKB_RECYCLE_SIZE;
++	if (unlikely(length > SKB_RECYCLE_SIZE))
++		len = length;
++
++	skb = __alloc_skb(len + NET_SKB_PAD, gfp_mask,
++				SKB_ALLOC_RX, NUMA_NO_NODE);
++	if (!skb)
++		return NULL;
++
++	/* Set truesize as the needed buffer size
++	* rather than the allocated size by __alloc_skb().
++	* */
++	if (length + NET_SKB_PAD < SKB_WITH_OVERHEAD(PAGE_SIZE))
++		skb->truesize = SKB_TRUESIZE(SKB_DATA_ALIGN(length + NET_SKB_PAD));
++
++	skb_reserve(skb, NET_SKB_PAD);
++	skb->dev = dev;
++	return skb;
++}
++EXPORT_SYMBOL(__netdev_alloc_skb_no_skb_reset);
++#else
++struct sk_buff *__netdev_alloc_skb_no_skb_reset(struct net_device *dev,
++						unsigned int length, gfp_t gfp_mask)
++{
++	return __netdev_alloc_skb(dev, length, gfp_mask);
++}
++EXPORT_SYMBOL(__netdev_alloc_skb_no_skb_reset);
++#endif
++
+ /**
+  *	__napi_alloc_skb - allocate skbuff for rx in a specific NAPI instance
+  *	@napi: napi instance this buffer was allocated for
+-- 
+2.34.1
+

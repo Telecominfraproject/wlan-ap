@@ -1,0 +1,233 @@
+From e9c45fea02f4636bda0b5175029802c2f15652ff Mon Sep 17 00:00:00 2001
+From: Amitesh Anand <quic_amitesh@quicinc.com>
+Date: Thu, 18 May 2023 21:11:39 -0700
+Subject: [PATCH 218/500] bridge: Port Hy-Fi bridging hooks
+
+Introduce two new netfilter hooks. The first allows the Hy-Fi bridging
+logic to indicate a different egress port (thereby overriding the FDB).
+The other is used for FDB update notifications and port changes.
+
+Change-Id: I21549968c56e6b60d7d08e19ec4a297b937264bf
+Signed-off-by: Murat Sezgin <msezgin@codeaurora.org>
+
+Pass MAC address to Hy-Fi bridge
+
+- This may be a skb on the forward or reverse direction of the
+  connection
+- Need to pass the dest address as well as the skb to determine if we
+  need to calculate the forward or reverse hash
+
+Change-Id: I245855910ac91f73a9e9e6bd3403f01bc662a93a
+Signed-off-by: Murat Sezgin <msezgin@codeaurora.org>
+
+Pass serial number to Linux bridge port lookup
+
+- This allows the same ECM lookup function to be used in interface
+  hierarchy generation and when updating stats (so no difference in
+  lookup even if the priority field changes)
+- If the priority field changes, will update the H-Active entry and
+  generate a debug log
+
+Change-Id: I392bbc82fab30c345b14e7927b6b0fa119d19a57
+Signed-off-by: Murat Sezgin <msezgin@codeaurora.org>
+Signed-off-by: Murat Sezgin <quic_msezgin@quicinc.com>
+Signed-off-by: Amitesh Anand <quic_amitesh@quicinc.com>
+---
+ include/linux/if_bridge.h | 15 +++++++++++++--
+ net/bridge/br.c           |  4 ++++
+ net/bridge/br_fdb.c       |  2 ++
+ net/bridge/br_if.c        |  6 ++++--
+ net/bridge/br_input.c     | 20 +++++++++++++++++++-
+ net/bridge/br_netlink.c   |  2 ++
+ net/bridge/br_private.h   |  9 +++++++++
+ 7 files changed, 53 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
+index caa532e8290f..df9c7f7700c3 100644
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -75,7 +75,8 @@ int br_ioctl_call(struct net *net, struct net_bridge *br, unsigned int cmd,
+ 
+ extern struct net_device *br_port_dev_get(struct net_device *dev,
+ 					  unsigned char *addr,
+-					  struct sk_buff *skb);
++					  struct sk_buff *skb,
++					  unsigned int cookie);
+ extern void br_refresh_fdb_entry(struct net_device *dev, const char *addr);
+ extern void br_dev_update_stats(struct net_device *dev,
+ 				struct rtnl_link_stats64 *nlstats);
+@@ -227,7 +228,9 @@ static inline clock_t br_get_ageing_time(const struct net_device *br_dev)
+ #endif
+ 
+ typedef struct net_bridge_port *br_port_dev_get_hook_t(struct net_device *dev,
+-		struct sk_buff *skb);
++						       struct sk_buff *skb,
++						       unsigned char *addr,
++						       unsigned int cookie);
+ extern br_port_dev_get_hook_t __rcu *br_port_dev_get_hook;
+ 
+ typedef void (br_notify_hook_t)(int group, int event, const void *ptr);
+@@ -247,4 +250,12 @@ struct br_fdb_event {
+ 
+ extern void br_fdb_register_notify(struct notifier_block *nb);
+ extern void br_fdb_unregister_notify(struct notifier_block *nb);
++
++typedef struct net_bridge_port *br_get_dst_hook_t(
++		const struct net_bridge_port *src,
++		struct sk_buff **skb);
++extern br_get_dst_hook_t __rcu *br_get_dst_hook;
++
++typedef void (br_notify_hook_t)(int group, int event, const void *ptr);
++extern br_notify_hook_t __rcu *br_notify_hook;
+ #endif
+diff --git a/net/bridge/br.c b/net/bridge/br.c
+index a6e94ceb7c9a..0120a36aafcf 100644
+--- a/net/bridge/br.c
++++ b/net/bridge/br.c
+@@ -472,6 +472,10 @@ static void __exit br_deinit(void)
+ 	br_fdb_fini();
+ }
+ 
++/* Hook for bridge event notifications */
++br_notify_hook_t __rcu *br_notify_hook __read_mostly;
++EXPORT_SYMBOL_GPL(br_notify_hook);
++
+ module_init(br_init)
+ module_exit(br_deinit)
+ MODULE_LICENSE("GPL");
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index 8c2fb401c545..fc3e7010d088 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -237,6 +237,8 @@ static void fdb_notify(struct net_bridge *br,
+ 		kfree_skb(skb);
+ 		goto errout;
+ 	}
++
++	__br_notify(RTNLGRP_NEIGH, type, fdb);
+ 	rtnl_notify(skb, net, 0, RTNLGRP_NEIGH, NULL, GFP_ATOMIC);
+ 	return;
+ errout:
+diff --git a/net/bridge/br_if.c b/net/bridge/br_if.c
+index 6e82384ff737..502b04712e91 100644
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@ -794,7 +794,8 @@ EXPORT_SYMBOL_GPL(br_port_flag_is_set);
+  * associated port.
+  */
+ struct net_device *br_port_dev_get(struct net_device *dev, unsigned char *addr,
+-				   struct sk_buff *skb)
++				   struct sk_buff *skb,
++				   unsigned int cookie)
+ {
+ 	struct net_bridge_fdb_entry *fdbe;
+ 	struct net_bridge *br;
+@@ -813,7 +814,8 @@ struct net_device *br_port_dev_get(struct net_device *dev, unsigned char *addr,
+ 		port_dev_get_hook = rcu_dereference(br_port_dev_get_hook);
+ 		if (port_dev_get_hook) {
+ 			struct net_bridge_port *pdst =
+-				__br_get(port_dev_get_hook, NULL, dev, skb);
++				__br_get(port_dev_get_hook, NULL, dev, skb,
++					 addr, cookie);
+ 			if (pdst) {
+ 				dev_hold(pdst->dev);
+ 				netdev = pdst->dev;
+diff --git a/net/bridge/br_input.c b/net/bridge/br_input.c
+index 348a6092a291..9a5339060056 100644
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@ -34,6 +34,10 @@ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
+ br_multicast_handle_hook_t __rcu *br_multicast_handle_hook __read_mostly;
+ EXPORT_SYMBOL_GPL(br_multicast_handle_hook);
+ 
++/* Hook for external forwarding logic */
++br_get_dst_hook_t __rcu *br_get_dst_hook __read_mostly;
++EXPORT_SYMBOL_GPL(br_get_dst_hook);
++
+ int br_pass_frame_up(struct sk_buff *skb)
+ {
+ 	struct net_device *indev, *brdev = BR_INPUT_SKB_CB(skb)->brdev;
+@@ -88,6 +92,8 @@ int br_handle_frame_finish(struct net *net, struct sock *sk, struct sk_buff *skb
+ 	struct net_bridge_vlan *vlan;
+ 	struct net_bridge *br;
+ 	br_multicast_handle_hook_t *multicast_handle_hook;
++	struct net_bridge_port *pdst = NULL;
++	br_get_dst_hook_t *get_dst_hook = rcu_dereference(br_get_dst_hook);
+ 	u16 vid = 0;
+ 	u8 state;
+ 
+@@ -200,7 +206,13 @@ int br_handle_frame_finish(struct net *net, struct sock *sk, struct sk_buff *skb
+ 		}
+ 		break;
+ 	case BR_PKT_UNICAST:
+-		dst = br_fdb_find_rcu(br, eth_hdr(skb)->h_dest, vid);
++		pdst = __br_get(get_dst_hook, NULL, p, &skb);
++		if (pdst) {
++			if (!skb)
++				goto out;
++		} else {
++			dst = br_fdb_find_rcu(br, eth_hdr(skb)->h_dest, vid);
++		}
+ 		break;
+ 	default:
+ 		break;
+@@ -216,12 +228,18 @@ int br_handle_frame_finish(struct net *net, struct sock *sk, struct sk_buff *skb
+ 			dst->used = now;
+ 		br_forward(dst->dst, skb, local_rcv, false);
+ 	} else {
++		if (pdst) {
++			br_forward(pdst, skb, local_rcv, false);
++			goto out1;
++		}
++
+ 		if (!mcast_hit)
+ 			br_flood(br, skb, pkt_type, local_rcv, false, vid);
+ 		else
+ 			br_multicast_flood(mdst, skb, brmctx, local_rcv, false);
+ 	}
+ 
++out1:
+ 	if (local_rcv)
+ 		return br_pass_frame_up(skb);
+ 
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index 8b2a1cdde9d5..36ea6c9be045 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -656,6 +656,8 @@ void br_info_notify(int event, const struct net_bridge *br,
+ 		kfree_skb(skb);
+ 		goto errout;
+ 	}
++
++	__br_notify(RTNLGRP_LINK, event, port);
+ 	rtnl_notify(skb, net, 0, RTNLGRP_LINK, NULL, GFP_ATOMIC);
+ 	return;
+ errout:
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index a760f6ab4c56..19e08c13d111 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -20,6 +20,7 @@
+ #include <linux/rhashtable.h>
+ #include <linux/refcount.h>
+ #include <linux/netfilter.h>
++#include <linux/export.h>
+ 
+ #define BR_HASH_BITS 8
+ #define BR_HASH_SIZE (1 << BR_HASH_BITS)
+@@ -2285,4 +2286,12 @@ bool br_is_neigh_suppress_enabled(const struct net_bridge_port *p, u16 vid);
+ #define __br_get(__hook, __default, __args ...) \
+ 		(__hook ? (__hook(__args)) : (__default))
+ 
++static inline void __br_notify(int group, int type, const void *data)
++{
++	br_notify_hook_t *notify_hook = rcu_dereference(br_notify_hook);
++
++	if (notify_hook)
++		notify_hook(group, type, data);
++}
++
+ #endif
+-- 
+2.34.1
+
