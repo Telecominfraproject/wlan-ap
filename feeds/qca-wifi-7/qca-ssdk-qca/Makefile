@@ -1,4 +1,3 @@
-
 include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
@@ -7,7 +6,7 @@ PKG_SOURCE_PROTO:=git
 PKG_BRANCH:=master
 PKG_RELEASE:=1
 PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/qca-ssdk
-PKG_MIRROR_HASH:=e59418ce9a553d5b765407c9743001aa04f4e1b54205b967bf6f14b6ad30305d
+PKG_MIRROR_HASH:=ee81c6e98b520eb7652d72a72f8d3a3df5f9cf4bdd5504a1711e94b6a752dc3b
 PKG_SOURCE_VERSION:=4a51edc04910792fde91098b6c1a1655e63800b6
 PKG_VERSION:=1.0
 
