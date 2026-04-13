@@ -8,7 +8,7 @@ mconf_LDFLAGS := $(shell ./lxdialog/check-lxdialog.sh -ldflags $(CC))
 mconf: CFLAGS += $(mconf_CFLAGS)
 
 mconf: mconf.o zconf.tab.o $(LXDIALOG)
-	$(CC) -o mconf $^ $(mconf_LDFLAGS)
+	gcc -o mconf $^ $(mconf_LDFLAGS)
 
 .PHONY: clean
 clean:
