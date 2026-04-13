@@ -1,0 +1,274 @@
+From 536e456eb97671a0d1f15e9b6ec34a04e8eab0fd Mon Sep 17 00:00:00 2001
+From: Sowmiya Sree Elavalagan <ssreeela@qti.qualcomm.com>
+Date: Mon, 4 Aug 2025 11:50:47 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL:wifi:hostapd: Add RRB-based roam
+ notification to reduce FT auth delays
+
+When a client roams from a source AP to a target AP and returns to the source with
+FT authentication, the AP first checks if the station is already present in its
+station list. It deletes the station from all associated links in hostapd down to
+the firmware, then creates a new STA entry and sends the authentication reply.
+
+Currently, the authentication reply is delayed by 400–450 ms. The station
+retransmits two additional authentication requests every 200 ms if it does
+not receive a reply. The AP processes all three and sends consecutive
+authentication responses, updating the Anonce each time. However, the STA
+sends a reassociation request using the Anonce from the first response,
+while the AP expects the latest Anonce, resulting in reassociation failure
+due to an invalid FTIE.
+
+This delay has increased following recent design changes after a package upgrade.
+
+To resolve this, introduce a new RRB message that sends a roam notification to
+all APs in the same mobility domain once a station successfully reassociates.
+Upon receiving this notification, other APs delete the station entry if present.
+This ensures that when the STA returns to the original AP, the authentication
+reply is sent immediately, avoiding retries and reassociation failures.
+
+Signed-off-by: Sowmiya Sree Elavalagan <ssreeela@qti.qualcomm.com>
+---
+ src/ap/hostapd.h       |   1 +
+ src/ap/ieee802_11.c    |   5 ++
+ src/ap/wpa_auth.h      |   4 ++
+ src/ap/wpa_auth_ft.c   | 131 +++++++++++++++++++++++++++++++++++++++++
+ src/ap/wpa_auth_glue.c |  10 ++++
+ 5 files changed, 151 insertions(+)
+
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -341,6 +341,7 @@ struct hostapd_data {
+ 	struct eth_p_oui_ctx *oui_push;
+ 	struct eth_p_oui_ctx *oui_sreq;
+ 	struct eth_p_oui_ctx *oui_sresp;
++	struct eth_p_oui_ctx *oui_rnotify;
+ #endif /* CONFIG_IEEE80211R_AP */
+ 
+ 	struct wps_context *wps;
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -7579,8 +7579,13 @@ static void handle_assoc_cb(struct hosta
+ 		ap_sta_set_authorized(hapd, sta, 1);
+ 	}
+ 
+-	if (sta->auth_alg == WLAN_AUTH_FT)
++	if (sta->auth_alg == WLAN_AUTH_FT) {
+ 		sta->ft_re_add = false;
++#ifdef CONFIG_IEEE80211R_AP
++		if (reassoc && !sta->vlan_id)
++			wpa_ft_push_roam_notification(hapd->wpa_auth, sta->addr);
++#endif
++	}
+ 
+ 	if (reassoc)
+ 		mlme_reassociate_indication(hapd, sta);
+--- a/src/ap/wpa_auth.h
++++ b/src/ap/wpa_auth.h
+@@ -51,6 +51,7 @@ struct ft_rrb_frame {
+ #define FT_PACKET_R0KH_R1KH_PUSH 0x03
+ #define FT_PACKET_R0KH_R1KH_SEQ_REQ 0x04
+ #define FT_PACKET_R0KH_R1KH_SEQ_RESP 0x05
++#define FT_PACKET_STATION_ROAM_INDICATION 0x06
+ 
+ /* packet layout
+  *  IEEE 802 extended OUI ethertype frame header
+@@ -590,6 +591,7 @@ int wpa_ft_fetch_pmk_r1(struct wpa_authe
+ 			const u8 **identity, size_t *identity_len,
+ 			const u8 **radius_cui, size_t *radius_cui_len,
+ 			int *session_timeout);
++void wpa_ft_push_roam_notification(struct wpa_authenticator *wpa_auth, const u8 *addr);
+ 
+ #endif /* CONFIG_IEEE80211R_AP */
+ 
+--- a/src/ap/wpa_auth_ft.c
++++ b/src/ap/wpa_auth_ft.c
+@@ -5250,6 +5250,53 @@ out:
+ 	return -1;
+ }
+ 
++static int wpa_ft_rrb_rx_roam_indication(struct wpa_authenticator *wpa_auth,
++					 const u8 *src_addr, const u8 *msg,
++					 size_t msg_len)
++{
++	const u8 *f_s1kh_id;
++	size_t f_s1kh_id_len, min_sz;
++	struct hostapd_data *hapd = wpa_auth->cb_ctx;
++	struct hostapd_data *link_bss;
++	struct sta_info *sta = NULL;
++
++	wpa_printf(MSG_DEBUG, "FT: RRB received STA Roam notification\n");
++	RRB_GET_SRC(msg, FT_RRB_S1KH_ID, s1kh_id, "roam indication", ETH_ALEN);
++
++	min_sz = ETH_ALEN + sizeof(struct ft_rrb_tlv);
++
++	if (msg_len < min_sz) {
++		wpa_printf(MSG_ERROR, "FT: RRB Received invalid roam notification\n");
++		return -1;
++	}
++
++	if (hostapd_is_mld_ap(hapd)) {
++		if (os_memcmp(hapd->own_addr, hapd->mld->mld_addr, ETH_ALEN) != 0)
++			return 0;
++
++		for_each_mld_link(link_bss, hapd) {
++			sta = ap_get_sta(link_bss, f_s1kh_id);
++			if (sta) {
++				hapd = link_bss;
++				break;
++			}
++		}
++	} else {
++		sta = ap_get_sta(hapd, f_s1kh_id);
++	}
++
++	if (!sta)
++		return 0;
++
++	if (ap_sta_is_mld(hapd, sta))
++		ap_sta_remove_link_sta(hapd, sta, 0);
++
++	ap_free_sta(hapd, sta);
++	return 0;
++
++out:
++	return -1;
++}
+ 
+ int wpa_ft_rrb_rx(struct wpa_authenticator *wpa_auth, const u8 *src_addr,
+ 		  const u8 *data, size_t data_len)
+@@ -5434,6 +5481,9 @@ void wpa_ft_rrb_oui_rx(struct wpa_authen
+ 		wpa_ft_rrb_rx_seq_resp(wpa_auth, src_addr, enc, elen, auth,
+ 				       alen, no_defer);
+ 		break;
++	case FT_PACKET_STATION_ROAM_INDICATION:
++		wpa_ft_rrb_rx_roam_indication(wpa_auth, src_addr, auth, alen);
++		break;
+ 	}
+ }
+ 
+@@ -5523,4 +5573,93 @@ void wpa_ft_push_pmk_r1(struct wpa_authe
+ 	}
+ }
+ 
++void wpa_ft_send_roam_notification(struct wpa_authenticator *wpa_auth,
++				   struct ft_remote_r1kh *r1kh, const u8 *addr)
++{
++	u8 *packet;
++	size_t tlv_len;
++	u8 *pos, *endpos;
++	size_t packet_len = 0, pad_len = 0;
++	struct tlv_list push_roam_notify[] = {
++		{ .type = FT_RRB_S1KH_ID, .len = ETH_ALEN,
++		  .data = addr },
++		{ .type = FT_RRB_LAST_EMPTY, .len = 0, .data = NULL },
++	};
++
++	wpa_printf(MSG_DEBUG, "FT: RRB push Roam notification from " MACSTR
++		   " to remote R0KH address " MACSTR,
++		   MAC2STR(wpa_auth->addr), MAC2STR(r1kh->addr));
++
++	tlv_len = wpa_ft_tlv_len(push_roam_notify);
++	packet_len = sizeof(u16) + tlv_len;
++#define RRB_MIN_MSG_LEN 64
++	if (packet_len < RRB_MIN_MSG_LEN) {
++		pad_len = RRB_MIN_MSG_LEN - packet_len;
++		if (pad_len < sizeof(struct ft_rrb_tlv))
++			pad_len = sizeof(struct ft_rrb_tlv);
++		wpa_printf(MSG_DEBUG,
++			   "FT: Pad message to minimum Ethernet frame length (%zu --> %zu)",
++			   packet_len, packet_len + pad_len);
++		packet_len += pad_len;
++	}
++
++	packet = os_zalloc(packet_len);
++	if (!packet) {
++		wpa_printf(MSG_ERROR, "FT: Failed to allocate RRB message");
++		return;
++	}
++
++	pos = packet;
++	WPA_PUT_LE16(pos, tlv_len);
++	pos += 2;
++	endpos = packet + packet_len;
++	pos += wpa_ft_tlv_lin(push_roam_notify, pos, endpos);
++	WPA_PUT_LE16(pos, FT_RRB_LAST_EMPTY);
++	pos += 2;
++	WPA_PUT_LE16(pos, pad_len - sizeof(struct ft_rrb_tlv));
++	pos += 2;
++	os_memset(pos, 0, pad_len - sizeof(struct ft_rrb_tlv));
++	pos = pos + pad_len - sizeof(struct ft_rrb_tlv);
++
++	if (pos != endpos) {
++		wpa_printf(MSG_ERROR, "FT: Length error building RRB");
++		goto err;
++	}
++	wpa_hexdump(MSG_MSGDUMP, "FT: RRB frame payload", packet, packet_len);
++
++	wpa_ft_rrb_oui_send(wpa_auth, r1kh->addr, FT_PACKET_STATION_ROAM_INDICATION,
++			    packet, packet_len);
++err:
++	os_free(packet);
++}
++
++void wpa_ft_push_roam_notification(struct wpa_authenticator *wpa_auth, const u8 *addr)
++{
++	struct ft_remote_r1kh *r1kh;
++	struct hostapd_data *hapd = wpa_auth->cb_ctx;
++	struct hostapd_data *tmp_hapd;
++	bool own_addr;
++
++	for (r1kh = *wpa_auth->conf.r1kh_list; r1kh; r1kh = r1kh->next) {
++		if (is_zero_ether_addr(r1kh->addr) ||
++		    is_zero_ether_addr(r1kh->id))
++			continue;
++
++		own_addr = false;
++		if (hapd->conf->mld_ap) {
++			for_each_mld_link(tmp_hapd, hapd) {
++				if (os_memcmp(r1kh->addr, tmp_hapd->own_addr,
++					      ETH_ALEN) == 0) {
++					own_addr = true;
++					break;
++				}
++			}
++		}
++
++		if (own_addr)
++			continue;
++
++		wpa_ft_send_roam_notification(wpa_auth, r1kh, addr);
++	}
++}
+ #endif /* CONFIG_IEEE80211R_AP */
+--- a/src/ap/wpa_auth_glue.c
++++ b/src/ap/wpa_auth_glue.c
+@@ -927,6 +927,8 @@ static struct eth_p_oui_ctx * hostapd_wp
+ 		return hapd->oui_sreq;
+ 	case FT_PACKET_R0KH_R1KH_SEQ_RESP:
+ 		return hapd->oui_sresp;
++	case FT_PACKET_STATION_ROAM_INDICATION:
++		return hapd->oui_rnotify;
+ #endif /* CONFIG_IEEE80211R_AP */
+ 	default:
+ 		return NULL;
+@@ -1726,6 +1728,12 @@ static int hostapd_wpa_register_ft_oui(s
+ 	if (!hapd->oui_sresp)
+ 		return -1;
+ 
++	hapd->oui_rnotify = eth_p_oui_register(hapd, ft_iface,
++					       FT_PACKET_STATION_ROAM_INDICATION,
++					       hostapd_rrb_oui_receive, hapd);
++	if (!hapd->oui_rnotify)
++		return -1;
++
+ 	return 0;
+ }
+ 
+@@ -1742,6 +1750,8 @@ static void hostapd_wpa_unregister_ft_ou
+ 	hapd->oui_sreq = NULL;
+ 	eth_p_oui_unregister(hapd->oui_sresp);
+ 	hapd->oui_sresp = NULL;
++	eth_p_oui_unregister(hapd->oui_rnotify);
++	hapd->oui_rnotify = NULL;
+ }
+ #endif /* CONFIG_IEEE80211R_AP */
+ 

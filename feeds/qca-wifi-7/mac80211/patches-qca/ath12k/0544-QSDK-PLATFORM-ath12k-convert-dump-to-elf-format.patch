@@ -1,0 +1,331 @@
+From f94089c3a34a3d91a1ea9cb54c9b7c8eb31d9cc7 Mon Sep 17 00:00:00 2001
+From: Narendhar Reddy <nare@qti.qualcomm.com>
+Date: Tue, 16 Sep 2025 23:36:08 +0530
+Subject: [PATCH] QSDK:PLATFORM:ath12k: convert PCI coredump to elf format
+
+Currently PCI soc coredump is in binary format. Parser tool is not able
+to extract the fw binaries.
+Add support to convert PCI coredump to ELF32 format.
+
+Signed-off-by: Narendhar Reddy <nare@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/coredump.c | 222 ++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/coredump.h |  44 +++-
+ 2 files changed, 255 insertions(+), 11 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/coredump.c
++++ b/drivers/net/wireless/ath/ath12k/coredump.c
+@@ -28,6 +28,227 @@ EXPORT_SYMBOL(ath12k_coredump_seg_info);
+ struct ath12k_coredump_info ath12k_coredump_ram_info;
+ EXPORT_SYMBOL(ath12k_coredump_ram_info);
+ 
++static ssize_t ath12k_coredump_pci_read(char *buffer, loff_t offset,
++					size_t count, void *data,
++					size_t header_size)
++{
++	struct ath12k_pci_elf_coredump_state *st = data;
++	size_t bytes_left = count;
++	struct ath12k_dump_segment *seg = NULL;
++	size_t copied = 0;
++	int i;
++	unsigned long data_left;
++	size_t seg_copy_sz, copy_size, hdr_copy;
++	void *addr;
++	loff_t cur;
++
++	/* Copy ELF header first */
++	if (offset < header_size) {
++		hdr_copy = min_t(size_t, bytes_left, header_size - offset);
++		memcpy(buffer, (u8 *)st->elf_hdr + offset, hdr_copy);
++		return hdr_copy;
++	}
++
++	offset -= header_size;
++
++	while (bytes_left) {
++		cur = 0;
++		seg = NULL;
++
++		for (i = 0; i < st->num_chunks; i++) {
++			if (offset < cur + st->chunks[i].len) {
++				seg = &st->chunks[i];
++				break;
++			}
++			cur += st->chunks[i].len;
++		}
++		if (!seg)
++			break;
++
++		data_left = offset - cur;
++		seg_copy_sz = seg->len - data_left;
++		copy_size = min_t(size_t, bytes_left, seg_copy_sz);
++		addr = (u8 *)seg->vaddr + data_left;
++
++		if (data_left + copy_size <= seg->len) {
++			memcpy_fromio(buffer, addr, copy_size);
++		} else {
++			ath12k_warn(st->ab, "Buffer copy would exceed segment bounds\n");
++			break;
++		}
++
++		offset     += copy_size;
++		buffer     += copy_size;
++		bytes_left -= copy_size;
++		copied     += copy_size;
++	}
++
++	return copied;
++}
++
++static void ath12k_coredump_pci_free(void *data)
++{
++	struct ath12k_pci_elf_coredump_state *st = data;
++
++	complete(&st->dump_done);
++}
++
++static int ath12k_coredump_build_dump_info(struct ath12k_base *ab,
++					struct ath12k_dump_segment *segments,
++					u32 num_seg,
++					struct ath12k_dump_segment **chunks_out,
++					u32 *num_chunks)
++{
++	struct ath12k_dump_entry tmp[ATH12K_MAX_DUMP_ENTRIES] = {0};
++	int i, type, num_dump_types = 0;
++	struct ath12k_dump_segment *chunks;
++	struct ath12k_pci_dump_file_data *df;
++	struct ath12k_dump_entry *entry;
++	void *data;
++	size_t data_len;
++
++	for (i = 0; i < num_seg; i++) {
++		type = segments[i].type;
++		if (type < 0 || type >= ATH12K_MAX_DUMP_ENTRIES)
++			continue;
++
++		if (tmp[type].entry_num == 0)
++			tmp[type].entry_start = i + 1;
++		tmp[type].type = type;
++		tmp[type].entry_num++;
++	}
++
++	/* to find the number of dump types */
++	for (i = 0; i < ATH12K_MAX_DUMP_ENTRIES; i++)
++		if (tmp[i].entry_num)
++			num_dump_types++;
++
++	data_len = ALIGN(sizeof(struct ath12k_pci_dump_file_data) +
++			num_dump_types * sizeof(struct ath12k_dump_entry), 4);
++	data = kzalloc(data_len, GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	df = data;
++	df->magic = ATH12K_RAMDUMP_MAGIC;
++	df->version = ATH12K_FW_CRASH_DUMP_V2;
++	df->chipset = ((struct ath12k_pci *)ab->drv_priv)->dev_id;
++	df->total_entries = num_dump_types;
++
++	entry = df->entry;
++	for (i = 0; i < ATH12K_MAX_DUMP_ENTRIES; i++) {
++		if (tmp[i].entry_num) {
++			*entry = tmp[i];
++			entry++;
++		}
++	}
++
++	chunks = kcalloc(1 + num_seg, sizeof(*chunks), GFP_KERNEL);
++	if (!chunks) {
++		kfree(data);
++		return -ENOMEM;
++	}
++
++	chunks[0].addr  = 0;
++	chunks[0].vaddr = data;
++	chunks[0].len   = data_len;
++	chunks[0].type  = 0xFFFFFFFF;
++
++	for (i = 0; i < num_seg; i++)
++		chunks[1 + i] = segments[i];
++
++	*chunks_out     = chunks;
++	*num_chunks = 1 + num_seg;
++	return 0;
++}
++
++static int ath12k_coredump_build_elf32(struct ath12k_base *ab,
++					struct ath12k_dump_segment *segments,
++					u32 num_seg,
++					struct ath12k_pci_elf_coredump_state **out_state)
++{
++	struct ath12k_pci_elf_coredump_state *st;
++	Elf32_Ehdr *ehdr;
++	Elf32_Phdr *phdr;
++	void *elf_hdr;
++	struct ath12k_dump_segment *chunks;
++	u32 num_chunks;
++	u16 phnum;
++	u32 elf_hdr_sz, cur_off, i, paddr32;
++	int ret;
++
++	ret = ath12k_coredump_build_dump_info(ab, segments,
++						  num_seg, &chunks, &num_chunks);
++	if (ret)
++		return ret;
++
++	phnum = num_chunks;
++	elf_hdr_sz = sizeof(Elf32_Ehdr) + phnum * sizeof(Elf32_Phdr);
++
++	elf_hdr = vzalloc(elf_hdr_sz);
++	if (!elf_hdr) {
++		kfree(chunks[0].vaddr);
++		kfree(chunks);
++		return -ENOMEM;
++	}
++
++	/* ELF header */
++	ehdr = (Elf32_Ehdr *)elf_hdr;
++	memcpy(ehdr->e_ident, ELFMAG, SELFMAG);
++	ehdr->e_ident[EI_CLASS] = ELFCLASS32;
++	ehdr->e_ident[EI_DATA] = ELFDATA2LSB;
++	ehdr->e_ident[EI_VERSION] = EV_CURRENT;
++	ehdr->e_ident[EI_OSABI] = ELFOSABI_NONE;
++	ehdr->e_type = cpu_to_le16(ET_CORE);
++	ehdr->e_machine = cpu_to_le16(EM_NONE);
++	ehdr->e_version = cpu_to_le32(EV_CURRENT);
++	ehdr->e_entry = cpu_to_le32(0);
++	ehdr->e_phoff = cpu_to_le32(sizeof(Elf32_Ehdr));
++	ehdr->e_shoff = cpu_to_le32(0);
++	ehdr->e_flags = cpu_to_le32(0);
++	ehdr->e_ehsize = cpu_to_le16(sizeof(Elf32_Ehdr));
++	ehdr->e_phentsize = cpu_to_le16(sizeof(Elf32_Phdr));
++	ehdr->e_phnum = cpu_to_le16(phnum);
++	ehdr->e_shentsize = cpu_to_le16(0);
++	ehdr->e_shnum = cpu_to_le16(0);
++	ehdr->e_shstrndx = cpu_to_le16(0);
++
++	/* Program headers */
++	phdr = (Elf32_Phdr *)((u8 *)elf_hdr + sizeof(Elf32_Ehdr));
++	cur_off = elf_hdr_sz;
++
++	for (i = 0; i < phnum; i++) {
++		paddr32 = (i == 0) ? 0 : (u32)chunks[i].addr;
++		phdr[i].p_type   = cpu_to_le32(PT_LOAD);
++		phdr[i].p_offset = cpu_to_le32(cur_off);
++		phdr[i].p_vaddr  = cpu_to_le32(paddr32);
++		phdr[i].p_paddr  = cpu_to_le32(paddr32);
++		phdr[i].p_filesz = cpu_to_le32(chunks[i].len);
++		phdr[i].p_memsz  = cpu_to_le32(chunks[i].len);
++		phdr[i].p_flags  = cpu_to_le32(PF_R | PF_W | PF_X);
++		phdr[i].p_align  = cpu_to_le32(0);
++		cur_off += chunks[i].len;
++	}
++
++	st = kzalloc(sizeof(*st), GFP_KERNEL);
++	if (!st) {
++		vfree(elf_hdr);
++		kfree(chunks[0].vaddr);
++		kfree(chunks);
++		return -ENOMEM;
++	}
++
++	st->ab         = ab;
++	st->elf_hdr    = elf_hdr;
++	st->elf_hdr_sz = elf_hdr_sz;
++	st->chunks     = chunks;
++	st->num_chunks = phnum;
++
++	init_completion(&st->dump_done);
++	*out_state = st;
++	return 0;
++}
++
+ static void *ath12k_coredump_find_segment(loff_t user_offset,
+                                          struct ath12k_dump_segment *segment,
+                                          int num_seg, size_t *data_left)
+@@ -468,11 +689,27 @@ void ath12k_coredump_download_rddm(struc
+ 		ath12k_core_issue_bug_on(ab);
+ 
+ 	} else if (!ab->in_panic) {
+-		ath12k_info(ab, "WLAN target is restarting");
+-		ath12k_coredump_build_inline(ab, segment, num_seg);
++		struct ath12k_pci_elf_coredump_state *st = NULL;
++		int ret;
++
++		ath12k_info(ab, "WLAN target is restarting\n");
++
++		ret = ath12k_coredump_build_elf32(ab, segment, num_seg, &st);
++
++		if (ret) {
++			ath12k_err(ab, "ELF32 build failed: %d\n", ret);
++			kfree(segment);
++			return;
++		}
++		dev_coredumpm(ab->dev, THIS_MODULE, st, st->elf_hdr_sz, GFP_KERNEL,
++				ath12k_coredump_pci_read, ath12k_coredump_pci_free);
++		wait_for_completion(&st->dump_done);
++		vfree(st->elf_hdr);
++		kfree(st->chunks[0].vaddr);
++		kfree(st->chunks);
++		kfree(st);
+ 		kfree(segment);
+ 	}
+-
+ }
+ 
+ #ifdef CPTCFG_ATH12K_COREDUMP
+--- a/drivers/net/wireless/ath/ath12k/coredump.h
++++ b/drivers/net/wireless/ath/ath12k/coredump.h
+@@ -32,15 +32,33 @@ enum ath12k_fw_crash_dump_type {
+ };
+ 
+ #define COREDUMP_TLV_HDR_SIZE 8
++#define ATH12K_RAMDUMP_MAGIC    0x574C414E  /* 'WLAN' */
++#define ATH12K_MAX_DUMP_ENTRIES FW_CRASH_DUMP_TYPE_MAX
+ 
+-struct ath12k_elf_coredump_state {
++struct ath12k_dump_entry {
++	u32 type;
++	u32 entry_start;
++	u32 entry_num;
++} __packed;
++
++struct ath12k_pci_dump_file_data {
++	u32 magic;
++	u32 version;
++	u32 chipset;
++	u32 total_entries;
++	struct ath12k_dump_entry entry[];
++} __packed;
++
++struct ath12k_pci_elf_coredump_state {
+ 	struct ath12k_base *ab;
+-	void *header;
+-	struct ath12k_ahb_dump_segment *segments;
++	void *elf_hdr;
++	u32   elf_hdr_sz;
++	struct ath12k_dump_segment *chunks;
++	u32   num_chunks;
+ 	struct completion dump_done;
+-	u32 num_seg;
+ };
+ 
++
+ struct ath12k_dump_segment {
+        unsigned long addr;
+        void *vaddr;
+@@ -49,6 +67,14 @@ struct ath12k_dump_segment {
+ 	   struct completion dump_done;
+ };
+ 
++struct ath12k_elf_coredump_state {
++	struct ath12k_base *ab;
++	void *header;
++	struct ath12k_ahb_dump_segment *segments;
++	struct completion dump_done;
++	u32 num_seg;
++};
++
+ struct ath12k_ahb_dump_segment {
+ 	unsigned long addr;
+ 	unsigned int len;

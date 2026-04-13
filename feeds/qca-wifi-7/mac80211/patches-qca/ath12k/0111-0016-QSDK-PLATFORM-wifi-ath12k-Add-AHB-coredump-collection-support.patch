@@ -1,0 +1,358 @@
+From d753d32da63201cf9da88e8f1fab5e38e61d46d6 Mon Sep 17 00:00:00 2001
+From: Sowmiya Sree Elavalagan <quic_ssreeela@quicinc.com>
+Date: Wed, 16 Oct 2024 16:09:05 +0530
+Subject: [PATCH] wifi: ath12k: Add AHB coredump collection support
+
+Snapshot of memory region during crash is required to debug the reason
+for crash. Collect dumps of various segments define in DTS as dump-region.
+Also collect the dump of userPD firmware region. Dump should be collected
+in ELF 32bit format. 
+
+First physical, virtual address along with size is computed for various
+segments and then ELF header is framed with this information. Dump is
+uploaded to user space with help of devcoredump framework.
+
+The dev_coredumpm has a callback registered, which would be invoked on
+trying to copy the data. All the information including physical address,
+virtual address and size are stored in array of struct. ELF header is
+formed with this information and same is received in the callback.
+Header is first copied and then various segments are dumped one after
+the other. Segment to be copied is calculated based on the sizes of the
+segments and total bytes already copied.
+
+Signed-off-by: Sowmiya Sree Elavalagan <quic_ssreeela@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c     |   2 +-
+ drivers/net/wireless/ath/ath12k/coredump.c | 252 +++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/coredump.h |  21 ++
+ 3 files changed, 274 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/wireless/ath/ath12k/coredump.c
++++ b/drivers/net/wireless/ath/ath12k/coredump.c
+@@ -438,3 +438,263 @@ void ath12k_coredump_collect(struct ath1
+ 	ath12k_hif_coredump_download(ab);
+ }
+ #endif
++
++#define ELFCLASS32     1
++#define EM_NONE                0
++#define ET_CORE        4
++#define EV_CURRENT     1
++
++static void *ath12k_coredump_find_ahb_segment(loff_t user_offset,
++                                              struct ath12k_ahb_dump_segment *segment,
++                                              int num_seg, unsigned long *data_left)
++{
++        int i;
++
++        for (i = 0; i < num_seg; i++, segment++) {
++                if (user_offset < segment->len) {
++                        *data_left = user_offset;
++                        return segment;
++                }
++                user_offset -= segment->len;
++        }
++
++        *data_left = 0;
++        return NULL;
++}
++
++static ssize_t ath12k_userpd_coredump_read(char *buffer, loff_t offset, size_t count,
++                                           void *data, size_t header_size)
++{
++        struct ath12k_elf_coredump_state *dump_state = data;
++        struct ath12k_ahb_dump_segment *segments = dump_state->segments;
++        struct ath12k_ahb_dump_segment *seg;
++        void *elfcore = dump_state->header;
++        size_t copy_size, bytes_left = count;
++        void *addr;
++        unsigned long data_left, seg_copy_sz;
++
++       /* Copy the header first */
++        if (offset < header_size) {
++                memcpy(buffer, elfcore, header_size);
++                offset += header_size;
++                bytes_left -= header_size;
++                buffer += header_size;
++                return header_size;
++        }
++
++        while (bytes_left) {
++                seg = ath12k_coredump_find_ahb_segment(offset - header_size, segments,
++                                                       dump_state->num_seg, &data_left);
++                if (!seg) {
++                        pr_info("Ramdump complete %lld bytes read\n", offset);
++                        return 0;
++                }
++
++                seg_copy_sz = seg->len - data_left;
++                if (seg_copy_sz)
++                        copy_size = min_t(size_t, bytes_left, seg_copy_sz);
++                else
++                        copy_size = bytes_left;
++
++                addr = seg->vaddr;
++                addr += data_left;
++                memcpy_fromio(buffer, addr, copy_size);
++                offset += copy_size;
++                buffer += copy_size;
++                bytes_left -= copy_size;
++        }
++
++        return count - bytes_left;
++}
++
++static void ath12k_userpd_coredump_free(void *data)
++{
++        struct ath12k_elf_coredump_state *elf_dump_state = data;
++
++        complete(&elf_dump_state->dump_done);
++}
++
++static void ath12k_coredump_free_seg_info(struct ath12k_base *ab, void *segment,
++                     int num_phdr)
++{
++        struct ath12k_ahb_dump_segment *seg_info = segment;
++        int index;
++
++        if (!seg_info)
++                return;
++
++        for (index = 0; index < num_phdr - 1; index++) {
++                if (seg_info && seg_info->vaddr)
++                        devm_iounmap(ab->dev, seg_info->vaddr);
++                seg_info++;
++        }
++}
++
++static int ath12k_coredump_build_seg_info(struct ath12k_base *ab, void *segment,
++                                          int num_phdr, int *bootaddr)
++{
++        struct ath12k_ahb_dump_segment *seg_info = segment;
++        struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++        int index, ret = 0;
++        ssize_t offset;
++        struct reserved_mem *rmem;
++        struct device_node *mem_regions;
++        struct elf32_phdr *phdrs;
++        struct elf32_phdr *phdr;
++        struct elf32_hdr *ehdr;
++        const struct firmware *fw;
++        char fw_name[ATH12K_USERPD_FW_NAME_LEN];
++
++        /* First dump various region from reserved memory */
++        for (index = 0; index < num_phdr - 1; index++) {
++                mem_regions = of_parse_phandle(ab->dev->of_node, "dump-region", index);
++                if (!mem_regions) {
++                        ath12k_warn(ab, "Memory region not defined to collect dump\n");
++                        return -EINVAL;
++                }
++
++                rmem = of_reserved_mem_lookup(mem_regions);
++                if (!rmem) {
++                        of_node_put(mem_regions);
++                        return -EINVAL;
++                }
++
++                seg_info->len = rmem->size;
++                seg_info->addr = rmem->base;
++                seg_info->hdr_vaddr = (void *)rmem->base;
++                seg_info->vaddr = devm_ioremap_wc(ab->dev, rmem->base, rmem->size);
++                seg_info++;
++                of_node_put(mem_regions);
++        }
++
++        snprintf(fw_name, sizeof(fw_name), "%s/%s/%s%d%s", ATH12K_FW_DIR,
++                 ab->hw_params->fw.dir, ATH12K_AHB_FW_PREFIX, ab_ahb->userpd_id,
++                 ATH12K_AHB_FW_SUFFIX);
++
++        ret = request_firmware(&fw, fw_name, ab->dev);
++        if (ret < 0) {
++                ath12k_err(ab, "request_firmware failed\n");
++                return ret;
++        }
++
++        ehdr = (struct elf32_hdr *)fw->data;
++        *bootaddr = ehdr->e_entry;
++        phdrs = (struct elf32_phdr *)(ehdr + 1);
++
++        for (index = 0; index < ehdr->e_phnum; index++) {
++                phdr = &phdrs[index];
++
++                if (!mdt_phdr_valid(phdr))
++                        continue;
++
++                offset = phdr->p_paddr - ab_ahb->mem_phys;
++                if (offset < 0 || offset + phdr->p_memsz > ab_ahb->mem_size) {
++                        ath12k_err(ab, "segment outside memory range\n");
++                        ret = -EINVAL;
++                        goto end;
++                }
++
++                seg_info->addr = ab_ahb->mem_phys + offset;
++                seg_info->hdr_vaddr = (void *)(uintptr_t)phdr->p_vaddr;
++                seg_info->vaddr = ab_ahb->mem_region + offset;
++                seg_info->len = phdr->p_memsz;
++        }
++end:
++        /* request_firmware is used to read the headers which has
++         * the start address this is used form the dump headers.
++         * however these address are not used for reading the
++         * coredump contents */
++
++        release_firmware(fw);
++        return ret;
++}
++
++void ath12k_coredump_ahb_collect(struct ath12k_base *ab)
++{
++        struct ath12k_elf_coredump_state elf_dump_state;
++        Elf32_Ehdr *ehdr;
++        Elf32_Phdr *phdr;
++        u8 class = ELFCLASS32;
++        struct ath12k_ahb_dump_segment *segment, *seg_info;
++        size_t data_size, offset, seg_info_len;
++        void *data;
++        struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++        int num_segs = 0, ret, index, phnum = 0;
++        u32 bootaddr;
++
++        num_segs = of_count_phandle_with_args(ab->dev->of_node, "dump-region", NULL);
++        if (num_segs <= 0) {
++                ath12k_warn(ab, "UserPD %d dump regions not defined\n", ab_ahb->userpd_id);
++                return;
++        }
++
++        phnum = num_segs;
++        /* Add one more segment to dump UPD FW info */
++        phnum++;
++
++        seg_info_len = phnum * sizeof(*segment);
++        segment = kzalloc(seg_info_len, GFP_NOWAIT);
++        if (!segment) {
++                ath12k_warn(ab, "Memory unavailable\n");
++                return;
++        }
++
++        ret = ath12k_coredump_build_seg_info(ab, segment, phnum, &bootaddr);
++        if (ret) {
++                ath12k_err(ab, "Failed to build segment info - %d\n", ret);
++                goto end;
++        }
++
++        data_size = sizeof(*ehdr);
++        data_size += phnum * sizeof(*phdr);
++        data = vzalloc(data_size);
++        if (!data)
++                goto end;
++
++        ehdr = (Elf32_Ehdr *)data;
++        memcpy(ehdr->e_ident, ELFMAG, SELFMAG);
++        ehdr->e_ident[EI_CLASS] = class;
++        ehdr->e_ident[EI_DATA] = ELFDATA2LSB;
++        ehdr->e_ident[EI_VERSION] = EV_CURRENT;
++        ehdr->e_ident[EI_OSABI] = ELFOSABI_NONE;
++        ehdr->e_type = ET_CORE;
++        ehdr->e_machine = EM_NONE;
++        ehdr->e_version = EV_CURRENT;
++        ehdr->e_entry = bootaddr;
++        ehdr->e_phoff = sizeof(*ehdr);
++        ehdr->e_ehsize = sizeof(*ehdr);
++        ehdr->e_phentsize = sizeof(*phdr);
++        ehdr->e_phnum = phnum;
++
++        phdr = (Elf32_Phdr *)(data + sizeof(*ehdr));
++        offset = sizeof(*ehdr);
++        offset += sizeof(*phdr) * phnum;
++        seg_info = segment;
++        for (index = 0; index < phnum; index++, seg_info++) {
++                phdr->p_type = PT_LOAD;
++                phdr->p_offset = offset;
++                phdr->p_vaddr = (intptr_t)seg_info->hdr_vaddr;
++                phdr->p_paddr = seg_info->addr;
++                phdr->p_filesz = seg_info->len;
++                phdr->p_memsz = seg_info->len;
++                phdr->p_flags = PF_R | PF_W | PF_X;
++                phdr->p_align = 0;
++                offset += phdr->p_filesz;
++                phdr++;
++        }
++
++        elf_dump_state.header = data;
++        elf_dump_state.num_seg = phnum;
++        elf_dump_state.ab =  ab;
++        elf_dump_state.segments = segment;
++        init_completion(&elf_dump_state.dump_done);
++
++        dev_coredumpm(ab->dev, THIS_MODULE, &elf_dump_state, data_size, GFP_KERNEL,
++                      ath12k_userpd_coredump_read, ath12k_userpd_coredump_free);
++
++        wait_for_completion(&elf_dump_state.dump_done);
++        vfree(elf_dump_state.header);
++end:
++        ath12k_coredump_free_seg_info(ab, segment, phnum);
++        kfree(segment);
++}
+--- a/drivers/net/wireless/ath/ath12k/coredump.h
++++ b/drivers/net/wireless/ath/ath12k/coredump.h
+@@ -33,6 +33,14 @@ enum ath12k_fw_crash_dump_type {
+ 
+ #define COREDUMP_TLV_HDR_SIZE 8
+ 
++struct ath12k_elf_coredump_state {
++	struct ath12k_base *ab;
++	void *header;
++	struct ath12k_ahb_dump_segment *segments;
++	struct completion dump_done;
++	u32 num_seg;
++};
++
+ struct ath12k_dump_segment {
+        unsigned long addr;
+        void *vaddr;
+@@ -40,6 +48,13 @@ struct ath12k_dump_segment {
+        unsigned int type;
+ };
+ 
++struct ath12k_ahb_dump_segment {
++	unsigned long addr;
++	unsigned int len;
++	void *hdr_vaddr;
++	void *vaddr;
++};
++
+ struct ath12k_dump_file_data {
+        /* "ATH12K-FW-DUMP" */
+        char df_magic[16];
+@@ -95,6 +110,7 @@ struct ath12k_coredump_info {
+ void ath12k_coredump_download_rddm(struct ath12k_base *ab);
+ void ath12k_coredump_build_inline(struct ath12k_base *ab,
+                                  struct ath12k_dump_segment *segments, int num_seg);
++void ath12k_coredump_ahb_collect(struct ath12k_base *ab);
+ #else
+ static inline void ath12k_coredump_download_rddm(struct ath12k_base *ab)
+ {
+@@ -105,6 +121,10 @@ static inline void ath12k_coredump_build
+                                                int num_seg)
+ {
+ }
++
++static inline void ath12k_coredump_ahb_collect(struct ath12k_base *ab)
++{
++}
+ #endif
+ struct ath12k_tlv_dump_data {
+ 	/* see ath11k_fw_crash_dump_type above */
+--- a/drivers/net/wireless/ath/ath12k/ahb.h
++++ b/drivers/net/wireless/ath/ath12k/ahb.h
+@@ -74,6 +74,10 @@ struct ath12k_ahb {
+ 	bool scm_auth_enabled;
+ 	const struct ath12k_ahb_ops *ahb_ops;
+ 	const struct ath12k_ahb_device_family_ops *device_ops;
++	phys_addr_t mem_phys;
++	size_t mem_size;
++	void *mem_region;
++	void *rpd_notifier;
+ };
+ 
+ struct ath12k_ahb_driver {

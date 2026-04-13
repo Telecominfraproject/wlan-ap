@@ -1,0 +1,153 @@
+From c37c3f34bbeea914cacf440135a4cc0853983b73 Mon Sep 17 00:00:00 2001
+From: Ramya Gnanasekar <quic_rgnanase@quicinc.com>
+Date: Fri, 25 Oct 2024 16:09:27 +0530
+Subject: [PATCH] UPSTREAM:CP:wifi:ath12k:Add status parsing in peer assoc conf
+ ev
+
+Firmware crash is seen due to ml_peer_id reuse. The sequence of events
+is as follows:
+1. Peer X associates to AP
+2. X gets disassociated due to some reason and host sends peer delete
+   WMI to the firmware
+3. Firmware flags the peer X for deletion but doesnot complete the
+   delete and doesnot reply back to host with peer unmap
+4. When host timeouts due to peer unmap not received cleans the peer
+   from driver hereby freeing the ml_peer_id allocated.
+5. Current logic in driver is to allocate ml_peer_id which is free and
+   when new peer Y associates, ml_peer_id which was just freed in #4.
+6. When firmware receives peer assoc WMI with duplicate ml_peer_id
+   firmware asserts.
+
+As a stop gap solution, status field in peer assoc confirmation event is
+used to send the status of peer assoc in such cases of ml_peer_id
+duplication. Status will be sent as 0 in success case and 1 in failure
+case. When failure is seen from firmware, peer assoc failure will be
+reported to mac80211 subsequently denying the client assocation with
+code 17 and sending peer delete to firmware when state changes from 1 to
+0.
+
+Patch-dependency: None
+Patch-work: None
+
+Signed-off-by: Ramya Gnanasekar <quic_rgnanase@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c  | 19 +++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/peer.h |  1 +
+ drivers/net/wireless/ath/ath12k/wmi.c  | 14 ++++++++++++--
+ drivers/net/wireless/ath/ath12k/wmi.h  |  2 ++
+ 4 files changed, 34 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -3944,6 +3944,15 @@ static void ath12k_bss_assoc(struct ath1
+ 		return;
+ 	}
+ 
++	spin_lock_bh(&dp->dp_lock);
++	peer = ath12k_dp_link_peer_find_by_vdev_id_and_addr(dp, arvif->vdev_id, arsta->addr);
++	if (peer && !peer->assoc_success) {
++		ath12k_warn(ar->ab, "peer assoc failure in firmware %pM\n", arsta->addr);
++		spin_unlock_bh(&dp->dp_lock);
++		return;
++	}
++	spin_unlock_bh(&dp->dp_lock);
++
+ 	ret = ath12k_setup_peer_smps(ar, arvif, bss_conf->bssid,
+ 				     &link_sta->ht_cap, &link_sta->he_6ghz_capa);
+ 	if (ret) {
+@@ -6504,6 +6513,8 @@ static int ath12k_mac_station_assoc(stru
+ 	struct cfg80211_chan_def def;
+ 	enum nl80211_band band;
+ 	struct cfg80211_bitrate_mask *mask;
++	struct ath12k_dp_link_peer *peer;
++	struct ath12k_dp *dp = ath12k_ab_to_dp(ar->ab);
+ 	u8 num_vht_rates, num_he_rates, num_ht_rates, num_eht_rates;
+ 	u8 link_id = arvif->link_id;
+ 
+@@ -6544,6 +6555,15 @@ static int ath12k_mac_station_assoc(stru
+ 		return -ETIMEDOUT;
+ 	}
+ 
++	spin_lock_bh(&dp->dp_lock);
++	peer = ath12k_dp_link_peer_find_by_vdev_id_and_addr(dp, arsta->arvif->vdev_id, arsta->addr);
++	if (!reassoc && peer && !peer->assoc_success) {
++		ath12k_warn(ar->ab, "peer assoc failure from firmware %pM\n", arsta->addr);
++		spin_unlock_bh(&dp->dp_lock);
++		return -EINVAL;
++	}
++	spin_unlock_bh(&dp->dp_lock);
++
+ 	num_vht_rates = ath12k_mac_bitrate_mask_num_vht_rates(ar, band, mask);
+ 	num_he_rates = ath12k_mac_bitrate_mask_num_he_rates(ar, band, mask);
+ 	num_ht_rates = ath12k_mac_bitrate_mask_num_ht_rates(ar, band, mask);
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -6751,6 +6751,7 @@ static int ath12k_pull_peer_assoc_conf_e
+ 
+ 	peer_assoc_conf->vdev_id = le32_to_cpu(ev->vdev_id);
+ 	peer_assoc_conf->macaddr = ev->peer_macaddr.addr;
++	peer_assoc_conf->status = le32_to_cpu(ev->status);
+ 
+ 	kfree(tb);
+ 	return 0;
+@@ -7797,6 +7798,8 @@ static int ath12k_service_available_even
+ static void ath12k_peer_assoc_conf_event(struct ath12k_base *ab, struct sk_buff *skb)
+ {
+ 	struct wmi_peer_assoc_conf_arg peer_assoc_conf = {0};
++	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
++	struct ath12k_dp_link_peer *peer;
+ 	struct ath12k *ar;
+ 
+ 	if (ath12k_pull_peer_assoc_conf_ev(ab, skb, &peer_assoc_conf) != 0) {
+@@ -7805,8 +7808,9 @@ static void ath12k_peer_assoc_conf_event
+ 	}
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_WMI,
+-		   "peer assoc conf ev vdev id %d macaddr %pM\n",
+-		   peer_assoc_conf.vdev_id, peer_assoc_conf.macaddr);
++		   "peer assoc conf ev vdev id %d macaddr %pM status:%d\n",
++		   peer_assoc_conf.vdev_id, peer_assoc_conf.macaddr,
++		   peer_assoc_conf.status);
+ 
+ 	rcu_read_lock();
+ 	ar = ath12k_mac_get_ar_by_vdev_id(ab, peer_assoc_conf.vdev_id);
+@@ -7818,6 +7822,13 @@ static void ath12k_peer_assoc_conf_event
+ 		return;
+ 	}
+ 
++	spin_lock_bh(&dp->dp_lock);
++	peer =  ath12k_dp_link_peer_find_by_vdev_id_and_addr(dp, peer_assoc_conf.vdev_id,
++							     peer_assoc_conf.macaddr);
++	if (peer && !peer_assoc_conf.status)
++		peer->assoc_success = true;
++	spin_unlock_bh(&dp->dp_lock);
++
+ 	complete(&ar->peer_assoc_done);
+ 	rcu_read_unlock();
+ }
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -4560,11 +4560,13 @@ struct wmi_vdev_install_key_complete_arg
+ struct wmi_peer_assoc_conf_event {
+ 	__le32 vdev_id;
+ 	struct ath12k_wmi_mac_addr_params peer_macaddr;
++	__le32 status;
+ } __packed;
+ 
+ struct wmi_peer_assoc_conf_arg {
+ 	u32 vdev_id;
+ 	const u8 *macaddr;
++	u32 status; /* 0 - Pass; 1 - Failure */
+ };
+ 
+ struct wmi_fils_discovery_event {
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.h
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.h
+@@ -115,6 +115,7 @@ struct ath12k_dp_link_peer {
+ 	struct ath12k_dp_peer_stats peer_stats;
+ 
+ 	u16 tcl_metadata;
++	bool assoc_success; /* information on peer assoc status from firmware */
+ };
+ 
+ struct ath12k_dp_peer {

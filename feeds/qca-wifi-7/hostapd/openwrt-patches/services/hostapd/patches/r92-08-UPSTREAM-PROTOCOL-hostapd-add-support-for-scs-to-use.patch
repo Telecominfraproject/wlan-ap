@@ -1,0 +1,630 @@
+From 56fc5aa70304109301b1192475f4fcd10ed0e102 Mon Sep 17 00:00:00 2001
+From: Hari Chandrakanthan <haric@qti.qualcomm.com>
+Date: Tue, 22 Jul 2025 23:49:52 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL:hostapd: add support for scs to use nft
+
+Add support to create/delete nft rules during scs add/delete.
+
+Patch-dependency:
+r92-01-UPSTREAM-PROTOCOL-CP-HOSTAPD-Register-to-receive-SCS-frame.patch
+r92-02-UPSTREAM-PROTOCOL-HOSTAPD-Add-Robust-AV-Streaming-and-SCS-Capability.patch
+r92-03-UPSTREAM-PROTOCOL-CP-HOSTAPD-Add-SCS-data-structs-and-sta-info-fields.patch
+r92-04-UPSTREAM-PROTOCOL-CP-HOSTAPD-Add-support-for-SCS-req-parsing.patch
+r92-06-UPSTREAM-PROTOCOL-CP-HOSTAPD-Handle-SCS-response-from-driver.patch
+
+Patch-work:
+https://lore.kernel.org/all/20250624205716.1052329-1-quic_rchoodam@quicinc.com/#r
+Tag: SCS
+
+Signed-off-by: Hari Chandrakanthan <haric@qti.qualcomm.com>
+Signed-off-by: Vivek Chettri <vchettri@qti.qualcomm.com>
+---
+ hostapd/main.c     |  20 ++++++
+ src/ap/hostapd.c   |  18 ++++-
+ src/ap/hostapd.h   |   3 +
+ src/ap/robust_av.c | 169 ++++++++++++++++++++++++++++++++++++++++++---
+ src/ap/robust_av.h |  40 +++++++++++
+ src/ap/ucode.c     | 110 +++++++++++++++++++++++++++++
+ src/ap/ucode.h     |  21 ++++++
+ 7 files changed, 368 insertions(+), 13 deletions(-)
+
+--- a/hostapd/main.c
++++ b/hostapd/main.c
+@@ -32,6 +32,7 @@
+ #include "eap_register.h"
+ #include "ctrl_iface.h"
+ #include "build_features.h"
++#include "ap/robust_av.h"
+ 
+ struct hapd_global {
+ 	void **drv_priv;
+@@ -1089,6 +1090,23 @@ int main(int argc, char *argv[])
+ 	hostapd_global_ctrl_iface_init(&interfaces);
+ 	hostapd_ucode_init(&interfaces);
+ 
++	hostapd_ucode_config_nft_table(TABLE_NAME, true);
++
++	for (i = 0; i < interfaces.count; i++) {
++		struct hostapd_iface *iface = interfaces.iface[i];
++
++		for (int j = 0; j < iface->num_bss; j++) {
++			struct hostapd_data *hapd;
++			char buf[128] = {0};
++
++			hapd = iface->bss[j];
++			if (hapd->conf->scs) {
++				os_snprintf(buf, 128, "%s_%s", CHAIN_NAME, hapd->conf->iface);
++				hostapd_ucode_config_nft_chain(hapd, TABLE_NAME, buf, true);
++			}
++		}
++	}
++
+ 	if (hostapd_global_run(&interfaces, daemonize, pid_file)) {
+ 		wpa_printf(MSG_ERROR, "Failed to start eloop");
+ 		goto out;
+@@ -1096,6 +1114,8 @@ int main(int argc, char *argv[])
+ 
+ 	ret = 0;
+ 
++	hostapd_ucode_config_nft_table(TABLE_NAME, false);
++
+  out:
+ 	hostapd_global_ctrl_iface_deinit(&interfaces);
+ 	/* Sending deauth to all stations before deinit */
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -11,6 +11,7 @@
+ #include <sqlite3.h>
+ #endif /* CONFIG_SQLITE */
+ 
++#include <linux/netfilter.h>
+ #include "utils/common.h"
+ #include "utils/eloop.h"
+ #include "utils/crc32.h"
+@@ -58,7 +59,7 @@
+ #include "wpa_auth_kay.h"
+ #include "hw_features.h"
+ #include "interference.h"
+-
++#include "robust_av.h"
+ 
+ static int hostapd_flush_old_stations(struct hostapd_data *hapd, u16 reason);
+ #ifdef CONFIG_WEP
+@@ -1810,6 +1811,7 @@ int hostapd_setup_bss(struct hostapd_dat
+ 	u8 if_addr[ETH_ALEN];
+ 	int flush_old_stations = 1;
+ 	struct hostapd_data *tx_hapd;
++	char buf[128] = {0};
+ 
+ 	if (!hostapd_mld_is_first_bss(hapd))
+ 		wpa_printf(MSG_DEBUG,
+@@ -2146,6 +2148,11 @@ setup_mld:
+ 
+ 	tx_hapd = hostapd_mbssid_get_tx_bss(hapd);
+ 
++	if (hapd->conf->scs) {
++		os_snprintf(buf, 128, "%s_%s", CHAIN_NAME, conf->iface);
++		hostapd_ucode_config_nft_chain(hapd, TABLE_NAME, buf, true);
++	}
++
+ 	/* If TX BSS is already beaconing, update it with newly added profile
+ 	 */
+ 	if (start_beacon && tx_hapd && tx_hapd != hapd && tx_hapd->beacon_set_done)
+@@ -4827,12 +4834,18 @@ int hostapd_remove_bss(struct hostapd_if
+ 		       bool is_link_remove)
+ {
+ 	size_t i;
++	char buf[128] = {0};
+ 
+ 	wpa_printf(MSG_INFO, "Remove BSS '%s'", iface->conf->bss[idx]->iface);
+ 
+ 	/* Remove hostapd_data only if it has already been initialized */
+ 	if (idx < iface->num_bss) {
+-		struct hostapd_data *hapd = iface->bss[idx];
++ 		struct hostapd_data *hapd = iface->bss[idx];
++
++		if (hapd && hapd->conf && hapd->conf->scs) {
++			os_snprintf(buf, sizeof(buf), "%s_%s", CHAIN_NAME, hapd->conf->iface);
++			hostapd_ucode_config_nft_chain(hapd, TABLE_NAME, buf, false);
++		}
+ 
+ 		hostapd_bss_deinit(hapd);
+ 		wpa_printf(MSG_DEBUG, "%s: free hapd %p (%s)",
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -29,6 +29,9 @@
+ 	((hapd->conf->oce & OCE_AP) && \
+ 	 (hapd->iface->drv_flags & WPA_DRIVER_FLAGS_OCE_AP))
+ 
++#define TABLE_NAME "wifi_qos_table"
++#define CHAIN_NAME "wifi_qos_chain"
++
+ struct wpa_ctrl_dst;
+ struct radius_server_data;
+ struct upnp_wps_device_sm;
+--- a/src/ap/robust_av.c
++++ b/src/ap/robust_av.c
+@@ -10,6 +10,7 @@
+ #include "robust_av.h"
+ #include "sta_info.h"
+ #include "ap_drv_ops.h"
++#include <linux/netfilter.h>
+ 
+ u8 *hostapd_add_scs_ie(u8 *frm, bool scs)
+ {
+@@ -728,9 +729,150 @@ hostapd_copy_and_send_scs_data(struct ho
+ 	return ret;
+ }
+ 
++static void hostapd_qm_prepare_nft_rule(struct hostapd_data *hapd, struct sta_info *sta,
++					struct hostapd_tclas_elements *te,
++					struct hostapd_nft_rule_params *rule,
++					u8 qm_id, u8 qm_tag)
++{
++
++	if (te->classifier_type == QM_TCLAS_CLASSIFIER_TYPE4) {
++		if (te->tclas_elem.type4_params.classifier_mask & BIT(0)) {
++			rule->ip_family = te->tclas_elem.type4_params.ip_ver;
++		}
++
++		if (te->tclas_elem.type4_params.classifier_mask & BIT(1)) {
++			if (rule->ip_family == 4) {
++				memcpy(&rule->saddr4, te->tclas_elem.type4_params.src_ip.ipv4, IPV4_LEN);
++				htonl(rule->saddr4);
++			} else {
++				memcpy(rule->saddr6, te->tclas_elem.type4_params.src_ip.ipv6, IPV6_LEN);
++			}
++			rule->valid_flags |= NFT_RULE_PARAM_SADDR;
++		}
++
++		if (te->tclas_elem.type4_params.classifier_mask & BIT(2)) {
++			if (rule->ip_family == 4) {
++				memcpy(&rule->daddr4, te->tclas_elem.type4_params.dst_ip.ipv4, IPV4_LEN);
++				htonl(rule->daddr4);
++			} else {
++				memcpy(rule->daddr6, te->tclas_elem.type4_params.dst_ip.ipv6, IPV6_LEN);
++			}
++			rule->valid_flags |= NFT_RULE_PARAM_DADDR;
++		}
++
++		if (te->tclas_elem.type4_params.classifier_mask & BIT(3)) {
++			rule->sport = te->tclas_elem.type4_params.src_port;
++			rule->valid_flags |= NFT_RULE_PARAM_SPORT;
++		}
++
++		if (te->tclas_elem.type4_params.classifier_mask & BIT(4)) {
++			rule->dport = te->tclas_elem.type4_params.dst_port;
++			rule->valid_flags |= NFT_RULE_PARAM_DPORT;
++		}
++
++		if (te->tclas_elem.type4_params.classifier_mask & BIT(6)) {
++			if (rule->ip_family == 4) {
++				rule->proto = te->tclas_elem.type4_params.protocol;
++			} else {
++				rule->proto = te->tclas_elem.type4_params.next_header;
++			}
++			rule->valid_flags |= NFT_RULE_PARAM_PROTO;
++		}
++
++		if (te->tclas_elem.type4_params.classifier_mask & BIT(5)) {
++			rule->dscp = te->tclas_elem.type4_params.dscp;
++			rule->valid_flags |= NFT_RULE_PARAM_DSCP;
++		}
++
++		wpa_printf(MSG_INFO, "qm_id : %d classifier_type : 0x%x classifier_mask : 0x%x\n", qm_id,
++			   te->classifier_type, te->tclas_elem.type4_params.classifier_mask);
++
++	} else if (te->classifier_type == QM_TCLAS_CLASSIFIER_TYPE10) {
++
++		rule->valid_flags |= NFT_RULE_PARAM_PROTO;
++		rule->proto = te->tclas_elem.type10_params.protocol_number;
++
++		if (rule->proto == IPPROTO_UDP) {
++			rule->valid_flags |= NFT_RULE_PARAM_DPORT;
++			rule->dport = 4500;
++		}
++
++		rule->esp_spi =  ((te->tclas_elem.type10_params.filter_value[0]  & te->tclas_elem.type10_params.filter_mask[0]) << 24) | \
++				  ((te->tclas_elem.type10_params.filter_value[1] & te->tclas_elem.type10_params.filter_mask[1]) << 16) | \
++				  ((te->tclas_elem.type10_params.filter_value[2] & te->tclas_elem.type10_params.filter_mask[2]) << 8)  | \
++				  ((te->tclas_elem.type10_params.filter_value[3] & te->tclas_elem.type10_params.filter_mask[3]) << 0);
++	}
++
++	memcpy(rule->dmac, sta->addr, ETH_ALEN);
++	rule->valid_flags |= NFT_RULE_PARAM_DMAC;
++	rule->mark = (qm_id << 8) | qm_tag;
++	os_snprintf(rule->chain, sizeof(rule->chain), "%s_%s", CHAIN_NAME, hapd->conf->iface);
++	os_snprintf(rule->table, sizeof(rule->table), "%s", TABLE_NAME);
++	rule->nf_family = NFPROTO_NETDEV;
++}
++
++static int hostapd_scs_add_nft_rule(struct hostapd_data *hapd, struct sta_info *sta, int scs_idx)
++{
++	struct hostapd_scs_req_desc_data *scs_req_desc = sta->scs_req_desc[scs_idx];
++	struct hostapd_tclas_elements te;
++	int i = 0;
++
++	struct hostapd_nft_rule_params rule = {0};
++
++	for (i = 0; i < scs_req_desc->num_tclas_elements; i++) {
++
++		os_memset(&rule, 0, sizeof(rule));
++
++		te = scs_req_desc->tclas[i];
++
++		hostapd_qm_prepare_nft_rule(hapd, sta, &te, &rule, scs_req_desc->scs_id, HOSTAPD_QOS_SCS_TAG);
++
++		if ((rule.valid_flags & NFT_RULE_PARAM_DPORT ||
++		    rule.valid_flags & NFT_RULE_PARAM_SPORT) &&
++		    !(rule.valid_flags & NFT_RULE_PARAM_PROTO)) {
++
++			rule.valid_flags |= NFT_RULE_PARAM_PROTO;
++
++			rule.proto = IPPROTO_UDP;
++			hostapd_ucode_config_nft_rule(hapd, &rule, true);
++
++			rule.proto = IPPROTO_TCP;
++		} else if (te.classifier_type == QM_TCLAS_CLASSIFIER_TYPE10) {
++			rule.ip_family = 4;
++			hostapd_ucode_config_nft_rule(hapd, &rule, true);
++			rule.ip_family = 6;
++		}
++
++		hostapd_ucode_config_nft_rule(hapd, &rule, true);
++
++		wpa_printf(MSG_INFO, "scs_id:%u rule valid flag : 0x%x ", scs_req_desc->scs_id, rule.valid_flags);
++	}
++	return 0;
++}
++
++static int hostapd_scs_delete_nft_rule(struct hostapd_data *hapd, struct sta_info *sta, int scs_idx)
++{
++	struct hostapd_scs_req_desc_data *scs_data;
++	struct hostapd_tclas_elements te;
++	struct hostapd_nft_rule_params rule = {0};
++	int i = 0;
++
++	scs_data = sta->scs_req_desc[scs_idx];
++
++	for (i = 0; i < scs_data->num_tclas_elements; i++) {
++
++		te = scs_data->tclas[i];
++
++		hostapd_qm_prepare_nft_rule(hapd, sta, &te, &rule, scs_data->scs_id, HOSTAPD_QOS_SCS_TAG);
++
++		hostapd_ucode_config_nft_rule(hapd, &rule, false);
++		wpa_printf(MSG_INFO, "scs_id:%u rule deleted", scs_data->scs_id);
++	}
++	return 0;
++}
+ 
+ static int
+-hostapd_process_scs_add(struct sta_info *sta,
++hostapd_process_scs_add(struct hostapd_data *hapd, struct sta_info *sta,
+ 			struct hostapd_scs_req_desc_data *scs_req_desc_tmp,
+ 			u8 status)
+ {
+@@ -763,12 +905,13 @@ hostapd_process_scs_add(struct sta_info
+ 	sta->scs_req_desc[idx] = scs_req_desc;
+ 	sta->scs_session_count++;
+ 
++	hostapd_scs_add_nft_rule(hapd, sta, idx);
++
+ 	return 0;
+ }
+ 
+-
+ static int
+-hostapd_process_scs_remove(struct sta_info *sta,
++hostapd_process_scs_remove(struct hostapd_data *hapd, struct sta_info *sta,
+ 			   struct hostapd_scs_req_desc_data *scs_req_desc,
+ 			   u8 status)
+ {
+@@ -789,6 +932,8 @@ hostapd_process_scs_remove(struct sta_in
+ 		return -EINVAL;
+ 	}
+ 
++	hostapd_scs_delete_nft_rule(hapd, sta, idx);
++
+ 	os_free(sta->scs_req_desc[idx]);
+ 
+ 	while (idx < (scs_session_count - 1)) {
+@@ -804,7 +949,7 @@ hostapd_process_scs_remove(struct sta_in
+ 
+ 
+ static int
+-hostapd_process_scs_change(struct sta_info *sta,
++hostapd_process_scs_change(struct hostapd_data *hapd, struct sta_info *sta,
+ 			   struct hostapd_scs_req_desc_data *scs_req_desc_tmp,
+ 			   u8 status)
+ {
+@@ -826,14 +971,19 @@ hostapd_process_scs_change(struct sta_in
+ 		return -EINVAL;
+ 	}
+ 
++	hostapd_scs_delete_nft_rule(hapd, sta, idx);
++
+ 	os_memcpy(sta->scs_req_desc[idx], scs_req_desc_tmp,
+ 		  sizeof(*scs_req_desc_tmp));
+ 
++	hostapd_scs_add_nft_rule(hapd, sta, idx);
++
+ 	return 0;
+ }
+ 
+ 
+-static void hostapd_process_scs_req(struct sta_info *sta,
++static void hostapd_process_scs_req(struct hostapd_data *hapd,
++				    struct sta_info *sta,
+ 				    struct hostapd_scs_req_data *scs_req,
+ 				    struct hostapd_scs_resp_data *scs_resp)
+ {
+@@ -870,7 +1020,7 @@ static void hostapd_process_scs_req(stru
+ 
+ 		switch (request_type) {
+ 		case QM_ADD_REQ:
+-			ret = hostapd_process_scs_add(sta, scs_req_desc,
++			ret = hostapd_process_scs_add(hapd, sta, scs_req_desc,
+ 						      status);
+ 			if (!ret)
+ 				scs_resp_desc->status = WLAN_STATUS_SUCCESS;
+@@ -881,7 +1031,7 @@ static void hostapd_process_scs_req(stru
+ 			break;
+ 
+ 		case QM_REMOVE_REQ:
+-			ret = hostapd_process_scs_remove(sta, scs_req_desc,
++			ret = hostapd_process_scs_remove(hapd, sta, scs_req_desc,
+ 							 status);
+ 			if (!ret)
+ 				scs_resp_desc->status =
+@@ -893,7 +1043,7 @@ static void hostapd_process_scs_req(stru
+ 			break;
+ 
+ 		case QM_CHANGE_REQ:
+-			ret = hostapd_process_scs_change(sta, scs_req_desc,
++			ret = hostapd_process_scs_change(hapd, sta, scs_req_desc,
+ 							 status);
+ 			if (!ret)
+ 				scs_resp_desc->status = WLAN_STATUS_SUCCESS;
+@@ -1055,7 +1205,7 @@ static int hostapd_handle_scs_req(struct
+ 		goto send_error_resp;
+ 	}
+ 
+-	hostapd_process_scs_req(sta, &scs_req, &scs_resp);
++	hostapd_process_scs_req(hapd, sta, &scs_req, &scs_resp);
+ 
+ send_error_resp:
+ 	ret = hostapd_send_scs_response(hapd, sta, mgmt->sa, &scs_resp);
+@@ -1066,7 +1216,6 @@ send_error_resp:
+ 	return ret;
+ }
+ 
+-
+ void
+ hostapd_handle_robust_av(struct hostapd_data *hapd, const u8 *buf, size_t len)
+ {
+--- a/src/ap/robust_av.h
++++ b/src/ap/robust_av.h
+@@ -87,6 +87,26 @@ struct hostapd_data;
+ #define HOSTAPD_SCS_IS_QOS_ATTR_PRESENT(PARAM1, PARAM2) \
+ 	(PARAM1 & HOSTAPD_SCS_QOS_ATTR_##PARAM2##_MASK)
+ 
++#define HOSTAPD_QOS_SCS_TAG	0xB9
++#define HOSTAPD_QOS_MSCS_TAG	0x58
++
++#define NFT_RULE_PARAM_SADDR    (1 << 0)
++#define NFT_RULE_PARAM_DADDR    (1 << 1)
++#define NFT_RULE_PARAM_SPORT    (1 << 2)
++#define NFT_RULE_PARAM_DPORT    (1 << 3)
++#define NFT_RULE_PARAM_PROTO    (1 << 4)
++#define NFT_RULE_PARAM_MARK     (1 << 5)
++#define NFT_RULE_PARAM_HANDLE   (1 << 6)
++#define NFT_RULE_PARAM_DMAC     (1 << 7)
++#define NFT_RULE_PARAM_ESP      (1 << 8)
++#define NFT_RULE_PARAM_SPI      (1 << 9)
++#define NFT_RULE_PARAM_DSCP     (1 << 10)
++
++#define NFT_RULE_PARAM_UDP_ENCAP_ESP (1 << 11)
++#define NFT_RULE_PARAM_UDP_ENCAP_ESP_SPI (1 << 12)
++
++#define NFT_UDP_PORT		4500
++
+ /* QoS MGMT status values */
+ enum hostapd_qm_status {
+ 	HOSTAPD_QM_STATUS_SUCCESS = 0,
+@@ -187,6 +207,26 @@ struct hostapd_scs_resp_data {
+ 			scs_resp_desc[HOSTAPD_SCS_MAX_DESCPRIPTORS_PER_REQUEST];
+ };
+ 
++struct hostapd_nft_rule_params {
++	u8 ip_family;
++	u8 nf_family;
++	char table[32];
++	char chain[32];
++	u32 valid_flags;
++	u8 saddr6[16];
++	u8 daddr6[16];
++	u32 saddr4;
++	u32 daddr4;
++	u16 sport;
++	u16 dport;
++	u8 proto;
++	u32 mark;
++	u64 rule_pos;
++	u8 dmac[ETH_ALEN];
++	u32 esp_spi;
++	u8 dscp;
++};
++
+ u8 *hostapd_add_scs_ie(u8 *frm, bool scs);
+ 
+ void
+--- a/src/ap/ucode.c
++++ b/src/ap/ucode.c
+@@ -9,6 +9,7 @@
+ #include "ap_drv_ops.h"
+ #include "dfs.h"
+ #include "acs.h"
++#include "robust_av.h"
+ #include <libubox/uloop.h>
+ #include "sta_info.h"
+ 
+@@ -926,3 +927,112 @@ void hostapd_ucode_free_bss(struct hosta
+ 	ucv_put(wpa_ucode_call(2));
+ 	ucv_gc(vm);
+ }
++
++void hostapd_ucode_config_nft_table(char *table, bool add)
++{
++	uc_value_t *nft_add;
++
++	if (wpa_ucode_call_prepare("config_nft_table"))
++		return;
++
++	wpa_printf(MSG_INFO, "%s: %s a NFT Table", __func__, add?"create":"delete");
++
++	if (add)
++		nft_add = ucv_boolean_new(true);
++	else
++		nft_add = ucv_boolean_new(false);
++
++	uc_value_push(ucv_get(ucv_string_new(table)));
++	uc_value_push(ucv_get(nft_add));
++	ucv_put(wpa_ucode_call(2));
++	ucv_gc(vm);
++}
++
++void hostapd_ucode_config_nft_chain(struct hostapd_data *hapd, char *table,
++				    char *chain, bool add)
++{
++	uc_value_t *nft_add;
++
++	if (wpa_ucode_call_prepare("config_nft_chain"))
++		return;
++
++	if (add)
++		nft_add = ucv_boolean_new(true);
++	else
++		nft_add = ucv_boolean_new(false);
++
++	wpa_printf(MSG_INFO, "%s: Create a NFT Chain", __func__);
++
++	uc_value_push(ucv_get(ucv_string_new(table)));
++	uc_value_push(ucv_get(ucv_string_new(chain)));
++	uc_value_push(ucv_get(ucv_string_new(hapd->conf->iface)));
++	uc_value_push(ucv_get(nft_add));
++	ucv_put(wpa_ucode_call(4));
++	ucv_gc(vm);
++}
++
++void hostapd_ucode_config_nft_rule(struct hostapd_data *hapd, struct hostapd_nft_rule_params *rparams,
++				   bool add)
++{
++	uc_value_t *nft_add;
++
++	char v4_src_addr[INET_ADDRSTRLEN] = {0};
++	char v4_dst_addr[INET_ADDRSTRLEN] = {0};
++	char v6_src_addr[INET6_ADDRSTRLEN] = {0};
++	char v6_dst_addr[INET6_ADDRSTRLEN] = {0};
++	char dst_mac_addr[18] = {0};
++
++	if (rparams->ip_family == 4) {
++		if ((rparams->valid_flags & NFT_RULE_PARAM_SADDR))
++			inet_ntop(AF_INET, &rparams->saddr4, v4_src_addr,
++				  sizeof(v4_src_addr));
++		if ((rparams->valid_flags & NFT_RULE_PARAM_DADDR))
++			inet_ntop(AF_INET, &rparams->daddr4, v4_dst_addr,
++				  sizeof(v4_dst_addr));
++	}
++
++	if (rparams->ip_family == 6) {
++		if ((rparams->valid_flags & NFT_RULE_PARAM_SADDR))
++			inet_ntop(AF_INET6, &rparams->saddr6, v6_src_addr,
++				  sizeof(v6_src_addr));
++		if ((rparams->valid_flags & NFT_RULE_PARAM_DADDR))
++			inet_ntop(AF_INET6, &rparams->daddr6, v6_dst_addr,
++				  sizeof(v6_src_addr));
++	}
++
++	snprintf(dst_mac_addr, sizeof(dst_mac_addr),
++		 "%02x:%02x:%02x:%02x:%02x:%02x",
++		 rparams->dmac[0], rparams->dmac[1], rparams->dmac[2],
++		 rparams->dmac[3], rparams->dmac[4], rparams->dmac[5]);
++
++	if (wpa_ucode_call_prepare("config_nft_rule"))
++		return;
++
++	wpa_printf(MSG_INFO, "%s: Create a NFT Rule", __func__);
++
++	if (add)
++		nft_add = ucv_boolean_new(true);
++	else
++		nft_add = ucv_boolean_new(false);
++
++	uc_value_push(ucv_get(ucv_string_new(rparams->table)));
++	uc_value_push(ucv_get(ucv_string_new(rparams->chain)));
++	uc_value_push(ucv_get(ucv_string_new(hapd->conf->iface)));
++	uc_value_push(ucv_get(nft_add));
++
++	uc_value_push(ucv_get(ucv_string_new(dst_mac_addr)));
++	uc_value_push(ucv_get(ucv_int64_new(rparams->proto)));
++	uc_value_push(ucv_get(ucv_string_new(v6_src_addr)));
++	uc_value_push(ucv_get(ucv_string_new(v6_dst_addr)));
++	uc_value_push(ucv_get(ucv_string_new(v4_src_addr)));
++	uc_value_push(ucv_get(ucv_string_new(v4_dst_addr)));
++
++	uc_value_push(ucv_get(ucv_int64_new(rparams->sport)));
++	uc_value_push(ucv_get(ucv_int64_new(rparams->dport)));
++	uc_value_push(ucv_get(ucv_int64_new(rparams->mark)));
++	uc_value_push(ucv_get(ucv_int64_new(rparams->esp_spi)));
++	uc_value_push(ucv_get(ucv_int64_new(rparams->dscp)));
++	uc_value_push(ucv_get(ucv_int64_new(rparams->ip_family)));
++	ucv_put(wpa_ucode_call(16));
++	ucv_gc(vm);
++}
+--- a/src/ap/ucode.h
++++ b/src/ap/ucode.h
+@@ -2,8 +2,10 @@
+ #define __HOSTAPD_AP_UCODE_H
+ 
+ #include "utils/ucode.h"
++#include "robust_av.h"
+ 
+ struct hostapd_data;
++struct nft_rule_params;
+ 
+ struct hostapd_ucode_bss {
+ #ifdef UCODE_SUPPORT
+@@ -28,6 +30,12 @@ void hostapd_ucode_add_bss(struct hostap
+ void hostapd_ucode_free_bss(struct hostapd_data *hapd);
+ void hostapd_ucode_reload_bss(struct hostapd_data *hapd);
+ 
++void hostapd_ucode_config_nft_table(char *table, bool add);
++void hostapd_ucode_config_nft_chain(struct hostapd_data *hapd, char *table,
++				    char *chain, bool add);
++void hostapd_ucode_config_nft_rule(struct hostapd_data *hapd, struct hostapd_nft_rule_params *rparams,
++				   bool add);
++
+ #else
+ 
+ static inline int hostapd_ucode_init(struct hapd_interfaces *ifaces)
+@@ -50,6 +58,19 @@ static inline void hostapd_ucode_free_bs
+ {
+ }
+ 
++static inline void hostapd_ucode_config_nft_table(char *table, bool add)
++{
++}
++static inline void hostapd_ucode_config_nft_chain(struct hostapd_data *hapd, char *table,
++						  char *chain, bool add)
++{
++}
++static inline void
++hostapd_ucode_config_nft_rule(struct hostapd_data *hapd,
++			      struct hostapd_nft_rule_params *rparams,
++			      bool add)
++{
++}
+ #endif
+ 
+ #endif

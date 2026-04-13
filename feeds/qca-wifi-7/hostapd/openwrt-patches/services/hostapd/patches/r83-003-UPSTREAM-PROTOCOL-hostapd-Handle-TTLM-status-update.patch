@@ -1,0 +1,338 @@
+From 0b476710a9a9618943302f64b43b3fa22cd01052 Mon Sep 17 00:00:00 2001
+From: Shwetha G K <kshwetha@qti.qualcomm.com>
+Date: Mon, 30 Jun 2025 16:14:42 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: hostapd: Handle TTLM status update event
+
+There are three types of events sent from the firmware after it
+receives the TTLM configurations from userspace. First, the
+Mapping Switch Time (MST) update: the mapping switch time provided
+by the user for an MLD via the CLI command is in TU units. The
+firmware converts this value into TSF units for each link in the
+MLD and sends an event per link with the converted value. This
+value must be stored per link and included in the TTLM IE. Second,
+the MST expiry: when the MST expires, the firmware sends an
+indication, after which the AP begins advertising the TTLM
+configured by the user. Third, the Expected Duration (ED) expiry:
+once the ED expires, the firmware sends an indication, and the AP
+stops advertising the established TTLM and reverts to the default
+mapping. This commit adds a handler for the MST update to ensure
+the updated value is included in the beacon when operating in
+non-beacon-offload mode. It also adds handlers for MST and ED
+expiry events, invoking hostapd_ttlm_handle_mapping_switch_time_expiry()
+to promote upcoming_ttlm to established_ttlm, and
+hostapd_ttlm_handle_expected_duration_expiry() to clear the
+established_ttlm.
+
+Signed-off-by: Shwetha G K <kshwetha@qti.qualcomm.com>
+Signed-off-by: Amith A <amitajit@qti.qualcomm.com>
+---
+ src/ap/drv_callbacks.c             | 44 +++++++++++++++++++++
+ src/ap/hostapd.h                   |  2 +
+ src/ap/ttlm.c                      | 63 ++++++++++++++++++++++++++++++
+ src/ap/ttlm.h                      |  5 ++-
+ src/common/defs.h                  |  6 +++
+ src/drivers/driver.h               | 17 ++++++++
+ src/drivers/driver_common.c        |  1 +
+ src/drivers/driver_nl80211_event.c | 58 +++++++++++++++++++++++++++
+ 8 files changed, 195 insertions(+), 1 deletion(-)
+
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -46,6 +46,7 @@
+ #include "neighbor_db.h"
+ #include "nan_usd_ap.h"
+ #include "interference.h"
++#include "ttlm.h"
+ 
+ 
+ #ifdef CONFIG_FILS
+@@ -2965,6 +2966,45 @@ static void hostapd_mld_iface_disable(st
+ 		hostapd_iface_disable(link_bss);
+ }
+ 
++static void hostapd_event_update_ttlm_status(struct hostapd_data *hapd,
++					     struct ttlm_update_event *ttlm_update_event)
++{
++	struct ttlm_context *ttlm_ctx = &hapd->mld->ttlm_ctx;
++	struct hostapd_data *link_bss;
++
++	wpa_printf(MSG_INFO, "TTLM: link id = %d status = %d",
++		   hapd->mld_link_id, ttlm_update_event->status);
++
++	switch (ttlm_update_event->status) {
++	case TTLM_MAP_SWITCH_TIMER_TSF:
++		if (ttlm_ctx->upcoming_ttlm.ttlm.mapping_switch_time_present)
++			hapd->mapping_switch_time =
++				ttlm_update_event->mapping_switch_tsf;
++		wpa_printf(MSG_INFO, "TTLM: Updated mapping switch time to %d",
++			   ttlm_update_event->mapping_switch_tsf);
++		break;
++	case TTLM_MAP_SWITCH_TIMER_EXPIRED:
++		for_each_mld_link(link_bss, hapd)
++			link_bss->mapping_switch_time = 0;
++
++		hostapd_ttlm_handle_mapping_switch_time_expiry(ttlm_ctx,
++							       hapd->mld_link_id);
++		/* TO-DO:
++		 * Send event to user-space to notify link update.
++		 * Go over all MLO peers on this MLD and clear the
++		 * peer-to-peer level mapping.
++		 */
++		break;
++	case TTLM_EXPECTED_DUR_EXPIRED:
++		hostapd_ttlm_handle_expected_duration_expiry(ttlm_ctx,
++							     hapd->mld_link_id);
++		/* TO-DO: Move P2P negotiated mapping to default */
++		break;
++	default:
++		wpa_printf(MSG_ERROR, "TTLM: Invalid status");
++
++	}
++}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 
+@@ -3346,6 +3386,11 @@ void hostapd_wpa_event(void *ctx, enum w
+ 			   hapd->conf->iface);
+ 		hostapd_mld_interface_freed(hapd);
+ 		break;
++	case EVENT_TTLM_UPDATE:
++		if (!data)
++			break;
++		hostapd_event_update_ttlm_status(hapd, &data->ttlm_update_event);
++		break;
+ #endif /* CONFIG_IEEE80211BE */
+ 	 case EVENT_UPDATE_MUEDCA_PARAMS:
+ 		 hostapd_event_update_muedca_params(hapd, &data->update_muedca);
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -593,6 +593,8 @@ struct hostapd_data {
+ 	size_t mbssid_idx;
+ 	struct hostapd_multi_mbssid_group *mbssid_group;
+ 	struct dl_list mbssid_bss;
++
++	u16 mapping_switch_time;
+ };
+ 
+ 
+--- a/src/ap/ttlm.c
++++ b/src/ap/ttlm.c
+@@ -251,6 +251,66 @@ hostapd_fill_ttlm_params(struct ttlm_inf
+ }
+ 
+ 
++void hostapd_ttlm_handle_mapping_switch_time_expiry(struct ttlm_context *ttlm_ctx,
++						    u8 link_id)
++{
++	struct ttlm_info *ttlm;
++
++	wpa_printf(MSG_INFO, "TTLM: Mapping switch time expired for link id:%d ",
++		   link_id);
++
++	memcpy(&ttlm_ctx->established_ttlm, &ttlm_ctx->upcoming_ttlm,
++	       sizeof(struct mlo_ttlm_ie));
++
++	ttlm_ctx->established_ttlm.ttlm.mapping_switch_time_present = false;
++	ttlm_ctx->established_ttlm.ttlm.mapping_switch_time = 0;
++
++	ttlm = &ttlm_ctx->established_ttlm.ttlm;
++	wpa_printf(MSG_INFO, "TTLM: Established mapping: disabled_link_bitmap:%x "
++		   "dir:%d default_map:%d MSTP:%d EDP:%d MST:%d ED:%d ieee_link_map:%x",
++		   ttlm_ctx->established_ttlm.disabled_link_bitmap,
++		   ttlm->direction, ttlm->default_link_mapping,
++		   ttlm->mapping_switch_time_present,
++		   ttlm->expected_duration_present,
++		   ttlm->mapping_switch_time, ttlm->expected_duration,
++		   ttlm->ieee_link_map_tid[0]);
++
++	memset(&ttlm_ctx->upcoming_ttlm, 0, sizeof(struct mlo_ttlm_ie));
++	ttlm_ctx->upcoming_ttlm.ttlm.direction = TTLM_DIRECTION_INVALID;
++}
++
++
++void hostapd_ttlm_handle_expected_duration_expiry(struct ttlm_context *ttlm_ctx,
++						  u8 link_id)
++{
++	wpa_printf(MSG_INFO, "TTLM: Expected duration expired for link id:%d ",
++		   link_id);
++
++	if (ttlm_ctx->upcoming_ttlm.ttlm.mapping_switch_time_present) {
++		/* Copy the new non-default ongoing mapping to established
++		 * mapping if expected duration expires for the established
++		 * mapping.
++		 */
++		hostapd_ttlm_handle_mapping_switch_time_expiry(ttlm_ctx,
++							       link_id);
++		return;
++	}
++
++	/* Use the default mapping when expected duration expires for the
++	 * established mapping and no new non-default TTLM announcement is
++	 * ongoing.
++	 */
++	memset(&ttlm_ctx->established_ttlm, 0,
++	       sizeof(struct mlo_ttlm_ie));
++
++	ttlm_ctx->established_ttlm.ttlm.direction = TTLM_DIRECTION_BIDI;
++	ttlm_ctx->established_ttlm.ttlm.default_link_mapping = 1;
++	ttlm_ctx->established_ttlm.disabled_link_bitmap = 0;
++	ttlm_ctx->established_ttlm.ttlm.link_mapping_size = 0;
++	wpa_printf(MSG_INFO, "TTLM: Set established mapping to default mapping");
++}
++
++
+ static int
+ hostapd_offload_set_adv_ttlm_multi_mbssid(struct hostapd_data *hapd)
+ {
+--- a/src/ap/ttlm.h
++++ b/src/ap/ttlm.h
+@@ -214,5 +214,8 @@ int hostapd_ttlm_teardown_tx_status(stru
+ int hostapd_send_ttlm_teardown(struct hostapd_data *hapd, struct sta_info *sta);
+ int hostapd_handle_ttlm_teardown(struct hostapd_data *hapd, struct sta_info *sta,
+ 				 const u8 *buf, size_t len);
+-
++void hostapd_ttlm_handle_mapping_switch_time_expiry(struct ttlm_context *ttlm_ctx,
++						    u8 link_id);
++void hostapd_ttlm_handle_expected_duration_expiry(struct ttlm_context *ttlm_ctx,
++						  u8 link_id);
+ #endif /* TTLM_H */
+--- a/src/common/defs.h
++++ b/src/common/defs.h
+@@ -559,4 +559,10 @@ enum wpa_p2p_mode {
+ 
+ #define BW_INTERFERENCE_MAXBITS 32
+ 
++enum ttlm_status {
++	TTLM_MAP_SWITCH_TIMER_TSF	= 0,
++	TTLM_MAP_SWITCH_TIMER_EXPIRED	= 1,
++	TTLM_EXPECTED_DUR_EXPIRED	= 2,
++};
++
+ #endif /* DEFS_H */
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -6492,6 +6492,11 @@ enum wpa_event_type {
+ 	 * AFC
+ 	 */
+ 	EVENT_AFC_RECEIVED,
++
++	/**
++	 * EVENT_TTLM_UPDATE - Notification about TTLM info update event
++	 */
++	EVENT_TTLM_UPDATE,
+ };
+ 
+ 
+@@ -7537,6 +7542,18 @@ union wpa_event_data {
+ 		u32 link_removal_count;
+ 		u64 tsf;
+ 	} link_removal_event;
++
++	/**
++	 * struct ttlm_update_event - Data for EVENT_TTLM_UPDATE
++	 * @link_id: Link for which TTLM update was received
++	 * @status: Type of update received
++	 * mapping_switch_tsf: Mapping switch time in TSF
++	 */
++	struct ttlm_update_event {
++		u8 link_id;
++		enum ttlm_status status;
++		u16 mapping_switch_tsf;
++	} ttlm_update_event;
+ };
+ 
+ /**
+--- a/src/drivers/driver_common.c
++++ b/src/drivers/driver_common.c
+@@ -110,6 +110,7 @@ const char * event_to_string(enum wpa_ev
+ 	E2S(LINK_REMOVAL_STARTED);
+ 	E2S(LINK_REMOVAL_COMPLETED);
+ 	E2S(AFC_RECEIVED);
++	E2S(TTLM_UPDATE);
+ 	}
+ 
+ 	return "UNKNOWN";
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -4794,6 +4794,69 @@ static void nl80211_obss_color_event(str
+ #endif /* CONFIG_IEEE80211AX */
+ 
+ 
++#ifdef CONFIG_IEEE80211BE
++static void nl80211_ttlm_update_event(struct i802_bss *bss, struct nlattr **tb)
++{
++	struct nlattr *ttlm_attrs[NL80211_ADVERTISED_TTLM_ATTR_MAX + 1];
++	static struct nla_policy
++		nl80211_advertised_ttlm_policy[NL80211_ADVERTISED_TTLM_ATTR_MAX + 1] = {
++		[NL80211_ADVERTISED_TTLM_ATTR_IE_COUNT] = { .type = NLA_U8 },
++		[NL80211_ADVERTISED_TTLM_ATTR_LINK_MAP_SIZE] = { .type = NLA_U8 },
++		[NL80211_ADVERTISED_TTLM_ATTR_IEEE_LINK_MAP] = { .type = NLA_U16 },
++		[NL80211_ADVERTISED_TTLM_ATTR_SWITCH_TIME] = { .type = NLA_U16 },
++		[NL80211_ADVERTISED_TTLM_ATTR_DURATION] = { .type = NLA_U32 },
++		[NL80211_ADVERTISED_TTLM_ATTR_STATUS] = { .type = NLA_U8 },
++		[NL80211_ADVERTISED_TTLM_ATTR_MST_TSF_UPDATE] = { .type = NLA_U16 },
++		[NL80211_ADVERTISED_TTLM_ATTR_ED_UPDATE] = { .type = NLA_U32 },
++	};
++	struct i802_link *mld_link = bss->flink;
++	union wpa_event_data data;
++	void *ctx = bss->ctx;
++
++	os_memset(&data, 0, sizeof(data));
++
++	if (tb[NL80211_ATTR_ADVERTISED_TTLM] == NULL ||
++	    nla_parse_nested(ttlm_attrs, NL80211_ADVERTISED_TTLM_ATTR_MAX,
++			     tb[NL80211_ATTR_ADVERTISED_TTLM],
++			     nl80211_advertised_ttlm_policy)) {
++		wpa_printf(MSG_DEBUG, "nl80211: Failed to parse TTLM status event");
++		return;
++	}
++
++	if (tb[NL80211_ATTR_MLO_LINK_ID]) {
++		data.ttlm_update_event.link_id = nla_get_u8(tb[NL80211_ATTR_MLO_LINK_ID]);
++
++		if (!nl80211_link_valid(bss->valid_links,
++					data.ttlm_update_event.link_id)) {
++			wpa_printf(MSG_DEBUG,
++				   "nl80211: Invalid link ID %d for TTLM status event",
++				   data.bss_color_collision.link_id);
++			return;
++		}
++
++		mld_link = nl80211_get_link(bss,
++					    data.ttlm_update_event.link_id);
++		ctx = mld_link->ctx;
++	}
++
++	if (ttlm_attrs[NL80211_ADVERTISED_TTLM_ATTR_STATUS])
++		data.ttlm_update_event.status =
++			nla_get_u8(ttlm_attrs[NL80211_ADVERTISED_TTLM_ATTR_STATUS]);
++
++	if (ttlm_attrs[NL80211_ADVERTISED_TTLM_ATTR_MST_TSF_UPDATE])
++		data.ttlm_update_event.mapping_switch_tsf =
++			nla_get_u16(ttlm_attrs[NL80211_ADVERTISED_TTLM_ATTR_MST_TSF_UPDATE]);
++
++	wpa_printf(MSG_DEBUG,
++		   "nl80211: TTLM update event on link_id: %d with status: %d, MST = %u",
++		   data.ttlm_update_event.link_id, data.ttlm_update_event.status,
++		   data.ttlm_update_event.mapping_switch_tsf);
++
++	wpa_supplicant_event(ctx, EVENT_TTLM_UPDATE, &data);
++}
++#endif /* CONFIG_IEEE80211BE */
++
++
+ static void do_process_drv_event(struct i802_bss *bss, int cmd,
+ 				 struct nlattr **tb)
+ {
+@@ -5080,6 +5143,11 @@ static void do_process_drv_event(struct
+ 	case NL80211_CMD_LINK_REMOVAL_COMPLETED:
+ 		nl80211_link_removal_event(bss, tb, false);
+ 		break;
++#ifdef CONFIG_IEEE80211BE
++	case NL80211_CMD_SET_TID_TO_LINK_MAPPING:
++		nl80211_ttlm_update_event(bss, tb);
++		break;
++#endif /* CONFIG_IEEE80211BE */
+ 	default:
+ 		wpa_dbg(drv->ctx, MSG_DEBUG, "nl80211: Ignored unknown event "
+ 			"(cmd=%d)", cmd);

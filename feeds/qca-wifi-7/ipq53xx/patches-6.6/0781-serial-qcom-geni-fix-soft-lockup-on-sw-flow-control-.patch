@@ -1,0 +1,113 @@
+From 43b77c19da9de0c39594bcd25135eade97764042 Mon Sep 17 00:00:00 2001
+From: Johan Hovold <johan+linaro@kernel.org>
+Date: Thu, 4 Jul 2024 12:18:03 +0200
+Subject: [PATCH] serial: qcom-geni: fix soft lockup on sw flow control and
+ suspend
+
+The stop_tx() callback is used to implement software flow control and
+must not discard data as the Qualcomm GENI driver is currently doing
+when there is an active TX command.
+
+Cancelling an active command can also leave data in the hardware FIFO,
+which prevents the watermark interrupt from being enabled when TX is
+later restarted. This results in a soft lockup and is easily triggered
+by stopping TX using software flow control in a serial console but this
+can also happen after suspend.
+
+Fix this by only stopping any active command, and effectively clearing
+the hardware fifo, when shutting down the port. When TX is later
+restarted, a transfer command may need to be issued to discard any stale
+data that could prevent the watermark interrupt from firing.
+
+Fixes: c4f528795d1a ("tty: serial: msm_geni_serial: Add serial driver support for GENI based QUP")
+Cc: stable@vger.kernel.org	# 4.17
+Change-Id: Ib01042773ceab423c5e32d177168de3bce598862
+Signed-off-by: Johan Hovold <johan+linaro@kernel.org>
+Link: https://lore.kernel.org/r/20240704101805.30612-2-johan+linaro@kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Poovendhan Selvaraj <quic_poovendh@quicinc.com>
+(cherry picked from commit 947cc4ecc06cb80a2aa2cebbbbf0e546fbaf0238)
+---
+ drivers/tty/serial/qcom_geni_serial.c | 33 +++++++++++++++++++--------
+ 1 file changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/tty/serial/qcom_geni_serial.c b/drivers/tty/serial/qcom_geni_serial.c
+index a22f84533591..13c7954f40ac 100644
+--- a/drivers/tty/serial/qcom_geni_serial.c
++++ b/drivers/tty/serial/qcom_geni_serial.c
+@@ -658,15 +658,25 @@ static void qcom_geni_serial_start_tx_dma(struct uart_port *uport)
+ 
+ static void qcom_geni_serial_start_tx_fifo(struct uart_port *uport)
+ {
++	unsigned char c;
+ 	u32 irq_en;
+ 
+-	if (qcom_geni_serial_main_active(uport) ||
+-	    !qcom_geni_serial_tx_empty(uport))
+-		return;
++	/*
++	 * Start a new transfer in case the previous command was cancelled and
++	 * left data in the FIFO which may prevent the watermark interrupt
++	 * from triggering. Note that the stale data is discarded.
++	 */
++	if (!qcom_geni_serial_main_active(uport) &&
++	    !qcom_geni_serial_tx_empty(uport)) {
++		if (uart_fifo_out(uport, &c, 1) == 1) {
++			writel(M_CMD_DONE_EN, uport->membase + SE_GENI_M_IRQ_CLEAR);
++			qcom_geni_serial_setup_tx(uport, 1);
++			writel(c, uport->membase + SE_GENI_TX_FIFOn);
++		}
++	}
+ 
+ 	irq_en = readl(uport->membase +	SE_GENI_M_IRQ_EN);
+ 	irq_en |= M_TX_FIFO_WATERMARK_EN | M_CMD_DONE_EN;
+-
+ 	writel(DEF_TX_WM, uport->membase + SE_GENI_TX_WATERMARK_REG);
+ 	writel(irq_en, uport->membase +	SE_GENI_M_IRQ_EN);
+ }
+@@ -674,13 +684,17 @@ static void qcom_geni_serial_start_tx_fifo(struct uart_port *uport)
+ static void qcom_geni_serial_stop_tx_fifo(struct uart_port *uport)
+ {
+ 	u32 irq_en;
+-	struct qcom_geni_serial_port *port = to_dev_port(uport);
+ 
+ 	irq_en = readl(uport->membase + SE_GENI_M_IRQ_EN);
+ 	irq_en &= ~(M_CMD_DONE_EN | M_TX_FIFO_WATERMARK_EN);
+ 	writel(0, uport->membase + SE_GENI_TX_WATERMARK_REG);
+ 	writel(irq_en, uport->membase + SE_GENI_M_IRQ_EN);
+-	/* Possible stop tx is called multiple times. */
++}
++
++static void qcom_geni_serial_cancel_tx_cmd(struct uart_port *uport)
++{
++	struct qcom_geni_serial_port *port = to_dev_port(uport);
++
+ 	if (!qcom_geni_serial_main_active(uport))
+ 		return;
+ 
+@@ -693,6 +707,8 @@ static void qcom_geni_serial_stop_tx_fifo(struct uart_port *uport)
+ 		writel(M_CMD_ABORT_EN, uport->membase + SE_GENI_M_IRQ_CLEAR);
+ 	}
+ 	writel(M_CMD_CANCEL_EN, uport->membase + SE_GENI_M_IRQ_CLEAR);
++
++	port->tx_remaining = 0;
+ }
+ 
+ static void qcom_geni_serial_handle_rx_fifo(struct uart_port *uport, bool drop)
+@@ -1082,11 +1098,10 @@ static void qcom_geni_serial_shutdown(struct uart_port *uport)
+ {
+ 	disable_irq(uport->irq);
+ 
+-	if (uart_console(uport))
+-		return;
+-
+ 	qcom_geni_serial_stop_tx(uport);
+ 	qcom_geni_serial_stop_rx(uport);
++
++	qcom_geni_serial_cancel_tx_cmd(uport);
+ }
+ 
+ static int qcom_geni_serial_port_setup(struct uart_port *uport)
+-- 
+2.34.1
+

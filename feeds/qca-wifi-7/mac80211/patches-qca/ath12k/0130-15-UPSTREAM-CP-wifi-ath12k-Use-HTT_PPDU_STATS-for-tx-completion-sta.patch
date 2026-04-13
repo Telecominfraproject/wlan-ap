@@ -1,0 +1,373 @@
+From fac426988eec730c7eae3e03462cac08044f1e59 Mon Sep 17 00:00:00 2001
+From: Ramanathan Choodamani <rchoodam@qti.qualcomm.com>
+Date: Mon, 28 Apr 2025 17:49:02 -0700
+Subject: [PATCH] Subject: [PATCH] QSDK:CP:wifi: ath12k: Use HTT_PPDU_STATS for
+ tx completion stats  processing
+
+The change adds support for parsing PPDU STATS to obtain
+tx mpdu completions. By leveraging these stats, the need for per-MSDU stats
+processing can be avoided. This is particularly beneficial for updating
+link metrics in mesh which happens on a per-packet basis.
+
+Add checks to avoid double counting when stats are enabled.
+
+Patch dependency:0112-0006-wifi-ath12k-Move-HTT-specific-code-to-newly-introduc.patch
+                 130-02-UPSTREAM-DP-ath12k-Update-HTT-ppdu-stats-from-the-firmware-descr.patch
+
+Signed-off-by: Ramanathan Choodamani <rchoodam@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h   |   1 +
+ drivers/net/wireless/ath/ath12k/dp_htt.c | 185 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/dp_htt.h |  53 +++++++
+ 3 files changed, 239 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -981,6 +981,7 @@ struct ath12k_base {
+ 	u32 ce_remap_base_addr;
+ 	bool ce_remap;
+ 	bool htt_flag;
++	bool stats_disable;
+ 
+ 	struct {
+ 		enum ath12k_bus bus;
+--- a/drivers/net/wireless/ath/ath12k/dp_htt.c
++++ b/drivers/net/wireless/ath/ath12k/dp_htt.c
+@@ -59,6 +59,68 @@ static int ath12k_get_ppdu_user_index(st
+ 	return -EINVAL;
+ }
+ 
++static void ath12k_dp_ppdu_stats_flush_tlv_parse(struct ath12k_base *ab,
++	   	struct htt_ppdu_stats_cmpltn_flush *msg)
++{
++	struct ath12k *ar;
++	struct ath12k_link_sta *arsta;
++	struct ath12k_dp *dp = ab->dp;
++	struct ath12k_dp_link_peer *peer = NULL;
++	struct rate_info rate;
++	struct ieee80211_tx_status status;
++	struct ieee80211_rate_status status_rate = { 0 };
++
++	rcu_read_lock();
++
++	spin_lock_bh(&dp->dp_lock);
++	peer = ath12k_dp_link_peer_find_by_id(ab->dp, msg->sw_peer_id);
++	if (unlikely(!peer || !peer->sta)) {
++		ath12k_dbg(ab, ATH12K_DBG_DATA,
++				"dp_tx: failed to find the peer with peer_id %d\n",
++				msg->sw_peer_id);
++		spin_unlock_bh(&dp->dp_lock);
++		rcu_read_unlock();
++		return;
++	}
++
++	if (peer->vif->type != NL80211_IFTYPE_MESH_POINT) {
++		spin_unlock_bh(&dp->dp_lock);
++		rcu_read_unlock();
++		return;
++	}
++
++	if (ether_addr_equal(peer->addr, peer->vif->addr)) {
++		spin_unlock_bh(&dp->dp_lock);
++		rcu_read_unlock();
++		return;
++	}
++
++	arsta = ath12k_peer_get_link_sta(ab, peer);
++	if (!arsta) {
++		ath12k_warn(ab, "link sta not found on peer %pM id %d\n",
++				peer->addr, peer->peer_id);
++		spin_unlock_bh(&dp->dp_lock);
++		rcu_read_unlock();
++		return;
++	}
++
++	memset(&status, 0, sizeof(status));
++	status.sta = peer->sta;
++	rate = peer->last_txrate;
++	spin_unlock_bh(&dp->dp_lock);
++
++	status_rate.rate_idx = rate;
++	status_rate.try_count = 1;
++
++	status.rates = &status_rate;
++	status.n_rates = 1;
++	status.mpdu_fail = FIELD_GET(HTT_PPDU_STATS_CMPLTN_FLUSH_INFO_NUM_MPDU,
++			msg->info);
++	ar = arsta->arvif->ar;
++	rcu_read_unlock();
++	ieee80211s_update_metric_ppdu(ar->ah->hw, &status);
++}
++
+ static int ath12k_htt_tlv_ppdu_stats_parse(struct ath12k_base *ab,
+ 					   u16 tag, u16 len, const void *ptr,
+ 					   void *data)
+@@ -71,6 +133,7 @@ static int ath12k_htt_tlv_ppdu_stats_par
+ 	int cur_user;
+ 	u16 peer_id;
+ 	u32 ppdu_id;
++	u32 frame_type;
+ 
+ 	ppdu_info = data;
+ 
+@@ -83,6 +146,22 @@ static int ath12k_htt_tlv_ppdu_stats_par
+ 		}
+ 		memcpy(&ppdu_info->ppdu_stats.common, ptr,
+ 		       sizeof(struct htt_ppdu_stats_common));
++
++		frame_type =
++			FIELD_GET(HTT_PPDU_STATS_CMN_FLAGS_FRAME_TYPE_M,
++				  ppdu_info->ppdu_stats.common.flags);
++		switch (frame_type) {
++			case HTT_STATS_FTYPE_TIDQ_DATA_SU:
++			case HTT_STATS_FTYPE_TIDQ_DATA_MU:
++				if (u32_get_bits(ppdu_info->frame_ctrl, HTT_STATS_FRAMECTRL_TYPE_MASK) <= HTT_STATS_FRAME_CTRL_TYPE_CTRL)
++					ppdu_info->frame_type = HTT_STATS_PPDU_FTYPE_CTRL;
++				else
++					ppdu_info->frame_type = HTT_STATS_PPDU_FTYPE_DATA;
++				break;
++			default:
++				ppdu_info->frame_type = HTT_STATS_PPDU_FTYPE_CTRL;
++			break;
++		}
+ 		break;
+ 	case HTT_PPDU_STATS_TAG_USR_RATE:
+ 		if (len < sizeof(struct htt_ppdu_stats_user_rate)) {
+@@ -150,6 +229,45 @@ static int ath12k_htt_tlv_ppdu_stats_par
+ 	case HTT_PPDU_STATS_TAG_SCH_CMD_STATUS:
+ 		ppdu_info->tlv_bitmap |= BIT(tag);
+ 		break;
++	case HTT_PPDU_STATS_TAG_USR_COMMON:
++		if (len < sizeof(struct htt_ppdu_stats_user_common)) {
++			ath12k_warn(ab, "Invalid len %d for the tag 0x%x\n",
++				    len, tag);
++			return -EINVAL;
++		}
++		/* No need to use these stats when SW is already
++		 * doing it on a per packet basis
++		 */
++		if (!ab->stats_disable)
++			break;
++		peer_id = ((struct htt_ppdu_stats_user_common *)ptr)->sw_peer_id;
++		cur_user = ath12k_get_ppdu_user_index(&ppdu_info->ppdu_stats,
++						      peer_id);
++		if (cur_user < 0)
++			return -EINVAL;
++		user_stats = &ppdu_info->ppdu_stats.user_stats[cur_user];
++		memcpy(&user_stats->common, ptr,
++		       sizeof(struct htt_ppdu_stats_user_common));
++		ppdu_info->frame_ctrl = FIELD_GET(HTT_PPDU_STATS_USR_CMN_CTL_FRM_CTRL,
++						  user_stats->common.ctrl);
++		user_stats->delay_ba = FIELD_GET(HTT_PPDU_STATS_USR_CMN_FLAG_DELAYBA,
++						  user_stats->common.info);
++		ppdu_info->delay_ba = user_stats->delay_ba;
++		break;
++	case HTT_PPDU_STATS_TAG_USR_COMPLTN_FLUSH:
++		if (len < sizeof(struct htt_ppdu_stats_cmpltn_flush)) {
++			ath12k_warn(ab, "Invalid len %d for the tag 0x%x\n",
++					len, tag);
++			return -EINVAL;
++		}
++		/* No need to use these stats when SW is already
++		 * doing it on a per packet basis
++		 */
++		if (!ab->stats_disable)
++			break;
++		ath12k_dp_ppdu_stats_flush_tlv_parse(ab,
++			   	(struct htt_ppdu_stats_cmpltn_flush *)ptr);
++		break;
+ 	}
+ 	return 0;
+ }
+@@ -532,6 +650,81 @@ static void ath12k_copy_to_bar(struct at
+ 	peer->delayba_flag = false;
+ }
+ 
++static void
++ath12k_dp_htt_ppdu_stats_update_tx_comp_stats(struct ath12k_pdev_dp *dp_pdev,
++		                struct htt_ppdu_stats_info *ppdu_info)
++{
++	struct ath12k *ar = dp_pdev->ar;
++	struct ath12k_base *ab = ar->ab;
++	struct ath12k_dp *dp = ab->dp;
++	struct ath12k_link_sta *arsta;
++	struct ath12k_dp_link_peer *peer = NULL;
++	struct htt_ppdu_user_stats* usr_stats = NULL;
++	struct rate_info rate;
++	struct ieee80211_tx_status status;
++	struct ieee80211_rate_status status_rate = { 0 };
++	u32 peer_id = 0;
++	int i;
++
++	lockdep_assert_held(&ar->data_lock);
++	if (!ab->stats_disable)
++		return;
++	ath12k_htt_update_ppdu_stats(dp_pdev, ppdu_info);
++
++	for (i = 0; i < ppdu_info->ppdu_stats.common.num_users; i++) {
++		usr_stats = &ppdu_info->ppdu_stats.user_stats[i];
++		peer_id = usr_stats->peer_id;
++		rcu_read_lock();
++		spin_lock_bh(&dp->dp_lock);
++		peer = ath12k_dp_link_peer_find_by_id(ab->dp, peer_id);
++		if (unlikely(!peer || !peer->sta)) {
++			ath12k_dbg(ab, ATH12K_DBG_DATA,
++				   "dp_tx: failed to find the peer with peer_id %d\n",
++				peer_id);
++			spin_unlock_bh(&dp->dp_lock);
++			rcu_read_unlock();
++			continue;
++		}
++
++		if (peer->vif->type != NL80211_IFTYPE_MESH_POINT) {
++			spin_unlock_bh(&dp->dp_lock);
++			rcu_read_unlock();
++			return;
++		}
++
++		if (ether_addr_equal(peer->addr, peer->vif->addr)) {
++			spin_unlock_bh(&dp->dp_lock);
++			rcu_read_unlock();
++			continue;
++		}
++
++		arsta = ath12k_peer_get_link_sta(ab, peer);
++		if (!arsta) {
++			ath12k_warn(ab, "link sta not found on peer %pM id %d\n",
++				    peer->addr, peer->peer_id);
++			spin_unlock_bh(&dp->dp_lock);
++			rcu_read_unlock();
++			continue;
++		}
++
++		memset(&status, 0, sizeof(status));
++
++		status.sta = peer->sta;
++		rate = peer->last_txrate;
++		spin_unlock_bh(&dp->dp_lock);
++		rcu_read_unlock();
++
++		status_rate.rate_idx = rate;
++		status_rate.try_count = 1;
++
++		status.rates = &status_rate;
++		status.n_rates = 1;
++		status.mpdu_succ = usr_stats->cmpltn_cmn.mpdu_success;
++
++		ieee80211s_update_metric_ppdu(ar->ah->hw, &status);
++	}
++}
++
+ static int ath12k_htt_pull_ppdu_stats(struct ath12k_base *ab,
+ 				      struct sk_buff *skb)
+ {
+@@ -639,6 +832,12 @@ static int ath12k_htt_pull_ppdu_stats(st
+ 		}
+ 	}
+ 
++	/* Update tx completion stats */
++	if ((ppdu_info->frame_type == HTT_STATS_PPDU_FTYPE_DATA &&
++		(ppdu_info->tlv_bitmap & (1 << HTT_PPDU_STATS_TAG_USR_RATE)) &&
++		 ppdu_info->tlv_bitmap & (1 << HTT_PPDU_STATS_TAG_USR_COMPLTN_COMMON)))
++		ath12k_dp_htt_ppdu_stats_update_tx_comp_stats(dp_pdev, ppdu_info);
++
+ 	spin_unlock_bh(&dp_pdev->ppdu_list_lock);
+ 
+ exit:
+--- a/drivers/net/wireless/ath/ath12k/dp_htt.h
++++ b/drivers/net/wireless/ath/ath12k/dp_htt.h
+@@ -318,6 +318,10 @@ enum htt_ppdu_stats_tag_type {
+ 	HTT_PPDU_STATS_TAG_MAX,
+ };
+ 
++#define HTT_STATS_FRAMECTRL_TYPE_MASK GENMASK(3,2)
++#define HTT_STATS_GET_FRAME_CTRL_TYPE(_val)	\
++		u32_get_bits(_val, HTT_STATS_FRAMECTRL_TYPE_MASK)
++
+ #define HTT_PPDU_STATS_TAG_DEFAULT (BIT(HTT_PPDU_STATS_TAG_COMMON) \
+ 				   | BIT(HTT_PPDU_STATS_TAG_USR_COMMON) \
+ 				   | BIT(HTT_PPDU_STATS_TAG_USR_RATE) \
+@@ -361,6 +365,11 @@ enum htt_ppdu_stats_ru_size {
+        HTT_PPDU_STATS_RU_996x4,
+ };
+ 
++enum htt_stats_frametype {
++	HTT_STATS_FTYPE_TIDQ_DATA_SU = 15,
++	HTT_STATS_FTYPE_TIDQ_DATA_MU,
++};
++
+ /* HTT_H2T_MSG_TYPE_RX_RING_SELECTION_CFG Message
+  *
+  * details:
+@@ -1249,6 +1258,38 @@ enum  htt_ppdu_stats_usr_compln_status {
+ 	HTT_PPDU_STATS_USER_STATUS_ABORT,
+ };
+ 
++#define HTT_STATS_MAX_CHAINS 8
++#define HTT_PPDU_STATS_USR_CMN_FLAG_DELAYBA    BIT(14)
++#define HTT_PPDU_STATS_USR_CMN_HDR_SW_PEERID    GENMASK(31, 16)
++#define HTT_PPDU_STATS_USR_CMN_CTL_FRM_CTRL    GENMASK(15, 0)
++#define HTT_PPDU_STATS_USER_CMN_TLV_TX_PWR_CHAINS_PER_U32 4
++#define HTT_PPDU_STATS_USER_CMN_TX_PWR_ARR_SIZE HTT_STATS_MAX_CHAINS / \
++						HTT_PPDU_STATS_USER_CMN_TLV_TX_PWR_CHAINS_PER_U32
++
++/* Common stats for both control and data packets */
++struct  htt_ppdu_stats_user_common {
++	u8 tid_num;
++	u8 vdev_id;
++	__le16 sw_peer_id;
++	__le32 info;
++	__le32 ctrl;
++	__le32 buffer_paddr_31_0;
++	__le32 buffer_paddr_39_32;
++	__le32 host_opaque_cookie;
++	__le32 qdepth_bytes;
++	__le32 full_aid;
++	__le32 data_frm_ppdu_id;
++	__le32 sw_rts_prot_dur_us;
++	u8 tx_pwr_multiplier;
++	u8 chain_enable_bits;
++	__le16 reserved;
++	/*
++	*tx_pwr is applicable for each radio chain
++	*tx_pwr for each radio chain is a 8 bit value
++	*/
++	__le32 tx_pwr[HTT_PPDU_STATS_USER_CMN_TX_PWR_ARR_SIZE];
++} __packed;
++
+ #define HTT_PPDU_STATS_USR_CMPLTN_CMN_FLAGS_LONG_RETRY_M	GENMASK(3, 0)
+ #define HTT_PPDU_STATS_USR_CMPLTN_CMN_FLAGS_SHORT_RETRY_M	GENMASK(7, 4)
+ #define HTT_PPDU_STATS_USR_CMPLTN_CMN_FLAGS_IS_AMPDU_M		BIT(8)
+@@ -1278,6 +1319,7 @@ struct htt_ppdu_stats_usr_cmpltn_cmn {
+ 
+ #define HTT_PPDU_STATS_NON_QOS_TID	16
+ #define HTT_PPDU_STATS_PPDU_ID         GENMASK(24, 0)
++#define HTT_PPDU_STATS_CMPLTN_FLUSH_INFO_NUM_MPDU GENMASK(16, 8)
+ 
+ struct htt_ppdu_stats_usr_cmpltn_ack_ba_status {
+ 	__le32 ppdu_id;
+@@ -1289,6 +1331,15 @@ struct htt_ppdu_stats_usr_cmpltn_ack_ba_
+ 	__le32 success_bytes;
+ } __packed;
+ 
++/* Flush stats for failed tx completions */
++struct htt_ppdu_stats_cmpltn_flush {
++	__le32 drop_reason;
++	__le32 info;
++	u8 tid_num;
++	u8 queue_type;
++	__le16 sw_peer_id;
++} __packed;
++
+ struct htt_ppdu_user_stats {
+ 	u16 peer_id;
+ 	u16 delay_ba;
+@@ -1297,6 +1348,8 @@ struct htt_ppdu_user_stats {
+ 	struct htt_ppdu_stats_user_rate rate;
+ 	struct htt_ppdu_stats_usr_cmpltn_cmn cmpltn_cmn;
+ 	struct htt_ppdu_stats_usr_cmpltn_ack_ba_status ack_ba;
++	struct htt_ppdu_stats_user_common common;
++	struct htt_ppdu_stats_cmpltn_flush cmpltn_flush;
+ };
+ 
+ #define HTT_PPDU_STATS_MAX_USERS	37

@@ -1,3 +1,7 @@
+# This has been copied from https://github.com/openwrt/openwrt which is under GPL-2.0-only license
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: GPL-2.0-only
+
 NETIFD_MAIN_DIR="${NETIFD_MAIN_DIR:-/lib/netifd}"
 
 . /usr/share/libubox/jshn.sh
@@ -39,10 +43,11 @@ prepare_key_wep() {
 }
 
 _wdev_prepare_channel() {
-	json_get_vars channel band hwmode htmode
+	json_get_vars channel band hwmode cfreq2
 
 	auto_channel=0
 	enable_ht=0
+	htmode=
 	hwmode="${hwmode##11}"
 
 	case "$channel" in
@@ -69,14 +74,7 @@ _wdev_prepare_channel() {
 
 	case "$band" in
 		2g) hwmode=g;;
-		5g) hwmode=a;;
-		6g)
-			hwmode=a;
-			case "$htmode" in
-				HE*|EHT*) wpa3_cipher="GCMP-256 ";;
-				*) wpa3_cipher="";;
-			esac
-		;;
+		5g|6g) hwmode=a;;
 		60g) hwmode=ad;;
 		*)
 			case "$hwmode" in
@@ -86,6 +84,15 @@ _wdev_prepare_channel() {
 			esac
 		;;
 	esac
+}
+
+_wdev_handler_1() {
+	interface=$4
+	json_load "$1"
+	json_select config
+	_wdev_prepare_channel
+	json_select ..
+	eval "drv_$2_$3 \"$interface\""
 }
 
 _wdev_handler() {
@@ -217,28 +224,24 @@ wireless_vif_parse_encryption() {
 	auth_mode_open=1
 	auth_mode_shared=0
 	auth_type=none
+	wpa=0
+	wpa_cipher=
+	eapol_key_index_workaround=0
 
 	if [ "$hwmode" = "ad" ]; then
 		wpa_cipher="GCMP"
 	else
 		wpa_cipher="CCMP"
-		case "$encryption" in
-			sae*|wpa3*|psk3*|owe) wpa_cipher="${wpa3_cipher}$wpa_cipher";;
-		esac
 	fi
 
 	case "$encryption" in
 		*tkip+aes|*tkip+ccmp|*aes+tkip|*ccmp+tkip) wpa_cipher="CCMP TKIP";;
 		*ccmp256) wpa_cipher="CCMP-256";;
-		*aes|*ccmp) wpa_cipher="CCMP";;
-		*tkip) wpa_cipher="TKIP";;
-		*gcmp256) wpa_cipher="GCMP-256";;
-		*gcmp) wpa_cipher="GCMP";;
-		wpa3-192*) wpa_cipher="GCMP-256";;
+		*gcmp | *sae-ext-key | akm24*) wpa_cipher="GCMP CCMP GCMP-256";;
+		*gcmp256 | wpa3-192*) wpa_cipher="GCMP-256";;
+		*aes|*ccmp| psk2 | wpa2 | sae* | owe | dpp) wpa_cipher="CCMP";;
+		*tkip | wpa | psk) wpa_cipher="TKIP";;
 	esac
-
-	# 802.11n requires CCMP for WPA
-	[ "$enable_ht:$wpa_cipher" = "1:TKIP" ] && wpa_cipher="CCMP TKIP"
 
 	# Examples:
 	# psk-mixed/tkip    => WPA1+2 PSK, TKIP
@@ -246,7 +249,7 @@ wireless_vif_parse_encryption() {
 	# wpa2/tkip+aes     => WPA2 RADIUS, CCMP+TKIP
 
 	case "$encryption" in
-		wpa2*|wpa3*|*psk2*|psk3*|sae*|owe*)
+		wpa2*|wpa3*|*psk2*|psk3*|*sae*|owe*|dpp)
 			wpa=2
 		;;
 		wpa*mixed*|*psk*mixed*)
@@ -260,6 +263,13 @@ wireless_vif_parse_encryption() {
 			wpa_cipher=
 		;;
 	esac
+	# Standlone TKIP is no longer allowed
+	# TKIP alone is now prohibited by WFA so the only
+	# combination left must be CCMP+TKIP (wpa=3)
+	[ "$wpa_cipher" = "TKIP" ] && {
+		wpa=3
+		wpa_cipher="CCMP TKIP"
+	}
 	wpa_pairwise="$wpa_cipher"
 
 	case "$encryption" in
@@ -275,11 +285,20 @@ wireless_vif_parse_encryption() {
 		wpa3*)
 			auth_type=eap2
 		;;
-		psk2-radius*)
-			auth_type=psk2-radius
-		;;
 		psk3-mixed*|sae-mixed*)
 			auth_type=psk-sae
+		;;
+		sae-sae_ext_key)
+			auth_type=sae-sae_ext_key
+		;;
+		akm24-sae-mixed)
+			auth_type=psk-sae-sae_ext_key
+		;;
+		sae-ext-key)
+			auth_type=sae-ext-key
+		;;
+		ft-sae-ext-key)
+			auth_type=ft-sae-ext-key
 		;;
 		psk3*|sae*)
 			auth_type=sae
@@ -287,11 +306,19 @@ wireless_vif_parse_encryption() {
 		*psk*)
 			auth_type=psk
 		;;
-		*wpa*|*8021x*)
+		*wpa*)
 			auth_type=eap
+			eapol_key_index_workaround=1
+		;;
+		*8021x*)
+			auth_type=eap
+			eapol_version=2
+			eap_server=0
 		;;
 		*wep*)
 			auth_type=wep
+			wpa=0
+			wpa_pairwise=
 			case "$encryption" in
 				*shared*)
 					auth_mode_open=0
@@ -301,6 +328,9 @@ wireless_vif_parse_encryption() {
 					auth_mode_shared=1
 				;;
 			esac
+		;;
+		dpp)
+			auth_type=dpp;
 		;;
 	esac
 
@@ -318,7 +348,7 @@ _wireless_set_brsnoop_isolation() {
 	json_get_vars isolate proxy_arp
 
 	[ ${isolate:-0} -gt 0 -o -z "$network_bridge" ] && return
-	[ ${multicast_to_unicast:-1} -gt 0 -o ${proxy_arp:-0} -gt 0 ] && json_add_boolean isolate 1
+	[ ${multicast_to_unicast:-0} -gt 0 -o ${proxy_arp:-0} -gt 0 ] && json_add_boolean isolate 1
 }
 
 for_each_interface() {
@@ -385,7 +415,7 @@ for_each_station() {
 }
 
 _wdev_common_device_config() {
-	config_add_string channel hwmode band htmode noscan
+	config_add_string channel hwmode band htmode noscan cfreq2
 }
 
 _wdev_common_iface_config() {

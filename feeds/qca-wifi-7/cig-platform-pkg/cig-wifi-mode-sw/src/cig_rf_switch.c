@@ -12,6 +12,7 @@
 #include <linux/uaccess.h>
 #include <linux/list.h>
 #include <linux/pagemap.h>
+#include <linux/version.h>
 
 #define PROC_NAME "rf_switch"
 #define PARTITION_NAME "RF_SWITCH"
@@ -36,7 +37,13 @@ struct block_device *find_mmc_partition(void)
 	unsigned int i;
 	
 	for (i = 0; i < MAX_MMC_DEVICE; i++) {
-		bdev = blkdev_get_by_dev(MKDEV(MMC_BLOCK_MAJOR, i * CONFIG_MMC_BLOCK_MINORS), FMODE_READ | FMODE_WRITE, NULL);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+		bdev = blkdev_get_by_dev(MKDEV(MMC_BLOCK_MAJOR,
+				i * CONFIG_MMC_BLOCK_MINORS), FMODE_READ | FMODE_WRITE, NULL, NULL);
+#else
+		bdev = blkdev_get_by_dev(MKDEV(MMC_BLOCK_MAJOR,
+				i * CONFIG_MMC_BLOCK_MINORS), FMODE_READ | FMODE_WRITE, NULL);
+#endif
 		if (IS_ERR(bdev)) {
 			pr_err("Failed to open MMC device %u: %ld\n", i, PTR_ERR(bdev));
 			continue;
@@ -44,7 +51,11 @@ struct block_device *find_mmc_partition(void)
 	
 		disk = bdev->bd_disk;
 		if (!disk) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+			blkdev_put(bdev, NULL);
+#else
 			blkdev_put(bdev, FMODE_READ | FMODE_WRITE);
+#endif
 			continue;
 		}
 	
@@ -55,7 +66,11 @@ struct block_device *find_mmc_partition(void)
 			}
 		}
 	
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+		blkdev_put(bdev, NULL);
+#else
 		blkdev_put(bdev, FMODE_READ | FMODE_WRITE);
+#endif
 	}
 	
 	return NULL;
@@ -66,6 +81,7 @@ int read_string_from_emmc(struct block_device *bdev, size_t max_length, char *bu
 	struct bio *bio;
 	struct page *page;
 	int err = 0;
+	int bi_size;
 	void *data;
 
 	page = alloc_page(GFP_KERNEL);
@@ -74,9 +90,18 @@ int read_string_from_emmc(struct block_device *bdev, size_t max_length, char *bu
 	}
 
 	bio = bio_alloc(bdev, __blkdev_sectors_to_bio_pages(1), REQ_OP_READ, GFP_KERNEL);
+	if (!bio) {
+		__free_page(page);
+		return -ENOMEM;
+	}
+
 	bio_set_dev(bio, bdev);
 	bio->bi_iter.bi_sector = 0;
-	bio_add_page(bio, page, PAGE_SIZE, 0);
+	bi_size = bio_add_page(bio, page, PAGE_SIZE, 0);
+	if (bi_size != PAGE_SIZE) {
+		err = -EIO;
+		goto out_bio;
+	}
 
 	submit_bio_wait(bio);
 
@@ -86,9 +111,9 @@ int read_string_from_emmc(struct block_device *bdev, size_t max_length, char *bu
 	}
 
 	data = kmap(page);
-	kunmap(page);
 	memcpy(buffer, data, max_length - 1);
 	buffer[max_length - 1] = '\0';
+	kunmap(page);
 
 out_bio:
 	bio_put(bio);
@@ -143,7 +168,6 @@ static int blkdev_issue_write(struct block_device *bdev, sector_t sector, sector
 	
 	bio->bi_iter.bi_sector = sector;
 	bio_set_dev(bio, bdev);
-	bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
 	
 	sz = bdev_logical_block_size(bdev);
 	bi_size = bio_add_page(bio, page, sz, 0);
@@ -261,7 +285,11 @@ static int __init rf_switch_init(void)
 static void __exit rf_switch_exit(void)
 {
 	if (target_bdev) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+		blkdev_put(target_bdev, NULL);
+#else
 		blkdev_put(target_bdev, FMODE_READ | FMODE_WRITE);
+#endif
 		target_bdev = NULL;
 	}
 	remove_proc_entry(PROC_NAME, NULL);

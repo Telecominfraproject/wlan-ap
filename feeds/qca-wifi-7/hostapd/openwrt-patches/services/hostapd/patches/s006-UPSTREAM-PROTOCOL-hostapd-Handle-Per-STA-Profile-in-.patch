@@ -1,0 +1,196 @@
+From 87a01ec9987ffbaa55b93dab249100314771a375 Mon Sep 17 00:00:00 2001
+From: Hari Naraayana Desikan Kannan <hnaraaya@qti.qualcomm.com>
+Date: Mon, 8 Sep 2025 14:36:59 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: hostapd: Handle Per-STA Profile in BTM for
+ multi-link disassociation
+
+Currently when a BSS Transition Management (BTM) request with
+DISASSOC_IMMINENT is sent to an non-AP MLD STA, hostapd starts the
+disassociation timer on the link where the BTM was transmitted.
+As per IEEE 802.11be Draft 7.0 Section 35.3.14,
+BSS Transition Management Request/Response frames are among the
+individually addressed MMPDUs that shall be intended for an MLD.
+So  BTM request can be sent on any affiliated link, and the
+Neighbor Report may include Per-STA Profile subelements to indicate
+preferred links for load balancing or multi-link reconfiguration.
+
+This behaviour can result in removing links that the STA has indicated
+as preferred, since the preference information is ignored.
+
+Fix by parsing the Common Info and Per-STA Profile subelements in the
+Neighbor Report to determine the set of preferred links. When
+DISASSOC_IMMINENT is set, start disassociation timers only on links
+that are not preferred, ensuring preferred links remain active.
+
+Signed-off-by: Hari Naraayana Desikan Kannan <hnaraaya@qti.qualcomm.com>
+---
+ src/ap/ieee802_11.h     |  2 +
+ src/ap/ieee802_11_eht.c | 88 +++++++++++++++++++++++++++++++++++++++++
+ src/ap/wnm_ap.c         | 43 ++++++++++++++++++++
+ 3 files changed, 133 insertions(+)
+
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -448,6 +448,8 @@ void hostapd_epcs_timeout_handler(void *
+ int hostapd_configure_epcs(struct hostapd_data *hapd,
+ 				  struct sta_info *sta,
+ 				  enum qos_mgmt_req_type req_type);
+ #endif /* CONFIG_IEEE80211BE */
+ u8 * hostapd_fragment_multi_link_element(struct wpabuf *buf, u8 *pos);
++unsigned int wnm_neighbor_report_get_pref_link_mask(const u8 *neigh_rep,
++						    size_t neigh_rep_len);
+ #endif /* IEEE802_11_H */
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -3666,5 +3666,97 @@ int hostapd_ctrl_iface_negotiated_ttlm_c
+ 			len += ret;
+ 	}
+ 
+ 	return len;
+ }
++
++u32 wnm_neighbor_report_get_pref_link_mask(const u8 *neigh_rep,
++					   size_t neigh_rep_len)
++{
++	const u8 *ie, *ie_end, *val, *val_end, *ml, *ml_end, *ml_val, *ml_val_end;
++	u8 eid, elen, id, len, common_len, ml_id, ml_len, link_id, own_link_id;
++	const u8 *end = neigh_rep + neigh_rep_len;
++	const u8 *pos = neigh_rep;
++	u32 mask = 0;
++	u16 sta_ctrl;
++	size_t off;
++
++#define EHT_ML_COMMON_INFO_LEN 13
++	while (pos + 2 <= end) {
++		eid = pos[0];
++		elen = pos[1];
++		ie = pos + 2;
++		ie_end = ie + elen;
++
++		pos += 2 + elen;
++
++		if (ie_end > end)
++			break;
++
++		if (eid != WLAN_EID_NEIGHBOR_REPORT ||
++		    elen < EHT_ML_COMMON_INFO_LEN)
++			continue;
++
++		/* Neighbor Report subelements */
++		off = EHT_ML_COMMON_INFO_LEN;
++		while (ie + off + 2 <= ie_end) {
++			id = ie[off];
++			len = ie[off + 1];
++			val = ie + off + 2;
++			val_end = val + len;
++
++			if (val_end > ie_end)
++				break;
++
++			off += 2 + len;
++
++			if (id != WNM_NEIGHBOR_BASIC_MULTI_LINK || len < 3)
++				continue;
++
++			/* BMLE: [ml_ctrl(2)][common_len(1)]
++			 * [Common Info][ML subelems...]
++			 */
++			common_len = val[2];
++
++			/* Ensure Common Info is fully present */
++			if (val + 2 + common_len > val_end)
++				continue;
++
++			/* If Common Info has [Length] [MLD addr(6)] + [Link-ID(1)],
++			 * consume it
++			 */
++			if (common_len >= 1 + ETH_ALEN + 1) {
++				own_link_id = val[2 + 1 + ETH_ALEN];
++
++				if (own_link_id < MAX_NUM_MLD_LINKS)
++					mask |= BIT(own_link_id);
++			}
++
++			/* Iterate ML subelements after Common Info */
++			ml = val + 2 + common_len;
++			ml_end = val_end;
++
++			while (ml + 2 <= ml_end) {
++				ml_id = ml[0];
++				ml_len = ml[1];
++				ml_val = ml + 2;
++				ml_val_end = ml_val + ml_len;
++
++				if (ml_val_end > ml_end)
++					break;
++				ml += 2 + ml_len;
++
++				if (ml_id != EHT_ML_SUB_ELEM_PER_STA_PROFILE ||
++				    ml_len < 2)
++					continue;
++
++				/* Link-ID is lower 4 bits of STA control (LE16) */
++				sta_ctrl = WPA_GET_LE16(ml_val);
++				link_id = sta_ctrl & 0x0f;
++
++				if (link_id < MAX_NUM_MLD_LINKS)
++					mask |= BIT(link_id);
++			}
++		}
++	}
++	return mask;
++}
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -1202,10 +1202,51 @@ int wnm_send_bss_tm_req(struct hostapd_d
+ 		return -1;
+ 	}
+ 	os_free(buf);
+ 
+ 	hapd->openwrt_stats.wnm.bss_transition_request_tx++;
++
++#ifdef CONFIG_IEEE80211BE
++	/*
++	 * Optional ML reconfig path for STA-initiated reconfig via BTM:
++	 * If DISASSOC_IMMINENT and Neighbor Report includes a Basic Multi-Link
++	 * subelement, start per-link disassoc only on affiliated links NOT present
++	 * in the union of Common-Info Own Link-ID and Per-STA Profile Link-IDs.
++	 */
++	if (ap_sta_is_mld(hapd, sta) &&
++	    (req_mode & WNM_BSS_TM_REQ_DISASSOC_IMMINENT) &&
++	    nei_rep && nei_rep_len) {
++		u32 pref_links =
++			wnm_neighbor_report_get_pref_link_mask(nei_rep, nei_rep_len);
++		if (pref_links) {
++			struct hostapd_data *hapd_ptr;
++
++			for_each_mld_link(hapd_ptr, hapd) {
++				int link_id = hapd_ptr->mld_link_id;
++				struct sta_info *link_sta;
++
++				if (!sta->mld_info.links[link_id].valid)
++					continue;
++
++				/* Keep links explicitly referenced by NR/BMLE */
++				if (pref_links & BIT(link_id))
++					continue;
++
++				link_sta = ap_get_sta(hapd_ptr, sta->addr);
++				if (!link_sta)
++					continue;
++
++				set_disassoc_timer(hapd_ptr, link_sta, disassoc_timer);
++				wpa_printf(MSG_DEBUG,
++					   "WNM: DISASSOC_IMMINENT + NR/BMLE: link_id=%d started per-link disassoc timer(s) for "
++					   MACSTR, link_id, MAC2STR(sta->addr));
++			}
++			return 0;
++		}
++	}
++#endif /* CONFIG_IEEE80211BE */
++
+ 	if (disassoc_timer && sta) {
+ #ifdef CONFIG_IEEE80211BE
+ 		/* Link removal is scheduled only when Link Removal Imminent field is set
+ 		 * in BTM as per IEEE P802.11be/D7.0 - 9.6.13.9 BSS Transition
+ 		 * Management Request frame format else schedule full disconnection */

@@ -1,0 +1,434 @@
+From a44f144e6f8773c5f6d673853e0e6f0cc69b051d Mon Sep 17 00:00:00 2001
+From: Harish Rachakonda <rachakon@qti.qualcomm.com>
+Date: Thu, 31 Jul 2025 01:08:45 +0530
+Subject: [PATCH] QSDP:CP:ath12k:wifi: Parsing of peer confing
+
+Add changes parse NL command containing peer configuration details.
+Extract each peer's MAC address, airtime value, group ID, and configuration
+status bit. Store the airtime and group ID.
+
+Add changes to send peer WMI command with the data received
+through NL vendor command.
+
+Patch-dependency: 0417-001-QSDK-CP-WMI-changes-for-ATF.patch
+		  0417-002-QSDK-CP-NL-vendor-changes-for-ATF-offload.patch 
+Patch-work: None
+
+Signed-off-by: Harish Rachakonda <rachakon@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h   |  15 ++
+ drivers/net/wireless/ath/ath12k/vendor.c | 181 +++++++++++++++++------
+ drivers/net/wireless/ath/ath12k/vendor.h |  32 ++--
+ drivers/net/wireless/ath/ath12k/wmi.h    |  12 ++
+ 4 files changed, 188 insertions(+), 52 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1083,6 +1083,20 @@ struct ath12k_atf_group_info {
+ 	u32 unconfigured_peers_airtime;
+ };
+ 
++struct ath12k_atf_peer_info {
++	u8 peer_macaddr[6];
++	u16 percentage_peer;
++	u16 group_index;
++	u32 explicit_peer_flag;
++};
++
++struct ath12k_atf_peer_params {
++	u32 num_peers;
++	u32 pdev_id;
++	u32 atf_flags;
++	struct ath12k_atf_peer_info *peer_info;
++};
++
+ struct ath12k_atf {
+ 	u32 total_groups;
+ 	struct ath12k_atf_group_info group_info[ATH12K_ATF_MAX_GROUPS];
+--- a/drivers/net/wireless/ath/ath12k/vendor.c
++++ b/drivers/net/wireless/ath/ath12k/vendor.c
+@@ -16,6 +16,7 @@
+ #include "telemetry_agent_if.h"
+ #include "erp.h"
+ #include "vendor_services.h"
++#include "dp_peer.h"
+ 
+ static const struct nla_policy
+ ath12k_wifi_config_policy[QCA_WLAN_VENDOR_ATTR_CONFIG_MAX + 1] = {
+@@ -73,10 +74,20 @@ ath12k_vendor_atf_grouping_param_policy[
+ };
+ 
+ static const struct nla_policy
+-ath12k_vendor_atf_offload_peer_config_policy[QCA_WLAN_VENDOR_ATF_OFFLOAD_PEER_CONFIG_MAX + 1] = {
+-	[QCA_WLAN_VENDOR_ATF_OFFLOAD_NUMBER_OF_PEERS] = {.type = NLA_U32},
+-	[QCA_WLAN_VENDOR_ATF_OFFLOAD_PEER_FLAGS] = {.type = NLA_U32},
+-	[QCA_WLAN_VENDOR_ATF_OFFLOAD_PEER_PAYLOAD] = {.type = NLA_BINARY},
++ath12k_vendor_atf_offload_peer_config_policy[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_CONFIG_MAX + 1] = {
++	[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_NUMBER_OF_PEERS] = {.type = NLA_U32},
++	[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_FULL_UPDATE] = {.type = NLA_FLAG},
++	[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_MORE] = {.type = NLA_FLAG},
++	[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_PAYLOAD] = {.type = NLA_NESTED},
++};
++
++static const struct nla_policy
++ath12k_vendor_atf_peer_param_policy[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_AIRTIME_MAX + 1] = {
++	[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_MAC] = {.type = NLA_BINARY,
++						      .len = ETH_ALEN},
++	[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_AIRTIME] = {.type = NLA_U16},
++	[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_GROUP_INDEX] = {.type = NLA_U16},
++	[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_CONFIGURED] = {.type = NLA_FLAG},
+ };
+ 
+ static const struct nla_policy
+@@ -5617,70 +5628,123 @@ static int ath12k_vendor_atf_offload_wmm
+ 	return ret;
+ }
+ 
++static void ath12k_update_atf_peer_info(struct ath12k *ar,
++					struct ath12k_atf_peer_params *peer_param)
++{
++	struct ath12k_dp *dp;
++	struct ath12k_dp_link_peer *link_peer;
++	struct ath12k_atf_peer_info *param_peer_info;
++	struct ath12k_base *ab = ar->ab;
++	int i;
++
++	param_peer_info = peer_param->peer_info;
++
++	dp = ath12k_ab_to_dp(ab);
++	spin_lock_bh(&dp->dp_lock);
++
++	for (i = 0; i < peer_param->num_peers; i++) {
++		link_peer = ath12k_dp_link_peer_find_by_addr(dp, param_peer_info->peer_macaddr);
++		if (!link_peer)
++			continue;
++
++		link_peer->atf_peer_conf_airtime = param_peer_info->percentage_peer;
++		link_peer->atf_group_index = param_peer_info->group_index;
++	}
++
++	spin_unlock_bh(&dp->dp_lock);
++}
++
+ static int ath12k_vendor_atf_offload_peer_config(struct ath12k *ar,
+ 						 struct nlattr *peer_config)
+ {
+-	struct nlattr *tb[QCA_WLAN_VENDOR_ATF_OFFLOAD_PEER_CONFIG_MAX + 1];
+-	struct ath12k_wmi_pdev *wmi = ar->wmi;
+-	struct sk_buff *skb;
+-	void *buf, *ptr;
+-	u32 buf_len, len;
+-	int ret;
+-	struct wmi_peer_atf_request_fixed_param *cmd;
+-	u32 num_peers, atf_flags, pdev_id = ar->pdev->pdev_id;
+-	struct wmi_tlv *tlv;
+-
+-	len = sizeof(*cmd) + TLV_HDR_SIZE;
++	struct nlattr *tb[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_CONFIG_MAX + 1];
++	struct nlattr *peer_attr;
++	struct nlattr *peer[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_AIRTIME_MAX + 1];
++	struct ath12k_atf_peer_params atf_peer_param = {0};
++	struct ath12k_atf_peer_info *peer_info;
++	int ret, rem, num_peers = 0;
+ 
+-	ret = nla_parse_nested(tb, QCA_WLAN_VENDOR_ATF_OFFLOAD_PEER_CONFIG_MAX,
++	ret = nla_parse_nested(tb, QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_CONFIG_MAX,
+ 			       peer_config,
+ 			       ath12k_vendor_atf_offload_peer_config_policy, NULL);
+ 	if (ret) {
+-		ath12k_err(ar->ab, "No data present in ATF peer condig command\n");
++		ath12k_err(ar->ab, "ATF: No data present in ATF peer condig command\n");
+ 		return ret;
+ 	}
+ 
+-	num_peers = nla_get_u8(tb[QCA_WLAN_VENDOR_ATF_OFFLOAD_NUMBER_OF_PEERS]);
+-	atf_flags = nla_get_u8(tb[QCA_WLAN_VENDOR_ATF_OFFLOAD_PEER_FLAGS]);
+-	buf = nla_data(tb[QCA_WLAN_VENDOR_ATF_OFFLOAD_PEER_PAYLOAD]);
+-	buf_len = nla_len(tb[QCA_WLAN_VENDOR_ATF_OFFLOAD_PEER_PAYLOAD]);
+-	if (!buf_len) {
+-		ath12k_warn(ar->ab, "No data present in ATF peer config command\n");
+-			return -EINVAL;
++	if (!tb[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_NUMBER_OF_PEERS]) {
++		ath12k_err(ar->ab, "ATF: Number of peers is missing");
++		return -EINVAL;
+ 	}
+-	len += buf_len;
++	atf_peer_param.num_peers =
++		nla_get_u8(tb[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_NUMBER_OF_PEERS]);
+ 
+-	skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, len);
+-	if (!skb)
+-		return -ENOMEM;
++	if (!tb[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_PAYLOAD]) {
++		ath12k_err(ar->ab, "ATF: Peer payload is missing");
++		return -EINVAL;
++	}
+ 
+-	ptr = skb->data;
+-	cmd = (struct wmi_peer_atf_request_fixed_param *)ptr;
+-	memcpy(skb->data, buf, buf_len);
+-	cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_PEER_ATF_REQUEST,
+-						 sizeof(*cmd));
+-	cmd->num_peers = cpu_to_le32(num_peers);
+-	cmd->pdev_id = cpu_to_le32(pdev_id);
+-	cmd->atf_flags = cpu_to_le32(atf_flags);
+-	ptr += sizeof(*cmd);
++	if (tb[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_FULL_UPDATE])
++		atf_peer_param.atf_flags = FIELD_PREP(WMI_ATF_FULL_UPDATE, 1);
+ 
+-	tlv = (struct wmi_tlv *)ptr;
+-	tlv->header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_ARRAY_STRUCT, TLV_HDR_SIZE);
+-	ptr += TLV_HDR_SIZE;
++	if (tb[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_MORE])
++		atf_peer_param.atf_flags = atf_peer_param.atf_flags |
++					   FIELD_PREP(WMI_ATF_PEER_PENDING, 1);
+ 
+-	memcpy(ptr, buf, buf_len);
++	atf_peer_param.atf_flags = atf_peer_param.atf_flags |
++				   FIELD_PREP(WMI_ATF_PEER_VALID_PDEV, 1);
+ 
+-	ath12k_dbg(ar->ab, ATH12K_DBG_WMI,
+-		   "WMI ATF peer config for num_peers %u pdev id %u atf_flags %u\n",
+-		   num_peers, pdev_id, atf_flags);
++	atf_peer_param.pdev_id = ar->pdev->pdev_id;
+ 
+-	ret = ath12k_wmi_cmd_send(wmi, skb, WMI_PEER_ATF_REQUEST_CMDID);
+-	if (ret) {
+-		ath12k_warn(ar->ab,
+-			    "failed to submit WMI_PEER_ATF_REQUEST_CMDID cmd\n");
+-		dev_kfree_skb(skb);
++	peer_info = kzalloc(atf_peer_param.num_peers * sizeof(struct ath12k_atf_peer_info),
++			    GFP_KERNEL);
++	if (!peer_info) {
++		ath12k_err(ar->ab, "ATF: Failed to allocate memory for peer_info");
++		return -ENOMEM;
+ 	}
+ 
++	nla_for_each_nested(peer_attr,
++			    tb[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_PAYLOAD],
++			    rem) {
++		ret = nla_parse_nested(peer, QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_AIRTIME_MAX,
++				       peer_attr, ath12k_vendor_atf_peer_param_policy, NULL);
++		if (ret) {
++			ath12k_warn(ar->ab, "ATF: Peer payload is invalid");
++			kfree(peer_info);
++			return -EINVAL;
++		}
++
++		if (!peer[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_MAC] ||
++		    !(nla_len(peer[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_MAC]) == ETH_ALEN) ||
++		    !peer[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_AIRTIME] ||
++		    !peer[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_GROUP_INDEX]) {
++			ath12k_warn(ar->ab, "ATF: All peer parameters not present");
++			kfree(peer_info);
++			return -EINVAL;
++		}
++
++
++		memcpy(peer_info[num_peers].peer_macaddr,
++		       nla_data(peer[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_MAC]), ETH_ALEN);
++		peer_info[num_peers].percentage_peer =
++			nla_get_u16(peer[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_AIRTIME]);
++		peer_info[num_peers].group_index =
++			nla_get_u16(peer[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_GROUP_INDEX]);
++		if (peer[QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_CONFIGURED])
++			peer_info[num_peers].explicit_peer_flag = 1;
++		else
++			peer_info[num_peers].explicit_peer_flag = 0;
++		num_peers++;
++	}
++
++	atf_peer_param.peer_info = peer_info;
++
++	ath12k_update_atf_peer_info(ar, &atf_peer_param);
++	ret = ath12k_wmi_atf_send_peer_config(ar, &atf_peer_param);
++	if (ret)
++		ath12k_warn(ar->ab, "Failed to send peer config");
++
++	kfree(peer_info);
+ 	return ret;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/vendor.h
++++ b/drivers/net/wireless/ath/ath12k/vendor.h
+@@ -960,16 +960,30 @@ enum qca_wlan_vendor_attr_atf_offload_ss
+ 	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_SSID_GROUP_LAST - 1,
+ };
+ 
+-enum qca_wlan_vendor_atf_offload_peer_config {
+-	QCA_WLAN_VENDOR_ATF_OFFLOAD_PEER_INVALID = 0,
+-	QCA_WLAN_VENDOR_ATF_OFFLOAD_NUMBER_OF_PEERS = 1,
+-	QCA_WLAN_VENDOR_ATF_OFFLOAD_PEER_FLAGS = 2,
+-	QCA_WLAN_VENDOR_ATF_OFFLOAD_PEER_PAYLOAD = 3,
++enum qca_wlan_vendor_attr_atf_offload_peer_config {
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_INVALID = 0,
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_NUMBER_OF_PEERS = 1,
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_FULL_UPDATE = 2,
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_MORE = 3,
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_PAYLOAD = 4,
+ 
+-	/*keep last */
+-	QCA_WLAN_VENDOR_ATF_OFFLOAD_PEER_CONFIG_LAST,
+-	QCA_WLAN_VENDOR_ATF_OFFLOAD_PEER_CONFIG_MAX =
+-		QCA_WLAN_VENDOR_ATF_OFFLOAD_PEER_CONFIG_LAST - 1,
++	/* keep last */
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_CONFIG_LAST,
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_CONFIG_MAX =
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_CONFIG_LAST - 1,
++};
++
++enum qca_wlan_vendor_attr_atf_offload_peer {
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_AIRTIME_INVALID = 0,
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_MAC = 1,
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_AIRTIME = 2,
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_GROUP_INDEX = 3,
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_CONFIGURED = 4,
++
++	/* keep last */
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_AIRTIME_MAX,
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_AIRTIME_LAST =
++	QCA_WLAN_VENDOR_ATTR_ATF_OFFLOAD_PEER_AIRTIME_MAX - 1,
+ };
+ 
+ enum qca_wlan_vendor_atf_offload_sched_duration {
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -29,6 +29,7 @@ struct ath12k_link_vif;
+ struct ath12k_fw_stats;
+ struct ath12k_reg_tpc_power_info;
+ struct ath12k_qos_params;
++struct ath12k_atf_peer_params;
+ 
+ extern const char *mgmt_frame_name[];
+ 
+@@ -2297,6 +2298,7 @@ enum wmi_tlv_tag {
+ 	WMI_TAG_MLO_PRIMARY_LINK_PEER_MIGRATION_COMPL_FIXED_PARAM = 0x4a5,
+ 	WMI_TAG_MLO_PRIMARY_LINK_PEER_MIGRATION_STATUS = 0x4a6,
+ 	WMI_TAG_ATF_SSID_GROUPING_REQUEST_EVENT_V2 = 0x4a7,
++	WMI_TAG_ATF_PEER_REQUEST_EVENT_V2 = 0x4A8,
+ 	WMI_TAG_PDEV_WSI_STATS_INFO_CMD = 0x4b1,
+ 	WMI_TAG_PDEV_DFS_RADAR_FLAGS = 0x4b4,
+ 	WMI_TAG_VDEV_CH_PSD_POWER_INFO = 0x4bc,
+@@ -8850,6 +8852,12 @@ struct wmi_atf_ssid_grp_request_fixed_pa
+ 	__le32 pdev_id;
+ };
+ 
++#define WMI_ATF_PEER_AIRTIME GENMASK(15, 0)
++#define WMI_ATF_PEER_GROUP_ID GENMASK(23, 16)
++#define WMI_ATF_PEER_CONFIGURED GENMASK(24, 24)
++#define WMI_ATF_PEER_PENDING GENMASK(1, 1)
++#define WMI_ATF_PEER_VALID_PDEV GENMASK(2, 2)
++#define WMI_ATF_FULL_UPDATE GENMASK(0, 0)
+ #define WMI_ATF_GROUP_SCHED_POLICY GENMASK(3, 0)
+ #define WMI_ATF_GROUP_NUM_IMPLICIT_PEERS GENMASK(31, 16)
+ #define WMI_ATF_GROUP_NUM_EXPLICIT_PEERS GENMASK(15, 0)
+@@ -8870,6 +8878,12 @@ struct wmi_peer_atf_request_fixed_param
+ 	__le32 atf_flags;
+ };
+ 
++struct wmi_atf_peer_info {
++	__le32 tlv_header;
++	__u8 peer_macaddr[6];
++	__le32 atf_peer_info;
++};
++
+ #define WMI_TLT_MAX_LINKS 5
+ #define WMI_TLT_NUM_TID_PER_AC 2
+ #define MLO_3LINK_MAX_RECOM_ACTIVE_LINKS 3
+@@ -9218,4 +9232,6 @@ int ath12k_wmi_send_mlo_peer_tid_to_link
+ int ath12k_wmi_ap_tid_to_link_map_config(struct ath12k *ar,
+ 					 struct ath12k_wmi_tid_to_link_map_ap_params *params);
+ int ath12k_wmi_atf_send_group_config(struct ath12k *ar);
++int ath12k_wmi_atf_send_peer_config(struct ath12k *ar,
++				    struct ath12k_atf_peer_params *peer_param);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.h
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.h
+@@ -130,6 +130,8 @@ struct ath12k_dp_link_peer {
+ 	bool assoc_success; /* information on peer assoc status from firmware */
+ 	u32 flow_cnt[ATH12K_DATA_TID_MAX];
+ 	u8 tid_weight[ATH12K_DATA_TID_MAX];
++	u32 atf_peer_conf_airtime;
++	u8 atf_group_index;
+ };
+ 
+ struct ath12k_dp_peer {
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -17921,3 +17921,76 @@ int ath12k_wmi_atf_send_group_config(str
+ 	return ret;
+ }
+ 
++int ath12k_wmi_atf_send_peer_config(struct ath12k *ar,
++				    struct ath12k_atf_peer_params *peer_param)
++{
++	struct ath12k_wmi_pdev *wmi = ar->wmi;
++	struct wmi_peer_atf_request_fixed_param *cmd;
++	struct ath12k_atf_peer_info *param_peer_info;
++	struct wmi_atf_peer_info *peer_info;
++	struct sk_buff *skb;
++	struct wmi_tlv *tlv;
++	void *ptr;
++	int ret, len, i;
++
++	len = sizeof(*cmd) + TLV_HDR_SIZE + TLV_HDR_SIZE;
++	len += peer_param->num_peers * sizeof(*peer_info);
++	skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, len);
++	if (!skb) {
++		ath12k_err(ar->ab, "failed to allocate skb");
++		return -ENOMEM;
++	}
++
++	ptr = skb->data;
++
++	cmd = (struct wmi_peer_atf_request_fixed_param *)ptr;
++	cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_PEER_ATF_REQUEST,
++						 sizeof(*cmd));
++	cmd->num_peers = cpu_to_le32(peer_param->num_peers);
++	cmd->pdev_id = cpu_to_le32(peer_param->pdev_id);
++	cmd->atf_flags = cpu_to_le32(peer_param->atf_flags);
++	ptr += sizeof(*cmd);
++
++	/* Adding two tag array structs because the WMI command structure expects two array
++	 * arguments. Since the first one is deprecated, it will be sent with a size of 0.
++	 */
++	tlv = (struct wmi_tlv *)ptr;
++	tlv->header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_ARRAY_STRUCT, TLV_HDR_SIZE);
++	ptr += TLV_HDR_SIZE;
++
++	tlv = (struct wmi_tlv *)ptr;
++	tlv->header = ath12k_wmi_tlv_hdr(WMI_TAG_ARRAY_STRUCT,
++					 peer_param->num_peers *
++					 sizeof(*peer_info));
++	ptr += TLV_HDR_SIZE;
++
++	param_peer_info = peer_param->peer_info;
++
++	peer_info = (struct wmi_atf_peer_info *)ptr;
++	for (i = 0; i < peer_param->num_peers; i++) {
++		peer_info->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_ATF_PEER_REQUEST_EVENT_V2,
++							       sizeof(*peer_info));
++		memcpy(peer_info->peer_macaddr, param_peer_info->peer_macaddr, ETH_ALEN);
++		peer_info->atf_peer_info =
++			le32_encode_bits(param_peer_info->percentage_peer, WMI_ATF_PEER_AIRTIME) |
++			le32_encode_bits(param_peer_info->group_index, WMI_ATF_PEER_GROUP_ID) |
++			le32_encode_bits(param_peer_info->explicit_peer_flag,
++					 WMI_ATF_PEER_CONFIGURED);
++		peer_info++;
++		param_peer_info++;
++	}
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_WMI,
++		   "ATF: WMI ATF peer config for num_peers %u pdev id %u atf_flags %u peers %u\n",
++		   peer_param->num_peers, peer_param->pdev_id,
++		   peer_param->atf_flags, peer_param->num_peers);
++	ret = ath12k_wmi_cmd_send(wmi, skb, WMI_PEER_ATF_REQUEST_CMDID);
++	if (ret) {
++		ath12k_warn(ar->ab,
++			    "failed to submit WMI_PEER_ATF_REQUEST_CMDID cmd\n");
++		dev_kfree_skb(skb);
++	}
++
++	return ret;
++}
++

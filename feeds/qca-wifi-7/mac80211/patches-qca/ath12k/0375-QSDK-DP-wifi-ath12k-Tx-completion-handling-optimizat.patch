@@ -1,0 +1,586 @@
+From edf002d7c4ff8b3bf487c8e67b12ed2476c7cf5f Mon Sep 17 00:00:00 2001
+From: Ripan Deuri <rdeuri@qti.qualcomm.com>
+Date: Wed, 25 Jun 2025 17:48:12 +0530
+Subject: [PATCH 2/3] QSDK: DP: wifi: ath12k: Tx completion handling
+ optimization
+
+The following optimizations are done in Tx completion handling:
+1. Added budget in NAPI handling to avoid RCU and backpressure issues
+
+2. Currently Tx completion code is organized as below:
+   /* Reap Logic */
+   Loop 1 {
+       Fetch descriptor from HW and copy data into software strctures
+   }
+
+   /* Processing Logic and Tx descriptor replenish */
+   Loop 2 {
+       Fetch software tx descriptor using cookie
+       Process tx descriptor and skb
+       Attach tx descriptor back to free list acquiring required descriptor lock
+   }
+
+   In this patch, Tx completion handler has been revamped as below:
+
+    Introduction and usage of scratch pad buffer "tx_status_buf[ATH12K_HW_MAX_QUEUES]".
+    This memory is used to copy data from HW Tx descriptor entry at the
+    time of reap. The field sw_metadata of this buffer are filled with all the
+    data required for processing.
+
+   /* Reap Logic */
+   Loop 1 {
+       Fetch descriptor from HW and copy data into scratch pad buffer
+   }
+
+   /* SW Tx Descriptor Reset and Replenish */
+   Acquire descriptor lock
+   Loop 2 {
+       Copy data from tx_desc into sw metadata
+       Reset tx_desc fields
+   }
+   Attach tx descriptors back to free list
+   Release lock
+
+   /* Processing Logic */
+   Loop 3 {
+       Processing of skb attached to sw_metadata
+   }
+
+   With above change, the tx descriptor replenish happens in batched mode
+   and those are replenished even before skb processing which significantly
+   reduces the contention.
+
+Signed-off-by: Ripan Deuri <rdeuri@qti.qualcomm.com>
+Signed-off-by: Harsh Kumar Bijlani <hbijlani@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c          |  40 ++--
+ drivers/net/wireless/ath/ath12k/dp.h          |   4 +
+ drivers/net/wireless/ath/ath12k/dp_cmn.h      |   1 +
+ drivers/net/wireless/ath/ath12k/pcic.c        |   4 +-
+ drivers/net/wireless/ath/ath12k/wifi7/dp.c    |   6 +-
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c | 177 ++++++++++++------
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h |   2 +-
+ 7 files changed, 156 insertions(+), 78 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp.c b/drivers/net/wireless/ath/ath12k/dp.c
+index cd00e4d..e4666d1 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -1386,7 +1386,6 @@ static void ath12k_dp_reoq_lut_cleanup(struct ath12k_base *ab)
+ static void ath12k_dp_cleanup(struct ath12k_base *ab)
+ {
+ 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+-	int i;
+ 
+ 	if (!dp->ab)
+ 		return;
+@@ -1402,11 +1401,6 @@ static void ath12k_dp_cleanup(struct ath12k_base *ab)
+ 
+ 	ath12k_dp_rx_reo_cmd_list_cleanup(ab);
+ 
+-	for (i = 0; i < ab->hw_params->max_tx_ring; i++) {
+-		kfree(dp->tx_ring[i].tx_status);
+-		dp->tx_ring[i].tx_status = NULL;
+-	}
+-
+ 	ath12k_dp_rx_free(ab);
+ 	/* Deinit any SOC level resource */
+ }
+@@ -1980,21 +1974,9 @@ static int ath12k_dp_setup(struct ath12k_base *ab)
+ 		goto fail_cmn_srng_cleanup;
+ 	}
+ 
+-	for (i = 0; i < ab->hw_params->max_tx_ring; i++) {
++	for (i = 0; i < ab->hw_params->max_tx_ring; i++)
+ 		dp->tx_ring[i].tcl_data_ring_id = i;
+ 
+-		dp->tx_ring[i].tx_status_head = 0;
+-		dp->tx_ring[i].tx_status_tail = DP_TX_COMP_RING_SIZE - 1;
+-		dp->tx_ring[i].tx_status = kmalloc(size, GFP_KERNEL);
+-		if (!dp->tx_ring[i].tx_status) {
+-			ret = -ENOMEM;
+-			/* FIXME: The allocated tx status is not freed
+-			 * properly here
+-			 */
+-			goto fail_cmn_reoq_cleanup;
+-		}
+-	}
+-
+ 	for (i = 0; i < HAL_DSCP_TID_MAP_TBL_NUM_ENTRIES_MAX; i++)
+ 		ath12k_hal_tx_set_dscp_tid_map(ab, i);
+ 
+@@ -2009,7 +1991,6 @@ static int ath12k_dp_setup(struct ath12k_base *ab)
+ fail_dp_rx_free:
+ 	ath12k_dp_rx_free(ab);
+ 
+-fail_cmn_reoq_cleanup:
+ 	ath12k_dp_reoq_lut_cleanup(ab);
+ 
+ fail_cmn_srng_cleanup:
+@@ -2059,9 +2040,17 @@ void ath12k_dp_cmn_hw_group_unassign(struct ath12k_dp *dp,
+ 				     struct ath12k_hw_group *ag)
+ {
+ 	struct ath12k_dp_hw_group *dp_hw_grp = &ag->dp_hw_grp;
++	int i;
+ 
+ 	lockdep_assert_held(&ag->mutex);
+ 
++	for (i = 0; i < ATH12K_HW_MAX_QUEUES; i++) {
++		if (!dp_hw_grp->tx_status_buf[i])
++			continue;
++		kfree(dp_hw_grp->tx_status_buf[i]);
++		dp_hw_grp->tx_status_buf[i] = NULL;
++	}
++
+ 	if (dp_hw_grp->fst) {
+ 		ath12k_dp_rx_fst_detach(dp->ab, dp_hw_grp->fst);
+ 		dp_hw_grp->fst = NULL;
+@@ -2078,6 +2067,7 @@ void ath12k_dp_cmn_hw_group_assign(struct ath12k_dp *dp,
+ {
+ 	struct ath12k_base *ab = dp->ab;
+ 	struct ath12k_dp_hw_group *dp_hw_grp = &ag->dp_hw_grp;
++	int i;
+ 
+ 	dp->dp_hw_grp = dp_hw_grp;
+ 	dp->device_id = ab->device_id;
+@@ -2085,6 +2075,16 @@ void ath12k_dp_cmn_hw_group_assign(struct ath12k_dp *dp,
+ 
+ 	if (!dp_hw_grp->fst)
+ 		dp_hw_grp->fst = ath12k_dp_rx_fst_attach(ab);
++
++	for (i = 0; i < ATH12K_HW_MAX_QUEUES; i++) {
++		if (dp_hw_grp->tx_status_buf[i])
++			continue;
++
++		/* Each arch tx completion handler can use this buffer by typecasting its own
++		 * entry struct (aligned to 32 or 64 bytes).
++		 */
++		dp_hw_grp->tx_status_buf[i] = kzalloc(TX_STATUS_BUFFER_SIZE, GFP_KERNEL);
++	}
+ }
+ 
+ static void ath12k_dp_srng_hw_disable(struct ath12k_base *ab, struct dp_srng *ring)
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+index 4500edc..fce113e 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -19,6 +19,10 @@
+ 
+ #define MAX_RXDMA_PER_PDEV     2
+ 
++#define MAX_NAPI_BUDGET             128
++#define TX_STATUS_ENTRY_MAX_SIZE    64
++#define TX_STATUS_BUFFER_SIZE       (TX_STATUS_ENTRY_MAX_SIZE * MAX_NAPI_BUDGET)
++
+ extern struct ath12k_ppeds_desc_params ath12k_ppeds_desc_params;
+ 
+ struct ath12k_base;
+diff --git a/drivers/net/wireless/ath/ath12k/dp_cmn.h b/drivers/net/wireless/ath/ath12k/dp_cmn.h
+index 5927305..8f4fd9d 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_cmn.h
++++ b/drivers/net/wireless/ath/ath12k/dp_cmn.h
+@@ -40,6 +40,7 @@ struct ath12k_dp_hw_group {
+ 	struct ath12k_dp_hw_link hw_links[ATH12K_GROUP_MAX_RADIO];
+ 	struct ath12k_dp *dp[ATH12K_MAX_SOCS];
+ 	struct dp_rx_fst *fst;
++	u8 *tx_status_buf[ATH12K_HW_MAX_QUEUES];
+ };
+ 
+ /* TODO: Move this to a seperate dp_stats file */
+diff --git a/drivers/net/wireless/ath/ath12k/pcic.c b/drivers/net/wireless/ath/ath12k/pcic.c
+index 8e2d217..e53c3b3 100644
+--- a/drivers/net/wireless/ath/ath12k/pcic.c
++++ b/drivers/net/wireless/ath/ath12k/pcic.c
+@@ -431,8 +431,8 @@ int ath12k_pcic_ext_cfg_gic_msi_irq(struct ath12k_base *ab,
+ 	if (ab->hw_params->ring_mask->tx[i])
+ 		budget = tx_comp_budget;
+ 
+-	netif_napi_add(napi_ndev, &irq_grp->napi,
+-		       ath12k_pcic_ext_grp_napi_poll);
++	netif_napi_add_weight(napi_ndev, &irq_grp->napi,
++		       ath12k_pcic_ext_grp_napi_poll, budget);
+ 
+ 	if (ab->hw_params->ring_mask->tx[i] ||
+ 	    ab->hw_params->ring_mask->rx[i] ||
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp.c b/drivers/net/wireless/ath/ath12k/wifi7/dp.c
+index 7fc1f19..87f9bc4 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp.c
+@@ -34,7 +34,11 @@ static int ath12k_wifi7_dp_service_srng(struct ath12k_dp *dp,
+ 	while (tx_mask) {
+ 		i = fls(tx_mask) - 1;
+ 		tx_mask ^= 1 << i;
+-		ath12k_wifi7_dp_tx_completion_handler(dp, i);
++		work_done = ath12k_wifi7_dp_tx_completion_handler(dp, i, budget);
++		budget -= work_done;
++		tot_work_done += work_done;
++		if (budget <= 0)
++			goto done;
+ 	}
+ 
+ 	if (dp->hw_params->ring_mask->rx_err[grp_id]) {
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+index 8f0394f..4abac0f 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -13,6 +13,18 @@
+ #include "../debugfs_sta.h"
+ #include "../debugfs.h"
+ 
++struct ath12k_tx_sw_metadata {
++	struct sk_buff *skb;
++	struct sk_buff *skb_ext_desc;
++	u8 mac_id       : 5,
++	  flags        : 1;
++} __packed __aligned(32);
++
++struct ath12k_wifi7_tx_status_entry {
++	struct hal_wbm_completion_ring_tx tx_status;
++	struct ath12k_tx_sw_metadata sw_metadata;
++} __packed;
++
+ static enum hal_tcl_encap_type
+ ath12k_dp_tx_get_encap_type(struct ath12k_base *ab, struct sk_buff *skb)
+ {
+@@ -168,7 +180,7 @@ tcl_ring_sel:
+ 
+ 	tx_ring = &dp->tx_ring[ti.ring_id];
+ 
+-	tx_desc = ath12k_dp_tx_assign_buffer(dp, pool_id);
++	tx_desc = ath12k_dp_tx_assign_buffer(dp, ti.ring_id);
+ 	if (!tx_desc) {
+ 		dp->device_stats.tx_err.txbuf_na[ti.ring_id]++;
+ 		return -ENOMEM;
+@@ -453,7 +465,8 @@ fail_unmap_dma:
+ 	ath12k_core_dma_unmap_single(dp->dev, ti.paddr, ti.data_len, DMA_TO_DEVICE);
+ 
+ fail_remove_tx_buf:
+-	ath12k_dp_tx_release_txbuf(dp, tx_desc, pool_id);
++	if (tx_desc)
++		ath12k_dp_tx_release_txbuf(dp, tx_desc, ti.ring_id);
+ 
+ 	spin_lock_bh(&arvif->link_stats_lock);
+ 	arvif->link_stats.tx_dropped++;
+@@ -468,12 +481,12 @@ fail_remove_tx_buf:
+ static void ath12k_wifi7_dp_tx_free_txbuf(struct ath12k_dp *dp,
+ 					  struct sk_buff *msdu,
+ 					  struct dp_tx_ring *tx_ring,
+-					  struct ath12k_tx_desc_info *tx_desc)
++					  struct ath12k_tx_sw_metadata *sw_metadata)
+ {
+ 	struct ath12k_pdev_dp *dp_pdev;
+ 	struct ath12k_skb_cb *skb_cb;
+-	struct sk_buff *skb_ext_desc = tx_desc->skb_ext_desc;
+-	u8 pdev_id = ath12k_hw_mac_id_to_pdev_id(dp->hw_params, tx_desc->mac_id);
++	struct sk_buff *skb_ext_desc = sw_metadata->skb_ext_desc;
++	u8 pdev_id = ath12k_hw_mac_id_to_pdev_id(dp->hw_params, sw_metadata->mac_id);
+ 
+ 	skb_cb = ATH12K_SKB_CB(msdu);
+ 	dp_pdev = dp->dp_pdevs[pdev_id];
+@@ -488,7 +501,7 @@ static void ath12k_wifi7_dp_tx_free_txbuf(struct ath12k_dp *dp,
+ 	if (atomic_dec_and_test(&dp_pdev->num_tx_pending))
+ 		wake_up(&dp_pdev->tx_empty_waitq);
+ 
+-	if (tx_desc->flags & DP_TX_DESC_FLAG_FAST)
++	if (sw_metadata->flags & DP_TX_DESC_FLAG_FAST)
+ 		dev_kfree_skb_any(msdu);
+ 	else
+ 		ieee80211_free_txskb(dp_pdev->hw, msdu);
+@@ -499,7 +512,7 @@ ath12k_wifi7_dp_tx_htt_tx_complete_buf(struct ath12k_base *ab,
+ 				       struct sk_buff *msdu,
+ 				       struct dp_tx_ring *tx_ring,
+ 				       struct ath12k_dp_htt_wbm_tx_status *ts,
+-				       struct ath12k_tx_desc_info *tx_desc,
++				       struct ath12k_tx_sw_metadata *sw_metadata,
+ 				       u16 peer_id)
+ {
+ 	struct ieee80211_tx_status status = { 0 };
+@@ -511,7 +524,7 @@ ath12k_wifi7_dp_tx_htt_tx_complete_buf(struct ath12k_base *ab,
+ 	struct ath12k_dp_link_peer *peer;
+ 	struct ath12k *ar;
+ 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+-	struct sk_buff *skb_ext_desc = tx_desc->skb_ext_desc;
++	struct sk_buff *skb_ext_desc = sw_metadata->skb_ext_desc;
+ 
+ 	skb_cb = ATH12K_SKB_CB(msdu);
+ 	info = IEEE80211_SKB_CB(msdu);
+@@ -529,7 +542,7 @@ ath12k_wifi7_dp_tx_htt_tx_complete_buf(struct ath12k_base *ab,
+ 		dev_kfree_skb_any(skb_ext_desc);
+ 	}
+ 
+-	if (tx_desc->flags & DP_TX_DESC_FLAG_FAST) {
++	if (sw_metadata->flags & DP_TX_DESC_FLAG_FAST) {
+ 		dev_kfree_skb_any(msdu);
+ 		return;
+ 	}
+@@ -583,7 +596,7 @@ static void
+ ath12k_wifi7_dp_tx_process_htt_tx_complete(struct ath12k_base *ab,
+ 					   void *desc, struct sk_buff *msdu,
+ 					   struct dp_tx_ring *tx_ring,
+-					   struct ath12k_tx_desc_info *tx_desc)
++					   struct ath12k_tx_sw_metadata *sw_metadata)
+ {
+ 	struct htt_tx_wbm_completion *status_desc;
+ 	struct ath12k_dp_htt_wbm_tx_status ts = {0};
+@@ -606,14 +619,14 @@ ath12k_wifi7_dp_tx_process_htt_tx_complete(struct ath12k_base *ab,
+ 				info3, HAL_WBM_COMPL_TX_INFO3_PEER_ID);
+ 
+ 		ath12k_wifi7_dp_tx_htt_tx_complete_buf(ab, msdu, tx_ring, &ts,
+-						       tx_desc, peer_id);
++						       sw_metadata, peer_id);
+ 		break;
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_DROP:
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_TTL:
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_REINJ:
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_INSPECT:
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_VDEVID_MISMATCH:
+-		ath12k_wifi7_dp_tx_free_txbuf(dp, msdu, tx_ring, tx_desc);
++		ath12k_wifi7_dp_tx_free_txbuf(dp, msdu, tx_ring, sw_metadata);
+ 		break;
+ 	case HAL_WBM_REL_HTT_TX_COMP_STATUS_MEC_NOTIFY:
+ 		/* This event is to be handled only when the driver decides to
+@@ -772,7 +785,7 @@ ath12k_wifi7_dp_tx_update_txcompl(struct ath12k_pdev_dp *dp_pdev,
+ static void ath12k_wifi7_dp_tx_complete_msdu(struct ath12k_pdev_dp *dp_pdev,
+ 					     struct sk_buff *msdu,
+ 					     struct hal_tx_status *ts,
+-					     struct ath12k_tx_desc_info *tx_desc,
++					     struct ath12k_tx_sw_metadata *sw_metadata,
+ 					     u8 mac_id, int ring)
+ {
+ 	struct ieee80211_tx_status status = { 0 };
+@@ -786,7 +799,7 @@ static void ath12k_wifi7_dp_tx_complete_msdu(struct ath12k_pdev_dp *dp_pdev,
+ 	struct ieee80211_vif *vif;
+ 	struct ath12k_vif *ahvif;
+ 	struct ath12k_dp_link_peer *peer;
+-	struct sk_buff *skb_ext_desc = tx_desc->skb_ext_desc;
++	struct sk_buff *skb_ext_desc = sw_metadata->skb_ext_desc;
+ 	struct ath12k *ar;
+ 
+ 	if (WARN_ON_ONCE(ts->buf_rel_source != HAL_WBM_REL_SRC_MODULE_TQM)) {
+@@ -810,7 +823,7 @@ static void ath12k_wifi7_dp_tx_complete_msdu(struct ath12k_pdev_dp *dp_pdev,
+ 		dev_kfree_skb_any(skb_ext_desc);
+ 	}
+ 
+-	if (tx_desc->flags & DP_TX_DESC_FLAG_FAST) {
++	if (sw_metadata->flags & DP_TX_DESC_FLAG_FAST) {
+ 		dev_kfree_skb_any(msdu);
+ 		return;
+ 	}
+@@ -975,14 +988,13 @@ ath12k_wifi7_dp_tx_status_parse(struct ath12k_base *ab,
+ 	ts->tid = FIELD_GET(HAL_WBM_RELEASE_TX_INFO3_TID, desc->info3);
+ }
+ 
+-void ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id)
++int ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id, int budget)
+ {
+ 	struct ath12k_base *ab = dp->ab;
+ 	struct ath12k_pdev_dp *dp_pdev;
+ 	int hal_ring_id = dp->tx_ring[ring_id].tcl_comp_ring.ring_id;
+ 	struct hal_srng *status_ring = &ab->hal.srng_list[hal_ring_id];
+ 	struct ath12k_tx_desc_info *tx_desc = NULL;
+-	struct sk_buff *msdu;
+ 	struct hal_tx_status ts = { 0 };
+ 	struct dp_tx_ring *tx_ring = &dp->tx_ring[ring_id];
+ 	struct hal_wbm_release_ring *desc;
+@@ -991,6 +1003,7 @@ void ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id)
+ #ifndef CONFIG_IO_COHERENCY
+ 	int valid_entries;
+ #endif
++	int orig_budget = budget;
+ 	spin_lock_bh(&status_ring->lock);
+ 
+ 	ath12k_hal_srng_access_begin(ab, status_ring);
+@@ -1000,48 +1013,38 @@ void ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id)
+ 	if (!valid_entries) {
+ 		ath12k_hal_srng_access_end(ab, status_ring);
+ 		spin_unlock_bh(&status_ring->lock);
+-		return;
++		return 0;
+ 	}
+ 
++	if (valid_entries > budget)
++		valid_entries = budget;
++
+ 	ath12k_hal_srng_dst_invalidate_entry(ab, status_ring, valid_entries);
+ #endif
+-	while (ATH12K_TX_COMPL_NEXT(tx_ring->tx_status_head) != tx_ring->tx_status_tail) {
+-		desc = ath12k_hal_srng_dst_get_next_cached_entry(ab, status_ring);
+-		if (!desc)
+-			break;
+-
+-		memcpy(&tx_ring->tx_status[tx_ring->tx_status_head],
+-		       desc, sizeof(*desc));
+-		tx_ring->tx_status_head =
+-			ATH12K_TX_COMPL_NEXT(tx_ring->tx_status_head);
+-	}
+-
+-	if (ath12k_hal_srng_dst_peek(ab, status_ring) &&
+-	    (ATH12K_TX_COMPL_NEXT(tx_ring->tx_status_head) == tx_ring->tx_status_tail)) {
+-		/* TODO: Process pending tx_status messages when kfifo_is_full() */
+-		ath12k_warn(ab, "Unable to process some of the tx_status ring desc because status_fifo is full\n");
+-	}
+ 
+-	ath12k_hal_srng_access_end(ab, status_ring);
+-
+-	spin_unlock_bh(&status_ring->lock);
++	struct ath12k_dp_hw_group *dp_hw_grp = dp->dp_hw_grp;
++	struct ath12k_wifi7_tx_status_entry *tx_status_entry;
++	struct ath12k_tx_sw_metadata *sw_metadata;
++	u8 n_entry = 0;
++	struct list_head desc_free_list, *cur;
++	struct hal_wbm_completion_ring_tx *tx_status;
++	struct sk_buff_head free_list_head;
+ 
+-	while (ATH12K_TX_COMPL_NEXT(tx_ring->tx_status_tail) != tx_ring->tx_status_head) {
+-		struct hal_wbm_completion_ring_tx *tx_status;
+-		u32 desc_id;
++	INIT_LIST_HEAD(&desc_free_list);
++	skb_queue_head_init(&free_list_head);
+ 
+-		tx_ring->tx_status_tail =
+-			ATH12K_TX_COMPL_NEXT(tx_ring->tx_status_tail);
+-		tx_status = &tx_ring->tx_status[tx_ring->tx_status_tail];
+-		ath12k_wifi7_dp_tx_status_parse(ab, tx_status, &ts);
++	tx_status_entry = (struct ath12k_wifi7_tx_status_entry *)dp_hw_grp->tx_status_buf[ring_id];
++	while (budget-- && (desc = ath12k_hal_srng_dst_get_next_cached_entry(ab, status_ring))) {
++		tx_status = (struct hal_wbm_completion_ring_tx *)desc;
+ 
+-		dp->device_stats.tx_wbm_rel_source[ts.buf_rel_source]++;
+ 		if (le32_get_bits(tx_status->info0, HAL_WBM_COMPL_TX_INFO0_CC_DONE)) {
+ 			/* HW done cookie conversion */
+ 			desc_va = ((u64)le32_to_cpu(tx_status->buf_va_hi) << 32 |
+ 				   le32_to_cpu(tx_status->buf_va_lo));
+ 			tx_desc = (struct ath12k_tx_desc_info *)((unsigned long)desc_va);
+ 		} else {
++			u32 desc_id;
++
+ 			/* SW does cookie conversion to VA */
+ 			desc_id = le32_get_bits(tx_status->buf_va_hi,
+ 						BUFFER_ADDR_INFO1_SW_COOKIE);
+@@ -1053,35 +1056,101 @@ void ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id)
+ 			continue;
+ 		}
+ 
+-		msdu = tx_desc->skb;
++		if (!tx_desc->in_use)
++			continue;
++
++		memcpy(&tx_status_entry->tx_status, tx_status, sizeof(*tx_status));
++
++		list_add_tail(&tx_desc->list, &desc_free_list);
++
++		n_entry++;
++		tx_status_entry++;
++	}
++
++	ath12k_hal_srng_access_end(ab, status_ring);
++
++	spin_unlock_bh(&status_ring->lock);
++
++	if (!n_entry)
++		return orig_budget - budget;
++
++	spin_lock_bh(&dp->tx_desc_lock[ring_id]);
++
++	tx_status_entry = (struct ath12k_wifi7_tx_status_entry *)dp_hw_grp->tx_status_buf[ring_id];
++	list_for_each(cur, &desc_free_list) {
++		sw_metadata = &tx_status_entry->sw_metadata;
++
++		tx_status_entry++;
++
++		tx_desc = list_entry(cur, struct ath12k_tx_desc_info, list);
++
++		sw_metadata->skb = tx_desc->skb;
++		sw_metadata->skb_ext_desc = tx_desc->skb_ext_desc;
++		sw_metadata->flags = tx_desc->flags;
++		sw_metadata->mac_id = tx_desc->mac_id;
++
++		tx_desc->skb = NULL;
++		tx_desc->skb_ext_desc = NULL;
++		tx_desc->in_use = false;
++		tx_desc->flags = 0;
++	}
++
++	list_splice(&desc_free_list, &dp->tx_desc_free_list[ring_id]);
++
++	spin_unlock_bh(&dp->tx_desc_lock[ring_id]);
++
++	tx_status_entry = (struct ath12k_wifi7_tx_status_entry *)dp_hw_grp->tx_status_buf[ring_id];
++	while (n_entry--) {
++		tx_status = &tx_status_entry->tx_status;
++		sw_metadata = &tx_status_entry->sw_metadata;
++
++		tx_status_entry++;
++
++		if (!sw_metadata->skb)
++			continue;
++
++		ath12k_wifi7_dp_tx_status_parse(ab, tx_status, &ts);
++
++		dp->device_stats.tx_wbm_rel_source[ts.buf_rel_source]++;
+ 
+ 		if (ts.buf_rel_source == HAL_WBM_REL_SRC_MODULE_FW) {
+ 			ath12k_wifi7_dp_tx_process_htt_tx_complete(ab, (void *)tx_status,
+-								   msdu, tx_ring, tx_desc);
+-			goto tx_release;
++								   sw_metadata->skb,
++								   tx_ring, sw_metadata);
++			continue;
+ 		}
+ 
+ 		dp->device_stats.tqm_rel_reason[ts.status]++;
+-		pdev_id = ath12k_hw_mac_id_to_pdev_id(dp->hw_params, tx_desc->mac_id);
++
++		if (sw_metadata->flags & DP_TX_DESC_FLAG_FAST) {
++			__skb_queue_head(&free_list_head, sw_metadata->skb);
++			sw_metadata->skb = NULL;
++		}
++
++		pdev_id = ath12k_hw_mac_id_to_pdev_id(dp->hw_params, sw_metadata->mac_id);
+ 
+ 		rcu_read_lock();
+ 
+ 		dp_pdev = ath12k_dp_to_dp_pdev(dp, pdev_id);
+ 		if (!dp_pdev) {
+ 			rcu_read_unlock();
+-			goto tx_release;
++			continue;
+ 		}
+ 
+ 		if (atomic_dec_and_test(&dp_pdev->num_tx_pending))
+ 			wake_up(&dp_pdev->tx_empty_waitq);
+ 
+-		ath12k_wifi7_dp_tx_complete_msdu(dp_pdev, msdu, &ts, tx_desc, 
+-						 tx_desc->mac_id, tx_ring->tcl_data_ring_id);
++		if (sw_metadata->skb)
++			ath12k_wifi7_dp_tx_complete_msdu(dp_pdev, sw_metadata->skb, &ts,
++							 sw_metadata, sw_metadata->mac_id,
++							 tx_ring->tcl_data_ring_id);
+ 
+ 		rcu_read_unlock();
+-tx_release:
+-		ath12k_dp_tx_release_txbuf(dp, tx_desc, tx_desc->pool_id);
+ 	}
++
++	dev_kfree_skb_list_fast(&free_list_head);
++
++	return orig_budget - budget;
+ }
+ 
+ u32 ath12k_wifi7_dp_tx_get_vdev_bank_config(struct ath12k_base *ab,
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h
+index ae69e84..d9c6817 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h
+@@ -7,7 +7,7 @@
+ #ifndef ATH12K_DP_TX_WIFI7_H
+ #define ATH12K_DP_TX_WIFI7_H
+ 
+-void ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id);
++int ath12k_wifi7_dp_tx_completion_handler(struct ath12k_dp *dp, int ring_id, int budget);
+ int ath12k_wifi7_dp_tx(struct ath12k_pdev_dp *dp_pdev,
+ 		       struct ath12k_link_vif *arvif,
+ 		       struct sk_buff *skb, bool gsn_valid, int mcbc_gsn,
+-- 
+2.34.1
+

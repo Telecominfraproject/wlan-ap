@@ -1,0 +1,589 @@
+From d70823d99d54217eb647fe21bb417cb80e1e4875 Mon Sep 17 00:00:00 2001
+From: P Praneesh <ppranees@qti.qualcomm.com>
+Date: Sun, 13 Jul 2025 22:47:49 +0530
+Subject: [PATCH 4/4] Upstream: DP: wifi: ath12k: Support Ethernet packet
+ capture in monitor mode
+
+Currently driver lacks the ability to capture the ethernet packets in
+monitor mode. 802.11 header and payload are captured in fragmented
+memory of the skb in the adjacent index. Add restitch fragmented MSDUs
+across the skb and their frag chain list by ensuring that all the
+fragments belongs to the single MSDU are processed together and
+reassembled in correct order. Below mentioned changes are added.
+
+1. Adjust fragment offsets to align with LLC/SNAP and L3 headers.
+   Without proper alignment, the payload may be misinterpreted or
+   truncated.
+2. Apply AMSDU padding when required to maintain 4-byte alignment,
+   ensuring compatibility with hardware expectations and upper-layer
+   parsing.
+3. Calculate the 802.11 header length dynamically based on frame
+   control fields. This ensures accurate identification of the payload
+   start and preserves header integrity.
+4. Invoke the restitching logic in the monitor receive path before
+   freeing the SKB. This guarantees that only complete and properly
+   formatted Ethernet packets are delivered to mac80211.
+
+Patch-dependency:
+0495-03-Upstream-DP-wifi-ath12k-collect-802.11-header-and-pa.patch
+
+Signed-off-by: P Praneesh <ppranees@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_mon.c      |  45 +-
+ drivers/net/wireless/ath/ath12k/dp_mon.h      |  19 +
+ .../net/wireless/ath/ath12k/wifi7/dp_mon2.c   | 407 +++++++++++++++++-
+ 3 files changed, 463 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.c b/drivers/net/wireless/ath/ath12k/dp_mon.c
+index 0298fcd..e340ed6 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -2152,10 +2152,8 @@ ath12k_dp_mon_get_skb_valid_frag(struct ath12k_dp *dp, struct sk_buff *skb)
+ 	if (likely(num_frags < MAX_SKB_FRAGS))
+ 		return skb;
+ 
+-	if (unlikely(!skb_has_frag_list(skb))) {
+-		ath12k_warn(dp, "skb has no frag_list, cannot retrieve last fragment\n");
++	if (unlikely(!skb_has_frag_list(skb)))
+ 		return NULL;
+-	}
+ 
+ 	last_skb = ath12k_mon_get_last_skb_from_fraglist(skb);
+ 	if (unlikely(!last_skb)) {
+@@ -2300,3 +2298,44 @@ u32 ath12k_wifi7_dp_mon_get_frag_size_by_idx(struct ath12k_dp *dp,
+ 	return size;
+ }
+ EXPORT_SYMBOL(ath12k_wifi7_dp_mon_get_frag_size_by_idx);
++
++void *ath12k_dp_mon_skb_get_frag_addr(struct sk_buff *skb, u8 idx)
++{
++	void *frag = NULL;
++
++	if (likely(idx < MAX_SKB_FRAGS))
++		frag = skb_frag_address(&skb_shinfo(skb)->frags[idx]);
++
++	return frag;
++}
++EXPORT_SYMBOL(ath12k_dp_mon_skb_get_frag_addr);
++
++int ath12k_dp_mon_adj_frag_offset(struct sk_buff *skb, u8 idx, int offset)
++{
++	u32 frag_offset;
++	skb_frag_t *frag;
++
++	if (unlikely(idx >= skb_shinfo(skb)->nr_frags))
++		return -EINVAL;
++
++	frag = &skb_shinfo(skb)->frags[idx];
++	frag_offset = skb_frag_off(frag);
++	frag_offset += offset;
++	skb_frag_off_set(frag, frag_offset);
++	skb_coalesce_rx_frag(skb, idx, -(offset), 0);
++
++	return 0;
++}
++EXPORT_SYMBOL(ath12k_dp_mon_adj_frag_offset);
++
++u32 ath12k_dp_mon_get_num_frags_in_fraglist(struct sk_buff *skb)
++{
++	struct sk_buff *list = NULL;
++	u32 num_frags = skb_shinfo(skb)->nr_frags;
++
++	skb_walk_frags(skb, list)
++		num_frags += skb_shinfo(list)->nr_frags;
++
++	return num_frags;
++}
++EXPORT_SYMBOL(ath12k_dp_mon_get_num_frags_in_fraglist);
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.h b/drivers/net/wireless/ath/ath12k/dp_mon.h
+index 00b6a69..730ee28 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.h
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.h
+@@ -21,6 +21,15 @@
+ #define ATH12K_MON_RX_PKT_OFFSET	8
+ #define ATH12K_DP_WLAN_MAX_AC		4
+ 
++#define	ATH12K_DP_MON_MIN_FRAGS_RESTITCH	2
++#define	ATH12K_DP_MON_L3_HDR_PAD		2
++#define	ATH12K_DP_MON_NONRAW_L2_HDR_PAD_BYTE	2
++#define	ATH12K_DP_MON_RAW_L2_HDR_PAD_BYTE	0
++#define	ATH12K_DP_MON_LLC_SIZE			3
++#define	ATH12K_DP_MON_SNAP_SIZE			5
++#define	ATH12K_DP_MON_DECAP_HDR_SIZE		14
++#define	ATH12K_DP_MON_KEYIV			0x20
++
+ #define DP_RXDMA_MON_STATUS_RING_SIZE	1024
+ #define DP_RXDMA_MONITOR_DESC_RING_SIZE	4096
+ #if defined(CONFIG_ATH12K_MEM_PROFILE_512M) || defined (CPTCFG_ATH12K_MEM_PROFILE_512M)
+@@ -53,6 +62,13 @@
+ struct ath12k_mon_data;
+ struct dp_mon_rx_filter;
+ 
++struct ath12k_dp_mon_pad_params {
++	u32 frag_size;
++	u32 msdu_llc_len;
++	u32 pad_byte_holder;
++	u32 frag_idx;
++};
++
+ struct dp_rxdma_mon_ring {
+ 	struct dp_srng refill_buf_ring;
+ 	struct idr bufs_idr;
+@@ -412,6 +428,9 @@ void ath12k_dp_mon_pktlog_config_filter(struct ath12k_pdev_dp *dp_pdev,
+ 				enum ath12k_pktlog_mode mode, bool enable);
+ u32 ath12k_wifi7_dp_mon_get_frag_size_by_idx(struct ath12k_dp *dp, struct sk_buff *skb,
+ 					     u8 idx);
++void *ath12k_dp_mon_skb_get_frag_addr(struct sk_buff *skb, u8 idx);
++int ath12k_dp_mon_adj_frag_offset(struct sk_buff *skb, u8 idx, int offset);
++u32 ath12k_dp_mon_get_num_frags_in_fraglist(struct sk_buff *skb);
+ static inline
+ int ath12k_dp_mon_rx_alloc(struct ath12k_dp *dp)
+ {
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+index 2947d41..9532e52 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+@@ -543,6 +543,393 @@ ath12k_wifi7_dp_mon_rx_deliver_mpdu(struct ath12k_pdev_dp *dp_pdev,
+ 	return 0;
+ }
+ 
++static int
++ath12k_wifi7_dp_mon_pad_amsdu(struct ath12k_pdev_dp *dp_pdev, struct sk_buff *mpdu,
++			      struct ath12k_dp_mon_pad_params *params)
++{
++	struct ath12k_dp *dp = dp_pdev->dp;
++	int amsdu_pad;
++	int frag_idx = params->frag_idx;
++	u8 *pad_start_ptr;
++
++	/* Calculate AMSDU padding to align to 4-byte boundary */
++	amsdu_pad = (params->frag_size + params->msdu_llc_len) % 4;
++	amsdu_pad = amsdu_pad ? (4 - amsdu_pad) : 0;
++
++	if (amsdu_pad && amsdu_pad <= params->pad_byte_holder) {
++		skb_coalesce_rx_frag(mpdu, params->frag_idx, amsdu_pad, 0);
++		pad_start_ptr = (u8 *)ath12k_dp_mon_skb_get_frag_addr(mpdu,
++								      params->frag_idx);
++		if (!pad_start_ptr)
++			return -EINVAL;
++
++		pad_start_ptr += ath12k_wifi7_dp_mon_get_frag_size_by_idx(dp,
++									  mpdu, frag_idx);
++		memset(pad_start_ptr, 0, amsdu_pad);
++	}
++
++	return 0;
++}
++
++static u32
++ath12k_wifi7_dp_mon_calculate_hdrlen(struct sk_buff *mpdu, u32 *msdu_llc_len,
++				     bool *is_amsdu)
++{
++	struct ieee80211_hdr *hdr;
++	__le16 fc;
++	u16 hdr_len = 0, tot_hdr_len;
++	u8 *hdr_desc;
++
++	*is_amsdu = false;
++
++	/* Get pointer to the start of the 802.11 header from frag[0]
++	 */
++	hdr_desc = (u8 *)ath12k_dp_mon_skb_get_frag_addr(mpdu, 0);
++	if (unlikely(!hdr_desc))
++		return hdr_len;
++
++	hdr_len = sizeof(struct ieee80211_hdr_3addr);
++	hdr = (struct ieee80211_hdr *)hdr_desc;
++	fc = hdr->frame_control;
++	if (ieee80211_has_a4(fc))
++		hdr_len += 6;
++
++	if (ieee80211_is_data_qos(fc)) {
++		u8 *qos_hdr = ieee80211_get_qos_ctl(hdr);
++
++		hdr_len += 2;
++		if (*qos_hdr & IEEE80211_QOS_CTL_A_MSDU_PRESENT)
++			*is_amsdu = true;
++	}
++
++	if (ieee80211_has_protected(fc)) {
++		u8 *iv = (u8 *)hdr_desc + hdr_len;
++
++		hdr_len += IEEE80211_WEP_IV_LEN;
++
++		/* Check if the Key IV bit is set in the 4th byte of the IV.
++		 * If set, this indicates the presence of an Integrity Check Value,
++		 * so we need to account for its length in the header.
++		 */
++		if (iv[3] & ATH12K_DP_MON_KEYIV)
++			hdr_len += IEEE80211_WEP_ICV_LEN;
++	}
++
++	if (ieee80211_has_order(fc))
++		hdr_len += IEEE80211_HT_CTL_LEN;
++
++	*msdu_llc_len = ATH12K_DP_MON_LLC_SIZE + ATH12K_DP_MON_SNAP_SIZE;
++	if (*is_amsdu)
++		*msdu_llc_len += ATH12K_DP_MON_DECAP_HDR_SIZE;
++
++	tot_hdr_len = *msdu_llc_len + hdr_len;
++
++	return tot_hdr_len;
++}
++
++static void
++ath12k_wifi7_dp_mon_process_msdu_frag(struct ath12k_pdev_dp *dp_pdev,
++				      struct sk_buff *mpdu, u8 msdu_llc_len,
++				      u32 tot_msdu_len,
++				      bool is_amsdu)
++{
++	struct ath12k_dp *dp = dp_pdev->dp;
++	struct sk_buff *msdu_cur;
++	struct hal_rx_mon_msdu_info *msdu_meta;
++	void *frag_addr;
++	u32 frag_idx = 1, hdr_frag_size, frag_size, pad_byte_holder = 0, frag_offset;
++	int ret, llc_amsdu_len, size, frag_llc_len;
++	u8 frag_iter, num_frags, amsdu_pad = 0, l2_hdr_offset, tot_num_frags;
++	bool prev_msdu_end_received = false, is_head_msdu = true;
++
++	tot_num_frags = ath12k_dp_mon_get_num_frags_in_fraglist(mpdu);
++
++	for (msdu_cur = mpdu; msdu_cur;) {
++		/*frag_iter starts from 0 for 2nd skb onwards
++		 */
++		frag_iter = (msdu_cur == mpdu) ? 2 : 0;
++		num_frags = skb_shinfo(msdu_cur)->nr_frags;
++
++		for (; frag_iter < num_frags; frag_iter++) {
++			frag_idx++;
++
++			/* After finishing an MSDU (i.e., one AMSDU subframe), adjust the
++			 * next fragment's offset to the start of the AMSDU subframe
++			 * header. This retains both the AMSDU subframe header and the
++			 * LLC/SNAP header for correct reassembly.
++			 * Note: msdu_llc_len here represents (LLC/SNAP + AMSDU subframe
++			 * header) length. Although calculated as (LLC/SNAP + decap
++			 * header) length, this works as both have the same size in this
++			 * context.
++			 */
++			if (prev_msdu_end_received) {
++				hdr_frag_size =
++				ath12k_wifi7_dp_mon_get_frag_size_by_idx(dp, msdu_cur,
++									 frag_iter);
++				/* Adjust page frag offset to point to LLC/SNAP header*/
++				if (hdr_frag_size > msdu_llc_len) {
++					frag_llc_len = hdr_frag_size - msdu_llc_len;
++					skb_coalesce_rx_frag(msdu_cur, frag_iter,
++							     -frag_llc_len, 0);
++				}
++				prev_msdu_end_received = false;
++				continue;
++			}
++
++			frag_addr = ath12k_dp_mon_skb_get_frag_addr(msdu_cur, frag_iter);
++			if (unlikely(!frag_addr))
++				continue;
++
++			msdu_meta = (struct hal_rx_mon_msdu_info *)
++					((u8 *)frag_addr - ATH12K_MON_RX_PKT_OFFSET);
++			frag_size =
++				ath12k_wifi7_dp_mon_get_frag_size_by_idx(dp, msdu_cur,
++									 frag_iter);
++
++			/*For middle buffers, no need to add headers
++			 */
++			if ((!msdu_meta->first_buffer) && (!msdu_meta->last_buffer)) {
++				tot_msdu_len += frag_size;
++				amsdu_pad = 0;
++				continue;
++			}
++
++			/* calculate if current buffer has palceholder to accommodate
++			 * amsdu pad byte
++			 */
++			pad_byte_holder = ATH12K_DP_MON_RX_BUF_SIZE -
++						(frag_size + ATH12K_MON_RX_PKT_OFFSET);
++
++			/* Below mention three conditions are handled here.
++			 * 1. If msdu has single buffer
++			 * 2. First buffer in case MSDU is spread in multiple buffer.
++			 * 3. Last buffer in case MSDU is spread in multiple buffer.
++			 *		First buffer	|	Last buffer
++			 * Case 1:		1	|	1
++			 * Case 2:		1	|	0
++			 * Case 3:		0	|	1
++			 * In 3rd case, only L2 header padding byte is 0 and in other
++			 * cases it will be 2 bytes.
++			 */
++
++			l2_hdr_offset = msdu_meta->first_buffer ? 2 : 0;
++			if (msdu_meta->first_buffer) {
++				/* Adjust fragment offset to point to the start of the
++				 * AMSDU subframe header. Only the first MSDU has the
++				 * 802.11 header; subsequent subframes begin directly
++				 * with the subframe header.
++				 */
++				hdr_frag_size =
++				ath12k_wifi7_dp_mon_get_frag_size_by_idx(dp, msdu_cur,
++									 frag_iter - 1);
++				llc_amsdu_len = msdu_llc_len + amsdu_pad;
++				if (hdr_frag_size > llc_amsdu_len) {
++					llc_amsdu_len = msdu_llc_len + amsdu_pad;
++					size = hdr_frag_size - llc_amsdu_len;
++					skb_coalesce_rx_frag(msdu_cur, frag_iter - 1,
++							     -size, 0);
++				}
++
++				/* Adjust page frag offset to point to the AMSDU subframe
++				 * header
++				 */
++				frag_offset = ATH12K_DP_MON_DECAP_HDR_SIZE +
++						l2_hdr_offset;
++				if (frag_size > frag_offset) {
++					ret = ath12k_dp_mon_adj_frag_offset(msdu_cur,
++									    frag_iter,
++									    frag_offset);
++					if (ret) {
++						ath12k_warn(dp,
++							    "Failed to adjust offset %d\n",
++							    frag_iter);
++						continue;
++					}
++
++					frag_size -= frag_offset;
++				}
++
++				/* calculate new page offset and create hole if amsdu_pad
++				 * required
++				 */
++				tot_msdu_len = frag_size;
++
++				/* No amsdu padding required for first frame of
++				 * continuation buffer
++				 */
++				if (!msdu_meta->first_buffer) {
++					amsdu_pad = 0;
++					continue;
++				}
++			} else {
++				tot_msdu_len += frag_size;
++			}
++
++			/* Below mentioned two cases are handled here
++			 * 1. Single buffer MSDU
++			 * 2. Last buffer of MSDU in case of multiple buffer MSDU
++			 */
++
++			/* This flag is used to identify the msdu boundary
++			 */
++			prev_msdu_end_received = true;
++
++			/* check size of buffer if amsdu padding required if it is last
++			 * subframe, then padding is not required
++			 */
++			if (is_amsdu && (frag_idx != (tot_num_frags - 1))) {
++				/* tot_msdu_len is total data payload size
++				 * amsdu padding gets calculated on complete AMSDU frame,
++				 * so msdu_llc_len needs to be added to data payload.
++				 */
++				struct ath12k_dp_mon_pad_params params = {
++					.frag_size = tot_msdu_len,
++					.msdu_llc_len =  msdu_llc_len,
++					.pad_byte_holder = pad_byte_holder,
++					.frag_idx = frag_iter,
++				};
++
++				ret = ath12k_wifi7_dp_mon_pad_amsdu(dp_pdev,
++								    msdu_cur, &params);
++				if (unlikely(ret)) {
++					ath12k_warn(dp,
++						    "proc_msdu_frag: AMSDU padding failed %d\n",
++						    ret);
++					continue;
++				}
++			}
++
++			tot_msdu_len = 0;
++		}
++
++		msdu_cur = is_head_msdu ?
++			   skb_shinfo(msdu_cur)->frag_list : msdu_cur->next;
++		is_head_msdu = false;
++	}
++}
++
++static struct hal_rx_mon_msdu_info *
++ath12k_dp_mon_get_msdu_meta(struct sk_buff *mpdu)
++{
++	void *frag_addr;
++
++	frag_addr = ath12k_dp_mon_skb_get_frag_addr(mpdu, 1);
++	if (!frag_addr)
++		return NULL;
++
++	return (struct hal_rx_mon_msdu_info *)((u8 *)frag_addr -
++						ATH12K_MON_RX_PKT_OFFSET);
++}
++
++static int
++ath12k_wifi7_dp_mon_restitch_frags(struct sk_buff *mpdu,
++				   struct ath12k_pdev_dp *dp_pdev)
++{
++	struct sk_buff *head_msdu;
++	struct hal_rx_mon_msdu_info *msdu_meta;
++	struct ath12k_dp *dp = dp_pdev->dp;
++	u32 hdr_frag_size, frag_size, frag_page_offset, msdu_llc_len;
++	u32 tot_msdu_len = 0;
++	u8 mpdu_buf_len;
++	u8 num_frags = ath12k_dp_mon_get_num_frags_in_fraglist(mpdu);
++	bool is_amsdu = false;
++	int ret;
++
++	head_msdu = mpdu;
++
++	if (unlikely(num_frags < ATH12K_DP_MON_MIN_FRAGS_RESTITCH)) {
++		ath12k_warn(dp, "mon_rx_restitch: not enough frags %d to proceed further",
++			    num_frags);
++		ret = -EINVAL;
++		goto free_mpdu;
++	}
++
++	mpdu_buf_len = ath12k_wifi7_dp_mon_calculate_hdrlen(mpdu, &msdu_llc_len,
++							    &is_amsdu);
++	if (unlikely(!mpdu_buf_len)) {
++		ath12k_warn(dp, "mon_rx_restitch: calculated buffer length is 0\n");
++		ret = -EINVAL;
++		goto free_mpdu;
++	}
++
++	hdr_frag_size = ath12k_wifi7_dp_mon_get_frag_size_by_idx(dp, mpdu, 0);
++	if (unlikely(!hdr_frag_size)) {
++		ath12k_warn(dp, "mon_rx_restitch: rx header size is 0\n");
++		ret = -EINVAL;
++		goto free_mpdu;
++	}
++
++	/* Adjust the fragment offset to align with the start of the 802.11 header.
++	 * If the current fragment size is larger than the expected MPDU buffer length,
++	 */
++	if (hdr_frag_size > mpdu_buf_len)
++		skb_coalesce_rx_frag(head_msdu, 0, -(hdr_frag_size - mpdu_buf_len), 0);
++
++	msdu_meta = ath12k_dp_mon_get_msdu_meta(mpdu);
++	if (!msdu_meta) {
++		ath12k_warn(dp,
++			    "mon_rx_restitch: Failed to get MSDU metadata from frag-1\n");
++		ret = -EINVAL;
++		goto free_mpdu;
++	}
++
++	frag_size = ath12k_wifi7_dp_mon_get_frag_size_by_idx(dp, mpdu, 1);
++	if (unlikely(!frag_size)) {
++		ath12k_warn(dp, "mon_rx_restitch: pkt size is 0\n");
++		ret = -EINVAL;
++		goto free_mpdu;
++	}
++
++	/* Adjust frag[1] offset to skip decap header and L3 padding.
++	 * This ensures the fragment points to the start of the L3 payload.
++	 */
++	frag_page_offset = ATH12K_DP_MON_DECAP_HDR_SIZE + ATH12K_DP_MON_L3_HDR_PAD;
++	ret = ath12k_dp_mon_adj_frag_offset(mpdu, 1, frag_page_offset);
++	if (unlikely(ret)) {
++		ath12k_warn(dp,
++			    "mon_rx_restitch: Failed to adjust frag[1] offset by %d\n",
++			    frag_page_offset);
++		ret = -EINVAL;
++		goto free_mpdu;
++	}
++
++	frag_size = frag_size - frag_page_offset;
++	if (msdu_meta->first_buffer && msdu_meta->last_buffer) {
++		/* MSDU is a single buffer
++		 */
++		if (is_amsdu) {
++			/* frag size is datapayload size, amsdu padding gets calculated on
++			 * complete AMSDU frame, so msdu_llc_len needs to be added to data
++			 * payload.
++			 */
++			struct ath12k_dp_mon_pad_params params = {
++				.frag_size = frag_size,
++				.msdu_llc_len = msdu_llc_len,
++				.pad_byte_holder =
++					ATH12K_DP_MON_RX_BUF_SIZE -
++						(frag_size + ATH12K_MON_RX_PKT_OFFSET),
++				.frag_idx = 1,
++			};
++
++			ret = ath12k_wifi7_dp_mon_pad_amsdu(dp_pdev, mpdu, &params);
++			if (unlikely(ret)) {
++				ath12k_warn(dp,
++					    "mon_rx_restitch: AMSDU padding failed %d\n",
++					    ret);
++				ret = -EINVAL;
++				goto free_mpdu;
++			}
++		}
++	} else {
++		tot_msdu_len = frag_size;
++	}
++
++	ath12k_wifi7_dp_mon_process_msdu_frag(dp_pdev, mpdu, msdu_llc_len,
++					      tot_msdu_len, is_amsdu);
++free_mpdu:
++	return ret;
++}
++
+ enum hal_rx_mon_status
+ ath12k_wifi7_dp_mon_rx_parse_ppdu_status(struct ath12k_pdev_dp *dp_pdev,
+ 					 struct ath12k_mon_data *pmon,
+@@ -554,6 +941,7 @@ ath12k_wifi7_dp_mon_rx_parse_ppdu_status(struct ath12k_pdev_dp *dp_pdev,
+ 	struct ath12k_pdev_mon_dp_stats *mon_stats = &dp_pdev->dp_mon_pdev->mon_stats;
+ 	enum hal_rx_mon_status hal_status;
+ 	u32 buf_size = ATH12K_DP_MON_RX_BUF_SIZE, num_skb = 0, pkt_tlv = 0;
++	int ret;
+ 	u8 fcs_len_left = FCS_LEN, last_frag_idx, last_frag_size;
+ 
+ 	hal_status = ath12k_wifi7_dp_mon_rx_parse_dest(dp_pdev, status_desc);
+@@ -575,7 +963,9 @@ ath12k_wifi7_dp_mon_rx_parse_ppdu_status(struct ath12k_pdev_dp *dp_pdev,
+ 			mon_stats->num_frag_raw += pkt_tlv;
+ 			dev_kfree_skb_any(mpdu);
+ 			mon_stats->num_skb_free++;
+-			continue;
++			num_skb = 0;
++			pkt_tlv = 0;
++			goto next_mpdu;
+ 		}
+ 
+ 		if (mpdu_meta->decap_type == DP_RX_DECAP_TYPE_RAW) {
+@@ -598,16 +988,23 @@ ath12k_wifi7_dp_mon_rx_parse_ppdu_status(struct ath12k_pdev_dp *dp_pdev,
+ 			ath12k_dp_mon_cnt_skb_and_frags(mpdu, &num_skb, &pkt_tlv);
+ 			mon_stats->num_skb_raw += num_skb;
+ 			mon_stats->num_frag_raw += pkt_tlv;
+-			ath12k_wifi7_dp_mon_rx_deliver_mpdu(dp_pdev, ppdu_info,
+-							    mpdu);
+ 		} else {
+ 			ath12k_dp_mon_cnt_skb_and_frags(mpdu, &num_skb, &pkt_tlv);
+ 			mon_stats->num_skb_eth += num_skb;
+ 			mon_stats->num_frag_eth += pkt_tlv;
+-			dev_kfree_skb_any(mpdu);
+-			mon_stats->num_skb_free++;
++			ret = ath12k_wifi7_dp_mon_restitch_frags(mpdu, dp_pdev);
++			if (unlikely(ret)) {
++				dev_kfree_skb_any(mpdu);
++				mon_stats->num_skb_free++;
++				num_skb = 0;
++				pkt_tlv = 0;
++				goto next_mpdu;
++			}
+ 		}
+ 
++		ath12k_wifi7_dp_mon_rx_deliver_mpdu(dp_pdev, ppdu_info, mpdu);
++
++next_mpdu:
+ 		mon_stats->num_skb_to_mac80211 += num_skb;
+ 		mon_stats->pkt_tlv_to_mac80211 += pkt_tlv;
+ 	}
+-- 
+2.34.1
+

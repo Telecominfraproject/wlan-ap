@@ -1,0 +1,203 @@
+From e8186eac82d750487d0a46b0e4afa2ee31caea01 Mon Sep 17 00:00:00 2001
+From: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+Date: Wed, 18 Jun 2025 21:09:03 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL:cfg80211: Enhance 6 GHz Channel List
+ Handling
+
+Currently, the wiphy sbands for 6 GHz band has 2 set of channels
+  (1) Channels array for the 6 GHz band which is power mode agnostic
+  (2) Power mode channel list for each of the 9 different power modes.
+
+Once the driver sends an indication to the cfg80211 with a new regd,
+for the 6 GHz band, the power mode channel list is modified based on
+the new regd information for each power mode.
+
+However, the power mode agnostic channel list is not updated
+accordingly, which can lead to inconsistencies.
+
+Add logic to fill the power mode agnostic channel list based on the
+power mode channel list. A channel will be treated as enabled in the
+power mode agnostic channel list if it is enabled in any of the power
+mode channel lists.
+
+This ensures that the power mode agnostic channel list is always
+a superset of the power mode channel lists. This is important for
+legacy callers of the cfg80211 API who are not aware of the power mode
+and are only concerned about the enablement of the 6 GHz channel
+irrespective of the power mode.
+
+Fixes: None
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+subsys/0048-cfg80211-mac80211-regulatory-awgn-and-6g-channel-cha.patch
+
+Signed-off-by: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+---
+ net/wireless/core.c |  19 ++++++++
+ net/wireless/reg.c  | 110 +++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 128 insertions(+), 1 deletion(-)
+
+diff --git a/net/wireless/core.c b/net/wireless/core.c
+index d6e34c5b5809..e9629a3a5811 100644
+--- a/net/wireless/core.c
++++ b/net/wireless/core.c
+@@ -1114,6 +1114,25 @@ int wiphy_register(struct wiphy *wiphy)
+ 				return -EINVAL;
+ 		}
+ 
++		for (i = 0; i < NL80211_REG_NUM_POWER_MODES; i++) {
++			int j;
++
++			if (!sband->chan_6g[i])
++				continue;
++
++			for (j = 0; j < sband->chan_6g[i]->n_channels; j++) {
++				sband->chan_6g[i]->channels[j].orig_flags =
++					sband->chan_6g[i]->channels[j].flags;
++				sband->chan_6g[i]->channels[j].orig_mag = INT_MAX;
++				sband->chan_6g[i]->channels[j].orig_mpwr =
++					sband->chan_6g[i]->channels[j].max_power;
++				sband->chan_6g[i]->channels[j].band = band;
++
++				if (WARN_ON(sband->chan_6g[i]->channels[j].freq_offset >= 1000))
++					return -EINVAL;
++			}
++		}
++
+ 		for_each_sband_iftype_data(sband, i, iftd) {
+ 			bool has_ap, has_non_ap;
+ 			u32 ap_bits = BIT(NL80211_IFTYPE_AP) |
+diff --git a/net/wireless/reg.c b/net/wireless/reg.c
+index f0103bf67d47..a03cb4911dd1 100644
+--- a/net/wireless/reg.c
++++ b/net/wireless/reg.c
+@@ -2611,6 +2611,111 @@ static void handle_channel_custom(struct wiphy *wiphy,
+ 	chan->max_power = chan->max_reg_power;
+ }
+ 
++/**
++ * validate_chan_for_power_mode - validate 6 GHz channel for power mode
++ * @wiphy: wiphy pointer
++ * @chan_idx: 6 GHz channel index
++ * @power_mode: 6 GHz power mode
++ * @flags: regulatory flags to check against
++ *
++ * Returns the channel if it is valid for the power mode and does not
++ * have the input flags set. Else returns NULL.
++ */
++static struct ieee80211_channel *
++validate_chan_for_power_mode(const struct wiphy *wiphy, unsigned int chan_idx,
++			     enum nl80211_regulatory_power_modes power_mode,
++			     u32 flags)
++{
++	const struct ieee80211_supported_band *sband = wiphy->bands[NL80211_BAND_6GHZ];
++	struct ieee80211_channel *chan_6g;
++
++	if (!sband || !sband->chan_6g[power_mode] ||
++	    !sband->chan_6g[power_mode]->n_channels ||
++	    chan_idx >= sband->chan_6g[power_mode]->n_channels) {
++		return NULL;
++	}
++
++	chan_6g = &sband->chan_6g[power_mode]->channels[chan_idx];
++	if (chan_6g->flags & flags)
++		return NULL;
++
++	return chan_6g;
++}
++
++/**
++ * find_valid_6ghz_power_mode_chan - find a valid 6 GHz channel
++ * @wiphy: wiphy pointer
++ * @chan_idx: 6 GHz channel index
++ *
++ * Returns the channel if the input channel idx is valid in any of the power
++ * modes. Else returns NULL.
++ */
++static struct ieee80211_channel *
++find_valid_6ghz_power_mode_chan(const struct wiphy *wiphy, unsigned int chan_idx)
++{
++	static const enum nl80211_regulatory_power_modes p_mode_order[] = {
++		NL80211_REG_AP_LPI,
++		NL80211_REG_AP_VLP,
++		NL80211_REG_AP_SP,
++	};
++	struct ieee80211_channel *chan_6g = NULL;
++	int i;
++
++	/* Check for the 6GHz channel in the order of power modes */
++	for (i = 0; i < ARRAY_SIZE(p_mode_order); i++) {
++		chan_6g = validate_chan_for_power_mode(wiphy, chan_idx,
++						       p_mode_order[i],
++						       IEEE80211_CHAN_DISABLED);
++		if (chan_6g)
++			break;
++	}
++
++	return chan_6g;
++}
++
++/**
++ * handle_common_6ghz_band_chans - Update the common 6 Ghz band channels
++ * @wiphy: wiphy pointer
++ *
++ * This function will iterate through all the three 6 GHz AP power mode channels
++ * and update them based the channel state in the 6 GHz AP power modes. If a
++ * channel in the common band, wiphy->bands[NL80211_BAND_6GHZ], is enabled,
++ * it indicates that the channel is enabled in at least one of the 3
++ * different bands (in order LPI, VLP, SP).
++ */
++static void handle_common_6ghz_band_chans(const struct wiphy *wiphy)
++{
++	unsigned int i;
++	const struct ieee80211_supported_band *sband = wiphy->bands[NL80211_BAND_6GHZ];
++	bool is_self_managed;
++
++	if (!sband)
++		return;
++
++	is_self_managed = wiphy->regulatory_flags & REGULATORY_WIPHY_SELF_MANAGED;
++	for (i = 0; i < sband->n_channels; i++) {
++		struct ieee80211_channel *chan_6g, *chan = &sband->channels[i];
++
++		chan_6g = find_valid_6ghz_power_mode_chan(wiphy, i);
++		if (!chan_6g) {
++			if (is_self_managed) {
++				chan->flags |= IEEE80211_CHAN_DISABLED;
++			} else {
++				chan->orig_flags |= IEEE80211_CHAN_DISABLED;
++				chan->flags = chan->orig_flags;
++			}
++			continue;
++		}
++
++		chan->flags = chan_6g->flags;
++		chan->beacon_found = chan_6g->beacon_found;
++		chan->max_antenna_gain = chan_6g->max_antenna_gain;
++		chan->max_reg_power = chan_6g->max_reg_power;
++		chan->psd = chan_6g->psd;
++		chan->max_power = chan_6g->max_power;
++	}
++}
++
+ static void handle_band_custom(struct wiphy *wiphy,
+ 			       struct ieee80211_supported_band *sband,
+ 			       const struct ieee80211_regdomain *regd)
+@@ -2632,8 +2737,11 @@ static void handle_band_custom(struct wiphy *wiphy,
+ 						      &sband->chan_6g[i]->channels[j],
+ 						      regd, MHZ_TO_KHZ(20), i);
+ 		}
+-		if (is_6g_chan)
++
++		if (is_6g_chan) {
++			handle_common_6ghz_band_chans(wiphy);
+ 			return;
++		}
+ 	}
+ 
+ 	/*
+-- 
+2.34.1
+

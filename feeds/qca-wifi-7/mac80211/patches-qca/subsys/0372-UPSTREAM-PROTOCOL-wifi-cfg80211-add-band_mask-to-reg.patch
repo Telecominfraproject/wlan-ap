@@ -1,0 +1,256 @@
+From eebf5b59896ffdc2f313a488725e5fb0ed19b206 Mon Sep 17 00:00:00 2001
+From: Amith A <amitajit@qti.qualcomm.com>
+Date: Tue, 5 Aug 2025 09:38:27 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: wifi: cfg80211: add band_mask to regdomain
+ and apply it in custom band handling
+
+Introduce a new `band_mask` field in `struct ieee80211_regdomain` to allow
+selective application of regulatory rules to specific bands. Update
+`reg_process_self_managed_hint()` to honor this mask when invoking
+`handle_band_custom()`, ensuring that only the intended bands are
+processed. Also, ensure that band_mask is correctly set by validating it
+against the regulatory rules being updated. For each band whose regulatory
+rule has changed, the corresponding bit in the band_mask must be set.
+
+The band_mask is interpreted as follows:
+If the band_mask is zero then all the bands are processed.
+If the band_mask is non-zero then all the bands for which the bits are set
+are processed.
+
+One use case for this is in AFC (Automated Frequency Coordination), where
+only 6 GHz band channels need to be updated when an AFC power event is
+received.
+
+Fixes: None
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Path-dependency: None
+
+Signed-off-by: Amith A <amitajit@qti.qualcomm.com>
+---
+ include/net/regulatory.h | 1 +
+ net/wireless/reg.c       | 6 ++++--
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+--- a/include/net/regulatory.h
++++ b/include/net/regulatory.h
+@@ -221,6 +221,7 @@ struct ieee80211_regdomain {
+ 	char alpha2[3];
+ 	u8 supp_cli_bitmap_6ghz;
+ 	enum nl80211_dfs_regions dfs_region;
++	u8 band_mask;
+ 	struct ieee80211_reg_rule reg_rules[];
+ };
+ 
+--- a/net/wireless/reg.c
++++ b/net/wireless/reg.c
+@@ -3301,6 +3301,189 @@ static void reg_process_pending_beacon_h
+ 	spin_unlock_bh(&reg_pending_beacons_lock);
+ }
+ 
++#define F_2GHZ_BEG	2400000
++#define F_2GHZ_END	2500000
++#define F_5GHZ_BEG	4900000
++#define F_5GHZ_END	5700000
++#define F_6GHZ_BEG	5900000
++#define F_6GHZ_END	7200000
++#define F_60GHZ_BEG	58320000
++#define F_60GHZ_END	69120000
++#define F_S1GHZ_BEG	902000
++#define F_S1GHZ_END	928000
++
++static inline bool reg_is_freq_in_range(u32 freq, u32 beg, u32 end)
++{
++	return freq >= beg && freq <= end;
++}
++
++static bool reg_is_freq_in_band(u32 freq_khz, enum nl80211_band band)
++{
++	switch (band) {
++	case NL80211_BAND_2GHZ:
++		return reg_is_freq_in_range(freq_khz, F_2GHZ_BEG, F_2GHZ_END);
++	case NL80211_BAND_5GHZ:
++		return reg_is_freq_in_range(freq_khz, F_5GHZ_BEG, F_5GHZ_END);
++	case NL80211_BAND_6GHZ:
++		return reg_is_freq_in_range(freq_khz, F_6GHZ_BEG, F_6GHZ_END);
++	case NL80211_BAND_60GHZ:
++		return reg_is_freq_in_range(freq_khz, F_60GHZ_BEG, F_60GHZ_END);
++	case NL80211_BAND_S1GHZ:
++		return reg_is_freq_in_range(freq_khz, F_S1GHZ_BEG, F_S1GHZ_END);
++	default:
++		return false;
++	}
++}
++
++static inline bool reg_is_rule_in_band(const struct ieee80211_reg_rule *rule,
++				       enum nl80211_band band)
++{
++	return reg_is_freq_in_band(rule->freq_range.start_freq_khz, band);
++}
++
++/**
++ * reg_is_rule_in_regd_band - Check if a reg rule exists in a regdomain for a
++ * specific band
++ * @ra: Pointer to the reg rule to be matched
++ * @regd: Pointer to the regulatory domain to be checked
++ * @band: band in which the input rule falls
++ *
++ * Returns: true if a matching rule is found in the specified band, false otherwise.
++ */
++static bool reg_is_rule_in_regd_band(const struct ieee80211_reg_rule *ra,
++				     const struct ieee80211_regdomain *regd,
++				     enum nl80211_band band)
++{
++	int i;
++
++	for (i = 0; i < regd->n_reg_rules; i++) {
++		const struct ieee80211_reg_rule *rb = &regd->reg_rules[i];
++
++		if (!reg_is_rule_in_band(rb, band))
++			continue;
++
++		if (memcmp(rb, ra, sizeof(*ra)) == 0)
++			return true;
++	}
++
++	return false;
++}
++
++/**
++ * count_rules_in_band() - Count number of rules in a regdomain for a specific band
++ * @regd: regulatory domain
++ * @band: band to filter
++ *
++ * Return: number of rules in the band
++ */
++static int count_rules_in_band(const struct ieee80211_regdomain *regd,
++			       enum nl80211_band band)
++{
++	int i, count = 0;
++
++	for (i = 0; i < regd->n_reg_rules; i++) {
++		const struct ieee80211_reg_rule *rule = &regd->reg_rules[i];
++
++		if (reg_is_rule_in_band(rule, band))
++			count++;
++	}
++
++	return count;
++}
++
++/**
++ * reg_is_rules_equal_for_band() - Check if reg rules for the given band match
++ * between the new and old regd
++ * @old_regd: current regdomain
++ * @new_regd: new regdomain
++ * @band: input band
++ *
++ * Return: true if reg rules between the regds match for the given band
++ */
++static bool reg_is_rules_equal_for_band(const struct ieee80211_regdomain *old_regd,
++					const struct ieee80211_regdomain *new_regd,
++					enum nl80211_band band)
++{
++	int count_old = count_rules_in_band(old_regd, band);
++	int count_new = count_rules_in_band(new_regd, band);
++	int i;
++
++	if (count_old != count_new)
++		return false;
++
++	for (i = 0; i < old_regd->n_reg_rules; i++) {
++		const struct ieee80211_reg_rule *rule = &old_regd->reg_rules[i];
++
++		if (!reg_is_rule_in_band(rule, band))
++			continue;
++
++		if (!reg_is_rule_in_regd_band(rule, new_regd, band))
++			return false;
++	}
++
++	return true;
++}
++
++/**
++ * reg_bands_have changed() - Check if reg rules in any of the bands in
++ * bands_absent have changed.
++ * @old_regd: current regd
++ * @new_regd: new regd
++ * @bands: bitmap of bands that shouldn't have reg rules changed
++ *
++ * Return: true if reg rules in any of the bands have changed
++ */
++static bool
++reg_bands_have_changed(const struct ieee80211_regdomain *old_regd,
++		       const struct ieee80211_regdomain *new_regd,
++		       u8 bands)
++{
++	enum nl80211_band band;
++
++	if (!old_regd || !new_regd)
++		return false;
++
++	for (band = 0; band < NUM_NL80211_BANDS; band++) {
++		if (!(bands & BIT(band)))
++			continue;
++
++		if (!reg_is_rules_equal_for_band(old_regd, new_regd, band)) {
++			pr_debug("Band %d changed in regd update but not set in band_mask\n",
++				 band);
++			return true;
++		}
++	}
++
++	return false;
++}
++
++/**
++ * reg_is_band_update_allowed() - Check if wiphy band update is allowed.
++ * Only the bands set in the new_regd->band_mask should have reg rules modified.
++ * @old_regd: current regd
++ * @new_regd: new regd
++ *
++ * Note: The desired bands to be changed in the regulatory are present in
++ * new_regd->band_mask. The bands not present in the band_mask should not
++ * change. If bands absent in the mask have changed, band_mask cannot
++ * be applied.
++ *
++ * Return: true if only the bands set in band mask have reg rules modified
++ */
++static bool reg_is_band_update_allowed(const struct ieee80211_regdomain *old_regd,
++				       const struct ieee80211_regdomain *new_regd)
++{
++	if (new_regd->band_mask) {
++		u8 bands_absent;
++
++		bands_absent = ~new_regd->band_mask;
++		if (reg_bands_have_changed(old_regd, new_regd, bands_absent))
++			return false;
++	}
++
++	return true;
++}
++
+ static void reg_process_self_managed_hint(struct wiphy *wiphy)
+ {
+ 	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
+@@ -3321,11 +3504,16 @@ static void reg_process_self_managed_hin
+ 		return;
+ 
+ 	tmp = get_wiphy_regdom(wiphy);
++	if (!reg_is_band_update_allowed(tmp, regd))
++		return;
++
+ 	rcu_assign_pointer(wiphy->regd, regd);
+ 	rcu_free_regdom(tmp);
+ 
+-	for (band = 0; band < NUM_NL80211_BANDS; band++)
+-		handle_band_custom(wiphy, wiphy->bands[band], regd);
++	for (band = 0; band < NUM_NL80211_BANDS; band++) {
++		if (regd->band_mask == 0 || regd->band_mask & BIT(band))
++			handle_band_custom(wiphy, wiphy->bands[band], regd);
++	}
+ 
+ 	reg_process_ht_flags(wiphy);
+ 
