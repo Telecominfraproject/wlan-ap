@@ -1,0 +1,345 @@
+From 109a6ad3f739a665a6f273dfcfa6d8764d82749d Mon Sep 17 00:00:00 2001
+From: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+Date: Mon, 14 Jul 2025 15:35:41 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL:cfg80211:mac80211: Fix STA disconnection
+ with AFC
+
+Currently, For 6 GHz, when a STA processes the channel switch announcement
+(CSA) frame, the target channel is determined from the CSA IE
+and the 6 GHz power mode is read from the beacon's 6 GHz operation IE's
+control field. The STA validates if the target channel is valid for the
+power mode from the beacon. If the target channel is not valid for the
+power mode, the STA disconnects from the AP.
+
+When the AP switches between channels of different power
+mode, the STA side validation fails as the target channel may not be
+valid for the power mode in the beacon. This results in the STA
+disconnection from the AP.
+
+Since , we do not know the power mode of the target channel from the CSA
+IEs, to fix this, verify whether the target channel is valid in at least
+one of the power modes, then allow the STA to switch to the target
+channel in the calculated power mode.
+
+After switching to the new channel with the calculated (or temporary)
+power mode, the STA receives the Root AP's power mode from the first
+beacon. If the power mode in the beacon differs from the calculated
+(or temporary) power mode, the STA switches to the new mode.
+However, if the beacon's power mode is not supported by the STA, the
+STA is brought down.
+
+Fixes: None
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+subsys/0048-cfg80211-mac80211-regulatory-awgn-and-6g-channel-cha.patch
+subsys/0340-UPSTREAM-PROTOCOL-cfg80211-mac80211-Store-6-GHz-powe.patch
+
+Signed-off-by: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+---
+ include/linux/ieee80211.h  |  4 +++
+ include/net/cfg80211.h     | 11 +++++++++
+ net/mac80211/ieee80211_i.h |  4 ++-
+ net/mac80211/mlme.c        | 14 +++++++++++
+ net/mac80211/spectmgmt.c   | 19 ++++++++++++---
+ net/mac80211/util.c        | 42 ++++++++------------------------
+ net/wireless/util.c        | 50 +++++++++++++++++++++++++++++++++++++-
+ 7 files changed, 107 insertions(+), 37 deletions(-)
+
+diff --git a/include/linux/ieee80211.h b/include/linux/ieee80211.h
+index a1472fec5c6a..f5fc6dd8232d 100644
+--- a/include/linux/ieee80211.h
++++ b/include/linux/ieee80211.h
+@@ -2859,6 +2859,10 @@ static inline bool ieee80211_he_capa_size_ok(const u8 *data, u8 len)
+  * struct ieee80211_he_6ghz_oper - HE 6 GHz operation Information field
+  * @primary: primary channel
+  * @control: control flags
++ *         Bit 0-1: channel width
++ *         Bit 2  : duplicate beacon
++ *         Bit 3-6: regulatory information
++ *         Bit 7  : reserved
+  * @ccfs0: channel center frequency segment 0
+  * @ccfs1: channel center frequency segment 1
+  * @minrate: minimum rate (in 1 Mbps units)
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index c7ef0b816285..d815ec5706f2 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -7549,6 +7549,17 @@ ieee80211_frequency_to_channel(int freq)
+ 	return ieee80211_freq_khz_to_channel(MHZ_TO_KHZ(freq));
+ }
+ 
++/**
++ * ieee80211_get_valid_6ghz_power_mode - get a valid 6 Ghz power mode
++ *
++ * @wiphy: the struct wiphy to get the power mode for
++ * @freq: the center frequency (in KHz) of the channel
++ *
++ * Return: The valid 6Ghz power mode for @freq in the order LPI, VLP, SP.
++ */
++enum nl80211_regulatory_power_modes
++ieee80211_get_valid_6ghz_power_mode(struct wiphy *wiphy, u32 freq);
++
+ /**
+  * ieee80211_get_channel_khz - get channel struct from wiphy for specified
+  * frequency
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index e6907f7aa9a4..f649d1e75a6a 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1834,6 +1834,7 @@ struct ieee80211_csa_ie {
+ 	u16 pre_value;
+ 	u16 reason_code;
+ 	u32 max_switch_time;
++	enum ieee80211_ap_reg_power power_mode;
+ };
+ 
+ enum ieee80211_elems_parse_error {
+@@ -2813,7 +2814,8 @@ void ieee80211_chandef_eht_oper(const struct ieee80211_eht_operation_info *info,
+ struct ieee80211_channel
+ *ieee80211_get_channel_6ghz_pwr_mode(struct ieee80211_sub_if_data *sdata,
+ 				     const struct ieee80211_he_operation *he_oper,
+-				     const int new_chan_idx);
++				     const int new_chan_idx,
++				     enum nl80211_regulatory_power_modes *out_mode);
+ 
+ bool ieee80211_chandef_he_6ghz_oper(struct ieee80211_sub_if_data *sdata,
+ 				    int link_id,
+diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
+index ce44034547ba..172fa1106702 100644
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@ -2381,6 +2381,19 @@ static void ieee80211_csa_switch_work(struct wiphy *wiphy,
+ 		return;
+ 	}
+ 
++	if (link->u.mgd.csa.ap_chandef.chan->band == NL80211_BAND_6GHZ &&
++	    link->csa.power_mode != IEEE80211_REG_UNSET_AP) {
++		/*
++		 * We do not as yet know the actual 6 GHz power mode to which
++		 * the AP will switch to after CSA. Therefore, we temporarily
++		 * use the locally calculated power mode.
++		 * The power mode and TPE will be updated upon receiving the
++		 * first beacon on the new channel.
++		 */
++		link->conf->power_type = link->csa.power_mode;
++		link->csa.power_mode = IEEE80211_REG_UNSET_AP;
++	}
++
+ 	/*
+ 	 * using reservation isn't immediate as it may be deferred until later
+ 	 * with multi-vif. once reservation is complete it will re-schedule the
+@@ -2679,6 +2692,7 @@ ieee80211_sta_process_chanswitch(struct ieee80211_link_data *link,
+ 		}
+ 
+ 		link->u.mgd.csa.tpe = csa_elems->csa_tpe;
++		link->csa.power_mode = csa_ie.power_mode;
+ 	} else {
+ 		/*
+ 		 * If there was no per-STA profile for this link, we
+diff --git a/net/mac80211/spectmgmt.c b/net/mac80211/spectmgmt.c
+index 34fb67148f59..5edf02b8eeaf 100644
+--- a/net/mac80211/spectmgmt.c
++++ b/net/mac80211/spectmgmt.c
+@@ -143,7 +143,8 @@ static void
+ validate_chandef_by_6ghz_he_eht_oper(struct ieee80211_sub_if_data *sdata,
+ 				     int link_id,
+ 				     struct ieee80211_conn_settings *conn,
+-				     struct cfg80211_chan_def *chandef)
++				     struct cfg80211_chan_def *chandef,
++				     enum nl80211_regulatory_power_modes pwr_mode_6ghz)
+ {
+ 	u32 control_freq, center_freq1, center_freq2;
+ 	enum nl80211_chan_width chan_width;
+@@ -213,6 +214,10 @@ validate_chandef_by_6ghz_he_eht_oper(struct ieee80211_sub_if_data *sdata,
+ 		eht_oper = &eht._oper;
+ 	}
+ 
++	he._6ghz_oper.control &= IEEE80211_HE_6GHZ_OPER_CTRL_CHANWIDTH;
++	he._6ghz_oper.control |= (pwr_mode_6ghz << IEEE80211_HE_6GHZ_OPER_CTRL_REG_INFO_LSB) &
++				  IEEE80211_HE_6GHZ_OPER_CTRL_REG_INFO;
++
+ 	if (!ieee80211_chandef_he_6ghz_oper(sdata, link_id, &he._oper,
+ 					    eht_oper, chandef))
+ 		chandef->chan = NULL;
+@@ -237,6 +242,7 @@ int ieee80211_parse_ch_switch_ie(struct ieee80211_sub_if_data *sdata,
+ 	const struct ieee80211_bandwidth_indication *bwi;
+ 	const struct ieee80211_ext_chansw_ie *ext_chansw_elem;
+ 	int secondary_channel_offset = -1;
++	enum nl80211_regulatory_power_modes pwr_mode_6ghz = NL80211_REG_NUM_POWER_MODES;
+ 
+ 	memset(csa_ie, 0, sizeof(*csa_ie));
+ 
+@@ -296,7 +302,8 @@ int ieee80211_parse_ch_switch_ie(struct ieee80211_sub_if_data *sdata,
+ 	if (new_band == NL80211_BAND_6GHZ) {
+ 		new_chan = ieee80211_get_channel_6ghz_pwr_mode(sdata,
+ 							       elems->he_operation,
+-							       new_chan_no);
++							       new_chan_no,
++							       &pwr_mode_6ghz);
+ 	} else {
+ 		new_freq = ieee80211_channel_to_frequency(new_chan_no, new_band);
+ 		new_chan = ieee80211_get_channel(sdata->local->hw.wiphy, new_freq);
+@@ -374,7 +381,8 @@ int ieee80211_parse_ch_switch_ie(struct ieee80211_sub_if_data *sdata,
+ 
+ 	/* check if the new chandef fits the capabilities */
+ 	if (new_band == NL80211_BAND_6GHZ)
+-		validate_chandef_by_6ghz_he_eht_oper(sdata, link_id, conn, &new_chandef);
++		validate_chandef_by_6ghz_he_eht_oper(sdata, link_id, conn, &new_chandef,
++						     pwr_mode_6ghz);
+ 	else
+ 		validate_chandef_by_ht_vht_oper(sdata, conn, vht_cap_info,
+ 						&new_chandef);
+@@ -405,6 +413,11 @@ int ieee80211_parse_ch_switch_ie(struct ieee80211_sub_if_data *sdata,
+ 			(elems->max_channel_switch_time[1] <<  8) |
+ 			(elems->max_channel_switch_time[2] << 16);
+ 
++	if (pwr_mode_6ghz != NL80211_REG_NUM_POWER_MODES)
++		csa_ie->power_mode = ieee80211_cfg_to_mac_power_type(pwr_mode_6ghz);
++	else
++		csa_ie->power_mode = IEEE80211_REG_UNSET_AP;
++
+ 	return 0;
+ }
+ 
+diff --git a/net/mac80211/util.c b/net/mac80211/util.c
+index 0850edc18123..eea5c9d477b6 100644
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -3451,43 +3451,21 @@ void ieee80211_chandef_eht_oper(const struct ieee80211_eht_operation_info *info,
+ struct ieee80211_channel
+ *ieee80211_get_channel_6ghz_pwr_mode(struct ieee80211_sub_if_data *sdata,
+ 				     const struct ieee80211_he_operation *he_oper,
+-				     const int new_chan_idx)
++				     const int new_chan_idx,
++				     enum nl80211_regulatory_power_modes *ap_mode)
+ {
+ 	enum nl80211_regulatory_power_modes mode;
+ 	struct ieee80211_channel *new_chan;
+-	const struct ieee80211_he_6ghz_oper *he_6ghz_oper;
+-	u8 reg_info;
+ 	u32 new_freq;
+ 
+-
+-	he_6ghz_oper = ieee80211_he_6ghz_oper(he_oper);
+-
+-	if (!he_6ghz_oper) {
+-		sdata_info(sdata,
+-			   "HE 6GHz operation missing (on Channel: %d), expect issues\n",
+-			   new_chan_idx);
+-		return false;
+-	}
+-	/* 6G Power mode present in the beacon */
+-	reg_info = (he_6ghz_oper->control & IEEE80211_HE_6GHZ_OPER_CTRL_REG_INFO) >>
+-		   IEEE80211_HE_6GHZ_OPER_CTRL_REG_INFO_LSB;
+-
+-	/*
+-	 * If the root AP is Indoor SP AP, convert the received control field
+-	 * to SP AP.
+-	 */
+-	if (reg_info == IEEE80211_6GHZ_CTRL_REG_INDOOR_SP_AP)
+-		reg_info = IEEE80211_6GHZ_CTRL_REG_SP_AP;
+-
+-	mode = GET_POWER_MODE_FOR_NON_AP_STA(NL80211_REG_REGULAR_CLIENT, reg_info);
+-
+-	/*
+-	 * The EHT operation IE does not contain the primary channel so the
+-	 * primary channel frequency should be taken from the 6 GHz operation
+-	 * information.
+-	 */
+ 	new_freq = ieee80211_channel_to_frequency(new_chan_idx,
+ 						  NL80211_BAND_6GHZ);
++	*ap_mode = ieee80211_get_valid_6ghz_power_mode(sdata->local->hw.wiphy,
++						       MHZ_TO_KHZ(new_freq));
++	if (*ap_mode == NL80211_REG_NUM_POWER_MODES)
++		return NULL;
++
++	mode = GET_POWER_MODE_FOR_NON_AP_STA(NL80211_REG_REGULAR_CLIENT, *ap_mode);
+ 	new_chan = ieee80211_get_6g_channel_khz(sdata->local->hw.wiphy,
+ 						MHZ_TO_KHZ(new_freq), mode);
+ 	return new_chan;
+@@ -3530,8 +3508,8 @@ bool ieee80211_chandef_he_6ghz_oper(struct ieee80211_sub_if_data *sdata,
+ 	/*
+ 	 * For AP/AP_VLAN/MESH_POINT interfaces, the 6G power mode depends on the
+ 	 * mode configured by user (LPI/SP/VLP). For other interfaces (for ex STA)
+-	 * mode depends on the power mode present in beacon as well as power mode
+-	 * configured by the user for that interface
++	 * mode depends on the power mode present in beacon as well as the client
++	 * type (regular client or subordinate client).
+ 	 */
+ 	if (iftype == NL80211_IFTYPE_AP || iftype == NL80211_IFTYPE_AP_VLAN) {
+ 		mode = sdata->wdev.links[link_id].reg_6g_power_mode;
+diff --git a/net/wireless/util.c b/net/wireless/util.c
+index 30e476a02be8..90880adb64dc 100644
+--- a/net/wireless/util.c
++++ b/net/wireless/util.c
+@@ -159,6 +159,47 @@ int ieee80211_freq_khz_to_channel(u32 freq)
+ }
+ EXPORT_SYMBOL(ieee80211_freq_khz_to_channel);
+ 
++enum nl80211_regulatory_power_modes
++ieee80211_get_valid_6ghz_power_mode(struct wiphy *wiphy, u32 freq)
++{
++	static const enum nl80211_regulatory_power_modes p_mode_order[] = {
++		NL80211_REG_AP_LPI,
++		NL80211_REG_AP_VLP,
++		NL80211_REG_AP_SP,
++	};
++	struct ieee80211_supported_band *sband;
++	int i, j;
++
++	sband = wiphy->bands[NL80211_BAND_6GHZ];
++
++	if (!sband)
++		return NL80211_REG_NUM_POWER_MODES;
++
++	for (i = 0; i < ARRAY_SIZE(p_mode_order); i++) {
++		enum nl80211_regulatory_power_modes mode = p_mode_order[i];
++
++		if (!sband->chan_6g[mode])
++			continue;
++
++		for (j = 0; j < sband->chan_6g[mode]->n_channels; j++) {
++			struct ieee80211_channel *chan =
++				&sband->chan_6g[mode]->channels[j];
++
++			if (ieee80211_channel_to_khz(chan) != freq)
++				continue;
++
++			if (chan->flags &
++			    (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR))
++				break;
++
++			return mode;
++		}
++	}
++
++	return NL80211_REG_NUM_POWER_MODES;
++}
++EXPORT_SYMBOL(ieee80211_get_valid_6ghz_power_mode);
++
+ struct ieee80211_channel
+ *ieee80211_get_6g_channel_khz(struct wiphy *wiphy, u32 freq,
+ 			      enum nl80211_regulatory_power_modes mode)
+@@ -168,9 +209,16 @@ struct ieee80211_channel
+ 
+ 	sband = wiphy->bands[NL80211_BAND_6GHZ];
+ 
+-	if (!sband || mode >= NL80211_REG_NUM_POWER_MODES)
++	if (!sband || mode > NL80211_REG_NUM_POWER_MODES)
+ 		return NULL;
+ 
++	if (mode == NL80211_REG_NUM_POWER_MODES) {
++		mode = ieee80211_get_valid_6ghz_power_mode(wiphy, freq);
++
++		if (mode == NL80211_REG_NUM_POWER_MODES)
++			return ieee80211_get_channel_khz(wiphy, freq);
++	}
++
+ 	if (!sband->chan_6g[mode])
+ 		return ieee80211_get_channel_khz(wiphy, freq);
+ 
+-- 
+2.34.1
+

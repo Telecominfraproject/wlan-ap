@@ -1,0 +1,212 @@
+From 1cc3a25a243bbc19aa8b73a23b64ff56e4d497e1 Mon Sep 17 00:00:00 2001
+From: Balamurugan Ramar <quic_bramar@quicinc.com>
+Date: Thu, 10 Apr 2025 23:27:15 +0530
+Subject: [PATCH] mac80211: wifi Initialize per cpu SW queues and variables
+
+Initialize percpu SW queues and variables to store SKBs temporarily in
+the mac80211; which are eventually transmitted to the driver.
+
+Signed-off-by: Ramanathan Choodamani <quic_rchoodam@quicinc.com>
+Signed-off-by: Balamurugan Ramar <quic_bramar@quicinc.com>
+---
+ net/mac80211/ieee80211_i.h | 30 +++++++++++---
+ net/mac80211/main.c        | 81 +++++++++++++++++++++++++++++++++++---
+ 2 files changed, 101 insertions(+), 10 deletions(-)
+
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 93d70ae..8aacbb2 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1399,6 +1399,11 @@ struct channel_cw_info {
+ 	struct ieee80211_channel *cw_channel;
+ };
+ 
++struct ieee80211_tasklet_data {
++	struct tasklet_struct tasklet;
++	struct ieee80211_local *local;
++};
++
+ struct ieee80211_local {
+ 	/* embed the driver visible part.
+ 	 * don't cast (use the static inlines below), but we keep
+@@ -1432,10 +1437,14 @@ struct ieee80211_local {
+ 	 */
+ 	struct workqueue_struct *workqueue;
+ 
+-	unsigned long queue_stop_reasons[IEEE80211_MAX_QUEUES];
+-	int q_stop_reasons[IEEE80211_MAX_QUEUES][IEEE80211_QUEUE_STOP_REASONS];
++	/* percpu SW queue variables to stop/wake individual queues
++	 * for the current CPU
++	 */
++	unsigned long __percpu *queue_stop_reasons[IEEE80211_MAX_QUEUES];
++	int __percpu
++		*q_stop_reasons[IEEE80211_MAX_QUEUES][IEEE80211_QUEUE_STOP_REASONS];
+ 	/* also used to protect ampdu_ac_queue and amdpu_ac_stop_refcnt */
+-	spinlock_t queue_stop_reason_lock;
++	spinlock_t __percpu *queue_stop_reason_lock;
+ 
+ 	int open_count;
+ 	int monitors, cooked_mntrs, tx_mntrs;
+@@ -1534,8 +1543,12 @@ struct ieee80211_local {
+ 	struct timer_list sta_cleanup;
+ 	int sta_generation;
+ 
+-	struct sk_buff_head pending[IEEE80211_MAX_QUEUES];
+-	struct tasklet_struct tx_pending_tasklet;
++	/* percpu SW queues - each CPU having IEEE80211_MAX_QUEUES.
++	 * Maintain percpu tx dequeue tasklets which
++	 * will dequeue packets from its own CPU
++	 */
++	struct sk_buff_head __percpu *pending[IEEE80211_MAX_QUEUES];
++	struct ieee80211_tasklet_data __percpu *tx_pending_tasklet;
+ 	struct tasklet_struct wake_txqs_tasklet;
+ 
+ 	atomic_t agg_queue_stop[IEEE80211_MAX_QUEUES];
+@@ -1696,6 +1709,13 @@ struct ieee80211_local {
+ 	bool wbrf_supported;
+ };
+ 
++struct ieee80211_queue_info {
++	struct ieee80211_hw *hw;
++	int queue;
++	enum queue_stop_reason reason;
++	bool refcounted;
++};
++
+ static inline struct ieee80211_sub_if_data *
+ IEEE80211_DEV_TO_SUB_IF(const struct net_device *dev)
+ {
+diff --git a/net/mac80211/main.c b/net/mac80211/main.c
+index f523c77..567cc62 100644
+--- a/net/mac80211/main.c
++++ b/net/mac80211/main.c
+@@ -804,9 +804,10 @@ struct ieee80211_hw *ieee80211_alloc_hw_nm(size_t priv_data_len,
+ 					   const char *requested_name)
+ {
+ 	struct ieee80211_local *local;
+-	int priv_size, i;
++	int priv_size, i, j;
+ 	struct wiphy *wiphy;
+ 	bool emulate_chanctx;
++	int cpu = 0;
+ 
+ 	if (WARN_ON(!ops->tx || !ops->start || !ops->stop || !ops->config ||
+ 		    !ops->add_interface || !ops->remove_interface ||
+@@ -993,7 +994,6 @@ struct ieee80211_hw *ieee80211_alloc_hw_nm(size_t priv_data_len,
+ 	mutex_init(&local->iflist_mtx);
+ 	spin_lock_init(&local->filter_lock);
+ 	spin_lock_init(&local->rx_path_lock);
+-	spin_lock_init(&local->queue_stop_reason_lock);
+ 
+ 	for (i = 0; i < IEEE80211_NUM_ACS; i++) {
+ 		INIT_LIST_HEAD(&local->active_txqs[i]);
+@@ -1038,11 +1038,55 @@ struct ieee80211_hw *ieee80211_alloc_hw_nm(size_t priv_data_len,
+ 	spin_lock_init(&local->ack_status_lock);
+ 	idr_init(&local->ack_status_frames);
+ 
+-	for (i = 0; i < IEEE80211_MAX_QUEUES; i++) {
+-		skb_queue_head_init(&local->pending[i]);
++	for (i = 0; i < IEEE80211_MAX_QUEUES; i++)
+ 		atomic_set(&local->agg_queue_stop[i], 0);
++
++	/* Initialize the percpu queues
++	 * This includes :
++	 * 1. Initializing the percpu pending queue
++	 * 2. Initializing the percpu tasklet for transmitting skbs from
++	 * each pending queue
++	 * 4. Initializing queue_stop_reasons for each cpu
++	 * 5. Initializing percpu spinlocks to avoid contention between a
++	 * tasklet and process trying to access the same pending queue
++	 */
++	local->tx_pending_tasklet =
++		alloc_percpu_gfp(struct ieee80211_tasklet_data, GFP_KERNEL);
++	if (!local->tx_pending_tasklet)
++		goto err_free;
++
++	local->queue_stop_reason_lock = alloc_percpu(spinlock_t);
++	if (!local->queue_stop_reason_lock)
++		goto err_free;
++
++	for (i = 0; i < IEEE80211_MAX_QUEUES; i++) {
++		local->pending[i] = alloc_percpu(struct sk_buff_head);
++		if (!local->pending[i])
++			goto err_free;
++
++		local->queue_stop_reasons[i] = alloc_percpu_gfp(unsigned long, GFP_KERNEL);
++		if (!local->queue_stop_reasons[i])
++			goto err_free;
++
++		for (j = 0; j < IEEE80211_QUEUE_STOP_REASONS; j++) {
++			local->q_stop_reasons[i][j] = alloc_percpu(int);
++			if (!local->q_stop_reasons[i][j])
++				goto err_free;
++		}
++	}
++
++	for_each_possible_cpu(cpu) {
++		struct ieee80211_tasklet_data *tasklet_data = per_cpu_ptr(local->tx_pending_tasklet, cpu);
++		for (i = 0; i < IEEE80211_MAX_QUEUES; i++) {
++			struct sk_buff_head *pending = per_cpu_ptr(local->pending[i], cpu);
++			if (!pending)
++				continue;
++			skb_queue_head_init(pending);
++		}
++		tasklet_data->local = local;
++		tasklet_setup(&tasklet_data->tasklet, ieee80211_tx_pending);
++		spin_lock_init(per_cpu_ptr(local->queue_stop_reason_lock, cpu));
+ 	}
+-	tasklet_setup(&local->tx_pending_tasklet, ieee80211_tx_pending);
+ 
+ 	if (!ieee80211_hw_check(&local->hw, HAS_TX_QUEUE))
+ 		tasklet_setup(&local->wake_txqs_tasklet, ieee80211_wake_txqs);
+@@ -1061,6 +1105,20 @@ struct ieee80211_hw *ieee80211_alloc_hw_nm(size_t priv_data_len,
+ 
+ 	return &local->hw;
+  err_free:
++	if (this_cpu_ptr(local->tx_pending_tasklet))
++		free_percpu(local->tx_pending_tasklet);
++	if (this_cpu_ptr(local->queue_stop_reason_lock))
++		free_percpu(local->queue_stop_reason_lock);
++	for (i = 0; i < IEEE80211_MAX_QUEUES; i++) {
++		if (this_cpu_ptr(local->pending[i]))
++			free_percpu(local->pending[i]);
++		if (this_cpu_ptr(local->queue_stop_reasons[i]))
++			free_percpu(local->queue_stop_reasons[i]);
++		for (j = 0; j < IEEE80211_QUEUE_STOP_REASONS; j++)
++			if (this_cpu_ptr(local->q_stop_reasons[i][j]))
++				free_percpu(local->q_stop_reasons[i][j]);
++	}
++
+ 	wiphy_free(wiphy);
+ 	return NULL;
+ }
+@@ -1837,6 +1895,7 @@ void ieee80211_free_hw(struct ieee80211_hw *hw)
+ {
+ 	struct ieee80211_local *local = hw_to_local(hw);
+ 	enum nl80211_band band;
++	int i, j;
+ 
+ 	mutex_destroy(&local->iflist_mtx);
+ 
+@@ -1849,6 +1908,18 @@ void ieee80211_free_hw(struct ieee80211_hw *hw)
+ 		     ieee80211_free_ack_frame, NULL);
+ 	idr_destroy(&local->ack_status_frames);
+ 
++	/* Free the perCPU SW queues and associated
++	 * variables
++	 */
++	for (i = 0; i < IEEE80211_MAX_QUEUES; i++) {
++		free_percpu(local->pending[i]);
++		free_percpu(local->queue_stop_reasons[i]);
++		for (j = 0; j < IEEE80211_QUEUE_STOP_REASONS; j++)
++			free_percpu(local->q_stop_reasons[i][j]);
++	}
++	free_percpu(local->tx_pending_tasklet);
++	free_percpu(local->queue_stop_reason_lock);
++
+ 	sta_info_stop(local);
+ 
+ 	ieee80211_free_led_names(local);
+-- 
+2.34.1
+

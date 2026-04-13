@@ -1,0 +1,238 @@
+From 684452262374c22ed57e7f0a5704237c23d7c9e8 Mon Sep 17 00:00:00 2001
+From: Rajat Soni <rajson@qti.qualcomm.com>
+Date: Fri, 20 Jun 2025 11:51:13 +0530
+Subject: [PATCH] QSDK: CP: hostapd: Add support for dynamic chain mask
+
+This patch introduces a new hostapd_cli command `chain_mask` that allows
+dynamic modification of TX and RX chain masks, the beacon information is
+updated to reflect the new configuration.
+ 
+Commands:
+ 
+For non-MLO:
+  hostapd_cli -i wlan# chain_mask <tx_chain_mask> <rx_chain_mask>
+ 
+For MLO:
+  hostapd_cli -i wlan# -l <link_id> chain_mask <tx_chain_mask> <rx_chain_mask>
+ 
+The implementation adds a new driver operation `set_chain_mask` and
+uses NL80211_CMD_SET_WIPHY to apply the changes. Get latest mode and
+update hostapd current mode, use it to update beacons that ensure the
+new chain mask settings are propagated correctly.
+
+Signed-off-by: Rajat Soni <rajson@qti.qualcomm.com>
+---
+ hostapd/ctrl_iface.c         | 57 ++++++++++++++++++++++++++++++++++++
+ hostapd/hostapd_cli.c        |  7 +++++
+ src/drivers/driver.h         |  1 +
+ src/drivers/driver_nl80211.c | 29 ++++++++++++++++++
+ src/drivers/nl80211_copy.h   |  1 +
+ 5 files changed, 95 insertions(+)
+
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -71,6 +71,7 @@
+ #include "config_file.h"
+ #include "ctrl_iface.h"
+ #include "ap/ttlm.h"
++#include "../src/drivers/driver_nl80211.h"
+ 
+ 
+ #define HOSTAPD_CLI_DUP_VALUE_MAX_LEN 256
+@@ -4614,6 +4615,73 @@ static int hostapd_ctrl_iface_disable_ml
+ 	return 0;
+ }
+ 
++static int hotapd_ctrl_set_tx_rx_chain_mask(struct hostapd_data *hapd, char *cmd,
++					    char *buf, size_t buflen)
++{
++	int ret = -1, i;
++	uint32_t tx_ant, rx_ant;
++	uint8_t radio_idx = NL80211_WIPHY_RADIO_ID_MAX;
++	char *ptr;
++	u16 num_modes, flags;
++	u8 dfs_domain;
++	struct hostapd_hw_modes *modes;
++
++	if (!hapd->started) {
++		wpa_printf(MSG_ERROR, "Interface is not UP.\n");
++		return ret;
++	}
++
++	tx_ant = (uint32_t)strtol(cmd, &ptr, 10);
++	rx_ant = (uint32_t)strtol(ptr, NULL, 10);
++
++	if (hapd->iface->num_multi_hws)
++		radio_idx = hapd->iface->current_hw_info->hw_idx;
++
++	/* Set tx_ant and rx_ant values to max so that driver
++	 * can move tx_ant and rx_ant to max supported values
++	 */
++
++	if (tx_ant == 0)
++		tx_ant = 0xffffffff;
++	if (rx_ant == 0)
++		rx_ant = 0xffffffff;
++
++	if (hapd->driver == NULL || hapd->driver->set_chain_mask == NULL) {
++		wpa_printf(MSG_ERROR, "Set chain mask not found.\n");
++		return -1;
++	}
++	ret = hapd->driver->set_chain_mask(hapd->drv_priv, radio_idx, tx_ant, rx_ant);
++
++	if (ret)
++		return ret;
++
++	/* Get latest modes sent by driver with new chain mask values.
++	 */
++	modes = nl80211_get_hw_feature_data(hapd->drv_priv, &num_modes,
++				    &flags, &dfs_domain, 0);
++	if (modes) {
++		for (i = 0; i < num_modes; i++) {
++			struct hostapd_hw_modes *mode = &modes[i];
++
++			if (mode->channels->freq ==
++			    hapd->iface->current_mode->channels->freq) {
++				os_memcpy(hapd->iface->current_mode,
++					  mode, sizeof(struct hostapd_hw_modes));
++				break;
++			}
++		}
++		os_free(modes);
++	} else {
++		wpa_printf(MSG_ERROR, "Failed to get latest modes.\n");
++		return -1;
++	}
++
++	ret = ieee802_11_update_beacons(hapd->iface);
++	if (ret)
++		wpa_printf(MSG_ERROR, "Failed to update beacons.\n");
++
++	return ret;
++}
+ 
+ static int hostapd_ctrl_iface_link_remove(struct hostapd_data *hapd, char *cmd,
+ 					  char *buf, size_t buflen)
+@@ -5917,6 +5985,10 @@ static int hostapd_ctrl_iface_receive_pr
+ 		if (hostapd_ctrl_iface_conf_ml_rec_links(hapd, buf + 17))
+ 			reply_len = -1;
+ #endif /* CONFIG_IEEE80211BE */
++	} else if (os_strncmp(buf, "CHAIN_MASK ", 11) == 0) {
++		if (hotapd_ctrl_set_tx_rx_chain_mask(hapd, buf+11,
++						     reply, reply_size))
++			reply_len = -1;
+ 	} else {
+ 		os_memcpy(reply, "UNKNOWN COMMAND\n", 16);
+ 		reply_len = 16;
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1490,6 +1490,11 @@ static int hostapd_cli_cmd_mld_add_link(
+ 	return hostapd_cli_cmd(ctrl, "MLD_ADD_LINK", 1, argc, argv);
+ }
+ #endif
++static int hostapd_cli_cmd_chain_mask(struct wpa_ctrl *ctrl, int argc,
++				      char *argv[])
++{
++	return hostapd_cli_cmd(ctrl, "CHAIN_MASK", 2, argc, argv);
++}
+ 
+ 
+ static int hostapd_cli_cmd_driver_flags(struct wpa_ctrl *ctrl, int argc,
+@@ -2003,6 +2008,8 @@ static const struct hostapd_cli_cmd host
+ 	{ "negotiated_ttlm", hostapd_cli_cmd_negotiated_ttlm, NULL,
+ 	  "= send ttlm test commands" },
+ #endif
++	{ "chain_mask", hostapd_cli_cmd_chain_mask, NULL,
++	"<tx chain mask> <rx chain mask>" },
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -3832,7 +3832,14 @@ struct wpa_driver_ops {
+ 	 */
+ 	int (*authenticate)(void *priv,
+ 			    struct wpa_driver_auth_params *params);
+-
++	/**
++	 * set_chain_mask - Set tx/rx chain mask
++	 * @priv: private driver interface data
++	 * @radio_idx: Radio index or hardware index
++	 * @tx_ant: tx antenna chain mask value
++	 * @rx_ant: rx antenna chain mask value
++	 */
++	int (*set_chain_mask)(void *priv, uint8_t radio_idx, uint32_t tx_ant, uint32_t rx_ant);
+ 	/**
+ 	 * set_ap - Set Beacon and Probe Response information for AP mode
+ 	 * @priv: Private driver interface data
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -5306,6 +5306,42 @@ static int nl80211_put_freq_params(struc
+ 	return 0;
+ }
+ 
++static int wpa_driver_set_chain_mask(void *priv, uint8_t radio_idx,
++				     uint32_t tx_ant, uint32_t rx_ant)
++{
++	struct i802_bss *bss = priv;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++	struct nl_msg *msg;
++	int ret = -1;
++
++	msg = nl80211_bss_msg(bss, 0, NL80211_CMD_SET_WIPHY);
++	if (!msg) {
++		wpa_printf(MSG_ERROR, "Failed to build NL80211_CMD_SET_WIPHY msg");
++		return -1;
++	}
++
++	NLA_PUT_U8(msg, NL80211_ATTR_DYNAMIC_CHAIN_MASK, 1);
++
++	if (radio_idx < NL80211_WIPHY_RADIO_ID_MAX)
++		NLA_PUT_U8(msg, NL80211_ATTR_WIPHY_RADIO_INDEX, radio_idx);
++
++	NLA_PUT_U32(msg, NL80211_ATTR_WIPHY_ANTENNA_TX, tx_ant);
++	NLA_PUT_U32(msg, NL80211_ATTR_WIPHY_ANTENNA_RX, rx_ant);
++
++	ret = send_and_recv_cmd(drv, msg);
++	if (!ret) {
++		return 0;
++	}
++nla_put_failure:
++	wpa_printf(MSG_ERROR, "nl80211: Chain_mask: Failed to set chain mask %d %d: "
++		   "%d (%s)", tx_ant, rx_ant, ret, strerror(-ret));
++
++	if (msg)
++		nlmsg_free(msg);
++
++	return ret;
++
++}
+ 
+ static int wpa_driver_nl80211_set_ap(void *priv,
+ 				     struct wpa_driver_ap_params *params)
+@@ -15544,6 +15580,7 @@ const struct wpa_driver_ops wpa_driver_n
+ 	.set_supp_port = wpa_driver_nl80211_set_supp_port,
+ 	.set_country = wpa_driver_nl80211_set_country,
+ 	.get_country = wpa_driver_nl80211_get_country,
++	.set_chain_mask = wpa_driver_set_chain_mask,
+ 	.set_ap = wpa_driver_nl80211_set_ap,
+ 	.set_acl = wpa_driver_nl80211_set_acl,
+ 	.if_add = wpa_driver_nl80211_if_add,
+--- a/src/drivers/nl80211_copy.h
++++ b/src/drivers/nl80211_copy.h
+@@ -3546,6 +3546,7 @@ enum nl80211_attrs {
+ 	NL80211_ATTR_AP_REMOVAL_COUNT,
+ 	NL80211_ATTR_TSF,
+ 	NL80211_ATTR_RXMGMT_LINK_REMOVAL_UPDATE,
++	NL80211_ATTR_DYNAMIC_CHAIN_MASK,
+ 	NL80211_ATTR_ML_MAX_REC_LINKS,
+ 
+ 	NL80211_ATTR_ERP,
+@@ -3592,6 +3593,7 @@ enum nl80211_attrs {
+ #define NL80211_ATTR_FEATURE_FLAGS NL80211_ATTR_FEATURE_FLAGS
+ 
+ #define NL80211_WIPHY_NAME_MAXLEN		64
++#define NL80211_WIPHY_RADIO_ID_MAX              0xff
+ 
+ #define NL80211_MAX_SUPP_RATES			32
+ #define NL80211_MAX_SUPP_SELECTORS		128

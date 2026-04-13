@@ -1,0 +1,336 @@
+From 5888377f18bd8b583198843bbd07ede0c4377bff Mon Sep 17 00:00:00 2001
+From: Harshitha Prem <hprem@qti.qualcomm.com>
+Date: Sun, 27 Jul 2025 21:12:17 +0530
+Subject: [PATCH 6/8] QSDK: CP: hostapd: ATF: Add distribution algo trigger
+ timer
+
+Airtime distribution occurs when any station joins/leaves and
+when commitatf is issued. So, once any station joins/leave
+trigger the algorithm.
+
+ATF algorithm overview:
+	1. trigger timer
+	2. On timer expiry, start algorithm
+	3. build the candidate list
+	4. distribute the airtime based on the candidate list
+	5. send to driver
+
+Add apis to trigger atf distribution logic during station join/leave
+and store the flags, which would be later used to update to the driver.
+
+Remove the static keyword to change the scope of the function
+hostapd_iface_num_sta(), so that it can be used by atf distribution
+logic.
+
+Signed-off-by: Harshitha Prem <hprem@qti.qualcomm.com>
+---
+ src/ap/hostapd.c      |  7 +++-
+ src/ap/hostapd.h      |  1 +
+ src/ap/sta_info.c     |  4 ++
+ src/ap/sta_info.h     |  3 ++
+ src/atf/atf_offload.c | 85 +++++++++++++++++++++++++++++++++++++++++++
+ src/atf/atf_offload.h | 78 +++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 177 insertions(+), 1 deletion(-)
+
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 5e42fc6..8fd3696 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -377,7 +377,7 @@ static int hostapd_iface_conf_changed(struct hostapd_config *newconf,
+ 	return 0;
+ }
+ 
+-static inline int hostapd_iface_num_sta(struct hostapd_iface *iface)
++int hostapd_iface_num_sta(struct hostapd_iface *iface)
+ {
+ 	int num_sta = 0;
+ 	int i;
+@@ -1117,6 +1117,11 @@ void hostapd_cleanup_iface_partial(struct hostapd_iface *iface)
+ 	ap_list_deinit(iface);
+ 	sta_track_deinit(iface);
+ 	airtime_policy_update_deinit(iface);
++
++#ifdef CONFIG_ATF_OFFLOAD
++	atf_timer_stop(iface);
++#endif
++
+ 	hostapd_free_multi_hw_info(iface->multi_hw_info);
+ 	iface->multi_hw_info = NULL;
+ 	iface->current_hw_info = NULL;
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 6eff4a1..bbefd19 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -950,6 +950,7 @@ void hostapd_new_assoc_sta(struct hostapd_data *hapd, struct sta_info *sta,
+ 			   int reassoc);
+ void hostapd_interface_deinit_free(struct hostapd_iface *iface);
+ void hostapd_deauthenticate_stations(struct hapd_interfaces *interfaces);
++int hostapd_iface_num_sta(struct hostapd_iface *iface);
+ int hostapd_enable_iface(struct hostapd_iface *hapd_iface);
+ int hostapd_reload_iface(struct hostapd_iface *hapd_iface);
+ int hostapd_reload_bss_only(struct hostapd_data *bss);
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index f1a7871..6e2a74a 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -1947,6 +1947,8 @@ void ap_sta_set_authorized_event(struct hostapd_data *hapd,
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_CONNECTED "%s%s%s%s%s",
+ 			buf, ip_addr, keyid_buf, dpp_pkhash_buf, alg_buf);
+ 
++		atf_join_leave_update(hapd->iface, sta, true);
++
+ 		if (hapd->msg_ctx_parent &&
+ 		    hapd->msg_ctx_parent != hapd->msg_ctx)
+ 			wpa_msg_no_global(hapd->msg_ctx_parent, MSG_INFO,
+@@ -1957,6 +1959,8 @@ void ap_sta_set_authorized_event(struct hostapd_data *hapd,
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_DISCONNECTED "%s", buf);
+ 		hostapd_ubus_notify(hapd, "disassoc", sta->addr);
+ 
++		atf_join_leave_update(hapd->iface, sta, false);
++
+ 		if (hapd->msg_ctx_parent &&
+ 		    hapd->msg_ctx_parent != hapd->msg_ctx)
+ 			wpa_msg_no_global(hapd->msg_ctx_parent, MSG_INFO,
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index fbf8de4..a3b9368 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -327,6 +327,9 @@ struct sta_info {
+ 	unsigned int dyn_airtime_weight;
+ 	struct os_reltime backlogged_until;
+ #endif /* CONFIG_AIRTIME_POLICY */
++#ifdef CONFIG_ATF_OFFLOAD
++        struct atf_peer atf_peer;
++#endif
+ 
+ #ifdef CONFIG_PASN
+ 	struct pasn_data *pasn;
+diff --git a/src/atf/atf_offload.c b/src/atf/atf_offload.c
+index 39032f8..ddc70cf 100644
+--- a/src/atf/atf_offload.c
++++ b/src/atf/atf_offload.c
+@@ -27,6 +27,9 @@
+ 
+ struct atf_offload *atf = NULL;
+ 
++/* one second timeout for Airtime distribution */
++#define ATF_ALGO_TIMEOUT 1
++
+ struct atf_peer_config *
+ atf_allocate_peer_config(u8 *macaddr, struct atf_algo *algo)
+ {
+@@ -237,6 +240,7 @@ atf_free_peer_configs(struct atf_algo *algo)
+ 		atf_free_peer_config(peer);
+ }
+ 
++
+ static void
+ atf_free_ssid_configs(struct atf_algo *algo)
+ {
+@@ -384,6 +388,87 @@ atf_get_algo_entry(struct hostapd_iface *iface)
+ }
+ 
+ 
++void
++atf_join_leave_update(struct hostapd_iface *iface, struct sta_info *sta, bool is_join)
++{
++	if (!iface || !iface->atf_algo || !sta)
++		return;
++
++	ATF_SET_STA_TO_UPDATE(sta->atf_peer);
++	if (is_join)
++		ATF_OFFLOAD_SET_JOIN_UPDATE(iface->atf_algo);
++	else
++		ATF_OFFLOAD_SET_LEAVE_UPDATE(iface->atf_algo);
++
++	atf_trigger_config_timer(iface);
++}
++
++
++void
++atf_trigger_config_timer(struct hostapd_iface *iface)
++{
++
++	wpa_printf(MSG_INFO, "ATF: Trigger distribution of airtime for iface %p", iface);
++	if (iface->atf_algo->atf_tasksched == 0) {
++		iface->atf_algo->atf_tasksched = 1;
++		atf_timer_start(iface);
++	}
++}
++
++
++static void
++atf_cfg_timeout_handler(void *eloop_ctx, void *timeout_ctx)
++{
++	struct hostapd_iface *iface = (struct hostapd_iface *)eloop_ctx;
++	struct atf_algo *algo;
++
++	if (!iface || !iface->atf_algo) {
++		wpa_printf(MSG_ERROR, "ATF: Something is wrong, check iface");
++		return;
++	}
++
++	algo = iface->atf_algo;
++
++	if (!algo->atf_enabled) {
++		wpa_printf(MSG_ERROR, "ATF not enabled. skip distribution");
++		goto out;
++	}
++
++	wpa_printf(MSG_DEBUG, "ATF: Hitting the timeout handler for iface %p", iface);
++
++	if (!hostapd_iface_num_sta(iface)) {
++		wpa_printf(MSG_INFO,
++			   "ATF: There is no peer associated in this iface, Skip distribution");
++		goto out;
++	}
++
++out:
++	algo->atf_tasksched = 0;
++	return;
++}
++
++
++int
++atf_timer_start(struct hostapd_iface *iface)
++{
++	wpa_printf(MSG_ERROR, "ATF: Trigger algo for iface %p", iface);
++	eloop_register_timeout(ATF_ALGO_TIMEOUT, 0, atf_cfg_timeout_handler, iface, NULL);
++	return 0;
++}
++
++
++void
++atf_timer_stop(struct hostapd_iface *iface)
++{
++	wpa_printf(MSG_DEBUG, "ATF: cancelling timeout");
++	if (!iface->atf_algo)
++		return;
++
++	iface->atf_algo->atf_tasksched = 0;
++	eloop_cancel_timeout(atf_cfg_timeout_handler, iface, NULL);
++}
++
++
+ void
+ atf_init_algo(struct hostapd_iface *iface)
+ {
+diff --git a/src/atf/atf_offload.h b/src/atf/atf_offload.h
+index b351b5a..8780dfd 100644
+--- a/src/atf/atf_offload.h
++++ b/src/atf/atf_offload.h
+@@ -23,6 +23,51 @@
+ #define ATF_MAX_SSID 16
+ #define ATF_MAX_PEER 512
+ 
++/**
++ * enum atf_offload_update_flag - Airtime update flags for driver
++ * @ATF_OFFLOAD_FULL_UPDATE: Full update and default update method
++ * @ATF_OFFLOAD_PARTIAL_JOIN_UPDATE: Partial update method for peer join case
++ * @ATF_OFFLOAD_PARTIAL_LEAVE_UPDATE: Partial update method for peer leave case
++ * @ATF_OFFLOAD_NO_UPDATE: set when driver is updated with latest.
++ */
++enum atf_offload_update_flag {
++	ATF_OFFLOAD_FULL_UPDATE,
++	ATF_OFFLOAD_PARTIAL_JOIN_UPDATE,
++	ATF_OFFLOAD_PARTIAL_LEAVE_UPDATE,
++	ATF_OFFLOAD_NO_UPDATE,
++};
++
++#define ATF_OFFLOAD_SET_NO_UPDATE(algo) (algo->update_flag = ATF_OFFLOAD_NO_UPDATE)
++
++#define ATF_OFFLOAD_SET_FULL_UPDATE(algo) (algo->update_flag = ATF_OFFLOAD_FULL_UPDATE)
++
++#define ATF_OFFLOAD_IS_FULL_UPDATE(algo) (algo->update_flag == ATF_OFFLOAD_FULL_UPDATE)
++
++#define ATF_OFFLOAD_IS_JOIN_UPDATE(algo)                                                 \
++	(algo->update_flag == ATF_OFFLOAD_PARTIAL_JOIN_UPDATE)
++
++#define ATF_OFFLOAD_IS_LEAVE_UPDATE(algo)                                                \
++	(algo->update_flag == ATF_OFFLOAD_PARTIAL_LEAVE_UPDATE)
++
++#define ATF_OFFLOAD_SET_JOIN_UPDATE(algo)                                                \
++	do {                                                                             \
++		if (!ATF_OFFLOAD_IS_FULL_UPDATE(algo))                                   \
++			algo->update_flag = ATF_OFFLOAD_PARTIAL_JOIN_UPDATE;             \
++	} while (0)
++
++#define ATF_OFFLOAD_SET_LEAVE_UPDATE(algo)                                               \
++	do {                                                                             \
++		if (!ATF_OFFLOAD_IS_FULL_UPDATE(algo) &&                                 \
++		    !ATF_OFFLOAD_IS_JOIN_UPDATE(algo))                                   \
++			algo->update_flag = ATF_OFFLOAD_PARTIAL_LEAVE_UPDATE;            \
++	} while (0)
++
++#define ATF_SET_STA_TO_UPDATE(sta) (sta.is_updated = true)
++
++#define ATF_CLEAR_STA_UPDATED(sta) (sta.is_updated = false)
++
++#define ATF_IS_STA_UPDATED(sta) (sta.is_updated)
++
+ /**
+  * @struct atf_peer_config - per sta config.
+  */
+@@ -39,6 +84,20 @@ struct atf_peer_config {
+ 	char group_name[WLAN_SSID_MAX_LEN];
+ };
+ 
++/**
++ * @struct atf_peer - atf peer config reference used in sta_info.
++ */
++
++struct atf_peer {
++	bool atf_configured;
++	struct atf_peer_config *peer_cfg_ref;
++	struct sta_info *sta;
++	u32 calculated_airtime;
++
++	/* Flag to indicate whether it is updated to driver */
++	bool is_updated;
++};
++
+ /**
+  * @struct atf_ssid_config - per ssid config when group is not enabled.
+  */
+@@ -94,6 +153,11 @@ struct atf_algo {
+ 	bool ssid_group_enabled;
+ 	bool atfstrictsched_enabled;
+ 
++	/* used in ATF distribution logic*/
++	enum atf_offload_update_flag update_flag;
++	/*Flag to indicate update task scheduled */
++	bool atf_tasksched;
++
+ 	/* used for ATF config parsing*/
+ 	struct atf_group *last_group;
+ 	struct atf_ssid_config *last_ssid_cfg;
+@@ -138,6 +202,15 @@ struct atf_peer_config *atf_allocate_peer_config(u8 *macaddr, struct atf_algo *a
+ 
+ void atf_free_peer_config(struct atf_peer_config *peer_config);
+ 
++int atf_timer_start(struct hostapd_iface *iface);
++
++void atf_timer_stop(struct hostapd_iface *iface);
++
++void atf_trigger_config_timer(struct hostapd_iface *iface);
++
++void atf_join_leave_update(struct hostapd_iface *iface, struct sta_info *sta,
++                           bool is_join);
++
+ #else
+ 
+ static inline void atf_offload_init(struct hapd_interfaces *ifaces)
+@@ -156,5 +229,10 @@ static inline void atf_deinit_algo(struct hostapd_iface *iface)
+ {
+ }
+ 
++static inline void atf_join_leave_update(struct hostapd_iface *iface, struct sta_info *sta,
++					 bool is_join)
++{
++}
++
+ #endif /* CONFIG_ATF_OFFLOAD */
+ #endif /* ATF_OFFLOAD_H */
+-- 
+2.34.1
+

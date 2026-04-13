@@ -1,0 +1,214 @@
+From dd3df839796c88ceca7f6742a5faf7a9a2e38ce1 Mon Sep 17 00:00:00 2001
+From: Ramanathan Choodamani <rchoodam@qti.qualcomm.com>
+Date: Fri, 12 Sep 2025 17:20:42 -0700
+Subject: [PATCH] QSDK:DP:wifi:ath12k:Update splitphy ds bank id for all links
+ during reassignment
+
+Add support to update splitphy ds bank id for all the links when a link
+gets a new bank id. This is because mere assignment without updating the
+refcount for that bank profile results in corruption of the entire table
+with respect to number of users when a double decrement happens during
+vdev delete for every link.
+To avoid this, ensure whenever a bank_id for a link is assigned to
+another link which happens when a VP profile is shared, the refcount
+for the bank is updated accordingly.
+
+Fixes: 016c6c2fe1e2 ("QSDK: DP: wifi: Package upgrade changes for datapath")
+
+Patch dependency:
+0528-QSDK-CP-wifi-ath12k-Add-locks-while-using-ppe_vp_pro.patch
+Patch-work: NA
+
+Signed-off-by: Ramanathan Choodamani <rchoodam@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c  | 29 +++++++++-----
+ drivers/net/wireless/ath/ath12k/dp.h  |  2 +
+ drivers/net/wireless/ath/ath12k/ppe.c | 55 ++++++++++++++-------------
+ drivers/net/wireless/ath/ath12k/ppe.h |  2 +
+ 4 files changed, 53 insertions(+), 35 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -567,6 +567,22 @@ skip_dma_alloc:
+ }
+ EXPORT_SYMBOL(ath12k_dp_srng_setup);
+ 
++void ath12k_dp_increment_bank_num_users(struct ath12k_dp *dp,
++					int bank_id)
++{
++	spin_lock_bh(&dp->tx_bank_lock);
++	dp->bank_profiles[bank_id].num_users++;
++	spin_unlock_bh(&dp->tx_bank_lock);
++}
++
++void ath12k_dp_tx_put_bank_profile(struct ath12k_dp *dp, u8 bank_id)
++{
++	spin_lock_bh(&dp->tx_bank_lock);
++	if (dp->bank_profiles[bank_id].num_users)
++		dp->bank_profiles[bank_id].num_users--;
++	spin_unlock_bh(&dp->tx_bank_lock);
++}
++
+ int ath12k_dp_tx_get_bank_profile(struct ath12k_base *ab,
+ 				  struct ath12k_link_vif *arvif,
+ 				  struct ath12k_dp *dp, bool vdev_id_check_en)
+@@ -620,13 +636,6 @@ inc_ref_and_return:
+ 	return bank_id;
+ }
+ 
+-void ath12k_dp_tx_put_bank_profile(struct ath12k_dp *dp, u8 bank_id)
+-{
+-	spin_lock_bh(&dp->tx_bank_lock);
+-	dp->bank_profiles[bank_id].num_users--;
+-	spin_unlock_bh(&dp->tx_bank_lock);
+-}
+-
+ void ath12k_dp_tx_update_bank_profile(struct ath12k_link_vif *arvif)
+ {
+ 	struct ath12k_base *ab = arvif->ar->ab;
+@@ -638,6 +647,7 @@ void ath12k_dp_tx_update_bank_profile(st
+ 	if (arvif->splitphy_ds_bank_id != DP_INVALID_BANK_ID) {
+ 		ath12k_dp_tx_put_bank_profile(dp, arvif->splitphy_ds_bank_id);
+ 		arvif->splitphy_ds_bank_id = ath12k_dp_tx_get_bank_profile(ab, arvif, dp, false);
++		ath12k_ppeds_update_splitphy_bank_id(ab, arvif);
+ 	}
+ 
+ 	ath12k_dp_tx_put_bank_profile(dp, dp_link_vif->bank_id);
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -1100,5 +1100,7 @@ void ath12k_dp_get_vif_stats(struct ath1
+ void ath12k_dp_get_pdev_stats(struct ath12k_pdev_dp *pdev,
+ 			      struct ath12k_telemetry_dp_radio *telemetry_radio);
+ 
++void ath12k_dp_increment_bank_num_users(struct ath12k_dp *dp,
++					int bank_id);
+ #endif
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/ppe.c
++++ b/drivers/net/wireless/ath/ath12k/ppe.c
+@@ -879,7 +879,6 @@ static int ath12k_ppeds_attach_link_apvl
+ 	int vdev_id = arvif->vdev_id;
+ 	int ret;
+ 	enum nl80211_iftype vif_type;
+-	unsigned long links_map;
+ 
+ 	if (!wdev)
+ 		return -EOPNOTSUPP;
+@@ -929,8 +928,6 @@ static int ath12k_ppeds_attach_link_apvl
+ 
+ 		vlan_iface->ppe_vp_profile_idx[link_id] = ppe_vp_profile_idx;
+ 	} else {
+-		int link_idx;
+-		struct ath12k_link_vif *iter_arvif;
+ 		bool vdev_id_check_en = false;
+ 
+ 		vlan_iface->ppe_vp_profile_idx[link_id] = ppe_vp_profile_idx;
+@@ -938,17 +935,7 @@ static int ath12k_ppeds_attach_link_apvl
+ 		arvif->splitphy_ds_bank_id =
+ 			ath12k_dp_tx_get_bank_profile(ab, arvif, ab->dp, vdev_id_check_en);
+ 
+-		links_map = ahvif->links_map;
+-		for_each_set_bit(link_idx, &links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
+-			iter_arvif = ahvif->link[link_idx];
+-
+-			if (!iter_arvif || iter_arvif == arvif ||
+-			    !iter_arvif->is_created || ab != iter_arvif->ar->ab)
+-				continue;
+-
+-			iter_arvif->splitphy_ds_bank_id =
+-						arvif->splitphy_ds_bank_id;
+-		}
++		ath12k_ppeds_update_splitphy_bank_id(ab, arvif);
+ 	}
+ 
+ 	ath12k_dp_ppeds_setup_vp_entry(ab, ar, arvif, vp_profile);
+@@ -1005,6 +992,43 @@ void ath12k_ppe_ds_attach_vlan_vif_link(
+ 	vlan_iface->attach_link_done = true;
+ }
+ 
++void ath12k_ppeds_update_splitphy_bank_id(struct ath12k_base *ab,
++					  struct ath12k_link_vif *arvif)
++{
++	struct ath12k_vif *ahvif = arvif->ahvif;
++	struct ath12k_link_vif *iter_arvif;
++	unsigned long links_map;
++	int link_idx;
++
++	links_map = ahvif->links_map;
++	for_each_set_bit(link_idx, &links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
++		iter_arvif = ahvif->link[link_idx];
++		int splitphy_ds_bank_id = DP_INVALID_BANK_ID;
++
++		if (!iter_arvif || iter_arvif == arvif ||
++		    !iter_arvif->is_created || ab != iter_arvif->ar->ab)
++			continue;
++
++		splitphy_ds_bank_id = iter_arvif->splitphy_ds_bank_id;
++		/**
++		 * If the link already has a splitphy_ds_bank_id
++		 * then decrement the refcount for that bank_id
++		 * before updating the link with a new bank_id
++		 */
++		if (splitphy_ds_bank_id != DP_INVALID_BANK_ID)
++			ath12k_dp_tx_put_bank_profile(ath12k_ab_to_dp(ab),
++						      splitphy_ds_bank_id);
++
++		iter_arvif->splitphy_ds_bank_id = arvif->splitphy_ds_bank_id;
++		ath12k_dp_increment_bank_num_users(ath12k_ab_to_dp(ab),
++						   arvif->splitphy_ds_bank_id);
++		ath12k_dbg(ab, ATH12K_DBG_PPE,
++			   "splitphy_ds_bank_id %d for vp_num %d vdev_id %d\n",
++			   arvif->splitphy_ds_bank_id,
++			   ahvif->dp_vif.ppe_vp_num, iter_arvif->vdev_id);
++	}
++}
++
+ int ath12k_ppeds_attach_link_vif(struct ath12k_link_vif *arvif, int vp_num,
+ 				 int *link_ppe_vp_profile_idx,
+ 				 struct ieee80211_vif *vif)
+@@ -1022,7 +1046,6 @@ int ath12k_ppeds_attach_link_vif(struct
+ 	int vdev_id = arvif->vdev_id;
+ 	int ret;
+ 	enum nl80211_iftype vif_type;
+-	unsigned long links_map;
+ 
+ 	if (!wdev)
+ 		return -EOPNOTSUPP;
+@@ -1080,8 +1103,6 @@ int ath12k_ppeds_attach_link_vif(struct
+ 
+ 		*link_ppe_vp_profile_idx = ppe_vp_profile_idx;
+ 	} else {
+-		int link_idx;
+-		struct ath12k_link_vif *iter_arvif;
+ 		bool vdev_id_check_en = false;
+ 		u8 link_id;
+ 
+@@ -1126,16 +1147,8 @@ int ath12k_ppeds_attach_link_vif(struct
+ 		*link_ppe_vp_profile_idx = ppe_vp_profile_idx;
+ 		arvif->splitphy_ds_bank_id = ath12k_dp_tx_get_bank_profile(ab, arvif, ab->dp, vdev_id_check_en);
+ 
+-		links_map = ahvif->links_map;
+-		for_each_set_bit(link_idx, &links_map, IEEE80211_MLD_MAX_NUM_LINKS) {
+-			iter_arvif = ahvif->link[link_idx];
+-
+-			if (!iter_arvif || iter_arvif == arvif ||
+-			    !iter_arvif->is_created || ab != iter_arvif->ar->ab)
+-				continue;
++		ath12k_ppeds_update_splitphy_bank_id(ab, arvif);
+ 
+-			iter_arvif->splitphy_ds_bank_id = arvif->splitphy_ds_bank_id;
+-		}
+ 	}
+ 
+ 	ath12k_dp_ppeds_setup_vp_entry(ab, ar, arvif, vp_profile);
+--- a/drivers/net/wireless/ath/ath12k/ppe.h
++++ b/drivers/net/wireless/ath/ath12k/ppe.h
+@@ -184,6 +184,8 @@ int ath12k_ppeds_attach_link_vif(struct
+ 				 struct ieee80211_vif *vif);
+ void ath12k_ppeds_detach_link_vif(struct ath12k_link_vif *arvif,
+ 				  int ppe_vp_profile_idx);
++void ath12k_ppeds_update_splitphy_bank_id(struct ath12k_base *ab,
++					  struct ath12k_link_vif *arvif);
+ void ath12k_vif_free_vp(struct ath12k_vif *ahvif, struct net_device *dev);
+ 
+ void ath12k_dp_ppeds_service_enable_disable(struct ath12k_base *ab,

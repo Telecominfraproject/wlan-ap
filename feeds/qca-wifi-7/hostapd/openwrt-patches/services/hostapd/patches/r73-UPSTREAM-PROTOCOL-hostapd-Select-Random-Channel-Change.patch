@@ -1,0 +1,474 @@
+From bec448373a4509fb6b8e38f502642008da252c29 Mon Sep 17 00:00:00 2001
+From: Guru Pratap Sharma <guruprat@qti.qualcomm.com>
+Date: Tue, 10 Jun 2025 21:27:46 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL hostapd: Select Random Channel Change for
+ AFC
+
+Enhance the AFC (Automatic Frequency Control) retail feature to support
+random channel selection upon receiving the EVENT_AFC_RECEIVED event.
+
+1. Select a random channel when the event is received.
+2. Switch to the best power mode for the selected channel.
+3. Trigger a Channel Switch Announcement (CSA) on the selected channel.
+
+Ensure that AFC-related transitions are handled predictably and robustly
+to improve system reliability under retail AFC conditions.
+
+Feature: AFC
+Patch-dependency: n00-001-hostapd-add-support-for-6GHz-operation.patch,
+r65-QSDK-HOSTAPD-Implement-Min-PSD-Calculation-and-Punct.patch,
+r66-UPSTREAM-PROTOCOL-hostapd-Fetch-AFC-support-from-wiphy.patch,
+r66-UPSTREAM-PROTOCOL-hostapd-Handle-AFC-Channel-Change.patch,
+r72-a-UPSTREAM-PROTOCOL-hostapd-6-GHz-power-mode-channels-.patch,
+r72-b-UPSTREAM-PROTOCOL-hostapd-Print-6-GHz-power-mode-cha.patch,
+r72-c-UPSTREAM-PROTOCOL-hostapd-Store-6-GHz-power-mode-cha.patch,
+r72-d-UPSTREAM-PROTOCOL-hostapd-Clean-up-and-refactor-6-GH.patch,
+r72-e-UPSTREAM-PROTOCOL-hostapd-Support-for-SP-and-Punctur.patch,
+r72-f-UPSTREAM-PROTOCOL-hostapd-Add-6-GHz-regulatory-struc.patch,
+r72-g-UPSTREAM-PROTOCOL-hostapd-Add-6-GHz-base-regulatory-.patch,
+r72-h-UPSTREAM-PROTOCOL-hostapd-Apply-best-power-mode-for-.patch,
+r72-i-UPSTREAM-PROTOCOL-hostapd-Fix-6-GHz-power-mode-confi.patch,
+r72-j-UPSTREAM-PROTOCOL-hostapd-Handle-empty-AFC-power-eve.patch
+Tag: 6G_REGULATORY
+
+Signed-off-by: Guru Pratap Sharma <guruprat@qti.qualcomm.com>
+---
+ src/ap/drv_callbacks.c      |   8 +
+ src/ap/interference.c       | 341 ++++++++++++++++++++++++++++++++++++
+ src/ap/interference.h       |   2 +-
+ src/drivers/driver.h        |   7 +
+ src/drivers/driver_common.c |   1 +
+ 5 files changed, 358 insertions(+), 1 deletion(-)
+
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 960eaf04e966..46e5311a046f 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -2308,6 +2308,11 @@ static void hostapd_event_awgn_detected(struct hostapd_data *hapd,
+ 				   awgn_info->chan_bw_interference_bitmap);
+ }
+ 
++static void hostapd_event_afc_received(struct hostapd_data *hapd)
++{
++	hostapd_intf_afc_received(hapd->iface);
++}
++
+ static void hostapd_event_dfs_pre_cac_expired(struct hostapd_data *hapd,
+ 					      struct dfs_event *radar)
+ {
+@@ -3216,6 +3221,9 @@ void hostapd_wpa_event(void *ctx, enum wpa_event_type event,
+ 		hapd = switch_link_hapd(hapd, data->awgn_event.link_id);
+ 		hostapd_event_awgn_detected(hapd, &data->awgn_event);
+ 		break;
++	case EVENT_AFC_RECEIVED:
++		hostapd_event_afc_received(hapd);
++		break;
+ 	case EVENT_DFS_PRE_CAC_EXPIRED:
+ 		if (!data)
+ 			break;
+diff --git a/src/ap/interference.c b/src/ap/interference.c
+index 6bcadcc90ac4..00a502d74643 100644
+--- a/src/ap/interference.c
++++ b/src/ap/interference.c
+@@ -132,6 +132,29 @@ static int intf_awgn_chan_range_available(struct hostapd_hw_modes *mode,
+ 	return 1;
+ }
+ 
++/*
++ * intf_afc_chan_range_available - check whether the channel can operate
++ * in the given bandwidth in 6Ghz and avail in regulatory channel list
++ * @num_chans - number of 20Mhz channels needed for the operating bandwidth
++ */
++static bool intf_afc_chan_range_available(struct hostapd_channel_data *chan_6ghz,
++					  int num_chans)
++{
++	int i;
++
++	for (i = 0; i < num_chans; i++) {
++		if ((chan_6ghz->flag & HOSTAPD_CHAN_DISABLED) ||
++		    (chan_6ghz->flag & HOSTAPD_CHAN_NO_IR)) {
++			wpa_printf(MSG_ERROR, "Freq [%d] is disabled. Flag: %x",
++				   chan_6ghz->freq, chan_6ghz->flag);
++			return false;
++		}
++		chan_6ghz++;
++	}
++
++	return true;
++}
++
+ static int is_in_chanlist(struct hostapd_iface *iface,
+ 			  struct hostapd_channel_data *chan)
+ {
+@@ -289,6 +312,146 @@ static int intf_awgn_find_channel_list(struct hostapd_iface *iface, int chan_wid
+ 	return channel_idx;
+ }
+ 
++static int convert_chwidth_to_20MHz_nchans(enum chan_width chan_width)
++{
++	int n_chans;
++
++	switch (chan_width) {
++	case CHAN_WIDTH_20_NOHT:
++	case CHAN_WIDTH_20:
++		n_chans = 1;
++		break;
++	case CHAN_WIDTH_40:
++		n_chans = 2;
++		break;
++	case CHAN_WIDTH_80:
++		n_chans = 4;
++		break;
++	case CHAN_WIDTH_80P80:
++	case CHAN_WIDTH_160:
++		n_chans = 8;
++		break;
++	case CHAN_WIDTH_320:
++		n_chans = 16;
++		break;
++	default:
++		n_chans = 1;
++		break;
++	}
++
++	return n_chans;
++}
++
++static int find_6g_enabled_chans(struct hostapd_iface *iface,
++				 int chan_width,
++				 struct hostapd_channel_data ***chandef_list,
++				 struct hostapd_hw_modes *mode,
++				 struct hostapd_channel_data **chan_6ghz,
++				 int n_chans, int power_type)
++{
++	int i, channel_idx = 0;
++
++	for (i = 0; i < mode->num_channels; i++) {
++		struct hostapd_channel_data *chan;
++		struct hostapd_channel_data *chan_6ghz_list;
++		int channel_width;
++		int new_centre_freq, new_start_freq, ret;
++		u8 num_channels_6ghz, chan_idx;
++
++		chan = &chan_6ghz[power_type][i];
++
++		if (!chan_in_current_hw_info(iface->current_hw_info, chan)) {
++			wpa_printf(MSG_DEBUG,
++				   "AFC: channel %d (%d) is not under current hardware index",
++				   chan->freq, chan->chan);
++			continue;
++		}
++
++		if (!is_in_chanlist(iface, chan)) {
++			wpa_printf(MSG_DEBUG, "AFC: channel %d (%d) not in chanlist",
++				   chan->freq, chan->chan);
++			continue;
++		}
++
++		ret = get_centre_freq_6g(chan->chan, chan_width, &new_centre_freq);
++		if (ret) {
++			wpa_printf(MSG_ERROR,
++				   "AFC : couldn't find centre freq for chan : %d chan_width : %d",
++				   chan->chan, chan_width);
++			continue;
++		}
++
++		channel_width = channel_width_to_int(chan_width);
++		new_start_freq = (channel_width == 20) ?
++			chan->freq : new_centre_freq - (channel_width / 2) + 10;
++		chan_6ghz_list = hostapd_iface_get_6ghz_chan_list(iface,
++								  new_start_freq,
++								  power_type,
++								  &num_channels_6ghz,
++								  &chan_idx);
++		if (!chan_6ghz_list) {
++			wpa_printf(MSG_ERROR, "Failed to get a 6ghz channel list");
++			continue;
++		}
++
++		if (chan_idx + n_chans > num_channels_6ghz) {
++			wpa_printf(MSG_ERROR, "Invalid channel index");
++			continue;
++		}
++
++		if (!intf_afc_chan_range_available(chan_6ghz_list, n_chans)) {
++			wpa_printf(MSG_DEBUG, "AFC: range not available for %d (%d)",
++				   chan->freq, chan->chan);
++			continue;
++		}
++
++		wpa_printf(MSG_DEBUG, "AFC: Adding channel %d (%d) to valid chandef list",
++			   chan->freq, chan->chan);
++		(*chandef_list)[channel_idx] = chan;
++		channel_idx++;
++	}
++
++	return channel_idx;
++}
++
++/*
++ * intf_afc_find_channel_list - find the list of channels that can operate with
++   channel width chan_width and present within the range ofi regulatory channel
++   list. returns the total number of available chandefs that supports the
++   provided bandwidth
++ * @chan_width - channel width to be checked
++ * @chandef_list - pointer array to hold the list of valid available chandef
++ */
++static int intf_afc_find_channel_list(struct hostapd_iface *iface,
++				      int chan_width,
++					  struct hostapd_channel_data ***chandef_list)
++{
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	struct hostapd_channel_data_6ghz *channels_6g_data = &mode->channels_6ghz;
++	struct hostapd_channel_data **chan_6ghz  = channels_6g_data->chans_6ghz;
++	static const enum nl80211_regulatory_power_modes pwr_mode_order[] = {
++		NL80211_REG_AP_SP,
++		NL80211_REG_AP_LPI,
++		NL80211_REG_AP_VLP};
++	int i, n_chans;
++
++	n_chans = convert_chwidth_to_20MHz_nchans(chan_width);
++	for (i = 0; i < ARRAY_SIZE(pwr_mode_order); i++) {
++		enum nl80211_regulatory_power_modes pwr_mode;
++		int n_en_chans;
++
++		pwr_mode = pwr_mode_order[i];
++		n_en_chans = find_6g_enabled_chans(iface, chan_width, chandef_list,
++						   mode, chan_6ghz, n_chans, pwr_mode);
++		if (!n_en_chans)
++			continue;
++
++		return n_en_chans;
++	}
++
++	return 0;
++}
++
+ enum chan_seg {
+ 	SEG_PRI20		  = 0x1,
+ 	SEG_SEC20		  = 0x2,
+@@ -531,3 +694,181 @@ exit:
+ 	os_free(available_chandef_list);
+ 	return 0;
+ }
++
++static int get_chanlist_for_bandwidth(struct hostapd_iface *iface,
++				      int *chan_width,
++				      struct hostapd_channel_data ***available_chandef_list)
++{
++	int num_available_chandefs = 0;
++
++	while (*chan_width > CHAN_WIDTH_20_NOHT) {
++		num_available_chandefs = intf_afc_find_channel_list(iface, *chan_width,
++								    available_chandef_list);
++		if (num_available_chandefs > 0)
++			break;
++		*chan_width = get_next_max_width(*chan_width);
++	}
++
++	return num_available_chandefs;
++}
++
++static int get_random_channel(struct hostapd_channel_data **chan_data,
++			      struct hostapd_channel_data **available_chandef_list,
++			      int *chan_idx, int num_available_chandefs)
++{
++	u32 _rand;
++
++	if (os_get_random((u8 *)&_rand, sizeof(_rand)) < 0) {
++		wpa_printf(MSG_ERROR, "AFC: couldn't get random number");
++		return  -1;
++	}
++
++	*chan_idx = _rand % num_available_chandefs;
++	*chan_data = available_chandef_list[*chan_idx];
++
++	return 0;
++}
++
++static int get_new_center_freq(struct hostapd_channel_data *chan_data,
++			       int chan_width, int *new_centre_freq)
++{
++	int ret = 0;
++
++	if (chan_width > CHAN_WIDTH_20) {
++		ret = get_centre_freq_6g(chan_data->chan, chan_width, new_centre_freq);
++		if (ret) {
++			wpa_printf(MSG_ERROR,
++				   "AFC : couldn't find centre freq for chan : %d chan_width : %d",
++				   chan_data->chan, chan_width);
++			return ret;
++		}
++	} else {
++		*new_centre_freq = chan_data->freq;
++	}
++
++	return ret;
++}
++
++static void set_csa_param(struct csa_settings *settings,
++			  struct hostapd_channel_data *chan_data,
++			  struct hostapd_iface *iface, int chan_width,
++			  int centre_freq)
++{
++	os_memset(settings, 0, sizeof(*settings));
++	settings->cs_count = 5;
++	settings->freq_params.freq = chan_data->freq;
++	settings->freq_params.bandwidth = channel_width_to_int(chan_width);
++	settings->freq_params.center_freq1 = centre_freq;
++	settings->freq_params.ht_enabled = iface->conf->ieee80211n;
++	settings->freq_params.vht_enabled = iface->conf->ieee80211ac;
++	settings->freq_params.he_enabled = iface->conf->ieee80211ax;
++	settings->freq_params.eht_enabled = iface->conf->ieee80211be;
++	settings->power_mode = -1;
++}
++
++/*
++ * hostapd_intf_afc_received- afc request is recieved.
++ * select random channel according to the availbilty .
++ * starting with sp , if sp not possible than LPI, if LPI not
++ * possible than vlp.
++ * Do the CSA according to the selected channel.
++ */
++int hostapd_intf_afc_received(struct hostapd_iface *iface)
++{
++	struct csa_settings settings;
++	struct hostapd_channel_data *chan_data = NULL;
++	struct hostapd_channel_data **available_chandef_list;
++	int ret = 0;
++	unsigned int i;
++	int chan_idx;
++	int num_available_chandefs;
++	int chan_width;
++	int new_chan_width;
++	int new_centre_freq;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++
++	chan_width = hostapd_get_chan_width_from_oper_chan_width(iface->conf);
++	wpa_printf(MSG_DEBUG, "chan_width=%d", chan_width);
++
++	available_chandef_list = os_zalloc(sizeof(struct hostapd_channel_data *) *
++			mode->num_channels);
++	if (!available_chandef_list) {
++		wpa_printf(MSG_ERROR, "available_chandef_list memory allocation failed");
++		ret = -1;
++		goto exit;
++	}
++
++	/* find a random channel to be switched */
++	num_available_chandefs = get_chanlist_for_bandwidth(iface, &chan_width,
++							    &available_chandef_list);
++	if (num_available_chandefs == 0) {
++		wpa_printf(MSG_ERROR, "AFC: no available_chandefs");
++		ret = -1;
++		goto exit;
++	}
++
++	if (get_random_channel(&chan_data, available_chandef_list, &chan_idx,
++			       num_available_chandefs)) {
++		ret = -1;
++		goto exit;
++	}
++	if (!chan_data) {
++		wpa_printf(MSG_ERROR, "AFC: channel info not available for chan_idx : %d",
++			   chan_idx);
++		ret = -1;
++		goto exit;
++	}
++
++	wpa_printf(MSG_DEBUG, "AFC: got random channel %d (%d)",
++		   chan_data->freq, chan_data->chan);
++	new_chan_width = chan_width;
++	if (get_new_center_freq(chan_data, new_chan_width, &new_centre_freq)) {
++		ret = -1;
++		goto exit;
++	}
++
++	set_csa_param(&settings, chan_data, iface, new_chan_width, new_centre_freq);
++	if (is_6ghz_freq(settings.freq_params.freq) &&
++	    iface->conf->enable_best_power_mode && settings.power_mode == -1) {
++		int best_power_mode;
++
++		best_power_mode =
++			hostapd_get_best_ap_6ghz_power_mode(iface,
++							    settings.freq_params.freq,
++								settings.freq_params.center_freq1,
++								settings.freq_params.bandwidth,
++								settings.freq_params.punct_bitmap);
++		if (best_power_mode != NL80211_REG_NUM_POWER_MODES) {
++			settings.power_mode = best_power_mode;
++			iface->power_mode_6ghz_before_change = best_power_mode;
++			wpa_printf(MSG_DEBUG, "%s: Best power mode for Freq %d is %d",
++				   __func__,
++				   settings.freq_params.freq,
++				   settings.power_mode);
++		}
++	}
++
++	for (i = 0; i < iface->num_bss; i++) {
++		/* Save CHAN_SWITCH VHT and HE config */
++		hostapd_chan_switch_config(iface->bss[i], &settings.freq_params);
++		wpa_printf(MSG_DEBUG, "channel=%u, freq=%d, bw=%d, center_freq1=%d, power_mode=%d",
++			   settings.freq_params.channel,
++			   settings.freq_params.freq,
++			   settings.freq_params.bandwidth,
++			   settings.freq_params.center_freq1,
++			   settings.power_mode);
++
++		ret = hostapd_switch_channel(iface->bss[i], &settings);
++		if (ret) {
++			/* FIX: What do we do if CSA fails in the middle of
++			 * submitting multi-BSS CSA requests?
++			 */
++			goto exit;
++		}
++	}
++
++exit:
++	os_free(available_chandef_list);
++
++	return ret;
++}
+diff --git a/src/ap/interference.h b/src/ap/interference.h
+index 1c3e481a7f8e..afef3a57661d 100644
+--- a/src/ap/interference.h
++++ b/src/ap/interference.h
+@@ -39,4 +39,4 @@ int hostapd_intf_awgn_detected(struct hostapd_iface *iface, int freq,
+ 			        int cf1, int cf2,
+ 			        u32 chan_bw_interference_bitmap);
+ 
+-
++int hostapd_intf_afc_received(struct hostapd_iface *iface);
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 62ce68a7e649..fb6dfced4542 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -6406,6 +6406,13 @@ enum wpa_event_type {
+ 	 * of the respective link(s).
+ 	 */
+ 	EVENT_LINK_REMOVAL_COMPLETED,
++
++	/**
++	 * EVENT_AFC_RECEIVED - Recieved AFC event
++	 * This event is used to slect random channel on trigger of
++	 * AFC
++	 */
++	EVENT_AFC_RECEIVED,
+ };
+ 
+ 
+diff --git a/src/drivers/driver_common.c b/src/drivers/driver_common.c
+index a5252d66ab41..1df64782512e 100644
+--- a/src/drivers/driver_common.c
++++ b/src/drivers/driver_common.c
+@@ -109,6 +109,7 @@ const char * event_to_string(enum wpa_event_type event)
+ 	E2S(AFC_PAYLOAD_RESET);
+ 	E2S(LINK_REMOVAL_STARTED);
+ 	E2S(LINK_REMOVAL_COMPLETED);
++	E2S(AFC_RECEIVED);
+ 	}
+ 
+ 	return "UNKNOWN";
+-- 
+2.34.1
+

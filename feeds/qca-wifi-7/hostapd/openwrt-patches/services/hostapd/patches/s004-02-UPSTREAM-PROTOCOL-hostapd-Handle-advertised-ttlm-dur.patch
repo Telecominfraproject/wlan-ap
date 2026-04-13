@@ -1,0 +1,356 @@
+From 01ca8dfc82c60ee082d7a0c70044085c3fa639b6 Mon Sep 17 00:00:00 2001
+From: Shwetha G K <kshwetha@qti.qualcomm.com>
+Date: Wed, 20 Aug 2025 14:32:46 +0530
+Subject: [PATCH] UPSTREAM: PROTOCOL: hostapd: Handle advertised ttlm during
+ start ap
+
+In the scenarios link dynamic link addition or DFS CAC completion, a link
+gets added to MLD at later point of time. In this case, if the MLD already
+has an advertised ttlm established or under advertisement, the new link
+getting added to the MLD should be explicitly indicated either to be
+enabled or disabled during start ap to the driver, else it may start
+beaconing though the advertised ttlm established earlier does not indicate
+the status of new link. Hence, add changes to handle the advertised ttlm
+mapping during start ap/ set beacon.
+
+Signed-off-by: Shwetha G K <kshwetha@qti.qualcomm.com>
+---
+ src/ap/ap_drv_ops.h          |  11 ++++
+ src/ap/beacon.c              | 114 +++++++++++++++++++++++++++++++++++
+ src/ap/hostapd.c             |  23 ++++++-
+ src/drivers/driver.h         |  37 ++++++++++++
+ src/drivers/driver_nl80211.c |  34 +++++++++++
+ 5 files changed, 218 insertions(+), 1 deletion(-)
+
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index 21aef49..cdb1f0c 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -264,6 +264,17 @@ static inline int hostapd_drv_set_ap(struct hostapd_data *hapd,
+ 	return hapd->driver->set_ap(hapd->drv_priv, params);
+ }
+ 
++#ifdef CONFIG_IEEE80211BE
++static inline bool
++hostapd_drv_read_link_set_beacon(struct hostapd_data *hapd, u8 mld_link_id)
++{
++	if (hapd->driver == NULL || hapd->driver->read_link_set_beacon == NULL)
++		return false;
++
++	return hapd->driver->read_link_set_beacon(hapd->drv_priv, mld_link_id);
++}
++#endif
++
+ static inline int hostapd_drv_set_radius_acl_auth(struct hostapd_data *hapd,
+ 						  const u8 *mac, int accepted,
+ 						  u32 session_timeout)
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index ab6e198..e192ec2 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -2998,6 +2998,24 @@ void ieee802_11_free_ap_params(struct wpa_driver_ap_params *params)
+ 	params->allowed_freqs = NULL;
+ }
+ 
++#ifdef CONFIG_IEEE80211BE
++static bool ieee802_11_is_link_beacon_set(struct hostapd_data *hapd)
++{
++	if (hapd->reenable_beacon)
++		return false;
++
++	return hostapd_drv_read_link_set_beacon(hapd, hapd->mld_link_id);
++}
++
++static inline int
++ieee802_11_configure_ttlm_on_non_tx(struct hostapd_data *hapd)
++{
++	if (hapd->iface->conf->mbssid == MULTI_MBSSID_GROUP_ENABLED)
++		return hostapd_offload_set_adv_ttlm_multi_mbssid(hapd);
++
++	return hostapd_offload_set_adv_ttlm_mbssid_enhanced(hapd);
++}
++#endif
+ 
+ static int __ieee802_11_set_beacon(struct hostapd_data *hapd)
+ {
+@@ -3013,6 +3031,9 @@ static int __ieee802_11_set_beacon(struct hostapd_data *hapd)
+ 	int i;
+ 	struct hostapd_hw_modes *mode;
+ #endif /* CONFIG_DRIVER_NL80211_QCA */
++#ifdef CONFIG_IEEE80211BE
++	bool beacon_set = false;
++#endif /* CONFIG_IEEE80211BE */
+ 
+ 	if (!hapd->drv_priv) {
+ 		wpa_printf(MSG_ERROR, "Interface is disabled");
+@@ -3058,6 +3079,11 @@ static int __ieee802_11_set_beacon(struct hostapd_data *hapd)
+ 		}
+ 	}
+ 
++#ifdef CONFIG_IEEE80211BE
++	if (hapd->conf->mld_ap)
++		beacon_set = ieee802_11_is_link_beacon_set(hapd);
++#endif
++
+ 	params.beacon_ies = beacon;
+ 	params.proberesp_ies = proberesp;
+ 	params.assocresp_ies = assocresp;
+@@ -3158,6 +3184,94 @@ static int __ieee802_11_set_beacon(struct hostapd_data *hapd)
+ 	}
+ #endif /* CONFIG_DRIVER_NL80211_QCA */
+ 
++#ifdef CONFIG_IEEE80211BE
++	/* If hapd has advertised ttlm established or under advertisement,
++	 * include ttlm attributes in params of start_ap despite of 2g/5g/6g
++	 * tx/non-tx bss.
++	 *
++	 * If the bss is 6GHz non-tx bss and its tx-bss has some non-default
++	 * TTLM being advertised send default TTLM mapping to driver as part of
++	 * ap_settings of non-tx bss.
++	 *
++	 * If hapd is 6GHz tx bss,
++	 *    - send set_ttlm nl command to driver across already started non-tx
++	 * bss's belonging to tx bss's mbssid group if any. If non-tx bss does
++	 * not have advertised ttlm, send default mapping to driver.
++	 *    - skip sending set_ttlm nl command on non-started non-tx bss's as
++	 * vdev not created yet. When start ap of the non-started non-tx bss
++	 * trigggered, send mapping through start ap params
++	 */
++	if (hapd->conf->mld_ap && hapd->conf->ttlm_enable && !beacon_set &&
++	    hapd->iface->drv_flags2 & WPA_DRIVER_FLAGS2_TTLM_BEACON_OFFLOAD) {
++		struct hostapd_data *tx_bss = hostapd_mbssid_get_tx_bss(hapd);
++		struct mlo_ttlm_ie *est_ttlm =
++			&hapd->mld->ttlm_ctx.established_ttlm;
++		struct mlo_ttlm_ie *up_ttlm =
++			&hapd->mld->ttlm_ctx.upcoming_ttlm;
++		struct wpa_driver_ap_ttlm_params *ttlm_params =
++			&params.ttlm_params;
++
++		/* bss has its own establised ttlm, include same in
++		 * params.ttlm_params
++		 */
++		if (est_ttlm->ttlm.expected_duration_present ||
++		    up_ttlm->ttlm.mapping_switch_time_present) {
++			if (hostapd_fill_ttlm_params(&up_ttlm->ttlm,
++						     &est_ttlm->ttlm,
++						     &ttlm_params->up_ttlm,
++						     &ttlm_params->est_ttlm)) {
++				wpa_printf(MSG_DEBUG,
++					   "TTLM: Failed to fill setap params");
++				os_memset(ttlm_params, 0, sizeof(*ttlm_params));
++				goto set_ap;
++			}
++
++			ttlm_params->send_default_mapping = false;
++
++			/* if this bss is 6g tx-bss, send ttlm config on already
++			 * started non-tx bss if any
++			 */
++			if (is_6ghz_freq(hapd->iface->freq) &&
++			    tx_bss == hapd &&
++			    ieee802_11_configure_ttlm_on_non_tx(hapd)) {
++				wpa_printf(MSG_DEBUG,
++					   "TTLM: fail to set param on non-tx");
++			}
++		} else if (is_6ghz_freq(hapd->iface->freq) &&
++			   hapd != tx_bss &&
++			   tx_bss->mld) {
++			/* 6g non-tx bss without ttlm advertisement, needs
++			 * default mapping to be sent to driver when its tx-bss
++			 * has non-default ttlm being advertised
++			 */
++			struct mlo_ttlm_ie *tx_est_ttlm =
++				&tx_bss->mld->ttlm_ctx.established_ttlm;
++			struct mlo_ttlm_ie *tx_up_ttlm =
++				&tx_bss->mld->ttlm_ctx.upcoming_ttlm;
++
++			if (!tx_est_ttlm->ttlm.expected_duration_present &&
++			    !tx_up_ttlm->ttlm.mapping_switch_time_present)
++				goto set_ap;
++
++			/* default value of established ttlm will be
++			 * default mapping
++			 */
++			if (hostapd_fill_ttlm_params(&up_ttlm->ttlm,
++						     &est_ttlm->ttlm,
++						     &ttlm_params->up_ttlm,
++						     &ttlm_params->est_ttlm)) {
++				wpa_printf(MSG_DEBUG,
++					   "TTLM: Fail to fill params");
++				os_memset(ttlm_params, 0,
++					  sizeof(*ttlm_params));
++				goto set_ap;
++			}
++			ttlm_params->send_default_mapping = true;
++		}
++	}
++#endif
++
++set_ap:
+ 	res = hostapd_drv_set_ap(hapd, &params);
+ 	if (res)
+ 		wpa_printf(MSG_ERROR, "Failed to set beacon parameters");
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 8e4d3e6..4f1e081 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -3834,8 +3834,29 @@ void hostapd_bss_setup_multi_link(struct hostapd_data *hapd,
+ 		break;
+ 	}
+ 
+-	if (hapd->mld)
++	if (hapd->mld) {
++		struct ttlm_context *ttlm = &hapd->mld->ttlm_ctx;
++		struct ttlm_info *info;
++
++		/* Enable this new link by default if advertised ttlm is
++		 * already in progress with few links marked disabled
++		 */
++		if (ttlm->established_ttlm.ttlm.expected_duration_present) {
++			info = &ttlm->established_ttlm.ttlm;
++
++			for (i = 0; i < NUM_MAX_TIDS; i++)
++				info->ieee_link_map_tid[i] |=
++					BIT(hapd->mld_link_id);
++		}
++
++		if (ttlm->upcoming_ttlm.ttlm.mapping_switch_time_present) {
++			info = &ttlm->upcoming_ttlm.ttlm;
++			for (i = 0; i < NUM_MAX_TIDS; i++)
++				info->ieee_link_map_tid[i] |=
++					BIT(hapd->mld_link_id);
++		}
+ 		return;
++	}
+ 
+ 	mld = os_zalloc(sizeof(struct hostapd_mld));
+ 	if (!mld)
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 4ee3641..7cf0f0c 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -1859,6 +1859,26 @@ struct drv_adv_ttlm_params {
+ 	u32 expected_duration;
+ };
+ 
++/**
++ * struct wpa_driver_ap_ttlm_params - TTLM parameters for AP mode during set
++ *	beacon
++ *
++ * This structure contains the TTLM (TID-to-Link Mapping) parameters to be
++ * used when starting an AP or updating its beacon. This structure to be
++ * populated when a new link is getting added to an MLD which already has an
++ * advertised TTLM established.
++ *
++ * @up_ttlm: upcoming TTLM element information
++ * @est_ttlm: established TTLM element information
++ * @send_default_mapping: whether to send default mapping (true for non-tx BSS
++ *	when its tx-BSS has non-default TTLM)
++ */
++struct wpa_driver_ap_ttlm_params {
++	struct drv_adv_ttlm_params up_ttlm;
++	struct drv_adv_ttlm_params est_ttlm;
++	bool send_default_mapping;
++};
++
+ struct wpa_driver_ap_params {
+ 	/**
+ 	 * head - Beacon head from IEEE 802.11 header to IEs before TIM IE
+@@ -2267,6 +2287,12 @@ struct wpa_driver_ap_params {
+ 	 * ml_max_rec_links - Max recommended links for ML
+ 	 */
+ 	u8 ml_max_rec_links;
++
++	/**
++	 * offload mode advertised ttlm data
++	 */
++	struct wpa_driver_ap_ttlm_params ttlm_params;
++
+ };
+ 
+ struct wpa_driver_mesh_bss_params {
+@@ -6057,6 +6083,17 @@ struct wpa_driver_ops {
+ 	 * Returns: 0 on success, -1 on failure
+ 	 */
+ 	int (*reset_afc)(void *priv, u8 link_id);
++
++#ifdef CONFIG_IEEE80211BE
++	/**
++	 * read_link_set_beacon - read the value of set_beacon of link from
++	 * driver.
++	 * @priv: Private driver interface data
++	 * @mld_link_id: link id of the bss
++	 * Return: Value of set_beacon of driver interface data
++	 */
++	bool (*read_link_set_beacon)(void *priv, u8 mld_link_id);
++#endif /* CONFIG_IEEE80211BE */
+ };
+ 
+ /**
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 45e65b4..fc3c281 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -5469,6 +5469,24 @@ wpa_set_offload_adv_ttlm_params(struct nl_msg *msg,
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_IEEE80211BE
++static bool wpa_driver_read_link_set_beacon(void *priv, u8 mld_link_id)
++{
++	struct i802_bss *bss = priv;
++	struct i802_link *link;
++
++	if (!nl80211_link_valid(bss->valid_links, mld_link_id)) {
++		wpa_printf(MSG_DEBUG,
++			   "nl80211: Link ID=%u invalid (valid: 0x%04x)",
++			   mld_link_id, bss->valid_links);
++		return false;
++	}
++	link = nl80211_get_link(bss, mld_link_id);
++
++	return link->beacon_set;
++}
++#endif
++
+ static int wpa_driver_nl80211_set_ap(void *priv,
+ 				     struct wpa_driver_ap_params *params)
+ {
+@@ -5486,6 +5504,9 @@ static int wpa_driver_nl80211_set_ap(void *priv,
+ 	struct wpa_driver_mesh_bss_params mesh_params;
+ #endif /* CONFIG_MESH */
+ 	struct nlattr *elems;
++#ifdef CONFIG_IEEE80211BE
++	struct wpa_driver_ap_ttlm_params *ttlm_param = &params->ttlm_params;
++#endif /* CONFIG_IEEE80211BE */
+ 
+ 	if (params->mld_ap) {
+ 		if (!nl80211_link_valid(bss->valid_links,
+@@ -5878,6 +5899,16 @@ static int wpa_driver_nl80211_set_ap(void *priv,
+ 			goto fail;
+ 	}
+ 
++#ifdef CONFIG_IEEE80211BE
++	if (cmd == NL80211_CMD_NEW_BEACON &&
++	    wpa_set_offload_adv_ttlm_params(msg, &ttlm_param->est_ttlm,
++					    &ttlm_param->up_ttlm,
++					    ttlm_param->send_default_mapping)) {
++		wpa_printf(MSG_DEBUG, "nl80211: set_beacon ttlm params failed");
++		goto fail;
++	}
++#endif /* CONFIG_IEEE80211BE */
++
+ #ifdef CONFIG_DRIVER_NL80211_QCA
+ 	if (cmd == NL80211_CMD_NEW_BEACON && params->allowed_freqs)
+ 		qca_set_allowed_ap_freqs(drv, params->allowed_freqs,
+@@ -16614,4 +16645,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.set_qos = nl80211_set_qos,
+ 	.clear_afc_payload = nl80211_clear_afc_payload,
+ 	.reset_afc = nl80211_reset_afc,
++#ifdef CONFIG_IEEE80211BE
++	.read_link_set_beacon = wpa_driver_read_link_set_beacon,
++#endif /* CONFIG_IEEE80211BE */
+ };
+-- 
+2.34.1
+

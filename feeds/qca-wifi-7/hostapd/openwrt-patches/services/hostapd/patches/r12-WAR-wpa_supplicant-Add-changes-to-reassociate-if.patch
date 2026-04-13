@@ -1,0 +1,548 @@
+From 5b17a5b79c7432c048035b3b48e36c1019660a97 Mon Sep 17 00:00:00 2001
+From: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+Date: Mon, 22 Jan 2024 12:14:33 +0530
+Subject: [PATCH] QSDK: [WAR] wpa_supplicant: Add changes to reassociate if
+ associated links is lesser than requested link
+
+With the latest hostapd, when the partner link is going for a CAC/ACS
+scanning, other link(s) will start beaconing without any RNR for
+affliated links. And in the station side, while scanning if it has the
+entry for the requested SSID, it will first check if the beacon has all
+the requested links are beaconing and try to associated immediately if
+the RNR has all links information. But, if it has less number of links,
+supplicant will retry for 5 times, after which it will associated with
+less number of links. This leads to station association with less number
+of links, though the AP will advertise the RNR with new link after the
+CAC/ACS is completed, station will not be able to add that link until ML
+reconfigure is supported.
+
+Hence, add this WAR to get the existing scan entries from the kernel for
+every 5 seconds if the associated number of links is lesser than the
+actual user requested configuration and try to re-associate after
+deauthenticating the existing link(s) if scan entry is found with the
+new link needed for completing the user configured association.
+
+Patch-depdendency: none
+
+Patch-work: none
+
+MLO
+
+Signed-off-by: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+Signed-off-by: Hari Naraayana Desikan Kannan <quic_hnaraaya@quicinc.com>
+Signed-off-by: Karthik M <<quic_karm@quicinc.com>
+---
+ wpa_supplicant/bss.c              |  22 ++--
+ wpa_supplicant/bss.h              |   7 +-
+ wpa_supplicant/events.c           |  54 +++++++++
+ wpa_supplicant/scan.c             | 193 ++++++++++++++++++++++++++++++
+ wpa_supplicant/scan.h             |   8 ++
+ wpa_supplicant/wpa_supplicant_i.h |   2 +-
+ 6 files changed, 277 insertions(+), 9 deletions(-)
+
+--- a/wpa_supplicant/bss.c
++++ b/wpa_supplicant/bss.c
+@@ -707,8 +707,8 @@ static int are_ies_equal(const struct wp
+ }
+ 
+ 
+-static u32 wpa_bss_compare_res(const struct wpa_bss *old,
+-			       const struct wpa_scan_res *new_res)
++u32 wpa_bss_compare_res(const struct wpa_bss *old,
++			const struct wpa_scan_res *new_res)
+ {
+ 	u32 changes = 0;
+ 	int caps_diff = old->caps ^ new_res->caps;
+@@ -781,9 +781,10 @@ void notify_bss_changes(struct wpa_suppl
+ }
+ 
+ 
+-static struct wpa_bss *
++struct wpa_bss *
+ wpa_bss_update(struct wpa_supplicant *wpa_s, struct wpa_bss *bss,
+-	       struct wpa_scan_res *res, struct os_reltime *fetch_time)
++	       struct wpa_scan_res *res, struct os_reltime *fetch_time,
++	       bool override)
+ {
+ 	u32 changes;
+ 
+@@ -812,13 +813,20 @@ wpa_bss_update(struct wpa_supplicant *wp
+ 			   (unsigned int) update_time.usec,
+ 			   res->freq,
+ 			   (res->flags & WPA_SCAN_ASSOCIATED) ? " assoc" : "");
+-		if ((bss->flags & WPA_BSS_ASSOCIATED) ||
++
++		/* Override flag is set during scanning for RNR entries in the
++		 * associated link when the requested affliated link is
++		 * initially in CAC/ACS timer, so that the new scan entry is
++		 * updated to re-initiate the association
++		 */
++		if (!override && ((bss->flags & WPA_BSS_ASSOCIATED) ||
+ 		    (!(res->flags & WPA_SCAN_ASSOCIATED) &&
+-		     !os_reltime_before(&bss->last_update, &update_time))) {
++		     !os_reltime_before(&bss->last_update, &update_time)))) {
+ 			wpa_printf(MSG_DEBUG,
+ 				   "Ignore this BSS entry since the previous update looks more current");
+ 			return bss;
+ 		}
++
+ 		wpa_printf(MSG_DEBUG,
+ 			   "Accept this BSS entry since it looks more current than the previous update");
+ 	}
+@@ -1016,7 +1024,7 @@ void wpa_bss_update_scan_res(struct wpa_
+ 	if (bss == NULL)
+ 		bss = wpa_bss_add(wpa_s, ssid + 2, ssid[1], res, fetch_time);
+ 	else {
+-		bss = wpa_bss_update(wpa_s, bss, res, fetch_time);
++		bss = wpa_bss_update(wpa_s, bss, res, fetch_time, false);
+ 		if (wpa_s->last_scan_res) {
+ 			unsigned int i;
+ 			for (i = 0; i < wpa_s->last_scan_res_used; i++) {
+@@ -1376,6 +1384,40 @@ const u8 * wpa_bss_get_ie_beacon(const s
+ }
+ 
+ 
++/**
++ * wpa_bss_get_ie_pos - Fetch a specified information element at given index
++ * from a BSS entry. This can be used to iterate over an element which is present
++ * multiple times in ie space
++ * @bss: BSS table entry
++ * @ie: Information element identitifier (WLAN_EID_*)
++ * @idx: index of entry of element to be found.
++ *
++ * This function returns the @idx'th matching information element in the BSS
++ * entry or NULL.
++ */
++const u8 * wpa_bss_get_ie_pos(const struct wpa_bss *bss, u8 ie, u8 idx)
++{
++        return get_ie_pos(wpa_bss_ie_ptr(bss), bss->ie_len, ie, idx);
++}
++
++/**
++ * wpa_bss_get_mbssid_idx - Fetch a mbssid idx of a BSS entry
++ * @bss: BSS table entry
++ *
++ * This function returns the mbssid idx of a BSS if MULTIPLE_BSSID_INDEX
++ * element is present in the BSS ie, 0 otherwise.
++ */
++u8 wpa_bss_get_mbssid_idx(const struct wpa_bss *bss)
++{
++        const u8 *mbssid_idx_ie = get_ie(wpa_bss_ie_ptr(bss), bss->ie_len,
++                                         WLAN_EID_MULTIPLE_BSSID_INDEX);
++        if (!mbssid_idx_ie)
++                return 0;
++        else
++                return mbssid_idx_ie[2];
++}
++
++
+ /**
+  * wpa_bss_get_ie_ext - Fetch a specified extended IE from a BSS entry
+  * @bss: BSS table entry
+--- a/wpa_supplicant/bss.h
++++ b/wpa_supplicant/bss.h
+@@ -225,6 +225,12 @@ int wpa_bss_parse_basic_ml_element(struc
+ 				   u8 *ap_mld_id);
+ u16 wpa_bss_parse_reconf_ml_element(struct wpa_supplicant *wpa_s,
+ 				    struct wpa_bss *bss);
++u32 wpa_bss_compare_res(const struct wpa_bss *old,
++		const struct wpa_scan_res *new_res);
++struct wpa_bss *
++wpa_bss_update(struct wpa_supplicant *wpa_s, struct wpa_bss *bss,
++		struct wpa_scan_res *res, struct os_reltime *fetch_time,
++		bool override);
+ 
+ const u8 * wpa_bss_get_rsne(struct wpa_supplicant *wpa_s,
+ 			    const struct wpa_bss *bss, struct wpa_ssid *ssid,
+@@ -232,5 +238,7 @@ const u8 * wpa_bss_get_rsne(struct wpa_s
+ const u8 * wpa_bss_get_rsnxe(struct wpa_supplicant *wpa_s,
+ 			     const struct wpa_bss *bss, struct wpa_ssid *ssid,
+ 			     bool mlo);
++const u8 * wpa_bss_get_ie_pos(const struct wpa_bss *bss, u8 ie, u8 idx);
++u8 wpa_bss_get_mbssid_idx(const struct wpa_bss *bss);
+ 
+ #endif /* BSS_H */
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -4257,6 +4257,73 @@ out:
+ }
+ 
+ 
++/* Returns true if all freq count and link count
++ * are same, false otherwise
++ */
++static bool is_all_links_associated(struct wpa_supplicant *wpa_s)
++{
++	int i = 0, freq;
++	int *freq_list = &wpa_s->conf->freq_list[0];
++	u16 valid_links = wpa_s->valid_links;
++	u8 freq_lists = 0; /* Bitmap of user configured frequencies */
++	u8 link_count = 0, freq_count = 0;
++	bool is_split_phy_5ghz = false, is_split_phy_6ghz = false;
++
++	/* If valid_links is not set, consider that all links are associated
++	 * Note: freq_list is not mandotary to present in station
++	 * configuration file.
++	 */
++	if (!valid_links || !freq_list)
++		return true;
++
++	for (i = 0; i < wpa_s->num_multi_hws; i++) {
++		struct hostapd_multi_hw_info *hw_info = &wpa_s->multi_hw_info[i];
++
++		if(hw_info->start_freq > 5925 && hw_info->end_freq < 6425)
++			is_split_phy_6ghz = true;
++
++		if (hw_info->start_freq > 5490 && hw_info->end_freq < 5895)
++			is_split_phy_5ghz = true;
++	}
++	i = 0;
++
++	freq = freq_list[i];
++	while(freq) {
++		if (!(freq < 5180 || freq > 5885)) {
++			if (is_split_phy_5ghz &&
++			    (freq >= 5180 && freq < 5490))
++				freq_lists |= SCAN_FREQ_BAND_5GHZ_LOW;
++			else
++				freq_lists |= SCAN_FREQ_BAND_5GHZ;
++		} else if (is_6ghz_freq(freq)) {
++			if (is_split_phy_6ghz &&
++			    (freq > 5925 && freq < 6425))
++				freq_lists |= SCAN_FREQ_BAND_6GHZ_LOW;
++			else
++				freq_lists |= SCAN_FREQ_BAND_6GHZ;
++		} else
++			freq_lists |= SCAN_FREQ_BAND_2GHZ;
++
++		freq = freq_list[++i];
++	}
++
++	for (i = 0; i < MAX_NUM_MLD_LINKS; i++) {
++		if (valid_links & BIT(i))
++			link_count++;
++	}
++
++	for (i = 0; i < SCAN_FREQ_BAND_MAX; i++) {
++		if (freq_lists & BIT(i))
++			freq_count++;
++	}
++
++	if (freq_count <= link_count)
++		return true;
++
++	return false;
++}
++
++
+ static void wpa_supplicant_event_assoc(struct wpa_supplicant *wpa_s,
+ 				       union wpa_event_data *data)
+ {
+@@ -4585,6 +4652,17 @@ static void wpa_supplicant_event_assoc(s
+ 
+ 	if (wpa_s->current_ssid && wpa_s->current_ssid->enable_4addr_mode)
+ 		wpa_supplicant_set_4addr_mode(wpa_s);
++
++	/* WAR: Check if all the links configured by user are associated,
++	 * otherwise trigger a scan request in background to re-associate
++	 * to all the links after CAC/ACS timer is completed in AP MLD
++	 */
++	if ((!is_all_links_associated(wpa_s)) &&
++	    wpa_s->current_ssid && !wpa_s->current_ssid->disable_reconfig)
++		eloop_register_timeout(5, 0,
++				       wpas_scan_for_rnr_entries,
++				       wpa_s, NULL);
++
+ }
+ 
+ 
+--- a/wpa_supplicant/scan.c
++++ b/wpa_supplicant/scan.c
+@@ -3848,3 +3848,171 @@ void wpas_scan_restart_sched_scan(struct
+ 	wpa_s->prev_sched_ssid = NULL;
+ 	wpa_supplicant_cancel_sched_scan(wpa_s);
+ }
++
++static bool wpa_bss_update_scan_rnr_res(struct wpa_supplicant *wpa_s,
++					struct wpa_scan_res *res,
++					struct os_reltime *fetch_time)
++{
++	const u8 *rnr_ie, *ssid, *pos;
++	u8 rnr_ie_len, i = 0, mbssid_idx = 0;
++	struct wpa_bss *bss;
++	u32 changes;
++	u8 ret = true;
++
++	bss = wpa_bss_get_bssid(wpa_s, res->bssid);
++	if (!bss) {
++		wpa_printf(MSG_ERROR, "No BSS found for entry" MACSTR,
++				MAC2STR(res->bssid));
++		return ret;
++	}
++
++	ssid = wpa_scan_get_ie(res, WLAN_EID_SSID);
++	if (ssid == NULL) {
++		wpa_dbg(wpa_s, MSG_DEBUG, "BSS: No SSID IE included for "
++			MACSTR, MAC2STR(res->bssid));
++		return ret;
++	}
++	if (ssid[1] > SSID_MAX_LEN) {
++		wpa_dbg(wpa_s, MSG_DEBUG, "BSS: Too long SSID IE included for "
++			MACSTR, MAC2STR(res->bssid));
++		return ret;
++	}
++
++	/* Res now will have matching ssid, check if the rnr has
++	 * changed.
++	 */
++	changes = wpa_bss_compare_res(bss, res);
++	if (changes & WPA_BSS_IES_CHANGED_FLAG) {
++		bss = wpa_bss_update(wpa_s, bss, res, fetch_time, true);
++		mbssid_idx = wpa_bss_get_mbssid_idx(bss);
++		i = 0;
++		/* NOTE: Any changes in rnr ie len calculation or fetching the ap info
++		 * from rnr ie must be reflected in wpa_bss_update_scan_rnr_res API as
++		 * it uses similar logic for WAR
++		 */
++		while ((rnr_ie = wpa_bss_get_ie_pos(bss, WLAN_EID_REDUCED_NEIGHBOR_REPORT, i++))) {
++			rnr_ie_len = rnr_ie[1];
++			pos = rnr_ie + 2;
++
++			while (rnr_ie_len > sizeof(struct ieee80211_neighbor_ap_info)) {
++				const struct ieee80211_neighbor_ap_info *ap_info =
++					(const struct ieee80211_neighbor_ap_info *) pos;
++				const u8 *data = ap_info->data;
++				size_t rnr_info_len = sizeof(struct ieee80211_neighbor_ap_info);
++				u8 tbtt_count = ((ap_info->tbtt_info_hdr & 0xF0) >> 4) + 1;
++				rnr_ie_len -= rnr_info_len;
++				pos += rnr_info_len;
++
++				if (ap_info->tbtt_info_len < 16) {
++					rnr_ie_len -= (tbtt_count * ap_info->tbtt_info_len);
++					pos += (tbtt_count * ap_info->tbtt_info_len);
++					continue;
++				}
++
++				while (tbtt_count--) {
++					u16 mld_id = *(data + 13);
++					u8 link_id = *(data + 14) & 0xF;
++
++					if (wpa_s->valid_links & BIT(link_id))
++						/*Existing link_id IE */
++						goto cont;
++
++					/* RNR updated with the new link */
++					/* For NON-MBSSID BSS and MBSSID Tx BSS, idx will be 0 */
++					if (mbssid_idx != mld_id) {
++						wpa_printf(MSG_DEBUG,
++							   "MLD: Reported link not part of current MLD");
++					} else {
++						int partner_freq = ieee80211_chan_to_freq(NULL, ap_info->op_class, ap_info->channel);
++						int curr_freq = 0;
++						if (partner_freq && wpa_s->conf->freq_list && wpa_s->conf->freq_list[0]) {
++							int i = 0;
++							curr_freq = wpa_s->conf->freq_list[i];
++							while (curr_freq) {
++								i++;
++								if (curr_freq == partner_freq) {
++									wpa_printf(MSG_DEBUG, "ML Partner freq %d is part of our scan list", partner_freq);
++									break;
++								}
++								curr_freq = wpa_s->conf->freq_list[i];
++							}
++						}
++						if (wpa_s->conf->freq_list && wpa_s->conf->freq_list[0] && !curr_freq) {
++							wpa_printf(MSG_DEBUG, "ML Partner freq %d is not part of our scan list ignore this link", partner_freq);
++							goto cont;
++						}
++
++						wpa_s->own_disconnect_req = 1;
++						wpa_supplicant_deauthenticate(wpa_s,
++									      WLAN_REASON_DEAUTH_LEAVING);
++						wpa_printf(MSG_INFO, "Match found and triggering deauthenticate\n");
++						ret = false;
++						goto exit;
++					}
++
++cont:
++					data += ap_info->tbtt_info_len;
++				}
++
++				rnr_ie_len -= (data - ap_info->data);
++				pos += (data - ap_info->data);
++			}
++		}
++	}
++
++exit:
++	return ret;
++}
++
++void wpas_scan_for_rnr_entries(void *eloop_ctx, void *timeout_ctx)
++{
++	struct wpa_supplicant *wpa_s = eloop_ctx;
++	struct wpa_scan_results *scan_res;
++	size_t i;
++	bool ret = true;
++
++	if (wpa_s->wpa_state != WPA_COMPLETED)
++		/* Still the original authentication is not completed
++		 * No need to re-check here, re-schedule to check after
++		 * authetication is completed
++		 */
++		goto exit;
++
++	scan_res = wpa_drv_get_scan_results(wpa_s, NULL);
++	if (scan_res == NULL) {
++		wpa_dbg(wpa_s, MSG_DEBUG, "No scan results available");
++		goto exit;
++	}
++	filter_scan_res(wpa_s, scan_res);
++
++	for (i = 0; i < scan_res->num; i++) {
++		const u8 *ml_ie, *mld_addr;
++
++		ml_ie = wpa_scan_get_ml_ie(scan_res->res[i],
++					   MULTI_LINK_CONTROL_TYPE_BASIC);
++		if (!ml_ie)
++			continue;
++
++		mld_addr = get_basic_mle_mld_addr(&ml_ie[3], ml_ie[1] - 1);
++		if (!mld_addr)
++			continue;
++
++		if (os_memcmp(wpa_s->bssid, mld_addr, ETH_ALEN) != 0) {
++			/* Need to check any scan entry for current assoc bssid */
++			continue;
++		}
++
++		ret = wpa_bss_update_scan_rnr_res(wpa_s,
++						  scan_res->res[i],
++						  &scan_res->fetch_time);
++		if (!ret)
++			break;
++	}
++	wpa_scan_results_free(scan_res);
++
++exit:
++	if (ret)
++		eloop_register_timeout(5, 0,
++				       wpas_scan_for_rnr_entries,
++				       wpa_s, NULL);
++}
+--- a/wpa_supplicant/scan.h
++++ b/wpa_supplicant/scan.h
+@@ -38,6 +38,16 @@
+  */
+ #define TX_POWER_NO_CONSTRAINT 64
+ 
++enum configured_freq_band {
++	SCAN_FREQ_BAND_2GHZ	= BIT(0),
++	SCAN_FREQ_BAND_5GHZ_LOW	= BIT(1),
++	SCAN_FREQ_BAND_5GHZ	= BIT(2),
++	SCAN_FREQ_BAND_6GHZ_LOW	= BIT(3),
++	SCAN_FREQ_BAND_6GHZ 	= BIT(4),
++
++	SCAN_FREQ_BAND_MAX	= BIT(5),
++};
++
+ int wpa_supplicant_enabled_networks(struct wpa_supplicant *wpa_s);
+ void wpa_supplicant_req_scan(struct wpa_supplicant *wpa_s, int sec, int usec);
+ int wpa_supplicant_delayed_sched_scan(struct wpa_supplicant *wpa_s,
+--- a/wpa_supplicant/wpa_supplicant_i.h
++++ b/wpa_supplicant/wpa_supplicant_i.h
+@@ -2043,4 +2043,6 @@ bool wpas_ap_supports_rsn_overriding_2(s
+ int wpas_get_owe_trans_network(const u8 *owe_ie, const u8 **bssid,
+ 			       const u8 **ssid, size_t *ssid_len);
+ 
++void wpas_scan_for_rnr_entries(void *eloop_ctx, void *timeout_ctx);
++
+ #endif /* WPA_SUPPLICANT_I_H */
+--- a/src/common/ieee802_11_common.c
++++ b/src/common/ieee802_11_common.c
+@@ -2577,6 +2577,30 @@ const u8 * get_ie(const u8 *ies, size_t
+ 	return NULL;
+ }
+ 
++/**
++* get_ie_pos - Fetch a specified information element at given index from IEs buffer
++* @ies: Information elements buffer
++* @len: Information elements buffer length
++* @eid: Information element identifier (WLAN_EID_*)
++* @idx: index of entry of element to be found.
++*
++* Returns: Pointer to the information element (id field) at given @idx
++* or %NULL if not found.
++*/
++const u8 * get_ie_pos(const u8 *ies, size_t len, u8 eid, u8 idx)
++{
++	const struct element *elem;
++
++	if (!ies)
++		return NULL;
++
++	for_each_element(elem, ies, len) {
++		if (elem->id == eid && !idx--)
++			return &elem->id;
++	}
++	return NULL;
++}
++
+ 
+ /**
+  * get_ie_ext - Fetch a specified extended information element from IEs buffer
+--- a/src/common/ieee802_11_common.h
++++ b/src/common/ieee802_11_common.h
+@@ -284,6 +284,7 @@ extern const struct oper_class_map globa
+ extern size_t global_op_class_size;
+ 
+ const u8 * get_ie(const u8 *ies, size_t len, u8 eid);
++const u8 * get_ie_pos(const u8 *ies, size_t len, u8 eid, u8 idx);
+ const u8 * get_ie_ext(const u8 *ies, size_t len, u8 ext);
+ const u8 * get_vendor_ie(const u8 *ies, size_t len, u32 vendor_type);
+ 
+--- a/wpa_supplicant/wpa_supplicant.c
++++ b/wpa_supplicant/wpa_supplicant.c
+@@ -715,6 +715,7 @@ static void wpa_supplicant_cleanup(struc
+ 	eloop_cancel_timeout(wpas_clear_disabled_interface, wpa_s, NULL);
+ 	eloop_cancel_timeout(wpas_verify_ssid_beacon, wpa_s, NULL);
+ 	eloop_cancel_timeout(wpas_wfa_capab_tx, wpa_s, NULL);
++	eloop_cancel_timeout(wpas_scan_for_rnr_entries, wpa_s, NULL);
+ 
+ 	wpas_wps_deinit(wpa_s);
+ 
+--- a/wpa_supplicant/config.c
++++ b/wpa_supplicant/config.c
+@@ -2869,6 +2869,7 @@ static const struct parse_data ssid_fiel
+ 	{ INT_RANGE(max_idle, 0, 65535)},
+ 	{ INT_RANGE(ssid_protection, 0, 1)},
+ 	{ INT_RANGE(rsn_overriding, 0, 2)},
++	{ INT_RANGE(disable_reconfig, 0, 1)},
+ };
+ 
+ #undef OFFSET
+--- a/wpa_supplicant/config_file.c
++++ b/wpa_supplicant/config_file.c
+@@ -1007,6 +1007,7 @@ static void wpa_config_write_network(FIL
+ 	INT(max_idle);
+ 	INT(ssid_protection);
+ 	INT_DEF(rsn_overriding, RSN_OVERRIDING_NOT_SET);
++	INT(disable_reconfig);
+ 
+ #undef STR
+ #undef INT
+--- a/wpa_supplicant/config_ssid.h
++++ b/wpa_supplicant/config_ssid.h
+@@ -1375,6 +1375,12 @@ struct wpa_ssid {
+ 	 */
+ 	int go_dik_id;
+ 
++	/**
++	 * disable_reconfig - Whether to re-associate if a new link gets added
++	 * in assciated AP MLD
++	 */
++	bool disable_reconfig;
++
+ };
+ 
+ #endif /* CONFIG_SSID_H */

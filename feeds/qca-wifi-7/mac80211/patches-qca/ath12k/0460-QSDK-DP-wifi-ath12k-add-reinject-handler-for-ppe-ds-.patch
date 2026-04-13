@@ -1,0 +1,358 @@
+From 61859060100db9d3022196dfd7699ff32cddd477 Mon Sep 17 00:00:00 2001
+From: Prateek Sharma <prsha@qti.qualcomm.com>
+Date: Fri, 11 Jul 2025 15:38:30 +0530
+Subject: [PATCH] QSDK: DP:wifi: ath12k: Add reinject handler for ppe-ds flow
+
+Add support for reinjecting frames in the direct switch
+transmit completion path.
+
+FW exception always occurs for the initial few sdwf packets.
+In the case of DS, since the FW doesn't get the svc id,
+it reinjects the packet back to the host, which then
+enqueues it to TCL with all necessary sdwf fields populated.
+
+Signed-off-by: Prateek Sharma <prsha@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.h          |   3 +
+ drivers/net/wireless/ath/ath12k/dp_htt.h      |  27 +++
+ drivers/net/wireless/ath/ath12k/dp_tx.c       | 157 +++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/dp_tx.h       |   9 +
+ drivers/net/wireless/ath/ath12k/wifi7/dp.c    |   1 +
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c |  12 ++
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h |   3 +
+ 7 files changed, 203 insertions(+), 9 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -463,6 +463,9 @@ struct ath12k_dp_arch_ops {
+ 				    struct ath12k_dp_link_peer *peer,
+ 				    u16 peer_id,
+ 				    u8 chip_id);
++	int (*sdwf_reinject_handler)(struct ath12k_pdev_dp *dp_pdev,
++				     struct ath12k_link_vif *arvif,
++				     struct sk_buff *skb, struct ath12k_link_sta *arsta);
+ };
+ 
+ struct ath12k_bp_stats {
+--- a/drivers/net/wireless/ath/ath12k/dp_htt.h
++++ b/drivers/net/wireless/ath/ath12k/dp_htt.h
+@@ -44,6 +44,33 @@ struct ath12k_dp;
+ #define ATH12K_DSCP_PRIORITY 7
+ #define HTT_TX_WBM_COMP_STATUS_OFFSET 8
+ 
++#define SDWF_PEER_ID_SHIFT 0x6
++#define SDWF_PEER_ID_MASK 0x3ff
++#define SDWF_MSDUQ_MASK 0x3f
++
++#define HTT_TX_WBM_COMPLETION_V3_REINJECT_REASON_M		0x0000000F
++
++#define HAL_TX_COMP_TQM_RELEASE_REASON_MASK             0x0001e000
++
++#define HTT_TX_WBM_REINJECT_SW_PEER_ID_M    0x0000ffff
++#define HTT_TX_WBM_REINJECT_DATA_LEN_M      0xffff0000
++#define HTT_TX_WBM_REINJECT_TID_M           0x0000001f
++#define HTT_TX_WBM_REINJECT_MSDUQ_ID_M      0x000001e0
++
++enum htt_tx_fw2wbm_reinject_reason {
++	HTT_TX_FW2WBM_REINJECT_REASON_RAW_ENCAP_EXP,
++	HTT_TX_FW2WBM_REINJECT_REASON_INJECT_VIA_EXP,
++	HTT_TX_FW2WBM_REINJECT_REASON_MCAST,
++	HTT_TX_FW2WBM_REINJECT_REASON_ARP,
++	HTT_TX_FW2WBM_REINJECT_REASON_DHCP,
++	HTT_TX_FW2WBM_REINJECT_REASON_FLOW_CONTROL,
++	HTT_TX_FW2WBM_REINJECT_REASON_MLO_MCAST,
++	HTT_TX_FW2WBM_REINJECT_REASON_SDWF_SVC_CLASS_ID_ABSENT,
++	HTT_TX_FW2WBM_REINJECT_REASON_OPT_DP_CTRL, /* tx qdata packet */
++
++	HTT_TX_FW2WBM_REINJECT_REASON_MAX,
++};
++
+ struct htt_tx_wbm_completion {
+ 	__le32 rsvd0[2];
+ 	__le32 info0;
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -16,12 +16,15 @@
+ #include "hal.h"
+ #include "dp_peer.h"
+ #include "dp_stats.h"
++#include "dp_htt.h"
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ static void
+ ath12k_dp_ppeds_tx_release_desc_list_bulk(struct ath12k_dp *dp,
+ 					  struct list_head *local_list,
+-					  int local_list_len)
++					  int local_list_len,
++					  struct list_head *local_list_no_skb,
++					  int list_no_skb_count)
+ {
+ 	struct ath12k_ppeds_tx_desc_info *desc = NULL, *first_desc = NULL, *last_desc = NULL, *tmp;
+ 	int hotlist_remaining_len;
+@@ -32,6 +35,15 @@ ath12k_dp_ppeds_tx_release_desc_list_bul
+ 
+ 	spin_lock_bh(&dp->ppe.ppeds_tx_desc_lock);
+ 
++	if (unlikely(list_no_skb_count)) {
++		list_for_each_entry_safe(desc, tmp, local_list_no_skb, list) {
++			desc->paddr = (dma_addr_t)NULL;
++			desc->in_use = false;
++		}
++
++		list_splice_tail(local_list_no_skb, &dp->ppe.ppeds_tx_desc_free_list);
++	}
++
+ 	hotlist_remaining_len = ath12k_ppeds_desc_params.ppeds_hotlist_len -
+ 						dp->ppe.ppeds_tx_desc_reuse_list_len;
+ 
+@@ -170,6 +182,118 @@ void ath12k_hal_srng_ppeds_dst_inv_entry
+ }
+ #endif
+ 
++u16 dp_sawf_msduq_peer_id_set(u16 peer_id, u8 msduq)
++{
++	u16 peer_msduq = 0;
++
++	peer_msduq |= (peer_id & SDWF_PEER_ID_MASK) << SDWF_PEER_ID_SHIFT;
++	peer_msduq |= (msduq & SDWF_MSDUQ_MASK);
++	return peer_msduq;
++}
++
++int ath12k_sdwf_reinject_handler(struct ath12k_base *ab, struct sk_buff *skb,
++				 struct htt_tx_wbm_completion *status_desc, u8 mac_id)
++{
++	struct ath12k_dp_link_peer *peer;
++	struct ath12k_dp_peer_qos *qos;
++	struct ath12k_pdev_dp *dp_pdev;
++	struct ath12k_link_sta *arsta;
++	struct ath12k_link_vif *arvif;
++	struct ath12k_skb_cb *skb_cb;
++	struct ath12k_dp *dp;
++	u8 host_tid_queue;
++	u16 data_length;
++	u16 peer_msduq;
++	u8 htt_q_idx;
++	u8 msduq_idx;
++	u16 peer_id;
++	u8 pdev_id;
++	u8 msduq;
++	int ret;
++	u8 tid;
++
++	peer_id = le32_get_bits(status_desc->info2, HTT_TX_WBM_REINJECT_SW_PEER_ID_M);
++	data_length = le32_get_bits(status_desc->info2, HTT_TX_WBM_REINJECT_DATA_LEN_M);
++	tid = le32_get_bits(status_desc->info3, HTT_TX_WBM_REINJECT_TID_M);
++	htt_q_idx = le32_get_bits(status_desc->info3, HTT_TX_WBM_REINJECT_MSDUQ_ID_M);
++
++	ath12k_dbg(ab, ATH12K_DBG_PPE,
++		   "peer_id %u data_length %u tid %u htt_q_idx %u",
++		   peer_id, data_length, tid, htt_q_idx);
++
++	host_tid_queue = htt_q_idx - DP_SDWF_DEFAULT_Q_PTID_MAX;
++	msduq_idx = tid + host_tid_queue * DP_SDWF_TID_MAX;
++
++	if (msduq_idx > DP_SDWF_Q_MAX - 1) {
++		ath12k_err(ab, "Invalid msduq idx: %u, tid %u htt_q_idx %u",
++			   msduq_idx, tid, htt_q_idx);
++		return -EINVAL;
++	}
++
++	dp = ath12k_ab_to_dp(ab);
++	pdev_id = ath12k_hw_mac_id_to_pdev_id(dp->hw_params, mac_id);
++
++	rcu_read_lock();
++	dp_pdev = ath12k_dp_to_dp_pdev(dp, pdev_id);
++
++	peer = ath12k_dp_link_peer_find_by_id(dp, peer_id);
++	if (!peer) {
++		ath12k_err(ab, "Invalid peer id %u", peer_id);
++		rcu_read_unlock();
++		return -EINVAL;
++	}
++	qos = peer->dp_peer->qos;
++	if (!qos) {
++		ath12k_err(ab, "QOS ctx for peer id %u", peer_id);
++		rcu_read_unlock();
++		return -EINVAL;
++	}
++
++	msduq = msduq_idx + DP_SDWF_DEFAULT_Q_MAX;
++	peer_msduq = dp_sawf_msduq_peer_id_set(peer_id, msduq);
++
++	skb->mark = ath_encode_sdwf_metadata(peer_msduq);
++	skb->len = data_length;
++
++	skb_cb = ATH12K_SKB_CB(skb);
++	skb_cb->flags |= ATH12K_SKB_HW_80211_ENCAP;
++
++	arsta = ath12k_peer_get_link_sta(ab, peer);
++	arvif = arsta->arvif;
++
++	/* This arch ops is temporary, must be removed once ppeds handler is moved to wifi7 */
++	ret = dp->arch_ops->sdwf_reinject_handler(dp_pdev, arvif, skb, arsta);
++
++	rcu_read_unlock();
++
++	return ret;
++}
++
++static inline
++void ath12k_ppeds_reinject_handler(struct ath12k_base *ab,
++				   struct ath12k_ppeds_tx_desc_info *tx_desc,
++				   struct htt_tx_wbm_completion *status_desc)
++{
++	u8 reinject_reason;
++	int status;
++
++	reinject_reason = le32_get_bits(status_desc->info1,
++					HTT_TX_WBM_COMPLETION_V3_REINJECT_REASON_M);
++
++	if (reinject_reason == HTT_TX_FW2WBM_REINJECT_REASON_SDWF_SVC_CLASS_ID_ABSENT) {
++		struct sk_buff *skb = tx_desc->skb;
++		/* sdwf reinject handler consume the skb,
++		 * so set tx_desc->skb = NULL here.
++		 */
++		status = ath12k_sdwf_reinject_handler(ab, skb, status_desc,
++						      tx_desc->mac_id);
++		if (!status)
++			tx_desc->skb = NULL;
++
++		return;
++	}
++}
++
+ int ath12k_ppeds_tx_completion_handler(struct ath12k_base *ab, int budget)
+ {
+ 	struct ath12k_dp *dp = ab->dp;
+@@ -178,12 +302,14 @@ int ath12k_ppeds_tx_completion_handler(s
+ 	struct hal_srng *status_ring = &ab->hal.srng_list[hal_ring_id];
+ 	struct ath12k_ppeds_tx_desc_info *tx_desc = NULL;
+ 	int valid_entries, count = 0;
++	int list_no_skb_count = 0;
+ 	struct hal_wbm_release_ring *desc;
+ 	struct hal_wbm_completion_ring_tx *tx_status;
+ 	struct htt_tx_wbm_completion *status_desc;
+ 	enum hal_wbm_rel_src_module buf_rel_source;
+ 	int htt_status;
+ 	struct list_head local_list;
++	struct list_head local_list_no_skb;
+ 	size_t stat_size;
+ 
+ 	BUG_ON(budget > DP_PPEDS_SERVICE_BUDGET);
+@@ -194,6 +320,7 @@ int ath12k_ppeds_tx_completion_handler(s
+ 	else
+ 		stat_size = sizeof(struct hal_wbm_release_ring);
+ 	INIT_LIST_HEAD(&local_list);
++	INIT_LIST_HEAD(&local_list_no_skb);
+ 	spin_lock_bh(&status_ring->lock);
+ 
+ 	ath12k_hal_srng_access_begin(ab, status_ring);
+@@ -231,10 +358,16 @@ int ath12k_ppeds_tx_completion_handler(s
+ 		tx_ring->macid[count] = tx_desc->mac_id;
+ 
+ 		if (unlikely(buf_rel_source == HAL_WBM_REL_SRC_MODULE_FW)) {
+-			status_desc = ((void *)tx_status) + HTT_TX_WBM_COMP_STATUS_OFFSET;
+-			htt_status = u32_get_bits(status_desc->info0,
+-						  HTT_TX_WBM_COMP_INFO0_STATUS);
+-			if (htt_status != HAL_WBM_REL_HTT_TX_COMP_STATUS_OK) {
++			status_desc = (void *)tx_status;
++			htt_status = le32_get_bits(status_desc->info0,
++						   HAL_TX_COMP_TQM_RELEASE_REASON_MASK);
++
++			if (htt_status == HAL_WBM_REL_HTT_TX_COMP_STATUS_REINJ) {
++				ath12k_ppeds_reinject_handler(ab, tx_desc, status_desc);
++			}
++
++			if (htt_status != HAL_WBM_REL_HTT_TX_COMP_STATUS_OK &&
++			    htt_status != HAL_WBM_REL_HTT_TX_COMP_STATUS_REINJ) {
+ 				ab->dp->ppe.ppeds_stats.fw2wbm_pkt_drops++;
+ 				ath12k_dbg(ab, ATH12K_DBG_PPE,
+ 					   "ath12k: Frame received from unexpected source %d status %d!\n",
+@@ -244,14 +377,20 @@ int ath12k_ppeds_tx_completion_handler(s
+ 		}
+ 		/* add descriptor to local list to process in bulk */
+ 		tx_desc->in_use = false;
+-		list_add_tail(&tx_desc->list, &local_list);
+-		count++;
++		if (likely(tx_desc->skb)) {
++			list_add_tail(&tx_desc->list, &local_list);
++			count++;
++		} else {
++			list_add_tail(&tx_desc->list, &local_list_no_skb);
++			list_no_skb_count++;
++		}
+ 	}
+ 	ath12k_hal_srng_access_end(ab, status_ring);
+ 	spin_unlock_bh(&status_ring->lock);
+ 
+-	ath12k_dp_ppeds_tx_release_desc_list_bulk(dp, &local_list, count);
+-	return count;
++	ath12k_dp_ppeds_tx_release_desc_list_bulk(dp, &local_list, count,
++						  &local_list_no_skb, list_no_skb_count);
++	return (count + list_no_skb_count);
+ }
+ #endif
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.h
+@@ -9,6 +9,13 @@
+ 
+ #include "core.h"
+ 
++#define DP_SDWF_DEFINED_Q_PTID_MAX 2
++#define DP_SDWF_DEFAULT_Q_PTID_MAX 2
++#define DP_SDWF_TID_MAX 8
++
++#define DP_SDWF_Q_MAX (DP_SDWF_DEFINED_Q_PTID_MAX * DP_SDWF_TID_MAX)
++#define DP_SDWF_DEFAULT_Q_MAX (DP_SDWF_DEFAULT_Q_PTID_MAX * DP_SDWF_TID_MAX)
++
+ #define DP_GET_HW_LINK_ID_FRM_PPDU_ID(PPDU_ID, LINK_ID_OFFSET, LINK_ID_BITS) \
+ 	(((PPDU_ID) >> (LINK_ID_OFFSET)) & ((1 << (LINK_ID_BITS)) - 1))
+ 
+@@ -41,6 +48,8 @@ void ath12k_dp_tx_update_peer_basic_stat
+ void ath12k_dp_tx_comp_update_peer_stats(struct ath12k_dp_peer *peer,
+ 					 struct hal_tx_status *ts, int ring_id,
+ 					 u16 tx_desc_flags);
++int ath12k_sdwf_reinject_handler(struct ath12k_base *ab, struct sk_buff *skb,
++				 struct htt_tx_wbm_completion *status_desc, u8 mac_id);
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ int ath12k_ppeds_tx_completion_handler(struct ath12k_base *ab, int ring_id);
+ struct ath12k_ppeds_tx_desc_info *
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp.c
+@@ -179,6 +179,7 @@ static struct ath12k_dp_arch_ops ath12k_
+ 	.rx_flow_delete_all_entries = ath12k_wifi7_dp_rx_flow_delete_all_entries,
+ 	.dump_fst_table = ath12k_wifi7_dp_dump_fst_table,
+ 	.peer_migrate_reo_cmd = ath12k_wifi7_dp_peer_migrate_reo_cmd,
++	.sdwf_reinject_handler = ath12k_wifi7_sdwf_reinject_handler,
+ };
+ 
+ /* TODO: remove export once this file is built with wifi7 ko */
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -2245,3 +2245,15 @@ u32 ath12k_wifi7_dp_tx_get_vdev_bank_con
+ 
+ 	return bank_config;
+ }
++
++int ath12k_wifi7_sdwf_reinject_handler(struct ath12k_pdev_dp *dp_pdev,
++				       struct ath12k_link_vif *arvif,
++				       struct sk_buff *skb, struct ath12k_link_sta *arsta)
++{
++	u8 ring_selector = 0, ring_id = 0;
++
++	ring_selector = smp_processor_id();
++	ring_id = ring_selector % dp_pdev->dp->hw_params->max_tx_ring;
++
++	return ath12k_wifi7_dp_tx(dp_pdev, arvif, skb, false, 0, false, arsta, ring_id, 0);
++}
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h
+@@ -19,4 +19,7 @@ ath12k_wifi7_dp_tx(struct ath12k_pdev_dp
+ u32 ath12k_wifi7_dp_tx_get_vdev_bank_config(struct ath12k_base *ab,
+ 					    struct ath12k_link_vif *arvif, bool vdev_id_check_en);
+ bool ath12k_mac_tx_check_max_limit(struct ath12k_pdev_dp *dp_pdev, struct sk_buff *skb);
++int ath12k_wifi7_sdwf_reinject_handler(struct ath12k_pdev_dp *dp_pdev,
++				       struct ath12k_link_vif *arvif,
++				       struct sk_buff *skb, struct ath12k_link_sta *arsta);
+ #endif

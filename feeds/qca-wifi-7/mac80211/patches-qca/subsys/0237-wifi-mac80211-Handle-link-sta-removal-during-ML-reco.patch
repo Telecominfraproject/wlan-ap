@@ -1,0 +1,318 @@
+From 011d1ef9f84ce8c053f1c909daad3d83f244521f Mon Sep 17 00:00:00 2001
+From: Balamurugan Ramar <quic_bramar@quicinc.com>
+Date: Thu, 10 Apr 2025 23:27:04 +0530
+Subject: [PATCH] mac80211: wifi Handle link sta removal during ML 
+ reconfiguration
+
+While handling MLD reconfiguration work, sdata valid links will be
+removed but sta_info valid links is not getting cleared. Because of
+this, valid links in sta_info and sdata will be different which leads
+to getting warn_on messages after a network restart or any disassociate
+handling.
+
+Fix this by removing the sta link after successfull MLD reconfiguration
+removal.
+
+Signed-off-by: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+Signed-off-by: Balamurugan Ramar <quic_bramar@quicinc.com>
+---
+ include/net/mac80211.h     |  2 ++
+ net/mac80211/cfg.c         |  4 +--
+ net/mac80211/driver-ops.c  | 16 +++++++++---
+ net/mac80211/driver-ops.h  | 12 +++++++++
+ net/mac80211/ieee80211_i.h |  2 +-
+ net/mac80211/mlme.c        | 35 ++++++++++++++++++++------
+ net/mac80211/sta_info.c    | 51 ++++++++++++++++++++++++++++++++------
+ net/mac80211/sta_info.h    |  5 ++--
+ 8 files changed, 105 insertions(+), 22 deletions(-)
+
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index a0e719b..0855143 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -5038,6 +5038,8 @@ struct ieee80211_ops {
+ 	int (*link_reconfig_remove)(struct ieee80211_hw *hw,
+ 				    struct ieee80211_vif *vif,
+ 				    const struct cfg80211_link_reconfig_removal_params *params);
++	bool (*removed_link_is_primary)(struct ieee80211_sta *sta,
++					u16 removed_links);
+ };
+ 
+ /**
+diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
+index fe35ec6..8332eb1 100644
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -5761,7 +5761,7 @@ ieee80211_add_link_station(struct wiphy *wiphy, struct net_device *dev,
+ 
+ 	ret = sta_link_apply_parameters(local, sta, STA_LINK_MODE_NEW, params);
+ 	if (ret) {
+-		ieee80211_sta_free_link(sta, params->link_id);
++		ieee80211_sta_free_link(sta, params->link_id, false);
+ 		return ret;
+ 	}
+ 
+@@ -5817,7 +5817,7 @@ ieee80211_del_link_station(struct wiphy *wiphy, struct net_device *dev,
+ 	if (sta->sta.valid_links == BIT(params->link_id))
+ 		return -EINVAL;
+ 
+-	ieee80211_sta_remove_link(sta, params->link_id);
++	ieee80211_sta_remove_link(sta, params->link_id, true);
+ 
+ 	return 0;
+ }
+diff --git a/net/mac80211/driver-ops.c b/net/mac80211/driver-ops.c
+index d8adb04..1acf54e 100644
+--- a/net/mac80211/driver-ops.c
++++ b/net/mac80211/driver-ops.c
+@@ -598,6 +598,7 @@ int drv_change_sta_links(struct ieee80211_local *local,
+ {
+ 	struct sta_info *info = container_of(sta, struct sta_info, sta);
+ 	struct link_sta_info *link_sta;
++	struct ieee80211_vif *vif = &sdata->vif;
+ 	unsigned long links_to_add;
+ 	unsigned long links_to_rem;
+ 	unsigned int link_id;
+@@ -609,8 +610,17 @@ int drv_change_sta_links(struct ieee80211_local *local,
+ 	if (!check_sdata_in_driver(sdata))
+ 		return -EIO;
+ 
+-	old_links &= sdata->vif.active_links;
+-	new_links &= sdata->vif.active_links;
++	if (vif->type == NL80211_IFTYPE_AP_VLAN) {
++		struct wireless_dev *wdev = ieee80211_vif_to_wdev(vif);
++		/* Update parent vif for further use when vif type is AP/VLAN */
++		vif = wdev_to_ieee80211_vif_vlan(wdev);
++
++		if (!vif)
++			return -EINVAL;
++	}
++
++	old_links &= vif->active_links;
++	new_links &= vif->active_links;
+ 
+ 	if (old_links == new_links)
+ 		return 0;
+@@ -627,7 +637,7 @@ int drv_change_sta_links(struct ieee80211_local *local,
+ 
+ 	trace_drv_change_sta_links(local, sdata, sta, old_links, new_links);
+ 	if (local->ops->change_sta_links)
+-		ret = local->ops->change_sta_links(&local->hw, &sdata->vif, sta,
++		ret = local->ops->change_sta_links(&local->hw, vif, sta,
+ 						   old_links, new_links);
+ 	trace_drv_return_int(local, ret);
+ 
+diff --git a/net/mac80211/driver-ops.h b/net/mac80211/driver-ops.h
+index 2bc4660..57e8375 100644
+--- a/net/mac80211/driver-ops.h
++++ b/net/mac80211/driver-ops.h
+@@ -1777,4 +1777,16 @@ drv_link_reconfig_remove(struct ieee80211_local *local,
+ 
+ 	return ret;
+ }
++
++static inline bool
++drv_check_removed_link_is_primary(struct ieee80211_local *local,
++				  struct sta_info *sta,
++				  u16 removed_links)
++{
++	if (local->ops->removed_link_is_primary)
++		return local->ops->removed_link_is_primary(&sta->sta,
++							   removed_links);
++
++	return false;
++}
+ #endif /* __MAC80211_DRIVER_OPS */
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 49fdb90..c1e6827 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -610,7 +610,7 @@ struct ieee80211_if_managed {
+ 	size_t assoc_req_ies_len;
+ 
+ 	struct wiphy_delayed_work ml_reconf_work;
+-	u16 removed_links;
++	unsigned long removed_links;
+ 
+ 	/* TID-to-link mapping support */
+ 	struct wiphy_delayed_work ttlm_work;
+diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
+index a4412ae..8abf090 100644
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@ -5895,7 +5895,7 @@ static bool ieee80211_assoc_success(struct ieee80211_sub_if_data *sdata,
+ 
+ 		if (assoc_data->link[link_id].status != WLAN_STATUS_SUCCESS) {
+ 			valid_links &= ~BIT(link_id);
+-			ieee80211_sta_remove_link(sta, link_id);
++			ieee80211_sta_remove_link(sta, link_id, true);
+ 			continue;
+ 		}
+ 
+@@ -6398,16 +6398,29 @@ static void ieee80211_ml_reconf_work(struct wiphy *wiphy,
+ 	struct ieee80211_sub_if_data *sdata =
+ 		container_of(work, struct ieee80211_sub_if_data,
+ 			     u.mgd.ml_reconf_work.work);
+-	u16 new_valid_links, new_active_links, new_dormant_links;
++	struct sta_info *sta;
++	struct ieee80211_local *local = sdata->local;
++	u16 new_valid_links, new_active_links, new_dormant_links, link_id;
+ 	int ret;
+ 
+ 	if (!sdata->u.mgd.removed_links)
+ 		return;
+ 
+ 	sdata_info(sdata,
+-		   "MLO Reconfiguration: work: valid=0x%x, removed=0x%x\n",
++		   "MLO Reconfiguration: work: valid=0x%x, removed=0x%lx\n",
+ 		   sdata->vif.valid_links, sdata->u.mgd.removed_links);
+ 
++	list_for_each_entry(sta, &local->sta_list, list) {
++		if (sdata != sta->sdata)
++			continue;
++
++		if (drv_check_removed_link_is_primary(local, sta,
++						      sdata->u.mgd.removed_links)) {
++			__ieee80211_disconnect(sdata);
++			return;
++		}
++	}
++
+ 	new_valid_links = sdata->vif.valid_links & ~sdata->u.mgd.removed_links;
+ 	if (new_valid_links == sdata->vif.valid_links)
+ 		return;
+@@ -6444,11 +6457,19 @@ static void ieee80211_ml_reconf_work(struct wiphy *wiphy,
+ 	ieee80211_vif_cfg_change_notify(sdata, BSS_CHANGED_MLD_VALID_LINKS);
+ 
+ out:
+-	if (!ret)
++	if (!ret) {
++		list_for_each_entry(sta, &local->sta_list, list) {
++			if (sdata != sta->sdata)
++				continue;
++
++			for_each_set_bit(link_id, &sdata->u.mgd.removed_links,
++					 IEEE80211_MLD_MAX_NUM_LINKS)
++				ieee80211_sta_remove_link(sta, link_id, false);
++		}
+ 		cfg80211_links_removed(sdata->dev, sdata->u.mgd.removed_links);
+-	else
++	} else
+ 		__ieee80211_disconnect(sdata);
+-
++	
+ 	sdata->u.mgd.removed_links = 0;
+ }
+ 
+@@ -10342,7 +10363,7 @@ int ieee80211_mgd_assoc_ml_reconf(struct ieee80211_sub_if_data *sdata,
+ 			if (!(rem_links & BIT(link_id)))
+ 				continue;
+ 
+-			ieee80211_sta_remove_link(sta, link_id);
++			ieee80211_sta_remove_link(sta, link_id, false);
+ 		}
+ 
+ 		/* notify the driver and upper layers */
+diff --git a/net/mac80211/sta_info.c b/net/mac80211/sta_info.c
+index d0d386d..72bb148 100644
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@ -3062,13 +3062,13 @@ int ieee80211_sta_allocate_link(struct sta_info *sta, unsigned int link_id)
+ 	return 0;
+ }
+ 
+-void ieee80211_sta_free_link(struct sta_info *sta, unsigned int link_id)
++void ieee80211_sta_free_link(struct sta_info *sta, unsigned int link_id, bool unhash)
+ {
+ 	lockdep_assert_wiphy(sta->sdata->local->hw.wiphy);
+ 
+ 	WARN_ON(!test_sta_flag(sta, WLAN_STA_INSERTED));
+ 
+-	sta_remove_link(sta, link_id, false);
++	sta_remove_link(sta, link_id, unhash);
+ }
+ 
+ int ieee80211_sta_activate_link(struct sta_info *sta, unsigned int link_id)
+@@ -3119,20 +3119,57 @@ hash:
+ 	return 0;
+ }
+ 
+-void ieee80211_sta_remove_link(struct sta_info *sta, unsigned int link_id)
++void ieee80211_sta_remove_link(struct sta_info *sta, unsigned int link_id,
++			       bool update)
+ {
+ 	struct ieee80211_sub_if_data *sdata = sta->sdata;
+-	u16 old_links = sta->sta.valid_links;
++	struct link_sta_info *sta_info;
++	struct ieee80211_link_sta *link_sta;
++	u16 old_links = sta->sta.valid_links, n_link_id;
+ 
+ 	lockdep_assert_wiphy(sdata->local->hw.wiphy);
+ 
+ 	sta->sta.valid_links &= ~BIT(link_id);
+ 
+-	if (!WARN_ON(!test_sta_flag(sta, WLAN_STA_INSERTED)))
+-		drv_change_sta_links(sdata->local, sdata, &sta->sta,
+-				     old_links, sta->sta.valid_links);
++	if (!WARN_ON(!test_sta_flag(sta, WLAN_STA_INSERTED)) && update)
++		if (drv_change_sta_links(sdata->local, sdata, &sta->sta,
++				     old_links, sta->sta.valid_links)) {
++			sta->sta.valid_links |= BIT(link_id);
++			return;
++		}
+ 
+ 	sta_remove_link(sta, link_id, true);
++
++	/* If deflink is getting removed, then move the contents of the next
++	 * asosciated link to deflink and free the moved link memory
++	 */
++	if (sta->deflink.link_id == link_id) {
++		n_link_id = ffs(sta->sta.valid_links) - 1;
++
++		sta_info = rcu_access_pointer(sta->link[n_link_id]);
++		link_sta = rcu_access_pointer(sta->sta.link[n_link_id]);
++
++		if (sta_info && link_sta) {
++			sta->deflink.link_id = n_link_id;
++			sta->sta.deflink.link_id = n_link_id;
++
++			memcpy(&sta->deflink, sta_info, sizeof(*sta_info));
++			memcpy(&sta->sta.deflink, link_sta, sizeof(*link_sta));
++
++			/* Free the moved link memory */
++			sta_remove_link(sta, n_link_id, true);
++
++			/* Re-add the link id to valid_links */
++			sta->sta.valid_links |= BIT(n_link_id);
++
++			rcu_assign_pointer(sta->link[n_link_id], &sta->deflink);
++			rcu_assign_pointer(sta->sta.link[n_link_id],
++					   &sta->sta.deflink);
++
++			link_sta_info_hash_add(sdata->local, &sta->deflink);
++			ieee80211_link_sta_debugfs_add(&sta->deflink);
++		}
++	}
+ }
+ 
+ void ieee80211_sta_set_max_amsdu_subframes(struct sta_info *sta,
+diff --git a/net/mac80211/sta_info.h b/net/mac80211/sta_info.h
+index c255434..4bc7636 100644
+--- a/net/mac80211/sta_info.h
++++ b/net/mac80211/sta_info.h
+@@ -964,9 +964,10 @@ void ieee80211_sta_expire(struct ieee80211_sub_if_data *sdata,
+ 			  unsigned long exp_time);
+ 
+ int ieee80211_sta_allocate_link(struct sta_info *sta, unsigned int link_id);
+-void ieee80211_sta_free_link(struct sta_info *sta, unsigned int link_id);
++void ieee80211_sta_free_link(struct sta_info *sta, unsigned int link_id, bool unhash);
+ int ieee80211_sta_activate_link(struct sta_info *sta, unsigned int link_id);
+-void ieee80211_sta_remove_link(struct sta_info *sta, unsigned int link_id);
++void ieee80211_sta_remove_link(struct sta_info *sta, unsigned int link_id,
++			       bool update);
+ 
+ void ieee80211_sta_ps_deliver_wakeup(struct sta_info *sta);
+ void ieee80211_sta_ps_deliver_poll_response(struct sta_info *sta);
+-- 
+2.34.1
+

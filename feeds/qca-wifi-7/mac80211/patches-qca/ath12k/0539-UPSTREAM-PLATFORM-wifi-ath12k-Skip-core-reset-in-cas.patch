@@ -1,0 +1,423 @@
+From 75ffe57308818408c113a169d9f7ac485592d600 Mon Sep 17 00:00:00 2001
+From: Avula Sri Charan <asrichar@qti.qualcomm.com>
+Date: Fri, 19 Sep 2025 15:21:25 +0530
+Subject: UPSTREAM:PLATFORM:wifi: ath12k: Skip core reset in case  of FW crash
+in rmmod path
+
+Currently for PCI based chips core_reset is being queued in case of a
+Firmware crash in rmmod path because of which ending up accessing ah
+after it is freed which is leading to a NULL crash.
+
+Also unregister the panic notifier for all the SOC's that are part of a
+group
+to avoid rddm dump collection after mhi suspend in case of any host panics.
+
+Set the CRASH_FLUSH for each soc upon receiving the FW crash notification
+irrespective of recovery is enabled or not and add changes to check on that
+flag and collect rddm dump before mhi_stop & pci_sw_reset.
+
+Disable SSR recovery on rmmod so that all FW crash notifications will
+be receieved instead of adding additional handling for recovery enabled
+cases This will also ensure that once rmmod is triggered only rootpd fatal
+notification is receieved.
+
+Remove the constraint to set the recovery mode only when radio is up so
+that the SSR recovery can be disabled in rmmod case irrespective of radios
+are enabled or disabled.
+
+Signed-off-by: Avula Sri Charan <asrichar@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/ahb.c      | 32 ++++----
+ drivers/net/wireless/ath/ath12k/core.c     | 91 +++++++++++++---------
+ drivers/net/wireless/ath/ath12k/core.h     |  2 +-
+ drivers/net/wireless/ath/ath12k/coredump.c |  8 +-
+ drivers/net/wireless/ath/ath12k/debugfs.c  | 37 ++++-----
+ drivers/net/wireless/ath/ath12k/mhi.c      |  9 ++-
+ 6 files changed, 92 insertions(+), 87 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -1103,6 +1103,7 @@ static void ath12k_core_dump_crash_reaso
+ static void ath12k_ahb_handle_userpd_crash(struct ath12k_base *ab)
+ {
+ 	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++	struct ath12k_hw_group *ag = ab->ag;
+ 
+ 	if (!test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags))
+ 		return;
+@@ -1113,15 +1114,15 @@ static void ath12k_ahb_handle_userpd_cra
+ 	complete(&ab_ahb->userpd_ready);
+ 	complete(&ab_ahb->userpd_stopped);
+ 	ath12k_core_dump_crash_reason(ab);
+-	if (!(test_bit(ATH12K_GROUP_FLAG_UNREGISTER, &ab->ag->flags))) {
++	set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
++
++	if (!test_bit(ATH12K_GROUP_FLAG_UNREGISTER, &ag->flags)) {
+ 		set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+-		set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+-		set_bit(ATH12K_GROUP_FLAG_RECOVERY, &ab->ag->flags);
++		set_bit(ATH12K_GROUP_FLAG_RECOVERY, &ag->flags);
+ 		ab_ahb->crash_type = ATH12K_RPROC_USERPD_CRASH;
+ 		queue_work(ab->workqueue_aux, &ab->reset_work);
+ 	} else {
+-		/* In case of userpd crash during rmmod case */
+-		WARN_ON(1);
++		ath12k_core_trigger_bug_on(ab);
+ 	}
+ }
+ 
+@@ -1214,17 +1215,12 @@ int ath12k_ahb_root_pd_fatal_notifier(st
+ 	if (ab->fw_recovery_support == ATH12K_FW_RECOVERY_DISABLE)
+ 		ab_ahb->tgt_rproc->recovery_disabled = true;
+ 
+-	if (!(test_bit(ATH12K_GROUP_FLAG_UNREGISTER, &ag->flags))) {
+-		set_bit(ATH12K_GROUP_FLAG_RECOVERY, &ag->flags);
+-		set_bit(ATH12K_GROUP_FLAG_CRASH_FLUSH, &ag->flags);
+-		set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+-		set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+-		ab_ahb->crash_type = ATH12K_RPROC_ROOTPD_CRASH;
+-		queue_work(ab->workqueue_aux, &ag->reset_group_work);
+-	} else {
+-		/* In case of rootpd crash during rmmod case */
+-		WARN_ON(1);
+-	}
++	set_bit(ATH12K_GROUP_FLAG_RECOVERY, &ag->flags);
++	set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
++
++	ab_ahb->crash_type = ATH12K_RPROC_ROOTPD_CRASH;
++	ath12k_core_trigger_partner_device_crash(ab);
++	queue_work(ab->workqueue_aux, &ag->reset_group_work);
+ 
+ 	return NOTIFY_OK;
+ }
+@@ -1242,8 +1238,10 @@ static void ath12k_ahb_queue_all_userpd_
+ 		    partner_ab->hif.bus == ATH12K_BUS_PCI)
+ 			continue;
+ 
+-		if (!(test_bit(ATH12K_GROUP_FLAG_UNREGISTER, &ab->ag->flags)))
++		if (!test_bit(ATH12K_GROUP_FLAG_UNREGISTER, &ag->flags))
+ 			queue_work(partner_ab->workqueue_aux, &partner_ab->reset_work);
++		else
++			ath12k_core_trigger_bug_on(ab);
+ 	}
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1486,7 +1486,7 @@ static void ath12k_core_hw_group_stop(st
+ 		mutex_lock(&ab->core_lock);
+ 		ath12k_core_pdev_deinit(ab);
+ 		mutex_unlock(&ab->core_lock);
+-    }
++	}
+ 
+ 	wiphy_work_cancel(ah->hw->wiphy, &ag->stats_work.stats_nb_work);
+ 	ath12k_stats_event_work_free(&ag->stats_work);
+@@ -3434,40 +3434,22 @@ static void ath12k_core_update_userpd_st
+ 		if (ab->is_bypassed)
+ 			continue;
+ 
+-		if (!ab->fw_recovery_support) {
+-			if (ab->hif.bus == ATH12K_BUS_PCI &&
+-			    !test_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags)) {
+-			/* Failsafe. Assert partner chips as crash notification would
+-			 * not be propagated to all chips in rare case.
+-			 */
+-				ath12k_info(ab, "sending fw_hang cmd to partner chip\n");
+-				ath12k_wmi_force_fw_hang_cmd(ab->pdevs[0].ar,
+-							     ATH12K_WMI_FW_HANG_ASSERT_TYPE,
+-							     ATH12K_WMI_FW_HANG_DELAY,
+-							     true);
+-
+-			} else if (ab->hif.bus == ATH12K_BUS_AHB ||
+-				   ab->hif.bus == ATH12K_BUS_HYBRID) {
+-				ath12k_hal_dump_srng_stats(ab);
+-				ath12k_core_trigger_bug_on(ab);
+-			}
+-			continue;
+-		} else {
+-			if (ab->hif.bus == ATH12K_BUS_PCI)
+-				continue;
+-		}
++		if (ab->hif.bus == ATH12K_BUS_AHB || ab->hif.bus == ATH12K_BUS_HYBRID) {
++			ath12k_hal_dump_srng_stats(ab);
++			ab_ahb = ath12k_ab_to_ahb(ab);
+ 
+-		ab_ahb = ath12k_ab_to_ahb(ab);
+-		if (!(test_bit(ATH12K_GROUP_FLAG_UNREGISTER, &ab->ag->flags))) {
+-			set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+-			set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+ 			ab_ahb->crash_type = ATH12K_RPROC_ROOTPD_CRASH;
+-		}
++			set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+ 
+-		if (!ab->is_reset) {
+-			ath12k_hif_irq_disable(ab);
++			if (!ab->is_reset)
++				ath12k_hif_irq_disable(ab);
++
++			if (ab->fw_recovery_support &&
++			    !test_bit(ATH12K_GROUP_FLAG_UNREGISTER, &ag->flags))
++				set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
++			else
++				ath12k_core_trigger_bug_on(ab);
+ 		}
+-		ath12k_hal_dump_srng_stats(ab);
+ 	}
+ }
+ 
+@@ -3520,7 +3502,7 @@ static int ath12k_core_trigger_umac_rese
+ 	return ret;
+ }
+ 
+-static void ath12k_core_trigger_partner_device_crash(struct ath12k_base *ab)
++void ath12k_core_trigger_partner_device_crash(struct ath12k_base *ab)
+ {
+ 	struct ath12k_hw_group *ag = ab->ag;
+ 	struct ath12k_ahb *ab_ahb = NULL;
+@@ -3549,7 +3531,6 @@ static void ath12k_core_trigger_partner_
+ 				&& ab_ahb->crash_type == ATH12K_RPROC_ROOTPD_CRASH)
+ 			continue;
+ 
+-
+ 		/* issue FW Hang command on partner chips for Mode0. This is a fool proof
+ 		 * method to ensure recovery of all partner chips in MODE0 instead of
+ 		 * relying on firmware to crash partner chips
+@@ -3585,6 +3566,29 @@ static void ath12k_partner_chip_power_st
+ 	}
+ }
+ 
++static void ath12k_core_disable_ext_irq_during_recovery(struct ath12k_base *ab)
++{
++	struct ath12k_ahb *ab_ahb;
++
++	if (!ab->is_reset) {
++		/* Disable IRQs only for PCI bus and AHB bus in case of userPD crash
++		 * IRQs will be disabled for AHB rootPD crash from rootPD crash notifier
++		 */
++		switch (ab->hif.bus) {
++		case ATH12K_BUS_AHB:
++		case ATH12K_BUS_HYBRID:
++			ab_ahb = ath12k_ab_to_ahb(ab);
++
++			if (ab_ahb->crash_type == ATH12K_RPROC_ROOTPD_CRASH)
++				break;
++			fallthrough;
++		case ATH12K_BUS_PCI:
++			ath12k_hif_irq_disable(ab);
++			break;
++		}
++	}
++}
++
+ static void ath12k_core_reset(struct work_struct *work)
+ {
+ 	struct ath12k_base *partner_ab, *ab = container_of(work, struct ath12k_base, reset_work);
+@@ -3684,6 +3688,9 @@ static void ath12k_core_reset(struct wor
+ 	ath12k_dbg(ab, ATH12K_DBG_BOOT, "reset starting\n");
+ 
+ 	mutex_lock(&ag->mutex);
++
++	ath12k_core_disable_ext_irq_during_recovery(ab);
++	ath12k_hif_ce_irq_disable(ab);
+ 	ab->is_reset = true;
+ 
+ 	if (ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE0)
+@@ -3774,9 +3781,6 @@ static void ath12k_core_reset(struct wor
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_BOOT, "waiting recovery start...\n");
+ 
+-	ath12k_hif_irq_disable(ab);
+-	ath12k_hif_ce_irq_disable(ab);
+-
+ 	if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE2)
+ 		ath12k_partner_chip_power_state_info(ag, FW_ASSERTED_CHIP_PWR_DOWN);
+ 
+@@ -4530,6 +4534,7 @@ static void ath12k_core_hw_group_destroy
+ 		mutex_lock(&ab->core_lock);
+ 		ath12k_core_soc_destroy(ab);
+ 		mutex_unlock(&ab->core_lock);
++		ath12k_core_panic_notifier_unregister(ab);
+ 	}
+ 	mutex_unlock(&ag->mutex);
+ }
+@@ -4554,12 +4559,25 @@ static void ath12k_core_hw_group_cleanup
+ 		return;
+ 	}
+ 
++	ath12k_send_fw_hang_cmd(ag->ab[0], ATH12K_FW_RECOVERY_DISABLE);
++
+ 	set_bit(ATH12K_GROUP_FLAG_UNREGISTER, &ag->flags);
+ 
+ 	ath12k_core_hw_group_stop(ag);
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
++		if (!ab)
++			continue;
++
++		if (test_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags)) {
++			if (ab->hif.bus == ATH12K_BUS_PCI)
++				ath12k_coredump_download_rddm(ab);
++		}
++	}
++
++	for (i = 0; i < ag->num_devices; i++) {
++		ab = ag->ab[i];
+ 		if (!ab || ab->is_bypassed)
+ 			continue;
+ 
+@@ -4955,7 +4973,6 @@ void ath12k_core_deinit(struct ath12k_ba
+ 
+ 	if (ath12k_telemetry_ab_agent_delete_handler(ab))
+ 		ath12k_err(ab, "failed to destroy soc agent\n");
+-	ath12k_core_panic_notifier_unregister(ab);
+ 	ath12k_core_hw_group_cleanup(ab->ag);
+ 	ath12k_core_hw_group_destroy(ab->ag);
+ #ifdef CPTCFG_ATHDEBUG
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -393,7 +393,6 @@ enum ath12k_hw_group_flags {
+ 	ATH12K_GROUP_FLAG_REGISTERED,
+ 	ATH12K_GROUP_FLAG_UNREGISTER,
+ 	ATH12K_GROUP_FLAG_RECOVERY,
+-	ATH12K_GROUP_FLAG_CRASH_FLUSH,
+ 	ATH12K_GROUP_FLAG_HW_CRYPTO_DISABLED,
+ 	ATH12K_GROUP_FLAG_RAW_MODE,
+ 	ATH12K_GROUP_FLAG_HIF_POWER_DOWN
+@@ -2452,4 +2451,5 @@ void ath12k_vendor_wlan_intf_stats(struc
+ void ath12k_debug_print_dcs_wlan_intf_stats(struct ath12k_base *ab,
+ 					    struct wmi_dcs_wlan_interference_stats *info);
+ struct ath12k_hw_group *ath12k_core_get_ag(void);
++void ath12k_core_trigger_partner_device_crash(struct ath12k_base *ab);
+ #endif /* _CORE_H_ */
+--- a/drivers/net/wireless/ath/ath12k/coredump.c
++++ b/drivers/net/wireless/ath/ath12k/coredump.c
+@@ -396,8 +396,7 @@ void ath12k_coredump_download_rddm(struc
+ 		}
+ 
+ 		if (mem_type == FW_CRASH_DUMP_CALDB_DATA &&
+-			!(ath12k_cold_boot_cal &&
+-			ab->hw_params->cold_boot_calib))
++		    !(ath12k_cold_boot_cal && ab->hw_params->cold_boot_calib))
+ 			continue;
+ 
+ 		if (!ab->qmi.target_mem[i].paddr) {
+@@ -410,7 +409,7 @@ void ath12k_coredump_download_rddm(struc
+ 		seg_info->vaddr = ab->qmi.target_mem[i].v.ioaddr;
+ 		seg_info->type = mem_type;
+ 		ath12k_info(ab,
+-		    "seg vaddr is %px len is 0x%x type %d\n",
++			    "seg vaddr is %px len is 0x%x type %d\n",
+ 			    seg_info->vaddr,
+ 			    seg_info->len,
+ 			    seg_info->type);
+@@ -430,7 +429,8 @@ void ath12k_coredump_download_rddm(struc
+ 
+ 	num_seg = num_seg - skip_count;
+ 
+-	if (!ab->fw_recovery_support || ab->in_panic) {
++	if (!ab->fw_recovery_support || ab->in_panic ||
++	    test_bit(ATH12K_GROUP_FLAG_UNREGISTER, &ag->flags)) {
+ 		if (ag->mlo_capable) {
+ 			dump_count = atomic_read(&ath12k_coredump_ram_info.num_chip);
+ 			if (dump_count >= ATH12K_MAX_SOCS) {
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -6301,13 +6301,15 @@ static void ath12k_debug_multipd_wmi_pde
+ void ath12k_send_fw_hang_cmd(struct ath12k_base *ab,
+                             unsigned int value)
+ {
+-	struct ath12k *ar;
+-	struct ath12k_pdev *pdev;
+ 	struct ath12k_hw_group *ag = ab->ag;
+ 	enum wmi_fw_hang_recovery_mode_type recovery_mode;
+-	int ret, radio_idx, radioup = 0;
++	int ret;
+ 	int i;
+ 
++	if (ath12k_hw_group_recovery_in_progress(ag)) {
++		ath12k_err(ab, "Recovery is in progress, try again once it's done\n");
++		return;
++	}
+ 
+ 	switch (value) {
+ 	case ATH12K_FW_RECOVERY_ENABLE_MODE2:
+@@ -6338,34 +6340,25 @@ void ath12k_send_fw_hang_cmd(struct ath1
+ 			mutex_unlock(&ab->core_lock);
+ 
+ 			/*
+-			 * TODO: Set MODE0 or MODE 1, if recovery mode addr is valid.
+ 			 * TODO: Instead of checking recovery mode addr from
+ 			 * TLV, need to check WMI caps once the support is
+ 			 * added from FW.
+ 			 */
+ 			if (ab->recovery_mode_address) {
+-				for (radio_idx = 0; radio_idx < ab->num_radios; radio_idx++) {
+ 
+-					pdev = &ab->pdevs[radio_idx];
+-					ar = pdev->ar;
+-					if (ar && ar->ah->state == ATH12K_HW_STATE_ON) {
+-						radioup = 1;
+-						break;
+-					}
+-				}
+-
+-				if (radioup) {
+-					if (ath12k_check_erp_power_down(ag) &&
+-					    ab->pm_suspend)
+-						continue;
+-
+-					ath12k_debug_multipd_wmi_pdev_set_param(ab, ab->fw_recovery_support);
+-					ret = ath12k_wmi_force_fw_hang_cmd(ar,
+-									   recovery_mode,
+-									   ATH12K_WMI_FW_HANG_DELAY, false);
+-					ath12k_info(ab, "setting FW assert mode [%d] ret [%d]\n", recovery_mode, ret);
+-				} else
++				if (ath12k_check_erp_power_down(ag) &&
++				    ab->pm_suspend)
+ 					continue;
++
++				ath12k_debug_multipd_wmi_pdev_set_param(ab, value);
++
++				ret =
++				ath12k_wmi_force_fw_hang_cmd(ab->pdevs[0].ar,
++							     recovery_mode,
++							     ATH12K_WMI_FW_HANG_DELAY,
++							     false);
++				ath12k_info(ab, "setting FW assert mode [%d] ret [%d]\n",
++					    recovery_mode, ret);
+ 			}
+ 		}
+ 	}
+--- a/drivers/net/wireless/ath/ath12k/mhi.c
++++ b/drivers/net/wireless/ath/ath12k/mhi.c
+@@ -142,10 +142,11 @@ static void ath12k_mhi_op_status_cb(stru
+ 				    enum mhi_callback cb)
+ {
+ 	struct ath12k_base *ab = dev_get_drvdata(mhi_cntrl->cntrl_dev);
++	struct ath12k_hw_group *ag = ab->ag;
+ 	struct ath12k_pci *ab_pci = ath12k_pci_priv(ab);
+ 
+-	ath12k_dbg(ab, ATH12K_DBG_BOOT, "mhi notify status reason %s\n",
+-		   ath12k_mhi_op_callback_to_str(cb));
++	ath12k_info(ab, "mhi notify status reason %s\n",
++		    ath12k_mhi_op_callback_to_str(cb));
+ 
+ 	switch (cb) {
+ 	case MHI_CB_SYS_ERROR:
+@@ -165,12 +166,12 @@ static void ath12k_mhi_op_status_cb(stru
+ 			complete(&ab->rddm_reset_done);
+ 			return;
+ 		}
++		set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+ 
+-		if (!(test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))) {
++		if (!test_bit(ATH12K_GROUP_FLAG_UNREGISTER, &ag->flags)) {
+ 			ath12k_info(ab, "Schedule SSR Recovery reset work queue\n");
+ 			set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+ 			set_bit(ATH12K_GROUP_FLAG_RECOVERY, &ab->ag->flags);
+-			set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
+ 			queue_work(ab->workqueue_aux, &ab->reset_work);
+ 			ath12k_hal_dump_srng_stats(ab);
+ 		}

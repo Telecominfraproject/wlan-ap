@@ -1,0 +1,975 @@
+From 24585a9f891a493c83eabab34a487f473d79348a Mon Sep 17 00:00:00 2001
+From: Harish Rachakonda <rachakon@qti.qualcomm.com>
+Date: Tue, 24 Sep 2024 17:27:14 +0530
+Subject: [PATCH] UPSTREAM:CP ath12k: Dynamic chain mask switch during thermal throttling
+
+Currently thermal throttling supports 4 level and 5 level
+based on the service bit sent by FW.
+
+1) A new parameter tx_chainmask, has been introduced in the thermal throttling
+   algorithm to reduce the tx_chainmask based on user configuration.
+2) New WMI service bits have been added by FW for 5-level thermal throttling,
+   tx_chainmask and for IPA and XFRM RDPs.
+3) The low water mark and high water mark changed based on the RDP type (IPA and XFRM).
+4) tx_chainmask, tmplwm, tmphwm, dcoffpercent, pout_reduction_25db can be
+   configure dynamically.
+
+To configure:
+echo "<level> <tmplwm> <tmphwm> <dcoffpercent> <pout_reduction_25db> <tx_chain_mask> <duty_cycle" > /sys/kernel/debug/ath12k/<hw>/macX/set_tt_configs
+
+where:
+ 1) level will be 0 to 4 if FW populates service bit for 5 level else 0
+    to 3.
+ 2) tx_chain_mask will be 1/3/7/15 if hw supports 4X4 or 1/3.
+ 3) pout_reduction_25db will be between 0 and 25.
+ 4) If the temperature drops below tmplwm, the algorithm will revert to the previous level. 
+ 5) If the temperature exceeds tmphwm, the algorithm will move to a higher level.
+ 6) dcoffpercent will be between 0 and 100.
+ 7) duty_cycle will be between 10 and 100.
+
+Patch-dependency:
+000-f-Revert-wifi-ath12k-wmi-remove-unused-thermal-command.patch
+502-ath12k-add-thermal-support.patch
+896-wifi-ath12k-Add-thermal-throttling-levels.patch
+901-wifi-ath12k-wifi-Support-for-throttling-5-levels-with-pout-reduction.patch
+patch-work: None
+
+Signed-off-by: Harish Rachakonda <rachakon@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h    |   2 +
+ drivers/net/wireless/ath/ath12k/debugfs.c |  58 ++++-
+ drivers/net/wireless/ath/ath12k/mac.c     |   5 +
+ drivers/net/wireless/ath/ath12k/thermal.c | 245 +++++++++++++++++-----
+ drivers/net/wireless/ath/ath12k/thermal.h |  72 +++++--
+ drivers/net/wireless/ath/ath12k/wmi.c     | 143 ++++++++++---
+ drivers/net/wireless/ath/ath12k/wmi.h     |  12 +-
+ 7 files changed, 432 insertions(+), 105 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -822,6 +822,10 @@ struct ath12k {
+ 	/* valid during scan; needed for mgmt rx during scan */
+ 	struct ieee80211_channel *scan_channel;
+ 
++	struct tt_level_config tt_level_configs[ENHANCED_THERMAL_LEVELS];
++	struct wmi_therm_throt_level_stats_info tt_level_stats[ENHANCED_THERMAL_LEVELS];
++	struct wmi_therm_throt_stats_event tt_current_state;
++
+ 	u8 cfg_tx_chainmask;
+ 	u8 cfg_rx_chainmask;
+ 	u8 num_rx_chains;
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -394,6 +394,178 @@ static const struct file_operations fops
+ 	.open = simple_open
+ };
+ 
++static ssize_t ath12k_debug_get_tt_stats_configs(struct file *file,
++						 char __user *user_buf,
++						 size_t count, loff_t *ppos)
++{
++	struct ath12k *ar = file->private_data;
++	int retval, i = 0;
++	size_t len = 0;
++	char *buf;
++	const int size = 1024;
++
++	buf = kzalloc(size, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	wiphy_lock(ath12k_ar_to_hw(ar)->wiphy);
++
++	if (ar->ah->state != ATH12K_HW_STATE_ON) {
++		retval = -ENETDOWN;
++		wiphy_unlock(ath12k_ar_to_hw(ar)->wiphy);
++		return retval;
++	}
++
++	len += scnprintf(buf + len, size - len,
++			 "Thermal levels are %d with pout enabled : %d and tx chainmask enabled : %d\n",
++			 (test_bit(WMI_SERVICE_THERM_THROT_5_LEVELS, ar->ab->wmi_ab.svc_map) ? ENHANCED_THERMAL_LEVELS : THERMAL_LEVELS),
++			 (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION, ar->ab->wmi_ab.svc_map) ? 1 : 0),
++			 (test_bit(WMI_SERVICE_THERM_THROT_TX_CHAIN_MASK, ar->ab->wmi_ab.svc_map) ? 1 : 0));
++
++	len += scnprintf(buf + len, size - len, "Thermal config\n");
++	for (i = 0; i < ar->tt_current_state.therm_throt_levels; i++) {
++		len += scnprintf(buf + len, size - len,
++				 "level:%d low threshold: %d, high threshold: %d, dcoffpercent: %d,",
++				 i, ar->tt_level_configs[i].tmplwm,
++				 ar->tt_level_configs[i].tmphwm,
++				 ar->tt_level_configs[i].dcoffpercent);
++
++		if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION, ar->ab->wmi_ab.svc_map))
++			len += scnprintf(buf + len, size - len, " rpout[0.25db]: %d",
++					 ar->tt_level_configs[i].pout_reduction_db);
++
++		if (test_bit(WMI_SERVICE_THERM_THROT_TX_CHAIN_MASK, ar->ab->wmi_ab.svc_map))
++			len += scnprintf(buf + len, size - len, " tx_chainmask: %d",
++					 ar->tt_level_configs[i].tx_chain_mask);
++		len += scnprintf(buf + len, size - len, " dc: %d\n",
++				 ar->tt_level_configs[i].duty_cycle);
++	}
++
++	len += scnprintf(buf + len, size - len, "Thermal stats\n");
++
++	len += scnprintf(buf + len, size - len, "Current temperature: %d, Current level: %d\n",
++			 ar->tt_current_state.temp,
++			 ar->tt_current_state.level);
++
++	for (i = 0; i < ar->tt_current_state.therm_throt_levels; i++) {
++		len += scnprintf(buf + len, size - len,
++				 "level: %d, entry count: %d, duty cycle spent: %d\n",
++				 i, ar->tt_level_stats[i].level_count,
++				 ar->tt_level_stats[i].dc_count);
++	}
++	wiphy_unlock(ath12k_ar_to_hw(ar)->wiphy);
++
++	retval = simple_read_from_buffer(user_buf, count, ppos, buf, len);
++	kfree(buf);
++
++	return retval;
++}
++
++static ssize_t ath12k_debug_write_tt_configs(struct file *file,
++					     const char __user *user_buf,
++					     size_t count, loff_t *ppos)
++{
++	struct ath12k *ar = file->private_data;
++	unsigned int tx_chainmask, level, tmphwm, dcoffpercent, pout_reduction_db, duty_cycle;
++	int tmplwm, ret;
++	char buf[128] = {0};
++
++	ret = simple_write_to_buffer(buf, sizeof(buf) - 1, ppos,
++				     user_buf, count);
++
++	if (ret <= 0)
++		goto out;
++
++	ret = sscanf(buf, "%d %d %d %d %d %d %d",
++		     &level, &tmplwm, &tmphwm, &dcoffpercent,
++		     &pout_reduction_db, &tx_chainmask, &duty_cycle);
++
++	if (dcoffpercent < 0 || dcoffpercent > 100) {
++		ath12k_err(ar->ab, "dcoffpercent should be between 0 and 100");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (duty_cycle > 100 || duty_cycle < 10) {
++		ath12k_err(ar->ab, "dc should be between 10 and 100");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (test_bit(WMI_SERVICE_THERM_THROT_TX_CHAIN_MASK, ar->ab->wmi_ab.svc_map)) {
++		if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION, ar->ab->wmi_ab.svc_map)) {
++			if (ret != 7) {
++				ath12k_err(ar->ab,
++					   "7 arguments required usage: level tmplwm tmphwm dcoffpercent pout_reduction_db tx_chainmask duty_cycle");
++				ret = -EINVAL;
++				goto out;
++			}
++		} else {
++			if (ret != 6) {
++				ath12k_err(ar->ab,
++					   "6 arguments required usage: level tmplwm tmphwm dcoffpercent tx_chainmask duty_cycle");
++				ret = -EINVAL;
++				goto out;
++			}
++		}
++	} else {
++		if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION, ar->ab->wmi_ab.svc_map)) {
++			if (ret != 6) {
++				ath12k_err(ar->ab,
++					   "6 arguments required usage: level tmplwm tmphwm dcoffpercent pout_reduction_db duty_cycle");
++				ret = -EINVAL;
++				goto out;
++			}
++		} else {
++			if (ret != 5) {
++				ath12k_err(ar->ab,
++					   "5 arguments required usage: level tmplwm tmphwm dcoffpercent duty_cycle");
++				ret = -EINVAL;
++				goto out;
++			}
++		}
++	}
++
++	if (pout_reduction_db > 100) {
++		ath12k_err(ar->ab, "pout_reduction_db should be betweem 0 and 100");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (test_bit(WMI_SERVICE_THERM_THROT_5_LEVELS, ar->ab->wmi_ab.svc_map)) {
++		if (level > 4) {
++			ath12k_err(ar->ab, "level should be between 0 and 4");
++			ret = -EINVAL;
++			goto out;
++		}
++	} else {
++		if (level > 3) {
++			ath12k_err(ar->ab, "level should be between 0 and 3");
++			ret = -EINVAL;
++			goto out;
++		}
++	}
++
++	if (tx_chainmask > ar->cfg_tx_chainmask || (tx_chainmask & (tx_chainmask + 1)) != 0) {
++		ath12k_err(ar->ab, "tx_chainmask shoulb be 1/3/7/15");
++		ret = -EINVAL;
++		goto out;
++	}
++
++	ath12k_update_tt_configs(ar, level, tmplwm, tmphwm,
++				 dcoffpercent, pout_reduction_db, tx_chainmask, duty_cycle);
++
++	ret = count;
++out:
++	return ret;
++}
++
++static const struct file_operations tt_configs = {
++	.read = ath12k_debug_get_tt_stats_configs,
++	.write = ath12k_debug_write_tt_configs,
++	.open = simple_open,
++};
++
+ static ssize_t ath12k_debugfs_dump_device_dp_stats(struct file *file,
+ 						char __user *user_buf,
+ 						size_t count, loff_t *ppos)
+@@ -2963,6 +3135,9 @@ void ath12k_debugfs_register(struct ath1
+ 				ar->debug.debugfs_pdev, ar,
+ 				&fops_dump_mgmt_stats);
+ 
++	debugfs_create_file("set_tt_configs", 0600, ar->debug.debugfs_pdev, ar,
++			    &tt_configs);
++
+ 	ath12k_debugfs_htt_stats_register(ar);
+ 	ath12k_debugfs_fw_stats_register(ar);
+ 
+@@ -3151,6 +3326,7 @@ static const struct file_operations fops
+ 	.open = simple_open,
+ };
+ 
++
+ #ifdef CPTCFG_ATH12K_POWER_OPTIMIZATION
+ static ssize_t ath12k_debug_write_dbs_power_reduction(struct file *file,
+ 						      char __user *user_buf,
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -15478,6 +15478,7 @@ static int ath12k_mac_setup_register(str
+ 				     struct ieee80211_supported_band *bands[])
+ {
+ 	struct ath12k_pdev_cap *cap = &ar->pdev->cap;
++	int level;
+ 	int ret;
+ 
+ 	init_waitqueue_head(&ar->txmgmt_empty_waitq);
+@@ -15492,6 +15493,84 @@ static int ath12k_mac_setup_register(str
+ 	if (ret)
+ 		return ret;
+ 
++	if (test_bit(WMI_SERVICE_IS_TARGET_IPA, ar->ab->wmi_ab.svc_map)) {
++		if (ar->ab->hw_params->hw_rev == ATH12K_HW_IPQ5424_HW10) {
++			for (level = 0; level < ENHANCED_THERMAL_LEVELS; level++) {
++				ar->tt_level_configs[level].tmplwm =
++					tt_level_configs[ATH12K_IPA_IPQ5424_THERMAL_LEVEL][level].tmplwm;
++				ar->tt_level_configs[level].tmphwm =
++					tt_level_configs[ATH12K_IPA_IPQ5424_THERMAL_LEVEL][level].tmphwm;
++				ar->tt_level_configs[level].dcoffpercent =
++					tt_level_configs[ATH12K_IPA_IPQ5424_THERMAL_LEVEL][level].dcoffpercent;
++				ar->tt_level_configs[level].priority = 0;
++				ar->tt_level_configs[level].duty_cycle =
++					ATH12K_THERMAL_DEFAULT_DUTY_CYCLE;
++
++				if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION,
++					     ar->ab->wmi_ab.svc_map))
++					ar->tt_level_configs[level].pout_reduction_db =
++						tt_level_configs[ATH12K_IPA_IPQ5424_THERMAL_LEVEL][level].pout_reduction_db;
++			}
++		} else {
++			for (level = 0; level < ENHANCED_THERMAL_LEVELS; level++) {
++				ar->tt_level_configs[level].tmplwm =
++					tt_level_configs[ATH12K_IPA_THERMAL_LEVEL][level].tmplwm;
++				ar->tt_level_configs[level].tmphwm =
++					tt_level_configs[ATH12K_IPA_THERMAL_LEVEL][level].tmphwm;
++				ar->tt_level_configs[level].dcoffpercent =
++					tt_level_configs[ATH12K_IPA_THERMAL_LEVEL][level].dcoffpercent;
++				ar->tt_level_configs[level].priority = 0;
++				ar->tt_level_configs[level].duty_cycle =
++					ATH12K_THERMAL_DEFAULT_DUTY_CYCLE;
++
++				if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION,
++					     ar->ab->wmi_ab.svc_map))
++					ar->tt_level_configs[level].pout_reduction_db =
++						tt_level_configs[ATH12K_IPA_THERMAL_LEVEL][level].pout_reduction_db;
++			}
++		}
++	} else {
++		if (ar->ab->hw_params->hw_rev == ATH12K_HW_IPQ5424_HW10) {
++			for (level = 0; level < ENHANCED_THERMAL_LEVELS; level++) {
++				ar->tt_level_configs[level].tmplwm =
++					tt_level_configs[ATH12K_XFRM_IPQ5424_THERMAL_LEVEL][level].tmplwm;
++				ar->tt_level_configs[level].tmphwm =
++					tt_level_configs[ATH12K_XFRM_IPQ5424_THERMAL_LEVEL][level].tmphwm;
++				ar->tt_level_configs[level].dcoffpercent =
++					tt_level_configs[ATH12K_XFRM_IPQ5424_THERMAL_LEVEL][level].dcoffpercent;
++				ar->tt_level_configs[level].priority = 0;
++				ar->tt_level_configs[level].duty_cycle =
++					ATH12K_THERMAL_DEFAULT_DUTY_CYCLE;
++
++				if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION,
++					     ar->ab->wmi_ab.svc_map))
++					ar->tt_level_configs[level].pout_reduction_db =
++						tt_level_configs[ATH12K_XFRM_IPQ5424_THERMAL_LEVEL][level].pout_reduction_db;
++			}
++		} else {
++			for (level = 0; level < ENHANCED_THERMAL_LEVELS; level++) {
++				ar->tt_level_configs[level].tmplwm =
++					tt_level_configs[ATH12K_XFRM_THERMAL_LEVEL][level].tmplwm;
++				ar->tt_level_configs[level].tmphwm =
++					tt_level_configs[ATH12K_XFRM_THERMAL_LEVEL][level].tmphwm;
++				ar->tt_level_configs[level].dcoffpercent =
++					tt_level_configs[ATH12K_XFRM_THERMAL_LEVEL][level].dcoffpercent;
++				ar->tt_level_configs[level].priority = 0;
++				ar->tt_level_configs[level].duty_cycle =
++					ATH12K_THERMAL_DEFAULT_DUTY_CYCLE;
++
++				if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION,
++					     ar->ab->wmi_ab.svc_map))
++					ar->tt_level_configs[level].pout_reduction_db =
++						tt_level_configs[ATH12K_XFRM_THERMAL_LEVEL][level].pout_reduction_db;
++			}
++		}
++	}
++
++	if (test_bit(WMI_SERVICE_THERM_THROT_TX_CHAIN_MASK, ar->ab->wmi_ab.svc_map))
++		for (level = 0; level < ENHANCED_THERMAL_LEVELS; level++)
++			ar->tt_level_configs[level].tx_chain_mask = ar->cfg_tx_chainmask;
++
+ 	ath12k_mac_setup_ht_vht_cap(ar, cap, ht_cap);
+ 	ath12k_mac_setup_sband_iftype_data(ar, cap);
+ 
+--- a/drivers/net/wireless/ath/ath12k/thermal.c
++++ b/drivers/net/wireless/ath/ath12k/thermal.c
+@@ -243,63 +243,151 @@ void ath12k_ath_update_active_pdev_count
+ }
+ #endif
+ 
+-static struct tt_level_config tt_level_configs[ATH12K_THERMAL_LEVELS][ENHANCED_THERMAL_LEVELS] = {
++struct tt_level_config tt_level_configs[ATH12K_THERMAL_LEVELS][ENHANCED_THERMAL_LEVELS] = {
+ 	{
+ 		{ /* Level 0 */
+-			ATH12K_THERMAL_LVL0_TEMP_LOW_MARK,
+-			ATH12K_THERMAL_LVL0_TEMP_HIGH_MARK,
+-			ATH12K_THERMAL_LVL0_DUTY_CYCLE, 0
++			ATH12K_THERMAL_IPA_LVL0_TEMP_LOW_MARK,
++			ATH12K_THERMAL_IPA_LVL0_TEMP_HIGH_MARK,
++			ATH12K_THERMAL_LVL0_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
+ 		},
+ 		{ /* Level 1 */
+-			ATH12K_THERMAL_LVL1_TEMP_LOW_MARK,
+-			ATH12K_THERMAL_LVL1_TEMP_HIGH_MARK,
+-			ATH12K_THERMAL_LVL1_DUTY_CYCLE, 0
++			ATH12K_THERMAL_IPA_LVL1_TEMP_LOW_MARK,
++			ATH12K_THERMAL_IPA_LVL1_TEMP_HIGH_MARK,
++			ATH12K_THERMAL_LVL1_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT1
+ 		},
+ 		{ /* Level 2 */
+-			ATH12K_THERMAL_LVL2_TEMP_LOW_MARK,
+-			ATH12K_THERMAL_LVL2_TEMP_HIGH_MARK,
+-			ATH12K_THERMAL_LVL2_DUTY_CYCLE, 0
++			ATH12K_THERMAL_IPA_LVL2_TEMP_LOW_MARK,
++			ATH12K_THERMAL_IPA_LVL2_TEMP_HIGH_MARK,
++			ATH12K_THERMAL_LVL2_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT2,
+ 		},
+ 		{ /* Level 3 */
+-			ATH12K_THERMAL_LVL3_TEMP_LOW_MARK,
+-			ATH12K_THERMAL_LVL3_TEMP_HIGH_MARK,
+-			ATH12K_THERMAL_LVL3_DUTY_CYCLE, 0
++			ATH12K_THERMAL_IPA_LVL3_TEMP_LOW_MARK,
++			ATH12K_THERMAL_IPA_LVL3_TEMP_HIGH_MARK,
++			ATH12K_THERMAL_LVL3_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT3,
++		},
++		{ /* Level 4 */
++			ATH12K_THERMAL_IPA_LVL4_TEMP_LOW_MARK,
++			ATH12K_THERMAL_IPA_LVL4_TEMP_HIGH_MARK,
++			ATH12K_THERMAL_LVL4_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT4
+ 		}
+ 	},
+ 	{
+ 		{ /* Level 0 */
+-			ATH12K_THERMAL_LVL0_V2_TEMP_LOW_MARK,
+-			ATH12K_THERMAL_LVL0_V2_TEMP_HIGH_MARK,
+-			ATH12K_THERMAL_LVL0_V2_DUTY_CYCLE, 0,
++			ATH12K_THERMAL_XFRM_LVL0_TEMP_LOW_MARK,
++			ATH12K_THERMAL_XFRM_LVL0_TEMP_HIGH_MARK,
++			ATH12K_THERMAL_LVL0_DUTY_CYCLE, 0,
+ 			THERMAL_CONFIG_POUT0
+ 		},
+ 		{ /* Level 1 */
+-			ATH12K_THERMAL_LVL1_V2_TEMP_LOW_MARK,
+-			ATH12K_THERMAL_LVL1_V2_TEMP_HIGH_MARK,
+-			ATH12K_THERMAL_LVL1_V2_DUTY_CYCLE, 0,
+-			THERMAL_CONFIG_POUT1
++			ATH12K_THERMAL_XFRM_LVL1_TEMP_LOW_MARK,
++			ATH12K_THERMAL_XFRM_LVL1_TEMP_HIGH_MARK,
++			ATH12K_THERMAL_LVL1_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
+ 		},
+ 		{ /* Level 2 */
+-			ATH12K_THERMAL_LVL2_V2_TEMP_LOW_MARK,
+-			ATH12K_THERMAL_LVL2_V2_TEMP_HIGH_MARK,
+-			ATH12K_THERMAL_LVL2_V2_DUTY_CYCLE, 0,
+-			THERMAL_CONFIG_POUT2,
++			ATH12K_THERMAL_XFRM_LVL2_TEMP_LOW_MARK,
++			ATH12K_THERMAL_XFRM_LVL2_TEMP_HIGH_MARK,
++			ATH12K_THERMAL_LVL2_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
+ 		},
+ 		{ /* Level 3 */
+-			ATH12K_THERMAL_LVL3_V2_TEMP_LOW_MARK,
+-			ATH12K_THERMAL_LVL3_V2_TEMP_HIGH_MARK,
+-			ATH12K_THERMAL_LVL3_V2_DUTY_CYCLE, 0,
+-			THERMAL_CONFIG_POUT3,
++			ATH12K_THERMAL_XFRM_LVL3_TEMP_LOW_MARK,
++			ATH12K_THERMAL_XFRM_LVL3_TEMP_HIGH_MARK,
++			ATH12K_THERMAL_LVL3_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
+ 		},
+ 		{ /* Level 4 */
+-			ATH12K_THERMAL_LVL4_V2_TEMP_LOW_MARK,
+-			ATH12K_THERMAL_LVL4_V2_TEMP_HIGH_MARK,
+-			ATH12K_THERMAL_LVL4_V2_DUTY_CYCLE, 0,
+-			THERMAL_CONFIG_POUT4
++			ATH12K_THERMAL_XFRM_LVL4_TEMP_LOW_MARK,
++			ATH12K_THERMAL_XFRM_LVL4_TEMP_HIGH_MARK,
++			ATH12K_THERMAL_LVL4_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
++		}
++	},
++	{
++		{ /* Level 0 */
++			ATH12K_THERMAL_XFRM_LVL0_TEMP_LOW_MARK_IPQ5424,
++			ATH12K_THERMAL_XFRM_LVL0_TEMP_HIGH_MARK_IPQ5424,
++			ATH12K_THERMAL_LVL0_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
++		},
++		{ /* Level 1 */
++			ATH12K_THERMAL_XFRM_LVL1_TEMP_LOW_MARK_IPQ5424,
++			ATH12K_THERMAL_XFRM_LVL1_TEMP_HIGH_MARK_IPQ5424,
++			ATH12K_THERMAL_LVL1_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
++		},
++		{ /* Level 2 */
++			ATH12K_THERMAL_XFRM_LVL2_TEMP_LOW_MARK_IPQ5424,
++			ATH12K_THERMAL_XFRM_LVL2_TEMP_HIGH_MARK_IPQ5424,
++			ATH12K_THERMAL_LVL2_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
++		},
++		{ /* Level 3 */
++			ATH12K_THERMAL_XFRM_LVL3_TEMP_LOW_MARK_IPQ5424,
++			ATH12K_THERMAL_XFRM_LVL3_TEMP_HIGH_MARK_IPQ5424,
++			ATH12K_THERMAL_LVL3_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
++		},
++		{ /* Level 4 */
++			ATH12K_THERMAL_XFRM_LVL4_TEMP_LOW_MARK_IPQ5424,
++			ATH12K_THERMAL_XFRM_LVL4_TEMP_HIGH_MARK_IPQ5424,
++			ATH12K_THERMAL_LVL4_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
++		}
++	},
++	{
++		{ /* Level 0 */
++			ATH12K_THERMAL_IPA_LVL0_TEMP_LOW_MARK_IPQ5424,
++			ATH12K_THERMAL_IPA_LVL0_TEMP_HIGH_MARK_IPQ5424,
++			ATH12K_THERMAL_LVL0_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
++		},
++		{ /* Level 1 */
++			ATH12K_THERMAL_IPA_LVL1_TEMP_LOW_MARK_IPQ5424,
++			ATH12K_THERMAL_IPA_LVL1_TEMP_HIGH_MARK_IPQ5424,
++			ATH12K_THERMAL_LVL1_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
++		},
++		{ /* Level 2 */
++			ATH12K_THERMAL_IPA_LVL2_TEMP_LOW_MARK_IPQ5424,
++			ATH12K_THERMAL_IPA_LVL2_TEMP_HIGH_MARK_IPQ5424,
++			ATH12K_THERMAL_LVL2_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
++		},
++		{ /* Level 3 */
++			ATH12K_THERMAL_IPA_LVL3_TEMP_LOW_MARK_IPQ5424,
++			ATH12K_THERMAL_IPA_LVL3_TEMP_HIGH_MARK_IPQ5424,
++			ATH12K_THERMAL_LVL3_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
++		},
++		{ /* Level 4 */
++			ATH12K_THERMAL_IPA_LVL4_TEMP_LOW_MARK_IPQ5424,
++			ATH12K_THERMAL_IPA_LVL4_TEMP_HIGH_MARK_IPQ5424,
++			ATH12K_THERMAL_LVL4_DUTY_CYCLE, 0,
++			THERMAL_CONFIG_POUT0
+ 		}
+ 	}
+ };
+ 
++void ath12k_update_tt_configs(struct ath12k *ar, int level, int tmplwm, int tmphwm,
++			      int dcoffpercent, int pout_reduction_db,
++			      int tx_chain_mask, int duty_cycle)
++{
++	ar->tt_level_configs[level].tx_chain_mask = tx_chain_mask;
++	ar->tt_level_configs[level].tmplwm = tmplwm;
++	ar->tt_level_configs[level].tmphwm = tmphwm;
++	ar->tt_level_configs[level].dcoffpercent = dcoffpercent;
++	ar->tt_level_configs[level].pout_reduction_db = pout_reduction_db;
++	ar->tt_level_configs[level].duty_cycle = duty_cycle;
++
++	ath12k_thermal_set_throttling(ar, ATH12K_THERMAL_LVL0_DUTY_CYCLE);
++}
++
+ static int
+ ath12k_thermal_get_max_throttle_state(struct thermal_cooling_device *cdev,
+ 				      unsigned long *state)
+@@ -401,19 +489,24 @@ void ath12k_thermal_event_temperature(st
+ 
+ void ath12k_thermal_event_throt_level(struct ath12k *ar, int curr_level)
+ {
+-	if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION, ar->ab->wmi_ab.svc_map) &&
++	if (test_bit(WMI_SERVICE_THERM_THROT_5_LEVELS, ar->ab->wmi_ab.svc_map) &&
+ 	    curr_level >= ENHANCED_THERMAL_LEVELS)
+ 		return;
+ 	else if (curr_level >= THERMAL_LEVELS)
+ 		return;
+ 
+ 	spin_lock_bh(&ar->data_lock);
+-	if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION, ar->ab->wmi_ab.svc_map))
+-		ar->thermal.throttle_state =
+-			tt_level_configs[ATH12K_ENHANCED_THERMAL_LEVEL][curr_level].dcoffpercent;
+-	else
++	if (test_bit(WMI_SERVICE_IS_TARGET_IPA, ar->ab->wmi_ab.svc_map)) {
+ 		ar->thermal.throttle_state =
+-			tt_level_configs[ATH12K_DEFAULT_THERMAL_LEVEL][curr_level].dcoffpercent;
++			tt_level_configs[ATH12K_IPA_THERMAL_LEVEL][curr_level].dcoffpercent;
++	} else {
++		if (ar->ab->hw_params->hw_rev == ATH12K_HW_IPQ5424_HW10)
++			ar->thermal.throttle_state =
++				tt_level_configs[ATH12K_XFRM_IPQ5424_THERMAL_LEVEL][curr_level].dcoffpercent;
++		else
++			ar->thermal.throttle_state =
++				tt_level_configs[ATH12K_XFRM_THERMAL_LEVEL][curr_level].dcoffpercent;
++	}
+ 	spin_unlock_bh(&ar->data_lock);
+ }
+ 
+@@ -445,31 +538,38 @@ int ath12k_thermal_set_throttling(struct
+ 	/* After how many duty cycles the FW sends stats to host */
+ 	param.dc_per_event = 0x2;
+ 
+-	if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION, ar->ab->wmi_ab.svc_map)) {
+-		tt_level_configs[ATH12K_ENHANCED_THERMAL_LEVEL][0].dcoffpercent = throttle_state;
+-		for (level = 0; level < ENHANCED_THERMAL_LEVELS; level++) {
+-			param.levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][level].tmplwm =
+-				tt_level_configs[ATH12K_ENHANCED_THERMAL_LEVEL][level].tmplwm;
+-			param.levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][level].tmphwm =
+-				tt_level_configs[ATH12K_ENHANCED_THERMAL_LEVEL][level].tmphwm;
+-			param.levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][level].dcoffpercent =
+-				tt_level_configs[ATH12K_ENHANCED_THERMAL_LEVEL][level].dcoffpercent;
+-			/* disable all data tx queues */
+-			param.levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][level].priority = 0;
+-			param.levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][level].pout_reduction_db =
+-				tt_level_configs[ATH12K_ENHANCED_THERMAL_LEVEL][level].pout_reduction_db;
+-		}
++	if (test_bit(WMI_SERVICE_IS_TARGET_IPA, ar->ab->wmi_ab.svc_map)) {
++		tt_level_configs[ATH12K_IPA_THERMAL_LEVEL][0].dcoffpercent =
++			throttle_state;
+ 	} else {
+-		tt_level_configs[ATH12K_DEFAULT_THERMAL_LEVEL][0].dcoffpercent = throttle_state;
+-		for (level = 0; level < THERMAL_LEVELS; level++) {
+-			param.levelconf[ATH12K_DEFAULT_THERMAL_LEVEL][level].tmplwm =
+-				tt_level_configs[ATH12K_DEFAULT_THERMAL_LEVEL][level].tmplwm;
+-			param.levelconf[ATH12K_DEFAULT_THERMAL_LEVEL][level].tmphwm =
+-				tt_level_configs[ATH12K_DEFAULT_THERMAL_LEVEL][level].tmphwm;
+-			param.levelconf[ATH12K_DEFAULT_THERMAL_LEVEL][level].dcoffpercent =
+-				tt_level_configs[ATH12K_DEFAULT_THERMAL_LEVEL][level].dcoffpercent;
+-			/* disable all data tx queues */
+-			param.levelconf[ATH12K_DEFAULT_THERMAL_LEVEL][level].priority = 0;
++		if (ar->ab->hw_params->hw_rev == ATH12K_HW_IPQ5424_HW10)
++			tt_level_configs[ATH12K_XFRM_IPQ5424_THERMAL_LEVEL][0].dcoffpercent =
++				throttle_state;
++		else
++			tt_level_configs[ATH12K_XFRM_THERMAL_LEVEL][0].dcoffpercent =
++				throttle_state;
++	}
++
++	for (level = 0; level < ENHANCED_THERMAL_LEVELS; level++) {
++		param.levelconf[level].tmplwm =
++			ar->tt_level_configs[level].tmplwm;
++		param.levelconf[level].tmphwm =
++			ar->tt_level_configs[level].tmphwm;
++		param.levelconf[level].dcoffpercent =
++			ar->tt_level_configs[level].dcoffpercent;
++		/* disable all data tx queues */
++		param.levelconf[level].priority = 0;
++		param.levelconf[level].duty_cycle = ar->tt_level_configs[level].duty_cycle;
++
++		if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION,
++			     ar->ab->wmi_ab.svc_map))
++			param.levelconf[level].pout_reduction_db =
++				ar->tt_level_configs[level].pout_reduction_db;
++
++		if (test_bit(WMI_SERVICE_THERM_THROT_TX_CHAIN_MASK,
++			     ar->ab->wmi_ab.svc_map)) {
++			param.levelconf[level].tx_chain_mask =
++				ar->tt_level_configs[level].tx_chain_mask;
+ 		}
+ 	}
+ 
+--- a/drivers/net/wireless/ath/ath12k/thermal.h
++++ b/drivers/net/wireless/ath/ath12k/thermal.h
+@@ -12,36 +12,55 @@
+ #define _ATH12K_THERMAL_
+ 
+ /* Below temperatures are in celsius */
+-#define ATH12K_THERMAL_LVL0_TEMP_LOW_MARK -100
+-#define ATH12K_THERMAL_LVL0_TEMP_HIGH_MARK 100
+-#define ATH12K_THERMAL_LVL1_TEMP_LOW_MARK 95
+-#define ATH12K_THERMAL_LVL1_TEMP_HIGH_MARK 105
+-#define ATH12K_THERMAL_LVL2_TEMP_LOW_MARK 100
+-#define ATH12K_THERMAL_LVL2_TEMP_HIGH_MARK 110
+-#define ATH12K_THERMAL_LVL3_TEMP_LOW_MARK 105
+-#define ATH12K_THERMAL_LVL3_TEMP_HIGH_MARK 120
+-
+-#define ATH12K_THERMAL_LVL0_V2_TEMP_LOW_MARK -100
+-#define ATH12K_THERMAL_LVL0_V2_TEMP_HIGH_MARK 95
+-#define ATH12K_THERMAL_LVL1_V2_TEMP_LOW_MARK 90
+-#define ATH12K_THERMAL_LVL1_V2_TEMP_HIGH_MARK 100
+-#define ATH12K_THERMAL_LVL2_V2_TEMP_LOW_MARK 95
+-#define ATH12K_THERMAL_LVL2_V2_TEMP_HIGH_MARK 105
+-#define ATH12K_THERMAL_LVL3_V2_TEMP_LOW_MARK 100
+-#define ATH12K_THERMAL_LVL3_V2_TEMP_HIGH_MARK 110
+-#define ATH12K_THERMAL_LVL4_V2_TEMP_LOW_MARK 105
+-#define ATH12K_THERMAL_LVL4_V2_TEMP_HIGH_MARK 120
++#define ATH12K_THERMAL_IPA_LVL0_TEMP_LOW_MARK -100
++#define ATH12K_THERMAL_IPA_LVL1_TEMP_LOW_MARK 110
++#define ATH12K_THERMAL_IPA_LVL2_TEMP_LOW_MARK 115
++#define ATH12K_THERMAL_IPA_LVL3_TEMP_LOW_MARK 120
++#define ATH12K_THERMAL_IPA_LVL4_TEMP_LOW_MARK 125
++#define ATH12K_THERMAL_IPA_LVL0_TEMP_HIGH_MARK 115
++#define ATH12K_THERMAL_IPA_LVL1_TEMP_HIGH_MARK 120
++#define ATH12K_THERMAL_IPA_LVL2_TEMP_HIGH_MARK 125
++#define ATH12K_THERMAL_IPA_LVL3_TEMP_HIGH_MARK 130
++#define ATH12K_THERMAL_IPA_LVL4_TEMP_HIGH_MARK 130
++
++#define ATH12K_THERMAL_XFRM_LVL0_TEMP_LOW_MARK -100
++#define ATH12K_THERMAL_XFRM_LVL1_TEMP_LOW_MARK 100
++#define ATH12K_THERMAL_XFRM_LVL2_TEMP_LOW_MARK 105
++#define ATH12K_THERMAL_XFRM_LVL3_TEMP_LOW_MARK 110
++#define ATH12K_THERMAL_XFRM_LVL4_TEMP_LOW_MARK 115
++#define ATH12K_THERMAL_XFRM_LVL0_TEMP_HIGH_MARK 105
++#define ATH12K_THERMAL_XFRM_LVL1_TEMP_HIGH_MARK 110
++#define ATH12K_THERMAL_XFRM_LVL2_TEMP_HIGH_MARK 115
++#define ATH12K_THERMAL_XFRM_LVL3_TEMP_HIGH_MARK 120
++#define ATH12K_THERMAL_XFRM_LVL4_TEMP_HIGH_MARK 120
++
++#define ATH12K_THERMAL_XFRM_LVL0_TEMP_LOW_MARK_IPQ5424 -100
++#define ATH12K_THERMAL_XFRM_LVL1_TEMP_LOW_MARK_IPQ5424 100
++#define ATH12K_THERMAL_XFRM_LVL2_TEMP_LOW_MARK_IPQ5424 105
++#define ATH12K_THERMAL_XFRM_LVL3_TEMP_LOW_MARK_IPQ5424 110
++#define ATH12K_THERMAL_XFRM_LVL4_TEMP_LOW_MARK_IPQ5424 125
++#define ATH12K_THERMAL_XFRM_LVL0_TEMP_HIGH_MARK_IPQ5424 105
++#define ATH12K_THERMAL_XFRM_LVL1_TEMP_HIGH_MARK_IPQ5424 110
++#define ATH12K_THERMAL_XFRM_LVL2_TEMP_HIGH_MARK_IPQ5424 120
++#define ATH12K_THERMAL_XFRM_LVL3_TEMP_HIGH_MARK_IPQ5424 130
++#define ATH12K_THERMAL_XFRM_LVL4_TEMP_HIGH_MARK_IPQ5424 130
++
++#define ATH12K_THERMAL_IPA_LVL0_TEMP_LOW_MARK_IPQ5424 -100
++#define ATH12K_THERMAL_IPA_LVL1_TEMP_LOW_MARK_IPQ5424 120
++#define ATH12K_THERMAL_IPA_LVL2_TEMP_LOW_MARK_IPQ5424 125
++#define ATH12K_THERMAL_IPA_LVL3_TEMP_LOW_MARK_IPQ5424 130
++#define ATH12K_THERMAL_IPA_LVL4_TEMP_LOW_MARK_IPQ5424 135
++#define ATH12K_THERMAL_IPA_LVL0_TEMP_HIGH_MARK_IPQ5424 125
++#define ATH12K_THERMAL_IPA_LVL1_TEMP_HIGH_MARK_IPQ5424 130
++#define ATH12K_THERMAL_IPA_LVL2_TEMP_HIGH_MARK_IPQ5424 135
++#define ATH12K_THERMAL_IPA_LVL3_TEMP_HIGH_MARK_IPQ5424 140
++#define ATH12K_THERMAL_IPA_LVL4_TEMP_HIGH_MARK_IPQ5424 140
+ 
+ #define ATH12K_THERMAL_LVL0_DUTY_CYCLE 0
+-#define ATH12K_THERMAL_LVL1_DUTY_CYCLE 50
+-#define ATH12K_THERMAL_LVL2_DUTY_CYCLE 90
+-#define ATH12K_THERMAL_LVL3_DUTY_CYCLE 100
+-
+-#define ATH12K_THERMAL_LVL0_V2_DUTY_CYCLE ATH12K_THERMAL_LVL0_DUTY_CYCLE
+-#define ATH12K_THERMAL_LVL1_V2_DUTY_CYCLE ATH12K_THERMAL_LVL0_DUTY_CYCLE
+-#define ATH12K_THERMAL_LVL2_V2_DUTY_CYCLE ATH12K_THERMAL_LVL1_DUTY_CYCLE
+-#define ATH12K_THERMAL_LVL3_V2_DUTY_CYCLE ATH12K_THERMAL_LVL2_DUTY_CYCLE
+-#define ATH12K_THERMAL_LVL4_V2_DUTY_CYCLE ATH12K_THERMAL_LVL3_DUTY_CYCLE
++#define ATH12K_THERMAL_LVL1_DUTY_CYCLE 0
++#define ATH12K_THERMAL_LVL2_DUTY_CYCLE 50
++#define ATH12K_THERMAL_LVL3_DUTY_CYCLE 90
++#define ATH12K_THERMAL_LVL4_DUTY_CYCLE 100
+ 
+ #define THERMAL_CONFIG_POUT0                        0
+ #define THERMAL_CONFIG_POUT1                        12
+@@ -49,8 +68,10 @@
+ #define THERMAL_CONFIG_POUT3                        12
+ #define THERMAL_CONFIG_POUT4                        12
+ 
+-#define ATH12K_DEFAULT_THERMAL_LEVEL 0
+-#define ATH12K_ENHANCED_THERMAL_LEVEL 1
++#define ATH12K_IPA_THERMAL_LEVEL 0
++#define ATH12K_XFRM_THERMAL_LEVEL 1
++#define ATH12K_XFRM_IPQ5424_THERMAL_LEVEL 2
++#define ATH12K_IPA_IPQ5424_THERMAL_LEVEL 3
+ 
+ #define ATH12K_FW_THERMAL_THROTTLING_ENABLE  1
+ #define ATH12K_THERMAL_THROTTLE_MAX     100
+@@ -64,6 +85,8 @@
+ #define ACTIVE_PDEV_TH 2
+ #endif
+ 
++extern struct tt_level_config tt_level_configs[ATH12K_THERMAL_LEVELS][ENHANCED_THERMAL_LEVELS];
++
+ struct ath12k_thermal {
+ 	struct thermal_cooling_device *cdev;
+ 	struct completion wmi_sync;
+@@ -105,6 +128,9 @@ void ath12k_ath_update_active_pdev_count
+ int ath12k_thermal_register(struct ath12k_base *sc);
+ void ath12k_thermal_unregister(struct ath12k_base *sc);
+ int ath12k_thermal_set_throttling(struct ath12k *ar, u32 throttle_state);
++void ath12k_update_tt_configs(struct ath12k *ar, int level, int tmplwm,
++			      int tmphwm, int dcoffpercent, int pout_reduction_db,
++			      int tx_chain_mask, int duty_cycle);
+ void ath12k_thermal_event_temperature(struct ath12k *ar, int temperature);
+ void ath12k_thermal_event_throt_level(struct ath12k *ar, int curr_level);
+ int ath12k_wmi_thermal_set_throttle(struct ath12k *ar);
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -3889,10 +3889,10 @@ ath12k_wmi_send_thermal_mitigation_cmd(s
+ 	struct sk_buff *skb;
+ 	int i, ret, len;
+ 
+-	if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION, ar->ab->wmi_ab.svc_map))
+-		len = sizeof(*cmd) + TLV_HDR_SIZE + ENHANCED_THERMAL_LEVELS * sizeof(*lvl_conf);
++	if (test_bit(WMI_SERVICE_THERM_THROT_5_LEVELS, ar->ab->wmi_ab.svc_map))
++		len = sizeof(*cmd) + TLV_HDR_SIZE + (ENHANCED_THERMAL_LEVELS * sizeof(*lvl_conf));
+ 	else
+-		len = sizeof(*cmd) + TLV_HDR_SIZE + THERMAL_LEVELS * sizeof(*lvl_conf);
++		len = sizeof(*cmd) + TLV_HDR_SIZE + (THERMAL_LEVELS * sizeof(*lvl_conf));
+ 
+ 	skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, len);
+ 	if (!skb)
+@@ -3907,13 +3907,13 @@ ath12k_wmi_send_thermal_mitigation_cmd(s
+ 	cmd->enable = cpu_to_le32(arg->enable);
+ 	cmd->dc = cpu_to_le32(arg->dc);
+ 	cmd->dc_per_event = cpu_to_le32(arg->dc_per_event);
+-	if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION, ar->ab->wmi_ab.svc_map))
++	if (test_bit(WMI_SERVICE_THERM_THROT_5_LEVELS, ar->ab->wmi_ab.svc_map))
+ 		cmd->therm_throt_levels = cpu_to_le32(ENHANCED_THERMAL_LEVELS);
+ 	else
+ 		cmd->therm_throt_levels = cpu_to_le32(THERMAL_LEVELS);
+ 
+ 	tlv = (struct wmi_tlv *)(skb->data + sizeof(*cmd));
+-	if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION, ar->ab->wmi_ab.svc_map))
++	if (test_bit(WMI_SERVICE_THERM_THROT_5_LEVELS, ar->ab->wmi_ab.svc_map))
+ 		tlv->header = ath12k_wmi_tlv_hdr(WMI_TAG_ARRAY_STRUCT,
+ 						 ENHANCED_THERMAL_LEVELS * sizeof(*lvl_conf));
+ 	else
+@@ -3924,21 +3924,26 @@ ath12k_wmi_send_thermal_mitigation_cmd(s
+ 								sizeof(*cmd) +
+ 								TLV_HDR_SIZE);
+ 
+-	if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION, ar->ab->wmi_ab.svc_map)) {
++	if (test_bit(WMI_SERVICE_THERM_THROT_5_LEVELS, ar->ab->wmi_ab.svc_map)) {
+ 		for (i = 0; i < ENHANCED_THERMAL_LEVELS; i++) {
+ 			lvl_conf->tlv_header =
+ 				ath12k_wmi_tlv_cmd_hdr(WMI_TAG_THERM_THROT_LEVEL_CONFIG_INFO,
+ 						       sizeof(*lvl_conf));
+ 
+-			lvl_conf->temp_lwm =
+-				arg->levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][i].tmplwm;
+-			lvl_conf->temp_hwm =
+-				arg->levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][i].tmphwm;
+-			lvl_conf->dc_off_percent =
+-				arg->levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][i].dcoffpercent;
+-			lvl_conf->prio = arg->levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][i].priority;
+-			lvl_conf->pout_reduction_25db =
+-				arg->levelconf[ATH12K_ENHANCED_THERMAL_LEVEL][i].pout_reduction_db;
++			lvl_conf->temp_lwm = arg->levelconf[i].tmplwm;
++			lvl_conf->temp_hwm = arg->levelconf[i].tmphwm;
++			lvl_conf->dc_off_percent = arg->levelconf[i].dcoffpercent;
++			lvl_conf->prio = arg->levelconf[i].priority;
++
++			if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION,
++				     ar->ab->wmi_ab.svc_map))
++				lvl_conf->pout_reduction_25db =
++					arg->levelconf[i].pout_reduction_db;
++
++			if (test_bit(WMI_SERVICE_THERM_THROT_TX_CHAIN_MASK,
++				     ar->ab->wmi_ab.svc_map))
++				lvl_conf->tx_chain_mask = arg->levelconf[i].tx_chain_mask;
++			lvl_conf->duty_cycle = arg->levelconf[i].duty_cycle;
+ 			lvl_conf++;
+ 		}
+ 	} else {
+@@ -3947,11 +3952,20 @@ ath12k_wmi_send_thermal_mitigation_cmd(s
+ 				ath12k_wmi_tlv_cmd_hdr(WMI_TAG_THERM_THROT_LEVEL_CONFIG_INFO,
+ 						       sizeof(*lvl_conf));
+ 
+-			lvl_conf->temp_lwm = arg->levelconf[ATH12K_DEFAULT_THERMAL_LEVEL][i].tmplwm;
+-			lvl_conf->temp_hwm = arg->levelconf[ATH12K_DEFAULT_THERMAL_LEVEL][i].tmphwm;
+-			lvl_conf->dc_off_percent =
+-				arg->levelconf[ATH12K_DEFAULT_THERMAL_LEVEL][i].dcoffpercent;
+-			lvl_conf->prio = arg->levelconf[ATH12K_DEFAULT_THERMAL_LEVEL][i].priority;
++			lvl_conf->temp_lwm = arg->levelconf[i].tmplwm;
++			lvl_conf->temp_hwm = arg->levelconf[i].tmphwm;
++			lvl_conf->dc_off_percent = arg->levelconf[i].dcoffpercent;
++			lvl_conf->prio = arg->levelconf[i].priority;
++
++			if (test_bit(WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION,
++				     ar->ab->wmi_ab.svc_map))
++				lvl_conf->pout_reduction_25db =
++					arg->levelconf[i].pout_reduction_db;
++
++			if (test_bit(WMI_SERVICE_THERM_THROT_TX_CHAIN_MASK,
++				     ar->ab->wmi_ab.svc_map))
++				lvl_conf->tx_chain_mask = arg->levelconf[i].tx_chain_mask;
++			lvl_conf->duty_cycle = arg->levelconf[i].duty_cycle;
+ 			lvl_conf++;
+ 		}
+ 	}
+@@ -9952,6 +9966,47 @@ exit:
+ 	rcu_read_unlock();
+ }
+ 
++static int ath12k_wmi_stats_parser(struct ath12k_base *ab,
++				   u16 tag, u16 tag_len,
++				   const void *ptr,
++				   void *data)
++{
++	int ret = 0;
++	u16 tlv_tag, tlv_len, len;
++	const struct wmi_tlv *tlv;
++	struct wmi_therm_throt_level_stats_info *tt_stats = data;
++
++	switch (tag) {
++	case WMI_TAG_THERM_THROT_STATS_EVENT:
++		break;
++	case WMI_TAG_ARRAY_STRUCT:
++		len = tag_len;
++		tlv = (struct wmi_tlv *)ptr;
++		tlv_tag = u32_get_bits(tlv->header, WMI_TLV_TAG);
++
++		while (len > 0) {
++			len -= sizeof(*tlv);
++			tlv_len = le32_get_bits(tlv->header, WMI_TLV_LEN);
++			ptr += sizeof(*tlv);
++			struct wmi_therm_throt_level_stats_info *stats;
++
++			stats = (struct wmi_therm_throt_level_stats_info *)ptr;
++
++			memcpy(tt_stats, stats,
++			       sizeof(struct wmi_therm_throt_level_stats_info));
++			ptr += tlv_len;
++			tt_stats++;
++			len -= tlv_len;
++		}
++		break;
++	default:
++		ath12k_warn(ab, "Invalid tag received tag %d len %d\n",
++			    tag, len);
++		return -EINVAL;
++	}
++	return ret;
++}
++
+ static void ath12k_wmi_thermal_throt_stats_event(struct ath12k_base *ab,
+ 						 struct sk_buff *skb)
+ {
+@@ -9959,6 +10014,7 @@ static void ath12k_wmi_thermal_throt_sta
+ 	const void **tb;
+ 	int ret;
+ 	const struct wmi_therm_throt_stats_event *ev;
++	struct wmi_therm_throt_level_stats_info *stats;
+ 
+ 	tb = ath12k_wmi_tlv_parse_alloc(ab, skb, GFP_ATOMIC);
+ 	if (IS_ERR(tb)) {
+@@ -9984,6 +10040,12 @@ static void ath12k_wmi_thermal_throt_sta
+ 	if (!ar)
+ 		goto err;
+ 
++	stats = ar->tt_level_stats;
++	memcpy(&ar->tt_current_state, ev, sizeof(struct wmi_therm_throt_stats_event));
++	ret = ath12k_wmi_tlv_iter(ab, skb->data, skb->len,
++				  ath12k_wmi_stats_parser,
++				  stats);
++
+ 	ath12k_thermal_event_throt_level(ar, ev->level);
+ 
+ err:
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -2361,6 +2361,9 @@ enum wmi_tlv_service {
+ 	WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION = 410,
+ 	WMI_SERVICE_WDS_NULL_FRAME_SUPPORT = 421,
+ 	WMI_SERVICE_MEC_AGING_TIMER_SUPPORT = 423,
++	WMI_SERVICE_IS_TARGET_IPA = 425,
++	WMI_SERVICE_THERM_THROT_TX_CHAIN_MASK = 426,
++	WMI_SERVICE_THERM_THROT_5_LEVELS = 429,
+ 
+ 	WMI_MAX_EXT2_SERVICE,
+ };
+@@ -4315,13 +4318,17 @@ enum set_init_cc_flags {
+ 
+ #define THERMAL_LEVELS  4
+ #define ENHANCED_THERMAL_LEVELS  5
+-#define ATH12K_THERMAL_LEVELS 2
++#define ATH12K_THERMAL_LEVELS 4
++#define ATH12K_TT_CHAINMASK 3
++
+ struct tt_level_config {
+ 	u32 tmplwm;
+ 	u32 tmphwm;
+ 	u32 dcoffpercent;
+ 	u32 priority;
+ 	u32 pout_reduction_db;
++	u16 tx_chain_mask;
++	u32 duty_cycle;
+ };
+ 
+ struct wmi_therm_throt_stats_event {
+@@ -4331,12 +4338,17 @@ struct wmi_therm_throt_stats_event {
+ 	__le32 therm_throt_levels;
+ } __packed;
+ 
++struct wmi_therm_throt_level_stats_info {
++	__le32 level_count;
++	__le32 dc_count;
++};
++
+ struct ath12k_wmi_thermal_mitigation_arg {
+ 	u32 pdev_id;
+ 	u32 enable;
+ 	u32 dc;
+ 	u32 dc_per_event;
+-	struct tt_level_config levelconf[ATH12K_THERMAL_LEVELS][ENHANCED_THERMAL_LEVELS];
++	struct tt_level_config levelconf[ENHANCED_THERMAL_LEVELS];
+ };
+ 
+ struct wmi_therm_throt_config_request_cmd {
+@@ -4355,6 +4367,8 @@ struct wmi_therm_throt_level_config_info
+ 	__le32 dc_off_percent;
+ 	__le32 prio;
+ 	__le32 pout_reduction_25db;
++	__le32 tx_chain_mask;
++	__le32 duty_cycle;
+ } __packed;
+ 
+ struct ath12k_wmi_init_country_arg {

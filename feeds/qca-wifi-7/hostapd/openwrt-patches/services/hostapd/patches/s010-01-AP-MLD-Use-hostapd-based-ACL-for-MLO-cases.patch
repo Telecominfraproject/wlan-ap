@@ -1,0 +1,189 @@
+From b312ad775e80e6f0a3c8e6e108009d905672fcb5 Mon Sep 17 00:00:00 2001
+From: Chenming Huang <chenhuan@qti.qualcomm.com>
+Date: Mon, 15 Sep 2025 14:50:30 +0530
+Subject: [PATCH 1/2] AP MLD: Use hostapd-based ACL for MLO cases
+
+Currently NL80211_CMD_SET_MAC_ACL is not supported for MLO cases.
+Since this command has no upstream driver support, further extension
+might not be accepted and this command itself may be removed in the
+future, too.
+
+To support the same ACL setting from hostapd control interface, use
+hostapd-based ACL instead when comes to MLO case. In addition, verify
+both the link addresses and MLD MAC addresses of the non-AP MLD.
+
+Patch-dependency: None
+Patch-work: https://git.w1.fi/cgit/hostap/patch/?id=d48a63d4da44c8cbd85dd409a7da68d0e2a052e2
+
+Signed-off-by: Chenming Huang <chenhuan@qti.qualcomm.com>
+---
+ src/ap/ctrl_iface_ap.c | 23 +++++++++++++++++++++
+ src/ap/drv_callbacks.c | 47 +++++++++++++++++++++++++++++++++++++++++-
+ src/ap/hostapd.c       |  8 +++++++
+ src/ap/ieee802_11.c    | 18 ++++++++++++++++
+ 4 files changed, 95 insertions(+), 1 deletion(-)
+
+diff --git a/src/ap/ctrl_iface_ap.c b/src/ap/ctrl_iface_ap.c
+index b1318e8..122cd66 100644
+--- a/src/ap/ctrl_iface_ap.c
++++ b/src/ap/ctrl_iface_ap.c
+@@ -2173,6 +2173,11 @@ int hostapd_disassoc_deny_mac(struct hostapd_data *hapd)
+ 	struct vlan_description vlan_id;
+ 
+ 	for (sta = hapd->sta_list; sta; sta = sta->next) {
++#ifdef CONFIG_IEEE80211BE
++		int link_id;
++		struct mld_link_info *info;
++#endif /* CONFIG_IEEE80211BE */
++
+ 		if (hostapd_maclist_found(hapd->conf->deny_mac,
+ 					  hapd->conf->num_deny_mac, sta->addr,
+ 					  &vlan_id) &&
+@@ -2180,6 +2185,24 @@ int hostapd_disassoc_deny_mac(struct hostapd_data *hapd)
+ 		     !vlan_compare(&vlan_id, sta->vlan_desc)))
+ 			ap_sta_disconnect(hapd, sta, sta->addr,
+ 					  WLAN_REASON_UNSPECIFIED);
++#ifdef CONFIG_IEEE80211BE
++			for (link_id = 0; hapd->conf->mld_ap &&
++				link_id < MAX_NUM_MLD_LINKS &&
++				sta->mld_info.mld_sta; link_id++) {
++			    info = &sta->mld_info.links[link_id];
++			    if (!info->valid || link_id != hapd->mld_link_id)
++				    continue;
++
++			    if (hostapd_maclist_found(hapd->conf->deny_mac,
++					  hapd->conf->num_deny_mac,
++					  info->peer_addr,
++					  &vlan_id) &&
++				(!vlan_id.notempty ||
++				 !vlan_compare(&vlan_id, sta->vlan_desc)))
++				    ap_sta_disconnect(hapd, sta, sta->addr,
++						WLAN_REASON_UNSPECIFIED);
++			}
++#endif /* CONFIG_IEEE80211BE */
+ 	}
+ 
+ 	return 0;
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 0123017..bb270a5 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -321,6 +321,7 @@ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
+ 	struct hostapd_iface *iface = hapd->iface;
+ #endif /* CONFIG_OWE */
+ 	bool updated = false;
++	bool driver_acl;
+ 	struct hostapd_ubus_request req = {
+ 		.type = HOSTAPD_UBUS_ASSOC_REQ,
+ 		.addr = addr,
+@@ -455,7 +456,12 @@ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
+ 	 * ACL if the driver supports ACL offload to avoid potentially
+ 	 * conflicting ACL rules.
+ 	 */
+-	if (hapd->iface->drv_max_acl_mac_addrs == 0 &&
++	driver_acl = hapd->iface->drv_max_acl_mac_addrs > 0;
++#ifdef CONFIG_IEEE80211BE
++	if (hapd->conf->mld_ap)
++		driver_acl = false;
++#endif
++	if (!driver_acl &&
+ 	    hostapd_check_acl(hapd, addr, NULL) != HOSTAPD_ACL_ACCEPT) {
+ 		wpa_printf(MSG_INFO, "STA " MACSTR " not allowed to connect",
+ 			   MAC2STR(addr));
+@@ -463,6 +469,45 @@ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
+ 		goto fail;
+ 	}
+ 
++#ifdef CONFIG_IEEE80211BE
++	/*
++	 * The idea is that ACL is per link. For MLO associations, check
++	 * whether peer MLD MAC address is acceptable in all requested links.
++	 * For each peer link address, check the corresponding association
++	 * local link's ACL configuration whether it is acceptable.
++	 */
++	if (!driver_acl && hapd->conf->mld_ap && link_addr) {
++		int link_id;
++		struct mld_link_info *info;
++		struct hostapd_data *bss;
++
++		for (link_id = 0; link_id < MAX_NUM_MLD_LINKS; link_id++) {
++			info = &sta->mld_info.links[link_id];
++			if (!info->valid)
++				continue;
++
++			bss = hostapd_mld_get_link_bss(hapd, link_id);
++			if (bss != hapd &&
++			    hostapd_check_acl(bss, addr, NULL) !=
++			    HOSTAPD_ACL_ACCEPT) {
++				wpa_printf(MSG_INFO, "STA " MACSTR
++					   " not allowed to connect",
++					   MAC2STR(addr));
++				reason = WLAN_REASON_UNSPECIFIED;
++				goto fail;
++			}
++			if (hostapd_check_acl(bss, info->peer_addr, NULL) !=
++			    HOSTAPD_ACL_ACCEPT) {
++				wpa_printf(MSG_INFO, "link addr" MACSTR
++					   " not allowed to connect",
++					   MAC2STR(info->peer_addr));
++				reason = WLAN_REASON_UNSPECIFIED;
++				goto fail;
++			}
++		}
++	}
++#endif /* CONFIG_IEEE80211BE */
++
+ 	if (hostapd_ubus_handle_event(hapd, &req)) {
+ 		wpa_printf(MSG_DEBUG, "Station " MACSTR " assoc rejected by ubus handler.\n",
+ 			   MAC2STR(req.addr));
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 824e286..48ff830 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -2295,6 +2295,14 @@ int hostapd_set_acl(struct hostapd_data *hapd)
+ 	if (hapd->iface->drv_max_acl_mac_addrs == 0)
+ 		return 0;
+ 
++#ifdef CONFIG_IEEE80211BE
++	if (hapd->conf->mld_ap) {
++		wpa_printf(MSG_DEBUG,
++			   "Kernel doesn't support offloaded ACL for AP MLD. Use hostapd based ACL instead.");
++		return 0;
++	}
++#endif /* CONFIG_IEEE80211BE */
++
+ 	if (conf->macaddr_acl == DENY_UNLESS_ACCEPTED) {
+ 		accept_acl = 1;
+ 		err = hostapd_set_acl_list(hapd, conf->accept_mac,
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 21fee3f..a265b8d 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -3388,6 +3388,24 @@ static void handle_auth(struct hostapd_data *hapd,
+ 	if (res == HOSTAPD_ACL_PENDING)
+ 		return;
+ 
++#ifdef CONFIG_IEEE80211BE
++	if (mld_sta) {
++		res = ieee802_11_allowed_address(hapd, mgmt->sa,
++						 (const u8 *) mgmt, len,
++						 &rad_info);
++		if (res == HOSTAPD_ACL_REJECT) {
++			wpa_msg(hapd->msg_ctx, MSG_DEBUG,
++				"Ignore Authentication frame from " MACSTR
++				" due to ACL reject", MAC2STR(mgmt->sa));
++			resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
++			goto fail;
++		}
++		if (res == HOSTAPD_ACL_PENDING)
++			return;
++	}
++#endif /* CONFIG_IEEE80211BE */
++
++
+ #ifdef CONFIG_SAE
+ 	if (auth_alg == WLAN_AUTH_SAE && !from_queue &&
+ 	    (auth_transaction == 1 ||
+-- 
+2.34.1
+

@@ -1,0 +1,390 @@
+From 6fd4c461ffc2ab6486cbce0116b9413954bd19ec Mon Sep 17 00:00:00 2001
+From: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+Date: Thu, 5 Jun 2025 23:34:55 +0530
+Subject: [PATCH 07/10] UPSTREAM:PROTOCOL: hostapd: Add 6 GHz base regulatory
+ APIs
+
+Add new APIs to hostapd for 6 GHz base regulatory support.
+  (1) Export the API 'hostapd_get_chan_width_from_oper_chan_width'
+      to get the channel width from the operating channel width.
+  (2) Add an API to get the best 6 GHz power mode for the iface.
+  (3) Add an API to get the best 6 GHz power mode for the given
+      freq, BW, puncture pattern.
+  (4) Add APIs to validate if the given freq and BW can form an
+      IEEE supported bonded channel.
+  (5) Add an API to get the bonded channel's center frequency.
+  (6) Use bonded channel's center frequency for getting the EIRP
+      power for filling in the TPE IEs for each BW.
+
+Fixes: None
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+n00-001-hostapd-add-support-for-6GHz-operation.patch
+r32-001-hostapd-Add-support-to-receive-AFC-power-update-comp.patch
+r72-a-UPSTREAM-PROTOCOL-hostapd-6-GHz-power-mode-channels-.patch
+r72-d-UPSTREAM-PROTOCOL-hostapd-Clean-up-and-refactor-6-GH.patch
+r72-e-UPSTREAM-PROTOCOL-hostapd-Support-for-SP-and-Punctur.patch
+r72-f-UPSTREAM-PROTOCOL-hostapd-Add-6-GHz-regulatory-struc.patch
+
+Signed-off-by: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+---
+ src/ap/hostapd.c    | 202 ++++++++++++++++++++++++++++++++++++++++++++
+ src/ap/hostapd.h    |  51 +++++++++++
+ src/ap/ieee802_11.c |  42 ++-------
+ 3 files changed, 262 insertions(+), 33 deletions(-)
+
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 834689c3700a..70db6963cf75 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -6790,6 +6790,208 @@ s16 hostapd_get_eirp_pwr(struct hostapd_iface *iface, u16 freq, u16 center_freq,
+ }
+ 
+ 
++enum chan_width
++hostapd_get_chan_width_from_oper_chan_width(struct hostapd_config *iconf)
++{
++	enum chan_width ch_width = CHAN_WIDTH_UNKNOWN;
++
++	switch (hostapd_get_oper_chwidth(iconf)) {
++	case CONF_OPER_CHWIDTH_USE_HT:
++		if (iconf->secondary_channel == 0)
++			ch_width = CHAN_WIDTH_20;
++		else
++			ch_width = CHAN_WIDTH_40;
++		break;
++	case CONF_OPER_CHWIDTH_80MHZ:
++		ch_width = CHAN_WIDTH_80;
++		break;
++	case CONF_OPER_CHWIDTH_80P80MHZ:
++	case CONF_OPER_CHWIDTH_160MHZ:
++		ch_width = CHAN_WIDTH_160;
++		break;
++	case CONF_OPER_CHWIDTH_320MHZ:
++		ch_width = CHAN_WIDTH_320;
++		break;
++	default:
++		return CHAN_WIDTH_20;
++	}
++
++	return ch_width;
++}
++
++
++u8
++hostapd_get_best_ap_6ghz_power_mode_for_iface(struct hostapd_iface *iface)
++{
++	enum chan_width ch_width = hostapd_get_chan_width_from_oper_chan_width(iface->conf);
++	u8 center_chan_no = hostapd_get_oper_centr_freq_seg0_idx(iface->conf);
++	u16 center_freq = ieee80211_chan_to_freq(NULL, iface->conf->op_class,
++						 center_chan_no);
++
++	return hostapd_get_best_ap_6ghz_power_mode(iface, iface->freq,
++						   center_freq, channel_width_to_int(ch_width),
++						   iface->conf->punct_bitmap);
++}
++
++
++/**
++ * hostapd_is_bonded_chan_freq() - Validate freq and BW for channel bonding
++ * @freq: Primary frequency in MHz
++ * @bonded_chan_entry: Bonded channel entry
++ * @bw: Bandwidth in MHz
++ * @center_freq_320_mhz: Center frequency for 320 MHz
++ *
++ * Return: True if the input freq, BW can form a bonded channel, false otherwise
++ */
++static bool
++hostapd_is_bonded_chan_freq(u16 freq,
++			    const struct bonded_channel_freq *bonded_chan_entry,
++			    u16 bw, u16 center_freq_320_mhz)
++{
++	if (bw == 320 && center_freq_320_mhz) {
++		u16 band_center;
++
++		/*
++		 * For the 5GHz 320/240 MHz channel, bonded pair ends are not
++		 * symmetric around the center of the channel. Use the start
++		 * frequency of the bonded channel to calculate the center
++		 */
++		if (is_5ghz_freq(freq))
++			band_center = bonded_chan_entry->start_freq - 10 + bw / 2;
++		else
++			band_center = (bonded_chan_entry->start_freq +
++					bonded_chan_entry->end_freq) >> 1;
++
++		if (band_center != center_freq_320_mhz)
++			return false;
++	}
++
++	if (freq >= bonded_chan_entry->start_freq &&
++	    freq <= bonded_chan_entry->end_freq)
++		return true;
++
++	return false;
++}
++
++/**
++ * hostapd_get_bonded_chan_entry() - Get the bonded channel entry
++ *
++ * This API returns the bonded channel entry for the given frequency and
++ * bandwidth. For 320 MHz, if center_freq_320_mhz is 0, the function will return
++ * the first bonded channel entry that matches the frequency and bandwidth.
++ *
++ * @freq: Frequency in MHz
++ * @bw: Bandwidth in MHz
++ * @center_freq_320_mhz: Center frequency for 320 MHz
++ *
++ * Return: Pointer to the bonded channel entry or NULL if not found.
++ */
++static const struct bonded_channel_freq *
++hostapd_get_bonded_chan_entry(u16 freq, u16 bw, u16 center_freq_320_mhz)
++{
++	const struct bonded_channel_freq *bonded_chan_arr;
++	u16 array_size, i, num_bws;
++
++	num_bws = ARRAY_SIZE(bw_bonded_array_pair_map);
++	for (i = 0; i < num_bws; i++) {
++		if (bw == bw_bonded_array_pair_map[i].bw) {
++			bonded_chan_arr =
++				bw_bonded_array_pair_map[i].bonded_chan_arr;
++			array_size = bw_bonded_array_pair_map[i].array_size;
++			break;
++		}
++	}
++
++	if (i == num_bws)
++		return NULL;
++
++	for (i = 0; i < array_size; i++) {
++		if (hostapd_is_bonded_chan_freq(freq, &bonded_chan_arr[i],
++						bw, center_freq_320_mhz))
++			return &bonded_chan_arr[i];
++	}
++
++	return NULL;
++}
++
++
++u16
++hostapd_get_bonded_chan_center_freq(u16 freq, u16 bw, u16 center_freq_320_mhz,
++				    s8 sec_chan_offset)
++{
++	const struct bonded_channel_freq *bonded_chan_ptr;
++
++	if (bw == 20)
++		return freq;
++
++	if (bw == 40 && (freq >= 2412 && freq <= 2472)) {
++		if (sec_chan_offset > 0)
++			return freq + 10;
++
++		if (sec_chan_offset < 0)
++			return freq - 10;
++
++		wpa_printf(MSG_DEBUG, "Invalid secondary channel offset %d",
++			   sec_chan_offset);
++		return 0;
++	}
++
++	bonded_chan_ptr = hostapd_get_bonded_chan_entry(freq, bw, center_freq_320_mhz);
++	if (!bonded_chan_ptr) {
++		wpa_printf(MSG_ERROR,
++			   "Invalid bonded channel freq: %d, bw: %d, center freq: %d",
++			   freq, bw, center_freq_320_mhz);
++		return 0;
++	}
++
++	return (bonded_chan_ptr->start_freq + bonded_chan_ptr->end_freq) / 2;
++}
++
++
++u8
++hostapd_get_best_ap_6ghz_power_mode(struct hostapd_iface *iface,
++				    u16 freq, u16 center_freq, u16 bw,
++				    u16 in_punc_pattern)
++{
++	static const enum nl80211_regulatory_power_modes p_mode_order[] = {
++		NL80211_REG_AP_LPI,
++		NL80211_REG_AP_VLP,
++		NL80211_REG_AP_SP,
++	};
++	int i;
++	u8 best_ap_pwr_mode = NL80211_REG_NUM_POWER_MODES;
++	s16 max_eirp_pwr = CHAN_MIN_TX_POWER;
++
++	if (bw > 20 && !hostapd_get_bonded_chan_entry(freq, bw, center_freq)) {
++		wpa_printf(MSG_ERROR,
++			   "BPM: Invalid bonded channel freq %d, bw %d, center_freq %d",
++			   freq, bw, center_freq);
++		return best_ap_pwr_mode;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(p_mode_order); i++) {
++		s16 tmp_eirp_pwr = hostapd_get_eirp_pwr(iface, freq,
++							center_freq, bw,
++							in_punc_pattern,
++							p_mode_order[i],
++							false,
++							NL80211_REG_NUM_POWER_MODES,
++							false);
++
++		wpa_printf(MSG_INFO,
++			   "%s freq %d, cfreq %d, bw %d, pp %d, pwr_type %d, EIRP %d",
++			   __func__, freq, center_freq, bw, in_punc_pattern, p_mode_order[i],
++			   tmp_eirp_pwr);
++
++		if (tmp_eirp_pwr > max_eirp_pwr) {
++			max_eirp_pwr = tmp_eirp_pwr;
++			best_ap_pwr_mode = p_mode_order[i];
++		}
++	}
++
++	return best_ap_pwr_mode;
++}
++
+ u16 hostapd_get_punct_bitmap(struct hostapd_data *hapd)
+ {
+ 	u16 punct_bitmap = 0;
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 9c12966dc1e4..0c79fab90145 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -1052,6 +1052,57 @@ s16 hostapd_get_eirp_pwr(struct hostapd_iface *iface, u16 freq, u16 center_freq,
+ 			 bool is_client_lookup, u8 client_type,
+ 			 bool is_twice_pwr);
+ 
++/**
++ * hostapd_get_chan_width_from_oper_chan_width() - Get the channel width
++ * @iconf: Pointer to hostapd_config
++ *
++ * Return: Channel width enum value for the given config's operating ch width.
++ */
++enum chan_width
++hostapd_get_chan_width_from_oper_chan_width(struct hostapd_config *iconf);
++
++/**
++ * hostapd_get_best_ap_6ghz_power_mode() - Get the best 6 GHz AP power mode
++ * @iface: Pointer to hostapd_iface
++ * @freq: Frequency in MHz
++ * @center_freq: Band center frequency
++ * @bw: Bandwidth in MHz
++ * @in_punc_pattern: Puncturing pattern
++ *
++ * Return: Best AP power mode for the given channel parameters.
++ */
++u8
++hostapd_get_best_ap_6ghz_power_mode(struct hostapd_iface *iface,
++				    u16 freq, u16 center_freq,
++				    u16 bw,
++				    u16 in_punc_pattern);
++
++/**
++ * hostapd_get_best_ap_6ghz_power_mode_for_iface() - Get the best 6 GHz power mode
++ * @iface: Pointer to hostapd_iface
++ *
++ * Return: Best AP power mode for the iface's channel parameters
++ */
++u8
++hostapd_get_best_ap_6ghz_power_mode_for_iface(struct hostapd_iface *iface);
++
++/**
++ * hostapd_get_bonded_chan_center_freq() - Get the bonded channel center freq
++ *
++ * This API returns the center frequency of the bonded channel based on the
++ * frequency, bandwidth, 320 MHz BW center frequency and secondary channel offset.
++ *
++ * @freq: Frequency in MHz
++ * @bw: Bandwidth in MHz
++ * @cen320_freq: Center frequency for 320 MHz
++ * @sec_chan_offset: Secondary channel offset
++ *
++ * Return: Center frequency in MHz for the bonded channel or 0 if not found.
++ */
++u16
++hostapd_get_bonded_chan_center_freq(u16 freq, u16 bw, u16 cen320_freq,
++				    s8 sec_chan_offset);
++
+ u16 hostapd_get_punct_bitmap(struct hostapd_data *hapd);
+ bool hostapd_is_usable_punct_bitmap(struct hostapd_iface *iface);
+ void hostapd_gen_per_sta_profiles(struct hostapd_data *hapd);
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 36d72959b3ab..67b15901139d 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -8124,35 +8124,6 @@ static void free_ieee_ordered_chan_list(struct ieee_chan_data *chan_data)
+ 	os_free(chan_data->channels);
+ }
+ 
+-static enum chan_width
+-hostapd_get_chan_width_from_oper_chan_width(struct hostapd_config *iconf)
+-{
+-	enum chan_width ch_width = CHAN_WIDTH_UNKNOWN;
+-
+-	switch (hostapd_get_oper_chwidth(iconf)) {
+-	case CONF_OPER_CHWIDTH_USE_HT:
+-		if (iconf->secondary_channel == 0)
+-			ch_width = CHAN_WIDTH_20;
+-		else
+-			ch_width = CHAN_WIDTH_40;
+-		break;
+-	case CONF_OPER_CHWIDTH_80MHZ:
+-		ch_width = CHAN_WIDTH_80;
+-		break;
+-	case CONF_OPER_CHWIDTH_80P80MHZ:
+-	case CONF_OPER_CHWIDTH_160MHZ:
+-		ch_width = CHAN_WIDTH_160;
+-		break;
+-	case CONF_OPER_CHWIDTH_320MHZ:
+-		ch_width = CHAN_WIDTH_320;
+-		break;
+-	default:
+-		return CHAN_WIDTH_20;
+-	}
+-
+-	return ch_width;
+-}
+-
+ static inline bool
+ hostapd_is_additional_tpe(enum max_tx_pwr_interpretation tx_pwr_intrpn)
+ {
+@@ -8172,15 +8143,19 @@ static void hostapd_get_eirp_arr_for_6ghz(struct hostapd_iface *iface,
+ 	u16 bw, max_bw = channel_width_to_int(chanwidth);
+ 	u8 i, op_class = iface->conf->op_class;
+ 	u16 cf_320 = 0;
++	u8 pwr_type = iface->conf->he_6ghz_reg_pwr_type;
++	u16 bw_cen_freq;
+ 
+ 	if (is_320_opclass(op_class))
+ 		cf_320 = ieee80211_chan_to_freq(NULL, op_class, cen320);
+ 
+-	for (i = 0, bw = 20; bw <= max_bw; i++, bw *= 2)
+-		max_eirp_arr[i] = hostapd_get_eirp_pwr(iface, freq, cf_320, bw,
++	for (i = 0, bw = 20; bw <= max_bw; i++, bw *= 2) {
++		bw_cen_freq = hostapd_get_bonded_chan_center_freq(freq, bw, cf_320, 0);
++		max_eirp_arr[i] = hostapd_get_eirp_pwr(iface, freq, bw_cen_freq, bw,
+ 						       iface->conf->punct_bitmap,
+-						       NL80211_REG_NUM_POWER_MODES,
++						       pwr_type,
+ 						       true, client_type, true);
++	}
+ 
+ 	if (pwr_mode == HE_REG_INFO_6GHZ_AP_TYPE_INDOOR_SP &&
+ 	    !hostapd_is_additional_tpe(tx_pwr_intrpn)) {
+@@ -8191,9 +8166,10 @@ static void hostapd_get_eirp_arr_for_6ghz(struct hostapd_iface *iface,
+ 		else
+ 			client_type = NL80211_REG_SUBORDINATE_CLIENT_LPI;
+ 		for (i = 0, bw = 20; bw <= max_bw; i++, bw *= 2) {
++			bw_cen_freq = hostapd_get_bonded_chan_center_freq(freq, bw, cf_320, 0);
+ 			/* TODO: Pass Intersected PP */
+ 			max_eirp_arr_lpi[i] =
+-			    hostapd_get_eirp_pwr(iface, freq, cf_320, bw,
++			    hostapd_get_eirp_pwr(iface, freq, bw_cen_freq, bw,
+ 						 iface->conf->punct_bitmap,
+ 						 NL80211_REG_NUM_POWER_MODES,
+ 						 true, client_type, true);
+-- 
+2.34.1
+

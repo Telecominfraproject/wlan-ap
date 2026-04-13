@@ -1,0 +1,292 @@
+From a14025cb2cbcb5fc909f4e93ee9e8647976f41af Mon Sep 17 00:00:00 2001
+From: P Praneesh <ppranees@qti.qualcomm.com>
+Date: Tue, 23 Sep 2025 23:39:05 +0530
+Subject: [PATCH] UPSTREAM:DP:wifi:ath12k: refactor monitor descriptor handling
+ and align structures
+
+Refactor monitor descriptor lifecycle management to improve safety,
+clarity, and hardware alignment. Replace boolean in_use flag with an
+explicit enum to represent descriptor states such as REPLENISH,
+TO_HW, PACKET_REAP, and error conditions. This improves state
+tracking and enhances error reporting.
+
+Move list_add_tail() calls for monitor descriptors after sanity
+checks to prevent stale or corrupted entries from being added to
+used lists. Ensure descriptors are only added after validating magic
+value and in_use state.
+
+Fix unsafe access to the monitor descriptor free list by refactoring
+ath12k_wifi7_dp_mon_desc_list_add_to_free(). Avoid passing the free
+list pointer and lock separately, which previously allowed callers
+to access the list without proper locking. This could lead to race
+conditions and corrupted list pointers. Instead, pass the dp_mon
+structure and acquire the lock internally to ensure consistent and
+safe access.
+
+Update dp_mon_packet_info structure to match hardware-defined layout.
+Replace separate dma_length, msdu_continuation, and truncated fields
+with packed bitfields. Add reserved fields to maintain alignment and
+support future extensions. This ensures accurate parsing of DMA
+buffers and improves compatibility with firmware expectations.
+
+Return HAL_RX_MON_STATUS_DROP_TLV explicitly for HAL_MON_DROP TLV in
+ath12k_wifi7_hal_mon_rx_parse_status_tlv(). Previously, the code
+only set a flag and continued execution, which could lead to
+ambiguous handling. This change ensures correct status propagation
+for drop TLVs.
+
+Patch-dependency:
+0511-UPSTREAM-DP-wifi-ath12k-validate-RX-status-header-le.patch
+
+Fixes : I96784d025c9
+(Upstream: DP: Add non linear skb support for monitor mode)
+Idd214a7c81e
+("pkg upgrade Added subsys, ath11k and ath12k patches for
+  win.wlan_host_opensource.4.0")
+
+Signed-off-by: P Praneesh <ppranees@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_mon.c      | 11 +++--
+ drivers/net/wireless/ath/ath12k/dp_mon.h      | 24 ++++++---
+ .../net/wireless/ath/ath12k/wifi7/dp_mon2.c   | 49 +++++++++++--------
+ .../net/wireless/ath/ath12k/wifi7/hal_mon.c   |  2 +-
+ 4 files changed, 54 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.c b/drivers/net/wireless/ath/ath12k/dp_mon.c
+index 937644f..1afc130 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -364,9 +364,10 @@ int ath12k_dp_mon_buf_replenish(struct ath12k_dp *dp,
+ 	u8 *mon_buf;
+ 
+ 	list_for_each_entry_safe(mon_desc, tmp_mon_desc, used_list, list) {
+-		if (unlikely(!mon_desc->in_use)) {
++		if (unlikely(mon_desc->in_use != DP_MON_DESC_REPLENISH)) {
+ 			ath12k_warn(dp,
+-				    "In use is not set, possibly desc from freelist\n");
++				    "Invalid in_use %d, possibly desc from freelist\n",
++				    mon_desc->in_use);
+ 			ath12k_dp_mon_handle_mon_desc(dp, mon_desc);
+ 			continue;
+ 		}
+@@ -395,6 +396,7 @@ int ath12k_dp_mon_buf_replenish(struct ath12k_dp *dp,
+ 		mon_desc->mon_buf = mon_buf;
+ 		mon_desc->paddr = paddr;
+ 		mon_desc->magic = ATH12K_MON_MAGIC_VALUE;
++		mon_desc->in_use = DP_MON_DESC_TO_HW;
+ 		mon_desc->buf_len = 0;
+ 		mon_desc->end_of_ppdu = 0;
+ 		dp_mon->num_frag_replenish++;
+@@ -445,6 +447,7 @@ out:
+ 			}
+ 
+ 			ath12k_dp_mon_desc_reset(mon_desc);
++			mon_desc->in_use = DP_MON_DESC_H_REPLENISH_ERR;
+ 		}
+ 
+ 		spin_lock_bh(&dp_mon->mon_desc_lock);
+@@ -474,7 +477,7 @@ size_t ath12k_dp_mon_list_cut_nodes(struct list_head *list, struct list_head *he
+ 
+ 		mon_desc = list_entry(cur, struct ath12k_dp_mon_desc, list);
+ 		ath12k_dp_mon_desc_reset(mon_desc);
+-		mon_desc->in_use = true;
++		mon_desc->in_use = DP_MON_DESC_REPLENISH;
+ 
+ 		count--;
+ 		nodes++;
+@@ -1463,7 +1466,7 @@ void ath12k_dp_mon_rx_buf_free(struct ath12k_dp *dp)
+ 	}
+ 
+ 	for (i = 0; i < DP_RXDMA_MONITOR_BUF_RING_SIZE; i++) {
+-		if (!dp_mon->mon_desc_pool[i].in_use)
++		if (dp_mon->mon_desc_pool[i].in_use != DP_MON_DESC_TO_HW)
+ 			continue;
+ 
+ 		mon_buf = dp_mon->mon_desc_pool[i].mon_buf;
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.h b/drivers/net/wireless/ath/ath12k/dp_mon.h
+index 5f20a88..cc9dca8 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.h
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.h
+@@ -198,9 +198,12 @@ struct dp_mon_frame_min_one {
+ 
+ struct dp_mon_packet_info {
+ 	u64 cookie;
+-	u16 dma_length;
+-	bool msdu_continuation;
+-	bool truncated;
++	u32 dma_length:12,
++	    rsvd1:4,
++	    msdu_continuation:1,
++	    truncated:1,
++	    rsvd2:14;
++	u32 rsvd3;
+ };
+ 
+ struct dp_mon_mpdu {
+@@ -331,14 +334,23 @@ struct ath12k_pdev_mon_dp {
+ 	struct workqueue_struct *rxmon_wq;
+ };
+ 
++enum ath12k_dp_mon_desc_in_use {
++	DP_MON_DESC_REPLENISH = 1,
++	DP_MON_DESC_STATUS_REAP,
++	DP_MON_DESC_PACKET_REAP,
++	DP_MON_DESC_H_PROC_ERR,
++	DP_MON_DESC_TO_HW,
++	DP_MON_DESC_H_REPLENISH_ERR,
++};
++
+ struct ath12k_dp_mon_desc {
+ 	struct list_head list;
+ 	u8 *mon_buf;
+ 	dma_addr_t paddr;
+ 	u32 magic;
+-	u16 buf_len:14,
+-	    in_use:1,
+-	    end_of_ppdu:1;
++	u16 buf_len;
++	u8 in_use;
++	u8 end_of_ppdu;
+ };
+ 
+ static inline enum dp_monitor_type
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+index 4316c4e..e0e1d42 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+@@ -109,7 +109,6 @@ ath12k_wifi7_dp_mon_rx_parse_status_buf(struct ath12k_pdev_dp *dp_pdev,
+ 
+ 	mon_buf = mon_desc->mon_buf;
+ 	mon_desc->mon_buf = NULL;
+-	list_add_tail(&mon_desc->list, &mon_desc_used_list);
+ 	if (unlikely(mon_desc->magic != ATH12K_MON_MAGIC_VALUE)) {
+ 		ath12k_warn(dp, "pkt buf: invalid magic value in mac_id %d\n",
+ 			    dp_pdev->mac_id);
+@@ -117,14 +116,17 @@ ath12k_wifi7_dp_mon_rx_parse_status_buf(struct ath12k_pdev_dp *dp_pdev,
+ 		goto buf_replenish;
+ 	}
+ 
+-	if (unlikely(!mon_desc->in_use)) {
+-		ath12k_warn(dp, "pkt buf: in_use flag not set, mac_id %d\n",
++	if (unlikely(mon_desc->in_use != DP_MON_DESC_TO_HW)) {
++		ath12k_warn(dp,
++			    "pkt buf: invalid in_use=[%d] flag, mac_id %d\n",
++			    mon_desc->in_use,
+ 			    dp_pdev->mac_id);
+ 		ret = -EINVAL;
+ 		goto buf_replenish;
+ 	}
+ 
+-	mon_desc->in_use = false;
++	list_add_tail(&mon_desc->list, &mon_desc_used_list);
++	mon_desc->in_use = DP_MON_DESC_PACKET_REAP;
+ 
+ 	ath12k_core_dma_unmap_page(dp->dev, mon_desc->paddr, ATH12K_DP_MON_RX_BUF_SIZE,
+ 				   DMA_FROM_DEVICE);
+@@ -432,10 +434,11 @@ ath12k_wifi7_dp_mon_free_pkt_buf(struct ath12k_pdev_dp *pdev_dp,
+ 			list_add_tail(&pkt_desc->list, &mon_desc_used_list);
+ 			num_buf++;
+ 
+-			if (unlikely(!pkt_desc->in_use)) {
+-				ath12k_warn(dp, "mon_flush: in_use flag not set, macid %d\n",
++			if (unlikely(pkt_desc->in_use != DP_MON_DESC_TO_HW)) {
++				ath12k_warn(dp,
++					    "mon_flush: invalid in_use=[%d] flag, macid %d\n",
++					    pkt_desc->in_use,
+ 					    pdev_dp->mac_id);
+-				pkt_desc->in_use = true;
+ 				goto next_tlv;
+ 			}
+ 
+@@ -445,7 +448,7 @@ ath12k_wifi7_dp_mon_free_pkt_buf(struct ath12k_pdev_dp *pdev_dp,
+ 			mon_stats->pkt_tlv_free++;
+ 			page_frag_free(pkt_desc->mon_buf);
+ 			pkt_desc->mon_buf = NULL;
+-			pkt_desc->in_use = false;
++			pkt_desc->in_use = DP_MON_DESC_H_PROC_ERR;
+ 		}
+ 
+ next_tlv:
+@@ -1158,12 +1161,11 @@ static void ath12k_wifi7_dp_mon_rx_h_empty_desc(struct ath12k_pdev_dp *pdev_dp)
+ 
+ static void
+ ath12k_wifi7_dp_mon_desc_list_add_to_free(struct list_head *local_list,
+-					  struct list_head *free_list,
+-					  spinlock_t *lock)
++					  struct ath12k_dp_mon *dp_mon)
+ {
+-	spin_lock_bh(lock);
+-	list_splice_tail_init(local_list, free_list);
+-	spin_unlock_bh(lock);
++	spin_lock_bh(&dp_mon->mon_desc_lock);
++	list_splice_tail_init(local_list, &dp_mon->mon_desc_free_list);
++	spin_unlock_bh(&dp_mon->mon_desc_lock);
+ }
+ 
+ static void
+@@ -1182,9 +1184,7 @@ ath12k_wifi7_dp_mon_flush_used_list(struct ath12k_pdev_dp *dp_pdev,
+ 		ath12k_wifi7_dp_mon_h_flush_tlv(dp_pdev, &desc);
+ 	}
+ 
+-	ath12k_wifi7_dp_mon_desc_list_add_to_free(mon_desc_used_list,
+-						  &dp_mon->mon_desc_free_list,
+-						  &dp_mon->mon_desc_lock);
++	ath12k_wifi7_dp_mon_desc_list_add_to_free(mon_desc_used_list, dp_mon);
+ }
+ 
+ static struct ath12k_dp_mon_ppdu_desc *
+@@ -1249,9 +1249,8 @@ static int ath12k_wifi7_dp_mon_rx_add_ppdu_desc(struct list_head *mon_desc_used_
+ 
+ 	queue_work(dp_mon_pdev->rxmon_wq, &dp_mon_pdev->rxmon_work);
+ 
+-	ath12k_wifi7_dp_mon_desc_list_add_to_free(mon_desc_used_list,
+-						  &dp_mon->mon_desc_free_list,
+-						  &dp_mon->mon_desc_lock);
++	ath12k_wifi7_dp_mon_desc_list_add_to_free(mon_desc_used_list, dp_mon);
++
+ 	return 0;
+ }
+ 
+@@ -1506,7 +1505,6 @@ int ath12k_dp_mon_rx_dual_ring_process(struct ath12k_pdev_dp *pdev_dp, int mac_i
+ 			goto move_next;
+ 		}
+ 
+-		list_add_tail(&mon_desc->list, mon_desc_used_list);
+ 		mon_stats->status_buf_reaped++;
+ 		if (unlikely(mon_desc->magic != ATH12K_MON_MAGIC_VALUE)) {
+ 			ath12k_warn(dp, "mon_dest: invalid magic value in mac_id %d\n",
+@@ -1514,8 +1512,17 @@ int ath12k_dp_mon_rx_dual_ring_process(struct ath12k_pdev_dp *pdev_dp, int mac_i
+ 			goto move_next;
+ 		}
+ 
++		if (unlikely(mon_desc->in_use != DP_MON_DESC_TO_HW)) {
++			ath12k_warn(dp,
++				    "mon_dest: invalid in_use=[%d] flag, mac_id %d\n",
++				    mon_desc->in_use,
++				    pdev_dp->mac_id);
++			goto move_next;
++		}
++
++		list_add_tail(&mon_desc->list, mon_desc_used_list);
+ 		mon_buf = mon_desc->mon_buf;
+-		mon_desc->in_use = false;
++		mon_desc->in_use = DP_MON_DESC_STATUS_REAP;
+ 		if (unlikely(!mon_buf)) {
+ 			ath12k_warn(dp, "mon_dest: NULL mon_buf received in mac_id %d\n",
+ 				    pdev_dp->mac_id);
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hal_mon.c b/drivers/net/wireless/ath/ath12k/wifi7/hal_mon.c
+index 1c81f53..2796fc4 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_mon.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_mon.c
+@@ -2117,7 +2117,7 @@ ath12k_wifi7_hal_mon_rx_parse_status_tlv(struct ath12k_hal *hal,
+ 		return HAL_RX_MON_STATUS_RX_HDR;
+ 	case HAL_MON_DROP:
+ 		ppdu_info->is_drop_tlv = true;
+-		break;
++		return HAL_RX_MON_STATUS_DROP_TLV;
+ 	case HAL_RX_PPDU_END_STATUS_DONE:
+ 	case 0:
+ 		return HAL_RX_MON_STATUS_PPDU_DONE;
+-- 
+2.34.1
+

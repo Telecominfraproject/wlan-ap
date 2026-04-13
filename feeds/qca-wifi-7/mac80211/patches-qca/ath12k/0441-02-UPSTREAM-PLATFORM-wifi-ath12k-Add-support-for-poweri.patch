@@ -1,0 +1,287 @@
+From 9a620ec36e34f66d93e6641170c8db66197147e4 Mon Sep 17 00:00:00 2001
+From: Aaradhana Sahu <aaradhana.sahu@oss.qualcomm.com>
+Date: Sat, 19 Jul 2025 15:11:58 +0530
+Subject: [PATCH 2/4] UPSTREAM:PLATFORM: wifi: ath12k: Add support for powering
+ up Q6
+
+When Q6 are powered down for inactive bands or radios, and the driver
+initiates the bring-up of one of these inactive radios, all Q6
+are first powered up. Following this, the driver executes the
+complete QMI initialization sequence for each previously inactive
+band.
+
+Patch-dependency: "UPSTREAM:CP:wifi:ath12k: ErP support"
+Patch-work: None
+
+Signed-off-by: Aaradhana Sahu <aaradhana.sahu@oss.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c | 76 ++++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/core.h |  4 ++
+ drivers/net/wireless/ath/ath12k/mac.c  | 37 ++++++++++++-
+ drivers/net/wireless/ath/ath12k/qmi.c  |  7 ++-
+ 4 files changed, 121 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+index ac172fa..32a1a6a 100644
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -938,6 +938,38 @@ void ath12k_core_to_group_ref_put(struct ath12k_base *ab)
+ 		   ag->id, ag->num_started);
+ }
+ 
++int ath12k_core_power_up(struct ath12k_hw_group *ag)
++{
++	struct ath12k_base *ab;
++	unsigned long time_left;
++	int i;
++
++	for (i = 0; i < ag->num_probed; i++) {
++		ab =  ag->ab[i];
++		ath12k_info(ab, "Q6 power up is started\n");
++		if (ab->pm_suspend) {
++			ath12k_hif_power_up(ab);
++			ab->pm_suspend = false;
++			ab->powerup_triggered = true;
++			reinit_completion(&ab->power_up);
++		}
++	}
++
++	for (i = 0; i < ag->num_probed; i++) {
++		ab =  ag->ab[i];
++		if (ab->powerup_triggered) {
++			time_left = wait_for_completion_timeout(&ab->power_up,
++								ATH12K_Q6_POWER_UP_TIMEOUT);
++			if (!time_left) {
++				ath12k_err(ab, "Q6 power up wait timed out\n");
++				return -ETIMEDOUT;
++			}
++		}
++	}
++
++	return 0;
++}
++
+ void ath12k_core_cleanup_power_down_q6(struct ath12k_hw *ah)
+ {
+ 	struct ath12k_hw_group *ag = ath12k_ah_to_ag(ah);
+@@ -1607,6 +1639,9 @@ core_pdev_create:
+ 		if (!ab)
+ 			continue;
+ 
++		if (ath12k_check_erp_power_down(ag) && !ab->powerup_triggered)
++			continue;
++
+ 		mutex_lock(&ab->core_lock);
+ 
+ 		if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE1 && !ab->recovery_start) {
+@@ -2283,6 +2318,42 @@ static void ath12k_core_post_reconfigure_recovery(struct ath12k_base *ab)
+ 	complete(&ab->driver_recovery);
+ }
+ 
++static void ath12k_core_radio_start(struct ath12k_base *ab)
++{
++	struct ath12k_hw_group *ag = ab->ag;
++	struct ath12k *ar;
++	int i, j;
++
++	mutex_lock(&ag->mutex);
++	for (i = 0; i < ag->num_devices; i++) {
++		ab = ag->ab[i];
++
++		for (j = 0; j < ab->num_radios; j++) {
++			ar = ab->pdevs[j].ar;
++
++			if (!ath12k_ftm_mode && ar) {
++				if (ar->allocated_vdev_map) {
++					continue;
++				} else {
++					if (ath12k_mac_start(ar)) {
++						ath12k_err(ar->ab, "mac radio start failed\n");
++						mutex_unlock(&ag->mutex);
++						return;
++					}
++				}
++			}
++		}
++
++		ab->powerup_triggered = false;
++		complete(&ab->power_up);
++	}
++
++	mutex_unlock(&ag->mutex);
++
++	if (test_bit(ATH12K_GROUP_FLAG_HIF_POWER_DOWN, &ag->flags))
++		clear_bit(ATH12K_GROUP_FLAG_HIF_POWER_DOWN, &ag->flags);
++}
++
+ static void ath12k_core_restart(struct work_struct *work)
+ {
+ 	struct ath12k_base *ab = container_of(work, struct ath12k_base, restart_work);
+@@ -2302,6 +2373,10 @@ static void ath12k_core_restart(struct work_struct *work)
+ 		return;
+ 	}
+ 
++	if (ath12k_core_hw_group_start_ready(ag) &&
++	    ath12k_check_erp_power_down(ag))
++		ath12k_core_radio_start(ab);
++
+ 	if (ab->is_reset) {
+ 		if (!test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags)) {
+ 			atomic_dec(&ab->reset_count);
+@@ -4390,6 +4465,7 @@ struct ath12k_base *ath12k_core_alloc(struct device *dev, size_t priv_size,
+ 	init_completion(&ab->restart_completed);
+ 	init_completion(&ab->wow.wakeup_completed);
+ 	init_completion(&ab->rddm_reset_done);
++	init_completion(&ab->power_up);
+ 
+ 	ab->dev = dev;
+ 	ab->hif.bus = bus;
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index 7e2d6ee..2699270 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -91,6 +91,7 @@
+ #define ATH12K_PHY_5GHZ_LOW "phy01"
+ #define ATH12K_PHY_5GHZ_HIGH "phy02"
+ #define ATH12K_PHY_6GHZ "phy03"
++#define ATH12K_Q6_POWER_UP_TIMEOUT	(20 * HZ)
+ 
+ #define ATH12K_MAX_TID_VALUE 8
+ #define ATH12K_FREE_MAP_ID_MASK GENMASK(31, 0)
+@@ -1742,6 +1743,8 @@ struct ath12k_base {
+ 	struct ath12k_dp_umac_reset dp_umac_reset;
+ 	bool early_cal_support;
+ 	bool pm_suspend;
++	bool powerup_triggered;
++	struct completion power_up;
+ 
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+@@ -1892,6 +1895,7 @@ struct reserved_mem *ath12k_core_get_reserved_mem_by_name(struct ath12k_base *ab
+ u8 ath12k_core_get_total_num_vdevs(struct ath12k_base *ab);
+ bool ath12k_core_is_vdev_limit_reached(struct ath12k *ar, bool is_bridge_vdev);
+ void ath12k_core_cleanup_power_down_q6(struct ath12k_hw *ah);
++int ath12k_core_power_up(struct ath12k_hw_group *ag);
+ 
+ int ath12k_core_add_dl_qos(struct ath12k_base *ab,
+ 			   struct ath12k_qos_params *params, u8 id);
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index db08888..5159912 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -7925,9 +7925,18 @@ int ath12k_mac_op_hw_scan(struct ieee80211_hw *hw,
+ 			  struct ieee80211_scan_request *hw_req)
+ {
+ 	struct ath12k *ar, *prev_ar;
+-	int i, from_index, to_index;
++	int i, from_index, to_index, ret;
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k_hw_group *ag = ath12k_ah_to_ag(ah);
+ 
+ 	lockdep_assert_wiphy(hw->wiphy);
++
++	if (ath12k_check_erp_power_down(ag)) {
++		ret = ath12k_core_power_up(ag);
++		if (ret)
++			return ret;
++	}
++
+ 	/* Since the targeted scan device could depend on the frequency
+ 	 * requested in the hw_req, select the corresponding radio
+ 	 */
+@@ -14114,6 +14123,7 @@ int ath12k_mac_op_start(struct ieee80211_hw *hw)
+ {
+ 	struct ath12k_hw *ah = ath12k_hw_to_ah(hw);
+ 	struct ath12k *ar;
++	struct ath12k_hw_group *ag = ath12k_ah_to_ag(ah);
+ 	int ret, i;
+ 
+ 	if (ath12k_ftm_mode)
+@@ -14121,6 +14131,11 @@ int ath12k_mac_op_start(struct ieee80211_hw *hw)
+ 
+ 	lockdep_assert_wiphy(hw->wiphy);
+ 
++	if (ath12k_check_erp_power_down(ag)) {
++		ret = ath12k_core_power_up(ag);
++		return ret;
++	}
++
+ 	ath12k_drain_tx(ah);
+ 
+ 	guard(mutex)(&ah->hw_mutex);
+@@ -14157,8 +14172,16 @@ int ath12k_mac_op_start(struct ieee80211_hw *hw)
+ 					   ar->pdev_idx, ret);
+ 				goto fail_start;
+ 			}
++
++			if (ath12k_check_erp_power_down(ag)) {
++				ar->ab->powerup_triggered = false;
++			}
+ 		}
+ 	}
++
++	if (ath12k_check_erp_power_down(ag))
++		clear_bit(ATH12K_GROUP_FLAG_HIF_POWER_DOWN, &ag->flags);
++
+ 	return 0;
+ 
+ fail_start:
+@@ -15747,11 +15770,20 @@ int ath12k_mac_mlo_standby_teardown(struct ath12k_hw *ah)
+ int ath12k_mac_op_add_chanctx(struct ieee80211_hw *hw,
+ 			      struct ieee80211_chanctx_conf *ctx)
+ {
++	struct ath12k_hw *ah = hw->priv;
++	struct ath12k_hw_group *ag = ath12k_ah_to_ag(ah);
+ 	struct ath12k *ar;
+ 	struct ath12k_base *ab;
++	int ret;
+ 
+ 	lockdep_assert_wiphy(hw->wiphy);
+ 
++	if (ath12k_check_erp_power_down(ag)) {
++		ret = ath12k_core_power_up(ag);
++		if (ret)
++			return ret;
++	}
++
+ 	ar = ath12k_get_ar_by_ctx(hw, ctx);
+ 	if (!ar)
+ 		return -EINVAL;
+@@ -21344,7 +21376,8 @@ static int __ath12k_mac_mlo_teardown(struct ath12k *ar, bool umac_reset)
+ 	int ret;
+ 	u8 num_link;
+ 
+-	if (test_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags))
++	if (test_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags) ||
++	    ath12k_check_erp_power_down(ab->ag))
+ 		return 0;
+ 
+ 	num_link = ath12k_get_num_partner_link(ar);
+diff --git a/drivers/net/wireless/ath/ath12k/qmi.c b/drivers/net/wireless/ath/ath12k/qmi.c
+index a58d5ea..6d795f5 100644
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -5528,6 +5528,10 @@ void ath12k_qmi_trigger_host_cap(struct ath12k_base *ab)
+ {
+ 	struct ath12k_qmi *qmi = &ab->qmi;
+ 
++	if (ath12k_check_erp_power_down(ab->ag) &&
++	    !ab->powerup_triggered)
++		return;
++
+ 	spin_lock(&qmi->event_lock);
+ 
+ 	if (ath12k_qmi_get_event_block(qmi)) {
+@@ -6499,7 +6503,8 @@ static void ath12k_qmi_driver_event_work(struct work_struct *work)
+ 			break;
+ 		case ATH12K_QMI_EVENT_FW_READY:
+ 			clear_bit(ATH12K_FLAG_QMI_FAIL, &ab->dev_flags);
+-			if (test_bit(ATH12K_FLAG_QMI_FW_READY_COMPLETE, &ab->dev_flags)) {
++			if (test_bit(ATH12K_FLAG_QMI_FW_READY_COMPLETE, &ab->dev_flags) ||
++			    ath12k_check_erp_power_down(ab->ag)) {
+ 				if (ab->is_reset)
+ 					ath12k_hal_dump_srng_stats(ab);
+ 
+-- 
+2.34.1
+

@@ -1,0 +1,205 @@
+From 57d9db25af006d9040c8d8577f253f3e2aa4dc5a Mon Sep 17 00:00:00 2001
+From: Avula Sri Charan <quic_asrichar@quicinc.com>
+Date: Tue, 18 Mar 2025 17:41:51 +0530
+Subject: UPSTREAM:PLATFORM: Enable MLO, Enable Q6 crash reason printing
+
+ Enable Fixed Mem mode for WKK, Enable MLO with Fixed MEM Mode.
+ Enable dump collection and printing ofthe crash reason in case of a FW crash
+
+Signed-off-by: Avula Sri Charan <quic_asrichar@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/Kconfig    |  2 +-
+ drivers/net/wireless/ath/ath12k/ahb.c      |  4 --
+ drivers/net/wireless/ath/ath12k/core.c     |  4 ++
+ drivers/net/wireless/ath/ath12k/coredump.c | 63 ++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/coredump.h | 21 ++++++++
+ drivers/net/wireless/ath/ath12k/qmi.c      | 51 ++++++++++++++++--
+ 6 files changed, 137 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/Kconfig
++++ b/drivers/net/wireless/ath/ath12k/Kconfig
+@@ -60,7 +60,7 @@ config ATH12K_TRACING
+ config ATH12K_COREDUMP
+ 	bool "ath12k coredump"
+ 	depends on ATH12K
+-	select BPAUTO_WANT_DEV_COREDUMP
++	select WANT_DEV_COREDUMP
+ 	help
+ 	  Enable ath12k coredump collection
+ 
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -1035,7 +1035,6 @@ static int ath12k_ahb_probe(struct platf
+ 	enum ath12k_device_family device_id;
+ 	struct ath12k_ahb *ab_ahb;
+ 	struct ath12k_base *ab;
+-	u32 addr;
+ 	int ret;
+ 
+ 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+@@ -1076,13 +1075,6 @@ static int ath12k_ahb_probe(struct platf
+ 		}
+ 	}
+  
+-	/* Set fixed_mem_region to true for platforms that support fixed memory
+-	 * reservation from DT. If memory is reserved from DT for FW, ath12k driver
+-	 * need not to allocate memory.
+-	 */
+-	if (!of_property_read_u32(ab->dev->of_node, "memory-region", &addr))
+-		set_bit(ATH12K_FLAG_FIXED_MEM_REGION, &ab->dev_flags);
+-
+ 	ath12k_fw_map(ab);
+ 
+ 	ret = ath12k_ahb_resource_init(ab);
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1804,6 +1804,7 @@ static int ath12k_core_get_wsi_info(stru
+ 		ag->wsi_node[device_count] = next_wsi_dev;
+ 
+ 		tx_endpoint = of_graph_get_endpoint_by_regs(next_wsi_dev, 0, -1);
++
+ 		if (!tx_endpoint) {
+ 			of_node_put(next_wsi_dev);
+ 			return -ENODEV;
+@@ -2105,7 +2106,12 @@ void ath12k_core_hw_group_set_mlo_capabl
+ 		/* even if 1 device's firmware feature indicates MLO
+ 		 * unsupported, make MLO unsupported for the whole group
+ 		 */
+-		if (!test_bit(ATH12K_FW_FEATURE_MLO, ab->fw.fw_features)) {
++
++		 /* TODO: As AHB, HYBRID chipsets dosen't support firmware2.bin
++		  * bypassing this check for the both. Need to make this generic
++		  */
++
++		if (ab->hif.bus == ATH12K_BUS_PCI && !test_bit(ATH12K_FW_FEATURE_MLO, ab->fw.fw_features)) {
+ 			ag->mlo_capable = false;
+ 			return;
+ 		}
+@@ -2176,6 +2182,7 @@ struct ath12k_base *ath12k_core_alloc(st
+ 				      enum ath12k_bus bus)
+ {
+ 	struct ath12k_base *ab;
++	u32 addr;
+ 
+ 	ab = kzalloc(sizeof(*ab) + priv_size, GFP_KERNEL);
+ 	if (!ab)
+@@ -2213,6 +2220,9 @@ struct ath12k_base *ath12k_core_alloc(st
+ 	ab->hif.bus = bus;
+ 	ab->qmi.num_radios = U8_MAX;
+ 
++	if (!of_property_read_u32(ab->dev->of_node, "memory-region", &addr))
++		set_bit(ATH12K_FLAG_FIXED_MEM_REGION, &ab->dev_flags);
++
+ 	/* Device index used to identify the devices in a group.
+ 	 *
+ 	 * In Intra-device MLO, only one device present in a group,
+--- a/drivers/net/wireless/ath/ath12k/coredump.c
++++ b/drivers/net/wireless/ath/ath12k/coredump.c
+@@ -4,6 +4,9 @@
+  * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+  */
+ #include <linux/devcoredump.h>
++#include <linux/pci.h>
++
++#include "pci.h"
+ #include "hif.h"
+ #include "coredump.h"
+ #include "debug.h"
+@@ -48,7 +51,67 @@ void ath12k_coredump_upload(struct work_
+ 	ab->dump_data = NULL;
+ }
+ 
++static void ath12k_coredump_q6crash_reason(struct ath12k_base *ab)
++{
++        int i = 0;
++        uint64_t coredump_offset = 0;
++        struct ath12k_pci *ar_pci = (struct ath12k_pci *)ab->drv_priv;
++        struct mhi_controller *mhi_ctrl = ar_pci->mhi_ctrl;
++        struct mhi_buf *mhi_buf;
++        struct image_info *rddm_image;
++        struct ath12k_coredump_q6ramdump_header *ramdump_header;
++        struct ath12k_coredump_q6ramdump_entry *ramdump_table;
++        char *msg = NULL;
++        struct pci_dev *pci_dev = ar_pci->pdev;
++
++        rddm_image = mhi_ctrl->rddm_image;
++        mhi_buf = rddm_image->mhi_buf;
++
++        ath12k_info(ab, "CRASHED - [DID:DOMAIN:BUS:SLOT] - %x:%04u:%02u:%02u\n",
++                    pci_dev->device, pci_dev->bus->domain_nr,
++                    pci_dev->bus->number, PCI_SLOT(pci_dev->devfn));
++
++        /* Get RDDM header size */
++        ramdump_header = (struct ath12k_coredump_q6ramdump_header *)mhi_buf[0].buf;
++        ramdump_table = ramdump_header->ramdump_table;
++        coredump_offset = le32_to_cpu(ramdump_header->header_size);
++
++        /* Traverse ramdump table to get coredump offset */
++        while (i < MAX_RAMDUMP_TABLE_SIZE) {
++                if (!strncmp(ramdump_table->description, COREDUMP_DESC,
++                             sizeof(COREDUMP_DESC)) ||
++                    !strncmp(ramdump_table->description, Q6_SFR_DESC,
++                             sizeof(Q6_SFR_DESC))) {
++                        break;
++                }
++                coredump_offset += le64_to_cpu(ramdump_table->size);
++                ramdump_table++;
++                i++;
++        }
++
++        if (i == MAX_RAMDUMP_TABLE_SIZE) {
++                ath12k_warn(ab, "Cannot find '%s' entry in ramdump\n",
++                            COREDUMP_DESC);
++                return;
++        }
++
++        /* Locate coredump data from the ramdump segments */
++        for (i = 0; i < rddm_image->entries; i++) {
++                if (coredump_offset < mhi_buf[i].len) {
++                        msg = mhi_buf[i].buf + coredump_offset;
++                        break;
++                }
++
++                coredump_offset -= mhi_buf[i].len;
++        }
++
++        if (msg && msg[0])
++                ath12k_err(ab, "Fatal error received from wcss!\n%s\n",
++                            msg);
++}
++
+ void ath12k_coredump_collect(struct ath12k_base *ab)
+ {
++	ath12k_coredump_q6crash_reason(ab);
+ 	ath12k_hif_coredump_download(ab);
+ }
+--- a/drivers/net/wireless/ath/ath12k/coredump.h
++++ b/drivers/net/wireless/ath/ath12k/coredump.h
+@@ -57,6 +57,27 @@ struct ath12k_dump_file_data {
+ 	u8 data[];
+ } __packed;
+ 
++#define MAX_RAMDUMP_TABLE_SIZE  6
++#define COREDUMP_DESC           "Q6-COREDUMP"
++#define Q6_SFR_DESC             "Q6-SFR"
++
++#define DESC_STRING_SIZE 20
++#define FILE_NAME_STRING_SIZE 20
++
++struct ath12k_coredump_q6ramdump_entry {
++        __le64 base_address;
++        __le64 actual_phys_address;
++        __le64 size;
++        char description[DESC_STRING_SIZE];
++        char file_name[FILE_NAME_STRING_SIZE];
++};
++
++struct ath12k_coredump_q6ramdump_header {
++        __le32 version;
++        __le32 header_size;
++        struct ath12k_coredump_q6ramdump_entry ramdump_table[MAX_RAMDUMP_TABLE_SIZE];
++};
++
+ #ifdef CPTCFG_ATH12K_COREDUMP
+ enum ath12k_fw_crash_dump_type ath12k_coredump_get_dump_type
+ 						(enum ath12k_qmi_target_mem type);

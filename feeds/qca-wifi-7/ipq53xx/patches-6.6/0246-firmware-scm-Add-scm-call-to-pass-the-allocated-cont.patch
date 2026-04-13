@@ -1,0 +1,172 @@
+From 095ed7b4578e06f4a29515ac05563850f5a4aff1 Mon Sep 17 00:00:00 2001
+From: Poovendhan Selvaraj <quic_poovendh@quicinc.com>
+Date: Wed, 24 May 2023 18:07:45 +0530
+Subject: [PATCH 294/500] firmware: scm: Add scm call to pass the allocated
+ context dump buffer to TZ
+
+In the newer TZs, CPU context is saved in a static address set in TZ.
+TZ also provides SCM call to check if a given feature is available and its version.
+
+This change checks if the static context dump feature is enabled by TZ.
+If not, allocates memory for context dump and invokes SCM to pass the buffer to TZ.
+
+Change-Id: Ib3b67dafead7723c6b4ba37883d20da5e90634af
+Signed-off-by: Poovendhan Selvaraj <quic_poovendh@quicinc.com>
+---
+ drivers/firmware/qcom_scm.c            | 88 +++++++++++++++++++++++++-
+ drivers/firmware/qcom_scm.h            |  6 ++
+ include/linux/firmware/qcom/qcom_scm.h |  1 +
+ 3 files changed, 94 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/firmware/qcom_scm.c b/drivers/firmware/qcom_scm.c
+index d3112a585061..4ea18baebb42 100644
+--- a/drivers/firmware/qcom_scm.c
++++ b/drivers/firmware/qcom_scm.c
+@@ -340,6 +340,34 @@ static int qcom_scm_set_boot_addr_mc(void *entry, unsigned int flags)
+ 	return qcom_scm_call(__scm->dev, &desc, NULL);
+ }
+ 
++/**
++ * qcom_scm_regsave() - pass a buffer to TZ for saving CPU register context
++ * @buf:	Allocated buffer which is used to store the cpu context
++ * @size:       size of the buffer
++ *
++ * Return: 0 on success.
++ *
++ * Upon successful return, TZ Dump the CPU register context in the
++ * buffer on crash
++ */
++int qcom_scm_regsave(void *buf, u32 size)
++{
++	int ret;
++	struct qcom_scm_desc desc = {
++		.svc = QCOM_SCM_SVC_UTIL,
++		.cmd = QCOM_SCM_CMD_SET_REGSAVE,
++		.arginfo = QCOM_SCM_ARGS(2, QCOM_SCM_RW, QCOM_SCM_VAL),
++		.args[0] = (u64)virt_to_phys(buf),
++		.args[1] = size,
++		.owner = ARM_SMCCC_OWNER_SIP,
++	};
++	struct qcom_scm_res res;
++
++	ret = qcom_scm_call(__scm->dev, &desc, &res);
++
++	return ret ? : res.result[0];
++}
++
+ /**
+  * qcom_scm_set_warm_boot_addr() - Set the warm boot address for all cpus
+  * @entry: Entry point function for the cpus
+@@ -425,6 +453,62 @@ static int __qcom_scm_set_dload_mode(struct device *dev, bool enable)
+ 	return qcom_scm_call_atomic(__scm->dev, &desc, NULL);
+ }
+ 
++/**
++`* qcom_scm_is_feature_available() - Check if a given feature is enabled by TZ,
++ * 				     and its version if enabled.
++ * @feature_id: ID of the feature to check in TZ for availablilty/version.
++ *
++ * Return: 0 on success and the version of the feature in result.
++ *
++ * TZ returns 0xFFFFFFFF if this smc call is not supported or
++ * if smc call supported but feature ID not supported
++ */
++long  qcom_scm_is_feature_available(u32 feature_id)
++{
++	long ret;
++	struct qcom_scm_res res;
++	struct qcom_scm_desc desc = {
++		.svc = QCOM_SCM_SVC_INFO,
++		.cmd = QCOM_SCM_IS_FEATURE_AVAIL,
++		.arginfo = QCOM_SCM_ARGS(1),
++		.args[0] = feature_id,
++		.owner = ARM_SMCCC_OWNER_SIP,
++	};
++
++	ret = qcom_scm_call(__scm->dev, &desc, &res);
++
++	return ret ? : res.result[0];
++}
++EXPORT_SYMBOL_GPL(qcom_scm_is_feature_available);
++
++static void qcom_scm_set_cpu_regsave(void)
++{
++	long ret;
++	void *buf;
++
++	ret = qcom_scm_is_feature_available(QCOM_SCM_CDUMP_FEATURE_ID);
++	if (ret >= 0) {
++		dev_info(__scm->dev,
++			"Crash Dump feature ID is %lx\n", ret);
++		return;
++	}
++	dev_info(__scm->dev,
++		"TZ doesn't support the static buffer to save CPU context");
++
++	/* Fallback to old method to save CPU context register */
++	buf = (void *) __get_free_pages(GFP_KERNEL,
++			get_order(QCOM_SCM_CDUMP_PAGE_SIZE));
++	if (!buf) {
++		dev_err(__scm->dev,
++			"Failed to allocate buffer memory\n");
++		return;
++	}
++	ret = qcom_scm_regsave(buf, QCOM_SCM_CDUMP_PAGE_SIZE);
++	if (ret) {
++		dev_err(__scm->dev, "Setting CPU context save buffer failed\n");
++	}
++}
++
+ static void qcom_scm_set_download_mode(bool enable)
+ {
+ 	bool avail;
+@@ -1586,8 +1670,10 @@ static int qcom_scm_probe(struct platform_device *pdev)
+ 	 * will cause the boot stages to enter download mode, unless
+ 	 * disabled below by a clean shutdown/reboot.
+ 	 */
+-	if (download_mode)
++	if (download_mode) {
+ 		qcom_scm_set_download_mode(true);
++		qcom_scm_set_cpu_regsave();
++	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/firmware/qcom_scm.h b/drivers/firmware/qcom_scm.h
+index 99e3ab2f1986..7527da6ce5a5 100644
+--- a/drivers/firmware/qcom_scm.h
++++ b/drivers/firmware/qcom_scm.h
+@@ -97,12 +97,18 @@ extern int scm_legacy_call(struct device *dev, const struct qcom_scm_desc *desc,
+ #define QCOM_SCM_PIL_PAS_IS_SUPPORTED	0x07
+ #define QCOM_SCM_PIL_PAS_MSS_RESET	0x0a
+ 
++#define QCOM_SCM_SVC_UTIL		0x03
++#define QCOM_SCM_CMD_SET_REGSAVE	0x02
++#define QCOM_SCM_CDUMP_FEATURE_ID	0x4
++#define QCOM_SCM_CDUMP_PAGE_SIZE	0x80000
++
+ #define QCOM_SCM_SVC_IO			0x05
+ #define QCOM_SCM_IO_READ		0x01
+ #define QCOM_SCM_IO_WRITE		0x02
+ 
+ #define QCOM_SCM_SVC_INFO		0x06
+ #define QCOM_SCM_INFO_IS_CALL_AVAIL	0x01
++#define QCOM_SCM_IS_FEATURE_AVAIL	0x03
+ 
+ #define QCOM_SCM_SVC_MP				0x0c
+ #define QCOM_SCM_MP_RESTORE_SEC_CFG		0x02
+diff --git a/include/linux/firmware/qcom/qcom_scm.h b/include/linux/firmware/qcom/qcom_scm.h
+index 1d8db07c2daa..e7162be30d42 100644
+--- a/include/linux/firmware/qcom/qcom_scm.h
++++ b/include/linux/firmware/qcom/qcom_scm.h
+@@ -78,6 +78,7 @@ extern int qcom_scm_pas_init_image(u32 peripheral, const void *metadata,
+ extern void qcom_scm_pas_metadata_release(struct qcom_scm_pas_metadata *ctx);
+ extern int qcom_scm_pas_mem_setup(u32 peripheral, phys_addr_t addr,
+ 				  phys_addr_t size);
++extern long qcom_scm_is_feature_available(u32 feature_id);
+ extern int qcom_scm_pas_auth_and_reset(u32 peripheral);
+ extern int qcom_scm_pas_shutdown(u32 peripheral);
+ extern bool qcom_scm_pas_supported(u32 peripheral);
+-- 
+2.34.1
+

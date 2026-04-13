@@ -1,0 +1,417 @@
+From 578fadae454e57cf61ac1b872e3a633389a171f6 Mon Sep 17 00:00:00 2001
+From: Kiran Venkatappa <quic_kiranv@quicinc.com>
+Date: Sat, 22 Feb 2025 23:06:41 +0530
+Subject: [PATCH 07/11] wifi: ath12k: Restructure ahb code
+
+Restructure ahb.c file into common and HW family specific files.
+ahb.c has common code that can be shared across multiple family
+of devices and ahb_wifi7.c includes code corresponding to wifi7
+device family.
+Majority of code is common and hence kept in ahb.c including probe
+and init sequence. Only certain init configs is different,
+so register wifi7 specific config and callbacks to common code
+that can be used to register and init ahb driver for this device.
+
+Signed-off-by: Kiran Venkatappa <quic_kiranv@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/Makefile    |   2 +-
+ drivers/net/wireless/ath/ath12k/ahb.c       | 136 ++++++++++++--------
+ drivers/net/wireless/ath/ath12k/ahb.h       |  24 ++--
+ drivers/net/wireless/ath/ath12k/ahb_wifi7.c |  80 ++++++++++++
+ drivers/net/wireless/ath/ath12k/ahb_wifi7.h |  20 +++
+ drivers/net/wireless/ath/ath12k/core.c      |   5 +-
+ 6 files changed, 198 insertions(+), 69 deletions(-)
+ create mode 100644 drivers/net/wireless/ath/ath12k/ahb_wifi7.c
+ create mode 100644 drivers/net/wireless/ath/ath12k/ahb_wifi7.h
+
+--- a/drivers/net/wireless/ath/ath12k/Makefile
++++ b/drivers/net/wireless/ath/ath12k/Makefile
+@@ -27,7 +27,7 @@ ath12k-y += core.o \
+ 	    fw.o \
+ 	    p2p.o
+ 
+-ath12k-$(CONFIG_ATH12K_AHB) += ahb.o
++ath12k-$(CPTCFG_ATH12K_AHB) += ahb.o ahb_wifi7.o
+ ath12k-$(CPTCFG_ATH12K_DEBUGFS) += debugfs.o debugfs_htt_stats.o debugfs_sta.o
+ ath12k-$(CONFIG_ACPI) += acpi.o
+ ath12k-$(CPTCFG_ATH12K_TRACING) += trace.o
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -16,21 +16,12 @@
+ #include "debug.h"
+ #include "hif.h"
+ 
+-static const struct of_device_id ath12k_ahb_of_match[] = {
+-	{ .compatible = "qcom,ipq5332-wifi",
+-	  .data = (void *)ATH12K_HW_IPQ5332_HW10,
+-	},
+-	{ .compatible = "qcom,ipq5424-wifi",
+-	  .data = (void *)ATH12K_HW_IPQ5424_HW10,
+-	},
+-	{ }
+-};
+-
+-MODULE_DEVICE_TABLE(of, ath12k_ahb_of_match);
+-
+ #define ATH12K_IRQ_CE0_OFFSET 4
+ #define ATH12K_MAX_UPDS 1
+ #define ATH12K_UPD_IRQ_WRD_LEN  18
++
++static struct ath12k_ahb_driver *ath12k_ahb_family_drivers[ATH12K_DEVICE_FAMILY_MAX];
++static struct platform_driver ath12k_ahb_drivers[ATH12K_DEVICE_FAMILY_MAX];
+ static const char ath12k_userpd_irq[][9] = {"spawn",
+ 				     "ready",
+ 				     "stop-ack"};
+@@ -748,14 +739,6 @@ static int ath12k_ahb_map_service_to_pip
+ 	return 0;
+ }
+ 
+-static const struct ath12k_ahb_ops ahb_ops_ipq5332 = {
+-	.mdt_load = qcom_mdt_load,
+-};
+-
+-static const struct ath12k_ahb_ops ahb_ops_ipq5424 = {
+-	.mdt_load = qcom_mdt_load_no_init,
+-};
+-
+ static const struct ath12k_hif_ops ath12k_ahb_hif_ops = {
+ 	.start = ath12k_ahb_start,
+ 	.stop = ath12k_ahb_stop,
+@@ -1024,13 +1007,34 @@ static void ath12k_ahb_resource_deinit(s
+ 	ab_ahb->xo_clk = NULL;
+ }
+ 
++static enum ath12k_device_family
++ath12k_ahb_get_device_family(const struct platform_device *pdev)
++{
++	enum ath12k_device_family device_id;
++	struct ath12k_ahb_driver *driver;
++	const struct of_device_id *of_id;
++
++	for (device_id = ATH12K_DEVICE_FAMILY_WIFI7;
++	     device_id < ATH12K_DEVICE_FAMILY_MAX; device_id++) {
++		driver = ath12k_ahb_family_drivers[device_id];
++		if (driver) {
++			of_id = of_match_device(driver->id_table, &pdev->dev);
++			if (of_id) {
++				/* Found the driver */
++				return 0;
++			}
++		}
++	}
++
++	return ATH12K_DEVICE_FAMILY_MAX;
++}
++
+ static int ath12k_ahb_probe(struct platform_device *pdev)
+ {
+-	struct ath12k_base *ab;
+-	const struct ath12k_hif_ops *hif_ops;
++	enum ath12k_device_family device_id;
+ 	struct ath12k_ahb *ab_ahb;
+-	enum ath12k_hw_rev hw_rev;
+-	u32 addr, userpd_id;
++	struct ath12k_base *ab;
++	u32 addr;
+ 	int ret;
+ 
+ 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
+@@ -1044,43 +1048,33 @@ static int ath12k_ahb_probe(struct platf
+ 	if (!ab)
+ 		return -ENOMEM;
+ 
+-	hw_rev = (enum ath12k_hw_rev)of_device_get_match_data(&pdev->dev);
+-	switch (hw_rev) {
+-	case ATH12K_HW_IPQ5332_HW10:
+-		hif_ops = &ath12k_ahb_hif_ops_ipq5332;
+-		userpd_id = ATH12K_IPQ5332_USERPD_ID;
+-		break;
+-	default:
+-		return -EOPNOTSUPP;
+-	}
+-
+ 	ab_ahb = ath12k_ab_to_ahb(ab);
+ 	ab_ahb->ab = ab;
++	ab->hif.ops = &ath12k_ahb_hif_ops;
++	ab->pdev = pdev;
++	platform_set_drvdata(pdev, ab);
+ 
+-	hw_rev = ath12k_ahb_get_hw_rev(pdev);
+-	switch (hw_rev) {
+-	case ATH12K_HW_IPQ5332_HW10:
+-		hif_ops = &ath12k_ahb_hif_ops;
+-		ab_ahb->userpd_id = ATH12K_IPQ5332_USERPD_ID;
+-		ab_ahb->scm_auth_enabled = true;
+-		ab_ahb->ahb_ops = &ahb_ops_ipq5332;
+-		break;
+-	case ATH12K_HW_IPQ5424_HW10:
+-		hif_ops = &ath12k_ahb_hif_ops;
+-		ab_ahb->userpd_id = ATH12K_IPQ5332_USERPD_ID;
+-		ab_ahb->scm_auth_enabled = false;
+-		ab_ahb->ahb_ops = &ahb_ops_ipq5424;
+-		break;
+-	default:
+-		ret = -EOPNOTSUPP;
++	device_id = ath12k_ahb_get_device_family(pdev);
++	if (device_id >= ATH12K_DEVICE_FAMILY_MAX) {
++		ath12k_err(ab, "failed to get device family: %d\n", device_id);
+ 		goto err_core_free;
+ 	}
+ 
+-	ab->hif.ops = hif_ops;
+-	ab->pdev = pdev;
+-	ab->hw_rev = hw_rev;
+-	platform_set_drvdata(pdev, ab);
++	ath12k_dbg(ab, ATH12K_DBG_AHB, "AHB device family id: %d\n", device_id);
++
++	ab_ahb->device_ops = &ath12k_ahb_family_drivers[device_id]->ops;
+ 
++	/* Call device specific probe. This is the callback that can
++	 * be used to override any ops in future
++	 */
++	if (ab_ahb->device_ops->probe) {
++		ret = ab_ahb->device_ops->probe(pdev);
++		if (ret) {
++			ath12k_err(ab, "failed to probe device: %d\n", ret);
++			goto err_core_free;
++		}
++	}
++ 
+ 	/* Set fixed_mem_region to true for platforms that support fixed memory
+ 	 * reservation from DT. If memory is reserved from DT for FW, ath12k driver
+ 	 * need not to allocate memory.
+@@ -1191,21 +1185,41 @@ qmi_fail:
+ 	return 0;
+ }
+ 
+-static struct platform_driver ath12k_ahb_driver = {
+-	.driver         = {
+-		.name   = "ath12k_ahb",
+-		.of_match_table = ath12k_ahb_of_match,
+-	},
+-	.probe  = ath12k_ahb_probe,
+-	.remove = ath12k_ahb_remove,
+-};
+-
+-int ath12k_ahb_init(void)
++int ath12k_ahb_register_driver(const enum ath12k_device_family device_id,
++			       struct ath12k_ahb_driver *driver)
+ {
+-	return platform_driver_register(&ath12k_ahb_driver);
++	struct platform_driver *ahb_driver;
++
++	if (device_id >= ATH12K_DEVICE_FAMILY_MAX)
++		return -EINVAL;
++
++	if (ath12k_ahb_family_drivers[device_id]) {
++		pr_err("Driver already for id: %d\n", device_id);
++		return -EALREADY;
++	}
++
++	ath12k_ahb_family_drivers[device_id] = driver;
++
++	ahb_driver = &ath12k_ahb_drivers[device_id];
++	ahb_driver->driver.name = driver->name;
++	ahb_driver->driver.of_match_table = driver->id_table;
++	ahb_driver->probe  = ath12k_ahb_probe;
++	ahb_driver->remove = ath12k_ahb_remove;
++
++	return platform_driver_register(ahb_driver);
+ }
+ 
+-void ath12k_ahb_exit(void)
++void ath12k_ahb_unregister_driver(const enum ath12k_device_family device_id)
+ {
+-	platform_driver_unregister(&ath12k_ahb_driver);
++	struct platform_driver *ahb_driver;
++
++	if (device_id >= ATH12K_DEVICE_FAMILY_MAX)
++		return;
++
++	if (!ath12k_ahb_family_drivers[device_id])
++		return;
++
++	ahb_driver = &ath12k_ahb_drivers[device_id];
++	platform_driver_unregister(ahb_driver);
++	ath12k_ahb_family_drivers[device_id] = NULL;
+ }
+--- a/drivers/net/wireless/ath/ath12k/ahb.h
++++ b/drivers/net/wireless/ath/ath12k/ahb.h
+@@ -50,6 +50,10 @@ struct ath12k_ahb_ops {
+ 			phys_addr_t *reloc_base);
+ };
+ 
++struct ath12k_ahb_device_family_ops {
++	int (*probe)(struct platform_device *pdev);
++};
++
+ struct ath12k_ahb {
+ 	struct ath12k_base *ab;
+ 	struct rproc *tgt_rproc;
+@@ -68,6 +72,13 @@ struct ath12k_ahb {
+ 	int userpd_irq_num[ATH12K_USERPD_MAX_IRQ];
+ 	bool scm_auth_enabled;
+ 	const struct ath12k_ahb_ops *ahb_ops;
++	const struct ath12k_ahb_device_family_ops *device_ops;
++};
++
++struct ath12k_ahb_driver {
++	const char *name;
++	const struct of_device_id *id_table;
++	struct ath12k_ahb_device_family_ops ops;
+ };
+ 
+ static inline struct ath12k_ahb *ath12k_ab_to_ahb(struct ath12k_base *ab)
+@@ -75,15 +86,8 @@ static inline struct ath12k_ahb *ath12k_
+ 	return (struct ath12k_ahb *)ab->drv_priv;
+ }
+ 
+-#ifdef CONFIG_ATH12K_AHB
+-int ath12k_ahb_init(void);
+-void ath12k_ahb_exit(void);
+-#else
+-static inline int ath12k_ahb_init(void)
+-{
+-	return 0;
+-}
++int ath12k_ahb_register_driver(const enum ath12k_device_family device_id,
++			       struct ath12k_ahb_driver *driver);
++void ath12k_ahb_unregister_driver(const enum ath12k_device_family device_id);
+ 
+-static inline void ath12k_ahb_exit(void) {};
+-#endif
+ #endif
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath12k/ahb_wifi7.c
+@@ -0,0 +1,80 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * Copyright (c) 2018-2019 The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++
++#include <linux/of_device.h>
++#include <linux/platform_device.h>
++#include <linux/soc/qcom/mdt_loader.h>
++#include "ahb.h"
++#include "ahb_wifi7.h"
++#include "debug.h"
++#include "hif.h"
++
++static const struct of_device_id ath12k_ahb_of_match[] = {
++	{ .compatible = "qcom,ipq5332-wifi",
++	  .data = (void *)ATH12K_HW_IPQ5332_HW10,
++	},
++	{ .compatible = "qcom,ipq5424-wifi",
++	  .data = (void *)ATH12K_HW_IPQ5424_HW10,
++	},
++	{ }
++};
++
++MODULE_DEVICE_TABLE(of, ath12k_ahb_of_match);
++
++static const struct ath12k_ahb_ops ahb_ops_ipq5332 = {
++	.mdt_load = qcom_mdt_load,
++};
++
++static const struct ath12k_ahb_ops ahb_ops_ipq5424 = {
++	.mdt_load = qcom_mdt_load_no_init,
++};
++
++static int ath12k_wifi7_ahb_probe(struct platform_device *pdev)
++{
++	struct ath12k_ahb *ab_ahb;
++	enum ath12k_hw_rev hw_rev;
++	struct ath12k_base *ab;
++
++	ab = platform_get_drvdata(pdev);
++	ab_ahb = ath12k_ab_to_ahb(ab);
++
++	hw_rev = (enum ath12k_hw_rev)(kernel_ulong_t)of_device_get_match_data(&pdev->dev);
++	switch (hw_rev) {
++	case ATH12K_HW_IPQ5332_HW10:
++		ab_ahb->userpd_id = ATH12K_IPQ5332_USERPD_ID;
++		ab_ahb->scm_auth_enabled = true;
++		ab_ahb->ahb_ops = &ahb_ops_ipq5332;
++		break;
++	case ATH12K_HW_IPQ5424_HW10:
++		ab_ahb->userpd_id = ATH12K_IPQ5332_USERPD_ID;
++		ab_ahb->scm_auth_enabled = false;
++		ab_ahb->ahb_ops = &ahb_ops_ipq5424;
++		break;
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	ab->hw_rev = hw_rev;
++
++	return 0;
++}
++
++static struct ath12k_ahb_driver ath12k_wifi7_ahb_driver = {
++	.name = "ath12k_wifi7_ahb",
++	.id_table = ath12k_wifi7_ahb_of_match,
++	.ops.probe = ath12k_wifi7_ahb_probe,
++};
++
++int ath12k_wifi7_ahb_init(void)
++{
++	return ath12k_ahb_register_driver(ATH12K_DEVICE_FAMILY_WIFI7,
++					  &ath12k_wifi7_ahb_driver);
++}
++
++void ath12k_wifi7_ahb_exit(void)
++{
++	ath12k_ahb_unregister_driver(ATH12K_DEVICE_FAMILY_WIFI7);
++}
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath12k/ahb_wifi7.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * Copyright (c) 2018-2019 The Linux Foundation. All rights reserved.
++ * Copyright (c) 2022-2025, Qualcomm Innovation Center, Inc. All rights reserved.
++ */
++#ifndef ATH12K_AHB_WIFI7_H
++#define ATH12K_AHB_WIFI7_H
++
++#ifdef CONFIG_ATH12K_AHB
++int ath12k_wifi7_ahb_init(void);
++void ath12k_wifi7_ahb_exit(void);
++#else
++static inline int ath12k_wifi7_ahb_init(void)
++{
++	return 0;
++}
++
++static inline void ath12k_wifi7_ahb_exit(void) {}
++#endif
++#endif /* ATH12K_AHB_WIFI7_H */
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -21,6 +21,7 @@
+ #include "pci.h"
+ #include "wow.h"
+ #include "pci_wifi7.h"
++#include "ahb_wifi7.h"
+ 
+ static int ahb_err, pci_err;
+ unsigned int ath12k_debug_mask;
+@@ -2250,7 +2251,7 @@ err_sc_free:
+ 
+ static int ath12k_init(void)
+ {
+-	ahb_err = ath12k_ahb_init();
++	ahb_err = ath12k_wifi7_ahb_init();
+ 	if (ahb_err)
+ 		pr_warn("Failed to initialize ath12k AHB device: %d\n", ahb_err);
+ 
+@@ -2268,7 +2269,7 @@ static void ath12k_exit(void)
+ 		ath12k_wifi7_pci_exit();
+ 
+ 	if (!ahb_err)
+-		ath12k_ahb_exit();
++		ath12k_wifi7_ahb_exit();
+ }
+ 
+ module_init(ath12k_init)

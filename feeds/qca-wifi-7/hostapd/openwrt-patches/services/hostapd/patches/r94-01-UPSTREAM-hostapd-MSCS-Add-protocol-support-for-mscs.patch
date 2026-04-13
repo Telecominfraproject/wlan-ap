@@ -1,0 +1,461 @@
+From cf2cd9cf1a8e9ff8cd0c389ccbd727df59545551 Mon Sep 17 00:00:00 2001
+From: Ramanathan Choodamani <rchoodam@qti.qualcomm.com>
+Date: Thu, 17 Jul 2025 00:38:44 -0700
+Subject: [PATCH] UPSTREAM:hostapd:MSCS:Add protocol support for Mirrored SCS
+
+Add MLME protocol support for Mirrored SCS protocol.
+
+1. If supported, advertise MSCS in extended capabilities.
+2. Add support to receive, parse and process MSCS request action frame.
+3. Add support to send MSCS response action frame.
+
+Patch-dependency: r89-01-UPSTREAM-PROTOCOL-CP-HOSTAPD-Register-to-receive-SCS-frame.patch
+Patch-work: NA
+Tag: MSCS
+
+Signed-off-by: Ramanathan Choodamani <rchoodam@qti.qualcomm.com>
+---
+ hostapd/config_file.c        |   2 +
+ src/ap/ap_config.h           |   1 +
+ src/ap/ieee802_11_shared.c   |   2 +
+ src/ap/robust_av.c           | 226 +++++++++++++++++++++++++++++++++++
+ src/ap/robust_av.h           |  33 +++++
+ src/ap/sta_info.h            |   3 +
+ src/common/ieee802_11_defs.h |   2 +
+ src/drivers/driver.h         |   4 +
+ 8 files changed, 273 insertions(+)
+
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -5151,6 +5151,8 @@ static int hostapd_config_fill(struct ho
+ #ifdef CONFIG_IEEE80211AX
+ 	} else if (os_strcmp(buf, "enable_scs") == 0) {
+ 		bss->scs = atoi(pos);
++	} else if (os_strcmp(buf, "enable_mscs") == 0) {
++		bss->mscs = atoi(pos);
+ #endif /* CONFIG_IEEE80211AX */
+ 	} else {
+ 		wpa_printf(MSG_ERROR,
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1031,6 +1031,7 @@ struct hostapd_bss_config {
+ 
+ #ifdef CONFIG_IEEE80211AX
+ 	bool scs;
++	bool mscs;
+ #endif /* CONFIG_IEEE80211AX */
+ };
+ 
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -483,6 +483,8 @@ static void hostapd_ext_capab_byte(struc
+ 		if (mbssid_complete)
+ 			*pos |= 0x01; /* Bit 80 - Complete List of NonTxBSSID
+ 				       * Profiles */
++		if (hapd->conf->mscs)
++			*pos |= 0x20; /* Bit 85 - Mirrored SCS */
+ 		break;
+ 	case 11: /* Bits 88-95 */
+ #ifdef CONFIG_SAE_PK
+--- a/src/ap/robust_av.c
++++ b/src/ap/robust_av.c
+@@ -1135,6 +1135,256 @@ error:
+ 	return ret;
+ }
+ 
++static int hostapd_copy_and_send_mscs_data(struct hostapd_data *hapd,
++		struct sta_info *sta, u8 req_type, const u8 dialog_token)
++{
++	struct qm_req_data qm_req = {0};
++	struct qm_resp_data qm_resp = {0};
++	struct qm_req_desc_data qm_desc_data = {0};
++
++	if (!hapd->driver)
++		return HOSTAPD_QM_STATUS_E_INVAL;
++
++	os_memcpy(qm_req.peer_mac, sta->addr, ETH_ALEN);
++
++	qm_req.qm_type = HOSTAPD_QM_TYPE_MSCS;
++	qm_req.dialog_token = dialog_token;
++	qm_req.num_qm_desc = 1;
++
++	qm_desc_data.qm_id = HOSTAPD_QM_DEFAULT_QM_ID;
++	qm_desc_data.request_type = req_type;
++	qm_desc_data.user_priority_bitmap = sta->mscs_ctxt->user_priority_bitmap;
++	qm_desc_data.user_priority_limit = sta->mscs_ctxt->user_priority_limit;
++	qm_desc_data.tclas_mask = sta->mscs_ctxt->tclas_mask;
++
++	/* Support added to parse one MSCS descriptor
++	 * per MSCS request
++	 */
++	qm_req.qm_req_desc[0] = qm_desc_data;
++	wpa_printf(MSG_DEBUG,
++		   "MSCS: mscs info qm_type 0x%x dialog_token 0x%x num_desc 0x%x\n",
++		   qm_req.qm_type,
++		   qm_req.dialog_token,
++		   qm_req.num_qm_desc);
++
++	wpa_printf(MSG_DEBUG,
++		   "MSCS: mscs info params req %x bmap 0x%x limit 0x%x mask 0x%x\n",
++		   req_type, qm_desc_data.user_priority_bitmap,
++		   qm_desc_data.user_priority_limit, qm_desc_data.tclas_mask);
++
++	return hostapd_drv_set_qos(hapd, &qm_req, &qm_resp);
++}
++
++static const u8 *hostapd_parse_mscs_desc(const u8 *payload,
++		struct hostapd_mscs_desc *mscs)
++{
++	u8 elem_id, elem_id_ext, length;
++
++	if (!payload || !mscs)
++	    return NULL;
++
++	elem_id = *payload++;
++
++	if (elem_id != WLAN_EID_EXTENSION)
++		return NULL;
++
++	length = *payload++;
++
++	if (length < IEEE80211_MSCS_DESC_MIN_LEN)
++		return NULL;
++
++	elem_id_ext = *payload++;
++	if (elem_id_ext != WLAN_EID_EXT_MSCS_DESCRIPTOR) {
++		wpa_printf(MSG_ERROR,
++			   "MSCS:mscs elem %d is not available in this frame !!!\n",
++			   WLAN_EID_EXT_MSCS_DESCRIPTOR);
++		return NULL;
++	}
++
++	mscs->req_type = *payload++;
++	mscs->user_priority_control.user_priority_bitmap = *payload++;
++	mscs->user_priority_control.user_priority_limit = *payload++;
++	os_memcpy(&mscs->stream_timeout, payload, sizeof(uint32_t));
++	payload += sizeof(uint32_t);
++	mscs->tclas_mask_elem.id = *payload++;
++	mscs->tclas_mask_elem.ie_len = *payload++;
++
++	wpa_printf(MSG_DEBUG, "%s:MSCS descriptors parsed successfully\n", __func__);
++	return payload;
++
++}
++
++static const u8 *hostapd_parse_tclas_mask(const u8 *payload,
++		struct hostapd_mscs_desc *mscs)
++{
++	if (!payload || !mscs)
++		return NULL;
++
++	mscs->tclas_mask_elem.id_ext = *payload++;
++	mscs->tclas_mask_elem.classifier_type = *payload++;
++	mscs->tclas_mask_elem.classifier_mask = *payload++;
++
++	return payload;
++
++}
++
++static int hostapd_process_mscs_req(struct hostapd_data *hapd,
++		struct sta_info *sta, const u8 *payload,
++		struct hostapd_mscs_desc *mscs_desc, const u8 dialog_token)
++{
++	int ret = HOSTAPD_QM_STATUS_SUCCESS;
++	int req_type = mscs_desc->req_type;
++
++	if (req_type != QM_ADD_REQ && !sta->mscs_session_exists) {
++		wpa_printf(MSG_ERROR, "MSCS: Session is inactive\n");
++		goto decline;
++	}
++
++	if (req_type == QM_ADD_REQ && sta->mscs_session_exists) {
++		wpa_printf(MSG_ERROR, "MSCS: Session already active\n");
++		goto decline;
++	}
++
++	payload = hostapd_parse_tclas_mask(payload, mscs_desc);
++
++	if (req_type != QM_REMOVE_REQ &&
++		mscs_desc->tclas_mask_elem.id_ext != WLAN_EID_EXT_TCLAS_MASK) {
++		wpa_printf(MSG_ERROR, "MSCS: TCLAS mask absent\n");
++		goto decline;
++	}
++
++	/* Allocate MSCS context if request is ADD */
++	if (req_type == QM_ADD_REQ) {
++		sta->mscs_ctxt =
++			(struct hostapd_mscs_ctxt *)os_zalloc(
++					sizeof(struct hostapd_mscs_ctxt));
++		if (!sta->mscs_ctxt)
++		    goto decline;
++	}
++
++	switch (req_type) {
++	case QM_ADD_REQ:
++	case QM_CHANGE_REQ:
++		sta->mscs_ctxt->user_priority_bitmap =
++			mscs_desc->user_priority_control.user_priority_bitmap;
++		sta->mscs_ctxt->user_priority_limit =
++			mscs_desc->user_priority_control.user_priority_limit;
++		sta->mscs_ctxt->tclas_mask =
++			mscs_desc->tclas_mask_elem.classifier_mask;
++		ret = hostapd_copy_and_send_mscs_data(hapd, sta, req_type,
++			dialog_token);
++		/**
++		 * Set mscs session exists to true if
++		 * driver returns SUCCESS.
++		 * In case of CHANGE_REQ, the session
++		 * would be present already, so it
++		 * is okay to re-write it here.
++		 * If drv returns an ADD failure, delete the
++		 * context.
++		 */
++		if (ret == HOSTAPD_QM_STATUS_SUCCESS)
++			sta->mscs_session_exists = true;
++		else if (req_type == QM_ADD_REQ) {
++			if (!sta->mscs_ctxt)
++				goto decline;
++			os_free(sta->mscs_ctxt);
++			sta->mscs_ctxt = NULL;
++		}
++		break;
++	case QM_REMOVE_REQ:
++		if (!sta->mscs_ctxt)
++		    goto decline;
++		ret = hostapd_copy_and_send_mscs_data(hapd, sta, req_type,
++						      dialog_token);
++		sta->mscs_session_exists = false;
++		os_free(sta->mscs_ctxt);
++		sta->mscs_ctxt = NULL;
++		ret = WLAN_STATUS_TCLAS_PROCESSING_TERMINATED;
++		break;
++	default:
++		goto decline;
++	}
++	return ret;
++
++decline:
++	wpa_printf(MSG_ERROR, "MSCS: Decline Request %d", req_type);
++	return HOSTAPD_QM_STATUS_DECLINED;
++}
++
++static int hostapd_send_mscs_response(struct hostapd_data *hapd,
++		struct sta_info *sta, const u8 *da, u8 dialog_token, int status_code)
++{
++	struct wpabuf *buf;
++	size_t len;
++
++	/** exact needed size:
++	 *  Action frm header (3 bytes) +
++	 *  Status code (2 bytes) +
++	 *  MSCS descriptor
++	 **/
++	len = 5 + sizeof(struct hostapd_mscs_desc);
++	buf = wpabuf_alloc(len);
++	if (!buf) {
++		wpa_printf(MSG_ERROR, "Failed to allocate buffer for MSCS response");
++		return -1;
++	}
++
++	wpabuf_put_u8(buf, WLAN_ACTION_ROBUST_AV_STREAMING);
++	wpabuf_put_u8(buf, ROBUST_AV_MSCS_RESP);
++	wpabuf_put_u8(buf, dialog_token);
++	wpabuf_put_u8(buf, LOW_BYTE(status_code));
++	wpabuf_put_u8(buf, HIGH_BYTE(status_code));
++
++	len = wpabuf_len(buf);
++	if (hostapd_drv_send_action(hapd, hapd->iface->freq, 0, da,
++				    wpabuf_head(buf), len)) {
++		wpa_printf(MSG_ERROR, "MSCS response send action failed");
++		wpabuf_free(buf);
++		return -1;
++	}
++
++	wpa_printf(MSG_INFO, "Successfully sent MSCS response frame len %d\n",
++		   (int)len);
++	wpabuf_free(buf);
++	return 0;
++}
++
++static int hostapd_handle_mscs_req(struct hostapd_data *hapd,
++		const u8 *buf, size_t frame_length)
++{
++	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
++	struct hostapd_mscs_desc mscs = {0};
++	struct sta_info *sta;
++	const u8 *payload, *payload_start;
++	int ret = 0;
++	u8 dialog_token;
++
++	if (!hapd->conf->mscs) {
++		wpa_printf(MSG_ERROR, "MSCS feature not enabled");
++		return -1;
++	}
++
++	sta = ap_get_sta(hapd, mgmt->sa);
++	if (!sta) {
++		wpa_printf(MSG_ERROR, "%s: STA not found", __func__);
++		return -1;
++	}
++
++	dialog_token = mgmt->u.action.u.robust_av_req.dialog_token;
++	payload_start = mgmt->u.action.u.robust_av_req.variable;
++
++	wpa_hexdump(MSG_DEBUG, "MSCS Request", payload_start, frame_length);
++	wpa_printf(MSG_DEBUG, "frame_len:%zu", frame_length);
++
++	payload = hostapd_parse_mscs_desc(payload_start, &mscs);
++	if (!payload)
++		return -1;
++
++	ret = hostapd_process_mscs_req(hapd, sta, payload, &mscs, dialog_token);
++
++	return hostapd_send_mscs_response(hapd, sta, mgmt->sa, dialog_token,
++					  ret);
++}
+ 
+ static int hostapd_handle_scs_req(struct hostapd_data *hapd, const u8 *buf,
+ 				  size_t frame_length)
+@@ -1232,6 +1482,10 @@ hostapd_handle_robust_av(struct hostapd_
+ 		if (hostapd_handle_scs_req(hapd, buf, len))
+ 			wpa_printf(MSG_ERROR, "SCS Request handling failed");
+ 		break;
++	case ROBUST_AV_MSCS_REQ:
++		if (hostapd_handle_mscs_req(hapd, buf, len))
++			wpa_printf(MSG_ERROR, "MSCS Request handling failed");
++		break;
+ 	default:
+ 		break;
+ 	}
+--- a/src/ap/robust_av.h
++++ b/src/ap/robust_av.h
+@@ -7,6 +7,10 @@
+ #define HOSTAPD_SCS_DESCR_CAP_BIT	2
+ 
+ struct hostapd_data;
++struct sta_info;
++
++#define LOW_BYTE(val)    ((val & 0x000000ff))
++#define HIGH_BYTE(val)   ((val & 0x0000ff00) >> 8)
+ 
+ #define HOSTAPD_SCS_MAX_DESCRIPTORS_PER_PEER		10
+ #define HOSTAPD_SCS_MAX_DESCPRIPTORS_PER_REQUEST	4
+@@ -107,6 +111,7 @@ struct hostapd_data;
+ 
+ #define NFT_UDP_PORT		4500
+ 
++#define HOSTAPD_QM_DEFAULT_QM_ID 0xFF
+ /* QoS MGMT status values */
+ enum hostapd_qm_status {
+ 	HOSTAPD_QM_STATUS_SUCCESS = 0,
+@@ -227,9 +232,41 @@ struct hostapd_nft_rule_params {
+ 	u8 dscp;
+ };
+ 
++struct hostapd_mscs_resp {
++	u8 status;
++	struct hostapd_mscs_desc *mscs;
++};
++
++struct hostapd_user_priority_control {
++	u8 user_priority_bitmap;
++	u8 user_priority_limit:3;
++};
++
++struct hostapd_mscs_ctxt {
++	u8 user_priority_bitmap;
++	u8 user_priority_limit:3;
++	u8 tclas_mask;
++};
++
++struct hostapd_tclas_mask_elem {
++	u8 id;
++	u8 ie_len;
++	u8 id_ext;
++	u8 classifier_type;
++	u8 classifier_mask;
++};
++
++struct hostapd_mscs_desc {
++	u8 req_type;
++	struct hostapd_user_priority_control user_priority_control;
++	u32 stream_timeout;
++	struct hostapd_tclas_mask_elem tclas_mask_elem;
++};
++
+ u8 *hostapd_add_scs_ie(u8 *frm, bool scs);
+ 
+ void
+ hostapd_handle_robust_av(struct hostapd_data *hapd, const u8 *buf, size_t len);
++void hostapd_handle_mscs(struct hostapd_data *hapd, const u8 *buf, size_t len);
+ 
+ #endif
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -360,6 +360,8 @@ struct sta_info {
+ 	struct hostapd_scs_req_desc_data
+ 			*scs_req_desc[HOSTAPD_SCS_MAX_DESCRIPTORS_PER_PEER];
+ 	u8 scs_session_count;
++	struct hostapd_mscs_ctxt *mscs_ctxt;
++	bool mscs_session_exists;
+ #endif
+ };
+ 
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -3611,4 +3611,6 @@ struct ieee80211_ttlm_elem {
+ 	u8 control;
+ 	u8 optional[];
+ } STRUCT_PACKED;
++
++#define IEEE80211_MSCS_DESC_MIN_LEN 8
+ #endif /* IEEE802_11_DEFS_H */
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -143,6 +143,7 @@ struct hostapd_wmm_rule {
+  */
+ enum qos_mgmt_type {
+ 	HOSTAPD_QM_TYPE_SCS,
++	HOSTAPD_QM_TYPE_MSCS,
+ 	/* Future QM protocols to be added here */
+ };
+ 
+@@ -313,6 +314,9 @@ struct qm_req_desc_data {
+ #ifdef CONFIG_IEEE80211BE
+ 	struct qm_qos_attributes qos_attr;
+ #endif /* CONFIG_IEEE80211BE */
++	u8 user_priority_bitmap;
++	u8 user_priority_limit;
++	u8 tclas_mask;
+ };
+ 
+ struct qm_req_data {
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -275,6 +275,17 @@ static void hostapd_free_scs_data(struct
+ 	sta->scs_session_count = 0;
+ 	wpa_printf(MSG_DEBUG, "SCS data freed");
+ }
++
++static void hostapd_free_mscs_data(struct sta_info *sta)
++{
++	if (!sta->mscs_ctxt)
++		return;
++
++	sta->mscs_session_exists = false;
++	os_free(sta->mscs_ctxt);
++	sta->mscs_ctxt = NULL;
++	wpa_printf(MSG_DEBUG, "MSCS data freed");
++}
+ #endif /* CONFIG_IEEE80211AX */
+ 
+ 
+@@ -576,6 +587,8 @@ void ap_free_sta(struct hostapd_data *ha
+ 	if (hapd->conf->scs) {
+ 		hostapd_free_scs_data(sta);
+ 	}
++	if (hapd->conf->mscs)
++		hostapd_free_mscs_data(sta);
+ #endif /* CONFIG_IEEE80211AX */
+ 
+ 	os_free(sta);

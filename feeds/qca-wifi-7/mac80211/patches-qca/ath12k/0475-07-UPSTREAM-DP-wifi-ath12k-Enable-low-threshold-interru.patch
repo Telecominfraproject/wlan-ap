@@ -1,0 +1,338 @@
+From e37a49ab9a81da0010c11e37067cb42647d3a9d3 Mon Sep 17 00:00:00 2001
+From: Jeevan Kukkalli <jeevank@qti.qualcomm.com>
+Date: Sat, 19 Jul 2025 11:46:06 +0530
+Subject: [PATCH 7/9] UPSTREAM: DP: wifi: ath12k: Enable low threshold
+ interrupt for rx mon buffer ring
+
+Currently, monitor buffer ring replenishment is triggered during the
+reaping of monitor status and packet buffers. In the case of packet
+buffers, this replenishment occurs per buffer, requiring the ring lock to
+be taken for each individual buffer. This results in significant lock
+contention and performance overhead, especially under high traffic
+conditions.
+
+To address this inefficiency, move the monitor descriptor to the free list
+immediately after processing. Driver fetches descriptor from the free list
+and populate the used list only when a low water mark interrupt is
+received from the hardware. This interrupt is configured to trigger when
+the number of available entries falls below half the total, ensuring timely
+replenishment without excessive locking.
+
+Additionally, the monitor source ring is currently configured with 4K
+entries, while the monitor destination ring has 8K entries. This imbalance
+leads to fewer available source buffers compared to destination buffers,
+increasing the risk of backpressure due to source buffer exhaustion.
+
+This change lays the groundwork for upcoming enhancements where monitor
+destination ring processing will be handled in a workqueue context. This
+future work will enable TLV parsing and packet delivery to mac80211 to
+occur in process context, further improving performance during monitor
+mode.
+
+Patch-dependency:
+0475-06-Upstream-DP-wifi-ath12k-add-drop-tlv-handling-while-.patch
+
+Signed-off-by: Jeevan Kukkalli <jeevank@qti.qualcomm.com>
+Signed-off-by: P Praneesh <ppranees@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c          | 10 ++++-
+ drivers/net/wireless/ath/ath12k/dp_mon.c      | 37 +++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/dp_mon.h      |  3 +-
+ drivers/net/wireless/ath/ath12k/hw.h          |  1 +
+ drivers/net/wireless/ath/ath12k/wifi7/dp.c    |  3 ++
+ .../net/wireless/ath/ath12k/wifi7/dp_mon2.c   | 24 ++++++++----
+ drivers/net/wireless/ath/ath12k/wifi7/hw.c    | 20 ++++++++++
+ 7 files changed, 88 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp.c b/drivers/net/wireless/ath/ath12k/dp.c
+index 762f6f6..006b189 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -297,6 +297,9 @@ static int ath12k_dp_srng_calculate_msi_group(struct ath12k_base *ab,
+ 		break;
+ #endif
+ 	case HAL_RXDMA_MONITOR_BUF:
++		grp_mask = &ab->hw_params->ring_mask->host2rxmon[0];
++		break;
++
+ 	case HAL_TCL_DATA:
+ 	case HAL_TCL_CMD:
+ 	case HAL_REO_CMD:
+@@ -450,12 +453,17 @@ skip_dma_alloc:
+ 		params.intr_timer_thres_us = HAL_SRNG_INT_TIMER_THRESHOLD_RX;
+ 		break;
+ 	case HAL_RXDMA_BUF:
+-	case HAL_RXDMA_MONITOR_BUF:
+ 		params.low_threshold = num_entries >> 3;
+ 		params.flags |= HAL_SRNG_FLAGS_LOW_THRESH_INTR_EN;
+ 		params.intr_batch_cntr_thres_entries = 0;
+ 		params.intr_timer_thres_us = HAL_SRNG_INT_TIMER_THRESHOLD_RX;
+ 		break;
++	case HAL_RXDMA_MONITOR_BUF:
++		params.low_threshold = num_entries >> 1;
++		params.flags |= HAL_SRNG_FLAGS_LOW_THRESH_INTR_EN;
++		params.intr_batch_cntr_thres_entries = 0;
++		params.intr_timer_thres_us = HAL_SRNG_INT_TIMER_THRESHOLD_RX;
++		break;
+ 	case HAL_RXDMA_MONITOR_STATUS:
+ 		params.low_threshold = num_entries >> 3;
+ 		params.flags |= HAL_SRNG_FLAGS_LOW_THRESH_INTR_EN;
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.c b/drivers/net/wireless/ath/ath12k/dp_mon.c
+index 6b28c66..7c271cb 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -2207,3 +2207,40 @@ void ath12k_dp_mon_add_rx_frag(struct sk_buff *skb, const void *mon_buf,
+ 		skb_frag_ref(skb, nr_frags);
+ }
+ EXPORT_SYMBOL(ath12k_dp_mon_add_rx_frag);
++
++void ath12k_dp_mon_rx_process_low_thres(struct ath12k_dp *dp)
++{
++	struct ath12k_base *ab = dp->ab;
++	struct ath12k_dp_mon *dp_mon = dp->dp_mon;
++	struct dp_rxdma_mon_ring *rx_ring;
++	struct hal_srng *srng;
++	int num_free, req_entries;
++	LIST_HEAD(list);
++
++	rx_ring = &dp_mon->rxdma_mon_buf_ring;
++	srng = &dp->hal->srng_list[rx_ring->refill_buf_ring.ring_id];
++
++	spin_lock_bh(&srng->lock);
++	ath12k_hal_srng_access_begin(ab, srng);
++
++	num_free = ath12k_hal_srng_src_num_free(ab, srng, true);
++	/* if ring is less than half filled need to replenish */
++	if (num_free < (rx_ring->bufs_max / 2)) {
++		ath12k_hal_srng_access_end(ab, srng);
++		spin_unlock_bh(&srng->lock);
++		return;
++	}
++
++	ath12k_hal_srng_access_end(ab, srng);
++	spin_unlock_bh(&srng->lock);
++
++	spin_lock_bh(&dp_mon->mon_desc_lock);
++	req_entries = ath12k_dp_mon_list_cut_nodes(&list,
++						   &dp->dp_mon->mon_desc_free_list,
++						   num_free);
++	spin_unlock_bh(&dp_mon->mon_desc_lock);
++
++	if (req_entries)
++		ath12k_dp_mon_buf_replenish(dp, rx_ring, &list, req_entries);
++}
++EXPORT_SYMBOL(ath12k_dp_mon_rx_process_low_thres);
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.h b/drivers/net/wireless/ath/ath12k/dp_mon.h
+index 10afc75..361b5cc 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.h
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.h
+@@ -27,7 +27,7 @@
+ #define DP_RXDMA_MONITOR_BUF_RING_SIZE  256
+ #define DP_RXDMA_MONITOR_DST_RING_SIZE  512
+ #else
+-#define DP_RXDMA_MONITOR_BUF_RING_SIZE 4096
++#define DP_RXDMA_MONITOR_BUF_RING_SIZE 8192
+ #define DP_RXDMA_MONITOR_DST_RING_SIZE 8192
+ #endif
+ #define DP_TX_MONITOR_BUF_RING_SIZE	4096
+@@ -353,6 +353,7 @@ void ath12k_dp_mon_skb_remove_frag(struct ath12k_dp *dp, struct sk_buff *skb,
+ 				   u16 idx, u16 truesize);
+ void ath12k_dp_mon_add_rx_frag(struct sk_buff *skb, const void *mon_buf,
+ 			       int offset, int frag_len, bool take_frag_ref);
++void ath12k_dp_mon_rx_process_low_thres(struct ath12k_dp *dp);
+ void ath12k_dp_mon_pktlog_config_filter(struct ath12k_pdev_dp *dp_pdev,
+ 				enum ath12k_pktlog_mode mode, bool enable);
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/hw.h b/drivers/net/wireless/ath/ath12k/hw.h
+index 6efb20a..4e89740 100644
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -194,6 +194,7 @@ struct ath12k_hw_ring_mask {
+ 	u8 reo_status[ATH12K_EXT_IRQ_DP_NUM_VECTORS];
+ 	u8 host2rxdma[ATH12K_EXT_IRQ_DP_NUM_VECTORS];
+ 	u8 tx_mon_dest[ATH12K_EXT_IRQ_DP_NUM_VECTORS];
++	u8 host2rxmon[ATH12K_EXT_IRQ_GRP_NUM_MAX];
+ 	u8 ppe2tcl[ATH12K_EXT_IRQ_DP_NUM_VECTORS];
+ 	u8 reo2ppe[ATH12K_EXT_IRQ_DP_NUM_VECTORS];
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp.c b/drivers/net/wireless/ath/ath12k/wifi7/dp.c
+index 932fc95..9341ea4 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp.c
+@@ -139,6 +139,9 @@ static int ath12k_wifi7_dp_service_srng(struct ath12k_dp *dp,
+ 			ath12k_dp_rx_bufs_replenish(dp, rx_ring, &list);
+ 	}
+ 
++	if (dp->hw_params->ring_mask->host2rxmon[grp_id])
++		ath12k_dp_mon_rx_process_low_thres(dp);
++
+ 	/* TODO: Implement handler for other interrupts */
+ 
+ done:
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+index 0ed412e..ec5f21b 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+@@ -69,7 +69,6 @@ ath12k_wifi7_dp_mon_rx_parse_status_buf(struct ath12k_pdev_dp *dp_pdev,
+ {
+ 	struct ath12k_dp *dp = dp_pdev->dp;
+ 	struct ath12k_dp_mon *dp_mon = dp->dp_mon;
+-	struct dp_rxdma_mon_ring *buf_ring = &dp_mon->rxdma_mon_buf_ring;
+ 	struct hal_rx_mon_ppdu_info *ppdu_info = &pmon->mon_ppdu_info;
+ 	struct ath12k_dp_mon_desc *mon_desc;
+ 	struct list_head mon_desc_used_list;
+@@ -104,6 +103,8 @@ ath12k_wifi7_dp_mon_rx_parse_status_buf(struct ath12k_pdev_dp *dp_pdev,
+ 		goto buf_replenish;
+ 	}
+ 
++	mon_desc->in_use = false;
++
+ 	ath12k_core_dma_unmap_page(dp->dev, mon_desc->paddr, ATH12K_DP_MON_RX_BUF_SIZE,
+ 				   DMA_FROM_DEVICE);
+ 
+@@ -171,7 +172,9 @@ ath12k_wifi7_dp_mon_rx_parse_status_buf(struct ath12k_pdev_dp *dp_pdev,
+ 	}
+ 
+ buf_replenish:
+-	ath12k_dp_mon_buf_replenish(dp, buf_ring, &mon_desc_used_list, 1);
++	spin_lock_bh(&dp_mon->mon_desc_lock);
++	list_splice_tail(&mon_desc_used_list, &dp_mon->mon_desc_free_list);
++	spin_unlock_bh(&dp_mon->mon_desc_lock);
+ 
+ 	return ret;
+ }
+@@ -273,7 +276,7 @@ ath12k_wifi7_dp_mon_free_pkt_buf(struct ath12k_pdev_dp *pdev_dp,
+ 	struct hal_tlv_64_hdr *tlv;
+ 	struct ath12k_dp_mon_desc *pkt_desc;
+ 	struct list_head mon_desc_used_list;
+-	struct dp_rxdma_mon_ring *buf_ring = &dp->dp_mon->rxdma_mon_buf_ring;
++	struct ath12k_dp_mon *dp_mon = dp->dp_mon;
+ 	u8 *ptr = mon_buf;
+ 	u16 tlv_tag, tlv_len;
+ 	int num_buf = 0;
+@@ -322,6 +325,7 @@ ath12k_wifi7_dp_mon_free_pkt_buf(struct ath12k_pdev_dp *pdev_dp,
+ 						   DMA_FROM_DEVICE);
+ 			page_frag_free(pkt_desc->mon_buf);
+ 			pkt_desc->mon_buf = NULL;
++			pkt_desc->in_use = false;
+ 		}
+ 
+ next_tlv:
+@@ -329,8 +333,11 @@ next_tlv:
+ 		ptr = PTR_ALIGN(ptr, HAL_TLV_64_ALIGN);
+ 	} while ((ptr - mon_buf) < mon_buf_len);
+ 
+-	if (likely(!list_empty(&mon_desc_used_list)))
+-		ath12k_dp_mon_buf_replenish(dp, buf_ring, &mon_desc_used_list, num_buf);
++	if (likely(!list_empty(&mon_desc_used_list))) {
++		spin_lock_bh(&dp_mon->mon_desc_lock);
++		list_splice_tail(&mon_desc_used_list, &dp_mon->mon_desc_free_list);
++		spin_unlock_bh(&dp_mon->mon_desc_lock);
++	}
+ }
+ 
+ static enum hal_rx_mon_status
+@@ -597,7 +604,6 @@ int ath12k_dp_mon_rx_dual_ring_process(struct ath12k_pdev_dp *pdev_dp, int mac_i
+ 	struct hal_mon_dest_desc *mon_dst_desc;
+ 	struct dp_srng *mon_dst_ring;
+ 	struct hal_srng *srng;
+-	struct dp_rxdma_mon_ring *buf_ring;
+ 	struct ath12k_link_sta *arsta;
+ 	struct ath12k_dp_link_peer *peer;
+ 	struct ath12k_neighbor_peer *nrp, *tmp;
+@@ -613,7 +619,6 @@ int ath12k_dp_mon_rx_dual_ring_process(struct ath12k_pdev_dp *pdev_dp, int mac_i
+ 	INIT_LIST_HEAD(&mon_desc_used_list);
+ 	srng_id = ath12k_hw_mac_id_to_srng_id(ab->hw_params, pdev_idx);
+ 	mon_dst_ring = &pdev_dp->dp_mon_pdev->rxdma_mon_dst_ring[srng_id];
+-	buf_ring = &dp_mon->rxdma_mon_buf_ring;
+ 
+ 	srng = &ab->hal.srng_list[mon_dst_ring->ring_id];
+ 	spin_lock_bh(&srng->lock);
+@@ -651,6 +656,7 @@ int ath12k_dp_mon_rx_dual_ring_process(struct ath12k_pdev_dp *pdev_dp, int mac_i
+ 		}
+ 
+ 		mon_buf = mon_desc->mon_buf;
++		mon_desc->in_use = false;
+ 		if (unlikely(!mon_buf)) {
+ 			ath12k_warn(dp, "mon_dest: NULL mon_buf received in mac_id %d\n",
+ 				    pdev_dp->mac_id);
+@@ -806,7 +812,9 @@ free_buf:
+ 		ath12k_wifi7_dp_mon_rx_memset_ppdu_info(pdev_dp, ppdu_info);
+ 	}
+ 
+-	ath12k_dp_mon_buf_replenish(dp, buf_ring, &mon_desc_used_list, num_buffs_reaped);
++	spin_lock_bh(&dp_mon->mon_desc_lock);
++	list_splice_tail(&mon_desc_used_list, &dp_mon->mon_desc_free_list);
++	spin_unlock_bh(&dp_mon->mon_desc_lock);
+ 
+ 	return num_buffs_reaped;
+ }
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hw.c b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+index 99af7fb..0923b97 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -228,6 +228,8 @@ static const struct ath12k_hw_ops wcn7850_ops = {
+ #define ATH12K_HOST2RXDMA_RING_MASK_1 0x2
+ #define ATH12K_HOST2RXDMA_RING_MASK_2 0x4
+ 
++#define	ATH12K_HOST2RXMON_RING_MASK_0	0x1
++
+ #define ATH12K_RX_MON_RING_MASK_0 0x1
+ #define ATH12K_RX_MON_RING_MASK_1 0x2
+ #define ATH12K_RX_MON_RING_MASK_2 0x4
+@@ -244,6 +246,10 @@ static struct ath12k_hw_ring_mask ath12k_wifi7_hw_ring_mask_qcn9274_msi8 = {
+                 ATH12K_TX_RING_MASK_2 | ATH12K_TX_RING_MASK_3,
+                 0, 0, 0, 0, 0
+         },
++	.host2rxmon = {
++		0, 0, 0,
++		ATH12K_HOST2RXMON_RING_MASK_0,
++	},
+         .rx_mon_dest = {
+                 0, 0,
+ 		ATH12K_RX_MON_RING_MASK_0,
+@@ -326,6 +332,10 @@ static struct ath12k_hw_ring_mask ath12k_wifi7_hw_ring_mask_qcn9274 = {
+ 		0, 0, 0, 0,
+ 		0, 0, 0, 0, 0,
+ 	},
++	.host2rxmon = {
++		0, 0, 0,
++		ATH12K_HOST2RXMON_RING_MASK_0,
++	},
+ 	.rx_mon_dest = {
+ 		0, 0, 0, 0,
+ 		0, 0, 0, 0,
+@@ -394,6 +404,10 @@ static struct ath12k_hw_ring_mask ath12k_wifi7_hw_ring_mask_ipq5332 = {
+ 		ATH12K_TX_RING_MASK_2,
+ 		ATH12K_TX_RING_MASK_3,
+ 	},
++	.host2rxmon = {
++		0, 0, 0,
++		ATH12K_HOST2RXMON_RING_MASK_0,
++	},
+ 	.rx_mon_dest = {
+ 		0, 0, 0, 0, 0, 0, 0, 0,
+ 		ATH12K_RX_MON_RING_MASK_0,
+@@ -443,6 +457,8 @@ static struct ath12k_hw_ring_mask ath12k_wifi7_hw_ring_mask_wcn7850 = {
+ 		ATH12K_TX_RING_MASK_1,
+ 		ATH12K_TX_RING_MASK_2,
+ 	},
++	.host2rxmon = {
++	},
+ 	.rx_mon_dest = {
+ 	},
+ 	.rx_mon_status = {
+@@ -482,6 +498,10 @@ static struct ath12k_hw_ring_mask ath12k_wifi7_hw_ring_mask_qcn6432 = {
+ 		ATH12K_TX_RING_MASK_3,
+ 		0, 0, 0
+ 	},
++	.host2rxmon = {
++		0, 0, 0,
++		ATH12K_HOST2RXMON_RING_MASK_0,
++	},
+ 	.rx_mon_dest = {
+ 		0, 0, 0, 0, 0, 0, 0, 0,
+ 		ATH12K_RX_MON_RING_MASK_0,
+-- 
+2.34.1
+

@@ -1,0 +1,503 @@
+From a05886e9c8180119debd756bd3df1a1023a660a0 Mon Sep 17 00:00:00 2001
+From: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+Date: Tue, 13 Aug 2024 10:54:27 +0530
+Subject: [PATCH] hostapd: Handle link reconfig event started and completed
+
+In driver which supports link removal offload procedure, driver will send
+following events once the link removal is scheduled,
+
+ 1) EVENT_LINK_REMOVAL_STARTED: When first beacon with ML reconfigure
+    element is sent out in air, mac80211 will notify the userspace that
+    link removal is started and it can proceed with further action like
+    BTM etc.,
+ 2) EVENT_LINK_REMOVAL_COMPLETED: When last beacon with ML reconfigure
+    element(i.e. with link removal tbtt count as 0) is sent out in air,
+    mac80211 will notify the userspace that link removal is completed.
+    After which, userspace shall initiate the disassociation of the
+    peer(s) connected and removal of the link completely.
+
+Signed-off-by: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+---
+ src/ap/ap_drv_ops.h                |   2 +
+ src/ap/drv_callbacks.c             | 109 +++++++++++++++++++++++++++++
+ src/ap/hostapd.c                   |  20 +++++-
+ src/ap/hostapd.h                   |   3 +
+ src/ap/wnm_ap.c                    |  23 ++++--
+ src/ap/wpa_auth.c                  |  25 +++++++
+ src/ap/wpa_auth.h                  |   3 +-
+ src/drivers/driver.h               |  30 ++++++++
+ src/drivers/driver_common.c        |   2 +
+ src/drivers/driver_nl80211_event.c |  52 ++++++++++++++
+ src/drivers/nl80211_copy.h         |   4 ++
+ 11 files changed, 262 insertions(+), 11 deletions(-)
+
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -72,8 +72,10 @@ int hostapd_if_remove(struct hostapd_dat
+ int hostapd_if_link_remove(struct hostapd_data *hapd,
+ 			   enum wpa_driver_if_type type,
+ 			   const char *ifname, u8 link_id);
++#ifdef CONFIG_IEEE80211BE
+ int hostapd_drv_ml_reconfig_link_remove(struct hostapd_data *hapd, enum wpa_driver_if_type type,
+ 					const struct driver_reconfig_link_removal_params *params);
++#endif /* CONFIG_IEEE80211BE */
+ int hostapd_set_ieee8021x(struct hostapd_data *hapd,
+ 			  struct wpa_bss_params *params);
+ int hostapd_get_seqnum(const char *ifname, struct hostapd_data *hapd,
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -2728,6 +2728,109 @@ static void hostapd_iface_disable(struct
+ 	hapd->disabled = 1;
+ }
+ 
++
++#ifdef CONFIG_IEEE80211BE
++static void hostapd_update_link_removal_field(struct hostapd_data *hapd,
++					      struct link_removal_event *ev,
++					      enum wpa_event_type event)
++{
++	struct hostapd_data *phapd;
++	struct hostapd_iface *iface, **tmp;
++	unsigned int i;
++	struct hapd_interfaces *interfaces;
++#ifdef CONFIG_WNM_AP
++	u8 bss_term_dur[12];
++	u8 req_mode;
++	u32 total_us;
++#endif
++
++	if (event == EVENT_LINK_REMOVAL_STARTED) {
++#ifdef CONFIG_WNM_AP
++		req_mode = WNM_BSS_TM_REQ_DISASSOC_IMMINENT |
++			   WNM_BSS_TM_REQ_BSS_TERMINATION_INCLUDED |
++			   WNM_BSS_TM_REQ_LINK_REMOVAL_IMMINENT;
++
++		bss_term_dur[0] = 4; /* Subelement ID */
++		bss_term_dur[1] = 10; /* Length */
++		/* TSF timer when corresponding BSS will be removed
++		 * link_removal_count * beacon_interval will give total number of
++		 * beacons ML reconfiguration element will be present after which the
++		 * BSS will be removed
++		 * Adding this with the TSF value of first beacon with ML reconfiguration
++		 * element is sent will be equal/greater than the last beacon with ML
++		 * reconfiguration element will be sent.
++		 */
++		total_us = host_to_le16(ev->link_removal_count) *
++			   TU_TO_USEC(hapd->iconf->beacon_int);
++		bss_term_dur[2] = ev->tsf + total_us;
++		os_memset(&bss_term_dur[3], 0, 7); /* Optional */
++
++		wnm_send_bss_tm_req(hapd, NULL, req_mode, ev->link_removal_count,
++				    0x01, &bss_term_dur[0], 0x01, NULL, NULL, 0,
++				    NULL, 0);
++#endif
++		hapd->eht_mld_link_removal_count = ev->link_removal_count;
++		hapd->eht_mld_link_removal_inprogress = true;
++	} else if (event == EVENT_LINK_REMOVAL_COMPLETED) {
++		hapd->eht_mld_link_removal_inprogress = false;
++		hapd->eht_mld_link_removal_count = 0;
++
++		iface = hapd->iface;
++		interfaces = iface->interfaces;
++
++		/* Save one of the partner bss to update the beacon */
++		for_each_mld_link(phapd, hapd)
++			if (phapd != hapd)
++				break;
++
++		if (iface->num_bss == 1) {
++			/* reconfigure GTK rekey primary auth */
++			wpa_auth_reconfig_primary_auth(hapd->wpa_auth, phapd->wpa_auth);
++
++			ap_for_each_sta(hapd, hostapd_sm_link_reconfigure, phapd);
++
++			hostapd_free_link_stas(hapd);
++
++			for (i = 0; i < interfaces->count; i++) {
++				if (interfaces->iface[i] == iface) {
++					hostapd_interface_deinit_free(iface);
++					os_remove_in_array(interfaces->iface, interfaces->count, sizeof(struct hostapd_iface *), i);
++					interfaces->count--;
++					tmp = os_realloc_array(interfaces->iface,
++							       interfaces->count,
++							       sizeof(struct hostapd_iface *));
++					if (!tmp)
++						return;
++					interfaces->iface = tmp;
++					break;
++				}
++			}
++		} else {
++			/* Should be updated when MBSSID grouping is enabled */
++			for (i = 0; i < iface->conf->num_bss; i++) {
++				if (iface->bss[i] == hapd)
++					break;
++			}
++
++			/* Shouldn't happen */
++			if (i >= iface->conf->num_bss) {
++				wpa_printf(MSG_ERROR, "Wrong hapd is provided\n");
++				return;
++			}
++
++			/* reconfigure GTK rekey primary auth */
++			wpa_auth_reconfig_primary_auth(hapd->wpa_auth, phapd->wpa_auth);
++
++			hostapd_remove_bss(iface, i, true);
++		}
++
++		/* Refresh all the partner beacons */
++		hostapd_refresh_all_iface_beacons(phapd->iface);
++	}
++}
++#endif /* CONFIG_IEEE80211BE */
++
++
+ static void hostapd_event_update_cu_param(struct hostapd_data *hapd,
+ 					  struct cu_event *cu_event)
+ {
+@@ -3171,6 +3274,22 @@ void hostapd_wpa_event(void *ctx, enum w
+ 		hostapd_event_afc_update_complete(hapd,
+ 						  &data->afc_rsp_info);
+ 		break;
++#ifdef CONFIG_IEEE80211BE
++	case EVENT_LINK_REMOVAL_STARTED:
++		hostapd_update_link_removal_field(hapd,
++						  &data->link_removal_event,
++						  EVENT_LINK_REMOVAL_STARTED);
++		break;
++	case EVENT_LINK_REMOVAL_COMPLETED:
++		hostapd_update_link_removal_field(hapd, 0,
++						  EVENT_LINK_REMOVAL_COMPLETED);
++		break;
++	case EVENT_LINK_RECONFIG:
++		link_hapd = switch_link_hapd(hapd, data->link_removal_event.link_id);
++		if (link_hapd->eht_mld_link_removal_inprogress)
++			link_hapd->eht_mld_link_removal_count = data->link_removal_event.link_removal_count;
++		break;
++#endif
+ 	default:
+ 		wpa_printf(MSG_DEBUG, "Unknown event %d", event);
+ 		break;
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -747,6 +747,8 @@ void hostapd_free_hapd_data(struct hosta
+ 	eloop_cancel_timeout(hostapd_switch_color_timeout_handler, hapd, NULL);
+ #ifdef CONFIG_IEEE80211BE
+ 	eloop_cancel_timeout(hostapd_link_remove_timeout_handler, hapd, NULL);
++	hapd->eht_mld_link_removal_inprogress = false;
++	hapd->eht_mld_link_removal_count = 0;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ #endif /* CONFIG_IEEE80211AX */
+@@ -3786,7 +3788,7 @@ static void hostapd_deinit_driver(const
+ }
+ 
+ 
+-static void hostapd_refresh_all_iface_beacons(struct hostapd_iface *hapd_iface)
++void hostapd_refresh_all_iface_beacons(struct hostapd_iface *hapd_iface)
+ {
+ 	size_t j;
+ 
+@@ -4235,7 +4237,8 @@ fail:
+ }
+ 
+ 
+-static int hostapd_remove_bss(struct hostapd_iface *iface, unsigned int idx)
++int hostapd_remove_bss(struct hostapd_iface *iface, unsigned int idx,
++		       bool is_link_remove)
+ {
+ 	size_t i;
+ 
+@@ -4253,6 +4256,17 @@ static int hostapd_remove_bss(struct hos
+ #ifdef CONFIG_IEEE80211BE
+ 		hostapd_mld_ref_dec(hapd->mld);
+ #endif /* CONFIG_IEEE80211BE */
++		if (is_link_remove)
++			/* If first bss is removed, if_link_remove will not be
++			 * called in hostapd_remove_bss, hence call
++			 * if_link_remove before calling the remove bss if the
++			 * first bss is removed.
++			 */
++			if (hapd->iface->bss[0] == hapd)
++				hostapd_if_link_remove(hapd, WPA_IF_AP_BSS,
++						       hapd->conf->iface,
++						       hapd->mld_link_id);
++
+ 		os_free(hapd);
+ 
+ 		iface->num_bss--;
+@@ -4306,7 +4320,7 @@ int hostapd_remove_iface(struct hapd_int
+ 				hapd_iface->driver_ap_teardown =
+ 					!(hapd_iface->drv_flags &
+ 					  WPA_DRIVER_FLAGS_AP_TEARDOWN_SUPPORT);
+-				return hostapd_remove_bss(hapd_iface, j);
++				return hostapd_remove_bss(hapd_iface, j, false);
+ 			}
+ 		}
+ 	}
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -992,6 +992,9 @@ bool hostapd_is_usable_punct_bitmap(stru
+ void hostapd_gen_per_sta_profiles(struct hostapd_data *hapd);
+ size_t hostapd_eid_eht_ml_reconfig_len(struct hostapd_data *hapd);
+ u8 * hostapd_eid_eht_reconf_ml(struct hostapd_data *hapd, u8 *eid);
++int hostapd_remove_bss(struct hostapd_iface *iface, unsigned int idx,
++		       bool is_link_remove);
++void hostapd_refresh_all_iface_beacons(struct hostapd_iface *hapd_iface);
+ 
+ static inline bool ap_pmf_enabled(struct hostapd_bss_config *conf)
+ {
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -51,7 +51,7 @@ static const u8 * wnm_ap_get_own_addr(st
+ 	const u8 *own_addr = hapd->own_addr;
+ 
+ #ifdef CONFIG_IEEE80211BE
+-	if (hapd->conf->mld_ap && (!sta || ap_sta_is_mld(hapd, sta)))
++	if (hapd->conf->mld_ap && sta && ap_sta_is_mld(hapd, sta))
+ 		own_addr = hapd->mld->mld_addr;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+@@ -1019,18 +1019,27 @@ int wnm_send_bss_tm_req(struct hostapd_d
+ 	size_t url_len;
+ 	const u8 *own_addr = wnm_ap_get_own_addr(hapd, sta);
+ 
+-	wpa_printf(MSG_DEBUG, "WNM: Send BSS Transition Management Request to "
+-		   MACSTR
+-		   " req_mode=0x%x disassoc_timer=%d valid_int=0x%x dialog_token=%u",
+-		   MAC2STR(sta->addr), req_mode, disassoc_timer, valid_int,
+-		   dialog_token);
++	if (sta)
++		wpa_printf(MSG_DEBUG, "WNM: Send BSS Transition Management Request to "
++			   MACSTR
++			   " req_mode=0x%x disassoc_timer=%d valid_int=0x%x dialog_token=%u",
++			   MAC2STR(sta->addr), req_mode, disassoc_timer, valid_int,
++			   dialog_token);
++	else
++		wpa_printf(MSG_DEBUG, "WNM: broadcast BSS Transition Management Request"
++			   "req_mode=0x%x disassoc_timer=%d valid_int=0x%x dialog_token=%u",
++			   req_mode, disassoc_timer, valid_int, dialog_token);
++
+ 	buf = os_zalloc(1000 + nei_rep_len + mbo_len);
+ 	if (buf == NULL)
+ 		return -1;
+ 	mgmt = (struct ieee80211_mgmt *) buf;
+ 	mgmt->frame_control = IEEE80211_FC(WLAN_FC_TYPE_MGMT,
+ 					   WLAN_FC_STYPE_ACTION);
+-	os_memcpy(mgmt->da, sta->addr, ETH_ALEN);
++	if (sta)
++		os_memcpy(mgmt->da, sta->addr, ETH_ALEN);
++	else
++		os_memcpy(mgmt->da, broadcast_ether_addr, ETH_ALEN);
+ 	os_memcpy(mgmt->sa, own_addr, ETH_ALEN);
+ 	os_memcpy(mgmt->bssid, own_addr, ETH_ALEN);
+ 	mgmt->u.action.category = WLAN_ACTION_WNM;
+@@ -1081,7 +1090,7 @@ int wnm_send_bss_tm_req(struct hostapd_d
+ 	os_free(buf);
+ 
+ 	hapd->openwrt_stats.wnm.bss_transition_request_tx++;
+-	if (disassoc_timer) {
++	if (disassoc_timer && sta) {
+ #ifdef CONFIG_IEEE80211BE
+ 		if (ap_sta_is_mld(hapd, sta)) {
+ 			int i;
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -7667,3 +7667,28 @@ void wpa_auth_reset_ml_link_info(struct
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ }
++
++
++void wpa_auth_reconfig_primary_auth(struct wpa_authenticator *wpa_auth,
++				    struct wpa_authenticator *wpa_pauth)
++{
++#ifdef CONFIG_IEEE80211BE
++	struct wpa_authenticator *primary_wpa_auth;
++
++	primary_wpa_auth = wpa_get_primary_auth(wpa_auth);
++	if (primary_wpa_auth != wpa_auth || !wpa_pauth)
++		return;
++
++	/* If the link to be removed is the primary authenticator for GTK
++	 * rekeying, then change the primary authenticator and re-schedule the
++	 * GTK rekeying with the new wpa_auth.
++	 */
++	wpa_auth->primary_auth = false;
++	wpa_pauth->primary_auth = true;
++
++	eloop_cancel_timeout(wpa_rekey_gtk, wpa_auth, NULL);
++
++	eloop_register_timeout(wpa_pauth->conf.wpa_group_rekey, 0,
++			       wpa_rekey_gtk, wpa_pauth, NULL);
++#endif /* CONFIG_IEEE80211BE */
++}
+--- a/src/ap/wpa_auth.h
++++ b/src/ap/wpa_auth.h
+@@ -691,7 +691,8 @@ void wpa_auth_ml_get_key_info(struct wpa
+ 
+ void wpa_release_link_auth_ref(struct wpa_state_machine *sm,
+ 			       int release_link_id);
+-
++void wpa_auth_reconfig_primary_auth(struct wpa_authenticator *wpa_auth,
++				    struct wpa_authenticator *wpa_pauth);
+ #define for_each_sm_auth(sm, link_id) \
+ 	for (link_id = 0; link_id < MAX_NUM_MLD_LINKS; link_id++)	\
+ 		if (sm->mld_links[link_id].valid &&			\
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -6324,6 +6324,28 @@ enum wpa_event_type {
+ 	 * EVENT_AFC_POWER_UPDATE_COMPLETE_NOTIFY - Notify AFC data is processed
+ 	 */
+ 	EVENT_AFC_POWER_UPDATE_COMPLETE_NOTIFY,
++
++	/**
++	 * EVENT_LINK_REMOVAL_STARTED - Update link_removal_count and TSF
++	 * received
++	 *
++	 * This event is used by the driver to indicate the received link
++	 * removal count of the link that is scheduled for removal and
++	 * timestamp of the first beacon with ML reconfiguration element is
++	 * sent.
++	 */
++	EVENT_LINK_REMOVAL_STARTED,
++
++	/**
++	 * EVENT_LINK_REMOVAL_COMPLETED - Update link scheduled for removal
++	 * procedure is completed.
++	 *
++	 * This event is used by the driver to intimate userspace about the
++	 * completion of ML reconfiguration element for the TBTT count
++	 * specified and the userspace can proceed further on the cleaning up
++	 * of the respective link(s).
++	 */
++	EVENT_LINK_REMOVAL_COMPLETED,
+ };
+ 
+ 
+@@ -7361,6 +7383,14 @@ union wpa_event_data {
+ 		u8 link_id;
+ 	} cu_event;
+ 
++	/**
++	 * Data for link_removal update
++	 */
++	struct link_removal_event {
++		u8 link_id;
++		u32 link_removal_count;
++		u64 tsf;
++	} link_removal_event;
+ };
+ 
+ /**
+--- a/src/drivers/driver_common.c
++++ b/src/drivers/driver_common.c
+@@ -106,6 +106,8 @@ const char * event_to_string(enum wpa_ev
+ 	E2S(RX_CRITICAL_UPDATE);
+ 	E2S(6GHZ_POWER_MODE_NOTIFY);
+ 	E2S(AFC_POWER_UPDATE_COMPLETE_NOTIFY);
++	E2S(LINK_REMOVAL_STARTED);
++	E2S(LINK_REMOVAL_COMPLETED);
+ 	}
+ 
+ 	return "UNKNOWN";
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -184,15 +184,19 @@ static const char * nl80211_command_to_s
+ 	C2S(NL80211_CMD_ADD_LINK_STA)
+ 	C2S(NL80211_CMD_MODIFY_LINK_STA)
+ 	C2S(NL80211_CMD_REMOVE_LINK_STA)
++        C2S(NL80211_CMD_SET_HW_TIMESTAMP)
++        C2S(NL80211_CMD_LINKS_REMOVED)
++        C2S(NL80211_CMD_SET_TID_TO_LINK_MAPPING)
++        C2S(NL80211_CMD_ASSOC_MLO_RECONF)
++        C2S(NL80211_CMD_EPCS_CFG)
++
++	/* Yet to upstream */
+ 	C2S(NL80211_CMD_UPDATE_HE_MUEDCA_PARAMS)
+-	C2S(NL80211_CMD_SET_HW_TIMESTAMP)
+ 	C2S(NL80211_CMD_AWGN_DETECT)
+-	C2S(NL80211_CMD_LINKS_REMOVED)
+-	C2S(NL80211_CMD_SET_TID_TO_LINK_MAPPING)
+-	C2S(NL80211_CMD_ASSOC_MLO_RECONF)
+-	C2S(NL80211_CMD_EPCS_CFG)
+ 	C2S(NL80211_CMD_STOP_BGRADAR_DETECT)
+ 	C2S(NL80211_CMD_INTERFERENCE_DETECT)
++	C2S(NL80211_CMD_LINK_REMOVAL_STARTED)
++	C2S(NL80211_CMD_LINK_REMOVAL_COMPLETED)
+ 	C2S(__NL80211_CMD_AFTER_LAST)
+ 	}
+ #undef C2S
+@@ -2889,6 +2893,45 @@ static void nl80211_spurious_frame(struc
+ }
+ 
+ 
++static void nl80211_link_removal_event(struct i802_bss *bss, struct nlattr **tb, bool started)
++{
++	union wpa_event_data data;
++	struct i802_link *mld_link = bss->flink;
++	void *ctx = bss->ctx;
++
++	os_memset(&data, 0, sizeof(data));
++
++	if (!tb) {
++		wpa_printf(MSG_ERROR, "tb is not set\n");
++		return;
++	}
++
++	if (!tb[NL80211_ATTR_AP_REMOVAL_COUNT] ||
++	    !tb[NL80211_ATTR_TSF]) {
++		wpa_printf(MSG_ERROR, "ignoring unknown event since count and tsf is not set\n");
++		return;
++	}
++
++	data.link_removal_event.link_removal_count =
++		nla_get_u32(tb[NL80211_ATTR_AP_REMOVAL_COUNT]);
++	data.link_removal_event.tsf =
++		nla_get_u64(tb[NL80211_ATTR_TSF]);
++
++	if (tb[NL80211_ATTR_MLO_LINK_ID]) {
++		data.link_removal_event.link_id =
++			nla_get_u8(tb[NL80211_ATTR_MLO_LINK_ID]);
++		mld_link = nl80211_get_link(bss,
++					    data.link_removal_event.link_id);
++		ctx = mld_link->ctx;
++
++		wpa_supplicant_event(ctx, started ? EVENT_LINK_REMOVAL_STARTED:
++				     EVENT_LINK_REMOVAL_COMPLETED, &data);
++	}
++	else
++		wpa_printf(MSG_ERROR, "Ignoring link removal event as link_id is not set\n");
++}
++
++
+ #ifdef CONFIG_DRIVER_NL80211_QCA
+ 
+ static void qca_nl80211_avoid_freq(struct wpa_driver_nl80211_data *drv,
+@@ -4895,6 +4938,12 @@ static void do_process_drv_event(struct
+ 	case NL80211_CMD_AWGN_DETECT:
+ 		nl80211_awgn_event(bss, tb);
+ 		break;
++	case NL80211_CMD_LINK_REMOVAL_STARTED:
++		nl80211_link_removal_event(bss, tb, true);
++		break;
++	case NL80211_CMD_LINK_REMOVAL_COMPLETED:
++		nl80211_link_removal_event(bss, tb, false);
++		break;
+ 	default:
+ 		wpa_dbg(drv->ctx, MSG_DEBUG, "nl80211: Ignored unknown event "
+ 			"(cmd=%d)", cmd);
+--- a/src/drivers/nl80211_copy.h
++++ b/src/drivers/nl80211_copy.h
+@@ -1616,6 +1616,10 @@ enum nl80211_commands {
+ 	 */
+ 	NL80211_CMD_INTERFERENCE_DETECT,
+ 
++	NL80211_CMD_LINK_REMOVAL_STARTED,
++
++	NL80211_CMD_LINK_REMOVAL_COMPLETED,
++
+ 	/* add new commands above here */
+ 
+ 	/* used to define NL80211_CMD_MAX below */

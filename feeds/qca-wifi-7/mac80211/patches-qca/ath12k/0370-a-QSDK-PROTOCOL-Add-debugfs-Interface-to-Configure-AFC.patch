@@ -1,0 +1,209 @@
+From 86e1304016707ab4206410513e0244a3fc600e0a Mon Sep 17 00:00:00 2001
+From: Priyadarshnee Srinivasan <priys@qti.qualcomm.com>
+Date: Tue, 24 Jun 2025 06:26:00 +0530
+Subject: [PATCH] QSDK:PROTOCOL wifi: ath12k: Add a debugfs cmd to configure
+ the AFC Grace Timer
+
+Currently, when the AFC server becomes unreachable, the firmware
+continues using the previously provisioned AFC payload and remains
+in standard power mode for up to 24 hours. This has a limitation where
+the grace timer value is fixed and cannot be modified dynamically,
+making it difficult to test AFC fallback behavior or adapt to
+different deployment needs.
+
+To address this issue, add a debugfs interface for
+6 GHz radios to configure the AFC grace timer value. Send the configured
+value to firmware using the WMI UNIT TEST command ID.
+
+The debugfs interface allows dynamic adjustment of the grace period. For
+example, writing echo 4 > /sys/kernel/debug/ieee80211/phy00
+/ath12k_hw2/configure_afc_grace_timer sets the timer to 20 minutes (as each
+unit represents 5 minutes). Once configured, if the AFC server fails to
+respond, the host receives a SWITCH_TO_LPI event after the specified
+duration, prompting a transition to low power mode. This improves
+testability and compliance handling without affecting default
+production behavior.
+
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+333-0020-mac80211-add-support-for-6G-channels-and-regulatory.patch
+
+Signed-off-by: Priyadarshnee Srinivasan <priys@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/debugfs.c | 49 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.c     | 34 ++++++++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.h     | 31 ++++++++++++++
+ 3 files changed, 114 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath12k/debugfs.c b/drivers/net/wireless/ath/ath12k/debugfs.c
+index 7aa71ddb..f4ad554f 100644
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -4029,6 +4029,47 @@ static const struct file_operations fops_btcoex_priority = {
+         .llseek = default_llseek,
+ };
+ 
++/**
++ * ath12k_write_afc_grace_timer_value() - Read the user programmed afc
++ * grace timer value and send it to firmware.
++ * @file: file pointer
++ * @user_buf: user buffer
++ * @count: size of the buffer
++ * @ppos: file position
++ *
++ * Return: 0 on success, negative error code on failure
++ */
++static ssize_t
++ath12k_write_afc_grace_timer_value(struct file *file,
++				   const char __user *user_buf,
++				   size_t count, loff_t *ppos)
++{
++	struct ath12k *ar = file->private_data;
++	int ret;
++	u32 afc_grace_timer_expiry_value;
++
++	guard(wiphy)(ath12k_ar_to_hw(ar)->wiphy);
++	if (ar->ah->state != ATH12K_HW_STATE_ON) {
++		ath12k_warn(ar->ab, "Interface not up\n");
++		ret = -ENETDOWN;
++		goto exit;
++	}
++
++	if (kstrtou32_from_user(user_buf, count, 0, &afc_grace_timer_expiry_value)) {
++		ret = -EINVAL;
++		goto exit;
++	}
++
++	ret = ath12k_wmi_set_afc_grace_timer(ar, afc_grace_timer_expiry_value);
++	if (ret)
++		goto exit;
++
++	ret = count;
++
++exit:
++	return ret;
++}
++
+ static ssize_t ath12k_write_simulate_awgn(struct file *file,
+ 					  const char __user *user_buf,
+ 					  size_t count, loff_t *ppos)
+@@ -4125,6 +4166,11 @@ static const struct file_operations fops_scan_args_config = {
+ 	.llseek = default_llseek,
+ };
+ 
++static const struct file_operations fops_configure_afc_grace_timer = {
++	.write = ath12k_write_afc_grace_timer_value,
++	.open = simple_open
++};
++
+ void ath12k_debugfs_register(struct ath12k *ar)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+@@ -4205,6 +4251,9 @@ void ath12k_debugfs_register(struct ath12k *ar)
+ 		debugfs_create_file("simulate_awgn", 0200,
+ 				    ar->debug.debugfs_pdev, ar,
+ 				    &fops_simulate_awgn);
++		debugfs_create_file("configure_afc_grace_timer", 0200,
++				    ar->debug.debugfs_pdev, ar,
++				    &fops_configure_afc_grace_timer);
+ 	}
+ 	debugfs_create_file("scan_args_config", 0600, ar->debug.debugfs_pdev, ar,
+ 			    &fops_scan_args_config);
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.c b/drivers/net/wireless/ath/ath12k/wmi.c
+index 1f19c3d4..a34b4a08 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -12952,6 +12952,40 @@ ath12k_wmi_send_unit_test_cmd(struct ath12k *ar,
+ 	return ret;
+ }
+ 
++int ath12k_wmi_set_afc_grace_timer(struct ath12k *ar, u32 afc_grace_timer_value)
++{
++	struct ath12k_link_vif *arvif;
++	u32 afc_args[AFC_MAX_TEST_ARGS];
++	struct wmi_unit_test_cmd wmi_ut;
++	bool arvif_found = false;
++
++	list_for_each_entry(arvif, &ar->arvifs, list) {
++		if (arvif->is_started) {
++			arvif_found = true;
++			break;
++		}
++	}
++
++	if (!arvif_found) {
++		ath12k_warn(ar->ab, "No valid vdev found to set AFC grace timer on ar:%d\n",
++			    ar->pdev_idx);
++		return -EINVAL;
++	}
++
++	afc_args[AFC_GRACE_TIMER_SUBCMDID] = AFC_UNIT_TEST_GRACE_TIMER_SUBCMDID;
++	afc_args[AFC_GRACE_TIMER_PDEV_ID] = ar->pdev->pdev_id;
++	afc_args[AFC_GRACE_TIMER_VALUE] = afc_grace_timer_value;
++
++	wmi_ut.vdev_id = cpu_to_le32(arvif->vdev_id);
++	wmi_ut.module_id = cpu_to_le32(AFC_UNIT_TEST_MODULE_ID);
++	wmi_ut.num_args = cpu_to_le32(AFC_MAX_TEST_ARGS);
++	wmi_ut.diag_token = cpu_to_le32(AFC_UNIT_TEST_TOKEN);
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_REG, "Sending AFC grace timer value to FW\n");
++
++	return ath12k_wmi_send_unit_test_cmd(ar, wmi_ut, afc_args);
++}
++
+ int ath12k_wmi_simulate_radar(struct ath12k *ar, u32 radar_params)
+ {
+ 	struct ath12k_link_vif *arvif;
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.h b/drivers/net/wireless/ath/ath12k/wmi.h
+index f719c8d7..de369604 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -4601,6 +4601,27 @@ enum dfs_test_args_idx {
+ 	DFS_MAX_TEST_ARGS,
+ };
+ 
++/* Grace timer subcmdid maintained in HALPHY */
++#define AFC_UNIT_TEST_GRACE_TIMER_SUBCMDID 82
++/* AFC module id maintained in HALPHY */
++#define AFC_UNIT_TEST_MODULE_ID            67
++/* AFC unit test token id */
++#define AFC_UNIT_TEST_TOKEN                 0
++
++/**
++ * enum afc_test_args_idx - AFC unit test args
++ * @AFC_GRACE_TIMER_SUBCMDID: Grace timer subcmdid
++ * @AFC_GRACE_TIMER_PDEV_ID: Pdev id
++ * @AFC_GRACE_TIMER_VALUE: Grace timer value
++ * @AFC_MAX_TEST_ARGS: Max test args
++ */
++enum afc_test_args_idx {
++	AFC_GRACE_TIMER_SUBCMDID,
++	AFC_GRACE_TIMER_PDEV_ID,
++	AFC_GRACE_TIMER_VALUE,
++	AFC_MAX_TEST_ARGS,
++};
++
+ struct wmi_dfs_unit_test_arg {
+ 	u32 cmd_id;
+ 	u32 pdev_id;
+@@ -7888,6 +7909,16 @@ int ath12k_wmi_send_pdev_pkt_route(struct ath12k *ar,
+ int ath12k_wmi_send_pdev_set_regdomain(struct ath12k *ar,
+ 				       struct ath12k_wmi_pdev_set_regdomain_arg *arg);
+ int ath12k_wmi_simulate_radar(struct ath12k *ar, u32 radar_params);
++
++/**
++ * ath12k_wmi_set_afc_grace_timer() - Send the user configured AFC grace timer
++ * value to FW via unit test command.
++ * @ar: pointer to ath12k radio
++ * @afc_grace_timer_value: user configured AFC grace timer value
++ *
++ * Return: 0 on success, negative error code on failure
++ */
++int ath12k_wmi_set_afc_grace_timer(struct ath12k *ar, u32 afc_grace_timer_value);
+ int ath12k_wmi_simulate_awgn(struct ath12k *ar, u32 chan_bw_interference_bitmap);
+ int ath12k_wmi_send_twt_enable_cmd(struct ath12k *ar, u32 pdev_id);
+ int ath12k_wmi_send_twt_disable_cmd(struct ath12k *ar, u32 pdev_id);
+-- 
+2.34.1
+

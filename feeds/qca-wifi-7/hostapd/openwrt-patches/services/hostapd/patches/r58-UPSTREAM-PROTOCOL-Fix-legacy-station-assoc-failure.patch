@@ -1,0 +1,328 @@
+From 4b5bcc3cd2d90a83c04bb0408dfef125ea306d7b Mon Sep 17 00:00:00 2001
+From: Hari Naraayana Desikan Kannan <quic_hnaraaya@quicinc.com>
+Date: Wed, 22 Jan 2025 15:15:03 +0530
+Subject: [PATCH] UPSTREAM: PROTOCOL: Fix legacy station assoc failure
+
+Currently, when a station tries to associate as a multi-link (ML)
+connection but fails to connect successfully
+(station disassociated/deauthed and marked as not authorized),
+we maintain the station context until the maximum inactivity timer
+expires. If that particular station tries to re-associate as a legacy
+station on a different link (non-associated link), the association
+fails after EAPOL because we have not cleared the associated link
+context. The existing code clears the link station context during
+authentication only if the station is associated as a multi-link (ML)
+connection.Also, if the station information is present on the partner
+link, the station entry is removed as part of pruning after sending
+disassociation on the first radio where it was originally associated.
+With MLO, all links of the same MLD use the same netdev, so pruning
+the legacy station removes the kernel entry completely, leading to
+repeated association and pruning until the station context is removed
+due to maximum inactivity on the first link the station was associated.
+
+To address this issue, clear the partner link for any station
+association, provided the partner link is not authorized. 
+Also skipping pruning if the station is authorized and tries to
+associate in partner links of the same MLD. This change
+ensures that the station can successfully associate as a legacy
+station on a different link without encountering association failures.
+
+TODO: Currently station is freed after max inactivity. But we need
+to remove after disassoc timer handler. Need to cleanup and handle
+scenarios like SA Query for MLD AP and legacy stas roaming.
+
+Signed-off-by: Hari Naraayana Desikan Kannan <quic_hnaraaya@quicinc.com>
+Signed-off-by: Arunpandi Kannan <quic_arunpand@quicinc.com>
+---
+ src/ap/ieee802_11.c    |  4 ++--
+ src/ap/sta_info.c      | 33 +++++++++++++++++++++++----------
+ src/ap/sta_info.h      |  7 +++++--
+ src/ap/wpa_auth_glue.c |  4 ++--
+ 4 files changed, 32 insertions(+), 16 deletions(-)
+
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -3535,7 +3535,7 @@ static void handle_auth(struct hostapd_d
+ 	    !(sta->added_unassoc) && auth_alg != WLAN_AUTH_PASN) {
+ 		res = ap_sta_check_link_sta(hapd, sta);
+ 		if (!res) {
+-			if (ap_sta_re_add(hapd, sta) < 0) {
++			if (ap_sta_re_add(hapd, sta, 1) < 0) {
+ 				resp = WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
+ 				goto fail;
+ 			}
+@@ -3546,6 +3546,16 @@ static void handle_auth(struct hostapd_d
+ #endif /* CONFIG_IEEE80211BE */
+ 	}
+ 
++	if ((sta = ap_get_sta(hapd, sa)) != NULL &&
++	    ap_sta_is_authorized(sta) &&
++	    !(sta->added_unassoc) &&
++	    (sta->skip_kernel_delete)) {
++		if (ap_sta_re_add(hapd, sta, 1) < 0) {
++			resp = WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
++			goto fail;
++		}
++	}
++
+ 	switch (auth_alg) {
+ 	case WLAN_AUTH_OPEN:
+ 		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
+@@ -5214,7 +5224,7 @@ int hostapd_process_assoc_ml_info(struct
+ 				   "ML STA was already created and we received assoc resp again (reassoc: %d)",
+ 				   reassoc);
+ 			/* cleanup all link sta in kernel and add later on ml processing */
+-			ap_sta_remove_link_sta(hapd, sta);
++			ap_sta_remove_link_sta(hapd, sta, 0);
+ 			hostapd_drv_sta_remove(hapd, sta->addr);
+ 			sta->flags &= ~(WLAN_STA_ASSOC | WLAN_STA_AUTHORIZED);
+ 			sta->unadded_sta = false;
+@@ -5322,7 +5332,7 @@ static int add_associated_sta(struct hos
+ 	}
+ 
+ 	if (sta->unadded_sta) {
+-		ap_sta_remove_link_sta(hapd, sta);
++		ap_sta_remove_link_sta(hapd, sta, 0);
+ 		sta->unadded_sta = false;
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+@@ -5369,6 +5379,7 @@ static int add_associated_sta(struct hos
+ 		hostapd_drv_sta_remove(hapd, sta->addr);
+ 		wpa_auth_sm_event(sta->wpa_sm, WPA_DRV_STA_REMOVED);
+ 		set = 0;
++		sta->skip_kernel_delete = false;
+ 
+ 		 /* Do not allow the FT-over-DS exception to be used more than
+ 		  * once per authentication exchange to guarantee a new TK is
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -284,8 +284,8 @@ static void __ap_free_sta(struct hostapd
+ 	    !hostapd_drv_link_sta_remove(hapd, sta->addr))
+ 		return;
+ #endif /* CONFIG_IEEE80211BE */
+-
+-	hostapd_drv_sta_remove(hapd, sta->addr);
++	if (!sta->skip_kernel_delete)
++		hostapd_drv_sta_remove(hapd, sta->addr);
+ }
+ 
+ 
+@@ -705,6 +705,38 @@ void set_valid_for_each_partner_link_sta
+ }
+ 
+ 
++int skip_prune_for_partner_links(struct hostapd_data *hapd,
++					 struct sta_info *sta)
++{
++	struct sta_info *link_sta;
++	struct hostapd_data *lhapd;
++
++	if (!hostapd_is_mld_ap(hapd))
++		return 0;
++
++	for_each_mld_link(lhapd, hapd) {
++		if (hapd == lhapd)
++			continue;
++
++		link_sta = ap_get_sta(lhapd, sta->addr);
++		if (link_sta &&
++		    ap_sta_is_authorized(sta)) {
++			if (!sta->mld_info.mld_sta ||
++			    !link_sta->mld_info.mld_sta) {
++				wpa_printf(MSG_DEBUG,
++					   "Skip kernel Delete in link=%d for STA "
++					   MACSTR,
++					   hapd->mld_link_id,
++					   MAC2STR(sta->addr));
++				sta->skip_kernel_delete = true;
++			}
++			return 1;
++		}
++	}
++	return 0;
++}
++
++
+ int hostapd_free_partner_link_stas(struct hostapd_data *hapd,
+ 				   struct sta_info *sta,
+ 				   void *ctx)
+@@ -722,7 +754,8 @@ int hostapd_free_partner_link_stas(struc
+ 		lsta = ap_get_sta(lhapd, sta->addr);
+ 		if (lsta && ap_sta_is_mld(lhapd, lsta) &&
+ 		    lsta->mld_info.links[hapd->mld_link_id].valid) {
+-			wpa_printf(MSG_DEBUG, "Removing link station " MACSTR,
++			wpa_printf(MSG_DEBUG, "Removing link station "
++				   MACSTR,
+ 				   MAC2STR(lsta->addr));
+ 			mlme_deletekeys_request(lhapd, lsta);
+ 			ap_free_sta(lhapd, lsta);
+@@ -1851,10 +1884,10 @@ bool ap_sta_set_authorized_flag(struct h
+ 				mld_assoc_link_id = -2;
+ 		}
+ #endif /* CONFIG_IEEE80211BE */
++		sta->flags |= WLAN_STA_AUTHORIZED;
+ 		if (mld_assoc_link_id != -2)
+ 			hostapd_prune_associations(hapd, sta->addr,
+ 						   mld_assoc_link_id);
+-		sta->flags |= WLAN_STA_AUTHORIZED;
+ 	} else {
+ 		sta->flags &= ~WLAN_STA_AUTHORIZED;
+ 	}
+@@ -2173,10 +2206,14 @@ int ap_sta_pending_delayed_1x_auth_fail_
+ 
+ #ifdef CONFIG_IEEE80211BE
+ void ap_sta_remove_link_sta(struct hostapd_data *hapd,
+-			    struct sta_info *sta)
++			    struct sta_info *sta,
++			    int check_authorized)
+ {
+ 	struct hostapd_data *tmp_hapd;
+ 
++	if (!hostapd_is_mld_ap(hapd))
++		return;
++
+ 	for_each_mld_link(tmp_hapd, hapd) {
+ 		struct sta_info *tmp_sta;
+ 
+@@ -2188,16 +2225,25 @@ void ap_sta_remove_link_sta(struct hosta
+ 			if (tmp_sta == sta ||
+ 			    !ether_addr_equal(tmp_sta->addr, sta->addr))
+ 				continue;
++			/*
++			 * In case the AP is affiliated with an AP MLD is
++			 * authorized, Don't remove the link sta.
++			 */
+ 
+-			ap_free_sta(tmp_hapd, tmp_sta);
+-			break;
++			if(check_authorized && ap_sta_is_authorized(tmp_sta))
++				continue;
++
++			if (ap_sta_is_mld(tmp_hapd, tmp_sta)) {
++				ap_free_sta(tmp_hapd, tmp_sta);
++				break;
++			}
+ 		}
+ 	}
+ }
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 
+-int ap_sta_re_add(struct hostapd_data *hapd, struct sta_info *sta)
++int ap_sta_re_add(struct hostapd_data *hapd, struct sta_info *sta, int check_authorized)
+ {
+ 	const u8 *mld_link_addr = NULL;
+ 	bool mld_link_sta = false;
+@@ -2212,18 +2258,18 @@ int ap_sta_re_add(struct hostapd_data *h
+ 	 */
+ 
+ #ifdef CONFIG_IEEE80211BE
++	/*
++	 * In case the AP is affiliated with an AP MLD, we need to
++	 * remove the station from all relevant links/APs.
++	 */
++	ap_sta_remove_link_sta(hapd, sta, check_authorized);
++
+ 	if (ap_sta_is_mld(hapd, sta)) {
+ 		u8 mld_link_id = hapd->mld_link_id;
+ 
+ 		mld_link_sta = sta->mld_assoc_link_id != mld_link_id;
+ 		mld_link_addr = sta->mld_info.links[mld_link_id].peer_addr;
+ 		eml_cap = sta->mld_info.common_info.eml_capa;
+-
+-		/*
+-		 * In case the AP is affiliated with an AP MLD, we need to
+-		 * remove the station from all relevant links/APs.
+-		 */
+-		ap_sta_remove_link_sta(hapd, sta);
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+@@ -2245,6 +2291,7 @@ int ap_sta_re_add(struct hostapd_data *h
+ 	}
+ 
+ 	sta->added_unassoc = 1;
++	sta->skip_kernel_delete = false;
+ 	return 0;
+ }
+ 
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -330,6 +330,7 @@ struct sta_info {
+ 	 */
+ 	u8 unadded_sta;
+ #endif /* CONFIG_IEEE80211BE */
++	u8 skip_kernel_delete;
+ 
+ 	u16 max_idle_period; /* if nonzero, the granted BSS max idle period in
+ 			      * units of 1000 TUs */
+@@ -373,7 +374,9 @@ int set_for_each_partner_link_sta(struct
+ 					    struct sta_info *sta,
+ 					    void *data));
+ 
+-void ap_sta_remove_link_sta(struct hostapd_data *hapd, struct sta_info *sta);
++void ap_sta_remove_link_sta(struct hostapd_data *hapd,
++			    struct sta_info *sta,
++			    int check_authorized);
+ void set_link_id_for_each_partner_link_sta(struct hostapd_data *hapd,
+ 					   struct sta_info *psta,
+ 					   int link_id);
+@@ -448,7 +451,8 @@ void ap_sta_delayed_1x_auth_fail_disconn
+ 					    unsigned timeout);
+ int ap_sta_pending_delayed_1x_auth_fail_disconnect(struct hostapd_data *hapd,
+ 						   struct sta_info *sta);
+-int ap_sta_re_add(struct hostapd_data *hapd, struct sta_info *sta);
++int ap_sta_re_add(struct hostapd_data *hapd, struct sta_info *sta,
++		  int check_authorized);
+ 
+ void ap_free_sta_pasn(struct hostapd_data *hapd, struct sta_info *sta);
+ 
+@@ -472,7 +476,8 @@ static inline void ap_sta_set_mld(struct
+ 
+ #ifdef CONFIG_IEEE80211BE
+ void ap_sta_remove_link_sta(struct hostapd_data *hapd,
+-                            struct sta_info *sta);
++                            struct sta_info *sta,
++			    int check_authorized);
+ int ap_sta_check_link_sta(struct hostapd_data *hapd,
+ 			  struct sta_info *sta);
+ #endif
+@@ -487,4 +492,7 @@ void set_valid_for_each_partner_link_sta
+ int hostapd_free_partner_link_stas(struct hostapd_data *hapd,
+ 				   struct sta_info *sta,
+ 				   void *ctx);
++
++int skip_prune_for_partner_links(struct hostapd_data *hapd,
++				 struct sta_info *sta);
+ #endif /* STA_INFO_H */
+--- a/src/ap/wpa_auth_glue.c
++++ b/src/ap/wpa_auth_glue.c
+@@ -1255,7 +1255,7 @@ hostapd_wpa_auth_add_sta_ml(struct hosta
+ 		 */
+ 		wpa_printf(MSG_DEBUG, "Remove STA "MACSTR" to make source to"
+ 			   " target roaming", MAC2STR(sta_mld));
+-		ap_sta_remove_link_sta(hapd, sta_ml_obj);
++		ap_sta_remove_link_sta(hapd, sta_ml_obj, 0);
+ 		ap_free_sta(hapd, sta_ml_obj);
+ 		sta_ml_obj = NULL;
+ 	}
+@@ -1369,7 +1369,7 @@ static int hostapd_wpa_auth_add_sta_ft(v
+ 		 * previous association. */
+ 		wpa_printf(MSG_DEBUG,
+ 			   "FT: Remove and re-add driver STA entry after successful FT authentication");
+-		return ap_sta_re_add(hapd, sta);
++		return ap_sta_re_add(hapd, sta, 0);
+ 	}
+ 
+ 	return 0;
+--- a/src/ap/utils.c
++++ b/src/ap/utils.c
+@@ -77,6 +77,8 @@ static int prune_associations(struct hos
+ 		if (data->mld_assoc_link_id >= 0 &&
+ 		    osta->mld_assoc_link_id == data->mld_assoc_link_id)
+ 			continue;
++		if (skip_prune_for_partner_links(data->hapd, osta))
++			continue;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 		wpa_printf(MSG_INFO, "%s: Prune association for " MACSTR,

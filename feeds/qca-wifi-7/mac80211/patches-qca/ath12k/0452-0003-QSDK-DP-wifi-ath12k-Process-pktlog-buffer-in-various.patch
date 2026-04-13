@@ -1,0 +1,338 @@
+From ce58c58a01d7de6c2f632a864b2cd2d136871241 Mon Sep 17 00:00:00 2001
+From: Adwait Nayak <adwaitn@qti.qualcomm.com>
+Date: Tue, 22 Jul 2025 22:26:15 +0530
+Subject: [PATCH] QSDK:DP: wifi: ath12k: Process pktlog buffer in various modes
+
+Add pktlog buffer processing change for pktlog lite,
+full mode.
+Add support for peer based pktlog
+
+Signed-off-by: Adwait Nayak <adwaitn@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/debugfs.h     | 10 ++--
+ drivers/net/wireless/ath/ath12k/dp_htt.c      | 53 +++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/dp_htt.h      | 37 +++++++++++++
+ drivers/net/wireless/ath/ath12k/pktlog.c      | 45 ++++++++++++++++
+ drivers/net/wireless/ath/ath12k/pktlog.h      |  7 +++
+ drivers/net/wireless/ath/ath12k/trace.h       |  2 +-
+ .../net/wireless/ath/ath12k/wifi7/dp_mon2.c   | 39 +++++++++++++-
+ 7 files changed, 188 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/debugfs.h b/drivers/net/wireless/ath/ath12k/debugfs.h
+index 89837ba..d59adda 100644
+--- a/drivers/net/wireless/ath/ath12k/debugfs.h
++++ b/drivers/net/wireless/ath/ath12k/debugfs.h
+@@ -52,9 +52,10 @@ void ath12k_debugfs_fw_stats_init(struct ath12k *ar);
+ void ath12k_send_fw_hang_cmd(struct ath12k_base *ab,
+ 			     unsigned int value);
+ 
+-static inline bool ath12k_debugfs_is_pktlog_rx_stats_enabled(struct ath12k *ar)
++static inline bool ath12k_debugfs_is_pktlog_peer_valid(struct ath12k *ar, u8 *addr)
+ {
+-	return (!ar->debug.pktlog_peer_valid && ar->debug.pktlog_mode);
++        return (ar->debug.pktlog_peer_valid && ar->debug.pktlog_mode &&
++                ether_addr_equal(addr, ar->debug.pktlog_peer_addr));
+ }
+ 
+ static inline int ath12k_debugfs_is_extd_tx_stats_enabled(struct ath12k *ar)
+@@ -226,7 +227,7 @@ static inline void ath12k_debugfs_fw_stats_init(struct ath12k *ar)
+ {
+ }
+ 
+-static inline bool ath12k_debugfs_is_pktlog_rx_stats_enabled(struct ath12k *ar)
++static inline bool ath12k_debugfs_is_pktlog_peer_valid(struct ath12k *ar, u8 *addr)
+ {
+ 	return false;
+ }
+@@ -302,4 +303,7 @@ static inline void ath12k_debugfs_nrp_cleanup_all(struct ath12k *ar)
+ void ath12k_init_pktlog(struct ath12k *ar);
+ void ath12k_deinit_pktlog(struct ath12k *ar);
+ void ath12k_htt_pktlog_process(struct ath12k *ar, u8 *data);
++void ath12k_htt_ppdu_pktlog_process(struct ath12k *ar, u8 *data, u32 len);
++void ath12k_dp_rx_stats_buf_pktlog_process(struct ath12k *ar, u8 *data,
++					   u16 log_type, u32 len);
+ #endif /* _ATH12K_DEBUGFS_H_ */
+diff --git a/drivers/net/wireless/ath/ath12k/dp_htt.c b/drivers/net/wireless/ath/ath12k/dp_htt.c
+index eb7ff35..558a5c7 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_htt.c
++++ b/drivers/net/wireless/ath/ath12k/dp_htt.c
+@@ -861,6 +861,7 @@ static int ath12k_htt_pull_ppdu_stats(struct ath12k_base *ab,
+ 	struct htt_ppdu_user_stats *usr_stats = NULL;
+ 	u32 peer_id = 0;
+ 	struct ath12k_pdev_dp *dp_pdev;
++	struct ath12k *ar;
+ 	int ret, i;
+ 	u8 pdev_id;
+ 	u32 ppdu_id, len;
+@@ -883,6 +884,21 @@ static int ath12k_htt_pull_ppdu_stats(struct ath12k_base *ab,
+ 	}
+ 
+ 	rcu_read_lock();
++	ar = ath12k_mac_get_ar_by_pdev_id(ab, pdev_id);
++	if (!ar) {
++		/* It is possible that the ar is not yet active (started).
++		 * The above function will only look for the active pdev
++		 * and hence %NULL return is possible. Just silently
++		 * discard this message
++		 */
++		goto exit;
++	}
++
++	if (ar->debug.is_pkt_logging &&
++	    (dp->rx_pktlog_mode == ATH12K_PKTLOG_MODE_LITE)) {
++		trace_ath12k_htt_ppdu_stats(ar, skb->data, len);
++		ath12k_htt_ppdu_pktlog_process(ar, (u8 *)skb->data, skb->len);
++	}
+ 
+ 	dp_pdev = ath12k_dp_to_dp_pdev(dp, pdev_id - 1);
+ 	if (!dp_pdev) {
+@@ -1061,6 +1077,40 @@ exit:
+ 	rcu_read_unlock();
+ }
+ 
++static void
++ath12k_htt_pktlog_tx_handler(struct ath12k_base *ab, struct sk_buff *skb)
++{
++        struct ath12k_pktlog_hdr pl_hdr;
++        struct ath12k *ar;
++        u8 pdev_id;
++        u32 *pl_tgt_hdr, *msg_word;
++        u16 payload_size;
++
++        if (!skb->data)
++                return;
++
++        msg_word = (u32 *)skb->data;
++
++        pdev_id = u32_get_bits(*msg_word, HTT_T2H_PKTLOG_PDEV_ID);
++        ar = ath12k_mac_get_ar_by_pdev_id(ab, pdev_id);
++        if (!ar) {
++                ath12k_err(ab, "invalid pdev id %d on htt pktlog\n", pdev_id);
++                return;
++        }
++
++        payload_size = u32_get_bits(*msg_word,
++                                    HTT_T2H_PKTLOG_PAYLOAD_SIZE);
++        pl_tgt_hdr = (u32 *)(msg_word + 1);
++        pl_hdr.size = u32_get_bits(*(pl_tgt_hdr +
++				     HTT_T2H_PKTLOG_HDR_SIZE_OFFSET),
++                                   HTT_T2H_PKTLOG_PAYLOAD_SIZE);
++        trace_ath12k_htt_pktlog_tx_handler(ar, pl_tgt_hdr, pl_hdr.size,
++					   ar->ab->pktlog_defs_checksum);
++
++        if (ar->debug.is_pkt_logging)
++                ath12k_htt_pktlog_process(ar, (u8 *)pl_tgt_hdr);
++}
++
+ static void ath12k_htt_t2h_ppdu_id_fmt_handler(struct ath12k_dp *dp,
+ 					       struct sk_buff *skb)
+ {
+@@ -1261,6 +1311,9 @@ void ath12k_dp_htt_htc_t2h_msg_handler(struct ath12k_base *ab,
+ 	case HTT_T2H_MSG_TYPE_MLO_TIMESTAMP_OFFSET_IND:
+ 		ath12k_htt_mlo_offset_event_handler(ab, skb);
+ 		break;
++	case HTT_T2H_MSG_TYPE_PKTLOG:
++		ath12k_htt_pktlog_tx_handler(ab, skb);
++		break;
+ 	case HTT_T2H_MSG_TYPE_MLO_RX_PEER_MAP:
+ 		ath12k_peer_mlo_map_event(ab, skb);
+ 		break;
+diff --git a/drivers/net/wireless/ath/ath12k/dp_htt.h b/drivers/net/wireless/ath/ath12k/dp_htt.h
+index 7a89173..c60ae5b 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_htt.h
++++ b/drivers/net/wireless/ath/ath12k/dp_htt.h
+@@ -1293,6 +1293,43 @@ enum htt_backpressure_lmac_ringid {
+ #define HTT_T2H_PPDU_STATS_INFO_PDEV_ID GENMASK(11, 10)
+ #define HTT_T2H_PPDU_STATS_INFO_PAYLOAD_SIZE GENMASK(31, 16)
+ 
++/* @brief target -> host packet log message
++ *
++ * @details
++ * The following field definitions describe the format of the packet log
++ * message sent from the target to the host.
++ * The message consists of a 4-octet header,followed by a variable number
++ * of 32-bit character values.
++ *
++ * |31                         16|15  12|11   10|9    8|7            0|
++ * |------------------------------------------------------------------|
++ * |        payload_size         | rsvd |pdev_id|mac_id|   msg type   |
++ * |------------------------------------------------------------------|
++ * |                              payload                             |
++ * |------------------------------------------------------------------|
++ *   - MSG_TYPE
++ *     Bits 7:0
++ *     Purpose: identifies this as a pktlog message
++ *     Value: HTT_T2H_MSG_TYPE_PKTLOG
++ *   - mac_id
++ *     Bits 9:8
++ *     Purpose: identifies which MAC/PHY instance generated this pktlog info
++ *     Value: 0-3
++ *   - pdev_id
++ *     Bits 11:10
++ *     Purpose: pdev_id
++ *     Value: 0-3
++ *     0 (for rings at SOC level),
++ *     1/2/3 PDEV -> 0/1/2
++ *   - payload_size
++ *     Bits 31:16
++ *     Purpose: explicitly specify the payload size
++ *     Value: payload size in bytes (payload size is a multiple of 4 bytes)
++ */
++#define HTT_T2H_PKTLOG_HDR_SIZE_OFFSET 1
++#define HTT_T2H_PKTLOG_PDEV_ID GENMASK(11, 10)
++#define HTT_T2H_PKTLOG_PAYLOAD_SIZE GENMASK(31, 16)
++
+ struct ath12k_htt_ppdu_stats_msg {
+ 	__le32 info;
+ 	__le32 ppdu_id;
+diff --git a/drivers/net/wireless/ath/ath12k/pktlog.c b/drivers/net/wireless/ath/ath12k/pktlog.c
+index 09eb5a1..4529deb 100644
+--- a/drivers/net/wireless/ath/ath12k/pktlog.c
++++ b/drivers/net/wireless/ath/ath12k/pktlog.c
+@@ -550,3 +550,48 @@ void ath12k_htt_pktlog_process(struct ath12k *ar, u8 *data)
+         ath12k_pktlog_pull_hdr(&hdr_arg, ar, data);
+         ath12k_pktlog_write_buf(pl_info, &hdr_arg);
+ }
++
++void ath12k_htt_ppdu_pktlog_process(struct ath12k *ar, u8 *data,
++                                    u32 len)
++{
++        struct ath12k_pktlog *pl_info = &ar->debug.pktlog;
++        struct ath12k_pktlog_hdr hdr;
++        struct ath12k_pktlog_hdr_arg hdr_arg;
++
++        hdr.flags = (1 << PKTLOG_FLG_FRM_TYPE_REMOTE_S);
++        hdr.missed_cnt = 0;
++        hdr.log_type = ATH12K_PKTLOG_TYPE_PPDU_STATS;
++        hdr.timestamp = 0;
++        hdr.size = len;
++        hdr.type_specific_data = 0;
++
++        hdr_arg.log_type = hdr.log_type;
++        hdr_arg.payload_size = hdr.size;
++        hdr_arg.payload = (u8 *)data;
++        hdr_arg.pktlog_hdr = (u8 *)&hdr;
++
++        ath12k_pktlog_write_buf(pl_info, &hdr_arg);
++}
++
++void ath12k_dp_rx_stats_buf_pktlog_process(struct ath12k *ar, u8 *data,
++                                          u16 log_type, u32 len)
++{
++        struct ath12k_pktlog *pl_info = &ar->debug.pktlog;
++        struct ath12k_pktlog_hdr hdr;
++        struct ath12k_pktlog_hdr_arg hdr_arg;
++
++        hdr.flags = (1 << PKTLOG_FLG_FRM_TYPE_REMOTE_S);
++        hdr.missed_cnt = 0;
++        hdr.log_type = log_type;
++        hdr.timestamp = 0;
++        hdr.size = len;
++        hdr.type_specific_data = 0;
++
++        hdr_arg.log_type = log_type;
++        hdr_arg.payload_size = len;
++        hdr_arg.payload = data;
++        hdr_arg.pktlog_hdr = (u8 *)&hdr;
++
++        ath12k_pktlog_write_buf(pl_info, &hdr_arg);
++}
++EXPORT_SYMBOL(ath12k_dp_rx_stats_buf_pktlog_process);
+diff --git a/drivers/net/wireless/ath/ath12k/pktlog.h b/drivers/net/wireless/ath/ath12k/pktlog.h
+index f250cbd..4398d17 100644
+--- a/drivers/net/wireless/ath/ath12k/pktlog.h
++++ b/drivers/net/wireless/ath/ath12k/pktlog.h
+@@ -15,6 +15,13 @@
+ #define PKTLOG_MAGIC_NUM_FW_VERSION_SUPPORT 0xDECDF1F0
+ #define ATH12K_DEBUGFS_PKTLOG_SIZE_DEFAULT (10 * 1024 * 1024)
+ 
++enum ath12k_pktlog_flag {
++        PKTLOG_FLG_FRM_TYPE_LOCAL_S = 0,
++        PKTLOG_FLG_FRM_TYPE_REMOTE_S,
++        PKTLOG_FLG_FRM_TYPE_CLONE_S,
++        PKTLOG_FLG_FRM_TYPE_UNKNOWN_S
++};
++
+ enum ath12k_pktlog_mode {
+         ATH12K_PKTLOG_DISABLED,
+         ATH12K_PKTLOG_MODE_LITE,
+diff --git a/drivers/net/wireless/ath/ath12k/trace.h b/drivers/net/wireless/ath/ath12k/trace.h
+index 8f3aef2..bba4c3c 100644
+--- a/drivers/net/wireless/ath/ath12k/trace.h
++++ b/drivers/net/wireless/ath/ath12k/trace.h
+@@ -21,7 +21,7 @@ static inline void trace_ ## name(proto) {}
+ #undef TRACE_SYSTEM
+ #define TRACE_SYSTEM ath12k
+ 
+-TRACE_EVENT(ath12k_htt_pktlog,
++TRACE_EVENT(ath12k_htt_pktlog_tx_handler,
+ 	    TP_PROTO(struct ath12k *ar, const void *buf, u16 buf_len,
+ 		     u32 pktlog_checksum),
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+index 24b6811..e07229d 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+@@ -11,7 +11,6 @@
+ #include "hal_qcn9274.h"
+ #include "hal_mon.h"
+ #include "../peer.h"
+-#include "../debugfs.h"
+ #include "../dp_mon_filter.h"
+ 
+ const struct ath12k_dp_arch_mon_ops ath12k_wifi7_dp_arch_mon_dual_ring_ops = {
+@@ -247,6 +246,41 @@ ath12k_wifi7_dp_mon_rx_parse_ppdu_status(struct ath12k_pdev_dp *dp_pdev,
+ 	return hal_status;
+ }
+ 
++static void
++ath12k_dp_rx_pktlog_process(struct ath12k_pdev_dp *pdev_dp,
++			    struct ath12k_dp_link_peer *peer,
++			    struct hal_rx_mon_ppdu_info *ppdu_info,
++			    struct sk_buff *skb, u32 end_offset)
++{
++	struct ath12k *ar = pdev_dp->ar;
++	struct ath12k_dp *dp = pdev_dp->dp;
++	u32 rx_buf_sz;
++	u16 log_type = 0;
++
++	if (!ar->debug.is_pkt_logging)
++		return;
++
++	rx_buf_sz = end_offset + 1;
++	if (ath12k_debugfs_is_pktlog_peer_valid(ar, peer->addr) &&
++	    ppdu_info->peer_id != HAL_INVALID_PEERID) {
++		log_type = ATH12K_PKTLOG_TYPE_RX_STATBUF;
++		trace_ath12k_htt_rxdesc(ar, skb->data, log_type, rx_buf_sz);
++		ath12k_dp_rx_stats_buf_pktlog_process(ar, skb->data, log_type,
++						      rx_buf_sz);
++	} else {
++		if (dp->rx_pktlog_mode == ATH12K_PKTLOG_MODE_LITE)
++			log_type = ATH12K_PKTLOG_TYPE_LITE_RX;
++		else if (dp->rx_pktlog_mode == ATH12K_PKTLOG_MODE_FULL)
++			log_type = ATH12K_PKTLOG_TYPE_RX_STATBUF;
++
++		trace_ath12k_htt_rxdesc(ar, skb->data, log_type,
++					rx_buf_sz);
++		ath12k_dp_rx_stats_buf_pktlog_process(ar, skb->data,
++						      log_type,
++						      rx_buf_sz);
++	}
++}
++
+ int ath12k_dp_mon_rx_dual_ring_process(struct ath12k_pdev_dp *pdev_dp, int mac_id,
+ 				       struct napi_struct *napi, int *budget)
+ {
+@@ -368,6 +402,9 @@ move_next:
+ 		ath12k_wifi7_dp_mon_rx_memset_ppdu_info(ppdu_info);
+ 
+ 	while ((skb = __skb_dequeue(&skb_list))) {
++		ath12k_dp_rx_pktlog_process(pdev_dp, peer,
++					    ppdu_info, skb, end_offset);
++
+ 		hal_status = ath12k_wifi7_dp_mon_rx_parse_ppdu_status(pdev_dp, pmon,
+ 								      skb, napi);
+ 		if (hal_status != HAL_RX_MON_STATUS_PPDU_DONE) {
+-- 
+2.34.1
+

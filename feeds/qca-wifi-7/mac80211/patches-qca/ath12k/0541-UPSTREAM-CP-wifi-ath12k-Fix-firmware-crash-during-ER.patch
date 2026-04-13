@@ -1,0 +1,219 @@
+From cf907a79e4a10263382e9253223c6c452d3835f8 Mon Sep 17 00:00:00 2001
+From: Aaradhana Sahu <aaradhana.sahu@oss.qualcomm.com>
+Date: Fri, 19 Sep 2025 18:40:33 +0530
+Subject: [PATCH] UPSTREAM:CP:wifi:ath12k: Fix firmware crash during standby exit
+
+Currently, the host does not send an MLO teardown with the umac_reset flag
+while entering standby mode. This causes a firmware assert during standby
+exit when the MLD AP remains connected to the client.
+
+Resolve firmware assert during standby exit by sending MLO teardown
+with umac_reset.
+
+Patch-dependency:
+0441-01-UPSTREAM-CP-PLATFORM-wifi-ath12k-Add-support-for-pow.patch
+Patch-work: None
+
+Signed-off-by: Aaradhana Sahu <aaradhana.sahu@oss.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c | 30 ++++++++++++++++++++------
+ drivers/net/wireless/ath/ath12k/core.h |  4 ++--
+ drivers/net/wireless/ath/ath12k/erp.c  |  2 +-
+ drivers/net/wireless/ath/ath12k/mac.c  | 26 ++++++++++------------
+ drivers/net/wireless/ath/ath12k/mac.h  |  1 -
+ drivers/net/wireless/ath/ath12k/wmi.c  |  5 +----
+ 6 files changed, 39 insertions(+), 29 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -998,19 +998,36 @@ int ath12k_core_power_up(struct ath12k_h
+ 	return 0;
+ }
+ 
+-void ath12k_core_cleanup_power_down_q6(struct ath12k_hw *ah)
++void ath12k_core_cleanup_power_down_q6(struct ath12k_hw_group *ag)
+ {
+-	struct ath12k_hw_group *ag = ath12k_ah_to_ag(ah);
+ 	struct ath12k_base *ab;
++	struct ath12k_hw *ah;
+ 	struct ath12k *ar;
++	unsigned long time_left;
+ 	int i, j, ret;
+ 	bool skip_power_down;
+ 
+-	lockdep_assert_wiphy(ah->hw->wiphy);
++	reinit_completion(&ag->umac_reset_complete);
++	for (i = 0; i < ag->num_hw; i++) {
++		ah = ag->ah[i];
++		if (!ah)
++			continue;
+ 
+-	ret = ath12k_mac_mlo_standby_teardown(ah);
+-	if (ret)
++		ret = ath12k_mac_mlo_standby_teardown(ah);
++		if (ret) {
++			ath12k_err(NULL, "mlo teardown is failed for ERP\n");
++			return;
++		}
++	}
++
++	time_left = wait_for_completion_timeout(&ag->umac_reset_complete,
++				msecs_to_jiffies(ATH12K_UMAC_RESET_TIMEOUT_IN_MS));
++	if (!time_left) {
++		ath12k_err(NULL, "UMAC reset didn't get completed within %d ms\n",
++			    ATH12K_UMAC_RESET_TIMEOUT_IN_MS);
++		ag->trigger_umac_reset = false;
+ 		return;
++	}
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+@@ -3478,7 +3495,6 @@ static void ath12k_core_upd_power_down(s
+  * chipsets
+  */
+ 
+-#define ATH12K_UMAC_RESET_TIMEOUT_IN_MS         1000
+ static int ath12k_core_trigger_umac_reset(struct ath12k_base *ab,
+ 					  enum wmi_mlo_tear_down_reason_code_type reason_code)
+ {
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -107,6 +107,7 @@
+ #define ATH12K_PHY_5GHZ_HIGH "phy02"
+ #define ATH12K_PHY_6GHZ "phy03"
+ #define ATH12K_Q6_POWER_UP_TIMEOUT	(20 * HZ)
++#define ATH12K_UMAC_RESET_TIMEOUT_IN_MS         1000
+ 
+ #define ATH12K_MAX_TID_VALUE 8
+ #define ATH12K_FREE_MAP_ID_MASK GENMASK(31, 0)
+@@ -1439,7 +1440,6 @@ struct ath12k {
+ 
+ 	bool erp_trigger_set;
+ 	struct work_struct erp_handle_trigger_work;
+-	struct completion standby_teardown;
+ 	struct completion suspend;
+ 	bool pdev_suspend;
+ 	struct completion pdev_resume;
+@@ -2146,7 +2146,7 @@ struct reserved_mem *ath12k_core_get_res
+ 						  const char* name);
+ u8 ath12k_core_get_total_num_vdevs(struct ath12k_base *ab);
+ bool ath12k_core_is_vdev_limit_reached(struct ath12k *ar, bool is_bridge_vdev);
+-void ath12k_core_cleanup_power_down_q6(struct ath12k_hw *ah);
++void ath12k_core_cleanup_power_down_q6(struct ath12k_hw_group *ag);
+ int ath12k_core_power_up(struct ath12k_hw_group *ag);
+ 
+ int ath12k_core_add_dl_qos(struct ath12k_base *ab,
+--- a/drivers/net/wireless/ath/ath12k/erp.c
++++ b/drivers/net/wireless/ath/ath12k/erp.c
+@@ -807,7 +807,7 @@ int ath12k_erp_enter(struct ieee80211_hw
+ 
+ 	if (!ath12k_check_erp_power_down(ag) &&
+ 	    ath12k_mac_validate_active_radio_count(ah))
+-		ath12k_core_cleanup_power_down_q6(ah);
++		ath12k_core_cleanup_power_down_q6(ag);
+ 
+ 	return 0;
+ 
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -16486,7 +16486,7 @@ err_vdev_del:
+ 	if (!ar->allocated_vdev_map && !arvif->is_scan_vif) {
+ 		if (ath12k_erp_get_sm_state() == ATH12K_ERP_ENTER_COMPLETE) {
+ 			if (ath12k_mac_validate_active_radio_count(ar->ah))
+-				ath12k_core_cleanup_power_down_q6(ar->ah);
++				ath12k_core_cleanup_power_down_q6(ab->ag);
+ 		}
+ 	}
+ 
+@@ -16732,20 +16732,20 @@ EXPORT_SYMBOL(ath12k_mac_op_ampdu_action
+ 
+ int ath12k_mac_mlo_standby_teardown(struct ath12k_hw *ah)
+ {
++	struct ath12k_hw_group *ag = ath12k_ah_to_ag(ah);
+ 	struct ath12k *ar;
+-	unsigned long time_left;
+ 	int ret = 0, i;
+ 	bool erp_standby_mode;
+ 
++	lockdep_assert_wiphy(ah->hw->wiphy);
+ 	for_each_ar(ah, ar, i) {
+ 		if (!ar->teardown_complete_event) {
+-			reinit_completion(&ar->standby_teardown);
+ 			if (ar->allocated_vdev_map)
+ 				erp_standby_mode = true;
+ 			else
+ 				erp_standby_mode = false;
+ 
+-			ret = ath12k_wmi_mlo_teardown(ar, false,
++			ret = ath12k_wmi_mlo_teardown(ar, !ag->trigger_umac_reset,
+ 						      WMI_MLO_TEARDOWN_REASON_STANDBY_DOWN,
+ 						      erp_standby_mode);
+ 			if (ret) {
+@@ -16754,14 +16754,7 @@ int ath12k_mac_mlo_standby_teardown(stru
+ 				return ret;
+ 			}
+ 
+-			time_left = wait_for_completion_timeout(&ar->standby_teardown,
+-								ATH12K_TEARDOWN_STANDBY_TIMEOUT);
+-
+-			if (!time_left) {
+-				ath12k_err(ar->ab, "Standby teardown wait timed out\n");
+-				ret = -ETIMEDOUT;
+-				return ret;
+-			}
++			ag->trigger_umac_reset = true;
+ 		}
+ 	}
+ 
+@@ -22479,7 +22472,6 @@ static void ath12k_mac_setup(struct ath1
+ 	init_completion(&ar->completed_11d_scan);
+ 	init_completion(&ar->thermal.wmi_sync);
+ 	init_completion(&ar->mvr_complete);
+-	init_completion(&ar->standby_teardown);
+ 	init_completion(&ar->suspend);
+ 	init_completion(&ar->pdev_resume);
+ 
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -99,7 +99,6 @@ struct ath12k_generic_iter {
+ 	u8_get_bits(hecap_phy[2], IEEE80211_HE_PHY_CAP2_UL_MU_PARTIAL_MU_MIMO)
+ 
+ #define ATH12K_MIN_TX_POWER		-127
+-#define ATH12K_TEARDOWN_STANDBY_TIMEOUT (2 * HZ)
+ #define ATH12K_PDEV_SUSPEND_TIMEOUT	(2 * HZ)
+ #define ATH12K_PDEV_RESUME_TIMEOUT	(2 * HZ)
+ 
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -12729,8 +12729,6 @@ static void ath12k_wmi_event_teardown_co
+ 	}
+ 
+ 	ar->teardown_complete_event = true;
+-	complete(&ar->standby_teardown);
+-
+ 	for (i = 0; i < ag->num_hw; i++) {
+ 		ah = ag->ah[i];
+ 		if (!ah)
+@@ -12743,10 +12741,10 @@ static void ath12k_wmi_event_teardown_co
+ 				complete_flag = false;
+ 		}
+ 	}
+-	if (complete_flag &&
+-	    (ag->recovery_mode != ATH12K_MLO_RECOVERY_MODE0 || ag->wsi_remap_in_progress))
++	if (complete_flag && ag->trigger_umac_reset) {
+                 complete(&ag->umac_reset_complete);
+-
++		ag->trigger_umac_reset = false;
++	}
+ }
+ 
+ #ifdef CPTCFG_ATH12K_DEBUGFS
+@@ -16806,7 +16804,7 @@ int ath12k_wmi_mlo_teardown(struct ath12
+ 	cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_MLO_TEARDOWN_CMD,
+ 						 sizeof(*cmd));
+ 	cmd->pdev_id = cpu_to_le32(ar->pdev->pdev_id);
+-	cmd->umac_reset = umac_reset;
++	cmd->umac_reset = cpu_to_le32(umac_reset);
+ 	cmd->reason_code = cpu_to_le32(reason_code);
+ 	cmd->erp_standby_mode = cpu_to_le32(erp_standby_mode);
+ 

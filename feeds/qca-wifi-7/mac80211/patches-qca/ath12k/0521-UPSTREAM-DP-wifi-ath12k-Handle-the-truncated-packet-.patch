@@ -1,0 +1,144 @@
+From 5e0f133b7db0ca4beb64c716d56a996120177108 Mon Sep 17 00:00:00 2001
+From: P Praneesh <ppranees@qti.qualcomm.com>
+Date: Tue, 12 Aug 2025 16:06:17 +0530
+Subject: [PATCH] UPSTREAM:DP:wifi:ath12k: Handle the truncated packet tlv in
+ monitor path
+
+Currently hardware provides the truncated packet in the buffer address
+TLV which is not getting handled in the driver which results in the
+providing this truncated packet to upper layer results in the invalid or
+malformed packets in the capture. Fix it by handling the truncated
+packets and free it in the driver itself to prevent it to reach it to
+higher layers.
+
+Patch-dependency:
+0495-04-Upstream-DP-wifi-ath12k-Support-Ethernet-packet-capt.patch
+
+Signed-off-by: P Praneesh <ppranees@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/debugfs.c     |  7 ++--
+ drivers/net/wireless/ath/ath12k/dp_mon.h      |  2 ++
+ drivers/net/wireless/ath/ath12k/hal_mon_cmn.h |  3 +-
+ .../net/wireless/ath/ath12k/wifi7/dp_mon2.c   | 32 +++++++++++++++++--
+ 4 files changed, 38 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/debugfs.c b/drivers/net/wireless/ath/ath12k/debugfs.c
+index 99a6845..065173f 100644
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -6611,10 +6611,11 @@ static ssize_t ath12k_dump_dp_mon_pdev_stats(struct file *file, char __user *use
+ 				 mon_stats->status_buf_processed,
+ 				 mon_stats->status_buf_free);
+ 		len += scnprintf(buf + len, size - len,
+-				 "packet frags process %u free %u to_mac80211 %u\n",
+-				 mon_stats->pkt_tlv_processed,
++				 "pkt frags proc %u free %u to_mac80211 %u truncated %u\n"
++				 , mon_stats->pkt_tlv_processed,
+ 				 mon_stats->pkt_tlv_free,
+-				 mon_stats->pkt_tlv_to_mac80211);
++				 mon_stats->pkt_tlv_to_mac80211,
++				 mon_stats->pkt_tlv_truncated);
+ 		len += scnprintf(buf + len, size - len,
+ 				 "Ring desc empty: %u flush %u truncated %u droptlv %u\n",
+ 				 mon_stats->ring_desc_empty,
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.h b/drivers/net/wireless/ath/ath12k/dp_mon.h
+index 183aea7..8a3721f 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.h
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.h
+@@ -151,6 +151,7 @@ enum dp_monitor_type {
+ 
+ struct ath12k_dp_mon_mpdu_meta {
+ 	u8 decap_type;
++	u8 truncated:1;
+ 	u32 err_bitmap;
+ };
+ 
+@@ -281,6 +282,7 @@ struct ath12k_pdev_mon_dp_stats {
+ 	u32 pkt_tlv_processed;
+ 	u32 pkt_tlv_free;
+ 	u32 pkt_tlv_to_mac80211;
++	u32 pkt_tlv_truncated;
+ 
+ 	u32 num_skb_alloc;
+ 	u32 num_skb_free;
+diff --git a/drivers/net/wireless/ath/ath12k/hal_mon_cmn.h b/drivers/net/wireless/ath/ath12k/hal_mon_cmn.h
+index d3d6153..185ef7c 100644
+--- a/drivers/net/wireless/ath/ath12k/hal_mon_cmn.h
++++ b/drivers/net/wireless/ath/ath12k/hal_mon_cmn.h
+@@ -86,7 +86,8 @@ struct hal_rx_mon_mpdu_info {
+ 	    mpdu_start_received:1,
+ 	    first_rx_hdr_rcvd:1,
+ 	    rx_hdr_rcvd:1,
+-	    raw_mpdu:1;
++	    raw_mpdu:1,
++	    truncated:1;
+ 	u32 err_bitmap;
+ };
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+index 633c4f5..f36c4cd 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+@@ -219,6 +219,11 @@ ath12k_wifi7_dp_mon_rx_parse_status_buf(struct ath12k_pdev_dp *dp_pdev,
+ 			msdu_info->last_buffer = true;
+ 	}
+ 
++	if (unlikely(packet_info->truncated)) {
++		mon_stats->pkt_tlv_truncated++;
++		ppdu_info->mpdu_info.truncated = true;
++	}
++
+ buf_replenish:
+ 	spin_lock_bh(&dp_mon->mon_desc_lock);
+ 	list_splice_tail(&mon_desc_used_list, &dp_mon->mon_desc_free_list);
+@@ -308,6 +313,29 @@ ath12k_dp_mon_parse_mpdu_start(struct ath12k_dp *dp, struct ath12k_mon_data *pmo
+ 	return 0;
+ }
+ 
++static void
++ath12k_wifi7_dp_mon_rx_parse_mpdu_end(struct ath12k_dp *dp, struct ath12k_mon_data *pmon)
++{
++	struct hal_rx_mon_ppdu_info *ppdu_info = &pmon->mon_ppdu_info;
++	struct ath12k_dp_mon_mpdu_meta *mpdu_meta;
++	struct sk_buff *skb = skb_peek_tail(&ppdu_info->mpdu_q);
++
++	if (!ppdu_info->mpdu_info.rx_hdr_rcvd)
++		goto reset_mpdu_info;
++
++	if (unlikely(!skb)) {
++		ath12k_warn(dp, "No skb found in the mpdu skb queue during mpdu_end\n");
++		goto reset_mpdu_info;
++	}
++
++	mpdu_meta = (struct ath12k_dp_mon_mpdu_meta *)skb->data;
++	mpdu_meta->truncated = ppdu_info->mpdu_info.truncated;
++
++reset_mpdu_info:
++	ppdu_info->mpdu_info.truncated = false;
++	ppdu_info->mpdu_info.mpdu_start_received = false;
++}
++
+ static int
+ ath12k_wifi7_dp_mon_rx_parse_dest_tlv(struct ath12k_pdev_dp *dp_pdev,
+ 				      struct ath12k_mon_data *pmon,
+@@ -323,7 +351,7 @@ ath12k_wifi7_dp_mon_rx_parse_dest_tlv(struct ath12k_pdev_dp *dp_pdev,
+ 	case HAL_RX_MON_STATUS_BUF_ADDR:
+ 		return ath12k_wifi7_dp_mon_rx_parse_status_buf(dp_pdev, pmon, tlv_data);
+ 	case HAL_RX_MON_STATUS_MPDU_END:
+-		pmon->mon_ppdu_info.mpdu_info.mpdu_start_received = false;
++		ath12k_wifi7_dp_mon_rx_parse_mpdu_end(dp_pdev->dp, pmon);
+ 		break;
+ 	case HAL_RX_MON_STATUS_MSDU_END:
+ 		ath12k_wifi7_dp_mon_rx_parse_status_msdu_end(pmon);
+@@ -979,7 +1007,7 @@ ath12k_wifi7_dp_mon_rx_parse_ppdu_status(struct ath12k_pdev_dp *dp_pdev,
+ 		 * To avoid processing an skb with zero length, add a check to
+ 		 * skip these cases.
+ 		 */
+-		if (!mpdu->len) {
++		if ((!mpdu->len) || (mpdu_meta->truncated)) {
+ 			ath12k_dp_mon_cnt_skb_and_frags(mpdu, &num_skb, &pkt_tlv);
+ 			mon_stats->num_skb_raw += num_skb;
+ 			mon_stats->num_frag_raw += pkt_tlv;
+-- 
+2.34.1
+

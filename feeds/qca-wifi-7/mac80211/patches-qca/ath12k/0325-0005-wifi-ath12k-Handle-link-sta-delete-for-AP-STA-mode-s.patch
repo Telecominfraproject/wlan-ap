@@ -1,0 +1,311 @@
+From 6e326e9b3618d38fc1f1c73c1b021c065a0a9f9e Mon Sep 17 00:00:00 2001
+From: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+Date: Mon, 12 May 2025 12:56:07 +0530
+Subject: [PATCH] wifi: ath12k: Handle link sta delete for AP/STA mode(s)
+
+As part of ML link reconfiguration framework, userspace will send link
+sta delete command to kernel to remove only the link station associated
+to the affected link. In-order to achieve that, mac80211 will send
+change_sta_links to the driver. Currently, we don't have support to
+delete a link dynamically in change_sta_links ops, hence the command is
+silently ignored by sending success to mac80211.
+
+Add support to delete the station peer dynamically it its AP mode and
+remove the link station structure from ahsta if its station mode.
+
+[Note: If primary link is getting removed, then we are not handling the
+link removal, instead we will be disassociating the entire MLD
+association due to limitation]
+
+Patch-work: None
+Patch-dependency: Initial MLO patche series
+
+Signed-off-by: Manish Dharanenthiran <quic_mdharane@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/debugfs.c  |   4 +
+ drivers/net/wireless/ath/ath12k/mac.c      | 161 ++++++++++++++++-----
+ drivers/net/wireless/ath/ath12k/mac.h      |   1 +
+ drivers/net/wireless/ath/ath12k/wifi7/hw.c |   1 +
+ 4 files changed, 134 insertions(+), 33 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -4391,7 +4391,15 @@ ap_and_sta_debugfs_file:
+ 
+ void ath12k_debugfs_remove_interface(struct ath12k_link_vif *arvif)
+ {
+-	arvif->debugfs_twt = NULL;
+-	debugfs_remove(arvif->ahvif->debugfs_primary_link);
+-	arvif->ahvif->debugfs_primary_link = NULL;
++	if (arvif->ahvif->vif->type == NL80211_IFTYPE_AP)
++		arvif->debugfs_twt = NULL;
++	/**
++	 * Remove ahvif debugfs only when all the link is going to be removed.
++	 */
++	if (hweight16(arvif->ahvif->links_map) <= 1) {
++		if (arvif->ahvif->vif->type != NL80211_IFTYPE_MESH_POINT)
++			arvif->ahvif->debugfs_primary_link = NULL;
++		/* TODO: debugfs_rfs_core_mask and debugfs_linkstats
++		 */
++	}
+ }
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -8767,10 +8767,11 @@ int ath12k_mac_op_change_sta_links(struc
+ 	struct ath12k_sta *ahsta = ath12k_sta_to_ahsta(sta);
+ 	struct ath12k_hw *ah = hw->priv;
+ 	struct ath12k_link_vif *arvif;
+-	struct ath12k_link_sta *arsta;
++	struct ath12k_link_sta *arsta, *tmp_arsta, *def_arsta;
+ 	unsigned long valid_links;
+ 	struct ath12k *ar;
+-	u8 link_id;
++	u16 removed_link_map;
++	u8 link_id, tmp_link_id;
+ 	int ret;
+ 
+ 	lockdep_assert_wiphy(hw->wiphy);
+@@ -8778,64 +8779,142 @@ int ath12k_mac_op_change_sta_links(struc
+ 	if (!sta->valid_links)
+ 		return -EINVAL;
+ 
+-	/* Firmware does not support removal of one of link stas. All sta
+-	 * would be removed during ML STA delete in sta_state(), hence link
+-	 * sta removal is not handled here.
+-	 */
+-	if (new_links < old_links)
+-		return 0;
+-
+-	if (ahsta->ml_peer_id == ATH12K_MLO_PEER_ID_INVALID) {
+-		ath12k_hw_warn(ah, "unable to add link for ml sta %pM", sta->addr);
+-		return -EINVAL;
+-	}
++	if (new_links > old_links) {
++		if (ahsta->ml_peer_id == ATH12K_MLO_PEER_ID_INVALID) {
++			ath12k_hw_warn(ah, "unable to add link for ml sta %pM", sta->addr);
++			return -EINVAL;
++		}
+ 
+-	/* this op is expected only after initial sta insertion with default link */
+-	if (WARN_ON(ahsta->links_map == 0))
+-		return -EINVAL;
++		/* this op is expected only after initial sta insertion with default link */
++		if (WARN_ON(ahsta->links_map == 0))
++			return -EINVAL;
++
++		if (hweight16(ahsta->links_map) >= ATH12K_WMI_MLO_PEER_MAX_LINKS) {
++			ath12k_err(NULL, "More than 3 links are not supported for ML STA %pM\n",
++				   sta->addr);
++			return -EINVAL;
++		}
+ 
+-	if ((test_bit(ahvif->primary_link_id, &sta->valid_links))) {
+-		arvif = ahvif->link[ahvif->primary_link_id];
+-		if (arvif->ar->ab->hw_params->is_plink_preferable) {
+-			ahsta->primary_link_id = ahvif->primary_link_id;
+-		} else {
+-			ahsta->primary_link_id = ahsta->assoc_link_id;
+-			arvif = ahvif->link[ahsta->assoc_link_id];
+-			if (!arvif->ar->ab->hw_params->is_plink_preferable) {
+-				for_each_set_bit(link_id, &sta->valid_links,
+-						 IEEE80211_MLD_MAX_NUM_LINKS) {
+-					if (link_id != ahsta->primary_link_id) {
+-						ahsta->primary_link_id = link_id;
+-						break;
++		if ((test_bit(ahvif->primary_link_id, &sta->valid_links))) {
++			arvif = ahvif->link[ahvif->primary_link_id];
++			if (arvif->ar->ab->hw_params->is_plink_preferable) {
++				ahsta->primary_link_id = ahvif->primary_link_id;
++			} else {
++				ahsta->primary_link_id = ahsta->assoc_link_id;
++				arvif = ahvif->link[ahsta->assoc_link_id];
++				if (!arvif->ar->ab->hw_params->is_plink_preferable) {
++					for_each_set_bit(link_id, &sta->valid_links,
++							 IEEE80211_MLD_MAX_NUM_LINKS) {
++						if (link_id != ahsta->primary_link_id) {
++							ahsta->primary_link_id = link_id;
++							break;
++						}
+ 					}
+ 				}
+ 			}
+ 		}
+-	}
+ 
+-	valid_links = new_links;
+-	for_each_set_bit(link_id, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
+-		if (ahsta->links_map & BIT(link_id))
+-			continue;
+-
+-		arvif = wiphy_dereference(hw->wiphy, ahvif->link[link_id]);
+-		arsta = ath12k_mac_alloc_assign_link_sta(ah, ahsta, ahvif, link_id);
+-
+-		if (!arvif || !arsta) {
+-			ath12k_hw_warn(ah, "Failed to alloc/assign link sta");
+-			continue;
++		valid_links = new_links;
++		for_each_set_bit(link_id, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++			if (ahsta->links_map & BIT(link_id))
++				continue;
++
++			arvif = wiphy_dereference(hw->wiphy, ahvif->link[link_id]);
++			arsta = ath12k_mac_alloc_assign_link_sta(ah, ahsta, ahvif, link_id);
++
++			if (!arvif || !arsta) {
++				ath12k_hw_warn(ah, "Failed to alloc/assign link sta");
++				continue;
++			}
++
++			ar = arvif->ar;
++			if (!ar)
++				continue;
++
++			ret = ath12k_mac_station_add(ar, arvif, arsta);
++			if (ret) {
++				ath12k_warn(ar->ab, "Failed to add station: %pM for VDEV: %d\n",
++					    arsta->addr, arvif->vdev_id);
++				ath12k_mac_free_unassign_link_sta(ah, ahsta, link_id);
++				return ret;
++			}
+ 		}
++	} else {
++		removed_link_map = old_links ^ new_links;
++
++		if (hweight16(removed_link_map) > 1)
++			return -EINVAL;
++
++		link_id = ffs(removed_link_map) - 1;
++
++		arvif = ahvif->link[link_id];
++		arsta = ahsta->link[link_id];
+ 
+-		ar = arvif->ar;
+-		if (!ar)
+-			continue;
+-
+-		ret = ath12k_mac_station_add(ar, arvif, arsta);
+-		if (ret) {
+-			ath12k_warn(ar->ab, "Failed to add station: %pM for VDEV: %d\n",
+-				    arsta->addr, arvif->vdev_id);
+-			ath12k_mac_free_unassign_link_sta(ah, ahsta, link_id);
+-			return ret;
++		if (!arsta)
++			return -EINVAL;
++
++		if (vif->type == NL80211_IFTYPE_AP) {
++			if (!arvif)
++				return -EINVAL;
++
++			ar = arvif->ar;
++
++			if (ahsta->primary_link_id == link_id) {
++				/* WAR: send low_ack if its primary link id is
++				 * getting removed, until primary UMAC
++				 * migration is supported
++				 */
++				ieee80211_report_low_ack(sta, ATH12K_REPORT_LOW_ACK_NUM_PKT);
++				return -EINVAL;
++			}
++
++			ret = ath12k_mac_station_unauthorize(ar, arvif, arsta);
++			if (ret)
++				ath12k_warn(ar->ab, "Failed to unauth station: %pM for VDEV: %d\n",
++					    arsta->addr, arvif->vdev_id);
++
++			ret = ath12k_mac_station_disassoc(ar, arvif, arsta);
++			if (ret)
++				ath12k_warn(ar->ab, "Failed to disassoc station: %pM for VDEV: %d\n",
++					    arsta->addr, arvif->vdev_id);
++
++			ret = ath12k_mac_station_remove(ar, arvif, arsta);
++			if (ret)
++				ath12k_warn(ar->ab, "Failed to remove station: %pM for VDEV: %d\n",
++					    sta->addr, arvif->vdev_id);
++
++			if (ret) {
++				if (test_bit(ATH12K_FLAG_RECOVERY, &arvif->ar->ab->dev_flags)) {
++					ath12k_info(ar->ab, " overwriting ret %d with 0 for %pM",
++						    ret, arsta->addr);
++					ret = 0;
++				}
++			}
++		} else if (vif->type == NL80211_IFTYPE_STATION)
++			ath12k_mac_free_unassign_link_sta(ahsta->ahvif->ah, arsta->ahsta,
++							  arsta->link_id);
++
++		/* If the link that is getting removed is the assoc link id of
++		 * the station, then move the contents of the next link to
++		 * deflink and free the moved link memory
++		 */
++		if (ahsta->assoc_link_id != ahsta->primary_link_id &&
++		    ahsta->assoc_link_id == link_id &&
++		    hweight32(ahsta->links_map) >= 1) {
++			tmp_link_id = ffs(ahsta->links_map) - 1;
++
++			tmp_arsta = wiphy_dereference(ah->hw->wiphy, ahsta->link[tmp_link_id]);
++			if (tmp_arsta) {
++				wiphy_work_cancel(ar->ah->hw->wiphy, &tmp_arsta->update_wk);
++				memcpy(&ahsta->deflink, tmp_arsta,
++				       sizeof(*tmp_arsta));
++				def_arsta = &ahsta->deflink;
++				wiphy_work_init(&def_arsta->update_wk, ath12k_sta_rc_update_wk);
++				ahsta->assoc_link_id = tmp_arsta->link_id;
++				rcu_assign_pointer(ahsta->link[tmp_link_id], &ahsta->deflink);
++				synchronize_rcu();
++				kfree(tmp_arsta);
++			}
+ 		}
+ 	}
+ 
+@@ -8843,6 +8922,21 @@ int ath12k_mac_op_change_sta_links(struc
+ }
+ EXPORT_SYMBOL(ath12k_mac_op_change_sta_links);
+ 
++bool ath12k_mac_op_removed_link_is_primary(struct ieee80211_sta *sta,
++					   u16 removed_links)
++{
++	struct ath12k_sta *ahsta = ath12k_sta_to_ahsta(sta);
++	unsigned long removed_link = removed_links;
++	u16 link_id;
++
++	for_each_set_bit(link_id, &removed_link, ATH12K_NUM_MAX_LINKS)
++		if (ahsta->primary_link_id == link_id)
++			return true;
++
++	return false;
++}
++EXPORT_SYMBOL(ath12k_mac_op_removed_link_is_primary);
++
+ bool ath12k_mac_op_can_activate_links(struct ieee80211_hw *hw,
+ 				      struct ieee80211_vif *vif,
+ 				      u16 active_links)
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -286,6 +286,7 @@ int ath12k_mac_op_get_txpower(struct iee
+ int ath12k_mac_op_link_reconfig_remove(struct ieee80211_hw *hw,
+ 				       struct ieee80211_vif *vif,
+ 				       const struct cfg80211_link_reconfig_removal_params *params);
++bool ath12k_mac_op_removed_link_is_primary(struct ieee80211_sta *sta, u16 removed_links);
+ int ath12k_mac_mgmt_tx(struct ath12k *ar, struct sk_buff *skb,
+ 		       bool is_prb_rsp);
+ void ath12k_mac_add_p2p_noa_ie(struct ath12k *ar,
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -1156,6 +1156,7 @@ static const struct ieee80211_ops ath12k
+ 	.link_sta_add_debugfs           = ath12k_debugfs_link_sta_op_add,
+ #endif
+ 	.link_reconfig_remove           = ath12k_mac_op_link_reconfig_remove,
++	.removed_link_is_primary        = ath12k_mac_op_removed_link_is_primary,
+ };
+ 
+ int ath12k_wifi7_hw_init(struct ath12k_base *ab)
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -3219,6 +3219,7 @@ enum wmi_phy_mode {
+ };
+ 
+ #define ATH12K_WMI_MLO_MAX_LINKS 4
++#define ATH12K_WMI_MLO_PEER_MAX_LINKS 3
+ 
+ struct wmi_ml_partner_info {
+ 	u32 vdev_id;

@@ -1,0 +1,482 @@
+From 630ba80167c8c9d39e8d777fe74fc7cd0556dd48 Mon Sep 17 00:00:00 2001
+From: Harsh Kumar Bijlani <quic_hbijlani@quicinc.com>
+Date: Fri, 28 Mar 2025 18:24:18 +0530
+Subject: [PATCH 3/3] wifi: ath12k: Use ath12k_dp_peer in per packet Tx & Rx
+ path
+
+As part of peer modularization in Unified Driver Framework, station view
+for the data path is shown below:
+
+ath12k_dp_peer
+       |
+       |-> ath12k_dp_link_peer
+       |
+       |-> ath12k_dp_link_peer
+       |
+       |-> ath12k_dp_link_peer
+
+This ath12k_dp_peer contains the fields used in the per pkt Tx Rx paths
+applicable across all the links and maintains an array of
+ath12k_dp_link_peer. Per pkt Tx and Rx path operates on ath12k_dp_peer.
+
+ath12k_dp_link_peer contains the fields specific to a link and these are
+mostly for telemetry and monitor usage.
+
+This patch is to move all the link agnostic fields from ath12k_dp_link_peer
+to ath12k_dp_peer and make changes in the APIs wherever required.
+
+Also make changes to fetch ath12k_dp_peer in per packet Tx and Rx paths
+using peer_id instead of ath12k_dp_link_peer.
+
+Signed-off-by: Harsh Kumar Bijlani <quic_hbijlani@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c          |  5 +-
+ drivers/net/wireless/ath/ath12k/dp_peer.c     | 39 ++++++++++++++++
+ drivers/net/wireless/ath/ath12k/dp_peer.h     | 24 +++++-----
+ drivers/net/wireless/ath/ath12k/dp_rx.c       | 46 ++++++++++++++-----
+ drivers/net/wireless/ath/ath12k/dp_rx.h       |  4 ++
+ drivers/net/wireless/ath/ath12k/mac.c         | 26 +++++------
+ drivers/net/wireless/ath/ath12k/peer.c        |  3 --
+ drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c | 20 ++++----
+ 8 files changed, 116 insertions(+), 51 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -44,8 +44,9 @@ void ath12k_dp_peer_cleanup(struct ath12
+ 	}
+ 
+ 	ath12k_dp_rx_peer_tid_cleanup(ar, peer);
+-	crypto_free_shash(peer->tfm_mmic);
+-	peer->dp_setup_done = false;
++	crypto_free_shash(peer->dp_peer->tfm_mmic);
++	if (peer->primary_link)
++		peer->dp_peer->primary_link_frag_setup = false;
+ 	spin_unlock_bh(&dp->dp_lock);
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.c
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.c
+@@ -345,6 +345,42 @@ static inline u16 ath12k_dp_peer_get_pee
+ 		((dp->device_id << PEER_TABLE_SOC_ID_SHIFT) | peer_id);
+ }
+ 
++struct ath12k_dp_peer *ath12k_dp_peer_find_by_peerid_index(struct ath12k_dp *dp,
++							   struct ath12k_pdev_dp *dp_pdev,
++							   u16 peer_id)
++{
++	u16 index;
++
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
++			 "ath12k dp peer find by peerid index called without rcu lock");
++
++	index = ath12k_dp_peer_get_peerid_index(dp, peer_id);
++
++	return rcu_dereference(dp_pdev->dp_hw->dp_peer_list[index]);
++}
++
++struct ath12k_dp_link_peer *
++ath12k_dp_link_peer_find_by_peerid_index(struct ath12k_dp *dp,
++					 struct ath12k_pdev_dp *dp_pdev, u16 peer_id)
++{
++	struct ath12k_dp_peer *dp_peer = NULL;
++	u8 link_id;
++
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held(),
++			 "ath12k dp link peer find by peerid index called without rcu lock");
++
++	if (dp_pdev->hw_link_id >= ATH12K_NUM_MAX_LINKS)
++		return NULL;
++
++	dp_peer = ath12k_dp_peer_find_by_peerid_index(dp, dp_pdev, peer_id);
++	if (!dp_peer)
++		return NULL;
++
++	link_id = dp_peer->hw_links[dp_pdev->hw_link_id];
++
++	return rcu_dereference(dp_peer->link_peers[link_id]);
++}
++
+ int ath12k_dp_peer_create(struct ath12k_dp_hw *dp_hw, u8 *addr,
+ 			  struct ath12k_dp_peer_create_params *params)
+ {
+@@ -449,6 +485,8 @@ int ath12k_dp_link_peer_assign(struct at
+ 	peer->dp_peer = dp_peer;
+ 	peer->hw_link_id = hw_link_id;
+ 
++	dp_peer->hw_links[peer->hw_link_id] = link_id;
++
+ 	peerid_index = ath12k_dp_peer_get_peerid_index(dp, peer->peer_id);
+ 
+ 	rcu_assign_pointer(dp_peer->link_peers[peer->link_id], peer);
+@@ -492,6 +530,7 @@ void ath12k_dp_link_peer_unassign(struct
+ 	spin_lock_bh(&dp_hw->peer_lock);
+ 
+ 	dp_peer = peer->dp_peer;
++	dp_peer->hw_links[peer->hw_link_id] = 0;
+ 
+ 	peerid_index = ath12k_dp_peer_get_peerid_index(dp, peer->peer_id);
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.h
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.h
+@@ -35,24 +35,11 @@ struct ath12k_dp_link_peer {
+ 	u8 pdev_idx;
+ 	u16 hw_peer_id;
+ 
+-	/* protected by ab->data_lock */
+-	struct ieee80211_key_conf *keys[WMI_MAX_KEY_INDEX + 1];
+-	struct ath12k_dp_rx_tid rx_tid[IEEE80211_NUM_TIDS + 1];
+-
+-	/* Info used in MMIC verification of
+-	 * RX fragments
+-	 */
+-	struct crypto_shash *tfm_mmic;
+-	u8 mcast_keyidx;
+-	u8 ucast_keyidx;
+-	u16 sec_type;
+-	u16 sec_type_grp;
+ 	struct ppdu_user_delayba ppdu_stats_delayba;
+ 	bool delayba_flag;
+ 	bool is_authorized;
+ 	bool mlo;
+ 	/* protected by ab->data_lock */
+-	bool dp_setup_done;
+ 
+ 	u16 ml_id;
+ 
+@@ -89,6 +76,8 @@ struct ath12k_dp_peer {
+ 	spinlock_t link_peers_lock;
+ 	struct ath12k_dp_link_peer __rcu *link_peers[ATH12K_NUM_MAX_LINKS];
+ 
++	bool primary_link_frag_setup;
++
+ 	bool is_authorized;
+ 	enum hal_pn_type pn_type;
+ 
+@@ -101,6 +90,8 @@ struct ath12k_dp_peer {
+ 	u8 ucast_keyidx;
+ 	u16 sec_type;
+ 	u16 sec_type_grp;
++
++	u8 hw_links[ATH12K_GROUP_MAX_RADIO];
+ };
+ 
+ void ath12k_peer_unmap_event(struct ath12k_base *ab, u16 peer_id);
+@@ -126,4 +117,11 @@ int ath12k_dp_link_peer_rhash_delete(str
+ int ath12k_dp_peer_create(struct ath12k_dp_hw *dp_hw, u8 *addr,
+ 			  struct ath12k_dp_peer_create_params *params);
+ void ath12k_dp_peer_delete(struct ath12k_dp_hw *dp_hw, u8 *addr);
++struct ath12k_dp_peer *ath12k_dp_peer_find_by_peerid_index(struct ath12k_dp *dp,
++							   struct ath12k_pdev_dp *dp_pdev,
++							   u16 peer_id);
++struct ath12k_dp_link_peer *
++ath12k_dp_link_peer_find_by_peerid_index(struct ath12k_dp *dp,
++					 struct ath12k_pdev_dp *dp_pdev, u16 peer_id);
++
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -663,8 +663,11 @@ void ath12k_dp_rx_peer_tid_cleanup(struc
+ 
+ 	lockdep_assert_held(&dp->dp_lock);
+ 
++	if (!peer->primary_link)
++		return;
++
+ 	for (i = 0; i <= IEEE80211_NUM_TIDS; i++) {
+-		rx_tid = &peer->rx_tid[i];
++		rx_tid = &peer->dp_peer->rx_tid[i];
+ 
+ 		ath12k_wifi7_dp_rx_peer_tid_delete(ar, peer, i);
+ 		ath12k_dp_rx_frags_cleanup(rx_tid, true);
+@@ -715,7 +718,7 @@ int ath12k_wifi7_dp_rx_peer_tid_setup(st
+ 		return -EINVAL;
+ 	}
+ 
+-	rx_tid = &peer->rx_tid[tid];
++	rx_tid = &peer->dp_peer->rx_tid[tid];
+ 	/* Update the tid queue if it is already setup */
+ 	if (rx_tid->active) {
+ 		paddr = rx_tid->paddr;
+@@ -841,14 +844,19 @@ int ath12k_dp_rx_ampdu_stop(struct ath12
+ 		return -ENOENT;
+ 	}
+ 
+-	active = peer->rx_tid[params->tid].active;
++	if (!peer->primary_link) {
++		spin_unlock_bh(&dp->dp_lock);
++		return 0;
++	}
++
++	active = peer->dp_peer->rx_tid[params->tid].active;
+ 
+ 	if (!active) {
+ 		spin_unlock_bh(&dp->dp_lock);
+ 		return 0;
+ 	}
+ 
+-	ret = ath12k_wifi7_peer_rx_tid_reo_update(ar, peer, peer->rx_tid, 1, 0, false);
++	ret = ath12k_wifi7_peer_rx_tid_reo_update(ar, peer, peer->dp_peer->rx_tid, 1, 0, false);
+ 	spin_unlock_bh(&dp->dp_lock);
+ 	if (ret) {
+ 		ath12k_warn(ab, "failed to update reo for rx tid %d: %d\n",
+@@ -892,7 +900,7 @@ int ath12k_dp_rx_peer_pn_replay_config(s
+ 	}
+ 
+ 	for (tid = 0; tid <= IEEE80211_NUM_TIDS; tid++) {
+-		rx_tid = &peer->rx_tid[tid];
++		rx_tid = &peer->dp_peer->rx_tid[tid];
+ 		if (!rx_tid->active)
+ 			continue;
+ 
+@@ -930,6 +938,20 @@ struct sk_buff *ath12k_dp_rx_get_msdu_la
+ 	return NULL;
+ }
+ 
++struct ath12k_dp_peer *
++ath12k_dp_rx_h_find_peer_by_peerid_index(struct ath12k_dp *dp,
++					 struct ath12k_pdev_dp *dp_pdev,
++					 struct sk_buff *msdu)
++{
++	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
++	struct ath12k_dp_peer *peer = NULL;
++
++	if (rxcb->peer_id)
++		peer = ath12k_dp_peer_find_by_peerid_index(dp, dp_pdev, rxcb->peer_id);
++
++	return peer;
++}
++
+ struct ath12k_dp_link_peer *
+ ath12k_dp_rx_h_find_peer(struct ath12k_dp *dp, struct sk_buff *msdu,
+ 			 struct hal_rx_desc_data *rx_desc_data)
+@@ -967,7 +989,7 @@ void ath12k_dp_rx_deliver_msdu(struct at
+ 	struct ieee80211_radiotap_he *he;
+ 	struct ieee80211_rx_status *rx_status;
+ 	struct ieee80211_sta *pubsta;
+-	struct ath12k_dp_link_peer *peer;
++	struct ath12k_dp_peer *peer;
+ 	struct ath12k_skb_rxcb *rxcb = ATH12K_SKB_RXCB(msdu);
+ 	u8 decap = rx_desc_data->decap;
+ 	bool is_mcbc = rxcb->is_mcbc;
+@@ -980,17 +1002,19 @@ void ath12k_dp_rx_deliver_msdu(struct at
+ 		status->flag |= RX_FLAG_RADIOTAP_HE;
+ 	}
+ 
++	rcu_read_lock();
+ 	spin_lock_bh(&dp->dp_lock);
+-	peer = ath12k_dp_rx_h_find_peer(dp, msdu, rx_desc_data);
++	peer = ath12k_dp_peer_find_by_peerid_index(dp, dp_pdev, rx_desc_data->peer_id);
+ 
+ 	pubsta = peer ? peer->sta : NULL;
+ 
+ 	if (pubsta && pubsta->valid_links) {
+ 		status->link_valid = 1;
+-		status->link_id = peer->link_id;
++		status->link_id = peer->hw_links[rxcb->hw_link_id];
+ 	}
+ 
+ 	spin_unlock_bh(&dp->dp_lock);
++	rcu_read_unlock();
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_DATA,
+ 		   "rx skb %p len %u peer %pM %d %s sn %u %s%s%s%s%s%s%s%s%s%s rate_idx %u vht_nss %u freq %u band %u flag 0x%x fcs-err %i mic-err %i amsdu-more %i\n",
+@@ -1082,14 +1106,14 @@ int ath12k_dp_rx_peer_frag_setup(struct
+ 	}
+ 
+ 	for (i = 0; i <= IEEE80211_NUM_TIDS; i++) {
+-		rx_tid = &peer->rx_tid[i];
++		rx_tid = &peer->dp_peer->rx_tid[i];
+ 		rx_tid->dp = dp;
+ 		timer_setup(&rx_tid->frag_timer, ath12k_dp_rx_frag_timer, 0);
+ 		skb_queue_head_init(&rx_tid->rx_frags);
+ 	}
+ 
+-	peer->tfm_mmic = tfm;
+-	peer->dp_setup_done = true;
++	peer->dp_peer->tfm_mmic = tfm;
++	peer->dp_peer->primary_link_frag_setup = true;
+ 	spin_unlock_bh(&dp->dp_lock);
+ 
+ 	return 0;
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.h
+@@ -171,5 +171,9 @@ void ath12k_dp_rx_h_undecap_raw(struct a
+ 				enum hal_encrypt_type enctype,
+ 				struct ieee80211_rx_status *status,
+ 				bool decrypted);
++struct ath12k_dp_peer *
++ath12k_dp_rx_h_find_peer_by_peerid_index(struct ath12k_dp *dp,
++					 struct ath12k_pdev_dp *dp_pdev,
++					 struct sk_buff *msdu);
+ 
+ #endif /* ATH12K_DP_RX_H */
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -5284,12 +5284,12 @@ static int ath12k_clear_peer_keys(struct
+ 	}
+ 	spin_unlock_bh(&ab->dp->dp_lock);
+ 
+-	for (i = 0; i < ARRAY_SIZE(peer->keys); i++) {
+-		if (!peer->keys[i])
++	for (i = 0; i < ARRAY_SIZE(peer->dp_peer->keys); i++) {
++		if (!peer->dp_peer->keys[i])
+ 			continue;
+ 
+ 		/* key flags are not required to delete the key */
+-		ret = ath12k_install_key(arvif, peer->keys[i],
++		ret = ath12k_install_key(arvif, peer->dp_peer->keys[i],
+ 					 DISABLE_KEY, addr, flags);
+ 		if (ret < 0 && first_errno == 0)
+ 			first_errno = ret;
+@@ -5299,7 +5299,7 @@ static int ath12k_clear_peer_keys(struct
+ 				    i, ret);
+ 
+ 		spin_lock_bh(&ab->dp->dp_lock);
+-		peer->keys[i] = NULL;
++		peer->dp_peer->keys[i] = NULL;
+ 		spin_unlock_bh(&ab->dp->dp_lock);
+ 	}
+ 
+@@ -5379,20 +5379,20 @@ static int ath12k_mac_set_key(struct ath
+ 	peer = ath12k_dp_link_peer_find_by_vdev_id_and_addr(ab->dp, arvif->vdev_id,
+ 							    peer_addr);
+ 	if (peer && cmd == SET_KEY) {
+-		peer->keys[key->keyidx] = key;
++		peer->dp_peer->keys[key->keyidx] = key;
+ 		if (key->flags & IEEE80211_KEY_FLAG_PAIRWISE) {
+-			peer->ucast_keyidx = key->keyidx;
+-			peer->sec_type = ath12k_dp_tx_get_encrypt_type(key->cipher);
++			peer->dp_peer->ucast_keyidx = key->keyidx;
++			peer->dp_peer->sec_type = ath12k_dp_tx_get_encrypt_type(key->cipher);
+ 		} else {
+-			peer->mcast_keyidx = key->keyidx;
+-			peer->sec_type_grp = ath12k_dp_tx_get_encrypt_type(key->cipher);
++			peer->dp_peer->mcast_keyidx = key->keyidx;
++			peer->dp_peer->sec_type_grp = ath12k_dp_tx_get_encrypt_type(key->cipher);
+ 		}
+ 	} else if (peer && cmd == DISABLE_KEY) {
+-		peer->keys[key->keyidx] = NULL;
++		peer->dp_peer->keys[key->keyidx] = NULL;
+ 		if (key->flags & IEEE80211_KEY_FLAG_PAIRWISE)
+-			peer->ucast_keyidx = 0;
++			peer->dp_peer->ucast_keyidx = 0;
+ 		else
+-			peer->mcast_keyidx = 0;
++			peer->dp_peer->mcast_keyidx = 0;
+ 	} else if (!peer)
+ 		/* impossible unless FW goes crazy */
+ 		ath12k_warn(ab, "peer %pM disappeared!\n", peer_addr);
+@@ -8283,7 +8283,7 @@ void ath12k_mac_op_tx(struct ieee80211_h
+ 				continue;
+ 			}
+ 
+-			key = peer->keys[peer->mcast_keyidx];
++			key = peer->dp_peer->keys[peer->dp_peer->mcast_keyidx];
+ 			if (key) {
+ 				skb_cb->cipher = key->cipher;
+ 				skb_cb->flags |= ATH12K_SKB_CIPHER_SET;
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -230,9 +230,6 @@ int ath12k_peer_create(struct ath12k *ar
+ 		}
+ 	}
+ 
+-	peer->sec_type = HAL_ENCRYPT_TYPE_OPEN;
+-	peer->sec_type_grp = HAL_ENCRYPT_TYPE_OPEN;
+-
+ 	ar->num_peers++;
+ 
+ 	spin_unlock_bh(&ar->ab->dp->dp_lock);
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
+@@ -240,7 +240,7 @@ void ath12k_wifi7_dp_rx_peer_tid_delete(
+ 					struct ath12k_dp_link_peer *peer, u8 tid)
+ {
+ 	struct ath12k_hal_reo_cmd cmd = {0};
+-	struct ath12k_dp_rx_tid *rx_tid = &peer->rx_tid[tid];
++	struct ath12k_dp_rx_tid *rx_tid = &peer->dp_peer->rx_tid[tid];
+ 	int ret;
+ 
+ 	if (!rx_tid->active)
+@@ -647,7 +647,7 @@ static void ath12k_wifi7_dp_rx_h_mpdu(st
+ 	enum hal_encrypt_type enctype;
+ 	bool is_decrypted = false;
+ 	struct ieee80211_hdr *hdr;
+-	struct ath12k_dp_link_peer *peer;
++	struct ath12k_dp_peer *peer;
+ 	u32 err_bitmap = rx_desc_data->err_bitmap;
+ 
+ 	/* PN for multicast packets will be checked in mac80211 */
+@@ -657,8 +657,9 @@ static void ath12k_wifi7_dp_rx_h_mpdu(st
+ 	if (rxcb->is_mcbc)
+ 		rxcb->peer_id = rx_desc_data->peer_id;
+ 
++	rcu_read_lock();
+ 	spin_lock_bh(&dp->dp_lock);
+-	peer = ath12k_dp_rx_h_find_peer(dp, msdu, rx_desc_data);
++	peer = ath12k_dp_rx_h_find_peer_by_peerid_index(dp, dp_pdev, msdu);
+ 	if (peer) {
+ 		if (rxcb->is_mcbc)
+ 			enctype = peer->sec_type_grp;
+@@ -668,6 +669,7 @@ static void ath12k_wifi7_dp_rx_h_mpdu(st
+ 		enctype = HAL_ENCRYPT_TYPE_OPEN;
+ 	}
+ 	spin_unlock_bh(&dp->dp_lock);
++	rcu_read_unlock();
+ 
+ 	if (enctype != HAL_ENCRYPT_TYPE_OPEN && !err_bitmap)
+ 		is_decrypted = rx_desc_data->is_decrypted;
+@@ -1192,7 +1194,7 @@ exit:
+ }
+ 
+ static int ath12k_wifi7_dp_rx_h_verify_tkip_mic(struct ath12k_pdev_dp *dp_pdev,
+-						struct ath12k_dp_link_peer *peer,
++						struct ath12k_dp_peer *peer,
+ 						enum hal_encrypt_type enctype,
+ 						struct sk_buff *msdu,
+ 						struct hal_rx_desc_data *rx_desc_data)
+@@ -1255,7 +1257,7 @@ mic_fail:
+ }
+ 
+ static int ath12k_wifi7_dp_rx_h_defrag(struct ath12k_pdev_dp *dp_pdev,
+-				       struct ath12k_dp_link_peer *peer,
++				       struct ath12k_dp_peer *peer,
+ 				       struct ath12k_dp_rx_tid *rx_tid,
+ 				       struct sk_buff **defrag_skb,
+ 				       enum hal_encrypt_type enctype,
+@@ -1558,7 +1560,7 @@ static int ath12k_wifi7_dp_rx_frag_h_mpd
+ {
+ 	struct ath12k_dp *dp = dp_pdev->dp;
+ 	struct ath12k_base *ab = dp->ab;
+-	struct ath12k_dp_link_peer *peer;
++	struct ath12k_dp_peer *peer;
+ 	struct ath12k_dp_rx_tid *rx_tid;
+ 	struct sk_buff *defrag_skb = NULL;
+ 	u32 peer_id = rx_desc_data->peer_id;
+@@ -1584,7 +1586,7 @@ static int ath12k_wifi7_dp_rx_frag_h_mpd
+ 		return -EINVAL;
+ 
+ 	spin_lock_bh(&dp->dp_lock);
+-	peer = ath12k_dp_link_peer_find_by_id(dp, peer_id);
++	peer = ath12k_dp_peer_find_by_peerid_index(dp, dp_pdev, peer_id);
+ 	if (!peer) {
+ 		ath12k_warn(ab, "failed to find the peer to de-fragment received fragment peer_id %d\n",
+ 			    peer_id);
+@@ -1592,7 +1594,7 @@ static int ath12k_wifi7_dp_rx_frag_h_mpd
+ 		goto out_unlock;
+ 	}
+ 
+-	if (!peer->dp_setup_done) {
++	if (!peer->primary_link_frag_setup) {
+ 		ath12k_warn(ab, "The peer %pM [%d] has uninitialized datapath\n",
+ 			    peer->addr, peer_id);
+ 		ret = -ENOENT;
+@@ -1647,7 +1649,7 @@ static int ath12k_wifi7_dp_rx_frag_h_mpd
+ 	del_timer_sync(&rx_tid->frag_timer);
+ 	spin_lock_bh(&dp->dp_lock);
+ 
+-	peer = ath12k_dp_link_peer_find_by_id(dp, peer_id);
++	peer = ath12k_dp_peer_find_by_peerid_index(dp, dp_pdev, peer_id);
+ 	if (!peer)
+ 		goto err_frags_cleanup;
+ 

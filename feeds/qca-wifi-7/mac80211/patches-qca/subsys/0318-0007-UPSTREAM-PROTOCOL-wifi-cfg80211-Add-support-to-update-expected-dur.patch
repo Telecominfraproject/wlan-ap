@@ -1,0 +1,244 @@
+From 5618c9b5eda61979673eddeaa89b4a081d00ce0a Mon Sep 17 00:00:00 2001
+From: Shwetha G K <kshwetha@qti.qualcomm.com>
+Date: Sat, 28 Jun 2025 16:16:03 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: wifi: cfg80211: Add support to update
+ expected duration in probe response
+
+Expected Duration(ED) value of the TTLM element starts decrementing for
+every beacon from the instant Mapping Switch Time(MST) expires. The
+userspace will be storing the ED value initially received from the user.
+When a probe request is received from the lower layers, the current value
+of the ED is also packed with it. The userspace is to be updated with this
+current value of ED so that it is reflected also in the probe response
+that will be sent in response to this probe request.
+
+Introduce new fields in `struct wireless_dev` and `struct cfg80211_rx_info`
+to support the parsing of TTLM expected duration from the probe request.
+Extend nl80211 attributes and CU MLD link attributes to include TTLM
+ED in the probe request that is forwarded to the userspace.
+
+Signed-off-by: Shwetha G K <kshwetha@qti.qualcomm.com>
+Signed-off-by: Amith A <amitajit@qti.qualcomm.com>
+---
+ include/net/cfg80211.h       |   5 ++
+ include/uapi/linux/nl80211.h |   2 +
+ net/wireless/nl80211.c       | 122 ++++++++++++++++++++++++++++++++++-
+ 3 files changed, 127 insertions(+), 2 deletions(-)
+
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -7110,6 +7110,7 @@ struct wireless_dev {
+ 		unsigned int cac_time_ms;
+ 		u8 switch_count;
+ 		u32 link_removal_tbtt_count;
++		u32 ttlm_expec_dur;
+ 	} links[IEEE80211_MLD_MAX_NUM_LINKS];
+ 	u16 valid_links;
+ 
+@@ -7119,6 +7120,7 @@ struct wireless_dev {
+ 	bool is_netdev_going_down; /*Indicates netdev going down - wdev specific*/
+ 	u8 ppe_vp_type;
+ 	bool link_removal_flag;
++	bool ttlm_expec_dur_update_flag;
+ };
+ 
+ static inline const u8 *wdev_address(struct wireless_dev *wdev)
+@@ -9280,6 +9282,8 @@ void cfg80211_conn_failed(struct net_dev
+  * @ack_tstamp: Hardware timestamp of ack TX in nanoseconds
+  * @link_removal_update: Indicates whether link removal update is present in
+  *	the rx info
++ * @ttlm_expec_dur_update: Indicates whether expected duration update for TTLM
++ *	element is present in the rx info
+  */
+ struct cfg80211_rx_info {
+ 	int freq;
+@@ -9293,6 +9297,7 @@ struct cfg80211_rx_info {
+ 	u64 ack_tstamp;
+ 	bool critical_update;
+ 	bool link_removal_update;
++	bool ttlm_expec_dur_update;
+ };
+ 
+ /**
+--- a/include/uapi/linux/nl80211.h
++++ b/include/uapi/linux/nl80211.h
+@@ -3617,6 +3617,7 @@ enum nl80211_attrs {
+ 	NL80211_ATTR_ERP,
+ 
+ 	NL80211_ATTR_ADVERTISED_TTLM,
++	NL80211_ATTR_ADVERTISED_TTLM_EXPEC_DUR_UPDATE,
+ 
+ 	/* add attributes here, update the policy in nl80211.c */
+ 
+@@ -8617,6 +8618,7 @@ enum nl80211_cu_mld_attrs {
+  * @NL80211_CU_MLD_LINK_ATTR_CRITICAL_FLAG: critical flag value
+  * @NL80211_CU_MLD_LINK_ATTR_BPCC: BSS parameter change count value
+  * @NL80211_CU_MLD_LINK_ATTR_SWITCH_COUNT: CSA/CCA switch count
++ * @NL80211_CU_ATTR_TTLM_EXPEC_DUR: Current expected duration
+  * @__NL80211_CU_MLD_LINK_ATTR_LAST: internal use
+  * @NL80211_CU_MLD_LINK ATTR_MAX: maximum per link critical update attribute
+  */
+@@ -8628,6 +8630,7 @@ enum nl80211_cu_mld_link_attrs {
+ 	NL80211_CU_MLD_LINK_ATTR_BPCC,
+ 	NL80211_CU_MLD_LINK_ATTR_SWITCH_COUNT,
+ 	NL80211_CU_ATTR_AP_REMOVAL_COUNT,
++	NL80211_CU_ATTR_TTLM_EXPEC_DUR,
+ 
+ 	/* keep last */
+ 	__NL80211_CU_MLD_LINK_ATTR_LAST,
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -21208,6 +21208,118 @@ nla_fail:
+ 	return -ENOBUFS;
+ }
+ 
++static int nl80211_send_mgmt_ttlm_expec_dur_update_len(struct wireless_dev *wdev)
++{
++	struct wiphy *wiphy = wdev->wiphy;
++	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
++	struct wireless_dev *tmp_wdev;
++	int link_id;
++	int len;
++
++	/* Add NLA_HEADER length for nested attributes,link_removal_update and MLD list
++	 */
++	len = 8;
++	list_for_each_entry(tmp_wdev, &rdev->wiphy.wdev_list, list) {
++		if (!tmp_wdev->valid_links || !tmp_wdev->ttlm_expec_dur_update_flag)
++			continue;
++		/* Add NLA_HEADER length fo nested attributes namely MLD and list of links
++		 * Add additional 4 bytes of WDEV ifidx
++		 */
++		len += 12;
++		for_each_valid_link(tmp_wdev, link_id) {
++			if (!tmp_wdev->links[link_id].ttlm_expec_dur)
++				continue;
++
++			/* Add NLA_HEADER length for link nested attributes - 4 bytes
++			 * link_id attribute - 1 byte
++			 * expec dur - 4 bytes + roundoff
++			 */
++			len += 12;
++		}
++	}
++	return len;
++}
++
++static int nl80211_send_mgmt_ttlm_expec_dur_update(struct sk_buff *msg,
++						   struct wireless_dev *wdev)
++{
++	struct wiphy *wiphy = wdev->wiphy;
++	struct wireless_dev *tmp_wdev;
++	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
++	struct nlattr *expec_dur_update;
++	struct nlattr *mld_list, *mld;
++	struct nlattr *link_list, *link;
++	struct net_device *tmp_netdev;
++	int link_id;
++	int i = 0, j = 0;
++
++	expec_dur_update = nla_nest_start_noflag(msg,
++						 NL80211_ATTR_ADVERTISED_TTLM_EXPEC_DUR_UPDATE);
++
++	if (!expec_dur_update)
++		goto nla_fail;
++
++	mld_list = nla_nest_start_noflag(msg, NL80211_CU_ATTR_MLD_LIST);
++	if (!mld_list)
++		goto nla_fail_expec_dur_update;
++
++	list_for_each_entry(tmp_wdev, &rdev->wiphy.wdev_list, list) {
++		if (!tmp_wdev->valid_links || !tmp_wdev->ttlm_expec_dur_update_flag)
++			continue;
++
++		mld = nla_nest_start_noflag(msg, ++i);
++		if (!mld)
++			goto nla_fail_mld_list;
++
++		tmp_netdev = tmp_wdev->netdev;
++		if (tmp_netdev &&
++		    nla_put_u32(msg, NL80211_CU_MLD_ATTR_IFINDEX, tmp_netdev->ifindex))
++			goto nla_fail_mld;
++
++		link_list = nla_nest_start_noflag(msg, NL80211_CU_MLD_ATTR_LINK_LIST);
++		if (!link_list)
++			goto nla_fail_mld;
++
++		for_each_valid_link(tmp_wdev, link_id) {
++			u32 expec_dur;
++
++			if (!tmp_wdev->links[link_id].ttlm_expec_dur)
++				continue;
++
++			expec_dur = tmp_wdev->links[link_id].ttlm_expec_dur;
++			tmp_wdev->links[link_id].ttlm_expec_dur = 0;
++			link = nla_nest_start(msg, ++j);
++			if (!link)
++				goto nla_fail_link_list;
++
++			if (nla_put_u8(msg, NL80211_CU_MLD_LINK_ATTR_ID, link_id) ||
++			    nla_put_u32(msg, NL80211_CU_ATTR_TTLM_EXPEC_DUR,
++					expec_dur))
++				goto nla_fail_link;
++
++			nla_nest_end(msg, link);
++		}
++		nla_nest_end(msg, link_list);
++		nla_nest_end(msg, mld);
++	}
++	nla_nest_end(msg, mld_list);
++	nla_nest_end(msg, expec_dur_update);
++	return 0;
++
++nla_fail_link:
++	nla_nest_cancel(msg, link);
++nla_fail_link_list:
++	nla_nest_cancel(msg, link_list);
++nla_fail_mld:
++	nla_nest_cancel(msg, mld);
++nla_fail_mld_list:
++	nla_nest_cancel(msg, mld_list);
++nla_fail_expec_dur_update:
++	nla_nest_cancel(msg, expec_dur_update);
++nla_fail:
++	return -ENOBUFS;
++}
++
+ int nl80211_send_mgmt(struct cfg80211_registered_device *rdev,
+ 		      struct wireless_dev *wdev, u32 nlportid,
+ 		      struct cfg80211_rx_info *info, gfp_t gfp)
+@@ -21215,7 +21327,7 @@ int nl80211_send_mgmt(struct cfg80211_re
+ 	struct net_device *netdev = wdev->netdev;
+ 	struct sk_buff *msg;
+ 	void *hdr;
+-	int cu_len = 0, link_removal_update_len = 0;
++	int cu_len = 0, link_removal_update_len = 0, ttlm_expec_dur_update_len = 0;
+ 
+ 	if (info->critical_update)
+ 		cu_len = nl80211_send_mgmt_critical_update_len(wdev);
+@@ -21223,7 +21335,11 @@ int nl80211_send_mgmt(struct cfg80211_re
+ 	if (info->link_removal_update)
+ 		link_removal_update_len = nl80211_send_mgmt_link_removal_update_len(wdev);
+ 
+-	msg = nlmsg_new(100 + info->len + cu_len + link_removal_update_len,
++	if (info->ttlm_expec_dur_update)
++		ttlm_expec_dur_update_len = nl80211_send_mgmt_ttlm_expec_dur_update_len(wdev);
++
++	msg = nlmsg_new(100 + info->len + cu_len + link_removal_update_len +
++			ttlm_expec_dur_update_len,
+ 			gfp);
+ 	if (!msg)
+ 		return -ENOMEM;
+@@ -21270,6 +21386,12 @@ int nl80211_send_mgmt(struct cfg80211_re
+ 		wdev->link_removal_flag = 0;
+ 	}
+ 
++	if (info->ttlm_expec_dur_update) {
++		if (nl80211_send_mgmt_ttlm_expec_dur_update(msg, wdev))
++			goto nla_put_failure;
++		wdev->ttlm_expec_dur_update_flag = 0;
++	}
++
+ 	genlmsg_end(msg, hdr);
+ 
+ 	return genlmsg_unicast(wiphy_net(&rdev->wiphy), msg, nlportid);

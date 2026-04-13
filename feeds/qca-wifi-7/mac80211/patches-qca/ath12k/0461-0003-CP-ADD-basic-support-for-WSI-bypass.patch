@@ -1,0 +1,471 @@
+From a401f21ccae4e66d7ee20d8f37837d71c4fd2caf Mon Sep 17 00:00:00 2001
+From: Kannan Saravanan <kannsara@qti.qualcomm.com>
+Date: Wed, 23 Jul 2025 15:40:54 +0530
+Subject: [PATCH 3/6] QSDK:CP: wifi:ath12k: Add support for WSI bypass remap
+ and debugfs interface
+
+This patchset introduces support for WSI bypass remap, allowing
+users to remove and re-add targets from the WSI hardwire to
+optimize power consumption.
+
+Key changes include:
+
+1. Creation and handling of a debugfs entry to retrieve the remap type
+   for a specific device.
+2. Cleanup of all ML peers using the low_ack command.
+3. Removal of legacy clients on devices undergoing bypass.
+
+These changes facilitate MLO teardown via UMAC reset, enabling firmware
+to decouple cleanly from the remapped device.
+
+Patch-dependency:
+	0461-0001-QSDK-Platform-Add-support-for-MLO-reconfig-QMI-messa.patch
+	0461-0002-QSDK-Platform-WSI-bypass-feature-support.patch
+---
+ drivers/net/wireless/ath/ath12k/core.c    |  61 ++++++-----
+ drivers/net/wireless/ath/ath12k/core.h    |   3 +
+ drivers/net/wireless/ath/ath12k/debugfs.c | 121 +++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/mac.c     | 127 +++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/mac.h     |   1 +
+ drivers/net/wireless/ath/ath12k/wmi.h     |   1 +
+ 6 files changed, 285 insertions(+), 29 deletions(-)
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -2205,6 +2205,37 @@ static void ath12k_core_mlo_hw_queues_st
+ 	}
+ }
+ 
++void ath12k_core_radio_cleanup(struct ath12k *ar)
++{
++	ar->free_map_id = ATH12K_FREE_MAP_ID_MASK;
++	ath12k_mac_drain_tx(ar);
++	ar->state_11d = ATH12K_11D_IDLE;
++	complete(&ar->completed_11d_scan);
++	complete(&ar->scan.started);
++	complete_all(&ar->scan.completed);
++	complete(&ar->scan.on_channel);
++	complete(&ar->peer_assoc_done);
++	complete(&ar->peer_delete_done);
++	if (!list_empty(&ar->ab->dp->neighbor_peers))
++		ath12k_debugfs_nrp_cleanup_all(ar);
++	complete(&ar->install_key_done);
++	complete(&ar->vdev_setup_done);
++	complete(&ar->vdev_delete_done);
++	complete(&ar->bss_survey_done);
++	complete(&ar->thermal.wmi_sync);
++	complete(&ar->scan.on_channel);
++
++	wake_up(&ar->dp.tx_empty_waitq);
++	idr_for_each(&ar->txmgmt_idr,
++		     ath12k_mac_tx_mgmt_pending_free, ar);
++	idr_destroy(&ar->txmgmt_idr);
++	wake_up(&ar->txmgmt_empty_waitq);
++
++	ar->monitor_vdev_id = -1;
++	ar->monitor_started = false;
++	ar->monitor_vdev_created = false;
++}
++
+ static void ath12k_core_pre_reconfigure_recovery(struct ath12k_base *ab)
+ {
+ 	struct ath12k_hw_group *ag = ab->ag;
+@@ -2242,34 +2273,7 @@ static void ath12k_core_pre_reconfigure_
+ 				arvif->is_created = false;
+ 				arvif->is_up = false;
+ 			}
+-
+-			ar->free_map_id = ATH12K_FREE_MAP_ID_MASK;
+-			ath12k_mac_drain_tx(ar);
+-			ar->state_11d = ATH12K_11D_IDLE;
+-			complete(&ar->completed_11d_scan);
+-			complete(&ar->scan.started);
+-			complete_all(&ar->scan.completed);
+-			complete(&ar->scan.on_channel);
+-			complete(&ar->peer_assoc_done);
+-			complete(&ar->peer_delete_done);
+-			if (!list_empty(&ab->dp->neighbor_peers))
+-				ath12k_debugfs_nrp_cleanup_all(ar);
+-			complete(&ar->install_key_done);
+-			complete(&ar->vdev_setup_done);
+-			complete(&ar->vdev_delete_done);
+-			complete(&ar->bss_survey_done);
+-			complete(&ar->thermal.wmi_sync);
+-			complete(&ar->scan.on_channel);
+-
+-			wake_up(&ar->dp.tx_empty_waitq);
+-			idr_for_each(&ar->txmgmt_idr,
+-				     ath12k_mac_tx_mgmt_pending_free, ar);
+-			idr_destroy(&ar->txmgmt_idr);
+-			wake_up(&ar->txmgmt_empty_waitq);
+-
+-			ar->monitor_vdev_id = -1;
+-			ar->monitor_started = false;
+-			ar->monitor_vdev_created = false;
++			ath12k_core_radio_cleanup(ar);
+ 		}
+ 
+ 		wiphy_unlock(ah->hw->wiphy);
+@@ -3727,6 +3731,7 @@ static struct ath12k_hw_group *ath12k_co
+ 	INIT_WORK(&ag->reset_group_work, ath12k_core_update_userpd_state);
+ 	mutex_init(&ag->mutex);
+ 	init_completion(&ag->umac_reset_complete);
++	init_completion(&ag->peer_cleanup_complete);
+ 	ag->mlo_capable = false;
+ 	ag->recovery_mode = ATH12K_MLO_RECOVERY_MODE0;
+ 	ag->wsi_load_info = NULL;
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -994,6 +994,7 @@ struct ath12k_chan_info {
+ 	u32 high_freq;
+ };
+ 
++#define ATH12K_MIN_ACTIVE_CHIP_FOR_BYPASS 2
+ enum ath12k_wsi_bypass_action {
+ 	ATH12K_WSI_BYPASS_DEFAULT,
+ 	ATH12K_WSI_BYPASS_REMOVE_DEVICE,
+@@ -1454,6 +1455,7 @@ struct ath12k_hw_group {
+ 	struct ath12k_stats_work_context stats_work;
+ 	u8 num_bypassed;
+ 	bool wsi_remap_in_progress;
++	struct completion peer_cleanup_complete;
+ };
+ 
+ /* Holds WSI info specific to each device, excluding WSI group info */
+@@ -2172,4 +2174,5 @@ int ath12k_wifi_stats_reply_setup(struct
+ struct ath12k_wsi_info *ath12k_core_get_current_wsi_info(struct ath12k_base *ab);
+ int ath12k_core_dynamic_wsi_remap(struct ath12k_base *ab);
+ void ath12k_core_pci_link_speed(struct ath12k_base *ab, u16 link_speed, u16 link_width);
++void ath12k_core_radio_cleanup(struct ath12k *ar);
+ #endif /* _CORE_H_ */
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -97,6 +97,114 @@ static const struct file_operations fops
+ 	.llseek = default_llseek,
+ };
+ 
++int ath12k_wsi_bypass_precheck(struct ath12k_base *ab, unsigned int value)
++{
++	struct ath12k_hw_group *ag = ab->ag;
++	struct ath12k *ar;
++	int i;
++
++	if (!test_bit(WMI_TLV_SERVICE_DYNAMIC_WSI_REMAP_SUPPORT, ab->wmi_ab.svc_map)) {
++		ath12k_err(ab, "Firmware doesn't support dynamic WSI remap\n");
++		return -EINVAL;
++	}
++
++	if (ab->ag->wsi_remap_in_progress) {
++		ath12k_err(ab, "WSI remap already in progress..\n");
++		return -EINVAL;
++	}
++
++	if (ath12k_hw_group_recovery_in_progress(ag)) {
++		ath12k_err(ab, "SSR is in progress, cannot allow remap\n");
++		return -EINVAL;
++	}
++
++	if (((ag->num_devices - ag->num_bypassed) == ATH12K_MIN_ACTIVE_CHIP_FOR_BYPASS) &&
++	    value == ATH12K_WSI_BYPASS_REMOVE_DEVICE) {
++		ath12k_err(ab, "Min 2 Chip has to be active.\n");
++		return -EINVAL;
++	}
++
++	if ((!ab->is_bypassed && value == ATH12K_WSI_BYPASS_ADD_DEVICE) ||
++	    (ab->is_bypassed && value == ATH12K_WSI_BYPASS_REMOVE_DEVICE)) {
++		ath12k_err(ab, "Invalid operation\n");
++		return -EINVAL;
++	}
++
++	for (i = 0; i < ab->num_radios; i++) {
++		ar = ab->pdevs[i].ar;
++		if (!ar) {
++			ath12k_err(ab, "Invalid Radio\n");
++			return -EINVAL;
++		}
++		if (ar->num_created_vdevs > 0) {
++			ath12k_err(ab, "Vaps are active, cannot do bypass\n");
++			return -EINVAL;
++		}
++	}
++
++	return 0;
++}
++
++static ssize_t
++ath12k_debug_write_wsi_bypass_device(struct file *file,
++				     const char __user *user_buf,
++				     size_t count, loff_t *ppos)
++{
++	struct ath12k_base *ab = file->private_data;
++	unsigned int value;
++	int ret;
++
++	if (kstrtouint_from_user(user_buf, count, 0, &value))
++		return -EINVAL;
++
++	if (value > ATH12K_WSI_BYPASS_ADD_DEVICE ||
++	    value <= ATH12K_WSI_BYPASS_DEFAULT) {
++		ath12k_warn(ab, "Please enter: 1 = Bypass device,"
++			    "2 = Re-add device\n");
++		return -EINVAL;
++	}
++
++	mutex_lock(&ab->core_lock);
++	ret = ath12k_wsi_bypass_precheck(ab, value);
++
++	if (ret) {
++		ath12k_err(ab, "WSI Bypass precheck failed\n");
++		mutex_unlock(&ab->core_lock);
++		goto exit;
++	}
++
++	ab->wsi_remap_state = value;
++
++	if (ab->is_bypassed && ab->wsi_remap_state == ATH12K_WSI_BYPASS_REMOVE_DEVICE) {
++		ath12k_warn(ab, "Failed! Device is already in bypass state\n");
++		ret = -EINVAL;
++		mutex_unlock(&ab->core_lock);
++		goto exit;
++	}
++	mutex_unlock(&ab->core_lock);
++
++	ret = ath12k_mac_dynamic_wsi_remap(ab);
++
++	if (ret) {
++		/* Reset the flags if there is a failure */
++		ath12k_err(ab, "WSI bypass has failed with error %d\n", ret);
++		ab->ag->wsi_remap_in_progress = false;
++		ab->wsi_remap_state = ATH12K_WSI_BYPASS_DEFAULT;
++		ab->is_bypassed = false;
++		goto exit;
++	}
++
++	ret = count;
++
++exit:
++	return ret;
++}
++
++static const struct file_operations fops_wsi_bypass_device = {
++	.write = ath12k_debug_write_wsi_bypass_device,
++	.open = simple_open,
++};
++
+ int wmi_ctrl_path_awgn_stat(struct ath12k *ar, char __user *ubuf,
+ 			    size_t count, loff_t *ppos)
+ {
+@@ -5292,6 +5400,11 @@ static ssize_t ath12k_write_simulate_fw_
+ 	if (buf[*ppos - 1] == '\n')
+ 		buf[*ppos - 1] = '\0';
+ 
++	if (ab->is_bypassed) {
++		ath12k_err(ab, "Target is in bypassed state, cannot simulate assert\n");
++		return -EINVAL;
++	}
++
+ 	for (i = 0; i < ab->num_radios; i++) {
+ 		pdev = &ab->pdevs[i];
+ 		ar = pdev->ar;
+@@ -5312,6 +5425,11 @@ static ssize_t ath12k_write_simulate_fw_
+ 		}
+ 	}
+ 
++	if (ag->wsi_remap_in_progress) {
++		ath12k_err(ab, "WSI remap in progress, try later\n");
++		return -EPERM;
++	}
++
+ 	if (!strcmp(buf, "assert")) {
+ 		ath12k_info(ab, "simulating firmware assert crash\n");
+ 		ret = ath12k_wmi_force_fw_hang_cmd(ar,
+@@ -5783,6 +5901,9 @@ void ath12k_debugfs_pdev_create(struct a
+ 			    &fops_soc_stats_disable);
+ 	debugfs_create_file("dump_srng_stats", 0600, ab->debugfs_soc, ab,
+ 			    &fops_dump_hal_stats);
++	if (test_bit(WMI_TLV_SERVICE_DYNAMIC_WSI_REMAP_SUPPORT, ab->wmi_ab.svc_map))
++		debugfs_create_file("wsi_bypass_device", 0600, ab->debugfs_soc, ab,
++				    &fops_wsi_bypass_device);
+ }
+ 
+ void ath12k_debugfs_unregister(struct ath12k *ar)
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -252,6 +252,7 @@ ath12k_phymodes[NUM_NL80211_BANDS][ATH12
+ #define ATH12K_MAX_NUM_BRIDGE_PER_MLD 2
+ #define BRIDGE_IN_RANGE(ar) (ar->num_created_bridge_vdevs < TARGET_NUM_BRIDGE_VDEVS)
+ #define ATH12K_MAX_AR_LINK_IDX	5
++#define ATH12K_MAC_PEER_CLEANUP_TIMEOUT_MSECS 10000
+ 
+ static const u32 ath12k_smps_map[] = {
+ 	[WLAN_HT_CAP_SM_PS_STATIC] = WMI_PEER_SMPS_STATIC,
+@@ -10983,9 +10984,10 @@ int ath12k_mac_op_sta_state(struct ieee8
+ 	struct ath12k_link_sta *arsta;
+ 	struct wireless_dev *wdev;
+ 	struct ath12k *ar = ah->radio;
++	struct ath12k_hw_group *ag = ar->ab->ag;
+ 	unsigned long links_map;
+ 	bool is_recovery = false;
+-	u8 link_id = 0, num_devices = ar->ab->ag->num_devices;
++	u8 link_id = 0, num_devices = ag->num_devices;
+ 	u8 t_link_id = 0;
+ 	u16 bridge_bitmap = 0;
+ 	int ret = -EINVAL;
+@@ -10993,6 +10995,13 @@ int ath12k_mac_op_sta_state(struct ieee8
+ 
+ 	lockdep_assert_wiphy(hw->wiphy);
+ 
++	if ((old_state == IEEE80211_STA_NOTEXIST &&
++	     new_state == IEEE80211_STA_NONE) && ag->wsi_remap_in_progress) {
++		ath12k_err(NULL, "cannot allow new station association, WSI bypass is in progress\n");
++		ret = -EINVAL;
++		goto exit;
++	}
++
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ 	if (!ahsta->ppe_vp_num)
+ 		ahsta->ppe_vp_num = ahvif->dp_vif.ppe_vp_num;
+@@ -11194,6 +11203,11 @@ ml_station_remove:
+ 		wiphy_work_cancel(hw->wiphy, &ahsta->set_4addr_wk);
+ 	}
+ 
++	if (ag->wsi_remap_in_progress && !ah->num_ml_peers) {
++		ath12k_dbg(NULL, ATH12K_DBG_WSI_BYPASS,
++			   "Bypass: Completing peer cleanup timer\n");
++		complete(&ag->peer_cleanup_complete);
++	}
+ 	ret = 0;
+ 
+ peer_delete:
+@@ -23075,3 +23089,114 @@ int ath12k_mac_reg_get_max_reg_eirp_from
+ 
+ 	return 0;
+ }
++
++void ath12k_mac_wsi_remap_peer_cleanup(struct ath12k_base *ab,
++				       bool skip_legacy)
++{
++	struct ath12k_dp_link_peer *link_peer, *tmp;
++	struct ath12k_sta *ahsta;
++	struct ieee80211_sta *sta;
++	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
++
++	ath12k_dbg(ab, ATH12K_DBG_WSI_BYPASS, "Bypass: Starting peer cleanup\n");
++	spin_lock_bh(&dp->dp_lock);
++	list_for_each_entry_safe(link_peer, tmp, &dp->peers, list) {
++		sta = link_peer->sta;
++		if (!sta)
++			continue;
++
++		if (skip_legacy && !sta->mlo)
++			continue;
++
++		ahsta = (struct ath12k_sta *)sta->drv_priv;
++
++		ath12k_mac_peer_disassoc(ab, sta, ahsta,
++					 ATH12K_DBG_WSI_BYPASS);
++	}
++	spin_unlock_bh(&dp->dp_lock);
++}
++
++int ath12k_mac_dynamic_wsi_remap(struct ath12k_base *ab)
++{
++	struct ath12k_hw_group *ag = ab->ag;
++	struct ath12k *ar = ab->pdevs[0].ar;
++	struct ath12k_hw *ah = ar ? ar->ah : NULL;
++	struct ath12k_base *partner_ab;
++	struct ath12k_pdev *pdev;
++	struct wiphy *wiphy;
++	long time_left;
++	u32 num_ml_peers;
++	int idx, ret = 0;
++	bool skip_legacy;
++
++	if (!ah) {
++		ath12k_err(ab, "Failed to find hw, Dynamic remap failed\n");
++		return -EINVAL;
++	}
++	wiphy = ah->hw->wiphy;
++
++	ag->wsi_remap_in_progress = true;
++
++	/* Cleanup ML peers before MLO teardown during bypass
++	 * operation. Ensure to cleanup the legacy clients for the device
++	 * which is bypassed.
++	 */
++	wiphy_lock(wiphy);
++	for (idx = 0; idx < ag->num_devices; idx++) {
++		partner_ab = ag->ab[idx];
++
++		if (partner_ab->is_bypassed)
++			continue;
++
++		if (ab == partner_ab)
++			skip_legacy = false;
++		else
++			skip_legacy = true;
++
++		ath12k_mac_wsi_remap_peer_cleanup(partner_ab, skip_legacy);
++	}
++	num_ml_peers = ah->num_ml_peers;
++	wiphy_unlock(wiphy);
++
++	/* Start a wait timer to ensure all ML peers are cleaned up
++	 * before proceeding with the UMAC reset. This is necessary to
++	 * avoid disrupting inter-device communication in the firmware.
++	 * Skipping this may lead to peer delete timeouts on the host,
++	 * followed by a firmware assert.
++	 */
++	if (num_ml_peers) {
++		reinit_completion(&ag->peer_cleanup_complete);
++		time_left = wait_for_completion_timeout(&ag->peer_cleanup_complete,
++				msecs_to_jiffies(ATH12K_MAC_PEER_CLEANUP_TIMEOUT_MSECS));
++
++		ath12k_dbg(ab, ATH12K_DBG_WSI_BYPASS,
++			   "Bypass: Waiting for ML peer cleanup\n");
++		if (!time_left) {
++			ath12k_err(ab, "peer cleanup didn't get completed within %d ms\n",
++				   ATH12K_MAC_PEER_CLEANUP_TIMEOUT_MSECS);
++			return -ETIMEDOUT;
++		}
++	}
++
++	/* Cleanup all the ar workqueues, make it to complete/default
++	 * before bypassing an device.
++	 */
++	if (ab->wsi_remap_state == ATH12K_WSI_BYPASS_REMOVE_DEVICE) {
++		for (idx = 0; idx < ab->num_radios; idx++) {
++			pdev = &ab->pdevs[idx];
++			ar = pdev->ar;
++
++			if (!ar)
++				continue;
++			if (ar->scan.state == ATH12K_SCAN_RUNNING) {
++				ath12k_scan_abort(ar);
++				ar->scan.arvif = NULL;
++			}
++			ath12k_core_radio_cleanup(ar);
++		}
++	}
++
++	ret = ath12k_core_dynamic_wsi_remap(ab);
++
++	return ret;
++}
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -651,4 +651,5 @@ int ath12k_mac_reg_get_max_reg_eirp_from
+ 						   bool is_client_needed,
+ 						   struct channel_power *chan_eirp_list);
+ int __ath12k_mac_mlo_setup(struct ath12k *ar);
++int ath12k_mac_dynamic_wsi_remap(struct ath12k_base *ab);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -2560,6 +2560,7 @@ enum wmi_tlv_service {
+ 	WMI_TLV_SERVICE_BOTH_PSD_EIRP_FOR_AP_SP_CLIENT_SP_SUPPORT = 393,
+ 	WMI_TLV_SERVICE_PDEV_PARAM_IN_UTF_WMI = 394,
+ 	WMI_TLV_SERVICE_SW_PROG_DFS_SUPPORT = 395,
++	WMI_TLV_SERVICE_DYNAMIC_WSI_REMAP_SUPPORT = 403,
+ 	WMI_TLV_SERVICE_THERM_THROT_POUT_REDUCTION = 410,
+ 	WMI_SERVICE_WDS_NULL_FRAME_SUPPORT = 421,
+ 	WMI_SERVICE_MEC_AGING_TIMER_SUPPORT = 423,

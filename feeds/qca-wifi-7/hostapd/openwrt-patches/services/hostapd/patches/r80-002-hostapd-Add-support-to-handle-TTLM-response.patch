@@ -1,0 +1,465 @@
+From a027d5f7e4c74807ff8b843717e514a5c5edc4a7 Mon Sep 17 00:00:00 2001
+From: Dhanavandhana Kannan <dhanavan@qti.qualcomm.com>
+Date: Mon, 2 Jun 2025 10:08:59 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: hostapd: Add support to handle
+TTLM response action frame
+
+Add support to parse the TTLM response action frame received from
+non-AP MLD and when the response status code is success, send the
+negotiated mapping to driver via netlink socket.
+
+For rejection case, there is no operation. AP MLD continues to
+operate on default/previous negotiated mapping.
+
+In case if non-AP MLD responds with preferred tid-to-link mapping,
+it will not be handled.
+
+Signed-off-by: Dhanavandhana Kannan <dhanavan@qti.qualcomm.com>
+---
+ src/ap/ap_drv_ops.h          |   9 +++
+ src/ap/ieee802_11.c          |  14 ++++
+ src/ap/ttlm.c                | 146 +++++++++++++++++++++++++++++++++++
+ src/ap/ttlm.h                |  36 +++++++++
+ src/common/ieee802_11_defs.h |   6 ++
+ src/drivers/driver.h         |  23 +++++-
+ src/drivers/driver_nl80211.c |  52 +++++++++++++
+ 7 files changed, 285 insertions(+), 1 deletion(-)
+
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -537,6 +537,15 @@ static inline int hostapd_drv_link_sta_r
+ 					     addr);
+ }
+ 
++static inline int hostapd_drv_set_ttlm_link_mapping(struct hostapd_data *hapd,
++						    struct driver_ttlm_info *params,
++						    const u8 *addr)
++{
++	if (!hapd->driver || !hapd->drv_priv || !hapd->driver->set_ttlm_link_mapping)
++		return -1;
++
++	return hapd->driver->set_ttlm_link_mapping(hapd->drv_priv, WPA_IF_AP_BSS, params, addr);
++}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ struct hostapd_multi_hw_info *
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -62,6 +62,7 @@
+ #include "nan_usd_ap.h"
+ #include "pasn/pasn_common.h"
+ #include "wpa_auth_i.h"
++#include "ttlm.h"
+ 
+ #ifdef CONFIG_FILS
+ static struct wpabuf *
+@@ -6916,6 +6917,15 @@ static int handle_action(struct hostapd_
+ 				   mgmt->u.action.u.epcs_req.action);
+ 			break;
+ 		}
++		switch (mgmt->u.action.u.ttlm_resp.action) {
++		case WLAN_PROT_EHT_T2L_MAPPING_RESPONSE:
++			hostapd_handle_ttlm_resp(hapd, sta, (const u8 *) mgmt, len);
++			break;
++		default:
++			wpa_printf(MSG_DEBUG, "Unknown Protected action frame of code:%d",
++				   mgmt->u.action.u.ttlm_resp.action);
++			break;
++		}
+ 		return 1;
+ #endif /* CONFIG_IEEE80211BE */
+ 	}
+--- a/src/ap/ttlm.c
++++ b/src/ap/ttlm.c
+@@ -13,6 +13,7 @@
+ #include "sta_info.h"
+ #include "hostapd.h"
+ #include "ap_drv_ops.h"
++#include "drivers/driver.h"
+ #include "ttlm.h"
+ 
+ 
+@@ -263,3 +264,189 @@ int hostapd_send_ttlm_req(struct hostapd
+ 
+ 	return ret;
+ }
++
++
++static void hostapd_reset_ttlm_info(struct ttlm_info *ttlm)
++{
++	u8 dir;
++
++	for (dir = 0; dir < TTLM_DIRECTION_MAX; dir++) {
++		ttlm[dir].default_link_mapping = true;
++		os_memset(ttlm[dir].ieee_link_map_tid, 0,
++			  sizeof(u16) * NUM_MAX_TIDS);
++	}
++}
++
++
++static void hostapd_copy_negotiated_ttlm_info_to_sta(struct hostapd_data *hapd,
++						     struct sta_info *sta,
++						     struct ttlm_ongoing_negotiation_info
++						     *ongoing_ttlm)
++{
++	struct ttlm_prev_negotiated_info *negotiated_ttlm = NULL;
++	struct ttlm_info *negotiated_ttlm_of_tids = NULL;
++	struct ttlm_info *ongoing_ttlm_of_tids = NULL;
++	struct ttlm_ongoing_negotiation_info *lsta_ttlm;
++	struct hostapd_data *lhapd;
++	struct sta_info *lsta;
++	int i, dir, tid;
++
++	negotiated_ttlm = &sta->mld_info.tid_map_info.ttlm_prev_negotiated_info;
++	negotiated_ttlm->dialog_token = ongoing_ttlm->dialog_token;
++
++	for (i = 0; i < TTLM_DIRECTION_MAX; i++) {
++		negotiated_ttlm->ttlm_info[i].direction = TTLM_DIRECTION_INVALID;
++		if (ongoing_ttlm->ttlm_info[i].direction == TTLM_DIRECTION_INVALID)
++			continue;
++
++		dir = ongoing_ttlm->ttlm_info[i].direction;
++
++		/* Populate the ongoing TTLM info into negotiated TTLM directions UL
++		 * and DL when direction is BIDI
++		 */
++		if (dir == TTLM_DIRECTION_BIDI) {
++			for (int j = 0; j < TTLM_DIRECTION_BIDI; j++) {
++				negotiated_ttlm_of_tids = &negotiated_ttlm->ttlm_info[j];
++				ongoing_ttlm_of_tids = &ongoing_ttlm->ttlm_info[dir];
++
++				if (j == TTLM_DIRECTION_DL)
++					negotiated_ttlm_of_tids->direction =
++						TTLM_DIRECTION_DL;
++				else
++					negotiated_ttlm_of_tids->direction =
++						TTLM_DIRECTION_UL;
++
++				negotiated_ttlm_of_tids->default_link_mapping =
++					ongoing_ttlm_of_tids->default_link_mapping;
++
++				for (tid = 0; tid < NUM_MAX_TIDS; tid++) {
++					negotiated_ttlm_of_tids->ieee_link_map_tid[tid] =
++						ongoing_ttlm_of_tids->ieee_link_map_tid[tid];
++				}
++
++				negotiated_ttlm_of_tids->link_mapping_size =
++					ongoing_ttlm_of_tids->link_mapping_size;
++			}
++		} else {
++			negotiated_ttlm_of_tids = &negotiated_ttlm->ttlm_info[dir];
++			ongoing_ttlm_of_tids = &ongoing_ttlm->ttlm_info[dir];
++
++			negotiated_ttlm_of_tids->direction = ongoing_ttlm_of_tids->direction;
++			negotiated_ttlm_of_tids->default_link_mapping =
++				ongoing_ttlm_of_tids->default_link_mapping;
++
++			for (tid = 0; tid < NUM_MAX_TIDS; tid++) {
++				negotiated_ttlm_of_tids->ieee_link_map_tid[tid] =
++					ongoing_ttlm_of_tids->ieee_link_map_tid[tid];
++			}
++
++			negotiated_ttlm_of_tids->link_mapping_size =
++				ongoing_ttlm_of_tids->link_mapping_size;
++		}
++	}
++
++	if ((negotiated_ttlm->ttlm_info[TTLM_DIRECTION_DL].direction ==
++	     TTLM_DIRECTION_DL) ||
++	    (negotiated_ttlm->ttlm_info[TTLM_DIRECTION_UL].direction ==
++	     TTLM_DIRECTION_UL)) {
++		os_memset(&negotiated_ttlm->ttlm_info[TTLM_DIRECTION_BIDI], 0,
++			  sizeof(struct ttlm_info));
++		negotiated_ttlm->ttlm_info[TTLM_DIRECTION_BIDI].direction =
++			TTLM_DIRECTION_INVALID;
++	}
++
++	for_each_mld_link(lhapd, hapd) {
++		lsta = ap_get_sta(lhapd, sta->addr);
++		if (lsta && lsta->mld_info.mld_sta) {
++			lsta_ttlm = &lsta->mld_info.tid_map_info.ttlm_ongoing_negotiation_info;
++			lsta_ttlm->ttlm_resp_type = TTLM_RESP_TYPE_INVALID;
++			lsta_ttlm->dialog_token = 0;
++			hostapd_reset_ttlm_info(lsta_ttlm->ttlm_info);
++		}
++	}
++}
++
++
++static void hostapd_fill_ttlm_nl_params(struct driver_ttlm_info *driver_ttlm_info,
++					struct ttlm_prev_negotiated_info *negotiated_ttlm)
++{
++	u8 dir_mask[3] = {BIT(TTLM_DIRECTION_DL), BIT(TTLM_DIRECTION_UL),
++			  BIT(TTLM_DIRECTION_BIDI)};
++	int i, dir;
++
++	for (i = 0; i < TTLM_DIRECTION_MAX; i++) {
++		if (negotiated_ttlm->ttlm_info[i].direction == TTLM_DIRECTION_INVALID)
++			continue;
++
++		dir = negotiated_ttlm->ttlm_info[i].direction;
++		driver_ttlm_info->dir_bmap |= dir_mask[dir];
++
++		/* As either DLINK or ULINK values can be sent via NL,
++		 * when the direction is BIDI populated the ttlm info
++		 * in both DL and UL directions and hence checking only
++		 * UL/DL directions here to fill driver ttlm info params.
++		 */
++		if (dir == TTLM_DIRECTION_DL)
++			os_memcpy(driver_ttlm_info->dlink,
++				  negotiated_ttlm->ttlm_info[dir].ieee_link_map_tid,
++				  sizeof(driver_ttlm_info->dlink));
++		else if (dir == TTLM_DIRECTION_UL)
++			os_memcpy(driver_ttlm_info->ulink,
++				  negotiated_ttlm->ttlm_info[dir].ieee_link_map_tid,
++				  sizeof(driver_ttlm_info->ulink));
++	}
++}
++
++
++int hostapd_apply_ttlm_mapping_to_driver(struct hostapd_data *hapd, struct sta_info *sta)
++{
++	struct ttlm_ongoing_negotiation_info *ongoing_ttlm;
++	struct driver_ttlm_info driver_ttlm_info = {};
++	int ret;
++
++	ongoing_ttlm = &sta->mld_info.tid_map_info.ttlm_ongoing_negotiation_info;
++	hostapd_copy_negotiated_ttlm_info_to_sta(hapd, sta, ongoing_ttlm);
++	hostapd_fill_ttlm_nl_params(&driver_ttlm_info,
++				    &sta->mld_info.tid_map_info.ttlm_prev_negotiated_info);
++
++	ret = hostapd_drv_set_ttlm_link_mapping(hapd, &driver_ttlm_info, sta->addr);
++	if (ret)
++		wpa_printf(MSG_ERROR, "Failed to send ttlm params to driver");
++
++	return ret;
++}
++
++
++int hostapd_handle_ttlm_resp(struct hostapd_data *hapd, struct sta_info *sta,
++			     const u8 *buf, size_t len)
++{
++	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
++	struct ttlm_ongoing_negotiation_info *ongoing_ttlm;
++	int ret = 0;
++
++	if (!sta) {
++		wpa_printf(MSG_ERROR, "Station is not found");
++		return -1;
++	}
++	ongoing_ttlm = &sta->mld_info.tid_map_info.ttlm_ongoing_negotiation_info;
++
++	if (ongoing_ttlm->dialog_token != mgmt->u.action.u.ttlm_resp.dialog_token) {
++		wpa_printf(MSG_ERROR, "TTLM dialog token mismatch: expected:%d, received:%d",
++			   ongoing_ttlm->dialog_token, mgmt->u.action.u.ttlm_resp.dialog_token);
++		hostapd_send_ttlm_teardown(hapd, sta);
++		return -1;
++	}
++
++	ongoing_ttlm->ttlm_resp_type = mgmt->u.action.u.ttlm_resp.status_code;
++	wpa_printf(MSG_DEBUG, "TTLM response received: dialog_token:%d response_code:%d",
++		   ongoing_ttlm->dialog_token, ongoing_ttlm->ttlm_resp_type);
++
++	if (ongoing_ttlm->ttlm_resp_type == TTLM_RESP_TYPE_SUCCESS)
++		ret = hostapd_apply_ttlm_mapping_to_driver(hapd, sta);
++	else if (ongoing_ttlm->ttlm_resp_type == TTLM_RESP_TYPE_PREFERRED_TID_TO_LINK_MAPPING)
++		wpa_printf(MSG_DEBUG, "Preferred mapping is suggested");
++	else
++		wpa_printf(MSG_DEBUG, "Denied Tid to link mapping");
++
++	return ret;
++}
+--- a/src/ap/ttlm.h
++++ b/src/ap/ttlm.h
+@@ -59,15 +59,47 @@ struct ttlm_info {
+ };
+ 
+ /**
++ * enum ttlm_resp_type - TTLM status corresponds to TTLM response frame
++ *
++ * @TTLM_RESP_TYPE_SUCCESS: TTLM mapping provided in the TTLM request is
++ *                       accepted by AP
++ * @TTLM_RESP_TYPE_DENIED_TID_TO_LINK_MAPPING: TTLM Request denied because
++ *                       the requested TID-to-link mapping is unacceptable.
++ * @TTLM_RESP_TYPE_PREFERRED_TID_TO_LINK_MAPPING: TTLM Request rejected and
++ *                       preferred TID-to-link mapping is suggested.
++ * @TTLM_RESP_TYPE_INVALID: Status code is not applicable.
++ */
++enum ttlm_resp_type {
++	TTLM_RESP_TYPE_SUCCESS = 0,
++	TTLM_RESP_TYPE_DENIED_TID_TO_LINK_MAPPING = 133,
++	TTLM_RESP_TYPE_PREFERRED_TID_TO_LINK_MAPPING = 134,
++	TTLM_RESP_TYPE_INVALID,
++};
++
++/**
+  * struct ttlm_onging_negotiation_info - Current ongoing TTLM negotiation
+  * (information about transmitted TTLM request/response frame)
+  *
+  * @dialog_token: Save the dialog token used in TTLM request and response frame.
+  * @ttlm_info: Provides the TID-to-link mapping info for UL/DL/BiDi
++ * @ttlm_resp_type: TTLM status corresponds to TTLM response frame.
+  */
+ struct ttlm_ongoing_negotiation_info {
+ 	u8 dialog_token;
+ 	struct ttlm_info ttlm_info[TTLM_DIRECTION_MAX];
++	enum ttlm_resp_type ttlm_resp_type;
++};
++
++/**
++ * struct ttlm_prev_negotiated_info - Previous successful TTLM negotiation
++ * is saved here.
++ *
++ * @dialog_token: Save the dialog token used in TTLM request and response frame.
++ * @ttlm_info: Provides the TID to LINK mapping information
++ */
++struct ttlm_prev_negotiated_info {
++	u8 dialog_token;
++	struct ttlm_info ttlm_info[TTLM_DIRECTION_MAX];
+ };
+ 
+ /**
+@@ -77,10 +109,12 @@ struct ttlm_ongoing_negotiation_info {
+  * frame.
+  * @ttlm_ongoing_negotiation_info: This has the ongoing TID-to-link mapping info
+  * transmitted by this peer to the connected peer.
++ * @ttlm_prev_negotiated_info: Previous successful TTLM negotiation is saved here.
+  */
+ struct tid_to_link_map_info {
+ 	u8 dialog_token;
+ 	struct ttlm_ongoing_negotiation_info ttlm_ongoing_negotiation_info;
++	struct ttlm_prev_negotiated_info ttlm_prev_negotiated_info;
+ };
+ 
+ /**
+@@ -103,5 +137,8 @@ int hostapd_send_ttlm_req(struct hostapd
+ 			  struct sta_info *sta);
+ int hostapd_build_ttlm_elem(struct ttlm_ongoing_negotiation_info *ttlm,
+ 			    u8 **ttlm_elem, size_t *ttlm_elem_len);
++int hostapd_handle_ttlm_resp(struct hostapd_data *hapd, struct sta_info *sta,
++			     const u8 *buf, size_t len);
++int hostapd_apply_ttlm_mapping_to_driver(struct hostapd_data *hapd, struct sta_info *sta);
+ 
+ #endif /* TTLM_H */
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -1199,6 +1199,12 @@ struct ieee80211_mgmt {
+ 					u8 dialog_token;
+ 					u8 variable[];
+ 				} STRUCT_PACKED rrm;
++				struct {
++					u8 action;
++					u8 dialog_token;
++					u8 status_code;
++					u8 variable[];
++				} STRUCT_PACKED ttlm_resp;
+ 			} u;
+ 		} STRUCT_PACKED action;
+ 	} u;
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -3136,6 +3136,21 @@ enum wpa_drv_update_connect_params_mask
+ 	WPA_DRV_UPDATE_AUTH_TYPE	= BIT(2),
+ };
+ 
++#define NUM_MAX_TIDS 8
++#define DRV_MAX_TTLM_DIR 2
++/**
++ * struct driver_ttlm_info - Holds TTLM data
++ * @dlink: link map of each tids in downlink direction
++ * @ulink: link map of each tids in uplink direction
++ * @dir_bmap: bitmap of directions (Bit 0 - for downlink,
++ *	Bit 1 - for uplink, Bit 2 - for bi-direction)
++ */
++struct driver_ttlm_info {
++	u16 dlink[NUM_MAX_TIDS];
++	u16 ulink[NUM_MAX_TIDS];
++	u8 dir_bmap;
++};
++
+ /**
+  * struct external_auth - External authentication trigger parameters
+  *
+@@ -5711,6 +5726,17 @@ struct wpa_driver_ops {
+ 	 * Returns: 0 on success, negative value on failure
+ 	 */
+ 	int (*set_epcs_cfg)(void *priv, bool epcs_cfg_value);
++
++	/**
++	 * set_ttlm_link_mapping - Set ttlm link mapping
++	 * @priv: Private driver interface data
++	 * @type: driver interface type
++	 * @params: ttlm params
++	 * Returns: 0 on success, negative value on failure
++	 */
++	int (*set_ttlm_link_mapping)(void *priv, enum wpa_driver_if_type type,
++				     struct driver_ttlm_info *params,
++				     const u8 *addr);
+ #endif /* CONFIG_IEEE80211BE */
+ };
+ 
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -15464,6 +15464,55 @@ failed:
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 
++#ifdef CONFIG_IEEE80211BE
++static int wpa_driver_nl80211_set_ttlm_link_mapping(void *priv, enum wpa_driver_if_type type,
++						    struct driver_ttlm_info *params,
++						    const u8 *addr)
++{
++	struct i802_bss *bss = priv;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++	struct nl_msg *msg;
++	enum nl80211_iftype nlmode;
++	int ret;
++
++	wpa_printf(MSG_DEBUG, "nl80211: MLD: set ttlm params");
++	msg = nlmsg_alloc();
++	if (!msg)
++		return -ENOMEM;
++
++	msg = nl80211_bss_msg(bss, 0, NL80211_CMD_SET_TID_TO_LINK_MAPPING);
++	if (!msg) {
++		nlmsg_free(msg);
++		return -ENOBUFS;
++	}
++
++	nlmode = wpa_driver_nl80211_if_type(type);
++	if (nlmode == NL80211_IFTYPE_AP) {
++		if (nla_put(msg, NL80211_ATTR_MLD_ADDR, ETH_ALEN, addr)) {
++			nlmsg_free(msg);
++			return -ENOBUFS;
++		}
++	}
++
++	if (nla_put(msg, NL80211_ATTR_MLO_TTLM_DLINK, sizeof(params->dlink), params->dlink)) {
++		nlmsg_free(msg);
++		return -ENOBUFS;
++	}
++
++	if (nla_put(msg, NL80211_ATTR_MLO_TTLM_ULINK, sizeof(params->ulink), params->ulink)) {
++		nlmsg_free(msg);
++		return -ENOBUFS;
++	}
++
++	ret = send_and_recv_cmd(drv, msg);
++	if (ret)
++		wpa_printf(MSG_ERROR, "nl80211: set ttlm failed. ret=%d (%s)",
++			   ret, strerror(-ret));
++	return ret;
++}
++#endif /* CONFIG_IEEE80211BE */
++
++
+ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.name = "nl80211",
+ 	.desc = "Linux nl80211/cfg80211",
+@@ -15642,5 +15691,6 @@ const struct wpa_driver_ops wpa_driver_n
+ 	.is_retail_afc_supported = nl80211_is_retail_afc_supported,
+ #ifdef CONFIG_IEEE80211BE
+ 	.set_epcs_cfg = wpa_driver_set_epcs_cfg,
++	.set_ttlm_link_mapping = wpa_driver_nl80211_set_ttlm_link_mapping,
+ #endif /* CONFIG_IEEE80211BE */
+ };

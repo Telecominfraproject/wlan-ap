@@ -1,0 +1,1263 @@
+From 444259452fc65712d6233dc0bea248c55ac39325 Mon Sep 17 00:00:00 2001
+From: Hariharan Ramanathan <hramanat@qti.qualcomm.com>
+Date: Tue, 10 Jun 2025 09:57:51 +0530
+Subject: [PATCH 3/4] UPSTREAM CP DP: wifi: ath12k: Add telemetry stats for QCA
+ Energy Service
+
+Implement telemetry stats collection for QCA Energy Service:
+
+Capture ath12k_pdev_telemetry_stats via WMI_CTRL_PATH_STATS_EVENTID
+Capture ath12k_peer_telemetry_stats via HTT PPDU TX and PPDU DP MON path
+Fetch these stats from the TLVs in each PPDU’s user info.
+Add new members to existing data structures to store and update the
+telemetry stats.
+
+Patch-dependency: 982-01-QSDK-Infra-wifi-ath12k-Add-rm-file-to-Makefile.patch
+Patch-work: None
+
+Original Patch:
+982-02-UPSTREAM-CP-DP-wifi-ath12k-Add-telemetry-stats-for-QCA-.patch
+
+Signed-off-by: Sidhanta Sahu <quic_sidhanta@quicinc.com>
+Signed-off-by: Hariharan Ramanathan <hramanat@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h    |  54 +++++
+ drivers/net/wireless/ath/ath12k/debugfs.c |  77 ++++++-
+ drivers/net/wireless/ath/ath12k/dp.c      |  38 ++++
+ drivers/net/wireless/ath/ath12k/dp.h      |  18 ++
+ drivers/net/wireless/ath/ath12k/dp_htt.c  | 108 ++++++++-
+ drivers/net/wireless/ath/ath12k/dp_htt.h  |  38 ++++
+ drivers/net/wireless/ath/ath12k/dp_mon.c  | 261 ++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/dp_mon.h  |   8 +
+ drivers/net/wireless/ath/ath12k/dp_peer.h |  26 +++
+ drivers/net/wireless/ath/ath12k/dp_rx.c   |   1 +
+ drivers/net/wireless/ath/ath12k/hal.h     |   7 +-
+ drivers/net/wireless/ath/ath12k/wmi.c     | 122 ++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.h     |  61 +++++
+ 13 files changed, 814 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -783,6 +783,19 @@ enum ath12k_hw_state {
+ 	/* Add other states as required */
+ };
+ 
++struct ath12k_ctrl_path_pmlo_telemetry_stats {
++       u32 pdev_id;
++       u8 estimated_air_time_ac_be;
++       u8 estimated_air_time_ac_bk;
++       u8 estimated_air_time_ac_vi;
++       u8 estimated_air_time_ac_vo;
++};
++
++struct ath12k_pdev_ctrl_path_stats {
++       struct ath12k_ctrl_path_pmlo_telemetry_stats telemetry_stats;
++       u8 pdev_freetime_per_sec;
++};
++
+ /* Antenna noise floor */
+ #define ATH12K_DEFAULT_NOISE_FLOOR -95
+ 
+@@ -1010,6 +1023,7 @@ struct ath12k {
+ 	bool supports_6ghz:1;
+ 	bool ch_info_can_report_survey:1;
+ 	bool target_suspend_ack:1;
++	struct ath12k_pdev_ctrl_path_stats stats;
+ 	bool dfs_block_radar_events:1;
+ 	bool monitor_vdev_created:1;
+ 	bool monitor_started:1;
+@@ -1845,4 +1859,44 @@ static inline void ath12k_core_dma_unmap
+ #endif
+ }
+ 
++static inline struct ath12k_base *ath12k_pdev_to_ab(struct ath12k_pdev *pdev)
++{
++       if (!pdev)
++               return NULL;
++
++       return pdev->ar->ab;
++}
++
++static inline int ath12k_get_pdev_id(struct ath12k_pdev *pdev)
++{
++       if (!pdev)
++               return -1;
++
++       return pdev->pdev_id;
++}
++
++static inline int ath12k_get_peer_count(struct ath12k_base *ab, bool get_max)
++{
++       struct ath12k_pdev *pdev;
++       int peer_count = 0;
++       int i;
++
++       if (!ab)
++               return 0;
++
++       for (i = 0; i < ab->num_radios; i++) {
++               rcu_read_lock();
++               pdev = rcu_dereference(ab->pdevs_active[i]);
++               if (pdev && pdev->ar) {
++                       if (get_max)
++                               peer_count += pdev->ar->max_num_peers;
++                       else
++                               peer_count += pdev->ar->num_peers;
++               }
++               rcu_read_unlock();
++       }
++
++       return peer_count;
++}
++
+ #endif /* _CORE_H_ */
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -2488,7 +2488,7 @@ static ssize_t ath12k_write_wmi_ctrl_pat
+ 	if (ret != 2)
+ 		return -EINVAL;
+ 
+-	if (!arg.action || arg.action > WMI_REQUEST_CTRL_PATH_STAT_RESET)
++	if (!arg.action)
+ 		return -EINVAL;
+ 
+ 	guard(mutex)(&ah->hw_mutex);
+@@ -2496,6 +2496,76 @@ static ssize_t ath12k_write_wmi_ctrl_pat
+ 	return ret ? ret : count;
+ }
+ 
++int wmi_ctrl_path_pmlo_stat(struct ath12k *ar, char __user *ubuf,
++                           size_t count, loff_t *ppos)
++{
++       struct wmi_ctrl_path_stats_list *stats, *tmp;
++       struct wmi_ctrl_path_pmlo_telemetry_stats *pmlo_stats;
++       const int size = 2048;
++       int len = 0, ret_val;
++       char *buf;
++       LIST_HEAD(wmi_stats_list);
++       u32 value;
++
++       buf = vmalloc(size);
++       if (!buf)
++               return -ENOMEM;
++
++       len += scnprintf(buf + len, size - len,
++                       "WMI_CTRL_PATH_PMLO_STATS:\n");
++
++       spin_lock_bh(&ar->debug.wmi_ctrl_path_stats_lock);
++       spin_unlock_bh(&ar->debug.wmi_ctrl_path_stats_lock);
++       list_for_each_entry_safe(stats, tmp, &wmi_stats_list, list) {
++               if (!stats)
++                       break;
++
++               pmlo_stats = stats->stats_ptr;
++
++               if (!pmlo_stats)
++                       break;
++
++               if (len < size) {
++                       len += scnprintf(buf + len, size - len,
++                               "pdev_id = %u\n",
++                               le32_to_cpu(pmlo_stats->pdev_id));
++               }
++
++               value = le32_to_cpu(pmlo_stats->estimated_air_time_per_ac);
++               if (len < size) {
++                       len += scnprintf(buf + len, size - len,
++                               "estimated_air_time_ac_be = %u\n",
++                               u32_get_bits(value, GENMASK(7, 0)));
++               }
++
++               if (len < size) {
++                       len += scnprintf(buf + len, size - len,
++                               "estimated_air_time_ac_bk = %u\n",
++                               u32_get_bits(value, GENMASK(15, 8)));
++               }
++
++               if (len < size) {
++                       len += scnprintf(buf + len, size - len,
++                               "estimated_air_time_ac_vi = %u\n",
++                               u32_get_bits(value, GENMASK(23, 16)));
++               }
++
++               if (len < size) {
++                       len += scnprintf(buf + len, size - len,
++                               "estimated_air_time_ac_vo = %u\n",
++                               u32_get_bits(value, GENMASK(31, 24)));
++               }
++
++               kfree(stats->stats_ptr);
++               list_del(&stats->list);
++               kfree(stats);
++       }
++
++       ret_val =  simple_read_from_buffer(ubuf, count, ppos, buf, len);
++       vfree(buf);
++       return ret_val;
++}
++
+ static int wmi_ctrl_path_pdev_stat(struct ath12k *ar, char __user *ubuf,
+ 				   size_t count, loff_t *ppos)
+ {
+@@ -2656,7 +2726,10 @@ static ssize_t ath12k_read_wmi_ctrl_path
+ 	case WMI_CTRL_PATH_AFC_STATS:
+ 		ret = wmi_ctrl_path_afc_stat(ar, ubuf, count, ppos);
+ 		break;
+-		/* Add case for newly wmi ctrl path added stats here */
++	case WMI_CTRL_PATH_PMLO_STATS:
++		ret = wmi_ctrl_path_pmlo_stat(ar, ubuf, count, ppos);
++	        break;
++		 /* Add case for newly wmi ctrl path added stats here */
+ 	default:
+ 		/* Unsupported tag */
+ 		ret = -EINVAL;
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -1106,6 +1106,7 @@ int ath12k_dp_pdev_alloc(struct ath12k_b
+ 	for (i = 0; i < ab->num_radios; i++) {
+ 		ar = ab->pdevs[i].ar;
+ 
++		memset(&ar->stats, 0, sizeof(struct ath12k_pdev_ctrl_path_stats));
+ 		dp_pdev = &ar->dp;
+ 
+ 		dp_pdev->hw = ar->ah->hw;
+@@ -1156,6 +1157,43 @@ out:
+ 	return ret;
+ }
+ 
++int ath12k_dp_get_pdev_telemetry_stats(struct ath12k_base *ab,
++                                      int pdev_id,
++                                      struct ath12k_pdev_telemetry_stats *stats)
++{
++       struct ath12k_pdev_dp *dp;
++       struct ath12k *ar;
++       u8 ac;
++
++       if (!ab) {
++               pr_warn("Failed to fetch pdev dp telemetry stats\n");
++               return -EINVAL;
++       }
++
++       ar = ath12k_mac_get_ar_by_pdev_id(ab, pdev_id);
++       if (!ar)
++               return -EINVAL;
++
++       dp = &ar->dp;
++
++       spin_lock_bh(&ar->data_lock);
++
++       /* Convert *_link_airtime from telemetry stats to a percentage of
++        * microseconds (us) */
++       for (ac = 0; ac < WLAN_MAX_AC; ac++) {
++               stats->tx_link_airtime[ac] =
++                       ((dp->stats.telemetry_stats.tx_link_airtime[ac] * 100) / 1000000);
++               stats->rx_link_airtime[ac] =
++                       ((dp->stats.telemetry_stats.rx_link_airtime[ac] * 100) / 1000000);
++               stats->link_airtime[ac] =
++                       (((dp->stats.telemetry_stats.tx_link_airtime[ac] +
++                          dp->stats.telemetry_stats.rx_link_airtime[ac]) * 100) / 1000000);
++       }
++
++       spin_unlock_bh(&ar->data_lock);
++
++       return 0;
++}
+ static void ath12k_dp_update_vdev_search(struct ath12k_link_vif *arvif)
+ {
+ 	u8 link_id = arvif->link_id;
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -152,6 +152,17 @@ struct ath12k_mon_data {
+ 	struct dp_mon_tx_ppdu_info *tx_data_ppdu_info;
+ };
+ 
++struct ath12k_pdev_telemetry_stats {
++       u32 link_airtime[WLAN_MAX_AC];
++       u32 tx_link_airtime[WLAN_MAX_AC];
++       u32 rx_link_airtime[WLAN_MAX_AC];
++};
++
++struct ath12k_pdev_dp_stats {
++       struct ath12k_pdev_telemetry_stats telemetry_stats;
++       /* Add other new stats if required */
++};
++
+ struct ath12k_pdev_dp {
+ 	u32 mac_id;
+ 	atomic_t num_tx_pending;
+@@ -175,6 +186,10 @@ struct ath12k_pdev_dp {
+ 	struct ieee80211_rx_status rx_status;
+ 	struct ath12k_mon_data mon_data;
+ 	struct ath12k_wmm_stats wmm_stats;
++	/* Protected by ab: base lock
++	 * determine when this stats is calculated based on peers
++	 */
++	struct ath12k_pdev_dp_stats stats;
+ };
+ 
+ #define DP_NUM_CLIENTS_MAX 64
+@@ -943,6 +958,9 @@ int ath12k_dp_htt_connect(struct ath12k_
+ void ath12k_dp_vdev_tx_attach(struct ath12k *ar, struct ath12k_link_vif *arvif);
+ void ath12k_dp_partner_cc_init(struct ath12k_base *ab);
+ int ath12k_dp_pdev_alloc(struct ath12k_base *ab);
++int ath12k_dp_get_pdev_telemetry_stats(struct ath12k_base *ab,
++                                      int pdev_id,
++                                      struct ath12k_pdev_telemetry_stats *stats);
+ void ath12k_dp_pdev_pre_alloc(struct ath12k *ar);
+ void ath12k_dp_pdev_free(struct ath12k_base *ab);
+ int ath12k_dp_tx_htt_srng_setup(struct ath12k_base *ab, u32 ring_id,
+--- a/drivers/net/wireless/ath/ath12k/dp_htt.c
++++ b/drivers/net/wireless/ath/ath12k/dp_htt.c
+@@ -162,6 +162,7 @@ static int ath12k_htt_tlv_ppdu_stats_par
+ 				ppdu_info->frame_type = HTT_STATS_PPDU_FTYPE_CTRL;
+ 			break;
+ 		}
++		ppdu_info->htt_frame_type = frame_type;
+ 		break;
+ 	case HTT_PPDU_STATS_TAG_USR_RATE:
+ 		if (len < sizeof(struct htt_ppdu_stats_user_rate)) {
+@@ -469,6 +470,7 @@ ath12k_update_per_peer_tx_stats(struct a
+ 	is_ofdma = (ppdu_type == HTT_PPDU_STATS_PPDU_TYPE_MU_OFDMA) |
+ 		(ppdu_type == HTT_PPDU_STATS_PPDU_TYPE_MU_MIMO_OFDMA);
+ 
++	ppdu_info->usr_ru_tones_sum += ru_tones;
+ 	/* Note: If host configured fixed rates and in some other special
+ 	 * cases, the broadcast/management frames are sent in different rates.
+ 	 * Firmware rate's control to be skipped for this?
+@@ -555,6 +557,8 @@ ath12k_update_per_peer_tx_stats(struct a
+ 	peer->tx_retry_failed += tx_retry_failed;
+ 	peer->tx_retry_count += tx_retry_count;
+ 	peer->txrate.nss = nss;
++	usr_stats->nss = nss;
++	ppdu_info->usr_nss_sum += nss;
+ 	peer->txrate.bw = ath12k_mac_bw_to_mac80211_bw(bw);
+ 	peer->tx_duration += tx_duration;
+ 	memcpy(&peer->last_txrate, &peer->txrate, sizeof(struct rate_info));
+@@ -582,11 +586,109 @@ ath12k_update_per_peer_tx_stats(struct a
+ 	}
+ 
+ 	peer_stats->ppdu_type = ppdu_type;
++	usr_stats->ru_tones = ru_tones;
+ 
+ 	spin_unlock_bh(&dp->dp_lock);
+ 	rcu_read_unlock();
+ }
+ 
++static void
++ath12k_ppdu_per_user_stats_phy_tx_time_update(struct ath12k_base *ab,
++                                             struct ath12k_dp_link_peer *peer,
++                                             const struct htt_ppdu_stats_info *ppdu_info,
++                                             const struct htt_ppdu_user_stats *user)
++{
++       const struct htt_ppdu_stats_common *common = &ppdu_info->ppdu_stats.common;
++       struct ath12k_dp_peer_stats *stats = NULL;
++       u32 ru_nss_width_sum = 0;
++       u16 phy_tx_time_us = 0;
++       u8 tid;
++       u8 ac;
++
++	lockdep_assert_held(&ab->dp->dp_lock);
++
++       if (!peer || !user || !common) {
++               ath12k_warn(ab, "Invalid ppdu user info received\n");
++               return;
++       }
++
++       ru_nss_width_sum = ppdu_info->usr_nss_sum * ppdu_info->usr_ru_tones_sum;
++       if (!ru_nss_width_sum)
++               ru_nss_width_sum = 1;
++
++       if (ppdu_info->htt_frame_type == HTT_STATS_FTYPE_TIDQ_DATA_SU)
++               phy_tx_time_us = common->phy_ppdu_tx_time_us;
++       else
++               phy_tx_time_us = (common->phy_ppdu_tx_time_us *
++                                 user->nss * user->ru_tones) / ru_nss_width_sum;
++
++       tid = user->rate.tid_num;
++       ac = ath12k_tid_to_ac(tid);
++       stats = &peer->peer_stats;
++       stats->dp_mon_stats.mon_stats.tx_airtime_consumption[ac].consumption += phy_tx_time_us;
++       ath12k_dbg(ab, ATH12K_DBG_DP_HTT, "ppdu info id: %d tid: %d htt frame type: %d  ppdu frame type: %d time: %d nss: %d tones: %d sum [nss: %d tone: %d consum: %d]\n",
++                  ppdu_info->ppdu_id,
++                  user->rate.tid_num,
++                  ppdu_info->htt_frame_type,
++                  ppdu_info->frame_type,
++                  common->phy_ppdu_tx_time_us,
++                  user->nss, user->ru_tones,
++                  ppdu_info->usr_nss_sum, ppdu_info->usr_ru_tones_sum,
++                  stats->dp_mon_stats.mon_stats.tx_airtime_consumption[ac].consumption);
++}
++
++static void ath12k_htt_update_peer_telemetry_stats(struct ath12k_pdev_dp *dp_pdev,
++						   struct htt_ppdu_stats_info *ppdu_info)
++{
++       struct ath12k_base *ab = dp_pdev->ar->ab;
++       struct ath12k_dp_link_peer *peer;
++       struct ieee80211_sta *sta;
++       struct ath12k_link_sta *arsta;
++       struct htt_ppdu_stats *ppdu_stats = &ppdu_info->ppdu_stats;
++       struct htt_ppdu_user_stats *user_stats = NULL;
++       u32 tlv_bitmap;
++       u8 uid;
++
++       if (!ppdu_info)
++               return;
++
++       if (ppdu_info->frame_type != HTT_STATS_PPDU_FTYPE_DATA)
++               return;
++
++       tlv_bitmap = ppdu_info->tlv_bitmap;
++       if (!(tlv_bitmap & BIT(HTT_PPDU_STATS_TAG_USR_RATE)))
++               return;
++
++       for (uid = 0; uid < HTT_PPDU_STATS_MAX_USERS; uid++) {
++               user_stats = &ppdu_stats->user_stats[uid];
++
++		spin_lock_bh(&dp_pdev->dp->dp_lock);
++
++               peer = ath12k_dp_link_peer_find_by_id(dp_pdev->dp,
++						     user_stats->peer_id);
++               if (!peer || !peer->sta) {
++			spin_unlock_bh(&dp_pdev->dp->dp_lock);
++                       return;
++               }
++
++               sta = peer->sta;
++
++		rcu_read_lock();
++               arsta = ath12k_peer_get_link_sta(ab, peer);
++               if (!arsta) {
++			rcu_read_unlock();
++			spin_unlock_bh(&dp_pdev->dp->dp_lock);
++                       return;
++               }
++		rcu_read_unlock();
++
++               ath12k_ppdu_per_user_stats_phy_tx_time_update(ab, peer,
++                                                             ppdu_info,
++                                                             user_stats);
++		spin_unlock_bh(&dp_pdev->dp->dp_lock);
++       }
++}
++
+ static void ath12k_htt_update_ppdu_stats(struct ath12k_pdev_dp *dp_pdev,
+ 					 struct htt_ppdu_stats_info *ppdu_info)
+ {
+@@ -594,6 +696,8 @@ static void ath12k_htt_update_ppdu_stats
+ 
+ 	for (user = 0; user < HTT_PPDU_STATS_MAX_USERS - 1; user++)
+ 		ath12k_update_per_peer_tx_stats(dp_pdev, ppdu_info, user);
++
++	ath12k_htt_update_peer_telemetry_stats(dp_pdev, ppdu_info);
+ }
+ 
+ static
+@@ -614,7 +718,12 @@ struct htt_ppdu_stats_info *ath12k_dp_ht
+ 						     typeof(*ppdu_info), list);
+ 			list_del(&ppdu_info->list);
+ 			dp_pdev->ppdu_stat_list_depth--;
+-			ath12k_htt_update_ppdu_stats(dp_pdev, ppdu_info);
++			/* Update the stats once per ppdu info as this function can be
++			 * called multiple times per ppdu info with data frame,
++			 * avoid updating the same user stats again for data frame
++			 */
++			if (ppdu_info->frame_type != HTT_STATS_PPDU_FTYPE_DATA)
++			        ath12k_htt_update_ppdu_stats(dp_pdev, ppdu_info);
+ 			kfree(ppdu_info);
+ 		}
+ 	}
+--- a/drivers/net/wireless/ath/ath12k/dp_htt.h
++++ b/drivers/net/wireless/ath/ath12k/dp_htt.h
+@@ -499,6 +499,7 @@ enum htt_ppdu_stats_tag_type {
+ 	HTT_PPDU_STATS_TAG_USR_COMMON_ARRAY,
+ 	HTT_PPDU_STATS_TAG_INFO,
+ 	HTT_PPDU_STATS_TAG_TX_MGMTCTRL_PAYLOAD,
++	HTT_PPDU_STATS_USERS_INFO,
+ 
+ 	/* New TLV's are added above to this line */
+ 	HTT_PPDU_STATS_TAG_MAX,
+@@ -517,6 +518,12 @@ enum htt_ppdu_stats_tag_type {
+ 				   | BIT(HTT_PPDU_STATS_TAG_USR_COMPLTN_FLUSH) \
+ 				   | BIT(HTT_PPDU_STATS_TAG_USR_COMMON_ARRAY))
+ 
++#define HTT_PPDU_STATS_ENHANCED_TX_COMPLN (BIT(HTT_PPDU_STATS_TAG_COMMON) \
++                                   | BIT(HTT_PPDU_STATS_TAG_USR_COMMON) \
++                                   | BIT(HTT_PPDU_STATS_TAG_USR_RATE) \
++                                   | BIT(HTT_PPDU_STATS_TAG_USR_COMPLTN_COMMON) \
++                                   | BIT(HTT_PPDU_STATS_TAG_USR_COMPLTN_FLUSH))
++
+ #define HTT_PPDU_STATS_TAG_PKTLOG  (BIT(HTT_PPDU_STATS_TAG_USR_MPDU_ENQ_BITMAP_64) | \
+ 				    BIT(HTT_PPDU_STATS_TAG_USR_MPDU_ENQ_BITMAP_256) | \
+ 				    BIT(HTT_PPDU_STATS_TAG_USR_COMPLTN_BA_BITMAP_64) | \
+@@ -1394,6 +1401,29 @@ struct htt_ppdu_stats_common {
+ 	 */
+ 	__le16 phy_mode;
+ 	__le16 bw_mhz;
++	__le32 cca_delta_time_us;
++	__le32 rxfrm_delta_time_us;
++	__le32 txfrm_delta_time_us;
++	/*  The phy_ppdu_tx_time_us reports the time it took to transmit
++	 * a PPDU by itself
++	 * BIT [15 :  0] - phy_ppdu_tx_time_us reports the time it took to
++	 *                 transmit by itself (not including response time)
++	 * BIT [23 : 16] - num_ul_expected_users reports the number of users
++	 *                 that are expected to respond to this transmission
++	 * BIT [24 : 24] - beam_change reports the beam forming pattern
++	 *                 between non-HE and HE portion.
++	 *                 If we apply TxBF starting from legacy preamble,
++	 *                 then beam_change = 0.
++	 *                 If we apply TxBF only starting from HE portion,
++	 *                 then beam_change = 1.
++	 * BIT [25 : 25] - doppler_indication
++	 * BIT [29 : 26] - spatial_reuse for HE_SU,HE_MU and HE_EXT_SU format PPDU
++	 *                 HTT_PPDU_STATS_SPATIAL_REUSE
++	 * BIT [31 : 30] - reserved
++	 */
++	__le16 phy_ppdu_tx_time_us;
++	u8 num_ul_expected_users;
++	u8 reserved;
+ } __packed;
+ 
+ enum htt_ppdu_stats_gi {
+@@ -1403,6 +1433,8 @@ enum htt_ppdu_stats_gi {
+ 	HTT_PPDU_STATS_SGI_3_2_US,
+ };
+ 
++#define HTT_PPDU_STATS_USER_RATE_TLV_TID_NUM_M     GENMASK(7, 0)
++
+ #define HTT_PPDU_STATS_USER_RATE_INFO0_USER_POS_M	GENMASK(3, 0)
+ #define HTT_PPDU_STATS_USER_RATE_INFO0_MU_GROUP_ID_M	GENMASK(11, 4)
+ #define HTT_PPDU_STATS_USER_RATE_INFO0_RU_SIZE         GENMASK(15, 12)
+@@ -1599,6 +1631,8 @@ struct htt_ppdu_user_stats {
+ 	u16 delay_ba;
+ 	u32 tlv_flags;
+ 	bool is_valid_peer_id;
++	u8 ru_tones;
++	u8 nss;
+ 	struct htt_ppdu_stats_user_rate rate;
+ 	struct htt_ppdu_stats_usr_cmpltn_cmn cmpltn_cmn;
+ 	struct htt_ppdu_stats_usr_cmpltn_ack_ba_status ack_ba;
+@@ -1621,7 +1655,11 @@ struct htt_ppdu_stats_info {
+ 	u32 frame_ctrl;
+ 	u32 delay_ba;
+ 	u32 bar_num_users;
++	u32 max_users;
+ 	struct htt_ppdu_stats ppdu_stats;
++	u32 usr_ru_tones_sum;
++	u16 htt_frame_type;
++	u8 usr_nss_sum;
+ 	struct list_head list;
+ };
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -1669,6 +1669,7 @@ ath12k_dp_mon_rx_parse_status_tlv(struct
+ 		if (userid < HAL_MAX_UL_MU_USERS) {
+ 			info[0] = __le32_to_cpu(mpdu_start->info0);
+ 			ppdu_info->userid = userid;
++			ppdu_info->userstats[userid].sw_peer_id = peer_id;
+ 			ppdu_info->userstats[userid].ampdu_id =
+ 				u32_get_bits(info[0], HAL_RX_MPDU_START_INFO0_PPDU_ID);
+ 		}
+@@ -3363,6 +3364,7 @@ void ath12k_dp_mon_rx_process_ulofdma(st
+ {
+ 	struct hal_rx_user_status *rx_user_status;
+ 	u32 num_users, i, mu_ul_user_v0_word0, mu_ul_user_v0_word1, ru_size;
++	u32 ru_width;
+ 
+ 	if (!(ppdu_info->reception_type == HAL_RX_RECEPTION_TYPE_MU_MIMO ||
+ 	      ppdu_info->reception_type == HAL_RX_RECEPTION_TYPE_MU_OFDMA ||
+@@ -3391,6 +3393,7 @@ void ath12k_dp_mon_rx_process_ulofdma(st
+ 				u32_get_bits(mu_ul_user_v0_word1,
+ 					     HAL_RX_UL_OFDMA_USER_INFO_V0_W1_NSS) + 1;
+ 
++			ppdu_info->usr_nss_sum += rx_user_status->nss;
+ 			rx_user_status->ofdma_info_valid = 1;
+ 			rx_user_status->ul_ofdma_ru_start_index =
+ 				u32_get_bits(mu_ul_user_v0_word1,
+@@ -3399,6 +3402,8 @@ void ath12k_dp_mon_rx_process_ulofdma(st
+ 			ru_size = u32_get_bits(mu_ul_user_v0_word1,
+ 					       HAL_RX_UL_OFDMA_USER_INFO_V0_W1_RU_SIZE);
+ 			rx_user_status->ul_ofdma_ru_width = ru_size;
++			ru_width = hal_rx_ul_ofdma_ru_size_to_width(ru_size);
++			rx_user_status->ul_ofdma_ru_width = ru_width;
+ 			rx_user_status->ul_ofdma_ru_size = ru_size;
+ 		}
+ 		rx_user_status->ldpc = u32_get_bits(mu_ul_user_v0_word1,
+@@ -3441,6 +3446,9 @@ ath12k_dp_mon_rx_update_user_stats(struc
+ 	if (!rx_stats)
+ 		return;
+ 
++	ppdu_info->usr_nss_sum += user_stats->nss;
++	ppdu_info->usr_ru_tones_sum += user_stats->ul_ofdma_ru_width;
++
+ 	peer->rssi_comb = ppdu_info->rssi_comb;
+ 	ewma_avg_rssi_add(&peer->avg_rssi, ppdu_info->rssi_comb);
+ 
+@@ -3533,6 +3541,81 @@ ath12k_dp_mon_rx_update_peer_mu_stats(st
+ }
+ 
+ static void
++ath12k_dp_mon_ppdu_per_user_rx_time_update(struct ath12k_pdev_dp *dp_pdev,
++                                          struct hal_rx_mon_ppdu_info *ppdu_info,
++                                          u32 uid)
++{
++       struct hal_rx_user_status *user_stats = &ppdu_info->userstats[uid];
++       struct ath12k_dp_peer_stats *stats = NULL;
++       struct ath12k_link_sta *arsta;
++       struct ath12k_dp_link_peer *peer;
++       u32 nss_ru_width_sum = 0;
++       u64 temp_result = 0;
++       u16 rx_time_us = 0;
++       u8 ac = 0;
++
++       if (!dp_pdev)
++               return;
++
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held(), "PPDU per user rx time update called without rcu lock\n");
++	lockdep_assert_held(&dp_pdev->dp->dp_lock);
++
++       peer = ath12k_dp_link_peer_find_by_id(dp_pdev->dp, user_stats->sw_peer_id);
++       if (!peer || !peer->sta) {
++               ath12k_dbg(dp_pdev->ar->ab, ATH12K_DBG_PEER,
++                          "peer stats not found on ppdu peer id %d\n",
++                          user_stats->sw_peer_id);
++               return;
++       }
++
++       arsta = ath12k_peer_get_link_sta(dp_pdev->ar->ab, peer);
++       if (!arsta) {
++               ath12k_warn(dp_pdev->ar->ab, "link sta not found on peer %pM id %d\n",
++                           peer->addr, peer->peer_id);
++               return;
++       }
++
++       nss_ru_width_sum = ppdu_info->usr_nss_sum * ppdu_info->usr_ru_tones_sum;
++       if (!nss_ru_width_sum)
++               nss_ru_width_sum = 1;
++
++       if (ppdu_info->reception_type != HAL_RX_RECEPTION_TYPE_SU) {
++               temp_result = ppdu_info->rx_duration * user_stats->nss *
++                             user_stats->ul_ofdma_ru_width;
++               rx_time_us = (u16)div_u64(temp_result, nss_ru_width_sum);
++       } else
++               rx_time_us = ppdu_info->rx_duration;
++
++       ac = ath12k_tid_to_ac(ppdu_info->tid);
++       stats = &peer->peer_stats;
++       stats->dp_mon_stats.mon_stats.rx_airtime_consumption[ac].consumption += rx_time_us;
++       ath12k_dbg(dp_pdev->ar->ab, ATH12K_DBG_DP_HTT, "peer: %pM tid: %d ac: %d sum nss: %d tones: %d per user nss: %d tone: %d time: %d cons: %d\n",
++                  peer->addr,
++                  ppdu_info->tid, ac,
++                  ppdu_info->usr_nss_sum, ppdu_info->usr_ru_tones_sum,
++                  user_stats->nss, user_stats->ul_ofdma_ru_width,
++                  rx_time_us,
++                  stats->dp_mon_stats.mon_stats.rx_airtime_consumption[ac].consumption);
++}
++
++static void ath12k_dp_mon_ppdu_rx_time_update(struct ath12k_pdev_dp *dp_pdev,
++                                             struct hal_rx_mon_ppdu_info *ppdu_info,
++                                             bool is_stat)
++{
++       u32 num_users, uid;
++
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held(), "PPDU rx time update called without rcu lock\n");
++	lockdep_assert_held(&dp_pdev->dp->dp_lock);
++
++       num_users = ppdu_info->num_users;
++       if (num_users > HAL_MAX_UL_MU_USERS)
++               num_users = HAL_MAX_UL_MU_USERS;
++
++       for (uid = 0; uid < num_users; uid++)
++               ath12k_dp_mon_ppdu_per_user_rx_time_update(dp_pdev, ppdu_info, uid);
++}
++
++static void
+ ath12k_dp_mon_rx_memset_ppdu_info(struct hal_rx_mon_ppdu_info *ppdu_info)
+ {
+ 	memset(ppdu_info, 0, sizeof(*ppdu_info));
+@@ -3703,10 +3786,12 @@ move_next:
+ 			}
+ 			ath12k_dp_mon_rx_update_peer_su_stats(pdev_dp, peer,
+ 							      ppdu_info);
++			ath12k_dp_mon_ppdu_rx_time_update(pdev_dp, ppdu_info, 0);
+ 		} else if ((ppdu_info->fc_valid) &&
+ 			   (ppdu_info->ast_index != HAL_AST_IDX_INVALID)) {
+ 			ath12k_dp_mon_rx_process_ulofdma(ppdu_info);
+ 			ath12k_dp_mon_rx_update_peer_mu_stats(pdev_dp, ppdu_info);
++			ath12k_dp_mon_ppdu_rx_time_update(pdev_dp, ppdu_info, 0);
+ 		}
+ 
+ next_skb:
+@@ -3746,3 +3831,187 @@ int ath12k_dp_mon_process_ring(struct at
+ 	return num_buffs_reaped;
+ }
+ EXPORT_SYMBOL(ath12k_dp_mon_process_ring);
++static void ath12k_dp_mon_clear_pdev_airtime_stats(struct ath12k *ar)
++{
++       struct ath12k_pdev_dp *pdev_dp = &ar->dp;
++       u8 ac;
++
++       for (ac = 0; ac < ATH12K_DP_WLAN_MAX_AC; ac++) {
++               pdev_dp->stats.telemetry_stats.tx_link_airtime[ac] = 0;
++               pdev_dp->stats.telemetry_stats.rx_link_airtime[ac] = 0;
++       }
++}
++
++static inline u64 ath12k_get_timestamp_in_us(void)
++{
++       struct timespec64 ts;
++
++       ktime_get_ts64(&ts);
++
++       return ((u64)ts.tv_sec * 1000000) + (ts.tv_nsec / 1000);
++}
++
++void ath12k_dp_mon_peer_update_telemetry_stats(struct ath12k_base *ab,
++                                              struct ath12k_dp_link_peer *peer,
++                                              struct ath12k_pdev *pdev)
++{
++       struct ath12k_mon_peer_airtime_stats *airtime_stats;
++       struct peer_airtime_consumption *peer_consump;
++       u64 current_time = ath12k_get_timestamp_in_us();
++       u32 remainder, time_diff;
++       u32 usage;
++       u16 consump_per_sec;
++       struct ath12k *ar = pdev->ar;
++       struct ath12k_pdev_dp *dp = &ar->dp;
++       struct ath12k_pdev_dp_stats *pdev_stats = &dp->stats;
++       u8 ac;
++
++       airtime_stats = &peer->peer_stats.dp_mon_stats.mon_stats;
++       time_diff = (u32)(current_time - airtime_stats->last_update_time);
++
++       for (ac = 0; ac < ATH12K_DP_WLAN_MAX_AC; ac++) {
++               /* *_link_airtime refers to the amount of time a peer spends
++                * transmitting or receiving data over the medium
++                * To calculate total pdev's airtime cosumption, then store
++                * each peer airtime consumption in pdev telemetry link airtime
++                */
++
++               /* Tx Airtime Consumption */
++               peer_consump = &airtime_stats->tx_airtime_consumption[ac];
++               usage = peer_consump->consumption;
++               consump_per_sec = (u8)div_u64((u64)(usage * 100), time_diff);
++               div_u64_rem((u64)(usage * 100), time_diff, &remainder);
++               if (remainder < time_diff / 2) {
++                       if (remainder && consump_per_sec == 0)
++                               consump_per_sec++;
++               } else {
++                       if (consump_per_sec < 100)
++                               consump_per_sec++;
++               }
++               peer_consump->avg_consumption_per_sec = consump_per_sec;
++               pdev_stats->telemetry_stats.tx_link_airtime[ac] += peer_consump->consumption;
++               peer_consump->consumption = 0;
++
++               /* Rx Airtime Consumption */
++               peer_consump = &airtime_stats->rx_airtime_consumption[ac];
++               usage = peer_consump->consumption;
++               consump_per_sec = (u8)div_u64((u64)(usage * 100), time_diff);
++               div_u64_rem((u64)(usage * 100), time_diff, &remainder);
++               if (remainder < time_diff / 2) {
++                       if (remainder && consump_per_sec == 0)
++                               consump_per_sec++;
++               } else {
++                       if (consump_per_sec < 100)
++                               consump_per_sec++;
++               }
++               peer_consump->avg_consumption_per_sec = consump_per_sec;
++               pdev_stats->telemetry_stats.rx_link_airtime[ac] += peer_consump->consumption;
++               peer_consump->consumption = 0;
++
++               ath12k_dbg(ab,
++                          ATH12K_DBG_DP_HTT,
++                          "peer: %pM time diff: %d link air tx: %d rx: %d cons tx: %d rx: %d\n",
++                          peer->addr, time_diff,
++                          pdev_stats->telemetry_stats.tx_link_airtime[ac],
++                          pdev_stats->telemetry_stats.rx_link_airtime[ac],
++                          airtime_stats->tx_airtime_consumption[ac].avg_consumption_per_sec,
++                          airtime_stats->rx_airtime_consumption[ac].avg_consumption_per_sec);
++       }
++
++       airtime_stats->last_update_time = current_time;
++}
++
++static inline void ath12k_pdev_dp_iterate_peer(struct ath12k_base *ab,
++                                              struct ath12k_pdev *pdev,
++                                              void (*iter)(struct ath12k_base *ab, struct ath12k_dp_link_peer *peer, struct ath12k_pdev *pdev))
++{
++       struct ath12k_dp_link_peer *peer, *tmp;
++       struct ieee80211_sta *sta;
++       struct ath12k *ar;
++
++       if (!pdev || !pdev->ar)
++               return;
++       ar = pdev->ar;
++       spin_lock_bh(&ab->dp->dp_lock);
++       list_for_each_entry_safe(peer, tmp, &ab->dp->peers, list) {
++               if (!peer->vif)
++                       continue;
++
++               sta = peer->sta;
++               if (!sta)
++                       continue;
++               /* In a split PHY scenario, if a pdev-level event occurs,
++                * halt the operation if the peer belongs to a different pdev
++                * than the one that triggered the event.
++                */
++               if (peer->pdev_idx != ar->pdev_idx)
++                       continue;
++
++               iter(ab, peer, pdev);
++       }
++       spin_unlock_bh(&ab->dp->dp_lock);
++}
++
++int ath12k_dp_mon_pdev_update_telemetry_stats(struct ath12k_base *ab,
++                                             const int pdev_id)
++{
++       struct ath12k_pdev *pdev;
++
++       rcu_read_lock();
++       pdev = rcu_dereference(ab->pdevs_active[pdev_id]);
++       if (!pdev) {
++               rcu_read_unlock();
++               return -EINVAL;
++       }
++
++       if (pdev->ar)
++               ath12k_dp_mon_clear_pdev_airtime_stats(pdev->ar);
++
++       ath12k_pdev_dp_iterate_peer(ab, pdev,
++                                   ath12k_dp_mon_peer_update_telemetry_stats);
++       rcu_read_unlock();
++
++       return 0;
++}
++
++static void ath12k_dp_mon_peer_telemetry_stats(const struct ath12k_dp_link_peer *peer,
++                                              struct ath12k_peer_telemetry_stats *stats)
++{
++       const struct ath12k_dp_mon_peer_stats *dp_stats;
++       u8 ac;
++
++       dp_stats = &peer->peer_stats.dp_mon_stats;
++       for (ac = 0; ac < ATH12K_DP_WLAN_MAX_AC; ac++) {
++               stats->tx_airtime_consumption[ac] =
++                       dp_stats->mon_stats.tx_airtime_consumption[ac].avg_consumption_per_sec;
++               stats->rx_airtime_consumption[ac] =
++                       dp_stats->mon_stats.rx_airtime_consumption[ac].avg_consumption_per_sec;
++       }
++       stats->snr = 0;
++}
++
++int ath12k_dp_get_peer_telemetry_stats(struct ath12k_base *ab,
++                                      const u8 *peer_addr,
++                                      struct ath12k_peer_telemetry_stats *stats)
++{
++       struct ath12k_dp_link_peer *peer;
++	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
++
++	spin_lock_bh(&dp->dp_lock);
++
++       peer = ath12k_dp_link_peer_find_by_addr(dp, peer_addr);
++       if (!peer) {
++		spin_unlock_bh(&dp->dp_lock);
++               ath12k_dbg(ab,
++                          ATH12K_DBG_DP_HTT,
++                          "Failed to find peer at addr: %pM\n", peer_addr);
++               return -EINVAL;
++       }
++
++       ath12k_dp_mon_peer_telemetry_stats(peer, stats);
++
++	spin_unlock_bh(&dp->dp_lock);
++
++       return 0;
++}
++
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.h
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.h
+@@ -8,10 +8,12 @@
+ #define ATH12K_DP_MON_H
+ 
+ #include "core.h"
++#include "dp_peer.h"
+ #include "wifi7/hal_desc.h"
+ 
+ #define ATH12K_MON_RX_DOT11_OFFSET	5
+ #define ATH12K_MON_RX_PKT_OFFSET	8
++#define ATH12K_DP_WLAN_MAX_AC		4
+ 
+ enum dp_monitor_mode {
+ 	ATH12K_DP_TX_MONITOR_MODE,
+@@ -103,4 +105,10 @@ ath12k_dp_mon_tx_parse_mon_status(struct
+ void ath12k_dp_mon_rx_process_ulofdma(struct hal_rx_mon_ppdu_info *ppdu_info);
+ int ath12k_dp_mon_srng_process(struct ath12k_pdev_dp *pdev_dp, int *budget,
+ 			       struct napi_struct *napi);
++int ath12k_dp_get_peer_telemetry_stats(struct ath12k_base *ab,
++                                      const u8 *peer_addr,
++                                      struct ath12k_peer_telemetry_stats *stats);
++
++int ath12k_dp_mon_pdev_update_telemetry_stats(struct ath12k_base *ab,
++                                             int pdev_id);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.h
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.h
+@@ -61,9 +61,35 @@ struct ath12k_wbm_tx_stats {
+ 	u64 wbm_tx_comp_stats[HAL_WBM_REL_HTT_TX_COMP_STATUS_MAX];
+ };
+ 
++struct peer_airtime_consumption {
++       u32 consumption;
++       u16 avg_consumption_per_sec;
++};
++
++struct ath12k_mon_peer_airtime_stats {
++       struct peer_airtime_consumption tx_airtime_consumption[WME_NUM_AC];
++       struct peer_airtime_consumption rx_airtime_consumption[WME_NUM_AC];
++       u64 last_update_time;
++};
++
++struct ath12k_peer_telemetry_stats {
++       u32 tx_mpdu_retried;
++       u32 tx_mpdu_total;
++       u32 rx_mpdu_retried;
++       u32 rx_mpdu_total;
++       u16 tx_airtime_consumption[WME_NUM_AC]; // Energy Service FR
++       u16 rx_airtime_consumption[WME_NUM_AC]; // Energy Service FR
++       u8 snr;
++};
++
++struct ath12k_dp_mon_peer_stats {
++       struct ath12k_mon_peer_airtime_stats mon_stats;
++};
++
+ struct ath12k_dp_peer_stats {
+ 	struct ath12k_rx_peer_stats *rx_stats;
+ 	struct ath12k_wbm_tx_stats *wbm_tx_stats;
++	struct ath12k_dp_mon_peer_stats dp_mon_stats;
+ };
+ 
+ DECLARE_EWMA(avg_rssi, 10, 8)
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -1352,6 +1352,7 @@ static int ath12k_dp_rx_pdev_mon_status_
+ 
+ 	memset(&pmon->rx_mon_stats, 0,
+ 	       sizeof(pmon->rx_mon_stats));
++	memset(&dp->stats, 0, sizeof(dp->stats));
+ 	return 0;
+ }
+ 
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -540,7 +540,8 @@ struct hal_rx_user_status {
+ 	ul_ofdma_ru_size:8;
+ 	u32 ul_ofdma_user_v0_word0;
+ 	u32 ul_ofdma_user_v0_word1;
+-	u32 ast_index;
++	u16 ast_index;  // End User Stat
++	u16 sw_peer_id; // mpdu start
+ 	u32 tid;
+ 	u16 tcp_msdu_count;
+ 	u16 tcp_ack_msdu_count;
+@@ -642,7 +643,7 @@ struct hal_rx_mon_ppdu_info {
+ 	u64 tsft;
+ 	u64 rx_duration;
+ 	u16 frame_control;
+-	u32 ast_index;
++	u16 ast_index;
+ 	u8 rs_fcs_err;
+ 	u8 rs_flags;
+ 	u8 cck_flag;
+@@ -684,6 +685,8 @@ struct hal_rx_mon_ppdu_info {
+ 	u8 medium_prot_type;
+ 	bool ppdu_continuation;
+ 	bool eht_usig;
++	u8 usr_nss_sum;
++	u32 usr_ru_tones_sum;
+ 	struct hal_rx_u_sig_info u_sig_info;
+ 	bool is_eht;
+ 	struct hal_rx_eht_info eht_info;
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -22,6 +22,7 @@
+ #include "peer.h"
+ #include "p2p.h"
+ #include "testmode.h"
++#include "dp_mon.h"
+ #include "vendor.h"
+ 
+ struct ath12k_wmi_svc_ready_parse {
+@@ -247,6 +248,63 @@ static const int ath12k_hw_mode_pri_map[
+ 	PRIMAP(WMI_HOST_HW_MODE_MAX),
+ };
+ 
++enum ath12k_type_req_ctrl_path_stats_id {
++       TYPE_REQ_CTRL_PATH_PDEV_TX_STAT = 0,
++       TYPE_REQ_CTRL_PATH_VDEV_EXTD_STAT,
++       TYPE_REQ_CTRL_PATH_MEM_STAT,
++       TYPE_REQ_CTRL_PATH_TWT_STAT,
++       TYPE_REQ_CTRL_PATH_BMISS_STAT,
++       TYPE_REQ_CTRL_PATH_PMLO_STAT,
++       TYPE_REQ_CTRL_PATH_RRM_STA_STAT,
++};
++
++int ath12k_wmi_pdev_enable_telemetry_stats(struct ath12k_base *ab,
++                                           struct ath12k *ar)
++{
++       struct ath12k_wmi_pdev *wmi = ar->wmi;
++       enum ath12k_type_req_ctrl_path_stats_id req_id = TYPE_REQ_CTRL_PATH_PMLO_STAT;
++       struct wmi_request_ctrl_path_stats_cmd_fixed_param *cmd;
++       u32 pdev_id_array;
++       u32 num_pdev_ids = 1;
++       int len, ret;
++       struct wmi_tlv *tlv;
++       struct sk_buff *skb;
++       void *ptr;
++
++       len = sizeof(struct wmi_request_ctrl_path_stats_cmd_fixed_param) +
++             TLV_HDR_SIZE + (sizeof(u32) * (num_pdev_ids));
++
++       skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, len);
++       if (!skb)
++               return -ENOMEM;
++
++       cmd = (void *)skb->data;
++       cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_CTRL_PATH_STATS_CMD_FIXED_PARAM,
++                                                sizeof(*cmd));
++
++       cmd->stats_id_mask = (1 << WMI_REQ_CTRL_PATH_PMLO_STAT);
++       cmd->request_id = req_id;
++       cmd->action = WMI_REQUEST_CTRL_PATH_STAT_PERIODIC_PUBLISH;
++       cmd->subid = ATH12K_WMI_SUBID_PERIODICITY_1_SEC;
++       pdev_id_array = ar->pdev->pdev_id;
++
++       ptr = skb->data + sizeof(*cmd);
++
++       tlv = ptr;
++       tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_UINT32) |
++               FIELD_PREP(WMI_TLV_LEN, sizeof(u32) * num_pdev_ids);
++       ptr += TLV_HDR_SIZE;
++       memcpy(ptr, &pdev_id_array, sizeof(pdev_id_array));
++
++       ret = ath12k_wmi_cmd_send(wmi, skb, WMI_REQUEST_CTRL_PATH_STATS_CMDID);
++       if (ret) {
++               dev_kfree_skb(skb);
++               ath12k_warn(ab, "Failed to send WMI_REQUEST_CTRL_PATH_STATS_CMDID: %d", ret);
++       }
++
++       return ret;
++}
++
+ static int
+ ath12k_wmi_tlv_iter(struct ath12k_base *ab, const void *ptr, size_t len,
+ 		    int (*iter)(struct ath12k_base *ab, u16 tag, u16 len,
+@@ -11435,6 +11493,56 @@ int wmi_print_ctrl_path_afc_stats_tlv(st
+ 	return 0;
+ }
+ 
++int wmi_print_ctrl_path_pmlo_stats_tlv(struct ath12k_base *ab, u16 len, const void *ptr, void *data)
++{
++       struct wmi_ctrl_path_stats_ev_parse_param *stats_buff = (struct wmi_ctrl_path_stats_ev_parse_param *)data;
++       struct wmi_ctrl_path_pmlo_telemetry_stats *pmlo_stats_skb = (struct wmi_ctrl_path_pmlo_telemetry_stats *)ptr;
++       struct wmi_ctrl_path_pmlo_telemetry_stats *pmlo_stats = NULL;
++       struct wmi_ctrl_path_stats_list *stats = kzalloc(sizeof(struct wmi_ctrl_path_stats_list), GFP_ATOMIC);
++       struct ath12k *ar = NULL;
++       u32 value;
++
++       if (!stats)
++               return -ENOMEM;
++
++       pmlo_stats = vmalloc(sizeof(*pmlo_stats));
++       if (!pmlo_stats) {
++               kfree(stats);
++               return -ENOMEM;
++       }
++
++       memcpy(pmlo_stats, pmlo_stats_skb, sizeof(struct wmi_ctrl_path_pmlo_telemetry_stats));
++       stats->stats_ptr = pmlo_stats;
++       list_add_tail(&stats->list, &stats_buff->list);
++
++       ar = ath12k_mac_get_ar_by_pdev_id(ab, pmlo_stats_skb->pdev_id);
++       if (!ar) {
++               ath12k_warn(ab, "Failed to get ar for wmi ctrl stats\n");
++               vfree(pmlo_stats);
++               list_del(&stats->list);
++               kfree(stats);
++               return -EINVAL;
++       }
++
++       spin_lock_bh(&ar->debug.wmi_ctrl_path_stats_lock);
++       value = le32_to_cpu(pmlo_stats->estimated_air_time_per_ac);
++       ar->stats.telemetry_stats.estimated_air_time_ac_be =
++               u32_get_bits(value, GENMASK(7, 0));
++       ar->stats.telemetry_stats.estimated_air_time_ac_bk =
++               u32_get_bits(value, GENMASK(15, 8));
++       ar->stats.telemetry_stats.estimated_air_time_ac_vi =
++               u32_get_bits(value, GENMASK(23, 16));
++       ar->stats.telemetry_stats.estimated_air_time_ac_vo =
++               u32_get_bits(value, GENMASK(31, 24));
++
++       //ath12k_wmi_crl_path_stats_list_free(ar, &ar->debug.period_wmi_list);
++       spin_unlock_bh(&ar->debug.wmi_ctrl_path_stats_lock);
++       ar->debug.wmi_ctrl_path_stats_tagid = WMI_CTRL_PATH_PMLO_STATS;
++       stats_buff->ar = ar;
++       vfree(pmlo_stats);
++       return 0;
++}
++
+ static int ath12k_wmi_ctrl_stats_subtlv_parser(struct ath12k_base *ab,
+ 					       u16 tag, u16 len,
+ 					       const void *ptr, void *data)
+@@ -11462,6 +11570,9 @@ static int ath12k_wmi_ctrl_stats_subtlv_
+ 	case WMI_CTRL_PATH_AFC_STATS:
+ 		ret = wmi_print_ctrl_path_afc_stats_tlv(ab, len, ptr, data);
+ 		break;
++	case WMI_CTRL_PATH_PMLO_STATS:
++	        ret = wmi_print_ctrl_path_pmlo_stats_tlv(ab, len, ptr, data);
++		break;
+ 		/* Add case for newly wmi ctrl path added stats here */
+ 	default:
+ 		ath12k_warn(ab,
+@@ -11568,6 +11679,9 @@ static void ath12k_wmi_ctrl_path_stats_e
+ 		src = &param.pdev_stats;
+ 		dst = &stats->pdev_stats;
+ 		break;
++	case WMI_CTRL_PATH_PMLO_STATS:
++		ath12k_dp_mon_pdev_update_telemetry_stats(ar->ab, ar->pdev_idx);
++		break;
+ 	default:
+ 		goto free;
+ 	}
+@@ -13411,6 +13525,14 @@ ath12k_wmi_send_wmi_ctrl_stats_cmd(struc
+ 
+ 	pdev_id = cpu_to_le32(ath12k_mac_get_target_pdev_id(ar));
+ 
++	switch (arg->stats_id) {
++	case WMI_REQ_CTRL_PATH_PMLO_STAT:
++		return ath12k_wmi_pdev_enable_telemetry_stats(ab, ar);
++	default:
++	        ath12k_warn(ab, "Unsupported stats id %d", arg->stats_id);
++		break;
++	}
++
+ 	len = sizeof(*cmd) +
+ 		TLV_HDR_SIZE + sizeof(u32) +
+ 		TLV_HDR_SIZE + TLV_HDR_SIZE;
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -172,6 +172,13 @@ struct wmi_vdev_set_tpc_power_cmd {
+ #define WMI_VHT_CAP_TX_FIXED_ANT		0x20000000
+ 
+ #define WMI_VHT_CAP_MAX_MPDU_LEN_11454		0x00000002
++#define ATH12K_WMI_SUBID_PERIODICITY_1_SEC     1000
++
++#define WMI_AC_BE                               0
++#define WMI_AC_BK                               1
++#define WMI_AC_VI                               2
++#define WMI_AC_VO                               3
++#define WMI_AC_MAX                              4
+ 
+ /* These macros should be used when we wish to advertise STBC support for
+  * only 1SS or 2SS or 3SS.
+@@ -2102,6 +2109,9 @@ enum wmi_tlv_tag {
+ 	WMI_TAG_PDEV_SRG_OBSS_BSSID_ENABLE_BITMAP_CMD,
+ 	WMI_TAG_PDEV_NON_SRG_OBSS_COLOR_ENABLE_BITMAP_CMD,
+ 	WMI_TAG_PDEV_NON_SRG_OBSS_BSSID_ENABLE_BITMAP_CMD,
++	/* TODO add all the missing cmds */
++	WMI_CTRL_PATH_STATS_CMD_FIXED_PARAM =
++		WMI_TAG_PDEV_NON_SRG_OBSS_BSSID_ENABLE_BITMAP_CMD + 4,
+ 	WMI_TAG_CTRL_PATH_STATS_CMD_FIXED_PARAM = 0x388,
+ 	WMI_TAG_CTRL_PATH_STATS_EV_FIXED_PARAM,
+ 	WMI_TAG_CTRL_PATH_PDEV_STATS,
+@@ -2163,6 +2173,7 @@ enum wmi_tlv_tag {
+ 	WMI_TAG_MLO_LINK_REMOVAL_TBTT_UPDATE,
+ 	WMI_TAG_MLO_LINK_REMOVAL_EVENT_FIXED_PARAM,
+ 	WMI_TAG_MLO_LINK_REMOVAL_CMD_FIXED_PARAM = 0x464,
++	WMI_CTRL_PATH_PMLO_STATS = 0x479,
+ 	WMI_TAG_MLO_PRIMARY_LINK_PEER_MIGRATION_FIXED_PARAM = 0x4a3,
+ 	WMI_TAG_MLO_NEW_PRIMARY_LINK_PEER_INFO = 0x4a4,
+ 	WMI_TAG_MLO_PRIMARY_LINK_PEER_MIGRATION_COMPL_FIXED_PARAM = 0x4a5,
+@@ -2714,6 +2725,32 @@ struct wmi_init_cmd {
+ 	__le32 num_host_mem_chunks;
+ } __packed;
+ 
++struct wmi_ctrl_path_pmlo_telemetry_stats {
++       __le32 pdev_id;
++       __le32 dl_inbss_airtime_per_ac;
++       __le32 ul_inbss_airtime_per_ac;
++       union {
++               struct {
++                       __le32 estimated_air_time_ac_be: 8,
++                              estimated_air_time_ac_bk: 8,
++                              estimated_air_time_ac_vi: 8,
++                              estimated_air_time_ac_vo: 8;
++               };
++               __le32 estimated_air_time_per_ac;
++       };
++       __le32 avg_chan_lat_per_ac[WMI_AC_MAX];
++       __le32 link_obss_airtime : 8,
++              link_idle_airtime : 8,
++              ul_inbss_airtime_non_ac : 8,
++              dl_inbss_airtime_non_ac : 8;
++       __le32 traffic_condition_used_per_ac[WMI_AC_MAX];
++       __le32 payload_ratio_dl_per_ac;
++       __le32 payload_ratio_ul_per_ac;
++       __le32 error_margin_per_ac[WMI_AC_MAX];
++       __le32 num_of_dl_asymmetric_clients_per_ac[WMI_AC_MAX];
++       __le32 num_of_ul_asymmetric_clients_per_ac[WMI_AC_MAX];
++} __packed;
++
+ /* WMI_RSRC_CFG_FLAGS2_FW_AST_INDICATION_DISABLE - Flag to indicate
+ * whether the WDS peer map/unmap event should be processed or
+ * ignored by FW.
+@@ -7415,6 +7452,7 @@ enum  wmi_ctrl_path_stats_id {
+ 	WMI_REQ_CTRL_PATH_AWGN_STAT		= 7,
+  	WMI_REQ_CTRL_PATH_BTCOEX_STAT		= 8,
+ 	WMI_REQ_CTRL_PATH_AFC_STAT       	= 11,
++	WMI_REQ_CTRL_PATH_PMLO_STAT             = 12,
+ };
+ 
+ enum wmi_ctrl_path_stats_action {
+@@ -7422,8 +7460,29 @@ enum wmi_ctrl_path_stats_action {
+ 	WMI_REQUEST_CTRL_PATH_STAT_RESET        = 2,
+ 	WMI_REQUEST_CTRL_PATH_STAT_START        = 3,
+ 	WMI_REQUEST_CTRL_PATH_STAT_STOP         = 4,
++	WMI_REQUEST_CTRL_PATH_STAT_PERIODIC_PUBLISH = 5,
+ };
+ 
++struct wmi_request_ctrl_path_stats_cmd_fixed_param {
++        u32 tlv_header;
++        /** Bitmask showing which of stats IDs 0-31 have been requested
++         * These stats ids are defined in enum wmi_ctrl_path_stats_id.
++         */
++        u32 stats_id_mask;
++        /** request ID to store the cookies in wifistats */
++        u32 request_id;
++        /** action
++         * get/reset/start/stop based on stats id
++         * defined as a part of wmi_ctrl_path_stats_action
++         */
++        u32 action;
++        /** Request Halphy subid stats
++         * According to the requested stats_id this halphy_subid varies
++         * For stats_id = 1, the possible values could be enum wmi_halphy_ctrl_path_statsid
++         */
++        u32 subid;
++} __packed;
++
+ struct  wmi_ctrl_path_stats_cmd {
+ 	__le32 tlv_header;
+ 	__le32 stats_id;
+@@ -8053,6 +8112,8 @@ bool ath12k_wmi_is_mvr_supported(struct
+ int ath12k_wmi_pdev_multiple_vdev_restart(struct ath12k *ar,
+ 					  struct wmi_pdev_multiple_vdev_restart_req_arg *arg);
+ void ath12k_wmi_peer_chan_width_switch_work(struct wiphy *wiphy, struct wiphy_work *work);
++int ath12k_wmi_pdev_enable_telemetry_stats(struct ath12k_base *ab,
++                                          struct ath12k *ar);
+ int ath12k_wmi_send_vdev_set_tpc_power(struct ath12k *ar,
+ 				       u32 vdev_id,
+ 				       struct ath12k_reg_tpc_power_info *param);

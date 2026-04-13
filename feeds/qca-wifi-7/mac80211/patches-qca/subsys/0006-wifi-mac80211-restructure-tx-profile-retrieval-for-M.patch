@@ -1,0 +1,325 @@
+From 8a13f82ac651588d2a099e64daf6290bb2855ee6 Mon Sep 17 00:00:00 2001
+From: Rameshkumar Sundaram <rameshkumar.sundaram@oss.qualcomm.com>
+Date: Thu, 13 Feb 2025 14:50:35 -0800
+Subject: [PATCH 098/141] wifi: mac80211: restructure tx profile retrieval for
+ MLO MBSSID
+
+For MBSSID, each vif (struct ieee80211_vif) stores another vif
+pointer for the transmitting profile of MBSSID set. This won't
+suffice for MLO as there may be multiple links, each of which can
+be part of different MBSSID sets. Hence the information needs to
+be stored per-link. Additionally, the transmitted profile itself
+may be part of an MLD hence storing vif will not suffice either.
+Fix MLO by storing an instance of struct ieee80211_bss_conf
+for each link.
+
+Modify following operations to reflect the above structure updates:
+- channel switch completion
+- BSS color change completion
+- Removing nontransmitted links in ieee80211_stop_mbssid()
+- drivers retrieving the transmitted link for beacon templates.
+
+Signed-off-by: Rameshkumar Sundaram <rameshkumar.sundaram@oss.qualcomm.com>
+Co-developed-by: Muna Sinada <muna.sinada@oss.qualcomm.com>
+Signed-off-by: Muna Sinada <muna.sinada@oss.qualcomm.com>
+Co-developed-by: Aloka Dixit <aloka.dixit@oss.qualcomm.com>
+Signed-off-by: Aloka Dixit <aloka.dixit@oss.qualcomm.com>
+Signed-off-by: Jeff Johnson <jeff.johnson@oss.qualcomm.com>
+---
+ include/net/mac80211.h                        |  7 +-
+ net/mac80211/cfg.c                            | 65 ++++++++++------
+ net/mac80211/ieee80211_i.h                    |  2 +
+ net/mac80211/iface.c                          | 75 +++++++++++++------
+ 6 files changed, 126 insertions(+), 58 deletions(-)
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -682,6 +682,9 @@ struct ieee80211_parsed_tpe {
+  *	responder functionality.
+  * @ftmr_params: configurable lci/civic parameter when enabling FTM responder.
+  * @nontransmitted: this BSS is a nontransmitted BSS profile
++ * @tx_bss_conf: Pointer to the BSS configuration of transmitting interface
++ *	if MBSSID is enabled. This pointer is RCU-protected due to CSA finish
++ *	and BSS color change flows accessing it.
+  * @transmitter_bssid: the address of transmitter AP
+  * @bssid_index: index inside the multiple BSSID set
+  * @bssid_indicator: 2^bssid_indicator is the maximum number of APs in set
+@@ -804,6 +807,7 @@ struct ieee80211_bss_conf {
+ 	struct ieee80211_ftm_responder_params *ftmr_params;
+ 	/* Multiple BSSID data */
+ 	bool nontransmitted;
++	struct ieee80211_bss_conf __rcu *tx_bss_conf;
+ 	u8 transmitter_bssid[ETH_ALEN];
+ 	u8 bssid_index;
+ 	u8 bssid_indicator;
+@@ -2028,7 +2032,6 @@ enum ieee80211_neg_ttlm_res {
+  * @txq: the multicast data TX queue
+  * @offload_flags: 802.3 -> 802.11 enapsulation offload flags, see
+  *	&enum ieee80211_offload_flags.
+- * @mbssid_tx_vif: Pointer to the transmitting interface if MBSSID is enabled.
+  */
+ struct ieee80211_vif {
+ 	enum nl80211_iftype type;
+@@ -2057,8 +2060,6 @@ struct ieee80211_vif {
+ 	bool probe_req_reg;
+ 	bool rx_mcast_action_reg;
+ 
+-	struct ieee80211_vif *mbssid_tx_vif;
+-
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+ };
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -146,8 +146,8 @@ static int ieee80211_set_ap_mbssid_optio
+ 					   struct ieee80211_bss_conf *link_conf)
+ {
+ 	struct ieee80211_sub_if_data *tx_sdata;
++	struct ieee80211_bss_conf *old;
+ 
+-	sdata->vif.mbssid_tx_vif = NULL;
+ 	link_conf->bssid_index = 0;
+ 	link_conf->nontransmitted = false;
+ 	link_conf->ema_ap = false;
+@@ -156,14 +156,27 @@ static int ieee80211_set_ap_mbssid_optio
+ 	if (sdata->vif.type != NL80211_IFTYPE_AP || !params->tx_wdev)
+ 		return -EINVAL;
+ 
++	old = sdata_dereference(link_conf->tx_bss_conf, sdata);
++	if (old)
++		return -EALREADY;
++
+ 	tx_sdata = IEEE80211_WDEV_TO_SUB_IF(params->tx_wdev);
+ 	if (!tx_sdata)
+ 		return -EINVAL;
+ 
+ 	if (tx_sdata == sdata) {
+-		sdata->vif.mbssid_tx_vif = &sdata->vif;
++		rcu_assign_pointer(link_conf->tx_bss_conf, link_conf);
+ 	} else {
+-		sdata->vif.mbssid_tx_vif = &tx_sdata->vif;
++		struct ieee80211_bss_conf *tx_bss_conf;
++
++		tx_bss_conf =
++			sdata_dereference(tx_sdata->vif.link_conf[params->tx_link_id],
++					  sdata);
++		if (rcu_access_pointer(tx_bss_conf->tx_bss_conf) != tx_bss_conf)
++			return -EINVAL;
++
++		rcu_assign_pointer(link_conf->tx_bss_conf, tx_bss_conf);
++
+ 		link_conf->nontransmitted = true;
+ 		link_conf->bssid_index = params->index;
+ 	}
+@@ -1671,7 +1684,6 @@ static int ieee80211_stop_ap(struct wiph
+ 	kfree(link_conf->ftmr_params);
+ 	link_conf->ftmr_params = NULL;
+ 
+-	sdata->vif.mbssid_tx_vif = NULL;
+ 	link_conf->bssid_index = 0;
+ 	link_conf->nontransmitted = false;
+ 	link_conf->ema_ap = false;
+@@ -1685,6 +1697,9 @@ static int ieee80211_stop_ap(struct wiph
+ 		ieee80211_free_key_list(local, &keys);
+ 	}
+ 
++	ieee80211_stop_mbssid(sdata);
++	RCU_INIT_POINTER(link_conf->tx_bss_conf, NULL);
++
+ 	link_conf->enable_beacon = false;
+ 	sdata->beacon_rate_set = false;
+ 	sdata->vif.cfg.ssid_len = 0;
+@@ -3705,6 +3720,7 @@ void ieee80211_csa_finish(struct ieee802
+ {
+ 	struct ieee80211_sub_if_data *sdata = vif_to_sdata(vif);
+ 	struct ieee80211_local *local = sdata->local;
++	struct ieee80211_bss_conf *tx_bss_conf;
+ 	struct ieee80211_link_data *link_data;
+ 
+ 	if (WARN_ON(link_id >= IEEE80211_MLD_MAX_NUM_LINKS))
+@@ -3718,25 +3734,24 @@ void ieee80211_csa_finish(struct ieee802
+ 		return;
+ 	}
+ 
+-	/* TODO: MBSSID with MLO changes */
+-	if (vif->mbssid_tx_vif == vif) {
++	tx_bss_conf = rcu_dereference(link_data->conf->tx_bss_conf);
++	if (tx_bss_conf == link_data->conf) {
+ 		/* Trigger ieee80211_csa_finish() on the non-transmitting
+ 		 * interfaces when channel switch is received on
+ 		 * transmitting interface
+ 		 */
+-		struct ieee80211_sub_if_data *iter;
+-
+-		list_for_each_entry_rcu(iter, &local->interfaces, list) {
+-			if (!ieee80211_sdata_running(iter))
+-				continue;
++		struct ieee80211_link_data *iter;
+ 
+-			if (iter == sdata || iter->vif.mbssid_tx_vif != vif)
++		for_each_sdata_link(local, iter) {
++			if (iter->sdata == sdata ||
++			    rcu_access_pointer(iter->conf->tx_bss_conf) != tx_bss_conf)
+ 				continue;
+ 
+-			wiphy_work_queue(iter->local->hw.wiphy,
+-					 &iter->deflink.csa.finalize_work);
++			wiphy_work_queue(iter->sdata->local->hw.wiphy,
++					 &iter->csa.finalize_work);
+ 		}
+ 	}
++
+ 	wiphy_work_queue(local->hw.wiphy, &link_data->csa.finalize_work);
+ 
+ 	rcu_read_unlock();
+@@ -4839,17 +4854,19 @@ ieee80211_color_change_bss_config_notify
+ 
+ 	ieee80211_link_info_change_notify(sdata, link, changed);
+ 
+-	if (!sdata->vif.bss_conf.nontransmitted && sdata->vif.mbssid_tx_vif) {
+-		struct ieee80211_sub_if_data *child;
++	if (!link->conf->nontransmitted &&
++	    rcu_access_pointer(link->conf->tx_bss_conf)) {
++		struct ieee80211_link_data *tmp;
++
++		for_each_sdata_link(sdata->local, tmp) {
++			if (tmp->sdata == sdata ||
++			    rcu_access_pointer(tmp->conf->tx_bss_conf) != link->conf)
++				continue;
+ 
+-		list_for_each_entry(child, &sdata->local->interfaces, list) {
+-			if (child != sdata && child->vif.mbssid_tx_vif == &sdata->vif) {
+-				child->vif.bss_conf.he_bss_color.color = color;
+-				child->vif.bss_conf.he_bss_color.enabled = enable;
+-				ieee80211_link_info_change_notify(child,
+-								  &child->deflink,
+-								  BSS_CHANGED_HE_BSS_COLOR);
+-			}
++			tmp->conf->he_bss_color.color = color;
++			tmp->conf->he_bss_color.enabled = enable;
++			ieee80211_link_info_change_notify(tmp->sdata, tmp,
++							  BSS_CHANGED_HE_BSS_COLOR);
+ 		}
+ 	}
+ }
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -2798,6 +2798,8 @@ int ieee80211_mgd_assoc_ml_reconf(struct
+ 
+ void ieee80211_process_ml_reconf_resp(struct ieee80211_sub_if_data *sdata,
+ 				      struct ieee80211_mgmt *mgmt, size_t len);
++void ieee80211_stop_mbssid(struct ieee80211_sub_if_data *sdata);
++
+ #if IS_ENABLED(CPTCFG_MAC80211_KUNIT_TEST)
+ #define EXPORT_SYMBOL_IF_MAC80211_KUNIT(sym) EXPORT_SYMBOL_IF_KUNIT(sym)
+ #define VISIBLE_IF_MAC80211_KUNIT
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -724,30 +724,59 @@ static void ieee80211_do_stop(struct iee
+ 		ieee80211_add_virtual_monitor(local);
+ }
+ 
+-static void ieee80211_stop_mbssid(struct ieee80211_sub_if_data *sdata)
++void ieee80211_stop_mbssid(struct ieee80211_sub_if_data *sdata)
+ {
+-	struct ieee80211_sub_if_data *tx_sdata, *non_tx_sdata, *tmp_sdata;
+-	struct ieee80211_vif *tx_vif = sdata->vif.mbssid_tx_vif;
++	struct ieee80211_sub_if_data *tx_sdata;
++	struct ieee80211_bss_conf *link_conf, *tx_bss_conf;
++	struct ieee80211_link_data *tx_link, *link;
++	unsigned int link_id;
++
++	lockdep_assert_wiphy(sdata->local->hw.wiphy);
++
++	/* Check if any of the links of current sdata is an MBSSID. */
++	for_each_vif_active_link(&sdata->vif, link_conf, link_id) {
++		tx_bss_conf = sdata_dereference(link_conf->tx_bss_conf, sdata);
++		if (!tx_bss_conf)
++			continue;
++
++		tx_sdata = vif_to_sdata(tx_bss_conf->vif);
++		RCU_INIT_POINTER(link_conf->tx_bss_conf, NULL);
++
++		/* If we are not tx sdata reset tx sdata's tx_bss_conf to avoid recusrion
++		 * while closing tx sdata at the end of outer loop below.
++		 */
++		if (sdata != tx_sdata) {
++			tx_link = sdata_dereference(tx_sdata->link[tx_bss_conf->link_id],
++						    tx_sdata);
++			if (!tx_link)
++				continue;
+ 
+-	if (!tx_vif)
+-		return;
+-
+-	tx_sdata = vif_to_sdata(tx_vif);
+-	sdata->vif.mbssid_tx_vif = NULL;
++			RCU_INIT_POINTER(tx_link->conf->tx_bss_conf, NULL);
++		}
+ 
+-	list_for_each_entry_safe(non_tx_sdata, tmp_sdata,
+-				 &tx_sdata->local->interfaces, list) {
+-		if (non_tx_sdata != sdata && non_tx_sdata != tx_sdata &&
+-		    non_tx_sdata->vif.mbssid_tx_vif == tx_vif &&
+-		    ieee80211_sdata_running(non_tx_sdata)) {
+-			non_tx_sdata->vif.mbssid_tx_vif = NULL;
+-			dev_close(non_tx_sdata->wdev.netdev);
++		/* loop through sdatas to find if any of their links
++		 * belong to same MBSSID set as the one getting deleted.
++		 */
++		for_each_sdata_link(tx_sdata->local, link) {
++			struct ieee80211_sub_if_data *link_sdata = link->sdata;
++
++			if (link_sdata == sdata || link_sdata == tx_sdata ||
++			    rcu_access_pointer(link->conf->tx_bss_conf) != tx_bss_conf)
++				continue;
++
++			RCU_INIT_POINTER(link->conf->tx_bss_conf, NULL);
++
++			/* Remove all links of matching MLD until dynamic link
++			 * removal can be supported.
++			 */
++			cfg80211_stop_iface(link_sdata->wdev.wiphy, &link_sdata->wdev,
++					    GFP_KERNEL);
+ 		}
+-	}
+ 
+-	if (sdata != tx_sdata && ieee80211_sdata_running(tx_sdata)) {
+-		tx_sdata->vif.mbssid_tx_vif = NULL;
+-		dev_close(tx_sdata->wdev.netdev);
++		/* If we are not tx sdata, remove links of tx sdata and proceed */
++		if (sdata != tx_sdata && ieee80211_sdata_running(tx_sdata))
++			cfg80211_stop_iface(tx_sdata->wdev.wiphy,
++					    &tx_sdata->wdev, GFP_KERNEL);
+ 	}
+ }
+ 
+@@ -755,21 +784,25 @@ static int ieee80211_stop(struct net_dev
+ {
+ 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+ 
+-	/* close dependent VLAN and MBSSID interfaces before locking wiphy */
++	/* close dependent VLAN interfaces before locking wiphy */
+ 	if (sdata->vif.type == NL80211_IFTYPE_AP) {
+ 		struct ieee80211_sub_if_data *vlan, *tmpsdata;
+ 
+ 		list_for_each_entry_safe(vlan, tmpsdata, &sdata->u.ap.vlans,
+ 					 u.vlan.list)
+ 			dev_close(vlan->dev);
+-
+-		ieee80211_stop_mbssid(sdata);
+ 	}
+ 
+ 	guard(wiphy)(sdata->local->hw.wiphy);
+ 
+ 	wiphy_work_cancel(sdata->local->hw.wiphy, &sdata->activate_links_work);
+ 
++	/* Close the dependent MBSSID interfaces with wiphy lock as we may be
++	 * terminating its partner links too in case of MLD.
++	 */
++	if (sdata->vif.type == NL80211_IFTYPE_AP)
++		ieee80211_stop_mbssid(sdata);
++
+ 	ieee80211_do_stop(sdata, true);
+ 
+ 	return 0;

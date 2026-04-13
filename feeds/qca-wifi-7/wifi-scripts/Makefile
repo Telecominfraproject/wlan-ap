@@ -1,24 +1,19 @@
-#
 # Copyright (C) 2024 OpenWrt.org
-#
-# This is free software, licensed under the GNU General Public License v2.
-# See /LICENSE for more information.
-#
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: GPL-2.0-only
 
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=wifi-scripts
 PKG_VERSION:=1.0
 PKG_RELEASE:=1
-PKG_LICENSE:=GPL-2.0
-
-PKG_MAINTAINER:=Felix Fietkau <nbd@nbd.name>
 
 include $(INCLUDE_DIR)/package.mk
 
 define Package/wifi-scripts
   SECTION:=utils
   CATEGORY:=Base system
+  DEPENDS:=+ucode +ucode-mod-nl80211 +ucode-mod-rtnl +ucode-mod-ubus +ucode-mod-uci
   TITLE:=Wi-Fi configuration scripts
   PKGARCH:=all
 endef
@@ -36,16 +31,12 @@ endef
 define Build/Compile
 endef
 
-WIFI_SCRIPTS_UPSTREAM_DIR:=$(TOPDIR)/package/network/config/wifi-scripts/files
-
 define Package/wifi-scripts/install
 	$(INSTALL_DIR) $(1)
+ifeq ($(CONFIG_USE_PRPLMESH_WHM),y)
+	sed -i 's/OpenWrt/prplOS/g' ./files/lib/wifi/mac80211.uc
+endif
 	$(CP) ./files/* $(1)/
-	$(INSTALL_DIR) $(1)/lib/netifd
-	$(CP) $(WIFI_SCRIPTS_UPSTREAM_DIR)/lib/netifd/wireless.uc $(1)/lib/netifd/
-	$(CP) $(WIFI_SCRIPTS_UPSTREAM_DIR)/lib/netifd/wireless-device.uc $(1)/lib/netifd/
-	$(INSTALL_DIR) $(1)/usr/share/ucode/wifi
-	$(CP) $(WIFI_SCRIPTS_UPSTREAM_DIR)/usr/share/ucode/wifi/utils.uc $(1)/usr/share/ucode/wifi/
 endef
 
 $(eval $(call BuildPackage,wifi-scripts))

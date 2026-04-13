@@ -1,6 +1,7 @@
 #!/bin/sh
 : '
  Copyright (c) 2020, The Linux Foundation. All rights reserved.
+ Copyright (c) 2024, Qualcomm Innovation Center, Inc. All rights reserved.
 
  Permission to use, copy, modify, and/or distribute this software for any
  purpose with or without fee is hereby granted, provided that the above
@@ -14,97 +15,54 @@
  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 '
+SERVER=$(fw_printenv serverip | cut -c10-24)
+TIMESTAMP=$(date +%y%m%d%H%M%S)$(printf "%04d" $((RANDOM % 10000)))
 
-SERVER=$(fw_printenv serverip | cut -c10-24);
-TIMESTAMP=$(date +%Y%m%d%H%M%S)
-
-if [ ! -n "$SERVER" ]; then
-	printf "%s\n" "Wrong configuaration SERVER = $SERVER" > /dev/console
-	exit 0
+if [ -z "$SERVER" ]; then
+    echo "Wrong configuration: SERVER is empty" > /dev/console
+    exit 1
 fi
 
-if [ -e /sys/bus/pci/devices/0002:00:00.0/0002:01:00.0/devcoredump/data ] && [ "$ACTION" = add ]; then
-	FILENAME="qcn9224-pci0-q6dump-$TIMESTAMP.bin"
-	DUMPPATH="/sys/bus/pci/devices/0002:00:00.0/0002:01:00.0/devcoredump/data"
-fi
+COREDUMP_PATH="/sys/class/devcoredump"
+LATEST_FILE=$(basename "$DEVPATH")
 
-if [ -e /sys/devices/platform/soc/c000000.wifi1/devcoredump/data ] && [ "$ACTION" = add ]; then
-	FILENAME="IPQ8074-m3dump-$TIMESTAMP.bin"
-	DUMPPATH="/sys/devices/platform/soc/c000000.wifi1/devcoredump/data"
-fi
+if [ -n "$LATEST_FILE" ] && [ -e "$COREDUMP_PATH/$LATEST_FILE/data" ]; then
+    TARGET_PATH="$COREDUMP_PATH/$LATEST_FILE/failing_device"
 
-if [ -e /sys/devices/platform/soc/c000000.wifi/devcoredump/data ] && [ "$ACTION" = add ]; then
-	FILENAME="IPQ6018-m3dump-$TIMESTAMP.bin"
-	DUMPPATH="/sys/devices/platform/soc/c000000.wifi/devcoredump/data"
-fi
+    if [ -e "$TARGET_PATH/subsystem_device" ]; then
+	# Extract the hexadecimal value (without '0x') from the file 'subsystem_device'
+        target=$(sed -n 's/.*0x\([0-9a-fA-F]*\).*/\1/p' "$TARGET_PATH/subsystem_device")
+        TARGET_PATH_N=$(readlink -n "$TARGET_PATH")
+        pci_path=$(basename "$TARGET_PATH_N")
+        pci_slot=$(echo "$pci_path" | awk '{print substr($0, 4, 1)}')
 
-if [ -e /sys/bus/pci/devices/0000:01:00.0/devcoredump/data ] && [ "$ACTION" = add ]; then
-	FILENAME="qcn9000-pci0-q6dump-$TIMESTAMP.bin"
-	DUMPPATH="/sys/bus/pci/devices/0000:01:00.0/devcoredump/data"
-fi
+        FILENAME="q6dump-${target}-pci${pci_slot}-${TIMESTAMP}.bin"
+    else
+        BOARD_NAME_PATH="/tmp/sysinfo/board_name"
+        PD_PATH="$TARGET_PATH"
 
-if [ -e /sys/bus/pci/devices/0001:01:00.0/devcoredump/data ] && [ "$ACTION" = add ]; then
-	FILENAME="qcn9000-pci1-q6dump-$TIMESTAMP.bin"
-	DUMPPATH="/sys/bus/pci/devices/0001:01:00.0/devcoredump/data"
-fi
+        if [ -e "$PD_PATH/name" ]; then
+            target=$(awk -F'[,-]' '{print $2}' "$BOARD_NAME_PATH")
+            FILENAME="q6dump-${target}-rootpd-${TIMESTAMP}.bin"
+        else
+            target=$(awk -F'[,-]' '{print $2}' "$BOARD_NAME_PATH")
+            pd_name=$(awk -F'_' '{print $NF}' "$PD_PATH/of_node/qcom,userpd-subsys-name")
+            FILENAME="q6dump-${target}-${pd_name}-${TIMESTAMP}.bin"
+        fi
+    fi
 
-if [ -e /sys/bus/pci/devices/0003:01:00.0/devcoredump/data ] && [ "$ACTION" = add ]; then
-	FILENAME="qcn9000-pci0-q6dump-$TIMESTAMP.bin"
-	DUMPPATH="/sys/bus/pci/devices/0003:01:00.0/devcoredump/data"
-fi
-
-if [ -e /sys/bus/pci/devices/0004:01:00.0/devcoredump/data ] && [ "$ACTION" = add ]; then
-	FILENAME="qcn9000-pci1-q6dump-$TIMESTAMP.bin"
-	DUMPPATH="/sys/bus/pci/devices/0004:01:00.0/devcoredump/data"
-fi
-
-if [ -e /sys/devices/platform/soc/soc:wifi1@c000000/devcoredump/data ] && [ "$ACTION" = add ]; then
-	FILENAME="qcn9100_1-q6dump-$TIMESTAMP.bin"
-	DUMPPATH="/sys/devices/platform/soc/soc:wifi1@c000000/devcoredump/data"
-fi
-
-if [ -e /sys/devices/platform/soc/soc:wifi2@c000000/devcoredump/data ] && [ "$ACTION" = add ]; then
-	FILENAME="qcn9100_2-q6dump-$TIMESTAMP.bin"
-	DUMPPATH="/sys/devices/platform/soc/soc:wifi2@c000000/devcoredump/data"
-fi
-
-if [ -e /sys/devices/platform/soc@0/cd00000.remoteproc/remoteproc/remoteproc0/devcoredump/data ] && [ "$ACTION" = add ]; then
-	FILENAME="IPQ9574-q6dump-$TIMESTAMP.bin"
-	DUMPPATH="/sys/devices/platform/soc@0/cd00000.remoteproc/remoteproc/remoteproc0/devcoredump/data"
-fi
-
-if [ -e /sys/devices/platform/soc@0/d100000.remoteproc/remoteproc/remoteproc0/devcoredump/data ] && [ "$ACTION" = add ]; then
-	FILENAME="IPQ5332-q6dump-$TIMESTAMP.bin"
-	DUMPPATH="/sys/devices/platform/soc@0/d100000.remoteproc/remoteproc/remoteproc0/devcoredump/data"
-fi
-
-# Collect IPQ5332 Internal Radio's Coredump
-if [ -e /sys/devices/platform/soc@0/d100000.remoteproc/d100000.remoteproc:remoteproc_pd4/d100000.remoteproc:remoteproc_pd4:remoteproc_pd1/remoteproc/remoteproc2/devcoredump/data ] && [ "$ACTION" = add ]; then
-        FILENAME="ipq5332-q6dump-$TIMESTAMP.bin"
-        DUMPPATH="/sys/devices/platform/soc@0/d100000.remoteproc/d100000.remoteproc:remoteproc_pd4/d100000.remoteproc:remoteproc_pd4:remoteproc_pd1/remoteproc/remoteproc2/devcoredump/data"
-fi
-
-# Collect QCN6432 External Radio's Coredump
-if [ -e /sys/devices/platform/soc@0/d100000.remoteproc/d100000.remoteproc:remoteproc_pd4/d100000.remoteproc:remoteproc_pd4:remoteproc_pd1/remoteproc/remoteproc3/devcoredump/data ] && [ "$ACTION" = add ]; then
-        FILENAME="qcn6432-q6dump-$TIMESTAMP.bin"
-        DUMPPATH="/sys/devices/platform/soc@0/d100000.remoteproc/d100000.remoteproc:remoteproc_pd4/d100000.remoteproc:remoteproc_pd4:remoteproc_pd1/remoteproc/remoteproc3/devcoredump/data"
-fi
-
-# Collect QCN6432 External Radio's Coredump
-if [ -e /sys/devices/platform/soc@0/d100000.remoteproc/d100000.remoteproc:remoteproc_pd4/d100000.remoteproc:remoteproc_pd4:remoteproc_pd1/remoteproc/remoteproc4/devcoredump/data ] && [ "$ACTION" = add ]; then
-        FILENAME="qcn6432-q6dump-$TIMESTAMP.bin"
-        DUMPPATH="/sys/devices/platform/soc@0/d100000.remoteproc/d100000.remoteproc:remoteproc_pd4/d100000.remoteproc:remoteproc_pd4:remoteproc_pd1/remoteproc/remoteproc4/devcoredump/data"
+    DUMPPATH="$COREDUMP_PATH/$LATEST_FILE/data"
 fi
 
 if [ -n "$FILENAME" ]; then
-	printf "%s\n" "Collecting dump_data in $SERVER" > /dev/console
-	$(tftp -l $DUMPPATH -r $FILENAME -p $SERVER 2>&1)
-	if [ $? -eq 0 ]; then
-		printf "%s\n" "$FILENAME collected in $SERVER" \
-								> /dev/console
-	else
-		printf "%s\n" "$FILENAME collection failed in $SERVER" \
-								> /dev/console
-	fi
-	echo 1 > $DUMPPATH
+    echo "Collecting $FILENAME to $SERVER" > /dev/console
+    (
+        if tftp -l "$DUMPPATH" -r "$FILENAME" -p "$SERVER" 2>&1; then
+            echo "$FILENAME collected to $SERVER" > /dev/console
+        else
+            echo "$FILENAME collection failed to $SERVER" > /dev/console
+        fi
+        echo 1 > $DUMPPATH
+    ) &
 fi
+

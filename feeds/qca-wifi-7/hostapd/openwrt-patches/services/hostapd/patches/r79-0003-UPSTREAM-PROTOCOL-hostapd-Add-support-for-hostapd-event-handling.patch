@@ -1,0 +1,254 @@
+From 559ecf996850879b46fd9af36d3045e046a0eda4 Mon Sep 17 00:00:00 2001
+From: Sri Vidya Gunturi <sgunturi@qti.qualcomm.com>
+Date: Tue, 8 Apr 2025 10:17:25 +0530
+Subject: [PATCH 03/20] UPSTREAM:PROTOCOL: hostapd: Add support for hostapd event
+ handling
+
+An EPCS non-AP MLD connected to the AP MLD can have any of the three
+states - EPCS_STATE_DISABLED, EPCS_STATE_ENABLE_REQ_SENT, EPCS_STATE_ENABLED.
+
+The following are the valid state transitions for EPCS:
+EPCS_STATE_DISABLED ---> EPCS_STATE_ENABLE_REQ_SENT ---> EPCS_STATE_ENABLED.
+EPCS_STATE_ENABLE_REQ_SENT ---> EPCS_STATE_DISABLED.
+EPCS_STATE_ENABLED ---> EPCS_STATE_DISABLED.
+
+The EPCS state of a non-AP MLD is moved to the mentioned states for
+the below scenarios:
+
+EPCS_STATE_DISABLED state -
+	1. The initial state is the EPCS_STATE_DISABLED.
+	2. When EPCS Teardown frame is sent from AP MLD to the non-AP MLD,
+	the state is moved to EPCS_STATE_DISABLED.
+	3. When EPCS Teardown frame is received from the non-AP MLD to
+	the AP MLD, the state is moved to EPCS_STATE_DISABLED.
+
+EPCS_STATE_ENABLE_REQ_SENT state -
+	1. When AP MLD sends a EPCS request frame to a non-AP MLD,
+	the EPCS state is moved to EPCS_STATE_ENABLE_REQ_SENT.
+	2. The state can be moved to EPCS_STATE_ENABLE_REQ_SENT only if
+	the previous state of the non-AP MLD was EPCS_STATE_DISABLED.
+	3. Start a timer for 150 secs when the state is moved
+	to EPCS_STATE_ENABLE_REQ_SENT. If EPCS Response frame is not received
+	by AP MLD in 150 secs, then the timer handler is triggered.
+	4. The timer handler resets the EPCS state from EPCS_STATE_ENABLE_REQ_SENT
+	to EPCS_STATE_DISABLED.
+
+EPCS_STATE_ENABLED state -
+	1. When AP MLD receives a response frame from non-AP MLD,
+	the state is moved to EPCS_STATE_ENABLED
+	2. When AP MLD sends a EPCS response frame to non-AP MLD,
+	the state is moved to EPCS_STATE_ENABLED.
+	3. The state is moved to EPCS_STATE_ENABLED, only if the previous
+	state of the non-AP MLD was EPCS_STATE_ENABLE_REQ_SENT.
+
+Signed-off-by: Sri Vidya Gunturi <sgunturi@qti.qualcomm.com>
+---
+ src/ap/hostapd.h        | 37 ++++++++++++++++
+ src/ap/ieee802_11.h     |  3 ++
+ src/ap/ieee802_11_eht.c | 95 +++++++++++++++++++++++++++++++++++++++++
+ src/ap/sta_info.c       |  1 +
+ src/ap/sta_info.h       |  1 +
+ 5 files changed, 137 insertions(+)
+
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 968cb9d..907940a 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -865,6 +865,36 @@ struct hostapd_iface {
+ 	u32 mbssid_idx_bmap;
+ };
+ 
++
++/*
++ * enum peer_epcs_state - EPCS states of peer
++ */
++enum peer_epcs_state {
++	EPCS_STATE_DISABLED = 0, /* The default state */
++	EPCS_STATE_ENABLE_REQ_SENT, /* EPCS request sent to the peer, waiting for EPCS response */
++	EPCS_STATE_ENABLED, /* EPCS session established */
++};
++
++/*
++ * struct wlan_epcs_info - EPCS information of frame
++ */
++struct wlan_epcs_info {
++	u8 action_code;
++	u8 dialog_token;
++	u16 status_code;
++};
++
++/*
++ * struct mld_peer_epcs_info - per mld-peer epcs info
++ */
++struct mld_peer_epcs_info {
++	bool is_epcs_capable;
++	enum peer_epcs_state state;
++	u8 self_gen_dialog_token;
++	bool timer_started;
++};
++
++
+ /* hostapd.c */
+ int hostapd_for_each_interface(struct hapd_interfaces *interfaces,
+ 			       int (*cb)(struct hostapd_iface *iface,
+@@ -1226,4 +1256,11 @@ afc_channel_change_timeout(void *eloop_ctx, void *timeout_ctx)
+ 	/* No-op if hostapd is not defined */
+ }
+ #endif
++#ifdef CONFIG_IEEE80211BE
++int hostapd_epcs_handle_and_send_action_frame(struct hostapd_data *hapd,
++					      struct wlan_epcs_info *epcs_info,
++					      struct sta_info *sta,
++					      bool is_rx_frame);
++
++#endif /* CONFIG_IEEE80211BE */
+ #endif /* HOSTAPD_H */
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index 8b7ce3f..32a7a11 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -305,4 +305,7 @@ int hostapd_process_assoc_ml_info(struct hostapd_data *hapd,
+ 				  bool offload,
+ 				  bool *set_beacon);
+ 
++#ifdef CONFIG_IEEE80211BE
++void hostapd_epcs_timeout_handler(void *eloop_ctx, void *timeout_ctx);
++#endif /* CONFIG_IEEE80211BE */
+ #endif /* IEEE802_11_H */
+diff --git a/src/ap/ieee802_11_eht.c b/src/ap/ieee802_11_eht.c
+index 5632992..c5b8213 100644
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -14,6 +14,11 @@
+ #include "hostapd.h"
+ #include "sta_info.h"
+ #include "ieee802_11.h"
++#include "common/defs.h"
++#include "common/ieee802_11_defs.h"
++#include "ap_config.h"
++#include "ap_drv_ops.h"
++#include "utils/eloop.h"
+ 
+ 
+ static u16 ieee80211_eht_ppet_size(u16 ppe_thres_hdr, const u8 *phy_cap_info)
+@@ -1681,3 +1686,93 @@ int hostapd_wnm_add_multi_link_sub_elem(struct hostapd_data *hapd,
+ 	return *len_pos + 2;
+ }
+ #endif /* CONFIG_IEEE80211BE */
++
++
++void hostapd_epcs_timeout_handler(void *eloop_ctx, void *timeout_ctx)
++{
++	struct wlan_epcs_info epcs_info = {0};
++	struct sta_info *sta = timeout_ctx;
++	struct hostapd_data *hapd = eloop_ctx;
++	struct mld_info *mld_info = &sta->mld_info;
++
++	if (!mld_info->mld_sta)
++		return;
++
++	epcs_info.action_code = WLAN_PROT_EHT_EPCS_ENABLE_TEARDOWN;
++	hostapd_epcs_handle_and_send_action_frame(hapd, &epcs_info, sta, false);
++	mld_info->epcs.timer_started = false;
++}
++
++int hostapd_epcs_handle_and_send_action_frame(struct hostapd_data *hapd,
++					      struct wlan_epcs_info *epcs_info,
++					      struct sta_info *sta,
++					      bool is_rx_frame)
++{
++	struct mld_peer_epcs_info *sta_epcs;
++	enum peer_epcs_state prev_epcs_state;
++
++	if (!sta || !sta->mld_info.mld_sta)
++		return -1;
++
++	sta_epcs = &sta->mld_info.epcs;
++	prev_epcs_state = sta_epcs->state;
++
++	switch (prev_epcs_state) {
++	case EPCS_STATE_DISABLED:
++		if (epcs_info->action_code != WLAN_PROT_EHT_EPCS_ENABLE_REQUEST)
++			goto failed;
++
++		if (is_rx_frame) {
++			epcs_info->action_code = WLAN_PROT_EHT_EPCS_ENABLE_RESPONSE;
++			sta_epcs->state = EPCS_STATE_ENABLED;
++		} else {
++			sta_epcs->state = EPCS_STATE_ENABLE_REQ_SENT;
++			if (sta_epcs->timer_started) {
++				wpa_printf(MSG_DEBUG, "Timer is already started for EPCS Request sent. Restarting the timer");
++				eloop_cancel_timeout(hostapd_epcs_timeout_handler, hapd, sta);
++				sta_epcs->timer_started = false;
++			}
++
++			if (!eloop_register_timeout(150, 0, hostapd_epcs_timeout_handler, hapd, sta))
++				sta_epcs->timer_started = true;
++
++			epcs_info->dialog_token = ++sta_epcs->self_gen_dialog_token;
++		}
++		break;
++
++	case EPCS_STATE_ENABLE_REQ_SENT:
++		if (epcs_info->action_code == WLAN_PROT_EHT_EPCS_ENABLE_TEARDOWN) {
++			sta_epcs->state = EPCS_STATE_DISABLED;
++
++		} else if (epcs_info->action_code == WLAN_PROT_EHT_EPCS_ENABLE_RESPONSE && is_rx_frame) {
++			if (epcs_info->dialog_token == sta_epcs->self_gen_dialog_token) {
++				sta_epcs->state = EPCS_STATE_ENABLED;
++			} else {
++				sta_epcs->state = EPCS_STATE_DISABLED;
++				wpa_printf(MSG_ERROR, "dialog token mis-match, "
++					   "received token: %d, peer token: %d",
++					   epcs_info->dialog_token, sta_epcs->self_gen_dialog_token);
++			}
++
++			eloop_cancel_timeout(hostapd_epcs_timeout_handler, hapd, sta);
++			sta_epcs->timer_started = false;
++		}
++		break;
++
++	case EPCS_STATE_ENABLED:
++		if (epcs_info->action_code != WLAN_PROT_EHT_EPCS_ENABLE_TEARDOWN)
++			goto failed;
++
++		sta_epcs->state = EPCS_STATE_DISABLED;
++		break;
++	}
++
++failed:
++	if (prev_epcs_state == sta_epcs->state) {
++		wpa_printf(MSG_ERROR, "Invalid EPCS State: %d, for the received action code: %d",
++			   prev_epcs_state, epcs_info->action_code);
++		return -1;
++	}
++
++	return 0;
++}
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index 05cafea..385b98c 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -545,6 +545,7 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ 	os_free(sta->ifname_wds);
+ 
+ #ifdef CONFIG_IEEE80211BE
++	eloop_cancel_timeout(hostapd_epcs_timeout_handler, hapd, sta);
+ 	ap_sta_free_sta_profile(&sta->mld_info);
+ #endif /* CONFIG_IEEE80211BE */
+ 
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index a2ddfec..d9d6454 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -88,6 +88,7 @@ struct mld_info {
+ 	} common_info;
+ 
+ 	struct mld_link_info links[MAX_NUM_MLD_LINKS];
++	struct mld_peer_epcs_info epcs;
+ };
+ 
+ struct sta_info {
+-- 
+2.34.1
+

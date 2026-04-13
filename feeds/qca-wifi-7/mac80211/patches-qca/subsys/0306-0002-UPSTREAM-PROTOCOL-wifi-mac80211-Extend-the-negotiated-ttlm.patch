@@ -1,0 +1,128 @@
+From 79bc08311c964b60142dee31b76b674e64941dca Mon Sep 17 00:00:00 2001
+From: Shwetha G K <kshwetha@qti.qualcomm.com>
+Date: Fri, 20 Jun 2025 08:57:10 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: wifi: mac80211: Add TTLM negotiation
+support on AP
+
+Add changes to support TTLM negotiation on AP MLD (the action
+frames are generated externally) using which lower layers are
+notified to map the HW TIDs accordingly.
+
+The STA MLD with which the TTLM negotiation performed can be
+identified through mld_mac_addr.
+
+In case of AP MLD, active/dormant/suspended links update not
+required as the mapping is specific to a peer associated and the
+mapping may vary for other clients. Handle the per peer
+negotiated mapping in lower layers.
+
+Save neg_ttlm in ieee80211_sta for further use during association.
+
+Signed-off-by: Shwetha G K <kshwetha@qti.qualcomm.com>
+Signed-off-by: Dhanavandhana Kannan <dhanavan@qti.qualcomm.com>
+---
+ include/net/mac80211.h |  7 +++++++
+ net/mac80211/mlme.c    | 45 ++++++++++++++++++++++++++++++++----------
+ 2 files changed, 42 insertions(+), 10 deletions(-)
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -2649,6 +2649,7 @@ struct ieee80211_link_sta {
+  * @spp_amsdu: indicates whether the STA uses SPP A-MSDU or not.
+  * @eml_cap: EML capabilities of station
+  * @mld_cap_op: MLD capabilites and operation field of station
++ * @neg_ttlm: TTLM negotiation parameters of the station
+  */
+ struct ieee80211_sta {
+ 	u8 addr[ETH_ALEN] __aligned(2);
+@@ -2680,6 +2681,7 @@ struct ieee80211_sta {
+ 	u16 eml_cap;
+ 	u16 mld_cap_op;
+ 	struct net_device *dev;
++	struct ieee80211_neg_ttlm neg_ttlm;
+ 
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+@@ -4684,6 +4686,9 @@ struct ieee80211_ppe_vp_ds_params {
+  * @deinit_interface: Called at the time of netdev deinit stage. This gives drivers
+  *	a flexibility to deinit driver specific data at interface deinit time.
+  * @erp: Notifies the driver to start ErP enter/exit procedure or to send status.
++ * @apply_neg_ttlm_per_client: Apply the ttlm negotiation on client as per the
++ * negotiation. This can be used to allow drivers to map the TIDs for the given
++ * client as per the negotiation.
+  */
+ struct ieee80211_ops {
+ 	void (*tx)(struct ieee80211_hw *hw,
+@@ -5096,6 +5101,9 @@ struct ieee80211_ops {
+ 				struct net_device *dev);
+ 	int (*erp)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		   int link_id, struct cfg80211_erp_params *params);
++	void (*apply_neg_ttlm_per_client)(struct ieee80211_hw *hw,
++					  struct ieee80211_vif *vif,
++					  struct ieee80211_sta *sta);
+ };
+ 
+ /**
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@ -7579,7 +7579,10 @@ int ieee80211_req_neg_ttlm(struct ieee80
+ 	struct ieee80211_neg_ttlm neg_ttlm = {};
+ 	u8 i;
+ 
+-	if (!ieee80211_vif_is_mld(&sdata->vif) ||
++	if (!ieee80211_vif_is_mld(&sdata->vif))
++		return -EINVAL;
++
++	if (sdata->vif.type != NL80211_IFTYPE_AP &&
+ 	    !(sdata->vif.cfg.mld_capa_op &
+ 	      IEEE80211_MLD_CAP_OP_TID_TO_LINK_MAP_NEG_SUPP))
+ 		return -EINVAL;
+@@ -7597,15 +7600,39 @@ int ieee80211_req_neg_ttlm(struct ieee80
+ 	    NEG_TTLM_RES_ACCEPT)
+ 		return -EINVAL;
+ 
+-	ieee80211_apply_neg_ttlm(sdata, neg_ttlm);
+-	sdata->u.mgd.dialog_token_alloc++;
+-	ieee80211_send_neg_ttlm_req(sdata, &sdata->vif.neg_ttlm,
+-				    sdata->u.mgd.dialog_token_alloc);
+-	wiphy_delayed_work_cancel(sdata->local->hw.wiphy,
+-				  &sdata->u.mgd.neg_ttlm_timeout_work);
+-	wiphy_delayed_work_queue(sdata->local->hw.wiphy,
+-				 &sdata->u.mgd.neg_ttlm_timeout_work,
+-				 IEEE80211_NEG_TTLM_REQ_TIMEOUT);
++	if (sdata->vif.type != NL80211_IFTYPE_AP) {
++		ieee80211_apply_neg_ttlm(sdata, neg_ttlm);
++		sdata->u.mgd.dialog_token_alloc++;
++		ieee80211_send_neg_ttlm_req(sdata, &sdata->vif.neg_ttlm,
++					    sdata->u.mgd.dialog_token_alloc);
++		wiphy_delayed_work_cancel(sdata->local->hw.wiphy,
++					  &sdata->u.mgd.neg_ttlm_timeout_work);
++		wiphy_delayed_work_queue(sdata->local->hw.wiphy,
++					 &sdata->u.mgd.neg_ttlm_timeout_work,
++					 IEEE80211_NEG_TTLM_REQ_TIMEOUT);
++	} else {
++		/* On AP mode, action frame exchange already completed from
++		 * external application. Apply the mapping for the given client
++		 * in driver. Disabling the links on AP MLD for negotiation
++		 * with a client is not needed.
++		 */
++		struct sta_info *sta_info = sta_info_get_bss(sdata, params->mld_mac_addr);
++
++		if (!sta_info || !sta_info->uploaded)
++			return -EINVAL;
++
++		sta_info->sta.neg_ttlm = neg_ttlm;
++		/* If set ttlm issued before association,
++		 * handle further as part of association
++		 */
++		if (sta_info->sta_state != IEEE80211_STA_AUTHORIZED)
++			return 0;
++
++		if (sdata->local->ops->apply_neg_ttlm_per_client)
++			sdata->local->ops->apply_neg_ttlm_per_client(&sdata->local->hw,
++								     &sdata->vif,
++								     &sta_info->sta);
++	}
+ 	return 0;
+ }
+ 

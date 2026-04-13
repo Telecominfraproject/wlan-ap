@@ -1,0 +1,157 @@
+From 6bcfc30bf3eb4027c79d27b785624330c33e4266 Mon Sep 17 00:00:00 2001
+From: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+Date: Fri, 26 Sep 2025 16:40:35 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: mac80211: Fix TPE parsing logic for
+ punctured AP
+
+Existing logic used to parse TPE IE from AP beacons and probe responses
+does not work appropriately when the AP is operating in a
+punctured channel.
+
+Consider a case where the AP is operating in EHT 80 MHz BW and one of
+the channel is punctured. The following diagram depicts the channel
+allocation and the TPE IE received from the AP.
+
+EHT 320:    |  |  |  |
+Punctured:  X
+HE 20:         |
+Chan Idx:   0  1  2  3
+
+TPE N:         |
+TPE K:      |     |  |
+
+TPE IE:    |---|   |---|---|---|
+          N  1    K  0   2   3
+
+When rearranging the TPE IE based on the channel index, the subchannel
+powers need to be ordered correctly to put each subchannel in its right
+place for the EHT 80 MHz channel advertised by the AP. But the current
+logic of calculation of the TPE IE offset does not handle these cases
+correctly and ends up rearranging the TPE IE incorrectly as:
+
+Expected TPE IE:  |---|  |---|   |---|---|
+                 K  0   N  1    K  2   3
+
+Actual TPE IE:    |---|   |---|---|---|
+                 N  1    K  0   2   3
+
+This happens as we fail to calculate the offset of HE portion of the TPE
+IE within the EHT 80 MHz. This is calculated by downgrading the AP's
+chandef from the operating bandwidth until we reach the HE channel width
+and calculating the number of subchannels that are lost when we
+downgrade the channel width. This logic assumes that one half of the
+subchannels are lost when we downgrade one level. This assumption
+breaks when the AP is operating in a punctured channel as the number of
+subchannels lost when downgrading the channel width may not always be
+half of the subchannels and depends on the position of the primary
+channel and the puncture pattern.
+
+Fix this by calculating the offset simple as the position of the
+HE chandef within the EHT chandef.
+
+HE chandef can be calculated by downgrading the AP's chandef to
+meet the HE channel width.
+
+The difference between the start frequencies of the EHT chandef and the
+HE chandef divided by 20 MHz gives the offset of the HE portion
+within the EHT channel.
+
+Offset = start_freq(HE) - start_freq(EHT) / 20 MHz
+
+EHT 320:    |  |  |  |
+HE 20:         |
+
+With the suggested change, the offset for the above example will be
+computed as 1. Thus the TPE IE will be rearranged correctly as:
+
+Expected TPE IE:  |---|  |---|   |---|---|
+                 K  0   N  1    K  2   3
+
+This logic works correctly for both punctured and non-punctured
+channels.
+
+Signed-off-by: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+---
+ net/mac80211/mlme.c | 40 ++++++++++++++++++++++++++++++++++------
+ 1 file changed, 34 insertions(+), 6 deletions(-)
+
+diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
+index 3eef5a6f1be1..34c8c3752ba2 100644
+--- a/net/mac80211/mlme.c
++++ b/net/mac80211/mlme.c
+@@ -744,6 +744,28 @@ static int ieee80211_chandef_num_widths(const struct cfg80211_chan_def *c)
+ 	}
+ }
+ 
++/* ieee80211_chandef_subchan_index -  This function returns the position
++ * (0 based) of the first subchannel of the used chandef within the ap's
++ * chandef. Both AP and used chandef must be valid and the used chandef must
++ * be a subset of the ap's chandef (same primary channel, same band), possibly
++ * a different width.
++ *
++ * Return: index of the first subchannel of 'used' within 'ap', or -1 on error
++ */
++static int ieee80211_chandef_subchan_index(const struct cfg80211_chan_def *ap,
++					   const struct cfg80211_chan_def *used)
++{
++	int n = ieee80211_chandef_num_subchans(ap);
++	u32 ap_start_freq = KHZ_TO_MHZ(cfg80211_get_start_freq(ap, 1));
++	u32 tmp_start_freq = KHZ_TO_MHZ(cfg80211_get_start_freq(used, 1));
++	int offset = (tmp_start_freq - ap_start_freq) / 20;
++
++	if (offset < 0 || offset >= n)
++		return -1;
++
++	return offset;
++}
++
+ VISIBLE_IF_MAC80211_KUNIT int
+ ieee80211_calc_chandef_subchan_offset(const struct cfg80211_chan_def *ap,
+ 				      u8 n_partial_subchans)
+@@ -751,6 +773,7 @@ ieee80211_calc_chandef_subchan_offset(const struct cfg80211_chan_def *ap,
+ 	int n = ieee80211_chandef_num_subchans(ap);
+ 	struct cfg80211_chan_def tmp = *ap;
+ 	int offset = 0;
++	bool chandef_downgraded = false;
+ 
+ 	/*
+ 	 * Given a chandef (in this context, it's the AP's) and a number
+@@ -768,16 +791,21 @@ ieee80211_calc_chandef_subchan_offset(const struct cfg80211_chan_def *ap,
+ 		return 0;
+ 
+ 	while (ieee80211_chandef_num_subchans(&tmp) > n_partial_subchans) {
+-		u32 prev = tmp.center_freq1;
+ 
+ 		ieee80211_chandef_downgrade(&tmp, NULL);
++		chandef_downgraded = true;
++	}
+ 
++	if (chandef_downgraded) {
+ 		/*
+-		 * if center_freq moved up, half the original channels
+-		 * are gone now but were below, so increase offset
++		 * Each subchannel is 20 MHz wide.
++		 * Calculate how far downgraded he chandef is from the
++		 * ap's chandef
+ 		 */
+-		if (prev < tmp.center_freq1)
+-			offset += ieee80211_chandef_num_subchans(&tmp);
++		int subchan_idx = ieee80211_chandef_subchan_index(ap, &tmp);
++
++		if (subchan_idx >= 0)
++			offset = subchan_idx;
+ 	}
+ 
+ 	/*
+@@ -799,7 +827,7 @@ ieee80211_rearrange_tpe_psd(struct ieee80211_parsed_tpe_psd *psd,
+ {
+ 	u8 needed = ieee80211_chandef_num_subchans(used);
+ 	u8 have = ieee80211_chandef_num_subchans(ap);
+-	u8 tmp[IEEE80211_TPE_PSD_ENTRIES_320MHZ];
++	s8 tmp[IEEE80211_TPE_PSD_ENTRIES_320MHZ];
+ 	u8 offset;
+ 
+ 	if (!psd->valid)
+-- 
+2.34.1
+

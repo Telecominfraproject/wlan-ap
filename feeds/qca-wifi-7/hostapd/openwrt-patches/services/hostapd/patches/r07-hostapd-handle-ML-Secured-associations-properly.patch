@@ -1,0 +1,556 @@
+From 9230b55f07de6916b84cad4ad4eae555b013f72f Mon Sep 17 00:00:00 2001
+From: Rameshkumar Sundaram <quic_ramess@quicinc.com>
+Date: Mon, 15 Jan 2024 14:29:57 +0530
+Subject: [PATCH] hostapd: handle ML Secured associations properly
+
+When association request is recieved for a STA which AP MLD has
+entry, it can be only accepted after SA procedure, while
+accepting such associations, handle following cases,
+
+- New association may request different set of links than the one
+already exists, hence clean up all stale link STA entries.
+in partner links and process and add requested link STA entries
+- Overwrite Existing ML information only after SA procedure is
+done and new association is accepted.
+- When assoc link changes, reinit the ml data maintianed in Station's
+wpa state machine and maintain only accpeted link's data.
+- copy sa_query_timed_out field to all link stations and reset the same
+after association is accepted.
+- Reset rejected link's valid bit after association response is sent
+so that it wont be referred and used anywhere.
+- Do not copy all STA flags from assoc link STA to other link STA as
+few flags can be link specifc (i.e. WLAN_STA_SHORT_PREAMBLE,
+WLAN_STA_VHT,WLAN_STA_6GHZ etc,)
+- When a link Station is freed, reset the corresponding link's valid
+bit in state machine's ml info.
+
+Signed-off-by: Rameshkumar Sundaram <quic_ramess@quicinc.com>
+Signed-off-by: Vignesh C <quic_vignc@quicinc.com>
+Signed-off-by: Yuvarani V <quic_yuvarani@quicinc.com>
+Signed-off-by: Arunpandi Kannan <quic_arunpand@quicinc.com>
+Signed-off-by: Hari Naraayana Desikan Kannan <quic_hnaraaya@quicinc.com>
+---
+ src/ap/ieee802_11.c     | 113 +++++++++++++++++++++++++------
+ src/ap/ieee802_11_eht.c |   3 +
+ src/ap/sta_info.c       |  20 ++++++
+ src/ap/sta_info.h       |   3 +
+ src/ap/wpa_auth.c       | 144 +++++++++++++++++++---------------------
+ src/ap/wpa_auth.h       |   2 +-
+ 6 files changed, 188 insertions(+), 97 deletions(-)
+
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -4182,7 +4182,7 @@ u16 owe_process_rsn_ie(struct hostapd_da
+ 	}
+ #ifdef CONFIG_IEEE80211BE
+ 	if (ap_sta_is_mld(hapd, sta))
+-		wpa_auth_set_ml_info(sta->wpa_sm,
++		wpa_auth_set_ml_info(sta->wpa_sm, hapd->mld_link_id,
+ 				     sta->mld_assoc_link_id, &sta->mld_info);
+ #endif /* CONFIG_IEEE80211BE */
+ 	rsn_ie -= 2;
+@@ -4444,12 +4444,6 @@ static int __check_assoc_ies(struct host
+ 						 elems->eht_240mhz_len);
+ 		if (resp != WLAN_STATUS_SUCCESS)
+ 			return resp;
+-
+-		if (!link) {
+-			resp = hostapd_process_ml_assoc_req(hapd, elems, sta);
+-			if (resp != WLAN_STATUS_SUCCESS)
+-				return resp;
+-		}
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+@@ -4521,11 +4515,40 @@ static int __check_assoc_ies(struct host
+ 		wpa_ie -= 2;
+ 		wpa_ie_len += 2;
+ 
+-		if (!sta->wpa_sm) {
+-			if (!link)
+-				assoc_sta = hostapd_ml_get_assoc_sta(
+-					hapd, sta, &assoc_hapd);
++#ifdef CONFIG_IEEE80211BE
++		if (!link && sta->mld_info.mld_sta && sta->mld_assoc_link_id != hapd->mld_link_id) {
++			struct hostapd_data *bss;
++			struct sta_info *lsta;
++			u8 link_id = hapd->mld_link_id;
+ 
++			wpa_printf(MSG_WARNING,
++				   "Existing ML STA "MACSTR" on link %u is associating after "
++				   "SA query timeout on a different link %u", MAC2STR(sta->addr),
++				   sta->mld_assoc_link_id, link_id);
++			wpa_auth_sta_deinit(sta->wpa_sm);
++			sta->wpa_sm = NULL;
++			sta->mld_assoc_link_id = link_id;
++			for_each_mld_link(bss, hapd) {
++				if (bss == hapd)
++					continue;
++				lsta = ap_get_sta(bss, sta->addr);
++				if (lsta) {
++					lsta->wpa_sm = NULL;
++					lsta->mld_assoc_link_id = link_id;
++				}
++			}
++		}
++		/* Overwrite existing ml info only after SA query procedure */
++		if (!link && hapd->iconf->ieee80211be && !hapd->conf->disable_11be) {
++			resp = hostapd_process_ml_assoc_req(hapd, elems, sta);
++			if (resp != WLAN_STATUS_SUCCESS)
++				return resp;
++		}
++#endif /* CONFIG_IEEE80211BE */
++		if (!sta->wpa_sm) {
++#ifdef CONFIG_IEEE80211BE
++			info = &sta->mld_info;
++#endif /* CONFIG_IEEE80211BE */
+ 			sta->wpa_sm = wpa_auth_sta_init(hapd->wpa_auth,
+ 							sta->addr,
+ 							p2p_dev_addr);
+@@ -4538,14 +4561,18 @@ static int __check_assoc_ies(struct host
+ 		}
+ 
+ #ifdef CONFIG_IEEE80211BE
+-		if (ap_sta_is_mld(hapd, sta)) {
++		if (!link && ap_sta_is_mld(hapd, sta)) {
+ 			wpa_printf(MSG_DEBUG,
+ 				   "MLD: %s ML info in RSN Authenticator",
+ 				   init ? "Set" : "Reset");
+-			wpa_auth_set_ml_info(sta->wpa_sm,
++			sta->wpa_sm->n_mld_affiliated_links = 0;
++			wpa_auth_reset_ml_link_info(sta->wpa_sm, sta->mld_assoc_link_id);
++			wpa_auth_set_ml_info(sta->wpa_sm, hapd->mld_link_id,
+ 					     sta->mld_assoc_link_id,
+ 					     info);
+ 		}
++		if (sta->mld_info.mld_sta && link)
++			assoc_sta = hostapd_ml_get_assoc_sta(hapd, sta, &assoc_hapd);
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 		wpa_auth_set_auth_alg(sta->wpa_sm, sta->auth_alg);
+@@ -5002,8 +5029,10 @@ static int ieee80211_ml_process_link(str
+ 		goto out;
+ 	}
+ 
+-	sta->flags |= origin_sta->flags | WLAN_STA_ASSOC_REQ_OK;
++	sta->flags = (origin_sta->flags & WLAN_STA_AUTH);
+ 	sta->mld_assoc_link_id = origin_sta->mld_assoc_link_id;
++	sta->sa_query_timed_out = origin_sta->sa_query_timed_out;
++	sta->wpa_sm = origin_sta->wpa_sm;
+ 	ap_sta_set_mld(sta, true);
+ 
+ 	status = __check_assoc_ies(hapd, sta, NULL, 0, &elems, reassoc, true);
+@@ -5037,12 +5066,6 @@ static int ieee80211_ml_process_link(str
+ 			ieee802_11_update_beacons(hapd->iface);
+ 	}
+ 
+-	/* Maintain state machine reference on all link STAs, this is needed
+-	 * during group rekey handling.
+-	 */
+-	wpa_auth_sta_deinit(sta->wpa_sm);
+-	sta->wpa_sm = origin_sta->wpa_sm;
+-
+ 	/*
+ 	 * Do not initialize the EAPOL state machine.
+ 	 * TODO: Maybe it is needed?
+@@ -5052,7 +5075,7 @@ static int ieee80211_ml_process_link(str
+ 	wpa_printf(MSG_DEBUG, "MLD: link=%u, association OK (aid=%u)",
+ 		   hapd->mld_link_id, sta->aid);
+ 
+-	sta->flags |= WLAN_STA_AUTH | WLAN_STA_ASSOC_REQ_OK;
++	sta->flags |= WLAN_STA_ASSOC_REQ_OK;
+ 	sta->vlan_id = origin_sta->vlan_id;
+ 
+ 	/* TODO: What other processing is required? */
+@@ -5067,10 +5090,15 @@ out:
+ 		ieee80211_ml_build_assoc_resp(hapd, phapd, sta, link);
+ 
+ 	wpa_printf(MSG_DEBUG, "MLD: link: status=%u", status);
+-	if (status != WLAN_STATUS_SUCCESS) {
+-		if (sta)
++	if (sta) {
++		if (status != WLAN_STATUS_SUCCESS) {
+ 			ap_free_sta(hapd, sta);
+-		return -1;
++		} else {
++			/* Maintain only accepted link STAs information in wpa_sm */
++			wpa_auth_set_ml_info(sta->wpa_sm,
++					     hapd->mld_link_id, sta->mld_assoc_link_id,
++					     &sta->mld_info);
++		}
+ 	}
+ 
+ 	return 0;
+@@ -5100,10 +5128,52 @@ int hostapd_process_assoc_ml_info(struct
+ {
+ #ifdef CONFIG_IEEE80211BE
+ 	unsigned int i;
++	const u8 *mld_link_addr = NULL;
++	bool mld_link_sta = false;
++	u16 eml_cap = 0;
+ 
+ 	if (!hostapd_is_mld_ap(hapd))
+ 		return 0;
+ 
++	if (tx_link_status == WLAN_STATUS_SUCCESS && sta->mld_info.mld_sta) {
++		u8 mld_link_id = hapd->mld_link_id;
++
++		mld_link_sta = sta->mld_assoc_link_id != mld_link_id;
++		mld_link_addr = sta->mld_info.links[mld_link_id].peer_addr;
++		eml_cap = sta->mld_info.common_info.eml_capa;
++		wpa_printf(MSG_DEBUG, "Add associated ML STA " MACSTR
++			   " (added_unassoc=%d auth_alg=%u ft_over_ds=%u reassoc=%d authorized=%d ft_tk=%d fils_tk=%d)",
++			   MAC2STR(sta->addr), sta->added_unassoc, sta->auth_alg,
++			   sta->ft_over_ds, reassoc,
++			   !!(sta->flags & WLAN_STA_AUTHORIZED),
++			   wpa_auth_sta_ft_tk_already_set(sta->wpa_sm),
++			   wpa_auth_sta_fils_tk_already_set(sta->wpa_sm));
++
++		if (!sta->added_unassoc && (!(sta->flags & WLAN_STA_AUTHORIZED) ||
++		    (reassoc && sta->ft_over_ds && sta->auth_alg == WLAN_AUTH_FT) ||
++		    (!wpa_auth_sta_ft_tk_already_set(sta->wpa_sm) &&
++		     !wpa_auth_sta_fils_tk_already_set(sta->wpa_sm)))) {
++			wpa_printf(MSG_DEBUG,
++				   "ML STA was already created and we received assoc resp again (reassoc: %d)",
++				   reassoc);
++			/* cleanup all link sta in kernel and add later on ml processing */
++			ap_sta_remove_link_sta(hapd, sta);
++			hostapd_drv_sta_remove(hapd, sta->addr);
++			sta->flags &= ~(WLAN_STA_ASSOC | WLAN_STA_AUTHORIZED);
++
++			if (hostapd_sta_add(hapd, sta->addr, 0, 0,
++					    sta->supported_rates,
++					    sta->supported_rates_len,
++					    0, NULL, NULL, NULL, 0, NULL, 0, NULL,
++					    sta->flags, 0, 0, 0, 0,
++					    mld_link_addr, mld_link_sta,
++					    eml_cap)) {
++				hostapd_logger(hapd, sta->addr,HOSTAPD_MODULE_IEEE80211,HOSTAPD_LEVEL_NOTICE,
++					       "Could not add STA to kernel driver");
++				return -1;
++			}
++		}
++	}
+ 	for (i = 0; i < MAX_NUM_MLD_LINKS; i++) {
+ 		struct hostapd_data *bss = NULL;
+ 		struct mld_link_info *link = &sta->mld_info.links[i];
+@@ -5230,7 +5300,7 @@ static int add_associated_sta(struct hos
+ 		   wpa_auth_sta_ft_tk_already_set(sta->wpa_sm),
+ 		   wpa_auth_sta_fils_tk_already_set(sta->wpa_sm));
+ 
+-	if (!mld_link_sta && !sta->added_unassoc &&
++	if (!ap_sta_is_mld(hapd, sta) && !sta->added_unassoc &&
+ 	    (!(sta->flags & WLAN_STA_AUTHORIZED) ||
+ 	     (reassoc && sta->ft_over_ds && sta->auth_alg == WLAN_AUTH_FT) ||
+ 	     (!wpa_auth_sta_ft_tk_already_set(sta->wpa_sm) &&
+@@ -5293,7 +5363,7 @@ static int add_associated_sta(struct hos
+ 			       "Could not %s STA to kernel driver",
+ 			       set ? "set" : "add");
+ 
+-		if (sta->added_unassoc) {
++		if (!ap_sta_is_mld(hapd, sta) && sta->added_unassoc) {
+ 			hostapd_drv_sta_remove(hapd, sta->addr);
+ 			sta->added_unassoc = 0;
+ 		}
+@@ -7335,6 +7405,7 @@ static void handle_assoc_cb(struct hosta
+ 	}
+ 
+ 	hostapd_set_sta_flags(hapd, sta);
++	sta->sa_query_timed_out = 0;
+ 
+ 	if (!(sta->flags & WLAN_STA_WDS) && sta->pending_wds_enable) {
+ 		wpa_printf(MSG_DEBUG, "Enable 4-address WDS mode for STA "
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -720,6 +720,9 @@ static u8 * hostapd_eid_eht_basic_ml_com
+ 				ptr += slice_len;
+ 			}
+ 		}
++		/* Dont refer to rejected links info Anymore */
++		if (link->status != WLAN_STATUS_SUCCESS)
++			link->valid = false;
+ 	}
+ 
+ out:
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -574,7 +574,7 @@ int hostapd_notif_assoc(struct hostapd_d
+ 		if (ap_sta_is_mld(hapd, sta)) {
+ 			wpa_printf(MSG_DEBUG,
+ 				   "MLD: Set ML info in RSN Authenticator");
+-			wpa_auth_set_ml_info(sta->wpa_sm,
++			wpa_auth_set_ml_info(sta->wpa_sm, hapd->mld_link_id,
+ 					     sta->mld_assoc_link_id,
+ 					     &sta->mld_info);
+ 		}
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -360,6 +360,7 @@ struct sta_info {
+ /* Number of seconds to keep STA entry after it has been deauthenticated. */
+ #define AP_MAX_INACTIVITY_AFTER_DEAUTH (1 * 5)
+ 
++void ap_sta_remove_link_sta(struct hostapd_data *hapd, struct sta_info *sta);
+ 
+ int ap_for_each_sta(struct hostapd_data *hapd,
+ 		    int (*cb)(struct hostapd_data *hapd, struct sta_info *sta,
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -109,13 +109,19 @@ void wpa_release_link_auth_ref(struct wp
+ 			       int release_link_id)
+ {
+ 	int link_id;
++	struct mld_link *link;
+ 
+ 	if (!sm || release_link_id >= MAX_NUM_MLD_LINKS)
+ 		return;
+ 
+ 	for_each_sm_auth(sm, link_id) {
+-		if (link_id == release_link_id)
+-			sm->mld_links[link_id].wpa_auth = NULL;
++		if (link_id == release_link_id) {
++			link = &sm->mld_links[link_id];
++			wpa_group_put(link->wpa_auth, link->wpa_auth->group);
++			link->wpa_auth = NULL;
++			link->valid = false;
++			break;
++		}
+ 	}
+ }
+ 
+@@ -380,6 +386,14 @@ int wpa_auth_for_each_auth(struct wpa_au
+ 	return wpa_auth->cb->for_each_auth(wpa_auth->cb_ctx, cb, cb_ctx);
+ }
+ 
++int wpa_auth_for_each_partner_auth(struct wpa_authenticator *wpa_auth,
++				   int (*cb)(struct wpa_authenticator *a, void *ctx),
++				   void *cb_ctx)
++{
++	if (!wpa_auth->cb->for_each_partner_auth)
++		return 0;
++	return wpa_auth->cb->for_each_partner_auth(wpa_auth->cb_ctx, cb, cb_ctx);
++}
+ 
+ void wpa_auth_store_ptksa(struct wpa_authenticator *wpa_auth,
+ 			  const u8 *addr, int cipher,
+@@ -1109,8 +1123,12 @@ static void wpa_free_sta_sm(struct wpa_s
+ 	os_free(sm->rsnxe);
+ 	os_free(sm->rsn_selection);
+ #ifdef CONFIG_IEEE80211BE
+-	for_each_sm_auth(sm, link_id)
+-		sm->mld_links[link_id].wpa_auth = NULL;
++	for_each_sm_auth(sm, link_id) {
++		struct mld_link *link = &sm->mld_links[link_id];
++		wpa_group_put(link->wpa_auth, link->wpa_auth->group);
++		link->wpa_auth = NULL;
++		link->valid = false;
++	}
+ #endif /* CONFIG_IEEE80211BE */
+ 	wpa_group_put(sm->wpa_auth, sm->group);
+ #ifdef CONFIG_DPP2
+@@ -7603,17 +7621,22 @@ void wpa_auth_sta_radius_psk_resp(struct
+ }
+ 
+ 
+-void wpa_auth_set_ml_info(struct wpa_state_machine *sm,
++void wpa_auth_set_ml_info(struct wpa_state_machine *sm, u8 link_id,
+ 			  u8 mld_assoc_link_id, struct mld_info *info)
+ {
+ #ifdef CONFIG_IEEE80211BE
+-	unsigned int link_id;
++	struct mld_link_info *link;
++	struct mld_link *sm_link;
++	struct wpa_get_link_auth_ctx ctx;
++	const u8 *rsn_ies;
++	size_t rsn_ies_len;
+ 
+-	if (!info)
++	if (!info || link_id >= MAX_NUM_MLD_LINKS)
+ 		return;
+ 
+-	os_memset(sm->mld_links, 0, sizeof(sm->mld_links));
+-	sm->n_mld_affiliated_links = 0;
++	link = &info->links[link_id];
++	sm_link = &sm->mld_links[link_id];
++	os_memset(sm_link, 0, sizeof(*sm_link));
+ 
+ 	wpa_auth_logger(sm->wpa_auth, wpa_auth_get_spa(sm), LOGGER_DEBUG,
+ 			"MLD: Initialization");
+@@ -7621,45 +7644,53 @@ void wpa_auth_set_ml_info(struct wpa_sta
+ 	os_memcpy(sm->peer_mld_addr, info->common_info.mld_addr, ETH_ALEN);
+ 
+ 	sm->mld_assoc_link_id = mld_assoc_link_id;
++	sm_link->valid = link->valid;
++	os_memcpy(sm_link->peer_addr, link->peer_addr, ETH_ALEN);
++	os_memcpy(sm_link->own_addr, link->local_addr, ETH_ALEN);
+ 
+-	for (link_id = 0; link_id < MAX_NUM_MLD_LINKS; link_id++) {
+-		struct mld_link_info *link = &info->links[link_id];
+-		struct mld_link *sm_link = &sm->mld_links[link_id];
+-		struct wpa_get_link_auth_ctx ctx;
+-
+-		sm_link->valid = link->valid;
+-		if (!link->valid)
+-			continue;
++	wpa_printf(MSG_DEBUG,
++		   "WPA_AUTH: MLD: id=%u, addr=" MACSTR " peer=" MACSTR,
++		   link_id,
++		   MAC2STR(link->local_addr),
++		   MAC2STR(sm_link->peer_addr));
++
++	if (link_id != mld_assoc_link_id) {
++		sm->n_mld_affiliated_links++;
++		ctx.addr = link->local_addr;
++		ctx.wpa_auth = NULL;
++		ctx.mld_addr = NULL;
++		ctx.link_id = -1;
++		wpa_auth_for_each_auth(sm->wpa_auth, wpa_get_link_sta_auth, &ctx);
++		if (ctx.wpa_auth) {
++			sm_link->wpa_auth = ctx.wpa_auth;
++			wpa_group_get(sm_link->wpa_auth, sm_link->wpa_auth->group);
++		}
++	} else {
++		/* Group get for assoc link would've been done during state machine init */
++		sm_link->wpa_auth = sm->wpa_auth;
++	}
+ 
+-		os_memcpy(sm_link->peer_addr, link->peer_addr, ETH_ALEN);
+-		os_memcpy(sm_link->own_addr, link->local_addr, ETH_ALEN);
++	if (!sm_link->wpa_auth) {
++		wpa_printf(MSG_ERROR, "Unable to find authenticator object for"
++			   "ML STA "MACSTR" on link "MACSTR" link id %d",
++			   MAC2STR(sm->wpa_auth->mld_addr), MAC2STR(sm_link->own_addr), link_id);
++		return;
++	}
+ 
+-		wpa_printf(MSG_DEBUG,
+-			   "WPA_AUTH: MLD: id=%u, peer=" MACSTR,
+-			   link_id,
+-			   MAC2STR(sm_link->peer_addr));
+-
+-		if (link_id != mld_assoc_link_id) {
+-			sm->n_mld_affiliated_links++;
+-			ctx.addr = link->local_addr;
+-			ctx.mld_addr = NULL;
+-			ctx.link_id = -1;
+-			ctx.wpa_auth = NULL;
+-			wpa_auth_for_each_auth(sm->wpa_auth,
+-					       wpa_get_link_sta_auth, &ctx);
+-			if (ctx.wpa_auth)
+-				sm_link->wpa_auth = ctx.wpa_auth;
+-		} else {
+-			sm_link->wpa_auth = sm->wpa_auth;
+-		}
++	rsn_ies = wpa_auth_get_wpa_ie(sm_link->wpa_auth, &rsn_ies_len);
++	/* This should not really happen */
++	if (!rsn_ies || rsn_ies_len < 2 || rsn_ies[0] != WLAN_EID_RSN ||
++	    rsn_ies[1] + 2 > rsn_ies_len) {
++		wpa_printf(MSG_INFO, "WPA_AUTH: MLD: Invalid RSNE");
++		return;
++	}
+ 
+-		if (!sm_link->wpa_auth)
+-			wpa_printf(MSG_ERROR,
+-				   "Unable to find authenticator object for ML STA "
+-				   MACSTR " on link id %d",
+-				   MAC2STR(sm->wpa_auth->mld_addr),
+-				   link_id);
++	if (rsn_ies[1] + 2UL + 2UL < rsn_ies_len &&
++	    rsn_ies[rsn_ies[1] + 2] == WLAN_EID_RSNX) {
++		sm_link->rsnxe = rsn_ies + 2 + rsn_ies[1];
++		sm_link->rsnxe_len = sm_link->rsnxe[1] + 2;
+ 	}
++
+ #endif /* CONFIG_IEEE80211BE */
+ }
+ 
+--- a/src/ap/wpa_auth.h
++++ b/src/ap/wpa_auth.h
+@@ -381,6 +381,8 @@ struct wpa_auth_callbacks {
+ 						 void *ctx), void *cb_ctx);
+ 	int (*for_each_auth)(void *ctx, int (*cb)(struct wpa_authenticator *a,
+ 						  void *ctx), void *cb_ctx);
++	int (*for_each_partner_auth)(void *ctx, int (*cb)(struct wpa_authenticator *a,
++							  void *ctx), void *cb_ctx);
+ 	int (*send_ether)(void *ctx, const u8 *dst, u16 proto, const u8 *data,
+ 			  size_t data_len);
+ 	int (*send_oui)(void *ctx, const u8 *dst, u8 oui_suffix, const u8 *data,
+@@ -680,7 +682,7 @@ void wpa_auth_set_ocv_override_freq(stru
+ 
+ void wpa_auth_sta_radius_psk_resp(struct wpa_state_machine *sm, bool success);
+ 
+-void wpa_auth_set_ml_info(struct wpa_state_machine *sm,
++void wpa_auth_set_ml_info(struct wpa_state_machine *sm, u8 link_id,
+ 			  u8 mld_assoc_link_id, struct mld_info *info);
+ void wpa_auth_reset_ml_link_info(struct wpa_state_machine *sm, u8 mld_assoc_link_id);
+ void wpa_auth_ml_get_key_info(struct wpa_authenticator *a,
+--- a/src/ap/wpa_auth_glue.c
++++ b/src/ap/wpa_auth_glue.c
+@@ -745,6 +745,26 @@ static int hostapd_wpa_auth_for_each_aut
+ 		hapd->iface->interfaces, wpa_auth_iface_iter, &data);
+ }
+ 
++static int hostapd_wpa_auth_for_each_partner_auth(
++	void *ctx, int (*cb)(struct wpa_authenticator *sm, void *ctx), void *cb_ctx)
++{
++	struct hostapd_data *hapd = ctx;
++	struct hostapd_data *bss;
++
++	if (cb(hapd->wpa_auth, cb_ctx))
++		return 1;
++
++#ifdef CONFIG_IEEE80211BE
++	if (!hapd->mld)
++		return 0;
++
++	for_each_mld_link(bss, hapd) {
++		if (bss != hapd && bss->wpa_auth && cb(bss->wpa_auth, cb_ctx))
++			return 1;
++	}
++#endif /* CONFIG_IEEE80211BE */
++	return 0;
++}
+ 
+ #ifdef CONFIG_IEEE80211R_AP
+ 
+@@ -1852,6 +1872,7 @@ int hostapd_setup_wpa(struct hostapd_dat
+ 		.get_sta_count = hostapd_wpa_auth_get_sta_count,
+ 		.for_each_sta = hostapd_wpa_auth_for_each_sta,
+ 		.for_each_auth = hostapd_wpa_auth_for_each_auth,
++		.for_each_partner_auth = hostapd_wpa_auth_for_each_partner_auth,
+ 		.send_ether = hostapd_wpa_auth_send_ether,
+ 		.send_oui = hostapd_wpa_auth_send_oui,
+ 		.channel_info = hostapd_channel_info,
+--- a/src/ap/wpa_auth_i.h
++++ b/src/ap/wpa_auth_i.h
+@@ -331,6 +331,9 @@ int wpa_auth_for_each_sta(struct wpa_aut
+ int wpa_auth_for_each_auth(struct wpa_authenticator *wpa_auth,
+ 			   int (*cb)(struct wpa_authenticator *a, void *ctx),
+ 			   void *cb_ctx);
++int wpa_auth_for_each_partner_auth(struct wpa_authenticator *wpa_auth,
++				   int (*cb)(struct wpa_authenticator *a, void *ctx),
++				   void *cb_ctx);
+ void wpa_auth_store_ptksa(struct wpa_authenticator *wpa_auth,
+ 			  const u8 *addr, int cipher,
+ 			  u32 life_time, const struct wpa_ptk *ptk);
+--- a/src/ap/wpa_auth_ie.c
++++ b/src/ap/wpa_auth_ie.c
+@@ -816,6 +816,11 @@ static int wpa_auth_pmksa_iter(struct wp
+ 
+ #endif /* CONFIG_IEEE80211BE */
+ 
++struct wpa_auth_pmk_iter_data {
++	struct rsn_pmksa_cache_entry **pmksa;
++	const u8 *spa;
++	const u8 *pmkid;
++};
+ 
+ enum wpa_validate_result
+ wpa_validate_wpa_ie(struct wpa_authenticator *wpa_auth,
+@@ -1267,6 +1272,7 @@ wpa_validate_wpa_ie(struct wpa_authentic
+ 			break;
+ 		}
+ 	}
++
+ 	if (sm->pmksa && pmkid) {
+ 		struct vlan_description *vlan;
+ 

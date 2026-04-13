@@ -1,0 +1,1154 @@
+From e9e09b1c15dac506095d21e86d15c52c8375ceff Mon Sep 17 00:00:00 2001
+From: Sathishkumar Muruganandam <murugana@qti.qualcomm.com>
+Date: Mon, 23 Jun 2025 10:55:19 +0530
+Subject: [PATCH 3/3] UPSTREAM:CP:wifi:ath12k: add WBS support
+ for NAC RSSI reporting
+
+WBS (Wide Band Scan) support is required for scan requests for
+> 20MHz bandwidth. Existing ROC (remain-on-channel) feature is
+extended for this and WMI scan start command appended with WBS
+flag for the same.
+
+Remove exiting peer creation for NAC RSSI and replace with new
+VDEV_FILTER_NEIGHBOR_RX_PACKETS_CMD for HW AST monitoring.
+
+Add new scan flag WMI_SCAN_FLAG_HIGHER_MCS_NAC_SCAN in start
+scan command if there is any NAC client is in monitoring and
+WBS request, both in place for enabling higher MCS NAC scan
+in HW.
+
+Signed-off-by: Sathishkumar Muruganandam <murugana@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c    |   1 +
+ drivers/net/wireless/ath/ath12k/debugfs.c | 136 ++++++--------
+ drivers/net/wireless/ath/ath12k/debugfs.h |   8 -
+ drivers/net/wireless/ath/ath12k/dp.h      |   6 +
+ drivers/net/wireless/ath/ath12k/dp_mon.c  |  15 +-
+ drivers/net/wireless/ath/ath12k/mac.c     | 101 +++++-----
+ drivers/net/wireless/ath/ath12k/mac.h     |   2 +-
+ drivers/net/wireless/ath/ath12k/reg.c     |  93 +---------
+ drivers/net/wireless/ath/ath12k/wmi.c     | 217 +++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/wmi.h     |  71 ++++++-
+ 10 files changed, 404 insertions(+), 246 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+index 14245ea21e9a..6cd4ae415fbe 100644
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -2035,6 +2035,7 @@ static void ath12k_core_pre_reconfigure_recovery(struct ath12k_base *ab)
+ 			complete(&ar->vdev_delete_done);
+ 			complete(&ar->bss_survey_done);
+ 			complete(&ar->thermal.wmi_sync);
++			complete(&ar->scan.on_channel);
+ 
+ 			wake_up(&ar->dp.tx_empty_waitq);
+ 			idr_for_each(&ar->txmgmt_idr,
+diff --git a/drivers/net/wireless/ath/ath12k/debugfs.c b/drivers/net/wireless/ath/ath12k/debugfs.c
+index a897e2371758..b357d2bf5177 100644
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -1709,8 +1709,6 @@ void ath12k_debugfs_nrp_cleanup_all(struct ath12k *ar)
+ 
+ 	spin_lock_bh(&dp->dp_lock);
+ 	list_for_each_entry_safe(nrp, tmp, &dp->neighbor_peers, list) {
+-		if (nrp->is_filter_on)
+-			complete(&nrp->filter_done);
+ 		list_del(&nrp->list);
+ 		kfree(nrp);
+ 	}
+@@ -1755,9 +1753,7 @@ static ssize_t ath12k_read_nrp_rssi(struct file *file,
+ 	struct ath12k *ar = file->private_data;
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+-	struct ath12k_link_vif *arvif = NULL;
+-	struct ath12k_neighbor_peer *nrp = NULL, *tmp;
+-	struct ath12k_wmi_peer_create_arg peer_param = {0};
++	struct ath12k_neighbor_peer *nrp = NULL;
+ 	u8 macaddr[ETH_ALEN] = {0};
+ 	loff_t file_pos = *ppos;
+ 	struct path *fpath = &file->f_path;
+@@ -1766,8 +1762,6 @@ static ssize_t ath12k_read_nrp_rssi(struct file *file,
+ 	int i = 0;
+ 	int j = 0;
+ 	int len = 0;
+-	int vdev_id = -1;
+-	bool nrp_found = false;
+ 
+ 	wiphy_lock(ath12k_ar_to_hw(ar)->wiphy);
+ 	if (ar->ah->state != ATH12K_HW_STATE_ON) {
+@@ -1779,73 +1773,28 @@ static ssize_t ath12k_read_nrp_rssi(struct file *file,
+ 	if (file_pos > 0)
+ 		return 0;
+ 
+-	list_for_each_entry(arvif, &ar->arvifs, list) {
+-		if (arvif->ahvif->vdev_type == WMI_VDEV_TYPE_AP) {
+-			vdev_id = arvif->vdev_id;
+-			break;
+-		}
+-	}
+-	if (vdev_id < 0) {
+-		ath12k_warn(ab, "unable to get vdev for AP interface\n");
+-		return 0;
+-	}
+-
+ 	for (i = 0, j = 0;  i < MAC_UNIT_LEN * ETH_ALEN; i += MAC_UNIT_LEN, j++) {
+ 		if (sscanf(fname + i, "%hhX", &macaddr[j]) <= 0)
+ 			return -EINVAL;
+ 	}
+ 
+ 	spin_lock_bh(&dp->dp_lock);
+-	list_for_each_entry(nrp, &dp->neighbor_peers, list) {
+-		if (ether_addr_equal(macaddr, nrp->addr)) {
+-			reinit_completion(&nrp->filter_done);
+-			nrp->vdev_id = vdev_id;
+-			nrp->is_filter_on = false;
++	list_for_each_entry(nrp, &dp->neighbor_peers, list)
++		if (ether_addr_equal(macaddr, nrp->addr))
+ 			break;
+-		}
+-	}
+ 	spin_unlock_bh(&dp->dp_lock);
+ 
+-	peer_param.vdev_id = nrp->vdev_id;
+-	peer_param.peer_addr = nrp->addr;
+-	peer_param.peer_type = WMI_PEER_TYPE_DEFAULT;
+-
+-	if (!ath12k_peer_create(ar, arvif, NULL, &peer_param)) {
+-		spin_lock_bh(&dp->dp_lock);
+-		list_for_each_entry_safe(nrp, tmp, &dp->neighbor_peers, list) {
+-			if (ether_addr_equal(nrp->addr, peer_param.peer_addr)) {
+-				nrp_found = true;
+-				break;
+-			}
+-		}
+-		spin_unlock_bh(&dp->dp_lock);
+-
+-		if (nrp_found) {
+-			spin_lock_bh(&dp->dp_lock);
+-			nrp->is_filter_on = true;
+-			spin_unlock_bh(&dp->dp_lock);
+-
+-			wait_for_completion_interruptible_timeout(&nrp->filter_done, 5 * HZ);
+-
+-			spin_lock_bh(&dp->dp_lock);
+-			nrp->is_filter_on = false;
+-			spin_unlock_bh(&dp->dp_lock);
+-
+-			len = scnprintf(buf, sizeof(buf),
+-					"Neighbor Peer MAC\t\tRSSI\t\tTime\n");
+-			len += scnprintf(buf + len, sizeof(buf) - len, "%pM\t\t%u\t\t%lld\n",
+-					 nrp->addr, nrp->rssi, nrp->timestamp);
+-		} else {
+-			ath12k_peer_delete(ar, vdev_id, macaddr);
+-			ath12k_warn(ab, "%pM not found in nrp list\n", macaddr);
+-			return -EINVAL;
+-		}
+-		ath12k_peer_delete(ar, vdev_id, macaddr);
+-	} else {
+-		ath12k_warn(ab, "unable to create peer for nrp[%pM]\n", macaddr);
++	if (!nrp) {
++		ath12k_warn(ab, "cannot find any NAC for mac addr [%pM]\n",
++			    macaddr);
+ 		return -EINVAL;
+ 	}
+ 
++	len = scnprintf(buf, sizeof(buf),
++			"Neighbor Peer MAC\t\tRSSI\t\tTime\n");
++	len += scnprintf(buf + len, sizeof(buf) - len, "%pM\t\t%u\t\t%lld\n",
++			 nrp->addr, nrp->rssi, nrp->timestamp);
++
+ 	return simple_read_from_buffer(ubuf, count, ppos, buf, len);
+ }
+ 
+@@ -1861,14 +1810,15 @@ static ssize_t ath12k_write_nrp_mac(struct file *file,
+ 	struct ath12k *ar = file->private_data;
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+-	struct ath12k_dp_link_peer *peer = NULL;
+ 	struct ath12k_neighbor_peer *nrp = NULL, *tmp = NULL;
++	struct ath12k_link_vif *arvif = NULL;
++	struct ath12k_set_neighbor_rx_params *param = NULL;
+ 	u8 mac[ETH_ALEN] = {0};
+ 	char fname[MAC_UNIT_LEN * ETH_ALEN] = {0};
+ 	char *str = NULL, *buf = NULL, *ptr = NULL;
+ 	int i = 0;
+ 	int j = 0;
+-	int ret = count;
++	int ret = count, ret1 = -1;
+ 	int action = 0;
+ 	ssize_t rc = 0;
+ 	bool del_nrp = false;
+@@ -1899,9 +1849,9 @@ static ssize_t ath12k_write_nrp_mac(struct file *file,
+ 	}
+ 
+ 	if (!strcmp(str, "add"))
+-		action = NRP_ACTION_ADD;
++		action = WMI_FILTER_NRP_ACTION_ADD;
+ 	else if (!strcmp(str, "del"))
+-		action = NRP_ACTION_DEL;
++		action = WMI_FILTER_NRP_ACTION_REMOVE;
+ 	else {
+ 		ath12k_err(ab, "error: invalid argument\n");
+ 		goto exit;
+@@ -1934,8 +1884,14 @@ static ssize_t ath12k_write_nrp_mac(struct file *file,
+ 		snprintf(fname + i, sizeof(fname) - i, "%02x:", mac[j]);
+ 	}
+ 
++	param = kzalloc(sizeof(*param), GFP_KERNEL);
++	if (!param)
++		goto exit;
++
++	param->action = action;
++
+ 	switch (action) {
+-	case NRP_ACTION_ADD:
++	case WMI_FILTER_NRP_ACTION_ADD:
+ 		if (dp->num_nrps == (ATH12K_MAX_NRPS - 1)) {
+ 			ath12k_warn(ab, "max nrp reached, cannot create more\n");
+ 			goto exit;
+@@ -1948,26 +1904,31 @@ static ssize_t ath12k_write_nrp_mac(struct file *file,
+ 			}
+ 		}
+ 
+-		spin_lock_bh(&dp->dp_lock);
+-		peer = ath12k_dp_link_peer_find_by_addr(dp, mac);
+-		if (peer) {
+-			ath12k_warn(ab, "cannot add exisitng peer [%pM] as nrp\n", mac);
+-			spin_unlock_bh(&dp->dp_lock);
+-			goto exit;
+-		}
+-		spin_unlock_bh(&dp->dp_lock);
+-
+ 		nrp = kzalloc(sizeof(*nrp), GFP_KERNEL);
+ 		if (!nrp)
+ 			goto exit;
+ 
+-		init_completion(&nrp->filter_done);
+ 		ether_addr_copy(nrp->addr, mac);
+ 
+ 		spin_lock_bh(&dp->dp_lock);
+ 		list_add_tail(&nrp->list, &dp->neighbor_peers);
+ 		spin_unlock_bh(&dp->dp_lock);
+ 
++		nrp->vdev_id = -1;
++		list_for_each_entry(arvif, &ar->arvifs, list) {
++			if (arvif->ahvif->vdev_type == WMI_VDEV_TYPE_AP) {
++				nrp->vdev_id = arvif->vdev_id;
++				break;
++			}
++		}
++
++		if (nrp->vdev_id < 0) {
++			ath12k_warn(ab, "unable to get vdev for AP interface\n");
++			goto exit;
++		}
++		param->vdev_id = nrp->vdev_id;
++		ether_addr_copy(param->nrp_addr, nrp->addr);
++
+ 		if (!dp->num_nrps) {
+ 			ar->debug.debugfs_nrp = debugfs_create_dir("nrp_rssi",
+ 								   ar->debug.debugfs_pdev);
+@@ -1981,7 +1942,7 @@ static ssize_t ath12k_write_nrp_mac(struct file *file,
+ 				    ar->debug.debugfs_nrp, ar,
+ 				    &fops_read_nrp_rssi);
+ 		break;
+-	case NRP_ACTION_DEL:
++	case WMI_FILTER_NRP_ACTION_REMOVE:
+ 		if (!dp->num_nrps) {
+ 			ath12k_err(ab, "error: no nac added\n");
+ 			goto exit;
+@@ -1991,21 +1952,34 @@ static ssize_t ath12k_write_nrp_mac(struct file *file,
+ 		list_for_each_entry_safe(nrp, tmp, &dp->neighbor_peers, list) {
+ 			if (ether_addr_equal(nrp->addr, mac)) {
+ 				list_del(&nrp->list);
+-				kfree(nrp);
+ 				del_nrp = true;
+ 				break;
+ 			}
+ 		}
+ 		spin_unlock_bh(&dp->dp_lock);
+ 
+-		if (!del_nrp)
++		if (!del_nrp) {
+ 			ath12k_warn(ab, "cannot delete %pM not added to list\n", mac);
+-		else
++			goto exit;
++		} else {
+ 			ath12k_debugfs_nrp_clean(ar, mac);
++			param->vdev_id = nrp->vdev_id;
++			ether_addr_copy(param->nrp_addr, nrp->addr);
++			kfree(nrp);
++		}
+ 		break;
+ 	default:
+ 		break;
+ 	}
++
++	ret1 = ath12k_wmi_vdev_set_neighbor_rx_cmd(ar, param);
++	if (ret1) {
++		ath12k_err(ar->ab, "ath12k_wmi_vdev_set_neighbor_rx_cmd failed, "
++			   "params vdev id %d action %d, nrp %pM",
++			   param->vdev_id, param->action, param->nrp_addr);
++		ret = ret1;
++	}
++
+ exit:
+ 	 wiphy_unlock(ath12k_ar_to_hw(ar)->wiphy);
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/debugfs.h b/drivers/net/wireless/ath/ath12k/debugfs.h
+index eaae97709442..a48252aa664e 100644
+--- a/drivers/net/wireless/ath/ath12k/debugfs.h
++++ b/drivers/net/wireless/ath/ath12k/debugfs.h
+@@ -26,20 +26,12 @@ void ath12k_wmi_crl_path_stats_list_free(struct ath12k *ar, struct list_head *he
+ #define ATH12K_MAX_NRPS 7
+ #define MAC_UNIT_LEN 3
+ 
+-enum {
+-	NRP_ACTION_ADD,
+-	NRP_ACTION_DEL,
+-};
+-
+ struct ath12k_neighbor_peer {
+ 	struct list_head list;
+-	struct completion filter_done;
+-	bool is_filter_on;
+ 	int vdev_id;
+ 	u8 addr[ETH_ALEN];
+ 	u8 rssi;
+ 	s64 timestamp;
+-	bool rssi_valid;
+ };
+ 
+ #ifdef CPTCFG_ATH12K_DEBUGFS
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+index 48bb99a99f95..01f8a8c7ea1f 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -943,6 +943,12 @@ static inline void ath12k_dp_get_mac_addr(u32 addr_l32, u16 addr_h16, u8 *addr)
+ 	memcpy(addr + 4, &addr_h16, ETH_ALEN - 4);
+ }
+ 
++static inline void ath12k_dp_mon_get_mac_addr(u16 addr_l16, u32 addr_h32, u8 *addr)
++{
++	memcpy(addr, &addr_l16, 2);
++	memcpy(addr + 2, &addr_h32, ETH_ALEN - 2);
++}
++
+ static inline struct ath12k_dp *
+ ath12k_dp_hw_grp_to_dp(struct ath12k_dp_hw_group *dp_hw_grp, u8 device_id)
+ {
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.c b/drivers/net/wireless/ath/ath12k/dp_mon.c
+index c1b9bd59f364..fc2f368ecbed 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -3750,21 +3750,18 @@ move_next:
+ 
+ 		rcu_read_lock();
+ 		spin_lock_bh(&dp->dp_lock);
+-		peer = ath12k_dp_link_peer_find_by_id(dp, ppdu_info->peer_id);
+ 
+ 		if (!list_empty(&dp->neighbor_peers)) {
+-			if (peer && !peer->sta) {
+-				list_for_each_entry_safe(nrp, tmp, &dp->neighbor_peers, list) {
+-					if (nrp->is_filter_on && ether_addr_equal(nrp->addr, peer->addr)) {
+-						nrp->rssi = ppdu_info->rssi_comb;
+-						nrp->timestamp = ktime_to_ms(ktime_get_real());
+-						complete(&nrp->filter_done);
+-					}
++			list_for_each_entry_safe(nrp, tmp, &dp->neighbor_peers, list) {
++				if (ether_addr_equal(nrp->addr, ppdu_info->addr2)) {
++					nrp->rssi = ppdu_info->rssi_comb;
++					nrp->timestamp = ktime_to_ms(ktime_get_real());
++					goto next_skb;
+ 				}
+-				goto next_skb;
+ 			}
+ 		}
+ 
++		peer = ath12k_dp_link_peer_find_by_id(dp, ppdu_info->peer_id);
+ 		if (!peer || !peer->sta) {
+ 			ath12k_dbg(ab, ATH12K_DBG_DATA,
+ 				   "failed to find the peer with monitor peer_id %d\n",
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 54b874b6c334..2918a7770e37 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -6578,16 +6578,19 @@ static int ath12k_mac_initiate_hw_scan(struct ieee80211_hw *hw,
+ 	}
+ 
+ 	if (n_channels) {
+-		arg->num_chan = n_channels;
+-		arg->chan_list = kcalloc(arg->num_chan, sizeof(*arg->chan_list),
+-					 GFP_KERNEL);
+-		if (!arg->chan_list) {
++		arg->chan_list.num_chan = n_channels;
++		arg->chan_list.chan = kcalloc(arg->chan_list.num_chan,
++					      sizeof(struct chan_info),
++					      GFP_KERNEL);
++
++		if (!arg->chan_list.chan) {
+ 			ret = -ENOMEM;
+ 			goto exit;
+ 		}
+ 
+-		for (i = 0; i < arg->num_chan; i++)
+-			arg->chan_list[i] = req->channels[i + from_index]->center_freq;
++		struct chan_info *chan = &arg->chan_list.chan[0];
++		for (i = 0; i < arg->chan_list.num_chan; i++)
++			chan[i].freq = req->channels[i + from_index]->center_freq;
+ 	}
+ 
+ 	/* if duration is set, default dwell times will be overwritten */
+@@ -6636,7 +6639,7 @@ static int ath12k_mac_initiate_hw_scan(struct ieee80211_hw *hw,
+ 
+ exit:
+ 	if (arg) {
+-		kfree(arg->chan_list);
++		kfree(arg->chan_list.chan);
+ 		kfree(arg->extraie.ptr);
+ 		kfree(arg);
+ 	}
+@@ -8713,15 +8716,11 @@ static int ath12k_mac_station_add(struct ath12k *ar,
+ 				  struct ath12k_link_sta *arsta)
+ {
+ 	struct ath12k_base *ab = ar->ab;
+-	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+ 	struct ath12k_vif *ahvif = arvif->ahvif;
+ 	struct ieee80211_vif *vif = ath12k_ahvif_to_vif(ahvif);
+ 	struct ieee80211_sta *sta = ath12k_ahsta_to_sta(arsta->ahsta);
+ 	struct ath12k_wmi_peer_create_arg peer_param = {0};
+-	struct ath12k_neighbor_peer *nrp, *tmp;
+-	int nvdev_id;
+ 	int ret;
+-	bool del_nrp = false;
+ 
+ 	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
+ 
+@@ -8757,32 +8756,6 @@ static int ath12k_mac_station_add(struct ath12k *ar,
+ 	}
+ 	peer_param.ml_enabled = sta->mlo;
+ 
+-	/*
+-	 * When the neighbor peer associates with this AP and successfully
+-	 * becomes a station, check and clear the corresponding MAC from
+-	 * NRP list and failing to do so would inadvertently cause the
+-	 * STA association(peer creation for STA) to fail due to the NRP
+-	 * having created a peer already for the same MAC address
+-	 */
+-	if (!list_empty(&dp->neighbor_peers)) {
+-		spin_lock_bh(&ab->base_lock);
+-		list_for_each_entry_safe(nrp, tmp, &dp->neighbor_peers, list) {
+-			if (ether_addr_equal(nrp->addr, arsta->addr)) {
+-				nvdev_id = nrp->vdev_id;
+-				list_del(&nrp->list);
+-				kfree(nrp);
+-				del_nrp = true;
+-				break;
+-			}
+-		}
+-		spin_unlock_bh(&ab->base_lock);
+-
+-		if (del_nrp) {
+-			ath12k_peer_delete(ar, nvdev_id, arsta->addr);
+-			ath12k_debugfs_nrp_clean(ar, arsta->addr);
+-		}
+-	}
+-
+ 	ret = ath12k_peer_create(ar, arvif, sta, &peer_param);
+ 	if (ret) {
+ 		ath12k_warn(ab, "Failed to add peer: %pM for VDEV: %d\n",
+@@ -17375,14 +17348,16 @@ EXPORT_SYMBOL(ath12k_mac_op_cancel_remain_on_channel);
+ 
+ int ath12k_mac_op_remain_on_channel(struct ieee80211_hw *hw,
+ 				    struct ieee80211_vif *vif,
+-				    struct ieee80211_channel *chan,
++				    struct cfg80211_chan_def *chandef,
+ 				    int duration,
+ 				    enum ieee80211_roc_type type)
+ {
+ 	struct ath12k_vif *ahvif = ath12k_vif_to_ahvif(vif);
+ 	struct ath12k_hw *ah = ath12k_hw_to_ah(hw);
+ 	struct ath12k_link_vif *arvif;
++	struct ath12k_base *ab;
+ 	struct ath12k *ar;
++	struct ieee80211_channel *chan;
+ 	u32 scan_time_msec;
+ 	bool create = true;
+ 	u8 link_id;
+@@ -17390,10 +17365,23 @@ int ath12k_mac_op_remain_on_channel(struct ieee80211_hw *hw,
+ 
+ 	lockdep_assert_wiphy(hw->wiphy);
+ 
++	if (!chandef || !chandef->chan) {
++		ath12k_err(NULL, "%s: null chandef!\n", __func__);
++		return -EINVAL;
++	}
++
++	chan = chandef->chan;
+ 	ar = ath12k_mac_select_scan_device(hw, vif, chan->center_freq);
+ 	if (!ar)
+ 		return -EINVAL;
+ 
++	ab = ar->ab;
++	if (!test_bit(WMI_TLV_SERVICE_SCAN_PHYMODE_SUPPORT,
++		      ab->wmi_ab.svc_map)) {
++		ath12k_err(ab, "ROC feature not supported!\n");
++		return -EOPNOTSUPP;
++	}
++
+ 	/* check if any of the links of ML VIF is already started on
+ 	 * radio(ar) correpsondig to given scan frequency and use it,
+ 	 * if not use deflink(link 0) for scan purpose.
+@@ -17430,7 +17418,7 @@ int ath12k_mac_op_remain_on_channel(struct ieee80211_hw *hw,
+ 
+ 		ret = ath12k_mac_vdev_create(ar, arvif, false);
+ 		if (ret) {
+-			ath12k_warn(ar->ab, "unable to create scan vdev for roc: %d\n",
++			ath12k_warn(ab, "unable to create scan vdev for roc: %d\n",
+ 				    ret);
+ 			return ret;
+ 		}
+@@ -17459,8 +17447,10 @@ int ath12k_mac_op_remain_on_channel(struct ieee80211_hw *hw,
+ 
+ 	spin_unlock_bh(&ar->data_lock);
+ 
+-	if (ret)
++	if (ret) {
++		ath12k_warn(ab, "roc scan state %d, not idle\n", ar->scan.state);
+ 		return ret;
++	}
+ 
+ 	scan_time_msec = hw->wiphy->max_remain_on_channel_duration * 2;
+ 
+@@ -17470,17 +17460,33 @@ int ath12k_mac_op_remain_on_channel(struct ieee80211_hw *hw,
+ 		return -ENOMEM;
+ 
+ 	ath12k_wmi_start_scan_init(ar, arg);
+-	arg->num_chan = 1;
+ 
+-	u32 *chan_list __free(kfree) = kcalloc(arg->num_chan, sizeof(*chan_list),
+-					       GFP_KERNEL);
+-	if (!chan_list)
++	arg->chan_list.num_chan = 1;
++	struct chan_info *chaninfo __free(kfree) = kcalloc(arg->chan_list.num_chan,
++							   sizeof(struct chan_info),
++							   GFP_KERNEL);
++	if (!chaninfo) {
++		ath12k_err(ab, "chan list memory allocation failed\n");
+ 		return -ENOMEM;
++	}
++
++	arg->chan_list.chan = chaninfo;
++	arg->chan_list.chan[0].freq = chan->center_freq;
++	arg->chan_list.chan[0].phymode = ath12k_phymodes[chandef->chan->band][chandef->width];
++
++	/* Wide Band Scan is required for bandwidth > 20_NoHT mode */
++	if (chandef->width > NL80211_CHAN_WIDTH_20_NOHT) {
++		arg->scan_f_wide_band = true;
++		arg->chandef = chandef;
++		ret = ath12k_wmi_update_scan_chan_list(ar, arg);
++		if (ret) {
++			ath12k_err(ab,"unable to update scan list:%d\n", ret);
++			return ret;
++		}
++	}
+ 
+-	arg->chan_list = chan_list;
+ 	arg->vdev_id = arvif->vdev_id;
+ 	arg->scan_id = ATH12K_SCAN_ID;
+-	arg->chan_list[0] = chan->center_freq;
+ 	arg->dwell_time_active = scan_time_msec;
+ 	arg->dwell_time_passive = scan_time_msec;
+ 	arg->max_scan_time = scan_time_msec;
+@@ -18504,6 +18510,9 @@ static int ath12k_mac_hw_register(struct ath12k_hw *ah)
+ 		wiphy_ext_feature_set(wiphy,
+ 				      NL80211_EXT_FEATURE_ENABLE_FTM_RESPONDER);
+ 
++	if (test_bit(WMI_TLV_SERVICE_SCAN_PHYMODE_SUPPORT, ar->ab->wmi_ab.svc_map))
++		ieee80211_hw_set(hw, SUPPORTS_EXT_REMAIN_ON_CHAN);
++
+ 	ath12k_reg_init(hw);
+ 
+ 	if (!is_raw_mode) {
+diff --git a/drivers/net/wireless/ath/ath12k/mac.h b/drivers/net/wireless/ath/ath12k/mac.h
+index c0d3bbd6a707..ce39577a9b7d 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -304,7 +304,7 @@ void ath12k_mac_op_sta_statistics(struct ieee80211_hw *hw,
+ 				  struct station_info *sinfo);
+ int ath12k_mac_op_remain_on_channel(struct ieee80211_hw *hw,
+ 				    struct ieee80211_vif *vif,
+-				    struct ieee80211_channel *chan,
++				    struct cfg80211_chan_def *chandef,
+ 				    int duration,
+ 				    enum ieee80211_roc_type type);
+ int ath12k_mac_op_cancel_remain_on_channel(struct ieee80211_hw *hw,
+diff --git a/drivers/net/wireless/ath/ath12k/reg.c b/drivers/net/wireless/ath/ath12k/reg.c
+index 1e6e5454f790..d90b4b6d620d 100644
+--- a/drivers/net/wireless/ath/ath12k/reg.c
++++ b/drivers/net/wireless/ath/ath12k/reg.c
+@@ -179,14 +179,7 @@ ath12k_reg_notifier(struct wiphy *wiphy, struct regulatory_request *request)
+ 
+ int ath12k_reg_update_chan_list(struct ath12k *ar, bool wait)
+ {
+-	struct ieee80211_supported_band **bands;
+-	struct ath12k_wmi_scan_chan_list_arg *arg;
+-	struct ieee80211_channel *channel;
+-	struct ieee80211_hw *hw = ath12k_ar_to_hw(ar);
+-	struct ath12k_wmi_channel_arg *ch;
+-	enum nl80211_band band;
+-	int num_channels = 0;
+-	int i, ret, left;
++	int left;
+ 
+ 	if (wait && ar->state_11d != ATH12K_11D_IDLE) {
+ 		left = wait_for_completion_timeout(&ar->completed_11d_scan,
+@@ -216,89 +209,7 @@ int ath12k_reg_update_chan_list(struct ath12k *ar, bool wait)
+ 	if (ar->ah->state == ATH12K_HW_STATE_RESTARTING)
+ 		return 0;
+ 
+-	bands = hw->wiphy->bands;
+-	for (band = 0; band < NUM_NL80211_BANDS; band++) {
+-		if (!(ar->mac.sbands[band].channels && bands[band]))
+-			continue;
+-
+-		for (i = 0; i < bands[band]->n_channels; i++) {
+-			if (bands[band]->channels[i].flags &
+-			    IEEE80211_CHAN_DISABLED)
+-				continue;
+-
+-			num_channels++;
+-		}
+-	}
+-
+-	if (!num_channels) {
+-		ath12k_warn(ar->ab, "pdev is not supported for this country\n");
+-		return -EOPNOTSUPP;
+-	}
+-
+-	arg = kzalloc(struct_size(arg, channel, num_channels), GFP_KERNEL);
+-
+-	if (!arg)
+-		return -ENOMEM;
+-
+-	arg->pdev_id = ar->pdev->pdev_id;
+-	arg->nallchans = num_channels;
+-
+-	ch = arg->channel;
+-
+-	for (band = 0; band < NUM_NL80211_BANDS; band++) {
+-		if (!(ar->mac.sbands[band].channels && bands[band]))
+-			continue;
+-
+-		for (i = 0; i < bands[band]->n_channels; i++) {
+-			channel = &bands[band]->channels[i];
+-
+-			if (channel->flags & IEEE80211_CHAN_DISABLED)
+-				continue;
+-
+-			/* TODO: Set to true/false based on some condition? */
+-			ch->allow_ht = true;
+-			ch->allow_vht = true;
+-			ch->allow_he = true;
+-
+-			ch->dfs_set =
+-				!!(channel->flags & IEEE80211_CHAN_RADAR);
+-			ch->is_chan_passive = !!(channel->flags &
+-						IEEE80211_CHAN_NO_IR);
+-			ch->is_chan_passive |= ch->dfs_set;
+-			ch->mhz = channel->center_freq;
+-			ch->cfreq1 = channel->center_freq;
+-			ch->minpower = 0;
+-			ch->maxpower = channel->max_power * 2;
+-			ch->maxregpower = channel->max_reg_power * 2;
+-			ch->antennamax = channel->max_antenna_gain * 2;
+-
+-			/* TODO: Use appropriate phymodes */
+-			if (channel->band == NL80211_BAND_2GHZ)
+-				ch->phy_mode = MODE_11G;
+-			else
+-				ch->phy_mode = MODE_11A;
+-
+-			if (channel->band == NL80211_BAND_6GHZ &&
+-			    cfg80211_channel_is_psc(channel))
+-				ch->psc_channel = true;
+-
+-			ath12k_dbg(ar->ab, ATH12K_DBG_WMI,
+-				   "mac channel [%d/%d] freq %d maxpower %d regpower %d antenna %d mode %d\n",
+-				   i, arg->nallchans,
+-				   ch->mhz, ch->maxpower, ch->maxregpower,
+-				   ch->antennamax, ch->phy_mode);
+-
+-			ch++;
+-			/* TODO: use quarrter/half rate, cfreq12, dfs_cfreq2
+-			 * set_agile, reg_class_idx
+-			 */
+-		}
+-	}
+-
+-	ret = ath12k_wmi_send_scan_chan_list_cmd(ar, arg);
+-	kfree(arg);
+-
+-	return ret;
++	return ath12k_wmi_update_scan_chan_list(ar, NULL);
+ }
+ 
+ static void ath12k_copy_regd(struct ieee80211_regdomain *regd_orig,
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.c b/drivers/net/wireless/ath/ath12k/wmi.c
+index 1f19c3d448e2..1c29ad8ee65f 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -3121,6 +3121,117 @@ send:
+ 	return ret;
+ }
+ 
++int ath12k_wmi_update_scan_chan_list(struct ath12k *ar,
++				     struct ath12k_wmi_scan_req_arg *req_arg)
++{
++	struct ieee80211_supported_band **bands;
++	struct ath12k_wmi_scan_chan_list_arg *arg;
++	struct cfg80211_chan_def *chandef;
++	struct ieee80211_channel *channel, *req_channel;
++	struct ieee80211_hw *hw = ar->ah->hw;
++	struct ath12k_wmi_channel_arg *ch;
++	enum nl80211_band band;
++	int num_channels = 0;
++	int i, ret;
++	bool found = false;
++
++	bands = hw->wiphy->bands;
++	for (band = 0; band < NUM_NL80211_BANDS; band++) {
++		if (!(ar->mac.sbands[band].channels && bands[band]))
++			continue;
++
++		for (i = 0; i < bands[band]->n_channels; i++) {
++			if (bands[band]->channels[i].flags &
++			    IEEE80211_CHAN_DISABLED)
++				continue;
++
++			num_channels++;
++		}
++	}
++
++	if (!num_channels) {
++		ath12k_warn(ar->ab, "pdev is not supported for this country\n");
++		return -ENOTSUPP;
++	}
++
++	arg = kzalloc(struct_size(arg, channel, num_channels), GFP_KERNEL);
++
++	if (!arg)
++		return -ENOMEM;
++
++	arg->pdev_id = ar->pdev->pdev_id;
++	arg->nallchans = num_channels;
++	arg->append_chan_list = true;
++
++	ch = arg->channel;
++	chandef = req_arg ? req_arg->chandef : NULL;
++	req_channel = chandef ? chandef->chan : NULL;
++
++	for (band = 0; band < NUM_NL80211_BANDS; band++) {
++		if (!(ar->mac.sbands[band].channels && bands[band]))
++			continue;
++
++		for (i = 0; i < bands[band]->n_channels; i++) {
++			channel = &bands[band]->channels[i];
++
++			if (channel->flags & IEEE80211_CHAN_DISABLED)
++				continue;
++
++                       if (req_channel && !found &&
++                           req_channel->center_freq == channel->center_freq) {
++                               ch->mhz = req_arg->chan_list.chan[0].freq;
++                               ch->cfreq1 = chandef->center_freq1;
++                               ch->cfreq2 = chandef->center_freq2;
++
++                               ch->phy_mode = req_arg->chan_list.chan[0].phymode;
++                               channel = req_channel;
++                               found = true;
++                       } else {
++                               ch->mhz = channel->center_freq;
++                               ch->cfreq1 = channel->center_freq;
++                               ch->phy_mode = (channel->band == NL80211_BAND_2GHZ) ?
++                                               MODE_11G : MODE_11A;
++                       }
++
++			/* TODO: Set to true/false based on some condition? */
++			ch->allow_ht = true;
++			ch->allow_vht = true;
++			ch->allow_he = true;
++
++			ch->dfs_set =
++				!!(channel->flags & IEEE80211_CHAN_RADAR);
++			ch->is_chan_passive = !!(channel->flags &
++						IEEE80211_CHAN_NO_IR);
++			ch->is_chan_passive |= ch->dfs_set;
++			ch->minpower = 0;
++			ch->maxpower = channel->max_power * 2;
++			ch->maxregpower = channel->max_reg_power * 2;
++			ch->antennamax = channel->max_antenna_gain * 2;
++
++			if (channel->band == NL80211_BAND_6GHZ &&
++			    cfg80211_channel_is_psc(channel))
++				ch->psc_channel = true;
++
++			ath12k_dbg(ar->ab, ATH12K_DBG_WMI,
++				   "mac channel [%d/%d] freq %d maxpower %d "
++				   "regpower %d antenna %d cfreq1 %d mode %d\n",
++				   i, arg->nallchans,
++				   ch->mhz, ch->maxpower, ch->maxregpower,
++				   ch->antennamax, ch->cfreq1, ch->phy_mode);
++
++			ch++;
++			/* TODO: use quarrter/half rate, cfreq12, dfs_cfreq2
++			 * set_agile, reg_class_idx
++			 */
++		}
++	}
++
++	ret = ath12k_wmi_send_scan_chan_list_cmd(ar, arg);
++	kfree(arg);
++
++	return ret;
++}
++
+ void ath12k_wmi_start_scan_init(struct ath12k *ar,
+ 				struct ath12k_wmi_scan_req_arg *arg)
+ {
+@@ -3227,6 +3338,8 @@ static void ath12k_wmi_copy_scan_event_cntrl_flags(struct wmi_start_scan_cmd *cm
+ 	if (arg->scan_f_en_ie_whitelist_in_probe)
+ 		cmd->scan_ctrl_flags |=
+ 			cpu_to_le32(WMI_SCAN_ENABLE_IE_WHTELIST_IN_PROBE_REQ);
++	if (arg->scan_f_higher_mcs_nac_scan)
++		cmd->scan_ctrl_flags |= cpu_to_le32(WMI_SCAN_FLAG_HIGHER_MCS_NAC_SCAN);
+ 
+ 	cmd->scan_ctrl_flags |= le32_encode_bits(arg->adaptive_dwell_time_mode,
+ 						 WMI_SCAN_DWELL_MODE_MASK);
+@@ -3236,6 +3349,8 @@ int ath12k_wmi_send_scan_start_cmd(struct ath12k *ar,
+ 				   struct ath12k_wmi_scan_req_arg *arg)
+ {
+ 	struct ath12k_wmi_pdev *wmi = ar->wmi;
++	struct ath12k_base *ab = ar->ab;
++	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+ 	struct wmi_start_scan_cmd *cmd;
+ 	struct ath12k_wmi_ssid_params *ssid = NULL;
+ 	struct ath12k_wmi_mac_addr_params *bssid;
+@@ -3244,14 +3359,16 @@ int ath12k_wmi_send_scan_start_cmd(struct ath12k *ar,
+ 	void *ptr;
+ 	int i, ret, len;
+ 	u32 *tmp_ptr, extraie_len_with_pad = 0;
++	u8 *phy_ptr;
+ 	struct ath12k_wmi_hint_short_ssid_arg *s_ssid = NULL;
+ 	struct ath12k_wmi_hint_bssid_arg *hint_bssid = NULL;
++	u8 phymode_roundup = 0;
+ 
+ 	len = sizeof(*cmd);
+ 
+ 	len += TLV_HDR_SIZE;
+-	if (arg->num_chan)
+-		len += arg->num_chan * sizeof(u32);
++	if (arg->chan_list.num_chan)
++		len += arg->chan_list.num_chan * sizeof(u32);
+ 
+ 	len += TLV_HDR_SIZE;
+ 	if (arg->num_ssids)
+@@ -3281,6 +3398,18 @@ int ath12k_wmi_send_scan_start_cmd(struct ath12k *ar,
+ 		extraie_len_with_pad = 0;
+ 	}
+ 
++	len += TLV_HDR_SIZE;
++	if (arg->scan_f_en_ie_whitelist_in_probe)
++		len += arg->ie_whitelist.num_vendor_oui *
++				sizeof(struct wmi_vendor_oui);
++
++	len += TLV_HDR_SIZE;
++	if (arg->scan_f_wide_band)
++		phymode_roundup =
++			roundup(arg->chan_list.num_chan * sizeof(u8),
++				sizeof(u32));
++	len += phymode_roundup;
++
+ 	skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, len);
+ 	if (!skb)
+ 		return -ENOMEM;
+@@ -3300,6 +3429,12 @@ int ath12k_wmi_send_scan_start_cmd(struct ath12k *ar,
+ 		arg->scan_priority = WMI_SCAN_PRIORITY_LOW;
+ 	cmd->notify_scan_events = cpu_to_le32(arg->notify_scan_events);
+ 
++	/* Set NAC scan flag if any NRP is set already */
++	spin_lock_bh(&dp->dp_lock);
++	if (arg->scan_f_wide_band && !list_empty(&dp->neighbor_peers))
++		arg->scan_f_higher_mcs_nac_scan = true;
++	spin_unlock_bh(&dp->dp_lock);
++
+ 	ath12k_wmi_copy_scan_event_cntrl_flags(cmd, arg);
+ 
+ 	cmd->dwell_time_active = cpu_to_le32(arg->dwell_time_active);
+@@ -3315,7 +3450,7 @@ int ath12k_wmi_send_scan_start_cmd(struct ath12k *ar,
+ 	cmd->max_scan_time = cpu_to_le32(arg->max_scan_time);
+ 	cmd->probe_delay = cpu_to_le32(arg->probe_delay);
+ 	cmd->burst_duration = cpu_to_le32(arg->burst_duration);
+-	cmd->num_chan = cpu_to_le32(arg->num_chan);
++	cmd->num_chan = cpu_to_le32(arg->chan_list.num_chan);
+ 	cmd->num_bssid = cpu_to_le32(arg->num_bssid);
+ 	cmd->num_ssids = cpu_to_le32(arg->num_ssids);
+ 	cmd->ie_len = cpu_to_le32(arg->extraie.len);
+@@ -3323,14 +3458,15 @@ int ath12k_wmi_send_scan_start_cmd(struct ath12k *ar,
+ 
+ 	ptr += sizeof(*cmd);
+ 
+-	len = arg->num_chan * sizeof(u32);
++	len = arg->chan_list.num_chan * sizeof(u32);
+ 
+ 	tlv = ptr;
+ 	tlv->header = ath12k_wmi_tlv_hdr(WMI_TAG_ARRAY_UINT32, len);
+ 	ptr += TLV_HDR_SIZE;
+ 	tmp_ptr = (u32 *)ptr;
+ 
+-	memcpy(tmp_ptr, arg->chan_list, arg->num_chan * 4);
++	for (i = 0; i < arg->chan_list.num_chan; ++i)
++		tmp_ptr[i] = arg->chan_list.chan[i].freq;
+ 
+ 	ptr += len;
+ 
+@@ -3379,6 +3515,36 @@ int ath12k_wmi_send_scan_start_cmd(struct ath12k *ar,
+ 
+ 	ptr += extraie_len_with_pad;
+ 
++       len = arg->ie_whitelist.num_vendor_oui * sizeof(struct wmi_vendor_oui);
++       tlv = ptr;
++       tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_STRUCT) |
++                     FIELD_PREP(WMI_TLV_LEN, len);
++       ptr += TLV_HDR_SIZE;
++
++       if (arg->scan_f_en_ie_whitelist_in_probe) {
++               /* TODO: fill vendor OUIs for probe req ie whitelisting */
++               /* currently added for FW TLV validation */
++       }
++
++       ptr += cmd->num_vendor_oui * sizeof(struct wmi_vendor_oui);
++
++       len = phymode_roundup;
++       tlv = ptr;
++       tlv->header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_ARRAY_BYTE) |
++                     FIELD_PREP(WMI_TLV_LEN, len);
++       ptr += TLV_HDR_SIZE;
++
++       /* Wide Band Scan */
++       if (arg->scan_f_wide_band) {
++               phy_ptr = ptr;
++               /* Add PHY mode TLV for wide band scan with phymode + 1 value
++                * so that phymode '0' is ignored by FW as default value.
++                */
++               for (i = 0; i < arg->chan_list.num_chan; ++i)
++                       phy_ptr[i] = arg->chan_list.chan[i].phymode + 1;
++       }
++       ptr += phymode_roundup;
++
+ 	if (arg->num_hint_s_ssid) {
+ 		len = arg->num_hint_s_ssid * sizeof(*s_ssid);
+ 		tlv = ptr;
+@@ -3563,12 +3729,12 @@ int ath12k_wmi_send_scan_chan_list_cmd(struct ath12k *ar,
+ 							 sizeof(*cmd));
+ 		cmd->pdev_id = cpu_to_le32(arg->pdev_id);
+ 		cmd->num_scan_chans = cpu_to_le32(num_send_chans);
+-		if (num_sends)
++		if (num_sends || arg->append_chan_list)
+ 			cmd->flags |= cpu_to_le32(WMI_APPEND_TO_EXISTING_CHAN_LIST_FLAG);
+ 
+ 		ath12k_dbg(ar->ab, ATH12K_DBG_WMI,
+-			   "WMI no.of chan = %d len = %d pdev_id = %d num_sends = %d\n",
+-			   num_send_chans, len, cmd->pdev_id, num_sends);
++			   "WMI no.of chan = %d len = %d pdev_id = %d num_sends = %d append_chan_list %d\n",
++			   num_send_chans, len, cmd->pdev_id, num_sends, arg->append_chan_list);
+ 
+ 		ptr = skb->data + sizeof(*cmd);
+ 
+@@ -14563,3 +14729,38 @@ int ath12k_wmi_send_wsi_stats_info(struct ath12k *ar,
+ 
+ 	return ret;
+ }
++
++int ath12k_wmi_vdev_set_neighbor_rx_cmd(struct ath12k *ar,
++					struct ath12k_set_neighbor_rx_params *param)
++{
++	struct ath12k_wmi_pdev *wmi = ar->wmi;
++	struct wmi_vdev_set_neighbor_rx_cmd *cmd;
++	struct sk_buff *skb;
++	int ret;
++
++	skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, sizeof(*cmd));
++	if (!skb)
++		return -ENOMEM;
++
++	cmd = (struct wmi_vdev_set_neighbor_rx_cmd *)skb->data;
++	cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_VDEV_FILTER_NRP_CONFIG_CMD,
++						(sizeof(*cmd)));
++	cmd->vdev_id = cpu_to_le32(param->vdev_id);
++	cmd->action = cpu_to_le32(param->action);
++	cmd->type = WMI_FILTER_NRP_TYPE_STA_MACADDR;
++	cmd->bssid_idx = cpu_to_le32(1);
++	ether_addr_copy(cmd->macaddr.addr, param->nrp_addr);
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_WMI,
++		   "WMI set nrp config vdev_id %d action %d nrp mac %pM\n",
++		   cmd->vdev_id, cmd->action, param->nrp_addr);
++
++	ret = ath12k_wmi_cmd_send(wmi, skb, WMI_VDEV_FILTER_NEIGHBOR_RX_PACKETS_CMDID);
++	if (ret) {
++		ath12k_warn(ar->ab,
++			    "failed to send VDEV_FILTER_NEIGHBOR_RX_PACKETS_CMDID cmd\n");
++		dev_kfree_skb(skb);
++	}
++
++	return ret;
++}
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.h b/drivers/net/wireless/ath/ath12k/wmi.h
+index f719c8d713ca..0769c65543e7 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -3681,6 +3681,12 @@ struct ath12k_wmi_element_info_arg {
+ };
+ 
+ #define WMI_IE_BITMAP_SIZE             8
++#define PROBE_REQ_MAX_OUIS            16
++
++struct wmi_vendor_oui {
++	u32 tlv_header;
++	u32 oui_type_subtype; /* vendor OUI type and subtype */
++};
+ 
+ #define WMI_SCAN_MAX_NUM_SSID                0x0A
+ /* prefix used by scan requestor ids on the host */
+@@ -3790,6 +3796,9 @@ struct  wmi_start_scan_cmd {
+ #define WMI_SCAN_RANDOM_SEQ_NO_IN_PROBE_REQ 0x80000
+ #define WMI_SCAN_ENABLE_IE_WHTELIST_IN_PROBE_REQ 0x100000
+ 
++/* Report Neighbour RX Packets for NAC(Non-Associated Client) */
++#define WMI_SCAN_FLAG_HIGHER_MCS_NAC_SCAN           0x4000000
++
+ #define WMI_SCAN_DWELL_MODE_MASK GENMASK(23, 21)
+ 
+ enum {
+@@ -3810,6 +3819,22 @@ struct ath12k_wmi_hint_bssid_arg {
+ 	struct ath12k_wmi_mac_addr_params bssid;
+ };
+ 
++struct ath12k_wmi_probe_req_whitelist {
++	u32 ie_bitmap[WMI_IE_BITMAP_SIZE];
++	u32 num_vendor_oui;
++	u32 voui[PROBE_REQ_MAX_OUIS];
++};
++
++struct chan_info {
++	u32 freq;
++	u32 phymode;
++};
++
++struct chan_list {
++	u32 num_chan;
++	struct chan_info *chan;
++};
++
+ struct ath12k_wmi_scan_req_arg {
+ 	u32 scan_id;
+ 	u32 scan_req_id;
+@@ -3865,15 +3890,18 @@ struct ath12k_wmi_scan_req_arg {
+ 	    scan_f_forced:1,
+ 	    scan_f_2ghz:1,
+ 	    scan_f_5ghz:1,
+-	    scan_f_80mhz:1;
++	    scan_f_80mhz:1,
++	    scan_f_wide_band:1,
++	    scan_f_higher_mcs_nac_scan:1;
+ 	enum scan_dwelltime_adaptive_mode adaptive_dwell_time_mode;
+ 	u32 burst_duration;
+ 	u32 num_chan;
+ 	u32 num_bssid;
+ 	u32 num_ssids;
+ 	u32 n_probes;
+-	u32 *chan_list;
++	struct chan_list chan_list;
+ 	u32 notify_scan_events;
++	struct cfg80211_chan_def *chandef;
+ 	struct cfg80211_ssid ssid[WLAN_SCAN_MAX_NUM_SSID];
+ 	struct ath12k_wmi_mac_addr_params bssid_list[WLAN_SCAN_MAX_NUM_BSSID];
+ 	struct ath12k_wmi_element_info_arg extraie;
+@@ -3881,6 +3909,7 @@ struct ath12k_wmi_scan_req_arg {
+ 	u32 num_hint_bssid;
+ 	struct ath12k_wmi_hint_short_ssid_arg hint_s_ssid[WLAN_SCAN_MAX_HINT_S_SSID];
+ 	struct ath12k_wmi_hint_bssid_arg hint_bssid[WLAN_SCAN_MAX_HINT_BSSID];
++	struct ath12k_wmi_probe_req_whitelist ie_whitelist;
+ };
+ 
+ struct wmi_ssid_arg {
+@@ -4347,6 +4376,7 @@ struct wmi_stop_scan_cmd {
+ struct ath12k_wmi_scan_chan_list_arg {
+ 	u32 pdev_id;
+ 	u16 nallchans;
++	bool append_chan_list;
+ 	struct ath12k_wmi_channel_arg channel[];
+ };
+ 
+@@ -7781,6 +7811,39 @@ struct wmi_mlo_pri_link_peer_migr_compl_event {
+ 	struct wmi_mlo_primary_link_peer_migration_status *peer_info[100];
+ };
+ 
++enum wmi_filter_nrp_action {
++	WMI_FILTER_NRP_ACTION_ADD        = 0x1,
++	WMI_FILTER_NRP_ACTION_REMOVE     = 0x2,
++	WMI_FILTER_NRP_ACTION_GET_LIST   = 0x3,
++};
++
++enum wmi_filter_nrp_type {
++	WMI_FILTER_NRP_TYPE_AP_BSSID     = 0x1,
++	WMI_FILTER_NRP_TYPE_STA_MACADDR  = 0x2,
++};
++
++enum wmi_filter_nrp_flag {
++	WMI_FILTER_NRP_CAPTURE_ONLY_RX_PACKETS      = 0x1,
++	WMI_FILTER_NRP_CAPTURE_ONLY_TX_PACKETS      = 0x2,
++	WMI_FILTER_NRP_CAPTURE_BOTH_TXRX_PACKETS    = 0x3,
++};
++
++struct wmi_vdev_set_neighbor_rx_cmd {
++	__le32 tlv_header;
++	__le32 vdev_id;
++	struct ath12k_wmi_mac_addr_params macaddr;
++	__le32 action;
++	__le32 type;
++	__le32 flag;
++	__le32 bssid_idx;
++} __packed;
++
++struct ath12k_set_neighbor_rx_params {
++	u32 vdev_id;
++	u32 action;
++	u8 nrp_addr[ETH_ALEN];
++};
++
+ int ath12k_wmi_cmd_send(struct ath12k_wmi_pdev *wmi, struct sk_buff *skb,
+ 			u32 cmd_id);
+ struct sk_buff *ath12k_wmi_alloc_skb(struct ath12k_wmi_base *wmi_sc, u32 len);
+@@ -7829,6 +7892,8 @@ void ath12k_wmi_start_scan_init(struct ath12k *ar,
+ 				struct ath12k_wmi_scan_req_arg *arg);
+ int ath12k_wmi_send_scan_start_cmd(struct ath12k *ar,
+ 				   struct ath12k_wmi_scan_req_arg *arg);
++int ath12k_wmi_update_scan_chan_list(struct ath12k *ar,
++				     struct ath12k_wmi_scan_req_arg *req_arg);
+ int ath12k_wmi_send_scan_stop_cmd(struct ath12k *ar,
+ 				  struct ath12k_wmi_scan_cancel_arg *arg);
+ int ath12k_wmi_send_wmm_update_cmd(struct ath12k *ar, u32 vdev_id,
+@@ -8005,6 +8070,8 @@ void ath12k_wmi_fw_stats_dump(struct ath12k *ar,
+ int ath12k_wmi_pdev_m3_dump_enable(struct ath12k *ar, u32 enable);
+ int ath12k_wmi_send_wsi_stats_info(struct ath12k *ar,
+ 				   struct ath12k_wmi_wsi_stats_info_param *param);
++int ath12k_wmi_vdev_set_neighbor_rx_cmd(struct ath12k *ar,
++					struct ath12k_set_neighbor_rx_params *param);
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ int ath12k_wmi_config_peer_ppeds_routing(struct ath12k *ar,
+ 					 const u8 *peer_addr, u8 vdev_id,
+-- 
+2.25.1
+

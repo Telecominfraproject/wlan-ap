@@ -1,0 +1,144 @@
+From 80c3d8f996a2ad307d3f2b0363b89ddd61c8c441 Mon Sep 17 00:00:00 2001
+From: Amith A <quic_amitajit@quicinc.com>
+Date: Tue, 5 Nov 2024 11:28:03 +0530
+Subject: [PATCH] QSDK:PROTOCOL:Add support for setting 00(Global mode) country
+ code
+
+1) When country code is set to 00, only 2GHz rules are received from the
+FW. 5GHz and 6GHz rules are null for country 00. When ath12k_regd_update
+is called for country 00, since the API updates the regd only using 6GHz
+rules, regd update never happens.
+
+To address this, add an exception for country code 00 to bypass waiting
+for 6GHz pdev and proceed with the regd_update with 2G pdev.
+
+2) After successfully setting country code to 00, an attempt to switch to
+a country that is the default_regd fails. This is because there is a check in
+ath12k_reg_handle_chan_list where new_regd is checked for NULL and the
+default_regd is compared with the new country. In case of country code
+00, the new_regd is not updated as regd update fails for 5GHz and 6GHz
+pdevs. Therefore, new_regd remains NULL and ath12k_reg_handle_chan_list
+returns a failure when the new country being set is same as the
+default_regd.
+
+To address this, add an exception for country code 00 to bypass this
+check and proceed with the regd update.
+
+Signed-off-by: Amith A <amitajit@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/reg.c | 30 +++++++++++++++------------
+ drivers/net/wireless/ath/ath12k/wmi.c | 21 ++++++++++++++++---
+ 2 files changed, 35 insertions(+), 16 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/reg.c
++++ b/drivers/net/wireless/ath/ath12k/reg.c
+@@ -346,19 +346,6 @@ int ath12k_regd_update(struct ath12k *ar
+ 	if (ah->regd_updated)
+ 		return 0;
+ 
+-	/* firmware provides reg rules which are similar for 2 GHz and 5 GHz
+-	 * pdev but 6 GHz pdev has superset of all rules including rules for
+-	 * all bands, we prefer 6 GHz pdev's rules to be used for setup of
+-	 * the wiphy regd.
+-	 * If 6 GHz pdev was part of the ath12k_hw, wait for the 6 GHz pdev,
+-	 * else pick the first pdev which calls this function and use its
+-	 * regd to update global hw regd.
+-	 * The regd_updated flag set at the end will not allow any further
+-	 * updates.
+-	 */
+-	if (ah->use_6ghz_regd && !ar->supports_6ghz)
+-		return 0;
+-
+ 	pdev_id = ar->pdev_idx;
+ 
+ 	spin_lock_bh(&ab->base_lock);
+@@ -386,6 +373,22 @@ int ath12k_regd_update(struct ath12k *ar
+ 		goto err;
+ 	}
+ 
++	/* firmware provides reg rules which are similar for 2 GHz and 5 GHz
++	 * pdev but 6 GHz pdev has superset of all rules including rules for
++	 * all bands, we prefer 6 GHz pdev's rules to be used for setup of
++	 * the wiphy regd.
++	 * If 6 GHz pdev was part of the ath12k_hw, wait for the 6 GHz pdev,
++	 * else pick the first pdev which calls this function and use its
++	 * regd to update global hw regd.
++	 * The regd_updated flag set at the end will not allow any further
++	 * updates.
++	 */
++	if (strncmp(regd->alpha2, "00", 2) &&
++	    (ah->use_6ghz_regd && !ar->supports_6ghz)) {
++		spin_unlock_bh(&ab->base_lock);
++		return 0;
++	}
++
+ 	regd_len = sizeof(*regd) + (regd->n_reg_rules *
+ 		sizeof(struct ieee80211_reg_rule));
+ 
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -7695,10 +7695,20 @@ static void ath12k_wmi_htc_tx_complete(s
+ 	}
+ }
+ 
++static inline bool
++ath12k_is_regd_alpha2_global_mode(const struct ieee80211_regdomain *regd)
++{
++	if (!regd)
++		return false;
++
++	return !strncmp(regd->alpha2, "00", 2);
++}
++
+ static int ath12k_reg_handle_chan_list(struct ath12k_base *ab,
+ 				       struct ath12k_reg_info *reg_info,
+ 				       enum ieee80211_ap_reg_power power_type)
+ {
++	const struct ieee80211_regdomain *wiphy_regd = NULL;
+ 	struct ieee80211_regdomain *regd;
+ 	int pdev_idx;
+ 	struct ath12k *ar;
+@@ -7726,13 +7736,24 @@ static int ath12k_reg_handle_chan_list(s
+ 			goto fallback;
+ 	}
+ 
++	ar = ab->pdevs[pdev_idx].ar;
++	rcu_read_lock();
++	if (ar)
++		wiphy_regd = rcu_dereference(ar->ah->hw->wiphy->regd);
++
+ 	/* Avoid multiple overwrites to default regd, during core
+-	 * stop-start after mac registration.
++	 * stop-start after mac registration. Also, add an exception when
++	 * the current regd in wiphy is 00.
+ 	 */
+-	if (ab->default_regd[pdev_idx] && !ab->new_regd[pdev_idx] &&
++	if (!ath12k_is_regd_alpha2_global_mode(wiphy_regd) &&
++	    ab->default_regd[pdev_idx] && !ab->new_regd[pdev_idx] &&
+ 	    !memcmp(ab->default_regd[pdev_idx]->alpha2,
+-		    reg_info->alpha2, 2))
++		    reg_info->alpha2, 2)) {
++		rcu_read_unlock();
+ 		goto retfail;
++	}
++
++	rcu_read_unlock();
+ 
+ 	regd = ath12k_reg_build_regd(ab, reg_info);
+ 	if (!regd) {
+@@ -7749,7 +7770,6 @@ static int ath12k_reg_handle_chan_list(s
+ 		 * generated regd to ar. NULL pointer handling will be
+ 		 * taken care by kfree itself.
+ 		 */
+-		ar = ab->pdevs[pdev_idx].ar;
+ 		kfree(ab->new_regd[pdev_idx]);
+ 		ab->new_regd[pdev_idx] = regd;
+ 		queue_work(ab->workqueue, &ar->regd_update_work);
+@@ -7784,7 +7804,6 @@ retfail:
+         return -EINVAL;
+ }
+ 
+-
+ static int ath12k_reg_chan_list_event(struct ath12k_base *ab, struct sk_buff *skb)
+ {
+        struct ath12k_reg_info *reg_info;

@@ -14,6 +14,7 @@
 # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
+. /lib/netifd/wireless/mac80211.sh
 
 sta_intf="$1"
 ap_intfs="$2"
@@ -22,60 +23,6 @@ dfs_log=1
 phy="$4"
 ml_link=""
 ap_ht_capab=$(cat $hostapd_conf 2> /dev/null | grep ht_capab | grep -v vht | cut -d'=' -f 2)
-ap_link_file="/tmp/ap_interface_link.txt"
-
-get_sta_freq_list() {
-	phy=$1
-	sta_freq=$2
-
-	hw_indices=$(iw phy ${phy} info | grep -e "channel list" | cut -d' ' -f 2)
-	if [ -z "$hw_indices" ]; then
-		return
-	fi
-
-	for i in $hw_indices
-	do
-		#fetch hw idx channels from phy info
-		hw_nchans=$(iw phy ${phy} info | awk -v p1="$i channel list" -v p2="$((i+1)) channel list"  ' $0 ~ p1{f=1;next} $0 ~ p2 {f=0} f')
-
-		for _b in `iw phy $phy info | grep 'Band ' | cut -d' ' -f 2`; do
-			expr="iw phy ${phy} info | awk  '/Band ${_b}/{ f = 1; next } /Band /{ f = 0 } f'"
-			expr_freq="$expr | awk '/Frequencies/,/valid /f'"
-			band_freq=$(eval ${expr_freq} | awk '{ print $2 }' | sed -e "s/\[//g" | sed -e "s/\]//g")
-
-			# band_freq list has the sta freq in it
-			if [[ "$band_freq" =~ "${sta_freq}" ]]; then
-				sta_chan=$(eval $expr_freq | grep -E -m1 "(\* ${sta_freq:-....} MHz${sta_freq:+|\\[$sta_freq\\]})" | grep MHz | awk '{print $4}' | sed -e "s/\[//g" | sed -e "s/\]//g")
-
-				#fetch band channels from phy info
-				band_nchans=$(echo $(eval ${expr_freq} | awk '{ print $4 }' | sed -e "s/\[//g" | sed -e "s/\]//g") | tr -d ' ')
-				hw_chans=$(echo $hw_nchans | tr -d ' ')
-
-				#check if the list is present in band info
-				if echo "$band_nchans" | grep -q "${hw_chans}";
-				then
-					found=false
-					for chan in $hw_nchans
-					do
-						if [[ "$chan" == "$sta_chan" ]]; then
-							found=true
-						fi
-					done
-					if [[ "$found" == "true" ]]; then
-						sta_freq_list=""
-						for chidx in ${hw_nchans}; do
-							frqs=$(eval $expr_freq | grep -E -m1 "(\* ${chidx:-....} MHz${chidx:+|\\[$chidx\\]})" | grep MHz | awk '{print $2}')
-							sta_freq_list="${sta_freq_list}${frqs} "
-						done
-						echo $sta_freq_list
-					fi
-				fi
-			else
-				continue;
-			fi
-		done
-	done
-}
 
 # Hostapd VHT and HE calculations
 hostapd_vht_he_eht_oper_chwidth() {
@@ -222,22 +169,152 @@ hostapd_ht20_mode() {
         hostapd_cli -i $ap_intf $ml_link set ht_capab $ht_capab_20 2> /dev/null
 }
 
+get_ap_ht_capab() {
+        sta_freq=$1
+        sta_radio_band_idx=$(ls /var/run/wpa_supplicant-*-updated-cfg | awk '{ print $1 }' | cut -f2 -d"-" | awk '{print substr($0,length,1)}')
+        for i in $sta_radio_band_idx
+        do
+                freq_list=$(cat /var/run/wpa_supplicant-radio${phy: -1}_band${i}-updated-cfg | grep freq_list | cut -d'=' -f 2)
+                highest_freq=$(echo "$freq_list" | awk '{print $NF}')
+                least_freq=$(echo "$freq_list" | cut -d ' ' -f1)
+                if [ "$sta_freq" -ge "$least_freq" ] && [ "$sta_freq" -le "$highest_freq" ]; then
+			hostapd_conf="/var/run/hostapd-${phy}_band$i.conf"
+			ap_ht_capab=$(cat $hostapd_conf 2> /dev/null | grep ht_capab | grep -v vht | cut -d'=' -f 2)
+                fi
+        done
+}
+
+hostapd_set_op_class() {
+    local freq=$1
+    local channel=$2
+    local width=$3
+    local intf=$4
+    local sec_channel=0
+    local vht_he_opclass=0
+
+    centre_freq=$(iw dev $intf info | grep $freq | awk '{print $9}')
+
+    # Determine sec_channel based on ap_ht_mode if width is 40
+    if [ "$width" -eq 40 ]; then
+	    if [ "$centre_freq" -gt "$freq" ]; then
+		    sec_channel=1
+	    elif [ "$centre_freq" -lt "$freq" ]; then
+		    sec_channel=-1
+	    else
+		    sec_channel=0
+	    fi
+    fi
+
+    # 2.4 GHz frequency range
+    if [ "$freq" -ge 2412 ] && [ "$freq" -le 2484 ]; then
+        if [ "$width" -eq 40 ]; then
+            case "$sec_channel" in
+                1) op_class=83 ;;
+                -1) op_class=84 ;;
+                *) op_class=81 ;;
+            esac
+        elif [ "$width" -eq 20 ]; then
+            if [ "$freq" -eq 2484 ]; then
+                op_class=82
+            else
+                op_class=81
+            fi
+        fi
+    fi
+
+    # 5 GHz frequency range
+    if [ "$freq" -ge 5180 ] && [ "$freq" -le 5885 ]; then
+        case "$width" in
+            80) vht_he_opclass=128 ;;  # 80 MHz
+            160) vht_he_opclass=129 ;;  # 160 MHz
+            "80+80") vht_he_opclass=130 ;;  # 80+80 MHz
+            *)
+        esac
+
+        if [ "$freq" -ge 5180 ] && [ "$freq" -le 5240 ]; then
+            if [ "$vht_he_opclass" -ne 0 ]; then
+                op_class=$vht_he_opclass
+            else
+                case "$sec_channel" in
+                    1) op_class=116 ;;
+                    -1) op_class=117 ;;
+                    *) op_class=115 ;;
+                esac
+            fi
+        elif [ "$freq" -ge 5260 ] && [ "$freq" -le 5320 ]; then
+            if [ "$vht_he_opclass" -ne 0 ]; then
+                op_class=$vht_he_opclass
+            else
+                case "$sec_channel" in
+                    1) op_class=119 ;;
+                    -1) op_class=120 ;;
+                    *) op_class=118 ;;
+                esac
+            fi
+        elif [ "$freq" -ge 5745 ] && [ "$freq" -le 5885 ]; then
+            if [ "$vht_he_opclass" -ne 0 ]; then
+                op_class=$vht_he_opclass
+            else
+                case "$sec_channel" in
+                    1) op_class=126 ;;
+                    -1) op_class=127 ;;
+                    *) op_class=125 ;;
+                esac
+            fi
+        elif [ "$freq" -ge 5500 ] && [ "$freq" -le 5720 ]; then
+            if [ "$vht_he_opclass" -ne 0 ] || [ "$width" -eq 320 ]; then
+                op_class=$vht_he_opclass
+            else
+                case "$sec_channel" in
+                    1) op_class=122 ;;
+                    -1) op_class=123 ;;
+                    *) op_class=121 ;;
+                esac
+            fi
+        fi
+
+    fi
+
+    # 6 GHz frequency range
+    if [ "$freq" -ge 5950 ] && [ "$freq" -le 7115 ]; then
+        case "$width" in
+            80) op_class=133 ;;  # 80 MHz
+            160) op_class=134 ;;  # 160 MHz
+            "80+80") op_class=135 ;;  # 80+80 MHz
+            320) op_class=137 ;;  # 320 MHz
+            *)
+		    if [ "$sec_channel" -ne 0 ]; then
+			    op_class=132
+		    else
+			    op_class=131
+		    fi
+		    ;;
+        esac
+    fi
+
+    if [ "$freq" -eq 5950 ];then
+	    op_class=136
+    fi
+
+	hostapd_cli -i $ap_intf $ml_link set op_class $op_class> /dev/null
+}
+
 # STA association is completed, hence adjusting hostapd running config
 hostapd_adjust_config() {
-	sta_freq=$1
-	sta_channel=$(iw $phy channels | grep $sta_freq |  awk '{print $4}' |  sed -e "s/\[//g" | sed -e "s/\]//g")
-	sta_width=$(iw dev $sta_intf info | grep $sta_freq | awk '{print $6}')
-	wifi_gen=$(wpa_cli -i $sta_intf status 2> /dev/null | grep wifi_generation | cut -d'=' -f 2)
-	ieee80211ac=$(wpa_cli -i $sta_intf status 2> /dev/null | grep ieee80211ac | cut -d'=' -f 2)
-	ap_intf=$2
-	wifi_6gband=$(hostapd_is_6ghz_band $sta_freq)
-	wifi_5gband=$(hostapd_is_5ghz_band $sta_freq)
+        sta_freq=$1
+        sta_channel=$(iw $phy channels | grep $sta_freq |  awk '{print $4}' |  sed -e "s/\[//g" | sed -e "s/\]//g")
+        sta_width=$(iw dev $sta_intf info | grep $sta_freq | awk '{print $6}')
+        wifi_gen=$(wpa_cli -i $sta_intf status 2> /dev/null | grep wifi_generation | cut -d'=' -f 2)
+        ieee80211ac=$(wpa_cli -i $sta_intf status 2> /dev/null | grep ieee80211ac | cut -d'=' -f 2)
+        ap_intf=$2
+        punct_bitmap=$3
+        wifi_6gband=$(hostapd_is_6ghz_band $sta_freq)
+        wifi_5gband=$(hostapd_is_5ghz_band $sta_freq)
 
 	if [ -z $ieee80211ac ]; then
 		ieee80211ac=0
 	fi
 
-	echo "STA associated in Channel $sta_channel, Width $sta_width MHz, Wifi Gen $wifi_gen, AP $ap_intf link $ml_link" > /dev/ttyMSM0
 
 	hostapd_cli -i $ap_intf $ml_link set channel $sta_channel 2> /dev/null
 	if [ "$wifi_5gband" == "true" ] || [ "$wifi_6gband" == "true" ]; then
@@ -245,6 +322,8 @@ hostapd_adjust_config() {
 	else
 		hostapd_cli -i $ap_intf $ml_link set hw_mode g 2> /dev/null
 	fi
+
+	get_ap_ht_capab $sta_freq
 
 	ap_ht_mode=$(echo $ap_ht_capab | sed -n 's/.*\(\[HT40*+*-*]\).*/\1/p')
 	#echo "Current AP HT capab $ap_ht_capab" > /dev/ttyMSM0
@@ -278,6 +357,7 @@ hostapd_adjust_config() {
 			hostapd_cli -i $ap_intf $ml_link set ieee80211be 1 2> /dev/null
 			hostapd_cli -i $ap_intf $ml_link set eht_oper_chwidth $ap_vht_he_eht_oper_chwidth
 			hostapd_cli -i $ap_intf $ml_link set eht_oper_centr_freq_seg0_idx $ap_vht_he_eht_oper_centr_freq_seg0_idx
+			hostapd_cli -i $ap_intf $ml_link set punct_bitmap $punct_bitmap
 		fi
 		hostapd_cli -i $ap_intf $ml_link set ieee80211ax 1 2> /dev/null
 		hostapd_cli -i $ap_intf $ml_link set he_oper_chwidth $ap_vht_he_eht_oper_chwidth
@@ -345,6 +425,8 @@ hostapd_adjust_config() {
                         hostapd_ht40_mode "$sta_channel"
                 fi
 	fi
+	hostapd_set_op_class $sta_freq $sta_channel $sta_width $sta_intf
+	echo "STA associated in Channel $sta_channel, Width $sta_width MHz, Wifi Gen $wifi_gen, AP $ap_intf link $ml_link op_class $op_class" > /dev/ttyMSM0
 }
 
 get_link_ids() {
@@ -360,10 +442,10 @@ get_link_ids() {
 
 		ctrl_iface=$(ls /var/run/hostapd/${ifname}*)
 		if [ -n "$ctrl_iface" ]; then
-			def_ctrl_iface_path=$(ls /var/run/hostapd/$ifname* | head -n 1)
+			def_ctrl_iface_path=$(ls /var/run/hostapd/${ifname}_* | head -n 1)
 			#Try to return links only if has link control interface
 			if [[ "$def_ctrl_iface_path" == *"link"* ]]; then
-				links=$(ls /var/run/hostapd/$ifname* | awk '{print substr($0,length,1)}')
+				links=$(ls /var/run/hostapd/${ifname}_* | awk '{print substr($0,length,1)}')
 				if [ -n "$links" ]; then
 					echo "$links"
 					return
@@ -434,23 +516,17 @@ get_link_info() {
 hostapd_get_ap_status() {
 	local ap_intf=$1
 	link_ids=$(get_link_ids $ap_intf)
-	is_eht=$(hostapd_cli -i $ap_intf status 2> /dev/null | grep ieee80211be | cut -d'=' -f 2)
 
-	if [ $is_eht -eq 1 ]; then
-		if [ -n "$link_ids" ]; then
-			for i in $link_ids
-			do
-				res=$(hostapd_cli -i $ap_intf -l $i status 2> /dev/null | grep state | cut -d'=' -f 2)
-				if [ "$res" != "ENABLED" ]; then
-					echo $res
-					return
-				fi
-			done
-			ap_status=$res
-		else
-			echo "FAIL"
-			return
-		fi
+	if [ -n "$link_ids" ]; then
+		for i in $link_ids
+		do
+			res=$(hostapd_cli -i $ap_intf -l $i status 2> /dev/null | grep state | cut -d'=' -f 2)
+			if [ "$res" != "ENABLED" ]; then
+				echo $res
+				return
+			fi
+		done
+		ap_status=$res
 	else
 		ap_status=$(hostapd_cli -i $ap_intf status 2> /dev/null | grep state | cut -d'=' -f 2)
 	fi
@@ -480,10 +556,7 @@ EOF
 chmod 777 /lib/radar_detect.sh
 wpa_cli -i $sta_intf -a /lib/radar_detect.sh &
 
-if [ -f $ap_link_file]; then
-	rm $ap_link_file
-fi
-#echo "Checking wpa_state $(wpa_cli -i $sta_intf status 2> /dev/null | grep wpa_state | cut -d'=' -f 2)" > /dev/ttyMSM0
+echo "Checking wpa_state $(wpa_cli -i $sta_intf status 2> /dev/null | grep wpa_state | cut -d'=' -f 2)" > /dev/ttyMSM0
 
 while true;
 do
@@ -525,8 +598,6 @@ do
 				else
 					hostapd_cli -i $ap_intf disable
 				fi
-				#echo "Last link disabled: $i" > /dev/ttyMSM0
-				echo "$ap_intf=$i" >> $ap_link_file
 			fi
 		done
 	fi
@@ -538,21 +609,35 @@ do
 		wifi_gen=$(wpa_cli -i $sta_intf status 2> /dev/null | grep wifi_generation | cut -d'=' -f 2)
 		if [ $wifi_gen -eq 7 ]; then
 			sta_link_freqs=$(wpa_cli -i $sta_intf mlo_status | grep freq | cut -d'=' -f 2)
+			sta_link_punct_bitmaps=$(wpa_cli -i $sta_intf mlo_signal_poll | grep PUNCT_BITMAP | cut -d'=' -f 2)
 
 			#Backward compatability where STA MLO support is not there in EHT
 			if [ -z "$sta_link_freqs"]; then
 				sta_link_freqs=$(wpa_cli -i $sta_intf status 2> /dev/null | grep freq | cut -d'=' -f 2)
+				sta_link_punct_bitmaps=$(wpa_cli -i $sta_intf signal_poll | grep PUNCT_BITMAP | cut -d'=' -f 2)
 			fi
+
+			index=1
 			for freq in $sta_link_freqs
 			do
+				link_punct_bitmap=0
+				if [ -n "$sta_link_punct_bitmaps" ]; then
+					link_punct_bitmap=$(echo "$sta_link_punct_bitmaps" |  cut -d ' ' -f 2 | awk -v n="$index" 'NR == n {print}')
+					if [ -z "$link_punct_bitmap"]; then
+						link_punct_bitmap=0
+					fi
+				fi
+
 				for ap_intf in $ap_intfs
 				do
 					ml_link=$(get_link_info $ap_intf $freq)
-					#echo link config command is $ml_link $freq $ap_intf  > /dev/console
+					echo link config command is $ml_link $freq $ap_intf  > /dev/console
 					if [ -n "$ml_link" ]; then
-						hostapd_adjust_config $freq $ap_intf
+						hostapd_adjust_config $freq $ap_intf $link_punct_bitmap
 					fi
 				done
+
+				let index++
 			done
 		else
 			sta_chan=$(iw $sta_intf info 2> /dev/null | grep channel | cut -d' ' -f 2)
@@ -561,14 +646,15 @@ do
 			# workaround for upstream station mld failed to get sta freq list
 			if [ $sta_freq -eq 0 ] && [ $wifi_gen -eq 6 ]; then
 				sta_freq=$(wpa_cli -i $sta_intf mlo_status 2> /dev/null | grep freq | cut -d'=' -f 2)
-			#	echo "sta freq $sta_freq" >> /tmp/apsta_debug.log
+				echo "sta freq $sta_freq" >> /tmp/apsta_debug.log
 			fi
 
 			wifi_6gband=$(hostapd_is_6ghz_band $sta_freq)
 
+			link_punct_bitmap=0
 			for ap_intf in $ap_intfs
 			do
-				hostapd_adjust_config $sta_freq $ap_intf
+				hostapd_adjust_config $sta_freq $ap_intf $link_punct_bitmap
 			done
 		fi
 
@@ -579,30 +665,14 @@ do
 
 		ap_status=$(hostapd_get_ap_status $ap_intf)
 
-		if [ "$ap_status" = "DISABLED" ]; then
+		if [ $(wpa_cli -i $sta_intf status 2> /dev/null | grep wpa_state | cut -d'=' -f 2) = "COMPLETED" ] &&
+		   [ "$ap_status" = "DISABLED" ]; then
 			for ap_intf in $ap_intfs
 			do
 				ap_links=$(get_link_ids $ap_intf)
 				if [ -n "$ap_links" ]; then
-
-					if [ -f $ap_link_file ]; then
-						#This is needed temporarily as hostapd needs to disable order
-						#to be restored atleast for the last disabled link
-						while read link_file; do
-							last_ap_intf=`echo $link_file | cut -d'=' -f1`
-							if [ $last_ap_intf = $ap_intf ];then
-								mld_disable_last_link=`echo $link_file | cut -d'=' -f2`
-								break;
-							fi
-						done < $ap_link_file
-					fi
-					#echo "Last link going to enable: $mld_disable_last_link" > /dev/ttyMSM0
-					hostapd_cli -i $ap_intf -l $mld_disable_last_link enable
 					for i in $ap_links
 					do
-						if [ $i = $mld_disable_last_link ];then
-							continue;
-						fi
 						hostapd_cli -i $ap_intf -l $i enable
 					done
 				else
@@ -611,27 +681,13 @@ do
 
 				ap_status=$(hostapd_get_ap_status $ap_intf)
 				# workaround for single instance hostapd not doing "enable" without "disable" call to deinit hapd driver
-				if [ $ap_status = "DISABLED" ]; then
-
+				if [ $(wpa_cli -i $sta_intf status 2> /dev/null | grep wpa_state | cut -d'=' -f 2) = "COMPLETED" ] &&
+				   [ "$ap_status" = "DISABLED" ]; then
 					if [ -n "$ap_links" ]; then
 						for i in $ap_links
 						do
 							hostapd_cli -i $ap_intf -l $i disable
-							sleep 5
-						done
-
-						#This is needed temporarily as hostapd needs to disable order
-						#to be restored atleast for the last disabled link
-
-						mld_disable_last_link=$i
-						#echo "Last link going to enable: $mld_disable_last_link" > /dev/ttyMSM0
-						hostapd_cli -i $ap_intf -l $mld_disable_last_link enable
-
-						for i in $ap_links
-						do
-							if [ $i = $mld_disable_last_link ];then
-								continue;
-							fi
+							sleep 1
 							hostapd_cli -i $ap_intf -l $i enable
 							sleep 4
 						done
@@ -643,34 +699,38 @@ do
 					fi
 				fi
 
-				if [ -f $ap_link_file ]; then
-					rm $ap_link_file
-				fi
-
 				ap_status=$(hostapd_get_ap_status $ap_intf)
-				if [ "$ap_status" = "DISABLED" -o "$ap_status" = "FAIL" ]; then
-					echo "REPEATER AP $ap_intf failed bring-up, exiting" > /dev/ttyMSM0
-					logread > /tmp/logread_AP_failure.log
-					echo "Collect if any core present in /tmp/ and output of /tmp/logread_AP_failure.log" > /dev/console
-					echo "Hostapd enable failed, exiting" >> /tmp/apsta_debug.log
-					date >> /tmp/apsta_debug.log
-					ap_link=$(get_link_ids $ap_intf)
-					if [ -n "$ap_link" ]; then
-						for i in $ap_link
-						do
-							hostapd_cli -i $ap_intf -l $i status>> /tmp/apsta_debug.log
-						done
-					else
-						hostapd_cli -i $ap_intf status>> /tmp/apsta_debug.log
-					fi
-					wpa_cli -i $sta_intf signal_poll >> /tmp/apsta_debug.log
-					wpa_cli -i $sta_intf status >> /tmp/apsta_debug.log
-					wpa_cli -i $sta_intf mlo_status >> /tmp/apsta_debug.log
-					wpa_cli -i $sta_intf list_n >> /tmp/apsta_debug.log
-					wpa_cli -i $sta_intf all_bss >> /tmp/apsta_debug.log
-					date >> /tmp/apsta_debug.log
+				if [ "$ap_status" = "DISABLED" -o "$ap_status" = "FAIL" ] &&
+				   [ $(wpa_cli -i $sta_intf status 2> /dev/null | grep wpa_state | cut -d'=' -f 2) = "COMPLETED" ]; then
+					echo "REPEATER AP $ap_intf failed bring-up, status $ap_status recovering" > /dev/ttyMSM0
+
+					# Below log dump should be enable for debugging purposes.
+
+					#logread > /tmp/logread_AP_failure.log
+					#echo "Collect if any core present in /tmp/ and output of /tmp/logread_AP_failure.log" > /dev/console
+					#echo "Hostapd enable failed, exiting" >> /tmp/apsta_debug.log
+					#date >> /tmp/apsta_debug.log
+					#iw dev >> /tmp/apsta_debug.log
+					#iw dev $ap_intf info >> /tmp/apsta_debug.log
+					#ap_link=$(get_link_ids $ap_intf)
+					#if [ -n "$ap_link" ]; then
+					#	for i in $ap_link
+					#	do
+					#		hostapd_cli -i $ap_intf -l $i status>> /tmp/apsta_debug.log
+					#	done
+					#else
+					#	hostapd_cli -i $ap_intf status>> /tmp/apsta_debug.log
+					#fi
+					#wpa_cli -i $sta_intf signal_poll >> /tmp/apsta_debug.log
+					#wpa_cli -i $sta_intf status >> /tmp/apsta_debug.log
+					#wpa_cli -i $sta_intf mlo_status >> /tmp/apsta_debug.log
+					#wpa_cli -i $sta_intf list_n >> /tmp/apsta_debug.log
+					#wpa_cli -i $sta_intf all_bss >> /tmp/apsta_debug.log
+					#date >> /tmp/apsta_debug.log
+
 					wifi down
-					exit
+					sleep 4
+					wifi up
 				fi
 			done
 		fi

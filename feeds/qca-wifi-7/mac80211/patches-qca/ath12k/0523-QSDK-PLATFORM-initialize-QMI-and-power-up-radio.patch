@@ -1,0 +1,142 @@
+From 4539cf98beb13f5adb11335486fb2243f627c51d Mon Sep 17 00:00:00 2001
+From: Narendhar Reddy <nare@qti.qualcomm.com>
+Date: Tue, 5 Aug 2025 15:29:37 +0530
+Subject: [PATCH] QSDK:PLATFORM:ath12k:initialize QMI and power up radio immediately after probe
+
+Currenlty, QMI initialization and radio power-up were deferred until all
+radio probe events were received. Make changes to initialize QMI and
+power up the radio immediately after each individual radio probe, removing
+the need to wait for all radios to complete probing.
+
+Signed-off-by: Narendhar Reddy <nare@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c | 17 +++++++++--------
+ drivers/net/wireless/ath/ath12k/qmi.c  |  5 +++++
+ 2 files changed, 14 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -1149,6 +1149,7 @@ int ath12k_core_check_smbios(struct ath1
+ 
+ static int ath12k_core_soc_create(struct ath12k_base *ab)
+ {
++	struct ath12k_hw_group *ag = ab->ag;
+ 	int ret;
+ 
+ 	if (ath12k_ftm_mode) {
+@@ -1174,12 +1175,16 @@ static int ath12k_core_soc_create(struct
+ 
+ err_qmi_deinit:
+ 	ath12k_debugfs_soc_destroy(ab);
++	mutex_unlock(&ag->mutex);
+ 	ath12k_qmi_deinit_service(ab);
++	mutex_lock(&ag->mutex);
+ 	return ret;
+ }
+ 
+ static void ath12k_core_soc_destroy(struct ath12k_base *ab)
+ {
++	struct ath12k_hw_group *ag = ab->ag;
++
+ 	if (!test_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags))
+ 		ath12k_qmi_firmware_stop(ab);
+ 
+@@ -1191,7 +1196,9 @@ static void ath12k_core_soc_destroy(stru
+ 
+ 	ath12k_reg_free(ab);
+ 	ath12k_debugfs_soc_destroy(ab);
++	mutex_unlock(&ag->mutex);
+ 	ath12k_qmi_deinit_service(ab);
++	mutex_lock(&ag->mutex);
+ 	ath12k_cfg_deinit(ab);
+ }
+ 
+@@ -4552,7 +4559,7 @@ static void ath12k_core_hw_group_cleanup
+ static int ath12k_core_hw_group_create(struct ath12k_hw_group *ag)
+ {
+ 	struct ath12k_base *ab;
+-	int i, ret;
++	int i;
+ 
+ 	lockdep_assert_held(&ag->mutex);
+ 
+@@ -4563,14 +4570,11 @@ static int ath12k_core_hw_group_create(s
+ 
+ 		mutex_lock(&ab->core_lock);
+ 
+-		ath12k_core_fill_adj_info(ab);
+-
+-		ret = ath12k_core_soc_create(ab);
+-		if (ret) {
++		if (test_bit(ATH12K_FLAG_SOC_CREATE_FAIL, &ab->dev_flags)) {
+ 			mutex_unlock(&ab->core_lock);
+-			ath12k_err(ab, "failed to create soc core: %d\n", ret);
+-			return ret;
++			return -ENODEV;
+ 		}
++		ath12k_core_fill_adj_info(ab);
+ 
+ 		mutex_unlock(&ab->core_lock);
+ 
+@@ -4885,6 +4889,16 @@ int ath12k_core_init(struct ath12k_base
+ 		   ag->num_devices, ag->num_probed);
+ 
+ 	mutex_lock(&ag->mutex);
++	mutex_lock(&ab->core_lock);
++	ret = ath12k_core_soc_create(ab);
++	if (ret) {
++		set_bit(ATH12K_FLAG_SOC_CREATE_FAIL, &ab->dev_flags);
++		mutex_unlock(&ab->core_lock);
++		mutex_unlock(&ag->mutex);
++		ath12k_err(ab, "failed to create soc core: %d\n", ret);
++		return ret;
++	}
++	mutex_unlock(&ab->core_lock);
+ 	is_ready = ath12k_core_hw_group_create_ready(ag);
+ 
+ 	if (is_ready) {
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -6024,7 +6024,7 @@ static bool ath12k_qmi_hw_group_host_cap
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+ 
+-		if (ab->is_bypassed)
++		if (ab && ab->is_bypassed)
+ 			continue;
+ 
+ 		if (!(ab && ab->qmi.num_radios != U8_MAX))
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -1685,6 +1685,9 @@ static int ath12k_ahb_probe(struct platf
+ 	return 0;
+ 
+ err_free_dp:
++	if (test_bit(ATH12K_FLAG_SOC_CREATE_FAIL, &ab->dev_flags))
++		return ret;
++
+ 	if (ab_ahb->device_ops->dp_deinit)
+ 		ab_ahb->device_ops->dp_deinit(ab->dp);
+ 
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -421,6 +421,7 @@ enum ath12k_dev_flags {
+ 	ATH12K_FLAG_UMAC_PRERESET_START,
+ 	ATH12K_FLAG_UMAC_RESET_COMPLETE,
+ 	ATH12K_FLAG_UMAC_RECOVERY_START,
++	ATH12K_FLAG_SOC_CREATE_FAIL,
+ };
+ 
+ enum ath12k_mlo_recovery_mode {
+--- a/drivers/net/wireless/ath/ath12k/pci.c
++++ b/drivers/net/wireless/ath/ath12k/pci.c
+@@ -1298,6 +1298,9 @@ static int ath12k_pci_probe(struct pci_d
+ 	return 0;
+ 
+ err_free_dp:
++	if (test_bit(ATH12K_FLAG_SOC_CREATE_FAIL, &ab->dev_flags))
++		return ret;
++
+ 	if (ab_pci->device_ops->dp_deinit)
+ 		ab_pci->device_ops->dp_deinit(ab->dp);
+ 

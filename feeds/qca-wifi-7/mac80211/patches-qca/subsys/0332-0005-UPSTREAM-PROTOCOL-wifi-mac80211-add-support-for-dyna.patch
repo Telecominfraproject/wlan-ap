@@ -1,0 +1,178 @@
+From aa8a80ff203a35366aa0b42b03146e122631a2a6 Mon Sep 17 00:00:00 2001
+From: Hari Naraayana Desikan Kannan <hnaraaya@qti.qualcomm.com>
+Date: Wed, 9 Jul 2025 11:42:46 +0530
+Subject: [PATCH 5/5] UPSTREAM:PROTOCOL: wifi: mac80211: add support for
+ dynamic link addition and removal in AP MLD
+
+Extend mac80211 to support multi-link reconfiguration for AP MLDs, as
+defined in IEEE 802.11be/D7.0 section 35.3.6.4. This enables dynamic
+addition and removal of links for an associated station based on
+reconfiguration requests.
+
+Introduce ieee80211_sta_assoc_ml_reconf() to process link additions
+and removals based on parameters received in the reconfiguration
+request. Validate each added link and initialize the corresponding
+station link. Reject reconfiguration when links are both added and
+removed, unchanged, add existing links, or remove non-existent ones.
+If any link addition fails, roll back previously added links.
+
+Pass the updated active link set to the driver by reusing the
+drv_change_sta_links() callback, extending the existing station
+link update flow to support reconfiguration. Set the reconfiguration
+state in the station context to allow drivers to distinguish it
+from standard link updates.
+
+This distinction is necessary because reconfiguration may require
+drivers to perform additional actions-such as preparing firmware for
+reconfiguration-that are not applicable to regular updates.
+Reusing the existing callback avoids interface duplication, while
+the reconfiguration state provides sufficient context for drivers
+to apply the correct logic.
+
+Signed-off-by: Hari Naraayana Desikan Kannan <hnaraaya@qti.qualcomm.com>
+---
+ include/net/mac80211.h |  7 ++++
+ net/mac80211/cfg.c     | 91 +++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 97 insertions(+), 1 deletion(-)
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -2720,6 +2720,8 @@ struct ieee80211_link_sta {
+  * @eml_cap: EML capabilities of station
+  * @mld_cap_op: MLD capabilites and operation field of station
+  * @neg_ttlm: TTLM negotiation parameters of the station
++ * @reconf: bitmap of links added and removed during multi-link
++ *	reconfiguration.
+  */
+ struct ieee80211_sta {
+ 	u8 addr[ETH_ALEN] __aligned(2);
+@@ -2747,6 +2749,11 @@ struct ieee80211_sta {
+ 	u16 valid_links;
+ 	struct ieee80211_link_sta deflink;
+ 	struct ieee80211_link_sta __rcu *link[IEEE80211_MLD_MAX_NUM_LINKS];
++	/* multi-link reconfiguration */
++	struct {
++		u16 removed_links;
++		u16 added_links;
++	} reconf;
+ 
+ 	u16 eml_cap;
+ 	u16 mld_cap_op;
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -6003,6 +6003,93 @@ ieee80211_set_ttlm(struct wiphy *wiphy,
+ 	return 0;
+ }
+ 
++static int ieee80211_sta_assoc_ml_reconf(struct wiphy *wiphy,
++					 struct net_device *dev,
++					 struct cfg80211_ml_reconf_req *req)
++{
++	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
++	struct sta_info *sta;
++	struct link_station_parameters *link_params;
++	const struct wiphy_iftype_ext_capab *ift_ext_capa;
++	unsigned long added_links = 0, link_id = 0, added_ok = 0;
++	u16 new_active_links;
++	int ret = 0;
++	__le16 mld_capa_ops = 0;
++
++	ift_ext_capa = cfg80211_get_iftype_ext_capa(sdata->local->hw.wiphy,
++						    NL80211_IFTYPE_AP);
++	if (ift_ext_capa) {
++		mld_capa_ops = cpu_to_le16(ift_ext_capa->mld_capa_and_ops);
++		if (!ieee80211_vif_is_mld(&sdata->vif) ||
++		    !(le16_to_cpu(mld_capa_ops) &
++		      IEEE80211_MLD_CAP_OP_LINK_RECONF_SUPPORT))
++			return -EINVAL;
++	}
++	sta = sta_info_get(sdata, req->mld_addr);
++	if (!sta)
++		return -ENOLINK;
++
++	for (link_id = 0; link_id < IEEE80211_MLD_MAX_NUM_LINKS; link_id++) {
++		if (!req->u.link_sta_params[link_id].link_mac)
++			continue;
++
++		if (sta->sta.valid_links & BIT(link_id))
++			continue;
++
++		added_links |= BIT(link_id);
++	}
++	/* Reject if:
++	 * any link is both added and removed,
++	 * no links are being changed,
++	 * removed links are not active,
++	 * all valid links would be removed.
++	 */
++	if ((added_links & req->rem_links) ||
++	    !(added_links | req->rem_links) ||
++	    ((sta->sta.valid_links & req->rem_links) != req->rem_links) ||
++	    !(sta->sta.valid_links & ~req->rem_links))
++		return -EINVAL;
++
++	new_active_links = sta->sta.valid_links & ~req->rem_links;
++
++	if (added_links) {
++		for_each_set_bit(link_id, &added_links,
++				 IEEE80211_MLD_MAX_NUM_LINKS) {
++			link_params = &req->u.link_sta_params[link_id];
++			link_params->mld_mac = req->mld_addr;
++
++			ret = ieee80211_add_link_station(wiphy, dev,
++							 link_params);
++			if (ret) {
++				for_each_set_bit(link_id, &added_ok,
++						 IEEE80211_MLD_MAX_NUM_LINKS) {
++					struct link_station_del_parameters del_params = {
++						.link_id = link_id,
++						.mld_mac = req->mld_addr,
++					};
++
++					ieee80211_del_link_station(wiphy, dev,
++								   &del_params);
++				}
++				return ret;
++			}
++
++			added_ok |= BIT(link_id);
++		}
++	}
++
++	sta->sta.reconf.added_links = added_links;
++	sta->sta.reconf.removed_links = req->rem_links;
++
++	ret = drv_change_sta_links(sdata->local, sdata,
++				   &sta->sta,
++				   sta->sta.valid_links,
++				   new_active_links);
++	sta->sta.reconf.added_links = 0;
++
++	return ret;
++}
++
+ static int
+ ieee80211_assoc_ml_reconf(struct wiphy *wiphy, struct net_device *dev,
+ 			  struct cfg80211_ml_reconf_req *req)
+@@ -6011,7 +6098,10 @@ ieee80211_assoc_ml_reconf(struct wiphy *
+ 
+ 	lockdep_assert_wiphy(sdata->local->hw.wiphy);
+ 
+-	return ieee80211_mgd_assoc_ml_reconf(sdata, req);
++	if (sdata->vif.type == NL80211_IFTYPE_AP)
++		return ieee80211_sta_assoc_ml_reconf(wiphy, dev, req);
++	else
++		return ieee80211_mgd_assoc_ml_reconf(sdata, req);
+ }
+ 
+ static int
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@ -3429,6 +3429,7 @@ void ieee80211_sta_remove_link(struct st
+ 			return;
+ 		}
+ 
++	sta->sta.reconf.removed_links &= ~BIT(link_id);
+ 	sta_remove_link(sta, link_id, true);
+ 
+ 	/* If deflink is getting removed, then move the contents of the next

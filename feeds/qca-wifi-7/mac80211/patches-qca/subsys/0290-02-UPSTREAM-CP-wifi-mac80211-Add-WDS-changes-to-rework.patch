@@ -1,0 +1,149 @@
+From 5ab5e00871495fe7d002503ec9f4f77cba8ffc64 Mon Sep 17 00:00:00 2001
+From: Muna Sinada <muna.sinada@oss.qualcomm.com>
+Date: Wed, 28 May 2025 12:30:16 -0700
+Subject: [PATCH 4/4] wifi: mac80211: Add WDS changes to rework
+
+Design for AP_VLAN interface links in upstream is different than
+internal code. With new design brought to internal code, MLO WDS is
+not functional.
+
+Add additionaly functionality to AP_VLAN interface's handling of links
+for MLO WDS.
+
+Patch-dependency: 
+ 0007-wifi-mac80211-Create-separate-links-for-VLAN-interfa.patch
+ 0141-wifi-mac80211-Changes-for-WDS-MLD.patch
+ 0185-mac80211-fix-WDS-repeater-and-root-ap-association.patch
+
+Signed-off-by: Muna Sinada <muna.sinada@oss.qualcomm.com>
+---
+ net/mac80211/cfg.c        | 23 ++++++-------------
+ net/mac80211/driver-ops.c |  2 +-
+ net/mac80211/link.c       | 47 +++++++++++++++++++--------------------
+ 3 files changed, 31 insertions(+), 41 deletions(-)
+
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -2492,35 +2492,26 @@ static int ieee80211_change_station(stru
+ 			}
+ 			if (sta->sta.valid_links) {
+ 				int link_id;
+-				for_each_set_bit(link_id,
+-						 (unsigned long *)&master->vif.valid_links,
++				unsigned long master_iter = master->vif.valid_links;
++				u16 new_links = master->vif.valid_links &
++						sta->sta.valid_links;
++
++				for_each_set_bit(link_id, &master_iter,
+ 						 IEEE80211_MLD_MAX_NUM_LINKS) {
+ 					if (!(sta->sta.valid_links & BIT(link_id))) {
+-						rcu_assign_pointer(
+-						vlansdata->vif.link_conf[link_id],
+-						NULL);
+-						rcu_assign_pointer(
+-						vlansdata->link[link_id],
+-						NULL);
+ 						memset(wdev->links[link_id].addr,
+ 						       0, ETH_ALEN);
+-						vlansdata->vif.valid_links &=
+-								~BIT(link_id);
+ 						wdev->valid_links &= ~BIT(link_id);
+ 					}
+ 					else {
+-						rcu_assign_pointer(
+-						vlansdata->vif.link_conf[link_id],
+-						master->vif.link_conf[link_id]);
+-						rcu_assign_pointer(vlansdata->link[link_id],
+-								   master->link[link_id]);
+ 						memcpy(wdev->links[link_id].addr,
+ 						       vlansdata->vif.link_conf[link_id]->bssid,
+ 							ETH_ALEN);
+-						vlansdata->vif.valid_links |= BIT(link_id);
+ 						wdev->valid_links |= BIT(link_id);
+ 					}
+ 				}
++
++				ieee80211_vif_set_links(vlansdata, new_links, 0);
+ 			}
+ 		}
+ 
+--- a/net/mac80211/driver-ops.c
++++ b/net/mac80211/driver-ops.c
+@@ -609,6 +609,7 @@ int drv_change_sta_links(struct ieee8021
+ 	might_sleep();
+ 	lockdep_assert_wiphy(local->hw.wiphy);
+ 
++	sdata = get_bss_sdata(sdata);
+ 	if (!check_sdata_in_driver(sdata))
+ 		return -EIO;
+ 
+--- a/net/mac80211/link.c
++++ b/net/mac80211/link.c
+@@ -16,27 +16,25 @@ static void ieee80211_update_apvlan_link
+ {
+ 	struct ieee80211_sub_if_data *vlan;
+ 	struct ieee80211_link_data *link;
+-	u16 ap_bss_links = sdata->vif.valid_links;
+-	u16 new_links, vlan_links;
+-	unsigned long add;
+ 
+ 	list_for_each_entry(vlan, &sdata->u.ap.vlans, u.vlan.list) {
++		unsigned long add = sdata->vif.valid_links;
++		unsigned long rem = ~sdata->vif.valid_links & GENMASK(15,0);
+ 		int link_id;
+ 
+-		if (!vlan)
++		if (add == vlan->vif.valid_links)
+ 			continue;
+ 
+-		/* No support for 4addr with MLO yet */
+-		if (vlan->wdev.use_4addr)
+-			return;
+-
+-		vlan_links = vlan->vif.valid_links;
+-
+-		new_links = ap_bss_links;
++		for_each_set_bit(link_id, &add, IEEE80211_MLD_MAX_NUM_LINKS) {
++			vlan->wdev.valid_links |= BIT(link_id);
++			ether_addr_copy(vlan->wdev.links[link_id].addr,
++					sdata->wdev.links[link_id].addr);
++		}
+ 
+-		add = new_links & ~vlan_links;
+-		if (!add)
+-			continue;
++		for_each_set_bit(link_id, &rem, IEEE80211_MLD_MAX_NUM_LINKS) {
++			vlan->wdev.valid_links &= ~BIT(link_id);
++			eth_zero_addr(vlan->wdev.links[link_id].addr);
++		}
+ 
+ 		ieee80211_vif_set_links(vlan, add, 0);
+ 
+@@ -103,8 +101,13 @@ void ieee80211_link_init(struct ieee8021
+ 
+ 		ap_bss = container_of(sdata->bss,
+ 				      struct ieee80211_sub_if_data, u.ap);
+-		ap_bss_conf = sdata_dereference(ap_bss->vif.link_conf[link_id],
+-						ap_bss);
++
++		if (deflink)
++			ap_bss_conf = &ap_bss->vif.bss_conf;
++		else
++			ap_bss_conf = sdata_dereference(ap_bss->vif.link_conf[link_id],
++							ap_bss);
++
+ 		memcpy(link_conf, ap_bss_conf, sizeof(*link_conf));
+ 	}
+ 
+@@ -364,8 +367,9 @@ static int ieee80211_vif_update_links(st
+ 		link = links[link_id];
+ 		ieee80211_link_init(sdata, link_id, &link->data, &link->conf);
+ 		ieee80211_link_setup(&link->data);
+-		ieee80211_set_wmm_default(&link->data, true,
+-			sdata->vif.type != NL80211_IFTYPE_STATION);
++		if (sdata->vif.type != NL80211_IFTYPE_AP_VLAN)
++			ieee80211_set_wmm_default(&link->data, true,
++				     sdata->vif.type != NL80211_IFTYPE_STATION);
+ 	}
+ 
+ 	if (new_links == 0)

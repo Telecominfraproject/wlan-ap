@@ -1,0 +1,205 @@
+From e864627b30cbafae11127a1b494250763785f02d Mon Sep 17 00:00:00 2001
+From: Nandha Kishore Easwaran <quic_nandhaki@quicinc.com>
+Date: Wed, 31 Jan 2024 11:38:54 +0530
+Subject: [PATCH] net: Add a new netdev_alloc_skb_fast API for Data path
+
+Add a new netdev_alloc_skb_fast API for Data path. This new API will
+be used by EDMA driver and Wifi driver to allocate SKBs where all fast
+recycle flags will be preserved. All fast_recycle flags will be reset
+when using netdev_alloc_skb.
+
+Change-Id: I4f9c9b5f04aaa1bd2a3dacccd9362ba9bdada364
+Signed-off-by: Nandha Kishore Easwaran <quic_nandhaki@quicinc.com>
+CRs-Fixed: 3666195
+---
+ include/linux/skbuff.h |  20 ++++++++
+ net/core/skbuff.c      | 114 ++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 133 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 29ae7c7d42aa..6b06c0dbc3fc 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -3269,6 +3269,9 @@ static inline void *netdev_alloc_frag_align(unsigned int fragsz,
+ struct sk_buff *__netdev_alloc_skb(struct net_device *dev, unsigned int length,
+ 				   gfp_t gfp_mask);
+ 
++struct sk_buff *__netdev_alloc_skb_fast(struct net_device *dev, unsigned int length,
++				   gfp_t gfp_mask);
++
+ struct sk_buff *__netdev_alloc_skb_no_skb_reset(struct net_device *dev, unsigned int length,
+ 				   gfp_t gfp_mask);
+ 
+@@ -3291,6 +3294,23 @@ static inline struct sk_buff *netdev_alloc_skb(struct net_device *dev,
+ 	return __netdev_alloc_skb(dev, length, GFP_ATOMIC);
+ }
+ 
++/**
++ *	netdev_alloc_skb_fast - allocate an skbuff for rx on a specific device
++ *	@dev: network device to receive on
++ *	@length: length to allocate
++ *
++ *      This API is same as netdev_alloc_skb except for the fact that it retains
++ *      the recycler fast flags.
++ *
++ *	%NULL is returned if there is no free memory. Although this function
++ *	allocates memory it can be called from an interrupt.
++ */
++static inline struct sk_buff *netdev_alloc_skb_fast(struct net_device *dev,
++						    unsigned int length)
++{
++	return __netdev_alloc_skb_fast(dev, length, GFP_ATOMIC);
++}
++
+ /* legacy helper around __netdev_alloc_skb() */
+ static inline struct sk_buff *__dev_alloc_skb(unsigned int length,
+ 					      gfp_t gfp_mask)
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 3150eef68996..a925fb480d86 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -744,7 +744,7 @@ struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
+ 	bool reset_skb = true;
+ 	skb = skb_recycler_alloc(dev, length, reset_skb);
+ 	if (likely(skb)) {
+-		skb->recycled_for_ds = 0;
++		skb_recycler_clear_flags(skb);
+ 		return skb;
+ 	}
+ 
+@@ -822,6 +822,109 @@ struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
+ }
+ EXPORT_SYMBOL(__netdev_alloc_skb);
+ 
++/**
++ *	__netdev_alloc_skb_fast - allocate an skbuff for rx on a specific device
++ *	@dev: network device to receive on
++ *	@length: length to allocate
++ *	@gfp_mask: get_free_pages mask, passed to alloc_skb
++ *
++ *	Allocate a new &sk_buff and assign it a usage count of one. The
++ *	buffer has NET_SKB_PAD headroom built in. Users should allocate
++ *	the headroom they think they need without accounting for the
++ *	built in space. The built in space is used for optimisations.
++ *
++ *	%NULL is returned if there is no free memory.
++ */
++struct sk_buff *__netdev_alloc_skb_fast(struct net_device *dev,
++				   unsigned int length, gfp_t gfp_mask)
++{
++	struct sk_buff *skb;
++	unsigned int len = length;
++
++#ifdef CONFIG_SKB_RECYCLER
++	bool reset_skb = true;
++	skb = skb_recycler_alloc(dev, length, reset_skb);
++	if (likely(skb)) {
++		skb->recycled_for_ds = 0;
++		return skb;
++	}
++
++	len = SKB_RECYCLE_SIZE;
++	if (unlikely(length > SKB_RECYCLE_SIZE))
++		len = length;
++
++	skb = __alloc_skb(len + NET_SKB_PAD, gfp_mask,
++			  SKB_ALLOC_RX, NUMA_NO_NODE);
++	if (!skb)
++		goto skb_fail;
++
++	goto skb_success;
++#else
++	struct page_frag_cache *nc;
++	bool pfmemalloc;
++	bool page_frag_alloc_enable = true;
++	void *data;
++
++	len += NET_SKB_PAD;
++
++#ifdef CONFIG_ALLOC_SKB_PAGE_FRAG_DISABLE
++	page_frag_alloc_enable = false;
++#endif
++	/* If requested length is either too small or too big,
++	 * we use kmalloc() for skb->head allocation.
++	 */
++	if (len <= SKB_WITH_OVERHEAD(1024) ||
++	    len > SKB_WITH_OVERHEAD(PAGE_SIZE) ||
++	    (gfp_mask & (__GFP_DIRECT_RECLAIM | GFP_DMA)) ||
++		!page_frag_alloc_enable) {
++		skb = __alloc_skb(len, gfp_mask, SKB_ALLOC_RX, NUMA_NO_NODE);
++		if (!skb)
++			goto skb_fail;
++		goto skb_success;
++	}
++
++	len += SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++	len = SKB_DATA_ALIGN(len);
++
++	if (sk_memalloc_socks())
++		gfp_mask |= __GFP_MEMALLOC;
++
++	if (in_irq() || irqs_disabled()) {
++		nc = this_cpu_ptr(&netdev_alloc_cache);
++		data = page_frag_alloc(nc, len, gfp_mask);
++		pfmemalloc = nc->pfmemalloc;
++	} else {
++		local_bh_disable();
++		nc = this_cpu_ptr(&napi_alloc_cache.page);
++		data = page_frag_alloc(nc, len, gfp_mask);
++		pfmemalloc = nc->pfmemalloc;
++		local_bh_enable();
++	}
++
++	if (unlikely(!data))
++		return NULL;
++
++	skb = __build_skb(data, len);
++	if (unlikely(!skb)) {
++		skb_free_frag(data);
++		return NULL;
++	}
++
++	/* use OR instead of assignment to avoid clearing of bits in mask */
++	if (pfmemalloc)
++		skb->pfmemalloc = 1;
++	skb->head_frag = 1;
++#endif
++
++skb_success:
++	skb_reserve(skb, NET_SKB_PAD);
++	skb->dev = dev;
++
++skb_fail:
++	return skb;
++}
++EXPORT_SYMBOL(__netdev_alloc_skb_fast);
++
+ #ifdef CONFIG_SKB_RECYCLER
+ /* __netdev_alloc_skb_no_skb_reset - allocate an skbuff for rx on a specific device
+  *	@dev: network device to receive on
+@@ -1599,6 +1702,11 @@ static void __copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+ 	new->queue_mapping = old->queue_mapping;
+ 
+ 	memcpy(&new->headers, &old->headers, sizeof(new->headers));
++
++	/* Clear the skb recycler flags here to make sure any skb whose size
++	 * has been altered is not put back into recycler pool.
++	 */
++	skb_recycler_clear_flags(new);
+ 	CHECK_SKB_FIELD(protocol);
+ 	CHECK_SKB_FIELD(csum);
+ 	CHECK_SKB_FIELD(hash);
+@@ -2366,6 +2474,10 @@ int pskb_expand_head(struct sk_buff *skb, int nhead, int ntail,
+ 	if (!skb->sk || skb->destructor == sock_edemux)
+ 		skb->truesize += size - osize;
+ 
++	/* Clear the skb recycler flags here to make sure any skb whose size
++	 * has been expanded is not put back into recycler.
++	 */
++	skb_recycler_clear_flags(skb);
+ 	return 0;
+ 
+ nofrags:
+-- 
+2.34.1
+

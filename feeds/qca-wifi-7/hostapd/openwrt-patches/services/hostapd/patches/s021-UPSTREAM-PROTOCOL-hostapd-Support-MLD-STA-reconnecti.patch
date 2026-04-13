@@ -1,0 +1,232 @@
+From 68a1da120f1007a0a66e3e0575723081f4dfe584 Mon Sep 17 00:00:00 2001
+From: Sowmiya Sree Elavalagan <ssreeela@qti.qualcomm.com>
+Date: Wed, 8 Oct 2025 18:22:11 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL:hostapd: Support MLD STA reconnection on
+ same band
+
+In the current design, when an authentication or association request
+is received, the mac80211 driver translates the link address to the
+MLD address and forwards it to hostapd. Hostapd processes the MLD address
+and replies using the same. The ath12k driver then translates the
+MLD address back to the link address.
+
+Initially, an MLD AP (with 3 links) and an MLD STA are connected using
+2 links. Later,without deauthenticaion, the same authorized MLD STA
+attempts to connect as a legacy STA or MLD STA using the same MLD
+address on the same band. It sends a auth/assoc request in the mld address,
+but the MLD AP responds using the previous STA's link address, causing
+connectivity issues.
+
+Add changes to avoid address translation between link and MLD
+addresses in the RX/TX path for auth/assoc frames.
+
+Hostapd receives the link address directly in auth/assoc frames.
+It find the mld address using MLD IEs and partner link information,
+and responds using the correct link address.
+
+Signed-off-by: Ramasamy Kaliappan <rkaliapp@qti.qualcomm.com>
+Co-developed-by: Sowmiya Sree Elavalagan <ssreeela@qti.qualcomm.com>
+Signed-off-by: Sowmiya Sree Elavalagan <ssreeela@qti.qualcomm.com>
+---
+ src/ap/ieee802_11.c     | 90 ++++++++++++++++++++++++++++++++++-------
+ src/ap/ieee802_11_eht.c |  7 +++-
+ src/ap/sta_info.h       |  3 ++
+ 3 files changed, 83 insertions(+), 17 deletions(-)
+
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -383,7 +383,7 @@ static int send_auth_reply(struct hostap
+ 	struct wpabuf *ml_resp = NULL;
+ 
+ #ifdef CONFIG_IEEE80211BE
+-	if (ap_sta_is_mld(hapd, sta)) {
++	if (ap_sta_is_mld(hapd, sta) && sta->mld_auth) {
+ 		ml_resp = hostapd_ml_auth_resp(hapd);
+ 		if (!ml_resp)
+ 			return -1;
+@@ -763,7 +763,7 @@ static struct wpabuf * auth_build_sae_co
+ 	const u8 *own_addr = hapd->own_addr;
+ 
+ #ifdef CONFIG_IEEE80211BE
+-	if (ap_sta_is_mld(hapd, sta))
++	if (ap_sta_is_mld(hapd, sta) && sta->mld_auth)
+ 		own_addr = hapd->mld->mld_addr;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+@@ -866,7 +866,8 @@ static int auth_sae_send_commit(struct h
+ #ifdef CONFIG_IEEE80211BE
+ 	u8 link_id = hapd->mld_link_id;
+ 
+-	if (hapd->conf->mld_ap && sta && sta->mld_info.mld_sta) {
++	if (hapd->conf->mld_ap && sta && sta->mld_info.mld_sta && sta->mld_auth) {
++		dst = sta->reply_addr;
+ 		/*
+ 		 * dst address should be partner link peer address,
+ 		 * if receive auth frame from sta partner link with same mld address
+@@ -919,7 +920,8 @@ static int auth_sae_send_confirm(struct
+ 
+ #ifdef CONFIG_IEEE80211BE
+ 	u8 link_id = hapd->mld_link_id;
+-	if (hapd->conf->mld_ap && sta && sta->mld_info.mld_sta) {
++	if (hapd->conf->mld_ap && sta && sta->mld_info.mld_sta && sta->mld_auth) {
++		dst = sta->reply_addr;
+ 		if (sta->unadded_sta) {
+ 
+ 			/*
+@@ -3558,6 +3560,8 @@ static void handle_auth(struct hostapd_d
+ 	sta->flags &= ~WLAN_STA_PREAUTH;
+ 	ieee802_1x_notify_pre_auth(sta->eapol_sm, 0);
+ 
++	os_memcpy(sta->reply_addr, mgmt->sa, ETH_ALEN);
++	sta->mld_auth = mld_sta;
+ 	/*
+ 	 * If the driver supports full AP client state, add a station to the
+ 	 * driver before sending authentication reply to make sure the driver
+@@ -3710,17 +3714,6 @@ static void handle_auth(struct hostapd_d
+  fail:
+ 	dst = mgmt->sa;
+ 
+-#ifdef CONFIG_IEEE80211BE
+-	if (ap_sta_is_mld(hapd, sta)) {
+-		u8 link_id = hapd->mld_link_id;
+-
+-		if (!sta->unadded_sta)
+-			dst = sta->addr;
+-		else
+-			dst = sta->mld_info.links[link_id].peer_addr;
+-	}
+-#endif /* CONFIG_IEEE80211BE */
+-
+ 	reply_res = send_auth_reply(hapd, sta, dst, auth_alg,
+ 				    auth_alg == WLAN_AUTH_SAE ?
+ 				    auth_transaction : auth_transaction + 1,
+@@ -6469,6 +6462,56 @@ static void handle_assoc(struct hostapd_
+ 		.ssi_signal = rssi,
+ 	};
+ 
++	if ((sta->flags & WLAN_STA_MFP) &&
++	     sta->sa_query_timed_out &&
++	     sta->mld_info.mld_sta) {
++		struct ieee802_11_elems elems;
++		u8 mld_addr[ETH_ALEN];
++
++		wpa_auth_sta_deinit(sta->wpa_sm);
++		sta->wpa_sm = NULL;
++		SET_EACH_PARTNER_STA_OBJ(hapd, sta, wpa_sm, NULL);
++		ap_sta_remove_link_sta(hapd, sta, 0);
++		hostapd_drv_sta_remove(hapd, sta->addr);
++		sta->flags &= ~(WLAN_STA_ASSOC | WLAN_STA_AUTHORIZED);
++		sta->unadded_sta = false;
++
++		if (ieee802_11_parse_elems(pos, left, &elems, 1) == ParseFailed) {
++			wpa_printf(MSG_DEBUG, "FT: Failed to parse elements");
++			goto fail;
++		}
++
++		if (!hostapd_process_ml_assoc_req_addr(hapd, elems.basic_mle,
++						       elems.basic_mle_len,
++						       mld_addr)) {
++			u8 link_id = hapd->mld_link_id;
++
++			wpa_printf(MSG_DEBUG, "Allowing reassocation of MLD STA "
++				   MACSTR " after SA Query time out", MAC2STR(mld_addr));
++			sta->mld_info.mld_sta = true;
++			set_link_id_for_each_partner_link_sta(hapd,
++							      sta,
++							      link_id);
++			sta->mld_assoc_link_id = link_id;
++
++			/*
++			 * Set the MLD address as the station address and the
++			 * station addresses.
++			 */
++			os_memcpy(sta->mld_info.common_info.mld_addr, mld_addr,
++					ETH_ALEN);
++			os_memcpy(sta->mld_info.links[link_id].peer_addr,
++					mgmt->sa, ETH_ALEN);
++			os_memcpy(sta->mld_info.links[link_id].local_addr,
++					hapd->own_addr, ETH_ALEN);
++		} else {
++			wpa_printf(MSG_DEBUG, "Allowing reassocation of MLD STA as legacy"
++				   " STA " MACSTR " after timed out SA Query procedure",
++				   MAC2STR(mgmt->sa));
++			memset(&sta->mld_info, 0x00, sizeof(sta->mld_info));
++		}
++	}
++
+ 	/* followed by SSID and Supported rates; and HT capabilities if 802.11n
+ 	 * is used */
+ 	resp = check_assoc_ies(hapd, sta, pos, left,
+@@ -7464,12 +7507,18 @@ static void handle_auth_cb(struct hostap
+ 
+ 	sta = ap_get_sta(hapd, mgmt->da);
+ 	if (!sta) {
+-		sta = ap_get_unadded_sta(hapd, mgmt->da);
++		sta = ap_get_link_sta(hapd, mgmt->da);
+ 		if (!sta) {
++			sta = ap_get_unadded_sta(hapd, mgmt->da);
++			if (!sta) {
++				wpa_printf(MSG_DEBUG, "handle_auth_cb: sta " MACSTR
++						" not found",
++						MAC2STR(mgmt->da));
++				return;
++			}
++		} else {
+ 			wpa_printf(MSG_DEBUG, "handle_auth_cb: STA " MACSTR
+-				   " not found",
+-				   MAC2STR(mgmt->da));
+-			return;
++				   " identified as link STA", MAC2STR(mgmt->da));
+ 		}
+ 	}
+ 
+@@ -7663,11 +7712,17 @@ static void handle_assoc_cb(struct hosta
+ 
+ 	sta = ap_get_sta(hapd, mgmt->da);
+ 	if (!sta) {
+-		sta = ap_get_unadded_sta(hapd, mgmt->da);
++		sta = ap_get_link_sta(hapd, mgmt->da);
+ 		if (!sta) {
+-			wpa_printf(MSG_INFO, "handle_assoc_cb: STA " MACSTR " not found",
+-				   MAC2STR(mgmt->da));
+-			return;
++			sta = ap_get_unadded_sta(hapd, mgmt->da);
++			if (!sta) {
++				wpa_printf(MSG_INFO, "handle_assoc_cb: STA " MACSTR " not found",
++					   MAC2STR(mgmt->da));
++				return;
++			}
++		} else {
++			wpa_printf(MSG_DEBUG, "handle_assoc_cb: STA " MACSTR
++				   " identified as link STA", MAC2STR(mgmt->da));
+ 		}
+ 	}
+ 
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -948,8 +948,11 @@ sae_confirm_skip_fixed_fields(struct hos
+ 	 * on the MLD MAC address.
+ 	 */
+ 	sta = ap_get_sta(hapd, mgmt->sa);
+-	if (!sta && (sta = ap_get_unadded_sta(hapd, mgmt->sa)) == NULL) {
+-
++	if (!sta)
++		sta = ap_get_link_sta(hapd,mgmt->sa);
++	if (!sta)
++	 	sta = ap_get_unadded_sta(hapd, mgmt->sa);
++	if(!sta) {
+ 		for (sta = hapd->sta_list; sta; sta = sta->next) {
+ 			int link_id = hapd->mld_link_id;
+ 
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -348,6 +348,9 @@ struct sta_info {
+ 	 * response send without add the station in kernel.
+ 	 */
+ 	u8 unadded_sta;
++	/*auth received existing authorized sta*/
++	int mld_auth;
++	u8 reply_addr[6];
+ #endif /* CONFIG_IEEE80211BE */
+ 	u8 skip_kernel_delete;
+ 

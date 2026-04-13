@@ -1,0 +1,169 @@
+From 387409d42c47dfc0592717aadbde91a40ee79b2a Mon Sep 17 00:00:00 2001
+From: Girish Kumar M P <gmp@qti.qualcomm.com>
+Date: Sun, 27 Jul 2025 05:28:58 +0530
+Subject: [PATCH 2/2] UPSTREAM:DP:wifi:ath12k:Fix memory corruption in TID
+ setup and cleanup
+
+Currently, TID is created for all SoCs when a peer is created, but it is
+only flushed on the primary peer. This causes the allocated TID on the
+non-primary SoC to become corrupted when reassigned to another primary
+SoC.
+
+Fixed it by creating the TID only for the primary SoC.
+
+Currently, hal_reo_qdesc setup happens after dma_map, causing incorrect
+data to be written directly to DDR during initialization. This leads to
+potential data inconsistency due to cache not being flushed before DMA
+operations.
+
+Fixing it by moving hal_reo_qdesc setup before dma_map, ensuring that
+the data is properly set up and visible to the DMA engine. This avoids
+the need for additional cache maintenance operations post-initialization.
+
+Currently, the peer TID pointers are reset inside the REO update loop,
+causing cleanup to be skipped if the loop exits early due to pending REO
+commands.
+
+This leads to stale pointers in the peer's TID structure, which can
+result in memory leaks, invalid accesses, or incorrect REO behavior.
+
+Fixing it by moving the TID reset and REO cache clear outside the loop
+to ensure consistent cleanup. Also introduce a temporary variable to
+avoid overwriting the original TID pointer.
+
+Fixes: Ie1f91000ab9b ("wifi: ath12k: Modularization of peer object
+Part-2")
+
+Signed-off-by: Girish Kumar M P <gmp@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_rx.c       |  7 ++--
+ drivers/net/wireless/ath/ath12k/hal.c         |  1 +
+ drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c | 34 +++++++++----------
+ 3 files changed, 22 insertions(+), 20 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -767,8 +767,6 @@ int ath12k_wifi7_dp_rx_peer_tid_setup(st
+ 		return ret;
+ 	}
+ 
+-	ath12k_hal_reo_qdesc_setup(&ab->hal, addr_aligned, tid, ba_win_sz, ssn, pn_type);
+-
+ 	rx_tid->active = true;
+ 
+ 	if (ab->hw_params->reoq_lut_support) {
+@@ -912,6 +910,11 @@ int ath12k_dp_rx_peer_pn_replay_config(s
+ 		return -ENOENT;
+ 	}
+ 
++	if (!peer->primary_link) {
++		spin_unlock_bh(&dp->dp_lock);
++		return 0;
++	}
++
+ 	for (tid = 0; tid <= IEEE80211_NUM_TIDS; tid++) {
+ 		rx_tid = &peer->dp_peer->rx_tid[tid];
+ 		if (!rx_tid->active)
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -110,14 +110,6 @@ void ath12k_hal_reo_init_cmd_ring(struct
+ 	ab->hal.hal_ops->reo_init_cmd_ring(ab, srng);
+ }
+ 
+-void ath12k_hal_reo_qdesc_setup(struct ath12k_hal *hal,
+-				struct hal_rx_reo_queue *qdesc,
+-				int tid, u32 ba_window_size,
+-				u32 start_seq, enum hal_pn_type type)
+-{
+-	hal->hal_ops->reo_qdesc_setup(qdesc, tid, ba_window_size, start_seq, type);
+-}
+-
+ void ath12k_hal_rx_buf_addr_info_set(struct ath12k_buffer_addr *b_info,
+ 				     dma_addr_t paddr, u32 cookie,
+ 				     u8 manager)
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
+@@ -256,13 +256,6 @@ void ath12k_wifi7_dp_rx_tid_del_func(str
+ 				update_rx_tid->active = true;
+ 				break;
+ 			}
+-
+-			ath12k_wifi7_peer_rx_tid_qref_reset(ab,
+-							    qelem->is_ml_peer ?
+-							    qelem->ml_peer_id :
+-							    qelem->peer_id,
+-							    qelem->tid);
+-			ath12k_wifi7_hal_reo_shared_qaddr_cache_clear(ab);
+ 			update_rx_tid->vaddr = NULL;
+ 			update_rx_tid->paddr = 0;
+ 			update_rx_tid->size = 0;
+@@ -377,6 +370,7 @@ void ath12k_wifi7_dp_rx_peer_tid_delete(
+ 					struct ath12k_dp_link_peer *peer, u8 tid)
+ {
+ 	struct ath12k_dp_rx_tid *rx_tid = &peer->dp_peer->rx_tid[tid];
++	struct ath12k_dp_rx_tid *temp_rx_tid = NULL;
+ 	struct dp_reo_update_rx_queue_elem *elem, *tmp;
+ 	struct ath12k_base *ab = ar->ab;
+ 	struct ath12k_dp *dp   = ath12k_ab_to_dp(ab);
+@@ -401,26 +395,29 @@ void ath12k_wifi7_dp_rx_peer_tid_delete(
+ 
+ 	list_for_each_entry_safe(elem, tmp, &dp->reo_cmd_update_rx_queue_list,
+ 			list) {
+-		rx_tid = &elem->data;
++		temp_rx_tid = &elem->data;
+ 
+-		if (ath12k_wifi7_peer_rx_tid_delete_handler(ab, rx_tid, elem->tid)) {
+-			rx_tid->active = true;
++		if (ath12k_wifi7_peer_rx_tid_delete_handler(ab, temp_rx_tid, elem->tid)) {
++			temp_rx_tid->active = true;
+ 			elem->reo_cmd_update_rx_queue_resend_flag = true;
+ 			break;
+ 		}
+-		ath12k_wifi7_peer_rx_tid_qref_reset(ab,
+-						    elem->is_ml_peer ? elem->ml_peer_id :
+-						    elem->peer_id, elem->tid);
+-		ath12k_wifi7_hal_reo_shared_qaddr_cache_clear(ab);
+-		rx_tid->vaddr = NULL;
+-		rx_tid->paddr = 0;
+-		rx_tid->size = 0;
+-		rx_tid->pending_desc_size = 0;
++		temp_rx_tid->vaddr = NULL;
++		temp_rx_tid->paddr = 0;
++		temp_rx_tid->size = 0;
++		temp_rx_tid->pending_desc_size = 0;
+ 
+ 		list_del(&elem->list);
+ 		kfree(elem);
+ 	}
+ 	spin_unlock_bh(&dp->reo_cmd_update_rx_queue_lock);
++
++	ath12k_wifi7_peer_rx_tid_qref_reset(ab,	peer->mlo ? peer->ml_id : peer->peer_id, tid);
++	ath12k_wifi7_hal_reo_shared_qaddr_cache_clear(ab);
++	rx_tid->vaddr = NULL;
++	rx_tid->paddr = 0;
++	rx_tid->size = 0;
++	rx_tid->pending_desc_size = 0;
+ }
+ 
+ void  ath12k_wifi7_dp_setup_pn_check_reo_cmd(struct ath12k_hal_reo_cmd *cmd,
+@@ -3162,6 +3159,7 @@ int ath12k_wifi7_dp_alloc_reo_qdesc(stru
+ 		return -ENOMEM;
+ 
+ 	*addr_aligned = PTR_ALIGN(vaddr, HAL_LINK_DESC_ALIGN);
++	ath12k_wifi7_hal_reo_qdesc_setup(*addr_aligned, tid, ba_win_sz, ssn, pn_type);
+ #ifndef CONFIG_IO_COHERENCY
+ 	paddr = dma_map_single(ab->dev, *addr_aligned, hw_desc_sz,
+ 			       DMA_BIDIRECTIONAL);
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -1376,10 +1376,6 @@ void ath12k_hal_rx_desc_get_crypto_heade
+ 					  enum hal_encrypt_type enctype);
+ u16 ath12k_hal_rxdesc_get_mpdu_frame_ctrl(struct ath12k_base *ab,
+ 					  struct hal_rx_desc *desc);
+-void ath12k_hal_reo_qdesc_setup(struct ath12k_hal *hal,
+-				struct hal_rx_reo_queue *qdesc,
+-				int tid, u32 ba_window_size,
+-				u32 start_seq, enum hal_pn_type type);
+ void ath12k_hal_setup_link_idle_list(struct ath12k_base *ab,
+ 				     struct wbm_idle_scatter_list *sbuf,
+ 				     u32 nsbufs, u32 tot_link_desc,

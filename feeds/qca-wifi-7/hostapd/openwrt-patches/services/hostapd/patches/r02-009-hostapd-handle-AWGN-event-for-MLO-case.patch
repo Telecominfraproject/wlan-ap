@@ -1,0 +1,133 @@
+From 29ecaab5b17d7bd32dfdf37d97fe95cc5b1a6b2e Mon Sep 17 00:00:00 2001
+From: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Date: Wed, 25 Oct 2023 22:29:40 +0530
+Subject: [PATCH] hostapd: handle AWGN event for MLO case
+
+During MLO operation, appropriate link BSS needs to be identified
+based on the frequency info present in AWGN event and then the
+event should be further processed.
+
+Add changes to identify link BSS based on freq info in the AWGN
+event.
+
+Signed-off-by: Aditya Kumar Singh <quic_adisi@quicinc.com>
+---
+ src/drivers/driver_nl80211_event.c | 41 +++++++++++++++++++++++++++---
+ 1 file changed, 37 insertions(+), 4 deletions(-)
+
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -2670,10 +2670,11 @@ static void nl80211_radar_event(struct i
+ 		   bss->ifname);
+ }
+ 
+-static void nl80211_awgn_event(struct wpa_driver_nl80211_data *drv,
+-			        struct nlattr **tb)
++static void nl80211_awgn_event(struct i802_bss *bss, struct nlattr **tb)
+ {
++	struct wpa_driver_nl80211_data *drv = bss->drv;
+ 	union wpa_event_data data;
++	struct i802_bss *bss_iter;
+ 
+ 	os_memset(&data, 0, sizeof(data));
+ 
+@@ -2694,7 +2695,53 @@ static void nl80211_awgn_event(struct wp
+ 		data.awgn_event.chan_bw_interference_bitmap =
+ 			nla_get_u32(tb[NL80211_ATTR_AWGN_INTERFERENCE_BITMAP]);
+ 
+-	wpa_supplicant_event(drv->ctx, EVENT_AWGN_DETECTED, &data);
++	data.awgn_event.link_id = nl80211_get_link_id_by_freq(bss, data.awgn_event.freq);
++	if (data.awgn_event.link_id == NL80211_DRV_LINK_ID_NA) {
++		/* For non-MLO operation, freq should still match */
++		if (!bss->valid_links &&
++		    (int)bss->links[0].freq == data.dfs_event.freq)
++			goto process_awgn_event;
++	} else {
++		/* valid link ID was found */
++		goto process_awgn_event;
++	}
++
++	wpa_printf(MSG_DEBUG, "nl80211: Checking suitable BSS for the AWGN event");
++
++	/* This event comes without ifidx and wdev_id. Hence need to check on all BSSes.
++	 */
++	for (bss_iter = drv->first_bss; bss_iter; bss_iter = bss_iter->next) {
++		data.awgn_event.link_id =
++				nl80211_get_link_id_by_freq(bss_iter,
++							    data.awgn_event.freq);
++		if (data.awgn_event.link_id == NL80211_DRV_LINK_ID_NA) {
++			/* For non-MLO operation, freq should still match */
++			if (!bss_iter->valid_links &&
++			    (int)bss_iter->links[0].freq == data.awgn_event.freq) {
++				bss = bss_iter;
++				goto process_awgn_event;
++			}
++		} else {
++			/* valid link ID was found */
++			bss = bss_iter;
++			goto process_awgn_event;
++		}
++	}
++
++	wpa_printf(MSG_DEBUG, "nl80211: AWGN event on unknown freq on %s",
++		   bss->ifname);
++
++	return;
++
++process_awgn_event:
++	wpa_printf(MSG_DEBUG,
++		   "nl80211: AWGN event on freq %d MHz, width: %d, cf1: %d MHz, cf2: %d MHz, bitmap: 0x%x, link_id: %d",
++		   data.awgn_event.freq, data.awgn_event.chan_width,
++		   data.awgn_event.cf1, data.awgn_event.cf2,
++		   data.awgn_event.chan_bw_interference_bitmap,
++		   data.awgn_event.link_id);
++
++	wpa_supplicant_event(bss->ctx, EVENT_AWGN_DETECTED, &data);
+ }
+ 
+ static void nl80211_spurious_frame(struct i802_bss *bss, struct nlattr **tb,
+@@ -4312,7 +4359,7 @@ static void do_process_drv_event(struct
+ 		wpa_supplicant_event(drv->ctx, EVENT_LINK_RECONFIG, NULL);
+ 		break;
+ 	case NL80211_CMD_AWGN_DETECT:
+-		nl80211_awgn_event(drv, tb);
++		nl80211_awgn_event(bss, tb);
+ 		break;
+ 	default:
+ 		wpa_dbg(drv->ctx, MSG_DEBUG, "nl80211: Ignored unknown event "
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -7172,6 +7172,7 @@ union wpa_event_data {
+ 		int cf1;
+ 		int cf2;
+ 		u32 chan_bw_interference_bitmap;
++		int link_id;
+ 	} awgn_event;
+ 
+ 	/**
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -2837,6 +2837,7 @@ void hostapd_wpa_event(void *ctx, enum w
+ 	case EVENT_AWGN_DETECTED:
+ 		if (!data)
+ 			break;
++		hapd = switch_link_hapd(hapd, data->awgn_event.link_id);
+ 		hostapd_event_awgn_detected(hapd, &data->awgn_event);
+ 		break;
+ 	case EVENT_DFS_PRE_CAC_EXPIRED:
+--- a/src/ap/interference.c
++++ b/src/ap/interference.c
+@@ -242,6 +242,13 @@ static int intf_awgn_find_channel_list(s
+ 	for (i = 0; i < mode->num_channels; i++) {
+ 		chan = &mode->channels[i];
+ 
++		if (!chan_in_current_hw_info(iface->current_hw_info, chan)) {
++			wpa_printf(MSG_DEBUG,
++				   "AWGN: channel %d (%d) is not under current hardware index",
++				   chan->freq, chan->chan);
++			continue;
++		}
++
+ 		/* Skip incompatible chandefs */
+ 		if (!intf_awgn_chan_range_available(mode, i, n_chans)) {
+ 			wpa_printf(MSG_DEBUG,

@@ -1,0 +1,160 @@
+From a2ccaacff79db0558a95695c63c2e8e5e2fc68a5 Mon Sep 17 00:00:00 2001
+From: Karthik M <quic_karm@quicinc.com>
+Date: Mon, 21 Apr 2025 08:46:43 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: Handle Dynamic link address change for connected
+ STA
+
+When an already connected Multi-Link Device (MLD) Station (STA) sends a
+reassociation request with a different link address, the Access Point (AP)
+initiates a Security Association (SA) query to the MLD address it has
+on record. However, the STA does not receive the SA query,
+leading to a timeout as AP sends out with old ML address.
+Consequently, the AP rejects the STA's reassociation request since
+the AP will not have station entry.
+
+The STA then restarts the authentication process with the AP,
+but this new request also contains a different link address.
+As a result, the STA repeatedly comes up new link address and
+fails to connect.
+
+If an authentication request from a MLD STA is received with
+a SA query timeout, the AP update the new link address from
+the authentication request and re-add the STA.
+When a previously connected STA returns with a new link address but
+retains the old ML address, Hostapd sends out to driver with
+new link address, the driver translates the Multi-Link (ML)
+address to the link address upon response. In this scenario,
+the authentication response will be sent to the old link address,
+which the STA might miss. To prevent this, send the authentication
+response to the same SA address, ensuring the driver does not perform
+the translation and the packet reaches the intended destination.
+The AP will then send an authentication reply with the updated link
+address for the MLD STA instead of the MLD address.
+Add support to update the SA query timeout to all the linked stations
+of MLD STA, It helps maintaining integrity during Reassociation.
+
+Patch-work: Patch-work: [PATCH] Hostapd: Handle Dynamic link address change
+            for connected  STA
+Patch-dependency: None
+
+Co-developed-by: Arunpandi Kannan <quic_arunpand@quicinc.com>
+Signed-off-by: Arunpandi Kannan <quic_arunpand@quicinc.com>
+Signed-off-by: Karthik M <quic_karm@quicinc.com>
+---
+ src/ap/ieee802_11.c | 72 ++++++++++++++++++++++++++++++++++++---------
+ 1 file changed, 58 insertions(+), 14 deletions(-)
+
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -3416,6 +3416,20 @@ static void handle_auth(struct hostapd_d
+ 
+ 	sta = ap_get_sta(hapd, sa);
+ 	if (sta) {
++#ifdef CONFIG_IEEE80211BE
++		if (mld_sta && sta->sa_query_timed_out) {
++			if (os_memcmp(mgmt->sa, sta->addr, ETH_ALEN)) {
++				u8 link_id = hapd->mld_link_id;
++
++				os_memcpy(sta->mld_info.links[link_id].peer_addr,
++					  mgmt->sa, ETH_ALEN);
++				if (ap_sta_re_add(hapd, sta, 1) < 0) {
++					resp = WLAN_STATUS_UNSPECIFIED_FAILURE;
++					goto fail;
++				}
++			}
++		}
++#endif /* CONFIG_IEEE80211BE */
+ 		sta->flags &= ~WLAN_STA_PENDING_FILS_ERP;
+ 		sta->ft_over_ds = 0;
+ 		if ((fc & WLAN_FC_RETRY) &&
+@@ -6162,10 +6176,18 @@ static void handle_assoc(struct hostapd_
+ 		sta = handle_mlo_translate(hapd, mgmt, len, reassoc,
+ 					   &assoc_hapd);
+ 		if (sta) {
+-			wpa_printf(MSG_DEBUG,
+-				   "MLD: Switching to assoc hapd/station");
+-			hapd = assoc_hapd;
+-			mld_addrs_not_translated = true;
++			if (hapd != assoc_hapd) {
++				wpa_printf(MSG_DEBUG,
++					   "MLD: Switching to assoc hapd/station");
++				hapd = assoc_hapd;
++				mld_addrs_not_translated = true;
++			}
++			if (sta->sa_query_timed_out) {
++				u8 link_id = hapd->mld_link_id;
++
++				os_memcpy(sta->mld_info.links[link_id].peer_addr,
++					  mgmt->sa, ETH_ALEN);
++			}
+ 		}
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+@@ -7541,7 +7563,7 @@ static void handle_assoc_cb(struct hosta
+ 	else
+ 		mlme_associate_indication(hapd, sta);
+ 
+-	sta->sa_query_timed_out = 0;
++	ap_sta_set_sa_query_timeout(hapd, sta, 0);
+ 
+ 	if (sta->eapol_sm == NULL) {
+ 		/*
+@@ -7558,7 +7580,7 @@ static void handle_assoc_cb(struct hosta
+ 	}
+ 
+ 	hostapd_set_sta_flags(hapd, sta);
+-	sta->sa_query_timed_out = 0;
++	ap_sta_set_sa_query_timeout(hapd, sta, 0);
+ 
+ 	if (!(sta->flags & WLAN_STA_WDS) && sta->pending_wds_enable) {
+ 		wpa_printf(MSG_DEBUG, "Enable 4-address WDS mode for STA "
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -1751,6 +1751,27 @@ done:
+ }
+ 
+ 
++void ap_sta_set_sa_query_timeout(struct hostapd_data *hapd, struct sta_info *sta, int value)
++{
++	struct sta_info *lsta;
++	struct hostapd_data *lhapd;
++
++	sta->sa_query_timed_out = value;
++#ifdef CONFIG_IEEE80211BE
++	if (ap_sta_is_mld(hapd, sta)) {
++		for_each_mld_link(lhapd, hapd) {
++			if (lhapd == hapd)
++				continue;
++
++			lsta = ap_get_sta(lhapd, sta->addr);
++			if (lsta)
++				lsta->sa_query_timed_out = value;
++		}
++	}
++#endif /* CONFIG_IEEE80211BE */
++	return;
++}
++
+ int ap_check_sa_query_timeout(struct hostapd_data *hapd, struct sta_info *sta)
+ {
+ 	u32 tu;
+@@ -1763,7 +1784,7 @@ int ap_check_sa_query_timeout(struct hos
+ 			       HOSTAPD_MODULE_IEEE80211,
+ 			       HOSTAPD_LEVEL_DEBUG,
+ 			       "association SA Query timed out");
+-		sta->sa_query_timed_out = 1;
++		ap_sta_set_sa_query_timeout(hapd, sta, 1);
+ 		os_free(sta->sa_query_trans_id);
+ 		sta->sa_query_trans_id = NULL;
+ 		sta->sa_query_count = 0;
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -434,6 +434,8 @@ int ap_sta_set_vlan(struct hostapd_data
+ void ap_sta_start_sa_query(struct hostapd_data *hapd, struct sta_info *sta);
+ void ap_sta_stop_sa_query(struct hostapd_data *hapd, struct sta_info *sta);
+ int ap_check_sa_query_timeout(struct hostapd_data *hapd, struct sta_info *sta);
++void ap_sta_set_sa_query_timeout(struct hostapd_data *hapd,
++				 struct sta_info *sta, int value);
+ const char * ap_sta_wpa_get_keyid(struct hostapd_data *hapd,
+ 				  struct sta_info *sta);
+ const u8 * ap_sta_wpa_get_dpp_pkhash(struct hostapd_data *hapd,

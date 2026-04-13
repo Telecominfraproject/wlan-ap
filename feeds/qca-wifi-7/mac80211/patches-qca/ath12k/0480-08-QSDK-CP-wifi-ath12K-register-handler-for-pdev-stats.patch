@@ -1,0 +1,190 @@
+From 292aa4a476cb8ffb3f3b8bb9865eed33d5e8ad89 Mon Sep 17 00:00:00 2001
+From: Sidhanta Sahu <sidhanta.sahu@oss.qualcomm.com>
+Date: Mon, 7 Jul 2025 10:42:36 -0700
+Subject: [PATCH 08/24] QSDK:CP:wifi:ath12K: register handler for pdev stats
+
+Configure handler for processing pdev stats to be called
+by telemetry agent.
+
+Patch-dependency:
+0462-07-QSDK-CP-wifi-ath12K-register-handler-for-peer-info.patch
+
+Signed-off-by: Sidhanta Sahu <sidhanta.sahu@oss.qualcomm.com>
+Signed-off-by: Aloka Dixit <aloka.dixit@oss.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h        |  5 ++
+ drivers/net/wireless/ath/ath12k/mac.c         | 39 ++++++++++++
+ drivers/net/wireless/ath/ath12k/mac.h         |  5 ++
+ .../wireless/ath/ath12k/telemetry_agent_if.c  | 59 ++++++++++++++++---
+ 4 files changed, 101 insertions(+), 7 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -729,6 +729,11 @@ struct ath12k_bridge_iter {
+ 	u8 active_num_devices;
+ };
+ 
++struct ath12k_vif_chanctx_iter {
++	struct ath12k *ar;
++	struct ieee80211_chanctx_conf *chanctx;
++};
++
+ #define ATH12K_SCAN_TIMEOUT_HZ (20 * HZ)
+ 
+ #define ATH12K_EHT_MCS_NUM	16
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -836,6 +836,48 @@ struct ath12k_link_vif *ath12k_mac_get_a
+ 	return arvif_iter.arvif;
+ }
+ 
++static void ath12k_get_active_arvif_chanctx_iter_rcu(void *data, u8 *mac,
++						     struct ieee80211_vif *vif)
++{
++	struct ath12k_vif *ahvif = (void *)vif->drv_priv;
++	struct ath12k_vif_chanctx_iter *arvif_iter = data;
++	struct ath12k_link_vif *arvif = NULL;
++	struct ieee80211_bss_conf *link_conf;
++	u8 link_id;
++
++	for_each_vif_active_link(vif, link_conf, link_id) {
++		arvif = rcu_dereference(ahvif->link[link_id]);
++		if (arvif && arvif->ar == arvif_iter->ar) {
++			if (arvif->link_id != ATH12K_DEFAULT_SCAN_LINK &&
++			    arvif->chanctx.def.chan)
++				arvif_iter->chanctx = &arvif->chanctx;
++			else
++				arvif_iter->chanctx = NULL;
++
++			break;
++		}
++	}
++}
++
++struct ieee80211_chanctx_conf *
++ath12k_mac_get_first_active_arvif_chanctx(struct ath12k *ar)
++{
++	struct ath12k_vif_chanctx_iter arvif_iter = {};
++	u32 flags;
++
++	arvif_iter.ar = ar;
++	arvif_iter.chanctx = NULL;
++
++	flags = IEEE80211_IFACE_ITER_RESUME_ALL;
++	ieee80211_iterate_active_interfaces_atomic(
++		ar->ah->hw,
++		flags,
++		ath12k_get_active_arvif_chanctx_iter_rcu,
++		&arvif_iter
++	);
++	return arvif_iter.chanctx;
++}
++
+ struct ath12k_link_vif *ath12k_mac_get_arvif_by_vdev_id(struct ath12k_base *ab,
+ 							u32 vdev_id)
+ {
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -670,4 +670,7 @@ int ath12k_mac_op_get_afc_eirp_pwr(struc
+  */
+ enum nl80211_6ghz_dev_deployment_type
+ ath12k_mac_op_get_6ghz_dev_deployment_type(struct ieee80211_hw *hw);
++
++struct ieee80211_chanctx_conf *
++	ath12k_mac_get_first_active_arvif_chanctx(struct ath12k *ar);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/telemetry_agent_if.c
++++ b/drivers/net/wireless/ath/ath12k/telemetry_agent_if.c
+@@ -11,6 +11,7 @@
+ #include "dp_peer.h"
+ #include "dp_mon.h"
+ #include "sdwf.h"
++#include "mac.h"
+ #include <linux/module.h>
+ 
+ struct telemetry_agent_ops *g_agent_ops;
+@@ -382,6 +383,71 @@ int ath12k_get_peer_info(void *obj, stru
+ 	return 0;
+ }
+ 
++int ath12k_get_pdev_stats(void *obj, struct agent_link_iface_stats_obj *stats)
++{
++	struct ath12k_pdev *pdev = (struct ath12k_pdev *)obj;
++	struct ath12k_pdev_telemetry_stats dp_stats;
++	struct ath12k_pdev_ctrl_path_stats *pdev_stats;
++	struct ieee80211_chanctx_conf *ctx;
++	struct ath12k_base *ab;
++	struct ath12k *ar;
++	int ac;
++
++	if (!pdev)
++		return -EINVAL;
++
++	ar = pdev->ar;
++	if (!ar) {
++		ath12k_err(NULL, "Failed to get ar from telemetry agent object pdev\n");
++		return -EINVAL;
++	}
++
++	ab = ar->ab;
++	pdev_stats = &ar->stats;
++	if (!pdev_stats ||
++	    ath12k_dp_get_pdev_telemetry_stats(ab, pdev->pdev_id, &dp_stats)) {
++		return -EINVAL;
++	}
++
++	memset(stats, 0, sizeof(*stats));
++	if (ar->monitor_started)
++		stats->is_mon_enabled  = true;
++
++	ctx = ath12k_mac_get_first_active_arvif_chanctx(ar);
++	if (!ctx)
++		return -ENOENT;
++
++	stats->freq = ctx->def.chan->center_freq;
++	stats->link_id = pdev->hw_link_id;
++	stats->soc_id = ath12k_get_ab_device_id(ab);
++
++	stats->available_airtime[0] =
++		pdev_stats->telemetry_stats.estimated_air_time_ac_be;
++	stats->available_airtime[1] =
++		pdev_stats->telemetry_stats.estimated_air_time_ac_bk;
++	stats->available_airtime[2] =
++		pdev_stats->telemetry_stats.estimated_air_time_ac_vi;
++	stats->available_airtime[3] =
++		pdev_stats->telemetry_stats.estimated_air_time_ac_vo;
++
++	stats->freetime = pdev_stats->pdev_freetime_per_sec;
++	for (ac = 0; ac < ATH12K_DP_WLAN_MAX_AC; ac++) {
++		stats->link_airtime[ac] = dp_stats.link_airtime[ac];
++		ath12k_dbg(NULL, ATH12K_DBG_RM,
++			   "pdev stats soc id : %d pdev id: %d link id: %d freq: %d AC: %d Available Airtime: %d Link Airtime: %d\n",
++			   stats->soc_id, pdev_stats->telemetry_stats.pdev_id,
++			   stats->link_id, stats->freq,
++			   ac, stats->available_airtime[ac], stats->link_airtime[ac]);
++	}
++
++	ath12k_dbg(NULL, ATH12K_DBG_RM,
++		   "pdev stats soc id : %d link id: %d freetime: %d is_mon_enabled: %d",
++		   stats->soc_id, stats->link_id, stats->freetime,
++		   stats->is_mon_enabled);
++
++	return 0;
++}
++
+ int register_telemetry_agent_ops(struct telemetry_agent_ops *agent_ops)
+ 
+ {
+@@ -418,12 +484,6 @@ int unregister_telemetry_agent_ops(struc
+ }
+ EXPORT_SYMBOL(unregister_telemetry_agent_ops);
+ 
+-int ath12k_get_pdev_stats(void *obj, struct agent_link_iface_stats_obj *stats)
+-{
+-	ath12k_err(NULL, "ath12k_get_pdev_stats - not implemented \n");
+-	return -1;
+-}
+-
+ int ath12k_get_peer_stats(void *obj, struct agent_peer_iface_stats_obj *stats)
+ {
+ 	ath12k_err(NULL, "ath12k_get_peer_stats - not implemented \n");

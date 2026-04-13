@@ -1,0 +1,153 @@
+From 316be0c1e66b25738b464456969a45940aa94216 Mon Sep 17 00:00:00 2001
+From: Wen Gong <quic_wgong@quicinc.com>
+Date: Wed, 12 Feb 2025 10:38:29 +0800
+Subject: [PATCH 037/141] wifi: ath12k: avoid deadlock during regulatory update
+ in ath12k_regd_update()
+
+Running this test in a loop it is easy to reproduce an rtnl deadlock:
+
+iw reg set FI
+ifconfig wlan0 down
+
+What happens is that thread A (workqueue) tries to update the regulatory:
+
+    try to acquire the rtnl_lock of ar->regd_update_work
+
+    rtnl_lock
+    ath12k_regd_update [ath12k]
+    ath12k_regd_update_work [ath12k]
+    process_one_work
+    worker_thread
+    kthread
+    ret_from_fork
+
+And thread B (ifconfig) tries to stop the interface:
+
+    try to cancel_work_sync(&ar->regd_update_work) in ath12k_mac_op_stop().
+    ifconfig  3109 [003]  2414.232506: probe:
+
+    ath12k_mac_op_stop [ath12k]
+    drv_stop [mac80211]
+    ieee80211_do_stop [mac80211]
+    ieee80211_stop [mac80211]
+
+The sequence of deadlock is:
+
+1. Thread B calls rtnl_lock().
+
+2. Thread A starts to run and calls rtnl_lock() from within
+   ath12k_regd_update_work(), then enters wait state because the lock is
+   owned by thread B.
+
+3. Thread B tries to call cancel_work_sync(&ar->regd_update_work), but
+   thread A is in ath12k_regd_update_work() waiting for rtnl_lock(). So
+   cancel_work_sync() forever waits for ath12k_regd_update_work() to
+   finish and we have a deadlock.
+
+Change to use regulatory_set_wiphy_regd(), which is the asynchronous
+version of regulatory_set_wiphy_regd_sync(). This way rtnl & wiphy locks
+are not required so can be removed, and in the end the deadlock issue can
+be avoided.
+
+But a side effect introduced by the asynchronous regd update is that,
+some essential information used in ath12k_reg_update_chan_list(), which
+would be called later in ath12k_regd_update(), might has not been updated
+by cfg80211, as a result wrong channel parameters sent to firmware.
+
+To handle this side effect, move ath12k_reg_update_chan_list() to
+ath12k_reg_notifier(), and advertise WIPHY_FLAG_NOTIFY_REGDOM_BY_DRIVER
+to cfg80211. This works because, in the process of the asynchronous regd
+update, after the new regd is processed, cfg80211 will notify ath12k by
+calling ath12k_reg_notifier(). Since all essential information is updated
+at that time, we are good to do channel list update.
+
+Please note ath12k_reg_notifier() could also be called due to other
+reasons, like core/beacon/user hints etc. For them we are not allowed to
+call ath12k_reg_update_chan_list() because regd has not been updated.
+This is done by verifying  the initiator.
+
+Tested-on: WCN7850 hw2.0 PCI WLAN.HMT.1.0.c5-00481-QCAHMTSWPL_V1.0_V2.0_SILICONZ-3
+
+Signed-off-by: Wen Gong <quic_wgong@quicinc.com>
+Co-developed-by: Baochen Qiang <quic_bqiang@quicinc.com>
+Signed-off-by: Baochen Qiang <quic_bqiang@quicinc.com>
+Acked-by: Jeff Johnson <quic_jjohnson@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/reg.c | 35 +++++++++++++++------------
+ 1 file changed, 20 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/reg.c b/drivers/net/wireless/ath/ath12k/reg.c
+index e34ae29a8a50..c3218fc4a837 100644
+--- a/drivers/net/wireless/ath/ath12k/reg.c
++++ b/drivers/net/wireless/ath/ath12k/reg.c
+@@ -55,6 +55,24 @@ ath12k_reg_notifier(struct wiphy *wiphy, struct regulatory_request *request)
+ 	ath12k_dbg(ar->ab, ATH12K_DBG_REG,
+ 		   "Regulatory Notification received for %s\n", wiphy_name(wiphy));
+ 
++	if (request->initiator == NL80211_REGDOM_SET_BY_DRIVER) {
++		ath12k_dbg(ar->ab, ATH12K_DBG_REG,
++			   "driver initiated regd update\n");
++		if (ah->state != ATH12K_HW_STATE_ON)
++			return;
++
++		for_each_ar(ah, ar, i) {
++			ret = ath12k_reg_update_chan_list(ar);
++			if (ret) {
++				ath12k_warn(ar->ab,
++					    "failed to update chan list for pdev %u, ret %d\n",
++					    i, ret);
++				break;
++			}
++		}
++		return;
++	}
++
+ 	/* Currently supporting only General User Hints. Cell base user
+ 	 * hints to be handled later.
+ 	 * Hints from other sources like Core, Beacons are not expected for
+@@ -211,7 +229,6 @@ int ath12k_regd_update(struct ath12k *ar, bool init)
+ 	struct ieee80211_regdomain *regd, *regd_copy = NULL;
+ 	int ret, regd_len, pdev_id;
+ 	struct ath12k_base *ab;
+-	int i;
+ 
+ 	ab = ar->ab;
+ 
+@@ -275,11 +292,7 @@ int ath12k_regd_update(struct ath12k *ar, bool init)
+ 		goto err;
+ 	}
+ 
+-	rtnl_lock();
+-	wiphy_lock(hw->wiphy);
+-	ret = regulatory_set_wiphy_regd_sync(hw->wiphy, regd_copy);
+-	wiphy_unlock(hw->wiphy);
+-	rtnl_unlock();
++	ret = regulatory_set_wiphy_regd(hw->wiphy, regd_copy);
+ 
+ 	kfree(regd_copy);
+ 
+@@ -290,15 +303,6 @@ int ath12k_regd_update(struct ath12k *ar, bool init)
+ 		goto skip;
+ 
+ 	ah->regd_updated = true;
+-	/* Apply the new regd to all the radios, this is expected to be received only once
+-	 * since we check for ah->regd_updated and allow here only once.
+-	 */
+-	for_each_ar(ah, ar, i) {
+-		ab = ar->ab;
+-		ret = ath12k_reg_update_chan_list(ar);
+-		if (ret)
+-			goto err;
+-	}
+ skip:
+ 	return 0;
+ err:
+@@ -770,6 +774,7 @@ void ath12k_regd_update_work(struct work_struct *work)
+ void ath12k_reg_init(struct ieee80211_hw *hw)
+ {
+ 	hw->wiphy->regulatory_flags = REGULATORY_WIPHY_SELF_MANAGED;
++	hw->wiphy->flags |= WIPHY_FLAG_NOTIFY_REGDOM_BY_DRIVER;
+ 	hw->wiphy->reg_notifier = ath12k_reg_notifier;
+ }
+ 
+-- 

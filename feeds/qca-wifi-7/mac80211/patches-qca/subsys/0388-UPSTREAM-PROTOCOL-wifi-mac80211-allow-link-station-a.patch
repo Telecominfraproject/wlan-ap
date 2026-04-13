@@ -1,0 +1,186 @@
+From b50a4a81e8735031edf3e2fa1d11abc795c8c1fb Mon Sep 17 00:00:00 2001
+From: Hari Naraayana Desikan Kannan <hnaraaya@qti.qualcomm.com>
+Date: Wed, 24 Sep 2025 23:04:20 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: wifi: mac80211: allow link STA add during
+ ML reconfig when MAC exists
+
+During MLO reconfiguration, a station may move from one link to another
+while keeping the same link MAC address.  The ML reconfiguration request
+can contain both add and remove operations with same link mac address.
+
+Currently, ieee80211_sta_activate_link() rejects the add with
+-EALREADY if the mac address already exists in the link STA hash,
+even when the old link is being removed in the same request.
+This causes valid reconfiguration to fail.
+
+Process the add first to avoid tearing down the STA context and keys
+when the station has only one active link. Attach the new link to the
+existing STA context, and when removing the old link later, move its
+context to the new link.
+
+If an added link's MAC matches a link marked for removal in the same
+request, delete the old hash entry and accept the add.
+When the corresponding station link remove is processed after the
+ML reconfiguration completes, skip hash removal for links that
+were already removed during the add.
+
+Signed-off-by: Hari Naraayana Desikan Kannan <hnaraaya@qti.qualcomm.com>
+---
+ include/net/mac80211.h  |  1 +
+ net/mac80211/cfg.c      | 28 ++++++++++++++++++++++++++++
+ net/mac80211/sta_info.c | 39 ++++++++++++++++++++++++++++++++++-----
+ 3 files changed, 63 insertions(+), 5 deletions(-)
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -2762,10 +2762,11 @@ struct ieee80211_sta {
+ 	struct ieee80211_link_sta __rcu *link[IEEE80211_MLD_MAX_NUM_LINKS];
+ 	/* multi-link reconfiguration */
+ 	struct {
+ 		u16 removed_links;
+ 		u16 added_links;
++		u16 matched_rem_links;
+ 	} reconf;
+ 
+ 	u16 eml_cap;
+ 	u16 mld_cap_op;
+ 	struct net_device *dev;
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -6134,10 +6134,14 @@ static int ieee80211_sta_assoc_ml_reconf
+ 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+ 	struct sta_info *sta;
+ 	struct link_station_parameters *link_params;
+ 	const struct wiphy_iftype_ext_capab *ift_ext_capa;
+ 	unsigned long added_links = 0, link_id = 0, added_ok = 0;
++	unsigned long matched_rem_links = 0;
++	struct link_sta_info *link_sta;
++	unsigned long rem_links = req->rem_links;
++	unsigned long link_id_iter;
+ 	u16 new_active_links;
+ 	int ret = 0;
+ 	__le16 mld_capa_ops = 0;
+ 
+ 	ift_ext_capa = cfg80211_get_iftype_ext_capa(sdata->local->hw.wiphy,
+@@ -6159,10 +6163,35 @@ static int ieee80211_sta_assoc_ml_reconf
+ 
+ 		if (sta->sta.valid_links & BIT(link_id))
+ 			continue;
+ 
+ 		added_links |= BIT(link_id);
++
++		for_each_set_bit(link_id_iter, &rem_links,
++				 IEEE80211_MLD_MAX_NUM_LINKS) {
++			link_sta = wiphy_dereference(sta->local->hw.wiphy,
++						     sta->link[link_id_iter]);
++
++			if (!link_sta)
++				continue;
++
++			if (ether_addr_equal(link_sta->addr,
++					     req->u.link_sta_params[link_id].link_mac)){
++				/*
++				 * Reject if the same link MAC is specified
++				 * for more than one added link in
++				 * the reconfiguration request.
++				 */
++				if (matched_rem_links & BIT(link_id_iter)) {
++					sta->sta.reconf.matched_rem_links = 0;
++					return -EINVAL;
++				}
++
++				matched_rem_links |= BIT(link_id_iter);
++				sta->sta.reconf.matched_rem_links |= BIT(link_id_iter);
++			}
++		}
+ 	}
+ 	/* Reject if:
+ 	 * any link is both added and removed,
+ 	 * no links are being changed,
+ 	 * removed links are not active,
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@ -3368,25 +3368,49 @@ void ieee80211_sta_free_link(struct sta_
+ }
+ 
+ int ieee80211_sta_activate_link(struct sta_info *sta, unsigned int link_id)
+ {
+ 	struct ieee80211_sub_if_data *sdata = sta->sdata;
+-	struct link_sta_info *link_sta;
++	struct link_sta_info *link_sta, *rem_link_sta;
+ 	u16 old_links = sta->sta.valid_links;
+ 	u16 new_links = old_links | BIT(link_id);
++	bool exists;
++	unsigned long rem_links = sta->sta.reconf.matched_rem_links;
++	unsigned long rem_link_id;
+ 	int ret;
+ 
+ 	link_sta = rcu_dereference_protected(sta->link[link_id],
+ 					     lockdep_is_held(&sdata->local->hw.wiphy->mtx));
+ 
+ 	if (WARN_ON(old_links == new_links || !link_sta))
+ 		return -EINVAL;
+ 
+ 	rcu_read_lock();
+-	if (link_sta_info_hash_lookup(sdata->local, link_sta->addr)) {
+-		rcu_read_unlock();
+-		return -EALREADY;
++	exists = link_sta_info_hash_lookup(sdata->local, link_sta->addr);
++
++	/*
++	 * If the link being added has the same MAC address as a link marked for
++	 * removal in the current ML reconfiguration request, the existing hash
++	 * entry is stale. Remove it now and proceed with the add.
++	 */
++
++	if (exists) {
++		if (!sta->sta.reconf.matched_rem_links)
++			return -EALREADY;
++
++		for_each_set_bit(rem_link_id,
++				 &rem_links,
++				 IEEE80211_MLD_MAX_NUM_LINKS) {
++			rem_link_sta = wiphy_dereference(sta->local->hw.wiphy,
++							 sta->link[rem_link_id]);
++
++			if (!ether_addr_equal(rem_link_sta->addr,
++					      link_sta->addr))
++				continue;
++
++			link_sta_info_hash_del(sdata->local, rem_link_sta);
++		}
+ 	}
+ 	/* we only modify under the mutex so this is fine */
+ 	rcu_read_unlock();
+ 
+ 	sta->sta.valid_links = new_links;
+@@ -3420,10 +3444,11 @@ void ieee80211_sta_remove_link(struct st
+ {
+ 	struct ieee80211_sub_if_data *sdata = sta->sdata;
+ 	struct link_sta_info *sta_info;
+ 	struct ieee80211_link_sta *link_sta;
+ 	u16 old_links = sta->sta.valid_links, n_link_id;
++	bool unhash = true;
+ 
+ 	lockdep_assert_wiphy(sdata->local->hw.wiphy);
+ 
+ 	sta->sta.valid_links &= ~BIT(link_id);
+ 
+@@ -3433,11 +3458,16 @@ void ieee80211_sta_remove_link(struct st
+ 			sta->sta.valid_links |= BIT(link_id);
+ 			return;
+ 		}
+ 
+ 	sta->sta.reconf.removed_links &= ~BIT(link_id);
+-	sta_remove_link(sta, link_id, true);
++	if (sta->sta.reconf.matched_rem_links & BIT(link_id)) {
++		unhash = false;
++		sta->sta.reconf.matched_rem_links &= ~BIT(link_id);
++	}
++
++	sta_remove_link(sta, link_id, unhash);
+ 
+ 	/* If deflink is getting removed, then move the contents of the next
+ 	 * asosciated link to deflink and free the moved link memory
+ 	 */
+ 	if (sta->deflink.link_id == link_id) {

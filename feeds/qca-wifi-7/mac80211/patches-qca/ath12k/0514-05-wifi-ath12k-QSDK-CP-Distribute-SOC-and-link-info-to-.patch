@@ -1,0 +1,173 @@
+From 1ca803f52acdabd5ec466c558cc849c7a7eda11c Mon Sep 17 00:00:00 2001
+From: Sidhanta Sahu <sidhanta.sahu@oss.qualcomm.com>
+Date: Tue, 12 Aug 2025 18:28:01 -0700
+Subject: [PATCH 5/5] wifi: ath12k: QSDK: CP: Distribute SOC and link info to
+ all enabled vendor apps
+
+Add service_id parameter to ath12k_vendor_send_link_info() to embed the
+service identifier in link report netlink messages. Modify the vendor
+report work queue to be scheduled only once when link state changes,
+with the work handler responsible for distributing SOC and link
+information to all enabled services.
+
+With the introduction of containerized vendor applications, multiple
+independent services need to receive SOC and link information. This
+change ensures efficient distribution of this information to all
+enabled services while minimizing work queue overhead.
+
+Patch-dependency:
+	0480-11-QSDK-CP-wifi-ath12K-implement-handshake-between-driv.patch
+
+Signed-off-by: Sidhanta Sahu <sidhanta.sahu@oss.qualcomm.com>
+---
+ .../net/wireless/ath/ath12k/vendor_services.c | 74 +++++++++++++++----
+ .../net/wireless/ath/ath12k/vendor_services.h |  4 +
+ 2 files changed, 65 insertions(+), 13 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/vendor_services.c
++++ b/drivers/net/wireless/ath/ath12k/vendor_services.c
+@@ -312,11 +312,11 @@ error:
+ }
+ 
+ int ath12k_vendor_send_link_info(struct ath12k_vendor_soc_device_info *soc_info,
+-				 struct ath12k_vendor_link_info *link_info)
++				 struct ath12k_vendor_link_info *link_info,
++				 u8 service_id)
+ {
+ 	int vendor_data_len =
+ 		nla_total_size(sizeof(struct ath12k_vendor_soc_device_info));
+-	u8 service_id = ATH12K_RM_MAIN_SERVICE;
+ 
+ 	return ath12k_vendor_send_init_response(service_id, vendor_data_len,
+ 						soc_info, link_info);
+@@ -329,18 +329,60 @@ static void ath12k_vendor_link_initializ
+ 	struct ath12k_vendor_service_info *vendor_info = vendor_work->vendor_info;
+ 	struct ath12k_vendor_soc_device_info *soc_info, *tmp;
+ 	struct ath12k_vendor_link_info *link_info;
+-	int ret;
++	int ret, id;
++	bool service_sent = false;
+ 
+ 	mutex_lock(&vendor_info->list_lock);
+ 	list_for_each_entry_safe(soc_info, tmp, &vendor_info->soc_list, list) {
+ 		link_info = &soc_info->link_info[0];
+-		ret = ath12k_vendor_send_link_info(soc_info, link_info);
+-		if (ret)
+-			ath12k_err(NULL, "Failed to send link info due to NL issue for soc: %d link: %d",
+-				    soc_info->soc_id, link_info->hw_link_id);
+-		else
++		/* Send to all enabled services */
++		service_sent = false;
++		/* First check if main service is enabled */
++		if (vendor_info->service_enabled[ATH12K_RM_MAIN_SERVICE]) {
++			ret = ath12k_vendor_send_link_info(soc_info, link_info,
++							   ATH12K_RM_MAIN_SERVICE);
++			if (ret) {
++				ath12k_err(NULL, "Failed to send link info to main service due to NL issue for soc: %d link: %d",
++					   soc_info->soc_id, link_info->hw_link_id);
++			} else {
++				ath12k_dbg(NULL, ATH12K_DBG_RM,
++					   "Sent link info for soc: %d hw link id: %d to main service",
++					   soc_info->soc_id, link_info->hw_link_id);
++				service_sent = true;
++			}
++		}
++
++		 /* TODO: Currently, any async event notifies to userspace via
++		  * vendor NL path and to notify about link state changes,
++		  * leverage the generic NL path to notify userspace, this will
++		  * avoid having this async workqueue to handle such scenarios
++		  * this requires changes to all the stack
++		  * For now, use below method to notify to all enabled
++		  * services by checking for any dynamic services
++		  */
++		for (id = 0; id < ATH12K_RM_MAX_SERVICE; id++) {
++			if (id != ATH12K_RM_MAIN_SERVICE &&
++			    test_bit(id, &vendor_info->dynamic_svc_bitmask) &&
++			    vendor_info->service_enabled[id]) {
++				ret = ath12k_vendor_send_link_info(soc_info,
++								   link_info, id);
++				if (ret) {
++					ath12k_err(NULL, "Failed to send link info to service %d due to NL issue for soc: %d link: %d",
++						   id, soc_info->soc_id,
++						   link_info->hw_link_id);
++				} else {
++					ath12k_dbg(NULL, ATH12K_DBG_RM,
++						   "Sent link info for soc: %d hw link id: %d to service %d",
++						   soc_info->soc_id,
++						   link_info->hw_link_id, id);
++					service_sent = true;
++				}
++			}
++		}
++
++		if (!service_sent)
+ 			ath12k_dbg(NULL, ATH12K_DBG_RM,
+-				   "Sent link info for soc: %d hw link id: %d",
++				   "No enabled services found for link info for soc: %d hw link id: %d",
+ 				   soc_info->soc_id, link_info->hw_link_id);
+ 
+ 		list_del(&soc_info->list);
+@@ -356,7 +398,7 @@ static int ath12k_vendor_queue_vendor_wo
+ 	struct ath12k_vendor_work *vendor_work;
+ 
+ 	if (!vendor_info.is_vendor_init_done || !vendor_info.wq) {
+-		ath12k_err(NULL, "failed to schedule vendor as service(s) not initialized");
++		ath12k_err(NULL, "failed to schedule vendor work as workqueue not initialized");
+ 		return -EINVAL;
+ 	}
+ 
+@@ -931,6 +973,7 @@ static void ath12k_vendor_report_link_in
+ 	struct ath12k_vendor_link_info *link_info;
+ 	struct ieee80211_chanctx_conf *ctx = NULL;
+ 	struct ath12k *ar = arvif->ar;
++	int ret;
+ 
+ 	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
+ 
+@@ -940,8 +983,8 @@ static void ath12k_vendor_report_link_in
+ 		return;
+ 	}
+ 
+-	/* Only report if the service is enabled */
+-	if (!vendor_info.is_vendor_init_done)
++	/* Only report if vendor services are initialized */
++	if (!vendor_info.is_vendor_init_done || !vendor_info.wq)
+ 		return;
+ 
+ 	soc_info = kmalloc(sizeof(*soc_info), GFP_KERNEL);
+@@ -965,7 +1008,22 @@ static void ath12k_vendor_report_link_in
+ 	list_add(&soc_info->list, &vendor_info.soc_list);
+ 	mutex_unlock(&vendor_info.list_lock);
+ 
+-	ath12k_vendor_queue_vendor_work();
++	/* Queue work with any valid service ID - the work handler will send
++	 * link info to all enabled services regardless of which service ID
++	 * was used to queue the work
++	 */
++	ret = ath12k_vendor_queue_vendor_work();
++	if (ret) {
++		ath12k_dbg(ab, ATH12K_DBG_RM,
++			   "Failed to queue link info work, cleaning up");
++		mutex_lock(&vendor_info.list_lock);
++		list_del(&soc_info->list);
++		kfree(soc_info);
++		mutex_unlock(&vendor_info.list_lock);
++	} else {
++		ath12k_dbg(ab, ATH12K_DBG_RM,
++			   "Queued link info work successfully");
++	}
+ }
+ 
+ int ath12k_vendor_link_state_update(const u8 mac_id,
+--- a/drivers/net/wireless/ath/ath12k/vendor_services.h
++++ b/drivers/net/wireless/ath/ath12k/vendor_services.h
+@@ -136,4 +136,8 @@ int ath12k_vendor_link_state_update(cons
+ 				    struct ath12k_link_vif *arvif,
+ 				    enum ath12k_vendor_link_state new_state);
+ 
++int ath12k_vendor_send_link_info(struct ath12k_vendor_soc_device_info *soc_info,
++				 struct ath12k_vendor_link_info *link_info,
++				 u8 service_id);
++
+ #endif /* ATH12K_VENDOR_SERVICES_H */

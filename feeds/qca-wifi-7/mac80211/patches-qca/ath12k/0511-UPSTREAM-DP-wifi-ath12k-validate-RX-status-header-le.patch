@@ -1,0 +1,142 @@
+From 4dd4b362ed1e7ec9b8ef38fc89a88547d1d2db5c Mon Sep 17 00:00:00 2001
+From: P Praneesh <ppranees@qti.qualcomm.com>
+Date: Thu, 7 Aug 2025 15:35:01 +0530
+Subject: [PATCH] UPSTREAM:DP:wifi:ath12k: validate RX status header length
+ before fragment copy
+
+Current code allocates an skb and copies RX status header fragments
+without thoroughly checking the validity of the TLV length. If the
+parsed TLV length is zero or too large, a negative fragment length
+may result when subtracting ATH12K_MON_RX_PKT_OFFSET. This may cause
+out-of-bounds access or SKB corruption, as a negative length can be
+interpreted as a large unsigned value, leading to unpredictable
+behavior.
+
+Fix this by explicitly validating the TLV length before proceeding
+to copy header fragments. Reject and warn if the length is zero or
+larger than the maximum permissible RX header length. Free the skb
+on error and return immediately, preventing SKB queue corruption.
+Introduce DP_MON_RX_HDR_LEN and DP_MON_MAX_RX_HDR_LEN macros to
+replace magic numbers and clarify header size limits.
+
+Also, change the type of fcs_len_left and related variables from u8
+to int in RX parsing to prevent overflow or underflow problems.
+
+Current code in ath12k_dp_mon_buf_replenish and ath12k_dp_mon_rx_buf_free
+calls page_frag_free() to release the allocated monitor buffer associated
+with a mon_desc. However, the mon_buf pointer is not explicitly cleared
+after being freed. If an error path, race, or misuse leads to attempting
+to free the same buffer more than once, this can result in a double-free,
+potentially causing kernel crashes such as "Unable to handle kernel paging
+request at virtual address dead000000000122".
+
+Fix this by setting mon_desc->mon_buf to NULL immediately after calling
+page_frag_free() or on DMA map failure. This helps avoid accidental reuse
+or double-free of the same buffer, as subsequent logic will operate on a
+NULL pointer instead of a dangling reference.
+
+Fixes : I96784d025c9
+(Upstream: DP: Add non linear skb support for monitor mode)
+
+Patch-dependency:
+0475-04-Upstream-DP-wifi-ath12k-add-page-fragment-support-in.patch
+
+Signed-off-by: P Praneesh <ppranees@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_mon.c        |  3 +++
+ drivers/net/wireless/ath/ath12k/dp_mon.h        |  1 +
+ drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c | 11 ++++++++---
+ 3 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.c b/drivers/net/wireless/ath/ath12k/dp_mon.c
+index e340ed6..a774353 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -670,6 +670,7 @@ int ath12k_dp_mon_buf_replenish(struct ath12k_dp *dp,
+ 						 DMA_FROM_DEVICE);
+ 		if (unlikely(dma_mapping_error(ab->dev, paddr))) {
+ 			page_frag_free(mon_buf);
++			mon_desc->mon_buf = NULL;
+ 			dp_mon->num_frag_free++;
+ 			ret = -EIO;
+ 			goto out;
+@@ -723,6 +724,7 @@ out:
+ 							   ATH12K_DP_MON_RX_BUF_SIZE,
+ 							   DMA_FROM_DEVICE);
+ 				page_frag_free(mon_buf);
++				mon_desc->mon_buf = NULL;
+ 				dp_mon->num_frag_free++;
+ 			}
+ 
+@@ -1704,6 +1706,7 @@ void ath12k_dp_mon_rx_buf_free(struct ath12k_dp *dp)
+ 		ath12k_core_dma_unmap_page(dp->dev, dp_mon->mon_desc_pool[i].paddr,
+ 					   ATH12K_DP_MON_RX_BUF_SIZE, DMA_FROM_DEVICE);
+ 		page_frag_free(mon_buf);
++		dp_mon->mon_desc_pool[i].mon_buf = NULL;
+ 		dp_mon->num_frag_free++;
+ 
+ reset_mon_desc:
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.h b/drivers/net/wireless/ath/ath12k/dp_mon.h
+index 730ee28..392b614 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.h
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.h
+@@ -58,6 +58,7 @@
+ 
+ #define DP_MON_RXDMA_BUF_COOKIE_BUF_ID		GENMASK(17, 0)
+ #define DP_MON_RXDMA_BUF_COOKIE_PDEV_ID 	GENMASK(19, 18)
++#define DP_MON_RX_HDR_LEN			128
+ 
+ struct ath12k_mon_data;
+ struct dp_mon_rx_filter;
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+index 9532e52..f217f17 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon2.c
+@@ -232,6 +232,10 @@ ath12k_wifi7_dp_mon_parse_status_rx_hdr(struct ath12k_pdev_dp *dp_pdev,
+ 
+ 	offset = (const u8 *)tlv_data - (const u8 *)mon_buf;
+ 	offset += ATH12K_MON_RX_PKT_OFFSET;
++	if (unlikely(frag_len <= 0) || frag_len > DP_MON_RX_HDR_LEN) {
++		ath12k_warn(dp_pdev->dp, "invalid rx header length: %d", frag_len);
++		return -EINVAL;
++	}
+ 
+ 	if (!ppdu_info->mpdu_info.mpdu_start_received) {
+ 		skb = dev_alloc_skb(ATH12K_DP_MON_MAX_RADIO_TAP_HDR);
+@@ -941,8 +945,7 @@ ath12k_wifi7_dp_mon_rx_parse_ppdu_status(struct ath12k_pdev_dp *dp_pdev,
+ 	struct ath12k_pdev_mon_dp_stats *mon_stats = &dp_pdev->dp_mon_pdev->mon_stats;
+ 	enum hal_rx_mon_status hal_status;
+ 	u32 buf_size = ATH12K_DP_MON_RX_BUF_SIZE, num_skb = 0, pkt_tlv = 0;
+-	int ret;
+-	u8 fcs_len_left = FCS_LEN, last_frag_idx, last_frag_size;
++	int ret, fcs_len_left, last_frag_idx, last_frag_size;
+ 
+ 	hal_status = ath12k_wifi7_dp_mon_rx_parse_dest(dp_pdev, status_desc);
+ 	if (hal_status != HAL_RX_MON_STATUS_PPDU_DONE)
+@@ -969,13 +972,14 @@ ath12k_wifi7_dp_mon_rx_parse_ppdu_status(struct ath12k_pdev_dp *dp_pdev,
+ 		}
+ 
+ 		if (mpdu_meta->decap_type == DP_RX_DECAP_TYPE_RAW) {
++			fcs_len_left = FCS_LEN;
+ 			last_frag_idx = skb_shinfo(mpdu)->nr_frags - 1;
+ 			if (skb_shinfo(mpdu)->nr_frags >= 2) {
+ 				last_frag_size =
+ 				ath12k_wifi7_dp_mon_get_frag_size_by_idx(dp_pdev->dp,
+ 									 mpdu,
+ 									 last_frag_idx);
+-				if (last_frag_size > 0 && last_frag_size < FCS_LEN) {
++				if (last_frag_size > 0 && last_frag_size <= FCS_LEN) {
+ 					ath12k_dp_mon_skb_remove_frag(dp_pdev->dp, mpdu,
+ 								      last_frag_idx,
+ 								      buf_size);
+@@ -1210,6 +1214,7 @@ ath12k_wifi7_dp_mon_rx_process_ppdu(struct work_struct *work)
+ 	spin_unlock_bh(&dp_mon_pdev->ppdu_desc_lock);
+ 
+ 	list_for_each_entry(ppdu_desc, &dp_mon_pdev->ppdu_desc_proc_list, list) {
++		skb_queue_head_init(&ppdu_info->mpdu_q);
+ 		for (desc_cnt = 0; desc_cnt < ppdu_desc->status_desc_cnt; desc_cnt++) {
+ 			status_desc = &ppdu_desc->status_desc[desc_cnt];
+ 			if (!status_desc->mon_buf)
+-- 
+2.34.1
+

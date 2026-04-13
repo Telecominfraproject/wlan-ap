@@ -1,0 +1,661 @@
+From 59352842e68ad6d0f7e46ce52926b15d26b7ed8d Mon Sep 17 00:00:00 2001
+From: Karthikeyan Kathirvel <kathirve@qti.qualcomm.com>
+Date: Fri, 30 May 2025 11:12:13 +0530
+Subject: [PATCH 4/4] wifi: ath12k: add WMI infra support for PTQM
+
+Previous change added support to form a list having peers ready for
+migration.
+
+Add the WMI infra to send the migration command to firmware. Multiple
+peers could be packed in a single WMI command. The num peers that can
+be packed in a single command depends on the WMI message size. The list
+formed earlier will be the input to WMI send infra.
+
+Also, add support to handle the migration event response from the firmware.
+
+Co-developed-by: Aditya Kumar Singh <quic_adisi@qti.qualcomm.com>
+Signed-off-by: Aditya Kumar Singh <quic_adisi@qti.qualcomm.com>
+Signed-off-by: Karthikeyan Kathirvel <kathirve@qti.qualcomm.com>
+Co-developed-by: Manish Dharanenthiran <mdharane@qti.qualcomm.com>
+Signed-off-by: Manish Dharanenthiran <mdharane@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h    |   5 +
+ drivers/net/wireless/ath/ath12k/dp_peer.c |  43 ++++
+ drivers/net/wireless/ath/ath12k/dp_peer.h |   4 +
+ drivers/net/wireless/ath/ath12k/mac.c     |  81 ++++++-
+ drivers/net/wireless/ath/ath12k/wmi.c     | 267 ++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.h     |  87 +++++++
+ 6 files changed, 482 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -482,6 +482,11 @@ struct ath12k_link_vif {
+ 	u32 tx_vdev_id;
+ 	struct ath12k_prb_resp_tmpl_ml_info ml_info;
+ 	bool ftm_responder;
++
++	struct work_struct wmi_migration_cmd_work;
++	struct completion wmi_migration_event_resp;
++	struct list_head peer_migrate_list;
++	bool is_umac_migration_in_progress;
+ };
+ 
+ struct ath12k_dp_link_vif {
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.c
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.c
+@@ -96,6 +96,49 @@ ath12k_dp_link_peer_find_by_id(struct at
+ }
+ EXPORT_SYMBOL(ath12k_dp_link_peer_find_by_id);
+ 
++/* ToDO: Need to see it it can be optimized */
++static struct ath12k_dp_link_peer *
++ath12k_dp_link_peer_find_by_ml_vdev_id(struct ath12k_dp *dp,
++				       int ml_peer_id,
++				       int vdev_id)
++{
++	struct ath12k_dp_link_peer *peer;
++
++	lockdep_assert_held(&dp->dp_lock);
++
++	list_for_each_entry(peer, &dp->peers, list)
++		if (ml_peer_id == peer->ml_id &&
++		    vdev_id == peer->vdev_id)
++			return peer;
++
++	return NULL;
++}
++
++struct ath12k_dp_link_peer *
++ath12k_dp_link_peer_find_by_ml_peer_vdev_id(struct ath12k_dp *dp,
++					    int peer_id,
++					    int vdev_id)
++{
++	struct ath12k_dp_link_peer *peer;
++
++	lockdep_assert_held(&dp->dp_lock);
++
++	if (peer_id == ATH12K_PEER_ID_INVALID)
++		return NULL;
++
++	if (peer_id & ATH12K_PEER_ML_ID_VALID)
++		return ath12k_dp_link_peer_find_by_ml_vdev_id(dp,
++							      peer_id,
++							      vdev_id);
++
++	list_for_each_entry(peer, &dp->peers, list)
++		if (peer_id == peer->peer_id)
++			return peer;
++
++	return NULL;
++}
++EXPORT_SYMBOL(ath12k_dp_link_peer_find_by_ml_peer_vdev_id);
++
+ struct ath12k_dp_link_peer *
+ ath12k_dp_link_peer_find_by_ast(struct ath12k_dp *dp,
+ 				int ast_hash)
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.h
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.h
+@@ -197,6 +197,10 @@ ath12k_dp_link_peer_find_by_peerid_index
+ struct ath12k_dp_link_peer *
+ ath12k_dp_link_peer_find_by_ast(struct ath12k_dp *dp,
+ 				int ast_hash);
++struct ath12k_dp_link_peer *
++ath12k_dp_link_peer_find_by_ml_peer_vdev_id(struct ath12k_dp *dp,
++					    int peer_id,
++					    int vdev_id);
+ 
+ void ath12k_peer_mlo_map_event(struct ath12k_base *ab, struct sk_buff *skb);
+ void ath12k_peer_mlo_unmap_event(struct ath12k_base *ab, struct sk_buff *skb);
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -281,6 +281,7 @@ static struct ath12k_link_sta *ath12k_ma
+ static u8 ath12k_mac_ahsta_get_pri_link_id(struct ath12k_vif *ahvif,
+ 					   struct ath12k_sta *ahsta,
+ 					   unsigned long int valid_links);
++static void ath12k_wmi_migration_cmd_work(struct work_struct *work);
+ static const char *ath12k_mac_phymode_str(enum wmi_phy_mode mode)
+ {
+ 	switch (mode) {
+@@ -1830,6 +1831,42 @@ static void ath12k_mac_set_arvif_ies(str
+ 	}
+ }
+ 
++static void ath12k_wmi_migration_cmd_work(struct work_struct *work)
++{
++	struct ath12k_link_vif *arvif = container_of(work, struct ath12k_link_vif,
++						     wmi_migration_cmd_work);
++	struct ath12k *ar = arvif->ar;
++	struct ath12k_hw *ah = ar->ah;
++	struct ath12k_mac_pri_link_migr_peer_node *peer_node, *tmp_peer;
++	struct ath12k_dp_peer *ml_peer;
++	struct ath12k_sta *ahsta;
++
++	if (wait_for_completion_timeout(&arvif->wmi_migration_event_resp,
++					ATH12K_MIGRATION_TIMEOUT_HZ))
++		return;
++
++	spin_lock_bh(&ah->dp_hw.peer_lock);
++
++	arvif->is_umac_migration_in_progress = false;
++
++	list_for_each_entry_safe(peer_node, tmp_peer, &arvif->peer_migrate_list, list) {
++		rcu_read_lock();
++		/* TODO: Need to check if we ml_peer_id validation
++		 */
++		ml_peer = rcu_dereference(ah->dp_hw.dp_peer_list[peer_node->ml_peer_id]);
++		rcu_read_unlock();
++
++		if (ml_peer) {
++			ahsta = ath12k_sta_to_ahsta(ml_peer->sta);
++			ahsta->is_migration_in_progress = false;
++		}
++
++		list_del(&peer_node->list);
++		kfree(peer_node);
++	}
++	spin_unlock_bh(&ah->dp_hw.peer_lock);
++}
++
+ static int ath12k_mac_setup_bcn_tmpl_ema(struct ath12k_link_vif *arvif,
+ 					 struct ath12k_link_vif *tx_arvif,
+ 					 u8 bssid_index)
+@@ -4620,6 +4657,12 @@ static void ath12k_mac_init_arvif(struct
+ 	wiphy_work_init(&arvif->peer_ch_width_switch_work,
+ 		  ath12k_wmi_peer_chan_width_switch_work);
+ 
++	init_completion(&arvif->wmi_migration_event_resp);
++	INIT_WORK(&arvif->wmi_migration_cmd_work,
++		  ath12k_wmi_migration_cmd_work);
++	INIT_LIST_HEAD(&arvif->peer_migrate_list);
++
++
+ 	for (i = 0; i < ARRAY_SIZE(arvif->bitrate_mask.control); i++) {
+ 		arvif->bitrate_mask.control[i].legacy = 0xffffffff;
+ 		arvif->bitrate_mask.control[i].gi = NL80211_TXRATE_DEFAULT_GI;
+@@ -4704,6 +4747,7 @@ static void ath12k_mac_remove_link_inter
+ 	}
+ 	wiphy_work_cancel(ah->hw->wiphy,
+ 			  &arvif->peer_ch_width_switch_work);
++	cancel_work_sync(&arvif->wmi_migration_cmd_work);
+ 
+ 	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac remove link interface (vdev %d link id %d)",
+ 		   arvif->vdev_id, arvif->link_id);
+@@ -9818,6 +9862,10 @@ ath12k_mac_free_link_migr_peer_list(stru
+ 	 * peers later as per the requirement
+ 	 */
+ 	list_for_each_entry_safe(peer_node, tmp_peer, peer_migr_list, list) {
++		ath12k_dbg(NULL, ATH12K_DBG_MAC,
++			   "pri link migrate: free ml_peer_id %u from migrate list\n",
++			   peer_node->ml_peer_id);
++
+ 		rcu_read_lock();
+ 		/* TODO: Need to check if we ml_peer_id validation
+ 		 */
+@@ -9913,7 +9961,7 @@ ath12k_mac_process_link_migrate_req(stru
+ 	struct list_head peer_migr_list;
+ 	struct ath12k_dp_peer *ml_peer;
+ 	struct ath12k_link_sta *arsta;
+-	unsigned long int valid_links;
++	unsigned long int valid_links = ahvif->links_map;
+ 	struct ath12k_sta *ahsta;
+ 	int ret, num_peers = 0;
+ 	struct ath12k *ar;
+@@ -9924,6 +9972,19 @@ ath12k_mac_process_link_migrate_req(stru
+ 
+ 	lockdep_assert_held(&ah->hw_mutex);
+ 
++	/* Check if firmware supports migration */
++	for_each_set_bit(link_id, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++		arvif = ath12k_get_arvif_from_link_id(ahvif, link_id);
++		if (!arvif)
++			continue;
++
++		if (!arvif->ar)
++			return -ENOTCONN;
++
++		if (!ath12k_wmi_is_umac_migration_supported(arvif->ar->ab))
++			return -EOPNOTSUPP;
++	}
++
+ 	spin_lock_bh(&ah->dp_hw.peer_lock);
+ 
+ 	/* Request for single MLD peer */
+@@ -10029,6 +10090,19 @@ send_link_mig_cmd:
+ 		   "pri link migrate: got num peers %d for vdev_id %d\n",
+ 		   num_peers, arvif->vdev_id);
+ 
++	if (ret)
++		goto exit_link_migrate_req;
++
++	spin_unlock_bh(&ah->dp_hw.peer_lock);
++
++	ret = ath12k_wmi_mlo_send_ptqm_migrate_cmd(arvif,
++						   &peer_migr_list, num_peers);
++	if (ret)
++		ath12k_err(arvif->ar->ab, "Failed to migrate pri link ret %d\n",
++			   ret);
++
++	spin_lock_bh(&ah->dp_hw.peer_lock);
++
+ exit_link_migrate_req:
+ 	ath12k_mac_free_link_migr_peer_list(ah, &peer_migr_list);
+ 	spin_unlock_bh(&ah->dp_hw.peer_lock);
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -12283,6 +12283,156 @@ static void ath12k_wmi_event_mlo_reconfi
+ 	rcu_read_unlock();
+ }
+ 
++static int ath12k_wmi_tlv_peer_migrate_sub_tlv_parse(struct ath12k_base *ab,
++						     u16 tag, u16 len,
++						     const void *ptr, void *data)
++{
++	struct wmi_mlo_pri_link_peer_migr_compl_event *parse = data;
++
++	switch (tag) {
++	case WMI_TAG_MLO_PRIMARY_LINK_PEER_MIGRATION_STATUS:
++		parse->peer_info[parse->num_pri_link_peer_mig_status++] =
++			(struct wmi_mlo_primary_link_peer_migration_status *)ptr;
++		break;
++	}
++
++	return 0;
++}
++
++static int ath12k_wmi_tlv_peer_ptqm_migrate_parse(struct ath12k_base *ab,
++						  u16 tag, u16 len,
++						  const void *ptr, void *data)
++{
++	struct wmi_mlo_pri_link_peer_migr_compl_event *parse = data;
++	struct wmi_mlo_pri_link_peer_mig_compl_fixed_param *fixed_param;
++	int ret = 0;
++
++	switch (tag) {
++	case WMI_TAG_MLO_PRIMARY_LINK_PEER_MIGRATION_COMPL_FIXED_PARAM:
++		fixed_param = (struct wmi_mlo_pri_link_peer_mig_compl_fixed_param *)ptr;
++		parse->fixed_param.vdev_id = fixed_param->vdev_id;
++		break;
++	case WMI_TAG_ARRAY_STRUCT:
++		ret = ath12k_wmi_tlv_iter(ab, ptr, len,
++					  ath12k_wmi_tlv_peer_migrate_sub_tlv_parse,
++					  parse);
++		if (ret) {
++			ath12k_warn(ab, "failed to parse PTQM event rx sub tlv %d\n", ret);
++			return ret;
++		}
++		break;
++	}
++
++	return 0;
++}
++
++static void ath12k_wmi_peer_migration_event(struct ath12k_base *ab,
++					      struct sk_buff *skb)
++{
++	struct wmi_mlo_pri_link_peer_migr_compl_event parse = {0};
++	struct ath12k_mac_pri_link_migr_peer_node *peer_node, *tmp_peer;
++	struct ath12k *ar;
++	struct ath12k_link_vif *arvif;
++	struct ath12k_dp_link_peer *peer;
++	struct ieee80211_sta *sta;
++	struct ath12k_sta *ahsta;
++	int vdev_id, num_peers, ret, i;
++	u16 ml_peer_id;
++	u8 status;
++
++	ret = ath12k_wmi_tlv_iter(ab, skb->data, skb->len,
++				  ath12k_wmi_tlv_peer_ptqm_migrate_parse,
++				  &parse);
++	if (ret) {
++		ath12k_warn(ab, "failed to parse mgmt rx tlv %d\n", ret);
++		return;
++	}
++
++	vdev_id = le32_to_cpu(parse.fixed_param.vdev_id);
++	num_peers = le32_to_cpu(parse.num_pri_link_peer_mig_status);
++
++	rcu_read_lock();
++	arvif = ath12k_mac_get_arvif_by_vdev_id(ab, vdev_id);
++	if (!arvif) {
++		rcu_read_unlock();
++		ath12k_warn(ab, "MLO Peer Migration event for unknow vdev %d\n",
++			    vdev_id);
++		return;
++	}
++
++	ar = arvif->ar;
++
++	ath12k_dbg(ab, ATH12K_DBG_WMI,
++		   "MLO Peer Migration event received for vdev %d, num_peers %d\n",
++		   vdev_id, num_peers);
++
++	spin_lock_bh(&ab->dp->dp_lock);
++
++	for (i = 0; i < num_peers; i++) {
++		ml_peer_id = le32_get_bits(parse.peer_info[i]->status_info,
++					   WMI_MLO_PRIMARY_LINK_PEER_MIGRATION_STATUS_ML_PEER_ID);
++		status = le32_get_bits(parse.peer_info[i]->status_info,
++				       WMI_MLO_PRIMARY_LINK_PEER_MIGRATION_STATUS_STATUS);
++
++		list_for_each_entry_safe(peer_node, tmp_peer, &arvif->peer_migrate_list,
++					 list) {
++			if (peer_node->ml_peer_id == ml_peer_id) {
++				list_del(&peer_node->list);
++				kfree(peer_node);
++			}
++		}
++
++		ml_peer_id |= ATH12K_PEER_ML_ID_VALID;
++		peer = ath12k_dp_link_peer_find_by_ml_peer_vdev_id(ab->dp,
++								   ml_peer_id,
++								   vdev_id);
++		if (!peer) {
++			ath12k_err(ab, "failed to find ML peer with id %d\n", ml_peer_id);
++			goto exit_pri_link_mig_event;
++		}
++
++		ath12k_dbg(ab, ATH12K_DBG_WMI,
++			   "peer migration status ML peer id %d status %u\n",
++			   ml_peer_id, status);
++
++		sta = peer->sta;
++		if (!sta)
++			continue;
++
++		ahsta = (struct ath12k_sta *)sta->drv_priv;
++
++		ahsta->is_migration_in_progress = false;
++
++		if (status != WMI_PRIMARY_LINK_PEER_MIGRATION_SUCCESS) {
++			ath12k_mac_peer_disassoc(ab, sta, ahsta,
++						 ATH12K_DBG_WMI);
++			continue;
++		}
++
++		/* if peer is actually migrated, this condition should fail. If not, then
++		 * possibly in HTT part some error occured
++		 */
++		if (ahsta->primary_link_id == peer->link_id) {
++			ath12k_err(ab,
++				   "unknown error occured during peer migration, disconnecting\n");
++			ath12k_mac_peer_disassoc(ab, sta, ahsta,
++						 ATH12K_DBG_WMI);
++		}
++	}
++
++exit_pri_link_mig_event:
++	spin_unlock_bh(&ab->dp->dp_lock);
++	rcu_read_unlock();
++
++	/* Event is received for all queued ML peers in this arvif */
++	if (list_empty(&arvif->peer_migrate_list)) {
++		complete(&arvif->wmi_migration_event_resp);
++		arvif->is_umac_migration_in_progress = false;
++	}
++
++	return;
++}
++
+ static void ath12k_wmi_op_rx(struct ath12k_base *ab, struct sk_buff *skb)
+ {
+ 	struct ath12k_skb_cb *skb_cb = ATH12K_SKB_CB(skb);
+@@ -12491,6 +12641,9 @@ static void ath12k_wmi_op_rx(struct ath1
+ 	case WMI_MLO_LINK_REMOVAL_EVENTID:
+ 		ath12k_wmi_event_mlo_reconfig_link_removal(ab, skb);
+ 		break;
++	case WMI_MLO_PRIMARY_LINK_PEER_MIGRATION_EVENT_ID:
++		ath12k_wmi_peer_migration_event(ab, skb);
++		break;
+ 	default:
+ 		ath12k_dbg(ab, ATH12K_DBG_WMI, "Unknown eventid: 0x%x\n", id);
+ 		break;
+@@ -13749,6 +13902,120 @@ int ath12k_wmi_mlo_reconfig_link_removal
+ 	}
+ 
+ 	return ret;
++}
++
++bool ath12k_wmi_is_umac_migration_supported(struct ath12k_base *ab)
++{
++	struct ath12k_wmi_base *wmi_ab = &ab->wmi_ab;
++
++	return test_bit(WMI_SERVICE_UMAC_MIGRATION_SUPPORT, wmi_ab->svc_map);
++}
++
++int ath12k_wmi_mlo_send_ptqm_migrate_cmd(struct ath12k_link_vif *arvif,
++				         struct list_head *peer_migr_list,
++				         u16 num_peers)
++{
++	struct ath12k_mac_pri_link_migr_peer_node *peer_node, *tmp_peer;
++	struct wmi_mlo_pri_link_peer_mig_fixed_param *cmd;
++	struct wmi_mlo_new_pri_link_peer_info *peer_info;
++	u16 max_entry_per_cmd = 0, max_entry_cnt = 0;
++	struct ath12k *ar = arvif->ar;
++	struct ath12k_base *ab = ar->ab;
++	struct ath12k_wmi_pdev *wmi = ar->wmi;
++	struct wmi_tlv *tlv;
++	struct sk_buff *skb;
++	void *ptr;
++	int ret = -EINVAL, len, i;
++
++	max_entry_per_cmd = (wmi->wmi_ab->max_msg_len[ar->pdev_idx] -
++			     sizeof(*cmd) - TLV_HDR_SIZE) /
++			    sizeof(*peer_info);
++
++	reinit_completion(&arvif->wmi_migration_event_resp);
++
++	while (num_peers > 0) {
++		len = sizeof(*cmd) + TLV_HDR_SIZE;
++		max_entry_cnt = min(max_entry_per_cmd, num_peers);
++
++		ath12k_dbg(ab, ATH12K_DBG_WMI,
++			   "Setting max entry limit for migration as %u\n",
++			   max_entry_cnt);
++
++		num_peers -= max_entry_cnt;
++		len += sizeof(*peer_info) * max_entry_cnt;
++
++		skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, len);
++		if (!skb)
++			return -ENOMEM;
++
++		cmd = (struct wmi_mlo_pri_link_peer_mig_fixed_param *)skb->data;
++		cmd->tlv_header =
++			ath12k_wmi_tlv_cmd_hdr(WMI_TAG_MLO_PRIMARY_LINK_PEER_MIGRATION_FIXED_PARAM,
++					       (sizeof(*cmd)));
++		cmd->vdev_id = cpu_to_le32(arvif->vdev_id);
++
++		ptr = skb->data + sizeof(*cmd);
++
++		len = sizeof(*peer_info) * max_entry_cnt;
++		tlv = ptr;
++		tlv->header = ath12k_wmi_tlv_hdr(WMI_TAG_ARRAY_STRUCT, len);
++		ptr += TLV_HDR_SIZE;
++
++		i = 0;
++		list_for_each_entry(peer_node, peer_migr_list, list) {
++			peer_info = ptr;
++			len = sizeof(*peer_info);
++			peer_info->tlv_header =
++				ath12k_wmi_tlv_cmd_hdr(WMI_TAG_MLO_NEW_PRIMARY_LINK_PEER_INFO,
++						       len);
++			peer_info->new_link_info =
++				le32_encode_bits(peer_node->ml_peer_id,
++						 WMI_MLO_PRIMARY_LINK_PEER_MIGRATION_ML_PEER_ID) |
++				le32_encode_bits(peer_node->hw_link_id,
++						 WMI_MLO_PRIMARY_LINK_PEER_MIGRATION_HW_LINK_ID);
++
++			ath12k_dbg(ab, ATH12K_DBG_WMI,
++				   "ml_peer_id %u new hw link id %d\n",
++				   peer_node->ml_peer_id, peer_node->hw_link_id);
++
++			ptr += len;
++
++			if (++i == max_entry_cnt)
++				break;
++		}
++
++		ret = ath12k_wmi_cmd_send(wmi, skb, WMI_MLO_PRIMARY_LINK_PEER_MIGRATION_CMDID);
++		if (ret) {
++			ath12k_warn(ar->ab, "failed to send WMI_MLO_PRIMARY_LINK_PEER_MIGRATION cmd\n");
++			dev_kfree_skb(skb);
++			return ret;
++		}
++
++		ath12k_dbg(ab, ATH12K_DBG_WMI,
++			   "WMI PTQM command sent. vdev_id %d num_peers %d\n",
++			   arvif->vdev_id, max_entry_cnt);
++
++		/* now that command is sent, remove this from the list so
++		 * that next iteration does not consider it again. Removing
++		 * from list also indicates that command was sent successfully
++		 * to firmware.
++		 */
++		i = 0;
++		list_for_each_entry_safe(peer_node, tmp_peer, peer_migr_list, list) {
++			list_move_tail(&peer_node->list, &arvif->peer_migrate_list);
++			if (++i == max_entry_cnt)
++				break;
++		}
++
++		/* cancel the worker if already there is a worker scheduled and
++		 * schedule a new one. This basically resets the timer
++		 */
++		cancel_work_sync(&arvif->wmi_migration_cmd_work);
++		queue_work(ar->ab->workqueue, &arvif->wmi_migration_cmd_work);
++		arvif->is_umac_migration_in_progress = true;
++	}
++
++	return ret;
+ }
+ 
+ int ath12k_wmi_pdev_ap_ps_cmd_send(struct ath12k *ar, u8 pdev_id,
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -780,6 +780,11 @@ enum wmi_tlv_cmd_id {
+ 	WMI_MLO_PEER_TID_TO_LINK_MAP_CMDID,
+ 	/* WMI cmd for dynamically deleting a link from a MLD VAP */
+ 	WMI_MLO_LINK_REMOVAL_CMDID,
++	WMI_MLO_AP_VDEV_TID_TO_LINK_MAP_CMDID,
++	WMI_MLO_VDEV_GET_LINK_INFO_CMDID,
++	WMI_MLO_LINK_SET_BSS_PARAMS_CMDID,
++	WMI_MLO_LINK_SWITCH_CONF_CMDID,
++	WMI_MLO_PRIMARY_LINK_PEER_MIGRATION_CMDID,
+ };
+ 
+ enum wmi_tlv_event_id {
+@@ -1010,6 +1015,12 @@ enum wmi_tlv_event_id {
+ 	WMI_MLO_TEARDOWN_COMPLETE_EVENTID,
+ 	/* Response event for Link Removal Cmd */
+ 	WMI_MLO_LINK_REMOVAL_EVENTID,
++
++	WMI_MLO_TID_TO_LIUNK_MAP_EVENT_ID,
++	WMI_MLO_LINK_INFO_EVENT_ID,
++	WMI_MLO_DISABLE_REQ_EVENT_ID,
++	WMI_MLO_SWITCH_REQUEST_EVENT_ID,
++	WMI_MLO_PRIMARY_LINK_PEER_MIGRATION_EVENT_ID,
+ };
+ 
+ enum wmi_tlv_pdev_param {
+@@ -2137,6 +2148,10 @@ enum wmi_tlv_tag {
+ 	WMI_TAG_MLO_LINK_REMOVAL_TBTT_UPDATE,
+ 	WMI_TAG_MLO_LINK_REMOVAL_EVENT_FIXED_PARAM,
+ 	WMI_TAG_MLO_LINK_REMOVAL_CMD_FIXED_PARAM = 0x464,
++	WMI_TAG_MLO_PRIMARY_LINK_PEER_MIGRATION_FIXED_PARAM = 0x4a3,
++	WMI_TAG_MLO_NEW_PRIMARY_LINK_PEER_INFO = 0x4a4,
++	WMI_TAG_MLO_PRIMARY_LINK_PEER_MIGRATION_COMPL_FIXED_PARAM = 0x4a5,
++	WMI_TAG_MLO_PRIMARY_LINK_PEER_MIGRATION_STATUS = 0x4a6,
+ 	WMI_TAG_PDEV_WSI_STATS_INFO_CMD = 0x4b1,
+ 	WMI_TAG_PDEV_DFS_RADAR_FLAGS = 0x4b4,
+ 	WMI_TAG_PDEV_UTF_CMD_FIXED_PARAM = 0x4be,
+@@ -2388,6 +2403,8 @@ enum wmi_tlv_service {
+ 	WMI_SERVICE_WDS_NULL_FRAME_SUPPORT = 421,
+ 	WMI_SERVICE_MEC_AGING_TIMER_SUPPORT = 423,
+ 
++	WMI_SERVICE_UMAC_MIGRATION_SUPPORT = 436,
++
+ 	WMI_MAX_EXT2_SERVICE,
+ };
+ 
+@@ -7636,6 +7653,72 @@ struct ath12k_wmi_wsi_stats_info_param {
+ };
+ 
+ 
++struct wmi_mlo_new_pri_link_peer_info {
++	__le32 tlv_header;
++	union {
++		__le32 new_link_info;
++		struct {
++			__le32 ml_peer_id :16,
++			       hw_link_id :16;
++		};
++	};
++};
++
++#define WMI_MLO_PRIMARY_LINK_PEER_MIGRATION_ML_PEER_ID GENMASK(15, 0)
++#define WMI_MLO_PRIMARY_LINK_PEER_MIGRATION_HW_LINK_ID GENMASK(31, 16)
++
++/* TODO: As of now setting it to 5 secs, this is based on the failure event
++ * which received. Later it will be updated based on the stress testing.
++ */
++#define ATH12K_MIGRATION_TIMEOUT_HZ	(5 * HZ)
++
++struct wmi_mlo_pri_link_peer_mig_fixed_param {
++	__le32 tlv_header;
++	__le32 vdev_id;
++} __packed;
++
++struct wmi_peer_ptqm_migrate_event_params {
++	__le32 vdev_id;
++	__le16 num_peers;
++};
++
++enum wmi_primary_link_peer_migration_evenr_status {
++	WMI_PRIMARY_LINK_PEER_MIGRATION_SUCCESS,
++	WMI_PRIMARY_LINK_PEER_MIGRATION_IN_PROGRESS,
++	WMI_PRIMARY_LINK_PEER_MIGRATION_DELETE_IN_PROGRESS,
++	WMI_PRIMARY_LINK_PEER_MIGRATION_DELETED,
++	WMI_PRIMARY_LINK_PEER_MIGRATION_TX_PIPES_FAILED,
++	WMI_PRIMARY_LINK_PEER_MIGRATION_RX_PIPES_FAILED,
++
++	/* Add any new status above this line */
++	WMI_PRIMARY_LINK_PEER_MIGRATION_FAIL = 255,
++};
++
++#define WMI_MLO_PRIMARY_LINK_PEER_MIGRATION_STATUS_ML_PEER_ID   GENMASK(15, 0)
++#define WMI_MLO_PRIMARY_LINK_PEER_MIGRATION_STATUS_STATUS       GENMASK(23, 16)
++
++struct wmi_mlo_primary_link_peer_migration_status {
++	union {
++		__le32 status_info;
++		struct {
++			__le32 ml_peer_id :16,
++			       status     :8, /* WMI_PRIMARY_LINK_PEER_MIGRATION_STATUS */
++			       reserved   :8;
++		};
++	};
++}__packed;
++
++struct wmi_mlo_pri_link_peer_mig_compl_fixed_param {
++	__le32 vdev_id;
++}__packed;
++
++struct wmi_mlo_pri_link_peer_migr_compl_event {
++	struct wmi_mlo_pri_link_peer_mig_compl_fixed_param fixed_param;
++	int num_pri_link_peer_mig_status;
++	/* TODO: need to change into dynamic var */
++	struct wmi_mlo_primary_link_peer_migration_status *peer_info[100];
++};
++
+ int ath12k_wmi_cmd_send(struct ath12k_wmi_pdev *wmi, struct sk_buff *skb,
+ 			u32 cmd_id);
+ struct sk_buff *ath12k_wmi_alloc_skb(struct ath12k_wmi_base *wmi_sc, u32 len);
+@@ -7879,4 +7962,8 @@ int ath12k_wmi_send_vdev_set_tpc_power(s
+ int ath12k_wmi_mlo_reconfig_link_removal(struct ath12k *ar, u32 vdev_id,
+ 					 const u8 *reconfig_ml_ie,
+ 					 size_t reconfig_ml_ie_len);
++bool ath12k_wmi_is_umac_migration_supported(struct ath12k_base *ab);
++int ath12k_wmi_mlo_send_ptqm_migrate_cmd(struct ath12k_link_vif *arvif,
++				         struct list_head *peer_migr_list,
++				         u16 num_peers);
+ #endif

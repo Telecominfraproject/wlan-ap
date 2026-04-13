@@ -1,0 +1,128 @@
+From 0fd1303ab6d682ecf76c235bbae378f5a4969970 Mon Sep 17 00:00:00 2001
+From: Karthikeyan Periyasamy <periyasa@qti.qualcomm.com>
+Date: Fri, 16 May 2025 17:14:15 +0530
+Subject: [PATCH 11/12] UPSTREAM: DP: wifi: ath12k: fix reap procedure of Rx
+ error process
+
+If the Rxdma buffer doesn't reap as expected, then it leads to backpressure
+from HW. Currently, the msdu type buffer error handler doesn't reap the
+buffer as expected in the ath12k_dp_rx_process_err(). Which may lead
+to the backpressure scenario due to unavailability of rx buffer.
+So fix this issue by properly reap the rxdma buffer for the msdu type
+buffer error.
+
+Signed-off-by: Karthikeyan Periyasamy <periyasa@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.h          |  1 +
+ drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c | 44 ++++++++++++++++---
+ .../net/wireless/ath/ath12k/wifi7/hal_rx.c    |  5 ++-
+ 3 files changed, 44 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+index 452deda..bc5aed7 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -480,6 +480,7 @@ struct ath12k_device_dp_tx_err_stats {
+ struct ath12k_device_dp_stats {
+ 	u32 err_ring_pkts;
+ 	u32 invalid_rbm;
++	u32 reo_excep_msdu_buf_type;
+ 	u32 rxdma_error[HAL_REO_ENTR_RING_RXDMA_ECODE_MAX];
+ 	u32 reo_error[HAL_REO_DEST_RING_ERROR_CODE_MAX];
+ 	u32 hal_reo_error[DP_REO_DST_RING_MAX];
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
+index 1024097..713d6df 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
+@@ -1819,6 +1819,34 @@ exit:
+ 	return 0;
+ }
+ 
++static int ath12k_wifi7_handle_msdu_buftype(struct ath12k_dp *dp, dma_addr_t paddr,
++					    struct list_head *rx_desc_used_list)
++{
++	struct ath12k_rx_desc_info *desc_info =
++				(struct ath12k_rx_desc_info *)(uintptr_t)paddr;
++	struct sk_buff *msdu;
++
++	if (!desc_info) {
++		ath12k_warn(dp, " rx exception, hw cookie conversion failed");
++		return -EINVAL;
++	}
++
++	if (desc_info->magic != ATH12K_DP_RX_DESC_MAGIC) {
++		ath12k_warn(dp, " rx exception, magic check failed");
++		return -EINVAL;
++	}
++
++	msdu = desc_info->skb;
++	desc_info->skb = NULL;
++
++	list_add_tail(&desc_info->list, rx_desc_used_list);
++	dma_unmap_single(dp->dev, ATH12K_SKB_RXCB(msdu)->paddr,
++			 msdu->len + skb_tailroom(msdu), DMA_FROM_DEVICE);
++	dev_kfree_skb_any(msdu);
++
++	return 0;
++}
++
+ int ath12k_wifi7_dp_rx_process_err(struct ath12k_dp *dp, struct napi_struct *napi,
+ 				   int budget)
+ {
+@@ -1865,19 +1893,25 @@ int ath12k_wifi7_dp_rx_process_err(struct ath12k_dp *dp, struct napi_struct *nap
+ 		drop = false;
+ 		dp->device_stats.err_ring_pkts++;
+ 
++		hw_link_id = le32_get_bits(reo_desc->info0,
++					   HAL_REO_DEST_RING_INFO0_SRC_LINK_ID);
++		device_id = hw_links[hw_link_id].device_id;
++		partner_dp = ath12k_dp_hw_grp_to_dp(dp_hw_grp, device_id);
++
+ 		ret = ath12k_wifi7_hal_desc_reo_parse_err(dp, reo_desc, &paddr,
+ 							  &desc_bank);
+ 		if (ret) {
+ 			ath12k_warn(ab, "failed to parse error reo desc %d\n",
+ 				    ret);
++			if (ret == -EOPNOTSUPP) {
++				used_list = &rx_desc_used_list[device_id];
++				if (!ath12k_wifi7_handle_msdu_buftype(partner_dp, paddr,
++								      used_list))
++					tot_n_bufs_reaped++;
++			}
+ 			continue;
+ 		}
+ 
+-		hw_link_id = le32_get_bits(reo_desc->info0,
+-					   HAL_REO_DEST_RING_INFO0_SRC_LINK_ID);
+-		device_id = hw_links[hw_link_id].device_id;
+-		partner_dp = ath12k_dp_hw_grp_to_dp(dp_hw_grp, device_id);
+-
+ 		pdev_id = ath12k_hw_mac_id_to_pdev_id(partner_dp->hw_params,
+ 						      hw_links[hw_link_id].pdev_idx);
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.c b/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.c
+index 6dfb0c9..f20bcf5 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.c
+@@ -329,6 +329,7 @@ int ath12k_wifi7_hal_desc_reo_parse_err(struct ath12k_dp *dp,
+ 	enum hal_reo_dest_ring_push_reason push_reason;
+ 	enum hal_reo_dest_ring_error_code err_code;
+ 	u32 cookie, val;
++	int ret = 0;
+ 
+ 	push_reason = le32_get_bits(desc->info0,
+ 				    HAL_REO_DEST_RING_INFO0_PUSH_REASON);
+@@ -344,7 +345,9 @@ int ath12k_wifi7_hal_desc_reo_parse_err(struct ath12k_dp *dp,
+ 	}
+ 
+ 	val = le32_get_bits(desc->info0, HAL_REO_DEST_RING_INFO0_BUFFER_TYPE);
+-	if (val != HAL_REO_DEST_RING_BUFFER_TYPE_LINK_DESC) {
++	if (val == HAL_REO_DEST_RING_BUFFER_TYPE_MSDU) {
++		ret = -EOPNOTSUPP;
++	} else if (val != HAL_REO_DEST_RING_BUFFER_TYPE_LINK_DESC) {
+ 		ath12k_warn(ab, "expected buffer type link_desc");
+ 		return -EINVAL;
+ 	}
+-- 
+2.34.1
+

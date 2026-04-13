@@ -1,0 +1,302 @@
+From 3fa2efcc33098c587c89eac712bd1fdf3752a19d Mon Sep 17 00:00:00 2001
+From: Uraj Sasan <usasan@qti.qualcomm.com>
+Date: Thu, 26 Jun 2025 23:37:01 +0530
+Subject: [PATCH 2/3] wifi: ath12k: Adds INI framework helpers and parsers
+
+Introduce a flexible INI parsing framework that allows driver components
+to define configuration variables with metadata such as name, type,
+min/max range, default value, and description using X-Macros.
+
+e.g we have a DP component so we can define one of the variable that
+can be used for the rxdma ring initialization as dp_rxdma_buf_ring.
+
+CFG_INI_UINT("dp_rxdma_buf_ring",
+	     WLAN_CFG_RXDMA_BUF_RING_SIZE_MIN,
+	     WLAN_CFG_RXDMA_BUF_RING_SIZE_MAX,
+	     WLAN_CFG_RXDMA_BUF_RING_SIZE,
+	     CFG_VALUE_OR_DEFAULT,
+	     "DP RXDMA buffer ring")
+
+Initialise the driver ini store using the XMacros as below:-
+
+CFG(CFG_DP_RXDMA_BUF_RING) \
+
+{ \
+    .name = _name, \
+    .field_offset = offsetof(struct cfg_values, _id##_internal), \
+    .cfg_type = CFG_ ##_mtype ## _ITEM, \
+    .item_handler = cfg_ ## _mtype ## _item_handler, \
+    .min = _min, \
+    .max = _max, \
+    .fallback = _fallback, \
+},
+
+Initialize the configuration store at compile time with user-defined
+defaults. Cross-reference these entries at runtime with values parsed
+from the INI file. Determine which variables to override and how to
+interpret their types, ranges, and constraints.
+
+Signed-off-by: Uraj Sasan <usasan@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/ini_parse.c | 249 ++++++++++++++++++++
+ 1 file changed, 249 insertions(+)
+ create mode 100644 drivers/net/wireless/ath/ath12k/ini_parse.c
+
+diff --git a/drivers/net/wireless/ath/ath12k/ini_parse.c b/drivers/net/wireless/ath/ath12k/ini_parse.c
+new file mode 100644
+index 0000000..e71fbf8
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath12k/ini_parse.c
+@@ -0,0 +1,249 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
++ */
++#include "ini.h"
++
++/**
++ * ini_file_read() - Function to read the ini file and load it into memory
++ * @path: Path to the file
++ *
++ * Return: Referene pointing to file contenct in memory on success else err ptr
++ */
++const struct firmware *ini_file_read(const char *path)
++{
++	const struct firmware *fw;
++	int ret;
++
++	ret = firmware_request_nowarn(&fw, path, NULL);
++
++	if (ret) {
++		ath12k_dbg(NULL, ATH12K_DBG_INI, "Failed to read file %s", path);
++		return ERR_PTR(ret);
++	}
++
++	return fw;
++}
++
++/**
++ * ini_read_values - Parse the next key-value or section from an INI buffer
++ * @main_cursor: Pointer to the current position in the INI buffer.
++ * @read_key: Output pointer to the parsed key or section name.
++ * @read_value: Output pointer to the parsed value.
++ * @section_item: Set to true if the line is a section header, false otherwise.
++ *
++ * Return: 0 on success,
++ *         -EINVAL on syntax error,
++ *         -EIO if end of buffer is reached.
++ */
++static int ini_read_values(char **main_cursor,
++			   char **read_key, char **read_value,
++				      bool *section_item)
++{
++	char *cursor = *main_cursor;
++
++	/* foreach line */
++	while (*cursor != '\0') {
++		char *key = cursor;
++		char *value = NULL;
++		bool comment = false;
++		bool eol = false;
++
++		/*
++		 * Look for the end of the line, while noting any
++		 * value ('=') or comment ('#') indicators
++		 */
++		while (!eol) {
++			switch (*cursor) {
++			case '\r':
++			case '\n':
++				*cursor = '\0';
++				cursor++;
++				fallthrough;
++			case '\0':
++				eol = true;
++				break;
++
++			case '=':
++				/*
++				 * The first '=' is the value indicator.
++				 * Subsequent '=' are valid value characters.
++				 */
++				if (!value && !comment) {
++					value = cursor + 1;
++					*cursor = '\0';
++				}
++
++				cursor++;
++				break;
++
++			case '#':
++				/*
++				 * We don't process comments, so we can null-
++				 * terminate unconditionally here (unlike '=').
++				 */
++				comment = true;
++				*cursor = '\0';
++				fallthrough;
++			default:
++				cursor++;
++				break;
++			}
++		}
++
++		key = strim(key);
++		/*
++		 * Ignoring comments, a valid ini line contains one of:
++		 *	1) some 'key=value' config item
++		 *	2) section header
++		 *	3) a line containing whitespace
++		 */
++		if (value) {
++			*read_key = key;
++			*read_value = value;
++			*section_item = 0;
++			*main_cursor = cursor;
++			return 0;
++		} else if (key[0] == '[') {
++			size_t len = strlen(key);
++
++			if (key[len - 1] != ']') {
++				ath12k_dbg(NULL, ATH12K_DBG_INI, "Invalid *.ini syntax '%s'", key);
++				return -EINVAL;
++			}
++			key[len - 1] = '\0';
++			*read_key = key + 1;
++			*section_item = 1;
++			*main_cursor = cursor;
++			return 0;
++		} else if (key[0] != '\0') {
++			ath12k_dbg(NULL, ATH12K_DBG_INI, "Invalid *.ini syntax '%s'", key);
++			return -EINVAL;
++		}
++
++		/* skip remaining EoL characters */
++		while (*cursor == '\n' || *cursor == '\r')
++			cursor++;
++	}
++
++	return -EIO;
++}
++
++int ath12k_ini_parse(const char *ini_path, void *context,
++	      ath12k_ini_item_cb item_cb)
++{
++	int ret;
++	char *read_key;
++	char *read_value;
++	bool section_item;
++	int ini_read_count = 0;
++	const struct firmware *fw;
++	char *cursor;
++	char *end;
++
++	fw = ini_file_read(ini_path);
++	if (IS_ERR(fw)) {
++		ath12k_dbg(NULL, ATH12K_DBG_INI, "Failed to read *.ini file @ %s", ini_path);
++		return ret;
++	}
++
++	/* foreach line */
++	cursor = (char *)fw->data;
++	end = cursor + fw->size;
++
++	while (cursor < end) {
++		ret  = ini_read_values(&cursor, &read_key, &read_value, &section_item);
++		if (ret)
++			break;
++
++		if (!section_item) {
++			ret = item_cb(context, read_key, read_value);
++			if (ret)
++				break;
++			ini_read_count++;
++		} else  {
++			ath12k_dbg(NULL, ATH12K_DBG_INI, "Section started in file");
++			/* Currently AP Platforms supports and uses Sections,
++			 * hence break the loop, sections will be parsed separately,
++			 * in case of non AP platforms, sections are used as
++			 * logical separators hence continue reading the values.
++			 */
++			break;
++		}
++	}
++
++	if (ini_read_count) {
++		ath12k_dbg(NULL, ATH12K_DBG_INI, "INI parsed # values read :%d",
++			   ini_read_count);
++		ret = 0;
++	} else {
++		ath12k_dbg(NULL, ATH12K_DBG_INI, "INI file parse fail: invalid file format");
++		ret = -EINVAL;
++	}
++	release_firmware(fw);
++
++	return ret;
++}
++
++int ath12k_ini_section_parse(const char *ini_path, void *context,
++		      ath12k_ini_item_cb item_cb,
++				 const char *section_name)
++{
++	int ret;
++	char *read_key;
++	char *read_value;
++	bool section_item;
++	bool section_found = 0;
++	bool section_complete = 0;
++	int ini_read_count = 0;
++	const struct firmware *fw;
++	char *cursor;
++	char *end;
++
++	fw = ini_file_read(ini_path);
++	if (IS_ERR(fw)) {
++		ath12k_dbg(NULL, ATH12K_DBG_INI, "Failed to read *.ini file @ %s", ini_path);
++		return ret;
++	}
++
++	/* foreach line */
++	cursor = (char *)fw->data;
++	end = cursor + fw->size;
++
++	while (cursor < end) {
++		ret  = ini_read_values(&cursor, &read_key, &read_value, &section_item);
++		if (ret)
++			break;
++
++		if (section_item) {
++			if (strcmp(read_key, section_name) == 0) {
++				section_found = 1;
++				section_complete = 0;
++			} else {
++				if (section_found == 1)
++					section_complete = 1;
++				section_found = 0;
++			}
++		} else if (section_found) {
++			ret = item_cb(context, read_key, read_value);
++			if (ret)
++				break;
++			ini_read_count++;
++		} else if (section_complete) {
++			break;
++		}
++	}
++
++	if (ini_read_count) {
++		ath12k_dbg(NULL, ATH12K_DBG_INI, "INI parse read: %d from section %s",
++				   ini_read_count, section_name);
++		ret = 0;
++	} else {
++		ath12k_dbg(NULL, ATH12K_DBG_INI, "INI file parse fail: Section not found %s",
++				       section_name);
++		ret = -EINVAL;
++	}
++
++	release_firmware(fw);
++	return ret;
++}
+-- 
+2.34.1
+

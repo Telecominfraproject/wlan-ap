@@ -1,0 +1,303 @@
+From 6a975971c217da2d852c556ae99ad7ea0eaecdc3 Mon Sep 17 00:00:00 2001
+From: Akriti Dinesh <adinesh@qti.qualcomm.com>
+Date: Thu, 28 Aug 2025 13:30:40 +0530
+Subject: [PATCH] UPSTREAM:CP:wifi: ath12k: Add debugfs support to configure
+ UL/DL/DLBF OFDMA
+
+Add a debugfs interface ofdma_conf to enable or disable UL OFDMA,
+DL OFDMA, and DL OFDMA TxBF features for both HE and EHT modes.
+
+This change introduces a complete configuration flow for OFDMA and
+TxBF control, addressing the requirement for flexible, per-feature
+enablement in ath12k.
+
+Ensure all features default to enabled on every VAP bring-up
+(wifi up). Remove the legacy dependency between HE and EHT, and
+introduce a new dependency: DLBF requires DL to be enabled.
+If DL is disabled and DLBF is enabled, return an "Invalid argument"
+error.
+
+Provide a runtime mechanism to parse user input and map it to internal
+flags: he_ul_enabled, he_dl_enabled, he_dlbf_enabled, and similarly
+for EHT. Based on these flags, compute the appropriate bitmask and
+send it to firmware using WMI commands WMI_VDEV_PARAM_SET_EHT_MU_MODE
+and WMI_VDEV_PARAM_SET_HEMU_MODE.
+
+Commands to enable/disable OFDMA features:
+
+Enable:
+echo 1 eht/he ul   > /sys/kernel/debug/ath12k/<hw_id>/mac0/ofdma_conf
+echo 1 eht/he dl   > /sys/kernel/debug/ath12k/<hw_id>/mac0/ofdma_conf
+echo 1 eht/he dlbf > /sys/kernel/debug/ath12k/<hw_id>/mac0/ofdma_conf
+
+Disable:
+echo 0 eht/he > /sys/kernel/debug/ath12k/<hw_id>/mac0/ofdma_conf
+echo 0 eht/he ul   > /sys/kernel/debug/ath12k/<hw_id>/mac0/ofdma_conf
+echo 0 eht/he dl   > /sys/kernel/debug/ath12k/<hw_id>/mac0/ofdma_conf
+echo 0 eht/he dlbf > /sys/kernel/debug/ath12k/<hw_id>/mac0/ofdma_conf
+
+Patch-dependency:
+0515-UPSTREAM-CP-wifi-ath12k-Add-support-to-enable-disabl.patch
+Patch-work: None
+
+Signed-off-by: Akriti Dinesh <adinesh@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h    |  6 ++
+ drivers/net/wireless/ath/ath12k/debugfs.c | 95 +++++++++++++++++++----
+ drivers/net/wireless/ath/ath12k/mac.c     | 43 ++++++----
+ 3 files changed, 115 insertions(+), 29 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1236,6 +1236,12 @@ struct ath12k {
+ 	u32 vht_cap_info;
+ 	struct ath12k_he ar_he;
+ 	bool ofdma_txbf_conf;
++	bool he_dl_enabled;
++	bool he_ul_enabled;
++	bool he_dlbf_enabled;
++	bool eht_dl_enabled;
++	bool eht_ul_enabled;
++	bool eht_dlbf_enabled;
+ 	struct {
+ 		struct completion started;
+ 		struct completion completed;
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -5788,6 +5788,35 @@ static const struct file_operations fops
+ 	.open = simple_open
+ };
+ 
++static int ath12k_configure_ofdma_feature(struct ath12k *ar,
++					 bool *dl_enabled,
++					 bool *ul_enabled,
++					 bool *dlbf_enabled,
++					 int value,
++					 const char *feature,
++					 const char *mode)
++{
++	if (!strcmp(feature, "default")) {
++		*dl_enabled = value;
++		*ul_enabled = value;
++		*dlbf_enabled = value;
++	} else if (!strcmp(feature, "dl")) {
++		*dl_enabled = value;
++		if (!value)
++			*dlbf_enabled = 0;
++	} else if (!strcmp(feature, "ul")) {
++		*ul_enabled = value;
++	} else if (!strcmp(feature, "dlbf")) {
++		if (!*dl_enabled && value) {
++			ath12k_warn(ar->ab, "%s DLBF requires DL to be enabled\n", mode);
++			return -EINVAL;
++		}
++		*dlbf_enabled = value;
++	}
++
++	return 0;
++}
++
+ static ssize_t ath12k_enable_ofdma_txbf(struct file *file,
+ 					const char __user *user_buf,
+ 					size_t count, loff_t *ppos)
+@@ -5796,45 +5825,97 @@ static ssize_t ath12k_enable_ofdma_txbf(
+ 	struct ath12k_link_vif *arvif;
+ 	int value, ret;
+ 	char buf[32] = {0};
+-	char mode[3] = {'\0'};
+-
++	char mode[4] = {'\0'};
++	char feature[8] = {'\0'};
+ 	ret = simple_write_to_buffer(buf, sizeof(buf) - 1, ppos,
+-				     user_buf, count);
++					user_buf, count);
+ 	if (ret < 0)
+ 		return ret;
+ 
+ 	buf[ret] = '\0';
+-	ret = sscanf(buf, "%d %s", &value, mode);
+-	if (ret != 2) {
+-		ath12k_err(ar->ab, "2 arguments required usage: enable/disable eht/he");
++	ret = sscanf(buf, "%d %3s %7s", &value, mode, feature);
++	if (ret < 2 || ret > 3) {
++		ath12k_err(ar->ab, "3 arguments required usage: enable/disable eht/he ul/dl/dlbf");
+ 		return -EINVAL;
+ 	}
+-
++	strim(mode);
++	if (ret == 2) {
++		if (strscpy(feature, "default", sizeof(feature)) < 0) {
++			ath12k_err(ar->ab, "Failed to copy default feature string");
++			return -EINVAL;
++		}
++	} else {
++		strim(feature);
++		if (strlen(feature) >= sizeof(feature) - 1) {
++			ath12k_err(ar->ab, "Feature string too long");
++			return -EINVAL;
++		}
++	}
+ 	if (strcmp(mode, "eht") && strcmp(mode, "he")) {
+ 		ath12k_err(ar->ab, "Mode should be eht/he");
+ 		return -EINVAL;
+ 	}
++	if (strcmp(feature, "ul") && strcmp(feature, "dl") &&
++		strcmp(feature, "dlbf") && strcmp(feature, "default")) {
++		ath12k_err(ar->ab,
++			  "Invalid feature: '%s'. Must be 'ul', 'dl','dlbf', or omitted\n",
++			  feature);
++		return -EINVAL;
++	}
+ 
+ 	wiphy_lock(ath12k_ar_to_hw(ar)->wiphy);
+-	ar->ofdma_txbf_conf = value;
++	if (!strcmp(mode, "eht")) {
++		ret = ath12k_configure_ofdma_feature(ar,
++						    &ar->eht_dl_enabled,
++						    &ar->eht_ul_enabled,
++						    &ar->eht_dlbf_enabled,
++						    value, feature, "EHT");
++	} else {
++		ret = ath12k_configure_ofdma_feature(ar,
++						    &ar->he_dl_enabled,
++						    &ar->he_ul_enabled,
++						    &ar->he_dlbf_enabled,
++						    value, feature, "HE");
++	}
++	if (ret)
++		goto unlock;
+ 
+ 	list_for_each_entry(arvif, &ar->arvifs, list) {
+-		if (!strcmp(mode, "eht")) {
+-			ath12k_mac_set_he_txbf_conf(arvif);
++		if (!strcmp(mode, "eht"))
+ 			ath12k_mac_set_eht_txbf_conf(arvif);
+-		} else {
++		if (!strcmp(mode, "he"))
+ 			ath12k_mac_set_he_txbf_conf(arvif);
+-		}
+ 	}
+-
++unlock:
+ 	wiphy_unlock(ath12k_ar_to_hw(ar)->wiphy);
++	return ret ? ret : count;
++}
++
++static ssize_t ath12k_show_ofdma_txbf(struct file *file,
++				     char __user *user_buf,
++				     size_t count, loff_t *ppos)
++{
++	struct ath12k *ar = file->private_data;
++	char buf[128];
++	int len;
++
++	len = scnprintf(buf, sizeof(buf),
++		       "HE DL: %d\nHE UL: %d\nHE DLBF: %d\n"
++		       "EHT DL: %d\nEHT UL: %d\nEHT DLBF: %d\n",
++		       ar->he_dl_enabled,
++		       ar->he_ul_enabled,
++		       ar->he_dlbf_enabled,
++		       ar->eht_dl_enabled,
++		       ar->eht_ul_enabled,
++		       ar->eht_dlbf_enabled);
+ 
+-	return count;
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
+ }
+ 
+ static const struct file_operations ofdma_txbf = {
+ 	.write = ath12k_enable_ofdma_txbf,
+ 	.open = simple_open,
++	.read = ath12k_show_ofdma_txbf,
+ };
+ 
+ void ath12k_debugfs_register(struct ath12k *ar)
+@@ -5963,7 +6044,7 @@ void ath12k_debugfs_register(struct ath1
+ 			    ar->debug.debugfs_pdev, ar,
+ 			    &fops_enable_dp_tid_stats);
+ 
+-	debugfs_create_file("ofdma_txbf_enable", 0600,
++	debugfs_create_file("ofdma_conf", 0600,
+ 			    ar->debug.debugfs_pdev, ar,
+ 			    &ofdma_txbf);
+ 
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -4515,19 +4515,22 @@ int ath12k_mac_set_he_txbf_conf(struct a
+ 	}
+ 
+ 	if (ahvif->vif->type != NL80211_IFTYPE_MESH_POINT) {
+-		value |= u32_encode_bits(HE_DL_MUOFDMA_ENABLE, HE_MODE_DL_OFDMA) |
+-			 u32_encode_bits(HE_UL_MUOFDMA_ENABLE, HE_MODE_UL_OFDMA);
+-
+ 		if (link_conf->he_full_ul_mumimo)
+ 			value |= u32_encode_bits(HE_UL_MUMIMO_ENABLE, HE_MODE_UL_MUMIMO);
+-
+ 		if (link_conf->he_su_beamformee)
+ 			value |= u32_encode_bits(HE_SU_BFEE_ENABLE, HE_MODE_SU_TX_BFEE);
+ 	}
+-
+-	if (ar->ofdma_txbf_conf)
++	if (ar->he_dl_enabled)
++		value |= u32_encode_bits(HE_DL_MUOFDMA_ENABLE, HE_MODE_DL_OFDMA);
++	if (ar->he_ul_enabled)
++		value |= u32_encode_bits(HE_UL_MUOFDMA_ENABLE, HE_MODE_UL_OFDMA);
++	if (ar->he_dlbf_enabled)
+ 		value |= u32_encode_bits(HE_DL_OFDMA_TXBF_ENABLE, HE_MODE_DL_OFDMA_TXBF);
+ 
++	ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
++		  "Set HE TXBF config: DL=%d UL=%d DLBF=%d, value=0x%x\n",
++		  ar->he_dl_enabled, ar->he_ul_enabled, ar->he_dlbf_enabled, value);
++
+ 	ret = ath12k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id, param, value);
+ 	if (ret) {
+ 		ath12k_warn(ar->ab, "failed to set vdev %d HE MU mode: %d\n",
+@@ -4648,22 +4651,23 @@ int ath12k_mac_set_eht_txbf_conf(struct
+ 				 u32_encode_bits(EHT_UL_MUOFDMA_ENABLE,
+ 						 EHT_MODE_UL_OFDMA_MUMIMO);
+ 	}
+-
+ 	if (ahvif->vif->type != NL80211_IFTYPE_MESH_POINT) {
+-		value |= u32_encode_bits(EHT_DL_MUOFDMA_ENABLE, EHT_MODE_DL_OFDMA) |
+-			 u32_encode_bits(EHT_UL_MUOFDMA_ENABLE, EHT_MODE_UL_OFDMA);
+-
+ 		if (link_conf->eht_80mhz_full_bw_ul_mumimo)
+ 			value |= u32_encode_bits(EHT_UL_MUMIMO_ENABLE, EHT_MODE_MUMIMO);
+-
+ 		if (link_conf->eht_su_beamformee)
+-			value |= u32_encode_bits(EHT_SU_BFEE_ENABLE,
+-						 EHT_MODE_SU_TX_BFEE);
++			value |= u32_encode_bits(EHT_SU_BFEE_ENABLE, EHT_MODE_SU_TX_BFEE);
+ 	}
+-
+-	if (ar->ofdma_txbf_conf)
++	if (ar->eht_dl_enabled)
++		value |= u32_encode_bits(EHT_DL_MUOFDMA_ENABLE, EHT_MODE_DL_OFDMA);
++	if (ar->eht_ul_enabled)
++		value |= u32_encode_bits(EHT_UL_MUOFDMA_ENABLE, EHT_MODE_UL_OFDMA);
++	if (ar->eht_dlbf_enabled)
+ 		value |= u32_encode_bits(EHT_DL_OFDMA_TXBF_ENABLE,
+-					 EHT_MODE_DL_OFDMA_TXBF);
++					EHT_MODE_DL_OFDMA_TXBF);
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_MAC,
++		  "Set EHT TXBF config: DL=%d UL=%d DLBF=%d, value=0x%x\n",
++		  ar->eht_dl_enabled, ar->eht_ul_enabled, ar->eht_dlbf_enabled, value);
+ 
+ 	ret = ath12k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id, param, value);
+ 	if (ret) {
+@@ -14698,6 +14702,14 @@ int ath12k_mac_start(struct ath12k *ar)
+ 		goto err;
+ 	}
+ 
++	ar->he_dl_enabled = 1;
++	ar->he_ul_enabled = 1;
++	ar->he_dlbf_enabled = 1;
++
++	ar->eht_dl_enabled = 1;
++	ar->eht_ul_enabled = 1;
++	ar->eht_dlbf_enabled = 1;
++
+ 	ar->num_started_vdevs = 0;
+ 	ar->num_created_vdevs = 0;
+ 	ar->num_created_bridge_vdevs = 0;

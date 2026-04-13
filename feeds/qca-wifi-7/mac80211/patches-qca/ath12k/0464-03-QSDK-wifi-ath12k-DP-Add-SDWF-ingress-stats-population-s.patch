@@ -1,0 +1,220 @@
+From 106302a695f280ba4bee6941846d0ab6eb249a13 Mon Sep 17 00:00:00 2001
+From: Nagarajan Maran <nmaran@qti.qualcomm.com>
+Date: Sat, 5 Jul 2025 14:50:24 +0530
+Subject: [PATCH] wifi: ath12k: DP: Add SDWF ingress stats population support
+
+Update SDWF packets ingress stats in per-packet path. Update these
+stats only in primary link peer since packets are sent only
+via primary link even though multi link stats collection is enabled.
+
+Following patch changes are also present
+	- 784-02-wifi-ath12k-Add-sawf-tx-stats-support.patch
+
+Signed-off-by: Nagarajan Maran <nmaran@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.h          |  1 +
+ drivers/net/wireless/ath/ath12k/dp_peer.h     |  6 ++
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c | 98 ++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h |  2 +-
+ drivers/net/wireless/ath/ath12k/wifi7/hw.c    |  6 +-
+ 5 files changed, 108 insertions(+), 5 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.h
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.h
+@@ -204,6 +204,12 @@ struct ath12k_dp_peer {
+ #define MSDUQ_FLOW_OVERRIDE	BIT(3)
+ #define MSDUQ_WHO_CL_INFO	GENMASK(5, 4)
+ 
++#define QOS_NW_DELAY_MAX	0x3FFFF
++#define QOS_NW_TAG_SHIFT	GENMASK(23, 16)
++#define QOS_TAG_ID		GENMASK(31, 24)
++#define QOS_NW_DELAY_SHIFT	0x6
++#define QOS_VALID_TAG		BIT(30)
++
+ struct ath12k_msduq {
+ 	bool reserved;
+ 	u8 qos_id;
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -183,6 +183,93 @@ ath12k_dp_qos_update(struct ath12k_dp *d
+ 	}
+ }
+ 
++static void ath12k_qos_tx_enqueue_peer_stats(struct ath12k_dp_link_peer_stats *peer_stats,
++					     u16 msduq_id,
++					     unsigned int len)
++{
++	struct tx_stats *qos_tx;
++	u8 tid, q_id;
++
++	if (!peer_stats->qos_stats) {
++		ath12k_err(NULL, "Qos stats not initialized\n");
++		return;
++	}
++
++	if (unlikely(msduq_id >= QOS_MSDUQ_MAX &&
++		     msduq_id < MSDUQ_MAX_DEF))
++		return;
++
++	msduq_id -= MSDUQ_MAX_DEF;
++
++	q_id = u16_get_bits(msduq_id, MSDUQ_MASK);
++	tid = u16_get_bits(msduq_id, MSDUQ_TID_MASK);
++
++	qos_tx = &peer_stats->qos_stats->qos_tx[tid][q_id];
++
++	qos_tx->queue_depth++;
++	qos_tx->tx_ingress.num++;
++	qos_tx->tx_ingress.bytes += len;
++}
++
++static void
++ath12k_dp_sdwftx_ingress_stats_update(struct ath12k_link_vif *arvif,
++				      u32 *skb_mark, u32 qos_nw_delay,
++				      unsigned int skb_len)
++{
++	struct ath12k *ar = arvif->ar;
++	struct ath12k_dp *dp;
++	struct ath12k_dp_link_peer *pri_peer;
++	u16 msduq, peer_id, qos_id;
++
++	if (!ar)
++		return;
++
++	if (!(*skb_mark & SDWF_VALID_MASK))
++		return;
++
++	msduq = u32_get_bits(*skb_mark, SDWF_MSDUQ_ID);
++
++	if ((ath12k_debugfs_is_dp_stats_enabled(&ar->dp) &&
++	    (ath12k_debugfs_is_qos_stats_enabled(ar) &
++	     ATH12K_QOS_STATS_BASIC))) {
++		peer_id = u32_get_bits(*skb_mark, SDWF_PEER_ID);
++
++		if (!ar->dp.dp)
++			return;
++
++		dp = ar->dp.dp;
++
++		spin_lock_bh(&dp->dp_lock);
++
++		pri_peer = ath12k_dp_link_peer_find_by_id(dp, peer_id);
++		if (!pri_peer || !pri_peer->dp_peer->qos) {
++			spin_unlock_bh(&dp->dp_lock);
++			return;
++		}
++
++		qos_id = dp_peer_msduq_qos_id(ar->ab, pri_peer->dp_peer->qos,
++					      msduq);
++		if (qos_id == QOS_ID_INVALID) {
++			ath12k_err(ar->ab, "msduq_id: %u not yet reserved\n",
++				   msduq);
++			spin_unlock_bh(&dp->dp_lock);
++			return;
++		}
++
++		ath12k_qos_tx_enqueue_peer_stats(&pri_peer->peer_stats,
++						 msduq, skb_len);
++		spin_unlock_bh(&dp->dp_lock);
++	}
++
++	/* Store the NWDELAY to skb->mark which can be fetched
++	 * during tx completion
++	 */
++	if (qos_nw_delay > QOS_NW_DELAY_MAX)
++		qos_nw_delay = QOS_NW_DELAY_MAX;
++
++	*skb_mark = u32_encode_bits((u32_get_bits(*skb_mark, QOS_NW_TAG_SHIFT)), QOS_TAG_ID) | (qos_nw_delay << QOS_NW_DELAY_SHIFT) | msduq;
++}
++
+ #define HTT_META_DATA_ALIGNMENT 0x8
+ 
+ /* Preparing HTT Metadata when utilized with ext MSDU */
+@@ -233,7 +320,8 @@ enum ath12k_dp_tx_enq_error
+ ath12k_wifi7_dp_tx(struct ath12k_pdev_dp *dp_pdev,
+ 		   struct ath12k_link_vif *arvif,
+ 		   struct sk_buff *skb, bool gsn_valid, int mcbc_gsn,
+-		   bool is_mcast, struct ath12k_link_sta *arsta, u8 ring_id)
++		   bool is_mcast, struct ath12k_link_sta *arsta, u8 ring_id,
++		   u32 qos_nw_delay)
+ {
+ 	struct ath12k_dp *dp = dp_pdev->dp;
+ 	struct ath12k_hal *hal = dp->hal;
+@@ -326,9 +414,15 @@ ath12k_wifi7_dp_tx(struct ath12k_pdev_dp
+ 			goto fail_remove_tx_buf;
+ 		}
+ 
+-		if (unlikely(skb->mark & SDWF_VALID_MASK))
++		if (unlikely(skb->mark & SDWF_VALID_MASK)) {
+ 			ath12k_dp_qos_update(dp, dp_pdev, skb->mark, &tcl_desc,
+ 					     0, NULL);
++			ath12k_dp_sdwftx_ingress_stats_update(arvif,
++							      &skb->mark,
++							      qos_nw_delay,
++							      skb_headlen(skb));
++			skb->tstamp = net_timedelta(skb->tstamp);
++		}
+ 
+ 		memcpy(hal_tcl_desc, &tcl_desc, sizeof(tcl_desc));
+ #ifndef CONFIG_IO_COHERENCY
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h
+@@ -14,7 +14,8 @@ enum ath12k_dp_tx_enq_error
+ ath12k_wifi7_dp_tx(struct ath12k_pdev_dp *dp_pdev,
+ 		   struct ath12k_link_vif *arvif,
+ 		   struct sk_buff *skb, bool gsn_valid, int mcbc_gsn,
+-		   bool is_mcast, struct ath12k_link_sta *arsta, u8 ring_id);
++		   bool is_mcast, struct ath12k_link_sta *arsta,
++		   u8 ring_id, u32 qos_nw_delay);
+ u32 ath12k_wifi7_dp_tx_get_vdev_bank_config(struct ath12k_base *ab,
+ 					    struct ath12k_link_vif *arvif, bool vdev_id_check_en);
+ bool ath12k_mac_tx_check_max_limit(struct ath12k_pdev_dp *dp_pdev, struct sk_buff *skb);
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -1325,6 +1325,7 @@ static void ath12k_wifi7_mac_op_tx(struc
+ 	bool is_dvlan = false;
+ 	struct ethhdr *eth;
+ 	bool is_prb_rsp;
++	u32 qos_nw_delay = info->sawf.nw_delay;
+ 	u16 frm_type = 0;
+ 	u16 mcbc_gsn;
+ 	u8 link_id;
+@@ -1396,11 +1397,17 @@ static void ath12k_wifi7_mac_op_tx(struc
+ 		switch (ahvif->dp_vif.tx_encap_type) {
+ 			case ATH12K_HW_TXRX_ETHERNET:
+ 				skb_cb->flags |= ATH12K_SKB_HW_80211_ENCAP;
+-				err = ath12k_wifi7_dp_tx(dp_pdev, arvif, skb, false, 0, is_mcast, arsta, ring_id);
++				err = ath12k_wifi7_dp_tx(dp_pdev, arvif,
++							 skb, false, 0,
++							 is_mcast, arsta,
++							 ring_id, qos_nw_delay);
+ 				break;
+ 			case ATH12K_HW_TXRX_NATIVE_WIFI:
+ 				ath12k_dp_tx_encap_nwifi(skb);
+-				err = ath12k_wifi7_dp_tx(dp_pdev, arvif, skb, false, 0, is_mcast, arsta, ring_id);
++				err = ath12k_wifi7_dp_tx(dp_pdev, arvif,
++							 skb, false, 0,
++							 is_mcast, arsta,
++							  ring_id, qos_nw_delay);
+ 				break;
+ 			case ATH12K_HW_TXRX_RAW:
+ 			default:
+@@ -1547,7 +1554,7 @@ static void ath12k_wifi7_mac_op_tx(struc
+ 		}
+ 
+ 		err = ath12k_wifi7_dp_tx(dp_pdev, arvif, skb, false, 0, is_mcast,
+-					 arsta, ring_id);
++					 arsta, ring_id, qos_nw_delay);
+ 		if (unlikely(err)) {
+ 			if (ath12k_wifi7_check_err_code_debug_logging(err))
+ 				ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "failed to transmit frame %d\n", err);
+@@ -1637,7 +1644,8 @@ static void ath12k_wifi7_mac_op_tx(struc
+ skip_peer_find:
+ 			err = ath12k_wifi7_dp_tx(tmp_dp_pdev, tmp_arvif,
+ 						 msdu_copied, true, mcbc_gsn,
+-						 is_mcast, arsta, ring_id);
++						 is_mcast, arsta, ring_id,
++						 qos_nw_delay);
+ 			if (unlikely(err)) {
+ 				if (ath12k_wifi7_check_err_code_debug_logging(err))
+ 					ath12k_dbg(ar->ab, ATH12K_DBG_MAC,

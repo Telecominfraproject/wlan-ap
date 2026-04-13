@@ -1,0 +1,623 @@
+From b8a5becf4cba4d64a74b0f7a9eec966f4330f2c0 Mon Sep 17 00:00:00 2001
+From: Arun Vikas T <vikast@qti.qualcomm.com>
+Date: Thu, 17 Jul 2025 13:09:30 +0530
+Subject: [PATCH 4/7] UPSTREAM:PROTOCOL:HOSTAPD: Add support for SCS request
+ handling and parsing
+
+Introduce support for processing Robust AV Streaming action
+frames, specifically Stream Classification Service (SCS) requests,
+as defined in IEEE 802.11 standard.
+
+- Integrate with the action frame handler to parse SCS requests
+  when the feature is enabled.
+- Parsing of SCS descriptors and fields:
+	- Intra Access Category element
+	- TCLAS elements (Type 4 and Type 10 classifiers)
+	- TCLAS processing element
+	- QoS attributes
+
+Add the following functions:
+- hostapd_handle_robust_av():
+Entry point for handling WLAN_ACTION_ROBUST_AV_STREAMING frames.
+- hostapd_handle_scs_req():
+Parses the action frame and extracts SCS descriptors.
+- hostapd_parse_scs_desc():
+Parses individual SCS descriptor fields including SCS ID, request type,
+and optional elements.
+- hostapd_parse_scs_tclas_elements():
+Parses and aggregates TCLAS elements and processing elements.
+- hostapd_parse_tclas4_params():
+Parses TCLAS classifier type 4 (IPv4/IPv6-based flow classification).
+- hostapd_parse_tclas10_params():
+Parses TCLAS classifier type 10 (protocol-based filtering).
+- hostapd_parse_scs_qos_attributes():
+Parses QoS attributes if present (enabled under CONFIG_IEEE80211BE).
+
+Spec-reference:
+IEEE Std 802.11-2024
+1. Section 11.25.2 - SCS procedures
+2. 9.4.2.120 SCS Descriptor element
+3. 9.4.2.326 QoS Characteristics element
+4. 9.4.2.30 TCLAS element
+
+Patch-dependency:
+r92-03-UPSTREAM-PROTOCOL-CP-HOSTAPD-Add-SCS-data-structs-and-sta-info-fields.patch
+Patch-work:
+https://lore.kernel.org/all/20250624205716.1052329-1-quic_rchoodam@quicinc.com/#r
+Tag: SCS
+
+Signed-off-by: Arun Vikas T <vikast@qti.qualcomm.com>
+---
+ src/ap/ieee802_11.c |   5 +
+ src/ap/robust_av.c  | 522 ++++++++++++++++++++++++++++++++++++++++++++
+ src/ap/robust_av.h  |   3 +
+ 3 files changed, 530 insertions(+)
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index cf0b172..a4e758a 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -6977,6 +6977,11 @@ static int handle_action(struct hostapd_data *hapd,
+ 		    hostapd_action_vs(hapd, sta, mgmt, len, freq, true) == 0)
+ 			return 1;
+ 		break;
++#ifdef CONFIG_IEEE80211AX
++	case WLAN_ACTION_ROBUST_AV_STREAMING:
++		hostapd_handle_robust_av(hapd, (const u8 *)mgmt, len);
++		return 1;
++#endif /* CONFIG_IEEE80211AX */
+ #ifndef CONFIG_NO_RRM
+ 	case WLAN_ACTION_RADIO_MEASUREMENT:
+ 		hostapd_handle_radio_measurement(hapd, (const u8 *) mgmt, len);
+diff --git a/src/ap/robust_av.c b/src/ap/robust_av.c
+index 26bfb53..1506c5f 100644
+--- a/src/ap/robust_av.c
++++ b/src/ap/robust_av.c
+@@ -8,6 +8,7 @@
+ #include "common/ieee802_11_common.h"
+ #include "hostapd.h"
+ #include "robust_av.h"
++#include "sta_info.h"
+ 
+ u8 *hostapd_add_scs_ie(u8 *frm, bool scs)
+ {
+@@ -35,3 +36,524 @@ u8 *hostapd_add_scs_ie(u8 *frm, bool scs)
+ 
+ 	return frm;
+ }
++
++
++static int hostapd_parse_tclas4_params(const u8 **payload,
++				       union tclas_elem *tclas_elem)
++{
++	enum qm_ip_ver ip_version;
++
++	tclas_elem->type4_params.classifier_mask = *(*payload)++;
++	tclas_elem->type4_params.ip_ver = *(*payload)++;
++	ip_version = tclas_elem->type4_params.ip_ver;
++
++	switch (ip_version) {
++	case IP_VERSION_4:
++		os_memcpy(tclas_elem->type4_params.src_ip.ipv4, *payload,
++			  IPV4_LEN);
++		*payload += IPV4_LEN;
++		os_memcpy(tclas_elem->type4_params.dst_ip.ipv4, *payload,
++			  IPV4_LEN);
++		*payload += IPV4_LEN;
++		break;
++
++	case IP_VERSION_6:
++		os_memcpy(tclas_elem->type4_params.src_ip.ipv6, *payload,
++			  IPV6_LEN);
++		*payload += IPV6_LEN;
++		os_memcpy(tclas_elem->type4_params.dst_ip.ipv6, *payload,
++			  IPV6_LEN);
++		*payload += IPV6_LEN;
++		break;
++
++	default:
++		wpa_printf(MSG_ERROR, "Invalid TCLAS4 IP version");
++		return HOSTAPD_QM_STATUS_E_INVAL;
++	}
++
++	tclas_elem->type4_params.src_port = WPA_GET_BE16(*payload);
++	*payload += 2;
++	tclas_elem->type4_params.dst_port = WPA_GET_BE16(*payload);
++	*payload += 2;
++	tclas_elem->type4_params.dscp = *(*payload)++;
++
++	if (ip_version == IP_VERSION_4) {
++		tclas_elem->type4_params.protocol = *(*payload)++;
++		/* Reserved octet */
++		*payload += 1;
++	} else if (ip_version == IP_VERSION_6) {
++		tclas_elem->type4_params.next_header = *(*payload)++;
++		os_memcpy(tclas_elem->type4_params.flow_label, *payload,
++			  HOSTAPD_TCLAS_FLOW_LABEL_SIZE);
++		*payload += HOSTAPD_TCLAS_FLOW_LABEL_SIZE;
++	}
++
++	wpa_printf(MSG_DEBUG, "TCLAS4 element parsing complete");
++	return HOSTAPD_QM_STATUS_SUCCESS;
++}
++
++
++static int hostapd_parse_tclas10_params(const u8 **payload,
++					union tclas_elem *tclas_elem,
++					u8 tclas_len)
++{
++	u8 filter_len;
++
++	tclas_elem->type10_params.protocol_instance = *(*payload)++;
++	tclas_elem->type10_params.protocol_number = *(*payload)++;
++
++	/* Calculating filter length from total Tclas element length.
++	 * tclas_len contains length of Elem ID (1) + Length (1) + UP (1) +
++	 * Classifier type (1) + Proto Instance (1) + Protocol number (1) +
++	 * Filter mask (Variable) + Filter value (Variable).
++	 * Subtracting fixed length field (6) from tclas_len to calculate
++	 * filter length value for filter_value and filter_mask
++	 */
++	filter_len = (tclas_len - 6) / 2;
++	if ((filter_len < 0) || (filter_len > HOSTAPD_TCLAS10_FILTER_LEN)) {
++		wpa_printf(MSG_ERROR, "TCLAS10 filter length Invalid");
++		return HOSTAPD_QM_STATUS_E_INVAL;
++	}
++
++	tclas_elem->type10_params.filter_len = filter_len;
++	os_memcpy(tclas_elem->type10_params.filter_value, *payload, filter_len);
++	*payload += filter_len;
++	os_memcpy(tclas_elem->type10_params.filter_mask, *payload, filter_len);
++	*payload += filter_len;
++
++	wpa_printf(MSG_DEBUG, "TCLAS10 element parsing complete");
++	return HOSTAPD_QM_STATUS_SUCCESS;
++}
++
++
++static int hostapd_parse_scs_tclas_elements(
++			const u8 **payload,
++			struct hostapd_scs_req_desc_data *scs_req_desc, u8 *len)
++{
++	struct hostapd_tclas_elements *tclas_tuple = NULL;
++	union tclas_elem *tclas_elem = NULL;
++	int ret = HOSTAPD_QM_STATUS_SUCCESS;
++	u8 elem_id, type, tclas_len;
++	u8 tclas_idx = 0;
++
++	while (*len > 0) {
++		elem_id = **payload;
++		/* Process only TCLAS element(s) and TCLAS Processing element
++		 * in this loop
++		 */
++		if (elem_id != WLAN_EID_TCLAS &&
++		    elem_id != WLAN_EID_TCLAS_PROCESSING)
++			break;
++
++		*payload += 1;
++		if (elem_id == WLAN_EID_TCLAS) {
++
++			if (tclas_idx >=
++			    HOSTAPD_SCS_MAX_TCLAS_ELEMENTS_PER_DESCRIPTOR) {
++				wpa_printf(MSG_ERROR, "TCLAS: Max elements per "
++					   "request exceeded");
++				ret = HOSTAPD_QM_STATUS_E_NOSUPPORT;
++				goto fail;
++			}
++
++			tclas_len = *(*payload)++;
++
++			/* Add elem_id, length to tclas_len */
++			tclas_len += 2;
++
++			if (*len < tclas_len) {
++				wpa_printf(MSG_ERROR, "Invalid TCLAS length:%d",
++					   tclas_len);
++				ret = HOSTAPD_QM_STATUS_E_INVAL;
++				goto fail;
++			}
++
++			tclas_tuple = &scs_req_desc->tclas[tclas_idx];
++			tclas_elem = &tclas_tuple->tclas_elem;
++			tclas_tuple->up = *(*payload)++;
++			tclas_tuple->classifier_type = *(*payload)++;
++			type = tclas_tuple->classifier_type;
++
++			switch (type) {
++			case QM_TCLAS_CLASSIFIER_TYPE4:
++				ret = hostapd_parse_tclas4_params(payload,
++								  tclas_elem);
++				if (ret)
++					goto fail;
++				break;
++			case QM_TCLAS_CLASSIFIER_TYPE10:
++				ret = hostapd_parse_tclas10_params(payload,
++								   tclas_elem,
++								   tclas_len);
++				if (ret)
++					goto fail;
++				break;
++			default:
++				wpa_printf(MSG_ERROR, "Unknown tclas "
++					   "classifier: %d", type);
++				ret = HOSTAPD_QM_STATUS_E_INVAL;
++				goto fail;
++			}
++
++			tclas_idx++;
++			*len -= tclas_len;
++
++		} else if (elem_id == WLAN_EID_TCLAS_PROCESSING) {
++			/* TCLAS processing element length */
++			*payload += 1;
++			scs_req_desc->tclas_processing = *(*payload)++;
++			/* Length of Element ID, len, TCLAS processing field */
++			*len -= 3;
++			wpa_printf(MSG_DEBUG, "Tclas processing value:%d",
++				   scs_req_desc->tclas_processing);
++		}
++
++		scs_req_desc->num_tclas_elements = tclas_idx;
++	}
++
++fail:
++	return ret;
++}
++
++
++#ifdef CONFIG_IEEE80211BE
++static int hostapd_parse_scs_qos_attributes(
++				const u8 *payload,
++				struct hostapd_scs_req_desc_data *scs_req_desc,
++				u8 *len)
++{
++	struct hostapd_scs_qos_attributes *qos_attr;
++	u8 elem_id, elem_id_extension;
++	u8 qos_length, temp_length;
++	u8 msdu_delivery_info;
++	u16 bitmap;
++	u32 control_info;
++	int ret = HOSTAPD_QM_STATUS_SUCCESS;
++
++	if (*len < HOSTAPD_SCS_QOS_ATTR_MIN_LEN)
++		return ret;
++
++	elem_id = *payload++;
++	if (elem_id != WLAN_EID_EXTENSION)
++		return ret;
++
++	qos_length = *payload++;
++	temp_length = qos_length;
++	elem_id_extension = *payload++;
++
++	if (elem_id_extension != WLAN_EID_EXT_QOS_CHARACTERISTICS) {
++		wpa_printf(MSG_ERROR, "Invalid QoS characteristics element ID:%d",
++			   elem_id_extension);
++		ret = HOSTAPD_QM_STATUS_E_INVAL;
++		goto fail;
++	}
++
++	/* Subtract length of elemid_extension */
++	qos_length -= 1;
++
++	qos_attr = &scs_req_desc->qos_attr;
++
++	/* Parse QoS attributes - Mandatory parameters*/
++	/* Control Info */
++	HOSTAPD_GET_QOS_ATTR(control_info, payload, CTRL_INFO, 32);
++
++	qos_attr->direction = HOSTAPD_GET_QOS_ATTR_CTRL_INFO(control_info,
++							     DIRECTION);
++	if (qos_attr->direction == SCS_DIRECTION_DIRECT) {
++		wpa_printf(MSG_ERROR, "SCS for direct link is not supported "
++			   "by AP");
++		ret = HOSTAPD_QM_STATUS_E_NOSUPPORT;
++		goto fail;
++	}
++	qos_attr->tid = HOSTAPD_GET_QOS_ATTR_CTRL_INFO(control_info, TID);
++	qos_attr->up = HOSTAPD_GET_QOS_ATTR_CTRL_INFO(control_info, UP);
++	qos_attr->bitmap = HOSTAPD_GET_QOS_ATTR_CTRL_INFO(control_info, BITMAP);
++	qos_attr->link_id = HOSTAPD_GET_QOS_ATTR_CTRL_INFO(control_info,
++							   LINK_ID);
++	qos_length -= HOSTAPD_SCS_QOS_ATTR_CTRL_INFO_LEN;
++
++	/* Min Service Interval */
++	HOSTAPD_GET_QOS_ATTR(qos_attr->min_service_interval, payload,
++			     SERVICE_INTERVAL, 32);
++	qos_length -= HOSTAPD_SCS_QOS_ATTR_SERVICE_INTERVAL_LEN;
++
++	/* Max Service Interval */
++	HOSTAPD_GET_QOS_ATTR(qos_attr->max_service_interval, payload,
++			     SERVICE_INTERVAL, 32);
++	qos_length -= HOSTAPD_SCS_QOS_ATTR_SERVICE_INTERVAL_LEN;
++
++	/* Min Data rate */
++	os_memcpy(&qos_attr->min_data_rate, payload,
++		  HOSTAPD_SCS_QOS_ATTR_MIN_DATA_RATE_LEN);
++	HOSTAPD_GET_QOS_ATTR_ACTUAL(qos_attr->min_data_rate, payload,
++				    &qos_attr->min_data_rate, MIN_DATA_RATE,
++				    32);
++	qos_length -= HOSTAPD_SCS_QOS_ATTR_MIN_DATA_RATE_LEN;
++
++	/* Delay Bound */
++	os_memcpy(&qos_attr->delay_bound, payload,
++		  HOSTAPD_SCS_QOS_ATTR_DELAY_BOULND_LEN);
++	HOSTAPD_GET_QOS_ATTR_ACTUAL(qos_attr->delay_bound, payload,
++				    &qos_attr->delay_bound, DELAY_BOULND, 32);
++	qos_length -= HOSTAPD_SCS_QOS_ATTR_DELAY_BOULND_LEN;
++
++	/* Parse QoS attributes - Optional parameters */
++	bitmap = scs_req_desc->qos_attr.bitmap;
++
++	/* Max MSDU Size */
++	if ((qos_length > 0) &&
++	    HOSTAPD_SCS_IS_QOS_ATTR_PRESENT(bitmap, MAX_MSDU_SIZE)) {
++		HOSTAPD_GET_QOS_ATTR(qos_attr->max_msdu_size, payload,
++				     MAX_MSDU_SIZE, 16);
++		qos_length -= HOSTAPD_SCS_QOS_ATTR_MAX_MSDU_SIZE_LEN;
++	}
++
++	/* Service Start Time */
++	if ((qos_length > 0) &&
++	    HOSTAPD_SCS_IS_QOS_ATTR_PRESENT(bitmap, SERVICE_START_TIME)) {
++		HOSTAPD_GET_QOS_ATTR(qos_attr->service_start_time, payload,
++				     SERVICE_START_TIME, 32);
++		qos_length -= HOSTAPD_SCS_QOS_ATTR_SERVICE_START_TIME_LEN;
++	}
++
++	/* Service Start Time Link ID */
++	if ((qos_length > 0) &&
++	    HOSTAPD_SCS_IS_QOS_ATTR_PRESENT(bitmap,
++					    SERVICE_START_TIME_LINK_ID)) {
++		HOSTAPD_GET_QOS_ATTR(qos_attr->service_start_time_link_id,
++				     payload, SERVICE_START_TIME_LINK_ID, 8);
++		qos_length -=
++			HOSTAPD_SCS_QOS_ATTR_SERVICE_START_TIME_LINK_ID_LEN;
++	}
++
++	/* Mean Data Rate */
++	if ((qos_length > 0) &&
++	    HOSTAPD_SCS_IS_QOS_ATTR_PRESENT(bitmap, MEAN_DATA_RATE)) {
++		os_memcpy(&qos_attr->mean_data_rate, payload,
++			  HOSTAPD_SCS_QOS_ATTR_MEAN_DATA_RATE_LEN);
++		HOSTAPD_GET_QOS_ATTR_ACTUAL(qos_attr->mean_data_rate, payload,
++					    &qos_attr->mean_data_rate,
++					    MEAN_DATA_RATE, 32);
++		qos_length -= HOSTAPD_SCS_QOS_ATTR_MEAN_DATA_RATE_LEN;
++	}
++
++	/* Burst Size */
++	if ((qos_length > 0) &&
++	    HOSTAPD_SCS_IS_QOS_ATTR_PRESENT(bitmap, BURST_SIZE)) {
++		HOSTAPD_GET_QOS_ATTR(qos_attr->burst_size, payload,
++				     BURST_SIZE, 32);
++		qos_length -= HOSTAPD_SCS_QOS_ATTR_BURST_SIZE_LEN;
++	}
++
++	/* MSDU Lifetime */
++	if ((qos_length > 0) &&
++	    HOSTAPD_SCS_IS_QOS_ATTR_PRESENT(bitmap, MSDU_LIFETIME)) {
++		HOSTAPD_GET_QOS_ATTR(qos_attr->msdu_lifetime, payload,
++				     MSDU_LIFETIME, 16);
++		qos_length -= HOSTAPD_SCS_QOS_ATTR_MSDU_LIFETIME_LEN;
++	}
++
++	/* MSDU Delivery Info */
++	if ((qos_length > 0) &&
++	    HOSTAPD_SCS_IS_QOS_ATTR_PRESENT(bitmap, MSDU_DELIVERY_INFO)) {
++		HOSTAPD_GET_QOS_ATTR(msdu_delivery_info, payload,
++				     MSDU_DELIVERY_INFO, 8);
++		qos_length -= HOSTAPD_SCS_QOS_ATTR_MSDU_DELIVERY_INFO_LEN;
++
++		/* MSDU Delivery Ratio */
++		qos_attr->msdu_delivery_ratio =
++			HOSTAPD_GET_QOS_ATTR_MSDU_DELIVERY_INFO(
++					msdu_delivery_info, RATIO);
++
++		/* MSDU Count Exponent */
++		qos_attr->msdu_count_exponent =
++			HOSTAPD_GET_QOS_ATTR_MSDU_DELIVERY_INFO(
++					msdu_delivery_info, COUNT_EXPONENT);
++	}
++
++	/* Medium Time */
++	if ((qos_length > 0) &&
++	    HOSTAPD_SCS_IS_QOS_ATTR_PRESENT(bitmap, MEDIUM_TIME)) {
++		HOSTAPD_GET_QOS_ATTR(qos_attr->medium_time, payload,
++				     MEDIUM_TIME, 16);
++		qos_length -= HOSTAPD_SCS_QOS_ATTR_MEDIUM_TIME_LEN;
++	}
++
++	scs_req_desc->is_qos_present = true;
++
++	if (qos_length == 0)
++		wpa_printf(MSG_INFO, "SCS QoS attributes parsing complete");
++
++	/* Subtracting length of (Elem ID and length field) - 2 bytes and
++	 * QOS attr length from the frm_length
++	 */
++	*len = *len - 2 - temp_length;
++
++fail:
++	return ret;
++}
++#endif /* CONFIG_IEEE80211BE */
++
++
++static int hostapd_parse_scs_desc(
++		struct hostapd_data *hapd, const u8 *payload,
++		struct sta_info *sta,
++		struct hostapd_scs_req_desc_data *scs_req_desc, u8 len)
++{
++	int ret = WLAN_STATUS_REQUEST_DECLINED;
++	u8 scs_id, req_type;
++	u8 elem_id;
++
++	/* SCS ID */
++	scs_req_desc->scs_id = *payload++;
++	/* Request Type */
++	scs_req_desc->request_type = *payload++;
++	len -= 2;
++
++	scs_id = scs_req_desc->scs_id;
++	req_type = scs_req_desc->request_type;
++
++	/* Only SCS ID and request type are present in Remove request */
++	if (req_type == SCS_REQ_REMOVE)
++		return WLAN_STATUS_SUCCESS;
++
++	elem_id = *payload;
++	/* Parse Intra-Access category */
++	if (elem_id == WLAN_EID_INTRA_ACCESS_CATEGORY_PRIORITY) {
++		/* Element ID */
++		payload++;
++		/* Length */
++		payload++;
++		scs_req_desc->intra_access_priority = *payload++;
++		/* Length of Intra Access Category element */
++		len -= 3;
++	}
++
++	elem_id = *payload;
++	/* Check if TCLAS element or QOS attributes is present or not */
++	if (elem_id != WLAN_EID_TCLAS && elem_id != WLAN_EID_EXTENSION) {
++		wpa_printf(MSG_ERROR, "Declining this request: Both "
++			   "TCLAS element & QOS attributes are absent");
++		goto decline;
++	}
++
++	/* Parse TCLAS elements */
++	ret = hostapd_parse_scs_tclas_elements(&payload, scs_req_desc, &len);
++	if (ret != HOSTAPD_QM_STATUS_SUCCESS) {
++		wpa_printf(MSG_ERROR, "SCS TCLAS element parse error");
++		ret = WLAN_STATUS_REQUEST_DECLINED;
++		goto decline;
++	}
++
++	scs_req_desc->is_qos_present = false;
++
++	/* Parse QoS attributes */
++#ifdef CONFIG_IEEE80211BE
++	ret = hostapd_parse_scs_qos_attributes(payload, scs_req_desc, &len);
++	if (ret != HOSTAPD_QM_STATUS_SUCCESS) {
++		ret = WLAN_STATUS_REQUEST_DECLINED;
++		goto decline;
++	}
++#endif /* CONFIG_IEEE80211BE */
++
++	wpa_printf(MSG_DEBUG, "SCS descriptor is parsed successfully, id:%d",
++		   scs_id);
++
++	if (len != 0)
++		wpa_printf(MSG_DEBUG, "Optional subelements are also present, "
++			  "len:%d", len);
++
++	return WLAN_STATUS_SUCCESS;
++
++decline:
++	wpa_printf(MSG_ERROR, "Decline SCS descriptor - id:%d, type:%d, ret:%d\n",
++		   scs_id, req_type, ret);
++	return ret;
++}
++
++
++static int hostapd_handle_scs_req(struct hostapd_data *hapd, const u8 *buf,
++				  size_t frame_length)
++{
++	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
++	struct hostapd_scs_req_data scs_req = {0};
++	const u8 *payload, *payload_start;
++	struct sta_info *sta;
++	u8 elem_id, elem_len;
++	u8 index = 0;
++	int ret = 0;
++	u8 scs_id;
++
++	if (!hapd->conf->scs) {
++		wpa_printf(MSG_ERROR, "SCS feature not enabled");
++		return -1;
++	}
++
++	sta = ap_get_sta(hapd, mgmt->sa);
++	if (!sta) {
++		wpa_printf(MSG_ERROR, "STA not found in scs_req handler");
++		return -1;
++	}
++
++	os_memcpy(scs_req.peer_mac, mgmt->sa, ETH_ALEN);
++
++	scs_req.dialog_token = mgmt->u.action.u.robust_av_req.dialog_token;
++	payload_start = mgmt->u.action.u.robust_av_req.variable;
++
++	while (frame_length > 0) {
++		payload = payload_start;
++		elem_id = *payload++;
++
++		if (elem_id != WLAN_EID_SCS_DESCRIPTOR)
++			break;
++
++		if (index >= HOSTAPD_SCS_MAX_DESCPRIPTORS_PER_REQUEST) {
++			wpa_printf(MSG_ERROR, "SCS Request: Max descriptors "
++				   "per request exceeded");
++			break;
++		}
++
++		elem_len = *payload++;
++		scs_id = *payload;
++
++		ret = hostapd_parse_scs_desc(hapd, payload, sta,
++					     &scs_req.scs_req_desc[index],
++					     elem_len);
++		if (ret != HOSTAPD_QM_STATUS_SUCCESS) {
++			wpa_printf(MSG_ERROR, "Parsing failure: ID:%d, "
++				   "Index:%d, status:%d", scs_id, index, ret);
++			return -1;
++		}
++
++		payload_start += (elem_len + 2);
++		frame_length -= (elem_len + 2);
++
++		index++;
++	}
++
++	scs_req.num_scs_desc = index;
++
++	return 0;
++}
++
++
++void
++hostapd_handle_robust_av(struct hostapd_data *hapd, const u8 *buf, size_t len)
++{
++	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
++
++	if (len < IEEE80211_HDRLEN + 3) {
++		wpa_printf(MSG_ERROR, "Robust AV frame length error - len %zu",
++			   len);
++		return;
++	}
++
++	switch (mgmt->u.action.u.robust_av_req.action) {
++	case ROBUST_AV_SCS_REQ:
++		if (hostapd_handle_scs_req(hapd, buf, len))
++			wpa_printf(MSG_ERROR, "SCS Request handling failed");
++		break;
++	default:
++		break;
++	}
++}
+diff --git a/src/ap/robust_av.h b/src/ap/robust_av.h
+index 8a38c82..9bcc659 100644
+--- a/src/ap/robust_av.h
++++ b/src/ap/robust_av.h
+@@ -189,4 +189,7 @@ struct hostapd_scs_resp_data {
+ 
+ u8 *hostapd_add_scs_ie(u8 *frm, bool scs);
+ 
++void
++hostapd_handle_robust_av(struct hostapd_data *hapd, const u8 *buf, size_t len);
++
+ #endif
+-- 
+2.34.1
+

@@ -1,0 +1,308 @@
+From 5397961a520ee3eb6454e3de60975d25f9cbd342 Mon Sep 17 00:00:00 2001
+From: Arun Vikas T <vikast@qti.qualcomm.com>
+Date: Thu, 17 Jul 2025 13:43:13 +0530
+Subject: [PATCH 5/7] UPSTREAM:PROTOCOL:CP:HOSTAPD: Copy and send SCS data over
+ QM framework
+
+Introduce logic to convert Stream Classification Service (SCS)
+request data into QoS Management (QM) request data format to
+enable further processing of SCS requests and prepare
+the data to be send to driver using generic NL80211_CMD_QOS_MGMT.
+
+Update SCS request handler to include this conversion step,
+laying the base for future integration with driver QoS operations.
+
+Integrate QoS response flow into SCS handling, including
+mapping between SCS and QoS data structures for the response to
+get processed in the further changes.
+
+Patch-dependency:
+r85-02-UPSTREAM-PROTOCOL-HOSTAPD-Define-QoS-Management-definitions.patch
+r85-03-UPSTREAM-PROTOCOL-CP-HOSTAPD-QM-NL80211-request-and-response.patch
+r92-04-UPSTREAM-PROTOCOL-CP-HOSTAPD-Add-support-for-SCS-req-parsing.patch
+Patch-work:
+https://lore.kernel.org/all/20250624205716.1052329-1-quic_rchoodam@quicinc.com/#r
+Tag: SCS
+
+Signed-off-by: Arun Vikas T <vikast@qti.qualcomm.com>
+---
+ src/ap/ap_drv_ops.c |  10 +++
+ src/ap/ap_drv_ops.h |   3 +
+ src/ap/robust_av.c  | 206 +++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 217 insertions(+), 2 deletions(-)
+
+diff --git a/src/ap/ap_drv_ops.c b/src/ap/ap_drv_ops.c
+index f07c658..52d7d91 100644
+--- a/src/ap/ap_drv_ops.c
++++ b/src/ap/ap_drv_ops.c
+@@ -1488,3 +1488,13 @@ int hostapd_drv_set_advertised_ttlm_params(struct hostapd_data *hapd,
+ 							send_default_mapping);
+ }
+ #endif /* CONFIG_IEEE80211BE */
++
++
++int hostapd_drv_set_qos(struct hostapd_data *hapd, struct qm_req_data *qm_req,
++			struct qm_resp_data *qm_resp)
++{
++	if (!hapd->driver || !hapd->drv_priv)
++		return -1;
++
++	return hapd->driver->set_qos(hapd->drv_priv, qm_req, qm_resp);
++}
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index 23a3fc2..d738b52 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -562,4 +562,7 @@ int hostapd_drv_set_advertised_ttlm_params(struct hostapd_data *hapd,
+ 					   const struct drv_adv_ttlm_params *est_ttlm_params,
+ 					   bool send_default_mapping);
+ 
++int hostapd_drv_set_qos(struct hostapd_data *hapd, struct qm_req_data *qm_req,
++			struct qm_resp_data *qm_resp);
++
+ #endif /* AP_DRV_OPS */
+diff --git a/src/ap/robust_av.c b/src/ap/robust_av.c
+index 1506c5f..649860b 100644
+--- a/src/ap/robust_av.c
++++ b/src/ap/robust_av.c
+@@ -9,6 +9,7 @@
+ #include "hostapd.h"
+ #include "robust_av.h"
+ #include "sta_info.h"
++#include "ap_drv_ops.h"
+ 
+ u8 *hostapd_add_scs_ie(u8 *frm, bool scs)
+ {
+@@ -472,10 +473,207 @@ decline:
+ }
+ 
+ 
++static void
++hostapd_copy_tclas4_elem(struct qm_tclas_type4_params *qm_tclas4,
++			 struct hostapd_tclas4_params scs_tclas4)
++{
++	qm_tclas4->classifier_mask = scs_tclas4.classifier_mask;
++	qm_tclas4->ip_ver = scs_tclas4.ip_ver;
++	qm_tclas4->src_port = scs_tclas4.src_port;
++	qm_tclas4->dst_port = scs_tclas4.dst_port;
++	qm_tclas4->dscp = scs_tclas4.dscp;
++
++	if (qm_tclas4->ip_ver == IP_VERSION_4) {
++		os_memcpy(qm_tclas4->src_ip.ipv4, scs_tclas4.src_ip.ipv4,
++			  IPV4_LEN);
++		os_memcpy(qm_tclas4->dst_ip.ipv4, scs_tclas4.dst_ip.ipv4,
++			  IPV4_LEN);
++		qm_tclas4->protocol = scs_tclas4.protocol;
++
++	} else if (qm_tclas4->ip_ver == IP_VERSION_6) {
++		os_memcpy(qm_tclas4->src_ip.ipv4, scs_tclas4.src_ip.ipv4,
++			  IPV6_LEN);
++		os_memcpy(qm_tclas4->dst_ip.ipv4, scs_tclas4.dst_ip.ipv4,
++			  IPV6_LEN);
++		qm_tclas4->next_header = scs_tclas4.next_header;
++		os_memcpy(qm_tclas4->flow_label, scs_tclas4.flow_label,
++			  TCLAS4_FLOW_LABEL_SIZE);
++	}
++}
++
++
++static void
++hostapd_copy_tclas10_elem(struct qm_tclas_type10_params *qm_tclas10,
++			  struct hostapd_tclas10_params scs_tclas10)
++{
++	u8 filter_len;
++
++	qm_tclas10->protocol_instance = scs_tclas10.protocol_instance;
++	qm_tclas10->protocol_number = scs_tclas10.protocol_number;
++	qm_tclas10->filter_len = scs_tclas10.filter_len;
++	filter_len = qm_tclas10->filter_len;
++
++	/* For SCS protocol, filter_len is equal for filter mask and value.
++	 * This filter_len is extracted from frame parsing.
++	 */
++	os_memcpy(qm_tclas10->filter_value, scs_tclas10.filter_value,
++		  filter_len);
++	os_memcpy(qm_tclas10->filter_mask, scs_tclas10.filter_mask, filter_len);
++}
++
++
++static void
++hostapd_copy_scs_tclas_elem(struct qm_tclas_elements *qm_tclas,
++			    struct hostapd_tclas_elements scs_tclas)
++{
++	u8 type;
++
++	qm_tclas->up = scs_tclas.up;
++	qm_tclas->classifier_type = scs_tclas.classifier_type;
++	type = qm_tclas->classifier_type;
++
++	switch (type) {
++	case QM_TCLAS_CLASSIFIER_TYPE4:
++		hostapd_copy_tclas4_elem(&qm_tclas->tclas_elem.type4_params,
++					 scs_tclas.tclas_elem.type4_params);
++		break;
++	case QM_TCLAS_CLASSIFIER_TYPE10:
++		hostapd_copy_tclas10_elem(&qm_tclas->tclas_elem.type10_params,
++					  scs_tclas.tclas_elem.type10_params);
++		break;
++	default:
++		wpa_printf(MSG_ERROR, "Unknown TCLAS classifier:%d", type);
++		break;
++	}
++}
++
++
++static void hostapd_copy_scs_qos_attr(
++			struct qm_qos_attributes *qm_qos_attr,
++			struct hostapd_scs_qos_attributes scs_qos_attr)
++{
++	/* Control Info */
++	qm_qos_attr->direction = scs_qos_attr.direction;
++	qm_qos_attr->tid = scs_qos_attr.tid;
++	qm_qos_attr->up = scs_qos_attr.up;
++	qm_qos_attr->bitmap = scs_qos_attr.bitmap;
++	qm_qos_attr->link_id = scs_qos_attr.link_id;
++
++	/* Mandatory QoS Parameters */
++	qm_qos_attr->min_service_interval = scs_qos_attr.min_service_interval;
++	qm_qos_attr->max_service_interval = scs_qos_attr.max_service_interval;
++	qm_qos_attr->min_data_rate = scs_qos_attr.min_data_rate;
++	qm_qos_attr->delay_bound = scs_qos_attr.delay_bound;
++
++	/* Optional QoS Parameters */
++	qm_qos_attr->max_msdu_size = scs_qos_attr.max_msdu_size;
++	qm_qos_attr->service_start_time = scs_qos_attr.service_start_time;
++	qm_qos_attr->service_start_time_link_id =
++				scs_qos_attr.service_start_time_link_id;
++	qm_qos_attr->mean_data_rate = scs_qos_attr.mean_data_rate;
++	qm_qos_attr->burst_size = scs_qos_attr.burst_size;
++	qm_qos_attr->msdu_lifetime = scs_qos_attr.msdu_lifetime;
++	qm_qos_attr->msdu_delivery_ratio = scs_qos_attr.msdu_delivery_ratio;
++	qm_qos_attr->msdu_count_exponent = scs_qos_attr.msdu_count_exponent;
++	qm_qos_attr->medium_time = scs_qos_attr.medium_time;
++}
++
++
++static void hostapd_copy_scs_desc(struct qm_req_desc_data *qm_data,
++				  struct hostapd_scs_req_desc_data scs_data)
++{
++	int tclas_idx;
++
++	qm_data->qm_id = scs_data.scs_id;
++	qm_data->request_type = scs_data.request_type;
++	qm_data->priority = scs_data.intra_access_priority;
++	qm_data->num_tclas_elements = scs_data.num_tclas_elements;
++
++	/* Copy TCLAS elements if only present */
++	for (tclas_idx = 0;
++	     tclas_idx < qm_data->num_tclas_elements;
++	     tclas_idx++) {
++		hostapd_copy_scs_tclas_elem(&qm_data->tclas[tclas_idx],
++					    scs_data.tclas[tclas_idx]);
++	}
++
++	/* Copy TCLAS Processing value if more than one TCLAS elem is present */
++	if (qm_data->num_tclas_elements > 1)
++		qm_data->tclas_processing = scs_data.tclas_processing;
++
++	qm_data->is_qos_present = scs_data.is_qos_present;
++
++#ifdef CONFIG_IEEE80211BE
++	/* Copy QoS Attribute if only present */
++	if (qm_data->is_qos_present)
++		hostapd_copy_scs_qos_attr(&qm_data->qos_attr,
++					  scs_data.qos_attr);
++#endif
++}
++
++
++static void
++hostapd_copy_scs_resp_desc(struct hostapd_scs_resp_desc_data *scs_resp_desc,
++			   struct qm_resp_desc_data qm_resp_desc)
++{
++	scs_resp_desc->scs_id = qm_resp_desc.qm_id;
++	scs_resp_desc->status = qm_resp_desc.status;
++}
++
++
++static void hostapd_copy_scs_resp(struct hostapd_scs_resp_data *scs_resp,
++				  struct qm_resp_data qm_resp)
++{
++	int idx;
++
++	scs_resp->dialog_token = qm_resp.dialog_token;
++	scs_resp->num_scs_desc = qm_resp.num_qm_desc;
++
++	for (idx = 0; idx < scs_resp->num_scs_desc; idx++)
++		hostapd_copy_scs_resp_desc(&(scs_resp->scs_resp_desc[idx]),
++					   qm_resp.qm_resp_desc[idx]);
++}
++
++
++static int
++hostapd_copy_and_send_scs_data(struct hostapd_data *hapd, struct sta_info *sta,
++			       struct hostapd_scs_req_data *scs_req,
++			       struct hostapd_scs_resp_data *scs_resp)
++{
++	int ret = HOSTAPD_QM_STATUS_SUCCESS;
++	struct qm_resp_data qm_resp = {0};
++	struct qm_req_data qm_req = {0};
++	int idx;
++
++	if (!hapd->driver)
++		return HOSTAPD_QM_STATUS_E_INVAL;
++
++	os_memcpy(qm_req.peer_mac, scs_req->peer_mac, ETH_ALEN);
++
++	qm_req.qm_type = HOSTAPD_QM_TYPE_SCS;
++	qm_req.dialog_token = scs_req->dialog_token;
++	qm_req.num_qm_desc = scs_req->num_scs_desc;
++
++	for (idx = 0; idx < qm_req.num_qm_desc; idx++) {
++		hostapd_copy_scs_desc(&qm_req.qm_req_desc[idx],
++				      scs_req->scs_req_desc[idx]);
++	}
++
++	ret = hostapd_drv_set_qos(hapd, &qm_req, &qm_resp);
++	if (ret == 0)
++		hostapd_copy_scs_resp(scs_resp, qm_resp);
++	else
++		wpa_printf(MSG_ERROR, "set_qos failed, ret:%d", ret);
++
++	return ret;
++}
++
++
+ static int hostapd_handle_scs_req(struct hostapd_data *hapd, const u8 *buf,
+ 				  size_t frame_length)
+ {
+ 	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
++	struct hostapd_scs_resp_data scs_resp = {0};
+ 	struct hostapd_scs_req_data scs_req = {0};
+ 	const u8 *payload, *payload_start;
+ 	struct sta_info *sta;
+@@ -522,7 +720,7 @@ static int hostapd_handle_scs_req(struct hostapd_data *hapd, const u8 *buf,
+ 		if (ret != HOSTAPD_QM_STATUS_SUCCESS) {
+ 			wpa_printf(MSG_ERROR, "Parsing failure: ID:%d, "
+ 				   "Index:%d, status:%d", scs_id, index, ret);
+-			return -1;
++			return ret;
+ 		}
+ 
+ 		payload_start += (elem_len + 2);
+@@ -533,7 +731,11 @@ static int hostapd_handle_scs_req(struct hostapd_data *hapd, const u8 *buf,
+ 
+ 	scs_req.num_scs_desc = index;
+ 
+-	return 0;
++	ret = hostapd_copy_and_send_scs_data(hapd, sta, &scs_req, &scs_resp);
++	if (ret)
++		wpa_printf(MSG_ERROR, "Send SCS data failed, ret:%d", ret);
++
++	return ret;
+ }
+ 
+ 
+-- 
+2.34.1
+

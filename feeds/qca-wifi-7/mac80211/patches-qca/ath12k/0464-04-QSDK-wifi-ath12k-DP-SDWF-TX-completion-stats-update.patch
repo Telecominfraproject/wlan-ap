@@ -1,0 +1,958 @@
+From 20b1e3c6ac2204342033b2cbff6e6e9c6b854f83 Mon Sep 17 00:00:00 2001
+From: Nagarajan Maran <nmaran@qti.qualcomm.com>
+Date: Mon, 7 Jul 2025 04:18:35 +0530
+Subject: [PATCH] QSDK: wifi: ath12k: DP: Update SDWF TX completion stats
+
+Update SDWF TX and delay statistics during TX completion processing.
+Stats are updated either on the primary link or across all links,
+depending on whether single-link or multi-link stats collection is
+enabled.
+
+All updated statistics are part of the SDWF basic stats set.
+
+Following patch changes are also present
+	- 784-02-wifi-ath12k-Add-sawf-tx-stats-support.patch
+	- 784-04-ath12k-Add-SAWF-tx-delay-stats-support.patch
+	- 786-ath12k-add-per-histogram-count-support.patch
+	- 845-wifi-ath12k-Add-SDWF-delay-histogram-stats-support.patch
+
+Signed-off-by: Nagarajan Maran <nmaran@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/ahb.c         |  22 +
+ drivers/net/wireless/ath/ath12k/core.h        |  11 +
+ drivers/net/wireless/ath/ath12k/dp_htt.c      |  24 +
+ drivers/net/wireless/ath/ath12k/dp_peer.h     |  62 +--
+ drivers/net/wireless/ath/ath12k/hal.h         |  27 ++
+ drivers/net/wireless/ath/ath12k/hif.h         |   6 +
+ drivers/net/wireless/ath/ath12k/hw.h          |   1 +
+ drivers/net/wireless/ath/ath12k/qos.c         |   1 +
+ drivers/net/wireless/ath/ath12k/telemetry.c   |  24 +
+ drivers/net/wireless/ath/ath12k/telemetry.h   |   3 +-
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c | 439 +++++++++++++++++-
+ .../net/wireless/ath/ath12k/wifi7/hal_desc.h  |   1 +
+ .../wireless/ath/ath12k/wifi7/hal_qcn9274.c   |   2 +
+ .../net/wireless/ath/ath12k/wifi7/hal_rx.c    |  50 ++
+ .../net/wireless/ath/ath12k/wifi7/hal_rx.h    |   3 +
+ .../net/wireless/ath/ath12k/wifi7/hal_tx.h    |   3 +
+ drivers/net/wireless/ath/ath12k/wifi7/hw.c    |   7 +
+ drivers/net/wireless/ath/ath12k/wmi.c         |   2 +
+ 18 files changed, 653 insertions(+), 35 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -153,6 +153,11 @@ static void ath12k_ahb_write32(struct at
+ 		iowrite32(value, ab->mem + offset);
+ }
+ 
++static inline u32 ath12k_ahb_pmm_read32(struct ath12k_base *ab, u32 offset)
++{
++	return ioread32(ab->mem_pmm + offset);
++}
++
+ #if LINUX_VERSION_IS_GEQ(6,13,0)
+ static void ath12k_ahb_cancel_workqueue(struct ath12k_base *ab)
+ {
+@@ -1022,6 +1027,7 @@ static struct ath12k_hif_ops ath12k_ahb_
+ 	.stop = ath12k_ahb_stop,
+ 	.read32 = ath12k_ahb_read32,
+ 	.write32 = ath12k_ahb_write32,
++	.pmm_read32 = ath12k_ahb_pmm_read32,
+ 	.irq_enable = ath12k_ahb_ext_irq_enable,
+ 	.irq_disable = ath12k_ahb_ext_irq_disable,
+ 	.map_service_to_pipe = ath12k_ahb_map_service_to_pipe,
+@@ -1467,8 +1473,23 @@ static int ath12k_ahb_resource_init(stru
+ 		ab->ce_remap_base_addr = ce_remap->base;
+ 	}
+ 
++	if (ab->hw_params->pmm_remap) {
++		const struct pmm_remap *pmm = ab->hw_params->pmm_remap;
++
++		ab->mem_pmm = ioremap(pmm->base, pmm->size);
++		if (IS_ERR(ab->mem_pmm)) {
++			dev_err(&pdev->dev, "pmm ioremap error\n");
++			ret = -ENOMEM;
++			goto err_ce_mem_unmap;
++		}
++		ab->pmm_remap = true;
++		ab->pmm_remap_base_addr = pmm->base;
++	}
++
+ 	return 0;
+ 
++err_ce_mem_unmap:
++	ab->mem_pmm = NULL;
+ err_mem_unmap:
+ 	ab->mem_ce = NULL;
+ 	devm_iounmap(ab->dev, ab->mem);
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1234,6 +1234,8 @@ struct ath12k {
+ 	s8 max_allowed_tx_power;
+ 
+ 	bool teardown_complete_event;
++	u64 delta_tsf2;
++	u64 delta_tqm;
+ 	struct ath12k_afc_info afc;
+ #ifdef CPTCFG_ATH12K_CFR
+ 	struct ath12k_cfr cfr;
+@@ -1287,6 +1289,11 @@ struct ath12k_hw {
+ 	struct ath12k radio[] __aligned(sizeof(void *));
+ };
+ 
++struct pmm_remap {
++	u32 base;
++	u32 size;
++};
++
+ struct ath12k_band_cap {
+ 	u32 phy_id;
+ 	u32 max_bw_supported;
+@@ -1465,6 +1472,7 @@ struct ath12k_hw_group {
+         struct completion umac_reset_complete;
+         bool trigger_umac_reset;
+ 	struct ath12k_qos_ctx qos;
++	u64 mlo_tstamp_offset;
+ 	struct ath12k_stats_work_context stats_work;
+ 	u8 num_bypassed;
+ 	bool wsi_remap_in_progress;
+@@ -1539,6 +1547,9 @@ struct ath12k_base {
+ 	u32 ce_remap_base_addr;
+ 	u32 cmem_offset;
+ 	bool ce_remap;
++	void __iomem *mem_pmm;
++	u32 pmm_remap_base_addr;
++	bool pmm_remap;
+ 	bool htt_flag;
+ 	bool stats_disable;
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_htt.c
++++ b/drivers/net/wireless/ath/ath12k/dp_htt.c
+@@ -1044,8 +1044,10 @@ static void ath12k_htt_mlo_offset_event_
+ 						struct sk_buff *skb)
+ {
+ 	struct ath12k_htt_mlo_offset_msg *msg;
++	struct ath12k_hw_group *ag = ab->ag;
+ 	struct ath12k_pdev *pdev;
+ 	struct ath12k *ar;
++	int i, j;
+ 	u8 pdev_id;
+ 
+ 	msg = (struct ath12k_htt_mlo_offset_msg *)skb->data;
+@@ -1075,6 +1077,29 @@ static void ath12k_htt_mlo_offset_event_
+ 	pdev->timestamp.mlo_comp_clks = __le32_to_cpu(msg->mlo_comp_clks);
+ 	pdev->timestamp.mlo_comp_timer = __le32_to_cpu(msg->mlo_comp_timer);
+ 
++	ag->mlo_tstamp_offset = ((u64)pdev->timestamp.mlo_offset_hi << 32 |
++				 pdev->timestamp.mlo_offset_lo);
++
++	/* MLO TSAMP OFFSET is common for all chips and
++	 * fetch delta_tsf2 for all the radios for this event
++	 */
++	for (i = 0; i < ag->num_devices; i++) {
++		struct ath12k_base *tmp_ab = ag->ab[i];
++
++		for (j = 0; j < tmp_ab->num_radios; j++) {
++			struct ath12k *tmp_ar;
++
++			pdev = &tmp_ab->pdevs[j];
++			tmp_ar = pdev->ar;
++			if (!tmp_ar || !tmp_ab->ce_pipe_init_done)
++				continue;
++
++			if (tmp_ab->hw_params->hal_ops->hal_get_tsf2_scratch_reg)
++				tmp_ab->hw_params->hal_ops->hal_get_tsf2_scratch_reg(tmp_ab, tmp_ar->lmac_id,
++										     &tmp_ar->delta_tsf2);
++		}
++	}
++
+ 	spin_unlock_bh(&ar->data_lock);
+ exit:
+ 	rcu_read_unlock();
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.h
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.h
+@@ -205,10 +205,12 @@ struct ath12k_dp_peer {
+ #define MSDUQ_WHO_CL_INFO	GENMASK(5, 4)
+ 
+ #define QOS_NW_DELAY_MAX	0x3FFFF
++#define QOS_NW_DELAY		GENMASK(23, 6)
+ #define QOS_NW_TAG_SHIFT	GENMASK(23, 16)
+ #define QOS_TAG_ID		GENMASK(31, 24)
+ #define QOS_NW_DELAY_SHIFT	0x6
+ #define QOS_VALID_TAG		BIT(30)
++#define DP_RETRY_COUNT		7
+ 
+ struct ath12k_msduq {
+ 	bool reserved;
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -332,6 +332,30 @@ enum hal_ring_type {
+ 	HAL_MAX_RING_TYPES,
+ };
+ 
++#define PMM_REG_BASE_QCN9224    0xB500FC
++#define HAL_IPQ5332_PMM_REG_BASE       0xCB500FC
++#define HAL_IPQ5332_PMM_SIZE           0x100
++
++enum hal_scratch_reg_enum {
++	PMM_QTIMER_GLOBAL_OFFSET_LO_US,
++	PMM_QTIMER_GLOBAL_OFFSET_HI_US,
++	PMM_MAC0_TSF1_OFFSET_LO_US,
++	PMM_MAC0_TSF1_OFFSET_HI_US,
++	PMM_MAC0_TSF2_OFFSET_LO_US,
++	PMM_MAC0_TSF2_OFFSET_HI_US,
++	PMM_MAC1_TSF1_OFFSET_LO_US,
++	PMM_MAC1_TSF1_OFFSET_HI_US,
++	PMM_MAC1_TSF2_OFFSET_LO_US,
++	PMM_MAC1_TSF2_OFFSET_HI_US,
++	PMM_MLO_OFFSET_LO_US,
++	PMM_MLO_OFFSET_HI_US,
++	PMM_TQM_CLOCK_OFFSET_LO_US,
++	PMM_TQM_CLOCK_OFFSET_HI_US,
++	PMM_Q6_CRASH_REASON,
++	PMM_SCRATCH_TWT_OFFSET,
++	PMM_PMM_REG_MAX
++};
++
+ /**
+  * enum hal_reo_cmd_type: Enum for REO command type
+  * @HAL_REO_CMD_GET_QUEUE_STATS: Get REO queue status/stats
+@@ -548,6 +572,8 @@ struct hal_tx_status {
+ 	u16 tones;
+ 	u8 ofdma;
+ 	bool acked;
++	u32 buffer_timestamp;
++	u32 tsf;
+ 	u8 transmit_cnt;
+ 	u8 first_msdu;
+ 	u8 last_msdu;
+@@ -1292,6 +1318,9 @@ struct hal_ops {
+ 				 u16 *num_msdus);
+ 	u8 (*rx_h_l3pad_get)(struct hal_rx_desc *desc);
+ 	void (*hal_mon_ops_init)(struct ath12k_hal *hal, u8 hw_version);
++	void (*hal_get_tsf2_scratch_reg)(struct ath12k_base *ab, u8 mac_id,
++					 u64 *value);
++	void (*hal_get_tqm_scratch_reg)(struct ath12k_base *ab, u64 *value);
+ 	void (*get_hw_hptp)(struct ath12k_base *ab, enum hal_ring_type type,
+ 			    struct hal_srng *srng, uint32_t *hp, uint32_t *tp);
+ };
+--- a/drivers/net/wireless/ath/ath12k/hif.h
++++ b/drivers/net/wireless/ath/ath12k/hif.h
+@@ -17,6 +17,7 @@ struct ath12k_hif_ops {
+ 	void (*write32)(struct ath12k_base *ab, u32 address, u32 data);
+ 	u32 (*cmem_read32)(struct ath12k_base *sc, u32 address);
+ 	void (*cmem_write32)(struct ath12k_base *sc, u32 address, u32 data);
++	u32 (*pmm_read32)(struct ath12k_base *sc, u32 address);
+ 	void (*irq_enable)(struct ath12k_base *ab);
+ 	void (*irq_disable)(struct ath12k_base *ab);
+ 	int (*start)(struct ath12k_base *ab);
+@@ -152,6 +153,16 @@ static inline u32 ath12k_hif_read32(stru
+ 	return ab->hif.ops->read32(ab, address);
+ }
+ 
++static inline u32 ath12k_hif_pmm_read32(struct ath12k_base *ab, u32 offset)
++{
++	return ab->hif.ops->pmm_read32(ab, offset);
++}
++
++static inline u32 ath12k_hif_cmem_read32(struct ath12k_base *ab, u32 address)
++{
++	return ab->hif.ops->cmem_read32(ab, address);
++}
++
+ static inline void ath12k_hif_cmem_write32(struct ath12k_base *ab, u32 address,
+                                       u32 data)
+ {
+--- a/drivers/net/wireless/ath/ath12k/hw.h
++++ b/drivers/net/wireless/ath/ath12k/hw.h
+@@ -296,6 +296,7 @@ struct ath12k_hw_params {
+ 
+ 	const struct ce_ie_addr *ce_ie_addr;
+ 	const struct ce_remap *ce_remap;
++	const struct pmm_remap *pmm_remap;
+ 	u32 afc_mem_offset;
+ 	bool send_platform_model;
+ 	bool handle_beacon_miss;
+--- a/drivers/net/wireless/ath/ath12k/qos.c
++++ b/drivers/net/wireless/ath/ath12k/qos.c
+@@ -17,6 +17,7 @@ struct ath12k_qos_ctx *ath12k_get_qos(st
+ 	}
+ 	return &ab->ag->qos;
+ }
++EXPORT_SYMBOL(ath12k_get_qos);
+ 
+ static
+ bool ath12k_qos_validate_params(struct ath12k_base *ab,
+--- a/drivers/net/wireless/ath/ath12k/telemetry.c
++++ b/drivers/net/wireless/ath/ath12k/telemetry.c
+@@ -189,3 +189,27 @@ int ath12k_telemetry_sdwf_sla_detection_
+ 		   ret);
+ 	return ret;
+ }
++
++bool ath12k_telemetry_get_sla_mov_avg_num_pkt(u32 *mov_avg)
++{
++	if (!telemetry_ctx) {
++		*mov_avg = 1;
++		return false;
++	}
++
++	*mov_avg = telemetry_ctx->sla_samples_params.moving_avg_pkt;
++	return true;
++}
++EXPORT_SYMBOL(ath12k_telemetry_get_sla_mov_avg_num_pkt);
++
++bool ath12k_telemetry_get_sla_num_pkts(u32 *pkt_num)
++{
++	if (!telemetry_ctx) {
++		*pkt_num = 1;
++		return false;
++	}
++
++	*pkt_num = telemetry_ctx->sla_samples_params.sla_num_pkt;
++	return true;
++}
++EXPORT_SYMBOL(ath12k_telemetry_get_sla_num_pkts);
+--- a/drivers/net/wireless/ath/ath12k/telemetry.h
++++ b/drivers/net/wireless/ath/ath12k/telemetry.h
+@@ -95,5 +95,6 @@ void ath12k_telemetry_deinit(struct ath1
+ int ath12k_telemetry_sdwf_sla_samples_config(struct ath12k_sla_samples_cfg param);
+ int ath12k_telemetry_sdwf_sla_thershold_config(struct ath12k_sla_thershold_cfg param);
+ int ath12k_telemetry_sdwf_sla_detection_config(struct ath12k_sla_detect_cfg param);
+-
++bool ath12k_telemetry_get_sla_num_pkts(u32 *pkt_num);
++bool ath12k_telemetry_get_sla_mov_avg_num_pkt(u32 *mov_avg);
+ #endif /* ATH12K_TELEMETRY_H */
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -15,6 +15,7 @@
+ #include "../sdwf.h"
+ #include "../dp_stats.h"
+ #include "../dp_peer.h"
++#include "../telemetry.h"
+ 
+ struct ath12k_tx_sw_metadata {
+ 	struct sk_buff *skb;
+@@ -28,7 +29,7 @@ struct ath12k_tx_sw_metadata {
+ 	    rsvd2          : 8;
+ } __packed __aligned(32);
+ 
+-static_assert(sizeof(struct ath12k_tx_sw_metadata) == 32, "size of struct ath12k_tx_sw_metadata is not 32 bytes!");
++static_assert(sizeof(struct ath12k_tx_sw_metadata) == 32, "size of struct ath12k_tx_sw_metadata is not 64 bytes!");
+ 
+ struct ath12k_wifi7_tx_status_entry {
+ 	struct hal_wbm_completion_ring_tx tx_status;
+@@ -270,6 +271,422 @@ ath12k_dp_sdwftx_ingress_stats_update(st
+ 	*skb_mark = u32_encode_bits((u32_get_bits(*skb_mark, QOS_NW_TAG_SHIFT)), QOS_TAG_ID) | (qos_nw_delay << QOS_NW_DELAY_SHIFT) | msduq;
+ }
+ 
++void ath12k_sdwf_update_peer_mcs_stats(struct tx_stats *qos_tx,
++				       struct hal_tx_status *ts)
++{
++	u8 mcs = MAX_MCS, pkt_type;
++
++	mcs = ts->mcs;
++	pkt_type = ts->pkt_type;
++
++	if (pkt_type > HAL_TX_RATE_STATS_PKT_TYPE_11BE ||
++	    pkt_type == HAL_TX_RATE_STATS_PKT_TYPE_11BA) {
++		return;
++	}
++
++	if (pkt_type == HAL_TX_RATE_STATS_PKT_TYPE_11BE)
++		pkt_type = DOT11_BE;
++
++	switch (pkt_type) {
++	case DOT11_A:
++		mcs = (mcs >= MAX_MCS_11A) ? (MAX_MCS - 1) : mcs;
++		break;
++	case DOT11_B:
++		mcs = (mcs >= MAX_MCS_11B) ? (MAX_MCS - 1) : mcs;
++		break;
++	case DOT11_N:
++		mcs = (mcs >= MAX_MCS_11N) ? (MAX_MCS - 1) : mcs;
++		break;
++	case DOT11_AC:
++		mcs = (mcs >= MAX_MCS_11AC) ? (MAX_MCS - 1) : mcs;
++		break;
++	case DOT11_AX:
++		mcs = (mcs >= MAX_MCS_11AX) ? (MAX_MCS - 1) : mcs;
++		break;
++	case DOT11_BE:
++		mcs = (mcs >= MAX_MCS_11BE) ? (MAX_MCS - 1) : mcs;
++		break;
++	default:
++		break;
++	}
++
++	if (mcs != MAX_MCS)
++		qos_tx->pkt_type[pkt_type].mcs_count[mcs]++;
++}
++
++bool ath12k_get_qos_params_delay_bound(struct ath12k_base *ab, u8 qos_id,
++				       u32 *delay_bound)
++{
++	struct ath12k_qos_ctx *qos_ctx;
++
++	if (qos_id >= QOS_PROFILES_MAX) {
++		ath12k_err(NULL, "Invalid qos id :%u\n", qos_id);
++		return false;
++	}
++
++	qos_ctx = ath12k_get_qos(ab);
++	if (!qos_ctx) {
++		ath12k_err(NULL, "QoS Context is NULL\n");
++		return false;
++	}
++
++	spin_lock_bh(&qos_ctx->profile_lock);
++	if (!qos_ctx->profiles[qos_id].ref_count) {
++		ath12k_err(NULL, "Qos ctx : %u profiles not present\n",
++			   qos_id);
++		spin_unlock_bh(&qos_ctx->profile_lock);
++		return false;
++	}
++
++	*delay_bound = qos_ctx->profiles[qos_id].params.msdu_delivery_info;
++	spin_unlock_bh(&qos_ctx->profile_lock);
++
++	return true;
++}
++
++#define HW_TX_DELAY_MAX				0x1000000
++
++#define TX_COMPL_SHIFT_BUFFER_TIMESTAMP_US	10
++#define HW_TX_DELAY_MASK			0x1FFFFFFF
++#define TX_COMPL_BUFFER_TSTAMP_US(TSTAMP) \
++	(((TSTAMP) << TX_COMPL_SHIFT_BUFFER_TIMESTAMP_US) & \
++	 HW_TX_DELAY_MASK)
++
++#define ATH12K_DP_SAWF_DELAY_BOUND_MS_MULTIPLER 1000
++#define ATH12K_MOV_AVG_PKT_WIN	10
++
++#define ATH12K_HIST_AVG_DIV	2
++
++const u32 ath12k_hist_hw_tx_comp_bucket[] = {
++	250, 500, 750, 1000, 1500, 2000, 2500, 5000, 6000, 7000, 8000, 9000, U32_MAX
++};
++
++void ath12k_hist_fill_buckets(struct hist_bucket *hist, u32 value)
++{
++	int idx;
++
++	hist->hist_type = HIST_TYPE_HW_TX_COMP_DELAY;
++
++	for (idx = HIST_BUCKET_0; idx < ARRAY_SIZE(ath12k_hist_hw_tx_comp_bucket); idx++) {
++		if (value <= ath12k_hist_hw_tx_comp_bucket[idx]) {
++			hist->freq[idx]++;
++			return;
++		}
++	}
++}
++
++void ath12k_update_hist_stats(struct hist_stats *hist_stats, u32 value)
++{
++	if (!hist_stats)
++		return;
++
++	ath12k_hist_fill_buckets(&hist_stats->hist, value);
++
++	if (!hist_stats->min || value < hist_stats->min)
++		hist_stats->min = value;
++
++	if (value > hist_stats->max)
++		hist_stats->max = value;
++
++	if (unlikely(!hist_stats->avg))
++		hist_stats->avg = value;
++	else
++		hist_stats->avg = (hist_stats->avg + value) / ATH12K_HIST_AVG_DIV;
++}
++
++void ath12k_sdwf_compute_hw_delay(struct ath12k *ar, struct hal_tx_status *ts,
++				  u32 *hw_delay)
++{
++	/* low 32 alone will be filled for TSF2 from FW and the value can be
++	 * negative for both TSF2 and TQM delta
++	 */
++	int tmp_delta_tsf2 = ar->delta_tsf2, tmp_delta_tqm = ar->delta_tqm;
++	u32 msdu_tqm_enqueue_tstamp_us, final_msdu_tqm_enqueue_tstamp_us;
++	u32 msdu_compl_tsf_tstamp_us, final_msdu_compl_tsf_tstamp_us;
++	struct ath12k_hw_group *ag = ar->ab->ag;
++	/* MLO TSTAMP OFFSET can be negative
++	 */
++	int mlo_offset = ag->mlo_tstamp_offset;
++	int delta_tsf2, delta_tqm;
++
++	msdu_tqm_enqueue_tstamp_us =
++		TX_COMPL_BUFFER_TSTAMP_US(ts->buffer_timestamp);
++	msdu_compl_tsf_tstamp_us = ts->tsf;
++	delta_tsf2 = mlo_offset - tmp_delta_tsf2;
++	delta_tqm = mlo_offset - tmp_delta_tqm;
++
++	final_msdu_tqm_enqueue_tstamp_us =
++		(msdu_tqm_enqueue_tstamp_us + delta_tqm) & HW_TX_DELAY_MASK;
++	final_msdu_compl_tsf_tstamp_us =
++		(msdu_compl_tsf_tstamp_us + delta_tsf2) & HW_TX_DELAY_MASK;
++
++	*hw_delay = (final_msdu_compl_tsf_tstamp_us -
++			final_msdu_tqm_enqueue_tstamp_us) & HW_TX_DELAY_MASK;
++}
++
++/* reinject_pkt stats - needs to be implemented */
++void ath12k_qos_stats_update(struct ath12k *ar, struct sk_buff *skb,
++			     struct hal_tx_status *ts,
++			     struct ath12k_pdev_dp *dp_pdev,
++			     ktime_t timestamp)
++{
++	struct ath12k_dp_link_peer *link_peer = NULL, *pri_peer = NULL;
++	struct ath12k_dp_peer *mld_peer;
++	struct ath12k_dp *dp = NULL;
++	struct ath12k_dp_hw *dp_hw = NULL;
++	struct ath12k_vif *ahvif = NULL;
++	struct ath12k_link_vif *arvif = NULL;
++	struct ath12k_mld_qos_stats *mld_qos;
++	struct tx_stats *qos_tx;
++	struct delay_stats *qos_delay;
++	u64 enqueue_timestamp, total_delay_pkts;
++	u32 len, q_id, tid, hw_delay, nw_delay, sw_delay, delay_bound;
++	u32 nwdelay_avg, hwdelay_avg, swdelay_avg, pkt_win;
++	u16 msduq_id;
++	u8 link_id, pri_link_id, qos_id;
++	bool update_pri_peer = false;
++
++	if (!ts || !dp_pdev)
++		return;
++
++	if (!(skb->mark & QOS_VALID_TAG))
++		return;
++
++	msduq_id = u32_get_bits(skb->mark, SDWF_MSDUQ_ID);
++	if (msduq_id >= QOS_MSDUQ_MAX &&
++	    msduq_id < MSDUQ_MAX_DEF)
++		return;
++
++	msduq_id -= MSDUQ_MAX_DEF;
++
++	q_id = u16_get_bits(msduq_id, MSDUQ_MASK);
++	tid = u16_get_bits(msduq_id, MSDUQ_TID_MASK);
++	len = skb->len;
++
++	if (!(ath12k_debugfs_is_qos_stats_enabled(ar) & ATH12K_QOS_STATS_BASIC))
++		return;
++
++	mld_peer = ath12k_dp_peer_find_by_peerid_index(dp_pdev->dp,
++						       dp_pdev,
++						       ts->peer_id);
++	if (!mld_peer) {
++		ath12k_err(ar->ab, "MLD peer NA with peer_id: %u\n",
++			   ts->peer_id);
++		return;
++	}
++
++	if (mld_peer->qos_stats_lvl == ATH12K_QOS_SINGLE_LINK_STATS) {
++		/* primary link only */
++		link_id = mld_peer->hw_links[dp_pdev->hw_link_id];
++	} else {
++		link_id = ath12k_dp_get_link_id(dp_pdev, ts, mld_peer);
++	}
++
++	if (link_id < ATH12K_NUM_MAX_LINKS) {
++		link_peer = rcu_dereference(mld_peer->link_peers[link_id]);
++		if (!link_peer) {
++			ath12k_err(ar->ab, "link peer not present with link_id: %u\n",
++				   link_id);
++			return;
++		}
++
++		if (link_peer->vif) {
++			ahvif = ath12k_vif_to_ahvif(link_peer->vif);
++		} else {
++			ath12k_err(ar->ab, "vif not present with link_id: %u\n",
++				   link_id);
++			return;
++		}
++
++		if (ahvif) {
++			arvif = rcu_dereference(ahvif->link[link_id]);
++		} else {
++			ath12k_err(ar->ab, "ath12k vif not present with link_id: %u\n",
++				   link_id);
++			return;
++		}
++
++		if (arvif && arvif->ar) {
++			dp = arvif->ar->ab->dp;
++			dp_hw = arvif->ar->dp.dp_hw;
++		} else {
++			ath12k_err(ar->ab, "link vif or link vif radio not present with link_id: %u\n",
++				   link_id);
++			return;
++		}
++
++		if (!dp || !dp_hw) {
++			ath12k_err(ar->ab, "dp or dp_hw not present %u\n",
++				   link_id);
++			return;
++		}
++	} else {
++		ath12k_err(ar->ab, "link peer NA with link_id: %u\n",
++			   link_id);
++		return;
++	}
++
++	spin_lock_bh(&dp->dp_lock);
++	spin_lock_bh(&dp_hw->peer_lock);
++
++	mld_qos = &mld_peer->mld_qos_stats[tid][q_id];
++
++	if (!link_peer->peer_stats.qos_stats) {
++		spin_unlock_bh(&dp_hw->peer_lock);
++		spin_unlock_bh(&dp->dp_lock);
++		return;
++	}
++
++	qos_tx = &link_peer->peer_stats.qos_stats->qos_tx[tid][q_id];
++
++	switch (ts->status) {
++	case HAL_WBM_TQM_REL_REASON_FRAME_ACKED:
++		mld_qos->tx_success_pkts++;
++		qos_tx->tx_success.num++;
++		qos_tx->tx_success.bytes += len;
++		if (ts->transmit_cnt > 1) {
++			qos_tx->total_retries_count += (ts->transmit_cnt - 1);
++			qos_tx->retry_count++;
++			if (ts->transmit_cnt > 2)
++				qos_tx->multiple_retry_count++;
++		}
++		ath12k_sdwf_update_peer_mcs_stats(qos_tx, ts);
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_MPDU:
++		qos_tx->dropped.fw_rem.num++;
++		qos_tx->dropped.fw_rem.bytes += len;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_TX:
++		qos_tx->dropped.fw_rem_tx++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_NOTX:
++		qos_tx->dropped.fw_rem_notx++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_AGED_FRAMES:
++		qos_tx->dropped.age_out++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_RESEAON1:
++		qos_tx->dropped.fw_reason1++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_RESEAON2:
++		qos_tx->dropped.fw_reason2++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_REMOVE_RESEAON3:
++		qos_tx->dropped.fw_reason3++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_DISABLE_QUEUE:
++		qos_tx->dropped.fw_rem_queue_disable++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_CMD_TILL_NONMATCHING:
++		qos_tx->dropped.fw_rem_no_match++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_DROP_THRESHOLD:
++		qos_tx->dropped.drop_threshold++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_DROP_LINK_DESC_UNAVAIL:
++		qos_tx->dropped.drop_link_desc_na++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_DROP_OR_INVALID_MSDU:
++		qos_tx->dropped.invalid_drop++;
++		break;
++	case HAL_WBM_TQM_REL_REASON_MULTICAST_DROP:
++		qos_tx->dropped.mcast_vdev_drop++;
++		break;
++	default:
++		qos_tx->dropped.invalid_rr++;
++		break;
++	}
++
++	if (ts->status != HAL_WBM_TQM_REL_REASON_FRAME_ACKED) {
++		qos_tx->tx_failed.num++;
++		qos_tx->tx_failed.bytes += len;
++		mld_qos->tx_failed_pkts++;
++		if (ts->transmit_cnt > DP_RETRY_COUNT)
++			qos_tx->failed_retry_count++;
++	}
++
++	pri_link_id = mld_peer->hw_links[dp_pdev->hw_link_id];
++
++	if (link_id == pri_link_id) {
++		qos_tx->queue_depth--;
++	} else {
++		update_pri_peer = true;
++	}
++
++	qos_delay = &link_peer->peer_stats.qos_stats->qos_delay[tid][q_id];
++
++	ath12k_sdwf_compute_hw_delay(ar, ts, &hw_delay);
++	if (hw_delay > HW_TX_DELAY_MAX) {
++		mld_qos->tx_invalid_delay_pkts++;
++		qos_delay->invalid_delay_pkts++;
++		goto out;
++	}
++
++	mld_qos->hwdelay_win_total += hw_delay;
++	ath12k_update_hist_stats(&qos_delay->delay_hist, hw_delay);
++
++	nw_delay = u32_get_bits(skb->mark, QOS_NW_DELAY);
++	mld_qos->nwdelay_win_total += nw_delay;
++
++	enqueue_timestamp = ktime_to_us(timestamp);
++
++	if (!enqueue_timestamp)
++		sw_delay = 0;
++	else
++		sw_delay = (u32) (enqueue_timestamp);
++
++	mld_qos->swdelay_win_total += sw_delay;
++
++	ath12k_telemetry_get_sla_mov_avg_num_pkt(&pkt_win);
++	if (!pkt_win)
++		pkt_win = ATH12K_MOV_AVG_PKT_WIN;
++
++	total_delay_pkts = mld_qos->tx_success_pkts +
++			   mld_qos->tx_failed_pkts -
++			   mld_qos->tx_invalid_delay_pkts;
++	if (!(total_delay_pkts % pkt_win)) {
++		nwdelay_avg = div_u64(mld_qos->nwdelay_win_total,
++				      pkt_win);
++		swdelay_avg = div_u64(mld_qos->swdelay_win_total,
++				      pkt_win);
++		hwdelay_avg = div_u64(mld_qos->hwdelay_win_total,
++				      pkt_win);
++		mld_qos->nwdelay_win_total = 0;
++		mld_qos->swdelay_win_total = 0;
++		mld_qos->hwdelay_win_total = 0;
++	}
++
++	if (!mld_peer->qos) {
++		ath12k_err(ar->ab, "link peer's qos not present\n");
++		goto out;
++	}
++
++	qos_id = mld_peer->qos->msduq_map[tid][q_id].qos_id;
++
++	if (ath12k_get_qos_params_delay_bound(arvif->ar->ab, qos_id,
++					      &delay_bound)) {
++		if (hw_delay > (delay_bound *
++				ATH12K_DP_SAWF_DELAY_BOUND_MS_MULTIPLER))
++			qos_delay->delay_failure++;
++		else
++			qos_delay->delay_success++;
++	}
++
++out:
++	spin_unlock_bh(&dp_hw->peer_lock);
++	spin_unlock_bh(&dp->dp_lock);
++
++	if (update_pri_peer) {
++		 pri_peer = rcu_dereference(mld_peer->link_peers[pri_link_id]);
++		 if (pri_peer) {
++			spin_lock_bh(&dp_pdev->dp->dp_lock);
++			if (pri_peer->peer_stats.qos_stats)
++				pri_peer->peer_stats.qos_stats->qos_tx[tid][q_id].queue_depth--;
++			spin_unlock_bh(&dp_pdev->dp->dp_lock);
++		}
++	}
++}
++
+ #define HTT_META_DATA_ALIGNMENT 0x8
+ 
+ /* Preparing HTT Metadata when utilized with ext MSDU */
+@@ -988,6 +1405,12 @@ ath12k_wifi7_dp_tx_htt_tx_complete_buf(s
+ 		status.sta = peer->sta;
+ 	spin_unlock_bh(&dp->dp_lock);
+ 
++	if ((unlikely(ath12k_debugfs_is_dp_stats_enabled(dp_pdev))) &&
++	    (unlikely(ath12k_debugfs_is_qos_stats_enabled(dp_pdev->ar)))) {
++		ath12k_qos_stats_update(dp_pdev->ar, msdu, ts, dp_pdev,
++					msdu->tstamp);
++	}
++
+ 	status.info = info;
+ 	status.skb = msdu;
+ 	ieee80211_tx_status_ext(ath12k_dp_pdev_to_hw(dp_pdev), &status);
+@@ -1317,6 +1740,8 @@ static void ath12k_wifi7_dp_tx_complete_
+ 	/* skip tx rate update from ieee80211_status*/
+ 	info->status.rates[0].idx = -1;
+ 
++	ar = dp_pdev->ar;
++
+ 	peer = ath12k_dp_peer_find_by_peerid_index(dp, dp_pdev, ts->peer_id);
+ 	if (peer) {
+ 		link_id = ath12k_dp_get_link_id(dp_pdev, ts, peer);
+@@ -1329,6 +1754,10 @@ static void ath12k_wifi7_dp_tx_complete_
+ 				ath12k_dp_tx_comp_update_peer_stats(peer, ts,
+ 								    ring,
+ 								    tx_desc_flags);
++			if (unlikely(ath12k_debugfs_is_qos_stats_enabled(ar)))
++				ath12k_qos_stats_update(ar, msdu, ts,
++							dp_pdev,
++							msdu->tstamp);
+ 		}
+ 	} else {
+ 		DP_DEVICE_STATS_INC(dp, tx_err.tx_comp_err[DP_TX_COMP_ERR_INVALID_PEER][ring], 1);
+@@ -1370,7 +1799,6 @@ static void ath12k_wifi7_dp_tx_complete_
+ 	 * Might end up reporting it out-of-band from HTT stats.
+ 	 */
+ 
+-	ar = dp_pdev->ar;
+ 	if (ath12k_debugfs_is_extd_tx_stats_enabled(ar)) {
+ 		if (ts->flags & HAL_TX_STATUS_FLAGS_FIRST_MSDU) {
+ 			if (ar->last_ppdu_id == 0) {
+@@ -1460,6 +1888,9 @@ ath12k_wifi7_dp_tx_status_parse(struct a
+ 	ts->tid = FIELD_GET(HAL_WBM_RELEASE_TX_INFO3_TID, desc->info3);
+ 	ts->transmit_cnt = le32_get_bits(desc->info1,
+ 					 HAL_WBM_COMPL_TX_INFO1_TRANSMIT_COUNT);
++	ts->buffer_timestamp = FIELD_GET(HAL_WBM_RELEASE_TX_INFO2_BUFFER_TIMESTAMP,
++					 desc->info2);
++	ts->tsf = desc->rate_stats.tsf;
+ 	ts->first_msdu = le32_get_bits(desc->info2,
+ 				       HAL_WBM_COMPL_TX_INFO2_FIRST_MSDU);
+ 	ts->last_msdu = le32_get_bits(desc->info2,
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_desc.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_desc.h
+@@ -1738,6 +1738,7 @@ struct hal_wbm_completion_ring_tx {
+ 
+ #define HAL_WBM_RELEASE_TX_INFO3_PEER_ID		GENMASK(15, 0)
+ #define HAL_WBM_RELEASE_TX_INFO3_TID			GENMASK(19, 16)
++#define HAL_WBM_RELEASE_TX_INFO3_TRANSMIT_CNT		GENMASK(30, 24)
+ #define HAL_WBM_RELEASE_TX_INFO3_SW_BUFFER_COOKIE_19_12	GENMASK(27, 20)
+ #define HAL_WBM_RELEASE_TX_INFO3_LOOPING_COUNT		GENMASK(31, 28)
+ 
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.c
+@@ -1039,6 +1039,64 @@ void ath12k_wifi7_hal_reo_shared_qaddr_c
+ 			   HAL_REO1_QDESC_ADDR(hal), val);
+ }
+ 
++#define PMM_REG_OFFSET  4
++
++static void ath12k_hal_get_tsf_reg(u8 mac_id, enum hal_scratch_reg_enum *tsf_enum_low,
++				   enum hal_scratch_reg_enum *tsf_enum_hi)
++{
++	if (!mac_id) {
++		*tsf_enum_low = PMM_MAC0_TSF2_OFFSET_LO_US;
++		*tsf_enum_hi = PMM_MAC0_TSF2_OFFSET_HI_US;
++	} else if (mac_id == 1) {
++		*tsf_enum_low = PMM_MAC1_TSF2_OFFSET_LO_US;
++		*tsf_enum_hi = PMM_MAC1_TSF2_OFFSET_HI_US;
++	}
++}
++
++void ath12k_hal_qcn9274_get_tsf2_scratch_reg(struct ath12k_base *ab,
++					     u8 mac_id, u64 *value)
++{
++	enum hal_scratch_reg_enum enum_lo, enum_hi;
++	u32 offset_lo, offset_hi;
++
++	ath12k_hal_get_tsf_reg(mac_id, &enum_lo, &enum_hi);
++
++	if (ab->hif.ops->pmm_read32) {
++		offset_lo = ath12k_hif_pmm_read32(ab, ATH12K_PPT_ADDR_OFFSET(enum_lo));
++		offset_hi = ath12k_hif_pmm_read32(ab, ATH12K_PPT_ADDR_OFFSET(enum_hi));
++	} else if (ab->hw_rev == ATH12K_HW_QCN6432_HW10) {
++		offset_lo = ath12k_hif_cmem_read32(ab, PMM_REG_BASE_QCN9224 + ATH12K_PPT_ADDR_OFFSET(enum_lo));
++		offset_hi = ath12k_hif_cmem_read32(ab, PMM_REG_BASE_QCN9224 + ATH12K_PPT_ADDR_OFFSET(enum_hi));
++	} else {
++		offset_lo = ath12k_hif_read32(ab, PMM_REG_BASE_QCN9224 + ATH12K_PPT_ADDR_OFFSET(enum_lo));
++		offset_hi = ath12k_hif_read32(ab, PMM_REG_BASE_QCN9224 + ATH12K_PPT_ADDR_OFFSET(enum_hi));
++	}
++
++	*value = ((u64)(offset_hi) << 32 | offset_lo);
++}
++
++void ath12k_hal_qcn9274_get_tqm_scratch_reg(struct ath12k_base *ab, u64 *value)
++{
++	u32 offset_lo, offset_hi;
++
++	if (ab->hif.ops->pmm_read32) {
++		offset_lo = ath12k_hif_pmm_read32(ab, ATH12K_PPT_ADDR_OFFSET(PMM_TQM_CLOCK_OFFSET_LO_US));
++		offset_hi = ath12k_hif_pmm_read32(ab, ATH12K_PPT_ADDR_OFFSET(PMM_TQM_CLOCK_OFFSET_HI_US));
++	} else if (ab->hw_rev == ATH12K_HW_QCN6432_HW10) {
++		offset_lo = ath12k_hif_cmem_read32(ab,
++						   PMM_REG_BASE_QCN9224 + ATH12K_PPT_ADDR_OFFSET(PMM_TQM_CLOCK_OFFSET_LO_US));
++		offset_hi = ath12k_hif_cmem_read32(ab,
++						   PMM_REG_BASE_QCN9224 + ATH12K_PPT_ADDR_OFFSET(PMM_TQM_CLOCK_OFFSET_HI_US));
++	} else {
++		offset_lo = ath12k_hif_read32(ab,
++					      PMM_REG_BASE_QCN9224 + ATH12K_PPT_ADDR_OFFSET(PMM_TQM_CLOCK_OFFSET_LO_US));
++		offset_hi = ath12k_hif_read32(ab,
++					      PMM_REG_BASE_QCN9224 + ATH12K_PPT_ADDR_OFFSET(PMM_TQM_CLOCK_OFFSET_HI_US));
++	}
++
++	*value = ((u64)(offset_hi) << 32 | offset_lo);
++}
++
+ static void
+ ath12k_wifi7_key_bitwise_left_shift(u8 *key, int length, int shift)
+ {
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_rx.h
+@@ -491,6 +491,9 @@ void ath12k_wifi7_hal_rx_flow_delete_ent
+ void ath12k_wifi7_hal_reset_rx_reo_tid_q(void *vaddr,
+ 					 u32 ba_window_size, u8 tid);
+ void ath12k_wifi7_hal_reo_shared_qaddr_cache_clear(struct ath12k_base *ab);
++void ath12k_hal_qcn9274_get_tsf2_scratch_reg(struct ath12k_base *ab,
++					     u8 mac_id, u64 *value);
++void ath12k_hal_qcn9274_get_tqm_scratch_reg(struct ath12k_base *ab, u64 *value);
+ void ath12k_wifi7_hal_rx_msdu_list_get(void *desc,
+ 				       void *list,
+ 				       u16 *num_msdus);
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -551,6 +551,11 @@ static const struct ce_remap ath12k_wifi
+ 	.cmem_offset = HAL_SEQ_WCSS_CMEM_OFFSET,
+ };
+ 
++const struct pmm_remap ath12k_wifi7_pmm_ipq5332 = {
++	.base = HAL_IPQ5332_PMM_REG_BASE,
++	.size = HAL_IPQ5332_PMM_SIZE,
++};
++
+ static const struct ce_ie_addr ath12k_wifi7_ce_ie_addr_ipq5424 = {
+ 	.ie1_reg_addr = CE_HOST_IPQ5424_IE_ADDRESS - HAL_IPQ5424_CE_WFSS_REG_BASE,
+ 	.ie2_reg_addr = CE_HOST_IPQ5424_IE_2_ADDRESS - HAL_IPQ5424_CE_WFSS_REG_BASE,
+@@ -972,6 +977,7 @@ static struct ath12k_hw_params ath12k_wi
+ 
+ 		.ce_ie_addr = &ath12k_wifi7_ce_ie_addr_ipq5332,
+ 		.ce_remap = &ath12k_wifi7_ce_remap_ipq5332,
++		.pmm_remap = &ath12k_wifi7_pmm_ipq5332,
+ 		.en_qdsslog = true,
+ 		.support_fse = true,
+ 		.alloc_cacheable_memory = true,
+@@ -1164,6 +1170,7 @@ static struct ath12k_hw_params ath12k_wi
+ 
+ 		.ce_ie_addr = &ath12k_wifi7_ce_ie_addr_ipq5424,
+ 		.ce_remap = &ath12k_wifi7_ce_remap_ipq5424,
++		.pmm_remap = &ath12k_wifi7_pmm_ipq5332,
+ 		.en_qdsslog = true,
+ 		.support_fse = true,
+ 		.alloc_cacheable_memory = true,
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -12397,6 +12397,8 @@ skip_lookup:
+ 	ar->mlo_setup_status = le32_to_cpu(ev->status);
+ 	max_ml_peer_ids = le32_to_cpu(ev->max_ml_peer_ids);
+ 	ar->ah->max_ml_peer_ids = max_ml_peer_ids ? max_ml_peer_ids : ATH12K_MAX_MLO_PEERS;
++	if (ab->hw_params->hal_ops->hal_get_tqm_scratch_reg)
++		ab->hw_params->hal_ops->hal_get_tqm_scratch_reg(ab, &ar->delta_tqm);
+ 	complete(&ar->mlo_setup_done);
+ 
+ out:
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_qcn9274.c
+@@ -1046,6 +1046,8 @@ const struct hal_ops hal_qcn9274_ops = {
+ 	.reset_rx_reo_tid_q = ath12k_wifi7_hal_reset_rx_reo_tid_q,
+ 	.get_idle_link_rbm = ath12k_wifi7_hal_get_idle_link_rbm,
+ 	.reo_shared_qaddr_cache_clear = ath12k_wifi7_hal_reo_shared_qaddr_cache_clear,
++	.hal_get_tsf2_scratch_reg = ath12k_hal_qcn9274_get_tsf2_scratch_reg,
++	.hal_get_tqm_scratch_reg = ath12k_hal_qcn9274_get_tqm_scratch_reg,
+ 	.rxdesc_get_mpdu_start_addr2 =
+ 			ath12k_wifi7_hal_rxdesc_get_mpdu_start_addr2_qcn9274,
+ 	.rx_h_is_decrypted = ath12k_wifi7_hal_rx_h_is_decrypted_qcn9274,

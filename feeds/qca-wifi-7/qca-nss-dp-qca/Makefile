@@ -3,12 +3,15 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=qca-nss-dp-qca
 PKG_SOURCE_PROTO:=git
-PKG_BRANCH:=ginger_open
+PKG_BRANCH:=master
 PKG_RELEASE:=1
 PKG_SOURCE_URL:=https://git.codelinaro.org/clo/qsdk/oss/lklm/nss-dp
-PKG_MIRROR_HASH:=df9d9810d105afebda133ef835ec2815942a9e4d61a7426f397cd59faa092a89
-PKG_SOURCE_VERSION:=fb3311980ad4a8211ca99c82079b2d7c36f6c353
-PKG_VERSION:=1.0
+PKG_MIRROR_HASH:=2b4e78fa195e7801c127fde833d0b44e79f2e61904c71f97b280d2a0cd378313
+PKG_VERSION:=23928147cfb6f55638cc0a27f700831623ed679c
+
+PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
+PKG_SOURCE_SUBDIR:=$(PKG_NAME)-$(PKG_VERSION)
+PKG_SOURCE_VERSION:=$(PKG_VERSION)
 include $(INCLUDE_DIR)/package.mk
 
 define KernelPackage/qca-nss-dp-qca
@@ -56,6 +59,10 @@ ifeq ($(CONFIG_TARGET_ipq95xx_generic_QSDK_MinEnt), y)
 EXTRA_CFLAGS+= -DNSS_DP_POINT_OFFLOAD
 endif
 
+ifeq ($(CONFIG_TARGET_ipq53xx_generic_QSDK_MinEnt)$(CONFIG_TARGET_ipq53xx_generic_QSDK_MinEntOpen), y)
+EXTRA_CFLAGS+= -DNSS_DP_VP_RINGS
+endif
+
 ifneq ($(CONFIG_TARGET_ipq95xx)$(CONFIG_TARGET_ipq53xx)$(CONFIG_TARGET_ipq54xx),)
 EXTRA_CFLAGS+= -DNSS_DP_NETSTANDBY
 MAKE_OPTS+=dp-net-standby=y
@@ -79,6 +86,9 @@ define KernelPackage/qca-nss-dp-qca/install
 	$(INSTALL_BIN) ./files/qca-nss-dp.init $(1)/etc/init.d/qca-nss-dp
 	$(INSTALL_BIN) ./files/qca-nss-dp.conf $(1)/etc/config/qca_nss_dp
 	$(INSTALL_BIN) ./files/edma_dump $(1)/usr/bin/edma_dump
+	$(INSTALL_BIN) ./files/edma_recover.sh $(1)/usr/bin/
+	$(INSTALL_BIN) ./files/edma_hang_inj.sh $(1)/usr/bin/
+	$(INSTALL_BIN) ./files/nss_cfg.ini $(1)/etc/config/
 endef
 endif
 

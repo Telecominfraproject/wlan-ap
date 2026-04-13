@@ -1,0 +1,507 @@
+From e2a727bd1d752b315b15decd1312e0bd7e536050 Mon Sep 17 00:00:00 2001
+From: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Date: Thu, 11 May 2023 16:29:28 +0530
+Subject: [PATCH] ath12k: add peer channel width switch command support
+
+Currently, separate set peer param command for each peer is being sent
+for changing channel width. However this leads to firmware buffer overflow
+during multi-client testing.
+
+This can be optimised by using WMI_PEER_CHAN_WIDTH_SWITCH_CMDID and it
+clubs N number of peers into single command. The value of N is
+advertised by firmware in service ready event 2.
+
+Add support to form and send WMI_PEER_CHAN_WIDTH_SWITCH_CMDID during peer
+channel width change.
+
+Dependency: ath12k/713-001-ath12k-update-sta-max-bandwith-during-peer-assoc-pre.patch
+            ath12k/713-002-ath12k-update-sta-max-bandwith-during-peer-assoc-pre.patch
+
+Patch-work: [None]
+
+Signed-off-by: Aditya Kumar Singh <quic_adisi@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h |  11 ++
+ drivers/net/wireless/ath/ath12k/mac.c  |  94 +++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.c  | 225 +++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/wmi.h  |  33 ++++
+ 4 files changed, 363 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -337,6 +337,11 @@ struct ath12k_rekey_data {
+ 	bool enable_offload;
+ };
+ 
++struct ath12k_peer_ch_width_switch_data {
++	int count;
++	struct wmi_chan_width_peer_arg peer_arg[];
++};
++
+ struct ath12k_link_vif {
+ 	u32 vdev_id;
+ 	u32 beacon_interval;
+@@ -385,6 +390,10 @@ struct ath12k_link_vif {
+ 	bool beacon_prot;
+ 	u64 tbtt_offset;
+ 	int num_stations;
++
++	struct completion peer_ch_width_switch_send;
++	struct wiphy_work peer_ch_width_switch_work;
++	struct ath12k_peer_ch_width_switch_data *peer_ch_width_switch_data;
+ };
+ 
+ struct ath12k_dp_link_vif {
+@@ -1282,6 +1291,7 @@ struct ath12k_base {
+ 	struct rhashtable_params rhash_sta_addr_param;
+ 	
+ 	bool in_coldboot_fwreset;
++	u32 chwidth_num_peer_caps;
+ 
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -4186,6 +4186,9 @@ static void ath12k_mac_init_arvif(struct
+ 	wiphy_work_init(&arvif->update_bcn_template_work,
+ 			ath12k_update_bcn_template_work);
+ 	arvif->num_stations = 0;
++	init_completion(&arvif->peer_ch_width_switch_send);
++	wiphy_work_init(&arvif->peer_ch_width_switch_work,
++		  ath12k_wmi_peer_chan_width_switch_work);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(arvif->bitrate_mask.control); i++) {
+ 		arvif->bitrate_mask.control[i].legacy = 0xffffffff;
+@@ -4264,6 +4267,8 @@ static void ath12k_mac_remove_link_inter
+ 			  &arvif->update_obss_color_notify_work);
+ 	wiphy_work_cancel(ah->hw->wiphy,
+ 			  &arvif->update_bcn_template_work);
++	wiphy_work_cancel(ah->hw->wiphy,
++			  &arvif->peer_ch_width_switch_work);
+ 
+ 	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac remove link interface (vdev %d link id %d)",
+ 		   arvif->vdev_id, arvif->link_id);
+@@ -6611,7 +6616,6 @@ static int ath12k_mac_station_assoc(stru
+ 
+ 	spin_lock_bh(&ar->data_lock);
+ 	arsta->bw = ath12k_mac_ieee80211_sta_bw_to_wmi(ar, link_sta);
+-	arsta->bw_prev = link_sta->bandwidth;
+ 	spin_unlock_bh(&ar->data_lock);
+ 
+ 	if (link_sta->vht_cap.vht_supported && num_vht_rates == 1) {
+@@ -6699,6 +6703,70 @@ static int ath12k_mac_station_disassoc(s
+ 	return 0;
+ }
+ 
++static int ath12k_mac_set_peer_ch_switch_data(struct ath12k_link_vif *arvif,
++					      struct ath12k_link_sta *arsta)
++{
++	struct ath12k *ar = arvif->ar;
++	struct ath12k_peer_ch_width_switch_data *peer_data;
++	struct wmi_chan_width_peer_arg *peer_arg;
++	struct ieee80211_link_sta *link_sta;
++	struct ieee80211_vif *vif = arvif->ahvif->vif;
++	struct cfg80211_chan_def def;
++	u16 ru_punct_bitmap;
++
++	if (!ar->ab->chwidth_num_peer_caps)
++		return -EOPNOTSUPP;
++
++	if (WARN_ON(ath12k_mac_vif_link_chan(vif, arvif->link_id, &def)))
++		return -EINVAL;
++
++	peer_data = arvif->peer_ch_width_switch_data;
++
++	if (!peer_data) {
++		peer_data = kzalloc(struct_size(peer_data, peer_arg,
++						arvif->num_stations),
++				    GFP_KERNEL);
++		if (!peer_data)
++			return -ENOMEM;
++
++		peer_data->count = 0;
++		arvif->peer_ch_width_switch_data = peer_data;
++	}
++
++	peer_arg = &peer_data->peer_arg[peer_data->count++];
++
++	ru_punct_bitmap = 0;
++
++	rcu_read_lock();
++	link_sta = ath12k_mac_get_link_sta(arsta);
++
++	if (link_sta) {
++		if (link_sta->he_cap.has_he && link_sta->eht_cap.has_eht)
++			ru_punct_bitmap = def.punctured;
++
++		if (ieee80211_vif_is_mesh(vif) && link_sta->punctured)
++			ru_punct_bitmap = link_sta->punctured;
++	}
++
++	rcu_read_unlock();
++
++	spin_lock_bh(&ar->data_lock);
++	ether_addr_copy(peer_arg->mac_addr.addr, arsta->addr);
++	peer_arg->chan_width = arsta->bw;
++	peer_arg->puncture_20mhz_bitmap = ~ru_punct_bitmap;
++	spin_unlock_bh(&ar->data_lock);
++
++	if (peer_data->count == 1) {
++		reinit_completion(&arvif->peer_ch_width_switch_send);
++		wiphy_work_queue(ar->ah->hw->wiphy, &arvif->peer_ch_width_switch_work);
++	}
++
++	if (peer_data->count == arvif->num_stations)
++		complete(&arvif->peer_ch_width_switch_send);
++
++	return 0;
++}
++
+ static void ath12k_sta_rc_update_wk(struct wiphy *wiphy, struct wiphy_work *wk)
+ {
+ 	struct ieee80211_link_sta *link_sta;
+@@ -6711,10 +6779,9 @@ static void ath12k_sta_rc_update_wk(stru
+ 	const u16 *vht_mcs_mask;
+ 	const u16 *he_mcs_mask;
+ 	const u16 *eht_mcs_mask;
+-	u32 changed, bw, nss, mac_nss, smps, bw_prev;
++	u32 changed, bw, nss, mac_nss, smps;
+ 	int err, num_vht_rates, num_he_rates, num_ht_rates, num_eht_rates;
+ 	const struct cfg80211_bitrate_mask *mask;
+-	enum wmi_phy_mode peer_phymode;
+ 	struct ath12k_link_sta *arsta;
+ 	struct ieee80211_vif *vif;
+ 
+@@ -6741,7 +6808,6 @@ static void ath12k_sta_rc_update_wk(stru
+ 	arsta->changed = 0;
+ 
+ 	bw = arsta->bw;
+-	bw_prev = arsta->bw_prev;
+ 	nss = arsta->nss;
+ 	smps = arsta->smps;
+ 
+@@ -6768,53 +6834,19 @@ static void ath12k_sta_rc_update_wk(stru
+ 		return;
+ 
+ 	if (changed & IEEE80211_RC_BW_CHANGED) {
+-		ath12k_peer_assoc_h_phymode(ar, arvif, arsta, peer_arg);
+-		peer_phymode = peer_arg->peer_phymode;
++		ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac bandwidth upgrade for sta %pM new %d\n",
++			   arsta->addr, bw);
+ 
+-		if (bw > bw_prev) {
+-			/* Phymode shows maximum supported channel width, if we
+-			 * upgrade bandwidth then due to sanity check of firmware,
+-			 * we have to send WMI_PEER_PHYMODE followed by
+-			 * WMI_PEER_CHWIDTH
+-			 */
+-			ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac bandwidth upgrade for sta %pM new %d old %d\n",
+-				   arsta->addr, bw, bw_prev);
+-			err = ath12k_wmi_set_peer_param(ar, arsta->addr,
+-							arvif->vdev_id, WMI_PEER_PHYMODE,
+-							peer_phymode);
+-			if (err) {
+-				ath12k_warn(ar->ab, "failed to update STA %pM to peer phymode %d: %d\n",
+-					    arsta->addr, peer_phymode, err);
+-				return;
+-			}
+-			err = ath12k_wmi_set_peer_param(ar, arsta->addr,
+-							arvif->vdev_id, WMI_PEER_CHWIDTH,
+-							bw);
+-			if (err)
+-				ath12k_warn(ar->ab, "failed to update STA %pM to peer bandwidth %d: %d\n",
+-					    arsta->addr, bw, err);
+-		} else {
+-			/* When we downgrade bandwidth this will conflict with phymode
+-			 * and cause to trigger firmware crash. In this case we send
+-			 * WMI_PEER_CHWIDTH followed by WMI_PEER_PHYMODE
+-			 */
+-			ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "mac bandwidth downgrade for sta %pM new %d old %d\n",
+-				   arsta->addr, bw, bw_prev);
+-			err = ath12k_wmi_set_peer_param(ar, arsta->addr,
+-							arvif->vdev_id, WMI_PEER_CHWIDTH,
+-							bw);
+-			if (err) {
+-				ath12k_warn(ar->ab, "failed to update STA %pM peer to bandwidth %d: %d\n",
+-					    arsta->addr, bw, err);
+-				return;
+-			}
+-			err = ath12k_wmi_set_peer_param(ar, arsta->addr,
+-							arvif->vdev_id, WMI_PEER_PHYMODE,
+-							peer_phymode);
+-			if (err)
+-				ath12k_warn(ar->ab, "failed to update STA %pM to peer phymode %d: %d\n",
+-					    arsta->addr, peer_phymode, err);
+-		}
++		err = ath12k_mac_set_peer_ch_switch_data(arvif, arsta);
++		if (!err || err == -EINVAL)
++			return;
++
++		err = ath12k_wmi_set_peer_param(ar, sta->addr,
++						arvif->vdev_id, WMI_PEER_CHWIDTH,
++						bw);
++		if (err)
++			ath12k_warn(ar->ab, "failed to update STA %pM to peer bandwidth %d: %d\n",
++				    arsta->addr, bw, err);
+ 	}
+ 
+ 	if (changed & IEEE80211_RC_NSS_CHANGED) {
+@@ -7742,7 +7774,6 @@ void ath12k_mac_op_link_sta_rc_update(st
+ 
+ 	if (changed & IEEE80211_RC_BW_CHANGED) {
+ 		bw = ath12k_mac_ieee80211_sta_bw_to_wmi(ar, link_sta);
+-		arsta->bw_prev = arsta->bw;
+ 		arsta->bw = bw;
+ 	}
+ 
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -5783,6 +5783,7 @@ static int ath12k_wmi_svc_rdy_ext2_parse
+ 				    ret);
+ 			return ret;
+ 		}
++		ab->chwidth_num_peer_caps = parse->arg.chwidth_num_peer_caps;
+ 		break;
+ 
+ 	case WMI_TAG_ARRAY_STRUCT:
+@@ -12514,3 +12515,183 @@ int ath12k_wmi_pdev_multiple_vdev_restar
+ 
+ 	return ret;
+ }
++
++static void ath12k_wmi_put_peer_list(struct ath12k_base *ab,
++				     struct wmi_chan_width_peer_list *peer_list,
++				     struct wmi_chan_width_peer_arg *peer_arg,
++				     u32 num_peers, int start_idx)
++{
++	struct wmi_chan_width_peer_list *itr;
++	struct wmi_chan_width_peer_arg *arg_itr;
++	int i;
++
++	ath12k_dbg(ab, ATH12K_DBG_WMI,
++		   "wmi peer channel width switch command peer list\n");
++
++	for (i = 0; i < num_peers; i++) {
++		itr = &peer_list[i];
++		arg_itr = &peer_arg[start_idx + i];
++
++		itr->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_CHAN_WIDTH_PEER_LIST,
++							 sizeof(*itr));
++		ether_addr_copy(itr->mac_addr.addr, arg_itr->mac_addr.addr);
++		itr->chan_width = cpu_to_le32(arg_itr->chan_width);
++		itr->puncture_20mhz_bitmap = cpu_to_le32(arg_itr->puncture_20mhz_bitmap);
++
++		ath12k_dbg(ab, ATH12K_DBG_WMI,
++			   "   (%u) width %u addr %pM punct_bitmap 0x%x\n",
++			   i + 1, arg_itr->chan_width, arg_itr->mac_addr.addr,
++			   arg_itr->puncture_20mhz_bitmap);
++	}
++}
++
++static int ath12k_wmi_peer_chan_width_switch(struct ath12k *ar,
++					     struct wmi_peer_chan_width_switch_arg *arg)
++{
++	struct ath12k_base *ab = ar->ab;
++	struct ath12k_wmi_pdev *wmi = ar->wmi;
++	struct wmi_peer_chan_width_switch_req_cmd *cmd;
++	struct wmi_chan_width_peer_list *peer_list;
++	struct wmi_tlv *tlv;
++	u32 num_peers;
++	size_t peer_list_len;
++	struct sk_buff *skb;
++	void *ptr;
++	int ret, len;
++
++	num_peers = arg->num_peers;
++
++	if (WARN_ON(num_peers > ab->chwidth_num_peer_caps))
++		return -EINVAL;
++
++	peer_list_len = num_peers * sizeof(*peer_list);
++
++	len = sizeof(*cmd) + TLV_HDR_SIZE + peer_list_len;
++
++	skb = ath12k_wmi_alloc_skb(wmi->wmi_ab, len);
++	if (!skb)
++		return -ENOMEM;
++
++	cmd = (struct wmi_peer_chan_width_switch_req_cmd *)skb->data;
++	cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_PEER_CHAN_WIDTH_SWITCH_CMD,
++						 sizeof(*cmd));
++	cmd->num_peers = cpu_to_le32(num_peers);
++	cmd->vdev_var = cpu_to_le32(arg->vdev_var);
++
++	ptr = skb->data + sizeof(*cmd);
++	tlv = (struct wmi_tlv *)ptr;
++
++	tlv->header = ath12k_wmi_tlv_hdr(WMI_TAG_ARRAY_STRUCT, peer_list_len);
++	peer_list = (struct wmi_chan_width_peer_list *)tlv->value;
++
++	ath12k_wmi_put_peer_list(ab, peer_list, arg->peer_arg, num_peers,
++				 arg->start_idx);
++
++	ptr += peer_list_len;
++
++	ret = ath12k_wmi_cmd_send(wmi, skb, WMI_PEER_CHAN_WIDTH_SWITCH_CMDID);
++	if (ret) {
++		ath12k_warn(ab, "wmi failed to send peer chan width switch command (%d)\n",
++			    ret);
++		dev_kfree_skb(skb);
++		return ret;
++	}
++
++	ath12k_dbg(ab, ATH12K_DBG_WMI,
++		   "wmi peer chan width switch cmd sent num_peers %d \n",
++		   num_peers);
++
++	return ret;
++}
++
++void ath12k_wmi_set_peers_chan_width(struct ath12k_link_vif *arvif,
++				     struct wmi_chan_width_peer_arg *peer_arg,
++				     int num, u8 start_idx)
++{
++	struct ath12k *ar = arvif->ar;
++	struct wmi_chan_width_peer_arg *arg;
++	int i, err;
++
++	for (i = 0; i < num; i++) {
++		arg = &peer_arg[start_idx + i];
++
++		err = ath12k_wmi_set_peer_param(ar, arg->mac_addr.addr,
++						arvif->vdev_id, WMI_PEER_CHWIDTH,
++						arg->chan_width);
++		if (err) {
++			ath12k_warn(ar->ab, "failed to update STA %pM peer bw %d: %d\n",
++				    arg->mac_addr.addr, arg->chan_width, err);
++			continue;
++		}
++	}
++}
++
++void ath12k_wmi_peer_chan_width_switch_work(struct wiphy *wiphy, struct wiphy_work *work)
++{
++	struct ath12k_link_vif *arvif = container_of(work, struct ath12k_link_vif,
++						     peer_ch_width_switch_work);
++	struct ath12k *ar = arvif->ar;
++	struct ath12k_peer_ch_width_switch_data *data;
++	struct wmi_peer_chan_width_switch_arg arg;
++	unsigned long time_left = 0;
++	int count_left, curr_count, max_count_per_cmd = ar->ab->chwidth_num_peer_caps;
++	int cmd_num = 0, ret;
++
++	/* possible that the worker got scheduled after complete was triggered. In
++	 * this case we don't wait for timeout
++	 */
++	if (arvif->peer_ch_width_switch_data->count == arvif->num_stations)
++		goto send_cmd;
++
++	time_left = wait_for_completion_timeout(&arvif->peer_ch_width_switch_send,
++						ATH12K_PEER_CH_WIDTH_SWITCH_TIMEOUT_HZ);
++	if (time_left == 0) {
++		/* Even though timeout occured, we would send the command for the peers
++		 * for which we received sta rc update event, hence not returning
++		 */
++		ath12k_dbg(ar->ab, ATH12K_DBG_WMI,
++			   "timed out waiting for all peers in peer channel width switch\n");
++	}
++
++send_cmd:
++
++	data = arvif->peer_ch_width_switch_data;
++
++	spin_lock_bh(&ar->data_lock);
++	arg.vdev_var = arvif->vdev_id;
++	spin_unlock_bh(&ar->data_lock);
++
++	arg.vdev_var |= ATH12K_PEER_VALID_VDEV_ID | ATH12K_PEER_PUNCT_BITMAP_VALID;
++	arg.peer_arg = data->peer_arg;
++
++	count_left = data->count;
++
++	while (count_left > 0) {
++		if (count_left <= max_count_per_cmd)
++			curr_count = count_left;
++		else
++			curr_count = max_count_per_cmd;
++
++		count_left -= curr_count;
++
++		cmd_num++;
++
++		arg.num_peers = curr_count;
++		arg.start_idx = (cmd_num - 1) * max_count_per_cmd;
++
++		ath12k_dbg(ar->ab, ATH12K_DBG_WMI,
++			   "wmi peer channel width switch command num %u\n",
++			   cmd_num);
++
++		ret = ath12k_wmi_peer_chan_width_switch(ar, &arg);
++		if (ret) {
++			/* fallback */
++			ath12k_wmi_set_peers_chan_width(arvif, arg.peer_arg,
++							arg.num_peers,
++							arg.start_idx);
++		}
++	}
++
++	kfree(arvif->peer_ch_width_switch_data);
++	arvif->peer_ch_width_switch_data = NULL;
++}
+--- a/drivers/net/wireless/ath/ath12k/wmi.h
++++ b/drivers/net/wireless/ath/ath12k/wmi.h
+@@ -436,6 +436,8 @@ enum wmi_tlv_cmd_id {
+ 	WMI_PEER_REORDER_QUEUE_REMOVE_CMDID,
+ 	WMI_PEER_SET_RX_BLOCKSIZE_CMDID,
+ 	WMI_PEER_ANTDIV_INFO_REQ_CMDID,
++	WMI_PEER_CHAN_WIDTH_SWITCH_CMDID =
++		WMI_PEER_ANTDIV_INFO_REQ_CMDID + 5,
+ 	WMI_BCN_TX_CMDID = WMI_TLV_CMD(WMI_GRP_MGMT),
+ 	WMI_PDEV_SEND_BCN_CMDID,
+ 	WMI_BCN_TMPL_CMDID,
+@@ -5834,6 +5836,38 @@ struct wmi_rssi_dbm_conv_offsets {
+ 	u32 xlna_bypass_threshold;
+ };
+ 
++#define ATH12K_PEER_VALID_VDEV_ID		(1 << 31)
++#define ATH12K_PEER_PUNCT_BITMAP_VALID		(1 << 30)
++#define ATH12K_PEER_CH_WIDTH_SWITCH_TIMEOUT_HZ	(5 * HZ)
++
++struct wmi_chan_width_peer_arg {
++	struct ath12k_wmi_mac_addr_params mac_addr;
++	u32 chan_width;
++	u32 puncture_20mhz_bitmap;
++	enum wmi_phy_mode peer_phymode;
++	bool is_upgrade;
++};
++
++struct wmi_peer_chan_width_switch_arg {
++	u32 num_peers;
++	u32 vdev_var;
++	u32 start_idx;
++	struct wmi_chan_width_peer_arg *peer_arg;
++};
++
++struct wmi_peer_chan_width_switch_req_cmd {
++	__le32 tlv_header;
++	__le32 num_peers;
++	__le32 vdev_var;
++} __packed;
++
++struct wmi_chan_width_peer_list {
++	__le32 tlv_header;
++	struct ath12k_wmi_mac_addr_params mac_addr;
++	__le32 chan_width;
++	__le32 puncture_20mhz_bitmap;
++} __packed;
++
+ #define ATH12K_FW_STATS_BUF_SIZE (1024 * 1024)
+ 
+ enum wmi_sys_cap_info_flags {
+@@ -7009,5 +7043,6 @@ int ath12k_wmi_pdev_ap_ps_cmd_send(struc
+ bool ath12k_wmi_is_mvr_supported(struct ath12k_base *ab);
+ int ath12k_wmi_pdev_multiple_vdev_restart(struct ath12k *ar,
+ 					  struct wmi_pdev_multiple_vdev_restart_req_arg *arg);
++void ath12k_wmi_peer_chan_width_switch_work(struct wiphy *wiphy, struct wiphy_work *work);
+ 
+ #endif

@@ -1,0 +1,254 @@
+From d910c48d25542eed49a554615da0bebf3782cd9b Mon Sep 17 00:00:00 2001
+From: Vignesh U <uvignesh@qti.qualcomm.com>
+Date: Tue, 15 Jul 2025 15:38:30 +0530
+Subject: [PATCH 2/5] UPSTREAM: PROTOCOL: wifi: ath12k: Add bandwidth mask and
+ puncture pattern utility for SP mode
+
+Current code lacks utilities to handle bandwidth-aware puncture patterns.
+This causes a problem when computing transmit power control (TPC) values
+for 6 GHz Standard Power (SP) AP mode, especially when puncturing is
+applied across different bandwidths.
+
+Add helper functions to derive bitmasks, extract sub-patterns, and compute
+puncture patterns for target bandwidths. These include:
+- get_mask_details(): Derive bitmask for a given bandwidth.
+- get_lower_bandwidth_puncture_pattern(): Extract sub-patterns from a wider
+					  bandwidth puncture bitmap.
+- ath12k_mac_get_punc_pattern_for_bw(): Compute puncture pattern for a
+					target bandwidth.
+- get_punc_bw(): Calculate total bandwidth of punctured sub-channels.
+
+Use these utilities in later changes to compute OOBE-based PSD and EIRP
+values. Add a test call in
+ath12k_mac_fill_reg_tpc_info_with_psd_eirp_pwr_for_sp() for validation.
+
+Fixes: None
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+ath12k/0420-a-UPSTREAM-PROTOCOL-ath12k-Add-data-structures-and-int.patch
+
+Signed-off-by: Vignesh U <uvignesh@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 199 ++++++++++++++++++++++++++
+ 1 file changed, 199 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index bf212ac..0fa7645 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -21724,11 +21724,210 @@ void ath12k_mac_op_apply_neg_ttlm_per_client(struct ieee80211_hw *hw,
+ }
+ EXPORT_SYMBOL(ath12k_mac_op_apply_neg_ttlm_per_client);
+ 
++/**
++ * get_mask_details - Derive puncture mask and weight based on bandwidth.
++ * @bw: Bandwidth in MHz (e.g., 40, 80, 160).
++ *
++ * The mapping is as follows:
++ *   - 40 MHz  → mask = 0x03  (2 bits)
++ *   - 80 MHz  → mask = 0x0F  (4 bits)
++ *   - 160 MHz → mask = 0xFF  (8 bits)
++ *
++ * For unsupported bandwidths, mask is 0.
++ *
++ * This function is typically used in puncture pattern calculations
++ * where the mask is needed to extract or align subchannel information for a
++ * given bandwidth.
++ *
++ * Return: A bitmask with the number of bits set equal to the number of 20 MHz
++ * sub-channels.
++ */
++static u16 get_mask_details(u16 bw)
++{
++	/* nchans : number of 20 Mhz bands */
++	u8 nchans;
++	u16 mask;
++
++	switch (bw) {
++	case ATH12K_CHWIDTH_20:
++	case ATH12K_CHWIDTH_40:
++	case ATH12K_CHWIDTH_80:
++	case ATH12K_CHWIDTH_160:
++	case ATH12K_CHWIDTH_320:
++		nchans = bw / ATH12K_CHWIDTH_20;
++		break;
++	default:
++		nchans = 0;
++		break;
++	}
++
++	mask = (1 << nchans) - 1;
++	return mask;
++}
++
++/**
++ * get_lower_bandwidth_puncture_pattern - Extract puncture pattern for a target bandwidth
++ * @prifreq: Primary channel center frequency in MHz.
++ * @cur_pat: Current puncture bitmap representing inactive sub-channels.
++ * @cur_cenfreq: Center frequency of the current bandwidth in MHz.
++ * @cur_bw: Current bandwidth in MHz.
++ * @target_bw: Target bandwidth in MHz for which the puncture pattern is needed.
++ *
++ * This function computes the puncture bitmap for a lower target bandwidth
++ * based on the current puncture pattern and channel configuration.
++ *
++ * It determines the location of the target bandwidth segment within the current
++ * bandwidth by calculating the offset of the primary channel from the left-most
++ * 20 MHz sub-channel. It then extracts the relevant bits from the current
++ * puncture bitmap corresponding to the target bandwidth.
++ *
++ * An example of converting a 160MHz BW puncture pattern to a 80MHz BW puncture
++ * pattern is shown below:
++
++ * |-----------------|pu|--| (current pattern = 0b0100_0000 = 0x40)
++ * |-----------|pf|--------| (primary channel = 49 Current bandwidth = 160)
++ * |33|37|41|45|49|53|57|61|
++ * |-----0-----|-----1-----| (location of target BW in the current bw = 1)
++
++ *             |-----|pu|--| (target pattern = 0b0100 = 0x4)
++ *             |pf|--------| (primary channel = 49 target bandwidth = 80)
++ *             |49|53|57|61|
++ *
++ * Example (6 GHz band):
++ *   - Current bandwidth: 160 MHz
++ *   - Current center frequency: 6185 MHz (Channel 47)
++ *   - Primary channel frequency: 6245 MHz (Channel 49)
++ *   - Current puncture pattern: 0x40 (binary: 0b0100_0000)
++ *
++ *   Computation:
++ *     start_20mhz_freq = 6185 - 80 + 10 = 6115 MHz (Channel 33)
++ *     target_bw_loc_in_curbw = (6245 - 6115) / 80 = 130 / 80 = 1
++ *     mask = 0xF (4-bit mask for 80 MHz)
++ *     n_20chans_in_target_bw = 80 / 20 = 4
++ *     nbits_to_right_shift = 1 * 4 = 4
++ *     target_pat = (0x40 >> 4) & 0xF = 0x4
++ *
++ *   Result:
++ *     Extracted 80 MHz puncture pattern = 0x4
++ *
++ * Return: Puncture bitmap representing inactive sub-channels for the given
++ * target bandwidth.
++ */
++static u16 get_lower_bandwidth_puncture_pattern(u16 prifreq, u16 cur_pat,
++						u16 cur_cenfreq, u16 cur_bw,
++						u16 target_bw)
++{
++	/* Location of the target bandwidth in current bandwidth */
++	u8 target_bw_loc_in_curbw;
++	/* Number of 20 MHz channels in the target bandwidth */ 
++	u8 n_20chans_in_target_bw;
++	/* Number of bits for the right shift */
++	u8 nbits_to_right_shift;
++	/* Center frequency of the left-most/first 20 MHz channel */
++	u16 start_20mhz_freq;
++	/* Puncture pattern in the target bandwidth */
++	u16 target_pat;
++	u16 mask;
++
++	if (cur_bw < target_bw)
++		return (u16)0xFFFF;
++
++	start_20mhz_freq = cur_cenfreq - (cur_bw / 2) + (ATH12K_CHWIDTH_20 / 2);
++	target_bw_loc_in_curbw = (prifreq - start_20mhz_freq) / target_bw;
++
++	n_20chans_in_target_bw = target_bw / ATH12K_CHWIDTH_20;
++	nbits_to_right_shift = target_bw_loc_in_curbw * n_20chans_in_target_bw;
++	mask = get_mask_details(target_bw);
++
++	target_pat = (cur_pat >> nbits_to_right_shift) & mask;
++	return target_pat;
++}
++
++/**
++ * ath12k_mac_get_punc_pattern_for_bw - Get puncture bitmap for a given
++ * bandwidth.
++ * @ctx: Channel context configuration.
++ * @target_bw: Target bandwidth in MHz.
++ *
++ * Computes the punctured channel pattern for the specified target bandwidth
++ * based on the current channel configuration.
++ * Example 1:
++ *   - Channel: 33 (6 GHz band)
++ *   - Bandwidth: 320 MHz
++ *   - Center frequency: 6265 MHz
++ *   - Punctured sub-channels: 41 and 45
++ *   - Resulting 320 MHz puncture bitmap: 0x000C (bits 2 and 3 set)
++ *
++ *   If target_bw = 160 MHz:
++ *     - Since the primary channel is in the lower half (i.e., channel 33–61),
++ *       then the function returns 0x0C (lower 8 bits of the 320 MHz bitmap).
++ *     - But if the primary channel is in the upper half (e.g., channel 65–93),
++ *       then the function returns 0x00 (upper 8 bits of the 320 MHz bitmap).
++ *
++ * Example 2:
++ *   - Channel: 65 (6 GHz band)
++ *   - Bandwidth: 320 MHz
++ *   - Center frequency: 6265 MHz
++ *   - Punctured sub-channels: 73 and 77
++ *   - Resulting 320 MHz bitmap: 0x0C00 (bits 10 and 11 set)
++ *
++ *   If target_bw = 80 MHz:
++ *     - The 320 MHz band is divided into four 80 MHz segments.
++ *     - Since the primary channel is in
++ *       the third 80 MHz segment (e.g., channel 65–77), the function returns
++ *       (0x0C00 >> 8) & 0xF = 0x0C.
++ *
++ * Return: Puncture bitmap representing inactive sub-channels for given
++ * bandwidth.
++ */
++static u16
++ath12k_mac_get_punc_pattern_for_bw(struct ieee80211_chanctx_conf *ctx, u16 target_bw)
++{
++	u16 pri_freq;
++	u16 cfreq;
++	u16 cur_bw;
++	u16 cur_punc_bitmap;
++
++	cur_punc_bitmap = ctx->def.punctured;
++	if (!cur_punc_bitmap)
++		return 0;
++
++	pri_freq = ctx->def.chan->center_freq;
++	cfreq = ctx->def.center_freq1;
++	cur_bw = ath12k_mac_get_chan_width(ctx->def.width);
++
++	return get_lower_bandwidth_puncture_pattern(pri_freq, cur_punc_bitmap,
++						    cfreq, cur_bw, target_bw);
++}
++
++/**
++ * get_punc_bw - Calculate total bandwidth of punctured sub-channels
++ * @punc_bitmap: Bitmap representing punctured sub-channels
++ *
++ * Counts the number of bits set in the puncture bitmap and multiplies
++ * by 20 MHz to determine the total bandwidth that is punctured.
++ *
++ * Return: Total punctured bandwidth in MHz.
++ */
++static u16 get_punc_bw(u16 punc_bitmap)
++{
++	u8 count =  hweight16(punc_bitmap);
++
++	return (count * ATH12K_CHWIDTH_20);
++}
++
+ void
+ ath12k_mac_fill_reg_tpc_info_with_psd_eirp_pwr_for_sp(struct ath12k *ar,
+ 						      struct ath12k_link_vif *arvif,
+ 						      struct ieee80211_chanctx_conf *ctx)
+ {
++	u16 punc_bitmap, punc_bw;
++
++	/* Test Code for ultility APIs */
++	punc_bitmap = ath12k_mac_get_punc_pattern_for_bw(ctx, ATH12K_CHWIDTH_80);
++	punc_bw = get_punc_bw(punc_bitmap);
++	ath12k_err(ar->ab,
++		   "punc_bitmap for 80MHz %u punc_bw %u", punc_bitmap, punc_bw);
+ 	 /* Host support for PSD and EIRP TLV for SP is implemented in subsequent patches */
+ 	ath12k_warn(ar->ab, "FW supports both PSD and EIRP TLV for SP. Add host support");
+ }
+-- 
+2.34.1
+

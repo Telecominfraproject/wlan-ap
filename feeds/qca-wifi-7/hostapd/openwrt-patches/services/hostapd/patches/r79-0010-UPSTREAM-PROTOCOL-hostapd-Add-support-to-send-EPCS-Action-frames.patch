@@ -1,0 +1,185 @@
+From 7864a0dadf53a69a3a961bf951a0e3db41e36249 Mon Sep 17 00:00:00 2001
+From: Sri Vidya Gunturi <quic_sgunturi@quicinc.com>
+Date: Thu, 12 Jun 2025 15:41:12 +0530
+Subject: [PATCH 10/20] UPSTREAM:PROTOCOL: hostapd: Add support to send EPCS
+ Action frames
+
+Add support to send the following EPCS Action frames -
+Request, Response and Teardown for AP MLD.
+
+For Protocol related info, refer to spec IEEE P802.11be/D7.0,
+in the section 35.16 EPCS priority access.
+
+As per the IEEE P802.11be/D7.0 Spec - 9.4.2.322.6 EPCS Priority Access
+Multi-Link element section, add support to frame EPCS Priority Access Multi-Link
+element to send as part of EPCS Request and Response action frames from AP MLD.
+
+Signed-off-by: Sri Vidya Gunturi <sgunturi@qti.qualcomm.com>
+---
+ src/ap/ieee802_11_eht.c | 143 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 143 insertions(+)
+
+diff --git a/src/ap/ieee802_11_eht.c b/src/ap/ieee802_11_eht.c
+index 9e2e85f..6238612 100644
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -19,6 +19,7 @@
+ #include "ap_config.h"
+ #include "ap_drv_ops.h"
+ #include "utils/eloop.h"
++#include "wmm.h"
+ 
+ 
+ static u16 ieee80211_eht_ppet_size(u16 ppe_thres_hdr, const u8 *phy_cap_info)
+@@ -1636,6 +1637,148 @@ u8 * hostapd_fragment_multi_link_element(struct wpabuf *buf, u8 *pos)
+ }
+ 
+ 
++#define EHT_PRIO_ACCESS_ML_COMMON_INFO_LEN 7 /* common info length: length field (1) + AP MLD MAC ADDR (6) */
++
++static size_t hostapd_eid_eht_ml_priority_access(struct hostapd_data *hapd,
++						 u8 *eid)
++{
++	u8 *pos = eid;
++	u32 i;
++	struct wpabuf *buf;
++	struct hostapd_data *other_hapd;
++	size_t sta_profile_len;
++	u8 mu_edca_start[3 + sizeof(struct ieee80211_he_mu_edca_parameter_set)];
++	u8 wmm_start[2 + sizeof(struct wmm_parameter_element)];
++
++	/*
++	 * As the Multi-Link element can exceed the size of 255 bytes need to
++	 * first build it and then handle fragmentation.
++	 */
++	buf = wpabuf_alloc(1024);
++	if (!buf)
++		return 0;
++
++	/* Set the Multi-Link Control field */
++	wpabuf_put_le16(buf, MULTI_LINK_CONTROL_TYPE_PRIOR_ACCESS);
++
++	/* Set the Priority Access Multi-Link ML element common info len */
++	wpabuf_put_u8(buf, EHT_PRIO_ACCESS_ML_COMMON_INFO_LEN);
++
++	/* Own MLD MAC Address */
++	wpabuf_put_data(buf, hapd->mld->mld_addr, ETH_ALEN);
++
++	/*sta_profile_len (44): sta control (2) +
++	 *                      ext id (1) + length field (1) + sub id (1) +
++	 *                      size of mu_edca_params (13) +
++	 *                      vendor id (1) + length field (1) +
++	 *                      size of wmm_params (24)
++	 */
++	sta_profile_len = 2 + 3 + sizeof(struct ieee80211_he_mu_edca_parameter_set) +
++			  2 + sizeof(struct wmm_parameter_element);
++
++	/* EPCS Priority Access Multi-Link element Link Info
++	 * Add link info for all the links
++	 */
++	for (i = 0; i < hapd->iface->interfaces->count; i++) {
++		if (!hapd->iface->interfaces->iface[i])
++			continue;
++
++		other_hapd = hapd->iface->interfaces->iface[i]->bss[0];
++
++		if (!other_hapd->conf->mld_ap)
++			continue;
++
++		/* Set the Per-STA Profile subelement */
++		wpabuf_put_u8(buf, EHT_ML_SUB_ELEM_PER_STA_PROFILE);
++
++		/* Set the Per-STA Profile length */
++		wpabuf_put_u8(buf, sta_profile_len);
++
++		/* Set the STA Control */
++		wpabuf_put_le16(buf, (other_hapd->mld_link_id & 0xf));
++
++		/* Set the EPCS MU EDCA params */
++		hostapd_eid_he_mu_edca_parameter_set(other_hapd, mu_edca_start,
++						     true);
++		wpabuf_put_data(buf, mu_edca_start,
++				3 + sizeof(struct ieee80211_he_mu_edca_parameter_set));
++
++		/* Set the EPCS WMM params */
++		hostapd_eid_wmm(other_hapd, wmm_start, true);
++		wpabuf_put_data(buf, wmm_start,
++				2 + sizeof(struct wmm_parameter_element));
++	}
++
++	/* Fragment the EPCS Priority Access Multi-Link element, if needed */
++	pos = hostapd_fragment_multi_link_element(buf, pos);
++	wpabuf_free(buf);
++
++	return (size_t)(pos - (u8 *) eid);
++}
++
++
++int hapd_epcs_drv_send_action_frame(struct hostapd_data *hapd,
++				    struct wlan_epcs_info *epcs_info,
++				    struct sta_info *sta)
++{
++	size_t prio_access_ml_elem_len;
++	u8 *prio_access_ml_elem;
++	struct wpabuf *buf;
++
++	buf = wpabuf_alloc(1024 + 5); /*len 5 for the EPCS hdr without PA ML element*/
++	if (!buf)
++		return -1;
++
++	wpabuf_put_u8(buf, WLAN_ACTION_PROTECTED_EHT);
++
++	switch (epcs_info->action_code) {
++	case WLAN_PROT_EHT_EPCS_ENABLE_REQUEST:
++	case WLAN_PROT_EHT_EPCS_ENABLE_RESPONSE:
++		/* EPCS Request and Response */
++		wpabuf_put_u8(buf, epcs_info->action_code);
++		wpabuf_put_u8(buf, epcs_info->dialog_token);
++
++		if (epcs_info->action_code == WLAN_PROT_EHT_EPCS_ENABLE_RESPONSE)
++			wpabuf_put_le16(buf, epcs_info->status_code);
++
++		prio_access_ml_elem = os_zalloc(1024);
++		if (!prio_access_ml_elem) {
++			wpa_printf(MSG_DEBUG, "Failed to allocate buffer for EPCS Action frame");
++			wpabuf_free(buf);
++			return -1;
++		}
++
++		prio_access_ml_elem_len = hostapd_eid_eht_ml_priority_access(hapd,
++									     prio_access_ml_elem);
++		wpabuf_put_data(buf, prio_access_ml_elem, prio_access_ml_elem_len);
++		os_free(prio_access_ml_elem);
++		break;
++
++	case WLAN_PROT_EHT_EPCS_ENABLE_TEARDOWN:
++		/* EPCS Tear Down */
++		wpabuf_put_u8(buf, WLAN_PROT_EHT_EPCS_ENABLE_TEARDOWN);
++		break;
++
++	default:
++		wpa_printf(MSG_DEBUG, "unknown protected_eht action frame of code:%d",
++			   epcs_info->action_code);
++		wpabuf_free(buf);
++		return -1;
++	}
++
++	if (hostapd_drv_send_action(hapd, hapd->iface->freq, 0, sta->addr,
++				    wpabuf_head(buf), wpabuf_len(buf)) < 0) {
++		wpa_printf(MSG_ERROR, "Sending the EPCS action frame failed for the STA mld addr: " MACSTR,
++			   MAC2STR(sta->mld_info.common_info.mld_addr));
++		wpabuf_free(buf);
++		return -1;
++	}
++
++	wpabuf_free(buf);
++	return 0;
++}
++
++
+ void hostapd_epcs_timeout_handler(void *eloop_ctx, void *timeout_ctx)
+ {
+ 	struct wlan_epcs_info epcs_info = {0};
+-- 
+2.34.1
+

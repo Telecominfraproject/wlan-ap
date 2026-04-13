@@ -1,0 +1,334 @@
+From f827952a2985c2069c59d5698b27a4da6585fe64 Mon Sep 17 00:00:00 2001
+From: Thiraviyam Mariyappan <tmariyap@qti.qualcomm.com>
+Date: Sun, 13 Jul 2025 21:29:48 +0530
+Subject: [PATCH] QSDK:ath12k:DP: tx performance optimization
+
+Below changes provides ~2gbps improvement in DBDC DL test. They are
+
+1. In TX path currently checks ring full by reading TP on every packet.
+The TP always follows HP and ring full is rare and do not occur for
+every packet. So, introducing this API
+ath12k_hal_srng_src_begin_get_next_entry_nolock_fast to remove the
+volatile access of tp for every packet and fetch the real tp only
+if ring full condition is hit with last cached tp.
+
+2. Avoid taking locks while processing the tx. The rings are accessed
+associated with specific cores for processing. There is no need to
+take locks and lock held check to avoid contention. Introduce simple
+inline functions to update the rings directly without too many
+checks in the ath12k_hif_write32 access.
+
+3. Disable the tcl_ring_retry feature, which is used to select the
+next TCL ring when the current ring is full. This feature introduces
+spin lock contention in the fast TX path, consuming CPU cycles and
+potentially impacting KPIs. Therefore, this feature is removed to
+simplify the TX code path and drop packets when the ring is full.
+
+4. Precompute the datapath registers addresses in hp_addr_direct and
+use it directly to save cpu time during tx completion.
+
+Orginal patches:
+718-d-ath12k-remove-locks-and-optimize-tx-completion-path.patch
+720-h-ath12k-Avoid-register-address-caculations-on-a-per-p.patch
+760-ath12k-Use-correct-offsets-for-handling-pci-and-ahb-.patch
+999-QSDK-DP-wifi-ath12k-optimize-ring-full-condition-che.patch
+
+Patch dependency:
+0378-QSDK-DP-wifi-ath12k-Tx-Enqueue-Optimization.patch
+
+Change-Id: Ib46cf68f282e6f6d8595f75becbbfdd1ee3273d6
+Signed-off-by: Balamurugan Mahalingam <bmahalin@qti.qualcomm.com>
+Signed-off-by: Hari Chandrakanthan <haric@qti.qualcomm.com>
+Signed-off-by: Ramanathan Choodamani <rchoodam@qti.qualcomm.com>
+Signed-off-by: Thiraviyam Mariyappan <tmariyap@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/hal.c         | 13 +----
+ drivers/net/wireless/ath/ath12k/hal.h         |  7 +--
+ drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c |  2 +-
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c | 20 +++----
+ drivers/net/wireless/ath/ath12k/wifi7/hal.c   | 18 +++++-
+ drivers/net/wireless/ath/ath12k/wifi7/hal.h   | 57 +++++++++++++++++++
+ 6 files changed, 87 insertions(+), 30 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -487,12 +487,12 @@ int ath12k_hal_srng_dst_num_free(struct
+ }
+ EXPORT_SYMBOL(ath12k_hal_srng_dst_num_free);
+ 
+-void __ath12k_hal_srng_dst_invalidate_entry(struct ath12k_dp *dp,
++void ath12k_hal_srng_dst_invalidate_entry(struct ath12k_dp *dp,
+ 					  struct hal_srng *srng, int entries)
+ {
+ 	u32 *desc, tp, hp;
+ 
+-	if (!(srng->flags & HAL_SRNG_FLAGS_CACHED) || !entries)
++	if (!(srng->flags & HAL_SRNG_FLAGS_CACHED))
+ 	        return;
+ 
+ 	tp = srng->u.dst_ring.tp;
+@@ -514,15 +514,6 @@ void __ath12k_hal_srng_dst_invalidate_en
+ 					DMA_FROM_DEVICE);
+ 	}
+ }
+-EXPORT_SYMBOL(__ath12k_hal_srng_dst_invalidate_entry);
+-
+-void ath12k_hal_srng_dst_invalidate_entry(struct ath12k_dp *dp,
+-					  struct hal_srng *srng, int entries)
+-{
+-	lockdep_assert_held(&srng->lock);
+-
+-	return __ath12k_hal_srng_dst_invalidate_entry(dp, srng, entries);
+-}
+ EXPORT_SYMBOL(ath12k_hal_srng_dst_invalidate_entry);
+ 
+ /* Returns number of available entries in src ring */
+--- a/drivers/net/wireless/ath/ath12k/hal.h
++++ b/drivers/net/wireless/ath/ath12k/hal.h
+@@ -848,6 +848,7 @@ struct hal_srng {
+ 			 * accessed through SW structure
+ 			 */
+ 			u32 *tp_addr;
++			u32 *tp_addr_direct;
+ 
+ 			/* Current SW loop cnt */
+ 			u32 loop_cnt;
+@@ -1374,10 +1375,8 @@ void *ath12k_hal_srng_dst_peek(struct at
+ int __ath12k_hal_srng_dst_num_free(struct hal_srng *srng, bool sync_hw_ptr);
+ int ath12k_hal_srng_dst_num_free(struct ath12k_base *ab, struct hal_srng *srng,
+ 				 bool sync_hw_ptr);
+-void __ath12k_hal_srng_dst_invalidate_entry(struct ath12k_dp *dp,struct hal_srng *srng,
+-					    int entries);
+-void ath12k_hal_srng_dst_invalidate_entry(struct ath12k_dp *dp,
+-					  struct hal_srng *srng, int entries);
++void ath12k_hal_srng_dst_invalidate_entry(struct ath12k_dp *dp,struct hal_srng *srng,
++					  int entries);
+ void *ath12k_hal_srng_src_get_next_reaped(struct ath12k_base *ab,
+ 					  struct hal_srng *srng);
+ void *ath12k_hal_srng_src_reap_next(struct ath12k_base *ab,
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_rx.c
+@@ -1423,7 +1423,7 @@ int ath12k_wifi7_dp_rx_process(struct at
+ 		ath12k_hal_srng_access_end(ab, srng);
+ 		return -EINVAL;
+ 	}
+-	__ath12k_hal_srng_dst_invalidate_entry(dp, srng, valid_entries);
++	ath12k_hal_srng_dst_invalidate_entry(dp, srng, valid_entries);
+ #endif
+ 	while ((desc = __ath12k_hal_srng_dst_get_next_cached_entry(srng, &last_tp))) {
+ 		struct rx_mpdu_desc_info *mpdu_info;
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -316,17 +316,14 @@ ath12k_wifi7_dp_tx(struct ath12k_pdev_dp
+ 		hal_ring_id = tx_ring->tcl_data_ring.ring_id;
+ 		tcl_ring = &hal->srng_list[hal_ring_id];
+ 
+-		spin_lock_bh(&tcl_ring->lock);
+ 
+-		ath12k_hal_srng_access_begin(ab, tcl_ring);
+-		hal_tcl_desc = ath12k_hal_srng_src_get_next_entry(ab, tcl_ring);
++		hal_tcl_desc = (void *)ath12k_hal_srng_src_begin_get_next_entry_nolock_fast(tcl_ring);
+ 		if (unlikely(!hal_tcl_desc)) {
+ 			/* NOTE: It is highly unlikely we'll be running out of tcl_ring
+ 			 * desc because the desc is directly enqueued onto hw queue.
+ 			 */
+-			ath12k_hal_srng_access_end(ab, tcl_ring);
++			ath12k_hal_srng_access_umac_src_ring_end_nolock_fast(tcl_ring);
+ 			dp->device_stats.tx_err.desc_na[ring_id]++;
+-			spin_unlock_bh(&tcl_ring->lock);
+ 			err = DP_TX_ENQ_DROP_TCL_DESC_NA;
+ 			goto fail_remove_tx_buf;
+ 		}
+@@ -335,10 +332,9 @@ ath12k_wifi7_dp_tx(struct ath12k_pdev_dp
+ #ifndef CONFIG_IO_COHERENCY
+ 		dmb(oshst);
+ #endif
+-		ath12k_hal_srng_access_end(ab, tcl_ring);
++		ath12k_hal_srng_access_umac_src_ring_end_nolock_fast(tcl_ring);
+ 
+ 		dp->device_stats.tx_fast_unicast[ring_id]++;
+-		spin_unlock_bh(&tcl_ring->lock);
+ 
+ 		DP_STATS_INC_PKT(dp_vif, tx_i.enque_to_hw_fast, 1, skb->len, ring_id);
+ 		atomic_inc(&dp_pdev->num_tx_pending);
+@@ -1438,12 +1434,12 @@ int ath12k_wifi7_dp_tx_completion_handle
+ 	int orig_budget = budget;
+ 	bool fast_flag;
+ 
+-	ath12k_hal_srng_access_begin(ab, status_ring);
++	ath12k_hal_srng_access_dst_ring_begin_nolock(ab, status_ring);
+ 
+ #ifndef CONFIG_IO_COHERENCY
+-	valid_entries = ath12k_hal_srng_dst_num_free(ab, status_ring, false);
++	valid_entries = __ath12k_hal_srng_dst_num_free(status_ring, false);
+ 	if (!valid_entries) {
+-		ath12k_hal_srng_access_end(ab, status_ring);
++		ath12k_hal_srng_access_dst_ring_end_nolock(status_ring);
+ 		return 0;
+ 	}
+ 
+@@ -1466,7 +1462,7 @@ int ath12k_wifi7_dp_tx_completion_handle
+ 	skb_queue_head_init(&free_list_head);
+ 
+ 	tx_status_entry = (struct ath12k_wifi7_tx_status_entry *)dp_hw_grp->tx_status_buf[tx_status_idx];
+-	while (budget-- && (desc = ath12k_hal_srng_dst_get_next_cached_entry(ab, status_ring, NULL))) {
++	while (budget-- && (desc = __ath12k_hal_srng_dst_get_next_cached_entry(status_ring, NULL))) {
+ 		tx_status = (struct hal_wbm_completion_ring_tx *)desc;
+ 
+ 		if (le32_get_bits(tx_status->info0, HAL_WBM_COMPL_TX_INFO0_CC_DONE)) {
+@@ -1502,7 +1498,7 @@ int ath12k_wifi7_dp_tx_completion_handle
+ 		tx_status_entry++;
+ 	}
+ 
+-	ath12k_hal_srng_access_end(ab, status_ring);
++	ath12k_hal_srng_access_dst_ring_end_nolock(status_ring);
+ 
+ 	if (!n_entry)
+ 		return orig_budget - budget;
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal.c
+@@ -286,17 +286,31 @@ void ath12k_wifi7_hal_set_umac_srng_ptr_
+ 	u32 reg_base = srng->hwreg_base[HAL_SRNG_REG_GRP_R2];
+ 
+ 	if (srng->ring_dir == HAL_SRNG_DIR_DST) {
+-		if (!ab->hw_params->supports_shadow_regs)
++		if (!ab->hw_params->supports_shadow_regs) {
+ 			srng->u.dst_ring.tp_addr =
+ 				(u32 *)((unsigned long)ab->mem + reg_base +
+ 				(HAL_REO1_RING_TP - HAL_REO1_RING_HP));
+-		else
++			if (type  == HAL_WBM2SW_RELEASE) {
++				if (ab->hif.bus == ATH12K_BUS_PCI ||
++						ab->hif.bus == ATH12K_BUS_HYBRID){
++					srng->u.dst_ring.tp_addr_direct =
++						(u32 *)((unsigned long)ab->mem +
++						(reg_base & WINDOW_RANGE_MASK) +
++						HAL_DP_REG_WINDOW_OFFSET +
++						(HAL_REO1_RING_TP - HAL_REO1_RING_HP));
++				} else {
++					srng->u.dst_ring.tp_addr_direct =
++						srng->u.dst_ring.tp_addr;
++				}
++			}
++		} else {
+ 			ath12k_dbg(ab, ATH12K_DBG_HAL,
+ 				   "type %d ring_num %d target_reg 0x%x shadow 0x%lx\n",
+ 				   type, ring_num,
+ 				   reg_base + HAL_REO1_RING_TP - HAL_REO1_RING_HP,
+ 				   (unsigned long)srng->u.dst_ring.tp_addr -
+ 				   (unsigned long)ab->mem);
++		}
+ 	} else  {
+ 		if (!ab->hw_params->supports_shadow_regs) {
+ 			srng->u.src_ring.hp_addr =
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal.h
+@@ -719,4 +719,61 @@ void ath12k_wifi7_hal_srng_hw_disable(st
+ 				      struct hal_srng *srng);
+ void ath12k_wifi7_hal_reset_rx_reo_tid_q(void *vaddr,
+ 					 u32 ba_window_size, u8 tid);
++static inline
++void *ath12k_hal_srng_src_begin_get_next_entry_nolock_fast(struct hal_srng *srng)
++{
++	void *desc;
++	u32 next_hp;
++
++	/* TODO: Using % is expensive, but we have to do this since size of some
++	 * SRNG rings is not power of 2 (due to descriptor sizes). Need to see
++	 * if separate function is defined for rings having power of 2 ring size
++	 * (TCL2SW, REO2SW, SW2RXDMA and CE rings) so that we can avoid the
++	 * overhead of % by using mask (with &).
++	 */
++	next_hp = (srng->u.src_ring.hp + srng->entry_size) % srng->ring_size;
++
++	if (next_hp == srng->u.src_ring.cached_tp) {
++		srng->u.src_ring.cached_tp = *(volatile u32 *)srng->u.src_ring.tp_addr;
++		if (next_hp == srng->u.src_ring.cached_tp)
++			return NULL;
++	}
++
++	desc = srng->ring_base_vaddr + srng->u.src_ring.hp;
++	srng->u.src_ring.hp = next_hp;
++
++	/* TODO: Reap functionality is not used by all rings. If particular
++	 * ring does not use reap functionality, we need not update reap_hp
++	 * with next_hp pointer. Need to make sure a separate function is used
++	 * before doing any optimization by removing below code updating
++	 * reap_hp.
++	 */
++	srng->u.src_ring.reap_hp = next_hp;
++
++	return desc;
++}
++
++/*
++ * ath12k_hal_srng_access_umac_src_ring_end_nolock_fast can be used
++ * only when the calling context tries to fill 1 entry of the ring at a time
++ */
++static inline
++void ath12k_hal_srng_access_umac_src_ring_end_nolock_fast(struct hal_srng *srng)
++{
++	writel_relaxed(srng->u.src_ring.hp, srng->u.src_ring.hp_addr_direct);
++	srng->timestamp = jiffies;
++}
++static inline
++void ath12k_hal_srng_access_dst_ring_begin_nolock(struct ath12k_base *ab,
++						  struct hal_srng *srng)
++{
++	srng->u.dst_ring.cached_hp = *srng->u.dst_ring.hp_addr;
++}
++static inline
++void ath12k_hal_srng_access_dst_ring_end_nolock(struct hal_srng *srng)
++{
++	srng->u.dst_ring.last_hp = *srng->u.dst_ring.hp_addr;
++	writel_relaxed(srng->u.dst_ring.tp, srng->u.dst_ring.tp_addr_direct);
++	srng->timestamp = jiffies;
++}
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -605,7 +605,7 @@ static struct ath12k_hw_params ath12k_wi
+ 		.cold_boot_calib = true,
+ 		.download_calib = true,
+ 		.supports_suspend = false,
+-		.tcl_ring_retry = true,
++		.tcl_ring_retry = false,
+ 		.reoq_lut_support = true,
+ 		.supports_shadow_regs = false,
+ 
+@@ -826,7 +826,7 @@ static struct ath12k_hw_params ath12k_wi
+ 		.cold_boot_calib = true,
+ 		.download_calib = true,
+ 		.supports_suspend = false,
+-		.tcl_ring_retry = true,
++		.tcl_ring_retry = false,
+ 		.reoq_lut_support = true,
+ 		.supports_shadow_regs = false,
+ 
+@@ -940,7 +940,7 @@ static struct ath12k_hw_params ath12k_wi
+ 		.cold_boot_calib = true,
+ 		.download_calib = true,
+ 		.supports_suspend = false,
+-		.tcl_ring_retry = true,
++		.tcl_ring_retry = false,
+ 		.reoq_lut_support = true,
+ 		.supports_shadow_regs = false,
+ 
+@@ -1046,7 +1046,7 @@ static struct ath12k_hw_params ath12k_wi
+ 		.cold_boot_calib = true,
+ 		.download_calib = true,
+ 		.supports_suspend = false,
+-		.tcl_ring_retry = true,
++		.tcl_ring_retry = false,
+ 		.reoq_lut_support = true,
+ 		.supports_shadow_regs = false,
+ 
+@@ -1131,7 +1131,7 @@ static struct ath12k_hw_params ath12k_wi
+ 		.cold_boot_calib = true,
+ 		.download_calib = true,
+ 		.supports_suspend = false,
+-		.tcl_ring_retry = true,
++		.tcl_ring_retry = false,
+ 		.reoq_lut_support = true,
+ 		.supports_shadow_regs = false,
+ 

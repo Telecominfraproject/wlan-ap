@@ -1,0 +1,254 @@
+From f62a02f5a3d2c5d96836101640c0944f087df736 Mon Sep 17 00:00:00 2001
+From: Vignesh U <uvignesh@qti.qualcomm.com>
+Date: Tue, 1 Jul 2025 10:05:24 +0530
+Subject: [PATCH 3/5] UPSTREAM:PROTOCOL:ath12k: add regulatory mask computation
+ for punctured and non-punctured channels
+
+Introduce regulatory mask computation logic for both punctured and
+non-punctured 6 GHz channels. This patch adds helper functions that
+calculate attenuation values based on frequency offset and bandwidth,
+which are essential for determining the effective Power Spectral Density
+(PSD) under Automated Frequency Coordination (AFC) constraints.
+
+The patch implements get_reg_mask_puncture() and
+get_reg_mask_non_puncture(), which compute the regulatory mask values for
+punctured and non-punctured channels respectively. These functions use
+offset-based shaping logic to apply decibel reduction (dbr) values across
+the spectrum, ensuring compliance with emission limits.
+
+The get_reg_mask_puncture() function uses interpolation between defined
+offsets in the puncture mask to determine the appropriate dbr value. It
+relies on get_y_val(), a linear interpolation helper, to compute
+intermediate values. The get_reg_mask_non_puncture() function applies a
+piecewise attenuation model based on the offset from the channel center,
+ensuring smooth roll-off beyond the usable bandwidth.
+
+The patch also introduces is_punc_type_invalid(), a utility to validate
+puncture type enums, which will be used in subsequent logic to gate
+regulatory mask application.
+
+These functions are declared in the header for reuse in upcoming patches
+that will integrate them into the full PSD computation pipeline. This
+patch builds on the mask shaping logic introduced earlier and is a
+critical step toward enabling AFC-compliant PSD enforcement.
+
+Fixes: None
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+ath12k/0401-b-UPSTREAM-PROTOCOL-ath12k-add-puncture-mask-handlers-.patch
+
+Signed-off-by: Vignesh U <uvignesh@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 121 ++++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/mac.h |  54 +++++++++++-
+ 2 files changed, 174 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index b47698e..f06f95c 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -5856,6 +5856,127 @@ handle_interim_20(struct ath12k_puncture_ctx *interim_20_punct_ctx)
+ 	pu_mask_r->dbr[2] = pdbm3[0];
+ }
+ 
++/**
++ * get_y_val - Calculate the interpolated y-value for a given x-value
++ * @x1: First x-coordinate
++ * @x2: Second x-coordinate
++ * @y1: y-coordinate corresponding to x1
++ * @y2: y-coordinate corresponding to x2
++ * @x: x-coordinate for which the interpolated y-value is to be calculated
++ *
++ * This function calculates the interpolated y-value for a given x-value using
++ * linear interpolation between two points (x1, y1) and (x2, y2). The function
++ * returns the interpolated y-value based on the input x-coordinate.
++ *
++ * Return: The interpolated y-value for the given x-coordinate.
++ */
++static s16 get_y_val(s16 x1, s16 x2, s16 y1, s16 y2, s16 x)
++{
++	s16 den = x2 - x1;
++
++	if (!den) {
++		ath12k_err(NULL,
++			   "Invalid x coordinates x1=%d y1=%d x2=%d y2=%d\n",
++			   x1, y1, x2, y2);
++		return ATH12K_INVALID_DBR;
++	}
++
++	return (y1 + (x - x1) * (y2 - y1) / (x2 - x1));
++}
++
++/**
++ * get_regmask_puncture - Calculate the regulatory mask for punctured channels
++ * @offset: Offset value for the frequency
++ * @bw: Bandwidth of the channel
++ * @pu_mask: Pointer to the punct_mask structure containing puncture mask limits
++ *
++ * This function calculates the regulatory mask for punctured channels based
++ * on the given offset, bandwidth, and puncture mask limits. The mask value is
++ * determined by the offset relative to the puncture mask limits defined in the
++ * punct_mask structure.
++ *
++ * Return: The calculated regulatory mask value, or ATH12K_INVALID_DBR if the offset
++ * does not fall within the defined puncture mask limits.
++ */
++s16 get_reg_mask_puncture(s16 offset, u16 bw, struct ath12k_punct_mask *pu_mask)
++{
++	s16 mask;
++
++	offset *= 10;
++	if (offset <= pu_mask->offset[0]) {
++		mask = pu_mask->dbr[0];
++	} else if ((offset > pu_mask->offset[0]) && (offset < pu_mask->offset[1])) {
++		mask = get_y_val(pu_mask->offset[0], pu_mask->offset[1],
++				 pu_mask->dbr[0], pu_mask->dbr[1], offset);
++	} else if (offset == pu_mask->offset[1]) {
++		mask = pu_mask->dbr[1];
++	} else if ((offset > pu_mask->offset[1]) && (offset < pu_mask->offset[2])) {
++		mask = get_y_val(pu_mask->offset[1], pu_mask->offset[2],
++				 pu_mask->dbr[1], pu_mask->dbr[2], offset);
++	} else if (offset >= pu_mask->offset[2]) {
++		mask = pu_mask->dbr[2];
++	} else {
++		ath12k_err(NULL, "invalid offset %d. Offset range: [%d, %d, %d]",
++			   offset, pu_mask->offset[0], pu_mask->offset[1],
++			   pu_mask->offset[2]);
++		mask = ATH12K_INVALID_DBR;
++	}
++
++	return mask;
++}
++
++/**
++ * get_reg_mask_non_puncture - Calculate the regulatory mask for non-punctured
++ * channels.
++ * @offset: Offset value for the frequency
++ * @bw: Bandwidth of the channel
++ *
++ * This function calculates the regulatory mask for non-punctured channels based
++ * on the given offset and bandwidth. The mask value is determined by the offset
++ * relative to the bandwidth and predefined thresholds.
++ *
++ * Return: The calculated regulatory mask value.
++ */
++s16 get_reg_mask_non_puncture(s16 offset, u16 bw)
++{
++	u16 hbw = bw / 2;
++	s16 mask;
++
++	offset = abs(offset);
++
++	if (offset >= ((bw * 3) / 2))
++		mask = ATH12K_REG_MASK_DB_MIN;
++	else if (offset >= bw)
++		mask = ATH12K_REG_MASK_DB_MID -
++			((ATH12K_REG_MASK_DB_STEP_MID * (offset - bw)) / hbw);
++	else if (offset >= (hbw + ATH12K_REG_MASK_OFFSET_THRESHOLD))
++		mask = ATH12K_REG_MASK_DB_BASE -
++			((ATH12K_REG_MASK_DB_STEP_BASE *
++			  (offset - (hbw + ATH12K_REG_MASK_OFFSET_THRESHOLD))) /
++			 (hbw - ATH12K_REG_MASK_OFFSET_THRESHOLD));
++	else
++		mask = ATH12K_REG_MASK_DB_NONE;
++
++	return mask;
++}
++
++/**
++ * is_punc_type_invalid - Check if a puncture type is invalid
++ * @punc_type: The puncture type to validate
++ *
++ * This function checks whether the given puncture type falls outside
++ * the valid range defined by the enumeration constants
++ * PUNCTURE_TYPE_FIRST and PUNCTURE_TYPE_LAST.
++ *
++ * Return: true if the puncture type is invalid, false otherwise.
++ */
++static inline bool
++is_punc_type_invalid(enum ath12k_puncture_type punc_type)
++{
++	return (punc_type < ATH12K_PUNCTURE_TYPE_FIRST) ||
++	       (punc_type > ATH12K_PUNCTURE_TYPE_LAST);
++}
++
+ void ath12k_mac_bss_info_changed(struct ath12k *ar,
+ 				struct ath12k_link_vif *arvif,
+ 				struct ieee80211_bss_conf *info,
+diff --git a/drivers/net/wireless/ath/ath12k/mac.h b/drivers/net/wireless/ath/ath12k/mac.h
+index 3b6dae6..3a20239 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.h
++++ b/drivers/net/wireless/ath/ath12k/mac.h
+@@ -505,6 +505,36 @@ handle_interim_20_plus(struct ath12k_puncture_ctx *interim_20_plus_punct_ctx);
+ void
+ handle_interim_20(struct ath12k_puncture_ctx *interim_20_punct_ctx);
+ 
++/**
++ * get_regmask_puncture - Calculate the regulatory mask for punctured channels
++ * @offset: Offset value for the frequency
++ * @bw: Bandwidth of the channel
++ * @pu_mask: Pointer to the punct_mask structure containing puncture mask limits
++ *
++ * This function calculates the regulatory mask for punctured channels based
++ * on the given offset, bandwidth, and puncture mask limits. The mask value is
++ * determined by the offset relative to the puncture mask limits defined in the
++ * punct_mask structure.
++ *
++ * Return: The calculated regulatory mask value, or INVALID_DBR if the offset
++ * does not fall within the defined puncture mask limits.
++ */
++s16 get_reg_mask_puncture(s16 offset, u16 bw, struct ath12k_punct_mask *pu_mask);
++
++/**
++ * get_reg_mask_non_puncture - Calculate the regulatory mask for non-punctured
++ * channels.
++ * @offset: Offset value for the frequency
++ * @bw: Bandwidth of the channel
++ *
++ * This function calculates the regulatory mask for non-punctured channels based
++ * on the given offset and bandwidth. The mask value is determined by the offset
++ * relative to the bandwidth and predefined thresholds.
++ *
++ * Return: The calculated regulatory mask value.
++ */
++s16 get_reg_mask_non_puncture(s16 offset, u16 bw);
++
+ /**
+  * enum ath12k_puncture_type - Enumeration of puncture types
+  * @ATH12K_PUNCTURE_TYPE_EDGE: Represents edge puncture type
+@@ -538,7 +568,29 @@ void ath12k_mac_op_apply_neg_ttlm_per_client(struct ieee80211_hw *hw,
+ 
+ /* Used for offset adjustments in shaping the mask */
+ #define ATH12K_PUNCTURE_OFFSET_STEP	5
++
+ /* Used for wider shaping in interim puncture logic */
+-#define ATH12K_PUNCTURE_MASK_WIDTH		100
++#define ATH12K_PUNCTURE_MASK_WIDTH	100
++
++/* Minimum dB reduction applied when offset is beyond 1.5x the bandwidth */
++#define ATH12K_REG_MASK_DB_MIN		-400
++
++/* Base dB reduction applied when offset is beyond the bandwidth */
++#define ATH12K_REG_MASK_DB_MID		-280
++
++/* Base dB reduction applied when offset is beyond half the bandwidth */
++#define ATH12K_REG_MASK_DB_BASE		-200
++
++/* Step size for attenuation slope beyond full bandwidth */
++#define ATH12K_REG_MASK_DB_STEP_MID	120
++
++/* Step size for attenuation slope beyond half bandwidth */
++#define ATH12K_REG_MASK_DB_STEP_BASE	80
++
++/* Offset threshold adjustment used in near-range shaping */
++#define ATH12K_REG_MASK_OFFSET_THRESHOLD	1
++
++/* No attenuation applied when offset is within half bandwidth */
++#define ATH12K_REG_MASK_DB_NONE	0
+ 
+ #endif
+-- 
+2.34.1
+

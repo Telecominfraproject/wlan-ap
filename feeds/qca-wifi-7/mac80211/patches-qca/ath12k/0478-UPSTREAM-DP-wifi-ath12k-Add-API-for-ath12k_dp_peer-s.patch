@@ -1,0 +1,336 @@
+From b9a37e35136deca701b58df4c204f6af920e0e42 Mon Sep 17 00:00:00 2001
+From: Harsh Kumar Bijlani <hbijlani@qti.qualcomm.com>
+Date: Mon, 28 Jul 2025 18:00:33 +0530
+Subject: [PATCH] UPSTREAM: DP: wifi: ath12k: Add API for ath12k_dp_peer search
+ using address and ieee80211_sta
+
+In the following scenarios, hostapd might not send NL command for delete
+station to driver:
+
+1. In congested environment with multiple clients, de-authentication
+   frames from client might be missed in AP Rx
+
+2. In roaming scenario, client can roam across the link and it is
+   not mandatory for client to send the deauthentication frame to AP
+
+3. Sometimes client may go to out of coverage and try to connect back
+   with another radio with same mac address
+
+In such cases, when NL command for add station is received in ath12k
+driver without delete station command being received, ath12k_dp_peer
+creation fails since there is an existing entry in driver
+with the same mac address and this results in station connection failure.
+
+This issue is introduced due to introduction of ath12k_dp_peer as part
+of Unified Driver framework.
+
+In order to address this, search for ath12k_dp_peer using mac address and
+ieee80211_sta in creation and deletion paths which makes it unique.
+
+Also ath12k_base has mac address based hash table for ath12k_link_sta
+and ath12k_dp has mac address based hash table for ath12k_dp_link_peer.
+In split-phy rdp, 2 radios share the same device and hence hash table
+is also shared between those radios. For above mentioned use cases,
+there can be issues in hash table entry add and delete during
+add station and delete station NL commands. This patch is intended to
+handle such scenarios by removing duplicate entry during add station
+and removing right entry on delete station command.
+
+Fixes: 70b5a1a98 (wifi: ath12k: Modularization of peer object Part-2)
+
+Patch Dependency:
+0116-0001-wifi-ath12k-Define-ath12k_dp_peer-structure-APIs-for.patch
+0116-0002-wifi-ath12k-Attach-and-detach-ath12k_dp_link_peer-to.patch
+
+Signed-off-by: Harsh Kumar Bijlani <hbijlani@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/debugfs_sta.c |  2 +-
+ drivers/net/wireless/ath/ath12k/dp_cmn.h      |  2 +-
+ drivers/net/wireless/ath/ath12k/dp_peer.c     | 51 ++++++++++++++-----
+ drivers/net/wireless/ath/ath12k/dp_peer.h     |  4 +-
+ drivers/net/wireless/ath/ath12k/mac.c         | 26 ++++++++--
+ drivers/net/wireless/ath/ath12k/peer.c        |  2 +-
+ 6 files changed, 66 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/debugfs_sta.c b/drivers/net/wireless/ath/ath12k/debugfs_sta.c
+index 08b9845..71fccff 100644
+--- a/drivers/net/wireless/ath/ath12k/debugfs_sta.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs_sta.c
+@@ -334,7 +334,7 @@ ath12k_dbg_sta_read_qos_msduq(struct file *file, char __user *user_buf,
+ 	wiphy_lock(ath12k_ar_to_hw(ar)->wiphy);
+ 	spin_lock_bh(&ah->dp_hw.peer_lock);
+ 
+-	peer = ath12k_dp_peer_find(&ah->dp_hw, arsta->addr);
++	peer = ath12k_dp_peer_find_by_addr_and_sta(&ah->dp_hw, arsta->addr, sta);
+ 	if (!peer) {
+ 		goto ret;
+ 	}
+diff --git a/drivers/net/wireless/ath/ath12k/dp_cmn.h b/drivers/net/wireless/ath/ath12k/dp_cmn.h
+index a1f9dee..a1a75d9 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_cmn.h
++++ b/drivers/net/wireless/ath/ath12k/dp_cmn.h
+@@ -104,7 +104,7 @@ void ath12k_dp_cmn_update_hw_links(struct ath12k_dp *dp,
+ 				   struct ath12k_hw_group *ag,
+ 				   struct ath12k *ar);
+ int ath12k_dp_link_peer_assign(struct ath12k *ar, u8 vdev_id,
+-			       u8 *dp_peer_addr, u8 *addr, u8 link_id,
++			       struct ieee80211_sta *sta, u8 *addr, u8 link_id,
+ 			       u32 hw_link_id, struct ieee80211_vif *vif);
+ void ath12k_dp_link_peer_unassign(struct ath12k *ar, u8 vdev_id, u8 *addr);
+ void ath12k_link_peer_get_sta_rate_info_stats(struct ath12k_dp *dp, const u8 *addr,
+diff --git a/drivers/net/wireless/ath/ath12k/dp_peer.c b/drivers/net/wireless/ath/ath12k/dp_peer.c
+index e26ba96..21b4b54 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.c
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.c
+@@ -465,6 +465,21 @@ struct ath12k_dp_peer *ath12k_dp_peer_find(struct ath12k_dp_hw *dp_hw, u8 *addr)
+ 	return NULL;
+ }
+ 
++struct ath12k_dp_peer *ath12k_dp_peer_find_by_addr_and_sta(struct ath12k_dp_hw *dp_hw, u8 *addr,
++							   struct ieee80211_sta *sta)
++{
++	struct ath12k_dp_peer *dp_peer;
++
++	lockdep_assert_held(&dp_hw->peer_lock);
++
++	list_for_each_entry(dp_peer, &dp_hw->peers, list) {
++		if (ether_addr_equal(dp_peer->addr, addr) && (dp_peer->sta == sta))
++			return dp_peer;
++	}
++
++	return NULL;
++}
++
+ #define PEER_TABLE_SOC_ID_SHIFT        10
+ 
+ u16 ath12k_dp_peer_get_peerid_index(struct ath12k_dp *dp, u16 peer_id)
+@@ -521,7 +536,7 @@ int ath12k_dp_peer_create(struct ath12k_dp_hw *dp_hw, u8 *addr,
+ 	struct wireless_dev *wdev;
+ 
+ 	spin_lock_bh(&dp_hw->peer_lock);
+-	dp_peer = ath12k_dp_peer_find(dp_hw, addr);
++	dp_peer = ath12k_dp_peer_find_by_addr_and_sta(dp_hw, addr, params->sta);
+ 	spin_unlock_bh(&dp_hw->peer_lock);
+ 
+ 	if (dp_peer)
+@@ -557,14 +572,14 @@ int ath12k_dp_peer_create(struct ath12k_dp_hw *dp_hw, u8 *addr,
+ 	return 0;
+ }
+ 
+-void ath12k_dp_peer_delete(struct ath12k_dp_hw *dp_hw, u8 *addr)
++void ath12k_dp_peer_delete(struct ath12k_dp_hw *dp_hw, u8 *addr, struct ieee80211_sta *sta)
+ {
+ 	struct ath12k_dp_peer *dp_peer;
+ 	u16 peerid_index;
+ 
+ 	spin_lock_bh(&dp_hw->peer_lock);
+ 
+-	dp_peer = ath12k_dp_peer_find(dp_hw, addr);
++	dp_peer = ath12k_dp_peer_find_by_addr_and_sta(dp_hw, addr, sta);
+ 	if (!dp_peer) {
+ 		spin_unlock_bh(&dp_hw->peer_lock);
+ 		return;
+@@ -588,26 +603,24 @@ void ath12k_dp_peer_delete(struct ath12k_dp_hw *dp_hw, u8 *addr)
+ }
+ 
+ int ath12k_dp_link_peer_assign(struct ath12k *ar, u8 vdev_id,
+-			       u8 *dp_peer_addr, u8 *addr, u8 link_id,
++			       struct ieee80211_sta *sta, u8 *addr, u8 link_id,
+ 			       u32 hw_link_id, struct ieee80211_vif *vif)
+ {
+ 	struct ath12k_pdev_dp *dp_pdev = &ar->dp;
+ 	struct ath12k_dp *dp = dp_pdev->dp;
+ 	struct ath12k_dp_hw *dp_hw = &ar->ah->dp_hw;
+ 	struct ath12k_dp_peer *dp_peer;
+-	struct ath12k_dp_link_peer *peer;
++	struct ath12k_dp_link_peer *peer, *temp_peer;
+ 	u16 peerid_index;
+ 	int ret;
+-	u8 *dp_peer_mac = dp_peer_addr;
++	u8 *dp_peer_mac = !sta ? addr : sta->addr;
+ 
+-	if (!dp_peer_addr) {
++	if (!sta) {
+ 		struct ath12k_dp_peer_create_params params = {0};
+ 
+ 		params.is_vdev_peer = true;
+ 
+ 		ath12k_dp_peer_create(dp_hw, addr, &params, vif);
+-
+-		dp_peer_mac = addr;
+ 	}
+ 
+ 	spin_lock_bh(&dp->dp_lock);
+@@ -620,7 +633,7 @@ int ath12k_dp_link_peer_assign(struct ath12k *ar, u8 vdev_id,
+ 
+ 	spin_lock_bh(&dp_hw->peer_lock);
+ 
+-	dp_peer = ath12k_dp_peer_find(dp_hw, dp_peer_mac);
++	dp_peer = ath12k_dp_peer_find_by_addr_and_sta(dp_hw, dp_peer_mac, sta);
+ 	if (!dp_peer) {
+ 		ret = -ENOENT;
+ 		goto err_dp_peer;
+@@ -661,6 +674,15 @@ int ath12k_dp_link_peer_assign(struct ath12k *ar, u8 vdev_id,
+ 
+ 	spin_unlock_bh(&dp_hw->peer_lock);
+ 
++	/* In case of Split PHY and roaming scenario, pdev idx
++	 * might differ but both the pdev will share same rhash
++	 * table. In that case update the rhash table if link_peer is
++	 * already present
++	 */
++	temp_peer = ath12k_dp_link_peer_find_by_addr(dp, addr);
++	if (temp_peer && temp_peer->hw_link_id != ar->hw_link_id)
++		ath12k_dp_link_peer_rhash_delete(dp, temp_peer);
++
+ 	ath12k_dp_link_peer_rhash_add(dp, peer);
+ 
+ 	spin_unlock_bh(&dp->dp_lock);
+@@ -682,7 +704,7 @@ void ath12k_dp_link_peer_unassign(struct ath12k *ar, u8 vdev_id, u8 *addr)
+ 	struct ath12k_dp *dp = dp_pdev->dp;
+ 	struct ath12k_dp_hw *dp_hw = &ar->ah->dp_hw;
+ 	struct ath12k_dp_peer *dp_peer;
+-	struct ath12k_dp_link_peer *peer;
++	struct ath12k_dp_link_peer *peer, *temp_peer;
+ 	u16 peerid_index;
+ 
+ 	spin_lock_bh(&dp->dp_lock);
+@@ -716,7 +738,10 @@ void ath12k_dp_link_peer_unassign(struct ath12k *ar, u8 vdev_id, u8 *addr)
+ 
+ 	kfree(peer->peer_stats.qos_stats);
+ 
+-	ath12k_dp_link_peer_rhash_delete(dp, peer);
++	/* To handle roaming and split phy scenario */
++	temp_peer = ath12k_dp_link_peer_find_by_addr(dp, addr);
++	if (temp_peer && temp_peer->hw_link_id == ar->hw_link_id)
++		ath12k_dp_link_peer_rhash_delete(dp, peer);
+ 
+ 	peer->dp_peer = NULL;
+ 
+@@ -725,7 +750,7 @@ void ath12k_dp_link_peer_unassign(struct ath12k *ar, u8 vdev_id, u8 *addr)
+ 	synchronize_rcu();
+ 
+ 	if (dp_peer->is_vdev_peer)
+-		ath12k_dp_peer_delete(dp_hw, addr);
++		ath12k_dp_peer_delete(dp_hw, addr, NULL);
+ }
+ 
+ void ath12k_link_peer_get_sta_rate_info_stats(struct ath12k_dp *dp, const u8 *addr,
+diff --git a/drivers/net/wireless/ath/ath12k/dp_peer.h b/drivers/net/wireless/ath/ath12k/dp_peer.h
+index 4186867..14ec1a9 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.h
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.h
+@@ -234,6 +234,8 @@ void ath12k_peer_map_event(struct ath12k_base *ab, u8 vdev_id, u16 peer_id,
+ 			   u8 *mac_addr, u16 ast_hash, u16 hw_peer_id);
+ struct ath12k_dp_peer *ath12k_dp_peer_find(struct ath12k_dp_hw *dp_hw,
+ 					   u8 *addr);
++struct ath12k_dp_peer *ath12k_dp_peer_find_by_addr_and_sta(struct ath12k_dp_hw *dp_hw,
++							   u8 *addr, struct ieee80211_sta *sta);
+ struct ath12k_dp_link_peer *
+ ath12k_dp_link_peer_find_by_vdev_id_and_addr(struct ath12k_dp *dp,
+ 					     int vdev_id, const u8 *addr);
+@@ -254,7 +256,7 @@ int ath12k_dp_link_peer_rhash_delete(struct ath12k_dp *dp,
+ int ath12k_dp_peer_create(struct ath12k_dp_hw *dp_hw, u8 *addr,
+ 			  struct ath12k_dp_peer_create_params *params,
+ 			  struct ieee80211_vif *vif);
+-void ath12k_dp_peer_delete(struct ath12k_dp_hw *dp_hw, u8 *addr);
++void ath12k_dp_peer_delete(struct ath12k_dp_hw *dp_hw, u8 *addr, struct ieee80211_sta *sta);
+ struct ath12k_dp_peer *ath12k_dp_peer_find_by_peerid_index(struct ath12k_dp *dp,
+ 							   struct ath12k_pdev_dp *dp_pdev,
+ 							   u16 peer_id);
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 4c77752..5ea7f8a 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -1429,7 +1429,7 @@ void ath12k_mac_peer_cleanup_all(struct ath12k *ar)
+ 	/* Delete all the self dp_peers on asserted radio
+ 	 */
+ 	list_for_each_entry_safe_reverse(arvif, tmp_vif, &ar->arvifs, list) {
+-		ath12k_dp_peer_delete(dp_hw, arvif->bssid);
++		ath12k_dp_peer_delete(dp_hw, arvif->bssid, NULL);
+ 		arvif->num_stations = 0;
+ 	}
+ 
+@@ -10314,6 +10314,7 @@ static int ath12k_mac_station_remove(struct ath12k *ar,
+ 	struct ieee80211_sta *sta = ath12k_ahsta_to_sta(ahsta);
+ 	struct ath12k_vif *ahvif = arvif->ahvif;
+ 	int ret = 0;
++	struct ath12k_link_sta *temp_arsta = NULL;
+ 
+ 	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
+ 
+@@ -10346,7 +10347,12 @@ static int ath12k_mac_station_remove(struct ath12k *ar,
+ 	ath12k_cfr_decrement_peer_count(ar, arsta);
+ 
+ 	spin_lock_bh(&ar->ab->base_lock);
+-	ath12k_link_sta_rhash_delete(ar->ab, arsta);
++
++	/* To handle roaming and split phy scenario */
++	temp_arsta = ath12k_link_sta_find_by_addr(ar->ab, arsta->addr);
++	if (temp_arsta && temp_arsta->arvif->ar == ar)
++		ath12k_link_sta_rhash_delete(ar->ab, arsta);
++
+ 	spin_unlock_bh(&ar->ab->base_lock);
+ 
+ 	if (ahsta->links_map)
+@@ -10366,6 +10372,7 @@ static int ath12k_mac_station_add(struct ath12k *ar,
+ 	struct ieee80211_sta *sta = ath12k_ahsta_to_sta(arsta->ahsta);
+ 	struct ath12k_wmi_peer_create_arg peer_param = {0};
+ 	int ret;
++	struct ath12k_link_sta *temp_arsta = NULL;
+ 
+ 	lockdep_assert_wiphy(ath12k_ar_to_hw(ar)->wiphy);
+ 
+@@ -10377,7 +10384,18 @@ static int ath12k_mac_station_add(struct ath12k *ar,
+ 	}
+ 
+ 	spin_lock_bh(&ab->base_lock);
++
++	/* In case of Split PHY and roaming scenario, pdev idx
++	 * might differ but both the pdev will share same rhash
++	 * table. In that case update the rhash table if link_sta is
++	 * already present
++	 */
++	temp_arsta = ath12k_link_sta_find_by_addr(ab, arsta->addr);
++	if (temp_arsta && temp_arsta->arvif->ar != ar)
++		ath12k_link_sta_rhash_delete(ab, temp_arsta);
++
+ 	ret = ath12k_link_sta_rhash_add(ab, arsta);
++
+ 	spin_unlock_bh(&ab->base_lock);
+ 	if (ret) {
+ 		ath12k_warn(ab, "Failed to add peer: %pM to hash table", arsta->addr);
+@@ -11244,7 +11262,7 @@ ml_station_remove:
+ 
+ 	if (old_state == IEEE80211_STA_NONE &&
+ 	    new_state == IEEE80211_STA_NOTEXIST) {
+-		ath12k_dp_peer_delete(&ah->dp_hw, sta->addr);
++		ath12k_dp_peer_delete(&ah->dp_hw, sta->addr, sta);
+ 		wiphy_work_cancel(hw->wiphy, &ahsta->set_4addr_wk);
+ 	}
+ 
+@@ -11257,7 +11275,7 @@ ml_station_remove:
+ 
+ peer_delete:
+ 	if (ret)
+-		ath12k_dp_peer_delete(&ah->dp_hw, sta->addr);
++		ath12k_dp_peer_delete(&ah->dp_hw, sta->addr, sta);
+ ml_peer_id_free:
+ 	if (ret)
+ 		ath12k_peer_ml_free(ah, ahsta);
+diff --git a/drivers/net/wireless/ath/ath12k/peer.c b/drivers/net/wireless/ath/ath12k/peer.c
+index 6f265e5..3f73779 100644
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -263,7 +263,7 @@ int ath12k_peer_create(struct ath12k *ar, struct ath12k_link_vif *arvif,
+ 	spin_unlock_bh(&ar->ab->dp->dp_lock);
+ 
+ 	ath12k_dp_link_peer_assign(ar, arvif->vdev_id,
+-				   sta ? sta->addr : NULL, arg->peer_addr,
++				   sta, arg->peer_addr,
+ 				   link_id, ar->hw_link_id, vif);
+ 
+ 	if (vif->type == NL80211_IFTYPE_AP)
+-- 
+2.34.1
+

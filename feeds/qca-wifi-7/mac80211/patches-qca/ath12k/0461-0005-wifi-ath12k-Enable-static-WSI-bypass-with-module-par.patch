@@ -1,0 +1,172 @@
+From 25f099c47efb600d9f9e0ed5ce641920b68da552 Mon Sep 17 00:00:00 2001
+From: Kannan Saravanan <kannsara@qti.qualcomm.com>
+Date: Wed, 23 Jul 2025 15:44:10 +0530
+Subject: [PATCH 5/6] wifi:ath12k: Enable static WSI bypass with module param
+
+The static WSI bypass mechanism will bypass one radio only if two active radios
+are present in the Access Point (AP). This is controlled using a module
+parameter and is configured during the insertion (insmod) of the ath12k module.
+
+The module parameter uses the WSI index of each radio as a bitmap to
+determine which radio to bypass. Below are examples of how
+to use this parameter:
+
+Examples:
+
+wsi_bypass_bmap = 1  // 0x0001
+This will bypass the 2G radio interface, as the WSI index of the 2G radio is 0.
+
+wsi_bypass_bmap = 2  // 0x0010
+This will bypass the 5G radio interface, as the WSI index of the 5G radio is 1.
+
+The current implementation leverages the dynamic bypass infrastructure to disable
+a radio when no active VAPs (Virtual Access Points) are present
+on the bypassed radio. The static bypass logic checks whether the static
+bypass bitmap is set for a given radio and initiates dynamic bypass
+for that radio once all chips are active.
+
+Note: After a radio has been bypassed, re-adding it is only supported by reloading
+the module (i.e., performing rmmod followed by insmod).
+
+Signed-off-by: Gautham Kumar Senthilkumaran <gauthamk@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.c    | 30 +++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/core.h    |  1 +
+ drivers/net/wireless/ath/ath12k/debugfs.c | 12 ++++++++-
+ drivers/net/wireless/ath/ath12k/mac.c     |  7 ++++--
+ 4 files changed, 47 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -137,6 +137,11 @@ bool ath12k_mlo_3_link_tx;
+ module_param_named(mlo_3_link_tx, ath12k_mlo_3_link_tx, bool, 0644);
+ MODULE_PARM_DESC(mlo_3_link_tx, "3 link MLO active TX support (0 - disable, 1 - enable)");
+ 
++unsigned int ath12k_wsi_bypass_bmap;
++module_param_named(wsi_bypass_bmap, ath12k_wsi_bypass_bmap, uint, 0644);
++MODULE_PARM_DESC(wsi_bypass_bmap,
++		 "Bitmap for the chip to be bypassed for WSI interface");
++
+ /* protected with ath12k_hw_group_mutex */
+ static struct list_head ath12k_hw_group_list = LIST_HEAD_INIT(ath12k_hw_group_list);
+ 
+@@ -1852,6 +1857,7 @@ int ath12k_core_qmi_firmware_ready(struc
+ 	struct ath12k *ar;
+ 	struct ath12k_bridge_iter bridge_iter = {};
+ 	u8 active_num_devices;
++	struct ath12k_base *partner_ab;
+ 
+ #ifdef CPTCFG_ATH12K_PPE_DS_SUPPORT
+ 	/* TODO: DS: revisit this for new DS design in WDS mode */
+@@ -1950,8 +1956,26 @@ int ath12k_core_qmi_firmware_ready(struc
+ 		}
+ 	}
+ 
++	if (ath12k_core_hw_group_start_ready(ag)) {
++		mutex_unlock(&ag->mutex);
++		for (i = 0; i < ag->num_devices; i++) {
++			partner_ab = ag->ab[i];
++			if (partner_ab->is_static_bypassed) {
++				ret = ath12k_wsi_bypass_precheck(partner_ab, 1);
++				if (ret) {
++					ath12k_err(ab, "WSI Bypass precheck failed");
++					goto out;
++				}
++				partner_ab->wsi_remap_state = 1;
++				ath12k_mac_dynamic_wsi_remap(partner_ab);
++			}
++		}
++		goto out;
++	}
++
+ 	mutex_unlock(&ag->mutex);
+ 
++out:
+ 	return 0;
+ 
+ err_core_stop:
+@@ -4082,6 +4106,12 @@ exit:
+ 	}
+ 
+ 	ab->device_id = ag->num_probed++;
++
++	if (ag->id != ATH12K_INVALID_GROUP_ID)
++		ab->is_static_bypassed = (ath12k_wsi_bypass_bmap & (1 << wsi->index));
++	else if (ath12k_wsi_bypass_bmap)
++		ath12k_warn(ab, "single device does not support static WSI bypass\n");
++
+ 	ag->ab[ab->device_id] = ab;
+ 	ab->ag = ag;
+ 
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1767,6 +1767,7 @@ struct ath12k_base {
+ 	struct ath12k_wsi_info bypass_wsi_info;
+ 	bool is_bypassed;
+ 	enum ath12k_wsi_bypass_action wsi_remap_state;
++	bool is_static_bypassed;
+ 
+ 	/* must be last */
+ 	u8 drv_priv[] __aligned(sizeof(void *));
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -152,7 +152,9 @@ ath12k_debug_write_wsi_bypass_device(str
+ {
+ 	struct ath12k_base *ab = file->private_data;
+ 	unsigned int value;
+-	int ret;
++	int ret, i;
++	struct ath12k_hw_group *ag = ab->ag;
++	struct ath12k_base *partner_ab;
+ 
+ 	if (kstrtouint_from_user(user_buf, count, 0, &value))
+ 		return -EINVAL;
+@@ -164,6 +166,14 @@ ath12k_debug_write_wsi_bypass_device(str
+ 		return -EINVAL;
+ 	}
+ 
++	for (i = 0; i < ag->num_devices; i++) {
++		partner_ab = ag->ab[i];
++		if (partner_ab->is_static_bypassed) {
++			ath12k_err(ab, "Static WSI Bypass is enabled\n");
++			ret = -EINVAL;
++			goto exit;
++		}
++	}
+ 	mutex_lock(&ab->core_lock);
+ 	ret = ath12k_wsi_bypass_precheck(ab, value);
+ 
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -885,7 +885,7 @@ struct ath12k *ath12k_mac_get_ar_by_pdev
+ 		return NULL;
+ 
+ 	for (i = 0; i < ab->num_radios; i++) {
+-		if (ab->fw_mode == ATH12K_FIRMWARE_MODE_FTM)
++		if (ab->fw_mode == ATH12K_FIRMWARE_MODE_FTM || ab->ag->wsi_remap_in_progress)
+ 			pdev = &ab->pdevs[i];
+ 		else
+ 			pdev = rcu_dereference(ab->pdevs_active[i]);
+@@ -14307,8 +14307,11 @@ void ath12k_mac_op_stop(struct ieee80211
+ 
+ 	ah->state = ATH12K_HW_STATE_OFF;
+ 
+-	for_each_ar(ah, ar, i)
++	for_each_ar(ah, ar, i) {
++		if (ar->ab->is_bypassed)
++			continue;
+ 		ath12k_mac_stop(ar);
++	}
+ 
+ 	mutex_unlock(&ah->hw_mutex);
+ }
+--- a/drivers/net/wireless/ath/ath12k/debugfs.h
++++ b/drivers/net/wireless/ath/ath12k/debugfs.h
+@@ -26,6 +26,7 @@ enum ath12k_dbg_aggr_mode {
+ };
+ 
+ void ath12k_wmi_crl_path_stats_list_free(struct ath12k *ar, struct list_head *head);
++int ath12k_wsi_bypass_precheck(struct ath12k_base *ab, unsigned int value);
+ 
+ #define ATH12K_MAX_NRPS 7
+ #define MAC_UNIT_LEN 3

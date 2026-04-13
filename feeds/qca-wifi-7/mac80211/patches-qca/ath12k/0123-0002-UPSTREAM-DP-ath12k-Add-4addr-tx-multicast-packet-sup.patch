@@ -1,0 +1,284 @@
+From 46a4a9bd483cb6df503d64a963c348174b39d57e Mon Sep 17 00:00:00 2001
+From: Tamizh Chelvam Raja <quic_tamizhr@quicinc.com>
+Date: Thu, 17 Apr 2025 16:04:58 +0530
+Subject: [PATCH 2/2] UPSTREAM:DP:ath12k: Add 4addr tx multicast packet support
+
+In 4addr, AP wired backbone to STA wired backbone ping fails due to ARP
+request not getting answered. Here 4addr ARP multicast packet is sent in
+3addr, so that 4addr STA not honouring the 3addr ARP multicast packet.
+Fix this issue by sending out multicast packet in 4addr format, firmware
+expects peer meta flag instead of vdev meta flag in Tx descriptor.
+
+Signed-off-by: Tamizh Chelvam Raja <quic_tamizhr@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.h          |  2 ++
+ drivers/net/wireless/ath/ath12k/dp_peer.c     |  3 ++
+ drivers/net/wireless/ath/ath12k/dp_peer.h     |  2 ++
+ drivers/net/wireless/ath/ath12k/wifi7/dp.h    |  1 +
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c | 33 +++++++++++++++----
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h |  2 +-
+ .../net/wireless/ath/ath12k/wifi7/hal_tx.c    |  4 ++-
+ .../net/wireless/ath/ath12k/wifi7/hal_tx.h    |  1 +
+ drivers/net/wireless/ath/ath12k/wifi7/hw.c    | 18 ++++++++--
+ 9 files changed, 55 insertions(+), 11 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -13,6 +13,8 @@
+ #include "hal.h"
+ #include <linux/rhashtable.h>
+ 
++#define HTT_TCL_META_DATA_PEER_ID_MISSION       GENMASK(15, 3)
++
+ #define MAX_RXDMA_PER_PDEV     2
+ 
+ struct ath12k_base;
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.c
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.c
+@@ -497,6 +497,9 @@ int ath12k_dp_link_peer_assign(struct at
+ 
+ 	peer->dp_peer = dp_peer;
+ 	peer->hw_link_id = hw_link_id;
++	peer->tcl_metadata |= u32_encode_bits(0, HTT_TCL_META_DATA_TYPE) |
++			      u32_encode_bits(peer->peer_id, HTT_TCL_META_DATA_PEER_ID);
++	peer->tcl_metadata &= ~HTT_TCL_META_DATA_VALID_HTT;
+ 
+ 	dp_peer->hw_links[peer->hw_link_id] = link_id;
+ 
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.h
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.h
+@@ -113,6 +113,8 @@ struct ath12k_dp_link_peer {
+ 	u8 rssi_comb;
+ 	struct ewma_avg_rssi avg_rssi;
+ 	struct ath12k_dp_peer_stats peer_stats;
++
++	u16 tcl_metadata;
+ };
+ 
+ struct ath12k_dp_peer {
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp.h
+@@ -10,6 +10,7 @@
+ #include "../dp_cmn.h"
+ #include "hw.h"
+ 
++
+ struct ath12k_base;
+ struct ath12k_dp;
+ 
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -86,7 +86,7 @@ static int ath12k_wifi7_dp_prepare_htt_m
+ int ath12k_wifi7_dp_tx(struct ath12k_pdev_dp *dp_pdev,
+ 		       struct ath12k_link_vif *arvif,
+ 		       struct sk_buff *skb, bool gsn_valid, int mcbc_gsn,
+-		       bool is_mcast)
++		       bool is_mcast, struct ath12k_dp_link_peer *peer)
+ {
+ 	struct ath12k_dp *dp = dp_pdev->dp;
+ 	struct ath12k_hal *hal = dp->hal;
+@@ -98,6 +98,7 @@ int ath12k_wifi7_dp_tx(struct ath12k_pde
+ 	struct hal_tcl_data_cmd *hal_tcl_desc;
+ 	struct hal_tx_msdu_ext_desc *msg;
+ 	struct sk_buff *skb_ext_desc = NULL;
++	struct ethhdr *eth = NULL;
+ 	struct hal_srng *tcl_ring;
+ 	struct ieee80211_hdr *hdr = (void *)skb->data;
+ 	struct ath12k_vif *ahvif = arvif->ahvif;
+@@ -107,6 +108,7 @@ int ath12k_wifi7_dp_tx(struct ath12k_pde
+ 	u8 pool_id;
+ 	u8 hal_ring_id;
+ 	int ret;
++	u16 peer_id;
+ 	u8 ring_selector, ring_map = 0;
+ 	bool tcl_ring_retry;
+ 	bool msdu_ext_desc = false;
+@@ -121,6 +123,22 @@ int ath12k_wifi7_dp_tx(struct ath12k_pde
+ 	    !ieee80211_is_data(hdr->frame_control))
+ 		return -EOPNOTSUPP;
+ 
++	if (info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP)
++		eth = (struct ethhdr *)skb->data;
++
++	if (eth && is_multicast_ether_addr(eth->h_dest) && peer) {
++		ti.meta_data_flags = peer->tcl_metadata;
++		peer_id = u16_get_bits(ti.meta_data_flags, HTT_TCL_META_DATA_PEER_ID_MISSION);
++		ti.bss_ast_hash = peer->ast_hash;
++		ti.bss_ast_idx = peer_id;
++		ti.lookup_override = true;
++	} else if (ieee80211_has_a4(hdr->frame_control) &&
++	    is_multicast_ether_addr(hdr->addr3) && peer) {
++		ti.meta_data_flags = peer->tcl_metadata;
++		ti.flags0 |= FIELD_PREP(HAL_TCL_DATA_CMD_INFO2_TO_FW, 1);
++	} else {
++		ti.meta_data_flags = dp_link_vif->tcl_metadata;
++	}
+ 	pool_id = skb_get_queue_mapping(skb) & (ATH12K_HW_MAX_QUEUES - 1);
+ 
+ 	/* Let the default ring selection be based on current processor
+@@ -146,7 +164,6 @@ tcl_ring_sel:
+ 		return -ENOMEM;
+ 
+ 	ti.bank_id = dp_link_vif->bank_id;
+-	ti.meta_data_flags = dp_link_vif->tcl_metadata;
+ 
+ 	if (dp_vif->tx_encap_type == HAL_TCL_ENCAP_TYPE_RAW &&
+ 	    test_bit(ATH12K_FLAG_HW_CRYPTO_DISABLED, &ab->dev_flags)) {
+@@ -163,7 +180,7 @@ tcl_ring_sel:
+ 		msdu_ext_desc = true;
+ 	}
+ 
+-	if (gsn_valid) {
++	if (gsn_valid && !(ti.lookup_override)) {
+ 		/* Reset and Initialize meta_data_flags with Global Sequence
+ 		 * Number (GSN) info.
+ 		 */
+@@ -171,6 +188,9 @@ tcl_ring_sel:
+ 			u32_encode_bits(HTT_TCL_META_DATA_TYPE_GLOBAL_SEQ_NUM,
+ 					HTT_TCL_META_DATA_TYPE) |
+ 			u32_encode_bits(mcbc_gsn, HTT_TCL_META_DATA_GLOBAL_SEQ_NUM);
++
++		if (arvif->nawds_support)
++			ti.meta_data_flags |= u32_encode_bits(1, HTT_TCL_META_DATA_GLOBAL_SEQ_HOST_INSPECTED);
+ 	}
+ 
+ 	ti.encap_type = ath12k_dp_tx_get_encap_type(ab, skb);
+@@ -183,9 +203,13 @@ tcl_ring_sel:
+ 	ti.vdev_id = dp_link_vif->vdev_id;
+ 	if (gsn_valid)
+ 		ti.vdev_id += HTT_TX_MLO_MCAST_HOST_REINJECT_BASE_VDEV_ID;
++	else if (arvif->nawds_support && is_mcast && !ti.lookup_override)
++		ti.meta_data_flags |= u32_encode_bits(1, HTT_TCL_META_DATA_HOST_INSPECTED_MISSION);
+ 
+-	ti.bss_ast_hash = dp_link_vif->ast_hash;
+-	ti.bss_ast_idx = dp_link_vif->ast_idx;
++	if (!(ti.lookup_override)) {
++		ti.bss_ast_hash = dp_link_vif->ast_hash;
++		ti.bss_ast_idx = dp_link_vif->ast_idx;
++	}
+ 	ti.dscp_tid_tbl_idx = 0;
+ 
+ 	if (skb->ip_summed == CHECKSUM_PARTIAL &&
+@@ -265,12 +289,14 @@ map:
+ 	     !(skb_cb->flags & ATH12K_SKB_CIPHER_SET) &&
+ 	     ieee80211_has_protected(hdr->frame_control)) ||
+ 	     is_diff_encap) {
++		if (is_null && msdu_ext_desc)
++			goto skip_htt_metadata;
+ 		/* Add metadata for sw encrypted vlan group traffic */
+ 		add_htt_metadata = true;
+ 		msdu_ext_desc = true;
+ 		ti.meta_data_flags |= HTT_TCL_META_DATA_VALID_HTT;
++skip_htt_metadata:
+ 		ti.flags0 |= u32_encode_bits(1, HAL_TCL_DATA_CMD_INFO2_TO_FW);
+-		ti.meta_data_flags |= HTT_TCL_META_DATA_VALID_HTT;
+ 		ti.encap_type = HAL_TCL_ENCAP_TYPE_RAW;
+ 		ti.encrypt_type = HAL_ENCRYPT_TYPE_OPEN;
+ 	}
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.h
+@@ -11,7 +11,7 @@ void ath12k_wifi7_dp_tx_completion_handl
+ int ath12k_wifi7_dp_tx(struct ath12k_pdev_dp *dp_pdev,
+ 		       struct ath12k_link_vif *arvif,
+ 		       struct sk_buff *skb, bool gsn_valid, int mcbc_gsn,
+-		       bool is_mcast);
++		       bool is_mcast, struct ath12k_dp_link_peer *peer);
+ u32 ath12k_wifi7_dp_tx_get_vdev_bank_config(struct ath12k_base *ab,
+ 					    struct ath12k_link_vif *arvif);
+ #endif
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_tx.c
+@@ -60,7 +60,9 @@ void ath12k_wifi7_hal_tx_cmd_desc_setup(
+ 		le32_encode_bits(ti->lmac_id, HAL_TCL_DATA_CMD_INFO3_PMAC_ID) |
+ 		le32_encode_bits(ti->vdev_id, HAL_TCL_DATA_CMD_INFO3_VDEV_ID);
+ 
+-	tcl_cmd->info4 = le32_encode_bits(ti->bss_ast_idx,
++	tcl_cmd->info4 = le32_encode_bits(ti->lookup_override,
++					  HAL_TCL_DATA_CMD_INFO4_IDX_LOOKUP_OVERRIDE) |
++			 le32_encode_bits(ti->bss_ast_idx,
+ 					  HAL_TCL_DATA_CMD_INFO4_SEARCH_INDEX) |
+ 			 le32_encode_bits(ti->bss_ast_hash,
+ 					  HAL_TCL_DATA_CMD_INFO4_CACHE_SET_NUM);
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_tx.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_tx.h
+@@ -35,6 +35,7 @@ struct hal_tx_info {
+ 	u8 dscp_tid_tbl_idx;
+ 	bool enable_mesh;
+ 	int bank_id;
++	bool lookup_override;
+ };
+ 
+ /* TODO: Check if the actual desc macros can be used instead */
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -784,12 +784,14 @@ static void ath12k_wifi7_mac_op_tx(struc
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+ 	struct ieee80211_key_conf *key = info->control.hw_key;
+ 	struct ieee80211_sta *sta = control->sta;
++	struct ath12k_link_sta *arsta = NULL;
+ 	struct ath12k_link_vif *tmp_arvif;
++	struct ath12k_sta *ahsta = NULL;
+ 	u32 info_flags = info->flags;
+ 	struct sk_buff *msdu_copied;
+ 	struct ath12k *ar, *tmp_ar;
+ 	struct ath12k_pdev_dp *dp_pdev, *tmp_dp_pdev;
+-	struct ath12k_dp_link_peer *peer;
++	struct ath12k_dp_link_peer *peer = NULL;
+ 	unsigned long links_map;
+ 	bool is_mcast = false, is_eth = false;
+ 	bool is_dvlan = false;
+@@ -834,6 +836,16 @@ static void ath12k_wifi7_mac_op_tx(struc
+ 
+ 	ar = arvif->ar;
+ 	skb_cb->link_id = link_id;
++
++	if (sta) {
++		ahsta = ath12k_sta_to_ahsta(sta);
++		if (ahsta->use_4addr_set) {
++			arsta = rcu_dereference(ahsta->link[link_id]);
++			peer = arsta->peer;
++		}
++	}
++
++
+ 	/* as skb_cb is common currently for dp and mgmt tx processing
+ 	 * set this in the common mac op tx function.
+ 	 */
+@@ -877,7 +889,7 @@ static void ath12k_wifi7_mac_op_tx(struc
+ 
+ 	if (!vif->valid_links || !is_mcast || is_dvlan || is_eth ||
+ 	    test_bit(ATH12K_FLAG_RAW_MODE, &ar->ab->dev_flags)) {
+-		ret = ath12k_wifi7_dp_tx(dp_pdev, arvif, skb, false, 0, is_mcast);
++		ret = ath12k_wifi7_dp_tx(dp_pdev, arvif, skb, false, 0, is_mcast, peer);
+ 		if (unlikely(ret)) {
+ 			ath12k_warn(ar->ab, "failed to transmit frame %d\n", ret);
+ 			ieee80211_free_txskb(ar->ah->hw, skb);
+@@ -944,7 +956,7 @@ static void ath12k_wifi7_mac_op_tx(struc
+ 
+ skip_peer_find:
+ 			ret = ath12k_wifi7_dp_tx(tmp_dp_pdev, tmp_arvif,
+-						 msdu_copied, true, mcbc_gsn, is_mcast);
++						 msdu_copied, true, mcbc_gsn, is_mcast, peer);
+ 			if (unlikely(ret)) {
+ 				if (ret == -ENOMEM) {
+ 					/* Drops are expected during heavy multicast
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -355,6 +355,7 @@ struct ath12k_link_vif {
+ 	spinlock_t link_stats_lock; /* Protects updates to link_stats */
+ 	bool is_scan_vif;
+ 	u32 key_cipher;
++	bool nawds_support;
+ };
+ 
+ struct ath12k_dp_link_vif {
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -6084,6 +6084,7 @@ static void ath12k_sta_set_4addr_wk(stru
+ 		ret = ath12k_wmi_vdev_set_param_cmd(ar, arvif->vdev_id,
+                                                     WMI_VDEV_PARAM_AP_ENABLE_NAWDS,
+                                                     1);
++                arvif->nawds_support = true;
+ 	}
+ }
+ 

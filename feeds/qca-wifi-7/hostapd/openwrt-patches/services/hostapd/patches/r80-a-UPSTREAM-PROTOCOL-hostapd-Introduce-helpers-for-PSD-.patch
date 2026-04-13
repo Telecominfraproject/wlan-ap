@@ -1,0 +1,306 @@
+From 2c4d2a83da7c0b34bb90b16a77a82e2e54a50d4f Mon Sep 17 00:00:00 2001
+From: Priyadarshnee Srinivasan <priys@qti.qualcomm.com>
+Date: Fri, 27 Jun 2025 16:03:53 +0530
+Subject: [PATCH 1/4] UPSTREAM:PROTOCOL: hostapd: Introduce helpers for PSD
+ limit and non-puncture regulatory mask calculation
+
+Add initial support for calculating minimum Power Spectral Density (PSD)
+limits and regulatory masks for non-punctured channels in the 6 GHz band.
+
+Introduce get_psd_limit(), a helper function that iterates through the
+Automated Frequency Coordination (AFC) frequency object list to determine
+the minimum PSD limit applicable to a given frequency. Ensure the most
+restrictive PSD value is selected when multiple overlapping frequency
+ranges are present.
+
+Add get_y_val(), a utility function that performs linear interpolation
+between two points. Use this to compute intermediate dB reduction values
+for shaping regulatory masks with smooth transitions.
+
+Add get_regmask_non_puncture(), which calculates the regulatory mask for
+non-punctured channels based on the offset from the center frequency and
+the channel bandwidth. Apply predefined attenuation thresholds and
+slope-based reductions to determine the mask value.
+
+Define the following constants and macros to support PSD and regulatory
+mask logic:
+- INVALID_EDGE, INVALID_DBR, INVALID_PSD: sentinel values for error
+  handling
+- DEFAULT_LOW_6GFREQ and DEFAULT_HIGH_6GFREQ: define the 6 GHz band range
+- MAX_PUNC_MASK_LIMITS: maximum number of offset/dB reduction pairs per
+  mask
+- PUNCTURE_* macros: define valid puncture bitmaps for 40/80/160/320 MHz
+  bandwidths
+
+Introduce struct punct_mask, which holds up to three offset and dB
+reduction (dbr) pairs used to define the shape of a regulatory mask for a
+punctured region.
+
+Add enum puncture_type to classify puncture configurations:
+- PUNCTURE_TYPE_EDGE: edge-only puncture
+- PUNCTURE_TYPE_INTERIM_20_PLUS: interim puncture wider than 20 MHz
+- PUNCTURE_TYPE_INTERIM_20: exactly 20 MHz interim puncture
+- PUNCTURE_TYPE_INVALID: fallback for unrecognized patterns
+
+Define static dB reduction profiles for each puncture type:
+- pdbm1[] for edge puncture shaping
+- pdbm2[] for interim 20+ MHz shaping
+- pdbm3[] for interim 20 MHz shaping
+
+Use these helpers and definitions in subsequent patches to implement full
+PSD enforcement logic that accounts for puncture masks and ensures
+compliance with Out-of-Band Emission (OOBE) constraints.
+
+Fixes: None
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+n00-001-hostapd-add-support-for-6GHz-operation.patch
+r32-001-hostapd-Add-support-to-receive-AFC-power-update-comp.patch
+
+Signed-off-by: Vignesh U <uvignesh@qti.qualcomm.com>
+---
+ src/ap/ieee802_11.c | 104 +++++++++++++++++++++++++++++++++++++++++
+ src/ap/ieee802_11.h | 110 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 214 insertions(+)
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index f89c0ae..2b22f34 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -8371,6 +8371,110 @@ static s8 get_psd_for_chan_idx(struct hostapd_data *hapd,
+ 	return chan_psd;
+ }
+ 
++/**
++ * get_psd_limit - Get the minimum PSD limit for a given frequency
++ * @freq: Frequency for which the PSD limit is to be determined
++ * @num_freq_obj: Number of frequency objects in the AFC response
++ * @afc_freq_info: Pointer to the array of AFC frequency objects
++ *
++ * This function calculates the minimum PSD (Power Spectral Density) limit for
++ * a given frequency by iterating through the AFC frequency objects. It returns
++ * the minimum PSD limit found within the range of the frequency objects.
++ *
++ * Return: Minimum PSD limit for the given frequency, or INVALID_PSD if the
++ * frequency is not found within the AFC frequency objects.
++ */
++s16 get_psd_limit(u16 freq, u8 num_freq_obj, struct afc_freq_obj *afc_freq_info)
++{
++	u8 i;
++	s16 min_psd = CHAN_MAX_PSD_POWER * EIRP_PWR_SCALE;
++	bool chan_freq_found = false;
++
++	for (i = 0; i < num_freq_obj; i++) {
++		if (freq >= afc_freq_info[i].low_freq &&
++		    freq <= afc_freq_info[i].high_freq) {
++			chan_freq_found = true;
++			if (afc_freq_info[i].max_psd < min_psd)
++				min_psd = afc_freq_info[i].max_psd;
++
++			/* Even though the frequency object is found, there may
++			 * be more matching frequency-object following it.
++			 * Continue search until the input frequency is out of
++			 * range.
++			 */
++			continue;
++		}
++
++		/* Assuming AFC payload is sorted in increasing order of
++		 * frequencies, stop and return here
++		 */
++		if (chan_freq_found)
++			return min_psd;
++	}
++
++	/* Handle for last frequency object */
++	if (chan_freq_found)
++		return min_psd;
++
++	return INVALID_PSD;
++}
++
++/**
++ * get_y_val - Calculate the interpolated y-value for a given x-value
++ * @x1: First x-coordinate
++ * @x2: Second x-coordinate
++ * @y1: y-coordinate corresponding to x1
++ * @y2: y-coordinate corresponding to x2
++ * @x: x-coordinate for which the interpolated y-value is to be calculated
++ *
++ * This function calculates the interpolated y-value for a given x-value using
++ * linear interpolation between two points (x1, y1) and (x2, y2). The function
++ * returns the interpolated y-value based on the input x-coordinate.
++ *
++ * Return: The interpolated y-value for the given x-coordinate.
++ */
++s16 get_y_val(s16 x1, s16 x2, s16 y1, s16 y2, s16 x)
++{
++	s16 den = x2 - x1;
++
++	if (!den)
++		return INVALID_DBR;
++
++	return y1 + ((x - x1) * (y2 - y1)) / (x2 - x1);
++}
++
++/**
++ * get_regmask_non_puncture - Calculate the regulatory mask for non-punctured
++ * channels.
++ * @offset: Offset value for the frequency
++ * @bw: Bandwidth of the channel
++ *
++ * This function calculates the regulatory mask for non-punctured channels based
++ * on the given offset and bandwidth. The mask value is determined by the offset
++ * relative to the bandwidth and predefined thresholds.
++ *
++ * Return: The calculated regulatory mask value.
++ */
++s16 get_regmask_non_puncture(s16 offset, u16 bw)
++{
++	u16 hbw = bw >> 1;
++	s16 mask;
++
++	if (offset < 0)
++		offset = 0 - offset;
++
++	if (offset >= ((bw * 3) / 2))
++		mask = -400;
++	else if (offset >= bw)
++		mask = -280 - ((120 * (offset - bw)) / hbw);
++	else if (offset >= (hbw + 1))
++		mask = -200 - ((80 * (offset - (hbw + 1))) / (hbw - 1));
++	else
++		mask = 0;
++
++	return mask;
++}
++
+ static int get_psd_values(struct hostapd_data *hapd, int non_11be_start_idx,
+ 			  int chan_start_idx, int non_11be_chan_count,
+ 			  int total_chan_count, u8 *tx_pwr_count,
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index 8b7ce3f..fd61240 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -286,6 +286,116 @@ u8 * hostapd_eid_mbssid(struct hostapd_data *hapd, u8 *eid, u8 *end,
+ 			const u8 *known_bss, size_t known_bss_len, u8 *rnr_eid,
+ 			u8 *rnr_count, u8 **rnr_offset, size_t rnr_len,
+ 			u32 *elemid_modified_bmap);
++#define INVALID_EDGE 0xFFF
++#define INVALID_DBR    100
++#define INVALID_PSD (-1270) /* -127 multiplied by 10 */
++
++/* Have the entire 6Ghz band as single range */
++#define DEFAULT_LOW_6GFREQ     5925
++#define DEFAULT_HIGH_6GFREQ    7125
++#define MAX_PUNC_MASK_LIMITS      3
++
++/* in the bitmap 0 indicates no puncturing and 1 indicated that sub channel is
++ * punctured
++ */
++#define PUNCTURE_INVALID     0xFFFF
++#define PUNCTURE_NONE        0x0000
++#define PUNCTURE_80MHZ_MASK  0x000F
++#define PUNCTURE_160MHZ_MASK 0x00FF
++#define PUNCTURE_320MHZ_MASK 0xFFFF
++#define PUNCTURE_40MHZ_MASK  0x0003
++
++/**
++ * struct punct_mask - Structure to hold puncture mask limits
++ * @offset: Array of offsets for puncture mask limits
++ * @dbr: Array of dbr values corresponding to the offsets
++ *
++ * This structure is used to define the puncture mask limits for different
++ * bandwidths. The `offset` array holds the offset values, and the `dbr` array
++ * holds the corresponding dbr values. The size of both arrays is defined by
++ * `MAX_PUNC_MASK_LIMITS`.
++ */
++struct punct_mask {
++	s16 offset[MAX_PUNC_MASK_LIMITS];
++	s16 dbr[MAX_PUNC_MASK_LIMITS];
++};
++
++/**
++ * enum puncture_type - Enumeration of puncture types
++ * @PUNCTURE_TYPE_EDGE: Represents edge puncture type
++ * @PUNCTURE_TYPE_INTERIM_20_PLUS: Represents interim puncture type with 20 MHz
++ * plus
++ * @PUNCTURE_TYPE_INTERIM_20: Represents interim puncture type with 20 MHz
++ * @PUNCTURE_TYPE_INVALID: Represents an invalid puncture type
++ *
++ * This enumeration defines the different types of punctures that can occur
++ * within a given bandwidth. Each type specifies a unique puncture pattern
++ * and is used to determine the appropriate mask limits for the puncture.
++ */
++enum puncture_type {
++	PUNCTURE_TYPE_EDGE = 0,
++	PUNCTURE_TYPE_INTERIM_20_PLUS,
++	PUNCTURE_TYPE_INTERIM_20,
++	PUNCTURE_TYPE_INVALID,
++};
++
++/**
++ * pdbm1, pdbm2 and pdbm3 - Array of dbr values for puncture mask type
++ * PUNCTURE_TYPE_EDGE, PUNCTURE_TYPE_INTERIM_20_PLUS and
++ * PUNCTURE_TYPE_INTERIM_20 respectively.
++ */
++static const s16 pdbm1[3] = {0, -200, -280};
++static const s16 pdbm2[3] = {0, -200, -250};
++static const s16 pdbm3[3] = {0, -200, -230};
++
++#define CHAN_MAX_PSD_POWER   127
++
++/**
++ * get_psd_limit - Get the minimum PSD limit for a given frequency
++ * @freq: Frequency for which the PSD limit is to be determined
++ * @num_freq_obj: Number of frequency objects in the AFC response
++ * @afc_freq_info: Pointer to the array of AFC frequency objects
++ *
++ * This function calculates the minimum PSD (Power Spectral Density) limit for
++ * a given frequency by iterating through the AFC frequency objects. It returns
++ * the minimum PSD limit found within the range of the frequency objects.
++ *
++ * Return: Minimum PSD limit for the given frequency, or INVALID_PSD if the
++ * frequency is not found within the AFC frequency objects.
++ */
++s16 get_psd_limit(u16 freq, u8 num_freq_obj,
++		  struct afc_freq_obj *afc_freq_info);
++
++/**
++ * get_y_val - Calculate the interpolated y-value for a given x-value
++ * @x1: First x-coordinate
++ * @x2: Second x-coordinate
++ * @y1: y-coordinate corresponding to x1
++ * @y2: y-coordinate corresponding to x2
++ * @x: x-coordinate for which the interpolated y-value is to be calculated
++ *
++ * This function calculates the interpolated y-value for a given x-value using
++ * linear interpolation between two points (x1, y1) and (x2, y2). The function
++ * returns the interpolated y-value based on the input x-coordinate.
++ *
++ * Return: The interpolated y-value for the given x-coordinate.
++ */
++s16 get_y_val(s16 x1, s16 x2, s16 y1, s16 y2, s16 x);
++
++/**
++ * get_regmask_non_puncture - Calculate the regulatory mask for non-punctured
++ * channels.
++ * @offset: Offset value for the frequency
++ * @bw: Bandwidth of the channel
++ *
++ * This function calculates the regulatory mask for non-punctured channels based
++ * on the given offset and bandwidth. The mask value is determined by the offset
++ * relative to the bandwidth and predefined thresholds.
++ *
++ * Return: The calculated regulatory mask value.
++ */
++s16 get_regmask_non_puncture(s16 offset, u16 bw);
++
+ u16 hostapd_critical_update_capab(struct hostapd_data *hapd);
+ bool hostapd_is_mld_ap(struct hostapd_data *hapd);
+ void hostapd_eid_update_cu_info(struct hostapd_data *hapd, u16 *elemid_modified,
+-- 
+2.34.1
+

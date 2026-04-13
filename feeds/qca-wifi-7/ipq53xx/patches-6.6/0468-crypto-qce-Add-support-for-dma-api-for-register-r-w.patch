@@ -1,0 +1,362 @@
+From fa097e45ccec7679417761456b242a1b866c48be Mon Sep 17 00:00:00 2001
+From: Md Sadre Alam <quic_mdalam@quicinc.com>
+Date: Wed, 1 Nov 2023 15:38:10 +0530
+Subject: [PATCH 473/500] crypto: qce - Add support for dma api for register
+ r/w
+
+Add support for dma api for register read/write. These
+all api will be used while using command descriptor for
+crypto register read/write.
+
+Change-Id: I47aef4e550fbed6f69ec3cd20670a47e94cd3c11
+Signed-off-by: Md Sadre Alam <quic_mdalam@quicinc.com>
+---
+ drivers/crypto/qce/core.h |  12 ++
+ drivers/crypto/qce/dma.c  | 226 ++++++++++++++++++++++++++++++++++++++
+ drivers/crypto/qce/dma.h  |  25 +++++
+ 3 files changed, 263 insertions(+)
+
+diff --git a/drivers/crypto/qce/core.h b/drivers/crypto/qce/core.h
+index 6f32da33a187..622c7d61bb36 100644
+--- a/drivers/crypto/qce/core.h
++++ b/drivers/crypto/qce/core.h
+@@ -97,6 +97,8 @@ struct qce_device {
+ 	struct kobject kobj;
+ 	struct kobject *kobj_parent;
+ 	dma_addr_t base_dma;
++	__le32 *reg_read_buf;
++	dma_addr_t reg_read_buf_phys;
+ 	bool qce_cmd_desc_enable;
+ };
+ 
+@@ -114,4 +116,14 @@ struct qce_algo_ops {
+ 	int (*async_req_handle)(struct crypto_async_request *async_req);
+ };
+ 
++int qce_write_reg_dma(struct qce_device *qce, unsigned int offset, u32 val,
++			int cnt);
++
++int qce_read_reg_dma(struct qce_device *qce, unsigned int offset, void *buff,
++			int cnt);
++
++void qce_clear_bam_transaction(struct qce_device *qce);
++
++int qce_submit_cmd_desc(struct qce_device *qce, unsigned long flags);
++
+ #endif /* _CORE_H_ */
+diff --git a/drivers/crypto/qce/dma.c b/drivers/crypto/qce/dma.c
+index 46db5bf366b4..c8ebae9e52e9 100644
+--- a/drivers/crypto/qce/dma.c
++++ b/drivers/crypto/qce/dma.c
+@@ -7,9 +7,209 @@
+ #include <crypto/scatterwalk.h>
+ 
+ #include "dma.h"
++#include "core.h"
++
++#define QCE_REG_BUF_DMA_ADDR(qce, vaddr) \
++	((qce)->reg_read_buf_phys + \
++	 ((uint8_t *)(vaddr) - (uint8_t *)(qce)->reg_read_buf))
++
++void qce_clear_bam_transaction(struct qce_device *qce)
++{
++	struct qce_bam_transaction *qce_bam_txn = qce->dma.qce_bam_txn;
++	qce_bam_txn->qce_bam_ce_index = 0;
++	qce_bam_txn->qce_write_sgl_cnt = 0;
++	qce_bam_txn->qce_read_sgl_cnt = 0;
++	qce_bam_txn->qce_bam_ce_index = 0;
++	qce_bam_txn->qce_pre_bam_ce_index = 0;
++}
++
++static int qce_dma_prep_cmd_sg(struct qce_device *qce, struct dma_chan *chan,
++				struct scatterlist *qce_bam_sgl,
++				int qce_sgl_cnt, unsigned long flags,
++				enum dma_transfer_direction dir,
++				dma_async_tx_callback cb, void *cb_param)
++{
++	struct dma_async_tx_descriptor *dma_desc;
++	dma_cookie_t cookie;
++	struct qce_desc_info *desc;
++
++	desc = qce->dma.qce_bam_txn->qce_desc;
++
++	if (!qce_bam_sgl || !qce_sgl_cnt)
++		return -EINVAL;
++
++	if (!dma_map_sg(qce->dev, qce_bam_sgl,
++				qce_sgl_cnt, dir)) {
++		dev_err(qce->dev, "failure in mapping sgl for cmd desc\n");
++		return -ENOMEM;
++	}
++
++	dma_desc = dmaengine_prep_slave_sg(chan, qce_bam_sgl, qce_sgl_cnt,
++						dir, flags);
++	if (!dma_desc) {
++		pr_err("%s:failure in prep cmd desc\n",__func__);
++		dma_unmap_sg(qce->dev, qce_bam_sgl, qce_sgl_cnt, dir);
++		kfree(desc);
++		return -EINVAL;
++	}
++
++	desc->dma_desc = dma_desc;
++	desc->dma_desc->callback = cb;
++	desc->dma_desc->callback_param = cb_param;
++
++	cookie = dmaengine_submit(desc->dma_desc);
++
++	return dma_submit_error(cookie);
++}
++
++int qce_submit_cmd_desc(struct qce_device *qce, unsigned long flags)
++{
++	struct qce_bam_transaction *qce_bam_txn = qce->dma.qce_bam_txn;
++	struct dma_chan *chan = qce->dma.rxchan;
++	unsigned long desc_flags;
++	int ret = 0;
++
++	if(flags & QCE_DMA_DESC_FLAG_LOCK)
++		desc_flags = DMA_PREP_CMD | DMA_PREP_LOCK;
++	else if (flags & QCE_DMA_DESC_FLAG_UNLOCK)
++		desc_flags = DMA_PREP_CMD | DMA_PREP_UNLOCK;
++	else
++		desc_flags = DMA_PREP_CMD;
++
++	/* For command descriptor always use consumer pipe
++	 * it recomended as per HPG
++	 */
++
++	if (qce_bam_txn->qce_read_sgl_cnt) {
++		ret = qce_dma_prep_cmd_sg(qce, chan,
++					qce_bam_txn->qce_reg_read_sgl,
++					qce_bam_txn->qce_read_sgl_cnt,
++					desc_flags, DMA_DEV_TO_MEM,
++					NULL, NULL);
++	}
++
++	if (qce_bam_txn->qce_write_sgl_cnt) {
++		ret = qce_dma_prep_cmd_sg(qce, chan,
++					qce_bam_txn->qce_reg_write_sgl,
++					qce_bam_txn->qce_write_sgl_cnt,
++					desc_flags, DMA_MEM_TO_DEV,
++					NULL, NULL);
++	}
++
++	if (ret) {
++		pr_err("%s: Error while submiting cmd desc\n",__func__);
++		return ret;
++	}
++
++	qce_dma_issue_pending(&qce->dma);
++
++	return ret;
++}
++
++static void qce_prep_dma_command_desc(struct qce_device *qce,
++		struct qce_dma_data *dma, bool read, unsigned int addr,
++		void *buff, int size)
++{
++	int qce_bam_ce_size, cnt, index;
++	struct bam_cmd_element *qce_bam_ce_buffer;
++	struct qce_bam_transaction *qce_bam_txn = dma->qce_bam_txn;
++
++	index = qce_bam_txn->qce_bam_ce_index;
++	qce_bam_ce_buffer = &qce_bam_txn->qce_bam_ce[index];
++	if (read)
++		bam_prep_ce(qce_bam_ce_buffer, addr, BAM_READ_COMMAND,
++				QCE_REG_BUF_DMA_ADDR(qce,
++					(unsigned int *)buff));
++	else
++		bam_prep_ce_le32(qce_bam_ce_buffer, addr, BAM_WRITE_COMMAND,
++				 *((__le32 *)buff));
++
++	if (read) {
++		cnt = qce_bam_txn->qce_read_sgl_cnt;
++		qce_bam_ce_buffer = &qce_bam_txn->qce_bam_ce
++			[qce_bam_txn->qce_pre_bam_ce_index];
++		qce_bam_txn->qce_bam_ce_index += size;
++		qce_bam_ce_size = (qce_bam_txn->qce_bam_ce_index -
++				qce_bam_txn->qce_pre_bam_ce_index) *
++			sizeof(struct bam_cmd_element);
++
++		sg_set_buf(&qce_bam_txn->qce_reg_read_sgl[cnt],
++				qce_bam_ce_buffer,
++				qce_bam_ce_size);
++
++		++qce_bam_txn->qce_read_sgl_cnt;
++		qce_bam_txn->qce_pre_bam_ce_index =
++					qce_bam_txn->qce_bam_ce_index;
++	} else {
++		cnt = qce_bam_txn->qce_write_sgl_cnt;
++		qce_bam_ce_buffer = &qce_bam_txn->qce_bam_ce
++			[qce_bam_txn->qce_pre_bam_ce_index];
++		qce_bam_txn->qce_bam_ce_index += size;
++		qce_bam_ce_size = (qce_bam_txn->qce_bam_ce_index -
++				qce_bam_txn->qce_pre_bam_ce_index) *
++			sizeof(struct bam_cmd_element);
++
++		sg_set_buf(&qce_bam_txn->qce_reg_write_sgl[cnt],
++				qce_bam_ce_buffer,
++				qce_bam_ce_size);
++
++		++qce_bam_txn->qce_write_sgl_cnt;
++		qce_bam_txn->qce_pre_bam_ce_index =
++					qce_bam_txn->qce_bam_ce_index;
++	}
++}
++
++int qce_write_reg_dma(struct qce_device *qce,
++		unsigned int offset, u32 val, int cnt)
++{
++	void *buff = &val;
++	unsigned int reg_addr = ((unsigned int)(qce->base_dma) + offset);
++
++	qce_prep_dma_command_desc(qce, &qce->dma, false, reg_addr, buff, cnt);
++
++	return 0;
++}
++
++int qce_read_reg_dma(struct qce_device *qce,
++		unsigned int offset, void *buff, int cnt)
++{
++	unsigned int reg_addr = ((unsigned int)(qce->base_dma) + offset);
++	void *vaddr = qce->reg_read_buf;
++
++	qce_prep_dma_command_desc(qce, &qce->dma, true, reg_addr, vaddr, cnt);
++
++	memcpy(buff, vaddr, 4);
++
++	return 0;
++}
++
++struct qce_bam_transaction *qce_alloc_bam_txn(struct qce_dma_data *dma)
++{
++	struct qce_bam_transaction *qce_bam_txn;
++
++	dma->qce_bam_txn = kmalloc(sizeof(*qce_bam_txn), GFP_KERNEL);
++	if (!dma->qce_bam_txn)
++		return NULL;
++
++	dma->qce_bam_txn->qce_desc = kzalloc(sizeof(struct qce_desc_info),
++						GFP_KERNEL);
++	if (!dma->qce_bam_txn->qce_desc)
++		return NULL;
++
++	sg_init_table(dma->qce_bam_txn->qce_reg_write_sgl,
++			QCE_BAM_CMD_SGL_SIZE);
++
++	sg_init_table(dma->qce_bam_txn->qce_reg_read_sgl,
++			QCE_BAM_CMD_SGL_SIZE);
++
++	qce_bam_txn = dma->qce_bam_txn;
++
++	return qce_bam_txn;
++}
+ 
+ int qce_dma_request(struct device *dev, struct qce_dma_data *dma)
+ {
++	struct qce_device *qce = container_of(dma, struct qce_device, dma);
+ 	int ret;
+ 
+ 	dma->txchan = dma_request_chan(dev, "tx");
+@@ -31,6 +231,23 @@ int qce_dma_request(struct device *dev, struct qce_dma_data *dma)
+ 
+ 	dma->ignore_buf = dma->result_buf + QCE_RESULT_BUF_SZ;
+ 
++	if (qce->qce_cmd_desc_enable) {
++		dma->qce_bam_txn = qce_alloc_bam_txn(dma);
++		if (!dma->qce_bam_txn) {
++			pr_err("Failed to allocate bam transaction\n");
++			return -ENOMEM;
++		}
++
++		qce->reg_read_buf = dmam_alloc_coherent(qce->dev,
++					QCE_MAX_REG_READ *
++					sizeof(*qce->reg_read_buf),
++					&qce->reg_read_buf_phys, GFP_KERNEL);
++		if (!qce->reg_read_buf) {
++			pr_err("Failed to allocate reg_read_buf\n");
++			return -ENOMEM;
++		}
++	}
++
+ 	return 0;
+ error_nomem:
+ 	dma_release_channel(dma->rxchan);
+@@ -44,6 +261,15 @@ void qce_dma_release(struct qce_dma_data *dma)
+ 	dma_release_channel(dma->txchan);
+ 	dma_release_channel(dma->rxchan);
+ 	kfree(dma->result_buf);
++	if (qce->qce_cmd_desc_enable) {
++		if (qce->reg_read_buf)
++			dmam_free_coherent(qce->dev, QCE_MAX_REG_READ *
++				sizeof(*qce->reg_read_buf),
++				qce->reg_read_buf,
++				qce->reg_read_buf_phys);
++			kfree(dma->qce_bam_txn->qce_desc);
++			kfree(dma->qce_bam_txn);
++	}
+ }
+ 
+ struct scatterlist *
+diff --git a/drivers/crypto/qce/dma.h b/drivers/crypto/qce/dma.h
+index 786402169360..98b14c600034 100644
+--- a/drivers/crypto/qce/dma.h
++++ b/drivers/crypto/qce/dma.h
+@@ -7,6 +7,7 @@
+ #define _DMA_H_
+ 
+ #include <linux/dmaengine.h>
++#include <linux/dma/qcom_bam_dma.h>
+ 
+ /* maximum data transfer block size between BAM and CE */
+ #define QCE_BAM_BURST_SIZE		64
+@@ -14,6 +15,12 @@
+ #define QCE_AUTHIV_REGS_CNT		16
+ #define QCE_AUTH_BYTECOUNT_REGS_CNT	4
+ #define QCE_CNTRIV_REGS_CNT		4
++#define QCE_BAM_CMD_SGL_SIZE		100
++#define QCE_BAM_CMD_ELEMENT_SIZE	100
++#define QCE_DMA_DESC_FLAG_BAM_NWD	(0x0004)
++#define QCE_DMA_DESC_FLAG_LOCK		(0x0002)
++#define QCE_DMA_DESC_FLAG_UNLOCK	(0x0001)
++#define QCE_MAX_REG_READ		8
+ 
+ struct qce_result_dump {
+ 	u32 auth_iv[QCE_AUTHIV_REGS_CNT];
+@@ -31,15 +38,33 @@ struct qce_dma_data {
+ 	struct dma_chan *txchan;
+ 	struct dma_chan *rxchan;
+ 	struct qce_result_dump *result_buf;
++	struct qce_bam_transaction *qce_bam_txn;
+ 	void *ignore_buf;
+ };
+ 
++struct qce_desc_info {
++	struct dma_async_tx_descriptor *dma_desc;
++	enum dma_data_direction dir;
++};
++
++struct qce_bam_transaction {
++	struct bam_cmd_element qce_bam_ce[QCE_BAM_CMD_ELEMENT_SIZE];
++	struct scatterlist qce_reg_write_sgl[QCE_BAM_CMD_SGL_SIZE];
++	struct scatterlist qce_reg_read_sgl[QCE_BAM_CMD_SGL_SIZE];
++	struct qce_desc_info *qce_desc;
++	uint32_t qce_bam_ce_index;
++	uint32_t qce_pre_bam_ce_index;
++	uint32_t qce_write_sgl_cnt;
++	uint32_t qce_read_sgl_cnt;
++};
++
+ int qce_dma_request(struct device *dev, struct qce_dma_data *dma);
+ void qce_dma_release(struct qce_dma_data *dma);
+ int qce_dma_prep_sgs(struct qce_dma_data *dma, struct scatterlist *sg_in,
+ 		     int in_ents, struct scatterlist *sg_out, int out_ents,
+ 		     dma_async_tx_callback cb, void *cb_param);
+ void qce_dma_issue_pending(struct qce_dma_data *dma);
++void qce_dma_issue_cmd_desc_pending(struct qce_dma_data *dma, bool read);
+ int qce_dma_terminate_all(struct qce_dma_data *dma);
+ struct scatterlist *
+ qce_sgtable_add(struct sg_table *sgt, struct scatterlist *sg_add,
+-- 
+2.34.1
+

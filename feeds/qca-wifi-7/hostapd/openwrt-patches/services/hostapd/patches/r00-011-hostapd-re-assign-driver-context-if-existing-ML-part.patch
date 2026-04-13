@@ -1,0 +1,169 @@
+From b4bd16074a9655c0b40e462325c6946c0c3f99c4 Mon Sep 17 00:00:00 2001
+From: Aditya Kumar Singh <quic_adisi@quicinc.com>
+Date: Fri, 20 Oct 2023 15:39:32 +0530
+Subject: [PATCH] hostapd: re-assign driver context if existing ML partner is
+ found
+
+Currently multiple driver contexts were maintained for a single interface
+in certain co-hosted situations. For instance - 5 GHz SLO and 5 GHz +
+6 GHz MLD. In this case, if 6 GHz config is passed first then driver would
+be created. And when 5 GHz config is parsed, since bss[0] is SLO, there
+won't be any partner and hence again driver would be created. This makes
+5 GHz interface to have two different drivers. During de-initialization,
+proper deinitialization will not happen and a few times seg fault could
+be seen.
+
+Hence to avoid this situation, try to maintain single driver if possible.
+
+Signed-off-by: Aditya Kumar Singh <quic_adisi@quicinc.com>
+---
+ src/ap/ap_drv_ops.h          |  9 +++++
+ src/ap/hostapd.c             |  1 +
+ src/drivers/driver.h         | 10 +++++
+ src/drivers/driver_nl80211.c | 71 ++++++++++++++++++++++++++++++++++++
+ 4 files changed, 91 insertions(+)
+
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -3089,10 +3089,12 @@ wpa_driver_nl80211_finish_drv_init(struc
+ 	if (!bss->if_dynamic && nl80211_get_ifmode(bss) == NL80211_IFTYPE_AP)
+ 		bss->static_ap = 1;
+ 
+-	if (first &&
+-	    nl80211_get_ifmode(bss) != NL80211_IFTYPE_P2P_DEVICE &&
+-	    linux_iface_up(drv->global->ioctl_sock, bss->ifname) > 0)
+-		drv->start_iface_up = 1;
++	if (nl80211_get_ifmode(bss) != NL80211_IFTYPE_P2P_DEVICE &&
++	    linux_iface_up(drv->global->ioctl_sock, bss->ifname) > 0) {
++		if (first)
++			drv->start_iface_up = 1;
++		bss->start_iface_up = 1;
++	}
+ 
+ 	if (wpa_driver_nl80211_capa(drv))
+ 		return -1;
+@@ -3109,8 +3111,11 @@ wpa_driver_nl80211_finish_drv_init(struc
+ 				set_addr)))
+ 		return -1;
+ 
+-	if (first && nl80211_get_ifmode(bss) == NL80211_IFTYPE_STATION)
+-		drv->start_mode_sta = 1;
++	if (nl80211_get_ifmode(bss) == NL80211_IFTYPE_STATION) {
++		if (first)
++			drv->start_mode_sta = 1;
++		bss->start_mode_sta = 1;
++	}
+ 
+ 	if (drv->hostapd || bss->static_ap)
+ 		nlmode = NL80211_IFTYPE_AP;
+@@ -9184,6 +9189,7 @@ static int wpa_driver_nl80211_if_remove(
+ {
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+ 	int ifindex = if_nametoindex(ifname);
++	enum nl80211_iftype nlmode;
+ 
+ 	wpa_printf(MSG_DEBUG, "nl80211: %s(type=%d ifname=%s) ifindex=%d added_if=%d",
+ 		   __func__, type, ifname, ifindex, bss->added_if);
+@@ -9222,12 +9228,20 @@ static int wpa_driver_nl80211_if_remove(
+ 		for (tbss = drv->first_bss; tbss; tbss = tbss->next) {
+ 			if (tbss->next == bss) {
+ 				tbss->next = bss->next;
+-				/* Unsubscribe management frames */
+-				nl80211_teardown_ap(bss);
++				bss->in_deinit = 1;
+ 				nl80211_remove_links(bss);
+-				nl80211_destroy_bss(bss);
++				nlmode = drv->nlmode;
+ 				if (!bss->added_if)
+ 					i802_set_iface_flags(bss, 0);
++				if (drv->nlmode != NL80211_IFTYPE_P2P_DEVICE &&
++				    bss->start_mode_sta)
++					wpa_driver_nl80211_set_mode(bss,
++								    NL80211_IFTYPE_STATION);
++				else
++					/* Unsubscribe management frames */
++					nl80211_teardown_ap(bss);
++				nl80211_destroy_bss(bss);
++				drv->nlmode = nlmode;
+ 				os_free(bss);
+ 				bss = NULL;
+ 				break;
+@@ -9238,16 +9252,30 @@ static int wpa_driver_nl80211_if_remove(
+ 				   "BSS %p in the list", __func__, bss);
+ 	} else {
+ 		wpa_printf(MSG_DEBUG, "nl80211: First BSS - reassign context");
+-		nl80211_teardown_ap(bss);
++		bss->in_deinit = 1;
+ 		nl80211_remove_links(bss);
+-		nl80211_destroy_bss(bss);
+-		if (!bss->added_if)
++		nlmode = drv->nlmode;
++		if (!bss->start_iface_up)
+ 			i802_set_iface_flags(bss, 0);
++		if (drv->nlmode != NL80211_IFTYPE_P2P_DEVICE &&
++		    bss->start_mode_sta)
++			wpa_driver_nl80211_set_mode(bss,
++						    NL80211_IFTYPE_STATION);
++		else
++			nl80211_teardown_ap(bss);
++		nl80211_destroy_bss(bss);
++		drv->nlmode = nlmode;
++
++		wpa_printf(MSG_DEBUG, "nl80211: First BSS - reassign context");
++
+ 		if (drv->first_bss->next) {
+ 			drv->first_bss = drv->first_bss->next;
+ 			drv->ctx = drv->first_bss->ctx;
+ 			drv->ifindex = drv->first_bss->ifindex;
++			drv->start_iface_up = drv->first_bss->start_iface_up;
++			drv->start_mode_sta = drv->first_bss->start_mode_sta;
+ 			os_free(bss);
++			bss = NULL;
+ 		} else {
+ 			wpa_printf(MSG_DEBUG, "nl80211: No second BSS to reassign context to");
+ 		}
+@@ -14866,6 +14894,14 @@ static bool wpa_driver_nl80211_can_share
+ 	wpa_printf(MSG_DEBUG, "nl80211: Driver for phy %s already exist",
+ 		   match_drv->phyname);
+ 
++	/* store the original state and mode */
++	if (nl80211_get_ifmode(bss) != NL80211_IFTYPE_P2P_DEVICE &&
++	    linux_iface_up(match_drv->global->ioctl_sock, bss->ifname) > 0)
++		bss->start_iface_up = 1;
++
++	if (nl80211_get_ifmode(bss) == NL80211_IFTYPE_STATION)
++		bss->start_mode_sta = 1;
++
+ 	*hapd = match_drv->first_bss->ctx;
+ 	ret = true;
+ 
+@@ -14932,7 +14968,6 @@ wpa_driver_get_multi_hw_info(void *priv,
+ 	return nl80211_get_multi_hw_info(bss, num_multi_hws);
+ }
+ 
+-
+ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.name = "nl80211",
+ 	.desc = "Linux nl80211/cfg80211",
+--- a/src/drivers/driver_nl80211.h
++++ b/src/drivers/driver_nl80211.h
+@@ -81,6 +81,8 @@ struct i802_bss {
+ 	unsigned int wdev_id_set:1;
+ 	unsigned int added_if:1;
+ 	unsigned int static_ap:1;
++	unsigned int start_iface_up:1;
++	unsigned int start_mode_sta:1;
+ 
+ 	u8 addr[ETH_ALEN];
+ 	u8 prev_addr[ETH_ALEN];
+--- a/hostapd/main.c
++++ b/hostapd/main.c
+@@ -279,7 +279,7 @@ static int hostapd_driver_init(struct ho
+ 				   &hapd->drv_priv, force_ifname, if_addr,
+ 				   params.num_bridge && params.bridge[0] ?
+ 				   params.bridge[0] : NULL,
+-				   0)) {
++				   1)) {
+ 			wpa_printf(MSG_ERROR, "Failed to add BSS (BSSID="
+ 				   MACSTR ")", MAC2STR(hapd->own_addr));
+ 			os_free(params.bridge);

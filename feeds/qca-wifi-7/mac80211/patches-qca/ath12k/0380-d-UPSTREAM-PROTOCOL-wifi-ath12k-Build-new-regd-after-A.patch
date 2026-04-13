@@ -1,0 +1,478 @@
+From 272ffe35b30086f0ef91f32cc80e4f20f8b462c6 Mon Sep 17 00:00:00 2001
+From: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+Date: Mon, 9 Jun 2025 12:07:34 +0530
+Subject: [PATCH 4/5] UPSTREAM:PROTOCOL:wifi:ath12k: Build new regd after AFC
+ payload
+
+Create a new regd for updation to the kernel wiphy after processing
+the AFC payload. Copy the 2.4 GHz and 5GHz regulatory rules and
+non-SP 6 GHz rules from the existing regd and use the new AFC payload
+to generate the 6 GHz SP rules.
+
+The SP rule here is the coalesced, HW frequency limited, 20 MHz
+boundary aligned AFC frequency ranges which are also present in the
+AFC payload channel object. Also, include the generated NO_IR
+rules for those frequencies which are not present in the AFC payload
+but are present in the country SP regulatory rules. Both the SP
+rules and NO_IR rules are added in the increasing order of
+frequencies.
+
+Improve code readability by modularizing the API
+'ath12k_reg_process_afc_power_event' into individual functions:
+   - To check for AFC payload validity,
+   - To generate the SP rules and NO_IR rules,
+   - To update the wiphy with the new regd.
+
+Fixes: None
+Patch-work: None
+Tag: 6G_REGULATORY
+Feature: AFC
+Patch-dependency:
+subsys/0048-cfg80211-mac80211-regulatory-awgn-and-6g-channel-cha.patch
+ath12k/0346-02-wifi-ath12k-Add-support-for-processing-AFC-power-eve.patch
+ath12k/0346-06-wifi-ath12k-Extract-AFC-response-and-send-AFC-cmd-to.patch
+ath12k/0380-a-UPSTREAM-PROTOCOL-wifi-ath12k-AFC-payload-cleanup-an.patch
+ath12k/0380-b-UPSTREAM-PROTOCOL-wifi-ath12k-Generate-SP-rules-base.patch
+ath12k/0380-c-UPSTREAM-PROTOCOL-wifi-ath12k-Generate-NO_IR-rules-b.patch
+
+Signed-off-by: Thirusenthil Kumaran J <thirusen@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/reg.c | 366 +++++++++++++++++++-------
+ 1 file changed, 274 insertions(+), 92 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/reg.c b/drivers/net/wireless/ath/ath12k/reg.c
+index f1147c82c1c4..e157c33dd561 100644
+--- a/drivers/net/wireless/ath/ath12k/reg.c
++++ b/drivers/net/wireless/ath/ath12k/reg.c
+@@ -1917,113 +1917,211 @@ ath12k_reg_generate_afc_and_no_ir_ranges(struct ath12k *ar,
+ 	return 0;
+ }
+ 
+-int ath12k_reg_process_afc_power_event(struct ath12k *ar)
++/**
++ * ath12k_get_sp_reg_rule() - Get the SP reg rule for the given frequency range
++ * @ab: pointer to ath12k_base
++ * @reg_rule: pointer to the reg rule frequency range
++ *
++ * This API returns the SP regulatory rule corresponding to the input AFC / IR
++ * rule.
++ *
++ * Return: pointer to the SP reg rule if found, NULL otherwise
++ */
++static const struct ieee80211_reg_rule *
++ath12k_get_sp_reg_rule(struct ath12k_base *ab,
++		       const struct ieee80211_reg_rule *reg_rule)
++{
++	const struct ath12k_6ghz_sp_reg_rule *sp_rule = ab->sp_rule;
++	int i;
++
++	for (i = 0; i < sp_rule->num_6ghz_sp_rule; i++) {
++		const struct ieee80211_reg_rule *sp_reg_rule = sp_rule->sp_reg_rule + i;
++
++		if (ath12k_reg_can_intersect(sp_reg_rule, reg_rule))
++			return sp_reg_rule;
++	}
++
++	return NULL;
++}
++
++/**
++ * ath12k_reg_copy_sp_reg_rule_to_regd() - Copy the SP reg rule to the
++ * regulatory domain.
++ * @ar: pointer to ath12k
++ * @afc_range: pointer to the AFC frequency range
++ * @new_regd: pointer to the new regulatory domain
++ * @idx: index in the new reg domain to copy the rule
++ * @is_no_ir: true if this is a no-IR range, false otherwise
++ *
++ * This API intersects the AFC / NO IR rule with the corresponding SP
++ * regulatory rule and copies the result to the new regulatory domain.
++ *
++ * Return: None
++ */
++static void
++ath12k_reg_copy_sp_rule_to_regd(struct ath12k *ar,
++				const struct ath12k_afc_freq_obj *afc_range,
++				struct ieee80211_regdomain *new_regd,
++				u16 idx,
++				bool is_no_ir)
+ {
+-	int new_reg_rule_cnt, num_regd_rules, num_sp_rules;
+-	int ret = 0, num_old_sp_rules = 0, num_new_sp_rules = 0;
+-	struct ieee80211_reg_rule *old_rule, *new_regd_rules;
+-	struct ath12k_afc_sp_reg_info *afc_reg_info = NULL;
+-	struct ath12k_6ghz_sp_reg_rule *sp_rule = NULL;
+-	struct ieee80211_regdomain *new_regd = NULL;
+-	struct ieee80211_regdomain *old_regd = NULL;
+-	struct ath12k_afc_freq_obj *afc_freq_obj;
+-	struct ath12k_afc_freq_obj *afc_ranges = NULL;
+-	struct ath12k_afc_freq_obj *no_ir_ranges = NULL;
+-	u16 num_afc_ranges = 0, num_no_ir_ranges = 0;
+ 	struct ieee80211_reg_rule new_rule = {0};
+-	struct ieee80211_regdomain *regd = NULL;
+ 	struct ath12k_base *ab = ar->ab;
+-	struct ath12k_hw *ah = ar->ah;
+-	int i, j, k, pdev_idx;
+-	char alpha2[3] = {0};
+-	u16 is_afc_chan_or_freq_obj_empty;
++	const struct ieee80211_reg_rule *sp_reg_rule;
+ 
+-	pdev_idx = ar->pdev_idx;
++	new_rule.freq_range.start_freq_khz = MHZ_TO_KHZ(afc_range->low_freq);
++	new_rule.freq_range.end_freq_khz = MHZ_TO_KHZ(afc_range->high_freq);
++	new_rule.mode = NL80211_REG_AP_SP;
++	sp_reg_rule = ath12k_get_sp_reg_rule(ab, &new_rule);
+ 
+-	if (!ab->sp_rule || !ar->afc.afc_reg_info)
+-		return -EINVAL;
++	if (sp_reg_rule) {
++		if (is_no_ir)
++			new_rule.flags = NL80211_RRF_NO_IR;
+ 
+-	spin_lock_bh(&ar->data_lock);
+-	sp_rule = ab->sp_rule;
+-	afc_reg_info = ar->afc.afc_reg_info;
+-	is_afc_chan_or_freq_obj_empty = (afc_reg_info->num_chan_objs == 0) ||
+-					(afc_reg_info->num_freq_objs == 0);
++		ath12k_reg_intersect_sp_rules(ar, sp_reg_rule, &new_rule,
++					      new_regd->reg_rules + idx);
++	} else {
++		ath12k_dbg(ar->ab, ATH12K_DBG_AFC,
++			   "No SP rule found for AFC range %d-%d\n",
++			   afc_range->low_freq, afc_range->high_freq);
++	}
++}
+ 
+-	if (afc_reg_info->fw_status_code != REG_FW_AFC_POWER_EVENT_SUCCESS ||
+-	    is_afc_chan_or_freq_obj_empty) {
+-		ath12k_warn(ab, "AFC Power event failure status code %d, afc_rule_empty: %d\n",
+-			    afc_reg_info->fw_status_code, is_afc_chan_or_freq_obj_empty);
+-		ath12k_handle_invalid_afc_payload(ar);
+-		ret = -EINVAL;
+-		goto end;
++/**
++ * ath12k_reg_merge_afc_and_no_ir_rules_into_regd() - Merge the AFC
++ * and No-IR rules into the regulatory domain.
++ * @ar: pointer to ath12k
++ * @new_regd: pointer to the new regulatory domain
++ * @idx: index in the new reg domain to copy the rule
++ * @afc_ranges: pointer to the AFC frequency ranges
++ * @num_afc_ranges: Number of AFC frequency ranges
++ * @no_ir_ranges: pointer to the No-IR frequency ranges
++ * @num_no_ir_ranges: Number of No-IR frequency ranges
++ *
++ * This API merges the two individually sorted AFC and No-IR rules
++ * into the regulatory domain in a sorted manner.
++ *
++ * Return: None
++ */
++static void
++ath12k_reg_merge_afc_and_no_ir_rules_into_regd(struct ath12k *ar,
++					       struct ieee80211_regdomain *new_regd,
++					       u16 idx,
++					       const struct ath12k_afc_freq_obj *afc_ranges,
++					       u16 num_afc_ranges,
++					       const struct ath12k_afc_freq_obj *no_ir_ranges,
++					       u16 num_no_ir_ranges)
++{
++	u16 i = 0, j = 0, k = idx;
++
++	while (i < num_afc_ranges && j < num_no_ir_ranges) {
++		if (afc_ranges[i].low_freq < no_ir_ranges[j].low_freq) {
++			ath12k_reg_copy_sp_rule_to_regd(ar,
++							afc_ranges + i,
++							new_regd, k, false);
++			i++;
++		} else {
++			ath12k_reg_copy_sp_rule_to_regd(ar,
++							no_ir_ranges + j,
++							new_regd, k, true);
++			j++;
++		}
++		k++;
+ 	}
+ 
+-	if (!sp_rule->num_6ghz_sp_rule) {
+-		ath12k_warn(ab, "No default 6 GHz sp rules present\n");
+-		ret = -EINVAL;
+-		goto end;
++	while (i < num_afc_ranges) {
++		ath12k_reg_copy_sp_rule_to_regd(ar, afc_ranges + i,
++						new_regd, k, false);
++		i++;
++		k++;
+ 	}
+ 
+-	ar->afc.is_6ghz_afc_power_event_received = true;
++	while (j < num_no_ir_ranges) {
++		ath12k_reg_copy_sp_rule_to_regd(ar, no_ir_ranges + j,
++						new_regd, k, true);
++		j++;
++		k++;
++	}
+ 
+-	if (ab->new_regd[pdev_idx])
+-		regd = ab->new_regd[pdev_idx];
+-	else
+-		regd = ab->default_regd[pdev_idx];
++	for (i = idx; i < k; i++) {
++		ath12k_dbg(ar->ab, ATH12K_DBG_AFC,
++			   "Final SP Rule [%d] %d-%d\n", i,
++			   KHZ_TO_MHZ(new_regd->reg_rules[i].freq_range.start_freq_khz),
++			   KHZ_TO_MHZ(new_regd->reg_rules[i].freq_range.end_freq_khz));
++	}
++}
++
++/**
++ * ath12k_reg_build_new_regd_for_afc() - Build a new regulatory domain
++ * for the AFC frequency ranges.
++ * @ar: pointer to ath12k
++ * @regd_afc: Output pointer to the new regulatory domain
++ * @afc_ranges: pointer to the AFC frequency ranges
++ * @num_afc_ranges: Number of AFC frequency ranges
++ * @no_ir_ranges: pointer to the No-IR frequency ranges
++ * @num_no_ir_ranges: Number of No-IR frequency ranges
++ *
++ * This API builds a new regulatory domain by copying the non-SP rules
++ * from the current regulatory domain and adding the AFC and No-IR
++ * rules to it.
++ *
++ * Return: 0 on success, negative error code on failure
++ */
++static int
++ath12k_reg_build_new_regd_for_afc(struct ath12k *ar,
++				  struct ieee80211_regdomain **regd_afc,
++				  const struct ath12k_afc_freq_obj *afc_ranges,
++				  u16 num_afc_ranges,
++				  const struct ath12k_afc_freq_obj *no_ir_ranges,
++				  u16 num_no_ir_ranges)
++{
++	struct ath12k_base *ab = ar->ab;
++	struct ieee80211_regdomain *new_regd;
++	struct ieee80211_regdomain *regd;
++	struct ieee80211_reg_rule *old_rule, *new_regd_rules;
++	int num_regd_rules, new_reg_rule_cnt;
++	int num_old_sp_rules = 0, num_new_sp_rules = 0;
++	int i, k;
++	char alpha2[3] = {0};
+ 
++	regd = ath12k_get_current_regd(ar);
+ 	if (!regd) {
+ 		ath12k_warn(ab, "Regulatory domain data not present\n");
+-		ret = -EINVAL;
+-		goto end;
++		return -EINVAL;
+ 	}
+ 
+-	num_sp_rules = ab->sp_rule->num_6ghz_sp_rule;
+ 	num_regd_rules = regd->n_reg_rules;
+-
+-	ret = ath12k_reg_generate_afc_and_no_ir_ranges(ar, afc_reg_info,
+-						       &afc_ranges,
+-						       &num_afc_ranges,
+-						       &no_ir_ranges,
+-						       &num_no_ir_ranges);
+-
+-	if (ret) {
+-		ath12k_warn(ab, "Failed to generate AFC and No-IR ranges\n");
+-		goto end;
+-	}
+-
+ 	for (i = 0; i < num_regd_rules; i++) {
+ 		old_rule = regd->reg_rules + i;
+ 		if (old_rule->mode == NL80211_REG_AP_SP)
+ 			num_old_sp_rules++;
+ 	}
+ 
+-	for (i = 0; i < num_sp_rules; i++) {
+-		old_rule = sp_rule->sp_reg_rule + i;
+-
+-		for (j = 0; j < num_afc_ranges; j++) {
+-			afc_freq_obj = afc_ranges + j;
+-			new_rule.freq_range.start_freq_khz =
+-						MHZ_TO_KHZ(afc_freq_obj->low_freq);
+-			new_rule.freq_range.end_freq_khz =
+-						MHZ_TO_KHZ(afc_freq_obj->high_freq);
+-			new_rule.mode = NL80211_REG_AP_SP;
+-			if (ath12k_reg_can_intersect(old_rule, &new_rule))
+-				num_new_sp_rules++;
+-		}
+-	}
+-
+ 	/* Remove the old sp rule from regd and add the new intersected sp rules */
++	num_new_sp_rules = num_afc_ranges + num_no_ir_ranges;
+ 	new_reg_rule_cnt = num_regd_rules  - num_old_sp_rules + num_new_sp_rules;
+ 	ath12k_dbg(ab, ATH12K_DBG_AFC,
+-		   "Total reg rules %d old sp rules %d new sp rules after intersection %d\n",
++		   "Total reg rules %d old sp rules %d new sp rules %d\n",
+ 		   num_regd_rules, num_old_sp_rules, num_new_sp_rules);
+ 
++	/* This is unlikely as we ensure each SP rules is 20 MHz wide. So
++	 * there can only be a maximum of 59 rules for 6 GHz.
++	 */
++	if (new_reg_rule_cnt > NL80211_MAX_SUPP_REG_RULES) {
++		ath12k_warn(ab,
++			    "New reg rule count %d > max reg rule count %d\n",
++			    new_reg_rule_cnt, NL80211_MAX_SUPP_REG_RULES);
++		new_reg_rule_cnt = NL80211_MAX_SUPP_REG_RULES;
++		num_new_sp_rules = (NL80211_MAX_SUPP_REG_RULES -
++				    num_regd_rules + num_old_sp_rules);
++	}
++
+ 	new_regd = kzalloc(sizeof(*new_regd) +
+ 			   (sizeof(*new_regd_rules) * new_reg_rule_cnt),
+ 			   GFP_ATOMIC);
+ 	if (!new_regd) {
+-		ret = -ENOMEM;
+-		goto end;
++		ath12k_err(ab, "Failed to alloc new_regd\n");
++		return -ENOMEM;
+ 	}
+ 
+ 	new_regd->n_reg_rules = new_reg_rule_cnt;
+@@ -2035,6 +2133,7 @@ int ath12k_reg_process_afc_power_event(struct ath12k *ar)
+ 		   "\nAFC: Country %s, CFG Regdomain %s, num_reg_rules %d\n",
+ 		   alpha2, ath12k_reg_get_regdom_str(new_regd->dfs_region),
+ 		   new_reg_rule_cnt);
++
+ 	k = 0;
+ 	for (i = 0; i < num_regd_rules; i++) {
+ 		old_rule = regd->reg_rules + i;
+@@ -2042,33 +2141,116 @@ int ath12k_reg_process_afc_power_event(struct ath12k *ar)
+ 		if (old_rule->mode == NL80211_REG_AP_SP) {
+ 			continue;
+ 		} else {
+-			memcpy((new_regd->reg_rules + k), old_rule, sizeof(*new_regd_rules));
++			memcpy((new_regd->reg_rules + k), old_rule,
++			       sizeof(*new_regd_rules));
+ 			k++;
+ 		}
+ 	}
+ 
+-	for (i = 0; i < num_sp_rules; i++) {
+-		old_rule = sp_rule->sp_reg_rule + i;
+-		for (j = 0; j < num_afc_ranges; j++) {
+-			afc_freq_obj = afc_ranges + j;
+-				new_rule.freq_range.start_freq_khz =
+-						MHZ_TO_KHZ(afc_freq_obj->low_freq);
+-				new_rule.freq_range.end_freq_khz =
+-						MHZ_TO_KHZ(afc_freq_obj->high_freq);
+-				new_rule.mode = NL80211_REG_AP_SP;
+-				if (ath12k_reg_can_intersect(old_rule, &new_rule)) {
+-					new_rule.psd = (s8)(afc_freq_obj->max_psd / 100);
+-					new_rule.flags |= NL80211_RRF_PSD;
+-					ath12k_reg_intersect_sp_rules(ar, old_rule, &new_rule,
+-								      new_regd->reg_rules + k);
+-					k++;
+-				}
+-			}
++	ath12k_reg_merge_afc_and_no_ir_rules_into_regd(ar, new_regd, k,
++						       afc_ranges,
++						       num_afc_ranges,
++						       no_ir_ranges,
++						       num_no_ir_ranges);
++
++	*regd_afc = new_regd;
++
++	return 0;
++}
++
++/**
++ * ath12k_reg_check_afc_payload_validity() - Check the validity of the AFC
++ * payload.
++ * @ar: pointer to ath12k
++ *
++ * This API checks the validity of the AFC payload. This function also handles
++ * Invalid / Empty payloads.
++ *
++ * Note: This API is invoked while holding ar and ah locks. Please exercise
++ * caution when acquiring locks within this function.
++ *
++ * Return: 0 on success, negative error code on failure
++ */
++static int
++ath12_reg_check_afc_payload_validity(struct ath12k *ar)
++{
++	bool is_afc_chan_or_freq_obj_empty;
++	struct ath12k_base *ab = ar->ab;
++	const struct ath12k_afc_sp_reg_info *afc_reg_info = ar->afc.afc_reg_info;
++
++	is_afc_chan_or_freq_obj_empty = (afc_reg_info->num_chan_objs == 0) &&
++					(afc_reg_info->num_freq_objs == 0);
++
++	if (afc_reg_info->fw_status_code == REG_FW_AFC_POWER_EVENT_SUCCESS &&
++	    !is_afc_chan_or_freq_obj_empty) {
++		ath12k_dbg(ab, ATH12K_DBG_AFC,
++			   "AFC Power event success\n");
++		return 0;
++	}
++
++	ath12k_warn(ab, "AFC Power event status code %d, is empty payload: %d\n",
++		    afc_reg_info->fw_status_code,
++		    is_afc_chan_or_freq_obj_empty);
++	ath12k_handle_invalid_afc_payload(ar);
++	ath12k_free_afc_power_event_info(&ar->afc);
++
++	if (afc_reg_info->fw_status_code != REG_FW_AFC_POWER_EVENT_SUCCESS)
++		return 1;
++
++	/* Empty payload is a valid payload. So Mark Power event success */
++	ar->afc.is_6ghz_afc_power_event_received = true;
++
++	return 1;
++}
++
++int ath12k_reg_process_afc_power_event(struct ath12k *ar)
++{
++	struct ieee80211_regdomain *new_regd = NULL;
++	struct ieee80211_regdomain *old_regd = NULL;
++	struct ath12k_base *ab = ar->ab;
++	struct ath12k_hw *ah = ar->ah;
++	struct ath12k_afc_freq_obj *afc_ranges = NULL;
++	struct ath12k_afc_freq_obj *no_ir_ranges = NULL;
++	u16 num_afc_ranges = 0;
++	u16 num_no_ir_ranges = 0;
++	int ret = 0, pdev_idx;
++
++	if (!ab->sp_rule || !ab->sp_rule->num_6ghz_sp_rule || !ar->afc.afc_reg_info) {
++		ath12k_warn(ab, "SP rule not present or AFC payload is NULL\n");
++		return -EINVAL;
++	}
++
++	spin_lock_bh(&ar->data_lock);
++
++	if (ath12_reg_check_afc_payload_validity(ar)) {
++		ret = -EINVAL;
++		goto end;
++	}
++
++	ar->afc.is_6ghz_afc_power_event_received = true;
++
++	ret = ath12k_reg_generate_afc_and_no_ir_ranges(ar, ar->afc.afc_reg_info,
++						       &afc_ranges,
++						       &num_afc_ranges,
++						       &no_ir_ranges,
++						       &num_no_ir_ranges);
++	if (ret) {
++		ath12k_warn(ab, "Failed to generate AFC and No-IR ranges\n");
++		goto end;
++	}
++
++	ret = ath12k_reg_build_new_regd_for_afc(ar, &new_regd,
++						afc_ranges, num_afc_ranges,
++						no_ir_ranges, num_no_ir_ranges);
++	if (ret) {
++		ath12k_warn(ab, "Failed to build new regd for AFC\n");
++		goto end;
+ 	}
+ 
+ 	spin_unlock_bh(&ar->data_lock);
+ 
+ 	spin_lock_bh(&ab->base_lock);
++	pdev_idx = ar->pdev_idx;
+ 	old_regd = ab->new_regd[pdev_idx];
+ 	ab->new_regd[pdev_idx] = new_regd;
+ 	spin_unlock_bh(&ab->base_lock);
+-- 
+2.34.1
+

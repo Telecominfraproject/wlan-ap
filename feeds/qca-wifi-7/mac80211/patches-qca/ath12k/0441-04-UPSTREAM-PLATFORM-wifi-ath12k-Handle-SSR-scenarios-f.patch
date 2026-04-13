@@ -1,0 +1,274 @@
+From 3d51bf96585069d73acb3f057370eeefad4e1f23 Mon Sep 17 00:00:00 2001
+From: Aaradhana Sahu <aaradhana.sahu@oss.qualcomm.com>
+Date: Mon, 21 Jul 2025 12:51:53 +0530
+Subject: [PATCH 2/2] UPSTREAM: PLATFORM: wifi: ath12k: Handle SSR scenarios
+ for Q6 power up/down
+
+When the driver operates only one radio, Q6 cores for all other
+inactive radios are powered down. The following changes handle
+Subsystem Restart (SSR) scenarios in this context:
+
+- If recovery is disabled and a firmware assert occurs, the host
+  collects a crash dump only for the active (powered-up) Q6 radio.
+- If Mode 0 recovery is enabled and a firmware assert occurs, the
+  host collects the crash dump for the active Q6 radio and proceeds
+  to recover all pdevs.
+- If Mode 1 recovery is enabled and a firmware assert occurs, the
+  host falls back to Mode 0 recovery.
+
+Patch-dependency: "UPSTREAM:CP:wifi:ath12k: ErP support"
+Patch-work: None
+
+Signed-off-by: Aaradhana Sahu <aaradhana.sahu@oss.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/ahb.c      |  1 +
+ drivers/net/wireless/ath/ath12k/core.c     | 37 ++++++++++++++++------
+ drivers/net/wireless/ath/ath12k/core.h     |  1 +
+ drivers/net/wireless/ath/ath12k/coredump.c |  3 ++
+ drivers/net/wireless/ath/ath12k/debugfs.c  |  4 +++
+ drivers/net/wireless/ath/ath12k/erp.c      | 10 ++++++
+ drivers/net/wireless/ath/ath12k/erp.h      |  1 +
+ drivers/net/wireless/ath/ath12k/mac.c      |  7 +++-
+ drivers/net/wireless/ath/ath12k/qmi.c      |  5 ++-
+ 9 files changed, 57 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/ahb.c b/drivers/net/wireless/ath/ath12k/ahb.c
+index c8783af..c56f329 100644
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -1102,6 +1102,7 @@ static void ath12k_ahb_handle_userpd_crash(struct ath12k_base *ab)
+ 	if (!(test_bit(ATH12K_GROUP_FLAG_UNREGISTER, &ab->ag->flags))) {
+ 		set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+ 		set_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
++		set_bit(ATH12K_GROUP_FLAG_RECOVERY, &ab->ag->flags);
+ 		ab_ahb->crash_type = ATH12K_RPROC_USERPD_CRASH;
+ 		queue_work(ab->workqueue_aux, &ab->reset_work);
+ 	} else {
+diff --git a/drivers/net/wireless/ath/ath12k/core.c b/drivers/net/wireless/ath/ath12k/core.c
+index e4a2feb..fc16793 100644
+--- a/drivers/net/wireless/ath/ath12k/core.c
++++ b/drivers/net/wireless/ath/ath12k/core.c
+@@ -2118,6 +2118,7 @@ void ath12k_core_halt(struct ath12k *ar)
+ 
+ 	cancel_work_sync(&ar->erp_handle_trigger_work);
+ 	ar->erp_trigger_set = false;
++	cancel_work_sync(&ar->ssr_erp_exit);
+ }
+ 
+ static void ath12k_core_mlo_hw_queues_stop(struct ath12k_hw_group *ag)
+@@ -2376,10 +2377,16 @@ static void ath12k_core_restart(struct work_struct *work)
+ 	}
+ 
+ 	if (ath12k_core_hw_group_start_ready(ag) &&
+-	    ath12k_check_erp_power_down(ag))
++	    ath12k_check_erp_power_down(ag) &&
++	    !ath12k_hw_group_recovery_in_progress(ag)) {
+ 		ath12k_core_radio_start(ab);
++		set_bit(ATH12K_FLAG_QMI_FW_READY_COMPLETE,
++			&ab->dev_flags);
++	}
+ 
+-	if (ab->is_reset) {
++	if (ab->is_reset ||
++	    (ath12k_check_erp_power_down(ag) &&
++	     ath12k_hw_group_recovery_in_progress(ag))) {
+ 		if (!test_bit(ATH12K_FLAG_REGISTERED, &ab->dev_flags)) {
+ 			atomic_dec(&ab->reset_count);
+ 			complete(&ab->reset_complete);
+@@ -3277,9 +3284,7 @@ static void ath12k_core_upd_power_down(struct ath12k_base *ab)
+ 	 * Collect coredump using user pd
+ 	 */
+ 	if (ab_ahb->crash_type == ATH12K_RPROC_USERPD_CRASH) {
+-		if (!ab->pm_suspend)
+-			ath12k_hif_power_down(ab, false);
+-
++		ath12k_hif_power_down(ab, false);
+ 		ath12k_coredump_ahb_collect(ab);
+ 	}
+ 
+@@ -3393,6 +3398,10 @@ static void ath12k_core_reset(struct work_struct *work)
+ 	} else {
+ 		ag->recovery_mode = ATH12K_MLO_RECOVERY_MODE0;
+ 	}
++
++	if (ath12k_check_erp_power_down(ag))
++		ag->recovery_mode = ATH12K_MLO_RECOVERY_MODE0;
++
+ 	if (ab->fw_recovery_support)
+ 		ath12k_info(ab, "Recovery is initiated with Mode%s\n",
+ 				(ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE0 ? "0" : "1"));
+@@ -3511,7 +3520,8 @@ static void ath12k_core_reset(struct work_struct *work)
+ 		}
+ 	}
+ 
+-	if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE0)
++	if (ag->recovery_mode == ATH12K_MLO_RECOVERY_MODE0 &&
++	    !ath12k_check_erp_power_down(ag))
+ 		ath12k_core_trigger_partner_device_crash(ab);
+ 
+ 	/* prepare coredump */
+@@ -3536,10 +3546,10 @@ static void ath12k_core_reset(struct work_struct *work)
+ 	ath12k_hif_ce_irq_disable(ab);
+ 
+ 	if (ab->hif.bus == ATH12K_BUS_PCI) {
+-		if (!ab->pm_suspend)
+-			ath12k_hif_power_down(ab, false);
++		ath12k_hif_power_down(ab, false);
+ 	} else {
+-		ath12k_core_upd_power_down(ab);
++		if (!ab->pm_suspend)
++			ath12k_core_upd_power_down(ab);
+ 	}
+ 
+ 	/* prepare for power up */
+@@ -3562,11 +3572,18 @@ static void ath12k_core_reset(struct work_struct *work)
+ 
+ 	for (i = 0; i < ag->num_devices; i++) {
+ 		ab = ag->ab[i];
+-		if (!ab || !ab->is_reset)
++		if (!ab->is_reset &&
++		    !ath12k_check_erp_power_down(ag))
+ 			continue;
+ 
+ 		ath12k_qmi_free_resource(ab);
+ 		ath12k_hif_power_up(ab);
++
++		if (ath12k_check_erp_power_down(ag)) {
++			ab->pm_suspend = false;
++			ab->powerup_triggered = true;
++		}
++
+ 		ath12k_dbg(ab, ATH12K_DBG_BOOT, "reset started\n");
+ 	}
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/core.h b/drivers/net/wireless/ath/ath12k/core.h
+index c39a6d9..045c6e9 100644
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1228,6 +1228,7 @@ struct ath12k {
+ 	struct completion suspend;
+ 	bool pdev_suspend;
+ 	struct completion pdev_resume;
++	struct work_struct ssr_erp_exit;
+ };
+ 
+ struct ath12k_6ghz_sp_reg_rule {
+diff --git a/drivers/net/wireless/ath/ath12k/coredump.c b/drivers/net/wireless/ath/ath12k/coredump.c
+index 35286ba..9fe6496 100644
+--- a/drivers/net/wireless/ath/ath12k/coredump.c
++++ b/drivers/net/wireless/ath/ath12k/coredump.c
+@@ -318,6 +318,9 @@ void ath12k_coredump_download_rddm(struct ath12k_base *ab)
+ 	struct ath12k_hw_group *ag = ab->ag;
+ 	bool state = false;
+ 
++	if (ath12k_check_erp_power_down(ag) && ab->pm_suspend)
++		return;
++
+ 	if (ab->in_panic)
+ 		state = true;
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/debugfs.c b/drivers/net/wireless/ath/ath12k/debugfs.c
+index 460dff8..bcefe94 100644
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -5354,6 +5354,10 @@ void ath12k_send_fw_hang_cmd(struct ath12k_base *ab,
+ 				}
+ 
+ 				if (radioup) {
++					if (ath12k_check_erp_power_down(ag) &&
++					    ab->pm_suspend)
++						continue;
++
+ 					ath12k_debug_multipd_wmi_pdev_set_param(ab, ab->fw_recovery_support);
+ 					ret = ath12k_wmi_force_fw_hang_cmd(ar,
+ 									   recovery_mode,
+diff --git a/drivers/net/wireless/ath/ath12k/erp.c b/drivers/net/wireless/ath/ath12k/erp.c
+index 91a37a3..87da982 100644
+--- a/drivers/net/wireless/ath/ath12k/erp.c
++++ b/drivers/net/wireless/ath/ath12k/erp.c
+@@ -604,6 +604,16 @@ static void ath12k_vendor_send_erp_trigger(struct wiphy *wiphy)
+ 	wiphy_unlock(wiphy);
+ }
+ 
++void ath12k_erp_ssr_exit(struct work_struct *work)
++{
++	struct ath12k *ar = container_of(work, struct ath12k, ssr_erp_exit);
++	struct ieee80211_hw *hw = ar->ah->hw;
++	struct wiphy *wiphy = hw->wiphy;
++
++	if (ath12k_erp_exit(wiphy, true))
++		ath12k_err(NULL, "Fail to exit from erp mode after ssr\n");
++}
++
+ int ath12k_erp_exit(struct wiphy *wiphy, bool send_event)
+ {
+ 	struct ath12k_erp_active_ar *active_ar;
+diff --git a/drivers/net/wireless/ath/ath12k/erp.h b/drivers/net/wireless/ath/ath12k/erp.h
+index 45a9f4c..c83a97f 100644
+--- a/drivers/net/wireless/ath/ath12k/erp.h
++++ b/drivers/net/wireless/ath/ath12k/erp.h
+@@ -22,5 +22,6 @@ int ath12k_erp_enter(struct ieee80211_hw *hw, struct ieee80211_vif *vif, int lin
+ 		     struct cfg80211_erp_params *params);
+ int ath12k_erp_exit(struct wiphy *wiphy, bool send_event);
+ enum ath12k_erp_states ath12k_erp_get_sm_state(void);
++void ath12k_erp_ssr_exit(struct work_struct *work);
+ #endif /* ATH12K_ERP_H */
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index da0e6fd..755ff9b 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -14131,7 +14131,8 @@ int ath12k_mac_op_start(struct ieee80211_hw *hw)
+ 
+ 	lockdep_assert_wiphy(hw->wiphy);
+ 
+-	if (ath12k_check_erp_power_down(ag)) {
++	if (ath12k_check_erp_power_down(ag) &&
++	    !ath12k_hw_group_recovery_in_progress(ag)) {
+ 		ret = ath12k_core_power_up(ag);
+ 		return ret;
+ 	}
+@@ -19363,6 +19364,9 @@ ath12k_mac_reconfig_complete(struct ieee80211_hw *hw,
+ 
+ 	ath12k_info(NULL, "HW group recovery flag cleared ag dev_flags:0x%lx\n",
+ 		    ar->ab->ag->flags);
++
++	if (ath12k_erp_get_sm_state() == ATH12K_ERP_ENTER_COMPLETE)
++		ieee80211_queue_work(hw, &ar->ssr_erp_exit);
+ }
+ 
+ void
+@@ -21354,6 +21358,7 @@ static void ath12k_mac_setup(struct ath12k *ar)
+ 	ar->monitor_started = false;
+ 
+ 	INIT_WORK(&ar->erp_handle_trigger_work, ath12k_erp_handle_trigger);
++	INIT_WORK(&ar->ssr_erp_exit, ath12k_erp_ssr_exit);
+ }
+ 
+ static int __ath12k_mac_mlo_setup(struct ath12k *ar)
+diff --git a/drivers/net/wireless/ath/ath12k/qmi.c b/drivers/net/wireless/ath/ath12k/qmi.c
+index 6d795f5..29815c4 100644
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -3907,6 +3907,10 @@ void ath12k_qmi_free_target_mem_chunk(struct ath12k_base *ab)
+ 	struct ath12k_hw_group *ag = ab->ag;
+ 	int i, mlo_idx;
+ 
++	if (ath12k_check_erp_power_down(ag) &&
++	    ab->pm_suspend)
++		return;
++
+ 	for (i = 0, mlo_idx = 0; i < ab->qmi.mem_seg_count; i++) {
+ 
+ 		if (ab->qmi.target_mem[i].type == MLO_GLOBAL_MEM_REGION_TYPE) {
+@@ -6508,7 +6512,6 @@ static void ath12k_qmi_driver_event_work(struct work_struct *work)
+ 				if (ab->is_reset)
+ 					ath12k_hal_dump_srng_stats(ab);
+ 
+-				set_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
+ 				queue_work(ab->workqueue, &ab->restart_work);
+ 				break;
+ 			}
+-- 
+2.34.1
+

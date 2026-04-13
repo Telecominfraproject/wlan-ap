@@ -1,0 +1,614 @@
+From f58ad1b9555878e433f703698c348ddbf653f7e0 Mon Sep 17 00:00:00 2001
+From: Vivek Chettri <vchettri@qti.qualcomm.com>
+Date: Thu, 3 Jul 2025 16:13:22 +0530
+Subject: [PATCH 3/4] UPSTREAM: DP: wifi: ath12k: Add support for QoS Datapath
+
+Network flows of different SCS request(identified by SCS ID) of a peer
+requires different QoS handling based on the QoS characteristics as
+exchanged in the protocol for a given SCS request.
+
+With the help of kernel net filter, as programmed using
+nftables by hostapd, we get the SCS ID per packet matching the SCS flow.
+
+Active flows from different SCS request would need a mapping
+of the QoS profile or TID and its relevant MSDUQ
+that is used to achieve the QoS prioritization.
+
+So per peer, we maintain SCS ID to QoS ID and MSDUQ mapping.
+Also we maintain information about all active user define MSDUQs
+as they used for different SCS flows of a peer.
+
+These mapping are then referenced in the per packet datapath
+to enqueue packets from a flow mapped for a SCS request
+to the appropriate MSDUQ.
+
+Add API to support the following
+
+	Allocate a peer QoS context to store the active SCS requests
+	and its QoS profile, and MSDUQ information
+
+	Add active SCS information of QoS profile and MSDUQ
+	in peer QoS context
+
+	Delete terminated SCS information of QoS profile and MSDUQ
+	in peer QoS context
+
+	Free peer QoS context when the peer is deleted.
+
+In per packet DP Tx, retrieve the SCS mapping for QoS profile and MSDUQ
+and update the TCL command to use the appropriate HW MSDUQ
+for transmission for achieving configured QoS.
+
+Signed-off-by: Vivek Chettri <vchettri@qti.qualcomm.com>
+Signed-off-by: Aishwarya R <aisr@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.h          |   8 +
+ drivers/net/wireless/ath/ath12k/dp_peer.c     | 246 ++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/dp_peer.h     |  67 +++++
+ drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c | 106 ++++++++
+ .../net/wireless/ath/ath12k/wifi7/hal_desc.h  |   1 +
+ drivers/net/wireless/ath/ath12k/wifi7/hw.c    |  11 +-
+ 6 files changed, 435 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+index deacb39..73dbd36 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -17,6 +17,14 @@
+ 
+ #define HTT_TCL_META_DATA_PEER_ID_MISSION       GENMASK(15, 3)
+ 
++/* QoS meta data */
++#define HTT_TCL_META_DATA_TYPE_SVC_ID_BASED	2
++#define HTT_TCL_META_DATA_SAWF_SVC_ID		GENMASK(10, 3)
++#define HTT_TCL_META_DATA_SAWF_TID_OVERRIDE	BIT(12)
++#define HTT_TX_WBM_COMP_STATUS_OFFSET 8
++
++#define HTT_TCL_META_DATA_TYPE_MISSION		GENMASK(1, 0)
++
+ #define MAX_RXDMA_PER_PDEV     2
+ 
+ #define MAX_NAPI_BUDGET             128
+diff --git a/drivers/net/wireless/ath/ath12k/dp_peer.c b/drivers/net/wireless/ath/ath12k/dp_peer.c
+index e856e03..5bb27be 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.c
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.c
+@@ -579,6 +579,7 @@ void ath12k_dp_peer_delete(struct ath12k_dp_hw *dp_hw, u8 *addr)
+ 	spin_unlock_bh(&dp_hw->peer_lock);
+ 
+ 	synchronize_rcu();
++	kfree(dp_peer->qos);
+ 	kfree(dp_peer);
+ }
+ 
+@@ -792,3 +793,248 @@ bool ath12k_dp_link_peer_reset_rx_stats(struct ath12k_dp *dp, const u8 *addr)
+ 	spin_unlock_bh(&dp->dp_lock);
+ 	return true;
+ }
++
++struct ath12k_dp_peer_qos *
++ath12k_dp_peer_qos_get(struct ath12k_dp *dp,
++		       struct ath12k_dp_peer *peer)
++{
++	struct ath12k_dp_peer_qos *qos = NULL;
++
++	if (peer && peer->qos)
++		qos = peer->qos;
++
++	return qos;
++}
++
++struct ath12k_dp_peer_qos *
++ath12k_dp_peer_qos_alloc(struct ath12k_dp *dp,
++			 struct ath12k_dp_peer *peer)
++{
++	struct ath12k_dp_peer_qos *qos;
++
++	if (!peer)
++		return NULL;
++
++	qos = kzalloc(sizeof(*qos), GFP_ATOMIC);
++	if (!qos)
++		return NULL;
++
++	peer->qos = qos;
++
++	ath12k_dbg(dp->ab, ATH12K_DBG_QOS, "Peer QoS allocated");
++	return peer->qos;
++}
++
++static u16 ath12k_get_tid_msduq(struct ath12k_base *ab,
++				struct ath12k_dp_peer_qos *qos,
++				u16 qos_id, u8 tid)
++{
++	u8 q, msduq = QOS_INVALID_MSDUQ;
++
++	/* Find matching msduq with qos_id in the reserved pool*/
++	for (q = 0; q < QOS_TID_MDSUQ_MAX; ++q) {
++		if (qos->msduq_map[tid][q].reserved &&
++		    qos->msduq_map[tid][q].qos_id == qos_id) {
++			msduq = qos->msduq_map[tid][q].msduq;
++			ath12k_dbg(ab, ATH12K_DBG_QOS,
++				   "Res:msduq 0x%x:tid %u usrdefq %u\n",
++				   msduq, tid, q);
++			break;
++		}
++	}
++
++	if (msduq == QOS_INVALID_MSDUQ) {
++		/* Reserve a new one */
++		for (q = 0; q < QOS_TID_MDSUQ_MAX; ++q) {
++			if (!qos->msduq_map[tid][q].reserved) {
++				qos->msduq_map[tid][q].reserved = true;
++				qos->msduq_map[tid][q].qos_id = qos_id;
++				msduq = u16_encode_bits(q, MSDUQ_MASK) |
++							u16_encode_bits(tid, MSDUQ_TID_MASK);
++				msduq = msduq + MSDUQ_MAX_DEF;
++				qos->msduq_map[tid][q].msduq = msduq;
++				ath12k_dbg(ab, ATH12K_DBG_QOS,
++					   "New: msduq 0x%x:tid %u usrdefq %u",
++					   msduq, tid, q);
++				break;
++			}
++		}
++	}
++
++	return msduq;
++}
++
++u16 ath12k_dp_peer_qos_msduq(struct ath12k_base *ab,
++			     struct ath12k_dp_peer_qos *qos, u16 qos_id)
++{
++	u16 msduq;
++	u8 qos_tid;
++
++	qos_tid = ath12k_qos_get_tid(ab, qos_id);
++	if (qos_tid >= QOS_TID_MAX) {
++		ath12k_err(ab, "Invalid TID: %d", qos_tid);
++		return QOS_INVALID_MSDUQ;
++	}
++
++	/* Get MSDUQ for excat QoS profile TID */
++	msduq = ath12k_get_tid_msduq(ab, qos, qos_id, qos_tid);
++
++	/* Get MSDUQ for lower QoS profile TID */
++	if (msduq == QOS_INVALID_MSDUQ && qos_tid != 0) {
++		u8 tid = qos_tid - 1;
++
++		while (tid < qos_tid) {
++			msduq = ath12k_get_tid_msduq(ab, qos, qos_id, tid);
++			if (msduq != QOS_INVALID_MSDUQ)
++				break;
++			--tid;
++		}
++	}
++	/* Get MSDUQ for higher QoS profile TID */
++	if (msduq == QOS_INVALID_MSDUQ) {
++		u8 tid = qos_tid + 1;
++
++		while (tid < QOS_MAX_TID) {
++			msduq = ath12k_get_tid_msduq(ab, qos, qos_id, tid);
++			if (msduq != QOS_INVALID_MSDUQ)
++				break;
++			++tid;
++		}
++	}
++	return msduq;
++}
++
++int ath12k_dp_peer_scs_add(struct ath12k_base *ab,
++			   struct ath12k_dp_peer_qos *qos,
++			   u8 scs_id, u16 qos_id)
++{
++	struct ath12k_dl_scs *scs;
++	u16 qos_data;
++
++	if (scs_id >= QOS_MAX_SCS_ID) {
++		ath12k_err(ab, "ath12k: Invalid SCS ID");
++		return -EINVAL;
++	}
++
++	scs = &qos->scs_map[scs_id];
++	qos_data = u16_encode_bits(QOS_INVALID_MSDUQ, SCS_MSDUQ_MASK) |
++		   u16_encode_bits(qos_id, SCS_QOS_ID_MASK);
++	scs->qos_id_msduq = qos_data;
++
++	ath12k_dbg(ab, ATH12K_DBG_QOS,
++		   "Peer QoS add scs_id:%d | msduq:%d| qos_id:%d",
++		   scs_id, u16_get_bits(qos_data, SCS_MSDUQ_MASK),
++		   u16_get_bits(qos_data, SCS_QOS_ID_MASK));
++
++	return 0;
++}
++
++int ath12k_dp_peer_scs_del(struct ath12k_base *ab,
++			   struct ath12k_dp_peer_qos *qos,
++			   u8 scs_id)
++{
++	struct ath12k_dl_scs *scs;
++	u16 qos_data;
++
++	if (!qos) {
++		ath12k_err(ab, "Invalid QoS");
++		return -EINVAL;
++	}
++
++	scs = &qos->scs_map[scs_id];
++	qos_data = u16_encode_bits(QOS_INVALID_MSDUQ, SCS_MSDUQ_MASK) |
++		   u16_encode_bits(QOS_ID_INVALID, SCS_QOS_ID_MASK);
++	scs->qos_id_msduq = qos_data;
++
++	ath12k_dbg(ab, ATH12K_DBG_QOS,
++		   "Peer QoS del scs_id:%d | msduq:%d| qos_id:%d",
++		   scs_id, u16_get_bits(qos_data, SCS_MSDUQ_MASK),
++		   u16_get_bits(qos_data, SCS_QOS_ID_MASK));
++	return 0;
++}
++
++u16 ath12k_dp_peer_scs_get_qos_id(struct ath12k_base *ab,
++				  struct ath12k_dp_peer_qos *qos, u8 scs_id)
++{
++	u16 qos_id = QOS_ID_INVALID;
++
++	if (!qos)
++		return qos_id;
++
++	qos_id = u16_get_bits(qos->scs_map[scs_id].qos_id_msduq,
++			      SCS_QOS_ID_MASK);
++
++	ath12k_dbg(ab, ATH12K_DBG_QOS,
++		   "Peer QoS Get QoS ID: %d| qos_id:%d",
++		   scs_id, u16_get_bits(qos->scs_map[scs_id].qos_id_msduq,
++					SCS_QOS_ID_MASK));
++	return qos_id;
++}
++
++int ath12k_dp_peer_scs_data(struct ath12k_dp *dp,
++			    struct ath12k_dp_peer_qos *qos, u8 scs_id,
++			    u16 *queue, u16 *id)
++{
++	u16 qos_data;
++	u16 msduq = QOS_INVALID_MSDUQ, qos_id = QOS_ID_INVALID;
++	int ret = -EINVAL;
++
++	if (!qos)
++		goto ret;
++
++	msduq = u16_get_bits(qos->scs_map[scs_id].qos_id_msduq,
++			     SCS_MSDUQ_MASK);
++	qos_id = u16_get_bits(qos->scs_map[scs_id].qos_id_msduq,
++			      SCS_QOS_ID_MASK);
++
++	if (msduq != QOS_INVALID_MSDUQ && qos_id < QOS_ID_INVALID) {
++		ret = 0;
++		goto ret;
++	}
++
++	if (qos_id >= QOS_ID_INVALID) {
++		ath12k_err(dp->ab, "Invalid QoS ID: %d", qos_id);
++		goto ret;
++	}
++
++	if (qos_id > QOS_UL_ID_MAX && qos_id < QOS_ID_INVALID)
++		msduq = qos_id - QOS_LEGACY_DL_ID_MIN;
++	else
++		msduq = ath12k_dp_peer_qos_msduq(dp->ab, qos, qos_id);
++
++	if (msduq == QOS_INVALID_MSDUQ)
++		goto ret;
++
++	qos_data = u16_encode_bits(msduq, SCS_MSDUQ_MASK) |
++		   u16_encode_bits(qos_id, SCS_QOS_ID_MASK);
++	qos->scs_map[scs_id].qos_id_msduq = qos_data;
++
++	ath12k_dbg(dp->ab, ATH12K_DBG_QOS,
++		   "Peer QoS get scs_id:%d | msduq:%d| qos_id:%d",
++		   scs_id, u16_get_bits(qos_data, SCS_MSDUQ_MASK),
++		   u16_get_bits(qos_data, SCS_QOS_ID_MASK));
++
++	ret = 0;
++ret:
++	*queue = msduq;
++	*id = qos_id;
++	return ret;
++}
++EXPORT_SYMBOL(ath12k_dp_peer_scs_data);
++
++u16 dp_peer_msduq_qos_id(struct ath12k_base *ab,
++			 struct ath12k_dp_peer_qos *qos,
++			 u16 msduq)
++{
++	u8 tid, q;
++
++	msduq = msduq - MSDUQ_MAX_DEF;
++	q = u16_get_bits(msduq, MSDUQ_MASK);
++	tid = u16_get_bits(msduq, MSDUQ_TID_MASK);
++
++	if (qos->msduq_map[tid][q].reserved)
++		return qos->msduq_map[tid][q].qos_id;
++
++	return QOS_ID_INVALID;
++}
++EXPORT_SYMBOL(dp_peer_msduq_qos_id);
+diff --git a/drivers/net/wireless/ath/ath12k/dp_peer.h b/drivers/net/wireless/ath/ath12k/dp_peer.h
+index 80108f4..5e0165b 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.h
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.h
+@@ -184,6 +184,7 @@ struct ath12k_dp_peer {
+ 
+ 	bool use_4addr;
+ 
++	struct ath12k_dp_peer_qos *qos;
+ 	/* Info used in MMIC verification of * RX fragments */
+ 	struct crypto_shash *tfm_mmic;
+ 	u8 mcast_keyidx;
+@@ -199,6 +200,48 @@ struct ath12k_dp_peer {
+ #endif
+ };
+ 
++#define QOS_TID_MAX 8
++#define QOS_TID_MDSUQ_MAX 2
++
++#define QOS_MSDUQ_MAX ((QOS_TID_MDSUQ_MAX * QOS_TID_MAX) + MSDUQ_MAX_DEF)
++
++#define QOS_MAX_SCS_ID 128
++
++#define QOS_TAG_MASK	GENMASK(7, 0)
++#define QOS_QOS_ID_MASK	GENMASK(15, 8)
++
++#define QOS_SCS_TAG	0xB9
++#define QOS_MSCS_TAG	0x58
++
++#define QOS_INVALID_MSDUQ  0x3F
++
++#define SCS_MSDUQ_MASK		GENMASK(5, 0)
++#define SCS_QOS_ID_MASK		GENMASK(15, 6)
++
++#define MSDUQ_MAX_DEF		16
++#define MSDUQ_TID_MASK		GENMASK(2, 0)
++#define MSDUQ_MASK		GENMASK(5, 3)
++
++#define MSDUQ_TID		GENMASK(2, 0)
++#define MSDUQ_FLOW_OVERRIDE	BIT(3)
++#define MSDUQ_WHO_CL_INFO	GENMASK(5, 4)
++
++struct ath12k_msduq {
++	bool reserved;
++	u8 qos_id;
++	u32 tgt_opaque_id;
++	u16 msduq;
++};
++
++struct ath12k_dl_scs {
++	u16 qos_id_msduq;
++};
++
++struct ath12k_dp_peer_qos {
++	struct ath12k_dl_scs scs_map[QOS_MAX_SCS_ID];
++	struct ath12k_msduq msduq_map[QOS_TID_MAX][QOS_TID_MDSUQ_MAX];
++};
++
+ void ath12k_peer_unmap_event(struct ath12k_base *ab, u16 peer_id);
+ void ath12k_peer_map_event(struct ath12k_base *ab, u8 vdev_id, u16 peer_id,
+ 			   u8 *mac_addr, u16 ast_hash, u16 hw_peer_id);
+@@ -241,4 +284,28 @@ ath12k_dp_link_peer_find_by_ml_peer_vdev_id(struct ath12k_dp *dp,
+ 
+ void ath12k_peer_mlo_map_event(struct ath12k_base *ab, struct sk_buff *skb);
+ void ath12k_peer_mlo_unmap_event(struct ath12k_base *ab, struct sk_buff *skb);
++struct ath12k_dp_peer_qos *
++ath12k_dp_peer_qos_get(struct ath12k_dp *dp,
++		       struct ath12k_dp_peer *peer);
++struct ath12k_dp_peer_qos *
++ath12k_dp_peer_qos_alloc(struct ath12k_dp *dp,
++			 struct ath12k_dp_peer *peer);
++void ath12k_dp_peer_qos_free(struct ath12k_dp *dp,
++			     struct ath12k_dp_peer *peer);
++int ath12k_dp_peer_scs_add(struct ath12k_base *ab,
++			   struct ath12k_dp_peer_qos *qos,
++			   u8 scs_id, u16 qos_profile_id);
++int ath12k_dp_peer_scs_del(struct ath12k_base *ab,
++			   struct ath12k_dp_peer_qos *qos,
++			   u8 scs_id);
++int ath12k_dp_peer_scs_data(struct ath12k_dp *dp,
++			    struct ath12k_dp_peer_qos *qos, u8 scs_id,
++			    u16 *msduq, u16 *qos_id);
++u16 ath12k_dp_peer_scs_get_qos_id(struct ath12k_base *ab,
++				  struct ath12k_dp_peer_qos *qos, u8 scs_id);
++u16 ath12k_dp_peer_qos_msduq(struct ath12k_base *ab,
++			     struct ath12k_dp_peer_qos *qos, u16 qos_id);
++u16 dp_peer_msduq_qos_id(struct ath12k_base *ab,
++			 struct ath12k_dp_peer_qos *qos,
++			 u16 msduq);
+ #endif
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+index ddd1690..740bf41 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_tx.c
+@@ -68,6 +68,104 @@ ath12k_wifi7_hal_tx_cmd_ext_desc_setup(struct ath12k_base *ab,
+ 						 HAL_TX_MSDU_EXT_INFO1_ENCRYPT_TYPE);
+ }
+ 
++static inline u32 ath12k_qos_get_metadata(u16 qos_id)
++{
++	u32 tcl_metadata = 0;
++
++	tcl_metadata = u32_encode_bits(HTT_TCL_META_DATA_TYPE_SVC_ID_BASED,
++				       HTT_TCL_META_DATA_TYPE_MISSION) |
++			u32_encode_bits(1, HTT_TCL_META_DATA_SAWF_TID_OVERRIDE) |
++			u32_encode_bits(qos_id, HTT_TCL_META_DATA_SAWF_SVC_ID);
++	return tcl_metadata;
++}
++
++static inline u32 ath12k_qos_get_tcl_cmd(u32 msduq)
++{
++	u32 tid, flow_override, who_classify_info_sel, update = 0;
++
++	tid = u32_get_bits(msduq, MSDUQ_TID);
++	flow_override = u32_get_bits(msduq, MSDUQ_FLOW_OVERRIDE);
++	who_classify_info_sel = u32_get_bits(msduq, MSDUQ_WHO_CL_INFO);
++
++	update = u32_encode_bits(tid, HAL_TCL_DATA_CMD_INFO3_TID) |
++		 u32_encode_bits(1, HAL_TCL_DATA_CMD_INFO3_TID_OVERWRITE) |
++		 u32_encode_bits(1, HAL_TCL_DATA_CMD_INFO3_FLOW_OVERRIDE_EN) |
++		 u32_encode_bits(who_classify_info_sel,
++				 HAL_TCL_DATA_CMD_INFO3_CLASSIFY_INFO_SEL) |
++		 u32_encode_bits(flow_override,
++				 HAL_TCL_DATA_CMD_INFO3_FLOW_OVERRIDE);
++	return update;
++}
++
++static inline
++void ath12k_wifi_qos_desc(struct hal_tcl_data_cmd *desc,
++			  u32 msduq, u16 qos_id)
++{
++	u32 meta_data_flags;
++
++	desc->info3 |= ath12k_qos_get_tcl_cmd(msduq);
++	meta_data_flags = ath12k_qos_get_metadata(qos_id);
++	desc->info1 = u32_encode_bits(meta_data_flags,
++				      HAL_TCL_DATA_CMD_INFO1_CMD_NUM);
++}
++
++static inline
++void ath12k_wifi_qos_hlos_tid(struct hal_tcl_data_cmd *desc,
++			      u8 tid)
++{
++	desc->info3 |= u32_encode_bits(tid, HAL_TCL_DATA_CMD_INFO3_TID) |
++		 u32_encode_bits(1, HAL_TCL_DATA_CMD_INFO3_TID_OVERWRITE);
++}
++
++static inline u8 ath12k_get_qos_tag(u32 mark)
++{
++	u8 qos_tag = u32_get_bits(mark, QOS_TAG_MASK);
++
++	if (qos_tag == QOS_SCS_TAG || qos_tag == QOS_MSCS_TAG)
++		return qos_tag;
++
++	return 0;
++}
++
++static inline void
++ath12k_dp_qos_update(struct ath12k_dp *dp, u32 mark,
++		     struct hal_tcl_data_cmd *desc, u8 qos_tag,
++		     u8 *addr)
++{
++	struct ath12k_dp_link_peer *peer;
++	u8 scs_id;
++	u16 msduq, qos_id;
++	int ret;
++
++	if (qos_tag == QOS_SCS_TAG) {
++		scs_id = u32_get_bits(mark, QOS_QOS_ID_MASK);
++
++		spin_lock_bh(&dp->dp_lock);
++		peer = ath12k_dp_link_peer_find_by_addr(dp, addr);
++		if (!peer) {
++			spin_unlock_bh(&dp->dp_lock);
++			return;
++		}
++		ret = ath12k_dp_peer_scs_data(dp, peer->dp_peer->qos,
++					      scs_id, &msduq, &qos_id);
++		spin_unlock_bh(&dp->dp_lock);
++
++		if (ret != 0) {
++			ath12k_err(dp->ab, "SCS Peer Data is NULL");
++			return;
++		}
++	} else {
++		msduq = u32_get_bits(mark, QOS_QOS_ID_MASK);
++	}
++	/* Update Desc for HLOS TID Override */
++	if (msduq < MSDUQ_MAX_DEF) {
++		ath12k_wifi_qos_hlos_tid(desc, msduq);
++	} else if (msduq < QOS_MSDUQ_MAX){
++	/* Update Desc for User Defined QoS MSDUQ */
++			ath12k_wifi_qos_desc(desc, msduq, qos_id);
++	}
++}
++
+ #define HTT_META_DATA_ALIGNMENT 0x8
+ 
+ /* Preparing HTT Metadata when utilized with ext MSDU */
+@@ -147,6 +245,7 @@ int ath12k_wifi7_dp_tx(struct ath12k_pdev_dp *dp_pdev,
+ 	u32 iova_mask = dp->hw_params->iova_mask;
+ 	bool is_diff_encap = false, is_null = false;
+ 	bool is_from_recycler;
++	u8 qos_tag;
+ 	bool stats_disable = ab->stats_disable;
+ 	struct hal_tcl_data_cmd tcl_desc = {0};
+ 	u8 ring_id;
+@@ -529,6 +628,13 @@ skip_htt_metadata:
+ 
+ 	ath12k_wifi7_hal_tx_cmd_desc_setup(ab, hal_tcl_desc, &ti);
+ 
++	if (unlikely(arsta)) {
++		qos_tag = ath12k_get_qos_tag(skb->mark);
++		if (qos_tag)
++			ath12k_dp_qos_update(dp, skb->mark, hal_tcl_desc,
++					     qos_tag, arsta->addr);
++	}
++
+ 	ath12k_hal_srng_access_end(ab, tcl_ring);
+ 
+ 	spin_unlock_bh(&tcl_ring->lock);
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hal_desc.h b/drivers/net/wireless/ath/ath12k/wifi7/hal_desc.h
+index 9430f4b..aed09ec 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hal_desc.h
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hal_desc.h
+@@ -1138,6 +1138,7 @@ struct hal_reo_flush_cache {
+ #define HAL_TCL_DATA_CMD_INFO2_TO_FW		BIT(21)
+ #define HAL_TCL_DATA_CMD_INFO2_PKT_OFFSET	GENMASK(31, 23)
+ 
++#define HAL_TCL_DATA_CMD_INFO3_TID_OVERWRITE		BIT(0)
+ #define HAL_TCL_DATA_CMD_INFO3_FLOW_OVERRIDE_EN		BIT(1)
+ #define HAL_TCL_DATA_CMD_INFO3_CLASSIFY_INFO_SEL	GENMASK(3, 2)
+ #define HAL_TCL_DATA_CMD_INFO3_TID			GENMASK(7, 4)
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/hw.c b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+index fc76ff5..e59c3e5 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/hw.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/hw.c
+@@ -1310,6 +1310,7 @@ static void ath12k_wifi7_mac_op_tx(struct ieee80211_hw *hw,
+ 	u16 mcbc_gsn;
+ 	u8 link_id;
+ 	int ret;
++	u8 qos_tag;
+ 
+ 	if (ahvif->vdev_type == WMI_VDEV_TYPE_MONITOR) {
+ 		ieee80211_free_txskb(hw, skb);
+@@ -1404,11 +1405,11 @@ static void ath12k_wifi7_mac_op_tx(struct ieee80211_hw *hw,
+ 
+ 	if (sta) {
+ 		ahsta = ath12k_sta_to_ahsta(sta);
+-		if (ahsta->use_4addr_set)
++		qos_tag = u32_get_bits(skb->mark, QOS_TAG_MASK);
++		if (ahsta->use_4addr_set || qos_tag)
+ 			arsta = rcu_dereference(ahsta->link[link_id]);
+ 	}
+ 
+-
+ 	/* as skb_cb is common currently for dp and mgmt tx processing
+ 	 * set this in the common mac op tx function.
+ 	 */
+@@ -1483,7 +1484,8 @@ static void ath12k_wifi7_mac_op_tx(struct ieee80211_hw *hw,
+ 			return;
+ 		}
+ 
+-		ret = ath12k_wifi7_dp_tx(dp_pdev, arvif, skb, false, 0, is_mcast, arsta);
++		ret = ath12k_wifi7_dp_tx(dp_pdev, arvif, skb, false, 0,
++					 is_mcast, arsta);
+ 		if (unlikely(ret)) {
+ 			ath12k_warn(ar->ab, "failed to transmit frame %d\n", ret);
+ 			ieee80211_free_txskb(ar->ah->hw, skb);
+@@ -1563,7 +1565,8 @@ static void ath12k_wifi7_mac_op_tx(struct ieee80211_hw *hw,
+ 
+ skip_peer_find:
+ 			ret = ath12k_wifi7_dp_tx(tmp_dp_pdev, tmp_arvif,
+-						 msdu_copied, true, mcbc_gsn, is_mcast, arsta);
++						 msdu_copied, true, mcbc_gsn,
++						 is_mcast, arsta);
+ 			if (unlikely(ret)) {
+ 				if (ret == -ENOMEM) {
+ 					/* Drops are expected during heavy multicast
+-- 
+2.34.1
+

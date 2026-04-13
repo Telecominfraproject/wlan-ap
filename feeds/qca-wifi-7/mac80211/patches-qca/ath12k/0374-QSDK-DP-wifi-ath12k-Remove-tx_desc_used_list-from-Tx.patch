@@ -1,0 +1,297 @@
+From 0bf872708381e88ae7b397b2da278cacfa003572 Mon Sep 17 00:00:00 2001
+From: Ripan Deuri <rdeuri@qti.qualcomm.com>
+Date: Thu, 29 May 2025 13:20:01 +0530
+Subject: [PATCH 1/3] QSDK: DP: wifi: ath12k: Remove tx_desc_used_list from Tx
+ descriptor handling
+
+In the current architecture, there are 2 linked lists in ath12k_dp
+for managing software Tx descriptor.
+    1. struct list_head tx_desc_free_list[ATH12K_HW_MAX_QUEUES];
+    2. struct list_head tx_desc_used_list[ATH12K_HW_MAX_QUEUES];
+
+1# is used to keep track of free descriptors.
+2# is used to keep track of used descriptors.
+
+The complete database of software Tx descriptors is maintained in
+struct ath12k_tx_desc_info *txbaddr[ATH12K_NUM_TX_SPT_PAGES] in ath12k_dp.
+
+In Tx enqueue path, Tx descriptor is removed from tx_desc_free_list and
+added to tx_desc_used_list, while in Tx completion path, Tx descriptor is
+removed from tx_desc_used_list and added back to tx_desc_free_list.
+
+With Tx KPI optimization changes coming in upcoming patches in Tx
+completion path, a local linked list shall be used for maintaining the Tx
+descriptors which shall then be added back to tx_desc_free_list.
+
+With above change, there can be issues in scenarios wherein deinit and Tx
+completion handler are accessing the descriptors.
+
+In order to fix this, remove list tx_desc_used_list and add a new field
+"in_use" in struct ath12k_tx_desc_info to indicate that this Tx desciptor
+is being used.
+
+With removal of tx_desc_used_list, wherever iteration is required iterate
+over txbaddr and make use of "in_use" for decision making.
+
+Signed-off-by: Ripan Deuri <rdeuri@qti.qualcomm.com>
+Signed-off-by: Harsh Kumar Bijlani <hbijlani@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp.c    | 112 ++++++++++++++----------
+ drivers/net/wireless/ath/ath12k/dp.h    |   2 +-
+ drivers/net/wireless/ath/ath12k/dp_tx.c |   6 +-
+ drivers/net/wireless/ath/ath12k/mac.c   |  26 ++++--
+ 4 files changed, 87 insertions(+), 59 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp.c b/drivers/net/wireless/ath/ath12k/dp.c
+index 818f63e..cd00e4d 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -1242,12 +1242,12 @@ void ath12k_dp_vdev_tx_attach(struct ath12k *ar, struct ath12k_link_vif *arvif)
+ static void ath12k_dp_cc_cleanup(struct ath12k_base *ab)
+ {
+ 	struct ath12k_rx_desc_info *desc_info;
+-	struct ath12k_tx_desc_info *tx_desc_info, *tmp1;
++	struct ath12k_tx_desc_info *tx_desc_info;
+ 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
+ 	struct ath12k_skb_cb *skb_cb;
+ 	struct sk_buff *skb;
+ 	struct ath12k *ar;
+-	int i, j;
++	int i, j, k;
+ 	u32 pool_id, tx_spt_page;
+ 
+ 	if (!dp->spt_info)
+@@ -1289,36 +1289,44 @@ static void ath12k_dp_cc_cleanup(struct ath12k_base *ab)
+ 	for (i = 0; i < ATH12K_HW_MAX_QUEUES; i++) {
+ 		spin_lock_bh(&dp->tx_desc_lock[i]);
+ 
+-		list_for_each_entry_safe(tx_desc_info, tmp1, &dp->tx_desc_used_list[i],
+-					 list) {
+-			list_del(&tx_desc_info->list);
+-			skb = tx_desc_info->skb;
+-
+-			if (!skb)
+-				continue;
++		for (j = 0; j < ATH12K_TX_SPT_PAGES_PER_POOL; j++) {
++			tx_spt_page = j + i * ATH12K_TX_SPT_PAGES_PER_POOL;
++			tx_desc_info = dp->txbaddr[tx_spt_page];
++			for (k = 0; k < ATH12K_MAX_SPT_ENTRIES; k++) {
++				if (!tx_desc_info[k].in_use)
++					continue;
++
++				skb = tx_desc_info[k].skb;
++				if (!skb)
++					continue;
++
++				tx_desc_info[k].skb = NULL;
++
++				if (tx_desc_info[k].skb_ext_desc) {
++					ath12k_core_dma_unmap_single(ab->dev,
++								     ATH12K_SKB_CB(skb)->paddr_ext_desc,
++								     tx_desc_info[k].skb_ext_desc->len,
++								     DMA_TO_DEVICE);
++					dev_kfree_skb_any(tx_desc_info[k].skb_ext_desc);
++					tx_desc_info[k].skb_ext_desc = NULL;
++				}
+ 
+-			if (tx_desc_info->skb_ext_desc) {
+-				ath12k_core_dma_unmap_single(ab->dev,
+-							     ATH12K_SKB_CB(skb)->paddr_ext_desc,
+-							     tx_desc_info->skb_ext_desc->len,
+-							     DMA_TO_DEVICE);
+-				dev_kfree_skb_any(tx_desc_info->skb_ext_desc);
+-			}
++				/* if we are unregistering, hw would've been destroyed and
++				 * ar is no longer valid.
++				 */
++				if (!(test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))) {
++					skb_cb = ATH12K_SKB_CB(skb);
++					ar = skb_cb->u.ar;
++					if (atomic_dec_and_test(&ar->dp.num_tx_pending))
++						wake_up(&ar->dp.tx_empty_waitq);
++				}
+ 
+-			/* if we are unregistering, hw would've been destroyed and
+-			 * ar is no longer valid.
+-			 */
+-			if (!(test_bit(ATH12K_FLAG_UNREGISTERING, &ab->dev_flags))) {
+-				skb_cb = ATH12K_SKB_CB(skb);
+-				ar = skb_cb->u.ar;
++				ath12k_core_dma_unmap_single(ab->dev, ATH12K_SKB_CB(skb)->paddr,
++							     skb->len, DMA_TO_DEVICE);
++				dev_kfree_skb_any(skb);
+ 
+-				if (atomic_dec_and_test(&ar->dp.num_tx_pending))
+-					wake_up(&ar->dp.tx_empty_waitq);
++				tx_desc_info[k].in_use = false;
+ 			}
+-
+-			ath12k_core_dma_unmap_single(ab->dev, ATH12K_SKB_CB(skb)->paddr,
+-						     skb->len, DMA_TO_DEVICE);
+-			dev_kfree_skb_any(skb);
+ 		}
+ 
+ 		spin_unlock_bh(&dp->tx_desc_lock[i]);
+@@ -1785,7 +1793,6 @@ static int ath12k_dp_cc_init(struct ath12k_base *ab)
+ 
+ 	for (i = 0; i < ATH12K_HW_MAX_QUEUES; i++) {
+ 		INIT_LIST_HEAD(&dp->tx_desc_free_list[i]);
+-		INIT_LIST_HEAD(&dp->tx_desc_used_list[i]);
+ 		spin_lock_init(&dp->tx_desc_lock[i]);
+ 	}
+ 
+@@ -2112,10 +2119,11 @@ void ath12k_dp_srng_hw_ring_disable(struct ath12k_base *ab)
+ void ath12k_dp_umac_txrx_desc_cleanup(struct ath12k_base *ab)
+ {
+ 	struct ath12k_rx_desc_info *desc_info;
+-	struct ath12k_tx_desc_info *tx_desc_info, *tmp;
++	struct ath12k_tx_desc_info *tx_desc_info;
+ 	struct ath12k_dp *dp;
+ 	struct sk_buff *skb;
+-	int i, j;
++	int i, j, k;
++	u32 tx_spt_page;
+ 
+ 	dp = ath12k_ab_to_dp(ab);
+ 	/* RX Descriptor cleanup */
+@@ -2149,25 +2157,35 @@ void ath12k_dp_umac_txrx_desc_cleanup(struct ath12k_base *ab)
+ 	/* TX Descriptor cleanup */
+ 	for (i = 0; i < ATH12K_HW_MAX_QUEUES; i++) {
+ 		spin_lock_bh(&dp->tx_desc_lock[i]);
+-		list_for_each_entry_safe(tx_desc_info, tmp, &dp->tx_desc_used_list[i],
+-					 list) {
+-			skb = tx_desc_info->skb;
+-			if (!skb)
+-				continue;
++		for (j = 0; j < ATH12K_TX_SPT_PAGES_PER_POOL; j++) {
++			tx_spt_page = j + i * ATH12K_TX_SPT_PAGES_PER_POOL;
++			tx_desc_info = dp->txbaddr[tx_spt_page];
++
++			for (k = 0; k < ATH12K_MAX_SPT_ENTRIES; k++) {
++				if (!tx_desc_info[k].in_use)
++					continue;
++
++				skb = tx_desc_info[k].skb;
++				if (!skb)
++					continue;
++
++				tx_desc_info[k].skb = NULL;
++
++				if (tx_desc_info[k].skb_ext_desc) {
++					ath12k_core_dma_unmap_single(ab->dev,
++								     ATH12K_SKB_CB(skb)->paddr_ext_desc,
++								     tx_desc_info[k].skb_ext_desc->len,
++								     DMA_TO_DEVICE);
++					dev_kfree_skb_any(tx_desc_info[k].skb_ext_desc);
++					tx_desc_info[k].skb_ext_desc = NULL;
++				}
+ 
+-			tx_desc_info->skb = NULL;
++				ath12k_core_dma_unmap_single(ab->dev, ATH12K_SKB_CB(skb)->paddr,
++							     skb->len, DMA_TO_DEVICE);
++				dev_kfree_skb_any(skb);
+ 
+-			if (tx_desc_info->skb_ext_desc) {
+-				ath12k_core_dma_unmap_single(ab->dev,
+-							     ATH12K_SKB_CB(skb)->paddr_ext_desc,
+-							     tx_desc_info->skb_ext_desc->len,
+-							     DMA_TO_DEVICE);
+-				dev_kfree_skb_any(tx_desc_info->skb_ext_desc);
++				tx_desc_info[k].in_use = false;
+ 			}
+-
+-			ath12k_core_dma_unmap_single(ab->dev, ATH12K_SKB_CB(skb)->paddr,
+-						     skb->len, DMA_TO_DEVICE);
+-			dev_kfree_skb_any(skb);
+ 		}
+ 		spin_unlock_bh(&dp->tx_desc_lock[i]);
+ 	}
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+index 1a3b07b..4500edc 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -386,6 +386,7 @@ struct ath12k_tx_desc_info {
+ 	struct sk_buff *skb_ext_desc;
+ 	u32 desc_id; /* Cookie */
+ 	u8 mac_id	: 5,
++	   in_use	: 1,
+ 	   flags	: 1;
+ 	u8 pool_id;
+ };
+@@ -639,7 +640,6 @@ struct ath12k_dp {
+ 	spinlock_t rx_desc_lock;
+ 
+ 	struct list_head tx_desc_free_list[ATH12K_HW_MAX_QUEUES];
+-	struct list_head tx_desc_used_list[ATH12K_HW_MAX_QUEUES];
+ 	/* protects the free and used desc lists */
+ 	spinlock_t tx_desc_lock[ATH12K_HW_MAX_QUEUES];
+ 
+diff --git a/drivers/net/wireless/ath/ath12k/dp_tx.c b/drivers/net/wireless/ath/ath12k/dp_tx.c
+index 2138944..8f3125b 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -278,7 +278,8 @@ void ath12k_dp_tx_release_txbuf(struct ath12k_dp *dp,
+ {
+ 	spin_lock_bh(&dp->tx_desc_lock[pool_id]);
+ 	tx_desc->skb_ext_desc = NULL;
+-	list_move_tail(&tx_desc->list, &dp->tx_desc_free_list[pool_id]);
++	tx_desc->in_use = false;
++	list_add_tail(&tx_desc->list, &dp->tx_desc_free_list[pool_id]);
+ 	spin_unlock_bh(&dp->tx_desc_lock[pool_id]);
+ }
+ EXPORT_SYMBOL(ath12k_dp_tx_release_txbuf);
+@@ -298,7 +299,8 @@ struct ath12k_tx_desc_info *ath12k_dp_tx_assign_buffer(struct ath12k_dp *dp,
+ 		return NULL;
+ 	}
+ 
+-	list_move_tail(&desc->list, &dp->tx_desc_used_list[pool_id]);
++	list_del(&desc->list);
++	desc->in_use = true;
+ 	spin_unlock_bh(&dp->tx_desc_lock[pool_id]);
+ 
+ 	return desc;
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index cdd10fc..3498bd7 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -13674,20 +13674,28 @@ static void ath12k_mac_vif_unref(struct ath12k_dp *dp, struct ieee80211_vif *vif
+ 	struct ath12k_tx_desc_info *tx_desc_info;
+ 	struct ath12k_skb_cb *skb_cb;
+ 	struct sk_buff *skb;
+-	int i;
++	u32 tx_spt_page;
++	int i, j, k;
+ 
+ 	for (i = 0; i < ATH12K_HW_MAX_QUEUES; i++) {
+ 		spin_lock_bh(&dp->tx_desc_lock[i]);
+ 
+-		list_for_each_entry(tx_desc_info, &dp->tx_desc_used_list[i],
+-				    list) {
+-			skb = tx_desc_info->skb;
+-			if (!skb)
+-				continue;
++		for (j = 0; j < ATH12K_TX_SPT_PAGES_PER_POOL; j++) {
++			tx_spt_page = j + i * ATH12K_TX_SPT_PAGES_PER_POOL;
++			tx_desc_info = dp->txbaddr[tx_spt_page];
++
++			for (k = 0; k < ATH12K_MAX_SPT_ENTRIES; k++) {
++				if (!tx_desc_info[k].in_use)
++					continue;
+ 
+-			skb_cb = ATH12K_SKB_CB(skb);
+-			if (skb_cb->vif == vif)
+-				skb_cb->vif = NULL;
++				skb = tx_desc_info[k].skb;
++				if (!skb)
++					continue;
++
++				skb_cb = ATH12K_SKB_CB(skb);
++				if (skb_cb->vif == vif)
++					skb_cb->vif = NULL;
++			}
+ 		}
+ 
+ 		spin_unlock_bh(&dp->tx_desc_lock[i]);
+-- 
+2.34.1
+

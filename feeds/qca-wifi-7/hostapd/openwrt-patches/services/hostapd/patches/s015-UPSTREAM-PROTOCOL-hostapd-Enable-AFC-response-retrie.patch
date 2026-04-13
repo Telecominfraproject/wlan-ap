@@ -1,0 +1,452 @@
+From 32ffef2402f75e49ff2d606cf1eed379ee229f31 Mon Sep 17 00:00:00 2001
+From: Priyadarshnee Srinivasan <priys@qti.qualcomm.com>
+Date: Mon, 29 Sep 2025 12:26:18 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL: hostapd: Enable AFC response retrieval to 
+ restore SP power mode after 'wifi' command
+
+When the 'wifi' command is issued, the firmware remains active, but
+hostapd restarts and loses the AFC response, causing the AP
+to fall back to LPI power mode. However, the ath12k driver and
+cfg80211 layer retain the AFC payload, as confirmed by SP channel
+availability in 'iw reg get'.
+
+Introduce the vendor command QCA_NL80211_VENDOR_SUBCMD_AFC_FETCH_POWER_EVENT
+to address this issue. Upon hostapd restart, if a 6 GHz interface
+is configured and SP channels are detected via
+hostapd_setup_interface_complete_sync, hostapd queries the driver
+for the AFC response using this command and the attribute
+QCA_WLAN_VENDOR_ATTR_CONFIG_RADIO_INDEX.
+
+Implement hostapd_fetch_afc_power_event to retrieve
+the AFC response synchronously. Process the response using
+qca_nl80211_handle_afc_events, enabling the AP to select the
+best power mode and transition to SP mode if available.
+
+Fixes: None
+Patch-work: None
+Tag: AFC
+Patch-dependency:
+r66-UPSTREAM-PROTOCOL-hostapd-Handle-AFC-Channel-Change.patch
+0002-QSDK-hostapd-Add-code-to-integrate-extension-code-with-hostapd.patch
+
+Signed-off-by: Priyadarshnee Srinivasan <priys@qti.qualcomm.com>
+---
+ src/ap/ap_drv_ops.h                |  16 +++++
+ src/ap/drv_callbacks.c             |  12 ++++
+ src/ap/hostapd.c                   | 103 +++++++++++++++++++++++++++++
+ src/common/qca-vendor.h            |   8 +++
+ src/drivers/driver.h               |  15 +++++
+ src/drivers/driver_nl80211.c       | 102 ++++++++++++++++++++++++++++
+ src/drivers/driver_nl80211.h       |  19 ++++++
+ src/drivers/driver_nl80211_event.c |   2 +-
+ 8 files changed, 276 insertions(+), 1 deletion(-)
+
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index 629b63c3e1..73ffd18530 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -596,6 +596,22 @@ hostapd_drv_reset_afc(struct hostapd_data *hapd)
+ 	return hapd->driver->reset_afc(hapd->drv_priv, hapd->mld_link_id);
+ }
+ 
++/**
++ * hostapd_drv_fetch_afc_power_event - Fetch AFC power event from driver
++ * @hapd: hostapd data
++ * @radio_idx: Radio index for which to fetch the event
++ * Return: 0 on success, -ve value on failure
++ */
++static inline int
++hostapd_drv_fetch_afc_power_event(struct hostapd_data *hapd, uint8_t radio_idx)
++{
++	if (hapd->driver == NULL || hapd->drv_priv == NULL ||
++	    hapd->driver->fetch_afc_power_event == NULL)
++		return -1;
++
++	return hapd->driver->fetch_afc_power_event(hapd->drv_priv, radio_idx);
++}
++
+ struct hostapd_multi_hw_info *
+ hostapd_get_multi_hw_info(struct hostapd_data *hapd,
+ 			  unsigned int *num_multi_hws);
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 3da6d048bf..976e0e5c00 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -2589,6 +2589,18 @@ static void hostapd_event_afc_update_complete(
+ 		return;
+ 	}
+ 	iface->is_afc_power_event_received = true;
++
++	if (hapd->driver && hapd->driver->is_only_afc_power_fetch &&
++	    hapd->drv_priv) {
++		bool is_only_afc_power_fetch =
++			hapd->driver->is_only_afc_power_fetch(hapd->drv_priv);
++
++		if (is_only_afc_power_fetch) {
++			wpa_printf(MSG_DEBUG, "AFC info fetch completed, no channel change requested\n");
++			return;
++		}
++	}
++
+ 	if (hostapd_drv_is_retail_afc_supported(hapd)) {
+ 		iface->is_afc_channel_change_pending = true;
+ 		/* Wait for NL8011_WIPHY_REG_CHANGE event to get the updated channel list */
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 130708a37e..1efca6340c 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -3051,6 +3051,91 @@ static void hostapd_interface_setup_failure_handler(void *eloop_ctx,
+ 		hapd->setup_complete_cb(hapd->setup_complete_cb_ctx);
+ }
+ 
++/**
++ * hostapd_is_sp_chans_available - Check if at least one tx-able
++ * 6Ghz SP channel is available for operation (A channel is non-tx-able if there
++ * is NO_IR flag is set in it)
++ * @iface: Pointer to hostapd interface data
++ * Return: true if SP channels are available, false otherwise
++ */
++static bool
++hostapd_is_sp_chans_available(struct hostapd_iface *iface)
++{
++	int i;
++	struct hostapd_hw_modes *mode = NULL;
++	bool sp_available = false;
++	struct hostapd_channel_data *pwr_mode_chan_list;
++	u8 num_6ghz_chans;
++
++	if (!iface->num_hw_features) {
++		wpa_printf(MSG_ERROR, "No hw features");
++		return sp_available;
++	}
++
++	for (i = 0; i < iface->num_hw_features; i++) {
++		if (iface->hw_features[i].is_6ghz) {
++			mode = &iface->hw_features[i];
++			break;
++		}
++	}
++	if (!mode) {
++		wpa_printf(MSG_ERROR, "No 6 GHz mode");
++		return sp_available;
++	}
++
++	num_6ghz_chans = mode->channels_6ghz.num_channels_6ghz[NL80211_REG_AP_SP];
++	pwr_mode_chan_list = mode->channels_6ghz.chans_6ghz[NL80211_REG_AP_SP];
++	if (!num_6ghz_chans || !pwr_mode_chan_list) {
++		wpa_printf(MSG_ERROR, "No 6 GHz SP channels");
++		return sp_available;
++	}
++
++	for (i = 0; i < num_6ghz_chans; i++) {
++		if (!(pwr_mode_chan_list[i].flag & HOSTAPD_CHAN_NO_IR) &&
++		    !(pwr_mode_chan_list[i].flag & HOSTAPD_CHAN_DISABLED)) {
++		    wpa_printf(MSG_DEBUG, "SP channel available: %d MHz",
++			       pwr_mode_chan_list[i].freq);
++		    sp_available = true;
++		    break;
++		}
++	}
++	return sp_available;
++}
++
++/**
++ * hostapd_fetch_afc_power_event - Fetch AFC power event from the driver
++ * @hapd: Pointer to hostapd BSS data
++ * Return: 0 on success, -ve value on failure
++ */
++static int hostapd_fetch_afc_power_event(struct hostapd_data *hapd)
++{
++#ifdef NEED_AP_MLME
++	uint8_t radio_idx = NL80211_WIPHY_RADIO_ID_MAX;
++	int ret = -1;
++
++	if (!hostapd_drv_is_retail_afc_supported(hapd)) {
++		wpa_printf(MSG_ERROR, "AFC enterprise mode, hostapd not supported");
++		return ret;
++	}
++
++	if (hapd->iface->num_multi_hws) {
++		if (hapd->iface->current_hw_info) {
++			radio_idx = hapd->iface->current_hw_info->hw_idx;
++		} else {
++			wpa_printf(MSG_ERROR, "No current_hw_info");
++			return ret;
++		}
++	}
++	wpa_printf(MSG_DEBUG, "Fetching AFC power event from the driver for idx: %d\n", radio_idx);
++	ret = hostapd_drv_fetch_afc_power_event(hapd, radio_idx);
++	if (ret)
++		wpa_printf(MSG_ERROR, "Failed to fetch AFC power event from driver: %d", ret);
++
++	return ret;
++#else /* NEED_AP_MLME */
++	return -1;
++#endif /* NEED_AP_MLME */
++}
+ 
+ static int hostapd_setup_interface_complete_sync(struct hostapd_iface *iface,
+ 						 int err)
+@@ -3133,6 +3218,24 @@ static int hostapd_setup_interface_complete_sync(struct hostapd_iface *iface,
+ 			u8 center_chan_no;
+ 			u16 center_freq;
+ 
++			if (!iface->is_afc_power_event_received) {
++			    bool sp_available = hostapd_is_sp_chans_available(iface);
++
++			    if (sp_available) {
++				int ret;
++
++				wpa_printf(MSG_DEBUG,
++					   "SP channels available in 6 GHz band for best power mode operation, fetching from driver");
++				ret = hostapd_fetch_afc_power_event(hapd);
++				if (ret)
++				    wpa_printf(MSG_DEBUG,
++					       "Failed to fetch AFC power event from driver");
++				/* Proceed with best power mode calculation */
++			    } else {
++				wpa_printf(MSG_DEBUG,
++					   "No SP channels available in 6 GHz band for best power mode operation");
++			    }
++			}
+ 			ch_width = hostapd_get_chan_width_from_oper_chan_width(iface->conf);
+ 			center_chan_no = hostapd_get_oper_centr_freq_seg0_idx(iface->conf);
+ 			center_freq = ieee80211_chan_to_freq(NULL, iface->conf->op_class,
+diff --git a/src/common/qca-vendor.h b/src/common/qca-vendor.h
+index 8a54009770..09fb6052aa 100644
+--- a/src/common/qca-vendor.h
++++ b/src/common/qca-vendor.h
+@@ -3901,6 +3901,14 @@ enum qca_wlan_vendor_attr_config {
+ 	 * 0 - Disable.
+ 	 */
+ 	QCA_WLAN_VENDOR_ATTR_CONFIG_SETUP_LINK_RECONFIG_SUPPORT = 130,
++	/* 8-bit unsigned value. Used to specify the HW Radio Index of a wiphy
++	 * device that is being configured. This attribute may be included in
++	 * %QCA_NL80211_VENDOR_SUBCMD_SET_WIPHY_CONFIGURATION or
++	 * %QCA_NL80211_VENDOR_SUBCMD_GET_WIPHY_CONFIGURATION subcmds to
++	 * specify a particular Radio of the wiphy device.
++	 */
++	QCA_WLAN_VENDOR_ATTR_CONFIG_RADIO_INDEX = 135,
++
+ 
+ 	/* keep last */
+ 	QCA_WLAN_VENDOR_ATTR_CONFIG_AFTER_LAST,
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 5289fa4a56..4ea61ae984 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -3880,6 +3880,13 @@ struct wpa_driver_ops {
+ 	 */
+ 	unsigned int (*get_ifindex)(void *priv);
+ 
++	/**
++	 * is_only_afc_power_fetch - Check if only AFC power fetch is required
++	 * not channel change is needed.
++	 * @priv: private driver interface data
++	 */
++	bool (*is_only_afc_power_fetch)(void *priv);
++
+ 	/**
+ 	 * get_ifname - Get interface name
+ 	 * @priv: private driver interface data
+@@ -6084,6 +6091,14 @@ struct wpa_driver_ops {
+ 	 * Returns: 0 on success, -1 on failure
+ 	 */
+ 	int (*reset_afc)(void *priv, u8 link_id);
++	/**
++	 * fetch_afc_power_event - Request the driver to send the AFC power event that it has cached
++	 * so that hostapd chan choose an SP channel for bring-up.
++	 * @priv: Private driver interface data
++	 * Returns: 0 on success, -1 on failure
++	 */
++	int (*fetch_afc_power_event)(void *priv, u8 radio_idx);
++
+ 
+ #ifdef CONFIG_IEEE80211BE
+ 	/**
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 8b211b7e9e..ed4b2acd15 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -1081,6 +1081,13 @@ static unsigned int nl80211_get_ifindex(void *priv)
+ 	return drv->ifindex;
+ }
+ 
++static bool nl80211_is_only_afc_power_fetch(void *priv)
++{
++	struct i802_bss *bss = priv;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++
++	return drv->is_only_fetch_afc_power_info;
++}
+ 
+ static int wpa_driver_nl80211_get_bssid(void *priv, u8 *bssid)
+ {
+@@ -16438,6 +16445,99 @@ error:
+ 	return ret;
+ }
+ 
++/**
++ * afc_process_power_event - Process AFC power event from the driver
++ * @msg: Pointer to netlink message
++ * @arg: Pointer to i802_bss
++ */
++static int
++afc_process_power_event(struct nl_msg *msg, void *arg)
++{
++	struct nlattr *tb[NL80211_ATTR_MAX + 1];
++	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
++	u8 *data;
++	u32 wiphy;
++	size_t len;
++	struct i802_bss *bss = arg;
++	int ret;
++
++	ret = nla_parse(tb, NL80211_ATTR_MAX,
++			genlmsg_attrdata(gnlh, 0),
++			genlmsg_attrlen(gnlh, 0), NULL);
++	if (ret) {
++	    wpa_printf(MSG_DEBUG, "nl80211: Failed to parse netlink attributes: %d", ret);
++	    return NL_SKIP;
++	}
++
++	if (tb[NL80211_ATTR_WIPHY]) {
++		wiphy = nla_get_u32(tb[NL80211_ATTR_WIPHY]);
++		wpa_printf(MSG_DEBUG, "nl80211: AFC power event on wiphy %u with cmd: %u\n", wiphy, gnlh->cmd);
++	}
++
++	if (!tb[NL80211_ATTR_VENDOR_DATA]) {
++		wpa_printf(MSG_DEBUG, "nl80211: No vendor data in AFC power event");
++		return NL_SKIP;
++	}
++	data = nla_data(tb[NL80211_ATTR_VENDOR_DATA]);
++	len = nla_len(tb[NL80211_ATTR_VENDOR_DATA]);
++	wpa_hexdump(MSG_MSGDUMP, "nl80211: AFC Vendor data", data, len);
++	ret = qca_nl80211_handle_afc_events(bss, data, len);
++	if (ret)
++		wpa_printf(MSG_DEBUG, "nl80211: Failed to handle AFC event: %d", ret);
++
++	return NL_SKIP;
++}
++
++/**
++ * nl80211_fetch_afc_power_event - Fetch AFC power event from the driver
++ * @priv: Pointer to i802_bss
++ * @radio_idx: Radio index to fetch the AFC power event for
++ *
++ * Return: 0 on success,-ve value on failure
++ */
++static int nl80211_fetch_afc_power_event(void *priv, u8 radio_idx)
++{
++	struct nl_msg *msg;
++	struct i802_bss *bss = priv;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++	struct nlattr *params;
++	int ret = -ENOBUFS;
++
++	wpa_printf(MSG_DEBUG, "nl80211: Fetching AFC power event\n");
++
++	if (drv->nlmode != NL80211_IFTYPE_AP)
++		return -EOPNOTSUPP;
++	if (!(msg = nl80211_bss_msg(bss, 0, NL80211_CMD_VENDOR)) ||
++	    nla_put_u32(msg, NL80211_ATTR_VENDOR_ID, OUI_QCA) ||
++	    nla_put_u32(msg, NL80211_ATTR_VENDOR_SUBCMD,
++			QCA_NL80211_VENDOR_SUBCMD_AFC_FETCH_POWER_EVENT)) {
++		goto error;
++	}
++
++	params = nla_nest_start(msg, NL80211_ATTR_VENDOR_DATA);
++	if (!params)
++		goto error;
++	if (radio_idx != NL80211_WIPHY_RADIO_ID_MAX &&
++	    nla_put_u8(msg,QCA_WLAN_VENDOR_ATTR_CONFIG_RADIO_INDEX, radio_idx))
++		goto error;
++	nla_nest_end(msg, params);
++
++	wpa_printf(MSG_DEBUG, "nl80211: Fetching AFC power event for radio_id: %d\n", radio_idx);
++
++	drv->is_only_fetch_afc_power_info = true;
++	ret = send_and_recv_resp(drv, msg, afc_process_power_event, bss);
++	if (ret)
++		wpa_printf(MSG_DEBUG,
++			   "nl80211: AFC fetch power event failed err=%d (%s)",
++			   ret, strerror(-ret));
++	drv->is_only_fetch_afc_power_info = false;
++
++	return ret;
++error:
++	nlmsg_free(msg);
++	wpa_printf(MSG_DEBUG, "nl80211: Could not fetch afc power event on radio: %u", radio_idx);
++	return ret;
++}
+ 
+ static int nl80211_reset_afc(void *priv, u8 link_id)
+ {
+@@ -16602,6 +16702,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.add_tx_ts = nl80211_add_ts,
+ 	.del_tx_ts = nl80211_del_ts,
+ 	.get_ifindex = nl80211_get_ifindex,
++	.is_only_afc_power_fetch = nl80211_is_only_afc_power_fetch,
+ #ifdef CONFIG_DRIVER_NL80211_QCA
+ 	.roaming = nl80211_roaming,
+ 	.disable_fils = nl80211_disable_fils,
+@@ -16668,6 +16769,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.set_qos = nl80211_set_qos,
+ 	.clear_afc_payload = nl80211_clear_afc_payload,
+ 	.reset_afc = nl80211_reset_afc,
++	.fetch_afc_power_event = nl80211_fetch_afc_power_event,
+ #ifdef CONFIG_IEEE80211BE
+ 	.read_link_set_beacon = wpa_driver_read_link_set_beacon,
+ #endif /* CONFIG_IEEE80211BE */
+diff --git a/src/drivers/driver_nl80211.h b/src/drivers/driver_nl80211.h
+index 375b45a584..fcac0d2d95 100644
+--- a/src/drivers/driver_nl80211.h
++++ b/src/drivers/driver_nl80211.h
+@@ -265,6 +265,17 @@ struct wpa_driver_nl80211_data {
+ 	 * (NL80211_CMD_VENDOR). 0 if no pending scan request.
+ 	 */
+ 	int last_scan_cmd;
++	/* To indicate that only AFC power info is being fetched without
++	 * triggering an automatic channel change after power response.
++	 * This variable is set to "true" during  hostapd_setup_interface_complete_sync
++	 * during hostapd bringup so that it fetches the AFC power info without
++	 * changing the channel, the best power mode for the bootup channel is set.
++	 * This variable is reset to "false" after the operation so that after
++	 * every power response received, channel change can be done if required.
++	 *
++	 */
++	bool is_only_fetch_afc_power_info;
++
+ #ifdef CONFIG_DRIVER_NL80211_QCA
+ 	bool roam_indication_done;
+ 	u8 *pending_roam_data;
+@@ -452,5 +463,13 @@ u32 get_nl80211_protocol_features(struct wpa_driver_nl80211_data *drv);
+ 
+ int get_sta_mlo_interface_info(struct wpa_driver_nl80211_data *drv);
+ void nl80211_free_sta_driver_link_data(struct hostap_sta_driver_data *data);
++/*
++ * qca_nl80211_handle_afc_events - Handle AFC events from the driver
++ * @bss: Pointer to the BSS data
++ * @data: Event data
++ * @len: Length of the event data
++ * Returns: 0 on success, -ve value on failure
++ */
++int qca_nl80211_handle_afc_events(struct i802_bss *bss, u8 *data, size_t len);
+ 
+ #endif /* DRIVER_NL80211_H */
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index 1327b68a51..b3eccdbdff 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -4353,7 +4353,7 @@ qca_nl80211_afc_power_update_completed(struct i802_bss *bss,
+ 	return 0;
+ }
+ 
+-static int
++int
+ qca_nl80211_handle_afc_events(struct i802_bss *bss,
+ 			      u8 *data, size_t len)
+ {
+-- 
+2.34.1
+

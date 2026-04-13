@@ -1,0 +1,490 @@
+From 59313a2cc9a45b3300ea88e737fd129b15786ced Mon Sep 17 00:00:00 2001
+From: Priyadarshnee Srinivasan <priys@qti.qualcomm.com>
+Date: Fri, 27 Jun 2025 14:58:29 +0530
+Subject: [PATCH] UPSTREAM:PROTOCOL wifi:ath12k: Handle switch to LPI and
+ invalid payload
+
+Currently, when the AFC server becomes unreachable, the firmware continues
+using the previously provisioned AFC payload and remains in standard power
+mode for the duration of the grace period. This has a problem where the
+system does not proactively transition to low power mode or notify user
+space until the grace period expires.
+
+To address this issue, handle the SWITCH_TO_LPI event from
+HALPHY by clearing the current AFC payload in the driver and notifying user
+space through a vendor NL event. Mark all standard power regulatory rules
+in the current regulatory domain as NO_IR to indicate that standard power
+transmission is no longer permitted.
+
+Also handle invalid AFC payloads received from firmware. If the payload
+is empty or the AFC power event indicates failure, clear the existing
+payload and apply the same actions as for the SWITCH_TO_LPI event.
+
+These changes ensure that user space applications are informed of
+AFC fallback conditions and can respond appropriately by clearing their
+payloads and switching to the lowest or best available power mode. If no
+valid channels are found, applications are expected to
+bring down the 6 GHz link.
+
+Patch-dependency:
+0346-02-wifi-ath12k-Add-support-for-processing-AFC-power-eve.patch
+0346-04-wifi-ath12k-Send-power-update-complete-event-after-A.patch
+0346-06-wifi-ath12k-Extract-AFC-response-and-send-AFC-cmd-to.patch
+0048-cfg80211-mac80211-regulatory-awgn-and-6g-channel-cha.patch
+
+Feature: AFC
+Tag: 6G_REGULATORY
+
+Signed-off-by: Priyadarshnee Srinivasan <priys@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/reg.c    | 176 ++++++++++++++++++++++-
+ drivers/net/wireless/ath/ath12k/reg.h    |   7 +
+ drivers/net/wireless/ath/ath12k/vendor.c |  97 +++++++++++++
+ drivers/net/wireless/ath/ath12k/vendor.h |   9 ++
+ drivers/net/wireless/ath/ath12k/wmi.c    |  48 ++-----
+ 5 files changed, 296 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/reg.c b/drivers/net/wireless/ath/ath12k/reg.c
+index e8313a8..d062680 100644
+--- a/drivers/net/wireless/ath/ath12k/reg.c
++++ b/drivers/net/wireless/ath/ath12k/reg.c
+@@ -1297,6 +1297,134 @@ void ath12k_reg_get_afc_eirp_power_for_bw(struct ath12k *ar, u16 *start_freq,
+ 	*tx_power = ath12k_reg_get_afc_eirp_power(ar, bw, cfi);
+ }
+ 
++/**
++ * ath12k_is_reg_rule_subset_of_chip_range() - Check if the rule range
++ * is subset of chip range
++ * @rule_range: rule range
++ * @chip_range: chip range
++ *
++ * Return: true if rule range is subset of chip range
++ */
++static bool
++ath12k_is_reg_rule_subset_of_chip_range(struct ieee80211_freq_range rule_range,
++					struct ieee80211_freq_range chip_range)
++{
++	if (rule_range.start_freq_khz >= chip_range.start_freq_khz &&
++	    rule_range.end_freq_khz <= chip_range.end_freq_khz)
++		return true;
++
++	return false;
++}
++
++/**
++ * ath12k_get_current_regd() - Get the current regulatory domain
++ * @ar: pointer to ath12k
++ *
++ * Return: pointer to the current regulatory domain or NULL in case of error
++ */
++static struct ieee80211_regdomain *ath12k_get_current_regd(struct ath12k *ar)
++{
++	struct ath12k_base *ab = ar->ab;
++	struct ieee80211_regdomain *regd;
++
++	spin_lock_bh(&ab->base_lock);
++	if (ab->new_regd[ar->pdev_idx])
++		regd = ab->new_regd[ar->pdev_idx];
++	else
++		regd = ab->default_regd[ar->pdev_idx];
++
++	if (!regd) {
++		ath12k_warn(ab, "Regulatory domain data not present\n");
++		goto end;
++	}
++end:
++	spin_unlock_bh(&ab->base_lock);
++	return regd;
++}
++
++/**
++ * ath12k_mark_sp_reg_rules_as_no_ir() - Mark the SP rules as NO_IR
++ * @ar: pointer to ath12k
++ * @regd: pointer to the regulatory domain
++ *
++ * Return: 0 on success, negative error code on failure
++ */
++static int
++ath12k_mark_sp_reg_rules_as_no_ir(struct ath12k *ar,
++				  struct ieee80211_regdomain *regd)
++{
++	struct ieee80211_freq_range chip_range = {0};
++	struct ath12k_wmi_hal_reg_capabilities_ext_arg *reg_cap;
++	struct ath12k_base *ab = ar->ab;
++	u8 i;
++
++	reg_cap = &ab->hal_reg_cap[ar->pdev_idx];
++	if (!reg_cap) {
++		ath12k_warn(ab, "Regulatory capabilities not present for pdev_id: %u\n",
++			    ar->pdev_idx);
++		return -EINVAL;
++	}
++
++	chip_range.start_freq_khz = MHZ_TO_KHZ(reg_cap->low_5ghz_chan);
++	chip_range.end_freq_khz = MHZ_TO_KHZ(reg_cap->high_5ghz_chan);
++
++	for (i = 0; i < regd->n_reg_rules; i++) {
++		struct ieee80211_reg_rule *new_rule;
++
++		new_rule =  regd->reg_rules + i;
++		if (new_rule->mode != NL80211_REG_AP_SP)
++			continue;
++		if (ath12k_is_reg_rule_subset_of_chip_range(new_rule->freq_range,
++							    chip_range))
++			new_rule->flags |= NL80211_RRF_NO_IR;
++		ath12k_dbg(ab, ATH12K_DBG_AFC, "Add NO_IR flag SP rule %u, s_freq %u, e_freq %u\n",
++			   i, new_rule->freq_range.start_freq_khz,
++			   new_rule->freq_range.end_freq_khz);
++	}
++	return 0;
++}
++
++/**
++ * ath12k_handle_invalid_afc_payload() - Handle invalid AFC payload by
++ * marking all the SP channels as NO_IR.
++ * @ar: pointer to ath12k
++ * Return: 0 on success, negative error code on failure
++ */
++static int ath12k_handle_invalid_afc_payload(struct ath12k *ar)
++{
++	struct ieee80211_regdomain *regd;
++	struct ath12k_hw *ah = ar->ah;
++	struct ath12k_base *ab = ar->ab;
++	int ret = 0;
++	struct ath12k_6ghz_sp_reg_rule *sp_rule;
++
++	regd = ath12k_get_current_regd(ar);
++	if (!regd) {
++		ath12k_warn(ab, "Regulatory domain data not present\n");
++		return -EINVAL;
++	}
++	if (!ab->sp_rule) {
++		ath12k_warn(ab, "SP rules not present for pdev: %u\n", ar->pdev_idx);
++		return -EINVAL;
++	}
++
++	sp_rule = ab->sp_rule;
++	if (!sp_rule->num_6ghz_sp_rule) {
++		ath12k_warn(ab, "No default 6 GHz sp rules present\n");
++		return -EINVAL;
++	}
++
++	ar->afc.is_6ghz_afc_power_event_received = false;
++	ret = ath12k_mark_sp_reg_rules_as_no_ir(ar, regd);
++	if (ret) {
++		ath12k_warn(ab, "Failed to mark SP rules as NO_IR\n");
++		return ret;
++	}
++	ah->regd_updated = false;
++	queue_work(ab->workqueue, &ar->regd_update_work);
++	return ret;
++}
++
+ int ath12k_reg_process_afc_power_event(struct ath12k *ar)
+ {
+ 	int new_reg_rule_cnt, num_regd_rules, num_afc_rules, num_sp_rules;
+@@ -1314,6 +1442,7 @@ int ath12k_reg_process_afc_power_event(struct ath12k *ar)
+ 	struct ath12k_hw *ah = ar->ah;
+ 	int i, j, k, pdev_idx;
+ 	char alpha2[3] = {0};
++	u16 is_afc_chan_or_freq_obj_empty;
+ 
+ 	pdev_idx = ar->pdev_idx;
+ 
+@@ -1324,10 +1453,14 @@ int ath12k_reg_process_afc_power_event(struct ath12k *ar)
+ 	sp_rule = ab->sp_rule;
+ 	afc_reg_info = ar->afc.afc_reg_info;
+ 	afc_freq_info = afc_reg_info->afc_freq_info;
+-
+-	if (afc_reg_info->fw_status_code != REG_FW_AFC_POWER_EVENT_SUCCESS) {
+-		ath12k_warn(ab, "AFC Power event failure status code %d",
+-			    afc_reg_info->fw_status_code);
++	is_afc_chan_or_freq_obj_empty = (afc_reg_info->num_chan_objs == 0) ||
++					(afc_reg_info->num_freq_objs == 0);
++
++	if (afc_reg_info->fw_status_code != REG_FW_AFC_POWER_EVENT_SUCCESS ||
++	    is_afc_chan_or_freq_obj_empty) {
++		ath12k_warn(ab, "AFC Power event failure status code %d, afc_rule_empty: %d\n",
++			    afc_reg_info->fw_status_code, is_afc_chan_or_freq_obj_empty);
++		ath12k_handle_invalid_afc_payload(ar);
+ 		ret = -EINVAL;
+ 		goto end;
+ 	}
+@@ -2460,6 +2593,33 @@ static int ath12k_reg_afc_start(struct ath12k_base *ab,
+ 	return ret;
+ }
+ 
++void ath12k_free_afc_power_event_info(struct ath12k_afc_info *afc)
++{
++	struct ath12k *ar = container_of(afc, struct ath12k, afc);
++	struct ath12k_afc_sp_reg_info *afc_reg_info;
++	struct ath12k_afc_chan_obj *afc_chan_info;
++	struct ath12k_base *ab = ar->ab;
++	int num_chan_objs;
++	int i;
++
++	if (!afc->afc_reg_info)
++		return;
++
++	ath12k_dbg(ab, ATH12K_DBG_AFC, "Freeing afc info\n");
++	afc_reg_info = afc->afc_reg_info;
++	num_chan_objs = afc_reg_info->num_chan_objs;
++	kfree(afc_reg_info->afc_freq_info);
++
++	for (i = 0; i < num_chan_objs; i++) {
++		afc_chan_info = afc_reg_info->afc_chan_info + i;
++		kfree(afc_chan_info->chan_eirp_info);
++	}
++
++	kfree(afc_reg_info->afc_chan_info);
++	kfree(afc_reg_info);
++	afc->afc_reg_info = NULL;
++}
++
+ int ath12k_process_expiry_event(struct ath12k *ar)
+ {
+ 	struct ath12k_afc_info *afc = &ar->afc;
+@@ -2480,7 +2640,13 @@ int ath12k_process_expiry_event(struct ath12k *ar)
+ 		}
+ 		break;
+ 	case REG_AFC_EXPIRY_EVENT_SWITCH_TO_LPI:
+-		/*TBH*/
++		ret = ath12k_handle_invalid_afc_payload(ar);
++		ath12k_free_afc_power_event_info(afc);
++		if (ret) {
++			ath12k_dbg(ar->ab, ATH12K_DBG_AFC, "Failed to process switch to LPI event\n");
++			return ret;
++		}
++		ath12k_send_afc_payload_reset(ar);
+ 		break;
+ 	default:
+ 		ath12k_dbg(ar->ab, ATH12K_DBG_AFC, "Invalid AFC expiry event subtype %d\n",
+diff --git a/drivers/net/wireless/ath/ath12k/reg.h b/drivers/net/wireless/ath/ath12k/reg.h
+index f174ffc..2927dac 100644
+--- a/drivers/net/wireless/ath/ath12k/reg.h
++++ b/drivers/net/wireless/ath/ath12k/reg.h
+@@ -629,4 +629,11 @@ void ath12k_reg_get_afc_eirp_power_for_bw(struct ath12k *ar, u16 *start_freq,
+ 					  u16 *center_freq, int pwr_level,
+ 					  struct cfg80211_chan_def *chan_def,
+ 					  s8 *tx_power);
++/**
++ * ath12k_free_afc_power_event_info() - Free AFC power event info
++ * @afc: Pointer to ath12k_afc_info
++ *
++ * Return: None
++ */
++void ath12k_free_afc_power_event_info(struct ath12k_afc_info *afc);
+ #endif
+diff --git a/drivers/net/wireless/ath/ath12k/vendor.c b/drivers/net/wireless/ath/ath12k/vendor.c
+index 905ed62..1402665 100644
+--- a/drivers/net/wireless/ath/ath12k/vendor.c
++++ b/drivers/net/wireless/ath/ath12k/vendor.c
+@@ -998,6 +998,103 @@ fail:
+ 	return -EINVAL;
+ }
+ 
++/**
++ * afc_payload_reset_evt_get_data_len: Get the AFC payload resent event data
++ * length.
++ *
++ * Return: Data length.
++ */
++static int afc_payload_reset_evt_get_data_len(void)
++{
++	u32 len = NLMSG_HDRLEN;
++
++	/* Size reserved for event type and HW index */
++	len += nla_total_size(sizeof(u8)) + nla_total_size(sizeof(u32));
++	len = nla_total_size(len);
++
++	return len;
++}
++
++int ath12k_send_afc_payload_reset(struct ath12k *ar)
++{
++	struct sk_buff *vendor_event;
++	int ret = -EINVAL;
++	int vendor_buffer_len, hw_index;
++	struct ath12k_base *ab = ar->ab;
++	struct ath12k_wmi_hal_reg_capabilities_ext_arg *reg_cap;
++	u16 freq_low;
++	struct ath12k_link_vif *tmp_arvif = NULL, *arvif;
++	struct wireless_dev *wdev;
++
++	list_for_each_entry(arvif, &ar->arvifs, list) {
++		if (arvif->is_started) {
++			tmp_arvif = arvif;
++			break;
++		}
++	}
++
++	if (!tmp_arvif || !tmp_arvif->ahvif) {
++		ath12k_warn(ar->ab, "Unable to send AFC payload reset event, no vif started\n");
++		goto out;
++	}
++
++	wdev = ieee80211_vif_to_wdev(tmp_arvif->ahvif->vif);
++	/* Hostapd application is a consumer of this afc payload reset event, without
++	 * the presence of the vif, it cannot take any action on the received payload
++	 * reset event. Hence, send this event only when a vif is present.
++	 */
++	if (!wdev) {
++		ath12k_warn(ar->ab, "Unable to send AFC payload reset event, no wdev\n");
++		goto out;
++	}
++
++	reg_cap = &ab->hal_reg_cap[ar->pdev_idx];
++	if (!reg_cap) {
++		ath12k_err(ab, "Unable to get reg cap for pdev %d\n", ar->pdev_idx);
++		goto out;
++	}
++
++	freq_low = reg_cap->low_5ghz_chan;
++	hw_index = ieee80211_get_radio_idx_by_freq(ar->ah->hw->wiphy, freq_low);
++	if (hw_index == -1) {
++		ath12k_err(ab, "Failed to get hw index for freq %d\n", freq_low);
++		goto out;
++	}
++
++	vendor_buffer_len = afc_payload_reset_evt_get_data_len();
++	vendor_event = cfg80211_vendor_event_alloc(ar->ah->hw->wiphy,
++						   wdev,
++						   vendor_buffer_len,
++						   QCA_NL80211_VENDOR_SUBCMD_AFC_EVENT_INDEX,
++						   GFP_ATOMIC);
++	if (!vendor_event) {
++		ath12k_warn(ar->ab, "failed to allocate skb for afc expiry event\n");
++		goto out;
++	}
++
++	if (nla_put_u8(vendor_event,
++		       QCA_WLAN_VENDOR_ATTR_AFC_EVENT_TYPE,
++		       QCA_WLAN_VENDOR_AFC_EVENT_TYPE_PAYLOAD_RESET)) {
++		ath12k_warn(ar->ab, "AFC payload reset complete event type put fail");
++		goto out;
++	}
++	if (nla_put_u32(vendor_event,
++			QCA_WLAN_VENDOR_ATTR_AFC_EVENT_HW_IDX,
++			hw_index)) {
++		ath12k_warn(ar->ab, "AFC payload reset complete event hw index put fail");
++		goto out;
++	}
++
++	ath12k_dbg(ar->ab, ATH12K_DBG_AFC,
++		   "Sending afc payload reset to higher layer of type %d, hw_index: %d\n",
++		   QCA_WLAN_VENDOR_AFC_EXPIRY_EVENT, hw_index);
++	cfg80211_vendor_event(vendor_event, GFP_ATOMIC);
++	ret = 0;
++
++out:
++	return ret;
++}
++
+ int ath12k_send_afc_request(struct ath12k *ar, struct ath12k_afc_host_request *afc_req)
+ {
+ 	struct sk_buff *vendor_event;
+diff --git a/drivers/net/wireless/ath/ath12k/vendor.h b/drivers/net/wireless/ath/ath12k/vendor.h
+index ab4456d..4784d07 100644
+--- a/drivers/net/wireless/ath/ath12k/vendor.h
++++ b/drivers/net/wireless/ath/ath12k/vendor.h
+@@ -59,6 +59,15 @@ int ath12k_vendor_send_power_update_complete(struct ath12k *ar);
+  */
+ int ath12k_send_afc_request(struct ath12k *ar, struct ath12k_afc_host_request *afc_req);
+ 
++/**
++ * ath12k_send_afc_payload_reset - Send AFC payload reset vendor NL event
++ * to userspace.
++ *
++ * @ar: Pointer to ar
++ * Return: 0 on success, negative errno on failure.
++ */
++int ath12k_send_afc_payload_reset(struct ath12k *ar);
++
+ /**
+  * Opclass, channel and EIRP information attribute length
+  * Refer kernel doc explanation for attribute
+diff --git a/drivers/net/wireless/ath/ath12k/wmi.c b/drivers/net/wireless/ath/ath12k/wmi.c
+index 1c1c141..f6075e1 100644
+--- a/drivers/net/wireless/ath/ath12k/wmi.c
++++ b/drivers/net/wireless/ath/ath12k/wmi.c
+@@ -6633,35 +6633,6 @@ static int ath12k_pull_vdev_start_resp_tlv(struct ath12k_base *ab, struct sk_buf
+ 	return 0;
+ }
+ 
+-static void ath12k_free_afc_power_event_info(struct ath12k_afc_info *afc)
+-{
+-	struct ath12k *ar = container_of(afc, struct ath12k, afc);
+-	struct ath12k_afc_sp_reg_info *afc_reg_info;
+-	struct ath12k_afc_chan_obj *afc_chan_info;
+-	struct ath12k_base *ab = ar->ab;
+-	int num_chan_objs = 0;
+-	int i;
+-
+-	if (!afc->afc_reg_info)
+-		return;
+-
+-	ath12k_dbg(ab, ATH12K_DBG_AFC, "Freeing afc info\n");
+-	spin_lock_bh(&ar->data_lock);
+-	afc_reg_info = afc->afc_reg_info;
+-	num_chan_objs = afc_reg_info->num_chan_objs;
+-	kfree(afc_reg_info->afc_freq_info);
+-
+-	for (i = 0; i < num_chan_objs; i++) {
+-		afc_chan_info = afc_reg_info->afc_chan_info + i;
+-		kfree(afc_chan_info->chan_eirp_info);
+-	}
+-
+-	kfree(afc_reg_info->afc_chan_info);
+-	kfree(afc_reg_info);
+-	afc->afc_reg_info = NULL;
+-	spin_unlock_bh(&ar->data_lock);
+-}
+-
+ static int ath12k_copy_afc_power_event_fixed_info(struct ath12k_base *ab,
+ 						  struct ath12k_afc_info *afc,
+ 						  const void *ptr,
+@@ -6705,10 +6676,12 @@ static int ath12k_wmi_afc_fill_freq_obj(struct ath12k_base *ab,
+ 	struct wmi_6ghz_afc_frequency_info *freq_buf = NULL;
+ 	struct ath12k_afc_freq_obj *freq_obj = NULL;
+ 	int i;
+-
++	/* AFC payload with 0 freq objects is still considered a valid payload. Hence,
++	 * do not return an error.
++	 */
+ 	if (!afc_reg_info->num_freq_objs) {
+-		ath12k_warn(ab, "No freq objects in afc power event\n");
+-		return -EINVAL;
++		ath12k_dbg(ab, ATH12K_DBG_AFC, "No freq objects in afc power event\n");
++		return 0;
+ 	}
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_AFC, "Num afc freq obj received %d\n",
+@@ -6748,9 +6721,12 @@ static int ath12k_wmi_afc_fill_chan_obj(struct ath12k_base *ab,
+ 	struct wmi_6ghz_afc_channel_info *chan_buf = NULL;
+ 	int i;
+ 
++	/* AFC payload with 0 channel objects is still considered a valid payload. Hence,
++	 * do not return an error.
++	 */
+ 	if (!afc_reg_info->num_chan_objs) {
+-		ath12k_warn(ab, "No channel objects in afc power event\n");
+-		return -EINVAL;
++		ath12k_dbg(ab, ATH12K_DBG_AFC, "No channel objects in afc power event\n");
++		return 0;
+ 	}
+ 
+ 	ath12k_dbg(ab, ATH12K_DBG_AFC, "Num chan objects received %d\n",
+@@ -6971,8 +6947,8 @@ static void ath12k_wmi_afc_event(struct ath12k_base *ab,
+ 	}
+ 
+ 	afc_info = &ar->afc;
+-	ath12k_dbg(ab, ATH12K_DBG_AFC, "Received AFC event of type %d\n",
+-		   ar->afc.event_type);
++	ath12k_dbg(ab, ATH12K_DBG_AFC, "Received AFC event of type %d for pdev: %d\n",
++		   ar->afc.event_type, ar->pdev->pdev_id);
+ 	ret = ath12k_wmi_tlv_iter(ab, skb->data, skb->len,
+ 				  ath12k_wmi_afc_event_parser, afc_info);
+ 	if (ret) {
+-- 
+2.34.1
+

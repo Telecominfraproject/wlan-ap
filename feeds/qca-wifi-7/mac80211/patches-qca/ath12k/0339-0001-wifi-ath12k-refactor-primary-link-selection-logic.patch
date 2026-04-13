@@ -1,0 +1,271 @@
+From 8a720ebd7912629bee548ea62463c262e5d1e233 Mon Sep 17 00:00:00 2001
+From: Aditya Kumar Singh <adisi@qti.qualcomm.com>
+Date: Thu, 29 May 2025 08:52:53 +0530
+Subject: [PATCH] wifi: ath12k: refactor primary link selection logic
+
+Currently, the primary link is selected using debugfs. With N-link MLO,
+some overwrite logic is also there. These logics are embedded directly
+within the function that adds links in STA. However, this logic will also
+be needed during migration in the future. Therefore, it is necessary to
+move this logic into helper APIs.
+
+As a preparatory step for migration, refactor the existing primary link
+selection logic into a helper function. The existing logic remains
+unchanged.
+
+Signed-off-by: Aditya Kumar Singh <adisi@qti.qualcomm.com>
+Signed-off-by: Manish Dharanenthiran <mdharane@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/core.h    |  10 ++
+ drivers/net/wireless/ath/ath12k/debugfs.c |  12 +-
+ drivers/net/wireless/ath/ath12k/mac.c     | 128 +++++++++++++++++-----
+ 3 files changed, 122 insertions(+), 28 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/core.h
++++ b/drivers/net/wireless/ath/ath12k/core.h
+@@ -1672,6 +1672,16 @@ static inline const char *ath12k_bus_str
+ 	return "unknown";
+ }
+ 
++static inline struct ath12k_link_vif *
++ath12k_get_arvif_from_link_id(struct ath12k_vif *ahvif, int link_id)
++{
++	if (link_id >= ATH12K_NUM_MAX_LINKS)
++		return NULL;
++
++	return rcu_dereference_protected(ahvif->link[link_id],
++					 lockdep_is_held(&ahvif->ah->hw_mutex));
++}
++
+ static inline struct ath12k_hw *ath12k_hw_to_ah(struct ieee80211_hw  *hw)
+ {
+ 	return hw->priv;
+--- a/drivers/net/wireless/ath/ath12k/debugfs.c
++++ b/drivers/net/wireless/ath/ath12k/debugfs.c
+@@ -4640,15 +4640,23 @@ static ssize_t ath12k_write_primary_link
+ 			continue;
+ 		ar = arvif->ar;
+ 		if (primary_link == ar->hw_link_id) {
++			ahvif->hw_link_id = primary_link;
+ 			is_link_found = true;
+ 			break;
+ 		}
+ 	}
+ 
++	/* If configured hw idx is not up then arvif information not available
++	 * at this point. Hence storing the input value and set the primary_link
++	 * in ath12k_mac_ahsta_get_pri_link_id().
++	 */
+ 	if (!is_link_found) {
++		ahvif->hw_link_id = primary_link;
+ 		mutex_unlock(&ah->hw_mutex);
+-		ath12k_warn(ar->ab, "Invalid link id : %u\n", primary_link);
+-		return -EINVAL;
++		ath12k_warn(ar->ab,
++			    "Link is not up primary link will be updated after sta association:%u\n",
++			    primary_link);
++		return count;
+ 	}
+ 
+ 	ahvif->primary_link_id = arvif->link_id;
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -278,6 +278,9 @@ static struct ath12k_link_sta *ath12k_ma
+ 								struct ath12k_sta *ahsta,
+ 								struct ath12k_vif *ahvif,
+ 								u8 link_id);
++static u8 ath12k_mac_ahsta_get_pri_link_id(struct ath12k_vif *ahvif,
++					   struct ath12k_sta *ahsta,
++					   unsigned long int valid_links);
+ static const char *ath12k_mac_phymode_str(enum wmi_phy_mode mode)
+ {
+ 	switch (mode) {
+@@ -9095,6 +9098,9 @@ int ath12k_mac_op_sta_state(struct ieee8
+ 			arsta->is_assoc_link = true;
+ 			ahsta->assoc_link_id = link_id;
+ 			ahsta->primary_link_id = link_id;
++			ath12k_dbg(NULL, ATH12K_DBG_MAC,
++				   "mac ML STA %pM primary link (reconfig) set to %u\n",
++				   sta->addr, ahsta->primary_link_id);
+ 		}
+ 	}
+ 
+@@ -9391,8 +9397,10 @@ static struct ath12k_link_sta *ath12k_ma
+ 
+ void ath12k_mac_assign_middle_link_id(struct ieee80211_sta *sta,
+ 				      struct ath12k_sta *ahsta,
++				      u8 *pri_link_id,
+ 				      u8 num_devices)
+ {
++	struct ath12k_hw *ah = ahsta->ahvif->ah;
+ 	struct ath12k_link_sta *arsta;
+ 	struct ath12k_base *ab;
+ 	u8 link_id;
+@@ -9401,6 +9409,8 @@ void ath12k_mac_assign_middle_link_id(st
+ 	bool adjacent_found = false;
+ 	unsigned long links;
+ 
++	lockdep_assert_held(&ah->hw_mutex);
++
+ 	/* 4 device: In case of 3 link STA association, Make sure to select
+ 	 * the middle device link as primary_link_id of sta which is adjacent
+ 	 * to other two devices.
+@@ -9451,8 +9461,8 @@ void ath12k_mac_assign_middle_link_id(st
+ 		if (ab->wsi_info.index == i) {
+ 			ath12k_info(ab, "Overwriting primary link_id as %d for sta %pM",
+ 				    link_id, sta->addr);
+-			ahsta->primary_link_id = link_id;
+-			break;
++			*pri_link_id = link_id;
++			return;
+ 		}
+ 	}
+ }
+@@ -9469,9 +9479,8 @@ int ath12k_mac_op_change_sta_links(struc
+ 	struct ath12k_link_sta *arsta, *tmp_arsta;
+ 	unsigned long valid_links;
+ 	struct ath12k *ar;
+-	struct ath12k_hw_group *ag;
+ 	u16 removed_link_map;
+-	u8 link_id, tmp_link_id;
++	u8 link_id, tmp_link_id, pri_link_id;
+ 	int ret;
+ 
+ 	lockdep_assert_wiphy(hw->wiphy);
+@@ -9495,25 +9504,6 @@ int ath12k_mac_op_change_sta_links(struc
+ 			return -EINVAL;
+ 		}
+ 
+-		if ((test_bit(ahvif->primary_link_id, &sta->valid_links))) {
+-			arvif = ahvif->link[ahvif->primary_link_id];
+-			if (arvif->ar->ab->hw_params->is_plink_preferable) {
+-				ahsta->primary_link_id = ahvif->primary_link_id;
+-			} else {
+-				ahsta->primary_link_id = ahsta->assoc_link_id;
+-				arvif = ahvif->link[ahsta->assoc_link_id];
+-				if (!arvif->ar->ab->hw_params->is_plink_preferable) {
+-					for_each_set_bit(link_id, &sta->valid_links,
+-							 IEEE80211_MLD_MAX_NUM_LINKS) {
+-						if (link_id != ahsta->primary_link_id) {
+-							ahsta->primary_link_id = link_id;
+-							break;
+-						}
+-					}
+-				}
+-			}
+-		}
+-
+ 		valid_links = new_links;
+ 		for_each_set_bit(link_id, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
+ 			if (ahsta->links_map & BIT(link_id))
+@@ -9538,11 +9528,20 @@ int ath12k_mac_op_change_sta_links(struc
+ 				ath12k_mac_free_unassign_link_sta(ah, ahsta, link_id);
+ 				return ret;
+ 			}
+-			ag = ar->ab->ag;
+ 		}
+ 
+-		ath12k_mac_assign_middle_link_id(sta, ahsta, ag->num_devices);
+-
++		if (!ret) {
++			pri_link_id =
++				ath12k_mac_ahsta_get_pri_link_id(ahvif, ahsta,
++								 ahsta->links_map);
++			if (pri_link_id == IEEE80211_MLD_MAX_NUM_LINKS)
++				pri_link_id = ahsta->assoc_link_id;
++
++			ahsta->primary_link_id = pri_link_id;
++			ath12k_dbg(NULL, ATH12K_DBG_MAC,
++				   "mac ML STA %pM primary link set to %u\n",
++				   sta->addr, ahsta->primary_link_id);
++		}
+ 	} else {
+ 		removed_link_map = old_links ^ new_links;
+ 
+@@ -9622,6 +9621,86 @@ int ath12k_mac_op_change_sta_links(struc
+ }
+ EXPORT_SYMBOL(ath12k_mac_op_change_sta_links);
+ 
++static u8 ath12k_mac_ahsta_get_pri_link_id(struct ath12k_vif *ahvif,
++					   struct ath12k_sta *ahsta,
++					   unsigned long int valid_links)
++{
++	struct ath12k_hw *ah = ahvif->ah;
++	struct ath12k_link_vif *arvif;
++	struct ieee80211_sta *sta;
++	struct ath12k *ar;
++	u8 link_id = 0, pri_link_id;
++	bool is_link_found = false;
++	unsigned long links_map;
++
++	lockdep_assert_held(&ah->hw_mutex);
++
++	if (WARN_ON(!valid_links))
++		return IEEE80211_MLD_MAX_NUM_LINKS;
++
++	sta = container_of((void *)ahsta, struct ieee80211_sta, drv_priv);
++
++	/* Handle conversion of user configured hw link id to primary link id
++	 */
++	if (ahvif->vif->type == NL80211_IFTYPE_STATION || ahvif->vif->type == NL80211_IFTYPE_AP) {
++		links_map = ahvif->links_map;
++		for_each_set_bit_from(link_id, &links_map, ATH12K_NUM_MAX_LINKS) {
++			arvif = ath12k_get_arvif_from_link_id(ahvif, link_id);
++			if (!arvif)
++				continue;
++			ar = arvif->ar;
++			if (!ar)
++				continue;
++			if (ahvif->hw_link_id == ar->hw_link_id) {
++				is_link_found = true;
++				break;
++			}
++		}
++		if (is_link_found)
++			ahvif->primary_link_id = arvif->link_id;
++	}
++
++	/* if not configured in debugfs then proceed to find a suitable
++	 * link with available links
++	 */
++	if (!test_bit(ahvif->primary_link_id, &valid_links))
++		goto select_pri_link;
++
++	/* if the configured link id is present and it is preferable,
++	 * take that link as the primary link
++	 */
++	arvif = ath12k_get_arvif_from_link_id(ahvif, ahvif->primary_link_id);
++	if (arvif->ar->ab->hw_params->is_plink_preferable) {
++		pri_link_id = ahvif->primary_link_id;
++		return pri_link_id;
++	}
++
++select_pri_link:
++	/* if the configured link id is not present, then take assoc link
++	 * as the primary link
++	 */
++	pri_link_id = ahsta->assoc_link_id;
++
++	arvif = ath12k_get_arvif_from_link_id(ahvif, ahsta->assoc_link_id);
++	if (arvif->ar->ab->hw_params->is_plink_preferable)
++		return pri_link_id;
++
++	/* if assoc link is not preferable, then select any other link as
++	 * primary link
++	 */
++	for_each_set_bit(link_id, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++		if (link_id != ahsta->primary_link_id) {
++			pri_link_id = link_id;
++			break;
++		}
++	}
++
++	ath12k_mac_assign_middle_link_id(sta, ahsta, &pri_link_id,
++					 arvif->ar->ab->ag->num_devices);
++
++	return pri_link_id;
++}
++
+ bool ath12k_mac_op_removed_link_is_primary(struct ieee80211_sta *sta,
+ 					   u16 removed_links)
+ {

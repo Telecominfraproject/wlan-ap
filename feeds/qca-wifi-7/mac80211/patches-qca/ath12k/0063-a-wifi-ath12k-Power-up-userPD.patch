@@ -1,0 +1,194 @@
+From c04b571a9e1d98f7fc427ad0189b1f44d5fca337 Mon Sep 17 00:00:00 2001
+From: Sowmiya Sree Elavalagan <quic_ssreeela@quicinc.com>
+Date: Fri, 28 Feb 2025 00:40:32 +0530
+Subject: [PATCH 081/141] wifi: ath12k: Power up userPD
+
+UserPD firmware image is loaded and booted by ath12k driver. Get the userPD
+memory region from DTS and load the firmware for userPD from pre-defined
+path into io-remapped address of this region. Authenticate this image
+using pasid which is a peripheral ID. Set the spawn bit to instruct Q6
+to spawn userPD thread. Wait for userPD to spawn which is indicated by
+spawn interrupt. Ready interrupt is triggered once the userPD is powered
+up completely.
+
+Tested-on: IPQ5332 hw1.0 AHB WLAN.WBE.1.3.1-00130-QCAHKSWPL_SILICONZ-1
+
+Signed-off-by: Sowmiya Sree Elavalagan <quic_ssreeela@quicinc.com>
+Signed-off-by: Raj Kumar Bhagat <quic_rajkbhag@quicinc.com>
+---
+ drivers/net/wireless/ath/ath12k/ahb.c | 128 ++++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/ahb.h |   9 ++
+ 2 files changed, 137 insertions(+)
+
+--- a/drivers/net/wireless/ath/ath12k/ahb.c
++++ b/drivers/net/wireless/ath/ath12k/ahb.c
+@@ -5,10 +5,12 @@
+  */
+ 
+ #include <linux/dma-mapping.h>
++#include <linux/firmware/qcom/qcom_scm.h>
+ #include <linux/of.h>
+ #include <linux/of_device.h>
+ #include <linux/platform_device.h>
+ #include <linux/remoteproc.h>
++#include <linux/soc/qcom/mdt_loader.h>
+ #include <linux/soc/qcom/smem_state.h>
+ #include "ahb.h"
+ #include "debug.h"
+@@ -356,6 +358,130 @@ static void ath12k_ahb_stop(struct ath12
+ 	ath12k_ce_cleanup_pipes(ab);
+ }
+ 
++static int ath12k_ahb_power_up(struct ath12k_base *ab)
++{
++	struct ath12k_ahb *ab_ahb = ath12k_ab_to_ahb(ab);
++	char fw_name[ATH12K_USERPD_FW_NAME_LEN];
++	char fw2_name[ATH12K_USERPD_FW_NAME_LEN];
++	struct device *dev = ab->dev;
++	const struct firmware *fw, *fw2;
++	struct reserved_mem *rmem = NULL;
++	unsigned long time_left;
++	u32 pasid;
++	int ret;
++
++	rmem = ath12k_core_get_reserved_mem_by_name(ab, "q6-region");
++	if (!rmem)
++		return -ENODEV;
++
++	ab_ahb->mem_phys = rmem->base;
++	ab_ahb->mem_size = rmem->size;
++	ab_ahb->mem_region = (void *)devm_ioremap_wc(dev, ab_ahb->mem_phys, ab_ahb->mem_size);
++	if (!ab_ahb->mem_region) {
++		ath12k_err(ab, "unable to map memory region: %pa+%pa\n",
++			   &rmem->base, &rmem->size);
++		return -ENOMEM;
++	}
++
++	snprintf(fw_name, sizeof(fw_name), "%s/%s/%s%d%s", ATH12K_FW_DIR,
++		 ab->hw_params->fw.dir, ATH12K_AHB_FW_PREFIX, ab_ahb->userpd_id,
++		 ATH12K_AHB_FW_SUFFIX);
++
++	ret = request_firmware(&fw, fw_name, dev);
++	if (ret < 0) {
++		ath12k_err(ab, "request_firmware failed\n");
++		return ret;
++	}
++
++	ath12k_dbg(ab, ATH12K_DBG_AHB, "Booting fw image %s, size %zd\n", fw_name,
++		   fw->size);
++
++	if (!fw->size) {
++		ath12k_err(ab, "Invalid firmware size\n");
++		ret = -EINVAL;
++		goto err_fw;
++	}
++
++	pasid = (u32_encode_bits(ab_ahb->userpd_id, ATH12K_USERPD_ID_MASK)) |
++		ATH12K_AHB_UPD_SWID;
++
++	/* Load FW image to a reserved memory location */
++	ret = qcom_mdt_load(dev, fw, fw_name, pasid, ab_ahb->mem_region,
++			    ab_ahb->mem_phys, ab_ahb->mem_size,
++			    &ab_ahb->mem_phys);
++	if (ret) {
++		ath12k_err(ab, "Failed to load MDT segments: %d\n", ret);
++		goto err_fw;
++	}
++
++	snprintf(fw2_name, sizeof(fw2_name), "%s/%s/%s", ATH12K_FW_DIR,
++		 ab->hw_params->fw.dir, ATH12K_AHB_FW2);
++
++	ret = request_firmware(&fw2, fw2_name, dev);
++	if (ret < 0) {
++		ath12k_err(ab, "request_firmware failed\n");
++		goto err_fw;
++	}
++
++	ath12k_dbg(ab, ATH12K_DBG_AHB, "Booting fw image %s, size %zd\n", fw2_name,
++		   fw2->size);
++
++	if (!fw2->size) {
++		ath12k_err(ab, "Invalid firmware size\n");
++		ret = -EINVAL;
++		goto err_fw2;
++	}
++
++	ret = qcom_mdt_load_no_init(dev, fw2, fw2_name, pasid,
++				    ab_ahb->mem_region, ab_ahb->mem_phys,
++				    ab_ahb->mem_size, &ab_ahb->mem_phys);
++	if (ret) {
++		ath12k_err(ab, "Failed to load MDT segments: %d\n", ret);
++		goto err_fw2;
++	}
++
++	/* Authenticate FW image using peripheral ID */
++	ret = qcom_scm_pas_auth_and_reset(pasid);
++	if (ret) {
++		ath12k_err(ab, "failed to boot the remote processor %d\n", ret);
++		goto err_fw2;
++	}
++
++	/* Instruct Q6 to spawn userPD thread */
++	ret = qcom_smem_state_update_bits(ab_ahb->spawn_state, BIT(ab_ahb->spawn_bit),
++					  BIT(ab_ahb->spawn_bit));
++	if (ret) {
++		ath12k_err(ab, "Failed to update spawn state %d\n", ret);
++		goto err_fw2;
++	}
++
++	time_left = wait_for_completion_timeout(&ab_ahb->userpd_spawned,
++						ATH12K_USERPD_SPAWN_TIMEOUT);
++	if (!time_left) {
++		ath12k_err(ab, "UserPD spawn wait timed out\n");
++		ret = -ETIMEDOUT;
++		goto err_fw2;
++	}
++
++	time_left = wait_for_completion_timeout(&ab_ahb->userpd_ready,
++						ATH12K_USERPD_READY_TIMEOUT);
++	if (!time_left) {
++		ath12k_err(ab, "UserPD ready wait timed out\n");
++		ret = -ETIMEDOUT;
++		goto err_fw2;
++	}
++
++	qcom_smem_state_update_bits(ab_ahb->spawn_state, BIT(ab_ahb->spawn_bit), 0);
++
++	ath12k_dbg(ab, ATH12K_DBG_AHB, "UserPD%d is now UP\n", ab_ahb->userpd_id);
++
++err_fw2:
++	release_firmware(fw2);
++err_fw:
++	release_firmware(fw);
++	return ret;
++}
++
+ static void ath12k_ahb_init_qmi_ce_config(struct ath12k_base *ab)
+ {
+ 	struct ath12k_qmi_ce_cfg *cfg = &ab->qmi.ce_cfg;
+@@ -594,6 +720,7 @@ static const struct ath12k_hif_ops ath12
+ 	.irq_enable = ath12k_ahb_ext_irq_enable,
+ 	.irq_disable = ath12k_ahb_ext_irq_disable,
+ 	.map_service_to_pipe = ath12k_ahb_map_service_to_pipe,
++	.power_up = ath12k_ahb_power_up,
+ };
+ 
+ static irqreturn_t ath12k_userpd_irq_handler(int irq, void *data)
+--- a/drivers/net/wireless/ath/ath12k/ahb.h
++++ b/drivers/net/wireless/ath/ath12k/ahb.h
+@@ -19,6 +19,15 @@
+ #define ATH12K_PCI_IRQ_CE0_OFFSET		3
+ #define ATH12K_ROOTPD_READY_TIMEOUT		(5 * HZ)
+ #define ATH12K_RPROC_AFTER_POWERUP		QCOM_SSR_AFTER_POWERUP
++#define ATH12K_AHB_FW_PREFIX			"q6_fw"
++#define ATH12K_AHB_FW_SUFFIX			".mdt"
++#define ATH12K_AHB_FW2				"iu_fw.mdt"
++#define ATH12K_AHB_UPD_SWID			0x12
++#define ATH12K_USERPD_SPAWN_TIMEOUT		(5 * HZ)
++#define ATH12K_USERPD_READY_TIMEOUT		(10 * HZ)
++#define ATH12K_USERPD_STOP_TIMEOUT		(5 * HZ)
++#define ATH12K_USERPD_ID_MASK			GENMASK(9, 8)
++#define ATH12K_USERPD_FW_NAME_LEN		35
+ 
+ enum ath12k_ahb_smp2p_msg_id {
+ 	ATH12K_AHB_POWER_SAVE_ENTER = 1,

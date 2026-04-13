@@ -1,0 +1,786 @@
+From ec83629b678483c0c5beea4f598f99d5afc0f986 Mon Sep 17 00:00:00 2001
+From: Sushant Butta <sbutta@qti.qualcomm.com>
+Date: Tue, 1 Jul 2025 00:18:38 +0530
+Subject: [PATCH 3/6] UPSTREAM: DP: wifi: ath12k: Refactor WCN7850 Status Ring
+ Handling to dp_mon1.c
+
+WCN7850 status ring processing is currently part of ath12k/dp_mon.c
+(ath12k.ko common module) with the Unified Driver framework,
+WCN7850 adopts the monitor quad ring model (mon1), so the status ring
+processing logic is being moved to the architecture-specific file
+ath12k/wifi7/dp_mon1.c(ath12k_wifi7.ko arch specific module)
+
+Patch-dependency:
+	0404-0002-UPSTREAM-DP-wifi-ath12k-Segregate-Architecture-Speci.patch
+
+Signed-off-by: Sushant Butta <sbutta@qti.qualcomm.com>
+---
+ drivers/net/wireless/ath/ath12k/dp_mon.c      | 289 +---------------
+ drivers/net/wireless/ath/ath12k/dp_mon.h      |   9 +-
+ drivers/net/wireless/ath/ath12k/hal.c         |   2 +
+ .../net/wireless/ath/ath12k/wifi7/dp_mon1.c   | 321 +++++++++++++++++-
+ 4 files changed, 335 insertions(+), 286 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.c b/drivers/net/wireless/ath/ath12k/dp_mon.c
+index 0519e96..6b5f74a 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.c
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.c
+@@ -61,90 +61,6 @@ ath12k_dp_mon_rx_ul_ofdma_ru_size_to_width(enum ath12k_eht_ru_size ru_size)
+ 	}
+ }
+ 
+-static struct sk_buff
+-*ath12k_dp_rx_alloc_mon_status_buf(struct ath12k_base *ab,
+-				   struct dp_rxdma_mon_ring *rx_ring,
+-				   int *buf_id)
+-{
+-	struct sk_buff *skb;
+-	dma_addr_t paddr;
+-
+-	skb = dev_alloc_skb(RX_MON_STATUS_BUF_SIZE);
+-
+-	if (!skb)
+-		goto fail_alloc_skb;
+-
+-	if (!IS_ALIGNED((unsigned long)skb->data,
+-			RX_MON_STATUS_BUF_ALIGN)) {
+-		skb_pull(skb, PTR_ALIGN(skb->data, RX_MON_STATUS_BUF_ALIGN) -
+-			 skb->data);
+-	}
+-
+-	paddr = dma_map_single(ab->dev, skb->data,
+-			       skb->len + skb_tailroom(skb),
+-			       DMA_FROM_DEVICE);
+-	if (unlikely(dma_mapping_error(ab->dev, paddr)))
+-		goto fail_free_skb;
+-
+-	spin_lock_bh(&rx_ring->idr_lock);
+-	*buf_id = idr_alloc(&rx_ring->bufs_idr, skb, 0,
+-			    rx_ring->bufs_max, GFP_ATOMIC);
+-	spin_unlock_bh(&rx_ring->idr_lock);
+-	if (*buf_id < 0)
+-		goto fail_dma_unmap;
+-
+-	ATH12K_SKB_RXCB(skb)->paddr = paddr;
+-	return skb;
+-
+-fail_dma_unmap:
+-	dma_unmap_single(ab->dev, paddr, skb->len + skb_tailroom(skb),
+-			 DMA_FROM_DEVICE);
+-fail_free_skb:
+-	dev_kfree_skb_any(skb);
+-fail_alloc_skb:
+-	return NULL;
+-}
+-
+-static enum dp_mon_status_buf_state
+-ath12k_dp_rx_mon_buf_done(struct ath12k_base *ab, struct hal_srng *srng,
+-			  struct dp_rxdma_mon_ring *rx_ring)
+-{
+-	struct ath12k_skb_rxcb *rxcb;
+-	struct hal_tlv_64_hdr *tlv;
+-	struct sk_buff *skb;
+-	struct ath12k_buffer_addr *status_desc;
+-	dma_addr_t paddr;
+-	u32 cookie;
+-	int buf_id;
+-	u8 rbm;
+-
+-	status_desc = ath12k_hal_srng_src_next_peek(ab, srng);
+-	if (!status_desc)
+-		return DP_MON_STATUS_NO_DMA;
+-
+-	ath12k_hal_rx_buf_addr_info_get(status_desc, &paddr, &cookie, &rbm);
+-
+-	buf_id = u32_get_bits(cookie, DP_RXDMA_BUF_COOKIE_BUF_ID);
+-
+-	spin_lock_bh(&rx_ring->idr_lock);
+-	skb = idr_find(&rx_ring->bufs_idr, buf_id);
+-	spin_unlock_bh(&rx_ring->idr_lock);
+-
+-	if (!skb)
+-		return DP_MON_STATUS_NO_DMA;
+-
+-	rxcb = ATH12K_SKB_RXCB(skb);
+-	dma_sync_single_for_cpu(ab->dev, rxcb->paddr,
+-				skb->len + skb_tailroom(skb),
+-				DMA_FROM_DEVICE);
+-
+-	tlv = (struct hal_tlv_64_hdr *)skb->data;
+-	if (le64_get_bits(tlv->tl, HAL_TLV_HDR_TAG) != HAL_RX_STATUS_BUFFER_DONE)
+-		return DP_MON_STATUS_NO_DMA;
+-
+-	return DP_MON_STATUS_REPLINISH;
+-}
+-
+ static u32 ath12k_dp_mon_comp_ppduid(u32 msdu_ppdu_id, u32 *ppdu_id)
+ {
+ 	u32 ret = 0;
+@@ -721,7 +637,7 @@ mon_deliver_fail:
+ 	return -EINVAL;
+ }
+ 
+-static int ath12k_dp_pkt_set_pktlen(struct sk_buff *skb, u32 len)
++int ath12k_dp_pkt_set_pktlen(struct sk_buff *skb, u32 len)
+ {
+ 	if (skb->len > len) {
+ 		skb_trim(skb, len);
+@@ -738,6 +654,7 @@ static int ath12k_dp_pkt_set_pktlen(struct sk_buff *skb, u32 len)
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL(ath12k_dp_pkt_set_pktlen);
+ 
+ /* Hardware fill buffer with 128 bytes aligned. So need to reap it
+  * with 128 bytes aligned.
+@@ -778,7 +695,7 @@ ath12k_dp_mon_parse_status_buf(struct ath12k *ar,
+ 	int buf_id;
+ 	u32 offset;
+ 
+-	buf_id = u32_get_bits(packet_info->cookie, DP_RXDMA_BUF_COOKIE_BUF_ID);
++	buf_id = u32_get_bits(packet_info->cookie, DP_MON_RXDMA_BUF_COOKIE_BUF_ID);
+ 
+ 	spin_lock_bh(&buf_ring->idr_lock);
+ 	msdu = idr_remove(&buf_ring->bufs_idr, buf_id);
+@@ -1003,7 +920,7 @@ int ath12k_dp_mon_buf_replenish(struct ath12k_base *ab,
+ 
+ 		ATH12K_SKB_RXCB(skb)->paddr = paddr;
+ 
+-		cookie = u32_encode_bits(buf_id, DP_RXDMA_BUF_COOKIE_BUF_ID);
++		cookie = u32_encode_bits(buf_id, DP_MON_RXDMA_BUF_COOKIE_BUF_ID);
+ 
+ 		mon_buf->paddr_lo = cpu_to_le32(lower_32_bits(paddr));
+ 		mon_buf->paddr_hi = cpu_to_le32(upper_32_bits(paddr));
+@@ -1859,7 +1776,7 @@ int ath12k_dp_mon_rx_dual_ring_process(struct ath12k_pdev_dp *pdev_dp, int mac_i
+ 			goto move_next;
+ 
+ 		cookie = le32_to_cpu(mon_dst_desc->cookie);
+-		buf_id = u32_get_bits(cookie, DP_RXDMA_BUF_COOKIE_BUF_ID);
++		buf_id = u32_get_bits(cookie, DP_MON_RXDMA_BUF_COOKIE_BUF_ID);
+ 
+ 		spin_lock_bh(&buf_ring->idr_lock);
+ 		skb = idr_remove(&buf_ring->bufs_idr, buf_id);
+@@ -1995,155 +1912,6 @@ free_skb:
+ }
+ EXPORT_SYMBOL(ath12k_dp_mon_rx_dual_ring_process);
+ 
+-static int ath12k_dp_rx_reap_mon_status_ring(struct ath12k_base *ab, int mac_id,
+-					     int *budget, struct sk_buff_head *skb_list)
+-{
+-	const struct ath12k_hw_hal_params *hal_params;
+-	int buf_id, srng_id, num_buffs_reaped = 0;
+-	enum dp_mon_status_buf_state reap_status;
+-	struct dp_rxdma_mon_ring *rx_ring;
+-	struct ath12k_mon_data *pmon;
+-	struct ath12k_skb_rxcb *rxcb;
+-	struct hal_tlv_64_hdr *tlv;
+-	struct ath12k_buffer_addr *rx_mon_status_desc;
+-	struct hal_srng *srng;
+-	struct ath12k_dp *dp;
+-	struct ath12k_dp_mon *dp_mon;
+-	struct sk_buff *skb;
+-	struct ath12k *ar;
+-	dma_addr_t paddr;
+-	u32 cookie;
+-	u8 rbm;
+-
+-	ar = ab->pdevs[ath12k_hw_mac_id_to_pdev_id(ab->hw_params, mac_id)].ar;
+-	dp = ab->dp;
+-	dp_mon = dp->dp_mon;
+-	pmon = &ar->dp.dp_mon_pdev->mon_data;
+-	srng_id = ath12k_hw_mac_id_to_srng_id(ab->hw_params, mac_id);
+-	rx_ring = &dp_mon->rx_mon_status_refill_ring[srng_id];
+-
+-	srng = &ab->hal.srng_list[rx_ring->refill_buf_ring.ring_id];
+-
+-	spin_lock_bh(&srng->lock);
+-
+-	ath12k_hal_srng_access_begin(ab, srng);
+-
+-	while (*budget) {
+-		*budget -= 1;
+-		rx_mon_status_desc = ath12k_hal_srng_src_peek(ab, srng);
+-		if (!rx_mon_status_desc) {
+-			pmon->buf_state = DP_MON_STATUS_REPLINISH;
+-			break;
+-		}
+-		ath12k_hal_rx_buf_addr_info_get(rx_mon_status_desc, &paddr,
+-						&cookie, &rbm);
+-		if (paddr) {
+-			buf_id = u32_get_bits(cookie, DP_RXDMA_BUF_COOKIE_BUF_ID);
+-
+-			spin_lock_bh(&rx_ring->idr_lock);
+-			skb = idr_find(&rx_ring->bufs_idr, buf_id);
+-			spin_unlock_bh(&rx_ring->idr_lock);
+-
+-			if (!skb) {
+-				ath12k_warn(ab, "rx monitor status with invalid buf_id %d\n",
+-					    buf_id);
+-				pmon->buf_state = DP_MON_STATUS_REPLINISH;
+-				goto move_next;
+-			}
+-
+-			rxcb = ATH12K_SKB_RXCB(skb);
+-
+-			dma_sync_single_for_cpu(ab->dev, rxcb->paddr,
+-						skb->len + skb_tailroom(skb),
+-						DMA_FROM_DEVICE);
+-
+-			tlv = (struct hal_tlv_64_hdr *)skb->data;
+-			if (le64_get_bits(tlv->tl, HAL_TLV_HDR_TAG) !=
+-					HAL_RX_STATUS_BUFFER_DONE) {
+-				pmon->buf_state = DP_MON_STATUS_NO_DMA;
+-				ath12k_warn(ab,
+-					    "mon status DONE not set %llx, buf_id %d\n",
+-					    le64_get_bits(tlv->tl, HAL_TLV_HDR_TAG),
+-					    buf_id);
+-				/* RxDMA status done bit might not be set even
+-				 * though tp is moved by HW.
+-				 */
+-
+-				/* If done status is missing:
+-				 * 1. As per MAC team's suggestion,
+-				 *    when HP + 1 entry is peeked and if DMA
+-				 *    is not done and if HP + 2 entry's DMA done
+-				 *    is set. skip HP + 1 entry and
+-				 *    start processing in next interrupt.
+-				 * 2. If HP + 2 entry's DMA done is not set,
+-				 *    poll onto HP + 1 entry DMA done to be set.
+-				 *    Check status for same buffer for next time
+-				 *    dp_rx_mon_status_srng_process
+-				 */
+-				reap_status = ath12k_dp_rx_mon_buf_done(ab, srng,
+-									rx_ring);
+-				if (reap_status == DP_MON_STATUS_NO_DMA)
+-					continue;
+-
+-				spin_lock_bh(&rx_ring->idr_lock);
+-				idr_remove(&rx_ring->bufs_idr, buf_id);
+-				spin_unlock_bh(&rx_ring->idr_lock);
+-
+-				dma_unmap_single(ab->dev, rxcb->paddr,
+-						 skb->len + skb_tailroom(skb),
+-						 DMA_FROM_DEVICE);
+-
+-				dev_kfree_skb_any(skb);
+-				pmon->buf_state = DP_MON_STATUS_REPLINISH;
+-				goto move_next;
+-			}
+-
+-			spin_lock_bh(&rx_ring->idr_lock);
+-			idr_remove(&rx_ring->bufs_idr, buf_id);
+-			spin_unlock_bh(&rx_ring->idr_lock);
+-
+-			dma_unmap_single(ab->dev, rxcb->paddr,
+-					 skb->len + skb_tailroom(skb),
+-					 DMA_FROM_DEVICE);
+-
+-			if (ath12k_dp_pkt_set_pktlen(skb, RX_MON_STATUS_BUF_SIZE)) {
+-				dev_kfree_skb_any(skb);
+-				goto move_next;
+-			}
+-			__skb_queue_tail(skb_list, skb);
+-		} else {
+-			pmon->buf_state = DP_MON_STATUS_REPLINISH;
+-		}
+-move_next:
+-		skb = ath12k_dp_rx_alloc_mon_status_buf(ab, rx_ring,
+-							&buf_id);
+-
+-		if (!skb) {
+-			ath12k_warn(ab, "failed to alloc buffer for status ring\n");
+-			hal_params = ab->hal.hal_params;
+-			ath12k_hal_rx_buf_addr_info_set(rx_mon_status_desc, 0,
+-							0,
+-							hal_params->rx_buf_rbm);
+-			num_buffs_reaped++;
+-			break;
+-		}
+-		rxcb = ATH12K_SKB_RXCB(skb);
+-
+-		cookie = u32_encode_bits(mac_id, DP_RXDMA_BUF_COOKIE_PDEV_ID) |
+-			 u32_encode_bits(buf_id, DP_RXDMA_BUF_COOKIE_BUF_ID);
+-
+-		ath12k_hal_rx_buf_addr_info_set(rx_mon_status_desc, rxcb->paddr,
+-						cookie,
+-						ab->hal.hal_params->rx_buf_rbm);
+-		ath12k_hal_srng_src_get_next_entry(ab, srng);
+-		num_buffs_reaped++;
+-	}
+-	ath12k_hal_srng_access_end(ab, srng);
+-	spin_unlock_bh(&srng->lock);
+-
+-	return num_buffs_reaped;
+-}
+-
+ static u32
+ ath12k_dp_rx_mon_mpdu_pop(struct ath12k *ar, int mac_id,
+ 			  void *ring_entry, struct sk_buff **head_msdu,
+@@ -2341,8 +2109,8 @@ next_msdu:
+  */
+ #define MON_DEST_RING_STUCK_MAX_CNT 16
+ 
+-static void ath12k_dp_rx_mon_dest_process(struct ath12k *ar, int mac_id,
+-					  u32 quota, struct napi_struct *napi)
++void ath12k_dp_rx_mon_dest_process(struct ath12k *ar, int mac_id,
++				   u32 quota, struct napi_struct *napi)
+ {
+ 	struct ath12k_pdev_mon_dp *dp_mon_pdev = ar->dp.dp_mon_pdev;
+ 	struct ath12k_mon_data *pmon = (struct ath12k_mon_data *)&dp_mon_pdev->mon_data;
+@@ -2444,48 +2212,7 @@ static void ath12k_dp_rx_mon_dest_process(struct ath12k *ar, int mac_id,
+ 					    rx_bufs_used);
+ 	}
+ }
+-
+-int __ath12k_dp_mon_process_ring(struct ath12k *ar, int mac_id,
+-				 struct napi_struct *napi, int *budget)
+-{
+-	struct ath12k_pdev_mon_dp *dp_mon_pdev = ar->dp.dp_mon_pdev;
+-	struct ath12k_mon_data *pmon = (struct ath12k_mon_data *)&dp_mon_pdev->mon_data;
+-	struct ath12k_pdev_mon_stats *rx_mon_stats = &pmon->rx_mon_stats;
+-	struct hal_rx_mon_ppdu_info *ppdu_info = &pmon->mon_ppdu_info;
+-	enum hal_rx_mon_status hal_status;
+-	struct sk_buff_head skb_list;
+-	int num_buffs_reaped;
+-	struct sk_buff *skb;
+-
+-	__skb_queue_head_init(&skb_list);
+-
+-	num_buffs_reaped = ath12k_dp_rx_reap_mon_status_ring(ar->ab, mac_id,
+-							     budget, &skb_list);
+-	if (!num_buffs_reaped)
+-		goto exit;
+-
+-	while ((skb = __skb_dequeue(&skb_list))) {
+-		memset(ppdu_info, 0, sizeof(*ppdu_info));
+-		ppdu_info->peer_id = HAL_INVALID_PEERID;
+-
+-		hal_status = ath12k_dp_mon_parse_rx_dest(&ar->dp, skb);
+-
+-		if (ar->monitor_started &&
+-		    pmon->mon_ppdu_status == DP_PPDU_STATUS_START &&
+-		    hal_status == HAL_TLV_STATUS_PPDU_DONE) {
+-			rx_mon_stats->status_ppdu_done++;
+-			pmon->mon_ppdu_status = DP_PPDU_STATUS_DONE;
+-			ath12k_dp_rx_mon_dest_process(ar, mac_id, *budget, napi);
+-			pmon->mon_ppdu_status = DP_PPDU_STATUS_START;
+-		}
+-
+-		dev_kfree_skb_any(skb);
+-	}
+-
+-exit:
+-	return num_buffs_reaped;
+-}
+-EXPORT_SYMBOL(__ath12k_dp_mon_process_ring);
++EXPORT_SYMBOL(ath12k_dp_rx_mon_dest_process);
+ 
+ void ath12k_dp_rxdma_mon_buf_ring_free(struct ath12k_base *ab,
+ 				       struct dp_rxdma_mon_ring *rx_ring)
+diff --git a/drivers/net/wireless/ath/ath12k/dp_mon.h b/drivers/net/wireless/ath/ath12k/dp_mon.h
+index 2564e8b..cf57c10 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_mon.h
++++ b/drivers/net/wireless/ath/ath12k/dp_mon.h
+@@ -42,6 +42,10 @@
+ 				  RX_MON_STATUS_BUF_ALIGN + \
+ 				  SKB_DATA_ALIGN(sizeof(struct skb_shared_info))))
+ 
++#define DP_MON_RXDMA_BUF_COOKIE_BUF_ID		GENMASK(17, 0)
++#define DP_MON_RXDMA_BUF_COOKIE_PDEV_ID 	GENMASK(19, 18)
++
++
+ struct ath12k_mon_data;
+ 
+ struct dp_rxdma_mon_ring {
+@@ -228,8 +232,6 @@ ath12k_dp_mon_tx_parse_mon_status(struct ath12k_pdev_dp *dp_pdev,
+ void ath12k_dp_mon_rx_process_ulofdma(struct hal_rx_mon_ppdu_info *ppdu_info);
+ int ath12k_dp_mon_rx_dual_ring_process(struct ath12k_pdev_dp *pdev_dp, int mac_id,
+ 				       struct napi_struct *napi, int *budget);
+-int __ath12k_dp_mon_process_ring(struct ath12k *ar, int mac_id,
+-				 struct napi_struct *napi, int *budget);
+ int ath12k_dp_get_peer_telemetry_stats(struct ath12k_base *ab,
+                                       const u8 *peer_addr,
+                                       struct ath12k_peer_telemetry_stats *stats);
+@@ -253,6 +255,9 @@ int ath12k_dp_mon_pdev_rx_htt_srng_setup(struct ath12k_pdev_dp *dp_pdev,
+ 					 u32 mac_id);
+ void ath12k_dp_mon_pdev_rx_attach(struct ath12k_pdev_dp *dp_pdev);
+ void ath12k_dp_mon_pdev_rx_mpdu_list_init(struct ath12k_mon_data *pmon);
++void ath12k_dp_rx_mon_dest_process(struct ath12k *ar, int mac_id,
++				   u32 quota, struct napi_struct *napi);
++int ath12k_dp_pkt_set_pktlen(struct sk_buff *skb, u32 len);
+ 
+ static inline
+ int ath12k_dp_mon_rx_alloc(struct ath12k_dp *dp)
+diff --git a/drivers/net/wireless/ath/ath12k/hal.c b/drivers/net/wireless/ath/ath12k/hal.c
+index 5ce91db..fd5f8fb 100644
+--- a/drivers/net/wireless/ath/ath12k/hal.c
++++ b/drivers/net/wireless/ath/ath12k/hal.c
+@@ -555,6 +555,7 @@ void *ath12k_hal_srng_src_next_peek(struct ath12k_base *ab,
+ 
+ 	return desc;
+ }
++EXPORT_SYMBOL(ath12k_hal_srng_src_next_peek);
+ 
+ void *ath12k_hal_srng_src_get_next_entry(struct ath12k_base *ab,
+ 					 struct hal_srng *srng)
+@@ -600,6 +601,7 @@ void *ath12k_hal_srng_src_peek(struct ath12k_base *ab, struct hal_srng *srng)
+ 
+ 	return srng->ring_base_vaddr + srng->u.src_ring.hp;
+ }
++EXPORT_SYMBOL(ath12k_hal_srng_src_peek);
+ 
+ void *ath12k_hal_srng_src_reap_next(struct ath12k_base *ab,
+ 				    struct hal_srng *srng)
+diff --git a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon1.c b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon1.c
+index 9c15097..19ea5cb 100644
+--- a/drivers/net/wireless/ath/ath12k/wifi7/dp_mon1.c
++++ b/drivers/net/wireless/ath/ath12k/wifi7/dp_mon1.c
+@@ -10,6 +10,7 @@
+ #include "../dp_mon.h"
+ #include "dp_mon1.h"
+ #include "../debug.h"
++#include "hal_mon.h"
+ 
+ struct ath12k_dp_arch_mon_ops ath12k_wifi7_dp_arch_mon_quad_ring_ops = {
+ 	.rx_srng_setup = ath12k_wifi7_dp_mon_rx_srng_setup,
+@@ -119,7 +120,7 @@ ath12k_wifi7_dp_mon_rx_status_bufs_replenish(struct ath12k_base *ab,
+ 		spin_unlock_bh(&rx_ring->idr_lock);
+ 		if (buf_id < 0)
+ 			goto fail_dma_unmap;
+-		cookie = u32_encode_bits(buf_id, DP_RXDMA_BUF_COOKIE_BUF_ID);
++		cookie = u32_encode_bits(buf_id, DP_MON_RXDMA_BUF_COOKIE_BUF_ID);
+ 
+ 		desc = ath12k_hal_srng_src_get_next_entry(ab, srng);
+ 		if (!desc)
+@@ -212,12 +213,326 @@ int ath12k_wifi7_dp_mon_rx_htt_srng_setup(struct ath12k_dp *dp)
+ 	return 0;
+ }
+ 
++static struct sk_buff
++*ath12k_wifi7_dp_mon_rx_alloc_status_buf(struct ath12k_base *ab,
++					 struct dp_rxdma_mon_ring *rx_ring,
++					 int *buf_id)
++{
++	struct sk_buff *skb;
++	dma_addr_t paddr;
++
++	skb = dev_alloc_skb(RX_MON_STATUS_BUF_SIZE);
++
++	if (!skb)
++		goto fail_alloc_skb;
++
++	if (!IS_ALIGNED((unsigned long)skb->data,
++			RX_MON_STATUS_BUF_ALIGN)) {
++		skb_pull(skb, PTR_ALIGN(skb->data, RX_MON_STATUS_BUF_ALIGN) -
++			 skb->data);
++	}
++
++	paddr = dma_map_single(ab->dev, skb->data,
++			       skb->len + skb_tailroom(skb),
++			       DMA_FROM_DEVICE);
++	if (unlikely(dma_mapping_error(ab->dev, paddr)))
++		goto fail_free_skb;
++
++	spin_lock_bh(&rx_ring->idr_lock);
++	*buf_id = idr_alloc(&rx_ring->bufs_idr, skb, 0,
++			    rx_ring->bufs_max, GFP_ATOMIC);
++	spin_unlock_bh(&rx_ring->idr_lock);
++	if (*buf_id < 0)
++		goto fail_dma_unmap;
++
++	ATH12K_SKB_RXCB(skb)->paddr = paddr;
++	return skb;
++
++fail_dma_unmap:
++	dma_unmap_single(ab->dev, paddr, skb->len + skb_tailroom(skb),
++			 DMA_FROM_DEVICE);
++fail_free_skb:
++	dev_kfree_skb_any(skb);
++fail_alloc_skb:
++	return NULL;
++}
++
++static enum dp_mon_status_buf_state
++ath12k_wifi7_dp_mon_rx_buf_done(struct ath12k_base *ab, struct hal_srng *srng,
++				struct dp_rxdma_mon_ring *rx_ring)
++{
++	struct ath12k_skb_rxcb *rxcb;
++	struct hal_tlv_64_hdr *tlv;
++	struct sk_buff *skb;
++	struct ath12k_buffer_addr *status_desc;
++	dma_addr_t paddr;
++	u32 cookie;
++	int buf_id;
++	u8 rbm;
++
++	status_desc = ath12k_hal_srng_src_next_peek(ab, srng);
++	if (!status_desc)
++		return DP_MON_STATUS_NO_DMA;
++
++	ath12k_hal_rx_buf_addr_info_get(status_desc, &paddr, &cookie, &rbm);
++
++	buf_id = u32_get_bits(cookie, DP_MON_RXDMA_BUF_COOKIE_BUF_ID);
++
++	spin_lock_bh(&rx_ring->idr_lock);
++	skb = idr_find(&rx_ring->bufs_idr, buf_id);
++	spin_unlock_bh(&rx_ring->idr_lock);
++
++	if (!skb)
++		return DP_MON_STATUS_NO_DMA;
++
++	rxcb = ATH12K_SKB_RXCB(skb);
++	dma_sync_single_for_cpu(ab->dev, rxcb->paddr,
++				skb->len + skb_tailroom(skb),
++				DMA_FROM_DEVICE);
++
++	tlv = (struct hal_tlv_64_hdr *)skb->data;
++	if (le64_get_bits(tlv->tl, HAL_TLV_HDR_TAG) != HAL_RX_STATUS_BUFFER_DONE)
++		return DP_MON_STATUS_NO_DMA;
++
++	return DP_MON_STATUS_REPLINISH;
++}
++
++static int ath12k_wifi7_dp_mon_rx_reap_status_ring(struct ath12k_base *ab, int mac_id,
++						   int *budget,
++						   struct sk_buff_head *skb_list)
++{
++	const struct ath12k_hw_hal_params *hal_params;
++	int buf_id, srng_id, num_buffs_reaped = 0;
++	enum dp_mon_status_buf_state reap_status;
++	struct dp_rxdma_mon_ring *rx_ring;
++	struct ath12k_mon_data *pmon;
++	struct ath12k_skb_rxcb *rxcb;
++	struct hal_tlv_64_hdr *tlv;
++	struct ath12k_buffer_addr *rx_mon_status_desc;
++	struct hal_srng *srng;
++	struct ath12k_dp *dp;
++	struct ath12k_dp_mon *dp_mon;
++	struct sk_buff *skb;
++	struct ath12k *ar;
++	dma_addr_t paddr;
++	u32 cookie;
++	u8 rbm;
++
++	ar = ab->pdevs[ath12k_hw_mac_id_to_pdev_id(ab->hw_params, mac_id)].ar;
++	dp = ab->dp;
++	dp_mon = dp->dp_mon;
++	pmon = &ar->dp.dp_mon_pdev->mon_data;
++	srng_id = ath12k_hw_mac_id_to_srng_id(ab->hw_params, mac_id);
++	rx_ring = &dp_mon->rx_mon_status_refill_ring[srng_id];
++
++	srng = &ab->hal.srng_list[rx_ring->refill_buf_ring.ring_id];
++
++	spin_lock_bh(&srng->lock);
++
++	ath12k_hal_srng_access_begin(ab, srng);
++
++	while (*budget) {
++		*budget -= 1;
++		rx_mon_status_desc = ath12k_hal_srng_src_peek(ab, srng);
++		if (!rx_mon_status_desc) {
++			pmon->buf_state = DP_MON_STATUS_REPLINISH;
++			break;
++		}
++		ath12k_hal_rx_buf_addr_info_get(rx_mon_status_desc, &paddr,
++						&cookie, &rbm);
++		if (paddr) {
++			buf_id = u32_get_bits(cookie, DP_MON_RXDMA_BUF_COOKIE_BUF_ID);
++
++			spin_lock_bh(&rx_ring->idr_lock);
++			skb = idr_find(&rx_ring->bufs_idr, buf_id);
++			spin_unlock_bh(&rx_ring->idr_lock);
++
++			if (!skb) {
++				ath12k_warn(ab, "rx monitor status with invalid buf_id %d\n",
++					    buf_id);
++				pmon->buf_state = DP_MON_STATUS_REPLINISH;
++				goto move_next;
++			}
++
++			rxcb = ATH12K_SKB_RXCB(skb);
++
++			dma_sync_single_for_cpu(ab->dev, rxcb->paddr,
++						skb->len + skb_tailroom(skb),
++						DMA_FROM_DEVICE);
++
++			tlv = (struct hal_tlv_64_hdr *)skb->data;
++			if (le64_get_bits(tlv->tl, HAL_TLV_HDR_TAG) !=
++					HAL_RX_STATUS_BUFFER_DONE) {
++				pmon->buf_state = DP_MON_STATUS_NO_DMA;
++				ath12k_warn(ab,
++					    "mon status DONE not set %llx, buf_id %d\n",
++					    le64_get_bits(tlv->tl, HAL_TLV_HDR_TAG),
++					    buf_id);
++				/* RxDMA status done bit might not be set even
++				 * though tp is moved by HW.
++				 */
++
++				/* If done status is missing:
++				 * 1. As per MAC team's suggestion,
++				 *    when HP + 1 entry is peeked and if DMA
++				 *    is not done and if HP + 2 entry's DMA done
++				 *    is set. skip HP + 1 entry and
++				 *    start processing in next interrupt.
++				 * 2. If HP + 2 entry's DMA done is not set,
++				 *    poll onto HP + 1 entry DMA done to be set.
++				 *    Check status for same buffer for next time
++				 *    dp_rx_mon_status_srng_process
++				 */
++				reap_status = ath12k_wifi7_dp_mon_rx_buf_done(ab, srng,
++									       rx_ring);
++				if (reap_status == DP_MON_STATUS_NO_DMA)
++					continue;
++
++				spin_lock_bh(&rx_ring->idr_lock);
++				idr_remove(&rx_ring->bufs_idr, buf_id);
++				spin_unlock_bh(&rx_ring->idr_lock);
++
++				dma_unmap_single(ab->dev, rxcb->paddr,
++						 skb->len + skb_tailroom(skb),
++						 DMA_FROM_DEVICE);
++
++				dev_kfree_skb_any(skb);
++				pmon->buf_state = DP_MON_STATUS_REPLINISH;
++				goto move_next;
++			}
++
++			spin_lock_bh(&rx_ring->idr_lock);
++			idr_remove(&rx_ring->bufs_idr, buf_id);
++			spin_unlock_bh(&rx_ring->idr_lock);
++
++			dma_unmap_single(ab->dev, rxcb->paddr,
++					 skb->len + skb_tailroom(skb),
++					 DMA_FROM_DEVICE);
++
++			if (ath12k_dp_pkt_set_pktlen(skb, RX_MON_STATUS_BUF_SIZE)) {
++				dev_kfree_skb_any(skb);
++				goto move_next;
++			}
++			__skb_queue_tail(skb_list, skb);
++		} else {
++			pmon->buf_state = DP_MON_STATUS_REPLINISH;
++		}
++move_next:
++		skb = ath12k_wifi7_dp_mon_rx_alloc_status_buf(ab, rx_ring,
++							       &buf_id);
++
++		if (!skb) {
++			ath12k_warn(ab, "failed to alloc buffer for status ring\n");
++			hal_params = ab->hal.hal_params;
++			ath12k_hal_rx_buf_addr_info_set(rx_mon_status_desc, 0,
++							0,
++							hal_params->rx_buf_rbm);
++			num_buffs_reaped++;
++			break;
++		}
++		rxcb = ATH12K_SKB_RXCB(skb);
++
++		cookie = u32_encode_bits(mac_id, DP_MON_RXDMA_BUF_COOKIE_PDEV_ID) |
++			 u32_encode_bits(buf_id, DP_MON_RXDMA_BUF_COOKIE_BUF_ID);
++
++		ath12k_hal_rx_buf_addr_info_set(rx_mon_status_desc, rxcb->paddr,
++						cookie,
++						ab->hal.hal_params->rx_buf_rbm);
++		ath12k_hal_srng_src_get_next_entry(ab, srng);
++		num_buffs_reaped++;
++	}
++	ath12k_hal_srng_access_end(ab, srng);
++	spin_unlock_bh(&srng->lock);
++
++	return num_buffs_reaped;
++}
++
++static enum hal_rx_mon_status
++ath12k_wifi7_dp_mon_rx_parse_dest(struct ath12k_pdev_dp *dp_pdev,
++				  struct sk_buff *skb)
++{
++	struct ath12k_pdev_mon_dp *dp_mon_pdev = dp_pdev->dp_mon_pdev;
++	struct ath12k_mon_data *pmon = (struct ath12k_mon_data *)&dp_mon_pdev->mon_data;
++	struct hal_tlv_64_hdr *tlv;
++	struct ath12k_skb_rxcb *rxcb;
++	enum hal_rx_mon_status hal_status;
++	u16 tlv_tag, tlv_len;
++	u8 *ptr = skb->data;
++
++	do {
++		tlv = (struct hal_tlv_64_hdr *)ptr;
++		tlv_tag = le64_get_bits(tlv->tl, HAL_TLV_64_HDR_TAG);
++
++		/* The actual length of PPDU_END is the combined length of many PHY
++		 * TLVs that follow. Skip the TLV header and
++		 * rx_rxpcu_classification_overview that follows the header to get to
++		 * next TLV.
++		 */
++
++		if (tlv_tag == HAL_RX_PPDU_END)
++			tlv_len = sizeof(struct hal_rx_rxpcu_classification_overview);
++		else
++			tlv_len = le64_get_bits(tlv->tl, HAL_TLV_64_HDR_LEN);
++
++		hal_status = ath12k_hal_mon_rx_parse_status(dp_pdev->dp->hal,
++							    &pmon->mon_ppdu_info,
++							    tlv);
++		ptr += sizeof(*tlv) + tlv_len;
++		ptr = PTR_ALIGN(ptr, HAL_TLV_64_ALIGN);
++
++		if ((ptr - skb->data) > skb->len)
++			break;
++
++	} while ((hal_status == HAL_RX_MON_STATUS_PPDU_NOT_DONE) ||
++		 (hal_status == HAL_RX_MON_STATUS_BUF_ADDR) ||
++		 (hal_status == HAL_RX_MON_STATUS_MPDU_START) ||
++		 (hal_status == HAL_RX_MON_STATUS_MPDU_END) ||
++		 (hal_status == HAL_RX_MON_STATUS_MSDU_END));
++
++	rxcb = ATH12K_SKB_RXCB(skb);
++	if (rxcb->is_end_of_ppdu)
++		hal_status = HAL_RX_MON_STATUS_PPDU_DONE;
++
++	return hal_status;
++}
++
+ int ath12k_wifi7_dp_mon_rx_quad_ring_process(struct ath12k_pdev_dp *pdev_dp, int mac_id,
+ 					     struct napi_struct *napi, int *budget)
+ {
++	struct ath12k *ar = pdev_dp->ar;
++	struct ath12k_pdev_mon_dp *dp_mon_pdev = ar->dp.dp_mon_pdev;
++	struct ath12k_mon_data *pmon = (struct ath12k_mon_data *)&dp_mon_pdev->mon_data;
++	struct ath12k_pdev_mon_stats *rx_mon_stats = &pmon->rx_mon_stats;
++	struct hal_rx_mon_ppdu_info *ppdu_info = &pmon->mon_ppdu_info;
++	enum hal_rx_mon_status hal_status;
++	struct sk_buff_head skb_list;
+ 	int num_buffs_reaped;
++	struct sk_buff *skb;
++
++	__skb_queue_head_init(&skb_list);
++
++	num_buffs_reaped = ath12k_wifi7_dp_mon_rx_reap_status_ring(ar->ab, mac_id,
++								   budget, &skb_list);
++	if (!num_buffs_reaped)
++		goto exit;
++
++	while ((skb = __skb_dequeue(&skb_list))) {
++		memset(ppdu_info, 0, sizeof(*ppdu_info));
++		ppdu_info->peer_id = HAL_INVALID_PEERID;
+ 
+-	num_buffs_reaped = __ath12k_dp_mon_process_ring(pdev_dp->ar, mac_id, napi,
+-							budget);
++		hal_status = ath12k_wifi7_dp_mon_rx_parse_dest(&ar->dp, skb);
++
++		if (ar->monitor_started &&
++		    pmon->mon_ppdu_status == DP_PPDU_STATUS_START &&
++		    hal_status == HAL_TLV_STATUS_PPDU_DONE) {
++			rx_mon_stats->status_ppdu_done++;
++			pmon->mon_ppdu_status = DP_PPDU_STATUS_DONE;
++			ath12k_dp_rx_mon_dest_process(ar, mac_id, *budget, napi);
++			pmon->mon_ppdu_status = DP_PPDU_STATUS_START;
++		}
++
++		dev_kfree_skb_any(skb);
++	}
++exit:
+ 	return num_buffs_reaped;
+ }
+-- 
+2.34.1
+
