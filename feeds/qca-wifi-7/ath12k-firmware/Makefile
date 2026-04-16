@@ -72,11 +72,19 @@ endef
 
 define Package/ath12k-firmware-ipq5332-peb/install
 	$(INSTALL_DIR) $(1)/lib/firmware/IPQ5332/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/qcn6432/
+	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN6432/hw1.0/
 	$(INSTALL_DATA) ./files/IPQ5332_peb/*.* \
 		$(1)/lib/firmware/IPQ5332/
+	$(INSTALL_DATA) ./files/IPQ5332_peb/*.* \
+                 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
 	$(INSTALL_DATA) ./files/IPQ5332_peb/qcn6432/* \
 		$(1)/lib/firmware/qcn6432/
+	$(INSTALL_DATA) ./files/IPQ5332_peb/*.* \
+                 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/
+	$(INSTALL_DATA) ./files/IPQ5332_peb/qcn6432/* \
+                 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/
 endef
 
 define Package/ath12k-firmware-ipq5332-peb-peb/install
