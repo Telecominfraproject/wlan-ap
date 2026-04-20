@@ -1,0 +1,156 @@
+From c7c7962d7474e15e09a3ba96974681781756d322 Mon Sep 17 00:00:00 2001
+From: Neelansh Mittal <neelanshm@codeaurora.org>
+Date: Tue, 30 Mar 2021 14:10:51 +0530
+Subject: [PATCH 280/500] xfrm: Add xfrm event notifier.
+
+Add xfrm_state change event notifier
+
+Change-Id: Ia211ad89fe78a0eff57c4f643d79c1396c0be0af
+Signed-off-by: Neelansh Mittal <neelanshm@codeaurora.org>
+Signed-off-by: Pavithra R <quic_pavir@quicinc.com>
+---
+ include/net/netns/xfrm.h |  2 ++
+ include/net/xfrm.h       | 16 ++++++++++++++++
+ net/xfrm/xfrm_policy.c   |  4 ++++
+ net/xfrm/xfrm_state.c    | 37 +++++++++++++++++++++++++++++++++++++
+ net/xfrm/xfrm_user.c     |  3 +++
+ 5 files changed, 62 insertions(+)
+
+diff --git a/include/net/netns/xfrm.h b/include/net/netns/xfrm.h
+index 423b52eca908..4c9330d3b1ac 100644
+--- a/include/net/netns/xfrm.h
++++ b/include/net/netns/xfrm.h
+@@ -83,6 +83,8 @@ struct netns_xfrm {
+ 
+ 	spinlock_t xfrm_policy_lock;
+ 	struct mutex xfrm_cfg_mutex;
++	spinlock_t xfrm_event_lock;
++	struct list_head event_notifier_list;
+ };
+ 
+ #endif
+diff --git a/include/net/xfrm.h b/include/net/xfrm.h
+index 393dfef89014..24c61ec466fd 100644
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@ -291,6 +291,21 @@ struct xfrm_state {
+ 	void			*data;
+ };
+ 
++enum xfrm_event_type {
++	XFRM_EVENT_NONE = 0,
++	XFRM_EVENT_STATE_ADD,
++	XFRM_EVENT_STATE_DEL,
++	XFRM_EVENT_MAX
++};
++
++struct xfrm_event_notifier {
++	struct list_head list;
++	void (*state_notify)(struct xfrm_state *x, enum xfrm_event_type event);
++};
++
++int xfrm_event_register_notifier(struct net *net, struct xfrm_event_notifier *event);
++void xfrm_event_unregister_notifier(struct net *net, struct xfrm_event_notifier *event);
++
+ static inline struct net *xs_net(struct xfrm_state *x)
+ {
+ 	return read_pnet(&x->xs_net);
+@@ -1609,6 +1624,7 @@ struct xfrm_state *xfrm_state_lookup_byaddr(struct net *net, u32 mark,
+ 					    const xfrm_address_t *saddr,
+ 					    u8 proto,
+ 					    unsigned short family);
++void xfrm_state_change_notify(struct xfrm_state *x, enum xfrm_event_type);
+ #ifdef CONFIG_XFRM_SUB_POLICY
+ void xfrm_tmpl_sort(struct xfrm_tmpl **dst, struct xfrm_tmpl **src, int n,
+ 		    unsigned short family);
+diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
+index d24b4d4f620e..a1e929d221dc 100644
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -4216,6 +4216,10 @@ static int __net_init xfrm_net_init(struct net *net)
+ 	spin_lock_init(&net->xfrm.xfrm_policy_lock);
+ 	seqcount_spinlock_init(&net->xfrm.xfrm_policy_hash_generation, &net->xfrm.xfrm_policy_lock);
+ 	mutex_init(&net->xfrm.xfrm_cfg_mutex);
++	spin_lock_init(&net->xfrm.xfrm_event_lock);
++
++	INIT_LIST_HEAD(&net->xfrm.event_notifier_list);
++
+ 	net->xfrm.policy_default[XFRM_POLICY_IN] = XFRM_USERPOLICY_ACCEPT;
+ 	net->xfrm.policy_default[XFRM_POLICY_FWD] = XFRM_USERPOLICY_ACCEPT;
+ 	net->xfrm.policy_default[XFRM_POLICY_OUT] = XFRM_USERPOLICY_ACCEPT;
+diff --git a/net/xfrm/xfrm_state.c b/net/xfrm/xfrm_state.c
+index 934bfd48c4e8..0fca52a7a798 100644
+--- a/net/xfrm/xfrm_state.c
++++ b/net/xfrm/xfrm_state.c
+@@ -719,6 +719,7 @@ int __xfrm_state_delete(struct xfrm_state *x)
+ 			sock_put(rcu_dereference_raw(x->encap_sk));
+ 
+ 		xfrm_dev_state_delete(x);
++		xfrm_state_change_notify(x, XFRM_EVENT_STATE_DEL);
+ 
+ 		/* All xfrm_state objects are created by xfrm_state_alloc.
+ 		 * The xfrm_state_alloc call gives a reference, and that
+@@ -3084,3 +3085,39 @@ void xfrm_audit_state_icvfail(struct xfrm_state *x,
+ }
+ EXPORT_SYMBOL_GPL(xfrm_audit_state_icvfail);
+ #endif /* CONFIG_AUDITSYSCALL */
++
++void xfrm_state_change_notify(struct xfrm_state *x, enum xfrm_event_type type)
++{
++	struct xfrm_event_notifier *event;
++	struct net *net = xs_net(x);
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(event, &net->xfrm.event_notifier_list, list) {
++		if (event->state_notify) {
++			event->state_notify(x, type);
++		}
++
++		BUG_ON(refcount_read(&x->refcnt) <= 0);
++	}
++
++	rcu_read_unlock();
++}
++EXPORT_SYMBOL(xfrm_state_change_notify);
++
++int xfrm_event_register_notifier(struct net *net, struct xfrm_event_notifier *event)
++{
++	spin_lock_bh(&net->xfrm.xfrm_event_lock);
++	list_add_tail_rcu(&event->list, &net->xfrm.event_notifier_list);
++	spin_unlock_bh(&net->xfrm.xfrm_event_lock);
++	return 0;
++}
++EXPORT_SYMBOL(xfrm_event_register_notifier);
++
++void xfrm_event_unregister_notifier(struct net *net, struct xfrm_event_notifier *event)
++{
++	spin_lock_bh(&net->xfrm.xfrm_event_lock);
++	list_del_rcu(&event->list);
++	spin_unlock_bh(&net->xfrm.xfrm_event_lock);
++	synchronize_rcu();
++}
++EXPORT_SYMBOL(xfrm_event_unregister_notifier);
+diff --git a/net/xfrm/xfrm_user.c b/net/xfrm/xfrm_user.c
+index ad01997c3aa9..e2efe1df2877 100644
+--- a/net/xfrm/xfrm_user.c
++++ b/net/xfrm/xfrm_user.c
+@@ -769,6 +769,8 @@ static struct xfrm_state *xfrm_state_construct(struct net *net,
+ 			goto error;
+ 	}
+ 
++	xfrm_state_change_notify(x, XFRM_EVENT_STATE_ADD);
++
+ 	return x;
+ 
+ error:
+@@ -807,6 +809,7 @@ static int xfrm_add_sa(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	if (err < 0) {
+ 		x->km.state = XFRM_STATE_DEAD;
+ 		xfrm_dev_state_delete(x);
++		xfrm_state_change_notify(x, XFRM_EVENT_STATE_DEL);
+ 		__xfrm_state_put(x);
+ 		goto out;
+ 	}
+-- 
+2.34.1
+

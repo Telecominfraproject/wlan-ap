@@ -1,0 +1,207 @@
+From 8d18026875074002312875cb570065e411688029 Mon Sep 17 00:00:00 2001
+From: Ratheesh Kannoth <rkannoth@codeaurora.org>
+Date: Wed, 16 Dec 2020 15:24:02 +0530
+Subject: [PATCH 305/500] net: pptp: Fill in src key for tuple.
+
+ PPTP gre conntrack is installed during OUT_CALL_REPLY or
+ IN_CALL_CONNECT. if conntrack is destroyed, gre conntrack
+ installs a conntrack in each direction (two conntrack in total)
+ with src call id as 0. This prevents updates of packet stats
+ from AE engine and result in timing out conntrack and leads to
+ flushing of AE flow. This change populates correct src call id.
+
+Signed-off-by: Ratheesh Kannoth <rkannoth@codeaurora.org>
+Change-Id: Ic7861d1e8dc61969194d17793a9d1d546029d29c
+---
+ drivers/net/ppp/pptp.c                 | 41 +++++++++++++++++-
+ include/linux/if_pppox.h               |  6 ++-
+ net/netfilter/nf_conntrack_proto_gre.c | 58 +++++++++++++++++++++++++-
+ 3 files changed, 101 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ppp/pptp.c b/drivers/net/ppp/pptp.c
+index 897c8a8a0a25..dd409af6b84e 100644
+--- a/drivers/net/ppp/pptp.c
++++ b/drivers/net/ppp/pptp.c
+@@ -93,6 +93,32 @@ static int lookup_chan_dst(u16 call_id, __be32 d_addr)
+ 	return i < MAX_CALLID;
+ }
+ 
++/* Search a pptp session based on local call id, local and remote ip address */
++static int lookup_session_src(struct pptp_opt *opt, u16 call_id, __be32 daddr, __be32 saddr)
++{
++	struct pppox_sock *sock;
++	int i = 1;
++
++	rcu_read_lock();
++	for_each_set_bit_from(i, callid_bitmap, MAX_CALLID) {
++		sock = rcu_dereference(callid_sock[i]);
++		if (!sock)
++			continue;
++
++		if (sock->proto.pptp.src_addr.call_id == call_id &&
++		    sock->proto.pptp.dst_addr.sin_addr.s_addr == daddr &&
++		    sock->proto.pptp.src_addr.sin_addr.s_addr == saddr) {
++			sock_hold(sk_pppox(sock));
++			memcpy(opt, &sock->proto.pptp, sizeof(struct pptp_opt));
++			sock_put(sk_pppox(sock));
++			rcu_read_unlock();
++			return 0;
++		}
++	}
++	rcu_read_unlock();
++	return -EINVAL;
++}
++
+ /* Search a pptp session based on peer call id and peer ip address */
+ static int lookup_session_dst(struct pptp_opt *opt, u16 call_id, __be32 d_addr)
+ {
+@@ -209,7 +235,6 @@ static int pptp_xmit(struct ppp_channel *chan, struct sk_buff *skb)
+ 	unsigned char *data;
+ 	__u32 seq_recv;
+ 
+-
+ 	struct rtable *rt;
+ 	struct net_device *tdev;
+ 	struct net_device *pptp_dev;
+@@ -735,6 +760,20 @@ int pptp_session_find(struct pptp_opt *opt, __be16 peer_call_id,
+ }
+ EXPORT_SYMBOL(pptp_session_find);
+ 
++/* pptp_session_find_by_src_callid()
++ *	Search and return a PPTP session info based on src callid and IP
++ *	address. The function accepts the parameters in network byte order.
++ */
++int pptp_session_find_by_src_callid(struct pptp_opt *opt, __be16 src_call_id,
++		      __be32 daddr, __be32 saddr)
++{
++	if (!opt)
++		return -EINVAL;
++
++	return lookup_session_src(opt, ntohs(src_call_id), daddr, saddr);
++}
++EXPORT_SYMBOL(pptp_session_find_by_src_callid);
++
+  /* Function to change the offload mode true/false for a PPTP session */
+ static int pptp_set_offload_mode(bool accel_mode,
+ 				 __be16 peer_call_id, __be32 peer_ip_addr)
+diff --git a/include/linux/if_pppox.h b/include/linux/if_pppox.h
+index 112b83ec8ef1..a1ec6dc1eab3 100644
+--- a/include/linux/if_pppox.h
++++ b/include/linux/if_pppox.h
+@@ -110,7 +110,11 @@ typedef int (*pptp_gre_seq_offload_callback_t)(struct sk_buff *skb,
+ extern int pppoe_channel_addressing_get(struct ppp_channel *chan,
+ 					 struct pppoe_opt *addressing);
+ 
+-/* Lookup PPTP session info and return PPTP session */
++/* Lookup PPTP session info and return PPTP session using sip, dip and local call id */
++extern int pptp_session_find_by_src_callid(struct pptp_opt *opt, __be16 src_call_id,
++			 __be32 daddr, __be32 saddr);
++
++/* Lookup PPTP session info and return PPTP session using dip and peer call id */
+ extern int pptp_session_find(struct pptp_opt *opt, __be16 peer_call_id,
+ 			     __be32 peer_ip_addr);
+ 
+diff --git a/net/netfilter/nf_conntrack_proto_gre.c b/net/netfilter/nf_conntrack_proto_gre.c
+index af369e686fc5..0ae5ceb07924 100644
+--- a/net/netfilter/nf_conntrack_proto_gre.c
++++ b/net/netfilter/nf_conntrack_proto_gre.c
+@@ -41,6 +41,8 @@
+ #include <net/netfilter/nf_conntrack_timeout.h>
+ #include <linux/netfilter/nf_conntrack_proto_gre.h>
+ #include <linux/netfilter/nf_conntrack_pptp.h>
++#include <linux/ip.h>
++#include <linux/if_pppox.h>
+ 
+ static const unsigned int gre_timeouts[GRE_CT_MAX] = {
+ 	[GRE_CT_UNREPLIED]	= 30*HZ,
+@@ -66,15 +68,17 @@ static inline int gre_key_cmpfn(const struct nf_ct_gre_keymap *km,
+ }
+ 
+ /* look up the source key for a given tuple */
+-static __be16 gre_keymap_lookup(struct net *net, struct nf_conntrack_tuple *t)
++static __be16 gre_keymap_lookup(struct net *net, struct nf_conntrack_tuple *t, bool *found)
+ {
+ 	struct nf_gre_net *net_gre = gre_pernet(net);
+ 	struct nf_ct_gre_keymap *km;
+ 	__be16 key = 0;
++	*found = false;
+ 
+ 	list_for_each_entry_rcu(km, &net_gre->keymap_list, list) {
+ 		if (gre_key_cmpfn(km, t)) {
+ 			key = km->tuple.src.u.gre.key;
++			*found = true;
+ 			break;
+ 		}
+ 	}
+@@ -156,6 +160,12 @@ bool gre_pkt_to_tuple(const struct sk_buff *skb, unsigned int dataoff,
+ 	__be16 srckey;
+ 	const struct gre_base_hdr *grehdr;
+ 	struct gre_base_hdr _grehdr;
++#if IS_ENABLED(CONFIG_PPTP)
++	struct pptp_opt opt;
++	struct iphdr *v4_hdr;
++	int ret;
++#endif
++	bool found;
+ 
+ 	/* first only delinearize old RFC1701 GRE header */
+ 	grehdr = skb_header_pointer(skb, dataoff, sizeof(_grehdr), &_grehdr);
+@@ -177,10 +187,54 @@ bool gre_pkt_to_tuple(const struct sk_buff *skb, unsigned int dataoff,
+ 	}
+ 
+ 	tuple->dst.u.gre.key = pgrehdr->call_id;
+-	srckey = gre_keymap_lookup(net, tuple);
++	srckey = gre_keymap_lookup(net, tuple, &found);
+ 	tuple->src.u.gre.key = srckey;
+ 
++#if !IS_ENABLED(CONFIG_PPTP)
+ 	return true;
++#else
++
++	/* Return if src key is found */
++	if (found) {
++		pr_debug("key map entry found (srckey=0x%x dstkey=0x%x)\n", ntohs(srckey),
++			 ntohs(tuple->dst.u.gre.key));
++		return true;
++	}
++
++	/* Key map was not found. Return for IPv6 packet */
++	v4_hdr = ip_hdr(skb);
++	if (v4_hdr->version != IPVERSION) {
++		pr_debug("PPTP IP version is %d\n", v4_hdr->version);
++		return true;
++	}
++
++	/* Lookup the call-id based on dest callID. This is needed for packet originated from the system */
++	ret = pptp_session_find(&opt, pgrehdr->call_id, v4_hdr->daddr);
++	if (!ret) {
++		tuple->src.u.gre.key = htons(opt.src_addr.call_id);
++		pr_debug("PPTP session found by dest callid sip=0x%x srckey=0x%x dip=0x%x destkey=0x%x\n",
++			 ntohl(opt.src_addr.sin_addr.s_addr), opt.src_addr.call_id,
++			 ntohl(opt.dst_addr.sin_addr.s_addr), opt.dst_addr.call_id);
++		return true;
++	}
++
++	/* Lookup the call-id based on source callID. This is needed for packets received */
++	ret =  pptp_session_find_by_src_callid(&opt, pgrehdr->call_id, v4_hdr->saddr, v4_hdr->daddr);
++	if (!ret) {
++		tuple->src.u.gre.key = htons(opt.dst_addr.call_id);
++		pr_debug("PPTP session found by src callid sip=0x%x srckey=0x%x dip=0x%x destkey=0x%x\n",
++				ntohl(opt.dst_addr.sin_addr.s_addr), opt.dst_addr.call_id,
++				ntohl(opt.src_addr.sin_addr.s_addr), opt.src_addr.call_id);
++		return true;
++	}
++
++	/* Do not create conntrack entry */
++	pr_debug("Could not find PPTP session (sip=0x%x srckey=0x%x dip=0x%x dstkey=0x%x)\n",
++				ntohl(v4_hdr->saddr), ntohs(srckey),
++				ntohl(v4_hdr->daddr), ntohs(tuple->dst.u.gre.key));
++	return false;
++#endif
++
+ }
+ 
+ #ifdef CONFIG_NF_CONNTRACK_PROCFS
+-- 
+2.34.1
+
