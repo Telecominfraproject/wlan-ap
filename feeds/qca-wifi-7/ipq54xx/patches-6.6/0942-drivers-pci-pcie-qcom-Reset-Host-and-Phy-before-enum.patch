@@ -1,0 +1,160 @@
+From 6c3d925eef7610de0d15fde2a9ec348143a40158 Mon Sep 17 00:00:00 2001
+From: Vignesh Viswanathan <viswanat@qti.qualcomm.com>
+Date: Sun, 24 Aug 2025 15:47:12 +0530
+Subject: [PATCH] drivers: pci: pcie-qcom: Reset Host and Phy before
+ enumeration
+
+For Early Cal, U-boot initializes the PCIe Phy and RC to start the
+calibration on the EP. In Kernel, once the PCIe driver is loaded, it
+waits for calibration to complete and re-initializes the Phy and RC
+without explicitly running the de-init sequence for the Phy and RC.
+
+This causes some clocks to go to a bad state, leading to NOC error when
+EP tries to access the host DDR via the RC.
+
+Add logic to de-initialize the RC and Phy if early cal is enabled, so
+that it can then be enumerated to a clean state.
+
+Change-Id: I7ab6fc70579e15774bc5717d6b3f63435fe71eef
+Signed-off-by: Vignesh Viswanathan <viswanat@qti.qualcomm.com>
+---
+ drivers/pci/controller/dwc/pcie-qcom.c   | 37 ++++++++++++++++++++++--
+ drivers/phy/qualcomm/phy-qcom-qmp-pcie.c | 25 ++++++++++++++++
+ 2 files changed, 59 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/pci/controller/dwc/pcie-qcom.c b/drivers/pci/controller/dwc/pcie-qcom.c
+index da205b56470f..afa9f65a06e4 100644
+--- a/drivers/pci/controller/dwc/pcie-qcom.c
++++ b/drivers/pci/controller/dwc/pcie-qcom.c
+@@ -314,6 +314,7 @@ struct qcom_pcie_ops {
+ 	void (*deinit)(struct qcom_pcie *pcie);
+ 	void (*ltssm_enable)(struct qcom_pcie *pcie);
+ 	int (*config_sid)(struct qcom_pcie *pcie);
++	void (*reset)(struct qcom_pcie *pcie);
+ };
+ 
+ struct qcom_pcie_cfg {
+@@ -1198,6 +1199,21 @@ static int qcom_pcie_get_resources_2_9_0(struct qcom_pcie *pcie)
+ 	return 0;
+ }
+ 
++static void qcom_pcie_reset_2_9_0(struct qcom_pcie *pcie)
++{
++	struct qcom_pcie_resources_2_9_0 *res = &pcie->res.v2_9_0;
++	struct device *dev = pcie->pci->dev;
++	int ret;
++
++	ret = clk_bulk_prepare_enable(res->num_clks, res->clks);
++	if (ret) {
++		dev_err(dev, "%s: Failed to enable clocks: %d\n", __func__, ret);
++		return;
++	}
++
++	clk_bulk_disable_unprepare(res->num_clks, res->clks);
++}
++
+ static void qcom_pcie_deinit_2_9_0(struct qcom_pcie *pcie)
+ {
+ 	struct qcom_pcie_resources_2_9_0 *res = &pcie->res.v2_9_0;
+@@ -1641,6 +1657,7 @@ static const struct qcom_pcie_ops ops_1_27_0 = {
+ 	.post_init = qcom_pcie_post_init_1_27_0,
+ 	.deinit = qcom_pcie_deinit_2_9_0,
+ 	.ltssm_enable = qcom_pcie_2_3_2_ltssm_enable,
++	.reset = qcom_pcie_reset_2_9_0,
+ };
+ 
+ static const struct qcom_pcie_cfg cfg_1_0_0 = {
+@@ -1896,7 +1913,8 @@ static ssize_t slot_remove_store(const struct bus_type *bus, const char *buf,
+ }
+ static BUS_ATTR_WO(slot_remove);
+ 
+-static int __qcom_pcie_probe(struct platform_device *pdev)
++static int __qcom_pcie_probe(struct platform_device *pdev,
++			     bool reset_before_init)
+ {
+ 	const struct qcom_pcie_cfg *pcie_cfg;
+ 	struct qcom_pcie_info *pcie_info;
+@@ -2041,6 +2059,19 @@ static int __qcom_pcie_probe(struct platform_device *pdev)
+ 
+ 	pp->ops = &qcom_pcie_dw_ops;
+ 
++	/* reset_before_init is set if host and phy were initialized by
++	 * the bootloader and requires a reset before initialization here.
++	 * This is to avoid causing the clocks to go a bad state.
++	 */
++	if (reset_before_init && pcie->cfg->ops->reset) {
++		pcie->cfg->ops->reset(pcie);
++		ret = phy_reset(pcie->phy);
++		if (ret) {
++			dev_err(pci->dev, "Failed to reset phy: %d\n", ret);
++			goto err_pm_runtime_put;
++		}
++	}
++
+ 	ret = phy_init(pcie->phy);
+ 	if (ret)
+ 		goto err_pm_runtime_put;
+@@ -2175,7 +2206,7 @@ static int qcom_pcie_deferred_probe(void *data)
+ 		if (cal_reset_wait_ms)
+ 			msleep(cal_reset_wait_ms);
+ 		dev_info(&pdev->dev, "Starting Enumeration\n");
+-		return __qcom_pcie_probe(pdev);
++		return __qcom_pcie_probe(pdev, true);
+ 	}
+ 
+ 	if (paniconcaltimeout) {
+@@ -2240,7 +2271,7 @@ static int qcom_pcie_probe(struct platform_device *pdev)
+ 			    "deferred_probe_%s", pdev->name);
+ 	} else {
+ 		dev_info(dev, "Early Cal not supported\n");
+-		ret =  __qcom_pcie_probe(pdev);
++		ret =  __qcom_pcie_probe(pdev, false);
+ 	}
+ 
+ 	return ret;
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-pcie.c b/drivers/phy/qualcomm/phy-qcom-qmp-pcie.c
+index 765a68287b24..f46c0d705aff 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-pcie.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-pcie.c
+@@ -3683,6 +3683,30 @@ static int qmp_pcie_disable(struct phy *phy)
+ 	return qmp_pcie_exit(phy);
+ }
+ 
++static int qmp_pcie_reset(struct phy *phy)
++{
++	struct qmp_pcie *qmp = phy_get_drvdata(phy);
++	int ret;
++
++	ret = clk_bulk_prepare_enable(qmp->num_pipe_clks, qmp->pipe_clks);
++	if (ret)
++		return ret;
++
++	ret = clk_bulk_prepare_enable(ARRAY_SIZE(qmp_pciephy_clk_l), qmp->clks);
++	if (ret) {
++		clk_bulk_disable_unprepare(qmp->num_pipe_clks, qmp->pipe_clks);
++		return ret;
++	}
++
++	ret = qmp_pcie_disable(phy);
++	if (ret) {
++		clk_bulk_disable_unprepare(ARRAY_SIZE(qmp_pciephy_clk_l), qmp->clks);
++		clk_bulk_disable_unprepare(qmp->num_pipe_clks, qmp->pipe_clks);
++	}
++
++	return ret;
++}
++
+ static int qmp_pcie_set_mode(struct phy *phy, enum phy_mode mode, int submode)
+ {
+ 	struct qmp_pcie *qmp = phy_get_drvdata(phy);
+@@ -3703,6 +3727,7 @@ static int qmp_pcie_set_mode(struct phy *phy, enum phy_mode mode, int submode)
+ static const struct phy_ops qmp_pcie_phy_ops = {
+ 	.power_on	= qmp_pcie_enable,
+ 	.power_off	= qmp_pcie_disable,
++	.reset		= qmp_pcie_reset,
+ 	.set_mode	= qmp_pcie_set_mode,
+ 	.owner		= THIS_MODULE,
+ };
+-- 
+2.34.1
+

@@ -1,0 +1,414 @@
+From 7afd0089e82310b942f374b9cb91ce0cc38c53d5 Mon Sep 17 00:00:00 2001
+From: Vignesh Viswanathan <quic_viswanat@quicinc.com>
+Date: Thu, 12 Oct 2023 15:02:38 +0530
+Subject: [PATCH 205/500] bus: mhi: add support to allocate rddm memory during
+ crash time
+
+Currently, MHI bus pre-allocates the RDDM buffer for crash dump
+collection during MHI power up.
+
+To save the memory allocated for RDDM buffers, add support to
+allocate memory at runtime during the RDDM download after target
+crash.
+
+This feature can be controlled by the driver registering the MHI
+controller by setting the rddm_prealloc flag to false in mhi_cntrl.
+By default rddm_prealloc is true, retaining the existing behaviour.
+
+The driver can also override the mhi_cntrl->rddm_seg_len. By default,
+rddm_seg_len will be same as seg_len.
+
+Signed-off-by: Ram Kumar D <quic_ramd@quicinc.com>
+(cherry picked from commit I07e696956f6f1afde8e2c1173eb5e10e543c3283)
+
+Change-Id: Icdea672704039d0c721d0a48c99e72e8db8d68da
+Signed-off-by: Vignesh Viswanathan <quic_viswanat@quicinc.com>
+---
+ drivers/bus/mhi/host/boot.c     | 151 +++++++++++++++++++++++++++-----
+ drivers/bus/mhi/host/init.c     |  23 +++--
+ drivers/bus/mhi/host/internal.h |  11 ++-
+ drivers/bus/mhi/host/main.c     |   4 +-
+ drivers/bus/mhi/host/pm.c       |   2 +-
+ include/linux/mhi.h             |   4 +
+ 6 files changed, 164 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/bus/mhi/host/boot.c b/drivers/bus/mhi/host/boot.c
+index 26bbdf18eefd..9842911230bc 100644
+--- a/drivers/bus/mhi/host/boot.c
++++ b/drivers/bus/mhi/host/boot.c
+@@ -48,6 +48,17 @@ int mhi_rddm_prepare(struct mhi_controller *mhi_cntrl,
+ 		bhi_vec->size = mhi_buf->len;
+ 	}
+ 
++	if (!mhi_cntrl->rddm_prealloc) {
++		mhi_buf->dma_addr = dma_map_single(mhi_cntrl->cntrl_dev,
++						   mhi_buf->buf, mhi_buf->len,
++						   DMA_TO_DEVICE);
++		if (dma_mapping_error(mhi_cntrl->cntrl_dev, mhi_buf->dma_addr)) {
++			dev_err(dev, "dma mapping failed, Address: %p and len: 0x%zx\n",
++				&mhi_buf->dma_addr, mhi_buf->len);
++			return -ENOMEM;
++		}
++	}
++
+ 	dev_dbg(dev, "BHIe programming for RDDM\n");
+ 
+ 	mhi_write_reg(mhi_cntrl, base, BHIE_RXVECADDR_HIGH_OFFS,
+@@ -171,10 +182,35 @@ int mhi_download_rddm_image(struct mhi_controller *mhi_cntrl, bool in_panic)
+ {
+ 	void __iomem *base = mhi_cntrl->bhie;
+ 	struct device *dev = &mhi_cntrl->mhi_dev->dev;
++	struct mhi_buf *mhi_buf = NULL;
+ 	u32 rx_status;
++	int ret;
++
++	/*
++	 * Allocate RDDM table if specified, this table is for debugging purpose
++	 */
++	if (!mhi_cntrl->rddm_prealloc && mhi_cntrl->rddm_size) {
++		ret = mhi_alloc_bhie_table(mhi_cntrl, &mhi_cntrl->rddm_image,
++					   mhi_cntrl->rddm_size, IMG_TYPE_RDDM);
++		if (ret) {
++			dev_err(dev, "Failed to allocate RDDM table memory\n");
++			return ret;
++		}
++
++		/* setup the RX vector table */
++		ret = mhi_rddm_prepare(mhi_cntrl, mhi_cntrl->rddm_image);
++		if (ret) {
++			dev_err(dev, "Failed to prepare RDDM\n");
++			mhi_free_bhie_table(mhi_cntrl, mhi_cntrl->rddm_image,
++					    IMG_TYPE_RDDM);
++			return ret;
++		}
++	}
+ 
+-	if (in_panic)
+-		return __mhi_download_rddm_in_panic(mhi_cntrl);
++	if (in_panic) {
++		ret = __mhi_download_rddm_in_panic(mhi_cntrl);
++		goto out;
++	}
+ 
+ 	dev_dbg(dev, "Waiting for RDDM image download via BHIe\n");
+ 
+@@ -186,7 +222,16 @@ int mhi_download_rddm_image(struct mhi_controller *mhi_cntrl, bool in_panic)
+ 					      &rx_status) || rx_status,
+ 			   msecs_to_jiffies(mhi_cntrl->timeout_ms));
+ 
+-	return (rx_status == BHIE_RXVECSTATUS_STATUS_XFER_COMPL) ? 0 : -EIO;
++	ret = (rx_status == BHIE_RXVECSTATUS_STATUS_XFER_COMPL) ? 0 : -EIO;
++
++out:
++	mhi_buf = &mhi_cntrl->rddm_image->mhi_buf[mhi_cntrl->rddm_image->entries - 1];
++
++	if (!mhi_cntrl->rddm_prealloc)
++		dma_unmap_single(mhi_cntrl->cntrl_dev, mhi_buf->dma_addr,
++				 mhi_buf->len, DMA_TO_DEVICE);
++
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(mhi_download_rddm_image);
+ 
+@@ -310,14 +355,26 @@ static int mhi_fw_load_bhi(struct mhi_controller *mhi_cntrl,
+ }
+ 
+ void mhi_free_bhie_table(struct mhi_controller *mhi_cntrl,
+-			 struct image_info *image_info)
++			 struct image_info *image_info,
++			 enum image_type img_type)
+ {
+ 	int i;
+ 	struct mhi_buf *mhi_buf = image_info->mhi_buf;
+ 
+-	for (i = 0; i < image_info->entries; i++, mhi_buf++)
+-		mhi_fw_free_coherent(mhi_cntrl, mhi_buf->len,
+-				     mhi_buf->buf, mhi_buf->dma_addr);
++	for (i = 0; i < image_info->entries; i++, mhi_buf++) {
++		if (img_type == IMG_TYPE_RDDM && !mhi_cntrl->rddm_prealloc) {
++			if (i == (image_info->entries - 1))
++				dma_unmap_single(mhi_cntrl->cntrl_dev,
++						 mhi_buf->dma_addr,
++						 mhi_buf->len,
++						 DMA_FROM_DEVICE);
++			kfree(mhi_buf->buf);
++
++		} else {
++			mhi_fw_free_coherent(mhi_cntrl, mhi_buf->len,
++					     mhi_buf->buf, mhi_buf->dma_addr);
++		}
++	}
+ 
+ 	kfree(image_info->mhi_buf);
+ 	kfree(image_info);
+@@ -325,21 +382,31 @@ void mhi_free_bhie_table(struct mhi_controller *mhi_cntrl,
+ 
+ int mhi_alloc_bhie_table(struct mhi_controller *mhi_cntrl,
+ 			 struct image_info **image_info,
+-			 size_t alloc_size)
++			 size_t alloc_size, enum image_type img_type)
+ {
+ 	size_t seg_size = mhi_cntrl->seg_len;
+-	int segments = DIV_ROUND_UP(alloc_size, seg_size) + 1;
++	int segments;
+ 	int i;
+ 	struct image_info *img_info;
+ 	struct mhi_buf *mhi_buf;
++	/* Maksed __GFP_DIRECT_RECLAIM flag for non-interrupt context
++	 * to avoid rcu context sleep issue in kmalloc during panic scenario
++	 */
++	gfp_t gfp = (in_interrupt() ? GFP_ATOMIC :
++		((GFP_KERNEL | __GFP_NORETRY) & ~__GFP_DIRECT_RECLAIM));
+ 
+-	img_info = kzalloc(sizeof(*img_info), GFP_KERNEL);
++	if (img_type == IMG_TYPE_RDDM)
++		seg_size = mhi_cntrl->rddm_seg_len;
++
++	segments = DIV_ROUND_UP(alloc_size, seg_size) + 1;
++
++	img_info = kzalloc(sizeof(*img_info), gfp);
+ 	if (!img_info)
+ 		return -ENOMEM;
+ 
+ 	/* Allocate memory for entries */
+ 	img_info->mhi_buf = kcalloc(segments, sizeof(*img_info->mhi_buf),
+-				    GFP_KERNEL);
++				    gfp);
+ 	if (!img_info->mhi_buf)
+ 		goto error_alloc_mhi_buf;
+ 
+@@ -353,11 +420,42 @@ int mhi_alloc_bhie_table(struct mhi_controller *mhi_cntrl,
+ 			vec_size = sizeof(struct bhi_vec_entry) * i;
+ 
+ 		mhi_buf->len = vec_size;
+-		mhi_buf->buf = mhi_fw_alloc_coherent(mhi_cntrl, vec_size,
+-						     &mhi_buf->dma_addr,
+-						     GFP_KERNEL);
+-		if (!mhi_buf->buf)
+-			goto error_alloc_segment;
++
++		if (img_type == IMG_TYPE_RDDM && !mhi_cntrl->rddm_prealloc) {
++			/* Vector table is the last entry */
++			if (i == segments - 1) {
++				mhi_buf->buf = kzalloc(PAGE_ALIGN(vec_size),
++						       gfp);
++				if (!mhi_buf->buf)
++					goto error_alloc_segment;
++
++				/* Vector table entry will be dma_mapped during
++				 * rddm prepare with DMA_TO_DEVICE and unmapped
++				 * once the target completes the RDDM XFER.
++				 */
++				continue;
++			}
++			mhi_buf->buf = kmalloc(vec_size, gfp);
++			if (!mhi_buf->buf)
++				goto error_alloc_segment;
++
++			mhi_buf->dma_addr = dma_map_single(mhi_cntrl->cntrl_dev,
++							   mhi_buf->buf,
++							   vec_size,
++							   DMA_FROM_DEVICE);
++			if (dma_mapping_error(mhi_cntrl->cntrl_dev,
++					      mhi_buf->dma_addr)) {
++				kfree(mhi_buf->buf);
++				goto error_alloc_segment;
++			}
++		} else {
++			mhi_buf->buf = mhi_fw_alloc_coherent(mhi_cntrl,
++							     vec_size,
++							     &mhi_buf->dma_addr,
++							     GFP_KERNEL);
++			if (!mhi_buf->buf)
++				goto error_alloc_segment;
++		}
+ 	}
+ 
+ 	img_info->bhi_vec = img_info->mhi_buf[segments - 1].buf;
+@@ -367,9 +465,18 @@ int mhi_alloc_bhie_table(struct mhi_controller *mhi_cntrl,
+ 	return 0;
+ 
+ error_alloc_segment:
+-	for (--i, --mhi_buf; i >= 0; i--, mhi_buf--)
+-		mhi_fw_free_coherent(mhi_cntrl, mhi_buf->len,
+-				     mhi_buf->buf, mhi_buf->dma_addr);
++	for (--i, --mhi_buf; i >= 0; i--, mhi_buf--) {
++		if (img_type == IMG_TYPE_RDDM && !mhi_cntrl->rddm_prealloc) {
++			dma_unmap_single(mhi_cntrl->cntrl_dev,
++					 mhi_buf->dma_addr, mhi_buf->len,
++					 DMA_FROM_DEVICE);
++			kfree(mhi_buf->buf);
++
++		} else {
++			mhi_fw_free_coherent(mhi_cntrl, mhi_buf->len,
++					     mhi_buf->buf, mhi_buf->dma_addr);
++		}
++	}
+ 
+ error_alloc_mhi_buf:
+ 	kfree(img_info);
+@@ -638,7 +745,8 @@ void mhi_fw_load_handler(struct mhi_controller *mhi_cntrl)
+ 	 * device transitioning into MHI READY state
+ 	 */
+ 	if (mhi_cntrl->fbc_download) {
+-		ret = mhi_alloc_bhie_table(mhi_cntrl, &mhi_cntrl->fbc_image, fw_sz);
++		ret = mhi_alloc_bhie_table(mhi_cntrl, &mhi_cntrl->fbc_image, fw_sz,
++					   IMG_TYPE_FBC);
+ 		if (ret) {
+ 			release_firmware(firmware);
+ 			goto error_fw_load;
+@@ -663,7 +771,8 @@ void mhi_fw_load_handler(struct mhi_controller *mhi_cntrl)
+ 
+ error_ready_state:
+ 	if (mhi_cntrl->fbc_download) {
+-		mhi_free_bhie_table(mhi_cntrl, mhi_cntrl->fbc_image);
++		mhi_free_bhie_table(mhi_cntrl, mhi_cntrl->fbc_image,
++				    IMG_TYPE_FBC);
+ 		mhi_cntrl->fbc_image = NULL;
+ 	}
+ 
+diff --git a/drivers/bus/mhi/host/init.c b/drivers/bus/mhi/host/init.c
+index eb1f75a6dd88..3c98ec34ed92 100644
+--- a/drivers/bus/mhi/host/init.c
++++ b/drivers/bus/mhi/host/init.c
+@@ -1043,6 +1043,13 @@ int mhi_register_controller(struct mhi_controller *mhi_cntrl,
+ 		mhi_cntrl->unmap_single = mhi_unmap_single_no_bb;
+ 	}
+ 
++	/* By default RDDM buffers are pre-allocated during INIT and
++	 * rddm_seg_len will be same as mhi_cntrl->seg_len. Client drivers
++	 * registering the MHI controller can override these if required
++	 */
++	mhi_cntrl->rddm_prealloc = true;
++	mhi_cntrl->rddm_seg_len = mhi_cntrl->seg_len;
++
+ 	/* Read the MHI device info */
+ 	ret = mhi_read_reg(mhi_cntrl, mhi_cntrl->regs,
+ 			   SOC_HW_VERSION_OFFS, &soc_info);
+@@ -1211,14 +1218,18 @@ int mhi_prepare_for_power_up(struct mhi_controller *mhi_cntrl)
+ 		/*
+ 		 * Allocate RDDM table for debugging purpose if specified
+ 		 */
+-		mhi_alloc_bhie_table(mhi_cntrl, &mhi_cntrl->rddm_image,
+-				     mhi_cntrl->rddm_size);
++		if (mhi_cntrl->rddm_prealloc)
++			mhi_alloc_bhie_table(mhi_cntrl, &mhi_cntrl->rddm_image,
++					     mhi_cntrl->rddm_size,
++					     IMG_TYPE_RDDM);
++
+ 		if (mhi_cntrl->rddm_image) {
+ 			ret = mhi_rddm_prepare(mhi_cntrl,
+ 					       mhi_cntrl->rddm_image);
+ 			if (ret) {
+ 				mhi_free_bhie_table(mhi_cntrl,
+-						    mhi_cntrl->rddm_image);
++						    mhi_cntrl->rddm_image,
++						    IMG_TYPE_RDDM);
+ 				goto error_reg_offset;
+ 			}
+ 		}
+@@ -1241,12 +1252,14 @@ EXPORT_SYMBOL_GPL(mhi_prepare_for_power_up);
+ void mhi_unprepare_after_power_down(struct mhi_controller *mhi_cntrl)
+ {
+ 	if (mhi_cntrl->fbc_image) {
+-		mhi_free_bhie_table(mhi_cntrl, mhi_cntrl->fbc_image);
++		mhi_free_bhie_table(mhi_cntrl, mhi_cntrl->fbc_image,
++				    IMG_TYPE_FBC);
+ 		mhi_cntrl->fbc_image = NULL;
+ 	}
+ 
+ 	if (mhi_cntrl->rddm_image) {
+-		mhi_free_bhie_table(mhi_cntrl, mhi_cntrl->rddm_image);
++		mhi_free_bhie_table(mhi_cntrl, mhi_cntrl->rddm_image,
++				    IMG_TYPE_RDDM);
+ 		mhi_cntrl->rddm_image = NULL;
+ 	}
+ 
+diff --git a/drivers/bus/mhi/host/internal.h b/drivers/bus/mhi/host/internal.h
+index 49a8ed6b759d..675d83b15d29 100644
+--- a/drivers/bus/mhi/host/internal.h
++++ b/drivers/bus/mhi/host/internal.h
+@@ -137,6 +137,11 @@ enum mhi_er_type {
+ 	MHI_ER_TYPE_VALID = 0x1,
+ };
+ 
++enum image_type {
++	IMG_TYPE_FBC,
++	IMG_TYPE_RDDM,
++};
++
+ struct db_cfg {
+ 	bool reset_req;
+ 	bool db_mode;
+@@ -275,9 +280,11 @@ int mhi_destroy_device(struct device *dev, void *data);
+ void mhi_create_devices(struct mhi_controller *mhi_cntrl);
+ 
+ int mhi_alloc_bhie_table(struct mhi_controller *mhi_cntrl,
+-			 struct image_info **image_info, size_t alloc_size);
++			 struct image_info **image_info, size_t alloc_size,
++			 enum image_type img_type);
+ void mhi_free_bhie_table(struct mhi_controller *mhi_cntrl,
+-			 struct image_info *image_info);
++			 struct image_info *image_info,
++			 enum image_type img_type);
+ void mhi_free_nonce_buffer(struct mhi_controller *mhi_cntrl);
+ 
+ /* Power management APIs */
+diff --git a/drivers/bus/mhi/host/main.c b/drivers/bus/mhi/host/main.c
+index dcf627b36e82..1dca6dbb93dd 100644
+--- a/drivers/bus/mhi/host/main.c
++++ b/drivers/bus/mhi/host/main.c
+@@ -503,13 +503,13 @@ irqreturn_t mhi_intvec_threaded_handler(int irq_number, void *priv)
+ 	}
+ 	write_unlock_irq(&mhi_cntrl->pm_lock);
+ 
+-	if (pm_state != MHI_PM_SYS_ERR_DETECT)
++	if (pm_state != MHI_PM_SYS_ERR_DETECT && ee != MHI_EE_RDDM)
+ 		goto exit_intvec;
+ 
+ 	switch (ee) {
+ 	case MHI_EE_RDDM:
+ 		/* proceed if power down is not already in progress */
+-		if (mhi_cntrl->rddm_image && mhi_is_active(mhi_cntrl)) {
++		if (mhi_cntrl->rddm_size && mhi_is_active(mhi_cntrl)) {
+ 			mhi_cntrl->status_cb(mhi_cntrl, MHI_CB_EE_RDDM);
+ 			mhi_cntrl->ee = ee;
+ 			wake_up_all(&mhi_cntrl->state_event);
+diff --git a/drivers/bus/mhi/host/pm.c b/drivers/bus/mhi/host/pm.c
+index 67beccfa09ab..5893bb4d1d49 100644
+--- a/drivers/bus/mhi/host/pm.c
++++ b/drivers/bus/mhi/host/pm.c
+@@ -748,7 +748,7 @@ void mhi_pm_sys_err_handler(struct mhi_controller *mhi_cntrl)
+ 	struct device *dev = &mhi_cntrl->mhi_dev->dev;
+ 
+ 	/* skip if controller supports RDDM */
+-	if (mhi_cntrl->rddm_image) {
++	if (mhi_cntrl->rddm_size) {
+ 		dev_dbg(dev, "Controller supports RDDM, skip SYS_ERROR\n");
+ 		return;
+ 	}
+diff --git a/include/linux/mhi.h b/include/linux/mhi.h
+index 167b9a403dae..f5a466a72043 100644
+--- a/include/linux/mhi.h
++++ b/include/linux/mhi.h
+@@ -362,6 +362,8 @@ struct mhi_controller_config {
+  * @wake_set: Device wakeup set flag
+  * @irq_flags: irq flags passed to request_irq (optional)
+  * @mru: the default MRU for the MHI device
++ * @rddm_prealloc: Enable/Disable preallocation of RDDM buffer during init
++ * @rddm_seg_len: Override rddm segment length if different from seg_len
+  *
+  * Fields marked as (required) need to be populated by the controller driver
+  * before calling mhi_register_controller(). For the fields marked as (optional)
+@@ -463,6 +465,8 @@ struct mhi_controller {
+ 	size_t license_buf_size;
+ 	void *nonce_buf;
+ 	dma_addr_t nonce_dma_addr;
++	bool rddm_prealloc;
++	u32 rddm_seg_len;
+ };
+ 
+ /**
+-- 
+2.34.1
+

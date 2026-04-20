@@ -1,0 +1,221 @@
+From d307242214f950f7e961f540ad21a00ed331c6f4 Mon Sep 17 00:00:00 2001
+From: Tian Yang <tiany@codeaurora.org>
+Date: Mon, 13 Apr 2020 10:14:08 -0700
+Subject: [PATCH 256/500] Generic rx-to-rx skb recycler
+
+Porting from 3.4 kernel (banana branch).
+
+Removing kmemcheck header and the no longer valid cpuhotplug notifier function.
+
+Change-Id: Ie81a7d812ec14a40da8f22cf4e0f7ddaaf166cff
+Signed-off-by: Varadarajan Narayanan <varada@codeaurora.org>
+Signed-off-by: Pamidipati, Vijay <vpamidip@codeaurora.org>
+Signed-off-by: Casey Chen <kexinc@codeaurora.org>
+Signed-off-by: Tian Yang <tiany@codeaurora.org>
+---
+ MAINTAINERS            |  5 ++++
+ include/linux/skbuff.h |  3 ++
+ net/Kconfig            | 15 ++++++++++
+ net/core/Makefile      |  1 +
+ net/core/skbuff.c      | 68 +++++++++++++++++++++++++++++++++++++-----
+ 5 files changed, 85 insertions(+), 7 deletions(-)
+
+diff --git a/MAINTAINERS b/MAINTAINERS
+index dd5de540ec0b..0abcf0a9a1dc 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -67,6 +67,11 @@ Maintainers List
+           first. When adding to this list, please keep the entries in
+           alphabetical order.
+ 
++SKB RECYCLER SUPPORT
++M:	Casey Chen <kexinc@codeaurora.org>
++S:	Maintained
++F:	net/core/skbuff_recycle.*
++
+ 3C59X NETWORK DRIVER
+ M:	Steffen Klassert <klassert@kernel.org>
+ L:	netdev@vger.kernel.org
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index fce97f3d3045..67b9ef5af8f7 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -1269,6 +1269,9 @@ void check_skb_fast_recyclable(struct sk_buff *skb);
+ void __consume_stateless_skb(struct sk_buff *skb);
+ void  __kfree_skb(struct sk_buff *skb);
+ extern struct kmem_cache *skbuff_cache;
++extern void kfree_skbmem(struct sk_buff *skb);
++extern void skb_release_data(struct sk_buff *skb, enum skb_drop_reason reason,
++			     bool napi_safe);
+ 
+ void kfree_skb_partial(struct sk_buff *skb, bool head_stolen);
+ bool skb_try_coalesce(struct sk_buff *to, struct sk_buff *from,
+diff --git a/net/Kconfig b/net/Kconfig
+index d532ec33f1fe..ce41802c488c 100644
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -360,6 +360,21 @@ config NET_FLOW_LIMIT
+ 	  with many clients some protection against DoS by a single (spoofed)
+ 	  flow that greatly exceeds average workload.
+ 
++config SKB_RECYCLER
++	bool "Generic skb recycling"
++	default y
++	help
++	  SKB_RECYCLER is used to implement RX-to-RX skb recycling.
++	  This config enables the recycling scheme for bridging and
++	  routing workloads. It can reduce skbuff freeing or
++	  reallocation overhead.
++
++
++config SKB_RECYCLER_MULTI_CPU
++	bool "Cross-CPU recycling for CPU-locked workloads"
++	depends on SMP && SKB_RECYCLER
++	default n
++
+ menu "Network testing"
+ 
+ config NET_PKTGEN
+diff --git a/net/core/Makefile b/net/core/Makefile
+index 731db2eaa610..3d1091bc25aa 100644
+--- a/net/core/Makefile
++++ b/net/core/Makefile
+@@ -40,3 +40,4 @@ obj-$(CONFIG_NET_SOCK_MSG) += skmsg.o
+ obj-$(CONFIG_BPF_SYSCALL) += sock_map.o
+ obj-$(CONFIG_BPF_SYSCALL) += bpf_sk_storage.o
+ obj-$(CONFIG_OF)	+= of_net.o
++obj-$(CONFIG_SKB_RECYCLER) += skbuff_recycle.o
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index c7fd3369210f..44dbc4a52e1b 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -115,6 +115,8 @@ struct kmem_cache *skb_data_cache;
+ #endif
+ #endif
+ 
++#include "skbuff_recycle.h"
++
+ static struct kmem_cache *skbuff_fclone_cache __ro_after_init;
+ #ifdef CONFIG_SKB_EXTENSIONS
+ static struct kmem_cache *skbuff_ext_cache __ro_after_init;
+@@ -720,7 +722,7 @@ EXPORT_SYMBOL(__alloc_skb);
+ /**
+  *	__netdev_alloc_skb - allocate an skbuff for rx on a specific device
+  *	@dev: network device to receive on
+- *	@len: length to allocate
++ *	@length: length to allocate
+  *	@gfp_mask: get_free_pages mask, passed to alloc_skb
+  *
+  *	Allocate a new &sk_buff and assign it a usage count of one. The
+@@ -730,11 +732,28 @@ EXPORT_SYMBOL(__alloc_skb);
+  *
+  *	%NULL is returned if there is no free memory.
+  */
+-struct sk_buff *__netdev_alloc_skb(struct net_device *dev, unsigned int len,
+-				   gfp_t gfp_mask)
++struct sk_buff *__netdev_alloc_skb(struct net_device *dev,
++				   unsigned int length, gfp_t gfp_mask)
+ {
+-	struct page_frag_cache *nc;
+ 	struct sk_buff *skb;
++	unsigned int len = length;
++
++#ifdef CONFIG_SKB_RECYCLER
++	skb = skb_recycler_alloc(dev, length);
++	if (likely(skb))
++		return skb;
++
++	len = SKB_RECYCLE_SIZE;
++	if (unlikely(length > SKB_RECYCLE_SIZE))
++		len = length;
++
++	skb = __alloc_skb(len + NET_SKB_PAD, gfp_mask,
++			  SKB_ALLOC_RX, NUMA_NO_NODE);
++	if (!skb)
++		goto skb_fail;
++	goto skb_success;
++#else
++	struct page_frag_cache *nc;
+ 	bool pfmemalloc;
+ 	void *data;
+ 
+@@ -781,6 +800,7 @@ struct sk_buff *__netdev_alloc_skb(struct net_device *dev, unsigned int len,
+ 	if (pfmemalloc)
+ 		skb->pfmemalloc = 1;
+ 	skb->head_frag = 1;
++#endif
+ 
+ skb_success:
+ 	skb_reserve(skb, NET_SKB_PAD);
+@@ -993,7 +1013,7 @@ static void skb_free_head(struct sk_buff *skb, bool napi_safe)
+ 	}
+ }
+ 
+-static void skb_release_data(struct sk_buff *skb, enum skb_drop_reason reason,
++void skb_release_data(struct sk_buff *skb, enum skb_drop_reason reason,
+ 			     bool napi_safe)
+ {
+ 	struct skb_shared_info *shinfo = skb_shinfo(skb);
+@@ -1036,7 +1056,7 @@ static void skb_release_data(struct sk_buff *skb, enum skb_drop_reason reason,
+ /*
+  *	Free an skbuff by memory without cleaning the state.
+  */
+-static void kfree_skbmem(struct sk_buff *skb)
++void kfree_skbmem(struct sk_buff *skb)
+ {
+ 	struct sk_buff_fclones *fclones;
+ 
+@@ -1314,8 +1334,41 @@ void consume_skb(struct sk_buff *skb)
+ 	if (!skb_unref(skb))
+ 		return;
+ 
++	prefetch(&skb->destructor);
++
++	/*Tian: Not sure if we need to continue using this since
++	 * since unref does the work in 5.4
++	 */
++
++	/*
++	if (likely(atomic_read(&skb->users) == 1))
++		smp_rmb();
++	else if (likely(!atomic_dec_and_test(&skb->users)))
++		return;
++	*/
++
++	/* If possible we'd like to recycle any skb rather than just free it,
++	 * but in order to do that we need to release any head state too.
++	 * We don't want to do this later because we'll be in a pre-emption
++	 * disabled state.
++	 */
++	skb_release_head_state(skb);
++
++	/* Can we recycle this skb?  If we can then it will be much faster
++	 * for us to recycle this one later than to allocate a new one
++	 * from scratch.
++	 */
++	if (likely(skb_recycler_consume(skb)))
++		return;
++
+ 	trace_consume_skb(skb, __builtin_return_address(0));
+-	__kfree_skb(skb);
++
++	/* We're not recycling so now we need to do the rest of what we would
++	 * have done in __kfree_skb (above and beyond the skb_release_head_state
++	 * that we already did).
++	 */
++	skb_release_data(skb, SKB_CONSUMED, false);
++	kfree_skbmem(skb);
+ }
+ EXPORT_SYMBOL(consume_skb);
+ #endif
+@@ -4938,6 +4991,7 @@ void __init skb_init(void)
+ 						SKB_SMALL_HEAD_HEADROOM,
+ 						NULL);
+ 	skb_extensions_init();
++	skb_recycler_init();
+ }
+ 
+ static int
+-- 
+2.34.1
+
