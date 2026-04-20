@@ -1,0 +1,153 @@
+From 10660848a414e7d0a6926cf45815b770f7e753cc Mon Sep 17 00:00:00 2001
+From: Md Sadre Alam <mdalam@qti.qualcomm.com>
+Date: Wed, 8 Oct 2025 14:07:36 +0530
+Subject: [PATCH] drivers: sdhci-msm: Enable ICE support for non-cmdq eMMC
+ devices
+
+Enable Inline Crypto Engine (ICE) support for eMMC devices that operate
+without Command Queue Engine (CQE).This allows hardware-accelerated
+encryption and decryption for standard (non-CMDQ) requests.
+
+This patch:
+- Adds ICE register definitions for non-CMDQ crypto configuration
+- Implements a per-request crypto setup via sdhci_msm_ice_cfg()
+- Hooks into the request path via mmc_host_ops.request
+- Initializes ICE hardware during CQE setup for compatible platforms
+
+With this, non-CMDQ eMMC devices can benefit from inline encryption,
+improving performance for encrypted I/O while maintaining compatibility
+with existing CQE crypto support.
+
+Change-Id: Ia96faa4057171742288c8e6b0788ae4a5872b0ae
+Signed-off-by: Md Sadre Alam <mdalam@qti.qualcomm.com>
+(cherry picked from commit 760d1e7796a6f575b9d5b504e72082ffad683831)
+---
+ drivers/mmc/host/sdhci-msm.c | 77 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 77 insertions(+)
+
+diff --git a/drivers/mmc/host/sdhci-msm.c b/drivers/mmc/host/sdhci-msm.c
+index ddbb826438b1..74ec1e36b2ec 100644
+--- a/drivers/mmc/host/sdhci-msm.c
++++ b/drivers/mmc/host/sdhci-msm.c
+@@ -19,6 +19,7 @@
+ #include <linux/reset.h>
+ 
+ #include <soc/qcom/ice.h>
++#include <linux/blk-mq.h>
+ 
+ #include "sdhci-cqhci.h"
+ #include "sdhci-pltfm.h"
+@@ -156,6 +157,18 @@
+ #define CQHCI_VENDOR_CFG1	0xA00
+ #define CQHCI_VENDOR_DIS_RST_ON_CQ_EN	(0x3 << 13)
+ 
++#define DISABLE_CRYPTO			BIT(15)
++#define CRYPTO_GENERAL_ENABLE		BIT(1)
++#define HC_VENDOR_SPECIFIC_FUNC4	0x260
++#define ICE_HCI_SUPPORT			BIT(28)
++
++/* non command queue crypto enable register*/
++#define NONCQ_CRYPTO_PARM		0x70
++#define NONCQ_CRYPTO_DUN		0x74
++
++#define ICE_HCI_PARAM_CCI GENMASK(7, 0)
++#define ICE_HCI_PARAM_CE  GENMASK(8, 8)
++
+ struct sdhci_msm_offset {
+ 	u32 core_hc_mode;
+ 	u32 core_mci_data_cnt;
+@@ -1864,6 +1877,52 @@ static void sdhci_msm_set_clock(struct sdhci_host *host, unsigned int clock)
+ 
+ #ifdef CONFIG_MMC_CRYPTO
+ 
++static int sdhci_msm_ice_cfg(struct sdhci_host *host, struct mmc_request *mrq,
++			     u32 slot)
++{
++	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
++	struct sdhci_msm_host *msm_host = sdhci_pltfm_priv(pltfm_host);
++	struct mmc_host *mmc = msm_host->mmc;
++	struct cqhci_host *cq_host = mmc->cqe_private;
++	unsigned int crypto_params = 0;
++	int key_index = 0;
++	bool bypass = true;
++	u64 dun = 0;
++
++	if (mrq->crypto_ctx) {
++		dun = mrq->crypto_ctx->bc_dun[0];
++		bypass = false;
++		key_index = mrq->crypto_key_slot;
++		if (cq_host->use_hwkey)
++			key_index = 0;
++	}
++
++	crypto_params = FIELD_PREP(ICE_HCI_PARAM_CE, !bypass) |
++			FIELD_PREP(ICE_HCI_PARAM_CCI, key_index);
++
++	cqhci_writel(cq_host, crypto_params, NONCQ_CRYPTO_PARM);
++
++	if (mrq->crypto_ctx)
++		cqhci_writel(cq_host, lower_32_bits(dun), NONCQ_CRYPTO_DUN);
++
++	/* Ensure crypto configuration is written before proceeding */
++	wmb();
++
++	return 0;
++}
++
++static void sdhci_msm_request(struct mmc_host *mmc, struct mmc_request *mrq)
++{
++	struct sdhci_host *host = mmc_priv(mmc);
++
++	if (mmc->caps2 & MMC_CAP2_CRYPTO) {
++
++		sdhci_msm_ice_cfg(host, mrq, 0);
++	}
++
++	sdhci_request(mmc, mrq);
++}
++
+ static int sdhci_msm_ice_init(struct sdhci_msm_host *msm_host,
+ 			      struct cqhci_host *cq_host)
+ {
+@@ -2056,6 +2115,8 @@ static int sdhci_msm_cqe_add_host(struct sdhci_host *host,
+ 	struct cqhci_host *cq_host;
+ 	bool dma64;
+ 	u32 cqcfg;
++	u32 config = 0x0;
++	u32 ice_cap = 0x0;
+ 	int ret;
+ 
+ 	/*
+@@ -2110,6 +2171,19 @@ static int sdhci_msm_cqe_add_host(struct sdhci_host *host,
+ 	if (ret)
+ 		goto cleanup;
+ 
++	/* Initalize the ICE for NON-CMDQ eMMC devices */
++	config = sdhci_readl(host, HC_VENDOR_SPECIFIC_FUNC4);
++	config &= ~DISABLE_CRYPTO;
++	sdhci_writel(host, config, HC_VENDOR_SPECIFIC_FUNC4);
++	mb();
++	ice_cap = cqhci_readl(cq_host, CQHCI_CAP);
++	if (ice_cap & ICE_HCI_SUPPORT) {
++		config = cqhci_readl(cq_host, CQHCI_CFG);
++		config |= CRYPTO_GENERAL_ENABLE;
++		cqhci_writel(cq_host, config, CQHCI_CFG);
++	}
++	sdhci_msm_ice_enable(msm_host);
++
+ 	dev_info(&pdev->dev, "%s: CQE init: success\n",
+ 			mmc_hostname(host->mmc));
+ 	return ret;
+@@ -2684,6 +2758,9 @@ static int sdhci_msm_probe(struct platform_device *pdev)
+ 
+ 	msm_host->mmc->caps |= MMC_CAP_WAIT_WHILE_BUSY | MMC_CAP_NEED_RSP_BUSY;
+ 
++#ifdef CONFIG_MMC_CRYPTO
++	host->mmc_host_ops.request = sdhci_msm_request;
++#endif
+ 	/* Set the timeout value to max possible */
+ 	host->max_timeout_count = 0xF;
+ 
+-- 
+2.34.1
+

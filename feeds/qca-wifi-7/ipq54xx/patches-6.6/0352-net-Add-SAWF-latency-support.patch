@@ -1,0 +1,509 @@
+From 3ae1dda313625304a60db3dddf879ad4bbbf0cc6 Mon Sep 17 00:00:00 2001
+From: Jackson Bockus <quic_jbockus@quicinc.com>
+Date: Mon, 23 May 2022 09:21:26 -0700
+Subject: [PATCH 309/500] net: Add SAWF latency support.
+
+Change-Id: I72f0750a8444f11198a6f9d494e42bf7eba1507d
+Signed-off-by: Jackson Bockus <quic_jbockus@quicinc.com>
+---
+ include/linux/netdevice.h | 111 ++++++++++++++-
+ include/linux/skbuff.h    |   8 ++
+ net/core/dev.c            | 283 +++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 398 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 9ae1466ccaa5..76d25dfbf785 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2002,6 +2002,9 @@ enum netdev_ml_priv_type {
+  * 	@dstats:	Dummy statistics
+  * 	@vstats:	Virtual ethernet statistics
+  *
++ *	@sawf_flags:	Service-aware Wi-Fi flags
++ *	@sawf_stats:	Service-aware Wi-Fi latency statistics.
++ *
+  *	@garp_port:	GARP
+  *	@mrp_port:	MRP
+  *
+@@ -2375,6 +2378,9 @@ struct net_device {
+ 		struct pcpu_dstats __percpu		*dstats;
+ 	};
+ 
++	uint16_t				sawf_flags;
++	struct pcpu_sawf_stats __percpu		*sawf_stats;
++
+ #if IS_ENABLED(CONFIG_GARP)
+ 	struct garp_port __rcu	*garp_port;
+ #endif
+@@ -2772,6 +2778,28 @@ struct pcpu_lstats {
+ 	struct u64_stats_sync syncp;
+ } __aligned(2 * sizeof(u64));
+ 
++#define NETDEV_SAWF_HIST_BASE_US	1	/* Number of microseconds represented by bucket 0. */
++#define NETDEV_SAWF_DELAY_BUCKETS	8	/* Number of buckets in latency histogram. */
++#define NETDEV_SAWF_FLAG_ENABLED	0x1	/* Flag to enable SAWF features for netdevice. */
++#define NETDEV_SAWF_FLAG_RX_LAT		0x2	/* Flag to enable Rx hardware latency. */
++#define NETDEV_SAWF_FLAG_TX_LAT		0X4	/* Flag to enable Tx hardware latency. */
++#define NETDEV_SAWF_FLAG_DEBUG		0X8	/* Flag to enable debug service class latency. */
++#define NETDEV_SAWF_FLAG_DEBUG_SHIFT	8	/* Offset of debug service class ID. */
++#define NETDEV_SAWF_FLAG_DEBUG_MASK	0XFF00	/* Mask of debug service class ID. */
++#define NETDEV_SAWF_SID_MAX		256	/* Number of valid service class IDs. */
++
++struct pcpu_sawf_stats {
++	u64	total_delay[NETDEV_SAWF_SID_MAX];	/* Total delay in milliseconds */
++	u64	delay[NETDEV_SAWF_SID_MAX][NETDEV_SAWF_DELAY_BUCKETS];		/* Delay histogram; 8 bins over 256 potential service classes. */
++	u64	tx_packets[NETDEV_SAWF_SID_MAX];	/* Packets sent per service class. */
++	u64	tx_bytes[NETDEV_SAWF_SID_MAX];		/* Bytes sent per service class. */
++	u32	debug_lat_max;		/* Maximum latency for specified debug service class. */
++	u32	debug_lat_min;		/* Minimum measured latency for specified debug service class. */
++	u32	debug_lat_ewma;		/* Exponential weighted moving average latency for specified debug service class. */
++	u32	debug_lat_last;		/* Most recent latency for specified debug service class. */
++	struct u64_stats_sync	syncp;
++};
++
+ void dev_lstats_read(struct net_device *dev, u64 *packets, u64 *bytes);
+ 
+ static inline void dev_sw_netstats_rx_add(struct net_device *dev, unsigned int len)
+@@ -3169,6 +3197,17 @@ struct net_device *netdev_get_by_name(struct net *net, const char *name,
+ 				      netdevice_tracker *tracker, gfp_t gfp);
+ struct net_device *dev_get_by_index_rcu(struct net *net, int ifindex);
+ struct net_device *dev_get_by_napi_id(unsigned int napi_id);
++int dev_restart(struct net_device *dev);
++
++bool netdev_sawf_deinit(struct net_device *dev);
++bool netdev_sawf_init(struct net_device *dev, uint16_t mode);
++bool netdev_sawf_flags_update(struct net_device *dev, uint16_t mode);
++bool netdev_sawf_enable(struct net_device *dev);
++bool netdev_sawf_disable(struct net_device *dev);
++bool netdev_sawf_debug_set(struct net_device *dev, uint8_t sid);
++bool netdev_sawf_debug_unset(struct net_device *dev);
++bool netdev_sawf_debug_get(struct net_device *dev, uint8_t *sid, uint32_t *max, uint32_t *min, uint32_t *avg, uint32_t *last);
++bool netdev_sawf_lat_get(struct net_device *dev, uint8_t sid, uint64_t *hist, uint64_t *avg);
+ 
+ static inline int dev_hard_header(struct sk_buff *skb, struct net_device *dev,
+ 				  unsigned short type,
+@@ -4938,12 +4977,82 @@ static inline bool netdev_xmit_more(void)
+ 	return __this_cpu_read(softnet_data.xmit.more);
+ }
+ 
++static inline bool netdev_check_sawf_debug_match(struct net_device *dev, uint8_t sid)
++{
++	return (dev->sawf_flags & NETDEV_SAWF_FLAG_DEBUG) && ((dev->sawf_flags >> NETDEV_SAWF_FLAG_DEBUG_SHIFT) == sid);
++}
++
++static inline void netdev_sawf_latency_record(struct sk_buff *skb, struct net_device *dev)
++{
++	struct pcpu_sawf_stats *sawf_stats;
++	int64_t lat;
++	uint8_t sid;
++	int bucket;
++
++	/*
++	 * Return if latency does not need to be recorded.
++	 */
++	if ((dev->sawf_flags & (NETDEV_SAWF_FLAG_ENABLED | NETDEV_SAWF_FLAG_TX_LAT)) != NETDEV_SAWF_FLAG_ENABLED) {
++		return;
++	}
++
++	sawf_stats = this_cpu_ptr(dev->sawf_stats);
++	if (!sawf_stats) {
++		return;
++	}
++
++
++	if (SKB_GET_SAWF_TAG(skb->mark) != SKB_SAWF_VALID_TAG) {
++		return;
++	}
++
++	if (!skb->tstamp) {
++		return;
++	}
++
++	lat = ktime_to_ns(net_timedelta(skb->tstamp));
++
++	sid = SKB_GET_SAWF_SERVICE_CLASS(skb->mark);
++
++	/*
++	 * Latency is divided by 1000 to convert from nanoseconds to microseconds.
++	 */
++	bucket = fls(div64_s64(lat, (1000 * NETDEV_SAWF_HIST_BASE_US))) - 1;
++	if (bucket < 0) {
++		bucket = 0;
++	} else if (bucket >= NETDEV_SAWF_DELAY_BUCKETS) {
++		bucket = NETDEV_SAWF_DELAY_BUCKETS - 1;
++	}
++
++	u64_stats_update_begin(&sawf_stats->syncp);
++	sawf_stats->delay[sid][bucket]++;
++	sawf_stats->total_delay[sid] += lat;
++	sawf_stats->tx_packets[sid]++;
++	sawf_stats->tx_bytes[sid] += skb->len;
++	u64_stats_update_end(&sawf_stats->syncp);
++
++	if (!netdev_check_sawf_debug_match(dev, sid)) {
++		return;
++	}
++
++	sawf_stats->debug_lat_last = lat;
++	sawf_stats->debug_lat_ewma = sawf_stats->debug_lat_ewma - (sawf_stats->debug_lat_ewma >> 8) + (lat >> 8);
++
++	if (lat > sawf_stats->debug_lat_max) {
++		sawf_stats->debug_lat_max = lat;
++	}
++
++	if (lat < sawf_stats->debug_lat_min || sawf_stats->debug_lat_min == 0) {
++		sawf_stats->debug_lat_min = lat;
++	}
++}
++
+ static inline netdev_tx_t netdev_start_xmit(struct sk_buff *skb, struct net_device *dev,
+ 					    struct netdev_queue *txq, bool more)
+ {
+ 	const struct net_device_ops *ops = dev->netdev_ops;
+ 	netdev_tx_t rc;
+-
++	netdev_sawf_latency_record(skb, dev);
+ 	rc = __netdev_start_xmit(ops, skb, dev, more);
+ 	if (rc == NETDEV_TX_OK)
+ 		txq_trans_update(txq);
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index 0671cb7f0b13..46daf67f17c5 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -272,6 +272,14 @@
+ 			 SKB_DATA_ALIGN(sizeof(struct sk_buff)) +	\
+ 			 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
+ 
++#define SKB_SAWF_VALID_TAG		0xAA
++#define SKB_SAWF_TAG_SHIFT		24
++#define SKB_SAWF_SERVICE_CLASS_SHIFT	16
++#define SKB_SAWF_SERVICE_CLASS_MASK	0xff
++
++#define SKB_GET_SAWF_TAG(x) ((x) >> SKB_SAWF_TAG_SHIFT)
++#define SKB_GET_SAWF_SERVICE_CLASS(x) (((x) >> SKB_SAWF_SERVICE_CLASS_SHIFT) & SKB_SAWF_SERVICE_CLASS_MASK)
++
+ struct ahash_request;
+ struct net_device;
+ struct scatterlist;
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 8dfe97c9fc3a..00503b0d980f 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3559,6 +3559,260 @@ netdev_features_t netif_skb_features(struct sk_buff *skb)
+ }
+ EXPORT_SYMBOL(netif_skb_features);
+ 
++/**
++ *	netdev_sawf_deinit - free sawf statistics.
++ *	@dev: Device to free sawf statistics.
++ *
++ *	Returns true on success, false on failure.
++ */
++bool netdev_sawf_deinit(struct net_device *dev)
++{
++	struct pcpu_sawf_stats __percpu *stats_to_delete;
++
++	if ((!dev->sawf_stats)) {
++		return false;
++	}
++
++	stats_to_delete = dev->sawf_stats;
++	dev->sawf_stats = NULL;
++
++	free_percpu(stats_to_delete);
++
++	return true;
++}
++EXPORT_SYMBOL(netdev_sawf_deinit);
++
++/**
++ *	netdev_sawf_init - Allocate netdev SAWF statistics.
++ *	@dev:  Device to allocate statistics on.
++ *	@mode: Initial flags to be set.
++ */
++bool netdev_sawf_init(struct net_device *dev, uint16_t mode)
++{
++	int cpu;
++
++	if (dev->sawf_stats) {
++		return false;
++	}
++
++	dev->sawf_stats = netdev_alloc_pcpu_stats(struct pcpu_sawf_stats);
++	if (!dev->sawf_stats) {
++		return false;
++	}
++
++	for_each_possible_cpu(cpu) {
++		struct pcpu_sawf_stats *stats = per_cpu_ptr(dev->sawf_stats, cpu);
++		memset(stats, 0, sizeof(*stats));
++	}
++
++	dev->sawf_flags = mode;
++
++	return true;
++}
++EXPORT_SYMBOL(netdev_sawf_init);
++
++/**
++ *	netdev_sawf_flags_update - Set SAWF flags.
++ *	@dev: Device to update
++ *	@flags: New value of flags
++ */
++bool netdev_sawf_flags_update(struct net_device *dev, uint16_t flags)
++{
++	if (!dev->sawf_stats) {
++		return false;
++	}
++
++	dev->sawf_flags = flags;
++
++	return true;
++}
++EXPORT_SYMBOL(netdev_sawf_flags_update);
++
++/**
++ *	netdev_sawf_enable - Re-enable SAWF statistics.
++ *	@dev: Device to enable.
++ */
++bool netdev_sawf_enable(struct net_device *dev)
++{
++	int cpu;
++	if (!dev->sawf_stats) {
++		return false;
++	}
++
++	for_each_possible_cpu(cpu) {
++		struct pcpu_sawf_stats *stats = per_cpu_ptr(dev->sawf_stats, cpu);
++		memset(stats, 0, sizeof(*stats));
++	}
++
++	dev->sawf_flags |= NETDEV_SAWF_FLAG_ENABLED;
++
++	return true;
++}
++EXPORT_SYMBOL(netdev_sawf_enable);
++
++/**
++ *	netdev_sawf_disable - Disable SAWF statistics collection.
++ *	@dev: device to disable statistics.
++ */
++bool netdev_sawf_disable(struct net_device *dev)
++{
++	if (!dev->sawf_stats) {
++		return false;
++	}
++
++	dev->sawf_flags &= ~NETDEV_SAWF_FLAG_ENABLED;
++
++	return true;
++}
++EXPORT_SYMBOL(netdev_sawf_disable);
++
++/**
++ *	netdev_sawf_debug_set - Sets the debug service class.
++ *	@dev: Device to configure
++ *	@sid: Service class ID to keep debug information.
++ */
++bool netdev_sawf_debug_set(struct net_device *dev, uint8_t sid)
++{
++	int cpu;
++
++	if (!dev->sawf_stats) {
++		return false;
++	}
++
++	for_each_possible_cpu(cpu) {
++		struct pcpu_sawf_stats *stats = per_cpu_ptr(dev->sawf_stats, cpu);
++		stats->debug_lat_max = 0;
++		stats->debug_lat_min = 0;
++		stats->debug_lat_ewma = 0;
++		stats->debug_lat_last = 0;
++	}
++
++	dev->sawf_flags = (dev->sawf_flags & ~(NETDEV_SAWF_FLAG_DEBUG_MASK)) | (sid << NETDEV_SAWF_FLAG_DEBUG_SHIFT) | (NETDEV_SAWF_FLAG_DEBUG);
++
++	return true;
++}
++EXPORT_SYMBOL(netdev_sawf_debug_set);
++
++/**
++ *	netdev_sawf_debug_set - Clears the debug service class.
++ *	@dev: Device to configure
++ */
++bool netdev_sawf_debug_unset(struct net_device *dev)
++{
++	if (!dev->sawf_stats) {
++		return false;
++	}
++
++	dev->sawf_flags &= ~NETDEV_SAWF_FLAG_DEBUG;
++
++	return true;
++}
++EXPORT_SYMBOL(netdev_sawf_debug_unset);
++
++/**
++ *	netdev_sawf_debug_get - Gets the debug SAWF information.
++ *	@dev:  Device to read debug information
++ *	@sid:  Pointer where service class id is written
++ *	@max:  Pointer where max latency is written
++ *	@min:  Pointer where min latency is written
++ *	@avg:  Pointer where average (exponential moving average) is written
++ *	@last: Pointer where last latency value is written.
++ */
++bool netdev_sawf_debug_get(struct net_device *dev, uint8_t *sid, uint32_t *max, uint32_t *min, uint32_t *avg, uint32_t *last)
++{
++	uint32_t cpu, avg_sum = 0, avg_count = 0;
++
++	if (!dev->sawf_stats || !(dev->sawf_flags & NETDEV_SAWF_FLAG_DEBUG)) {
++		return false;
++	}
++
++	/*
++	 * Initialize minimum to max value of uint32 so any valid value is less than it.
++	 * Initialize maximum to 0 so any valid value is greater than it.
++	 */
++	*min = 0xFFFFFFFF;
++	*max = 0;
++
++	*sid = dev->sawf_flags >> NETDEV_SAWF_FLAG_DEBUG_SHIFT;
++	for_each_possible_cpu(cpu) {
++		struct pcpu_sawf_stats *sawf_stats = per_cpu_ptr(dev->sawf_stats, cpu);
++
++		if (*min > sawf_stats->debug_lat_min && sawf_stats->debug_lat_min != 0) {
++			*min = sawf_stats->debug_lat_min;
++		}
++
++		if (*max < sawf_stats->debug_lat_max) {
++			*max = sawf_stats->debug_lat_max;
++		}
++
++		if (sawf_stats->debug_lat_last) {
++			*last = sawf_stats->debug_lat_last;
++		}
++
++		if (sawf_stats->debug_lat_ewma) {
++			avg_sum += sawf_stats->debug_lat_ewma;
++			avg_count++;
++		}
++	}
++
++	if (avg_count) {
++		*avg = avg_sum / avg_count;
++	}
++
++	/*
++	 * If minimum hasn't been updated, set it to 0.
++	 */
++	if (*min == 0xFFFFFFFF) {
++		*min = 0;
++	}
++
++	return true;
++}
++EXPORT_SYMBOL(netdev_sawf_debug_get);
++
++/**
++ *	netdev_sawf_debug_get - Gets latency statistics for a service class.
++ *	@dev:  Device to read latency statistics
++ *	@sid:  Service class ID to get
++ *	@hist: Pointer to array where histogram data is written.
++ *	@avg:  Pointer where mean latency is written.
++ */
++bool netdev_sawf_lat_get(struct net_device *dev, uint8_t sid, uint64_t *hist, uint64_t *avg)
++{
++	uint32_t bucket = 0, cpu = 0;
++	uint64_t total_lat = 0, total_packets = 0;
++
++	if (!dev->sawf_stats) {
++		return false;
++	}
++
++	if (!(dev->sawf_flags & NETDEV_SAWF_FLAG_ENABLED)) {
++		return false;
++	}
++
++	for (bucket = 0; bucket < NETDEV_SAWF_DELAY_BUCKETS; bucket++) {
++		hist[bucket] = 0;
++	}
++
++	for_each_possible_cpu(cpu) {
++		unsigned int start;
++		struct pcpu_sawf_stats *sawf_stats = per_cpu_ptr(dev->sawf_stats, cpu);
++		do {
++			start = u64_stats_fetch_begin(&sawf_stats->syncp);
++			for (bucket = 0; bucket < NETDEV_SAWF_DELAY_BUCKETS; bucket++) {
++				hist[bucket] += sawf_stats->delay[sid][bucket];
++			}
++
++			total_packets += sawf_stats->tx_packets[sid];
++			total_lat += sawf_stats->total_delay[sid];
++		} while (u64_stats_fetch_retry(&sawf_stats->syncp, start));
++	}
++
++	*avg = div64_u64(total_lat, total_packets);
++	return true;
++}
++EXPORT_SYMBOL(netdev_sawf_lat_get);
++
+ static int xmit_one(struct sk_buff *skb, struct net_device *dev,
+ 		    struct netdev_queue *txq, bool more)
+ {
+@@ -5135,11 +5389,23 @@ int do_xdp_generic(struct bpf_prog *xdp_prog, struct sk_buff *skb)
+ }
+ EXPORT_SYMBOL_GPL(do_xdp_generic);
+ 
++static inline void netif_sawf_timestamp(struct sk_buff *skb, struct net_device *dev)
++{
++	if (!(dev->sawf_flags & NETDEV_SAWF_FLAG_RX_LAT)) {
++		__net_timestamp(skb);
++	}
++}
++
+ static int netif_rx_internal(struct sk_buff *skb)
+ {
+ 	int ret;
++	struct net_device *dev = skb->dev;
+ 
+-	net_timestamp_check(READ_ONCE(netdev_tstamp_prequeue), skb);
++	if (dev->sawf_flags & NETDEV_SAWF_FLAG_ENABLED) {
++		netif_sawf_timestamp(skb, dev);
++	} else {
++		net_timestamp_check(READ_ONCE(netdev_tstamp_prequeue), skb);
++	}
+ 
+ 	trace_netif_rx(skb);
+ 
+@@ -5814,7 +6080,12 @@ static int netif_receive_skb_internal(struct sk_buff *skb)
+ {
+ 	int ret;
+ 
+-	net_timestamp_check(READ_ONCE(netdev_tstamp_prequeue), skb);
++	struct net_device *dev = skb->dev;
++	if (dev->sawf_flags & NETDEV_SAWF_FLAG_ENABLED) {
++		netif_sawf_timestamp(skb, dev);
++	} else {
++		net_timestamp_check(READ_ONCE(netdev_tstamp_prequeue), skb);
++	}
+ 
+ 	if (skb_defer_rx_timestamp(skb))
+ 		return NET_RX_SUCCESS;
+@@ -5844,7 +6115,13 @@ void netif_receive_skb_list_internal(struct list_head *head)
+ 
+ 	INIT_LIST_HEAD(&sublist);
+ 	list_for_each_entry_safe(skb, next, head, list) {
+-		net_timestamp_check(READ_ONCE(netdev_tstamp_prequeue), skb);
++		struct net_device *dev = skb->dev;
++		if (dev->sawf_flags & NETDEV_SAWF_FLAG_ENABLED) {
++			netif_sawf_timestamp(skb, dev);
++		} else {
++			net_timestamp_check(READ_ONCE(netdev_tstamp_prequeue), skb);
++		}
++
+ 		skb_list_del_init(skb);
+ 		if (!skb_defer_rx_timestamp(skb))
+ 			list_add_tail(&skb->list, &sublist);
+-- 
+2.34.1
+
