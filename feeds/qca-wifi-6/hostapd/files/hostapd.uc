@@ -403,7 +403,7 @@ function normalize_rxkhs(txt)
 		if(match(k[0], /^r1kh/)) {
 			k[1] = lc(k[1]);
 		}
-		if(!k[2] = hostapd.rkh_derive_key(k[2])) {
+		if (!(k[2] = hostapd.rkh_derive_key(k[2]))) {
 			return;
 		}
 		return join(" ", k);
