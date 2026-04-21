@@ -190,8 +190,9 @@ platform_do_upgrade() {
 		nand_upgrade_tar "$1"
 		;;
 	asterfusion,AP7330|\
-	zyxel,nwa130be|\
 	zyxel,nwa210be|\
+	zyxel,nwa130be|\
+	zyxel,nwa55be|\
 	zyxel,nwa50be)
 		nand_upgrade_tar "$1"
 		;;
