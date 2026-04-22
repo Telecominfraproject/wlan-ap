@@ -216,6 +216,7 @@ platform_do_upgrade() {
 	emplus,wap588m)
 		CI_UBIPART="ubi_1"
 		nand_do_upgrade "$1"
+		;;
 	sonicfi,rap630w-211g)
 		chmod +x /tmp/root/lib/upgrade/sonicfi/nand_sonicfi_rap630w_211g.sh
 		/tmp/root/lib/upgrade/sonicfi/nand_sonicfi_rap630w_211g.sh "$1"
