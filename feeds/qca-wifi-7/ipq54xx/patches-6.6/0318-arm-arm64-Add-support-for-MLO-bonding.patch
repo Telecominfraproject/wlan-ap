@@ -1,0 +1,422 @@
+From 11d7234c08dbc3844d2d5386a4fe663a9322c91e Mon Sep 17 00:00:00 2001
+From: Shivani Soni <quic_soni@quicinc.com>
+Date: Thu, 17 Nov 2022 00:16:38 +0530
+Subject: [PATCH 318/500] arm/arm64: Add support for MLO bonding
+
+1. Introduced BOND_MODE_MLO to support MLO bonding
+2. Transmit handling according to new mode
+
+Change-Id: Ib272e77cce56ee50b0a13305fac8fae76743c206
+Signed-off-by: Shivani Soni <quic_soni@quicinc.com>
+Signed-off-by: Pavithra R <quic_pavir@quicinc.com>
+---
+ drivers/net/bonding/bond_main.c    | 212 ++++++++++++++++++++++++-----
+ drivers/net/bonding/bond_options.c |   1 +
+ include/net/bonding.h              |  30 +++-
+ include/uapi/linux/if_bonding.h    |   1 +
+ 4 files changed, 210 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index 4aeae3330a36..11ab1920cacb 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -1863,6 +1863,8 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
+ 	int link_reporting;
+ 	int res = 0, i;
+ 
++	ASSERT_RTNL();
++
+ 	if (slave_dev->flags & IFF_MASTER &&
+ 	    !netif_is_bond_master(slave_dev)) {
+ 		BOND_NL_ERR(bond_dev, extack,
+@@ -1983,13 +1985,17 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
+ 	call_netdevice_notifiers(NETDEV_JOIN, slave_dev);
+ 
+ 	/* If this is the first slave, then we need to set the master's hardware
+-	 * address to be the same as the slave's.
++	 * address to be the same as the slave's except for BOND_MODE_MLO.
++	 * For BOND_MODE_MLO, master's mac address is MLD address which should
++	 * not be same as slave's address.
+ 	 */
+-	if (!bond_has_slaves(bond) &&
+-	    bond->dev->addr_assign_type == NET_ADDR_RANDOM) {
+-		res = bond_set_dev_addr(bond->dev, slave_dev);
+-		if (res)
+-			goto err_undo_flags;
++	if (BOND_MODE(bond) != BOND_MODE_MLO) {
++		if (!bond_has_slaves(bond) &&
++		    bond->dev->addr_assign_type == NET_ADDR_RANDOM) {
++			res = bond_set_dev_addr(bond->dev, slave_dev);
++			if (res)
++				goto err_undo_flags;
++		}
+ 	}
+ 
+ 	new_slave = bond_alloc_slave(bond, slave_dev);
+@@ -2018,18 +2024,21 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
+ 	bond_hw_addr_copy(new_slave->perm_hwaddr, slave_dev->dev_addr,
+ 			  slave_dev->addr_len);
+ 
+-	if (!bond->params.fail_over_mac ||
+-	    BOND_MODE(bond) != BOND_MODE_ACTIVEBACKUP) {
+-		/* Set slave to master's mac address.  The application already
+-		 * set the master's mac address to that of the first slave
+-		 */
+-		memcpy(ss.__data, bond_dev->dev_addr, bond_dev->addr_len);
+-		ss.ss_family = slave_dev->type;
+-		res = dev_set_mac_address(slave_dev, (struct sockaddr *)&ss,
+-					  extack);
+-		if (res) {
+-			slave_err(bond_dev, slave_dev, "Error %d calling set_mac_address\n", res);
+-			goto err_restore_mtu;
++	/* Set slave to master's mac address except for BOND_MODE_MLO
++	 * as for MLO mode master's mac address is not same as slave's mac address.
++	 * The application already set the master's mac address to that of the first slave
++	 */
++	if (BOND_MODE(bond) != BOND_MODE_MLO) {
++		if (!bond->params.fail_over_mac ||
++		    BOND_MODE(bond) != BOND_MODE_ACTIVEBACKUP) {
++			memcpy(ss.__data, bond_dev->dev_addr, bond_dev->addr_len);
++			ss.ss_family = slave_dev->type;
++			res = dev_set_mac_address(slave_dev, (struct sockaddr *)&ss,
++					extack);
++			if (res) {
++				slave_err(bond_dev, slave_dev, "Error %d calling set_mac_address\n", res);
++				goto err_restore_mtu;
++			}
+ 		}
+ 	}
+ 
+@@ -2386,6 +2395,7 @@ int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
+ 
+ 	return res;
+ }
++EXPORT_SYMBOL(bond_enslave);
+ 
+ /* Try to release the slave device <slave> from the bond device <master>
+  * It is legal to access curr_active_slave without a lock because all the function
+@@ -2581,6 +2591,7 @@ int bond_release(struct net_device *bond_dev, struct net_device *slave_dev)
+ {
+ 	return __bond_release_one(bond_dev, slave_dev, false, false);
+ }
++EXPORT_SYMBOL(bond_release);
+ 
+ /* First release a slave and then destroy the bond if no more slaves are left.
+  * Must be under rtnl_lock when this function is called.
+@@ -2602,6 +2613,29 @@ static int bond_release_and_destroy(struct net_device *bond_dev,
+ 	return ret;
+ }
+ 
++/* Destroy the bond for BOND_MODE_MLO if no more slaves are left.
++ * Must be under rtnl_lock when this function is called.
++ */
++bool bond_destroy_mlo(struct net_device *bond_dev)
++{
++	struct bonding *bond = netdev_priv(bond_dev);
++
++	ASSERT_RTNL();
++
++	if (!bond_has_slaves(bond)) {
++		bond_dev->priv_flags |= IFF_DISABLE_NETPOLL;
++		netdev_info(bond_dev, "Destroying bond as no slaves are present\n");
++		bond_remove_proc_entry(bond);
++		unregister_netdevice(bond_dev);
++		return true;
++	}
++
++	pr_err("%p: Not able to destroy bond netdevice: %s as slaves are present\n", bond_dev, bond_dev->name);
++
++	return false;
++}
++EXPORT_SYMBOL(bond_destroy_mlo);
++
+ static void bond_info_query(struct net_device *bond_dev, struct ifbond *info)
+ {
+ 	struct bonding *bond = netdev_priv(bond_dev);
+@@ -4251,6 +4285,24 @@ static struct net_device *bond_xor_get_tx_dev(struct sk_buff *skb,
+ 	return NULL;
+ }
+ 
++/* Transmit function for BOND_MODE_MLO.
++ * Get transmit link interface from registered callback.
++ */
++struct net_device *bond_mlo_get_tx_dev(struct net_device *bond_dev, u8 *dst_mac)
++{
++	struct net_device *slave_dev = NULL;
++	struct mlo_bond_info *mlo_info = NULL;
++	void *bond_mlo_ctx;
++
++	mlo_info = bond_get_mlo_priv(bond_dev);
++	if (mlo_info->bond_get_mlo_tx_netdev) {
++		bond_mlo_ctx = bond_get_mlo_ctx(bond_dev);
++		slave_dev = mlo_info->bond_get_mlo_tx_netdev(bond_mlo_ctx, dst_mac);
++	}
++
++        return slave_dev;
++}
++
+ /* bond_get_tx_dev - Calculate egress interface for a given packet.
+  *
+  * Supports 802.3AD and balance-xor modes
+@@ -4291,6 +4343,9 @@ struct net_device *bond_get_tx_dev(struct sk_buff *skb, uint8_t *src_mac,
+ 		return bond_3ad_get_tx_dev(skb, src_mac, dst_mac,
+ 					   src, dst, protocol,
+ 					   bond_dev, layer4hdr);
++	case BOND_MODE_MLO:
++		return bond_mlo_get_tx_dev(bond_dev, dst_mac);
++
+ 	default:
+ 		return NULL;
+ 	}
+@@ -5031,20 +5086,26 @@ static int bond_set_mac_address(struct net_device *bond_dev, void *addr)
+ 	if (!is_valid_ether_addr(ss->__data))
+ 		return -EADDRNOTAVAIL;
+ 
+-	bond_for_each_slave(bond, slave, iter) {
+-		slave_dbg(bond_dev, slave->dev, "%s: slave=%p\n",
+-			  __func__, slave);
+-		res = dev_set_mac_address(slave->dev, addr, NULL);
+-		if (res) {
+-			/* TODO: consider downing the slave
+-			 * and retry ?
+-			 * User should expect communications
+-			 * breakage anyway until ARP finish
+-			 * updating, so...
+-			 */
+-			slave_dbg(bond_dev, slave->dev, "%s: err %d\n",
+-				  __func__, res);
+-			goto unwind;
++	/*
++	 * Do not allow mac address change for slave netdevice for BOND_MODE_MLO
++	 * as master's mac address is not same as slave's mac address.
++	 */
++	if (BOND_MODE(bond) != BOND_MODE_MLO) {
++		bond_for_each_slave(bond, slave, iter) {
++			slave_dbg(bond_dev, slave->dev, "%s: slave=%p\n",
++				  __func__, slave);
++			res = dev_set_mac_address(slave->dev, addr, NULL);
++			if (res) {
++				/* TODO: consider downing the slave
++				 * and retry ?
++				 * User should expect communications
++				 * breakage anyway until ARP finish
++				 * updating, so...
++				 */
++				slave_dbg(bond_dev, slave->dev, "%s: err %d\n",
++					  __func__, res);
++				goto unwind;
++			}
+ 		}
+ 	}
+ 
+@@ -5689,6 +5750,27 @@ static netdev_tx_t bond_tls_device_xmit(struct bonding *bond, struct sk_buff *sk
+ }
+ #endif
+ 
++/* In bond_xmit_mlo(), we send the packet and bond netdevice
++ * to registered callback for final xmit.
++ */
++static netdev_tx_t bond_xmit_mlo(struct sk_buff *skb, struct net_device *bond_dev)
++{
++	struct bonding *bond = netdev_priv(bond_dev);
++	int slave_cnt, ret;
++	struct mlo_bond_info *mlo_info = bond_get_mlo_priv(bond_dev);
++
++	slave_cnt = READ_ONCE(bond->slave_cnt);
++	if (unlikely(slave_cnt == 0) || unlikely(!mlo_info->bond_mlo_xmit_netdev)) {
++		bond_tx_drop(bond_dev, skb);
++	} else {
++		ret = mlo_info->bond_mlo_xmit_netdev(skb, bond_dev);
++		if (ret != NET_XMIT_SUCCESS)
++			netdev_err(bond_dev, "Xmit failed with mode %d %p\n", BOND_MODE(bond), skb);
++	}
++
++	return NETDEV_TX_OK;
++}
++
+ static netdev_tx_t __bond_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	struct bonding *bond = netdev_priv(dev);
+@@ -5717,6 +5799,8 @@ static netdev_tx_t __bond_start_xmit(struct sk_buff *skb, struct net_device *dev
+ 		return bond_alb_xmit(skb, dev);
+ 	case BOND_MODE_TLB:
+ 		return bond_tlb_xmit(skb, dev);
++	case BOND_MODE_MLO:
++		return bond_xmit_mlo(skb, dev);
+ 	default:
+ 		/* Should never happen, mode already checked */
+ 		netdev_err(dev, "Unknown bonding mode %d\n", BOND_MODE(bond));
+@@ -6711,6 +6795,70 @@ int bond_create(struct net *net, const char *name)
+ 	return res;
+ }
+ 
++/* bond_create_mlo()
++ * Create bond netdevice for BOND_MODE_MLO with MLO specific callback and context.
++ */
++struct net_device *bond_create_mlo(struct net *net, const char *name, struct mlo_bond_info *mlo_info)
++{
++	struct net_device *bond_dev;
++	struct bonding *bond;
++	int res;
++
++	ASSERT_RTNL();
++
++	bond_dev = alloc_netdev_mq(sizeof(struct bonding),
++				   name ? name : "bond%d", NET_NAME_UNKNOWN,
++				   bond_setup, tx_queues);
++	if (!bond_dev) {
++		pr_err("%s: eek! can't alloc netdev!\n", name);
++		return NULL;
++	}
++
++	bond = netdev_priv(bond_dev);
++
++	dev_net_set(bond_dev, net);
++	bond_dev->rtnl_link_ops = &bond_link_ops;
++
++	/*
++	 * MLO specific initialization.
++	 */
++	bond_dev->ieee80211_ptr = mlo_info->wdev;
++	bond->params.mode = BOND_MODE_MLO;
++	mlo_info->wdev->netdev = bond_dev;
++
++	memcpy((void *)&bond->mlo_info, (void *)mlo_info, sizeof(*mlo_info));
++	eth_hw_addr_random(bond_dev);
++
++	res = register_netdevice(bond_dev);
++	if (res < 0) {
++		free_netdev(bond_dev);
++		return NULL;
++	}
++
++	netif_carrier_off(bond_dev);
++	bond_work_init_all(bond);
++
++	bond->id = ~0U;
++	if (bond_id_mask != (~0UL)) {
++		bond->id = (u32)ffz(bond_id_mask);
++		set_bit(bond->id, &bond_id_mask);
++	}
++
++	return bond_dev;
++}
++EXPORT_SYMBOL(bond_create_mlo);
++
++/* bond_get_mlo_ctx
++ * Returns MLO context stored in netdev priv of bond netdevice
++ */
++void *bond_get_mlo_ctx(struct net_device *bond_dev)
++{
++	struct mlo_bond_info *mlo_info = bond_get_mlo_priv(bond_dev);
++
++	return mlo_info->bond_mlo_ctx;
++}
++EXPORT_SYMBOL(bond_get_mlo_ctx);
++
+ static int __net_init bond_net_init(struct net *net)
+ {
+ 	struct bond_net *bn = net_generic(net, bond_net_id);
+diff --git a/drivers/net/bonding/bond_options.c b/drivers/net/bonding/bond_options.c
+index f3f27f0bd2a6..9abd9689840b 100644
+--- a/drivers/net/bonding/bond_options.c
++++ b/drivers/net/bonding/bond_options.c
+@@ -94,6 +94,7 @@ static const struct bond_opt_value bond_mode_tbl[] = {
+ 	{ "802.3ad",       BOND_MODE_8023AD,       0},
+ 	{ "balance-tlb",   BOND_MODE_TLB,          0},
+ 	{ "balance-alb",   BOND_MODE_ALB,          0},
++	{ "mode mlo",      BOND_MODE_MLO,          0},
+ 	{ NULL,            -1,                     0},
+ };
+ 
+diff --git a/include/net/bonding.h b/include/net/bonding.h
+index 7cbf28ca7f3f..ac2cd0da8192 100644
+--- a/include/net/bonding.h
++++ b/include/net/bonding.h
+@@ -23,6 +23,7 @@
+ #include <linux/etherdevice.h>
+ #include <linux/reciprocal_div.h>
+ #include <linux/if_link.h>
++#include <net/cfg80211.h>
+ 
+ #include <net/bond_3ad.h>
+ #include <net/bond_alb.h>
+@@ -209,6 +210,20 @@ struct bond_ipsec {
+ 	struct xfrm_state *xs;
+ };
+ 
++/**
++ * mlo_bond_info - mlo_bond_info structure maintains members corresponding to wifi 7
++ * @bond_mlo_xmit_netdev: Callback function to provide skb to wifi driver for xmit
++ * @bond_get_mlo_tx_netdev: Callback function to get link interface from wifi driver for transmit
++ * @bond_mlo_ctx: Private member for wifi driver
++ * @wdev: ieee80211_ptr for wifi VAP
++ */
++struct mlo_bond_info {
++	int (*bond_mlo_xmit_netdev)(struct sk_buff *skb, struct net_device *bond_dev);
++	struct net_device *(*bond_get_mlo_tx_netdev)(void *bond_mlo_ctx, void *dst);
++	void *bond_mlo_ctx;
++	struct wireless_dev *wdev;
++};
++
+ /*
+  * Here are the locking policies for the two bonding locks:
+  * Get rcu_read_lock when reading or RTNL when writing slave list.
+@@ -264,6 +279,8 @@ struct bonding {
+ #endif /* CONFIG_XFRM_OFFLOAD */
+ 	struct bpf_prog *xdp_prog;
+ 	u32 id;
++	/* MLO mode info */
++	struct mlo_bond_info mlo_info;
+ };
+ 
+ #define bond_slave_get_rcu(dev) \
+@@ -644,6 +661,12 @@ static inline __be32 bond_confirm_addr(struct net_device *dev, __be32 dst, __be3
+ 	return addr;
+ }
+ 
++static inline struct mlo_bond_info *bond_get_mlo_priv(struct net_device *bond_dev)
++{
++	struct bonding *bond = netdev_priv(bond_dev);
++	return &bond->mlo_info;
++}
++
+ struct bond_net {
+ 	struct net		*net;	/* Associated network namespace */
+ 	struct list_head	dev_list;
+@@ -656,15 +679,18 @@ struct bond_net {
+ int bond_rcv_validate(const struct sk_buff *skb, struct bonding *bond, struct slave *slave);
+ netdev_tx_t bond_dev_queue_xmit(struct bonding *bond, struct sk_buff *skb, struct net_device *slave_dev);
+ int bond_create(struct net *net, const char *name);
++extern struct net_device *bond_create_mlo(struct net *net, const char *name, struct mlo_bond_info *mlo_info);
++extern void *bond_get_mlo_ctx(struct net_device *bond_dev);
++extern bool bond_destroy_mlo(struct net_device *bond_dev);
+ int bond_create_sysfs(struct bond_net *net);
+ void bond_destroy_sysfs(struct bond_net *net);
+ void bond_prepare_sysfs_group(struct bonding *bond);
+ int bond_sysfs_slave_add(struct slave *slave);
+ void bond_sysfs_slave_del(struct slave *slave);
+ void bond_xdp_set_features(struct net_device *bond_dev);
+-int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
++extern int bond_enslave(struct net_device *bond_dev, struct net_device *slave_dev,
+ 		 struct netlink_ext_ack *extack);
+-int bond_release(struct net_device *bond_dev, struct net_device *slave_dev);
++extern int bond_release(struct net_device *bond_dev, struct net_device *slave_dev);
+ u32 bond_xmit_hash(struct bonding *bond, struct sk_buff *skb);
+ int bond_set_carrier(struct bonding *bond);
+ void bond_select_active_slave(struct bonding *bond);
+diff --git a/include/uapi/linux/if_bonding.h b/include/uapi/linux/if_bonding.h
+index d174914a837d..7b43536a8670 100644
+--- a/include/uapi/linux/if_bonding.h
++++ b/include/uapi/linux/if_bonding.h
+@@ -71,6 +71,7 @@
+ #define BOND_MODE_8023AD        4
+ #define BOND_MODE_TLB           5
+ #define BOND_MODE_ALB		6 /* TLB + RLB (receive load balancing) */
++#define BOND_MODE_MLO		7 /* MLO (Multi link) mode for Wi-Fi 7 AP links */
+ 
+ /* each slave's link has 4 states */
+ #define BOND_LINK_UP    0           /* link is up and running */
+-- 
+2.34.1
+
