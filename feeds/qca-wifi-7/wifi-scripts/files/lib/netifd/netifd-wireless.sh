@@ -239,8 +239,8 @@ wireless_vif_parse_encryption() {
 		*ccmp256) wpa_cipher="CCMP-256";;
 		*gcmp | *sae-ext-key | akm24*) wpa_cipher="GCMP CCMP GCMP-256";;
 		*gcmp256 | wpa3-192*) wpa_cipher="GCMP-256";;
-		*aes|*ccmp| psk2 | wpa2 | sae* | owe | dpp) wpa_cipher="CCMP";;
-		*tkip | wpa | psk) wpa_cipher="TKIP";;
+		*aes|*ccmp| psk2 | wpa2 | psk | wpa | sae* | owe | dpp) wpa_cipher="CCMP";;
+		*tkip) wpa_cipher="TKIP";;
 	esac
 
 	# Examples:

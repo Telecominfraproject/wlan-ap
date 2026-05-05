@@ -414,7 +414,7 @@ export function info(name) {
 			channel_offset: data.hardware.channel_offset || 'none',
 		};
 
-		if (!data.wiphy_freq) {
+		if (data.mlo_links) {
 			dev.channel = format_channel(data.mlo_links[0].wiphy_freq);
 			dev.freq = format_frequency(data.mlo_links[0].wiphy_freq);
 			dev.center_freq1 = format_channel(data.mlo_links[0].center_freq1) || 'unknown';

@@ -94,6 +94,7 @@ function wiphy_detect() {
 		let info = {
 			antenna_rx: phy.wiphy_antenna_avail_rx,
 			antenna_tx: phy.wiphy_antenna_avail_tx,
+			reconf: true,
 			bands: {},
 		};
 		let multi_radio = {};
