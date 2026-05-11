@@ -1,0 +1,203 @@
+From 939510ed9815f4bdd0581231d0d5474ff3aa7dc1 Mon Sep 17 00:00:00 2001
+From: John Crispin <john@phrozen.org>
+Date: Mon, 11 May 2026 08:00:10 +0200
+Subject: [PATCH 4/5] mediatek: kernel: add boot_param module and dual-image
+ rootfs gate
+
+Add a kernel patch under target/linux/mediatek/patches-6.12 that
+introduces a 'boot_param' kernel module exposing cmdline parameters
+(dual_boot, boot_image_slot, upgrade_image_slot, boot/upgrade kernel
+and rootfs partition names, env partition, etc.) for vendor U-Boot
+implementations that need to communicate slot state to userspace.
+
+Also lets drivers/mtd/ubi/block.c accept 'ubiblock.rootfs_volume='
+and 'ubiblock.no_default_rootdev' so the default-rootfs heuristic
+can be overridden by cmdline, and gates the implicit
+mount_ubi_rootfs() call in init/do_mounts.c behind dual_boot=0.
+
+Devices that do not pass any boot_param.* on the kernel cmdline see
+no change in behaviour: dual_boot stays false and the existing rootfs
+mount path is unchanged.
+
+Needed by the upcoming sonicfi_rap630w-211g device whose vendor
+bootloader uses this slot-state ABI; kept as a generic kernel patch
+so any other mediatek device with the same scheme can opt in via
+its own bootloader environment.
+
+Signed-off-by: John Crispin <john@phrozen.org>
+---
+ ...nel-boot-param-and-dual-image-rootfs.patch | 162 ++++++++++++++++++
+ 1 file changed, 162 insertions(+)
+ create mode 100644 target/linux/mediatek/patches-6.12/971-kernel-boot-param-and-dual-image-rootfs.patch
+
+diff --git a/target/linux/mediatek/patches-6.12/971-kernel-boot-param-and-dual-image-rootfs.patch b/target/linux/mediatek/patches-6.12/971-kernel-boot-param-and-dual-image-rootfs.patch
+new file mode 100644
+index 0000000000..e93a34982d
+--- /dev/null
++++ b/target/linux/mediatek/patches-6.12/971-kernel-boot-param-and-dual-image-rootfs.patch
+@@ -0,0 +1,162 @@
++Add a kernel module that exposes a set of cmdline parameters under
++'boot_param.*' (dual_boot, boot_image_slot, upgrade_image_slot,
++boot/upgrade kernel/rootfs partition names, env partition) that a
++vendor bootloader can set to indicate which of two paired rootfs
++slots is currently active. Userspace upgrade logic reads these
++via /sys/module/boot_param/parameters/ to pick the inactive slot.
++
++Also let drivers/mtd/ubi/block.c accept a 'ubiblock.rootfs_volume='
++override of the volume name treated as the default root device, and
++a 'ubiblock.no_default_rootdev' switch to suppress the implicit
++ROOT_DEV assignment entirely, so the dual-boot flow can route the
++root device explicitly from the cmdline instead of relying on the
++'rootfs' volume name.
++
++When 'boot_param.dual_boot=1' is set on the kernel cmdline, the
++early-boot path in init/do_mounts.c skips the implicit
++mount_ubi_rootfs() and lets the cmdline-supplied root device take
++effect.
++
++The new boot_param.o is built unconditionally; with no cmdline
++parameters set, dual_boot defaults to false and the rest of the
++parameters default to empty strings, so the patch is a no-op on
++devices that do not opt in.
++
++---
++ drivers/mtd/ubi/block.c     | 11 +++++++++--
++ include/linux/boot_param.h  |  8 ++++++++
++ init/do_mounts.c            |  3 ++-
++ kernel/Makefile             |  2 ++
++ kernel/boot_param.c         | 49 +++++++++++++++++++++++++++++++++++++++++++++
++ 5 files changed, 70 insertions(+), 3 deletions(-)
++ create mode 100644 include/linux/boot_param.h
++ create mode 100644 kernel/boot_param.c
++
++--- a/drivers/mtd/ubi/block.c
+++++ b/drivers/mtd/ubi/block.c
++@@ -93,6 +93,12 @@ static LIST_HEAD(ubiblock_devices);
++ static DEFINE_MUTEX(devices_mutex);
++ static int ubiblock_major;
++
+++static char rootfs_volume[256] = "rootfs";
+++module_param_string(rootfs_volume, rootfs_volume, sizeof(rootfs_volume), 0444);
+++
+++static bool no_default_rootdev;
+++module_param(no_default_rootdev, bool, 0444);
+++
++ static int __init ubiblock_set_param(const char *val,
++ 				     const struct kernel_param *kp)
++ {
++@@ -433,8 +439,9 @@ int ubiblock_create(struct ubi_volume_in
++ 		 dev->ubi_num, dev->vol_id, vi->name);
++ 	mutex_unlock(&devices_mutex);
++
++-	if (!strcmp(vi->name, "rootfs") &&
+++	if (!strcmp(vi->name, rootfs_volume) &&
++ 	    IS_ENABLED(CONFIG_MTD_ROOTFS_ROOT_DEV) &&
+++	    !no_default_rootdev &&
++ 	    ROOT_DEV == 0) {
++ 		pr_notice("ubiblock: device ubiblock%d_%d (%s) set to be root filesystem\n",
++ 			  dev->ubi_num, dev->vol_id, vi->name);
++@@ -602,7 +609,7 @@ static void ubiblock_create_from_param(s
++ 	int ret, is_ubifs;
++ 	struct ubi_volume_desc *desc;
++
++-	if (strcmp(vi->name, "rootfs") &&
+++	if (strcmp(vi->name, rootfs_volume) &&
++ 	    strcmp(vi->name, "fit"))
++ 		return;
++
++--- /dev/null
+++++ b/include/linux/boot_param.h
++@@ -0,0 +1,8 @@
+++/* SPDX-License-Identifier: GPL-2.0 */
+++#ifndef __BOOT_PARAM_H__
+++#define __BOOT_PARAM_H__
+++
+++extern bool dual_boot;
+++
+++#endif /* __BOOT_PARAM_H__ */
+++
++--- a/init/do_mounts.c
+++++ b/init/do_mounts.c
++@@ -25,6 +25,7 @@
++ #include <linux/nfs_mount.h>
++ #include <linux/raid/detect.h>
++ #include <uapi/linux/mount.h>
+++#include <linux/boot_param.h>
++
++ #include "do_mounts.h"
++
++@@ -411,7 +412,7 @@ static int __init mount_nodev_root(char
++ void __init mount_root(char *root_device_name)
++ {
++ #ifdef CONFIG_MTD_ROOTFS_ROOT_DEV
++-	if (!mount_ubi_rootfs())
+++	if (!dual_boot && !mount_ubi_rootfs())
++ 		return;
++ #endif
++
++--- a/kernel/Makefile
+++++ b/kernel/Makefile
++@@ -12,6 +12,8 @@ obj-y     = fork.o exec_domain.o panic.o
++ 	    notifier.o ksysfs.o cred.o reboot.o \
++ 	    async.o range.o smpboot.o ucount.o regset.o ksyms_common.o
++
+++obj-y += boot_param.o
+++
++ obj-$(CONFIG_USERMODE_DRIVER) += usermode_driver.o
++ obj-$(CONFIG_MULTIUSER) += groups.o
++ obj-$(CONFIG_VHOST_TASK) += vhost_task.o
++--- /dev/null
+++++ b/kernel/boot_param.c
++@@ -0,0 +1,49 @@
+++/* SPDX-License-Identifier: GPL-2.0 */
+++/*
+++ * Copyright (C) 2022 MediaTek Inc. All rights reserved.
+++ *
+++ * Author: Weijie Gao <weijie.gao@mediatek.com>
+++ */
+++
+++#include <linux/kernel.h>
+++#include <linux/moduleparam.h>
+++#include <linux/boot_param.h>
+++
+++#define BOOT_PARAM_STR_MAX_LEN			256
+++
+++bool dual_boot;
+++module_param(dual_boot, bool, 0444);
+++
+++static bool reset_boot_count;
+++module_param(reset_boot_count, bool, 0444);
+++
+++static bool no_split_rootfs_data;
+++module_param(no_split_rootfs_data, bool, 0444);
+++
+++static bool reserve_rootfs_data;
+++module_param(reserve_rootfs_data, bool, 0444);
+++
+++static uint boot_image_slot;
+++module_param(boot_image_slot, uint, 0444);
+++
+++static uint upgrade_image_slot;
+++module_param(upgrade_image_slot, uint, 0444);
+++
+++static char rootfs_data_part[BOOT_PARAM_STR_MAX_LEN];
+++module_param_string(rootfs_data_part, rootfs_data_part, BOOT_PARAM_STR_MAX_LEN, 0644);
+++
+++static char boot_kernel_part[BOOT_PARAM_STR_MAX_LEN];
+++module_param_string(boot_kernel_part, boot_kernel_part, BOOT_PARAM_STR_MAX_LEN, 0444);
+++
+++static char boot_rootfs_part[BOOT_PARAM_STR_MAX_LEN];
+++module_param_string(boot_rootfs_part, boot_rootfs_part, BOOT_PARAM_STR_MAX_LEN, 0444);
+++
+++static char upgrade_kernel_part[BOOT_PARAM_STR_MAX_LEN];
+++module_param_string(upgrade_kernel_part, upgrade_kernel_part, BOOT_PARAM_STR_MAX_LEN, 0444);
+++
+++static char upgrade_rootfs_part[BOOT_PARAM_STR_MAX_LEN];
+++module_param_string(upgrade_rootfs_part, upgrade_rootfs_part, BOOT_PARAM_STR_MAX_LEN, 0444);
+++
+++static char env_part[BOOT_PARAM_STR_MAX_LEN];
+++module_param_string(env_part, env_part, BOOT_PARAM_STR_MAX_LEN, 0444);
+++
+-- 
+2.34.1
+
