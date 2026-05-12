@@ -99,14 +99,11 @@ static int rtl826xb_get_features(struct phy_device *phydev)
 
     switch (priv->phytype)
     {
-        case RTK_PHYLIB_RTL8251L:
-        case RTK_PHYLIB_RTL8254B:
-            linkmode_clear_bit(ETHTOOL_LINK_MODE_10000baseT_Full_BIT,
-                       phydev->supported);
+        /* support 10G modes */
+        case RTK_PHYLIB_RTL8261N:
             break;
-
         default:
-	    linkmode_clear_bit(ETHTOOL_LINK_MODE_10000baseT_Full_BIT,
+            linkmode_clear_bit(ETHTOOL_LINK_MODE_10000baseT_Full_BIT,
                        phydev->supported);
             break;
     }

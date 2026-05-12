@@ -808,6 +808,8 @@ define Package/hostapd-common/install
 	$(INSTALL_BIN) ./files/wps-hotplug.sh $(1)/etc/rc.button/wps
 	$(INSTALL_DATA) ./files/wpad_acl.json $(1)/usr/share/acl.d
 	$(INSTALL_DATA) ./files/wpad.json $(1)/etc/capabilities
+	$(INSTALL_BIN) ./files/mpskd $(1)/usr/share/hostap/
+	$(INSTALL_BIN) ./files/mpskd.init $(1)/etc/init.d/mpskd
 endef
 
 define Package/hostapd/install

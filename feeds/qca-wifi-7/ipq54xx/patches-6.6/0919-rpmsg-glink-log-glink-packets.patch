@@ -1,0 +1,368 @@
+From f32a8860b9216fac483a9b9cbb546cdf72c25c6c Mon Sep 17 00:00:00 2001
+From: Manikanta Mylavarapu <mmanikan@qti.qualcomm.com>
+Date: Mon, 7 Jul 2025 15:37:22 +0530
+Subject: [PATCH] rpmsg: glink: log glink packets
+
+Add support to log GLINK TX and RX packets with
+global timer values for the debugging purposes.
+
+(cherry picked from commit I70664d45ee4c6e1b605ef64f8077226650290e3a)
+(cherry picked from commit Id69fce2f65d2cfbcfc2300355c20d060a7c8d211)
+(cherry picked from commit Idf8543b0b363d158bff3513239e46eec89d4a62b)
+Change-Id: Ibe043fea28987495eb9f5fa1a265786bad7103cb
+Signed-off-by: Nikhil Prakash V <nprakash@codeaurora.org>
+Signed-off-by: Manikanta Mylavarapu <mmanikan@codeaurora.org>
+Signed-off-by: Manikanta Mylavarapu <quic_mmanikan@quicinc.com>
+Signed-off-by: Manikanta Mylavarapu <mmanikan@qti.qualcomm.com>
+---
+ drivers/rpmsg/qcom_glink_native.c | 163 +++++++++++++++++++++++++++++-
+ drivers/rpmsg/qcom_glink_native.h |  14 +++
+ drivers/rpmsg/qcom_glink_smem.c   |  13 ---
+ 3 files changed, 176 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/rpmsg/qcom_glink_native.c b/drivers/rpmsg/qcom_glink_native.c
+index 25750e4faf5f..f24aa68bd9f1 100644
+--- a/drivers/rpmsg/qcom_glink_native.c
++++ b/drivers/rpmsg/qcom_glink_native.c
+@@ -209,8 +209,85 @@ static const struct rpmsg_endpoint_ops glink_endpoint_ops;
+ #define NATIVE_RTS_SIG			NATIVE_CTS_SIG
+ #define NATIVE_CTS_SIG			BIT(30)
+ 
++#define RPMLOG_SIZE		256
++#define GLOBAL_TIMER_LO		0x0
++#define GLOBAL_TIMER_HI		0x4
++
+ static void qcom_glink_rx_done_work(struct work_struct *work);
+ 
++static void __iomem *global_timer_base;
++
++/* NOTE: log_global_timer() excepts simple variables as arguments
++ * Do not pass expressions with side effects eg: i++ etc.
++ */
++#define log_global_timer(array, index) { \
++	if (global_timer_base) { \
++		(array)[(index)].global_timer_lo  = \
++			readl_relaxed(global_timer_base + GLOBAL_TIMER_LO) - 0x13; \
++		(array)[(index)].global_timer_hi = \
++			readl_relaxed(global_timer_base + GLOBAL_TIMER_HI); \
++	} \
++}
++
++#define log_kernel_ts(array, index) ((array)[(index)++].timestamp = ktime_to_ms(ktime_get()))
++
++/**
++ * struct rpm_cmd_log - Structure to log GLINK commands and their parameters
++ * @timestamp: Kernel timestamp in milliseconds when the command was processed
++ * @cmd: GLINK command ID
++ * @param1: First parameter of the command
++ * @param2: Second parameter of the command
++ * @rxtail: RX FIFO tail pointer value
++ * @rxhead: RX FIFO head pointer value
++ * @global_timer_lo: Lower 32 bits of the global timer value
++ * @global_timer_hi: Upper 32 bits of the global timer value
++ * @hdr: Raw header and data bytes for detailed debugging
++ */
++struct rpm_cmd_log {
++	u64 timestamp;
++	int cmd;
++	unsigned int param1;
++	unsigned int param2;
++	__le32 rxtail;
++	__le32 rxhead;
++	unsigned int global_timer_lo;
++	unsigned int global_timer_hi;
++	unsigned long glink_intr_cnt;
++	unsigned char hdr[60];
++} glinkintr[RPMLOG_SIZE], glinksend[RPMLOG_SIZE];
++
++static unsigned int glinkintrindex;
++static unsigned int glinksendindex;
++
++struct glinkwork {
++	u64 timestamp;
++	int cmd;
++	unsigned int param1;
++	unsigned int param2;
++} glink_work[RPMLOG_SIZE];
++
++static unsigned int glinkworkindex;
++
++/**
++ * struct work_queue_timelog - Structure to track work queue timing events
++ * @timestamp: Timestamp when the work queue event occurred
++ *
++ * Used to track scheduling and cancellation evens for debugging purposes.
++ */
++struct work_queue_timelog {
++	u64 timestamp;
++} glinkwork_schedule[RPMLOG_SIZE], glinkwork_cancel[RPMLOG_SIZE];
++
++static unsigned int glinkwork_sche_index;
++static unsigned int glinkwork_cancel_index;
++
++/** glink_intr_cnt - Counter for GLINK interrupts
++ *
++ * This counter tracks the number of interrupts received bythe GLINK driver.
++ * It can be used for debugging.
++ */
++atomic_t glink_intr_cnt;
++
+ static struct glink_channel *qcom_glink_alloc_channel(struct qcom_glink *glink,
+ 						      const char *name)
+ {
+@@ -280,6 +357,16 @@ static void qcom_glink_channel_release(struct kref *ref)
+ 
+ 	kfree(channel->name);
+ 	kfree(channel);
++	memset(glinkintr, 0, sizeof(struct rpm_cmd_log) * RPMLOG_SIZE);
++	memset(glinksend, 0, sizeof(struct rpm_cmd_log) * RPMLOG_SIZE);
++	memset(glink_work, 0, sizeof(struct glinkwork) * RPMLOG_SIZE);
++	memset(glinkwork_schedule, 0, sizeof(struct work_queue_timelog) * RPMLOG_SIZE);
++	memset(glinkwork_cancel, 0, sizeof(struct work_queue_timelog) * RPMLOG_SIZE);
++	glinkintrindex = 0;
++	glinksendindex = 0;
++	glinkworkindex = 0;
++	glinkwork_sche_index = 0;
++	glinkwork_cancel_index = 0;
+ }
+ 
+ static struct glink_channel *qcom_glink_channel_ref_get(struct qcom_glink *glink,
+@@ -363,6 +450,7 @@ static int qcom_glink_tx(struct qcom_glink *glink,
+ 			 const void *hdr, size_t hlen,
+ 			 const void *data, size_t dlen, bool wait)
+ {
++	struct glink_msg *msg = (struct glink_msg *)hdr;
+ 	unsigned int tlen = hlen + dlen;
+ 	unsigned long flags;
+ 	int ret = 0;
+@@ -409,6 +497,31 @@ static int qcom_glink_tx(struct qcom_glink *glink,
+ 	qcom_glink_tx_write(glink, hdr, hlen, data, dlen);
+ 	qcom_glink_tx_kick(glink);
+ 
++	if (hdr) {
++		if (hlen > sizeof(glinksend[glinksendindex].hdr)) {
++			memcpy(glinksend[glinksendindex].hdr,
++			       hdr,
++			       sizeof(glinksend[glinksendindex].hdr));
++		} else {
++			memcpy(glinksend[glinksendindex].hdr, hdr, hlen);
++			if (data && (hlen < sizeof(glinksend[glinksendindex].hdr))) {
++				size_t max_data_len = sizeof(glinksend[glinksendindex].hdr) - hlen;
++				size_t copy_len = min_t(size_t, dlen, max_data_len);
++
++				memcpy(glinksend[glinksendindex].hdr + hlen, data, copy_len);
++			}
++		}
++	}
++	if (msg) {
++		glinksend[glinksendindex].cmd = msg->cmd;
++		glinksend[glinksendindex].param1 = msg->param1;
++		glinksend[glinksendindex].param2 = msg->param2;
++	}
++
++	log_global_timer(glinksend, glinksendindex);
++	log_kernel_ts(glinksend, glinksendindex);
++	glinksendindex &= (RPMLOG_SIZE - 1);
++
+ out:
+ 	spin_unlock_irqrestore(&glink->tx_lock, flags);
+ 
+@@ -860,6 +973,9 @@ static int qcom_glink_rx_defer(struct qcom_glink *glink, size_t extra)
+ 	spin_unlock(&glink->rx_lock);
+ 
+ 	schedule_work(&glink->rx_work);
++	log_kernel_ts(glinkwork_schedule, glinkwork_sche_index);
++	glinkwork_sche_index &= (RPMLOG_SIZE - 1);
++
+ 	qcom_glink_rx_advance(glink, sizeof(dcmd->msg) + extra);
+ 
+ 	return 0;
+@@ -887,6 +1003,7 @@ static int qcom_glink_rx_data(struct qcom_glink *glink, size_t avail)
+ 	}
+ 
+ 	qcom_glink_rx_peek(glink, &hdr, 0, sizeof(hdr));
++	memcpy(glinkintr[glinkintrindex].hdr, (void *)&hdr, sizeof(hdr));
+ 	chunk_size = le32_to_cpu(hdr.chunk_size);
+ 	left_size = le32_to_cpu(hdr.left_size);
+ 
+@@ -954,6 +1071,10 @@ static int qcom_glink_rx_data(struct qcom_glink *glink, size_t avail)
+ 
+ 	qcom_glink_rx_peek(glink, intent->data + intent->offset,
+ 			   sizeof(hdr), chunk_size);
++	memcpy(glinkintr[glinkintrindex].hdr + sizeof(hdr),
++	       intent->data + intent->offset,
++	       (((sizeof(hdr) + chunk_size) > 60) ?
++	       60 - sizeof(hdr) : chunk_size));
+ 	intent->offset += chunk_size;
+ 
+ 	/* Handle message when no fragments remain to be received */
+@@ -1109,6 +1230,7 @@ static void qcom_glink_handle_signals(struct qcom_glink *glink,
+ 
+ void qcom_glink_native_rx(struct qcom_glink *glink)
+ {
++	struct glink_smem_pipe *pipe = to_smem_pipe(glink->rx_pipe);
+ 	struct glink_msg msg;
+ 	unsigned int param1;
+ 	unsigned int param2;
+@@ -1116,13 +1238,23 @@ void qcom_glink_native_rx(struct qcom_glink *glink)
+ 	unsigned int cmd;
+ 	int ret = 0;
+ 
++	atomic_inc(&glink_intr_cnt);
++
+ 	/* To wakeup any blocking writers */
+ 	wake_up_all(&glink->tx_avail_notify);
+ 
+ 	for (;;) {
++		glinkintr[glinkintrindex].glink_intr_cnt = glink_intr_cnt.counter;
++		glinkintr[glinkintrindex].rxtail = *pipe->tail;
++		glinkintr[glinkintrindex].rxhead = *pipe->head;
++		log_global_timer(glinkintr, glinkintrindex);
++
+ 		avail = qcom_glink_rx_avail(glink);
+-		if (avail < sizeof(msg))
++		if (avail < sizeof(msg)) {
++			log_kernel_ts(glinkintr, glinkintrindex);
++			glinkintrindex &= (RPMLOG_SIZE - 1);
+ 			break;
++		}
+ 
+ 		qcom_glink_rx_peek(glink, &msg, 0, sizeof(msg));
+ 
+@@ -1130,6 +1262,10 @@ void qcom_glink_native_rx(struct qcom_glink *glink)
+ 		param1 = le16_to_cpu(msg.param1);
+ 		param2 = le32_to_cpu(msg.param2);
+ 
++		glinkintr[glinkintrindex].cmd = cmd;
++		glinkintr[glinkintrindex].param1 = param1;
++		glinkintr[glinkintrindex].param2 = param2;
++
+ 		switch (cmd) {
+ 		case GLINK_CMD_VERSION:
+ 		case GLINK_CMD_VERSION_ACK:
+@@ -1177,6 +1313,9 @@ void qcom_glink_native_rx(struct qcom_glink *glink)
+ 			ret = -EINVAL;
+ 			break;
+ 		}
++		/* Make sure we log the timestamp before exiting */
++		log_kernel_ts(glinkintr, glinkintrindex);
++		glinkintrindex &= (RPMLOG_SIZE - 1);
+ 
+ 		if (ret)
+ 			break;
+@@ -1716,6 +1855,12 @@ static void qcom_glink_work(struct work_struct *work)
+ 		param1 = le16_to_cpu(msg->param1);
+ 		param2 = le32_to_cpu(msg->param2);
+ 
++		glink_work[glinkworkindex].cmd = cmd;
++		glink_work[glinkworkindex].param1 = param1;
++		glink_work[glinkworkindex].param2 = param2;
++		log_kernel_ts(glink_work, glinkworkindex);
++		glinkworkindex &= (RPMLOG_SIZE - 1);
++
+ 		switch (cmd) {
+ 		case GLINK_CMD_VERSION:
+ 			qcom_glink_receive_version(glink, param1, param2);
+@@ -1754,6 +1899,9 @@ static void qcom_glink_cancel_rx_work(struct qcom_glink *glink)
+ 	/* cancel any pending deferred rx_work */
+ 	cancel_work_sync(&glink->rx_work);
+ 
++	log_kernel_ts(glinkwork_cancel, glinkwork_cancel_index);
++	glinkwork_cancel_index &= (RPMLOG_SIZE - 1);
++
+ 	list_for_each_entry_safe(dcmd, tmp, &glink->rx_queue, node)
+ 		kfree(dcmd);
+ }
+@@ -1821,6 +1969,7 @@ struct qcom_glink *qcom_glink_native_probe(struct device *dev,
+ {
+ 	int ret;
+ 	struct qcom_glink *glink;
++	unsigned int global_timer;
+ 
+ 	glink = devm_kzalloc(dev, sizeof(*glink), GFP_KERNEL);
+ 	if (!glink)
+@@ -1857,6 +2006,13 @@ struct qcom_glink *qcom_glink_native_probe(struct device *dev,
+ 	if (ret)
+ 		dev_err(glink->dev, "failed to register chrdev\n");
+ 
++	ret = of_property_read_u32(dev->of_node, "global_timer", &global_timer);
++	if (!ret) {
++		global_timer_base = ioremap(global_timer, 8);
++		if (!global_timer_base)
++			dev_err(glink->dev, "Failed to map global timer registers\n");
++	}
++
+ 	return glink;
+ }
+ EXPORT_SYMBOL_GPL(qcom_glink_native_probe);
+@@ -1875,6 +2031,7 @@ void qcom_glink_native_remove(struct qcom_glink *glink)
+ 	int cid;
+ 	int ret;
+ 
++	atomic_set(&glink_intr_cnt, 0);
+ 	qcom_glink_cancel_rx_work(glink);
+ 
+ 	/* Fail all attempts at sending messages */
+@@ -1903,6 +2060,10 @@ void qcom_glink_native_remove(struct qcom_glink *glink)
+ 
+ 	idr_destroy(&glink->lcids);
+ 	idr_destroy(&glink->rcids);
++	if (global_timer_base) {
++		iounmap(global_timer_base);
++		global_timer_base = NULL;
++	}
+ }
+ EXPORT_SYMBOL_GPL(qcom_glink_native_remove);
+ 
+diff --git a/drivers/rpmsg/qcom_glink_native.h b/drivers/rpmsg/qcom_glink_native.h
+index 8dbec24de23e..c2ab58e00fc2 100644
+--- a/drivers/rpmsg/qcom_glink_native.h
++++ b/drivers/rpmsg/qcom_glink_native.h
+@@ -30,6 +30,20 @@ struct qcom_glink_pipe {
+ struct device;
+ struct qcom_glink;
+ 
++struct qcom_glink_smem;
++struct glink_smem_pipe {
++	struct qcom_glink_pipe native;
++
++	__le32 *tail;
++	__le32 *head;
++
++	void *fifo;
++
++	struct qcom_glink_smem *smem;
++};
++
++#define to_smem_pipe(p) container_of(p, struct glink_smem_pipe, native)
++
+ struct qcom_glink *qcom_glink_native_probe(struct device *dev,
+ 					   unsigned long features,
+ 					   struct qcom_glink_pipe *rx,
+diff --git a/drivers/rpmsg/qcom_glink_smem.c b/drivers/rpmsg/qcom_glink_smem.c
+index 6f0ecaeae3b4..16897391e232 100644
+--- a/drivers/rpmsg/qcom_glink_smem.c
++++ b/drivers/rpmsg/qcom_glink_smem.c
+@@ -49,19 +49,6 @@ struct qcom_glink_smem {
+ 	u32 remote_pid;
+ };
+ 
+-struct glink_smem_pipe {
+-	struct qcom_glink_pipe native;
+-
+-	__le32 *tail;
+-	__le32 *head;
+-
+-	void *fifo;
+-
+-	struct qcom_glink_smem *smem;
+-};
+-
+-#define to_smem_pipe(p) container_of(p, struct glink_smem_pipe, native)
+-
+ static size_t glink_smem_rx_avail(struct qcom_glink_pipe *np)
+ {
+ 	struct glink_smem_pipe *pipe = to_smem_pipe(np);
+-- 
+2.34.1
+

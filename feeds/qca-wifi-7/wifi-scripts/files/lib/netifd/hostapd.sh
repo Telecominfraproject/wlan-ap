@@ -779,6 +779,7 @@ hostapd_set_bss_options() {
 				wireless_setup_vif_failed INVALID_WPA_PSK
 				return 1
 			fi
+			[ -z "$wpa_psk_file" ] && set_default wpa_psk_file /var/run/hostapd-"$ifname".psk
 			[ -n "$wpa_psk_file" ] && {
 				[ -e "$wpa_psk_file" ] || touch "$wpa_psk_file"
 				append bss_conf "wpa_psk_file=$wpa_psk_file" "$N"
@@ -1130,7 +1131,7 @@ hostapd_set_bss_options() {
 		) > "$_macfile"
 	}
 
-	([ -n "$vlan_possible"] && [ -n "$dynamic_vlan" ]) && {
+	([ -n "$vlan_possible" ] && [ -n "$dynamic_vlan" ]) && {
 		json_get_vars vlan_naming vlan_tagged_interface vlan_bridge vlan_file vlan_no_bridge
 		set_default vlan_naming 1
 		[ -z "$vlan_file" ] && set_default vlan_file /var/run/hostapd-"$ifname".vlan
