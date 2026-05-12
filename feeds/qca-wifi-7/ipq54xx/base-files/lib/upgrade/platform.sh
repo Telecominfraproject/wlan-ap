@@ -1,6 +1,6 @@
 . /lib/functions/system.sh
 
-RAMFS_COPY_BIN='fw_printenv fw_setenv'
+RAMFS_COPY_BIN='fw_printenv fw_setenv dumpimage'
 RAMFS_COPY_DATA='/etc/fw_env.config /var/lock/fw_printenv.lock'
 
 find_mmc_part() {
@@ -35,28 +35,71 @@ do_flash_emmc() {
 	tar Oxf $tar_file ${board_dir}/$part | dd of=${emmcblock}
 }
 
+do_flash_bootconfig_emmc() {
+	local bin=$1
+	local emmcblock=$2
+
+	dd if=/dev/zero of=${emmcblock} &> /dev/null
+	dd if=/tmp/${bin}.bin of=${emmcblock}
+}
+
+do_flash_partition() {
+	local bin=$1
+	local mtdname=$2
+	local emmcblock="$(find_mmc_part "$mtdname")"
+
+	if [ -e "$emmcblock" ]; then
+		do_flash_bootconfig_emmc $bin $emmcblock
+	fi
+}
+
+do_flash_bootconfig() {
+	local mtdname=$1
+	local bin=bootconfig
+
+	#flash bootconfig with updated boot-info
+	if [ -f /tmp/bootconfig.bin ]; then
+		do_flash_partition $bin $mtdname
+	else
+		echo " Bootconfig binary is missing.... "
+		return 1
+	fi
+}
+
+get_upgrade_bank() {
+	local mtdname=$1
+	local boot_set=$(grep "Boot-set" /tmp/bootconfig_members.txt | awk -F: '{print $2}')
+	local image_status=$(grep "Image-set-status" /tmp/bootconfig_members.txt | awk -F: '{print $2}')
+	local current_bank=0
+
+	if [ "$boot_set" -eq 0 ] && [ "$image_status" -ne 1 ]; then
+		mtdname="${mtdname}_1"
+		current_bank=1
+	elif [ "$boot_set" -eq 1 ] && [ "$image_status" -eq 2 ]; then
+		mtdname="${mtdname}_1"
+		current_bank=1
+	fi
+
+	if [[ -z "$mtdname" || "$mtdname" == "_1" ]]; then
+		echo $current_bank
+	else
+		echo $mtdname
+	fi
+}
+
 spi_nor_emmc_do_upgrade_bootconfig() {
 	local tar_file="$1"
 
 	local board_dir=$(tar tf $tar_file | grep -m 1 '^sysupgrade-.*/$')
 	board_dir=${board_dir%/}
-	[ -f /proc/boot_info/bootconfig0/getbinary_bootconfig ] || {
-		echo "bootconfig does not exist"
-		exit
-	}
-	CI_ROOTPART="$(cat /proc/boot_info/bootconfig0/rootfs/upgradepartition)"
-	CI_KERNPART="$(cat /proc/boot_info/bootconfig0/0:HLOS/upgradepartition)"
+
+	CI_ROOTPART="$(get_upgrade_bank "rootfs")"
+	CI_KERNPART="$(get_upgrade_bank "0:HLOS")"
 
 	[ -n "$CI_KERNPART" -a -n "$CI_ROOTPART" ] || {
 		echo "kernel or rootfs partition is unknown"
 		exit
 	}
-
-	local primary="0"
-	[ "$(cat /proc/boot_info/bootconfig0/rootfs/primaryboot)" = "0" ] && primary="1"
-	echo "$primary" > /proc/boot_info/bootconfig0/rootfs/primaryboot 2>/dev/null
-	echo "$primary" > /proc/boot_info/bootconfig0/0:HLOS/primaryboot 2>/dev/null
-	cp /proc/boot_info/bootconfig0/getbinary_bootconfig /tmp/bootconfig
 
 	do_flash_emmc $tar_file $CI_KERNPART $board_dir kernel
 	do_flash_emmc $tar_file $CI_ROOTPART $board_dir root
@@ -65,20 +108,6 @@ spi_nor_emmc_do_upgrade_bootconfig() {
 	if [ -e "$emmcblock" ]; then
 		mkfs.ext4 -F "$emmcblock"
 	fi
-
-	for part in "0:BOOTCONFIG" "0:BOOTCONFIG1"; do
-				local mtdchar=$(echo $(find_mtd_chardev $part) | sed 's/^.\{5\}//')
-				if [ -n "$mtdchar" ]; then
-						echo start to update $mtdchar
-						mtd -qq write /proc/boot_info/bootconfig0/getbinary_bootconfig "/dev/${mtdchar}" 2>/dev/null && echo update mtd $mtdchar
-			   else
-						emmcblock=$(find_mmc_part $part)
-						echo erase ${emmcblock}
-						dd if=/dev/zero of=${emmcblock} 2> /dev/null
-						echo update $emmcblock
-						dd if=/tmp/bootconfig of=${emmcblock} 2> /dev/null
-				fi
-	done
 }
 
 emmc_do_upgrade() {
@@ -101,6 +130,18 @@ platform_check_image() {
 	return 1
 }
 
+extract_bootconfig() {
+	local mtdname=$1
+	local mtdpart=$(grep "\"${mtdname}\"" /proc/mtd | awk -F: '{print $1}')
+	local emmcblock="$(find_mmc_part "$mtdname")"
+
+	if [ -e "$emmcblock" ]; then
+		dd if=${emmcblock} of=/tmp/bootconfig.bin
+	else
+		dd if=/dev/${mtdpart} of=/tmp/bootconfig.bin
+	fi
+}
+
 platform_do_upgrade() {
 	CI_UBIPART="rootfs"
 	CI_ROOTPART="ubi_rootfs"
@@ -108,10 +149,25 @@ platform_do_upgrade() {
 	block_kernel="0:HLOS"
 	block_rootfs="rootfs"
 
+	extract_bootconfig "0:BOOTCONFIG"
+
+	dumpimage -b 5
+
+	if [[ "$?" == 1 ]];then
+		echo "bootconfig functionality failed, rebooting.."
+		if [ $alive -eq 0 ]; then
+			reboot
+		fi
+		return 1
+	fi
+
 	board=$(board_name)
 	case $board in
 	cig,wf197)
-		# TODO Add image upgrade and bootconfig function
+		spi_nor_emmc_do_upgrade_bootconfig $1
 		;;
 	esac
+
+	dumpimage -b 0
+	do_flash_bootconfig "0:BOOTCONFIG"
 }

@@ -353,7 +353,7 @@ function wdev_update_disabled_vifs(wdev)
 
 		let name = vif.name;
 		if (enabled == false)
-			disabled[name] = true;
+			disabled[wdev] = true;
 		else if (ifindex != cache[name])
 			changed = true;
 
@@ -652,7 +652,6 @@ export function new(data, script, driver)
 	};
 	wdev_update_disabled_vifs(wdev);
 	wdev_config_init(wdev);
-	if (!handler_timer)
-		handler_timer = uloop.timer(1, run_next_handler);
+	handler_timer = uloop.timer(1, run_next_handler);
 	return proto(wdev, wdev_proto);
 };
