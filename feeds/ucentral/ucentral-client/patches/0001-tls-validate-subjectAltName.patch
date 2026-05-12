@@ -1,0 +1,144 @@
+tls: validate hostname against subjectAltName
+
+When the server certificate is presented, the client only matched the
+configured server hostname against the certificate's CN. Modern PKI
+practice (and RFC 6125) requires matching against subjectAltName DNS
+entries when present. With this patch the client accepts the connection
+if either the CN or any GEN_DNS entry of subjectAltName matches the
+configured server hostname (with the existing wildcard-prefix rule).
+
+Link libssl/libcrypto explicitly since we now call OpenSSL X509 APIs
+directly from main.c.
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -17,13 +17,15 @@ FIND_LIBRARY(ubus NAMES ubus)
+ FIND_LIBRARY(blobmsg_json NAMES blobmsg_json)
+ FIND_LIBRARY(ubox NAMES ubox)
+ FIND_LIBRARY(websockets NAMES websockets)
++FIND_LIBRARY(ssl NAMES ssl)
++FIND_LIBRARY(crypto NAMES crypto)
+ FIND_PATH(ubus_include_dir NAMES libubus.h)
+ FIND_PATH(libwebsockets_include_dir NAMES libwebsockets.h)
+ INCLUDE_DIRECTORIES(${ubox_include_dir} ${ubus_include_dir} ${libwebsockets_include_dir})
+ 
+ ADD_EXECUTABLE(ucentral ${SOURCES})
+ 
+-TARGET_LINK_LIBRARIES(ucentral ${ubox} ${ubus} ${websockets} ${blobmsg_json} z)
++TARGET_LINK_LIBRARIES(ucentral ${ubox} ${ubus} ${websockets} ${blobmsg_json} ${ssl} ${crypto} z)
+ 
+ INSTALL(TARGETS ucentral
+ 	RUNTIME DESTINATION sbin
+--- a/main.c
++++ b/main.c
+@@ -6,6 +6,9 @@
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ 
++#include <openssl/ssl.h>
++#include <openssl/x509v3.h>
++
+ #include <libubox/uloop.h>
+ 
+ #include "ucentral.h"
+@@ -82,24 +85,24 @@ get_reconnect_timeout(void)
+ }
+ 
+ static int
+-validate_CN(char *CN)
++match_hostname(const char *name)
+ {
+-	int CN_len;
++	int name_len;
+ 	int server_len;
+ 	int ret;
+ 
+-	if (!strcmp(client.server, CN))
++	if (!strcmp(client.server, name))
+ 		return 0;
+-	if (strncmp(CN, "*.", 2))
++	if (strncmp(name, "*.", 2))
+ 		return -1;
+ 
+-	CN_len = strlen(CN);
++	name_len = strlen(name);
+ 	server_len = strlen(client.server);
+ 
+-	if (server_len < CN_len)
++	if (server_len < name_len)
+ 		return -1;
+ 
+-	ret = strcmp(&CN[1], &client.server[server_len - CN_len + 1]);
++	ret = strcmp(&name[1], &client.server[server_len - name_len + 1]);
+ 
+ 	if (!ret)
+ 		ULOG_INFO("server is using a wildcard certificate\n");
+@@ -107,6 +110,57 @@ validate_CN(char *CN)
+ 	return ret;
+ }
+ 
++static int
++validate_SAN(struct lws *wsi)
++{
++	SSL *ssl = lws_get_ssl(wsi);
++	GENERAL_NAMES *sans;
++	X509 *cert;
++	int n, count;
++	int ret = -1;
++
++	if (!ssl)
++		return -1;
++
++	cert = SSL_get_peer_certificate(ssl);
++	if (!cert)
++		return -1;
++
++	sans = X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
++	if (!sans)
++		goto out;
++
++	count = sk_GENERAL_NAME_num(sans);
++	for (n = 0; n < count && ret; n++) {
++		const GENERAL_NAME *gn = sk_GENERAL_NAME_value(sans, n);
++		const unsigned char *data;
++		char dns[256];
++		int len;
++
++		if (gn->type != GEN_DNS)
++			continue;
++
++		data = ASN1_STRING_get0_data(gn->d.dNSName);
++		len = ASN1_STRING_length(gn->d.dNSName);
++		if (len <= 0 || len >= (int)sizeof(dns))
++			continue;
++		if (memchr(data, '\0', len))
++			continue;
++
++		memcpy(dns, data, len);
++		dns[len] = '\0';
++
++		ULOG_INFO(" Peer Cert SAN       : %s\n", dns);
++		if (!match_hostname(dns))
++			ret = 0;
++	}
++
++	GENERAL_NAMES_free(sans);
++out:
++	X509_free(cert);
++	return ret;
++}
++
+ static void
+ sul_connect_attempt(struct lws_sorted_usec_list *sul)
+ {
+@@ -231,8 +285,8 @@ callback_broker(struct lws *wsi, enum lws_callback_reasons reason,
+ 			if (!lws_tls_peer_cert_info(wsi, LWS_TLS_CERT_INFO_COMMON_NAME, &ci, sizeof(ci.ns.name)))
+ 				ULOG_INFO(" Peer Cert CN        : %s\n", ci.ns.name);
+ 
+-			if (validate_CN(ci.ns.name)) {
+-				ULOG_INFO("CN does not match");
++			if (match_hostname(ci.ns.name) && validate_SAN(wsi)) {
++				ULOG_INFO("hostname does not match (CN/SAN)");
+ 				bad_CN = 1;
+ 			//	lws_wsi_close(wsi, LWS_TO_KILL_SYNC);
+ 				return -1;
