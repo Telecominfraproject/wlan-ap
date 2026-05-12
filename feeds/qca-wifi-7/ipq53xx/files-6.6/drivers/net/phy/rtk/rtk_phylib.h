@@ -181,6 +181,7 @@ typedef struct rtk_macsec_port_info_s
 struct rtk_phy_priv {
     rtk_phylib_phy_t phytype;
     uint8 isBasePort;
+    uint8 limit_10g;  /* set if DTS mdio node has limit_rtlphy_10g_ablity */
     rt_phy_patch_db_t *patch;
     rtk_macsec_port_info_t *macsec;
 };

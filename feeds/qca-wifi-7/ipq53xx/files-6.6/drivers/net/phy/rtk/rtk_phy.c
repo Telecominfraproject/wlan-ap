@@ -5,6 +5,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/phy.h>
 #include <linux/ethtool.h>
 #include <linux/netdevice.h>
@@ -101,6 +102,9 @@ static int rtl826xb_get_features(struct phy_device *phydev)
     {
         /* support 10G modes */
         case RTK_PHYLIB_RTL8261N:
+            if (priv->limit_10g)
+                linkmode_clear_bit(ETHTOOL_LINK_MODE_10000baseT_Full_BIT,
+                           phydev->supported);
             break;
         default:
             linkmode_clear_bit(ETHTOOL_LINK_MODE_10000baseT_Full_BIT,
@@ -157,6 +161,15 @@ static int rtl826xb_probe(struct phy_device *phydev)
         }
     }
     priv->isBasePort = (phydev->drv->phy_id == REALTEK_PHY_ID_RTL8261N) ? (1) : (((phydev->mdio.addr % 4) == 0) ? (1) : (0));
+
+    if (phydev->drv->phy_id == REALTEK_PHY_ID_RTL8261N) {
+        struct device_node *mdio_node = phydev->mdio.dev.of_node
+                                        ? phydev->mdio.dev.of_node->parent
+                                        : NULL;
+        if (mdio_node && of_property_read_bool(mdio_node, "limit_rtlphy_10g_ablity"))
+            priv->limit_10g = 1;
+    }
+
     phydev->priv = priv;
 
     return 0;
