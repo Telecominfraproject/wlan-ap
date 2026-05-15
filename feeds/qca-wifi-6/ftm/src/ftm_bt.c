@@ -305,6 +305,13 @@ boolean qinsert_cmd(ftm_bt_pkt_type *ftm_bt_pkt)
     return FALSE;
   }
   newitem->next=NULL;
+  if(ftm_bt_pkt->ftm_hdr.cmd_data_len == 0 ||
+     ftm_bt_pkt->ftm_hdr.cmd_data_len > HC_VS_MAX_CMD_EVENT)
+  {
+    free(newitem);
+    ftm_log_send_msg(&event_buf_user_unknown_err[0],logsize);
+    return FALSE;
+  }
   newitem->data = (void *)malloc(ftm_bt_pkt->ftm_hdr.cmd_data_len);
   if(newitem->data == NULL)
   {
