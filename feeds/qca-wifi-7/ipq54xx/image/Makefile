@@ -3,6 +3,10 @@ include $(INCLUDE_DIR)/image.mk
 
 IMG_PREFIX:=$(VERSION_DIST_SANITIZED)-$(IMG_PREFIX_VERNUM)$(IMG_PREFIX_VERCODE)$(IMG_PREFIX_EXTRA)$(BOARD)
 
+ifeq ($(CONFIG_IO_COHERENCY),y)
+DTC_CFLAGS += -D __CONFIG_IO_COHERENCY__
+endif
+
 # default all platform image(fit) build 
 define Device/Default
   PROFILES = Default $$(DEVICE_NAME)
