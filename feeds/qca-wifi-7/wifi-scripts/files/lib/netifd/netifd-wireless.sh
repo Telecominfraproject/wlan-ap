@@ -285,6 +285,9 @@ wireless_vif_parse_encryption() {
 		wpa3*)
 			auth_type=eap2
 		;;
+		psk2-radius*)
+			auth_type=psk2-radius
+		;;
 		psk3-mixed*|sae-mixed*)
 			auth_type=psk-sae
 		;;
