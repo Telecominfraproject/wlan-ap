@@ -1772,24 +1772,6 @@ void hostapd_ubus_notify_authorized(struct hostapd_data *hapd, struct sta_info *
 	ubus_notify(ctx, &hapd->ubus.obj, "sta-authorized", b.head, -1);
 }
 
-void hostapd_ubus_notify_ft_finish(struct hostapd_data *hapd, struct sta_info *sta)
-{
-	char md[5];
-
-	if (!hapd->ubus.obj.has_subscribers)
-		return;
-
-	blob_buf_init(&b, 0);
-	blobmsg_add_macaddr(&b, "address", sta->addr);
-	blobmsg_add_string(&b, "ifname", hapd->conf->iface);
-	snprintf(md, sizeof(md), "%02x%02x",
-		 hapd->conf->mobility_domain[0],
-		 hapd->conf->mobility_domain[1]);
-	blobmsg_add_string(&b, "mobility-domain", md);
-
-	ubus_notify(ctx, &hapd->ubus.obj, "ft-finish", b.head, -1);
-}
-
 void hostapd_ubus_notify_beacon_report(
 	struct hostapd_data *hapd, const u8 *addr, u8 token, u8 rep_mode,
 	struct rrm_measurement_beacon_report *rep, size_t len)
