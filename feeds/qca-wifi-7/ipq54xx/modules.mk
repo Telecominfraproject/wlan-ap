@@ -2,7 +2,7 @@ define KernelPackage/bootconfig
   SUBMENU:=Other modules
   TITLE:=Bootconfig partition for failsafe
   KCONFIG:=CONFIG_BOOTCONFIG_PARTITION
-  FILES:=$(LINUX_DIR)/drivers/platform/ipq/bootconfig.ko@ge6.1
+  FILES:=$(LINUX_DIR)/drivers/platform/ipq/bootconfig.ko@ge6.6
   AUTOLOAD:=$(call AutoLoad,56,bootconfig,1)
 endef
 

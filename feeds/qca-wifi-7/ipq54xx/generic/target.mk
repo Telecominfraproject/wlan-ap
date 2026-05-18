@@ -22,4 +22,5 @@ DEFAULT_PACKAGES += \
 	uboot-2025-ipq5424-debug-mmc \
 	uboot-2025-ipq5424-debug-norplusmmc \
 	uboot-2025-ipq5424-debug-norplusnand \
-	uboot-2025-ipq5424-debug-nand
+	uboot-2025-ipq5424-debug-nand \
+	dumpimage
