@@ -95,6 +95,10 @@ hostapd_append_wpa_key_mgmt() {
 		owe)
 			append wpa_key_mgmt "OWE"
 		;;
+		psk2-radius)
+			append wpa_key_mgmt "WPA-PSK"
+			[ "${ieee80211r:-0}" -gt 0 ] && append wpa_key_mgmt "FT-PSK"
+		;;
 		sae-ext-key)
 			append wpa_key_mgmt "SAE-EXT-KEY"
 		;;
@@ -594,6 +598,83 @@ append_acct_server() {
 	[ -n "$acct_secret" ] && append bss_conf "acct_server_shared_secret=$acct_secret" "$N"
 }
 
+append_radius_server() {
+
+	json_get_vars \
+		auth_server auth_secret auth_port \
+		auth_server_secondary auth_secret_secondary auth_port_secondary \
+		dae_client dae_secret dae_port \
+		dynamic_ownip ownip radius_client_addr \
+		eap_reauth_period request_cui \
+		erp_domain mobility_domain \
+		fils_realm fils_dhcp
+
+	set_default dynamic_ownip 1
+
+	# legacy compatibility
+	[ -n "$auth_server" ] || json_get_var auth_server server
+	[ -n "$auth_port" ] || json_get_var auth_port port
+	[ -n "$auth_secret" ] || json_get_var auth_secret key
+
+	[ "$fils" -gt 0 ] && {
+		set_default erp_domain "$mobility_domain"
+		set_default erp_domain "$(echo "$ssid" | md5sum | head -c 8)"
+		set_default fils_realm "$erp_domain"
+
+		append bss_conf "erp_send_reauth_start=1" "$N"
+		append bss_conf "erp_domain=$erp_domain" "$N"
+		append bss_conf "fils_realm=$fils_realm" "$N"
+		append bss_conf "fils_cache_id=$(echo "$fils_realm" | md5sum | head -c 4)" "$N"
+
+		[ "$fils_dhcp" = "*" ] && {
+			json_get_values network network
+			fils_dhcp=
+			for net in $network; do
+				fils_dhcp="$(ifstatus "$net" | jsonfilter -e '@.data.dhcpserver')"
+				[ -n "$fils_dhcp" ] && break
+			done
+
+			[ -z "$fils_dhcp" -a -n "$network_bridge" -a -n "$network_ifname" ] && \
+				fils_dhcp="$(udhcpc -B -n -q -s /lib/netifd/dhcp-get-server.sh -t 1 -i "$network_ifname" 2>/dev/null)"
+		}
+		[ -n "$fils_dhcp" ] && append bss_conf "dhcp_server=$fils_dhcp" "$N"
+	}
+
+	set_default auth_port 1812
+	set_default auth_port_secondary 1812
+	set_default dae_port 3799
+	set_default request_cui 0
+
+	[ "$eap_server" -eq 0  -a -n "$auth_server" ] && {
+		json_for_each_item append_auth_server auth_server
+	}
+
+	[ -n "$auth_server_secondary" ] && {
+		append bss_conf "auth_server_addr=$auth_server_secondary" "$N"
+		append bss_conf "auth_server_port=$auth_port_secondary" "$N"
+		[ -n "$auth_secret_secondary" ] && \
+			append bss_conf "auth_server_shared_secret=$auth_secret_secondary" "$N"
+	}
+
+	[ "$request_cui" -gt 0 ] && append bss_conf "radius_request_cui=$request_cui" "$N"
+	[ -n "$eap_reauth_period" ] && append bss_conf "eap_reauth_period=$eap_reauth_period" "$N"
+
+	[ -n "$dae_client" -a -n "$dae_secret" ] && {
+		append bss_conf "radius_das_port=$dae_port" "$N"
+		append bss_conf "radius_das_client=$dae_client $dae_secret" "$N"
+	}
+	json_for_each_item append_radius_auth_req_attr radius_auth_req_attr
+
+	if [ -n "$ownip" ]; then
+		append bss_conf "own_ip_addr=$ownip" "$N"
+	elif [ "$dynamic_ownip" -gt 0 ]; then
+		append bss_conf "dynamic_own_ip_addr=$dynamic_ownip" "$N"
+	fi
+
+	[ -n "$radius_client_addr" ] && append bss_conf "radius_client_addr=$radius_client_addr" "$N"
+	[ "$macfilter" = radius ] && append bss_conf "macaddr_acl=2" "$N"
+}
+
 hostapd_set_bss_options() {
 	local var="$1"
 	local phy="$2"
@@ -717,6 +798,11 @@ hostapd_set_bss_options() {
 				set_default sae_pwe 2
 			fi
 		;;
+		psk2-radius)
+			set_default ieee80211w 1
+			set_default sae_require_mfp 0
+			[ "$ppsk" -eq 0 ] && set_default sae_pwe 4
+                ;;
 	esac
 
 	#rsn override used for sae encryption only
@@ -780,6 +866,7 @@ hostapd_set_bss_options() {
 				return 1
 			fi
 			[ -z "$wpa_psk_file" ] && set_default wpa_psk_file /var/run/hostapd-"$ifname".psk
+
 			[ -n "$wpa_psk_file" ] && {
 				[ -e "$wpa_psk_file" ] || touch "$wpa_psk_file"
 				append bss_conf "wpa_psk_file=$wpa_psk_file" "$N"
@@ -865,6 +952,11 @@ hostapd_set_bss_options() {
 			hostapd_append_wep_key bss_conf
 			append bss_conf "wep_default_key=$wep_keyidx" "$N"
 			[ -n "$wep_rekey" ] && append bss_conf "wep_rekey_period=$wep_rekey" "$N"
+		;;
+		psk2-radius)
+			append bss_conf "wpa_psk_radius=3" "$N"
+			append_radius_server
+			vlan_possible=1
 		;;
 	esac
 
