@@ -366,6 +366,7 @@ drv_morse_setup() {
 	if [ -n "$ifname" ]; then
 		morse_cli -i $ifname ampdu $ampdu
 		[ -n "$bss_color" ] && morse_cli -i $ifname bsscolor $bss_color
+		morsectrl -i $ifname edconfig energy ignore || logger -t morse "edconfig energy ignore failed"
 	fi
 
 	if [ -n "$forced_listen_interval" ]
