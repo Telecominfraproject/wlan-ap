@@ -1,0 +1,191 @@
+From 6ab36677fa236fcba7875f4d4583fd4b7047bad2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Linus=20L=C3=BCssing?= <linus.luessing@c0d3.blue>
+Date: Thu, 15 Jan 2026 14:21:23 +0100
+Subject: [PATCH] batman-adv: avoid adding bridge VLAN IDs through
+ ndo_vlan_rx_add_vid()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Linux bridge by default adds the PVID of a port (default VID 1) and
+by that triggers our ndo_vlan_rx_add_vid() handler. The PVID is
+for ingress traffic from bat0 to the bridge and other bridge ports.
+However this makes no statement about what is received or send on bat0
+itself, bat0 might as well be an untagged access port, even with a PVID
+configured. Therefore ignoring here when a bridge is involved.
+
+Also, similarly a "bridge vlan add vid 42 dev bat0 untagged" would call
+this handler with VID 42. Even though we wouldn't be interested in this
+VLAN as its traffic would be untagged on our side.
+
+The issue is that any extra VLAN currently increases our own
+OGM protocol overhead quite a bit, so we want to avoid that
+by only adding VLANs that we are sure someone will be using.
+So only add VLANs through snooping of actual, VLAN tagged
+traffic, not through kernel internal network events
+if we have a bridge on top.
+
+Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
+[antonio@mandelbit.com: backported to v2022.1]
+Signed-off-by: Antonio Quartulli <antonio@mandelbit.com>
+Signed-off-by: Firas Shaari <firas@80211networks.com>
+---
+ net/batman-adv/multicast.c      | 29 ++-------------------
+ net/batman-adv/soft-interface.c | 46 +++++++++++++++++++++++++++++++++
+ net/batman-adv/soft-interface.h |  1 +
+ 3 files changed, 49 insertions(+), 27 deletions(-)
+
+diff --git a/net/batman-adv/multicast.c b/net/batman-adv/multicast.c
+index 4a6079db..541c0c4d 100644
+--- a/net/batman-adv/multicast.c
++++ b/net/batman-adv/multicast.c
+@@ -72,31 +72,6 @@ static void batadv_mcast_start_timer(struct batadv_priv *bat_priv)
+ 			   msecs_to_jiffies(BATADV_MCAST_WORK_PERIOD));
+ }
+ 
+-/**
+- * batadv_mcast_get_bridge() - get the bridge on top of the softif if it exists
+- * @soft_iface: netdev struct of the mesh interface
+- *
+- * If the given soft interface has a bridge on top then the refcount
+- * of the according net device is increased.
+- *
+- * Return: NULL if no such bridge exists. Otherwise the net device of the
+- * bridge.
+- */
+-static struct net_device *batadv_mcast_get_bridge(struct net_device *soft_iface)
+-{
+-	struct net_device *upper = soft_iface;
+-
+-	rcu_read_lock();
+-	do {
+-		upper = netdev_master_upper_dev_get_rcu(upper);
+-	} while (upper && !netif_is_bridge_master(upper));
+-
+-	dev_hold(upper);
+-	rcu_read_unlock();
+-
+-	return upper;
+-}
+-
+ /**
+  * batadv_mcast_mla_rtr_flags_softif_get_ipv4() - get mcast router flags from
+  *  node for IPv4
+@@ -258,7 +233,7 @@ batadv_mcast_mla_flags_get(struct batadv_priv *bat_priv)
+ 	struct batadv_mcast_mla_flags mla_flags;
+ 	struct net_device *bridge;
+ 
+-	bridge = batadv_mcast_get_bridge(dev);
++	bridge = batadv_softif_get_bridge(dev);
+ 
+ 	memset(&mla_flags, 0, sizeof(mla_flags));
+ 	mla_flags.enabled = 1;
+@@ -499,7 +474,7 @@ batadv_mcast_mla_softif_get(struct net_device *dev,
+ 			    struct hlist_head *mcast_list,
+ 			    struct batadv_mcast_mla_flags *flags)
+ {
+-	struct net_device *bridge = batadv_mcast_get_bridge(dev);
++	struct net_device *bridge = batadv_softif_get_bridge(dev);
+ 	int ret4, ret6 = 0;
+ 
+ 	if (bridge)
+diff --git a/net/batman-adv/soft-interface.c b/net/batman-adv/soft-interface.c
+index a04b4978..90501c09 100644
+--- a/net/batman-adv/soft-interface.c
++++ b/net/batman-adv/soft-interface.c
+@@ -676,6 +676,31 @@ static void batadv_softif_destroy_vlan_own(struct batadv_priv *bat_priv,
+ 			       "vlan interface destroyed", false);
+ }
+ 
++/**
++ * batadv_softif_get_bridge() - get the bridge on top of the softif if it exists
++ * @mesh_iface: netdev struct of the mesh interface
++ *
++ * If the given mesh interface has a bridge on top then the refcount
++ * of the according net device is increased.
++ *
++ * Return: NULL if no such bridge exists. Otherwise the net device of the
++ * bridge.
++ */
++struct net_device *batadv_softif_get_bridge(struct net_device *mesh_iface)
++{
++	struct net_device *upper = mesh_iface;
++
++	rcu_read_lock();
++	do {
++		upper = netdev_master_upper_dev_get_rcu(upper);
++	} while (upper && !netif_is_bridge_master(upper));
++
++	dev_hold(upper);
++	rcu_read_unlock();
++
++	return upper;
++}
++
+ /**
+  * batadv_interface_add_vid() - ndo_add_vid API implementation
+  * @dev: the netdev of the mesh interface
+@@ -691,6 +716,7 @@ static int batadv_interface_add_vid(struct net_device *dev, __be16 proto,
+ 				    unsigned short vid)
+ {
+ 	struct batadv_priv *bat_priv = netdev_priv(dev);
++	struct net_device *bridge;
+ 
+ 	/* only 802.1Q vlans are supported.
+ 	 * batman-adv does not know how to handle other types
+@@ -698,6 +724,20 @@ static int batadv_interface_add_vid(struct net_device *dev, __be16 proto,
+ 	if (proto != htons(ETH_P_8021Q))
+ 		return -EINVAL;
+ 
++	/* The Linux bridge adds the PVID of a port (default VID 1) and
++	 * triggers this handler. The PVID is for ingress traffic from
++	 * bat0 to the bridge and other bridge ports. However this makes no
++	 * statement about what is received or send on bat0 itself, bat0
++	 * might as well be an untagged access port, even with a PVID
++	 * configured. Therefore ignoring here when a bridge is involved.
++	 * Instead learn VLANs on the fly from traffic.
++	 */
++	bridge = batadv_softif_get_bridge(dev);
++	if (bridge) {
++		dev_put(bridge);
++		return 0;
++	}
++
+ 	vid |= BATADV_VLAN_HAS_TAG;
+ 
+ 	return batadv_softif_create_vlan_own(bat_priv, vid);
+@@ -719,6 +759,7 @@ static int batadv_interface_kill_vid(struct net_device *dev, __be16 proto,
+ 				     unsigned short vid)
+ {
+ 	struct batadv_priv *bat_priv = netdev_priv(dev);
++	struct net_device *bridge;
+ 
+ 	/* only 802.1Q vlans are supported. batman-adv does not know how to
+ 	 * handle other types
+@@ -726,6 +767,11 @@ static int batadv_interface_kill_vid(struct net_device *dev, __be16 proto,
+ 	if (proto != htons(ETH_P_8021Q))
+ 		return -EINVAL;
+ 
++	bridge = batadv_softif_get_bridge(dev);
++	if (bridge) {
++		dev_put(bridge);
++		return 0;
++	}
+ 
+ 	batadv_softif_destroy_vlan_own(bat_priv, vid | BATADV_VLAN_HAS_TAG);
+ 	return 0;
+diff --git a/net/batman-adv/soft-interface.h b/net/batman-adv/soft-interface.h
+index 6ce30fe9..b2784ecf 100644
+--- a/net/batman-adv/soft-interface.h
++++ b/net/batman-adv/soft-interface.h
+@@ -19,6 +19,7 @@ int batadv_skb_head_push(struct sk_buff *skb, unsigned int len);
+ void batadv_interface_rx(struct net_device *soft_iface,
+ 			 struct sk_buff *skb, int hdr_size,
+ 			 struct batadv_orig_node *orig_node);
++struct net_device *batadv_softif_get_bridge(struct net_device *soft_iface);
+ bool batadv_softif_is_valid(const struct net_device *net_dev);
+ extern struct rtnl_link_ops batadv_link_ops;
+ int batadv_softif_create_vlan_own(struct batadv_priv *bat_priv,
+-- 
+2.52.0
+
