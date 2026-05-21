@@ -1,0 +1,248 @@
+From f142435963da7d4c32c64f3f7c59b3dfaaa962fb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Linus=20L=C3=BCssing?= <linus.luessing@c0d3.blue>
+Date: Thu, 15 Jan 2026 14:13:49 +0100
+Subject: [PATCH] batman-adv: limit number of learned VLANs from bridged-in
+ clients
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Currently with batman-adv compatibility version 15 each added VLAN
+increases the OGM protocol overhead of this node considerably. Therefore
+adding a configurable knob to limit the number of learned, snooped VLANs
+from traffic from bridged-in clients.
+
+There are currently also still issues in the BLA code that would
+temporarily break any broadcast transmissions with every newly learned
+VLAN. Therefore setting the default limit for externally learned VLANs to
+zero for now.
+
+Signed-off-by: Linus Lüssing <linus.luessing@c0d3.blue>
+[antonio@mandelbit.com: backported to v2022.1]
+Signed-off-by: Antonio Quartulli <antonio@mandelbit.com>
+Signed-off-by: Firas Shaari <firas@80211networks.com>
+---
+ include/uapi/linux/batman_adv.h    |  6 ++++++
+ net/batman-adv/netlink.c           | 15 ++++++++++++++
+ net/batman-adv/soft-interface.c    | 33 ++++++++++++++++++++++++++----
+ net/batman-adv/soft-interface.h    |  4 ++--
+ net/batman-adv/translation-table.c |  3 ++-
+ net/batman-adv/types.h             |  6 ++++++
+ 6 files changed, 60 insertions(+), 7 deletions(-)
+
+diff --git a/include/uapi/linux/batman_adv.h b/include/uapi/linux/batman_adv.h
+index 35dc016c..44018dd6 100644
+--- a/include/uapi/linux/batman_adv.h
++++ b/include/uapi/linux/batman_adv.h
+@@ -481,6 +481,12 @@ enum batadv_nl_attrs {
+ 	 */
+ 	BATADV_ATTR_MULTICAST_FANOUT,
+ 
++	/**
++	 * @BATADV_ATTR_VLAN_DYN_MAX: defines the maximum number of allowed
++	 * learned VLANs from bridged-in clients.
++	 */
++	BATADV_ATTR_VLAN_DYN_MAX,
++
+ 	/* add attributes above here, update the policy in netlink.c */
+ 
+ 	/**
+diff --git a/net/batman-adv/netlink.c b/net/batman-adv/netlink.c
+index 07f21cdb..afbd1446 100644
+--- a/net/batman-adv/netlink.c
++++ b/net/batman-adv/netlink.c
+@@ -131,6 +131,7 @@ static const struct nla_policy batadv_netlink_policy[NUM_BATADV_ATTR] = {
+ 	[BATADV_ATTR_MCAST_FLAGS]		= { .type = NLA_U32 },
+ 	[BATADV_ATTR_MCAST_FLAGS_PRIV]		= { .type = NLA_U32 },
+ 	[BATADV_ATTR_VLANID]			= { .type = NLA_U16 },
++	[BATADV_ATTR_VLAN_DYN_MAX]		= { .type = NLA_U16 },
+ 	[BATADV_ATTR_AGGREGATED_OGMS_ENABLED]	= { .type = NLA_U8 },
+ 	[BATADV_ATTR_AP_ISOLATION_ENABLED]	= { .type = NLA_U8 },
+ 	[BATADV_ATTR_ISOLATION_MARK]		= { .type = NLA_U32 },
+@@ -359,6 +360,10 @@ static int batadv_netlink_mesh_fill(struct sk_buff *msg,
+ 			atomic_read(&bat_priv->orig_interval)))
+ 		goto nla_put_failure;
+ 
++	if (nla_put_u16(msg, BATADV_ATTR_VLAN_DYN_MAX,
++			bat_priv->softif_vlan_dyn_max))
++		goto nla_put_failure;
++
+ 	batadv_hardif_put(primary_if);
+ 
+ 	genlmsg_end(msg, hdr);
+@@ -613,6 +618,16 @@ static int batadv_netlink_set_mesh(struct sk_buff *skb, struct genl_info *info)
+ 		atomic_set(&bat_priv->orig_interval, orig_interval);
+ 	}
+ 
++	if (info->attrs[BATADV_ATTR_VLAN_DYN_MAX]) {
++		u16 vlan_dyn_max;
++
++		attr = info->attrs[BATADV_ATTR_VLAN_DYN_MAX];
++		vlan_dyn_max = nla_get_u16(attr);
++		vlan_dyn_max = min_t(u16, vlan_dyn_max, VLAN_N_VID);
++
++		bat_priv->softif_vlan_dyn_max = vlan_dyn_max;
++	}
++
+ 	batadv_netlink_notify_mesh(bat_priv);
+ 
+ 	return 0;
+diff --git a/net/batman-adv/soft-interface.c b/net/batman-adv/soft-interface.c
+index 079d030e..a04b4978 100644
+--- a/net/batman-adv/soft-interface.c
++++ b/net/batman-adv/soft-interface.c
+@@ -23,6 +23,7 @@
+ #include <linux/kref.h>
+ #include <linux/list.h>
+ #include <linux/lockdep.h>
++#include <linux/net.h>
+ #include <linux/netdevice.h>
+ #include <linux/netlink.h>
+ #include <linux/percpu.h>
+@@ -46,6 +47,7 @@
+ #include "distributed-arp-table.h"
+ #include "gateway_client.h"
+ #include "hard-interface.h"
++#include "log.h"
+ #include "multicast.h"
+ #include "network-coding.h"
+ #include "send.h"
+@@ -550,13 +552,16 @@ struct batadv_softif_vlan *batadv_softif_vlan_get(struct batadv_priv *bat_priv,
+  * batadv_softif_create_vlan() - create a softif vlan struct
+  * @bat_priv: the bat priv with all the soft interface information
+  * @vid: the VLAN identifier
++ * @own: VLAN was not detected via bridged in traffic
+  *
+  * Return: a pointer to a newly allocated softif vlan struct on success, NULL
+  * otherwise.
+  */
+ static struct batadv_softif_vlan *
+-batadv_softif_create_vlan(struct batadv_priv *bat_priv, unsigned short vid)
++batadv_softif_create_vlan(struct batadv_priv *bat_priv, unsigned short vid,
++			  bool own)
+ {
++	unsigned short vlan_dyn_max, vlan_dyn_count;
+ 	struct batadv_softif_vlan *vlan;
+ 
+ 	spin_lock_bh(&bat_priv->softif_vlan_list_lock);
+@@ -567,6 +572,19 @@ batadv_softif_create_vlan(struct batadv_priv *bat_priv, unsigned short vid)
+ 		return vlan;
+ 	}
+ 
++	vlan_dyn_max = bat_priv->softif_vlan_dyn_max;
++	vlan_dyn_count = bat_priv->softif_vlan_dyn_count;
++
++	if (vid & BATADV_VLAN_HAS_TAG && !own &&
++	    vlan_dyn_max <= vlan_dyn_count) {
++		spin_unlock_bh(&bat_priv->softif_vlan_list_lock);
++
++		net_ratelimited_function(batadv_info, bat_priv->soft_iface,
++					 "not adding VLAN %d, already learned %hu VID(s)\n",
++					 batadv_print_vid(vid), vlan_dyn_max);
++		return NULL;
++	}
++
+ 	vlan = kzalloc(sizeof(*vlan), GFP_ATOMIC);
+ 	if (!vlan) {
+ 		spin_unlock_bh(&bat_priv->softif_vlan_list_lock);
+@@ -582,6 +600,9 @@ batadv_softif_create_vlan(struct batadv_priv *bat_priv, unsigned short vid)
+ 
+ 	atomic_set(&vlan->ap_isolation, 0);
+ 
++	if (vid & BATADV_VLAN_HAS_TAG && !own)
++		bat_priv->softif_vlan_dyn_count++;
++
+ 	hlist_add_head_rcu(&vlan->list, &bat_priv->softif_vlan_list);
+ 	spin_unlock_bh(&bat_priv->softif_vlan_list_lock);
+ 
+@@ -591,20 +612,22 @@ batadv_softif_create_vlan(struct batadv_priv *bat_priv, unsigned short vid)
+ /**
+  * batadv_softif_vlan_get_or_create() - retrieve or create a softif vlan struct
+  * @bat_priv: the batpriv ith all the mesh interface information
++ * @addr: the MAC address of the client to add
+  * @vid: the VLAN identifier
++ * @own: VLAN was not detected via bridged in traffic
+  *
+  * Return : the softif vlan struct if found or created, NULL otherwise
+  */
+ struct batadv_softif_vlan *
+-batadv_softif_vlan_get_or_create(struct batadv_priv *bat_priv,
+-				 unsigned short vid)
++batadv_softif_vlan_get_or_create(struct batadv_priv *bat_priv, const u8* addr,
++				 unsigned short vid, bool own)
+ {
+ 	struct batadv_softif_vlan *vlan = batadv_softif_vlan_get(bat_priv, vid);
+ 
+ 	if (vlan)
+ 		return vlan;
+ 
+-	return batadv_softif_create_vlan(bat_priv, vid);
++	return batadv_softif_create_vlan(bat_priv, vid, own);
+ }
+ 
+ /**
+@@ -805,6 +828,8 @@ static int batadv_softif_init_late(struct net_device *dev)
+ 	bat_priv->tt.last_changeset_len = 0;
+ 	bat_priv->isolation_mark = 0;
+ 	bat_priv->isolation_mark_mask = 0;
++	bat_priv->softif_vlan_dyn_max = 20;
++	bat_priv->softif_vlan_dyn_count = 0;
+ 
+ 	/* randomize initial seqno to avoid collision */
+ 	get_random_bytes(&random_seqno, sizeof(random_seqno));
+diff --git a/net/batman-adv/soft-interface.h b/net/batman-adv/soft-interface.h
+index 7050ccd3..6ce30fe9 100644
+--- a/net/batman-adv/soft-interface.h
++++ b/net/batman-adv/soft-interface.h
+@@ -27,8 +27,8 @@ void batadv_softif_vlan_release(struct kref *ref);
+ struct batadv_softif_vlan *batadv_softif_vlan_get(struct batadv_priv *bat_priv,
+ 						  unsigned short vid);
+ struct batadv_softif_vlan *
+-batadv_softif_vlan_get_or_create(struct batadv_priv *bat_priv,
+-				 unsigned short vid);
++batadv_softif_vlan_get_or_create(struct batadv_priv *bat_priv, const u8* addr,
++				 unsigned short vid, bool own);
+ 
+ /**
+  * batadv_softif_vlan_put() - decrease the vlan object refcounter and
+diff --git a/net/batman-adv/translation-table.c b/net/batman-adv/translation-table.c
+index a66be4f7..a88b462c 100644
+--- a/net/batman-adv/translation-table.c
++++ b/net/batman-adv/translation-table.c
+@@ -635,6 +635,7 @@ static void batadv_tt_global_free(struct batadv_priv *bat_priv,
+ int batadv_tt_local_add(struct net_device *soft_iface, const u8 *addr,
+ 			unsigned short vid, int ifindex, u32 mark)
+ {
++	bool own = (ifindex == BATADV_NULL_IFINDEX) ? true : false;
+ 	struct batadv_priv *bat_priv = netdev_priv(soft_iface);
+ 	struct batadv_tt_local_entry *tt_local;
+ 	struct batadv_tt_global_entry *tt_global = NULL;
+@@ -710,7 +711,7 @@ int batadv_tt_local_add(struct net_device *soft_iface, const u8 *addr,
+ 	}
+ 
+ 	/* increase the refcounter of the related vlan */
+-	vlan = batadv_softif_vlan_get_or_create(bat_priv, vid);
++	vlan = batadv_softif_vlan_get_or_create(bat_priv, addr, vid, own);
+ 	if (!vlan) {
+ 		kmem_cache_free(batadv_tl_cache, tt_local);
+ 		tt_local = NULL;
+diff --git a/net/batman-adv/types.h b/net/batman-adv/types.h
+index ca9449ec..416b4e2f 100644
+--- a/net/batman-adv/types.h
++++ b/net/batman-adv/types.h
+@@ -1695,6 +1695,12 @@ struct batadv_priv {
+ 	/** @softif_vlan_list_lock: lock protecting softif_vlan_list */
+ 	spinlock_t softif_vlan_list_lock;
+ 
++	/** @softif_vlan_dyn_max: maximum number of allowed learned VLANs */
++	unsigned short softif_vlan_dyn_max;
++
++	/** @softif_vlan_dyn_count: current number of learned VLANs */
++	unsigned short softif_vlan_dyn_count;
++
+ #ifdef CONFIG_BATMAN_ADV_BLA
+ 	/** @bla: bridge loop avoidance data */
+ 	struct batadv_priv_bla bla;
+-- 
+2.52.0
+
