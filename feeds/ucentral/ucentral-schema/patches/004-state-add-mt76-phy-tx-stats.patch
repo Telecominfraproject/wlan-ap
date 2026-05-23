@@ -1,0 +1,125 @@
+From: Firas Shaari <firas@80211networks.com>
+Subject: [PATCH] state: bridge SSID tx_failed/tx_retries gap on mt76 and ath11k
+
+mt76 (mt7621/mt7915) and ath11k (QSDK) drivers on the wlan-ap kernel do
+not propagate per-STA TX status to mac80211. As a result, the Kafka
+state payload always reports
+
+    interfaces[].ssids[].counters.tx_failed       = 0
+    interfaces[].ssids[].counters.tx_retries      = 0
+    interfaces[].ssids[].delta_counters.tx_failed = 0
+    interfaces[].ssids[].delta_counters.tx_retries = 0
+
+even under heavy traffic, leaving cloud consumers with no TX-failure
+signal to work with.
+
+Each driver does count semantically-comparable RF-only retry/fail data
+in its own debugfs interface:
+
+  mt76 reads: /sys/kernel/debug/ieee80211/<phy>/mt76/tx_stats
+              BA miss count  (unicast block-ACK miss count)
+
+  ath11k reads: /sys/kernel/debug/ieee80211/<phy>/ath11k/htt_stats
+                tx_xretry from HTT_TX_PDEV_STATS_CMN_TLV (type 1)
+                triggered by writing 1 to .../ath11k/htt_stats_type
+                (excess-retry count -- frames whose ACK never came back)
+
+Both counters represent the same thing -- unicast frames that needed a
+retry because the receiver never ack-ed -- so the values are directly
+comparable across driver families.
+
+The phy-aggregate count is then projected onto each VAP on the radio,
+weighted by the VAPs tx_packets share. A VAP with no traffic gets
+nothing; a VAP carrying most of the load takes most of the failure
+budget. The existing generate_deltas pipeline then populates
+ssid.delta_counters from those values unchanged. No schema additions,
+no new fields -- the fields that consumers already key off just stop
+being zero.
+
+Verified end-to-end on:
+  - yuncore_ax820  (ramips/mt7621, mt7915e)   -> mt76 BA miss
+  - yuncore_fap655 (ipq50xx, ath11k QSDK)     -> ath11k tx_xretry
+
+Both APs show monotonically increasing nonzero tx_failed and tx_retries
+on their SSID counters and delta_counters across consecutive samples in
+the live Kafka state topic.
+
+tx_retries is set equal to the per-SSID failure value (neither driver
+exposes a separate per-frame retry counter at this level).
+associations[].tx_failed/tx_retries remain 0 -- those need a driver-
+level fix.
+
+Signed-off-by: Firas Shaari <firas@80211networks.com>
+---
+--- a/system/state.uc	2026-05-23 16:02:34.670558527 -0400
++++ b/system/state.uc	2026-05-23 17:37:29.774598108 -0400
+@@ -567,6 +567,69 @@
+ 				push(radio.survey, v);
+ 	}
+ 	delete radio.in_use;
++
++	/* OpenWiFi: bridge SSID tx_failed/tx_retries gap on hardware that doesn'''t
++	 * propagate per-STA TX status to mac80211 (mt76 on mt7621/mt7915, ath11k on
++	 * QSDK). state.interfaces[].ssids[].(counters|delta_counters).tx_failed and
++	 * .tx_retries always read 0 from RTNL on those drivers. Each driver does
++	 * count comparable RF-only retry/fail counters in its own debugfs:
++	 *
++	 *   mt76:    /sys/kernel/debug/ieee80211/<phy>/mt76/tx_stats
++	 *            BA miss count                                  (unicast BA-miss)
++	 *
++	 *   ath11k:  /sys/kernel/debug/ieee80211/<phy>/ath11k/htt_stats
++	 *            tx_xretry (HTT_TX_PDEV_STATS_CMN_TLV type 1)   (TX excess retry)
++	 *            -- triggered by writing 1 to htt_stats_type first
++	 *
++	 * Both counters represent the same thing: unicast frames whose ACK didn'''t
++	 * arrive and triggered a retry. Project the phy-aggregate count onto each
++	 * VAP on the radio, weighted by tx_packets share so heavier-traffic VAPs
++	 * absorb the larger fraction of failures.
++	 */
++	if (length(data.interfaces) && data.interfaces[0].ifname) {
++		let ifname = data.interfaces[0].ifname;
++		let phyname_raw = fs.readfile('/sys/class/net/' + ifname + '/phy80211/name');
++		let phyname = phyname_raw ? trim(phyname_raw) : null;
++		let phy_fail = 0;
++		if (phyname) {
++			let mt76_raw = fs.readfile('/sys/kernel/debug/ieee80211/' + phyname + '/mt76/tx_stats');
++			if (mt76_raw) {
++				let m = match(mt76_raw, /BA miss count: ([0-9]+)/);
++				if (m) phy_fail = +m[1];
++			} else {
++				let ath_type = fs.open('/sys/kernel/debug/ieee80211/' + phyname + '/ath11k/htt_stats_type', 'w');
++				if (ath_type) {
++					ath_type.write('1
++');
++					ath_type.close();
++					sleep(100);
++					let htt_raw = fs.readfile('/sys/kernel/debug/ieee80211/' + phyname + '/ath11k/htt_stats');
++					if (htt_raw) {
++						let m = match(htt_raw, /tx_xretry = ([0-9]+)/);
++						if (m) phy_fail = +m[1];
++					}
++				}
++			}
++		}
++
++		if (phy_fail > 0) {
++			let total_tx = 0;
++			for (let v in data.interfaces) {
++				if (ports && ports[v.ifname] && ports[v.ifname].counters)
++					total_tx += +ports[v.ifname].counters.tx_packets || 0;
++			}
++			for (let v in data.interfaces) {
++				if (!ports || !ports[v.ifname] || !ports[v.ifname].counters)
++					continue;
++				let vap_tx = +ports[v.ifname].counters.tx_packets || 0;
++				let attributed = total_tx > 0
++					? int(phy_fail * vap_tx / total_tx)
++					: int(phy_fail / length(data.interfaces));
++				ports[v.ifname].counters.tx_failed = (+ports[v.ifname].counters.tx_failed || 0) + attributed;
++				ports[v.ifname].counters.tx_retries = (+ports[v.ifname].counters.tx_retries || 0) + attributed;
++			}
++		}
++	}
+ 	push(state.radios, radio);
+ }
+ if (!length(state.radios))
