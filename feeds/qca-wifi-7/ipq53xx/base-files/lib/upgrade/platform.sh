@@ -271,6 +271,7 @@ platform_do_upgrade() {
 	cig,wf189w|\
 	cig,wf189h|\
 	cig,wf189|\
+	asterfusion,AP7330|\
 	emplus,wap7635)
 		if [ -f /proc/boot_info/bootconfig0/rootfs/upgradepartition ]; then
 			CI_UBIPART="$(cat /proc/boot_info/bootconfig0/rootfs/upgradepartition)"
@@ -324,7 +325,6 @@ platform_do_upgrade() {
 		sonicfi_dualimage_check
 		nand_upgrade_tar "$1"
 		;;
-	asterfusion,AP7330|\
 	zyxel,nwa130be|\
 	zyxel,nwa210be|\
 	zyxel,nwa50be)
