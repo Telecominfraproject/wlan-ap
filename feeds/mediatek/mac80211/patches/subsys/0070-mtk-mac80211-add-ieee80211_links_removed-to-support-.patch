@@ -1,0 +1,244 @@
+From 99b42710f8ceba94b480f20fd69f9a1d2fc866be Mon Sep 17 00:00:00 2001
+From: Shayne Chen <shayne.chen@mediatek.com>
+Date: Fri, 3 May 2024 17:51:37 +0800
+Subject: [PATCH 070/137] mtk: mac80211: add ieee80211_links_removed() to
+ support MLD AP reconf
+
+Add ieee80211_links_removed() to let driver notify upper layers for MLD AP
+reconfiguration. Also modify some parts to prevent from removing whole
+STA while removing a link.
+
+Signed-off-by: Shayne Chen <shayne.chen@mediatek.com>
+---
+ include/net/mac80211.h     |  8 ++++++++
+ net/mac80211/cfg.c         | 25 +++++++++++++++++++------
+ net/mac80211/ieee80211_i.h |  4 ++++
+ net/mac80211/iface.c       | 19 +++++++++++++++++++
+ net/mac80211/sta_info.c    |  6 ++++++
+ net/wireless/ap.c          | 18 +++++++++++++-----
+ net/wireless/nl80211.c     |  9 ++++++---
+ 7 files changed, 75 insertions(+), 14 deletions(-)
+
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index e3648d5f..1bdc150b 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -8023,6 +8023,14 @@ int ieee80211_emulate_switch_vif_chanctx(struct ieee80211_hw *hw,
+  */
+ bool ieee80211_vif_nan_started(struct ieee80211_vif *vif);
+ 
++/**
++ * ieee80211_links_removed - notify removed links
++ * @vif: interface to be notified
++ * @removed_links: links bitmap being removed
++ *
++ */
++void ieee80211_links_removed(struct ieee80211_vif *vif, u16 removed_links);
++
+ /**
+  * ieee80211_get_scanning - get scanning bitmask
+  *
+diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
+index 3b439490..7a5f826e 100644
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -1916,10 +1916,12 @@ static int ieee80211_stop_ap(struct wiphy *wiphy, struct net_device *dev,
+ 	RCU_INIT_POINTER(link_conf->tx_bss_conf, NULL);
+ 
+ 	link_conf->enable_beacon = false;
+-	sdata->beacon_rate_set = false;
+-	sdata->vif.cfg.ssid_len = 0;
+-	sdata->vif.cfg.s1g = false;
+-	clear_bit(SDATA_STATE_OFFCHANNEL_BEACON_STOPPED, &sdata->state);
++	if (ieee80211_num_beaconing_links(sdata) <= 1) {
++		sdata->beacon_rate_set = false;
++		sdata->vif.cfg.ssid_len = 0;
++		sdata->vif.cfg.s1g = false;
++		clear_bit(SDATA_STATE_OFFCHANNEL_BEACON_STOPPED, &sdata->state);
++	}
+ 	ieee80211_link_info_change_notify(sdata, link,
+ 					  BSS_CHANGED_BEACON_ENABLED);
+ 
+@@ -1934,8 +1936,10 @@ static int ieee80211_stop_ap(struct wiphy *wiphy, struct net_device *dev,
+ 	drv_stop_ap(sdata->local, sdata, link_conf);
+ 
+ 	/* free all potentially still buffered bcast frames */
+-	local->total_ps_buffered -= skb_queue_len(&sdata->u.ap.ps.bc_buf);
+-	ieee80211_purge_tx_queue(&local->hw, &sdata->u.ap.ps.bc_buf);
++	if (ieee80211_num_beaconing_links(sdata) <= 1) {
++		local->total_ps_buffered -= skb_queue_len(&sdata->u.ap.ps.bc_buf);
++		ieee80211_purge_tx_queue(&local->hw, &sdata->u.ap.ps.bc_buf);
++	}
+ 
+ 	ieee80211_link_copy_chanctx_to_vlans(link, true);
+ 	ieee80211_link_release_channel(link);
+@@ -5663,6 +5667,15 @@ ieee80211_skip_cac(struct wireless_dev *wdev, unsigned int link_id)
+ 	}
+ }
+ 
++void ieee80211_links_removed(struct ieee80211_vif *vif, u16 removed_links)
++{
++	struct ieee80211_sub_if_data *sdata = vif_to_sdata(vif);
++
++	sdata->removed_links = removed_links;
++	wiphy_work_queue(sdata->local->hw.wiphy, &sdata->links_removed_work);
++}
++EXPORT_SYMBOL_GPL(ieee80211_links_removed);
++
+ const struct cfg80211_ops mac80211_config_ops = {
+ 	.add_virtual_intf = ieee80211_add_iface,
+ 	.del_virtual_intf = ieee80211_del_iface,
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 7fdc1449..9f9cd589 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1213,6 +1213,10 @@ struct ieee80211_sub_if_data {
+ 
+ 	u16 restart_active_links;
+ 
++	/* for MLD reconf of affliated AP removal */
++	struct wiphy_work links_removed_work;
++	u16 removed_links;
++
+ #ifdef CPTCFG_MAC80211_DEBUGFS
+ 	struct {
+ 		struct dentry *subdir_stations;
+diff --git a/net/mac80211/iface.c b/net/mac80211/iface.c
+index 8623b460..70dcb93e 100644
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -825,6 +825,7 @@ static int ieee80211_stop(struct net_device *dev)
+ 	guard(wiphy)(sdata->local->hw.wiphy);
+ 
+ 	wiphy_work_cancel(sdata->local->hw.wiphy, &sdata->activate_links_work);
++	wiphy_work_cancel(sdata->local->hw.wiphy, &sdata->links_removed_work);
+ 
+ 	/* Close the dependent MBSSID interfaces with wiphy lock as we may be
+ 	 * terminating its partner links too in case of MLD.
+@@ -1903,6 +1904,22 @@ static void ieee80211_activate_links_work(struct wiphy *wiphy,
+ 	sdata->desired_active_links = 0;
+ }
+ 
++static void ieee80211_links_removed_work(struct wiphy *wiphy,
++					 struct wiphy_work *work)
++{
++	struct ieee80211_sub_if_data *sdata =
++		container_of(work, struct ieee80211_sub_if_data, links_removed_work);
++	struct ieee80211_local *local = sdata->local;
++
++	lockdep_assert_wiphy(local->hw.wiphy);
++
++	if (!ieee80211_sdata_running(sdata))
++		return;
++
++	cfg80211_links_removed(sdata->dev, sdata->removed_links);
++	sdata->removed_links = 0;
++}
++
+ /*
+  * Helper function to initialise an interface to a specific type.
+  */
+@@ -1941,6 +1958,8 @@ static void ieee80211_setup_sdata(struct ieee80211_sub_if_data *sdata,
+ 	wiphy_work_init(&sdata->work, ieee80211_iface_work);
+ 	wiphy_work_init(&sdata->activate_links_work,
+ 			ieee80211_activate_links_work);
++	wiphy_work_init(&sdata->links_removed_work,
++			ieee80211_links_removed_work);
+ 
+ 	switch (type) {
+ 	case NL80211_IFTYPE_P2P_GO:
+diff --git a/net/mac80211/sta_info.c b/net/mac80211/sta_info.c
+index 12eb0545..b6a31431 100644
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@ -1683,6 +1683,12 @@ int __sta_info_flush(struct ieee80211_sub_if_data *sdata, bool vlans,
+ 		    !(sta->sta.valid_links & BIT(link_id)))
+ 			continue;
+ 
++		/* sta still has more than one link */
++		if (link_id >= 0 && (sta->sta.valid_links & ~BIT(link_id))) {
++			ieee80211_sta_remove_link(sta, link_id);
++			continue;
++		}
++
+ 		if (!WARN_ON(__sta_info_destroy_part1(sta)))
+ 			list_add(&sta->free_list, &free_list);
+ 
+diff --git a/net/wireless/ap.c b/net/wireless/ap.c
+index e4f06e93..a9b967be 100644
+--- a/net/wireless/ap.c
++++ b/net/wireless/ap.c
+@@ -16,10 +16,15 @@ static int ___cfg80211_stop_ap(struct cfg80211_registered_device *rdev,
+ 			       bool notify)
+ {
+ 	struct wireless_dev *wdev = dev->ieee80211_ptr;
+-	int err;
++	int err, i;
++	u16 beaconing_links = 0;
+ 
+ 	lockdep_assert_wiphy(wdev->wiphy);
+ 
++	for_each_valid_link(wdev, i)
++		if (wdev->links[i].ap.beacon_interval)
++			beaconing_links |= BIT(i);
++
+ 	if (!rdev->ops->stop_ap)
+ 		return -EOPNOTSUPP;
+ 
+@@ -36,19 +41,22 @@ static int ___cfg80211_stop_ap(struct cfg80211_registered_device *rdev,
+ 
+ 	err = rdev_stop_ap(rdev, dev, link_id);
+ 	if (!err) {
+-		wdev->conn_owner_nlportid = 0;
+ 		wdev->links[link_id].ap.beacon_interval = 0;
+ 		memset(&wdev->links[link_id].ap.chandef, 0,
+ 		       sizeof(wdev->links[link_id].ap.chandef));
+-		wdev->u.ap.ssid_len = 0;
+-		rdev_set_qos_map(rdev, dev, NULL);
++		if (hweight16(beaconing_links) <= 1) {
++			wdev->conn_owner_nlportid = 0;
++			wdev->u.ap.ssid_len = 0;
++			rdev_set_qos_map(rdev, dev, NULL);
++		}
+ 		if (notify)
+ 			nl80211_send_ap_stopped(wdev, link_id);
+ 
+ 		cfg80211_sched_dfs_chan_update(rdev);
+ 	}
+ 
+-	schedule_work(&cfg80211_disconnect_work);
++	if (hweight16(beaconing_links) <= 1)
++		schedule_work(&cfg80211_disconnect_work);
+ 
+ 	return err;
+ }
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index a775586c..7ac05a4e 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -20101,7 +20101,8 @@ void cfg80211_links_removed(struct net_device *dev, u16 link_mask)
+ 	trace_cfg80211_links_removed(dev, link_mask);
+ 
+ 	if (WARN_ON(wdev->iftype != NL80211_IFTYPE_STATION &&
+-		    wdev->iftype != NL80211_IFTYPE_P2P_CLIENT))
++		    wdev->iftype != NL80211_IFTYPE_P2P_CLIENT &&
++		    wdev->iftype != NL80211_IFTYPE_AP))
+ 		return;
+ 
+ 	if (WARN_ON(!wdev->valid_links || !link_mask ||
+@@ -20109,8 +20110,10 @@ void cfg80211_links_removed(struct net_device *dev, u16 link_mask)
+ 		    wdev->valid_links == link_mask))
+ 		return;
+ 
+-	cfg80211_wdev_release_link_bsses(wdev, link_mask);
+-	wdev->valid_links &= ~link_mask;
++	if (wdev->iftype != NL80211_IFTYPE_AP) {
++		cfg80211_wdev_release_link_bsses(wdev, link_mask);
++		wdev->valid_links &= ~link_mask;
++	}
+ 
+ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+ 	if (!msg)
+-- 
+2.45.2
+

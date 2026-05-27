@@ -1,0 +1,349 @@
+From a0783ebaa8c2ed09bfa0a3cf933db925075b0802 Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Fri, 7 Nov 2025 14:56:45 +0800
+Subject: [PATCH 55/89] mtk: mt76: mt7996: add critical update and event
+ support
+
+Add critical update support
+modification: wmm configuration
+inclusion: channel switch
+(affiliated link's per-STA profile CSA/eCSA countdown is included)
+
+Fix the CU flag countdown issue of the non-CU link as reported from cert.
+1. Avoid setting the CSA beacon twice during channel switch.
+2. Raise the bypass_seq_bitmap up for the non-CU link.
+
+Reset the beacon when switching channels during CAC
+Otherwise, the FW will not be able to perform the CSA countdown.
+Also, modify the bpcc check since channel switch will add the bpcc twice
+(before CSA and after CSA).
+
+Since the type of mgmt->u.beacon.cap_info is "__le16", it should be
+translated before being used.
+
+Allow to disable beacon during CSA.
+This helps the firmware to reset the CSA state when
+CAC is required after CSA.
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+Signed-off-by: Shayne Chen <shayne.chen@mediatek.com>
+---
+ mt76_connac_mcu.h |   3 +
+ mt7996/main.c     |   8 ++-
+ mt7996/mcu.c      | 145 ++++++++++++++++++++++++++++++++++++++++++++++
+ mt7996/mcu.h      |  47 ++++++++++++++-
+ mt7996/mt7996.h   |   1 +
+ 5 files changed, 202 insertions(+), 2 deletions(-)
+
+diff --git a/mt76_connac_mcu.h b/mt76_connac_mcu.h
+index 991a38e6e..d969510ce 100644
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1085,6 +1085,7 @@ enum {
+ 	MCU_UNI_EVENT_PP = 0x5a,
+ 	MCU_UNI_EVENT_PER_STA_INFO = 0x6d,
+ 	MCU_UNI_EVENT_ALL_STA_INFO = 0x6e,
++	MCU_UNI_EVENT_BSS_INFO = 0x74,
+ 	MCU_UNI_EVENT_SDO = 0x83,
+ };
+ 
+@@ -1414,6 +1415,8 @@ enum {
+ 	UNI_BSS_INFO_MLD = 26,
+ 	UNI_BSS_INFO_PM_DISABLE = 27,
+ 	UNI_BSS_INFO_EHT = 30,
++	UNI_BSS_INFO_BCN_CRIT_UPDATE = 32,
++	UNI_BSS_INFO_BCN_STA_PROF_CSA = 37,
+ };
+ 
+ enum {
+diff --git a/mt7996/main.c b/mt7996/main.c
+index f43248198..070d18645 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -434,6 +434,8 @@ int mt7996_vif_link_add(struct mt76_phy *mphy, struct ieee80211_vif *vif,
+ 		mtxq->wcid = idx;
+ 	}
+ 
++	link->bpcc = 0;
++
+ 	mt76_bss_dbg(vif, "band=%u, bss_idx=%u, link_id=%u, wcid=%u",
+ 		     phy->mt76->band_idx, mlink->idx, link_conf->link_id,
+ 		     msta_link->wcid.idx);
+@@ -1063,7 +1065,11 @@ mt7996_link_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		link->mt76.beacon_rates_idx =
+ 			mt7996_get_rates_table(phy, info, true, false);
+ 
+-		mt7996_mcu_add_beacon(hw, vif, info, info->enable_beacon);
++		/* The CSA beacon will be set in channel_switch_beacon,
++		 * but beacon can be disabled during CSA for DFS channel.
++		 */
++		if (!info->enable_beacon || !info->csa_active)
++			mt7996_mcu_add_beacon(hw, vif, info, info->enable_beacon);
+ 	}
+ 
+ 	if (changed & (BSS_CHANGED_UNSOL_BCAST_PROBE_RESP |
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 1648d9dd1..c39fdab7b 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -1461,6 +1461,54 @@ mt7996_mcu_pp_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ 	}
+ }
+ 
++static void
++mt7996_mcu_bss_bcn_crit_finish(void *priv, u8 *mac, struct ieee80211_vif *vif)
++{
++	struct mt7996_mcu_bss_event *data = priv;
++	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
++	struct mt7996_vif_link *mconf;
++	unsigned long valid_links = vif->valid_links;
++	unsigned int link_id;
++
++	if (!ieee80211_vif_is_mld(vif))
++		return;
++
++	rcu_read_lock();
++	for_each_set_bit(link_id, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++		mconf = (struct mt7996_vif_link *)rcu_dereference(mvif->mt76.link[link_id]);
++		if (!mconf)
++			continue;
++
++		if (mconf->mt76.idx == data->bss_idx) {
++			ieee80211_crit_update_notify(vif, link_id,
++						     NL80211_CRIT_UPDATE_NONE,
++						     GFP_ATOMIC);
++			rcu_read_unlock();
++			return;
++		}
++	}
++	rcu_read_unlock();
++}
++
++static void
++mt7996_mcu_bss_event(struct mt7996_dev *dev, struct sk_buff *skb)
++{
++	struct mt7996_mcu_bss_event *event = (void *)skb->data;
++	struct tlv *tlv = (struct tlv *)event->buf;
++
++	switch (le16_to_cpu(tlv->tag)) {
++	case UNI_EVENT_BSS_BCN_CRIT_UPDATE:
++		ieee80211_iterate_active_interfaces_atomic(dev->mt76.hw,
++				IEEE80211_IFACE_ITER_RESUME_ALL,
++				mt7996_mcu_bss_bcn_crit_finish, event);
++		break;
++	default:
++		dev_err(dev->mt76.dev, "Unknown BSS event tag: %d\n",
++			le16_to_cpu(tlv->tag));
++		return;
++	}
++}
++
+ static void
+ mt7996_mcu_uni_rx_unsolicited_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ {
+@@ -1490,6 +1538,9 @@ mt7996_mcu_uni_rx_unsolicited_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ 	case MCU_UNI_EVENT_PP:
+ 		mt7996_mcu_pp_event(dev, skb);
+ 		break;
++	case MCU_UNI_EVENT_BSS_INFO:
++		mt7996_mcu_bss_event(dev, skb);
++		break;
+ #ifdef CONFIG_MTK_DEBUG
+ 	case MCU_UNI_EVENT_SR:
+ 		mt7996_mcu_rx_sr_event(dev, skb);
+@@ -3740,6 +3791,98 @@ mt7996_mcu_beacon_mbss(struct sk_buff *rskb, struct sk_buff *skb,
+ 	}
+ }
+ 
++static bool
++mt7996_mcu_beacon_is_cu_link(struct sk_buff *skb, struct mt7996_vif_link *mconf,
++			     u16 tail_offset)
++{
++	const struct element *elem;
++	u8 *beacon_tail = skb->data + tail_offset;
++	bool has_ml_ie = false;
++	int bpcc;
++
++	for_each_element_extid(elem, WLAN_EID_EXT_EHT_MULTI_LINK,
++			       beacon_tail, skb->len - tail_offset)
++		if (ieee80211_mle_type_ok(elem->data + 1,
++					  IEEE80211_ML_CONTROL_TYPE_BASIC,
++					  elem->datalen - 1)) {
++			has_ml_ie = true;
++			break;
++		}
++
++	if (!has_ml_ie)
++		return false;
++
++	bpcc = ieee80211_mle_get_bss_param_ch_cnt(elem->data + 1);
++	if (bpcc < 0 || bpcc == mconf->bpcc)
++		return false;
++
++	mconf->bpcc = bpcc;
++
++	return true;
++}
++
++static void
++mt7996_mcu_beacon_crit_update(struct sk_buff *rskb, struct sk_buff *skb,
++			      struct ieee80211_bss_conf *conf,
++			      struct mt7996_vif_link *mconf,
++			      struct ieee80211_mutable_offsets *offs)
++{
++	struct ieee80211_mgmt *mgmt = (void *)skb->data;
++	struct bss_bcn_crit_update_tlv *crit;
++	struct tlv *tlv;
++	u16 capab_info = le16_to_cpu(mgmt->u.beacon.capab_info);
++
++	if (!ieee80211_vif_is_mld(conf->vif) ||
++	    !(capab_info & WLAN_CAPABILITY_PBCC))
++		return;
++
++	tlv = mt7996_mcu_add_uni_tlv(rskb, UNI_BSS_INFO_BCN_CRIT_UPDATE, sizeof(*crit));
++
++	/* TODO: Support 11vMBSS */
++	crit = (struct bss_bcn_crit_update_tlv *)tlv;
++	crit->bss_bitmap = cpu_to_le32(BIT(0));
++	/* The beacon of the CU link should be set in sequence
++	 * to ensure it appears in the air before the beacon of
++	 * the non-CU link.
++	 */
++	if (!mt7996_mcu_beacon_is_cu_link(skb, mconf, offs->tim_offset))
++		crit->bypass_seq_bitmap = cpu_to_le32(BIT(0));
++	else
++		crit->bypass_seq_bitmap = cpu_to_le32(0);
++	crit->tim_ie_pos[0] = cpu_to_le16(offs->tim_offset);
++	crit->cap_info_ie_pos[0] = cpu_to_le16(offsetof(struct ieee80211_mgmt,
++							u.beacon.capab_info));
++	crit->require_event = true;
++}
++
++static void
++mt7996_mcu_beacon_sta_prof_csa(struct sk_buff *rskb,
++			       struct ieee80211_bss_conf *conf,
++			       struct ieee80211_mutable_offsets *offs)
++{
++	struct ieee80211_vif *vif = conf->vif;
++	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
++	struct mt7996_dev *dev = mvif->deflink.phy->dev;
++	struct mt7996_vif_link *cs_mconf;
++	struct bss_bcn_sta_prof_cntdwn_tlv *sta_prof;
++	struct tlv *tlv;
++	u8 cs_band;
++
++	if (!ieee80211_vif_is_mld(vif) || !offs->sta_prof_cntdwn_offs[0])
++		return;
++
++	cs_mconf = mt7996_vif_link(dev, conf->vif, mvif->cs_links[0]);
++	if (!cs_mconf)
++		return;
++
++	tlv = mt7996_mcu_add_uni_tlv(rskb, UNI_BSS_INFO_BCN_STA_PROF_CSA, sizeof(*sta_prof));
++
++	cs_band = cs_mconf->phy->mt76->band_idx;
++	sta_prof = (struct bss_bcn_sta_prof_cntdwn_tlv *)tlv;
++	sta_prof->sta_prof_csa_offs[cs_band] = cpu_to_le16(offs->sta_prof_cntdwn_offs[0] - 4);
++	sta_prof->cs_bss_idx[cs_band] = cs_mconf->mt76.idx;
++}
++
+ static void
+ mt7996_mcu_beacon_cont(struct mt7996_dev *dev,
+ 		       struct ieee80211_bss_conf *link_conf,
+@@ -3833,6 +3976,8 @@ int mt7996_mcu_add_beacon(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	if (link_conf->bssid_indicator)
+ 		mt7996_mcu_beacon_mbss(rskb, skb, bcn, &offs);
+ 	mt7996_mcu_beacon_cntdwn(rskb, skb, &offs, link_conf->csa_active);
++	mt7996_mcu_beacon_sta_prof_csa(rskb, link_conf, &offs);
++	mt7996_mcu_beacon_crit_update(rskb, skb, link_conf, link, &offs);
+ out:
+ 	dev_kfree_skb(skb);
+ 	return mt76_mcu_skb_send_msg(&dev->mt76, rskb,
+diff --git a/mt7996/mcu.h b/mt7996/mcu.h
+index c09efa7a2..70459c33f 100644
+--- a/mt7996/mcu.h
++++ b/mt7996/mcu.h
+@@ -581,6 +581,29 @@ struct bss_bcn_mbss_tlv {
+ 	__le16 offset[MAX_BEACON_NUM];
+ } __packed __aligned(4);
+ 
++struct bss_bcn_crit_update_tlv {
++	__le16 tag;
++	__le16 len;
++	__le32 bss_bitmap;
++	/* Bypass the beacon sequence handling in firmware for the
++	 * BSSes in the bitmap. If the flag is set for a BSS, then the
++	 * firmware will not set the beacon of the BSS in sequence.
++	 */
++	__le32 bypass_seq_bitmap;
++	__le16 tim_ie_pos[32];
++	__le16 cap_info_ie_pos[32];
++	bool require_event;
++	u8 rsv[3];
++} __packed;
++
++struct bss_bcn_sta_prof_cntdwn_tlv {
++	__le16 tag;
++	__le16 len;
++	__le16 sta_prof_csa_offs[__MT_MAX_BAND];
++	u8 cs_bss_idx[__MT_MAX_BAND];
++	u8 pkt_content[3];
++} __packed;
++
+ struct bss_txcmd_tlv {
+ 	__le16 tag;
+ 	__le16 len;
+@@ -1057,7 +1080,9 @@ enum {
+ 					 sizeof(struct bss_bcn_content_tlv) +	\
+ 					 4 + MT_TXD_SIZE +			\
+ 					 sizeof(struct bss_bcn_cntdwn_tlv) +	\
+-					 sizeof(struct bss_bcn_mbss_tlv))
++					 sizeof(struct bss_bcn_mbss_tlv) +	\
++					 sizeof(struct bss_bcn_crit_update_tlv) +	\
++					 sizeof(struct bss_bcn_sta_prof_cntdwn_tlv))
+ #define MT7996_MAX_BSS_OFFLOAD_SIZE	2048
+ #define MT7996_MAX_BEACON_SIZE		(MT7996_MAX_BSS_OFFLOAD_SIZE - \
+ 					 MT7996_BEACON_UPDATE_SIZE)
+@@ -1154,6 +1179,26 @@ enum {
+ 	UNI_CMD_THERMAL_PROTECT_INFO,
+ };
+ 
++struct mt7996_mcu_bss_event {
++	struct mt7996_mcu_rxd rxd;
++
++	/* fixed field */
++	u8 bss_idx;
++	u8 __rsv[3];
++	/* tlv */
++	u8 buf[];
++} __packed;
++
++struct mt7996_mcu_bss_bcn_crit_update_event {
++	__le16 tag;
++	__le16 len;
++	u8 rsv[4];
++} __packed;
++
++enum {
++	UNI_EVENT_BSS_BCN_CRIT_UPDATE = 0x01,
++};
++
+ struct tx_power_ctrl {
+ 	u8 _rsv[4];
+ 
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index 1b0e7f0a6..d4b343f7f 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -452,6 +452,7 @@ struct mt7996_vif_link {
+ 	struct cfg80211_bitrate_mask bitrate_mask;
+ 
+ 	u8 mld_idx;
++	u8 bpcc;
+ };
+ 
+ struct mt7996_vif_link_info {
+-- 
+2.45.2
+

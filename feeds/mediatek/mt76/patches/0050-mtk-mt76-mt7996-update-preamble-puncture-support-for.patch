@@ -1,0 +1,310 @@
+From a8cc484591d0a85f5e994cd5d6ab6ea03ba2f68b Mon Sep 17 00:00:00 2001
+From: Allen Ye <allen.ye@mediatek.com>
+Date: Mon, 1 Dec 2025 21:22:16 +0800
+Subject: [PATCH 50/89] mtk: mt76: mt7996: update preamble puncture support for
+ mt7996
+
+Add pp station mode support. Current fw only support one bitmap on a band.
+For extender mode, fw only consider that extender and root AP are both in
+fw mode and detect the same bitmap. So that extender AP/STA can use the
+same bitmap setting.
+Current PP_DSCB_CTRL cmd only use bitmap value in fw implementation.
+
+Add protection to prevent crash happened when mcu cmd (CHANNEL_SWITCH) timeout.
+
+Signed-off-by: Allen Ye <allen.ye@mediatek.com>
+---
+ mt76_connac_mcu.h |   1 +
+ mt7996/main.c     |   7 +++
+ mt7996/mcu.c      | 155 ++++++++++++++++++++++++++++++++++++++++++++++
+ mt7996/mcu.h      |  52 ++++++++++++++++
+ mt7996/mt7996.h   |   3 +
+ 5 files changed, 218 insertions(+)
+
+diff --git a/mt76_connac_mcu.h b/mt76_connac_mcu.h
+index cced020da..20a4b5d6d 100644
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1075,6 +1075,7 @@ enum {
+ 	MCU_UNI_EVENT_RSSI_MONITOR = 0x41,
+ 	MCU_UNI_EVENT_NIC_CAPAB = 0x43,
+ 	MCU_UNI_EVENT_WED_RRO = 0x57,
++	MCU_UNI_EVENT_PP = 0x5a,
+ 	MCU_UNI_EVENT_PER_STA_INFO = 0x6d,
+ 	MCU_UNI_EVENT_ALL_STA_INFO = 0x6e,
+ 	MCU_UNI_EVENT_SDO = 0x83,
+diff --git a/mt7996/main.c b/mt7996/main.c
+index e08f85258..f7fb0913f 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -1294,6 +1294,13 @@ mt7996_mac_sta_event(struct mt7996_dev *dev, struct ieee80211_vif *vif,
+ 			if (err)
+ 				goto unlock;
+ 
++			if (link_sta->eht_cap.has_eht &&
++			    vif->type == NL80211_IFTYPE_STATION) {
++				err = mt7996_mcu_set_pp_sta_dscb(link->phy, &link_conf->chanreq.oper, link->mt76.omac_idx);
++				if (err)
++					return err;
++			}
++
+ 			msta_link->wcid.tx_info |= MT_WCID_TX_INFO_SET;
+ 			break;
+ 		case MT76_STA_EVENT_AUTHORIZE:
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 299ea806b..0cad526be 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -1039,6 +1039,43 @@ mt7996_mcu_wed_rro_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ 	}
+ }
+ 
++static void
++mt7996_mcu_pp_event(struct mt7996_dev *dev, struct sk_buff *skb)
++{
++	struct mt7996_mcu_pp_basic_event *event;
++	struct mt7996_mcu_pp_dscb_event *dscb_event;
++	struct mt7996_phy *phy;
++	struct mt76_phy *mphy;
++	u16 report_bitmap;
++
++	event = (struct mt7996_mcu_pp_basic_event *)skb->data;
++
++	switch (le16_to_cpu(event->tag)) {
++	case UNI_EVENT_STATIC_PP_TAG_CSA_DSCB_IE:
++	case UNI_EVENT_STATIC_PP_TAG_DSCB_IE:
++		if (!mt7996_band_valid(dev, event->band_idx))
++			return;
++
++		mphy = mt76_dev_phy(&dev->mt76, event->band_idx);
++		phy = mphy->priv;
++
++		dscb_event = (struct mt7996_mcu_pp_dscb_event *)event;
++		report_bitmap = le16_to_cpu(dscb_event->punct_bitmap);
++
++		if (phy->punct_bitmap == report_bitmap)
++			return;
++
++		if (phy->pp_mode == PP_FW_MODE) {
++			phy->punct_bitmap = report_bitmap;
++			mt7996_vendor_pp_bitmap_update(phy, report_bitmap);
++		}
++		break;
++	case UNI_EVENT_PP_TAG_ALG_CTRL:
++		mt7996_dump_pp_statistic_event(dev, (struct mt7996_mcu_pp_alg_ctrl_event *)event);
++		break;
++	}
++}
++
+ static void
+ mt7996_mcu_uni_rx_unsolicited_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ {
+@@ -1060,6 +1097,9 @@ mt7996_mcu_uni_rx_unsolicited_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ 	case MCU_UNI_EVENT_WED_RRO:
+ 		mt7996_mcu_wed_rro_event(dev, skb);
+ 		break;
++	case MCU_UNI_EVENT_PP:
++		mt7996_mcu_pp_event(dev, skb);
++		break;
+ 	case MCU_UNI_EVENT_THERMAL:
+ 		mt7996_mcu_rx_thermal_info_query(dev, skb);
+ 		break;
+@@ -5866,3 +5906,118 @@ int mt7996_mcu_set_dup_wtbl(struct mt7996_dev *dev)
+ 	return mt76_mcu_send_msg(&dev->mt76, MCU_WM_UNI_CMD(CHIP_CONFIG), &req,
+ 				 sizeof(req), true);
+ }
++
++int mt7996_mcu_set_pp_en(struct mt7996_phy *phy, u8 mode, u16 bitmap)
++{
++	struct mt7996_dev *dev = phy->dev;
++	bool pp_auto = (mode == PP_FW_MODE);
++	struct {
++		u8 _rsv1[4];
++
++		__le16 tag;
++		__le16 len;
++		u8 mgmt_mode;
++		u8 band_idx;
++		u8 force_bitmap_ctrl;
++		u8 auto_mode;
++		__le16 bitmap;
++		u8 csa_enable;
++		u8 _rsv2;
++	} __packed req = {
++		.tag = cpu_to_le16(UNI_CMD_PP_EN_CTRL),
++		.len = cpu_to_le16(sizeof(req) - 4),
++
++		.mgmt_mode = !pp_auto,
++		.band_idx = phy->mt76->band_idx,
++		.force_bitmap_ctrl = (mode == PP_USR_MODE) ? 2 : 0,
++		.auto_mode = pp_auto,
++		.bitmap = cpu_to_le16(bitmap),
++		.csa_enable = false,
++	};
++
++	if (phy->mt76->chandef.chan->band == NL80211_BAND_2GHZ ||
++	    mode > PP_USR_MODE)
++		return 0;
++
++	if (bitmap && phy->punct_bitmap == bitmap)
++		return 0;
++
++	phy->punct_bitmap = bitmap;
++	phy->pp_mode = mode;
++
++#ifdef CONFIG_MTK_DEBUG
++	/* Configuring PP would cause FW to disable MRU Probe by default. */
++	if (!is_mt7996(&dev->mt76))
++		phy->mru_probe_enable = false;
++#endif
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_WM_UNI_CMD(PP),
++				 &req, sizeof(req), false);
++}
++
++int mt7996_mcu_set_pp_sta_dscb(struct mt7996_phy *phy,
++			       struct cfg80211_chan_def *chandef,
++			       u8 omac_idx)
++{
++	struct mt7996_dev *dev = phy->dev;
++	struct {
++		u8 _rsv1[4];
++
++		__le16 tag;
++		__le16 len;
++		u8 band_idx;
++		u8 omac_idx;
++		u8 eht_op_present;
++		u8 dscb_present;
++		__le16 dscb;
++		u8 ctrl;
++		u8 ccfs0;
++		u8 ccfs1;
++		u8 rsv2[3];
++	} __packed req = {
++		.tag = cpu_to_le16(UNI_CMD_PP_DSCB_CTRL),
++		.len = cpu_to_le16(sizeof(req) - 4),
++
++		.band_idx = phy->mt76->band_idx,
++		.omac_idx = omac_idx,
++		.eht_op_present = true,
++		.dscb_present = !!chandef->punctured,
++		.dscb = cpu_to_le16(chandef->punctured),
++		.ctrl = 0,
++		.ccfs0 = ieee80211_frequency_to_channel(chandef->center_freq1),
++		.ccfs1 = ieee80211_frequency_to_channel(chandef->center_freq1),
++	};
++
++	if (phy->mt76->chandef.chan->band == NL80211_BAND_2GHZ ||
++	    phy->punct_bitmap == chandef->punctured)
++		return 0;
++
++	switch (chandef->width) {
++	case NL80211_CHAN_WIDTH_320:
++		req.ctrl |= IEEE80211_EHT_OPER_CHAN_WIDTH_320MHZ;
++		if (chandef->chan->hw_value < req.ccfs1)
++			req.ccfs0 -= 16;
++		else
++			req.ccfs0 += 16;
++		break;
++	case NL80211_CHAN_WIDTH_160:
++		req.ctrl |= IEEE80211_EHT_OPER_CHAN_WIDTH_160MHZ;
++		if (chandef->chan->hw_value < req.ccfs1)
++			req.ccfs0 -= 8;
++		else
++			req.ccfs0 += 8;
++		break;
++	case NL80211_CHAN_WIDTH_80:
++		req.ctrl |= IEEE80211_EHT_OPER_CHAN_WIDTH_80MHZ;
++		req.ccfs0 = 0;
++		break;
++	default:
++		return 0;
++		break;
++	}
++
++	phy->punct_bitmap = cpu_to_le16(chandef->punctured);
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_WM_UNI_CMD(PP),
++				 &req, sizeof(req), false);
++}
+diff --git a/mt7996/mcu.h b/mt7996/mcu.h
+index 2417386ab..0a00dab58 100644
+--- a/mt7996/mcu.h
++++ b/mt7996/mcu.h
+@@ -1087,6 +1087,58 @@ enum {
+ 	MT7996_SEC_MODE_MAX,
+ };
+ 
++enum {
++	UNI_CMD_PP_EN_CTRL,
++	UNI_CMD_PP_ALG_CTRL,
++	UNI_CMD_PP_DSCB_CTRL,
++	UNI_CMD_PP_CHANGE_CAP_CTRL = 4,
++};
++
++enum pp_mode {
++	PP_DISABLE = 0,
++	PP_FW_MODE,
++	PP_USR_MODE,
++};
++
++enum pp_alg_action {
++	PP_ALG_SET_TIMER,
++	PP_ALG_SET_THR,
++	PP_ALG_GET_STATISTICS,
++};
++
++enum {
++	UNI_EVENT_PP_TAG_ALG_CTRL = 1,
++	UNI_EVENT_STATIC_PP_TAG_DSCB_IE,
++	UNI_EVENT_STATIC_PP_TAG_CSA_DSCB_IE,
++	UNI_EVENT_PP_SHOW_INFO,
++};
++
++struct mt7996_mcu_pp_basic_event {
++	struct mt7996_mcu_rxd rxd;
++
++	u8 __rsv1[4];
++
++	__le16 tag;
++	__le16 len;
++	u8 band_idx;
++	u8 __rsv2[3];
++} __packed;
++
++struct mt7996_mcu_pp_dscb_event {
++	struct mt7996_mcu_rxd rxd;
++
++	u8 __rsv1[4];
++
++	__le16 tag;
++	__le16 len;
++	u8 band_idx;
++	u8 omac_idx;
++	u8 new_dscb;
++	u8 __rsv2;
++	__le16 punct_bitmap;
++	u8 __rsv3[2];
++} __packed;
++
+ #define MT7996_PATCH_SEC		GENMASK(31, 24)
+ #define MT7996_PATCH_SCRAMBLE_KEY	GENMASK(15, 8)
+ #define MT7996_PATCH_AES_KEY		GENMASK(7, 0)
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index 661cf41ca..0722ab677 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -965,6 +965,9 @@ int mt7996_mcu_set_emlsr_mode(struct mt7996_dev *dev,
+ 			      struct ieee80211_vif *vif,
+ 			      struct ieee80211_sta *sta,
+ 			      struct ieee80211_eml_params *eml_params);
++int mt7996_mcu_set_pp_en(struct mt7996_phy *phy, u8 mode, u16 bitmap);
++int mt7996_mcu_set_pp_sta_dscb(struct mt7996_phy *phy, struct cfg80211_chan_def *chandef,
++			       u8 omac_idx);
+ #ifdef CONFIG_MAC80211_DEBUGFS
+ void mt7996_sta_add_debugfs(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			    struct ieee80211_sta *sta, struct dentry *dir);
+-- 
+2.45.2
+
