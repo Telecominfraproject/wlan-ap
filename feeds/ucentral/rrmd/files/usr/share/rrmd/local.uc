@@ -118,11 +118,10 @@ stations_stats = {
 
 function interfaces_subunsub(path, sub) {
 	/* check if this is a hostapd instance */
-	let name = split(path, '.');
-
-	if (length(name) != 2 || name[0] != 'hostapd')
+	let prefix = 'hostapd.';
+	if (substr(path, 0, length(prefix)) != prefix)
 		return;
-	name = name[1];
+	let name = substr(path, length(prefix));
 
 	ulog_info(sprintf('%s %s\n', sub ? 'add' : 'remove', path));
 
