@@ -1,0 +1,237 @@
+#!/bin/sh
+# ba-recovery: detect and recover broken BA sessions after cross-band roaming
+#
+# ROOT CAUSE:
+# QCN9274 firmware (WLAN.WBE.1.4.1) maintains internal BA/TX aggregation
+# state indexed by STA MAC across both 5G and 6G MACs. When the same STA
+# re-appears on a different MAC after a band-hop roam, the firmware does
+# NOT reset this state. The PHY rate stays high but actual throughput
+# collapses to 0-5 Mbps because the firmware's BA window tracking is stale.
+#
+# Kernel patch 994 (force-fresh TID on ampdu_start) handles ~50-70% of
+# cases by resetting the REO queue. This script is the userspace safety net
+# for the remaining cases where firmware still gets stuck.
+#
+# FLOW:
+# 1. Watches hostapd syslog for STA association messages
+# 2. Detects band-hops (STA moves between phy5g-apX and phy6g-apX)
+# 3. Only acts if STA was previously passing real traffic (>= PKT_THRESHOLD)
+# 4. After CHECK_DELAY seconds, samples RX packet count twice (1s apart)
+# 5. If delta < PKT_THRESHOLD -> disassociates STA to force clean reconnect
+# 6. Stops kicking after MAX_KICKS consecutive failures per STA
+#
+# Usage: ba-recovery [CHECK_DELAY_SEC] [PKT_THRESHOLD]
+# Defaults: CHECK_DELAY=2, PKT_THRESHOLD=2000
+#
+# Install as init.d service for persistent background operation.
+
+CHECK_DELAY="${1:-2}"
+PKT_THRESHOLD="${2:-2000}"
+MAX_KICKS=5
+
+# Only run on EAP105 — this workaround is specific to QCN9274 FW bug
+BOARD=$(cat /tmp/sysinfo/board_name 2>/dev/null)
+case "$BOARD" in
+	edgecore,eap105) ;;
+	*)
+		logger -t ba-recovery "board '$BOARD' is not EAP105, exiting"
+		exit 0
+		;;
+esac
+
+log() {
+	logger -t ba-recovery "$*"
+	echo "[$(date +%s)] $*"
+}
+
+get_rx_pkts() {
+	local mac="$1"
+	local iface="$2"
+	local mac_upper pkts
+
+	mac_upper=$(echo "$mac" | tr 'a-f' 'A-F')
+
+	pkts=$(iwinfo "$iface" assoc 2>/dev/null | \
+		grep -A2 "$mac_upper" | \
+		grep "RX:" | \
+		head -1 | \
+		sed -n 's/.*[[:space:]]\([0-9]*\) Pkts\..*/\1/p')
+
+	[ -z "$pkts" ] && pkts="0"
+	echo "$pkts"
+}
+
+do_recover() {
+	local mac="$1"
+	local iface="$2"
+	local delta="$3"
+	local kicks last_kick now elapsed
+
+	# Increment kick counter
+	kicks=0
+	[ -f "$STATE_DIR/${mac}.kicks" ] && kicks=$(cat "$STATE_DIR/${mac}.kicks")
+	
+	# Reset counter if last kick was more than 30 seconds ago (not a rapid-fire loop)
+	now=$(date +%s)
+	last_kick=0
+	[ -f "$STATE_DIR/${mac}.last_kick" ] && last_kick=$(cat "$STATE_DIR/${mac}.last_kick")
+	elapsed=$((now - last_kick))
+	if [ "$elapsed" -gt 30 ]; then
+		kicks=0
+	fi
+	
+	kicks=$((kicks + 1))
+	echo "$kicks" > "$STATE_DIR/${mac}.kicks"
+	echo "$now" > "$STATE_DIR/${mac}.last_kick"
+
+	if [ "$kicks" -gt "$MAX_KICKS" ]; then
+		log "SKIP: $mac rapid-fire kicks=$kicks > max=$MAX_KICKS within 30s, backing off"
+		return
+	fi
+
+	log "RECOVER: $mac on $iface pkt_delta=${delta} < threshold=${PKT_THRESHOLD} (kick $kicks/$MAX_KICKS)"
+	log "RECOVER: disassociating $mac from $iface"
+	hostapd_cli -i "$iface" disassociate "$mac" reason=4 tx=0
+}
+
+check_sta_pkts() {
+	local mac="$1"
+	local iface="$2"
+	local pkts1 pkts2 delta
+
+	pkts1=$(get_rx_pkts "$mac" "$iface")
+	if [ "$pkts1" = "0" ]; then
+		log "check: $mac on $iface — STA not found in assoc table"
+		return
+	fi
+
+	sleep 1
+
+	pkts2=$(get_rx_pkts "$mac" "$iface")
+	if [ "$pkts2" = "0" ]; then
+		log "check: $mac on $iface — STA gone after 1s"
+		return
+	fi
+
+	delta=$((pkts2 - pkts1))
+
+	# Skip truly idle STAs (no traffic at all) — they aren't broken, just inactive
+	if [ "$delta" -eq 0 ] && [ ! -f "$STATE_DIR/${mac}.active" ]; then
+		log "SKIP: $mac on $iface — idle STA (delta=0, never active), ignoring"
+		return
+	fi
+
+	if [ "$delta" -lt "$PKT_THRESHOLD" ]; then
+		do_recover "$mac" "$iface" "$delta"
+	else
+		log "OK: $mac on $iface pkt_delta=${delta}/s (healthy)"
+		# Reset kick counter on success
+		rm -f "$STATE_DIR/${mac}.kicks"
+		# Mark as active for future reference
+		echo "$delta" > "$STATE_DIR/${mac}.active"
+	fi
+}
+
+update_active_state() {
+	local mac="$1"
+	local iface="$2"
+	local pkts1 pkts2 delta
+
+	pkts1=$(get_rx_pkts "$mac" "$iface")
+	[ "$pkts1" = "0" ] && return
+
+	sleep 1
+
+	pkts2=$(get_rx_pkts "$mac" "$iface")
+	[ "$pkts2" = "0" ] && return
+
+	delta=$((pkts2 - pkts1))
+	if [ "$delta" -ge "$PKT_THRESHOLD" ]; then
+		echo "$delta" > "$STATE_DIR/${mac}.active"
+	fi
+}
+
+# --- Main ---
+log "=== ba-recovery daemon starting (pid=$$) ==="
+log "CONFIG: CHECK_DELAY=${CHECK_DELAY}s, PKT_THRESHOLD=${PKT_THRESHOLD}pkts/s, MAX_KICKS=${MAX_KICKS}"
+
+# Discover interfaces (retry up to 30 times waiting for hostapd)
+IFACE_5G=""
+IFACE_6G=""
+RETRIES=30
+while [ "$RETRIES" -gt 0 ]; do
+	for obj in $(ubus list 2>/dev/null | grep "^hostapd\\."); do
+		iface="${obj#hostapd.}"
+		case "$iface" in
+			*5g*) IFACE_5G="$iface" ;;
+			*6g*) IFACE_6G="$iface" ;;
+		esac
+	done
+	[ -n "$IFACE_5G" ] && [ -n "$IFACE_6G" ] && break
+	RETRIES=$((RETRIES - 1))
+	sleep 2
+done
+
+if [ -z "$IFACE_5G" ] && [ -z "$IFACE_6G" ]; then
+	log "ERROR: no hostapd interfaces found after 60s"
+	exit 1
+fi
+[ -n "$IFACE_5G" ] && log "  5G interface: $IFACE_5G"
+[ -n "$IFACE_6G" ] && log "  6G interface: $IFACE_6G"
+
+# State tracking
+STATE_DIR="/tmp/ba-recovery-state"
+rm -rf "$STATE_DIR"
+mkdir -p "$STATE_DIR"
+
+cleanup() {
+	rm -rf "$STATE_DIR"
+	kill $(jobs -p) 2>/dev/null
+	exit 0
+}
+trap cleanup INT TERM
+
+log "=== ready, watching logread for hostapd events ==="
+
+# Watch syslog for hostapd "associated" messages
+# Format: "hostapd: phy5g-ap0: STA xx:xx:xx:xx:xx:xx IEEE 802.11: associated (aid N)"
+logread -f | while IFS= read -r line; do
+	case "$line" in
+		*"IEEE 802.11: associated (aid"*)
+			# Extract MAC and interface from hostapd log
+			mac=$(echo "$line" | sed -n 's/.*STA \([0-9a-fA-F:]*\) IEEE.*/\1/p' | tr 'A-F' 'a-f')
+			iface=$(echo "$line" | sed -n 's/.*hostapd: \([^ :]*\): STA.*/\1/p')
+
+			[ -z "$mac" ] && continue
+			[ -z "$iface" ] && continue
+
+			# Determine band from interface name
+			band=""
+			case "$iface" in
+				*5g*) band="5g" ;;
+				*6g*) band="6g" ;;
+				*) continue ;;
+			esac
+
+			# Check for band hop
+			prev_band=""
+			[ -f "$STATE_DIR/$mac" ] && prev_band=$(cat "$STATE_DIR/$mac")
+			echo "$band" > "$STATE_DIR/$mac"
+
+			if [ -n "$prev_band" ] && [ "$prev_band" != "$band" ]; then
+				log "BAND-HOP: $mac moved $prev_band -> $band ($iface)"
+				(
+					sleep "$CHECK_DELAY"
+					check_sta_pkts "$mac" "$iface"
+				) &
+			else
+				# Same band or first association — sample traffic to track active state
+				# Do this in background to not block the log reader
+				(
+					sleep 1
+					update_active_state "$mac" "$iface"
+				) &
+			fi
+			;;
+	esac
+done

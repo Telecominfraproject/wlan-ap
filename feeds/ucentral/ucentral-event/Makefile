@@ -19,11 +19,13 @@ define Build/Compile
 endef
 
 define Package/ucentral-event/install
-	$(INSTALL_DIR) $(1)/usr/sbin $(1)/etc/init.d $(1)/etc/config
+	$(INSTALL_DIR) $(1)/usr/sbin $(1)/usr/bin $(1)/etc/init.d $(1)/etc/config
 	$(INSTALL_BIN) ./files/ucentral-event $(1)/usr/sbin/
 	$(INSTALL_BIN) ./files/ucentral-wifiscan $(1)/usr/sbin/
+	$(INSTALL_BIN) ./files/ba-recovery $(1)/usr/bin/
 	$(INSTALL_BIN) ./files/ucentral-event.init $(1)/etc/init.d/ucentral-event
 	$(INSTALL_BIN) ./files/ucentral-wifiscan.init $(1)/etc/init.d/ucentral-wifiscan
+	$(INSTALL_BIN) ./files/ba-recovery.init $(1)/etc/init.d/ba-recovery
 	$(INSTALL_DATA) ./files/event $(1)/etc/config/
 	$(INSTALL_DATA) ./files/events.json $(1)/etc/
 endef
