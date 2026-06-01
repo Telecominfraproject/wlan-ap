@@ -1990,7 +1990,7 @@ wpa_supplicant_start() {
 	[ -n "$wpa_supp_init" ] || return 0
 	[ -n "$mld" ] && is_mld="true"
 
-	ubus_call wpa_supplicant config_set '{ "phy": "'"$phy"'", "radio": '"$radio"', "num_global_macaddr": '"$num_global_macaddr"', "is_ml": '"$is_mld"', "macaddr_base" : '"$macaddr_base"' }' > /dev/null
+	ubus_call wpa_supplicant config_set '{ "phy": "'"$phy"'", "radio": '"$radio"', "num_global_macaddr": '"$num_global_macaddr"', "is_ml": '"$is_mld"', "macaddr_base" : "'"$macaddr_base"'" }' > /dev/null
 	if [ "${dpp}" -eq 1 ]; then
 		/usr/sbin/wpa_cli -i $ifname -p /var/run/wpa_supplicant -a /lib/netifd/dpp-supplicant-event-update -B
 	fi
