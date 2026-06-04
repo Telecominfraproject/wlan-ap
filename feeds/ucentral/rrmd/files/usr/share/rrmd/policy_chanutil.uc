@@ -349,7 +349,7 @@ function hostapd_switch_channel(msg) {
 
 function switch_status_check(iface, dfs_enabled_5g_flag) {
     // add a 5 sec delay regardless of DFS being enabled or not
-    sleep(5);
+    sleep(5000);
 
     // need to wait for radio 5GHz interface to be UP, when DFS is enabled
     if (dfs_enabled_5g_flag == 1) {
