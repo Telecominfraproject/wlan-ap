@@ -225,8 +225,8 @@ platform_check_image() {
 		local info_output=$(get_firmware_info "$1")
 		FW_VER="${info_output%%|*}"
 		FW_BUILD_DATE="${info_output#*|}"
-		local LIMIT_VER="4.2.3"
-		local LIMIT_BUILD_DATE="20260402"
+		local LIMIT_VER="5.0.0"
+		local LIMIT_BUILD_DATE="20260603"
 
 		echo "Checking version for $board..."
 		echo "Current: v$CURRENT_VER, Firmware: v$FW_VER, Limit: <= v$LIMIT_VER"
