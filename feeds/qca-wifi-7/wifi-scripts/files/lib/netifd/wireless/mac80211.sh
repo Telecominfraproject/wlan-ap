@@ -227,6 +227,7 @@ drv_mac80211_init_device_config() {
 	config_add_string path phy 'macaddr:macaddr'
 	config_add_string tx_burst
 	config_add_string distance band
+	config_add_string ifname_prefix
 	config_add_string macaddr_base
 	config_add_int radio beacon_int chanbw frag rts
 	config_add_int rxantenna txantenna txpower min_tx_power antenna_gain
@@ -1449,6 +1450,14 @@ mac80211_prepare_vif() {
 	json_get_vars ifname mode ssid wds powersave macaddr enable wpa_psk_file vlan_file ppe_vp mld
 
 	[ -n "$ifname" ] || {
+		local prefix;
+
+		case "$mode" in
+		ap|sta|mesh) prefix=$mode;;
+		adhoc) prefix=ibss;;
+		monitor) prefix=mon;;
+		esac
+
                 if [ "$is_wiphy_multi_radio" -eq 1 ]; then
                         if [[ "$htmode" == EHT* ]] && [ -n "$mld" ]; then
 				config_get mld_ifname "$mld" ifname
@@ -1458,10 +1467,10 @@ mac80211_prepare_vif() {
 					ifname="$mld_ifname"
 				fi
                         else
-				mac80211_set_ifname "$phy$vif_phy_suffix"
+				mac80211_set_ifname "$ifname_prefix" "$prefix"
                         fi
                 else
-                        mac80211_set_ifname "$phy$vif_phy_suffix"
+			mac80211_set_ifname "$ifname_prefix" "$prefix"
                 fi
 
 	}
@@ -2141,7 +2150,7 @@ drv_mac80211_setup() {
 		num_global_macaddr:1 multiple_bssid \
 		eht_ulmumimo_80mhz eht_ulmumimo_160mhz eht_ulmumimo_320mhz \
 		ccfs disable_csa_dfs ru_punct_bitmap \
-		macaddr_base
+		ifname_prefix macaddr_base
 	json_get_values basic_rate_list basic_rate
 	json_get_values scan_list scan_list
 	json_select ..
@@ -2173,6 +2182,8 @@ drv_mac80211_setup() {
 	}
 
 	mac80211_set_suffix
+
+	set_default ifname_prefix "$phy$vif_phy_suffix"
 
 	[ -f /tmp/mlo_support.txt ] && mlo_add_flag=$(cat /tmp/mlo_support.txt)
 	if [ $mlo_add_flag -eq 0 ]; then
