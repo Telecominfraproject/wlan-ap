@@ -484,6 +484,7 @@ void signal_handler(int sig)
     case SIGTERM:
     case SIGHUP:
         cleanup();
+        exit(0);
         break;
     default:
         break;
