@@ -538,7 +538,7 @@ function iface_reload_config(name, phydev, config, old_config)
 		return false;
 	}
 
-	if (iface.state() != "ENABLED") {
+	if (type(iface.state) != "function" || iface.state() != "ENABLED") {
 		hostapd.printf(`Interface ${iface_name} is not fully configured`);
 		return false;
 	}
