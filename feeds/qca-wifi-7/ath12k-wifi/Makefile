@@ -128,6 +128,8 @@ define Package/ath12k-wifi-cig-wf189/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/
 	$(INSTALL_DATA) ./board-2.bin.wf189-us.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin.US
 	$(INSTALL_DATA) ./board-2.bin.wf189-us.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin.US
+	$(INSTALL_DATA) ./board-2.bin.wf189-ca.QCN92XX $(1)/lib/firmware/ath12k/QCN92XX/hw1.0/board-2.bin.CA
+	$(INSTALL_DATA) ./board-2.bin.wf189-ca.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin.CA
 endef
 
 define Package/ath12k-wifi-edgecore-eap105/install
@@ -183,6 +185,8 @@ define Package/ath12k-wifi-cig-wf189w/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN6432/hw1.0/
 	$(INSTALL_DATA) ./board-2.bin.189w-us.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin.US
 	$(INSTALL_DATA) ./board-2.bin.189w-us.QCN6432 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/board-2.bin.US
+	$(INSTALL_DATA) ./board-2.bin.189w-ca.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin.CA
+	$(INSTALL_DATA) ./board-2.bin.189w-ca.QCN6432 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/board-2.bin.CA
 	$(INSTALL_DATA) ./ipq5332_qcn6432.regdb $(1)/lib/firmware/ath12k/QCN6432/hw1.0/regdb.bin
 endef
 
@@ -192,6 +196,8 @@ define Package/ath12k-wifi-cig-wf189h/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath12k/QCN6432/hw1.0/
 	$(INSTALL_DATA) ./board-2.bin.189h-us.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin.US
 	$(INSTALL_DATA) ./board-2.bin.189h-us.QCN6432 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/board-2.bin.US
+	$(INSTALL_DATA) ./board-2.bin.189h-ca.IPQ5332 $(1)/lib/firmware/ath12k/IPQ5332/hw1.0/board-2.bin.CA
+	$(INSTALL_DATA) ./board-2.bin.189h-ca.QCN6432 $(1)/lib/firmware/ath12k/QCN6432/hw1.0/board-2.bin.CA
 	$(INSTALL_DATA) ./ipq5332_qcn6432.regdb $(1)/lib/firmware/ath12k/QCN6432/hw1.0/regdb.bin
 endef
 
