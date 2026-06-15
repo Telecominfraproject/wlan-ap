@@ -14,7 +14,7 @@ define KernelPackage/mt798x-2p5g-phy
   DEPENDS:=@TARGET_mediatek +mt798x-2p5g-phy-firmware-internal
   KCONFIG:=CONFIG_MEDIATEK_2P5GE_PHY=m
   FILES:=$(LINUX_DIR)/drivers/net/phy/mediatek/mtk-2p5ge.ko
-  AUTOLOAD:=$(call AutoLoad,73,mtk-2p5ge)
+  AUTOLOAD:=$(call AutoLoad,73,mtk-2p5ge,1)
 endef
 
 define KernelPackage/mt798x-2p5g-phy/description
