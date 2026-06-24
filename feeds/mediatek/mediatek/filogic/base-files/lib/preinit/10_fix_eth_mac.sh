@@ -32,6 +32,19 @@ preinit_set_mac_address() {
 		addr=$(get_mac_binary "/tmp/tp_data/default-mac" 0)
 		ip link set dev eth1 address "$(macaddr_add $addr 1)"
 		;;
+	emplus,wap588m)
+		lan_mac_offset="0x2A"
+		wan_mac_offset="0x24"
+		part_name="Factory"
+		lan_mac=$(mtd_get_mac_binary $part_name $lan_mac_offset)
+		wan_mac=$(mtd_get_mac_binary $part_name $wan_mac_offset)
+		ip link set eth0 down
+		ip link set eth1 down
+		ip link set dev eth0 address "$wan_mac"
+		ip link set dev eth1 address "$lan_mac"
+		ip link set eth0 up
+		ip link set eth1 up
+		;;
 	*)
 		;;
 	esac
