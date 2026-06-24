@@ -1,0 +1,162 @@
+From: Tanya Singh <tanya_singh@accton.com>
+Date: Tue, 24 Jun 2026 12:00:00 +0000
+Subject: [PATCH] ath11k: fix inter-radio roaming ar mismatch and double
+ teardown
+
+This patch fixes two critical bugs in the inter-radio roaming path on
+IPQ60xx dual-radio SoCs that cause random WiFi client disconnections:
+
+Bug 1 - ar mismatch:
+When a station roams from wlan0 (5GHz) to wlan1 (2.4GHz), peer_create()
+on the new radio calls ath11k_peer_delete(ar=wlan1, vdev_id=wlan0_vdev).
+This causes reinit_completion() and wait_for_completion() to operate on
+wlan1->peer_delete_done, but the firmware response event resolves the
+radio by vdev_id and signals wlan0->peer_delete_done instead. The
+completion on wlan1 never arrives, causing a timeout every time.
+
+Fix: resolve the correct radio (old_ar) via ath11k_mac_get_ar_by_vdev_id()
+before calling ath11k_peer_delete(), and call it with old_ar so that the
+completion signal is symmetric.
+
+Bug 2 - double teardown race condition:
+When the station associates to the new radio, two concurrent paths try to
+delete the same peer: (1) peer_create on the new radio finds the old peer
+and tries to delete it, and (2) hostapd's "Prune association" triggers
+mac_op_sta_state NONE->NOTEXIST on the old radio which also tries to
+delete it. Without coordination, this causes num_peers underflow,
+rhashtable corruption, and potential use-after-free.
+
+Fix: use the existing peer->delete_in_progress flag as an atomic claim
+mechanism under tbl_mtx_lock + base_lock. Only the winner performs the
+teardown; the loser in peer_create returns -EAGAIN, and the loser in
+mac_op_sta_state skips the peer teardown while still performing mac80211
+bookkeeping.
+
+Signed-off-by: Tanya Singh <tanya_singh@accton.com>
+---
+ drivers/net/wireless/ath/ath11k/peer.c | 55 ++++++++++++++++++++++----
+ drivers/net/wireless/ath/ath11k/mac.c  | 33 ++++++++++++---
+ 2 files changed, 76 insertions(+), 12 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath11k/peer.c	2026-06-24 17:57:24.972091821 +0800
++++ b/drivers/net/wireless/ath/ath11k/peer.c	2026-06-24 17:59:45.645701071 +0800
+@@ -956,6 +956,8 @@ int ath11k_peer_create(struct ath11k *ar
+ 	struct ath11k_sta *arsta;
+ 	int ret, fbret;
+ 	u8 vdev_id = 0;
++	bool peer_claimed = false;
++	struct ath11k *old_ar = NULL;
+ 	int rhash_count;
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+@@ -985,17 +987,59 @@ int ath11k_peer_create(struct ath11k *ar
+ 	mutex_lock(&ar->ab->tbl_mtx_lock);
+ 	spin_lock_bh(&ar->ab->base_lock);
+ 	peer = ath11k_peer_find_by_addr(ar->ab, param->peer_addr);
+-	if (peer)
++	if (peer && !peer->delete_in_progress) {
+ 		vdev_id = peer->vdev_id;
++		peer->delete_in_progress = true;
++		peer_claimed = true;
++	} else if (peer && peer->delete_in_progress) {
++		/* Another path is already deleting this peer, retry later */
++		spin_unlock_bh(&ar->ab->base_lock);
++		mutex_unlock(&ar->ab->tbl_mtx_lock);
++		return -EAGAIN;
++	}
+ 	spin_unlock_bh(&ar->ab->base_lock);
+ 	mutex_unlock(&ar->ab->tbl_mtx_lock);
+ 
+-	if (peer) {
++	if (peer_claimed) {
+ 		if (vdev_id == param->vdev_id)
+ 			return -EINVAL;
+ 
+ 		ath11k_dp_peer_cleanup(ar, vdev_id, param->peer_addr);
+-		ath11k_peer_delete(ar, vdev_id, param->peer_addr);
++
++		/* Fix ar mismatch: resolve the correct radio that owns the old
++		 * vdev_id. We must call peer_delete through that radio so the
++		 * completion signal arrives on the correct peer_delete_done.
++		 */
++		rcu_read_lock();
++		old_ar = ath11k_mac_get_ar_by_vdev_id(ar->ab, vdev_id);
++		rcu_read_unlock();
++
++		if (!old_ar) {
++			ath11k_warn(ar->ab,
++				    "failed to find ar for old vdev_id %d during roaming\n",
++				    vdev_id);
++			old_ar = ar;
++		}
++
++		if (old_ar == ar) {
++			/* Same radio: no cross-radio mutex needed */
++			ret = ath11k_peer_delete(old_ar, vdev_id,
++						 param->peer_addr);
++		} else {
++			/* Cross-radio: need old radio's conf_mutex for
++			 * lockdep_assert_held inside ath11k_peer_delete
++			 */
++			mutex_lock(&old_ar->conf_mutex);
++			ret = ath11k_peer_delete(old_ar, vdev_id,
++						 param->peer_addr);
++			mutex_unlock(&old_ar->conf_mutex);
++		}
++
++		if (ret && ret != -ETIMEDOUT) {
++			ath11k_warn(ar->ab,
++				    "failed to delete old peer %pM vdev %d during roaming: %d\n",
++				    param->peer_addr, vdev_id, ret);
++		}
+ 	}
+ 
+ 	ret = ath11k_wmi_send_peer_create_cmd(ar, param);
+--- a/drivers/net/wireless/ath/ath11k/mac.c	2026-06-24 17:57:45.772331051 +0800
++++ b/drivers/net/wireless/ath/ath11k/mac.c	2026-06-24 18:00:39.118307996 +0800
+@@ -5728,15 +5728,38 @@ static int ath11k_mac_op_sta_state(struc
+ 				    sta->addr, arvif->vdev_id);
+ 	} else if ((old_state == IEEE80211_STA_NONE &&
+ 		    new_state == IEEE80211_STA_NOTEXIST)) {
+-		ath11k_dp_peer_cleanup(ar, arvif->vdev_id, sta->addr);
++		bool peer_claimed = false;
+ 
+-		ret = ath11k_peer_delete(ar, arvif->vdev_id, sta->addr);
+-		if (ret)
+-			ath11k_warn(ar->ab, "Failed to delete peer: %pM for VDEV: %d\n",
+-				    sta->addr, arvif->vdev_id);
+-		else
+-			ath11k_dbg(ar->ab, ATH11K_DBG_PEER, "Removed peer: %pM for VDEV: %d\n",
++		/* Fix double teardown: atomically claim the peer for deletion.
++		 * If peer_create on another radio already claimed it via
++		 * delete_in_progress, skip the teardown here but still do
++		 * mac80211-level bookkeeping (dec_num_stations etc).
++		 */
++		mutex_lock(&ar->ab->tbl_mtx_lock);
++		spin_lock_bh(&ar->ab->base_lock);
++		peer = ath11k_peer_find(ar->ab, arvif->vdev_id, sta->addr);
++		if (peer && !peer->delete_in_progress) {
++			peer->delete_in_progress = true;
++			peer_claimed = true;
++		}
++		spin_unlock_bh(&ar->ab->base_lock);
++		mutex_unlock(&ar->ab->tbl_mtx_lock);
++
++		if (peer_claimed) {
++			ath11k_dp_peer_cleanup(ar, arvif->vdev_id, sta->addr);
++
++			ret = ath11k_peer_delete(ar, arvif->vdev_id, sta->addr);
++			if (ret)
++				ath11k_warn(ar->ab, "Failed to delete peer: %pM for VDEV: %d\n",
++					    sta->addr, arvif->vdev_id);
++			else
++				ath11k_dbg(ar->ab, ATH11K_DBG_PEER, "Removed peer: %pM for VDEV: %d\n",
++					   sta->addr, arvif->vdev_id);
++		} else {
++			ath11k_dbg(ar->ab, ATH11K_DBG_MAC,
++				   "peer %pM vdev %d deletion already in progress, skipping teardown\n",
+ 				   sta->addr, arvif->vdev_id);
++		}
+ 
+ 		ath11k_mac_dec_num_stations(arvif, sta);
+ 		mutex_lock(&ar->ab->tbl_mtx_lock);
