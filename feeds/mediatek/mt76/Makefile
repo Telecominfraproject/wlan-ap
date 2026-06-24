@@ -759,6 +759,9 @@ define KernelPackage/mt7990-firmware/install
 		$(PKG_BUILD_DIR)/firmware/mt7996/mt7990_eeprom.bin \
 		$(PKG_BUILD_DIR)/firmware/mt7996/mt7990_eeprom_2i5i.bin \
 		$(1)/lib/firmware/mediatek/mt7996
+ifneq ($(filter "DEVICE_edgecore_eap115" "DEVICE_edgecore_eap115a",$(CONFIG_TARGET_PROFILE)),)
+	cp ./edgecore_eap115_eeprom.bin $(1)/lib/firmware/mediatek/mt7996/
+endif
 endef
 
 define Package/mt76-test/install
