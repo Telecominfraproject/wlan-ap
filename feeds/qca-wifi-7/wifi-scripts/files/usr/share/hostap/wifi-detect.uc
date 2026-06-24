@@ -237,14 +237,14 @@ function wiphy_detect() {
 
 		let entry = wiphy_get_entry(name, path);
 		entry.info = info;
-		if (phy.radios) {
-			entry.multi_radio = multi_radio;
-		} else if (length(keys(band_freq_data)) > 1) {
+
+		//Fixed the missing info.radios after updating to ATH 13.1
+		let synth_multi = {};
+		let synth_radios = [];
+		if (length(keys(band_freq_data)) > 1) {
 			// Synthesize multi_radio for multi-band phy when driver does not
 			// support NL80211_ATTR_WIPHY_RADIOS (e.g., older ath12k firmware)
 			let band_order = [ '2G', '5G', '6G', '60G' ];
-			let synth_multi = {};
-			let synth_radios = [];
 			let r_idx = 0;
 			for (let bn in band_order) {
 				if (!(bn in band_freq_data))
@@ -261,10 +261,15 @@ function wiphy_detect() {
 				});
 				r_idx++;
 			}
-			if (r_idx > 1) {
-				entry.multi_radio = synth_multi;
+			if(r_idx > 1)
 				entry.info.radios = synth_radios;
-			}
+		}
+		//end		
+
+		if (phy.radios) {
+			entry.multi_radio = multi_radio;
+		} else if (length(keys(band_freq_data)) > 1) {
+			entry.multi_radio = synth_multi;
 		}
 	}
 }
