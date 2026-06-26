@@ -1305,14 +1305,14 @@ hostapd_set_bss_options() {
 
 	set_default hs20 0
 	set_default disable_dgaf "$hs20"
-	set_default osen 0
+	#set_default osen 0
 	set_default anqp_domain_id 0
 	set_default hs20_deauth_req_timeout 60
 	if [ "$hs20" = "1" ]; then
 		append bss_conf "hs20=1" "$N"
 		append_hs20_icons
 		append bss_conf "disable_dgaf=$disable_dgaf" "$N"
-		append bss_conf "osen=$osen" "$N"
+		[ -n "$osen" ] && append bss_conf "osen=$osen" "$N"
 		append bss_conf "anqp_domain_id=$anqp_domain_id" "$N"
 		append bss_conf "hs20_deauth_req_timeout=$hs20_deauth_req_timeout" "$N"
 		[ -n "$osu_ssid" ] && append bss_conf "osu_ssid=$osu_ssid" "$N"
@@ -1324,7 +1324,7 @@ hostapd_set_bss_options() {
 		json_for_each_item append_hs20_oper_friendly_name hs20_oper_friendly_name
 		json_for_each_item append_hs20_conn_capab hs20_conn_capab
 		json_for_each_item append_osu_provider osu_provider
-		json_for_each_item append_operator_icon operator_icon
+		[ -n "$operator_icon" ] && json_for_each_item append_operator_icon operator_icon
 	fi
 
 	if [ "$eap_server" = "1" ]; then
