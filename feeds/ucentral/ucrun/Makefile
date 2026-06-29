@@ -1,13 +1,9 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=ucrun
+PKG_VERSION:=2022.02.19~5be6abeb
 PKG_RELEASE:=1
 
-PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL=https://github.com/ucentral-io/ucrun.git
-PKG_MIRROR_HASH:=6e9e77fcb6720febd9bcffb00c1822fc2ea18dda809e99fd2dd675d727f89132
-PKG_SOURCE_DATE:=2022-02-19
-PKG_SOURCE_VERSION:=5be6abebc4ae6057b47a5b3f0799d5ff01bc60c3
 CMAKE_INSTALL:=1
 
 PKG_LICENSE:=GPL-2.0-only
@@ -17,6 +13,12 @@ PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 
 include $(INCLUDE_DIR)/package.mk
 include $(INCLUDE_DIR)/cmake.mk
+
+define Build/Prepare
+	mkdir -p $(PKG_BUILD_DIR)
+	$(CP) ./src/* $(PKG_BUILD_DIR)/
+	$(Build/Patch)
+endef
 
 define Package/ucrun
   SECTION:=utils
