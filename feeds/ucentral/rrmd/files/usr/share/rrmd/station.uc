@@ -221,7 +221,7 @@ return {
 	},
 
 	kick: function(msg) {
-		if (!msg.addr || !msg.ban_time || !msg.reason)
+		if (!msg.addr || msg.ban_time == null || !msg.reason)
 			return false;
 
 		if (!exists(stations, msg.addr))
@@ -231,12 +231,37 @@ return {
 			addr: msg.addr,
 			reason: msg.reason,
 			deauth: 1,
-			ban_time: msg.ban_time,
+			ban_time: msg.ban_time || 30,
 			global_ban: msg.global_ban || false,
 		};
 
-		/* tell hostapd to kick a station via ubus */
-		global.ubus.conn.call(`hostapd.${stations[msg.addr].device}`, 'del_client', payload);
+		let device = stations[msg.addr].device;
+
+		/* kick from current device */
+		global.ubus.conn.call(`hostapd.${device}`, 'del_client', payload);
+
+		/* apply ban on all other interfaces to prevent roaming */
+		for (let d in global.local.status()) {
+			if (d != device)
+				global.ubus.conn.call(`hostapd.${d}`, 'del_client', payload);
+		}
+
+		/* clear captive portal auth state so client must re-authenticate after reconnect */
+		let uci = require('uci').cursor();
+		uci.foreach('uspot', 'uspot', function(s) {
+			if (s['.anonymous'])
+				return;
+			let ifnames = type(s.ifname) == 'array' ? s.ifname : [s.ifname];
+			for (let ifname in ifnames) {
+				if (ifname == device) {
+					global.ubus.conn.call('uspot', 'client_remove', {
+						interface: s['.name'],
+						address: msg.addr
+					});
+					break;
+				}
+			}
+		});
 
 		return true;
 	},
