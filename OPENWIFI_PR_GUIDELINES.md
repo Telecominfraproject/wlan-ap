@@ -7,7 +7,7 @@ How to submit and integrate pull requests for the OpenWiFi/OpenLAN repositories:
 - **`wlan-ucentral-client`** — the on-device uCentral client (C)
 
 Code formatting and commit-message rules live in
-[openwifi-coding-guidelines.md](openwifi-coding-guidelines.md). This document covers the
+[OPENWIFI_CODING_GUIDELINES.md](OPENWIFI_CODING_GUIDELINES.md). This document covers the
 **PR lifecycle** and has two tracks:
 
 - **[Part A — Contributor Guide](#part-a--contributor-guide):** submitting a PR.
@@ -35,9 +35,15 @@ see B7). Everything below is what each side does to make this work.
 Deliver a **clean, replayable sequence of standalone commits** so the integrator can replay
 your branch without rewriting it.
 
+> **Which base branch?** This guide covers **feature / general-fix PRs, which target
+> `main`.** A fix for an already-shipped release (4.2.x / 2.11.x) is a **backport PR that
+> targets `release/vX.Y.0`** and is cut from that release branch — see
+> [OPENWIFI_RELEASE_PROCEDURE.md](OPENWIFI_RELEASE_PROCEDURE.md).
+
 ## A1. Branch off the latest `main`, named after the ticket
 
-`main` is the integration branch — never branch off a release or `next`.
+`main` is the integration branch for feature work — branch feature/general-fix PRs off
+`main` (release backports branch off `release/vX.Y.0` instead; see the release procedure).
 
 ```bash
 git checkout main
@@ -114,7 +120,8 @@ it in `wlan-ucentral-schema` first, then bump the submodule in `wlan-ap` as its 
 - [ ] `main` builds at every commit.
 - [ ] PR description: what/why, ticket, affected targets/boards, **test evidence**.
 - [ ] Schema edited in `.yml` + regenerated; submodule bump is its own PR/commit.
-- [ ] PR targets `main`, not a release branch.
+- [ ] Feature/general-fix PR targets `main`; a release backport targets `release/vX.Y.0`
+      (see [OPENWIFI_RELEASE_PROCEDURE.md](OPENWIFI_RELEASE_PROCEDURE.md)).
 - [ ] `git log origin/main..HEAD` shows only your real commits, no merge lines.
 
 ---
@@ -208,13 +215,16 @@ Signed-off-by: ...
 
 ## B7. Releases
 
-- `main` is the integration branch — feature PRs land there first, **never on a release
-  branch**.
-- Releases are **semver tags with RC candidates** (`v4.2.x`, `v5.0.0`, `…-rcN`). Release/
-  version branches (`v2.8.0`, `release/v2.6.0`, `next`, `staging-*`) are the **only** place
-  merge commits are allowed — they integrate the release train, e.g.
-  `Merge pull request #509 from .../v2.8.0-rc4`.
-- Fixes are integrated on `main` and **cherry-picked into the release train**.
+- `main` is the integration branch — **feature PRs land there first**. Fixes for a shipped
+  release go onto its **`release/vX.Y.0`** branch (4.2.x, 2.11.x), not onto `main`.
+- Releases are **semver tags with RC candidates** (`v4.2.x`, `v2.11.x`, `…-rcN`), and every
+  `vX.Y.Z` tag lives **on the release branch**. Release branches are **merge-based** (the
+  opposite of `main`): fixes arrive as GitHub-merged PRs from `staging-*` (or vendor)
+  branches, e.g. `Merge pull request #1046 from .../staging-WIFI-15388-pmf-value-fix-for-4.2.3`.
+- Fixes that apply to the trunk are landed on `main` first and **cherry-picked** into the
+  release branch; **release-only** fixes are authored directly on the release-branch staging
+  branch. The full workflow — branching, backport PRs, version bump, tagging — is in
+  [OPENWIFI_RELEASE_PROCEDURE.md](OPENWIFI_RELEASE_PROCEDURE.md).
 
 ## B8. Reviewer / merger checklist
 
