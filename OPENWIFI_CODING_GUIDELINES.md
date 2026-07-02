@@ -7,7 +7,7 @@ Coding standards for the OpenWiFi/OpenLAN repositories:
 - **`wlan-ucentral-client`** — the on-device uCentral client (C)
 
 For the PR lifecycle (branching, submitting, integrating), see
-[openwifi-pr-guidelines.md](openwifi-pr-guidelines.md). This document covers **code
+[OPENWIFI_PR_GUIDELINES.md](OPENWIFI_PR_GUIDELINES.md). This document covers **code
 formatting, commit messages, and per-language conventions**.
 
 ---
