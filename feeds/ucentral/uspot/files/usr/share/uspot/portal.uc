@@ -254,7 +254,7 @@ return {
 		if (!ctx.mac) {
 			this.syslog(ctx, 'failed to look up mac');
 			include('error.uc', ctx);
-			return NULL;
+			return null;
 		}
 		ctx.spotfilter = lookup_station(ctx.mac);
 		ctx.config = config[ctx.spotfilter] || {};
@@ -272,7 +272,7 @@ return {
 		if (!connected) {
 			this.syslog(ctx, 'spotfilter error');
 			include('error.uc', ctx);
-			return NULL;
+			return null;
 		}
 		ctx.connected = connected;
 		if (!uam && connected?.state) {
