@@ -156,6 +156,7 @@ function generate_config(info, name, single_wiphy, id, radio_idx) {
 set ${s}.type='mac80211'
 set ${s}.${id}
 set ${s}.band='${lc(band_name)}'
+set ${s}.ifname_prefix='phy${lc(band_name)}'
 set ${s}.channel='${channel}'
 set ${s}.country='${country || ''}'
 set ${s}.macaddr_base='${macaddr_base || ''}'
