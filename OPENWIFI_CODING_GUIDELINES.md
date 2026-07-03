@@ -34,10 +34,11 @@ The history is **linear**. Keep it that way:
 Every commit follows the OpenWrt/kernel trailer style:
 
 ```
-<subsystem>: <imperative, lower-case summary, no trailing period>
+<subsystem>: <imperative summary — first word lower-case; proper nouns, board names, and identifiers keep their case; no trailing period>
 
-<body: why the change is needed and what it does, wrapped at ~72 cols.
-Use "-" bullet lists for multi-part fixes.>
+<Required body, wrapped at ~72 cols: explain why the change is needed, then what
+it does. Use "-" bullets for multi-part fixes. Record test evidence as plain text
+("Tested on EAP105 ...") for functional/board/driver changes.>
 
 Fixes: WIFI-15468
 Signed-off-by: Your Name <email>
@@ -49,8 +50,9 @@ Signed-off-by: Your Name <email>
   **mandatory**. Examples in use: `ucentral-schema:`, `ipq807x:`, `ucentral:`, `hostapd:`,
   `patches-25.12:`, `ucentral-client:`, `uspot:`, `netifd:`, `mac80211:`, `profiles:`,
   `qca-wifi-7:`, `config.yml:`.
-- **Lower-case after the colon**, imperative mood (`fix`, `add`, `remove`, `update`,
-  `disable`), **no trailing period**.
+- **First word after the colon is lower-case and imperative** (`fix`, `add`, `remove`,
+  `update`, `disable`); **preserve the case of proper nouns, board names, and identifiers**
+  (e.g. `SonicFi RAP630E`, `OpenWrt`, `RTGS`); **no trailing period**.
 - **Patch commits carry the OpenWrt version** in the prefix: `patches-25.12: …`. Bump the
   number when you renumber/rebase patches.
 - Target/driver prefixes can stack: `qca-wifi-7: wifi-scripts: fix …`,
@@ -66,9 +68,21 @@ config.yml: update OpenWrt baseline to v25.12.3
 
 ### Body
 
-- Explain **why**, then **what**. For multi-part fixes, lead with a one-line problem
-  statement, then a `-` bullet per root cause.
-- **`Fixes: <TICKET>`** references the tracker (`WIFI-#####`, `WLAN-####`).
+A body is **required** on every commit. Write it as plain text, not labelled
+sections:
+
+- **Explain why, then what.** Lead with the reason the change is needed (the bug, gap, or
+  motivation the diff can't show), then what the commit does. Imperative mood, wrapped at
+  ~72 columns; use `-` bullets for multi-part fixes.
+- **Record test evidence as plain text** for functional, board, or driver changes — e.g.
+  "Tested on EAP105 and EAP014, verified FT roam with no DHCP drop." This is required for
+  the changes B1 (Hardware risk) calls out; mechanical commits (bumps, renames, reverts)
+  need none. Optionally use a `Tested-by:` trailer when someone else verified the change.
+
+Trailers follow the body:
+
+- **`Fixes: <TICKET>`** (`WIFI-#####`, `WLAN-####`) **where the commit addresses a tracked
+  issue.** Bug fixes reference a ticket; refactors, additions, and bumps often have none.
 - **`Signed-off-by:` is required on every commit** (DCO). Preserve upstream sign-offs when
   forwarding a patch; add your own.
 
@@ -95,12 +109,30 @@ config.yml: update OpenWrt baseline to v25.12.3
 
 ---
 
-## 3. C code style (`wlan-ucentral-client`, packages)
+## 3. File headers (SPDX)
+
+Every **new** source file begins with an SPDX license identifier, written in that file's own
+comment syntax; for files with a shebang, the identifier goes **immediately after the
+shebang line**. Use the **same license as the rest of the package** — C sources in these
+repos use `BSD-3-Clause`. When editing an existing file, match its current header; don't
+change a file's license identifier as a drive-by.
+
+Comment syntax per language:
+
+- C / headers: `/* SPDX-License-Identifier: BSD-3-Clause */`
+- ucode (`.uc`): `// SPDX-License-Identifier: <package license>` — above `"use strict";`
+- Shell / procd init scripts: shebang first, then `# SPDX-License-Identifier: <package license>`
+- YAML / UCI config: `# SPDX-License-Identifier: <package license>`
+
+---
+
+## 4. C code style (`wlan-ucentral-client`, packages)
 
 Follow the **OpenWrt / libubox / Linux-kernel** idiom — be consistent with it, not with
 generic C conventions.
 
-- **`/* SPDX-License-Identifier: BSD-3-Clause */`** as the first line of every file.
+- **`/* SPDX-License-Identifier: BSD-3-Clause */`** as the first line of every C source and
+  header file (see §3 for the cross-language rule).
 - **Tabs for indentation.** Never spaces.
 - **K&R braces.** For function *definitions*, the return type and name go on the same line,
   but the opening brace is on its own line:
@@ -125,7 +157,7 @@ generic C conventions.
 
 ---
 
-## 4. ucode (`.uc`) style (`wlan-ucentral-schema` renderer & state)
+## 5. ucode (`.uc`) style (`wlan-ucentral-schema` renderer & state)
 
 - **`"use strict";`** at the top of every module.
 - **Tabs for indentation.**
@@ -148,7 +180,7 @@ generic C conventions.
 
 ---
 
-## 5. Schema authoring (`wlan-ucentral-schema`)
+## 6. Schema authoring (`wlan-ucentral-schema`)
 
 - **Author in YAML, never hand-edit generated JSON.** The source of truth is the
   `schema/*.yml` files (2-space indent); `ucentral.schema.json`, `*.pretty.json`, and the
@@ -162,13 +194,16 @@ generic C conventions.
 
 ---
 
-## 6. Quick checklist
+## 7. Quick checklist
 
 - [ ] One logical change per commit; tree builds at every commit.
-- [ ] Subject is `subsystem: imperative lower-case summary` with no trailing period.
-- [ ] Body explains *why*; multi-part fixes use `-` bullets; `Fixes: <TICKET>` where applicable.
+- [ ] Subject `subsystem: imperative summary`: first word lower-case, proper nouns/board
+      names keep their case, no trailing period.
+- [ ] Body present (why, then what); test evidence in plain text for functional/board/driver
+      changes; `Fixes: <TICKET>` where applicable.
 - [ ] `Signed-off-by:` present on every commit (yours preserved + upstream preserved).
-- [ ] C: tabs, SPDX header, `static`, blobmsg policy + `__MAX` sentinel, `ULOG_*` logging.
+- [ ] New source files carry an SPDX identifier (first line, or immediately after a shebang).
+- [ ] C: tabs, `static`, blobmsg policy + `__MAX` sentinel, `ULOG_*` logging.
 - [ ] ucode: `"use strict"`, tabs, `let`, helpers imported from `libs/`, null-guards + `assert()`.
 - [ ] Schema: edited the `.yml`, regenerated JSON via `generate.sh`, didn't hand-edit JSON.
 - [ ] Patch packages prefixed with the OpenWrt version (`patches-25.12: …`).
