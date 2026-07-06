@@ -1,8 +1,14 @@
 #!/bin/sh
 
-# https://github.com/qca/qca-swiss-army-knife.git
+tool_repo='https://github.com/qca/qca-swiss-army-knife.git'
 
-encoder=/code/qca/qca-swiss-army-knife/tools/scripts/ath12k/ath12k-bdencoder
+if [ -d /code/qca/qca-swiss-army-knife ]; then
+	encoder=/code/qca/qca-swiss-army-knife/tools/scripts/ath12k/ath12k-bdencoder
+else
+	[ ! -d /tmp/qca-swiss-army-knife ] && \
+		git clone $tool_repo /tmp/qca-swiss-army-knife
+	encoder=/tmp/qca-swiss-army-knife/tools/scripts/ath12k/ath12k-bdencoder
+fi
 
 $encoder -c board-2-eap105-IPQ5332.json -o board-2.bin.eap105.IPQ5332
 $encoder -c board-2-eap105-QCN92XX.json -o board-2.bin.eap105.QCN92XX
