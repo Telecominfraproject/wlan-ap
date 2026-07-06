@@ -27,3 +27,6 @@ $encoder -c board-2-nwa210be-QCN92XX.json -o board-2.bin.nwa210be.QCN92XX
 
 $encoder -c board-2-ap7330-IPQ5332.json -o board-2.bin.ap7330.IPQ5332
 $encoder -c board-2-ap7330-QCN92XX.json -o board-2.bin.ap7330.QCN92XX
+
+$encoder -c board-2-um-325be-IPQ5332.json -o board-2.bin.um-325be.IPQ5332
+$encoder -c board-2-um-325be-QCN92XX.json -o board-2.bin.um-325be.QCN92XX
