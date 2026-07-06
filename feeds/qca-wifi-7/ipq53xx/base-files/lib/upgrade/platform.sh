@@ -325,6 +325,7 @@ platform_do_upgrade() {
 		sonicfi_dualimage_check
 		nand_upgrade_tar "$1"
 		;;
+	indio,um-325be|\
 	zyxel,nwa130be|\
 	zyxel,nwa210be|\
 	zyxel,nwa50be)
