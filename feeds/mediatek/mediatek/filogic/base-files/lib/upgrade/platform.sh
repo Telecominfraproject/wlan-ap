@@ -217,6 +217,26 @@ platform_do_upgrade() {
 		CI_UBIPART="ubi_1"
 		nand_do_upgrade "$1"
 		;;
+	sonicfi,rap630w-211g)
+		local upgrade_kernel_part
+		local upgrade_rootfs_part
+		local upgrade_image_slot
+
+		upgrade_kernel_part=$(cmdline_get_var "boot_param.upgrade_kernel_part")
+		upgrade_rootfs_part=$(cmdline_get_var "boot_param.upgrade_rootfs_part")
+		upgrade_image_slot=$(cmdline_get_var "boot_param.upgrade_image_slot")
+
+		CI_UBIPART="ubi"
+		CI_KERNPART="${upgrade_kernel_part}"
+		CI_ROOTPART="${upgrade_rootfs_part}"
+
+		{
+			echo -e "dual_boot.current_slot\t${upgrade_image_slot}"
+			echo -e "dual_boot.slot_${upgrade_image_slot}_invalid\t0"
+		} > /tmp/fw_setenv.txt
+		CI_FWSETENV="-s /tmp/fw_setenv.txt"
+		nand_do_upgrade "$1"
+		;;
 	*)
 		nand_do_upgrade "$1"
 		;;
@@ -238,6 +258,13 @@ platform_check_image() {
 	bananapi,bpi-r4-poe|\
 	cmcc,rax3000m)
 		[ "$magic" != "d00dfeed" ] && {
+			echo "Invalid image type."
+			return 1
+		}
+		return 0
+		;;
+	sonicfi,rap630w-211g)
+		[ "$magic" != "73797375" ] && {
 			echo "Invalid image type."
 			return 1
 		}
