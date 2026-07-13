@@ -221,7 +221,7 @@ return {
 	},
 
 	kick: function(msg) {
-		if (!msg.addr || !msg.ban_time || !msg.reason)
+		if (!msg.addr || msg.ban_time == null || !msg.reason)
 			return false;
 
 		if (!exists(stations, msg.addr))
