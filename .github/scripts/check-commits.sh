@@ -12,6 +12,7 @@
 #   - missing Fixes: WIFI-#### trailer        (§2: "where applicable")
 #   - branch name not WIFI-<num>-<desc>       (A1; fork branches vary)
 #   - subject line longer than 72 chars
+#   - no explanatory body                     (§2; mechanical commits may skip)
 
 set -euo pipefail
 
@@ -24,6 +25,17 @@ range="${BASE_SHA}..${HEAD_SHA}"
 
 err()  { echo "::error::$*";   fail=1; }
 warn() { echo "::warning::$*"; }
+
+# Shorten a subject for display in messages so a runaway subject line doesn't
+# flood the annotations / PR comment. Reports the full length separately.
+trunc() {
+  local s="$1" max=80
+  if [ "${#s}" -gt "$max" ]; then
+    printf '%s…' "${s:0:max}"
+  else
+    printf '%s' "$s"
+  fi
+}
 
 # ---------------------------------------------------------------
 # 1. No merge commits — history must replay cleanly onto main
@@ -72,7 +84,7 @@ for sha in $(git rev-list --reverse --no-merges "$range"); do
   if echo "$subject" | grep -qE '^Revert "'; then
     : # standard revert format is fine; reason-in-body is reviewed by humans
   elif ! echo "$subject" | grep -qE "$SUBJECT_RE"; then
-    err "$short: subject '$subject' is not canonical. Use 'subsystem: imperative lower-case summary', no trailing period (e.g. 'ipq50xx: add SonicFi RAP630E')."
+    err "$short: subject '$(trunc "$subject")' is not canonical. Use 'subsystem: imperative lower-case summary', no trailing period (e.g. 'ipq50xx: add SonicFi RAP630E')."
   fi
 
   if [ "${#subject}" -gt 72 ]; then
@@ -84,9 +96,24 @@ for sha in $(git rev-list --reverse --no-merges "$range"); do
     err "$short: missing 'Signed-off-by: Name <email>' trailer (DCO, guidelines A3). Use 'git commit -s'."
   fi
 
-  # --- Fixes: trailer — expected, but 'where applicable' ---
-  if ! echo "$body" | grep -qE '^Fixes: (WIFI|WLAN)-[0-9]+'; then
+  # --- Fixes: trailer — expected 'where applicable'; must be capital-F 'Fixes:' ---
+  if echo "$body" | grep -qE '^Fixes: (WIFI|WLAN)-[0-9]+'; then
+    :  # correct: capital-F 'Fixes:' with a valid ticket
+  elif echo "$body" | grep -qiE '^fixes:' && ! echo "$body" | grep -qE '^Fixes:'; then
+    warn "$short: the trailer must be a capital-F 'Fixes: WIFI-#####' (found a different case) (guidelines A3)."
+  else
     warn "$short: no 'Fixes: WIFI-#####' trailer. Add one if this commit relates to a ticket (guidelines A3)."
+  fi
+
+  # --- Explanatory body — required by §2, but mechanical commits may skip ---
+  # "Body prose" = the message minus the subject, blank lines, and known
+  # trailers. If nothing is left, the commit has only a subject (+ trailers).
+  body_prose=$(git log -1 --format='%b' "$sha" \
+    | grep -vE '^[[:space:]]*$' \
+    | grep -viE '^(Signed-off-by|Fixes|Tested-by|Reviewed-by|Acked-by|Reported-by|Suggested-by|Co-developed-by|Co-authored-by|Cc|Link|Closes|Depends-on|Change-Id):' \
+    || true)
+  if [ -z "$body_prose" ]; then
+    warn "$short: no explanatory body — §2 expects why, then what. Mechanical commits (bumps, renames, reverts) may ignore this."
   fi
 done
 
