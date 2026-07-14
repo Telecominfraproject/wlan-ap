@@ -4,10 +4,10 @@ PKG_NAME:=ucentral-schema
 PKG_RELEASE:=1
 
 PKG_SOURCE_URL=https://github.com/Telecominfraproject/wlan-ucentral-schema.git
-PKG_MIRROR_HASH:=bd5fbf787c6951a95135a416faa6e8c0ac40edc46ddba0b5fd02a71fbdd6e70b
+PKG_MIRROR_HASH:=d65790b72224682dbf159f7e954102294b55a6cbaf43dbca0fc5d0ed7fa28a44
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_DATE:=2026-07-09
-PKG_SOURCE_VERSION:=7d85da69aede2fe5fe9e88fcd7b05ada21f0d4b3
+PKG_SOURCE_DATE:=2026-07-14
+PKG_SOURCE_VERSION:=23acec32bf25a53e2a9fee4d7c04926f27a7797b
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=BSD-3-Clause
 
