@@ -221,7 +221,7 @@ return {
 	},
 
 	kick: function(msg) {
-		if (!msg.addr || !msg.ban_time || !msg.reason)
+		if (!msg.addr || msg.ban_time == null || !msg.reason)
 			return false;
 
 		if (!exists(stations, msg.addr))
@@ -237,6 +237,35 @@ return {
 
 		/* tell hostapd to kick a station via ubus */
 		global.ubus.conn.call(`hostapd.${stations[msg.addr].device}`, 'del_client', payload);
+
+		/* clear captive portal auth state so client must re-authenticate after reconnect */
+		let uci = require('uci').cursor();
+		uci.foreach('uspot', 'uspot', function(s) {
+			if (s['.anonymous'])
+				return;
+			let ifnames = type(s.ifname) == 'array' ? s.ifname : [s.ifname];
+			for (let ifname in ifnames) {
+				if (ifname == stations[msg.addr].device) {
+					/*
+					 * go through uspot first so it can close out RADIUS
+					 * accounting (Acct-Stop) and its own bookkeeping, but
+					 * uspot only acts if the client is in *its* in-memory
+					 * cache. Also call spotfilter directly so the BPF
+					 * authorization entry is guaranteed to be cleared even
+					 * if that cache is stale (e.g. after a uspot restart).
+					 */
+					global.ubus.conn.call('uspot', 'client_remove', {
+						interface: s['.name'],
+						address: msg.addr
+					});
+					global.ubus.conn.call('spotfilter', 'client_remove', {
+						interface: s['.name'],
+						address: msg.addr
+					});
+					break;
+				}
+			}
+		});
 
 		return true;
 	},
