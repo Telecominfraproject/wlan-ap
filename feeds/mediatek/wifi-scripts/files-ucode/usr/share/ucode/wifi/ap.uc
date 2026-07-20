@@ -57,7 +57,7 @@ function iface_setup(config) {
 	append_vars(config, [
 		'ctrl_interface', 'ap_isolate', 'max_num_sta', 'ap_max_inactivity', 'airtime_bss_weight',
 		'airtime_bss_limit', 'airtime_sta_weight', 'bss_load_update_period', 'chan_util_avg_period',
-		'disassoc_low_ack', 'skip_inactivity_poll', 'ignore_broadcast_ssid', 'uapsd_advertisement_enabled',
+		'disassoc_low_ack', 'skip_inactivity_poll', 'ignore_broadcast_ssid', 'dynamic_probe_resp', 'uci_section', 'uapsd_advertisement_enabled',
 		'utf8_ssid', 'multi_ap', 'multi_ap_vlanid', 'multi_ap_profile', 'tdls_prohibit', 'bridge',
 		'wds_sta', 'wds_bridge', 'snoop_iface', 'vendor_elements', 'nas_identifier', 'radius_acct_interim_interval',
 		'ocv', 'multicast_to_unicast', 'preamble', 'proxy_arp', 'per_sta_vif', 'mbo',
@@ -375,6 +375,7 @@ function iface_roaming(config) {
 	set_default(config, 'mobility_domain', substr(md5(config.ssid), 0, 4));
 	set_default(config, 'ft_psk_generate_local', config.auth_type == 'psk');
 	set_default(config, 'ft_iface', config.network_ifname);
+	set_default(config, 'ft_l2_refresh', 30);
 
 	if (!config.ft_psk_generate_local) {
 		if (!config.r0kh || !config.r1kh) {
@@ -398,7 +399,7 @@ function iface_roaming(config) {
 
 	append_vars(config, [
 		'mobility_domain', 'ft_psk_generate_local', 'ft_over_ds', 'reassociation_deadline',
-		'ft_iface'
+		'ft_iface', 'ft_l2_refresh'
 	]);
 }
 
