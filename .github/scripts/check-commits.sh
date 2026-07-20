@@ -10,7 +10,7 @@
 # WARNINGS (annotate, don't fail — "typically"/"where applicable" rules):
 #   - more than 3 commits                     (A1: "typically 1-3")
 #   - missing Fixes: WIFI-#### trailer        (§2: "where applicable")
-#   - branch name not WIFI-<num>-<desc>       (A1; fork branches vary)
+#   - branch name not staging-WIFI-<num>-<desc> (A1; fork branches vary)
 #   - subject line longer than 72 chars
 #   - no explanatory body                     (§2; mechanical commits may skip)
 
@@ -58,10 +58,10 @@ elif [ "$count" -gt 3 ]; then
 fi
 
 # ---------------------------------------------------------------
-# 3. Branch naming — WIFI-<number>-<short-kebab-description>
+# 3. Branch naming — staging-WIFI-<number>-<short-hyphenated-description>
 # ---------------------------------------------------------------
-if [ -n "$HEAD_REF" ] && ! echo "$HEAD_REF" | grep -qE '^(WIFI|WLAN)-[0-9]+-[a-zA-Z0-9-]+$'; then
-  warn "Branch '$HEAD_REF' does not match WIFI-<number>-<short-kebab-description> (guidelines A1)."
+if [ -n "$HEAD_REF" ] && ! echo "$HEAD_REF" | grep -qE '^staging-(WIFI|WLAN)-[0-9]+-[a-zA-Z0-9.-]+$'; then
+  warn "Branch '$HEAD_REF' does not match staging-WIFI-<number>-<short-hyphenated-description> (guidelines A1)."
 fi
 
 # ---------------------------------------------------------------
