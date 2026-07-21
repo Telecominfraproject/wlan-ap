@@ -1943,15 +1943,14 @@ define Device/emplus_wap588m
    PAGESIZE := 2048
    IMAGE_SIZE := 65536k
    KERNEL_IN_UBI := 1
-   FIT_KEY_DIR := $(DTS_DIR)/keys/emplus_wap588m
-   FIT_KEY_NAME := fit_key
    IMAGES += factory.bin
    IMAGE/factory.bin := append-ubi | check-size $$$$(IMAGE_SIZE)
    IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
    KERNEL = kernel-bin | lzma | \
-     fit-sign lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
+     fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
    KERNEL_INITRAMFS = kernel-bin | lzma | \
-     fit-sign lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd
+     fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd
+
  endef
  TARGET_DEVICES += emplus_wap588m
 
