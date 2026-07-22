@@ -63,6 +63,7 @@ function iface_setup(config) {
 		'ocv', 'multicast_to_unicast', 'preamble', 'proxy_arp', 'per_sta_vif', 'mbo',
 		'bss_transition', 'wnm_sleep_mode', 'wnm_sleep_mode_no_keys', 'qos_map_set', 'max_listen_int',
 		'dtim_period', 'wmm_enabled', 'start_disabled', 'na_mcast_to_ucast',
+		'radius_require_message_authenticator',
 	]);
 }
 
@@ -175,7 +176,7 @@ function iface_auth_type(config) {
 
 		if (config.radius_das_client && config.radius_das_secret) {
 			set_default(config, 'radius_das_port', 3799);
-			set_default(config, 'radius_das_client', `${config.radius_das_client} ${config.radius_das_secret}`);
+			config.radius_das_client = `${config.radius_das_client} ${config.radius_das_secret}`;
 		}
 
 		set_default(config, 'eapol_version', config.wpa & 1);
@@ -184,6 +185,23 @@ function iface_auth_type(config) {
 		append('eapol_key_index_workaround', '1');
 		append('ieee8021x', '1');
 
+		break;
+
+	case 'psk2-radius':
+		/* WPA2-PSK, but the PSK is fetched from the RADIUS server during
+		 * the 4-way handshake so clients can be centrally tracked. */
+		set_default(config, 'ieee80211w', 1);
+		set_default(config, 'radius_require_message_authenticator', 0);
+		config.vlan_possible = 1;
+		config.wpa_psk_radius = 3;
+		config.macaddr_acl = 2;
+
+		iface_authentication_server(config);
+
+		if (config.radius_das_client && config.radius_das_secret) {
+			set_default(config, 'radius_das_port', 3799);
+			config.radius_das_client = `${config.radius_das_client} ${config.radius_das_secret}`;
+		}
 		break;
 	}
 
