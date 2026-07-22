@@ -47,6 +47,11 @@ export function parse_encryption(config, dev_config) {
 		wpa3_pairwise = null;
 		break;
 
+	case 'psk2-radius':
+		/* WPA2-PSK with the PSK fetched from RADIUS (client tracking) */
+		wpa3_pairwise = null;
+		break;
+
 	case 'sae':
 	case 'psk3':
 		config.auth_type = 'sae';
@@ -155,6 +160,12 @@ export function wpa_key_mgmt(config) {
 			append_value(config, 'wpa_key_mgmt', 'FT-PSK');
 		if (config.ieee80211w)
 			append_value(config, 'wpa_key_mgmt', 'WPA-PSK-SHA256');
+		break;
+
+	case 'psk2-radius':
+		append_value(config, 'wpa_key_mgmt', 'WPA-PSK');
+		if (config.ieee80211r)
+			append_value(config, 'wpa_key_mgmt', 'FT-PSK');
 		break;
 
 	case 'eap':
