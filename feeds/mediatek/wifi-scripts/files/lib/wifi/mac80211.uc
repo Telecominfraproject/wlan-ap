@@ -114,9 +114,10 @@ for (let phy_name, phy in board.wlan) {
 			num_global_macaddr = board.wlan.defaults.ssids?.[band_name]?.mac_count;
 		}
 
-		if (length(info.radios) > 0)
+		if (length(info.radios) > 0) {
 			id += `\nset ${s}.radio='${radio.index}'`;
-
+			id += `\nset ${s}.sku_idx='${radio.index}'`;
+		}
 		if (has_mlo)
 			init_mld = true;
 
