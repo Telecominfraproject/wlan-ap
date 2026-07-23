@@ -23,5 +23,6 @@ cd ${BUILD_DIR}
 cd -
 
 echo "### Building image ..."
+cp ${ROOT_PATH}/feeds/python/python-async-timeout/Makefile ${BUILD_DIR}/feeds/packages/lang/python/python-async-timeout
 cd $BUILD_DIR
 make -j$(nproc) V=s
