@@ -81,12 +81,12 @@ if [ $mlo_add_flag -eq 0 ]; then
 fi
 
 MP_CONFIG_INT="mesh_retry_timeout mesh_confirm_timeout mesh_holding_timeout mesh_max_peer_links
-	       mesh_max_retries mesh_ttl mesh_element_ttl mesh_hwmp_max_preq_retries
-	       mesh_path_refresh_time mesh_min_discovery_timeout mesh_hwmp_active_path_timeout
-	       mesh_hwmp_preq_min_interval mesh_hwmp_net_diameter_traversal_time mesh_hwmp_rootmode
-	       mesh_hwmp_rann_interval mesh_gate_announcements mesh_sync_offset_max_neighor
-	       mesh_rssi_threshold mesh_hwmp_active_path_to_root_timeout mesh_hwmp_root_interval
-	       mesh_hwmp_confirmation_interval mesh_awake_window mesh_plink_timeout"
+		mesh_max_retries mesh_ttl mesh_element_ttl mesh_hwmp_max_preq_retries
+		mesh_path_refresh_time mesh_min_discovery_timeout mesh_hwmp_active_path_timeout
+		mesh_hwmp_preq_min_interval mesh_hwmp_net_diameter_traversal_time mesh_hwmp_rootmode
+		mesh_hwmp_rann_interval mesh_gate_announcements mesh_sync_offset_max_neighor
+		mesh_rssi_threshold mesh_hwmp_active_path_to_root_timeout mesh_hwmp_root_interval
+		mesh_hwmp_confirmation_interval mesh_awake_window mesh_plink_timeout"
 MP_CONFIG_BOOL="mesh_auto_open_plinks mesh_fwding"
 MP_CONFIG_STRING="mesh_power_mode"
 
@@ -163,16 +163,16 @@ dpp_ifaces=
 #epcs params
 enable_epcs=
 epcs_params="epcs_he_mu_edca_ac_be_aifsn epcs_he_mu_edca_ac_be_aci epcs_he_mu_edca_ac_be_ecwmin
-	     epcs_he_mu_edca_ac_be_ecwmax epcs_he_mu_edca_ac_be_timer epcs_he_mu_edca_ac_bk_aifsn
-	     epcs_he_mu_edca_ac_bk_aci epcs_he_mu_edca_ac_bk_ecwmin epcs_he_mu_edca_ac_bk_ecwmax
-	     epcs_he_mu_edca_ac_bk_timer epcs_he_mu_edca_ac_vi_ecwmin epcs_he_mu_edca_ac_vi_ecwmax
-	     epcs_he_mu_edca_ac_vi_aifsn epcs_he_mu_edca_ac_vi_aci epcs_he_mu_edca_ac_vi_timer
-	     epcs_he_mu_edca_ac_vo_aifsn epcs_he_mu_edca_ac_vo_aci epcs_he_mu_edca_ac_vo_ecwmin
-	     epcs_he_mu_edca_ac_vo_ecwmax epcs_he_mu_edca_ac_vo_timer epcs_wmm_ac_be_cwmin
-	     epcs_wmm_ac_be_cwmax epcs_wmm_ac_be_aifs epcs_wmm_ac_be_txop_limit epcs_wmm_ac_bk_cwmin
-	     epcs_wmm_ac_bk_cwmax epcs_wmm_ac_bk_aifs epcs_wmm_ac_bk_txop_limit epcs_wmm_ac_vi_cwmin
-	     epcs_wmm_ac_vi_cwmax epcs_wmm_ac_vi_aifs epcs_wmm_ac_vi_txop_limit epcs_wmm_ac_vo_cwmin
-	     epcs_wmm_ac_vo_cwmax epcs_wmm_ac_vo_aifs epcs_wmm_ac_vo_txop_limit"
+		epcs_he_mu_edca_ac_be_ecwmax epcs_he_mu_edca_ac_be_timer epcs_he_mu_edca_ac_bk_aifsn
+		epcs_he_mu_edca_ac_bk_aci epcs_he_mu_edca_ac_bk_ecwmin epcs_he_mu_edca_ac_bk_ecwmax
+		epcs_he_mu_edca_ac_bk_timer epcs_he_mu_edca_ac_vi_ecwmin epcs_he_mu_edca_ac_vi_ecwmax
+		epcs_he_mu_edca_ac_vi_aifsn epcs_he_mu_edca_ac_vi_aci epcs_he_mu_edca_ac_vi_timer
+		epcs_he_mu_edca_ac_vo_aifsn epcs_he_mu_edca_ac_vo_aci epcs_he_mu_edca_ac_vo_ecwmin
+		epcs_he_mu_edca_ac_vo_ecwmax epcs_he_mu_edca_ac_vo_timer epcs_wmm_ac_be_cwmin
+		epcs_wmm_ac_be_cwmax epcs_wmm_ac_be_aifs epcs_wmm_ac_be_txop_limit epcs_wmm_ac_bk_cwmin
+		epcs_wmm_ac_bk_cwmax epcs_wmm_ac_bk_aifs epcs_wmm_ac_bk_txop_limit epcs_wmm_ac_vi_cwmin
+		epcs_wmm_ac_vi_cwmax epcs_wmm_ac_vi_aifs epcs_wmm_ac_vi_txop_limit epcs_wmm_ac_vo_cwmin
+		epcs_wmm_ac_vo_cwmax epcs_wmm_ac_vo_aifs epcs_wmm_ac_vo_txop_limit"
 ttlm_enable=
 enable_dscp_policy_capa=
 
@@ -180,40 +180,40 @@ enable_dscp_policy_capa=
 atf_offload=
 
 mac80211_freq_to_channel() {
-        local freq=$1
+	local freq=$1
 
-        if [ "$freq" -lt 1000 ]; then
+	if [ "$freq" -lt 1000 ]; then
 		echo 0
 		return
-        fi
-        if [ "$freq" -eq 2484 ]; then
+	fi
+	if [ "$freq" -eq 2484 ]; then
 		echo 14
 		return
-        fi
-        if [ "$freq" -eq 5935 ]; then
+	fi
+	if [ "$freq" -eq 5935 ]; then
 		echo 2
 		return
-        fi
-        if [ "$freq" -lt 2484 ]; then
+	fi
+	if [ "$freq" -lt 2484 ]; then
 		echo $(((freq-2407)/5))
 		return
-        fi
-        if [ "$freq" -ge 4910 ] && [ "$freq" -le 4980 ]; then
+	fi
+	if [ "$freq" -ge 4910 ] && [ "$freq" -le 4980 ]; then
 		echo $(((freq-4000)/5))
 		return
-        fi
-        if [ "$freq" -lt 5950 ]; then
+	fi
+	if [ "$freq" -lt 5950 ]; then
 		echo $(((freq-5000)/5))
 		return
-        fi
-        if [ "$freq" -le 45000 ]; then
+	fi
+	if [ "$freq" -le 45000 ]; then
 		echo $(((freq-5950)/5))
 		return
-        fi
-        if [ "$freq" -ge 58320 ] && [ "$freq" -le 70200 ]; then
+	fi
+	if [ "$freq" -ge 58320 ] && [ "$freq" -le 70200 ]; then
 		echo $(((freq-56160)/5))
 		return
-        fi
+	fi
 }
 
 wdev_tool() {
@@ -388,30 +388,30 @@ get_sta_freq_list() {
 	freq1=$1
 	freq2=$2
 
-        case "$band_name" in
-                2g) band="1:";;
-                5gl|5gh|5g) band="2:";;
-                60g) band="3:";;
-                6g|6gl|6gh) band="4:";;
-        esac
+	case "$band_name" in
+		2g) band="1:";;
+		5gl|5gh|5g) band="2:";;
+		60g) band="3:";;
+		6g|6gl|6gh) band="4:";;
+	esac
 
 	iw "$phy" info | awk -v band="$band" -v min="$freq1" -v max="$freq2" '
 
 $1 ~ /Band/ {
-        band_match = band == $2
+	band_match = band == $2
 }
 
 band_match && $3 == "MHz" {
-        freq = $2
-         if (freq >= min && freq <= max) {
-                print int($2)
-        }
+	freq = $2
+	if (freq >= min && freq <= max) {
+		print int($2)
+	}
 }
 ' | tr '\n' ' '
 }
 
 cfg_append() {
-        echo "$1" >> "$2"
+	echo "$1" >> "$2"
 }
 
 mac80211_prepare_atf_config() {
@@ -480,7 +480,7 @@ mac80211_prepare_atf_config() {
 		config_get atf_device "$1" device
 
 		if [[ "$device" != "$atf_device" ]]; then
-                        return
+			return
 		fi
 
 		config_get cmd "$1" command
@@ -923,7 +923,7 @@ mac80211_hostapd_setup_base() {
 	case "$htmode" in
 		HE*) enable_ax=1 ;;
 		EHT*) enable_ax=1; enable_be=1
-		      [ -n "$disable_eml_cap" ] && append base_cfg "disable_eml_cap=$disable_eml_cap" "$N"
+			[ -n "$disable_eml_cap" ] && append base_cfg "disable_eml_cap=$disable_eml_cap" "$N"
 		;;
 	esac
 
@@ -1185,10 +1185,10 @@ mac80211_hostapd_setup_bss() {
 
 	[ "$wds" -gt 0 ] && {
 		wds_support=$(mac80211_wds_support_check "$phy")
-                if [ "$wds_support" -ne 1 ]; then
-                        echo WDS is supported only in native wifi mode for ath11k driver. Kindly update the config > /dev/ttyMSM0
-                        return
-                fi
+		if [ "$wds_support" -ne 1 ]; then
+			echo WDS is supported only in native wifi mode for ath11k driver. Kindly update the config > /dev/ttyMSM0
+			return
+		fi
 
 		append hostapd_cfg "wds_sta=1" "$N"
 		[ -n "$wds_bridge" ] && append hostapd_cfg "wds_bridge=$wds_bridge" "$N"
@@ -1212,7 +1212,7 @@ mac80211_hostapd_setup_bss() {
 		elif [ -n "$multiple_bssid" ] && [ "$multiple_bssid" -eq 3 ] && [ $((id % mbssid_group_size)) == "0" ]; then
 			append hostapd_cfg "$fils_cfg" "$N"
 		fi
-        fi
+	fi
 
 	if [ -n "$enable_scs" ]; then
 		append hostapd_cfg "enable_scs=$enable_scs" "$N"
@@ -1279,9 +1279,9 @@ mac80211_hostapd_setup_bss() {
 			;;
 	esac
 
-        [ -n "$commitatf" ] && append hostapd_cfg "commitatf=$commitatf" "$N"
-        [ -n "$atfssidsched" ] && append hostapd_cfg "atfssidsched=$atfssidsched" "$N"
-        [ -n "$atfssidgroup" ] && append hostapd_cfg "atfssidgroup=$atfssidgroup" "$N"
+	[ -n "$commitatf" ] && append hostapd_cfg "commitatf=$commitatf" "$N"
+	[ -n "$atfssidsched" ] && append hostapd_cfg "atfssidsched=$atfssidsched" "$N"
+	[ -n "$atfssidgroup" ] && append hostapd_cfg "atfssidgroup=$atfssidgroup" "$N"
 
 	cat >> /var/run/hostapd-$phy$vif_phy_suffix.conf <<EOF
 $hostapd_cfg
@@ -1404,7 +1404,7 @@ find_phy() {
 }
 
 mac80211_check_ap() {
-        has_ap=$((has_ap+1))
+	has_ap=$((has_ap+1))
 }
 
 mac80211_get_band_name() {
@@ -1462,20 +1462,21 @@ mac80211_prepare_vif() {
 			adhoc) prefix=ibss;;
 			monitor) prefix=mon;;
 		esac
-                if [ "$is_wiphy_multi_radio" -eq 1 ]; then
-                        if [[ "$htmode" == EHT* ]] && [ -n "$mld" ]; then
+
+		if [ "$is_wiphy_multi_radio" -eq 1 ]; then
+			if [[ "$htmode" == EHT* ]] && [ -n "$mld" ]; then
 				config_get mld_ifname "$mld" ifname
 				if [ -z "$mld_ifname" ]; then
 					ifname=$phy-$mld
 				else
 					ifname="$mld_ifname"
 				fi
-                        else
+			else
 				mac80211_set_ifname "$ifname_prefix" "$prefix"
-                        fi
-                else
-                        mac80211_set_ifname "$ifname_prefix" "$prefix"
-                fi
+			fi
+		else
+			mac80211_set_ifname "$ifname_prefix" "$prefix"
+		fi
 
 	}
 
@@ -1486,12 +1487,12 @@ mac80211_prepare_vif() {
 
 	[ -z $ppe_vp ] && ppe_vp="ds"
 
-        if [ $mode == "mesh" ] && [ $ppe_vp == "ds" ]; then
-                ppe_vp="passive"
-        fi
-        if [ $mode == "monitor" ]; then
-                 append mon_ifname "$ifname"
-        fi
+	if [ $mode == "mesh" ] && [ $ppe_vp == "ds" ]; then
+		ppe_vp="passive"
+	fi
+	if [ $mode == "monitor" ]; then
+		append mon_ifname "$ifname"
+	fi
 
 	append active_ifnames "$ifname"
 	set_default wds 0
@@ -1677,93 +1678,93 @@ mac80211_setup_mesh() {
 }
 
 mac80211_get_seg0() {
-        local ht_mode="$1"
-        local seg0=0
+	local ht_mode="$1"
+	local seg0=0
 
-        case "$ht_mode" in
-                40)
-                        if [ "$freq" -gt 5950 ] && [ "$freq" -le 7115 ]; then
-                                case "$(( (channel / 4) % 2 ))" in
-                                        1) seg0=$((channel - 2));;
-                                        0) seg0=$((channel + 2));;
-                                esac
-                        elif [ "$freq" -lt 2484 ]; then
-                                if [ "$channel" -lt 7 ]; then
-                                        seg0=$((channel + 2))
-                                else
-                                        seg0=$((channel - 2))
-                                fi
-                        elif [ "$freq" != 5935 ]; then
-                                case "$(( (channel / 4) % 2 ))" in
-                                        1) seg0=$((channel + 2));;
-                                        0) seg0=$((channel - 2));;
-                                esac
-                        fi
-                ;;
+	case "$ht_mode" in
+		40)
+			if [ "$freq" -gt 5950 ] && [ "$freq" -le 7115 ]; then
+				case "$(( (channel / 4) % 2 ))" in
+					1) seg0=$((channel - 2));;
+					0) seg0=$((channel + 2));;
+				esac
+			elif [ "$freq" -lt 2484 ]; then
+				if [ "$channel" -lt 7 ]; then
+					seg0=$((channel + 2))
+				else
+					seg0=$((channel - 2))
+				fi
+			elif [ "$freq" != 5935 ]; then
+				case "$(( (channel / 4) % 2 ))" in
+					1) seg0=$((channel + 2));;
+					0) seg0=$((channel - 2));;
+				esac
+			fi
+		;;
 		80)
-                        if [ "$freq" -gt 5950 ] && [ "$freq" -le 7115 ]; then
-                                case "$(( (channel / 4) % 4 ))" in
-                                        0) seg0=$((channel + 6));;
-                                        1) seg0=$((channel + 2));;
-                                        2) seg0=$((channel - 2));;
-                                        3) seg0=$((channel - 6));;
-                                esac
-                        elif [ "$freq" != 5935 ]; then
-                                case "$(( (channel / 4) % 4 ))" in
-                                        1) seg0=$((channel + 6));;
-                                        2) seg0=$((channel + 2));;
-                                        3) seg0=$((channel - 2));;
-                                        0) seg0=$((channel - 6));;
-                                esac
-                        fi
-                ;;
+			if [ "$freq" -gt 5950 ] && [ "$freq" -le 7115 ]; then
+				case "$(( (channel / 4) % 4 ))" in
+					0) seg0=$((channel + 6));;
+					1) seg0=$((channel + 2));;
+					2) seg0=$((channel - 2));;
+					3) seg0=$((channel - 6));;
+				esac
+			elif [ "$freq" != 5935 ]; then
+				case "$(( (channel / 4) % 4 ))" in
+					1) seg0=$((channel + 6));;
+					2) seg0=$((channel + 2));;
+					3) seg0=$((channel - 2));;
+					0) seg0=$((channel - 6));;
+				esac
+			fi
+		;;
 		160)
-                        if [ "$freq" -gt 5950 ] && [ "$freq" -le 7115 ]; then
-                                case "$channel" in
-                                        1|5|9|13|17|21|25|29) seg0=15;;
-                                        33|37|41|45|49|53|57|61) seg0=47;;
-                                        65|69|73|77|81|85|89|93) seg0=79;;
-                                        97|101|105|109|113|117|121|125) seg0=111;;
-                                        129|133|137|141|145|149|153|157) seg0=143;;
-                                        161|165|169|173|177|181|185|189) seg0=175;;
-                                        193|197|201|205|209|213|217|221) seg0=207;;
-                                esac
-                        elif [ "$freq" != 5935 ]; then
-                                case "$channel" in
-                                        36|40|44|48|52|56|60|64) seg0=50;;
-                                        100|104|108|112|116|120|124|128) seg0=114;;
-                                        149|153|157|161|165|169|173|177) seg0=163;;
-                                esac
-                        fi
-                ;;
+			if [ "$freq" -gt 5950 ] && [ "$freq" -le 7115 ]; then
+				case "$channel" in
+					1|5|9|13|17|21|25|29) seg0=15;;
+					33|37|41|45|49|53|57|61) seg0=47;;
+					65|69|73|77|81|85|89|93) seg0=79;;
+					97|101|105|109|113|117|121|125) seg0=111;;
+					129|133|137|141|145|149|153|157) seg0=143;;
+					161|165|169|173|177|181|185|189) seg0=175;;
+					193|197|201|205|209|213|217|221) seg0=207;;
+				esac
+			elif [ "$freq" != 5935 ]; then
+				case "$channel" in
+					36|40|44|48|52|56|60|64) seg0=50;;
+					100|104|108|112|116|120|124|128) seg0=114;;
+					149|153|157|161|165|169|173|177) seg0=163;;
+				esac
+			fi
+		;;
 		320)
-                        if [ "$freq" -ge 5955 ] && [ "$freq" -le 7115 ]; then
-                                case "$channel" in
-                                        1|5|9|13|17|21|25|29|33|37|41|45) seg0=31;;
-                                        49|53|57|61|65|69|73|77) seg0=63;;
-                                        81|85|89|93|97|101|105|109) seg0=95;;
-                                        113|117|121|125|129|133|137|141) seg0=127;;
-                                        145|149|153|157|161|165|169|173) seg0=159;;
-                                        177|181|185|189|193|197|201|205|209|213|217|221) seg0=191;;
-                                esac
-                        elif [ "$freq" -ge 5500 ] && [ "$freq" -le 5730 ]; then
-                                seg0=130
-                        fi
-                ;;
-                esac
-                printf "$seg0"
+			if [ "$freq" -ge 5955 ] && [ "$freq" -le 7115 ]; then
+				case "$channel" in
+					1|5|9|13|17|21|25|29|33|37|41|45) seg0=31;;
+					49|53|57|61|65|69|73|77) seg0=63;;
+					81|85|89|93|97|101|105|109) seg0=95;;
+					113|117|121|125|129|133|137|141) seg0=127;;
+					145|149|153|157|161|165|169|173) seg0=159;;
+					177|181|185|189|193|197|201|205|209|213|217|221) seg0=191;;
+				esac
+			elif [ "$freq" -ge 5500 ] && [ "$freq" -le 5730 ]; then
+				seg0=130
+			fi
+		;;
+	esac
+	printf "$seg0"
 }
 
 get_seg0_freq() {
-        local ctrl_freq="$1"
-        local ctrl_chan="$2"
-        local seg0_chan="$3"
+	local ctrl_freq="$1"
+	local ctrl_chan="$2"
+	local seg0_chan="$3"
 
-        if [ $((seg0_chan)) -gt $((ctrl_chan)) ]; then
-                printf $(($ctrl_freq + (($seg0_chan - $ctrl_chan) * 5)))
-        else
-                printf $(($ctrl_freq - (($ctrl_chan - $seg0_chan) * 5)))
-        fi
+	if [ $((seg0_chan)) -gt $((ctrl_chan)) ]; then
+		printf $(($ctrl_freq + (($seg0_chan - $ctrl_chan) * 5)))
+	else
+		printf $(($ctrl_freq - (($ctrl_chan - $seg0_chan) * 5)))
+	fi
 }
 
 mac80211_setup_monitor() {
@@ -1775,21 +1776,21 @@ mac80211_setup_monitor() {
 	[ -n "$freq" ] && json_add_string freq "$freq"
 	json_add_string htmode "$htmode"
 	case "$htmode" in
-                VHT20|HT20|HE20|EHT20)
-                        bw=20
-                        ;;
-                HT40*|VHT40|HE40|EHT40)
-                        bw=40
+		VHT20|HT20|HE20|EHT20)
+			bw=20
+		;;
+		HT40*|VHT40|HE40|EHT40)
+			bw=40
 			center_freq=$(get_seg0_freq "$freq" "$channel" "$(mac80211_get_seg0 40)")
-                        ;;
-                VHT80|HE80|EHT80)
-                        bw=80
-                        center_freq=$(get_seg0_freq "$freq" "$channel" "$(mac80211_get_seg0 80)")
-                        ;;
-                VHT160|HE160|EHT160)
-                        bw=160
-                        center_freq=$(get_seg0_freq "$freq" "$channel" "$(mac80211_get_seg0 160)")
-                        ;;
+		;;
+		VHT80|HE80|EHT80)
+			bw=80
+			center_freq=$(get_seg0_freq "$freq" "$channel" "$(mac80211_get_seg0 80)")
+		;;
+		VHT160|HE160|EHT160)
+			bw=160
+			center_freq=$(get_seg0_freq "$freq" "$channel" "$(mac80211_get_seg0 160)")
+		;;
 		EHT320)
 			if [ "$band" = "6g" ]; then
 				bw=320
@@ -1800,14 +1801,14 @@ mac80211_setup_monitor() {
 				fi
 				center_freq=$(get_seg0_freq "$freq" "$channel" "$idx")
 			fi
-			;;
-        esac
+		;;
+	esac
 
-        if [ $is_wiphy_multi_radio -eq 1 ]; then
-                json_add_boolean is_multi_radio 1
-                [ -n "$center_freq" ] && json_add_string center_freq "$center_freq"
-                json_add_string bw "$bw"
-        fi
+	if [ $is_wiphy_multi_radio -eq 1 ]; then
+		json_add_boolean is_multi_radio 1
+		[ -n "$center_freq" ] && json_add_string center_freq "$center_freq"
+		json_add_string bw "$bw"
+	fi
 	json_close_object
 
 	json_set_namespace "$prev"
@@ -1884,20 +1885,20 @@ mac80211_set_vif_txpower() {
 }
 
 mac80211_set_fq_limit() {
-        json_select data
-        json_get_vars ifname
-        json_select ..
+	json_select data
+	json_get_vars ifname
+	json_select ..
 
-        json_select config
-        json_get_vars fq_limit
+	json_select config
+	json_get_vars fq_limit
 
-        if [ "$fq_limit" -gt 0 ]; then
-                tc qdisc add dev "$ifname" parent :1 fq_codel limit "$fq_limit"
-                tc qdisc add dev "$ifname" parent :2 fq_codel limit "$fq_limit"
-                tc qdisc add dev "$ifname" parent :3 fq_codel limit "$fq_limit"
-                tc qdisc add dev "$ifname" parent :4 fq_codel limit "$fq_limit"
-        fi
-        json_select ..
+	if [ "$fq_limit" -gt 0 ]; then
+		tc qdisc add dev "$ifname" parent :1 fq_codel limit "$fq_limit"
+		tc qdisc add dev "$ifname" parent :2 fq_codel limit "$fq_limit"
+		tc qdisc add dev "$ifname" parent :3 fq_codel limit "$fq_limit"
+		tc qdisc add dev "$ifname" parent :4 fq_codel limit "$fq_limit"
+	fi
+	json_select ..
 }
 
 wpa_supplicant_init_config() {
@@ -2166,9 +2167,9 @@ drv_mac80211_setup() {
 
 	if [ "$is_wiphy_multi_radio" -eq 1 ]; then
 		echo [debug] $device - radio as $radio > /tmp/logs
-        else
-                radio=-1
-        fi
+	else
+		radio=-1
+	fi
 
 	[ -f /tmp/mlo_support.txt ] && mlo_add_flag=$(cat /tmp/mlo_support.txt)
 	if [ $mlo_add_flag -eq 0 ]; then
@@ -2193,13 +2194,13 @@ drv_mac80211_setup() {
 	if [ $mlo_add_flag -eq 0 ]; then
 		if [ "$(cat /sys/module/ath12k/parameters/ppe_rfs_support)" == 'Y' ]; then
 			# Note: ppe_vp_accel and ppe_vp_rfs are mutually exclusive.
-			#       ppe_vp_accel enables PPE acceleration path and ppe_vp_rfs
-			#       is expected to enable only flow steering for VLAN type
-			#       interface (eg: WDS root).
+			#	ppe_vp_accel enables PPE acceleration path and ppe_vp_rfs
+			#	is expected to enable only flow steering for VLAN type
+			#	interface (eg: WDS root).
 			echo 1 >> /sys/module/mac80211/parameters/ppe_vp_rfs
 			# Note: Format is default MLO mask followed by band specific core masks
-			#       in order of 2 GHz, 5 GHz and 6GHz bands
-			#       echo <DEFAULT/ MLO MASK>,<2GHZ MASK>,<5GHZ MASK>,<6GHZ_MASK>
+			#	in order of 2 GHz, 5 GHz and 6GHz bands
+			#	echo <DEFAULT/ MLO MASK>,<2GHZ MASK>,<5GHZ MASK>,<6GHZ_MASK>
 			echo 0x7,0x7,0x7,0x7 > /sys/module/ath12k/parameters/rfs_core_mask
 
 			if [ "$(cat /sys/module/mac80211/parameters/ppe_vp_accel)" == 'Y' ]; then
@@ -2300,10 +2301,10 @@ drv_mac80211_setup() {
 	for_each_interface "sta adhoc mesh" mac80211_set_noscan
 	[ -n "$has_ap" ] && mac80211_hostapd_setup_base "$phy"
 
-        if [ "$mlo_add_flag" = 1 ]; then
+	if [ "$mlo_add_flag" = 1 ]; then
 		for_each_interface "ap" mac80211_prepare_vif
-                return;
-        fi
+		return;
+	fi
 
 	local prev
 	json_set_namespace wdev_uc prev
@@ -2403,40 +2404,40 @@ mac80211_derive_ml_info() {
 	fi
 
 	mac80211_get_wifi_ifaces() {
-	        config_get iface_mode "$1" mode
-	        if [ -n "$iface_mode" ] && [ "$iface_mode" = "sta" ]; then
-	                 append _staifaces "$1"
-	        fi
+		config_get iface_mode "$1" mode
+		if [ -n "$iface_mode" ] && [ "$iface_mode" = "sta" ]; then
+			append _staifaces "$1"
+		fi
 	}
 	config_foreach mac80211_get_wifi_ifaces wifi-iface
 
 	if [ -z "$_staifaces" ]; then
-	        return
+		return
 	fi
 
 	for _mld in $_mlds
 	do
-	        for _staifname in $_staifaces
-	        do
-	                config_get mld_name "$_staifname" mld
-	                config_get mldevice "$_staifname" device
-	                if [ ${#mldevice} -ne 12 ]; then
-	                        continue;
-	                fi
-
-	                if ! [[ "$sta_mldevices" =~ "$mldevice" ]]; then
-
-	                        if [ -n "$mld_name" ] &&  [ "$_mld" = "$mld_name" ]; then
-	                        	append sta_mldevices "$mldevice"
-	                                config_get disabled "$mldevice" disabled
-	                                if [ "$disabled" -eq 1 ]; then
-	                                        continue;
-	                                fi
-	                                config_get radio "$mldevice" radio
-	                                append _sta_radios $radio
-	                        fi
-	                fi
-	        done
+		for _staifname in $_staifaces
+		do
+			config_get mld_name "$_staifname" mld
+			config_get mldevice "$_staifname" device
+			if [ ${#mldevice} -ne 12 ]; then
+				continue;
+			fi
+			
+			if ! [[ "$sta_mldevices" =~ "$mldevice" ]]; then
+			
+				if [ -n "$mld_name" ] &&  [ "$_mld" = "$mld_name" ]; then
+					append sta_mldevices "$mldevice"
+					config_get disabled "$mldevice" disabled
+				if [ "$disabled" -eq 1 ]; then
+					continue;
+				fi
+					config_get radio "$mldevice" radio
+					append _sta_radios $radio
+				fi
+			fi
+		done
 	done
 }
 
