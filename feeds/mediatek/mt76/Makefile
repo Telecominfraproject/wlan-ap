@@ -324,7 +324,12 @@ define KernelPackage/mt7996e
   	   +@KERNEL_RELAY +@DRIVER_11BE_SUPPORT
   FILES:= $(PKG_BUILD_DIR)/mt7996/mt7996e.ko
   AUTOLOAD:=$(call AutoProbe,mt7996e)
-  MODPARAMS.mt7996e:=wed_enable=1
+  ifneq ($(filter "DEVICE_edgecore_eap115" "DEVICE_edgecore_eap115a",$(CONFIG_TARGET_PROFILE)),)
+    # Disable WED (flow offload) on EAP115/EAP115a to avoid data-path regression
+    MODPARAMS.mt7996e:=wed_enable=0
+  else
+    MODPARAMS.mt7996e:=wed_enable=1
+  endif
 endef
 
 define KernelPackage/mt7992-firmware
