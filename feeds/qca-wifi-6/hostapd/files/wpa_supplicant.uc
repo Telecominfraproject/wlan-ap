@@ -33,6 +33,33 @@ function iface_stop(iface)
 	iface.running = false;
 }
 
+function disable_wds_offload(phydev, ifname, config)
+{
+	if (!config["4addr"])
+		return null;
+	/*
+	 * phydev.name may be phy0.0;
+	 * debugfs is actually always phydev.phy, for example phy0.
+	 */
+	let path =
+		`/sys/kernel/debug/ieee80211/${phydev.phy}/netdev:${ifname}/disable_offload`;
+
+	let fp = open(path, "w");
+	if (!fp)
+		return `unable to open ${path}`;
+
+	let written = fp.write("1\n");
+	let closed = fp.close();
+	let value = readfile(path);
+
+	if (written != 2 || !closed || 
+	    value == null || trim(value) != "1")
+		return `unable to set ${path}`;
+
+	wpas.printf(`WDS: disable_offload=1 on ${ifname}`);
+	return null;
+}
+
 function iface_start(phydev, iface, macaddr_list)
 {
 	let phy = phydev.name;
@@ -50,8 +77,19 @@ function iface_start(phydev, iface, macaddr_list)
 	wpas.data.iface_phy[ifname] = phy;
 	wdev_remove(ifname);
 	let ret = phydev.wdev_add(ifname, wdev_config);
-	if (ret)
+	if (ret) {
 		wpas.printf(`Failed to create device ${ifname}: ${ret}`);
+		delete wpas.data.iface_phy[ifname];
+		return;
+	}
+
+	ret = disable_wds_offload(phydev, ifname, wdev_config);
+	if (ret) {
+		wpas.printf(`WDS setup failed for ${ifname}: ${ret}`);
+		delete wpas.data.iface_phy[ifname];
+		wdev_remove(ifname);
+		return;
+	}
 	wdev_set_up(ifname, true);
 	wpas.add_iface(iface.config);
 	iface.running = true;
