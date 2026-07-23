@@ -371,7 +371,7 @@ setup_model()
 	elif [[ $board == *"bpi-r4"* ]]; then
 		dbg "setup_model: bpi-r4 NUM_WIFI_CARD=$num_of_wifi"
 		MT7988 $num_of_wifi
-	elif [[ $board == *"7987"* ]]; then
+	elif [[ $board == *"7987"* || $board == "edgecore,eap115" || $board == "edgecore,eap115a" ]]; then
 		dbg "setup_model: MT7987 NUM_WIFI_CARD=$num_of_wifi"
 		MT7988 $num_of_wifi
 	fi
@@ -437,6 +437,16 @@ set_rps_cpus()
 			fi
 		fi
 	done
+
+	board=$(board_name)
+	case $board in
+	edgecore,eap115|\
+	edgecore,eap115a)
+		# for EAP115, change CPU loading of ethter traffic on Core0 and Core2
+		echo 4 > /sys/class/net/eth0/queues/rx-0/rps_cpus
+		echo 4 > /sys/class/net/eth1/queues/rx-0/rps_cpus
+		;;
+	esac
 }
 
 set_smp_affinity()
