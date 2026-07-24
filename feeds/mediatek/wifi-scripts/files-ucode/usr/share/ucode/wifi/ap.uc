@@ -73,6 +73,12 @@ function iface_authentication_server(config) {
 		append_vars(config, [ 'auth_server_port', 'auth_server_shared_secret' ]);
 	}
 
+	if (config.auth_server_secondary) {
+		append('auth_server_addr', config.auth_server_secondary);
+		append('auth_server_port', config.auth_port_secondary);
+		append('auth_server_shared_secret', config.auth_secret_secondary);
+	}
+
 	append_vars(config, [ 'radius_auth_req_attr' ]);
 }
 
@@ -80,6 +86,12 @@ function iface_accounting_server(config) {
 	for (let server in config.acct_server_addr) {
 		append('acct_server_addr', server);
 		append_vars(config, [ 'acct_server_port', 'acct_server_shared_secret' ]);
+	}
+
+	if (config.acct_server_secondary) {
+		append('acct_server_addr', config.acct_server_secondary);
+		append('acct_server_port', config.acct_port_secondary);
+		append('acct_server_shared_secret', config.acct_secret_secondary);
 	}
 
 	append_vars(config, [ 'radius_acct_req_attr' ]);
