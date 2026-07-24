@@ -6,6 +6,7 @@
 #include "hostapd.h"
 #include "beacon.h"
 #include "hw_features.h"
+#include "ieee802_11_auth.h"
 #include "ap_drv_ops.h"
 #include "dfs.h"
 #include "acs.h"
@@ -703,6 +704,121 @@ out:
 		interfaces->ctrl_iface_init(hapd);
 
 	return ret ? NULL : ucv_boolean_new(true);
+}
+
+
+int hostapd_ucode_sta_auth(struct hostapd_data *hapd, struct sta_info *sta)
+{
+	char addr[sizeof(MACSTR)];
+	uc_value_t *val, *cur;
+	int ret = 0;
+
+	if (wpa_ucode_call_prepare("sta_auth"))
+		return 0;
+
+	uc_value_push(ucv_get(ucv_string_new(hapd->conf->iface)));
+
+	snprintf(addr, sizeof(addr), MACSTR, MAC2STR(sta->addr));
+	val = ucv_string_new(addr);
+	uc_value_push(ucv_get(val));
+
+	val = wpa_ucode_call(2);
+
+	cur = ucv_object_get(val, "psk", NULL);
+	if (ucv_type(cur) == UC_ARRAY) {
+		struct hostapd_sta_wpa_psk_short *p, **next;
+		size_t len = ucv_array_length(cur);
+
+		next = &sta->psk;
+		hostapd_free_psk_list(*next);
+		*next = NULL;
+
+		for (size_t i = 0; i < len; i++) {
+			uc_value_t *cur_psk;
+			const char *str;
+			size_t str_len;
+
+			cur_psk = ucv_array_get(cur, i);
+			str = ucv_string_get(cur_psk);
+			if (!str)
+				continue;
+			str_len = strlen(str);
+			if (str_len < 8 || str_len > 64)
+				continue;
+
+			p = os_zalloc(sizeof(*p));
+			if (!p)
+				continue;
+
+			if (str_len == 64) {
+				if (hexstr2bin(str, p->psk, PMK_LEN) < 0) {
+					os_free(p);
+					continue;
+				}
+			} else {
+				p->is_passphrase = 1;
+				os_memcpy(p->passphrase, str, str_len + 1);
+			}
+
+			*next = p;
+			next = &p->next;
+		}
+	}
+
+	cur = ucv_object_get(val, "force_psk", NULL);
+	sta->use_sta_psk = ucv_is_truish(cur);
+
+	cur = ucv_object_get(val, "status", NULL);
+	if (ucv_type(cur) == UC_INTEGER)
+		ret = ucv_int64_get(cur);
+
+	ucv_put(val);
+	ucv_gc(vm);
+
+	return ret;
+}
+
+void hostapd_ucode_sta_connected(struct hostapd_data *hapd, struct sta_info *sta)
+{
+	char addr[sizeof(MACSTR)];
+	uc_value_t *val, *cur;
+
+	if (wpa_ucode_call_prepare("sta_connected"))
+		return;
+
+	uc_value_push(ucv_get(ucv_string_new(hapd->conf->iface)));
+
+	snprintf(addr, sizeof(addr), MACSTR, MAC2STR(sta->addr));
+	val = ucv_string_new(addr);
+	uc_value_push(ucv_get(val));
+
+	val = ucv_object_new(vm);
+	if (sta->psk_idx)
+		ucv_object_add(val, "psk_idx", ucv_int64_new(sta->psk_idx - 1));
+	if (sta->psk)
+		ucv_object_add(val, "psk", ucv_string_new(sta->psk->passphrase));
+	if (sta->vlan_id)
+		ucv_object_add(val, "vlan", ucv_int64_new(sta->vlan_id));
+	uc_value_push(ucv_get(val));
+
+	val = wpa_ucode_call(3);
+	if (ucv_type(val) != UC_OBJECT)
+		goto out;
+
+	cur = ucv_object_get(val, "vlan", NULL);
+	if (ucv_type(cur) == UC_INTEGER) {
+		struct vlan_description vdesc = {
+			.notempty = 1,
+			.untagged = ucv_int64_get(cur),
+		};
+
+		ap_sta_set_vlan(hapd, sta, &vdesc);
+		ap_sta_bind_vlan(hapd, sta);
+	}
+
+out:
+	ucv_put(val);
+	ucv_gc(vm);
 }
 
 
