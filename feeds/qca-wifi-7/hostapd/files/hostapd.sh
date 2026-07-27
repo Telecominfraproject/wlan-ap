@@ -1028,7 +1028,7 @@ hostapd_set_bss_options() {
 						return 1
 					fi
 					[ -z "$ft_key" ] && {
-						key=`echo -n "$mobility_domain/$auth_secret" | md5sum | awk '{print $1}'`
+						key=`echo -n "$mobility_domain/${auth_secret:-$key}" | md5sum | awk '{print $1}'`
 
 						set_default r0kh "ff:ff:ff:ff:ff:ff,*,$key"
 						set_default r1kh "00:00:00:00:00:00,00:00:00:00:00:00,$key"
