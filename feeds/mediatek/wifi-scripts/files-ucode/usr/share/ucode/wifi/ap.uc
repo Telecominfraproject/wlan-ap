@@ -395,6 +395,7 @@ function iface_eap_server(config) {
 	append_vars(config, [
 		'eap_server', 'eap_server_erp', 'eap_user_file', 'ca_cert', 'server_cert',
 		'private_key', 'private_key_passwd', 'server_id',
+		'radius_server_clients', 'radius_server_auth_port',
 	]);
 }
 
@@ -472,15 +473,58 @@ function iface_key_caching(config) {
 	]);
 }
 
+function iface_hs20_icons(uci) {
+	uci.foreach('wireless', 'hs20-icon', (s) => {
+		append_raw(`hs20_icon=${s.width}:${s.height}:${s.lang}:${s.type}:${s['.name']}:${s.path}`);
+	});
+}
+
+function iface_osu_provider(uci, name) {
+	let s = uci.get_all('wireless', name);
+	if (!s || s['.type'] != 'osu-provider')
+		return;
+
+	append_raw('# provider ' + name);
+	append('osu_server_uri', s.osu_server_uri);
+	append('osu_nai', s.osu_nai);
+	append('osu_nai2', s.osu_nai2);
+	append('osu_method_list', s.osu_method);
+
+	for (let desc in s.osu_service_desc)
+		append('osu_service_desc', desc);
+	for (let name in s.osu_friendly_name)
+		append('osu_friendly_name', name);
+	for (let icon in s.osu_icon)
+		append('osu_icon', icon);
+
+	append_raw('');
+}
+
 function iface_hs20(config) {
 	if (!config.hs20)
 		return;
 
+	set_default(config, 'disable_dgaf', config.hs20);
+
 	append_vars(config, [
 		'hs20', 'disable_dgaf', 'anqp_domain_id', 'hs20_deauth_req_timeout',
 		'hs20_wan_metrics', 'hs20_operating_class', 'hs20_t_c_filename', 'hs20_t_c_timestamp',
-		'hs20_t_c_server_url', 'hs20_conn_capab'
+		'hs20_t_c_server_url', 'osu_ssid'
 	]);
+
+	/* repeated keys: one line per entry */
+	for (let name in config.hs20_oper_friendly_name)
+		append('hs20_oper_friendly_name', name);
+	for (let capab in config.hs20_conn_capab)
+		append('hs20_conn_capab', capab);
+	for (let icon in config.operator_icon)
+		append('operator_icon', icon);
+
+	/* hs20-icon and osu-provider live in separate wireless sections */
+	let uci = libuci.cursor();
+	iface_hs20_icons(uci);
+	for (let name in config.osu_provider)
+		iface_osu_provider(uci, name);
 }
 
 function iface_interworking(config) {
@@ -488,18 +532,31 @@ function iface_interworking(config) {
 		return;
 	
 	config.interworking = true;
-	
+
+	/* domain_name is a single comma-separated directive */
 	if (config.domain_name)
 		config.domain_name = join(',', config.domain_name);
 
+	/* 3GPP cellular network info is a single semicolon-separated directive */
 	if (config.anqp_3gpp_cell_net)
-		config.domain_name = join(',', config.anqp_3gpp_cell_net);
+		config.anqp_3gpp_cell_net = join(';', config.anqp_3gpp_cell_net);
 
 	append_vars(config, [
 		'interworking', 'internet', 'asra', 'uesa', 'access_network_type', 'hessid', 'venue_group',
-		'venue_type', 'network_auth_type', 'gas_address3', 'roaming_consortium', 'anqp_elem', 'nai_realm',
-		'venue_name', 'venue_url', 'domain_name', 'anqp_3gpp_cell_net',
+		'venue_type', 'network_auth_type', 'gas_address3', 'domain_name', 'anqp_3gpp_cell_net',
 	]);
+
+	/* these keys must be emitted once per list entry */
+	for (let oi in config.roaming_consortium)
+		append('roaming_consortium', oi);
+	for (let elem in config.anqp_elem)
+		append('anqp_elem', elem);
+	for (let realm in config.nai_realm)
+		append('nai_realm', realm);
+	for (let name in config.venue_name)
+		append('venue_name', name);
+	for (let url in config.venue_url)
+		append('venue_url', url);
 }
 
 function iface_rates(config, dev_config) {

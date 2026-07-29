@@ -16,6 +16,10 @@ export function parse_encryption(config, dev_config) {
 	if (!config.wpa)
 		config.wpa_pairwise = null;
 
+	/* OSEN (OSU Server-only authenticated L2 Encryption Network) */
+	if (wildcard(config.encryption, '*osen*'))
+		config.auth_osen = true;
+
 	config.wpa_pairwise = (config.hw_mode == 'ad') ? 'GCMP' : 'CCMP';
 	config.auth_type = encryption[0] ?? 'none';
 
@@ -149,8 +153,12 @@ export function parse_encryption(config, dev_config) {
 };
 
 export function wpa_key_mgmt(config) {
-	if (!config.wpa)
+	if (!config.wpa) {
+		/* OSEN can be used on an otherwise open OSU BSS */
+		if (config.auth_osen)
+			config.wpa_key_mgmt = 'OSEN';
 		return;
+	}
 
 	switch(config.auth_type) {
 	case 'psk':
@@ -306,6 +314,9 @@ export function wpa_key_mgmt(config) {
 			break;
 		}
 	}
+
+	if (config.auth_osen)
+		append_value(config, 'wpa_key_mgmt', 'OSEN');
 
 	if (config.rsn_override && config.rsn_override_key_mgmt_2)
 		config.key_mgmt = config.rsn_override_key_mgmt_2;
