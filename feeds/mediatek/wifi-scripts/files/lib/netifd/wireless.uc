@@ -149,7 +149,12 @@ function config_init(uci)
 
 		let radios = map(dev_names, (v) => radio_idx[v]);
 		radios = filter(radios, (v) => v != null);
-		let radio_config = map(dev_names, (v) => devices[v].config);
+		// null-guard: a wifi-iface may reference a device whose wireless
+		// handler is not registered (e.g. morse radio2 when the morse handler
+		// did not load). devices[v] is then null; without ?. this throws
+		// "left-hand side expression is null" and aborts config_init for ALL
+		// radios (2.4G/5G included), causing an endless setup-retry loop.
+		let radio_config = map(dev_names, (v) => devices[v]?.config);
 		let mlo_created = false;
 
 		for (let dev_name in dev_names) {

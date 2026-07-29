@@ -1,0 +1,128 @@
+#!/bin/sh
+
+# Auto-detect and configure Morse Micro HaLow PHY on USB hotplug
+# Triggered when a new ieee80211 PHY is registered
+#
+# Flow:
+#   1) Check $DEVPATH points to an ieee80211 PHY with a morse_* driver
+#   2) Run `wifi config` which invokes detect_morse() to create
+#      wireless.radioN=wifi-device and wireless.default_radioN=wifi-iface
+#   3) Bring the radio up via `wifi up <radio>`
+
+[ "$ACTION" = "add" ] || exit 0
+[ -n "$DEVPATH" ] || exit 0
+
+PHY_NAME="${DEVPATH##*/}"
+[ -d "/sys/class/ieee80211/${PHY_NAME}" ] || exit 0
+
+# Check driver is morse_* (USB or SDIO/SPI variants)
+DRV_LINK=$(readlink -f "/sys/class/ieee80211/${PHY_NAME}/device/driver" 2>/dev/null)
+DRV_NAME="${DRV_LINK##*/}"
+case "$DRV_NAME" in
+morse_*) ;;
+*) exit 0 ;;
+esac
+
+logger -t morse-hotplug "Morse PHY ${PHY_NAME} (driver=${DRV_NAME}) detected"
+
+# CRITICAL TIMING GATE — wait until the morse PHY is *fully* ready before we
+# ever let netifd run drv_morse_setup on it.
+#
+# Root cause this guards against (proven on 25.12 native netifd):
+#   The ieee80211 hotplug 'add' fires at ieee80211_register_hw() time, i.e.
+#   the moment /sys/class/ieee80211/phyN appears (~10.2s) - BUT firmware load
+#   + morse_mac_init + the driver's auto-wlan creation only finish ~1.3s later
+#   (~11.6s). If drv_morse_setup runs in that window, find_phy() fails ->
+#   the handler returns without ever sending wireless_set_up -> netifd's
+#   shared wdev state machine retries/teardowns forever -> it drags the PCIe
+#   mt7996 (radio0/radio1) into the same churn -> netifd busy-loops, network
+#   dies. A fixed `sleep 2` "happened" to clear the bar but is fragile
+#   (firmware load time varies). Poll for the real readiness signal instead:
+#   the driver auto-creates a wlan* netdev under the phy once mac_init done.
+_ready=0
+_i=0
+while [ "$_i" -lt 100 ]; do   # up to ~20s (200ms * 100), well past the ~1.3s gap
+	# phy dir must still exist (dongle not yanked mid-settle)
+	[ -d "/sys/class/ieee80211/${PHY_NAME}" ] || break
+	# Readiness signal: the morse debugfs node
+	# /sys/kernel/debug/ieee80211/<phy>/morse only appears after the driver
+	# has finished firmware load + morse_mac_init. This is the reliable
+	# ready marker for the USB dongle (verified on EAP115). The old check
+	# (a netdev under device/net/) does NOT work for the USB morse phy: the
+	# driver's auto-wlan does not populate .../device/net the way the PCIe
+	# radios do, so that check hung until timeout and this handler aborted,
+	# leaving radio2 out of netifd entirely (no wlan, no hostapd_s1g).
+	if [ -e "/sys/kernel/debug/ieee80211/${PHY_NAME}/morse" ]; then
+		_ready=1
+		break
+	fi
+	# Fallback: some driver variants do populate a netdev under the phy.
+	if [ -n "$(ls -1 "/sys/class/ieee80211/${PHY_NAME}/device/net/" 2>/dev/null)" ]; then
+		_ready=1
+		break
+	fi
+	usleep 200000 2>/dev/null || sleep 1
+	_i=$((_i + 1))
+done
+if [ "$_ready" != 1 ]; then
+	logger -t morse-hotplug "PHY ${PHY_NAME} not ready after wait; aborting (netifd will not be asked to setup an unready morse phy)"
+	exit 0
+fi
+logger -t morse-hotplug "PHY ${PHY_NAME} ready (netdev populated), proceeding"
+
+# Let OpenWrt framework handle detection. `wifi config` invokes detect_morse()
+# which creates the wifi-device / wifi-iface for the new morse PHY.
+/sbin/wifi config
+
+# Bring up every morse radio now that the phy is proven ready.
+#
+# morse radios now DEFAULT to enabled (disabled=0, like 7EC) because the
+# netifd busy-loop is root-fixed by patch 0186. So this hotplug is no longer
+# the thing that "enables" a morse radio - it is the thing that guarantees a
+# successful bring-up AFTER the USB phy is fully ready. On boot netifd may run
+# drv_morse_setup while the USB dongle is still enumerating (phy0 absent):
+# find_phy() fails there and the handler bails harmlessly (0186 means no
+# busy-loop), but no wlan interface gets created. This hotplug fires once the
+# phy netdev is populated, so we (re)bring-up the morse radio(s) here and
+# find_phy() is guaranteed to succeed -> wlanN is created, hostapd_s1g starts.
+#
+# IMPORTANT: only touch morse radios. `wifi up <radio>` reconfigures just that
+# device via netifd, leaving the PCIe 2G/5G radios (radio0/radio1) running.
+# A global `wifi reload` would tear down AND rebuild every radio and race with
+# the in-progress 2G/5G bring-up (WDS-STA-INTERFACE-REMOVED / Reason 3 DEAUTH).
+# Walk ALL radio slots (not just contiguous morse ones): on EAP115 the morse
+# radio is radio2, preceded by PCIe radio0/radio1, so a "while type == morse"
+# loop from 0 would stop immediately and never reach radio2.
+morse_radios=
+morse_committed=
+devidx=0
+while [ -n "$(uci -q get wireless.radio${devidx}.type)" ]; do
+	if [ "$(uci -q get wireless.radio${devidx}.type)" = "morse" ]; then
+		# Ensure enabled (default is 0, but heal any persisted disabled=1).
+		if [ "$(uci -q get wireless.radio${devidx}.disabled)" = "1" ]; then
+			uci -q set wireless.radio${devidx}.disabled=0
+			morse_committed=1
+			logger -t morse-hotplug "Enabled wireless.radio${devidx} (morse)"
+		fi
+		morse_radios="${morse_radios:+$morse_radios }radio${devidx}"
+	fi
+	devidx=$((devidx + 1))
+done
+
+# Refresh capabilities.json. [ECCLOUD-10057]
+# (harmless if the helper is absent; guarded so P1 works without ucentral bits)
+[ -x /usr/sbin/halow-capabilities-regen ] && /usr/sbin/halow-capabilities-regen
+
+# No morse radio in config: nothing to do.
+[ -n "$morse_radios" ] || exit 0
+
+[ -n "$morse_committed" ] && uci -q commit wireless
+
+# Bring up ONLY the morse radio(s). `wifi up <radio>` reconfigures just that
+# device via netifd, so the PCIe 2G/5G radios are left running and are not
+# torn down by this hotplug event. Now that the phy is ready, drv_morse_setup
+# find_phy() succeeds and the HaLow interface (wlanN) is created.
+for r in $morse_radios; do
+	logger -t morse-hotplug "Bringing up ${r} (morse) without touching other radios"
+	/sbin/wifi up "$r"
+done
