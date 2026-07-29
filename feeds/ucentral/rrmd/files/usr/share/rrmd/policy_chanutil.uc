@@ -1,4 +1,6 @@
 let board_info = global.ubus.conn.call('system', 'board');
+let math = require('math');
+
 let config = {
     /* Channel utilization threshold: When Utilization of the current channel or adjacent channel reaches the configured threshold (in %), the AP switches to a different Channel.
     Set this field to 0 to disable this feature. Range: 0-99 */
@@ -45,13 +47,35 @@ case 'edgecore,eap112':
     break;
 }
 
+// MTK board capability flags — add new boards here instead of scattering checks
+let mtk_caps = {
+    single_phy_multi_band: (board_name == 'edgecore,eap115' || board_name == 'edgecore,eap115a'),
+    uses_sr_scene_cond: (board_name == 'edgecore,eap111' || board_name == 'edgecore,eap112' ||
+                         board_name == 'edgecore,eap115' || board_name == 'edgecore,eap115a'),
+    has_halow: (board_name == 'edgecore,eap112' && phy_count == 3),
+};
+
+function get_phy_id(iface) {
+    let iface_num = replace(iface, /[^0-9]/g, '');
+    let phy_id = 'phy' + iface_num;
+
+    if (board_name == 'edgecore,eap105') {
+        phy_id = 'phy00';
+    } else if (mtk_caps.single_phy_multi_band) {
+        phy_id = 'phy0';
+    }
+
+    return phy_id;
+}
+
 function cool_down_check(iface, cool_down_period) {
     let now_t = time();
-    let cool_down_f= 0;
+    let cool_down_f = 0;
 
     // check cool_down_period passed or not
-    let deltaTS = now_t - stats_info_read("/tmp/chan_switch_time_" + iface);
-    ulog_info(`[%s] Cool down check: current_time=%d, chan_switch_time=%d, deltaTS(time passed)=%d \n`, iface, now_t, stats_info_read("/tmp/chan_switch_time_" + iface), deltaTS);
+    let chan_switch_time = stats_info_read("/tmp/chan_switch_time_" + iface);
+    let deltaTS = now_t - chan_switch_time;
+    ulog_info(`[%s] Cool down check: current_time=%d, chan_switch_time=%d, deltaTS(time passed)=%d \n`, iface, now_t, chan_switch_time, deltaTS);
 
     if (deltaTS < (cool_down_period/1000)) {
         ulog_info(`[%s] Need to cool down (%d seconds hasn't passed) before switching channel \n`, iface, cool_down_period/1000);
@@ -261,7 +285,7 @@ function interface_status_check(iface) {
     let radio_status = 'DISABLED';
     let radio_down_f = 1;
 
-    if (board_info.board_name == 'edgecore,eap112' && phy_count == 3) {
+    if (mtk_caps.has_halow) {
         //  hostapd_cli_s1g status | grep 'Selected interface'| awk -F "\'" '{print $2}'
         let check_HaLow_iface_cmd = sprintf('hostapd_cli_s1g status | grep \'Selected interface\'| awk -F "\'" \'{print $2}\'');
         let check_HaLow_iface = fs.popen(check_HaLow_iface_cmd);
@@ -348,6 +372,9 @@ function hostapd_switch_channel(msg) {
 }
 
 function switch_status_check(iface, dfs_enabled_5g_flag) {
+    // add a 5 sec delay regardless of DFS being enabled or not
+    sleep(5000);
+
     // need to wait for radio 5GHz interface to be UP, when DFS is enabled
     if (dfs_enabled_5g_flag == 1) {
         ulog_info(`[%s] 5G radio might need some time to be UP (DFS enabled) \n`, iface);
@@ -394,11 +421,7 @@ function switch_status_check(iface, dfs_enabled_5g_flag) {
 }
 
 function dfs_chan_check(iface, rcs_channel) {
-    let iface_num = replace(iface, /[^0-9]/g, '');
-    let phy_id = 'phy' + iface_num;
-    if (board_name == 'edgecore,eap105') {
-        phy_id = 'phy00';
-    }
+    let phy_id = get_phy_id(iface);
     let dfs_enabled_5g_f = 0;
     let dfs_chan_list = global.phy.phys[phy_id].dfs_channels;
 
@@ -438,18 +461,18 @@ function fixed_channel_config(iface, iface_num, fixed_channel_f, auto_channel_f,
 }
 
 function get_chan_util(radio_band, sleep_time) {
-	let pdev_stats = {};
-	let chan_util = 0;
+    let pdev_stats = {};
+    let chan_util = 0;
     let total_usage = 0;
 
     let prev_values = {
-		txFrameCount: null,
-		rxFrameCount: null,
-		rxClearCount: null,
+        txFrameCount: null,
+        rxFrameCount: null,
+        rxClearCount: null,
         chanBusyTime: null,
-		cycleCount: null,
+        cycleCount: null,
         chanActiveTime: null,
-	};
+    };
 
     for (let c = 0; c < 2; c++) {
         // Check tx and tx stats for wlanX interface
@@ -464,11 +487,23 @@ function get_chan_util(radio_band, sleep_time) {
             chanActiveTime: null,
         };
 
-        if (board_info.board_name == 'edgecore,eap111' || board_info.board_name == 'edgecore,eap112') {
-            // for EAP111 and EAP112 (only 2.4G and 5G radio bands)
+        if (mtk_caps.uses_sr_scene_cond) {
+            // for MTK based APs (only 2.4G and 5G radio bands)
+            // Trigger the kernel to log SR scene condition for this band
             system(`cat /tmp/sr_scene_cond_phy${radio_band}`);
-            // logread -e "Congestion Ratio" | tail -n 1  | awk -F'= ' '{print $2}' | tr -d '%'
-            let cmd = sprintf('logread -e \"Congestion Ratio\" | tail -n 1  | awk -F\'= \' \'{print $2}\' | tr -d \'\%\'');
+
+            let cmd;
+            if (mtk_caps.single_phy_multi_band) {
+                // EAP115/115a: single phy with band0=2g, band1=5g
+                // The kernel logs "Band index = X" followed by "Congestion Ratio = YY.Y%"
+                // Filter by band index to get the correct band's congestion ratio
+                let band_idx = (radio_band == '2g') ? 0 : 1;
+                cmd = sprintf('logread | grep -E "(Band index = %d|Congestion Ratio)" | grep -A1 "Band index = %d" | grep "Congestion Ratio" | tail -n 1 | awk -F\'= \' \'{print $2}\' | tr -d \' %%\'', band_idx, band_idx);
+            } else {
+                // EAP111/EAP112: separate phys, each logs "Band index = 0"; each phy is independent
+                cmd = sprintf('logread -e \"Congestion Ratio\" | tail -n 1 | awk -F\'= \' \'{print $2}\' | tr -d \' %%\'');
+            }
+
             let chan_util_cmd = fs.popen(cmd);
             let _chan_util = chan_util_cmd.read('all');
             chan_util_cmd.close();
@@ -536,13 +571,8 @@ function get_chan_util(radio_band, sleep_time) {
 }
 
 function random_channel_selection(iface, band, htmode, chan_list_valid, exclude_dfs) {
-    let math = require('math');
     let bw = replace(htmode, /[^0-9]/g, '');
-    let iface_num = replace(iface, /[^0-9]/g, '');
-    let phy_id = 'phy' + iface_num;
-    if (board_name == 'edgecore,eap105') {
-        phy_id = 'phy00';
-    }
+    let phy_id = get_phy_id(iface);
 
     // channel list from the driver based on the country code
     let chan_list_cc = uniq(sort(global.phy.phys[phy_id].channels, (a, b) => a - b));
@@ -820,11 +850,12 @@ function channel_optimize() {
 
     ulog_info(`Interval for checking Channel Utilization = %d seconds; Interval for cooling down = %d seconds \n`, config.interval/1000, cool_down_period/1000);
 
+    // get wireless interface uci config from "ubus call network.wireless status"
+    let wireless_status = global.ubus.conn.call('network.wireless', 'status');
+
     for (let j = 0; j < num_radios; j++) {
         let radio_id = "radio" + j;
 
-        // get wireless interface uci config from "ubus call network.wireless status"
-        let wireless_status = global.ubus.conn.call('network.wireless', 'status');
         radio_disabled[j] = wireless_status[radio_id].disabled;
         radio_band[j] = wireless_status[radio_id].config.band;
 
@@ -971,7 +1002,6 @@ function channel_optimize() {
                         /* Collect the chan util info of #max_chan channels*/
                         for (let num_chan = 0; num_chan < max_chan; num_chan++) {
                             ulog_info(`[%s] Channel utilization check ROUND#%d \n`, radio_iface[l], num_chan);
-
                             if (num_chan == 0) {
                                 curr_chan_list[num_chan] = current_channel[l];
                                 chan_util_list[num_chan] = chan_util_value[l];
@@ -984,7 +1014,6 @@ function channel_optimize() {
                                 // call RCS for multiple random chan
                                 let chan_scan = algo_rcs(radio_iface[l], curr_chan_list[num_chan-1], radio_band[l], htmode[l], selected_channels[l], acs_exclude_dfs[l]);
                                 curr_chan_list[num_chan] = stats_info_read("/tmp/rrm_random_channel_" + radio_iface[l]);
-
                                 if (chan_scan == 1) {
                                     // assign channel from RCS to interface
                                     init_payload = {
