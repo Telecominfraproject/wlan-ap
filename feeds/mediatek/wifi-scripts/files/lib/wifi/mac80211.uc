@@ -96,6 +96,19 @@ for (let phy_name, phy in board.wlan) {
 		if (!phy.path)
 			continue;
 
+		/* Skip Morse Micro HaLow PHYs - they are handled separately by
+		 * morse detect, not by the mac80211 ucode path. The MM8108 driver
+		 * registers as NL80211_BAND_5GHZ, so without this it would be
+		 * mis-detected here as a mac80211 5G radio (creating a bogus
+		 * type=mac80211 radio) and, more importantly, a morse phy appearing
+		 * in the enumeration perturbs the shared-path dual-radio mapping of
+		 * the mt7996 (2G/5G on one PCIe path), which wedges netifd. Identify
+		 * it by the kernel driver name via uevent so it works for USB/SDIO/SPI
+		 * regardless of phy.path. */
+		let uevent = readfile(`/sys/class/ieee80211/${phy_name}/device/uevent`);
+		if (uevent && match(uevent, /DRIVER=morse/))
+			continue;
+
 		let macaddr = trim(readfile(`/sys/class/ieee80211/${phy_name}/macaddress`));
 		if (radio_exists(phy.path, macaddr, phy_name, radio.index))
 			continue;

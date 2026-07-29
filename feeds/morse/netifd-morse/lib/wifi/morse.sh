@@ -86,21 +86,35 @@ detect_morse() {
 		config_foreach check_morse_device wifi-device
 		[ "$found" -gt 0 ] && continue
 
-		path="$(iwinfo dot11ah path "$dev")"
-		if [ -n "$path" ]; then
-			dev_id="set wireless.radio${devidx}.path='$path'"
-		else
-			dev_id="set wireless.radio${devidx}.macaddr=$(cat /sys/class/ieee80211/${dev}/macaddress)"
-		fi
+		# Determine the sysfs device path for this morse phy.
+		#
+		# ucentral needs radio.path for BOTH capabilities generation
+		# (wifi/phy.uc lookup_paths() only maps wifi-devices that have a
+		# `path`) AND apply-time binding (wiphy.uc path_to_section() matches
+		# s.path == path). Without it the HaLow radio never reaches
+		# capabilities.json (cloud rejects "band HaLow") and its SSID never
+		# renders.
+		#
+		# On this platform `iwinfo dot11ah/nl80211 path` returns nothing for
+		# the USB morse dongle (iwinfo has no working path backend for it),
+		# so we derive the path exactly the way OpenWrt stores it for the
+		# PCIe radios: realpath of the phy's device node with the leading
+		# "/sys/devices/platform/" (or "/sys/devices/") prefix stripped
+		# (mt7996 -> soc/11280000.pcie/...; morse USB -> soc/11200000.usb/...).
+		# macaddr is kept too: netifd's drv_morse_setup find_phy() matches on it.
+		path="$(iwinfo dot11ah path "$dev" 2>/dev/null)"
+		[ -n "$path" ] || path="$(iwinfo nl80211 path "$dev" 2>/dev/null)"
+		[ -n "$path" ] || path="$(readlink -f "/sys/class/ieee80211/${dev}/device" 2>/dev/null | sed 's#^/sys/devices/platform/##; s#^/sys/devices/##')"
 
 		uci -q batch <<-EOF
 			set wireless.radio${devidx}=wifi-device
 			set wireless.radio${devidx}.type=morse
-			${dev_id}
+			set wireless.radio${devidx}.path='$path'
+			set wireless.radio${devidx}.macaddr=$(cat /sys/class/ieee80211/${dev}/macaddress)
 			set wireless.radio${devidx}.band=s1g
 			set wireless.radio${devidx}.hwmode=11ah
 			set wireless.radio${devidx}.reconf=0
-			set wireless.radio${devidx}.disabled=1
+			set wireless.radio${devidx}.disabled=0
 
 			set wireless.default_radio${devidx}=wifi-iface
 			set wireless.default_radio${devidx}.mode=ap
