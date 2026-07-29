@@ -1,0 +1,396 @@
+From: Jose Garcia Doblado <jose.garciadoblado@joindigital.com>
+Subject: [PATCH] wifi: ath11k: fix ar mismatch and double-teardown race in
+ cross-radio peer delete
+
+When a station roams between radios on the same AP, ath11k_peer_create()
+finds the existing peer on the old vdev and removes it before creating
+the new one:
+
+    ath11k_dp_peer_cleanup(ar, vdev_id, param->peer_addr);
+    ath11k_peer_delete(ar, vdev_id, param->peer_addr);
+
+`ar` here is the new radio performing the create, while `vdev_id` belongs
+to the old vdev on a different radio. This has two bugs, and the naive
+fix (fail peer_create when another path is already tearing the peer
+down) introduces a third problem, observed in the field as FT roaming
+silently degrading to full re-authentication. All three are addressed
+here.
+
+1) ar mismatch in ath11k_dp_peer_cleanup() and ath11k_peer_delete()
+
+ath11k_wait_for_peer_delete_done() waits on ar->peer_delete_done.
+ath11k_peer_delete_resp_event() (wmi.c) resolves the owning radio via
+ath11k_mac_get_ar_by_vdev_id(ab, vdev_id) and signals that radio's
+peer_delete_done. For a cross-radio roam these are two different struct
+ath11k instances, so the completion being waited on is never the one the
+firmware response signals - the wait always times out. Similarly,
+ath11k_dp_peer_cleanup() uses ar-local data-path state; calling it with
+the new radio's ar while passing the old vdev_id leaves the old radio's
+data path uncleaned, corrupting the newly-created peer's data path and
+causing "disconnected due to excessive missing ACKs" shortly after a
+successful association.
+
+Fix: resolve old_ar via ath11k_mac_get_ar_by_vdev_id() before either
+call so both operate through the radio that actually owns vdev_id.
+ath11k_peer_delete() requires the conf_mutex of the ar it is called
+with, so old_ar->conf_mutex is acquired when it differs from the
+caller's. This acquisition uses a bounded mutex_trylock() loop instead
+of mutex_lock(): two simultaneous peer_creates handling roams in
+opposite directions (r0->r1 and r1->r0) would otherwise each hold their
+own conf_mutex while blocking on the other's - an ABBA deadlock. On
+trylock timeout the claim (see below) is released and the create fails;
+the station simply retries its association.
+
+2) Double-teardown race with the normal STA-removal path
+
+ath11k_mac_op_sta_state() (IEEE80211_STA_NONE -> NOTEXIST) also calls
+ath11k_dp_peer_cleanup() + ath11k_peer_delete() on the same peer when
+hostapd's "Prune association" removes the old BSS association around the
+same time the new one forms. Both paths can run concurrently with no
+coordination, which leads to:
+
+ - num_peers going negative (both callers decrement it for a peer
+   incremented only once)
+ - rhashtable corruption (rhash entry removed twice)
+ - use-after-free: ath11k_dp_peer_cleanup() -> ath11k_peer_rx_tid_cleanup()
+   drops base_lock around each del_timer_sync() per TID; if the other
+   caller frees the peer during one of those windows, this function
+   resumes with a stale peer pointer
+
+Fix: ath11k_peer_create() and ath11k_mac_op_sta_state() each look up the
+peer and atomically set peer->delete_in_progress under tbl_mtx_lock +
+base_lock before touching it. Only the caller that wins this claim
+performs the teardown. The losing NONE->NOTEXIST path skips the peer
+work (but still does its mac80211-level bookkeeping) and clears
+peer->sta, since mac80211 frees the sta as soon as the callback returns.
+The safety-net force-remove block there is gated on the same claim.
+
+3) Peer-create must wait for a concurrent teardown, never fail
+
+mac80211 does NOT retry a failed sta insertion: an error from
+ath11k_peer_create() propagates through sta_state(NOTEXIST->NONE) to
+NL80211_CMD_NEW_STATION, and hostapd rejects the (re)association with
+status 17.
+
+Fix: when ath11k_peer_create() loses the claim it waits (bounded, on
+ab->peer_mapping_wq) for the concurrent teardown to remove the peer and
+then re-evaluates, proceeding with a clean create. Supporting changes:
+
+ - The old-peer lookup walks ab->peers (new helper
+   ath11k_peer_find_list_by_addr()) instead of the rhash table: the
+   teardown removes the rhash entry before the firmware delete is even
+   sent, so an rhash lookup would let the create overtake the in-flight
+   delete (firmware sees create-before-delete for the same MAC).
+ - ath11k_peer_delete()'s manual peer removal (timeout / no-unmap-event
+   paths) now wakes ab->peer_mapping_wq like the unmap event handlers
+   do; otherwise waiters sleep until their full timeout.
+ - Every error path taken after a claim releases it again (new helper
+   ath11k_peer_unclaim()); a leaked claim would make the peer
+   permanently undeletable (all teardown paths and vdev cleanup skip
+   claimed peers) and permanently block that MAC from associating.
+ - A stale same-vdev peer (previously return -EINVAL, which with a
+   claim taken would leak it) is now torn down through the same path
+   and the create proceeds.
+
+Signed-off-by: Jose Garcia Doblado <jose.garciadoblado@joindigital.com>
+---
+--- a/drivers/net/wireless/ath/ath11k/peer.c
++++ b/drivers/net/wireless/ath/ath11k/peer.c
+@@ -3,11 +3,26 @@
+  * Copyright (c) 2018-2019 The Linux Foundation. All rights reserved.
+  */
+ 
++#include <linux/delay.h>
++
+ #include "core.h"
+ #include "peer.h"
+ #include "debug.h"
+ #include "nss.h"
+ 
++/* How long ath11k_peer_create() waits in total for a concurrent teardown
++ * of an old peer entry with the same MAC before giving up.
++ */
++#define ATH11K_PEER_CLAIM_TIMEOUT_MS	1500
++
++/* Single wait slice on peer_mapping_wq while waiting for a concurrent
++ * teardown; re-evaluated in a loop bounded by the claim timeout above.
++ */
++#define ATH11K_PEER_DELETE_WAIT_MS	500
++
++/* Bounded wait for old_ar->conf_mutex in the cross-radio roam path */
++#define ATH11K_CROSS_AR_LOCK_TIMEOUT_MS	1000
++
+ static struct ath11k_peer *ath11k_peer_find_list_by_id(struct ath11k_base *ab,
+ 						       int peer_id)
+ {
+@@ -25,6 +40,25 @@
+ 	return NULL;
+ }
+ 
++/* Search the peer list rather than the rhash table: a peer whose teardown
++ * has already removed the rhash entry but is still waiting for the firmware
++ * delete response only shows up here.
++ */
++static struct ath11k_peer *ath11k_peer_find_list_by_addr(struct ath11k_base *ab,
++							 const u8 *addr)
++{
++	struct ath11k_peer *peer;
++
++	lockdep_assert_held(&ab->base_lock);
++
++	list_for_each_entry(peer, &ab->peers, list) {
++		if (ether_addr_equal(peer->addr, addr))
++			return peer;
++	}
++
++	return NULL;
++}
++
+ struct ath11k_peer *ath11k_peer_find(struct ath11k_base *ab, int vdev_id,
+ 				     const u8 *addr)
+ {
+@@ -912,6 +946,12 @@
+ 	}
+ 	// Peer can be deleted in the unmap or here, so only decrement num_peers once
+ 	ar->num_peers--;
++	/* The unmap event handlers wake peer_mapping_wq after removing the
++	 * peer from the list; do the same for the manual removal above so
++	 * waiters (ath11k_wait_for_peer_deleted and the claim-wait loop in
++	 * ath11k_peer_create) don't sleep until their timeout.
++	 */
++	wake_up(&ar->ab->peer_mapping_wq);
+ 	spin_unlock_bh(&ar->ab->base_lock);
+ 	mutex_unlock(&ar->ab->tbl_mtx_lock);
+ 
+@@ -923,6 +963,24 @@
+ 	return ath11k_wait_for_peer_common(ar->ab, vdev_id, addr, true);
+ }
+ 
++/* Drop a deletion claim taken in ath11k_peer_create() when the teardown
++ * could not be carried out, so a later teardown path can retry it instead
++ * of the peer being stuck as undeletable.
++ */
++static void ath11k_peer_unclaim(struct ath11k_base *ab, int vdev_id,
++				const u8 *addr)
++{
++	struct ath11k_peer *peer;
++
++	mutex_lock(&ab->tbl_mtx_lock);
++	spin_lock_bh(&ab->base_lock);
++	peer = ath11k_peer_find(ab, vdev_id, addr);
++	if (peer)
++		peer->delete_in_progress = false;
++	spin_unlock_bh(&ab->base_lock);
++	mutex_unlock(&ab->tbl_mtx_lock);
++}
++
+ static int ath11k_get_peer_count(struct rhashtable *ht)
+ {
+ 	struct rhashtable_iter iter;
+@@ -952,8 +1010,11 @@
+ 		       struct ieee80211_sta *sta, struct peer_create_params *param)
+ {
+ 	struct ath11k_peer *peer;
++	struct ath11k *old_ar;
+ 	struct ieee80211_vif *vif = arvif->vif;
+ 	struct ath11k_sta *arsta;
++	bool peer_claimed;
++	unsigned long claim_timeout;
+ 	int ret, fbret;
+ 	u8 vdev_id = 0;
+ 	int rhash_count;
+@@ -982,20 +1043,116 @@
+ 		ar->num_peers = rhash_count;
+ 	}
+ 
++	claim_timeout = jiffies + msecs_to_jiffies(ATH11K_PEER_CLAIM_TIMEOUT_MS);
++
++retry_claim:
++	peer_claimed = false;
++
+ 	mutex_lock(&ar->ab->tbl_mtx_lock);
+ 	spin_lock_bh(&ar->ab->base_lock);
+-	peer = ath11k_peer_find_by_addr(ar->ab, param->peer_addr);
+-	if (peer)
++	peer = ath11k_peer_find_list_by_addr(ar->ab, param->peer_addr);
++	if (peer) {
+ 		vdev_id = peer->vdev_id;
++		/* Atomically claim this peer for deletion; only the winner
++		 * of this claim proceeds with the teardown below.
++		 */
++		if (!peer->delete_in_progress) {
++			peer->delete_in_progress = true;
++			peer_claimed = true;
++		}
++	}
+ 	spin_unlock_bh(&ar->ab->base_lock);
+ 	mutex_unlock(&ar->ab->tbl_mtx_lock);
+ 
++	if (peer && !peer_claimed) {
++		/* Another path (STA NONE->NOTEXIST teardown or a cross-radio
++		 * peer_create) is already deleting this peer. Do not fail the
++		 * creation: mac80211 does not retry a failed sta insertion,
++		 * so an error here rejects the (re)association, which in
++		 * practice breaks FT roaming. Wait for the teardown to finish
++		 * and re-evaluate instead.
++		 */
++		if (time_after(jiffies, claim_timeout)) {
++			ath11k_warn(ar->ab,
++				    "timed out waiting for teardown of old peer %pM (vdev %d)\n",
++				    param->peer_addr, vdev_id);
++			return -EBUSY;
++		}
++
++		wait_event_timeout(ar->ab->peer_mapping_wq, ({
++				bool gone;
++
++				spin_lock_bh(&ar->ab->base_lock);
++				gone = !ath11k_peer_find_list_by_addr(ar->ab,
++							param->peer_addr);
++				spin_unlock_bh(&ar->ab->base_lock);
++
++				gone;
++				}),
++				msecs_to_jiffies(ATH11K_PEER_DELETE_WAIT_MS));
++		goto retry_claim;
++	}
++
+ 	if (peer) {
+-		if (vdev_id == param->vdev_id)
++		/* Claim taken: tear the old peer down through the radio that
++		 * owns vdev_id so that both ath11k_dp_peer_cleanup() and the
++		 * peer delete completion use the right ath11k instance
++		 * (cross-radio roam).
++		 */
++		rcu_read_lock();
++		old_ar = ath11k_mac_get_ar_by_vdev_id(ar->ab, vdev_id);
++		rcu_read_unlock();
++
++		if (!old_ar) {
++			ath11k_warn(ar->ab,
++				    "failed to find radio owning vdev_id %d for roaming peer %pM\n",
++				    vdev_id, param->peer_addr);
++			ath11k_peer_unclaim(ar->ab, vdev_id, param->peer_addr);
+ 			return -EINVAL;
++		}
+ 
+-		ath11k_dp_peer_cleanup(ar, vdev_id, param->peer_addr);
+-		ath11k_peer_delete(ar, vdev_id, param->peer_addr);
++		if (vdev_id == param->vdev_id)
++			ath11k_warn(ar->ab,
++				    "stale peer %pM found on own vdev %d, deleting before create\n",
++				    param->peer_addr, vdev_id);
++
++		if (old_ar != ar) {
++			/* Bounded trylock: a peer_create on old_ar could at
++			 * the same time be waiting for our conf_mutex for a
++			 * roam in the opposite direction, so blocking
++			 * unconditionally here would be an ABBA deadlock.
++			 */
++			unsigned long lock_timeout = jiffies +
++				msecs_to_jiffies(ATH11K_CROSS_AR_LOCK_TIMEOUT_MS);
++
++			while (!mutex_trylock(&old_ar->conf_mutex)) {
++				if (time_after(jiffies, lock_timeout)) {
++					ath11k_warn(ar->ab,
++						    "timed out acquiring conf_mutex of radio owning vdev %d for roaming peer %pM\n",
++						    vdev_id, param->peer_addr);
++					ath11k_peer_unclaim(ar->ab, vdev_id,
++							    param->peer_addr);
++					return -EBUSY;
++				}
++				msleep(10);
++			}
++		}
++
++		ath11k_dp_peer_cleanup(old_ar, vdev_id, param->peer_addr);
++		ret = ath11k_peer_delete(old_ar, vdev_id, param->peer_addr);
++
++		if (old_ar != ar)
++			mutex_unlock(&old_ar->conf_mutex);
++
++		if (ret) {
++			ath11k_warn(ar->ab,
++				    "failed to delete roaming peer %pM on old vdev_id %d: %d\n",
++				    param->peer_addr, vdev_id, ret);
++			/* If the peer entry survived the failed delete, drop
++			 * the claim so a later teardown path can retry it.
++			 */
++			ath11k_peer_unclaim(ar->ab, vdev_id, param->peer_addr);
++		}
+ 	}
+ 
+ 	ret = ath11k_wmi_send_peer_create_cmd(ar, param);
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -5728,24 +5728,48 @@
+ 				    sta->addr, arvif->vdev_id);
+ 	} else if ((old_state == IEEE80211_STA_NONE &&
+ 		    new_state == IEEE80211_STA_NOTEXIST)) {
+-		ath11k_dp_peer_cleanup(ar, arvif->vdev_id, sta->addr);
++		bool peer_claimed = false;
+ 
+-		ret = ath11k_peer_delete(ar, arvif->vdev_id, sta->addr);
+-		if (ret)
+-			ath11k_warn(ar->ab, "Failed to delete peer: %pM for VDEV: %d\n",
+-				    sta->addr, arvif->vdev_id);
+-		else
+-			ath11k_dbg(ar->ab, ATH11K_DBG_PEER, "Removed peer: %pM for VDEV: %d\n",
+-				   sta->addr, arvif->vdev_id);
++		/* Atomically claim this peer for deletion; only the winner
++		 * of this claim proceeds with the teardown below. The
++		 * concurrent owner may be a cross-radio ath11k_peer_create()
++		 * handling a roam between the radios of this chip.
++		 */
++		mutex_lock(&ar->ab->tbl_mtx_lock);
++		spin_lock_bh(&ar->ab->base_lock);
++		peer = ath11k_peer_find(ar->ab, arvif->vdev_id, sta->addr);
++		if (peer) {
++			if (!peer->delete_in_progress) {
++				peer->delete_in_progress = true;
++				peer_claimed = true;
++			} else if (peer->sta == sta) {
++				/* Another path owns the teardown; mac80211 is
++				 * about to free this sta, so drop the peer's
++				 * reference to it.
++				 */
++				peer->sta = NULL;
++			}
++		}
++		spin_unlock_bh(&ar->ab->base_lock);
++		mutex_unlock(&ar->ab->tbl_mtx_lock);
++
++		if (peer_claimed) {
++			ath11k_dp_peer_cleanup(ar, arvif->vdev_id, sta->addr);
++
++			ret = ath11k_peer_delete(ar, arvif->vdev_id, sta->addr);
++			if (ret)
++				ath11k_warn(ar->ab, "Failed to delete peer: %pM for VDEV: %d\n",
++					    sta->addr, arvif->vdev_id);
++		}
+ 
+ 		ath11k_mac_dec_num_stations(arvif, sta);
+ 		mutex_lock(&ar->ab->tbl_mtx_lock);
+ 		spin_lock_bh(&ar->ab->base_lock);
+ 		peer = ath11k_peer_find(ar->ab, arvif->vdev_id, sta->addr);
+-		/* Skip if peer deletion already in progress to prevent
+-		 * double-delete and num_peers underflow
++		/* Only force-remove if this caller claimed the peer; skip if
++		 * another caller owns the teardown.
+ 		 */
+-		if (peer && peer->sta == sta) {
++		if (peer_claimed && peer && peer->sta == sta) {
+ 			ath11k_warn(ar->ab, "Found peer entry %pM n vdev %i after it was supposedly removed\n",
+ 				    vif->addr, arvif->vdev_id);
+ 			ath11k_peer_rhash_delete(ar->ab, peer);
+@@ -5756,6 +5780,10 @@
+ 			list_del(&peer->list);
+ 			kfree(peer);
+ 			ar->num_peers--;
++			/* Wake waiters (e.g. the claim-wait loop in
++			 * ath11k_peer_create) now that the peer is gone.
++			 */
++			wake_up(&ar->ab->peer_mapping_wq);
+ 			ath11k_dbg(ar->ab, ATH11K_DBG_PEER, "%s peer deleted %pM vdev_id: %d num_peers: %d\n",
+ 				__func__, sta->addr, arvif->vdev_id, ar->num_peers);
+ 		}
