@@ -8,10 +8,12 @@
 #include <net/if.h>
 
 #include <pcap.h>
+#include <poll.h>
 #include <signal.h>
 
 #include <sys/socket.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 #include <uci.h>
 
@@ -52,7 +54,8 @@ void cleanup()
     syslog(LOG_INFO, "Cleanup complete.\n");
 }
 
-int setup_tc()
+// Create the shared ifb-inject mirror interface (once). Returns 0 on success.
+int setup_ifb()
 {
     char cmd[512];
 
@@ -69,39 +72,75 @@ int setup_tc()
             return -1;
         }
     }
+    return 0;
+}
+
+// Install the ingress qdisc + DHCP redirect filter for a single resolved VAP.
+// Returns 0 on success, -1 if the filter could not be installed (caller should
+// leave the VAP unresolved and retry later).
+int setup_tc_for_iface(struct iface_info *iface)
+{
+    char cmd[512];
+
+    // Adding the ingress qdisc is idempotent-ish: it fails harmlessly if one
+    // already exists, so we suppress its output and never treat it as fatal.
+    // The filter add below is the operation we actually gate on.
+    snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s ingress 2>/dev/null",
+             iface->iface);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd),
+             "tc filter add dev %s ingress protocol ip pref 32 u32 "
+             "match ip protocol 17 0xff "
+             "match u16 0x0044 0xffff at 20 "
+             "match u16 0x0043 0xffff at 22 "
+             "match u8 0x01 0xff at 28 "
+             "action vlan push id %d pipe "
+             "action mirred egress mirror dev ifb-inject pipe "
+             "action drop",
+             iface->iface, iface->serial);
+    if (system(cmd) != 0)
+    {
+        syslog(LOG_ERR, "Failed to setup tc for %s\n", iface->iface);
+        return -1;
+    }
+    return 0;
+}
+
+// Attempt to resolve every not-yet-resolved VAP via iwinfo and, on success,
+// install its tc redirect. Missing VAPs are NOT fatal: they are simply left
+// unresolved so they can be retried later (e.g. DFS VAPs that appear only after
+// CAC completes). Returns the number of VAPs still unresolved.
+int resolve_and_setup()
+{
+    int unresolved = 0;
 
     for (int i = 0; i < iface_map_size; i++)
     {
-        snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s ingress 2>/dev/null 1>2",
-                 iface_map[i].iface);
-        int result = system(cmd);
-        if (result == 2)
+        if (iface_map[i].resolved)
+            continue;
+
+        if (parse_iwinfo_by_essid(&iface_map[i]) != 0 || iface_map[i].iface[0] == '\0')
         {
-            syslog(LOG_INFO, "Ingress qdisc already exists for %s\n", iface_map[i].iface);
-        }
-        else if (result == 1)
-        {
-            syslog(LOG_ERR, "Failed to add qdisc for %s\n", iface_map[i].iface);
-            return -1;
+            unresolved++;
+            continue;
         }
 
-        snprintf(cmd, sizeof(cmd),
-                 "tc filter add dev %s ingress protocol ip pref 32 u32 "
-                 "match ip protocol 17 0xff "
-                 "match u16 0x0044 0xffff at 20 "
-                 "match u16 0x0043 0xffff at 22 "
-                 "match u8 0x01 0xff at 28 "
-                 "action vlan push id %d pipe "
-                 "action mirred egress mirror dev ifb-inject pipe "
-                 "action drop",
-                 iface_map[i].iface, iface_map[i].serial);
-        if (system(cmd) != 0)
+        if (setup_tc_for_iface(&iface_map[i]) != 0)
         {
-            syslog(LOG_ERR, "Failed to setup tc for %s\n", iface_map[i].iface);
-            return -1;
+            // VAP exists but tc install failed; retry on the next pass.
+            unresolved++;
+            continue;
         }
+
+        iface_map[i].resolved = 1;
+        syslog(LOG_INFO,
+               "Resolved iface_info[%d]: iface='%s', freq='%s', essid='%s', bssid='%s', upstream='%s', serial=%d",
+               i, iface_map[i].iface, iface_map[i].frequency, iface_map[i].essid,
+               iface_map[i].bssid, iface_map[i].upstream, iface_map[i].serial);
     }
-    return 0;
+
+    return unresolved;
 }
 
 int parse_iwinfo_by_essid(struct iface_info *iface)
@@ -125,10 +164,11 @@ int parse_iwinfo_by_essid(struct iface_info *iface)
     if (line)
     {
         output[strcspn(output, "\n")] = '\0'; // Remove trailing newline
-        snprintf(iface->iface, LEN_IFACE + 1, output);
+        snprintf(iface->iface, LEN_IFACE + 1, "%s", output);
     }
     else
     {
+        pclose(fp);
         return 1;
     }
 
@@ -137,10 +177,11 @@ int parse_iwinfo_by_essid(struct iface_info *iface)
     if (line)
     {
         output[strcspn(output, "\n")] = '\0'; // Remove trailing newline
-        snprintf(iface->bssid, LEN_BSSID + 1, output);
+        snprintf(iface->bssid, LEN_BSSID + 1, "%s", output);
     }
     else
     {
+        pclose(fp);
         return 1;
     }
 
@@ -160,9 +201,9 @@ void add_iface_info(const char *essid, const char *upstream, const char *freq, i
     struct iface_info *info = &iface_map[iface_map_size];
     memset(info, 0, sizeof(struct iface_info));
     // use snprintf to copy essid to info->essid
-    snprintf(info->essid, LEN_ESSID + 1, essid);
-    snprintf(info->upstream, LEN_IFACE + 1, upstream);
-    snprintf(info->frequency, 2, freq);
+    snprintf(info->essid, LEN_ESSID + 1, "%s", essid);
+    snprintf(info->upstream, LEN_IFACE + 1, "%s", upstream);
+    snprintf(info->frequency, sizeof(info->frequency), "%s", freq);
     info->serial = serial;
     iface_map_size++;
 }
@@ -252,7 +293,7 @@ int parse_uci_config()
             }
 
             // Store in port_map
-            snprintf(port_map[port_map_size].name, LEN_IFACE + 1, upstream);
+            snprintf(port_map[port_map_size].name, LEN_IFACE + 1, "%s", upstream);
             port_map[port_map_size].sock = sock;
             port_map[port_map_size].ifindex = ifindex;
             port_map_size++;
@@ -491,6 +532,31 @@ void signal_handler(int sig)
     }
 }
 
+// Emit a heartbeat naming the SSIDs whose VAP is still not up, so a long wait
+// (e.g. a 600s DFS CAC) is visibly "waiting" rather than looking like a hang.
+// The SSID list is best-effort and truncated if it does not fit; the count is
+// authoritative and passed in by the caller.
+void log_pending(int unresolved)
+{
+    char list[512];
+    size_t off = 0;
+
+    list[0] = '\0';
+    for (int i = 0; i < iface_map_size; i++)
+    {
+        if (iface_map[i].resolved)
+            continue;
+
+        int w = snprintf(list + off, sizeof(list) - off, "%s'%s'",
+                         off ? ", " : "", iface_map[i].essid);
+        if (w < 0 || (size_t)w >= sizeof(list) - off)
+            break; // buffer full; log what we have so far
+        off += (size_t)w;
+    }
+
+    syslog(LOG_INFO, "Still waiting for %d SSID(s) to come up: %s", unresolved, list);
+}
+
 int main(int argc, char *argv[])
 {
     openlog("dhcp_inject:", LOG_PID | LOG_CONS, LOG_DAEMON);
@@ -505,27 +571,22 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    for (int i = 0; i < iface_map_size; i++)
-    {
-        if (parse_iwinfo_by_essid(&iface_map[i]) != 0)
-        {
-            syslog(LOG_ERR, "Failed to get iface info for ESSID: %s\n", iface_map[i].essid);
-            cleanup();
-            return 1;
-        }
-        else
-        {
-            syslog(LOG_INFO, "iface_info[%d]: iface='%s', freq='%s', essid='%s', bssid='%s', upstream='%s', serial=%d\n",
-                   i, iface_map[i].iface, iface_map[i].frequency, iface_map[i].essid, iface_map[i].bssid,
-                   iface_map[i].upstream, iface_map[i].serial);
-        }
-    }
-
-    if (setup_tc() != 0)
+    if (setup_ifb() != 0)
     {
         syslog(LOG_ERR, "Setup failed\n");
         cleanup();
         return 1;
+    }
+
+    // Best-effort initial resolve. VAPs that are not up yet (e.g. 5 GHz DFS
+    // VAPs still doing CAC) are not fatal; they are retried from the main loop
+    // as they come online. This is what keeps the daemon out of a crash loop.
+    int unresolved = resolve_and_setup();
+    if (unresolved > 0)
+    {
+        syslog(LOG_INFO,
+               "%d SSID(s) not up yet; will keep retrying every %d seconds",
+               unresolved, RESOLVE_RETRY_INTERVAL);
     }
 
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -537,13 +598,72 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (pcap_loop(handle, -1, process_packet, NULL) < 0)
+    // We must service the resolve/heartbeat timers even when ifb-inject is
+    // idle. libpcap's read timeout does NOT guarantee a return when no packets
+    // arrive (on Linux the timer only runs once traffic starts), so a plain
+    // blocking pcap loop would stall the timers - fatal here, since at startup
+    // there may be no tc filters and hence no traffic at all until VAPs
+    // resolve. Instead we put the handle in non-blocking mode and drive it from
+    // poll() with our own 1s timeout, which fires regardless of packet arrival.
+    if (pcap_setnonblock(handle, 1, errbuf) != 0)
     {
-        syslog(LOG_ERR, "pcap_loop failed: %s\n", pcap_geterr(handle));
+        syslog(LOG_ERR, "Failed to set non-blocking mode: %s\n", errbuf);
         cleanup();
         return 1;
     }
+    int pcap_fd = pcap_get_selectable_fd(handle);
+
+    time_t last_resolve = time(NULL);
+    time_t last_heartbeat = time(NULL);
+    while (1)
+    {
+        if (pcap_fd >= 0)
+        {
+            struct pollfd pfd = { .fd = pcap_fd, .events = POLLIN };
+            int pr = poll(&pfd, 1, 1000);
+            if (pr < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                syslog(LOG_ERR, "poll failed: %s\n", strerror(errno));
+                break;
+            }
+        }
+        else
+        {
+            // Fallback: fd not selectable (should not happen for a live Linux
+            // capture). Sleep so we don't busy-spin, then drain in non-blocking
+            // mode below.
+            usleep(200000);
+        }
+
+        // Drain whatever is buffered. In non-blocking mode this returns
+        // promptly (0 when nothing is available) rather than waiting.
+        int n = pcap_dispatch(handle, -1, process_packet, NULL);
+        if (n < 0)
+        {
+            syslog(LOG_ERR, "pcap_dispatch failed: %s\n", pcap_geterr(handle));
+            break;
+        }
+
+        if (unresolved > 0)
+        {
+            time_t now = time(NULL);
+            if (now - last_resolve >= RESOLVE_RETRY_INTERVAL)
+            {
+                last_resolve = now;
+                unresolved = resolve_and_setup();
+                if (unresolved == 0)
+                    syslog(LOG_INFO, "All configured SSIDs are now resolved");
+            }
+            if (unresolved > 0 && now - last_heartbeat >= HEARTBEAT_INTERVAL)
+            {
+                last_heartbeat = now;
+                log_pending(unresolved);
+            }
+        }
+    }
 
     cleanup();
-    return 0;
+    return 1;
 }
