@@ -12,6 +12,15 @@
 #define MAX_INTERFACES 48
 #define MAX_PORTS 8
 
+// How often (seconds) to retry resolving VAPs that were not yet up at startup
+// (e.g. 5 GHz DFS VAPs that only appear after CAC completes).
+#define RESOLVE_RETRY_INTERVAL 10
+
+// How often (seconds) to emit a "still waiting" heartbeat while some VAPs are
+// not up yet, so a long DFS CAC (up to 600s on weather channels) is not
+// mistaken for a hung daemon.
+#define HEARTBEAT_INTERVAL 60
+
 #define CONFIG_PATH "/etc/config/dhcpinject"
 
 #define IWINFO_CMD "iwinfo | grep '\"%s\"$' -A2 | grep '.*Channel:.*\\(%s\\..*\\) GHz' -B2 | awk '/ESSID/{print $1} /Access Point/{gsub(/:/, \"\", $3); print $3}'"
@@ -51,8 +60,9 @@ struct iface_info {
     char essid[LEN_ESSID + 1];
     char bssid[LEN_BSSID + 1];
 	char upstream[LEN_IFACE + 1];
-	char frequency[4];
+	char frequency[LEN_FREQ + 1];
     int serial;
+    int resolved; // 1 once the VAP has been resolved via iwinfo and tc is set up
 };
 
 struct port_info {
@@ -74,3 +84,7 @@ char *get_hostname() {
     }
     return hostname;
 }
+
+// Forward declarations (definitions live in udhcpinject.c)
+int parse_iwinfo_by_essid(struct iface_info *iface);
+int setup_tc_for_iface(struct iface_info *iface);
