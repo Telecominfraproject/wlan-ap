@@ -63,6 +63,8 @@ struct iface_info {
 	char frequency[LEN_FREQ + 1];
     int serial;
     int resolved; // 1 once the VAP has been resolved via iwinfo and tc is set up
+    int ifindex;  // netdev ifindex recorded at resolve time; used to detect a
+                  // VAP that was torn down and recreated (radar/DFS, wifi reload)
 };
 
 struct port_info {
