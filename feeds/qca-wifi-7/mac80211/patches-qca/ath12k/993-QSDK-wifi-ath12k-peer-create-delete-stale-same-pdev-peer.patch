@@ -1,0 +1,103 @@
+From: Tanya Singh <tanya_singh@accton.com>
+Date: Thu, 30 Jul 2026 11:10:00 +0800
+Subject: [PATCH] wifi: ath12k: recover from same-pdev peer collision on
+ (re)association
+
+ath12k allows only one peer per client MAC per pdev (radio).
+ath12k_peer_create() rejects with -EINVAL when a peer for that MAC already
+exists on the target radio ("Peer %pM already found in pdev_idx %d vdev %d"
+-> "Failed to add peer/station" -> hostapd "Could not add STA to kernel
+driver"), with no recovery for the same-pdev case. It only fixes up the
+different-pdev / split-PHY case via ath12k_peer_find_by_addr() +
+ath12k_peer_rhash_delete().
+
+On a multi-BSS radio (up to 8 VAPs/band on EAP105, ipq53xx), a client that
+(re)associates to another VAP on the same radio while its peer on the
+previous VAP has not been torn down keeps hitting this reject and loops.
+This happens with:
+  - a stable-MAC client roaming between co-located SSIDs on one radio, and
+  - a leaked peer from a prior session blocking even a fresh association.
+Because the blocking peer may be an active association, hostapd inactivity
+ageing / disassoc_low_ack cannot win the race.
+
+This is the ath12k analogue of the ath11k fix in commit 1d106efd
+("ath11k: fix multi band roaming", WIFI-12188), which for a same-MAC
+peer on a *different* vdev removes the stale peer and proceeds instead of
+returning -EINVAL. ath11k only needs ath11k_peer_rhash_delete() there
+because different vdevs map to different radios; ath12k must actually
+delete the firmware peer on its original vdev (WMI peer delete), because
+its firmware enforces one peer per MAC per pdev and would otherwise reject
+the new peer_create. The ath12k delete path (ath12k_peer_delete_send)
+already carries the delete-side guards that 1d106efd added to ath11k
+(vdev_id-checked rhash delete + fallback ath12k_peer_find(vdev_id,addr)),
+so only the create side needs this change.
+
+Handle the cross-vdev, non-MLO collision by deleting the stale peer on its
+original vdev (same pdev_idx => same ar; conf_mutex already held; done
+outside base_lock/tbl_mtx_lock) and continuing with the create, moving the
+client to the new VAP in a single cycle. The same-vdev and MLO cases keep
+the original reject; a single re-check after the delete prevents looping if
+the peer somehow persists.
+
+Signed-off-by: Tanya Singh <tanya_singh@accton.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -807,11 +807,54 @@
+ 	spin_lock_bh(&ab->base_lock);
+  	peer = ath12k_peer_find_by_pdev_idx(ab, ar->pdev_idx, arg->peer_addr);
+ 	if (peer) {
+-		ath12k_warn(ab, "Peer %pM already found in pdev_idx %d vdev %d\n",
+-			    arg->peer_addr, ar->pdev_idx, peer->vdev_id);
++		u32 stale_vdev_id = peer->vdev_id;
++		bool stale_mlo = peer->mlo;
++
++		/* A peer for this MAC already exists on this radio (pdev). ath12k
++		 * allows only one peer per MAC per pdev, so simply rejecting here
++		 * makes a client loop forever when it (re)associates to another VAP
++		 * on the same radio while its previous peer has not yet been torn
++		 * down (e.g. roaming between co-located SSIDs on a multi-BSS radio).
++		 * For that cross-vdev, non-MLO case, delete the stale peer on its
++		 * original vdev and continue - effectively moving the client to the
++		 * new VAP instead of blocking it. All other cases keep the original
++		 * reject.
++		 */
++		if (stale_vdev_id == arg->vdev_id || stale_mlo) {
++			ath12k_warn(ab, "Peer %pM already found in pdev_idx %d vdev %d\n",
++				    arg->peer_addr, ar->pdev_idx, peer->vdev_id);
++			spin_unlock_bh(&ab->base_lock);
++			mutex_unlock(&ab->tbl_mtx_lock);
++			return -EINVAL;
++		}
++
+ 		spin_unlock_bh(&ab->base_lock);
+ 		mutex_unlock(&ab->tbl_mtx_lock);
+-		return -EINVAL;
++
++		ath12k_warn(ab,
++			    "Peer %pM exists on pdev_idx %d vdev %d; deleting stale peer to allow create on vdev %d\n",
++			    arg->peer_addr, ar->pdev_idx, stale_vdev_id, arg->vdev_id);
++
++		ret = ath12k_peer_delete(ar, stale_vdev_id, arg->peer_addr, NULL);
++		if (ret) {
++			ath12k_warn(ab,
++				    "failed to delete stale peer %pM on vdev %d ret %d\n",
++				    arg->peer_addr, stale_vdev_id, ret);
++			return ret;
++		}
++
++		mutex_lock(&ab->tbl_mtx_lock);
++		spin_lock_bh(&ab->base_lock);
++
++		peer = ath12k_peer_find_by_pdev_idx(ab, ar->pdev_idx, arg->peer_addr);
++		if (peer) {
++			ath12k_warn(ab,
++				    "Peer %pM still present on pdev_idx %d vdev %d after delete; aborting create\n",
++				    arg->peer_addr, ar->pdev_idx, peer->vdev_id);
++			spin_unlock_bh(&ab->base_lock);
++			mutex_unlock(&ab->tbl_mtx_lock);
++			return -EINVAL;
++		}
+ 	}
+ 
+ 	/* In case of Split PHY and roaming scenario, pdev idx
