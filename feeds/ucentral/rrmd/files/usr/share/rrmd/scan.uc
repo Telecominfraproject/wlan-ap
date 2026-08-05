@@ -12,7 +12,7 @@ let scan_blocked_cnt = 0;
 function scan(phy, params) {
 	if (params.wiphy_freq) {
 		params.center_freq1 = (int) (params.wiphy_freq) + (int) (phys[phy].offset);
-		params.scan_ssids = [ '' ];
+		params.scan_frequencies = [ (int) (params.wiphy_freq) ];
 	}
 
 	params.scan_flags = SCAN_FLAG_AP;
