@@ -591,7 +591,15 @@ morse_override_hostapd_set_bss_options() {
 		*,*);;
 		*) iw_qos_map_set="";;
 	esac
-	[ -n "$iw_qos_map_set" ] && append bss_conf "qos_map_set=$iw_qos_map_set" "$N"
+	# qos_map_set requires NL80211_CMD_SET_QOS_MAP support in the driver.
+	# Morse Micro's morse_usb driver (1.17.8) does not implement it, so
+	# hostapd_s1g fails with "Failed to initialize QoS Map" and aborts
+	# interface init. Only emit qos_map_set when Interworking/HS20 is
+	# actually enabled (where it's required) so AP setup succeeds on
+	# drivers that lack the capability.
+	if [ "${iw_enabled:-0}" = "1" ] || [ "${hs20:-0}" = "1" ]; then
+		[ -n "$iw_qos_map_set" ] && append bss_conf "qos_map_set=$iw_qos_map_set" "$N"
+	fi
 
 	local hs20 disable_dgaf osen anqp_domain_id hs20_deauth_req_timeout \
 		osu_ssid hs20_wan_metrics hs20_operating_class hs20_t_c_filename hs20_t_c_timestamp \
@@ -818,6 +826,10 @@ morse_override_wpa_supplicant_add_network() {
 
 	[ "$_w_mode" = "mesh" ] && {
 		json_get_vars mesh_id dtim_period encryption
+		# HaLow mesh cannot connect when the cloud config omits
+		# dtim_period - wpa_supplicant_s1g's mesh network then has no
+		# DTIM and peering fails. Default it to 1 for mesh.
+		set_default dtim_period 1
 		[ -n "$mesh_id" ] && ssid="${mesh_id}"
 		[ -n "$mesh_max_peer_links" ] && append mesh_data "max_peer_links=${mesh_max_peer_links}" "$N"
 		[ -n "$mesh_plink_timeout" ] && append mesh_data "mesh_max_inactivity=${mesh_plink_timeout}" "$N"
