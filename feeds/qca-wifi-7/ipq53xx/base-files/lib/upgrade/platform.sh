@@ -60,7 +60,7 @@ version_le() {
 
 	[ -z "$ver1" ] || [ -z "$ver2" ] && return 1
 
-	[ "$(printf '%s\n' "$ver1" "$ver2" | sort -V | head -n1)" = "$ver1" ]
+	[ "$(printf '%s\n' "$ver1" "$ver2" | sort -Vr | head -n1)" != "$ver1" ]
 }
 
 find_mmc_part() {
