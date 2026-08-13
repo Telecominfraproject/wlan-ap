@@ -206,6 +206,9 @@ function format_mgmt_key(key) {
 }
 
 function assoc_flags(data) {
+	if (!data)
+		return [];
+
 	const assoc_mhz = {
 		width_40: 40,
 		width_80: 80,
@@ -309,25 +312,34 @@ export function assoclist(dev) {
 	let ret = {};
 	
 	for (let station in stations) {
+		/*
+		 * The kernel may omit parts of the station info, e.g. for stations
+		 * that just associated and did not exchange any data yet. Access all
+		 * nested attributes defensively to avoid bailing out with a reference
+		 * error in that case.
+		 */
+		let sta_info = station.sta_info ?? {};
+		let rx_bitrate = sta_info.rx_bitrate;
+		let tx_bitrate = sta_info.tx_bitrate;
 		let sta = {
 			mac: uc(station.mac),
-			signal: station.sta_info.signal_avg,
+			signal: sta_info.signal_avg ?? 0,
 			noise: ifaces[dev].noise,
-			snr: station.sta_info.signal_avg - ifaces[dev].noise,
-			inactive_time: station.sta_info.inactive_time,
+			snr: (sta_info.signal_avg ?? 0) - ifaces[dev].noise,
+			inactive_time: sta_info.inactive_time ?? 0,
 			rx: {
-				bitrate: format_rate(station.sta_info.rx_bitrate.bitrate),
-				bitrate_raw: station.sta_info.rx_bitrate.bitrate,
-				packets: station.sta_info.rx_packets,
-				flags: assoc_flags(station.sta_info.rx_bitrate),
+				bitrate: format_rate(rx_bitrate?.bitrate),
+				bitrate_raw: rx_bitrate?.bitrate ?? 0,
+				packets: sta_info.rx_packets ?? 0,
+				flags: assoc_flags(rx_bitrate),
 			},
 			tx: {
-				bitrate: format_rate(station.sta_info.tx_bitrate.bitrate),
-				bitrate_raw: station.sta_info.tx_bitrate.bitrate,
-				packets: station.sta_info.tx_packets,
-				flags: assoc_flags(station.sta_info.tx_bitrate),
+				bitrate: format_rate(tx_bitrate?.bitrate),
+				bitrate_raw: tx_bitrate?.bitrate ?? 0,
+				packets: sta_info.tx_packets ?? 0,
+				flags: assoc_flags(tx_bitrate),
 			},
-			expected_throughput: station.sta_info.expected_throughput ?? 'unknown',
+			expected_throughput: sta_info.expected_throughput ?? 'unknown',
 		};
 		ret[sta.mac] = sta;
 	}
