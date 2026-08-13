@@ -633,6 +633,11 @@ ifeq ($(CONFIG_TARGET_PROFILE), "DEVICE_edgecore_eap111")
 	cp ./edgecore_eap111_eeprom_dbdc.bin \
 		$(1)/lib/firmware/mediatek/mt7981_eeprom_mt7976_dbdc.bin
 endif
+
+ifeq ($(CONFIG_TARGET_PROFILE), "DEVICE_sonicfi_rap630w_211g")
+	cp ./sonicfi_rap630w_211g_eeprom_dbdc.bin \
+		$(1)/lib/firmware/mediatek/mt7981_eeprom_mt7976_dbdc.bin
+endif
 endef
 
 define KernelPackage/mt7986-firmware/install
