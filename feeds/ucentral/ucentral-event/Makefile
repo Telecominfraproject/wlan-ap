@@ -12,6 +12,7 @@ define Package/ucentral-event
   SECTION:=ucentral
   CATEGORY:=uCentral
   TITLE:=uCentral event gathering daemon
+  DEPENDS:=+iw
 endef
 
 define Build/Compile

@@ -13,12 +13,27 @@
 # for the remaining cases where firmware still gets stuck.
 #
 # FLOW:
-# 1. Watches hostapd syslog for STA association messages
+# 1. Subscribes to nl80211 netlink events ("iw event") and watches for
+#    NL80211_CMD_NEW_STATION, which mac80211 emits from sta_info_insert()
+#    once hostapd has added the STA after a successful association
 # 2. Detects band-hops (STA moves between phy5g-apX and phy6g-apX)
 # 3. Only acts if STA was previously passing real traffic (>= PKT_THRESHOLD)
 # 4. After CHECK_DELAY seconds, samples RX packet count twice (1s apart)
 # 5. If delta < PKT_THRESHOLD -> disassociates STA to force clean reconnect
 # 6. Stops kicking after MAX_KICKS consecutive failures per STA
+#
+# WHY NETLINK INSTEAD OF SYSLOG:
+# The first version of this script parsed "logread -f" for hostapd's
+# "IEEE 802.11: associated (aid N)" message. That has several problems:
+#   - it depends on hostapd log level and on the exact wording of a log
+#     string that is not an API and changes between hostapd versions
+#   - every single syslog line on the box has to be piped and matched by
+#     the shell, and events are silently lost if syslogd rate-limits or
+#     the ring buffer wraps under load (exactly the situation we care about)
+#   - it needs a running/attachable syslogd
+# nl80211 NEW_STATION comes straight from cfg80211, is the authoritative
+# "STA is now on this interface" event, carries the ifindex and MAC as
+# structured attributes, and is delivered on a dedicated multicast group.
 #
 # Usage: ba-recovery [CHECK_DELAY_SEC] [PKT_THRESHOLD]
 # Defaults: CHECK_DELAY=2, PKT_THRESHOLD=2000
@@ -155,7 +170,18 @@ update_active_state() {
 log "=== ba-recovery daemon starting (pid=$$) ==="
 log "CONFIG: CHECK_DELAY=${CHECK_DELAY}s, PKT_THRESHOLD=${PKT_THRESHOLD}pkts/s, MAX_KICKS=${MAX_KICKS}"
 
-# Discover interfaces (retry up to 30 times waiting for hostapd)
+# nl80211 event source — required
+IW=$(command -v iw 2>/dev/null)
+if [ -z "$IW" ]; then
+	log "ERROR: iw not found, cannot subscribe to nl80211 events"
+	exit 1
+fi
+
+# Discover interfaces (retry up to 30 times waiting for hostapd).
+# Informational only — the nl80211 event stream does not depend on hostapd
+# being up, and the band is derived per-event from the netlink ifname. So a
+# timeout here is not fatal: radios may be disabled at boot and enabled
+# later, and we still want to be listening when that happens.
 IFACE_5G=""
 IFACE_6G=""
 RETRIES=30
@@ -173,8 +199,7 @@ while [ "$RETRIES" -gt 0 ]; do
 done
 
 if [ -z "$IFACE_5G" ] && [ -z "$IFACE_6G" ]; then
-	log "ERROR: no hostapd interfaces found after 60s"
-	exit 1
+	log "WARN: no hostapd interfaces found after 60s, listening anyway"
 fi
 [ -n "$IFACE_5G" ] && log "  5G interface: $IFACE_5G"
 [ -n "$IFACE_6G" ] && log "  6G interface: $IFACE_6G"
@@ -191,21 +216,30 @@ cleanup() {
 }
 trap cleanup INT TERM
 
-log "=== ready, watching logread for hostapd events ==="
+log "=== ready, subscribed to nl80211 events ==="
 
-# Watch syslog for hostapd "associated" messages
-# Format: "hostapd: phy5g-ap0: STA xx:xx:xx:xx:xx:xx IEEE 802.11: associated (aid N)"
-logread -f | while IFS= read -r line; do
+# Watch nl80211 (netlink) for NEW_STATION events.
+# "iw event" line format (it fflush()es stdout after every event, so this
+# streams line by line through the pipe):
+#   "phy5g-ap0 (phy #1): new station aa:bb:cc:dd:ee:ff"
+# Events without an ifindex (wdev-only) are ignored — we need a netdev to
+# map to a band and to talk to hostapd_cli.
+# stderr is left attached so netlink setup failures land in syslog via procd.
+"$IW" event | while IFS= read -r line; do
 	case "$line" in
-		*"IEEE 802.11: associated (aid"*)
-			# Extract MAC and interface from hostapd log
-			mac=$(echo "$line" | sed -n 's/.*STA \([0-9a-fA-F:]*\) IEEE.*/\1/p' | tr 'A-F' 'a-f')
-			iface=$(echo "$line" | sed -n 's/.*hostapd: \([^ :]*\): STA.*/\1/p')
+		*": new station "*)
+			# Prefix up to the first ':' is "<ifname> (phy #N)" or "<ifname>"
+			iface="${line%%:*}"
+			iface="${iface%% *}"
+			# iw formats MACs with %02x, so this is always lowercase
+			# and matches the state-file naming used below.
+			mac="${line##*new station }"
 
 			[ -z "$mac" ] && continue
 			[ -z "$iface" ] && continue
 
-			# Determine band from interface name
+			# Determine band from interface name. This also drops
+			# wdev-only / phy-only events, which have no band.
 			band=""
 			case "$iface" in
 				*5g*) band="5g" ;;
@@ -235,3 +269,7 @@ logread -f | while IFS= read -r line; do
 			;;
 	esac
 done
+
+# "iw event" only returns on netlink socket error or SIGPIPE; procd respawns us.
+log "ERROR: nl80211 event stream ended, exiting for respawn"
+exit 1
