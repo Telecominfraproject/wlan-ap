@@ -30,10 +30,40 @@
 #    NL80211_CMD_NEW_STATION, which mac80211 emits from sta_info_insert()
 #    once hostapd has added the STA after a successful association
 # 2. Detects band-hops (STA moves between phy5g-apX and phy6g-apX)
-# 3. Only acts if STA was previously passing real traffic (>= PKT_THRESHOLD)
-# 4. After CHECK_DELAY seconds, samples RX packet count twice (1s apart)
-# 5. If delta < PKT_THRESHOLD -> disassociates STA to force clean reconnect
-# 6. Stops kicking after MAX_KICKS consecutive failures per STA
+# 3. After CHECK_DELAY seconds, samples the AP-side RX packet counter for
+#    that STA twice, 1s apart, giving a pkts/s rate
+# 4. Any sample >= SEEN_FLOOR refreshes the activity marker, then the rate is
+#    classified:
+#      >= ACTIVE_FLOOR    healthy, stop here
+#      >  DEAD_THRESHOLD  passing traffic but not healthy. Never kicked.
+#      <= DEAD_THRESHOLD  candidate for the stuck-BA signature
+# 5. A candidate is kicked only if it carried traffic within ACTIVE_TTL and a
+#    second confirming sample still reads dead. The confirm absorbs post-roam
+#    TCP ramp-up, which at a single sample point is indistinguishable from a
+#    stuck session: measured runs show the first sample reading 0 pkts/s on
+#    links that go on to reach 9400 pkts/s as well as on genuinely stuck ones.
+# 6. Stops kicking after MAX_KICKS failures per STA within 30s
+# 7. A settled-rate sample is logged SETTLED_DELAY later, purely so each roam
+#    is self-contained evidence of where the link ended up.
+#
+# WHY SEEN_FLOOR IS SEPARATE FROM ACTIVE_FLOOR:
+# The marker used to be refreshed only by a healthy sample, which deadlocks: a
+# stuck STA can never produce one, so once the marker expired it could never be
+# recovered again. A run on 2026-08-17 showed exactly that, 9 consecutive
+# band-hops at 0-213 pkts/s with LANforge pushing traffic throughout, every one
+# skipped as "not seen active" and no kick ever attempted. Refreshing at
+# SEEN_FLOOR instead means a stuck session keeps its own eligibility alive, since
+# the stuck rate is far above SEEN_FLOOR while idle chatter is far below it.
+#
+# WHY THE RATE BANDS ARE WHERE THEY ARE:
+# An earlier version skipped only when the rate was exactly 0 and kicked
+# anything below a single 2000 pkts/s threshold. In practice that kicked
+# idle clients passing 1 pkt/s of background chatter, and each kick forced
+# a reassociation that produced another band-hop and another check. It also
+# kicked a STA measured at 1378 pkts/s (~16 Mbps), which is nothing like
+# the 0-5 Mbps signature this works around. The "was active" marker was
+# only ever written at >= 2000 pkts/s, so it never armed and the
+# previously-active precondition was dead code.
 #
 # WHY NETLINK INSTEAD OF SYSLOG:
 # The first version of this script parsed "logread -f" for hostapd's
@@ -48,14 +78,44 @@
 # "STA is now on this interface" event, carries the ifindex and MAC as
 # structured attributes, and is delivered on a dedicated multicast group.
 #
-# Usage: ba-recovery [CHECK_DELAY_SEC] [PKT_THRESHOLD]
-# Defaults: CHECK_DELAY=2, PKT_THRESHOLD=2000
+# Usage: ba-recovery [CHECK_DELAY_SEC] [DEAD_THRESHOLD] [ACTIVE_FLOOR]
+# Defaults: CHECK_DELAY=3, DEAD_THRESHOLD=800, ACTIVE_FLOOR=1000
+#
+# Measured rates on EAP105, uplink, 1500-byte frames:
+#
+#   idle client                    0-1 pkts/s
+#   stuck BA session         195-560 pkts/s   (~2.5-7 Mbps)
+#   healthy after a roam    1643-9482 pkts/s  (~20-115 Mbps)
+#
+# DEAD_THRESHOLD sits at 800, inside the empty gap between the top of the
+# observed stuck range (560) and the lowest healthy reading (1643). An earlier
+# value of 300 bisected the stuck range and let 400, 414, 513 and 556 pkts/s
+# sessions through uncorrected. SEEN_FLOOR at 100 sits in the equally wide gap
+# below the stuck range.
 #
 # Install as init.d service for persistent background operation.
 
-CHECK_DELAY="${1:-2}"
-PKT_THRESHOLD="${2:-2000}"
+CHECK_DELAY="${1:-3}"
+DEAD_THRESHOLD="${2:-800}"
+ACTIVE_FLOOR="${3:-1000}"
 MAX_KICKS=5
+
+# Any sample at or above this refreshes the activity marker. It sits well below
+# DEAD_THRESHOLD on purpose: a stuck STA still pushes 195-560 pkts/s, so it keeps
+# its own eligibility alive and stays recoverable across consecutive stuck roams.
+# Observed idle traffic is 0-1 pkts/s, so the margin either side is large.
+SEEN_FLOOR=100
+
+# How long an activity observation stays trustworthy. Past this the STA is
+# treated as idle and will not be kicked, so a client that finished its transfer
+# is left alone.
+ACTIVE_TTL=120
+
+# Delay before the confirming sample when a candidate is found.
+CONFIRM_DELAY=3
+
+# Delay before the observational settled-rate sample.
+SETTLED_DELAY=10
 
 # Only run on EAP105 — this workaround is specific to QCN9274 FW bug
 BOARD=$(cat /tmp/sysinfo/board_name 2>/dev/null)
@@ -70,6 +130,33 @@ esac
 log() {
 	logger -t ba-recovery "$*"
 	echo "[$(date +%s)] $*"
+}
+
+# Milliseconds since the AP last saw a frame from this STA, from the
+# "<mac> ... <N> ms ago" line of "iwinfo <iface> assoc". Echoes -1 if unreadable.
+#
+# Logged for diagnosis only, NOT used to make decisions. It was tried as an
+# idle-vs-stuck discriminator on the theory that mac80211 derives it from
+# rx_stats.last_rx (ieee80211_sta_last_active), updated on reception ahead of
+# reorder/BA release, so a stalled-but-transmitting STA would read low. Hardware
+# refuted that: in the window right after a roam it reads 1700-3700ms on links
+# that go on to push 9400 pkts/s seconds later, because the client simply has not
+# resumed transmitting yet. It measures "has not started again", not "has nothing
+# to send", so it cannot separate the two cases at the point we sample.
+get_inactive_ms() {
+	local mac="$1"
+	local iface="$2"
+	local mac_upper ms
+
+	mac_upper=$(echo "$mac" | tr 'a-f' 'A-F')
+
+	ms=$(iwinfo "$iface" assoc 2>/dev/null | \
+		grep "$mac_upper" | \
+		head -1 | \
+		sed -n 's/.*[[:space:]]\([0-9]\{1,\}\) ms ago.*/\1/p')
+
+	[ -z "$ms" ] && ms="-1"
+	echo "$ms"
 }
 
 get_rx_pkts() {
@@ -87,6 +174,51 @@ get_rx_pkts() {
 
 	[ -z "$pkts" ] && pkts="0"
 	echo "$pkts"
+}
+
+# Record that this STA was observed passing real traffic, with a timestamp.
+mark_active() {
+	date +%s > "$STATE_DIR/${1}.active"
+}
+
+# Purely observational: sample once more after SETTLED_DELAY and log the rate
+# the link actually ended up at. Without this a "recovered on its own" line is
+# ambiguous, since a confirm of 500/s (~6 Mbps) looks the same whether the link
+# then climbed to 100 Mbps or stayed at 6. Takes no action.
+log_settled() {
+	local mac="$1" iface="$2" p1 p2 rate
+
+	sleep "$SETTLED_DELAY"
+
+	p1=$(get_rx_pkts "$mac" "$iface")
+	[ "$p1" = "0" ] && return
+	sleep 1
+	p2=$(get_rx_pkts "$mac" "$iface")
+	[ "$p2" = "0" ] && return
+
+	rate=$((p2 - p1))
+	[ "$rate" -ge "$SEEN_FLOOR" ] && mark_active "$mac"
+	if [ "$rate" -ge "$ACTIVE_FLOOR" ]; then
+		log "SETTLED: $mac on $iface ${rate}/s (healthy)"
+	else
+		log "SETTLED: $mac on $iface ${rate}/s (still below ${ACTIVE_FLOOR}/s) inactive=$(get_inactive_ms "$mac" "$iface")ms"
+	fi
+}
+
+# True if the STA was seen healthy within ACTIVE_TTL seconds. Anything older
+# is stale: the client may simply have finished what it was doing.
+was_recently_active() {
+	local mac="$1" ts age
+
+	[ -f "$STATE_DIR/${mac}.active" ] || return 1
+
+	ts=$(cat "$STATE_DIR/${mac}.active" 2>/dev/null)
+	case "$ts" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+
+	age=$(( $(date +%s) - ts ))
+	[ "$age" -le "$ACTIVE_TTL" ]
 }
 
 do_recover() {
@@ -117,15 +249,20 @@ do_recover() {
 		return
 	fi
 
-	log "RECOVER: $mac on $iface pkt_delta=${delta} < threshold=${PKT_THRESHOLD} (kick $kicks/$MAX_KICKS)"
+	log "RECOVER: $mac on $iface pkt_delta=${delta}/s <= dead=${DEAD_THRESHOLD} (kick $kicks/$MAX_KICKS)"
 	log "RECOVER: disassociating $mac from $iface"
-	hostapd_cli -i "$iface" disassociate "$mac" reason=4 tx=0
+	# hostapd_cli prints "OK" on stdout, which procd forwards to syslog.
+	if hostapd_cli -i "$iface" disassociate "$mac" reason=4 tx=0 >/dev/null 2>&1; then
+		log "RECOVER: disassociate accepted for $mac"
+	else
+		log "RECOVER: disassociate FAILED for $mac on $iface"
+	fi
 }
 
 check_sta_pkts() {
 	local mac="$1"
 	local iface="$2"
-	local pkts1 pkts2 delta
+	local pkts1 pkts2 delta confirm inact
 
 	pkts1=$(get_rx_pkts "$mac" "$iface")
 	if [ "$pkts1" = "0" ]; then
@@ -143,21 +280,73 @@ check_sta_pkts() {
 
 	delta=$((pkts2 - pkts1))
 
-	# Skip truly idle STAs (no traffic at all) — they aren't broken, just inactive
-	if [ "$delta" -eq 0 ] && [ ! -f "$STATE_DIR/${mac}.active" ]; then
-		log "SKIP: $mac on $iface — idle STA (delta=0, never active), ignoring"
+	# The RX counter is cumulative per association and resets to zero when the
+	# STA reassociates. A negative delta means that happened between the two
+	# samples, so the reading is meaningless rather than low. Abort instead of
+	# clamping to 0: clamping would look like "no traffic" and could kick a STA
+	# that is fine. The next band-hop re-evaluates.
+	if [ "$delta" -lt 0 ]; then
+		log "check: $mac on $iface — RX counter reset mid-sample (reassociated), no reading"
 		return
 	fi
 
-	if [ "$delta" -lt "$PKT_THRESHOLD" ]; then
-		do_recover "$mac" "$iface" "$delta"
-	else
+	# Any real traffic keeps the STA eligible for recovery, including the low
+	# rates a stuck session produces. See SEEN_FLOOR.
+	[ "$delta" -ge "$SEEN_FLOOR" ] && mark_active "$mac"
+
+	# Healthy: nothing to do.
+	if [ "$delta" -ge "$ACTIVE_FLOOR" ]; then
 		log "OK: $mac on $iface pkt_delta=${delta}/s (healthy)"
-		# Reset kick counter on success
 		rm -f "$STATE_DIR/${mac}.kicks"
-		# Mark as active for future reference
-		echo "$delta" > "$STATE_DIR/${mac}.active"
+		return
 	fi
+
+	# Passing real traffic but below the healthy bar. Degraded is not the
+	# failure mode this works around, so never kick here.
+	if [ "$delta" -gt "$DEAD_THRESHOLD" ]; then
+		log "SKIP: $mac on $iface pkt_delta=${delta}/s — degraded but passing, not the stuck-BA signature"
+		return
+	fi
+
+	# At or below DEAD_THRESHOLD. Only act if this STA has carried traffic
+	# recently, otherwise it is just idle. Because SEEN_FLOOR is low enough that a
+	# stuck session refreshes the marker itself, this does not lock out a STA that
+	# stays stuck across several roams.
+	inact=$(get_inactive_ms "$mac" "$iface")
+
+	if ! was_recently_active "$mac"; then
+		log "SKIP: $mac on $iface pkt_delta=${delta}/s inactive=${inact}ms — no traffic within ${ACTIVE_TTL}s, treating as idle"
+		return
+	fi
+
+	# Confirm before kicking. TCP can take a few seconds to ramp back up
+	# after a roam, which looks identical to a stuck BA session at T+3s.
+	sleep "$CONFIRM_DELAY"
+
+	pkts1=$(get_rx_pkts "$mac" "$iface")
+	[ "$pkts1" = "0" ] && { log "check: $mac on $iface — STA gone before confirm"; return; }
+	sleep 1
+	pkts2=$(get_rx_pkts "$mac" "$iface")
+	[ "$pkts2" = "0" ] && { log "check: $mac on $iface — STA gone during confirm"; return; }
+
+	confirm=$((pkts2 - pkts1))
+
+	if [ "$confirm" -lt 0 ]; then
+		log "check: $mac on $iface — RX counter reset mid-confirm (reassociated), no reading"
+		return
+	fi
+
+	[ "$confirm" -ge "$SEEN_FLOOR" ] && mark_active "$mac"
+
+	if [ "$confirm" -gt "$DEAD_THRESHOLD" ]; then
+		log "SKIP: $mac on $iface recovered on its own (first=${delta}/s confirm=${confirm}/s inactive=${inact}ms)"
+		log_settled "$mac" "$iface"
+		return
+	fi
+
+	log "STUCK: $mac on $iface first=${delta}/s confirm=${confirm}/s inactive=${inact}ms"
+	do_recover "$mac" "$iface" "$confirm"
+	log_settled "$mac" "$iface"
 }
 
 update_active_state() {
@@ -174,14 +363,14 @@ update_active_state() {
 	[ "$pkts2" = "0" ] && return
 
 	delta=$((pkts2 - pkts1))
-	if [ "$delta" -ge "$PKT_THRESHOLD" ]; then
-		echo "$delta" > "$STATE_DIR/${mac}.active"
+	if [ "$delta" -ge "$SEEN_FLOOR" ]; then
+		mark_active "$mac"
 	fi
 }
 
 # --- Main ---
 log "=== ba-recovery daemon starting (pid=$$) ==="
-log "CONFIG: CHECK_DELAY=${CHECK_DELAY}s, PKT_THRESHOLD=${PKT_THRESHOLD}pkts/s, MAX_KICKS=${MAX_KICKS}"
+log "CONFIG: CHECK_DELAY=${CHECK_DELAY}s DEAD_THRESHOLD=${DEAD_THRESHOLD}pkts/s ACTIVE_FLOOR=${ACTIVE_FLOOR}pkts/s SEEN_FLOOR=${SEEN_FLOOR}pkts/s ACTIVE_TTL=${ACTIVE_TTL}s CONFIRM_DELAY=${CONFIRM_DELAY}s SETTLED_DELAY=${SETTLED_DELAY}s MAX_KICKS=${MAX_KICKS}"
 
 # nl80211 event source — required
 IW=$(command -v iw 2>/dev/null)
