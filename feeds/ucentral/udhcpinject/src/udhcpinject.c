@@ -8,10 +8,12 @@
 #include <net/if.h>
 
 #include <pcap.h>
+#include <poll.h>
 #include <signal.h>
 
 #include <sys/socket.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 #include <uci.h>
 
@@ -52,7 +54,8 @@ void cleanup()
     syslog(LOG_INFO, "Cleanup complete.\n");
 }
 
-int setup_tc()
+// Create the shared ifb-inject mirror interface (once). Returns 0 on success.
+int setup_ifb()
 {
     char cmd[512];
 
@@ -69,39 +72,166 @@ int setup_tc()
             return -1;
         }
     }
+    return 0;
+}
+
+// Install the ingress qdisc + DHCP redirect filter for a single resolved VAP.
+// Returns 0 on success, -1 if the filter could not be installed (caller should
+// leave the VAP unresolved and retry later).
+int setup_tc_for_iface(struct iface_info *iface)
+{
+    char cmd[512];
+
+    // Adding the ingress qdisc is idempotent-ish: it fails harmlessly if one
+    // already exists, so we suppress its output and never treat it as fatal.
+    // The filter add below is the operation we actually gate on.
+    snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s ingress 2>/dev/null",
+             iface->iface);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd),
+             "tc filter add dev %s ingress protocol ip pref 32 u32 "
+             "match ip protocol 17 0xff "
+             "match u16 0x0044 0xffff at 20 "
+             "match u16 0x0043 0xffff at 22 "
+             "match u8 0x01 0xff at 28 "
+             "action vlan push id %d pipe "
+             "action mirred egress mirror dev ifb-inject pipe "
+             "action drop",
+             iface->iface, iface->serial);
+    if (system(cmd) != 0)
+    {
+        syslog(LOG_ERR, "Failed to setup tc for %s\n", iface->iface);
+        return -1;
+    }
+    return 0;
+}
+
+// Attempt to resolve every not-yet-resolved VAP via iwinfo and, on success,
+// install its tc redirect. Missing VAPs are NOT fatal: they are simply left
+// unresolved so they can be retried later (e.g. DFS VAPs that appear only after
+// CAC completes). Returns the number of VAPs still unresolved.
+int resolve_and_setup()
+{
+    int unresolved = 0;
 
     for (int i = 0; i < iface_map_size; i++)
     {
-        snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s ingress 2>/dev/null 1>2",
-                 iface_map[i].iface);
-        int result = system(cmd);
-        if (result == 2)
+        if (iface_map[i].resolved)
+            continue;
+
+        if (parse_iwinfo_by_essid(&iface_map[i]) != 0 || iface_map[i].iface[0] == '\0')
         {
-            syslog(LOG_INFO, "Ingress qdisc already exists for %s\n", iface_map[i].iface);
-        }
-        else if (result == 1)
-        {
-            syslog(LOG_ERR, "Failed to add qdisc for %s\n", iface_map[i].iface);
-            return -1;
+            unresolved++;
+            continue;
         }
 
-        snprintf(cmd, sizeof(cmd),
-                 "tc filter add dev %s ingress protocol ip pref 32 u32 "
-                 "match ip protocol 17 0xff "
-                 "match u16 0x0044 0xffff at 20 "
-                 "match u16 0x0043 0xffff at 22 "
-                 "match u8 0x01 0xff at 28 "
-                 "action vlan push id %d pipe "
-                 "action mirred egress mirror dev ifb-inject pipe "
-                 "action drop",
-                 iface_map[i].iface, iface_map[i].serial);
-        if (system(cmd) != 0)
+        if (setup_tc_for_iface(&iface_map[i]) != 0)
         {
-            syslog(LOG_ERR, "Failed to setup tc for %s\n", iface_map[i].iface);
-            return -1;
+            // VAP exists but tc install failed; retry on the next pass.
+            unresolved++;
+            continue;
+        }
+
+        iface_map[i].resolved = 1;
+        iface_map[i].ifindex = (int)if_nametoindex(iface_map[i].iface);
+        syslog(LOG_INFO,
+               "Resolved iface_info[%d]: iface='%s', freq='%s', essid='%s', bssid='%s', upstream='%s', serial=%d",
+               i, iface_map[i].iface, iface_map[i].frequency, iface_map[i].essid,
+               iface_map[i].bssid, iface_map[i].upstream, iface_map[i].serial);
+    }
+
+    return unresolved;
+}
+
+// Return 1 if our DHCP redirect filter (installed at "pref 32") is currently
+// present on the given VAP's ingress, 0 otherwise. If the device is missing tc
+// prints nothing (stderr suppressed) and we report absent.
+int tc_filter_present(const char *iface)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "tc filter show dev %s ingress 2>/dev/null", iface);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp)
+        return 0;
+
+    int present = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), fp))
+    {
+        // Our filter renders as "... pref 32 u32 ...". Match "pref 32 " so we
+        // don't accidentally match a higher pref like 320, and never confuse it
+        // with the unrelated bridger bpf filter at a much higher pref.
+        if (strstr(line, "pref 32 "))
+        {
+            present = 1;
+            break;
         }
     }
-    return 0;
+    pclose(fp);
+    return present;
+}
+
+// Re-check every already-resolved VAP and make sure its DHCP redirect is still
+// installed. A radar/DFS event or wifi reload can tear down and recreate the AP
+// netdevs (dropping the tc ingress filter) or flush the filter in place; either
+// way DHCP stops being mirrored to ifb-inject and injection silently dies.
+// Instead of inferring this from the ifindex (which misses a flush that keeps
+// the same index), we check the actual invariant - is our filter present?
+//
+//   - device gone     -> mark unresolved so it re-resolves via iwinfo later
+//   - filter missing   -> reinstall in place (the VAP name is stable, so no
+//                         iwinfo lookup is needed). If that fails, fall back to
+//                         unresolved so the iwinfo path retries next pass.
+//
+// Returns the number of VAPs that still need re-resolution (device gone or an
+// in-place reinstall failed), so the caller knows to run resolve_and_setup().
+int revalidate_resolved()
+{
+    int need_resolve = 0;
+
+    for (int i = 0; i < iface_map_size; i++)
+    {
+        if (!iface_map[i].resolved)
+            continue;
+
+        if (if_nametoindex(iface_map[i].iface) == 0)
+        {
+            syslog(LOG_INFO,
+                   "VAP '%s' (essid='%s') disappeared; will re-resolve",
+                   iface_map[i].iface, iface_map[i].essid);
+            iface_map[i].resolved = 0;
+            iface_map[i].ifindex = 0;
+            iface_map[i].iface[0] = '\0';
+            need_resolve++;
+            continue;
+        }
+
+        if (tc_filter_present(iface_map[i].iface))
+            continue;
+
+        syslog(LOG_INFO,
+               "Redirect filter missing on VAP '%s' (essid='%s'); reinstalling",
+               iface_map[i].iface, iface_map[i].essid);
+        if (setup_tc_for_iface(&iface_map[i]) != 0)
+        {
+            // Could not reinstall right now; drop to unresolved and let the
+            // iwinfo-based path retry on the next pass.
+            iface_map[i].resolved = 0;
+            iface_map[i].ifindex = 0;
+            iface_map[i].iface[0] = '\0';
+            need_resolve++;
+        }
+        else
+        {
+            // Refresh the recorded ifindex in case the netdev was recreated
+            // with the same name but a new index.
+            iface_map[i].ifindex = (int)if_nametoindex(iface_map[i].iface);
+        }
+    }
+
+    return need_resolve;
 }
 
 int parse_iwinfo_by_essid(struct iface_info *iface)
@@ -125,10 +255,11 @@ int parse_iwinfo_by_essid(struct iface_info *iface)
     if (line)
     {
         output[strcspn(output, "\n")] = '\0'; // Remove trailing newline
-        snprintf(iface->iface, LEN_IFACE + 1, output);
+        snprintf(iface->iface, LEN_IFACE + 1, "%s", output);
     }
     else
     {
+        pclose(fp);
         return 1;
     }
 
@@ -137,10 +268,11 @@ int parse_iwinfo_by_essid(struct iface_info *iface)
     if (line)
     {
         output[strcspn(output, "\n")] = '\0'; // Remove trailing newline
-        snprintf(iface->bssid, LEN_BSSID + 1, output);
+        snprintf(iface->bssid, LEN_BSSID + 1, "%s", output);
     }
     else
     {
+        pclose(fp);
         return 1;
     }
 
@@ -160,9 +292,9 @@ void add_iface_info(const char *essid, const char *upstream, const char *freq, i
     struct iface_info *info = &iface_map[iface_map_size];
     memset(info, 0, sizeof(struct iface_info));
     // use snprintf to copy essid to info->essid
-    snprintf(info->essid, LEN_ESSID + 1, essid);
-    snprintf(info->upstream, LEN_IFACE + 1, upstream);
-    snprintf(info->frequency, 2, freq);
+    snprintf(info->essid, LEN_ESSID + 1, "%s", essid);
+    snprintf(info->upstream, LEN_IFACE + 1, "%s", upstream);
+    snprintf(info->frequency, sizeof(info->frequency), "%s", freq);
     info->serial = serial;
     iface_map_size++;
 }
@@ -243,16 +375,19 @@ int parse_uci_config()
                 continue;
             }
 
-            // Get interface index
+            // Get interface index. A zero here is NOT fatal: the upstream
+            // 802.1q device may not be up yet, and netifd may later tear it
+            // down and recreate it with a different ifindex. We therefore keep
+            // the socket open and re-resolve the ifindex lazily at send time
+            // (see process_packet), so a stale/absent index self-heals.
             int ifindex = if_nametoindex(upstream);
             if (ifindex == 0)
             {
-                syslog(LOG_ERR, "Failed to get ifindex for %s\n", upstream);
-                close(sock);
+                syslog(LOG_INFO, "Upstream %s not up yet; will resolve on demand\n", upstream);
             }
 
             // Store in port_map
-            snprintf(port_map[port_map_size].name, LEN_IFACE + 1, upstream);
+            snprintf(port_map[port_map_size].name, LEN_IFACE + 1, "%s", upstream);
             port_map[port_map_size].sock = sock;
             port_map[port_map_size].ifindex = ifindex;
             port_map_size++;
@@ -457,7 +592,20 @@ void process_packet(unsigned char *user, const struct pcap_pkthdr *header,
     {
         if (!strcmp(info->upstream, port_map[i].name))
         {
-            socket_address.sll_ifindex = port_map[i].ifindex;
+            // Re-resolve the upstream ifindex on every injection. netifd can
+            // tear down and recreate these 802.1q upstream devices (e.g. on a
+            // wifi/network reload or a DFS channel change), assigning a new
+            // ifindex. A cached ifindex then goes stale and sendto() fails with
+            // ENXIO ("No such device or address") even though the device is up.
+            unsigned int ifindex = if_nametoindex(port_map[i].name);
+            if (ifindex == 0)
+            {
+                syslog(LOG_ERR, "Upstream %s not present, dropping packet: %s\n",
+                       info->upstream, strerror(errno));
+                break;
+            }
+            port_map[i].ifindex = ifindex;
+            socket_address.sll_ifindex = ifindex;
             if (sendto(port_map[i].sock, new_packet, new_len, 0, (struct sockaddr *)&socket_address,
                        sizeof(socket_address)) < 0)
             {
@@ -484,10 +632,36 @@ void signal_handler(int sig)
     case SIGTERM:
     case SIGHUP:
         cleanup();
+        exit(0);
         break;
     default:
         break;
     }
+}
+
+// Emit a heartbeat naming the SSIDs whose VAP is still not up, so a long wait
+// (e.g. a 600s DFS CAC) is visibly "waiting" rather than looking like a hang.
+// The SSID list is best-effort and truncated if it does not fit; the count is
+// authoritative and passed in by the caller.
+void log_pending(int unresolved)
+{
+    char list[512];
+    size_t off = 0;
+
+    list[0] = '\0';
+    for (int i = 0; i < iface_map_size; i++)
+    {
+        if (iface_map[i].resolved)
+            continue;
+
+        int w = snprintf(list + off, sizeof(list) - off, "%s'%s'",
+                         off ? ", " : "", iface_map[i].essid);
+        if (w < 0 || (size_t)w >= sizeof(list) - off)
+            break; // buffer full; log what we have so far
+        off += (size_t)w;
+    }
+
+    syslog(LOG_INFO, "Still waiting for %d SSID(s) to come up: %s", unresolved, list);
 }
 
 int main(int argc, char *argv[])
@@ -504,27 +678,22 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    for (int i = 0; i < iface_map_size; i++)
-    {
-        if (parse_iwinfo_by_essid(&iface_map[i]) != 0)
-        {
-            syslog(LOG_ERR, "Failed to get iface info for ESSID: %s\n", iface_map[i].essid);
-            cleanup();
-            return 1;
-        }
-        else
-        {
-            syslog(LOG_INFO, "iface_info[%d]: iface='%s', freq='%s', essid='%s', bssid='%s', upstream='%s', serial=%d\n",
-                   i, iface_map[i].iface, iface_map[i].frequency, iface_map[i].essid, iface_map[i].bssid,
-                   iface_map[i].upstream, iface_map[i].serial);
-        }
-    }
-
-    if (setup_tc() != 0)
+    if (setup_ifb() != 0)
     {
         syslog(LOG_ERR, "Setup failed\n");
         cleanup();
         return 1;
+    }
+
+    // Best-effort initial resolve. VAPs that are not up yet (e.g. 5 GHz DFS
+    // VAPs still doing CAC) are not fatal; they are retried from the main loop
+    // as they come online. This is what keeps the daemon out of a crash loop.
+    int unresolved = resolve_and_setup();
+    if (unresolved > 0)
+    {
+        syslog(LOG_INFO,
+               "%d SSID(s) not up yet; will keep retrying every %d seconds",
+               unresolved, RESOLVE_RETRY_INTERVAL);
     }
 
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -536,13 +705,79 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (pcap_loop(handle, -1, process_packet, NULL) < 0)
+    // We must service the resolve/heartbeat timers even when ifb-inject is
+    // idle. libpcap's read timeout does NOT guarantee a return when no packets
+    // arrive (on Linux the timer only runs once traffic starts), so a plain
+    // blocking pcap loop would stall the timers - fatal here, since at startup
+    // there may be no tc filters and hence no traffic at all until VAPs
+    // resolve. Instead we put the handle in non-blocking mode and drive it from
+    // poll() with our own 1s timeout, which fires regardless of packet arrival.
+    if (pcap_setnonblock(handle, 1, errbuf) != 0)
     {
-        syslog(LOG_ERR, "pcap_loop failed: %s\n", pcap_geterr(handle));
+        syslog(LOG_ERR, "Failed to set non-blocking mode: %s\n", errbuf);
         cleanup();
         return 1;
     }
+    int pcap_fd = pcap_get_selectable_fd(handle);
+
+    time_t last_resolve = time(NULL);
+    time_t last_heartbeat = time(NULL);
+    while (1)
+    {
+        if (pcap_fd >= 0)
+        {
+            struct pollfd pfd = { .fd = pcap_fd, .events = POLLIN };
+            int pr = poll(&pfd, 1, 1000);
+            if (pr < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                syslog(LOG_ERR, "poll failed: %s\n", strerror(errno));
+                break;
+            }
+        }
+        else
+        {
+            // Fallback: fd not selectable (should not happen for a live Linux
+            // capture). Sleep so we don't busy-spin, then drain in non-blocking
+            // mode below.
+            usleep(200000);
+        }
+
+        // Drain whatever is buffered. In non-blocking mode this returns
+        // promptly (0 when nothing is available) rather than waiting.
+        int n = pcap_dispatch(handle, -1, process_packet, NULL);
+        if (n < 0)
+        {
+            syslog(LOG_ERR, "pcap_dispatch failed: %s\n", pcap_geterr(handle));
+            break;
+        }
+
+        // Run the maintenance pass on a fixed cadence regardless of whether
+        // everything is currently resolved. This is what lets us recover after
+        // a radio restart: every resolved VAP is checked for its redirect
+        // filter (reinstalled in place if flushed), and any VAP whose netdev
+        // has gone is re-resolved via iwinfo once it returns.
+        time_t now = time(NULL);
+        if (now - last_resolve >= RESOLVE_RETRY_INTERVAL)
+        {
+            last_resolve = now;
+
+            int need_resolve = revalidate_resolved();
+            if (unresolved > 0 || need_resolve > 0)
+            {
+                unresolved = resolve_and_setup();
+                if (unresolved == 0)
+                    syslog(LOG_INFO, "All configured SSIDs are now resolved");
+            }
+        }
+        if (unresolved > 0 && now - last_heartbeat >= HEARTBEAT_INTERVAL)
+        {
+            last_heartbeat = now;
+            log_pending(unresolved);
+        }
+    }
 
     cleanup();
-    return 0;
+    return 1;
 }
