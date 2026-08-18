@@ -404,6 +404,8 @@ hostapd_common_add_bss_config() {
 
 	config_add_boolean apup
 	config_add_string apup_peer_ifname_prefix
+
+	config_add_string uci_section
 }
 
 hostapd_set_vlan_file() {
@@ -556,7 +558,7 @@ hostapd_set_bss_options() {
 		ppsk airtime_bss_weight airtime_bss_limit airtime_sta_weight \
 		multicast_to_unicast_all proxy_arp per_sta_vif na_mcast_to_ucast \
 		eap_server eap_user_file ca_cert server_cert private_key private_key_passwd server_id radius_server_clients radius_server_auth_port \
-		vendor_elements fils ocv apup rsn_override
+		vendor_elements fils ocv apup rsn_override uci_section
 
 	set_default rsn_override 1
 	set_default fils 0
@@ -1182,6 +1184,8 @@ hostapd_set_bss_options() {
 			append bss_conf "apup_peer_ifname_prefix=$apup_peer_ifname_prefix" "$N"
 		fi
 	fi
+
+	[ -n "$uci_section" ] && append bss_conf "uci_section=$uci_section" "$N"
 
 	json_get_values opts hostapd_bss_options
 	for val in $opts; do
