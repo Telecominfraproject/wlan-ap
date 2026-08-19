@@ -28,14 +28,11 @@ define Package/nrf54l15/install
 	$(INSTALL_BIN) ./files/firmware/* $(1)/etc/ble_fw/nordic
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_DATA) ./files/ble_chip.config $(1)/etc/config/ble_chip
-	$(INSTALL_DATA) ./files/ble.config $(1)/etc/config/ble
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/ble_chip.init $(1)/etc/init.d/ble_chip
-	$(INSTALL_BIN) ./files/ble.init $(1)/etc/init.d/ble
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/mcumgr $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/burning_hci_uart_image $(1)/usr/sbin
-	$(INSTALL_BIN) ./files/ibeacon_start.sh $(1)/usr/sbin
 endef
 
 $(eval $(call BuildPackage,nrf54l15))
