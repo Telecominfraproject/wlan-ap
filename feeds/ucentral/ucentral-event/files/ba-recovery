@@ -1,0 +1,474 @@
+#!/bin/sh
+# ba-recovery: detect and recover broken BA sessions after cross-band roaming
+#
+# ROOT CAUSE:
+# QCN9274 firmware (WLAN.WBE.1.4.1) maintains internal BA/TX aggregation
+# state indexed by STA MAC across both 5G and 6G MACs. When the same STA
+# re-appears on a different MAC after a band-hop roam, the firmware does
+# NOT reset this state. The PHY rate stays high but actual throughput
+# collapses to a few Mbps because the firmware's BA window tracking is stale.
+#
+# This script is a pure userspace workaround and is currently the ONLY
+# mitigation in the tree for this firmware bug, so every stuck band-hop is
+# handled here.
+#
+# A kernel-side attempt (ath12k: force fresh TID on ampdu_start) was tried
+# and dropped. It freed the REO queue descriptor synchronously from
+# ath12k_dp_rx_peer_tid_setup(), bypassing ath12k's deferred-free protocol
+# (REO UPDATE_RX_QUEUE vld=0 -> reo_cmd_cache_flush_list -> aged flush ->
+# free). The REO hardware can still DMA into the descriptor after it has
+# been kfree()d back to the general slab, which corrupted unrelated
+# structures and panicked the AP. Do not reintroduce that approach without
+# routing the teardown through ath12k_peer_rx_tid_delete_handler() and
+# letting ath12k_dp_rx_tid_del_func() own the free.
+#
+# FLOW:
+# 1. Subscribes to nl80211 netlink events ("iw event") and watches for
+#    NL80211_CMD_NEW_STATION, which mac80211 emits from sta_info_insert()
+#    once hostapd has added the STA after a successful association
+# 2. Detects band-hops (STA moves between phy5g-apX and phy6g-apX)
+# 3. After CHECK_DELAY seconds, samples the AP-side RX packet counter for
+#    that STA twice, 1s apart, giving a pkts/s rate
+# 4. Any sample >= SEEN_FLOOR refreshes the activity marker, then the rate is
+#    classified:
+#      >= ACTIVE_FLOOR    healthy, stop here
+#      >  DEAD_THRESHOLD  passing traffic but not healthy. Never kicked.
+#      <= DEAD_THRESHOLD  candidate for the stuck-BA signature
+# 5. A candidate is kicked only if it carried traffic within ACTIVE_TTL and a
+#    second confirming sample still reads dead. The confirm absorbs post-roam
+#    TCP ramp-up, which at a single sample point is indistinguishable from a
+#    stuck session: measured runs show the first sample reading 0 pkts/s on
+#    links that go on to reach 9400 pkts/s as well as on genuinely stuck ones.
+# 6. Stops kicking after MAX_KICKS failures per STA within 30s
+# 7. A settled-rate sample is logged SETTLED_DELAY later, purely so each roam
+#    is self-contained evidence of where the link ended up.
+#
+# WHY THREE RATE BANDS AND NOT ONE THRESHOLD:
+# Rate alone has to separate three different situations, and a single cutoff
+# cannot. An idle client passing a packet or two per second of background
+# chatter must be left alone, because kicking it forces a reassociation that
+# produces another band-hop and another check. A client running at, say,
+# 1378 pkts/s (~16 Mbps) is degraded but nothing like the few-Mbps signature
+# this works around, so it must not be kicked either. Only the narrow band
+# between idle and healthy is the stuck-BA case. Hence ACTIVE_FLOOR above and
+# DEAD_THRESHOLD below it, with the span in between explicitly left alone.
+#
+# WHY SEEN_FLOOR IS SEPARATE FROM ACTIVE_FLOOR:
+# The activity marker records that a STA has data to move, and it has to be
+# refreshable by a stuck session. Refreshing it only on a healthy sample
+# deadlocks: a stuck STA can never produce one, so once its marker expired it
+# could never be recovered again, and consecutive stuck roams would all be
+# skipped as "not seen active" with no kick attempted. SEEN_FLOOR sits below
+# the stuck range and well above idle chatter, so a stuck session keeps its own
+# eligibility alive while an idle client still ages out.
+#
+# WHY NETLINK INSTEAD OF SYSLOG:
+# The obvious alternative is parsing "logread -f" for hostapd's
+# "IEEE 802.11: associated (aid N)" message. That has several problems:
+#   - it depends on hostapd log level and on the exact wording of a log
+#     string that is not an API and changes between hostapd versions
+#   - every single syslog line on the box has to be piped and matched by
+#     the shell, and events are silently lost if syslogd rate-limits or
+#     the ring buffer wraps under load (exactly the situation we care about)
+#   - it needs a running/attachable syslogd
+# nl80211 NEW_STATION comes straight from cfg80211, is the authoritative
+# "STA is now on this interface" event, carries the ifindex and MAC as
+# structured attributes, and is delivered on a dedicated multicast group.
+#
+# Usage: ba-recovery [CHECK_DELAY_SEC] [DEAD_THRESHOLD] [ACTIVE_FLOOR]
+# Defaults: CHECK_DELAY=3, DEAD_THRESHOLD=800, ACTIVE_FLOOR=1000
+#
+# Measured rates on EAP105, uplink, 1500-byte frames:
+#
+#   idle client                    0-1 pkts/s
+#   stuck BA session         195-560 pkts/s   (~2.5-7 Mbps)
+#   healthy after a roam    1643-9482 pkts/s  (~20-115 Mbps)
+#
+# DEAD_THRESHOLD sits at 800, inside the empty gap between the top of the
+# observed stuck range (560) and the lowest healthy reading (1643). A lower
+# value bisects the stuck range and lets 400-560 pkts/s sessions through
+# uncorrected. SEEN_FLOOR at 100 sits in the equally wide gap below the stuck
+# range.
+#
+# Install as init.d service for persistent background operation.
+
+CHECK_DELAY="${1:-3}"
+DEAD_THRESHOLD="${2:-800}"
+ACTIVE_FLOOR="${3:-1000}"
+MAX_KICKS=5
+
+# Any sample at or above this refreshes the activity marker. It sits well below
+# DEAD_THRESHOLD on purpose: a stuck STA still pushes 195-560 pkts/s, so it keeps
+# its own eligibility alive and stays recoverable across consecutive stuck roams.
+# Observed idle traffic is 0-1 pkts/s, so the margin either side is large.
+SEEN_FLOOR=100
+
+# How long an activity observation stays trustworthy. Past this the STA is
+# treated as idle and will not be kicked, so a client that finished its transfer
+# is left alone.
+ACTIVE_TTL=120
+
+# Delay before the confirming sample when a candidate is found.
+CONFIRM_DELAY=3
+
+# Delay before the observational settled-rate sample.
+SETTLED_DELAY=10
+
+# Only run on EAP105 — this workaround is specific to QCN9274 FW bug
+BOARD=$(cat /tmp/sysinfo/board_name 2>/dev/null)
+case "$BOARD" in
+	edgecore,eap105) ;;
+	*)
+		logger -t ba-recovery "board '$BOARD' is not EAP105, exiting"
+		exit 0
+		;;
+esac
+
+log() {
+	logger -t ba-recovery "$*"
+	echo "[$(date +%s)] $*"
+}
+
+# Milliseconds since the AP last saw a frame from this STA, from the
+# "<mac> ... <N> ms ago" line of "iwinfo <iface> assoc". Echoes -1 if unreadable.
+#
+# Logged for diagnosis only, NOT used to make decisions. It was tried as an
+# idle-vs-stuck discriminator on the theory that mac80211 derives it from
+# rx_stats.last_rx (ieee80211_sta_last_active), updated on reception ahead of
+# reorder/BA release, so a stalled-but-transmitting STA would read low. Hardware
+# refuted that: in the window right after a roam it reads 1700-3700ms on links
+# that go on to push 9400 pkts/s seconds later, because the client simply has not
+# resumed transmitting yet. It measures "has not started again", not "has nothing
+# to send", so it cannot separate the two cases at the point we sample.
+get_inactive_ms() {
+	local mac="$1"
+	local iface="$2"
+	local mac_upper ms
+
+	mac_upper=$(echo "$mac" | tr 'a-f' 'A-F')
+
+	ms=$(iwinfo "$iface" assoc 2>/dev/null | \
+		grep "$mac_upper" | \
+		head -1 | \
+		sed -n 's/.*[[:space:]]\([0-9]\{1,\}\) ms ago.*/\1/p')
+
+	[ -z "$ms" ] && ms="-1"
+	echo "$ms"
+}
+
+get_rx_pkts() {
+	local mac="$1"
+	local iface="$2"
+	local mac_upper pkts
+
+	mac_upper=$(echo "$mac" | tr 'a-f' 'A-F')
+
+	pkts=$(iwinfo "$iface" assoc 2>/dev/null | \
+		grep -A2 "$mac_upper" | \
+		grep "RX:" | \
+		head -1 | \
+		sed -n 's/.*[[:space:]]\([0-9]*\) Pkts\..*/\1/p')
+
+	[ -z "$pkts" ] && pkts="0"
+	echo "$pkts"
+}
+
+# Record that this STA was observed passing real traffic, with a timestamp.
+mark_active() {
+	date +%s > "$STATE_DIR/${1}.active"
+}
+
+# Purely observational: sample once more after SETTLED_DELAY and log the rate
+# the link actually ended up at. Without this a "recovered on its own" line is
+# ambiguous, since a confirm of 500/s (~6 Mbps) looks the same whether the link
+# then climbed to 100 Mbps or stayed at 6. Takes no action.
+log_settled() {
+	local mac="$1" iface="$2" p1 p2 rate
+
+	sleep "$SETTLED_DELAY"
+
+	p1=$(get_rx_pkts "$mac" "$iface")
+	[ "$p1" = "0" ] && return
+	sleep 1
+	p2=$(get_rx_pkts "$mac" "$iface")
+	[ "$p2" = "0" ] && return
+
+	rate=$((p2 - p1))
+	[ "$rate" -ge "$SEEN_FLOOR" ] && mark_active "$mac"
+	if [ "$rate" -ge "$ACTIVE_FLOOR" ]; then
+		log "SETTLED: $mac on $iface ${rate}/s (healthy)"
+	else
+		log "SETTLED: $mac on $iface ${rate}/s (still below ${ACTIVE_FLOOR}/s) inactive=$(get_inactive_ms "$mac" "$iface")ms"
+	fi
+}
+
+# True if the STA was seen healthy within ACTIVE_TTL seconds. Anything older
+# is stale: the client may simply have finished what it was doing.
+was_recently_active() {
+	local mac="$1" ts age
+
+	[ -f "$STATE_DIR/${mac}.active" ] || return 1
+
+	ts=$(cat "$STATE_DIR/${mac}.active" 2>/dev/null)
+	case "$ts" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+
+	age=$(( $(date +%s) - ts ))
+	[ "$age" -le "$ACTIVE_TTL" ]
+}
+
+do_recover() {
+	local mac="$1"
+	local iface="$2"
+	local delta="$3"
+	local kicks last_kick now elapsed
+
+	# Increment kick counter
+	kicks=0
+	[ -f "$STATE_DIR/${mac}.kicks" ] && kicks=$(cat "$STATE_DIR/${mac}.kicks")
+	
+	# Reset counter if last kick was more than 30 seconds ago (not a rapid-fire loop)
+	now=$(date +%s)
+	last_kick=0
+	[ -f "$STATE_DIR/${mac}.last_kick" ] && last_kick=$(cat "$STATE_DIR/${mac}.last_kick")
+	elapsed=$((now - last_kick))
+	if [ "$elapsed" -gt 30 ]; then
+		kicks=0
+	fi
+	
+	kicks=$((kicks + 1))
+	echo "$kicks" > "$STATE_DIR/${mac}.kicks"
+	echo "$now" > "$STATE_DIR/${mac}.last_kick"
+
+	if [ "$kicks" -gt "$MAX_KICKS" ]; then
+		log "SKIP: $mac rapid-fire kicks=$kicks > max=$MAX_KICKS within 30s, backing off"
+		return
+	fi
+
+	log "RECOVER: $mac on $iface pkt_delta=${delta}/s <= dead=${DEAD_THRESHOLD} (kick $kicks/$MAX_KICKS)"
+	log "RECOVER: disassociating $mac from $iface"
+	# hostapd_cli prints "OK" on stdout, which procd forwards to syslog.
+	if hostapd_cli -i "$iface" disassociate "$mac" reason=4 tx=0 >/dev/null 2>&1; then
+		log "RECOVER: disassociate accepted for $mac"
+	else
+		log "RECOVER: disassociate FAILED for $mac on $iface"
+	fi
+}
+
+check_sta_pkts() {
+	local mac="$1"
+	local iface="$2"
+	local pkts1 pkts2 delta confirm inact
+
+	pkts1=$(get_rx_pkts "$mac" "$iface")
+	if [ "$pkts1" = "0" ]; then
+		log "check: $mac on $iface — STA not found in assoc table"
+		return
+	fi
+
+	sleep 1
+
+	pkts2=$(get_rx_pkts "$mac" "$iface")
+	if [ "$pkts2" = "0" ]; then
+		log "check: $mac on $iface — STA gone after 1s"
+		return
+	fi
+
+	delta=$((pkts2 - pkts1))
+
+	# The RX counter is cumulative per association and resets to zero when the
+	# STA reassociates. A negative delta means that happened between the two
+	# samples, so the reading is meaningless rather than low. Abort instead of
+	# clamping to 0: clamping would look like "no traffic" and could kick a STA
+	# that is fine. The next band-hop re-evaluates.
+	if [ "$delta" -lt 0 ]; then
+		log "check: $mac on $iface — RX counter reset mid-sample (reassociated), no reading"
+		return
+	fi
+
+	# Any real traffic keeps the STA eligible for recovery, including the low
+	# rates a stuck session produces. See SEEN_FLOOR.
+	[ "$delta" -ge "$SEEN_FLOOR" ] && mark_active "$mac"
+
+	# Healthy: nothing to do.
+	if [ "$delta" -ge "$ACTIVE_FLOOR" ]; then
+		log "OK: $mac on $iface pkt_delta=${delta}/s (healthy)"
+		rm -f "$STATE_DIR/${mac}.kicks"
+		return
+	fi
+
+	# Passing real traffic but below the healthy bar. Degraded is not the
+	# failure mode this works around, so never kick here.
+	if [ "$delta" -gt "$DEAD_THRESHOLD" ]; then
+		log "SKIP: $mac on $iface pkt_delta=${delta}/s — degraded but passing, not the stuck-BA signature"
+		return
+	fi
+
+	# At or below DEAD_THRESHOLD. Only act if this STA has carried traffic
+	# recently, otherwise it is just idle. Because SEEN_FLOOR is low enough that a
+	# stuck session refreshes the marker itself, this does not lock out a STA that
+	# stays stuck across several roams.
+	inact=$(get_inactive_ms "$mac" "$iface")
+
+	if ! was_recently_active "$mac"; then
+		log "SKIP: $mac on $iface pkt_delta=${delta}/s inactive=${inact}ms — no traffic within ${ACTIVE_TTL}s, treating as idle"
+		return
+	fi
+
+	# Confirm before kicking. TCP can take a few seconds to ramp back up
+	# after a roam, which looks identical to a stuck BA session at T+3s.
+	sleep "$CONFIRM_DELAY"
+
+	pkts1=$(get_rx_pkts "$mac" "$iface")
+	[ "$pkts1" = "0" ] && { log "check: $mac on $iface — STA gone before confirm"; return; }
+	sleep 1
+	pkts2=$(get_rx_pkts "$mac" "$iface")
+	[ "$pkts2" = "0" ] && { log "check: $mac on $iface — STA gone during confirm"; return; }
+
+	confirm=$((pkts2 - pkts1))
+
+	if [ "$confirm" -lt 0 ]; then
+		log "check: $mac on $iface — RX counter reset mid-confirm (reassociated), no reading"
+		return
+	fi
+
+	[ "$confirm" -ge "$SEEN_FLOOR" ] && mark_active "$mac"
+
+	if [ "$confirm" -gt "$DEAD_THRESHOLD" ]; then
+		log "SKIP: $mac on $iface recovered on its own (first=${delta}/s confirm=${confirm}/s inactive=${inact}ms)"
+		log_settled "$mac" "$iface"
+		return
+	fi
+
+	log "STUCK: $mac on $iface first=${delta}/s confirm=${confirm}/s inactive=${inact}ms"
+	do_recover "$mac" "$iface" "$confirm"
+	log_settled "$mac" "$iface"
+}
+
+update_active_state() {
+	local mac="$1"
+	local iface="$2"
+	local pkts1 pkts2 delta
+
+	pkts1=$(get_rx_pkts "$mac" "$iface")
+	[ "$pkts1" = "0" ] && return
+
+	sleep 1
+
+	pkts2=$(get_rx_pkts "$mac" "$iface")
+	[ "$pkts2" = "0" ] && return
+
+	delta=$((pkts2 - pkts1))
+	if [ "$delta" -ge "$SEEN_FLOOR" ]; then
+		mark_active "$mac"
+	fi
+}
+
+# --- Main ---
+log "=== ba-recovery daemon starting (pid=$$) ==="
+log "CONFIG: CHECK_DELAY=${CHECK_DELAY}s DEAD_THRESHOLD=${DEAD_THRESHOLD}pkts/s ACTIVE_FLOOR=${ACTIVE_FLOOR}pkts/s SEEN_FLOOR=${SEEN_FLOOR}pkts/s ACTIVE_TTL=${ACTIVE_TTL}s CONFIRM_DELAY=${CONFIRM_DELAY}s SETTLED_DELAY=${SETTLED_DELAY}s MAX_KICKS=${MAX_KICKS}"
+
+# nl80211 event source — required
+IW=$(command -v iw 2>/dev/null)
+if [ -z "$IW" ]; then
+	log "ERROR: iw not found, cannot subscribe to nl80211 events"
+	exit 1
+fi
+
+# Discover interfaces (retry up to 30 times waiting for hostapd).
+# Informational only — the nl80211 event stream does not depend on hostapd
+# being up, and the band is derived per-event from the netlink ifname. So a
+# timeout here is not fatal: radios may be disabled at boot and enabled
+# later, and we still want to be listening when that happens.
+IFACE_5G=""
+IFACE_6G=""
+RETRIES=30
+while [ "$RETRIES" -gt 0 ]; do
+	for obj in $(ubus list 2>/dev/null | grep "^hostapd\\."); do
+		iface="${obj#hostapd.}"
+		case "$iface" in
+			*5g*) IFACE_5G="$iface" ;;
+			*6g*) IFACE_6G="$iface" ;;
+		esac
+	done
+	[ -n "$IFACE_5G" ] && [ -n "$IFACE_6G" ] && break
+	RETRIES=$((RETRIES - 1))
+	sleep 2
+done
+
+if [ -z "$IFACE_5G" ] && [ -z "$IFACE_6G" ]; then
+	log "WARN: no hostapd interfaces found after 60s, listening anyway"
+fi
+[ -n "$IFACE_5G" ] && log "  5G interface: $IFACE_5G"
+[ -n "$IFACE_6G" ] && log "  6G interface: $IFACE_6G"
+
+# State tracking
+STATE_DIR="/tmp/ba-recovery-state"
+rm -rf "$STATE_DIR"
+mkdir -p "$STATE_DIR"
+
+cleanup() {
+	rm -rf "$STATE_DIR"
+	kill $(jobs -p) 2>/dev/null
+	exit 0
+}
+trap cleanup INT TERM
+
+log "=== ready, subscribed to nl80211 events ==="
+
+# Watch nl80211 (netlink) for NEW_STATION events.
+# "iw event" line format (it fflush()es stdout after every event, so this
+# streams line by line through the pipe):
+#   "phy5g-ap0 (phy #1): new station aa:bb:cc:dd:ee:ff"
+# Events without an ifindex (wdev-only) are ignored — we need a netdev to
+# map to a band and to talk to hostapd_cli.
+# stderr is left attached so netlink setup failures land in syslog via procd.
+"$IW" event | while IFS= read -r line; do
+	case "$line" in
+		*": new station "*)
+			# Prefix up to the first ':' is "<ifname> (phy #N)" or "<ifname>"
+			iface="${line%%:*}"
+			iface="${iface%% *}"
+			# iw formats MACs with %02x, so this is always lowercase
+			# and matches the state-file naming used below.
+			mac="${line##*new station }"
+
+			[ -z "$mac" ] && continue
+			[ -z "$iface" ] && continue
+
+			# Determine band from interface name. This also drops
+			# wdev-only / phy-only events, which have no band.
+			band=""
+			case "$iface" in
+				*5g*) band="5g" ;;
+				*6g*) band="6g" ;;
+				*) continue ;;
+			esac
+
+			# Check for band hop
+			prev_band=""
+			[ -f "$STATE_DIR/$mac" ] && prev_band=$(cat "$STATE_DIR/$mac")
+			echo "$band" > "$STATE_DIR/$mac"
+
+			if [ -n "$prev_band" ] && [ "$prev_band" != "$band" ]; then
+				log "BAND-HOP: $mac moved $prev_band -> $band ($iface)"
+				(
+					sleep "$CHECK_DELAY"
+					check_sta_pkts "$mac" "$iface"
+				) &
+			else
+				# Same band or first association — sample traffic to track active state
+				# Do this in background to not block the log reader
+				(
+					sleep 1
+					update_active_state "$mac" "$iface"
+				) &
+			fi
+			;;
+	esac
+done
+
+# "iw event" only returns on netlink socket error or SIGPIPE; procd respawns us.
+log "ERROR: nl80211 event stream ended, exiting for respawn"
+exit 1
