@@ -246,6 +246,7 @@ drv_morse_setup() {
 	json_get_vars \
 		phy macaddr path \
 		country \
+		channel \
 		txpower \
 		frag rts htmode \
 		ampdu \
@@ -689,6 +690,14 @@ morse_vap_cleanup() {
 
 morse_interface_cleanup() {
 	local phy="$1"
+
+	# Removing an interface mid-scan wedges the chip: rm_if and the scan's
+	# cfg_scan(false) both wait on a firmware command while holding mors->lock,
+	# and every command afterwards fails with -110. Abort scans first.
+	local _wdev
+	for _wdev in $(_list_phy_interfaces "$phy"); do
+		iw dev "$_wdev" scan abort >/dev/null 2>&1
+	done
 
 	morse_vap_cleanup hostapd_s1g "$(uci -q -P /var/state get wireless._${phy}.aplist)"
 	morse_vap_cleanup wpa_supplicant_s1g "$(uci -q -P /var/state get wireless._${phy}.splist)"
