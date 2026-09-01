@@ -67,6 +67,15 @@ define Device/hfcl_ion4xi
 endef
 TARGET_DEVICES += hfcl_ion4xi
 
+define Device/hfcl_ion4xi_wp2
+  DEVICE_TITLE := HFCL ION4Xi_WP2
+  DEVICE_DTS := qcom-ipq6018-hfcl-ion4xi_wp2
+  DEVICE_DTS_CONFIG := config@cp01-c1
+  SUPPORTED_DEVICES := hfcl,ion4xi_wp2
+  DEVICE_PACKAGES := ath11k-wifi-hfcl-ion4xi_wp2 uboot-envtools kmod-hwmon-lm75
+endef
+TARGET_DEVICES += hfcl_ion4xi_wp2
+
 define Device/edgecore_eap101
   DEVICE_TITLE := EdgeCore EAP101
   DEVICE_DTS := qcom-ipq6018-edgecore-eap101
