@@ -176,6 +176,11 @@ $(call Package/ath11k-wifi-default)
     TITLE:=hfcl-ion4xi_w bdf
 endef
 
+define Package/ath11k-wifi-hfcl-ion4xi_wp2
+$(call Package/ath11k-wifi-default)
+    TITLE:=hfcl-ion4xi_wp2 bdf
+endef
+
 define Package/ath11k-wifi-hfcl-ion4x_w
 $(call Package/ath11k-wifi-default)
     TITLE:=hfcl-ion4x_w bdf
@@ -383,6 +388,11 @@ define Package/ath11k-wifi-hfcl-ion4xi_wp/install
 	$(INSTALL_DATA) ./board-hfcl-ion4xi_wp.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board.bin
 endef
 
+define Package/ath11k-wifi-hfcl-ion4xi_wp2/install
+	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/
+	$(INSTALL_DATA) ./board-hfcl-ion4xi_wp2.bin.IPQ6018 $(1)/lib/firmware/ath11k/IPQ6018/hw1.0/board.bin
+endef
+
 define Package/ath11k-wifi-hfcl-ion4xi_w/install
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/IPQ5018/hw1.0/
 	$(INSTALL_DIR) $(1)/lib/firmware/ath11k/qcn6122/hw1.0/
@@ -483,6 +493,7 @@ $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xe))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4x_3))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_wp))
+$(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_wp2))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_w))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4x_w))
 $(eval $(call BuildPackage,ath11k-wifi-hfcl-ion4xi_HMR))

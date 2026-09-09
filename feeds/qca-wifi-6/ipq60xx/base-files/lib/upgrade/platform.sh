@@ -129,6 +129,7 @@ platform_check_image() {
 	hfcl,ion4x_2|\
 	hfcl,ion4x_3|\
 	hfcl,ion4xe|\
+    hfcl,ion4xi_wp2|\
 	yuncore,ax840|\
 	yuncore,fap650)
 		[ "$magic_long" = "73797375" ] && return 0
@@ -178,6 +179,12 @@ platform_do_upgrade() {
 		fi
 		nand_upgrade_tar "$1"
 		;;
+    hfcl,ion4xi_wp2)
+	CI_UBIPART="rootfs"
+	fw_setenv bootargs "ubi.mtd=rootfs root=mtd:ubi_rootfs rootfstype=squashfs rootwait swiotlb=1 coherent_pool=2M" || exit 1
+	fw_setenv fsbootargs "ubi.mtd=rootfs root=mtd:ubi_rootfs rootfstype=squashfs rootwait" || exit 1
+	nand_upgrade_tar "$1"
+	;;
 	edgecore,eap101)
 		if [ "$(find_mtd_chardev rootfs)" ]; then
 			CI_UBIPART="rootfs"
