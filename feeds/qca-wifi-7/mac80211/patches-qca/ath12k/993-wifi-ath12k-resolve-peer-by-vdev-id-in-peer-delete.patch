@@ -1,0 +1,62 @@
+From: Arif Alam <arif.alam@netexperience.com>
+Date: Thu, 28 Aug 2026 00:00:00 -0400
+Subject: [PATCH] wifi: ath12k: resolve peer by vdev_id in peer delete path
+
+ath12k_peer_delete_send() resolves the peer it is about to tear down with
+ath12k_peer_find_by_addr(), which is a lookup in the MAC-address keyed
+rhashtable. That table is shared by all pdevs of an ath12k_base, so on a
+split-PHY device (2 GHz + 5 GHz on one SoC) it holds exactly one entry per
+client address, no matter which radio the client is on.
+
+When a client roams from one band to another, ath12k_peer_create() on the
+new radio replaces the rhash entry with the new link peer before mac80211
+removes the station from the old radio. The subsequent delete on the old
+vdev then finds the *new* peer by address. The vdev_id check only guards
+the rhash removal - the rest of the function keeps operating on that
+wrongly resolved peer, so it:
+
+  - clears ab->peer_list[] at the *new* peer's peer_id, which permanently
+    removes the roamed client from the RCU peer lookup used by the Rx fast
+    path (ath12k_peer_find_by_peer_list_index() in ath12k_dp_rx_h_mpdu()).
+    Every uplink frame from that client then falls back to the slow path:
+    ab->base_lock is taken per packet, the peer is re-resolved from
+    addr2 in the Rx descriptor, PPE/SFE direct delivery is skipped and the
+    frame is pushed through the full mac80211 Rx stack. The result is a
+    large, permanent uplink throughput drop for the roamed client.
+
+  - leaves ab->peer_list[] populated at the *old* peer's peer_id. The old
+    peer is freed shortly after by ath12k_peer_unmap_event(), which relies
+    on this function having cleared the slot and having done the
+    synchronize_rcu(), so a dangling pointer is left behind in the Rx
+    lookup table.
+
+Resolve the peer with ath12k_peer_find(), which is keyed by (vdev_id,
+addr), so the delete path always acts on the peer belonging to the vdev
+being torn down. Keep the address-keyed lookup only for deciding whether
+the rhash entry is ours to remove - if it points at another radio's peer
+it must be left alone, since that peer is the live one.
+
+Signed-off-by: Arif Alam <arif.alam@netexperience.com>
+---
+ drivers/net/wireless/ath/ath12k/peer.c |  9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -567,8 +567,14 @@
+ 	if (peer && peer->vdev_id == vdev_id)
+ 		ath12k_peer_rhash_delete(ab, peer);
+ 
+-	if (!peer)
+-		peer = ath12k_peer_find(ab, vdev_id, addr);
++	/* The address keyed rhash table is shared by all pdevs of this
++	 * ath12k_base. On a cross band roam the entry for this address may
++	 * already have been replaced by the link peer created on the other
++	 * radio, and that peer must not be touched here. Always resolve the
++	 * peer being deleted by (vdev_id, addr) so that the peer list and ML
++	 * peer list slots cleared below belong to the vdev being torn down.
++	 */
++	peer = ath12k_peer_find(ab, vdev_id, addr);
+ 
+ 	if (!peer) {
+ 		spin_unlock_bh(&ab->base_lock);
