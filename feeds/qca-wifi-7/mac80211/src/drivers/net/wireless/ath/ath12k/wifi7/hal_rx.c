@@ -386,6 +386,7 @@ int ath12k_wifi7_hal_wbm_desc_parse_err(struct ath12k_dp *dp, void *desc,
 	struct hal_wbm_release_ring *wbm_desc = desc;
 	struct hal_wbm_release_ring_cc_rx *wbm_cc_desc = desc;
 	struct ath12k_base *ab = dp->ab;
+	struct ath12k_rx_desc_info *desc_info;
 	enum hal_wbm_rel_desc_type type;
 	enum hal_wbm_rel_src_module rel_src;
 	bool hw_cc_done;
@@ -452,8 +453,25 @@ int ath12k_wifi7_hal_wbm_desc_parse_err(struct ath12k_dp *dp, void *desc,
 
 		desc_va = ((u64)le32_to_cpu(wbm_cc_desc->buf_va_hi) << 32 |
 			   le32_to_cpu(wbm_cc_desc->buf_va_lo));
-		rel_info->rx_desc =
-			(struct ath12k_rx_desc_info *)((unsigned long)desc_va);
+		desc_info = (struct ath12k_rx_desc_info *)((unsigned long)desc_va);
+
+		/* desc_va comes straight from HW CC writeback and is
+		 * unverified, so it could be a wild pointer. Probe it
+		 * safely with copy_from_kernel_nofault (no need to know
+		 * the pool base/size) and drop the packet on failure,
+		 * instead of crashing later when rel_info->rx_desc is
+		 * dereferenced.
+		 */
+		if (desc_va &&
+		    copy_from_kernel_nofault(&val, &desc_info->magic, sizeof(val))) {
+			dp->device_stats.invalid_rbm++;
+			ath12k_warn(dp->ab,
+				    "invalid rx_desc VA 0x%llx from HW CC, dropping\n",
+				    desc_va);
+			return -EINVAL;
+		}
+
+		rel_info->rx_desc = desc_info;
 	}
 
 	rel_info->err_rel_src = rel_src;
