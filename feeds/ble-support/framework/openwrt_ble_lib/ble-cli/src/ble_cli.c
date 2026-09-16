@@ -177,6 +177,7 @@ static int cmd_beacon(int argc, char *argv[])
     snprintf(config.uuid, sizeof(config.uuid), "%.36s", "E2C56DB5-DFFB-48D2-B060-D0F5A71096E0");
     config.major = 1; config.minor = 1;
     config.tx_power = -59; config.interval_ms = 100;
+    config.radio_power_dbm = BLE_RADIO_POWER_DEFAULT;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--uuid") == 0 && i + 1 < argc)

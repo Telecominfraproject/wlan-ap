@@ -13,10 +13,16 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-/** Serialized command buffer */
+/** Serialized command buffer (may contain multiple sub-commands) */
+#define CHIP_CMD_MAX_SEGMENTS 8
 typedef struct {
     uint8_t data[512];
     uint16_t len;
+    /* For multi-command sequences: offset and delay for each segment */
+    uint8_t  num_segments;                       /* 0 = single command (no segmenting) */
+    uint16_t seg_offset[CHIP_CMD_MAX_SEGMENTS];  /* start offset of each segment */
+    uint16_t seg_len[CHIP_CMD_MAX_SEGMENTS];     /* length of each segment */
+    uint16_t seg_delay_ms[CHIP_CMD_MAX_SEGMENTS]; /* delay AFTER sending this segment */
 } chip_cmd_buf_t;
 
 /**

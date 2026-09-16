@@ -154,6 +154,24 @@ int main(int argc, char *argv[])
         return 0;
     }
 
+    /*
+     * Compute GAP roles from /etc/config/ble feature flags.
+     * Used only by UART chip profiles (e.g. TI NPI); BlueZ ignores it.
+     *   ibeacon.enabled       → Broadcaster (0x01)
+     *   scan.enabled          → Observer (0x02)
+     *   gatt_server.enabled   → Peripheral (0x04)
+     */
+    config.chip.roles = 0;
+    if (uci_app_get_bool("ble", "ibeacon", "enabled", false))
+        config.chip.roles |= BLE_ROLE_BROADCASTER;
+    if (uci_app_get_bool("ble", "scan", "enabled", false))
+        config.chip.roles |= BLE_ROLE_OBSERVER;
+    if (uci_app_get_bool("ble", "gatt_server", "enabled", false))
+        config.chip.roles |= BLE_ROLE_PERIPHERAL;
+    if (config.chip.roles == 0)
+        config.chip.roles = BLE_ROLE_BROADCASTER;  /* default */
+    syslog(LOG_INFO, "GAP roles bitmask: 0x%02X", config.chip.roles);
+
     /* Initialize libble */
     ret = ble_init(&config);
     if (ret != BLE_OK) {
@@ -166,13 +184,23 @@ int main(int argc, char *argv[])
     ble_app_config_t app_cfg;
     uci_app_config_load(&app_cfg);
 
-    /* Set log level from daemon config */
-    if (strcmp(app_cfg.daemon.log_level, "debug") == 0)
+    /*
+     * Set log level from daemon config (UCI ble.daemon.log_level).
+     * The `-v` command-line flag forces debug and overrides UCI here.
+     *   debug → everything (per-frame TX/RX, byte dumps, handshake detail)
+     *   info  → user-facing state only (connect/disconnect, scan/beacon
+     *           started/stopped, provisioning milestones) — the default
+     *   warn  → warnings and errors
+     *   error → errors only
+     */
+    if (verbose || strcmp(app_cfg.daemon.log_level, "debug") == 0)
         setlogmask(LOG_UPTO(LOG_DEBUG));
     else if (strcmp(app_cfg.daemon.log_level, "warn") == 0)
         setlogmask(LOG_UPTO(LOG_WARNING));
     else if (strcmp(app_cfg.daemon.log_level, "error") == 0)
         setlogmask(LOG_UPTO(LOG_ERR));
+    else /* "info" (default) or any unrecognized value */
+        setlogmask(LOG_UPTO(LOG_INFO));
 
     /*
      * Autostart for ibeacon/scan is handled by app_plugins_init()

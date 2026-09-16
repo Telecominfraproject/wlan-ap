@@ -64,6 +64,9 @@ typedef struct {
     /* GATT state */
     uint16_t gatt_conn_handle;
     bool gatt_connected;
+
+    /* Local BD address (filled during init) */
+    char bd_address[BLE_ADDR_STR_LEN];
 } libble_ctx_t;
 
 /**

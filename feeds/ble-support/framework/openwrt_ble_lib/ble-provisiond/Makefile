@@ -58,6 +58,7 @@ define Build/Compile
 		$(PKG_BUILD_DIR)/app/config_provision.c \
 		$(PKG_BUILD_DIR)/app/mtu_segment.c \
 		$(PKG_BUILD_DIR)/app/npi_gatt_handler.c \
+		$(PKG_BUILD_DIR)/app/app_status.c \
 		-lble -lubus -lubox -lblobmsg_json -luci -ldbus-1 -ljson-c
 endef
 

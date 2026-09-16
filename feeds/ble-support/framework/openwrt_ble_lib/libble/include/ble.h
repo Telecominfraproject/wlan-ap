@@ -128,6 +128,13 @@ typedef struct {
 
 /* ── Configuration ── */
 
+/* GAP role bitmask (used by UART chip profiles like TI NPI).
+ * Ignored by the BlueZ transport (BlueZ manages roles automatically). */
+#define BLE_ROLE_BROADCASTER   0x01   /**< advertising (iBeacon) */
+#define BLE_ROLE_OBSERVER      0x02   /**< scanning */
+#define BLE_ROLE_PERIPHERAL    0x04   /**< connectable peripheral / GATT server */
+#define BLE_ROLE_CENTRAL       0x08   /**< central / GATT client */
+
 /** BLE chip hardware descriptor (from UCI `config ble_chip`) */
 typedef struct {
     bool enabled;                   /**< option enabled */
@@ -141,6 +148,7 @@ typedef struct {
     int backdoor_pin;               /**< option backdoorpin: GPIO for bootloader entry (-1=none) */
     bool wdt_enabled;               /**< option wdt_enabled: hardware watchdog */
     char section_name[32];          /**< UCI section name, e.g. 'eap115' */
+    uint8_t roles;                  /**< GAP role bitmask (UART chips only; 0=auto/broadcaster) */
 } ble_chip_config_t;
 
 /** Main library configuration */
@@ -183,6 +191,9 @@ BLE_API int ble_unsubscribe(ble_event_cb_t cb);
 
 /** Get active transport name (e.g. "bluez", "uart_hci"). */
 BLE_API const char *ble_get_transport_name(void);
+
+/** Get local BLE adapter BD address (e.g. "AA:BB:CC:DD:EE:FF"). Empty if unknown. */
+BLE_API const char *ble_get_bd_address(void);
 
 /** Get active chip profile name (e.g. "hci_h4", "ti_npi", "json"). NULL if BlueZ. */
 BLE_API const char *ble_get_chip_profile_name(void);
@@ -253,6 +264,42 @@ BLE_API int ble_hci_send(uint16_t opcode, const uint8_t *params, uint8_t param_l
 
 /** Send vendor-specific command. */
 BLE_API int ble_vendor_cmd(uint16_t ocf, const uint8_t *params, uint8_t param_len);
+
+/* ── TI multi_role GATT bridge (NPI GATT frames over UART) ── */
+
+/**
+ * Send a fully-formed NPI GATT frame verbatim over the active UART transport
+ * (no HCI framing added). Used to push NOTIFY / READ_RSP to the multi_role FW.
+ */
+BLE_API int ble_ti_gatt_send_raw(const uint8_t *frame, uint16_t len);
+
+/**
+ * Register a callback to receive GATT frames forwarded by the multi_role FW.
+ * @param cb   invoked with (cmd1, payload, payload_len, ctx) per NPI GATT frame.
+ * @param ctx  opaque pointer passed back to cb.
+ * @return BLE_OK.
+ */
+BLE_API int ble_ti_set_gatt_bridge_cb(void (*cb)(uint8_t cmd1,
+                                                 const uint8_t *payload,
+                                                 uint16_t plen, void *ctx),
+                                      void *ctx);
+
+/**
+ * Force a scan/beacon stop on the TI multi_role transport regardless of the
+ * library's own active state. Used at daemon startup to clear a scan/beacon
+ * the firmware kept running across a restart. No-op effect on other transports
+ * beyond the normal stop path.
+ */
+BLE_API int ble_ti_force_scan_stop(void);
+BLE_API int ble_ti_force_beacon_stop(void);
+
+/**
+ * Record the firmware's actual advertised BD address (6 bytes, little-endian)
+ * and rewrite the status file so ble_get_bd_address() and
+ * /var/run/ble-provision.status reflect the real MAC (TI multi_role uses the
+ * chip's own public address, not the eth0-derived value).
+ */
+BLE_API int ble_ti_set_actual_bd_address(const uint8_t addr_le[6]);
 
 #ifdef __cplusplus
 }

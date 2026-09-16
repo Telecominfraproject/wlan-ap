@@ -60,12 +60,20 @@ static void scan_deinit(void)
 static int scan_start(void)
 {
     results_count = 0;
-    return ble_scan_start(scan_duration, scan_active_mode, scan_filter_dup);
+    int r = ble_scan_start(scan_duration, scan_active_mode, scan_filter_dup);
+    if (r == 0) {
+        extern void app_status_set_scan_running(bool, const char *);
+        app_status_set_scan_running(true, NULL);
+    }
+    return r;
 }
 
 static int scan_stop(void)
 {
-    return ble_scan_stop();
+    int r = ble_scan_stop();
+    extern void app_status_set_scan_running(bool, const char *);
+    app_status_set_scan_running(false, NULL);
+    return r;
 }
 
 app_plugin_t scan_app_plugin = {

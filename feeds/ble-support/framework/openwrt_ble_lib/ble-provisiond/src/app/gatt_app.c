@@ -129,6 +129,77 @@ void app_plugins_init(void)
     gatt_server_app_plugin.init();
 
     /*
+     * TI multi_role GATT bridge: when the active chip profile is ti_npi, the
+     * GATT server runs on the MCU and forwards phone activity over UART as NPI
+     * GATT frames. Initialize the handler so those frames are routed to the
+     * shared handle_* handlers (same ones the BlueZ GATT server uses).
+     */
+    {
+        extern const char *ble_get_chip_profile_name(void);
+        extern const char *ble_get_bd_address(void);
+        extern int npi_gatt_handler_init(void);
+        extern int npi_gatt_send_provision_setup(const char *name,
+                                                 const uint8_t bdaddr[6]);
+        const char *cp = ble_get_chip_profile_name();
+        if (cp && strcmp(cp, "ti_npi") == 0) {
+            syslog(LOG_INFO, "TI ti_npi transport: enabling NPI GATT bridge");
+            npi_gatt_handler_init();
+
+            /*
+             * Push provisioning setup to the multi_role firmware: device name
+             * from UCI (same key the BlueZ GATT server uses) and BD address
+             * from libble (derived from eth0), then start connectable adv.
+             */
+            char name[64] = "OpenWrt-BLE";
+            uci_app_get_string("ble", "gatt_server", "device_name",
+                               name, sizeof(name), "OpenWrt-BLE");
+
+            uint8_t bdaddr[6] = {0};
+            bool have_addr = false;
+            const char *addr_str = ble_get_bd_address();
+            if (addr_str && *addr_str) {
+                unsigned int m[6];
+                if (sscanf(addr_str, "%x:%x:%x:%x:%x:%x",
+                           &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                    /* String is big-endian (MSB first); firmware wants LE. */
+                    bdaddr[0] = (uint8_t)m[5]; bdaddr[1] = (uint8_t)m[4];
+                    bdaddr[2] = (uint8_t)m[3]; bdaddr[3] = (uint8_t)m[2];
+                    bdaddr[4] = (uint8_t)m[1]; bdaddr[5] = (uint8_t)m[0];
+                    have_addr = true;
+                }
+            }
+            /*
+             * Store the params; they are pushed to the firmware when it reports
+             * NPI_GATT_EVT_READY (after its advertising set is created + the
+             * default scan response is loaded), so the name update is not
+             * overwritten.
+             */
+            extern void npi_gatt_set_provision_params(const char *name,
+                                                      const uint8_t *bdaddr);
+            npi_gatt_set_provision_params(name, have_addr ? bdaddr : NULL);
+
+            /*
+             * Mirror UCI gatt_server.enabled so the firmware advertises the
+             * provisioning service only when enabled (parity with BlueZ, which
+             * only registers + advertises services when enabled). When
+             * disabled, provision setup sends ADV_STOP.
+             */
+            bool gatt_en = uci_app_get_bool("ble", "gatt_server", "enabled", false);
+            extern void npi_gatt_set_gatt_enabled(bool enabled);
+            npi_gatt_set_gatt_enabled(gatt_en);
+
+            /*
+             * Actively ask the firmware to (re)emit READY. On first boot the
+             * firmware emits READY on its own; but once provisioned it stops,
+             * so after a daemon restart this QUERY_READY is what makes the
+             * firmware re-announce readiness → the device name is re-synced.
+             */
+            extern int npi_gatt_query_ready(void);
+            npi_gatt_query_ready();
+        }
+    }
+
+    /*
      * Always start gatt_server_app — it opens D-Bus and initializes
      * ble_adv module (shared infrastructure for all advertising).
      * GATT registration + connectable advertising is conditional on
@@ -141,6 +212,30 @@ void app_plugins_init(void)
     if (ibeacon_autostart_enabled()) {
         syslog(LOG_INFO, "Autostart: iBeacon");
         ibeacon_app_plugin.start();
+    }
+
+    /*
+     * The TI multi_role firmware runs autonomously and keeps scanning/beaconing
+     * across daemon restarts. So if a feature is DISABLED in UCI we must
+     * actively tell the firmware to stop — otherwise a scan/beacon left running
+     * from a previous session continues. (BlueZ has no such residual state; this
+     * is TI-specific.) Only meaningful on the ti_npi transport.
+     */
+    {
+        extern const char *ble_get_chip_profile_name(void);
+        const char *cp0 = ble_get_chip_profile_name();
+        if (cp0 && strcmp(cp0, "ti_npi") == 0) {
+            extern int ble_ti_force_scan_stop(void);
+            extern int ble_ti_force_beacon_stop(void);
+            if (!uci_app_get_bool("ble", "scan", "enabled", false)) {
+                syslog(LOG_INFO, "TI: scan disabled — sending SCAN_STOP to clear residual scan");
+                ble_ti_force_scan_stop();
+            }
+            if (!uci_app_get_bool("ble", "ibeacon", "enabled", false)) {
+                syslog(LOG_INFO, "TI: ibeacon disabled — sending BEACON_STOP to clear residual beacon");
+                ble_ti_force_beacon_stop();
+            }
+        }
     }
 
     /* Autostart scan if enabled in UCI */
@@ -173,14 +268,35 @@ void app_plugins_init(void)
         ble_scan_start(duration, active, filter_dup);
         syslog(LOG_INFO, "Autostart: Scan (filter=%s duration=%ums)", filter, duration);
     }
+
+    /* Write the initial application-layer status snapshot. Subsequent changes
+     * (scan/ibeacon/gatt start/stop, connect/disconnect, MTU) rewrite it via
+     * the app_status setters. */
+    {
+        extern void app_status_write(void);
+        app_status_write();
+    }
 }
 
 void app_plugins_deinit(void)
 {
     extern app_plugin_t gatt_server_app_plugin;
 
+    {
+        extern const char *ble_get_chip_profile_name(void);
+        extern void npi_gatt_handler_deinit(void);
+        const char *cp = ble_get_chip_profile_name();
+        if (cp && strcmp(cp, "ti_npi") == 0)
+            npi_gatt_handler_deinit();
+    }
+
     gatt_server_app_plugin.stop();
     gatt_app_plugin.deinit();
     scan_app_plugin.deinit();
     ibeacon_app_plugin.deinit();
+
+    {
+        extern void app_status_remove(void);
+        app_status_remove();
+    }
 }

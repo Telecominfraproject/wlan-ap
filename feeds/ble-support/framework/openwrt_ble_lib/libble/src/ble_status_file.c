@@ -117,7 +117,7 @@ static void get_bluez_version(char *buf, size_t buflen)
                 char *end = p;
                 while (*end && (*end == '.' || (*end >= '0' && *end <= '9'))) end++;
                 *end = '\0';
-                snprintf(buf, buflen, "%s", p);
+                snprintf(buf, buflen, "%.31s", p);
             }
         }
         pclose(fp);
@@ -164,6 +164,9 @@ void ble_status_write(libble_ctx_t *ctx, bool success, const char *error_msg)
 
     get_timestamp(timestamp, sizeof(timestamp));
 
+    /* BD address from context (already read during init) */
+    const char *bdaddr = ctx->bd_address[0] ? ctx->bd_address : "";
+
     /* Get BlueZ version if using BlueZ transport */
     bluez_ver[0] = '\0';
     if (ctx->active_transport_idx >= 0 &&
@@ -200,6 +203,7 @@ void ble_status_write(libble_ctx_t *ctx, bool success, const char *error_msg)
             "  \"version\": \"%d.%d.%d\",\n"
             "  \"pid\": %d,\n"
             "  \"timestamp\": \"%s\",\n"
+            "  \"bd_address\": \"%s\",\n"
             "  \"transport\": \"%s\",\n"
             "  \"chip_profile\": \"%s\",\n"
             "  \"chip_vendor\": \"%s\",\n"
@@ -222,6 +226,7 @@ void ble_status_write(libble_ctx_t *ctx, bool success, const char *error_msg)
             LIBBLE_VERSION_MAJOR, LIBBLE_VERSION_MINOR, LIBBLE_VERSION_PATCH,
             (int)getpid(),
             timestamp,
+            bdaddr,
             transport_name,
             profile_name,
             ctx->config.chip.vendor,
@@ -252,6 +257,8 @@ void ble_status_write(libble_ctx_t *ctx, bool success, const char *error_msg)
     if (success) {
         BLE_LOG_INFO("═══════════════════════════════════════════════════════");
         BLE_LOG_INFO("  BLE Provision Daemon initialized successfully");
+        if (bdaddr[0])
+            BLE_LOG_INFO("  BD Address:   %s", bdaddr);
         BLE_LOG_INFO("  Transport:    %s", transport_name);
         if (profile_name[0])
             BLE_LOG_INFO("  Chip Profile: %s", profile_name);

@@ -758,6 +758,25 @@ static int gatt_server_init(void)
 
 static int gatt_server_start(void)
 {
+    /*
+     * On the TI (ti_npi) UART transport the GATT server and all advertising run
+     * on the CC2652R1 firmware and are driven over NPI (see npi_gatt_handler).
+     * There is no BlueZ adapter to talk to, so skip the entire D-Bus GATT /
+     * advertising registration here — otherwise BlueZ RegisterApplication /
+     * RegisterAdvertisement fail and spam the log. This keeps the BlueZ path
+     * unchanged while making the TI path quiet and self-consistent.
+     */
+    {
+        extern const char *ble_get_chip_profile_name(void);
+        const char *cp = ble_get_chip_profile_name();
+        if (cp && strcmp(cp, "ti_npi") == 0) {
+            gs.running = true;
+            syslog(LOG_INFO, "gatt_server: TI ti_npi transport — GATT/adv handled "
+                   "on-chip via NPI, skipping BlueZ registration");
+            return 0;
+        }
+    }
+
     syslog(LOG_INFO, "gatt_server: starting (connecting to D-Bus...)");
 
     DBusError err;

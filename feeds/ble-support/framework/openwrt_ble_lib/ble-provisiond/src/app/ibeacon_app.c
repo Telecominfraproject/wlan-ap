@@ -36,6 +36,7 @@ static int ibeacon_init(void)
     beacon_config.major = 1;
     beacon_config.minor = 1;
     beacon_config.tx_power = -59;
+    beacon_config.radio_power_dbm = BLE_RADIO_POWER_DEFAULT;
     beacon_config.interval_ms = 100;
 
     /* Read UCI config — override defaults */
@@ -85,6 +86,10 @@ static int ibeacon_start(void)
 {
     ble_uuid_parse(beacon_config.uuid, beacon_config.uuid_bytes);
     int ret = ble_beacon_start(&beacon_config);
+    if (ret == 0) {
+        extern void app_status_set_ibeacon_active(bool);
+        app_status_set_ibeacon_active(true);
+    }
 
     /* On BlueZ transport, also register LE advertisement via D-Bus */
     const char *transport = ble_get_transport_name();
@@ -111,6 +116,10 @@ static int ibeacon_stop(void)
         ble_adv_stop(2);  /* iBeacon uses instance 2 (after GATT's instance 1) */
     }
 
+    {
+        extern void app_status_set_ibeacon_active(bool);
+        app_status_set_ibeacon_active(false);
+    }
     return ble_beacon_stop();
 }
 

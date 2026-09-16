@@ -69,6 +69,10 @@ static int ubus_scan_start(struct ubus_context *ctx, struct ubus_object *obj,
     scan_file_open(&active_scan_ctx, active_scan_filter_name, max_records, on_limit);
 
     int ret = ble_scan_start(duration, active, filter_dup);
+    if (ret == BLE_OK) {
+        extern void app_status_set_scan_running(bool, const char *);
+        app_status_set_scan_running(true, NULL);
+    }
     blob_buf_init(&b, 0);
     if (ret == BLE_OK) {
         blobmsg_add_string(&b, "status", "scanning");
@@ -90,6 +94,11 @@ static int ubus_scan_stop(struct ubus_context *ctx, struct ubus_object *obj,
 
     /* Close scan result file */
     scan_file_close(&active_scan_ctx);
+
+    {
+        extern void app_status_set_scan_running(bool, const char *);
+        app_status_set_scan_running(false, NULL);
+    }
 
     blob_buf_init(&b, 0);
     blobmsg_add_string(&b, "status", "stopped");
@@ -120,6 +129,7 @@ static int ubus_beacon_start(struct ubus_context *ctx, struct ubus_object *obj,
     snprintf(config.uuid, sizeof(config.uuid), "%.36s", "E2C56DB5-DFFB-48D2-B060-D0F5A71096E0");
     config.major = 1; config.minor = 1;
     config.tx_power = -59; config.interval_ms = 100;
+    config.radio_power_dbm = BLE_RADIO_POWER_DEFAULT;
 
     if (tb[BCN_UUID])
         snprintf(config.uuid, sizeof(config.uuid), "%s", blobmsg_get_string(tb[BCN_UUID]));
@@ -219,6 +229,8 @@ static int ubus_status(struct ubus_context *ctx, struct ubus_object *obj,
     (void)obj; (void)method; (void)msg;
     blob_buf_init(&b, 0);
     blobmsg_add_string(&b, "transport", ble_get_transport_name());
+    const char *bd = ble_get_bd_address();
+    if (bd && bd[0]) blobmsg_add_string(&b, "bd_address", bd);
     const char *cp = ble_get_chip_profile_name();
     if (cp) blobmsg_add_string(&b, "chip_profile", cp);
     blobmsg_add_u8(&b, "scanning", ble_scan_is_active());

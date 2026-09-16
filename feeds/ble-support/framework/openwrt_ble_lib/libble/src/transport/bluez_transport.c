@@ -440,5 +440,8 @@ transport_plugin_t bluez_transport_plugin = {
     .register_event_callback = bluez_register_event_callback,
     .get_fd                  = bluez_get_fd,
     .process_events          = bluez_process_events,
+    .send_raw                = NULL,
+    .recv_raw                = NULL,
+    .priv                    = NULL,
     .active                  = false
 };

@@ -34,6 +34,11 @@ typedef struct transport_plugin {
     int (*get_fd)(void);
     int (*process_events)(void);
 
+    /* Optional: raw send/receive for HCI commands with response (UART only) */
+    int (*send_raw)(const uint8_t *data, uint16_t len, void *priv);
+    int (*recv_raw)(uint8_t *buf, uint16_t buflen, uint32_t timeout_ms, void *priv);
+    void *priv;
+
     bool active;
 } transport_plugin_t;
 

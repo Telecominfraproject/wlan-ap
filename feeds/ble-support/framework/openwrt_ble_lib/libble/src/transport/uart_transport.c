@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <termios.h>
+#include <sys/select.h>
 
 #include "transport_plugin.h"
 #include "../log.h"
@@ -26,6 +27,20 @@
 #define HCI_EVT_LE_META     0x3E
 #define UART_RX_BUF_SIZE    1024
 #define UART_DEFAULT_BAUD   B115200
+
+/* Chip-profile RX parser hook — set by ble_core after selecting the profile.
+ * When set, uart_parse_rx delegates raw bytes to this parser instead of the
+ * built-in standard-HCI parser. This lets vendor profiles (e.g. TI) handle
+ * their own event format. */
+typedef int (*chip_parse_fn_t)(const uint8_t *data, uint16_t len,
+                               void (*event_cb)(const ble_event_t *, void *),
+                               void *ctx);
+static chip_parse_fn_t s_chip_parse = NULL;
+
+void uart_transport_set_chip_parser(chip_parse_fn_t fn)
+{
+    s_chip_parse = fn;
+}
 
 static struct {
     int fd;
@@ -59,6 +74,15 @@ static int uart_configure_port(int fd, speed_t baud)
 
 static void uart_parse_rx(void)
 {
+    /* If a chip-specific parser is registered, delegate to it */
+    if (s_chip_parse) {
+        s_chip_parse(uart_state.rx_buf, uart_state.rx_len,
+                     uart_state.event_cb, uart_state.event_cb_ctx);
+        /* Chip parser handles its own reassembly; clear our buffer */
+        uart_state.rx_len = 0;
+        return;
+    }
+
     int offset = 0;
     while (offset < uart_state.rx_len) {
         if (uart_state.rx_buf[offset] != HCI_PKT_EVENT) {
@@ -176,8 +200,88 @@ static int uart_process_events(void)
     int space = UART_RX_BUF_SIZE - uart_state.rx_len;
     if (space <= 0) { uart_state.rx_len = 0; space = UART_RX_BUF_SIZE; }
     ssize_t n = read(uart_state.fd, &uart_state.rx_buf[uart_state.rx_len], space);
-    if (n > 0) { uart_state.rx_len += n; uart_parse_rx(); }
+    if (n > 0) {
+        BLE_LOG_DBG("uart_process_events: read %d bytes (chip_parse=%s)",
+                    (int)n, s_chip_parse ? "yes" : "no");
+        uart_state.rx_len += n;
+        uart_parse_rx();
+    }
     return 0;
+}
+
+static int uart_send_raw(const uint8_t *data, uint16_t len, void *priv)
+{
+    (void)priv;
+    if (!uart_state.initialized || uart_state.fd < 0) return -EINVAL;
+
+    /* Diagnostic: log the exact bytes we write and the write() return value.
+     * This confirms whether the daemon is really pushing the command onto the
+     * fd, and lets us compare against what the firmware/loopback echoes back. */
+    {
+        char hex[97] = {0};
+        int dl = (len > 32) ? 32 : len;
+        for (int i = 0; i < dl; i++)
+            sprintf(hex + i * 3, "%02X ", data[i]);
+        BLE_LOG_DBG("uart_send_raw: fd=%d writing %u bytes [%s%s]",
+                    uart_state.fd, len, hex, (len > 32) ? "..." : "");
+    }
+
+    ssize_t n = write(uart_state.fd, data, len);
+    if (n < 0) {
+        BLE_LOG_ERR("uart_send_raw: write() failed: %s", strerror(errno));
+        return -errno;
+    }
+    if (n != (ssize_t)len) {
+        BLE_LOG_ERR("uart_send_raw: short write %d/%u", (int)n, len);
+        return -EIO;
+    }
+    /* Force the bytes out of the kernel/UART FIFO immediately. */
+    tcdrain(uart_state.fd);
+    BLE_LOG_DBG("uart_send_raw: wrote %d bytes OK", (int)n);
+    return 0;
+}
+
+static int uart_recv_raw(uint8_t *buf, uint16_t buflen, uint32_t timeout_ms, void *priv)
+{
+    (void)priv;
+    if (!uart_state.initialized || uart_state.fd < 0) return -EINVAL;
+
+    /*
+     * Read with timeout — accumulate bytes until:
+     *   - buflen reached, or
+     *   - no more data after initial response arrives (50ms gap)
+     */
+    struct timeval tv;
+    fd_set fds;
+    int total = 0;
+    uint32_t gap_ms = 50;  /* inter-byte gap to detect end of frame */
+
+    /* Wait for first byte with full timeout */
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    FD_ZERO(&fds);
+    FD_SET(uart_state.fd, &fds);
+
+    int ret = select(uart_state.fd + 1, &fds, NULL, NULL, &tv);
+    if (ret <= 0) return (ret == 0) ? 0 : -errno;
+
+    /* First byte(s) arrived — keep reading with short gap timeout */
+    while (total < buflen) {
+        ssize_t n = read(uart_state.fd, buf + total, buflen - total);
+        if (n > 0) {
+            total += (int)n;
+        }
+
+        /* Wait briefly for more data */
+        tv.tv_sec = 0;
+        tv.tv_usec = gap_ms * 1000;
+        FD_ZERO(&fds);
+        FD_SET(uart_state.fd, &fds);
+        ret = select(uart_state.fd + 1, &fds, NULL, NULL, &tv);
+        if (ret <= 0) break;  /* No more data within gap — frame complete */
+    }
+
+    return total;
 }
 
 transport_plugin_t uart_transport_plugin = {
@@ -189,5 +293,8 @@ transport_plugin_t uart_transport_plugin = {
     .register_event_callback = uart_register_event_callback,
     .get_fd                  = uart_get_fd,
     .process_events          = uart_process_events,
+    .send_raw                = uart_send_raw,
+    .recv_raw                = uart_recv_raw,
+    .priv                    = NULL,
     .active                  = false
 };
