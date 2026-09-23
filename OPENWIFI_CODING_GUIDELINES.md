@@ -81,8 +81,9 @@ sections:
 
 Trailers follow the body:
 
-- **`Fixes: <TICKET>`** (`WIFI-#####`, `WLAN-####`) **where the commit addresses a tracked
-  issue.** Bug fixes reference a ticket; refactors, additions, and bumps often have none.
+- **`Fixes: WIFI-#####`** **where the commit addresses a tracked issue.** `WIFI-` is the only
+  ticket prefix in use. Bug fixes reference a ticket; refactors, additions, and bumps often
+  have none.
 - **`Signed-off-by:` is required on every commit** (DCO). Preserve upstream sign-offs when
   forwarding a patch; add your own.
 
