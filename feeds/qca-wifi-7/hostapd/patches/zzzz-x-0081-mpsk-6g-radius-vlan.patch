@@ -1,0 +1,170 @@
+From: Marek Kwaczynski <marek@shasta.cloud>
+Subject: [PATCH] qca-wifi-7: hostapd: add ucode station hooks for MPSK
+
+The WiFi-7 hostapd tree ships mpskd, but its ucode glue only exposes the
+bss_add/bss_reload/bss_remove hooks, so mpskd never sees a station and
+its sta_auth/sta_connected handlers are dead code. Port the two station
+hooks from the WiFi-6 tree:
+
+ - sta_auth lets mpskd hand hostapd the per-station PSK list and force it
+   over the BSS-wide passphrase (use_sta_psk). The selected passphrase
+   also gets its own SAE PT, otherwise H2E, which is mandatory on 6 GHz,
+   cannot be used with a per-station PSK.
+ - sta_connected reports the matched PSK index, the passphrase and the
+   RADIUS-assigned VLAN, and applies the VLAN that mpskd returns via
+   ap_sta_set_vlan()/ap_sta_bind_vlan().
+
+psk_idx is tracked in hostapd_wpa_auth_get_psk() and sae_get_password()
+so mpskd can tell which MPSK entry a station matched. Together with mpskd
+caching the VLAN it learns on 2.4/5 GHz, this restores the RADIUS VLAN
+for the same client when it later joins the 6 GHz SAE BSS, where there is
+no RADIUS exchange.
+
+The hook bodies live in the package src/ overlay (src/ap/ucode.{c,h}),
+same as in the WiFi-6 tree.
+
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -632,11 +632,14 @@
+ 			      const struct sae_pk **s_pk)
+ {
+ 	const char *password = NULL;
+-	struct sae_password_entry *pw;
++	struct sae_password_entry *pw = NULL;
+ 	struct sae_pt *pt = NULL;
+ 	const struct sae_pk *pk = NULL;
+ 	struct hostapd_sta_wpa_psk_short *psk = NULL;
+ 
++	if (sta && sta->use_sta_psk)
++		goto use_sta_psk;
++
+ 	/* With sae_track_password functionality enabled, try to first find the
+ 	 * next viable wildcard-address password if a password identifier was
+ 	 * not used. Select an wildcard-addr entry if the STA is known to have
+@@ -697,12 +700,30 @@
+ 		pt = hapd->conf->ssid.pt;
+ 	}
+ 
+-	if (!password && sta && !rx_id) {
++use_sta_psk:
++	if (!password && sta && (!rx_id || sta->use_sta_psk)) {
++		sta->psk_idx = 0;
+ 		for (psk = sta->psk; psk; psk = psk->next) {
+-			if (psk->is_passphrase) {
+-				password = psk->passphrase;
++			if (!psk->is_passphrase)
++				continue;
++
++			password = psk->passphrase;
++			if (!sta->use_sta_psk)
++				break;
++
++			sta->psk_idx = 1;
++			if (sta->sae_pt) {
++				pt = sta->sae_pt;
+ 				break;
+ 			}
++
++			pt = sae_derive_pt(hapd->conf->sae_groups,
++					   hapd->conf->ssid.ssid,
++					   hapd->conf->ssid.ssid_len,
++					   (const u8 *) password,
++					   os_strlen(password), NULL);
++			sta->sae_pt = pt;
++			break;
+ 		}
+ 	}
+ 
+@@ -3465,6 +3486,12 @@
+ 		goto fail;
+ 	}
+ 
++	res = hostapd_ucode_sta_auth(hapd, sta);
++	if (res) {
++		resp = res;
++		goto fail;
++	}
++
+ 	sta->flags &= ~WLAN_STA_PREAUTH;
+ 	ieee802_1x_notify_pre_auth(sta->eapol_sm, 0);
+ 
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -474,6 +474,9 @@
+ 	forced_memzero(sta->last_tk, WPA_TK_MAX_LEN);
+ #endif /* CONFIG_TESTING_OPTIONS */
+ 
++	if (sta->sae_pt)
++		sae_deinit_pt(sta->sae_pt);
++
+ 	os_free(sta);
+ }
+ 
+@@ -1558,6 +1561,9 @@
+ 		sta->flags &= ~WLAN_STA_AUTHORIZED;
+ 	}
+ 
++	if (authorized)
++		hostapd_ucode_sta_connected(hapd, sta);
++
+ 	return true;
+ }
+ 
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -180,6 +180,9 @@
+ 	int vlan_id_bound; /* updated by ap_sta_bind_vlan() */
+ 	 /* PSKs from RADIUS authentication server */
+ 	struct hostapd_sta_wpa_psk_short *psk;
++	struct sae_pt *sae_pt;
++	int use_sta_psk;
++	int psk_idx;
+ 
+ 	char *identity; /* User-Name from RADIUS */
+ 	char *radius_cui; /* Chargeable-User-Identity from RADIUS */
+--- a/src/ap/wpa_auth_glue.c
++++ b/src/ap/wpa_auth_glue.c
+@@ -412,6 +412,9 @@
+ 	}
+ #endif /* CONFIG_SAE */
+ 
++	if (sta)
++		sta->psk_idx = 0;
++
+ #ifdef CONFIG_OWE
+ 	if ((hapd->conf->wpa_key_mgmt & WPA_KEY_MGMT_OWE) &&
+ 	    sta && sta->owe_pmk) {
+@@ -438,13 +441,18 @@
+ 	 * returned psk which should not be returned again.
+ 	 * logic list (all hostapd_get_psk; all sta->psk)
+ 	 */
++	if (sta && sta->use_sta_psk)
++		psk = NULL;
+ 	if (sta && sta->psk && !psk) {
+ 		struct hostapd_sta_wpa_psk_short *pos;
++		int psk_idx = 1;
+ 
+ 		if (vlan_id)
+ 			*vlan_id = 0;
+ 		psk = sta->psk->psk;
+-		for (pos = sta->psk; pos; pos = pos->next) {
++		if (vlan_id)
++			sta->psk_idx = psk_idx;
++		for (pos = sta->psk; pos; pos = pos->next, psk_idx++) {
+ 			if (pos->is_passphrase) {
+ 				if (pbkdf2_sha1(pos->passphrase,
+ 						hapd->conf->ssid.ssid,
+@@ -458,9 +466,13 @@
+ 			}
+ 			if (pos->psk == prev_psk) {
+ 				psk = pos->next ? pos->next->psk : NULL;
++				if (vlan_id)
++					sta->psk_idx = psk_idx + 1;
+ 				break;
+ 			}
+ 		}
++		if (vlan_id && !psk)
++			sta->psk_idx = 0;
+ 	}
+ 	return psk;
+ }
