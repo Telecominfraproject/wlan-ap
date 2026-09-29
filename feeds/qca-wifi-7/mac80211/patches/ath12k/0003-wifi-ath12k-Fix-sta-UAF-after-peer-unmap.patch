@@ -1,0 +1,63 @@
+From: jiashuaiquan <jiashuaiquan@asterfusion.com>
+Date: Wed, 16 Sep 2026 15:32:00 +0800
+Subject: [PATCH] wifi: ath12k: fix sta UAF after peer unmap
+
+Late TX completion can still look up a link peer after HTT unmap
+has already freed it, then pass the stale peer->sta into
+ieee80211_tx_status_ext(). That walks a torn-down sta_info and
+crashes in get_link_sta / vif.type.
+
+Clear the RCU-visible link_peers entry and peer->sta first so new
+and in-flight readers stop using the station, then defer the free
+with call_rcu until existing RCU read-side critical sections end.
+
+Tested on AP7330 (ipq53xx), verified STA disconnect/reconnect no longer
+hits the unmap UAF.
+
+Fixes: WIFI-15395
+Signed-off-by: jiashuaiquan <jiashuaiquan@asterfusion.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.h
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.h
+@@ -146,6 +146,7 @@ struct ath12k_dp_link_peer {
+ 	u32 atf_actual_ul_duration;
+ 
+ 	bool is_assigned;
++	struct rcu_head rcu;
+ };
+ 
+ struct ath12k_dp_peer {
+--- a/drivers/net/wireless/ath/ath12k/dp_peer.c
++++ b/drivers/net/wireless/ath/ath12k/dp_peer.c
+@@ -172,6 +172,17 @@ bool ath12k_dp_link_peer_exist_by_vdev_id(struct ath12k_dp *dp, int vdev_id)
+ 	return false;
+ }
+ 
++static void ath12k_link_peer_free_rcu(struct rcu_head *head)
++{
++	struct ath12k_dp_link_peer *peer = container_of(head, struct ath12k_dp_link_peer,
++							rcu);
++
++	kfree(peer->peer_stats.rx_stats);
++	kfree(peer->peer_stats.tx_stats);
++	kfree(peer->peer_stats.qos_stats);
++	kfree(peer);
++}
++
+ void ath12k_link_peer_free(struct ath12k_dp_link_peer *peer)
+ {
+ 	if (!peer)
+@@ -203,7 +214,12 @@ void ath12k_peer_unmap_event(struct ath12k_base *ab, u16 peer_id)
+ 	ath12k_dbg(ab, ATH12K_DBG_PEER, "htt peer unmap vdev %d peer %pM id %d\n",
+ 		   peer->vdev_id, peer->addr, peer_id);
+ 
+-	ath12k_link_peer_free(peer);
++	if (peer->dp_peer && peer->link_id < ATH12K_NUM_MAX_LINKS)
++		rcu_assign_pointer(peer->dp_peer->link_peers[peer->link_id], NULL);
++	WRITE_ONCE(peer->sta, NULL);
++
++	list_del(&peer->list);
++	call_rcu(&peer->rcu, ath12k_link_peer_free_rcu);
+ 	wake_up(&ab->peer_mapping_wq);
+ 
+ exit:
