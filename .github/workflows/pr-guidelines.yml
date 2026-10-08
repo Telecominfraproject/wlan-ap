@@ -11,56 +11,158 @@ name: PR Guidelines
 # One job runs all checks, aggregates their findings into a single sticky PR
 # comment (so the author is informed directly), then fails if any hard rule was
 # violated. Check details also appear as inline Checks annotations.
+#
+# Fork PRs are failed by a gate that runs before checkout; see that step.
+#
+# Can also be run by hand with a PR number. A dispatch run attaches to a
+# branch, not a PR, so it cannot satisfy a required status check — it reports
+# in the job summary and the sticky comment.
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, edited, milestoned, demilestoned]
+    # 'ready_for_review' matters because the job is gated on draft == false:
+    # without it, taking a PR out of draft would never trigger a run, leaving a
+    # required check permanently unstarted until the next push.
+    types: [opened, synchronize, reopened, edited, ready_for_review, milestoned, demilestoned]
     branches:
       - main
       - staging-for-v4.2.0-LTS
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to check (e.g. 1234)'
+        required: true
+        type: string
 
 permissions:
   contents: read
   pull-requests: write
 
 # Only one run per PR at a time; cancel superseded runs so rapid pushes don't
-# race to create duplicate comments or waste CI minutes.
+# race to create duplicate comments or waste CI minutes. Manual runs share the
+# group, so they can't double-post.
 concurrency:
-  group: pr-guidelines-${{ github.event.pull_request.number }}
+  group: pr-guidelines-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:
   guidelines:
     name: PR & commit guidelines
     runs-on: ubuntu-latest
-    # Only run on ready-for-review PRs from branches in this repo. Fork PRs get
-    # a read-only token, so the sticky-comment step can't post — skip them here.
+    # Fork PRs are NOT excluded here: a skipped job reports no failure, so the
+    # fork gate below has to run and fail instead. Manual runs always proceed —
+    # the draft flag isn't known until the resolve step has called the API.
     if: >-
-      github.event.pull_request.draft == false &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.draft == false
     steps:
+      # One API read serves both triggers: a dispatch run has no
+      # github.event.pull_request payload, only the PR number typed in. It also
+      # means a re-run picks up an edited description or milestone.
+      #
+      # The body goes to a file under RUNNER_TEMP (outside the workspace, so
+      # checkout won't wipe it) because GITHUB_OUTPUT is line-based and a
+      # multi-line body could forge output lines.
+      - name: Resolve PR metadata
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Exactly one of these is non-empty.
+          PR_NUMBER_RAW: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Free text on a manual run — validate before it reaches an API path.
+          case "$PR_NUMBER_RAW" in
+            ''|*[!0-9]*)
+              echo "::error::pr_number must be a positive integer (got: '$PR_NUMBER_RAW')."
+              exit 1 ;;
+          esac
+
+          if ! gh api "repos/$REPO/pulls/$PR_NUMBER_RAW" > "$RUNNER_TEMP/pr.json"; then
+            echo "::error::PR #$PR_NUMBER_RAW not found in $REPO."
+            exit 1
+          fi
+
+          jq -r '.body // ""' "$RUNNER_TEMP/pr.json" > "$RUNNER_TEMP/pr_body.txt"
+
+          get() { jq -r "$1" "$RUNNER_TEMP/pr.json"; }
+
+          HEAD_SHA="$(get '.head.sha // ""')"
+          if [ -z "$HEAD_SHA" ]; then
+            echo "::error::PR #$PR_NUMBER_RAW has no head SHA (deleted branch?)."
+            exit 1
+          fi
+
+          {
+            echo "number=$PR_NUMBER_RAW"
+            echo "head_repo=$(get '.head.repo.full_name // ""')"
+            echo "head_sha=$HEAD_SHA"
+            echo "head_ref=$(get '.head.ref // ""')"
+            echo "base_sha=$(get '.base.sha // ""')"
+            echo "base_ref=$(get '.base.ref // ""')"
+            # Strip newlines so a crafted title can't inject output lines.
+            echo "milestone=$(get '.milestone.title // ""' | tr -d '\n\r')"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "PR #$PR_NUMBER_RAW: $(get '.head.repo.full_name // "?"'):$(get '.head.ref') -> $(get '.base.ref')"
+          echo "State: $(get '.state'), draft: $(get '.draft')"
+
+      # Keep this BEFORE actions/checkout. A fork PR's token is read-only, so
+      # the sticky comment can't post and run_check would build a comment that
+      # is never delivered; the annotation and job summary still work. It also
+      # means the fork's .github/scripts are never executed — which matters most
+      # on a manual run, where the token IS writable. Inline rather than a
+      # script for the same reason: a script in the tree is the PR's own copy.
+      - name: Reject PRs from forks
+        if: steps.pr.outputs.head_repo != github.repository
+        env:
+          HEAD_REPO: ${{ steps.pr.outputs.head_repo }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          {
+            echo "## ❌ PRs from forks are not accepted"
+            echo ""
+            echo "This PR's head branch lives in \`$HEAD_REPO\`, not in \`$REPO\`."
+            echo ""
+            echo "Push your branch to \`$REPO\` and open the PR from there. If you"
+            echo "don't have push access, ask a maintainer for it or to re-open"
+            echo "this change as a branch in the repository."
+            echo ""
+            echo "No other guideline checks were run — this one gates the rest."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::PRs from forks are not allowed (head repo: $HEAD_REPO)."
+          exit 1
+
       - uses: actions/checkout@v4
         with:
           # Full history so the BASE..HEAD rev-list range resolves.
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ steps.pr.outputs.head_sha }}
 
       - name: Run checks and post PR comment
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          # Body arrives as a file, not a value — see the resolve step.
+          PR_BODY_FILE: ${{ runner.temp }}/pr_body.txt
           # Empty when no milestone is assigned.
-          PR_MILESTONE: ${{ github.event.pull_request.milestone.title }}
+          PR_MILESTONE: ${{ steps.pr.outputs.milestone }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           set -uo pipefail
           MARKER="<!-- pr-guidelines-check -->"
           FAIL=0
           : > sections.md
+
+          # Held in a file so a multi-line body can't forge GITHUB_OUTPUT
+          # lines; the checks below just use it as a variable.
+          PR_BODY="$(cat "$PR_BODY_FILE")"
 
           # Run a check command, re-emit its output (so ::error::/::warning::
           # annotations still render), and fold its findings into the comment.
@@ -74,9 +176,12 @@ jobs:
               echo "### $title"
               echo ""
               local lines
-              lines="$(echo "$out" | grep -E '^::(error|warning)::' || true)"
+              # Matches both bare annotations and ones carrying properties
+              # (`::error file=src/foo.c,line=42::`); the properties are dropped
+              # from the bullet, so each message repeats path:line in its text.
+              lines="$(echo "$out" | grep -E '^::(error|warning)[^:]*::' || true)"
               if [ -n "$lines" ]; then
-                echo "$lines" | sed -E 's/^::error::/- ❌ /; s/^::warning::/- ⚠️ /'
+                echo "$lines" | sed -E 's/^::error[^:]*:: ?/- ❌ /; s/^::warning[^:]*:: ?/- ⚠️ /'
               elif [ "$rc" -ne 0 ]; then
                 # Non-zero exit but no annotation — the check crashed rather than
                 # reporting a specific violation. Don't claim "no issues".
@@ -109,9 +214,30 @@ jobs:
           # ------------------------------------------------------------------
           # Routed through run_check so the ::error:: reaches stdout (inline
           # annotation) and only the bullet lands in the sticky comment.
+          # The ticket must be in the PR *description* — a commit `Fixes:` trailer
+          # alone does not satisfy A4, so the error says so explicitly and quotes
+          # the ticket the commits already name, to make the fix copy-pasteable.
           check_pr_desc() {
-            echo "$PR_BODY" | grep -qE '\b(WIFI|WLAN)-[0-9]+\b' && return 0
-            echo "::error::PR description must reference the ticket (WIFI-##### / WLAN-####)."
+            local ticket
+            ticket="$(printf '%s' "$PR_BODY" \
+              | grep -oE '\bWIFI-[0-9]+\b' | head -n1 || true)"
+            if [ -n "$ticket" ]; then
+              echo "PR description references $ticket."
+              return 0
+            fi
+
+            # Merge-base range: base.sha is the base-branch tip at event time, so
+            # the two-dot form would also scan commits the PR never made.
+            ticket="$(git log --format='%B' "$(git merge-base "$BASE_SHA" "$HEAD_SHA")..$HEAD_SHA" \
+              | grep -oE '\bWIFI-[0-9]+\b' | head -n1 || true)"
+
+            if [ -n "$ticket" ]; then
+              echo "::error::PR description does not reference a ticket — the commits mention $ticket, so add it to the description as well (e.g. a \`Ticket: $ticket\` line). A commit \`Fixes:\` trailer alone does not satisfy this check (guidelines A4)."
+            elif [ -z "${PR_BODY//[[:space:]]/}" ]; then
+              echo "::error::PR description is empty. It must state what/why, the ticket (\`WIFI-#####\`), the affected targets/boards and the test evidence (guidelines A4)."
+            else
+              echo "::error::PR description must reference the ticket, e.g. a \`Ticket: WIFI-15706\` line or a Jira link (guidelines A4)."
+            fi
             return 1
           }
           run_check "PR description (ticket link)" check_pr_desc
@@ -149,7 +275,13 @@ jobs:
             fi
             echo ""
             cat sections.md
-            echo "See [OPENWIFI_PR_GUIDELINES.md](OPENWIFI_PR_GUIDELINES.md) and [OPENWIFI_CODING_GUIDELINES.md](OPENWIFI_CODING_GUIDELINES.md). Items marked ⚠️ are advisory and do not fail the check."
+            if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "_Checked manually against \`$HEAD_SHA\`._"
+              echo ""
+            fi
+            # Absolute links: relative paths don't resolve inside PR comments.
+            DOCS="$GITHUB_SERVER_URL/$REPO/blob/main"
+            echo "See [OPENWIFI_PR_GUIDELINES.md]($DOCS/OPENWIFI_PR_GUIDELINES.md) and [OPENWIFI_CODING_GUIDELINES.md]($DOCS/OPENWIFI_CODING_GUIDELINES.md). Items marked ⚠️ are advisory and do not fail the check."
           } > comment.md
 
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
