@@ -2,6 +2,17 @@ KERNEL_LOADADDR := 0x41080000
 
 DEVICE_VARS += CE_TYPE
 
+define Build/wax610-netgear-tar
+	rm -rf $@.tmp
+	mkdir $@.tmp
+	mv $@ $@.tmp/nand-ipq6018-apps.img
+	md5sum $@.tmp/nand-ipq6018-apps.img | cut -c 1-32 > $@.tmp/nand-ipq6018-apps.md5sum
+	echo "WAX610" > $@.tmp/metadata.txt
+	echo "WAX610-610Y_V99.9.9.9" > $@.tmp/version
+	tar -C $@.tmp/ -cf $@ .
+	rm -rf $@.tmp
+endef
+
 define Device/cig_wf660a
   DEVICE_TITLE := Cigtech WF-660a
   DEVICE_DTS := qcom-ipq6018-cig-wf660a
@@ -216,3 +227,13 @@ define Device/yuncore_fap650
 endef
 TARGET_DEVICES += yuncore_fap650
 
+define Device/netgear_wax610
+  DEVICE_TITLE := Netgear WAX610
+  DEVICE_DTS := qcom-ipq6018-netgear-wax610
+  SUPPORTED_DEVICES := netgear,wax610
+  DEVICE_DTS_CONFIG := config@cp03-c1
+  DEVICE_PACKAGES := ath11k-wifi-netgear-wax610 uboot-envtools
+  IMAGES += ui-factory.tar
+  IMAGE/ui-factory.tar := append-ubi | qsdk-ipq-factory-nand | pad-to 4096 | wax610-netgear-tar
+endef
+TARGET_DEVICES += netgear_wax610
