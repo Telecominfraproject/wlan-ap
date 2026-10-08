@@ -11,6 +11,14 @@ name: PR Guidelines
 # One job runs all checks, aggregates their findings into a single sticky PR
 # comment (so the author is informed directly), then fails if any hard rule was
 # violated. Check details also appear as inline Checks annotations.
+#
+# Fork PRs are checked like any other, so outside contributions are not held
+# up by the tooling. Their token is read-only, so the sticky comment cannot be
+# posted — those runs report through the job summary and inline annotations.
+#
+# Can also be run by hand with a PR number, except on fork PRs. A dispatch run
+# attaches to a branch, not a PR, so it cannot satisfy a required status check
+# — it reports in the job summary and the sticky comment.
 
 on:
   pull_request:
@@ -21,49 +29,135 @@ on:
     branches:
       - main
       - staging-for-v4.2.0-LTS
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to check (e.g. 1234)'
+        required: true
+        type: string
 
 permissions:
   contents: read
   pull-requests: write
 
 # Only one run per PR at a time; cancel superseded runs so rapid pushes don't
-# race to create duplicate comments or waste CI minutes.
+# race to create duplicate comments or waste CI minutes. Manual runs share the
+# group, so they can't double-post.
 concurrency:
-  group: pr-guidelines-${{ github.event.pull_request.number }}
+  group: pr-guidelines-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:
   guidelines:
     name: PR & commit guidelines
     runs-on: ubuntu-latest
-    # Only run on ready-for-review PRs from branches in this repo. Fork PRs get
-    # a read-only token, so the sticky-comment step can't post — skip them here.
+    # Fork PRs are NOT excluded here: a skipped job reports no failure, so the
+    # fork gate below has to run and fail instead. Manual runs always proceed —
+    # the draft flag isn't known until the resolve step has called the API.
     if: >-
-      github.event.pull_request.draft == false &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.draft == false
     steps:
+      # One API read serves both triggers: a dispatch run has no
+      # github.event.pull_request payload, only the PR number typed in. It also
+      # means a re-run picks up an edited description or milestone.
+      #
+      # The body goes to a file under RUNNER_TEMP (outside the workspace, so
+      # checkout won't wipe it) because GITHUB_OUTPUT is line-based and a
+      # multi-line body could forge output lines.
+      - name: Resolve PR metadata
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Exactly one of these is non-empty.
+          PR_NUMBER_RAW: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          # Free text on a manual run — validate before it reaches an API path.
+          case "$PR_NUMBER_RAW" in
+            ''|*[!0-9]*)
+              echo "::error::pr_number must be a positive integer (got: '$PR_NUMBER_RAW')."
+              exit 1 ;;
+          esac
+
+          if ! gh api "repos/$REPO/pulls/$PR_NUMBER_RAW" > "$RUNNER_TEMP/pr.json"; then
+            echo "::error::PR #$PR_NUMBER_RAW not found in $REPO."
+            exit 1
+          fi
+
+          jq -r '.body // ""' "$RUNNER_TEMP/pr.json" > "$RUNNER_TEMP/pr_body.txt"
+
+          get() { jq -r "$1" "$RUNNER_TEMP/pr.json"; }
+
+          HEAD_SHA="$(get '.head.sha // ""')"
+          if [ -z "$HEAD_SHA" ]; then
+            echo "::error::PR #$PR_NUMBER_RAW has no head SHA (deleted branch?)."
+            exit 1
+          fi
+
+          {
+            echo "number=$PR_NUMBER_RAW"
+            echo "head_repo=$(get '.head.repo.full_name // ""')"
+            echo "head_sha=$HEAD_SHA"
+            echo "head_ref=$(get '.head.ref // ""')"
+            echo "base_sha=$(get '.base.sha // ""')"
+            echo "base_ref=$(get '.base.ref // ""')"
+            # Strip newlines so a crafted title can't inject output lines.
+            echo "milestone=$(get '.milestone.title // ""' | tr -d '\n\r')"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "PR #$PR_NUMBER_RAW: $(get '.head.repo.full_name // "?"'):$(get '.head.ref') -> $(get '.base.ref')"
+          echo "State: $(get '.state'), draft: $(get '.draft')"
+
+      # Fork PRs are welcome on pull_request, where the token is read-only.
+      # They are refused on workflow_dispatch: a dispatch run carries a WRITE
+      # token, and the checks below execute .github/scripts from the checked-out
+      # tree — on a fork PR that is the fork's copy of those scripts, so running
+      # it with a writable token would be a privilege-escalation path. Keep this
+      # ahead of the checkout.
+      - name: Refuse manual runs on fork PRs
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          steps.pr.outputs.head_repo != github.repository
+        env:
+          HEAD_REPO: ${{ steps.pr.outputs.head_repo }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          set -uo pipefail
+          echo "::error::PR #$PR_NUMBER comes from a fork ($HEAD_REPO). Manual runs are not supported for fork PRs, because a dispatch run has a writable token. Let the pull_request trigger check it, or ask the contributor to re-push."
+          exit 1
+
       - uses: actions/checkout@v4
         with:
           # Full history so the BASE..HEAD rev-list range resolves.
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ steps.pr.outputs.head_sha }}
 
       - name: Run checks and post PR comment
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          # Body arrives as a file, not a value — see the resolve step.
+          PR_BODY_FILE: ${{ runner.temp }}/pr_body.txt
           # Empty when no milestone is assigned.
-          PR_MILESTONE: ${{ github.event.pull_request.milestone.title }}
+          PR_MILESTONE: ${{ steps.pr.outputs.milestone }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          # Equal to REPO for a branch in this repo; a fork's slug otherwise.
+          HEAD_REPO: ${{ steps.pr.outputs.head_repo }}
         run: |
           set -uo pipefail
           MARKER="<!-- pr-guidelines-check -->"
           FAIL=0
           : > sections.md
+
+          # Held in a file so a multi-line body can't forge GITHUB_OUTPUT
+          # lines; the checks below just use it as a variable.
+          PR_BODY="$(cat "$PR_BODY_FILE")"
 
           # Run a check command, re-emit its output (so ::error::/::warning::
           # annotations still render), and fold its findings into the comment.
@@ -176,6 +270,10 @@ jobs:
             fi
             echo ""
             cat sections.md
+            if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "_Checked manually against \`$HEAD_SHA\`._"
+              echo ""
+            fi
             # Absolute links: relative paths don't resolve inside PR comments.
             DOCS="$GITHUB_SERVER_URL/$REPO/blob/main"
             echo "See [OPENWIFI_PR_GUIDELINES.md]($DOCS/OPENWIFI_PR_GUIDELINES.md) and [OPENWIFI_CODING_GUIDELINES.md]($DOCS/OPENWIFI_CODING_GUIDELINES.md). Items marked ⚠️ are advisory and do not fail the check."
@@ -183,21 +281,34 @@ jobs:
 
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
 
-          # Post or update the sticky comment (found via the hidden marker).
-          EXISTING="$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
-            --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | head -n1 || true)"
-
-          if [ -n "$EXISTING" ]; then
-            gh api -X PATCH "repos/$REPO/issues/comments/$EXISTING" -F body=@comment.md >/dev/null
-            echo "Updated existing comment $EXISTING."
+          # A fork PR's token is read-only, so the comments API would 403. The
+          # findings are already in the job summary above and in the inline
+          # annotations, so skip posting rather than failing on it.
+          if [ "$HEAD_REPO" != "$REPO" ]; then
+            echo "Fork PR ($HEAD_REPO): skipping the sticky comment, the token is read-only."
+            echo "_Posted as a job summary rather than a PR comment: a fork PR's token cannot comment._" \
+              >> "$GITHUB_STEP_SUMMARY"
           else
-            gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -F body=@comment.md >/dev/null
-            echo "Created new comment."
+            # Post or update the sticky comment (found via the hidden marker).
+            EXISTING="$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+              --jq ".[] | select(.body | contains(\"$MARKER\")) | .id" | head -n1 || true)"
+
+            if [ -n "$EXISTING" ]; then
+              gh api -X PATCH "repos/$REPO/issues/comments/$EXISTING" -F body=@comment.md >/dev/null
+              echo "Updated existing comment $EXISTING."
+            else
+              gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -F body=@comment.md >/dev/null
+              echo "Created new comment."
+            fi
           fi
 
-          # Fail the check last, so the comment is always posted first.
+          # Fail the check last, so the report is always delivered first.
           if [ "$FAIL" -ne 0 ]; then
-            echo "PR/commit guidelines not satisfied. See the PR comment for details."
+            if [ "$HEAD_REPO" != "$REPO" ]; then
+              echo "PR/commit guidelines not satisfied. See the job summary for details."
+            else
+              echo "PR/commit guidelines not satisfied. See the PR comment for details."
+            fi
             exit 1
           fi
           echo "All PR & commit guideline checks passed."
