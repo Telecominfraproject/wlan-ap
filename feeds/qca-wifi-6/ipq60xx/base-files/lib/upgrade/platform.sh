@@ -120,6 +120,7 @@ platform_check_image() {
 	glinet,ax1800|\
 	glinet,axt1800|\
 	indio,um-310ax-v1|\
+	netgear,wax610|\
 	wallys,dr6018|\
 	wallys,dr6018-v4|\
 	edgecore,eap101|\
@@ -148,7 +149,8 @@ platform_do_upgrade() {
 		spi_nor_emmc_do_upgrade_bootconfig $1
 		;;
 	cig,wf188n|\
-	emplus,wap386v2)
+	emplus,wap386v2|\
+	netgear,wax610)
 		[ -f /proc/boot_info/rootfs/upgradepartition ] && {
 			CI_UBIPART="$(cat /proc/boot_info/rootfs/upgradepartition)"
 			CI_BOOTCFG=1
