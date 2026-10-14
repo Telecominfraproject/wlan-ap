@@ -1,0 +1,137 @@
+From: jiashuaiquan <jiashuaiquan@asterfusion.com>
+Date: Wed, 14 Oct 2026 19:30:00 +0800
+Subject: [PATCH] wifi: ath12k: hold RCU across tx status after peer delete
+
+ath12k_dp_tx_complete_msdu() copies status.sta = peer->sta under
+rcu_read_lock() but drops the lock before ieee80211_tx_status_ext()
+(664-i). The two 967-a mesh paths do the same before
+ieee80211s_update_metric_ppdu().
+
+On a normal disconnect, ath12k_peer_delete_send() (901-02) already
+clears peer_list/ml_peer_list and calls synchronize_rcu() before the
+WMI delete, so a completion cannot find the peer via the arrays by
+the time unmap arrives. The remaining race is: completion copies sta,
+drops RCU, delete_send's synchronize_rcu() returns, mac80211 frees
+sta_info, then completion walks the freed sta in get_link_sta /
+vif.type.
+
+Keep rcu_read_lock() held across ieee80211_tx_status_ext() and across
+ieee80211s_update_metric_ppdu(). For FW-initiated unmaps, still clear
+the array slots (only if they still point at this peer).
+
+Move struct rcu_head rcu to the start of ath12k_peer so kfree_rcu()
+is valid; the previous offset after ml_addr was past the 4096-byte
+kvfree_rcu limit.
+
+Tested on AP7330 (ipq53xx), verified STA disconnect/reconnect no longer
+hits the unmap UAF.
+
+Fixes: WIFI-15395
+Signed-off-by: jiashuaiquan <jiashuaiquan@asterfusion.com>
+---
+--- a/drivers/net/wireless/ath/ath12k/peer.h
++++ b/drivers/net/wireless/ath/ath12k/peer.h
+@@ -26,3 +26,4 @@
+ struct ath12k_peer {
++	struct rcu_head rcu;
+ 	struct list_head list;
+ 	struct ieee80211_sta *sta;
+@@ -81,7 +82,6 @@ struct ath12k_peer {
+ 	 * here and would be same for all partner peers
+ 	 */
+ 	u8 ml_addr[ETH_ALEN];
+-	struct rcu_head rcu;
+ #if defined(CPTCFG_MAC80211_PPE_SUPPORT) || defined(CPTCFG_ATH12K_PPE_DS_SUPPORT)
+ 	/* Duplicate PPE port number to avoid link vif lookup in rx data path */
+ 	int ppe_vp_num;
+--- a/drivers/net/wireless/ath/ath12k/peer.c
++++ b/drivers/net/wireless/ath/ath12k/peer.c
+@@ -247,5 +247,13 @@ void ath12k_peer_unmap_event(struct ath12k_base *ab, u16 peer_id)
+ {
+ 	struct ath12k_peer *peer;
++	u16 ml_peer_id;
+ 
+ 	spin_lock_bh(&ab->base_lock);
++
++	if (peer_id >= ab->peer_list_size) {
++		ath12k_warn(ab,
++			    "peer-unmap-event: peer_id %u exceeds peer list size\n",
++			    peer_id);
++		goto exit;
++	}
+ 
+@@ -263,12 +271,21 @@
+ 	ath12k_dbg(ab, ATH12K_DBG_PEER, "htt peer unmap vdev %d peer %pM id %d\n",
+ 		   peer->vdev_id, peer->addr, peer_id);
+ 
++	ml_peer_id = peer->ml_peer_id & ~ATH12K_ML_PEER_ID_VALID;
++	if (peer->peer_id < ab->peer_list_size &&
++	    rcu_access_pointer(ab->peer_list[peer->peer_id]) == peer)
++		rcu_assign_pointer(ab->peer_list[peer->peer_id], NULL);
++	if (peer->mlo && ml_peer_id < ab->ml_peer_list_size &&
++	    rcu_access_pointer(ab->ml_peer_list[ml_peer_id][peer->pdev_idx]) == peer)
++		rcu_assign_pointer(ab->ml_peer_list[ml_peer_id][peer->pdev_idx],
++				   NULL);
++
+ 	list_del(&peer->list);
+ #ifdef CPTCFG_ATH12K_SAWF
+ 	if (peer->sawf_ctx_peer.telemetry_peer_ctx)
+ 		ath12k_telemetry_peer_ctx_free(peer->sawf_ctx_peer.telemetry_peer_ctx);
+ #endif
+-	kfree(peer);
++	kfree_rcu(peer, rcu);
+ 	wake_up(&ab->peer_mapping_wq);
+ 
+ exit:
+--- a/drivers/net/wireless/ath/ath12k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_tx.c
+@@ -1363,14 +1363,14 @@
+ 			ath12k_sawf_stats_update(ar, msdu, &ts, pri_peer, timestamp);
+ 			spin_unlock_bh(&ab->base_lock);
+ 		}
+ 	}
+ 
+-	rcu_read_unlock();
+-
+ 	if (flags & ATH12K_SKB_HW_80211_ENCAP)
+ 		ieee80211_tx_status_8023(ar->ah->hw, vif, msdu);
+ 	else
+ 		ieee80211_tx_status_ext(ar->ah->hw, &status);
++
++	rcu_read_unlock();
+ }
+ 
+ static inline bool ath12k_dp_tx_completion_valid(struct hal_wbm_release_ring *desc)
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -1472,8 +1472,8 @@
+ 	status.mpdu_fail = FIELD_GET(HTT_PPDU_STATS_CMPLTN_FLUSH_INFO_NUM_MPDU,
+ 			msg->info);
+ 	ar = arsta->arvif->ar;
+-	rcu_read_unlock();
+ 	ieee80211s_update_metric_ppdu(ar->ah->hw, &status);
++	rcu_read_unlock();
+ }
+ 
+ static int ath12k_htt_tlv_ppdu_stats_parse(struct ath12k_base *ab,
+@@ -2068,19 +2068,19 @@
+ 
+ 		memset(&status, 0, sizeof(status));
+ 
+ 		status.sta = peer->sta;
+ 		rate = arsta->last_txrate;
+-		rcu_read_unlock();
+ 
+ 		status_rate.rate_idx = rate;
+ 		status_rate.try_count = 1;
+ 
+ 		status.rates = &status_rate;
+ 		status.n_rates = 1;
+ 		status.mpdu_succ = usr_stats->cmpltn_cmn.mpdu_success;
+ 
+ 		ieee80211s_update_metric_ppdu(ar->ah->hw, &status);
++		rcu_read_unlock();
+ 	}
+ }
+ 
+ static int ath12k_htt_pull_ppdu_stats(struct ath12k_base *ab,
