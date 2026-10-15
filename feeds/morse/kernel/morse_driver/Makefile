@@ -7,19 +7,18 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=morse_driver
-PKG_RELEASE=3
+PKG_RELEASE=4
 
-PKG_VERSION:=1.11.4
+PKG_VERSION:=1.17.8
 
 PKG_LICENSE:=GPLv2
 PKG_LICENSE_FILES:=LICENSE
 
-PKG_SOURCE_VERSION:=$(PKG_VERSION)
 PKG_SOURCE_URL:=https://github.com/MorseMicro/morse_driver.git
-PKG_MIRROR_HASH:=f9b959b3fdac47b8fab23beae985685e0f28aabcf7a84050ca69ca872454c569
-PKG_HASH:=159d018a92e0cf742795ed49bd94fb6ed324163012bb91c2a2e4e0f6037bbf23
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_VERSION:=b2ab42a5f22527422adf6afab73f2d019c16f162
+PKG_SOURCE_VERSION:=3eef5a0a43645808e501ff4b83f29d675588bd9b
+PKG_MIRROR_HASH:=skip
+PKG_HASH:=skip
 
 PKG_MAINTAINER:=Morse Micro
 PKG_BUILD_PARALLEL:=1
@@ -32,12 +31,12 @@ DTC=$(wildcard $(LINUX_DIR)/scripts/dtc/dtc)
 define KernelPackage/morse
   SUBMENU:=Wireless Drivers
   TITLE:=Morse Micro WIFI HaLow driver
-  DEPENDS:= +kmod-mmc +kmod-mac80211 +kmod-trelay +kmod-lib-crc7 +morse-fw +morse-board-config
+  DEPENDS:= +kmod-mmc +kmod-usb-core +kmod-mac80211 +kmod-trelay +kmod-lib-crc7 +morse-fw +morse-board-config
   FILES:=\
     $(PKG_BUILD_DIR)/morse.ko \
     $(PKG_BUILD_DIR)/dot11ah/dot11ah.ko
   AUTOLOAD:=$(call AutoProbe,morse)
-  MODPARAMS.morse:=country=US
+  MODPARAMS.morse:=country=US enable_watchdog_reset=Y enable_ps=0
   PROVIDES:=kmod-morse
 endef
 
@@ -50,6 +49,11 @@ define KernelPackage/morse/config
 
        config MORSE_SPI
             bool "SPI support "
+            default n
+            depends on PACKAGE_kmod-morse
+
+       config MORSE_USB
+            bool "USB support "
             default y
             depends on PACKAGE_kmod-morse
 
@@ -112,6 +116,10 @@ ifeq ($(CONFIG_MORSE_SPI),y)
   MORSE_MAKEDEFS += CONFIG_MORSE_SPI=y
 endif
 
+ifeq ($(CONFIG_MORSE_USB),y)
+  MORSE_MAKEDEFS += CONFIG_MORSE_USB=y
+endif
+
 ifeq ($(CONFIG_MORSE_USER_ACCESS),y)
   NOSTDINC_FLAGS += -DCONFIG_MORSE_USER_ACCESS
   MORSE_MAKEDEFS += CONFIG_MORSE_USER_ACCESS=y
@@ -146,11 +154,11 @@ MORSE_MAKEDEFS += \
   MORSE_VERSION=0-$(PKG_VERSION) \
   KERNEL_SRC=$(LINUX_DIR) \
   CONFIG_MORSE_SDIO_ALIGNMENT=$(CONFIG_MORSE_SDIO_ALIGNMENT) \
-  CONFIG_BACKPORT_VERSION=v5.18.1
-# This refers to the version of mac80211 backported to OpenWrt
-# Occasionally patches are required to remove some parts of the driver
-# as OpenWrt may sometimes pull in further patches from later kernel versions
-# than that of the mac80211 backport.
+  CONFIG_BACKPORT_VERSION=v6.18
+# TIP platform is locked to mac80211 backports 6.18.7 (cannot downgrade).
+# Morse 1.17.8 is officially validated only up to Linux 6.12; set the knob
+# to v6.18 so MAC80211_BACKPORT_VERSION_CODE selects 6.18 API prototypes,
+# combined with compat patches 030 (S1G chan-flags) and 031 (twt union).
 
 NOSTDINC_FLAGS = \
 	-I$(PKG_BUILD_DIR) \

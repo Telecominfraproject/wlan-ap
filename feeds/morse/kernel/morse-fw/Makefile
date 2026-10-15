@@ -11,13 +11,14 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=morse-fw
-PKG_RELEASE=2
+PKG_RELEASE=3
 
-PKG_VERSION:=rel_1_11_4_2024_Jul_09
-
-PKG_SOURCE:=morsemicro-fw-rel_1_11_4_2024_Jul_09.tar
-PKG_SOURCE_URL:=https://github.com/MorseMicro/firmware_binaries/releases/download/v1.11.4/
-PKG_HASH:=6df1e39655278adf140776b3e76b8faced41828a9d482363aed0795e96f5d241
+PKG_VERSION:=1.17.8
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_URL:=https://github.com/MorseMicro/morse-firmware.git
+PKG_SOURCE_VERSION:=$(PKG_VERSION)
+PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar.gz
+PKG_MIRROR_HASH:=skip
 
 PKG_MAINTAINER:=Morse Micro <info@morsemicro.com>
 PKG_BUILD_PARALLEL:=1
@@ -31,22 +32,21 @@ define Package/morse-fw
   SECTION:=firmware
   CATEGORY:=Firmware
   URL:=$(PKG_SOURCE_URL)
-  TITLE:=Morse Micro WIFI HaLow firmware
+  TITLE:=Morse Micro WIFI HaLow firmware for 8108
   PROVIDES:=morse-fw
 endef
-
-TAR_CMD=$(HOST_TAR) -C $(1) $(TAR_OPTIONS)
 
 define Build/Compile
 
 endef
 
+# Files from the git repo are overridden by a file in this path (for local dev).
 define Package/morse-fw/install
-	$(INSTALL_DIR) $(1)/lib/firmware/morse/.
-	if [ -e ./files/lib/firmware/morse/mm6108.bin ]; then \
-		$(INSTALL_DATA) ./files/lib/firmware/morse/mm6108.bin $(1)/lib/firmware/morse/; \
+	$(INSTALL_DIR) $(1)/lib/firmware/morse
+	if [ -e ./files/lib/firmware/morse/mm8108b2-rl.bin ]; then \
+		$(INSTALL_DATA) ./files/lib/firmware/morse/mm8108b2-rl.bin $(1)/lib/firmware/morse/; \
 	else \
-		$(INSTALL_DATA) $(PKG_BUILD_DIR)/lib/firmware/morse/mm6108.bin $(1)/lib/firmware/morse/; \
+		$(INSTALL_DATA) $(PKG_BUILD_DIR)/firmware/mm8108b2-rl.bin $(1)/lib/firmware/morse/; \
 	fi
 endef
 
