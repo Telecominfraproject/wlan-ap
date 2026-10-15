@@ -3239,10 +3239,11 @@ int ath12k_wifi7_dp_rx_process_wbm_err(struct ath12k_dp *dp,
 	int num_buffs_reaped[ATH12K_MAX_SOCS] = {};
 	int total_num_buffs_reaped = 0;
 	struct ath12k_rx_desc_info *desc_info;
+	struct ath12k_rx_desc_info *cookie_desc;
 	struct ath12k_device_dp_stats *device_stats = &dp->device_stats;
 	struct ath12k_dp_hw_link *hw_links = dp_hw_grp->hw_links;
 	u8 hw_link_id, device_id;
-	int ret, pdev_id;
+	int ret, pdev_id, owner_id;
 	struct hal_rx_desc *msdu_data;
 	struct ath12k_vif *ahvif;
 	struct ath12k_dp_link_peer *link_peer;
@@ -3275,35 +3276,86 @@ int ath12k_wifi7_dp_rx_process_wbm_err(struct ath12k_dp *dp,
 
 		desc_info = err_info.rx_desc;
 
-		/* retry manual desc retrieval if hw cc is not done */
-		if (!desc_info) {
+		/*
+		 * The VA written back by HW cookie conversion cannot be
+		 * trusted blindly. Always resolve the descriptor from the
+		 * SW cookie and use the HW VA only for cross-checking.
+		 * When HW CC is not done, rx_desc is NULL and the cookie
+		 * result is used directly.
+		 */
+		if (!err_info.hw_cc_done)
 			DP_DEVICE_STATS_INC(dp, wbm_err.drop[WBM_ERR_GET_SW_DESC_FROM_CK_ERROR], 1);
-			desc_info = ath12k_dp_get_rx_desc(dp, err_info.cookie);
-			if (!desc_info) {
-				DP_DEVICE_STATS_INC(dp, wbm_err.drop[WBM_ERR_GET_SW_DESC_ERROR], 1);
-				ath12k_warn(ab, "Invalid cookie in DP WBM rx error descriptor retrieval: 0x%x\n",
-					    err_info.cookie);
-				continue;
-			}
-		}
 
-		if (desc_info->magic != ATH12K_DP_RX_DESC_MAGIC)
-			ath12k_warn(ab, "WBM RX err, Check HW CC implementation");
-
-		msdu = desc_info->skb;
-		desc_info->skb = NULL;
-
-		device_id = desc_info->device_id;
-		partner_dp = ath12k_dp_hw_grp_to_dp(dp_hw_grp, device_id);
-		if (unlikely(!partner_dp)) {
-			ath12k_wifi7_dp_rx_wbm_err_dev_free_skb(dp, msdu, WBM_ERR_DROP_NULL_PARTNER_DP);
-
-			/* In any case continuation bit is set
-			 * in the previous record, cleanup scatter_msdu_list
-			 */
+		/*
+		 * This ring may carry partner-owned buffers in a multi-device
+		 * hw group. Derive the owning device from the cookie and
+		 * resolve the descriptor in the owner's pool.
+		 */
+		owner_id = ath12k_dp_rx_cookie_to_device_id(err_info.cookie);
+		if (unlikely(owner_id < 0)) {
+			DP_DEVICE_STATS_INC(dp, wbm_err.drop[WBM_ERR_GET_SW_DESC_ERROR], 1);
+			ath12k_warn(ab, "WBM err: cookie 0x%x does not map to any device (hw_cc_done %d)\n",
+				    err_info.cookie, err_info.hw_cc_done);
 			ath12k_wifi7_dp_clean_up_skb_list(&scatter_msdu_list);
 			continue;
 		}
+
+		device_id = owner_id;
+		partner_dp = ath12k_dp_hw_grp_to_dp(dp_hw_grp, device_id);
+		if (unlikely(!partner_dp)) {
+			/*
+			 * Valid cookie but the owning device is not (or no
+			 * longer) part of the group. Its descriptors and skbs
+			 * belong to that device's cleanup path, so do not touch
+			 * them here; just account and skip.
+			 */
+			DP_DEVICE_STATS_INC(dp, wbm_err.drop[WBM_ERR_DROP_NULL_PARTNER_DP], 1);
+			ath12k_wifi7_dp_clean_up_skb_list(&scatter_msdu_list);
+			continue;
+		}
+
+		cookie_desc = ath12k_dp_get_rx_desc(partner_dp, err_info.cookie);
+		if (unlikely(!cookie_desc)) {
+			DP_DEVICE_STATS_INC(dp, wbm_err.drop[WBM_ERR_GET_SW_DESC_ERROR], 1);
+			ath12k_warn(ab, "WBM err: invalid cookie 0x%x (hw_cc_done %d)\n",
+				    err_info.cookie, err_info.hw_cc_done);
+			ath12k_wifi7_dp_clean_up_skb_list(&scatter_msdu_list);
+			continue;
+		}
+
+		if (err_info.hw_cc_done && unlikely(desc_info != cookie_desc)) {
+			DP_DEVICE_STATS_INC(dp, wbm_err.drop[WBM_ERR_CC_VA_MISMATCH_ERROR], 1);
+			ath12k_warn(ab, "WBM err: HW CC VA does not match cookie 0x%x\n",
+				    err_info.cookie);
+		}
+
+		desc_info = cookie_desc;
+		if (unlikely(desc_info->magic != ATH12K_DP_RX_DESC_MAGIC ||
+			     !desc_info->skb)) {
+			DP_DEVICE_STATS_INC(dp, wbm_err.drop[WBM_ERR_STALE_OR_CORRUPT_DESC_ERROR], 1);
+			ath12k_warn(ab, "WBM err: %s rx desc, cookie 0x%x magic 0x%x\n",
+				    desc_info->skb ? "corrupt" : "stale",
+				    err_info.cookie, desc_info->magic);
+			ath12k_wifi7_dp_clean_up_skb_list(&scatter_msdu_list);
+			continue;
+		}
+
+		if (unlikely(desc_info->device_id != device_id)) {
+			/*
+			 * The descriptor was resolved from the owner's pool, so
+			 * its device_id must match. A mismatch means the
+			 * descriptor memory is corrupted; its skb pointer cannot
+			 * be trusted either, so leave it alone and skip.
+			 */
+			DP_DEVICE_STATS_INC(dp, wbm_err.drop[WBM_ERR_DESC_OWNER_MISMATCH_ERROR], 1);
+			ath12k_warn(ab, "WBM err: rx desc owner mismatch, cookie 0x%x desc device %u expected %u\n",
+				    err_info.cookie, desc_info->device_id, device_id);
+			ath12k_wifi7_dp_clean_up_skb_list(&scatter_msdu_list);
+			continue;
+		}
+
+		msdu = desc_info->skb;
+		desc_info->skb = NULL;
 
 		list_add_tail(&desc_info->list, &rx_desc_used_list[device_id]);
 

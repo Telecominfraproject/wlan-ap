@@ -1416,6 +1416,23 @@ struct ath12k_rx_desc_info *ath12k_dp_get_rx_desc(struct ath12k_dp *dp,
 }
 EXPORT_SYMBOL(ath12k_dp_get_rx_desc);
 
+int ath12k_dp_rx_cookie_to_device_id(u32 cookie)
+{
+	u32 ppt_idx = u32_get_bits(cookie, ATH12K_DP_CC_COOKIE_PPT);
+	u32 device_id;
+
+	if (unlikely(ppt_idx < ATH12K_RX_SPT_PAGE_OFFSET))
+		return -EINVAL;
+
+	device_id = (ppt_idx - ATH12K_RX_SPT_PAGE_OFFSET) /
+		     ATH12K_NUM_RX_SPT_PAGES;
+	if (unlikely(device_id >= ATH12K_MAX_SOCS))
+		return -EINVAL;
+
+	return device_id;
+}
+EXPORT_SYMBOL(ath12k_dp_rx_cookie_to_device_id);
+
 struct ath12k_tx_desc_info *ath12k_dp_get_tx_desc(struct ath12k_dp *dp,
 						  u32 cookie)
 {
