@@ -10,14 +10,14 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=hostapd_s1g
 PKG_RELEASE=2
 
-PKG_VERSION:=1.12.4
+PKG_VERSION:=1.17.8
 
 PKG_LICENSE:=BSD-3-Clause
 
 PKG_SOURCE_VERSION:=$(PKG_VERSION)
 PKG_SOURCE_URL:=https://github.com/MorseMicro/hostap.git
-PKG_MIRROR_HASH:=2f6894e40c7105b23530cd9559bd836d29f23ffb87cbbaa614eb2361667e55a0
-PKG_HASH:=a2f17ce3d2fe25d45cc2d6869e9ea644bcac441ec9b541972034768d4fc63608
+PKG_MIRROR_HASH:=skip
+PKG_HASH:=skip
 PKG_SOURCE_PROTO:=git
 
 PKG_MAINTAINER:=Morse Micro <info@morsemicro.com>
@@ -99,7 +99,7 @@ define Package/hostapd_s1g
   CATEGORY:=Network
   SUBMENU:=WirelessAPD
   TITLE:=Morse Micro HaLow hostapd
-  DEPENDS:= +kmod-morse +libnl +libopenssl +libubus
+  DEPENDS:= kmod-morse +libnl +libopenssl +libubus
   USERID:=network=101:network=101
   PROVIDES:=hostapd_s1g
 endef
@@ -130,7 +130,8 @@ TARGET_CPPFLAGS := \
 	-I$(PKG_BUILD_DIR)/src/crypto \
 	$(TARGET_CPPFLAGS) \
 	-DCONFIG_LIBNL20 \
-	-D_GNU_SOURCE
+	-D_GNU_SOURCE \
+	-Wno-error=deprecated-declarations
 
 TARGET_LDFLAGS += -lnl-3 -lnl-genl-3 -lnl-route-3
 TARGET_LDFLAGS += -lm -lpthread -lcrypto -lssl

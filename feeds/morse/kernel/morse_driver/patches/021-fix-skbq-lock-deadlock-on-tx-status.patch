@@ -1,0 +1,70 @@
+morse: fix RCU stall deadlock in morse_skbq_skb_finish TX status path
+
+The morse_skbq_tx_status_process() function calls morse_skbq_skb_finish()
+while holding mq->lock (spin_lock_bh). Inside __skbq_data_tx_finish(),
+MORSE_IEEE80211_TX_STATUS() is called which invokes mac80211's
+ieee80211_tx_status(). When A-MPDU aggregation is active, mac80211 may
+call ieee80211_send_bar() from within the tx_status callback, which
+re-enters the driver's ops_tx() -> morse_skbq_skb_tx() -> morse_skbq_tx()
+and attempts to acquire the same mq->lock, causing a deadlock on the
+singlethread MorseNetWorkQ workqueue. Since the workqueue thread never
+yields, this manifests as an RCU self-detected stall on the CPU.
+
+Fix by splitting the TX status processing in morse_skbq_tx_status_process:
+1. Perform the skb unlink from the pending queue and header removal
+   while holding the spinlock.
+2. Release the spinlock.
+3. Call morse_skbq_skb_finish() with the skb already detached.
+
+To make step 3 safe, add a check in __skbq_data_tx_finish: if the skb
+is already unlinked (next == NULL), skip the unlink call.
+
+This patch only modifies morse driver code (skbq.c) and has no effect
+on other wireless drivers (mt7996, ath, etc.) or their 2.4G/5G behavior.
+
+Signed-off-by: EdgeCore <dev@edge-core.com>
+
+--- a/skbq.c
++++ b/skbq.c
+@@ -480,14 +480,22 @@ static void morse_skbq_tx_status_process
+ 			continue;
+ 		}
+ 
++		/*
++		 * Unlink from pending queue while holding the lock, so that
++		 * morse_skbq_skb_finish -> __skbq_data_tx_finish sees the skb
++		 * already detached and skips its own unlink.
++		 */
++		__morse_skbq_unlink(mq, &mq->pending, tx_skb);
++
+ 		morse_skb_remove_hdr_after_sent_to_chip(tx_skb);
+ 
+-		if (is_fullmac_mode())
++		spin_unlock_bh(&mq->lock);
++
++		if (is_fullmac_mode()) {
+ 			morse_skbq_skb_finish_fullmac(mq, tx_skb, tx_sts);
+-		else
++		} else {
+ 			morse_skbq_skb_finish(mq, tx_skb, tx_sts);
+-
+-		spin_unlock_bh(&mq->lock);
++		}
+ 	}
+ 
+ 	if (mors->cfg->ops->skbq_get_tx_buffered_count(mors) == 0) {
+@@ -1228,7 +1236,13 @@ static int __skbq_data_tx_finish(struct
+ 	if (morse_skbq_mon)
+ 		morse_skbq_mon_adjust(mors, skb, 0);
+ 
+-	__morse_skbq_unlink(mq, &mq->pending, skb);
++	/*
++	 * If the caller already unlinked the skb (e.g. morse_skbq_tx_status_process
++	 * to avoid holding the lock across ieee80211_tx_status), the skb will not
++	 * be on any queue. Check before unlinking to avoid list corruption.
++	 */
++	if (skb->next != NULL)
++		__morse_skbq_unlink(mq, &mq->pending, skb);
+ 
+ 	/* Workaround Linux */
+ 	__skbq_qosnullfunc_to_nullfunc(skb);
