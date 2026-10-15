@@ -1,0 +1,162 @@
+From 87088bba93c4ecea504d1f38ddb9530e874001fa Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Thu, 5 Mar 2026 15:54:37 +0800
+Subject: [PATCH 88/89] mtk: mt76: mt7996: rework beacon monitor for 11v MBSS
+
+Rework beacon monitor for 11v MBSS.
+When the STA is connected to an 11v non-TX BSS, then beacon loss is
+repeatedly triggered, as no actual beacon is sent from the AP.
+To address this, move the beacon receiving mechanism from mt76 rx path to
+mac80211, allowing it can recognize the beacon TX BSS of its connected
+AP and count it as the beacon of the non-TX BSS.
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Signed-off-by: Shayne Chen <shayne.chen@mediatek.com>
+---
+ mt7996/mac.c  | 50 --------------------------------------------------
+ mt7996/main.c | 39 ++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 36 insertions(+), 53 deletions(-)
+
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index 3bb1d12ac..061ab66ff 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -14,7 +14,6 @@
+ #include "vendor.h"
+ #include "mt7996_trace.h"
+ 
+-static void mt7996_rx_beacon_hint(struct mt7996_phy *phy, struct mt7996_vif *mvif);
+ static int mt7996_mac_btwt_add_member(struct mt7996_twt_flow *flow, u16 idx);
+ static int mt7996_mac_btwt_del_member(struct mt7996_twt_flow *flow, u16 idx);
+ 
+@@ -626,20 +625,6 @@ mt7996_mac_fill_rx(struct mt7996_dev *dev, enum mt76_rxq_id q,
+ 			 */
+ 			if (ieee80211_has_a4(fc) && is_mesh && status->amsdu)
+ 				*qos &= ~IEEE80211_QOS_CTL_A_MSDU_PRESENT;
+-		} else if (ieee80211_is_beacon(fc)) {
+-			struct ieee80211_hw *hw = phy->mt76->hw;
+-			struct ieee80211_sta *sta;
+-
+-			sta = ieee80211_find_sta_by_link_addrs(hw, hdr->addr2, NULL, NULL);
+-			if (!sta)
+-				sta = ieee80211_find_sta_by_ifaddr(hw, hdr->addr2, NULL);
+-
+-			if (sta) {
+-				msta = (struct mt7996_sta *)sta->drv_priv;
+-
+-				if (msta && msta->vif)
+-					mt7996_rx_beacon_hint(phy, msta->vif);
+-			}
+ 		}
+ 		skb_set_mac_header(skb, (unsigned char *)hdr - skb->data);
+ 
+@@ -4202,41 +4187,6 @@ unlock:
+ 	return ret;
+ }
+ 
+-
+-static void
+-mt7996_rx_beacon_hint(struct mt7996_phy *phy, struct mt7996_vif *mvif)
+-{
+-	struct mt7996_vif_link *mconf;
+-	int band_idx = phy->mt76->band_idx;
+-	unsigned int link_id = mvif->mt76.band_to_link[band_idx];
+-
+-	mvif->beacon_received_time[band_idx] = jiffies;
+-
+-	if (link_id >= IEEE80211_LINK_UNSPECIFIED)
+-		return;
+-
+-	if (mvif->lost_links & BIT(link_id)) {
+-		mvif->lost_links &= ~BIT(link_id);
+-		mt76_bss_dbg(container_of((void *)mvif, struct ieee80211_vif, drv_priv),
+-			     "link %d: resume beacon monitoring", link_id);
+-	}
+-
+-	mconf = (struct mt7996_vif_link *)rcu_dereference(mvif->mt76.link[link_id]);
+-	if (!mconf) {
+-		mvif->tx_paused_links &= ~BIT(link_id);
+-		return;
+-	}
+-
+-	/* resume TX */
+-	if (delayed_work_pending(&mconf->sta_chsw_work) &&
+-	    mconf->state == MT7996_STA_CHSW_PAUSE_TX &&
+-	    mconf->next_state != MT7996_STA_CHSW_RESUME_TX) {
+-		mconf->next_state = MT7996_STA_CHSW_RESUME_TX;
+-		cancel_delayed_work(&mconf->sta_chsw_work);
+-		ieee80211_queue_delayed_work(phy->mt76->hw, &mconf->sta_chsw_work, 0);
+-	}
+-}
+-
+ static int
+ mt7996_beacon_mon_send_probe(struct mt7996_phy *phy, struct mt7996_vif *mvif,
+ 			     struct ieee80211_bss_conf *conf, unsigned int link_id)
+diff --git a/mt7996/main.c b/mt7996/main.c
+index 66e5679e6..7167081b6 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -3247,6 +3247,9 @@ mt7996_event_callback(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ {
+ 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
+ 	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
++	struct mt7996_vif_link *mconf;
++	struct mt7996_phy *phy;
++	unsigned int link_id;
+ 	int i;
+ 
+ 	switch (event->type) {
+@@ -3254,10 +3257,7 @@ mt7996_event_callback(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		if (event->u.mlme.data == ASSOC_EVENT &&
+ 		    event->u.mlme.status == MLME_SUCCESS) {
+ 			struct ieee80211_bss_conf *conf;
+-			struct mt7996_vif_link *mconf;
+-			struct mt7996_phy *phy;
+ 			unsigned long cur, valid_links = vif->valid_links ?: BIT(0);
+-			unsigned int link_id;
+ 			int next_time = INT_MAX;
+ 
+ 			mutex_lock(&dev->mt76.mutex);
+@@ -3298,6 +3298,39 @@ mt7996_event_callback(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 
+ 		cancel_delayed_work(&mvif->beacon_mon_work);
+ 		break;
++	case BCN_RX_EVENT:
++		link_id = event->u.bcn.link_id;
++		if (link_id >= IEEE80211_LINK_UNSPECIFIED)
++			return;
++
++		mutex_lock(&dev->mt76.mutex);
++		mconf = mt7996_vif_link(dev, vif, link_id);
++		if (!mconf) {
++			mvif->tx_paused_links &= ~BIT(link_id);
++			mutex_unlock(&dev->mt76.mutex);
++			break;
++		}
++
++		phy = mconf->phy;
++		mvif->beacon_received_time[phy->mt76->band_idx] = jiffies;
++		if (mvif->lost_links & BIT(link_id)) {
++			mvif->lost_links &= ~BIT(link_id);
++			mt76_sta_dbg(vif, "link %d: resume beacon monitoring", link_id);
++		}
++
++		/* resume TX */
++		if (mconf->state != MT7996_STA_CHSW_PAUSE_TX ||
++		    mconf->next_state == MT7996_STA_CHSW_RESUME_TX) {
++			mutex_unlock(&dev->mt76.mutex);
++			break;
++		}
++		mconf->next_state = MT7996_STA_CHSW_RESUME_TX;
++
++		mutex_unlock(&dev->mt76.mutex);
++
++		cancel_delayed_work(&mconf->sta_chsw_work);
++		ieee80211_queue_delayed_work(hw, &mconf->sta_chsw_work, 0);
++		break;
+ 	default:
+ 		break;
+ 	}
+-- 
+2.45.2
+

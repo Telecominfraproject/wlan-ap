@@ -1,0 +1,214 @@
+From 11bb00bf79d349a1dbb697b5b3bdbfd4b970ccee Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Thu, 26 Mar 2026 00:17:05 +0800
+Subject: [PATCH] mtk: hostapd: fix DFS bootup radar detection issues
+
+Fix the following DFS bootup radar detection issues
+1. When the target channel is unavailable (during NOP) and there are no
+other usable DFS channels to perform CAC, the bandwidth should be downgraded
+to select a suitable channel.
+2. When all channels are unavailable during bootup, then the link should wait
+for NOP expiration to trigger CAC on that channel.
+However, since the bss->links[].freq is not set, the bss cannot
+receive any radar events. Consequently, the link will never be setup.
+
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+---
+ src/ap/ap_drv_ops.c          | 49 +++++++++++++++++++++++++++++-------
+ src/ap/ap_drv_ops.h          |  1 +
+ src/ap/dfs.c                 | 20 +++++++++------
+ src/drivers/driver.h         | 13 ++++++++++
+ src/drivers/driver_nl80211.c | 16 ++++++++++++
+ 5 files changed, 82 insertions(+), 17 deletions(-)
+
+diff --git a/src/ap/ap_drv_ops.c b/src/ap/ap_drv_ops.c
+index d79480d79..6fff40ed6 100644
+--- a/src/ap/ap_drv_ops.c
++++ b/src/ap/ap_drv_ops.c
+@@ -1169,15 +1169,6 @@ int hostapd_start_dfs_cac(struct hostapd_iface *iface,
+ 	}
+ 	data.radar_background = radar_background;
+ 	data.dfs_state_update = update_state;
+-	data.link_id = -1;
+-
+-#ifdef CONFIG_IEEE80211BE
+-	if (hapd->conf->mld_ap) {
+-		data.link_id = hapd->mld_link_id;
+-		wpa_printf(MSG_DEBUG,
+-			   "hostapd_start_dfs_cac: link_id=%d", data.link_id);
+-	}
+-#endif /* CONFIG_IEEE80211BE */
+ 
+ 	data.link_id = -1;
+ #ifdef CONFIG_IEEE80211BE
+@@ -1198,6 +1189,46 @@ int hostapd_start_dfs_cac(struct hostapd_iface *iface,
+ }
+ 
+ 
++int hostapd_wait_dfs_nop(struct hostapd_iface *iface, int freq)
++{
++	struct hostapd_hw_modes *cmode = iface->current_mode;
++	struct hostapd_data *hapd = iface->bss[0];
++	struct hostapd_channel_data *chan;
++	bool valid = false;
++	s8 link_id = -1;
++	int i;
++
++	if (!hapd->driver || !hapd->driver->wait_dfs_nop || !cmode)
++		return 0;
++
++	if (!iface->conf->ieee80211h) {
++		wpa_printf(MSG_ERROR, "DFS functionality is not enabled");
++		return -1;
++	}
++
++	for (i = 0; i < cmode->num_channels; i++) {
++		chan = &cmode->channels[i];
++		if (chan->freq != freq)
++			continue;
++
++		valid = true;
++		break;
++	}
++
++	if (!valid) {
++		wpa_printf(MSG_ERROR, "Invalid frequency %d", freq);
++		return -1;
++	}
++
++#ifdef CONFIG_IEEE80211BE
++	if (hapd->conf->mld_ap)
++		link_id = hapd->mld_link_id;
++#endif /* CONFIG_IEEE80211BE */
++
++	return hapd->driver->wait_dfs_nop(hapd->drv_priv, link_id, freq);
++}
++
++
+ int hostapd_drv_set_qos_map(struct hostapd_data *hapd,
+ 			    const u8 *qos_map_set, u8 qos_map_set_len)
+ {
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index 7888cfeac..086879cc6 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -149,6 +149,7 @@ int hostapd_start_dfs_cac(struct hostapd_iface *iface,
+ 			  int sec_channel_offset, int oper_chwidth,
+ 			  int center_segment0, int center_segment1,
+ 			  bool radar_background, bool update_state);
++int hostapd_wait_dfs_nop(struct hostapd_iface *iface, int freq);
+ int hostapd_drv_do_acs(struct hostapd_data *hapd);
+ int hostapd_drv_update_dh_ie(struct hostapd_data *hapd, const u8 *peer,
+ 			     u16 reason_code, const u8 *ie, size_t ielen);
+diff --git a/src/ap/dfs.c b/src/ap/dfs.c
+index 07a592a8e..65448c92b 100644
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -646,15 +646,20 @@ dfs_get_valid_channel(struct hostapd_iface *iface,
+ static int dfs_set_valid_channel(struct hostapd_iface *iface, int skip_radar)
+ {
+ 	struct hostapd_channel_data *channel;
++	enum dfs_channel_type channel_type;
+ 	u8 cf1 = 0, cf2 = 0;
+ 	int sec = 0;
+ 
++	channel_type = skip_radar ? DFS_AVAILABLE : DFS_ANY_CHANNEL;
+ 	channel = dfs_get_valid_channel(iface, &sec, &cf1, &cf2,
+-					skip_radar ? DFS_AVAILABLE :
+-					DFS_ANY_CHANNEL);
++					channel_type);
+ 	if (!channel) {
+-		wpa_printf(MSG_ERROR, "could not get valid channel");
+-		return -1;
++		channel = dfs_downgrade_bandwidth(iface, &sec, &cf1, &cf2,
++						  &channel_type);
++		if (!channel) {
++			wpa_printf(MSG_ERROR, "could not get valid channel");
++			return -1;
++		}
+ 	}
+ 
+ 	iface->freq = channel->freq;
+@@ -874,8 +879,7 @@ static unsigned int dfs_get_cac_time(struct hostapd_iface *iface,
+ int hostapd_handle_dfs(struct hostapd_iface *iface)
+ {
+ 	struct hostapd_channel_data *channel;
+-	int res, n_chans, n_chans1, start_chan_idx, start_chan_idx1;
+-	int sec = 0, skip_radar = 0;
++	int res, n_chans, n_chans1, start_chan_idx, start_chan_idx1, sec = 0;
+ 	u8 cf1 = 0, cf2 = 0;
+ 	bool use_radar_background = dfs_use_radar_background(iface);
+ 	enum dfs_channel_type channel_type = DFS_NO_CAC_YET;
+@@ -932,9 +936,9 @@ int hostapd_handle_dfs(struct hostapd_iface *iface)
+ 		wpa_printf(MSG_DEBUG, "DFS %d chans unavailable - choose other channel: %s",
+ 			   res, res ? "yes": "no");
+ 		if (res) {
+-			if (dfs_set_valid_channel(iface, skip_radar) < 0) {
++			if (dfs_set_valid_channel(iface, 0) < 0) {
+ 				hostapd_set_state(iface, HAPD_IFACE_DFS);
+-				return 0;
++				return hostapd_wait_dfs_nop(iface, iface->freq);
+ 			}
+ 		}
+ 	} while (res);
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 61e8facb3..f77f708d9 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -4976,6 +4976,19 @@ struct wpa_driver_ops {
+ 	 */
+ 	int (*start_dfs_cac)(void *priv, struct hostapd_freq_params *freq);
+ 
++	/**
++	 * wait_dfs_nop - Wait for NOP to finish to start radar detection
++	 * @priv: Private driver interface data
++	 * @link_id: Link ID of the specified link; -1 for non-MLD
++	 * @freq: Channel frequency
++	 * Returns: 0 on success, -1 on failure
++	 *
++	 * This callback is used when hostapd is started while all channels
++	 * are unavailable. The freq of the bss is set to receive the NOP
++	 * finish event.
++	 */
++	int (*wait_dfs_nop)(void *priv, s8 link_id, int freq);
++
+ 	/**
+ 	 * stop_ap - Removes beacon from AP
+ 	 * @priv: Private driver interface data
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index acacc1bb6..804285678 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -11547,6 +11547,21 @@ static int nl80211_start_radar_detection(void *priv,
+ 	return -1;
+ }
+ 
++static int nl80211_wait_dfs_nop(void *priv, s8 link_id, int freq)
++{
++	struct i802_bss *bss = priv;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++
++	if (!(drv->capa.flags & WPA_DRIVER_FLAGS_RADAR)) {
++		wpa_printf(MSG_DEBUG,
++			   "nl80211: Driver does not support radar detection");
++		return -1;
++	}
++
++	nl80211_link_set_freq(bss, link_id, freq);
++	return 0;
++}
++
+ #ifdef CONFIG_TDLS
+ 
+ static int nl80211_add_peer_capab(struct nl_msg *msg,
+@@ -17680,6 +17695,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.poll_client = nl80211_poll_client,
+ 	.set_p2p_powersave = nl80211_set_p2p_powersave,
+ 	.start_dfs_cac = nl80211_start_radar_detection,
++	.wait_dfs_nop = nl80211_wait_dfs_nop,
+ 	.stop_ap = wpa_driver_nl80211_stop_ap,
+ #ifdef CONFIG_TDLS
+ 	.send_tdls_mgmt = nl80211_send_tdls_mgmt,
+-- 
+2.45.2
+

@@ -1,0 +1,422 @@
+From 507b00a752a81bd0a6bd6c1c1e70ee8f9ca3c6ce Mon Sep 17 00:00:00 2001
+From: Howard Hsu <howard-yh.hsu@mediatek.com>
+Date: Wed, 17 Sep 2025 18:35:57 +0800
+Subject: [PATCH 129/137] mtk: mac80211: add support twt setup for multi-link
+ operation
+
+Change the TWT setup and teardown functions to use ieee80211_sta
+and link_id, improving the handling of link-specific operations and
+ensuring compatiability with multi-link devices.
+
+Signed-off-by: Howard Hsu <howard-yh.hsu@mediatek.com>
+---
+ include/net/mac80211.h    |  4 +-
+ net/mac80211/cfg.c        | 80 ++++++++++++++++++++++++---------------
+ net/mac80211/driver-ops.h | 12 +++---
+ net/mac80211/s1g.c        | 29 ++++++++------
+ net/mac80211/trace.h      | 26 ++++++++-----
+ 5 files changed, 92 insertions(+), 59 deletions(-)
+
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index cb17958c..c8e4de5b 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -4974,10 +4974,10 @@ struct ieee80211_ops {
+ 				      struct ieee80211_vif *vif,
+ 				      struct ieee80211_sta *sta, bool enabled);
+ 	int (*add_twt_setup)(struct ieee80211_hw *hw,
+-			     struct ieee80211_sta *sta,
++			     struct ieee80211_sta *sta, u8 link_id,
+ 			     struct ieee80211_twt_setup *twt);
+ 	int (*twt_teardown_request)(struct ieee80211_hw *hw,
+-				    struct ieee80211_sta *sta,
++				    struct ieee80211_sta *sta, u8 link_id,
+ 				    struct ieee80211_twt_teardown *td);
+ 	int (*add_btwt)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			u8 link_id, struct cfg80211_broadcast_twt_settings *btwt);
+diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
+index 793ea4c0..8174f45b 100644
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -1945,37 +1945,47 @@ static int ieee80211_stop_ap(struct wiphy *wiphy, struct net_device *dev,
+ 
+ static int process_btwt_id_0(struct ieee80211_local *local,
+ 			     struct ieee80211_sub_if_data *sdata,
+-			     struct sta_info *sta,
+-			     bool add)
++			     struct sta_info *sta)
+ {
+-	int ret = -EINVAL;
++	struct ieee80211_link_sta *link_sta;
++	struct ieee80211_twt_setup *twt;
++	unsigned int link_id;
++	int ret;
+ 
+ 	if (!sta->sta.btwt)
+-		return ret;
+-
+-	if (add) {
+-		struct ieee80211_twt_setup *twt;
+-
+-		twt = kzalloc(sizeof(*twt) + sizeof(struct ieee80211_twt_params),
+-			      GFP_KERNEL);
+-		if (!twt)
+-			return -ENOMEM;
++		return -EINVAL;
+ 
+-		twt->control |= IEEE80211_TWT_NEGO_TYPE_BTWT_MBR_MGMT << 2;
+-		ret = drv_add_twt_setup(local, sdata, &sta->sta, twt);
++	twt = kzalloc(sizeof(*twt) + sizeof(struct ieee80211_twt_params), GFP_KERNEL);
++	if (!twt)
++		return -ENOMEM;
+ 
+-		kfree(twt);
+-	} else {
+-		struct ieee80211_twt_teardown td;
++	twt->control |= IEEE80211_TWT_NEGO_TYPE_BTWT_MBR_MGMT << 2;
+ 
+-		memset(&td, 0, sizeof(td));
+-		td.neg_type = IEEE80211_TWT_NEGO_TYPE_BTWT_MBR_MGMT;
+-		ret = drv_twt_teardown_request(local, sdata, &sta->sta, &td);
++	for_each_sta_active_link(&sdata->vif, &sta->sta, link_sta, link_id) {
++		ret = drv_add_twt_setup(local, sdata, &sta->sta, link_id, twt);
++		if (ret)
++			break;
+ 	}
++	kfree(twt);
+ 
+ 	return ret;
+ }
+ 
++static void ieee80211_teardown_sta_btwt(struct ieee80211_local *local,
++					struct ieee80211_sub_if_data *sdata,
++					struct sta_info *sta, u8 link_id)
++{
++	struct ieee80211_twt_teardown td;
++
++	if (!sta->sta.btwt || !sdata->deflink.btwt_active_bitmap)
++		return;
++
++	memset(&td, 0, sizeof(td));
++	td.neg_type = IEEE80211_TWT_NEGO_TYPE_BTWT_MBR_MGMT;
++
++	drv_twt_teardown_request(local, sdata, &sta->sta, link_id, &td);
++}
++
+ static int sta_apply_auth_flags(struct ieee80211_local *local,
+ 				struct sta_info *sta,
+ 				u32 mask, u32 set)
+@@ -2478,22 +2488,27 @@ static int ieee80211_del_station(struct wiphy *wiphy, struct net_device *dev,
+ {
+ 	struct ieee80211_local *local = wiphy_priv(wiphy);
+ 	struct ieee80211_sub_if_data *sdata;
++	struct sta_info *sta;
+ 
+ 	sdata = IEEE80211_DEV_TO_SUB_IF(dev);
+ 
+-	if (sdata->vif.type == NL80211_IFTYPE_AP &&
+-	    sdata->deflink.btwt_active_bitmap & BIT(0)) {
+-		struct sta_info *sta = sta_info_get_bss(sdata, params->mac);
+-
+-		if (sta)
+-			process_btwt_id_0(local, sdata, sta, false);
++	if (!params->mac) {
++		sta_info_flush(sdata, params->link_id);
++		return 0;
+ 	}
+ 
+-	if (params->mac)
+-		return sta_info_destroy_addr_bss(sdata, params->mac);
++	if (sdata->vif.type == NL80211_IFTYPE_AP) {
++		sta = sta_info_get_bss(sdata, params->mac);
+ 
+-	sta_info_flush(sdata, params->link_id);
+-	return 0;
++		if (sta) {
++			int link_id = sta->sta.valid_links
++				? ffs(sta->sta.valid_links) - 1 : 0;
++
++			ieee80211_teardown_sta_btwt(local, sdata, sta, link_id);
++		}
++	}
++
++	return sta_info_destroy_addr_bss(sdata, params->mac);
+ }
+ 
+ static int ieee80211_change_station(struct wiphy *wiphy,
+@@ -2594,7 +2609,7 @@ static int ieee80211_change_station(struct wiphy *wiphy,
+ 	if (sdata->vif.type == NL80211_IFTYPE_AP &&
+ 	    test_sta_flag(sta, WLAN_STA_AUTHORIZED) &&
+ 	    sdata->deflink.btwt_active_bitmap & BIT(0))
+-		process_btwt_id_0(local, sdata, sta, true);
++		process_btwt_id_0(local, sdata, sta);
+ 
+ 	return 0;
+ }
+@@ -5681,6 +5696,7 @@ ieee80211_del_link_station(struct wiphy *wiphy, struct net_device *dev,
+ 			   struct link_station_del_parameters *params)
+ {
+ 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
++	struct ieee80211_local *local = wiphy_priv(wiphy);
+ 	struct sta_info *sta;
+ 
+ 	lockdep_assert_wiphy(sdata->local->hw.wiphy);
+@@ -5696,6 +5712,8 @@ ieee80211_del_link_station(struct wiphy *wiphy, struct net_device *dev,
+ 	if (sta->sta.valid_links == BIT(params->link_id))
+ 		return -EINVAL;
+ 
++	ieee80211_teardown_sta_btwt(local, sdata, sta, params->link_id);
++
+ 	ieee80211_sta_remove_link(sta, params->link_id);
+ 
+ 	return 0;
+diff --git a/net/mac80211/driver-ops.h b/net/mac80211/driver-ops.h
+index 8a4c0fec..d5e7fd65 100644
+--- a/net/mac80211/driver-ops.h
++++ b/net/mac80211/driver-ops.h
+@@ -1636,7 +1636,7 @@ static inline void drv_sta_set_decap_offload(struct ieee80211_local *local,
+ 
+ static inline int drv_add_twt_setup(struct ieee80211_local *local,
+ 				    struct ieee80211_sub_if_data *sdata,
+-				    struct ieee80211_sta *sta,
++				    struct ieee80211_sta *sta, u8 link_id,
+ 				    struct ieee80211_twt_setup *twt)
+ {
+ 	struct ieee80211_twt_params *twt_agrt;
+@@ -1650,8 +1650,8 @@ static inline int drv_add_twt_setup(struct ieee80211_local *local,
+ 
+ 	twt_agrt = (void *)twt->params;
+ 
+-	trace_drv_add_twt_setup(local, sta, twt, twt_agrt);
+-	ret = local->ops->add_twt_setup(&local->hw, sta, twt);
++	trace_drv_add_twt_setup(local, sta, link_id, twt, twt_agrt);
++	ret = local->ops->add_twt_setup(&local->hw, sta, link_id, twt);
+ 	trace_drv_return_int(local, ret);
+ 
+ 	return ret;
+@@ -1659,7 +1659,7 @@ static inline int drv_add_twt_setup(struct ieee80211_local *local,
+ 
+ static inline int drv_twt_teardown_request(struct ieee80211_local *local,
+ 					   struct ieee80211_sub_if_data *sdata,
+-					   struct ieee80211_sta *sta,
++					   struct ieee80211_sta *sta, u8 link_id,
+ 					   struct ieee80211_twt_teardown *td)
+ {
+ 	int ret = -EINVAL;
+@@ -1672,8 +1672,8 @@ static inline int drv_twt_teardown_request(struct ieee80211_local *local,
+ 	if (!local->ops->twt_teardown_request)
+ 		return ret;
+ 
+-	trace_drv_twt_teardown_request(local, sta, td);
+-	ret = local->ops->twt_teardown_request(&local->hw, sta, td);
++	trace_drv_twt_teardown_request(local, sta, link_id, td);
++	ret = local->ops->twt_teardown_request(&local->hw, sta, link_id, td);
+ 	trace_drv_return_int(local, ret);
+ 
+ 	return ret;
+diff --git a/net/mac80211/s1g.c b/net/mac80211/s1g.c
+index 33c55de4..6b52fa8f 100644
+--- a/net/mac80211/s1g.c
++++ b/net/mac80211/s1g.c
+@@ -96,7 +96,7 @@ ieee80211_s1g_send_twt_teardown(struct ieee80211_sub_if_data *sdata,
+ 
+ static int
+ ieee80211_s1g_handle_twt_demand_setup(struct ieee80211_sub_if_data *sdata,
+-				      struct sk_buff *skb)
++				      struct sk_buff *skb, u8 link_id)
+ {
+ 	const size_t fixed_len = offsetof(struct ieee80211_twt_params, bcast.rtwt);
+ 	struct ieee80211_mgmt *mgmt = (void *)skb->data;
+@@ -143,8 +143,8 @@ ieee80211_s1g_handle_twt_demand_setup(struct ieee80211_sub_if_data *sdata,
+ 		return -ENOSPC;
+ 
+ 	settings.id = ffz(sdata->deflink.btwt_active_bitmap | BIT(0));
+-	/* FIXME: The link id shall be decided based on the effective link. */
+-	ret = drv_add_btwt(sdata->local, sdata, 0, &settings);
++
++	ret = drv_add_btwt(sdata->local, sdata, link_id, &settings);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -161,7 +161,7 @@ ieee80211_s1g_handle_twt_demand_setup(struct ieee80211_sub_if_data *sdata,
+ 
+ static void
+ ieee80211_s1g_rx_twt_setup(struct ieee80211_sub_if_data *sdata,
+-			   struct sta_info *sta, struct sk_buff *skb)
++			   struct sta_info *sta, struct sk_buff *skb, u8 link_id)
+ {
+ 	struct ieee80211_mgmt *mgmt = (void *)skb->data;
+ 	struct ieee80211_twt_setup *twt = (void *)mgmt->u.action.u.s1g.variable;
+@@ -171,7 +171,7 @@ ieee80211_s1g_rx_twt_setup(struct ieee80211_sub_if_data *sdata,
+ 	if (twt->control & IEEE80211_TWT_CONTROL_NEG_TYPE_BROADCAST &&
+ 	    (le16_get_bits(twt_agrt->req_type, IEEE80211_TWT_REQTYPE_SETUP_CMD) ==
+ 	     TWT_SETUP_CMD_DEMAND)) {
+-		ret = ieee80211_s1g_handle_twt_demand_setup(sdata, skb);
++		ret = ieee80211_s1g_handle_twt_demand_setup(sdata, skb, link_id);
+ 		if (ret) {
+ 			le16p_replace_bits(&twt_agrt->req_type, TWT_SETUP_CMD_REJECT,
+ 					   IEEE80211_TWT_REQTYPE_SETUP_CMD);
+@@ -180,7 +180,7 @@ ieee80211_s1g_rx_twt_setup(struct ieee80211_sub_if_data *sdata,
+ 		}
+ 	}
+ 
+-	ret = drv_add_twt_setup(sdata->local, sdata, &sta->sta, twt);
++	ret = drv_add_twt_setup(sdata->local, sdata, &sta->sta, link_id, twt);
+ 	if (ret)
+ 		pr_info("%s: Handle add twt setup failed: %d\n", __func__, ret);
+ 
+@@ -195,7 +195,7 @@ send_rsp:
+ 
+ static void
+ ieee80211_s1g_rx_twt_teardown(struct ieee80211_sub_if_data *sdata,
+-			      struct sta_info *sta, struct sk_buff *skb)
++			      struct sta_info *sta, struct sk_buff *skb, u8 link_id)
+ {
+ 	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)skb->data;
+ 	struct ieee80211_twt_teardown *td = (void *)mgmt->u.action.u.s1g.variable;
+@@ -203,17 +203,19 @@ ieee80211_s1g_rx_twt_teardown(struct ieee80211_sub_if_data *sdata,
+ 	if (td->all)
+ 		return; /* Not supported yet */
+ 
+-	drv_twt_teardown_request(sdata->local, sdata, &sta->sta, td);
++	drv_twt_teardown_request(sdata->local, sdata, &sta->sta, link_id, td);
+ }
+ 
+ static void
+ ieee80211_s1g_tx_twt_setup_fail(struct ieee80211_sub_if_data *sdata,
+ 				struct sta_info *sta, struct sk_buff *skb)
+ {
++	struct ieee80211_rx_status *rx_status = IEEE80211_SKB_RXCB(skb);
+ 	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)skb->data;
+ 	struct ieee80211_twt_setup *twt = (void *)mgmt->u.action.u.s1g.variable;
+ 	struct ieee80211_twt_params *twt_agrt = (void *)twt->params;
+ 	struct ieee80211_twt_teardown td;
++	u8 link_id;
+ 
+ 	if (twt->control & IEEE80211_TWT_CONTROL_NEG_TYPE_BROADCAST) {
+ 		td.id = le16_get_bits(twt_agrt->bcast.btwt_info,
+@@ -224,7 +226,8 @@ ieee80211_s1g_tx_twt_setup_fail(struct ieee80211_sub_if_data *sdata,
+ 				      IEEE80211_TWT_REQTYPE_FLOWID);
+ 	}
+ 
+-	drv_twt_teardown_request(sdata->local, sdata, &sta->sta, &td);
++	link_id = rx_status->link_valid ? rx_status->link_id : 0;
++	drv_twt_teardown_request(sdata->local, sdata, &sta->sta, link_id, &td);
+ 
+ 	ieee80211_s1g_send_twt_teardown(sdata, mgmt->sa, sdata->vif.addr, &td);
+ }
+@@ -234,7 +237,9 @@ void ieee80211_s1g_rx_twt_action(struct ieee80211_sub_if_data *sdata,
+ {
+ 	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)skb->data;
+ 	struct ieee80211_local *local = sdata->local;
++	struct ieee80211_rx_status *rx_status = IEEE80211_SKB_RXCB(skb);
+ 	struct sta_info *sta;
++	u8 link_id;
+ 
+ 	lockdep_assert_wiphy(local->hw.wiphy);
+ 
+@@ -242,12 +247,14 @@ void ieee80211_s1g_rx_twt_action(struct ieee80211_sub_if_data *sdata,
+ 	if (!sta)
+ 		return;
+ 
++	link_id = rx_status->link_valid ? rx_status->link_id : 0;
++
+ 	switch (mgmt->u.action.u.s1g.action_code) {
+ 	case WLAN_S1G_TWT_SETUP:
+-		ieee80211_s1g_rx_twt_setup(sdata, sta, skb);
++		ieee80211_s1g_rx_twt_setup(sdata, sta, skb, link_id);
+ 		break;
+ 	case WLAN_S1G_TWT_TEARDOWN:
+-		ieee80211_s1g_rx_twt_teardown(sdata, sta, skb);
++		ieee80211_s1g_rx_twt_teardown(sdata, sta, skb, link_id);
+ 		break;
+ 	default:
+ 		break;
+diff --git a/net/mac80211/trace.h b/net/mac80211/trace.h
+index 416e6202..4cca42ea 100644
+--- a/net/mac80211/trace.h
++++ b/net/mac80211/trace.h
+@@ -2492,10 +2492,11 @@ DEFINE_EVENT(sta_flag_evt, drv_sta_set_decap_offload,
+ TRACE_EVENT(drv_add_twt_setup,
+ 	TP_PROTO(struct ieee80211_local *local,
+ 		 struct ieee80211_sta *sta,
++		 u8 link_id,
+ 		 struct ieee80211_twt_setup *twt,
+ 		 struct ieee80211_twt_params *twt_agrt),
+ 
+-	TP_ARGS(local, sta, twt, twt_agrt),
++	TP_ARGS(local, sta, link_id, twt, twt_agrt),
+ 
+ 	TP_STRUCT__entry(
+ 		LOCAL_ENTRY
+@@ -2507,11 +2508,12 @@ TRACE_EVENT(drv_add_twt_setup,
+ 		__field(u8, duration)
+ 		__field(__le16, mantissa)
+ 		__field(u8, channel)
++		__field(u32, link_id)
+ 	),
+ 
+ 	TP_fast_assign(
+ 		LOCAL_ASSIGN;
+-		STA_ASSIGN;
++		STA_NAMED_ASSIGN(sta);
+ 		__entry->dialog_token = twt->dialog_token;
+ 		__entry->control = twt->control;
+ 		__entry->req_type = twt_agrt->req_type;
+@@ -2519,14 +2521,16 @@ TRACE_EVENT(drv_add_twt_setup,
+ 		__entry->duration = twt_agrt->indiv.min_twt_dur;
+ 		__entry->mantissa = twt_agrt->indiv.mantissa;
+ 		__entry->channel = twt_agrt->indiv.channel;
++		__entry->link_id = link_id;
+ 	),
+ 
+ 	TP_printk(
+ 		LOCAL_PR_FMT STA_PR_FMT
+-		" token:%d control:0x%02x req_type:0x%04x"
++		" (link %d) token:%d control:0x%02x req_type:0x%04x"
+ 		" twt:%llu duration:%d mantissa:%d channel:%d",
+-		LOCAL_PR_ARG, STA_PR_ARG, __entry->dialog_token,
+-		__entry->control, le16_to_cpu(__entry->req_type),
++		LOCAL_PR_ARG, STA_PR_ARG, __entry->link_id,
++		__entry->dialog_token, __entry->control,
++		le16_to_cpu(__entry->req_type),
+ 		le64_to_cpu(__entry->twt), __entry->duration,
+ 		le16_to_cpu(__entry->mantissa), __entry->channel
+ 	)
+@@ -2535,25 +2539,29 @@ TRACE_EVENT(drv_add_twt_setup,
+ TRACE_EVENT(drv_twt_teardown_request,
+ 	TP_PROTO(struct ieee80211_local *local,
+ 		 struct ieee80211_sta *sta,
++		 u8 link_id,
+ 		 struct ieee80211_twt_teardown *td),
+ 
+-	TP_ARGS(local, sta, td),
++	TP_ARGS(local, sta, link_id, td),
+ 
+ 	TP_STRUCT__entry(
+ 		LOCAL_ENTRY
+ 		STA_ENTRY
+ 		__field(u8, flowid)
++		__field(u32, link_id)
+ 	),
+ 
+ 	TP_fast_assign(
+ 		LOCAL_ASSIGN;
+-		STA_ASSIGN;
++		STA_NAMED_ASSIGN(sta);
+ 		__entry->flowid = td->id;
++		__entry->link_id = link_id;
+ 	),
+ 
+ 	TP_printk(
+-		LOCAL_PR_FMT STA_PR_FMT " flowid:%d",
+-		LOCAL_PR_ARG, STA_PR_ARG, __entry->flowid
++		LOCAL_PR_FMT STA_PR_FMT " (link %d) flowid:%d",
++		LOCAL_PR_ARG, STA_PR_ARG, __entry->link_id,
++		__entry->flowid
+ 	)
+ );
+ 
+-- 
+2.45.2
+

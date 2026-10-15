@@ -1,0 +1,210 @@
+From fd02c20190d3daf7f6983d5e472d266eba13d178 Mon Sep 17 00:00:00 2001
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Tue, 18 Nov 2025 20:56:46 +0800
+Subject: [PATCH 37/89] mtk: mt76: mt7996: consider multiple channel switch
+ commands for MLD AP
+
+---
+ channel.c       |  2 ++
+ mac80211.c      |  1 +
+ mt76.h          |  5 +++++
+ mt7996/main.c   | 53 +++++++++++++++++++++++++++++++++++++++++--------
+ mt7996/mcu.c    |  4 ++++
+ mt7996/mt7996.h |  2 ++
+ 6 files changed, 59 insertions(+), 8 deletions(-)
+
+diff --git a/channel.c b/channel.c
+index d9f8529db..06e22ebef 100644
+--- a/channel.c
++++ b/channel.c
+@@ -131,6 +131,7 @@ int mt76_assign_vif_chanctx(struct ieee80211_hw *hw,
+ 	}
+ 
+ 	mlink->ctx = conf;
++	mvif->band_to_link[phy->band_idx] = link_id;
+ 	ret = dev->drv->vif_link_add(phy, vif, link_conf, mlink);
+ 	if (ret) {
+ 		if (mlink_alloc)
+@@ -178,6 +179,7 @@ void mt76_unassign_vif_chanctx(struct ieee80211_hw *hw,
+ 
+ 	dev->drv->vif_link_remove(phy, vif, link_conf, mlink);
+ 	mlink->ctx = NULL;
++	mlink->mvif->band_to_link[phy->band_idx] = IEEE80211_LINK_UNSPECIFIED;
+ 
+ 	if (mlink != (struct mt76_vif_link *)vif->drv_priv)
+ 		kfree_rcu(mlink, rcu_head);
+diff --git a/mac80211.c b/mac80211.c
+index 993da3e15..70aea0ee0 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1069,6 +1069,7 @@ int mt76_set_channel(struct mt76_phy *phy, struct cfg80211_chan_def *chandef,
+ 
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(mt76_set_channel);
+ 
+ int mt76_update_channel(struct mt76_phy *phy)
+ {
+diff --git a/mt76.h b/mt76.h
+index fa46bc2fb..88de215fc 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -851,6 +851,8 @@ struct mt76_vif_data {
+ 	struct mt76_phy *roc_phy;
+ 	u16 valid_links;
+ 	u8 deflink_id;
++
++	u8 band_to_link[__MT_MAX_BAND];
+ };
+ 
+ struct mt76_phy {
+@@ -2098,6 +2100,9 @@ mt76_vif_init(struct ieee80211_vif *vif, struct mt76_vif_data *mvif)
+ 
+ 	mlink->mvif = mvif;
+ 	rcu_assign_pointer(mvif->link[0], mlink);
++
++	memset(mvif->band_to_link, IEEE80211_LINK_UNSPECIFIED,
++	       sizeof(mvif->band_to_link));
+ }
+ 
+ void mt76_vif_cleanup(struct mt76_dev *dev, struct ieee80211_vif *vif);
+diff --git a/mt7996/main.c b/mt7996/main.c
+index 181f3d744..9148dbaf4 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -517,6 +517,9 @@ static int mt7996_add_interface(struct ieee80211_hw *hw,
+ 	vif->offload_flags |= IEEE80211_OFFLOAD_ENCAP_4ADDR;
+ 	mvif->mt76.deflink_id = IEEE80211_LINK_UNSPECIFIED;
+ 
++	memset(mvif->cs_links, IEEE80211_LINK_UNSPECIFIED,
++	       sizeof(mvif->cs_links));
++
+ out:
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+@@ -915,30 +918,52 @@ mt7996_channel_switch_beacon(struct ieee80211_hw *hw,
+ 			     struct cfg80211_chan_def *chandef)
+ {
+ 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
++	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
+ 	struct mt7996_phy *phy = mt7996_band_phy(dev, chandef->chan->band);
+ 	struct ieee80211_bss_conf *link_conf;
++	u16 ready_links = 0;
+ 	unsigned int link_id;
++	int i;
+ 
+ 	mutex_lock(&dev->mt76.mutex);
++	link_id = mvif->mt76.band_to_link[phy->mt76->band_idx];
++	if (link_id == IEEE80211_LINK_UNSPECIFIED)
++		goto out;
+ 
+-	for_each_vif_active_link(vif, link_conf, link_id) {
+-		struct mt7996_vif_link *link =
+-			mt7996_vif_link(dev, vif, link_id);
++	for (i = 0; i < sizeof(mvif->cs_links); i++) {
++		if (mvif->cs_links[i] == IEEE80211_LINK_UNSPECIFIED) {
++			mvif->cs_links[i] = link_id;
++			ready_links |= BIT(link_id);
++			break;
++		}
+ 
+-		if (!link || link->phy != phy)
+-			continue;
++		ready_links |= BIT(mvif->cs_links[i]);
++	}
++
++	if (ready_links < vif->valid_links)
++		goto out;
++
++	for (i = 0; i < sizeof(mvif->cs_links); i++) {
++		link_id = mvif->cs_links[i];
++		if (link_id == IEEE80211_LINK_UNSPECIFIED)
++			break;
++
++		link_conf = link_conf_dereference_protected(vif, link_id);
++		if (!link_conf)
++			break;
+ 
+ 		/* Reset beacon when channel switch triggered during CAC to let
+ 		 * FW correctly perform CSA countdown
+ 		 */
+-		if (!cfg80211_reg_can_beacon(hw->wiphy, &phy->mt76->chandef,
++		if (i == 0 &&
++		    !cfg80211_reg_can_beacon(hw->wiphy, &phy->mt76->chandef,
+ 					     vif->type))
+ 			mt7996_mcu_add_beacon(hw, vif, link_conf, false);
+ 
+ 		mt7996_mcu_add_beacon(hw, vif, link_conf, true);
+-		break;
+ 	}
+ 
++out:
+ 	mutex_unlock(&dev->mt76.mutex);
+ }
+ 
+@@ -949,9 +974,13 @@ mt7996_post_channel_switch(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	struct cfg80211_chan_def *chandef = &link_conf->chanreq.oper;
+ 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
+ 	struct mt7996_phy *phy = mt7996_band_phy(dev, chandef->chan->band);
++	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
+ 	struct mt7996_vif_link *link;
+ 	int ret = -EINVAL;
+ 
++	if (mvif->cs_links[0] != link_conf->link_id)
++		return 0;
++
+ 	mutex_lock(&dev->mt76.mutex);
+ 
+ 	link = mt7996_vif_conf_link(dev, vif, link_conf);
+@@ -965,11 +994,19 @@ mt7996_post_channel_switch(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	ieee80211_iterate_stations_mtx(hw, mt7996_mcu_update_sta_rec_bw, link);
+ 
+ 	ret = mt7996_mcu_rdd_resume_tx(phy);
++	if (ret)
++		goto out;
+ 
+ out:
++	memset(mvif->cs_links, IEEE80211_LINK_UNSPECIFIED,
++	       sizeof(mvif->cs_links));
++
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+-	return ret;
++	if (ret || phy->mt76->dfs_state != MT_DFS_STATE_CAC)
++		return ret;
++
++	return mt76_set_channel(phy->mt76, chandef, false);
+ }
+ 
+ static void
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index dee3b19b0..345bf9b8d 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -425,6 +425,10 @@ mt7996_mcu_csa_finish(void *priv, u8 *mac, struct ieee80211_vif *vif)
+ 		return;
+ 
+ 	ieee80211_csa_finish(vif, link_conf->link_id);
++	/* remove CSA for affiliated links */
++	valid_links = vif->valid_links & ~BIT(link_conf->link_id);
++	for_each_set_bit(link_id, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS)
++		ieee80211_csa_finish(vif, link_id);
+ }
+ 
+ static void
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index 12a3b2495..ff8ad7fc8 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -296,6 +296,8 @@ struct mt7996_vif {
+ 
+ 	u8 mld_group_idx;
+ 	u8 mld_remap_idx;
++
++	u8 cs_links[__MT_MAX_BAND];
+ };
+ 
+ /* crash-dump */
+-- 
+2.45.2
+

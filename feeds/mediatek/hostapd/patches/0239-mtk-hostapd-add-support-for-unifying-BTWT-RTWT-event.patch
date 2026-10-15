@@ -1,0 +1,491 @@
+From 38094f5056a031054ddf4956a1c97a2cdd4f0c7a Mon Sep 17 00:00:00 2001
+From: Howard Hsu <howard-yh.hsu@mediatek.com>
+Date: Fri, 12 Sep 2025 09:57:13 +0800
+Subject: [PATCH 239/260] mtk: hostapd: add support for unifying BTWT/RTWT
+ event handling
+
+Add unified event handling for Broadcast TWT and Restricted TWT by
+introducing NL80211_CMD_ADD_BROADCAST_TWT event support. This allows the
+kernel to notify hostapd about BTWT/RTWT schedule changes through a
+single event path, enabling proper beacon updates.
+
+Signed-off-by: Howard Hsu <howard-yh.hsu@mediatek.com>
+---
+ hostapd/ctrl_iface.c               | 66 ++++++++++++++----------
+ src/ap/drv_callbacks.c             | 38 ++++++++++++++
+ src/ap/hostapd.c                   |  3 ++
+ src/ap/ieee802_11_he.c             | 14 +++--
+ src/common/ieee802_11_defs.h       | 14 +++++
+ src/drivers/driver.h               | 23 ++++++++-
+ src/drivers/driver_nl80211.c       |  5 +-
+ src/drivers/driver_nl80211_event.c | 83 ++++++++++++++++++++++++++++++
+ 8 files changed, 213 insertions(+), 33 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index c7fa7e84b..7438ba42b 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -2891,12 +2891,14 @@ hostapd_ctrl_iface_add_broadcast_twt(struct hostapd_data *hapd, char *cmd,
+ 				     char *buf, size_t buflen)
+ {
+ 	char *pos = cmd, *end;
++	struct broadcast_twt_entry *entry;
+ 	struct broadcast_twt_param *param;
+ 
+-	param = os_malloc(sizeof(*param));
+-	if (param == NULL)
++	entry = os_zalloc(sizeof(*entry));
++	if (entry == NULL)
+ 		return -ENOBUFS;
+ 
++	param = &entry->btwt;
+ 	param->id = strtol(pos, &end, 10);
+ 	if (pos == end) {
+ 		wpa_printf(MSG_ERROR, "broadcast_twt: invalid btwt id");
+@@ -2925,9 +2927,6 @@ hostapd_ctrl_iface_add_broadcast_twt(struct hostapd_data *hapd, char *cmd,
+ 	}
+ 	pos = end;
+ 
+-	param->trigger = 0;
+-	param->flow_type = 0;
+-	param->recommendation = 0;
+ 	param->persist = 255;
+ 
+ 	pos = os_strstr(cmd, "trigger=");
+@@ -2946,9 +2945,18 @@ hostapd_ctrl_iface_add_broadcast_twt(struct hostapd_data *hapd, char *cmd,
+ 	if (pos)
+ 		param->persist = atoi(pos + 8);
+ 
+-	if (param->id > 31 ||
+-	    param->wake_intv_exp > 31 ||
+-	    param->recommendation > 7) {
++	pos = os_strstr(cmd, "dl_tid_bitmap=");
++	if (pos)
++		param->rtwt.dl_tid_bmp = strtol(pos + 14, NULL, 0);
++
++	pos = os_strstr(cmd, "ul_tid_bitmap=");
++	if (pos)
++		param->rtwt.ul_tid_bmp = strtol(pos + 14, NULL, 0);
++
++	if (param->id > 31 || param->wake_intv_exp > 31 ||
++	    param->recommendation > 4 ||
++	    (param->recommendation != 4 &&
++	     (param->rtwt.dl_tid_bmp != 0 || param->rtwt.ul_tid_bmp != 0))) {
+ 		wpa_printf(MSG_ERROR, "broadcast_twt: invalid argument");
+ 		goto fail;
+ 	}
+@@ -2959,20 +2967,23 @@ hostapd_ctrl_iface_add_broadcast_twt(struct hostapd_data *hapd, char *cmd,
+ 	}
+ 
+ 	hapd->broadcast_twt_cnt++;
+-	dl_list_add_tail(&hapd->btwt_sp_list, &param->list);
++	dl_list_add_tail(&hapd->btwt_sp_list, &entry->list);
+ 	ieee802_11_set_beacon_per_bss_only(hapd);
+ 
+ 	return os_snprintf(buf, buflen, "broadcast_twt: id=%hhu min_wake_dur=%hhu "
+ 			   "wake_intv_mantissa=%hu wake_intv_exp=%hu "
+ 			   "trigger=%hhu flow_type=%hhu "
+-			   "recommendation=%hhu persist=%hhu in bssid=" MACSTR "\n",
++			   "recommendation=%hhu persist=%hhu "
++			   "restricted_twt: dl_tid_bitmap=0x%02x ul_tid_bitmap=0x%02x "
++			   "in bssid=" MACSTR "\n",
+ 			   param->id, param->min_wake_dur, param->wake_intv_mantissa,
+ 			   param->wake_intv_exp, param->trigger, param->flow_type,
+ 			   param->recommendation, param->persist,
++			   param->rtwt.dl_tid_bmp, param->rtwt.ul_tid_bmp,
+ 			   MAC2STR(hapd->own_addr));
+ 
+ fail:
+-	os_free(param);
++	os_free(entry);
+ 	return -1;
+ }
+ 
+@@ -2983,7 +2994,7 @@ hostapd_ctrl_iface_del_broadcast_twt(struct hostapd_data *hapd, char *cmd,
+ 	char *pos = cmd, *end;
+ 	bool found = false;
+ 	int ret;
+-	struct broadcast_twt_param *param, *iter;
++	struct broadcast_twt_entry *entry, *iter;
+ 	u8 id;
+ 
+ 	if (hapd->broadcast_twt_cnt == 0) {
+@@ -3003,9 +3014,9 @@ hostapd_ctrl_iface_del_broadcast_twt(struct hostapd_data *hapd, char *cmd,
+ 		return -1;
+ 	}
+ 
+-	dl_list_for_each_safe(param, iter, &hapd->btwt_sp_list,
+-			      struct broadcast_twt_param, list) {
+-		if (param->id == id) {
++	dl_list_for_each_safe(entry, iter, &hapd->btwt_sp_list,
++			      struct broadcast_twt_entry, list) {
++		if (entry->btwt.id == id) {
+ 			found = true;
+ 			break;
+ 		}
+@@ -3017,12 +3028,12 @@ hostapd_ctrl_iface_del_broadcast_twt(struct hostapd_data *hapd, char *cmd,
+ 	}
+ 
+ 	hapd->broadcast_twt_cnt--;
+-	dl_list_del(&param->list);
++	dl_list_del(&entry->list);
+ 	ieee802_11_set_beacon_per_bss_only(hapd);
+ 	ret = os_snprintf(buf, buflen, "broadcast_twt: id=%hhu in bssid="
+-			  MACSTR " deleted\n", param->id,
++			  MACSTR " deleted\n", entry->btwt.id,
+ 			  MAC2STR(hapd->own_addr));
+-	os_free(param);
++	os_free(entry);
+ 	return ret;
+ }
+ 
+@@ -3031,7 +3042,7 @@ hostapd_ctrl_iface_get_broadcast_twt(struct hostapd_data *hapd, char *buf, size_
+ {
+ 	int ret;
+ 	char *pos, *end;
+-	struct broadcast_twt_param *param;
++	struct broadcast_twt_entry *entry;
+ 
+ 	pos = buf;
+ 	end = buf + buflen;
+@@ -3042,16 +3053,19 @@ hostapd_ctrl_iface_get_broadcast_twt(struct hostapd_data *hapd, char *buf, size_
+ 		return pos - buf;
+ 	pos += ret;
+ 
+-	dl_list_for_each(param, &hapd->btwt_sp_list,
+-			 struct broadcast_twt_param, list) {
++	dl_list_for_each(entry, &hapd->btwt_sp_list,
++			 struct broadcast_twt_entry, list) {
+ 		ret = os_snprintf(pos, end - pos, "id=%hhu min_wake_dur=%hhu "
+ 				  "wake_intv_mantissa=%hu wake_intv_exp=%hhu "
+ 				  "trigger=%hhu flow_type=%hhu "
+-				  "recommendation=%hhu persist=%hhu in bssid=" MACSTR "\n",
+-				  param->id, param->min_wake_dur,
+-				  param->wake_intv_mantissa, param->wake_intv_exp,
+-				  param->trigger, param->flow_type,
+-				  param->recommendation, param->persist,
++				  "recommendation=%hhu persist=%hhu "
++				  "restricted_twt: dl_tid_bitmap=0x%02x ul_tid_bitmap=0x%02x "
++				  "in bssid=" MACSTR "\n",
++				  entry->btwt.id, entry->btwt.min_wake_dur,
++				  entry->btwt.wake_intv_mantissa, entry->btwt.wake_intv_exp,
++				  entry->btwt.trigger, entry->btwt.flow_type,
++				  entry->btwt.recommendation, entry->btwt.persist,
++				  entry->btwt.rtwt.dl_tid_bmp, entry->btwt.rtwt.ul_tid_bmp,
+ 				  MAC2STR(hapd->own_addr));
+ 
+ 		if (os_snprintf_error(end - pos, ret))
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 1fc07eb17..fdf315b94 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -2826,6 +2826,37 @@ static void hostapd_event_pp_bitmap_update(struct hostapd_data *hapd,
+ }
+ #endif /* CONFIG_IEEE80211BE */
+ 
++#ifdef CONFIG_IEEE80211AX
++static int hostapd_event_btwt_add(struct hostapd_data *hapd,
++				  union wpa_event_data *data)
++{
++	struct broadcast_twt_entry *entry = NULL, *it;
++	struct dl_list *list;
++
++	list = &hapd->btwt_sp_list;
++	dl_list_for_each(it, list, struct broadcast_twt_entry, list) {
++		if (it->btwt.id == data->btwt.id) {
++			entry = it;
++			break;
++		}
++	}
++	if (!entry) {
++		entry = os_zalloc(sizeof(*entry));
++		if (!entry)
++			return -1;
++
++		dl_list_add_tail(list, &entry->list);
++		hapd->broadcast_twt_cnt++;
++	}
++	os_memcpy(&entry->btwt, &data->btwt, sizeof(struct broadcast_twt_param));
++
++	ieee802_11_set_bss_critical_update(hapd,
++					   BSS_CRIT_UPDATE_EVENT_BCAST_TWT_PARAM_SET);
++	ieee802_11_set_beacon_per_bss_only(hapd);
++
++	return 0;
++}
++#endif /* CONFIG_IEEE80211AX */
+ 
+ void hostapd_wpa_event(void *ctx, enum wpa_event_type event,
+ 		       union wpa_event_data *data)
+@@ -3240,6 +3271,13 @@ void hostapd_wpa_event(void *ctx, enum wpa_event_type event,
+ 		hostapd_mld_interface_freed(hapd);
+ 		break;
+ #endif /* CONFIG_IEEE80211BE */
++#ifdef CONFIG_IEEE80211AX
++	case EVENT_BCAST_TWT_ADD:
++		if (!data)
++			break;
++		hostapd_event_btwt_add(hapd, data);
++		break;
++#endif /* CONFIG_IEEE80211AX */
+ 	default:
+ 		wpa_printf(MSG_DEBUG, "Unknown event %d", event);
+ 		break;
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 4df1284d9..36ab9ee6b 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -3290,6 +3290,9 @@ hostapd_alloc_bss_data(struct hostapd_iface *hapd_iface,
+ 	dl_list_init(&hapd->sae_commit_queue);
+ #endif /* CONFIG_SAE */
+ 	dl_list_init(&hapd->erp_keys);
++#ifdef CONFIG_IEEE80211AX
++	dl_list_init(&hapd->btwt_sp_list);
++#endif /* CONFIG_IEEE80211AX */
+ 
+ 	return hapd;
+ }
+diff --git a/src/ap/ieee802_11_he.c b/src/ap/ieee802_11_he.c
+index f016da235..56935ce83 100644
+--- a/src/ap/ieee802_11_he.c
++++ b/src/ap/ieee802_11_he.c
+@@ -596,7 +596,7 @@ size_t hostapd_eid_twt_len(struct hostapd_data *hapd)
+ 
+ u8 * hostapd_eid_twt(struct hostapd_data *hapd, u8 *eid)
+ {
+-	struct broadcast_twt_param *param;
++	struct broadcast_twt_entry *entry;
+ 	u8 *pos = eid;
+ 	u8 *control;
+ 	u8 cnt = 0;
+@@ -605,14 +605,15 @@ u8 * hostapd_eid_twt(struct hostapd_data *hapd, u8 *eid)
+ 		return eid;
+ 
+ 	*pos++ = WLAN_EID_TWT;
+-	*pos++ = 1 + hapd->broadcast_twt_cnt * sizeof(struct btwt_param_set_field); /* len */
++	*pos++ = 1 + hapd->broadcast_twt_cnt * sizeof(struct btwt_param_set_field);
+ 	control = pos++;
+ 
+ 	*control = TWT_CONTROL_NEG_TYPE_BROADCAST | TWT_CONTROL_RX_DISABLED;
+ 
+-	dl_list_for_each(param, &hapd->btwt_sp_list,
+-			 struct broadcast_twt_param, list) {
++	dl_list_for_each(entry, &hapd->btwt_sp_list,
++			 struct broadcast_twt_entry, list) {
+ 		struct btwt_param_set_field *btwt_ie = (struct btwt_param_set_field *) pos;
++		struct broadcast_twt_param *param = &entry->btwt;
+ 		u16 req_type = 0, btwt_info_val = 0;
+ 
+ 		req_type = TWT_SETUP_CMD_ACCEPT << 1;
+@@ -631,6 +632,11 @@ u8 * hostapd_eid_twt(struct hostapd_data *hapd, u8 *eid)
+ 
+ 		btwt_info_val = (param->id << 3);
+ 		btwt_info_val |= (param->persist << 8);
++
++		/* TODO: The value of RTWT Schedule Info subfield shall be based on
++		 * the availability of RTWT schedule. */
++		if (param->recommendation == BTWT_RECOMMENDATION_RESTRICTED)
++			btwt_info_val |= RTWT_SCHEDULE_INFO_ACTIVE << 1;
+ 		btwt_ie->btwt_info = host_to_le16(btwt_info_val);
+ 
+ 		pos += sizeof(*btwt_ie);
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index d2b426f3d..5d411376b 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -3434,4 +3434,18 @@ struct btwt_param_set_field {
+ 	le16 btwt_info;
+ } STRUCT_PACKED;
+ 
++
++/* IEEE 802.11be/D7.0, Table 9-348 Broadcast TWT Recommendation */
++enum btwt_recommendation {
++	BTWT_RECOMMENDATION_NO_CONSTRAINTS = 0,
++	BTWT_RECOMMENDATION_RESTRICTED = 4,
++};
++
++/* IEEE 802.11be/D7.0, Table 9-349a Restricted TWT Schedule Info subfield */
++enum rtwt_schedule_info {
++	RTWT_SCHEDULE_INFO_IDLE = 0,
++	RTWT_SCHEDULE_INFO_ACTIVE = 1,
++	RTWT_SCHEDULE_INFO_FULL = 2,
++	RTWT_SCHEDULE_INFO_MBSSID = 3,
++};
+ #endif /* IEEE802_11_DEFS_H */
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 83036179c..4ccf20fc1 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -3010,10 +3010,9 @@ struct cca_settings {
+ };
+ 
+ /**
+- * struct broadcast_twt_param - Parameters for broadcast TWT service period
++ * struct broadcast_twt_param - Parameters for broadcast/restricted TWT service period
+  */
+ struct broadcast_twt_param {
+-	struct dl_list list;
+ 	u8 id;
+ 	u8 min_wake_dur;
+ 	u16 wake_intv_mantissa;
+@@ -3022,6 +3021,16 @@ struct broadcast_twt_param {
+ 	bool flow_type;
+ 	u8 recommendation;
+ 	u8 persist;
++
++	struct rtwt_param {
++		u8 dl_tid_bmp;
++		u8 ul_tid_bmp;
++	} rtwt;
++};
++
++struct broadcast_twt_entry {
++	struct dl_list list;
++	struct broadcast_twt_param btwt;
+ };
+ 
+ /* TDLS peer capabilities for send_tdls_mgmt() */
+@@ -6644,6 +6653,11 @@ enum wpa_event_type {
+ 	 * EVENT_CRIT_UPDATE - Notification of the status of a critical update event
+ 	 */
+ 	EVENT_CRIT_UPDATE,
++
++	/**
++	 * EVENT_BCAST_TWT_ADD - Broadcast TWT parameters added/updated
++	 */
++	EVENT_BCAST_TWT_ADD,
+ };
+ 
+ 
+@@ -7690,6 +7704,11 @@ union wpa_event_data {
+ 			CRIT_UPDATE_FLAG,
+ 		} flag;
+ 	} crit_update_info;
++
++	/**
++	 * struct broadcast_twt_param - Data for EVENT_BCAST_TWT_ADD
++	 */
++	struct broadcast_twt_param btwt;
+ };
+ 
+ /**
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 6dc8d5c1a..97dbb7ef3 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -12677,7 +12677,10 @@ int nl80211_add_btwt(void *priv, struct broadcast_twt_param *param)
+ 	    nla_put_u8(msg, NL80211_BROADCAST_TWT_ATTR_RECOMMENDATION, param->recommendation) ||
+ 	    nla_put_u8(msg, NL80211_BROADCAST_TWT_ATTR_PERSISTENCE, param->persist) ||
+ 	    (param->trigger && nla_put_flag(msg, NL80211_BROADCAST_TWT_ATTR_TRIGGER)) ||
+-	    (param->flow_type && nla_put_flag(msg, NL80211_BROADCAST_TWT_ATTR_FLOW_TYPE)))
++	    (param->flow_type && nla_put_flag(msg, NL80211_BROADCAST_TWT_ATTR_FLOW_TYPE)) ||
++	    (param->recommendation == 4 &&
++	     nla_put_u8(msg, NL80211_BROADCAST_TWT_ATTR_DL_TID_BMP, param->rtwt.dl_tid_bmp) &&
++	     nla_put_u8(msg, NL80211_BROADCAST_TWT_ATTR_UL_TID_BMP, param->rtwt.ul_tid_bmp)))
+ 		goto fail;
+ 
+ 	nla_nest_end(msg, data);
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index 672edc95b..2229872f4 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -4440,6 +4440,84 @@ static void nl80211_notify_crit_update(struct wpa_driver_nl80211_data *drv,
+ 	wpa_supplicant_event(bss->ctx, EVENT_CRIT_UPDATE, &data);
+ }
+ 
++#ifdef CONFIG_IEEE80211AX
++static void nl80211_add_btwt_event(struct wpa_driver_nl80211_data *drv,
++				   struct nlattr **tb)
++{
++	static const struct nla_policy btwt_policy[NL80211_BROADCAST_TWT_ATTR_MAX + 1] = {
++		[NL80211_BROADCAST_TWT_ATTR_ID] = { .type = NLA_U8 },
++		[NL80211_BROADCAST_TWT_ATTR_MIN_WAKE_DUR] = { .type = NLA_U8 },
++		[NL80211_BROADCAST_TWT_ATTR_MANTISSA] = { .type = NLA_U16 },
++		[NL80211_BROADCAST_TWT_ATTR_EXPONENT] = { .type = NLA_U8 },
++		[NL80211_BROADCAST_TWT_ATTR_TRIGGER] = { .type = NLA_FLAG },
++		[NL80211_BROADCAST_TWT_ATTR_FLOW_TYPE] = { .type = NLA_FLAG },
++		[NL80211_BROADCAST_TWT_ATTR_RECOMMENDATION] = { .type = NLA_U8 },
++		[NL80211_BROADCAST_TWT_ATTR_PERSISTENCE] = { .type = NLA_U8 },
++		[NL80211_BROADCAST_TWT_ATTR_DL_TID_BMP] = { .type = NLA_U8 },
++		[NL80211_BROADCAST_TWT_ATTR_UL_TID_BMP] = { .type = NLA_U8 },
++	};
++	struct nlattr *btwt[NL80211_BROADCAST_TWT_ATTR_MAX + 1];
++	struct i802_bss *bss = NULL;
++	union wpa_event_data ev;
++	int ifidx = -1;
++
++	if (!tb[NL80211_ATTR_BROADCAST_TWT_PARAMS] || !tb[NL80211_ATTR_IFINDEX])
++		return;
++
++	ifidx = nla_get_u32(tb[NL80211_ATTR_IFINDEX]);
++	bss = get_bss_ifindex(drv, ifidx);
++	if (bss == NULL) {
++		wpa_printf(MSG_WARNING, "nl80211: Unknown ifindex (%d) for add_btwt",
++			   ifidx);
++		return;
++	}
++
++	if (nla_parse_nested(btwt, NL80211_BROADCAST_TWT_ATTR_MAX,
++			     tb[NL80211_ATTR_BROADCAST_TWT_PARAMS], btwt_policy) ||
++	    !btwt[NL80211_BROADCAST_TWT_ATTR_ID] ||
++	    !btwt[NL80211_BROADCAST_TWT_ATTR_MIN_WAKE_DUR] ||
++	    !btwt[NL80211_BROADCAST_TWT_ATTR_MANTISSA] ||
++	    !btwt[NL80211_BROADCAST_TWT_ATTR_EXPONENT] ||
++	    !btwt[NL80211_BROADCAST_TWT_ATTR_RECOMMENDATION] ||
++	    !btwt[NL80211_BROADCAST_TWT_ATTR_PERSISTENCE]) {
++		wpa_printf(MSG_DEBUG,
++			   "nl80211: Failed to parse ADD_BROADCAST_TWT nested attributes");
++		return;
++	}
++
++	os_memset(&ev, 0, sizeof(ev));
++
++	ev.btwt.id = nla_get_u8(btwt[NL80211_BROADCAST_TWT_ATTR_ID]);
++	ev.btwt.min_wake_dur = nla_get_u8(btwt[NL80211_BROADCAST_TWT_ATTR_MIN_WAKE_DUR]);
++	ev.btwt.wake_intv_mantissa = nla_get_u16(btwt[NL80211_BROADCAST_TWT_ATTR_MANTISSA]);
++	ev.btwt.wake_intv_exp = nla_get_u8(btwt[NL80211_BROADCAST_TWT_ATTR_EXPONENT]);
++	ev.btwt.trigger = btwt[NL80211_BROADCAST_TWT_ATTR_TRIGGER] ? 1 : 0;
++	ev.btwt.flow_type = btwt[NL80211_BROADCAST_TWT_ATTR_FLOW_TYPE] ? 1 : 0;
++	ev.btwt.recommendation = nla_get_u8(btwt[NL80211_BROADCAST_TWT_ATTR_RECOMMENDATION]);
++	ev.btwt.persist = nla_get_u8(btwt[NL80211_BROADCAST_TWT_ATTR_PERSISTENCE]);
++
++	ev.btwt.rtwt.dl_tid_bmp = btwt[NL80211_BROADCAST_TWT_ATTR_DL_TID_BMP] ?
++		nla_get_u8(btwt[NL80211_BROADCAST_TWT_ATTR_DL_TID_BMP]) : 0;
++	ev.btwt.rtwt.ul_tid_bmp = btwt[NL80211_BROADCAST_TWT_ATTR_UL_TID_BMP] ?
++		nla_get_u8(btwt[NL80211_BROADCAST_TWT_ATTR_UL_TID_BMP]) : 0;
++
++	wpa_printf(MSG_DEBUG, "nl80211: ADD_BROADCAST_TWT event on ifname=%s"
++			      " id=%u min_wake_dur=%u mantissa=%u exp=%u trigger=%d"
++			      " flow_type=%d recommendation=%d persist=%d",
++		   bss->ifname, ev.btwt.id, ev.btwt.min_wake_dur,
++		   ev.btwt.wake_intv_mantissa, ev.btwt.wake_intv_exp, ev.btwt.trigger,
++		   ev.btwt.flow_type, ev.btwt.recommendation, ev.btwt.persist);
++
++	if (btwt[NL80211_BROADCAST_TWT_ATTR_DL_TID_BMP] ||
++	    btwt[NL80211_BROADCAST_TWT_ATTR_UL_TID_BMP]) {
++		wpa_printf(MSG_DEBUG, " dl_tid_bitmap=0x%x ul_tid_bitmap=0x%x",
++			   ev.btwt.rtwt.dl_tid_bmp, ev.btwt.rtwt.ul_tid_bmp);
++	}
++
++	wpa_supplicant_event(bss->ctx, EVENT_BCAST_TWT_ADD, &ev);
++}
++#endif /* CONFIG_IEEE80211AX */
++
+ 
+ static void do_process_drv_event(struct i802_bss *bss, int cmd,
+ 				 struct nlattr **tb)
+@@ -4737,6 +4815,11 @@ static void do_process_drv_event(struct i802_bss *bss, int cmd,
+ 	case NL80211_CMD_NOTIFY_CRIT_UPDATE:
+ 		nl80211_notify_crit_update(drv, tb);
+ 		break;
++#ifdef CONFIG_IEEE80211AX
++	case NL80211_CMD_ADD_BROADCAST_TWT:
++		nl80211_add_btwt_event(drv, tb);
++		break;
++#endif /* CONFIG_IEEE80211AX */
+ 	default:
+ 		wpa_dbg(drv->ctx, MSG_DEBUG, "nl80211: Ignored unknown event "
+ 			"(cmd=%d)", cmd);
+-- 
+2.45.2
+

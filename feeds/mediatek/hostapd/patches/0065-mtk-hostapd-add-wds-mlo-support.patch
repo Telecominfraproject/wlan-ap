@@ -1,0 +1,189 @@
+From 293a5a1f41abfb7ca676fdd660ed85b8804d4b1f Mon Sep 17 00:00:00 2001
+From: Peter Chiu <chui-hao.chiu@mediatek.com>
+Date: Tue, 16 Jan 2024 16:22:17 +0800
+Subject: [PATCH 065/260] mtk: hostapd: add wds mlo support
+
+1. Add mld_assoc_sta to get the primary sta_info.
+2. Find hapd according to mld address.
+
+The latest get_hapd_bssid return hapd only if link id is matched.
+However,the hostapd_rx_from_unknown_sta does not have link
+information so it cannot get hapd.
+
+Modify get_hapd_bssid to ignore link id when link id is -1.
+
+Without this patch, wds mode cannot work and the AP would not be
+aware that station is using 4 address.
+
+Transmit correct hapd by i802_bss->ctx to EVENT_RX_FROM_UNKNOWN handler.
+Without this patch, AP cannot setup AP_VLAN interface in mlo + legacy case.
+In mlo + legacy case, if wds null is sent to legacy AP, it cannot get correct
+hapd according drv->ctx because drv->ctx and legacy AP's hapd may not under
+the same hostapd_iface.
+
+Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
+---
+ src/ap/drv_callbacks.c       |  7 ++++---
+ src/ap/ieee802_11.c          |  8 ++++++++
+ src/ap/sta_info.c            |  6 +++++-
+ src/ap/sta_info.h            |  1 +
+ src/drivers/driver.h         |  3 +++
+ src/drivers/driver_nl80211.c | 14 ++++++++++++++
+ 6 files changed, 35 insertions(+), 4 deletions(-)
+
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 1fe69ec3e..e9e185921 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -1913,6 +1913,7 @@ switch_link_scan(struct hostapd_data *hapd, u64 scan_cookie)
+ static struct hostapd_data * get_hapd_bssid(struct hostapd_iface *iface,
+ 					    const u8 *bssid, int link_id)
+ {
++	struct hostapd_data *ret = NULL;
+ 	size_t i;
+ 
+ 	if (bssid == NULL)
+@@ -1940,7 +1941,7 @@ static struct hostapd_data * get_hapd_bssid(struct hostapd_iface *iface,
+ 		if (ether_addr_equal(bssid, hapd->own_addr) ||
+ 		    (hapd->conf->mld_ap &&
+ 		     ether_addr_equal(bssid, hapd->mld->mld_addr) &&
+-		     link_id == hapd->mld_link_id))
++		     (link_id == hapd->mld_link_id || link_id == -1)))
+ 			return hapd;
+ 
+ 		if (!hapd->conf->mld_ap)
+@@ -1952,13 +1953,13 @@ static struct hostapd_data * get_hapd_bssid(struct hostapd_iface *iface,
+ 
+ 			if (ether_addr_equal(bssid, p_hapd->own_addr) ||
+ 			    (ether_addr_equal(bssid, p_hapd->mld->mld_addr) &&
+-			     link_id == p_hapd->mld_link_id))
++			     (link_id == p_hapd->mld_link_id || link_id == -1)))
+ 				return p_hapd;
+ 		}
+ #endif /* CONFIG_IEEE80211BE */
+ 	}
+ 
+-	return NULL;
++	return ret;
+ }
+ 
+ 
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 8da1ea2fd..5cba6a1d6 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -3685,6 +3685,7 @@ static void handle_auth(struct hostapd_data *hapd,
+ 
+ 			ap_sta_set_mld(sta, true);
+ 			sta->mld_assoc_link_id = link_id;
++			sta->mld_assoc_sta = sta;
+ 
+ 			/*
+ 			 * Set the MLD address as the station address and the
+@@ -5241,6 +5242,7 @@ int ieee80211_ml_process_link(struct hostapd_data *hapd,
+ #ifdef CONFIG_ENC_ASSOC
+ 	sta->epp_sta = origin_sta->epp_sta;
+ #endif /* CONFIG_ENC_ASSOC */
++	sta->mld_assoc_sta = origin_sta;
+ 
+ 	status = __check_assoc_ies(hapd, sta, NULL, 0, &elems, type,
+ 				   origin_sta->wpa_sm);
+@@ -7834,6 +7836,12 @@ void ieee802_11_rx_from_unknown(struct hostapd_data *hapd, const u8 *src,
+ 	struct sta_info *sta;
+ 
+ 	sta = ap_get_sta(hapd, src);
++
++#ifdef CONFIG_IEEE80211BE
++	if (sta && sta->mld_info.mld_sta)
++		sta = sta->mld_assoc_sta;
++#endif
++
+ 	if (sta &&
+ 	    ((sta->flags & WLAN_STA_ASSOC) ||
+ 	     ((sta->flags & WLAN_STA_ASSOC_REQ_OK) && wds))) {
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index 4a77f6bf6..ee5ba5b25 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -74,6 +74,7 @@ struct sta_info * ap_get_sta(struct hostapd_data *hapd, const u8 *sta)
+ 	while (s != NULL && os_memcmp(s->addr, sta, 6) != 0)
+ 		s = s->hnext;
+ 
++#ifdef CONFIG_IEEE80211BE
+ 	if (hapd->conf->mld_ap && !s) {
+ 		u8 link_id;
+ 
+@@ -84,10 +85,13 @@ struct sta_info * ap_get_sta(struct hostapd_data *hapd, const u8 *sta)
+ 				continue;
+ 
+ 			for (s = h->sta_list; s; s = s->next)
+-				if (!os_memcmp(s->setup_link_addr, sta, 6))
++				if ((!os_memcmp(s->setup_link_addr, sta, 6) ||
++				     !os_memcmp(s->addr, sta, 6)) &&
++				     s->flags & WLAN_STA_ASSOC)
+ 					return s;
+ 		}
+ 	}
++#endif
+ 
+ 	return s;
+ }
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index 00d94d08f..eec3410db 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -322,6 +322,7 @@ struct sta_info {
+ 	struct mld_info mld_info;
+ 	u8 mld_assoc_link_id;
+ 	struct link_reconf_req_list *reconf_req;
++	struct sta_info *mld_assoc_sta;
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	u16 max_idle_period; /* if nonzero, the granted BSS max idle period in
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 0740b307e..300909da1 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -5754,6 +5754,9 @@ struct wpa_driver_ops {
+ 	 * @pp_mode: Value is defined in enum pp_mode
+ 	 */
+ 	int (*pp_mode_set)(void *priv, const u8 pp_mode);
++#ifdef CONFIG_IEEE80211BE
++	int (*get_mld_addr)(void *priv, u8 *addr);
++#endif
+ };
+ 
+ /**
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 3c152c1b4..8719bf531 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -16698,6 +16698,17 @@ fail:
+ 	return -ENOBUFS;
+ }
+ 
++#ifdef CONFIG_IEEE80211BE
++static int nl80211_get_mld_addr(void *priv, u8 *addr)
++{
++	struct i802_bss *bss = priv;
++
++	os_memcpy(addr, bss->addr, ETH_ALEN);
++
++	return 0;
++}
++#endif
++
+ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.name = "nl80211",
+ 	.desc = "Linux nl80211/cfg80211",
+@@ -16896,4 +16907,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.amnt_dump = nl80211_amnt_dump,
+ 	.background_radar_mode = nl80211_background_radar_mode,
+ 	.pp_mode_set = nl80211_pp_mode_set,
++#ifdef CONFIG_IEEE80211BE
++	.get_mld_addr = nl80211_get_mld_addr,
++#endif
+ };
+-- 
+2.45.2
+
