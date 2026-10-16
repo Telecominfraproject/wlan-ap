@@ -1,0 +1,223 @@
+From f9e45effb61d67ff5f4770fa6aa55f3f5126db8e Mon Sep 17 00:00:00 2001
+From: "niko.lei" <niko.lei@cybertan.com.tw>
+Date: Sat, 10 Oct 2026 15:36:36 +0800
+Subject: [PATCH] mac80211: harden the WBM error path
+
+Repeated connect -> traffic -> disconnect cycles on RAP7110C lead to
+a reboot in the WBM error release path. The ticket log shows the WBM
+error path handing bogus data up the stack shortly before:
+
+WARNING: CPU: 0 PID: 0 at .../ath12k/dp_rx.c:3374
+  ath12k_dp_rx_h_ppdu+0x68/0x1010 [ath12k]
+  Hardware name: SONICFI RAP7110C-341X (DT)
+  pc : ath12k_dp_rx_h_ppdu+0x68/0x1010 [ath12k]
+  Call trace:
+    ath12k_dp_rx_h_ppdu+0x68/0x1010 [ath12k]
+    ath12k_dp_rx_process_wbm_err+0x39c/0x654 [ath12k]
+    ath12k_dp_service_srng+0x220/0x350 [ath12k]
+    __napi_poll+0x34/0x180
+    net_rx_action+0x130/0x250
+
+Changes:
+With HW cookie conversion done, the WBM error path dereferenced the
+rx descriptor virtual address (buf_va) written back by HW without any
+validation. The root cause is not confirmed, so harden the path:
+
+- resolve the descriptor from the SW cookie in the owning device's
+  pool and use buf_va only for cross-checking
+- drop entries with an invalid cookie, bad magic, no skb, or a
+  mismatching owner, without touching untrusted descriptors
+
+The cookie is also written by HW, so a stale release entry can still
+resolve to a HW-owned descriptor; this patch removes the wild dereference,
+not that case. The REO path is left unchanged as no failure has been
+observed there.
+
+Fixes: WIFI-15687
+Signed-off-by: Niko Lei <niko.lei@cybertan.com.tw>
+---
+ drivers/net/wireless/ath/ath12k/dp.c    | 25 +++++++-
+ drivers/net/wireless/ath/ath12k/dp.h    |  3 +-
+ drivers/net/wireless/ath/ath12k/dp_rx.c | 83 +++++++++++++++++++++----
+ 3 files changed, 97 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath12k/dp.c b/drivers/net/wireless/ath/ath12k/dp.c
+index 8e76ef9..d493767 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.c
++++ b/drivers/net/wireless/ath/ath12k/dp.c
+@@ -1897,12 +1897,17 @@ struct ath12k_rx_desc_info *ath12k_dp_get_rx_desc(struct ath12k_base *ab,
+ {
+ 	struct ath12k_dp *dp = &ab->dp;
+ 	struct ath12k_rx_desc_info **desc_addr_ptr;
+-	u16 ppt_idx, spt_idx;
++	u16 start_ppt_idx, end_ppt_idx, ppt_idx, spt_idx;
+ 
+ 	ppt_idx = u32_get_bits(cookie, ATH12K_DP_CC_COOKIE_PPT);
+ 	spt_idx = u32_get_bits(cookie, ATH12k_DP_CC_COOKIE_SPT);
+ 
+-	if (WARN_ON(ppt_idx < dp->rx_spt_base))
++	start_ppt_idx = dp->rx_spt_base + ATH12K_RX_SPT_PAGE_OFFSET;
++	end_ppt_idx = start_ppt_idx + ATH12K_NUM_RX_SPT_PAGES;
++
++	if (WARN_ON_ONCE(ppt_idx < start_ppt_idx ||
++			 ppt_idx >= end_ppt_idx ||
++			 spt_idx >= ATH12K_MAX_SPT_ENTRIES))
+ 		return NULL;
+ 
+ 	ppt_idx = ppt_idx - dp->rx_spt_base;
+@@ -1912,6 +1917,22 @@ struct ath12k_rx_desc_info *ath12k_dp_get_rx_desc(struct ath12k_base *ab,
+ 	return *desc_addr_ptr;
+ }
+ 
++int ath12k_dp_rx_cookie_to_chip_id(u32 cookie)
++{
++	u32 ppt_idx = u32_get_bits(cookie, ATH12K_DP_CC_COOKIE_PPT);
++	u32 chip_id;
++
++	if (unlikely(ppt_idx < ATH12K_RX_SPT_PAGE_OFFSET))
++		return -EINVAL;
++
++	chip_id = (ppt_idx - ATH12K_RX_SPT_PAGE_OFFSET) /
++		   ATH12K_NUM_RX_SPT_PAGES;
++	if (unlikely(chip_id >= ATH12K_MAX_SOCS))
++		return -EINVAL;
++
++	return chip_id;
++}
++
+ struct ath12k_tx_desc_info *ath12k_dp_get_tx_desc(struct ath12k_base *ab,
+ 						  u32 cookie)
+ {
+diff --git a/drivers/net/wireless/ath/ath12k/dp.h b/drivers/net/wireless/ath/ath12k/dp.h
+index 025bf1e..12218da 100644
+--- a/drivers/net/wireless/ath/ath12k/dp.h
++++ b/drivers/net/wireless/ath/ath12k/dp.h
+@@ -259,7 +259,7 @@ struct ath12k_pdev_dp {
+ 
+ #define ATH12K_PPEDS_TX_SPT_PAGE_OFFSET 0
+ #define ATH12K_TX_SPT_PAGE_OFFSET ATH12K_NUM_PPEDS_TX_SPT_PAGES
+-#define ATH12K_RX_SPT_PAGE_OFFSET ATH12K_NUM_PPEDS_TX_SPT_PAGES + ATH12K_NUM_TX_SPT_PAGES
++#define ATH12K_RX_SPT_PAGE_OFFSET (ATH12K_NUM_PPEDS_TX_SPT_PAGES + ATH12K_NUM_TX_SPT_PAGES)
+ 
+ 
+ #define ATH12K_NUM_PPEDS_TX_SPT_PAGES (ATH12K_NUM_POOL_PPEDS_TX_DESC / \
+@@ -2855,6 +2855,7 @@ int ath12k_dp_link_desc_setup(struct ath12k_base *ab,
+ 			      u32 n_link_desc);
+ struct ath12k_rx_desc_info *ath12k_dp_get_rx_desc(struct ath12k_base *ab,
+ 						  u32 cookie);
++int ath12k_dp_rx_cookie_to_chip_id(u32 cookie);
+ struct ath12k_tx_desc_info *ath12k_dp_get_tx_desc(struct ath12k_base *ab,
+ 						  u32 desc_id);
+ void ath12k_dp_tx_update_bank_profile(struct ath12k_link_vif *arvif);
+diff --git a/drivers/net/wireless/ath/ath12k/dp_rx.c b/drivers/net/wireless/ath/ath12k/dp_rx.c
+index bcf12df..22c02ea 100644
+--- a/drivers/net/wireless/ath/ath12k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath12k/dp_rx.c
+@@ -5336,10 +5336,11 @@ int ath12k_dp_rx_process_wbm_err(struct ath12k_base *ab,
+ 	void *rx_desc;
+ 	int i, num_buffs_reaped[ATH12K_MAX_SOCS] = { 0 };
+ 	struct ath12k_rx_desc_info *desc_info;
++	struct ath12k_rx_desc_info *cookie_desc;
+ 	struct ath12k_soc_dp_stats *soc_stats = &ab->soc_stats;
+ 	bool scatter_list_valid = false;
+ 	int total_num_buffs_reaped = 0;
+-	int ret;
++	int ret, owner_id;
+ 	u8 hw_link_id, chip_id;
+ 	char buf[64] = {0};
+ 	struct list_head rx_desc_used_list[ATH12K_MAX_SOCS];
+@@ -5371,21 +5372,81 @@ int ath12k_dp_rx_process_wbm_err(struct ath12k_base *ab,
+ 
+ 		desc_info = (struct ath12k_rx_desc_info *)err_info.rx_desc;
+ 
+-		/* retry manual desc retrieval if hw cc is not done */
+-		if (!desc_info) {
+-			desc_info = ath12k_dp_get_rx_desc(ab, err_info.cookie);
+-			if (!desc_info) {
+-				ath12k_warn(ab, "Invalid cookie in manual desc retrieval cookie 0x%x", err_info.cookie);
+-				continue;
+-			}
++		/*
++		 * The VA written back by HW cookie conversion cannot be
++		 * trusted blindly. Always resolve the descriptor from the
++		 * SW cookie and use the HW VA only for cross-checking.
++		 * When HW CC is not done, rx_desc is NULL and the cookie
++		 * result is used directly.
++		 *
++		 * This ring may carry partner-owned buffers in a multi-chip
++		 * group. Derive the owning chip from the cookie and resolve
++		 * the descriptor in that chip's pool.
++		 */
++		owner_id = ath12k_dp_rx_cookie_to_chip_id(err_info.cookie);
++		if (unlikely(owner_id < 0 || owner_id >= ab->ag->num_chip)) {
++			ath12k_warn(ab, "WBM err: cookie 0x%x does not map to any chip (hw_cc_done %d)\n",
++				    err_info.cookie, err_info.hw_cc_done);
++			__skb_queue_purge(&scatter_msdu_list);
++			scatter_list_valid = false;
++			continue;
++		}
++
++		src_ab = ab->ag->ab[owner_id];
++		if (unlikely(!src_ab)) {
++			/*
++			 * Valid cookie but the owning chip is not present. Its
++			 * descriptors and skbs belong to that chip's cleanup
++			 * path, so do not touch them here; just skip.
++			 */
++			ath12k_warn(ab, "WBM err: owner chip %d of cookie 0x%x not present\n",
++				    owner_id, err_info.cookie);
++			__skb_queue_purge(&scatter_msdu_list);
++			scatter_list_valid = false;
++			continue;
++		}
++
++		cookie_desc = ath12k_dp_get_rx_desc(src_ab, err_info.cookie);
++		if (unlikely(!cookie_desc)) {
++			ath12k_warn(ab, "WBM err: invalid cookie 0x%x (hw_cc_done %d)\n",
++				    err_info.cookie, err_info.hw_cc_done);
++			__skb_queue_purge(&scatter_msdu_list);
++			scatter_list_valid = false;
++			continue;
++		}
++
++		if (err_info.hw_cc_done && unlikely(desc_info != cookie_desc))
++			ath12k_warn(ab, "WBM err: HW CC VA does not match cookie 0x%x\n",
++				    err_info.cookie);
++
++		desc_info = cookie_desc;
++		if (unlikely(desc_info->magic != ATH12K_DP_RX_DESC_MAGIC ||
++			     !desc_info->skb)) {
++			ath12k_warn(ab, "WBM err: %s rx desc, cookie 0x%x magic 0x%x\n",
++				    desc_info->skb ? "corrupt" : "stale",
++				    err_info.cookie, desc_info->magic);
++			__skb_queue_purge(&scatter_msdu_list);
++			scatter_list_valid = false;
++			continue;
+ 		}
+ 
+-		if (desc_info->magic != ATH12K_DP_RX_DESC_MAGIC)
+-			ath12k_warn(ab, "WBM RX err, Check HW CC implementation");
++		if (unlikely(desc_info->chip_id != owner_id)) {
++			/*
++			 * The descriptor was resolved from the owner's pool, so
++			 * its chip_id must match. A mismatch means the descriptor
++			 * memory or lookup table is corrupted; the entry may even
++			 * be another chip's descriptor still owned by HW, so do
++			 * not touch it; just skip.
++			 */
++			ath12k_warn(ab, "WBM err: rx desc owner mismatch, cookie 0x%x desc chip %u expected %d\n",
++				    err_info.cookie, desc_info->chip_id, owner_id);
++			__skb_queue_purge(&scatter_msdu_list);
++			scatter_list_valid = false;
++			continue;
++		}
+ 
+ 		msdu = desc_info->skb;
+ 		desc_info->skb = NULL;
+-		src_ab = ab->ag->ab[desc_info->chip_id];
+ 		dp = &src_ab->dp;
+ 		chip_id = src_ab->chip_id;
+ 
+-- 
+2.34.1
+
