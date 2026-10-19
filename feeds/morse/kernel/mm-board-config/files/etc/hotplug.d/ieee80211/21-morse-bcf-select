@@ -1,0 +1,216 @@
+#!/bin/sh
+#
+# Point /lib/firmware/morse/bcf_default.bin at the board config file that matches
+# the chip which was just detected, the OTP board type, and the regulatory region
+# from UCI.
+#
+# Keyed on the DETECTED CHIP first and the device model never: the mapping lives
+# in /usr/share/morse-board-config/bcf-select.conf, so a second chip is a new row
+# there and not a change to this script.
+#
+# WHAT THIS DOES AND DOES NOT AFFECT
+#   The driver reads the BCF while it is probing, which is *before* the ieee80211
+#   device this event belongs to exists. So the symlink written here applies from
+#   the next driver or firmware load, not to the load that triggered the event.
+#   That is fine because of how the first boot after flashing sequences:
+#     - kmodloader loads morse with the package's built-in module parameters
+#       (country=US from MODPARAMS.morse) against the build-time symlink, which
+#       points at bcf_mf08651_us.bin - and that file does carry .regdom_US, so the
+#       first probe succeeds;
+#     - the phy appears, this script runs and re-points the symlink for whatever
+#       country UCI actually holds;
+#     - netifd's drv_morse_setup then rewrites /etc/modules.d/morse from UCI and
+#       reloads the module, which is the load that picks up the new symlink.
+#   Every later country change goes through that same reload.
+#   This script deliberately does NOT reload the driver: doing so from a hotplug
+#   handler would re-enter this same event.
+#
+# BCF name resolution in the driver, for reference (verified against
+# morse_driver mm6108-2.0.1, firmware.c morse_bcf_request() and init.c):
+#   1. module param bcf=<name>            -> /lib/firmware/morse/<name>
+#   2. module param serial (default
+#      "default") and OTP board type != 0 -> bcf_boardtype_<board_type>.bin
+#   3. otherwise                          -> bcf_<serial>.bin, i.e.
+#                                            bcf_default.bin out of the box
+#   A missing file is not fatal: the driver logs "BCF <name> not found" and
+#   brings the chip up with no board config at all. Hence the OTP warning below.
+#
+# Nothing else writes this path. Never "cp" a BCF over it: cp follows the
+# symlink and overwrites the BCF it points at.
+
+[ "${ACTION}" = "add" ] || return 0
+
+FW_DIR="/lib/firmware/morse"
+LINK="${FW_DIR}/bcf_default.bin"
+DB="/usr/share/morse-board-config/db.txt"
+MAP="/usr/share/morse-board-config/bcf-select.conf"
+DEV="/sys/${DEVPATH}/device"
+TAG="morse-bcf"
+
+bcf_log() { logger -t "$TAG" "$@"; }
+bcf_warn() { logger -t "$TAG" -p daemon.warn "$@"; }
+bcf_err() { logger -t "$TAG" -p daemon.err "$@"; }
+
+[ -f "$MAP" ] || return 0
+
+# Only act on Morse phys. The driver registers as morse_spi / morse_sdio /
+# morse_usb depending on the bus, so match the family and not one bus.
+morse_driver="$(basename "$(readlink -f "${DEV}/driver" 2>/dev/null)" 2>/dev/null)"
+case "$morse_driver" in
+	morse_*) ;;
+	*) return 0 ;;
+esac
+
+# --- chip detection -----------------------------------------------------------
+# Sources in order of reliability. All of them are chip-family level, never
+# device-model level.
+chip=""
+
+# 1. Device tree compatible string. The driver's own OF match table keys the chip
+#    series off exactly these strings (spi.c morse_spi_of_match[]:
+#    "morse,mm610x-spi" -> mm61xx_chip_series, "morse,mm810x-spi" ->
+#    mm81xx_chip_series), so this is the same identity the driver used.
+if [ -r "${DEV}/of_node/compatible" ]; then
+	compatible="$(tr '\0' '\n' < "${DEV}/of_node/compatible" 2>/dev/null)"
+	case "$compatible" in
+		*mm610x*) chip="MM6108" ;;
+		*mm810x*) chip="MM8108" ;;
+	esac
+fi
+
+# 2. modalias, which carries the same strings through the SPI/SDIO/USB device id
+#    tables for a device that was not created from the device tree.
+if [ -z "$chip" ] && [ -r "${DEV}/modalias" ]; then
+	modalias="$(cat "${DEV}/modalias" 2>/dev/null)"
+	case "$modalias" in
+		*mm610x*) chip="MM6108" ;;
+		*mm810x*) chip="MM8108" ;;
+	esac
+fi
+
+# 3. OTP board type looked up in db.txt, whose 4th column is the chip name. This
+#    is upstream's own chip data source.
+board_type="$(printf "%04x" "$(cat "${DEV}/board_type" 2>/dev/null)" 2>/dev/null)"
+[ -n "$board_type" ] || board_type="0000"
+
+if [ -z "$chip" ] && [ -f "$DB" ]; then
+	chip="$(awk -F, -v b="$board_type" '$1==b{print toupper($4); exit}' "$DB" 2>/dev/null)"
+fi
+# db.txt row 0804 reads "M8108" upstream, a typo for MM8108. Normalise it so a
+# typo in vendor data cannot turn a known chip into an unknown one.
+[ "$chip" = "M8108" ] && chip="MM8108"
+
+if [ -z "$chip" ]; then
+	bcf_warn "could not identify the chip for ${DEVPATH} (driver=${morse_driver}, OTP board_type=${board_type}); leaving ${LINK} as installed"
+	return 0
+fi
+
+# A chip we have no board config for is reported, never given
+# another chip's BCF.
+if ! grep -q "^${chip}," "$MAP"; then
+	bcf_err "chip ${chip} detected but no BCF is available for it in ${MAP}; NOT applying another chip's board config. Add a ${chip} row to ${MAP} and install the matching file under ${FW_DIR}."
+	return 0
+fi
+
+# --- region -------------------------------------------------------------------
+# Same source of truth as hostapd_s1g.init: the country on the morse wifi-device.
+# /sbin/hotplug-call already sources /lib/functions.sh before sourcing us; the
+# guard is only for the case where this script is run by hand during bring-up.
+type config_load >/dev/null 2>&1 || . /lib/functions.sh
+
+morse_radio=""
+bcf_find_morse_radio() {
+	local radio_type
+	config_get radio_type "$1" type
+	[ "$radio_type" = "morse" ] && morse_radio="$1"
+}
+
+config_load wireless
+config_foreach bcf_find_morse_radio wifi-device
+
+country=""
+[ -n "$morse_radio" ] && country="$(uci -q get "wireless.${morse_radio}.country")"
+
+# Country buckets copied verbatim from hostapd_s1g.init so that this script and
+# the mechanism it is meant to replace cannot disagree.
+case "$country" in
+	"JP")
+		region="JP"
+		;;
+	# "CE" is not a country code; it is the model suffix for the ETSI variant of
+	# this board. It is listed here because this script reads the country straight
+	# out of UCI, so it sees whatever was provisioned - the normalisation the
+	# netifd handler does lives in netifd's memory and is never written back to
+	# UCI. Without this label a provisioned CE falls through to the DEFAULT row and
+	# gets the US board config, which has no regdom for any European country.
+	"AT"|"BE"|"BG"|"CE"|"CH"|"CY"|"CZ"|"DK"|"EE"|"ES"|"EU"|"FI"|"FR"|"DE"|"GB"|"GR"|"HR"|"HU"|\
+	"IE"|"IS"|"IT"|"LI"|"LT"|"LU"|"LV"|"MT"|"NL"|"NO"|"PL"|"PT"|"RO"|"SE"|"SK"|"SI"|"TR")
+		region="EU"
+		;;
+	*)
+		region="DEFAULT"
+		;;
+esac
+
+# --- table lookup -------------------------------------------------------------
+bcf=""
+while IFS=, read -r t_chip t_board t_region t_bcf; do
+	case "$t_chip" in
+		""|"#"*) continue ;;
+	esac
+	[ "$t_chip" = "$chip" ] || continue
+	[ "$t_board" = "*" ] || [ "$t_board" = "$board_type" ] || continue
+	[ "$t_region" = "$region" ] || [ "$t_region" = "DEFAULT" ] || continue
+	bcf="$t_bcf"
+	break
+done < "$MAP"
+
+if [ -z "$bcf" ]; then
+	bcf_err "no BCF row matches chip=${chip} board_type=${board_type} region=${region} (country=${country:-unset}) in ${MAP}; leaving ${LINK} as installed"
+	return 0
+fi
+
+# A row may name the sentinel "none", meaning the region is known but has no
+# authorised board config. That is a separate state from "no row at all": without
+# such a row the region would fall through to the chip's DEFAULT row, because a
+# DEFAULT row matches every region. Treated like every other failure path here -
+# report it and do not touch the symlink - so no region ever silently inherits
+# another region's regulatory content.
+if [ "$bcf" = "none" ]; then
+	bcf_err "chip=${chip} region=${region} (country=${country:-unset}) has no authorised BCF in ${MAP}; leaving ${LINK} as installed. The driver will report \"Country code ${country:-?} not found in BCF\" if the installed file has no regdom for this country. A board config for this region is a missing deliverable, not a configuration error."
+	return 0
+fi
+
+if [ ! -f "${FW_DIR}/${bcf}" ]; then
+	bcf_err "chip=${chip} region=${region} needs ${bcf} but ${FW_DIR}/${bcf} is not installed; leaving ${LINK} as installed. Add it to BCF_SET_<profile>_${chip} in the morse-board-config package."
+	return 0
+fi
+
+# --- apply --------------------------------------------------------------------
+# ln -sfn, never cp: cp would follow this symlink and overwrite the BCF it points
+# at, which corrupts a shipped file and hides which board config is live.
+current="$(readlink "$LINK" 2>/dev/null)"
+if [ "$current" = "${FW_DIR}/${bcf}" ]; then
+	bcf_log "${bcf} already selected for chip=${chip} board_type=${board_type} region=${region} (country=${country:-unset})"
+elif ln -sfn "${FW_DIR}/${bcf}" "$LINK"; then
+	bcf_log "selected ${bcf} for chip=${chip} board_type=${board_type} region=${region} (country=${country:-unset}), was ${current:-a regular file or absent}; applies from the next driver load"
+else
+	bcf_err "failed to point ${LINK} at ${FW_DIR}/${bcf}"
+	return 0
+fi
+
+# --- diagnostics --------------------------------------------------------------
+# A burnt OTP board type takes the driver down path 2 above, where bcf_default.bin
+# is never consulted. Warn rather than invent a mapping: pointing an unknown board
+# type at one of Morse's own module BCFs would be a silent substitution of
+# regulatory content.
+if [ "$board_type" != "0000" ] && [ ! -e "${FW_DIR}/bcf_boardtype_${board_type}.bin" ]; then
+	bcf_warn "OTP board_type=${board_type} is burnt, so the driver requests bcf_boardtype_${board_type}.bin and ignores ${LINK}; that file is not installed, so the chip comes up with NO board config. An authorised BCF for board type ${board_type} has to be added."
+fi
+
+# Make the file the driver actually loaded visible next to the
+# file this script selected, so the two can be compared without a serial console.
+loaded="$(dmesg 2>/dev/null | sed -n 's/.*Loaded BCF from \([^,]*\),.*/\1/p' | tail -n 1)"
+[ -n "$loaded" ] && bcf_log "driver reported loading ${loaded} on the current load"
+
+return 0

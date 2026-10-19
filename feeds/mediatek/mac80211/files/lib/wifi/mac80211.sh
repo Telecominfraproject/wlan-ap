@@ -161,6 +161,15 @@ is_morse_phy() {
 setup_morse_wireless() {
 	local dev="$1"
 	local name="$2"
+	local path="$3"
+	local macaddr="$4"
+	local dev_id
+
+	if [ -n "$path" ]; then
+		dev_id="set wireless.${name}.path='$path'"
+	else
+		dev_id="set wireless.${name}.macaddr='$macaddr'"
+	fi
 
 	# Create Morse-specific wireless configuration with exact settings
 	uci -q batch <<-EOF
@@ -168,7 +177,7 @@ setup_morse_wireless() {
 		set wireless.${name}.disabled='0'
 		set wireless.${name}.mode='ap'
 		set wireless.${name}.type='morse'
-		set wireless.${name}.path='platform/11009000.spi/spi_master/spi1/spi1.0'
+		${dev_id}
 		set wireless.${name}.channel='12'
 		set wireless.${name}.hwmode='a'
 		set wireless.${name}.band='s1g'
@@ -187,7 +196,24 @@ detect_mac80211() {
 
 	json_load_file /etc/board.json
 
-	for _dev in /sys/class/ieee80211/*; do
+	# Number a Morse (HaLow) phy before the others. Section names otherwise
+	# follow the phy index, and the Morse phy index is not stable: it is
+	# phy0 on a cold boot but comes back as a new index whenever the driver
+	# is reloaded. uCentral renders against the current section names and
+	# then regenerates this file from scratch, so a changed numbering makes
+	# it apply one radio's settings to another. Without a Morse phy the
+	# order is unchanged.
+	local _morse_devs="" _other_devs="" _d
+	for _d in /sys/class/ieee80211/*; do
+		[ -e "$_d" ] || continue
+		if is_morse_phy "${_d##*/}"; then
+			_morse_devs="$_morse_devs $_d"
+		else
+			_other_devs="$_other_devs $_d"
+		fi
+	done
+
+	for _dev in $_morse_devs $_other_devs; do
 		[ -e "$_dev" ] || continue
 
 		dev="${_dev##*/}"
@@ -214,7 +240,7 @@ detect_mac80211() {
 		# Check if this is a Morse PHY
 		if is_morse_phy "$dev"; then
 			# Use dedicated Morse configuration
-			setup_morse_wireless "$dev" "$name"
+			setup_morse_wireless "$dev" "$name" "$path" "$macaddr"
 		else
 			# Standard wireless configuration for non-Morse devices
 			mode_band=""

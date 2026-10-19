@@ -3,7 +3,7 @@
 #
 APP=wpa_event_listener
 
-LDFLAGS+=-lwpa_client -lubox
+LDFLAGS+=-lwpa_client_s1g -lubox
 
 ODIR=build
 

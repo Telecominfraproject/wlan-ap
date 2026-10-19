@@ -17,7 +17,7 @@ define Package/wpa_event_listener
   CATEGORY:=Base system
   TITLE:= WPA supplicant s1g event listener
   MAINTAINER:=Morse Micro
-  DEPENDS:= wpa_supplicant_s1g +libwpa_client
+  DEPENDS:= wpa_supplicant_s1g +libwpa_client_s1g
 endef
 
 define Package/wpa_event_listener/description
