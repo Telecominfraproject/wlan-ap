@@ -1,3 +1,17 @@
+#
+# hostapd/wpa_supplicant config generation for the morse netifd handler.
+#
+# Notable defaults:
+#   * disassoc_low_ack defaults to 0, because HaLow stations sleep for long
+#     periods.
+#   * mesh forces dtim_period=1.
+#   * sae_password= is emitted alongside wpa_passphrase=, and wps_cred_add_sae=1
+#     is set for virtual-push-button WPS.
+#   * a network block is only written when an ssid is set; a bridged STA or mesh
+#     pins its MAC to the bridge MAC when the bridge address was set explicitly.
+#   * enable_4addr_mode=1 is added to every wpa_supplicant network block.
+#
+
 # netifd wireless implements _wdev_prepare_channel
 # which parses the band and hwmode config options before a drv_* function is called
 # for now, we override these with desired vals to avoid modifying netifd-wireless
@@ -15,6 +29,10 @@ morse_wpa_supplicant_prepare_interface() {
 	json_get_vars sae_pwe multi_ap
 	json_get_values sae_group_list sae_group
 
+	# Upstream sets sae_pwe unconditionally. Leave it unset for
+	# a Multi-AP (prplmesh) backhaul STA, which pairs by WPS and then has pmf=2
+	# forced two lines down; pinning sae_pwe=1 (hash-to-element only) there breaks
+	# pairing with controllers that only do hunting-and-pecking. Not chip-specific.
 	[ "${multi_ap:=0}" -lt 1 ] && set_default sae_pwe 1
 
 	local pmf=
@@ -76,7 +94,7 @@ morse_override_hostapd_set_bss_options() {
 	set_default maxassoc 0
 	set_default max_inactivity 0
 	set_default short_preamble 1
-	set_default disassoc_low_ack 1
+	set_default disassoc_low_ack 0
 	set_default skip_inactivity_poll 0
 	set_default hidden 0
 	set_default wmm 1
@@ -96,7 +114,7 @@ morse_override_hostapd_set_bss_options() {
 	set_default wpa_group_rekey 604800
 	set_default beacon_int 100
 
-	/sbin/hostapd_s1g -vfils || fils=0
+	/usr/sbin/hostapd_s1g -vfils || fils=0
 
 	append bss_conf "ctrl_interface=/var/run/hostapd_s1g"
 	if [ "$isolate" -gt 0 ]; then
@@ -141,6 +159,8 @@ morse_override_hostapd_set_bss_options() {
 		append bss_conf "radius_acct_interim_interval=$acct_interval" "$N"
 	json_for_each_item append_acct_server acct_server
 	json_for_each_item append_radius_acct_req_attr radius_acct_req_attr
+
+	[ -n "$ocv" ] && append bss_conf "ocv=$ocv" "$N"
 
 	case "$auth_type" in
 		sae|owe|eap2|eap192)
@@ -315,6 +335,10 @@ morse_override_hostapd_set_bss_options() {
 	[ "$wps_label" -gt 0 ] && append config_methods label
 	[ "$wps_virtual_push_button" -gt 0 ] && append config_methods virtual_push_button
 
+	# Enable SAE (WPA3-Personal transition mode) automatically for
+	# WPA2-PSK credentials received using WPS.
+	[ "$wps_virtual_push_button" -gt 0 ] && append bss_conf "wps_cred_add_sae=1" "$N"
+
 	# WPS not possible on Multi-AP backhaul-only SSID
 	[ "$multi_ap" = 1 ] && wps_possible=
 
@@ -356,11 +380,7 @@ morse_override_hostapd_set_bss_options() {
 	}
 
 	append bss_conf "ssid=$ssid" "$N"
-	# AJ 26/05/2023: I've commented out the bridge= setting as it is causing our standard 
-	# bridged interface configuration to not function correctly. Further investigation will be required here
-	# as this setting is not any different to what the system does anyway if it's not set, and the documentation
-	# indicates it is optional...
-	#[ -n "$network_bridge" ] && append bss_conf "bridge=$network_bridge${N}wds_bridge=" "$N"
+	[ -n "$network_bridge" ] && append bss_conf "bridge=$network_bridge${N}wds_bridge=" "$N"
 	[ -n "$iapp_interface" ] && {
 		local ifname
 		network_get_device ifname "$iapp_interface" || ifname="$iapp_interface"
@@ -765,8 +785,6 @@ morse_override_wpa_supplicant_add_network() {
 		json_select ..
 	fi
 
-	[ -n "$ocv" ] && append bss_conf "ocv=$ocv" "$N"
-
 	case "$auth_type" in
 		sae|owe|eap2|eap192)
 			set_default ieee80211w 2
@@ -776,6 +794,7 @@ morse_override_wpa_supplicant_add_network() {
 		;;
 	esac
 
+	set_default fils 0
 	set_default ieee80211r 0
 	set_default multi_ap 0
 
@@ -817,7 +836,7 @@ morse_override_wpa_supplicant_add_network() {
 	}
 
 	[ "$_w_mode" = "mesh" ] && {
-		json_get_vars mesh_id dtim_period encryption
+		json_get_vars mesh_id encryption no_auto_peer
 		[ -n "$mesh_id" ] && ssid="${mesh_id}"
 		[ -n "$mesh_max_peer_links" ] && append mesh_data "max_peer_links=${mesh_max_peer_links}" "$N"
 		[ -n "$mesh_plink_timeout" ] && append mesh_data "mesh_max_inactivity=${mesh_plink_timeout}" "$N"
@@ -829,8 +848,12 @@ morse_override_wpa_supplicant_add_network() {
 		[ -n "$country" ] && append network_data "country=\"$country\"" "$N$T"
 		[ -n "$s1g_prim_chwidth" ] && append network_data "s1g_prim_chwidth=$s1g_prim_chwidth" "$N$T"
 		[ -n "$s1g_prim_1mhz_chan_index" ] && append network_data "s1g_prim_1mhz_chan_index=$s1g_prim_1mhz_chan_index" "$N$T"
-		[ -n "$dtim_period" ] && append network_data "dtim_period=$dtim_period" "$N$T"
+		#SW-13323 - Restrict DTIM period to 1 for mesh
+		append network_data "dtim_period=1" "$N$T"
 
+		# Suppress automatic (beacon triggered) peering so the peer can be
+		# chosen explicitly with 'wpa_cli_s1g ... mesh_peer_add <MAC>'.
+		[ "$no_auto_peer" = "1" ] && append network_data "no_auto_peer=1" "$N$T"
 		[ -n "$mesh_rssi_threshold" ] && append network_data "mesh_rssi_threshold=${mesh_rssi_threshold}" "$N$T"
 		[ -n "$mesh_hwmp_rootmode" ] && append network_data "dot11MeshHWMPRootMode=${mesh_hwmp_rootmode}" "$N$T"
 		[ -n "$mesh_gate_announcements" ] && append network_data "dot11MeshGateAnnouncements=${mesh_gate_announcements}" "$N$T"
@@ -1075,6 +1098,11 @@ morse_override_wpa_supplicant_add_network() {
 	[ -n "$bssid" ] && append network_data "bssid=$bssid" "$N$T"
 	[ -n "$beacon_int" ] && append network_data "beacon_int=$beacon_int" "$N$T"
 
+	# A HaLow STA is a bridged WAN uplink, and only 4addr clears IFF_DONT_BRIDGE.
+	# Keep unconditional: morse.sh gates its `iw set 4addr on` on `wds`, which the
+	# cloud never sets, so this is the only 4addr trigger there.
+	append network_data "enable_4addr_mode=1" "$N$T"
+
 	local bssid_blacklist bssid_whitelist
 	json_get_values bssid_blacklist bssid_blacklist
 	json_get_values bssid_whitelist bssid_whitelist
@@ -1102,6 +1130,21 @@ morse_override_wpa_supplicant_add_network() {
 	json_get_vars cac
 	[ -n "$cac" ] && append network_data "cac=$cac" "$N$T"
 
+	json_get_vars auth_retry_backoff
+	if [ -n "$auth_retry_backoff" ]; then
+		case "$auth_retry_backoff" in
+			*[!0-9\ ]*) echo "WARNING: auth_retry_backoff contains invalid characters, ignoring '$auth_retry_backoff'" ;;
+			*)
+				local _ok=1 _n=0
+				for _v in $auth_retry_backoff; do
+					_n=$(( _n + 1 ))
+					[ "$_v" -eq 0 ] && { echo "WARNING: auth_retry_backoff zero at position $_n, ignoring '$auth_retry_backoff'"; _ok=0; break; }
+				done
+				[ "$_ok" -eq 1 ] && [ "$_n" -gt 0 ] && append network_data "auth_retry_backoff=$auth_retry_backoff" "$N$T"
+				;;
+		esac
+	fi
+
 	json_get_vars twt wake_interval min_wake_duration setup_command
 	twt_block=
 	if [ "${twt:=0}" -eq "1" ]; then
@@ -1114,6 +1157,7 @@ morse_override_wpa_supplicant_add_network() {
 
 	if [ "$multi_ap" -eq 1 ]; then
 		echo "wps_priority=1" >> "$_config"
+		echo "wps_cred_add_sae=1" >> "$_config"
 		echo "update_config=1"  >> "$_config"
 		#Adding obtained wps network credentials here to make it persistent
 		append network_data "proto=RSN" "$N$T"
@@ -1122,14 +1166,48 @@ morse_override_wpa_supplicant_add_network() {
 		else
 			wpa_add_network_block "multiap_bh" "$_config"
 		fi
+	elif [ "$matter_enable" = 1 ]; then
+		echo "update_config=1"  >> "$_config"
+		echo "pmf=2"  >> "$_config"
 	elif [ "$dpp" = 1 ]; then
 		echo "update_config=1"  >> "$_config"
 		echo "ctrl_interface_group=0"  >> "$_config"
 		echo "dpp_config_processing=0"  >> "$_config"
 		echo "dpp_key=/etc/dpp_key.pem"  >> "$_config"
 		echo "dpp_chirp_forever=1"  >> "$_config"
+	elif [ -n "$ssid" ]; then
+		# Only append a network block if we have an ssid, as otherwise
+		# wpa_supplicant likes scanning and connecting to anything.
 
-	else
+		# If we're a normal mesh or sta on a bridge, it's useful for the MAC address
+		# presented by wpa_supplicant to be the same as the MAC address of the bridge
+		# so any AP/mesh point can easily figure out who we are (i.e. map the MAC
+		# address back to an IP). Note that if network_ifname exists, this implies it's
+		# a bridge (this actually comes from bridge-ifname in what netifd provides).
+		# However, if the bridge MAC does not have a set MAC address, we should not
+		# use it, as it may change later. netifd will prefer this interface's
+		# MAC address for the bridge when it comes up.
+		#
+		# Exceptions (why this is in an else):
+		# - I don't know what matter does.
+		# - if prplmesh is enabled, it relies on MAC addresses being unique
+		#   keys for its internal topology db.
+		# - if we're trying to pair via DPP, then it's not safe to do this as
+		#   we probably printed it on the box (i.e. it's static, and will
+		#   only work with a particular hardware MAC address). Note that currently
+		#   once DPP is done we switch to a 'normal' configuration, so this won't
+		#   cause any issues.
+		# - mesh. Mesh SAE binds both peer MACs into the confirm
+		#   exchange, and wpa_supplicant applies mac_value only when it joins,
+		#   i.e. after the interface already has an address, so peers keep a
+		#   phantom entry and peering never settles.
+		if [ "$_w_mode" != "mesh" ] && [ -n "$network_ifname" ] && \
+		   [ "$(cat /sys/class/net/$network_ifname/addr_assign_type)" = 3 ]; then
+			# 3 means 'use specified mac_value' (cf 0 is normal, and 1/2 are randomisation strategies)
+			append network_data "mac_addr=3" "$N$T"
+			append network_data "mac_value=$(cat "/sys/class/net/$network_ifname/address")" "$N$T"
+		fi
+
 		wpa_add_network_block "sta" "$_config"
 	fi
 	return 0
