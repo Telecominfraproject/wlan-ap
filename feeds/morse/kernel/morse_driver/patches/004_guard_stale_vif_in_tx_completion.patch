@@ -1,0 +1,347 @@
+Subject: [PATCH] skbq: validate the cached vif before completing a Tx SKB
+
+A Tx SKB can outlive the interface it was queued for. Frames sit in
+morse_skbq::skbq or morse_skbq::pending until the chip reports a Tx status,
+which may take up to tx_status_lifetime_ms (15 s by default), and neither
+.remove_interface nor .stop nor .flush drops those frames or flushes the
+workqueue that completes them. Meanwhile the completion path takes the vif
+straight out of ieee80211_tx_info::control.vif, a raw pointer cached by
+mac80211 when the frame was queued, and dereferences it without any
+validity or NULL check. Once the interface is gone that pointer is dangling,
+and the frames still queued for it are completed against freed memory.
+
+Reconfiguring an interface is enough to hit this: the vaps are torn down and
+rebuilt in a few hundred milliseconds, far inside the status lifetime. Two
+crashes were seen in the same function, 0x3c apart, both consuming the same
+cached pointer: one in ieee80211_find_sta(), which reaches the mac80211
+sub_if_data 3040 bytes below the vif, and one in morse_bss_stats_update_tx(),
+which reaches morse_vif::ap 1568 bytes above it. Both ran with mq->lock held,
+so the oops happens in interrupt context and the box panics instead of just
+losing the worker. A slow or timing-out bus makes the window wider by leaving
+frames pending for longer.
+
+Resolve the vif through a new helper instead. The driver's own vif table is
+the only source of truth: the cached pointer is accepted only while that same
+pointer value is still registered in the table, and it is compared, never
+dereferenced. When the SKB carries no cached pointer the helper falls back to
+the recorded interface id exactly as the old code did, so frames that do carry
+a cached pointer no longer depend on the firmware echoing an id back. Every
+consumer of the resolved vif now handles NULL by completing or dropping the
+frame without touching per-interface state, and each one holds the RCU read
+lock from the lookup through to its last dereference.
+
+That is sound because the interface storage is released by free_netdev() from
+netdev_run_todo(), and every path leading there first passes the
+synchronize_net() that unregister_netdevice() runs once all interfaces have
+been closed. The table entry is dropped on every path that leads to the
+storage being released: .remove_interface clears it for an interface that came
+up, and .add_interface now clears it on its own failure path too, because
+mac80211 does not call .remove_interface for an interface whose .add_interface
+returned an error while its netdev is still freed. Without that second half
+the check would compare a dangling cached pointer against an equally dangling
+table entry and accept it, so it is a precondition of the validation rather
+than an extra hardening step. Only the table entry is dropped there; the
+per-vif resources that a partly completed add leaked are a separate issue.
+The grace period that precedes the release therefore always begins after the
+entry has been dropped, whether the interface was brought down before being
+deleted, deleted while still up, or never came up at all. This relies on every
+interface type the driver advertises being backed by a netdev, which holds.
+
+Known limitations. Comparing pointer values cannot distinguish a freed vif
+from a new one that happens to be allocated at the same address, so in that
+case the frame's statistics are attributed to the new BSS; the same applies to
+a reused interface id on the fallback path. The result is misattribution, not
+a crash. The vif table is also briefly empty while a hardware restart
+reconfigures, and while mac80211 removes and re-adds a running interface to
+change its MAC address; Tx statuses arriving in those windows are dropped
+conservatively. The copy of the status fill path built when the rate control
+module is disabled is fixed the same way for symmetry, though it is not
+compiled in this configuration.
+
+Upstream carries the same unsafe code. The vif resolution and all three
+dereferences are identical in 1.17.8, mm6108-2.0.1, mm6108-2.1.1 and in
+mm8108-2.1.0, which is the current main branch, so there is nothing to
+backport and this fix is written locally. Re-evaluate it when the driver is
+next uprevved.
+
+--- a/skbq.h
++++ b/skbq.h
+@@ -109,2 +109,52 @@
+ /**
++ * morse_skbq_tx_vif_get() - Resolve the still-live vif a queued Tx SKB belongs to.
++ *
++ * @mors:   Morse device.
++ * @skb:    The Tx SKB being completed or dropped. Only its control buffer is read.
++ * @vif_id: Interface id recorded for this frame, taken either from the Morse Tx
++ *          header (morse_buff_skb_header::tx_info.flags) or from the Tx status
++ *          reported by the chip (morse_skb_tx_status::flags). It is only used when
++ *          the SKB has no cached vif pointer, which matches what the driver did
++ *          before this helper existed.
++ *
++ * A Tx SKB can outlive the struct ieee80211_vif it was queued for: it may sit in
++ * morse_skbq::skbq or morse_skbq::pending for seconds (see tx_status_lifetime_ms)
++ * while the interface is torn down. ieee80211_tx_info::control.vif is a raw pointer
++ * cached when the frame was queued and must never be dereferenced on its own after
++ * that point. This helper accepts the cached pointer only while the same pointer
++ * value is still registered in the driver's vif table, and otherwise falls back to
++ * @vif_id.
++ *
++ * Must be called from an RCU read-side critical section, and the returned vif (and
++ * anything reached through it, including its drv_priv) may only be dereferenced
++ * inside that same section. The table entry is dropped on every path that leads to
++ * the interface storage being released: .remove_interface clears it for interfaces
++ * that came up, and .add_interface clears it on its own failure path, because
++ * mac80211 does not call .remove_interface for an interface whose .add_interface
++ * returned an error. The storage itself is only released by free_netdev() from
++ * netdev_run_todo(), which is always reached after the synchronize_net() that
++ * unregister_netdevice() runs once every interface has already been closed. So the
++ * grace period that precedes the release always begins after the table entry has
++ * been dropped, and an RCU section that observed a live table entry keeps the
++ * storage alive until it ends. This holds whether the interface is brought down
++ * before it is deleted, deleted while still up, or never came up at all. It relies
++ * on every supported interface type being backed by a netdev, which is true for all
++ * types this driver advertises.
++ *
++ * Return: the live vif, or NULL. NULL is a normal, expected outcome and callers
++ *         must handle it by completing or dropping the frame without touching any
++ *         per-interface state. Its causes are:
++ *          - the interface was removed while the frame was in flight;
++ *          - adding the interface failed part way through, so the driver dropped the
++ *            table entry again and the interface will never be usable;
++ *          - the driver is between a hardware restart's interface cleanup and the
++ *            mac80211 reconfiguration that re-adds the interfaces, during which the
++ *            table is empty even though the mac80211 interfaces still exist (the
++ *            same is true for the short window in which mac80211 re-adds an
++ *            interface to change its MAC address while it is running).
++ */
++struct ieee80211_vif *morse_skbq_tx_vif_get(struct morse *mors, struct sk_buff *skb,
++					    int vif_id);
++
++/**
+  * @brief Flush pending and in-flight tx SKBs from the queue.
+--- a/skbq.c
++++ b/skbq.c
+@@ -108,4 +108,5 @@
+ 	rcu_read_lock();
+-	vif = txi->control.vif ? txi->control.vif : morse_get_vif_from_tx_status(mors, tx_sts);
+-	sta = ieee80211_find_sta(vif, hdr->addr1);
++	vif = morse_skbq_tx_vif_get(mors, skb,
++				    MORSE_TX_CONF_FLAGS_VIF_ID_GET(le32_to_cpu(tx_sts->flags)));
++	sta = vif ? ieee80211_find_sta(vif, hdr->addr1) : NULL;
+ 	if (sta)
+@@ -398,2 +399,32 @@
+
++/* See the kerneldoc for this function in skbq.h. */
++struct ieee80211_vif *morse_skbq_tx_vif_get(struct morse *mors, struct sk_buff *skb,
++					    int vif_id)
++{
++	struct ieee80211_vif *cached = IEEE80211_SKB_CB(skb)->control.vif;
++	struct ieee80211_vif *vif = NULL;
++	int i;
++
++	/* No cached pointer: resolve from the id recorded for this frame. This is
++	 * the same fallback the driver used before this helper existed, and it is
++	 * already range checked and locked internally.
++	 */
++	if (!cached)
++		return morse_get_vif_from_vif_id(mors, vif_id);
++
++	/* Pointer comparison only - the cached value is never dereferenced. If it is
++	 * no longer registered, the frame has outlived its interface.
++	 */
++	spin_lock_bh(&mors->vif_list_lock);
++	for (i = 0; i < mors->max_vifs; i++) {
++		if (__morse_get_vif_from_vif_id(mors, i) == cached) {
++			vif = cached;
++			break;
++		}
++	}
++	spin_unlock_bh(&mors->vif_list_lock);
++
++	return vif;
++}
++
+ static void morse_skbq_sta_eosp(struct morse *mors, struct sk_buff *skb)
+@@ -404,5 +435,8 @@
+
+-	vif = (txi->control.vif) ? txi->control.vif :
+-	    morse_get_vif_from_vif_id(mors, MORSE_TX_CONF_FLAGS_VIF_ID_GET
+-				      (le32_to_cpu(hdr->tx_info.flags)));
++	/* Held from resolving the vif through to the last dereference of it. */
++	rcu_read_lock();
++	vif = morse_skbq_tx_vif_get(mors, skb,
++				    MORSE_TX_CONF_FLAGS_VIF_ID_GET(le32_to_cpu(hdr->tx_info.flags)));
++
++	/* The vif id above must be read before the Morse header is pulled off. */
+ 	morse_skb_remove_hdr_after_sent_to_chip(skb);
+@@ -413,3 +447,3 @@
+ 	if (txi->flags & IEEE80211_TX_STATUS_EOSP) {
+-		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++		struct ieee80211_hdr *hdr80211 = (struct ieee80211_hdr *)skb->data;
+ 		struct ieee80211_sta *sta;
+@@ -417,10 +451,8 @@
+ 		if (vif) {
+-			/* Must be held while finding and dereferencing sta */
+-			rcu_read_lock();
+-			sta = ieee80211_find_sta(vif, hdr->addr1);
++			sta = ieee80211_find_sta(vif, hdr80211->addr1);
+ 			if (sta)
+ 				ieee80211_sta_eosp(sta);
+-			rcu_read_unlock();
+-		}
+-	}
++		}
++	}
++	rcu_read_unlock();
+ }
+@@ -455,5 +487,6 @@
+ {
+-	struct ieee80211_tx_info *txi = IEEE80211_SKB_CB(skb);
+ 	struct ieee80211_vif *vif = NULL;
+ 	struct morse_vif *mors_vif;
++	bool can_filter;
++	bool ap_like;
+
+@@ -464,11 +497,18 @@
+ 		mors_vif = morse_wiphy_get_sta_vif(mq->mors);
++		can_filter = mors_vif && mors_vif->supports_ps_filter;
++		ap_like = false;
+ 	} else {
+-		vif = txi->control.vif ?
+-		    txi->control.vif : morse_get_vif_from_tx_status(mq->mors, tx_sts);
+-		mors_vif = ieee80211_vif_to_morse_vif(vif);
+-	}
+-
+-	if (!mors_vif->supports_ps_filter) {
+-		/* Do not rebuffer invalid pages, or on VIFs that do not support
+-		 * PS filtering.
++		/* Held from resolving the vif through to the last dereference. */
++		rcu_read_lock();
++		vif = morse_skbq_tx_vif_get(mq->mors, skb,
++				MORSE_TX_CONF_FLAGS_VIF_ID_GET(le32_to_cpu(tx_sts->flags)));
++		mors_vif = vif ? ieee80211_vif_to_morse_vif(vif) : NULL;
++		can_filter = mors_vif && mors_vif->supports_ps_filter;
++		ap_like = vif && vif->type != NL80211_IFTYPE_STATION;
++		rcu_read_unlock();
++	}
++
++	if (!can_filter) {
++		/* Do not rebuffer invalid pages, frames whose interface has gone
++		 * away, or VIFs that do not support PS filtering.
+ 		 */
+@@ -479,3 +519,3 @@
+ 	/* mac80211 handles per-station re-buffering in AP mode */
+-	if (vif && vif->type != NL80211_IFTYPE_STATION)
++	if (ap_like)
+ 		return false;
+@@ -533,2 +573,29 @@
+ 			continue;
++		}
++
++		/* Only softmac, non-monitor completions resolve a vif below. */
++		if (!is_fullmac_mode() && !mors->monitor_mode) {
++			bool vif_gone;
++
++			rcu_read_lock();
++			vif_gone = !morse_skbq_tx_vif_get(mors, tx_skb,
++					MORSE_TX_CONF_FLAGS_VIF_ID_GET(
++						le32_to_cpu(tx_sts->flags)));
++			rcu_read_unlock();
++
++			if (vif_gone) {
++				/* No live interface owns this frame any more: it was
++				 * either removed while the frame was in flight, or
++				 * the vif table is empty because a hardware restart
++				 * has not finished reconfiguring. Drop the frame
++				 * instead of reporting a status against an interface
++				 * we cannot resolve.
++				 */
++				MORSE_SKB_ERR_RATELIMITED(mors,
++					"tx status with no live interface [pktid:%u chan:%u]\n",
++					le32_to_cpu(tx_sts->pkt_id), tx_sts->channel);
++				__skbq_drop_pending_skb(mq, tx_skb);
++				spin_unlock_bh(&mq->lock);
++				continue;
++			}
+ 		}
+@@ -1346,4 +1413,17 @@
+
+-		vif = txi->control.vif ? txi->control.vif :
+-				morse_get_vif_from_tx_status(mors, tx_sts);
++		vif = morse_skbq_tx_vif_get(mors, skb,
++				MORSE_TX_CONF_FLAGS_VIF_ID_GET(le32_to_cpu(tx_sts->flags)));
++		if (!vif) {
++			/* No live interface owns this frame any more. Nothing from
++			 * here on may touch per-interface state, so drop the frame
++			 * without reporting a status for it.
++			 */
++			rcu_read_unlock();
++			MORSE_SKB_ERR_RATELIMITED(mors,
++				"tx finish with no live interface [chan:%u]\n",
++				tx_sts->channel);
++			mors->debug.page_stats.tx_status_dropped++;
++			morse_tx_complete_or_free(mors, skb, tx_sts->channel, false);
++			return 0;
++		}
+
+--- a/rc.c
++++ b/rc.c
+@@ -654,3 +654,4 @@
+
+-	vif = txi->control.vif ? txi->control.vif : morse_get_vif_from_tx_status(mors, tx_sts);
++	vif = morse_skbq_tx_vif_get(mors, skb,
++				    MORSE_TX_CONF_FLAGS_VIF_ID_GET(le32_to_cpu(tx_sts->flags)));
+
+@@ -662,2 +663,5 @@
+ 	if (!msta)
++		goto exit;
++
++	if (!vif)
+ 		goto exit;
+--- a/bss_stats.c
++++ b/bss_stats.c
+@@ -300,3 +300,3 @@
+
+-	if (vif->type != NL80211_IFTYPE_AP || !skb ||
++	if (!vif || vif->type != NL80211_IFTYPE_AP || !skb ||
+ 		!morse_bss_stats_is_enabled(mors_vif))
+--- a/bss_stats.h
++++ b/bss_stats.h
+@@ -183,3 +183,4 @@
+  *
+- * @vif: pointer to ieee80211_vif
++ * @vif: pointer to ieee80211_vif. May be NULL when the interface a queued Tx
++ *       frame belonged to has already gone away, in which case this is a no-op.
+  * @skb: Tx skbuff
+--- a/pv1.c
++++ b/pv1.c
+@@ -660,4 +660,4 @@
+ {
+-	struct morse_vif *mors_vif = ieee80211_vif_to_morse_vif(vif);
+-	struct morse *mors = morse_vif_to_morse(mors_vif);
++	struct morse_vif *mors_vif;
++	struct morse *mors;
+ 	u16 pv1_fc = le16_to_cpu(pv1_hdr->frame_ctrl);
+@@ -667,2 +667,8 @@
+ 	u16 aid;
++
++	if (!vif)
++		return NULL;
++
++	mors_vif = ieee80211_vif_to_morse_vif(vif);
++	mors = morse_vif_to_morse(mors_vif);
+
+--- a/mac.c
++++ b/mac.c
+@@ -3529,2 +3529,11 @@
+ exit:
++	/* mac80211 does not call .remove_interface when .add_interface fails, so
++	 * the table entry has to be dropped here. Leaving it behind would outlive
++	 * the interface: the netdev is freed without .remove_interface ever being
++	 * called, and a queued Tx completion would then validate a stale cached
++	 * vif pointer against an equally stale table entry and accept it.
++	 */
++	if (ret && morse_get_vif_from_vif_id(mors, mors_vif->id) == vif)
++		morse_vif_remove(mors, mors_vif->id);
++
+ 	mutex_unlock(&mors->lock);
