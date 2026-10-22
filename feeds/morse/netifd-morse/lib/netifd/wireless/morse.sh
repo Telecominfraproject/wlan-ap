@@ -1,13 +1,27 @@
 #!/bin/sh
 
-echo "Adding device handler type: morse"
+# NOTE: do NOT print anything to stdout at handler top level. On 25.12 the
+# netifd ucode wireless master loads every /lib/netifd/wireless/*.sh via
+# handler_load(), which runs "<handler> '' dump" and parses stdout line by
+# line as JSON. Stray non-JSON lines here (the old "Adding device handler"
+# / "Configuring" echoes) corrupt that stream and make handler_load spin in
+# its `while (!f.error())` loop -> netifd busy-loops (state=R, network dead).
+# mac80211.sh keeps its top level output-free for the same reason.
 
 . /lib/netifd/netifd-wireless.sh
 . /lib/netifd/hostapd_s1g.sh
 . /lib/netifd/morse/morse_overrides.sh
 . /lib/netifd/morse/morse_utils.sh
 
-echo "Configuring $3"
+# Capture the script-level command BEFORE init_wireless_driver consumes "$@".
+# handler_load() registers this handler via `morse.sh "" dump`, so here the
+# 2nd positional arg is "dump". drv_morse_cleanup() (called with no args by the
+# framework during that dump path) must use THIS flag to skip its
+# side-effecting hostapd_common_cleanup (killall meshd-nl80211), which would
+# otherwise corrupt the JSON dump written to handler_load's tmpfd and leave the
+# morse handler unregistered (no radio2, no wlan0).
+MORSE_HANDLER_CMD="$2"
+
 init_wireless_driver "$@"
 
 MM_MOD_INT="watchdog_interval_secs max_rates max_rate_tries spi_clock_speed max_txq_len virtual_sta_max max_aggregation_count
@@ -87,6 +101,24 @@ build_morse_mod_params(){
 }
 
 drv_morse_cleanup() {
+	# CRITICAL: skip the real cleanup during the "dump" phase.
+	#
+	# 25.12 handler_load() registers each wireless handler by running
+	# "./morse.sh '' dump >&<tmpfd>" and parsing that fd as the JSON dump.
+	# The framework's init_wireless_driver() invokes drv_<name>_cleanup as
+	# part of that dump path. hostapd_common_cleanup runs `killall
+	# meshd-nl80211` (and touches processes/fds); doing that while the dump
+	# is being written to the inherited tmpfd corrupts the stream so
+	# handler_load reads 0 objects -> the morse handler is NEVER registered
+	# -> radio2 never enters netifd (no wlan0). mac80211's cleanup does no
+	# such thing, which is why only morse broke.
+	#
+	# During dump the script was invoked as `morse.sh "" dump`, captured in
+	# MORSE_HANDLER_CMD at the top level (the framework calls this function
+	# with no positional args, so we cannot rely on $2 here). Skip the
+	# side-effecting cleanup in that case; only run it for genuine
+	# teardown/cleanup calls.
+	[ "$MORSE_HANDLER_CMD" = "dump" ] && return 0
 	hostapd_common_cleanup
 }
 
@@ -155,6 +187,24 @@ drv_morse_init_iface_config() {
 
 	#beacon interval
 	config_add_int beacon_int
+}
+
+# The 25.12 netifd-wireless.sh framework's init_wireless_driver() calls
+# drv_<name>_init_{device,iface,vlan,station}_config during the "dump" phase.
+# morse only defined device/iface; the missing vlan/station callbacks made the
+# dump eval hit "drv_morse_init_vlan_config: not found" and abort mid-way, so
+# the handler's JSON dump was truncated. handler_load() then read 0 objects and
+# the morse wireless handler was NEVER registered -> radio2 never entered
+# netifd's wdev state machine (network.wireless up radio2 = "Not found", no
+# wlan0). Define the two callbacks (mirroring mac80211) so the dump completes
+# and morse registers as a wireless handler.
+drv_morse_init_vlan_config() {
+	config_add_string name
+	config_add_int vid
+}
+
+drv_morse_init_station_config() {
+	config_add_string ifname
 }
 
 get_mesh11sd_config() {
@@ -257,13 +307,25 @@ drv_morse_setup() {
 	MOD_PARAMS=
 	build_morse_mod_params
 
-	#if [ -n "$country" ]; then
-	#	if change_module_parameters || ! is_module_loaded; then
-	#		is_module_loaded && rmmod morse
-	#		/sbin/kmodloader /etc/modules.d/morse
-	#	fi
-		# don't do iw reg set as in mac80211
-	#fi
+	# The morse driver's regulatory country is a module parameter, fixed at
+	# insertion time (boot loads it with the default country=US). When the
+	# cloud/uci config selects another country (e.g. JP), the driver keeps
+	# emitting "Regulatory domain JP is not consistent with loaded country
+	# code US" and repeatedly runs morse_mac_restart. build_morse_mod_params
+	# has folded the desired country into MOD_PARAMS, so reload the module
+	# with the new parameters whenever they changed (or it isn't loaded yet).
+	#
+	# Deliberately do NOT issue a global "iw reg set" here: the mt7996
+	# 2.4G/5G radios are not self-managed and share the single global
+	# cfg80211 regulatory domain, so a global reg set for the HaLow country
+	# would be picked up by mt7996's reg_notifier and clobber 2.4G/5G. The
+	# per-phy S1G regulatory is handled in morse_set_ap_regulatory instead.
+	if [ -n "$country" ]; then
+		if change_module_parameters || ! is_module_loaded; then
+			is_module_loaded && rmmod morse
+			/sbin/kmodloader /etc/modules.d/morse
+		fi
+	fi
 
 	local retries=4
 	while ! find_phy; do
@@ -280,6 +342,21 @@ drv_morse_setup() {
 	# happens in two situations: boot, and a module load above.
 	auto_ifname=$(morse_get_ifname "$phy")
 	if [ $auto_ifname ]; then
+		# EdgeCore: after a country-change module reload the driver kicks
+		# off a firmware restart (morse_mac_restart). The phy node appears
+		# before that restart has settled, so starting hostapd_s1g too early
+		# races the driver's nl80211 (re-)registration and fails with
+		# "nl80211: kernel reports: Match already configured", after which
+		# bring-up only recovers on the next netifd reconf retry (~1-2 min).
+		# Gate on firmware readiness: morse_cli hw_version fails until the
+		# firmware is back up, so poll it before proceeding.
+		local _ready_retries=40
+		while ! morse_cli -i "$auto_ifname" hw_version >/dev/null 2>&1; do
+			sleep 0.25
+			_ready_retries="$((_ready_retries - 1))"
+			[ "$_ready_retries" -le 0 ] && break
+		done
+
 		# As a happy byproduct of the bonus wlan?, we can interact
 		# without module to determine the MAC and chip id.
 		# This is an ugly place to do this, since we really only
@@ -393,7 +470,42 @@ drv_morse_setup() {
 		morse_cli -i $ifname li $unscaled_interval $scale_factor
 	fi
 
+	# Seed the nl80211 survey so cloud/iwinfo telemetry has channel-survey
+	# data from boot. Unlike the mt7996 (mac80211) 2.4G/5G radios - which
+	# accumulate operating-channel survey continuously and therefore already
+	# have a survey dump right after bring-up - the morse S1G firmware only
+	# populates the survey table AFTER an explicit scan (per Morse support:
+	# "run iw dev <if> scan first, then the survey dump has data"). Without
+	# this the HaLow radio shows no survey at boot while 2.4G/5G do.
+	#
+	# Kick a single background scan once the interface is up. Done detached so
+	# it never blocks/fails bring-up, and only once here (netifd re-runs setup
+	# on reconf, which refreshes it). Harmless on AP/mesh: it is a brief
+	# off-channel scan; failures (busy/unsupported) are ignored.
+	[ -n "$ifname" ] && morse_survey_seed_scan "$ifname"
+
 	wireless_set_up
+}
+
+# One-shot, detached survey seed scan (see call site in drv_morse_setup).
+morse_survey_seed_scan() {
+	local _if="$1"
+	(
+		# Wait briefly for the netdev to be operationally up so the scan
+		# request is accepted, then trigger a single scan. morse populates
+		# its survey table off the back of this.
+		local _tries=20
+		while [ "$_tries" -gt 0 ]; do
+			[ -d "/sys/class/net/${_if}" ] && \
+				[ "$(cat /sys/class/net/${_if}/operstate 2>/dev/null)" != "down" ] && break
+			_tries=$((_tries - 1))
+			sleep 0.5
+		done
+		# A single scan is enough to make `iw dev <if> survey dump` return
+		# data. Ignore errors (e.g. transient EBUSY); the next reconf retries.
+		iw dev "${_if}" scan >/dev/null 2>&1 || \
+			iw dev "${_if}" scan passive >/dev/null 2>&1
+	) >/dev/null 2>&1 &
 }
 
 drv_morse_teardown() {
@@ -457,7 +569,13 @@ morse_iface_bringup() {
 
 	set_default wds 0
 
-	[ -z "$ifname" ] && ifname="$(_find_free_ifname wlan)"
+	# Name the HaLow netdev after the mt7996 (mac80211) convention instead of
+	# the generic "wlanN": <phy>-<mode><idx>, e.g. phy3-ap0 / phy3-sta0 /
+	# phy3-mesh0. $phy is the morse phy resolved by find_phy() (NOT hardcoded -
+	# the HaLow dongle may enumerate as any phyN), so the name tracks the real
+	# phy. Only auto-name when the config didn't pin an ifname; a cloud/uci
+	# supplied ifname is still honoured (mirrors mac80211_prepare_vif).
+	[ -z "$ifname" ] && ifname="$(morse_set_ifname "$phy" "$mode")"
 
 	json_add_string ifname "$ifname"
 	json_add_string phy "$phy"
@@ -543,6 +661,30 @@ _find_free_ifname()
 	done
 
 	echo "$prefix$idx"
+}
+
+# Build a HaLow netdev name the mt7996/mac80211 way: <phy>-<mode><idx>.
+# mac80211 uses "$phy$suffix-<mode><idx>" (e.g. phy1.1-ap0); morse has a single
+# S1G band so there is no ".N" band suffix -> phy3-ap0 / phy3-sta0 / phy3-mesh0.
+# The mode maps sta/adhoc the same way mac80211 does (adhoc -> ibss). phy is
+# passed in (dynamic, whatever phyN the dongle enumerated as). Picks the first
+# free index so multiple vifs of the same mode don't collide.
+morse_set_ifname()
+{
+	local _phy="$1"
+	local _mode="$2"
+	local _p
+
+	case "$_mode" in
+		ap)      _p=ap ;;
+		sta)     _p=sta ;;
+		mesh)    _p=mesh ;;
+		adhoc)   _p=ibss ;;
+		monitor) _p=mon ;;
+		*)       _p=ap ;;
+	esac
+
+	_find_free_ifname "${_phy}-${_p}"
 }
 
 morse_setup_ap() {

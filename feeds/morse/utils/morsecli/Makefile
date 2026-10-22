@@ -10,15 +10,15 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=morsecli
 PKG_RELEASE=5
 
-PKG_VERSION:=1.12.4
+PKG_VERSION:=1.17.8
 
 PKG_LICENSE:=GPLv2
 PKG_LICENSE_FILES:=
 
 PKG_SOURCE_VERSION:=$(PKG_VERSION)
 PKG_SOURCE_URL:=https://github.com/MorseMicro/morse_cli.git
-PKG_MIRROR_HASH:=5adc419fb649c38f79affb3fffbd2d4f1f6a554f66a385b431b72998a22a4a9a
-PKG_HASH:=04c88a3aea99082a29eb1f84a9b62dcbb85980fa040e0e34901c1826f33ae74c
+PKG_MIRROR_HASH:=skip
+PKG_HASH:=skip
 PKG_SOURCE_PROTO:=git
 
 PKG_MAINTAINER:=Morse Micro <info@morsemicro.com>
@@ -30,7 +30,7 @@ define Package/morsecli
   SECTION:=utils
   CATEGORY:=Network
   TITLE:=Morse Micro WIFI HaLow driver command line tool
-  DEPENDS:= +kmod-morse +libnl
+  DEPENDS:= kmod-morse +libnl +libusb-1.0
   FILES:=\
 	$(PKG_BUILD_DIR)/morse_cli
   PROVIDES:=morsectrl
