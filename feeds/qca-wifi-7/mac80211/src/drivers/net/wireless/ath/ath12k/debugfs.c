@@ -906,7 +906,9 @@ static ssize_t ath12k_debugfs_dump_device_dp_stats(struct file *file,
 			"Desc parse error", "Invalid Cookie", "Invalid Push reason",
 			"Invalid hw id", "Null Partner dp", "Process Null Partner dp",
 			"Null Pdev", "Null ar", "CAC Running", "Scatter Gather",
-			"Invalid NWifi Hdr len", "REO Generic", "RXDMA Generic"};
+			"Invalid NWifi Hdr len", "REO Generic", "RXDMA Generic",
+			"CC VA mismatch(not dropped)", "Stale or corrupt desc", 
+			"Desc owner mismatch"};
 
 	static const char *wbm_rel_src[HAL_WBM_REL_SRC_MODULE_MAX] = {
                         "TQM", "Rxdma", "Reo", "FW", "SW" };
