@@ -131,6 +131,7 @@ platform_check_image() {
 	hfcl,ion4xe|\
 	cambium,xv2-2|\
 	cambium,xv2-2t0|\
+	cambium,xv2-2t1|\
 	yuncore,ax840|\
 	yuncore,fap650)
 		[ "$magic_long" = "73797375" ] && return 0
@@ -186,6 +187,7 @@ platform_do_upgrade() {
 		# Write the bank we are NOT running from, the way the HFCL ION4x
 		# boards above do.
 	cambium,xv2-2t0)
+	cambium,xv2-2t1)
 		# Two 96 MiB NAND banks, rootfs (A) and rootfs_1 (B), injected by the
 		# vendor U-Boot's mtdparts rather than the device tree. Write the bank
 		# we are NOT running from, the way the HFCL ION4x boards above do.
