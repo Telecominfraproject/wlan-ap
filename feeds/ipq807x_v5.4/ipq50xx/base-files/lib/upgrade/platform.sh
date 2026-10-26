@@ -90,6 +90,7 @@ platform_check_image() {
 	optimcloud,d50|\
 	optimcloud,d50-5g|\
 	cambium,xv2-22h|\
+	cambium,xv2-21x|\
 	yuncore,fap655|\
 	glinet,b3000|\
 	udaya,a6-id2|\
@@ -113,6 +114,7 @@ platform_do_upgrade() {
 	board=$(board_name)
 	case $board in
 	cambium,xv2-22h)
+	cambium,xv2-21x)
 		# Two identical NAND banks, rootfs @0x80000 and rootfs_1 @0x6080000,
 		# selected by the vendor U-Boot's bootcmd, which runs
 		#   run boot_a; run boot_b; bootipq
@@ -218,6 +220,7 @@ platform_do_upgrade() {
 	optimcloud,d50-5g|\
 	emplus,wap581|\
 	cambium,xv2-22h|\
+	cambium,xv2-21x|\
 	yuncore,fap655)
 		[ -f /proc/boot_info/rootfs/upgradepartition ] && {
 			CI_UBIPART="$(cat /proc/boot_info/rootfs/upgradepartition)"
