@@ -80,6 +80,17 @@ define Device/cambium_xv2_2
   DEVICE_PACKAGES := ath11k-wifi-cig-wf188n uboot-envtools
 endef
 TARGET_DEVICES += cambium_xv2_2
+# The XV2-2T0 has only the integrated IPQ6018 radio. ath11k-wifi-cig-wf188n
+# carries Cambium's own bdwlan.b10-snow_leopard, a flat 64 KiB BDF installed
+# as board.bin.
+define Device/cambium_xv2_2t0
+  DEVICE_TITLE := Cambium XV2-2T0
+  DEVICE_DTS := qcom-ipq6018-cambium-xv2-2t0
+  DEVICE_DTS_CONFIG := config@cp01-c1,config@cp01-c1-1,config@cp01-c1-2
+  SUPPORTED_DEVICES := cambium,xv2-2t0
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf188n uboot-envtools
+endef
+TARGET_DEVICES += cambium_xv2_2t0
 
 define Device/edgecore_eap101
   DEVICE_TITLE := EdgeCore EAP101
