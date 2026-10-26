@@ -107,6 +107,21 @@ define Device/cambium_xv2_2t1
   DEVICE_PACKAGES := ath11k-wifi-cig-wf188n uboot-envtools
 endef
 TARGET_DEVICES += cambium_xv2_2t1
+# The XE3-4 is a tri-band AP-CP01 design with a QCN9074 on PCIe for a third,
+# 6 GHz, radio. ath11k-firmware-qcn9000 brings that radio's firmware and
+# ath11k-wifi-wallys-dr6018-v4 the closest open-source board data for both
+# chips (the Wallys DR6018-v4 pairs the same IPQ6018 + QCN9074). Its vendor
+# U-Boot selects config@cp01-c3-xv3-4 for the board's hardware ID 3, so that is
+# the default; config@cp01-c3 is the bootloader's board-type fallback and
+# config@cp01-c1 what a custom bootcmd names.
+define Device/cambium_xe3_4
+  DEVICE_TITLE := Cambium XE3-4
+  DEVICE_DTS := qcom-ipq6018-cambium-xe3-4
+  DEVICE_DTS_CONFIG := config@cp01-c3-xv3-4,config@cp01-c3,config@cp01-c1
+  SUPPORTED_DEVICES := cambium,xe3-4
+  DEVICE_PACKAGES := ath11k-wifi-wallys-dr6018-v4 uboot-envtools ath11k-firmware-qcn9000
+endef
+TARGET_DEVICES += cambium_xe3_4
 
 define Device/edgecore_eap101
   DEVICE_TITLE := EdgeCore EAP101
