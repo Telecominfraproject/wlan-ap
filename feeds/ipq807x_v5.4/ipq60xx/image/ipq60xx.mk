@@ -67,6 +67,20 @@ define Device/hfcl_ion4xi
 endef
 TARGET_DEVICES += hfcl_ion4xi
 
+# The XV2-2 is the AP-CP01-C1 design with one 2.5G port and the integrated
+# IPQ6018 radio alone, no PCIe; ath11k-wifi-cig-wf188n carries its board
+# data. Its U-Boot environment has no hwid, so the vendor bootipq falls back to
+# the FIT's default configuration: config@cp01-c1 is the only one listed, so
+# that is what it finds.
+define Device/cambium_xv2_2
+  DEVICE_TITLE := Cambium XV2-2
+  DEVICE_DTS := qcom-ipq6018-cambium-xv2-2
+  DEVICE_DTS_CONFIG := config@cp01-c1
+  SUPPORTED_DEVICES := cambium,xv2-2
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf188n uboot-envtools
+endef
+TARGET_DEVICES += cambium_xv2_2
+
 define Device/edgecore_eap101
   DEVICE_TITLE := EdgeCore EAP101
   DEVICE_DTS := qcom-ipq6018-edgecore-eap101
