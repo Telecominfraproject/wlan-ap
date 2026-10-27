@@ -303,6 +303,13 @@ function iface_macfilter(config) {
 		append('macaddr_acl', 0);
 		break;
 
+	case 'radius':
+		/* RADIUS MAC authentication. For the non-802.1X auth types
+		 * iface_ppsk() already sets it together with the server. */
+		if (!(config.auth_type in [ 'none', 'owe', 'psk', 'sae', 'psk-sae', 'sae-ext', 'psk-sae-ext', 'wep' ]))
+			append('macaddr_acl', 2);
+		return;
+
 	default:
 		return;
 	}
