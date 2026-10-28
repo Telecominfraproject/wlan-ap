@@ -8,7 +8,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=netifd-morse
-PKG_RELEASE=1
+PKG_RELEASE=2
 
 PKG_LICENSE:=GPLv2
 PKG_LICENSE_FILES:=
@@ -33,9 +33,8 @@ endef
 define Package/netifd-morse/install
 	$(INSTALL_DIR) $(1)/lib/
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
-	$(INSTALL_DIR) $(1)/etc/init.d
 	$(CP) ./lib/* $(1)/lib/
-	$(INSTALL_BIN) ./etc/init.d/halow-gpio-reset $(1)/etc/init.d/
+	$(CP) ./etc/uci-defaults/* $(1)/etc/uci-defaults/
 endef
 
 $(eval $(call BuildPackage,netifd-morse))
