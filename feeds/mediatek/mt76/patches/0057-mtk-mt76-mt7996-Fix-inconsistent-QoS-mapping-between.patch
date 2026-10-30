@@ -1,0 +1,197 @@
+From 5581dd08259d939b09cee94a1a54d35bbe99e4a9 Mon Sep 17 00:00:00 2001
+From: Rex Lu <rex.lu@mediatek.com>
+Date: Fri, 7 Jun 2024 13:51:25 +0800
+Subject: [PATCH 57/89] mtk: mt76: mt7996: Fix inconsistent QoS mapping between
+ SW and HW
+
+Fix inconsistent QoS mapping between SW and HW.
+Specifically, the mapping from IP DSCP to IEEE 802.11 user priority may be customized.
+Therefore, driver needs to pass the mapping to HW, so that the QoS type of traffic can be mapped in a consistent manner for both SW and HW paths.
+
+Refactor mt7996_mcu_set_qos_map function.
+1. According to fw logic, it will fill the dscp value 0~63 correspond tid.
+for example:
+The last set is 48-56 in the default qos map from hostapd.
+And it will set tid 7. but 57-63 in original function will not fill any value,
+so it will set zero to fw. Once the value of dscp is 57. mac80211 will correspond to tid 7.
+and fw will correspond to tid 0.
+
+Signed-off-by: Benjamin Lin <benjamin-jw.lin@mediatek.com>
+Signed-off-by: Rex Lu <rex.lu@mediatek.com>
+
+sync mt7996_net_fill_forward_path
+
+Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
+---
+ mt76_connac_mcu.h |  1 +
+ mt7996/main.c     | 27 ++++++++++++++++++++--
+ mt7996/mcu.c      | 57 +++++++++++++++++++++++++++++++++++++++++++++++
+ mt7996/mt7996.h   |  5 +++++
+ 4 files changed, 88 insertions(+), 2 deletions(-)
+
+diff --git a/mt76_connac_mcu.h b/mt76_connac_mcu.h
+index d969510ce..69e59678d 100644
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1281,6 +1281,7 @@ enum {
+ 	MCU_EXT_CMD_GROUP_PRE_CAL_INFO = 0xab,
+ 	MCU_EXT_CMD_DPD_PRE_CAL_INFO = 0xac,
+ 	MCU_EXT_CMD_PHY_STAT_INFO = 0xad,
++	MCU_EXT_CMD_SET_QOS_MAP = 0xb4,
+ 	MCU_EXT_CMD_WF_RF_PIN_CTRL = 0xbd,
+ };
+ 
+diff --git a/mt7996/main.c b/mt7996/main.c
+index 10f8b68f3..1d1a67f13 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -2710,17 +2710,20 @@ mt7996_net_fill_forward_path(struct ieee80211_hw *hw,
+ 			     struct net_device_path *path)
+ {
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
+ 	struct mt7996_sta *msta = (struct mt7996_sta *)sta->drv_priv;
+ 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
+ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
+ 	struct mt7996_sta_link *msta_link;
+ 	struct mt7996_vif_link *link;
++	u8 tid = mvif->qos_map[path->mtk_wdma.tid >> 2];
++	u8 link_id = (sta->mlo && tid % 2) ? msta->seclink_id : msta->deflink_id;
+ 
+ 	link = mt7996_vif_link(dev, vif, msta->deflink_id);
+ 	if (!link)
+ 		return -EIO;
+ 
+-	msta_link = mt7996_sta_link(msta, msta->deflink_id);
++	msta_link = mt7996_sta_link(msta, link_id);
+ 	if (!msta_link)
+ 		return -EIO;
+ 
+@@ -2759,6 +2762,7 @@ mt7996_net_fill_forward_path(struct ieee80211_hw *hw,
+ 	path->mtk_wdma.bss = link->mt76.idx;
+ 	path->mtk_wdma.queue = 0;
+ 	path->mtk_wdma.wcid = msta_link->wcid.idx;
++	path->mtk_wdma.tid = tid;
+ 
+ 	if (ieee80211_hw_check(hw, SUPPORTS_AMSDU_IN_AMPDU) &&
+ 	    mtk_wed_is_amsdu_supported(wed))
+@@ -2915,7 +2919,26 @@ static int
+ mt7996_set_qos_map(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 		   struct cfg80211_qos_map *qos_map)
+ {
+-	return 0;
++	struct mt7996_dev *dev = mt7996_hw_dev(hw);
++	unsigned long valid_links = vif->valid_links ?: BIT(0);
++	unsigned int link_id;
++	int ret = 0;
++
++	mutex_lock(&dev->mt76.mutex);
++	for_each_set_bit(link_id, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++		struct mt7996_vif_link *mconf =
++			mt7996_vif_link(dev, vif, link_id);
++
++		if (!mconf)
++			continue;
++
++		ret = mt7996_mcu_set_qos_map(dev, vif, mconf, qos_map);
++		if(ret)
++			break;
++	}
++	mutex_unlock(&dev->mt76.mutex);
++
++	return ret;
+ }
+ 
+ const struct ieee80211_ops mt7996_ops = {
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 14fa78283..5f6b3064c 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -7792,4 +7792,61 @@ int mt7996_mcu_set_csi(struct mt7996_phy *phy, u8 mode,
+ 		return -EINVAL;
+ 	}
+ }
++
++int mt7996_mcu_set_qos_map(struct mt7996_dev *dev, struct ieee80211_vif *vif,
++			   struct mt7996_vif_link *link,
++			   struct cfg80211_qos_map *usr_qos_map)
++{
++	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
++	struct {
++		u8 bss_idx;
++		u8 qos_map_enable;
++		u8 __rsv[2];
++		s8 qos_map[IP_DSCP_NUM];
++	} __packed req = {
++		.bss_idx = link->mt76.idx,
++		.qos_map_enable = true,
++	};
++	s8 i;
++
++	/* Default QoS map, defined in section 2.3 of RFC8325.
++	 * Three most significant bits of DSCP are used as UP.
++	 */
++	for (i = 0; i < IP_DSCP_NUM; ++i)
++		req.qos_map[i] = i >> 3;
++
++	/* Recommended QoS map, defined in section 4 of RFC8325.
++	 * Used in cfg80211_classify8021d since kernel v6.8.
++	 */
++	req.qos_map[10] = req.qos_map[12] = req.qos_map[14] = req.qos_map[16] = 0;
++	req.qos_map[18] = req.qos_map[20] = req.qos_map[22] = 3;
++	req.qos_map[24] = 4;
++	req.qos_map[40] = 5;
++	req.qos_map[44] = req.qos_map[46] = 6;
++	req.qos_map[48] = 7;
++
++	/* User-defined QoS map */
++	if (usr_qos_map) {
++		for (i = 0; i < IEEE80211_NUM_UPS; ++i) {
++			u8 low = usr_qos_map->up[i].low;
++			u8 high = usr_qos_map->up[i].high;
++
++			if (low < IP_DSCP_NUM && high < IP_DSCP_NUM && low <= high)
++				memset(req.qos_map + low, i, high - low + 1);
++		}
++
++		for (i = 0; i < usr_qos_map->num_des; ++i) {
++			u8 dscp = usr_qos_map->dscp_exception[i].dscp;
++			u8 up = usr_qos_map->dscp_exception[i].up;
++
++			if (dscp < IP_DSCP_NUM && up < IEEE80211_NUM_UPS)
++				req.qos_map[dscp] = up;
++		}
++	}
++
++	memcpy(mvif->qos_map, req.qos_map, IP_DSCP_NUM);
++
++	return mt76_mcu_send_msg(&dev->mt76, MCU_WA_EXT_CMD(SET_QOS_MAP), &req,
++				 sizeof(req), false);
++}
+ #endif
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index 615a9b220..db26888b0 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -172,6 +172,8 @@
+ #define MT7996_MAX_PROBE_TIMEOUT	500
+ #define MT7996_MAX_PROBE_TRIES		2
+ 
++#define IP_DSCP_NUM			64
++
+ #define MT7996_HW_DROP_STAT	4
+ #define MT7996_HW_DROP_REASON	0x20
+ 
+@@ -479,6 +481,9 @@ struct mt7996_vif {
+ 	void *probe[__MT_MAX_BAND];
+ 	unsigned long probe_send_time[__MT_MAX_BAND];
+ 	int probe_send_count[__MT_MAX_BAND];
++
++	/* QoS map support */
++	u8 qos_map[IP_DSCP_NUM];
+ };
+ 
+ /* crash-dump */
+-- 
+2.45.2
+
