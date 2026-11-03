@@ -1,0 +1,307 @@
+#!/usr/bin/ucode
+
+// ucentral-sshguard - block a source address on the SSH port after repeated
+// authentication failures.
+//
+// dropbear reports every counted authentication failure and every success
+// as a "dropbear.auth" ubus event (dropbear patch 920):
+//     { "result": "fail" | "success", "addr": "<numeric host>", "port": N }
+// When one source reaches <failures> failures within <window> minutes it is
+// added to the nftables set inet <table> <set4|set6> with a timeout of
+// <ban_time> minutes. The ssh template installs a rule that drops new SSH
+// connections from addresses in that set. A successful login clears the
+// failure count of its source.
+//
+// A firewall reload empties the sets, so active blocks are re-added every
+// SYNC_INTERVAL. Active blocks are kept in STATE_FILE (tmpfs) so a daemon
+// restart does not forget them.
+
+'use strict';
+
+import * as libubus from 'ubus';
+import * as libuci from 'uci';
+import * as uloop from 'uloop';
+import * as fs from 'fs';
+import { ulog_open, ulog, ULOG_SYSLOG, LOG_DAEMON, LOG_INFO, LOG_NOTICE, LOG_WARNING } from 'log';
+
+const STATE_FILE = '/tmp/sshguard.state';
+const SYNC_INTERVAL = 30000;	// ms
+const MAX_TRACKED = 4096;	// sources with pending failures
+const NFT_BATCH = 128;		// set elements per nft invocation
+
+let cfg = {};
+let fails = {};		// addr -> { family, count, first }
+let bans = {};		// addr -> { family, until, failures }
+let ubus;
+let listener;
+let timer;
+let tracked_full_logged = false;
+
+function config_load() {
+	let uci = libuci.cursor();
+	let c = uci.get_all('sshguard', 'main') || {};
+
+	cfg = {
+		enabled: +c.enabled == 1,
+		failures: int(c.failures ?? 9),
+		window: int(c.window ?? 10) * 60,
+		ban_time: int(c.ban_time ?? 10) * 60,
+		table: c.table ?? 'fw4',
+		set4: c.set4 ?? 'ssh_ban4',
+		set6: c.set6 ?? 'ssh_ban6',
+	};
+
+	if (!(cfg.failures > 0))
+		cfg.enabled = false;
+	if (!(cfg.window > 0))
+		cfg.window = 600;
+	if (!(cfg.ban_time > 0))
+		cfg.ban_time = 600;
+}
+
+// Accept only numeric IPv4/IPv6 addresses; everything that reaches nft
+// passes through here.
+function parse_addr(addr) {
+	if (type(addr) != 'string' || length(addr) == 0 || length(addr) > 64)
+		return null;
+
+	addr = split(addr, '%')[0];	// drop an IPv6 zone index
+
+	let m = match(addr, /^::ffff:([0-9.]+)$/i);
+	if (m)
+		addr = m[1];
+
+	if (match(addr, /^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$/)) {
+		for (let octet in split(addr, '.'))
+			if (int(octet) > 255)
+				return null;
+
+		return { addr, family: 4 };
+	}
+
+	if (index(addr, ':') >= 0 && match(addr, /^[0-9a-fA-F:]+$/))
+		return { addr: lc(addr), family: 6 };
+
+	return null;
+}
+
+function set_name(family) {
+	return family == 4 ? cfg.set4 : cfg.set6;
+}
+
+// elems: [ [ addr, seconds ], ... ] of one address family
+function nft_add(family, elems) {
+	for (let i = 0; i < length(elems); i += NFT_BATCH) {
+		let spec = join(', ', map(slice(elems, i, i + NFT_BATCH),
+			(e) => sprintf('%s timeout %ds', e[0], e[1] > 0 ? e[1] : 1)));
+		let rc = system([ 'nft', 'add', 'element', 'inet', cfg.table,
+			set_name(family), '{ ' + spec + ' }' ], 5000);
+
+		if (rc != 0)
+			ulog(LOG_WARNING, 'adding to set %s failed (nft rc %d)', set_name(family), rc);
+	}
+}
+
+function nft_del(entry) {
+	system([ 'nft', 'delete', 'element', 'inet', cfg.table,
+		set_name(entry.family), '{ ' + entry.addr + ' }' ], 5000);
+}
+
+function state_save() {
+	fs.writefile(STATE_FILE, sprintf('%J', bans));
+}
+
+function state_load() {
+	let data = fs.readfile(STATE_FILE);
+	let saved;
+
+	try {
+		saved = data ? json(data) : null;
+	} catch (e) {
+		saved = null;
+	}
+
+	if (type(saved) != 'object')
+		return;
+
+	let now = time();
+	for (let addr, b in saved) {
+		let entry = parse_addr(addr);
+
+		if (entry && type(b) == 'object' && +b.until > now)
+			bans[entry.addr] = { family: entry.family, until: +b.until, failures: +b.failures || 0 };
+	}
+}
+
+function ban(entry, count) {
+	bans[entry.addr] = { family: entry.family, until: time() + cfg.ban_time, failures: count };
+	delete fails[entry.addr];
+
+	nft_add(entry.family, [ [ entry.addr, cfg.ban_time ] ]);
+	state_save();
+
+	ulog(LOG_NOTICE, 'blocking %s on the SSH port for %d s after %d failed logins',
+		entry.addr, cfg.ban_time, count);
+
+	ubus.call('event', 'event', {
+		object: 'ssh',
+		verb: 'ban',
+		payload: { client: entry.addr, failures: count, duration: cfg.ban_time }
+	});
+}
+
+function prune_fails(now) {
+	for (let addr in keys(fails))
+		if (now - fails[addr].first > cfg.window)
+			delete fails[addr];
+}
+
+function on_auth(ev, msg) {
+	if (!cfg.enabled || type(msg) != 'object')
+		return;
+
+	let entry = parse_addr(msg.addr);
+	if (!entry)
+		return;
+
+	if (msg.result == 'success') {
+		delete fails[entry.addr];
+		return;
+	}
+
+	if (msg.result != 'fail')
+		return;
+
+	let now = time();
+
+	// already blocked; this is a connection that was open before the block
+	if (bans[entry.addr] && bans[entry.addr].until > now)
+		return;
+
+	let f = fails[entry.addr];
+	if (!f || now - f.first > cfg.window) {
+		if (!f && length(fails) >= MAX_TRACKED) {
+			prune_fails(now);
+			if (length(fails) >= MAX_TRACKED) {
+				if (!tracked_full_logged)
+					ulog(LOG_WARNING, 'tracking %d sources, ignoring new ones', MAX_TRACKED);
+				tracked_full_logged = true;
+				return;
+			}
+		}
+		tracked_full_logged = false;
+
+		f = fails[entry.addr] = { family: entry.family, count: 0, first: now };
+	}
+
+	if (++f.count >= cfg.failures)
+		ban(entry, f.count);
+}
+
+// Expire old state and re-add active blocks (a firewall reload empties the
+// sets). "nft add element" of an existing element is a no-op.
+function sync() {
+	let now = time();
+	let v4 = [], v6 = [];
+	let changed = false;
+
+	prune_fails(now);
+
+	for (let addr in keys(bans)) {
+		let b = bans[addr];
+
+		if (b.until <= now) {
+			delete bans[addr];
+			changed = true;
+			ulog(LOG_INFO, 'block on %s expired', addr);
+			continue;
+		}
+
+		push(b.family == 4 ? v4 : v6, [ addr, b.until - now ]);
+	}
+
+	if (length(v4))
+		nft_add(4, v4);
+	if (length(v6))
+		nft_add(6, v6);
+	if (changed)
+		state_save();
+}
+
+const methods = {
+	status: {
+		call: function(req) {
+			let now = time();
+
+			return {
+				enabled: cfg.enabled,
+				failures: cfg.failures,
+				window: cfg.window,
+				ban_time: cfg.ban_time,
+				blocked: map(filter(keys(bans), (a) => bans[a].until > now),
+					(a) => ({ addr: a, remaining: bans[a].until - now, failures: bans[a].failures })),
+				pending: map(keys(fails),
+					(a) => ({ addr: a, failures: fails[a].count, age: now - fails[a].first })),
+			};
+		},
+		args: {}
+	},
+
+	unban: {
+		call: function(req) {
+			let entry = parse_addr(req.args.addr);
+
+			if (!entry)
+				return libubus.STATUS_INVALID_ARGUMENT;
+
+			delete fails[entry.addr];
+			if (bans[entry.addr]) {
+				delete bans[entry.addr];
+				state_save();
+			}
+			nft_del(entry);
+			ulog(LOG_NOTICE, 'block on %s lifted manually', entry.addr);
+
+			return 0;
+		},
+		args: { addr: '' }
+	},
+
+	reload: {
+		call: function(req) {
+			config_load();
+			ulog(LOG_INFO, 'reloaded: block after %d failures within %d s for %d s%s',
+				cfg.failures, cfg.window, cfg.ban_time, cfg.enabled ? '' : ' (disabled)');
+
+			return 0;
+		},
+		args: {}
+	},
+};
+
+ulog_open(ULOG_SYSLOG, LOG_DAEMON, 'sshguard');
+
+uloop.init();
+
+ubus = libubus.connect();
+if (!ubus) {
+	ulog(LOG_WARNING, 'unable to connect to ubus');
+	exit(1);
+}
+
+config_load();
+state_load();
+
+listener = ubus.listener('dropbear.auth', on_auth);
+ubus.publish('sshguard', methods);
+
+timer = uloop.timer(1000, function() {
+	sync();
+	timer.set(SYNC_INTERVAL);
+});
+
+ulog(LOG_INFO, 'started: block after %d failures within %d s for %d s%s',
+	cfg.failures, cfg.window, cfg.ban_time, cfg.enabled ? '' : ' (disabled)');
+
+uloop.run();
+uloop.done();
