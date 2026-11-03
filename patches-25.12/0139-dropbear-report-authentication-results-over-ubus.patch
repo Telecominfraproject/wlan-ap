@@ -1,0 +1,178 @@
+From 0aad82a47f6f43692ab369ac0629b2c9999f7416 Mon Sep 17 00:00:00 2001
+From: andy79_yang <andy79_yang@accton.com>
+Date: Mon, 2 Nov 2026 15:37:10 +0800
+Subject: [PATCH] dropbear: report authentication results over ubus
+
+Add a patch that makes dropbear send a "dropbear.auth" ubus event for
+every authentication failure that counts towards MaxAuthTries and for
+every successful login, carrying the result and the numeric source
+address and port.
+
+ucentral-sshguard subscribes to this event to block a source address
+on the SSH port after repeated failures (WIFI-15536, EN 18031-1 AUM-6),
+without parsing syslog. Sending is fire-and-forget and does not change
+authentication behaviour or timing.
+
+Signed-off-by: andy79_yang <andy79_yang@accton.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ...20-svr-auth-report-results-over-ubus.patch | 147 ++++++++++++++++++
+ 1 file changed, 147 insertions(+)
+ create mode 100644 package/network/services/dropbear/patches/920-svr-auth-report-results-over-ubus.patch
+
+diff --git a/package/network/services/dropbear/patches/920-svr-auth-report-results-over-ubus.patch b/package/network/services/dropbear/patches/920-svr-auth-report-results-over-ubus.patch
+new file mode 100644
+index 0000000..b7caaf0
+--- /dev/null
++++ b/package/network/services/dropbear/patches/920-svr-auth-report-results-over-ubus.patch
+@@ -0,0 +1,147 @@
++From: andy79_yang <andy79_yang@accton.com>
++Subject: [PATCH] svr-auth: report authentication results over ubus
++
++Send a "dropbear.auth" ubus event for every authentication failure that
++counts towards MaxAuthTries and for every successful authentication:
++
++  {"result":"fail"|"success","addr":"<numeric host>","port":<port>}
++
++This lets a local daemon block a source address after repeated failures
++without parsing syslog text. Failures that do not count (the "none"
++method, unknown public keys offered as queries) are not reported.
++
++The event is sent by a detached grandchild running /bin/ubus; only the
++short-lived intermediate child is reaped here and all errors are
++ignored, so authentication results and timing do not depend on ubus.
++The failure event is sent before the MaxAuthTries check, which exits the
++session, and the success event before privileges are dropped.
++
++Set DROPBEAR_SVR_AUTH_NOTIFY to 0 in localoptions.h to disable.
++
++Signed-off-by: andy79_yang <andy79_yang@accton.com>
++---
++--- a/src/svr-auth.c
+++++ b/src/svr-auth.c
++@@ -38,6 +38,20 @@
++ 
++ static int checkusername(const char *username, unsigned int userlen);
++ 
+++/* Report each counted authentication failure and each success as a ubus
+++ * event so a local daemon can act on repeated failures from one source
+++ * without parsing syslog. Set to 0 in localoptions.h to disable. */
+++#ifndef DROPBEAR_SVR_AUTH_NOTIFY
+++#define DROPBEAR_SVR_AUTH_NOTIFY 1
+++#endif
+++#ifndef DROPBEAR_SVR_AUTH_NOTIFY_PROG
+++#define DROPBEAR_SVR_AUTH_NOTIFY_PROG "/bin/ubus"
+++#endif
+++
+++#if DROPBEAR_SVR_AUTH_NOTIFY
+++static void svr_auth_notify(const char *result);
+++#endif
+++
++ /* initialise the first time for a session, resetting all parameters */
++ void svr_authinitialise() {
++ 	memset(&ses.authstate, 0, sizeof(ses.authstate));
++@@ -342,6 +356,77 @@
++ 	return DROPBEAR_SUCCESS;
++ }
++ 
+++#if DROPBEAR_SVR_AUTH_NOTIFY
+++/* Send "ubus send dropbear.auth {result,addr,port}".
+++ * Fire and forget: the event is sent by a detached grandchild, only the
+++ * intermediate child (which exits immediately) is reaped here, and every
+++ * error is ignored so authentication behaviour and timing do not depend
+++ * on ubus being available. */
+++static void svr_auth_notify(const char *result) {
+++	char payload[128];
+++	const char *sep;
+++	int hostlen;
+++	pid_t pid;
+++
+++#if DROPBEAR_FUZZ
+++	if (fuzz.fuzzing) {
+++		return;
+++	}
+++#endif
+++
+++	if (svr_ses.addrstring == NULL
+++			|| access(DROPBEAR_SVR_AUTH_NOTIFY_PROG, X_OK) != 0) {
+++		return;
+++	}
+++
+++	/* addrstring is "host:port" with a numeric host; the port follows
+++	 * the last ':' (IPv6 hosts contain ':' themselves) */
+++	sep = strrchr(svr_ses.addrstring, ':');
+++	if (sep == NULL) {
+++		return;
+++	}
+++	hostlen = (int)(sep - svr_ses.addrstring);
+++	if (hostlen <= 0 || hostlen > 64) {
+++		return;
+++	}
+++
+++	snprintf(payload, sizeof(payload),
+++			"{\"result\":\"%s\",\"addr\":\"%.*s\",\"port\":%d}",
+++			result, hostlen, svr_ses.addrstring, atoi(sep + 1));
+++
+++	pid = fork();
+++	if (pid < 0) {
+++		return;
+++	}
+++
+++	if (pid == 0) {
+++		if (fork() == 0) {
+++			int fd;
+++
+++			for (fd = 3; fd < 256; fd++) {
+++				close(fd);
+++			}
+++			fd = open("/dev/null", O_RDWR);
+++			if (fd >= 0) {
+++				dup2(fd, STDIN_FILENO);
+++				dup2(fd, STDOUT_FILENO);
+++				dup2(fd, STDERR_FILENO);
+++				if (fd > STDERR_FILENO) {
+++					close(fd);
+++				}
+++			}
+++			execl(DROPBEAR_SVR_AUTH_NOTIFY_PROG, DROPBEAR_SVR_AUTH_NOTIFY_PROG,
+++					"send", "dropbear.auth", payload, (char *)NULL);
+++		}
+++		_exit(0);
+++	}
+++
+++	while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {
+++		/* retry */
+++	}
+++}
+++#endif
+++
++ /* Send a failure message to the client, in responds to a userauth_request.
++  * Partial indicates whether to set the "partial success" flag,
++  * incrfail is whether to count this failure in the failure count (which
++@@ -425,6 +510,11 @@
++ 		}
++ 
++ 		ses.authstate.failcount++;
+++
+++#if DROPBEAR_SVR_AUTH_NOTIFY
+++		/* before the max-tries check below, which exits the session */
+++		svr_auth_notify("fail");
+++#endif
++ 	}
++ 
++ 	if (ses.authstate.failcount >= svr_opts.maxauthtries) {
++@@ -458,6 +548,11 @@
++ 	 * delayed-zlib mode */
++ 	ses.authstate.authdone = 1;
++ 
+++#if DROPBEAR_SVR_AUTH_NOTIFY
+++	/* while still running as root, before privileges are dropped */
+++	svr_auth_notify("success");
+++#endif
+++
++ #if DROPBEAR_SVR_DROP_PRIVS
++ 	/* Drop privileges as soon as authentication has happened. */
++ 	svr_switch_user();
+-- 
+2.53.0.windows.2
+
