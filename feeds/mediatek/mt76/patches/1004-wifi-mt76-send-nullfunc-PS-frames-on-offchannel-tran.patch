@@ -1,0 +1,231 @@
+From 92837006e90e9a81d5d16871856b721ea4d045a7 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Sat, 7 Mar 2026 15:44:38 +0000
+Subject: [PATCH] wifi: mt76: send nullfunc PS frames on offchannel transitions
+
+[ upstream commit b451ffe2c0c1b9ae78ca3ed41d0e3b315957b6f8 ]
+
+Since mt76 uses chanctx, mac80211 does not send nullfunc power save
+notifications when the driver goes offchannel for scan or ROC.
+Add mt76_offchannel_notify() to send nullfunc PM=1 before going
+offchannel and PM=0 after returning, so that the AP can buffer
+frames during the absence.
+
+For MLO, iterate all vif links on the phy and set
+IEEE80211_TX_CTRL_MLO_LINK so that the driver's tx_prepare_skb
+resolves the correct per-link wcid.
+
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+Backport-note: adapted to the SDK vif link handling.
+ - The SDK changed mt76_vif_link_phy() to take the mt76_dev and to return
+   NULL when the link has no wcid, so the new calls use that form.
+ - The SDK stores every MLD link, link 0 included, in mvif->link[]. It does
+   not clear link[0] when MLD link 0 is removed, and drv_priv->wcid is NULL
+   on an MLD vif that has no link 0. So walk vif->active_links, look the link
+   up in mvif->link[] only (as the SDK's mt7996_tx() does), and drop the
+   upstream deflink_id/drv_priv special case.
+ - When mac80211 returns no sta, for example on a link-addressed MLO
+   nullfunc, use the wcid of the link instead of drv_priv->wcid, so that
+   mt76_tx() never gets a NULL wcid.
+---
+ channel.c  |  12 +++++--
+ mac80211.c | 102 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ mt76.h     |   1 +
+ scan.c     |   7 +++-
+ 4 files changed, 118 insertions(+), 4 deletions(-)
+
+diff --git a/channel.c b/channel.c
+index 6f387e76..edf2fe75 100644
+--- a/channel.c
++++ b/channel.c
+@@ -366,8 +366,10 @@ void mt76_roc_complete(struct mt76_phy *phy)
+ 	if (mlink)
+ 		mlink->mvif->roc_phy = NULL;
+ 	if (phy->chanctx && phy->main_chandef.chan && phy->offchannel &&
+-	    !test_bit(MT76_MCU_RESET, &dev->phy.state))
++	    !test_bit(MT76_MCU_RESET, &dev->phy.state)) {
+ 		__mt76_set_channel(phy, &phy->main_chandef, false);
++		mt76_offchannel_notify(phy, false);
++	}
+ 	mt76_put_vif_phy_link(phy, phy->roc_vif, phy->roc_link);
+ 	phy->roc_vif = NULL;
+ 	phy->roc_link = NULL;
+@@ -405,6 +407,7 @@ int mt76_remain_on_channel(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	struct mt76_phy *phy = hw->priv;
+ 	struct mt76_dev *dev = phy->dev;
+ 	struct mt76_vif_link *mlink;
++	bool offchannel;
+ 	int ret = 0;
+ 
+ 	phy = dev->band_phys[chan->band];
+@@ -430,8 +433,11 @@ int mt76_remain_on_channel(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	mlink->mvif->roc_phy = phy;
+ 	phy->roc_vif = vif;
+ 	phy->roc_link = mlink;
+-	ret = __mt76_set_channel(phy, &chandef,
+-				 mt76_offchannel_chandef(phy, chan, &chandef));
++
++	offchannel = mt76_offchannel_chandef(phy, chan, &chandef);
++	if (offchannel)
++		mt76_offchannel_notify(phy, true);
++	ret = __mt76_set_channel(phy, &chandef, offchannel);
+ 	if (ret) {
+ 		mlink->mvif->roc_phy = NULL;
+ 		phy->roc_vif = NULL;
+diff --git a/mac80211.c b/mac80211.c
+index 62f3c6e4..48bd3337 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -2162,3 +2162,105 @@ u16 mt76_select_links(struct ieee80211_vif *vif, int max_active_links)
+ 	return sel_links;
+ }
+ EXPORT_SYMBOL_GPL(mt76_select_links);
++
++struct mt76_offchannel_cb_data {
++	struct mt76_phy *phy;
++	bool offchannel;
++};
++
++static void
++mt76_offchannel_send_nullfunc(struct mt76_offchannel_cb_data *data,
++			      struct ieee80211_vif *vif,
++			      struct mt76_vif_link *mlink, int link_id)
++{
++	struct mt76_phy *phy = data->phy;
++	struct ieee80211_tx_info *info;
++	struct ieee80211_sta *sta = NULL;
++	struct ieee80211_hdr *hdr;
++	struct mt76_wcid *wcid;
++	struct sk_buff *skb;
++
++	skb = ieee80211_nullfunc_get(phy->hw, vif, link_id, true);
++	if (!skb)
++		return;
++
++	hdr = (struct ieee80211_hdr *)skb->data;
++	if (data->offchannel)
++		hdr->frame_control |= cpu_to_le16(IEEE80211_FCTL_PM);
++
++	skb->priority = 7;
++	skb_set_queue_mapping(skb, IEEE80211_AC_VO);
++
++	if (!ieee80211_tx_prepare_skb(phy->hw, vif, skb,
++				      phy->main_chandef.chan->band,
++				      &sta)) {
++		ieee80211_free_txskb(phy->hw, skb);
++		return;
++	}
++
++	if (sta)
++		wcid = (struct mt76_wcid *)sta->drv_priv;
++	else
++		wcid = mlink->wcid;
++
++	if (link_id >= 0) {
++		info = IEEE80211_SKB_CB(skb);
++		info->control.flags &= ~IEEE80211_TX_CTRL_MLO_LINK;
++		info->control.flags |=
++			u32_encode_bits(link_id, IEEE80211_TX_CTRL_MLO_LINK);
++	}
++
++	mt76_tx(phy, sta, wcid, skb);
++}
++
++static void
++mt76_offchannel_notify_iter(void *_data, u8 *mac, struct ieee80211_vif *vif)
++{
++	struct mt76_offchannel_cb_data *data = _data;
++	struct mt76_dev *dev = data->phy->dev;
++	struct mt76_vif_link *mlink;
++	struct mt76_vif_data *mvif;
++	unsigned long links;
++	unsigned int link_id;
++
++	if (vif->type != NL80211_IFTYPE_STATION || !vif->cfg.assoc)
++		return;
++
++	mlink = (struct mt76_vif_link *)vif->drv_priv;
++	mvif = mlink->mvif;
++
++	if (!ieee80211_vif_is_mld(vif)) {
++		if (mt76_vif_link_phy(dev, mlink) == data->phy)
++			mt76_offchannel_send_nullfunc(data, vif, mlink, -1);
++		return;
++	}
++
++	links = vif->active_links;
++	for_each_set_bit(link_id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
++		mlink = rcu_dereference(mvif->link[link_id]);
++		if (!mlink)
++			continue;
++		if (mt76_vif_link_phy(dev, mlink) != data->phy)
++			continue;
++
++		mt76_offchannel_send_nullfunc(data, vif, mlink, link_id);
++	}
++}
++
++void mt76_offchannel_notify(struct mt76_phy *phy, bool offchannel)
++{
++	struct mt76_offchannel_cb_data data = {
++		.phy = phy,
++		.offchannel = offchannel,
++	};
++
++	if (!phy->num_sta)
++		return;
++
++	local_bh_disable();
++	ieee80211_iterate_active_interfaces_atomic(phy->hw,
++		IEEE80211_IFACE_ITER_NORMAL,
++		mt76_offchannel_notify_iter, &data);
++	local_bh_enable();
++}
++EXPORT_SYMBOL_GPL(mt76_offchannel_notify);
+diff --git a/mt76.h b/mt76.h
+index b7ded47d..072dc178 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -2156,6 +2156,7 @@ struct mt76_vif_link *mt76_get_vif_phy_link(struct mt76_phy *phy,
+ 					    struct ieee80211_vif *vif);
+ void mt76_put_vif_phy_link(struct mt76_phy *phy, struct ieee80211_vif *vif,
+ 			   struct mt76_vif_link *mlink);
++void mt76_offchannel_notify(struct mt76_phy *phy, bool offchannel);
+ 
+ /* usb */
+ static inline bool mt76u_urb_error(struct urb *urb)
+diff --git a/scan.c b/scan.c
+index eaddad2c..afc7ca5b 100644
+--- a/scan.c
++++ b/scan.c
+@@ -17,8 +17,10 @@ static void mt76_scan_complete(struct mt76_dev *dev, bool abort)
+ 	clear_bit(MT76_SCANNING, &phy->state);
+ 
+ 	if (dev->scan.chan && phy->main_chandef.chan && phy->offchannel &&
+-	    !test_bit(MT76_MCU_RESET, &dev->phy.state))
++	    !test_bit(MT76_MCU_RESET, &dev->phy.state)) {
+ 		mt76_set_channel(phy, &phy->main_chandef, false);
++		mt76_offchannel_notify(phy, false);
++	}
+ 	mt76_put_vif_phy_link(phy, dev->scan.vif, dev->scan.mlink);
+ 	memset(&dev->scan, 0, sizeof(dev->scan));
+ 	if (!test_bit(MT76_MCU_RESET, &dev->phy.state))
+@@ -139,12 +141,15 @@ void mt76_scan_work(struct work_struct *work)
+ 	if (dev->scan.chan && phy->num_sta && phy->offchannel) {
+ 		dev->scan.chan = NULL;
+ 		mt76_set_channel(phy, &phy->main_chandef, false);
++		mt76_offchannel_notify(phy, false);
+ 		goto out;
+ 	}
+ 
+ 	dev->scan.chan = req->channels[dev->scan.chan_idx++];
+ 	offchannel = mt76_offchannel_chandef(phy, dev->scan.chan, &chandef);
+ 
++	if (offchannel)
++		mt76_offchannel_notify(phy, true);
+ 	mt76_set_channel(phy, &chandef, offchannel);
+ 
+ 	if (!req->n_ssids)
+-- 
+2.34.1
+

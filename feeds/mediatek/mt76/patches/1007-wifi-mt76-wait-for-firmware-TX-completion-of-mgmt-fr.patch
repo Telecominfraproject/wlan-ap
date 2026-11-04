@@ -1,0 +1,128 @@
+From 6f93bd0ab5d403debfbcaedaa894c875dc9c59fb Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Sat, 7 Mar 2026 19:22:34 +0000
+Subject: [PATCH] wifi: mt76: wait for firmware TX completion of mgmt frames
+ before channel switch
+
+[ upstream commit 447cc8c89c172297c527d733a915e0d05aa4a813 ]
+
+After flushing software-pending frames to DMA, mt76_has_tx_pending()
+only checks DMA ring q->queued. For token-based drivers, q->queued is
+decremented at DMA consumption, but firmware may not have transmitted
+the frame yet. Waiting for all tokens is not feasible because data
+frames may be stuck in firmware powersave/aggregation queues.
+
+Track PSD queue tokens (firmware ALTX) per phy using an atomic counter.
+These frames are sent by firmware immediately without PS buffering, so
+the counter reliably reaches zero after transmission.
+
+Increment the counter in mt76_token_consume() and decrement it in
+mt76_token_release(), only for PSD queue tokens. Include the counter
+in mt76_has_tx_pending() so channel switch waits for firmware TX
+completion of management and nullfunc frames.
+
+mt7615 (uses mt76_token_get/put) and non-token drivers are unaffected
+as they never call mt76_token_consume/release.
+
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+Backport-note: SDK patch 0098 already adds txwi->phy_idx and already sets
+ t->phy_idx/t->qid in mt76_dma_tx_queue_skb(), and the SDK's
+ mt76_token_consume() takes a phy_idx and resolves the phy for its
+ per-band token count. So the dma.c and txwi struct hunks are dropped, and
+ consume/release count mgmt_tx_pending on that same phy.
+---
+ mac80211.c        | 3 +++
+ mt76.h            | 2 ++
+ mt76_connac_mac.c | 6 ++++++
+ mt7996/mac.c      | 6 ++++++
+ tx.c              | 7 +++++++
+ 5 files changed, 24 insertions(+)
+
+diff --git a/mac80211.c b/mac80211.c
+index aadb9e15..2f44992d 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -967,6 +967,9 @@ bool mt76_has_tx_pending(struct mt76_phy *phy)
+ 			return true;
+ 	}
+ 
++	if (atomic_read(&phy->mgmt_tx_pending))
++		return true;
++
+ 	return false;
+ }
+ EXPORT_SYMBOL_GPL(mt76_has_tx_pending);
+diff --git a/mt76.h b/mt76.h
+index b8e34ee5..3fcca6a2 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -1116,6 +1116,8 @@ struct mt76_phy {
+ 
+ 	struct ieee80211_vif *monitor_vif;
+ 
++	atomic_t mgmt_tx_pending;
++
+ 	struct cfg80211_chan_def chandef;
+ 	struct cfg80211_chan_def main_chandef;
+ 	bool offchannel;
+diff --git a/mt76_connac_mac.c b/mt76_connac_mac.c
+index b651ec1d..eeb16e80 100644
+--- a/mt76_connac_mac.c
++++ b/mt76_connac_mac.c
+@@ -1230,5 +1230,11 @@ void mt76_connac2_tx_token_put(struct mt76_dev *dev)
+ 	}
+ 	spin_unlock_bh(&dev->token_lock);
+ 	idr_destroy(&dev->token);
++
++	for (id = 0; id < __MT_MAX_BAND; id++) {
++		struct mt76_phy *phy = dev->phys[id];
++		if (phy)
++			atomic_set(&phy->mgmt_tx_pending, 0);
++	}
+ }
+ EXPORT_SYMBOL_GPL(mt76_connac2_tx_token_put);
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index 061ab66f..11efd178 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -2458,6 +2458,12 @@ void mt7996_tx_token_put(struct mt7996_dev *dev)
+ 	}
+ 	spin_unlock_bh(&dev->mt76.token_lock);
+ 	idr_destroy(&dev->mt76.token);
++
++	for (id = 0; id < __MT_MAX_BAND; id++) {
++		struct mt76_phy *phy = dev->mt76.phys[id];
++		if (phy)
++			atomic_set(&phy->mgmt_tx_pending, 0);
++	}
+ }
+ 
+ static int
+diff --git a/tx.c b/tx.c
+index b19d4562..e1951bdc 100644
+--- a/tx.c
++++ b/tx.c
+@@ -906,6 +906,9 @@ int mt76_token_consume(struct mt76_dev *dev, struct mt76_txwi_cache **ptxwi,
+ 
+ 		(*ptxwi)->phy_idx = phy_idx;
+ 		phy->tokens++;
++
++		if ((*ptxwi)->qid == MT_TXQ_PSD)
++			atomic_inc(&phy->mgmt_tx_pending);
+ 	}
+ 
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+@@ -956,6 +959,10 @@ mt76_token_release(struct mt76_dev *dev, int token, bool *wake)
+ 		dev->token_count--;
+ 		phy->tokens--;
+ 
++		if (txwi->qid == MT_TXQ_PSD &&
++		    atomic_dec_and_test(&phy->mgmt_tx_pending))
++			wake_up(&dev->tx_wait);
++
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 		if (mtk_wed_device_active(&dev->mmio.wed) &&
+ 		    token >= dev->mmio.wed.wlan.token_start &&
+-- 
+2.34.1
+
