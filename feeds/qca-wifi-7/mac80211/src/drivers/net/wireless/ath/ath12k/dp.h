@@ -1053,6 +1053,7 @@ int ath12k_dp_link_desc_setup(struct ath12k_base *ab,
 			      u32 n_link_desc);
 struct ath12k_rx_desc_info *ath12k_dp_get_rx_desc(struct ath12k_dp *dp,
 						  u32 cookie);
+int ath12k_dp_rx_cookie_to_device_id(u32 cookie);
 struct ath12k_tx_desc_info *ath12k_dp_get_tx_desc(struct ath12k_dp *dp,
 						  u32 desc_id);
 bool ath12k_dp_wmask_compaction_rx_tlv_supported(struct ath12k_base *ab);
