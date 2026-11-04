@@ -307,7 +307,7 @@ function setup() {
 	system(`iw phy ${data.phy} set txpower ${data.config.txpower} radio ${data.config.radio}`);
 
 	log(`Setup SMP Affinity`);
-	system(`/sbin/smp-mt76.sh`);
+	system(`[ ! -x /sbin/smp-mt76.sh ] || /sbin/smp-mt76.sh`);
 	system(`echo /tmp/%e.core > /proc/sys/kernel/core_pattern`);
 
 	return 0;
