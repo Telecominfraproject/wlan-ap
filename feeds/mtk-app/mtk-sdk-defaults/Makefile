@@ -22,7 +22,8 @@ define Package/mtk-sdk-defaults/description
   System settings the MediaTek SDK was validated with. They used to be
   OpenWrt patches on staging-mtk-v5.0; as a package they only apply to
   boards built with the SDK kernel:
-  - the packet steering service is disabled
+  - the packet steering service is disabled where smp_util sets the CPU
+    affinity instead
   - PPPQ (per-port per-queue QoS) is enabled on the PPE
   - the system log is copied to /dev/pmsg0 so it is kept in ramoops
 endef
