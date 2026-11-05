@@ -165,6 +165,25 @@ define Device/yuncore_fap655
 endef
 TARGET_DEVICES += yuncore_fap655
 
+define Device/cambium_xv2_22h
+  DEVICE_TITLE := Cambium XV2-22H
+  DEVICE_DTS := qcom-ipq5018-cambium-xv2-22h
+  SUPPORTED_DEVICES := cambium,xv2-22h
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf186h ath11k-firmware-ipq50xx-map-spruce kmod-netconsole
+  DEVICE_DTS_CONFIG := config@mp03.3-cheetah
+define Device/cambium_xv2_21x
+  DEVICE_TITLE := Cambium XV2-21X
+  DEVICE_DTS := qcom-ipq5018-cambium-xv2-21x
+  SUPPORTED_DEVICES := cambium,xv2-21x
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf186h ath11k-firmware-ipq50xx-map-spruce kmod-netconsole
+  DEVICE_DTS_CONFIG := config@mp03.3-ocelot
+  KERNEL_LOADADDR := 0x41080000
+  KERNEL := kernel-bin | fit none $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
+  KERNEL_INITRAMFS := kernel-bin | fit none $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
+endef
+TARGET_DEVICES += cambium_xv2_22h
+TARGET_DEVICES += cambium_xv2_21x
+
 define Device/edgecore_oap101
   DEVICE_TITLE := EdgeCore OAP101
   DEVICE_DTS := qcom-ipq5018-oap101

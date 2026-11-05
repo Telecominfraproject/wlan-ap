@@ -67,6 +67,62 @@ define Device/hfcl_ion4xi
 endef
 TARGET_DEVICES += hfcl_ion4xi
 
+# The XV2-2 is the AP-CP01-C1 design with one 2.5G port and the integrated
+# IPQ6018 radio alone, no PCIe; ath11k-wifi-cig-wf188n carries its board
+# data. Its U-Boot environment has no hwid, so the vendor bootipq falls back to
+# the FIT's default configuration: config@cp01-c1 is the only one listed, so
+# that is what it finds.
+define Device/cambium_xv2_2
+  DEVICE_TITLE := Cambium XV2-2
+  DEVICE_DTS := qcom-ipq6018-cambium-xv2-2
+  DEVICE_DTS_CONFIG := config@cp01-c1
+  SUPPORTED_DEVICES := cambium,xv2-2
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf188n uboot-envtools
+endef
+TARGET_DEVICES += cambium_xv2_2
+# The XV2-2T0 has only the integrated IPQ6018 radio. ath11k-wifi-cig-wf188n
+# carries Cambium's own bdwlan.b10-snow_leopard, a flat 64 KiB BDF installed
+# as board.bin.
+define Device/cambium_xv2_2t0
+  DEVICE_TITLE := Cambium XV2-2T0
+  DEVICE_DTS := qcom-ipq6018-cambium-xv2-2t0
+  DEVICE_DTS_CONFIG := config@cp01-c1,config@cp01-c1-1,config@cp01-c1-2
+  SUPPORTED_DEVICES := cambium,xv2-2t0
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf188n uboot-envtools
+endef
+TARGET_DEVICES += cambium_xv2_2t0
+# The XV2-2T0 has only the integrated IPQ6018 radio. ath11k-wifi-cig-wf188n
+# carries Cambium's own bdwlan.b10-snow_leopard, a flat 64 KiB BDF installed
+# as board.bin.
+# The XV2-2T1 is the XV2-2T0 with 120-degree sector antennas in place of the
+# omni ones. The vendor's device trees for the two differ only in the board SKU
+# number and its firmware stages the same bdwlan.b10-snow_leopard for both, so
+# it shares the 2T0's board data package. What sets it apart is the antenna
+# gain: 03_wireless declares the TX power ceiling the stock firmware applies.
+define Device/cambium_xv2_2t1
+  DEVICE_TITLE := Cambium XV2-2T1
+  DEVICE_DTS := qcom-ipq6018-cambium-xv2-2t1
+  DEVICE_DTS_CONFIG := config@cp01-c1,config@cp01-c1-1,config@cp01-c1-2
+  SUPPORTED_DEVICES := cambium,xv2-2t1
+  DEVICE_PACKAGES := ath11k-wifi-cig-wf188n uboot-envtools
+endef
+TARGET_DEVICES += cambium_xv2_2t1
+# The XE3-4 is a tri-band AP-CP01 design with a QCN9074 on PCIe for a third,
+# 6 GHz, radio. ath11k-firmware-qcn9000 brings that radio's firmware and
+# ath11k-wifi-wallys-dr6018-v4 the closest open-source board data for both
+# chips (the Wallys DR6018-v4 pairs the same IPQ6018 + QCN9074). Its vendor
+# U-Boot selects config@cp01-c3-xv3-4 for the board's hardware ID 3, so that is
+# the default; config@cp01-c3 is the bootloader's board-type fallback and
+# config@cp01-c1 what a custom bootcmd names.
+define Device/cambium_xe3_4
+  DEVICE_TITLE := Cambium XE3-4
+  DEVICE_DTS := qcom-ipq6018-cambium-xe3-4
+  DEVICE_DTS_CONFIG := config@cp01-c3-xv3-4,config@cp01-c3,config@cp01-c1
+  SUPPORTED_DEVICES := cambium,xe3-4
+  DEVICE_PACKAGES := ath11k-wifi-wallys-dr6018-v4 uboot-envtools ath11k-firmware-qcn9000
+endef
+TARGET_DEVICES += cambium_xe3_4
+
 define Device/edgecore_eap101
   DEVICE_TITLE := EdgeCore EAP101
   DEVICE_DTS := qcom-ipq6018-edgecore-eap101

@@ -129,6 +129,10 @@ platform_check_image() {
 	hfcl,ion4x_2|\
 	hfcl,ion4x_3|\
 	hfcl,ion4xe|\
+	cambium,xv2-2|\
+	cambium,xv2-2t0|\
+	cambium,xv2-2t1|\
+	cambium,xe3-4|\
 	yuncore,ax840|\
 	yuncore,fap650)
 		[ "$magic_long" = "73797375" ] && return 0
@@ -175,6 +179,37 @@ platform_do_upgrade() {
 		else
 			CI_UBIPART="rootfs_1"
 			fw_setenv primary 1 || exit 1
+		fi
+		nand_upgrade_tar "$1"
+		;;
+	cambium,xv2-2)
+		# Two NAND banks, rootfs (A) and rootfs_1 (B), declared in the device
+		# tree: 96 MiB each on the XV2-2T and XE3-4, 52 MiB on the XV2-2.
+		# Write the bank we are NOT running from, the way the HFCL ION4x
+		# boards above do.
+	cambium,xv2-2t0)
+	cambium,xv2-2t1)
+		# Two 96 MiB NAND banks, rootfs (A) and rootfs_1 (B), injected by the
+		# vendor U-Boot's mtdparts rather than the device tree. Write the bank
+		# we are NOT running from, the way the HFCL ION4x boards above do.
+	cambium,xe3-4)
+		# Two 96 MiB NAND banks, rootfs (A) and rootfs_1 (B), declared in the
+		# device tree. Write the bank we are NOT running from, the way the
+		# HFCL ION4x boards above do.
+		#
+		# The bank selector in this unit's U-Boot environment is "image"
+		# (image=0 boots rootfs, image=1 boots rootfs_1, per the vendor's own
+		# getimageside and S00fwenv_cleanup scripts), where HFCL uses
+		# "primary". It goes through CI_FWSETENV so nand_do_upgrade_success
+		# only flips it once the write has succeeded. UNVERIFIED on hardware:
+		# the vendor's own upgrade never writes "image" itself, it sets
+		# bootcount=9 and lets U-Boot swap sides.
+		if grep -q rootfs_1 /proc/cmdline; then
+			CI_UBIPART="rootfs"
+			CI_FWSETENV="image 0"
+		else
+			CI_UBIPART="rootfs_1"
+			CI_FWSETENV="image 1"
 		fi
 		nand_upgrade_tar "$1"
 		;;
