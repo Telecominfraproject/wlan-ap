@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+
+import struct
+import argparse
+import pprint
+import requests
+import subprocess
+import json
+import time
+import math
+
+class WeatherAPI:
+    def __init__(self, key):
+        self.key = key
+
+    def fetch(self, lat, lon):
+        pass
+
+    def pressure_sealevel_get(self):
+        pass
+
+    def temp_sealevel_get(self):
+        pass
+
+class GoogleWeatherAPI(WeatherAPI):
+    def fetch(self, lat, lon):
+        url=f'https://weather.googleapis.com/v1/currentConditions:lookup?key={self.key}' \
+            f'&location.latitude={lat}&location.longitude={lon}'
+        response = requests.get(url)
+        self.data = response.json()
+
+    def pressure_sealevel_get(self):
+        return float(self.data['airPressure']['meanSeaLevelMillibars'])
+
+    def temp_sealevel_get(self):
+        return float(self.data['temperature']['degrees'])
+
+class OpenWeatherAPI(WeatherAPI):
+    def fetch(self, lat, lon):
+        url=f'https://api.openweathermap.org/data/3.0/onecall?lat={lat}&lon={lon}&appid={self.key}'
+        response = requests.get(url)
+        self.data = response.json()
+
+    def pressure_sealevel_get(self):
+        return float(self.data['current']['pressure'])
+
+    def temp_sealevel_get(self):
+        return float(self.data['current']['temp']) - 273.15
+
+class WeatherData:
+    def __init__(self, api, lat, lon):
+        api.fetch(lat, lon)
+
+        self.pressure_sealevel = api.pressure_sealevel_get()
+        self.temp_sealevel = api.temp_sealevel_get()
+
+def sysfs_pressure_get():
+    file_path = '/sys/bus/iio/devices/iio:device0/in_pressure_input'
+
+    try:
+        process = subprocess.Popen(['cat', file_path], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+        output, error = process.communicate()
+
+        if process.returncode != 0:
+            print(f"Error reading the file {file_path}: {error.decode().strip()}")
+            return None
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None
+
+    pressure = float(output.decode().strip()) * 10
+
+    return pressure
+
+def sysfs_temp_get():
+    file_path = '/sys/bus/iio/devices/iio:device0/in_temp_input'
+
+    try:
+        process = subprocess.Popen(['cat', file_path], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE)
+        output, error = process.communicate()
+
+        if process.returncode != 0:
+            print(f"Error reading the file {file_path}: {error.decode().strip()}")
+            return None
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None
+
+    temp = float(output.decode().strip()) / 1000
+
+    return temp
+
+def altitude_calculate(pressure_sealevel, pressure_target, temp_sealevel):
+    '''ISA barometric formula'''
+
+    l  = 0.0065                 # lapse rate of dry air
+    r  = 287.0                  # air constant in 'J/kg*K' not 'J/mol*K'
+    g  = 9.8                    # gravitational acceleration
+    t  = temp_sealevel + 273.15 # sealevel temperature in K (kelvin) not degree celsius
+    p0 = pressure_sealevel      # sealevel pressure (hPa)
+    p  = pressure_target        # pressure at target area (hPa)
+
+    val = ((((p0 / p)**((r * l) / g)) - 1) * t) / l
+
+    return val
+
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371000  # 地球半徑，單位為公尺
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+    distance = R * c
+    return distance
+
+def altitude_write_to_file(filename, altitude):
+    with open(filename, 'w') as f:
+        f.write(str(altitude))
+
+class CalibrationData:
+    bin_path = '/sbin/mtk_factory_rw.sh'
+
+    @classmethod
+    def pressure_offset_write(cls, offset):
+        '''
+        Write the calibrated offset value into factory partition.
+        Maximum precision of 0.001 hPa.
+
+        Parameters:
+        - offset (float): the offset pressure value in hectopascals (hPa).
+        '''
+
+        offset_round = round(offset * 1000)
+        packed_bytes = struct.pack('>i', offset_round)
+        val_str = packed_bytes.hex()
+        val_str_split = [val_str[i:i+2] for i in range(0, 8, 2)]
+
+        subprocess.run([cls.bin_path, '-w', '4', '0xFFFEA'] + val_str_split,
+                       text=True, capture_output=True, check=True)
+
+    @classmethod
+    def pressure_offset_read(cls):
+        '''
+        Read the calibrated offset value from factory partition.
+        Maximum precision of 0.001 hPa.
+
+        Returns:
+        - float: The offset pressure value in hectopascals (hPa).
+        '''
+
+        result = subprocess.run([cls.bin_path, '-r', '4', '0xFFFEA'],
+                                text=True, capture_output=True, check=True)
+        result_str = result.stdout
+        val_str = result_str.replace('-', '')
+        packed_bytes = bytes.fromhex(val_str)
+        val = struct.unpack('>i', packed_bytes)[0]
+
+        return (val / 1000)
+
+def altitude_evaluate(args, lon, lat):
+    key = args.key
+    # lat = args.lat
+    # lon = args.lon
+    path = args.write
+    api = args.api
+
+    if api == 'gw':
+        weather_api = GoogleWeatherAPI(key)
+    elif api == 'ow':
+        weather_api = OpenWeatherAPI(key)
+
+    weather_data = WeatherData(weather_api, lat, lon)
+
+    p_sealevel = weather_data.pressure_sealevel
+    t_sealevel = weather_data.temp_sealevel
+    p_measured = sysfs_pressure_get()
+    p_offset = CalibrationData.pressure_offset_read()
+    altitude = altitude_calculate(p_sealevel, p_measured + p_offset, t_sealevel)
+
+    #print(f"pressure_sealevel(hPa): {p_sealevel}")
+    #print(f"pressure_measured(hPa): {p_measured}")
+    #print(f"pressure_offset(hPa):   {p_offset}")
+    #print(f"temp_sealevel(c):       {t_sealevel}")
+    #print(f"altitude(m):            {altitude}")
+
+    if path != None:
+        altitude_write_to_file(path, altitude)
+    return altitude
+
+def update_offset(offset):
+    if offset < -1000 or offset > 1000:
+        raise RuntimeError("invalid calibration offset")
+
+    CalibrationData.pressure_offset_write(offset)
+    new_offset = CalibrationData.pressure_offset_read()
+    print(f"offset updated: {new_offset}")
+
+def print_pressure():
+    p_offset = CalibrationData.pressure_offset_read()
+    p_measured = sysfs_pressure_get()
+    val = p_offset + p_measured
+    print(f"pressure measured: {p_measured}")
+    print(f"pressure offset: {p_offset}")
+    print(f"pressure calibrated: {val}")
+
+
+
+def wpa_scan_to_google_json(interfaces, max_results=10, timeout=10):
+    if isinstance(interfaces, str):
+        interfaces = [interfaces]
+
+    ap_list = []
+
+    for interface in interfaces:
+        # 1. Trigger scan
+        subprocess.run(['wpa_cli', '-i', interface, 'scan'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # 2. Wait for scan to complete
+        start_time = time.time()
+        while True:
+            result = subprocess.run(['wpa_cli', '-i', interface, 'scan_results'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            output = result.stdout.decode()
+            lines = output.strip().split('\n')
+            if len(lines) > 1:
+                break
+            if time.time() - start_time > timeout:
+                raise TimeoutError(f"Scan timeout on {interface}")
+            time.sleep(1)
+
+        # 3. Parse scan_results
+        for line in lines[1:]:
+            parts = line.split('\t')
+            if len(parts) < 5:
+                continue
+            bssid = parts[0]
+            frequency = int(parts[1])
+            signal_level = int(parts[2])
+            ssid = parts[4]
+            channel = freq_to_channel(frequency)
+            ap_list.append({
+                "macAddress": bssid,
+                "signalStrength": signal_level,
+                "channel": channel,
+                "ssid": ssid
+            })
+
+    # 4. Limit the number of APs
+    ap_list = ap_list[:max_results]
+
+    # 5. Format for Google API
+    return {"wifiAccessPoints": ap_list}
+
+def freq_to_channel(freq):
+    # 2.4G
+    if 2412 <= freq <= 2472:
+        return (freq - 2407) // 5
+    # 5G
+    elif 5000 <= freq <= 5895:
+        return (freq - 5000) // 5
+    # 6G (Wi-Fi 6E)
+    elif 5925 <= freq <= 7125:
+        return (freq - 5950) // 5 + 1
+    else:
+        return 0
+
+def send_to_google_geolocation_api(payload, api_key):
+    url = f"https://www.googleapis.com/geolocation/v1/geolocate?key={api_key}"
+    headers = {'Content-Type': 'application/json'}
+    response = requests.post(url, headers=headers, data=json.dumps(payload))
+    return response.json()
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='altitude-tool is a tool to get the altitude of a coordinate',
+        formatter_class=lambda prog: argparse.HelpFormatter(prog, width=120)
+    )
+    parser.add_argument('-k', '--key', type=str, help='API key to access weather API')
+    parser.add_argument('-f', '--key-file', type=str, help='File containing the weather API key')
+    parser.add_argument('-K', '--geo-key', type=str, help='API key to access geolocation API')
+    parser.add_argument('-F', '--geo-key-file', type=str, help='File containing the geolocation API key')
+    parser.add_argument('-i', '--interface', type=str, nargs='+', help='Interface for WiFi scanning')
+    parser.add_argument('-x', '--lon', type=float, help='Longitude')
+    parser.add_argument('-y', '--lat', type=float, help='Latitude')
+    parser.add_argument('-w', '--write', type=str, help='Write to path')
+    parser.add_argument('-o', '--geo-op', type=str, help='Geolocation operation')
+    parser.add_argument('--api', type=str, choices=['gw', 'ow'], default='gw',
+                        help='Choose the API: gw (google-weather-api), ow (open-weather-map)')
+    parser.add_argument('--geo-api', type=str, choices=['gg'], default='gg',
+                        help='Choose the API: gg (google-geolocation-api)')
+    parser.add_argument('-n', '--new-offset', type=float, help='update calibration offset')
+    parser.add_argument('-c', '--calibrated', type=float, help='update offset by calibrated value')
+    parser.add_argument('-p', '--print-pressure', action='store_true', help='print pressure')
+    parser.add_argument('-r', '--ref-altitude', type=str, help='input reference altitude')
+    parser.add_argument('-l', '--loop', type=int, help='loop count', default=1)
+
+    args = parser.parse_args()
+
+    if args.key_file:
+        try:
+            with open(args.key_file, 'r') as file:
+                args.key = file.read().strip()
+        except Exception as e:
+            print(f"Error reading geo key from file: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    if args.geo_key_file:
+        try:
+            with open(args.geo_key_file, 'r') as file:
+                args.geo_key = file.read().strip()
+        except Exception as e:
+            print(f"Error reading geo key from file: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    if args.geo_op == 'full_test':
+        if args.interface is None:
+            print("interface not set")
+        print("actual Geolocation:", {"latitude": args.lat, "longitude": args.lon})
+        print (f"g_longitude    ,g_latitude     ,accuracy  ,distance            ,g_altitude         ")
+        a = 0
+        while a < args.loop:
+            ap_list_json = wpa_scan_to_google_json(args.interface)
+            # print("scan result:", json.dumps({"wifiAccessPoints": ap_list_json}, ensure_ascii=False, indent=2))
+            result = send_to_google_geolocation_api(ap_list_json, args.geo_key)
+            # print("Geolocation API result using interface:", result)
+            distance = haversine (args.lat, args.lon, result['location']['lat'], result['location']['lng'])
+            if args.api is not None and args.key is not None and \
+               args.lat is not None and args.lon is not None:
+                altitude = altitude_evaluate(args, result['location']['lng'], result['location']['lat'])
+            print (f"{result['location']['lng']:<15},{result['location']['lat']:<15},{result['accuracy']:<10},{distance:<20},{altitude:<20}")
+            time.sleep(1)
+            a += 1
+    elif args.geo_op == 'altitude_only':
+        if args.ref_altitude is None:
+            print("ref_altitude is not set")
+        print(f"altitude_only ref_altitude: {args.ref_altitude}")
+        print("actual Geolocation:", {"latitude": args.lat, "longitude": args.lon})
+        print(f"g_altitude")
+        a = 0
+        while a < args.loop:
+            altitude = altitude_evaluate(args, args.lon, args.lat)
+            print(f"{altitude}")
+            a += 1
+    elif args.geo_key is not None:
+        if args.interface is not None:
+            ap_list_json = wpa_scan_to_google_json(args.interface)
+            print("scan result:", json.dumps({"wifiAccessPoints": ap_list_json}, ensure_ascii=False, indent=2))
+            result = send_to_google_geolocation_api(ap_list_json, args.geo_key)
+            print("Geolocation API result using interface:", result)
+        else:
+            json_data = {
+                "wifiAccessPoints": [
+                    {
+                        "macAddress": "01:23:45:67:89:AB",
+                        "signalStrength": -65,
+                        "channel": 11,
+                        "ssid": "MyWifi"
+                    },
+                    {
+                        "macAddress": "01:23:45:67:89:AC",
+                        "signalStrength": -70,
+                        "channel": 6,
+                        "ssid": "AnotherWifi"
+                    }
+                ]
+            }
+            result = send_to_google_geolocation_api(json_data, args.geo_key)
+            print("Geolocation API result:", result)
+        print(args.lat, args.lon, result['location']['lat'], result['location']['lng'])
+        distance = haversine (args.lat, args.lon, result['location']['lat'], result['location']['lng'])
+        print(f"{distance}")
+        # args.lat = result['location']['lat']
+        # args.lon = result['location']['lng']
+        if args.api is not None and args.key is not None and \
+           args.lat is not None and args.lon is not None:
+            altitude = altitude_evaluate(args, args.lon, args.lat)
+            print(f"{altitude}")
+    elif args.interface is not None:
+        ap_list_json = wpa_scan_to_google_json(args.interface)
+        print("scan result:", json.dumps({"wifiAccessPoints": ap_list_json}, ensure_ascii=False, indent=2))
+    elif args.api is not None and args.key is not None and \
+       args.lat is not None and args.lon is not None:
+        altitude = altitude_evaluate(args, args.lon, args.lat)
+        print(f"{altitude}")
+    elif args.new_offset is not None:
+        update_offset(args.new_offset)
+    elif args.calibrated is not None:
+        update_offset(args.calibrated - sysfs_pressure_get())
+    elif args.print_pressure:
+        print_pressure()
+    else:
+        print('use -i [Apcli interface] to get scan result ')
+        print('use -K [Geolocation API Key] to get geolocation result by test data')
+        print('use -F [Geolocation API Key File] to get geolocation result by test data')
+        print('use -i [Apcli interface] -K [Geolocation API Key] to get geolocation result by scan result')
+        print('use -i [Apcli interface] -F [Geolocation API Key File] to get geolocation result by scan result')
+        print('use -i [Apcli interface] -K [Geolocation API Key] -k [Weather API Key] to get evaluated weather result by scan result')
+        print('use -i [Apcli interface] -K [Geolocation API Key] -f [Weather API Key File] to get evaluated weather result by scan result')
+        print('use -i [Apcli interface] -F [Geolocation API Key File] -k [Weather API Key] to get evaluated weather result by scan result')
+        print('use -i [Apcli interface] -F [Geolocation API Key File] -f [Weather API Key File] to get evaluated weather result by scan result')
+        print('use -k [Weather API Key] --api [Weather API] -x [Longitude] -y [Latitude] together or only -n\n')
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()

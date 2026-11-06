@@ -1,0 +1,819 @@
+From 6a42af6f64567c7011939b7c1b1e1709f5f0ab68 Mon Sep 17 00:00:00 2001
+From: Ryder Lee <ryder.lee@mediatek.com>
+Date: Mon, 19 Jan 2026 20:07:18 -0800
+Subject: [PATCH 87/89] mtk: mt76: mt7996: add support for loading power limit
+ table from file
+
+Background:
+When adding single SKU power tables for 30 or more config directly into
+the MT76 device tree overlay, the resulting dtbo size exceeds 2.x MB.
+This causes the system to hang at "starting kernel" during boot, likely
+due to a size limitation when mounting the dtbo.
+
+To address this, power limit tables are now loaded from a user-provided
+file in the filesystem, and a debugfs knob is added for runtime control.
+
+Users can now create a separate power limit file for each country, making
+it easy to adjust settings as needed. As a result, the sku_idx mechanism
+is no longer required.
+
+Key changes:
+- Add functions to read and parse power limit table from a text file.
+- Support flexible parsing of 1D/2D arrays for rates and path limits.
+- Apply parsed power limits to driver structures for each band/channel.
+- Add debug output for easier verification of parsed values.
+- Add debugfs knob 'power_table_file' to enable file-based power table.
+- When enabled, re-initialize txpower and update firmware for all PHYs.
+- Roll back changes if any step fails.
+
+This enables easier testing and tuning of power limit settings without
+recompiling the driver or firmware, and allows dynamic switching between
+default and file-based configurations at runtime. Also avoids dtbo size
+limitations and boot issues caused by large embedded power tables.
+
+Add support for configuring the singlesku file path for mt7996 either via
+the hostapd.conf or through debugfs. This enables more flexible SKU table
+management and runtime adjustment.
+
+Signed-off-by: Ryder Lee <ryder.lee@mediatek.com>
+---
+ eeprom.c         | 427 +++++++++++++++++++++++++++++++++++++++++++++++
+ mt76.h           |   8 +
+ mt7996/debugfs.c |  95 ++++++++++-
+ mt7996/init.c    |  25 ++-
+ mt7996/mcu.c     |  19 ++-
+ mt7996/vendor.c  |  29 ++--
+ mt7996/vendor.h  |   1 +
+ 7 files changed, 581 insertions(+), 23 deletions(-)
+
+diff --git a/eeprom.c b/eeprom.c
+index 920457d94..016a6fccb 100644
+--- a/eeprom.c
++++ b/eeprom.c
+@@ -8,6 +8,7 @@
+ #include <linux/mtd/partitions.h>
+ #include <linux/nvmem-consumer.h>
+ #include <linux/etherdevice.h>
++#include <linux/fs.h>
+ #include "mt76.h"
+ #include "mt76_connac.h"
+ 
+@@ -17,6 +18,13 @@ enum mt76_sku_type {
+ 	MT76_SKU_BACKOFF_BF_OFFSET,
+ };
+ 
++struct chan_section {
++	int chan[2];
++	int chan_num;
++	int txs_delta[4];
++	int txs_delta_num;
++};
++
+ static int mt76_get_of_eeprom_data(struct mt76_dev *dev, void *eep, int len)
+ {
+ 	struct device_node *np = dev->dev->of_node;
+@@ -631,3 +639,422 @@ mt76_eeprom_init(struct mt76_dev *dev, int len)
+ 	return !mt76_get_of_eeprom(dev, dev->eeprom.data, len);
+ }
+ EXPORT_SYMBOL_GPL(mt76_eeprom_init);
++
++/* read power table from filesystem */
++
++static int mt76_parse_list(const char *str, void *arr, int max,
++			   long min, long maxv, size_t elem_size)
++{
++	char *s, *p, *tok;
++	long val;
++	int ret, cnt = 0;
++
++	s = kstrdup(str, GFP_KERNEL);
++	if (!s)
++		return -ENOMEM;
++
++	p = s;
++	while ((tok = strsep(&p, ",")) && cnt < max) {
++		if (!*tok)
++			goto err;
++
++		ret = kstrtol(tok, 10, &val);
++		if (ret < 0)
++			goto err;
++
++		val = clamp(val, min, maxv);
++
++		if (elem_size == sizeof(s8))
++			((s8 *)arr)[cnt++] = (s8)val;
++		else if (elem_size == sizeof(int))
++			((int *)arr)[cnt++] = (int)val;
++		else
++			goto err;
++	}
++
++	kfree(s);
++	return cnt;
++err:
++	kfree(s);
++	return -EINVAL;
++}
++
++#define mt76_parse_s8(str, arr, max) \
++	mt76_parse_list((str), (arr), (max), 0L, 127L, sizeof(s8))
++
++#define mt76_parse_int(str, arr, max) \
++	mt76_parse_list((str), (arr), (max), 0L, 233L, sizeof(int))
++
++static int
++mt76_parse_s8_2d(const char *str, s8 *arr, int group_max, int elem_max)
++{
++	int ret, group = 0;
++	char *s, *p, *tok;
++
++	s = kstrdup(str, GFP_KERNEL);
++	if (!s)
++		return -ENOMEM;
++
++	p = s;
++	while ((tok = strsep(&p, ";")) && group < group_max) {
++		ret = mt76_parse_s8(tok, arr + group * elem_max, elem_max);
++		if (ret < 0) {
++			kfree(s);
++			return ret;
++		}
++		group++;
++	}
++	kfree(s);
++	return group;
++}
++
++static ssize_t
++mt76_read_file(const char *path, char *buf, size_t buf_size)
++{
++	struct file *filp;
++	loff_t pos = 0;
++	ssize_t ret;
++
++	filp = filp_open(path, O_RDONLY, 0);
++	if (IS_ERR(filp))
++		return PTR_ERR(filp);
++
++	ret = kernel_read(filp, buf, buf_size - 1, &pos);
++	if (ret >= 0)
++		buf[ret] = '\0';
++
++	filp_close(filp, NULL);
++	return ret;
++}
++
++static int mt76_find_file_section(const char *buf, const char *section_name,
++				  const char **section_start, size_t *section_len)
++{
++	const char *start, *end;
++	size_t len;
++
++	start = strstr(buf, section_name);
++	if (!start)
++		return -ENOENT;
++
++	start = strchr(start, '\n');
++	if (!start)
++		return -ENOENT;
++
++	start++;	/* skip section header */
++
++	end = strchr(start, '[');
++	if (!end)
++		end = start + strlen(start);
++
++	len = end - start;
++
++	*section_start = start;
++	*section_len = len;
++	return 0;
++}
++
++static int mt76_parse_file_chan_block(const char *section, size_t section_len,
++				      struct ieee80211_channel *chan,
++				      struct chan_section *chan_sec)
++{
++	int ret;
++	char *data, *line, *p;
++
++	memset(chan_sec, 0, sizeof(*chan_sec));
++
++	data = kstrndup(section, section_len, GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	p = data;
++	while ((line = strsep(&p, "\n")) != NULL) {
++		char *val = strchr(line, '=');
++
++		if (!val)
++			continue;
++		val++;
++
++		if (strstr(line, "channels=")) {
++			ret = mt76_parse_int(val, chan_sec->chan,
++					     ARRAY_SIZE(chan_sec->chan));
++			if (ret < 0) {
++				kfree(data);
++				return ret;
++			}
++			chan_sec->chan_num = ret;
++		} else if (strstr(line, "txs-delta=")) {
++			ret = mt76_parse_int(val, chan_sec->txs_delta,
++					     ARRAY_SIZE(chan_sec->txs_delta));
++			if (ret < 0) {
++				kfree(data);
++				return ret;
++			}
++			chan_sec->txs_delta_num = ret;
++		}
++	}
++	kfree(data);
++
++	if (chan_sec->chan_num < 2)
++		return -EINVAL;
++
++	return chan->hw_value >= chan_sec->chan[0] &&
++		chan->hw_value <= chan_sec->chan[1];
++}
++
++static int
++mt76_parse_file_txs_delta(struct chan_section *chan_sec, int nss)
++{
++	if (nss <= 0 || nss > chan_sec->txs_delta_num)
++		return 0;
++
++	return chan_sec->txs_delta[nss - 1];
++}
++
++static void
++mt76_apply_file_limit(struct mt76_dev *dev, s8 *pwr, size_t pwr_len, s8 target_power,
++		      s8 nss_delta, s8 *max_power, int n_chains, enum mt76_sku_type type)
++{
++	int i;
++
++	for (i = 0; i < pwr_len; i++) {
++		u8 backoff_chain_idx = i;
++		int backoff_n_chains;
++		s8 backoff_delta;
++		s8 delta;
++
++		switch (type) {
++		case MT76_SKU_RATE:
++			delta = 0;
++			backoff_delta = 0;
++			backoff_n_chains = 0;
++			break;
++		case MT76_SKU_BACKOFF_BF_OFFSET:
++			backoff_chain_idx += 1;
++			fallthrough;
++		case MT76_SKU_BACKOFF:
++			delta = mt76_tx_power_path_delta(n_chains);
++			backoff_n_chains = mt76_backoff_n_chains(dev, backoff_chain_idx);
++			backoff_delta = mt76_tx_power_path_delta(backoff_n_chains);
++			break;
++		default:
++			return;
++		}
++
++		pwr[i] = min_t(s8, target_power + delta - backoff_delta,
++			       pwr[i] + nss_delta);
++
++		/* used for padding, doesn't need to be considered */
++		if (pwr[i] >= S8_MAX - 1)
++			continue;
++
++		/* only consider backoff value for the configured chain number */
++		if (type != MT76_SKU_RATE && n_chains != backoff_n_chains)
++			continue;
++
++		if (max_power)
++			*max_power = max(*max_power, pwr[i]);
++	}
++}
++
++static void
++mt76_apply_file_multi_limit(struct mt76_dev *dev, s8 *pwr, size_t pwr_len, size_t pwr_num,
++			    s8 target_power, s8 nss_delta, s8 *max_power,
++			    int n_chains, enum mt76_sku_type type)
++{
++	static const int connac2_backoff_ru_idx = 2;
++	int i;
++
++	for (i = 0; i < pwr_num; i++) {
++		if (!is_mt799x(dev) && type == MT76_SKU_BACKOFF &&
++		    i > connac2_backoff_ru_idx)
++			type = MT76_SKU_BACKOFF_BF_OFFSET;
++
++		mt76_apply_file_limit(dev, pwr + pwr_len * i, pwr_len, target_power,
++				nss_delta, max_power, n_chains, type);
++	}
++}
++
++static int
++mt76_parse_file_chan_power(const char *section, size_t section_len,
++			   struct mt76_power_limits *dest)
++{
++	char *data, *line, *p, *val;
++	int r;
++
++	data = kstrndup(section, section_len, GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++#define parse_power(key, a)								\
++	if (strstr(line, key)) {							\
++		r = mt76_parse_s8(val, (s8 *)(a), ARRAY_SIZE(a));			\
++		if (r < 0) { kfree(data); return r; }					\
++		continue;								\
++	}
++#define parse_power_2d(key, a)								\
++	if (strstr(line, key)) {							\
++		r = mt76_parse_s8_2d(val, (s8 *)(a), ARRAY_SIZE(a), ARRAY_SIZE((a)[0]));\
++		if (r < 0) { kfree(data); return r; }					\
++		continue;								\
++	}
++
++	p = data;
++	while ((line = strsep(&p, "\n")) != NULL) {
++		val = strchr(line, '=');
++		if (!val)
++			continue;
++		val++;
++
++		/* parse rate power table */
++		parse_power("rates-cck=", dest->cck)
++		parse_power("rates-ofdm=", dest->ofdm)
++		parse_power_2d("rates-mcs=", dest->mcs)
++		parse_power_2d("rates-ru=", dest->ru)
++		parse_power_2d("rates-eht=", dest->eht)
++
++		/* parse backoff table */
++		parse_power("paths-cck=", dest->path.cck)
++		parse_power("paths-ofdm=", dest->path.ofdm)
++		parse_power("paths-ofdm-bf=", dest->path.ofdm_bf)
++		parse_power_2d("paths-ru=", dest->path.ru)
++		parse_power_2d("paths-ru-bf=", dest->path.ru_bf)
++	}
++#undef parse_power
++#undef parse_power_2d
++
++	kfree(data);
++	return r;
++}
++
++char *mt76_find_power_limits_section_file(struct mt76_phy *phy)
++{
++	const char *header = "[power-limits]\n";
++	char *buf;
++
++#define BUF_SIZE 0x60000 /* SZ_384K */
++
++	if (!phy->sku_filename[0])
++		return NULL;
++
++	buf = kzalloc(BUF_SIZE, GFP_KERNEL);
++	if (!buf)
++		return NULL;
++
++	if (mt76_read_file(phy->sku_filename, buf, BUF_SIZE) <= 0)
++		goto err;
++
++	if (strncmp(buf, header, strlen(header)) != 0)
++		goto err;
++
++	if (strstr(buf, "country=") || strstr(buf, "regdomain="))
++		return buf;
++
++err:
++	kfree(buf);
++	return NULL;
++}
++EXPORT_SYMBOL_GPL(mt76_find_power_limits_section_file);
++
++s8 mt76_get_rate_power_limits_file(struct mt76_phy *phy,
++				   struct ieee80211_channel *chan,
++				   struct mt76_power_limits *dest,
++				   s8 target_power)
++{
++	struct mt76_dev *dev = phy->dev;
++	char band, *buf;
++	const char *region_name, *search;
++	const char *const region_names[] = {
++		[NL80211_DFS_UNSET] = "ww",
++		[NL80211_DFS_ETSI] = "etsi",
++		[NL80211_DFS_FCC] = "fcc",
++		[NL80211_DFS_JP] = "jp",
++	};
++	int section, n_chains = hweight16(phy->chainmask);
++
++	memset(dest, target_power, sizeof(*dest));
++	memset(&dest->path, 0, sizeof(dest->path));
++
++	buf = mt76_find_power_limits_section_file(phy);
++	if (!buf)
++		return target_power;
++
++	switch (chan->band) {
++	case NL80211_BAND_2GHZ:
++		band = '2';
++		break;
++	case NL80211_BAND_5GHZ:
++		band = '5';
++		break;
++	case NL80211_BAND_6GHZ:
++		band = '6';
++		break;
++	default:
++		goto out;
++	}
++
++	if (dev->region >= ARRAY_SIZE(region_names) || !region_names[dev->region])
++		goto out;
++
++	region_name = region_names[dev->region];
++	search = buf;
++
++#define MAX_SECTION_NUM 64
++
++	for (section = 0; section < MAX_SECTION_NUM; section++) {
++		struct chan_section chan_sec;
++		const char *ptr;
++		size_t len;
++		char name[24];
++		s8 delta, max_power = -127;
++		int ret;
++
++		snprintf(name, sizeof(name), "[txpower-%cg.r%d]", band, section);
++
++		ret = mt76_find_file_section(search, name, &ptr, &len);
++		if (ret)
++			goto out;
++
++		ret = mt76_parse_file_chan_block(ptr, len, chan, &chan_sec);
++		if (ret <= 0)
++			continue;
++
++		ret = mt76_parse_file_chan_power(ptr, len, dest);
++		if (ret < 0)
++			goto out;
++
++		search = ptr + len;
++		delta = mt76_parse_file_txs_delta(&chan_sec, n_chains);
++
++#define __apply_array_limit(arr, type)					 \
++	mt76_apply_file_limit(dev, (arr), ARRAY_SIZE(arr), target_power, \
++			      delta, &max_power, n_chains, type)
++
++#define __apply_multi_array_limit(arr, type)				 \
++	mt76_apply_file_multi_limit(dev, (arr)[0], ARRAY_SIZE((arr)[0]), \
++				    ARRAY_SIZE(arr), target_power, delta,\
++				    &max_power, n_chains, type)
++
++		__apply_array_limit(dest->cck, MT76_SKU_RATE);
++		__apply_array_limit(dest->ofdm, MT76_SKU_RATE);
++		__apply_multi_array_limit(dest->mcs, MT76_SKU_RATE);
++		__apply_multi_array_limit(dest->ru, MT76_SKU_RATE);
++		__apply_multi_array_limit(dest->eht, MT76_SKU_RATE);
++
++		__apply_array_limit(dest->path.cck, MT76_SKU_BACKOFF);
++		__apply_array_limit(dest->path.ofdm, MT76_SKU_BACKOFF);
++		__apply_array_limit(dest->path.ofdm_bf, MT76_SKU_BACKOFF_BF_OFFSET);
++		__apply_multi_array_limit(dest->path.ru, MT76_SKU_BACKOFF);
++		__apply_multi_array_limit(dest->path.ru_bf, MT76_SKU_BACKOFF);
++		target_power = max_power;
++
++		break;
++	}
++#undef __apply_array_limit
++#undef __apply_multi_array_limit
++
++out:
++	kfree(buf);
++	return target_power;
++}
++EXPORT_SYMBOL_GPL(mt76_get_rate_power_limits_file);
+diff --git a/mt76.h b/mt76.h
+index 6cd4e88f4..6a8d48fa2 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -92,6 +92,7 @@
+ #define MT_NPU_Q_RX(_n)		__MT_NPU_Q(MT76_WED_Q_RX, _n)
+ #define MT_NPU_Q_TXFREE(_n)	(FIELD_PREP(MT_QFLAG_WED_TYPE, MT76_WED_Q_TXFREE) | \
+ 				 FIELD_PREP(MT_QFLAG_WED_RING, _n))
++#define SKU_FILENAME_MAX	64
+ 
+ struct mt76_dev;
+ struct mt76_phy;
+@@ -1127,6 +1128,7 @@ struct mt76_phy {
+ 
+ 	int txpower_cur;
+ 	u8 sku_idx;
++	char sku_filename[SKU_FILENAME_MAX];
+ 	u8 antenna_mask;
+ 	u16 chainmask;
+ 
+@@ -2254,6 +2256,12 @@ s8 mt76_get_rate_power_limits(struct mt76_phy *phy,
+ 			      struct mt76_power_limits *dest,
+ 			      s8 target_power);
+ 
++s8 mt76_get_rate_power_limits_file(struct mt76_phy *phy,
++				   struct ieee80211_channel *chan,
++				   struct mt76_power_limits *dest,
++				   s8 target_power);
++char *mt76_find_power_limits_section_file(struct mt76_phy *phy);
++
+ static inline bool mt76_queue_is_rx(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+ 	int i;
+diff --git a/mt7996/debugfs.c b/mt7996/debugfs.c
+index 1658bcf98..f60d4161f 100644
+--- a/mt7996/debugfs.c
++++ b/mt7996/debugfs.c
+@@ -10,6 +10,98 @@
+ #include "mac.h"
+ 
+ #define FW_BIN_LOG_MAGIC	0x44d9c99a
++static ssize_t
++mt7996_sku_filename_set(struct file *file, const char __user *user_buf,
++		    size_t count, loff_t *ppos)
++{
++	struct mt7996_phy *phy = file->private_data;
++	struct mt76_phy *mphy = phy->mt76;
++	char buf[SKU_FILENAME_MAX];
++	ssize_t ret;
++	bool en;
++	s8 delta, limit;
++
++	/* It’s possible that the user sets power without setting AP channel */
++	if (!cfg80211_chandef_valid(&mphy->chandef) ||
++	    !cfg80211_chandef_valid(&mphy->main_chandef))
++		return -EFAULT;
++
++	if (count >= sizeof(buf))
++		return -EINVAL;
++
++	if (copy_from_user(buf, user_buf, count))
++		return -EFAULT;
++
++	if (count && buf[count - 1] == '\n')
++		buf[count - 1] = '\0';
++	else
++		buf[count] = '\0';
++
++	if (buf[0])
++		snprintf(mphy->sku_filename, SKU_FILENAME_MAX, "%s", buf);
++	else
++		mphy->sku_filename[0] = '\0';
++
++	en = !!buf[0];
++
++	if (en)
++		mt7996_init_txpower(phy);
++	else // "TODO: disable sku_filename, turn to sku_idx?"
++		mt76_phy_dbg(mphy, "Clear sku_filename to disable the sku!");
++
++	phy->sku_path_en = en;
++	phy->sku_limit_en = en;
++
++	ret = mt7996_mcu_set_tx_power_ctrl(phy, UNI_TXPOWER_SKU_POWER_LIMIT_CTRL,
++					   phy->sku_limit_en);
++	if (ret)
++		goto error;
++
++	ret = mt7996_mcu_set_tx_power_ctrl(phy, UNI_TXPOWER_BACKOFF_POWER_LIMIT_CTRL,
++					   phy->sku_path_en);
++	if (ret)
++		goto error;
++
++	limit = mphy->main_chandef.chan->max_power;
++
++	delta = mt76_tx_power_path_delta(hweight16(mphy->chainmask));
++	delta = DIV_ROUND_UP(mphy->txpower_cur + delta, 2);
++	limit = min_t(s8, delta, limit);
++
++	ret = mt7996_mcu_set_txpower_sku(phy, limit);
++	if (ret)
++		goto error;
++
++	return count;
++
++error:
++	mphy->sku_filename[0] = '\0';
++	phy->sku_path_en = false;
++	phy->sku_limit_en = false;
++	return ret;
++}
++
++static ssize_t
++mt7996_sku_filename_get(struct file *file, char __user *user_buf,
++		    size_t count, loff_t *ppos)
++{
++	struct mt7996_phy *phy = file->private_data;
++	struct mt76_phy *mphy = phy->mt76;
++	char buf[SKU_FILENAME_MAX + 8];
++	int len;
++
++	len = snprintf(buf, sizeof(buf), "%s\n",
++		       mphy->sku_filename[0] ? mphy->sku_filename : "");
++
++	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
++}
++
++static const struct file_operations fops_mt7996_sku_filename = {
++	.write = mt7996_sku_filename_set,
++	.read = mt7996_sku_filename_get,
++	.open = simple_open,
++	.llseek = default_llseek,
++};
+ 
+ /** global debugfs **/
+ 
+@@ -1506,7 +1598,8 @@ int mt7996_init_band_debugfs(struct mt7996_phy *phy)
+ 		debugfs_create_file("rdd_pulse_th", 0200, dir, dev, &fops_rdd_pulse_th);
+ 		debugfs_create_file("rdd_fcc5_lpn", 0200, dir, dev, &fops_rdd_fcc5_lpn);
+ 	}
+-
++	debugfs_create_file("power_table_filename", 0600, dir, phy,
++			    &fops_mt7996_sku_filename);
+ #ifdef CONFIG_MTK_DEBUG
+ 	mt7996_mtk_init_band_debugfs(phy, dir);
+ #endif
+diff --git a/mt7996/init.c b/mt7996/init.c
+index 595eea900..e18d3fdb1 100644
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -402,7 +402,8 @@ static void __mt7996_init_txpower(struct mt7996_phy *phy,
+ 	int path_delta = mt76_tx_power_path_delta(n_chains);
+ 	int pwr_delta = mt7996_eeprom_get_power_delta(dev, sband->band);
+ 	struct mt76_power_limits *limits;
+-	struct device_node *np;
++	struct device_node *np = NULL;
++	char *file = NULL;
+ 
+ 	limits = kzalloc(sizeof(*limits), GFP_KERNEL);
+ 	if (!limits)
+@@ -410,21 +411,31 @@ static void __mt7996_init_txpower(struct mt7996_phy *phy,
+ 
+ 	phy->sku_limit_en = true;
+ 	phy->sku_path_en = true;
+-	np = mt76_find_power_limits_node(phy->mt76);
++
++	if (phy->mt76->sku_filename[0])
++		file = mt76_find_power_limits_section_file(phy->mt76);
++	else
++		np = mt76_find_power_limits_node(phy->mt76);
++
+ 	for (i = 0; i < sband->n_channels; i++) {
+ 		struct ieee80211_channel *chan = &sband->channels[i];
+ 		int target_power = mt7996_eeprom_get_target_power(dev, chan);
+ 
+ 		target_power += pwr_delta;
+-		target_power = mt76_get_rate_power_limits(phy->mt76, chan,
+-							  limits,
+-							  target_power);
++		if (file)
++			target_power = mt76_get_rate_power_limits_file(phy->mt76, chan,
++								       limits,
++								       target_power);
++		else
++			target_power = mt76_get_rate_power_limits(phy->mt76, chan,
++								  limits,
++								  target_power);
+ 		if (!limits->path.ofdm[0])
+ 			phy->sku_path_en = false;
+ 
+ 		target_power += path_delta;
+ 		target_power = DIV_ROUND_UP(target_power, 2);
+-		if (!np)
++		if (!np && !file)
+ 			chan->max_power = min_t(int, chan->max_reg_power,
+ 						target_power);
+ 		else
+@@ -432,7 +443,9 @@ static void __mt7996_init_txpower(struct mt7996_phy *phy,
+ 		phy->txpower = max(phy->txpower, chan->max_power);
+ 		chan->orig_mpwr = target_power;
+ 	}
++
+ 	kfree(limits);
++	kfree(file);
+ }
+ 
+ void mt7996_init_txpower(struct mt7996_phy *phy)
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 9a9a727fc..9a107d74c 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -8088,6 +8088,7 @@ int mt7996_mcu_set_txpower_sku(struct mt7996_phy *phy,
+ 	};
+ 	struct mt76_power_limits *la;
+ 	struct sk_buff *skb;
++	struct ieee80211_channel *chan = mphy->main_chandef.chan;
+ 	int i, ret, txpower_limit;
+ 
+ 	if (txpower_setting == INT_MIN || txpower_setting > 127)
+@@ -8103,13 +8104,21 @@ int mt7996_mcu_set_txpower_sku(struct mt7996_phy *phy,
+ 	if (!la)
+ 		return -ENOMEM;
+ 
+-	txpower_limit = mt76_get_rate_power_limits(mphy, mphy->main_chandef.chan,
+-						   la, txpower_limit);
++	if (mphy->sku_filename[0])
++		txpower_limit =
++			mt76_get_rate_power_limits_file(mphy, chan, la, txpower_limit);
++	else
++		txpower_limit =
++			mt76_get_rate_power_limits(mphy, chan, la, txpower_limit);
++
++	if (!la->path.ofdm[0])
++		phy->sku_path_en = false;
++
+ 	if(phy->mt76->cap.has_6ghz && dev->mt76.afc_power_table) {
+-		ret = mt7996_afc_update_power_limit(dev, mphy->main_chandef.chan, la,
+-						    &txpower_limit, &mphy->main_chandef);
++		ret = mt7996_afc_update_power_limit(dev, chan, la, &txpower_limit,
++						    &mphy->main_chandef);
+ 		if (ret)
+-			return ret;
++			goto out;
+ 	}
+ 
+ 	mt7996_update_max_txpower_cur(phy, txpower_limit);
+diff --git a/mt7996/vendor.c b/mt7996/vendor.c
+index b88c9edcc..fb7d47fb2 100644
+--- a/mt7996/vendor.c
++++ b/mt7996/vendor.c
+@@ -168,6 +168,7 @@ txpower_ctrl_policy[NUM_MTK_VENDOR_ATTRS_TXPOWER_CTRL] = {
+ 	[MTK_VENDOR_ATTR_TXPOWER_CTRL_LINK_ID] = { .type = NLA_U8 },
+ 	[MTK_VENDOR_ATTR_TXPOWER_CTRL_AFC_TABLE] = { .type = NLA_BINARY },
+ 	[MTK_VENDOR_ATTR_TXPOWER_CTRL_AFC_LPI] = { .type = NLA_U8 },
++	[MTK_VENDOR_ATTR_TXPOWER_CTRL_SKU_FILENAME] = { .type = NLA_STRING },
+ };
+ 
+ static const struct nla_policy
+@@ -1651,10 +1652,23 @@ static int mt7996_vendor_txpower_ctrl(struct wiphy *wiphy,
+ 			return err;
+ 	}
+ 
+-	if (tb[MTK_VENDOR_ATTR_TXPOWER_CTRL_SKU_IDX]) {
+-		struct mt76_power_limits *la = NULL;
+-		struct ieee80211_channel *chan = mphy->main_chandef.chan;
++	if (tb[MTK_VENDOR_ATTR_TXPOWER_CTRL_SKU_FILENAME]) {
++		err = nla_strscpy(mphy->sku_filename,
++				  tb[MTK_VENDOR_ATTR_TXPOWER_CTRL_SKU_FILENAME],
++				  SKU_FILENAME_MAX);
++
++		if (err > 0 && mphy->sku_filename[0]) {
++			mt7996_init_txpower(phy);
++			phy->sku_limit_en = true;
++			phy->sku_path_en = true;
++		} else {
++			mphy->sku_filename[0] = '\0';
++			phy->sku_limit_en = false;
++			phy->sku_path_en = false;
++		}
++	} else if (tb[MTK_VENDOR_ATTR_TXPOWER_CTRL_SKU_IDX]) {
+ 		u8 orig_sku_idx = mphy->sku_idx;
++		struct ieee80211_channel *chan = mphy->main_chandef.chan;
+ 
+ 		mphy->sku_idx = nla_get_u8(tb[MTK_VENDOR_ATTR_TXPOWER_CTRL_SKU_IDX]);
+ 
+@@ -1667,20 +1681,13 @@ static int mt7996_vendor_txpower_ctrl(struct wiphy *wiphy,
+ 
+ 		phy->sku_limit_en = true;
+ 		phy->sku_path_en = true;
+-		la = kzalloc(sizeof(*la), GFP_KERNEL);
+-		if (!la)
+-			return -ENOMEM;
+-
+-		mt76_get_rate_power_limits(mphy, chan, la, 127);
+-		if (!la->path.ofdm[0])
+-			phy->sku_path_en = false;
+ 
+ #ifdef CONFIG_MTK_DEBUG
+ 		/* To make sure the sku is still enabled when we restart AP. */
+ 		dev->dbg.sku_disable = false;
+ #endif
+-		kfree(la);
+ 	} else {
++		mphy->sku_filename[0] = '\0';
+ 		phy->sku_limit_en = false;
+ 		phy->sku_path_en = false;
+ 	}
+diff --git a/mt7996/vendor.h b/mt7996/vendor.h
+index 81522505e..64f2c7c95 100644
+--- a/mt7996/vendor.h
++++ b/mt7996/vendor.h
+@@ -345,6 +345,7 @@ enum mtk_vendor_attr_txpower_ctrl {
+ 	MTK_VENDOR_ATTR_TXPOWER_CTRL_LINK_ID,
+ 	MTK_VENDOR_ATTR_TXPOWER_CTRL_AFC_TABLE,
+ 	MTK_VENDOR_ATTR_TXPOWER_CTRL_AFC_LPI,
++	MTK_VENDOR_ATTR_TXPOWER_CTRL_SKU_FILENAME,
+ 
+ 	/* keep last */
+ 	NUM_MTK_VENDOR_ATTRS_TXPOWER_CTRL,
+-- 
+2.45.2
+

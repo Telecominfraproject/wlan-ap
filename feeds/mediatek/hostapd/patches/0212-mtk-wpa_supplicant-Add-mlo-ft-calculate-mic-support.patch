@@ -1,0 +1,253 @@
+From 49079049b375d355af74ad35f5877038f5668565 Mon Sep 17 00:00:00 2001
+From: Allen Ye <allen.ye@mediatek.com>
+Date: Wed, 4 Mar 2026 15:18:06 +0800
+Subject: [PATCH 212/260] mtk: wpa_supplicant: Add mlo ft calculate mic support
+
+Add reassoc req & resp mlo ft mic data calculation.
+For reaasoc resp, the ie content should consider the RSN in the
+per-sta profile of each link. Which would be different with assoc link
+if ap have 6g band and enable transition mode.
+
+Signed-off-by: Allen Ye <allen.ye@mediatek.com>
+
+Fix sta roaming to different link id set bss failed with wpa_sm storing
+the previous connection link address.
+e.g. 2 links bss, roaming from link id 0 & 1 to link id 1 & 2.
+
+Signed-off-by: Allen Ye <allen.ye@mediatek.com>
+---
+ src/rsn_supp/wpa_ft.c | 161 ++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 156 insertions(+), 5 deletions(-)
+
+diff --git a/src/rsn_supp/wpa_ft.c b/src/rsn_supp/wpa_ft.c
+index 0730eb58c..0766704f2 100644
+--- a/src/rsn_supp/wpa_ft.c
++++ b/src/rsn_supp/wpa_ft.c
+@@ -186,6 +186,110 @@ int wpa_sm_set_ft_params(struct wpa_sm *sm, const u8 *ies, size_t ies_len)
+ }
+ 
+ 
++static u8 count_link_bitmap(u16 link_map)
++{
++	u8 c = 0;
++	while (link_map) {
++		link_map &= (link_map - 1);
++		c++;
++	}
++	return c;
++}
++
++
++static int wpa_ft_mic_link_data(struct wpa_sm *sm,
++				struct ft_links *ft_links_data,
++				struct wpa_ft_ies *reassoc_ft_ies)
++{
++	u8 link_id, count = 0;
++	struct wpabuf *mlbuf = NULL;
++	int ret = 0;
++
++	for_each_link(ft_links_data->valid_links, link_id) {
++		struct ft_link_data *link_data;
++		const u8 *rsne, *rsnxe;
++		u8 rsne_len = 0, rsnxe_len = 0;
++		struct ieee802_11_elems elems;
++
++		link_data = &ft_links_data->links[count];
++		count++;
++
++		if (wpa_sm_get_link_addr(sm, link_data->link_addr, link_id,
++					 ft_links_data->is_assoc_resp)) {
++			ret = -1;
++			break;
++		}
++		if (!ft_links_data->is_assoc_resp)
++			continue;
++
++		/* parse per-sta profile for non-assoc link */
++		if (link_id != sm->mlo.assoc_link_id) {
++			/* Reset ml buf for each non-assoc link.
++			 * ieee802_11_parse_link_assoc_req() will remove the subelem fragment
++			 * tag which changes the mle content in the buf. */
++			if (mlbuf) {
++				wpabuf_free(mlbuf);
++				mlbuf = NULL;
++			}
++			mlbuf = ieee802_11_defrag(reassoc_ft_ies->basic_ml,
++						  reassoc_ft_ies->basic_mle_len, true);
++			if (!mlbuf) {
++				ret = -1;
++				break;
++			}
++			memset(&elems, 0, sizeof(elems));
++			elems.rsn_ie = reassoc_ft_ies->rsn;
++			elems.rsn_ie_len = reassoc_ft_ies->rsn_len;
++			elems.rsnxe = reassoc_ft_ies->rsnxe;
++			elems.rsnxe_len = reassoc_ft_ies->rsnxe_len;
++			if (ieee802_11_parse_link_assoc_req(&elems, mlbuf, link_id,
++							true) == ParseFailed) {
++				wpa_printf(MSG_DEBUG, "MLD: link: Failed to parse"
++					   " association request Multi-Link element");
++				ret = -1;
++				break;
++			}
++		}
++
++		if (link_id == sm->mlo.assoc_link_id) {
++			rsne = reassoc_ft_ies->rsn;
++			rsne_len = reassoc_ft_ies->rsn_len;
++		} else {
++			rsne = elems.rsn_ie;
++			rsne_len = elems.rsn_ie_len;
++		}
++
++		if (!rsne || rsne_len > sizeof(link_data->rsne) - 2)
++			continue;
++
++		link_data->rsne[0] = WLAN_EID_RSN;
++		link_data->rsne[1] = rsne_len;
++		os_memcpy(link_data->rsne + 2, rsne, rsne_len);
++		link_data->rsne_len = rsne_len + 2;
++		ft_links_data->elem_count++;
++
++		if (link_id == sm->mlo.assoc_link_id) {
++			rsnxe = reassoc_ft_ies->rsnxe;
++			rsnxe_len = reassoc_ft_ies->rsnxe_len;
++		} else {
++			rsnxe = elems.rsnxe;
++			rsnxe_len = elems.rsnxe_len;
++		}
++
++		if (!rsnxe_len || rsnxe_len > sizeof(link_data->rsnxe) - 2)
++			continue;
++
++		link_data->rsnxe[0] = WLAN_EID_RSNX;
++		link_data->rsnxe[1] = rsnxe_len;
++		os_memcpy(link_data->rsnxe + 2, rsnxe, rsnxe_len);
++		link_data->rsnxe_len = rsnxe_len + 2;
++		ft_links_data->elem_count++;
++	}
++	if (mlbuf)
++		wpabuf_free(mlbuf);
++	return ret;
++}
++
+ /**
+  * wpa_ft_gen_req_ies - Generate FT (IEEE 802.11r) IEs for Auth/ReAssoc Request
+  * @sm: Pointer to WPA state machine data from wpa_sm_init()
+@@ -453,6 +557,8 @@ static u8 * wpa_ft_gen_req_ies(struct wpa_sm *sm, size_t *len,
+ 	}
+ 
+ 	if (kck) {
++		struct ft_links ft_links_data;
++
+ 		/*
+ 		 * IEEE Std 802.11r-2008, 11A.8.4
+ 		 * MIC shall be calculated over:
+@@ -470,18 +576,41 @@ static u8 * wpa_ft_gen_req_ies(struct wpa_sm *sm, size_t *len,
+ 		if (rsnxe_len)
+ 			*elem_count += 1;
+ 		/* TODO: fix mld STA FT mic */
++		os_memset(&ft_links_data, 0, sizeof(ft_links_data));
++		if (sm->mlo.req_links) {
++			ft_links_data.valid_links = wpa_sm_get_valid_links(sm, NULL);
++			ft_links_data.link_count =
++				count_link_bitmap(ft_links_data.valid_links);
++			ft_links_data.links = os_zalloc(ft_links_data.link_count *
++				sizeof(struct ft_link_data));
++			if (!ft_links_data.links) {
++				os_free(buf);
++				return NULL;
++			}
++			res = wpa_ft_mic_link_data(sm, &ft_links_data, NULL);
++			if (res) {
++				os_free(buf);
++				os_free(ft_links_data.links);
++				return NULL;
++			}
++		}
++
+ 		if (wpa_ft_mic(sm->key_mgmt, kck, kck_len,
+ 			       sm->own_addr, target_ap, 5,
+ 			       ((u8 *) mdie) - 2, 2 + sizeof(*mdie),
+ 			       ftie_pos, 2 + *ftie_len,
+ 			       (u8 *) rsnie, 2 + rsnie->len, ric_ies,
+ 			       ric_ies_len, rsnxe_len ? rsnxe : NULL, rsnxe_len,
+-			       NULL, NULL,
++			       &ft_links_data, NULL,
+ 			       fte_mic) < 0) {
+ 			wpa_printf(MSG_INFO, "FT: Failed to calculate MIC");
+ 			os_free(buf);
++			if (sm->mlo.req_links)
++				os_free(ft_links_data.links);
+ 			return NULL;
+ 		}
++		if (sm->mlo.req_links)
++			os_free(ft_links_data.links);
+ 	}
+ 
+ 	*len = pos - buf;
+@@ -1079,8 +1208,10 @@ int wpa_ft_validate_reassoc_resp(struct wpa_sm *sm, const u8 *ies,
+ 	int own_rsnxe_used;
+ 	size_t mic_len;
+ 	int ret = -1;
++	struct ft_links ft_links_data;
+ 
+ 	os_memset(&parse, 0, sizeof(parse));
++	os_memset(&ft_links_data, 0, sizeof(ft_links_data));
+ 
+ 	wpa_hexdump(MSG_DEBUG, "FT: Response IEs", ies, ies_len);
+ 
+@@ -1180,11 +1311,30 @@ int wpa_ft_validate_reassoc_resp(struct wpa_sm *sm, const u8 *ies,
+ 		goto fail;
+ 	}
+ 
+-	count = 3;
++	/* MDE and FTE */
++	count = 2;
++	if (parse.basic_ml) {
++		ft_links_data.is_assoc_resp = true;
++		ft_links_data.valid_links =
++			wpa_sm_get_valid_links(sm, &sm->mlo.assoc_link_id);
++		ft_links_data.link_count = count_link_bitmap(ft_links_data.valid_links);
++		ft_links_data.links = os_zalloc(ft_links_data.link_count *
++			sizeof(struct ft_link_data));
++		if (!ft_links_data.links)
++			goto fail;
++		if (wpa_ft_mic_link_data(sm, &ft_links_data, &parse))
++			goto fail;
++		count += ft_links_data.elem_count;
++	} else {
++		if (parse.rsn)
++			count++;
++		if (parse.rsnxe)
++			count++;
++	}
++
+ 	if (parse.ric)
+ 		count += ieee802_11_ie_count(parse.ric, parse.ric_len);
+-	if (parse.rsnxe)
+-		count++;
++
+ 	if (parse.fte_elem_count != count) {
+ 		wpa_printf(MSG_DEBUG, "FT: Unexpected IE count in MIC "
+ 			   "Control: received %u expected %u",
+@@ -1208,7 +1358,7 @@ int wpa_ft_validate_reassoc_resp(struct wpa_sm *sm, const u8 *ies,
+ 		       parse.ric, parse.ric_len,
+ 		       parse.rsnxe ? parse.rsnxe - 2 : NULL,
+ 		       parse.rsnxe ? parse.rsnxe_len + 2 : 0,
+-		       NULL, NULL,
++		       &ft_links_data, NULL,
+ 		       mic) < 0) {
+ 		wpa_printf(MSG_DEBUG, "FT: Failed to calculate MIC");
+ 		goto fail;
+@@ -1331,6 +1481,7 @@ int wpa_ft_validate_reassoc_resp(struct wpa_sm *sm, const u8 *ies,
+ 	ret = 0;
+ fail:
+ 	wpa_ft_parse_ies_free(&parse);
++	os_free(ft_links_data.links);
+ 	return ret;
+ }
+ 
+-- 
+2.45.2
+

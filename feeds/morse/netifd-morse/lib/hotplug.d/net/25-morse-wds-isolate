@@ -1,0 +1,122 @@
+#!/bin/sh
+# morse-halow-native-netifd: break the WDS 4-addr broadcast loop.
+#
+# PROBLEM (root-caused on real HW, EAP115 AP + EAP112 STA, both morse):
+# In WDS/4-addr AP mode hostapd creates a dynamic AP_VLAN netdev per associated
+# STA (e.g. wlan0.sta1) and adds it to the same bridge as the AP master port
+# (wlan0). Both share the SAME radio/BSS (same air). When the STA uplinks a
+# broadcast/multicast:
+#   STA -> wlan0.sta1 (enters bridge) -> bridge floods to wlan0 (cross-port)
+#        -> wlan0 re-transmits it over the air as a normal group frame
+#        -> the originating STA hears its own broadcast
+#          => "br-...: received packet on wlanX with own address as source"
+#          => IPv6 duplicate address, ping dead, network storm.
+#
+# hostapd multicast_to_unicast does NOT help here: convert_to_unicast walks the
+# AP master (wlan0) sta_list, but the STA is attached to the AP_VLAN
+# (wlan0.sta1), so wlan0's list is empty -> it falls back to a plain multicast
+# air TX -> still loops. Per-port hairpin/bcast_flood toggles also don't help
+# because the flood is CROSS-PORT (wlan0.sta1 -> wlan0), not same-port.
+#
+# FIX (verified live: setting these stops the loop and ping goes 0% loss):
+# Put BOTH the AP master port and its WDS AP_VLAN child into bridge "isolated"
+# mode. Linux bridge only blocks traffic between two ports when BOTH are
+# isolated; isolated ports still forward to non-isolated ports (the wired
+# uplink eth), so STA data still flows - only the wlan0<->wlan0.sta1 air
+# reflection is cut. wlan0.staN is recreated on every (re)association, so this
+# must run on the netdev-add hotplug event, not once at setup.
+#
+# Only acts on morse (S1G) WDS AP_VLAN children and their parent; never touches
+# mt7996 2.4G/5G interfaces.
+
+[ "$ACTION" = "add" ] || exit 0
+
+# Only WDS AP_VLAN children: hostapd names them "<master>.staM". The morse AP
+# master may be "wlanN" (legacy) or the mt7996-style "phyN-ap0" (new naming),
+# so match any ".staM" child; the _is_morse() check on the parent below keeps
+# this morse-only. (e.g. wlan0.sta1 or phy3-ap0.sta1)
+case "$DEVICENAME" in
+	*.sta*) ;;
+	*) exit 0 ;;
+esac
+
+WDS_IF="$DEVICENAME"
+PARENT_IF="${WDS_IF%%.*}"		# wlan0.sta1 -> wlan0 ; phy3-ap0.sta1 -> phy3-ap0
+
+# Confirm the parent is a morse (S1G / dot11ah) PHY; skip anything else so we
+# never affect the mt7996 radios. morse netdevs live under the morse driver.
+_is_morse() {
+	local ifc="$1"
+	local drv
+	drv="$(readlink -f "/sys/class/net/$ifc/device/driver" 2>/dev/null)"
+	case "$drv" in
+		*morse*) return 0 ;;
+	esac
+	# Fallback: morse_cli responds only on morse interfaces.
+	morse_cli -i "$ifc" hw_version >/dev/null 2>&1 && return 0
+	return 1
+}
+
+_is_morse "$PARENT_IF" || exit 0
+
+# Both ports must be bridge members for isolation to matter. Setting isolated
+# on a non-bridged dev is harmless (kernel just ignores until bridged), but we
+# guard anyway. Retry briefly because the netdev-add hotplug can fire slightly
+# before the bridge enslave completes.
+#
+# IMPORTANT (reassoc race): wlan0.sta1 is torn down and RE-CREATED on every
+# (re)association, and each fresh bridge-enslave resets its port flags back to
+# the default isolated=off. The hotplug 'add' can fire a beat before the STA's
+# first uplink broadcast, so there is a brief window where the loop can emit a
+# few "own address as source" lines before we flip the flag. We minimise it by
+# re-asserting BOTH ports here and spawning a short (~3s) background re-assert to
+# catch the bridge enslave that lands just after this event.
+#
+# Note we deliberately key ONLY on the WDS child (wlanN.staM), which appears
+# only on the AP side, and derive the parent from it. We must NOT isolate a bare
+# morse interface unconditionally: on the STA side (e.g. EAP112 wlan2) the morse
+# interface is itself a bridged 4-addr client, and isolating it would break the
+# STA's own bridging. The child name is the reliable "this is the AP side"
+# signal.
+_set_isolated() {
+	local ifc="$1"
+	local i=0
+	while [ $i -lt 10 ]; do
+		if [ -d "/sys/class/net/$ifc/brport" ]; then
+			bridge link set dev "$ifc" isolated on 2>/dev/null
+			# hairpin/mcast_to_unicast on the master port would also
+			# re-open air reflection paths; force them off for morse.
+			bridge link set dev "$ifc" hairpin off 2>/dev/null
+			return 0
+		fi
+		i=$((i + 1))
+		sleep 0.3
+	done
+	return 1
+}
+
+logger -t morse-wds-isolate "isolating WDS pair $PARENT_IF <-> $WDS_IF to break 4addr air loop"
+_set_isolated "$PARENT_IF"
+_set_isolated "$WDS_IF"
+
+# Background re-assert to close the reassoc race: the child may be enslaved to
+# the bridge slightly after this hotplug fires, and its flags reset on each
+# re-create. Re-apply a few times over the next ~3s without blocking hotplug.
+(
+	n=0
+	while [ $n -lt 12 ]; do
+		[ -d "/sys/class/net/$WDS_IF" ] || break
+		if [ -d "/sys/class/net/$WDS_IF/brport" ]; then
+			bridge link set dev "$WDS_IF" isolated on 2>/dev/null
+			bridge link set dev "$WDS_IF" hairpin off 2>/dev/null
+		fi
+		if [ -d "/sys/class/net/$PARENT_IF/brport" ]; then
+			bridge link set dev "$PARENT_IF" isolated on 2>/dev/null
+			bridge link set dev "$PARENT_IF" hairpin off 2>/dev/null
+		fi
+		n=$((n + 1))
+		sleep 0.25
+	done
+) >/dev/null 2>&1 &
+
+exit 0
