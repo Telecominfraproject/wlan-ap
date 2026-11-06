@@ -182,6 +182,17 @@ platform_check_image() {
 
 	board=$(board_name)
 	case $board in
+	cambium,x7-35x)
+		# The magic test at the bottom accepts any wlan-ap sysupgrade tar
+		# and nothing checks BOARD=, so insist the tar was built for this
+		# board: nand_do_platform_check looks for
+		# sysupgrade-cambium_x7_35x/CONTROL inside it. Without this an
+		# EAP105 image would be written to a bank and booted.
+		nand_do_platform_check "cambium_x7_35x" "$1" || {
+			echo "ERROR: image was not built for $board. Upgrade ABORTED."
+			return 1
+		}
+		;;
 	sonicfi,rap7110c-341x)
 		local CURRENT_VER=$(get_current_version)
 
@@ -286,6 +297,29 @@ platform_do_upgrade() {
 	cig,wf672b|\
 	cig,wf672)
 		spi_nor_emmc_do_upgrade_bootconfig $1
+		;;
+	cambium,x7-35x)
+		# Two 96 MiB NAND banks, "rootfs" (A) and "rootfs_1" (B), each a
+		# UBI with a kernel and a ubi_rootfs volume. U-Boot picks the bank
+		# from its "image" variable (image=0 boots rootfs, image=1 boots
+		# rootfs_1) and bootcmd is a plain bootipq; there is no boot_a /
+		# boot_b command chain on this board. Write the bank we are NOT
+		# running from and let nand_do_upgrade_success flip "image" only
+		# once the write has succeeded.
+		#
+		# "rootfs" is a prefix of "rootfs_1", so test for the long name
+		# first and anchor the short one on its delimiter.
+		if grep -q 'ubi.mtd=rootfs_1' /proc/cmdline; then
+			CI_UBIPART="rootfs"
+			CI_FWSETENV="image 0"
+		elif grep -qE 'ubi.mtd=rootfs([[:space:]]|$)' /proc/cmdline; then
+			CI_UBIPART="rootfs_1"
+			CI_FWSETENV="image 1"
+		else
+			echo "ERROR: cannot tell which bank is running (no ubi.mtd= in /proc/cmdline). Upgrade ABORTED."
+			return 1
+		fi
+		nand_upgrade_tar "$1"
 		;;
 	edgecore,eap105)
 		if [ -e /tmp/downgrade ]; then
