@@ -1,0 +1,171 @@
+From 8037962e43dc8a22dd49d7dc12e647a851531572 Mon Sep 17 00:00:00 2001
+From: "crychic.tan" <crychic.tan@cybertan.com.tw>
+Date: Mon, 19 Oct 2026 15:41:55 +0800
+Subject: [PATCH] mediatek: mtk_ppe: keep TTL and DSCP of bridged flows
+
+With WED offload enabled, bridged WiFi <-> Ethernet traffic is forwarded
+by the PPE as L2 subflows. Once a flow is offloaded, the PPE decrements
+the IP TTL of every bridged packet and rewrites its DSCP to 0. Bridged
+packets must keep their TTL, and losing the DSCP breaks QoS for the rest
+of the network.
+
+The L2 flow template sets the BIND_TTL bit for every packet type and
+never fills IB2_DSCP, which the PPE uses to rewrite the TOS byte.
+
+Add a mediatek target kernel patch that only sets BIND_TTL for routed
+packet types, and that stores the TOS / traffic class of the packet that
+triggers the bind in IB2_DSCP of the subflow.
+
+Signed-off-by: crychic.tan <crychic.tan@cybertan.com.tw>
+---
+ ...e-keep-ttl-and-dscp-of-bridged-flows.patch | 138 ++++++++++++++++++
+ 1 file changed, 138 insertions(+)
+ create mode 100644 target/linux/mediatek/patches-6.12/999-2702-net-ethernet-mtk_ppe-keep-ttl-and-dscp-of-bridged-flows.patch
+
+diff --git a/target/linux/mediatek/patches-6.12/999-2702-net-ethernet-mtk_ppe-keep-ttl-and-dscp-of-bridged-flows.patch b/target/linux/mediatek/patches-6.12/999-2702-net-ethernet-mtk_ppe-keep-ttl-and-dscp-of-bridged-flows.patch
+new file mode 100644
+index 0000000000..612ae00d91
+--- /dev/null
++++ b/target/linux/mediatek/patches-6.12/999-2702-net-ethernet-mtk_ppe-keep-ttl-and-dscp-of-bridged-flows.patch
+@@ -0,0 +1,138 @@
++From: crychic.tan <crychic.tan@cybertan.com.tw>
++Subject: [PATCH] net: ethernet: mtk_ppe: keep TTL and DSCP of bridged flows
++
++L2 (bridge) flows are offloaded as per-5-tuple subflows that inherit ib1
++and ib2 from the L2 flow template. Two fields of that template are wrong
++for bridged traffic:
++
++- mtk_foe_entry_prepare() sets BIND_TTL for every packet type, so the PPE
++  decrements the IP TTL / hop limit of bridged packets as if it routed
++  them.
++- IB2_DSCP is never set, and the PPE rewrites the TOS byte / traffic
++  class of every bound packet from it, so all bridged packets lose their
++  DSCP and ECN bits once the flow is offloaded.
++
++Only set BIND_TTL for routed packet types. When binding a subflow, take
++the TOS / traffic class from the packet that triggered the bind and store
++it in IB2_DSCP, the same way the MediaTek SDK does. The packet comes from
++either the GMAC rx path (skb->data at the network header, possibly behind
++an in-band MTK DSA tag) or the WED rx path (skb->data at the MAC header),
++so it is parsed from the MAC header.
++
++NETSYS v2 has no "keep DSCP/ECN" option, so the value is fixed for the
++lifetime of the subflow, including the ECN bits.
++
++Signed-off-by: crychic.tan <crychic.tan@cybertan.com.tw>
++---
++ drivers/net/ethernet/mediatek/mtk_ppe.c | 64 +++++++++++++++++++++++++++++++++---
++ 1 file changed, 59 insertions(+), 5 deletions(-)
++
++--- a/drivers/net/ethernet/mediatek/mtk_ppe.c
+++++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
++@@ -236,7 +236,10 @@ int mtk_foe_entry_prepare(struct mtk_eth
++ 		val = FIELD_PREP(MTK_FOE_IB1_STATE, MTK_FOE_STATE_BIND) |
++ 		      FIELD_PREP(MTK_FOE_IB1_PACKET_TYPE_V2, type) |
++ 		      FIELD_PREP(MTK_FOE_IB1_UDP, l4proto == IPPROTO_UDP) |
++-		      MTK_FOE_IB1_BIND_CACHE_V2 | MTK_FOE_IB1_BIND_TTL_V2;
+++		      MTK_FOE_IB1_BIND_CACHE_V2;
+++		/* bridged packets must not have their IP TTL decremented */
+++		if (type != MTK_PPE_PKT_TYPE_BRIDGE)
+++			val |= MTK_FOE_IB1_BIND_TTL_V2;
++ 		entry->ib1 = val;
++ 
++ 		val = FIELD_PREP(MTK_FOE_IB2_DEST_PORT_V2, pse_port) |
++@@ -247,7 +250,9 @@ int mtk_foe_entry_prepare(struct mtk_eth
++ 		val = FIELD_PREP(MTK_FOE_IB1_STATE, MTK_FOE_STATE_BIND) |
++ 		      FIELD_PREP(MTK_FOE_IB1_PACKET_TYPE, type) |
++ 		      FIELD_PREP(MTK_FOE_IB1_UDP, l4proto == IPPROTO_UDP) |
++-		      MTK_FOE_IB1_BIND_CACHE | MTK_FOE_IB1_BIND_TTL;
+++		      MTK_FOE_IB1_BIND_CACHE;
+++		if (type != MTK_PPE_PKT_TYPE_BRIDGE)
+++			val |= MTK_FOE_IB1_BIND_TTL;
++ 		entry->ib1 = val;
++ 
++ 		val = FIELD_PREP(MTK_FOE_IB2_DEST_PORT, pse_port) |
++@@ -739,15 +744,59 @@ int mtk_foe_entry_commit(struct mtk_ppe
++ 	return 0;
++ }
++ 
+++/* length of the in-band MediaTek DSA tag, see net/dsa/tag_mtk.c */
+++#define MTK_PPE_DSA_TAG_LEN	4
+++
+++/* Return the IPv4 TOS or IPv6 traffic class of the packet that is about to be
+++ * bound. skb->data points to the network header on the GMAC rx path and to the
+++ * MAC header on the WED rx path, so parse from the MAC header in both cases.
+++ */
+++static u8 mtk_ppe_skb_dsfield(struct sk_buff *skb)
+++{
+++	u8 *hdr = skb_mac_header(skb) + 2 * ETH_ALEN;
+++	u8 *end = skb_tail_pointer(skb);
+++	__be16 proto;
+++
+++	if (IS_ENABLED(CONFIG_NET_DSA) &&
+++	    skb->protocol == htons(ETH_P_XDSA) && !skb_metadata_dst(skb))
+++		hdr += MTK_PPE_DSA_TAG_LEN;
+++
+++	if (hdr + 2 > end)
+++		return 0;
+++
+++	proto = get_unaligned((__be16 *)hdr);
+++	hdr += 2;
+++	if (proto == htons(ETH_P_8021Q)) {
+++		if (hdr + VLAN_HLEN > end)
+++			return 0;
+++
+++		proto = get_unaligned((__be16 *)(hdr + 2));
+++		hdr += VLAN_HLEN;
+++	}
+++
+++	if (hdr + 2 > end)
+++		return 0;
+++
+++	switch (proto) {
+++	case htons(ETH_P_IP):
+++		return hdr[1];
+++	case htons(ETH_P_IPV6):
+++		return get_unaligned_be16(hdr) >> 4;
+++	default:
+++		return 0;
+++	}
+++}
+++
++ static void
++ mtk_foe_entry_commit_subflow(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
++-			     u16 hash)
+++			     u16 hash, u8 dsfield)
++ {
++ 	const struct mtk_soc_data *soc = ppe->eth->soc;
++ 	struct mtk_flow_entry *flow_info;
++ 	struct mtk_foe_mac_info *l2;
++ 	struct mtk_foe_entry *hwe;
++ 	u32 ib1_mask = mtk_get_ib1_pkt_type_mask(ppe->eth) | MTK_FOE_IB1_UDP;
+++	u32 *ib2;
++ 	int type;
++ 
++ 	flow_info = kzalloc(sizeof(*flow_info), GFP_ATOMIC);
++@@ -775,7 +824,12 @@ mtk_foe_entry_commit_subflow(struct mtk_
++ 	else if (type >= MTK_PPE_PKT_TYPE_IPV6_ROUTE_3T && l2->etype == ETH_P_IP)
++ 		l2->etype = ETH_P_IPV6;
++ 
++-	*mtk_foe_entry_ib2(ppe->eth, &flow_info->data) = entry->data.bridge.ib2;
+++	/* The PPE rewrites the TOS / traffic class of bound packets from
+++	 * IB2_DSCP, so carry over the value of the packet being bound.
+++	 */
+++	ib2 = mtk_foe_entry_ib2(ppe->eth, &flow_info->data);
+++	*ib2 = entry->data.bridge.ib2 & ~MTK_FOE_IB2_DSCP;
+++	*ib2 |= FIELD_PREP(MTK_FOE_IB2_DSCP, dsfield);
++ 
++ 	__mtk_foe_entry_commit(ppe, &flow_info->data, hash);
++ }
++@@ -849,7 +903,7 @@ void __mtk_ppe_check_skb(struct mtk_ppe
++ 	if (!entry)
++ 		goto out;
++ 
++-	mtk_foe_entry_commit_subflow(ppe, entry, hash);
+++	mtk_foe_entry_commit_subflow(ppe, entry, hash, mtk_ppe_skb_dsfield(skb));
++ 
++ out:
++ 	spin_unlock_bh(&ppe_lock);
+-- 
+2.34.1
+
