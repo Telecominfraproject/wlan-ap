@@ -977,11 +977,14 @@ mac80211_reset_config() {
 
 # A board whose antennas carry more gain than its board data was characterised
 # for declares a per-band TX power ceiling in /etc/board.json, as
-# wlan.defaults.max_txpower.<band> in dBm. The configured txpower is clamped to
-# it, and an unset one, which would otherwise mean "auto" and so the regulatory
-# maximum, becomes the ceiling. Boards that declare nothing are unaffected.
+# wlan.defaults.max_txpower.<band> in integer dBm. Example:
+#   "wlan": { "defaults": { "max_txpower": { "2g": 24, "5g": 23, "6g": 18 } } }
+# The configured txpower is clamped to it, and an unset one, which would
+# otherwise mean "auto" and so the regulatory maximum, becomes the ceiling.
+# Boards that declare nothing are unaffected.
 mac80211_board_txpower_limit() {
 	local limit
+	local txp
 
 	case "$band" in
 		2g|5g|6g) ;;
@@ -991,7 +994,18 @@ mac80211_board_txpower_limit() {
 	case "$limit" in
 		''|*[!0-9]*) return;;
 	esac
-	[ -n "$txpower" ] && [ "${txpower%%.*}" -le "$limit" ] 2>/dev/null && return
+
+	# txpower is the config value in integer dBm; reject anything non-integer
+	# so the board metadata remains unambiguous.
+	[ -n "$txpower" ] || {
+		txpower=$limit
+		return
+	}
+	case "$txpower" in
+		''|*[!0-9]*) return 0 ;;
+	esac
+	txp="${txpower%%.*}"
+	[ -n "$txp" ] && [ "$txp" -le "$limit" ] 2>/dev/null && return
 	txpower=$limit
 }
 
