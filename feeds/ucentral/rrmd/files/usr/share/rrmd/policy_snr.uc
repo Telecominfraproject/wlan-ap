@@ -54,7 +54,7 @@ function snr_update() {
 
 			/* kick the station and ban it for the configured timeout */
 			ulog_info(`kick ${addr} as signal (${station.signal}) is too low\n`);
-			global.station.kick(addr, config.kick_reason, device.client_kick_ban_time);
+			global.station.kick({ addr: addr, reason: config.kick_reason, ban_time: +device.client_kick_ban_time });
 			kick_count++;
 		}
 	} catch(e) {
