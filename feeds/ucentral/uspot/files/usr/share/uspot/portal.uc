@@ -228,7 +228,7 @@ return {
 			'&ip=' + ctx.env.REMOTE_ADDR +
 			'&called=' + ctx.config.nasmac +
 			'&nasid=' + ctx.config.nasid +
-			'&ssid=' + ctx.ssid +
+			'&ssid=' + replace(ctx.ssid, /[^A-Za-z0-9._~-]/g, (c) => sprintf('%%%02X', ord(c))) +
 			'&sessionid=' + ctx.sessionid;
 		if (ctx.query_string?.redir)
 			uam_url += '&userurl=' + ctx.query_string.redir;
