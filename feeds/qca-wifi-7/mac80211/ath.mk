@@ -155,7 +155,7 @@ ifeq ($(CONFIG_PACKAGE_MAC80211_ATHDEBUG),y)
 endif
   AUTOLOAD:=$(call AutoProbe,ath12k ath12k_wifi7 ath_debug)
 endef
-  MODPARAMS.ath12k:=frame_mode=1 cold_boot_cal=0
+  MODPARAMS.ath12k:=frame_mode=2 cold_boot_cal=0
 
 define KernelPackage/ath12k-qca/description
 This module adds support for Qualcomm Technologies 802.11ax family of
