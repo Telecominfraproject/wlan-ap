@@ -80,6 +80,7 @@ define Device/cambium_xv2_2
   DEVICE_PACKAGES := ath11k-wifi-cig-wf188n uboot-envtools
 endef
 TARGET_DEVICES += cambium_xv2_2
+
 # The XV2-2T0 has only the integrated IPQ6018 radio. ath11k-wifi-cig-wf188n
 # carries Cambium's own bdwlan.b10-snow_leopard, a flat 64 KiB BDF installed
 # as board.bin.
@@ -91,9 +92,7 @@ define Device/cambium_xv2_2t0
   DEVICE_PACKAGES := ath11k-wifi-cig-wf188n uboot-envtools
 endef
 TARGET_DEVICES += cambium_xv2_2t0
-# The XV2-2T0 has only the integrated IPQ6018 radio. ath11k-wifi-cig-wf188n
-# carries Cambium's own bdwlan.b10-snow_leopard, a flat 64 KiB BDF installed
-# as board.bin.
+
 # The XV2-2T1 is the XV2-2T0 with 120-degree sector antennas in place of the
 # omni ones. The vendor's device trees for the two differ only in the board SKU
 # number and its firmware stages the same bdwlan.b10-snow_leopard for both, so
@@ -107,6 +106,7 @@ define Device/cambium_xv2_2t1
   DEVICE_PACKAGES := ath11k-wifi-cig-wf188n uboot-envtools
 endef
 TARGET_DEVICES += cambium_xv2_2t1
+
 # The XE3-4 is a tri-band AP-CP01 design with a QCN9074 on PCIe for a third,
 # 6 GHz, radio. ath11k-firmware-qcn9000 brings that radio's firmware and
 # ath11k-wifi-wallys-dr6018-v4 the closest open-source board data for both

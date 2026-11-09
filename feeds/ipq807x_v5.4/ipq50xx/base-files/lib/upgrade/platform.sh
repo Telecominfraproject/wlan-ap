@@ -113,7 +113,7 @@ platform_do_upgrade() {
 
 	board=$(board_name)
 	case $board in
-	cambium,xv2-22h)
+	cambium,xv2-22h|\
 	cambium,xv2-21x)
 		# Two identical NAND banks, rootfs @0x80000 and rootfs_1 @0x6080000,
 		# selected by the vendor U-Boot's bootcmd, which runs
