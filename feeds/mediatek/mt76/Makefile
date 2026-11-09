@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=mt76
-PKG_RELEASE=2
+PKG_RELEASE=3
 
 PKG_LICENSE:=BSD-3-Clause-Clear
 PKG_LICENSE_FILES:=
@@ -238,7 +238,13 @@ define KernelPackage/mt7915e
   DEPENDS+=@PCI_SUPPORT +kmod-mt76-connac +kmod-hwmon-core +kmod-thermal +@DRIVER_11AX_SUPPORT +@KERNEL_RELAY
   FILES:= $(PKG_BUILD_DIR)/mt7915/mt7915e.ko
   AUTOLOAD:=$(call AutoProbe,mt7915e)
-  MODPARAMS.mt7915e:=wed_enable=1
+  ifneq ($(filter "DEVICE_edgecore_eap111" "DEVICE_edgecore_eap112",$(CONFIG_TARGET_PROFILE)),)
+    # No WED on EAP111/EAP112: TX then uses the full software token pool
+    # (WIFI-14886), and nothing on these boards offloads flows to WED.
+    MODPARAMS.mt7915e:=wed_enable=0
+  else
+    MODPARAMS.mt7915e:=wed_enable=1
+  endif
 endef
 
 define KernelPackage/mt7916-firmware
