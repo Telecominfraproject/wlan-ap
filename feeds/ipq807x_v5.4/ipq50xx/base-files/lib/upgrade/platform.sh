@@ -89,6 +89,8 @@ platform_check_image() {
 	optimcloud,d60-5g|\
 	optimcloud,d50|\
 	optimcloud,d50-5g|\
+	cambium,xv2-22h|\
+	cambium,xv2-21x|\
 	yuncore,fap655|\
 	glinet,b3000|\
 	udaya,a6-id2|\
@@ -111,6 +113,29 @@ platform_do_upgrade() {
 
 	board=$(board_name)
 	case $board in
+	cambium,xv2-22h|\
+	cambium,xv2-21x)
+		# Two identical NAND banks, rootfs @0x80000 and rootfs_1 @0x6080000,
+		# selected by the vendor U-Boot's bootcmd, which runs
+		#   run boot_a; run boot_b; bootipq
+		# Write the bank we are NOT running from and reorder that chain only after a
+		# successful write, so an interrupted upgrade leaves the running bank intact
+		# and still first in the chain. fw_setenv needs -s here because the bootcmd
+		# value contains spaces and semicolons.
+		if grep -q "ubi.mtd=rootfs_1" /proc/cmdline; then
+			CI_UBIPART="rootfs"
+			cambium_first="boot_a"; cambium_second="boot_b"
+		else
+			CI_UBIPART="rootfs_1"
+			cambium_first="boot_b"; cambium_second="boot_a"
+		fi
+		# changing_bootcmd=1 is required or the vendor U-Boot discards a non-default
+		# bootcmd on the next boot.
+		printf 'changing_bootcmd 1\nbootcmd run %s; run %s; bootipq\n' \
+			"$cambium_first" "$cambium_second" > /tmp/fw_setenv.txt
+		CI_FWSETENV="-s /tmp/fw_setenv.txt"
+		nand_upgrade_tar "$1"
+		;;
 	indio,um-325ax-v2|\
 	indio,um-335ax|\
 	indio,um-525axp|\
@@ -194,6 +219,8 @@ platform_do_upgrade() {
 	optimcloud,d50|\
 	optimcloud,d50-5g|\
 	emplus,wap581|\
+	cambium,xv2-22h|\
+	cambium,xv2-21x|\
 	yuncore,fap655)
 		[ -f /proc/boot_info/rootfs/upgradepartition ] && {
 			CI_UBIPART="$(cat /proc/boot_info/rootfs/upgradepartition)"
