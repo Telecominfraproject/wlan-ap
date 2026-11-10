@@ -1,0 +1,482 @@
+From 9b188fd22a73285d500feaa4fecbfcf11a9cd845 Mon Sep 17 00:00:00 2001
+From: "huimin.he" <huimin.he@cybertan.com.tw>
+Date: Thu, 29 Oct 2026 18:00:00 +0800
+Subject: [PATCH] mt76: mt7996: add debugfs to read back txpower tables
+
+Make it possible to check on sonicfi_rap736c that the firmware uses the
+power limit table from DT:
+
+- mt76: pass CONFIG_MAC80211_DEBUGFS to the driver build on
+  sonicfi_rap736c.
+  mt76 is built against mac80211 backports, where MAC80211_DEBUGFS only
+  shows up as CPTCFG_MAC80211_DEBUGFS in backport/autoconf.h. The
+  driver checks CONFIG_MAC80211_DEBUGFS, so with
+  PACKAGE_MAC80211_DEBUGFS=y the per-station debugfs files (e.g. mt7996
+  fixed_rate and hw-queues) are still compiled out. Define
+  CONFIG_MAC80211_DEBUGFS in NOSTDINC_FLAGS like it is already done for
+  MAC80211_MESH, only for the sonicfi_rap736c profile so that other
+  boards are not affected.
+
+- mt76: mt7996: add txpower_info, txpower_sku and txpower_path to the
+  mt7996 debugfs directory of sonicfi_rap736c (in
+  patches-sonicfi_rap736c). They query the firmware for the SKU and
+  backoff enable state, the rate power table and the per-path (backoff)
+  table it is using on the current channel of every band.
+
+Signed-off-by: huimin.he <huimin.he@cybertan.com.tw>
+---
+ package/kernel/mt76/Makefile                  |   6 +
+ ...-debugfs-to-read-back-txpower-tables.patch | 424 ++++++++++++++++++
+ 2 files changed, 430 insertions(+)
+ create mode 100644 package/kernel/mt76/patches-sonicfi_rap736c/3003-mt76-mt7996-add-debugfs-to-read-back-txpower-tables.patch
+
+diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
+index d6ccf690db..fa995b6fd2 100644
+--- a/package/kernel/mt76/Makefile
++++ b/package/kernel/mt76/Makefile
+@@ -413,6 +413,12 @@ NOSTDINC_FLAGS := \
+ 	-include backport/autoconf.h \
+ 	-include backport/backport.h
+ 
++ifeq ($(CONFIG_TARGET_PROFILE), "DEVICE_sonicfi_rap736c")
++  ifdef CONFIG_PACKAGE_MAC80211_DEBUGFS
++    NOSTDINC_FLAGS += -DCONFIG_MAC80211_DEBUGFS
++  endif
++endif
++
+ ifdef CONFIG_PACKAGE_MAC80211_MESH
+   NOSTDINC_FLAGS += -DCONFIG_MAC80211_MESH
+ endif
+diff --git a/package/kernel/mt76/patches-sonicfi_rap736c/3003-mt76-mt7996-add-debugfs-to-read-back-txpower-tables.patch b/package/kernel/mt76/patches-sonicfi_rap736c/3003-mt76-mt7996-add-debugfs-to-read-back-txpower-tables.patch
+new file mode 100644
+index 0000000000..0c786bf9fd
+--- /dev/null
++++ b/package/kernel/mt76/patches-sonicfi_rap736c/3003-mt76-mt7996-add-debugfs-to-read-back-txpower-tables.patch
+@@ -0,0 +1,424 @@
++From b84801b323296b6fa082920044db3f053ab196e8 Mon Sep 17 00:00:00 2001
++From: "huimin.he" <huimin.he@cybertan.com.tw>
++Date: Thu, 29 Oct 2026 18:00:00 +0800
++Subject: [PATCH] mt76: mt7996: add debugfs to read back txpower tables
++
++There is no way to check on the board whether the firmware uses the
++power limit table from DT. Add three debugfs files that query the
++firmware (UNI_TXPOWER_SHOW_INFO) for every band on its current channel,
++based on the MediaTek SDK debug tools:
++- txpower_info: SKU and backoff limit enable state
++- txpower_sku:  rate power table
++- txpower_path: per-path (backoff) table
++
++The request categories (0/1/2) differ from the categories in the event
++(0/3/5); the firmware does not answer an unknown request category and
++the MCU timeout then restarts the whole chip.
++
++Signed-off-by: huimin.he <huimin.he@cybertan.com.tw>
++---
++ mt7996/debugfs.c | 236 +++++++++++++++++++++++++++++++++++++++++++++++
++ mt7996/mcu.c     |  36 ++++++++
++ mt7996/mcu.h     |  68 ++++++++++++++
++ mt7996/mt7996.h  |   3 +
++ 4 files changed, 343 insertions(+)
++
++diff --git a/mt7996/debugfs.c b/mt7996/debugfs.c
++index ef9a920..67cd89c 100644
++--- a/mt7996/debugfs.c
+++++ b/mt7996/debugfs.c
++@@ -870,6 +870,236 @@ mt7996_rf_regval_set(void *data, u64 val)
++ DEFINE_DEBUGFS_ATTRIBUTE(fops_rf_regval, mt7996_rf_regval_get,
++ 			 mt7996_rf_regval_set, "0x%08llx\n");
++ 
+++static const char * const mt7996_bw_names[] = {
+++	[NL80211_CHAN_WIDTH_20_NOHT] = "20 (no HT)",
+++	[NL80211_CHAN_WIDTH_20] = "20",
+++	[NL80211_CHAN_WIDTH_40] = "40",
+++	[NL80211_CHAN_WIDTH_80] = "80",
+++	[NL80211_CHAN_WIDTH_80P80] = "80+80",
+++	[NL80211_CHAN_WIDTH_160] = "160",
+++	[NL80211_CHAN_WIDTH_320] = "320",
+++};
+++
+++static void
+++mt7996_txpower_phy_header(struct seq_file *s, struct mt7996_phy *phy)
+++{
+++	struct mt76_phy *mphy = phy->mt76;
+++	struct cfg80211_chan_def *chandef = &mphy->chandef;
+++	const char *bw = NULL;
+++
+++	if (chandef->width < ARRAY_SIZE(mt7996_bw_names))
+++		bw = mt7996_bw_names[chandef->width];
+++
+++	seq_printf(s, "\n===== band %d: channel %d, bandwidth %s MHz, chainmask 0x%x (%d chains) =====\n",
+++		   mphy->band_idx,
+++		   chandef->chan ? chandef->chan->hw_value : 0,
+++		   bw ? bw : "?", mphy->chainmask,
+++		   hweight16(mphy->chainmask));
+++}
+++
+++/* read back from the firmware whether the SKU and backoff limits are on */
+++static int
+++mt7996_txpower_info(struct seq_file *s, void *data)
+++{
+++	struct mt7996_dev *dev = dev_get_drvdata(s->private);
+++	struct mt7996_mcu_txpower_event *event;
+++	struct mt7996_phy *phy;
+++	int ret;
+++
+++	event = kzalloc(sizeof(*event), GFP_KERNEL);
+++	if (!event)
+++		return -ENOMEM;
+++
+++	mt7996_for_each_phy(dev, phy) {
+++		mt7996_txpower_phy_header(s, phy);
+++		seq_printf(s, "driver: txpower %d dBm, txpower_cur %d [0.5 dBm]\n",
+++			   phy->txpower, phy->mt76->txpower_cur);
+++
+++		ret = mt7996_mcu_get_txpower_info(phy, UNI_TXPOWER_SHOW_BASIC_INFO,
+++						  event);
+++		if (ret) {
+++			seq_printf(s, "firmware query failed: %d\n", ret);
+++			continue;
+++		}
+++		if (event->basic_info.category != UNI_TXPOWER_BASIC_INFO) {
+++			seq_printf(s, "unexpected event category %d\n",
+++				   event->basic_info.category);
+++			continue;
+++		}
+++
+++		seq_printf(s, "firmware: category %d, band_idx %d, band %d\n",
+++			   event->basic_info.category,
+++			   event->basic_info.band_idx, event->basic_info.band);
+++		seq_printf(s, "SKU (rate table):     %s\n",
+++			   event->basic_info.sku_enable ? "enable" : "disable");
+++		seq_printf(s, "Backoff (path table): %s\n",
+++			   event->basic_info.bf_backoff_enable ?
+++			   "enable" : "disable");
+++		seq_printf(s, "Percentage control:   %s, power drop %d\n",
+++			   event->basic_info.percentage_ctrl_enable ?
+++			   "enable" : "disable",
+++			   event->basic_info.power_drop_level);
+++		seq_printf(s, "Max / min power bound: %d / %d\n",
+++			   event->basic_info.max_power_bound,
+++			   event->basic_info.min_power_bound);
+++		seq_printf(s, "Thermal compensation: %s, %d\n",
+++			   event->basic_info.thermal_compensate_enable ?
+++			   "enable" : "disable",
+++			   event->basic_info.thermal_compensate_value);
+++		seq_printf(s, "TX front-end loss:    %d %d %d %d\n",
+++			   event->basic_info.front_end_loss_tx[0],
+++			   event->basic_info.front_end_loss_tx[1],
+++			   event->basic_info.front_end_loss_tx[2],
+++			   event->basic_info.front_end_loss_tx[3]);
+++	}
+++
+++	kfree(event);
+++
+++	return 0;
+++}
+++
+++static const struct {
+++	const char *name;
+++	u8 len;
+++} mt7996_sku_rate_groups[] = {
+++	{ "CCK", 4 }, { "OFDM", 8 }, { "HT20", 8 }, { "HT40", 9 },
+++	{ "VHT20", 12 }, { "VHT40", 12 }, { "VHT80", 12 }, { "VHT160", 12 },
+++	{ "HE26", 12 }, { "HE52", 12 }, { "HE106", 12 }, { "BW20/HE242", 12 },
+++	{ "BW40/HE484", 12 }, { "BW80/HE996", 12 }, { "BW160/HE2x996", 12 },
+++	{ "EHT26", 16 }, { "EHT52", 16 }, { "EHT106", 16 },
+++	{ "BW20/EHT242", 16 }, { "BW40/EHT484", 16 }, { "BW80/EHT996", 16 },
+++	{ "BW160/EHT2x996", 16 }, { "BW320/EHT4x996", 16 },
+++	{ "EHT26_52", 16 }, { "EHT26_106", 16 }, { "EHT484_242", 16 },
+++	{ "EHT996_484", 16 }, { "EHT996_484_242", 16 },
+++	{ "EHT2x996_484", 16 }, { "EHT3x996", 16 }, { "EHT3x996_484", 16 },
+++};
+++
+++/* rate power table the firmware is using on the current channel */
+++static int
+++mt7996_txpower_sku(struct seq_file *s, void *data)
+++{
+++	struct mt7996_dev *dev = dev_get_drvdata(s->private);
+++	struct mt7996_mcu_txpower_event *event;
+++	struct mt7996_phy *phy;
+++	int i, j, offs, ret;
+++
+++	BUILD_BUG_ON(ARRAY_SIZE(mt7996_sku_rate_groups) != 31);
+++
+++	event = kzalloc(sizeof(*event), GFP_KERNEL);
+++	if (!event)
+++		return -ENOMEM;
+++
+++	mt7996_for_each_phy(dev, phy) {
+++		u8 band_idx = phy->mt76->band_idx;
+++
+++		mt7996_txpower_phy_header(s, phy);
+++
+++		ret = mt7996_mcu_get_txpower_info(phy, UNI_TXPOWER_SHOW_PHY_RATE,
+++						  event);
+++		if (ret) {
+++			seq_printf(s, "firmware query failed: %d\n", ret);
+++			continue;
+++		}
+++		if (event->phy_rate_info.category != UNI_TXPOWER_PHY_RATE_INFO) {
+++			seq_printf(s, "unexpected event category %d\n",
+++				   event->phy_rate_info.category);
+++			continue;
+++		}
+++
+++		seq_printf(s, "category %d, max / min power bound %d / %d\n",
+++			   event->phy_rate_info.category,
+++			   event->phy_rate_info.max_power_bound,
+++			   event->phy_rate_info.min_power_bound);
+++		seq_printf(s, "%-16s %s\n", "",
+++			   "mcs0 / 1m / 6m ... (raw firmware values)");
+++
+++		for (i = 0, offs = 0; i < ARRAY_SIZE(mt7996_sku_rate_groups); i++) {
+++			seq_printf(s, "%-16s", mt7996_sku_rate_groups[i].name);
+++			for (j = 0; j < mt7996_sku_rate_groups[i].len; j++, offs++)
+++				seq_printf(s, " %4d",
+++					   event->phy_rate_info.frame_power[offs][band_idx]);
+++			seq_puts(s, "\n");
+++		}
+++	}
+++
+++	kfree(event);
+++
+++	return 0;
+++}
+++
+++static const char * const mt7996_sku_path_groups[] = {
+++	"RU26", "RU52", "RU26_52", "RU106", "RU106_26", "BW20/RU242",
+++	"BW40/RU484", "RU242_484", "BW80/RU996", "RU484_996",
+++	"RU242_484_996", "BW160/RU2x996", "RU484_2x996", "RU3x996",
+++	"RU484_3x996", "BW320/RU4x996",
+++};
+++
+++/* per-path (backoff) table the firmware is using on the current channel */
+++static int
+++mt7996_txpower_path(struct seq_file *s, void *data)
+++{
+++	struct mt7996_dev *dev = dev_get_drvdata(s->private);
+++	struct mt7996_mcu_txpower_event *event;
+++	struct mt7996_phy *phy;
+++	int i, j, offs, ret;
+++	s8 *val;
+++
+++	event = kzalloc(sizeof(*event), GFP_KERNEL);
+++	if (!event)
+++		return -ENOMEM;
+++
+++	mt7996_for_each_phy(dev, phy) {
+++		mt7996_txpower_phy_header(s, phy);
+++
+++		ret = mt7996_mcu_get_txpower_info(phy,
+++						  UNI_TXPOWER_SHOW_BACKOFF_TABLE,
+++						  event);
+++		if (ret) {
+++			seq_printf(s, "firmware query failed: %d\n", ret);
+++			continue;
+++		}
+++		if (event->backoff_table_info.category !=
+++		    UNI_TXPOWER_BACKOFF_TABLE_SHOW_INFO) {
+++			seq_printf(s, "unexpected event category %d\n",
+++				   event->backoff_table_info.category);
+++			continue;
+++		}
+++
+++		val = event->backoff_table_info.frame_power;
+++		seq_printf(s, "category %d, backoff table: %s\n",
+++			   event->backoff_table_info.category,
+++			   event->backoff_table_info.backoff_en ?
+++			   "enable" : "disable");
+++		seq_printf(s, "%-19s %s\n", "",
+++			   "1T1S 2T1S 3T1S 4T1S 5T1S 2T2S 3T2S 4T2S 5T2S 3T3S 4T3S 5T3S 4T4S 5T4S 5T5S");
+++
+++		seq_printf(s, "%-19s", "CCK");
+++		for (j = 0, offs = 0; j < 5; j++, offs++)
+++			seq_printf(s, " %4d", val[offs]);
+++		seq_printf(s, "\n%-19s", "OFDM");
+++		for (j = 0; j < 5; j++, offs++)
+++			seq_printf(s, " %4d", val[offs]);
+++		seq_printf(s, "\n%-19s     ", "BF-OFDM");
+++		for (j = 0; j < 4; j++, offs++)
+++			seq_printf(s, " %4d", val[offs]);
+++		seq_puts(s, "\n");
+++
+++		for (i = 0; i < ARRAY_SIZE(mt7996_sku_path_groups); i++) {
+++			seq_printf(s, "%-19s", mt7996_sku_path_groups[i]);
+++			for (j = 0; j < 15; j++, offs++)
+++				seq_printf(s, " %4d", val[offs]);
+++			seq_printf(s, "\nBF-%-16s", mt7996_sku_path_groups[i]);
+++			for (j = 0; j < 15; j++, offs++)
+++				seq_printf(s, " %4d", val[offs]);
+++			seq_puts(s, "\n");
+++		}
+++	}
+++
+++	kfree(event);
+++
+++	return 0;
+++}
+++
++ int mt7996_init_debugfs(struct mt7996_dev *dev)
++ {
++ 	struct dentry *dir;
++@@ -902,6 +1132,12 @@ int mt7996_init_debugfs(struct mt7996_dev *dev)
++ 			    &fops_radar_trigger);
++ 	debugfs_create_devm_seqfile(dev->mt76.dev, "rdd_monitor", dir,
++ 				    mt7996_rdd_monitor);
+++	debugfs_create_devm_seqfile(dev->mt76.dev, "txpower_info", dir,
+++				    mt7996_txpower_info);
+++	debugfs_create_devm_seqfile(dev->mt76.dev, "txpower_sku", dir,
+++				    mt7996_txpower_sku);
+++	debugfs_create_devm_seqfile(dev->mt76.dev, "txpower_path", dir,
+++				    mt7996_txpower_path);
++ 
++ 	dev->debugfs_dir = dir;
++ 
++diff --git a/mt7996/mcu.c b/mt7996/mcu.c
++index bdd41e7..b91724c 100644
++--- a/mt7996/mcu.c
+++++ b/mt7996/mcu.c
++@@ -5392,6 +5392,42 @@ out:
++ 	return ret;
++ }
++ 
+++int mt7996_mcu_get_txpower_info(struct mt7996_phy *phy, u8 category,
+++				struct mt7996_mcu_txpower_event *event)
+++{
+++	struct {
+++		u8 _rsv[4];
+++
+++		__le16 tag;
+++		__le16 len;
+++
+++		u8 power_ctrl_id;
+++		u8 category;
+++		u8 band_idx;
+++		u8 rsv[1];
+++	} __packed req = {
+++		.tag = cpu_to_le16(UNI_TXPOWER_SHOW_INFO),
+++		.len = cpu_to_le16(sizeof(req) - 4),
+++		.power_ctrl_id = UNI_TXPOWER_SHOW_INFO,
+++		.category = category,
+++		.band_idx = phy->mt76->band_idx,
+++	};
+++	struct sk_buff *skb;
+++	int ret;
+++
+++	ret = mt76_mcu_send_and_get_msg(&phy->dev->mt76,
+++					MCU_WM_UNI_CMD_QUERY(TXPOWER),
+++					&req, sizeof(req), true, &skb);
+++	if (ret)
+++		return ret;
+++
+++	memset(event, 0, sizeof(*event));
+++	memcpy(event, skb->data, min_t(int, skb->len, sizeof(*event)));
+++	dev_kfree_skb(skb);
+++
+++	return 0;
+++}
+++
++ int mt7996_mcu_cp_support(struct mt7996_dev *dev, u8 mode)
++ {
++ 	__le32 cp_mode;
++diff --git a/mt7996/mcu.h b/mt7996/mcu.h
++index 9e00988..e253a46 100644
++--- a/mt7996/mcu.h
+++++ b/mt7996/mcu.h
++@@ -966,8 +966,76 @@ enum {
++ 	UNI_TXPOWER_SKU_POWER_LIMIT_CTRL = 0,
++ 	UNI_TXPOWER_BACKOFF_POWER_LIMIT_CTRL = 3,
++ 	UNI_TXPOWER_POWER_LIMIT_TABLE_CTRL = 4,
+++	UNI_TXPOWER_SHOW_INFO = 7,
++ };
++ 
+++/* UNI_TXPOWER_SHOW_INFO request categories */
+++enum {
+++	UNI_TXPOWER_SHOW_BASIC_INFO = 0,
+++	UNI_TXPOWER_SHOW_BACKOFF_TABLE = 1,
+++	UNI_TXPOWER_SHOW_PHY_RATE = 2,
+++};
+++
+++/* categories in the UNI_TXPOWER_SHOW_INFO event, differ from the request */
+++enum {
+++	UNI_TXPOWER_BASIC_INFO = 0,
+++	UNI_TXPOWER_BACKOFF_TABLE_SHOW_INFO = 3,
+++	UNI_TXPOWER_PHY_RATE_INFO = 5,
+++};
+++
+++struct mt7996_mcu_txpower_event {
+++	u8 _rsv[4];
+++
+++	__le16 tag;
+++	__le16 len;
+++
+++	union {
+++		struct {
+++			u8 category;
+++			u8 rsv1;
+++			u8 band_idx;
+++			u8 band;
+++			bool is_epa;
+++			bool is_elna;
+++			bool percentage_ctrl_enable;
+++			s8 power_drop_level;
+++			s8 front_end_loss_tx[4];
+++			s8 front_end_loss_rx[4];
+++			bool thermal_compensate_enable;
+++			s8 thermal_compensate_value;
+++			u8 rsv2;
+++			s8 max_power_bound;
+++			s8 min_power_bound;
+++			bool sku_enable;
+++			bool bf_backoff_enable;
+++			bool mu_tx_power_manual_enable;
+++			s8 mu_tx_power_auto;
+++			s8 mu_tx_power_manual;
+++			u8 rsv3;
+++		} __packed basic_info;
+++
+++		struct {
+++			u8 category;
+++			u8 band_idx;
+++			u8 band;
+++			u8 epa_gain;
+++			s8 frame_power[MT7996_SKU_RATE_NUM][__MT_MAX_BAND];
+++			s8 max_power_bound;
+++			s8 min_power_bound;
+++			u8 rsv1;
+++		} __packed phy_rate_info;
+++
+++		struct {
+++			u8 category;
+++			u8 band_idx;
+++			u8 band;
+++			u8 backoff_en;
+++			s8 frame_power[MT7996_SKU_PATH_NUM];
+++			u8 rsv[3];
+++		} __packed backoff_table_info;
+++	};
+++} __packed;
+++
++ enum {
++ 	UNI_CMD_ACCESS_REG_BASIC = 0x0,
++ 	UNI_CMD_ACCESS_RF_REG_BASIC,
++diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
++index 2097cbe..9c4eb2c 100644
++--- a/mt7996/mt7996.h
+++++ b/mt7996/mt7996.h
++@@ -776,6 +776,9 @@ int mt7996_mcu_get_temperature(struct mt7996_phy *phy);
++ int mt7996_mcu_set_thermal_throttling(struct mt7996_phy *phy, u8 state);
++ int mt7996_mcu_set_thermal_protect(struct mt7996_phy *phy, bool enable);
++ int mt7996_mcu_set_txpower_sku(struct mt7996_phy *phy);
+++struct mt7996_mcu_txpower_event;
+++int mt7996_mcu_get_txpower_info(struct mt7996_phy *phy, u8 category,
+++				struct mt7996_mcu_txpower_event *event);
++ int mt7996_mcu_rdd_resume_tx(struct mt7996_phy *phy);
++ int mt7996_mcu_rdd_cmd(struct mt7996_dev *dev, int cmd, u8 rdd_idx, u8 val);
++ int mt7996_mcu_rdd_background_enable(struct mt7996_phy *phy,
++-- 
++2.34.1
++
+-- 
+2.34.1
+
