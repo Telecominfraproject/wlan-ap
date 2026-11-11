@@ -1,0 +1,122 @@
+HaLow multi-country driver fixes (merged 023+024+025)
+
+This patch combines three related fixes for HaLow country switching in the
+morse driver, concatenated verbatim from three individually validated
+patches. Each file section keeps its original line numbers; patch applies
+each section in turn with automatic offset detection.
+
+023 forces the country modparam to win over a stale replayed regdomain on
+reload, always applies the regdomain once so morse_dot11ah_channel_set_map()
+populates __mors_s1g_map, and defaults __mors_s1g_map to the US map so the
+RX path never dereferences NULL.
+
+024 guards morse_mesh_deinit() against a NULL mesh context.
+
+025 runs the start-time FW restart synchronously, before interfaces are
+added, so it re-syncs firmware on a country change and cannot wipe an
+already-added mesh vif's beacon state.
+
+Signed-off-by: EdgeCore <dev@edge-core.com>
+
+--- a/mac.c
++++ b/mac.c
+@@ -6480,8 +6480,36 @@ int morse_mac_register(struct morse *mors)
+ 		MORSE_WARN(mors, "Country modparam (%c%c) ignored, hardware restricted to %c%c\n",
+ 			country[0], country[1], mors->country[0], mors->country[1]);
+ 		ret = morse_set_regdomain(mors, mors->country);
+ 		memcpy(country, mors->country, sizeof(country));
+-	} else if (!test_bit(MORSE_STATE_FLAG_REGDOM_SET_BY_USER, &mors->state_flags)) {
+-		ret = morse_set_regdomain(mors, country);
++	} else if (!country_codes_are_equal(mors->country, country)) {
++		/*
++		 * EdgeCore: on a module reload (HaLow country change via JSON),
++		 * cfg80211 can replay a stale global user regdomain into our
++		 * self-managed wiphy during register, setting mors->country and
++		 * REGDOM_SET_BY_USER before this point. That makes mors->country
++		 * disagree with the freshly loaded country modparam and causes
++		 * morse_mac_ops_add_interface() to reject AP interfaces with
++		 * -EPERM, producing an endless morse_mac_restart loop.
++		 *
++		 * The country modparam is the intended regdomain for this load,
++		 * so force it to win and clear the stale user flag. This only
++		 * touches the morse self-managed wiphy, never the shared 2.4/5G
++		 * (mt7996) global regulatory domain.
++		 */
++		ret = morse_set_regdomain(mors, country);
++		clear_bit(MORSE_STATE_FLAG_REGDOM_SET_BY_USER, &mors->state_flags);
++	} else if (!test_bit(MORSE_STATE_FLAG_REGDOM_SET_BY_USER, &mors->state_flags)) {
++		/*
++		 * EdgeCore: even when mors->country already matches the country
++		 * modparam, we must still apply the regdomain at least once here.
++		 * morse_set_regdomain() is the only path that calls
++		 * morse_dot11ah_channel_set_map(), which initialises the dot11ah
++		 * __mors_s1g_map. If a replayed regdomain notification set
++		 * mors->country == country but did not call set_map (e.g. it
++		 * early-returned), skipping this would leave __mors_s1g_map unset
++		 * and the first RX frame would panic. Applying it here is
++		 * idempotent and guarantees the channel map is populated.
++		 */
++		ret = morse_set_regdomain(mors, country);
+ 	}
+ 	if (ret) {
+--- a/dot11ah/s1g_channels.c
++++ b/dot11ah/s1g_channels.c
+@@ -499,7 +499,11 @@ const struct morse_dot11ah_ch_map *mapped_channels[] = {
+ 	&mors_us_map,
+ };
+ 
+-static const struct morse_dot11ah_ch_map *__mors_s1g_map;
++/*
++ * EdgeCore: default to the always-present US map so the RX path never
++ * dereferences a NULL pointer if channel_set_map() fails for a country.
++ */
++static const struct morse_dot11ah_ch_map *__mors_s1g_map = &mors_us_map;
+ 
+ int morse_dot11ah_channel_set_map(const char *alpha, u32 channelization_scheme)
+ {
+--- a/mesh.c
++++ b/mesh.c
+@@ -605,6 +605,9 @@ int morse_mesh_deinit(struct morse_vif *mors_vif)
+ {
+ 	struct morse_mesh *mesh = mors_vif->mesh;
+ 
++	if (!mesh)
++		return 0;
++
+ 	DEL_TIMER_SYNC(&mesh->mesh_probe_timer);
+ 	mors_vif->mesh->conf = NULL;
+ 	kfree(mors_vif->mesh);
+--- a/mac.c
++++ b/mac.c
+@@ -2541,6 +2541,8 @@
+ 	return 0;
+ }
+ 
++static int morse_mac_restart(struct morse *mors);
++
+ static int morse_mac_driver_restart(struct morse *mors)
+ {
+ 	schedule_work(&mors->driver_restart);
+@@ -2670,8 +2670,21 @@ static int morse_mac_ops_start(struct ieee80211_hw *hw)
+ 	restart_requested =
+ 	    test_and_clear_bit(MORSE_STATE_FLAG_RELOAD_FW_AFTER_START, &mors->state_flags);
+ 	if (restart_requested) {
+ 		MORSE_INFO(mors, "FW reload was requested during initialisation\n");
+-		morse_mac_driver_restart(mors);
++		/*
++		 * EdgeCore: run the restart synchronously here, before any
++		 * interface is added (mac80211 always calls start() before
++		 * add_interface()). The async morse_mac_driver_restart() could
++		 * otherwise run after the (mesh) vif was added, wiping the
++		 * firmware vif/beacon state ("previous beacon not consumed",
++		 * SCAN-FAILED ret=-19). Running it synchronously also re-syncs
++		 * the firmware to the freshly applied regdomain before start()
++		 * returns, which a country-change reload (e.g. JP->US) needs to
++		 * bring the AP interface up.
++		 */
++		morse_watchdog_pause(mors);
++		morse_mac_restart(mors);
++		morse_watchdog_resume(mors);
+ 		mutex_unlock(&mors->lock);
+ 		return 0;
+ 	}

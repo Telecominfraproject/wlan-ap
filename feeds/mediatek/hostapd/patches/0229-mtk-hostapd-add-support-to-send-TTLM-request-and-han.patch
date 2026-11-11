@@ -1,0 +1,199 @@
+From 515721f8254c9bf4bc612785b735933d89923eb0 Mon Sep 17 00:00:00 2001
+From: Michael-CY Lee <michael-cy.lee@mediatek.com>
+Date: Wed, 1 Oct 2025 15:13:15 +0800
+Subject: [PATCH 229/260] mtk: hostapd: add support to send TTLM request and
+ handle TTLM response
+
+This patch only adds support for sending TTLM requests and handling
+TTLM responses. Another patch will be provided to add support for
+triggering TTLM requests via hostapd_cli.
+
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+---
+ src/ap/hostapd.c             |   1 +
+ src/ap/hostapd.h             |   3 ++
+ src/ap/ieee802_11.h          |   1 +
+ src/ap/ieee802_11_eht.c      | 102 +++++++++++++++++++++++++++++++++++
+ src/common/ieee802_11_defs.h |   1 +
+ 5 files changed, 108 insertions(+)
+
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index cd0b6ff35..7f87d5a76 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -3475,6 +3475,7 @@ void hostapd_bss_setup_multi_link(struct hostapd_data *hapd,
+ 	os_strlcpy(mld->name, conf->iface, sizeof(conf->iface));
+ 	dl_list_init(&mld->links);
+ 	mld->ctrl_sock = -1;
++	mld->dialog_token = 1;
+ 	if (hapd->conf->ctrl_interface)
+ 		mld->ctrl_interface = os_strdup(hapd->conf->ctrl_interface);
+ 
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index acb16ca42..c453beca8 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -625,6 +625,9 @@ struct hostapd_mld {
+ 	struct dl_list ctrl_dst;
+ 	char *ctrl_interface; /* Directory for UNIX domain sockets */
+ 
++	/* dialog token for neg TTLM request */
++	u8 dialog_token;
++
+ 	bool epcs_disabled;
+ };
+ 
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index f9d2c2987..cfea535fc 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -343,6 +343,7 @@ void hostapd_neg_ttlm_resp_tx_status(struct hostapd_data *hapd,
+ size_t hostapd_eid_eht_ml_tid_to_link_map_len(struct hostapd_data *hapd);
+ u8 * hostapd_eid_eht_ml_tid_to_link_map(struct hostapd_data *hapd, u8 *eid);
+ 
++int ieee802_11_send_neg_ttlm_request(struct hostapd_data *hapd, struct sta_info *sta);
+ int ieee802_11_send_neg_ttlm_teardown(struct hostapd_data *hapd, const u8 *addr);
+ void hostapd_teardown_neg_ttlm(struct hostapd_data *hapd, struct sta_info *sta);
+ size_t hostapd_eid_eht_epcs_ml_len(struct mld_info *mld);
+diff --git a/src/ap/ieee802_11_eht.c b/src/ap/ieee802_11_eht.c
+index fcf8ef800..66e0ba927 100644
+--- a/src/ap/ieee802_11_eht.c
++++ b/src/ap/ieee802_11_eht.c
+@@ -3163,6 +3163,42 @@ fail:
+ 	}
+ }
+ 
++static void ieee802_11_rx_neg_ttlm_resp(struct hostapd_data *hapd, const u8 *addr,
++					const u8 *frm, size_t len)
++{
++	struct hostapd_data *assoc_hapd;
++	struct sta_info *sta;
++	struct ieee80211_neg_ttlm *neg_ttlm;
++	u16 status_code;
++	int ret = 0;
++
++	if (!hostapd_is_mld_ap(hapd))
++		return;
++
++	sta = ap_get_sta(hapd, addr);
++	if (!sta || !ap_sta_is_mld(hapd, sta))
++		return;
++
++	sta = hostapd_ml_get_assoc_sta(hapd, sta, &assoc_hapd);
++	if (!sta || sta->neg_ttlm.dialog_token != *frm)
++		return;
++
++	neg_ttlm = &sta->neg_ttlm;
++	status_code = le_to_host16(*(u16 *)(frm + 1));
++	if (status_code == WLAN_STATUS_SUCCESS) {
++		neg_ttlm->valid = true;
++		ret = hostapd_drv_set_sta_ttlm(assoc_hapd, sta->addr, neg_ttlm);
++		if (ret) {
++			ieee802_11_send_neg_ttlm_teardown(hapd, sta->addr);
++			hostapd_teardown_neg_ttlm(assoc_hapd, sta);
++			os_memset(neg_ttlm, 0, sizeof(*neg_ttlm));
++		}
++	} else {
++		wpa_printf(MSG_ERROR, "TTLM: STA rejected TTLM request");
++		os_memset(neg_ttlm, 0, sizeof(*neg_ttlm));
++	}
++}
++
+ static void ieee802_11_rx_neg_ttlm_teardown(struct hostapd_data *hapd, const u8 *addr)
+ {
+ 	struct hostapd_data *assoc_hapd;
+@@ -3469,6 +3505,71 @@ ieee802_11_rx_epcs_teardown(struct hostapd_data *hapd, const u8 *addr,
+ }
+ 
+ 
++int ieee802_11_send_neg_ttlm_request(struct hostapd_data *hapd, struct sta_info *sta)
++{
++	struct wpabuf *buf;
++	struct ieee80211_neg_ttlm *neg_ttlm = &sta->neg_ttlm;
++	u16 control = 0;
++	size_t len;
++	int ret, i;
++	bool map_size = neg_ttlm->link_map_size;
++
++	/* TODO currently do not support bi-direction Neg-TTLM */
++	for (i = 0; i < IEEE80211_TTLM_NUM_TIDS; i++) {
++		if (neg_ttlm->ulink[i] != neg_ttlm->dlink[i]) {
++			wpa_printf(MSG_ERROR,
++				   "Only Bi-direction Neg-TTLM is supported");
++			return -1;
++		}
++	}
++
++	/* TID-To-Link Mapping Request frame */
++	len = 1 + /* Protected EHT Action */
++	      1 + /* TID-To-Link Mapping Response */
++	      1; /* Dialog Token */
++
++	/* TID-To-Link Mapping Element for bi-direction */
++	len += 1 + /* Element ID */
++	       1 + /* len */
++	       1 + /* Element ID Extension */
++	       2 + /* Control */
++	       2 * IEEE80211_TTLM_NUM_TIDS; /* Link Mapping of each TID */
++
++	buf = wpabuf_alloc(len);
++	if (!buf)
++		return -1;
++
++	neg_ttlm->dialog_token = hapd->mld->dialog_token++;
++	if (hapd->mld->dialog_token == 0)
++		hapd->mld->dialog_token++;
++
++	wpabuf_put_u8(buf, WLAN_ACTION_PROTECTED_EHT);
++	wpabuf_put_u8(buf, WLAN_PROT_EHT_T2L_MAPPING_REQUEST);
++	wpabuf_put_u8(buf, neg_ttlm->dialog_token);
++	wpabuf_put_u8(buf, WLAN_EID_EXTENSION);
++	wpabuf_put_u8(buf, len - 5);
++	wpabuf_put_u8(buf, WLAN_EID_EXT_TID_TO_LINK_MAPPING);
++	control |= IEEE80211_TTLM_DIRECTION_BOTH;
++	control |= IEEE80211_TTLM_CONTROL_INDICATOR;
++	if (neg_ttlm->def_link_map)
++		control |= IEEE80211_TTLM_CONTROL_DEF_LINK_MAP;
++	if (map_size)
++		control |= IEEE80211_TTLM_CONTROL_LINK_MAP_SIZE;
++	wpabuf_put_le16(buf, control);
++	for (i = 0; i < IEEE80211_TTLM_NUM_TIDS; i++) {
++		if (map_size)
++			wpabuf_put_u8(buf, neg_ttlm->ulink[i]);
++		else
++			wpabuf_put_le16(buf, neg_ttlm->ulink[i]);
++	}
++
++	ret = hostapd_drv_send_action(hapd, hapd->iface->freq, 0, sta->addr,
++				      wpabuf_head(buf), wpabuf_len(buf));
++	wpabuf_free(buf);
++
++	return ret;
++}
++
+ int ieee802_11_send_neg_ttlm_teardown(struct hostapd_data *hapd, const u8 *addr)
+ {
+ 	struct wpabuf *buf;
+@@ -3556,6 +3657,7 @@ void ieee802_11_rx_protected_eht_action(struct hostapd_data *hapd,
+ 		return;
+ 	case WLAN_PROT_EHT_T2L_MAPPING_RESPONSE:
+ 		wpa_printf(MSG_INFO, "EHT: TTLM response");
++		ieee802_11_rx_neg_ttlm_resp(hapd, mgmt->sa, payload, plen);
+ 		return;
+ 	case WLAN_PROT_EHT_T2L_MAPPING_TEARDOWN:
+ 		wpa_printf(MSG_INFO, "EHT: TTLM teardown");
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 6f4eadf9f..d2b426f3d 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -825,6 +825,7 @@ struct ieee80211_neg_ttlm {
+ 	bool def_link_map;
+ 	bool link_map_size;
+ 	bool valid;
++	u8 dialog_token;
+ };
+ 
+ struct neg_ttlm_req {
+-- 
+2.45.2
+

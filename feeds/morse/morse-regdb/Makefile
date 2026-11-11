@@ -23,7 +23,9 @@ PKG_SOURCE_URL:=https://github.com/MorseMicro/morse_regdb.git
 PKG_SOURCE_PROTO:=git
 PKG_MIRROR_HASH:=0d074d2810f520c138427ab63ce0b8ab61f0f073cf7cd91177ad840a3322540a
 
-PKG_VERSION:=$(PKG_SOURCE_VERSION)
+# apk rejects a leading 'v' in the package version, so strip it from the
+# git tag (PKG_SOURCE_VERSION stays v2.1.1 for the git checkout).
+PKG_VERSION:=2.1.1
 
 include $(INCLUDE_DIR)/package.mk
 

@@ -1,0 +1,248 @@
+From acb0eee1b98c78729f577ec542d54e9fac2b7d89 Mon Sep 17 00:00:00 2001
+From: Howard Hsu <howard-yh.hsu@mediatek.com>
+Date: Mon, 19 Jan 2026 17:59:06 +0800
+Subject: [PATCH 132/137] mtk: mac80211: add support handling twt information
+ frame
+
+Add twt information frame handling to support suspend and resume
+individual twt operations.
+
+Signed-off-by: Howard Hsu <howard-yh.hsu@mediatek.com>
+---
+ include/linux/ieee80211-he.h | 15 +++++++++++++++
+ include/net/mac80211.h       |  6 ++++++
+ net/mac80211/driver-ops.h    | 15 +++++++++++++++
+ net/mac80211/iface.c         |  1 +
+ net/mac80211/rx.c            | 26 ++++++++++++++++++++++++++
+ net/mac80211/s1g.c           | 28 ++++++++++++++++++++++++++--
+ net/mac80211/trace.h         | 29 +++++++++++++++++++++++++++++
+ 7 files changed, 118 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/ieee80211-he.h b/include/linux/ieee80211-he.h
+index 95aedf1a..2d2b5f65 100644
+--- a/include/linux/ieee80211-he.h
++++ b/include/linux/ieee80211-he.h
+@@ -103,6 +103,21 @@ struct ieee80211_twt_teardown {
+ 	u8 all:1;
+ } __packed;
+ 
++#define IEEE80211_TWT_INFO_FLOW_ID		GENMASK(2, 0)
++#define IEEE80211_TWT_INFO_RESP_REQ		BIT(3)
++#define IEEE80211_TWT_INFO_NEXT_TWT_REQ		BIT(4)
++#define IEEE80211_TWT_INFO_NEXT_TWT_SIZE	GENMASK(6, 5)
++
++#define IEEE80211_TWT_INFO_NEXT_TWT_SIZE_0	0
++#define IEEE80211_TWT_INFO_NEXT_TWT_SIZE_32	1
++#define IEEE80211_TWT_INFO_NEXT_TWT_SIZE_48	2
++#define IEEE80211_TWT_INFO_NEXT_TWT_SIZE_64	3
++
++struct ieee80211_twt_info {
++	u8 control;
++	u8 next_twt[];
++} __packed;
++
+ enum ieee80211_btwt_recommendation {
+ 	IEEE80211_BTWT_RECOMM_NO_CONSTRAINT = 0,
+ 	IEEE80211_BTWT_RECOMM_RTWT_SP = 4,
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index 645e578b..914151da 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -4566,6 +4566,9 @@ struct ieee80211_prep_tx_info {
+  *	twt structure.
+  * @twt_teardown_request: Update the hw with TWT teardown request received
+  *	from the peer.
++ * @twt_information: Handle TWT Information frame received from the peer.
++ *	This is used to suspend or resume a TWT agreement. The driver is
++ *	responsible for parsing the TWT Information element.
+  * @set_radar_background: Configure dedicated offchannel chain available for
+  *	radar/CAC detection on some hw. This chain can't be used to transmit
+  *	or receive frames and it is bounded to a running wdev.
+@@ -4984,6 +4987,9 @@ struct ieee80211_ops {
+ 	int (*twt_teardown_request)(struct ieee80211_hw *hw,
+ 				    struct ieee80211_sta *sta, u8 link_id,
+ 				    struct ieee80211_twt_teardown *td);
++	void (*twt_information)(struct ieee80211_hw *hw,
++				struct ieee80211_sta *sta, u8 link_id,
++				struct ieee80211_twt_info *twt_info);
+ 	int (*add_btwt)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			u8 link_id, struct cfg80211_broadcast_twt_settings *btwt);
+ 	int (*del_btwt)(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+diff --git a/net/mac80211/driver-ops.h b/net/mac80211/driver-ops.h
+index d5e7fd65..bbe9ed79 100644
+--- a/net/mac80211/driver-ops.h
++++ b/net/mac80211/driver-ops.h
+@@ -1679,6 +1679,21 @@ static inline int drv_twt_teardown_request(struct ieee80211_local *local,
+ 	return ret;
+ }
+ 
++static inline void drv_twt_information(struct ieee80211_local *local,
++				       struct ieee80211_sub_if_data *sdata,
++				       struct ieee80211_sta *sta, u8 link_id,
++				       struct ieee80211_twt_info *twt_info)
++{
++	might_sleep();
++	lockdep_assert_wiphy(local->hw.wiphy);
++	if (!check_sdata_in_driver(sdata))
++		return;
++
++	trace_drv_twt_information(local, sta, link_id, twt_info);
++	local->ops->twt_information(&local->hw, sta, link_id, twt_info);
++	trace_drv_return_void(local);
++}
++
+ static inline int drv_add_btwt(struct ieee80211_local *local,
+ 			       struct ieee80211_sub_if_data *sdata, u8 link_id,
+ 			       struct cfg80211_broadcast_twt_settings *settings)
+diff --git a/net/mac80211/iface.c b/net/mac80211/iface.c
+index 4bb36e08..a6841ce9 100644
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -1726,6 +1726,7 @@ static void ieee80211_iface_process_skb(struct ieee80211_local *local,
+ 		switch (mgmt->u.action.u.s1g.action_code) {
+ 		case WLAN_S1G_TWT_TEARDOWN:
+ 		case WLAN_S1G_TWT_SETUP:
++		case WLAN_S1G_TWT_INFORMATION:
+ 			ieee80211_s1g_rx_twt_action(sdata, skb);
+ 			break;
+ 		default:
+diff --git a/net/mac80211/rx.c b/net/mac80211/rx.c
+index 2e68f526..64a742e3 100644
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@ -3621,6 +3621,31 @@ ieee80211_process_rx_twt_action(struct ieee80211_rx_data *rx)
+ 			break;
+ 
+ 		return true; /* queue the frame */
++	case WLAN_S1G_TWT_INFORMATION: {
++		static const u8 next_twt_len[] = {0, 4, 6, 8};
++		struct ieee80211_twt_info *twt_info;
++		u8 next_twt_size;
++
++		if (!rx->local->ops->twt_information)
++			break;
++
++		if (rx->skb->len < IEEE80211_MIN_ACTION_SIZE +
++				   1 + /* action code */
++				   sizeof(struct ieee80211_twt_info))
++			break;
++
++		twt_info = (void *)mgmt->u.action.u.s1g.variable;
++		next_twt_size = FIELD_GET(IEEE80211_TWT_INFO_NEXT_TWT_SIZE,
++					  twt_info->control);
++
++		if (rx->skb->len < IEEE80211_MIN_ACTION_SIZE +
++				   1 + /* action code */
++				   sizeof(struct ieee80211_twt_info) +
++				   next_twt_len[next_twt_size])
++			break;
++
++		return true; /* queue the frame */
++	}
+ 	default:
+ 		break;
+ 	}
+@@ -3897,6 +3922,7 @@ ieee80211_rx_h_action(struct ieee80211_rx_data *rx)
+ 		switch (mgmt->u.action.u.s1g.action_code) {
+ 		case WLAN_S1G_TWT_SETUP:
+ 		case WLAN_S1G_TWT_TEARDOWN:
++		case WLAN_S1G_TWT_INFORMATION:
+ 			if (ieee80211_process_rx_twt_action(rx))
+ 				goto queue;
+ 			break;
+diff --git a/net/mac80211/s1g.c b/net/mac80211/s1g.c
+index d54fac5e..53320530 100644
+--- a/net/mac80211/s1g.c
++++ b/net/mac80211/s1g.c
+@@ -208,8 +208,9 @@ ieee80211_s1g_rx_twt_setup(struct ieee80211_sub_if_data *sdata,
+ send_rsp:
+ 	le16p_replace_bits(&twt_agrt->req_type, TWT_RESPONDING_OR_SCHEDULING_STA,
+ 			   IEEE80211_TWT_REQTYPE_REQUEST);
+-	/* TWT Information not supported yet */
+-	twt->control |= IEEE80211_TWT_CONTROL_RX_DISABLED;
++
++	u8p_replace_bits(&twt->control, !sdata->local->ops->twt_information,
++			 IEEE80211_TWT_CONTROL_RX_DISABLED);
+ 
+ 	ieee80211_s1g_send_twt_setup(sdata, mgmt->sa, sdata->vif.addr, twt);
+ }
+@@ -241,6 +242,26 @@ ieee80211_s1g_rx_twt_teardown(struct ieee80211_sub_if_data *sdata,
+ 	drv_twt_teardown_request(sdata->local, sdata, &sta->sta, link_id, td);
+ }
+ 
++static void
++ieee80211_s1g_rx_twt_info(struct ieee80211_sub_if_data *sdata,
++			  struct sta_info *sta, struct sk_buff *skb, u8 link_id)
++{
++	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)skb->data;
++	struct ieee80211_twt_info *twt_info;
++	u8 resp_requested, next_twt_req;
++
++	twt_info = (void *)mgmt->u.action.u.s1g.variable;
++
++	resp_requested = FIELD_GET(IEEE80211_TWT_INFO_RESP_REQ, twt_info->control);
++	next_twt_req = FIELD_GET(IEEE80211_TWT_INFO_NEXT_TWT_REQ, twt_info->control);
++	if (resp_requested || next_twt_req) {
++		pr_info("Unsupported field in TWT Information element\n");
++		return;
++	}
++
++	drv_twt_information(sdata->local, sdata, &sta->sta, link_id, twt_info);
++}
++
+ static void
+ ieee80211_s1g_tx_twt_setup_fail(struct ieee80211_sub_if_data *sdata,
+ 				struct sta_info *sta, struct sk_buff *skb)
+@@ -291,6 +312,9 @@ void ieee80211_s1g_rx_twt_action(struct ieee80211_sub_if_data *sdata,
+ 	case WLAN_S1G_TWT_TEARDOWN:
+ 		ieee80211_s1g_rx_twt_teardown(sdata, sta, skb, link_id);
+ 		break;
++	case WLAN_S1G_TWT_INFORMATION:
++		ieee80211_s1g_rx_twt_info(sdata, sta, skb, link_id);
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/net/mac80211/trace.h b/net/mac80211/trace.h
+index 4cca42ea..235f631c 100644
+--- a/net/mac80211/trace.h
++++ b/net/mac80211/trace.h
+@@ -2565,6 +2565,35 @@ TRACE_EVENT(drv_twt_teardown_request,
+ 	)
+ );
+ 
++TRACE_EVENT(drv_twt_information,
++	TP_PROTO(struct ieee80211_local *local,
++		 struct ieee80211_sta *sta,
++		 u8 link_id,
++		 struct ieee80211_twt_info *twt_info),
++
++	TP_ARGS(local, sta, link_id, twt_info),
++
++	TP_STRUCT__entry(
++		LOCAL_ENTRY
++		STA_ENTRY
++		__field(u8, link_id)
++		__field(u8, control)
++	),
++
++	TP_fast_assign(
++		LOCAL_ASSIGN;
++		STA_NAMED_ASSIGN(sta);
++		__entry->link_id = link_id;
++		__entry->control = twt_info->control;
++	),
++
++	TP_printk(
++		LOCAL_PR_FMT STA_PR_FMT " (link %d) control:0x%02x",
++		LOCAL_PR_ARG, STA_PR_ARG, __entry->link_id,
++		__entry->control
++	)
++);
++
+ TRACE_EVENT(drv_add_btwt,
+ 	TP_PROTO(struct ieee80211_local *local,
+ 		 struct ieee80211_sub_if_data *sdata, u8 link_id,
+-- 
+2.45.2
+

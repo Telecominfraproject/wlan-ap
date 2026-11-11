@@ -1,0 +1,182 @@
+From 559e74e11681b0e0139358c3070513f30ddcfa83 Mon Sep 17 00:00:00 2001
+From: Shayne Chen <shayne.chen@mediatek.com>
+Date: Tue, 10 Mar 2026 16:56:14 +0800
+Subject: [PATCH 75/89] mtk: mt76: mt7996: introduce chanctx state
+
+Introduce chanctx state so that we can set some MCU commands according
+to the current state.
+
+
+Fix issue that set_channel runs before chanctx_state is set in
+mt76_switch_vif_chanctx().
+
+Signed-off-by: Shayne Chen <shayne.chen@mediatek.com>
+---
+ channel.c     | 22 ++++++++++++++++++----
+ mt76.h        | 11 +++++++++++
+ mt7996/main.c | 34 +++++++++++++++++++++++++++++++++-
+ mt7996/mcu.c  |  3 ++-
+ 4 files changed, 64 insertions(+), 6 deletions(-)
+
+diff --git a/channel.c b/channel.c
+index 3539fa06e..68fd6a140 100644
+--- a/channel.c
++++ b/channel.c
+@@ -47,6 +47,8 @@ int mt76_add_chanctx(struct ieee80211_hw *hw,
+ 		mt76_abort_scan(dev);
+ 
+ 	mutex_lock(&dev->mutex);
++
++	ctx->state = MT76_CHANCTX_STATE_ADD;
+ 	if (!phy->chanctx)
+ 		ret = mt76_phy_update_channel(phy, conf);
+ 	else
+@@ -75,8 +77,10 @@ void mt76_remove_chanctx(struct ieee80211_hw *hw,
+ 		mt76_abort_scan(dev);
+ 
+ 	mutex_lock(&dev->mutex);
+-	if (phy->chanctx == ctx)
++	if (phy->chanctx == ctx) {
+ 		phy->chanctx = NULL;
++		phy->radar_enabled = false;
++	}
+ 	mutex_unlock(&dev->mutex);
+ }
+ EXPORT_SYMBOL_GPL(mt76_remove_chanctx);
+@@ -98,6 +102,7 @@ void mt76_change_chanctx(struct ieee80211_hw *hw,
+ 	cancel_delayed_work_sync(&phy->mac_work);
+ 
+ 	mutex_lock(&dev->mutex);
++	ctx->state = MT76_CHANCTX_STATE_CHANGE;
+ 	mt76_phy_update_channel(phy, conf);
+ 	mutex_unlock(&dev->mutex);
+ }
+@@ -231,6 +236,7 @@ int mt76_switch_vif_chanctx(struct ieee80211_hw *hw,
+ 	    phy != old_phy && old_phy->chanctx == old_ctx)
+ 		old_phy->chanctx = NULL;
+ 
++	new_ctx->state = MT76_CHANCTX_STATE_SWITCH;
+ 	if (update_chan)
+ 		ret = mt76_phy_update_channel(phy, vifs->new_ctx);
+ 
+@@ -257,9 +263,13 @@ int mt76_switch_vif_chanctx(struct ieee80211_hw *hw,
+ 
+ skip_link_replace:
+ 	for (i = 0; i < n_vifs; i++) {
+-		mlink = mt76_vif_conf_link(dev, vifs[i].vif, vifs[i].link_conf);
+-		if (!mlink)
+-			continue;
++		old_ctx = (struct mt76_chanctx *)vifs[i].old_ctx->drv_priv;
++		new_ctx = (struct mt76_chanctx *)vifs[i].new_ctx->drv_priv;
++
++		if (vifs[i].vif->type == NL80211_IFTYPE_AP)
++			new_ctx->has_ap = true;
++		else if (vifs[i].vif->type == NL80211_IFTYPE_STATION)
++			new_ctx->has_sta = true;
+ 
+ 		mt76_bss_dbg(vifs[i].vif,
+ 			     "chan=%d->%d, width=%d->%d, punct_bitmap=0x%04x->0x%04x, link=%u",
+@@ -271,6 +281,10 @@ skip_link_replace:
+ 			     vifs[i].new_ctx->def.punctured,
+ 			     vifs[i].link_conf->link_id);
+ 
++		mlink = mt76_vif_conf_link(dev, vifs[i].vif, vifs[i].link_conf);
++		if (!mlink)
++			continue;
++
+ 		mlink->ctx = vifs->new_ctx;
+ 	}
+ 
+diff --git a/mt76.h b/mt76.h
+index 133ceab85..1d66b65fd 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -1417,8 +1417,19 @@ struct mt76_ethtool_worker_info {
+ 	int sta_count;
+ };
+ 
++enum mt76_chanctx_state {
++	MT76_CHANCTX_STATE_UNSPEC,
++	MT76_CHANCTX_STATE_ADD,
++	MT76_CHANCTX_STATE_CHANGE,
++	MT76_CHANCTX_STATE_SWITCH,
++};
++
+ struct mt76_chanctx {
+ 	struct mt76_phy *phy;
++
++	enum mt76_chanctx_state state;
++	bool has_ap:1;
++	bool has_sta:1;
+ };
+ 
+ #define CCK_RATE(_idx, _rate) {					\
+diff --git a/mt7996/main.c b/mt7996/main.c
+index 7a2455240..412f14883 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -759,7 +759,7 @@ int mt7996_set_channel(struct mt76_phy *mphy)
+ {
+ 	struct mt7996_phy *phy = mphy->priv;
+ 	struct mt7996_dev *dev = phy->dev;
+-	int ret;
++	int ret = 0;
+ 
+ 	if (dev->cal.data) {
+ 		ret = mt7996_mcu_apply_tx_dpd(phy);
+@@ -773,6 +773,38 @@ int mt7996_set_channel(struct mt76_phy *mphy)
+ 		return 0;
+ 	}
+ 
++	if (mphy->chanctx && mphy->chanctx->state == MT76_CHANCTX_STATE_ADD) {
++		ret = mt7996_mcu_edcca_enable(phy, true);
++		if (ret)
++			goto out;
++
++		ret = mt7996_mcu_set_pp_en(phy, PP_USR_MODE,
++					   mphy->chandef.punctured);
++		if (ret)
++			goto out;
++	} else if (mphy->chanctx && mphy->chanctx->state == MT76_CHANCTX_STATE_SWITCH) {
++		u8 delta;
++		int current_txpower;
++
++		if (mphy->chanctx->has_ap && phy->pp_mode == PP_USR_MODE) {
++			ret = mt7996_mcu_set_pp_en(phy, PP_USR_MODE,
++						   mphy->main_chandef.punctured);
++		} else if (mphy->chanctx->has_sta) {
++			u8 omac_idx = get_omac_idx(NL80211_IFTYPE_STATION,
++				      phy->omac_mask);
++			ret = mt7996_mcu_set_pp_sta_dscb(phy, &mphy->main_chandef,
++							 omac_idx);
++		}
++		if (ret)
++			goto out;
++
++		delta = mt76_tx_power_path_delta(hweight16(mphy->chainmask));
++		current_txpower = DIV_ROUND_UP(mphy->txpower_cur + delta, 2);
++		ret = mt7996_mcu_set_txpower_sku(phy, current_txpower);
++		if (ret)
++			goto out;
++	}
++
+ 	ret = mt7996_mcu_set_chan_info(phy, UNI_CHANNEL_SWITCH, false);
+ 	if (ret)
+ 		goto out;
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 7e963440c..7f49c2a35 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -5969,7 +5969,8 @@ int mt7996_mcu_set_chan_info(struct mt7996_phy *phy, u16 tag, bool sta)
+ 		.channel_band = ch_band[chandef->chan->band],
+ 	};
+ 
+-	if (phy->mt76->offchannel || !phy->mt76->chanctx)
++	if (phy->mt76->offchannel ||
++	    !test_bit(MT76_STATE_RUNNING, &phy->mt76->state))
+ 		req.switch_reason = CH_SWITCH_SCAN_BYPASS_DPD;
+ 	else if (!cfg80211_reg_can_beacon(phy->mt76->hw->wiphy, chandef, iftype))
+ 		req.switch_reason = CH_SWITCH_DFS;
+-- 
+2.45.2
+
