@@ -1,0 +1,183 @@
+From 4bfe62092aba0b9762984bcabbbea1afb7f975e4 Mon Sep 17 00:00:00 2001
+From: "crychic.tan" <crychic.tan@cybertan.com.tw>
+Date: Tue, 20 Oct 2026 18:44:27 +0800
+Subject: [PATCH] mediatek: mt76: fix tx BA setup on TIDs with WED traffic
+
+An AddBA request is queued behind the data frames of its TID's AC, and
+with WED those keep coming without A-MPDU while the session is set up.
+The request then took 3.8-5.7 s to reach the station, longer than the
+1 s mac80211 waits for the response, so a BA session of a busy WED TID
+that was torn down, or that was first set up after its traffic had
+started, did not come back until the traffic paused.
+
+Add an mt76 package patch that sends AddBA requests from the ALTX queue
+while WED is active, and starts new sessions at the sequence number of
+the last WED frame of the TID, as the request no longer follows the
+queued frames.
+
+Signed-off-by: crychic.tan <crychic.tan@cybertan.com.tw>
+---
+ ...tx-ba-setup-on-tids-with-wed-traffic.patch | 151 ++++++++++++++++++
+ 1 file changed, 151 insertions(+)
+ create mode 100644 package/kernel/mt76/patches/101-wifi-mt76-fix-tx-ba-setup-on-tids-with-wed-traffic.patch
+
+diff --git a/package/kernel/mt76/patches/101-wifi-mt76-fix-tx-ba-setup-on-tids-with-wed-traffic.patch b/package/kernel/mt76/patches/101-wifi-mt76-fix-tx-ba-setup-on-tids-with-wed-traffic.patch
+new file mode 100644
+index 0000000000..b062dab0b4
+--- /dev/null
++++ b/package/kernel/mt76/patches/101-wifi-mt76-fix-tx-ba-setup-on-tids-with-wed-traffic.patch
+@@ -0,0 +1,151 @@
++From: crychic.tan <crychic.tan@cybertan.com.tw>
++Subject: [PATCH] wifi: mt76: fix tx BA setup on TIDs with WED traffic
++
++mac80211 sends an AddBA request with the TID of the session, so it is
++queued in the hardware queue of that TID's AC behind the data frames of
++the station, and gives up on the session if no response arrives within
++one second. Frames forwarded by WED fill that hardware queue without the
++host being able to hold them back, and without a BA session they are
++sent one by one. On MT7981 with 900-2000 frames queued, the request
++reached the station 3.8-5.7 s after it was sent, so every try timed out
++and the TID stayed without A-MPDU until the traffic paused.
++
++Send AddBA requests from the ALTX queue while WED is active.
++
++The start sequence number of the request then also has to be right
++without the hardware, as the request no longer follows the queued
++frames: if it lies ahead of them, the station takes every frame for an
++old one and the TID stalls. mac80211 does not see the WED forwarded
++frames, which get their sequence numbers from the hardware, so keep the
++sequence number of the last WED frame of each TID from the PPDU based tx
++status and start new sessions of that TID there. Do not let the hardware
++fill in the start sequence number of a request sent from the ALTX queue
++either; with MT_TXD5_ADD_BA set, such sessions stalled at times.
++
++With this, a session torn down during a TCP transfer on TID 1 or 5 was
++set up again at once (within about 0.1 s where measured) in 35 of 35
++tries, compared with 0 of 5 before.
++
++Signed-off-by: crychic.tan <crychic.tan@cybertan.com.tw>
++---
++ tx.c              |   20 +++++++++++++++++++-
++ mt76_connac_mac.c |   13 +++++++++++--
++ mt7915/mac.c      |   15 +++++++++++++--
++ mt7915/main.c     |    7 +++++++
++ mt7915/mt7915.h   |    3 +++
++ 5 files changed, 53 insertions(+), 5 deletions(-)
++
++--- a/tx.c
+++++ b/tx.c
++@@ -614,6 +614,23 @@ void mt76_txq_schedule(struct mt76_phy *
++ }
++ EXPORT_SYMBOL_GPL(mt76_txq_schedule);
++ 
+++/* Frames forwarded by WED fill the hardware queues of their station, and the
+++ * host cannot hold them back while a BA session is set up. An AddBA request
+++ * queued behind them can take longer to be sent than mac80211 waits for the
+++ * response.
+++ */
+++static bool
+++mt76_tx_wed_addba_req(struct mt76_dev *dev, struct sk_buff *skb)
+++{
+++	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)skb->data;
+++
+++	return mt76_is_mmio(dev) && mtk_wed_device_active(&dev->mmio.wed) &&
+++	       ieee80211_is_action(mgmt->frame_control) &&
+++	       skb->len >= IEEE80211_MIN_ACTION_SIZE + 1 &&
+++	       mgmt->u.action.category == WLAN_CATEGORY_BACK &&
+++	       mgmt->u.action.u.addba_req.action_code == WLAN_ACTION_ADDBA_REQ;
+++}
+++
++ static int
++ mt76_txq_schedule_pending_wcid(struct mt76_phy *phy, struct mt76_wcid *wcid,
++ 			       struct sk_buff_head *head)
++@@ -635,7 +652,8 @@ mt76_txq_schedule_pending_wcid(struct mt
++ 		    !ieee80211_is_data_present(hdr->frame_control) &&
++ 		    (!ieee80211_is_bufferable_mmpdu(skb) ||
++ 		     ieee80211_is_deauth(hdr->frame_control) ||
++-		     head == &wcid->tx_offchannel))
+++		     head == &wcid->tx_offchannel ||
+++		     mt76_tx_wed_addba_req(dev, skb)))
++ 			qid = MT_TXQ_PSD;
++ 
++ 		q = phy->q_tx[qid];
++--- a/mt76_connac_mac.c
+++++ b/mt76_connac_mac.c
++@@ -577,11 +577,20 @@ void mt76_connac2_mac_write_txwi(struct
++ 	txwi[6] = 0;
++ 	txwi[7] = amsdu_en ? cpu_to_le32(MT_TXD7_HW_AMSDU) : 0;
++ 
++-	if (is_8023)
+++	if (is_8023) {
++ 		mt76_connac2_mac_write_txwi_8023(txwi, skb, wcid);
++-	else
+++	} else {
++ 		mt76_connac2_mac_write_txwi_80211(dev, txwi, skb, key);
++ 
+++		/* With MT_TXD5_ADD_BA set, the hardware fills in the start
+++		 * sequence number of an AddBA request. For a request sent from
+++		 * the ALTX queue (see mt76_tx_wed_addba_req()) that left the
+++		 * session stalled at times, so keep the one set by mac80211.
+++		 */
+++		if (qid >= MT_TXQ_PSD)
+++			txwi[5] &= ~cpu_to_le32(MT_TXD5_ADD_BA);
+++	}
+++
++ 	if (txwi[2] & cpu_to_le32(MT_TXD2_FIX_RATE)) {
++ 		/* Fixed rata is available just for 802.11 txd */
++ 		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++--- a/mt7915/mac.c
+++++ b/mt7915/mac.c
++@@ -1005,9 +1005,20 @@ static void mt7915_mac_add_txs(struct mt
++ 
++ 	msta = container_of(wcid, struct mt7915_sta, wcid);
++ 
++-	if (pid == MT_PACKET_ID_WED)
+++	if (pid == MT_PACKET_ID_WED) {
+++		u32 txs = le32_to_cpu(txs_data[0]);
+++
+++		/* PPDU based tx status of WED forwarded frames */
+++		if (FIELD_GET(MT_TXS0_TXS_FORMAT, txs) > 1) {
+++			u8 tid = FIELD_GET(MT_TXS0_TID, txs);
+++
+++			msta->wed_seq[tid] = le32_get_bits(txs_data[1],
+++							   MT_TXS1_SEQNO);
+++			set_bit(tid, &msta->wed_seq_valid);
+++		}
+++
++ 		mt76_connac2_mac_fill_txs(&dev->mt76, wcid, txs_data);
++-	else
+++	} else
++ 		mt76_connac2_mac_add_txs_skb(&dev->mt76, wcid, pid, txs_data);
++ 
++ 	if (!wcid->sta)
++--- a/mt7915/main.c
+++++ b/mt7915/main.c
++@@ -977,6 +977,13 @@ mt7915_ampdu_action(struct ieee80211_hw
++ 		ret = mt7915_mcu_add_tx_ba(dev, params, false);
++ 		break;
++ 	case IEEE80211_AMPDU_TX_START:
+++		/* WED forwarded frames get their sequence numbers from the
+++		 * hardware, not from mac80211. Start the session at the last
+++		 * one sent, so that the station does not take the following
+++		 * frames for old ones.
+++		 */
+++		if (test_bit(tid, &msta->wed_seq_valid))
+++			params->ssn = msta->wed_seq[tid];
++ 		set_bit(tid, &msta->wcid.ampdu_state);
++ 		ret = IEEE80211_AMPDU_TX_START_IMMEDIATE;
++ 		break;
++--- a/mt7915/mt7915.h
+++++ b/mt7915/mt7915.h
++@@ -148,6 +148,9 @@ struct mt7915_sta {
++ 	unsigned long changed;
++ 	unsigned long jiffies;
++ 	unsigned long authorized; /* jiffies at authorization, 0 before */
+++	/* sequence number of the last WED frame of each TID */
+++	u16 wed_seq[IEEE80211_NUM_TIDS];
+++	unsigned long wed_seq_valid;
++ 	struct mt76_connac_sta_key_conf bip;
++ 
++ 	struct {
+-- 
+2.34.1
+

@@ -1,0 +1,227 @@
+From b6b24e1c69100646270940bc45ee96eae95d52ab Mon Sep 17 00:00:00 2001
+From: "crychic.tan" <crychic.tan@cybertan.com.tw>
+Date: Mon, 19 Oct 2026 16:22:04 +0800
+Subject: [PATCH] mediatek: mt76: start tx BA sessions for WED forwarded frames
+
+With WED offload enabled and the DSCP of bridged flows kept, the WED tx
+path picks the TID of offloaded frames from their DSCP. mt76 only starts
+a tx BlockAck session from its own tx path, so a TID that only carries
+WED traffic is sent without A-MPDU and runs at a few Mbit/s instead of
+several hundred.
+
+Add an mt76 package patch that starts the BA session of a TID from the
+PPDU tx status of WED forwarded frames, which already carries the TID
+and is used to refresh the BA session timer. As that tx status is not
+reported for every frame, the periodic MAC work also starts the missing
+sessions of all non-VO TIDs while WED is active, starting two seconds
+after a station is authorized.
+
+Signed-off-by: crychic.tan <crychic.tan@cybertan.com.tw>
+---
+ ...ba-sessions-for-wed-forwarded-frames.patch | 194 ++++++++++++++++++
+ 1 file changed, 194 insertions(+)
+ create mode 100644 package/kernel/mt76/patches/100-wifi-mt76-connac-start-tx-ba-sessions-for-wed-forwarded-frames.patch
+
+diff --git a/package/kernel/mt76/patches/100-wifi-mt76-connac-start-tx-ba-sessions-for-wed-forwarded-frames.patch b/package/kernel/mt76/patches/100-wifi-mt76-connac-start-tx-ba-sessions-for-wed-forwarded-frames.patch
+new file mode 100644
+index 0000000000..56ba721e59
+--- /dev/null
++++ b/package/kernel/mt76/patches/100-wifi-mt76-connac-start-tx-ba-sessions-for-wed-forwarded-frames.patch
+@@ -0,0 +1,194 @@
++From: crychic.tan <crychic.tan@cybertan.com.tw>
++Subject: [PATCH] wifi: mt76: connac: start tx BA sessions for WED forwarded frames
++
++A tx BlockAck session is only started from mt76_connac2_tx_check_aggr(),
++which runs when the host frees the txwi of a frame it sent itself. Frames
++forwarded by WED never get there, so a TID that only carries WED traffic
++never gets a BA session and is sent without A-MPDU.
++
++This went unnoticed while the PPE cleared the DSCP of offloaded flows and
++all of them ended up on TID 0, which the host tx path always sets up.
++Once the DSCP is kept, the WED tx path picks the TID from it and such a
++TID runs at a fraction of the link rate: on MT7981 (WED v2), DL TCP
++with DSCP CS1 (TID 1) ran at 3.5 Mbit/s instead of 674 Mbit/s, and
++with DSCP EF (TID 5) at 4-54 Mbit/s instead of 410 Mbit/s, until a
++frame on the host tx path happened to set the session up.
++
++With WED active the hardware already reports a PPDU tx status with the
++TID of WED forwarded frames, which is used to refresh the BA session
++timer. Start the BA session of that TID from there as well, using the
++same checks as the host tx path.
++
++The tx status is not reported for every frame though. After a session
++of a busy WED TID was torn down, it was seen not to come back for
++several seconds, until the station reassociated. So mt7915_mac_work()
++also starts the missing sessions of all non-VO TIDs of every station
++every 500 ms while WED is active. Peers that refuse a session are
++handled by the retry limits of mac80211.
++
++That check leaves a station alone until it has been authorized for two
++seconds. When it started the sessions of all TIDs right after
++association while a QCA station was setting up its own session of
++TID 0, the uplink of TID 0 stayed at about 20 Mbit/s instead of
++600 Mbit/s until that session was torn down (11 of 41 associations).
++The host tx path never starts a session before authorization either.
++
++Signed-off-by: crychic.tan <crychic.tan@cybertan.com.tw>
++---
++ mt76_connac.h     |    1 +
++ mt76_connac_mac.c |   39 ++++++++++++++++++++++++++-------------
++ mt7915/mac.c      |   29 +++++++++++++++++++++++++++++
++ mt7915/main.c     |    5 ++++-
++ mt7915/mt7915.h   |    1 +
++ 5 files changed, 61 insertions(+), 14 deletions(-)
++
++--- a/mt76_connac.h
+++++ b/mt76_connac.h
++@@ -455,6 +455,7 @@ int mt76_connac2_mac_fill_rx_rate(struct
++ 				  struct ieee80211_supported_band *sband,
++ 				  __le32 *rxv, u8 *mode);
++ void mt76_connac2_tx_check_aggr(struct ieee80211_sta *sta, __le32 *txwi);
+++void mt76_connac2_tx_check_aggr_tid(struct ieee80211_sta *sta, u8 tid);
++ void mt76_connac2_txwi_free(struct mt76_dev *dev, struct mt76_txwi_cache *t,
++ 			    struct ieee80211_sta *sta,
++ 			    struct list_head *free_list);
++--- a/mt76_connac_mac.c
+++++ b/mt76_connac_mac.c
++@@ -612,6 +612,23 @@ void mt76_connac2_mac_write_txwi(struct
++ }
++ EXPORT_SYMBOL_GPL(mt76_connac2_mac_write_txwi);
++ 
+++void mt76_connac2_tx_check_aggr_tid(struct ieee80211_sta *sta, u8 tid)
+++{
+++	struct mt76_wcid *wcid = (struct mt76_wcid *)sta->drv_priv;
+++
+++	if (!(sta->deflink.ht_cap.ht_supported || sta->deflink.he_cap.has_he))
+++		return;
+++
+++	if (tid >= 6) /* skip VO queue */
+++		return;
+++
+++	if (!test_and_set_bit(tid, &wcid->ampdu_state)) {
+++		if (ieee80211_start_tx_ba_session(sta, tid, 0))
+++			clear_bit(tid, &wcid->ampdu_state);
+++	}
+++}
+++EXPORT_SYMBOL_GPL(mt76_connac2_tx_check_aggr_tid);
+++
++ bool mt76_connac2_mac_fill_txs(struct mt76_dev *dev, struct mt76_wcid *wcid,
++ 			       __le32 *txs_data)
++ {
++@@ -644,6 +661,12 @@ bool mt76_connac2_mac_fill_txs(struct mt
++ 			tid = FIELD_GET(MT_TXS0_TID, txs);
++ 
++ 			ieee80211_refresh_tx_agg_session_timer(sta, tid);
+++
+++			/* WED forwarded frames never reach
+++			 * mt76_connac2_tx_check_aggr(), so start the BA session
+++			 * of their TID from the tx status instead.
+++			 */
+++			mt76_connac2_tx_check_aggr_tid(sta, tid);
++ 		}
++ 	}
++ 
++@@ -1134,16 +1157,10 @@ EXPORT_SYMBOL_GPL(mt76_connac2_mac_fill_
++ 
++ void mt76_connac2_tx_check_aggr(struct ieee80211_sta *sta, __le32 *txwi)
++ {
++-	struct mt76_wcid *wcid;
++-	u16 fc, tid;
+++	u16 fc;
++ 	u32 val;
++ 
++-	if (!sta ||
++-	    !(sta->deflink.ht_cap.ht_supported || sta->deflink.he_cap.has_he))
++-		return;
++-
++-	tid = le32_get_bits(txwi[1], MT_TXD1_TID);
++-	if (tid >= 6) /* skip VO queue */
+++	if (!sta)
++ 		return;
++ 
++ 	val = le32_to_cpu(txwi[2]);
++@@ -1152,11 +1169,7 @@ void mt76_connac2_tx_check_aggr(struct i
++ 	if (unlikely(fc != (IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_DATA)))
++ 		return;
++ 
++-	wcid = (struct mt76_wcid *)sta->drv_priv;
++-	if (!test_and_set_bit(tid, &wcid->ampdu_state)) {
++-		if (ieee80211_start_tx_ba_session(sta, tid, 0))
++-			clear_bit(tid, &wcid->ampdu_state);
++-	}
+++	mt76_connac2_tx_check_aggr_tid(sta, le32_get_bits(txwi[1], MT_TXD1_TID));
++ }
++ EXPORT_SYMBOL_GPL(mt76_connac2_tx_check_aggr);
++ 
++--- a/mt7915/mac.c
+++++ b/mt7915/mac.c
++@@ -1983,6 +1983,30 @@ void mt7915_mac_sta_rc_work(struct work_
++ 	spin_unlock_bh(&dev->mt76.sta_poll_lock);
++ }
++ 
+++static void mt7915_mac_wed_check_aggr(void *data, struct ieee80211_sta *sta)
+++{
+++	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
+++	u8 tid;
+++
+++	/* The BA session of a TID that only carries WED traffic is started
+++	 * from the tx status of its frames, which is not reported for every
+++	 * frame and can be missing for a long time. Start the missing
+++	 * sessions of all non-VO TIDs here as well.
+++	 *
+++	 * Leave a station alone until it has been authorized for a while.
+++	 * Starting all sessions at once while a station was setting up its
+++	 * own session of TID 0 right after association was seen to leave
+++	 * the uplink of that TID at about 20 Mbit/s until the session was
+++	 * torn down.
+++	 */
+++	if (!msta->authorized ||
+++	    time_before(jiffies, msta->authorized + 2 * HZ))
+++		return;
+++
+++	for (tid = 0; tid < IEEE80211_NUM_TIDS; tid++)
+++		mt76_connac2_tx_check_aggr_tid(sta, tid);
+++}
+++
++ void mt7915_mac_work(struct work_struct *work)
++ {
++ 	struct mt7915_phy *phy;
++@@ -2001,6 +2025,11 @@ void mt7915_mac_work(struct work_struct
++ 		mt7915_mac_update_stats(phy);
++ 		mt7915_mac_severe_check(phy);
++ 
+++		if (mtk_wed_device_active(&phy->dev->mt76.mmio.wed))
+++			ieee80211_iterate_stations_atomic(mphy->hw,
+++							  mt7915_mac_wed_check_aggr,
+++							  NULL);
+++
++ 		if (phy->dev->muru_debug)
++ 			mt7915_mcu_muru_debug_get(phy);
++ 	}
++--- a/mt7915/main.c
+++++ b/mt7915/main.c
++@@ -856,7 +856,10 @@ int mt7915_mac_sta_event(struct mt76_dev
++ 
++ 	case MT76_STA_EVENT_AUTHORIZE:
++ 		mt7915_drop_other_sta(dev, vif, sta);
++-		return mt7915_mcu_add_sta(dev, vif, sta, CONN_STATE_PORT_SECURE, false);
+++		ret = mt7915_mcu_add_sta(dev, vif, sta, CONN_STATE_PORT_SECURE, false);
+++		if (!ret)
+++			msta->authorized = jiffies;
+++		return ret;
++ 
++ 	case MT76_STA_EVENT_DISASSOC:
++ 		mutex_lock(&dev->mt76.mutex);
++--- a/mt7915/mt7915.h
+++++ b/mt7915/mt7915.h
++@@ -147,6 +147,7 @@ struct mt7915_sta {
++ 
++ 	unsigned long changed;
++ 	unsigned long jiffies;
+++	unsigned long authorized; /* jiffies at authorization, 0 before */
++ 	struct mt76_connac_sta_key_conf bip;
++ 
++ 	struct {
+-- 
+2.34.1
+

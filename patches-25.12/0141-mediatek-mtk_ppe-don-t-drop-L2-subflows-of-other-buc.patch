@@ -1,0 +1,163 @@
+From ab518cece78293bf16a40a4d180ba6e4c9ab0cd4 Mon Sep 17 00:00:00 2001
+From: "crychic.tan" <crychic.tan@cybertan.com.tw>
+Date: Tue, 20 Oct 2026 14:31:32 +0800
+Subject: [PATCH] mediatek: mtk_ppe: don't drop L2 subflows of other bucket
+ entries
+
+When a flow is about to be bound, the PPE driver drops every other flow
+of the same hash bucket. For a bridged (L2) subflow that is still bound
+to another entry of the bucket, this loses its counters and leaves its
+hardware entry bound but untracked, so it is not invalidated when the
+flow rule is removed and keeps forwarding to the old destination, for
+example a station that has left.
+
+Add a target patch that only drops the subflow of the entry that is
+about to be bound, after adding its last counters to its L2 flow.
+
+Signed-off-by: crychic.tan <crychic.tan@cybertan.com.tw>
+---
+ ...-l2-subflows-of-other-bucket-entries.patch | 132 ++++++++++++++++++
+ 1 file changed, 132 insertions(+)
+ create mode 100644 target/linux/mediatek/patches-6.12/999-2704-net-ethernet-mtk_ppe-do-not-drop-l2-subflows-of-other-bucket-entries.patch
+
+diff --git a/target/linux/mediatek/patches-6.12/999-2704-net-ethernet-mtk_ppe-do-not-drop-l2-subflows-of-other-bucket-entries.patch b/target/linux/mediatek/patches-6.12/999-2704-net-ethernet-mtk_ppe-do-not-drop-l2-subflows-of-other-bucket-entries.patch
+new file mode 100644
+index 0000000000..08cd8603aa
+--- /dev/null
++++ b/target/linux/mediatek/patches-6.12/999-2704-net-ethernet-mtk_ppe-do-not-drop-l2-subflows-of-other-bucket-entries.patch
+@@ -0,0 +1,132 @@
++From: crychic.tan <crychic.tan@cybertan.com.tw>
++Subject: [PATCH] net: ethernet: mtk_ppe: don't drop L2 subflows of other bucket entries
++
++When a packet of an unbound flow reaches the bind rate,
++__mtk_ppe_check_skb() walks the flows of the hash bucket of its entry and
++drops every one that does not match the new flow. An L2 subflow bound to
++another entry of the same bucket is freed as well, while its hardware
++entry stays bound. From then on the packets forwarded by that entry are
++no longer counted, and the entry is not invalidated when its L2 flow is
++removed, so it keeps forwarding to the old destination, for example a
++station that has left, until it ages out. That does not happen as long
++as packets keep arriving.
++
++With two connections whose entries fall in the same bucket, the first
++one stayed bound after all flow rules were removed in 6 of 6 tries on
++MT7981, and the flower counters showed 8-28 % of the bytes, as the
++counters already reported for the dropped subflow were lost as well.
++
++Only drop the subflow of the entry that is about to be bound, and add
++its last counters to its L2 flow before anything else is bound to the
++entry and its counters are cleared. Subflows of the other entries stay
++tracked, and the next stats update drops them once they have expired.
++To find the L2 flow, keep a pointer to it in the subflow again, as
++before "net: ethernet: mtk_eth_soc: improve keeping track of offloaded
++flows". A matching regular flow is now bound after the walk, so the
++subflow of the entry is always dropped first. With this, no entry stayed
++bound after the flow rules were removed in the same 6 tries, and the
++counters showed 104-105 % of the bytes (the PPE counts L2 frames).
++
++Signed-off-by: crychic.tan <crychic.tan@cybertan.com.tw>
++---
++ drivers/net/ethernet/mediatek/mtk_ppe.c |   42 +++++++++++++++++++++++++++----
++ drivers/net/ethernet/mediatek/mtk_ppe.h |    2 +
++ 2 files changed, 38 insertions(+), 6 deletions(-)
++
++--- a/drivers/net/ethernet/mediatek/mtk_ppe.c
+++++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
++@@ -641,6 +641,24 @@ mtk_flow_entry_update_l2(struct mtk_ppe
++ 	}
++ }
++ 
+++/* The hardware entry of an L2 subflow is about to be bound to another flow:
+++ * add its last counters to the L2 flow and drop the subflow.
+++ */
+++static void
+++mtk_flow_entry_expire_subflow(struct mtk_ppe *ppe, struct mtk_flow_entry *entry)
+++{
+++	struct mtk_flow_entry *l2_flow = entry->l2_flow;
+++	struct mtk_foe_accounting *acct;
+++
+++	acct = mtk_ppe_mib_entry_read(ppe, entry->hash);
+++	if (acct) {
+++		l2_flow->prev_packets += acct->packets;
+++		l2_flow->prev_bytes += acct->bytes;
+++	}
+++
+++	__mtk_foe_entry_clear(ppe, entry, false);
+++}
+++
++ void mtk_foe_entry_get_stats(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
++ 			     int *idle)
++ {
++@@ -808,6 +826,7 @@ mtk_foe_entry_commit_subflow(struct mtk_
++ 		return;
++ 
++ 	flow_info->type = MTK_FLOW_TYPE_L2_SUBFLOW;
+++	flow_info->l2_flow = entry;
++ 	flow_info->hash = hash;
++ 	hlist_add_head(&flow_info->list,
++ 		       &ppe->foe_flow[hash / soc->hash_offset]);
++@@ -843,12 +862,11 @@ void __mtk_ppe_check_skb(struct mtk_ppe
++ 	const struct mtk_soc_data *soc = ppe->eth->soc;
++ 	struct hlist_head *head = &ppe->foe_flow[hash / soc->hash_offset];
++ 	struct mtk_foe_entry *hwe = mtk_foe_get_entry(ppe, hash);
++-	struct mtk_flow_entry *entry;
+++	struct mtk_flow_entry *entry, *found = NULL;
++ 	struct mtk_foe_bridge key = {};
++ 	struct mtk_foe_entry foe = {};
++ 	struct hlist_node *n;
++ 	struct ethhdr *eh;
++-	bool found = false;
++ 	int entry_len;
++ 	u8 *tag;
++ 
++@@ -861,6 +879,17 @@ void __mtk_ppe_check_skb(struct mtk_ppe
++ 	memcpy(&foe, hwe, entry_len);
++ 
++ 	hlist_for_each_entry_safe(entry, n, head, list) {
+++		/* Subflows are created from their L2 flow below. The other
+++		 * entries of the bucket may still be bound to their subflows,
+++		 * so only drop the subflow of this entry, before anything else
+++		 * is bound to it.
+++		 */
+++		if (entry->type == MTK_FLOW_TYPE_L2_SUBFLOW) {
+++			if (entry->hash == hash)
+++				mtk_flow_entry_expire_subflow(ppe, entry);
+++			continue;
+++		}
+++
++ 		if (found ||
++ 		    !mtk_flow_entry_match(ppe->eth, entry, &foe, entry_len)) {
++ 			if (entry->hash != 0xffff)
++@@ -868,13 +897,14 @@ void __mtk_ppe_check_skb(struct mtk_ppe
++ 			continue;
++ 		}
++ 
++-		entry->hash = hash;
++-		__mtk_foe_entry_commit(ppe, &entry->data, hash);
++-		found = true;
+++		found = entry;
++ 	}
++ 
++-	if (found)
+++	if (found) {
+++		found->hash = hash;
+++		__mtk_foe_entry_commit(ppe, &found->data, hash);
++ 		goto out;
+++	}
++ 
++ 	eh = eth_hdr(skb);
++ 	ether_addr_copy(key.dest_mac, eh->h_dest);
++--- a/drivers/net/ethernet/mediatek/mtk_ppe.h
+++++ b/drivers/net/ethernet/mediatek/mtk_ppe.h
++@@ -290,6 +290,8 @@ struct mtk_flow_entry {
++ 		struct {
++ 			struct hlist_node list;
++ 			struct hlist_node l2_list;
+++			/* L2 flow of an L2 subflow */
+++			struct mtk_flow_entry *l2_flow;
++ 		};
++ 		/* L2 flows */
++ 		struct {
+-- 
+2.34.1
+
