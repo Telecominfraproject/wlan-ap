@@ -1,0 +1,311 @@
+From: ruanyaoyu <ruanyaoyu@actiontec.com>
+Date: Wed, 5 Aug 2026 16:30:00 +0800
+Subject: [PATCH] hostapd: add 6G MPSK-RADIUS SAE password support
+
+hostapd: support MPSK-RADIUS passphrase for 6G SAE authentication
+
+Problem:
+RADIUS Tunnel-Password is currently only copied into sta->psk, which
+sae_get_password() treats as a password-only fallback with no PT.
+6G SAE (H2E) requires a PT in auth_build_sae_commit(), so 6G MPSK-RADIUS
+connections failed while 2.4G/5G WPA2-PSK worked fine.
+
+Changes:
+1. In ieee802_11_set_radius_info(), when SAE is enabled and RADIUS
+   returns a passphrase, dynamically derive a PT (sae_derive_pt()) and
+   register a MAC-keyed sae_password_entry in hapd->conf->sae_passwords,
+   so sae_get_password() can serve 6G SAE auth. The entry is tracked
+   via sta->radius_sae_pw and released in ap_free_sta() to avoid leaks.
+   Re-auth with an unchanged password reuses the existing entry instead
+   of leaking a new PT.
+
+2. Add a MAX_RADIUS_TRIES(3) guard in the WPA2-PSK + RADIUS-PSK retry
+   loop (PTKCALCNEGOTIATING) to stop indefinite RADIUS re-queries when
+   the returned PSK keeps failing MIC verification. Does not affect the
+   SAE path, which resolves PT before the 4-way handshake.
+
+Affected files: src/ap/ieee802_11.c, src/ap/sta_info.c,
+src/ap/sta_info.h, src/ap/wpa_auth.c, src/ap/wpa_auth_i.h
+
+Tested: WF189 (ipq53xx) + FreeRADIUS, 6G MPSK-RADIUS auth succeeds and
+obtains IP.
+
+Signed-off-by: ruanyaoyu <ruanyaoyu@actiontec.com>
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 96ce821..7712c9f 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -2563,6 +2563,137 @@ int ieee802_11_set_radius_info(struct hostapd_data *hapd, struct sta_info *sta,
+ 	}
+ 	if (ap_sta_set_vlan(hapd, sta, vlan_id) < 0)
+ 		return -1;
++#ifdef CONFIG_SAE
++	/*
++	 * MPSK-RADIUS / 6G SAE: when RADIUS hands us a passphrase, derive a
++	 * SAE password token (PT) and register an sae_password_entry keyed
++	 * by the STA's MAC so sae_get_password() can serve SAE auth on 6G.
++	 * The entry is owned by the STA (sta->radius_sae_pw) and is removed
++	 * from hapd->conf->sae_passwords (and freed) in ap_free_sta().
++	 *
++	 * This runs AFTER ap_sta_set_vlan() succeeds, so a VLAN assignment
++	 * failure returns -1 before any entry is added to the shared list
++	 * -- otherwise a half-registered entry could leak if the caller
++	 * does not reach ap_free_sta().
++	 *
++	 * Gate on wpa_key_mgmt_sae() rather than dynamic_vlan: a 6G SAE
++	 * BSS with MPSK-RADIUS may have dynamic_vlan disabled, and the PT
++	 * is required for SAE auth regardless of VLAN assignment.
++	 */
++	if (wpa_key_mgmt_sae(hapd->conf->wpa_key_mgmt) &&
++	    info->psk && info->psk->passphrase[0]) {
++		struct sae_password_entry *pw, *entry, *prev_entry;
++		const u8 *ssid = hapd->conf->ssid.ssid;
++		size_t ssid_len = hapd->conf->ssid.ssid_len;
++		size_t entry_len, pw_len;
++
++		wpa_printf(MSG_DEBUG,
++			   "MPSK-RADIUS: build sae_password_entry for " MACSTR,
++			   MAC2STR(sta->addr));
++
++		pw = os_zalloc(sizeof(*pw));
++		if (!pw)
++			goto mpsk_done;
++		pw->next = NULL;
++		pw->password = os_strdup(info->psk->passphrase);
++		if (!pw->password) {
++			os_free(pw);
++			goto mpsk_done;
++		}
++
++		os_memcpy(pw->peer_addr, sta->addr, ETH_ALEN);
++		/*
++		 * Leave pw->vlan_id == 0. sta->vlan_id is already set by
++		 * ap_sta_set_vlan() above, so sae_accept_sta() must NOT
++		 * re-enter it (its vlan_id > 0 branch): in per_sta_vif mode
++		 * that second call would re-run ap_sta_get_free_vlan_id()
++		 * and leak a bridge id; with tagged VLANs the single int
++		 * field cannot represent RADIUS' tagged+untagged set. Static
++		 * sae_password entries use vlanid=N because they have no
++		 * RADIUS source -- the RADIUS path does, so no value here.
++		 */
++
++
++		wpa_printf(MSG_DEBUG,
++			   "MPSK-RADIUS: sae_derive_pt() for ssid (len %zu)",
++			   ssid_len);
++		pw->pt = sae_derive_pt(hapd->conf->sae_groups,
++				       ssid, ssid_len,
++				       (const u8 *) pw->password,
++				       os_strlen(pw->password),
++				       pw->identifier);
++		wpa_printf(MSG_DEBUG, "MPSK-RADIUS: pw->pt=%p", pw->pt);
++		if (!pw->pt) {
++			wpa_printf(MSG_WARNING,
++				   "MPSK-RADIUS: sae_derive_pt failed for "
++				   MACSTR, MAC2STR(sta->addr));
++			str_clear_free(pw->password);
++			os_free(pw);
++			goto mpsk_done;
++		}
++
++		/* Replace an existing entry for the same STA, or append. */
++		prev_entry = NULL;
++		entry = hapd->conf->sae_passwords;
++		for (;;) {
++			if (entry == NULL) {
++				if (prev_entry)
++					prev_entry->next = pw;
++				else
++					hapd->conf->sae_passwords = pw;
++				sta->radius_sae_pw = pw;
++				wpa_printf(MSG_DEBUG,
++					   "MPSK-RADIUS: added new sae_passwords entry");
++				break;
++			}
++
++			if (os_memcmp(entry->peer_addr, pw->peer_addr,
++				      ETH_ALEN) == 0) {
++				entry_len = os_strlen(entry->password);
++				pw_len = os_strlen(pw->password);
++
++				if (entry_len == pw_len &&
++				    os_memcmp_const(entry->password,
++						    pw->password,
++						    entry_len) == 0) {
++					wpa_printf(MSG_DEBUG,
++						   "MPSK-RADIUS: password unchanged, no update");
++					if (pw->pt)
++						sae_deinit_pt(pw->pt);
++					str_clear_free(pw->password);
++					os_free(pw);
++					sta->radius_sae_pw = entry;
++					break;
++				}
++
++				pw->next = entry->next;
++				if (prev_entry)
++					prev_entry->next = pw;
++				else
++					hapd->conf->sae_passwords = pw;
++				if (entry->pt)
++					sae_deinit_pt(entry->pt);
++#ifdef CONFIG_SAE_PK
++				if (entry->pk)
++					sae_deinit_pk(entry->pk);
++#endif
++				str_clear_free(entry->password);
++				os_free(entry->identifier);
++				os_free(entry);
++
++				sta->radius_sae_pw = pw;
++				wpa_printf(MSG_DEBUG,
++					   "MPSK-RADIUS: replaced sae_passwords entry");
++				break;
++			}
++
++			prev_entry = entry;
++			entry = entry->next;
++		}
++	}
++
++mpsk_done:
++#endif /* CONFIG_SAE */
+ 	if (sta->vlan_id)
+ 		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_RADIUS,
+ 			       HOSTAPD_LEVEL_INFO, "VLAN ID %d", sta->vlan_id);
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index 51f9a5a..4fc7f84 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -469,6 +469,49 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ 	ap_sta_free_sta_profile(&sta->mld_info);
+ #endif /* CONFIG_IEEE80211BE */
+ 
++#ifdef CONFIG_SAE
++	/*
++	 * MPSK-RADIUS: remove and free the dynamically-added SAE password
++	 * entry for this STA from the shared hapd->conf->sae_passwords
++	 * list. Without this, the entry (cleartext passphrase + PT) would
++	 * leak for every RADIUS-authenticated STA and stay resident long
++	 * after the STA is gone.
++	 *
++	 * Timing safety: on config reload, hostapd_clear_old_bss() flushes
++	 * all STAs (via hostapd_free_stas -> ap_free_sta) BEFORE the old
++	 * conf is freed -- hostapd_config_free(oldconf) runs only after
++	 * hapd->conf is reassigned to the new conf. So when we reach here,
++	 * the entry pointed to by sta->radius_sae_pw is still alive in the
++	 * list. The pointer-comparison search (rather than a direct
++	 * dereference) is defensive: it locates the node's predecessor for
++	 * safe unlinking and would no-op gracefully if a future code path
++	 * ever cleared the list first -- never a double free. Set to NULL
++	 * after removal.
++	 */
++	if (sta->radius_sae_pw) {
++		struct sae_password_entry **pp, *victim = sta->radius_sae_pw;
++
++		pp = &hapd->conf->sae_passwords;
++		while (*pp) {
++			if (*pp == victim) {
++				*pp = victim->next;
++				if (victim->pt)
++					sae_deinit_pt(victim->pt);
++#ifdef CONFIG_SAE_PK
++				if (victim->pk)
++					sae_deinit_pk(victim->pk);
++#endif
++				str_clear_free(victim->password);
++				os_free(victim->identifier);
++				os_free(victim);
++				break;
++			}
++			pp = &(*pp)->next;
++		}
++		sta->radius_sae_pw = NULL;
++	}
++
++#endif /* CONFIG_SAE */
+ #ifdef CONFIG_TESTING_OPTIONS
+ 	os_free(sta->sae_postponed_commit);
+ 	forced_memzero(sta->last_tk, WPA_TK_MAX_LEN);
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index aea7057..2713839 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -226,6 +226,15 @@ struct sta_info {
+ #ifdef CONFIG_SAE
+ 	struct sae_data *sae;
+ 	unsigned int mesh_sae_pmksa_caching:1;
++	/*
++	 * MPSK-RADIUS: SAE password entry dynamically added for this STA
++	 * to hapd->conf->sae_passwords. On config reload, STAs are flushed
++	 * (ap_free_sta) before the conf is freed, so this pointer stays
++	 * valid while the STA exists. Used as a search key in ap_free_sta()
++	 * to locate and unlink the entry from the list; set to NULL after
++	 * removal.
++	 */
++	struct sae_password_entry *radius_sae_pw;
+ #endif /* CONFIG_SAE */
+ 
+ 	/* valid only if session_timeout_set == 1 */
+diff --git a/src/ap/wpa_auth.c b/src/ap/wpa_auth.c
+index ffb88a0..ca81a4d 100644
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -40,6 +40,7 @@
+ #define STATE_MACHINE_ADDR wpa_auth_get_spa(sm)
+ #define KDE_ALL_LINKS 0xffff
+ 
++#define MAX_RADIUS_TRIES 3
+ 
+ static void wpa_send_eapol_timeout(void *eloop_ctx, void *timeout_ctx);
+ static int wpa_sm_step(struct wpa_state_machine *sm);
+@@ -3827,6 +3828,24 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 	if (!ok && wpa_key_mgmt_wpa_psk_no_sae(sm->wpa_key_mgmt) &&
+ 	    wpa_auth->conf.radius_psk && wpa_auth->cb->request_radius_psk &&
+ 	    !sm->waiting_radius_psk) {
++		/*
++		 * Prevent infinite RADIUS PSK query loops: if we have already
++		 * asked the RADIUS server MAX_RADIUS_TRIES times for this
++		 * state machine without obtaining a usable PSK, give up and
++		 * disconnect the STA rather than retrying forever.
++		 *
++		 * radius_tries is os_zalloc-initialised to 0 when the state
++		 * machine is created and is destroyed together with the sm on
++		 * STA disconnect, so a new association always starts fresh.
++		 */
++		if (sm->radius_tries >= MAX_RADIUS_TRIES) {
++			wpa_printf(MSG_DEBUG,
++				   "Too many RADIUS PSK tries (%u) - disconnect",
++				   sm->radius_tries);
++			wpa_sta_disconnect(wpa_auth, sm->addr,
++					   WLAN_REASON_PREV_AUTH_NOT_VALID);
++			goto out;
++		}
+ 		wpa_printf(MSG_DEBUG, "No PSK available - ask RADIUS server");
+ 		wpa_auth->cb->request_radius_psk(wpa_auth->cb_ctx, sm->addr,
+ 						 sm->wpa_key_mgmt,
+@@ -3834,6 +3853,11 @@ SM_STATE(WPA_PTK, PTKCALCNEGOTIATING)
+ 						 sm->last_rx_eapol_key,
+ 						 sm->last_rx_eapol_key_len);
+ 		sm->waiting_radius_psk = 1;
++		/*
++		 * Count this attempt only when we actually issue a new
++		 * RADIUS PSK request, not on every state entry.
++		 */
++		sm->radius_tries++;
+ 		goto out;
+ 	}
+ 
+diff --git a/src/ap/wpa_auth_i.h b/src/ap/wpa_auth_i.h
+index 0aa25b9..94c7d64 100644
+--- a/src/ap/wpa_auth_i.h
++++ b/src/ap/wpa_auth_i.h
+@@ -100,6 +100,7 @@ struct wpa_state_machine {
+ 	unsigned int spp_amsdu:1;
+ 
+ 	unsigned int ptkstart_without_success;
++	unsigned int radius_tries;
+ 
+ #ifdef CONFIG_OCV
+ 	int ocv_enabled;
