@@ -152,6 +152,24 @@ hostapd_get_list() {
 	done
 }
 
+# A board can declare the 6 GHz regulatory power type it is to run as in
+# /etc/board.json, as wlan.defaults.he_6ghz_reg_pwr_type in hostapd's numbering:
+# 0 for indoor (LPI), 2 for very low power. It stands in for the value the
+# configuration renderer emits whenever the configuration has not asked for AFC
+# standard power, the only case in which that value is a deliberate choice
+# rather than the renderer's fall-through. Raw hostapd options are appended
+# after it and still win. Boards that declare nothing are unaffected.
+hostapd_board_6ghz_pwr_type() {
+	local def
+
+	[ "$band" = "6g" ] || return
+	[ "$afc" -gt 0 ] && return
+	def=$(jsonfilter -i /etc/board.json -e '@.wlan.defaults.he_6ghz_reg_pwr_type' 2>/dev/null)
+	case "$def" in
+		0|2) he_6ghz_reg_pwr_type=$def;;
+	esac
+}
+
 hostapd_prepare_device_config() {
 	local config="$1"
 	local driver="$2"
@@ -311,6 +329,7 @@ hostapd_prepare_device_config() {
 
 		he_6ghz_reg_pwr_type=1
 	}
+	hostapd_board_6ghz_pwr_type
 	[ -n "$he_6ghz_reg_pwr_type" ] && append base_cfg "he_6ghz_reg_pwr_type=$he_6ghz_reg_pwr_type" "$N"
 
 	json_get_values opts hostapd_options
