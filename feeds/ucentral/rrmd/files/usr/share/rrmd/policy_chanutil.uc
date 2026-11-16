@@ -83,7 +83,13 @@ function random_time_calc() {
     fp_SN.close();
 
     if (device_SN) {
-        unique_random = (match(trim(device_SN), /^(SN=EC)(\d+)/)[2]);
+        if (match(trim(device_SN), /^(SN=EC)(\d+)/)) {
+            unique_random = (match(trim(device_SN), /^(SN=EC)(\d+)/)[2]);
+        } else if (match(trim(device_SN), /^(SN=RAP[A-Z0-9]*[A-Z])(\d+)$/i)) {
+            unique_random = (match(trim(device_SN), /^(SN=RAP[A-Z0-9]*[A-Z])(\d+)$/i)[2]);
+        } else {
+            sn_flag = 1;
+        }
     } else {
         command = "fw_printenv serial_number";
         let fp_serial_num = fs.popen(command);
@@ -91,7 +97,13 @@ function random_time_calc() {
         fp_serial_num.close();
 
         if (device_SN) {
-            unique_random = (match(trim(device_SN), /^(serial_number=EC)(\d+)/)[2]);
+            if (match(trim(device_SN), /^(serial_number=EC)(\d+)/)) {
+                unique_random = (match(trim(device_SN), /^(serial_number=EC)(\d+)/)[2]);
+            } else if (match(trim(device_SN), /^(serial_number=RAP[A-Z0-9]*[A-Z])(\d+)$/i)) {
+                unique_random = (match(trim(device_SN), /^(serial_number=RAP[A-Z0-9]*[A-Z])(\d+)$/i)[2]);
+            } else {
+                sn_flag = 1;
+            }
         } else {
             // If there's no valid SN, set a flag to get fixed random
             sn_flag = 1;
