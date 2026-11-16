@@ -1,0 +1,127 @@
+#!/bin/sh /etc/rc.common
+# Copyright (C) 2007 OpenWrt.org
+
+#start after dbus (60)
+START=62
+USE_PROCD=1
+
+DEF_DIR="/etc/default"
+LOG_DIR="/var/log"
+RUN_DIR="/var/run"
+SYSINFO_DIR="/var/sysinfo"
+GPIO_DIR="/sys/class/gpio"
+FW_DIR="/etc/ble_fw/ti"
+FW_NCP="ble5_host_test_sdk8_3_bd9.bin"
+
+DEV_VENDOR="$(cat $SYSINFO_DIR/board_name | awk -F, '{print $1}')"
+DEV_MODEL="$(cat $SYSINFO_DIR/board_name | awk -F, '{print $2}')"
+
+# Drive a Linux GPIO as an output at a PHYSICAL level.
+#
+# Every sysfs write is checked. An unchecked write here is a silent no-op, and
+# that is precisely how the BLE MCU sat held in reset through several rounds of
+# debugging without anything logging a single word: the old tisbl.sh wrote to
+# /sys/class/gpio/gpio496/value, which did not exist, and ignored the result.
+gpio_out() {
+	_n=$1
+	_v=$2
+
+	[ -n "$_n" ] || return 1
+
+	if [ ! -d "$GPIO_DIR/gpio$_n" ]; then
+		echo "$_n" > "$GPIO_DIR/export" 2>/dev/null || return 1
+		[ -d "$GPIO_DIR/gpio$_n" ] || return 1
+	fi
+
+	echo out   > "$GPIO_DIR/gpio$_n/direction" 2>/dev/null || return 1
+	echo "$_v" > "$GPIO_DIR/gpio$_n/value"     2>/dev/null || return 1
+}
+
+start_service() {
+	config_load ble_chip
+	config_get vendor      $DEV_MODEL vendor
+	config_get model       $DEV_MODEL model
+	config_get firmware    $DEV_MODEL firmware
+	config_get tty         $DEV_MODEL tty
+	config_get baudrate    $DEV_MODEL baudrate
+	config_get resetpin    $DEV_MODEL resetpin
+	config_get backdoorpin $DEV_MODEL backdoorpin
+	config_get wdt_enabled $DEV_MODEL wdt_enabled
+	config_get sw_rstpin   $DEV_MODEL sw_rstpin
+
+	case $(echo "$model") in
+	CC2652R1)
+		tichip="2652"
+		;;
+	esac
+
+	# Put the chip in a known-good state before anything else touches it:
+	# MCU running, application selected (not the ROM serial bootloader).
+	#
+	# PHYSICAL levels, measured on EAP104 with BLE working. Verify on a new
+	# board; see the mcu_pins comment in qcom-ipq5018-eap104.dts.
+	#
+	#     resetpin     HIGH = running           LOW = held in reset
+	#     backdoorpin  HIGH = run application   LOW = ROM serial bootloader
+	#
+	# The mcu_pins pinctrl hog in the device tree sets the same two levels at
+	# kernel start. This is the backstop, not a duplicate: that hog was
+	# measured inert in one build and fully applied in the next, with nothing
+	# in it changed -- its liveness follows driver probe order. Unlike the hog,
+	# this reports when it cannot do its job.
+	gpio_out "$resetpin" 1 || \
+		logger -st ble_chip "cannot drive resetpin '$resetpin' -- MCU may be held in reset"
+	gpio_out "$backdoorpin" 1 || \
+		logger -st ble_chip "cannot drive backdoorpin '$backdoorpin' -- MCU may stay in the ROM bootloader"
+
+	# sw_rstpin is passed through as before, because this file is shared by
+	# every CC2652R1 board and some of them use it. The per-board difference
+	# belongs in /etc/config/ble_chip, not in a model branch here: a board that
+	# must not pulse a switch reset simply does not set the option, and nothing
+	# in this script has to know which board it is running on.
+	#
+	# What changed is that tisbl.sh no longer trusts the value. It reads the
+	# pin's mux owner out of /sys/kernel/debug/pinctrl/*/pinmux-pins and refuses
+	# any pin a peripheral driver has muxed, which is a check /sys/class/gpio/
+	# export cannot perform: pinctrl-msm is not strict, so exporting a pin
+	# another driver owns succeeds and then silently overrides it.
+	#
+	# On EAP104 this option was 501. With the gpiochip base at 465 that is
+	# TLMM 36 = MDC, the MDIO clock shared by the QCA8337 switch and its four
+	# PHYs; driving it as a static output stopped MDIO, so ethernet died and
+	# shutdown hung. The switch reset belongs to the ess-switch driver
+	# (reset_gpio, TLMM 39) and no BLE script should hold it. That value must be
+	# removed from UCI -- tisbl.sh will now refuse it loudly, but refusing is
+	# not the same as being configured correctly.
+	tisbl.sh "$tty" "$baudrate" "$tichip" "$firmware" "$resetpin" "$backdoorpin" \
+		"$sw_rstpin" || \
+		logger -st ble_chip "tisbl.sh failed -- BLE firmware may not be usable"
+
+	sleep 1
+
+	# `=` not `==`: == is a bashism that busybox ash only tolerates.
+	if [ "$wdt_enabled" = "1" ]; then
+		if [ "$(ps | grep '[w]dt_touch.sh')" ]; then
+			wdt_touch.sh active
+		else
+			# Kept as-is. This closes an fd the backgrounded child would
+			# otherwise inherit, and multi-digit descriptors are not portable
+			# to POSIX sh -- the same class of bug that made tisbl.sh's
+			# `exec 100>` silently fail. Left alone deliberately because its
+			# purpose here is not understood well enough to remove safely.
+			exec 1000>&-
+			wdt_touch.sh >/dev/null 2>&1 &
+		fi
+	fi
+}
+
+reload_service()
+{
+	stop
+	start
+}
+
+service_triggers()
+{
+	procd_add_reload_trigger "ble_chip"
+}
