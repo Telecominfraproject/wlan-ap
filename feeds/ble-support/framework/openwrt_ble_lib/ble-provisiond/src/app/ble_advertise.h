@@ -21,6 +21,36 @@
 #define BLE_ADV_MFR_DATA_MAX    28
 #define BLE_ADV_NAME_MAX        32
 
+/*
+ * Advertising interval, in milliseconds, for the provisioning advertisement.
+ *
+ * Until this was set the daemon offered no interval at all, so bluetoothd passed
+ * 0 to MGMT and the kernel applied its own default: 1280 ms for a connectable
+ * advertisement and 62.5 ms for a non-connectable one. Measured consequence on
+ * eap102, where the kernel time-rotates two advertisements onto one hardware set
+ * in 2-second slots: the provisioning advertisement transmitted 1.6 times per
+ * slot and a scanner 1 m away received it 6 times in 62 s against the beacon's
+ * 148. Both were on the air; the provisioning one was effectively undiscoverable.
+ *
+ * 100 ms gives roughly 20 transmissions per slot. These boards are mains
+ * powered, so the airtime is affordable and discovery latency is what matters.
+ *
+ * Deliberately not a UCI option. /etc/config/ble is restored to the package copy
+ * during a configuration apply (§19.9.9), which is why model_id is derived
+ * rather than configured (8.24) — a per-board value here would silently revert.
+ */
+#define BLE_ADV_PROV_INTERVAL_MS   100
+
+/*
+ * Range BlueZ accepts for MinInterval/MaxInterval on org.bluez.LEAdvertisement1.
+ * Out-of-range values make RegisterAdvertisement fail outright, and the beacon
+ * interval is reachable from UCI (ble.ibeacon.interval), so values are clamped
+ * rather than passed through. A silently non-advertising beacon is the failure
+ * mode this package keeps having to hunt down.
+ */
+#define BLE_ADV_INTERVAL_MIN_MS    20
+#define BLE_ADV_INTERVAL_MAX_MS    10485000
+
 typedef enum {
 	BLE_ADV_TYPE_PERIPHERAL = 0,  /* connectable, for GATT server */
 	BLE_ADV_TYPE_BROADCAST,       /* non-connectable, for iBeacon */
@@ -43,6 +73,14 @@ typedef struct {
 	uint16_t mfr_company_id;              /* 0x004C for Apple */
 	uint8_t mfr_data[BLE_ADV_MFR_DATA_MAX];
 	uint8_t mfr_data_len;
+	/*
+     * Requested advertising interval in milliseconds, published as
+     * MinInterval/MaxInterval. 0 means "offer nothing and let the kernel pick",
+     * which is what every instance did before and is still the behaviour for any
+     * future caller that does not set it.
+     */
+	uint32_t min_interval_ms;
+	uint32_t max_interval_ms;
 	/* D-Bus path */
 	char path[64];
 } ble_adv_instance_t;
@@ -97,10 +135,21 @@ int ble_adv_update_mfr_data(int instance_id, const uint8_t *data, uint8_t len);
  * @param major       iBeacon major value.
  * @param minor       iBeacon minor value.
  * @param tx_power    Measured power at 1m (dBm).
+ * @param interval_ms Advertising interval in milliseconds, clamped to
+ *                    [BLE_ADV_INTERVAL_MIN_MS, BLE_ADV_INTERVAL_MAX_MS].
+ *                    0 leaves the choice to the kernel, which is what happened
+ *                    before this parameter existed.
  * @return instance id (>0) on success, negative on error.
+ *
+ * The interval is a parameter rather than a constant because ble.ibeacon.interval
+ * already exists in UCI and was being read into ble_beacon_config_t and then
+ * dropped: on the BlueZ path ble_beacon_start() does nothing with it, so the
+ * option had no effect and said so nowhere. Passing it here is what makes the
+ * documented option work.
  */
 int ble_adv_start_ibeacon(const uint8_t uuid_bytes[16],
-						  uint16_t major, uint16_t minor, int8_t tx_power);
+						  uint16_t major, uint16_t minor, int8_t tx_power,
+						  uint32_t interval_ms);
 
 /**
  * Stop and unregister an advertisement instance.

@@ -167,10 +167,10 @@ static uint16_t s_hci_len = 0;
  *
  * The TI multi_role firmware forwards phone GATT activity to the host using
  * NPI GATT frames: SOF(0xFE) LEN(2 LE) CMD0(0xA2) CMD1 PAYLOAD FCS.
- * These frames are interleaved on the same UART
- * as the HCI-format scan events. When parse_rx detects such a frame it hands
- * the decoded (cmd1, payload) to a bridge callback registered by the daemon's
- * npi_gatt_handler. FCS = XOR of LEN_LO..end-of-payload.
+ * These frames are interleaved on the same UART as the HCI-format scan events.
+ * When parse_rx detects such a frame, it hands the decoded (cmd1, payload) to a
+ * bridge callback registered by the daemon's npi_gatt_handler.
+ * FCS = XOR of LEN_LO..end-of-payload.
  */
 #define NPI_GATT_SOF        0xFE
 #define NPI_GATT_CMD0       0xA2

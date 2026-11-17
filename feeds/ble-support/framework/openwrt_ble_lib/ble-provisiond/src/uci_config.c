@@ -4,25 +4,25 @@
  * @brief UCI configuration reader for ble-provisiond.
  *
  * Boot sequence:
- *   1. Read /var/sysinfo/board_name → "vendor,model" (e.g. "edgecore,eap104")
- *   2. Extract model part after comma → "eap104"
- *   3. Use model as UCI section name: uci get ble_chip.eap104.tty
+ *   1. Read /var/sysinfo/board_name → "vendor,model" (e.g. "edgecore,eap115")
+ *   2. Extract model part after comma → "eap115"
+ *   3. Use model as UCI section name: uci get ble_chip.eap115.tty
  *   4. Load all chip parameters from that section
  *   5. Auto-detect chip_profile from vendor/model fields
  *
  * UCI package: /etc/config/ble_chip
  *
  * Example:
- *   config ble_chip 'eap104'
+ *   config ble_chip 'eap115'
  *       option enabled '1'
- *       option vendor 'ti'
- *       option model 'CC2652R1'
- *       option firmware '/etc/ble_fw/ti/ble5_multi_role_sdk8_33_bd9.bin'
+ *       option vendor 'nordic'
+ *       option model 'NRF54L15'
+ *       option firmware '/etc/ble_fw/nordic/zephyr_hci_uart_291.signed.bin'
  *       option fw_loaded ''
- *       option tty '/dev/ttyMSM1'
+ *       option tty '/dev/ttyS2'
  *       option baudrate '115200'
- *       option resetpin '496'
- *       option backdoorpin '500'
+ *       option resetpin '542'
+ *       option backdoorpin '541'
  *       option wdt_enabled '0'
  */
 
@@ -49,9 +49,9 @@
 /**
  * @brief Read /var/sysinfo/board_name and extract the model part.
  *
- * File content example: "edgecore,eap104\n"
+ * File content example: "edgecore,eap115\n"
  * → board_vendor = "edgecore"
- * → board_model  = "eap104"  (used as UCI section name)
+ * → board_model  = "eap115"  (used as UCI section name)
  *
  * @param vendor_out  Output buffer for vendor string.
  * @param vendor_sz   Size of vendor buffer.
@@ -130,9 +130,9 @@ static ble_chip_t detect_chip_profile(const char *ble_vendor, const char *ble_mo
  * @brief Load BLE configuration from UCI using board_name auto-detection.
  *
  * Flow:
- *   1. Read /var/sysinfo/board_name → extract model (e.g. "eap104")
+ *   1. Read /var/sysinfo/board_name → extract model (e.g. "eap115")
  *   2. Open UCI package "ble_chip"
- *   3. Look up section by model name: ble_chip.eap104
+ *   3. Look up section by model name: ble_chip.eap115
  *   4. Read all chip options from that section
  *   5. Set device_path, baud_rate, chip_profile accordingly
  *

@@ -152,6 +152,33 @@ static DBusHandlerResult adv_message_handler(DBusConnection *conn,
 			dbus_message_iter_close_container(&dict, &entry);
 		}
 
+		/*
+         * MinInterval / MaxInterval — uint32 milliseconds.
+         *
+         * Offered only when set, so an instance that leaves them at 0 keeps the
+         * previous behaviour of letting the kernel choose. That matters because
+         * the kernel's choice is not neutral: 1280 ms for connectable and
+         * 62.5 ms for non-connectable, a 20x difference that starved the
+         * provisioning advertisement to 4% of the air on eap102.
+         *
+         * Both are published with the same value. The pair is a range the
+         * controller may pick within, and nothing here benefits from letting it
+         * drift, while an inverted pair makes RegisterAdvertisement fail.
+         */
+		if (inst->min_interval_ms > 0 && inst->max_interval_ms > 0) {
+			static const char *ivl_keys[2] = { "MinInterval", "MaxInterval" };
+			uint32_t ivl_vals[2] = { inst->min_interval_ms, inst->max_interval_ms };
+			for (int k = 0; k < 2; k++) {
+				DBusMessageIter entry, variant;
+				dbus_message_iter_open_container(&dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+				dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &ivl_keys[k]);
+				dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "u", &variant);
+				dbus_message_iter_append_basic(&variant, DBUS_TYPE_UINT32, &ivl_vals[k]);
+				dbus_message_iter_close_container(&entry, &variant);
+				dbus_message_iter_close_container(&dict, &entry);
+			}
+		}
+
 		dbus_message_iter_close_container(&iter, &dict);
 		dbus_connection_send(conn, reply, NULL);
 		dbus_message_unref(reply);
@@ -285,8 +312,31 @@ static int register_advertisement_once(ble_adv_instance_t *inst)
 	}
 
 	dbus_message_unref(reply);
+	/*
+     * This line is a contract, not just a message. BCN-009, BCN-010 and BCN-011
+     * all match on `registered (type=broadcast)` with the closing parenthesis
+     * included, and so do the investigation probes. Adding a field inside the
+     * parentheses would make every one of them silently stop matching — a
+     * presence check would fail for the wrong reason and an absence check would
+     * pass for the wrong reason, which is the trap the deploy guard at the top of
+     * 12_beacon.sh exists for. So it stays byte-identical and the interval goes
+     * on its own line below.
+     */
 	syslog(LOG_INFO, "ble_adv: instance %d registered (type=%s)",
 		   inst->id, inst->type == BLE_ADV_TYPE_PERIPHERAL ? "peripheral" : "broadcast");
+
+	/*
+     * Logged separately because the interval is otherwise invisible from the
+     * host: what we requested appears only in MGMT, and what the controller was
+     * programmed with appears only in btmon. This records our half, so a wrong
+     * value can be told apart from a value BlueZ discarded. It does not prove
+     * the interval reached the radio — BlueZ has been reported to drop
+     * MinInterval/MaxInterval in some versions, and only a second device
+     * scanning can settle that.
+     */
+	if (inst->min_interval_ms > 0)
+		syslog(LOG_INFO, "ble_adv: instance %d interval requested %u ms",
+			   inst->id, inst->min_interval_ms);
 	return 0;
 }
 
@@ -371,6 +421,38 @@ static void unregister_advertisement(ble_adv_instance_t *inst)
 
 /* ── Allocate an instance slot ── */
 
+/*
+ * Clamp a requested interval into the range BlueZ accepts.
+ *
+ * Out-of-range values do not degrade gracefully: BlueZ fails the whole
+ * RegisterAdvertisement, so the advertisement simply never happens. The beacon
+ * interval comes from UCI (ble.ibeacon.interval), so a typo there would
+ * otherwise silence the beacon with nothing to connect cause to effect — the
+ * failure mode §19.9.7 and §19.9.13 each cost several wrong hypotheses. Clamp
+ * and say so instead.
+ *
+ * 0 is passed through untouched and means "offer no interval", which leaves the
+ * kernel default in place.
+ */
+static uint32_t adv_clamp_interval(uint32_t ms, int instance_hint)
+{
+	if (ms == 0)
+		return 0;
+	if (ms < BLE_ADV_INTERVAL_MIN_MS) {
+		syslog(LOG_WARNING, "ble_adv: interval %u ms below the %u ms BlueZ minimum "
+			   "(instance %d) — using %u ms",
+			   ms, BLE_ADV_INTERVAL_MIN_MS, instance_hint, BLE_ADV_INTERVAL_MIN_MS);
+		return BLE_ADV_INTERVAL_MIN_MS;
+	}
+	if (ms > BLE_ADV_INTERVAL_MAX_MS) {
+		syslog(LOG_WARNING, "ble_adv: interval %u ms above the %u ms BlueZ maximum "
+			   "(instance %d) — using %u ms",
+			   ms, BLE_ADV_INTERVAL_MAX_MS, instance_hint, BLE_ADV_INTERVAL_MAX_MS);
+		return BLE_ADV_INTERVAL_MAX_MS;
+	}
+	return ms;
+}
+
 static ble_adv_instance_t *alloc_instance(void)
 {
 	for (int i = 0; i < BLE_ADV_MAX_INSTANCES; i++) {
@@ -425,6 +507,15 @@ int ble_adv_start_connectable(const char *local_name,
 	}
 
 	inst->type = BLE_ADV_TYPE_PERIPHERAL;
+	/*
+     * A fixed interval rather than the kernel default of 1280 ms. This is the
+     * advertisement a phone has to find before anything else can happen, and at
+     * 1280 ms it transmitted 1.6 times per 2-second rotation slot on eap102 —
+     * six receptions in 62 seconds from a scanner a metre away. See
+     * BLE_ADV_PROV_INTERVAL_MS.
+     */
+	inst->min_interval_ms = adv_clamp_interval(BLE_ADV_PROV_INTERVAL_MS, inst->id);
+	inst->max_interval_ms = inst->min_interval_ms;
 	if (local_name)
 		strncpy(inst->local_name, local_name, BLE_ADV_NAME_MAX - 1);
 	inst->include_tx_power = true;
@@ -591,7 +682,8 @@ int ble_adv_update_mfr_data(int instance_id, const uint8_t *data, uint8_t len)
 }
 
 int ble_adv_start_ibeacon(const uint8_t uuid_bytes[16],
-						  uint16_t major, uint16_t minor, int8_t tx_power)
+						  uint16_t major, uint16_t minor, int8_t tx_power,
+						  uint32_t interval_ms)
 {
 	if (!adv_ctx.initialized) return -EINVAL;
 
@@ -600,6 +692,17 @@ int ble_adv_start_ibeacon(const uint8_t uuid_bytes[16],
 		syslog(LOG_ERR, "ble_adv: no free instance slots");
 		return -ENOMEM;
 	}
+
+	/*
+     * From ble.ibeacon.interval, which the daemon has always read and then
+     * discarded on this path: ble_beacon_start() does nothing with it when no
+     * chip profile is active, and this function had no interval parameter, so
+     * the option silently had no effect. The kernel was instead applying its own
+     * 62.5 ms for a non-connectable advertisement — twenty times faster than the
+     * provisioning advertisement next to it.
+     */
+	inst->min_interval_ms = adv_clamp_interval(interval_ms, inst->id);
+	inst->max_interval_ms = inst->min_interval_ms;
 
 	/*
      * Broadcast, i.e. non-connectable. This used to be PERIPHERAL, with the
@@ -678,7 +781,8 @@ void ble_adv_stop(int instance_id)
  * twice deleted exactly that kind of cache after it went stale — adv_refresh()'s
  * byte cache (§19.6.1) and `model_id_derived` in adv_status.c. The search is
  * unambiguous because BLE_ADV_TYPE_BROADCAST is assigned in exactly one place,
- * ble_adv_start_ibeacon() above (ble_advertise.c:630); a second kind of
+ * ble_adv_start_ibeacon() above (no line number on purpose: the one that was
+ * here drifted within a single editing session); a second kind of
  * broadcast advertisement would
  * need a discriminator of its own rather than a type match.
  */

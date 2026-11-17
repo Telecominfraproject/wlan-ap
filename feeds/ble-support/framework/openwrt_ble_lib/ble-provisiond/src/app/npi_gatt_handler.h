@@ -12,7 +12,7 @@
  * Only the uCentral Provisioning v2 service is supported. The legacy 16-bit
  * FE00/FE10 services have been retired on both transports.
  *
- * Characteristic addressing
+ * ── Characteristic addressing ──
  * The bridge carries the COMPLETE 16-byte characteristic UUID in every
  * CHAR_WRITE / CHAR_READ / NOTIFY / READ_RSP frame — not a 16-bit alias and not
  * an ATT handle index. This costs 16 bytes per frame but keeps the protocol
