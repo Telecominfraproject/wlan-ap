@@ -921,6 +921,19 @@ EXPORT int ble_beacon_start(const ble_beacon_config_t *config)
          * module (LEAdvertisingManager1 API) at the application layer.
          * libble just marks beacon as active; actual advertising is started
          * by ibeacon_app via ble_adv_start_ibeacon() in ble-provisiond.
+         *
+         * So BLE_OK and BLE_STATE_ADVERTISING below record an intent, not an
+         * advertisement. Nothing has been sent anywhere at this point and this
+         * function cannot know whether anything will be: the D-Bus registration
+         * happens after it returns. That is a contract on the caller — if the
+         * registration fails it must call ble_beacon_stop() to undo this, which
+         * is what ubus_api.c and ibeacon_app.c now do.
+         *
+         * Worth stating because it was not, and the cost was real: both callers
+         * used to log the registration failure and discard it, so the ubus reply
+         * and the status file both reported "advertising" on a board whose
+         * controller had refused the advertisement. BCN-001..008 were green for
+         * the whole of that, because they trust those two sources.
          */
 	}
 

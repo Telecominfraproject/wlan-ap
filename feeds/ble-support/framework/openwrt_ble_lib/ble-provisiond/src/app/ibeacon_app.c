@@ -87,24 +87,53 @@ static int ibeacon_start(void)
 {
 	ble_uuid_parse(beacon_config.uuid, beacon_config.uuid_bytes);
 	int ret = ble_beacon_start(&beacon_config);
-	if (ret == 0) {
-		extern void app_status_set_ibeacon_active(bool);
-		app_status_set_ibeacon_active(true);
-	}
+	if (ret != 0)
+		return ret;
+
+	/*
+     * app_status_set_ibeacon_active(true) used to be called here, before the
+     * D-Bus registration below had even been attempted. On the BlueZ path
+     * ble_beacon_start() only does bookkeeping, so the status file announced an
+     * active beacon that nothing had yet tried to put on the air — and when the
+     * registration then failed, the file was never corrected. It is set after
+     * the registration now, and only if the registration worked.
+     */
 
 	/* On BlueZ transport, also register LE advertisement via D-Bus */
 	const char *transport = ble_get_transport_name();
 	if (transport && strcmp(transport, "bluez") == 0) {
 		extern int ble_adv_start_ibeacon(const uint8_t uuid_bytes[16],
-										 uint16_t major, uint16_t minor, int8_t tx_power);
+										 uint16_t major, uint16_t minor, int8_t tx_power,
+										 uint32_t interval_ms);
+		/*
+         * interval_ms comes from ble.ibeacon.interval via ibeacon_init(). Until
+         * ble_adv_start_ibeacon() took it, this value reached libble and was
+         * dropped there on the BlueZ path, so the UCI option did nothing.
+         */
 		int adv_ret = ble_adv_start_ibeacon(beacon_config.uuid_bytes,
 											beacon_config.major,
 											beacon_config.minor,
-											beacon_config.tx_power);
-		if (adv_ret < 0)
-			syslog(LOG_WARNING, "ibeacon: LE advertising registration failed: %d", adv_ret);
+											beacon_config.tx_power,
+											beacon_config.interval_ms);
+		if (adv_ret < 0) {
+			/*
+             * Roll back rather than report a beacon that is not there. This is
+             * the autostart path, reached at boot when ble.ibeacon.enabled is 1,
+             * and it has no test covering it — so a wrong status here would be
+             * carried by the status file and the start-up log with nothing to
+             * contradict it.
+             */
+			syslog(LOG_ERR, "ibeacon: LE advertising registration failed (%d) — "
+				   "the beacon is NOT advertising", adv_ret);
+			ble_beacon_stop();
+			return BLE_ERR_IO;
+		}
 	}
 
+	{
+		extern void app_status_set_ibeacon_active(bool);
+		app_status_set_ibeacon_active(true);
+	}
 	return ret;
 }
 

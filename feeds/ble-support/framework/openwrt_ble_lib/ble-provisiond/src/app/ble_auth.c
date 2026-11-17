@@ -4,9 +4,9 @@
  * @file ble_auth.c
  * @brief Application-layer authentication for GATT provisioning v2.
  *
- * See ble_auth.h. Mirrors the reference phone
- * app's behaviour: verify a plaintext credential against the /etc/shadow
- * root hash with crypt_r(), fail-closed, re-read every call.
+ * See ble_auth.h. Mirrors the reference phone app's behaviour: verify a
+ * plaintext credential against the /etc/shadow root hash with crypt_r(),
+ * fail-closed, re-read every call.
  */
 
 #define _GNU_SOURCE

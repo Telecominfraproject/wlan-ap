@@ -147,12 +147,39 @@ static int ubus_beacon_start(struct ubus_context *ctx, struct ubus_object *obj,
 	const char *transport = ble_get_transport_name();
 	if (ret == BLE_OK && transport && strcmp(transport, "bluez") == 0) {
 		extern int ble_adv_start_ibeacon(const uint8_t uuid_bytes[16],
-										 uint16_t major, uint16_t minor, int8_t tx_power);
+										 uint16_t major, uint16_t minor, int8_t tx_power,
+										 uint32_t interval_ms);
+		/*
+         * config.interval_ms is the `interval` field of the ubus call, or 100 by
+         * default. It was previously handed to libble and discarded on this path.
+         */
 		int adv_ret = ble_adv_start_ibeacon(config.uuid_bytes,
 											config.major, config.minor,
-											config.tx_power);
-		if (adv_ret < 0)
-			syslog(LOG_WARNING, "beacon: LE adv registration failed: %d", adv_ret);
+											config.tx_power,
+											config.interval_ms);
+		/*
+         * This result used to be logged at warning level and then discarded, so
+         * the reply was built from `ret` alone — and on the BlueZ path `ret` is
+         * libble's, which does nothing here beyond bookkeeping and therefore
+         * always says BLE_OK. The API consequently reported "advertising" on a
+         * board where the controller had refused the advertisement outright, and
+         * went on doing so for every one of twelve start/stop cycles.
+         *
+         * That lie is why BCN-001 through BCN-008 were all green on eap105 while
+         * nothing was ever on the air: every one of them trusts either this reply
+         * or the status file. Only BCN-009 and BCN-010, which read the daemon's
+         * own advertising log, saw the truth.
+         *
+         * So the failure is now reported, and libble's bookkeeping is rolled back
+         * with ble_beacon_stop() so ble_beacon_is_active() does not claim an
+         * advertisement that does not exist either.
+         */
+		if (adv_ret < 0) {
+			syslog(LOG_ERR, "beacon: LE advertisement registration failed (%d) — "
+				   "the beacon is NOT advertising", adv_ret);
+			ble_beacon_stop();
+			ret = BLE_ERR_IO;
+		}
 	}
 
 	blob_buf_init(&b, 0);

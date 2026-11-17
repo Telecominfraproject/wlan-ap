@@ -148,7 +148,7 @@ typedef struct {
 	int reset_pin;                  /**< option resetpin: GPIO number for HW reset (-1=none) */
 	int backdoor_pin;               /**< option backdoorpin: GPIO for bootloader entry (-1=none) */
 	bool wdt_enabled;               /**< option wdt_enabled: hardware watchdog */
-	char section_name[32];          /**< UCI section name, e.g. 'eap104' */
+	char section_name[32];          /**< UCI section name, e.g. 'eap115' */
 	uint8_t roles;                  /**< GAP role bitmask (UART chips only; 0=auto/broadcaster) */
 } ble_chip_config_t;
 

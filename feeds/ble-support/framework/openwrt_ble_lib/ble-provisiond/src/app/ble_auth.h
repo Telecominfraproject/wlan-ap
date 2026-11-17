@@ -9,7 +9,7 @@
  * — the C equivalent of the reference app's crypt.crypt check.
  *
  * BLE itself stays open (no pairing/bonding); this module is the security
- * gate for configuration reads and writes.
+ * gate for config reads and writes.
  *
  * The verification is fail-closed: empty input, or a locked/disabled/missing
  * root row, always fails. The credential and hash are never logged.

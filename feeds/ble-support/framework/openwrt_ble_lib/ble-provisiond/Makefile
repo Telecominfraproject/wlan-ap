@@ -21,7 +21,7 @@ define Package/ble-provisiond
   SECTION:=utils
   CATEGORY:=Utilities
   TITLE:=BLE Provision Daemon
-  DEPENDS:=+libble +libubus +libubox +libblobmsg-json +libjson-c +libuci +libdbus +zlib
+  DEPENDS:=+libble +libubus +libubox +libblobmsg-json +libuci +libdbus +zlib
 endef
 
 define Package/ble-provisiond/description
