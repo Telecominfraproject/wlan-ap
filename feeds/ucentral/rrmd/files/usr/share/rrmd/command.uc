@@ -47,8 +47,8 @@ const actions = {
 		// But fetching it immediately failed once.
 		// Could n't reprouce it though
 		// Give few milliseconds to settle
-		sleep(10);	
-		let level = global.local.txpower(msg.bssid) / 100;
+		sleep(5000);	
+		let level = global.phy.get_txpower(msg.bssid) / 100;
 		return result(0, msg.event, 'BSS ' + msg.bssid + ' changed TX power', { action: 'tx_power', bssid: msg.bssid, level });
 	},
 

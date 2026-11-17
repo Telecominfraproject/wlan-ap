@@ -2,6 +2,7 @@ let uci = require("uci");
 let cursor = uci ? uci.cursor() : null;
 
 const SCAN_FLAG_AP = (1<<2);
+const TX_POWER_FIXED = 2;	/* NL80211_TX_POWER_FIXED */
 
 function freq2channel(freq) {
 	if (freq == 2484)
@@ -148,6 +149,58 @@ function lookup_phys() {
 	return ret;
 }
 
+/* tx power helpers (MLO / link-aware, for ath12k single-wiphy) */
+function iface_get(dev) {
+	let info = global.nl80211.request(global.nl80211.const.NL80211_CMD_GET_INTERFACE, 0, { dev });
+	if (!info)
+		warn(`txpower: GET_INTERFACE ${dev} failed: ${global.nl80211.error()}\n`);
+	return info;
+}
+
+/* ucode versions differ in how the nested link id is named */
+function link_id_of(l) {
+	if (l?.link_id != null)
+		return l.link_id;
+	if (l?.mlo_link_id != null)
+		return l.mlo_link_id;
+	return null;
+}
+
+/*
+ * Returns:
+ *   { link: null }    interface has no mlo_links (legacy ath11k / MTK): do not send mlo_link_id
+ *   { link: {...} }   link matching the BSSID
+ *   { err: "..." }    several links but none matches the BSSID
+ */
+function find_link(info, bssid) {
+	let links = info?.mlo_links;
+	if (type(links) != "array" || !length(links))
+		return { link: null };
+
+	bssid = lc(bssid);
+	for (let l in links)
+		if (l?.mac && lc(l.mac) == bssid)
+			return { link: l };
+
+	/* single-link vif (e.g. phy5g-ap0 with only "link 0"): link MAC may not be reported */
+	if (length(links) == 1)
+		return { link: links[0] };
+
+	return { err: `no MLO link matches ${bssid}` };
+}
+
+function txpower_set_mbm(dev, mbm, link_id) {
+	let req = { dev, wiphy_tx_power_setting: TX_POWER_FIXED, wiphy_tx_power_level: mbm };
+	if (link_id != null)
+		req.mlo_link_id = link_id;
+	let ret = global.nl80211.request(global.nl80211.const.NL80211_CMD_SET_WIPHY, 0, req);
+	if (ret === false ) {
+		warn(`txpower: SET_WIPHY ${dev} link=${link_id} ${mbm} mBm failed: ${global.nl80211.error()}\n`);
+		return false;
+	}
+	return true;
+}
+
 return {
 	phys: lookup_phys(),
 
@@ -163,11 +216,43 @@ return {
 	txpower: function(msg) {
 		if (!msg.bssid || !msg.level)
 			return false;
+
 		let dev = global.local.bssid_to_ifname(msg.bssid);
-		if (dev == null) {
+		if (dev == null)
+			return false;
+
+		let info = iface_get(dev);
+		if (!info)
+			return false;
+
+		let r = find_link(info, msg.bssid);
+		if (r.err) {
+			warn(`txpower: ${dev}: ${r.err}\n`);
 			return false;
 		}
-		global.nl80211.request(global.nl80211.const.NL80211_CMD_SET_WIPHY, 0, { dev, wiphy_tx_power_setting: 2, wiphy_tx_power_level: msg.level * 100});
+
+		let want_mbm = msg.level * 100;
+		let link_id = link_id_of(r.link);
+
+		if (!txpower_set_mbm(dev, want_mbm, link_id))
+			return false;
+
 		return true;
+	},
+
+	get_txpower: function(bssid) {
+		let dev = global.local.bssid_to_ifname(bssid);
+		if (dev == null)
+			return false;
+
+		let info = iface_get(dev);
+		if (!info)
+			return false;
+
+		let r = find_link(info, bssid);
+		if (r.link?.wiphy_tx_power_level != null)
+			return r.link.wiphy_tx_power_level;
+
+		return info.wiphy_tx_power_level;
 	},
 };
