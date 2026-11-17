@@ -6,61 +6,16 @@
 
 append DRIVERS "morse"
 
-# Find and set $phy for this $device (a wifi-device section name)
-lookup_phy() {
-	[ -n "$phy" ] && {
-		[ -d /sys/class/ieee80211/$phy ] && return
-	}
-
-	local devpath
-	config_get devpath "$device" path
-	[ -n "$devpath" ] && {
-		phy="$(iwinfo dot11ah phyname "path=$devpath")"
-		[ -n "$phy" ] && return
-	}
-
-	local macaddr="$(config_get "$device" macaddr | tr 'A-Z' 'a-z')"
-	[ -n "$macaddr" ] && {
-		for _phy in /sys/class/ieee80211/*; do
-			[ -e "$_phy" ] || continue
-
-			[ "$macaddr" = "$(cat ${_phy}/macaddress)" ] || continue
-			phy="${_phy##*/}"
-			return
-		done
-	}
-	phy=
-	return
-}
-
-# Find and save the phy and macaddr for this $device (a wifi-device section name)
-find_morse_phy() {
+# Set found=1 and the morse_device if the $device (a wifi-device section name) type is morse
+find_morse_device() {
 	local device="$1"
+	local type
 
-	config_get phy "$device" phy
-	lookup_phy
-	[ -n "$phy" -a -d "/sys/class/ieee80211/$phy" ] || {
-		echo "PHY for wifi device $1 not found"
-		return 1
-	}
-	config_set "$device" phy "$phy"
+	config_get type "$device" type
+	[ "$type" != "morse" ] && return 0
 
-	config_get macaddr "$device" macaddr
-	[ -z "$macaddr" ] && {
-		config_set "$device" macaddr "$(cat /sys/class/ieee80211/${phy}/macaddress)"
-	}
-
-	return 0
-}
-
-# Set found=1 if the $phy for this $device (a wifi-device section name) is the same as $dev
-check_morse_device() {
-	config_get phy "$1" phy
-	[ -z "$phy" ] && {
-		find_morse_phy "$1" >/dev/null || return 0
-		config_get phy "$1" phy
-	}
-	[ "$phy" = "$dev" ] && found=1
+	found=1
+	morse_device=$device
 }
 
 detect_morse() {
@@ -80,17 +35,47 @@ detect_morse() {
 
 		dev="${_dev##*/}"
 
-		# Skip already configured devices.
-		# The path or macaddr are used to find the corresponding phy.
-		found=0
-		config_foreach check_morse_device wifi-device
-		[ "$found" -gt 0 ] && continue
+		local path="$(iwinfo nl80211 path "$dev")"
+		local macaddr="$(cat /sys/class/ieee80211/${dev}/macaddress)"
+		local board_type="$(cat /sys/class/ieee80211/${dev}/device/board_type)"
 
-		path="$(iwinfo dot11ah path "$dev")"
-		if [ -n "$path" ]; then
-			dev_id="set wireless.radio${devidx}.path='$path'"
+		# Skip if neither path nor macaddr is available
+		if [ -z "$path" ] && [ -z "$macaddr" ]; then
+			logger -p 3 -t wifi-morse "Ignoring $dev: unable to find sysfs path or macaddr"
+			continue
+		fi
+
+		# Assumes there is only one Morse device in the system.
+		# If a Morse device already exists, update its path to match the current device.
+		# Skip creating a new configuration or applying defaults when one is already present.
+
+		found=0
+		config_foreach find_morse_device wifi-device
+
+		if [ "$found" -gt 0 ]; then
+			# Verify whether the existing Morse device's sysfs path still exists in the system.
+			# If it does, avoid updating the path because having two sysfs entries for the same Morse device
+			# indicates an invalid or inconsistent system state.
+			config_get devpath ${morse_device} path
+			phy="$(iwinfo nl80211 phyname "path=$devpath")"
+			if [ -n "$phy" ] && [ "$phy" != "$dev" ]; then
+				logger -p 3 -t wifi-morse "Ignoring $dev, as Morse device $phy already exists."
+				continue
+			fi
+
+			if [ -n "$path" ]; then
+				uci set wireless.${morse_device}.path=$path
+			else
+				uci set wireless.${morse_device}.macaddr=$macaddr
+			fi
+			uci -q commit wireless
+			continue
 		else
-			dev_id="set wireless.radio${devidx}.macaddr=$(cat /sys/class/ieee80211/${dev}/macaddress)"
+			if [ -n "$path" ]; then
+				dev_id="set wireless.radio${devidx}.path='$path'"
+			else
+				dev_id="set wireless.radio${devidx}.macaddr=$macaddr"
+			fi
 		fi
 
 		uci -q batch <<-EOF
@@ -114,23 +99,32 @@ EOF
 
 		board=$(board_name)
 
-		case "$board" in
-			morse,ekh01-03 |\
-			morse,ekh03v3)
-				bcf=bcf_mf08551.bin
-			;;
-			morse,ekh01v1)
-				bcf=bcf_mf03120.bin
-			;;
-			morse,ekh01v2)
-				bcf=bcf_mf08251.bin
-			;;
-			morse,ekh04v4)
-				bcf=bcf_ekh04_v4.bin
-			;;
-		esac
+		# board_type is 'we have OTP bits set', in which case it should
+		# automatically load the correct file (bcf_boardtype...) and
+		# we don't need to override.
+		# We force HaLowLink 1 since 4v3 support currently requires
+		# an explicit BCF file, though currently the AZW modules
+		# do not have OTP bits burnt.
+		if [ "$board_type" -eq 0 ] || [ "$board" = morse,halowlink1 ] || [ "$board" = morse,halowlink2 ]; then
+			case "$board" in
+				morse,ekh04v6)
+					bcf=bcf_ekh04_v6.bin
+				;;
+				morse,halowlink1)
+					bcf=bcf_mm_hl1.bin
+				;;
+				morse,halowlink2)
+					bcf=bcf_mm_hl2_ext.bin
+				;;
+				*)
+					if [[ $path  = *usb* ]]; then
+						bcf=bcf_mf15457.bin
+					fi
+				;;
+			esac
 
-		[ -n "${bcf}" ] && uci -q set wireless.radio${devidx}.bcf="${bcf}"
+			[ -n "${bcf}" ] && uci -q set wireless.radio${devidx}.bcf="${bcf}"
+		fi
 
 		uci -q commit wireless
 
