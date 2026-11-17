@@ -323,6 +323,7 @@ platform_do_upgrade() {
 	sonicfi,rap750e-h|\
 	sonicfi,rap750e-s|\
 	sonicfi,rap750w-311a|\
+	sonicfi,rap7110w|\
 	sonicfi,rap7220c)
 		sonicfi_dualimage_check
 		nand_upgrade_tar "$1"
