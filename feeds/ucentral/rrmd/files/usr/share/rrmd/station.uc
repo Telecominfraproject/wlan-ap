@@ -287,9 +287,15 @@ return {
 			if (msg.neighbors[i])
 				push(neighbors, replace(msg.neighbors[i], ':', ''));
 
-		let ret = global.ubus.conn.call(`hostapd.${stations[msg.addr].device}`, 'wnm_disassoc_imminent', {
-			addr: msg.addr, duration: 20, abridged: 1, neighbors }) == null;
-		return ret;
+		global.ubus.conn.call(`hostapd.${stations[msg.addr].device}`, 'wnm_disassoc_imminent', {
+			addr: msg.addr, duration: 20, abridged: 1, neighbors });
+		let err = global.ubus.conn.error(true);
+		if (err) {
+			ulog_info(`bss_transition: wnm_disassoc_imminent failed: ${err}\n`);
+			return false;
+		}
+
+		return true;
 	},
 
 	reload: function() {
