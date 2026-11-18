@@ -1,0 +1,108 @@
+From 2a14144d64bde43f790bcd30e309ed859e76a86f Mon Sep 17 00:00:00 2001
+From: "crychic.tan" <crychic.tan@cybertan.com.tw>
+Date: Wed, 18 Nov 2026 10:09:51 +0800
+Subject: [PATCH 146/149] mediatek: mtk_ppe: keep misclassified IPv6 WED flows
+ on the CPU
+
+With WED on MT7981, the WiFi side picks the TID of the IPv6 packets
+that the PPE forwards to it from bits 6:4 of their traffic class instead
+of bits 7:5, as it does for the IPv4 TOS. Now that the traffic class of
+bridged WED flows is kept, many IPv6 DSCP classes are sent to stations
+in the wrong access category, e.g. CS3/AF3x on VO and CS5 on BK.
+
+Add a target kernel patch that leaves IPv6 packets forwarded to a WED
+device to the CPU when the hardware would put them in another access
+category, so that mac80211 picks their TID. IPv4 packets, packets
+received from a WED device and flows without WED are not affected.
+
+Signed-off-by: crychic.tan <crychic.tan@cybertan.com.tw>
+---
+ ...classified-ipv6-wed-flows-on-the-cpu.patch | 76 +++++++++++++++++++
+ 1 file changed, 76 insertions(+)
+ create mode 100644 target/linux/mediatek/patches-6.12/999-2707-net-ethernet-mtk_ppe-keep-misclassified-ipv6-wed-flows-on-the-cpu.patch
+
+diff --git a/target/linux/mediatek/patches-6.12/999-2707-net-ethernet-mtk_ppe-keep-misclassified-ipv6-wed-flows-on-the-cpu.patch b/target/linux/mediatek/patches-6.12/999-2707-net-ethernet-mtk_ppe-keep-misclassified-ipv6-wed-flows-on-the-cpu.patch
+new file mode 100644
+index 0000000000..423a617d14
+--- /dev/null
++++ b/target/linux/mediatek/patches-6.12/999-2707-net-ethernet-mtk_ppe-keep-misclassified-ipv6-wed-flows-on-the-cpu.patch
+@@ -0,0 +1,76 @@
++From: crychic.tan <crychic.tan@cybertan.com.tw>
++Subject: [PATCH] net: ethernet: mtk_ppe: keep misclassified IPv6 WED flows on the CPU
++
++The TXD that WED fills in for a packet forwarded by the PPE carries no
++TID, and on WED v2 the PPE entry has no field for it either, so the
++WiFi side picks the TID from the IP header of the packet. On MT7981 it
++takes bits 7:5 of the IPv4 TOS byte, but bits 6:4 of the IPv6 traffic
++class, one bit too low.
++
++While the PPE cleared the TOS / traffic class of bridged packets, all of
++them went to TID 0. Now that it is kept for flows from or to a WED
++device, IPv6 packets forwarded to a station end up in the access
++category of another DSCP: CS2/AF2x and CS6 on VI, CS3/AF3x on VO,
++CS4/AF41, VA and EF on BE, AF42/AF43 and CS5 on BK.
++
++Leave IPv6 packets that are forwarded to a WED device to the CPU when
++the TID the WiFi side would pick is in another access category than the
++one it picks for an IPv4 packet with the same TOS, so that mac80211
++picks their TID. IPv6 packets with a traffic class of 0x00-0x0f,
++0x20-0x2f or 0xe0-0xff keep being offloaded, as do packets received
++from a WED device and all IPv4 packets.
++
++Signed-off-by: crychic.tan <crychic.tan@cybertan.com.tw>
++---
++ drivers/net/ethernet/mediatek/mtk_ppe.c |   26 ++++++++++++++++++++++
++ 1 file changed, 26 insertions(+)
++
++--- a/drivers/net/ethernet/mediatek/mtk_ppe.c
+++++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
++@@ -819,6 +819,20 @@ static int mtk_ppe_skb_dsfield(struct sk_buff *skb)
++ 	}
++ }
++ 
+++/* WMM access category of each TID: BK = 0, BE = 1, VI = 2, VO = 3 */
+++static const u8 mtk_ppe_tid_ac[8] = { 1, 0, 0, 1, 2, 2, 3, 3 };
+++
+++/* The WiFi side of a WED device picks the TID of a packet forwarded to it
+++ * from its IP header. On MT7981 this is bits 7:5 of the IPv4 TOS byte, but
+++ * bits 6:4 of the IPv6 traffic class. Return true if that puts an IPv6 packet
+++ * with this traffic class in another access category than an IPv4 packet with
+++ * the same TOS.
+++ */
+++static bool mtk_ppe_wed_ipv6_ac_mismatch(u8 tclass)
+++{
+++	return mtk_ppe_tid_ac[(tclass >> 4) & 7] != mtk_ppe_tid_ac[tclass >> 5];
+++}
+++
++ static void
++ mtk_foe_entry_commit_subflow(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
++ 			     u16 hash)
++@@ -953,6 +967,7 @@ void __mtk_ppe_check_skb(struct mtk_ppe *ppe, struct sk_buff *skb, u16 hash)
++ 	if (entry->wed) {
++ 		u32 *ib2 = &entry->data.bridge.ib2;
++ 		int dsfield = mtk_ppe_skb_dsfield(skb);
+++		int type = mtk_get_ib1_pkt_type(ppe->eth, foe.ib1);
++ 
++ 		/* A subflow sends its packets with the L2 header of its L2
++ 		 * flow: an Ethernet header with an optional VLAN tag. The PPE
++@@ -963,6 +978,17 @@ void __mtk_ppe_check_skb(struct mtk_ppe *ppe, struct sk_buff *skb, u16 hash)
++ 		if (dsfield < 0)
++ 			goto out;
++ 
+++		/* The TID of a packet forwarded to a WED device cannot be set
+++		 * from the PPE entry. Leave IPv6 packets to the CPU when the
+++		 * TID the WiFi side would pick from their traffic class is in
+++		 * the wrong access category, so that mac80211 picks the TID.
+++		 */
+++		if (entry->wed_index >= 0 &&
+++		    (type == MTK_PPE_PKT_TYPE_IPV6_ROUTE_3T ||
+++		     type == MTK_PPE_PKT_TYPE_IPV6_ROUTE_5T) &&
+++		    mtk_ppe_wed_ipv6_ac_mismatch(dsfield))
+++			goto out;
+++
++ 		*ib2 &= ~MTK_FOE_IB2_DSCP;
++ 		if (dsfield > 0)
++ 			*ib2 |= FIELD_PREP(MTK_FOE_IB2_DSCP, dsfield);
+-- 
+2.34.1
+
