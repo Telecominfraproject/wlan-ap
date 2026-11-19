@@ -5,7 +5,6 @@ BOARD:=ipq53xx
 BOARDNAME:=Qualcomm Technologies, Inc. IPQ53XX
 FEATURES:=squashfs fpu ramdisk nand pcie
 CPU_TYPE:=cortex-a53
-CPU_SUBTYPE:=neon-vfpv4
 SUBTARGETS:=generic ipq53xx_32
 
 
