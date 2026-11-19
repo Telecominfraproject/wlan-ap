@@ -3,6 +3,7 @@ ARCH:=arm
 SUBTARGET:=ipq50xx_32
 BOARDNAME:=QTI IPQ50XX(32bit) based boards
 CPU_TYPE:=cortex-a7
+CPU_SUBTYPE:=neon-vfpv4
 
 DEFAULT_PACKAGES += \
 	uboot-2016-ipq5018 uboot-2016-ipq5018_tiny fwupgrade-tools \

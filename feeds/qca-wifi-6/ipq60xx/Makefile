@@ -5,7 +5,6 @@ BOARD:=ipq60xx
 BOARDNAME:=Qualcomm Technologies, Inc IPQ60xx
 FEATURES:=ubifs squashfs fpu ramdisk nand pcie usbgadget
 CPU_TYPE:=cortex-a53
-CPU_SUBTYPE:=neon-vfpv4
 MAINTAINER:=John Crispin <blogic@openwrt.org>
 SUBTARGETS:=generic ipq60xx_32
 
