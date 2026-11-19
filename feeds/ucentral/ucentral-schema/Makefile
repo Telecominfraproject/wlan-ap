@@ -46,6 +46,7 @@ define Package/ucentral-schema/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/reboot_cause.uc $(1)/usr/share/ucentral
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/state.uc $(1)/usr/share/ucentral
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/telemetry.uc $(1)/usr/share/ucentral
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/wan_subnet.uc $(1)/usr/share/ucentral
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/tools/ujq $(1)/usr/bin
 	$(LN) /usr/share/ucentral/schemareader.uc $(1)/usr/share/ucode
 	$(LN) /usr/share/ucentral/ucentral.uc $(1)/usr/bin/ucentral_apply
