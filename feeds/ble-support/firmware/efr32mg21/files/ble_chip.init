@@ -1,0 +1,124 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (C) 2007 OpenWrt.org
+#
+# Silicon Labs EFR32MG21 BLE chip bring-up for the ble-support framework.
+#
+# Flow: flash the host firmware over UART (DFU) if it differs from what is
+# currently loaded, then hand the radio to the Linux Bluetooth stack:
+#
+#   RCP        -> btattach  -> hci0   (consumed by libble's bluez transport)
+#   RCP+802154 -> sl_cpcd                (CPC multiprotocol daemon)
+#
+# The UART DFU tool (sl_bt_host_uart_dfu) drives the chip reset line itself via
+# /dev/mem, so unlike the TI/Nordic chips this script does not toggle sysfs
+# GPIOs. resetpin/backdoorpin stay in /etc/config/ble_chip only for a uniform
+# schema across chips.
+
+#start after dbus (60)
+START=20
+USE_PROCD=1
+
+DFU_PROG="/usr/sbin/sl_bt_host_uart_dfu"
+BTATTACH_PROG="/usr/bin/btattach"
+SL_CPCD_PROG="/usr/sbin/sl_cpcd"
+
+DEF_DIR="/etc/default"
+LOG_DIR="/var/log"
+RUN_DIR="/var/run"
+SYSINFO_DIR="/var/sysinfo"
+
+# Persistent record of which firmware image was last flashed into the EFR32.
+# This lives on the writable overlay (survives reboots) rather than in UCI:
+# UCI config is reset to the package default on every sysupgrade, which would
+# make the flash test always fail and reflash the chip on every boot. The
+# EFR32's flash has a finite erase/write endurance, so reflashing on each boot
+# is not acceptable -- the chip must be programmed only when the image truly
+# changes. The file stores the full path of the firmware that was flashed, so a
+# change of firmware image is detected and triggers exactly one reflash.
+#
+# The name is deliberately explicit (not a dotfile) so a future maintainer
+# browsing /etc/ble_fw/silabs/ sees at a glance that this is the BLE firmware
+# flash-state marker, kept alongside the .gbl images it tracks.
+FW_STATE="/etc/ble_fw/silabs/firmware_flashed.state"
+
+FW_RCP="bt_rcp_v7.3.0-b1859.gbl"
+FW_RCP_MULTI="bt_rcp_802154_hci_v7.3.0-b1859.gbl"
+
+HCI_IF="hci0"
+
+DEV_VENDOR="$(cat $SYSINFO_DIR/board_name | awk -F, '{print $1}')"
+DEV_MODEL="$(cat $SYSINFO_DIR/board_name | awk -F, '{print $2}')"
+
+start_service() {
+	config_load ble_chip
+
+	config_get enabled  "$DEV_MODEL" enabled 1
+	config_get firmware "$DEV_MODEL" firmware
+	config_get tty      "$DEV_MODEL" tty
+	config_get baudrate "$DEV_MODEL" baudrate
+
+	[ "$enabled" = "1" ] || return 0
+	[ -n "$firmware" ] || return 0
+
+	# What is currently programmed into the chip, per our persistent record.
+	fw_loaded=""
+	[ -f "$FW_STATE" ] && fw_loaded="$(cat "$FW_STATE" 2>/dev/null)"
+
+	# Flash only when the requested image differs from what was last flashed.
+	# This is the guard that protects the chip's limited flash endurance.
+	if [ "$firmware" != "$fw_loaded" ]; then
+		logger -st ble_chip "flashing BLE firmware: $firmware (was: ${fw_loaded:-none})"
+		if "$DFU_PROG" "$tty" "$baudrate" "$firmware"; then
+			mkdir -p "$(dirname "$FW_STATE")"
+			printf '%s' "$firmware" > "$FW_STATE"
+			fw_loaded="$firmware"
+		else
+			logger -st ble_chip "DFU flash failed -- not updating state record"
+			# Leave fw_loaded as-is; do not record a flash that did not happen.
+		fi
+	else
+		logger -st ble_chip "BLE firmware already current ($firmware) -- skipping flash"
+	fi
+
+	case $(echo "$fw_loaded" | awk -F/ '{print $5}') in
+	"$FW_RCP")
+		procd_open_instance
+		procd_set_param command /bin/sh -c "$BTATTACH_PROG -B $tty -S $baudrate -N > $RUN_DIR/btattach_index 2>&1"
+		procd_set_param respawn
+		procd_close_instance
+		;;
+	"$FW_RCP_MULTI")
+		procd_open_instance
+		procd_set_param command /bin/sh -c "$SL_CPCD_PROG -c $DEF_DIR/cpcd.conf > $LOG_DIR/sl_cpcd.log 2>&1"
+		procd_set_param respawn
+		procd_close_instance
+		;;
+	esac
+
+	sleep 2
+}
+
+service_running() {
+	fw_loaded=""
+	[ -f "$FW_STATE" ] && fw_loaded="$(cat "$FW_STATE" 2>/dev/null)"
+
+	case $(echo "$fw_loaded" | awk -F/ '{print $5}') in
+	"$FW_RCP")
+		if [ -z "$(hciconfig $HCI_IF 2>/dev/null | grep 'UP RUNNING')" ]; then
+			hciconfig "$HCI_IF" up
+		fi
+		;;
+	esac
+}
+
+reload_service()
+{
+	stop
+	start
+}
+
+service_triggers()
+{
+	procd_add_reload_trigger "ble_chip"
+}

@@ -1,0 +1,63 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+/**
+ * @file transport_plugin.h
+ * @brief Transport plugin interface for libble (internal).
+ *
+ * Transport plugins abstract the physical BLE controller interface.
+ * Implementations: BlueZ D-Bus, direct UART HCI.
+ */
+#ifndef LIBBLE_TRANSPORT_PLUGIN_H
+#define LIBBLE_TRANSPORT_PLUGIN_H
+
+#include "../ble_types.h"
+#include "../../include/ble.h"
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+/**
+ * @brief Transport event callback type.
+ */
+typedef void (*transport_event_cb_t)(const ble_event_t *event, void *ctx);
+
+/**
+ * @brief Transport plugin operations.
+ */
+typedef struct transport_plugin {
+	const char *name;
+
+	int (*init)(const char *config);
+	int (*deinit)(void);
+	int (*send_hci_cmd)(const ble_hci_cmd_t *cmd);
+	int (*send_vendor_cmd)(uint8_t ogf, uint16_t ocf,
+						   const uint8_t *params, uint8_t param_len);
+	int (*register_event_callback)(transport_event_cb_t cb, void *ctx);
+	int (*get_fd)(void);
+	int (*process_events)(void);
+
+	/* Optional: raw send/receive for HCI commands with response (UART only) */
+	int (*send_raw)(const uint8_t *data, uint16_t len, void *priv);
+	int (*recv_raw)(uint8_t *buf, uint16_t buflen, uint32_t timeout_ms, void *priv);
+	void *priv;
+
+	bool active;
+} transport_plugin_t;
+
+/* Built-in transport plugins */
+extern transport_plugin_t bluez_transport_plugin;
+extern transport_plugin_t uart_transport_plugin;
+
+/**
+ * @brief Read the adapter's own address from BlueZ (org.bluez.Adapter1.Address).
+ *
+ * BlueZ-specific, so it is not part of transport_plugin_t. Only meaningful once
+ * the BlueZ transport is initialized; returns a negative errno otherwise.
+ *
+ * @param out     Destination for "XX:XX:XX:XX:XX:XX"; must hold >= 18 bytes.
+ * @param out_sz  Size of @out.
+ * @return 0 on success, negative errno on failure.
+ */
+int bluez_transport_get_address(char *out, size_t out_sz);
+
+#endif /* LIBBLE_TRANSPORT_PLUGIN_H */
