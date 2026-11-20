@@ -38,6 +38,8 @@ let board_name = board_info.board_name;
 switch(board_name) {
 case 'edgecore,eap105':
 case 'zyxel,nwa130be':
+case 'sonicfi,rap7110c-341x':
+case 'sonicfi,rap7220c':
     num_radios = 3;
     break;
 case 'edgecore,eap112':
@@ -47,6 +49,20 @@ case 'edgecore,eap112':
     break;
 }
 
+// QCA board capability flags — add new boards here instead of scattering checks
+let qca_caps = {
+    // all radios share one wiphy, named phy00
+    single_phy_multi_radio: (board_name == 'edgecore,eap105' ||
+                             board_name == 'sonicfi,rap7110c-341x' || board_name == 'sonicfi,rap7220c' ||
+                             board_name == 'sonicfi,rap750w-311a' || board_name == 'sonicfi,rap750e-s' ||
+                             board_name == 'sonicfi,rap750e-h'),
+
+    // radios are named radio0_band<N> in UCI/netifd instead of radio<N>
+    band_radio_names: (board_name == 'sonicfi,rap7110c-341x' || board_name == 'sonicfi,rap7220c' ||
+                       board_name == 'sonicfi,rap750w-311a' || board_name == 'sonicfi,rap750e-s' ||
+                       board_name == 'sonicfi,rap750e-h'),
+};
+
 // MTK board capability flags — add new boards here instead of scattering checks
 let mtk_caps = {
     single_phy_multi_band: (board_name == 'edgecore,eap115' || board_name == 'edgecore,eap115a'),
@@ -55,11 +71,18 @@ let mtk_caps = {
     has_halow: (board_name == 'edgecore,eap112' && phy_count == 3),
 };
 
+function get_radio_name(index) {
+    if (qca_caps.band_radio_names)
+        return 'radio0_band' + index;
+    else
+        return 'radio' + index;
+}
+
 function get_phy_id(iface) {
     let iface_num = replace(iface, /[^0-9]/g, '');
     let phy_id = 'phy' + iface_num;
 
-    if (board_name == 'edgecore,eap105') {
+    if (qca_caps.single_phy_multi_radio) {
         phy_id = 'phy00';
     } else if (mtk_caps.single_phy_multi_band) {
         phy_id = 'phy0';
@@ -180,6 +203,25 @@ function get_center_channel(channel, band, bw) {
     let center_channel_map = {};
 
     switch (band) {
+    case '2g':
+        if (bw == 40) {
+            center_channel_map = {
+                "1": 3,
+                "2": 4,
+                "3": 5,
+                "4": 6,
+                "5": 7,
+                "6": 8,
+                "7": 9,
+                "8": 6,
+                "9": 7,
+                "10": 8,
+                "11": 9,
+                "12": 10,
+                "13": 11
+            };
+        }
+        break;
     case '5g':
         if (bw == 40) {
             center_channel_map = {
@@ -353,8 +395,13 @@ function hostapd_switch_channel(msg) {
     let target_freq = channel_to_freq(msg.band, msg.channel);
     let center_channel = get_center_channel(msg.channel, msg.band, bandwidth);
     let center_freq = channel_to_freq(msg.band, center_channel);
-    if (bandwidth > 20)
-        sec_channel_offset = 1;
+    if (bandwidth > 20) {
+        let center_channel_40 = get_center_channel(msg.channel, msg.band, 40);
+        if (+msg.channel < +center_channel_40)
+            sec_channel_offset = 1;
+        else
+            sec_channel_offset = -1;
+    }
 
     // use hostapd_cli command
     if (target_freq != null) {
@@ -450,6 +497,7 @@ function dfs_chan_check(iface, rcs_channel) {
 }
 
 function fixed_channel_config(iface, iface_num, fixed_channel_f, auto_channel_f, fixed_chan_bkp, channel_config) {
+    let radio_id = get_radio_name(iface_num);
     // if fixed channel config is stored in the /tmp/fixed_channel_<radio_iface> file
     if (fixed_channel_f == 1) {
         if (auto_channel_f == 1) {
@@ -457,7 +505,7 @@ function fixed_channel_config(iface, iface_num, fixed_channel_f, auto_channel_f,
             ulog_info(`[%s] Current channel is "auto"; Configured fixed channel was %d, reassigning fixed channel ...\n`, iface, fixed_chan_bkp);
 
             // Set channel to the fixed channel
-            global.uci.set('wireless', 'radio' + iface_num, 'channel', fixed_chan_bkp);
+            global.uci.set('wireless', radio_id, 'channel', fixed_chan_bkp);
             global.uci.commit('wireless');
             global.uci.apply;
         } else if (auto_channel_f == 0) {
@@ -465,7 +513,7 @@ function fixed_channel_config(iface, iface_num, fixed_channel_f, auto_channel_f,
             ulog_info(`[%s] Current channel is fixed (=%d), changing it to "auto" (=0) to trigger ACS \n`, iface, channel_config);
 
             // Set channel to "auto"
-            global.uci.set('wireless', 'radio' + iface_num, 'channel', '0');
+            global.uci.set('wireless', radio_id, 'channel', '0');
             global.uci.commit('wireless');
             global.uci.apply;
         }
@@ -582,7 +630,23 @@ function get_chan_util(radio_band, sleep_time) {
     return chan_util;
 }
 
-function random_channel_selection(iface, band, htmode, chan_list_valid, exclude_dfs) {
+function expand_channel_list(chan_list) {
+    let chan_list_expanded = [];
+
+    for (let entry in chan_list) {
+        let range = match(trim("" + entry), /^([0-9]+)-([0-9]+)$/);
+        if (range) {
+            for (let c = int(range[1]); c <= int(range[2]); c++)
+                push(chan_list_expanded, c);
+        } else if (match(trim("" + entry), /^[0-9]+$/)) {
+            push(chan_list_expanded, int(entry));
+        }
+    }
+
+    return uniq(chan_list_expanded);
+}
+
+function random_channel_selection(iface, band, htmode, chan_list_valid, exclude_dfs, current_channel) {
     let bw = replace(htmode, /[^0-9]/g, '');
     let phy_id = get_phy_id(iface);
 
@@ -733,7 +797,7 @@ function random_channel_selection(iface, band, htmode, chan_list_valid, exclude_
 
     if (chan_list_valid) {
         // if channel list is provided in the wireless config, check if it is valid based on the bandwidth selected and the country code
-        for (let valid_chan in chan_list_valid) {
+        for (let valid_chan in expand_channel_list(chan_list_valid)) {
             for (let legal_chan in chan_list_legal) {
                 if (valid_chan == legal_chan) {
                     push(chan_list_allowed, valid_chan);
@@ -743,6 +807,11 @@ function random_channel_selection(iface, band, htmode, chan_list_valid, exclude_
     } else {
         // if channel list is not provided in the wireless config, check if the channel from the default channel list is valid based on the country code
         chan_list_allowed = chan_list_legal;
+    }
+
+    if (current_channel) {
+        let current_center = get_center_channel(+current_channel, band, bw);
+        chan_list_allowed = filter(chan_list_allowed, (chan) => get_center_channel(+chan, band, bw) != current_center);
     }
 
     ulog_info(`[%s] Allowed channel list = %s \n`, iface, chan_list_allowed);
@@ -779,7 +848,7 @@ function algo_rcs(iface, current_channel, band, htmode, selected_channels, exclu
     let same_center_channel = false;
 
     // random_channel_selection script will help to select random channel
-    chosen_random_channel = random_channel_selection(iface, band, htmode, selected_channels, exclude_dfs);
+    chosen_random_channel = random_channel_selection(iface, band, htmode, selected_channels, exclude_dfs, current_channel);
     stats_info_write("/tmp/rrm_random_channel_" + iface, chosen_random_channel);
 
     if (chosen_random_channel == current_channel) {
@@ -866,7 +935,7 @@ function channel_optimize() {
     let wireless_status = global.ubus.conn.call('network.wireless', 'status');
 
     for (let j = 0; j < num_radios; j++) {
-        let radio_id = "radio" + j;
+        let radio_id = get_radio_name(j);
 
         radio_disabled[j] = wireless_status[radio_id].disabled;
         radio_band[j] = wireless_status[radio_id].config.band;
@@ -1206,10 +1275,11 @@ function channel_optimize() {
                                     radio_5g_restarted = 1;
                                 }
 
+                                let radio_name = get_radio_name(high_util_iface);
                                 // wifi down radioX
-                                system(`wifi down radio${high_util_iface}`);
+                                system(`wifi down ${radio_name}`);
                                 // wifi up radioX
-                                system(`wifi up radio${high_util_iface}`);
+                                system(`wifi up ${radio_name}`);
                             }
                         }
 
