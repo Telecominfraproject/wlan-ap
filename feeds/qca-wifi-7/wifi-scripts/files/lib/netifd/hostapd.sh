@@ -152,8 +152,6 @@ hostapd_common_add_device_config() {
 	config_add_boolean legacy_rates
 	config_add_int cell_density
 	config_add_int rts_threshold
-	config_add_int rssi_reject_assoc_rssi
-	config_add_int rssi_ignore_probe_request
 	config_add_int maxassoc
 
 	config_add_string acs_chan_bias
@@ -173,7 +171,7 @@ hostapd_prepare_device_config() {
 
 	json_get_vars country country3 country_ie beacon_int:100 doth require_mode legacy_rates \
 		acs_chan_bias local_pwr_constraint spectrum_mgmt_required airtime_mode cell_density \
-		rts_threshold beacon_rate rssi_reject_assoc_rssi rssi_ignore_probe_request maxassoc \
+		rts_threshold beacon_rate maxassoc \
 		mbssid:0
 
 	hostapd_set_log_options base_cfg
@@ -267,8 +265,6 @@ hostapd_prepare_device_config() {
 		hostapd_add_rate brlist "$br"
 	done
 
-	[ -n "$rssi_reject_assoc_rssi" ] && append base_cfg "rssi_reject_assoc_rssi=$rssi_reject_assoc_rssi" "$N"
-	[ -n "$rssi_ignore_probe_request" ] && append base_cfg "rssi_ignore_probe_request=$rssi_ignore_probe_request" "$N"
 	[ -n "$beacon_rate" ] && append base_cfg "beacon_rate=$beacon_rate" "$N"
 	append base_cfg "beacon_int=$beacon_int" "$N"
 	[ -n "$rts_threshold" ] && append base_cfg "rts_threshold=$rts_threshold" "$N"
@@ -438,6 +434,9 @@ hostapd_common_add_bss_config() {
 	config_add_int wps_cred_add_sae
 
 	config_add_string uci_section
+
+	config_add_int rssi_reject_assoc_rssi
+	config_add_int rssi_ignore_probe_request
 }
 
 hostapd_set_vlan_file() {
@@ -700,7 +699,7 @@ hostapd_set_bss_options() {
 		vendor_elements fils ocv apup dpp ssid_protection \
 		rsn_override_key_mgmt rsn_override_pairwise rsn_override_mfp \
 		rsn_override_key_mgmt_2 rsn_override_pairwise_2 rsn_override_mfp_2 \
-		uci_section
+		uci_section rssi_reject_assoc_rssi rssi_ignore_probe_request
 
 
 	json_get_values sae_groups sae_groups
@@ -757,6 +756,8 @@ hostapd_set_bss_options() {
 	append bss_conf "uapsd_advertisement_enabled=$uapsd" "$N"
 	append bss_conf "utf8_ssid=$utf8_ssid" "$N"
 	append bss_conf "multi_ap=$multi_ap" "$N"
+	[ -n "$rssi_reject_assoc_rssi" ] && append bss_conf "rssi_reject_assoc_rssi=$rssi_reject_assoc_rssi" "$N"
+	[ -n "$rssi_ignore_probe_request" ] && append bss_conf "rssi_ignore_probe_request=$rssi_ignore_probe_request" "$N"
 	[ -n "$vendor_elements" ] && append bss_conf "vendor_elements=$vendor_elements" "$N"
 
 	[ "$tdls_prohibit" -gt 0 ] && append bss_conf "tdls_prohibit=$tdls_prohibit" "$N"
