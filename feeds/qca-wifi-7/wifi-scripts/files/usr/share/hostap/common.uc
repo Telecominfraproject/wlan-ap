@@ -201,7 +201,17 @@ function macaddr_split(str)
 
 function macaddr_join(addr)
 {
-	return join(":", map(addr, (val) => sprintf("%02x", val)));
+	return join(":", map(addr, (val) => sprintf("%02x", val & 0xff)));
+}
+
+function macaddr_add_offset(addr, offset)
+{
+	for (let i = 5; i >= 0 && offset > 0; i--) {
+		let val = addr[i] + offset;
+
+		addr[i] = val % 256;
+		offset = val / 256;
+	}
 }
 
 function wdev_macaddr(wdev)
@@ -237,6 +247,8 @@ const phy_proto = {
 		let num_global = int(data.num_global ?? 1);
 		let use_global = !mbssid && idx < num_global;
 		let mbssid_group_size = int(data.mbssid_group_size ?? 4);
+		if (!mbssid_group_size)
+			mbssid_group_size = 4;
 
 		let base_addr = phy_sysfs_file(phy, "macaddress");
 		if (!base_addr)
@@ -279,9 +291,23 @@ const phy_proto = {
 			}
 		}
 		let maxbssid = 2 ** maxbssid_ind;
+		let align_group = mbssid && lc(data.band ?? "") == "6g";
+
+		if (align_group) {
+			// Keep the 6 GHz MBSSID group at or above the configured
+			// base so its low bits cannot wrap into the WLAN/LAN and
+			// 2.4 GHz/5 GHz addresses below it.
+			let rem = addr[5] % maxbssid;
+
+			if (rem)
+				macaddr_add_offset(addr, maxbssid - rem);
+		}
+
 		if (mbssid && idx >= maxbssid) {
-			addr[5] = ((addr[5] >> maxbssid_ind) << maxbssid_ind);
-			addr[5] = addr[5] + (idx / maxbssid) * maxbssid;
+			if (!align_group)
+				addr[5] = ((addr[5] >> maxbssid_ind) << maxbssid_ind);
+
+			macaddr_add_offset(addr, (idx / maxbssid) * maxbssid);
 			idx = idx % maxbssid;
 		}
 

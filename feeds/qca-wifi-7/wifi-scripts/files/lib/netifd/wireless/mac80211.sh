@@ -1301,21 +1301,23 @@ mac80211_get_addr() {
 
 mac80211_generate_mac() {
 	local phy="$1"
-	local id="${macidx:-0}"
+	local id="${3:-${macidx:-0}}"
 	local group_size
 	local mode="$2"
 	local mbssid=""
-	if [ -n "mbssid_group_size" ]; then
+	if [ "$multiple_bssid" = "3" ] && [ -n "$mbssid_group_size" ]; then
 		group_size="$mbssid_group_size"
 	else
+		# Standard MBSSID (modes 1/2) and the fallback for mode 3
+		# group all APs of the radio.
 		group_size="$has_ap"
 	fi
 
-	if [ "$mode" = "ap" ]; then
+	if [ "$mode" = "ap" ] && [ "$has_ap" -gt 1 ]; then
 		mbssid=$multiple_bssid
 	fi
 
-	wdev_tool "$phy$phy_suffix" get_macaddr id=$id num_global=$num_global_macaddr mbssid=$mbssid mbssid_group_size=$group_size macaddr_base=${macaddr_base}
+	wdev_tool "$phy$phy_suffix" get_macaddr id=$id num_global=$num_global_macaddr mbssid=$mbssid mbssid_group_size=$group_size macaddr_base=${macaddr_base} band=${band}
 }
 
 get_board_phy_name() (
@@ -1501,13 +1503,31 @@ mac80211_prepare_vif() {
 	json_add_string _ppe_vp "$ppe_vp"
 
 	default_macaddr=
+	local mac_auto=0
+	local mbssid_ap=0
+	local mac_id="${macidx:-0}"
+
+	if [ "$mode" = "ap" ] && [ -n "$multiple_bssid" ] && [ "$multiple_bssid" -gt 0 ]; then
+		mbssid_ap=1
+		mac_id="${mbssid_ap_idx:-0}"
+	fi
+
 	if [ -z "$macaddr" ]; then
-		macaddr="$(mac80211_generate_mac $phy $mode)"
-		macidx="$(($macidx + 1))"
+		macaddr="$(mac80211_generate_mac $phy $mode $mac_id)"
+		mac_auto=1
 		#default_macaddr=1
 	elif [ "$macaddr" = 'random' ]; then
 		macaddr="$(macaddr_random)"
 	fi
+
+	# MBSSID MACs encode the BSS position in the hostapd group. Track AP
+	# positions separately so explicit/random AP MACs do not shift the
+	# auto-generated MACs of non-AP interfaces on the same radio.
+	if [ "$mbssid_ap" = 1 ]; then
+		mbssid_ap_idx="$((${mbssid_ap_idx:-0} + 1))"
+	fi
+	[ "$mac_auto" = 1 ] && macidx="$(($macidx + 1))"
+
 	json_add_string _macaddr "$macaddr"
 	json_add_string _default_macaddr "$default_macaddr"
 	json_select ..
@@ -2259,6 +2279,7 @@ drv_mac80211_setup() {
 
 	macidx=0
 	staidx=0
+	mbssid_ap_idx=0
 
 	if [ $mlo_add_flag -eq 0 ]; then
 		[ -n "$chanbw" ] && {
