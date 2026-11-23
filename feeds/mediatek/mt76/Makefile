@@ -540,6 +540,16 @@ PKG_YEAR:=$(shell echo $(PKG_SOURCE_DATE) | cut -d'-' -f1 | cut -c3-4)
 PKG_MONTH:=$(shell echo $(PKG_SOURCE_DATE) | cut -d'-' -f2 | sed 's/^0*//')
 ADDITIONAL_CFLAGS=-DPKG_YEAR=$(PKG_YEAR) -DPKG_MONTH=$(PKG_MONTH)
 
+ifdef CONFIG_TARGET_PROFILE
+TARGET_PROFILE=$(subst ",,$(CONFIG_TARGET_PROFILE))
+PATCH_PROFILE_NAME=patches-$(subst DEVICE_,,$(TARGET_PROFILE))
+endif
+
+define Build/Patch
+	$(Build/Patch/Default)
+	$(call PatchDir,$(PKG_BUILD_DIR),$(PATCH_PROFILE_NAME)/,profile/)
+endef
+
 define Build/Prepare
 	$(call Build/Prepare/Default)
 	$(CP) $(CURDIR)/src/firmware/mt7981_*.bin $(CURDIR)/src/firmware/mt7986_*.bin $(PKG_BUILD_DIR)/firmware/
