@@ -1,0 +1,170 @@
+From 90a0b7b3c0093d1795f3a2065027934b8c06f1c2 Mon Sep 17 00:00:00 2001
+From: "huimin.he" <huimin.he@cybertan.com.tw>
+Date: Thu, 19 Nov 2026 10:48:35 +0800
+Subject: [PATCH] mtk: mt76: mt7996: do not limit the txpower by txpower_cur
+
+The txpower vendor command (sent by hostapd for sku_idx), the channel
+switch of a chanctx and the debugfs power_table_filename limit the power
+tables to DIV_ROUND_UP(txpower_cur + path_delta, 2). txpower_cur is the
+result of the previous mt7996_mcu_set_txpower_sku() call: it starts at 0
+and is already limited by the power tables. When one of them runs before
+the first mt7996_mcu_set_txpower_sku() call, the power is limited to
+path_delta / 2 and stays there, since every later call takes the min with
+the value it produced:
+
+  2.4G, 2 chains: DIV_ROUND_UP(0 + 6, 2) = 3 dBm, every table entry 6
+  5G,   3 chains: DIV_ROUND_UP(0 + 9, 2) = 5 dBm, every table entry 10,
+                  "iw dev" txpower 5.00 dBm
+
+Only an "iw dev <ap> set txpower fixed" that changes the BSS txpower
+gets out of it.
+
+Keep the txpower mac80211 sets for the BSS (BSS_CHANGED_TXPOWER) and use
+it instead; before mac80211 sets it, use the max/regulatory power of the
+channel.
+
+Signed-off-by: huimin.he <huimin.he@cybertan.com.tw>
+---
+ mt7996/debugfs.c |  6 ++----
+ mt7996/main.c    | 11 +++++------
+ mt7996/mcu.c     | 28 ++++++++++++++++++++++++++++
+ mt7996/mt7996.h  |  3 +++
+ mt7996/vendor.c  |  2 +-
+ 5 files changed, 39 insertions(+), 11 deletions(-)
+
+diff --git a/mt7996/debugfs.c b/mt7996/debugfs.c
+index f60d416..bd21ec4 100644
+--- a/mt7996/debugfs.c
++++ b/mt7996/debugfs.c
+@@ -19,7 +19,7 @@ mt7996_sku_filename_set(struct file *file, const char __user *user_buf,
+ 	char buf[SKU_FILENAME_MAX];
+ 	ssize_t ret;
+ 	bool en;
+-	s8 delta, limit;
++	s8 limit;
+ 
+ 	/* It’s possible that the user sets power without setting AP channel */
+ 	if (!cfg80211_chandef_valid(&mphy->chandef) ||
+@@ -64,9 +64,7 @@ mt7996_sku_filename_set(struct file *file, const char __user *user_buf,
+ 
+ 	limit = mphy->main_chandef.chan->max_power;
+ 
+-	delta = mt76_tx_power_path_delta(hweight16(mphy->chainmask));
+-	delta = DIV_ROUND_UP(mphy->txpower_cur + delta, 2);
+-	limit = min_t(s8, delta, limit);
++	limit = min_t(int, mt7996_get_txpower_setting(phy), limit);
+ 
+ 	ret = mt7996_mcu_set_txpower_sku(phy, limit);
+ 	if (ret)
+diff --git a/mt7996/main.c b/mt7996/main.c
+index 7167081..41b4045 100644
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -795,9 +795,6 @@ int mt7996_set_channel(struct mt76_phy *mphy)
+ 		if (ret)
+ 			goto out;
+ 	} else if (mphy->chanctx && mphy->chanctx->state == MT76_CHANCTX_STATE_SWITCH) {
+-		u8 delta;
+-		int current_txpower;
+-
+ 		if (mphy->chanctx->has_ap && phy->pp_mode == PP_USR_MODE) {
+ 			ret = mt7996_mcu_set_pp_en(phy, PP_USR_MODE,
+ 						   mphy->main_chandef.punctured);
+@@ -810,9 +807,8 @@ int mt7996_set_channel(struct mt76_phy *mphy)
+ 		if (ret)
+ 			goto out;
+ 
+-		delta = mt76_tx_power_path_delta(hweight16(mphy->chainmask));
+-		current_txpower = DIV_ROUND_UP(mphy->txpower_cur + delta, 2);
+-		ret = mt7996_mcu_set_txpower_sku(phy, current_txpower);
++		ret = mt7996_mcu_set_txpower_sku(phy,
++						 mt7996_get_txpower_setting(phy));
+ 		if (ret)
+ 			goto out;
+ 	}
+@@ -1190,6 +1186,9 @@ mt7996_link_info_changed(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 	if (changed & BSS_CHANGED_MU_GROUPS)
+ 		mt7996_update_mu_group(hw, link, info);
+ 
++	if (changed & BSS_CHANGED_TXPOWER && info->txpower > 0)
++		phy->txpower_setting = info->txpower;
++
+ 	if (changed & BSS_CHANGED_TXPOWER &&
+ 	    info->txpower != phy->txpower) {
+ 		phy->txpower = info->txpower;
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index fdf3818..c3382e3 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -8046,6 +8046,34 @@ static bool mt7996_is_psd_country(char *country)
+ 	return 0;
+ }
+ 
++/* The txpower to limit the power tables to, in dBm: the one mac80211 set
++ * for the BSS or, before that, the regulatory limit of the channel.
++ *
++ * Do not derive it from txpower_cur: that is the result of the last
++ * mt7996_mcu_set_txpower_sku() call, which starts at 0 and is already
++ * limited by the power tables, so DIV_ROUND_UP(txpower_cur + path_delta, 2)
++ * locked the power at path_delta / 2 (3 dBm with 2 chains, 5 dBm with 3)
++ * when it was used before the first call.
++ */
++int mt7996_get_txpower_setting(struct mt7996_phy *phy)
++{
++	struct ieee80211_channel *chan = phy->mt76->main_chandef.chan;
++	int power = 127;
++
++	if (phy->txpower_setting > 0)
++		return phy->txpower_setting;
++
++	if (!chan)
++		return power;
++
++	if (chan->max_power > 0)
++		power = min_t(int, power, chan->max_power);
++	if (chan->max_reg_power > 0)
++		power = min_t(int, power, chan->max_reg_power);
++
++	return power;
++}
++
+ static s8 mt7996_get_power_bound(struct mt7996_phy *phy, s8 txpower)
+ {
+        struct mt76_phy *mphy = phy->mt76;
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index dcf2e5b..f84bd23 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -764,6 +764,8 @@ struct mt7996_phy {
+ 	u32 rx_ampdu_ts;
+ 	u32 ampdu_ref;
+ 	int txpower;
++	/* txpower from mac80211 (BSS_CHANGED_TXPOWER) in dBm, 0 = not set */
++	int txpower_setting;
+ 
+ 	struct mt76_mib_stats mib;
+ 	struct mt76_channel_state state_ts;
+@@ -1349,6 +1351,7 @@ int mt7996_mcu_get_temperature(struct mt7996_phy *phy);
+ int mt7996_mcu_set_thermal_throttling(struct mt7996_phy *phy, u8 state);
+ int mt7996_mcu_set_thermal_protect(struct mt7996_phy *phy, bool enable);
+ int mt7996_mcu_set_thermal_info_query(struct mt7996_phy *phy);
++int mt7996_get_txpower_setting(struct mt7996_phy *phy);
+ int mt7996_mcu_set_txpower_sku(struct mt7996_phy *phy,
+ 			       int txpower_setting);
+ int mt7996_mcu_rdd_resume_tx(struct mt7996_phy *phy);
+diff --git a/mt7996/vendor.c b/mt7996/vendor.c
+index fb7d47f..530f32e 100644
+--- a/mt7996/vendor.c
++++ b/mt7996/vendor.c
+@@ -1723,7 +1723,7 @@ static int mt7996_vendor_txpower_ctrl(struct wiphy *wiphy,
+ 			mt7996_free_afc_table(dev);
+ 	}
+ 
+-	current_txpower = DIV_ROUND_UP(mphy->txpower_cur + delta, 2);
++	current_txpower = mt7996_get_txpower_setting(phy);
+ 	new_power_limit = min_t(s8, current_txpower, new_power_limit);
+ 
+ 	err = mt7996_mcu_set_txpower_sku(phy, new_power_limit);
+-- 
+2.34.1
+
