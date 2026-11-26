@@ -39,6 +39,41 @@ define Device/sercomm_ap72tip-v4
 endef
 TARGET_DEVICES += sercomm_ap72tip-v4
 
+define Device/cambium_x7_35x
+  # Cambium's Miami U-Boot will not run a kernel placed at the base of DRAM:
+  # bootm loads, decompresses, relocates the FDT and preps successfully, then
+  # the jump never returns and the board resets with no console output. Phil
+  # Taylor's validated RAM boot for this SKU uses 0x41000000, as does upstream
+  # qualcommax; only this QCA feed uses 0x40000000 (ipq53xx.mk line 1).
+  KERNEL_LOADADDR := 0x41000000
+  DEVICE_TITLE := Cambium X7-35X
+  DEVICE_DTS := ipq5332-cambium-x7-35x
+  DEVICE_DTS_DIR := ../dts
+  # Cambium's U-Boot auto-selects the FIT config by board name; the OEM node is
+  # mi01.6-acadia (confirmed in the 0:APPSBL string table), NOT the plain
+  # config@mi01.6 every other ipq53xx board here uses.
+  DEVICE_DTS_CONFIG := config@mi01.6-acadia
+  # image.mk would default this to cambium,x7,35x (it maps _ -> , blindly),
+  # which never matches /tmp/sysinfo/board_name. Set it explicitly.
+  SUPPORTED_DEVICES := cambium,x7-35x
+  IMAGES := sysupgrade.bin nand-factory.ubi
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+  IMAGE/nand-factory.ubi := append-ubi
+  # FIT COMPRESSION: this target's Device/Default builds the initramfs FIT as
+  # `fit none` (uncompressed) and the persistent kernel as gzip. We use lzma for
+  # both because that is what m0vse's validated X7-35X tree ships (and it gates
+  # on it), and because a 4.8 MB FIT beats a 14.4 MB one.
+  #
+  # NOTE, so nobody re-derives a wrong cause from this: uncompressed FIT was NOT
+  # why this board failed to boot. Staged-bootm telemetry showed `loados`
+  # succeeding (the kernel decompressed fine) and the failure was the jump --
+  # the load address above. Both compressions work; lzma is a preference.
+  KERNEL_INITRAMFS = kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
+  KERNEL = kernel-bin | lzma | fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
+  DEVICE_PACKAGES := ath12k-wifi-edgecore-eap105 ath12k-firmware-qcn92xx ath12k-firmware-ipq5332 uboot-envtools
+endef
+TARGET_DEVICES += cambium_x7_35x
+
 define Device/edgecore_eap105
   DEVICE_TITLE := Edgecore EAP105
   DEVICE_DTS := ipq5332-edgecore-eap105
