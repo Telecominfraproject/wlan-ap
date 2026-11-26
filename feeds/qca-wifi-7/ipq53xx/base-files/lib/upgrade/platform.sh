@@ -219,8 +219,7 @@ platform_check_image() {
 		;;
 	sonicfi,rap750e-h|\
 	sonicfi,rap750e-s|\
-	sonicfi,rap750w-311a|\
-	sonicfi,rap7220c)
+	sonicfi,rap750w-311a)
 		local CURRENT_VER=$(get_current_version)
 		local FW_VER FW_BUILD_DATE
 		local info_output=$(get_firmware_info "$1")
