@@ -9,6 +9,8 @@ function result(error, event, text, data) {
 	return res;
 }
 
+let txpower_timers = {};
+
 const actions = {
 	// ubus call rrm command '{"action": "kick", "addr": "1c:57:dc:37:3c:b1", "reason": 5, "ban_time": 30, "global_ban": true }'
 	kick: function(msg) {
@@ -43,13 +45,30 @@ const actions = {
 		if (!global.phy.txpower(msg))
 			return result(1, msg.event, 'BSS ' + msg.bssid + ' failed to set TX power', { action: 'tx_power', bssid: msg.bssid });
 
-		// iw dev gives updated value
-		// But fetching it immediately failed once.
-		// Could n't reprouce it though
-		// Give few milliseconds to settle
-		sleep(10);	
-		let level = global.local.txpower(msg.bssid) / 100;
-		return result(0, msg.event, 'BSS ' + msg.bssid + ' changed TX power', { action: 'tx_power', bssid: msg.bssid, level });
+		// poll the applied level from a timer (up to ~5 s in testing),
+		// report the result as an event
+		const poll_ms = 500, timeout_ms = 8000;
+		let bssid = lc(msg.bssid), elapsed = 0;
+
+		txpower_timers[bssid]?.cancel();
+		txpower_timers[bssid] = global.uloop.timer(poll_ms, function() {
+			elapsed += poll_ms;
+			let mbm = global.phy.get_txpower(bssid);
+			let level = (mbm == null || mbm === false) ? null : mbm / 100;
+
+			if (level != +msg.level && elapsed < timeout_ms) {
+				txpower_timers[bssid].set(poll_ms);
+				return;
+			}
+
+			delete txpower_timers[bssid];
+			if (level == +msg.level)
+				result(0, 1, 'BSS ' + msg.bssid + ' changed TX power', { action: 'tx_power', bssid: msg.bssid, level });
+			else
+				result(1, 1, 'BSS ' + msg.bssid + ' TX power ' + msg.level + ' not applied (timeout)', { action: 'tx_power', bssid: msg.bssid, level });
+		});
+
+		return result(0, msg.event, 'BSS ' + msg.bssid + ' TX power change requested', { action: 'tx_power', bssid: msg.bssid, level: msg.level });
 	},
 
 	// ubus call rrm command '{"action": "bss_transition", "addr": "4e:7f:3e:2c:8a:68", "neighbors": ["34:ef:b6:af:48:b1"] }'

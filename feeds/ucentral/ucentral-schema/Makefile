@@ -4,10 +4,10 @@ PKG_NAME:=ucentral-schema
 PKG_RELEASE:=1
 
 PKG_SOURCE_URL=https://github.com/Telecominfraproject/wlan-ucentral-schema.git
-PKG_MIRROR_HASH:=765669cdbc0d92b6cc4464bbaa93e6ec80ea8e1a4c36a763a3958f9645f2c95f
+PKG_MIRROR_HASH:=618713f46e9351a1bc150b3d8e8b0a7a6933c21bf74ba5eec1e433589be0f81b
 PKG_SOURCE_PROTO:=git
-PKG_SOURCE_DATE:=2026-11-16
-PKG_SOURCE_VERSION:=77c45cbfeb2dedbf63d45024043b85c8a80ab90c
+PKG_SOURCE_DATE:=2026-11-26
+PKG_SOURCE_VERSION:=f4fff6fb667ac47a6ef8b7e3609a80197f7ab098
 PKG_MAINTAINER:=John Crispin <john@phrozen.org>
 PKG_LICENSE:=BSD-3-Clause
 
@@ -46,6 +46,7 @@ define Package/ucentral-schema/install
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/reboot_cause.uc $(1)/usr/share/ucentral
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/state.uc $(1)/usr/share/ucentral
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/telemetry.uc $(1)/usr/share/ucentral
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/system/wan_subnet.uc $(1)/usr/share/ucentral
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/tools/ujq $(1)/usr/bin
 	$(LN) /usr/share/ucentral/schemareader.uc $(1)/usr/share/ucode
 	$(LN) /usr/share/ucentral/ucentral.uc $(1)/usr/bin/ucentral_apply

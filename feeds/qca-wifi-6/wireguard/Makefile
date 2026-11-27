@@ -33,7 +33,7 @@ include $(INCLUDE_DIR)/kernel-defaults.mk
 include $(INCLUDE_DIR)/package-defaults.mk
 
 define Build/Compile
-	$(MAKE) $(KERNEL_MAKEOPTS) M="$(PKG_BUILD_DIR)/src" modules EXTRA_CFLAGS="-Wno-stringop-overread"
+	$(MAKE) $(KERNEL_MAKEOPTS) M="$(PKG_BUILD_DIR)/src" modules EXTRA_CFLAGS="-Wno-stringop-overread -Wno-error=format"
 endef
 
 define KernelPackage/wireguard-backport
