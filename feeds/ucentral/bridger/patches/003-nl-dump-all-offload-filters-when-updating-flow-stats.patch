@@ -1,0 +1,104 @@
+From ffa46399bfb9bc830220cea818f36933a240b013 Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@nbd.name>
+Date: Sat, 4 Jul 2026 17:36:29 +0000
+Subject: [PATCH] nl: dump all offload filters when updating flow stats
+
+The stats update sent a targeted RTM_GETTFILTER for a single handle,
+but the per-device offload_update flag limited it to one request per
+device and second. Every other hardware-offloaded flow on the device
+never had its counters read; since skip_sw filters bypass the BPF
+counters entirely, those flows idled out after 30 seconds and were
+re-established over and over.
+
+Dump all ingress filters of the device instead; handle_filter()
+already demultiplexes the results to flows via the handle. Since the
+dump delivers counters for flows outside their own update iteration,
+accumulate deltas from both the BPF map and the tc stats into
+cur_packets, compute the average after both updates and reset the
+counter explicitly at the end of each flow's iteration.
+
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+
+[backport of upstream bridger commit a429ae138b17 ("nl: dump all offload
+filters when updating flow stats"), refreshed on top of patches 001 and 002]
+
+In this bridger version the change also fixes a reply desync on the
+command socket. The targeted RTM_GETTFILTER is answered with the filter
+and a separate ACK. nl_wait_for_ack() returned after the filter and left
+the ACK queued, so every later request on cmd_sock read the reply of the
+request before it. A filter add that succeeded could then be reported as
+failed: bridger forgot the filter, never deleted it, and it kept
+redirecting the flow to the old port. On the SonicFi RAP630W-211G this
+black-holed the downlink of a station that moved from an offloaded SSID
+to a rate-limited (blacklisted) one. A dump ends with NLMSG_DONE, which
+nl_wait_for_ack() consumes, so requests and replies stay in step.
+---
+ bpf.c  | 3 +--
+ flow.c | 3 +++
+ nl.c   | 8 +++++++-
+ 3 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/bpf.c b/bpf.c
+index 634b2db..c593847 100644
+--- a/bpf.c
++++ b/bpf.c
+@@ -55,8 +55,7 @@ void bridger_bpf_flow_update(struct bridger_flow *flow)
+ 
+ 	bpf_map_lookup_elem(map_offload, &flow->key, &flow->offload);
+ 
+-	flow->cur_packets = flow->offload.packets - prev_packets;
+-	bridger_ewma(&flow->avg_packets, flow->cur_packets);
++	flow->cur_packets += flow->offload.packets - prev_packets;
+ }
+ 
+ void bridger_bpf_flow_delete(struct bridger_flow *flow)
+diff --git a/flow.c b/flow.c
+index dfce914..63bd0ce 100644
+--- a/flow.c
++++ b/flow.c
+@@ -165,6 +165,7 @@ bridger_flow_update_cb(struct uloop_timeout *timeout)
+ 		avl_delete(&sorted_flows, &flow->sort_node);
+ 		bridger_bpf_flow_update(flow);
+ 		bridger_nl_flow_offload_update(flow);
++		bridger_ewma(&flow->avg_packets, flow->cur_packets);
+ 		avl_insert(&sorted_flows, &flow->sort_node);
+ 
+ 		flow_debug_msg(flow, "Update");
+@@ -174,6 +175,8 @@ bridger_flow_update_cb(struct uloop_timeout *timeout)
+ 		else if (++flow->idle >= 30)
+ 			bridger_flow_delete(flow);
+ 
++		flow->cur_packets = 0;
++
+ 		if (flow->idle)
+ 			continue;
+ 
+diff --git a/nl.c b/nl.c
+index 958ab76..29873be 100644
+--- a/nl.c
++++ b/nl.c
+@@ -710,6 +710,11 @@ int bridger_nl_flow_offload_add(struct bridger_flow *flow)
+ 
+ void bridger_nl_flow_offload_update(struct bridger_flow *flow)
+ {
++	struct tcmsg tcmsg = {
++		.tcm_parent = TC_H_MAKE(TC_H_CLSACT, TC_H_MIN_INGRESS),
++		.tcm_family = AF_UNSPEC,
++		.tcm_ifindex = flow->offload_ifindex,
++	};
+ 	struct nl_msg *msg;
+ 	struct device *dev;
+ 
+@@ -727,7 +732,8 @@ void bridger_nl_flow_offload_update(struct bridger_flow *flow)
+ 		return;
+ 
+ 	dev->offload_update = false;
+-	msg = bridger_nl_flow_offload_msg(flow, flow->offload_ifindex, RTM_GETTFILTER);
++	msg = nlmsg_alloc_simple(RTM_GETTFILTER, NLM_F_REQUEST | NLM_F_DUMP);
++	nlmsg_append(msg, &tcmsg, sizeof(tcmsg), NLMSG_ALIGNTO);
+ 	nl_send_auto_complete(cmd_sock, msg);
+ 	nlmsg_free(msg);
+ 	nl_wait_for_ack(cmd_sock);
+-- 
+2.34.1
+
